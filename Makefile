@@ -408,6 +408,12 @@ test-smoke-prod: ## Run smoke tests against prod (uses AWS_PROFILE=layerv-prod)
 	go test -tags=smoke -v -count=1 -timeout 15m ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Prod smoke tests done!$(END_COLOUR)"
 
+test-debug: ## Run the #2214 pointer-uniqueness fence under -tags=nhp_debug (the CI fence; opts in to the panic-on-reuse variant of common.TokenStore.Store)
+	@echo "[OpenNHP] Running #2214 pointer-uniqueness fence under -tags=nhp_debug..."
+	cd nhp && go test -tags=nhp_debug -count=1 -race -timeout 2m ./common/...
+	cd endpoints && KBS_SKIP_INIT=1 go test -tags=nhp_debug -count=1 -race -timeout 5m ./ac/... ./server/...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Debug-tag fence tests done!$(END_COLOUR)"
+
 test-all: test test-lambdas test-local ## Run all tests
 
 # Fuzz parameters. The fuzz recipes route through scripts/run-fuzz.sh,

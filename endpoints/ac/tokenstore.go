@@ -61,11 +61,22 @@ const accessTokenLatePacketBufferSeconds = common.AccessTokenLatePacketBufferSec
 // each non-self copy falsely registering as an "other holder" of
 // the entry's tracked FlowKeys — keeping scheduler entries alive
 // past their genuine firewall deadlines (a silent security
-// regression, not a panic). #2214 (debug-only Store assertion that
-// a pointer is not already present under another token) and #2215
-// (synthetic atomic entryID alternative) track stronger guards;
-// for now, audit any AccessEntry-lifecycle change against this
-// invariant before merging.
+// regression, not a panic). #2214 fences this at CI under
+// `-tags=nhp_debug`: common.TokenStore.Store panics if the same
+// pointer is stored under a second token (see
+// nhp/common/tokenstore_debug_on.go + the AccessEntry-typed
+// positive test in tokenstore_debug_test.go). Production builds
+// pay zero overhead. #2215 tracks a stronger synthetic-entryID
+// alternative; the two are non-exclusive.
+//
+// Test-author note: tests that legitimately re-key the same
+// *AccessEntry under a new token (e.g. a token-rotation harness)
+// must call tokenStore.Delete(oldToken) BEFORE
+// tokenStore.Store(newToken, entry). Without the Delete, the
+// nhp_debug-build fence will trip; production builds will accept
+// the re-Store and silently break the pointer-identity invariant.
+// Either way the test would be exercising a state production
+// code never produces.
 type AccessEntry struct {
 	User           *common.AgentUser
 	SrcAddrs       []*common.NetAddress

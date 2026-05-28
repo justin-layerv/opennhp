@@ -152,6 +152,19 @@ func (ts *TokenStore[E]) SetOnExpire(fn func(token string, entry E)) {
 
 // Store adds or updates a token entry in the store.
 // Empty tokens are silently ignored.
+//
+// Pointer-uniqueness fence: under build tag `nhp_debug`, Store
+// asserts that `entry` is not already stored under a different
+// token. Panics on violation. See assertUniquePointerLocked (debug
+// build) for the rationale — #2214 catches latent AccessEntry pool/
+// reuse refactors that would silently break
+// latestOtherFirewallDeadline's self-skip pointer-equality.
+// Production builds use the no-op variant: zero overhead, zero
+// observability — by design, this fence is a CI-only regression
+// catcher, not a runtime safety net. The `nhp_debug` tag name is
+// namespaced (rather than plain `debug`) to avoid surprise
+// activation if a dependency or sibling package adopts the
+// `debug` build-tag convention.
 func (ts *TokenStore[E]) Store(token string, entry E) {
 	if len(token) == 0 {
 		return
@@ -159,6 +172,8 @@ func (ts *TokenStore[E]) Store(token string, entry E) {
 
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
+
+	ts.assertUniquePointerLocked(token, entry)
 
 	prefix := token[0:1]
 	tokenMap, found := ts.store[prefix]

@@ -9,9 +9,27 @@ NHP has three levels of testing:
 | Level | Location | Build Tag | Dependencies | CI |
 |-------|----------|-----------|--------------|-----|
 | **Unit Tests** | `endpoints/server/*_test.go` | none | none | Yes |
+| **#2214 fence** | `*/tokenstore_debug_test.go` | `nhp_debug` | none | Yes — see build-and-push.yml; `make test-debug` is the local reproducer |
 | **Local E2E** | `tests/local/*_test.go` | `local` | Docker (etcd) | Yes |
 | **Integration** | `tests/integration/*_test.go` | `integration` | AWS infra | Manual |
 | **E2E** | `tests/e2e/*_test.go` | `e2e` | Live deployment | Manual |
+
+> The `nhp_debug` build tag activates `common.TokenStore.Store`'s
+> pointer-uniqueness assertion (#2214). Production builds use the
+> no-op variant (`nhp/common/tokenstore_debug_off.go`) and pay zero
+> cost. The CI fence runs on every PR via the "Debug-tag
+> pointer-uniqueness assertion" step in
+> `.github/workflows/build-and-push.yml`; locally, `make test-debug`
+> reproduces it. See `nhp/common/tokenstore_debug_on.go` for the
+> rationale and `endpoints/ac/tokenstore.go`'s `AccessEntry` godoc
+> for the pointer-identity invariant the fence protects.
+>
+> Note: `make test-debug` exercises `endpoints/ac/...` alongside the
+> common-package tests. Some AC tests independently require iptables /
+> ipset (CI runs inside a privileged Docker container where these are
+> pre-installed); a host without them may see unrelated AC test
+> failures. The fence-specific tests themselves
+> (`*_debug_test.go`) have no such dependency.
 
 ## Running Tests
 

@@ -659,6 +659,50 @@ jobs:
               echo '::group::L3 Flush InFlightMarker Race Stress (count=10)'
               go test -v -timeout 5m -race -count=10 -run '^TestScheduler_InFlightMarker_' /workspace/endpoints/ac/...
               echo '::endgroup::'
+
+              # #2214 — pointer-uniqueness fence at common.TokenStore.Store.
+              # Build tag 'nhp_debug' (namespaced to avoid colliding with
+              # any future 'debug' tag a dependency might adopt) swaps the
+              # no-op assertUniquePointerLocked in tokenstore_debug_off.go
+              # for the panic-on-reuse variant in tokenstore_debug_on.go.
+              # Production builds pay zero cost; this CI step is the
+              # regression catcher that fires before any future AccessEntry
+              # / ACTokenEntry pool/reuse refactor silently breaks
+              # latestOtherFirewallDeadline's pointer-equality self-skip on
+              # the AC or the analogous server-side invariant.
+              # Scoped to the three packages the invariant touches:
+              # nhp/common (where the fence is implemented),
+              # endpoints/ac (where AccessEntry's pointer-identity invariant
+              # load-bears the L3-flush peer-rescheduling math), and
+              # endpoints/server (where ACTokenEntry is the other
+              # production pointer-typed instantiation — defense-in-depth
+              # so a future server-side pool/reuse change is also fenced).
+              #
+              # cd into each module's root before invoking go test —
+              # nhp/ and endpoints/ are separate Go modules in the
+              # multi-module workspace, and 'go test <abs-path>' refuses
+              # to cross module roots from a foreign cwd (the
+              # "directory X is outside module root Y" failure mode).
+              # The earlier 'NHP Core Tests' / 'Endpoints Tests' steps
+              # in this heredoc use the same cd-then-relative pattern.
+              # -race matches sibling 'NHP Core Tests' / 'Endpoints Tests'
+              # steps. The fence itself runs under ts.mu so adds no value
+              # for the assertion, but the underlying package tests benefit
+              # from race detection generally and build-tag-conditional
+              # code paths get exercised under TSAN that the !nhp_debug
+              # pass wouldn't.
+              #
+              # KBS_SKIP_INIT=1 is inherited from the docker -e env at
+              # line 622, not set per-invocation here. The local Makefile
+              # 'make test-debug' target sets it explicitly. If a future
+              # restructure removes the container-level env, this step
+              # would need an explicit 'KBS_SKIP_INIT=1 ' prefix on the
+              # endpoints invocation to keep the AC tests' key-init guard
+              # happy.
+              echo '::group::Debug-tag pointer-uniqueness assertion (#2214)'
+              cd /workspace/nhp && go test -tags=nhp_debug -count=1 -timeout 2m -race -v ./common/...
+              cd /workspace/endpoints && go test -tags=nhp_debug -count=1 -timeout 5m -race -v ./ac/... ./server/...
+              echo '::endgroup::'
             "
 
       - name: Go vet

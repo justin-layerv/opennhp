@@ -50,6 +50,18 @@ CVE-2026-39836
 # https://avd.aquasec.com/nvd/cve-2026-42499
 CVE-2026-42499
 
+# Three further stdlib CVEs landed in Trivy's DB on 2026-05-28 — same
+# story: fixed in Go 1.25.10 / 1.26.3 (per NVD) so our own binary is
+# patched, but the Traefik v3.6.16 binary is still built with
+# Go 1.25.0 and continues to flag. Will go away when Traefik publishes
+# a release built with Go >= 1.25.10.
+# https://nvd.nist.gov/vuln/detail/CVE-2026-39823 (html/template URL escaping)
+CVE-2026-39823
+# https://nvd.nist.gov/vuln/detail/CVE-2026-39825 (net/http/httputil ReverseProxy)
+CVE-2026-39825
+# https://nvd.nist.gov/vuln/detail/CVE-2026-39826 (html/template <script> escaping)
+CVE-2026-39826
+
 # go.opentelemetry.io/otel/sdk - FALSE POSITIVE
 # CVE-2026-39883 (PATH hijacking via kenv on BSD) is fixed in v1.43.0.
 # We are on v1.43.0. Trivy's database incorrectly flags it — the affected
