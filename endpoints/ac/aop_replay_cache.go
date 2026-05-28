@@ -96,8 +96,8 @@ import (
 // is fixed-size, txid renders as digits only, and sendTime renders
 // as a signed-decimal nanos-since-epoch, so the `:` separators
 // unambiguously delimit the three fields. Today every
-// `ppd.RemotePubKey` is 32 bytes (PublicKeySize, allocated in
-// `nhp/core/responder.go` via `make([]byte, PublicKeySize)`);
+// `ppd.RemotePubKey` is 32 bytes (PublicKeySize, backed by
+// `PacketParserData.remotePubKeyBuf` in `nhp/core/responder.go`);
 // PublicKeySizeEx (64 bytes) is reserved for a future cipher
 // scheme but never assigned into RemotePubKey, so the unambiguity
 // holds because every key has identical length. If a future scheme

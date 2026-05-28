@@ -96,7 +96,12 @@ type PacketParserData struct {
 	ConnCookieStore        *CookieStore
 	ConnPeerPublicKey      *[PublicKeySizeEx]byte
 	RemotePubKey           []byte
-	BodyMessage            []byte
+	// remotePubKeyBuf lives inside the PacketParserData allocation; it avoids
+	// a separate heap object for RemotePubKey. Because RemotePubKey slices into
+	// this array, downstream aliases extend this struct's lifetime. See Destroy
+	// for why the buffer is left intact.
+	remotePubKeyBuf [PublicKeySize]byte
+	BodyMessage     []byte
 
 	decryptedMsgCh chan<- *PacketParserData //Plaintext payload dispatched (Decryption cycle completed)
 	feedbackMsgCh  chan<- *PacketParserData
@@ -317,7 +322,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	// generate gcm key and decrypt device pubkey ChainKey1 -> ChainKey2
 	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ess[:])
 	SetZero(ess[:])
-	peerPk := make([]byte, PublicKeySize)
+	peerPk := ppd.remotePubKeyBuf[:]
 	aead, err = AeadFromKey(ppd.Ciphers.GcmType, &key)
 	if err != nil {
 		log.Error("failed to create AEAD for peer pubkey decryption: %v", err)
@@ -677,6 +682,8 @@ func (ppd *PacketParserData) Destroy() {
 	}
 	// Defense-in-depth: clear scratch even though hash digests are not key material.
 	SetZero(ppd.hashBuf[:])
+	// Do not clear remotePubKeyBuf here: RemotePubKey is consumed after
+	// Destroy releases packet/hash state on PacketToMsg and async paths.
 }
 
 func (ppd *PacketParserData) IsAllowedAtOverload() bool {

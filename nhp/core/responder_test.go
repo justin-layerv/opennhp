@@ -1,6 +1,11 @@
 package core
 
-import "testing"
+import (
+	"bytes"
+	"net"
+	"testing"
+	"time"
+)
 
 // TestShouldCheckRecvAttack_AOPNoLongerExempt is the regression
 // fence for issue #1123. The previous implementation skipped the
@@ -67,5 +72,145 @@ func TestShouldCheckFlood_ARTExempt(t *testing.T) {
 func TestShouldCheckFlood_DefaultEnforced(t *testing.T) {
 	if !shouldCheckFlood(NHP_SERVER, NHP_AGENT, NHP_KNK) {
 		t.Fatal("non-exempt (deviceType, peerType, msgType) must enforce the flood gate")
+	}
+}
+
+type validatePeerFixture struct {
+	acPeer        *UdpPeer
+	server        *Device
+	serverConn    *ConnectionData
+	packetContent []byte
+	initTime      int64
+}
+
+func TestValidatePeerPopulatesRemotePubKey(t *testing.T) {
+	fixture := newValidatePeerFixture(t)
+	ppd := fixture.parseAndValidate(t)
+	defer ppd.Destroy()
+
+	if !bytes.Equal(ppd.RemotePubKey, fixture.acPeer.PublicKey()) {
+		t.Fatalf("RemotePubKey mismatch\ngot:  %x\nwant: %x", ppd.RemotePubKey, fixture.acPeer.PublicKey())
+	}
+}
+
+func TestValidatePeerRemotePubKeySurvivesDestroy(t *testing.T) {
+	fixture := newValidatePeerFixture(t)
+	ppd := fixture.parseAndValidate(t)
+	want := append([]byte(nil), fixture.acPeer.PublicKey()...)
+
+	ppd.Destroy()
+
+	if !bytes.Equal(ppd.RemotePubKey, want) {
+		t.Fatalf("RemotePubKey after Destroy mismatch\ngot:  %x\nwant: %x", ppd.RemotePubKey, want)
+	}
+}
+
+// BenchmarkValidatePeer uses ART so one encrypted packet can be replayed through
+// validatePeer without tripping the server-side replay/flood gates.
+func BenchmarkValidatePeer(b *testing.B) {
+	fixture := newValidatePeerFixture(b)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ppd := fixture.parseAndValidate(b)
+		ppd.Destroy()
+	}
+}
+
+func newValidatePeerFixture(tb testing.TB) validatePeerFixture {
+	tb.Helper()
+	silenceGlobalLogger(tb)
+
+	acPrivKey := validatePeerPrivateKey(1)
+	serverPrivKey := validatePeerPrivateKey(33)
+	acDevice := NewDevice(NHP_AC, acPrivKey, nil)
+	if acDevice == nil {
+		tb.Fatal("failed to create AC device")
+	}
+	serverDevice := NewDevice(NHP_SERVER, serverPrivKey, nil)
+	if serverDevice == nil {
+		tb.Fatal("failed to create server device")
+	}
+
+	acPeer := &UdpPeer{
+		PubKeyBase64: acDevice.PublicKeyBase64(),
+		Ip:           "127.0.0.1",
+		Port:         12345,
+		Type:         NHP_AC,
+	}
+	serverPeer := &UdpPeer{
+		PubKeyBase64: serverDevice.PublicKeyBase64(),
+		Ip:           "127.0.0.1",
+		Port:         12346,
+		Type:         NHP_SERVER,
+	}
+	serverDevice.AddPeer(acPeer)
+	acDevice.AddPeer(serverPeer)
+
+	acConn := validatePeerConnectionData(acDevice, 12345, 12346)
+	mad, err := acDevice.MsgToPacket(&MsgData{
+		ConnData:      acConn,
+		PeerPk:        serverPeer.PublicKey(),
+		HeaderType:    NHP_ART,
+		TransactionId: 1,
+	})
+	if err != nil {
+		tb.Fatalf("MsgToPacket failed: %v", err)
+	}
+
+	return validatePeerFixture{
+		acPeer:        acPeer,
+		server:        serverDevice,
+		serverConn:    validatePeerConnectionData(serverDevice, 12346, 12345),
+		packetContent: append([]byte(nil), mad.BasePacket.Content...),
+		initTime:      time.Now().UnixNano(),
+	}
+}
+
+func (f validatePeerFixture) parseAndValidate(tb testing.TB) *PacketParserData {
+	tb.Helper()
+
+	pkt := Packet{
+		Content:    f.packetContent,
+		HeaderType: NHP_ART,
+	}
+	pd := PacketData{
+		BasePacket: &pkt,
+		ConnData:   f.serverConn,
+		InitTime:   f.initTime,
+	}
+
+	ppd, err := f.server.createPacketParserData(&pd)
+	if err != nil {
+		tb.Fatalf("createPacketParserData failed: %v", err)
+	}
+	if err := ppd.validatePeer(); err != nil {
+		tb.Fatalf("validatePeer failed: %v", err)
+	}
+
+	return ppd
+}
+
+func validatePeerPrivateKey(start byte) []byte {
+	key := make([]byte, PrivateKeySize)
+	for i := range key {
+		key[i] = start + byte(i)
+	}
+	return key
+}
+
+func validatePeerConnectionData(device *Device, localPort int, remotePort int) *ConnectionData {
+	return &ConnectionData{
+		Device:           device,
+		LocalAddr:        &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: localPort},
+		RemoteAddr:       &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: remotePort},
+		InitTime:         time.Now().UnixNano(),
+		CookieStore:      &CookieStore{},
+		SendQueue:        make(chan *Packet, 1),
+		RecvQueue:        make(chan *Packet, 1),
+		BlockSignal:      make(chan struct{}, 1),
+		SetTimeoutSignal: make(chan struct{}, 1),
+		StopSignal:       make(chan struct{}),
 	}
 }
