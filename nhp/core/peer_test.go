@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 // MatchesIP gates the per-IP cap bypass for AC/DB conns in udpserver.go,
@@ -40,6 +41,153 @@ func TestUdpPeerMatchesIP(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUdpPeerCheckRecvAddress(t *testing.T) {
+	now := int64(100 * time.Second)
+	withinHoldTime := now + int64(time.Second)
+	// CheckRecvAddress uses strict >, so this is one nanosecond past the boundary.
+	afterHoldTime := now + MinimalPeerAddressHoldTime*int64(time.Second) + 1
+	var typedNilUDPAddr *net.UDPAddr
+
+	tests := []struct {
+		name     string
+		recvAddr *net.UDPAddr
+		currAddr net.Addr
+		currTime int64
+		want     bool
+	}{
+		{
+			name:     "hold time expired accepts new address",
+			currAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.4"), Port: 62206},
+			currTime: afterHoldTime,
+			want:     true,
+		},
+		{
+			name:     "hold time expired ignores previous recv address",
+			recvAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.4"), Port: 62207},
+			currTime: afterHoldTime,
+			want:     true,
+		},
+		{
+			name:     "matching recv address within hold time",
+			recvAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currTime: withinHoldTime,
+			want:     true,
+		},
+		{
+			name:     "IPv4 byte representation mismatch still matches",
+			recvAddr: &net.UDPAddr{IP: net.IP{10, 0, 0, 3}, Port: 62206},
+			currAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currTime: withinHoldTime,
+			want:     true,
+		},
+		{
+			name:     "different IP rejected within hold time",
+			recvAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.4"), Port: 62206},
+			currTime: withinHoldTime,
+			want:     false,
+		},
+		{
+			name:     "different port rejected within hold time",
+			recvAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62207},
+			currTime: withinHoldTime,
+			want:     false,
+		},
+		{
+			name:     "scoped IPv6 zone mismatch rejected within hold time",
+			recvAddr: &net.UDPAddr{IP: net.ParseIP("fe80::1"), Port: 62206, Zone: "en0"},
+			currAddr: &net.UDPAddr{IP: net.ParseIP("fe80::1"), Port: 62206, Zone: "en1"},
+			currTime: withinHoldTime,
+			want:     false,
+		},
+		{
+			name:     "non UDP address rejected within hold time",
+			recvAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currAddr: &net.IPAddr{IP: net.ParseIP("10.0.0.3")},
+			currTime: withinHoldTime,
+			want:     false,
+		},
+		{
+			name:     "nil recv address rejected within hold time",
+			currAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currTime: withinHoldTime,
+			want:     false,
+		},
+		{
+			name:     "nil current address rejected within hold time",
+			recvAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currTime: withinHoldTime,
+			want:     false,
+		},
+		{
+			name:     "typed nil UDP address rejected within hold time",
+			recvAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206},
+			currAddr: typedNilUDPAddr,
+			currTime: withinHoldTime,
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &UdpPeer{lastRecvTime: now, recvAddr: tt.recvAddr}
+			if got := p.CheckRecvAddress(tt.currTime, tt.currAddr); got != tt.want {
+				t.Fatalf("CheckRecvAddress() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUdpPeerCheckRecvAddressHotPathDoesNotAllocate(t *testing.T) {
+	now := int64(100 * time.Second)
+	currTime := now + int64(time.Second)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206}
+	p := &UdpPeer{lastRecvTime: now, recvAddr: addr}
+
+	if !p.CheckRecvAddress(currTime, addr) {
+		t.Fatal("CheckRecvAddress() = false, want true")
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		_ = p.CheckRecvAddress(currTime, addr)
+	})
+	if allocs != 0 {
+		t.Fatalf("CheckRecvAddress() allocs = %v, want 0", allocs)
+	}
+}
+
+func BenchmarkUdpPeerCheckRecvAddress(b *testing.B) {
+	now := int64(100 * time.Second)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 62206}
+
+	b.Run("hold_time_expired", func(b *testing.B) {
+		p := &UdpPeer{lastRecvTime: now, recvAddr: addr}
+		currTime := now + MinimalPeerAddressHoldTime*int64(time.Second) + 1
+
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if !p.CheckRecvAddress(currTime, addr) {
+				b.Fatal("CheckRecvAddress() = false, want true")
+			}
+		}
+	})
+
+	b.Run("hot_recv_match", func(b *testing.B) {
+		p := &UdpPeer{lastRecvTime: now, recvAddr: addr}
+		currTime := now + int64(time.Second)
+
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if !p.CheckRecvAddress(currTime, addr) {
+				b.Fatal("CheckRecvAddress() = false, want true")
+			}
+		}
+	})
 }
 
 func TestUdpPeerName(t *testing.T) {

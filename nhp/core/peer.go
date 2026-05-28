@@ -211,7 +211,10 @@ func (p *UdpPeer) UpdateSend(currTime int64) {
 	p.lastSendTime = currTime
 }
 
-// a peer should not have multiple layer-4 addresses within its hold time
+// a peer should not have multiple layer-4 addresses within its hold time.
+// Within the hold window, CheckRecvAddress returns true only when currAddr is a
+// non-nil *net.UDPAddr whose IP, port, and zone match p.recvAddr. Unexpected
+// address types are rejected without logging to keep the packet hot path cheap.
 func (p *UdpPeer) CheckRecvAddress(currTime int64, currAddr net.Addr) bool {
 	p.Lock()
 	defer p.Unlock()
@@ -220,11 +223,14 @@ func (p *UdpPeer) CheckRecvAddress(currTime int64, currAddr net.Addr) bool {
 		return true
 	}
 
-	if p.recvAddr != nil && p.recvAddr.String() == currAddr.String() {
-		return true
+	udpAddr, ok := currAddr.(*net.UDPAddr)
+	if !ok || udpAddr == nil || p.recvAddr == nil {
+		return false
 	}
 
-	return false
+	return p.recvAddr.Port == udpAddr.Port &&
+		p.recvAddr.Zone == udpAddr.Zone &&
+		p.recvAddr.IP.Equal(udpAddr.IP)
 }
 
 // MatchesIP reports whether ipStr matches the peer's static configured
