@@ -118,6 +118,9 @@ func TestQurlLinkFrontend_RootServesConsumerLandingPage(t *testing.T) {
 		"Share the link. Not the exposure.",
 		"Create a secure link",
 		"Access link invalid",
+		// Source-text proxy for behavior smoke cannot execute; update it with
+		// any copy refactor that preserves the UX.
+		"If you opened this page from a qURL access link",
 		`rel="canonical" href="https://qurl.link/"`,
 		`property="og:image" content="https://qurl.link/og-image.png"`,
 	}
@@ -125,6 +128,14 @@ func TestQurlLinkFrontend_RootServesConsumerLandingPage(t *testing.T) {
 		if !strings.Contains(bodyStr, want) {
 			t.Fatalf("deployed qurl.link root is missing landing/verifier copy %q", want)
 		}
+	}
+
+	if !reducedMotionScrollBehaviorRE.MatchString(bodyStr) {
+		t.Fatal("deployed qurl.link root is missing the reduced-motion smooth-scroll override.")
+	}
+
+	if !noscriptFallbackStyleRE.MatchString(bodyStr) {
+		t.Fatal("deployed qurl.link root is missing the no-JS fallback visibility overrides.")
 	}
 
 	if robotsNoindexMetaRE.MatchString(bodyStr) {
@@ -254,9 +265,15 @@ func TestQurlLinkFrontend_AllowlistContainsServingHost(t *testing.T) {
 var (
 	// Order-independent match for a robots meta tag whose content asks
 	// crawlers not to index the page.
-	robotsNoindexMetaRE   = regexp.MustCompile(`(?is)<meta\b(?=[^>]*\bname=["']robots["'])(?=[^>]*\bcontent=["'][^"']*noindex)[^>]*>`)
-	staticBodyClassAttrRE = regexp.MustCompile(`(?is)<body\b[^>]*\bclass=["']([^"']*)["'][^>]*>`)
-	scriptSrcOnlyInlineRE = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s*(?:;|$)`)
+	robotsNoindexMetaRE           = regexp.MustCompile(`(?is)<meta\b(?=[^>]*\bname=["']robots["'])(?=[^>]*\bcontent=["'][^"']*noindex)[^>]*>`)
+	staticBodyClassAttrRE         = regexp.MustCompile(`(?is)<body\b[^>]*\bclass=["']([^"']*)["'][^>]*>`)
+	scriptSrcOnlyInlineRE         = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s*(?:;|$)`)
+	reducedMotionScrollBehaviorRE = regexp.MustCompile(
+		`(?is)@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)\s*\{[^{}]*html\s*\{[^{}]*scroll-behavior\s*:\s*auto\s*;`,
+	)
+	noscriptFallbackStyleRE = regexp.MustCompile(
+		`(?is)<noscript>.*?\.access-shell\s*\{[^{}]*display\s*:\s*grid\s*;.*?\.access-noscript\s*\{[^{}]*display\s*:\s*block\s*;`,
+	)
 )
 
 func TestQurlLinkFrontend_CSPAllowsInlineScript(t *testing.T) {

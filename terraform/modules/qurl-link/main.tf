@@ -251,7 +251,8 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
       # this one inline-script page, so disallowing same-origin .js
       # loads is the tighter, accurate posture.
       # style-src keeps 'unsafe-inline' because the marketing rows use
-      # inline style attributes for per-card CSS custom properties.
+      # inline style attributes for per-card CSS custom properties, and the
+      # no-JS verifier fallback keeps its state flip in a noscript style.
       content_security_policy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
       override                = true
     }

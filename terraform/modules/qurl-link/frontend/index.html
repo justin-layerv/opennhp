@@ -625,7 +625,8 @@
       line-height: 1.6;
     }
 
-    .access-error {
+    .access-error,
+    .access-noscript {
       display: none;
     }
 
@@ -693,6 +694,12 @@
 
       .node {
         animation: float-node 6s ease-in-out infinite;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
       }
     }
 
@@ -1024,6 +1031,34 @@
           Please request a new access link from the resource owner.
         </p>
       </div>
+      <!-- Fragment tokens are invisible to static HTML, so the no-JS fallback
+        appears after the landing page too. The body-scoped style is intentional:
+        strict validators may flag it, but browsers only parse it when scripting
+        is disabled and it keeps the fallback state local to this panel. -->
+      <noscript>
+        <style>
+          .access-loading,
+          .access-error {
+            display: none;
+          }
+
+          .access-shell {
+            display: grid;
+          }
+
+          .access-noscript {
+            display: block;
+          }
+        </style>
+        <div class="access-noscript">
+          <h2 class="access-title">qURL access links need JavaScript</h2>
+          <p class="access-message">
+            If you opened this page from a qURL access link, JavaScript is required
+            to verify and open the private resource. The landing page above does not
+            require JavaScript.
+          </p>
+        </div>
+      </noscript>
     </div>
   </div>
 
