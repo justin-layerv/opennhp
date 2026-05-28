@@ -138,7 +138,7 @@ func TestQurlLinkFrontend_RootServesConsumerLandingPage(t *testing.T) {
 		t.Fatal("deployed qurl.link root is missing the no-JS fallback visibility overrides.")
 	}
 
-	if robotsNoindexMetaRE.MatchString(bodyStr) {
+	if hasRobotsNoindexMeta(bodyStr) {
 		t.Fatal("deployed qurl.link root still carries noindex,nofollow; the consumer landing page should be indexable.")
 	}
 
@@ -263,9 +263,14 @@ func TestQurlLinkFrontend_AllowlistContainsServingHost(t *testing.T) {
 // so a future CSP shape with hyphenated tokens before the directive
 // can't accidentally satisfy the boundary.
 var (
-	// Order-independent match for a robots meta tag whose content asks
-	// crawlers not to index the page.
-	robotsNoindexMetaRE           = regexp.MustCompile(`(?is)<meta\b(?=[^>]*\bname=["']robots["'])(?=[^>]*\bcontent=["'][^"']*noindex)[^>]*>`)
+	// Order-independent detection of a robots meta tag whose content asks
+	// crawlers not to index the page. Go's RE2 engine has no lookahead, so
+	// the "both attributes present, any order" check can't live in a single
+	// pattern — instead we enumerate <meta> elements (metaTagRE) and test
+	// each for the two attributes independently (see hasRobotsNoindexMeta).
+	metaTagRE                     = regexp.MustCompile(`(?is)<meta\b[^>]*>`)
+	robotsNameAttrRE              = regexp.MustCompile(`(?i)\bname=["']robots["']`)
+	noindexContentAttrRE          = regexp.MustCompile(`(?i)\bcontent=["'][^"']*noindex`)
 	staticBodyClassAttrRE         = regexp.MustCompile(`(?is)<body\b[^>]*\bclass=["']([^"']*)["'][^>]*>`)
 	scriptSrcOnlyInlineRE         = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s*(?:;|$)`)
 	reducedMotionScrollBehaviorRE = regexp.MustCompile(
@@ -275,6 +280,19 @@ var (
 		`(?is)<noscript>.*?\.access-shell\s*\{[^{}]*display\s*:\s*grid\s*;.*?\.access-noscript\s*\{[^{}]*display\s*:\s*block\s*;`,
 	)
 )
+
+// hasRobotsNoindexMeta reports whether body contains a <meta> element that
+// carries both name="robots" and a content value including "noindex", in any
+// attribute order. RE2 lacks lookahead, so we enumerate meta tags and test the
+// two attributes per tag rather than expressing "both present" in one pattern.
+func hasRobotsNoindexMeta(body string) bool {
+	for _, tag := range metaTagRE.FindAllString(body, -1) {
+		if robotsNameAttrRE.MatchString(tag) && noindexContentAttrRE.MatchString(tag) {
+			return true
+		}
+	}
+	return false
+}
 
 func TestQurlLinkFrontend_CSPAllowsInlineScript(t *testing.T) {
 	resp, _ := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
