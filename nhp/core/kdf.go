@@ -29,6 +29,17 @@ var hashNewFuncs = [...]func() hash.Hash{
 	HASH_SHA256:  makeHashFunc(HASH_SHA256),
 }
 
+// Pre-allocated single-byte KDF domain-separation tags. KeyGen1/2/3 pass
+// these to HMAC.Write on every call (~4x per packet); hoisting them to
+// package level turns heap-escaping []byte literals into shared static data.
+// MUST NOT be mutated: these arrays are shared across all KDF calls and
+// goroutines.
+var (
+	kdfTag1 = [1]byte{0x1}
+	kdfTag2 = [1]byte{0x2}
+	kdfTag3 = [1]byte{0x3}
+)
+
 type NoiseFactory struct {
 	HashType HashTypeEnum
 }
@@ -61,18 +72,18 @@ func (n *NoiseFactory) HMAC2(dst *[HashSize]byte, key, in0, in1 []byte) {
 
 func (n *NoiseFactory) KeyGen1(dst0 *[HashSize]byte, key, input []byte) {
 	n.HMAC1(dst0, key, input)
-	n.HMAC1(dst0, dst0[:], []byte{0x1})
+	n.HMAC1(dst0, dst0[:], kdfTag1[:])
 }
 
 func (n *NoiseFactory) KeyGen2(dst0, dst1 *[HashSize]byte, key, input []byte) {
 	var prk [HashSize]byte
 	n.HMAC1(&prk, key, input)
 	mac := hmac.New(n.hashFunc(), prk[:])
-	mac.Write([]byte{0x1})
+	mac.Write(kdfTag1[:])
 	mac.Sum(dst0[:0])
 	mac.Reset()
 	mac.Write(dst0[:])
-	mac.Write([]byte{0x2})
+	mac.Write(kdfTag2[:])
 	mac.Sum(dst1[:0])
 	SetZero(prk[:])
 }
@@ -81,15 +92,15 @@ func (n *NoiseFactory) KeyGen3(dst0, dst1, dst2 *[HashSize]byte, key, input []by
 	var prk [HashSize]byte
 	n.HMAC1(&prk, key, input)
 	mac := hmac.New(n.hashFunc(), prk[:])
-	mac.Write([]byte{0x1})
+	mac.Write(kdfTag1[:])
 	mac.Sum(dst0[:0])
 	mac.Reset()
 	mac.Write(dst0[:])
-	mac.Write([]byte{0x2})
+	mac.Write(kdfTag2[:])
 	mac.Sum(dst1[:0])
 	mac.Reset()
 	mac.Write(dst1[:])
-	mac.Write([]byte{0x3})
+	mac.Write(kdfTag3[:])
 	mac.Sum(dst2[:0])
 	SetZero(prk[:])
 }
