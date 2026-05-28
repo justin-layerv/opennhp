@@ -518,10 +518,17 @@ resource "aws_iam_policy" "dynamodb_write" {
 # GSIs (in declaration order below):
 #   - owner-index            (owner_id → created_at)
 #   - owner-expires-index    (owner_id → expires_at)
+#   - owner-type-created-index        (owner_resource_type → created_at; dashboard type lists)
+#   - owner-type-status-created-index (owner_resource_type_status → created_at; dashboard type+status lists)
 #   - owner-target-hash-index (owner_id → target_url_hash; find-or-create dedup)
 #   - status-index           (status   → expires_at; KEYS_ONLY, expiring-soon scan)
 #   - custom-domain-index    (custom_domain; domain routing)
 #   - owner-alias-index      (owner_id → alias; sparse, tenant-scoped alias lookup)
+#
+# Rollout note: qurl-service owns the sparse key writes and backfill. Create
+# these GSIs first, then backfill existing rows before enabling indexed readers.
+# Projection is ALL intentionally: resource list APIs render full Resource rows
+# directly from the GSI and avoid per-row GetItem fanout on dashboard hot paths.
 resource "aws_dynamodb_table" "qurl_resources" {
   count = var.deploy_qurl_tables ? 1 : 0
 
@@ -569,6 +576,48 @@ resource "aws_dynamodb_table" "qurl_resources" {
     name            = "owner-expires-index"
     hash_key        = "owner_id"
     range_key       = "expires_at"
+    projection_type = "ALL"
+  }
+
+  attribute {
+    name = "owner_resource_type"
+    type = "S"
+  }
+
+  # GSI: Find resources by the composite owner/type key, sorted by creation time.
+  # The partition key is encoded by qurl-service as "{owner_id}#{type}" where
+  # type is lower-case ("url" or "tunnel"). Tenant+type is deliberately packed
+  # into the hash key so one hot owner does not collapse URL and tunnel rows
+  # into the same GSI partition. qurl-service does not parse this value back
+  # into owner/type; if that changes, split from the right because owner_id may
+  # contain "#", while type may not. qurl-service must omit this attribute
+  # entirely for non-list-visible rows; an empty string would still project into
+  # the sparse index. Transit resources stay out of the public dashboard
+  # resource-list indexes and are surfaced through the connector installation
+  # aggregate view instead.
+  global_secondary_index {
+    name            = "owner-type-created-index"
+    hash_key        = "owner_resource_type"
+    range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  attribute {
+    name = "owner_resource_type_status"
+    type = "S"
+  }
+
+  # GSI: Find resources by the composite owner/type/status key, sorted by
+  # creation time. The partition key is "{owner_id}#{type}#{status}";
+  # qurl-service writes only active/revoked statuses into this sparse index.
+  # Future lifecycle statuses stay out until the API intentionally exposes them.
+  # This is the hot dashboard path for
+  # GET /v1/resources?type=<url|tunnel>&status=<active|revoked>; pagination
+  # must happen over the filtered result set rather than an owner-wide page.
+  global_secondary_index {
+    name            = "owner-type-status-created-index"
+    hash_key        = "owner_resource_type_status"
+    range_key       = "created_at"
     projection_type = "ALL"
   }
 
