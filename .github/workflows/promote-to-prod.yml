@@ -47,6 +47,11 @@ on:
         required: false
         default: ''
         type: string
+      frps_image_tag:
+        description: 'qurl-reverse-tunnel-server image tag for terraform deploy_frps precondition (reads from sandbox SSM if empty)'
+        required: false
+        default: ''
+        type: string
       run_terraform:
         description: 'Run terraform apply (required for first deploy or infra changes)'
         required: false
@@ -142,6 +147,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       qurl_image_tag: ${{ steps.resolve-qurl-tag.outputs.qurl_image_tag }}
+      frps_image_tag: ${{ steps.resolve-frps-tag.outputs.frps_image_tag }}
       current_prod_qurl_tag: ${{ steps.prod-state.outputs.qurl_tag }}
       effective_image_tag: ${{ steps.resolve-rollback.outputs.effective_image_tag }}
       changelog: ${{ steps.changelog.outputs.changelog }}
@@ -239,6 +245,78 @@ jobs:
               echo "Resolved QURL image tag from sandbox SSM: $QURL_TAG"
               echo "qurl_image_tag=$QURL_TAG" >> "$GITHUB_OUTPUT"
             fi
+          fi
+
+      - name: Resolve FRPS image tag
+        id: resolve-frps-tag
+        env:
+          FRPS_IMAGE_TAG_INPUT: ${{ inputs.frps_image_tag }}
+          SSM_FRPS_PARAM: /sandbox/nhp/reverse-tunnel-server/image-tag
+        run: |
+          set -euo pipefail
+          # qurl-reverse-tunnel-server image tag for terraform's
+          # `deploy_frps => non-bootstrap frps_image_tag` precondition only.
+          # The *running* image is owned by rts CI (promote-production.yml
+          # writes /prod/nhp/reverse-tunnel-server/image-tag + instance-refresh;
+          # user_data reads it from SSM at boot), so this resolves the
+          # sandbox-validated tag instead of baking a SHA in tfvars (mirrors
+          # the qurl_image_tag flow above).
+          #
+          # Hardened beyond resolve-qurl-tag per cr on #2235 (the build-and-push
+          # sibling's defensive shape, #1575): Docker TagRegexp validation so a
+          # malformed SSM value can't smuggle metacharacters/newlines into
+          # GITHUB_OUTPUT, region pin, and ParameterNotFound distinguished from
+          # real AWS errors (IAM/creds/throttle) so a creds regression fails
+          # loud rather than silently collapsing to the placeholder.
+          #
+          # On the benign "no real tag yet" path we emit the bootstrap
+          # placeholder so the terraform precondition fails loud when
+          # deploy_frps=true, and stays inert when deploy_frps=false.
+
+          # Docker distribution TagRegexp: leading char restricted, then
+          # [A-Za-z0-9._-], 1-128 chars total.
+          TAG_RE='^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+
+          if [[ -n "$FRPS_IMAGE_TAG_INPUT" ]]; then
+            if [[ ! "$FRPS_IMAGE_TAG_INPUT" =~ $TAG_RE ]]; then
+              echo "::error::Provided frps_image_tag is not a valid Docker tag: $(printf %q "$FRPS_IMAGE_TAG_INPUT")"
+              exit 1
+            fi
+            echo "Using provided FRPS image tag: $FRPS_IMAGE_TAG_INPUT"
+            echo "frps_image_tag=$FRPS_IMAGE_TAG_INPUT" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # INVARIANT: the failure paths below MUST emit the literal
+          # `v0.0.0-bootstrap`, never an empty string. TF_VAR_frps_image_tag=""
+          # would OVERRIDE the variable's `v0.0.0-bootstrap` default to empty,
+          # which slips past the `^v0\.0\.0-bootstrap` precondition regex and
+          # silently bypasses the deploy_frps gate. Keep it non-empty so the
+          # precondition fails loud when deploy_frps=true.
+          echo "No FRPS image tag provided, reading from sandbox SSM ($SSM_FRPS_PARAM)..."
+          SSM_ERR="$(mktemp)"
+          trap 'rm -f "$SSM_ERR"' EXIT
+          if FRPS_TAG="$(aws ssm get-parameter --region "$AWS_REGION" --name "$SSM_FRPS_PARAM" --query "Parameter.Value" --output text 2>"$SSM_ERR")"; then
+            if [[ -z "$FRPS_TAG" || "$FRPS_TAG" == "None" || "$FRPS_TAG" =~ ^v0\.0\.0-bootstrap ]]; then
+              echo "::warning::SSM $SSM_FRPS_PARAM holds no real tag (got '$FRPS_TAG'). deploy_frps=true will fail the non-bootstrap precondition — provide frps_image_tag explicitly."
+              echo "frps_image_tag=v0.0.0-bootstrap" >> "$GITHUB_OUTPUT"
+            elif [[ ! "$FRPS_TAG" =~ $TAG_RE ]]; then
+              echo "::error::SSM $SSM_FRPS_PARAM holds a value that is not a valid Docker tag: $(printf %q "$FRPS_TAG")"
+              exit 1
+            else
+              echo "Resolved FRPS image tag from sandbox SSM: $FRPS_TAG"
+              echo "frps_image_tag=$FRPS_TAG" >> "$GITHUB_OUTPUT"
+            fi
+          elif grep -q "ParameterNotFound" "$SSM_ERR"; then
+            # Benign: sandbox rts CI hasn't published yet — placeholder, fail
+            # loud only if deploy_frps=true downstream.
+            echo "::warning::SSM $SSM_FRPS_PARAM not found (sandbox rts CI hasn't published). deploy_frps=true will fail the non-bootstrap precondition — provide frps_image_tag explicitly."
+            echo "frps_image_tag=v0.0.0-bootstrap" >> "$GITHUB_OUTPUT"
+          else
+            # Real error (IAM/creds/throttle/region) — do not mask as placeholder.
+            echo "::error::Failed to read $SSM_FRPS_PARAM (not ParameterNotFound):"
+            cat "$SSM_ERR" >&2
+            exit 1
           fi
 
       - name: Gather sandbox state
@@ -438,6 +516,7 @@ jobs:
           IMAGE_TAG: ${{ inputs.image_tag }}
           EFFECTIVE_TAG: ${{ steps.resolve-rollback.outputs.effective_image_tag }}
           QURL_IMAGE_TAG: ${{ steps.resolve-qurl-tag.outputs.qurl_image_tag }}
+          FRPS_IMAGE_TAG: ${{ steps.resolve-frps-tag.outputs.frps_image_tag }}
           DEPLOY_SERVER: ${{ inputs.deploy_server }}
           DEPLOY_AC: ${{ inputs.deploy_ac }}
           DEPLOY_QURL: ${{ inputs.deploy_qurl }}
@@ -505,6 +584,15 @@ jobs:
               echo "| QURL Service | \`$ECR_QURL_REPO\` | _(not resolved)_ | — | :warning: no tag |"
             else
               echo "| QURL Service | \`$ECR_QURL_REPO\` | \`${QURL_IMAGE_TAG:-N/A}\` | $QURL_PUSHED | :no_entry_sign: skipped |"
+            fi
+            # qurl-reverse-tunnel-server: surfaced so the approver can see whether
+            # the deploy_frps non-bootstrap precondition will pass. This is NOT an
+            # image this workflow deploys — the running tag is owned by rts CI
+            # (promote-production.yml writes the SSM param + instance-refresh).
+            if [[ "$FRPS_IMAGE_TAG" =~ ^v0\.0\.0-bootstrap ]]; then
+              echo "| qurl-reverse-tunnel-server | _(TF precondition only)_ | \`$FRPS_IMAGE_TAG\` | — | :warning: unresolved — plan fails if deploy_frps=true |"
+            else
+              echo "| qurl-reverse-tunnel-server | _(TF precondition only)_ | \`$FRPS_IMAGE_TAG\` | — | rts CI / SSM (not this workflow) |"
             fi
             echo ""
 
@@ -1583,6 +1671,7 @@ jobs:
           TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
           TF_VAR_image_tag: ${{ needs.manifest.outputs.effective_image_tag }}
+          TF_VAR_frps_image_tag: ${{ needs.manifest.outputs.frps_image_tag }}
           TF_VAR_cell_id: ${{ inputs.cell_id }}
         run: |
           terraform plan -no-color -out=tfplan 2>&1 | tee plan-output.txt
@@ -2144,6 +2233,7 @@ jobs:
           TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
           TF_VAR_image_tag: ${{ needs.manifest.outputs.effective_image_tag }}
+          TF_VAR_frps_image_tag: ${{ needs.manifest.outputs.frps_image_tag }}
           TF_VAR_cell_id: ${{ inputs.cell_id }}
         # `-no-color` matches the plan step's flag so apply output stays
         # readable in `gh run view --log` (no embedded ANSI escapes).

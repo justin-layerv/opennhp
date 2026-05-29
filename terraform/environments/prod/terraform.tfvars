@@ -299,12 +299,16 @@ qurl_default_ac_port = 443
 #
 # Fleet shape mirrors the sandbox-soaked config: a plain per-AZ ASG (one
 # instance per AZ via frps_az_suffixes), NOT canary/blue-green/per_az — those
-# stay at their prod defaults (off/null). frps_image_tag is pinned to the
-# immutable sandbox-soaked tag (#155), present in prod ECR via replication;
-# terraform/main.tf's bootstrap-placeholder precondition requires a real tag
-# whenever deploy_frps = true.
+# stay at their prod defaults (off/null).
+#
+# frps_image_tag is intentionally NOT set here. The running image is owned by
+# rts CI (qurl-reverse-tunnel-server's promote-production.yml writes
+# /prod/nhp/reverse-tunnel-server/image-tag + instance-refresh; user_data reads
+# it from SSM at boot). The tfvars var only fed terraform/main.tf's
+# `deploy_frps ⇒ non-bootstrap frps_image_tag` precondition, so we resolve it at
+# deploy time as TF_VAR_frps_image_tag from the sandbox-validated SSM tag in
+# promote-to-prod.yml (mirroring qurl_image_tag) rather than baking a SHA here.
 deploy_frps           = true
-frps_image_tag        = "a7adad429516630c039973bd0d3f2010f8a5835b" # qurl-reverse-tunnel-server #155 (sandbox-soaked, present in prod ECR)
 frps_az_suffixes      = ["a", "b", "c"]
 frps_min_size         = 3
 frps_max_size         = 3
