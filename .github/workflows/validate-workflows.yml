@@ -25,6 +25,8 @@ on:
       - "scripts/check-image-tag-writer-allowlist.sh"
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
+      - "scripts/check-frps-az-suffixes-validation-drift.sh"
+      - "terraform/modules/qurl-reverse-tunnel-server/variables.tf"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
@@ -60,6 +62,8 @@ on:
       - "scripts/check-image-tag-writer-allowlist.sh"
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
+      - "scripts/check-frps-az-suffixes-validation-drift.sh"
+      - "terraform/modules/qurl-reverse-tunnel-server/variables.tf"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
@@ -284,3 +288,6 @@ jobs:
 
       - name: Check asp+ac_id lockstep (TF ↔ Go)
         run: bash scripts/check-asp-and-ac-id-lockstep.sh
+
+      - name: Check frps_az_suffixes validation drift (root ↔ module ↔ env-roots)
+        run: bash scripts/check-frps-az-suffixes-validation-drift.sh

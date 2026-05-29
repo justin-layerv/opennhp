@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # check-frps-az-suffixes-validation-drift.sh
 # ----------------------------------------------------------------------------
-# Fail if the `frps_az_suffixes` validation blocks drift between the three
+# Fail if the `frps_az_suffixes` validation blocks drift between the four
 # declarations of the variable:
 #   - `terraform/variables.tf`                                        (root)
 #   - `terraform/modules/qurl-reverse-tunnel-server/variables.tf`     (module)
 #   - `terraform/environments/sandbox/variables.tf`                   (env-root, added by PR #2035)
+#   - `terraform/environments/prod/variables.tf`                      (env-root, added by the prod FRPS-behind-AC activation PR)
 #
-# Why this exists: the same variable is declared in all three places —
+# Why this exists: the same variable is declared in all four places —
 # once at the module so module-direct consumers (smoke fixtures, isolated
 # tests) get plan-time validation, once at the root so a typo fails plan
 # even when `deploy_frps = false` keeps the module out of the graph, and
-# once at the sandbox env root so a tfvars typo attributes to the env
-# root rather than bubbling up to the parent module. All three
+# once at each env root (sandbox + prod) so a tfvars typo attributes to
+# the env root rather than bubbling up to the parent module. All four
 # `validation { condition = ... ; error_message = ... }` blocks are
 # intentionally duplicated and explicitly documented as "keep in
 # lockstep" — this script is the lint that enforces the lockstep so
@@ -28,7 +29,7 @@
 #     drift would produce two different runtime contracts depending on
 #     which caller instantiated the variable).
 #   - Each `condition` / `error_message` pair from every `validation`
-#     block matches between the two files.
+#     block matches between root and each mirrored copy.
 #
 # What this script handles (cr round 7 hardening):
 #   - **Multi-line `default` and `type` values.** A `default = [` opening
@@ -39,7 +40,7 @@
 #   - **Validation block ordering.** Each `validation { condition;
 #     error_message }` pair is normalised to a single line and the
 #     resulting set is sorted before comparison, so reordering the two
-#     validation blocks in just one of the two files is not flagged as
+#     validation blocks in just one copy is not flagged as
 #     drift (the logic is what matters; ordering is incidental).
 #
 # What this script does NOT enforce (intentional):
@@ -56,9 +57,9 @@
 #
 # Exit codes:
 #   0 — type, default, and the (unordered) set of validation pairs match
-#       between the two declarations.
-#   1 — drift detected (script prints a diff). Either update both files
-#       in lockstep, or update the inline "keep both in lockstep" note
+#       between root and every mirrored copy.
+#   1 — drift detected (script prints a diff). Either update all copies
+#       in lockstep, or update the inline "keep in lockstep" note
 #       to explain why divergence is intentional and update this script
 #       to allow it.
 # ============================================================================
@@ -75,19 +76,19 @@ MODULE_VARS="${REPO_ROOT}/terraform/modules/qurl-reverse-tunnel-server/variables
 # (`connect_layerv_host`, `frps_min_size`/`max_size`/`desired_capacity`);
 # this script covers `frps_az_suffixes` only.
 SANDBOX_ENV_VARS="${REPO_ROOT}/terraform/environments/sandbox/variables.tf"
+# Prod env-root copy (added by the prod FRPS-behind-AC activation PR —
+# closes the same "Value for undeclared variable" gap for prod that
+# #2035 closed for sandbox). Covered here so the prod copy can't
+# silently drift from root after activation. #2037 still tracks
+# extending coverage to the other mirrored variable families.
+PROD_ENV_VARS="${REPO_ROOT}/terraform/environments/prod/variables.tf"
 
-if [ ! -f "$ROOT_VARS" ]; then
-  echo "ERROR: missing $ROOT_VARS" >&2
-  exit 1
-fi
-if [ ! -f "$MODULE_VARS" ]; then
-  echo "ERROR: missing $MODULE_VARS" >&2
-  exit 1
-fi
-if [ ! -f "$SANDBOX_ENV_VARS" ]; then
-  echo "ERROR: missing $SANDBOX_ENV_VARS" >&2
-  exit 1
-fi
+for _f in "$ROOT_VARS" "$MODULE_VARS" "$SANDBOX_ENV_VARS" "$PROD_ENV_VARS"; do
+  if [ ! -f "$_f" ]; then
+    echo "ERROR: missing $_f" >&2
+    exit 1
+  fi
+done
 
 # Extract the load-bearing lines from the `frps_az_suffixes` variable
 # block. The awk script:
@@ -171,56 +172,55 @@ canonicalize() {
   printf '%s\n%s\n' "$header" "$validations"
 }
 
-root_extract=$(extract_validation "$ROOT_VARS")
-module_extract=$(extract_validation "$MODULE_VARS")
-sandbox_env_extract=$(extract_validation "$SANDBOX_ENV_VARS")
+# The root copy is the source of truth; every mirrored copy below must
+# match it. Add a new declaration site (e.g. a future env-root) to this
+# list as one `"<label>|<path>"` entry to bring it under lockstep
+# enforcement — no new compare block needed.
+MIRRORED=(
+  "module|$MODULE_VARS"
+  "sandbox-env-root|$SANDBOX_ENV_VARS"
+  "prod-env-root|$PROD_ENV_VARS"
+)
 
+root_extract=$(extract_validation "$ROOT_VARS")
 if [ -z "$root_extract" ]; then
   echo "ERROR: could not extract frps_az_suffixes validation from $ROOT_VARS" >&2
   exit 1
 fi
-if [ -z "$module_extract" ]; then
-  echo "ERROR: could not extract frps_az_suffixes validation from $MODULE_VARS" >&2
-  exit 1
-fi
-if [ -z "$sandbox_env_extract" ]; then
-  echo "ERROR: could not extract frps_az_suffixes validation from $SANDBOX_ENV_VARS" >&2
-  exit 1
-fi
-
 root_canonical=$(canonicalize "$root_extract")
-module_canonical=$(canonicalize "$module_extract")
-sandbox_env_canonical=$(canonicalize "$sandbox_env_extract")
 
-# The root copy is the source of truth — both the module and the env-root
-# copies must match it. Compare pairwise so a drift in either downstream
-# copy attributes to the specific file that drifted, rather than a
-# three-way fail-with-confusion.
+# Compare each mirrored copy against root. Pairwise so a drift attributes
+# to the specific file that drifted rather than failing with confusion.
 drift_detected=0
+for entry in "${MIRRORED[@]}"; do
+  label="${entry%%|*}"
+  file="${entry#*|}"
 
-if [ "$root_canonical" != "$module_canonical" ]; then
-  echo "ERROR: frps_az_suffixes validation has drifted between the root and module declarations." >&2
-  echo "" >&2
-  echo "  diff (< $ROOT_VARS vs > $MODULE_VARS):" >&2
-  diff <(printf '%s\n' "$root_canonical") <(printf '%s\n' "$module_canonical") >&2 || true
-  echo "" >&2
-  drift_detected=1
-fi
+  extract=$(extract_validation "$file")
+  if [ -z "$extract" ]; then
+    echo "ERROR: could not extract frps_az_suffixes validation from $file" >&2
+    exit 1
+  fi
+  canonical=$(canonicalize "$extract")
 
-if [ "$root_canonical" != "$sandbox_env_canonical" ]; then
-  echo "ERROR: frps_az_suffixes validation has drifted between the root and sandbox-env-root declarations." >&2
-  echo "" >&2
-  echo "  diff (< $ROOT_VARS vs > $SANDBOX_ENV_VARS):" >&2
-  diff <(printf '%s\n' "$root_canonical") <(printf '%s\n' "$sandbox_env_canonical") >&2 || true
-  echo "" >&2
-  drift_detected=1
-fi
+  if [ "$root_canonical" != "$canonical" ]; then
+    echo "ERROR: frps_az_suffixes validation has drifted between the root and $label declarations." >&2
+    echo "" >&2
+    echo "  diff (< $ROOT_VARS vs > $file):" >&2
+    diff <(printf '%s\n' "$root_canonical") <(printf '%s\n' "$canonical") >&2 || true
+    echo "" >&2
+    drift_detected=1
+  fi
+done
 
 if [ "$drift_detected" -ne 0 ]; then
-  echo "  Update all three files in lockstep, or change the inline 'keep" >&2
+  echo "  Update all copies in lockstep, or change the inline 'keep" >&2
   echo "  in lockstep' notes to explain the intentional divergence and" >&2
   echo "  update this script to allow it." >&2
   exit 1
 fi
 
-echo "frps_az_suffixes validation: root, module, and sandbox-env-root declarations are in sync."
+# Derive the label list from MIRRORED so adding a future env-root stays a
+# one-line array edit (no other lines to update).
+labels=$(printf '%s, ' "${MIRRORED[@]%%|*}")
+echo "frps_az_suffixes validation: root + ${#MIRRORED[@]} mirrored declarations (${labels%, }) are in sync."

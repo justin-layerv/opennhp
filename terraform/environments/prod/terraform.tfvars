@@ -284,30 +284,58 @@ qurl_geoip_s3_kms_key_arn = "arn:aws:kms:us-east-2:235500187906:key/1a8cbf38-72e
 qurl_default_ac_id   = "layerv-ac-tf"
 qurl_default_ac_port = 443
 
-# FRPS-behind-AC customer-facing DNS — INTENTIONALLY EMPTY in prod.
+# ==============================================================================
+# FRPS-behind-AC / reverse-tunnel activation (prod)
+# ==============================================================================
+# Activates the qurl-reverse-tunnel-server data path in prod, mirroring the
+# sandbox topology that has soaked green (the layerv-nhp-sandbox-frps ASG runs
+# 3/3 healthy and connect.layerv.xyz resolves per-AZ). The three documented
+# flip-to-prod prereqs are met:
+#   1. Sandbox burn-in green — frps ASG healthy, connect.layerv.xyz live.
+#   2. qurl-reverse-tunnel-server #98 merged + sandbox in tunnel-auth mode.
+#   3. cross-account Route53 (aws.route53_mgmt) + the connect_cross_account
+#      record are in main, and prod cross_account_route53_role_arn is set —
+#      so connect.layerv.ai publishes into the layerv-mgmt layerv.ai zone.
 #
-# Prod opts out of the FRPS-behind-AC topology in this PR. The variable
-# + module wiring is in place, but `connect_layerv_host = ""` short-
-# circuits every count-gated piece of plumbing
-# (`aws_route53_record.connect{,_cross_account}` in `terraform/main.tf`,
-# AC NLB target group / listener / ASG attachment in
-# `terraform/modules/ac/main.tf`, the `entryPoints.frps-control`
-# + `frps-control.toml` blocks in `terraform/modules/ac/user_data.sh.tpl`)
-# to `count = 0`, making prod a true no-op for this PR.
+# Fleet shape mirrors the sandbox-soaked config: a plain per-AZ ASG (one
+# instance per AZ via frps_az_suffixes), NOT canary/blue-green/per_az — those
+# stay at their prod defaults (off/null). frps_image_tag is pinned to the
+# immutable sandbox-soaked tag (#155), present in prod ECR via replication;
+# terraform/main.tf's bootstrap-placeholder precondition requires a real tag
+# whenever deploy_frps = true.
+deploy_frps           = true
+frps_image_tag        = "a7adad429516630c039973bd0d3f2010f8a5835b" # qurl-reverse-tunnel-server #155 (sandbox-soaked, present in prod ECR)
+frps_az_suffixes      = ["a", "b", "c"]
+frps_min_size         = 3
+frps_max_size         = 3
+frps_desired_capacity = 3
+
+# qurl-service tunnel auth + active-registration reads. This is a consistent
+# set enforced at plan time by terraform_data.qurl_tunnel_active_registration_preconditions:
+# qurl_tunnel_active_registrations_enabled requires qurl_tunnel_auth_enabled +
+# deploy_frps + qurl_router_enabled + enable_instance_hrw + MULTIVALUE — all
+# satisfied here (qurl_router_enabled/enable_qurl_site_authz already true above).
+qurl_tunnel_auth_enabled                            = true
+qurl_tunnel_active_registrations_enabled            = true
+enable_instance_hrw                                 = true
+qurl_reverse_tunnel_server_cloud_map_routing_policy = "MULTIVALUE"
+
+# Knock-token-as-identity auth on qurl-reverse-tunnel-server (sandbox parity).
+qurl_reverse_tunnel_server_tunnel_auth_mode = "tunnel-auth"
+
+# Customer-facing FRPS control-channel DNS. A non-empty value un-gates the AC
+# NLB:7000 listener/TG/ASG-attachment + Traefik frps-control entrypoint and
+# publishes connect.layerv.ai → AC NLB via connect_cross_account (cross-account
+# into the layerv-mgmt layerv.ai zone). This is the customer-traffic gate.
 #
-# Flip-to-prod sequencing (separate follow-up PR; matches the
-# `bootstrap-alb` rollout pattern of sandbox #1975 → prod #2001):
-#   1. Sandbox burn-in is green (post-apply `nc -zv connect.layerv.xyz
-#      7000` regression fence passes pre- and post-knock).
-#   2. qurl-reverse-tunnel-server #98 is merged AND deployed to
-#      sandbox FRPS with `LAYERV_REQUIRE_KNOCK=true`.
-#   3. nhp #2002 (cross-account Route53 provider alias) lands so
-#      `aws_route53_record.connect_cross_account` can write to the
-#      `layerv-mgmt` zone — same scope as `bootstrap.layerv.ai`
-#      per `SLACK_QURL_ROLLOUT.md` §5b.
-#
-# Until all three land, prod stays empty.
-connect_layerv_host = ""
+# Pre-merge gate: eyeball the CI prod plan for exactly (1) connect_cross_account
+# A-record Create into the mgmt zone, the AC NLB:7000 listener + TG + ASG
+# attachment Creates, and NO `aws_autoscaling_group.frps` *replace* (the
+# static-name + create_before_destroy invariant in terraform/CLAUDE.md).
+# Post-apply on-call checks: `nc -zv connect.layerv.ai 7000` from outside the
+# VPC; `layerv-nhp-prod-frps` ASG 3/3 healthy; registration heartbeats reaching
+# qurl-service (see docs/runbooks/qurl-internal-v1-triage.md if dials fail).
+connect_layerv_host = "connect.layerv.ai"
 
 # QURL plugin configuration (NHP Server)
 # Enables qurl.link → qurl.site authentication flow in NHP Server
@@ -398,34 +426,9 @@ deploy_redis = true
 deploy_cost_analytics                 = false
 cross_account_cost_analytics_role_arn = "arn:aws:iam::165115313779:role/nhp-cost-analytics-access"
 
-# ==============================================================================
-# qurl-reverse-tunnel-server (per-AZ tunnel routing)
-# ==============================================================================
-# Multi-AZ ASG sizing for the per-AZ qurl-reverse-tunnel-server fleet (#1499).
-# qurl-service hashes OwnerID to one of frps_az_suffixes and emits the matching
-# DNS name as `frps_addr` in API responses, so frpc and qurl-router converge on
-# the same instance. The ASG runs at desired = 3 (one instance per AZ); each
-# instance reads its AZ from IMDS at boot and registers with the matching
-# Cloud Map service. Module defaults remain 1/1/1 so the module can still
-# be consumed in isolation; the override here is what flips on multi-AZ.
-#
-# Note: this PR ships the Terraform side; `deploy_frps = true` is left
-# unchanged (still false / default) and will flip in a coordinated
-# follow-up after the qurl-service and frpc PRs land. Setting these size
-# vars now is harmless — they only take effect when deploy_frps is true.
-#
-# `frps_az_suffixes` is intentionally NOT pinned here yet: the env
-# `module "nhp"` block in `main.tf` doesn't forward `frps_az_suffixes`
-# (or any of the legacy `frps_*` triple), so an env-level pin would be
-# silently a no-op until PR 4 re-threads the legacy passthrough. The
-# module default in `terraform/variables.tf` (`["a", "b", "c"]`) is the
-# single load-bearing source of truth for now; PR 4 will add the env
-# pin alongside the value flip so the OwnerID-hash ↔
-# frps-${suffix}.${namespace} mapping stays stable when the legacy
-# passthrough is re-wired.
-frps_min_size         = 3
-frps_max_size         = 3
-frps_desired_capacity = 3
+# (qurl-reverse-tunnel-server per-AZ sizing + frps_az_suffixes now live in the
+#  "FRPS-behind-AC / reverse-tunnel activation" block above, alongside the
+#  deploy_frps flip — the env-root passthroughs this PR adds make them effective.)
 
 # Athena config for Grafana cost dashboard — points to sandbox-deployed resources in mgmt account.
 # These values come from sandbox's cost_analytics module outputs (terraform/modules/cost-analytics/outputs.tf).

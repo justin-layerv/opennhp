@@ -154,21 +154,26 @@ module "nhp" {
   instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
   enable_qurl_site_authz         = var.enable_qurl_site_authz
 
-  # qurl-reverse-tunnel-server. #1745 wired only the NEW
-  # variables introduced by that PR (per-AZ sizing, blue/green, canary,
-  # MULTIVALUE flip). Existing tfvars values for `deploy_frps`,
-  # `frps_image_tag`, `frps_az_suffixes`, and the legacy sizing triple
-  # are currently being silently discarded in prod too — `terraform.tfvars`
-  # sets `frps_min_size`/`max_size`/`desired_capacity = 3` but
-  # `prod/variables.tf` declares none of them, so plan emits the same
-  # "Value for undeclared variable" warnings sandbox had pre-#2035. Today
-  # the latent state is benign because `connect_layerv_host = ""` keeps
-  # `deploy_frps` count-gated off in prod, but the gap pre-dates the
-  # eventual value flip and is the same bug-class #2035 fixed for sandbox.
-  # The sandbox env-root close-out landed in #2035 (see that PR's diff
-  # for the variable-list and module-passthrough template); mirror that
-  # wiring here when prod flips `deploy_frps = true` and sets a non-empty
-  # `connect_layerv_host`.
+  # qurl-reverse-tunnel-server (FRPS-behind-AC) — prod env-root close-out.
+  # Mirrors the sandbox wiring (#2035): #1745 had threaded only the NEW
+  # per-AZ/blue-green/canary/MULTIVALUE vars, leaving `deploy_frps`,
+  # `connect_layerv_host`, `qurl_tunnel_auth_enabled`, `frps_image_tag`,
+  # the frps ports/suffixes, and the legacy sizing triple undeclared at
+  # the prod env-root — so prod tfvars values silently no-op'd as "Value
+  # for undeclared variable" warnings (the bug-class #2035 fixed for
+  # sandbox). Declaring + threading them here is what makes the prod
+  # `deploy_frps = true` / `connect_layerv_host` flip take effect.
+  qurl_tunnel_auth_enabled = var.qurl_tunnel_auth_enabled
+  deploy_frps              = var.deploy_frps
+  connect_layerv_host      = var.connect_layerv_host
+  frps_image_tag           = var.frps_image_tag
+  frps_bind_port           = var.frps_bind_port
+  frps_vhost_http_port     = var.frps_vhost_http_port
+  frps_az_suffixes         = var.frps_az_suffixes
+  frps_min_size            = var.frps_min_size
+  frps_max_size            = var.frps_max_size
+  frps_desired_capacity    = var.frps_desired_capacity
+
   qurl_reverse_tunnel_server_min_size_per_az               = var.qurl_reverse_tunnel_server_min_size_per_az
   qurl_reverse_tunnel_server_max_size_per_az               = var.qurl_reverse_tunnel_server_max_size_per_az
   qurl_reverse_tunnel_server_desired_capacity_per_az       = var.qurl_reverse_tunnel_server_desired_capacity_per_az

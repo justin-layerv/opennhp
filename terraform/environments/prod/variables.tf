@@ -546,7 +546,7 @@ variable "enable_qurl_site_authz" {
 }
 
 variable "qurl_tunnel_active_registrations_enabled" {
-  description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps prod on the legacy per-AZ upstream_addr path until sandbox burn-in completes."
+  description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while reporter and AC discovery rollout are verified."
   type        = bool
   default     = false
 }
@@ -1521,4 +1521,143 @@ variable "qurl_fileviewer_eip" {
   description = "IPv4 EIP attached to the fileviewer EC2 instance."
   type        = string
   default     = null
+}
+
+# =============================================================================
+# FRPS-behind-AC / reverse-tunnel activation — prod env-root declarations.
+# Mirrored verbatim from terraform/environments/sandbox/variables.tf (#2035)
+# so prod tfvars flips reach module.nhp instead of no-op'ing as undeclared
+# variables. Keep byte-identical with the sandbox copies.
+#
+# Drift coverage: the `frps_az_suffixes` validation block is enforced in
+# lockstep across root/module/sandbox/prod by
+# `scripts/check-frps-az-suffixes-validation-drift.sh`. The other mirrored
+# validations here (`connect_layerv_host`, `frps_min/max/desired`) are kept
+# in sync by convention only — #2037 tracks extending the lint to cover them.
+# =============================================================================
+variable "deploy_frps" {
+  description = "Deploy the QURL FRP tunnel server for proxying traffic to customer backends. Requires `deploy_ac = true`, `deploy_qurl_service = true`, `qurl_internal_service_token_arn` set, and `qurl_service_domain` set — all four are enforced by `terraform_data.frps_preconditions` at plan time so that FRPS never boots with tunnel auth disabled."
+  type        = bool
+  default     = false
+}
+
+variable "connect_layerv_host" {
+  description = "Customer-facing public DNS name that fronts the FRPS control channel (sandbox: `connect.layerv.xyz`, prod: `connect.layerv.ai`). Written into the DDB seed row's `resource_fqdn` field; the bridge materializes that as `ResourceInfo.Hostname` so the agent dials this name instead of the internal Cloud Map host; NLB:frps_bind_port → AC kernel → ipset-gated → Traefik TCP entrypoint → internal `frps-{az}`. Bare DNS name only (no scheme, port, slashes, whitespace, or userinfo); empty value opts out of the FRPS-behind-AC topology and is only valid for envs without `deploy_frps = true`. Validation duplicated from terraform/variables.tf so a malformed value attributes to the env root rather than the parent module; see the parent for the full migration narrative (why the `.internal` and `frps-` shape fences exist transitionally)."
+  type        = string
+  default     = ""
+
+  # Validations duplicated from terraform/variables.tf — the root copy
+  # fences malformed values regardless of `deploy_frps`; this env copy
+  # gives earlier/clearer attribution when a tfvars-driven typo hits
+  # the env root first (parent validation still fires too).
+  #
+  # RFC 1035 per-label form is the load-bearing fence (quote-injection
+  # exclusion); the `.internal` and `frps-` checks are transitional
+  # input-shape fences against the current customer-facing role of this
+  # variable. Keep wording identical to the parent so error messages
+  # don't drift across layers.
+  # TODO(nhp #2019 — "AC out of the FRPS data path"): both the
+  # `!endswith(".internal")` and `!startswith("frps-")` validations
+  # below are TRANSITIONAL — mirror of the parent's TODO marker at
+  # terraform/variables.tf:2076. When the AC exits the FRPS data plane
+  # and Hostname legitimately points at FRPS directly, the `.internal`
+  # and `frps-` shape fences become wrong for the end-state. Rip them
+  # out HERE in the same PR that rips the parent's copy. Grep for
+  # `TODO(nhp #2019` to find every site that needs the lockstep
+  # removal.
+  validation {
+    condition     = var.connect_layerv_host == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", var.connect_layerv_host))
+    error_message = "connect_layerv_host must be a bare lowercase DNS name in per-label RFC 1035 form (each label 1-63 chars, alphanumeric with hyphens but not leading/trailing, multiple labels dot-separated; no scheme, port, slashes, whitespace, or userinfo), or empty to opt out of FRPS-behind-AC. Today's values `connect.layerv.{ai,xyz}` conform."
+  }
+
+  validation {
+    condition     = var.connect_layerv_host == "" || !endswith(var.connect_layerv_host, ".internal")
+    error_message = "connect_layerv_host must NOT end in `.internal` — the FRPS-behind-AC redesign (SLACK_QURL_ROLLOUT.md §6) intentionally splits the customer-facing dial target from the internal FRPS Cloud Map host. Use the public AC ingress name (e.g. `connect.layerv.{ai,xyz}`); the AC Traefik TCP entrypoint forwards to the internal `frps-{az}` host via `var.frp_control_upstream_host` separately."
+  }
+
+  validation {
+    condition     = var.connect_layerv_host == "" || !startswith(var.connect_layerv_host, "frps-")
+    error_message = "connect_layerv_host must NOT start with `frps-` — looks like an FRPS Cloud Map name. Use the customer-facing AC ingress name (e.g. `connect.layerv.{ai,xyz}`), distinct from the FRPS host the AC Traefik TCP entrypoint forwards to internally. See SLACK_QURL_ROLLOUT.md §6 (FRPS-behind-AC redesign)."
+  }
+}
+
+variable "frps_image_tag" {
+  description = "qurl-reverse-tunnel-server binary version tag. Separate from NHP image_tag since frps has its own release cadence. Defaults to a placeholder tag that CI must overwrite on first deploy — a Terraform-only operator can't accidentally install a moving `latest` that slipped between applies."
+  type        = string
+  default     = "v0.0.0-bootstrap"
+}
+
+variable "frps_bind_port" {
+  description = "FRP server control port. Shared between qurl-reverse-tunnel-server module (bind port) and AC module (Traefik route target) so they can't drift."
+  type        = number
+  default     = 7000
+}
+
+variable "frps_vhost_http_port" {
+  description = "FRP vhost HTTP port. Shared between qurl-reverse-tunnel-server module (bind port) and AC module (qurl-router plugin target) so they can't drift."
+  type        = number
+  default     = 8080
+}
+
+variable "frps_az_suffixes" {
+  description = "AZ suffix letters that qurl-reverse-tunnel-server creates per-AZ Cloud Map services for, and that qurl-service hashes OwnerID into. Default `[\"a\", \"b\", \"c\"]` matches us-east-{1,2}{a,b,c}. Each entry must be a single lowercase letter."
+  type        = list(string)
+  default     = ["a", "b", "c"]
+
+  # Validation duplicated from terraform/variables.tf — the root copy
+  # fences a typo at plan time even when `deploy_frps = false` keeps the
+  # module out of the graph. Terraform validates root inputs before
+  # propagating them to children, so both copies fire; this env copy
+  # gives earlier/clearer attribution (env root rather than parent
+  # module) when tfvars-driven inputs are malformed. Lockstep with the
+  # root + module copies is enforced by
+  # `scripts/check-frps-az-suffixes-validation-drift.sh`.
+  validation {
+    condition     = length(var.frps_az_suffixes) > 0 && alltrue([for s in var.frps_az_suffixes : can(regex("^[a-z]$", s))])
+    error_message = "frps_az_suffixes must be a non-empty list of single lowercase letters (e.g., [\"a\", \"b\", \"c\"]) — each entry is the trailing letter of an AWS AZ name."
+  }
+
+  validation {
+    condition     = length(toset(var.frps_az_suffixes)) == length(var.frps_az_suffixes)
+    error_message = "frps_az_suffixes must not contain duplicates (each suffix maps to a distinct Cloud Map service)."
+  }
+}
+
+variable "frps_min_size" {
+  description = "ASG minimum size for qurl-reverse-tunnel-server. Default 1; production envs set this to length(frps_az_suffixes) for one-instance-per-AZ via the per-AZ Cloud Map fanout."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.frps_min_size >= 1 && floor(var.frps_min_size) == var.frps_min_size
+    error_message = "frps_min_size must be an integer >= 1 — qurl-reverse-tunnel-server is the only path for tunnel traffic; N=0 means tunnel resources 502."
+  }
+}
+
+variable "frps_max_size" {
+  description = "ASG maximum size for qurl-reverse-tunnel-server. Default 1; production envs match min_size and length(frps_az_suffixes)."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.frps_max_size >= 1 && floor(var.frps_max_size) == var.frps_max_size
+    error_message = "frps_max_size must be an integer >= 1 — see frps_min_size."
+  }
+}
+
+variable "frps_desired_capacity" {
+  description = "ASG desired capacity for qurl-reverse-tunnel-server. Default 1; production envs set this to length(frps_az_suffixes) for one-instance-per-AZ steady state."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.frps_desired_capacity >= 1 && floor(var.frps_desired_capacity) == var.frps_desired_capacity
+    error_message = "frps_desired_capacity must be an integer >= 1 — see frps_min_size."
+  }
+}
+
+variable "qurl_tunnel_auth_enabled" {
+  description = "Enable qurl-service tunnel-auth endpoint and type=tunnel branches in CreateQurl/CreateResource (qurl-service PR #277 feature gate). Default false keeps the new code paths inert in production until the creation endpoint (qurl-service #405) and per-AZ FRPS assignment (qurl-service #396) are both deployed. Flip per-env via tfvars after the dependent qurl-service work ships and the qurl-service deploy is verified."
+  type        = bool
+  default     = false
 }
