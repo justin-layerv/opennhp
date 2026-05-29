@@ -6,8 +6,9 @@ require (
 	github.com/OpenNHP/opennhp/nhp v0.6.0
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/config v1.32.16
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.15
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.39
-	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.56.2
+	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.57.0
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.3
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.39.28
 	github.com/aws/smithy-go v1.25.1
@@ -37,12 +38,12 @@ require (
 	golang.org/x/mobile v0.0.0-20260312152759-81488f6aeb60
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.20.0
+	golang.org/x/sys v0.43.0
 )
 
 require (
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
-	github.com/aws/aws-sdk-go-v2/credentials v1.19.15 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.22 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 // indirect
@@ -199,7 +200,6 @@ require (
 	golang.org/x/arch v0.25.0 // indirect
 	golang.org/x/mod v0.34.0 // indirect
 	golang.org/x/net v0.53.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/term v0.42.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
