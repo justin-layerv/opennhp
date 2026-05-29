@@ -341,6 +341,61 @@ qurl_reverse_tunnel_server_tunnel_auth_mode = "tunnel-auth"
 # qurl-service (see docs/runbooks/qurl-internal-v1-triage.md if dials fail).
 connect_layerv_host = "connect.layerv.ai"
 
+# ==============================================================================
+# Agent-bootstrap knock flow + bootstrap-alb (prod)
+# ==============================================================================
+# Enables the qurl-service agent-bootstrap chain and the bootstrap-alb ingress
+# that fronts bootstrap.layerv.ai. Consistent set enforced at plan time:
+# enable_qurl_agent_bootstrap requires deploy_qurl_bootstrap_chain, which
+# requires deploy_qurl_service (true above).
+#
+# bootstrap-alb runs the module's cross-account Path 1 (parent zone layerv.ai
+# in layerv-mgmt) — operator runbook: terraform/modules/bootstrap-alb/README.md
+# "Step 0 — cross-account cert + DNS". The ACM cert was operator-pre-provisioned
+# (Step 0) and is attached via bootstrap_alb_existing_certificate_arn with
+# provision_certificate=false + manage_dns_alias=false (the plan-time XOR cert
+# gate accepts exactly this combination).
+#
+# REQUIRED POST-APPLY MANUAL STEP (Path 1, manage_dns_alias=false): write the
+# bootstrap.layerv.ai A-alias → bootstrap-alb DNS name into the layerv-mgmt
+# layerv.ai zone AFTER this apply (the alias targets the ALB DNS that only
+# exists post-apply), and verify with `dig +short bootstrap.layerv.ai`
+# returning the ALB DNS BEFORE the qurl-service rollout starts taking traffic.
+# Until the alias resolves, bootstrap.layerv.ai is NXDOMAIN and ALL customer
+# agent-bootstrap traffic is blocked. A clean re-apply re-requires both Step 0
+# (cert) and this A-alias — they are operator-owned, not in TF.
+deploy_qurl_bootstrap_chain = true
+enable_qurl_agent_bootstrap = true
+
+deploy_bootstrap_alb                       = true
+bootstrap_alb_dns_name                     = "bootstrap.layerv.ai"
+bootstrap_alb_provision_certificate        = false                                                                                 # Path 1: cert pre-provisioned cross-account
+bootstrap_alb_manage_dns_alias             = false                                                                                 # Path 1: A-alias written out-of-band post-apply
+bootstrap_alb_existing_certificate_arn     = "arn:aws:acm:us-east-2:235500187906:certificate/baf58cbf-b14d-454e-a13a-988a81594eb3" # bootstrap.layerv.ai, ISSUED (Step 0)
+bootstrap_alb_elb_5xx_threshold_per_minute = 1
+
+# WAF go-live watch period (count-only). Unlike sandbox's dark launch, this PR
+# flips enable_qurl_agent_bootstrap=true simultaneously, so real customer agents
+# can hit bootstrap.layerv.ai on day 1. Per var.bootstrap_alb_waf_count_only_rule_groups's
+# guidance, bring both managed groups up count-only for the first 2–4 weeks —
+# AnonymousIpList false-positives on customer VPN egress; CommonRuleSet (CRS)
+# body-inspection false-positives on PEM-wrapped public keys. Flip to enforce
+# after the watch period — tracked in #2238 (also covers populating
+# bootstrap_alb_cross_account_subscriber_arns post-activation).
+bootstrap_alb_waf_count_only_rule_groups = ["AWSManagedRulesAnonymousIpList", "AWSManagedRulesCommonRuleSet"]
+
+# Interim alarm routing for go-live. Unlike sandbox's dark launch (where the
+# bootstrap-alb alarms had nowhere to go ON PURPOSE), this PR activates real
+# traffic with elb_5xx_threshold_per_minute=1 — so a 5xx alarm must reach a
+# human on day 1 rather than publishing to a subscriber-less SNS topic. Until
+# the durable alerts-infra cross-account ARN is wired
+# (bootstrap_alb_cross_account_subscriber_arns, tracked in #2238), subscribe
+# the same on-call addresses prod already uses (alert_emails above).
+# NOTE: SNS email subscriptions are PENDING until each recipient clicks the
+# confirmation link — these must be confirmed before the apply window or the
+# alarm still goes unheard. Remove once #2238 wires the cross-account path.
+bootstrap_alb_alarm_email_subscriptions = ["justin@layerv.ai", "benc@layerv.ai", "joe@layerv.ai"]
+
 # QURL plugin configuration (NHP Server)
 # Enables qurl.link → qurl.site authentication flow in NHP Server
 # api_url points at the internal-ALB hostname (workload-account PHZ

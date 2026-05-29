@@ -97,6 +97,8 @@ module "nhp" {
   # QURL Service
   deploy_qurl_service                      = var.deploy_qurl_service
   qurl_tunnel_active_registrations_enabled = var.qurl_tunnel_active_registrations_enabled
+  deploy_qurl_bootstrap_chain              = var.deploy_qurl_bootstrap_chain
+  enable_qurl_agent_bootstrap              = var.enable_qurl_agent_bootstrap
   qurl_service_domain                      = var.qurl_service_domain
   qurl_hosted_zone_id                      = var.qurl_hosted_zone_id
   qurl_jwt_secret_arn                      = var.qurl_jwt_secret_arn
@@ -182,6 +184,22 @@ module "nhp" {
   qurl_reverse_tunnel_server_green_standby_capacity_per_az = var.qurl_reverse_tunnel_server_green_standby_capacity_per_az
   enable_qurl_reverse_tunnel_server_canary                 = var.enable_qurl_reverse_tunnel_server_canary
   qurl_reverse_tunnel_server_tunnel_auth_mode              = var.qurl_reverse_tunnel_server_tunnel_auth_mode
+
+  # bootstrap-alb (agent-bootstrap knock-flow ingress) — prod env-root
+  # close-out, mirror of sandbox #2054. Declared + threaded so prod tfvars
+  # flips reach module.nhp. Prod runs the module's cross-account Path 1
+  # (operator pre-provisioned cert via bootstrap_alb_existing_certificate_arn,
+  # provision_certificate=false, manage_dns_alias=false).
+  deploy_bootstrap_alb                        = var.deploy_bootstrap_alb
+  bootstrap_alb_dns_name                      = var.bootstrap_alb_dns_name
+  bootstrap_alb_route53_zone_id               = var.bootstrap_alb_route53_zone_id
+  bootstrap_alb_manage_dns_alias              = var.bootstrap_alb_manage_dns_alias
+  bootstrap_alb_provision_certificate         = var.bootstrap_alb_provision_certificate
+  bootstrap_alb_existing_certificate_arn      = var.bootstrap_alb_existing_certificate_arn
+  bootstrap_alb_waf_count_only_rule_groups    = var.bootstrap_alb_waf_count_only_rule_groups
+  bootstrap_alb_cross_account_subscriber_arns = var.bootstrap_alb_cross_account_subscriber_arns
+  bootstrap_alb_alarm_email_subscriptions     = var.bootstrap_alb_alarm_email_subscriptions
+  bootstrap_alb_elb_5xx_threshold_per_minute  = var.bootstrap_alb_elb_5xx_threshold_per_minute
 
   # QURL Idempotency Cache
   qurl_idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds

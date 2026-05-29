@@ -1661,3 +1661,112 @@ variable "qurl_tunnel_auth_enabled" {
   type        = bool
   default     = false
 }
+
+# =============================================================================
+# bootstrap-alb / agent-bootstrap activation — prod env-root declarations.
+# The variable blocks below are mirrored verbatim from
+# terraform/environments/sandbox/variables.tf (#2054) so prod tfvars flips
+# reach module.nhp instead of no-op'ing as undeclared variables. Keep each
+# block byte-identical with its sandbox copy (file-level grouping/ordering may
+# differ — prod co-locates the bootstrap-chain + bootstrap-alb vars).
+# =============================================================================
+variable "deploy_qurl_bootstrap_chain" {
+  description = "Inject the four bootstrap-chain env vars (NHP_SERVER_PUBLIC_KEY_B64, NHP_SERVER_HOST, NHP_SERVER_PORT, QURL_AGENT_BOOTSTRAP_ENABLED) on the qurl-service ECS task def. Default false; flip to true to land the chain. The agent-enabled flag itself is gated separately via `enable_qurl_agent_bootstrap` so activation is a focused one-line tfvars flip per environment."
+  type        = bool
+  default     = false
+}
+
+variable "enable_qurl_agent_bootstrap" {
+  description = "Wave 5 activation flag for the qurl-service agent → nhp-server bootstrap chain. Drives the QURL_AGENT_BOOTSTRAP_ENABLED env var on the task def. Default false: the chain stays inert until this is flipped to true per environment. Only consulted when deploy_qurl_bootstrap_chain = true."
+  type        = bool
+  default     = false
+}
+
+variable "deploy_bootstrap_alb" {
+  description = "Deploy the bootstrap-alb stack (bootstrap.layerv.{xyz,ai}). Default off; flip per-env once the cert is wired (Path 1 / prod: operator pre-provisions cross-account; Path 2 / sandbox: module provisions same-account — see modules/bootstrap-alb/README.md) and qurl-service ECS is ready to register against the new target group."
+  type        = bool
+  default     = false
+}
+
+variable "bootstrap_alb_dns_name" {
+  description = "Public DNS name for the bootstrap ALB. Sandbox: `bootstrap.layerv.xyz`. Prod: `bootstrap.layerv.ai`. Only read when `deploy_bootstrap_alb = true`."
+  type        = string
+  default     = ""
+
+  # Mirrored from parent for root-pointed error attribution; keep in lockstep with terraform/variables.tf.
+  validation {
+    condition     = var.bootstrap_alb_dns_name == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.bootstrap_alb_dns_name))
+    error_message = "bootstrap_alb_dns_name must be empty (when `deploy_bootstrap_alb=false`) or a valid lowercase FQDN like `bootstrap.layerv.xyz`."
+  }
+}
+
+variable "bootstrap_alb_route53_zone_id" {
+  description = "Hosted zone ID for the parent of `bootstrap_alb_dns_name`. Required when `bootstrap_alb_provision_certificate` or `bootstrap_alb_manage_dns_alias` is true. Empty when both are false (operator-managed out-of-band — typical when the parent zone is cross-account, but also valid for any same-account env that chooses to operator-manage cert + alias)."
+  type        = string
+  default     = ""
+
+  # Mirrored from parent for root-pointed error attribution; keep in lockstep with terraform/variables.tf.
+  validation {
+    condition     = var.bootstrap_alb_route53_zone_id == "" || can(regex("^Z[A-Z0-9]{8,}$", var.bootstrap_alb_route53_zone_id))
+    error_message = "bootstrap_alb_route53_zone_id must be empty or a valid Route53 zone ID (uppercase, starts with Z)."
+  }
+}
+
+variable "bootstrap_alb_manage_dns_alias" {
+  description = "Whether the bootstrap-alb stack writes the A-alias from `bootstrap_alb_dns_name` to the ALB. True when the parent zone is in the same account as the ALB; false when cross-account (alias is operator-managed in the zone's account). Sandbox: true (`layerv.xyz` zone in 767397897469, same account). Prod: false (`layerv.ai` zone in `layerv-mgmt`)."
+  type        = bool
+  default     = false
+}
+
+variable "bootstrap_alb_provision_certificate" {
+  description = "Whether the bootstrap-alb stack provisions+validates an ACM cert. True only when the parent zone is in the same account as the ALB (DNS validation needs to write CNAMEs there). Sandbox: true (same-account `layerv.xyz`). Prod: false (cross-account `layerv.ai`; operator pre-provisions the cert and supplies the ARN via `bootstrap_alb_existing_certificate_arn`)."
+  type        = bool
+  default     = false
+}
+
+variable "bootstrap_alb_existing_certificate_arn" {
+  description = "ACM cert ARN to attach when `bootstrap_alb_provision_certificate=false`. Empty during the first-apply bootstrap window; populated after the operator pre-provisions the cert in this account."
+  type        = string
+  default     = ""
+
+  # Mirrored from parent for root-pointed error attribution; keep in lockstep with terraform/variables.tf.
+  validation {
+    condition     = var.bootstrap_alb_existing_certificate_arn == "" || can(regex("^arn:(aws|aws-us-gov|aws-cn|aws-iso|aws-iso-b|aws-iso-c|aws-iso-e|aws-iso-f):acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$", var.bootstrap_alb_existing_certificate_arn))
+    error_message = "bootstrap_alb_existing_certificate_arn must be empty or a valid ACM ARN: `arn:<partition>:acm:<region>:<12-digit-account>:certificate/<canonical 8-4-4-4-12 UUID>`."
+  }
+}
+
+variable "bootstrap_alb_waf_count_only_rule_groups" {
+  description = "Managed rule-group names from the bootstrap-alb WAF to override to `count` action (vs the default `none` action which honors the group's own block/count actions). Use to bring a new managed group up in count-only mode for a watch period before flipping to enforce. Recommended sandbox-rollout posture is count-only for BOTH `AWSManagedRulesAnonymousIpList` (customer VPN egress class) AND `AWSManagedRulesCommonRuleSet` (CRS body inspection false-positives on PEM-wrapped public keys) for the first 2–4 weeks of sandbox bootstrap traffic."
+  type        = list(string)
+  default     = []
+
+  # Mirrored from parent for root-pointed error attribution; keep in lockstep with terraform/variables.tf.
+  validation {
+    condition = alltrue([for n in var.bootstrap_alb_waf_count_only_rule_groups : contains([
+      "AWSManagedRulesAmazonIpReputationList",
+      "AWSManagedRulesAnonymousIpList",
+      "AWSManagedRulesCommonRuleSet",
+      "AWSManagedRulesBotControlRuleSet",
+    ], n)])
+    error_message = "Each entry must be one of the managed rule groups the bootstrap-alb module enables: AWSManagedRulesAmazonIpReputationList, AWSManagedRulesAnonymousIpList, AWSManagedRulesCommonRuleSet, AWSManagedRulesBotControlRuleSet."
+  }
+}
+
+variable "bootstrap_alb_cross_account_subscriber_arns" {
+  description = "Cross-account IAM principals that may subscribe to the bootstrap-alb alerts SNS topic. Today's pattern is alerts-infra (the org-wide AWS Chatbot home) subscribing from a separate AWS account. **CRITICAL ROLLOUT SEQUENCING**: leave this empty (the default) in the sandbox-flip PR that first sets `deploy_bootstrap_alb=true` (Merge plan step 3 in PR #1886). Between that flip and the paired data-plane PR (step 4), the ALB returns 503 on every probe of `/v1/agent/bootstrap` — populating the cross-account subscriber list here would page alerts-infra during the entire dark-launch window. Populate with the alerts-infra role ARN in a SEPARATE follow-up after step 4 lands and qurl-service is healthy. Empty list skips the cross-account policy entirely (alarms still publish to the topic; just no downstream routing)."
+  type        = list(string)
+  default     = []
+}
+
+variable "bootstrap_alb_alarm_email_subscriptions" {
+  description = "Optional email addresses to subscribe to the bootstrap-alb alerts SNS topic. Empty list (default) ships the topic without subscriptions — the canonical alarm-routing path is alerts-infra's cross-account Chatbot subscription (see `bootstrap_alb_cross_account_subscriber_arns`). Email is for interim direct-routing before alerts-infra is wired, or for ops-team accountability copies alongside chat-platform routing. **Subscription confirmation required**: each recipient receives an AWS confirmation email after apply and MUST click the link before alarms deliver — until confirmed, the subscription sits in `PendingConfirmation` and alarms fire silently to that address. See README Step 3 #7 for the `aws sns list-subscriptions-by-topic` verification."
+  type        = list(string)
+  default     = []
+}
+
+variable "bootstrap_alb_elb_5xx_threshold_per_minute" {
+  description = "ALB-side 5xx alarm threshold (per minute). **Default `null` defers to the module's own default** (which is `10` — dark-launch-friendly; tolerates the 503-on-empty-TG noise between this stack's first apply and the paired data-plane PR). Env tfvars SHOULD override this down to `1` once the data plane is attached and the surface is live (any ALB-side 5xx is the outage signal at that point). The `null` default keeps the module as the single source of truth for the dark-launch posture — flipping prod live becomes 'set this var to 1' rather than 'remember which layer holds the dark-launch default'."
+  type        = number
+  default     = null
+}
