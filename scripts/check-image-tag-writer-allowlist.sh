@@ -4,7 +4,7 @@
 # Fail if anything outside the deployer family writes
 #   /<env>/nhp/<component>/image-tag
 #   /<env>/nhp/<component>/green-image-tag
-# where <component> ∈ {server, ac}.
+# where <component> ∈ {server, ac, reverse-tunnel-server}.
 #
 # Background: until 2026-05-19 the build matrix in build-and-push.yml
 # also wrote /<env>/nhp/<component>/image-tag at the end of each
@@ -19,8 +19,9 @@
 #   - canary-deploy.yml       (prod; writes /image-tag — prod has no
 #                              green-image-tag sibling)
 #   - update-ssm-image-tag.sh (helper called by promote-to-prod.yml
-#                              for prod canary; same single-slot
-#                              contract)
+#                              for prod canary (server/ac) and the
+#                              prod reverse-tunnel-server deploy-qrts
+#                              job; same single-slot contract)
 #
 # Anything else that writes these slots can recreate the original
 # race or another flavour of it. This script keeps that contract

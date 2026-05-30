@@ -74,6 +74,7 @@ SSM_SANDBOX_STATE="/sandbox/nhp/deploy/state"
 SSM_SANDBOX_SERVER_TAG="/sandbox/nhp/server/image-tag"
 SSM_SANDBOX_AC_TAG="/sandbox/nhp/ac/image-tag"
 SSM_SANDBOX_QURL_TAG="/layerv-nhp-sandbox/qurl-api-image-tag"
+SSM_SANDBOX_QRTS_TAG="/sandbox/nhp/reverse-tunnel-server/image-tag"
 # Prod (AWS_PROFILE=layerv-prod)
 SSM_PROD_COMMIT="/prod/nhp/deploy/deployed-commit"
 SSM_PROD_DEPLOYED_AT="/prod/nhp/deploy/deployed-at"
@@ -81,6 +82,7 @@ SSM_PROD_STATE="/prod/nhp/deploy/state"
 SSM_PROD_SERVER_TAG="/prod/nhp/server/image-tag"
 SSM_PROD_AC_TAG="/prod/nhp/ac/image-tag"
 SSM_PROD_QURL_TAG="/layerv-nhp-prod/qurl-api-image-tag"
+SSM_PROD_QRTS_TAG="/prod/nhp/reverse-tunnel-server/image-tag"
 
 # Color codes
 RED='\033[0;31m'
@@ -240,6 +242,7 @@ SANDBOX_STATE=$(read_ssm "layerv" "$SSM_SANDBOX_STATE")
 SANDBOX_SERVER_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_SERVER_TAG")
 SANDBOX_AC_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_AC_TAG")
 SANDBOX_QURL_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_QURL_TAG")
+SANDBOX_QRTS_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_QRTS_TAG")
 
 info "Sandbox SSM parameters loaded"
 
@@ -250,6 +253,7 @@ PROD_STATE=$(read_ssm "layerv-prod" "$SSM_PROD_STATE")
 PROD_SERVER_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_SERVER_TAG")
 PROD_AC_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_AC_TAG")
 PROD_QURL_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_QURL_TAG")
+PROD_QRTS_TAG=$(read_ssm "layerv-prod" "$SSM_PROD_QRTS_TAG")
 
 info "Prod SSM parameters loaded"
 
@@ -259,12 +263,14 @@ SANDBOX_STATE="${SANDBOX_STATE:-(not set)}"
 SANDBOX_SERVER_TAG="${SANDBOX_SERVER_TAG:-(not set)}"
 SANDBOX_AC_TAG="${SANDBOX_AC_TAG:-(not set)}"
 SANDBOX_QURL_TAG="${SANDBOX_QURL_TAG:-(not set)}"
+SANDBOX_QRTS_TAG="${SANDBOX_QRTS_TAG:-(not set)}"
 PROD_COMMIT="${PROD_COMMIT:-(not set)}"
 PROD_DEPLOYED_AT="${PROD_DEPLOYED_AT:-(not set)}"
 PROD_STATE="${PROD_STATE:-(not set)}"
 PROD_SERVER_TAG="${PROD_SERVER_TAG:-(not set)}"
 PROD_AC_TAG="${PROD_AC_TAG:-(not set)}"
 PROD_QURL_TAG="${PROD_QURL_TAG:-(not set)}"
+PROD_QRTS_TAG="${PROD_QRTS_TAG:-(not set)}"
 
 # Hard block: no sandbox commit means nothing to deploy
 if [[ -z "$SANDBOX_COMMIT" ]]; then
@@ -520,10 +526,12 @@ fi
 deploy_server=false
 deploy_ac=false
 deploy_qurl=false
+deploy_qrts=false
 run_terraform=false
 SERVER_REASON=""
 AC_REASON=""
 QURL_REASON=""
+QRTS_REASON=""
 TF_REASON=""
 
 if [[ "$FIRST_DEPLOY" == "true" ]]; then
@@ -536,6 +544,18 @@ if [[ "$FIRST_DEPLOY" == "true" ]]; then
     AC_REASON="first prod deployment"
     TF_REASON="first prod deployment"
     QURL_REASON="first prod deployment"
+    # qrts is gated even on first deploy: unlike server/ac/qurl, a first prod
+    # deploy can precede the first sandbox rts-CI publish, and forcing
+    # deploy_qrts=true then hard-fails the workflow's bootstrap pre-check with a
+    # confusing message for an operator who just hit "first deploy". Mirror the
+    # regular path's bootstrap guard — skip with a clear reason + warn instead.
+    if [[ "$SANDBOX_QRTS_TAG" != "(not set)" && "$SANDBOX_QRTS_TAG" != v0.0.0-bootstrap* ]]; then
+        deploy_qrts=true
+        QRTS_REASON="first prod deployment"
+    else
+        QRTS_REASON="[SKIP] first prod deployment but sandbox qrts tag is '${SANDBOX_QRTS_TAG}' (rts CI hasn't published a real image yet)"
+        warn "First prod deploy: skipping qrts — sandbox qrts tag is '${SANDBOX_QRTS_TAG}' (no real image published yet). Re-dispatch with deploy_qrts once rts CI publishes, or pass -f frps_image_tag explicitly. See docs/runbooks/promote-to-prod-partial-deploy.md 'Case E: qrts decoupling end-states' for why a first promotion may land without qrts."
+    fi
 else
     # Server/AC: always deployed together — they share Go modules (nhp/, endpoints/)
     # and are built from the same commit. Compare image tags directly rather than
@@ -586,16 +606,32 @@ else
         QURL_REASON="tag changed: ${PROD_QURL_TAG} → ${SANDBOX_QURL_TAG}"
     fi
 
-    # Fallback: if no components detected but commits differ
-    if [[ "$deploy_server" == "false" && "$deploy_ac" == "false" && "$run_terraform" == "false" && "$deploy_qurl" == "false" ]]; then
-        warn "No component changes detected but commits differ. Deploying all as safety fallback."
+    # qurl-reverse-tunnel-server (separate repo — the qrts image SSM tag + ASG
+    # instance-refresh, ported into promote-to-prod.yml's deploy-qrts job).
+    # Skip the bootstrap placeholder — that resolves nothing real.
+    # NOTE: the v0.0.0-bootstrap* RHS is intentionally unquoted — it's a glob
+    # prefix-match (catches v0.0.0-bootstrap, -bootstrap-1, etc.), not the literal
+    # string match the other quoted comparisons on this line use.
+    if [[ "$SANDBOX_QRTS_TAG" != "(not set)" && "$SANDBOX_QRTS_TAG" != v0.0.0-bootstrap* && "$SANDBOX_QRTS_TAG" != "$PROD_QRTS_TAG" ]]; then
+        deploy_qrts=true
+        QRTS_REASON="tag changed: ${PROD_QRTS_TAG} → ${SANDBOX_QRTS_TAG}"
+    fi
+
+    # Fallback: if no components detected but commits differ. Covers the
+    # commit-driven components (server/ac/terraform) only — qurl and qrts
+    # are NOT force-deployed here because they have their own image-tag
+    # change detection above (a commit diff with no qurl/qrts tag change
+    # means nothing to roll for them). Keep the message accurate to that
+    # behavior rather than claiming "all".
+    if [[ "$deploy_server" == "false" && "$deploy_ac" == "false" && "$run_terraform" == "false" && "$deploy_qurl" == "false" && "$deploy_qrts" == "false" ]]; then
+        warn "No component changes detected but commits differ. Deploying nhp server/ac + terraform as safety fallback (qurl/qrts left to their own tag-change detection)."
         deploy_server=true
         deploy_ac=true
         run_terraform=true
         SERVER_REASON="safety fallback (no specific changes detected)"
         AC_REASON="safety fallback (no specific changes detected)"
         TF_REASON="safety fallback (no specific changes detected)"
-        WARNINGS+=("No specific component changes detected — deploying all as safety fallback")
+        WARNINGS+=("No specific component changes detected — deploying nhp server/ac + terraform as safety fallback (qurl/qrts excluded by design)")
     fi
 fi
 
@@ -626,6 +662,7 @@ DEPLOY_COMPONENTS=()
 if [[ "$deploy_server" == "true" ]]; then DEPLOY_COMPONENTS+=("NHP Server"); fi
 if [[ "$deploy_ac" == "true" ]]; then DEPLOY_COMPONENTS+=("Access Controller"); fi
 if [[ "$deploy_qurl" == "true" ]]; then DEPLOY_COMPONENTS+=("QURL Service"); fi
+if [[ "$deploy_qrts" == "true" ]]; then DEPLOY_COMPONENTS+=("qurl-reverse-tunnel-server"); fi
 if [[ "$run_terraform" == "true" ]]; then DEPLOY_COMPONENTS+=("Terraform"); fi
 
 COMPONENT_LIST=$(IFS=", "; echo "${DEPLOY_COMPONENTS[*]}")
@@ -641,11 +678,18 @@ fi
 GH_CMD=(gh workflow run promote-to-prod.yml --ref main
     -f "image_tag=${PROMOTION_TAG}"
     -f "deploy_server=${deploy_server}" -f "deploy_ac=${deploy_ac}"
-    -f "deploy_qurl=${deploy_qurl}" -f "run_terraform=${run_terraform}"
+    -f "deploy_qurl=${deploy_qurl}" -f "deploy_qrts=${deploy_qrts}"
+    -f "run_terraform=${run_terraform}"
 )
 if [[ -n "$QURL_TAG_FOR_COMMAND" ]]; then
     GH_CMD+=(-f "qurl_image_tag=${QURL_TAG_FOR_COMMAND}")
 fi
+# qrts image tag: the deploy-qrts job resolves it from sandbox SSM when the
+# input is empty (same source this script reads), so no -f is needed here.
+# Trade-off (cf. qurl, which DOES pass its tag): there's a small window between
+# this script's SSM read and the workflow's resolve step where sandbox could
+# re-publish. Acceptable — the bootstrap-placeholder fence + the deploy-qrts
+# pre-check fail loud if the resolved tag is bad either way.
 GH_CMD+=(-f "cell_id=cell0")
 
 # String form for display and JSON output
@@ -676,15 +720,18 @@ if [[ "$MODE" == "json" ]]; then
         --arg sandbox_server_tag "$SANDBOX_SERVER_TAG" \
         --arg sandbox_ac_tag "$SANDBOX_AC_TAG" \
         --arg sandbox_qurl_tag "$SANDBOX_QURL_TAG" \
+        --arg sandbox_qrts_tag "$SANDBOX_QRTS_TAG" \
         --arg prod_commit "$PROD_COMMIT" \
         --arg prod_deployed_at "$PROD_DEPLOYED_AT" \
         --arg prod_state "$PROD_STATE" \
         --arg prod_server_tag "$PROD_SERVER_TAG" \
         --arg prod_ac_tag "$PROD_AC_TAG" \
         --arg prod_qurl_tag "$PROD_QURL_TAG" \
+        --arg prod_qrts_tag "$PROD_QRTS_TAG" \
         --argjson deploy_server "$deploy_server" \
         --argjson deploy_ac "$deploy_ac" \
         --argjson deploy_qurl "$deploy_qurl" \
+        --argjson deploy_qrts "$deploy_qrts" \
         --argjson run_terraform "$run_terraform" \
         --arg command "$GH_COMMAND" \
         --arg image_tag "$PROMOTION_TAG" \
@@ -702,7 +749,8 @@ if [[ "$MODE" == "json" ]]; then
             state: $sandbox_state,
             server_tag: $sandbox_server_tag,
             ac_tag: $sandbox_ac_tag,
-            qurl_tag: $sandbox_qurl_tag
+            qurl_tag: $sandbox_qurl_tag,
+            qrts_tag: $sandbox_qrts_tag
           },
           prod: {
             commit: $prod_commit,
@@ -710,12 +758,14 @@ if [[ "$MODE" == "json" ]]; then
             state: $prod_state,
             server_tag: $prod_server_tag,
             ac_tag: $prod_ac_tag,
-            qurl_tag: $prod_qurl_tag
+            qurl_tag: $prod_qurl_tag,
+            qrts_tag: $prod_qrts_tag
           },
           components: {
             deploy_server: $deploy_server,
             deploy_ac: $deploy_ac,
             deploy_qurl: $deploy_qurl,
+            deploy_qrts: $deploy_qrts,
             run_terraform: $run_terraform
           },
           command: $command,
@@ -743,14 +793,14 @@ fi
 header "SANDBOX (source)"
 echo "  Commit:   ${SANDBOX_COMMIT:0:7} — $(commit_subject "$SANDBOX_COMMIT")"
 echo "  Deployed: ${SANDBOX_DEPLOYED_AT} ($(time_ago "$SANDBOX_DEPLOYED_AT"))"
-echo "  Tags:     server=${SANDBOX_SERVER_TAG}  ac=${SANDBOX_AC_TAG}  qurl=${SANDBOX_QURL_TAG}"
+echo "  Tags:     server=${SANDBOX_SERVER_TAG}  ac=${SANDBOX_AC_TAG}  qurl=${SANDBOX_QURL_TAG}  qrts=${SANDBOX_QRTS_TAG}"
 echo "  State:    ${SANDBOX_STATE}"
 
 # --- Production ---
 header "PRODUCTION (target)"
 echo "  Commit:   ${PROD_COMMIT:0:7} — $(commit_subject "$PROD_COMMIT")"
 echo "  Deployed: ${PROD_DEPLOYED_AT} ($(time_ago "$PROD_DEPLOYED_AT"))"
-echo "  Tags:     server=${PROD_SERVER_TAG}  ac=${PROD_AC_TAG}  qurl=${PROD_QURL_TAG}"
+echo "  Tags:     server=${PROD_SERVER_TAG}  ac=${PROD_AC_TAG}  qurl=${PROD_QURL_TAG}  qrts=${PROD_QRTS_TAG}"
 echo "  State:    ${PROD_STATE}"
 
 # --- Changelog ---
@@ -786,6 +836,15 @@ else
         echo -e "  ${YELLOW}[SKIP]${NC}    QURL Service      — no QURL tag configured"
     fi
 fi
+if [[ "$deploy_qrts" == "true" ]]; then
+    echo -e "  ${GREEN}[DEPLOY]${NC}  qurl-reverse-tunnel-server — ${QRTS_REASON}"
+else
+    if [[ "$SANDBOX_QRTS_TAG" == "(not set)" || "$SANDBOX_QRTS_TAG" == v0.0.0-bootstrap* ]]; then
+        echo -e "  ${YELLOW}[SKIP]${NC}    qurl-reverse-tunnel-server — sandbox CI hasn't published a real tag yet (${SANDBOX_QRTS_TAG})"
+    else
+        echo -e "  ${YELLOW}[SKIP]${NC}    qurl-reverse-tunnel-server — same tag (${SANDBOX_QRTS_TAG})"
+    fi
+fi
 if [[ "$run_terraform" == "true" ]]; then
     echo -e "  ${GREEN}[DEPLOY]${NC}  Terraform         — ${TF_REASON}"
 else
@@ -799,6 +858,7 @@ echo "    -f image_tag=${PROMOTION_TAG} \\"
 echo "    -f deploy_server=${deploy_server} \\"
 echo "    -f deploy_ac=${deploy_ac} \\"
 echo "    -f deploy_qurl=${deploy_qurl} \\"
+echo "    -f deploy_qrts=${deploy_qrts} \\"
 echo "    -f run_terraform=${run_terraform} \\"
 if [[ -n "$QURL_TAG_FOR_COMMAND" ]]; then
     echo "    -f qurl_image_tag=${QURL_TAG_FOR_COMMAND} \\"
@@ -861,6 +921,12 @@ if OUTPUT=$("${GH_CMD[@]}" 2>&1); then
     echo "  2. If deployment fails and needs rollback:"
     echo "     gh workflow run promote-to-prod.yml --ref main \\"
     echo "       -f rollback=true -f image_tag=${PROMOTION_TAG}"
+    echo "     # NOTE: a rollback that includes qrts (deploy_qrts=true) also"
+    echo "     #       requires an explicit -f frps_image_tag=<prior-tag> —"
+    echo "     #       qrts isn't tracked by deployed-commit (resolve-frps-tag fails loud otherwise)."
+    echo "     #       Prior tag: the qrts tag in prod at script-run time, which"
+    echo "     #       becomes the rollback target if this deploy succeeds:"
+    echo "     #         -f frps_image_tag=${PROD_QRTS_TAG}"
     echo ""
     echo "  3. If deployment lock is stuck:"
     echo "     GitHub Actions UI → promote-to-prod → Run workflow → force_unlock=true"

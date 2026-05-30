@@ -9,7 +9,7 @@
 #                 routed through blue-green-deploy.yml (which writes the
 #                 standby slot via active-color indirection). See
 #                 scripts/check-image-tag-writer-allowlist.sh for why.
-#   component:    NHP component (server, ac)
+#   component:    NHP component (server, ac, reverse-tunnel-server)
 #   image-tag:    Docker image tag to deploy (typically commit SHA)
 #   --refresh:    Optional flag to trigger ASG instance refresh after SSM update
 #
@@ -35,7 +35,7 @@ set -euo pipefail
 if [[ $# -lt 3 ]]; then
   echo "Usage: $0 <environment> <component> <image-tag> [--refresh]"
   echo "  environment: prod   (sandbox writes go through blue-green-deploy.yml)"
-  echo "  component:   server, ac"
+  echo "  component:   server, ac, reverse-tunnel-server"
   echo "  image-tag:   Docker image tag (e.g., commit SHA)"
   echo "  --refresh:   Optional flag to trigger ASG instance refresh"
   exit 1
@@ -69,8 +69,21 @@ if [[ "$ENVIRONMENT" != "prod" ]]; then
 fi
 
 # Validate component
-if [[ "$COMPONENT" != "server" && "$COMPONENT" != "ac" ]]; then
-  echo "ERROR: Invalid component '$COMPONENT'. Must be 'server' or 'ac'."
+if [[ "$COMPONENT" != "server" && "$COMPONENT" != "ac" && "$COMPONENT" != "reverse-tunnel-server" ]]; then
+  echo "ERROR: Invalid component '$COMPONENT'. Must be 'server', 'ac', or 'reverse-tunnel-server'."
+  exit 1
+fi
+
+# Validate the image-tag string at the helper boundary (defense-in-depth).
+# Callers already validate their own tags — deploy-server/ac pass commit SHAs;
+# deploy-qrts's resolve-frps-tag enforces Docker's TagRegexp upstream — but this
+# helper is the shared prod-canary slot writer, so it re-checks rather than
+# trusting every present and future caller. The pattern is Docker's own tag
+# grammar (alnum/underscore start, then alnum/._- up to 128 chars), which keeps
+# shell metacharacters out of the value before it reaches SSM / any downstream
+# interpolation.
+if [[ ! "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$ ]]; then
+  echo "ERROR: Invalid image tag '$IMAGE_TAG'. Must match Docker tag grammar ^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}\$ (alphanumerics, '.', '_', '-'; <=128 chars)." >&2
   exit 1
 fi
 
@@ -78,12 +91,20 @@ fi
 declare -A ECR_REPOS=(
   ["server"]="layerv/nhp-server"
   ["ac"]="layerv/nhp-ac"
+  ["reverse-tunnel-server"]="layerv/qurl-reverse-tunnel-server"
 )
 ECR_REPO="${ECR_REPOS[$COMPONENT]}"
 
 # SSM parameter paths
 SSM_IMAGE_TAG_PARAM="/${ENVIRONMENT}/nhp/${COMPONENT}/image-tag"
 SSM_ASG_NAME_PARAM="/${ENVIRONMENT}/nhp/${COMPONENT}/asg-name"
+
+# Single source of truth for the slot path: this writer derives it; CI callers
+# (e.g. the deploy-qrts summary) read it back from here instead of re-declaring
+# the literal in workflow env. No-op outside Actions (GITHUB_OUTPUT unset).
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  echo "ssm_image_tag_param=${SSM_IMAGE_TAG_PARAM}" >> "$GITHUB_OUTPUT"
+fi
 
 echo "============================================"
 echo "SSM Image Tag Update"
@@ -165,11 +186,41 @@ if [[ -x "$SCRIPT_DIR/cancel-existing-refresh.sh" ]]; then
   "$SCRIPT_DIR/cancel-existing-refresh.sh" "$ASG_NAME" || true
 fi
 
-# Set refresh preferences based on component
-if [[ "$COMPONENT" == "server" ]]; then
-  MIN_HEALTHY=90
-else
-  MIN_HEALTHY=50
+# Min-healthy-percentage during the rolling instance refresh, per component.
+#
+# Explicit per-component (like ECR_REPOS above) rather than an `else` default,
+# so the safety requirement is declared, not inherited: 50% keeps the fleet
+# serving when the prod ASG runs >= 2 instances (ac N/N/N, qrts 3/3/3 — 50%
+# rolls 1 at a time, keeping the rest). server runs a larger fleet at 90%. A new
+# component must add its own entry here — `set -u` makes a missing key fail
+# loud (caught by the component validation above), instead of silently
+# inheriting an unsafe value.
+declare -A COMPONENT_MIN_HEALTHY=(
+  ["server"]="90"
+  ["ac"]="50"
+  ["reverse-tunnel-server"]="50"
+)
+MIN_HEALTHY="${COMPONENT_MIN_HEALTHY[$COMPONENT]}"
+
+# Runtime guard: AWS computes MinHealthyPercentage against the ASG's *live*
+# DesiredCapacity at refresh time, not the >=2 the table assumes. If a fleet is
+# ever scaled to a single instance (manual debugging, a cost tfvar), no
+# percentage both makes progress AND keeps a host in service — replacing the
+# one instance either stalls (min-healthy rounds up to the whole fleet) or drops
+# it (rounds to 0). Refuse rather than risk a surprise prod outage or a hung
+# deploy; the operator scales to >=2 for a zero-downtime refresh, or replaces
+# the instance out-of-band if a brief outage is acceptable.
+DESIRED_CAPACITY=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names "$ASG_NAME" \
+  --query "AutoScalingGroups[0].DesiredCapacity" \
+  --output text \
+  --region "$AWS_REGION" 2>/dev/null) || DESIRED_CAPACITY=""
+if [[ "$DESIRED_CAPACITY" =~ ^[0-9]+$ && "$DESIRED_CAPACITY" -lt 2 ]]; then
+  echo "ERROR: ASG $ASG_NAME has DesiredCapacity=$DESIRED_CAPACITY (<2). A rolling refresh at MIN_HEALTHY=${MIN_HEALTHY}% cannot keep $COMPONENT in service while replacing its only instance — it would stall or drop prod. Scale the ASG to >=2 for a zero-downtime refresh, or replace the instance out-of-band if a brief outage is acceptable." >&2
+  exit 2
+fi
+if [[ ! "$DESIRED_CAPACITY" =~ ^[0-9]+$ ]]; then
+  echo "::warning::Could not read DesiredCapacity for $ASG_NAME (got '${DESIRED_CAPACITY:-empty}') — proceeding with MIN_HEALTHY=${MIN_HEALTHY}% unchecked. Verify the ASG runs >=2 instances."
 fi
 
 # SkipMatching must be false because the Docker image tag is stored in SSM and

@@ -72,6 +72,11 @@ on:
         required: false
         default: false
         type: boolean
+      deploy_qrts:
+        description: 'Deploy qurl-reverse-tunnel-server (qrts): write prod image-tag SSM + ASG instance-refresh'
+        required: false
+        default: false
+        type: boolean
       cell_id:
         description: 'Target cell identifier'
         required: false
@@ -135,6 +140,7 @@ env:
   ECR_SERVER_REPO: 'layerv/nhp-server'
   ECR_AC_REPO: 'layerv/nhp-ac'
   ECR_QURL_REPO: 'layerv/nhp-qurl'
+  ECR_QRTS_REPO: 'layerv/qurl-reverse-tunnel-server'
   PROD_SSM_PREFIX: 'layerv-nhp-prod'
 
 jobs:
@@ -184,6 +190,7 @@ jobs:
           DEPLOY_SERVER: ${{ inputs.deploy_server }}
           DEPLOY_AC: ${{ inputs.deploy_ac }}
           DEPLOY_QURL: ${{ inputs.deploy_qurl }}
+          DEPLOY_QRTS: ${{ inputs.deploy_qrts }}
           ROLLBACK: ${{ inputs.rollback }}
           ALLOW_STALE_TERRAFORM: ${{ inputs.allow_stale_terraform }}
           FORCE_UNLOCK: ${{ inputs.force_unlock }}
@@ -191,7 +198,8 @@ jobs:
           if [[ "$RUN_TERRAFORM" != "true" \
              && "$DEPLOY_SERVER" != "true" \
              && "$DEPLOY_AC" != "true" \
-             && "$DEPLOY_QURL" != "true" ]]; then
+             && "$DEPLOY_QURL" != "true" \
+             && "$DEPLOY_QRTS" != "true" ]]; then
             # Compose: enumerate every set-but-meaningless flag so an
             # operator who set both rollback=true AND force_unlock=true
             # sees both diagnostics, not just the first matching elif.
@@ -204,7 +212,7 @@ jobs:
               for flag in "${BYPASS_FLAGS[@]}"; do
                 echo "  - $flag"
               done
-              echo "::error::Set at least one of run_terraform / deploy_server / deploy_ac / deploy_qurl to true (the bypass flags apply to the run that actually deploys, not on their own)."
+              echo "::error::Set at least one of run_terraform / deploy_server / deploy_ac / deploy_qurl / deploy_qrts to true (the bypass flags apply to the run that actually deploys, not on their own)."
               echo "::error::See docs/runbooks/promote-to-prod-partial-deploy.md \"Bypasses you should know about\" for the manual-SSM stuck-lock-clear path if you need to reset state without redeploying."
             else
               echo "::error::No-op dispatch: run_terraform=false AND every deploy_*=false. Set at least one to true (run_terraform=true is the typical full-promote default)."
@@ -252,6 +260,8 @@ jobs:
         env:
           FRPS_IMAGE_TAG_INPUT: ${{ inputs.frps_image_tag }}
           SSM_FRPS_PARAM: /sandbox/nhp/reverse-tunnel-server/image-tag
+          DEPLOY_QRTS: ${{ inputs.deploy_qrts }}
+          ROLLBACK: ${{ inputs.rollback }}
         run: |
           set -euo pipefail
           # qurl-reverse-tunnel-server image tag for terraform's
@@ -287,6 +297,16 @@ jobs:
             exit 0
           fi
 
+          # Rollback safety (symmetric with resolve-qurl-tag's guard above):
+          # qrts isn't tracked by deployed-commit — the running tag lives in
+          # SSM. A rollback that deploys qrts must pin frps_image_tag
+          # explicitly, else resolving from sandbox SSM would "roll back" to
+          # the CURRENT sandbox tag, not the prior prod one.
+          if [[ "$ROLLBACK" == "true" && "$DEPLOY_QRTS" == "true" ]]; then
+            echo "::error::rollback=true with deploy_qrts=true requires an explicit frps_image_tag (qrts isn't tracked by deployed-commit). Provide frps_image_tag or set deploy_qrts=false."
+            exit 1
+          fi
+
           # INVARIANT: the failure paths below MUST emit the literal
           # `v0.0.0-bootstrap`, never an empty string. TF_VAR_frps_image_tag=""
           # would OVERRIDE the variable's `v0.0.0-bootstrap` default to empty,
@@ -298,7 +318,7 @@ jobs:
           trap 'rm -f "$SSM_ERR"' EXIT
           if FRPS_TAG="$(aws ssm get-parameter --region "$AWS_REGION" --name "$SSM_FRPS_PARAM" --query "Parameter.Value" --output text 2>"$SSM_ERR")"; then
             if [[ -z "$FRPS_TAG" || "$FRPS_TAG" == "None" || "$FRPS_TAG" =~ ^v0\.0\.0-bootstrap ]]; then
-              echo "::warning::SSM $SSM_FRPS_PARAM holds no real tag (got '$FRPS_TAG'). deploy_frps=true will fail the non-bootstrap precondition — provide frps_image_tag explicitly."
+              echo "::warning::SSM $SSM_FRPS_PARAM holds no real tag (got '$FRPS_TAG'). deploy_frps=true (tfvars) will fail the terraform non-bootstrap precondition, and deploy_qrts=true will fail the deploy-qrts pre-check — provide frps_image_tag explicitly."
               echo "frps_image_tag=v0.0.0-bootstrap" >> "$GITHUB_OUTPUT"
             elif [[ ! "$FRPS_TAG" =~ $TAG_RE ]]; then
               echo "::error::SSM $SSM_FRPS_PARAM holds a value that is not a valid Docker tag: $(printf %q "$FRPS_TAG")"
@@ -310,7 +330,7 @@ jobs:
           elif grep -q "ParameterNotFound" "$SSM_ERR"; then
             # Benign: sandbox rts CI hasn't published yet — placeholder, fail
             # loud only if deploy_frps=true downstream.
-            echo "::warning::SSM $SSM_FRPS_PARAM not found (sandbox rts CI hasn't published). deploy_frps=true will fail the non-bootstrap precondition — provide frps_image_tag explicitly."
+            echo "::warning::SSM $SSM_FRPS_PARAM not found (sandbox rts CI hasn't published). deploy_frps=true (tfvars) will fail the terraform non-bootstrap precondition, and deploy_qrts=true will fail the deploy-qrts pre-check — provide frps_image_tag explicitly."
             echo "frps_image_tag=v0.0.0-bootstrap" >> "$GITHUB_OUTPUT"
           else
             # Real error (IAM/creds/throttle/region) — do not mask as placeholder.
@@ -1143,10 +1163,18 @@ jobs:
       # not dirty the lock (the asymmetry with image/AMI/secret checks
       # would surprise operators reading the lock history). Lock release
       # by finalize.if-always() also handles cleanup.
+      # deploy_qrts is intentionally gated here even though the qrts ASG is
+      # decoupled from the server/ac/qurl control plane: the qrts launch
+      # template, user_data (which reads the image-tag SSM param at boot),
+      # ASG, and asg-name param are all terraform-managed in this repo, so a
+      # stale terraform state can mean a stale qrts launch config. A solo
+      # deploy_qrts=true with !run_terraform must still prove terraform is
+      # current — same rationale as server/ac/qurl. Operators with a known-
+      # unrelated tf drift use the allow_stale_terraform bypass.
       - name: Verify terraform is current with deployed code
         if: |
           !inputs.run_terraform &&
-          (inputs.deploy_server || inputs.deploy_ac || inputs.deploy_qurl)
+          (inputs.deploy_server || inputs.deploy_ac || inputs.deploy_qurl || inputs.deploy_qrts)
         env:
           ALLOW_STALE_TERRAFORM: ${{ inputs.allow_stale_terraform }}
           ROLLBACK: ${{ inputs.rollback }}
@@ -2997,8 +3025,123 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
+  # DEPLOY QRTS - qurl-reverse-tunnel-server image (via update-ssm-image-tag.sh)
+  # =============================================================================
+  # Deploys the qurl-reverse-tunnel-server (qrts) image in the SAME prod
+  # promotion as server/ac/qurl, instead of a separate qurl-reverse-tunnel-
+  # server-repo workflow — making qrts consistent with how nhp owns the
+  # server/ac/qurl deploys. qrts runs on an EC2 ASG that terraform creates
+  # (deploy_frps tfvars); user_data reads /prod/nhp/reverse-tunnel-server/
+  # image-tag at boot. This job routes through the deployer-family helper
+  # update-ssm-image-tag.sh (ECR verify -> SSM put -> cancel + start + wait
+  # instance-refresh) — the same helper deploy-server/deploy-ac use and the only
+  # allowlisted writer of the image-tag slot. Gated after terraform-apply (the
+  # ASG + asg-name SSM param must exist first).
+  #
+  # NOTE: the qurl-reverse-tunnel-server repo's own promote-production.yml writes
+  # the same SSM param + instance-refresh, so two prod deploy paths exist today.
+  # It should be deprecated now that nhp owns the prod deploy — tracked in #2242.
+  #
+  # Decoupling: unlike deploy-qurl, deploy-qrts does NOT chain on
+  # deploy-server/ac/traefik results — qrts is functionally independent of the
+  # NHP control plane, so a server-canary failure shouldn't block the qrts
+  # refresh. The decision gates are terraform-apply (its ASG/asg-name state) +
+  # inputs.deploy_qrts; manifest/preflight/terraform-plan in `needs` are the
+  # standard pipeline-shape dependencies every deploy-* job carries, not extra
+  # gates (terraform-apply already transitively depends on terraform-plan).
+  deploy-qrts:
+    name: Deploy qurl-reverse-tunnel-server (qrts)
+    needs: [manifest, preflight, terraform-plan, terraform-apply]
+    if: |
+      always() &&
+      needs.preflight.result == 'success' &&
+      (
+        (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
+        (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
+      ) &&
+      inputs.deploy_qrts
+    runs-on: ubuntu-latest
+    # 30 min floor for the fixed 3/3/3 ASG: cancel-existing + start + wait the
+    # instance refresh, which rolls each of the 3 instances with a 180s warmup
+    # (~9 min of warmup alone) plus refresh/poll overhead. Sized with headroom
+    # above the wait-loop ceiling, not against a scaling fleet.
+    timeout-minutes: 30
+    env:
+      # Legacy frps_* manifest output name (pre-qrts-rename); consumed here under
+      # the QRTS_IMAGE_TAG env so the rest of the job uses current terminology.
+      QRTS_IMAGE_TAG: ${{ needs.manifest.outputs.frps_image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy qrts (SSM image-tag + ASG instance-refresh)
+        id: deploy-qrts-step
+        run: |
+          set -euo pipefail
+          if [[ -z "$QRTS_IMAGE_TAG" || "$QRTS_IMAGE_TAG" =~ ^v0\.0\.0-bootstrap ]]; then
+            echo "::error::qrts image tag unresolved ('${QRTS_IMAGE_TAG:-empty}') — provide frps_image_tag or ensure sandbox SSM holds a real tag."
+            exit 1
+          fi
+          START_TIME=$(date +%s)
+          # Route through the deployer-family helper (ECR verify -> SSM put ->
+          # cancel-existing + start + wait instance-refresh). Same path
+          # deploy-server/deploy-ac use, and required by the image-tag writer
+          # allowlist (scripts/check-image-tag-writer-allowlist.sh) — the
+          # workflow must not write /prod/nhp/<component>/image-tag directly.
+          DEPLOY_EXIT=0
+          ./.github/scripts/update-ssm-image-tag.sh prod reverse-tunnel-server "$QRTS_IMAGE_TAG" --refresh || DEPLOY_EXIT=$?
+          echo "duration=$(( $(date +%s) - START_TIME ))s" >> "$GITHUB_OUTPUT"
+          exit "$DEPLOY_EXIT"
+
+      # Guarded on outcome != 'skipped' (mirrors deploy-ac/deploy-qurl): if an
+      # earlier step in this job fails (e.g. Configure AWS credentials), Actions
+      # auto-skips the deploy step, and a bare always() summary would otherwise
+      # print the *intended* tag as though it deployed. The Result/Duration rows
+      # report what actually happened, not just what was requested.
+      - name: qrts deploy summary
+        if: always() && steps.deploy-qrts-step.outcome != 'skipped'
+        env:
+          RESULT: ${{ steps.deploy-qrts-step.outcome }}
+          DURATION: ${{ steps.deploy-qrts-step.outputs.duration }}
+          # Single source of truth: the SSM slot path is emitted by the deploy
+          # step's update-ssm-image-tag.sh (which derives it from env/component
+          # and is the actual writer), not re-declared as a workflow literal.
+          SSM_IMAGE_TAG_PARAM: ${{ steps.deploy-qrts-step.outputs.ssm_image_tag_param }}
+        run: |
+          {
+            echo "## Deploy qurl-reverse-tunnel-server (qrts)"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Result | \`${RESULT:-unknown}\` |"
+            # ${QRTS_IMAGE_TAG:-unresolved}: the summary also runs on a FAILED
+            # deploy (outcome != skipped), and the bootstrap-placeholder fence can
+            # fail the step before the tag is validated — so an empty tag reads
+            # "unresolved" rather than a misleading bare "repo:" with no tag.
+            echo "| Image | \`$ECR_QRTS_REPO:${QRTS_IMAGE_TAG:-unresolved}\` |"
+            echo "| Method | SSM image-tag + ASG instance-refresh |"
+            echo "| SSM param | \`${SSM_IMAGE_TAG_PARAM:-/prod/nhp/reverse-tunnel-server/image-tag}\` |"
+            echo "| Duration | \`${DURATION:-n/a}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =============================================================================
   # SMOKE TEST - Application-level validation
   # =============================================================================
+  # The three smoke jobs are fully decoupled from deploy-qrts — it's neither in
+  # their `needs` nor their gate. This mirrors deploy-qrts's own decoupling from
+  # the server/ac/qurl chain: the nhp/qurl smoke suites don't exercise qrts, so a
+  # qrts failure must NOT skip them — otherwise you'd lose the "did server/ac/qurl
+  # deploy cleanly?" signal that scopes a rollback (qrts-only roll vs. everything).
+  # A qrts failure still fails the run via finalize's QRTS_RESULT loop. A qrts-only
+  # dispatch skips the smokes via the "at least one of deploy-server/ac/qurl
+  # succeeded" tail (none did). When a qrts smoke suite lands, add it as its own
+  # job rather than to that tail.
   smoke-test:
     name: Smoke Test
     needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl]
@@ -3237,7 +3380,7 @@ jobs:
   finalize:
     name: Finalize
     if: always()
-    needs: [manifest, preflight, terraform-plan, qurl-schema-compat, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, nhp-smoke-tests, monitor]
+    needs: [manifest, preflight, terraform-plan, qurl-schema-compat, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl, deploy-qrts, smoke-test, qurl-smoke-tests, nhp-smoke-tests, monitor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -3262,6 +3405,7 @@ jobs:
           TRAEFIK_PLUGINS_RESULT: ${{ needs.deploy-traefik-plugins.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
+          QRTS_RESULT: ${{ needs.deploy-qrts.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
@@ -3284,7 +3428,7 @@ jobs:
           # cancelled run does not silently report success, matching the
           # treatment of every other job's cancelled state.
           FAILED=false
-          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$SCHEMA_COMPAT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$TRAEFIK_PLUGINS_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$MONITOR_RESULT"; do
+          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$SCHEMA_COMPAT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$TRAEFIK_PLUGINS_RESULT" "$AC_RESULT" "$QURL_RESULT" "$QRTS_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$MONITOR_RESULT"; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               FAILED=true
               break
@@ -3425,6 +3569,7 @@ jobs:
           TRAEFIK_PLUGINS_RESULT: ${{ needs.deploy-traefik-plugins.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
+          QRTS_RESULT: ${{ needs.deploy-qrts.result }}
         # Lock layering: the SSM `/prod/nhp/deploy/state` parameter is
         # informational/post-hoc. Real concurrency enforcement is the
         # workflow-level `concurrency: group: promote-to-prod, cancel-
@@ -3465,7 +3610,8 @@ jobs:
                && "$SERVER_RESULT" == "skipped" \
                && "$TRAEFIK_PLUGINS_RESULT" == "skipped" \
                && "$AC_RESULT" == "skipped" \
-               && "$QURL_RESULT" == "skipped" ]]; then
+               && "$QURL_RESULT" == "skipped" \
+               && "$QRTS_RESULT" == "skipped" ]]; then
             LOCK_VALUE="rejected"
           else
             LOCK_VALUE="failed"
@@ -3591,6 +3737,7 @@ jobs:
           TRAEFIK_PLUGINS_RESULT: ${{ needs.deploy-traefik-plugins.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
+          QRTS_RESULT: ${{ needs.deploy-qrts.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
@@ -3681,6 +3828,7 @@ jobs:
           MSG+=$(row "Traefik Plugins" "$TRAEFIK_PLUGINS_RESULT")
           MSG+=$(row "AC"            "$AC_RESULT")
           MSG+=$(row "QURL"          "$QURL_RESULT")
+          MSG+=$(row "QRTS"          "$QRTS_RESULT")
           MSG+=$(row "Smoke Test"    "$SMOKE_RESULT")
           MSG+=$(row "QURL Smoke"    "$QURL_SMOKE_RESULT")
           MSG+=$(row "NHP Smoke"     "$NHP_SMOKE_RESULT")
@@ -3737,6 +3885,7 @@ jobs:
         env:
           IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
           QURL_IMAGE_TAG: ${{ needs.manifest.outputs.qurl_image_tag }}
+          QRTS_IMAGE_TAG: ${{ needs.manifest.outputs.frps_image_tag }}
           # Same conditional as the lock release + metric + SNS steps.
           DEPLOY_STATUS: ${{ steps.final_status.outputs.value }}
           MANIFEST_RESULT: ${{ needs.manifest.result }}
@@ -3748,6 +3897,7 @@ jobs:
           TRAEFIK_PLUGINS_RESULT: ${{ needs.deploy-traefik-plugins.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
+          QRTS_RESULT: ${{ needs.deploy-qrts.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
@@ -3790,6 +3940,7 @@ jobs:
             echo "| Deploy Traefik Plugins | $(result_emoji "$TRAEFIK_PLUGINS_RESULT") $TRAEFIK_PLUGINS_RESULT |"
             echo "| Deploy AC | $(result_emoji "$AC_RESULT") $AC_RESULT |"
             echo "| Deploy QURL | $(result_emoji "$QURL_RESULT") $QURL_RESULT |"
+            echo "| Deploy qurl-reverse-tunnel-server | $(result_emoji "$QRTS_RESULT") $QRTS_RESULT |"
             echo "| Smoke Test | $(result_emoji "$SMOKE_RESULT") $SMOKE_RESULT |"
             echo "| QURL Smoke Tests | $(result_emoji "$QURL_SMOKE_RESULT") $QURL_SMOKE_RESULT |"
             echo "| NHP Smoke Tests | $(result_emoji "$NHP_SMOKE_RESULT") $NHP_SMOKE_RESULT |"
@@ -3801,6 +3952,7 @@ jobs:
             echo "| NHP Server | \`$ECR_SERVER_REPO:$IMAGE_TAG\` |"
             echo "| Access Controller | \`$ECR_AC_REPO:$IMAGE_TAG\` |"
             echo "| QURL Service | \`$ECR_QURL_REPO:${QURL_IMAGE_TAG:-N/A}\` |"
+            echo "| qurl-reverse-tunnel-server | \`$ECR_QRTS_REPO:${QRTS_IMAGE_TAG:-N/A}\` |"
             echo ""
             echo "### Quick Links"
             echo "- [ECS Console](https://${AWS_REGION}.console.aws.amazon.com/ecs/v2/clusters?region=${AWS_REGION})"

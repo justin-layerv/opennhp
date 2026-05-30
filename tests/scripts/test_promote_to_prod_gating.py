@@ -96,15 +96,15 @@ ARCHITECTURE
   primary assertion without a paired fixture trips the coverage
   invariant — by design.
 
-ADDING A 4TH IMAGE-DEPLOY JOB? Checklist:
+ADDING A 5TH IMAGE-DEPLOY JOB? Checklist:
 1. The new job's `if:` gate must follow the post-#1322 shape (see
    `_assert_image_deploys` for the exact pattern). The auto-discovery
    below picks it up automatically — no test bump needed for the
    gate-shape assertions.
-2. The floor in `_assert_image_deploys` is `>= 3` (not `== 3`) so
-   adding a 4th deploy-* job does NOT require a ratchet update —
+2. The floor in `_assert_image_deploys` is `>= 4` (not `== 4`) so
+   adding a 5th deploy-* job does NOT require a ratchet update —
    the floor only catches structural removals. Optional: bump to
-   `>= 4` to fail-loud if the new 4th job is later removed.
+   `>= 5` to fail-loud if the new 5th job is later removed.
 3. Add the new job to `finalize`'s `Release deployment lock` rejected
    branch (`SERVER_RESULT && AC_RESULT && QURL_RESULT && NEW_RESULT
    == skipped`). `_assert_finalize` derives the expected RESULT vars
@@ -378,10 +378,10 @@ def _discover_image_deploy_jobs(jobs: dict) -> list[str]:
     """Return job names that look like image deploys.
 
     "Looks like" = name starts with `deploy-` AND the gate references an
-    `inputs.deploy_*` boolean. The caller asserts a floor of ≥3 (today:
-    deploy-server, deploy-ac, deploy-qurl). If you add a 4th image-deploy
-    job, bump the floor in `_assert_image_deploys` and confirm it appears
-    in the discovered list when the test runs.
+    `inputs.deploy_*` boolean. The caller asserts a floor of ≥4 (today:
+    deploy-server, deploy-ac, deploy-qurl, deploy-qrts). If you add a 5th
+    image-deploy job, bump the floor in `_assert_image_deploys` and confirm
+    it appears in the discovered list when the test runs.
     """
     discovered = []
     for name, job in jobs.items():
@@ -417,19 +417,19 @@ def _assert_image_deploys(jobs: dict, failures: list[str]) -> None:
                 + ", ".join(missing_operator_clause)
             )
 
-    # Floor of 3 = deploy-server + deploy-ac + deploy-qurl as of #1322.
-    # The check is `>= 3`, NOT `== 3` — adding a 4th deploy-* doesn't
-    # need a ratchet update (the new job inherits the gate-shape
-    # assertions automatically); only removals require dropping the
-    # floor. Better to fail loud on a structural removal than to
-    # silently regress when a deploy-* drops out without anyone
-    # noticing the missing gate fence.
+    # Floor of 4 = deploy-server + deploy-ac + deploy-qurl + deploy-qrts.
+    # (Was 3 as of #1322; bumped when deploy-qrts landed.) The check is
+    # `>= 4`, NOT `== 4` — adding a 5th deploy-* doesn't need a ratchet
+    # update (the new job inherits the gate-shape assertions
+    # automatically); only removals require dropping the floor. Better to
+    # fail loud on a structural removal than to silently regress when a
+    # deploy-* drops out without anyone noticing the missing gate fence.
     if not _check(
-        "discovered ≥3 image-deploy jobs (deploy-* with inputs.deploy_* in gate)",
-        len(deploy_jobs) >= 3,
+        "discovered ≥4 image-deploy jobs (deploy-* with inputs.deploy_* in gate)",
+        len(deploy_jobs) >= 4,
         f"found: {deploy_jobs}; all deploy-* prefix: {all_deploy_prefix}",
     ):
-        failures.append("discovery found <3 image-deploy jobs — has the workflow shape changed?")
+        failures.append("discovery found <4 image-deploy jobs — has the workflow shape changed?")
         # Empty deploy_jobs makes the per-job loop a no-op; everything
         # below this point is safe to run without an explicit return.
 
@@ -522,6 +522,136 @@ def _assert_sns_row_widths(jobs: dict, failures: list[str]) -> None:
         )
 
 
+def _assert_smoke_decoupled_from_qrts(jobs: dict, failures: list[str]) -> None:
+    """The smoke jobs must stay decoupled from deploy-qrts.
+
+    deploy-qrts is intentionally independent of the server/ac/qurl
+    control plane (PR #2241): the nhp/qurl smoke suites exercise
+    server/ac/qurl, not qrts, so a qrts failure must NOT skip them —
+    otherwise the "did server/ac/qurl deploy cleanly?" signal that
+    scopes a rollback is lost. Guard against a future change that
+    re-couples them by re-adding `deploy-qrts` to a smoke job's `needs`
+    or `if`. (finalize legitimately needs deploy-qrts for QRTS_RESULT;
+    only jobs with "smoke" in the name are checked here.)
+    """
+    smoke_jobs = [n for n in jobs if isinstance(n, str) and "smoke" in n]
+    if not _check(
+        "found at least one smoke job",
+        len(smoke_jobs) > 0,
+        "no jobs with 'smoke' in the name — were they renamed?",
+    ):
+        failures.append("no smoke jobs discovered (rename?)")
+        return
+    for name in smoke_jobs:
+        job = jobs[name]
+        needs = job.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        gate = str(job.get("if", ""))
+        in_needs = "deploy-qrts" in needs
+        in_gate = "deploy-qrts" in gate
+        if not _check(
+            f"smoke job `{name}` is decoupled from deploy-qrts (not in needs/if)",
+            not in_needs and not in_gate,
+            f"deploy-qrts in needs={in_needs}, in if={in_gate}",
+        ):
+            failures.append(
+                f"smoke job `{name}` re-coupled to deploy-qrts "
+                f"(needs={in_needs}, if={in_gate})"
+            )
+
+
+def _assert_qrts_rollback_guard(jobs: dict, failures: list[str]) -> None:
+    """resolve-frps-tag must fence a qrts rollback without an explicit tag.
+
+    qrts isn't tracked by `deployed-commit`, so a rollback that deploys
+    qrts must pin `frps_image_tag` — otherwise resolving from sandbox
+    SSM would silently roll *forward* to current sandbox instead of the
+    prior prod tag (PR #2241). Assert the fail-loud fence stays:
+    `rollback=true && deploy_qrts=true` (with no explicit tag) => exit 1.
+    """
+    manifest = jobs.get("manifest", {})
+    step = next(
+        (
+            s
+            for s in manifest.get("steps", [])
+            if s.get("id") == "resolve-frps-tag"
+        ),
+        None,
+    )
+    if step is None:
+        _check(
+            "manifest has `resolve-frps-tag` step",
+            False,
+            "step id `resolve-frps-tag` not found in manifest",
+        )
+        failures.append("resolve-frps-tag step not found in manifest")
+        return
+    _check("manifest has `resolve-frps-tag` step", True)
+    run = str(step.get("run", ""))
+    has_conjunction = bool(
+        re.search(
+            r'"\$ROLLBACK"\s*==\s*"true"\s*&&\s*"\$DEPLOY_QRTS"\s*==\s*"true"',
+            run,
+        )
+    )
+    if not _check(
+        "resolve-frps-tag fences rollback+deploy_qrts (requires explicit frps_image_tag)",
+        has_conjunction and "exit 1" in run,
+        "missing the `ROLLBACK==true && DEPLOY_QRTS==true => exit 1` guard",
+    ):
+        failures.append(
+            "resolve-frps-tag missing the qrts rollback guard "
+            "(rollback=true + deploy_qrts=true must require explicit frps_image_tag)"
+        )
+
+
+def _assert_every_image_deploy_has_sns_row(jobs: dict, failures: list[str]) -> None:
+    """Every image-deploy job must be represented in finalize's SNS row set.
+
+    `_assert_sns_row_widths` guards the *width* of rows that exist, but
+    nothing asserts a row *exists* per deploy-* job — a future deploy-*
+    added without an SNS representation would silently drop out of the
+    prod notification. Tie each discovered image-deploy job to a
+    `needs.<job>.result` reference in finalize's `Send SNS notification`
+    step (the row helper reads those bindings).
+    """
+    deploy_jobs = _discover_image_deploy_jobs(jobs)
+    if not deploy_jobs:
+        # _assert_image_deploys surfaces the discovery failure itself.
+        return
+    finalize = jobs.get("finalize", {})
+    sns_step = next(
+        (
+            step
+            for step in finalize.get("steps", [])
+            if step.get("name") == "Send SNS notification"
+        ),
+        None,
+    )
+    if sns_step is None:
+        _check(
+            "finalize has `Send SNS notification` step",
+            False,
+            "step `Send SNS notification` not found in finalize",
+        )
+        failures.append("finalize `Send SNS notification` step not found")
+        return
+    _check("finalize has `Send SNS notification` step", True)
+    blob = str(sns_step.get("env", {})) + str(sns_step.get("run", ""))
+    for name in deploy_jobs:
+        ref = f"needs.{name}.result"
+        if not _check(
+            f"finalize SNS notification represents `{name}` ({ref})",
+            ref in blob,
+            f"{name} has no `{ref}` binding in the SNS step",
+        ):
+            failures.append(
+                f"image-deploy job `{name}` missing from finalize SNS "
+                f"notification (no {ref})"
+            )
+
+
 def _assert_manifest_rejects_no_op(jobs: dict, failures: list[str]) -> None:
     """The manifest job must hard-reject a no-op dispatch.
 
@@ -531,8 +661,8 @@ def _assert_manifest_rejects_no_op(jobs: dict, failures: list[str]) -> None:
     dispatch" step exits 1 at the earliest possible moment so the
     operator gets a clear error rather than an inscrutable green
     checkmark. Pin the step's presence + its `if`-block must reference
-    each of the four input flags whose all-false combination is the
-    no-op shape.
+    each of the five input flags whose all-false combination is the
+    no-op shape (run_terraform + the four deploy_* surfaces incl. qrts).
     """
     manifest = jobs.get("manifest", {})
     reject_step = next(
@@ -554,6 +684,7 @@ def _assert_manifest_rejects_no_op(jobs: dict, failures: list[str]) -> None:
         '"$DEPLOY_SERVER" != "true"',
         '"$DEPLOY_AC" != "true"',
         '"$DEPLOY_QURL" != "true"',
+        '"$DEPLOY_QRTS" != "true"',
     ):
         if not _check(
             f"Reject no-op dispatch tests `{needle}`",
@@ -2616,6 +2747,69 @@ def _assert_sns_row_widths_boundary() -> bool:
     return fits_ok and over_rejected
 
 
+_BAD_FIXTURE_SMOKE_COUPLED_TO_QRTS = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      # Bug: a smoke job re-coupled to deploy-qrts (both in `needs` and in
+      # the `if` gate). PR #2241 decoupled them — a qrts failure must not
+      # skip the server/ac/qurl smokes. Without the guard this regression
+      # would pass silently.
+      smoke-test:
+        needs: [deploy-server, deploy-qrts]
+        if: |
+          always() &&
+          (needs.deploy-qrts.result == 'success' || needs.deploy-qrts.result == 'skipped')
+        runs-on: ubuntu-latest
+        steps:
+          - run: echo smoke
+    """
+)
+
+
+_BAD_FIXTURE_QRTS_ROLLBACK_GUARD_MISSING = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      # Bug: resolve-frps-tag step with the qrts rollback fence removed.
+      # Without `rollback=true && deploy_qrts=true => exit 1`, a qrts
+      # rollback with no explicit frps_image_tag would resolve from sandbox
+      # SSM and roll *forward* instead of to the prior prod tag.
+      manifest:
+        runs-on: ubuntu-latest
+        steps:
+          - id: resolve-frps-tag
+            run: |
+              FRPS_TAG=$(some-resolve)
+              echo "frps_image_tag=$FRPS_TAG" >> "$GITHUB_OUTPUT"
+    """
+)
+
+
+_BAD_FIXTURE_DEPLOY_MISSING_SNS_ROW = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      # Bug: an image-deploy job (deploy-qrts) with no representation in
+      # finalize's Send SNS notification step — the SNS env binds
+      # deploy-server but not deploy-qrts, so a qrts result would silently
+      # drop out of the prod notification.
+      deploy-qrts:
+        if: inputs.deploy_qrts
+        runs-on: ubuntu-latest
+        steps:
+          - run: echo deploy
+      finalize:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Send SNS notification
+            env:
+              SERVER_RESULT: ${{ needs.deploy-server.result }}
+            run: echo sns
+    """
+)
+
+
 def _assert_negative_fixtures_reject_bad_input() -> bool:
     """Self-test: each assertion family must reject its known-bad fixture.
 
@@ -2789,6 +2983,21 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
             _assert_lambda_loud_fail_policy,
             _BAD_FIXTURE_LAMBDA_LOUD_FAIL_NON_ALLOWLISTED_COE,
         ),
+        (
+            "smoke jobs re-coupled to deploy-qrts (needs + if)",
+            _assert_smoke_decoupled_from_qrts,
+            _BAD_FIXTURE_SMOKE_COUPLED_TO_QRTS,
+        ),
+        (
+            "qrts rollback guard removed from resolve-frps-tag",
+            _assert_qrts_rollback_guard,
+            _BAD_FIXTURE_QRTS_ROLLBACK_GUARD_MISSING,
+        ),
+        (
+            "image-deploy job missing from finalize SNS notification",
+            _assert_every_image_deploy_has_sns_row,
+            _BAD_FIXTURE_DEPLOY_MISSING_SNS_ROW,
+        ),
     )
     all_rejected = True
     for label, assertion, fixture in cases:
@@ -2876,6 +3085,9 @@ def main() -> int:
         _assert_force_push_verify_step,
         _assert_preflight,
         _assert_sns_row_widths,
+        _assert_smoke_decoupled_from_qrts,
+        _assert_qrts_rollback_guard,
+        _assert_every_image_deploy_has_sns_row,
     )
     for fn in assertions:
         fn(jobs, failures)
