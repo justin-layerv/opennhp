@@ -26,6 +26,7 @@ on:
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
+      - "scripts/check-packer-failure-surfaced.sh"
       - "terraform/modules/qurl-reverse-tunnel-server/variables.tf"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
@@ -63,6 +64,7 @@ on:
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
+      - "scripts/check-packer-failure-surfaced.sh"
       - "terraform/modules/qurl-reverse-tunnel-server/variables.tf"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
@@ -298,3 +300,18 @@ jobs:
 
       - name: Check frps_az_suffixes validation drift (root ↔ module ↔ env-roots)
         run: bash scripts/check-frps-az-suffixes-validation-drift.sh
+
+      # Structural fence for the notify-job wiring that surfaces Packer Build
+      # AMI failures (issue #2252). packer-build is not a required check (it's
+      # skipped on PRs), so a post-merge bake failure's only signal is the
+      # notify Slack alert. A bake failure also skips deploy-sandbox-infra,
+      # which would otherwise render a green "NHP Build successful" — exactly
+      # how the #2239 AC-AMI bug stayed silent for ~12h. This fence pins
+      # packer-build ∈ notify.needs + PACKER_RESULT + the failure branch.
+      # Fixtures run first so an extractor/assertion regression surfaces
+      # against synthetic inputs before the real tree runs.
+      - name: Test check-packer-failure-surfaced.sh fixtures (issue #2252)
+        run: bash tests/scripts/check-packer-failure-surfaced_test.sh
+
+      - name: Check Packer Build AMI failures are surfaced in notify (#2252)
+        run: bash scripts/check-packer-failure-surfaced.sh

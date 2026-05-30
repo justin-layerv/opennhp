@@ -263,6 +263,13 @@ jobs:
     if: |
       (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
       github.event_name == 'workflow_dispatch'
+    # NOTE (issue #2252): packer-build is deliberately NOT a required status
+    # check on main. It is skipped on the PR path (the if: above only runs it on
+    # push-to-main or workflow_dispatch), so requiring it would either block
+    # every PR with a never-reported context or be a no-op. The failure we must
+    # never miss is the POST-merge bake — that is surfaced via the notify job's
+    # Slack alert (packer-build ∈ notify.needs + PACKER_RESULT), and the wiring
+    # is fenced by scripts/check-packer-failure-surfaced.sh.
     permissions:
       id-token: write
       contents: read
@@ -2140,6 +2147,12 @@ jobs:
       - test
       - test-lambdas
       - build
+      # Packer AMI bakes run independently of build/deploy; include so a failed
+      # bake surfaces in Slack instead of being masked by a green build
+      # (issue #2252 / PR #2251). The matrix result aggregates across
+      # sandbox+prod — failure on either leg makes needs.packer-build.result
+      # 'failure'.
+      - packer-build
       # Sandbox deploy jobs
       - deploy-sandbox-infra
       - deploy-sandbox-blue-green
@@ -2150,6 +2163,12 @@ jobs:
     # on its own concurrency group and emits its own SNS-routed Slack
     # (see blue-green-deploy.yml:notify) — silence from here is more
     # accurate than a guess. See PR #1082 for the full rationale.
+    #
+    # Residual gap (acknowledged, #2252): in the narrow race where blue/green is
+    # independently 'cancelled' (concurrency preempt) AND a packer leg failed in
+    # the same run, this skip also suppresses the bake-failure alert. The
+    # superseding run that caused the preempt re-bakes packer and emits its own
+    # notify, so the failure resurfaces on the next run rather than being lost.
     if: |
       always() &&
       github.event_name != 'pull_request' &&
@@ -2164,6 +2183,8 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           TEST_LAMBDAS_RESULT: ${{ needs.test-lambdas.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          # Packer AMI bake (matrix-aggregated across sandbox+prod)
+          PACKER_RESULT: ${{ needs.packer-build.result }}
           # Sandbox deploy components
           SANDBOX_INFRA: ${{ needs.deploy-sandbox-infra.result }}
           SANDBOX_BLUE_GREEN: ${{ needs.deploy-sandbox-blue-green.result }}
@@ -2241,8 +2262,24 @@ jobs:
             SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke"
           fi
 
-          # Determine overall status and header
-          if [[ "$BUILD_RESULT" == "success" ]]; then
+          # Determine overall status and header.
+          #
+          # Packer AMI bakes run independently of the build/deploy pipeline. On a
+          # main push a bake failure skips Terraform Pre-Deploy Checks (gated on
+          # packer success-or-skip) → deploy-sandbox-infra → SANDBOX_DEPLOYED=false,
+          # which would otherwise fall into the "$BUILD_RESULT == success" branch and
+          # render a green "NHP Build successful", hiding the failure (issue #2252;
+          # this is how the #2239 AC-AMI bug stayed silent for ~12h). Surface it as a
+          # top-level failure first. Only 'failure' forces red: 'skipped' (the PR
+          # path, where packer-build doesn't run) is ignored, and a no-op bake that
+          # finds the AMI already present reports 'success' (not 'skipped'), which
+          # falls through harmlessly. build/test failures still land in the elif chain.
+          if [[ "$PACKER_RESULT" == "failure" ]]; then
+            COLOR="#dc3545"
+            EMOJI="x"
+            HEADER="NHP Packer AMI Build"
+            STATUS_TEXT="failed"
+          elif [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
             for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
@@ -2330,6 +2367,10 @@ jobs:
                 {
                   \"type\": \"mrkdwn\",
                   \"text\": \"*Build (Server + AC):*\n$(status_emoji "$BUILD_RESULT")\"
+                },
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*Packer AMI:*\n$(status_emoji "$PACKER_RESULT")\"
                 }
               ]
             }"
