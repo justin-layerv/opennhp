@@ -2488,7 +2488,7 @@ variable "bootstrap_alb_dns_name" {
 }
 
 variable "bootstrap_alb_route53_zone_id" {
-  description = "Hosted zone ID for the parent of `bootstrap_alb_dns_name`. Required when `bootstrap_alb_provision_certificate` or `bootstrap_alb_manage_dns_alias` is true. Empty when both are false (operator-managed out-of-band — typical when the parent zone is cross-account, but also valid for any same-account env that chooses to operator-manage cert + alias)."
+  description = "Hosted zone ID for the parent of `bootstrap_alb_dns_name`. Required when `bootstrap_alb_provision_certificate` or `bootstrap_alb_manage_dns_alias` is true. Empty when both are false — typical when the parent zone is cross-account: the cert is operator-pre-provisioned out-of-band and the A-alias is written cross-account by `aws_route53_record.bootstrap_alb_cross_account` (not by this module, so this zone-id stays empty)."
   type        = string
   default     = ""
 
@@ -2501,7 +2501,7 @@ variable "bootstrap_alb_route53_zone_id" {
 }
 
 variable "bootstrap_alb_manage_dns_alias" {
-  description = "Whether the bootstrap-alb stack writes the A-alias from `bootstrap_alb_dns_name` to the ALB. True when the parent zone is in the same account as the ALB; false when cross-account (alias is operator-managed in the zone's account). Sandbox: true (`layerv.xyz` zone in 767397897469, same account). Prod: false (`layerv.ai` zone in `layerv-mgmt`)."
+  description = "Whether the bootstrap-alb *module* writes the A-alias from `bootstrap_alb_dns_name` to the ALB. True when the parent zone is in the same account as the ALB; false when cross-account — in the cross-account case the alias is written by `aws_route53_record.bootstrap_alb_cross_account` in `terraform/main.tf` (via the `aws.route53_mgmt` provider), NOT operator-managed. Sandbox: true (`layerv.xyz` zone in 767397897469, same account; module-managed). Prod: false (`layerv.ai` zone in `layerv-mgmt`; root cross-account record manages it)."
   type        = bool
   default     = false
 }

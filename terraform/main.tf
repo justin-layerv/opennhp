@@ -1250,6 +1250,19 @@ data "aws_route53_zone" "main" {
 locals {
   main_zone_id = var.hosted_zone_id != null ? var.hosted_zone_id : try(data.aws_route53_zone.main[0].zone_id, null)
 
+  # Apex name of the main zone, trailing-dot-stripped, for the cross-account
+  # bootstrap-alb record's subdomain precondition. Prefer the operator-supplied
+  # `hosted_zone` (set even when `hosted_zone_id` bypasses the data lookup —
+  # the prod case); fall back to the data source's name when only the name was
+  # given. Null when neither is available (the precondition then degrades to a
+  # skip rather than blocking on an unknowable zone name).
+  main_zone_name = var.hosted_zone != null ? trimsuffix(var.hosted_zone, ".") : try(trimsuffix(data.aws_route53_zone.main[0].name, "."), null)
+
+  # "Bootstrap-alb DNS is in play": the deploy flag is on and a name to publish
+  # is set. Shared base gate for both the DNS-writer precondition fence and the
+  # cross-account record (which then adds its cross-account-specific gates).
+  bootstrap_alb_dns_enabled = var.deploy_bootstrap_alb && var.bootstrap_alb_dns_name != ""
+
   # Canonical VPC-internal nhp-server origin used by both qurl-service
   # headless resolve and qurl-reverse-tunnel-server knock-token validation.
   # The namespace suffix comes from modules/data/main.tf's private DNS
@@ -1385,6 +1398,106 @@ resource "aws_route53_record" "connect" {
     name                   = module.ac[0].nlb_dns_name
     zone_id                = module.ac[0].nlb_zone_id
     evaluate_target_health = true
+  }
+}
+
+# Plan-time fence for the bootstrap-alb DNS writer — mirrors
+# `terraform_data.frps_preconditions` / the `connect_cross_account` fence.
+# The two writers are mutually exclusive (the cross-account record below gates
+# on `!manage_dns_alias`; the module's `alb_alias` gates on `manage_dns_alias`),
+# so at most one ever fires. This fence ensures at *least* one does: when
+# `deploy_bootstrap_alb` is on with a `dns_name`, require either the module's
+# same-account alias (`manage_dns_alias = true`, sandbox Path 2) OR the root
+# cross-account record (`cross_account_route53_role_arn` + a resolvable
+# `main_zone_id`, prod Path 1). With neither, both collapse to `count = 0` and
+# the A-alias is silently never published — the silent-count-0 trap the connect
+# fence guards against. Today's prod sets the cross-account role + zone, so this
+# is a greenfield/refactor guard, not a blocker for this apply.
+resource "terraform_data" "bootstrap_alb_dns_preconditions" {
+  count = local.bootstrap_alb_dns_enabled ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.bootstrap_alb_manage_dns_alias || (var.cross_account_route53_role_arn != null && local.main_zone_id != null)
+      error_message = "deploy_bootstrap_alb=true with bootstrap_alb_dns_name set needs a DNS writer: either bootstrap_alb_manage_dns_alias=true (the module writes the same-account alias) OR cross_account_route53_role_arn set + a resolvable hosted_zone_id/hosted_zone (the root aws_route53_record.bootstrap_alb_cross_account writes it cross-account). Both are currently false/null, so bootstrap.layerv.* would never be published."
+    }
+
+    # On the cross-account path, require `hosted_zone` (the zone *name*) in
+    # addition to `hosted_zone_id`, so `local.main_zone_name` resolves and the
+    # record's dot-boundary subdomain precondition can actually validate
+    # `bootstrap_alb_dns_name` at plan time. Without it the subdomain check
+    # degrades to a skip and a typo'd TLD only surfaces at apply on
+    # ChangeResourceRecordSets. Prod sets both (terraform.tfvars); this catches
+    # a future cross-account env that sets only the id.
+    precondition {
+      condition     = var.bootstrap_alb_manage_dns_alias || var.cross_account_route53_role_arn == null || var.hosted_zone != null
+      error_message = "Cross-account bootstrap_alb path (bootstrap_alb_manage_dns_alias=false + cross_account_route53_role_arn set) requires var.hosted_zone to be set (in addition to var.hosted_zone_id) so the dot-boundary subdomain precondition can validate bootstrap_alb_dns_name."
+    }
+  }
+}
+
+# Cross-account public DNS pointer for the bootstrap-alb (prod Path 1).
+# The bootstrap-alb module's own `alb_alias` record (gated on
+# `manage_dns_alias`) is same-account only — fine for sandbox Path 2
+# (`layerv.xyz` in-account), but prod's parent zone (`layerv.ai`) lives in
+# `layerv-mgmt`. So — exactly like `connect_cross_account` above — the root
+# writes the A-alias cross-account via `aws.route53_mgmt` against the
+# module's exported `alb_dns_name`/`alb_zone_id`. This makes
+# `bootstrap.layerv.ai` fully terraform-managed and removes the
+# operator-written post-apply A-alias step (module README Path 1 "Step 0"
+# DNS).
+#
+# MUTUALLY EXCLUSIVE with the module's `alb_alias`: the module writes iff
+# `manage_dns_alias = true`; this record additionally gates on
+# `!manage_dns_alias`, so the two writers can never both fire (no split-brain /
+# double A-record). This is the same structural guarantee `connect`'s two
+# records get from their `cross_account_route53_role_arn != null` vs `== null`
+# gates — here the splitting variable is `manage_dns_alias` instead. The
+# `bootstrap_alb_dns_preconditions` fence above then only has to ensure at
+# least one writer is active.
+#
+# `evaluate_target_health = false` matches the module's own `alb_alias`
+# default (`cert_dns.tf`): the alias publishes "the ALB exists"; target
+# health is surfaced by the ALB itself (503 when the TG is empty/unhealthy)
+# and the `alb_unhealthy_hosts` alarm, not by DNS-level NXDOMAIN. Note this
+# diverges from `connect_cross_account` (which uses `true`) and is coupled to
+# the README Step 3 dark-launch verification ("expect 503" before TG
+# registration): if that runbook ever flips to "expect 200" post-cutover,
+# revisit `evaluate_target_health` here and on the module's `alb_alias`.
+resource "aws_route53_record" "bootstrap_alb_cross_account" {
+  count    = local.bootstrap_alb_dns_enabled && !var.bootstrap_alb_manage_dns_alias && var.cross_account_route53_role_arn != null && local.main_zone_id != null ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = local.main_zone_id
+  name    = var.bootstrap_alb_dns_name
+  type    = "A"
+
+  # Make the "fence guards everything below it" intent explicit, matching how
+  # the qurl-reverse-tunnel-server module depends_on `frps_preconditions`.
+  # Preconditions evaluate at plan regardless, so this is for legibility/order.
+  depends_on = [terraform_data.bootstrap_alb_dns_preconditions]
+
+  # No create_before_destroy here, matching the module's own alb_alias intent:
+  # CBD breaks for an RRSet name-keyed record (see modules/bootstrap-alb/
+  # cert_dns.tf) — don't reflexively add it.
+  alias {
+    name                   = module.bootstrap_alb[0].alb_dns_name
+    zone_id                = module.bootstrap_alb[0].alb_zone_id
+    evaluate_target_health = false
+  }
+
+  # Same dot-boundary subdomain check the module's `alb_alias` carries
+  # (modules/bootstrap-alb/cert_dns.tf) — without it, a typo'd
+  # `bootstrap_alb_dns_name` (wrong TLD / stray char) would fail at apply on
+  # ChangeResourceRecordSets instead of at plan with an operator-friendly
+  # message. Apex match (`== zone`) and proper-subdomain match
+  # (`endswith(., ".${zone}")`) are both accepted. Skips when the zone name
+  # can't be determined (`main_zone_name == null`) rather than blocking.
+  lifecycle {
+    precondition {
+      condition     = local.main_zone_name == null || var.bootstrap_alb_dns_name == local.main_zone_name || endswith(var.bootstrap_alb_dns_name, ".${local.main_zone_name}")
+      error_message = "bootstrap_alb_dns_name must be the apex of, or a subdomain of, the main hosted zone. Got bootstrap_alb_dns_name=`${var.bootstrap_alb_dns_name}` but zone=`${local.main_zone_name}`."
+    }
   }
 }
 
@@ -4083,9 +4196,10 @@ check "bootstrap_alb_required_variables" {
       bootstrap_alb_route53_zone_id to be non-empty (the alias
       record needs a zone to land in). Either:
         - Set bootstrap_alb_route53_zone_id = "<parent zone ID>", OR
-        - Leave bootstrap_alb_manage_dns_alias = false and write
-          the A-alias out-of-band in the parent-zone account
-          (Path 1 posture — see modules/bootstrap-alb/README.md
+        - Leave bootstrap_alb_manage_dns_alias = false AND set
+          cross_account_route53_role_arn (Path 1 posture — the root
+          aws_route53_record.bootstrap_alb_cross_account writes the
+          alias cross-account; see modules/bootstrap-alb/README.md
           "Account topology" + Step 2).
     EOT
   }

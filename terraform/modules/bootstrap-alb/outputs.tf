@@ -9,12 +9,12 @@ output "alb_arn" {
 }
 
 output "alb_dns_name" {
-  description = "Public DNS name AWS assigns to the bootstrap ALB. The Route53 alias for `var.dns_name` (operator-managed in the parent zone's account) points at this."
+  description = "Public DNS name AWS assigns to the bootstrap ALB. The Route53 alias for `var.dns_name` (module-managed same-account when `manage_dns_alias=true`, or root-cross-account-managed via `aws_route53_record.bootstrap_alb_cross_account`) points at this."
   value       = aws_lb.this.dns_name
 }
 
 output "alb_zone_id" {
-  description = "Hosted zone ID for the bootstrap ALB; used by alias records pointing at it (operator runbook reads this when writing the alias in the parent zone's account)."
+  description = "Hosted zone ID for the bootstrap ALB; used by alias records pointing at it (the module's own `alb_alias` same-account, or the root `aws_route53_record.bootstrap_alb_cross_account` cross-account)."
   value       = aws_lb.this.zone_id
 }
 

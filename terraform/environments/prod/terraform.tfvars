@@ -350,27 +350,24 @@ connect_layerv_host = "connect.layerv.ai"
 # requires deploy_qurl_service (true above).
 #
 # bootstrap-alb runs the module's cross-account Path 1 (parent zone layerv.ai
-# in layerv-mgmt) — operator runbook: terraform/modules/bootstrap-alb/README.md
-# "Step 0 — cross-account cert + DNS". The ACM cert was operator-pre-provisioned
-# (Step 0) and is attached via bootstrap_alb_existing_certificate_arn with
-# provision_certificate=false + manage_dns_alias=false (the plan-time XOR cert
-# gate accepts exactly this combination).
+# in layerv-mgmt). The ACM cert is operator-pre-provisioned (module README
+# "Step 0 — cross-account cert + DNS") and attached via
+# bootstrap_alb_existing_certificate_arn with provision_certificate=false (the
+# plan-time XOR cert gate accepts exactly this combination).
 #
-# REQUIRED POST-APPLY MANUAL STEP (Path 1, manage_dns_alias=false): write the
-# bootstrap.layerv.ai A-alias → bootstrap-alb DNS name into the layerv-mgmt
-# layerv.ai zone AFTER this apply (the alias targets the ALB DNS that only
-# exists post-apply), and verify with `dig +short bootstrap.layerv.ai`
-# returning the ALB DNS BEFORE the qurl-service rollout starts taking traffic.
-# Until the alias resolves, bootstrap.layerv.ai is NXDOMAIN and ALL customer
-# agent-bootstrap traffic is blocked. A clean re-apply re-requires both Step 0
-# (cert) and this A-alias — they are operator-owned, not in TF.
+# DNS is automated: manage_dns_alias=false keeps the module's OWN (same-account)
+# alias off, and the bootstrap.layerv.ai A-alias is instead written
+# cross-account by terraform via aws_route53_record.bootstrap_alb_cross_account
+# in terraform/main.tf (mirrors connect_cross_account). So there is NO manual
+# post-apply A-alias step — the only operator pre-step remaining is the ACM
+# cert (Step 0). A clean re-apply re-requires only the cert.
 deploy_qurl_bootstrap_chain = true
 enable_qurl_agent_bootstrap = true
 
 deploy_bootstrap_alb                       = true
 bootstrap_alb_dns_name                     = "bootstrap.layerv.ai"
 bootstrap_alb_provision_certificate        = false                                                                                 # Path 1: cert pre-provisioned cross-account
-bootstrap_alb_manage_dns_alias             = false                                                                                 # Path 1: A-alias written out-of-band post-apply
+bootstrap_alb_manage_dns_alias             = false                                                                                 # Path 1: A-alias written cross-account by aws_route53_record.bootstrap_alb_cross_account (see block above)
 bootstrap_alb_existing_certificate_arn     = "arn:aws:acm:us-east-2:235500187906:certificate/baf58cbf-b14d-454e-a13a-988a81594eb3" # bootstrap.layerv.ai, ISSUED (Step 0)
 bootstrap_alb_elb_5xx_threshold_per_minute = 1
 

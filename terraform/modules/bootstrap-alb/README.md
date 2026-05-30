@@ -31,8 +31,10 @@ public key on cold start.
   `layerv-mgmt` out-of-band).
 - Route 53 alias `bootstrap.layerv.{xyz,ai}` → ALB. **Module-managed
   in sandbox** (same-account; `manage_dns_alias=true`).
-  **Operator-managed out-of-band in prod** (cross-account zone in
-  `layerv-mgmt`).
+  **Terraform-managed cross-account in prod** by the root
+  `aws_route53_record.bootstrap_alb_cross_account` (cross-account zone
+  in `layerv-mgmt`, written via the `aws.route53_mgmt` provider —
+  no longer an operator step).
 - CloudWatch alarms: ALB target 5xx, ALB-side 5xx, target health,
   TLS-handshake-failure rate, WAF rate-limit-block rate.
 - SNS topic for the alarms (alerts-infra subscribes via cross-account
@@ -72,21 +74,24 @@ parent zone happens to live in that same account, so the module can
 provision cert + validation CNAMEs + alias itself
 (`provision_certificate=true`, `manage_dns_alias=true`). In prod
 the parent zone is in `layerv-mgmt`, so the operator pre-provisions
-the cert in nhp's prod account and writes validation CNAMEs + the
-A-alias into the `layerv-mgmt` zone out-of-band
-(`provision_certificate=false` + `existing_certificate_arn=<ARN>`,
-`manage_dns_alias=false`).
+the cert in nhp's prod account and writes its validation CNAMEs into
+the `layerv-mgmt` zone out-of-band (`provision_certificate=false` +
+`existing_certificate_arn=<ARN>`). The A-alias is `manage_dns_alias=false`
+at the module level but is **not** operator-managed — the root
+`aws_route53_record.bootstrap_alb_cross_account` writes it cross-account.
 
 ## First-apply runbook (operator)
 
 Two paths, one per env:
 
 - **Path 1 — cross-account zone (prod, `layerv.ai`)**: operator
-  pre-provisions the ACM cert in nhp's prod account, writes
-  validation CNAMEs + A-alias into `layerv-mgmt` out-of-band, then
-  lands the cert ARN via `bootstrap_alb_existing_certificate_arn`
-  with `provision_certificate=false` + `manage_dns_alias=false`.
-  See **Step 0** below.
+  pre-provisions the ACM cert in nhp's prod account and writes its
+  validation CNAMEs into `layerv-mgmt` out-of-band, then lands the cert
+  ARN via `bootstrap_alb_existing_certificate_arn` with
+  `provision_certificate=false` + `manage_dns_alias=false`. The
+  `bootstrap.layerv.ai` A-alias is **terraform-managed** by the root
+  `aws_route53_record.bootstrap_alb_cross_account` — no manual A-alias
+  write. See **Step 0** below.
 - **Path 2 — same-account zone (sandbox, `layerv.xyz`)**: module
   provisions cert + validation CNAMEs + A-alias itself via
   `provision_certificate=true` + `manage_dns_alias=true`. The first
@@ -300,44 +305,29 @@ up `deploy_bootstrap_alb = true` and `module.bootstrap_alb[0]` enters
 the plan. There is no per-module state — the module shares nhp's
 root state.
 
-### Step 2 — A-alias write (operator, after first apply)
+### Step 2 — A-alias (terraform-managed, no operator action)
 
-> **Path 1 only.** Sandbox runs Path 2 (same-account zone) and sets
-> `manage_dns_alias=true`, so the module's `aws_route53_record.
-> alb_alias` writes the A-alias during Step 1's apply — Step 2 is a
-> no-op there. Prod *will* run Path 1 (cross-account zone in
-> `layerv-mgmt`) when it flips on (tracked in `SLACK_QURL_ROLLOUT.md`
-> §5b); until then prod stays `deploy_bootstrap_alb=false` and this
-> step is dormant there.
+> **No manual write.** The `bootstrap.layerv.ai` A-alias is written by
+> the root `aws_route53_record.bootstrap_alb_cross_account` in
+> `terraform/main.tf` (cross-account, via the `aws.route53_mgmt`
+> provider keyed on `cross_account_route53_role_arn`) during the same
+> Step 1 apply that creates the ALB. Both paths are now terraform-managed:
+> sandbox via the module's `aws_route53_record.alb_alias`
+> (`manage_dns_alias=true`), prod via the root cross-account record
+> (`manage_dns_alias=false`). The two writers are mutually exclusive
+> (gated on `manage_dns_alias`), mirroring the `connect` /
+> `connect_cross_account` pair.
+>
+> The operator's only out-of-band DNS work in Path 1 is the **cert
+> validation CNAMEs** (part of pre-provisioning the ACM cert in Step 0)
+> — the A-alias is no longer a manual step.
+
+To verify the alias resolved after Step 1's apply:
 
 ```sh
-# Read the ALB DNS / zone from nhp root's outputs (the module is
-# count-gated, so the outputs are non-null only after Step 1's apply
-# lands with deploy_bootstrap_alb=true).
-ALB_DNS=$(cd terraform && terraform output -raw bootstrap_alb_dns_name)
-ALB_ZONE=$(cd terraform && terraform output -raw bootstrap_alb_zone_id)
-
-# Write the A-alias into the parent-zone account. <MGMT_PROFILE>
-# points at layerv-mgmt (parent zone for prod's layerv.ai);
-# <PARENT_ZONE_ID> is the parent zone ID. Path 1 today only
-# applies to prod (TLD=ai); sandbox runs Path 2 and the module
-# writes this alias during Step 1's apply.
-AWS_PROFILE=<MGMT_PROFILE> aws route53 change-resource-record-sets \
-  --hosted-zone-id <PARENT_ZONE_ID> \
-  --change-batch '{
-    "Changes": [{
-      "Action": "UPSERT",
-      "ResourceRecordSet": {
-        "Name": "bootstrap.layerv.ai",
-        "Type": "A",
-        "AliasTarget": {
-          "HostedZoneId": "'"$ALB_ZONE"'",
-          "DNSName": "'"$ALB_DNS"'",
-          "EvaluateTargetHealth": false
-        }
-      }
-    }]
-  }'
+# Resolves to the ALB once the cross-account record propagates
+# (seconds-to-minutes). 503s here are expected pre-cutover — see Step 3.
+dig +short bootstrap.layerv.ai
 ```
 
 ### Step 3 — verify dark-launch posture (operator, after first apply)
@@ -405,9 +395,10 @@ Operator-checkable signals the stack landed correctly:
 dig @1.1.1.1 +short bootstrap.layerv.xyz
 # Expect: a non-empty A-record (the ALB's public IPs). If empty,
 #         wait ~30s and retry; Route 53 propagation isn't done yet.
-#         If still empty after ~5 min, the alias didn't write (Path 2
-#         module-managed: check `aws_route53_record.alb_alias` is in
-#         state; Path 1 operator-managed: re-run Step 2's UPSERT).
+#         If still empty after ~5 min, the alias didn't write — both
+#         paths are terraform-managed: check the relevant record is in
+#         state (Path 2: `aws_route53_record.alb_alias`; Path 1: the root
+#         `aws_route53_record.bootstrap_alb_cross_account`) and re-apply.
 
 # 0a. Cert chain validates against public roots (no -k flag).
 #    This is the highest-risk part of first-apply: a wrong cert ARN
