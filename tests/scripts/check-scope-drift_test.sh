@@ -97,7 +97,7 @@ test_in_sync() {
     report_fail "$name" "expected exit 0, got $rc. Output: $out"
     return
   fi
-  if ! echo "$out" | grep -q "OK: bug_report.yml Component dropdown matches"; then
+  if ! grep -q "OK: bug_report.yml Component dropdown matches" <<<"$out"; then
     report_fail "$name" "expected OK message, got: $out"
     return
   fi
@@ -125,11 +125,11 @@ test_form_only_drift() {
     report_fail "$name" "expected non-zero exit, got 0. Output: $out"
     return
   fi
-  if ! echo "$out" | grep -q "In bug_report.yml but NOT in CLAUDE.md"; then
+  if ! grep -q "In bug_report.yml but NOT in CLAUDE.md" <<<"$out"; then
     report_fail "$name" "expected form-only-drift message, got: $out"
     return
   fi
-  if ! echo "$out" | grep -q "bonus-scope"; then
+  if ! grep -q "bonus-scope" <<<"$out"; then
     report_fail "$name" "expected 'bonus-scope' in output, got: $out"
     return
   fi
@@ -156,18 +156,18 @@ test_claude_only_drift() {
     report_fail "$name" "expected non-zero exit, got 0. Output: $out"
     return
   fi
-  if ! echo "$out" | grep -q "In CLAUDE.md Scopes table but NOT in bug_report.yml"; then
+  if ! grep -q "In CLAUDE.md Scopes table but NOT in bug_report.yml" <<<"$out"; then
     report_fail "$name" "expected claude-only-drift message, got: $out"
     return
   fi
   # Assert EACH missing scope is reported, not just one or the other.
   # A partial-output regression that only emits one side of the diff
   # would previously slip past a combined 'missing|server' match.
-  if ! echo "$out" | grep -q "missing"; then
+  if ! grep -q "missing" <<<"$out"; then
     report_fail "$name" "expected 'missing' scope in output, got: $out"
     return
   fi
-  if ! echo "$out" | grep -q "server"; then
+  if ! grep -q "server" <<<"$out"; then
     report_fail "$name" "expected 'server' scope in output, got: $out"
     return
   fi
@@ -279,7 +279,7 @@ EOF
     report_fail "$name" "expected non-zero exit, got 0. Output: $out"
     return
   fi
-  if ! echo "$out" | grep -q "no .id: component. dropdown"; then
+  if ! grep -q "no .id: component. dropdown" <<<"$out"; then
     report_fail "$name" "expected actionable error about missing dropdown, got: $out"
     return
   fi
@@ -311,7 +311,7 @@ EOF
     report_fail "$name" "expected non-zero exit, got 0. Output: $out"
     return
   fi
-  if ! echo "$out" | grep -q "could not find .### Scopes. heading"; then
+  if ! grep -q "could not find .### Scopes. heading" <<<"$out"; then
     report_fail "$name" "expected actionable error, got: $out"
     return
   fi
@@ -348,7 +348,7 @@ EOF
     report_fail "$name" "expected non-zero exit, got 0. Output: $out"
     return
   fi
-  if ! echo "$out" | grep -q "parsed to zero rows"; then
+  if ! grep -q "parsed to zero rows" <<<"$out"; then
     report_fail "$name" "expected zero-rows error, got: $out"
     return
   fi
@@ -379,7 +379,7 @@ test_duplicate_component_in_form() {
     report_fail "$name" "expected non-zero exit, got 0. Output: $out"
     return
   fi
-  if ! echo "$out" | grep -q "duplicate component"; then
+  if ! grep -q "duplicate component" <<<"$out"; then
     report_fail "$name" "expected 'duplicate component' error, got: $out"
     return
   fi
@@ -405,7 +405,7 @@ test_other_leak_into_claude_md() {
     report_fail "$name" "expected non-zero exit, got 0. Output: $out"
     return
   fi
-  if ! echo "$out" | grep -q "form-only sentinel"; then
+  if ! grep -q "form-only sentinel" <<<"$out"; then
     report_fail "$name" "expected 'form-only sentinel' targeted advice, got: $out"
     return
   fi
@@ -448,7 +448,7 @@ EOF
   fi
   # Success path should acknowledge `other` is present even when it
   # came in via dict-shape, not the simpler "NOT present" warning.
-  if ! echo "$out" | grep -q "plus 'other' in the form"; then
+  if ! grep -q "plus 'other' in the form" <<<"$out"; then
     report_fail "$name" "expected success message to confirm 'other' present, got: $out"
     return
   fi
@@ -472,7 +472,7 @@ test_form_without_other_warns() {
     report_fail "$name" "expected exit 0, got $rc. Output: $out"
     return
   fi
-  if ! echo "$out" | grep -q "NOT present"; then
+  if ! grep -q "NOT present" <<<"$out"; then
     report_fail "$name" "expected 'NOT present' warning, got: $out"
     return
   fi
@@ -518,7 +518,7 @@ EOF
     report_fail "$name" "silent failure — grep -vx likely tripped set -e"
     return
   fi
-  if ! echo "$out" | grep -q "parsed to zero rows"; then
+  if ! grep -q "parsed to zero rows" <<<"$out"; then
     report_fail "$name" "expected zero-rows error, got: $out"
     return
   fi

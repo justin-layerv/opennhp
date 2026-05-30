@@ -53,6 +53,12 @@ report_fail() { fail=$((fail + 1)); failures+="  ✗ $1: $2\n"; printf '  \033[3
 
 # ----------------------------------------------------------------------------
 # Matchers (each returns 0 for "pattern present", 1 for "absent")
+#
+# When adding a matcher, grep the herestring: `grep -qE 'pat' <<<"$1"`, NOT
+# `printf '%s\n' "$1" | grep -qE 'pat'`. `grep -q` exits on first match and
+# SIGPIPEs the upstream writer; under `set -o pipefail` (set above) that becomes
+# a spurious exit 141 on a job that actually matched — a timing-dependent flake
+# (#2256). The herestring has no upstream writer to race.
 # ----------------------------------------------------------------------------
 
 # Pipeline:
@@ -83,16 +89,22 @@ report_fail() { fail=$((fail + 1)); failures+="  ✗ $1: $2\n"; printf '  \033[3
 # arg or repo collection, not the auth identity) and work fine on
 # installation tokens. Don't widen without a documented case.
 matches_gh_api_user() {
-  printf '%s\n' "$1" \
+  # Capture the filtered text, then grep -q the herestring. A `grep -q` at the
+  # end of a pipe early-exits on first match and SIGPIPEs the upstream stages;
+  # under `set -o pipefail` that surfaces as a spurious exit 141 ("write error:
+  # Broken pipe") on a job that actually matched — a timing-dependent CI flake
+  # (#2256). The capture pipeline has no early-exit consumer, so it can't race.
+  local filtered
+  filtered=$(printf '%s\n' "$1" \
     | sed -e ':a' -e '$!{N;ba' -e '}' -e 's/\\\n[[:space:]]*/ /g' \
     | sed 's/[[:space:]]\{1,\}#.*$//' \
     | grep -vE '^[[:space:]]*#' \
-    | grep -E 'gh[[:space:]]+api[[:space:]]+' \
-    | grep -qE '/user($|[^a-zA-Z0-9_/])'
+    | grep -E 'gh[[:space:]]+api[[:space:]]+')
+  grep -qE '/user($|[^a-zA-Z0-9_/])' <<<"$filtered"
 }
 
 matches_app_slug_output_ref() {
-  printf '%s\n' "$1" | grep -qE 'steps\.app_token\.outputs\.app-slug'
+  grep -qE 'steps\.app_token\.outputs\.app-slug' <<<"$1"
 }
 
 # Closes a wiring gap: `matches_app_slug_output_ref` and
@@ -128,7 +140,7 @@ matches_app_slug_output_ref() {
 # the YAML structure ever gets clever enough to warrant it.
 matches_app_slug_env_wiring() {
   # shellcheck disable=SC2016 # literal `${{ ... }}` is GitHub Actions expression syntax.
-  printf '%s\n' "$1" | grep -qE 'APP_SLUG:[[:space:]]*\$\{\{[[:space:]]*steps\.app_token\.outputs\.app-slug[[:space:]]*\}\}'
+  grep -qE 'APP_SLUG:[[:space:]]*\$\{\{[[:space:]]*steps\.app_token\.outputs\.app-slug[[:space:]]*\}\}' <<<"$1"
 }
 
 # Explicit alternation — `${APP_SLUG}` OR `$APP_SLUG`, no malformed
@@ -142,7 +154,7 @@ matches_app_slug_env_wiring() {
 # only, drop the unbraced alternative.
 matches_auth_user_from_app_slug() {
   # shellcheck disable=SC2016 # literal `$` and braces are regex content, not parameter expansion.
-  printf '%s\n' "$1" | grep -qE 'AUTH_USER="(\$\{APP_SLUG\}|\$APP_SLUG)\[bot\]"'
+  grep -qE 'AUTH_USER="(\$\{APP_SLUG\}|\$APP_SLUG)\[bot\]"' <<<"$1"
 }
 
 # Pin the `EXPECTED_BOT_USER` constant. The header comment at the env
@@ -154,7 +166,7 @@ matches_auth_user_from_app_slug() {
 # When the App is genuinely renamed, update both this matcher's
 # pattern AND the workflow env in the same PR.
 matches_expected_bot_user_pinned() {
-  printf '%s\n' "$1" | grep -qE 'EXPECTED_BOT_USER:[[:space:]]+ops-routines-reader\[bot\]'
+  grep -qE 'EXPECTED_BOT_USER:[[:space:]]+ops-routines-reader\[bot\]' <<<"$1"
 }
 
 # ----------------------------------------------------------------------------
