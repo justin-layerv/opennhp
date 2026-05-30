@@ -300,17 +300,9 @@ build {
         # failure). Without this trap a half-completed run leaves a stale
         # manifest on the runner that can confuse a retry.
         "trap 'rm -f \"$MANIFEST\"' EXIT",
-        # The manifest's artifact_id field is "region:ami-id" (or comma-separated
-        # for multi-region builds). Extract the ami-id for the build region.
-        "AMI_LINE=$(jq -r '.builds[-1].artifact_id' \"$MANIFEST\")",
-        # On any failure path below, dump the manifest contents before exit so
-        # the operator debugging the failed run sees what Packer actually
-        # wrote — instead of just \"no artifact_id\" with no context. The trap
-        # above still removes the manifest file on exit, so this is the only
-        # chance to see it.
-        "if [ -z \"$AMI_LINE\" ] || [ \"$AMI_LINE\" = \"null\" ]; then echo \"ERROR: no artifact_id in $MANIFEST\"; echo '--- $MANIFEST contents ---'; cat \"$MANIFEST\" || true; exit 1; fi",
-        "AMI_ID=$(echo \"$AMI_LINE\" | tr ',' '\\n' | awk -F: -v r=\"$AWS_REGION\" '$1 == r {print $2}')",
-        "if ! echo \"$AMI_ID\" | grep -Eq '^ami-[0-9a-f]+$'; then echo \"ERROR: parsed AMI ID '$AMI_ID' from manifest is not a valid ami-* identifier (full artifact_id: '$AMI_LINE')\"; echo '--- $MANIFEST contents ---'; cat \"$MANIFEST\" || true; exit 1; fi",
+        # The shared parser extracts the build-region ami-* from Packer's
+        # region:ami-* artifact_id and dumps the manifest on malformed input.
+        "AMI_ID=$(\"${path.root}/../scripts/ami-id-from-manifest.sh\" \"$MANIFEST\" \"$AWS_REGION\")",
         "aws ssm put-parameter --region \"$AWS_REGION\" --name \"/$ENVIRONMENT/nhp/server/ami-id\" --value \"$AMI_ID\" --type String --overwrite",
         "echo \"Published $AMI_ID to /$ENVIRONMENT/nhp/server/ami-id\"",
       ]

@@ -21,39 +21,69 @@ set -ex
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
 echo "Starting NHP AC installation at $(date)"
 
-export DEBIAN_FRONTEND=noninteractive
-
-# Define retry helper inline (needed before AWS CLI and REGION are available)
 mkdir -p /home/ubuntu/scripts
-retry_with_backoff() {
-    local max_attempts=$1 delay=$2 max_delay=$3; shift 3
-    local attempt=1
-    while true; do
-        if "$@"; then return 0; fi
-        if [ "$attempt" -ge "$max_attempts" ]; then echo "ERROR: $* failed after $max_attempts attempts"; return 1; fi
-        echo "$* failed (attempt $attempt/$max_attempts), retrying in $${delay}s..."
-        sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
-        if [ "$delay" -gt "$max_delay" ]; then delay=$max_delay; fi
-    done
+
+# The custom AC AMI (packer/nhp-ac.pkr.hcl) must bake every runtime package/tool
+# below. Do not install packages or repair missing tooling during boot: that
+# would put AC startup back on external package/tooling availability, where a
+# transient upstream outage can abort user_data under `set -e` before
+# Traefik/docker come up. If this check fails, the AMI is incomplete and should
+# be rebuilt instead of self-healed here.
+# Keep xtrace quiet while probing packages; the explicit missing list below is
+# the operator-facing diagnostic if validation fails.
+set +x
+declare -a MISSING_BAKED_PACKAGES=()
+
+package_installed() {
+  local package=$1 status
+  status=$(dpkg-query -W -f='$${Status}' "$package" 2>/dev/null || true)
+  [ "$status" = "install ok installed" ]
 }
-apt_get_with_retry() { retry_with_backoff 10 2 60 apt-get "$@"; }
 
-apt_get_with_retry update -y
-# Note: awscli package deprecated in Ubuntu 24.04, using unzip + curl for AWS CLI v2
-apt_get_with_retry install -y jq curl docker.io gettext-base iptables ipset unzip netcat-openbsd
-# iptables-persistent is pre-seeded to skip interactive prompts during install
-echo iptables-persistent iptables-persistent/autosave_v4 boolean false | debconf-set-selections
-echo iptables-persistent iptables-persistent/autosave_v6 boolean false | debconf-set-selections
-apt_get_with_retry install -y iptables-persistent
+require_baked_binary() {
+  local package=$1 binary=$2
+  if ! package_installed "$package" || ! command -v "$binary" >/dev/null 2>&1; then
+    MISSING_BAKED_PACKAGES+=("$package")
+  fi
+}
 
-# Install AWS CLI v2 (works on all Ubuntu versions)
-if ! command -v aws &> /dev/null; then
-  echo "Installing AWS CLI v2..."
-  curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-  unzip -q /tmp/awscliv2.zip -d /tmp
-  /tmp/aws/install
-  rm -rf /tmp/aws /tmp/awscliv2.zip
+require_baked_python_module() {
+  local package=$1 module=$2
+  if ! package_installed "$package" || ! python3 -c "import $module" >/dev/null 2>&1; then
+    MISSING_BAKED_PACKAGES+=("$package")
+  fi
+}
+
+require_baked_command() {
+  local dependency=$1 binary=$2
+  if ! command -v "$binary" >/dev/null 2>&1; then
+    MISSING_BAKED_PACKAGES+=("$dependency")
+  fi
+}
+
+require_baked_binary "jq" "jq"
+require_baked_binary "curl" "curl"
+require_baked_binary "docker.io" "docker"
+require_baked_binary "gettext-base" "envsubst"
+require_baked_binary "iptables" "iptables"
+require_baked_binary "ipset" "ipset"
+require_baked_binary "unzip" "unzip"
+require_baked_binary "netcat-openbsd" "nc"
+require_baked_binary "iptables-persistent" "netfilter-persistent"
+require_baked_binary "ca-certificates" "update-ca-certificates"
+require_baked_command "awscli-v2" "aws"
+# python3-cryptography is a library package, so validate the importable module
+# in addition to dpkg status instead of trying to normalize it to command -v.
+require_baked_python_module "python3-cryptography" "cryptography"
+
+if [ "$${#MISSING_BAKED_PACKAGES[@]}" -gt 0 ]; then
+  echo "ERROR: AC AMI is missing baked runtime packages/tools: $${MISSING_BAKED_PACKAGES[*]}"
+  echo "Rebuild the AC AMI with packer/nhp-ac.pkr.hcl; user_data intentionally does not run apt-get at boot."
+  exit 1
 fi
+set -x
+echo "All baked runtime dependencies present; skipping apt-get at boot"
+
 aws --version
 
 # Enable and start Docker
@@ -680,8 +710,8 @@ fi
 # The AC registers with NHP servers using cloud mode credentials.
 # ============================================================================
 
-# Install cryptography library for key generation
-apt_get_with_retry install -y python3-cryptography
+# python3-cryptography (used for key generation below) is verified in the baked
+# runtime dependency check near the top of this script.
 
 # Per-instance secret name
 AC_SECRET_NAME="${name_prefix}-ac-$INSTANCE_ID"
@@ -1835,12 +1865,12 @@ systemctl start nhp-health-monitor
 # job of #2007's post-deploy smoke (TCP+FRP handshake from a knocked-
 # in agent); don't conflate the two.
 %{ if frp_control_upstream_host != "" || length(frp_control_additional_upstreams) > 0 ~}
-# Precheck: `nc` is installed at the top of user_data via apt
-# (netcat-openbsd); fail loudly here rather than letting the loop
-# below FATAL with the misleading "Traefik didn't bind" message
-# if the install failed.
+# Precheck: `nc` is validated at the top of user_data as a baked
+# netcat-openbsd dependency; keep this local guard so the loop below
+# does not FATAL with the misleading "Traefik didn't bind" message
+# if the AMI is incomplete.
 if ! command -v nc >/dev/null 2>&1; then
-  echo "FATAL: nc binary not found — netcat-openbsd install failed earlier in user_data. The post-Traefik listener-bind verification cannot run." >&2
+  echo "FATAL: nc binary not found — netcat-openbsd is missing from the baked AC AMI. The post-Traefik listener-bind verification cannot run." >&2
   exit 1
 fi
 for FRPS_CONTROL_PORT in ${join(" ", frp_control_listener_ports)}; do

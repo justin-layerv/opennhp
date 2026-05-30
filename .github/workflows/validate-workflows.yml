@@ -177,6 +177,13 @@ jobs:
       - name: Test + enforce image-tag writer allowlist
         run: bash tests/scripts/check-image-tag-writer-allowlist_test.sh
 
+      # Shared by the Server/AC Packer post-processors and the AC
+      # workflow-side publish workaround in build-and-push.yml. This keeps
+      # Packer's region:ami-* artifact_id parsing from drifting across the
+      # three callers.
+      - name: Test AMI ID manifest parser
+        run: bash tests/scripts/ami-id-from-manifest_test.sh
+
       # Structural fence for the dependabot-go-tidy bot-identity preflight
       # (PR #1777). PR #1384 used `gh api /user`, which 403s on App
       # installation tokens; PR #1777 swapped to the action's `app-slug`

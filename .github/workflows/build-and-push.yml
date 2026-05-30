@@ -101,6 +101,8 @@ jobs:
       tests: ${{ steps.filter.outputs.tests }}
       lambdas: ${{ steps.filter.outputs.lambdas }}
       packer: ${{ steps.filter.outputs.packer }}
+      packer_server: ${{ steps.filter.outputs.packer_server }}
+      packer_ac: ${{ steps.filter.outputs.packer_ac }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -153,6 +155,10 @@ jobs:
               - 'terraform/lambda/**'
             packer:
               - 'packer/**'
+            packer_server:
+              - 'packer/nhp-server-docker.pkr.hcl'
+            packer_ac:
+              - 'packer/nhp-ac.pkr.hcl'
 
       - name: Change Detection Summary
         run: |
@@ -166,6 +172,8 @@ jobs:
             echo "| Tests | ${{ steps.filter.outputs.tests }} |"
             echo "| Lambdas | ${{ steps.filter.outputs.lambdas }} |"
             echo "| Packer | ${{ steps.filter.outputs.packer }} |"
+            echo "| Packer Server AMI | ${{ steps.filter.outputs.packer_server }} |"
+            echo "| Packer AC AMI | ${{ steps.filter.outputs.packer_ac }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Force build override
@@ -229,30 +237,29 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # ============================================================================
-  # PACKER - Build Docker-optimized AMI if missing or packer files changed
+  # PACKER - Build runtime-baked AMIs if missing or packer files changed
   # ============================================================================
-  # The AMI is required for Terraform — there is no fallback to vanilla Ubuntu.
-  # This job builds the AMI and publishes its ID to SSM Parameter Store.
-  # Terraform reads from SSM, so once built, subsequent deploys reuse it.
+  # The Server and AC AMIs are required for Terraform — there is no fallback to
+  # vanilla Ubuntu. This job builds the AMIs and publishes their IDs to SSM
+  # Parameter Store. Terraform reads from SSM, so once built, subsequent deploys
+  # reuse them.
   #
   # This job always runs on pushes to main and workflow_dispatch (so that
   # terraform-plan has a deterministic dependency). Internally it decides
-  # whether to actually build by checking two things:
-  #   1. Did packer/** files change on this commit?
-  #   2. Is the SSM parameter missing (fresh env bootstrap)?
-  # If either is true, we build. Otherwise the job is a no-op that succeeds
-  # immediately and terraform-plan continues.
+  # whether to actually build each component by checking two things:
+  #   1. Did that component's Packer template change on this commit?
+  #   2. Is that component's SSM parameter missing (fresh env bootstrap)?
+  # If either is true for a component, we build only that AMI. Otherwise the
+  # job is a no-op that succeeds immediately and terraform-plan continues.
   # ============================================================================
   packer-build:
     name: Packer Build AMI (${{ matrix.environment }})
     needs: [changes, setup]
     runs-on: ubuntu-latest
-    # 30 minutes (was 20) gives headroom for the rare slow run: an
-    # apt mirror flap, ECR auth backoff, or a multi-region copy can each
-    # add a few minutes. The happy path is ~10 minutes; the extra 10 minute
-    # buffer is cheap insurance against an occasional flake forcing a
-    # full re-run. Bump again only if we observe sustained run times >25m.
-    timeout-minutes: 30
+    # 45 minutes gives headroom for building both Server and AC AMIs. A rare
+    # apt mirror flap, ECR auth backoff, or multi-region copy can each
+    # add a few minutes. Bump again only if we observe sustained run times >40m.
+    timeout-minutes: 45
     if: |
       (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
       github.event_name == 'workflow_dispatch'
@@ -280,28 +287,30 @@ jobs:
       #
       # These roles are intentionally separate from the broader
       # AWS_ROLE_ARN / AWS_PROD_ROLE_ARN that the rest of the workflow
-      # uses. They have only the amazon-ebs builder permissions plus a
-      # scoped ssm:PutParameter on /{env}/nhp/server/ami-id, defined in
-      # terraform/modules/ecr/packer.tf. See that file for the rationale
-      # on why packer-build is granted a separate role from the
-      # terraform-apply role.
+      # uses. They have the amazon-ebs builder permissions plus scoped
+      # ssm:PutParameter on /{env}/nhp/{server,ac}/ami-id, defined in
+      # terraform/modules/ecr/packer.tf. The workflow still reads/verifies
+      # AMI parameters through the environment deploy role, and publishes
+      # the AC AMI from that role, so the first main run that adds the new
+      # AC parameter path is not blocked waiting for the Packer role's
+      # updated SSM policy to apply. See terraform/modules/ecr/packer.tf
+      # for why packer-build is separate from the terraform-apply role.
       #
       # The Terraform output `github_actions_packer_role_arn` (in both
       # terraform/environments/sandbox and terraform/environments/prod)
       # exposes the ARN to put in the corresponding GitHub Actions secret.
     # AWS_REGION is inherited from the workflow-level `env:` block at the top
     # of this file (currently us-east-2). All AWS-touching steps in this job
-    # — Configure AWS credentials, the Packer build itself, and the SSM
-    # publish post-processor — read from that single source of truth so
-    # changing the region is a one-line edit at the top of the workflow.
+    # read from that single source of truth so changing the region is a
+    # one-line edit at the top of the workflow.
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (AMI parameter read)
         uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
         with:
-          role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PACKER_PROD_ROLE_ARN || secrets.AWS_PACKER_SANDBOX_ROLE_ARN }}
+          role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Check if AMI already exists
@@ -310,41 +319,71 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
           set -euo pipefail
-          SSM_PARAM="/${ENVIRONMENT}/nhp/server/ami-id"
+          COMPONENTS=(server ac)
 
           # Distinguish "ParameterNotFound" (expected fresh-env case) from
           # other errors (creds, region, network) so a transient failure
           # doesn't silently force a rebuild on every run.
-          if PARAM_VALUE=$(aws ssm get-parameter --name "$SSM_PARAM" --query 'Parameter.Value' --output text 2>/tmp/ssm-err); then
-            echo "AMI exists in SSM: $PARAM_VALUE"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          for component in "${COMPONENTS[@]}"; do
+            SSM_PARAM="/${ENVIRONMENT}/nhp/${component}/ami-id"
+            ERR_FILE="/tmp/${component}-ami-ssm-err"
 
-          if grep -q "ParameterNotFound" /tmp/ssm-err; then
-            echo "No AMI found in SSM (ParameterNotFound) — will build"
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            if PARAM_VALUE=$(aws ssm get-parameter --name "$SSM_PARAM" --query 'Parameter.Value' --output text 2>"$ERR_FILE"); then
+              echo "${component} AMI exists in SSM: $PARAM_VALUE"
+              echo "${component}_exists=true" >> "$GITHUB_OUTPUT"
+              continue
+            fi
 
-          echo "::error::Unexpected SSM error checking $SSM_PARAM:"
-          cat /tmp/ssm-err
-          exit 1
+            if grep -q "ParameterNotFound" "$ERR_FILE"; then
+              echo "No ${component} AMI found in SSM (ParameterNotFound) — will build"
+              echo "${component}_exists=false" >> "$GITHUB_OUTPUT"
+              continue
+            fi
+
+            echo "::error::Unexpected SSM error checking $SSM_PARAM:"
+            cat "$ERR_FILE"
+            exit 1
+          done
 
       - name: Decide whether to build
         id: should-build
         env:
-          PACKER_CHANGED: ${{ needs.changes.outputs.packer }}
-          AMI_EXISTS: ${{ steps.check-ami.outputs.exists }}
+          SERVER_TEMPLATE_CHANGED: ${{ needs.changes.outputs.packer_server }}
+          AC_TEMPLATE_CHANGED: ${{ needs.changes.outputs.packer_ac }}
+          SERVER_AMI_EXISTS: ${{ steps.check-ami.outputs.server_exists }}
+          AC_AMI_EXISTS: ${{ steps.check-ami.outputs.ac_exists }}
         run: |
           set -euo pipefail
-          if [[ "$PACKER_CHANGED" == "true" || "$AMI_EXISTS" == "false" ]]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "Will build AMI (packer_changed=$PACKER_CHANGED, ami_exists=$AMI_EXISTS)"
-          else
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping build — AMI exists and packer files unchanged"
+          build_server=false
+          build_ac=false
+
+          if [[ "$SERVER_TEMPLATE_CHANGED" == "true" || "$SERVER_AMI_EXISTS" == "false" ]]; then
+            build_server=true
           fi
+          if [[ "$AC_TEMPLATE_CHANGED" == "true" || "$AC_AMI_EXISTS" == "false" ]]; then
+            build_ac=true
+          fi
+
+          if [[ "$build_server" == "true" || "$build_ac" == "true" ]]; then
+            build_any=true
+          else
+            build_any=false
+          fi
+
+          {
+            echo "server=$build_server"
+            echo "ac=$build_ac"
+            echo "any=$build_any"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Packer build decision: server=$build_server (template_changed=$SERVER_TEMPLATE_CHANGED, exists=$SERVER_AMI_EXISTS), ac=$build_ac (template_changed=$AC_TEMPLATE_CHANGED, exists=$AC_AMI_EXISTS)"
+
+      - name: Configure AWS credentials (Packer build)
+        if: steps.should-build.outputs.any == 'true'
+        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
+        with:
+          role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PACKER_PROD_ROLE_ARN || secrets.AWS_PACKER_SANDBOX_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
       # Verify Packer pin integrity BEFORE Setup Packer runs. This step
       # catches three classes of pin breakage at the earliest possible moment:
@@ -359,7 +398,7 @@ jobs:
       # ran after, a bad action SHA would fail Setup Packer first and the
       # verifier would never get a chance to surface the cleaner error.
       - name: Verify Packer pin integrity
-        if: steps.should-build.outputs.build == 'true'
+        if: steps.should-build.outputs.any == 'true'
         env:
           # gh CLI needs auth to call repos/.../git/commits/{sha}. The
           # default GITHUB_TOKEN has read access to public repos which is
@@ -385,13 +424,15 @@ jobs:
             exit 1
           fi
 
-          # Check 2 — packer/*.pkr.hcl plugin constraint is pinned to a
+          # Check 2 — packer/*.pkr.hcl plugin constraints are pinned to a
           # constrained range, not floating to whatever the latest plugin
           # release happens to be at build time.
-          if ! grep -q 'version *= *"~> *[0-9]' packer/nhp-server-docker.pkr.hcl; then
-            echo "::error::packer/nhp-server-docker.pkr.hcl required_plugins.amazon.version is missing or floating. Pin it to a constrained range (current: \"~> 1.3\")."
-            exit 1
-          fi
+          for template in packer/nhp-server-docker.pkr.hcl packer/nhp-ac.pkr.hcl; do
+            if ! grep -q 'version *= *"~> *[0-9]' "$template"; then
+              echo "::error::${template} required_plugins.amazon.version is missing or floating. Pin it to a constrained range (current: \"~> 1.3\")."
+              exit 1
+            fi
+          done
 
           # Check 3 — the setup-packer action SHA pin actually resolves
           # on GitHub. This is the check that would have caught the bad
@@ -455,13 +496,14 @@ jobs:
           echo "  setup-packer SHA $ACTION_SHA resolves on $ACTION_REPO"
 
       - name: Setup Packer
-        if: steps.should-build.outputs.build == 'true'
+        if: steps.should-build.outputs.any == 'true'
         uses: hashicorp/setup-packer@c3d53c525d422944e50ee27b840746d6522b08de # v3.2.0
         with:
           # Pin a specific Packer version so a surprise upstream release
           # can't change AMI build behaviour mid-rollout. Bump intentionally
           # when upgrading (coordinate with packer/nhp-server-docker.pkr.hcl
-          # required_plugins). The "Verify Packer pin integrity" step
+          # and packer/nhp-ac.pkr.hcl required_plugins). The
+          # "Verify Packer pin integrity" step
           # above asserts the runner Packer version is still pinned (not
           # "latest"), the version actually exists as a hashicorp/packer
           # release, the template plugin pin is still present, AND the
@@ -469,41 +511,71 @@ jobs:
           #
           # When bumping: the bump procedure is documented at
           # packer/nhp-server-docker.pkr.hcl::"Pin the Amazon plugin..."
+          # (nhp-ac.pkr.hcl uses the same Amazon plugin constraint)
           # and includes verifying the new release exists via:
           #   gh api repos/hashicorp/packer/releases/tags/v<NEW> -q .tag_name
           version: 1.15.1
 
       - name: Packer Init
-        if: steps.should-build.outputs.build == 'true'
+        if: steps.should-build.outputs.any == 'true'
         working-directory: packer
-        run: packer init nhp-server-docker.pkr.hcl
+        env:
+          BUILD_SERVER_AMI: ${{ steps.should-build.outputs.server }}
+          BUILD_AC_AMI: ${{ steps.should-build.outputs.ac }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_SERVER_AMI" == "true" ]]; then
+            packer init nhp-server-docker.pkr.hcl
+          fi
+          if [[ "$BUILD_AC_AMI" == "true" ]]; then
+            packer init nhp-ac.pkr.hcl
+          fi
 
       - name: Packer Validate
-        if: steps.should-build.outputs.build == 'true'
+        if: steps.should-build.outputs.any == 'true'
         working-directory: packer
         env:
           ENVIRONMENT: ${{ matrix.environment }}
           AWS_BUILD_REGION: ${{ env.AWS_REGION }}
           GIT_SHA: ${{ github.sha }}
+          BUILD_SERVER_AMI: ${{ steps.should-build.outputs.server }}
+          BUILD_AC_AMI: ${{ steps.should-build.outputs.ac }}
         run: |
           set -euo pipefail
           # Run packer validate before packer build so syntax / template errors
           # surface in seconds, not after a 10-minute build attempt that ends
           # with the same syntax error. Same -var set as the build step below
           # so the validation matches the actual invocation.
-          packer validate \
-            -var "environment=${ENVIRONMENT}" \
-            -var "aws_region=${AWS_BUILD_REGION}" \
-            -var "git_sha=${GIT_SHA}" \
-            nhp-server-docker.pkr.hcl
+          if [[ "$BUILD_SERVER_AMI" == "true" ]]; then
+            packer validate \
+              -var "environment=${ENVIRONMENT}" \
+              -var "aws_region=${AWS_BUILD_REGION}" \
+              -var "git_sha=${GIT_SHA}" \
+              nhp-server-docker.pkr.hcl
+          fi
+          if [[ "$BUILD_AC_AMI" == "true" ]]; then
+            # Temporary first-merge IAM-ordering workaround: AC publishes from
+            # the deploy role below while the Packer role's new scoped
+            # /<env>/nhp/ac/ami-id grant lands. Collapse back to Packer
+            # publishing in #2248.
+            packer validate \
+              -var "environment=${ENVIRONMENT}" \
+              -var "aws_region=${AWS_BUILD_REGION}" \
+              -var "git_sha=${GIT_SHA}" \
+              -var "runtime_packages_only=true" \
+              -var "publish_ssm=false" \
+              nhp-ac.pkr.hcl
+          fi
 
       - name: Packer Build
-        if: steps.should-build.outputs.build == 'true'
+        if: steps.should-build.outputs.any == 'true'
         working-directory: packer
         env:
           ENVIRONMENT: ${{ matrix.environment }}
           AWS_BUILD_REGION: ${{ env.AWS_REGION }}
           GIT_SHA: ${{ github.sha }}
+          BUILD_SERVER_AMI: ${{ steps.should-build.outputs.server }}
+          BUILD_AC_AMI: ${{ steps.should-build.outputs.ac }}
         run: |
           set -euo pipefail
           # -on-error=cleanup tells Packer to terminate the builder instance
@@ -512,36 +584,96 @@ jobs:
           # a transient build failure leaves a billing surprise.
           # git_sha is embedded in the AMI name and tags so an operator can
           # grep an AMI back to the exact packer/* template version.
-          packer build \
-            -on-error=cleanup \
-            -var "environment=${ENVIRONMENT}" \
-            -var "aws_region=${AWS_BUILD_REGION}" \
-            -var "git_sha=${GIT_SHA}" \
-            nhp-server-docker.pkr.hcl
+          if [[ "$BUILD_SERVER_AMI" == "true" ]]; then
+            packer build \
+              -on-error=cleanup \
+              -var "environment=${ENVIRONMENT}" \
+              -var "aws_region=${AWS_BUILD_REGION}" \
+              -var "git_sha=${GIT_SHA}" \
+              nhp-server-docker.pkr.hcl
+          fi
+          if [[ "$BUILD_AC_AMI" == "true" ]]; then
+            # See #2248: CI keeps publish_ssm=false until the dedicated Packer
+            # role's AC SSM grant is steady-state in every environment.
+            packer build \
+              -on-error=cleanup \
+              -var "environment=${ENVIRONMENT}" \
+              -var "aws_region=${AWS_BUILD_REGION}" \
+              -var "git_sha=${GIT_SHA}" \
+              -var "runtime_packages_only=true" \
+              -var "publish_ssm=false" \
+              nhp-ac.pkr.hcl
+          fi
+
+      - name: Configure AWS credentials (AMI parameter publish/verify)
+        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
+        with:
+          role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Publish AC AMI Parameter
+        if: steps.should-build.outputs.ac == 'true'
+        working-directory: packer
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          AWS_BUILD_REGION: ${{ env.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          MANIFEST="manifest-ac-${ENVIRONMENT}.json"
+          SSM_PARAM="/${ENVIRONMENT}/nhp/ac/ami-id"
+
+          if [[ ! -f "$MANIFEST" ]]; then
+            echo "::error::AC Packer manifest $MANIFEST not found; cannot publish $SSM_PARAM"
+            exit 1
+          fi
+
+          trap 'rm -f "$MANIFEST"' EXIT
+          if ! AMI_ID=$("../scripts/ami-id-from-manifest.sh" "$MANIFEST" "$AWS_BUILD_REGION"); then
+            echo "::error::Could not parse AC AMI ID from $MANIFEST for $AWS_BUILD_REGION"
+            exit 1
+          fi
+
+          aws ssm put-parameter \
+            --name "$SSM_PARAM" \
+            --value "$AMI_ID" \
+            --type String \
+            --overwrite
+          echo "Published AC AMI $AMI_ID to $SSM_PARAM"
 
       - name: Verify SSM Parameter
         env:
           ENVIRONMENT: ${{ matrix.environment }}
-          DID_BUILD: ${{ steps.should-build.outputs.build }}
+          BUILT_SERVER_AMI: ${{ steps.should-build.outputs.server }}
+          BUILT_AC_AMI: ${{ steps.should-build.outputs.ac }}
         run: |
           set -euo pipefail
-          SSM_PARAM="/${ENVIRONMENT}/nhp/server/ami-id"
-          AMI_ID=$(aws ssm get-parameter --name "$SSM_PARAM" --query 'Parameter.Value' --output text)
+          COMPONENTS=(server ac)
 
-          # Defence in depth: even though the packer post-processor parses
-          # the manifest itself, double-check here that the SSM value is a
-          # bare ami-* identifier and not a "region:ami-*" string.
-          if ! echo "$AMI_ID" | grep -Eq '^ami-[0-9a-f]+$'; then
-            echo "::error::SSM parameter $SSM_PARAM contains invalid AMI ID '$AMI_ID' (expected ami-XXXX)"
-            exit 1
-          fi
-
-          echo "AMI ID: $AMI_ID"
           {
             echo "## Packer Build (${ENVIRONMENT})"
-            echo "AMI: \`${AMI_ID}\`"
-            echo "Built on this run: ${DID_BUILD}"
+            echo "Built server AMI on this run: ${BUILT_SERVER_AMI}"
+            echo "Built AC AMI on this run: ${BUILT_AC_AMI}"
+            echo ""
           } >> "$GITHUB_STEP_SUMMARY"
+
+          for component in "${COMPONENTS[@]}"; do
+            SSM_PARAM="/${ENVIRONMENT}/nhp/${component}/ami-id"
+            if ! AMI_ID=$(aws ssm get-parameter --name "$SSM_PARAM" --query 'Parameter.Value' --output text); then
+              echo "::error::SSM parameter $SSM_PARAM is missing after the Packer build decision. The component should have been built when its parameter was absent; inspect the Check if AMI already exists and Packer Build steps."
+              exit 1
+            fi
+
+            # Defence in depth: even though the packer post-processor parses
+            # the manifest itself, double-check here that the SSM value is a
+            # bare ami-* identifier and not a "region:ami-*" string.
+            if ! echo "$AMI_ID" | grep -Eq '^ami-[0-9a-f]+$'; then
+              echo "::error::SSM parameter $SSM_PARAM contains invalid AMI ID '$AMI_ID' (expected ami-XXXX)"
+              exit 1
+            fi
+
+            echo "${component} AMI ID: $AMI_ID"
+            echo "- ${component}: \`${AMI_ID}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
 
   # ============================================================================
   # TEST - Runs after terraform validation/plan passes (or is skipped)
@@ -1167,8 +1299,15 @@ jobs:
         # .github/workflows/*.yml. The runner scripts live under tests/;
         # cover them explicitly here so a typo lands at PR time, not later.
         run: |
+          shellcheck ./tests/lints/ac-apt-guard/run-fixtures.sh
           shellcheck ./tests/lints/terraform-prod-drift/run-fixtures.sh
           shellcheck ./tests/lints/terraform-tag-charset/run-fixtures.sh
+
+      - name: Run AC apt guard fixture suite
+        # Regression fence for the AC user_data no-runtime-apt invariant in
+        # terraform/modules/ac/main.tf. Runs unconditionally so regex drift
+        # cannot hide until the next AC boot-path incident.
+        run: ./tests/lints/ac-apt-guard/run-fixtures.sh
 
       - name: Run terraform-prod-drift fixture suite
         # Regression fences for #1316 (resource-policy Condition denylist)

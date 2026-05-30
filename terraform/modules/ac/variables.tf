@@ -38,6 +38,31 @@ variable "environment" {
   }
 }
 
+# =============================================================================
+# AMI Configuration
+# =============================================================================
+
+variable "ac_ami_id" {
+  description = <<-EOT
+    Runtime-baked AMI ID for NHP AC instances.
+
+    If not set, reads from SSM parameter: /{environment}/nhp/ac/ami-id
+    If neither exists, Terraform fails at plan time (no fallback to vanilla Ubuntu).
+
+    The live Terraform-managed AC still pulls the deploy-selected Docker image
+    at boot; this AMI bakes the OS/runtime package layer so user_data can fail
+    closed when jq/docker/ipset/etc. are missing instead of running apt.
+
+    Build and publish AMI:
+      cd packer && packer build -var 'environment=sandbox' \
+        -var 'runtime_packages_only=true' nhp-ac.pkr.hcl
+      aws ssm put-parameter --name "/sandbox/nhp/ac/ami-id" \
+        --value "ami-xxx" --type String --overwrite
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "domain_name" {
   description = "Domain name for the AC (e.g., nhp.layerv.xyz)"
   type        = string

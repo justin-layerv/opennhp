@@ -1024,6 +1024,7 @@ module "ac" {
   }
 
   environment        = var.environment
+  ac_ami_id          = var.ac_ami_id
   domain_name        = var.domain_name
   hosted_zone        = var.hosted_zone
   hosted_zone_id     = var.hosted_zone_id

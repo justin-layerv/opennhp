@@ -193,7 +193,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-redirect-url-drift lint-disable-agent-validation lint-run-fuzz
+lint: lint-redirect-url-drift lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
@@ -255,6 +255,20 @@ lint-run-fuzz:
 	@./tests/lints/run-fuzz/run-fixtures.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] run-fuzz wrapper check passed!$(END_COLOUR)"
 
+# Fence AC user_data against boot-time apt update/install/upgrade regressions.
+# Runtime dependencies must be baked by packer/nhp-ac.pkr.hcl and validated at
+# boot, not installed from the public Ubuntu mirror in user_data.
+.PHONY: lint-ac-apt-guard
+lint-ac-apt-guard:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking AC boot-time apt guard...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck tests/lints/ac-apt-guard/run-fixtures.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@./tests/lints/ac-apt-guard/run-fixtures.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] AC boot-time apt guard passed!$(END_COLOUR)"
+
 # Run the same checks CI runs for .github/workflows/**,
 # .github/ISSUE_TEMPLATE/**, and CLAUDE.md's Scopes table.
 # CI splits these across two workflows:
@@ -306,6 +320,7 @@ lint-workflows:
 	@bash tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh
 	@bash scripts/check-nhp-server-internal-url-validation-drift.sh
 	@bash tests/scripts/check-image-tag-writer-allowlist_test.sh
+	@bash tests/scripts/ami-id-from-manifest_test.sh
 	@python3 -c 'import yaml' 2>/dev/null || { \
 		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \
 		echo "$(COLOUR_RED)  Match the CI install: python3 -m pip install --no-cache-dir pyyaml$(END_COLOUR)"; \

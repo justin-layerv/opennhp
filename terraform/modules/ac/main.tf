@@ -160,9 +160,26 @@ resource "aws_lambda_invocation" "keygen" {
   }
 }
 
-# Ubuntu 24.04 LTS (Noble Numbat) - latest LTS with updated python3-cryptography
-data "aws_ssm_parameter" "ubuntu_ami" {
-  name = "/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id"
+# AMI Selection (fail-fast, no fallback):
+# 1. If var.ac_ami_id is set directly, use it
+# 2. Otherwise, read from SSM parameter /{environment}/nhp/ac/ami-id
+#
+# The AMI must be pre-built with the AC runtime packages installed. Without a
+# custom AMI, Terraform fails at plan time with a clear error instead of
+# launching vanilla Ubuntu that user_data intentionally refuses to self-heal
+# with apt at boot.
+#
+# Build and publish AMI:
+#   cd packer && packer build -var 'environment=sandbox' \
+#     -var 'runtime_packages_only=true' nhp-ac.pkr.hcl
+#   aws ssm put-parameter --name "/sandbox/nhp/ac/ami-id" \
+#     --value "ami-xxx" --type String --overwrite
+#
+# Naming aligned with sibling /${env}/nhp/ac/* parameters
+# (image-tag, asg-name, active-color, ...).
+data "aws_ssm_parameter" "ac_ami" {
+  count = var.ac_ami_id == null ? 1 : 0
+  name  = "/${var.environment}/nhp/ac/ami-id"
 }
 
 # ==================== Locals ====================
@@ -171,6 +188,11 @@ locals {
   is_prod    = var.environment == "prod"
   account_id = data.aws_caller_identity.current.account_id
   region     = data.aws_region.current.id
+
+  # Fail fast: either var.ac_ami_id is set, or SSM parameter must exist.
+  ac_ami_id = var.ac_ami_id != null ? var.ac_ami_id : data.aws_ssm_parameter.ac_ami[0].value
+
+  ac_runtime_apt_regex = "(?m)^[[:space:]]*(?:\\([[:space:]]*)?(?:(?:sudo|env|command)[[:space:]]+|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)*(?:apt_get_with_retry|(?:/[^[:space:]]+/)?(?:apt-get|apt|aptitude))[[:space:]]+(?:update|install|upgrade|dist-upgrade|full-upgrade)\\b"
 
   resolved_max_capacity             = coalesce(var.ac_max_capacity, local.is_prod ? 6 : 3)
   resolved_deletion_spike_threshold = coalesce(var.secret_reconciliation_deletion_spike_threshold, local.is_prod ? 10 : 60)
@@ -1104,6 +1126,37 @@ resource "terraform_data" "qurl_router_frp_server_urls_comment_escape_fence" {
   }
 }
 
+# DO NOT REMOVE - load-bearing plan-time fence. AC runtime dependencies must be
+# baked into the AMI, not installed by user_data. Any executable apt site here
+# puts boot back on the public Ubuntu mirror path and can regress standby health
+# during transient mirror sync windows. This scans the full init template and
+# this file's small launch-template bootstrap heredoc for obvious apt
+# invocations; it is intentionally a source-scan fence, not a full shell parser,
+# and it does not inspect rendered output from future template interpolations.
+# That boundary is acceptable because today's template inputs are data values,
+# not shell fragments; add a rendered-output apt fence if that ever changes.
+#
+# Lockstep: adding a `require_baked_*` check in user_data.sh.tpl MUST land with
+# the matching packer/nhp-ac.pkr.hcl bake change. Pairing stricter user_data
+# validation with a stale AC AMI fails loud by design.
+resource "terraform_data" "ac_user_data_runtime_apt_guard_fence" {
+  lifecycle {
+    precondition {
+      condition = length(concat(
+        regexall(
+          local.ac_runtime_apt_regex,
+          file("${path.module}/user_data.sh.tpl"),
+        ),
+        regexall(
+          local.ac_runtime_apt_regex,
+          file("${path.module}/main.tf"),
+        ),
+      )) == 0
+      error_message = "AC user_data/bootstrap must not run apt update/install/upgrade at boot. Bake runtime dependencies into the AC AMI and validate them in user_data instead of adding runtime package installs."
+    }
+  }
+}
+
 # Render-shape fence for the qurl-router middleware block. When the
 # router is enabled, the rendered user_data MUST contain the
 # `frpServerUrls = [` literal — a templatefile-condition regression
@@ -1164,7 +1217,7 @@ resource "terraform_data" "ac_user_data_qurl_router_render_check" {
 # Launch Template
 resource "aws_launch_template" "ac" {
   name_prefix   = "${var.name_prefix}-ac-"
-  image_id      = data.aws_ssm_parameter.ubuntu_ami.value
+  image_id      = local.ac_ami_id
   instance_type = local.is_prod ? "c6i.xlarge" : "t3.medium"
 
   iam_instance_profile {
@@ -1188,12 +1241,17 @@ resource "aws_launch_template" "ac" {
   }
 
   # Full init script is stored in S3 (exceeds EC2's 16KB user_data limit).
-  # This bootstrap installs AWS CLI, downloads the init script, and execs it.
+  # This bootstrap validates the baked AWS CLI/curl tools, downloads the init
+  # script, and execs it. It intentionally does not install missing tools at
+  # boot; the AC launch template is pinned to local.ac_ami_id and the AMI must
+  # be rebuilt if bootstrap dependencies are absent.
   # An md5 of the rendered local.user_data is embedded so a content change
   # forces a launch template version bump (and thus an instance refresh on
   # the next deploy). See the in-heredoc comment for why md5(local.user_data)
   # instead of the S3 object's etag.
   # Keep in sync with modules/compute/main.tf::aws_launch_template.server.
+  # The apt-guard fixture extracts this BOOTSTRAP heredoc by delimiter; update
+  # tests/lints/ac-apt-guard/run-fixtures.sh if the assignment shape changes.
   user_data = var.plugin_bucket_name != null ? base64encode(<<-BOOTSTRAP
 #!/bin/bash
 set -ex
@@ -1212,14 +1270,21 @@ exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
 # Report bootstrap failures to CloudWatch for operational visibility
 report_failure() {
   echo "BOOTSTRAP FAILED: $1"
-  command -v aws &>/dev/null && aws cloudwatch put-metric-data \
+  local region="$${REGION:-}"
+  [ -n "$region" ] && command -v aws &>/dev/null && aws cloudwatch put-metric-data \
     --namespace "LayerV/NHP" \
     --metric-name "BootstrapFailure" \
     --value 1 --unit Count \
     --dimensions "Component=ac,Environment=${var.environment}" \
-    --region "$REGION" 2>/dev/null || true
+    --region "$region" 2>/dev/null || true
 }
 trap 'report_failure "unexpected error on line $LINENO"' ERR
+for binary in aws curl; do
+  if ! command -v "$binary" >/dev/null 2>&1; then
+    report_failure "missing baked bootstrap dependency: $binary"
+    exit 1
+  fi
+done
 # Retry helper (same as user_data.sh.tpl)
 retry_with_backoff() {
   local max_attempts=$1 delay=$2 max_delay=$3; shift 3
@@ -1232,15 +1297,6 @@ retry_with_backoff() {
     if [ "$delay" -gt "$max_delay" ]; then delay=$max_delay; fi
   done
 }
-apt_get_with_retry() { retry_with_backoff 10 2 60 apt-get "$@"; }
-# Install unzip (not present on Ubuntu 24.04 minimal AMI)
-export DEBIAN_FRONTEND=noninteractive
-apt_get_with_retry update -y
-apt_get_with_retry install -y unzip
-# Install AWS CLI v2
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-unzip -qo /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --update
-rm -rf /tmp/awscliv2.zip /tmp/aws
 # Get region from IMDSv2
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)

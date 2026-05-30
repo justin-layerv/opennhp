@@ -2,7 +2,7 @@
 # PACKER BUILD IAM ROLE (per-environment, dedicated)
 #
 # Used by .github/workflows/build-and-push.yml::packer-build to bake the
-# Docker-optimized NHP Server AMI introduced in PR #252.
+# runtime AMIs Terraform-managed Server and AC launch templates consume.
 #
 # Why a separate role from `nhp-${var.environment}-github-actions`:
 #
@@ -81,15 +81,18 @@ resource "aws_iam_role" "github_actions_packer" {
 #   - snapshot + register the AMI (CreateSnapshot + CreateImage + RegisterImage)
 #   - clean up on success or failure (Terminate + Delete + Deregister)
 #
-# Plus a scoped ssm:PutParameter for the shell-local post-processor that
-# publishes the resulting AMI ID to /{env}/nhp/server/ami-id (introduced
-# in PR #252 and renamed in round 5 to align with the existing /{env}/nhp/server/*
-# convention). The SSM grant is scoped to the exact parameter path so
-# this role cannot write to any other SSM parameter, even within
-# /{env}/nhp/server/* (e.g. it can't touch image-tag or asg-name).
+# Plus scoped ssm:PutParameter grants for shell-local post-processors that
+# publish resulting AMI IDs to /{env}/nhp/server/ami-id and
+# /{env}/nhp/ac/ami-id. CI currently publishes the AC parameter from the
+# environment deploy role after the build so the first main run adding this new
+# path is not blocked by IAM propagation/ordering, but the scoped grant keeps
+# standalone and steady-state Packer publishes least-privileged. The SSM grant
+# is scoped to the exact parameter paths so this role cannot write to any other
+# SSM parameter, even within /{env}/nhp/{server,ac}/* (e.g. it can't touch
+# image-tag or asg-name).
 resource "aws_iam_policy" "github_actions_packer_build" {
   name        = "nhp-${var.environment}-github-actions-packer-build"
-  description = "Permissions for the packer-build job to bake the NHP Server Docker AMI (introduced in #252, granted in this PR)."
+  description = "Permissions for the packer-build job to bake NHP Server and AC runtime AMIs."
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -148,21 +151,27 @@ resource "aws_iam_policy" "github_actions_packer_build" {
         }
       },
       {
-        Sid      = "SSMPutAMIIDParameter"
-        Effect   = "Allow"
-        Action   = ["ssm:PutParameter"]
-        Resource = "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/server/ami-id"
+        Sid    = "SSMPutAMIIDParameter"
+        Effect = "Allow"
+        Action = ["ssm:PutParameter"]
+        Resource = [
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/server/ami-id",
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/ac/ami-id"
+        ]
       },
       {
         # Packer's SSM put-parameter call also needs ssm:GetParameter to
         # read the parameter back for the --overwrite path. AWS CLI's
         # put-parameter --overwrite is technically a Put-only operation
         # but some IAM contexts require Get for the response handling.
-        # Scoping to the same single parameter as the Put.
-        Sid      = "SSMGetAMIIDParameter"
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
-        Resource = "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/server/ami-id"
+        # Scoping to the same two parameters as the Put.
+        Sid    = "SSMGetAMIIDParameter"
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
+        Resource = [
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/server/ami-id",
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/ac/ami-id"
+        ]
       }
     ]
   })
@@ -174,7 +183,7 @@ resource "aws_iam_role_policy_attachment" "github_actions_packer_build" {
 }
 
 output "github_actions_packer_role_arn" {
-  description = "ARN of the dedicated IAM role assumed by the build-and-push.yml::packer-build job. After applying this module, store this ARN in the GitHub Actions repo secret AWS_PACKER_SANDBOX_ROLE_ARN (sandbox) or AWS_PACKER_PROD_ROLE_ARN (prod)."
+  description = "ARN of the dedicated IAM role assumed by the build-and-push.yml::packer-build job for Server and AC AMI builds. After applying this module, store this ARN in the GitHub Actions repo secret AWS_PACKER_SANDBOX_ROLE_ARN (sandbox) or AWS_PACKER_PROD_ROLE_ARN (prod)."
   value       = aws_iam_role.github_actions_packer.arn
 }
 

@@ -33,6 +33,7 @@ module "nhp" {
   multi_tenant                = var.multi_tenant
   deploy_etcd                 = var.deploy_etcd
   server_ami_id               = var.server_ami_id
+  ac_ami_id                   = var.ac_ami_id
   min_capacity                = var.min_capacity
   max_capacity                = var.max_capacity
   vpc_cidr                    = var.vpc_cidr
@@ -631,7 +632,7 @@ output "github_actions_role_arn" {
 }
 
 output "github_actions_packer_role_arn" {
-  description = "Dedicated IAM role ARN for the build-and-push.yml::packer-build job. Store in GitHub Actions secret AWS_PACKER_PROD_ROLE_ARN."
+  description = "Dedicated IAM role ARN for the build-and-push.yml::packer-build Server and AC AMI builds. Store in GitHub Actions secret AWS_PACKER_PROD_ROLE_ARN."
   value       = module.nhp.github_actions_packer_role_arn
 }
 

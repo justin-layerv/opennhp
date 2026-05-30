@@ -3,6 +3,17 @@
 #
 # Usage:
 #   packer init nhp-ac.pkr.hcl
+#   packer build -var 'runtime_packages_only=true' -var 'environment=sandbox' nhp-ac.pkr.hcl
+#
+# After building for Terraform-managed AC, the AMI ID is automatically
+# published to SSM parameter:
+#   /{environment}/nhp/ac/ami-id
+#
+# Terraform-managed AC instances still pull the deploy-selected Docker image at
+# boot. This bake is load-bearing for OS/runtime packages only: user_data fails
+# closed if jq/docker/ipset/etc. are missing and never falls back to apt.
+#
+# To build a full self-service/Marketplace image with embedded binaries:
 #   packer build -var 'image_tag=abc123' -var 'plugin_bucket=layerv-nhp-sandbox-plugins' nhp-ac.pkr.hcl
 #
 # For AWS Marketplace submission:
@@ -16,7 +27,7 @@
 packer {
   required_plugins {
     amazon = {
-      version = ">= 1.2.0"
+      version = "~> 1.3"
       source  = "github.com/hashicorp/amazon"
     }
   }
@@ -38,6 +49,7 @@ variable "environment" {
 
 variable "image_tag" {
   type        = string
+  default     = ""
   description = "Docker image tag to extract binaries from"
 }
 
@@ -49,6 +61,7 @@ variable "ecr_repo" {
 
 variable "plugin_bucket" {
   type        = string
+  default     = ""
   description = "S3 bucket containing plugins"
 }
 
@@ -82,6 +95,29 @@ variable "ami_description" {
   description = "AMI description"
 }
 
+variable "git_sha" {
+  type        = string
+  default     = "unknown"
+  description = <<-EOT
+    Git commit SHA at the time of the build. Used to tag the AMI and embed
+    in the AMI name so an operator can grep an AMI back to the exact
+    packer/* template version that produced it. CI passes this from
+    $${{ github.sha }}. Local builds default to "unknown".
+  EOT
+}
+
+variable "runtime_packages_only" {
+  type        = bool
+  default     = false
+  description = "Build only the OS/runtime package layer used by Terraform-managed AC. Skips embedding AC binaries/plugins, which live user_data refreshes from ECR/S3 at boot."
+}
+
+variable "publish_ssm" {
+  type        = bool
+  default     = true
+  description = "Publish the built AC AMI ID to /{environment}/nhp/ac/ami-id from the Packer shell-local post-processor. CI can disable this and publish from the workflow after switching to the environment deploy role."
+}
+
 # Marketplace-specific variables
 variable "marketplace" {
   type        = bool
@@ -104,8 +140,10 @@ variable "ami_regions" {
 # ==================== Locals ====================
 
 locals {
-  timestamp = formatdate("YYYYMMDD-hhmmss", timestamp())
-  ami_name  = var.marketplace ? "${var.ami_name_prefix}-${var.product_version}" : "${var.ami_name_prefix}-${var.environment}-${local.timestamp}"
+  timestamp     = formatdate("YYYYMMDD-hhmmss", timestamp())
+  git_sha_label = var.git_sha != "" ? var.git_sha : "unknown"
+  git_sha_short = length(local.git_sha_label) >= 7 ? substr(local.git_sha_label, 0, 7) : local.git_sha_label
+  ami_name      = var.marketplace ? "${var.ami_name_prefix}-${var.product_version}" : "${var.ami_name_prefix}-${var.environment}-${local.timestamp}-${local.git_sha_short}"
 
   # Common tags
   base_tags = {
@@ -123,8 +161,10 @@ locals {
 
   # Build-time tags (not for final AMI)
   build_tags = {
-    ImageTag  = var.image_tag
-    BuildTime = local.timestamp
+    ImageTag            = var.image_tag
+    BuildTime           = local.timestamp
+    GitSHA              = var.git_sha
+    RuntimePackagesOnly = var.runtime_packages_only ? "true" : "false"
   }
 
   all_tags = merge(local.base_tags, local.marketplace_tags, local.build_tags)
@@ -168,7 +208,9 @@ source "amazon-ebs" "nhp-ac" {
     volume_size           = 30 # Minimum reasonable size
     volume_type           = "gp3"
     delete_on_termination = true
-    encrypted             = var.marketplace # Encrypt for Marketplace
+    # Encrypt every internal and Marketplace build so snapshots created from
+    # the AMI inherit encryption at rest.
+    encrypted = true
   }
 
   # Marketplace requires specific snapshot settings
@@ -182,22 +224,62 @@ build {
 
   # Install base dependencies
   provisioner "shell" {
+    inline_shebang = "/bin/bash"
     inline = [
+      "set -euo pipefail",
       "echo 'Installing base dependencies...'",
-      "sudo apt-get update",
-      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io jq curl unzip gettext-base iptables ipset python3-cryptography ca-certificates",
+      "retry_with_backoff() {",
+      "  local max_attempts=$1 delay=$2 max_delay=$3",
+      "  shift 3",
+      "  local attempt=1",
+      "  while true; do",
+      "    if \"$@\"; then",
+      "      return 0",
+      "    fi",
+      "    if [ \"$attempt\" -ge \"$max_attempts\" ]; then",
+      "      echo \"ERROR: $* failed after $max_attempts attempts\"",
+      "      return 1",
+      "    fi",
+      "    echo \"$* failed (attempt $attempt/$max_attempts), retrying in $delay seconds...\"",
+      "    sleep \"$delay\"",
+      "    attempt=$((attempt + 1))",
+      "    delay=$((delay * 2))",
+      "    if [ \"$delay\" -gt \"$max_delay\" ]; then",
+      "      delay=$max_delay",
+      "    fi",
+      "  done",
+      "}",
+      "apt_get_with_retry() {",
+      "  retry_with_backoff 10 2 60 sudo env DEBIAN_FRONTEND=noninteractive apt-get \"$@\"",
+      "}",
+      "apt_get_with_retry update",
+      # Pre-seed iptables-persistent so its install is non-interactive (rules are
+      # rebuilt from scratch on every boot, so don't auto-save the build-time set).
+      "echo iptables-persistent iptables-persistent/autosave_v4 boolean false | sudo debconf-set-selections",
+      "echo iptables-persistent iptables-persistent/autosave_v6 boolean false | sudo debconf-set-selections",
+      # Bake the AC's complete runtime package set into the AMI. netcat-openbsd
+      # (nc, used by the frps-control bind check) and iptables-persistent were
+      # the only two the AC installed at boot but did NOT bake — forcing an
+      # unconditional `apt-get update` on every launch. Baking them here lets
+      # user_data.sh.tpl skip apt entirely, making AC boot independent of the
+      # public Ubuntu mirror.
+      "apt_get_with_retry install -y docker.io jq curl unzip gettext-base iptables ipset python3-cryptography ca-certificates netcat-openbsd iptables-persistent",
       "sudo systemctl enable docker",
+      "sudo systemctl start docker",
     ]
   }
 
   # Install AWS CLI v2 (more reliable than apt version)
   provisioner "shell" {
+    inline_shebang = "/bin/bash"
     inline = [
+      "set -euo pipefail",
       "echo 'Installing AWS CLI v2...'",
       "curl -sL 'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip' -o /tmp/awscliv2.zip",
       "unzip -q /tmp/awscliv2.zip -d /tmp",
       "sudo /tmp/aws/install",
       "rm -rf /tmp/aws /tmp/awscliv2.zip",
+      "aws --version",
     ]
   }
 
@@ -215,8 +297,14 @@ build {
 
   # Login to ECR and extract binaries
   provisioner "shell" {
-    inline = [
+    inline_shebang = "/bin/bash"
+    inline = var.runtime_packages_only ? [
+      "set -euo pipefail",
+      "echo 'Skipping AC binary extraction (runtime_packages_only=true); Terraform user_data pulls the active AC image at boot.'",
+      ] : [
+      "set -euo pipefail",
       "echo 'Extracting binaries from ECR...'",
+      "if [ -z \"${var.image_tag}\" ]; then echo 'ERROR: image_tag is required when runtime_packages_only=false'; exit 1; fi",
       "ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)",
       "ECR_REPO=${var.ecr_repo != "" ? var.ecr_repo : "$ACCOUNT_ID.dkr.ecr.${var.aws_region}.amazonaws.com/layerv-nhp-${var.environment}-ac"}",
       "",
@@ -250,8 +338,14 @@ build {
 
   # Download Traefik plugins from S3
   provisioner "shell" {
-    inline = [
+    inline_shebang = "/bin/bash"
+    inline = var.runtime_packages_only ? [
+      "set -euo pipefail",
+      "echo 'Skipping Traefik plugin embedding (runtime_packages_only=true); Terraform user_data downloads configured plugins at boot.'",
+      ] : [
+      "set -euo pipefail",
       "echo 'Downloading Traefik plugins from S3...'",
+      "if [ -z \"${var.plugin_bucket}\" ]; then echo 'ERROR: plugin_bucket is required when runtime_packages_only=false'; exit 1; fi",
       "for PLUGIN in ${join(" ", var.traefik_plugins)}; do",
       "  echo \"Downloading plugin: $PLUGIN (version: ${var.plugin_version})\"",
       "  sudo mkdir -p /opt/layerv/traefik/plugins-local/src/$PLUGIN",
@@ -450,5 +544,42 @@ build {
       "",
       "echo 'AMI build complete - ready for Marketplace submission!'",
     ]
+  }
+
+  # Persist the build artifact metadata so the next post-processor can publish
+  # the bare AMI ID to the environment-specific SSM parameter Terraform reads.
+  # Same manifest parsing pattern as nhp-server-docker.pkr.hcl; amazon-ebs
+  # artifact IDs are "region:ami-xxx", which cannot be written to SSM as-is.
+  post-processors {
+    post-processor "manifest" {
+      output     = "manifest-ac-${var.environment}.json"
+      strip_path = true
+      custom_data = {
+        environment           = var.environment
+        region                = var.aws_region
+        git_sha               = var.git_sha
+        runtime_packages_only = var.runtime_packages_only ? "true" : "false"
+        publish_ssm           = var.publish_ssm ? "true" : "false"
+      }
+    }
+
+    post-processor "shell-local" {
+      inline_shebang = "/bin/bash"
+      environment_vars = [
+        "AWS_REGION=${var.aws_region}",
+        "ENVIRONMENT=${var.environment}",
+      ]
+      inline = [
+        "set -euo pipefail",
+        "echo '=== Publishing AC AMI ID to SSM ==='",
+        "MANIFEST=\"manifest-ac-$ENVIRONMENT.json\"",
+        "if [ \"${var.publish_ssm}\" != \"true\" ]; then echo 'publish_ssm=false; leaving manifest for caller-managed SSM publish'; exit 0; fi",
+        "trap 'rm -f \"$MANIFEST\"' EXIT",
+        "if [ \"${var.marketplace}\" = \"true\" ]; then echo 'Marketplace build; skipping /$ENVIRONMENT/nhp/ac/ami-id publish'; exit 0; fi",
+        "AMI_ID=$(\"${path.root}/../scripts/ami-id-from-manifest.sh\" \"$MANIFEST\" \"$AWS_REGION\")",
+        "aws ssm put-parameter --region \"$AWS_REGION\" --name \"/$ENVIRONMENT/nhp/ac/ami-id\" --value \"$AMI_ID\" --type String --overwrite",
+        "echo \"Published $AMI_ID to /$ENVIRONMENT/nhp/ac/ami-id\"",
+      ]
+    }
   }
 }

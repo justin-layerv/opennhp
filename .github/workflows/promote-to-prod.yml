@@ -877,18 +877,21 @@ jobs:
           fi
           echo "All required images verified in prod ECR."
 
-      - name: Verify prod NHP Server AMI is published to SSM
-        if: inputs.run_terraform || inputs.deploy_server
+      - name: Verify prod NHP AMIs are published to SSM
+        if: inputs.run_terraform || inputs.deploy_server || inputs.deploy_ac
         env:
           AMI_MAX_AGE_DAYS: ${{ inputs.ami_max_age_days }}
           FORCE_STALE_AMI: ${{ inputs.force_stale_ami }}
+          RUN_TERRAFORM: ${{ inputs.run_terraform }}
+          DEPLOY_SERVER: ${{ inputs.deploy_server }}
+          DEPLOY_AC: ${{ inputs.deploy_ac }}
         run: |
           set -euo pipefail
-          # The compute module reads /prod/nhp/server/ami-id via
-          # aws_ssm_parameter (see terraform/modules/compute/main.tf). If the
-          # parameter is missing, terraform plan errors out partway through
-          # with a generic "couldn't find resource" message. Catch it here
-          # so the operator gets a clear, actionable error before approval.
+          # The compute and AC modules read /prod/nhp/{server,ac}/ami-id via
+          # aws_ssm_parameter (see terraform/modules/{compute,ac}/main.tf). If
+          # either parameter is missing, terraform plan errors out partway
+          # through with a generic "couldn't find resource" message. Catch it
+          # here so the operator gets a clear, actionable error before approval.
           #
           # Note on the hardcoded "/prod/" path: this entire workflow is
           # prod-specific (job name promote-to-prod, role-to-assume uses
@@ -898,82 +901,99 @@ jobs:
           # to promote to a non-prod environment, they need to change the
           # env name in many other places too — search for "/prod/",
           # "prod_", and PROD_ACCOUNT_ID before reusing.
-          AMI_PARAM="/prod/nhp/server/ami-id"
-          if ! AMI_ID=$(aws ssm get-parameter --name "$AMI_PARAM" --query 'Parameter.Value' --output text 2>/tmp/ssm-err); then
-            if grep -q "ParameterNotFound" /tmp/ssm-err; then
-              echo "::error::Prod NHP Server AMI not published yet. Build the AMI first:"
-              echo "  1. Confirm /sandbox/nhp/server/ami-id is populated in sandbox."
-              echo "  2. Run packer build manually against prod credentials, OR"
-              echo "  3. Copy the sandbox AMI to the prod account/region and publish it to $AMI_PARAM."
-              echo "  See packer/README.md for the full bootstrap procedure."
-              exit 1
-            fi
-            echo "::error::Unexpected SSM error reading $AMI_PARAM:"
-            cat /tmp/ssm-err
-            exit 1
+          COMPONENTS=()
+          if [[ "$RUN_TERRAFORM" == "true" || "$DEPLOY_SERVER" == "true" ]]; then
+            COMPONENTS+=(server)
           fi
-          if ! echo "$AMI_ID" | grep -Eq '^ami-[0-9a-f]+$'; then
-            echo "::error::Prod AMI parameter contains an invalid value: '$AMI_ID' (expected ami-<hex>)"
-            exit 1
+          if [[ "$RUN_TERRAFORM" == "true" || "$DEPLOY_AC" == "true" ]]; then
+            COMPONENTS+=(ac)
           fi
-          # Verify the AMI still exists and is available — a deregistered AMI
-          # would pass the SSM check but fail at launch_template apply time.
-          AMI_JSON=$(aws ec2 describe-images --image-ids "$AMI_ID" \
-            --query 'Images[0].{State:State,CreationDate:CreationDate}' \
-            --output json 2>/dev/null || echo '{}')
-          STATE=$(echo "$AMI_JSON" | jq -r '.State // ""')
-          CREATION=$(echo "$AMI_JSON" | jq -r '.CreationDate // ""')
-          if [[ "$STATE" != "available" ]]; then
-            echo "::error::Prod AMI $AMI_ID is not available (state=$STATE). It may have been deregistered."
-            exit 1
-          fi
-          # Stale AMI check. Stale AMIs may carry unpatched kernel/Docker
-          # vulnerabilities, so we hard-fail past the threshold. Operators
-          # have two escape valves:
-          #   1. Set ami_max_age_days higher when launching the workflow (per
-          #      run, no code change).
-          #   2. Set force_stale_ami=true to bypass the check entirely (use
-          #      for intentional rollback to an older known-good image, or
-          #      while a fresh AMI is rebuilding).
-          # The default threshold (60 days) is calibrated to the AMI rebuild
-          # cadence; tighten if rebuilds become more frequent.
           AMI_AGE_THRESHOLD_DAYS="${AMI_MAX_AGE_DAYS:-60}"
-          if [[ -n "$CREATION" ]]; then
-            # `date -d` is GNU date syntax (Linux). This step always runs on
-            # ubuntu-latest GitHub Actions runners so it works, but the same
-            # command would fail on macOS BSD `date` (which uses `-j -f`).
-            # If anyone ports this verify step to a self-hosted macOS runner
-            # or a local debugging script, swap to:
-            #   date -j -f "%Y-%m-%dT%H:%M:%S.%3NZ" "$CREATION" +%s
-            # Or, more portably, use python -c 'import datetime; ...'.
-            CREATION_EPOCH=$(date -d "$CREATION" +%s 2>/dev/null || echo 0)
-            NOW_EPOCH=$(date -u +%s)
-            AGE_DAYS=$(( (NOW_EPOCH - CREATION_EPOCH) / 86400 ))
-            if (( CREATION_EPOCH > 0 && AGE_DAYS > AMI_AGE_THRESHOLD_DAYS )); then
-              if [[ "$FORCE_STALE_AMI" == "true" ]]; then
-                echo "::warning::Prod AMI $AMI_ID is $AGE_DAYS days old (threshold $AMI_AGE_THRESHOLD_DAYS). Bypass enabled via force_stale_ami=true — proceeding."
-                {
-                  echo "## :warning: AMI age check bypassed"
-                  echo "Prod AMI \`$AMI_ID\` is **$AGE_DAYS days old** (threshold $AMI_AGE_THRESHOLD_DAYS). Operator passed \`force_stale_ami=true\` to bypass."
-                } >> "$GITHUB_STEP_SUMMARY"
-              else
-                {
-                  echo "## :x: AMI age check failed"
-                  echo "Prod AMI \`$AMI_ID\` is **$AGE_DAYS days old**, exceeding the configured threshold of **$AMI_AGE_THRESHOLD_DAYS days**."
-                  echo ""
-                  echo "Stale AMIs may carry unpatched kernel/Docker security vulnerabilities. Two ways forward:"
-                  echo ""
-                  echo "1. **Rebuild the AMI** — re-run \`build-and-push.yml::packer-build\` against prod (or merge any \`packer/\`-touching change to \`main\`) and then re-run this promotion."
-                  echo "2. **Bypass the check** — re-run this workflow with \`force_stale_ami=true\` if you are intentionally rolling back to a known-good older image."
-                } >> "$GITHUB_STEP_SUMMARY"
-                echo "::error::Prod AMI $AMI_ID is $AGE_DAYS days old, exceeding threshold $AMI_AGE_THRESHOLD_DAYS. Rebuild via packer-build or pass force_stale_ami=true to bypass."
+
+          for component in "${COMPONENTS[@]}"; do
+            case "$component" in
+              server) label="Server" ;;
+              ac) label="AC" ;;
+            esac
+
+            AMI_PARAM="/prod/nhp/${component}/ami-id"
+            ERR_FILE="/tmp/${component}-ami-ssm-err"
+            if ! AMI_ID=$(aws ssm get-parameter --name "$AMI_PARAM" --query 'Parameter.Value' --output text 2>"$ERR_FILE"); then
+              if grep -q "ParameterNotFound" "$ERR_FILE"; then
+                echo "::error::Prod NHP ${label} AMI not published yet. Build the AMI first:"
+                echo "  1. Confirm /sandbox/nhp/${component}/ami-id is populated in sandbox."
+                echo "  2. Run packer build manually against prod credentials, OR"
+                echo "  3. Copy the sandbox AMI to the prod account/region and publish it to $AMI_PARAM."
+                echo "     Cross-account copy requires the source snapshot to use a customer-managed CMK shared with prod; default aws/ebs-encrypted snapshots cannot be shared."
+                echo "  See packer/README.md for the full bootstrap procedure."
                 exit 1
               fi
-            else
-              echo "Prod AMI age: $AGE_DAYS days (threshold $AMI_AGE_THRESHOLD_DAYS) — OK"
+              echo "::error::Unexpected SSM error reading $AMI_PARAM:"
+              cat "$ERR_FILE"
+              exit 1
             fi
-          fi
-          echo "Prod NHP Server AMI verified: $AMI_ID (available)"
+            if ! echo "$AMI_ID" | grep -Eq '^ami-[0-9a-f]+$'; then
+              echo "::error::Prod ${label} AMI parameter contains an invalid value: '$AMI_ID' (expected ami-<hex>)"
+              exit 1
+            fi
+            # Verify the AMI still exists and is available — a deregistered AMI
+            # would pass the SSM check but fail at launch_template apply time.
+            AMI_JSON=$(aws ec2 describe-images --image-ids "$AMI_ID" \
+              --query 'Images[0].{State:State,CreationDate:CreationDate}' \
+              --output json 2>/dev/null || echo '{}')
+            STATE=$(echo "$AMI_JSON" | jq -r '.State // ""')
+            CREATION=$(echo "$AMI_JSON" | jq -r '.CreationDate // ""')
+            if [[ "$STATE" != "available" ]]; then
+              echo "::error::Prod ${label} AMI $AMI_ID is not available (state=$STATE). It may have been deregistered."
+              exit 1
+            fi
+            # Stale AMI check. Stale AMIs may carry unpatched kernel/Docker
+            # vulnerabilities, so we hard-fail past the threshold. Operators
+            # have two escape valves:
+            #   1. Set ami_max_age_days higher when launching the workflow (per
+            #      run, no code change).
+            #   2. Set force_stale_ami=true to bypass the check entirely (use
+            #      for intentional rollback to an older known-good image, or
+            #      while a fresh AMI is rebuilding).
+            # The default threshold (60 days) is calibrated to the AMI rebuild
+            # cadence; tighten if rebuilds become more frequent.
+            if [[ -n "$CREATION" ]]; then
+              # `date -d` is GNU date syntax (Linux). This step always runs on
+              # ubuntu-latest GitHub Actions runners so it works, but the same
+              # command would fail on macOS BSD `date` (which uses `-j -f`).
+              # If anyone ports this verify step to a self-hosted macOS runner
+              # or a local debugging script, swap to:
+              #   date -j -f "%Y-%m-%dT%H:%M:%S.%3NZ" "$CREATION" +%s
+              # Or, more portably, use python -c 'import datetime; ...'.
+              CREATION_EPOCH=$(date -d "$CREATION" +%s 2>/dev/null || echo 0)
+              NOW_EPOCH=$(date -u +%s)
+              AGE_DAYS=$(( (NOW_EPOCH - CREATION_EPOCH) / 86400 ))
+              if (( CREATION_EPOCH > 0 && AGE_DAYS > AMI_AGE_THRESHOLD_DAYS )); then
+                if [[ "$FORCE_STALE_AMI" == "true" ]]; then
+                  echo "::warning::Prod ${label} AMI $AMI_ID is $AGE_DAYS days old (threshold $AMI_AGE_THRESHOLD_DAYS). Bypass enabled via force_stale_ami=true — proceeding."
+                  {
+                    echo "## :warning: ${label} AMI age check bypassed"
+                    echo "Prod ${label} AMI \`$AMI_ID\` is **$AGE_DAYS days old** (threshold $AMI_AGE_THRESHOLD_DAYS). Operator passed \`force_stale_ami=true\` to bypass."
+                  } >> "$GITHUB_STEP_SUMMARY"
+                else
+                  {
+                    echo "## :x: ${label} AMI age check failed"
+                    echo "Prod ${label} AMI \`$AMI_ID\` is **$AGE_DAYS days old**, exceeding the configured threshold of **$AMI_AGE_THRESHOLD_DAYS days**."
+                    echo ""
+                    echo "Stale AMIs may carry unpatched kernel/Docker security vulnerabilities. Two ways forward:"
+                    echo ""
+                    echo "1. **Rebuild the AMI** — re-run \`build-and-push.yml::packer-build\` against prod (or merge any \`packer/\`-touching change to \`main\`) and then re-run this promotion."
+                    echo "2. **Bypass the check** — re-run this workflow with \`force_stale_ami=true\` if you are intentionally rolling back to a known-good older image."
+                  } >> "$GITHUB_STEP_SUMMARY"
+                  echo "::error::Prod ${label} AMI $AMI_ID is $AGE_DAYS days old, exceeding threshold $AMI_AGE_THRESHOLD_DAYS. Rebuild via packer-build or pass force_stale_ami=true to bypass."
+                  exit 1
+                fi
+              else
+                echo "Prod ${label} AMI age: $AGE_DAYS days (threshold $AMI_AGE_THRESHOLD_DAYS) — OK"
+              fi
+            fi
+            echo "Prod NHP ${label} AMI verified: $AMI_ID (available)"
+          done
 
       - name: Verify Secrets Manager secrets exist
         run: |

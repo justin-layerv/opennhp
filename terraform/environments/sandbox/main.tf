@@ -15,6 +15,7 @@ module "nhp" {
   aws_region             = var.aws_region
   aws_account_id         = var.aws_account_id
   server_ami_id          = var.server_ami_id
+  ac_ami_id              = var.ac_ami_id
   domain_name            = var.domain_name
   hosted_zone            = var.hosted_zone
   multi_tenant           = var.multi_tenant
@@ -671,7 +672,7 @@ output "github_actions_role_arn" {
 }
 
 output "github_actions_packer_role_arn" {
-  description = "ARN to put in GitHub Actions secret AWS_PACKER_SANDBOX_ROLE_ARN (see terraform/modules/ecr/packer.tf)."
+  description = "ARN to put in GitHub Actions secret AWS_PACKER_SANDBOX_ROLE_ARN for Server and AC AMI builds (see terraform/modules/ecr/packer.tf)."
   value       = module.nhp.github_actions_packer_role_arn
 }
 

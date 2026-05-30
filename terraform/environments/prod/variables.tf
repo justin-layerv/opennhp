@@ -74,6 +74,12 @@ variable "server_ami_id" {
   default     = null
 }
 
+variable "ac_ami_id" {
+  description = "Runtime-baked AMI ID for NHP AC. If null, AC module reads from /prod/nhp/ac/ami-id SSM parameter."
+  type        = string
+  default     = null
+}
+
 variable "min_capacity" {
   type = number
 }

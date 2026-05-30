@@ -131,6 +131,21 @@ variable "server_ami_id" {
   default     = null
 }
 
+variable "ac_ami_id" {
+  description = <<-EOT
+    Runtime-baked AMI ID for NHP AC instances. If null, the AC module reads
+    from SSM parameter /<environment>/nhp/ac/ami-id (aligned with sibling
+    /<environment>/nhp/ac/* parameters: image-tag, asg-name, active-color,
+    ...). Terraform fails at plan time if neither is set (no fallback to
+    vanilla Ubuntu). The Terraform-managed AC still pulls the deploy-selected
+    Docker image at boot; this AMI bakes the OS/runtime package layer so
+    user_data can fail closed when runtime packages are missing instead of
+    running apt.
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "min_capacity" {
   description = "Minimum ASG capacity"
   type        = number
