@@ -246,19 +246,25 @@ build {
   provisioner "shell" {
     inline = [
       "echo 'Cleaning up...'",
-      "",
-      "# Remove Docker (not needed at runtime)",
+
+      # Remove Docker (not needed at runtime)
       "sudo systemctl stop docker || true",
       "sudo apt-get purge -y docker.io containerd runc || true",
       "sudo apt-get autoremove -y",
       "sudo rm -rf /var/lib/docker",
-      "",
+
       "sudo apt-get clean",
       "sudo rm -rf /var/lib/apt/lists/*",
       "sudo rm -rf /tmp/* /var/tmp/*",
       "sudo rm -f /etc/ssh/ssh_host_*",
       "sudo truncate -s 0 /etc/machine-id",
-      "",
+
+      # Clear bash history (consistency with nhp-ac; #2254). truncate does the
+      # privileged write itself; `sudo cat /dev/null > /root/.bash_history` would
+      # fail — the `>` redirect runs in the unprivileged login shell (#2251).
+      "truncate -s 0 ~/.bash_history",
+      "sudo truncate -s 0 /root/.bash_history",
+
       "echo 'AMI build complete'",
     ]
   }

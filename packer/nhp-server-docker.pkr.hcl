@@ -236,6 +236,12 @@ build {
       "sudo rm -rf /var/lib/cloud/instances/* /var/lib/cloud/instance",
       "sudo rm -rf /var/lib/cloud/data/*",
       "sudo truncate -s 0 /etc/machine-id",
+      # Clear bash history (consistency with nhp-ac; #2254). truncate does the
+      # write itself so it is root-safe via sudo; `sudo cat /dev/null >
+      # /root/.bash_history` would fail — the `>` redirect runs as the
+      # unprivileged login shell (see #2251).
+      "truncate -s 0 ~/.bash_history",
+      "sudo truncate -s 0 /root/.bash_history",
       # Sanity check: the Ubuntu cloud-init image must have the ssh module
       # enabled so the keys we just removed are regenerated on first boot.
       "grep -q '^\\s*-\\s*ssh\\s*$' /etc/cloud/cloud.cfg || (echo 'ssh module missing from cloud.cfg — keys would not regenerate' && exit 1)",

@@ -504,44 +504,46 @@ build {
   provisioner "shell" {
     inline = [
       "echo 'Final cleanup for Marketplace compliance...'",
-      "",
-      "# Clean apt cache",
+
+      # Clean apt cache
       "sudo apt-get clean",
       "sudo rm -rf /var/lib/apt/lists/*",
-      "",
-      "# Clean temp files",
+
+      # Clean temp files
       "sudo rm -rf /tmp/*",
       "sudo rm -rf /var/tmp/*",
-      "",
-      "# Remove SSH host keys (regenerated on first boot)",
+
+      # Remove SSH host keys (regenerated on first boot)
       "sudo rm -f /etc/ssh/ssh_host_*",
-      "",
-      "# Clear machine-id (regenerated on first boot)",
+
+      # Clear machine-id (regenerated on first boot)
       "sudo truncate -s 0 /etc/machine-id",
       "sudo rm -f /var/lib/dbus/machine-id",
-      "",
-      "# Remove any AWS credentials that might have been cached",
+
+      # Remove any AWS credentials that might have been cached
       "rm -rf ~/.aws",
       "sudo rm -rf /root/.aws",
-      "",
-      "# Clear bash history",
-      "cat /dev/null > ~/.bash_history",
-      "sudo cat /dev/null > /root/.bash_history",
-      "history -c",
-      "",
-      "# Remove authorized_keys (Marketplace requirement)",
+
+      # Clear bash history. Use truncate (it does the privileged write itself) —
+      # NOT `sudo cat /dev/null > /root/.bash_history`, whose `>` runs in the
+      # unprivileged login shell and aborts the errexit bake (#2251). No
+      # `history -c`: dash (the default /bin/sh -e) has no such builtin (exit 127).
+      "truncate -s 0 ~/.bash_history",
+      "sudo truncate -s 0 /root/.bash_history",
+
+      # Remove authorized_keys (Marketplace requirement)
       "rm -f ~/.ssh/authorized_keys",
       "sudo rm -f /root/.ssh/authorized_keys",
-      "",
-      "# Clear cloud-init data (will re-run on first boot)",
+
+      # Clear cloud-init data (will re-run on first boot)
       "sudo cloud-init clean --logs",
-      "",
-      "# Remove any log files",
+
+      # Remove any log files
       "sudo find /var/log -type f -exec truncate -s 0 {} \\;",
-      "",
-      "# Sync filesystem",
+
+      # Sync filesystem
       "sync",
-      "",
+
       "echo 'AMI build complete - ready for Marketplace submission!'",
     ]
   }

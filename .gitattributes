@@ -12,3 +12,7 @@
 *.tfvars text eol=lf
 *.sh text eol=lf
 *.tpl text eol=lf
+# Packer templates embed shell in `inline` blocks; pin LF so a CRLF file
+# (nhp-server-docker.pkr.hcl was wholly CRLF) can't drift the others.
+*.hcl text eol=lf
+*.pkr.hcl text eol=lf
