@@ -28,6 +28,7 @@ on:
       - "scripts/check-asp-and-ac-id-lockstep.sh"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
       - "scripts/check-packer-failure-surfaced.sh"
+      - "scripts/check-app-image-line-rendered.sh"
       - "terraform/modules/qurl-reverse-tunnel-server/variables.tf"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
@@ -307,3 +308,16 @@ jobs:
 
       - name: Check Packer Build AMI failures are surfaced in notify (#2252)
         run: bash scripts/check-packer-failure-surfaced.sh
+
+      # Sibling of the packer fence above, different invariant family: that one
+      # guards "a failure must surface"; this one guards "a success must be
+      # labeled accurately" — the notify "App image" line must distinguish a
+      # fresh app-image ship (rebuilt → <sha>) from a re-roll of the existing
+      # image (unchanged …) so a stale binary can't look "live" (issue #2264 /
+      # PR #2263). The fixture test's last case enforces the real tree.
+      # shellcheck the script+test since actionlint's -shellcheck only covers
+      # workflow-embedded scripts.
+      - name: Test App-image line rendering fence (issue #2264)
+        run: |
+          shellcheck scripts/check-app-image-line-rendered.sh tests/scripts/check-app-image-line-rendered_test.sh
+          bash tests/scripts/check-app-image-line-rendered_test.sh

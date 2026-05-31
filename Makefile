@@ -324,6 +324,8 @@ lint-workflows:
 	@bash tests/scripts/check-image-tag-writer-allowlist_test.sh
 	@shellcheck .github/scripts/resolve-active-image-tag.sh tests/scripts/resolve-active-image-tag_test.sh
 	@bash tests/scripts/resolve-active-image-tag_test.sh
+	@shellcheck scripts/check-app-image-line-rendered.sh tests/scripts/check-app-image-line-rendered_test.sh
+	@bash tests/scripts/check-app-image-line-rendered_test.sh
 	@bash tests/scripts/ami-id-from-manifest_test.sh
 	@python3 -c 'import yaml' 2>/dev/null || { \
 		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \
