@@ -91,8 +91,15 @@ resource "aws_iam_role" "github_actions_packer" {
 # SSM parameter, even within /{env}/nhp/{server,ac}/* (e.g. it can't touch
 # image-tag or asg-name).
 resource "aws_iam_policy" "github_actions_packer_build" {
-  name        = "nhp-${var.environment}-github-actions-packer-build"
-  description = "Permissions for the packer-build job to bake NHP Server and AC runtime AMIs."
+  name = "nhp-${var.environment}-github-actions-packer-build"
+  # description is ForceNew on aws_iam_policy: an edit forces a destroy+recreate
+  # that needs iam:DetachRolePolicy on the -packer role, which the deploy role
+  # lacks (its "IAMRoles" statement in main.tf scopes to role/nhp-*-github-actions,
+  # excluding "-packer") — so the replace 403s and wedges the apply (it did, for
+  # ~2 days, until #2259). Frozen via ignore_changes below; the policy's real
+  # scope (Server + AC AMIs) is in the block comment above. Policy-document edits
+  # are NOT frozen and apply in-place via iam:CreatePolicyVersion.
+  description = "Permissions for the packer-build job to bake the NHP Server Docker AMI (introduced in #252, granted in this PR)."
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -175,6 +182,14 @@ resource "aws_iam_policy" "github_actions_packer_build" {
       }
     ]
   })
+
+  lifecycle {
+    # Structural guard for the ForceNew footgun documented on `description`
+    # above: ignore description drift so an edit can never force a policy
+    # replace the deploy role can't perform. Scoped to description ONLY — the
+    # policy document is intentionally still reconciled.
+    ignore_changes = [description]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "github_actions_packer_build" {
