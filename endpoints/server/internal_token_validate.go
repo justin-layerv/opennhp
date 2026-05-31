@@ -22,6 +22,20 @@ import (
 // smaller because this endpoint's contract is much tighter.
 const maxInternalTokenValidateRequestSize int64 = 4 << 10 // 4 KiB
 
+const (
+	// internalTokenValidateResponseNonceHeader carries the downstream
+	// caller's response-auth nonce. Wire format is exactly 32
+	// lowercase hex characters. When present on a successfully
+	// request-authenticated /token/validate call, the handler signs
+	// the exact response bytes into X-Nhp-Auth.
+	internalTokenValidateResponseNonceHeader = "X-Nhp-Nonce"
+	internalTokenValidateResponseNonceHexLen = 32
+	// internalTokenValidateResponseAuthPathPrefix is a signature
+	// context string, not an HTTP route. It reuses internalauth.Signer
+	// without making response HMACs replayable as request HMACs.
+	internalTokenValidateResponseAuthPathPrefix = "/nhp/internal/token/validate/response/"
+)
+
 // internalTokenValidateRequest is the JSON body of
 // POST /nhp/internal/token/validate.
 //
@@ -157,6 +171,59 @@ type internalTokenValidateResponse struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// internalTokenValidateResponseAuthPath builds the response-auth
+// signature-context path for a caller-supplied nonce, or returns ""
+// if the nonce is malformed (not exactly 32 lowercase hex chars). The
+// empty string is the same "do not sign" sentinel that responseAuthPath
+// and writeInternalTokenValidateJSON's authPath parameter use, so the
+// builder and the field it feeds share one convention. A valid result
+// is always non-empty (non-empty prefix + nonce).
+func internalTokenValidateResponseAuthPath(nonce string) string {
+	if len(nonce) != internalTokenValidateResponseNonceHexLen {
+		return ""
+	}
+	for _, r := range nonce {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			continue
+		}
+		return ""
+	}
+	return internalTokenValidateResponseAuthPathPrefix + nonce
+}
+
+// writeInternalTokenValidateJSON marshals payload and writes it as the
+// response body. authPath selects response signing: empty means write
+// the legacy unsigned body; a non-empty authPath is a pre-validated
+// signature-context path (built by internalTokenValidateResponseAuthPath
+// in handleInternalTokenValidate, only after request HMAC verification
+// and nonce-shape validation both pass) over which the exact response
+// bytes are signed into X-Nhp-Auth.
+func (hs *HttpServer) writeInternalTokenValidateJSON(ctx *gin.Context, status int, payload any, authPath string) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Error("internal token validate: marshal response failed reqID=%s err=%v", GetRequestID(ctx), err)
+		// Marshal failures are intentionally unsigned even on a signed
+		// response path. Current payload structs cannot fail to marshal
+		// in practice; if a future payload can, the verifier must reject
+		// this unsigned 500 rather than trust a body we could not sign.
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal response"})
+		return
+	}
+	if authPath != "" {
+		// A non-empty authPath is a signing request. The handler only
+		// builds one when the signer is non-nil, so this guard is
+		// defensive depth for future direct callers of the writer helper
+		// (only the direct-call unit test reaches the nil branch today).
+		if hs.internalAuthSigner == nil {
+			log.Error("internal token validate: response signing requested without signer reqID=%s", GetRequestID(ctx))
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "response signer unavailable"})
+			return
+		}
+		ctx.Header(internalauth.Header, hs.internalAuthSigner.Sign(http.MethodPost, authPath, body))
+	}
+	ctx.Data(status, "application/json; charset=utf-8", body)
+}
+
 // handleInternalTokenValidate verifies an AC-issued knock token
 // for tunnel-server PR-2c. The endpoint mirrors handleInternalKnock's
 // auth posture exactly:
@@ -172,6 +239,29 @@ type internalTokenValidateResponse struct {
 // comment at the call site) and returns a structured response
 // describing the entry's ownership + TTL.
 //
+// Response auth: callers that send an X-Nhp-Nonce of exactly 32
+// lowercase hex characters receive X-Nhp-Auth over (nonce, exact
+// response bytes) after request HMAC verification succeeds. Legacy
+// callers that omit the nonce keep receiving the unsigned response
+// body so nhp-server can roll out before qurl-reverse-tunnel-server
+// starts requiring signed responses. The server validates nonce
+// format, not uniqueness; replay protection depends on the verifier
+// generating a fresh single-use nonce per request and accepting only
+// the signature bound to that in-flight nonce. The response signature
+// uses the same shared internal-auth secret as the request, so it
+// defends against a path-positioned tamper point that lacks the
+// secret, not against a compromised authenticated caller.
+// The HTTP status is intentionally outside the signature; consumers
+// must make trust decisions from the signed JSON fields, not from
+// status alone. A status rewrite can deny service, but cannot forge
+// valid=true / owner_id without also forging the body signature.
+// Once responseAuthPath is set (after request HMAC verification and
+// nonce-shape validation both pass), downstream validation/store
+// errors are signed too; a verifier that opted in must verify any
+// signed non-200 response before classifying the status as failure.
+// The durable cross-repo contract lives in:
+// docs/design/TOKEN_VALIDATE_RESPONSE_AUTH.md.
+//
 // Idempotency: the handler does not extend ExpireTime on lookup —
 // multiple validations within the entry's TTL return identical
 // bodies.
@@ -183,6 +273,19 @@ type internalTokenValidateResponse struct {
 // holds it), so the replay adds no leverage. The skew defense lives
 // in internalauth.Signer; this handler defers to it.
 func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
+	responseNonce := ctx.GetHeader(internalTokenValidateResponseNonceHeader)
+	// responseAuthPath stays empty (legacy unsigned response) until request
+	// HMAC verification succeeds AND the opt-in nonce is well formed — see
+	// the success branch below. Keeping it empty here is what leaves pre-auth
+	// rejects, permit-mode unverified responses, and malformed-nonce 400s
+	// unsigned, per docs/design/TOKEN_VALIDATE_RESPONSE_AUTH.md.
+	responseAuthPath := ""
+	// Closure intentionally reads responseAuthPath at call time: early
+	// returns see "", while post-auth branches see the assigned signing path.
+	respond := func(status int, payload any) {
+		hs.writeInternalTokenValidateJSON(ctx, status, payload, responseAuthPath)
+	}
+
 	// Source IP check: reject non-RFC-1918 IPs.
 	//
 	// Mirror handleInternalKnock — RemoteAddr (not ctx.ClientIP())
@@ -191,7 +294,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	srcIP := extractIP(ctx.Request.RemoteAddr)
 	if !isPrivateIP(srcIP) {
 		log.Warning("internal token validate rejected: non-private source IP %s", srcIP)
-		ctx.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		respond(http.StatusForbidden, gin.H{"error": "forbidden"})
 		return
 	}
 
@@ -201,7 +304,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	// a parameter unsigned.
 	if ctx.Request.URL.RawQuery != "" || ctx.Request.URL.Fragment != "" {
 		log.Warning("internal token validate rejected: URL must have no query or fragment (got query=%q fragment=%q)", ctx.Request.URL.RawQuery, ctx.Request.URL.Fragment)
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "bad request"})
+		respond(http.StatusBadRequest, gin.H{"error": "bad request"})
 		return
 	}
 
@@ -230,13 +333,13 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		if err != nil {
 			log.Warning("internal token validate: read body failed src=%s reqID=%s err=%v",
 				srcIP, GetRequestID(ctx), err)
-			ctx.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+			respond(http.StatusBadRequest, gin.H{"error": "failed to read body"})
 			return
 		}
 		if int64(len(body)) > maxInternalTokenValidateRequestSize {
 			log.Warning("internal token validate rejected: body over limit src=%s reqID=%s size=%d limit=%d",
 				srcIP, GetRequestID(ctx), len(body), maxInternalTokenValidateRequestSize)
-			ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "body too large"})
+			respond(http.StatusRequestEntityTooLarge, gin.H{"error": "body too large"})
 			return
 		}
 		ctx.Request.Body = io.NopCloser(bytes.NewReader(body))
@@ -264,7 +367,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 				if hs.internalAuthEmit != nil {
 					hs.internalAuthEmit(MetricInternalAuthFailStrict)
 				}
-				ctx.JSON(http.StatusUnauthorized, gin.H{"error": internalauth.ErrInternalAuth.Error()})
+				respond(http.StatusUnauthorized, gin.H{"error": internalauth.ErrInternalAuth.Error()})
 				return
 			}
 			// Permit-mode: log + count, allow through. Same rollout
@@ -274,14 +377,31 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 			if hs.internalAuthEmit != nil {
 				hs.internalAuthEmit(MetricInternalAuthFailPermit)
 			}
-		} else if hs.internalAuthEmit != nil {
-			// Success path — mutually exclusive with the FailStrict /
-			// FailPermit emits above. The `else if` shape MUST stay
-			// or the Success/Fail mutual-exclusion invariant breaks.
-			// (Legacy-mode no-emit is enforced by the outer
-			// `if hs.internalAuthSigner == nil` short-circuit, not
-			// this branch.)
-			hs.internalAuthEmit(MetricInternalAuthSuccess)
+		} else {
+			if hs.internalAuthEmit != nil {
+				// Success path means request HMAC verification
+				// succeeded. Emit before response-nonce validation so
+				// an authenticated caller with a malformed opt-in nonce
+				// is still counted as request-auth success, while
+				// remaining mutually exclusive with FailStrict /
+				// FailPermit above.
+				// (Legacy-mode no-emit is enforced by the outer
+				// `if hs.internalAuthSigner == nil` short-circuit,
+				// not this branch.)
+				hs.internalAuthEmit(MetricInternalAuthSuccess)
+			}
+			if responseNonce != "" {
+				authPath := internalTokenValidateResponseAuthPath(responseNonce)
+				if authPath == "" {
+					log.Warning("internal token validate rejected: malformed response nonce reqID=%s", GetRequestID(ctx))
+					if hs.internalAuthEmit != nil {
+						hs.internalAuthEmit(MetricInternalTokenValidateBadNonce)
+					}
+					respond(http.StatusBadRequest, gin.H{"error": "bad nonce"})
+					return
+				}
+				responseAuthPath = authPath
+			}
 		}
 	}
 
@@ -305,7 +425,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	var req internalTokenValidateRequest
 	dec := json.NewDecoder(ctx.Request.Body)
 	if err := dec.Decode(&req); err != nil || dec.More() {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		respond(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
@@ -316,7 +436,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		// valid=false — a tunnel-server caller that omits the
 		// token should get a loud failure, not an authoritative
 		// "the token is invalid" response that could be cached.
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "missing token"})
+		respond(http.StatusBadRequest, gin.H{"error": "missing token"})
 		return
 	}
 
@@ -328,7 +448,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	// echo would degrade log-correlation without flagging the bug
 	// at the source.
 	if len(req.AgentRunID) > maxAgentRunIDBytes {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "agent_run_id too long"})
+		respond(http.StatusBadRequest, gin.H{"error": "agent_run_id too long"})
 		return
 	}
 
@@ -359,7 +479,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 			if loadErr != nil {
 				hs.udpServer.metrics.IncrCounter(MetricACKTokenSharedStoreReadFailure)
 				log.Warning("internal token validate shared-store lookup failed: src=%s reqID=%s err=%v", srcIP, GetRequestID(ctx), loadErr)
-				ctx.JSON(http.StatusServiceUnavailable, gin.H{"error": "token store unavailable"})
+				respond(http.StatusServiceUnavailable, gin.H{"error": "token store unavailable"})
 				return
 			}
 			if found {
@@ -371,7 +491,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 			// fleet-visible fallback. Echo the supplied run_id so the
 			// caller can correlate request/response without keeping
 			// per-call state.
-			ctx.JSON(http.StatusOK, internalTokenValidateResponse{
+			respond(http.StatusOK, internalTokenValidateResponse{
 				Valid: false,
 				RunID: req.AgentRunID,
 				Error: "not_found",
@@ -399,7 +519,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		// pinhole; the expired branch has no live pinhole, so the
 		// echoed run_id is purely a request/response correlation
 		// key and the caller's value is the safer default.
-		ctx.JSON(http.StatusOK, internalTokenValidateResponse{
+		respond(http.StatusOK, internalTokenValidateResponse{
 			Valid: false,
 			RunID: req.AgentRunID,
 			Error: "expired",
@@ -461,7 +581,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	if runID == "" {
 		runID = req.AgentRunID
 	}
-	ctx.JSON(http.StatusOK, internalTokenValidateResponse{
+	respond(http.StatusOK, internalTokenValidateResponse{
 		Valid:      true,
 		KnockSrcIP: entry.KnockSrcIP,
 		KnockUser:  user,

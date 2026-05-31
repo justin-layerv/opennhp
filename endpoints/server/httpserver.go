@@ -68,8 +68,8 @@ type HttpServer struct {
 	// on the signer==nil check before consulting require.
 	internalAuthSigner  *internalauth.Signer
 	internalAuthRequire bool
-	// internalAuthEmit is the counter-emit callback for the three
-	// /nhp/internal/knock metrics. In production it's bound to
+	// internalAuthEmit is the counter-emit callback for internal
+	// auth rollout metrics. In production it's bound to
 	// us.metrics.IncrCounter at Start time; tests plumb a capturing
 	// function to assert increment counts without spinning up a real
 	// metrics Publisher. Nil is fine (no-op).
@@ -82,6 +82,21 @@ type HttpServer struct {
 	signals struct {
 		stop chan struct{}
 	}
+}
+
+func (hs *HttpServer) installHTTPMiddleware(store sessions.Store, corsOrigins []string, logOutput io.Writer) {
+	hs.ginEngine.Use(requestIDMiddleware())
+	hs.ginEngine.Use(sessions.Sessions("nhpsessions", store))
+	hs.ginEngine.Use(securityHeadersMiddleware())
+	// Do not add response-compression middleware without updating
+	// /nhp/internal/token/validate response auth; its signature covers the
+	// exact JSON bytes written by ctx.Data.
+	hs.ginEngine.Use(corsMiddleware(corsOrigins))
+	hs.ginEngine.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		Output:    logOutput,
+		Formatter: ginLogFormatter,
+	}))
+	hs.ginEngine.Use(gin.Recovery())
 }
 
 // Note HttpServer must be started after starting UdpServer, when log and config have been setup
@@ -178,16 +193,8 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		return fmt.Errorf("NHP_COOKIE_KEYS: %w", err)
 	}
 	store := cookie.NewStore(cookieKeys...)
-	hs.ginEngine.Use(requestIDMiddleware())
-	hs.ginEngine.Use(sessions.Sessions("nhpsessions", store))
-	hs.ginEngine.Use(securityHeadersMiddleware())
 	corsOrigins := parseAllowedOrigins(os.Getenv("NHP_CORS_ALLOWED_ORIGINS"))
-	hs.ginEngine.Use(corsMiddleware(corsOrigins))
-	hs.ginEngine.Use(gin.LoggerWithConfig(gin.LoggerConfig{
-		Output:    us.log.Writer(),
-		Formatter: ginLogFormatter,
-	}))
-	hs.ginEngine.Use(gin.Recovery())
+	hs.installHTTPMiddleware(store, corsOrigins, us.log.Writer())
 
 	// Initialize health check manager (fail-fast if no storage backend)
 	if err := hs.initHealthManager(); err != nil {

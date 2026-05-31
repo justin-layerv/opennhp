@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
@@ -125,11 +127,19 @@ func newTokenValidateRouterWithCounters(t *testing.T, require bool) (*gin.Engine
 // Source IP is loopback so the RFC-1918 gate never fires.
 func doValidateRequest(t *testing.T, r *gin.Engine, body string, authHeader string) *httptest.ResponseRecorder {
 	t.Helper()
+	return doValidateRequestWithNonce(t, r, body, authHeader, "")
+}
+
+func doValidateRequestWithNonce(t *testing.T, r *gin.Engine, body string, authHeader string, nonce string) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/token/validate", strings.NewReader(body))
 	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("Content-Type", "application/json")
 	if authHeader != "" {
 		req.Header.Set(internalauth.Header, authHeader)
+	}
+	if nonce != "" {
+		req.Header.Set(internalTokenValidateResponseNonceHeader, nonce)
 	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -140,6 +150,103 @@ func doValidateRequest(t *testing.T, r *gin.Engine, body string, authHeader stri
 func signValidate(t *testing.T, signer *internalauth.Signer, body string) string {
 	t.Helper()
 	return signer.Sign(http.MethodPost, "/nhp/internal/token/validate", []byte(body))
+}
+
+func verifyValidateResponseSignature(t *testing.T, signer *internalauth.Signer, nonce string, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	authPath := internalTokenValidateResponseAuthPath(nonce)
+	if authPath == "" {
+		t.Fatalf("response auth path rejected nonce %q", nonce)
+	}
+	if err := signer.Verify(rec.Header().Get(internalauth.Header), http.MethodPost, authPath, rec.Body.Bytes(), 0); err != nil {
+		t.Fatalf("response signature did not verify: %v\nheader=%q\nbody=%s", err, rec.Header().Get(internalauth.Header), rec.Body.String())
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthWireContract(t *testing.T) {
+	const nonce = "0123456789abcdef0123456789abcdef"
+
+	if internalTokenValidateResponseNonceHeader != "X-Nhp-Nonce" {
+		t.Fatalf("response nonce header = %q, want X-Nhp-Nonce", internalTokenValidateResponseNonceHeader)
+	}
+	if internalauth.Header != "X-Nhp-Auth" {
+		t.Fatalf("response auth header = %q, want X-Nhp-Auth", internalauth.Header)
+	}
+	gotPath := internalTokenValidateResponseAuthPath(nonce)
+	wantPath := "/nhp/internal/token/validate/response/" + nonce
+	if gotPath != wantPath {
+		t.Fatalf("response auth path = %q, want %q", gotPath, wantPath)
+	}
+	if internalTokenValidateResponseAuthPath(strings.ToUpper(nonce)) != "" {
+		t.Fatal("uppercase nonce accepted")
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthRejectsCrossContextSignatures(t *testing.T) {
+	signer, err := internalauth.New(testTokenValidateSecret)
+	if err != nil {
+		t.Fatalf("internalauth.New: %v", err)
+	}
+	nonce := "0123456789abcdef0123456789abcdef"
+	responsePath := internalTokenValidateResponseAuthPath(nonce)
+	if responsePath == "" {
+		t.Fatalf("internalTokenValidateResponseAuthPath(%q) rejected nonce", nonce)
+	}
+	body := []byte(`{"valid":true}`)
+
+	requestHeader := signer.Sign(http.MethodPost, "/nhp/internal/token/validate", body)
+	if err := signer.Verify(requestHeader, http.MethodPost, responsePath, body, 0); err == nil {
+		t.Fatal("request-context signature verified in response context")
+	}
+
+	responseHeader := signer.Sign(http.MethodPost, responsePath, body)
+	if err := signer.Verify(responseHeader, http.MethodPost, "/nhp/internal/token/validate", body, 0); err == nil {
+		t.Fatal("response-context signature verified in request context")
+	}
+}
+
+func TestInternalTokenValidate_WriteJSONRejectsSignResponseWithoutSigner(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/nhp/internal/token/validate", nil)
+
+	var hs HttpServer
+	hs.writeInternalTokenValidateJSON(ctx, http.StatusOK, internalTokenValidateResponse{Valid: true}, internalTokenValidateResponseAuthPathPrefix+"0123456789abcdef0123456789abcdef")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500. body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(internalauth.Header); got != "" {
+		t.Fatalf("response signature header = %q, want absent when signer is nil", got)
+	}
+	if !strings.Contains(rec.Body.String(), "response signer unavailable") {
+		t.Fatalf("body = %q, want response signer unavailable", rec.Body.String())
+	}
+}
+
+func TestInternalTokenValidate_WriteJSONMarshalFailureIsUnsigned(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/nhp/internal/token/validate", nil)
+
+	signer, err := internalauth.New(testTokenValidateSecret)
+	if err != nil {
+		t.Fatalf("internalauth.New: %v", err)
+	}
+	hs := HttpServer{internalAuthSigner: signer}
+	hs.writeInternalTokenValidateJSON(ctx, http.StatusOK, map[string]any{"bad": make(chan int)}, internalTokenValidateResponseAuthPathPrefix+"0123456789abcdef0123456789abcdef")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500. body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(internalauth.Header); got != "" {
+		t.Fatalf("marshal-failure response signature header = %q, want absent", got)
+	}
+	if !strings.Contains(rec.Body.String(), "failed to marshal response") {
+		t.Fatalf("body = %q, want failed to marshal response", rec.Body.String())
+	}
 }
 
 type fakeACKTokenStore struct {
@@ -156,6 +263,16 @@ func (f *fakeACKTokenStore) StoreACToken(context.Context, string, *ACTokenEntry)
 func (f *fakeACKTokenStore) LoadACToken(context.Context, string) (*ACTokenEntry, bool, error) {
 	f.loadCalls++
 	return f.entry, f.found, f.err
+}
+
+type failingReadCloser struct{}
+
+func (failingReadCloser) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+func (failingReadCloser) Close() error {
+	return nil
 }
 
 func storeTestACToken(t *testing.T, us *UdpServer, token string, entry *ACTokenEntry) {
@@ -260,6 +377,497 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 		t.Errorf("decode response into fields map: %v", err)
 	} else if _, present := fields["resource_id"]; present {
 		t.Errorf("response body contains resource_id key (expected omitted until paired tunnel-server change): %s", rec.Body.String())
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthSignsNonceBoundBody(t *testing.T) {
+	r, signer, us := newTokenValidateRouter(t, true)
+
+	expire := time.Now().Add(60 * time.Second).UTC()
+	entry := &ACTokenEntry{
+		User: &common.AgentUser{
+			UserId:  "user-response-auth",
+			OwnerId: "owner-response-auth",
+		},
+		ResourceId: "r-response-auth",
+		ACTokens:   map[string]string{"r-response-auth": "ac-token-response-auth"},
+		KnockSrcIP: "203.0.113.42",
+		RunID:      "run-response-auth",
+		OpenTime:   60,
+		ExpireTime: expire,
+	}
+	storeTestACToken(t, us, "ac-token-response-auth", entry)
+
+	body := `{"token":"ac-token-response-auth","agent_run_id":"run-from-caller"}`
+	nonce := "0123456789abcdef0123456789abcdef"
+	rec := doValidateRequestWithNonce(t, r, body, signValidate(t, signer, body), nonce)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get(internalauth.Header) == "" {
+		t.Fatal("response missing X-Nhp-Auth signature")
+	}
+	verifyValidateResponseSignature(t, signer, nonce, rec)
+	// The signature covers the uncompressed JSON bytes, so the wire body
+	// must stay uncompressed. If response-compression middleware is ever
+	// added, rec.Body would hold the compressed bytes and the check above
+	// would fail as an opaque signature mismatch; this guard names the real
+	// cause. See the no-compression comment in httpserver.go's Start.
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("response Content-Encoding = %q, want empty; response auth signs uncompressed bytes (do not add response-compression middleware)", got)
+	}
+	authPath := internalTokenValidateResponseAuthPath(nonce)
+	if authPath == "" {
+		t.Fatalf("response auth path rejected nonce %q", nonce)
+	}
+	tamperedBody := append([]byte(nil), rec.Body.Bytes()...)
+	tamperedBody[len(tamperedBody)-1] ^= 0x01
+	if err := signer.Verify(rec.Header().Get(internalauth.Header), http.MethodPost, authPath, tamperedBody, 0); err == nil {
+		t.Fatal("tampered response body verified, want signature mismatch")
+	}
+
+	var got internalTokenValidateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v. body=%s", err, rec.Body.String())
+	}
+	if !got.Valid || got.OwnerId != "owner-response-auth" {
+		t.Fatalf("unexpected response after verified signature: %+v", got)
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthProductionMiddlewareDoesNotContentEncode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	signer, err := internalauth.New(testTokenValidateSecret)
+	if err != nil {
+		t.Fatalf("internalauth.New: %v", err)
+	}
+	us := &UdpServer{tokenStore: common.NewTokenStore[*ACTokenEntry]()}
+	hs := &HttpServer{
+		udpServer:           us,
+		ginEngine:           gin.New(),
+		internalAuthSigner:  signer,
+		internalAuthRequire: true,
+		internalAuthEmit:    func(string) {},
+	}
+	if err := hs.ginEngine.SetTrustedProxies(nil); err != nil {
+		t.Fatalf("SetTrustedProxies(nil): %v", err)
+	}
+	hs.installHTTPMiddleware(cookie.NewStore([]byte("0123456789abcdef0123456789abcdef")), nil, io.Discard)
+	hs.ginEngine.POST("/nhp/internal/token/validate", hs.handleInternalTokenValidate)
+
+	storeTestACToken(t, us, "ac-token-no-content-encoding", &ACTokenEntry{
+		User: &common.AgentUser{
+			UserId:  strings.Repeat("user-", 512),
+			OwnerId: strings.Repeat("owner-", 512),
+		},
+		ResourceId: "r-no-content-encoding",
+		KnockSrcIP: "203.0.113.43",
+		RunID:      "run-no-content-encoding",
+		OpenTime:   60,
+		ExpireTime: time.Now().Add(60 * time.Second).UTC(),
+	})
+
+	body := `{"token":"ac-token-no-content-encoding","agent_run_id":"run-from-caller"}`
+	nonce := "77777777777777777777777777777777"
+	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/token/validate", strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set(internalauth.Header, signValidate(t, signer, body))
+	req.Header.Set(internalTokenValidateResponseNonceHeader, nonce)
+	rec := httptest.NewRecorder()
+	hs.ginEngine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want absent so response auth verifies exact wire bytes", got)
+	}
+	verifyValidateResponseSignature(t, signer, nonce, rec)
+}
+
+func TestInternalTokenValidate_ResponseAuthSignsInvalidResponses(t *testing.T) {
+	cases := []struct {
+		name  string
+		token string
+		setup func(t *testing.T, us *UdpServer)
+		want  string
+		nonce string
+	}{
+		{
+			name:  "not found",
+			token: "ac-token-response-auth-not-found",
+			want:  "not_found",
+			nonce: "11111111111111111111111111111111",
+		},
+		{
+			name:  "expired",
+			token: "ac-token-response-auth-expired",
+			setup: func(t *testing.T, us *UdpServer) {
+				t.Helper()
+				storeTestACToken(t, us, "ac-token-response-auth-expired", &ACTokenEntry{
+					User:       &common.AgentUser{UserId: "user-expired", OwnerId: "owner-expired"},
+					ResourceId: "r-expired",
+					ExpireTime: time.Now().Add(-time.Minute).UTC(),
+				})
+			},
+			want:  "expired",
+			nonce: "22222222222222222222222222222222",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, signer, us := newTokenValidateRouter(t, true)
+			if tc.setup != nil {
+				tc.setup(t, us)
+			}
+
+			body := `{"token":"` + tc.token + `","agent_run_id":"run-invalid-signed"}`
+			rec := doValidateRequestWithNonce(t, r, body, signValidate(t, signer, body), tc.nonce)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+			}
+			verifyValidateResponseSignature(t, signer, tc.nonce, rec)
+
+			var got internalTokenValidateResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode response: %v. body=%s", err, rec.Body.String())
+			}
+			if got.Valid {
+				t.Fatalf("Valid = true, want false for %s", tc.name)
+			}
+			if got.Error != tc.want {
+				t.Fatalf("Error = %q, want %q. body=%s", got.Error, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthSignsPostAuthNonOKResponses(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		nonce   string
+		want    int
+		wantErr string
+		setup   func(t *testing.T, us *UdpServer)
+	}{
+		{
+			name:    "missing token",
+			body:    `{"agent_run_id":"run-missing-token"}`,
+			nonce:   "33333333333333333333333333333333",
+			want:    http.StatusBadRequest,
+			wantErr: "missing token",
+		},
+		{
+			name:    "invalid request body",
+			body:    `{"token":`,
+			nonce:   "55555555555555555555555555555555",
+			want:    http.StatusBadRequest,
+			wantErr: "invalid request body",
+		},
+		{
+			name:    "agent run id too long",
+			body:    `{"token":"ac-token-run-id-too-long","agent_run_id":"` + strings.Repeat("r", maxAgentRunIDBytes+1) + `"}`,
+			nonce:   "66666666666666666666666666666666",
+			want:    http.StatusBadRequest,
+			wantErr: "agent_run_id too long",
+		},
+		{
+			name:    "shared store unavailable",
+			body:    `{"token":"ac-token-store-error-signed","agent_run_id":"run-store-error"}`,
+			nonce:   "44444444444444444444444444444444",
+			want:    http.StatusServiceUnavailable,
+			wantErr: "token store unavailable",
+			setup: func(t *testing.T, us *UdpServer) {
+				t.Helper()
+				us.metrics = metrics.NewPublisherForTest(t)
+				us.ackTokenStore = &fakeACKTokenStore{err: errors.New("dynamodb unavailable")}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, signer, us := newTokenValidateRouter(t, true)
+			if tc.setup != nil {
+				tc.setup(t, us)
+			}
+
+			rec := doValidateRequestWithNonce(t, r, tc.body, signValidate(t, signer, tc.body), tc.nonce)
+
+			if rec.Code != tc.want {
+				t.Fatalf("code = %d, want %d. body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+			verifyValidateResponseSignature(t, signer, tc.nonce, rec)
+
+			var got map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode response: %v. body=%s", err, rec.Body.String())
+			}
+			if got["error"] != tc.wantErr {
+				t.Fatalf("error = %q, want %q. body=%s", got["error"], tc.wantErr, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthAbsentWithoutNonce(t *testing.T) {
+	r, signer, us := newTokenValidateRouter(t, true)
+	entry := &ACTokenEntry{
+		User:       &common.AgentUser{UserId: "user-no-nonce", OwnerId: "owner-no-nonce"},
+		ResourceId: "r-no-nonce",
+		ACTokens:   map[string]string{"r-no-nonce": "ac-token-no-nonce"},
+		RunID:      "run-no-nonce",
+		ExpireTime: time.Now().Add(60 * time.Second).UTC(),
+	}
+	storeTestACToken(t, us, "ac-token-no-nonce", entry)
+
+	body := `{"token":"ac-token-no-nonce","agent_run_id":"run-from-caller"}`
+	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(internalauth.Header); got != "" {
+		t.Fatalf("response signature header = %q, want absent for no-nonce legacy caller", got)
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthDoesNotSignStrictAuthFailure(t *testing.T) {
+	r, _, _ := newTokenValidateRouter(t, true)
+	wrongSigner, err := internalauth.New(testTokenValidateWrongSecret)
+	if err != nil {
+		t.Fatalf("internalauth.New wrong signer: %v", err)
+	}
+
+	body := `{"token":"ac-token-auth-fail","agent_run_id":"run-from-caller"}`
+	nonce := "abcdef0123456789abcdef0123456789"
+	rec := doValidateRequestWithNonce(t, r, body, signValidate(t, wrongSigner, body), nonce)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401. body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(internalauth.Header); got != "" {
+		t.Fatalf("strict auth failure response was signed (%q); unauthenticated callers must not get a signing oracle", got)
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthDoesNotSignPreAuthRejects(t *testing.T) {
+	cases := []struct {
+		name       string
+		target     string
+		remoteAddr string
+		wantCode   int
+	}{
+		{
+			name:       "non private source IP",
+			target:     "/nhp/internal/token/validate",
+			remoteAddr: "198.51.100.9:54321",
+			wantCode:   http.StatusForbidden,
+		},
+		{
+			name:       "query string",
+			target:     "/nhp/internal/token/validate?x=1",
+			remoteAddr: "127.0.0.1:54321",
+			wantCode:   http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _, _ := newTokenValidateRouter(t, true)
+			req := httptest.NewRequest(http.MethodPost, tc.target, strings.NewReader(`{"token":"ac-token-pre-auth-reject"}`))
+			req.RemoteAddr = tc.remoteAddr
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(internalTokenValidateResponseNonceHeader, "0123456789abcdef0123456789abcdef")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantCode {
+				t.Fatalf("code = %d, want %d. body=%s", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if got := rec.Header().Get(internalauth.Header); got != "" {
+				t.Fatalf("pre-auth reject response was signed (%q), want unsigned", got)
+			}
+		})
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthDoesNotSignPreAuthBodyFailures(t *testing.T) {
+	cases := []struct {
+		name     string
+		newReq   func(t *testing.T, signer *internalauth.Signer) *http.Request
+		wantCode int
+	}{
+		{
+			name: "body too large",
+			newReq: func(t *testing.T, signer *internalauth.Signer) *http.Request {
+				body := strings.Repeat("x", int(maxInternalTokenValidateRequestSize)+1)
+				req := httptest.NewRequest(http.MethodPost, "/nhp/internal/token/validate", strings.NewReader(body))
+				req.Header.Set(internalauth.Header, signValidate(t, signer, body))
+				return req
+			},
+			wantCode: http.StatusRequestEntityTooLarge,
+		},
+		{
+			name: "read failure",
+			newReq: func(t *testing.T, _ *internalauth.Signer) *http.Request {
+				req := httptest.NewRequest(http.MethodPost, "/nhp/internal/token/validate", nil)
+				req.Body = failingReadCloser{}
+				return req
+			},
+			wantCode: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, signer, _ := newTokenValidateRouter(t, true)
+			req := tc.newReq(t, signer)
+			req.RemoteAddr = "127.0.0.1:54321"
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(internalTokenValidateResponseNonceHeader, "0123456789abcdef0123456789abcdef")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantCode {
+				t.Fatalf("code = %d, want %d. body=%s", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if got := rec.Header().Get(internalauth.Header); got != "" {
+				t.Fatalf("pre-auth body-failure response was signed (%q), want unsigned", got)
+			}
+		})
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthDoesNotSignPermitModeAuthFailure(t *testing.T) {
+	r, _, us, counts := newTokenValidateRouterWithCounters(t, false)
+	wrongSigner, err := internalauth.New(testTokenValidateWrongSecret)
+	if err != nil {
+		t.Fatalf("internalauth.New wrong signer: %v", err)
+	}
+	storeTestACToken(t, us, "ac-token-permit-response-auth", &ACTokenEntry{
+		User:       &common.AgentUser{UserId: "user-permit-response-auth", OwnerId: "owner-permit-response-auth"},
+		ResourceId: "r-permit-response-auth",
+		KnockSrcIP: "10.0.0.52",
+		OpenTime:   60,
+		ExpireTime: time.Now().Add(60 * time.Second),
+	})
+
+	body := `{"token":"ac-token-permit-response-auth","agent_run_id":"run-from-caller"}`
+	nonce := "abcdef0123456789abcdef0123456789"
+	rec := doValidateRequestWithNonce(t, r, body, signValidate(t, wrongSigner, body), nonce)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 in permit mode. body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(internalauth.Header); got != "" {
+		t.Fatalf("permit-mode auth failure response was signed (%q); unverified callers must not get a signing oracle", got)
+	}
+	var got internalTokenValidateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v. body=%s", err, rec.Body.String())
+	}
+	if !got.Valid {
+		t.Fatalf("Valid = false, want permit-mode request to reach validation. body=%s", rec.Body.String())
+	}
+	if counts[MetricInternalAuthFailPermit] != 1 {
+		t.Errorf("MetricInternalAuthFailPermit = %d, want 1", counts[MetricInternalAuthFailPermit])
+	}
+	if counts[MetricInternalAuthSuccess] != 0 {
+		t.Errorf("MetricInternalAuthSuccess = %d, want 0 (bad request auth is not success)", counts[MetricInternalAuthSuccess])
+	}
+	if counts[MetricInternalAuthFailStrict] != 0 {
+		t.Errorf("MetricInternalAuthFailStrict = %d, want 0 (permit mode)", counts[MetricInternalAuthFailStrict])
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthSignsPermitModeAuthSuccess(t *testing.T) {
+	r, signer, us, counts := newTokenValidateRouterWithCounters(t, false)
+	storeTestACToken(t, us, "ac-token-permit-auth-success", &ACTokenEntry{
+		User:       &common.AgentUser{UserId: "user-permit-auth-success", OwnerId: "owner-permit-auth-success"},
+		ResourceId: "r-permit-auth-success",
+		KnockSrcIP: "10.0.0.53",
+		OpenTime:   60,
+		ExpireTime: time.Now().Add(60 * time.Second),
+	})
+
+	body := `{"token":"ac-token-permit-auth-success","agent_run_id":"run-from-caller"}`
+	nonce := "fedcba9876543210fedcba9876543210"
+	rec := doValidateRequestWithNonce(t, r, body, signValidate(t, signer, body), nonce)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 in permit mode. body=%s", rec.Code, rec.Body.String())
+	}
+	verifyValidateResponseSignature(t, signer, nonce, rec)
+
+	var got internalTokenValidateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v. body=%s", err, rec.Body.String())
+	}
+	if !got.Valid {
+		t.Fatalf("Valid = false, want signed permit-mode success. body=%s", rec.Body.String())
+	}
+	if counts[MetricInternalAuthSuccess] != 1 {
+		t.Errorf("MetricInternalAuthSuccess = %d, want 1", counts[MetricInternalAuthSuccess])
+	}
+	if counts[MetricInternalAuthFailPermit] != 0 {
+		t.Errorf("MetricInternalAuthFailPermit = %d, want 0 (request auth succeeded)", counts[MetricInternalAuthFailPermit])
+	}
+	if counts[MetricInternalAuthFailStrict] != 0 {
+		t.Errorf("MetricInternalAuthFailStrict = %d, want 0 (permit mode)", counts[MetricInternalAuthFailStrict])
+	}
+}
+
+func TestInternalTokenValidate_ResponseAuthRejectsMalformedNonceBeforeLookup(t *testing.T) {
+	cases := []struct {
+		name  string
+		nonce string
+	}{
+		{name: "uppercase", nonce: "ABCDEF0123456789ABCDEF0123456789"},
+		{name: "non hex character", nonce: "0123456789abcdef0123456789abcdeg"},
+		{name: "wrong length", nonce: "0123456789abcdef0123456789abcde"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, signer, us, counts := newTokenValidateRouterWithCounters(t, true)
+			store := &fakeACKTokenStore{err: errors.New("shared store should not be called for malformed nonce")}
+			us.ackTokenStore = store
+
+			body := `{"token":"ac-token-malformed-nonce","agent_run_id":"run-from-caller"}`
+			rec := doValidateRequestWithNonce(t, r, body, signValidate(t, signer, body), tc.nonce)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code = %d, want 400 for malformed response nonce. body=%s", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get(internalauth.Header); got != "" {
+				t.Fatalf("malformed nonce response was signed (%q), want unsigned 400", got)
+			}
+			if store.loadCalls != 0 {
+				t.Fatalf("shared-store LoadACToken calls = %d, want 0; malformed authenticated nonce should fail before lookup", store.loadCalls)
+			}
+			if counts[MetricInternalAuthSuccess] != 1 {
+				t.Errorf("MetricInternalAuthSuccess = %d, want 1 (request HMAC succeeded before nonce-shape reject)", counts[MetricInternalAuthSuccess])
+			}
+			if counts[MetricInternalTokenValidateBadNonce] != 1 {
+				t.Errorf("MetricInternalTokenValidateBadNonce = %d, want 1", counts[MetricInternalTokenValidateBadNonce])
+			}
+			if counts[MetricInternalAuthFailStrict] != 0 {
+				t.Errorf("MetricInternalAuthFailStrict = %d, want 0", counts[MetricInternalAuthFailStrict])
+			}
+			if counts[MetricInternalAuthFailPermit] != 0 {
+				t.Errorf("MetricInternalAuthFailPermit = %d, want 0", counts[MetricInternalAuthFailPermit])
+			}
+			if !strings.Contains(rec.Body.String(), "bad nonce") {
+				t.Fatalf("body = %q, want bad nonce", rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -1249,10 +1857,10 @@ func TestInternalTokenValidate_LegacyMode_NoSigner(t *testing.T) {
 }
 
 // TestInternalTokenValidate_LegacyMode_NoCounterEmit locks the
-// invariant that the auth-counter trio is signer-gated: a handler
+// invariant that the auth rollout counters are signer-gated: a handler
 // with internalAuthSigner == nil (legacy posture) must NOT emit any
-// of MetricInternalAuthSuccess / FailStrict / FailPermit, regardless
-// of request shape. The strict/permit counter tests already cover
+// of MetricInternalAuthSuccess / FailStrict / FailPermit / BadNonce,
+// regardless of request shape. The strict/permit counter tests already cover
 // signer-set; this row pins the signer-nil baseline so a future
 // refactor that moves the emit calls out from under the signer
 // nil-check would trip this immediately.
@@ -1286,9 +1894,12 @@ func TestInternalTokenValidate_LegacyMode_NoCounterEmit(t *testing.T) {
 		ExpireTime: time.Now().Add(60 * time.Second),
 	})
 	body := `{"token":"ac-token-legacy"}`
-	rec := doValidateRequest(t, r, body, "")
+	rec := doValidateRequestWithNonce(t, r, body, "", "0123456789abcdef0123456789abcdef")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("legacy mode: code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(internalauth.Header); got != "" {
+		t.Fatalf("legacy mode response was signed (%q), want nonce ignored when signer is nil", got)
 	}
 	if counts[MetricInternalAuthSuccess] != 0 {
 		t.Errorf("MetricInternalAuthSuccess = %d, want 0 (legacy mode must not emit auth counters)", counts[MetricInternalAuthSuccess])
@@ -1298,6 +1909,9 @@ func TestInternalTokenValidate_LegacyMode_NoCounterEmit(t *testing.T) {
 	}
 	if counts[MetricInternalAuthFailPermit] != 0 {
 		t.Errorf("MetricInternalAuthFailPermit = %d, want 0 (legacy mode must not emit auth counters)", counts[MetricInternalAuthFailPermit])
+	}
+	if counts[MetricInternalTokenValidateBadNonce] != 0 {
+		t.Errorf("MetricInternalTokenValidateBadNonce = %d, want 0 (legacy mode must not emit auth counters)", counts[MetricInternalTokenValidateBadNonce])
 	}
 }
 

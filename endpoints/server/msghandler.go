@@ -172,7 +172,13 @@ const (
 	// Watching Success rise while FailPermit drops is the positive
 	// signal operators need before flipping NHP_INTERNAL_AUTH_REQUIRE=true.
 	MetricInternalAuthSuccess = "InternalAuthSuccess"
-	MetricACPeerCount         = "ACPeerCount"
+	// MetricInternalTokenValidateBadNonce fires when an authenticated
+	// /nhp/internal/token/validate caller opts in to response auth with
+	// a malformed X-Nhp-Nonce. It is deliberately separate from the
+	// request-auth success/fail trio so rollout dashboards can catch
+	// verifier nonce-shape bugs without redefining request-auth success.
+	MetricInternalTokenValidateBadNonce = "InternalTokenValidateBadNonce"
+	MetricACPeerCount                   = "ACPeerCount"
 	// MetricACGraceAbsorbed increments once per /health/knock-ready probe
 	// where ACPeerChecker returned pass from the grace-window branch
 	// (live count was zero but the last-non-zero timestamp was inside
