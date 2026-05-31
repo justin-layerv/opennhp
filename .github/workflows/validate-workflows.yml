@@ -179,6 +179,16 @@ jobs:
       - name: Test + enforce image-tag writer allowlist
         run: bash tests/scripts/check-image-tag-writer-allowlist_test.sh
 
+      # Fence the canonical active-color → slot resolver (shared by
+      # build-and-push.yml, promote-to-prod.yml, blue-green-deploy.yml, and
+      # trigger-prod-deploy.sh). green→green-image-tag / blue→image-tag, and
+      # fail-closed on a read error / corrupt active-color / bad input. shellcheck
+      # both since actionlint's -shellcheck only covers workflow-embedded scripts.
+      - name: Test active-color image-tag resolver
+        run: |
+          shellcheck .github/scripts/resolve-active-image-tag.sh tests/scripts/resolve-active-image-tag_test.sh
+          bash tests/scripts/resolve-active-image-tag_test.sh
+
       # Shared by the Server/AC Packer post-processors and the AC
       # workflow-side publish workaround in build-and-push.yml. This keeps
       # Packer's region:ami-* artifact_id parsing from drifting across the

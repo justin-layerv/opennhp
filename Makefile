@@ -320,6 +320,8 @@ lint-workflows:
 	@bash tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh
 	@bash scripts/check-nhp-server-internal-url-validation-drift.sh
 	@bash tests/scripts/check-image-tag-writer-allowlist_test.sh
+	@shellcheck .github/scripts/resolve-active-image-tag.sh tests/scripts/resolve-active-image-tag_test.sh
+	@bash tests/scripts/resolve-active-image-tag_test.sh
 	@bash tests/scripts/ami-id-from-manifest_test.sh
 	@python3 -c 'import yaml' 2>/dev/null || { \
 		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \

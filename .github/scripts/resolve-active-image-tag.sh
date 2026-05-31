@@ -5,6 +5,8 @@
 # Single source of truth for the active-tag lookup, shared by:
 #   - build-and-push.yml's "Resolve Image Tag" step (sandbox dispatcher)
 #   - promote-to-prod.yml's "Gather sandbox state" step
+#   - blue-green-deploy.yml's cross-component active-tag assertion
+#   - scripts/trigger-prod-deploy.sh's sandbox state read (prod promotion helper)
 #
 # Any caller that reads /<env>/nhp/<component>/image-tag or
 # /<env>/nhp/<component>/green-image-tag directly is reading a slot, not
@@ -52,7 +54,7 @@ BASE="/${ENVIRONMENT}/nhp/${COMPONENT}"
 
 if ! COLOR=$(aws ssm get-parameter \
     --name "${BASE}/active-color" \
-    --query "Parameter.Value" --output text 2>&1); then
+    --query "Parameter.Value" --output text --no-cli-pager 2>&1); then
   echo "::error::Failed to read ${BASE}/active-color from SSM: $COLOR" >&2
   exit 1
 fi
@@ -76,7 +78,7 @@ fi
 
 if ! TAG=$(aws ssm get-parameter \
     --name "$PARAM" \
-    --query "Parameter.Value" --output text 2>&1); then
+    --query "Parameter.Value" --output text --no-cli-pager 2>&1); then
   echo "::error::Failed to read $PARAM from SSM: $TAG" >&2
   exit 1
 fi

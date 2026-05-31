@@ -62,6 +62,13 @@ done
 
 REGION="us-east-2"
 
+# Canonical blue/green active-tag resolver (single source of truth, also used by
+# build-and-push.yml, promote-to-prod.yml, blue-green-deploy.yml). Resolves the
+# live tag via the active-color → slot indirection. Located relative to this
+# script (scripts/ -> repo root -> .github/scripts/).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESOLVE_ACTIVE_TAG="$SCRIPT_DIR/../.github/scripts/resolve-active-image-tag.sh"
+
 # Script state
 PREFLIGHT_FAILED=0
 declare -a WARNINGS=()
@@ -71,8 +78,10 @@ declare -a WARNINGS=()
 SSM_SANDBOX_COMMIT="/sandbox/nhp/deploy/deployed-commit"
 SSM_SANDBOX_DEPLOYED_AT="/sandbox/nhp/deploy/deployed-at"
 SSM_SANDBOX_STATE="/sandbox/nhp/deploy/state"
-SSM_SANDBOX_SERVER_TAG="/sandbox/nhp/server/image-tag"
-SSM_SANDBOX_AC_TAG="/sandbox/nhp/ac/image-tag"
+# Sandbox server/AC tags are NOT read from a fixed slot — they are blue/green
+# and resolved via active-color → slot (RESOLVE_ACTIVE_TAG above). There is
+# deliberately no SSM_SANDBOX_{SERVER,AC}_TAG constant, so nothing can drift
+# back to reading the blue /image-tag slot directly.
 SSM_SANDBOX_QURL_TAG="/layerv-nhp-sandbox/qurl-api-image-tag"
 SSM_SANDBOX_QRTS_TAG="/sandbox/nhp/reverse-tunnel-server/image-tag"
 # Prod (AWS_PROFILE=layerv-prod)
@@ -222,6 +231,15 @@ else
     fail "jq not found. Install with: brew install jq"
 fi
 
+# Check 6: active-color resolver present (sandbox server/AC tags depend on it).
+# Without this guard a missing/renamed resolver surfaces only as a bare exit-127
+# "No such file" mid-run, then collapses into a generic "(not set)" failure.
+if [[ -f "$RESOLVE_ACTIVE_TAG" ]]; then
+    pass "active-color resolver present"
+else
+    fail "active-color resolver not found at ${RESOLVE_ACTIVE_TAG}. Expected .github/scripts/resolve-active-image-tag.sh — run from a full checkout of the nhp repo."
+fi
+
 # Hard exit if basic preflight checks failed
 if [[ "$PREFLIGHT_FAILED" -ne 0 ]]; then
     echo ""
@@ -239,14 +257,35 @@ header "READING DEPLOYMENT STATE"
 SANDBOX_COMMIT=$(read_ssm "layerv" "$SSM_SANDBOX_COMMIT")
 SANDBOX_DEPLOYED_AT=$(read_ssm "layerv" "$SSM_SANDBOX_DEPLOYED_AT")
 SANDBOX_STATE=$(read_ssm "layerv" "$SSM_SANDBOX_STATE")
-SANDBOX_SERVER_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_SERVER_TAG")
-SANDBOX_AC_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_AC_TAG")
+# Server and AC are blue/green-managed: sandbox alternates the active color on
+# every deploy, and the LIVE tag lives in the active color's slot. Reading
+# image-tag (the blue slot) unconditionally would promote the standby (stale)
+# image whenever active=green. Resolve via the canonical active-color → slot
+# resolver instead. It exits non-zero (fail-closed) on a read error or an
+# unexpected/corrupt active-color, so `|| echo ""` maps any failure to "" →
+# "(not set)" → a clean preflight fail rather than promoting a guessed/stale
+# tag. The resolver omits --region, so we pin it via env: set BOTH AWS_REGION
+# and AWS_DEFAULT_REGION (AWS precedence is --region > AWS_REGION >
+# AWS_DEFAULT_REGION), so an operator's ambient AWS_REGION can't silently send
+# only these two reads to a different region while the rest of the script's
+# explicit --region calls stay on us-east-2.
+# (QURL/QRTS below are single-tag, not blue/green; prod is canary — read directly.)
+#
+# Unlike the promote-to-prod.yml caller (which adds 2>/dev/null because its
+# ::error:: output renders as CI annotations), we intentionally let the
+# resolver's stderr through: this is an interactive operator tool, so showing
+# the specific failure cause (which active-color/slot read failed, and why)
+# inline is worth more than cosmetic quiet — the gating signal is still the
+# exit code, which `|| echo ""` turns into a clean "(not set)" preflight fail.
+SANDBOX_SERVER_TAG=$(AWS_PROFILE=layerv AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" bash "$RESOLVE_ACTIVE_TAG" sandbox server || echo "")
+SANDBOX_AC_TAG=$(AWS_PROFILE=layerv AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" bash "$RESOLVE_ACTIVE_TAG" sandbox ac || echo "")
 SANDBOX_QURL_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_QURL_TAG")
 SANDBOX_QRTS_TAG=$(read_ssm "layerv" "$SSM_SANDBOX_QRTS_TAG")
 
 info "Sandbox SSM parameters loaded"
 
-# Prod (profile=layerv-prod)
+# Prod (profile=layerv-prod). Prod is canary-deployed: server/AC each have a
+# single image-tag slot and no active-color, so a direct read is correct here.
 PROD_COMMIT=$(read_ssm "layerv-prod" "$SSM_PROD_COMMIT")
 PROD_DEPLOYED_AT=$(read_ssm "layerv-prod" "$SSM_PROD_DEPLOYED_AT")
 PROD_STATE=$(read_ssm "layerv-prod" "$SSM_PROD_STATE")
@@ -452,7 +491,7 @@ fi
 # workflow updates deployed-commit even for terraform-only changes that don't
 # build images, so deployed-commit may have no corresponding ECR image.
 if [[ "$SANDBOX_SERVER_TAG" == "(not set)" ]]; then
-    fail "Sandbox server image tag not set in SSM (${SSM_SANDBOX_SERVER_TAG})."
+    fail "Could not resolve sandbox server image tag via active-color (resolve-active-image-tag.sh sandbox server). Check /sandbox/nhp/server/active-color and the matching {image,green-image}-tag slot."
 elif AWS_PROFILE=layerv aws ecr describe-images \
     --repository-name layerv/nhp-server \
     --image-ids imageTag="${SANDBOX_SERVER_TAG}" \
@@ -464,7 +503,7 @@ fi
 
 # Check: AC image exists in ECR
 if [[ "$SANDBOX_AC_TAG" == "(not set)" ]]; then
-    fail "Sandbox AC image tag not set in SSM (${SSM_SANDBOX_AC_TAG})."
+    fail "Could not resolve sandbox AC image tag via active-color (resolve-active-image-tag.sh sandbox ac). Check /sandbox/nhp/ac/active-color and the matching {image,green-image}-tag slot."
 elif AWS_PROFILE=layerv aws ecr describe-images \
     --repository-name layerv/nhp-ac \
     --image-ids imageTag="${SANDBOX_AC_TAG}" \
