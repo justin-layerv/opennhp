@@ -57,7 +57,12 @@ assert_exit() {
 #                       (tests the extractor's end boundary — notify isn't last)
 make_wf() {
   local needs_packer="$1" env_packer="$2" logic_packer="$3" decoy_needs="$4" include_notify="$5" trailing_decoy="${6:-0}"
-  local f="$TMP/wf_${needs_packer}${env_packer}${logic_packer}${decoy_needs}${include_notify}${trailing_decoy}_$RANDOM.yml"
+  # $7 logic_deploy — deploy-failure vs validate-success branch ordering (A5):
+  #   ok=deploy-failure checked first, after=validate-success first (wrong),
+  #   ''=omit the branch entirely (A5 skips). Defaults to omit so the
+  #   packer-focused fixtures above are unaffected.
+  local logic_deploy="${7:-}"
+  local f="$TMP/wf_${needs_packer}${env_packer}${logic_packer}${decoy_needs}${include_notify}${trailing_decoy}${logic_deploy}_$RANDOM.yml"
   {
     echo "name: Build and Deploy NHP"
     echo "on:"
@@ -116,6 +121,27 @@ make_wf() {
           echo "          fi"
           ;;
       esac
+      # Optional deploy-failure vs validate-success branch (A5 ordering).
+      case "$logic_deploy" in
+        ok)
+          # Correct: deploy-failure checked BEFORE validate-success.
+          echo "          if [[ \"\$DEPLOY_FAILED\" == \"true\" ]]; then"
+          echo "            COLOR=\"#dc3545\""
+          echo "          elif [[ \"\$SANDBOX_VALIDATE\" == \"success\" ]]; then"
+          echo "            COLOR=\"#36a64f\""
+          echo "          fi"
+          ;;
+        after)
+          # Wrong order: validate-success wins first, so a failed/cancelled
+          # smoke with a green validate renders green. A5's ordering catches it.
+          echo "          if [[ \"\$SANDBOX_VALIDATE\" == \"success\" ]]; then"
+          echo "            COLOR=\"#36a64f\""
+          echo "          elif [[ \"\$DEPLOY_FAILED\" == \"true\" ]]; then"
+          echo "            COLOR=\"#dc3545\""
+          echo "          fi"
+          ;;
+        *) : ;;  # omit: no deploy/validate branch -> A5 gracefully skips
+      esac
     fi
     if [ "$trailing_decoy" = "1" ]; then
       # A job emitted AFTER notify whose needs lists packer-build. The awk
@@ -172,6 +198,15 @@ assert_exit "bad A1 (trailing scope): packer-build in a job after notify, not no
 # No notify job at all -> exit 1 (could-not-locate)
 assert_exit "bad: notify job entirely absent" \
   "$(make_wf 1 1 ok 0 0)" 1
+
+# A5 good: deploy-failure checked BEFORE validate-success -> exit 0.
+assert_exit "good A5: DEPLOY_FAILED==true checked before SANDBOX_VALIDATE==success" \
+  "$(make_wf 1 1 ok 0 1 0 ok)" 0
+
+# A5 wrong order: validate-success checked first -> exit 1. A green validate
+# would mask a failed smoke and render green (the bug A5 fences).
+assert_exit "bad A5: SANDBOX_VALIDATE==success checked before DEPLOY_FAILED==true" \
+  "$(make_wf 1 1 ok 0 1 0 after)" 1
 
 # Real tree: the actual build-and-push.yml must already satisfy the lint
 assert_exit "real tree: build-and-push.yml notify wiring is present" "" 0

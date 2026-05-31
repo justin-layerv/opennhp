@@ -2144,6 +2144,10 @@ jobs:
     name: Notify
     needs:
       - setup
+      # changes.outputs.app: true when the path filter saw app changes OR
+      # force_build was set. Used to label the Slack status with whether a new
+      # app image actually shipped vs. a re-roll of the existing one.
+      - changes
       - test
       - test-lambdas
       - build
@@ -2190,6 +2194,9 @@ jobs:
           SANDBOX_BLUE_GREEN: ${{ needs.deploy-sandbox-blue-green.result }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-sandbox.result }}
+          # true when a new app image was built this run (vs. a re-roll of the
+          # existing image on a terraform/config/CI-only deploy)
+          APP_REBUILT: ${{ needs.changes.outputs.app }}
           # Metadata
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
@@ -2297,16 +2304,21 @@ jobs:
               DEPLOY_FAILED="true"
             fi
 
-            if [[ "$SANDBOX_VALIDATE" == "success" ]]; then
-              COLOR="#36a64f"
-              EMOJI="white_check_mark"
-              HEADER="NHP Server + AC Sandbox Deploy"
-              STATUS_TEXT="successful"
-            elif [[ "$DEPLOY_FAILED" == "true" ]]; then
+            # DEPLOY_FAILED is checked BEFORE validate-success: a green validate
+            # must not mask a failed (or cancelled) smoke or blue/green. Reversing
+            # these renders a deploy with a red smoke as a green "successful"
+            # (the bug this fixes; e.g. #2229/#2230 posted green with :x: Smoke).
+            # This ordering is fenced by check-packer-failure-surfaced.sh (A5).
+            if [[ "$DEPLOY_FAILED" == "true" ]]; then
               COLOR="#dc3545"
               EMOJI="x"
               HEADER="NHP Server + AC Sandbox Deploy"
               STATUS_TEXT="failed"
+            elif [[ "$SANDBOX_VALIDATE" == "success" ]]; then
+              COLOR="#36a64f"
+              EMOJI="white_check_mark"
+              HEADER="NHP Server + AC Sandbox Deploy"
+              STATUS_TEXT="successful"
             elif [[ "$SANDBOX_DEPLOYED" == "false" ]]; then
               COLOR="#36a64f"
               EMOJI="white_check_mark"
@@ -2338,6 +2350,31 @@ jobs:
             EMOJI="warning"
             HEADER="NHP"
             STATUS_TEXT="incomplete"
+          fi
+
+          # App-image line: distinguish a real app-image ship from a re-roll of
+          # the existing image (terraform/config/CI-only deploys re-deploy the
+          # same binary). Without this, a green re-roll is indistinguishable from
+          # shipping the commit's code — which is how a stale binary can look
+          # "live" for days. Only meaningful when a sandbox deploy ran.
+          #
+          # "rebuilt" tracks APP_REBUILT (changes.outputs.app), i.e. a new
+          # sha-tagged image was built+pushed. Note the `app` path filter also
+          # includes .trivyignore, so a .trivyignore-only commit reads "rebuilt"
+          # even though the Go/Docker bytes are identical — still accurate (a new
+          # image *is* produced and rolled), just not a source-code change.
+          APP_IMAGE=""
+          if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
+            if [[ "$APP_REBUILT" == "true" ]]; then
+              APP_IMAGE="rebuilt → \`${IMAGE_TAG:0:7}\`"
+            elif [[ "$APP_REBUILT" == "false" ]]; then
+              APP_IMAGE="unchanged — infra/config only (app binary not rebuilt)"
+            else
+              # APP_REBUILT empty: the changes job was skipped/failed, so we
+              # can't tell whether a new image shipped. Don't claim "unchanged"
+              # (it could be wrong) — say so explicitly.
+              APP_IMAGE="rebuild status unknown (changes job did not report)"
+            fi
           fi
 
           # Build the blocks array with improved layout
@@ -2383,6 +2420,18 @@ jobs:
               \"text\": {
                 \"type\": \"mrkdwn\",
                 \"text\": \"*Sandbox:* $SANDBOX_STATUS\"
+              }
+            }"
+          fi
+
+          # Add the app-image line so a re-roll can't masquerade as a fresh ship
+          if [[ -n "$APP_IMAGE" ]]; then
+            BLOCKS="$BLOCKS,
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*App image:* $APP_IMAGE\"
               }
             }"
           fi

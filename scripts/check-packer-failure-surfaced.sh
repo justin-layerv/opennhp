@@ -24,10 +24,16 @@
 #   A4. that PACKER_RESULT == "failure" branch is evaluated BEFORE the
 #       BUILD_RESULT == "success" branch (the #2252 regression is an *ordering*
 #       bug; A3 alone — existence — wouldn't catch a reorder)
+#   A5. the DEPLOY_FAILED == "true" branch is evaluated BEFORE the
+#       SANDBOX_VALIDATE == "success" branch. Same class of ordering bug as A4:
+#       a green validate must not mask a failed/cancelled smoke or blue/green
+#       and render a green "successful" deploy. (Skipped if either line is
+#       absent, mirroring A4.)
 #
 # Detection is string-grep based, scoped to the notify job block, so it stays
-# runnable without a YAML parser. NOTE: A3/A4 pin the *canonical* shell form
-# (`"$PACKER_RESULT" == "failure"`); a behavior-preserving rewrite — single
+# runnable without a YAML parser. NOTE: A3/A4/A5 pin the *canonical* shell form
+# (`"$PACKER_RESULT" == "failure"`, `"$DEPLOY_FAILED" == "true"`,
+# `"$SANDBOX_VALIDATE" == "success"`); a behavior-preserving rewrite — single
 # brackets, `= "failure"`, reordered operands, a `case` — would trip a false
 # positive. That's intended (the fence pins one form); if you deliberately
 # reshape that branch, update these patterns in lockstep. The fixture test
@@ -79,6 +85,29 @@ need() { # need <egrep-pattern> <human message>
   fi
 }
 
+# need_order — fail when <first-pattern> is evaluated AT/AFTER <second-pattern>
+# in the notify block; the first branch must come first. Both patterns absent
+# -> skip (graceful; a missing branch is covered by the existence `need` checks).
+# The `|| true` tolerates grep's no-match exit under `set -euo pipefail` so the
+# `-n` guards run instead of errexit aborting before the FAIL summary below.
+#
+# `head -1` takes the FIRST match, so callers must pass patterns that target the
+# canonical branch-condition form `"$VAR" == "value"`. The other shapes of the
+# same vars in the notify block are deliberately NOT matched and so don't shift
+# the captured line: the `DEPLOY_FAILED="true"` assignment (no `==`) and the
+# `for result in … ; [[ "$result" == "failure" ]]` loop (matches $result, not
+# $SANDBOX_VALIDATE). If a future edit adds an earlier `[[ "$VAR" == "value" ]]`
+# for that same var, revisit these patterns — head -1 would then capture it.
+need_order() { # need_order <first-egrep> <second-egrep> <human message>
+  local first="$1" second="$2" msg="$3" l1 l2
+  l1=$(printf '%s\n' "$notify_block" | grep -nE "$first" | head -1 | cut -d: -f1) || true
+  l2=$(printf '%s\n' "$notify_block" | grep -nE "$second" | head -1 | cut -d: -f1) || true
+  if [ -n "$l1" ] && [ -n "$l2" ] && [ "$l1" -ge "$l2" ]; then
+    printf '  \033[31m✗\033[0m %s (first branch line %s, second branch line %s)\n' "$msg" "$l1" "$l2" >&2
+    fail=1
+  fi
+}
+
 # A1: packer-build in notify.needs
 need '^[[:space:]]*-[[:space:]]+packer-build([[:space:]]|$)' \
   "notify job is missing 'packer-build' in its needs: — a packer bake failure won't reach the Slack step (#2252)"
@@ -93,25 +122,23 @@ need '"\$PACKER_RESULT"[[:space:]]*==[[:space:]]*"failure"' \
   "notify job does not treat PACKER_RESULT==failure as a failure — a packer bake failure would render a green message"
 
 # A4: the packer-failure branch must be evaluated BEFORE the build-success
-# branch. This is the load-bearing ordering: on a main push, build succeeds in
-# parallel while a bake failure cascades into a skipped deploy, so if the
-# build-success branch wins first the message renders green — the exact #2252
-# regression. A3 only proves the branch exists; A4 proves it runs first, so a
-# refactor that moved the packer check below the build-success elif (which slips
-# past A3) is caught here. (Skipped if either line is absent — A3 covers a
-# missing packer branch.)
-# `|| true`: under this script's `set -euo pipefail`, a no-match `grep -n`
-# returns non-zero and the pipefail'd substitution would trip errexit *here* —
-# aborting before the `-n` guards and the final FAIL summary below, defeating
-# the documented graceful-skip. Tolerate the empty capture so the guards run.
+# branch — the load-bearing #2252 ordering. On a main push, build succeeds in
+# parallel while a bake failure cascades into a skipped deploy; if build-success
+# wins first the message renders green. A3 proves the branch exists; A4 proves
+# it runs first (a reorder that slips past A3 is caught here).
 # shellcheck disable=SC2016  # literal grep patterns; '$' must NOT expand
-pk_line=$(printf '%s\n' "$notify_block" | grep -nE '"\$PACKER_RESULT"[[:space:]]*==[[:space:]]*"failure"' | head -1 | cut -d: -f1) || true
-# shellcheck disable=SC2016
-bd_line=$(printf '%s\n' "$notify_block" | grep -nE '"\$BUILD_RESULT"[[:space:]]*==[[:space:]]*"success"' | head -1 | cut -d: -f1) || true
-if [ -n "$pk_line" ] && [ -n "$bd_line" ] && [ "$pk_line" -ge "$bd_line" ]; then
-  printf '  \033[31m✗\033[0m %s\n' "notify job checks PACKER_RESULT==failure (line $pk_line) at/after BUILD_RESULT==success (line $bd_line) — a bake failure with a green build would still render green; the packer branch must be evaluated first (#2252)" >&2
-  fail=1
-fi
+need_order '"\$PACKER_RESULT"[[:space:]]*==[[:space:]]*"failure"' \
+  '"\$BUILD_RESULT"[[:space:]]*==[[:space:]]*"success"' \
+  "notify job checks PACKER_RESULT==failure at/after BUILD_RESULT==success — a bake failure with a green build would still render green; the packer branch must be evaluated first (#2252)"
+
+# A5: the deploy-failure branch must be evaluated BEFORE the validate-success
+# branch — same class as A4, one level down. Inside the build-success branch a
+# green SANDBOX_VALIDATE must not win ahead of DEPLOY_FAILED, or a failed/
+# cancelled smoke or blue/green renders a green "successful" deploy.
+# shellcheck disable=SC2016  # literal grep patterns; '$' must NOT expand
+need_order '"\$DEPLOY_FAILED"[[:space:]]*==[[:space:]]*"true"' \
+  '"\$SANDBOX_VALIDATE"[[:space:]]*==[[:space:]]*"success"' \
+  "notify job checks DEPLOY_FAILED==true at/after SANDBOX_VALIDATE==success — a green validate would mask a failed/cancelled smoke or blue/green and render green; the deploy-failure branch must be evaluated first"
 
 if [ "$fail" -ne 0 ]; then
   echo "check-packer-failure-surfaced: FAIL — a Packer Build AMI failure could go silent. See issue #2252 / PR #2251." >&2
