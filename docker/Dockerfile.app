@@ -9,6 +9,13 @@ FROM --platform=$BUILDPLATFORM ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c
 ARG TARGETARCH
 ARG TARGETOS
 
+# Checksums come from https://go.dev/dl/?mode=json. Keep GO_VERSION in
+# lockstep with nhp/go.mod via scripts/check-go-version-drift.sh.
+ARG GO_VERSION=1.26.3
+ARG GO_LINUX_AMD64_SHA256=2b2cfc7148493da5e73981bffbf3353af381d5f93e789c82c79aff64962eb556
+ARG GO_LINUX_ARM64_SHA256=9d89a3ea57d141c2b22d70083f2c8459ba3890f2d9e818e7e933b75614936565
+ARG GO_LINUX_ARMV6L_SHA256=d44133d4c66b1451a1e247da26db7716f76a081c0169a75e6c84e1871e394320
+
 # Install basic tools
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -22,25 +29,28 @@ RUN apt-get update && \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Go version
-ENV GO_VERSION=1.21.2
+ENV GO_VERSION=${GO_VERSION}
 
-# Set Go download URL based on architecture
+# Download and verify Go based on target architecture.
 RUN case "${TARGETARCH}" in \
     "amd64") \
-        GO_ARCH="linux-amd64" \
+        GO_ARCH="linux-amd64"; \
+        GO_SHA256="${GO_LINUX_AMD64_SHA256}" \
         ;; \
     "arm64") \
-        GO_ARCH="linux-arm64" \
+        GO_ARCH="linux-arm64"; \
+        GO_SHA256="${GO_LINUX_ARM64_SHA256}" \
         ;; \
     "arm") \
-        GO_ARCH="linux-armv6l" \
+        GO_ARCH="linux-armv6l"; \
+        GO_SHA256="${GO_LINUX_ARMV6L_SHA256}" \
         ;; \
     *) \
-        echo "Unsupported architecture: ${TARGETARCH}" && exit 1 \
+        echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 \
         ;; \
     esac && \
-    wget https://golang.org/dl/go${GO_VERSION}.${GO_ARCH}.tar.gz -O /tmp/go.tar.gz && \
+    wget "https://go.dev/dl/go${GO_VERSION}.${GO_ARCH}.tar.gz" -O /tmp/go.tar.gz && \
+    echo "${GO_SHA256}  /tmp/go.tar.gz" | sha256sum -c - && \
     tar -C /usr/local -xzf /tmp/go.tar.gz && \
     rm /tmp/go.tar.gz
 

@@ -72,14 +72,18 @@ env:
   # Bumping this requires lockstep updates across:
   #   - env.GO_VERSION in build-and-push.yml, ubuntu-build.yml,
   #     codeql.yml, build-binaries.yml
-  #   - FROM tags in docker/Dockerfile.{server,ac,ac.aws}
-  #   - bind-mounted golang:${GO_VERSION}-bookworm container refs in
-  #     this file (search for "GO_VERSION-LOCKSTEP" anchor below)
-  #   - `go` directive in nhp/go.mod and endpoints/go.mod
-  # NOTE: `make lint-workflows` does NOT currently catch drift here —
-  # #1337 tracks the lockstep lint that will. Until it lands, bumpers
-  # must walk this list manually.
+  #   - ARG GO_VERSION and verified tarball checksums in
+  #     docker/Dockerfile.{app,base}
+  #   - `go` directives in the CI-touched Go modules
+  # GO_TEST_IMAGE and docker/Dockerfile.{server,ac,ac.aws} must share
+  # one golang:<version>-bookworm@sha256:<digest> ref (also covers the
+  # FROM tags in those three files). Re-resolve via `docker buildx
+  # imagetools inspect golang:${GO_VERSION}-bookworm`, then pick an
+  # official OCI index digest that satisfies the Docker age gate.
+  # `make lint-workflows` runs scripts/check-go-version-drift.sh over
+  # these surfaces so a one-sided bump fails before merge.
   GO_VERSION: '1.26.3'
+  GO_TEST_IMAGE: 'golang:1.26.3-bookworm@sha256:252599aeb51ad60b83e4d8821802068127c528c707cb7dd7afd93be057c6011c'
 
 jobs:
   # ============================================================================
@@ -711,7 +715,7 @@ jobs:
 
       # Sets up Go on the runner solely to manage the module/build cache
       # across runs. Tests themselves still execute in the
-      # golang:${GO_VERSION}-bookworm container below; we bind-mount the
+      # digest-pinned GO_TEST_IMAGE container below; we bind-mount the
       # runner's GOMODCACHE and GOCACHE into the container so cache state
       # persists across runs without rebuilding the module graph or
       # recompiling every package from scratch.
@@ -747,9 +751,7 @@ jobs:
           # user, the `mkdir -p` below plus the bind-mount owner will
           # need to agree on the target UID (chown or --user).
           mkdir -p "$HOME/go/pkg/mod" "$HOME/.cache/go-build"
-          # GO_VERSION-LOCKSTEP: golang:${{ env.GO_VERSION }}-bookworm
-          # below tracks env.GO_VERSION at the top of this file. When
-          # bumping Go, both must move together; see env block comment.
+          # Pinned via GO_TEST_IMAGE; see env block.
           docker run --rm \
             --privileged \
             --cap-add=NET_ADMIN \
@@ -759,7 +761,7 @@ jobs:
             -v "$HOME/.cache/go-build:/root/.cache/go-build" \
             -w /workspace \
             -e KBS_SKIP_INIT=1 \
-            golang:${{ env.GO_VERSION }}-bookworm \
+            "${GO_TEST_IMAGE}" \
             bash -c "
               set -e
               echo '::group::Installing iptables and ipset'
@@ -850,15 +852,13 @@ jobs:
           # Shares the runner's GOMODCACHE/GOCACHE with the Run tests
           # step, so vet reuses test-compiled packages instead of doing
           # a cold rebuild.
-          # GO_VERSION-LOCKSTEP: golang:${{ env.GO_VERSION }}-bookworm
-          # below tracks env.GO_VERSION at the top of this file. When
-          # bumping Go, both must move together; see env block comment.
+          # Pinned via GO_TEST_IMAGE; see env block.
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -v "$HOME/go/pkg/mod:/root/go/pkg/mod" \
             -v "$HOME/.cache/go-build:/root/.cache/go-build" \
             -w /workspace \
-            golang:${{ env.GO_VERSION }}-bookworm \
+            "${GO_TEST_IMAGE}" \
             bash -c "cd nhp && go vet ./... && cd ../internalauth && go vet ./... && cd ../endpoints && go vet ./..."
 
   # ============================================================================

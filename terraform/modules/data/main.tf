@@ -36,6 +36,12 @@ locals {
 
   # Certificate paths inside container
   etcd_cert_dir = "/etc/etcd/tls"
+
+  # Dependabot's terraform ecosystem does not scan image strings inside
+  # jsonencode() task definitions. To bump: re-resolve the OCI index
+  # digest with `docker buildx imagetools inspect
+  # public.ecr.aws/docker/library/alpine:3.22`, then update this line.
+  etcd_tls_init_image = "public.ecr.aws/docker/library/alpine:3.22@sha256:310c62b5e7ca5b08167e4384c68db0fd2905dd9c7493756d356e893909057601"
 }
 
 # Private DNS Namespace for Service Discovery
@@ -1046,7 +1052,7 @@ resource "aws_ecs_task_definition" "etcd" {
     # ECS natively injects secrets as environment variables - no aws-cli or JSON parsing needed
     {
       name      = "tls-init"
-      image     = "public.ecr.aws/docker/library/alpine:3.19"
+      image     = local.etcd_tls_init_image
       essential = false
 
       # ECS injects these from Secrets Manager automatically

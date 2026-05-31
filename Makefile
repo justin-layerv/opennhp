@@ -312,6 +312,8 @@ lint-workflows:
 	@bash scripts/lint-issue-templates.sh
 	@bash tests/scripts/check-scope-drift_test.sh
 	@bash scripts/check-scope-drift.sh
+	@bash tests/scripts/check-go-version-drift_test.sh
+	@bash scripts/check-go-version-drift.sh
 	@bash scripts/check-smoke-tier-filter-coverage.sh
 	@bash scripts/check-cert-cleanup-log-gate-unique.sh
 	@bash scripts/check-cleanup-event-type-lockstep.sh

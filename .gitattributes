@@ -8,6 +8,12 @@
 *.md linguist-documentation=true
 
 # Ensure consistent LF line endings for shell-interpreted files
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile* text eol=lf
 *.tf text eol=lf
 *.tfvars text eol=lf
 *.sh text eol=lf

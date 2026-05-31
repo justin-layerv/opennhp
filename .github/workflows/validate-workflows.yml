@@ -9,12 +9,13 @@ on:
     # dropdown — a rename there without a CLAUDE.md update must still
     # re-run scope-drift. validate-issue-templates.yml runs in parallel
     # on the same paths; the two checks are orthogonal.
-    paths:
+    paths: &validate_paths
       - ".github/workflows/**"
       - ".github/scripts/**"
       - ".github/ISSUE_TEMPLATE/**"
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
+      - "scripts/check-go-version-drift.sh"
       - "scripts/check-disable-agent-validation.sh"
       - "scripts/check-smoke-tier-filter-coverage.sh"
       - "scripts/check-cert-cleanup-log-gate-unique.sh"
@@ -31,6 +32,16 @@ on:
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
+      - "docker/Dockerfile.server"
+      - "docker/Dockerfile.ac"
+      - "docker/Dockerfile.ac.aws"
+      - "docker/Dockerfile.app"
+      - "docker/Dockerfile.base"
+      - "nhp/go.mod"
+      - "internalauth/go.mod"
+      - "endpoints/go.mod"
+      - "examples/server_plugin/go.mod"
+      - "tests/local/go.mod"
       - "tests/smoke/**"
       - "tests/lints/disable-agent-validation/**"
       - "tests/lints/paths-filter-coverage/**"
@@ -47,42 +58,7 @@ on:
       - "endpoints/server/main/etc/config.toml"
   pull_request:
     branches: [ "main" ]
-    paths:
-      - ".github/workflows/**"
-      - ".github/scripts/**"
-      - ".github/ISSUE_TEMPLATE/**"
-      - "CLAUDE.md"
-      - "scripts/check-scope-drift.sh"
-      - "scripts/check-disable-agent-validation.sh"
-      - "scripts/check-smoke-tier-filter-coverage.sh"
-      - "scripts/check-cert-cleanup-log-gate-unique.sh"
-      - "scripts/check-cleanup-event-type-lockstep.sh"
-      - "scripts/check-lockdown-body-drift.sh"
-      - "scripts/check-paths-filter-coverage.py"
-      - "scripts/print-dispatch-ref-error.sh"
-      - "scripts/check-image-tag-writer-allowlist.sh"
-      - "scripts/check-image-tag-writer-allowlist.py"
-      - "scripts/check-asp-and-ac-id-lockstep.sh"
-      - "scripts/check-frps-az-suffixes-validation-drift.sh"
-      - "scripts/check-packer-failure-surfaced.sh"
-      - "terraform/modules/qurl-reverse-tunnel-server/variables.tf"
-      - "terraform/modules/qurl-service/main.tf"
-      - "terraform/modules/custom-domain-cert/lambda/**"
-      - "tests/scripts/**"
-      - "tests/smoke/**"
-      - "tests/lints/disable-agent-validation/**"
-      - "tests/lints/paths-filter-coverage/**"
-      - "tests/lints/dispatch-ref-error/**"
-      - "terraform/modules/compute/user_data.sh.tpl"
-      - "terraform/environments/prod/**"
-      - "terraform/environments/sandbox/**"
-      - "terraform/modules/ac/variables.tf"
-      - "terraform/variables.tf"
-      - "terraform/resources.tf"
-      - "endpoints/server/staticplugins/agent/plugin.go"
-      - "endpoints/server/resource_lookup.go"
-      - "docker/nhp-server/etc/config.toml"
-      - "endpoints/server/main/etc/config.toml"
+    paths: *validate_paths
 
 # Restrict default permissions for security
 permissions:
@@ -162,6 +138,12 @@ jobs:
       # enforcement, or CLAUDE.md lists a scope reporters can't pick.
       - name: Check scope drift (bug form ↔ CLAUDE.md)
         run: bash scripts/check-scope-drift.sh
+
+      - name: Test check-go-version-drift.sh
+        run: bash tests/scripts/check-go-version-drift_test.sh
+
+      - name: Check Go version drift
+        run: bash scripts/check-go-version-drift.sh
 
       # Structural fence for the promote-to-prod gate logic that closed
       # issue #1322 (deploy-* must require terraform-apply success when
