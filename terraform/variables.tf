@@ -216,6 +216,12 @@ variable "nhp_knock_headertype_verify_require" {
   default     = false
 }
 
+variable "nhp_internal_auth_require" {
+  description = "Root passthrough for the compute module's internal_auth_require. Flip true only after the target environment/cell has completed permit-mode burn-in: InternalAuthFailPermit stays zero while InternalAuthSuccess confirms signed internal traffic, and all nhp-server instances plus signer fleets have rolled with NHP_INTERNAL_AUTH_SECRET."
+  type        = bool
+  default     = false
+}
+
 variable "nhp_knock_global_rate_limit_pps" {
   description = "Root passthrough for the compute module's knock_global_rate_limit_pps (#1159). Aggregate UDP knock pps cap; defends against distributed low-rate floods that stay under the per-IP limit but aggregate above ECDH throughput. 0 disables. See modules/compute/variables.tf."
   type        = number

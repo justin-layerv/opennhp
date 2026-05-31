@@ -201,6 +201,12 @@ variable "nhp_knock_headertype_verify_require" {
   default     = false
 }
 
+variable "nhp_internal_auth_require" {
+  description = "Wrapper passthrough for the root nhp_internal_auth_require — see ../../variables.tf and ../../modules/compute/variables.tf for gate semantics and burn-in criteria."
+  type        = bool
+  default     = false
+}
+
 variable "nhp_knock_global_rate_limit_pps" {
   description = "Wrapper passthrough for the root nhp_knock_global_rate_limit_pps (#1159). Aggregate UDP knock pps cap."
   type        = number

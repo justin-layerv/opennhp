@@ -845,12 +845,11 @@ func parseTrustedCIDRs(raw string) []string {
 // server bring-up.
 //
 // Read once at Start: flipping NHP_INTERNAL_AUTH_REQUIRE via Terraform
-// takes effect ONLY on the next ECS task revision deploy, not on a
-// running process. That's intentional (no in-process env re-read
-// surface to spoof), but operators should know the Terraform apply
-// itself cycles tasks — if the flip needs to be immediate during an
-// incident rollback, trigger a manual service update after apply.
-// See #1233.
+// updates the EC2 launch template/user_data only; running nhp-server
+// processes keep their old EnvironmentFile until the server ASG is rolled
+// by a deploy or explicit instance refresh. That's intentional (no
+// in-process env re-read surface to spoof), but operators should not expect
+// a Terraform-only apply to flip live instances immediately. See #1233.
 func loadInternalAuthConfig(envSecret, envRequire string) (*internalauth.Signer, bool, string, error) {
 	// Trim the secret at the loader boundary (not at the os.Getenv
 	// call site) so every entry point — Start, tests, a hypothetical

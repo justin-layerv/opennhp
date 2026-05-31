@@ -136,6 +136,12 @@ ac_license_key_sha256 = "cd7f8df5284861a9ebfbe485085843b3631b8dbe325f272622473bf
 nhp_cloudmap_service_name = "server"
 cloudmap_enabled          = true
 
+# Strict internal HMAC auth (#1311). Prod permit-mode burn-in was verified on
+# 2026-05-31 before enabling: qurl-service headless resolve emitted
+# InternalAuthSuccess (Sum=1 at 14:28 CDT), and InternalAuthFailPermit stayed at
+# zero/no datapoints across the 14-day burn-in and fresh-smoke windows.
+nhp_internal_auth_require = true
+
 # Production domains
 production_domains = ["qurl.site", "qurl.link"]
 

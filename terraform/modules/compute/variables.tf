@@ -513,6 +513,23 @@ variable "knock_headertype_verify_require" {
   default     = false
 }
 
+variable "internal_auth_require" {
+  description = <<-EOT
+    Set NHP_INTERNAL_AUTH_REQUIRE=true on the server to enforce strict HMAC
+    verification for /nhp/internal/knock and /nhp/internal/token/validate
+    (#1122 / #1311). Default false leaves the gate in permit mode: unsigned or
+    bad-signature internal requests are logged/metriced via
+    InternalAuthFailPermit but are still allowed.
+
+    Flip strict only after the environment/cell has completed permit-mode
+    burn-in: InternalAuthFailPermit stays zero while InternalAuthSuccess
+    confirms signed internal traffic, and all nhp-server instances plus
+    signer fleets have rolled with NHP_INTERNAL_AUTH_SECRET.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # =============================================================================
 # Knock-port DoS hardening (#1159)
 # =============================================================================

@@ -930,6 +930,9 @@ NHP_TRUSTED_PROXY_CIDRS=$CF_CIDRS
 %{ if cors_allowed_origins != "" ~}
 NHP_CORS_ALLOWED_ORIGINS=${cors_allowed_origins}
 %{ endif ~}
+%{ if internal_auth_require ~}
+NHP_INTERNAL_AUTH_REQUIRE=true
+%{ endif ~}
 %{ if knock_headertype_verify_require ~}
 NHP_KNOCK_HEADERTYPE_VERIFY=true
 %{ endif ~}

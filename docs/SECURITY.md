@@ -297,11 +297,21 @@ enable_slack_target                = true
 
 ### `NHP_INTERNAL_AUTH_SECRET`
 
-`NHP_INTERNAL_AUTH_SECRET` (≥ 32 bytes) signs `/nhp/internal/knock` requests
-between qurl-service and nhp-server. Terraform provisions and seeds the
-value (`aws_secretsmanager_secret.nhp_internal_auth`); the app-layer gate
-defaults to permit mode — flip `NHP_INTERNAL_AUTH_REQUIRE=true` only after
-the permit-mode mismatch counter stays at zero through a full deploy cycle.
+`NHP_INTERNAL_AUTH_SECRET` (≥ 32 bytes) signs internal requests between LayerV
+services. The nhp-server `NHP_INTERNAL_AUTH_REQUIRE` gate enforces that secret
+on `/nhp/internal/knock` and `/nhp/internal/token/validate`. Terraform
+provisions and seeds the value (`aws_secretsmanager_secret.nhp_internal_auth`)
+and exposes the `nhp_internal_auth_require` gate; environments set it true only
+after per-env/cell permit-mode burn-in has completed. In strict environments
+the server receives `NHP_INTERNAL_AUTH_REQUIRE=true` and rejects unsigned or
+badly signed internal requests instead of permit-allowing them. The app binary
+still defaults to permit mode when the env var is unset; that fallback is
+reserved for rollback, burn-in, or non-Terraform local runs.
+
+The same shared secret can also be used by other service-to-service auth paths
+outside nhp-server. For example, qurl-reverse-tunnel-server's
+`/internal/v1/tunnel/auth-by-owner` call is a qurl-service endpoint, not an
+nhp-server route, so it is not controlled by `NHP_INTERNAL_AUTH_REQUIRE`.
 
 **Entropy comes from upstream provisioning.** The shared module
 (`internalauth.MinSecretLength`) only fences the length floor — a 32-byte
@@ -328,9 +338,39 @@ Operational notes:
   block because the secret doesn't exist yet. Post-apply plans are clean.
   Any CI workflow that fails on terraform warnings should ignore the
   `nhp_internal_auth_secret_populated` check until the first apply lands.
+- **Burn-in before strict:** before setting `nhp_internal_auth_require = true`,
+  verify `InternalAuthFailPermit` stays zero over the burn-in window while
+  `InternalAuthSuccess` confirms signed internal traffic, and confirm all
+  nhp-server instances plus qurl-service tasks and any qurl-reverse-tunnel-server
+  instances have rolled with `NHP_INTERNAL_AUTH_SECRET`. This is a manual
+  promote gate: Terraform can seed and wire the secret, but it cannot prove
+  signer fleets are actively signing live internal requests.
+  The forward strict flip requires the same user_data refresh as rollback:
+  include a server image deploy in the rollout, or explicitly refresh the
+  server ASG after applying the tfvars change.
+  `InternalAuthSuccess`, `InternalAuthFailPermit`, and
+  `InternalAuthFailStrict` are aggregate counters across the strict-gated
+  nhp-server endpoints; use server logs or a future endpoint-dimensioned metric
+  when you need per-route proof for `/nhp/internal/token/validate`.
+  If a new signer fleet is introduced after an environment is already strict
+  (for example, first prod qurl-reverse-tunnel-server deployment), roll it with
+  the shared secret and verify its signed `/nhp/internal/token/validate` calls
+  before sending live traffic.
+- **Rollback:** set `nhp_internal_auth_require = false` in the affected
+  environment tfvars and apply Terraform. Then make sure existing server
+  instances actually re-run user_data: either include a server image deploy in
+  that deployment, or start an explicit server ASG instance refresh (prod:
+  `aws autoscaling start-instance-refresh --profile layerv-prod --region us-east-2 --auto-scaling-group-name layerv-nhp-prod-server`).
+  This follows the instance-refresh convention in
+  [`CLAUDE.md`](../CLAUDE.md#quick-debugging); swap the profile and ASG name for
+  non-prod environments.
+  Leave `NHP_INTERNAL_AUTH_SECRET` in place; signer fleets can keep signing
+  during the rollback window.
 - **Rotation ≠ dynamic pickup.** nhp-server reads the secret once at
   instance boot in `user_data.sh.tpl`. Rotating the Secrets Manager value
   without an ASG instance refresh will break knock verification on
-  existing instances. qurl-service is fine — ECS `valueFrom` re-resolves
-  per task start, so a rolling deploy (or stop-task) picks up the new
-  value. #1312 tracks a proper current/previous rotation envelope.
+  existing instances. qurl-reverse-tunnel-server has the same instance-refresh
+  requirement because its `user_data.sh.tpl` fetches and persists the secret at
+  boot. qurl-service is fine — ECS `valueFrom` re-resolves per task start, so a
+  rolling deploy (or stop-task) picks up the new value. #1312 tracks a proper
+  current/previous rotation envelope.

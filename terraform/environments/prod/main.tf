@@ -73,6 +73,7 @@ module "nhp" {
   auth_aes_key                        = var.auth_aes_key
   nhp_cors_allowed_origins            = var.nhp_cors_allowed_origins
   nhp_knock_headertype_verify_require = var.nhp_knock_headertype_verify_require
+  nhp_internal_auth_require           = var.nhp_internal_auth_require
 
   # Knock-port DoS hardening (#1159)
   nhp_knock_global_rate_limit_pps   = var.nhp_knock_global_rate_limit_pps
