@@ -6,8 +6,9 @@ name: Promote to Production
 # Deployment flow:
 #   manifest → preflight (approval) → terraform-plan (shows diff)
 #           → terraform-apply (approval) → deploy-server (canary)
-#           → deploy-ac (canary) → deploy-qurl (ECS)
-#           → smoke-test → monitor → finalize
+#           → deploy-ac (canary) → deploy-qurl (ECS) → deploy-qrts (ASG)
+#           → smoke-test / qurl-smoke-tests / qrts-smoke-tests → monitor
+#           → nhp-smoke-tests and monitor → finalize
 #
 # Usage:
 #   # Full promotion (all components)
@@ -155,6 +156,7 @@ jobs:
       qurl_image_tag: ${{ steps.resolve-qurl-tag.outputs.qurl_image_tag }}
       frps_image_tag: ${{ steps.resolve-frps-tag.outputs.frps_image_tag }}
       current_prod_qurl_tag: ${{ steps.prod-state.outputs.qurl_tag }}
+      current_prod_frps_tag: ${{ steps.prod-state.outputs.frps_tag }}
       effective_image_tag: ${{ steps.resolve-rollback.outputs.effective_image_tag }}
       changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
@@ -265,12 +267,10 @@ jobs:
         run: |
           set -euo pipefail
           # qurl-reverse-tunnel-server image tag for terraform's
-          # `deploy_frps => non-bootstrap frps_image_tag` precondition only.
-          # The *running* image is owned by rts CI (promote-production.yml
-          # writes /prod/nhp/reverse-tunnel-server/image-tag + instance-refresh;
-          # user_data reads it from SSM at boot), so this resolves the
-          # sandbox-validated tag instead of baking a SHA in tfvars (mirrors
-          # the qurl_image_tag flow above).
+          # `deploy_frps => non-bootstrap frps_image_tag` precondition and for
+          # deploy-qrts's SSM image-tag + ASG instance-refresh step. Resolve the
+          # sandbox-validated tag instead of baking a SHA in tfvars (mirrors the
+          # qurl_image_tag flow above).
           #
           # Hardened beyond resolve-qurl-tag per cr on #2235 (the build-and-push
           # sibling's defensive shape, #1575): Docker TagRegexp validation so a
@@ -286,10 +286,15 @@ jobs:
           # Docker distribution TagRegexp: leading char restricted, then
           # [A-Za-z0-9._-], 1-128 chars total.
           TAG_RE='^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+          QRTS_SHA_RE='^[0-9a-f]{40}$'
 
           if [[ -n "$FRPS_IMAGE_TAG_INPUT" ]]; then
             if [[ ! "$FRPS_IMAGE_TAG_INPUT" =~ $TAG_RE ]]; then
               echo "::error::Provided frps_image_tag is not a valid Docker tag: $(printf %q "$FRPS_IMAGE_TAG_INPUT")"
+              exit 1
+            fi
+            if [[ "$DEPLOY_QRTS" == "true" && ! "$FRPS_IMAGE_TAG_INPUT" =~ $QRTS_SHA_RE ]]; then
+              echo "::error::deploy_qrts=true requires frps_image_tag to be a full 40-character lowercase git SHA so QRtS smoke can verify the refreshed binary; got $(printf %q "$FRPS_IMAGE_TAG_INPUT")."
               exit 1
             fi
             echo "Using provided FRPS image tag: $FRPS_IMAGE_TAG_INPUT"
@@ -322,6 +327,9 @@ jobs:
               echo "frps_image_tag=v0.0.0-bootstrap" >> "$GITHUB_OUTPUT"
             elif [[ ! "$FRPS_TAG" =~ $TAG_RE ]]; then
               echo "::error::SSM $SSM_FRPS_PARAM holds a value that is not a valid Docker tag: $(printf %q "$FRPS_TAG")"
+              exit 1
+            elif [[ "$DEPLOY_QRTS" == "true" && ! "$FRPS_TAG" =~ $QRTS_SHA_RE ]]; then
+              echo "::error::SSM $SSM_FRPS_PARAM resolved $(printf %q "$FRPS_TAG"), but deploy_qrts=true requires a full 40-character lowercase git SHA so QRtS smoke can verify the refreshed binary."
               exit 1
             else
               echo "Resolved FRPS image tag from sandbox SSM: $FRPS_TAG"
@@ -449,6 +457,20 @@ jobs:
           PROD_QURL_TAG=$(aws ssm get-parameter \
             --name "/${PROD_SSM_PREFIX}/qurl-api-image-tag" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "not deployed")
+          # QRtS image tags are owned by qurl-reverse-tunnel-server CI and live
+          # in the /prod/nhp namespace, not the legacy layerv-nhp-prod prefix.
+          # Empty means "no rollback hint" for qrts-smoke-tests. Do not forward
+          # sentinels or bootstrap placeholders as rollback targets.
+          QRTS_SHA_RE='^[0-9a-f]{40}$'
+          PROD_FRPS_TAG=$(aws ssm get-parameter \
+            --name "/prod/nhp/reverse-tunnel-server/image-tag" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          if [[ -z "$PROD_FRPS_TAG" || "$PROD_FRPS_TAG" == "None" || "$PROD_FRPS_TAG" =~ ^v0\.0\.0-bootstrap ]]; then
+            PROD_FRPS_TAG=""
+          elif [[ ! "$PROD_FRPS_TAG" =~ $QRTS_SHA_RE ]]; then
+            echo "::warning::Prod QRtS tag $(printf %q "$PROD_FRPS_TAG") is not a full 40-character lowercase git SHA; suppressing rollback hint because deploy_qrts=true would reject it."
+            PROD_FRPS_TAG=""
+          fi
           PROD_DEPLOYED_COMMIT=$(aws ssm get-parameter \
             --name "/prod/nhp/deploy/deployed-commit" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "not deployed")
@@ -457,6 +479,7 @@ jobs:
             echo "server_tag=$PROD_SERVER_TAG"
             echo "ac_tag=$PROD_AC_TAG"
             echo "qurl_tag=$PROD_QURL_TAG"
+            echo "frps_tag=$PROD_FRPS_TAG"
             echo "deployed_commit=$PROD_DEPLOYED_COMMIT"
           } >> "$GITHUB_OUTPUT"
 
@@ -540,6 +563,7 @@ jobs:
           DEPLOY_SERVER: ${{ inputs.deploy_server }}
           DEPLOY_AC: ${{ inputs.deploy_ac }}
           DEPLOY_QURL: ${{ inputs.deploy_qurl }}
+          DEPLOY_QRTS: ${{ inputs.deploy_qrts }}
           RUN_TERRAFORM: ${{ inputs.run_terraform }}
           ROLLBACK: ${{ inputs.rollback }}
           CHANGELOG: ${{ steps.changelog.outputs.changelog }}
@@ -557,6 +581,7 @@ jobs:
           PROD_SERVER_TAG: ${{ steps.prod-state.outputs.server_tag }}
           PROD_AC_TAG: ${{ steps.prod-state.outputs.ac_tag }}
           PROD_QURL_TAG: ${{ steps.prod-state.outputs.qurl_tag }}
+          PROD_FRPS_TAG: ${{ steps.prod-state.outputs.frps_tag }}
           PROD_DEPLOYED_COMMIT: ${{ steps.prod-state.outputs.deployed_commit }}
         run: |
           # Get commit info
@@ -606,14 +631,19 @@ jobs:
               echo "| QURL Service | \`$ECR_QURL_REPO\` | \`${QURL_IMAGE_TAG:-N/A}\` | $QURL_PUSHED | :no_entry_sign: skipped |"
             fi
             # qurl-reverse-tunnel-server: surfaced so the approver can see whether
-            # the deploy_frps non-bootstrap precondition will pass. This is NOT an
-            # image this workflow deploys — the running tag is owned by rts CI
-            # (promote-production.yml writes the SSM param + instance-refresh).
-            if [[ "$FRPS_IMAGE_TAG" =~ ^v0\.0\.0-bootstrap ]]; then
-              echo "| qurl-reverse-tunnel-server | _(TF precondition only)_ | \`$FRPS_IMAGE_TAG\` | — | :warning: unresolved — plan fails if deploy_frps=true |"
-            else
-              echo "| qurl-reverse-tunnel-server | _(TF precondition only)_ | \`$FRPS_IMAGE_TAG\` | — | rts CI / SSM (not this workflow) |"
+            # the deploy_frps non-bootstrap precondition and deploy-qrts pre-check
+            # will pass.
+            FRPS_TAG_DISPLAY="$FRPS_IMAGE_TAG"
+            FRPS_PUSHED="rts CI / SSM"
+            FRPS_STATUS=":white_check_mark:"
+            if [[ "$DEPLOY_QRTS" != "true" ]]; then
+              FRPS_TAG_DISPLAY="${FRPS_IMAGE_TAG:-N/A}"
+              FRPS_STATUS=":no_entry_sign: skipped"
+            elif [[ "$FRPS_IMAGE_TAG" =~ ^v0\.0\.0-bootstrap ]]; then
+              FRPS_PUSHED="—"
+              FRPS_STATUS=":warning: no tag"
             fi
+            echo "| qurl-reverse-tunnel-server | \`$ECR_QRTS_REPO\` | \`$FRPS_TAG_DISPLAY\` | $FRPS_PUSHED | $FRPS_STATUS |"
             echo ""
 
             # Commit details
@@ -675,6 +705,20 @@ jobs:
               QURL_CHANGED=":arrow_right: **updating**"
             fi
             echo "| QURL Service | \`$PROD_QURL_TAG\` | \`$QURL_PROMOTE_TAG\` | $QURL_CHANGED |"
+
+            QRTS_CURRENT_TAG="${PROD_FRPS_TAG:-not deployed}"
+            if [[ "$DEPLOY_QRTS" != "true" ]]; then
+              QRTS_PROMOTE_TAG="N/A"
+              QRTS_CHANGED="skipped"
+            else
+              QRTS_PROMOTE_TAG="${FRPS_IMAGE_TAG:-N/A}"
+              if [[ "$QRTS_CURRENT_TAG" == "$QRTS_PROMOTE_TAG" ]]; then
+                QRTS_CHANGED="no change"
+              else
+                QRTS_CHANGED=":arrow_right: **updating**"
+              fi
+            fi
+            echo "| qurl-reverse-tunnel-server | \`$QRTS_CURRENT_TAG\` | \`$QRTS_PROMOTE_TAG\` | $QRTS_CHANGED |"
             echo ""
 
             # Configuration
@@ -3144,14 +3188,11 @@ jobs:
   # =============================================================================
   # SMOKE TEST - Application-level validation
   # =============================================================================
-  # The three smoke jobs are fully decoupled from deploy-qrts — it's neither in
-  # their `needs` nor their gate. The nhp/qurl smoke suites don't exercise qrts,
-  # so a qrts failure must NOT skip them — otherwise you'd lose the "did server/ac/qurl
-  # deploy cleanly?" signal that scopes a rollback (qrts-only roll vs. everything).
-  # A qrts failure still fails the run via finalize's QRTS_RESULT loop. A qrts-only
-  # dispatch skips the smokes via the "at least one of deploy-server/ac/qurl
-  # succeeded" tail (none did). When a qrts smoke suite lands, add it as its own
-  # job rather than to that tail.
+  # The control-plane smoke jobs stay decoupled from deploy-qrts — deploy-qrts
+  # is neither in their `needs` nor their gate. The nhp/qurl smoke suites don't
+  # exercise qrts, so a qrts failure must NOT skip them; otherwise we'd lose the
+  # "did server/ac/qurl deploy cleanly?" signal that scopes a rollback. QRtS has
+  # its own post-deploy smoke job below, gated only on deploy-qrts success.
   smoke-test:
     name: Smoke Test
     needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl]
@@ -3291,18 +3332,47 @@ jobs:
       AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}
 
   # =============================================================================
+  # QRTS SMOKE TESTS - qurl-reverse-tunnel-server post-deploy validation
+  #
+  # Runs the QRtS reusable smoke workflow after the prod ASG instance refresh
+  # completes. This is a hard gate from day one because it only probes the
+  # refreshed ASG instances for local service, binary, and dashboard health.
+  # The job is separate from the NHP/qURL app smokes so their results stay
+  # visible in mixed deploys; monitor still stays fail-closed if any smoke fails.
+  # =============================================================================
+  qrts-smoke-tests:
+    name: qURL Reverse Tunnel Server Smoke Tests
+    needs: [manifest, deploy-qrts]
+    if: needs.deploy-qrts.result == 'success'
+    uses: ./.github/workflows/qrts-smoke-tests.yml
+    with:
+      environment: prod
+      # Keep in sync with terraform/modules/qurl-reverse-tunnel-server/variables.tf
+      # var.frps_dashboard_port. Prod tfvars does not override that default today.
+      dashboard_port: '7500'
+      expected_image_tag: ${{ needs.manifest.outputs.frps_image_tag }}
+      rollback_image_tag: ${{ needs.manifest.outputs.current_prod_frps_tag }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}
+
+  # =============================================================================
   # MONITOR - Post-deploy CloudWatch alarm watch
   # =============================================================================
   monitor:
     name: Post-Deploy Monitor
-    needs: [smoke-test, qurl-smoke-tests]
+    needs: [smoke-test, qurl-smoke-tests, qrts-smoke-tests]
+    # Any smoke failure skips monitor and lets finalize fail immediately with
+    # the failed smoke result, matching the existing control-plane behavior.
     if: |
       always() &&
       (needs.smoke-test.result == 'success' || needs.smoke-test.result == 'skipped') &&
       (needs.qurl-smoke-tests.result == 'success' || needs.qurl-smoke-tests.result == 'skipped') &&
-      (needs.smoke-test.result == 'success' || needs.qurl-smoke-tests.result == 'success')
+      (needs.qrts-smoke-tests.result == 'success' || needs.qrts-smoke-tests.result == 'skipped') &&
+      (needs.smoke-test.result == 'success' || needs.qurl-smoke-tests.result == 'success' || needs.qrts-smoke-tests.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # QRtS alarms use the same prod name prefix (layerv-nhp-prod-frps-*),
+    # so this shared post-deploy monitor includes tunnel-server alarms.
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
@@ -3390,7 +3460,7 @@ jobs:
   finalize:
     name: Finalize
     if: always()
-    needs: [manifest, preflight, terraform-plan, qurl-schema-compat, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl, deploy-qrts, smoke-test, qurl-smoke-tests, nhp-smoke-tests, monitor]
+    needs: [manifest, preflight, terraform-plan, qurl-schema-compat, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl, deploy-qrts, smoke-test, qurl-smoke-tests, nhp-smoke-tests, qrts-smoke-tests, monitor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -3419,6 +3489,7 @@ jobs:
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
+          QRTS_SMOKE_RESULT: ${{ needs.qrts-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
         run: |
           # Check if any non-skipped job failed. As of PR3, nhp-smoke-tests
@@ -3438,7 +3509,7 @@ jobs:
           # cancelled run does not silently report success, matching the
           # treatment of every other job's cancelled state.
           FAILED=false
-          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$SCHEMA_COMPAT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$TRAEFIK_PLUGINS_RESULT" "$AC_RESULT" "$QURL_RESULT" "$QRTS_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$MONITOR_RESULT"; do
+          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$SCHEMA_COMPAT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$TRAEFIK_PLUGINS_RESULT" "$AC_RESULT" "$QURL_RESULT" "$QRTS_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$QRTS_SMOKE_RESULT" "$MONITOR_RESULT"; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               FAILED=true
               break
@@ -3751,6 +3822,7 @@ jobs:
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
+          QRTS_SMOKE_RESULT: ${{ needs.qrts-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
           # Force-push protection state surfaced from preflight so
           # operators see "Protection: unverified" in the notification
@@ -3842,6 +3914,7 @@ jobs:
           MSG+=$(row "Smoke Test"    "$SMOKE_RESULT")
           MSG+=$(row "QURL Smoke"    "$QURL_SMOKE_RESULT")
           MSG+=$(row "NHP Smoke"     "$NHP_SMOKE_RESULT")
+          MSG+=$(row "QRTS Smoke"    "$QRTS_SMOKE_RESULT")
           MSG+=$(row "Monitor"       "$MONITOR_RESULT")
           MSG+=$'\n'
           # Pull last-terraform-apply-at out of SSM so the notification
@@ -3911,6 +3984,7 @@ jobs:
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
+          QRTS_SMOKE_RESULT: ${{ needs.qrts-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
           ROLLBACK: ${{ inputs.rollback }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -3954,6 +4028,7 @@ jobs:
             echo "| Smoke Test | $(result_emoji "$SMOKE_RESULT") $SMOKE_RESULT |"
             echo "| QURL Smoke Tests | $(result_emoji "$QURL_SMOKE_RESULT") $QURL_SMOKE_RESULT |"
             echo "| NHP Smoke Tests | $(result_emoji "$NHP_SMOKE_RESULT") $NHP_SMOKE_RESULT |"
+            echo "| qURL Reverse Tunnel Server Smoke Tests | $(result_emoji "$QRTS_SMOKE_RESULT") $QRTS_SMOKE_RESULT |"
             echo "| Monitor | $(result_emoji "$MONITOR_RESULT") $MONITOR_RESULT |"
             echo ""
             echo "### Deployed Artifacts"

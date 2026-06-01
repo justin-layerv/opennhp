@@ -1,0 +1,365 @@
+name: qURL Reverse Tunnel Server Smoke Tests
+
+# Direct workflow_dispatch prod runs intentionally do not bind a GitHub
+# environment. It uses SSM RunShellScript, but the payload is the fixed
+# checked-in service/binary/dashboard probe below, guarded by the main-branch ref
+# check plus STS account assertion; promote-to-prod owns the production approval
+# gate. If org policy later requires environment protection for prod probes,
+# disable direct prod dispatch rather than adding a second approval path here.
+# Future mutating probes must disable direct prod dispatch before landing.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment (sandbox or prod)
+        required: true
+        type: string
+      aws_region:
+        required: false
+        type: string
+        default: us-east-2
+      dashboard_port:
+        required: false
+        type: string
+        default: '7500'
+      expected_image_tag:
+        description: Optional full 40-character git SHA expected on the refreshed instances
+        required: false
+        type: string
+        default: ''
+      rollback_image_tag:
+        description: Optional image tag to mention in failure rollback hints
+        required: false
+        type: string
+        default: ''
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      # Direct workflow_dispatch prod runs may read this repo-level secret as a
+      # fallback. Reusable callers should pass the target role through
+      # AWS_ROLE_ARN so caller intent wins.
+      AWS_PROD_ROLE_ARN:
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - sandbox
+          - prod
+        default: sandbox
+      aws_region:
+        description: AWS region for the smoke run
+        required: false
+        type: string
+        default: us-east-2
+      dashboard_port:
+        description: Local FRP dashboard port on each instance
+        required: false
+        type: string
+        default: '7500'
+      expected_image_tag:
+        description: Optional full 40-character git SHA expected on the refreshed instances
+        required: false
+        type: string
+        default: ''
+      rollback_image_tag:
+        description: Optional image tag to mention in failure rollback hints
+        required: false
+        type: string
+        default: ''
+
+env:
+  PROD_ACCOUNT_ID: '235500187906'
+  SANDBOX_ACCOUNT_ID: '767397897469'
+
+jobs:
+  smoke-test:
+    name: qURL RTS Smoke (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    # Covers ASG settle wait (3m), SSM-online wait (5m), SSM delivery
+    # timeout (3m), remote execution timeout (11m), runner poll (15m),
+    # and setup/STS overhead without clipping the diagnostic-producing loops.
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Guard prod against non-default refs
+        if: inputs.environment == 'prod' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::prod smoke requires refs/heads/main on the invoking workflow (got ${{ github.ref }})"
+          exit 1
+
+      - name: Resolve AWS role ARN
+        id: role
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          AWS_ROLE: ${{ secrets.AWS_ROLE_ARN }}
+          PROD_ROLE: ${{ secrets.AWS_PROD_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in
+            sandbox|prod) ;;
+            *)
+              echo "::error::Unknown environment: $ENVIRONMENT"
+              exit 1
+              ;;
+          esac
+          # Reusable callers pass the target role as AWS_ROLE_ARN. Direct
+          # sandbox workflow_dispatch runs use the repo/org AWS_ROLE_ARN secret
+          # (same as nhp-smoke-tests); direct prod dispatch may use
+          # AWS_PROD_ROLE_ARN as a fallback when AWS_ROLE_ARN is absent.
+          ARN="$AWS_ROLE"
+          if [ -z "$ARN" ] && [ "$ENVIRONMENT" = "prod" ]; then
+            ARN="$PROD_ROLE"
+          fi
+          if [ -z "$ARN" ]; then
+            echo "::error::AWS role ARN is empty for environment=$ENVIRONMENT"
+            echo "::error::Direct sandbox workflow_dispatch requires repo/org AWS_ROLE_ARN; direct prod dispatch requires AWS_PROD_ROLE_ARN or AWS_ROLE_ARN."
+            exit 1
+          fi
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Assert assumed role matches target environment
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            EXPECTED="$PROD_ACCOUNT_ID"
+          else
+            EXPECTED="$SANDBOX_ACCOUNT_ID"
+          fi
+          ACTUAL_ACCOUNT=$(aws sts get-caller-identity --query 'Account' --output text)
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED" ]; then
+            echo "::error::Assumed account $ACTUAL_ACCOUNT does not match expected $EXPECTED for environment=$ENVIRONMENT"
+            exit 1
+          fi
+          echo "Assumed account $ACTUAL_ACCOUNT for environment=$ENVIRONMENT"
+
+      - name: Resolve ASG instances
+        id: asg
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          PARAM="/${ENVIRONMENT}/nhp/reverse-tunnel-server/asg-name"
+          ASG_NAME="$(aws ssm get-parameter --name "$PARAM" --query 'Parameter.Value' --output text)"
+          if [ -z "$ASG_NAME" ] || [ "$ASG_NAME" = "None" ]; then
+            echo "::error::Empty ASG name from $PARAM"
+            exit 1
+          fi
+          ASG_SETTLE_ATTEMPTS=18
+          ASG_SETTLE_DELAY_SECONDS=10
+          # This count wait absorbs ASG eventual consistency. The prod
+          # deploy-qrts job waits for instance refresh completion before this
+          # workflow runs, and expected_image_tag below fails closed if a stale
+          # instance remains on the old binary.
+          for attempt in $(seq 1 "$ASG_SETTLE_ATTEMPTS"); do
+            ASG_JSON="$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$ASG_NAME" \
+              --query "AutoScalingGroups[0].{Desired:DesiredCapacity,Instances:Instances[?LifecycleState=='InService' && HealthStatus=='Healthy'].InstanceId}" \
+              --output json)"
+            DESIRED="$(printf '%s' "$ASG_JSON" | jq -r '.Desired // empty')"
+            IDS="$(printf '%s' "$ASG_JSON" | jq -r '(.Instances // []) | join(" ")')"
+            if ! [[ "$DESIRED" =~ ^[0-9]+$ ]] || (( DESIRED < 1 )); then
+              echo "::error::Invalid DesiredCapacity '$DESIRED' for $ASG_NAME"
+              exit 1
+            fi
+            read -r -a ID_ARRAY <<< "$IDS"
+            if ((${#ID_ARRAY[@]} == DESIRED)); then
+              break
+            fi
+            if (( attempt == ASG_SETTLE_ATTEMPTS )); then
+              echo "::error::Healthy InService instance count (${#ID_ARRAY[@]}) does not match desired capacity ($DESIRED) for $ASG_NAME: ${IDS:-<none>}"
+              exit 1
+            fi
+            echo "Waiting for $ASG_NAME healthy InService count (${#ID_ARRAY[@]}) to match desired capacity ($DESIRED); attempt $attempt/$ASG_SETTLE_ATTEMPTS"
+            sleep "$ASG_SETTLE_DELAY_SECONDS"
+          done
+          {
+            echo "name=$ASG_NAME"
+            echo "ids=$IDS"
+            echo "desired=$DESIRED"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Resolved $ASG_NAME instances: $IDS (desired=$DESIRED)"
+
+      - name: Wait for SSM managed instances
+        env:
+          INSTANCE_IDS: ${{ steps.asg.outputs.ids }}
+        run: |
+          set -euo pipefail
+          read -r -a INSTANCE_ID_ARGS <<< "$INSTANCE_IDS"
+          for _ in {1..30}; do
+            OFFLINE=""
+            for id in "${INSTANCE_ID_ARGS[@]}"; do
+              ping="$(aws ssm describe-instance-information \
+                --filters "Key=InstanceIds,Values=$id" \
+                --query 'InstanceInformationList[0].PingStatus' \
+                --output text 2>/dev/null || echo None)"
+              if [ "$ping" != "Online" ]; then
+                OFFLINE="$OFFLINE $id($ping)"
+              fi
+            done
+            if [ -z "$OFFLINE" ]; then
+              echo "All instances are online in SSM."
+              exit 0
+            fi
+            echo "Waiting for SSM online status:$OFFLINE"
+            sleep 10
+          done
+          echo "::error::Timed out waiting for SSM online status:$OFFLINE"
+          exit 1
+
+      - name: Smoke each refreshed instance
+        id: smoke
+        env:
+          INSTANCE_IDS: ${{ steps.asg.outputs.ids }}
+          DASHBOARD_PORT: ${{ inputs.dashboard_port }}
+          EXPECTED_IMAGE_TAG: ${{ inputs.expected_image_tag }}
+          ROLLBACK_IMAGE_TAG: ${{ inputs.rollback_image_tag }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          read -r -a INSTANCE_ID_ARGS <<< "$INSTANCE_IDS"
+          if ! [[ "$DASHBOARD_PORT" =~ ^[0-9]+$ ]] || (( 10#$DASHBOARD_PORT < 1024 || 10#$DASHBOARD_PORT > 65535 )); then
+            echo "::error::dashboard_port must be an integer TCP port from 1024 through 65535; got '$DASHBOARD_PORT'."
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_IMAGE_TAG" && ! "$EXPECTED_IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::expected_image_tag must be a full 40-character lowercase git SHA; got '$EXPECTED_IMAGE_TAG'."
+            exit 1
+          fi
+          # Default dashboard_port=7500 is tied to
+          # terraform/modules/qurl-reverse-tunnel-server/variables.tf
+          # var.frps_dashboard_port. Env-specific tfvars overrides must pass this input.
+          SSM_DELIVERY_TIMEOUT_SECONDS=180
+          REMOTE_EXECUTION_TIMEOUT_SECONDS=660
+          RUNNER_POLL_TIMEOUT_SECONDS=900
+          # Keep the instance-side checks in a shellchecked script and ship it
+          # over SSM as base64 so the workflow avoids jq-to-JSON-to-/bin/sh escaping.
+          SMOKE_SCRIPT_B64="$(base64 -w0 .github/scripts/qrts-instance-smoke.sh)"
+          PARAMS="$(jq -n \
+            --arg port "$DASHBOARD_PORT" \
+            --arg expected "$EXPECTED_IMAGE_TAG" \
+            --arg environment "$TARGET_ENVIRONMENT" \
+            --arg timeout "$REMOTE_EXECUTION_TIMEOUT_SECONDS" \
+            --arg script_b64 "$SMOKE_SCRIPT_B64" '{
+            executionTimeout: [$timeout],
+            commands: [
+              "set -eu",
+              "SMOKE_SCRIPT_PATH=$(mktemp /tmp/qurl-rts-smoke.XXXXXX.sh)",
+              "trap '\''rm -f \"$SMOKE_SCRIPT_PATH\"'\'' EXIT",
+              "printf %s '\''\($script_b64)'\'' | base64 -d > \"$SMOKE_SCRIPT_PATH\"",
+              "sh \"$SMOKE_SCRIPT_PATH\" \"\($port)\" \"\($expected)\" \"\($environment)\""
+            ]
+          }')"
+          # `--timeout-seconds` is SSM delivery timeout; `executionTimeout`
+          # in PARAMS caps remote script runtime.
+          COMMAND_ID="$(aws ssm send-command \
+            --instance-ids "${INSTANCE_ID_ARGS[@]}" \
+            --document-name AWS-RunShellScript \
+            --comment "qurl-reverse-tunnel-server smoke $GITHUB_RUN_ID" \
+            --timeout-seconds "$SSM_DELIVERY_TIMEOUT_SECONDS" \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' \
+            --output text)"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "::notice::Started SSM smoke command $COMMAND_ID"
+
+          declare -A INSTANCE_DONE=()
+          TIMED_OUT_IDS=()
+          FAILED=""
+          EXPECTED_DONE=${#INSTANCE_ID_ARGS[@]}
+          # Poll past delivery + remote caps so SSM delivery latency does not become a false runner timeout.
+          # Current prod QRtS is a 3-instance fleet; if this scales to dozens,
+          # switch this per-instance 5s poll to batching/backoff to avoid SSM API throttling.
+          DEADLINE=$((SECONDS + RUNNER_POLL_TIMEOUT_SECONDS))
+          while (( SECONDS < DEADLINE )); do
+            for id in "${INSTANCE_ID_ARGS[@]}"; do
+              if [ -n "${INSTANCE_DONE[$id]:-}" ]; then
+                continue
+              fi
+              STATUS="$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$id" \
+                --query 'Status' \
+                --output text 2>/dev/null || echo Pending)"
+              case "$STATUS" in
+                Success)
+                  echo "Smoke passed on $id"
+                  aws ssm get-command-invocation \
+                    --command-id "$COMMAND_ID" \
+                    --instance-id "$id" \
+                    --query '{Status:Status, Output:StandardOutputContent}' \
+                    --output json || true
+                  INSTANCE_DONE[$id]=success
+                  ;;
+                Failed|Cancelled|TimedOut)
+                  echo "::error::Smoke command $COMMAND_ID failed on $id with status=$STATUS"
+                  aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$id" --output json || true
+                  FAILED="$FAILED $id($STATUS)"
+                  INSTANCE_DONE[$id]=failed
+                  ;;
+                Pending|InProgress|Delayed|Cancelling)
+                  ;;
+                *)
+                  echo "Smoke command $COMMAND_ID on $id status=$STATUS; polling"
+                  ;;
+              esac
+            done
+            if ((${#INSTANCE_DONE[@]} == EXPECTED_DONE)); then
+              break
+            fi
+            sleep 5
+          done
+
+          for id in "${INSTANCE_ID_ARGS[@]}"; do
+            if [ -z "${INSTANCE_DONE[$id]:-}" ]; then
+              FAILED="$FAILED $id(TimedOut)"
+              TIMED_OUT_IDS+=("$id")
+            fi
+          done
+          if [ -n "$FAILED" ]; then
+            echo "::error::qurl-reverse-tunnel-server smoke failed:$FAILED"
+            if ((${#TIMED_OUT_IDS[@]} > 0)); then
+              echo "::warning::Cancelling timed-out SSM smoke command $COMMAND_ID on: ${TIMED_OUT_IDS[*]}"
+              aws ssm cancel-command --command-id "$COMMAND_ID" --instance-ids "${TIMED_OUT_IDS[@]}" || true
+            fi
+            echo "::error::QRtS smoke runs after the ASG refresh; the new image may already be live and rollback requires an explicit re-dispatch."
+            if [ -n "${ROLLBACK_IMAGE_TAG:-}" ]; then
+              echo "::error::Rollback hint: rerun promote-to-prod.yml with deploy_qrts=true and frps_image_tag=${ROLLBACK_IMAGE_TAG} after confirming rollback is appropriate."
+            fi
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          ASG_NAME: ${{ steps.asg.outputs.name }}
+          INSTANCE_IDS: ${{ steps.asg.outputs.ids }}
+          ASG_DESIRED: ${{ steps.asg.outputs.desired }}
+          COMMAND_ID: ${{ steps.smoke.outputs.command_id }}
+        run: |
+          {
+            echo "## qURL Reverse Tunnel Server Smoke (${ENVIRONMENT})"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| ASG | \`${ASG_NAME:-unknown}\` |"
+            echo "| ASG desired | \`${ASG_DESIRED:-unknown}\` |"
+            echo "| Instances | \`${INSTANCE_IDS:-unknown}\` |"
+            echo "| SSM command | \`${COMMAND_ID:-not-started}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

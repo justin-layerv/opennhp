@@ -10,18 +10,19 @@ Triggered on every push to `main` with app or infra changes. Builds Docker image
 
 > **Preferred method:** Use `./scripts/trigger-prod-deploy.sh` instead of running `gh workflow run` manually. The script reads SSM state from both accounts, validates sandbox health, auto-detects which components changed, and generates the correct command. Run with `--dry-run` to preview without executing.
 
-**Manual workflow** for promoting existing sandbox ECR images to production. No rebuild — uses images already built and validated in sandbox. Orchestrates deployment through canary (server/AC) and ECS task def registration (QURL).
+**Manual workflow** for promoting existing sandbox ECR images to production. No rebuild — uses images already built and validated in sandbox. Orchestrates deployment through canary (server/AC), ECS task def registration (QURL), and ASG instance refresh (qurl-reverse-tunnel-server).
 
 **Components deployed:**
 - **NHP Server** (`layerv/nhp-server`) — Canary deploy via `canary-deploy.yml` (Step Functions, health checks, auto-rollback). Falls back to direct SSM + instance refresh on first deploy.
 - **Access Controller** (`layerv/nhp-ac`) — Same canary pattern, deployed sequentially after server.
 - **QURL Service** (`layerv/nhp-qurl`) — ECS task definition re-registration via `deploy-ecs-service.sh` (circuit breaker auto-rollback).
+- **qURL Reverse Tunnel Server** (`layerv/qurl-reverse-tunnel-server`) — SSM image-tag update plus ASG instance refresh, followed by the QRtS smoke workflow.
 
 Each component can be independently enabled/disabled via workflow inputs.
 
 **Deployment flow:**
 ```
-manifest ──→ preflight (approval) ──→ terraform ──→ server ──→ AC ──→ QURL ──→ smoke test ──→ monitor ──→ finalize
+manifest ──→ preflight (approval) ──→ terraform ──→ server ──→ AC ──→ QURL ──→ QRtS ──→ smoke tests ──→ monitor ──→ finalize
 ```
 
 **Manifest (pre-approval):** Runs immediately before the approval gate so reviewers see:
@@ -34,7 +35,7 @@ manifest ──→ preflight (approval) ──→ terraform ──→ server ─
 - **Deployment lock** — SSM-based lock prevents concurrent deployments
 - **Sequential deploys** — Server must be healthy before AC, AC before QURL
 - **5-minute monitoring window** — Watches CloudWatch alarms post-deploy
-- **Smoke tests** — Infrastructure validation + QURL health/readiness/API checks
+- **Smoke tests** — Infrastructure validation + QURL/NHP/API checks + QRtS ASG smoke
 - **Tracking** — SSM deployed-commit/deployed-at, CloudWatch deployment metrics, SNS notifications
 
 #### Standard deployment

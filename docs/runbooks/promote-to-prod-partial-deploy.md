@@ -24,7 +24,7 @@ This is the failure mode tracked in **issue #1322** — the 2026-04-24 prod rele
    `deploy-qurl`): the tunnel fleet validates knock tokens against nhp-server and
    routes through the AC, so a failed core deploy **skips** qrts rather than
    rolling it onto a half-updated control plane (#2298).
-4. `smoke-test` → `qurl-smoke-tests` → `nhp-smoke-tests` → `monitor` → `finalize`.
+4. `smoke-test` / `qurl-smoke-tests` / `qrts-smoke-tests` → `monitor`; `nhp-smoke-tests` and `monitor` → `finalize`.
 
 Pre-#1322, the deploy-* jobs gated on `needs.terraform-apply.result == 'success' || == 'skipped'`. When `qurl-schema-compat` failed, GitHub Actions skipped `terraform-apply` (because of `needs:`), and the deploy-* jobs *also* observed `skipped` — so they ran anyway, rolling new binaries onto the previous terraform state. `finalize` then walked job results looking only for `failure || cancelled`, saw none, and reported the run as `success`.
 
@@ -55,6 +55,7 @@ Post-#1322, the gate is:
    | Deploy QURL Service | skipped |
    | Deploy qurl-reverse-tunnel-server | skipped |
    | Smoke Test | skipped |
+   | qURL Reverse Tunnel Server Smoke Tests | skipped |
    | Finalize | (overall: failed) |
 
    If you see deploy-* jobs as `success` while `qurl-schema-compat` is `failure`, the gate has regressed — re-open #1322.
@@ -141,10 +142,14 @@ Do **not** ssh-and-fix-by-hand. The fail-closed branch is intentional — silent
 | Terraform Plan / Apply | skipped (app-only dispatch) |
 | Deploy NHP Server / AC / QURL | skipped |
 | **Deploy qurl-reverse-tunnel-server** | **success** |
-| Smoke Test / QURL / NHP smoke | **skipped** — the smokes gate on "≥1 of server/ac/qurl succeeded", which a qrts-only dispatch never satisfies; this is intentional (qrts has no app-layer smoke). |
+| Smoke Test / QURL / NHP smoke | **skipped** — those suites gate on "≥1 of server/ac/qurl succeeded", which a qrts-only dispatch never satisfies. |
+| **qURL Reverse Tunnel Server Smoke Tests** | **success** — runs after `deploy-qrts` and verifies the refreshed tunnel-server ASG via the QRtS smoke workflow. |
+| Monitor | success, after the qrts smoke passes |
 | Finalize | (overall: deployed) |
 
-A qrts-only run that shows the smokes as `skipped` is the **expected** shape, not a regression.
+A qrts-only run that shows the control-plane smokes as `skipped` and `qURL Reverse Tunnel Server Smoke Tests` as `success` is the **expected** shape, not a regression.
+
+Direct `qrts-smoke-tests.yml` `workflow_dispatch` runs are diagnostic. Pass `expected_image_tag` for sandbox runs when you need to prove the refreshed instances are on a specific QRtS image; without it the smoke still checks service, binary, and dashboard health but intentionally skips version-to-image verification, so it does not prove the instances are on a newly refreshed image.
 
 **Mixed dispatch where a core deploy fails** (e.g. `deploy_server=true deploy_qrts=true`, server-canary fails): qrts gates on `(deploy-server == success || skipped)`, so a **failed** core deploy makes that clause false and qrts is **skipped** — it does **not** roll onto a half-updated control plane. End-state: prod stays on **old-qrts + old-server**, `finalize=failed`, lock released as `failed`; there is no new-qrts split-state to reconcile on the qrts side. Roll qrts forward by re-dispatching once the core deploy succeeds. (Pre-#2298 this produced a new-qrts + old-server split-state; the chained gate makes that impossible now.)
 

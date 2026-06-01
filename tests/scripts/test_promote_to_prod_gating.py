@@ -144,6 +144,12 @@ BUILD_AND_PUSH_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-and-push.
 BUILD_LAMBDA_PACKAGES_ACTION = (
     REPO_ROOT / ".github" / "actions" / "build-lambda-packages" / "action.yml"
 )
+QRTS_SMOKE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "qrts-smoke-tests.yml"
+QRTS_INSTANCE_SMOKE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "qrts-instance-smoke.sh"
+QRTS_TERRAFORM_VARIABLES = (
+    REPO_ROOT / "terraform" / "modules" / "qurl-reverse-tunnel-server" / "variables.tf"
+)
+QRTS_PROD_TFVARS = REPO_ROOT / "terraform" / "environments" / "prod" / "terraform.tfvars"
 _TERRAFORM_MODULE_SCAN_PATHS = (
     REPO_ROOT / "terraform" / "main.tf",
     REPO_ROOT / "terraform" / "environments" / "prod" / "main.tf",
@@ -421,6 +427,29 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
     return False
 
 
+def _qrts_dashboard_port_default() -> str | None:
+    if not QRTS_TERRAFORM_VARIABLES.is_file():
+        return None
+    text = QRTS_TERRAFORM_VARIABLES.read_text()
+    marker = 'variable "frps_dashboard_port"'
+    try:
+        start = text.index(marker)
+    except ValueError:
+        return None
+    next_var = text.find('\nvariable "', start + len(marker))
+    block = text[start:] if next_var == -1 else text[start:next_var]
+    match = re.search(r"^\s*default\s*=\s*(\d+)\s*$", block, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _qrts_prod_dashboard_port_override() -> str | None:
+    if not QRTS_PROD_TFVARS.is_file():
+        return None
+    text = QRTS_PROD_TFVARS.read_text()
+    match = re.search(r"^\s*frps_dashboard_port\s*=\s*(\d+)\s*$", text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
 def _info(label: str) -> None:
     """Informational line — same channel as `_check` but not grep-able
     as `ok`/`FAIL`. See the REPORTING CONVENTION docstring."""
@@ -581,24 +610,28 @@ def _assert_sns_row_widths(jobs: dict, failures: list[str]) -> None:
 
 
 def _assert_smoke_decoupled_from_qrts(jobs: dict, failures: list[str]) -> None:
-    """The smoke jobs must stay decoupled from deploy-qrts.
+    """The control-plane smoke jobs must stay decoupled from deploy-qrts.
 
     deploy-qrts is intentionally independent of the server/ac/qurl
     control plane (PR #2241): the nhp/qurl smoke suites exercise
     server/ac/qurl, not qrts, so a qrts failure must NOT skip them —
     otherwise the "did server/ac/qurl deploy cleanly?" signal that
     scopes a rollback is lost. Guard against a future change that
-    re-couples them by re-adding `deploy-qrts` to a smoke job's `needs`
-    or `if`. (finalize legitimately needs deploy-qrts for QRTS_RESULT;
-    only jobs with "smoke" in the name are checked here.)
+    re-couples them by re-adding `deploy-qrts` to a control-plane smoke
+    job's `needs` or `if`. The dedicated `qrts-smoke-tests` job is the
+    one allowed and required to depend on deploy-qrts.
     """
-    smoke_jobs = [n for n in jobs if isinstance(n, str) and "smoke" in n]
+    smoke_jobs = [
+        n
+        for n in jobs
+        if isinstance(n, str) and "smoke" in n and n != "qrts-smoke-tests"
+    ]
     if not _check(
-        "found at least one smoke job",
+        "found at least one control-plane smoke job",
         len(smoke_jobs) > 0,
-        "no jobs with 'smoke' in the name — were they renamed?",
+        "no non-qrts jobs with 'smoke' in the name — were they renamed?",
     ):
-        failures.append("no smoke jobs discovered (rename?)")
+        failures.append("no control-plane smoke jobs discovered (rename?)")
         return
     for name in smoke_jobs:
         job = jobs[name]
@@ -617,6 +650,321 @@ def _assert_smoke_decoupled_from_qrts(jobs: dict, failures: list[str]) -> None:
                 f"smoke job `{name}` re-coupled to deploy-qrts "
                 f"(needs={in_needs}, if={in_gate})"
             )
+
+
+def _assert_qrts_smoke_after_deploy_qrts(jobs: dict, failures: list[str]) -> None:
+    """qrts-smoke-tests must be a required post-deploy signal for deploy-qrts.
+
+    The QRtS smoke suite must run only after the prod ASG instance refresh has
+    completed. It also must feed monitor/finalize so a qrts-only promotion gets
+    the same post-deploy alarm watch + failure propagation as the app deploys.
+    """
+    job = jobs.get("qrts-smoke-tests")
+    if job is None:
+        _check("qrts-smoke-tests job exists", False)
+        failures.append("qrts-smoke-tests job missing")
+        return
+    _check("qrts-smoke-tests job exists", True)
+
+    needs = job.get("needs", [])
+    if isinstance(needs, str):
+        needs = [needs]
+    gate = str(job.get("if", ""))
+    if not _check(
+        "qrts-smoke-tests needs deploy-qrts",
+        "deploy-qrts" in needs,
+        f"needs: {needs}",
+    ):
+        failures.append("qrts-smoke-tests does not depend on deploy-qrts")
+    if not _check(
+        "qrts-smoke-tests needs manifest for rollback hint",
+        "manifest" in needs,
+        f"needs: {needs}",
+    ):
+        failures.append("qrts-smoke-tests missing manifest need for rollback tag")
+    if not _check(
+        "qrts-smoke-tests gates on deploy-qrts success",
+        gate.strip() == "needs.deploy-qrts.result == 'success'",
+        f"if: {gate!r}",
+    ):
+        failures.append(
+            "qrts-smoke-tests must run only after deploy-qrts succeeds "
+            "(not after skipped)"
+        )
+    uses = str(job.get("uses", ""))
+    if not _check(
+        "qrts-smoke-tests calls the local QRtS reusable smoke workflow",
+        uses == "./.github/workflows/qrts-smoke-tests.yml",
+        f"uses: {uses!r}",
+    ):
+        failures.append("qrts-smoke-tests does not call the local QRtS smoke workflow")
+    elif QRTS_SMOKE_WORKFLOW.is_file():
+        smoke_workflow_text = QRTS_SMOKE_WORKFLOW.read_text()
+        smoke_wf = yaml.safe_load(smoke_workflow_text) or {}
+        smoke_job = (smoke_wf.get("jobs") or {}).get("smoke-test", {})
+        job_environment = smoke_job.get("environment")
+        smoke_steps = smoke_job.get("steps", [])
+        smoke_run = "\n".join(str(step.get("run", "")) for step in smoke_steps)
+        instance_smoke = (
+            QRTS_INSTANCE_SMOKE_SCRIPT.read_text()
+            if QRTS_INSTANCE_SMOKE_SCRIPT.is_file()
+            else ""
+        )
+        smoke_surface = f"{smoke_workflow_text}\n{smoke_run}\n{instance_smoke}"
+        # These exact markers intentionally fence review-discovered invariants;
+        # rewording probe behavior must update this dict in lockstep.
+        required_markers = {
+            "STS account assertion": "aws sts get-caller-identity",
+            "SSM ASG resolution": "/${ENVIRONMENT}/nhp/reverse-tunnel-server/asg-name",
+            "ASG single snapshot": "ASG_JSON",
+            "ASG settle retry budget": "ASG_SETTLE_ATTEMPTS=18",
+            "ASG settle retry diagnostic": "Waiting for $ASG_NAME healthy InService count",
+            "ASG desired capacity read": "DesiredCapacity",
+            "ASG desired/healthy count guard": "does not match desired capacity",
+            "ASG desired summary": "ASG desired",
+            "service health": "systemctl is-active --quiet qurl-reverse-tunnel-server",
+            "service inactive diagnostic": "qurl-reverse-tunnel-server service is not active",
+            "binary path": "BINARY=/opt/layerv/qurl-reverse-tunnel-server/nhp-frps",
+            "binary version": '"$BINARY" --version',
+            "binary version timeout": 'timeout 30 "$BINARY" --version',
+            "binary version stderr isolation": '2>"$VERSION_STDERR"',
+            "binary/image commit match": "ACTUAL_COMMIT",
+            "binary version CRLF normalization": "tr -d '\\r'",
+            "binary commit contract comment": "qurl-reverse-tunnel-server/internal/version.Full",
+            "prod release bare commit contract": "Prod release images must expose a bare clean SHA",
+            "source SHA image tag contract": "image tag is the source commit SHA",
+            "trailing version annotation fails closed": "any trailing annotation then fails",
+            "bare commit validation": "bare lowercase SHA prefix",
+            "expected image tag input": "EXPECTED_IMAGE_TAG",
+            "expected image tag validation": "expected_image_tag must be a full 40-character lowercase git SHA",
+            "target environment validation": "target environment must be prod or sandbox",
+            "remote environment argument": '--arg environment "$TARGET_ENVIRONMENT"',
+            "direct sandbox dispatch role diagnostic": "Direct sandbox workflow_dispatch requires repo/org AWS_ROLE_ARN",
+            "direct prod dispatch policy comment": "disable direct prod dispatch",
+            "direct prod dispatch mutation guard": "Future mutating probes must disable direct prod dispatch",
+            "dashboard port self-validation": "dashboard port must be an integer TCP port",
+            "dashboard port source-of-truth comment": "var.frps_dashboard_port",
+            "checked-in instance smoke script": "qrts-instance-smoke.sh",
+            "instance smoke script transport": "base64",
+            "remote execution timeout": "executionTimeout",
+            "SSM delivery timeout": "SSM_DELIVERY_TIMEOUT_SECONDS=180",
+            "runner poll timeout headroom": "RUNNER_POLL_TIMEOUT_SECONDS=900",
+            "runner poll timeout comment": "runner poll (15m)",
+            "SSM polling scale note": "if this scales to dozens",
+            "instance dependency source comment": "Ubuntu coreutils supplies mktemp/timeout",
+            "instance dependency check": "jq curl mktemp timeout",
+            "remote smoke script temp path": "SMOKE_SCRIPT_PATH=$(mktemp",
+            "serverinfo temp path": 'SERVERINFO_JSON="$(mktemp',
+            "dashboard probe": "/api/serverinfo",
+            "dashboard serverinfo version contract": "upstream FRP `/api/serverinfo` contract",
+            "dashboard serverinfo jq diagnostic": "dashboard serverinfo JSON missing non-empty .version string",
+            "dashboard empty-body diagnostic": "dashboard response body empty",
+            "prod dashboard 401 fails closed": "dashboard returned 401 in prod",
+            "sandbox dashboard 401 allowance": "generic sandbox 401",
+            "dashboard auth follow-up": "require authenticated 200 + `.version`",
+            "dashboard attempt budget": "DASHBOARD_MAX_ATTEMPTS=18",
+            "dashboard retry delay": "DASHBOARD_RETRY_DELAY_SECONDS=5",
+            "dashboard curl max timeout": "DASHBOARD_CURL_MAX_SECONDS=10",
+            "dashboard curl connect timeout": "DASHBOARD_CURL_CONNECT_SECONDS=5",
+            "base-10 dashboard port validation": "10#$DASHBOARD_PORT",
+            "base-10 instance port normalization": "DASHBOARD_PORT_DECIMAL",
+            "dashboard warmup retries connection/5xx/404": "000|5??|404",
+            "dashboard 404 warmup rationale": "404 stays in the warmup set",
+            "dashboard non-404 4xx fails fast": "terminal dashboard response",
+            "SSM timeout cancellation": "cancel-command",
+            "post-refresh failure warning": "new image may already be live",
+            "runner timeout status label": "id(TimedOut)",
+            "success-path SSM output": "StandardOutputContent",
+            "SSM cancellation transition keeps polling": "Pending|InProgress|Delayed|Cancelling",
+            "remote POSIX shell": "set -eu",
+        }
+        if not _check(
+            "local QRtS smoke workflow avoids extra GitHub environment approval",
+            job_environment in (None, ""),
+            f"jobs.smoke-test.environment: {job_environment!r}",
+        ):
+            failures.append(
+                "local QRtS smoke workflow must not bind a GitHub environment"
+            )
+        missing_markers = [
+            label for label, marker in required_markers.items() if marker not in smoke_surface
+        ]
+        if not _check(
+            "local QRtS smoke workflow keeps core service/binary/dashboard probes",
+            not missing_markers,
+            f"missing marker(s): {missing_markers}",
+        ):
+            failures.append(
+                "local QRtS smoke workflow missing probe marker(s): "
+                f"{missing_markers}"
+            )
+        if not _check(
+            "local QRtS smoke workflow treats Cancelling as non-terminal",
+            "Failed|Cancelled|TimedOut|Cancelling" not in smoke_run,
+            "Cancelling must stay with pending states until SSM reaches Cancelled",
+        ):
+            failures.append(
+                "local QRtS smoke workflow still treats Cancelling as terminal failure"
+            )
+        if not _check(
+            "local QRtS instance smoke script file exists",
+            QRTS_INSTANCE_SMOKE_SCRIPT.is_file(),
+            f"{QRTS_INSTANCE_SMOKE_SCRIPT.relative_to(REPO_ROOT)} not found",
+        ):
+            failures.append("local QRtS instance smoke script file missing")
+    else:
+        if not _check(
+            "local QRtS smoke workflow file exists",
+            False,
+            f"{QRTS_SMOKE_WORKFLOW.relative_to(REPO_ROOT)} not found",
+        ):
+            failures.append("local QRtS smoke workflow file missing")
+    with_block = job.get("with", {})
+    if not _check(
+        "qrts-smoke-tests targets prod",
+        with_block.get("environment") == "prod",
+        f"with.environment: {with_block.get('environment')!r}",
+    ):
+        failures.append("qrts-smoke-tests with.environment must be prod")
+    terraform_dashboard_port = _qrts_dashboard_port_default()
+    prod_dashboard_port_override = _qrts_prod_dashboard_port_override()
+    effective_prod_dashboard_port = prod_dashboard_port_override or terraform_dashboard_port
+    if not _check(
+        "qrts-smoke-tests passes the effective prod dashboard port",
+        effective_prod_dashboard_port is not None
+        and with_block.get("dashboard_port") == effective_prod_dashboard_port,
+        (
+            f"with.dashboard_port: {with_block.get('dashboard_port')!r}; "
+            f"terraform default: {terraform_dashboard_port!r}; "
+            f"prod tfvars override: {prod_dashboard_port_override!r}"
+        ),
+    ):
+        failures.append(
+            "qrts-smoke-tests dashboard_port must stay tied to the qurl-reverse-tunnel-server effective prod value"
+        )
+    if not _check(
+        "qrts-smoke-tests passes promoted qrts tag as expected image tag",
+        "frps_image_tag" in str(with_block.get("expected_image_tag", "")),
+        f"expected_image_tag: {with_block.get('expected_image_tag')!r}",
+    ):
+        failures.append("qrts-smoke-tests expected_image_tag not wired to manifest")
+    if not _check(
+        "qrts-smoke-tests passes current prod qrts tag as rollback hint",
+        "current_prod_frps_tag" in str(with_block.get("rollback_image_tag", "")),
+        f"rollback_image_tag: {with_block.get('rollback_image_tag')!r}",
+    ):
+        failures.append("qrts-smoke-tests rollback_image_tag not wired to manifest")
+    prod_state_step = next(
+        (
+            step
+            for step in (jobs.get("manifest", {}).get("steps", []) or [])
+            if step.get("id") == "prod-state"
+        ),
+        {},
+    )
+    prod_state_run = str(prod_state_step.get("run", ""))
+    if not _check(
+        "prod-state suppresses non-SHA qrts rollback hints",
+        "suppressing rollback hint because deploy_qrts=true would reject it"
+        in prod_state_run,
+        "current_prod_frps_tag must be empty when the saved prod qrts tag is not a full SHA",
+    ):
+        failures.append("prod-state must not forward non-SHA qrts rollback hints")
+    if not _check(
+        "prod-state treats missing qrts tag as no rollback hint",
+        '-z "$PROD_FRPS_TAG"' in prod_state_run,
+        "first-ever prod qrts deploys should not emit the non-SHA rollback warning for an empty tag",
+    ):
+        failures.append("prod-state must silently suppress an empty qrts rollback hint")
+    secrets = job.get("secrets", {})
+    if not _check(
+        "qrts-smoke-tests uses the prod AWS role",
+        "AWS_PROD_ROLE_ARN" in str(secrets.get("AWS_ROLE_ARN", "")),
+        f"secrets.AWS_ROLE_ARN: {secrets.get('AWS_ROLE_ARN')!r}",
+    ):
+        failures.append("qrts-smoke-tests AWS_ROLE_ARN must use AWS_PROD_ROLE_ARN")
+
+    monitor = jobs.get("monitor", {})
+    monitor_needs = monitor.get("needs", [])
+    if isinstance(monitor_needs, str):
+        monitor_needs = [monitor_needs]
+    monitor_gate = str(monitor.get("if", ""))
+    monitor_run = "\n".join(
+        str(step.get("run", "")) for step in (monitor.get("steps", []) or [])
+    )
+    monitor_alarm_prefixes = re.findall(
+        r"--alarm-name-prefix\s+[\"']([^\"']+)[\"']",
+        monitor_run,
+    )
+    qrts_alarm_prefix = "layerv-nhp-prod-frps"
+    workflow_text = WORKFLOW.read_text() if WORKFLOW.is_file() else ""
+    if not _check(
+        "monitor waits on qrts-smoke-tests",
+        "qrts-smoke-tests" in monitor_needs,
+        f"monitor.needs: {monitor_needs}",
+    ):
+        failures.append("monitor.needs missing qrts-smoke-tests")
+    if not _check(
+        "monitor gate accepts qrts-smoke-tests success/skipped and a qrts smoke success",
+        "needs.qrts-smoke-tests.result == 'success'" in monitor_gate
+        and "needs.qrts-smoke-tests.result == 'skipped'" in monitor_gate,
+        f"monitor.if: {monitor_gate!r}",
+    ):
+        failures.append("monitor.if missing qrts-smoke-tests result handling")
+    if not _check(
+        "monitor documents smoke-failure skip semantics",
+        "Any smoke failure skips monitor" in workflow_text,
+        "monitor should document that finalize, not monitor, handles failed smoke results",
+    ):
+        failures.append("monitor missing smoke-failure skip semantics comment")
+    if not _check(
+        "monitor documents QRtS alarm-prefix coverage",
+        "layerv-nhp-prod-frps-*" in workflow_text,
+        "monitor should document that the shared alarm prefix includes QRtS alarms",
+    ):
+        failures.append("monitor missing QRtS alarm-prefix coverage comment")
+    if not _check(
+        "monitor CloudWatch alarm prefix covers QRtS alarms",
+        bool(monitor_alarm_prefixes)
+        and all(
+            prefix and qrts_alarm_prefix.startswith(prefix)
+            for prefix in monitor_alarm_prefixes
+        ),
+        (
+            f"monitor --alarm-name-prefix values: {monitor_alarm_prefixes}; "
+            f"QRtS alarm prefix: {qrts_alarm_prefix}"
+        ),
+    ):
+        failures.append("monitor alarm prefix no longer covers QRtS alarms")
+
+    finalize = jobs.get("finalize", {})
+    finalize_needs = finalize.get("needs", [])
+    if isinstance(finalize_needs, str):
+        finalize_needs = [finalize_needs]
+    if not _check(
+        "finalize waits on qrts-smoke-tests",
+        "qrts-smoke-tests" in finalize_needs,
+        f"finalize.needs: {finalize_needs}",
+    ):
+        failures.append("finalize.needs missing qrts-smoke-tests")
+    outcome = next(
+        (step for step in finalize.get("steps", []) if step.get("id") == "outcome"),
+        {},
+    )
+    outcome_env = outcome.get("env", {})
+    outcome_run = str(outcome.get("run", ""))
+    if not _check(
+        "finalize outcome exposes QRTS_SMOKE_RESULT",
+        "needs.qrts-smoke-tests.result" in str(outcome_env.get("QRTS_SMOKE_RESULT", "")),
+        f"env.QRTS_SMOKE_RESULT: {outcome_env.get('QRTS_SMOKE_RESULT')!r}",
+    ):
+        failures.append("finalize outcome missing QRTS_SMOKE_RESULT env wiring")
+    if not _check(
+        "finalize outcome FAILED loop iterates QRTS_SMOKE_RESULT",
+        "QRTS_SMOKE_RESULT" in outcome_run,
+        "QRTS_SMOKE_RESULT missing from outcome.run",
+    ):
+        failures.append("finalize outcome loop missing QRTS_SMOKE_RESULT")
 
 
 def _assert_qrts_rollback_guard(jobs: dict, failures: list[str]) -> None:
@@ -661,6 +1009,23 @@ def _assert_qrts_rollback_guard(jobs: dict, failures: list[str]) -> None:
         failures.append(
             "resolve-frps-tag missing the qrts rollback guard "
             "(rollback=true + deploy_qrts=true must require explicit frps_image_tag)"
+        )
+    has_sha_guard = all(
+        marker in run
+        for marker in (
+            "QRTS_SHA_RE='^[0-9a-f]{40}$'",
+            '[[ "$DEPLOY_QRTS" == "true" && ! "$FRPS_IMAGE_TAG_INPUT" =~ $QRTS_SHA_RE ]]',
+            '[[ "$DEPLOY_QRTS" == "true" && ! "$FRPS_TAG" =~ $QRTS_SHA_RE ]]',
+            "QRtS smoke can verify the refreshed binary",
+        )
+    )
+    if not _check(
+        "resolve-frps-tag requires SHA tags when deploy_qrts=true",
+        has_sha_guard,
+        "missing the deploy_qrts=true full-SHA guard for provided and SSM-resolved tags",
+    ):
+        failures.append(
+            "resolve-frps-tag must require full lowercase SHA tags when deploy_qrts=true"
         )
 
 
@@ -3469,6 +3834,35 @@ _BAD_FIXTURE_SMOKE_COUPLED_TO_QRTS = textwrap.dedent(
 )
 
 
+_BAD_FIXTURE_QRTS_SMOKE_NOT_AFTER_DEPLOY = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      # Bug: qrts-smoke-tests exists but does not wait for deploy-qrts, so a
+      # qrts-only promotion could report green before the ASG refresh is proven.
+      # This fixture intentionally exercises several qrts-smoke wiring rules;
+      # the harness only requires at least one assertion in the family to fail.
+      qrts-smoke-tests:
+        needs: [manifest, preflight]
+        if: inputs.deploy_qrts
+        uses: ./.github/workflows/qrts-smoke-tests.yml
+        with:
+          environment: prod
+        secrets:
+          AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}
+      monitor:
+        needs: [smoke-test, qurl-smoke-tests]
+        if: needs.smoke-test.result == 'success'
+      finalize:
+        needs: [qrts-smoke-tests]
+        steps:
+          - id: outcome
+            env: {}
+            run: echo done
+    """
+)
+
+
 _BAD_FIXTURE_QRTS_ROLLBACK_GUARD_MISSING = textwrap.dedent(
     """
     on: workflow_dispatch
@@ -3731,6 +4125,11 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
             _BAD_FIXTURE_SMOKE_COUPLED_TO_QRTS,
         ),
         (
+            "qrts smoke does not wait for deploy-qrts",
+            _assert_qrts_smoke_after_deploy_qrts,
+            _BAD_FIXTURE_QRTS_SMOKE_NOT_AFTER_DEPLOY,
+        ),
+        (
             "qrts rollback guard removed from resolve-frps-tag",
             _assert_qrts_rollback_guard,
             _BAD_FIXTURE_QRTS_ROLLBACK_GUARD_MISSING,
@@ -3776,6 +4175,7 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
         _assert_lambda_tests_before_prod_credentials,
         _assert_manifest_rejects_no_op,
         _assert_preflight,
+        _assert_qrts_smoke_after_deploy_qrts,
         _assert_terraform_apply_needs_schema_compat,
         # _assert_sns_row_widths is exercised by its own dedicated
         # self-test (`_assert_sns_row_widths_boundary` covers the
@@ -3856,6 +4256,7 @@ def main() -> int:
         _assert_preflight,
         _assert_sns_row_widths,
         _assert_smoke_decoupled_from_qrts,
+        _assert_qrts_smoke_after_deploy_qrts,
         _assert_qrts_rollback_guard,
         _assert_every_image_deploy_has_sns_row,
     )
