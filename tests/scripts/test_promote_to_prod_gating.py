@@ -140,6 +140,10 @@ __test__ = False
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "promote-to-prod.yml"
+BUILD_AND_PUSH_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-and-push.yml"
+BUILD_LAMBDA_PACKAGES_ACTION = (
+    REPO_ROOT / ".github" / "actions" / "build-lambda-packages" / "action.yml"
+)
 _TERRAFORM_MODULE_SCAN_PATHS = (
     REPO_ROOT / "terraform" / "main.tf",
     REPO_ROOT / "terraform" / "environments" / "prod" / "main.tf",
@@ -157,6 +161,56 @@ _TERRAFORM_MODULE_SCAN_PATHS = (
 # Python identifiers). If this prefix is ever changed, update the
 # fixtures by hand alongside this constant.
 _LAMBDA_ARTIFACT_PREFIX = "lambda-"
+
+_DUMMY_AWS_TEST_ENV = {
+    "AWS_ACCESS_KEY_ID": "unit-test",
+    "AWS_SECRET_ACCESS_KEY": "unit-test",
+    "AWS_SESSION_TOKEN": "unit-test",
+    "AWS_DEFAULT_REGION": "us-east-2",
+    "AWS_REGION": "us-east-2",
+    "AWS_EC2_METADATA_DISABLED": "true",
+}
+
+_CERT_LAMBDA_REQUIREMENTS = (
+    # Keep each module's local filename convention; the fence cares that both
+    # cert suites install their own pinned test dependency files.
+    "terraform/modules/acme-cert/lambda/requirements-dev.txt",
+    "terraform/modules/custom-domain-cert/lambda/requirements-test.txt",
+)
+
+_CERT_LAMBDA_SUITES = {
+    "acme-cert": (
+        "terraform/modules/acme-cert/lambda",
+        "test_acme_cert_manager.py",
+    ),
+    "custom-domain-cert": (
+        "terraform/modules/custom-domain-cert/lambda",
+        "test_cert_manager.py",
+    ),
+}
+
+
+def _drifted_dummy_aws_env(env: dict) -> dict:
+    return {
+        key: env.get(key)
+        for key, expected in _DUMMY_AWS_TEST_ENV.items()
+        # Catch YAML booleans and missing keys as drift from the string env.
+        if str(env.get(key)) != expected
+    }
+
+
+def _missing_cert_lambda_requirements(run_body: str) -> list[str]:
+    return [
+        requirement for requirement in _CERT_LAMBDA_REQUIREMENTS
+        if requirement not in run_body
+    ]
+
+
+def _missing_cert_lambda_suites(run_body: str) -> list[str]:
+    return [
+        suite for suite, markers in _CERT_LAMBDA_SUITES.items()
+        if not all(marker in run_body for marker in markers)
+    ]
 
 # Gate matchers — anchored regexes, NOT plain substrings. The naïve
 # `"inputs.run_terraform && success" in gate` test passes false-positively
@@ -1728,6 +1782,333 @@ def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
         )
 
 
+def _assert_lambda_build_before_aws_credentials(
+    jobs: dict,
+    failures: list[str],
+    *,
+    job_name: str,
+    credential_scope: str,
+) -> None:
+    """Run Lambda package builds/tests before a workflow assumes AWS credentials.
+
+    The composite build action runs Python unit tests. Some of those tests
+    create metric clients and exercise code paths adjacent to metric emission,
+    so workflows must not hand the action real credentials first. This is
+    defense-in-depth with the action-level dummy AWS env and test-level mocks.
+    """
+    plan_steps = (jobs.get(job_name) or {}).get("steps") or []
+    if not _check(
+        f"`{job_name}` job resolves to a job with steps for Lambda test "
+        "credential ordering",
+        bool(plan_steps),
+        f"`{job_name}` missing or empty — cannot verify Lambda tests run "
+        f"before {credential_scope} credentials",
+    ):
+        failures.append(
+            f"`{job_name}` job missing or empty; cannot verify Lambda tests "
+            f"run before {credential_scope} credentials"
+        )
+        return
+
+    build_indices = [
+        idx for idx, step in enumerate(plan_steps)
+        if step.get("name") == "Build Lambda Packages"
+    ]
+    credential_indices = [
+        idx for idx, step in enumerate(plan_steps)
+        if str(step.get("uses", "")).startswith(
+            "aws-actions/configure-aws-credentials@"
+        )
+    ]
+
+    detail = (
+        f"Build Lambda Packages indices={build_indices}; "
+        f"configure-aws-credentials indices={credential_indices}"
+    )
+    if not _check(
+        f"`{job_name}` has at least one `Build Lambda Packages` step",
+        bool(build_indices),
+        detail,
+    ):
+        failures.append(
+            f"`{job_name}` must have at least one `Build Lambda Packages` "
+            "step"
+        )
+    if not _check(
+        f"`{job_name}` has at least one AWS credential configuration step",
+        bool(credential_indices),
+        detail,
+    ):
+        failures.append(
+            f"`{job_name}` has no aws-actions/configure-aws-credentials step; "
+            "either the job shape changed or this assertion needs updating"
+        )
+
+    if not build_indices or not credential_indices:
+        return
+
+    last_build_idx = max(build_indices)
+    first_credential_idx = min(credential_indices)
+    if not _check(
+        f"all `Build Lambda Packages` steps run before {credential_scope} "
+        f"AWS credentials in `{job_name}`",
+        last_build_idx < first_credential_idx,
+        detail,
+    ):
+        failures.append(
+            f"`{job_name}` configures AWS credentials before running "
+            f"`Build Lambda Packages`; Lambda unit tests can inherit "
+            f"{credential_scope} creds "
+            "and publish real CloudWatch metrics"
+        )
+
+
+def _jobs_with_lambda_build(jobs: dict) -> set[str]:
+    return {
+        name for name, job in jobs.items()
+        if any(
+            step.get("name") == "Build Lambda Packages"
+            for step in (job.get("steps") or [])
+        )
+    }
+
+
+def _job_has_aws_credentials(jobs: dict, job_name: str) -> bool:
+    return any(
+        str(step.get("uses", "")).startswith(
+            "aws-actions/configure-aws-credentials@"
+        )
+        for step in ((jobs.get(job_name) or {}).get("steps") or [])
+    )
+
+
+def _assert_lambda_tests_before_prod_credentials(jobs: dict, failures: list[str]) -> None:
+    """Fence every promote-to-prod Lambda package build against prod creds."""
+    build_jobs = _jobs_with_lambda_build(jobs)
+    if not _check(
+        "promote-to-prod has at least one `Build Lambda Packages` job",
+        bool(build_jobs),
+        "no `Build Lambda Packages` step found — either the workflow shape "
+        "changed or this assertion needs updating",
+    ):
+        failures.append("promote-to-prod has no `Build Lambda Packages` step")
+        return
+    if not _check(
+        "promote-to-prod keeps the Lambda package build in `terraform-plan`",
+        "terraform-plan" in build_jobs,
+        f"jobs with Build Lambda Packages: {sorted(build_jobs)}",
+    ):
+        failures.append(
+            "`terraform-plan` no longer builds Lambda packages before prod "
+            "planning; either restore the ordering fence or update this "
+            "assertion with the new job contract"
+        )
+
+    for job_name in sorted(build_jobs):
+        _assert_lambda_build_before_aws_credentials(
+            jobs,
+            failures,
+            job_name=job_name,
+            credential_scope="prod",
+        )
+
+
+def _assert_build_and_push_lambda_tests_before_credentials(jobs: dict, failures: list[str]) -> None:
+    """Fence every credentialed build-and-push Lambda package build."""
+    expected_jobs = {"terraform-plan", "deploy-sandbox-infra"}
+    build_jobs = _jobs_with_lambda_build(jobs)
+    if not _check(
+        "build-and-push has at least one `Build Lambda Packages` job",
+        bool(build_jobs),
+        "no `Build Lambda Packages` step found — either the workflow shape "
+        "changed or this assertion needs updating",
+    ):
+        failures.append("build-and-push has no `Build Lambda Packages` step")
+        return
+
+    missing_expected = expected_jobs - build_jobs
+    if not _check(
+        "build-and-push keeps Lambda package builds in the deploy gate jobs",
+        not missing_expected,
+        (
+            f"expected jobs missing Build Lambda Packages: "
+            f"{sorted(missing_expected)}; "
+            f"actual jobs: {sorted(build_jobs)}"
+        ),
+    ):
+        failures.append(
+            "build-and-push no longer builds Lambda packages in the expected "
+            f"deploy gate jobs: {sorted(missing_expected)}"
+        )
+
+    for job_name in sorted(build_jobs):
+        if not _job_has_aws_credentials(jobs, job_name):
+            continue
+        _assert_lambda_build_before_aws_credentials(
+            jobs,
+            failures,
+            job_name=job_name,
+            credential_scope="sandbox",
+        )
+
+
+def _assert_build_and_push_test_lambdas_hermetic(jobs: dict, failures: list[str]) -> None:
+    """Fence the standalone Lambda test job against ambient AWS credentials."""
+    job = jobs.get("test-lambdas") or {}
+    steps = job.get("steps") or []
+    if not _check(
+        "build-and-push has standalone `test-lambdas` job",
+        bool(steps),
+        "`test-lambdas` missing or empty — cannot verify standalone Lambda "
+        "unit tests are hermetic",
+    ):
+        failures.append(
+            "`test-lambdas` job missing or empty; cannot verify standalone "
+            "Lambda unit tests are hermetic"
+        )
+        return
+
+    has_credentials = any(
+        str(step.get("uses", "")).startswith(
+            "aws-actions/configure-aws-credentials@"
+        )
+        for step in steps
+    )
+    if not _check(
+        "`test-lambdas` does not configure AWS credentials",
+        not has_credentials,
+    ):
+        failures.append(
+            "`test-lambdas` configures AWS credentials; standalone Lambda "
+            "unit tests must stay credential-free"
+        )
+
+    install_step = next(
+        (
+            step for step in steps
+            if step.get("name") == "Install test dependencies"
+        ),
+        None,
+    )
+    run_step = next(
+        (
+            step for step in steps
+            if step.get("name") == "Run Lambda unit tests"
+        ),
+        None,
+    )
+    if install_step is None:
+        _check("`test-lambdas` has install step", False)
+        failures.append("`test-lambdas` missing Install test dependencies step")
+    if run_step is None:
+        _check("`test-lambdas` has Lambda unit-test step", False)
+        failures.append("`test-lambdas` missing Run Lambda unit tests step")
+        return
+
+    if install_step is not None:
+        install_run = str(install_step.get("run", ""))
+        missing_requirements = _missing_cert_lambda_requirements(install_run)
+        if not _check(
+            "`test-lambdas` installs cert Lambda test requirements",
+            not missing_requirements,
+            f"missing requirement installs: {missing_requirements}",
+        ):
+            failures.append(
+                "`test-lambdas` dependency install no longer covers cert "
+                f"Lambda test requirements: {missing_requirements}"
+            )
+
+    env = run_step.get("env") or {}
+    drifted_env = _drifted_dummy_aws_env(env)
+    if not _check(
+        "`test-lambdas` runs with dummy AWS unit-test env",
+        not drifted_env,
+        f"drifted AWS env: {drifted_env}",
+    ):
+        failures.append(
+            "`test-lambdas` Run Lambda unit tests step must set dummy AWS env "
+            f"matching the package-build action; drifted keys: {sorted(drifted_env)}"
+        )
+
+    run_body = str(run_step.get("run", ""))
+    missing_suites = _missing_cert_lambda_suites(run_body)
+    if not _check(
+        "`test-lambdas` runs both cert Lambda unit suites",
+        not missing_suites,
+        f"missing suites: {missing_suites}",
+    ):
+        failures.append(
+            "`test-lambdas` no longer runs every AWS-adjacent cert Lambda "
+            f"unit suite: {missing_suites}"
+        )
+
+
+def _assert_build_lambda_action_unit_tests_hermetic(action: dict, failures: list[str]) -> None:
+    """Fence the composite action's Lambda unit-test step."""
+    steps = ((action.get("runs") or {}).get("steps") or [])
+    if not _check(
+        "build-lambda-packages action has composite steps",
+        bool(steps),
+        "action.yml missing runs.steps — cannot verify Lambda unit-test env",
+    ):
+        failures.append(
+            "build-lambda-packages action missing runs.steps; cannot verify "
+            "Lambda unit-test env"
+        )
+        return
+
+    run_step = next(
+        (
+            step for step in steps
+            if step.get("name") == "Run Python Unit Tests"
+        ),
+        None,
+    )
+    if run_step is None:
+        _check("build-lambda-packages action has Python unit-test step", False)
+        failures.append(
+            "build-lambda-packages action missing Run Python Unit Tests step"
+        )
+        return
+
+    run_body = str(run_step.get("run", ""))
+    missing_requirements = _missing_cert_lambda_requirements(run_body)
+    if not _check(
+        "build-lambda-packages action installs cert Lambda test requirements",
+        not missing_requirements,
+        f"missing requirement installs: {missing_requirements}",
+    ):
+        failures.append(
+            "build-lambda-packages action Run Python Unit Tests step no "
+            "longer installs cert Lambda test requirements: "
+            f"{missing_requirements}"
+        )
+
+    env = run_step.get("env") or {}
+    drifted_env = _drifted_dummy_aws_env(env)
+    if not _check(
+        "build-lambda-packages action unit tests use dummy AWS env",
+        not drifted_env,
+        f"drifted AWS env: {drifted_env}",
+    ):
+        failures.append(
+            "build-lambda-packages action Run Python Unit Tests step must set "
+            "dummy AWS env; drifted keys: "
+            f"{sorted(drifted_env)}"
+        )
+
+    missing_suites = _missing_cert_lambda_suites(run_body)
+    if not _check(
+        "build-lambda-packages action runs both cert Lambda unit suites",
+        not missing_suites,
+        f"missing suites: {missing_suites}",
+    ):
+        failures.append(
+            "build-lambda-packages action no longer runs every AWS-adjacent "
+            f"cert Lambda unit suite: {missing_suites}"
+        )
+
+
 def _assert_preflight(jobs: dict, failures: list[str]) -> None:
     preflight = jobs.get("preflight", {})
     stale_step = next(
@@ -2797,6 +3178,190 @@ _BAD_FIXTURE_LAMBDA_LOUD_FAIL_ALLOWLIST_UPLOAD_DRIFT = textwrap.dedent(
 )
 
 
+_BAD_FIXTURE_LAMBDA_TESTS_AFTER_PROD_CREDS = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: unit tests run after prod credentials are configured. A
+          # metric-emission test can publish to the real prod account and
+          # page the custom-domain-cert alarm.
+          - name: Configure AWS credentials
+            uses: aws-actions/configure-aws-credentials@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+          - name: Build Lambda Packages
+            uses: ./.github/actions/build-lambda-packages
+    """
+)
+
+
+_BAD_FIXTURE_BUILD_AND_PUSH_LAMBDA_TESTS_AFTER_CREDS = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Build Lambda Packages
+            uses: ./.github/actions/build-lambda-packages
+          - name: Configure AWS credentials
+            uses: aws-actions/configure-aws-credentials@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+      deploy-sandbox-infra:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: sandbox deploy credentials are configured before Lambda unit
+          # tests, leaving the action-level dummy env as the only metric guard.
+          - name: Configure AWS credentials
+            uses: aws-actions/configure-aws-credentials@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+          - name: Build Lambda Packages
+            uses: ./.github/actions/build-lambda-packages
+    """
+)
+
+
+_BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_CERT_REQUIREMENTS = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      test-lambdas:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Install test dependencies
+            run: |
+              # Bug: the acme-cert requirements are missing, so the
+              # AWS-adjacent suite can silently lose its pinned dependencies.
+              pip install -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
+          - name: Run Lambda unit tests
+            env:
+              AWS_ACCESS_KEY_ID: unit-test
+              AWS_SECRET_ACCESS_KEY: unit-test
+              AWS_SESSION_TOKEN: unit-test
+              AWS_DEFAULT_REGION: us-east-2
+              AWS_REGION: us-east-2
+              AWS_EC2_METADATA_DISABLED: "true"
+            run: |
+              (cd terraform/modules/acme-cert/lambda && python -m pytest test_acme_cert_manager.py -v)
+              (cd terraform/modules/custom-domain-cert/lambda && python -m pytest test_cert_manager.py -v)
+    """
+)
+
+
+_BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_DUMMY_ENV = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      test-lambdas:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Install test dependencies
+            run: |
+              pip install -r terraform/modules/acme-cert/lambda/requirements-dev.txt
+              pip install -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
+          - name: Run Lambda unit tests
+            # Bug: no dummy AWS env backstop, so ambient runner credentials or
+            # IMDS could be discovered by an unmocked boto3 call.
+            run: |
+              (cd terraform/modules/acme-cert/lambda && python -m pytest test_acme_cert_manager.py -v)
+              (cd terraform/modules/custom-domain-cert/lambda && python -m pytest test_cert_manager.py -v)
+    """
+)
+
+
+_BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_ACME_SUITE = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      test-lambdas:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Install test dependencies
+            run: |
+              pip install -r terraform/modules/acme-cert/lambda/requirements-dev.txt
+              pip install -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
+          - name: Run Lambda unit tests
+            env:
+              AWS_ACCESS_KEY_ID: unit-test
+              AWS_SECRET_ACCESS_KEY: unit-test
+              AWS_SESSION_TOKEN: unit-test
+              AWS_DEFAULT_REGION: us-east-2
+              AWS_REGION: us-east-2
+              AWS_EC2_METADATA_DISABLED: "true"
+            # Bug: custom-domain tests still run, but the acme-cert suite is
+            # missing from the standalone job.
+            run: |
+              (cd terraform/modules/custom-domain-cert/lambda && python -m pytest test_cert_manager.py -v)
+    """
+)
+
+
+_BAD_FIXTURE_BUILD_LAMBDA_ACTION_MISSING_CERT_REQUIREMENTS = textwrap.dedent(
+    """
+    name: Build Lambda Packages
+    runs:
+      using: composite
+      steps:
+        - name: Run Python Unit Tests
+          shell: bash
+          env:
+            AWS_ACCESS_KEY_ID: unit-test
+            AWS_SECRET_ACCESS_KEY: unit-test
+            AWS_SESSION_TOKEN: unit-test
+            AWS_DEFAULT_REGION: us-east-2
+            AWS_REGION: us-east-2
+            AWS_EC2_METADATA_DISABLED: "true"
+          run: |
+            # Bug: custom-domain tests run without their pinned test deps.
+            pip install -q -r terraform/modules/acme-cert/lambda/requirements-dev.txt
+            pytest terraform/modules/acme-cert/lambda/test_acme_cert_manager.py -v
+            pytest terraform/modules/custom-domain-cert/lambda/test_cert_manager.py -v
+    """
+)
+
+
+_BAD_FIXTURE_BUILD_LAMBDA_ACTION_MISSING_DUMMY_ENV = textwrap.dedent(
+    """
+    name: Build Lambda Packages
+    runs:
+      using: composite
+      steps:
+        - name: Run Python Unit Tests
+          shell: bash
+          # Bug: the composite action's unit-test step has no dummy AWS env,
+          # so credentialed caller jobs can leak deploy creds into boto3.
+          run: |
+            pip install -q -r terraform/modules/acme-cert/lambda/requirements-dev.txt
+            pip install -q -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
+            pytest terraform/modules/acme-cert/lambda/test_acme_cert_manager.py -v
+            pytest terraform/modules/custom-domain-cert/lambda/test_cert_manager.py -v
+    """
+)
+
+
+_BAD_FIXTURE_BUILD_LAMBDA_ACTION_MISSING_ACME_SUITE = textwrap.dedent(
+    """
+    name: Build Lambda Packages
+    runs:
+      using: composite
+      steps:
+        - name: Run Python Unit Tests
+          shell: bash
+          env:
+            AWS_ACCESS_KEY_ID: unit-test
+            AWS_SECRET_ACCESS_KEY: unit-test
+            AWS_SESSION_TOKEN: unit-test
+            AWS_DEFAULT_REGION: us-east-2
+            AWS_REGION: us-east-2
+            AWS_EC2_METADATA_DISABLED: "true"
+          run: |
+            pip install -q -r terraform/modules/acme-cert/lambda/requirements-dev.txt
+            pip install -q -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
+            # Bug: custom-domain tests still run, but acme-cert is missing.
+            pytest terraform/modules/custom-domain-cert/lambda/test_cert_manager.py -v
+    """
+)
+
+
 _BAD_FIXTURE_PREFLIGHT = textwrap.dedent(
     """
     on: workflow_dispatch
@@ -3121,6 +3686,46 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
             _BAD_FIXTURE_LAMBDA_LOUD_FAIL_NON_ALLOWLISTED_COE,
         ),
         (
+            "lambda package tests run after prod credentials",
+            _assert_lambda_tests_before_prod_credentials,
+            _BAD_FIXTURE_LAMBDA_TESTS_AFTER_PROD_CREDS,
+        ),
+        (
+            "build-and-push lambda package tests run after credentials",
+            _assert_build_and_push_lambda_tests_before_credentials,
+            _BAD_FIXTURE_BUILD_AND_PUSH_LAMBDA_TESTS_AFTER_CREDS,
+        ),
+        (
+            "build-and-push standalone Lambda tests missing cert requirements",
+            _assert_build_and_push_test_lambdas_hermetic,
+            _BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_CERT_REQUIREMENTS,
+        ),
+        (
+            "build-and-push standalone Lambda tests missing dummy AWS env",
+            _assert_build_and_push_test_lambdas_hermetic,
+            _BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_DUMMY_ENV,
+        ),
+        (
+            "build-and-push standalone Lambda tests missing acme suite",
+            _assert_build_and_push_test_lambdas_hermetic,
+            _BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_ACME_SUITE,
+        ),
+        (
+            "build-lambda-packages action missing cert requirements",
+            _assert_build_lambda_action_unit_tests_hermetic,
+            _BAD_FIXTURE_BUILD_LAMBDA_ACTION_MISSING_CERT_REQUIREMENTS,
+        ),
+        (
+            "build-lambda-packages action missing dummy AWS env",
+            _assert_build_lambda_action_unit_tests_hermetic,
+            _BAD_FIXTURE_BUILD_LAMBDA_ACTION_MISSING_DUMMY_ENV,
+        ),
+        (
+            "build-lambda-packages action missing acme suite",
+            _assert_build_lambda_action_unit_tests_hermetic,
+            _BAD_FIXTURE_BUILD_LAMBDA_ACTION_MISSING_ACME_SUITE,
+        ),
+        (
             "smoke jobs re-coupled to deploy-qrts (needs + if)",
             _assert_smoke_decoupled_from_qrts,
             _BAD_FIXTURE_SMOKE_COUPLED_TO_QRTS,
@@ -3138,10 +3743,12 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
     )
     all_rejected = True
     for label, assertion, fixture in cases:
-        fake_jobs = (yaml.safe_load(fixture) or {}).get("jobs", {})
+        fake_input = yaml.safe_load(fixture) or {}
+        # Workflow fixtures pass jobs; action fixtures pass the action root.
+        fake_root = fake_input.get("jobs", fake_input)
         fake_failures: list[str] = []
         with contextlib.redirect_stdout(io.StringIO()):
-            assertion(fake_jobs, fake_failures)
+            assertion(fake_root, fake_failures)
         if not _check(
             f"self-test: {label} assertion rejects its known-bad fixture",
             len(fake_failures) > 0,
@@ -3163,6 +3770,10 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
         _assert_force_push_verify_step,
         _assert_lambda_artifact_symmetry,
         _assert_lambda_loud_fail_policy,
+        _assert_build_lambda_action_unit_tests_hermetic,
+        _assert_build_and_push_lambda_tests_before_credentials,
+        _assert_build_and_push_test_lambdas_hermetic,
+        _assert_lambda_tests_before_prod_credentials,
         _assert_manifest_rejects_no_op,
         _assert_preflight,
         _assert_terraform_apply_needs_schema_compat,
@@ -3182,11 +3793,20 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
 
 
 def main() -> int:
-    if not WORKFLOW.is_file():
-        print(f"FAIL: {WORKFLOW} not found")
-        return 1
+    for path in (WORKFLOW, BUILD_AND_PUSH_WORKFLOW, BUILD_LAMBDA_PACKAGES_ACTION):
+        if not path.is_file():
+            print(f"FAIL: {path} not found")
+            return 1
 
     print(f"Checking {WORKFLOW.relative_to(REPO_ROOT)} for #1322 gate regression…")
+    print(
+        f"Checking {BUILD_AND_PUSH_WORKFLOW.relative_to(REPO_ROOT)} "
+        "for Lambda test credential-order regression…"
+    )
+    print(
+        f"Checking {BUILD_LAMBDA_PACKAGES_ACTION.relative_to(REPO_ROOT)} "
+        "for Lambda test hermeticity…"
+    )
 
     # Run the harness's own canaries first: a parser regression that always
     # passes can't slip past us if each assertion has been verified to
@@ -3212,7 +3832,10 @@ def main() -> int:
         return 1
 
     wf = yaml.safe_load(WORKFLOW.read_text())
+    build_and_push_wf = yaml.safe_load(BUILD_AND_PUSH_WORKFLOW.read_text())
+    build_lambda_action = yaml.safe_load(BUILD_LAMBDA_PACKAGES_ACTION.read_text())
     jobs = wf.get("jobs", {})
+    build_and_push_jobs = build_and_push_wf.get("jobs", {})
     failures: list[str] = []
 
     # Single source of truth for the assertion set. The negative-fixture
@@ -3225,6 +3848,7 @@ def main() -> int:
         _assert_terraform_apply_needs_schema_compat,
         _assert_lambda_artifact_symmetry,
         _assert_lambda_loud_fail_policy,
+        _assert_lambda_tests_before_prod_credentials,
         _assert_finalize,
         _assert_finalize_step_order,
         _assert_final_status_consumed,
@@ -3237,6 +3861,19 @@ def main() -> int:
     )
     for fn in assertions:
         fn(jobs, failures)
+
+    build_and_push_assertions: tuple[Callable[[dict, list[str]], None], ...] = (
+        _assert_build_and_push_lambda_tests_before_credentials,
+        _assert_build_and_push_test_lambdas_hermetic,
+    )
+    for fn in build_and_push_assertions:
+        fn(build_and_push_jobs, failures)
+
+    action_assertions: tuple[Callable[[dict, list[str]], None], ...] = (
+        _assert_build_lambda_action_unit_tests_hermetic,
+    )
+    for fn in action_assertions:
+        fn(build_lambda_action, failures)
 
     if failures:
         print()

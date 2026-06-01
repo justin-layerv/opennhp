@@ -20,6 +20,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 
+import pytest
 from botocore.exceptions import ClientError
 
 
@@ -34,6 +35,21 @@ os.environ.setdefault('SSM_CERT_PREFIX', '/nhp/certs')
 os.environ.setdefault('QURL_DOMAINS_TABLE', 'test-qurl-domains')
 
 import custom_domain_cert_manager as cm
+
+
+@pytest.fixture(autouse=True)
+def _no_unmocked_cloudwatch_metrics(monkeypatch):
+    mock_put_metric_data = MagicMock(name='unmocked_put_metric_data')
+    monkeypatch.setattr(cm.cloudwatch_client, 'put_metric_data', mock_put_metric_data)
+    yield
+    # This only fences CloudWatch metrics. Other AWS clients still rely on
+    # per-test mocks plus the workflow's dummy credentials backstop. Check
+    # after the test body so metric helpers that swallow ordinary exceptions
+    # still surface any unmocked CloudWatch write.
+    assert mock_put_metric_data.call_count == 0, (
+        'unit tests must patch CloudWatch metric writes explicitly; '
+        f'unmocked calls: {mock_put_metric_data.call_args_list}'
+    )
 
 
 # Pinned payload schema for qurl-service's DomainCleanupEvent. This struct
@@ -1528,15 +1544,15 @@ class TestRenewalScanSkipped(unittest.TestCase):
     def tearDown(self):
         self._get_item_patcher.stop()
 
-    @patch('custom_domain_cert_manager.publish_metric')
     @patch('custom_domain_cert_manager.trigger_cert_sync')
     @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
     @patch('custom_domain_cert_manager.list_cert_meta_params')
     def test_renewal_scan_does_not_count_skipped_as_renewed(
-        self, mock_list, mock_provision, mock_sync, mock_metric
+        self, mock_list, mock_cw, mock_provision, mock_sync
     ):
         """Domains skipped due to lock should not inflate the renewed count."""
-        del mock_sync, mock_metric  # @patch suppresses side effects only
+        del mock_sync, mock_cw  # @patch suppresses side effects only
         expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
         mock_list.return_value = [
             {'Name': '/nhp/certs/a.com/meta', 'Value': json.dumps({
@@ -1957,8 +1973,11 @@ class TestHandlerSnsDispatch(unittest.TestCase):
         assert len(result['records']) == 1
         assert result['records'][0]['status'] == cm.RESULT_CLEANED
 
+    @patch.object(cm, 'publish_failure_metric')
     @patch('custom_domain_cert_manager.handle_domain_cleanup')
-    def test_handler_processes_multiple_records_independently(self, mock_cleanup):
+    def test_handler_processes_multiple_records_independently(
+        self, mock_cleanup, mock_failure_metric,
+    ):
         # SNS-to-Lambda is always 1 Record today, but the dispatcher tolerates
         # batches. Lock that semantics: a malformed first record must not
         # block the second record from running.
@@ -1995,6 +2014,7 @@ class TestHandlerSnsDispatch(unittest.TestCase):
         assert result['records'][0]['status'] == cm.RESULT_INVALID_PAYLOAD
         assert result['records'][1]['status'] == cm.RESULT_CLEANED
         mock_cleanup.assert_called_once()
+        mock_failure_metric.assert_called_once_with(cm.FAILURE_SNS_DECODE)
 
 
 class TestDeleteAcmeTxtRecord(unittest.TestCase):

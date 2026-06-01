@@ -50,9 +50,20 @@ runs:
 
     - name: Run Python Unit Tests
       shell: bash
+      env:
+        # Keep Lambda unit tests hermetic even when the caller has already
+        # configured deploy credentials. Tests must mock AWS side effects, not
+        # publish metrics or mutate resources in the active account.
+        AWS_ACCESS_KEY_ID: unit-test
+        AWS_SECRET_ACCESS_KEY: unit-test
+        AWS_SESSION_TOKEN: unit-test
+        AWS_DEFAULT_REGION: us-east-2
+        AWS_REGION: us-east-2
+        AWS_EC2_METADATA_DISABLED: "true"
       run: |
         echo "::group::Running Python Unit Tests"
         pip install -q -r terraform/modules/acme-cert/lambda/requirements-dev.txt
+        pip install -q -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
         pytest terraform/modules/acme-cert/lambda/test_acme_cert_manager.py -v
         pytest terraform/modules/custom-domain-cert/lambda/test_cert_manager.py -v
         echo "::endgroup::"

@@ -15,14 +15,32 @@ from unittest.mock import Mock, patch, MagicMock
 
 # Set required environment variables before importing the module
 os.environ.setdefault('DOMAINS', 'test.example.com,*.test.example.com')
-os.environ.setdefault('SECRET_ARN', 'arn:aws:secretsmanager:us-east-1:123456789:secret:test')
-os.environ.setdefault('ACME_ACCOUNT_SECRET_ARN', 'arn:aws:secretsmanager:us-east-1:123456789:secret:acme')
-os.environ.setdefault('KMS_KEY_ARN', 'arn:aws:kms:us-east-1:123456789:key/test')
+os.environ.setdefault('SECRET_ARN', 'arn:aws:secretsmanager:us-east-2:123456789:secret:test')
+os.environ.setdefault('ACME_ACCOUNT_SECRET_ARN', 'arn:aws:secretsmanager:us-east-2:123456789:secret:acme')
+os.environ.setdefault('KMS_KEY_ARN', 'arn:aws:kms:us-east-2:123456789:key/test')
 os.environ.setdefault('ACME_EMAIL', 'test@example.com')
 os.environ.setdefault('ACME_DIRECTORY', 'https://acme-staging-v02.api.letsencrypt.org/directory')
 os.environ.setdefault('HOSTED_ZONE_ID', 'Z1234567890')
 os.environ.setdefault('RENEWAL_DAYS_BEFORE_EXPIRY', '30')
-os.environ.setdefault('SNS_TOPIC_ARN', 'arn:aws:sns:us-east-1:123456789:test')
+os.environ.setdefault('SNS_TOPIC_ARN', 'arn:aws:sns:us-east-2:123456789:test')
+os.environ.setdefault('AWS_DEFAULT_REGION', 'us-east-2')
+
+import acme_cert_manager as acm
+
+
+@pytest.fixture(autouse=True)
+def _no_unmocked_cloudwatch_metrics(monkeypatch):
+    mock_put_metric_data = MagicMock(name='unmocked_put_metric_data')
+    monkeypatch.setattr(acm.cloudwatch_client, 'put_metric_data', mock_put_metric_data)
+    yield
+    # This only fences CloudWatch metrics. Other AWS clients still rely on
+    # per-test mocks plus the workflow's dummy credentials backstop. Check
+    # after the test body so metric helpers that swallow ordinary exceptions
+    # still surface any unmocked CloudWatch write.
+    assert mock_put_metric_data.call_count == 0, (
+        'unit tests must patch CloudWatch metric writes explicitly; '
+        f'unmocked calls: {mock_put_metric_data.call_args_list}'
+    )
 
 
 class TestHandler:

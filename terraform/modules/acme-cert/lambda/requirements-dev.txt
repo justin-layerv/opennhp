@@ -1,15 +1,12 @@
 # Development dependencies for testing ACME Certificate Manager Lambda
 # Install with: pip install -r requirements-dev.txt
 
-# Testing framework
-pytest>=8.0.0
-pytest-cov>=4.1.0
+# Pin test tooling so promote-to-prod Lambda tests are reproducible across re-runs.
+pytest==9.0.3
 
 # AWS SDK (provided by Lambda runtime, needed for testing)
-boto3>=1.34.0
-
-# Mocking AWS services
-moto>=5.0.0
+boto3==1.36.7
+botocore==1.36.7
 
 # The Lambda dependencies (for running tests)
 -r requirements.txt

@@ -888,23 +888,34 @@ jobs:
 
       - name: Install test dependencies
         if: needs.changes.outputs.lambdas == 'true'
-        # custom-domain-cert tests need botocore (for ClientError) which
-        # isn't a dev tool — install it from the lambda's pinned test
-        # requirements file so the CI environment matches what developers
-        # use locally and so an upstream botocore release can't break the
-        # test job during a merge window.
+        # Install from the cert lambdas' pinned/dev requirements so the
+        # standalone Lambda test job covers the same AWS-adjacent suites as
+        # the package-build action.
         run: |
-          pip install pytest boto3
+          pip install -r terraform/modules/acme-cert/lambda/requirements-dev.txt
           pip install -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
 
       - name: Run Lambda unit tests
         if: needs.changes.outputs.lambdas == 'true'
+        env:
+          # Match the package-build action's hermetic unit-test backstop:
+          # tests must mock AWS side effects, not discover ambient runner
+          # credentials or IMDS.
+          AWS_ACCESS_KEY_ID: unit-test
+          AWS_SECRET_ACCESS_KEY: unit-test
+          AWS_SESSION_TOKEN: unit-test
+          AWS_DEFAULT_REGION: us-east-2
+          AWS_REGION: us-east-2
+          AWS_EC2_METADATA_DISABLED: "true"
         run: |
           echo '::group::Billing Lambda Tests'
           python -m pytest terraform/modules/billing/lambda/test_*.py -v
           echo '::endgroup::'
           echo '::group::Developer Portal Lambda Tests'
           python -m pytest terraform/modules/developer-portal/lambda/test_*.py -v
+          echo '::endgroup::'
+          echo '::group::ACME Cert Lambda Tests'
+          (cd terraform/modules/acme-cert/lambda && python -m pytest test_acme_cert_manager.py -v)
           echo '::endgroup::'
           echo '::group::Custom Domain Cert Lambda Tests'
           (cd terraform/modules/custom-domain-cert/lambda && python -m pytest test_cert_manager.py -v)
@@ -1428,14 +1439,16 @@ jobs:
           key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
           restore-keys: terraform-plugins-
 
+      # Build Lambda packages before assuming AWS credentials so unit tests
+      # cannot publish metrics to the active account if a mock regresses.
+      - name: Build Lambda Packages
+        uses: ./.github/actions/build-lambda-packages
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Build Lambda Packages
-        uses: ./.github/actions/build-lambda-packages
 
       - name: Terraform Init
         working-directory: terraform/environments/${{ matrix.environment }}
@@ -1510,14 +1523,16 @@ jobs:
           key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
           restore-keys: terraform-plugins-
 
+      # Build Lambda packages before assuming AWS credentials so unit tests
+      # cannot publish metrics to the active account if a mock regresses.
+      - name: Build Lambda Packages
+        uses: ./.github/actions/build-lambda-packages
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Build Lambda Packages
-        uses: ./.github/actions/build-lambda-packages
 
       - name: Terraform Init
         working-directory: terraform/environments/sandbox
