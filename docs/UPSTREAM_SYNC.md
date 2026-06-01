@@ -6,13 +6,13 @@ This document tracks the synchronization status between this fork (LayerV NHP) a
 
 | Field | Value |
 |-------|-------|
-| **Last reviewed upstream SHA** | f53b7e2d |
-| **Last review date** | 2026-05-01 |
+| **Last reviewed upstream SHA** | e903f92c |
+| **Last review date** | 2026-06-01 |
 | **Reviewer** | Claude Code |
 
 > **HOW TO USE:** When checking for updates, run:
 > ```bash
-> git log f53b7e2d..upstream/main --oneline
+> git log e903f92c..upstream/main --oneline
 > ```
 > This shows ONLY new commits since last review. Update the SHA after each review.
 
@@ -64,6 +64,25 @@ Values where the fork intentionally diverges from upstream. **If an upstream com
 ---
 
 ## Sync History
+
+### 2026-06-01 - Routine Review (No Sync Required)
+
+- **Reviewed up to:** e903f92c
+- **Commits reviewed:** ~76 (non-merge)
+- **PRs created:** None
+- **Commits synced:** None
+- **Summary:**
+  - ~23 Dependabot/dependency updates (auto-skipped, includes 2 GMSM bumps)
+  - ~7 Release Please / version bumps (auto-skipped)
+  - ~7 CI/GitHub Actions workflow changes (auto-skipped)
+  - ~13 Demo infrastructure/TLS proxy changes (upstream-specific, skipped)
+  - ~16 JS-Agent browser SDK feature + fixes (upstream-only component, skipped)
+  - ~5 Relay multi-cluster feature (fork doesn't use relay, skipped)
+  - 1 auth-plugin demo polish (`599eb8cc`) — upstream-specific plugin (skipped)
+  - 1 plugin dep alignment (`5390ffa1`) — upstream plugin layout (authenticator/basic/oidc), fork has different layout (skipped)
+  - 1 cgo removal from errors.go (`6558da64`) — **already fixed** in fork (fork's errors.go never had cgo import)
+  - 2 noise chain key fix + tests (`d0cb1683`, `b75b5614`) — **already synced** from `enable_webrtc` branch (2026-05-19 entry); now also landed on `upstream/main` via PR #1557
+- **Notes:** The chain key fix we cherry-picked from `upstream/enable_webrtc` on 2026-05-19 has now been merged to `upstream/main`. As anticipated in the 2026-05-19 entry (which called it a clean "revert"), this registers as a clean duplicate of our existing commit — the same no-op outcome — no action needed. Our upstream contribution PR [OpenNHP#1557](https://github.com/OpenNHP/opennhp/pull/1557) was merged 2026-05-23 (`e7886f8e`).
 
 ### 2026-05-19 - Noise Intermediate Chain Key Fix (Feature-Branch Cherry-Pick)
 
@@ -204,6 +223,17 @@ Non-obvious skips that don't fit Auto-Skip Categories:
 | bf927049 | feat(relay): add nhp-relay component | SKIP | New upstream feature; fork doesn't need relay | 2026-05-01 |
 | 2c4e5859 | fix(plugin): align plugin deps with endpoints | SKIP | Upstream example plugin (basic/); fork has own plugin layout | 2026-05-01 |
 | 8813ca76 | fix(infra): drop nhp-acd from root | SKIP | Upstream demo infra; fork has own Terraform | 2026-05-01 |
+| 6558da64 | fix(core): remove cgo dependency from errors | SKIP | Already fixed in fork (fork's errors.go never had cgo import) | 2026-06-01 |
+| 5390ffa1 | fix(plugins): align shared deps with endpoints | SKIP | Upstream plugin layout (authenticator/basic/oidc); fork has different layout | 2026-06-01 |
+| d0cb1683 | fix: reusing empty intermediate chain key | SKIP | Already synced from `enable_webrtc` branch (2026-05-19) | 2026-06-01 |
+| b75b5614 | test(nhp/core): chain-key regression tests | SKIP | Already synced from `enable_webrtc` branch (2026-05-19) | 2026-06-01 |
+| 599eb8cc | feat(server-plugin): polish basic auth-plugin demo | SKIP | Upstream authenticator plugin demo (we use QURL) | 2026-06-01 |
+| d0836539 | feat(relay): multi-cluster via pubkey-derived id | SKIP | Fork doesn't use relay | 2026-06-01 |
+| 6709d00c | feat(js-agent): vendor browser SDK | SKIP | Upstream-only JS agent component | 2026-06-01 |
+| 738a996f | feat(demo): add demo.nhp TLS proxy to AC nginx | SKIP | Upstream demo infrastructure | 2026-06-01 |
+| 3e4a8172 | fix(terraform): mark demo_nhp_cert as sensitive | SKIP | Upstream demo Terraform | 2026-06-01 |
+| 9501ba23 | fix(terraform): mark derived-from-sensitive outputs | SKIP | Upstream demo Terraform | 2026-06-01 |
+| cc36a684 | feat(js-agent): CBOR token support | SKIP | Upstream-only JS agent component | 2026-06-01 |
 
 ---
 
@@ -299,7 +329,7 @@ A change is a good upstream candidate if it:
 | #75 | DNS re-resolution on server discovery | - | CANDIDATE | General improvement, benefits all users |
 | #93 | DNS cache invalidation on failures | - | CANDIDATE | Pairs with #75 |
 | #86 | Crypto error handling improvements | - | CANDIDATE | Already adapted from upstream #1338 |
-| #2010 | Noise intermediate chain key fix | [OpenNHP#1557](https://github.com/OpenNHP/opennhp/pull/1557) | OPEN | Cherry-picked the existing `enable_webrtc` commit `03619015` onto `upstream/main`. Once merged + released, `qurl-reverse-tunnel-client` can return to a public OpenNHP submodule pin instead of repointing at `layervai/nhp` (avoids the binary-distribution fingerprint surfaced in [qurl-reverse-tunnel-client#178](https://github.com/layervai/qurl-reverse-tunnel-client/pull/178)). |
+| #2010 | Noise intermediate chain key fix | [OpenNHP#1557](https://github.com/OpenNHP/opennhp/pull/1557) | MERGED | Cherry-picked the existing `enable_webrtc` commit `03619015` onto `upstream/main`; merged 2026-05-23 (`e7886f8e`). Downstream follow-up **resolved**: [qurl-reverse-tunnel-client#178](https://github.com/layervai/qurl-reverse-tunnel-client/pull/178) bumped the OpenNHP submodule straight to the post-fix merge commit and stayed on the public OpenNHP pin (no `layervai/nhp` binary-distribution fingerprint) — pinning the merge commit avoided any wait on an upstream release. |
 
 ### Fork-Only (Never Contribute)
 
@@ -353,7 +383,7 @@ Record all contribution attempts here:
 
 | Date | Description | Upstream PR | Result |
 |------|-------------|-------------|--------|
-| 2026-05-22 | Backport noise intermediate chain key fix to `upstream/main` (cherry-pick of `03619015` from `enable_webrtc`) | [OpenNHP#1557](https://github.com/OpenNHP/opennhp/pull/1557) | OPEN — pending upstream review |
+| 2026-05-22 | Backport noise intermediate chain key fix to `upstream/main` (cherry-pick of `03619015` from `enable_webrtc`) | [OpenNHP#1557](https://github.com/OpenNHP/opennhp/pull/1557) | MERGED 2026-05-23 (`e7886f8e`) |
 
 ---
 
