@@ -1183,8 +1183,9 @@ jobs:
       # not dirty the lock (the asymmetry with image/AMI/secret checks
       # would surprise operators reading the lock history). Lock release
       # by finalize.if-always() also handles cleanup.
-      # deploy_qrts is intentionally gated here even though the qrts ASG is
-      # decoupled from the server/ac/qurl control plane: the qrts launch
+      # deploy_qrts is intentionally gated here even though qrts rolls via its
+      # own ASG instance-refresh (a separate path from the server/ac canary): the
+      # qrts launch
       # template, user_data (which reads the image-tag SSM param at boot),
       # ASG, and asg-name param are all terraform-managed in this repo, so a
       # stale terraform state can mean a stale qrts launch config. A solo
@@ -3041,16 +3042,20 @@ jobs:
   # the same SSM param + instance-refresh, so two prod deploy paths exist today.
   # It should be deprecated now that nhp owns the prod deploy — tracked in #2242.
   #
-  # Decoupling: unlike deploy-qurl, deploy-qrts does NOT chain on
-  # deploy-server/ac/traefik results — qrts is functionally independent of the
-  # NHP control plane, so a server-canary failure shouldn't block the qrts
-  # refresh. The decision gates are terraform-apply (its ASG/asg-name state) +
-  # inputs.deploy_qrts; manifest/preflight/terraform-plan in `needs` are the
-  # standard pipeline-shape dependencies every deploy-* job carries, not extra
-  # gates (terraform-apply already transitively depends on terraform-plan).
+  # Sequencing: deploy-qrts chains AFTER the core control plane
+  # (server -> traefik-plugins -> ac -> qurl) and gates on their
+  # `success || skipped` results, mirroring deploy-qurl. The tunnel fleet
+  # validates knock tokens against nhp-server and routes protected traffic
+  # through the AC (Traefik plugins included), so it must not roll onto a
+  # half-updated control plane — a FAILED core deploy skips qrts (#2298).
+  # Smoke stays decoupled from qrts (PR #2241): qrts and the smoke suites are
+  # siblings off deploy-qurl, so a qrts failure cannot skip smoke. Full gate
+  # rationale on the job's `if:` below; manifest/preflight/terraform-plan in
+  # `needs` are the standard pipeline-shape deps (terraform-apply already
+  # transitively depends on terraform-plan).
   deploy-qrts:
     name: Deploy qurl-reverse-tunnel-server (qrts)
-    needs: [manifest, preflight, terraform-plan, terraform-apply]
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
@@ -3058,6 +3063,10 @@ jobs:
         (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
         (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
       ) &&
+      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
+      (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
       inputs.deploy_qrts
     runs-on: ubuntu-latest
     # 30 min floor for the fixed 3/3/3 ASG: cancel-existing + start + wait the
@@ -3133,9 +3142,8 @@ jobs:
   # SMOKE TEST - Application-level validation
   # =============================================================================
   # The three smoke jobs are fully decoupled from deploy-qrts — it's neither in
-  # their `needs` nor their gate. This mirrors deploy-qrts's own decoupling from
-  # the server/ac/qurl chain: the nhp/qurl smoke suites don't exercise qrts, so a
-  # qrts failure must NOT skip them — otherwise you'd lose the "did server/ac/qurl
+  # their `needs` nor their gate. The nhp/qurl smoke suites don't exercise qrts,
+  # so a qrts failure must NOT skip them — otherwise you'd lose the "did server/ac/qurl
   # deploy cleanly?" signal that scopes a rollback (qrts-only roll vs. everything).
   # A qrts failure still fails the run via finalize's QRTS_RESULT loop. A qrts-only
   # dispatch skips the smokes via the "at least one of deploy-server/ac/qurl

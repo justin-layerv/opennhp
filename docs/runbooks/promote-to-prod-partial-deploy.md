@@ -18,11 +18,12 @@ This is the failure mode tracked in **issue #1322** — the 2026-04-24 prod rele
 
 1. `preflight` (image presence, AMI age, secrets, deployment lock, **stale-terraform check**).
 2. `terraform-plan` → `qurl-schema-compat` → `terraform-apply`.
-3. `deploy-server` → `deploy-ac` → `deploy-qurl`, plus `deploy-qrts`
-   (qurl-reverse-tunnel-server). Note: `deploy-qrts` is **decoupled** from the
-   server/ac/qurl chain — it gates only on `terraform-apply` + `deploy_qrts`,
-   because qrts is functionally independent of the NHP control plane (a
-   server-canary failure should not block the qrts image refresh).
+3. `deploy-server` → `deploy-traefik-plugins` → `deploy-ac` → `deploy-qurl` →
+   `deploy-qrts` (qurl-reverse-tunnel-server). `deploy-qrts` chains **after** the
+   core control plane and gates on its `success || skipped` results (mirroring
+   `deploy-qurl`): the tunnel fleet validates knock tokens against nhp-server and
+   routes through the AC, so a failed core deploy **skips** qrts rather than
+   rolling it onto a half-updated control plane (#2298).
 4. `smoke-test` → `qurl-smoke-tests` → `nhp-smoke-tests` → `monitor` → `finalize`.
 
 Pre-#1322, the deploy-* jobs gated on `needs.terraform-apply.result == 'success' || == 'skipped'`. When `qurl-schema-compat` failed, GitHub Actions skipped `terraform-apply` (because of `needs:`), and the deploy-* jobs *also* observed `skipped` — so they ran anyway, rolling new binaries onto the previous terraform state. `finalize` then walked job results looking only for `failure || cancelled`, saw none, and reported the run as `success`.
@@ -128,9 +129,9 @@ Recovery options, in order of preference:
 
 Do **not** ssh-and-fix-by-hand. The fail-closed branch is intentional — silently fail-opening on a transient AWS error would re-create the exact partial-deploy class #1322 was meant to prevent.
 
-### Case E: qrts decoupling end-states
+### Case E: qrts end-states (sequenced after the core)
 
-`deploy-qrts` is decoupled from the server/ac/qurl chain (it gates only on `terraform-apply` + `deploy_qrts`), so its partial-state shapes differ from the chained jobs.
+`deploy-qrts` chains after the server/ac/qurl deploys and gates on their `success || skipped` results (mirroring `deploy-qurl`; #2298). Its partial-state shapes:
 
 **qrts-only dispatch** (`deploy_qrts=true`, everything else false):
 
@@ -145,7 +146,7 @@ Do **not** ssh-and-fix-by-hand. The fail-closed branch is intentional — silent
 
 A qrts-only run that shows the smokes as `skipped` is the **expected** shape, not a regression.
 
-**Mixed dispatch where a chained job fails but qrts succeeds** (e.g. `deploy_server=true deploy_qrts=true`, server-canary fails): because qrts is decoupled, it **still rolls forward** to the new image even though `deploy-server` failed. End-state: prod runs **new-qrts + old-server**, `finalize=failed`, lock released as `failed`. This is a genuine split-state — reconcile qrts independently of the server rollback (qrts has its own image-tag SSM param `/prod/nhp/reverse-tunnel-server/image-tag`; roll it back with a `deploy_qrts=true -f frps_image_tag=<prior-tag>` dispatch, see the trigger script's rollback hint).
+**Mixed dispatch where a core deploy fails** (e.g. `deploy_server=true deploy_qrts=true`, server-canary fails): qrts gates on `(deploy-server == success || skipped)`, so a **failed** core deploy makes that clause false and qrts is **skipped** — it does **not** roll onto a half-updated control plane. End-state: prod stays on **old-qrts + old-server**, `finalize=failed`, lock released as `failed`; there is no new-qrts split-state to reconcile on the qrts side. Roll qrts forward by re-dispatching once the core deploy succeeds. (Pre-#2298 this produced a new-qrts + old-server split-state; the chained gate makes that impossible now.)
 
 **First promotion that lands without qrts.** `trigger-prod-deploy.sh`'s first-deploy path force-enables server/ac/terraform/qurl, but **gates qrts** on the same bootstrap check as the steady-state path: if sandbox rts CI hasn't published a real image yet (tag is `(not set)` or `v0.0.0-bootstrap*`), it sets `deploy_qrts=false` with a `[SKIP]` reason and a `warn`, rather than letting the workflow's bootstrap pre-check hard-fail the whole promotion. So a **first prod promotion showing `deploy_qrts=false` is expected** when sandbox qrts hasn't published — not a missed step. To add qrts once rts CI publishes, re-dispatch with `deploy_qrts=true` (or pass `-f frps_image_tag=<tag>` explicitly). The skip reason is printed by the trigger script at dispatch time; the workflow run page itself only records the resolved `deploy_qrts=false` input.
 
@@ -220,7 +221,7 @@ The gate has four escape hatches. Three are user-facing **input flags** at workf
   Use `failed` (not `deployed`) so subsequent forensics correctly indicate the prior run did not complete. This is the audit-trail-leaving alternative to `force_unlock=true`-with-deploy. Same IAM-gated surface as the `"initial"` sentinel below.
 - `aws ssm put-parameter --name /prod/nhp/deploy/last-terraform-apply-commit --value initial` — manual SSM write. The `"initial"` sentinel resets the gate to first-deploy mode, which warns-and-proceeds. Useful for greenfield bootstraps; misuse means anyone with `ssm:PutParameter` on this path can silently disable the check on the next promote. SSM write to `/prod/nhp/*` is IAM-gated by `AWS_PROD_ROLE_ARN`, so this is operator-with-prod-credentials surface, not a public attack vector — but include it in security audits alongside the input flags. Equivalent variants: writing `""` (empty string), `None`, or any other value the gate's first-deploy sentinel test treats as "no prior apply" (search the workflow for `"initial"` to enumerate the matched sentinels). The audit boundary is "anyone who can write `/prod/nhp/deploy/last-terraform-apply-commit`," not the literal `"initial"` string.
 
-> **Not a bypass, but on-call should know**: a mixed dispatch where a chained job fails but `deploy_qrts=true` succeeds leaves prod in a new-qrts + old-everything-else split-state (`finalize=failed`). This is the decoupling trade-off, not a gate bypass — see **Case E: qrts decoupling end-states** above for the reconcile path.
+> **On-call should know** (changed by #2298): `deploy-qrts` is now sequenced after the core and gates on it, so a mixed dispatch where a core job **fails** **skips** qrts — there is no longer a new-qrts + old-everything-else split-state to reconcile. prod simply stays on the prior qrts image (`finalize=failed`). See **Case E: qrts end-states (sequenced after the core)** above.
 
 ### SSM write surface (audit boundary)
 
