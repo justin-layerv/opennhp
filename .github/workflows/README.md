@@ -148,3 +148,4 @@ Automated pipeline (weekdays 7am UTC): check for pending changes → deploy to s
 | `claude.yml` | Claude Code agent for issue triage |
 | `release-please.yml` | Automated changelog and version bumps |
 | `dependabot-go-tidy.yml` | Auto-fix `go mod tidy` for Dependabot PRs |
+| `prod-rollout-tasks.yml` | Enforce the PR Prod Rollout Tasks checkbox and task-ledger diff contract |

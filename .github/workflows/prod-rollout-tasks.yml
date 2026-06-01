@@ -1,0 +1,76 @@
+name: prod-rollout-tasks
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft]
+
+concurrency:
+  group: prod-rollout-tasks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: read
+
+jobs:
+  check-pr-body:
+    name: Check PR body
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require exactly one Prod Rollout Tasks choice
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Draft PRs report success so required-check branch protection does
+          # not block work-in-progress changes before they are ready for review.
+          if [ "$PR_DRAFT" = "true" ]; then
+            echo "Draft PR; the prod rollout tasks body check will run when the PR is ready for review."
+            exit 0
+          fi
+
+          if ! printf '%s\n' "$PR_BODY" | grep -Eq '^##[[:space:]]+Prod Rollout Tasks[[:space:]]*$'; then
+            echo "::error::Missing exact '## Prod Rollout Tasks' section in the PR body. Check spelling and capitalization. See docs/runbooks/prod-rollout-task-ledger.md."
+            exit 1
+          fi
+
+          tasks_section=$(printf '%s\n' "$PR_BODY" | awk '
+            /^##[[:space:]]+Prod Rollout Tasks[[:space:]]*$/ { in_section=1; next }
+            /^##[[:space:]]+/ && in_section { exit }
+            in_section { print }
+          ')
+
+          # Keep these checkbox labels in sync with .github/PULL_REQUEST_TEMPLATE.md
+          # and docs/runbooks/prod-rollout-task-ledger.md.
+          # The [[:space:]]*$ anchors intentionally absorb GitHub's CRLF body lines.
+          # Labels must stay regex-safe; metacharacters silently change matching semantics.
+          count_checked() {
+            local label="$1"
+            printf '%s\n' "$tasks_section" | grep -Ec "^[[:space:]]*[-*+][[:space:]]+\[[xX]\][[:space:]]+${label}[[:space:]]*$" || true
+          }
+
+          updated_count=$(count_checked 'Updated the prod rollout task ledger')
+          notasks_count=$(count_checked 'Confirmed this PR has no prod rollout tasks')
+          total=$((updated_count + notasks_count))
+
+          if [ "$total" -ne 1 ]; then
+            echo "::error::Choose exactly one Prod Rollout Tasks checkbox in the PR body."
+            echo "Found updated=$updated_count no-tasks=$notasks_count."
+            echo "Expected exactly one of these checked lines, with the exact label text; put context elsewhere in the PR body or ledger:"
+            echo "- [x] Updated the prod rollout task ledger"
+            echo "- [x] Confirmed this PR has no prod rollout tasks"
+            exit 1
+          fi
+
+          if [ "$updated_count" -eq 1 ]; then
+            # Fail closed if the PR files API is unavailable.
+            changed_files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+            if ! printf '%s\n' "$changed_files" | grep -Fxq 'docs/runbooks/prod-rollout-task-ledger.md'; then
+              echo "::error::The PR body says the prod rollout task ledger was updated, but docs/runbooks/prod-rollout-task-ledger.md is not in the PR diff."
+              exit 1
+            fi
+          fi

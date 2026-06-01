@@ -1,5 +1,17 @@
 # terraform — Local Guidance
 
+## Prod Rollout Task Ledger
+
+Terraform, workflow, or user-data changes often create concrete prod rollout
+tasks such as config writes, deploy ordering, ASG refreshes, rollback steps, or
+post-rollout verification. When they do, update
+[`../docs/runbooks/prod-rollout-task-ledger.md`](../docs/runbooks/prod-rollout-task-ledger.md)
+by adding an entry following its PR Update Rule before merge.
+
+During review, confirm either the task ledger was updated or the PR has no
+pre-rollout, rollout, or post-rollout tasks. Do not add entries just to
+describe behavior changes.
+
 ## State Drift Protection for CI/CD-Managed Values
 
 Some SSM parameters are created by Terraform but updated by CI/CD (e.g., image tags, blue/green deployment state). These use `lifecycle { ignore_changes = [value] }` to prevent Terraform from overwriting CI/CD updates:

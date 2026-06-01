@@ -39,6 +39,16 @@ Commit format and full details: see [`docs/COMMIT_CONVENTION.md`](docs/COMMIT_CO
 > `.github/workflows/validate-workflows.yml`); add a new scope to both
 > places in the same PR.
 
+## Prod Rollout Task Ledger
+
+Any PR that creates a concrete task that must happen before, during, or after
+prod rollout must add an entry to
+[`docs/runbooks/prod-rollout-task-ledger.md`](docs/runbooks/prod-rollout-task-ledger.md)
+following its PR Update Rule before merge. The ledger is not a behavior-change
+log. The CI PR-body check enforces the checkbox choice for ready, non-draft PRs;
+reviewers enforce whether the selected checkbox is truthful and the ledger
+contains only required rollout tasks.
+
 ---
 
 > **Note:** This is a fork of [OpenNHP](https://github.com/OpenNHP/opennhp). See `docs/UPSTREAM_SYNC.md` for the upstream synchronization process.
@@ -202,7 +212,9 @@ This file stays light. Subtree-scoped rules live in nested `CLAUDE.md` files (au
 | Upstream sync process | `docs/UPSTREAM_SYNC.md` |
 | Session enforcement (server-side authz) | `docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md` |
 | Commit convention + scopes table | `docs/COMMIT_CONVENTION.md` |
+| Runbooks index | `docs/runbooks/README.md` |
 | Security monitoring + secrets / `NHP_INTERNAL_AUTH_SECRET` / KMS exception | `docs/SECURITY.md` |
+| Prod Rollout Task Ledger | `docs/runbooks/prod-rollout-task-ledger.md` |
 | qurl-service `/internal/v1/*` triage | `docs/runbooks/qurl-internal-v1-triage.md` |
 | Create a QURL via API | `docs/runbooks/create-qurl.md` |
 | L3 flush scheduler breaker open — recovery | `docs/runbooks/l3-flush-breaker-recovery.md` |

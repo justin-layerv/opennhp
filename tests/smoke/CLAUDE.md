@@ -1,5 +1,17 @@
 # tests/smoke — Local Guidance
 
+## Prod Rollout Task Ledger
+
+Smoke-suite changes that add/remove required prod verification, alter
+deploy-mode mapping, add SSM probes, or create a new release gate often create
+prod rollout tasks. When they do, update
+[`../../docs/runbooks/prod-rollout-task-ledger.md`](../../docs/runbooks/prod-rollout-task-ledger.md)
+by adding an entry following its PR Update Rule before merge.
+
+During review, confirm either the task ledger was updated or the PR has no
+pre-rollout, rollout, or post-rollout tasks. Do not add entries just to
+describe behavior changes.
+
 ## Smoke Test Suite
 
 Location: `tests/smoke/` (own Go module, build tag `smoke`).
