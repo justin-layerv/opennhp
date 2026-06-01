@@ -45,6 +45,17 @@ locals {
   discord_bot_alb_dns_name = "qurl-bot-discord-sandbox-2094914143.us-east-2.elb.amazonaws.com"
 }
 
+# Env-root bot DNS records are same-account Route53 writers that consume the
+# Terraform CI role narrowed inside module.nhp. Wait for the scoped inline
+# grants before changing these records on the cutover apply.
+resource "time_sleep" "route53_record_change_iam_propagation" {
+  count = length(module.nhp.route53_record_change_iam_propagation_triggers) > 0 ? 1 : 0
+
+  triggers = module.nhp.route53_record_change_iam_propagation_triggers
+
+  create_duration = module.nhp.route53_record_change_iam_propagation_duration
+}
+
 # Validates ACM cert in qurl-integrations sandbox account
 # (730883236711, us-east-2):
 #   arn:aws:acm:us-east-2:730883236711:certificate/a5c27c4f-c340-4575-8777-5b9b29aaf92c
@@ -73,6 +84,8 @@ resource "aws_route53_record" "discord_bot_cert_validation" {
   ttl     = 60
   records = ["_2e0faef7b5213be9aaca34388d6c157a.jkddzztszm.acm-validations.aws."]
 
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
+
   # Mirrors `aws_route53_record.qurl_s3_connector` in
   # `terraform/main.tf`. Escape hatches:
   #   Retirement: `terraform state rm`, remove the block, apply.
@@ -100,6 +113,8 @@ resource "aws_route53_record" "slack_bot_cert_validation" {
   type    = "CNAME"
   ttl     = 60
   records = ["_be6d56f1f7df4a79161075db80592027.jkddzztszm.acm-validations.aws."]
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 
   lifecycle {
     prevent_destroy = true
@@ -143,6 +158,8 @@ resource "aws_route53_record" "slack_bot_alias" {
     zone_id                = "Z3AADJGX6KTTL2"
     evaluate_target_health = false
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # Public alias for the discord bot — points discord.layerv.xyz at the
@@ -175,6 +192,8 @@ resource "aws_route53_record" "discord_bot_alias" {
     zone_id                = "Z3AADJGX6KTTL2"
     evaluate_target_health = false
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 
   lifecycle {
     precondition {

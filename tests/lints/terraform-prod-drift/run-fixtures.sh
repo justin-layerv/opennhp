@@ -50,7 +50,36 @@ FIXTURES=(
   "role-policies-exclusive-noop|0|0||"
   "heredoc-jsonencode-error|2|2|heredoc-form \`jsonencode(<<EOF|heredoc-form \`jsonencode(<<EOF"
   "multi-leg-with-bad-paren|0|0|interpolation inside a string|"
+  "github-actions-permission-boundary|0|1||permissions_boundary"
   "route53-tag-filter-gap|1|0||"
+  "route53-recordset-wildcard|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-partial-wildcard|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-partial-interpolation-condition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-notaction|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-action-change-glob|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-action-service-glob|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-notresource|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-notresource-condition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-broad-condition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-plain-condition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-service-case|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-service-wildcard|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-gov-partition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-change-resource|0|0||"
+  "route53-recordset-missing-null|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-negated-condition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-role-inline-policy|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-user-policy|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-group-policy|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-managed-policy|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-broad-suffix-condition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-prefix-wildcard-condition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-acme-missing-null|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-acme-boundary-condition|0|0||"
+  "route53-recordset-left-label-wildcard-condition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-narrow-condition|0|0||"
+  "route53-recordset-unreviewed-variable-condition|0|1||route53:ChangeResourceRecordSets"
+  "route53-recordset-variable-condition|0|0||"
 )
 
 # Consistency check (cr round 3 nit, tightened in round 6): the FIXTURES
@@ -65,6 +94,32 @@ if [[ "$declared_names" != "$on_disk_names" ]]; then
   diff <(echo "$declared_names") <(echo "$on_disk_names") >&2 || true
   exit 1
 fi
+
+# The Route53 normalized-record-name exact-name rule is enforced in both the
+# Python condition lint and the terraform/modules/ecr variable validation. Keep
+# a small sentinel here so wildcard support cannot be added in one language
+# without touching this check.
+python3 - "$REPO_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+py_lint = (root / ".github/scripts/check-terraform-policy-conditions.py").read_text()
+ecr_hcl = (root / "terraform/modules/ecr/main.tf").read_text()
+# These are literal source needles by design: if the validation is rewritten
+# but stays semantically equivalent, update both implementations and these
+# sentinel strings in the same change so reviewers see the lockstep edit.
+needles = {
+    "python wildcard rejection": 'any(char in pattern for char in "*?")' in py_lint,
+    "hcl wildcard rejection": 'length(regexall("[*?]", name)) == 0' in ecr_hcl,
+}
+missing = [name for name, ok in needles.items() if not ok]
+if missing:
+    for name in missing:
+        print(f"::error::Route53 exact-name rule alignment check missing {name}", file=sys.stderr)
+    sys.exit(1)
+print("Route53 exact-name rule alignment check: OK")
+PY
 
 PASS=0
 FAIL=0

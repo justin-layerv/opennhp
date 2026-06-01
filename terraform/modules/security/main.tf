@@ -707,15 +707,45 @@ resource "aws_iam_policy" "permission_boundary" {
         Resource = "*"
       },
       {
-        Sid    = "AllowRoute53ForACME"
+        Sid    = "AllowRoute53ACMERead"
         Effect = "Allow"
         Action = [
           "route53:GetChange",
-          "route53:ChangeResourceRecordSets",
           "route53:ListResourceRecordSets",
           "route53:ListHostedZonesByName"
         ]
         Resource = "*"
+      },
+      {
+        # This boundary grant is intentionally ACME-DNS-only. It narrows any
+        # attached role's existing Route53 grants to ACME TXT changes, but it
+        # remains zone-wildcard as a permission-boundary ceiling. Do not attach
+        # the boundary to roles that need ACM validation CNAMEs, aliases, or
+        # Terraform-style DNS writes; those roles need a different boundary.
+        Sid    = "AllowRoute53ACMERecordChanges"
+        Effect = "Allow"
+        Action = [
+          "route53:ChangeResourceRecordSets"
+        ]
+        Resource = "arn:aws:route53:::hostedzone/*"
+        Condition = {
+          # Route53 populates these multi-valued keys for every
+          # ChangeResourceRecordSets batch; ForAllValues validates every
+          # record in the request. ForAllValues is vacuously true if AWS
+          # omits a key, so Null=false keeps the wildcard zone ARN fail-closed.
+          "ForAllValues:StringLike" = {
+            "route53:ChangeResourceRecordSetsNormalizedRecordNames" = ["_acme-challenge.*"]
+          }
+          Null = {
+            "route53:ChangeResourceRecordSetsNormalizedRecordNames" = "false"
+            "route53:ChangeResourceRecordSetsActions"               = "false"
+            "route53:ChangeResourceRecordSetsRecordTypes"           = "false"
+          }
+          "ForAllValues:StringEquals" = {
+            "route53:ChangeResourceRecordSetsActions"     = ["CREATE", "UPSERT", "DELETE"]
+            "route53:ChangeResourceRecordSetsRecordTypes" = ["TXT"]
+          }
+        }
       },
       {
         Sid    = "AllowKMSForEncryption"

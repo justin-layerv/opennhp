@@ -218,6 +218,59 @@ variable "website_api_cfn_stack_name" {
   }
 }
 
+variable "route53_change_record_hosted_zone_ids" {
+  description = <<-EOT
+    Hosted zone IDs where the GitHub Actions Terraform role may call
+    route53:ChangeResourceRecordSets. Keep this to the zones explicitly
+    owned by the environment wiring; do not use '*' here. This is the
+    guardrail for nhp#1146: a sandbox CI foothold must not be able to
+    populate records in an orphan public qurl.link zone just because Route53
+    has no resource-account boundary.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for zone_id in var.route53_change_record_hosted_zone_ids :
+      can(regex("^Z[A-Z0-9]{8,}$", zone_id))
+    ])
+    error_message = "route53_change_record_hosted_zone_ids entries must be Route53 hosted zone IDs beginning with Z and at least 9 characters."
+  }
+}
+
+variable "route53_change_record_name_patterns" {
+  description = <<-EOT
+    Normalized record-name patterns that may be changed in Terraform-created
+    hosted zones whose IDs are not stable enough to pass as static inputs
+    (for example the qurl-service private hosted zone). Values must be
+    lowercase, trailing-dot-free exact Route53 normalized names. Because these
+    patterns scope a wildcard hosted-zone ARN, keep them fully qualified to an
+    environment-owned suffix; do not use broad cross-zone suffixes. Each
+    pattern must be an apex-or-deeper name where the environment is the only
+    authoritative zone; do not rely on suffixes also served by orphan or
+    delegated hosted zones. Review any future wildcard use as a code change.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for name in var.route53_change_record_name_patterns :
+      name == lower(trimsuffix(name, ".")) &&
+      length(name) > 0 &&
+      (
+        # Static lint cannot resolve this variable's runtime values; this
+        # validation is the production guard for computed-zone pattern scope.
+        # Keep this exact-name-only rule aligned with the Python Route53 lint's
+        # _is_narrow_route53_record_name_pattern helper.
+        length(regexall("[*?]", name)) == 0
+      )
+    ])
+    error_message = "route53_change_record_name_patterns entries must be non-empty, lowercase, trailing-dot-free exact FQDNs with no wildcards."
+  }
+}
+
 # ==================== Data Sources ====================
 
 data "aws_caller_identity" "current" {}
@@ -258,7 +311,12 @@ locals {
   # to enforce the SHA-backbone convention** so this prose guard
   # doesn't rot.
   core_ecr_repos = ["nhp-server", "nhp-ac", "nhp-console", "qurl-reverse-tunnel-server"]
-  ecr_repos      = var.deploy_qurl_ecr ? concat(local.core_ecr_repos, ["nhp-qurl"]) : local.core_ecr_repos
+
+  route53_change_record_hosted_zone_arns = [
+    for zone_id in var.route53_change_record_hosted_zone_ids :
+    "arn:aws:route53:::hostedzone/${zone_id}"
+  ]
+  ecr_repos = var.deploy_qurl_ecr ? concat(local.core_ecr_repos, ["nhp-qurl"]) : local.core_ecr_repos
 
   # Single source of truth for "this account is the source of cross-
   # account ECR replication." Referenced by both
@@ -1481,19 +1539,42 @@ resource "aws_iam_policy" "terraform_apply_services" {
   name        = "nhp-${var.environment}-github-actions-terraform-apply-services"
   description = "Application services permissions for Terraform apply (${var.environment})"
 
+  # Remove the legacy wildcard Route53 record grant only after the scoped
+  # inline grants exist, avoiding a transient self-apply window where
+  # Terraform loses Route53 record-write permission mid-run.
+  depends_on = [
+    aws_iam_role_policy.route53_managed_zone_record_changes,
+    aws_iam_role_policy.route53_computed_zone_record_changes
+  ]
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "Route53"
+        # CreateHostedZone has no resource ARN and public hosted-zone
+        # creation has no usable name/tag condition. Keep hosted-zone
+        # lifecycle separate from record mutation so ChangeResourceRecordSets
+        # can be scoped below to the environment-owned zones (#1146).
+        # Residual risk: CI can still create undelegated public zones with
+        # matching suffixes; revisit if Route53 adds tag/name conditions for
+        # hosted-zone creation.
+        Sid    = "Route53HostedZoneCreate"
         Effect = "Allow"
         Action = [
-          "route53:ChangeResourceRecordSets",
-          "route53:CreateHostedZone",
+          "route53:CreateHostedZone"
+        ]
+        Resource = "*"
+      },
+      {
+        # Hosted-zone lifecycle only. Route53 health-check tagging uses a
+        # different ARN shape and needs its own grant if added later.
+        Sid    = "Route53HostedZoneLifecycle"
+        Effect = "Allow"
+        Action = [
           "route53:DeleteHostedZone",
           "route53:ChangeTagsForResource"
         ]
-        Resource = "*"
+        Resource = "arn:aws:route53:::hostedzone/*"
       },
       {
         Sid    = "CloudWatch"
@@ -1793,6 +1874,68 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "arn:aws:states:${local.region}:${local.account_id}:stateMachine:layerv-nhp-*",
           "arn:aws:states:${local.region}:${local.account_id}:execution:layerv-nhp-*:*"
         ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "route53_managed_zone_record_changes" {
+  count = length(local.route53_change_record_hosted_zone_arns) > 0 ? 1 : 0
+
+  name = "route53-managed-zone-record-changes"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "Route53ManagedZoneRecordChanges"
+        Effect = "Allow"
+        Action = [
+          "route53:ChangeResourceRecordSets"
+        ]
+        Resource = local.route53_change_record_hosted_zone_arns
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "route53_computed_zone_record_changes" {
+  count = length(var.route53_change_record_name_patterns) > 0 ? 1 : 0
+
+  name = "route53-computed-zone-record-changes"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Terraform-created hosted zones, such as the qurl-service private
+        # hosted zone, do not have a stable zone ID before apply. Keep this
+        # wildcard resource constrained by Route53's normalized-record-name
+        # condition so it cannot write arbitrary records into orphan zones.
+        # This relies on Route53 rejecting record names outside the target
+        # zone's suffix, so the allowed names must stay fully qualified to an
+        # environment-owned suffix.
+        Sid    = "Route53ComputedZoneRecordChanges"
+        Effect = "Allow"
+        Action = [
+          "route53:ChangeResourceRecordSets"
+        ]
+        Resource = "arn:aws:route53:::hostedzone/*"
+        Condition = {
+          # Route53 populates this multi-valued key for every
+          # ChangeResourceRecordSets batch; ForAllValues is the documented
+          # shape for validating every record in a multi-record request.
+          # ForAllValues is vacuously true if AWS omits the key, so the
+          # Null=false guard below keeps the wildcard zone ARN fail-closed.
+          "ForAllValues:StringLike" = {
+            "route53:ChangeResourceRecordSetsNormalizedRecordNames" = var.route53_change_record_name_patterns
+          }
+          Null = {
+            "route53:ChangeResourceRecordSetsNormalizedRecordNames" = "false"
+          }
+        }
       }
     ]
   })
@@ -2449,4 +2592,23 @@ output "terraform_apply_services_policy_arn" {
 output "terraform_apply_services_attachment_id" {
   description = "ID of the role-policy attachment for terraform-apply-services. Forces a `time_sleep` shim to order AFTER the attachment lands at AWS — see qurl_link_static_attachment_id above for the same shape."
   value       = aws_iam_role_policy_attachment.terraform_apply_services.id
+}
+
+# Trigger sources for Route53 record-change IAM propagation shims. The inline
+# policies below replace the legacy wildcard record-mutation grant; same-account
+# DNS writers wait on each active policy's content and inline-policy ID before
+# cutover writes. Omit inactive policy families so prod cross-account zones do
+# not carry inert managed-zone triggers.
+output "route53_record_change_policy_triggers" {
+  description = "Trigger map for Route53 record-change IAM propagation shims."
+  value = merge(
+    length(aws_iam_role_policy.route53_managed_zone_record_changes) > 0 ? {
+      managed_policy_doc_hash = sha256(join("", aws_iam_role_policy.route53_managed_zone_record_changes[*].policy))
+      managed_policy_id       = join(",", aws_iam_role_policy.route53_managed_zone_record_changes[*].id)
+    } : {},
+    length(aws_iam_role_policy.route53_computed_zone_record_changes) > 0 ? {
+      computed_policy_doc_hash = sha256(join("", aws_iam_role_policy.route53_computed_zone_record_changes[*].policy))
+      computed_policy_id       = join(",", aws_iam_role_policy.route53_computed_zone_record_changes[*].id)
+    } : {},
+  )
 }

@@ -44,6 +44,11 @@ variable "hosted_zone_id" {
   description = "Route 53 hosted zone ID (bypasses zone lookup for cross-account zones)"
   type        = string
   default     = null
+
+  validation {
+    condition     = var.hosted_zone_id == null || can(regex("^Z[A-Z0-9]{8,}$", var.hosted_zone_id))
+    error_message = "hosted_zone_id must be a valid Route53 hosted zone ID (uppercase, starts with Z, at least 9 characters)."
+  }
 }
 
 variable "lambda_layer_bucket" {
@@ -359,6 +364,11 @@ variable "qurl_service_domain" {
 variable "qurl_hosted_zone_id" {
   type    = string
   default = null
+
+  validation {
+    condition     = var.qurl_hosted_zone_id == null || can(regex("^Z[A-Z0-9]{8,}$", var.qurl_hosted_zone_id))
+    error_message = "qurl_hosted_zone_id must be a valid Route53 hosted zone ID (uppercase, starts with Z, at least 9 characters)."
+  }
 }
 
 variable "qurl_jwt_secret_arn" {
@@ -421,8 +431,8 @@ variable "qurl_site_hosted_zone_id" {
   default     = null
 
   validation {
-    condition     = var.qurl_site_hosted_zone_id == null || can(regex("^Z[A-Z0-9]+$", var.qurl_site_hosted_zone_id))
-    error_message = "qurl_site_hosted_zone_id must be a valid Route53 zone ID (starts with Z)"
+    condition     = var.qurl_site_hosted_zone_id == null || can(regex("^Z[A-Z0-9]{8,}$", var.qurl_site_hosted_zone_id))
+    error_message = "qurl_site_hosted_zone_id must be a valid Route53 hosted zone ID (uppercase, starts with Z, at least 9 characters)."
   }
 }
 
@@ -485,6 +495,11 @@ variable "qurl_link_frontend_domain" {
 variable "qurl_link_hosted_zone_id" {
   type    = string
   default = null
+
+  validation {
+    condition     = var.qurl_link_hosted_zone_id == null || can(regex("^Z[A-Z0-9]{8,}$", var.qurl_link_hosted_zone_id))
+    error_message = "qurl_link_hosted_zone_id must be a valid Route53 hosted zone ID (uppercase, starts with Z, at least 9 characters)."
+  }
 }
 
 variable "qurl_link_external_dns" {
@@ -1242,6 +1257,11 @@ variable "status_page_hosted_zone_id" {
   description = "Route53 hosted zone ID for the status page domain"
   type        = string
   default     = null
+
+  validation {
+    condition     = var.status_page_hosted_zone_id == null || can(regex("^Z[A-Z0-9]{8,}$", var.status_page_hosted_zone_id))
+    error_message = "status_page_hosted_zone_id must be a valid Route53 hosted zone ID (uppercase, starts with Z, at least 9 characters)."
+  }
 }
 
 variable "status_page_nhp_auth_enabled" {
@@ -1420,6 +1440,11 @@ variable "developer_portal_hosted_zone_id" {
   description = "Route53 hosted zone ID for developer portal custom domain"
   type        = string
   default     = null
+
+  validation {
+    condition     = var.developer_portal_hosted_zone_id == null || can(regex("^Z[A-Z0-9]{8,}$", var.developer_portal_hosted_zone_id))
+    error_message = "developer_portal_hosted_zone_id must be a valid Route53 hosted zone ID (uppercase, starts with Z, at least 9 characters)."
+  }
 }
 
 variable "developer_portal_ci_bypass_secret_name" {

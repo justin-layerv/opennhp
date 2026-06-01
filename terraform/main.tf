@@ -333,7 +333,9 @@ module "ecr" {
   # qurl-reverse-tunnel-server source repo (for ECR publish workflow OIDC trust)
   qurl_reverse_tunnel_server_github_repo = var.qurl_reverse_tunnel_server_github_repo
 
-  website_api_cfn_stack_name = var.website_api_cfn_stack_name
+  website_api_cfn_stack_name            = var.website_api_cfn_stack_name
+  route53_change_record_hosted_zone_ids = local.route53_change_record_hosted_zone_ids
+  route53_change_record_name_patterns   = local.route53_change_record_name_patterns
 }
 
 # Networking Module - VPC, Subnets, Security Groups
@@ -895,6 +897,8 @@ resource "aws_route53_record" "status_page_cert_validation" {
   ttl             = 60
   type            = each.value.type
   zone_id         = var.status_page_hosted_zone_id
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 resource "aws_acm_certificate_validation" "status_page" {
@@ -970,6 +974,8 @@ resource "aws_route53_record" "status_page_dns" {
     zone_id                = module.status_page[0].cloudfront_hosted_zone_id
     evaluate_target_health = false
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # DNS Module - Route 53 records
@@ -988,6 +994,8 @@ module "dns" {
 
   # Skip main record when AC is deployed (AC manages the domain for HTTPS)
   skip_main_record = var.deploy_ac
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # Security Module - WAF for DDoS protection
@@ -1024,12 +1032,16 @@ module "ac" {
     aws.us_east_1 = aws.us_east_1
   }
 
-  environment        = var.environment
-  ac_ami_id          = var.ac_ami_id
-  domain_name        = var.domain_name
-  hosted_zone        = var.hosted_zone
-  hosted_zone_id     = var.hosted_zone_id
-  skip_dns_records   = var.cross_account_route53_role_arn != null # Cross-account zones: DNS records created in root module
+  environment      = var.environment
+  ac_ami_id        = var.ac_ami_id
+  domain_name      = var.domain_name
+  hosted_zone      = var.hosted_zone
+  hosted_zone_id   = var.hosted_zone_id
+  skip_dns_records = var.cross_account_route53_role_arn != null # Cross-account zones: DNS records created in root module
+
+  route53_record_change_iam_propagation_triggers = local.route53_record_change_iam_propagation_triggers
+  route53_record_change_iam_propagation_duration = local.iam_propagation_duration
+
   acme_email         = var.acme_email
   vpc_id             = module.networking.vpc_id
   vpc_cidr           = var.vpc_cidr
@@ -1252,6 +1264,70 @@ data "aws_route53_zone" "main" {
 locals {
   main_zone_id = var.hosted_zone_id != null ? var.hosted_zone_id : try(data.aws_route53_zone.main[0].zone_id, null)
 
+  # GitHub Actions Terraform role Route53 mutation scope (#1146). Keep
+  # ChangeResourceRecordSets bound to the zones this environment explicitly
+  # owns/manages so sandbox CI cannot populate records inside orphan hosted
+  # zones such as the stale qurl.link public zone.
+  # Environments that write same-account Route53 records must keep this list
+  # non-empty; the scoped role grants intentionally fail closed instead of
+  # falling back to wildcard ChangeResourceRecordSets.
+  # This precondition only catches a completely missing grant input. When
+  # adding a same-account writer for a new zone, add that zone ID here or add
+  # an exact computed-zone name pattern below in the same change.
+  # Cross-account aws.route53_mgmt writers are intentionally excluded from this
+  # grant list: those records use the management-account role, not this
+  # workload-account CI role. Some mgmt records still depend on the propagation
+  # shim below because sandbox resolves the alias same-account; in prod that is
+  # only an unnecessary one-time cutover wait.
+  route53_change_record_hosted_zone_ids = distinct(compact(concat(
+    var.cross_account_route53_role_arn == null ? [
+      local.main_zone_id,
+      var.qurl_hosted_zone_id,
+      var.qurl_site_hosted_zone_id,
+      var.qurl_link_hosted_zone_id,
+      var.status_page_hosted_zone_id,
+      var.developer_portal_hosted_zone_id,
+    ] : [],
+    var.cross_account_route53_role_arn == null && var.deploy_bootstrap_alb && (var.bootstrap_alb_manage_dns_alias || var.bootstrap_alb_provision_certificate) ? [var.bootstrap_alb_route53_zone_id] : [],
+  )))
+
+  # Private hosted zones created by this same apply do not have stable IDs
+  # before creation. Use Route53's normalized-record-name condition for those
+  # narrow computed-zone writes instead of reopening ChangeResourceRecordSets
+  # against every hosted zone in the account.
+  # Patterns must be apex-or-deeper names where this environment is the only
+  # authoritative zone; do not use suffixes also served by orphan or delegated
+  # zones.
+  # This is apex-only for today's qurl_internal_alias. If the private hosted
+  # zone later adds subdomain records such as _acme-challenge passthroughs, add
+  # the corresponding normalized names here in the same change.
+  route53_change_record_name_patterns = compact([
+    var.deploy_qurl_service && var.qurl_internal_service_domain != null && var.qurl_internal_service_domain != "" ? lower(trimsuffix(var.qurl_internal_service_domain, ".")) : null,
+  ])
+  route53_same_account_record_writers_enabled = (
+    (
+      var.cross_account_route53_role_arn == null &&
+      (
+        var.hosted_zone != null ||
+        var.hosted_zone_id != null ||
+        var.deploy_ac ||
+        var.qurl_hosted_zone_id != null ||
+        var.qurl_site_hosted_zone_id != null ||
+        var.qurl_link_hosted_zone_id != null ||
+        var.status_page_hosted_zone_id != null ||
+        var.developer_portal_hosted_zone_id != null
+      )
+    ) ||
+    local.qurl_internal_alb_enabled ||
+    (
+      var.deploy_bootstrap_alb &&
+      (var.bootstrap_alb_manage_dns_alias || var.bootstrap_alb_provision_certificate)
+    )
+  )
+  iam_propagation_duration                       = "60s"
+  route53_record_change_iam_propagation_enabled  = length(local.route53_change_record_hosted_zone_ids) > 0 || length(local.route53_change_record_name_patterns) > 0
+  route53_record_change_iam_propagation_triggers = module.ecr.route53_record_change_policy_triggers
+
   # Apex name of the main zone, trailing-dot-stripped, for the cross-account
   # bootstrap-alb record's subdomain precondition. Prefer the operator-supplied
   # `hosted_zone` (set even when `hosted_zone_id` bypasses the data lookup —
@@ -1274,6 +1350,20 @@ locals {
   # registers `server.<namespace>` regardless, but without AC there are no
   # AC-issued knock tokens for either consumer to validate.
   nhp_server_internal_url = var.deploy_ac ? "http://server.${module.data.namespace_name}:8888" : ""
+}
+
+# Fail the plan if same-account DNS writers are enabled but the CI role would
+# get no Route53 record-change grant. Without this, a miswired future env would
+# plan cleanly and fail only at ChangeResourceRecordSets time.
+resource "terraform_data" "route53_record_change_policy_inputs" {
+  count = local.route53_same_account_record_writers_enabled ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = local.route53_record_change_iam_propagation_enabled
+      error_message = "Same-account Route53 record writers are enabled, but route53_change_record_hosted_zone_ids and route53_change_record_name_patterns are both empty. Set a same-account hosted zone ID/name or add the computed-zone normalized record names before applying."
+    }
+  }
 }
 
 # Validate the shared nhp-server origin at the root level, not inside the
@@ -1317,6 +1407,8 @@ resource "aws_route53_record" "ac_domain" {
     zone_id                = module.ac[0].nlb_zone_id
     evaluate_target_health = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 resource "aws_route53_record" "ac_wildcard" {
@@ -1332,6 +1424,8 @@ resource "aws_route53_record" "ac_wildcard" {
     zone_id                = module.ac[0].nlb_zone_id
     evaluate_target_health = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # FRPS-behind-AC public DNS (SLACK_QURL_ROLLOUT.md §6, 2026-05-18).
@@ -1386,6 +1480,8 @@ resource "aws_route53_record" "connect_cross_account" {
     zone_id                = module.ac[0].nlb_zone_id
     evaluate_target_health = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 resource "aws_route53_record" "connect" {
@@ -1401,6 +1497,8 @@ resource "aws_route53_record" "connect" {
     zone_id                = module.ac[0].nlb_zone_id
     evaluate_target_health = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # Plan-time fence for the bootstrap-alb DNS writer — mirrors
@@ -1477,7 +1575,10 @@ resource "aws_route53_record" "bootstrap_alb_cross_account" {
   # Make the "fence guards everything below it" intent explicit, matching how
   # the qurl-reverse-tunnel-server module depends_on `frps_preconditions`.
   # Preconditions evaluate at plan regardless, so this is for legibility/order.
-  depends_on = [terraform_data.bootstrap_alb_dns_preconditions]
+  depends_on = [
+    terraform_data.bootstrap_alb_dns_preconditions,
+    time_sleep.route53_record_change_iam_propagation,
+  ]
 
   # No create_before_destroy here, matching the module's own alb_alias intent:
   # CBD breaks for an RRSet name-keyed record (see modules/bootstrap-alb/
@@ -1524,6 +1625,8 @@ resource "aws_route53_record" "qurl_site_wildcard" {
     zone_id                = module.ac[0].nlb_zone_id
     evaluate_target_health = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # ==================== QURL FRP Server ====================
@@ -1918,6 +2021,8 @@ resource "aws_route53_record" "qurl_api_cert_validation" {
   ttl             = 60
   type            = each.value.type
   zone_id         = var.qurl_hosted_zone_id
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # Wait for certificate validation to complete
@@ -1942,6 +2047,8 @@ resource "aws_route53_record" "qurl_api" {
     zone_id                = module.qurl_service[0].alb_zone_id
     evaluate_target_health = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # ==================== QURL Service — internal ALB cert + private DNS ====================
@@ -2033,6 +2140,8 @@ resource "aws_route53_record" "qurl_internal_cert_validation" {
   ttl             = 60
   type            = each.value.type
   zone_id         = var.qurl_hosted_zone_id
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 resource "aws_acm_certificate_validation" "qurl_internal" {
@@ -2093,6 +2202,8 @@ resource "aws_route53_record" "qurl_internal_alias" {
     zone_id                = module.qurl_service[0].internal_alb_zone_id
     evaluate_target_health = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 
   # The PHZ above uses create_before_destroy to avoid a NXDOMAIN window
   # on rename — that protection is incomplete unless this record also
@@ -2206,7 +2317,10 @@ resource "aws_route53_record" "website_api" {
   # Keep the precondition gate inline with apply ordering even though
   # local.website_api_dns_enabled already short-circuits count — belt-and-
   # suspenders against a future edit that loosens the count predicate.
-  depends_on = [terraform_data.website_api_preconditions]
+  depends_on = [
+    terraform_data.website_api_preconditions,
+    time_sleep.route53_record_change_iam_propagation,
+  ]
 }
 
 # ==================== Redis (Distributed Rate Limiting) ====================
@@ -2808,6 +2922,8 @@ resource "aws_route53_record" "developer_portal_cert_validation" {
   ttl             = 60
   type            = each.value.type
   zone_id         = var.developer_portal_hosted_zone_id
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 resource "aws_acm_certificate_validation" "developer_portal" {
@@ -2830,6 +2946,8 @@ resource "aws_route53_record" "developer_portal" {
     zone_id                = module.developer_portal[0].custom_domain_target_hosted_zone_id
     evaluate_target_health = false
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 module "developer_portal" {
@@ -3082,6 +3200,8 @@ resource "aws_route53_record" "qurl_link_cert_validation" {
   ttl             = 60
   type            = each.value.type
   zone_id         = var.qurl_link_hosted_zone_id
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # ACM validation - waits for certificate to be validated
@@ -3122,6 +3242,8 @@ resource "aws_route53_record" "qurl_link" {
     zone_id                = module.qurl_link[0].cloudfront_hosted_zone_id
     evaluate_target_health = false
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # IPv6 AAAA record for CloudFront (is_ipv6_enabled=true on distribution)
@@ -3139,6 +3261,8 @@ resource "aws_route53_record" "qurl_link_ipv6" {
     zone_id                = module.qurl_link[0].cloudfront_hosted_zone_id
     evaluate_target_health = false
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # ==============================================================================
@@ -3191,6 +3315,8 @@ resource "aws_route53_record" "qurl_resolve_cert_validation" {
   ttl             = 60
   type            = each.value.type
   zone_id         = var.qurl_link_hosted_zone_id
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # Wait for certificate validation to complete
@@ -3223,6 +3349,8 @@ resource "aws_route53_record" "qurl_link_resolve" {
     zone_id                = var.enable_resolve_cloudfront ? aws_cloudfront_distribution.qurl_resolve[0].hosted_zone_id : module.compute.nlb_zone_id
     evaluate_target_health = !var.enable_resolve_cloudfront
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # IPv6 AAAA record for resolve.qurl.link — REMOVED.
@@ -3251,6 +3379,8 @@ resource "aws_route53_record" "qurl_link_resolve_origin" {
     zone_id                = module.compute.nlb_zone_id
     evaluate_target_health = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # ==============================================================================
@@ -3295,6 +3425,8 @@ resource "aws_route53_record" "qurl_resolve_cf_cert_validation" {
   ttl             = 60
   type            = each.value.type
   zone_id         = var.qurl_link_hosted_zone_id
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # Wait for CloudFront certificate validation
@@ -3590,7 +3722,23 @@ resource "time_sleep" "qurl_link_static_iam_propagation" {
     attachment_id   = module.ecr.qurl_link_static_attachment_id
   }
 
-  create_duration = "60s"
+  create_duration = local.iam_propagation_duration
+}
+
+# IAM eventual-consistency shim for same-account Route53 record writers that
+# consume the scoped inline grants replacing the legacy wildcard mutation grant.
+# If a cutover apply changes DNS in the same graph as the new grants, wait for
+# the IAM evaluator before create/replace calls to ChangeResourceRecordSets.
+# In-place updates are not gated by depends_on; keep the first cutover attended
+# if a same-account record mutation is intentionally included in that apply.
+# Cross-account Route53 writers use aws.route53_mgmt and do not consume this CI
+# role policy.
+resource "time_sleep" "route53_record_change_iam_propagation" {
+  count = local.route53_record_change_iam_propagation_enabled ? 1 : 0
+
+  triggers = local.route53_record_change_iam_propagation_triggers
+
+  create_duration = local.iam_propagation_duration
 }
 
 # Enable CloudFront additional metrics on the resolve distribution.
@@ -4047,9 +4195,12 @@ resource "aws_route53_record" "qurl_s3_connector" {
   # future edit adding an input can't forget to widen both records'
   # count predicates. Preconditions on the terraform_data above
   # still fire first when only the flag is set.
-  count      = local.qurl_integrations_dns_enabled ? 1 : 0
-  provider   = aws.route53_mgmt
-  depends_on = [terraform_data.qurl_integrations_dns_preconditions]
+  count    = local.qurl_integrations_dns_enabled ? 1 : 0
+  provider = aws.route53_mgmt
+  depends_on = [
+    terraform_data.qurl_integrations_dns_preconditions,
+    time_sleep.route53_record_change_iam_propagation,
+  ]
 
   # Omit allow_overwrite (matches plain-record `qurl_api`): these are
   # new records with no mgmt-account consumers; failing on a pre-
@@ -4078,9 +4229,12 @@ resource "aws_route53_record" "qurl_s3_connector" {
 }
 
 resource "aws_route53_record" "qurl_fileviewer" {
-  count      = local.qurl_integrations_dns_enabled ? 1 : 0
-  provider   = aws.route53_mgmt
-  depends_on = [terraform_data.qurl_integrations_dns_preconditions]
+  count    = local.qurl_integrations_dns_enabled ? 1 : 0
+  provider = aws.route53_mgmt
+  depends_on = [
+    terraform_data.qurl_integrations_dns_preconditions,
+    time_sleep.route53_record_change_iam_propagation,
+  ]
 
   zone_id = var.qurl_hosted_zone_id
   name    = var.qurl_fileviewer_domain
@@ -4319,8 +4473,12 @@ module "bootstrap_alb" {
   # existing_certificate_arn=="") before plan finishes. The root-level
   # `check` block above catches the gate-on-without-tfvars case first
   # and points the operator at the right root variables.
-  dns_name                 = var.bootstrap_alb_dns_name
-  route53_zone_id          = var.bootstrap_alb_route53_zone_id
+  dns_name        = var.bootstrap_alb_dns_name
+  route53_zone_id = var.bootstrap_alb_route53_zone_id
+
+  route53_record_change_iam_propagation_triggers = local.route53_record_change_iam_propagation_triggers
+  route53_record_change_iam_propagation_duration = local.iam_propagation_duration
+
   manage_dns_alias         = var.bootstrap_alb_manage_dns_alias
   provision_certificate    = var.bootstrap_alb_provision_certificate
   existing_certificate_arn = var.bootstrap_alb_existing_certificate_arn

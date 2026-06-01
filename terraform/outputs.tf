@@ -28,6 +28,16 @@ output "github_actions_packer_role_arn" {
   value       = module.ecr.github_actions_packer_role_arn
 }
 
+output "route53_record_change_iam_propagation_triggers" {
+  description = "Trigger map for env-root Route53 record-change IAM propagation shims."
+  value       = local.route53_record_change_iam_propagation_triggers
+}
+
+output "route53_record_change_iam_propagation_duration" {
+  description = "Duration for env-root Route53 record-change IAM propagation shims."
+  value       = local.iam_propagation_duration
+}
+
 output "etcd_endpoint" {
   description = "etcd endpoint for multi-tenant configuration"
   value       = module.data.etcd_endpoint

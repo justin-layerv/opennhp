@@ -23,5 +23,9 @@ terraform {
       source  = "hashicorp/aws"
       version = ">= 5.21"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
   }
 }

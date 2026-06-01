@@ -14,7 +14,7 @@ output "guardduty_detector_id" {
 }
 
 output "permission_boundary_arn" {
-  description = "IAM permission boundary policy ARN - attach to roles for least privilege"
+  description = "IAM permission boundary policy ARN. Route53 writes are ACME TXT-only; revalidate real DNS-01 issuance before first attaching this boundary to a role."
   value       = aws_iam_policy.permission_boundary.arn
 }
 

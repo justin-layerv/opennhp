@@ -93,6 +93,18 @@ variable "route53_zone_id" {
   }
 }
 
+variable "route53_record_change_iam_propagation_triggers" {
+  description = "Optional trigger map for waiting on Terraform CI Route53 record-change IAM propagation before same-account bootstrap DNS writes."
+  type        = map(string)
+  default     = {}
+}
+
+variable "route53_record_change_iam_propagation_duration" {
+  description = "Duration to wait for Terraform CI Route53 record-change IAM propagation before same-account bootstrap DNS writes."
+  type        = string
+  default     = "60s"
+}
+
 variable "manage_dns_alias" {
   description = "Whether this stack writes the A-alias from `dns_name` to the ALB. True when the parent zone is in the same account as this ALB; false when the zone is cross-account and the operator writes the alias out-of-band. Sandbox: true (`layerv.xyz` zone in account 767397897469, same as the ALB). Prod: false (`layerv.ai` zone in `layerv-mgmt`, cross-account). See README's runbook for the operator path."
   type        = bool

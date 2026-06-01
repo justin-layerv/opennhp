@@ -20,6 +20,10 @@ terraform {
       version               = "~> 6.27"
       configuration_aliases = [aws.us_east_1]
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
   }
 }
 
@@ -232,6 +236,17 @@ data "aws_route53_zone" "main" {
 locals {
   resolved_zone_id  = var.hosted_zone_id != null ? var.hosted_zone_id : data.aws_route53_zone.main[0].zone_id
   resolved_zone_arn = var.hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.hosted_zone_id}" : data.aws_route53_zone.main[0].arn
+}
+
+# Same-account AC DNS records consume the parent Terraform CI role's scoped
+# Route53 record-change grants. On a cutover apply, wait for those inline IAM
+# policies to propagate before issuing ChangeResourceRecordSets.
+resource "time_sleep" "route53_record_change_iam_propagation" {
+  count = !var.skip_dns_records && length(var.route53_record_change_iam_propagation_triggers) > 0 ? 1 : 0
+
+  triggers = var.route53_record_change_iam_propagation_triggers
+
+  create_duration = var.route53_record_change_iam_propagation_duration
 }
 
 # Security Group for AC instances
@@ -1808,6 +1823,8 @@ resource "aws_route53_record" "ac" {
     zone_id                = aws_lb.ac.zone_id
     evaluate_target_health = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # Wildcard record for tenant subdomains (points to CloudFront if enabled, otherwise NLB)
@@ -1822,6 +1839,8 @@ resource "aws_route53_record" "ac_wildcard" {
     zone_id                = var.enable_cloudfront ? aws_cloudfront_distribution.ac[0].hosted_zone_id : aws_lb.ac.zone_id
     evaluate_target_health = !var.enable_cloudfront
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # ==================== CloudFront + WAF ====================
@@ -1858,6 +1877,8 @@ resource "aws_route53_record" "cloudfront_cert_validation" {
   ttl             = 60
   type            = each.value.type
   zone_id         = local.resolved_zone_id
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 resource "aws_acm_certificate_validation" "cloudfront" {
@@ -2054,6 +2075,8 @@ resource "aws_route53_record" "ac_cloudfront" {
     zone_id                = aws_cloudfront_distribution.ac[0].hosted_zone_id
     evaluate_target_health = false
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 # ==================== DynamoDB License Seeding ====================

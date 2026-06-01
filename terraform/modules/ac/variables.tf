@@ -85,6 +85,18 @@ variable "skip_dns_records" {
   default     = false
 }
 
+variable "route53_record_change_iam_propagation_triggers" {
+  description = "Optional trigger map for waiting on Terraform CI Route53 record-change IAM propagation before same-account DNS writes."
+  type        = map(string)
+  default     = {}
+}
+
+variable "route53_record_change_iam_propagation_duration" {
+  description = "Duration to wait for Terraform CI Route53 record-change IAM propagation before same-account DNS writes."
+  type        = string
+  default     = "60s"
+}
+
 variable "acme_email" {
   description = "Email for Let's Encrypt certificate registration"
   type        = string

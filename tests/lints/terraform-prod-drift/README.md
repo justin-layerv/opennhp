@@ -7,7 +7,10 @@ Regression fixtures for the two PR-time terraform drift detectors:
 
 Each fixture is a minimal terraform tree that the lints run against. The
 test harness (`run-fixtures.sh`) asserts each lint produces the expected
-exit code on each fixture.
+exit code on each fixture. It also has a small alignment sentinel for
+nhp#1146's Route53 normalized-record-name exact-name rule, which is
+intentionally duplicated in the Python condition lint and
+`terraform/modules/ecr` variable validation.
 
 ## Fixtures
 
@@ -42,7 +45,36 @@ exit code on each fixture.
 | `role-policies-exclusive-noop` | A — `aws_iam_role_policies_exclusive` no-op contract (cr round 16) | exit 0 | exit 0 |
 | `heredoc-jsonencode-error` | A/B — `jsonencode(<<EOF ...)` hard-fail (cr round 17) | exit 2 + ::error | exit 2 + ::error |
 | `multi-leg-with-bad-paren` | A — multi-leg ternary with interpolation warn (cr round 14) | exit 0 + interpolation warn | exit 0 |
+| `github-actions-permission-boundary` | B — nhp#1146 ACME-only permission boundary must not cap terraform CI | exit 0 | exit 1 (`permissions_boundary` on canonical CI role) |
 | `route53-tag-filter-gap` | A — `aws_route53_zone` tags-filter drift detection (cr round 14) | exit 1 (gap) | exit 0 |
+| `route53-recordset-wildcard` | B — nhp#1146 wildcard Route53 record mutation | exit 0 | exit 1 (missing normalized-record-name condition) |
+| `route53-recordset-partial-wildcard` | B — nhp#1146 partial hosted-zone wildcard | exit 0 | exit 1 (missing normalized-record-name condition) |
+| `route53-recordset-partial-interpolation-condition` | B — nhp#1146 wildcard zone with an unresolved partial interpolation in the name condition | exit 0 | exit 1 (partial interpolation is not a reviewed variable ref) |
+| `route53-recordset-notaction` | B — nhp#1146 Allow + NotAction wildcard mutation | exit 0 | exit 1 (missing normalized-record-name condition) |
+| `route53-recordset-action-change-glob` | B — nhp#1146 `route53:Change*` action glob wildcard mutation | exit 0 | exit 1 (action glob matches record mutation) |
+| `route53-recordset-action-service-glob` | B — nhp#1146 `route53:*` action glob wildcard mutation | exit 0 | exit 1 (service glob matches record mutation) |
+| `route53-recordset-notresource` | B — nhp#1146 Allow + NotResource wildcard mutation | exit 0 | exit 1 (NotResource is wildcard-equivalent) |
+| `route53-recordset-notresource-condition` | B — nhp#1146 Allow + NotResource remains banned even with a narrow name condition | exit 0 | exit 1 (NotResource is a broad complement) |
+| `route53-recordset-broad-condition` | B — nhp#1146 broad `NormalizedRecordNames = ["*"]` | exit 0 | exit 1 (condition is present but not narrow) |
+| `route53-recordset-plain-condition` | B — nhp#1146 non-`ForAllValues` normalized-name condition | exit 0 | exit 1 (condition does not validate every record) |
+| `route53-recordset-service-case` | B — nhp#1146 mixed-case Route53 service ARN wildcard | exit 0 | exit 1 (case-insensitive wildcard resource detection) |
+| `route53-recordset-service-wildcard` | B — nhp#1146 service-level Route53 ARN wildcard | exit 0 | exit 1 (Route53 ARN wildcard resource detection) |
+| `route53-recordset-gov-partition` | B — nhp#1146 non-`aws` partition hosted-zone wildcard | exit 0 | exit 1 (partition-agnostic Route53 ARN detection) |
+| `route53-recordset-change-resource` | B — nhp#1146 `arn:aws:route53:::change/*` is not a hosted-zone wildcard | exit 0 | exit 0 |
+| `route53-recordset-missing-null` | B — nhp#1146 narrow condition without `Null=false` | exit 0 | exit 1 (absent-key guard is required) |
+| `route53-recordset-negated-condition` | B — nhp#1146 negated normalized-name condition | exit 0 | exit 1 (`StringNotLike` does not narrow access) |
+| `route53-recordset-role-inline-policy` | B — nhp#1146 `aws_iam_role.inline_policy` wildcard mutation | exit 0 | exit 1 (inline role policies are scanned) |
+| `route53-recordset-user-policy` | B — nhp#1146 `aws_iam_user_policy` wildcard mutation | exit 0 | exit 1 (user policies are scanned) |
+| `route53-recordset-group-policy` | B — nhp#1146 `aws_iam_group_policy` wildcard mutation | exit 0 | exit 1 (group policies are scanned) |
+| `route53-recordset-managed-policy` | B — nhp#1146 `aws_iam_policy` wildcard mutation | exit 0 | exit 1 (managed policies are scanned) |
+| `route53-recordset-broad-suffix-condition` | B — nhp#1146 broad suffix wildcard such as `*.com` | exit 0 | exit 1 (condition suffix is too broad) |
+| `route53-recordset-prefix-wildcard-condition` | B — nhp#1146 wildcard such as `*x` | exit 0 | exit 1 (condition wildcard shape is too broad) |
+| `route53-recordset-acme-missing-null` | B — nhp#1146 ACME boundary missing action/type `Null=false` guards | exit 0 | exit 1 (all ACME multi-valued keys require absent-key guards) |
+| `route53-recordset-acme-boundary-condition` | B — nhp#1146 valid ACME TXT-only boundary condition shape | exit 0 | exit 0 |
+| `route53-recordset-left-label-wildcard-condition` | B — nhp#1146 left-label wildcard requires code review before use | exit 0 | exit 1 (computed-zone patterns are exact-name-only) |
+| `route53-recordset-narrow-condition` | B — nhp#1146 valid computed-zone wildcard with narrow name condition | exit 0 | exit 0 |
+| `route53-recordset-unreviewed-variable-condition` | B — nhp#1146 wildcard zone with an unreviewed variable-sourced name condition | exit 0 | exit 1 (only reviewed variable refs may defer to Terraform validation) |
+| `route53-recordset-variable-condition` | B — nhp#1146 valid computed-zone wildcard with variable-sourced name condition | exit 0 | exit 0 |
 
 The `clean` fixture additionally exercises `count`-gated `aws_iam_role_policy` (the `cloudformation_website_api` grant is gated on `var.deploy_website_api_dns`, mirroring the real `terraform/modules/ecr/main.tf` shape that landed in #1414). `indexed-managed-policy` covers the same gating shape for `aws_iam_policy`.
 

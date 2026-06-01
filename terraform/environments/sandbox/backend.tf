@@ -11,6 +11,10 @@ terraform {
       source  = "auth0/auth0"
       version = "~> 1.0"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
   }
 
   backend "s3" {

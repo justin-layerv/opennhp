@@ -83,6 +83,18 @@ data "aws_route53_zone" "selected" {
   }
 }
 
+# Same-account bootstrap cert-validation and alias records consume the parent
+# Terraform CI role's scoped Route53 record-change grants. On a cutover apply,
+# wait for those inline IAM policies to propagate before issuing
+# ChangeResourceRecordSets. Cross-account path #1 renders no records here.
+resource "time_sleep" "route53_record_change_iam_propagation" {
+  count = (var.provision_certificate || var.manage_dns_alias) && length(var.route53_record_change_iam_propagation_triggers) > 0 ? 1 : 0
+
+  triggers = var.route53_record_change_iam_propagation_triggers
+
+  create_duration = var.route53_record_change_iam_propagation_duration
+}
+
 resource "aws_acm_certificate" "this" {
   count = var.provision_certificate ? 1 : 0
 
@@ -232,6 +244,8 @@ resource "aws_route53_record" "cert_validation" {
   lifecycle {
     create_before_destroy = true
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
 
 resource "aws_acm_certificate_validation" "this" {
@@ -340,4 +354,6 @@ resource "aws_route53_record" "alb_alias" {
       error_message = "manage_dns_alias=true requires var.dns_name to be the apex of, or a subdomain of, the zone resolved from var.route53_zone_id. Got dns_name=`${var.dns_name}` but zone=`${trimsuffix(data.aws_route53_zone.selected[0].name, ".")}`."
     }
   }
+
+  depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
