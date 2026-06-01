@@ -75,6 +75,71 @@ class TestIsValidDomain(unittest.TestCase):
         assert not cm.is_valid_domain('*.example.com')
 
 
+class TestIsSyntheticDomain(unittest.TestCase):
+    """Tests for is_synthetic_domain() — RFC-reserved test/example names only."""
+
+    def test_reserved_tlds_are_synthetic(self):
+        assert cm.is_synthetic_domain('smoke-cleanup-abc.example.invalid')
+        assert cm.is_synthetic_domain('foo.test')
+        assert cm.is_synthetic_domain('bar.localhost')
+        assert cm.is_synthetic_domain('baz.example')
+        assert cm.is_synthetic_domain('SMOKE.EXAMPLE.INVALID')  # case-insensitive
+        assert cm.is_synthetic_domain('trailing.invalid.')      # trailing dot
+
+    def test_reserved_doc_domains_are_synthetic(self):
+        assert cm.is_synthetic_domain('example.com')
+        assert cm.is_synthetic_domain('sub.example.org')
+        assert cm.is_synthetic_domain('a.b.example.net')
+
+    def test_real_customer_domains_are_NOT_synthetic(self):
+        # Each MUST be False — a true here would silently blind the real
+        # customer-cert-failure alarm, which is strictly worse than a cosmetic
+        # monitor failure. Includes the company zone (NOT suppressed by design)
+        # and near-miss strings that must not match the reserved patterns.
+        assert not cm.is_synthetic_domain('secure.acme.com')
+        assert not cm.is_synthetic_domain('links.bigcorp.io')
+        assert not cm.is_synthetic_domain('cd-smoke-tok-123.layerv.xyz')
+        assert not cm.is_synthetic_domain('notexample.com')
+        assert not cm.is_synthetic_domain('example.com.evil.net')
+        assert not cm.is_synthetic_domain('myinvalid.com')
+        assert not cm.is_synthetic_domain('')
+
+
+class TestSsmComment(unittest.TestCase):
+    """Tests for _ssm_comment() — clamps to AWS SendCommand's 100-char limit."""
+
+    def test_short_comment_unchanged(self):
+        c = 'Cert sync triggered for custom domain: short.example.com'
+        assert cm._ssm_comment(c) == c
+
+    def test_long_comment_truncated_to_100(self):
+        long_domain = 'smoke-cleanup-43b4b748-e2d7-4c22-b99f-a2aab5300383.example.invalid'
+        c = f'Cert delete triggered for custom domain: {long_domain}'
+        assert len(c) > 100  # the bug precondition
+        out = cm._ssm_comment(c)
+        assert len(out) <= 100
+        assert out == c[:100]
+
+
+class TestPublishFailureMetricSynthetic(unittest.TestCase):
+    """publish_failure_metric() suppresses prod failures for synthetic domains ONLY."""
+
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    def test_skips_synthetic_domain(self, mock_cw):
+        cm.publish_failure_metric(cm.FAILURE_CERT_SYNC, domain='smoke-cleanup-x.example.invalid')
+        mock_cw.assert_not_called()
+
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    def test_emits_for_real_domain(self, mock_cw):
+        cm.publish_failure_metric(cm.FAILURE_CERT_SYNC, domain='secure.customer.com')
+        assert mock_cw.called
+
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    def test_emits_when_no_domain(self, mock_cw):
+        cm.publish_failure_metric(cm.FAILURE_CERT_SYNC)
+        assert mock_cw.called
+
+
 class TestDomainToAcmeSubdomain(unittest.TestCase):
     """Tests for domain_to_acme_subdomain() helper."""
 
@@ -794,6 +859,30 @@ class TestTriggerCertSync(unittest.TestCase):
             cm.trigger_cert_sync('example.com')
             mock_send.assert_not_called()
 
+    @patch.dict(os.environ, {'AC_INSTANCE_TAG': 'nhp-ac'})
+    @patch.object(cm.ssm_client, 'send_command')
+    def test_long_domain_comment_is_clamped(self, mock_send):
+        """Regression guard at the SendCommand boundary: a long domain must
+        reach AWS with the Comment clamped to the 100-char limit. TestSsmComment
+        proves _ssm_comment() truncates; this proves trigger_cert_sync actually
+        routes the Comment through it — an unwrapped Comment= would trip AWS's
+        ValidationException and emit a spurious CertSyncError metric (#2300)."""
+        mock_send.return_value = {'Command': {'CommandId': 'test-123'}}
+        # Multi-label domain whose total length alone exceeds SSM_COMMENT_MAX,
+        # so any unclamped Comment= overflows regardless of annotation text
+        # (format-agnostic guard). Each label is well under the DNS 63-char
+        # limit, so the fixture stays valid — and keeps reaching send_command —
+        # even if DOMAIN_REGEX is ever tightened to enforce per-label length.
+        long_domain = 'sub.' * 30 + 'customer.net'
+        self.assertGreater(len(long_domain), cm.SSM_COMMENT_MAX)
+
+        cm.trigger_cert_sync(long_domain)
+
+        comment = mock_send.call_args.kwargs['Comment']
+        assert len(comment) <= cm.SSM_COMMENT_MAX
+        # Domain leads the annotation, so the surviving text is the domain head.
+        assert long_domain.startswith(comment)
+
 
 class TestTriggerCertDelete(unittest.TestCase):
     """Tests for trigger_cert_delete() — the per-domain incremental cleanup
@@ -841,6 +930,24 @@ class TestTriggerCertDelete(unittest.TestCase):
             os.environ.pop('AC_INSTANCE_TAG', None)
             cm.trigger_cert_delete('example.com')
             mock_send.assert_not_called()
+
+    @patch.dict(os.environ, {'AC_INSTANCE_TAG': 'nhp-ac'})
+    @patch.object(cm.ssm_client, 'send_command')
+    def test_long_domain_comment_is_clamped(self, mock_send):
+        """Same SendCommand-boundary guard as TestTriggerCertSync, for the
+        delete path — the comment-overflow bug (#2300) tripped on cleanup
+        domains, so the clamp wiring here is the one that actually regressed."""
+        mock_send.return_value = {'Command': {'CommandId': 'test-123'}}
+        # Multi-label long domain (see TestTriggerCertSync) — valid even under a
+        # stricter per-label regex, so it always reaches send_command.
+        long_domain = 'sub.' * 30 + 'customer.net'
+        self.assertGreater(len(long_domain), cm.SSM_COMMENT_MAX)
+
+        cm.trigger_cert_delete(long_domain)
+
+        comment = mock_send.call_args.kwargs['Comment']
+        assert len(comment) <= cm.SSM_COMMENT_MAX
+        assert long_domain.startswith(comment)
 
 
 class _StubDnsException(Exception):

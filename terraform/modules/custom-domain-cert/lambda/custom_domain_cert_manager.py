@@ -313,6 +313,29 @@ def is_valid_domain(domain: str) -> bool:
     return bool(DOMAIN_REGEX.match(domain)) and '..' not in domain
 
 
+# RFC 2606 / RFC 6761 reserved names. These can never be a real customer custom
+# domain, so a provisioning/sync failure on one is a synthetic (smoke/test)
+# artifact — not a customer-impacting cert failure. publish_failure_metric()
+# suppresses the prod ProvisioningFailures metric for them, so the promote
+# post-deploy monitor's cert alarms aren't tripped by the smoke suite's
+# cleanup domains (e.g. smoke-cleanup-*.example.invalid).
+#
+# SCOPED DELIBERATELY to provably-reserved names ONLY. Do NOT extend this to
+# customer-controllable patterns (a `smoke-` prefix, or LayerV's own zones):
+# a too-broad match would silently blind the real customer-cert-failure alarm,
+# which is strictly worse than a cosmetic monitor failure.
+_RESERVED_TLD_SUFFIXES = ('.invalid', '.test', '.localhost', '.example')
+_RESERVED_DOC_DOMAINS = ('example.com', 'example.net', 'example.org')
+
+
+def is_synthetic_domain(domain: str) -> bool:
+    """True iff domain is an RFC-reserved test/example name (never a real customer domain)."""
+    d = (domain or '').strip().lower().rstrip('.')
+    if d.endswith(_RESERVED_TLD_SUFFIXES):
+        return True
+    return any(d == dd or d.endswith('.' + dd) for dd in _RESERVED_DOC_DOMAINS)
+
+
 def domain_to_acme_subdomain(domain: str) -> str:
     """Derive ACME subdomain from a domain name (e.g. 'a.b.com' -> 'a--b--com')."""
     return domain.replace('.', '--')
@@ -1857,6 +1880,28 @@ def _delete_orphan_domain_row(domain: str) -> str:
         return DDB_ERROR
 
 
+# AWS SSM SendCommand caps the Comment field at 100 chars (regex ^.{0,100}$).
+# A long custom-domain name overflows the annotation and raises a
+# ValidationException, which the trigger functions below catch and report as a
+# (spurious) CertSyncError failure metric. _ssm_comment() truncates to stay
+# within the limit — the comment is a human-readable annotation only. The
+# domain leads the string (see the call sites) so that for realistic names an
+# overflow trims the trailing boilerplate, keeping the (searchable) domain
+# legible in SSM run history; a pathological >100-char domain is itself sliced,
+# but the clamp's only contract is to never exceed the limit (hence never raise
+# ValidationException), not to keep every input legible.
+SSM_COMMENT_MAX = 100
+
+
+def _ssm_comment(text: str) -> str:
+    """Clamp an SSM SendCommand Comment to AWS's 100-char limit.
+
+    Slicing past the end is a no-op, so this leaves a within-limit comment
+    unchanged and truncates only an overflowing one.
+    """
+    return text[:SSM_COMMENT_MAX]
+
+
 def trigger_cert_sync(domain: str):
     """Trigger certificate sync on AC instances via SSM SendCommand.
 
@@ -1897,13 +1942,13 @@ def trigger_cert_sync(domain: str):
                 ]
             },
             TimeoutSeconds=120,
-            Comment=f'Cert sync triggered for custom domain: {domain}'
+            Comment=_ssm_comment(f'{domain}: cert sync triggered')
         )
         command_id = response['Command']['CommandId']
         logger.info(f"Triggered cert sync on AC instances, command: {command_id}")
     except Exception as e:
         logger.error(f"Failed to trigger cert sync: {e}")
-        publish_failure_metric(FAILURE_CERT_SYNC)
+        publish_failure_metric(FAILURE_CERT_SYNC, domain=domain)
 
 
 def trigger_cert_delete(domain: str):
@@ -1957,13 +2002,13 @@ def trigger_cert_delete(domain: str):
                 ]
             },
             TimeoutSeconds=120,
-            Comment=f'Cert delete triggered for custom domain: {domain}'
+            Comment=_ssm_comment(f'{domain}: cert delete triggered')
         )
         command_id = response['Command']['CommandId']
         logger.info(f"Triggered cert delete on AC instances, command: {command_id}")
     except Exception as e:
         logger.error(f"Failed to trigger cert delete: {e}")
-        publish_failure_metric(FAILURE_CERT_SYNC)
+        publish_failure_metric(FAILURE_CERT_SYNC, domain=domain)
 
 
 def send_alert(message: str, is_error: bool = True):
@@ -2008,12 +2053,35 @@ def publish_metric(metric_name: str, value: float, dimensions: Optional[List[Dic
         logger.error(f"Failed to publish CloudWatch metric {metric_name}: {e}")
 
 
-def publish_failure_metric(category: Optional[str] = None):
+def publish_failure_metric(category: Optional[str] = None, domain: Optional[str] = None):
     """Publish a provisioning failure metric to CloudWatch.
 
     Publishes two data points: one without dimensions (for the existing alarm)
     and one with a FailureCategory dimension (for granular diagnosis).
+
+    When ``domain`` is an RFC-reserved synthetic name (smoke/test — see
+    is_synthetic_domain), the metric is skipped: a failure on a domain that can
+    never belong to a real customer must not trip the prod cert alarms (which
+    the promote post-deploy monitor watches).
+
+    Scoping is deliberate: only the cert sync/delete trigger paths pass
+    ``domain``, because that is the sole surface the smoke suite exercises with
+    reserved-name domains (cleanup of smoke-cleanup-*.example.invalid). The
+    other callers (provisioning, DNS validation, renewal-scan, orphan-cleanup)
+    omit ``domain`` and always emit — a reserved-name domain doesn't reach those
+    paths in practice, and suppressing there would only widen the blind spot (a
+    genuine infra fault on a synthetic domain would then emit nothing) for no
+    real-world benefit. A real customer domain always alarms on every path
+    regardless.
+
+    Revisit this boundary if smoke ever starts exercising the renewal-scan or
+    orphan-cleanup paths (FAILURE_RENEWAL_SCAN / FAILURE_ORPHANED_CERT) against
+    reserved-name domains: those callers would then need ``domain`` too, or the
+    prod alarm could re-trip on a synthetic failure.
     """
+    if domain and is_synthetic_domain(domain):
+        logger.info(f"Skipping ProvisioningFailures metric for synthetic domain: {domain}")
+        return
     # Always publish the aggregate metric (keeps existing alarm working)
     publish_metric(CW_METRIC_PROVISIONING_FAILURES, 1)
     # Also publish with category dimension for diagnosis without logs
