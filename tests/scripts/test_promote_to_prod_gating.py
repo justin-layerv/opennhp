@@ -140,6 +140,10 @@ __test__ = False
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "promote-to-prod.yml"
+_TERRAFORM_MODULE_SCAN_PATHS = (
+    REPO_ROOT / "terraform" / "main.tf",
+    REPO_ROOT / "terraform" / "environments" / "prod" / "main.tf",
+)
 
 # Load-bearing convention: artifact names participating in the prod
 # `archive_file` plan→apply pass MUST start with this prefix. The two
@@ -1430,6 +1434,69 @@ if len(_LAMBDA_LOUD_FAIL_ALLOWLIST) > 1:
     )
 
 
+# Lambdas whose parent `module "X"` in the prod promote roots carries a
+# module-wide `depends_on`: terraform may defer their `archive_file` to
+# apply, so no zip exists at plan time. Uploads use `ignore` plus a
+# `continue-on-error: true` download. Keep this separate from the deprecated
+# `_LAMBDA_LOUD_FAIL_ALLOWLIST` (different lifecycle; #2284 removes these by
+# narrowing module depends_on). Mechanism and safety argument live in the
+# runbook's "Loud-fail vs deferred-to-apply" section.
+_LAMBDA_DEFERRED_MODULES = {
+    "lambda-ac-keygen": "ac",
+    "lambda-ac-secret-reconciliation": "ac",
+    "lambda-compute-keygen": "compute",
+    "lambda-compute-termination-cleanup": "compute",
+    "lambda-playground-proxy": "developer_portal",
+    "lambda-developer-portal-auth0-cleanup": "developer_portal",
+}
+_LAMBDA_DEFERRED_TO_APPLY = frozenset(_LAMBDA_DEFERRED_MODULES)
+
+# A `lambda-*` upload may use `if-no-files-found: ignore` (paired with a
+# `continue-on-error: true` download) iff its name is in EITHER set; every
+# other `lambda-*` upload must stay `if-no-files-found: error`.
+_LAMBDA_IGNORE_OK = _LAMBDA_LOUD_FAIL_ALLOWLIST | _LAMBDA_DEFERRED_TO_APPLY
+_LAMBDA_IGNORE_OVERLAP = _LAMBDA_LOUD_FAIL_ALLOWLIST & _LAMBDA_DEFERRED_TO_APPLY
+if _LAMBDA_IGNORE_OVERLAP:
+    raise RuntimeError(
+        f"`lambda-*` ignore policy sets overlap: {sorted(_LAMBDA_IGNORE_OVERLAP)}. "
+        "Keep `_LAMBDA_LOUD_FAIL_ALLOWLIST` and `_LAMBDA_DEFERRED_TO_APPLY` "
+        "disjoint; their lifecycles differ."
+    )
+
+
+def _terraform_modules_with_depends_on() -> set[str]:
+    """Return prod-promote module blocks with module-wide depends_on."""
+    # Lightweight HCL scan: assumes balanced braces inside module blocks; after
+    # large module edits, re-validate or replace this with hcl2json/HCL parsing.
+    modules: set[str] = set()
+    for path in _TERRAFORM_MODULE_SCAN_PATHS:
+        text = path.read_text()
+        for match in re.finditer(r'(?m)^module\s+"([^"]+)"\s*\{', text):
+            depth = 1
+            pos = match.end()
+            while pos < len(text) and depth:
+                if text[pos] == "{":
+                    depth += 1
+                elif text[pos] == "}":
+                    depth -= 1
+                pos += 1
+            block = text[match.end() : pos - 1]
+            if re.search(r"(?m)^\s*depends_on\s*=", block):
+                modules.add(match.group(1))
+    return modules
+
+
+def _terraform_module_from_artifact_path(path: str) -> str | None:
+    prefix = "terraform/modules/"
+    if not path.startswith(prefix):
+        return None
+    # Assumes dir slug matches a scanned module block; shared-zip sibling
+    # module instances need explicit mapping if their depends_on status drifts.
+    # Root-level archive_files return None and require manual/runbook audit.
+    module_slug = path[len(prefix) :].split("/", 1)[0]
+    return module_slug.replace("-", "_")
+
+
 def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
     """Loud-fail policy: non-optional uploads use `error`; allowlisted
     downloads use `continue-on-error: true`.
@@ -1441,14 +1508,19 @@ def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
 
     The download half (paired): if a Lambda IS allowlisted (i.e. its
     upload uses `if-no-files-found: ignore`), the matching download
-    must use `continue-on-error: true` so the toggle-off case
-    proceeds cleanly. Without this assertion a future contributor
-    could allowlist the upload, forget the matching download flag,
-    and hard-fail prod when the toggle goes off — exactly the
-    asymmetry this assertion fences.
+    must use `continue-on-error: true` so the missing-zip case
+    (toggle-off for the deprecated allowlist; deferred read-at-apply
+    for `_LAMBDA_DEFERRED_TO_APPLY`) proceeds cleanly. Without this
+    assertion a future contributor could allowlist the upload, forget
+    the matching download flag, and hard-fail prod when no zip arrives.
 
-    Single allowlist (`_LAMBDA_LOUD_FAIL_ALLOWLIST`) drives both
-    halves so they stay in lockstep.
+    Two sets drive the policy via `_LAMBDA_IGNORE_OK`: the deprecated
+    `_LAMBDA_LOUD_FAIL_ALLOWLIST` (toggle-off escape hatch, shrinking to
+    empty per #1383) and `_LAMBDA_DEFERRED_TO_APPLY` (module-wide-depends_on
+    Lambdas whose archive_file defers to apply; #2284). A name in either set
+    must use `ignore` upload + `continue-on-error: true` download; every other
+    `lambda-*` upload stays `error`. Both halves read the union so they stay
+    in lockstep.
     """
     plan_steps = (jobs.get("terraform-plan") or {}).get("steps") or []
     apply_steps = (jobs.get("terraform-apply") or {}).get("steps") or []
@@ -1459,17 +1531,84 @@ def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
     # assertion-grep semantics stay clean — every `ok` line should be
     # an asserted invariant per the REPORTING CONVENTION docstring.
     _info(
-        f"loud-fail allowlist (current entries): "
+        f"loud-fail allowlist (deprecated, →empty per #1383): "
         f"{sorted(_LAMBDA_LOUD_FAIL_ALLOWLIST)}"
     )
+    _info(
+        f"deferred-to-apply set (module-wide depends_on, #2284): "
+        f"{sorted(_LAMBDA_DEFERRED_TO_APPLY)}"
+    )
 
-    # Upload half:
-    #   - non-allowlisted uploads must be `error`
-    #   - allowlisted uploads must be `ignore` (the runbook documents the
-    #     pair as `ignore` + `continue-on-error: true`; if a future
-    #     change kept the name on the allowlist but flipped the upload
-    #     to `error`, the workflow still works — `error` is stricter —
-    #     but the convention would silently drift)
+    module_wide_depends_on = _terraform_modules_with_depends_on()
+    lambda_upload_paths: dict[str, str] = {}
+    for step in plan_steps:
+        if not str(step.get("uses", "")).startswith("actions/upload-artifact@"):
+            continue
+        with_block = step.get("with") or {}
+        name = with_block.get("name", "")
+        path = with_block.get("path", "")
+        if isinstance(name, str) and name.startswith(_LAMBDA_ARTIFACT_PREFIX):
+            lambda_upload_paths[name] = str(path)
+
+    missing_deferred_uploads = sorted(_LAMBDA_DEFERRED_TO_APPLY - set(lambda_upload_paths))
+    _check(
+        "`_LAMBDA_DEFERRED_TO_APPLY` entries have real `lambda-*` upload steps",
+        not missing_deferred_uploads,
+        "\n".join(f"  - `{name}` is not uploaded in terraform-plan" for name in missing_deferred_uploads),
+    )
+    if missing_deferred_uploads:
+        failures.append(
+            f"`_LAMBDA_DEFERRED_TO_APPLY` includes missing upload(s): "
+            f"{missing_deferred_uploads}"
+        )
+
+    deferred_without_module_depends_on = sorted(
+        (name, module)
+        for name, module in _LAMBDA_DEFERRED_MODULES.items()
+        if module not in module_wide_depends_on
+    )
+    deferred_without_module_detail = "\n".join(
+        f"  - `{name}` maps to module `{module}`, which has no module-wide depends_on"
+        for name, module in deferred_without_module_depends_on
+    )
+    _check(
+        "`_LAMBDA_DEFERRED_TO_APPLY` entries map to module-wide depends_on modules",
+        not deferred_without_module_depends_on,
+        deferred_without_module_detail,
+    )
+    if deferred_without_module_depends_on:
+        failures.append(
+            "`_LAMBDA_DEFERRED_TO_APPLY` entry maps to a module without "
+            f"module-wide depends_on: {deferred_without_module_depends_on}"
+        )
+
+    strict_uploads_in_deferred_modules = sorted(
+        (name, module)
+        for name, path in lambda_upload_paths.items()
+        if (
+            (module := _terraform_module_from_artifact_path(path)) in module_wide_depends_on
+            and name not in _LAMBDA_IGNORE_OK
+        )
+    )
+    strict_deferred_detail = "\n".join(
+        f"  - `{name}` is in module `{module}`, which has module-wide depends_on"
+        for name, module in strict_uploads_in_deferred_modules
+    )
+    _check(
+        "module-wide depends_on Lambda uploads are in an `ignore` policy set",
+        not strict_uploads_in_deferred_modules,
+        strict_deferred_detail,
+    )
+    if strict_uploads_in_deferred_modules:
+        failures.append(
+            "module-wide depends_on Lambda upload(s) are still strict-error: "
+            f"{strict_uploads_in_deferred_modules}"
+        )
+
+    # Upload half — the allowlisted-must-be-`ignore` rule (the
+    # non-allowlisted rule is in the docstring). A future `error` on
+    # an allowlisted name still works (stricter) but silently drifts
+    # from the runbook's `ignore` + `continue-on-error: true` pairing.
     drifted_uploads: list[tuple[str, str]] = []
     for step in plan_steps:
         if not str(step.get("uses", "")).startswith("actions/upload-artifact@"):
@@ -1490,18 +1629,16 @@ def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
             if isinstance(if_no_files_raw, str)
             else str(if_no_files_raw)
         )
-        expected = "ignore" if name in _LAMBDA_LOUD_FAIL_ALLOWLIST else "error"
+        expected = "ignore" if name in _LAMBDA_IGNORE_OK else "error"
         if if_no_files != expected:
             drifted_uploads.append((name, str(if_no_files_raw)))
     drifted_uploads.sort()
 
-    # Download half:
-    #   - allowlisted downloads must have `continue-on-error: true`
-    #     (paired with the upload's `if-no-files-found: ignore`)
-    #   - non-allowlisted downloads must NOT have `continue-on-error:
-    #     true` (it would silently swallow the very loud-fail this
-    #     policy establishes; a future copy-paste from the lone
-    #     allowlisted block would be the most likely way to hit this)
+    # Download half — the non-allowlisted-must-NOT-have-`continue-
+    # on-error: true` rule (the allowlisted rule is in the docstring).
+    # A stray `continue-on-error: true` would silently swallow the
+    # loud-fail; likely failure mode: copy-paste from an `ignore`
+    # allowlisted block.
     drifted_downloads_missing_coe: list[str] = []
     drifted_downloads_extra_coe: list[str] = []
     for step in apply_steps:
@@ -1527,7 +1664,7 @@ def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
             )
         coe_raw = step.get("continue-on-error")
         coe_set = coe_raw is True or (isinstance(coe_raw, str) and coe_raw.lower() == "true")
-        if name in _LAMBDA_LOUD_FAIL_ALLOWLIST:
+        if name in _LAMBDA_IGNORE_OK:
             if not coe_set:
                 drifted_downloads_missing_coe.append(name)
         else:
@@ -1538,7 +1675,7 @@ def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
 
     upload_detail = "\n".join(
         f"  - `{name}` has `if-no-files-found: {value}` (expected "
-        f"`{'ignore' if name in _LAMBDA_LOUD_FAIL_ALLOWLIST else 'error'}`)"
+        f"`{'ignore' if name in _LAMBDA_IGNORE_OK else 'error'}`)"
         for name, value in drifted_uploads
     )
     _check(
@@ -1550,8 +1687,8 @@ def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
     if drifted_uploads:
         failures.append(
             f"`lambda-*` upload(s) drifted from the loud-fail policy: "
-            f"{[name for name, _ in drifted_uploads]} (allowlist: "
-            f"{sorted(_LAMBDA_LOUD_FAIL_ALLOWLIST)})"
+            f"{[name for name, _ in drifted_uploads]} (ignore-ok set: "
+            f"{sorted(_LAMBDA_IGNORE_OK)})"
         )
 
     download_detail_missing = "\n".join(
@@ -1569,7 +1706,7 @@ def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
             f"`continue-on-error: true`: {drifted_downloads_missing_coe} — "
             f"the upload-side `if-no-files-found: ignore` and the "
             f"download-side `continue-on-error: true` must stay paired "
-            f"so the toggle-off case proceeds cleanly"
+            f"so the missing-zip case proceeds cleanly"
         )
 
     download_detail_extra = "\n".join(
@@ -1586,8 +1723,8 @@ def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
             f"non-allowlisted `lambda-*` download(s) have "
             f"`continue-on-error: true`: {drifted_downloads_extra_coe} — "
             f"this silently swallows the very loud-fail the policy "
-            f"establishes (most likely a copy-paste from the lone "
-            f"allowlisted block)"
+            f"establishes (most likely a copy-paste from an "
+            f"`ignore` allowlisted block)"
         )
 
 
@@ -2618,8 +2755,8 @@ _BAD_FIXTURE_LAMBDA_LOUD_FAIL_NON_ALLOWLISTED_COE = textwrap.dedent(
           # Bug: a non-allowlisted `lambda-*` download with
           # `continue-on-error: true`. The upload uses `error` (correct)
           # but the download silently swallows any failure — defeating
-          # the loud-fail intent. Most likely a copy-paste from the
-          # lone allowlisted custom-domain-cert block.
+          # the loud-fail intent. Most likely a copy-paste from an
+          # `ignore` allowlisted block.
           - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
             continue-on-error: true
             with:
@@ -3062,6 +3199,15 @@ def main() -> int:
         "self-test: _assert_sns_row_widths handles the boundary correctly",
         _assert_sns_row_widths_boundary(),
         "boundary check accepted >width or rejected exactly-at-width",
+    ):
+        return 1
+
+    scan_roots = {path.relative_to(REPO_ROOT).as_posix() for path in _TERRAFORM_MODULE_SCAN_PATHS}
+    required_scan_roots = {"terraform/main.tf", "terraform/environments/prod/main.tf"}
+    if not _check(
+        "self-test: module-wide depends_on scan covers root and prod env modules",
+        required_scan_roots <= scan_roots,
+        f"scan roots: {sorted(scan_roots)}",
     ):
         return 1
 

@@ -1765,14 +1765,10 @@ jobs:
           path: terraform/environments/prod/tfplan.json
           retention-days: 1
 
-      # All non-optional `lambda-*` uploads use `if-no-files-found: error`
-      # so a missing zip fails at plan-time rather than 30 min later when
-      # terraform-apply tries to read the file. The lone `ignore`
-      # exception (`lambda-custom-domain-cert`, kept as a future toggle-
-      # off escape hatch) is placed at the end so strict-error uploads
-      # stay contiguous. See docs/runbooks/promote-to-prod-lambda-
-      # artifacts.md for the policy + per-step comment-density
-      # conventions.
+      # `lambda-*` upload policy: `error` by default; `ignore` only for
+      # the deferred-to-apply set plus deprecated custom-domain-cert.
+      # Full policy/class membership: docs/runbooks/promote-to-prod-lambda-
+      # artifacts.md and tests/scripts/test_promote_to_prod_gating.py.
       # Module-level toggle: `var.centralized_cert_enabled`.
       - name: Upload acme-cert Lambda
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1791,14 +1787,15 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      # Module-level toggle: `var.deploy_developer_portal`.
+      # Deferred-to-apply: module "developer_portal" has a module-wide
+      # depends_on. #2284.
       - name: Upload playground proxy Lambda
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-playground-proxy
           path: terraform/modules/developer-portal/lambda/playground_proxy.zip
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: ignore
 
       # Conditional toggle chain: `var.enable_stale_finding_watchdog &&
       # var.enable_guardduty && (alerts || email_alerts)`. Silent
@@ -1812,22 +1809,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      # ---------------------------------------------------------------------
-      # Lambda zips materialized at plan time by `data "archive_file"` in
-      # prod-deployed modules. Each one needs an upload here AND a paired
-      # download in the terraform-apply job below — apply runs on a fresh
-      # runner without the zip on disk, and `aws_lambda_function.filename`
-      # opens the zip directly when terraform creates or updates the
-      # function. (terraform reads `output_base64sha256` regardless to
-      # decide whether anything changed, but only opens the zip on
-      # create/update — which is why the gap stayed silent until #1326:
-      # unchanged Lambdas don't trip the open.) The structural-symmetry
-      # assertion in tests/scripts/test_promote_to_prod_gating.py fences
-      # the upload↔download pairing; the runbook documents the invariant.
-      # ---------------------------------------------------------------------
-
-      # Module-level toggle: `var.deploy_ac` (count=0 → archive_file
-      # unevaluated → no zip on disk). `if:` matches the toggle.
+      # Deferred-to-apply: module "ac" has a module-wide depends_on. #2284.
+      # `if:` still gates the toggle-off case (a deploy_ac=false plan shows
+      # full AC teardown — caught at the prod approval gate).
       - name: Upload AC keygen Lambda
         if: inputs.deploy_ac
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1835,14 +1819,10 @@ jobs:
           name: lambda-ac-keygen
           path: terraform/modules/ac/keygen_lambda.zip
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: ignore
 
-      # Toggle chain: BOTH `var.deploy_ac` (transitive) AND
-      # `var.enable_secret_reconciliation` (direct on archive_file)
-      # must be true for the zip to materialize. `if:` gates only on
-      # the outer toggle; `enable_secret_reconciliation=false` while
-      # `deploy_ac=true` would still hit the same upload failure
-      # (latent — prod has both true today).
+      # Deferred-to-apply: same module "ac" depends_on. #2284.
+      # Additionally gated by `var.enable_secret_reconciliation`.
       - name: Upload AC secret reconciliation Lambda
         if: inputs.deploy_ac
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1850,39 +1830,40 @@ jobs:
           name: lambda-ac-secret-reconciliation
           path: terraform/modules/ac/lambda/ac_secret_reconciliation.zip
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: ignore
 
-      # Always-on (no toggle): `module "compute"` and the archive_file
-      # are unconditional. See terraform/modules/compute/main.tf.
+      # Deferred-to-apply: module "compute" has a module-wide depends_on. #2284.
+      # Always-on, so any missing plan-time zip is the deferral case.
       - name: Upload compute keygen Lambda
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-compute-keygen
           path: terraform/modules/compute/keygen_lambda.zip
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: ignore
 
-      # Conditional toggle: `var.enable_termination_cleanup`.
+      # Deferred-to-apply: same module "compute" depends_on. #2284.
+      # Additionally gated by `var.enable_termination_cleanup`.
       - name: Upload compute termination cleanup Lambda
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-compute-termination-cleanup
           path: terraform/modules/compute/lambda/server_termination_cleanup.zip
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: ignore
 
-      # Module-level toggle: `var.deploy_developer_portal`.
+      # Deferred-to-apply: same module "developer_portal" depends_on as
+      # the playground-proxy upload above. #2284.
       - name: Upload developer portal auth0 cleanup Lambda
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-developer-portal-auth0-cleanup
           path: terraform/modules/developer-portal/lambda/auth0_cleanup.zip
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: ignore
 
-      # Always-on (no toggle): `module "nhp_keypair"` and the
-      # archive_file are unconditional. See
-      # terraform/modules/nhp-keypair/main.tf.
+      # Always-on (no toggle): `module "nhp_keypair"` has no module-wide
+      # depends_on, so the archive_file materializes at plan time.
       - name: Upload nhp-keypair keygen Lambda
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1915,11 +1896,11 @@ jobs:
           if-no-files-found: error
 
       # Feature-gated by `var.deploy_custom_domain_cert` (currently true
-      # in prod). The ignore + `continue-on-error: true` pattern is the
-      # toggle-off escape hatch and is the documented exception to the
-      # loud-fail policy at the top of this block. See the runbook for
-      # the rationale and #1382 for the transient-failure masking
-      # trade-off it introduces.
+      # in prod). Deprecated `ignore` escape hatch (#1383) — distinct
+      # from the deferred-to-apply `ignore` class above; see the runbook's
+      # "Loud-fail vs deferred-to-apply" section. #1382 tracks the
+      # transient-failure masking trade-off `continue-on-error: true`
+      # introduces.
       - name: Upload custom domain cert Lambda
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -2175,6 +2156,7 @@ jobs:
 
       - name: Download playground proxy Lambda
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true # deferred-to-apply (#2284)
         with:
           name: lambda-playground-proxy
           path: terraform/modules/developer-portal/lambda
@@ -2185,14 +2167,11 @@ jobs:
           name: lambda-stale-finding-watchdog
           path: terraform/modules/security/lambda
 
-      # Paired downloads for the prod-deployed `archive_file` Lambdas
-      # uploaded above. Names + paths must stay in lockstep with the
-      # upload steps; the structural-symmetry test in
-      # tests/scripts/test_promote_to_prod_gating.py enforces it.
       # Mirrors the upload gate above (`inputs.deploy_ac`).
       - name: Download AC keygen Lambda
         if: inputs.deploy_ac
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true # deferred-to-apply (#2284)
         with:
           name: lambda-ac-keygen
           path: terraform/modules/ac
@@ -2200,30 +2179,30 @@ jobs:
       - name: Download AC secret reconciliation Lambda
         if: inputs.deploy_ac
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true # deferred-to-apply (#2284)
         with:
           name: lambda-ac-secret-reconciliation
           path: terraform/modules/ac/lambda
 
       - name: Download compute keygen Lambda
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true # deferred-to-apply (#2284)
         with:
           name: lambda-compute-keygen
           path: terraform/modules/compute
 
       - name: Download compute termination cleanup Lambda
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true # deferred-to-apply (#2284)
         with:
           name: lambda-compute-termination-cleanup
           path: terraform/modules/compute/lambda
 
-      # Shares the `terraform/modules/developer-portal/lambda` directory
-      # with `lambda-playground-proxy`'s download (above). The artifact
-      # contents are different filenames (auth0_cleanup.zip vs
-      # playground_proxy.zip), so they coexist on disk; don't "tidy
-      # up" by giving each its own subdirectory — that would break
-      # the `archive_file.output_path` reference in terraform.
+      # Shares `terraform/modules/developer-portal/lambda` with playground-
+      # proxy by design (see runbook's "Sibling Lambdas" callout).
       - name: Download developer portal auth0 cleanup Lambda
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true # deferred-to-apply (#2284)
         with:
           name: lambda-developer-portal-auth0-cleanup
           path: terraform/modules/developer-portal/lambda
@@ -2246,8 +2225,8 @@ jobs:
           name: lambda-cloudfront-cidr-drift
           path: terraform/lambda/.build
 
-      # `ignore` exception, mirroring the upload-side ordering — placed
-      # last so all strict-error downloads are contiguous.
+      # Deprecated `ignore` escape hatch (#1383), paired with upload-side
+      # `ignore`; #1382 tracks the `continue-on-error` masking trade-off.
       - name: Download custom domain cert Lambda
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
