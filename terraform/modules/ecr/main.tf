@@ -1490,6 +1490,12 @@ resource "aws_iam_policy" "terraform_apply_iam" {
           "wafv2:CreateWebACL",
           "wafv2:DeleteWebACL",
           "wafv2:UpdateWebACL",
+          # Associate/Disassociate are required to attach the WebACL to the
+          # bootstrap-alb ALB (regional resource). Create/Update/Delete alone
+          # don't cover the association — prod apply hit AccessDenied on
+          # wafv2:AssociateWebACL for bootstrap-alb-prod (run 26735323138).
+          "wafv2:AssociateWebACL",
+          "wafv2:DisassociateWebACL",
           "wafv2:PutLoggingConfiguration",
           "wafv2:DeleteLoggingConfiguration",
           "wafv2:TagResource",
