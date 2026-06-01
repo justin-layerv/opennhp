@@ -202,6 +202,24 @@ declare -A COMPONENT_MIN_HEALTHY=(
 )
 MIN_HEALTHY="${COMPONENT_MIN_HEALTHY[$COMPONENT]}"
 
+# Max wait iterations for wait-for-instance-refresh.sh (each sleeps 10s), per
+# component. Explicit per-component (like COMPONENT_MIN_HEALTHY above) rather
+# than the script's 60-iteration (600s) default: the reverse-tunnel-server
+# 3/3/3 fleet rolls one instance at a time at 50% min-healthy with a 180s
+# warmup, so a full refresh runs ~11 min — the 600s default timed out mid-roll
+# and false-failed deploy-qrts even though the refresh had succeeded (prod run
+# 26736875324). 150 (=1500s/25m) clears that with headroom, under deploy-qrts's
+# 30-min job timeout. server/ac deploy via canary in mature prod and only reach
+# this wait on a greenfield first-deploy fallback, where 600s holds — bump their
+# entry if a larger first-deploy fleet ever needs it. `set -u` makes a missing
+# key fail loud (caught by the component validation above).
+declare -A COMPONENT_REFRESH_MAX_ITERATIONS=(
+  ["server"]="60"
+  ["ac"]="60"
+  ["reverse-tunnel-server"]="150"
+)
+REFRESH_MAX_ITERATIONS="${COMPONENT_REFRESH_MAX_ITERATIONS[$COMPONENT]}"
+
 # Runtime guard: AWS computes MinHealthyPercentage against the ASG's *live*
 # DesiredCapacity at refresh time, not the >=2 the table assumes. If a fleet is
 # ever scaled to a single instance (manual debugging, a cost tfvar), no
@@ -245,9 +263,11 @@ REFRESH_ID=$(aws autoscaling start-instance-refresh \
 
 echo "Instance Refresh ID: $REFRESH_ID"
 
-# Wait for instance refresh to complete
+# Wait for instance refresh to complete. Arg 3 ("") is the optional health-check
+# command (unused here); arg 4 is the per-component max-iterations (see
+# COMPONENT_REFRESH_MAX_ITERATIONS above) — must be passed positionally after it.
 if [[ -x "$SCRIPT_DIR/wait-for-instance-refresh.sh" ]]; then
-  "$SCRIPT_DIR/wait-for-instance-refresh.sh" "$ASG_NAME" "$REFRESH_ID"
+  "$SCRIPT_DIR/wait-for-instance-refresh.sh" "$ASG_NAME" "$REFRESH_ID" "" "$REFRESH_MAX_ITERATIONS"
 else
   echo "WARNING: wait-for-instance-refresh.sh not found, refresh started but not monitored"
   echo "Check AWS console for refresh status: $REFRESH_ID"
