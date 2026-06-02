@@ -785,6 +785,58 @@ resource "auth0_client_grant" "slack_oauth_qurl_api" {
   scopes     = ["qurl:read", "qurl:write"]
 }
 
+# ── Passwordless email connection — qurl-bot-slack `/qurl setup` ──
+# The Slack bot's `/qurl setup <email>` flow redirects the workspace admin
+# to Auth0 `/authorize?connection=email&login_hint=<email>` so Auth0 emails
+# a one-time login code (the connection name must match the bot's
+# AUTH0_EMAIL_CONNECTION env var, which defaults to "email"). Without an
+# enabled `email` connection on this client Auth0 rejects /authorize with
+# `invalid_request: the connection is not enabled`, no code is sent, and the
+# bot's OAuth callback renders "authorization failed". The other connections
+# in this module (google/github) are scoped to the SPA dashboard client, so
+# the Slack client had no usable connection for the email flow.
+#
+# Gated on enable_slack_oauth_client (not manage_tenant_resources) so it
+# tracks the Slack client's lifecycle and is created in the same env that
+# owns the client. Delivery uses the tenant's existing SES email provider
+# (auth0_email_provider.ses). Client enablement is set via the separate
+# auth0_connection_clients resource below — mirroring the google/github
+# pattern — because a connection and its client-list must not both be
+# managed inline.
+resource "auth0_connection" "slack_email" {
+  count                = var.enable_slack_oauth_client ? 1 : 0
+  name                 = "email"
+  strategy             = "email"
+  is_domain_connection = false
+
+  options {
+    name                   = "email"
+    disable_signup         = false
+    brute_force_protection = true
+
+    # 6-digit code, 300s TTL — matches the bot copy ("valid for 5 minutes").
+    totp {
+      time_step = 300
+      length    = 6
+    }
+  }
+
+  # Passwordless email connections accumulate users (linked accounts); mirror
+  # the prevent_destroy posture of the social connections below. To remove,
+  # first drop it from state with `terraform state rm`.
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "auth0_connection_clients" "slack_email" {
+  count         = var.enable_slack_oauth_client ? 1 : 0
+  connection_id = auth0_connection.slack_email[0].id
+  enabled_clients = [
+    auth0_client.slack_oauth[0].id,
+  ]
+}
+
 # Mirrors the backend_service pattern at L274-309. Same Auth0 provider
 # limitation: if the management M2M lacks `read:client_keys`, the provider
 # returns an empty `client_secret` and the operator must one-time copy the
