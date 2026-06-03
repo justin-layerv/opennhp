@@ -826,6 +826,16 @@ resource "auth0_connection" "slack_email" {
   # first drop it from state with `terraform state rm`.
   lifecycle {
     prevent_destroy = true
+
+    # Auth0 accepts these passwordless-email options on create, but the
+    # Management API reads the existing sandbox connection back as
+    # name=null/brute_force_protection=false. Without update:connections_options
+    # on the CI Management API token, every later apply tries to patch that
+    # read-after-create drift and fails before unrelated infra changes can land.
+    ignore_changes = [
+      options[0].name,
+      options[0].brute_force_protection,
+    ]
   }
 }
 
