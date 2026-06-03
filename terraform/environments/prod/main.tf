@@ -139,12 +139,14 @@ module "nhp" {
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
 
   # QURL Link redirect page
-  deploy_qurl_link             = var.deploy_qurl_link
-  qurl_link_frontend_domain    = var.qurl_link_frontend_domain
-  qurl_link_hosted_zone_id     = var.qurl_link_hosted_zone_id
-  qurl_link_external_dns       = var.qurl_link_external_dns
-  qurl_link_enable_access_logs = var.qurl_link_enable_access_logs
-  enable_resolve_cloudfront    = var.enable_resolve_cloudfront
+  deploy_qurl_link                = var.deploy_qurl_link
+  qurl_link_frontend_domain       = var.qurl_link_frontend_domain
+  qurl_link_hosted_zone_id        = var.qurl_link_hosted_zone_id
+  qurl_link_external_dns          = var.qurl_link_external_dns
+  qurl_link_enable_access_logs    = var.qurl_link_enable_access_logs
+  enable_resolve_cloudfront       = var.enable_resolve_cloudfront
+  resolve_waf_ip_reputation_block = var.resolve_waf_ip_reputation_block
+  enable_resolve_waf_logging      = var.enable_resolve_waf_logging
 
   # QURL Router plugin
   qurl_router_enabled            = var.qurl_router_enabled

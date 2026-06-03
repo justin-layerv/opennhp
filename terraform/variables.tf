@@ -700,6 +700,40 @@ variable "enable_resolve_cloudfront" {
   default     = false
 }
 
+variable "resolve_waf_ip_reputation_block" {
+  description = <<-EOT
+    Whether the resolve CloudFront WAF's AWSManagedRulesAmazonIpReputationList
+    rule blocks (true) or only counts (false) matched requests.
+
+    Default false (count). The resolve endpoint is already token-gated — the app
+    returns an "Access Link Invalid" 403 for a missing/invalid token — so the
+    IP-reputation list's marginal protection here is low, while it false-positives
+    legitimate datacenter-origin traffic: the prod resolve->proxy smoke monitor,
+    VPN exit nodes, corporate egress proxies, and link-unfurl bots
+    (Slack/iMessage/Google). On 2026-06-02 AWS's reputation list began blocking
+    the prod smoke runner IP (57.151.136.166), turning the resolve->proxy canary
+    red with a CloudFront "Request blocked" 403. Counting (not blocking) keeps the
+    rule evaluated and labeled for visibility while WAF logging (enabled with the
+    resolve WebACL) records what it WOULD block. Flip back to true once log review
+    confirms the matched set is actually hostile. See the prod-rollout task ledger.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "enable_resolve_waf_logging" {
+  description = <<-EOT
+    Enable WAF request logging for the resolve CloudFront WebACL. Default true so
+    the IP-reputation rule (run in count mode) is observable. Mirrors
+    modules/security's enable_waf_logging toggle and lets an operator turn the
+    logs off without tearing down the resolve edge (enable_resolve_cloudfront).
+    The logging_filter already keeps only IP-reputation-labeled or BLOCKed
+    requests, so on-cost is bounded; this is the explicit off-switch.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "traefik_plugins" {
   description = <<-EOT
     Map of Traefik plugins to deploy.

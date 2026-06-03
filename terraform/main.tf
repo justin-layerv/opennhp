@@ -3523,8 +3523,22 @@ resource "aws_wafv2_web_acl" "qurl_resolve" {
     name     = "AWSManagedRulesAmazonIpReputationList"
     priority = 4
 
+    # Block vs. count is operator-controlled via var.resolve_waf_ip_reputation_block
+    # (default: count). Rationale and history live in that variable's description
+    # and the prod-rollout task ledger: this endpoint is token-gated, so the list
+    # mostly false-positives legitimate datacenter-origin traffic (CI smoke, VPN,
+    # proxies, link-unfurlers). Exactly one of count{}/none{} is set; none{} is the
+    # WAF "use the managed group's own action" (i.e., block) sentinel. Count vs.
+    # block is action-only — the managed group still costs the same 25 WCU either way.
     override_action {
-      none {}
+      dynamic "count" {
+        for_each = var.resolve_waf_ip_reputation_block ? [] : [1]
+        content {}
+      }
+      dynamic "none" {
+        for_each = var.resolve_waf_ip_reputation_block ? [1] : []
+        content {}
+      }
     }
 
     statement {
@@ -3548,6 +3562,88 @@ resource "aws_wafv2_web_acl" "qurl_resolve" {
   }
 
   tags = local.common_tags
+}
+
+# WAF logging for the resolve WebACL. On by default (var.enable_resolve_waf_logging)
+# whenever the WebACL exists so the IP-reputation rule (now in count mode by
+# default) is observable: we log what it WOULD block to decide its permanent fate
+# from real client-IP patterns. Must live in us-east-1 alongside the
+# CLOUDFRONT-scoped WebACL. Mirrors the WAF logging pattern in modules/security;
+# the "aws-waf-logs-" name prefix is what authorizes WAF delivery to CloudWatch
+# Logs (no explicit resource policy).
+#
+# The access token rides in the query string (?token=at_...) — a live credential
+# — so the query string is redacted from logs. With it redacted, the remaining
+# fields (client IP, URI path, rule labels) carry no secret material.
+#
+# kms_key_id is intentionally omitted: module.kms is main-region only (its key
+# cannot encrypt a us-east-1 log group) and this stack has no us-east-1
+# customer-managed logs key. CloudWatch default at-rest encryption applies; with
+# the token redacted there is nothing sensitive to protect. A us-east-1 CMK can
+# follow if policy requires it.
+resource "aws_cloudwatch_log_group" "qurl_resolve_waf" {
+  count             = local.deploy_qurl_resolve_waf_logging ? 1 : 0
+  provider          = aws.us_east_1
+  name              = "aws-waf-logs-${local.name_prefix}-resolve"
+  retention_in_days = var.environment == "prod" ? 90 : 30
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-resolve-waf-logs"
+    Component = "qurl-resolve"
+  })
+}
+
+resource "aws_wafv2_web_acl_logging_configuration" "qurl_resolve" {
+  count                   = local.deploy_qurl_resolve_waf_logging ? 1 : 0
+  provider                = aws.us_east_1
+  log_destination_configs = [aws_cloudwatch_log_group.qurl_resolve_waf[0].arn]
+  resource_arn            = aws_wafv2_web_acl.qurl_resolve[0].arn
+
+  # Redact the token query arg (a live access credential) from logged requests.
+  # Only the query string is redacted — that's where the token rides today
+  # (GET /plugins/qurl?token=...). Request headers are otherwise logged verbatim;
+  # if the resolve edge ever starts receiving a sensitive header (Cookie /
+  # Authorization), add a `redacted_fields { single_header { name = ... } }` for it.
+  redacted_fields {
+    query_string {}
+  }
+
+  # Scope logs to the actionable set rather than every resolve request: keep
+  # requests the IP-reputation rule matched (now counted — exactly the decision
+  # set we are evaluating before deciding the rule's permanent fate) plus any
+  # request another rule actually BLOCKed. Everything else is dropped, so this
+  # public, scanner-exposed endpoint can't drive unbounded CloudWatch volume.
+  # NOTE: the managed group's label namespace is "amazon-ip-list" (per AWS docs),
+  # NOT "amazon-ip-reputation-list" — the latter silently matches nothing.
+  logging_filter {
+    default_behavior = "DROP"
+
+    filter {
+      behavior    = "KEEP"
+      requirement = "MEETS_ANY"
+
+      condition {
+        label_name_condition {
+          label_name = "awswaf:managed:aws:amazon-ip-list:AWSManagedIPReputationList"
+        }
+      }
+      condition {
+        label_name_condition {
+          label_name = "awswaf:managed:aws:amazon-ip-list:AWSManagedReconnaissanceList"
+        }
+      }
+      condition {
+        label_name_condition {
+          label_name = "awswaf:managed:aws:amazon-ip-list:AWSManagedIPDDoSList"
+        }
+      }
+      condition {
+        action_condition {
+          action = "BLOCK"
+        }
+      }
+    }
+  }
 }
 
 # CloudFront Distribution for resolve.qurl.link
@@ -3668,6 +3764,11 @@ locals {
   # its own broader gate per terraform/CLAUDE.md → "IAM eventual-
   # consistency shim pattern": OR of every consumer's condition.
   deploy_qurl_resolve_cf = var.deploy_qurl_link && var.enable_resolve_cloudfront
+
+  # Resolve WAF logging gates on its own toggle on top of the resolve-CF gate,
+  # so logs can be turned off without tearing down the edge (used by the resolve
+  # WAF log group + logging configuration).
+  deploy_qurl_resolve_waf_logging = local.deploy_qurl_resolve_cf && var.enable_resolve_waf_logging
 }
 
 # IAM eventual-consistency shim for the qurl_link_static CI policy.

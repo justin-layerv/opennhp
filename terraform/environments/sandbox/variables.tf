@@ -353,6 +353,18 @@ variable "enable_resolve_cloudfront" {
   default     = false
 }
 
+variable "resolve_waf_ip_reputation_block" {
+  description = "Block (true) vs. count (false) the resolve WAF's IP-reputation rule. See root module variable for rationale."
+  type        = bool
+  default     = false
+}
+
+variable "enable_resolve_waf_logging" {
+  description = "Enable WAF request logging for the resolve CloudFront WebACL. See root module variable for rationale."
+  type        = bool
+  default     = true
+}
+
 # QURL Service deployment
 variable "deploy_qurl_service" {
   description = "Deploy the QURL API service on ECS Fargate"

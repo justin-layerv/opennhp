@@ -205,6 +205,19 @@ qurl_link_external_dns    = false                  # DNS via route53_mgmt cross-
 # CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
 enable_resolve_cloudfront = true
 
+# Resolve WAF: run the Amazon IP-reputation rule in COUNT (observe, don't block).
+# Conscious prod posture, not a side effect of the module default: the endpoint
+# is token-gated and RateLimit/CommonRuleSet/KnownBadInputs stay enforcing, while
+# the IP-reputation list false-positives legitimate datacenter-origin traffic
+# (CI smoke, VPN, proxies, link-unfurlers). WAF logging captures what it would
+# block; flip to true to restore blocking. See docs/runbooks/prod-rollout-task-ledger.md.
+resolve_waf_ip_reputation_block = false
+
+# Keep resolve WAF logging on (explicit, matching the posture decision above) so
+# the count-mode IP-reputation rule stays observable. The logging_filter scopes
+# it to IP-reputation-matched + BLOCKed requests; set false only under log-cost pressure.
+enable_resolve_waf_logging = true
+
 # Traefik plugins (downloaded from S3 at boot time)
 # Plugin source files are uploaded by traefik-plugins repo CI to s3://layerv-nhp-prod-plugins/
 # Key names must match moduleName in traefik.toml for Traefik local plugin resolution

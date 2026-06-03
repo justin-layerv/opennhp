@@ -144,6 +144,72 @@ entry to Completed Entries only after `Status: Verified`.
 - Completed date:
 - Evidence:
 
+### 2026-06-02 - PR #2306 - Resolve WAF IP-reputation count + logging
+
+- Ledger PR: [#2306](https://github.com/layervai/nhp/pull/2306)
+- Source PR / issue: [PR #2306](https://github.com/layervai/nhp/pull/2306)
+- Component: `terraform`
+- Task owner: prod rollout coordinator
+- Rollout tasks:
+  - Promote with `run_terraform=true` so the resolve WebACL change applies in
+    prod. Validate in sandbox first (`build-and-push` applies the same shared
+    terraform).
+  - No deploy ordering or ASG refresh required for this change itself (WAF /
+    CloudFront config only). BUT `run_terraform=true` applies the **entire**
+    pending prod terraform diff (last-apply `c9db0f19` -> HEAD), not just the
+    WAF rule — at the time of writing that includes auth0 + ACME/custom-domain
+    cert-lambda drift. Prod is currently split-stated (`state=failed`, server/AC
+    binaries behind applied terraform); coordinate this apply with the broader
+    split-state recovery rather than treating it as an isolated WAF apply.
+  - Watch the first apply for a WAF→CloudWatch-Logs resource-policy size error.
+    Delivery to the new `aws-waf-logs-layerv-nhp-{prod,sandbox}-resolve` group is
+    authorized by a single AWS-managed CloudWatch Logs resource policy with a
+    5120-char cap, shared across all `aws-waf-logs-*` destinations in the
+    account/region. Almost certainly fine (few WAF→CW configs here), but if the
+    account is near the cap the logging-config apply fails with a policy-size
+    error — if so, consolidate/prune `aws-waf-logs-*` destinations or switch this
+    group's delivery to S3/Firehose.
+- Post-rollout tasks:
+  - Deterministic config proof (does not depend on which CI IP the runner
+    draws): `aws wafv2 get-web-acl` on the resolve WebACL and confirm the
+    `AWSManagedRulesAmazonIpReputationList` rule's `OverrideAction` is now
+    `Count`; `get-sampled-requests` on rule metric
+    `<env>-resolve-ip-reputation` should show matches as `action=COUNT` with the
+    request allowed overall.
+  - Supporting behavioral evidence: re-run the prod `QURL Smoke Tests (prod)`
+    job and confirm the resolve->proxy tests pass (`TestQURLEndToEndFlow`,
+    `TestMultiInstance_*`, `TestCustomDomain_EndToEnd_ResolveAndProxy`). Treat a
+    single green run as supporting only — the block is IP-dependent and GitHub
+    runner IPs are dynamic, so green proves the path works for that run, not that
+    the rule changed; the config proof above is authoritative.
+  - Confirm WAF logging is delivering to CloudWatch log group
+    `aws-waf-logs-layerv-nhp-prod-resolve` (us-east-1) and that logged requests
+    have the `token` query string redacted.
+  - Review the IP-reputation count labels in the logs to decide whether the rule
+    should return to Block (flip `resolve_waf_ip_reputation_block = true`) or be
+    narrowed. This disposition decision is tracked with an explicit owner +
+    deadline in [#2308](https://github.com/layervai/nhp/issues/2308) (assign the
+    WAF-posture owner; decide before the next prod release cut) so count-mode
+    does not silently become permanent-by-default. A surgical CI-runner-IP
+    allowlist was considered and rejected as the fix — GitHub-hosted runner
+    egress IPs are dynamic across large Azure ranges, so an allowlist is
+    impractical and high-maintenance.
+- Rollback tasks:
+  - Restore IP-reputation Block by setting
+    `resolve_waf_ip_reputation_block = true` (or reverting this PR) and applying;
+    no data migration or refresh involved.
+- Follow-ups / deferred tasks:
+  - [#2308](https://github.com/layervai/nhp/issues/2308) - decide the
+    IP-reputation rule's permanent fate (count vs. block) from log review.
+  - [#2307](https://github.com/layervai/nhp/issues/2307) - add Terraform
+    security scanning (tfsec/checkov) to CI; includes an inline-justified
+    suppression for this log group's deliberate us-east-1 KMS omission.
+  - Optional us-east-1 customer-managed KMS key for the resolve WAF log group
+    (currently CloudWatch default encryption; token is redacted).
+- Status: Open
+- Status note: Waiting for rollout (sandbox validation, then prod promote with
+  `run_terraform=true`).
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries
