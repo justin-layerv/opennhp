@@ -291,88 +291,126 @@ func TestResolve_CookiesHaveExpectedDomain(t *testing.T) {
 }
 
 // TestResolve_FollowsRedirectAndReachesProtectedResource is the
-// indirect proof that the AC ipset opened for the runner's IP
-// during the resolve. We mint a QURL pointing at example.com,
-// follow the redirect chain with a cookie jar, and assert the
-// final response body contains the target's content marker.
+// indirect proof that the AC ipset opened for the runner's IP during
+// the resolve. We mint a QURL pointing at example.com, resolve it to a
+// 302, then follow that redirect to r_{id}.qurl.site.* and assert the
+// proxied response reaches the target's content marker.
 //
 // If this test passes, the full flow works end-to-end:
 //
 //	(runner) → POST /plugins/qurl (token in body) → 302
 //	        → r_{id}.qurl.site.* (AC proxies) → target → 200 body
 //
-// A failure in this test with 02_docker_image_test and the health
-// tests passing indicates a knock-forwarding or ipset regression.
+// A failure with the health tests and the sibling resolve tests
+// passing indicates a knock-forwarding or ipset regression.
 //
-// Retries the full chain on transport errors and 5xx via a local
-// loop (resolveWithRetries doesn't apply here because we need the
-// follow-redirect client, not the no-redirect one). A single mint
-// is consumed per attempt — up to 4 QURLs may be created during
-// a flake window, each with a 60s TTL.
+// Two-phase structure (closes #1026, the retry-loop follow-up to
+// PR #1025):
+//
+//  1. resolveWithRetries gets the 302 on the no-redirect client. It is
+//     the single place that classifies the resolve server's own access
+//     decision: a 4xx on the direct /plugins/qurl response (e.g. 403
+//     token rejected) fails loud and non-retryable; a transport error
+//     or 5xx retries with a fresh mint. The decision is made on the
+//     single-hop response, never inferred from a redirect chain.
+//
+//  2. We then follow the 302 ourselves and treat the GET as pure
+//     reachability. A non-200 here is NOT the resolve server's access
+//     decision — it traverses qurl-service's router and the AC proxy.
+//     A freshly-minted resource's r_{id}.qurl.site route can briefly
+//     race propagation and 404 before it is ready (observed ~1/20
+//     locally), so we retry the GET (same session, no re-mint) within
+//     resolveRetryBudget instead of failing on the first blip. A
+//     persistent failure still fails once the budget exhausts.
+//
+// Each mint is a distinct resource (see uniqueSmokeTarget), so this
+// test never contends with the sibling resolve tests for a shared
+// per-resource max_sessions slot.
 func TestResolve_FollowsRedirectAndReachesProtectedResource(t *testing.T) {
 	ctx := context.Background()
 
+	// Phase 1: resolve to a 302. The access decision is made here, on
+	// the direct /plugins/qurl response — a bad token fails loud inside
+	// resolveWithRetries and never reaches phase 2.
+	resolveResp := resolveWithRetries(ctx, t, func() *QURLResponse {
+		return mintSmokeQURL(ctx, t, "https://example.com")
+	})
+	loc := resolveResp.Header.Get("Location")
+	if loc == "" {
+		t.Fatal("302 response has no Location header")
+	}
+	locURL, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse Location %q: %v", loc, err)
+	}
+
+	// Phase 2: follow the 302 to the protected resource. Seed a fresh
+	// cookie jar with the session cookies from the 302 (nhp_token /
+	// nhp_refresh_token, scoped to the qurl.site parent domain) so the
+	// AC's L7 authz gate honors the GET. Re-GETting with the established
+	// session needs no re-mint — the ipset stays open for the runner's
+	// IP and the session cookie is reusable.
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatalf("cookiejar: %v", err)
 	}
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     jar,
-	}
+	jar.SetCookies(locURL, resolveResp.Cookies())
+	client := &http.Client{Jar: jar}
 
-	// example.com's canonical body marker. If example.com ever
-	// changes its HTML, this test will need to pick a new marker
-	// or a new target URL.
-	marker := "Example Domain"
+	// example.com's canonical body marker (#1022: external dependency).
+	const marker = "Example Domain"
 
-	deadline := time.Now().Add(postFlipMaxWait)
+	deadline := time.Now().Add(resolveRetryBudget)
 	attempt := 0
 	var lastErr error
-
 	for {
 		attempt++
-		minted := mintSmokeQURL(ctx, t, "https://example.com")
 
-		reqURL := testConfig.NHPServerBaseURL + "/plugins/qurl"
-		formData := "token=" + url.QueryEscape(minted.AccessToken())
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(formData))
+		reqCtx, cancel := context.WithTimeout(ctx, resolvePerAttemptTimeout)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, locURL.String(), nil)
 		if err != nil {
-			t.Fatalf("build request: %v", err)
+			cancel()
+			t.Fatalf("build follow request: %v", err)
 		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
 		resp, err := client.Do(req)
 		if err != nil {
+			cancel()
 			lastErr = fmt.Errorf("attempt %d: transport error: %w", attempt, err)
-		} else if resp.StatusCode >= 500 {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("attempt %d: 5xx status %d", attempt, resp.StatusCode)
-		} else if resp.StatusCode != http.StatusOK {
-			// 4xx: real access decision, not a flake. Fail loud.
-			resp.Body.Close()
-			t.Fatalf("attempt %d: final status=%d, want 200 (non-retryable)", attempt, resp.StatusCode)
+			t.Logf("follow-redirect: %v", lastErr)
 		} else {
-			// 200: read body up to 64 KB and check for the marker.
-			// Using io.ReadAll(io.LimitReader(...)) is safer than
-			// a single Read() which may return fewer bytes than
-			// requested.
 			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 			resp.Body.Close()
-			if readErr != nil {
-				t.Fatalf("read resolved body: %v", readErr)
+			cancel()
+			switch {
+			case readErr != nil:
+				lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, readErr)
+				t.Logf("follow-redirect: %v", lastErr)
+			case resp.StatusCode == http.StatusOK && strings.Contains(string(body), marker):
+				if attempt > 1 {
+					t.Logf("follow-redirect: reached target on attempt %d", attempt)
+				}
+				return
+			case resp.StatusCode == http.StatusOK:
+				// Reached a 200 but not the proxied target — during
+				// propagation the AC can briefly serve a fallback /
+				// interstitial. Retry; persistent wrong content fails
+				// once the budget exhausts.
+				lastErr = fmt.Errorf("attempt %d: status 200 but body missing %q: %s",
+					attempt, marker, truncate(body, 200))
+				t.Logf("follow-redirect: %v", lastErr)
+			default:
+				// Non-200 from a downstream hop: the freshly-minted
+				// r_{id} route racing propagation (404) or a blue/green
+				// flip (5xx). Retryable — NOT the resolve server's
+				// access decision (that was settled in phase 1).
+				lastErr = fmt.Errorf("attempt %d: downstream status %d (retryable)", attempt, resp.StatusCode)
+				t.Logf("follow-redirect: %v", lastErr)
 			}
-			if !strings.Contains(string(body), marker) {
-				t.Fatalf("final body does not contain %q\nbody: %s", marker, truncate(body, 400))
-			}
-			if attempt > 1 {
-				t.Logf("TestResolve_FollowsRedirect: succeeded on attempt %d", attempt)
-			}
-			return
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("exhausted %s budget after %d attempts: %v", postFlipMaxWait, attempt, lastErr)
+			t.Fatalf("follow-redirect: exhausted %s budget after %d attempts: %v",
+				resolveRetryBudget, attempt, lastErr)
 		}
 		time.Sleep(postFlipPollInterval)
 	}

@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -34,6 +36,46 @@ type MintOptions struct {
 	Label     string // prefixed with "smoke-" by MintQURL
 	TargetURL string // where the QURL points once resolved
 	ExpiresIn string // duration string, e.g. "60s"; defaults to "60s"
+}
+
+// mintResourceNonce makes every smoke mint resolve to a DISTINCT
+// qurl-service resource. See uniqueSmokeTarget for the why.
+var mintResourceNonce atomic.Uint64
+
+// uniqueSmokeTarget appends a unique query nonce to a smoke target URL so
+// each mint creates its OWN qurl-service resource.
+//
+// qurl-service dedupes resources by (owner_id, NormalizeTargetURL(target)),
+// and NormalizeTargetURL keeps the query string (it only lowercases
+// scheme/host, drops the fragment, and trims a trailing slash). Without a
+// per-mint nonce, every "https://example.com" QURL minted under the single
+// smoke M2M owner collapses onto ONE resource that shares ONE per-resource
+// max_sessions counter. The first resolve takes the lone session slot; every
+// later token (a different token hash, so session reuse can't match) then
+// trips max_sessions_reached, which the NHP qurl plugin renders as a 403
+// "Access Link Invalid" — failing the resolve smoke tests in a way that
+// worsens as the suite runs. A unique resource per mint restores test
+// isolation and mirrors real usage (distinct customers/targets => distinct
+// resources, no shared cap).
+//
+// The nonce is a no-op for the resolved content: example.com returns the
+// same 200 "Example Domain" body regardless of query string. It MUST be a
+// query param, not a path — example.com 404s on an unknown path, which would
+// break the follow-redirect body assertion.
+//
+// UnixNano + a process-wide counter keeps it unique even for mints issued
+// within the same nanosecond (retry loops, parallel subtests). A malformed
+// or scheme-less target is returned untouched — such a target isn't
+// exercising the dedupe-prone resolve path.
+func uniqueSmokeTarget(rawTarget string) string {
+	u, err := url.Parse(rawTarget)
+	if err != nil || u.Scheme == "" {
+		return rawTarget
+	}
+	q := u.Query()
+	q.Set("nhp_smoke_nonce", fmt.Sprintf("%d-%d", time.Now().UnixNano(), mintResourceNonce.Add(1)))
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // QURLResponse holds the fields we care about from the QURL create
@@ -83,7 +125,7 @@ func MintQURL(ctx context.Context, t *testing.T, opts MintOptions) (*QURLRespons
 	}
 	body := map[string]interface{}{
 		"description":  "smoke-" + label + "-" + fmt.Sprintf("%d", time.Now().Unix()),
-		"target_url":   opts.TargetURL,
+		"target_url":   uniqueSmokeTarget(opts.TargetURL),
 		"expires_in":   opts.ExpiresIn,
 		"max_sessions": 1,
 	}
