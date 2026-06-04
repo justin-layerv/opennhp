@@ -3116,23 +3116,36 @@ func (s *UdpServer) ResolveOwnerIDByPubKey(ctx context.Context, pubKeyB64 string
 // today); nil is tolerated (falls back to context.Background, only
 // reachable in bare-struct test paths).
 func (s *UdpServer) ResolveAuthSvcProvider(ctx context.Context, aspId, logPrefix string) *common.AuthServiceProviderData {
+	aspData, _ := s.resolveAuthSvcProvider(ctx, aspId, logPrefix, MetricAuthFailure)
+	return aspData
+}
+
+// ResolveInternalKnockAuthSvcProvider mirrors ResolveAuthSvcProvider for
+// /nhp/internal/knock, but routes unknown aspId misses to an internal-knock
+// catalog metric instead of the UDP knock auth-failure metric. DDB/shutdown
+// attribution is intentionally shared with ResolveAuthSvcProvider.
+func (s *UdpServer) ResolveInternalKnockAuthSvcProvider(ctx context.Context, aspId, logPrefix string) (*common.AuthServiceProviderData, error) {
+	return s.resolveAuthSvcProvider(ctx, aspId, logPrefix, MetricInternalKnockASPNotFound)
+}
+
+func (s *UdpServer) resolveAuthSvcProvider(ctx context.Context, aspId, logPrefix, unknownASPMetric string) (*common.AuthServiceProviderData, error) {
 	if aspData := s.FindAuthSvcProvider(aspId); aspData != nil {
-		return aspData
+		return aspData, nil
 	}
 	if s.resourceLookup == nil {
 		// Non-cloud / lookup-disabled deployment AND aspId not in the
 		// TOML-loaded authServiceMap → genuine auth-policy outcome.
 		// Owned here so the attribution stays correct regardless of
 		// which code path reaches the nil-aspData reject.
-		s.metrics.IncrCounter(MetricAuthFailure)
-		return nil
+		s.metrics.IncrCounter(unknownASPMetric)
+		return nil, common.ErrAuthServiceProviderNotFound
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	resolved, lookupErr := s.resourceLookup.LookupAuthServiceProvider(ctx, aspId)
 	if lookupErr == nil {
-		return resolved
+		return resolved, nil
 	}
 	switch {
 	case errors.Is(lookupErr, context.Canceled) && ctx.Err() != nil:
@@ -3149,14 +3162,16 @@ func (s *UdpServer) ResolveAuthSvcProvider(ctx context.Context, aspId, logPrefix
 		// future operator triaging "why no DDB alarm during
 		// shutdown" finds the answer here.
 		log.Info("[%s] event=\"resource_lookup_shutdown\" aspId=%q (server stopping; no counter increment — suppresses DDB-error metric even for a concurrent throttle)", logPrefix, aspId)
+		return nil, ctx.Err()
 	case errors.Is(lookupErr, ErrResourceUnknownASP):
 		// Auth-policy outcome: aspId genuinely not registered.
-		s.metrics.IncrCounter(MetricAuthFailure)
+		s.metrics.IncrCounter(unknownASPMetric)
+		return nil, common.ErrAuthServiceProviderNotFound
 	default:
 		log.Error("[%s] resource lookup ddb error aspId=%q: %v", logPrefix, aspId, lookupErr)
 		s.metrics.IncrCounter(MetricResourceLookupDDBError)
+		return nil, fmt.Errorf("resource lookup ddb error: %w", lookupErr)
 	}
-	return nil
 }
 
 func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32) (artMsg *common.ACOpsResultMsg, err error) {

@@ -1227,15 +1227,11 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 	}
 
 	if len(res.Resources) == 0 {
-		// Load-bearing for TestInternalKnock_LegacyMode_NoSignerSet:
-		// the legacy-mode handler test passes a zero-value HttpServer{}
-		// (nil udpServer, nil storage), which means *any* deref past
-		// this early return would nil-panic. The test relies on this
-		// short-circuit to avoid wiring a full UdpServer mock just to
-		// fence the nil-signer code path. If a future refactor moves
-		// resource loading or any UdpServer access ABOVE this return,
-		// also update the legacy-mode test to plumb the dependency it
-		// now needs.
+		// Defensive catalog guard: callers that reach the open path
+		// with no concrete AC destinations should fail before any
+		// connection or pinhole work. Internal-knock requests resolve
+		// storage-backed resources before this point, so this catches
+		// malformed catalog entries and non-internal call paths.
 		err = common.ErrResourceNotFound
 		ackMsg.ErrCode = common.ErrResourceNotFound.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
@@ -1587,8 +1583,23 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 		return
 	}
 
-	if fwdReq.Request == nil || fwdReq.Resource == nil {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "missing request or resource"})
+	if fwdReq.Request == nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "missing request"})
+		return
+	}
+
+	resolvedResource, err := hs.resolveInternalKnockResource(ctx.Request.Context(), fwdReq.Request, fwdReq.Resource)
+	if err != nil {
+		switch {
+		case errors.Is(err, errInvalidInternalKnockRequest):
+			log.Warning("handleInternalKnock: invalid resource resolution request: %v", err)
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		case errors.Is(err, common.ErrAuthServiceProviderNotFound), errors.Is(err, common.ErrResourceNotFound):
+			ctx.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		default:
+			log.Error("handleInternalKnock: resource resolution failed: %v", err)
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "resource resolution failed"})
+		}
 		return
 	}
 
@@ -1608,7 +1619,7 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 	}
 	fwdReq.Request.Ctx = ctx.Request.Context()
 
-	ackMsg, err := hs.handleHttpOpenResource(fwdReq.Request, fwdReq.Resource)
+	ackMsg, err := hs.handleHttpOpenResource(fwdReq.Request, resolvedResource)
 	resp := HttpKnockForwardResponse{AckMsg: ackMsg}
 	if err != nil {
 		resp.Error = err.Error()

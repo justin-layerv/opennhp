@@ -210,6 +210,57 @@ entry to Completed Entries only after `Status: Verified`.
 - Status note: Waiting for rollout (sandbox validation, then prod promote with
   `run_terraform=true`).
 
+### 2026-06-03 - PR #2310 - Internal Knock Storage-Resolved Resources
+
+- Ledger PR: [#2310](https://github.com/layervai/nhp/pull/2310)
+- Source PR / issue: [PR #2310](https://github.com/layervai/nhp/pull/2310) /
+  [issue #1209](https://github.com/layervai/nhp/issues/1209)
+- Component: `server`, internal knock API
+- Task owner: prod rollout coordinator
+- Pre-rollout tasks:
+  - Confirm qurl-service companion PR
+    [layervai/qurl-service#821](https://github.com/layervai/qurl-service/pull/821)
+    remains draft or otherwise blocked from prod rollout until this NHP server
+    change is deployed.
+  - Confirm prod NHP server instances are already enforcing strict
+    `NHP_INTERNAL_AUTH_REQUIRE=true` before relying on storage-resolved
+    internal knocks.
+  - Confirm prod qurl-service still sends request-level `resId` before
+    NHP deploy. Evidence from qurl-service `origin/main` / PR #821:
+    `HTTPKnockRequest.ResourceID` is populated from `NHPResourceID`; the
+    `resource` body is not the lookup identity source.
+- Rollout tasks:
+  - Deploy this NHP server change before qurl-service PR
+    [#821](https://github.com/layervai/qurl-service/pull/821).
+  - After the NHP deploy is healthy, mark the qurl-service companion ready for
+    review/merge and include it in a later qurl-service rollout.
+- Post-rollout tasks:
+  - Before qurl-service PR #821 deploys, verify prod NHP health reports the
+    expected image tag for this PR's merge commit.
+  - After qurl-service PR #821 deploys, run a prod headless qURL resolve smoke
+    and confirm NHP internal knock success with no strict-auth failures.
+    Also confirm the returned/effective open window is the storage catalog
+    cap (120s in prod), not qurl-service's default 300s. Pre-merge prod
+    evidence: `layerv-nhp-prod-cell0-resources` has only
+    `qurl-tunnel-server-{a,b,c}` rows for the system customer and all three
+    rows have `open_time=120`; qurl-service task definition
+    `layerv-nhp-prod-cell0-qurl-api:46` has `QURL_DEFAULT_OPEN_TIME=300`.
+- Rollback tasks:
+  - If storage-resolved internal knocks fail before qurl-service PR #821
+    deploys, roll back this NHP server image.
+  - If failures appear only after qurl-service PR #821 deploys, roll back
+    qurl-service first to restore the previous body-supplied `resInfo` payload,
+    then evaluate whether this NHP server image also needs rollback.
+- Follow-ups / deferred tasks:
+  - [#1210](https://github.com/layervai/nhp/issues/1210) remains open for any
+    independent-trust-root SrcIp attestation design; do not close it with a
+    duplicate same-key request signature.
+- Status: Open
+- Status note: waiting for NHP rollout first, then qurl-service companion
+  rollout and smoke evidence.
+- Completed date:
+- Evidence:
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries

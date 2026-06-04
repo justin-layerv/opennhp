@@ -26,11 +26,10 @@ import (
 //   permit mode (signer set, require=false)   → warn + allow through
 //   strict mode (signer set, require=true)    → reject unsigned with 401
 //
-// The "allow through" rows still short-circuit inside the handler
-// before reaching handleHttpOpenResource — the router uses a zero-
-// value HttpServer, so a body that tries to open a resource would
-// nil-panic. That's deliberate: it surfaces a regression where the
-// gate silently accepts something and calls downstream code.
+// The "allow through" rows still stop before opening an AC pinhole —
+// the router uses a zero-value HttpServer, so successful auth reaches
+// server-owned resource resolution and returns 500 because the test fixture
+// intentionally has no UdpServer.
 
 const (
 	testInternalKnockSecret = "test-secret-for-internal-knock-auth-tests"
@@ -43,7 +42,7 @@ const (
 // internalKnockTestBody mirrors emptyKnockBody in the fuzz test.
 // Keeping it separate (private to this file) lets the auth tests evolve
 // without coupling to the fuzz seed format.
-const internalKnockTestBody = `{"request":{},"resource":{}}`
+const internalKnockTestBody = `{"request":{"aspId":"qurl","resId":"nhp-resource","srcIp":"203.0.113.25"},"resource":{"aspId":"qurl","resId":"nhp-resource"}}`
 
 // newAuthTestRouter builds a Gin router with a signer-configured
 // HttpServer. require toggles strict vs permit mode.
@@ -118,15 +117,14 @@ func TestInternalKnock_StrictMode_RejectsUnsigned(t *testing.T) {
 
 // TestInternalKnock_StrictMode_AcceptsValidSignature pins the happy
 // path: a correctly signed request passes the gate and the handler
-// proceeds to downstream resource resolution. Downstream returns a
-// structured ack_msg with errCode!=success because no real resource
-// is wired in this zero-value test setup — that body shape is the
-// positive signal "auth accepted; downstream code path executed".
+// proceeds to downstream resource resolution. The zero-value test
+// server has no UdpServer, so the post-auth resource resolver returns
+// 500. That body shape is the positive signal "auth accepted; the
+// resolver path executed and refused an uninitialized server."
 //
 // Asserting only "not 401" would silently weaken if a future refactor
 // short-circuited downstream entirely: the test would still pass on
-// any non-401 response. Asserting on the ack_msg body shape requires
-// the downstream code path to actually run.
+// any non-401 response.
 func TestInternalKnock_StrictMode_AcceptsValidSignature(t *testing.T) {
 	r, signer := newAuthTestRouter(t, true)
 	body := internalKnockTestBody
@@ -136,12 +134,11 @@ func TestInternalKnock_StrictMode_AcceptsValidSignature(t *testing.T) {
 	if rec.Code == http.StatusUnauthorized {
 		t.Fatalf("valid signature rejected with 401: %s", rec.Body.String())
 	}
-	// Positive signal: response carries the ack_msg envelope that only
-	// the downstream code path (handleHttpOpenResource → HttpKnockForwardResponse)
-	// produces. If the auth layer ever short-circuited with 200 (silent
-	// no-op), this body would be empty / different and the test fails.
-	if !strings.Contains(rec.Body.String(), `"ack_msg"`) {
-		t.Errorf("downstream code path didn't run — response missing ack_msg envelope: %s", rec.Body.String())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("valid signature code = %d, want 500 from resource resolver. body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "resource resolution failed") {
+		t.Errorf("resource resolver did not run: %s", rec.Body.String())
 	}
 }
 
@@ -191,8 +188,11 @@ func TestInternalKnock_PermitMode_AllowsUnsigned(t *testing.T) {
 	if rec.Code == http.StatusUnauthorized {
 		t.Fatalf("permit-mode rejected unsigned request: body=%s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"ack_msg"`) {
-		t.Errorf("downstream code path didn't run — response missing ack_msg envelope: %s", rec.Body.String())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("permit-mode unsigned code = %d, want 500 from resource resolver. body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "resource resolution failed") {
+		t.Errorf("resource resolver did not run: %s", rec.Body.String())
 	}
 	if counts[MetricInternalAuthFailPermit] != 1 {
 		t.Errorf("MetricInternalAuthFailPermit = %d, want 1", counts[MetricInternalAuthFailPermit])
@@ -224,8 +224,11 @@ func TestInternalKnock_PermitMode_AllowsTamperedSignature(t *testing.T) {
 	if rec.Code == http.StatusUnauthorized {
 		t.Fatalf("permit-mode rejected tampered-sig request: body=%s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"ack_msg"`) {
-		t.Errorf("permit-mode with bad sig didn't reach downstream: %s", rec.Body.String())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("permit-mode bad-sig code = %d, want 500 from resource resolver. body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "resource resolution failed") {
+		t.Errorf("permit-mode with bad sig did not reach resource resolver: %s", rec.Body.String())
 	}
 	if counts[MetricInternalAuthFailPermit] != 1 {
 		t.Errorf("MetricInternalAuthFailPermit = %d, want 1", counts[MetricInternalAuthFailPermit])
@@ -274,19 +277,14 @@ func TestInternalKnock_IncrementsSuccess(t *testing.T) {
 // before — no auth layer, RFC-1918 gate only. The pre-fix code
 // passed unsigned requests straight through to downstream; this test
 // pins both halves: not-401 (no accidental enforcement) and the
-// downstream ack_msg envelope (positive "reached downstream" signal).
+// downstream resource-resolution 500 (positive "reached downstream" signal).
 //
 // Test design: zero-value HttpServer{} (nil udpServer) is
-// deliberate. The current handleHttpOpenResource path exits on
-// len(res.Resources) == 0 BEFORE any udpServer deref, so the test
-// body (which omits Resources) short-circuits at that early return
-// with an ack_msg carrying ErrResourceNotFound. A future refactor
-// that moves a udpServer.* call before the early return would
-// nil-panic here, which is the signal we want — this test also
-// serves as a regression fence on "nothing downstream may access
-// udpServer before the resource-lookup gate." If that invariant
-// changes, either restructure the handler or plumb a stub
-// udpServer; don't just add a nil-check that hides the coupling.
+// deliberate. The current post-auth path resolves ResourceData from
+// the server-owned catalog before handleHttpOpenResource can dispatch
+// AC operations, so the zero-value fixture returns
+// an internal server-not-ready error instead of trusting caller-supplied
+// ResourceData.
 func TestInternalKnock_LegacyMode_NoSignerSet(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	hs := &HttpServer{} // no signer
@@ -299,8 +297,11 @@ func TestInternalKnock_LegacyMode_NoSignerSet(t *testing.T) {
 	if rec.Code == http.StatusUnauthorized {
 		t.Fatalf("legacy mode emitted 401 (gate regressed on): body=%s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"ack_msg"`) {
-		t.Errorf("legacy mode didn't reach downstream — response missing ack_msg envelope: %s", rec.Body.String())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("legacy mode code = %d, want 500 from resource resolver. body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "resource resolution failed") {
+		t.Errorf("legacy mode did not reach resource resolver: %s", rec.Body.String())
 	}
 }
 

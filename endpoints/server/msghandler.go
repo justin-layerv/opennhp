@@ -172,6 +172,12 @@ const (
 	// Watching Success rise while FailPermit drops is the positive
 	// signal operators need before flipping NHP_INTERNAL_AUTH_REQUIRE=true.
 	MetricInternalAuthSuccess = "InternalAuthSuccess"
+	// MetricInternalKnockASPNotFound fires when an authenticated
+	// /nhp/internal/knock request reaches catalog resolution but the
+	// requested aspId is absent. Kept separate from MetricAuthFailure
+	// so internal service-to-service catalog misses do not page the
+	// UDP knock auth-policy alarm.
+	MetricInternalKnockASPNotFound = "InternalKnockASPNotFound"
 	// MetricInternalTokenValidateBadNonce fires when an authenticated
 	// /nhp/internal/token/validate caller opts in to response auth with
 	// a malformed X-Nhp-Nonce. It is deliberately separate from the
@@ -556,6 +562,13 @@ const (
 	// shape as MetricAgentLookupDDBError — all N piggybackers receive
 	// the same wrapped error and each increments.
 	MetricResourceLookupDDBError = "ResourceLookupDDBError"
+
+	// MetricInternalKnockResourceNotFound fires when an authenticated
+	// /nhp/internal/knock request reaches an ASP catalog but the
+	// requested resourceId is absent. The HTTP response stays opaque
+	// ("not found") to avoid an enumeration oracle; this counter gives
+	// operators the missing-resource signal without widening the wire body.
+	MetricInternalKnockResourceNotFound = "InternalKnockResourceNotFound"
 
 	// MetricResourceLookupMalformedRow fires once per row that the
 	// resolver had to skip during a cache-miss iteration. The counter

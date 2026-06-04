@@ -19,6 +19,26 @@ import (
 func newForwardingTestServer(storage StorageBackend) *HttpServer {
 	udpSrv := &UdpServer{
 		acConnectionMap: make(map[string][]*ACConn),
+		authServiceMap: common.AuthSvcProviderMap{
+			"qurl": {
+				AuthSvcId: "qurl",
+				ResourceGroups: common.ResourceGroupMap{
+					"r_test": {
+						ResourceGroup: common.ResourceGroup{
+							AuthServiceId: "qurl",
+							ResourceId:    "r_test",
+							OpenTime:      77,
+							Resources: map[string]*common.ResourceInfo{
+								"default": {
+									ACId: "test-ac",
+									Addr: &common.NetAddress{Ip: "10.0.2.100", Port: 443},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 		// metrics is nil — Publisher.IncrCounter is nil-safe
 	}
 	hs := &HttpServer{
@@ -28,8 +48,8 @@ func newForwardingTestServer(storage StorageBackend) *HttpServer {
 	return hs
 }
 
-// buildKnockRequest creates a valid HttpKnockForwardRequest with a populated
-// Resource (required to reach the forwarding code path in handleHttpOpenResource).
+// buildKnockRequest creates a valid HttpKnockForwardRequest. Resource only
+// carries optional caller metadata; routing data is resolved by the server.
 func buildKnockRequest(source string) HttpKnockForwardRequest {
 	return HttpKnockForwardRequest{
 		Request: &common.HttpKnockRequest{
@@ -41,12 +61,7 @@ func buildKnockRequest(source string) HttpKnockForwardRequest {
 			ResourceGroup: common.ResourceGroup{
 				AuthServiceId: "qurl",
 				ResourceId:    "r_test",
-				Resources: map[string]*common.ResourceInfo{
-					"default": {
-						ACId: "test-ac",
-						Addr: &common.NetAddress{Ip: "10.0.2.100", Port: 443},
-					},
-				},
+				OpenTime:      300,
 			},
 		},
 		Source: source,
@@ -110,6 +125,17 @@ func TestHandleInternalKnock_EmptySource_BlocksForwarding(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("unexpected status %d, body: %s", w.Code, w.Body.String())
+	}
+
+	var resp HttpKnockForwardResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.AckMsg == nil {
+		t.Fatalf("AckMsg is nil, response: %s", w.Body.String())
+	}
+	if resp.AckMsg.OpenTime != 77 {
+		t.Fatalf("AckMsg.OpenTime = %d, want storage-resolved OpenTime 77", resp.AckMsg.OpenTime)
 	}
 
 	if storage.GetCallCount("GetACAssignment") != 0 {
