@@ -786,65 +786,44 @@ resource "auth0_client_grant" "slack_oauth_qurl_api" {
 }
 
 # ── Passwordless email connection — qurl-bot-slack `/qurl setup` ──
-# The Slack bot's `/qurl setup <email>` flow redirects the workspace admin
-# to Auth0 `/authorize?connection=email&login_hint=<email>` so Auth0 emails
-# a one-time login code (the connection name must match the bot's
-# AUTH0_EMAIL_CONNECTION env var, which defaults to "email"). Without an
-# enabled `email` connection on this client Auth0 rejects /authorize with
-# `invalid_request: the connection is not enabled`, no code is sent, and the
-# bot's OAuth callback renders "authorization failed". The other connections
-# in this module (google/github) are scoped to the SPA dashboard client, so
-# the Slack client had no usable connection for the email flow.
+# NO LONGER MANAGED BY TERRAFORM. The `email` connection
+# (sandbox id con_cxZM9f9WZqXOJ6Bn) and its client enablement now live only
+# in the Auth0 dashboard. The resource blocks were replaced with the `removed`
+# blocks below so Terraform forgets them from state WITHOUT destroying the
+# live tenant resources (lifecycle.destroy = false). The connection stays
+# enabled on the qurl-bot-slack client, so the bot's `/qurl setup <email>`
+# OAuth flow keeps working.
 #
-# Gated on enable_slack_oauth_client (not manage_tenant_resources) so it
-# tracks the Slack client's lifecycle and is created in the same env that
-# owns the client. Delivery uses the tenant's existing SES email provider
-# (auth0_email_provider.ses). Client enablement is set via the separate
-# auth0_connection_clients resource below — mirroring the google/github
-# pattern — because a connection and its client-list must not both be
-# managed inline.
-resource "auth0_connection" "slack_email" {
-  count                = var.enable_slack_oauth_client ? 1 : 0
-  name                 = "email"
-  strategy             = "email"
-  is_domain_connection = false
+# Why removed: setting a connection's `options` (totp / brute_force_protection
+# / name) requires the `update:connections_options` Management API scope, which
+# the CI Terraform M2M token does not hold. The initial create (#2305) landed,
+# but the Management API reads the options back with different values, so every
+# subsequent apply tried to PATCH the read-after-create drift and failed with
+# `403 Forbidden: Updating the "options" property requires the
+# "update:connections_options" scope` — blocking ALL unrelated sandbox infra
+# changes on every push to main. The #2309 `ignore_changes` on
+# name/brute_force_protection did not cover the full readback drift, so applies
+# kept failing.
+#
+# To re-adopt into Terraform later: grant `update:connections_options` to the
+# CI M2M client on the shared tenant's Management API, delete these `removed`
+# blocks, re-add the resources, and `terraform import` the live connection id.
+# Leaving the `removed` blocks in place is a harmless no-op once state is clean
+# (mirrors the smoke_test_customer removed block in environments/sandbox).
+removed {
+  from = auth0_connection.slack_email
 
-  options {
-    name                   = "email"
-    disable_signup         = false
-    brute_force_protection = true
-
-    # 6-digit code, 300s TTL — matches the bot copy ("valid for 5 minutes").
-    totp {
-      time_step = 300
-      length    = 6
-    }
-  }
-
-  # Passwordless email connections accumulate users (linked accounts); mirror
-  # the prevent_destroy posture of the social connections below. To remove,
-  # first drop it from state with `terraform state rm`.
   lifecycle {
-    prevent_destroy = true
-
-    # Auth0 accepts these passwordless-email options on create, but the
-    # Management API reads the existing sandbox connection back as
-    # name=null/brute_force_protection=false. Without update:connections_options
-    # on the CI Management API token, every later apply tries to patch that
-    # read-after-create drift and fails before unrelated infra changes can land.
-    ignore_changes = [
-      options[0].name,
-      options[0].brute_force_protection,
-    ]
+    destroy = false
   }
 }
 
-resource "auth0_connection_clients" "slack_email" {
-  count         = var.enable_slack_oauth_client ? 1 : 0
-  connection_id = auth0_connection.slack_email[0].id
-  enabled_clients = [
-    auth0_client.slack_oauth[0].id,
-  ]
+removed {
+  from = auth0_connection_clients.slack_email
+
+  lifecycle {
+    destroy = false
+  }
 }
 
 # Mirrors the backend_service pattern at L274-309. Same Auth0 provider
