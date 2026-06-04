@@ -71,13 +71,14 @@ type UdpServer struct {
 		totalSendBytes uint64
 	}
 
-	config     *Config
-	httpConfig *HttpConfig
-	log        *log.Logger
-	listenAddr *net.UDPAddr
-	listenConn *net.UDPConn
-	localIp    string
-	localMac   string
+	config        *Config
+	httpConfig    *HttpConfig
+	log           *log.Logger
+	listenAddr    *net.UDPAddr
+	listenAddrStr string
+	listenConn    *net.UDPConn
+	localIp       string
+	localMac      string
 
 	device       *core.Device
 	httpServer   *HttpServer
@@ -754,7 +755,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		Port: s.config.ListenPort,
 	})
 	if err != nil {
-		log.Error("[Server] listen error on %s: %v", s.listenAddr.String(), err)
+		log.Error("[Server] listen error on %s: %v", s.listenAddrStr, err)
 		return fmt.Errorf("listen error: %w", err)
 	}
 
@@ -777,6 +778,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		log.Error("[Server] failed to resolve local UDPAddr: %v", err)
 		return fmt.Errorf("resolve UDPAddr error: %w", err)
 	}
+	s.listenAddrStr = s.listenAddr.String()
 
 	prk, err := base64.StdEncoding.DecodeString(s.config.PrivateKeyBase64)
 	if err != nil {
@@ -1782,8 +1784,8 @@ func (s *UdpServer) SendPacket(pkt *core.Packet, conn *UdpConn) (n int, err erro
 	}()
 
 	pktType := core.HeaderTypeToString(pkt.HeaderType)
-	log.Info("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddr.String(), conn.ConnData.RemoteAddr.String(), len(pkt.Content))
-	log.Evaluate("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddr.String(), conn.ConnData.RemoteAddr.String(), len(pkt.Content))
+	log.Info("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddrStr, conn.ConnData.RemoteAddr.String(), len(pkt.Content))
+	log.Evaluate("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddrStr, conn.ConnData.RemoteAddr.String(), len(pkt.Content))
 
 	if conn.isWebRTC && conn.dc != nil {
 		err = conn.dc.Send(pkt.Content)
@@ -1824,7 +1826,7 @@ func (s *UdpServer) recvPacketRoutine() {
 		n, remoteAddr, err := s.listenConn.ReadFromUDP(pkt.Buf[:])
 		if err != nil {
 			s.device.ReleasePoolPacket(pkt)
-			log.Error("[Server] ReadFromUDP on %s failed: %v", s.listenAddr.String(), err)
+			log.Error("[Server] ReadFromUDP on %s failed: %v", s.listenAddrStr, err)
 			if n == 0 {
 				// listenConn closed
 				return
@@ -1871,17 +1873,17 @@ func (s *UdpServer) recvPacketRoutine() {
 
 		recvTime := time.Now().UnixNano()
 		pkt.Content = pkt.Buf[:n]
-		//log.Trace("receive udp packet (%s -> %s): %+v", addrStr, s.listenAddr.String(), pkt.Content)
+		//log.Trace("receive udp packet (%s -> %s): %+v", addrStr, s.listenAddrStr, pkt.Content)
 
 		typ, _, err := s.device.RecvPrecheck(pkt) // this check also records packet header type
 		msgType := core.HeaderTypeToString(typ)
-		log.Info("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddr.String(), n)
-		log.Evaluate("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddr.String(), n)
+		log.Info("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddrStr, n)
+		log.Evaluate("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddrStr, n)
 		if err != nil {
 			s.recordPreCheckThreat(preCheckThreats, ipStr)
 			s.device.ReleasePoolPacket(pkt)
-			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, addrStr, s.listenAddr.String(), err)
-			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, addrStr, s.listenAddr.String(), err)
+			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, addrStr, s.listenAddrStr, err)
+			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, addrStr, s.listenAddrStr, err)
 			continue
 		}
 		// Any successful precheck from this IP clears the IP's counter:
@@ -1952,7 +1954,7 @@ func (s *UdpServer) recvPacketRoutine() {
 
 			conn.ConnData.RecvQueue <- pkt
 
-			log.Info("Accept new UDP connection from %s to %s", addrStr, s.listenAddr.String())
+			log.Info("Accept new UDP connection from %s to %s", addrStr, s.listenAddrStr)
 
 			// launch connection routine
 			s.wg.Add(1)
@@ -2251,7 +2253,7 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 			// process keepalive packet
 			if pkt.HeaderType == core.NHP_KPL {
 				s.device.ReleasePoolPacket(pkt)
-				log.Info("Receive [NHP_KPL] message (%s -> %s)", addrStr, s.listenAddr.String())
+				log.Info("Receive [NHP_KPL] message (%s -> %s)", addrStr, s.listenAddrStr)
 				continue
 			}
 

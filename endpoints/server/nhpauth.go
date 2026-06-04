@@ -123,13 +123,15 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 			}
 		}
 
-		// find out auth service provider. ResolveAuthSvcProvider
-		// encapsulates the FindAuthSvcProvider fast-path + DDB-backed
-		// fallback (#1976) + three-way error classification (shutdown /
-		// unknown-ASP / DDB infra trouble) so this hot path stays
-		// readable and the same logic can be reused by the forwarder.
-		aspData := s.ResolveAuthSvcProvider(s.LifecycleCtx(), knkMsg.AuthServiceId,
-			fmt.Sprintf("HandleKnockRequest-Auth agent=%s tx=%d remote=%s", knkMsg.UserId, transactionId, addrStr))
+		// find out auth service provider. Try the in-memory map first
+		// (hot path, no allocation). Only fall through to
+		// ResolveAuthSvcProvider (which formats the log prefix and
+		// consults DDB) on a cache miss.
+		aspData := s.FindAuthSvcProvider(knkMsg.AuthServiceId)
+		if aspData == nil {
+			aspData = s.ResolveAuthSvcProvider(s.LifecycleCtx(), knkMsg.AuthServiceId,
+				fmt.Sprintf("HandleKnockRequest-Auth agent=%s tx=%d remote=%s", knkMsg.UserId, transactionId, addrStr))
+		}
 		if aspData == nil {
 			err = common.ErrAuthServiceProviderNotFound
 			ackMsg.ErrCode = common.ErrAuthServiceProviderNotFound.ErrorCode()
