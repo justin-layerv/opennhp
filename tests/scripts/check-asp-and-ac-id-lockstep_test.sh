@@ -46,10 +46,13 @@ _make_fixture() {
   local ac_module_ac_id_default="$9"
   local sandbox_qurl_default_ac_id="${10}"
   local prod_qurl_default_ac_id="${11}"
-  # Optional 12th/13th args for the customer-id contract; default
+  # Optional 12th-16th args for the customer-id contract; default
   # to matching values so legacy 11-arg callers continue to pass.
   local go_customer_id="${12:-00000000000000000000000000}"
   local tf_customer_id="${13:-00000000000000000000000000}"
+  local go_qurl_dynamic_customer_id_prefix="${14:-00000000000000000000000001}"
+  local tf_qurl_dynamic_customer_id_prefix="${15:-00000000000000000000000001}"
+  local qurl_service_customer_id_prefix_expr="${16:-local.nhp_qurl_dynamic_customer_id_prefix}"
 
   mkdir -p \
     "$dir/scripts" \
@@ -73,6 +76,7 @@ EOF
 package server
 const (
 	nhpSystemCustomerID = "$go_customer_id"
+	nhpQURLDynamicCustomerIDPrefix = "$go_qurl_dynamic_customer_id_prefix"
 )
 EOF
 
@@ -89,6 +93,14 @@ EOF
   cat > "$dir/terraform/resources.tf" <<EOF
 locals {
   nhp_system_customer_id = "$tf_customer_id"
+  nhp_qurl_dynamic_customer_id_prefix = "$tf_qurl_dynamic_customer_id_prefix"
+}
+EOF
+
+  cat > "$dir/terraform/main.tf" <<EOF
+module "qurl_service" {
+  source = "./modules/qurl-service"
+  nhp_resources_customer_id_prefix = $qurl_service_customer_id_prefix_expr
 }
 EOF
 
@@ -453,6 +465,60 @@ test_customer_id_drift_fails() {
 }
 
 test_customer_id_drift_fails
+
+# Assert the dynamic qURL customer-id prefix contract fires when Go and TF disagree.
+test_dynamic_customer_id_prefix_drift_fails() {
+  local name="dynamic-customer-id-prefix-drift-fails"
+  local tmp; tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+
+  _make_fixture "$tmp" \
+    "agent" "agent" "agent" "agent" "agent" "agent" "agent" \
+    "layerv-ac-tf" "layerv-ac-tf" "layerv-ac-tf" \
+    "00000000000000000000000000" "00000000000000000000000000" \
+    "00000000000000000000000001" "11111111111111111111111111"
+
+  local out
+  if out=$(bash "$tmp/scripts/check-asp-and-ac-id-lockstep.sh" 2>&1); then
+    report_fail "$name" "expected non-zero exit, got 0. Output:\n$out"
+  else
+    if [[ "$out" == *"DRIFT (nhp_qurl_dynamic_customer_id_prefix)"* ]] && [[ "$out" == *"11111"* ]]; then
+      report_pass "$name"
+    else
+      report_fail "$name" "expected dynamic customer_id prefix DRIFT message naming the mismatched 1...1 value, got:\n$out"
+    fi
+  fi
+}
+
+test_dynamic_customer_id_prefix_drift_fails
+
+# Assert the qurl-service module is wired to the dynamic prefix, not merely that
+# the dynamic local itself matches the Go constant.
+test_qurl_service_module_prefix_wiring_fails() {
+  local name="qurl-service-module-prefix-wiring-fails"
+  local tmp; tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+
+  _make_fixture "$tmp" \
+    "agent" "agent" "agent" "agent" "agent" "agent" "agent" \
+    "layerv-ac-tf" "layerv-ac-tf" "layerv-ac-tf" \
+    "00000000000000000000000000" "00000000000000000000000000" \
+    "00000000000000000000000001" "00000000000000000000000001" \
+    "local.nhp_system_customer_id"
+
+  local out
+  if out=$(bash "$tmp/scripts/check-asp-and-ac-id-lockstep.sh" 2>&1); then
+    report_fail "$name" "expected non-zero exit, got 0. Output:\n$out"
+  else
+    if [[ "$out" == *"DRIFT (qurl_service_nhp_resources_customer_id_prefix)"* ]] && [[ "$out" == *"local.nhp_system_customer_id"* ]]; then
+      report_pass "$name"
+    else
+      report_fail "$name" "expected qurl_service_nhp_resources_customer_id_prefix DRIFT naming local.nhp_system_customer_id, got:\n$out"
+    fi
+  fi
+}
+
+test_qurl_service_module_prefix_wiring_fails
 
 echo
 echo "Passed: $pass    Failed: $fail"

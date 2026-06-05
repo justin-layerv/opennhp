@@ -683,6 +683,34 @@ const (
 	// CrossPartition, MalformedRow, Pagination) is operational
 	// follow-up work, not code work.
 	MetricResourceLookupAspMismatch = "ResourceLookupAspMismatch"
+
+	// MetricResourceLookupDirectAspMismatch fires when exact resource_id
+	// lookup finds a row but its auth_service_id does not match the requested
+	// aspId. Unlike MetricResourceLookupAspMismatch, this is not a Query
+	// FilterExpression regression; it points at a producer writing a direct
+	// row under the wrong auth service.
+	//
+	// Single-counting under direct-resource singleflight: this and the other
+	// direct producer-regression counters below fire inside the winning DDB
+	// lookup. N concurrent knocks for the same bad qURL token produce N
+	// MetricInternalKnockResourceNotFound increments, but only one producer
+	// regression increment; repeated knocks inside the 1s direct negative-cache
+	// window also reuse the reject without re-counting. Alarm posture should
+	// stay `> 0` rather than interpreting the direct counters as per-knock
+	// rates.
+	MetricResourceLookupDirectAspMismatch = "ResourceLookupDirectAspMismatch"
+
+	// MetricResourceLookupMissingDirectTTL fires when exact resource_id lookup
+	// finds a direct row without the app-level ttl required for qURL dynamic
+	// resources. This is a producer-contract regression, distinct from generic
+	// malformed static catalog rows.
+	MetricResourceLookupMissingDirectTTL = "ResourceLookupMissingDirectTTL"
+
+	// MetricResourceLookupExpiredDirectRow fires when exact resource_id lookup
+	// finds a row whose app-level ttl has elapsed. DynamoDB TTL deletion is
+	// asynchronous, so the reader rejects expired direct rows before converting
+	// them into knockable ResourceData.
+	MetricResourceLookupExpiredDirectRow = "ResourceLookupExpiredDirectRow"
 )
 
 // Multi-AC broadcast observability metric names (issue #376).

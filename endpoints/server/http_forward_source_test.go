@@ -2,13 +2,16 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
@@ -86,6 +89,83 @@ func callHandleInternalKnock(t *testing.T, hs *HttpServer, fwdReq HttpKnockForwa
 
 	hs.handleInternalKnock(c)
 	return w
+}
+
+func TestHandleInternalKnock_ResourceLookupUsesLifecycleCtx(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const resourceID = "q_123456789ab"
+	type ctxKey struct{}
+	key := ctxKey{}
+	q := newFakeResourcesQuerier()
+	type seenGetItemCtx struct {
+		marker any
+		err    error
+	}
+	seenCtx := make(chan seenGetItemCtx, 1)
+	q.beforeGetItemCtx = func(ctx context.Context) {
+		seenCtx <- seenGetItemCtx{marker: ctx.Value(key), err: ctx.Err()}
+	}
+	q.putDynamicQURLWithTTL(resourceID, "qurl", "test-ac", "backend.example", "backend.example", 443, 77, time.Now().Add(time.Hour).Unix())
+	lookup, err := NewResourceLookup(q, "nhp-resources-test", nhpSystemCustomerID, &captureApplier{})
+	if err != nil {
+		t.Fatalf("NewResourceLookup: %v", err)
+	}
+
+	lifecycleParent := context.WithValue(context.Background(), key, "lifecycle")
+	lifecycleCtx, cancelLifecycle := context.WithCancel(lifecycleParent)
+	defer cancelLifecycle()
+	hs := &HttpServer{
+		udpServer: &UdpServer{
+			acConnectionMap: make(map[string][]*ACConn),
+			resourceLookup:  lookup,
+			lifecycleCtx:    lifecycleCtx,
+			metrics:         metrics.NewPublisherForTest(t),
+		},
+		httpForwarder: NewHttpKnockForwarder(NewMemoryStorage(), nil, "10.0.0.1", 8888, nil, nil),
+	}
+	fwdReq := HttpKnockForwardRequest{
+		Request: &common.HttpKnockRequest{
+			AuthServiceId: "qurl",
+			ResourceId:    resourceID,
+			SrcIp:         "10.0.1.50",
+		},
+		Resource: &common.ResourceData{
+			ResourceGroup: common.ResourceGroup{
+				AuthServiceId: "qurl",
+				ResourceId:    resourceID,
+				OpenTime:      300,
+			},
+		},
+		Source: SourceAPI,
+	}
+	body, err := json.Marshal(fwdReq)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	reqParent := context.WithValue(context.Background(), key, "request")
+	reqCtx, cancelReq := context.WithCancel(reqParent)
+	cancelReq()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/nhp/internal/knock", bytes.NewReader(body)).WithContext(reqCtx)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.RemoteAddr = "10.0.1.100:12345"
+
+	hs.handleInternalKnock(c)
+
+	select {
+	case got := <-seenCtx:
+		if got.marker != "lifecycle" {
+			t.Fatalf("resource lookup ctx marker = %v, want lifecycle marker", got.marker)
+		}
+		if got.err != nil {
+			t.Fatalf("resource lookup ctx err = %v, want live lifecycle ctx", got.err)
+		}
+	default:
+		t.Fatal("resource lookup GetItem was not called")
+	}
 }
 
 // TestHandleInternalKnock_APISource_AllowsForwarding verifies that when

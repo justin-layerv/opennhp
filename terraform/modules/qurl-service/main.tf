@@ -48,6 +48,46 @@ resource "terraform_data" "frps_env_var_triple" {
   }
 }
 
+resource "terraform_data" "nhp_resource_catalog_inputs" {
+  lifecycle {
+    precondition {
+      condition = (
+        (
+          var.nhp_resources_table_name == ""
+          && var.nhp_resources_table_arn == ""
+          && var.nhp_resources_customer_id_prefix == ""
+        )
+        || (
+          var.nhp_resources_table_name != ""
+          && var.nhp_resources_table_arn != ""
+          && var.nhp_resources_customer_id_prefix != ""
+        )
+      )
+      error_message = "nhp_resources_table_name, nhp_resources_table_arn, and nhp_resources_customer_id_prefix must be provided together so qurl-service can publish dynamic q_ catalog shard rows with scoped IAM."
+    }
+    precondition {
+      condition = (
+        (
+          var.nhp_server_internal_url == ""
+          && var.nhp_resources_table_name == ""
+        )
+        || (
+          var.nhp_server_internal_url != ""
+          && var.nhp_resources_table_name != ""
+        )
+      )
+      error_message = "nhp_server_internal_url and nhp_resources_table_name must be provided together; qurl-service requires the dynamic catalog table and internal knock origin as one atomic NHP integration surface."
+    }
+    precondition {
+      condition = (
+        var.nhp_resources_customer_id_prefix == ""
+        || var.nhp_resources_customer_id_prefix != "00000000000000000000000000"
+      )
+      error_message = "nhp_resources_customer_id_prefix must not be the NHP system customer_id partition; qurl-service may only write its reserved dynamic q_ shard namespace."
+    }
+  }
+}
+
 # Module-reuse hardening for the QURL agent → nhp-server bootstrap chain.
 # The validation/precondition split:
 #   - Variable-level `validation` blocks (in variables.tf) handle
@@ -338,6 +378,12 @@ locals {
         { name = "CUSTOM_DOMAIN_CLEANUP_TOPIC_ARN", value = var.custom_domain_cleanup_topic_arn },
       ] : [],
     ) : [],
+    # NHP dynamic resource catalog. qurl-service #827 requires this table
+    # and NHP_SERVER_INTERNAL_URL as one atomic integration surface; the
+    # module precondition above rejects table-only or URL-only wiring.
+    var.nhp_resources_table_name != "" ? [
+      { name = "NHP_RESOURCES_TABLE_NAME", value = var.nhp_resources_table_name },
+    ] : [],
     # NHP integration (headless resolve via POST /v1/resolve)
     var.nhp_server_internal_url != "" ? [
       { name = "NHP_SERVER_INTERNAL_URL", value = var.nhp_server_internal_url },
@@ -542,39 +588,71 @@ resource "aws_iam_role_policy" "task_dynamodb" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = concat([
-      {
-        Sid    = "DynamoDBAccess"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:UpdateItem",
-          "dynamodb:DeleteItem",
-          "dynamodb:Query",
-          "dynamodb:Scan",
-          "dynamodb:BatchGetItem",
-          "dynamodb:BatchWriteItem",
-          # DescribeTable is required by the periodic schema reconciler
-          # in qurl-service (internal/health/dynamodb_schema.go) which
-          # calls DescribeTable every 60s on each table in the registry
-          # to detect GSI drift. Without this permission the reconciler
-          # fails with AccessDenied, /health/ready flips to 503, and
-          # the ALB de-registers every task. Added to close the
-          # 2026-03-24 incident class (nhp PR #877) at runtime as the
-          # belt-and-suspenders to the workflow gate in promote-to-prod.
-          "dynamodb:DescribeTable",
-        ]
-        Resource = concat(
-          var.dynamodb_table_arns,
-          [for arn in var.dynamodb_table_arns : "${arn}/index/*"],
-          # Idempotency table (if configured)
-          var.idempotency_table_arn != "" ? [var.idempotency_table_arn] : [],
-          # API key idempotency table (if configured)
-          var.apikey_idempotency_table_arn != "" ? [var.apikey_idempotency_table_arn] : []
-        )
-      },
+    Statement = concat(
+      [
+        {
+          Sid    = "DynamoDBAccess"
+          Effect = "Allow"
+          Action = [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:DeleteItem",
+            "dynamodb:Query",
+            "dynamodb:Scan",
+            "dynamodb:BatchGetItem",
+            "dynamodb:BatchWriteItem",
+            # DescribeTable is required by the periodic schema reconciler
+            # in qurl-service (internal/health/dynamodb_schema.go) which
+            # calls DescribeTable every 60s on each table in the registry
+            # to detect GSI drift. Without this permission the reconciler
+            # fails with AccessDenied, /health/ready flips to 503, and
+            # the ALB de-registers every task. Added to close the
+            # 2026-03-24 incident class (nhp PR #877) at runtime as the
+            # belt-and-suspenders to the workflow gate in promote-to-prod.
+            "dynamodb:DescribeTable",
+          ]
+          Resource = concat(
+            var.dynamodb_table_arns,
+            [for arn in var.dynamodb_table_arns : "${arn}/index/*"],
+            # Idempotency table (if configured)
+            var.idempotency_table_arn != "" ? [var.idempotency_table_arn] : [],
+            # API key idempotency table (if configured)
+            var.apikey_idempotency_table_arn != "" ? [var.apikey_idempotency_table_arn] : []
+          )
+        },
       ],
+      var.nhp_resources_table_arn != "" ? [{
+        Sid    = "NHPResourceCatalogWrite"
+        Effect = "Allow"
+        # qurl-service treats nhp_resources as a write-only catalog client:
+        # full PutItem on mint/update and DeleteItem on revoke. It is not in
+        # qurl-service's schema-reconciler registry, so DescribeTable remains
+        # intentionally scoped to qurl-service-owned DynamoDB tables above.
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:DeleteItem",
+        ]
+        Resource = [var.nhp_resources_table_arn]
+        Condition = {
+          # Safe with PutItem/DeleteItem because each request has exactly one
+          # table leading key; the ForAllValues absent-key caveat is not
+          # reachable for these item APIs.
+          "ForAllValues:StringLike" = {
+            # Matches terraform/resources.tf
+            # local.nhp_qurl_dynamic_customer_id_prefix,
+            # endpoints/server/resource_lookup.go
+            # nhpQURLDynamicCustomerIDPrefix, and qurl-service's
+            # NHPQurlDynamicCustomerIDPrefix. Dynamic qURL rows live under
+            # "<prefix>-00" through "<prefix>-ff"; the two-character pattern
+            # keeps the policy compact while preventing writes to Terraform-owned
+            # static qurl-tunnel-server or agent rows in the system partition.
+            # IAM StringLike cannot express hex-only; writer/reader helpers and
+            # the shared vector tests enforce the [0-9a-f]{2} shard suffix.
+            "dynamodb:LeadingKeys" = ["${var.nhp_resources_customer_id_prefix}-??"]
+          }
+        }
+      }] : [],
       # KMS decrypt for DynamoDB (tables are encrypted with KMS)
       var.secrets_kms_key_arn != null ? [{
         Sid      = "KMSDecryptDynamoDB"

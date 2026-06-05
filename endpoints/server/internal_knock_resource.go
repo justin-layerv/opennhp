@@ -6,12 +6,19 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 var (
 	errInvalidInternalKnockRequest = errors.New("invalid internal knock request")
 	errInternalKnockServerNotReady = errors.New("internal knock server not ready")
+)
+
+const (
+	qurlInternalKnockAuthServiceID = "qurl"
+	qurlDynamicResourcePrefix      = "q_"
+	qurlDynamicResourceHexLength   = 11
 )
 
 // resolveInternalKnockResource canonicalizes req.AuthServiceId and
@@ -41,20 +48,56 @@ func (hs *HttpServer) resolveInternalKnockResource(ctx context.Context, req *com
 	if hs == nil || hs.udpServer == nil {
 		return nil, errInternalKnockServerNotReady
 	}
-	aspData, err := hs.udpServer.ResolveInternalKnockAuthSvcProvider(ctx, aspID, "handleInternalKnock-resource")
-	if err != nil {
-		return nil, err
+	srcIP := strings.TrimSpace(req.SrcIp)
+	dynamicQURLResource := aspID == qurlInternalKnockAuthServiceID && isQURLDynamicResourceID(resourceID)
+	if dynamicQURLResource && srcIP == "" {
+		// Dynamic rows choose the AC directly from storage, but the downstream
+		// L3 pinhole still needs qurl-service's caller IP as its source key.
+		// Match the static placement path's fail-closed posture on empty SrcIp.
+		hs.udpServer.incrCounterIfMetrics(MetricInternalKnockResourceNotFound)
+		return nil, common.ErrResourceNotFound
 	}
-	resolved := aspData.GetResourceData(resourceID)
+	var resolved *common.ResourceData
+
+	if dynamicQURLResource {
+		// Dynamic qURL resources are minted after the ASP-level catalog may
+		// already be cached. Keep those q_ rows on an exact row lookup; static
+		// qURL resources, including qurl-tunnel-server placement, stay on the
+		// ASP catalog.
+		dynamicResource, err := hs.udpServer.ResolveInternalKnockResource(ctx, aspID, resourceID, "handleInternalKnock-resource")
+		if err != nil {
+			return nil, err
+		}
+		resolved = dynamicResource
+	} else {
+		aspData, err := hs.udpServer.ResolveInternalKnockAuthSvcProvider(ctx, aspID, "handleInternalKnock-resource")
+		if err != nil {
+			return nil, err
+		}
+		// qurl-service's /v1/resolve path has no agent public key; the
+		// qurl-service-supplied SrcIp is the stable identity that matches the L3
+		// pinhole. In strict mode it is covered by the internal-auth body HMAC;
+		// before strict mode, it is still placement-only and not an authz boundary.
+		// Empty SrcIp intentionally remains an empty identity so a per-AZ-only
+		// catalog fails closed instead of placing by a different key. Rendezvous
+		// hashing is sticky, so a small qurl-service egress-IP set can concentrate
+		// placement on fewer AZs; that is a load-distribution tradeoff only.
+		placementIdentity := qurlplacement.Identity{SourceIP: srcIP}
+		resolved = qurlplacement.ResolveResource(resourceID, placementIdentity, aspData)
+	}
 	if resolved == nil {
 		// ASP misses are counted inside ResolveInternalKnockAuthSvcProvider;
 		// resourceId misses are only knowable here after ASP resolution.
-		hs.udpServer.metrics.IncrCounter(MetricInternalKnockResourceNotFound)
+		hs.udpServer.incrCounterIfMetrics(MetricInternalKnockResourceNotFound)
 		return nil, common.ErrResourceNotFound
 	}
 
+	// Production handleInternalKnock verifies the body HMAC before reaching this
+	// resolver. qurl-service supplies SrcIp from c.ClientIP(), and downstream
+	// ACTokenEntry.KnockSrcIP validation consumes this canonical trimmed value.
 	req.AuthServiceId = aspID
 	req.ResourceId = resourceID
+	req.SrcIp = srcIP
 	resolved = cloneResourceData(resolved)
 	if resolved.OpenTime == 0 {
 		resolved.OpenTime = DefaultIpOpenTime
@@ -65,6 +108,26 @@ func (hs *HttpServer) resolveInternalKnockResource(ctx context.Context, req *com
 		resolved.OpenTime = callerResource.OpenTime
 	}
 	return resolved, nil
+}
+
+func (hs *HttpServer) internalKnockResourceLookupContext() context.Context {
+	if hs == nil || hs.udpServer == nil {
+		return context.Background()
+	}
+	return hs.udpServer.LifecycleCtx()
+}
+
+func isQURLDynamicResourceID(resourceID string) bool {
+	if len(resourceID) != len(qurlDynamicResourcePrefix)+qurlDynamicResourceHexLength ||
+		!strings.HasPrefix(resourceID, qurlDynamicResourcePrefix) {
+		return false
+	}
+	for _, ch := range resourceID[len(qurlDynamicResourcePrefix):] {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func cloneResourceData(src *common.ResourceData) *common.ResourceData {

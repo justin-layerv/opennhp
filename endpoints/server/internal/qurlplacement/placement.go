@@ -27,6 +27,12 @@ type Identity struct {
 	// authenticates it with Noise IK before resource resolution.
 	PublicKey string
 
+	// SourceIP is used by signed qurl-service HTTP internal knocks. That path
+	// has no agent public key, and the L3 pinhole is keyed by source IP. Before
+	// strict internal auth, SourceIP can steer placement but cannot authorize
+	// access; rendezvous stickiness may group shared egress IPs onto one AZ.
+	SourceIP string
+
 	// UserID is a degraded fallback for call sites that cannot provide a
 	// public key. Production qURL tunnel-control paths reject missing public
 	// keys before placement; this fallback is for non-qURL/custom callers that
@@ -38,6 +44,9 @@ type Identity struct {
 func (i Identity) stableKey() string {
 	if i.PublicKey != "" {
 		return "pub:" + i.PublicKey
+	}
+	if i.SourceIP != "" {
+		return "srcip:" + i.SourceIP
 	}
 	if i.UserID != "" {
 		userIDFallbackWarningOnce.Do(func() {
@@ -167,8 +176,8 @@ func aliasResourceInfo(info *common.ResourceInfo) *common.ResourceInfo {
 	// The public ACK must carry the exact host:port the client should dial.
 	// Apply that to per-AZ aliases and direct-row transition fallback alike;
 	// standard clients no longer carry a YAML-side server.port fallback. This
-	// also means a transition/debug direct row's catalog-level port_suffix=false
-	// opt-out is intentionally not preserved by the placement-neutral alias.
+	// is fenced by staticplugins/agent's dispatch test as well as placement
+	// direct-row fallback coverage here.
 	cloned.PortSuffix = true
 	return &cloned
 }

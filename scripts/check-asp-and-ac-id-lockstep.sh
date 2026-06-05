@@ -62,6 +62,7 @@ if [ "${1:-}" = "--list-sources" ]; then
 endpoints/server/staticplugins/agent/plugin.go
 endpoints/server/resource_lookup.go
 terraform/variables.tf
+terraform/main.tf
 terraform/resources.tf
 terraform/modules/ac/variables.tf
 terraform/environments/sandbox/variables.tf
@@ -126,6 +127,29 @@ extract_locals_value() {
         exit
       }
       if (depth <= 0) { inblock = 0 }
+    }
+  ' "$file" 2>/dev/null
+}
+
+# Pull a `name = RHS` assignment from a named top-level module block.
+# Used for module wiring contracts where the RHS is an expression such
+# as `local.nhp_qurl_dynamic_customer_id_prefix`, not a quoted literal.
+extract_module_assignment() {
+  local file="$1" module_name="$2" name="$3"
+  awk -v module_name="$module_name" -v name="$name" '
+    $0 ~ "^module[[:space:]]+\"" module_name "\"[[:space:]]*\\{" { inblock = 1; depth = 1; next }
+    inblock {
+      n = gsub(/\{/, "{")
+      m = gsub(/\}/, "}")
+      depth += n - m
+      if (depth == 1 && match($0, "^[[:space:]]*" name "[[:space:]]*=[[:space:]]*[^#]+")) {
+        s = substr($0, RSTART, RLENGTH)
+        sub("^[[:space:]]*" name "[[:space:]]*=[[:space:]]*", "", s)
+        sub(/[[:space:]]+$/, "", s)
+        print s
+        exit
+      }
+      if (depth <= 0) { exit }
     }
   ' "$file" 2>/dev/null
 }
@@ -305,13 +329,15 @@ EOF
 fi
 
 # -----------------------------------------------------------------------------
-# Contract 3: nhpSystemCustomerID — Go-side const must agree with TF-side
-#                                   local for the partition the bridge reads
-#                                   and the seed-row writes both target.
+# Contract 3: resource lookup customer_id partitions — Go-side consts must agree
+#                                                   with TF-side locals for the
+#                                                   static partition and dynamic
+#                                                   qURL shard-key prefix.
 # -----------------------------------------------------------------------------
 
 LOOKUP_GO="${REPO_ROOT}/endpoints/server/resource_lookup.go"
 RESOURCES_TF="${REPO_ROOT}/terraform/resources.tf"
+MAIN_TF="${REPO_ROOT}/terraform/main.tf"
 customer_id_drift=0
 if [ ! -f "$LOOKUP_GO" ]; then
   echo "ERROR: customer-id-lockstep source missing: endpoints/server/resource_lookup.go" >&2
@@ -319,9 +345,15 @@ if [ ! -f "$LOOKUP_GO" ]; then
 elif [ ! -f "$RESOURCES_TF" ]; then
   echo "ERROR: customer-id-lockstep source missing: terraform/resources.tf" >&2
   customer_id_drift=1
+elif [ ! -f "$MAIN_TF" ]; then
+  echo "ERROR: customer-id-lockstep source missing: terraform/main.tf" >&2
+  customer_id_drift=1
 else
   go_customer_id=$(extract_go_const "$LOOKUP_GO" nhpSystemCustomerID || true)
   tf_customer_id=$(extract_locals_value "$RESOURCES_TF" nhp_system_customer_id || true)
+  go_qurl_dynamic_customer_id_prefix=$(extract_go_const "$LOOKUP_GO" nhpQURLDynamicCustomerIDPrefix || true)
+  tf_qurl_dynamic_customer_id_prefix=$(extract_locals_value "$RESOURCES_TF" nhp_qurl_dynamic_customer_id_prefix || true)
+  qurl_module_customer_id_prefix_expr=$(extract_module_assignment "$MAIN_TF" qurl_service nhp_resources_customer_id_prefix || true)
   if [ -z "${go_customer_id:-}" ]; then
     echo "ERROR: could not extract \`nhpSystemCustomerID = \"...\"\` from $LOOKUP_GO" >&2
     echo "       Either the const was renamed, moved, or the extractor regressed." >&2
@@ -334,18 +366,41 @@ else
     echo "DRIFT (nhp_system_customer_id): terraform/resources.tf::local.nhp_system_customer_id = \"$tf_customer_id\" but endpoints/server/resource_lookup.go::nhpSystemCustomerID = \"$go_customer_id\"" >&2
     customer_id_drift=1
   fi
+  if [ -z "${go_qurl_dynamic_customer_id_prefix:-}" ]; then
+    echo "ERROR: could not extract \`nhpQURLDynamicCustomerIDPrefix = \"...\"\` from $LOOKUP_GO" >&2
+    echo "       Either the const was renamed, moved, or the extractor regressed." >&2
+    customer_id_drift=1
+  elif [ -z "${tf_qurl_dynamic_customer_id_prefix:-}" ]; then
+    echo "ERROR: could not extract \`nhp_qurl_dynamic_customer_id_prefix = \"...\"\` from $RESOURCES_TF" >&2
+    echo "       Either the local was renamed, moved out of the locals{} block, or the extractor regressed." >&2
+    customer_id_drift=1
+  elif [ "$go_qurl_dynamic_customer_id_prefix" != "$tf_qurl_dynamic_customer_id_prefix" ]; then
+    echo "DRIFT (nhp_qurl_dynamic_customer_id_prefix): terraform/resources.tf::local.nhp_qurl_dynamic_customer_id_prefix = \"$tf_qurl_dynamic_customer_id_prefix\" but endpoints/server/resource_lookup.go::nhpQURLDynamicCustomerIDPrefix = \"$go_qurl_dynamic_customer_id_prefix\"" >&2
+    customer_id_drift=1
+  fi
+  if [ -z "${qurl_module_customer_id_prefix_expr:-}" ]; then
+    echo "ERROR: could not extract \`module \"qurl_service\" { nhp_resources_customer_id_prefix = ... }\` from $MAIN_TF" >&2
+    echo "       Either the module input was renamed, removed, or the extractor regressed." >&2
+    customer_id_drift=1
+  elif [ "$qurl_module_customer_id_prefix_expr" != "local.nhp_qurl_dynamic_customer_id_prefix" ]; then
+    echo "DRIFT (qurl_service_nhp_resources_customer_id_prefix): terraform/main.tf::module.qurl_service.nhp_resources_customer_id_prefix = $qurl_module_customer_id_prefix_expr but it must be local.nhp_qurl_dynamic_customer_id_prefix" >&2
+    customer_id_drift=1
+  fi
 fi
 
 if [ "$customer_id_drift" -ne 0 ]; then
   cat >&2 <<EOF
 
-nhp_system_customer_id lockstep FAILED. The Go-side bridge queries DDB
-under the partition key from \`nhpSystemCustomerID\` (resource_lookup.go);
-the TF seed-row writer puts the row under \`local.nhp_system_customer_id\`
-(resources.tf). A drift means the writer puts the row in one partition
-and the reader queries another — the resolver returns
-ErrResourceUnknownASP on every knock (empty partition, no rows match
-the FilterExpression).
+resource lookup customer_id lockstep FAILED. The Go-side bridge queries
+DDB under \`nhpSystemCustomerID\` for static system rows and
+\`nhpQURLDynamicCustomerIDPrefix\` plus a resource_id-derived shard suffix for
+qurl-service dynamic q_ rows (resource_lookup.go); Terraform writes/passes the
+matching locals from resources.tf and must wire
+module.qurl_service.nhp_resources_customer_id_prefix to the dynamic prefix
+local. Drift means writers and readers target different partitions — either
+every static ASP lookup returns ErrResourceUnknownASP, every dynamic q_ lookup
+returns ErrResourceUnknownResource, or qurl-service is granted write reach over
+Terraform-owned system rows.
 
 To fix: align both values. Then re-run this script.
 EOF
@@ -355,4 +410,4 @@ if [ "$aspid_drift" -ne 0 ] || [ "$ac_id_drift" -ne 0 ] || [ "$customer_id_drift
   exit 1
 fi
 
-echo "asp+ac_id+customer_id lockstep OK: PluginID=\"$go_plugin_id\", ac_id=\"$ac_module_id\", customer_id=\"$go_customer_id\""
+echo "asp+ac_id+customer_id lockstep OK: PluginID=\"$go_plugin_id\", ac_id=\"$ac_module_id\", system_customer_id=\"$go_customer_id\", qurl_dynamic_customer_id_prefix=\"$go_qurl_dynamic_customer_id_prefix\", qurl_service_prefix=\"$qurl_module_customer_id_prefix_expr\""

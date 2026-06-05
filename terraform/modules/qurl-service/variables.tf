@@ -107,6 +107,32 @@ variable "dynamodb_table_prefix" {
   default     = ""
 }
 
+variable "nhp_resources_table_name" {
+  description = "Full NHP-owned resources table name where qurl-service writes dynamic q_ catalog rows"
+  type        = string
+  default     = ""
+}
+
+variable "nhp_resources_table_arn" {
+  description = "ARN of the NHP-owned resources table for dynamic q_ catalog row writes"
+  type        = string
+  default     = ""
+}
+
+variable "nhp_resources_customer_id_prefix" {
+  description = "Reserved NHP resources table customer_id prefix qurl-service may write dynamic q_ catalog shard rows under"
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.nhp_resources_customer_id_prefix == ""
+      || can(regex("^[0-9A-HJKMNP-TV-Z]{26}$", var.nhp_resources_customer_id_prefix))
+    )
+    error_message = "nhp_resources_customer_id_prefix must be empty or a 26-character ULID-shaped prefix."
+  }
+}
+
 # ==================== Auth0 ====================
 
 variable "auth0_domain" {

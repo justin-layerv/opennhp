@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "contract": "qurl_dynamic_resource_row",
+  "description": "DynamoDB wire shape for qurl-service-owned dynamic qURL rows in NHP's nhp_resources table.",
+  "attributes": {
+    "customer_id": {
+      "type": "S",
+      "value": "00000000000000000000000001-20"
+    },
+    "resource_id": {
+      "type": "S",
+      "value": "q_123456789ab"
+    },
+    "owner_token_hash": {
+      "type": "S",
+      "value": "owner-token-hash"
+    },
+    "resource_fqdn": {
+      "type": "S",
+      "value": "backend.example.com"
+    },
+    "ac_id": {
+      "type": "S",
+      "value": "qurl-ac"
+    },
+    "dest_host": {
+      "type": "S",
+      "value": "backend.internal"
+    },
+    "dest_port": {
+      "type": "N",
+      "value": "8443"
+    },
+    "port_suffix": {
+      "type": "BOOL",
+      "value": true
+    },
+    "open_time": {
+      "type": "N",
+      "value": "300"
+    },
+    "auth_service_id": {
+      "type": "S",
+      "value": "qurl"
+    },
+    "ttl": {
+      "type": "N",
+      "value": "1893456000"
+    }
+  }
+}

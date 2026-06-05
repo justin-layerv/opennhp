@@ -3128,6 +3128,43 @@ func (s *UdpServer) ResolveInternalKnockAuthSvcProvider(ctx context.Context, asp
 	return s.resolveAuthSvcProvider(ctx, aspId, logPrefix, MetricInternalKnockASPNotFound)
 }
 
+// ResolveInternalKnockResource performs a direct resource_id lookup for
+// qurl-service's dynamic q_ resources. It intentionally bypasses the aspId map
+// cache used by ResolveInternalKnockAuthSvcProvider so freshly minted qURLs do
+// not wait for ResourceLookup's ASP-level cache TTL before becoming knockable.
+func (s *UdpServer) ResolveInternalKnockResource(ctx context.Context, aspId, resourceID, logPrefix string) (*common.ResourceData, error) {
+	if s.resourceLookup == nil {
+		s.incrCounterIfMetrics(MetricInternalKnockResourceNotFound)
+		return nil, common.ErrResourceNotFound
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	resolved, lookupErr := s.resourceLookup.LookupResource(ctx, aspId, resourceID)
+	if lookupErr == nil {
+		return resolved, nil
+	}
+	switch {
+	case errors.Is(lookupErr, context.Canceled) && ctx.Err() != nil:
+		log.Info("[%s] event=\"resource_lookup_shutdown\" aspId=%q resourceID=%q (server stopping; no counter increment — suppresses DDB-error metric even for a concurrent throttle)", logPrefix, aspId, resourceID)
+		return nil, ctx.Err()
+	case errors.Is(lookupErr, ErrResourceUnknownResource):
+		s.incrCounterIfMetrics(MetricInternalKnockResourceNotFound)
+		return nil, common.ErrResourceNotFound
+	default:
+		log.Error("[%s] resource lookup ddb error aspId=%q resourceID=%q: %v", logPrefix, aspId, resourceID, lookupErr)
+		s.incrCounterIfMetrics(MetricResourceLookupDDBError)
+		return nil, fmt.Errorf("resource lookup ddb error: %w", lookupErr)
+	}
+}
+
+func (s *UdpServer) incrCounterIfMetrics(name string) {
+	if s == nil || s.metrics == nil {
+		return
+	}
+	s.metrics.IncrCounter(name)
+}
+
 func (s *UdpServer) resolveAuthSvcProvider(ctx context.Context, aspId, logPrefix, unknownASPMetric string) (*common.AuthServiceProviderData, error) {
 	if aspData := s.FindAuthSvcProvider(aspId); aspData != nil {
 		return aspData, nil

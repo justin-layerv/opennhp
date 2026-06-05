@@ -223,6 +223,7 @@ type Resource struct {
 	PortSuffix    bool   `json:"port_suffix,omitempty" dynamodbav:"port_suffix,omitempty"`
 	OpenTime      int    `json:"open_time" dynamodbav:"open_time"` // Seconds
 	AuthServiceID string `json:"auth_service_id" dynamodbav:"auth_service_id"`
+	TTL           int64  `json:"ttl,omitempty" dynamodbav:"ttl,omitempty"`
 }
 
 // ============================================================================

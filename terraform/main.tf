@@ -2371,8 +2371,11 @@ module "qurl_service" {
   autoscaling_max_capacity = var.qurl_autoscaling_max_capacity
 
   # DynamoDB
-  dynamodb_table_arns   = module.dynamodb.qurl_table_arns
-  dynamodb_table_prefix = "${local.name_prefix}-${var.cell_id}"
+  dynamodb_table_arns              = module.dynamodb.qurl_table_arns
+  dynamodb_table_prefix            = "${local.name_prefix}-${var.cell_id}"
+  nhp_resources_table_name         = module.dynamodb.resources_table_name
+  nhp_resources_table_arn          = module.dynamodb.resources_table_arn
+  nhp_resources_customer_id_prefix = local.nhp_qurl_dynamic_customer_id_prefix
 
   # Auth0
   auth0_domain                     = var.qurl_auth0_domain

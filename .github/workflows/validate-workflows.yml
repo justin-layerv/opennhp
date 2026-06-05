@@ -52,6 +52,7 @@ on:
       - "terraform/environments/sandbox/**"
       - "terraform/modules/ac/variables.tf"
       - "terraform/variables.tf"
+      - "terraform/main.tf"
       - "terraform/resources.tf"
       - "endpoints/server/staticplugins/agent/plugin.go"
       - "endpoints/server/resource_lookup.go"

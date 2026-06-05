@@ -80,8 +80,17 @@ locals {
 
   # LayerV system customer (nil ULID) per dynamodb module convention.
   # Matches `nhpSystemCustomerID` in resource_lookup.go — the bridge
-  # queries this partition for any agent-aspId catalog lookup.
+  # queries this partition for agent-aspId catalog lookup and static qURL
+  # tunnel-server placement rows.
   nhp_system_customer_id = "00000000000000000000000000"
+
+  # Reserved dynamic qURL customer_id prefix. Matches
+  # `nhpQURLDynamicCustomerIDPrefix` in resource_lookup.go and qurl-service's
+  # NHPQurlDynamicCustomerIDPrefix. qurl-service writes dynamic per-token
+  # `q_...` rows under shard keys "<prefix>-00" through "<prefix>-ff", so
+  # DynamoDB hot traffic spreads across 256 partition keys while IAM
+  # LeadingKeys still excludes Terraform-owned static rows.
+  nhp_qurl_dynamic_customer_id_prefix = "00000000000000000000000001"
 
   # OpenTime in seconds. Mirrors the server's `DefaultIpOpenTime = 120`
   # constant (`endpoints/server/constants.go`); shorter than the QURL
@@ -108,6 +117,16 @@ check "tunnel_server_dest_host_shape" {
       can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", cfg.dest_host))
     ])
     error_message = "Every `local.tunnel_server_resource_ids[*].dest_host` is the internal tunnel-server dial target written into the DDB seed row's `dest_host` field; each must be a per-label RFC 1035 DNS name. Today's values derive from `module.data.namespace_name` + `var.frps_az_suffixes` which already conform; a future change to either input must preserve that."
+  }
+}
+
+check "tunnel_server_resource_id_static_prefix" {
+  assert {
+    condition = alltrue([
+      for resource_id, _ in local.tunnel_server_resource_ids :
+      startswith(resource_id, "qurl-")
+    ])
+    error_message = "Every static qURL tunnel-server resource_id must keep the `qurl-` prefix because resource_lookup.go key-bounds the qURL ASP cache to static `qurl-` rows; dynamic qurl-service rows live under resource_id-derived shard keys and resolve through exact GetItem."
   }
 }
 
@@ -149,6 +168,12 @@ resource "aws_dynamodb_table_item" "tunnel_server_nhp_resource" {
   #   SkipAuth = true       — pre-authenticated; X25519+DDB pubkey
   #                           lookup IS the auth gate (the agent plugin
   #                           fences on this).
+  #
+  # Do NOT add `ttl` to these static rows. qurl-service-owned dynamic `q_...`
+  # rows live under local.nhp_qurl_dynamic_customer_id_prefix shard keys, carry
+  # ttl, and the exact lookup rejects expired rows before DynamoDB's lazy TTL
+  # sweeper eventually removes them; a ttl attribute here can silently expire
+  # the static tunnel placement catalog.
   item = jsonencode({
     customer_id     = { S = local.nhp_system_customer_id }
     resource_id     = { S = each.key }
@@ -163,21 +188,38 @@ resource "aws_dynamodb_table_item" "tunnel_server_nhp_resource" {
 
   # Lifecycle NOTE: unlike `aws_dynamodb_table_item.ac_license` (which
   # carries `ignore_changes = [item]` because Console/qurl-service write
-  # to those rows out-of-band), the LayerV-system tunnel-server row is
-  # TF-exclusively owned. qurl-service does NOT write to `nhp_resources`
-  # for the system tenant (audited 2026-05-23 — no `nhp_resources` /
-  # `NhpResourcesTable` consumer in qurl-service; the table is read-only
-  # for non-TF writers via the bridge). Apply MUST reconcile this row
-  # so a TF-side `item` change (e.g. the #1976 cutover flipping
-  # auth_service_id and ac_id off their sentinels and resource_fqdn to
-  # the customer-facing host) actually propagates to DDB. Without that
-  # reconciliation the bridge's FilterExpression matches no rows and
-  # every knock returns ErrResourceUnknownASP — the failure mode this
-  # PR explicitly exists to fix. If a future system-tenant out-of-band
-  # writer lands (qurl-service growing system-row persistence), revisit
+  # to those rows out-of-band), these static qurl-tunnel-server rows are
+  # TF-exclusively owned. qurl-service writes dynamic per-token `q_...`
+  # rows under the reserved dynamic shard-key prefix, so IAM prevents it from
+  # mutating the static `qurl-tunnel-server*` resource IDs seeded here. Apply MUST
+  # reconcile these rows so a TF-side `item` change (e.g. the #1976
+  # cutover flipping auth_service_id and ac_id off their sentinels and
+  # resource_fqdn to the customer-facing host) actually propagates to
+  # DDB. Without that reconciliation the bridge's FilterExpression
+  # matches no rows and every knock returns ErrResourceUnknownASP — the
+  # failure mode this PR explicitly exists to fix. If a future
+  # out-of-band writer mutates these static resource IDs, revisit
   # field-level `ignore_changes = [item["<field>"]]` rather than the
   # whole `item`. #1909 tracks `prevent_destroy = true` for row-deletion
   # safety once that out-of-band-write surface exists.
+}
+
+locals {
+  # Central fence for Terraform-owned static rows in nhp_resources. Dynamic
+  # qurl-service-owned `q_...` rows intentionally carry ttl under the reserved
+  # shard prefix; any future Terraform-owned static table item resource must be
+  # added here so table-wide DynamoDB TTL cannot silently reap it.
+  static_nhp_resources_table_items = values(aws_dynamodb_table_item.tunnel_server_nhp_resource)
+}
+
+check "static_resource_rows_omit_ttl" {
+  assert {
+    condition = alltrue([
+      for row in local.static_nhp_resources_table_items :
+      !contains(keys(jsondecode(row.item)), "ttl")
+    ])
+    error_message = "Terraform-owned static nhp_resources rows must not carry ttl; DynamoDB TTL is table-wide and would eventually delete them."
+  }
 }
 
 # State address rename — `frps_nhp_resource` → `tunnel_server_nhp_resource`.

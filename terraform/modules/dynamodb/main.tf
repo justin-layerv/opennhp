@@ -305,6 +305,15 @@ resource "aws_dynamodb_table" "resources" {
     kms_key_arn = var.kms_key_arn
   }
 
+  # TTL is table-wide. Today only qurl-service-owned dynamic q_ rows may set
+  # ttl so stale per-token resources age out even if revoke cleanup misses a
+  # DeleteItem. Static Terraform-managed rows and any future nhp_resources
+  # writer must omit ttl unless the row is meant to expire.
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-${var.cell_id}-resources"
     Component = "dynamodb"

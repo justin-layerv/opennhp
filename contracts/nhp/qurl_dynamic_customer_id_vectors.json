@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "contract": "qurl_dynamic_customer_id",
+  "customer_id_prefix": "00000000000000000000000001",
+  "algorithm": "customer_id_prefix + '-' + first_byte_hex(sha256(resource_id))",
+  "cases": [
+    {
+      "resource_id": "q_123456789ab",
+      "customer_id": "00000000000000000000000001-20"
+    },
+    {
+      "resource_id": "q_00000000022",
+      "customer_id": "00000000000000000000000001-00"
+    },
+    {
+      "resource_id": "q_0000000007c",
+      "customer_id": "00000000000000000000000001-80"
+    },
+    {
+      "resource_id": "q_fffffffffff",
+      "customer_id": "00000000000000000000000001-f0"
+    },
+    {
+      "resource_id": "q_00000000001",
+      "customer_id": "00000000000000000000000001-ff"
+    }
+  ]
+}

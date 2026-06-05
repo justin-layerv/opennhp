@@ -1588,7 +1588,7 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 		return
 	}
 
-	resolvedResource, err := hs.resolveInternalKnockResource(ctx.Request.Context(), fwdReq.Request, fwdReq.Resource)
+	resolvedResource, err := hs.resolveInternalKnockResource(hs.internalKnockResourceLookupContext(), fwdReq.Request, fwdReq.Resource)
 	if err != nil {
 		switch {
 		case errors.Is(err, errInvalidInternalKnockRequest):

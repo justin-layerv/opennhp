@@ -21,6 +21,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
@@ -60,10 +61,33 @@ const (
 	// contract for the full revocation story.
 	resourceLookupCacheTTL = 60 * time.Second
 
+	// resourceLookupDirectCacheSize bounds the dynamic qURL direct-row cache.
+	// These entries are one small *ResourceData each, so the cache can be much
+	// wider than the ASP catalog cache without carrying the whole static
+	// ResourceGroups map. It exists to protect the one-popular-qURL case: 256
+	// resource_id-derived partitions spread aggregate traffic, but a single hot
+	// q_ token still maps to one DynamoDB item.
+	resourceLookupDirectCacheSize = 4096
+
+	// resourceLookupDirectCacheTTL is intentionally short. qurl-service remains
+	// the auth/token gate before it emits an internal knock; this cache only
+	// keeps the routing row warm. The effective entry expiry is min(this TTL,
+	// the row's app-level ttl) so an about-to-expire row cannot be kept alive by
+	// the cache while DynamoDB TTL deletion catches up asynchronously.
+	resourceLookupDirectCacheTTL = 5 * time.Second
+
+	// resourceLookupDirectNegativeCacheTTL caps repeated DDB reads for one hot
+	// revoked/expired/malformed qURL token. Keep it much shorter than the
+	// positive cache so a just-created/repaired row is admitted quickly while a
+	// bad token burst is flattened to roughly one consistent GetItem per second
+	// per server process. Transient DDB errors are never negative-cached.
+	resourceLookupDirectNegativeCacheTTL = 1 * time.Second
+
 	// nhpSystemCustomerID is the 26-char nil-ULID (Crockford base32
 	// alphabet, all zeros) partition that agent seed rows are written
 	// under (terraform/resources.tf's `local.nhp_system_customer_id`).
-	// All current "agent" resources share this partition; a future
+	// System-owned static qURL tunnel-server rows also live here, but
+	// qurl-service-owned dynamic q_ rows deliberately do not. A future
 	// per-tenant schema would key by a real customer ULID instead. The
 	// constant is duplicated from terraform's `local`; a drift on either
 	// side surfaces as a cache miss that returns ErrResourceUnknownASP
@@ -78,7 +102,27 @@ const (
 	// agentPeerLookupIndexName ↔ `terraform/modules/dynamodb/main.tf`'s
 	// `pubkey-index` constant.
 	nhpSystemCustomerID = "00000000000000000000000000"
+
+	// nhpQURLDynamicCustomerIDPrefix is the reserved customer_id prefix for
+	// qurl-service-owned dynamic q_ rows. LookupResource derives the final
+	// partition as "<prefix>-<00..ff>" from resource_id, matching qurl-service's
+	// writer-side helper. This keeps the direct lookup to one GetItem while
+	// spreading high-volume dynamic rows across 256 DynamoDB partition keys.
+	nhpQURLDynamicCustomerIDPrefix = "00000000000000000000000001"
+
+	// Dynamic qURL rows use resource_id="q_..." and are resolved via exact
+	// GetItem. The cached qURL ASP catalog is only for static qURL resources
+	// such as qurl-tunnel-server and its per-AZ rows, all of which carry the
+	// "qurl-" prefix. Keep the Query key-bounded to this prefix so a
+	// mis-written qURL row in the static partition cannot enter the
+	// ASP-level placement cache.
+	qurlStaticResourcePrefix = "qurl-"
 )
+
+func qurlDynamicCustomerIDForResourceID(resourceID string) string {
+	sum := sha256.Sum256([]byte(resourceID))
+	return fmt.Sprintf("%s-%02x", nhpQURLDynamicCustomerIDPrefix, sum[0])
+}
 
 // Lookup-error sentinels. Wired into structured log events so triage
 // can distinguish "DDB outage" from "unknown aspId" from "writer-side
@@ -91,6 +135,11 @@ var (
 	// ErrResourceUnknownASP indicates no rows under the configured
 	// customer partition carry the requested auth_service_id.
 	ErrResourceUnknownASP = errors.New("resource lookup: unknown aspId")
+
+	// ErrResourceUnknownResource indicates the requested resource_id
+	// does not exist under the configured customer partition for the
+	// requested auth_service_id.
+	ErrResourceUnknownResource = errors.New("resource lookup: unknown resource")
 
 	// ErrResourceLookupInternal signals a programmer-error reachable
 	// only via a future regression in this package — e.g., a
@@ -109,6 +158,7 @@ var (
 // separately from the storage-layer cache TTLs.
 type resourcesQuerier interface {
 	Query(ctx context.Context, params *dynamodb.QueryInput, optFns ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
+	GetItem(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 }
 
 // aspDataApplier publishes a freshly-resolved *AuthServiceProviderData
@@ -129,6 +179,17 @@ type aspDataApplier interface {
 type resourceCacheEntry struct {
 	asp       *common.AuthServiceProviderData
 	fetchedAt time.Time
+}
+
+type resourceDirectCacheKey struct {
+	aspId      string
+	resourceID string
+}
+
+type resourceDirectCacheEntry struct {
+	resource *common.ResourceData
+	expires  time.Time
+	negative bool
 }
 
 // ResourceLookup is the per-process resolver for aspId →
@@ -155,21 +216,26 @@ type resourceCacheEntry struct {
 // the agent-peer lookup. A future hardening could negative-cache
 // unknown aspIds for 1–2s; deferred until traffic justifies it.
 type ResourceLookup struct {
-	cache      *lru.Cache[string, *resourceCacheEntry]
-	querier    resourcesQuerier
-	table      string
-	customerID string
-	ttl        time.Duration
-	applier    aspDataApplier
-	now        func() time.Time
-	sfGroup    singleflight.Group
-	metrics    counterIncrementer
+	cache       *lru.Cache[string, *resourceCacheEntry]
+	directCache *lru.Cache[resourceDirectCacheKey, *resourceDirectCacheEntry]
+	querier     resourcesQuerier
+	table       string
+	customerID  string
+	ttl         time.Duration
+	applier     aspDataApplier
+	now         func() time.Time
+	sfGroup     singleflight.Group
+	directGroup singleflight.Group
+	metrics     counterIncrementer
 	// onSingleflightEnter is a test-only hook invoked at every caller's
 	// entry into sfGroup.Do (NOT just the winner's closure body).
 	// Mirrors the agent-peer hook so the singleflight tests have a
 	// barrier to confirm all N concurrent callers commit to a slot
 	// before the winner's DDB Query completes. nil in production.
 	onSingleflightEnter func(aspId string)
+	// onDirectSingleflightEnter is the direct qURL-resource equivalent of
+	// onSingleflightEnter. nil in production.
+	onDirectSingleflightEnter func(aspId, resourceID string)
 }
 
 // NewResourceLookup constructs a ResourceLookup wired to a DynamoDB
@@ -192,14 +258,19 @@ func NewResourceLookup(querier resourcesQuerier, tableName, customerID string, a
 		// upstream semantics change) fails loud at construction.
 		return nil, fmt.Errorf("resource lookup: lru init: %w", err)
 	}
+	directCache, err := lru.New[resourceDirectCacheKey, *resourceDirectCacheEntry](resourceLookupDirectCacheSize)
+	if err != nil {
+		return nil, fmt.Errorf("resource lookup: direct lru init: %w", err)
+	}
 	return &ResourceLookup{
-		cache:      cache,
-		querier:    querier,
-		table:      tableName,
-		customerID: customerID,
-		ttl:        resourceLookupCacheTTL,
-		applier:    applier,
-		now:        time.Now,
+		cache:       cache,
+		directCache: directCache,
+		querier:     querier,
+		table:       tableName,
+		customerID:  customerID,
+		ttl:         resourceLookupCacheTTL,
+		applier:     applier,
+		now:         time.Now,
 	}, nil
 }
 
@@ -305,17 +376,119 @@ func (l *ResourceLookup) LookupAuthServiceProvider(ctx context.Context, aspId st
 	return asp, nil
 }
 
+// LookupResource returns one ResourceData by exact resource_id. It deliberately
+// bypasses the aspId-level cache used by LookupAuthServiceProvider: dynamic
+// qURL resources are minted continuously by qurl-service, so callers must keep
+// this path scoped to those dynamic `q_...` IDs and leave static qURL tunnel
+// resources on the ASP placement path. It still uses its own short direct-row
+// cache plus singleflight: the first lookup reads the resource_id-derived
+// dynamic qURL shard with strongly consistent GetItem, while repeated knocks
+// for the same hot qURL stay in-process until the shorter of
+// resourceLookupDirectCacheTTL or the row's app-level ttl. Direct rows must
+// carry a live app-level ttl; DynamoDB TTL deletion is asynchronous, so
+// expired-but-not-swept rows are rejected here before they become knockable
+// ResourceData. Unknown/invalid direct rows are cached negatively for a much
+// shorter window so one hot revoked/expired token cannot issue one consistent
+// GetItem per knock.
+//
+// CONTRACT: callers MUST pass UdpServer.LifecycleCtx() or another
+// shutdown-scoped context, not a per-request context. The singleflight closure
+// captures the first caller's ctx; if that request context is canceled, every
+// piggybacked caller would receive the same cancellation even if its own request
+// is still live.
+func (l *ResourceLookup) LookupResource(ctx context.Context, aspId, resourceID string) (*common.ResourceData, error) {
+	if l == nil || aspId == "" || resourceID == "" || l.querier == nil {
+		return nil, ErrResourceUnknownResource
+	}
+	if aspId != qurlInternalKnockAuthServiceID || !isQURLDynamicResourceID(resourceID) {
+		return nil, ErrResourceUnknownResource
+	}
+
+	if res, ok := l.getCachedDirectResource(aspId, resourceID); ok {
+		if res == nil {
+			return nil, ErrResourceUnknownResource
+		}
+		return res, nil
+	}
+
+	if l.onDirectSingleflightEnter != nil {
+		l.onDirectSingleflightEnter(aspId, resourceID)
+	}
+	v, err, _ := l.directGroup.Do(directResourceSingleflightKey(aspId, resourceID), func() (any, error) {
+		if res, ok := l.getCachedDirectResource(aspId, resourceID); ok {
+			if res == nil {
+				return nil, ErrResourceUnknownResource
+			}
+			return res, nil
+		}
+		return l.lookupAndCacheDirectResource(ctx, aspId, resourceID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	res, ok := v.(*common.ResourceData)
+	if !ok {
+		return nil, fmt.Errorf("%w: %w: unexpected direct lookup result type %T", ErrResourceLookupInternal, ErrResourceLookupRetryAfter, v)
+	}
+	return res, nil
+}
+
+func (l *ResourceLookup) lookupAndCacheDirectResource(ctx context.Context, aspId, resourceID string) (*common.ResourceData, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
+	defer cancel()
+
+	customerID := qurlDynamicCustomerIDForResourceID(resourceID)
+	out, err := l.querier.GetItem(queryCtx, &dynamodb.GetItemInput{
+		TableName:      aws.String(l.table),
+		ConsistentRead: aws.Bool(true),
+		Key: map[string]types.AttributeValue{
+			"customer_id": &types.AttributeValueMemberS{Value: customerID},
+			"resource_id": &types.AttributeValueMemberS{Value: resourceID},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrResourceLookupRetryAfter, err)
+	}
+	if len(out.Item) == 0 {
+		l.cacheNegativeDirectResource(aspId, resourceID)
+		return nil, ErrResourceUnknownResource
+	}
+
+	var row Resource
+	if err := attributevalue.UnmarshalMap(out.Item, &row); err != nil {
+		log.Warning("resource lookup: malformed direct row in nhp_resources partition=%q resource_id=%q err=%v (writer-side schema regression — investigate)",
+			customerID, resourceID, err)
+		if l.metrics != nil {
+			l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
+		}
+		l.cacheNegativeDirectResource(aspId, resourceID)
+		return nil, ErrResourceUnknownResource
+	}
+	resData, ok := l.resourceDataFromRow(aspId, row, true)
+	if !ok {
+		l.cacheNegativeDirectResource(aspId, resourceID)
+		return nil, ErrResourceUnknownResource
+	}
+	l.cacheDirectResource(aspId, resourceID, row.TTL, resData)
+	return resData, nil
+}
+
+func directResourceSingleflightKey(aspId, resourceID string) string {
+	return aspId + "\x00" + resourceID
+}
+
 // queryAndCache Queries the system partition for all rows, filters
 // by auth_service_id == aspId, assembles the *AuthServiceProviderData
 // (one ResourceGroup per row, with inner Resources keyed identically),
 // applies it to authServiceMap, and caches it.
 //
 // The Query is partition-bounded (single customer_id) so cost is
-// O(rows-under-partition), not O(table). Today the system partition
-// holds only the small agent catalog (a few rows under
-// `auth_service_id = "agent"`); a future per-tenant schema would
-// partition by real customer_id and this query would still be small
-// per-tenant.
+// O(rows-under-partition), not O(table). Dynamic qURL `q_` rows live in
+// a separate partition read only by LookupResource/GetItem, so agent and
+// static qURL ASP refreshes do not scale with qURL token count. For the qURL
+// ASP, the key condition is still narrowed to static `qurl-` resources as a
+// row-shape guard. A future per-tenant schema would partition by real
+// customer_id and this query would still be small per-tenant.
 //
 // SkipAuth=true is stamped on the resulting *AuthServiceProviderData
 // to match the contract the agent plugin fences on (see
@@ -330,23 +503,27 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 	queryCtx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
 	defer cancel()
 
-	// FilterExpression on auth_service_id keeps the wire response
-	// bounded to rows for the requested aspId. DDB still consumes RCUs
-	// for the full partition scan (the filter applies post-Query), so
-	// this is NOT a cost-control mechanism — it's a transfer-size and
-	// unmarshal-cost reduction that becomes load-bearing once the
-	// partition holds rows for multiple aspIds (the multi-aspId schema
-	// the godoc anticipates). Today the system partition only carries
-	// `auth_service_id = "agent"` rows; the filter is a no-op against
-	// current data.
+	// FilterExpression on auth_service_id keeps the wire response bounded to
+	// rows for the requested aspId. DDB still consumes RCUs for every row that
+	// matches the KeyConditionExpression (the filter applies post-Query), so
+	// this is NOT a cost-control mechanism. The qURL ASP adds a sort-key prefix
+	// condition below as a static-row shape fence; dynamic `q_` rows live in the
+	// resource_id-derived dynamic shard partitions and are not visible to this
+	// Query.
+	keyCondition := "customer_id = :cid"
+	values := map[string]types.AttributeValue{
+		":cid": &types.AttributeValueMemberS{Value: l.customerID},
+		":asp": &types.AttributeValueMemberS{Value: aspId},
+	}
+	if aspId == qurlInternalKnockAuthServiceID {
+		keyCondition += " AND begins_with(resource_id, :rid_prefix)"
+		values[":rid_prefix"] = &types.AttributeValueMemberS{Value: qurlStaticResourcePrefix}
+	}
 	out, err := l.querier.Query(queryCtx, &dynamodb.QueryInput{
-		TableName:              aws.String(l.table),
-		KeyConditionExpression: aws.String("customer_id = :cid"),
-		FilterExpression:       aws.String("auth_service_id = :asp"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":cid": &types.AttributeValueMemberS{Value: l.customerID},
-			":asp": &types.AttributeValueMemberS{Value: aspId},
-		},
+		TableName:                 aws.String(l.table),
+		KeyConditionExpression:    aws.String(keyCondition),
+		FilterExpression:          aws.String("auth_service_id = :asp"),
+		ExpressionAttributeValues: values,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrResourceLookupRetryAfter, err)
@@ -396,166 +573,11 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 			}
 			continue
 		}
-		// Defense-in-depth: KeyConditionExpression already constrains
-		// rows to l.customerID, but a future regression in the query
-		// expression (typo, missing :cid substitution, AWS SDK quirk)
-		// could let cross-partition rows leak silently. A row from
-		// the wrong partition has no business being inserted into
-		// THIS partition's aspData; skip + count so the regression
-		// surfaces in alarms rather than as a cross-tenant correctness
-		// bug. Dedicated counter (not MetricResourceLookupMalformedRow)
-		// because the alarm urgency is different — a cross-partition
-		// row in a per-tenant schema is a potential cross-tenant leak
-		// and should fire at threshold `> 0`, not the row-shape-drift
-		// thresholds operators set on MalformedRow.
-		if row.CustomerID != l.customerID {
-			log.Warning("resource lookup: skipping cross-partition row partition=%q row.customer_id=%q aspId=%q resource_id=%q (KeyConditionExpression regression — investigate)",
-				l.customerID, row.CustomerID, aspId, row.ResourceID)
-			if l.metrics != nil {
-				l.metrics.IncrCounter(MetricResourceLookupCrossPartition)
-			}
+		resData, ok := l.resourceDataFromRow(aspId, row, false)
+		if !ok {
 			continue
 		}
-		if row.AuthServiceID != aspId {
-			// Defense-in-depth: the server-side FilterExpression
-			// (`auth_service_id = :asp` in the Query above) already
-			// constrains the wire response to rows where this is true.
-			// A row reaching this client-side check that fails it means
-			// a filter regression — typo, missing :asp substitution,
-			// AWS SDK quirk, or a future writer path that bypasses the
-			// filter. Without this counter the regression silently
-			// surfaces as either (a) cross-aspId routing (a knock for X
-			// gets resources from Y) or (b) ErrResourceUnknownASP if
-			// no rows match. Either shape is bad; the counter lets the
-			// regression alarm at threshold > 0 rather than wait for
-			// the downstream symptom. Mirrors the cross-partition
-			// branch above.
-			log.Warning("resource lookup: skipping row with mismatched auth_service_id partition=%q row.auth_service_id=%q requested aspId=%q resource_id=%q (FilterExpression regression — investigate)",
-				l.customerID, row.AuthServiceID, aspId, row.ResourceID)
-			if l.metrics != nil {
-				l.metrics.IncrCounter(MetricResourceLookupAspMismatch)
-			}
-			continue
-		}
-		if row.ResourceID == "" {
-			// Defensive: a row without a resource_id can't be addressed
-			// by an agent knock and would key the inner map on "".
-			// Skip rather than poison the map. Fires the malformed-row
-			// counter for parity with the UnmarshalMap branch — both
-			// are writer-side regressions of the same severity, and an
-			// operator dashboarding the counter should see either.
-			log.Warning("resource lookup: skipping row with empty resource_id partition=%q aspId=%q ac_id=%q",
-				l.customerID, aspId, row.ACID)
-			if l.metrics != nil {
-				l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
-			}
-			continue
-		}
-		if row.ResourceFQDN == "" {
-			// Defensive: the bridge leaves Addr.Ip empty so the ack
-			// host comes from ResourceFQDN/Hostname. A row missing both
-			// would emit an empty ResourceHost and leave the agent with
-			// no usable dial target. Treat it as malformed at the DDB
-			// boundary instead of papering over it at DestHost().
-			log.Warning("resource lookup: skipping row with empty resource_fqdn partition=%q aspId=%q resource_id=%q ac_id=%q",
-				l.customerID, aspId, row.ResourceID, row.ACID)
-			if l.metrics != nil {
-				l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
-			}
-			continue
-		}
-		if row.PortSuffix && (row.DestPort <= 0 || row.DestPort > 65535) {
-			// Defensive: port_suffix=true is the writer's promise that
-			// ResourceInfo.DestHost() will publish resource_fqdn:dest_port
-			// to the agent. A missing/out-of-range dest_port would otherwise
-			// degrade into a bare hostname and hide the writer regression
-			// until agents fail to reach the intended per-AZ listener.
-			log.Warning("resource lookup: skipping row with port_suffix=true but out-of-range dest_port=%d partition=%q aspId=%q resource_id=%q ac_id=%q",
-				row.DestPort, l.customerID, aspId, row.ResourceID, row.ACID)
-			if l.metrics != nil {
-				l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
-			}
-			continue
-		}
-
 		matched++
-
-		// OpenTime: defend against writer-side regressions. Non-positive
-		// → DefaultIpOpenTime (the TOML overlay can't emit 0; treating
-		// 0 as a regression keeps the contract symmetric across both
-		// loaders). Overflow comparison widens to int64 so a value
-		// >MaxUint32 that fits in 64-bit int doesn't wrap to garbage
-		// when cast to uint32. The clamp catches a future writer
-		// regression (admin manual edit, schema migration default);
-		// it isn't a portability fence — on 32-bit builds the
-		// unmarshal would truncate before reaching here.
-		openTime := row.OpenTime
-		if openTime <= 0 {
-			log.Warning("resource lookup: non-positive open_time=%d for aspId=%q resource_id=%q — using DefaultIpOpenTime",
-				openTime, aspId, row.ResourceID)
-			openTime = DefaultIpOpenTime
-		}
-		if int64(openTime) > int64(math.MaxUint32) {
-			log.Warning("resource lookup: open_time=%d exceeds uint32 for aspId=%q resource_id=%q — clamping",
-				openTime, aspId, row.ResourceID)
-			// Use math.MaxInt32 instead of math.MaxUint32 to avoid a
-			// signed-overflow on 32-bit builds where int(uint32(max))
-			// truncates to -1. The downstream uint32 cast at the
-			// ResourceGroup.OpenTime assignment widens it back, but
-			// storing a positive int through the rest of the function
-			// keeps the value sane for any future caller reading the
-			// local. Caps at ~68 years (MaxInt32 seconds), still well
-			// past any plausible OpenTime use.
-			openTime = math.MaxInt32
-		}
-
-		// Build the in-memory ResourceData the agent plugin's
-		// callback path consumes. The shape contract:
-		//   - Hostname carries the customer-facing ingress (from
-		//     row.ResourceFQDN); the agent plugin's callback path
-		//     (handleNhpOpenResource → ResourceData.DestHost()) falls
-		//     back to Hostname when Addr.Ip is empty, so leaving Ip
-		//     blank is load-bearing — the AC's
-		//     applyDefaultIpSubstitution writes LOCAL_IP at ipset-time.
-		//   - row.DestHost is intentionally NOT propagated; today the
-		//     TF writer puts the internal Cloud Map name in dest_host
-		//     and the customer-facing ingress in resource_fqdn (= the
-		//     two values genuinely diverge, see terraform/resources.tf
-		//     `tunnel_server_resource_ids`). The bridge surfaces only the
-		//     ingress to the agent (via Hostname); the internal name
-		//     stays informational. If a future row needs both legs
-		//     visible (proxy/gateway in front of dial target), revisit
-		//     so dest_host populates Addr.Ip.
-		//   - Resources map keys MUST match the outer ResourceGroups
-		//     key (inner-equals-outer is load-bearing — the agent
-		//     plugin's `helper.AspData.ResourceGroups[req.Msg.ResourceId]`
-		//     lookup keys on the outer; the inner Resources map is
-		//     iterated by handleNhpOpenResource to issue per-resource
-		//     AC ops).
-		//   - SkipAuth=true is hardcoded here because the agent
-		//     plugin fences on res.SkipAuth and refuses with
-		//     ErrBackendAuthRequired (52007) if false. The
-		//     X25519+DDB pubkey lookup upstream IS the auth gate;
-		//     this catalog path is post-auth.
-		resData := &common.ResourceData{
-			ResourceGroup: common.ResourceGroup{
-				AuthServiceId: aspId,
-				ResourceId:    row.ResourceID,
-				OpenTime:      uint32(openTime),
-				Resources: map[string]*common.ResourceInfo{
-					row.ResourceID: {
-						ACId:       row.ACID,
-						Hostname:   row.ResourceFQDN,
-						PortSuffix: row.PortSuffix,
-						Addr: &common.NetAddress{
-							Port:     row.DestPort,
-							Protocol: "tcp",
-						},
-					},
-				},
-			},
-			SkipAuth: true,
-		}
 		asp.ResourceGroups[row.ResourceID] = resData
 	}
 
@@ -586,6 +608,116 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 	return asp, nil
 }
 
+func (l *ResourceLookup) resourceDataFromRow(aspId string, row Resource, direct bool) (*common.ResourceData, bool) {
+	rowKind := "row"
+	aspMismatchReason := "FilterExpression regression"
+	aspMismatchMetric := MetricResourceLookupAspMismatch
+	partitionID := l.customerID
+	if direct {
+		rowKind = "direct row"
+		aspMismatchReason = "requested aspId mismatch"
+		aspMismatchMetric = MetricResourceLookupDirectAspMismatch
+		// Direct rows are exact-key GetItem results, so DDB already
+		// bounds row.CustomerID to the derived shard partition.
+		partitionID = row.CustomerID
+	}
+	if !direct && row.CustomerID != l.customerID {
+		log.Warning("resource lookup: skipping cross-partition row partition=%q row.customer_id=%q aspId=%q resource_id=%q (KeyConditionExpression regression — investigate)",
+			l.customerID, row.CustomerID, aspId, row.ResourceID)
+		if l.metrics != nil {
+			l.metrics.IncrCounter(MetricResourceLookupCrossPartition)
+		}
+		return nil, false
+	}
+	if row.AuthServiceID != aspId {
+		log.Warning("resource lookup: skipping %s with mismatched auth_service_id partition=%q row.auth_service_id=%q requested aspId=%q resource_id=%q (%s)",
+			rowKind, partitionID, row.AuthServiceID, aspId, row.ResourceID, aspMismatchReason)
+		if l.metrics != nil {
+			l.metrics.IncrCounter(aspMismatchMetric)
+		}
+		return nil, false
+	}
+	if row.ResourceID == "" {
+		log.Warning("resource lookup: skipping %s with empty resource_id partition=%q aspId=%q ac_id=%q",
+			rowKind, partitionID, aspId, row.ACID)
+		if l.metrics != nil {
+			l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
+		}
+		return nil, false
+	}
+	if direct {
+		nowUnix := l.now().Unix()
+		switch {
+		case row.TTL <= 0:
+			log.Warning("resource lookup: skipping direct row with missing ttl partition=%q aspId=%q resource_id=%q",
+				partitionID, aspId, row.ResourceID)
+			if l.metrics != nil {
+				l.metrics.IncrCounter(MetricResourceLookupMissingDirectTTL)
+			}
+			return nil, false
+		case row.TTL <= nowUnix:
+			log.Warning("resource lookup: skipping expired direct row partition=%q aspId=%q resource_id=%q ttl=%d now=%d",
+				partitionID, aspId, row.ResourceID, row.TTL, nowUnix)
+			if l.metrics != nil {
+				l.metrics.IncrCounter(MetricResourceLookupExpiredDirectRow)
+			}
+			return nil, false
+		}
+	}
+	if row.ResourceFQDN == "" {
+		log.Warning("resource lookup: skipping %s with empty resource_fqdn partition=%q aspId=%q resource_id=%q ac_id=%q",
+			rowKind, partitionID, aspId, row.ResourceID, row.ACID)
+		if l.metrics != nil {
+			l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
+		}
+		return nil, false
+	}
+	if row.PortSuffix && (row.DestPort <= 0 || row.DestPort > 65535) {
+		log.Warning("resource lookup: skipping %s with port_suffix=true but out-of-range dest_port=%d partition=%q aspId=%q resource_id=%q ac_id=%q",
+			rowKind, row.DestPort, partitionID, aspId, row.ResourceID, row.ACID)
+		if l.metrics != nil {
+			l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
+		}
+		return nil, false
+	}
+
+	openTime := row.OpenTime
+	if openTime <= 0 {
+		log.Warning("resource lookup: non-positive open_time=%d for aspId=%q resource_id=%q — using DefaultIpOpenTime",
+			openTime, aspId, row.ResourceID)
+		openTime = DefaultIpOpenTime
+	}
+	if int64(openTime) > int64(math.MaxUint32) {
+		log.Warning("resource lookup: open_time=%d exceeds uint32 for aspId=%q resource_id=%q — clamping",
+			openTime, aspId, row.ResourceID)
+		openTime = math.MaxInt32
+	}
+
+	// Shape contract shared by the ASP Query and direct GetItem paths:
+	// Hostname carries the customer-facing ingress, DestHost stays
+	// informational, inner Resources keys match the outer ResourceGroup key,
+	// and SkipAuth=true because this catalog path is post-auth.
+	return &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			AuthServiceId: aspId,
+			ResourceId:    row.ResourceID,
+			OpenTime:      uint32(openTime),
+			Resources: map[string]*common.ResourceInfo{
+				row.ResourceID: {
+					ACId:       row.ACID,
+					Hostname:   row.ResourceFQDN,
+					PortSuffix: row.PortSuffix,
+					Addr: &common.NetAddress{
+						Port:     row.DestPort,
+						Protocol: "tcp",
+					},
+				},
+			},
+		},
+		SkipAuth: true,
+	}, true
+}
+
 // getCached returns a non-expired aspData from the cache, or nil if
 // the entry is missing OR expired. Expired entries are removed inline
 // so the next call takes the DDB path. Mirrors AgentPeerLookup.getCached.
@@ -602,6 +734,48 @@ func (l *ResourceLookup) getCached(aspId string) *common.AuthServiceProviderData
 		l.metrics.IncrCounter(MetricResourceLookupCacheHit)
 	}
 	return entry.asp
+}
+
+func (l *ResourceLookup) getCachedDirectResource(aspId, resourceID string) (*common.ResourceData, bool) {
+	key := resourceDirectCacheKey{aspId: aspId, resourceID: resourceID}
+	entry, ok := l.directCache.Get(key)
+	if !ok {
+		return nil, false
+	}
+	if !l.now().Before(entry.expires) {
+		l.directCache.Remove(key)
+		return nil, false
+	}
+	if entry.negative {
+		return nil, true
+	}
+	return entry.resource, true
+}
+
+func (l *ResourceLookup) cacheDirectResource(aspId, resourceID string, rowTTL int64, resource *common.ResourceData) {
+	if resource == nil || rowTTL <= 0 {
+		return
+	}
+	now := l.now()
+	expires := now.Add(resourceLookupDirectCacheTTL)
+	if ttlExpires := time.Unix(rowTTL, 0); ttlExpires.Before(expires) {
+		expires = ttlExpires
+	}
+	if !expires.After(now) {
+		return
+	}
+	l.directCache.Add(resourceDirectCacheKey{aspId: aspId, resourceID: resourceID}, &resourceDirectCacheEntry{
+		resource: resource,
+		expires:  expires,
+	})
+}
+
+func (l *ResourceLookup) cacheNegativeDirectResource(aspId, resourceID string) {
+	expires := l.now().Add(resourceLookupDirectNegativeCacheTTL)
+	l.directCache.Add(resourceDirectCacheKey{aspId: aspId, resourceID: resourceID}, &resourceDirectCacheEntry{
+		expires:  expires,
+		negative: true,
+	})
 }
 
 // NewResourceLookupFromStorage builds a ResourceLookup using the

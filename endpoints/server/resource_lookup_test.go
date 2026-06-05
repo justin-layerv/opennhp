@@ -2,9 +2,14 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,16 +25,19 @@ import (
 
 // fakeResourcesQuerier mocks the DDB Query path for ResourceLookup.
 // Stores rows keyed by resource_id; Query returns every row whose
-// stored customer_id matches the request's :cid value (mirrors the
-// real DDB partition behavior — the table is keyed on customer_id
-// and Query returns ALL rows in that partition, not filtered by
-// auth_service_id; the ResourceLookup filters client-side).
+// stored customer_id matches the request's :cid value and optional
+// sort-key prefix. This mirrors the real DDB partition behavior: the
+// table is keyed on customer_id/resource_id, while auth_service_id is
+// only a FilterExpression that this fake intentionally ignores so the
+// client-side defense checks stay testable.
 type fakeResourcesQuerier struct {
 	mu                 sync.Mutex
 	calls              int
 	rowsByCust         map[string][]map[string]types.AttributeValue
 	err                error
 	beforeQuery        func()
+	beforeGetItem      func()
+	beforeGetItemCtx   func(context.Context)
 	simulatePagination bool
 }
 
@@ -47,6 +55,25 @@ func newFakeResourcesQuerier() *fakeResourcesQuerier {
 // legacy DDB rows written before the attribute existed.
 func (f *fakeResourcesQuerier) put(customerID, resourceID, aspID, acID, resourceFQDN, destHost string, destPort, openTime int) {
 	f.putResource(customerID, resourceID, aspID, acID, resourceFQDN, destHost, destPort, openTime, false, false)
+}
+
+func (f *fakeResourcesQuerier) putWithTTL(customerID, resourceID, aspID, acID, resourceFQDN, destHost string, destPort, openTime int, ttl int64) {
+	f.putResource(customerID, resourceID, aspID, acID, resourceFQDN, destHost, destPort, openTime, false, false)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rows := f.rowsByCust[customerID]
+	if len(rows) == 0 {
+		return
+	}
+	rows[len(rows)-1]["ttl"] = &types.AttributeValueMemberN{Value: strconv.FormatInt(ttl, 10)}
+}
+
+func (f *fakeResourcesQuerier) putDynamicQURL(resourceID, aspID, acID, resourceFQDN, destHost string, destPort, openTime int) {
+	f.put(qurlDynamicCustomerIDForResourceID(resourceID), resourceID, aspID, acID, resourceFQDN, destHost, destPort, openTime)
+}
+
+func (f *fakeResourcesQuerier) putDynamicQURLWithTTL(resourceID, aspID, acID, resourceFQDN, destHost string, destPort, openTime int, ttl int64) {
+	f.putWithTTL(qurlDynamicCustomerIDForResourceID(resourceID), resourceID, aspID, acID, resourceFQDN, destHost, destPort, openTime, ttl)
 }
 
 // putWithPortSuffix emits the port_suffix attribute explicitly. Use it
@@ -72,6 +99,12 @@ func (f *fakeResourcesQuerier) putResource(customerID, resourceID, aspID, acID, 
 	if includePortSuffix {
 		row["port_suffix"] = &types.AttributeValueMemberBOOL{Value: portSuffix}
 	}
+	f.rowsByCust[customerID] = append(f.rowsByCust[customerID], row)
+}
+
+func (f *fakeResourcesQuerier) putDynamoDBItem(customerID string, row map[string]types.AttributeValue) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.rowsByCust[customerID] = append(f.rowsByCust[customerID], row)
 }
 
@@ -119,9 +152,29 @@ func (f *fakeResourcesQuerier) Query(_ context.Context, in *dynamodb.QueryInput,
 		return &dynamodb.QueryOutput{}, nil
 	}
 	rows := f.rowsByCust[cid]
-	// Copy the slice so the caller's iteration doesn't race with put().
-	out := make([]map[string]types.AttributeValue, len(rows))
-	copy(out, rows)
+	keyCondition := ""
+	if in.KeyConditionExpression != nil {
+		keyCondition = *in.KeyConditionExpression
+	}
+	resourceIDPrefix := ""
+	if strings.Contains(keyCondition, "begins_with(resource_id, :rid_prefix)") {
+		if v, ok := in.ExpressionAttributeValues[":rid_prefix"]; ok {
+			if s, ok := v.(*types.AttributeValueMemberS); ok {
+				resourceIDPrefix = s.Value
+			}
+		}
+	}
+	// Copy matching rows so the caller's iteration doesn't race with put().
+	out := make([]map[string]types.AttributeValue, 0, len(rows))
+	for _, row := range rows {
+		if resourceIDPrefix != "" {
+			rid, _ := row["resource_id"].(*types.AttributeValueMemberS)
+			if rid == nil || !strings.HasPrefix(rid.Value, resourceIDPrefix) {
+				continue
+			}
+		}
+		out = append(out, row)
+	}
 	resp := &dynamodb.QueryOutput{Items: out}
 	if f.simulatePagination {
 		// Mimic DDB returning a continuation token on a paginated
@@ -134,6 +187,54 @@ func (f *fakeResourcesQuerier) Query(_ context.Context, in *dynamodb.QueryInput,
 		}
 	}
 	return resp, nil
+}
+
+func (f *fakeResourcesQuerier) GetItem(ctx context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	f.mu.Lock()
+	beforeGetItem := f.beforeGetItem
+	beforeGetItemCtx := f.beforeGetItemCtx
+	f.mu.Unlock()
+	if beforeGetItem != nil {
+		beforeGetItem()
+	}
+	if beforeGetItemCtx != nil {
+		beforeGetItemCtx(ctx)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	cid := ""
+	if v, ok := in.Key["customer_id"]; ok {
+		if s, ok := v.(*types.AttributeValueMemberS); ok {
+			cid = s.Value
+		}
+	}
+	resourceID := ""
+	if v, ok := in.Key["resource_id"]; ok {
+		if s, ok := v.(*types.AttributeValueMemberS); ok {
+			resourceID = s.Value
+		}
+	}
+	if cid == "" || resourceID == "" {
+		return &dynamodb.GetItemOutput{}, nil
+	}
+	for _, row := range f.rowsByCust[cid] {
+		v, ok := row["resource_id"].(*types.AttributeValueMemberS)
+		if !ok || v.Value != resourceID {
+			continue
+		}
+		item := make(map[string]types.AttributeValue, len(row))
+		for k, attr := range row {
+			item[k] = attr
+		}
+		return &dynamodb.GetItemOutput{Item: item}, nil
+	}
+	return &dynamodb.GetItemOutput{}, nil
 }
 
 func (f *fakeResourcesQuerier) callCount() int {
@@ -186,6 +287,174 @@ func newTestResourceLookup(t *testing.T, q resourcesQuerier, applier aspDataAppl
 		t.Fatalf("NewResourceLookup: %v", err)
 	}
 	return l
+}
+
+func TestQURLDynamicCustomerIDForResourceID(t *testing.T) {
+	fixture := loadNHPQURLDynamicCustomerIDFixture(t)
+
+	if fixture.Contract != "qurl_dynamic_customer_id" {
+		t.Fatalf("contract = %q, want qurl_dynamic_customer_id", fixture.Contract)
+	}
+	if fixture.CustomerIDPrefix != nhpQURLDynamicCustomerIDPrefix {
+		t.Fatalf("customer_id_prefix = %q, want %q", fixture.CustomerIDPrefix, nhpQURLDynamicCustomerIDPrefix)
+	}
+	if fixture.Algorithm != "customer_id_prefix + '-' + first_byte_hex(sha256(resource_id))" {
+		t.Fatalf("algorithm = %q", fixture.Algorithm)
+	}
+	if len(fixture.Cases) == 0 {
+		t.Fatal("fixture must include at least one case")
+	}
+
+	for _, tt := range fixture.Cases {
+		if got := qurlDynamicCustomerIDForResourceID(tt.ResourceID); got != tt.CustomerID {
+			t.Fatalf("qurlDynamicCustomerIDForResourceID(%q) = %q, want %q", tt.ResourceID, got, tt.CustomerID)
+		}
+	}
+}
+
+type nhpQURLDynamicCustomerIDFixture struct {
+	Version          int    `json:"version"`
+	Contract         string `json:"contract"`
+	CustomerIDPrefix string `json:"customer_id_prefix"`
+	Algorithm        string `json:"algorithm"`
+	Cases            []struct {
+		ResourceID string `json:"resource_id"`
+		CustomerID string `json:"customer_id"`
+	} `json:"cases"`
+}
+
+func loadNHPQURLDynamicCustomerIDFixture(t *testing.T) nhpQURLDynamicCustomerIDFixture {
+	t.Helper()
+
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+	data, err := os.ReadFile(filepath.Join(repoRoot, "contracts", "nhp", "qurl_dynamic_customer_id_vectors.json"))
+	if err != nil {
+		t.Fatalf("read shard fixture: %v", err)
+	}
+
+	var fixture nhpQURLDynamicCustomerIDFixture
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatalf("parse shard fixture: %v", err)
+	}
+	return fixture
+}
+
+type nhpQURLDynamicResourceRowFixture struct {
+	Version     int                                      `json:"version"`
+	Contract    string                                   `json:"contract"`
+	Description string                                   `json:"description"`
+	Attributes  map[string]nhpQURLDynamicResourceRowAttr `json:"attributes"`
+}
+
+type nhpQURLDynamicResourceRowAttr struct {
+	Type  string `json:"type"`
+	Value any    `json:"value"`
+}
+
+func loadNHPQURLDynamicResourceRowFixture(t *testing.T) nhpQURLDynamicResourceRowFixture {
+	t.Helper()
+
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+	data, err := os.ReadFile(filepath.Join(repoRoot, "contracts", "nhp", "qurl_dynamic_resource_row_fixture.json"))
+	if err != nil {
+		t.Fatalf("read row fixture: %v", err)
+	}
+
+	var fixture nhpQURLDynamicResourceRowFixture
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatalf("parse row fixture: %v", err)
+	}
+	if fixture.Version != 1 {
+		t.Fatalf("row fixture version = %d, want 1", fixture.Version)
+	}
+	if fixture.Contract != "qurl_dynamic_resource_row" {
+		t.Fatalf("row fixture contract = %q, want qurl_dynamic_resource_row", fixture.Contract)
+	}
+	if len(fixture.Attributes) == 0 {
+		t.Fatal("row fixture must include attributes")
+	}
+	return fixture
+}
+
+func (f nhpQURLDynamicResourceRowFixture) attr(t *testing.T, key string) nhpQURLDynamicResourceRowAttr {
+	t.Helper()
+
+	attr, ok := f.Attributes[key]
+	if !ok {
+		t.Fatalf("row fixture missing attribute %q", key)
+	}
+	return attr
+}
+
+func (f nhpQURLDynamicResourceRowFixture) stringValue(t *testing.T, key string) string {
+	t.Helper()
+
+	attr := f.attr(t, key)
+	value, ok := attr.Value.(string)
+	if !ok {
+		t.Fatalf("row fixture attribute %q value = %T, want string", key, attr.Value)
+	}
+	return value
+}
+
+func (f nhpQURLDynamicResourceRowFixture) intValue(t *testing.T, key string) int {
+	t.Helper()
+
+	value, err := strconv.Atoi(f.stringValue(t, key))
+	if err != nil {
+		t.Fatalf("row fixture attribute %q must be an int: %v", key, err)
+	}
+	return value
+}
+
+func (f nhpQURLDynamicResourceRowFixture) boolValue(t *testing.T, key string) bool {
+	t.Helper()
+
+	attr := f.attr(t, key)
+	value, ok := attr.Value.(bool)
+	if !ok {
+		t.Fatalf("row fixture attribute %q value = %T, want bool", key, attr.Value)
+	}
+	return value
+}
+
+func (f nhpQURLDynamicResourceRowFixture) dynamoDBItem(t *testing.T) map[string]types.AttributeValue {
+	t.Helper()
+
+	item := make(map[string]types.AttributeValue, len(f.Attributes))
+	for key, attr := range f.Attributes {
+		switch attr.Type {
+		case "S":
+			value, ok := attr.Value.(string)
+			if !ok {
+				t.Fatalf("row fixture attribute %q value = %T, want string", key, attr.Value)
+			}
+			item[key] = &types.AttributeValueMemberS{Value: value}
+		case "N":
+			value, ok := attr.Value.(string)
+			if !ok {
+				t.Fatalf("row fixture attribute %q value = %T, want numeric string", key, attr.Value)
+			}
+			item[key] = &types.AttributeValueMemberN{Value: value}
+		case "BOOL":
+			value, ok := attr.Value.(bool)
+			if !ok {
+				t.Fatalf("row fixture attribute %q value = %T, want bool", key, attr.Value)
+			}
+			item[key] = &types.AttributeValueMemberBOOL{Value: value}
+		default:
+			t.Fatalf("row fixture attribute %q has unsupported DynamoDB type %q", key, attr.Type)
+		}
+	}
+	return item
 }
 
 // putTunnelServerRow is a convenience around put() for the standard
@@ -243,6 +512,445 @@ func TestResourceLookup_CacheMissThenHit(t *testing.T) {
 	// pointer-compare — see TestApplyAspMapDelta_FastPathPointerEqual.
 	if got := applier.count(); got != 2 {
 		t.Errorf("applyAspMapDelta calls after second lookup = %d, want 2 (cache hit republishes for self-healing)", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceBypassesAspCacheForDynamicRows(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "qurl", "existing-ac", "existing.example", "existing.example", 7000, 120)
+	applier := &captureApplier{}
+	l := newTestResourceLookup(t, q, applier)
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "qurl")
+	if err != nil {
+		t.Fatalf("warm lookup err: %v", err)
+	}
+	if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
+		t.Fatalf("warm ASP missing qurl-tunnel-server; got %v", aspKeys(asp))
+	}
+
+	q.putDynamicQURLWithTTL("q_123456789ab", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, time.Now().Add(time.Hour).Unix())
+	if _, ok := asp.ResourceGroups["q_123456789ab"]; ok {
+		t.Fatal("test setup invalid: cached ASP already contains q_123456789ab")
+	}
+
+	res, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+	if err != nil {
+		t.Fatalf("LookupResource err: %v", err)
+	}
+	if res.ResourceId != "q_123456789ab" {
+		t.Fatalf("ResourceId = %q, want q_123456789ab", res.ResourceId)
+	}
+	info := res.Resources["q_123456789ab"]
+	if info == nil {
+		t.Fatalf("Resources missing q_123456789ab: %#v", res.Resources)
+	}
+	if info.ACId != "dynamic-ac" {
+		t.Fatalf("ACId = %q, want dynamic-ac", info.ACId)
+	}
+	if info.Addr == nil || info.Addr.Port != 8443 {
+		t.Fatalf("Addr = %#v, want port 8443", info.Addr)
+	}
+	if got := applier.count(); got != 1 {
+		t.Fatalf("applier count = %d, want 1; direct row lookup must not publish an ASP map", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceConsumesSharedDynamicRowFixture(t *testing.T) {
+	fixture := loadNHPQURLDynamicResourceRowFixture(t)
+	aspID := fixture.stringValue(t, "auth_service_id")
+	resourceID := fixture.stringValue(t, "resource_id")
+	q := newFakeResourcesQuerier()
+	q.putDynamoDBItem(fixture.stringValue(t, "customer_id"), fixture.dynamoDBItem(t))
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	res, err := l.LookupResource(context.Background(), aspID, resourceID)
+	if err != nil {
+		t.Fatalf("LookupResource err: %v", err)
+	}
+	if res.AuthServiceId != aspID {
+		t.Fatalf("AuthServiceId = %q, want fixture auth_service_id", res.AuthServiceId)
+	}
+	if res.ResourceId != resourceID {
+		t.Fatalf("ResourceId = %q, want fixture resource_id", res.ResourceId)
+	}
+	if res.OpenTime != uint32(fixture.intValue(t, "open_time")) {
+		t.Fatalf("OpenTime = %d, want fixture open_time", res.OpenTime)
+	}
+	if !res.SkipAuth {
+		t.Fatal("SkipAuth = false, want true for post-auth dynamic qURL catalog rows")
+	}
+	info := res.Resources[resourceID]
+	if info == nil {
+		t.Fatalf("Resources missing fixture resource_id: %#v", res.Resources)
+	}
+	if info.ACId != fixture.stringValue(t, "ac_id") {
+		t.Fatalf("ACId = %q, want fixture ac_id", info.ACId)
+	}
+	if info.Hostname != fixture.stringValue(t, "resource_fqdn") {
+		t.Fatalf("Hostname = %q, want fixture resource_fqdn", info.Hostname)
+	}
+	if want := fixture.boolValue(t, "port_suffix"); info.PortSuffix != want {
+		t.Fatalf("PortSuffix = %v, want fixture port_suffix=%v", info.PortSuffix, want)
+	}
+	if info.Addr == nil || info.Addr.Port != fixture.intValue(t, "dest_port") || info.Addr.Protocol != "tcp" {
+		t.Fatalf("Addr = %#v, want port fixture dest_port and tcp protocol", info.Addr)
+	}
+	if got := q.callCount(); got != 1 {
+		t.Fatalf("DDB calls = %d, want 1 direct fixture lookup", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceCachesDynamicRows(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+	q.putDynamicQURLWithTTL("q_123456789ab", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, now.Add(time.Hour).Unix())
+
+	first, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+	if err != nil {
+		t.Fatalf("first LookupResource err: %v", err)
+	}
+	second, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+	if err != nil {
+		t.Fatalf("second LookupResource err: %v", err)
+	}
+	if second != first {
+		t.Fatalf("second LookupResource returned a different pointer; want direct cache hit")
+	}
+	if got := q.callCount(); got != 1 {
+		t.Fatalf("DDB calls after cached direct lookup = %d, want 1", got)
+	}
+
+	now = now.Add(resourceLookupDirectCacheTTL + time.Second)
+	third, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+	if err != nil {
+		t.Fatalf("third LookupResource err: %v", err)
+	}
+	if third == second {
+		t.Fatalf("third LookupResource returned cached pointer after direct cache TTL")
+	}
+	if got := q.callCount(); got != 2 {
+		t.Fatalf("DDB calls after direct cache TTL expiry = %d, want 2", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceDirectCacheExpiresAtRowTTL(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+	q.putDynamicQURLWithTTL("q_123456789ab", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, now.Add(2*time.Second).Unix())
+
+	if _, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab"); err != nil {
+		t.Fatalf("first LookupResource err: %v", err)
+	}
+	now = now.Add(time.Second)
+	if _, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab"); err != nil {
+		t.Fatalf("cached LookupResource before row ttl err: %v", err)
+	}
+	if got := q.callCount(); got != 1 {
+		t.Fatalf("DDB calls before row ttl expiry = %d, want 1", got)
+	}
+
+	now = now.Add(2 * time.Second)
+	_, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+	if !errors.Is(err, ErrResourceUnknownResource) {
+		t.Fatalf("LookupResource after row ttl err = %v, want ErrResourceUnknownResource", err)
+	}
+	if got := q.callCount(); got != 2 {
+		t.Fatalf("DDB calls after row ttl expiry = %d, want 2", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceNegativeCachesMissingDynamicRows(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+
+	for i := 0; i < 2; i++ {
+		_, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+		if !errors.Is(err, ErrResourceUnknownResource) {
+			t.Fatalf("LookupResource #%d err = %v, want ErrResourceUnknownResource", i+1, err)
+		}
+	}
+	if got := q.callCount(); got != 1 {
+		t.Fatalf("DDB calls during negative cache window = %d, want 1", got)
+	}
+
+	now = now.Add(resourceLookupDirectNegativeCacheTTL + time.Second)
+	_, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+	if !errors.Is(err, ErrResourceUnknownResource) {
+		t.Fatalf("LookupResource after negative cache expiry err = %v, want ErrResourceUnknownResource", err)
+	}
+	if got := q.callCount(); got != 2 {
+		t.Fatalf("DDB calls after negative cache expiry = %d, want 2", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceNegativeCachesExpiredDirectRows(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+	counter := &fakeCounterIncrementer{}
+	l.SetMetrics(counter)
+	q.putDynamicQURLWithTTL("q_00000000001", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, now.Add(-time.Second).Unix())
+
+	for i := 0; i < 2; i++ {
+		_, err := l.LookupResource(context.Background(), "qurl", "q_00000000001")
+		if !errors.Is(err, ErrResourceUnknownResource) {
+			t.Fatalf("LookupResource #%d err = %v, want ErrResourceUnknownResource", i+1, err)
+		}
+	}
+	if got := q.callCount(); got != 1 {
+		t.Fatalf("DDB calls during expired-row negative cache window = %d, want 1", got)
+	}
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	if got := counter.counts[MetricResourceLookupExpiredDirectRow]; got != 1 {
+		t.Fatalf("MetricResourceLookupExpiredDirectRow = %d, want 1; negative cache should not re-count cached rejects", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceDDBErrorNotNegativeCached(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.err = errors.New("ddb throttled")
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	for i := 0; i < 2; i++ {
+		_, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+		if !errors.Is(err, ErrResourceLookupRetryAfter) {
+			t.Fatalf("LookupResource #%d err = %v, want ErrResourceLookupRetryAfter", i+1, err)
+		}
+	}
+	if got := q.callCount(); got != 2 {
+		t.Fatalf("DDB calls after repeated infra errors = %d, want 2; transient DDB errors must not be negative-cached", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceSingleflightDedupsConcurrentMiss(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	now := time.Unix(1000, 0)
+	q.putDynamicQURLWithTTL("q_123456789ab", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, now.Add(time.Hour).Unix())
+
+	const N = 8
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	l.now = func() time.Time { return now }
+
+	var entered sync.WaitGroup
+	entered.Add(N)
+	release := make(chan struct{})
+	l.onDirectSingleflightEnter = func(aspId, resourceID string) {
+		entered.Done()
+	}
+	q.beforeGetItem = func() {
+		<-release
+	}
+
+	type result struct {
+		res *common.ResourceData
+		err error
+	}
+	results := make(chan result, N)
+	var startWg sync.WaitGroup
+	startWg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			startWg.Done()
+			res, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+			results <- result{res: res, err: err}
+		}()
+	}
+	startWg.Wait()
+	entered.Wait()
+	close(release)
+
+	var firstPtr *common.ResourceData
+	for i := 0; i < N; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("goroutine #%d err: %v", i, r.err)
+			continue
+		}
+		if firstPtr == nil {
+			firstPtr = r.res
+			continue
+		}
+		if r.res != firstPtr {
+			t.Errorf("goroutine #%d got distinct ResourceData pointer; want singleflight shared result", i)
+		}
+	}
+	if got := q.callCount(); got != 1 {
+		t.Fatalf("DDB calls = %d, want 1 direct GetItem", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceIgnoresDynamicRowsInSystemPartition(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.putWithTTL(nhpSystemCustomerID, "q_123456789ab", "qurl", "wrong-partition-ac", "wrong.example", "wrong.example", 8443, 300, time.Now().Add(time.Hour).Unix())
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	_, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+
+	if !errors.Is(err, ErrResourceUnknownResource) {
+		t.Fatalf("err = %v, want ErrResourceUnknownResource; dynamic qURL lookup must read only the reserved qURL partition", err)
+	}
+}
+
+func TestResourceLookup_LookupResourceIgnoresDynamicRowsInWrongShard(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.putWithTTL(nhpQURLDynamicCustomerIDPrefix+"-00", "q_123456789ab", "qurl", "wrong-shard-ac", "wrong.example", "wrong.example", 8443, 300, time.Now().Add(time.Hour).Unix())
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	_, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+
+	if !errors.Is(err, ErrResourceUnknownResource) {
+		t.Fatalf("err = %v, want ErrResourceUnknownResource; dynamic qURL lookup must read only the resource_id-derived shard", err)
+	}
+}
+
+func TestResourceLookup_LookupResourceRejectsExpiredDirectRow(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	now := time.Unix(1_900_000_000, 0)
+	q.putDynamicQURLWithTTL("q_00000000001", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, now.Add(-time.Second).Unix())
+	counter := &fakeCounterIncrementer{}
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	l.now = func() time.Time { return now }
+	l.SetMetrics(counter)
+
+	_, err := l.LookupResource(context.Background(), "qurl", "q_00000000001")
+	if !errors.Is(err, ErrResourceUnknownResource) {
+		t.Fatalf("err = %v, want ErrResourceUnknownResource for expired direct row", err)
+	}
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	if got := counter.counts[MetricResourceLookupExpiredDirectRow]; got != 1 {
+		t.Fatalf("MetricResourceLookupExpiredDirectRow = %d, want 1", got)
+	}
+	if got := counter.counts[MetricResourceLookupMalformedRow]; got != 0 {
+		t.Fatalf("MetricResourceLookupMalformedRow = %d, want 0; expired rows are valid rows rejected by freshness", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceRejectsMissingDirectRowTTL(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.putDynamicQURL("q_0000000007c", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300)
+	counter := &fakeCounterIncrementer{}
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	l.SetMetrics(counter)
+
+	_, err := l.LookupResource(context.Background(), "qurl", "q_0000000007c")
+	if !errors.Is(err, ErrResourceUnknownResource) {
+		t.Fatalf("err = %v, want ErrResourceUnknownResource for direct row without ttl", err)
+	}
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	if got := counter.counts[MetricResourceLookupMissingDirectTTL]; got != 1 {
+		t.Fatalf("MetricResourceLookupMissingDirectTTL = %d, want 1 for direct row without ttl", got)
+	}
+	if got := counter.counts[MetricResourceLookupMalformedRow]; got != 0 {
+		t.Fatalf("MetricResourceLookupMalformedRow = %d, want 0; missing direct ttl has a dedicated producer-contract counter", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceRejectsNonDynamicResourceIDBeforeDDB(t *testing.T) {
+	for _, resourceID := range []string{
+		"qurl-tunnel-server",
+		"q_",
+		"q_3a7f2c8e9",
+		"q_3a7f2c8e91b0",
+		"q_3A7F2C8E91B",
+		"q_zzzzzzzzzzz",
+	} {
+		t.Run(resourceID, func(t *testing.T) {
+			q := newFakeResourcesQuerier()
+			putTunnelServerRow(q, "qurl-tunnel-server")
+			l := newTestResourceLookup(t, q, &captureApplier{})
+
+			_, err := l.LookupResource(context.Background(), "qurl", resourceID)
+
+			if !errors.Is(err, ErrResourceUnknownResource) {
+				t.Fatalf("err = %v, want ErrResourceUnknownResource for non-dynamic direct lookup", err)
+			}
+			if got := q.callCount(); got != 0 {
+				t.Fatalf("DDB calls = %d, want 0 for non-dynamic direct lookup", got)
+			}
+		})
+	}
+}
+
+func TestResourceLookup_LookupResourceRejectsNonQURLASPBeforeDDB(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.putDynamicQURLWithTTL("q_123456789ab", "agent", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, time.Now().Add(time.Hour).Unix())
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	_, err := l.LookupResource(context.Background(), "agent", "q_123456789ab")
+
+	if !errors.Is(err, ErrResourceUnknownResource) {
+		t.Fatalf("err = %v, want ErrResourceUnknownResource for non-qurl ASP direct lookup", err)
+	}
+	if got := q.callCount(); got != 0 {
+		t.Fatalf("DDB calls = %d, want 0 for non-qurl ASP direct lookup", got)
+	}
+}
+
+func TestResourceLookup_QURLASPCacheExcludesDynamicRows(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.putDynamicQURL("q_123456789ab", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300)
+	q.put(nhpSystemCustomerID, "qurl-tunnel-server-a", "qurl", "static-ac", "static.example", "static.example", 7000, 120)
+
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "qurl")
+	if err != nil {
+		t.Fatalf("LookupAuthServiceProvider err: %v", err)
+	}
+	if _, ok := asp.ResourceGroups["qurl-tunnel-server-a"]; !ok {
+		t.Fatalf("static qurl-tunnel-server-a missing from ASP cache; got %v", aspKeys(asp))
+	}
+	if _, ok := asp.ResourceGroups["q_123456789ab"]; ok {
+		t.Fatalf("dynamic q_ row leaked into ASP cache; got %v", aspKeys(asp))
+	}
+}
+
+func TestResourceLookup_QURLStaticRowsRequireStaticPrefix(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.put(nhpSystemCustomerID, "tunnel-server-a", "qurl", "static-ac", "static.example", "static.example", 7000, 120)
+	applier := &captureApplier{}
+	l := newTestResourceLookup(t, q, applier)
+
+	_, err := l.LookupAuthServiceProvider(context.Background(), "qurl")
+	if !errors.Is(err, ErrResourceUnknownASP) {
+		t.Fatalf("err = %v, want ErrResourceUnknownASP for qurl static row without qurl- prefix", err)
+	}
+	if got := applier.count(); got != 0 {
+		t.Fatalf("applier count = %d, want 0 for misprefixed qurl static row", got)
+	}
+	if got := q.callCount(); got != 1 {
+		t.Fatalf("DDB calls = %d, want 1", got)
+	}
+}
+
+func TestResourceLookup_LookupResourceRejectsWrongASP(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.putDynamicQURL("q_123456789ab", "other-asp", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300)
+	counter := &fakeCounterIncrementer{}
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	l.SetMetrics(counter)
+
+	_, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+	if !errors.Is(err, ErrResourceUnknownResource) {
+		t.Fatalf("err = %v, want ErrResourceUnknownResource", err)
+	}
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	if got := counter.counts[MetricResourceLookupAspMismatch]; got != 0 {
+		t.Fatalf("MetricResourceLookupAspMismatch = %d, want 0; direct wrong-ASP requests must not trip the Query-regression alarm", got)
+	}
+	if got := counter.counts[MetricResourceLookupDirectAspMismatch]; got != 1 {
+		t.Fatalf("MetricResourceLookupDirectAspMismatch = %d, want 1; direct wrong-ASP rows must be visible as producer regressions", got)
 	}
 }
 

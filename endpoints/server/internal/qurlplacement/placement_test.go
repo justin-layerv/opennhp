@@ -98,6 +98,32 @@ func TestResolveResource_PublicKeyPreferredOverUserID(t *testing.T) {
 	}
 }
 
+func TestResolveResource_SourceIPStableAndPreferredOverUserID(t *testing.T) {
+	asp := testTunnelASP()
+
+	withSourceIPAndUserID := ResolveResource(TunnelServerResourceID, Identity{SourceIP: "203.0.113.25", UserID: "different-user"}, asp)
+	withSourceIPOnly := ResolveResource(TunnelServerResourceID, Identity{SourceIP: "203.0.113.25"}, asp)
+	if withSourceIPAndUserID == nil || withSourceIPAndUserID.Resources[TunnelServerResourceID] == nil {
+		t.Fatalf("ResolveResource with source IP + user id returned %+v", withSourceIPAndUserID)
+	}
+	if withSourceIPOnly == nil || withSourceIPOnly.Resources[TunnelServerResourceID] == nil {
+		t.Fatalf("ResolveResource with source IP only returned %+v", withSourceIPOnly)
+	}
+
+	sourceIPAndUserIDHost := withSourceIPAndUserID.Resources[TunnelServerResourceID].DestHost()
+	sourceIPOnlyHost := withSourceIPOnly.Resources[TunnelServerResourceID].DestHost()
+	if sourceIPAndUserIDHost != sourceIPOnlyHost {
+		t.Fatalf("placement with source IP + user id = %q, want source-IP-only placement %q", sourceIPAndUserIDHost, sourceIPOnlyHost)
+	}
+	again := ResolveResource(TunnelServerResourceID, Identity{SourceIP: "203.0.113.25"}, asp)
+	if again == nil || again.Resources[TunnelServerResourceID] == nil {
+		t.Fatalf("second ResolveResource with source IP returned %+v", again)
+	}
+	if got := again.Resources[TunnelServerResourceID].DestHost(); got != sourceIPOnlyHost {
+		t.Fatalf("second source-IP placement = %q, want stable %q", got, sourceIPOnlyHost)
+	}
+}
+
 func TestResolveResource_SingleAZCandidate(t *testing.T) {
 	asp := &common.AuthServiceProviderData{
 		AuthSvcId: "agent",
@@ -140,10 +166,12 @@ func TestResolveResource_EmptyIdentityDoesNotHotspotPerAZRows(t *testing.T) {
 }
 
 func TestResolveResource_DirectTunnelServerRowFallback(t *testing.T) {
+	direct := testTunnelResource(TunnelServerResourceID, 7000)
+	direct.Resources[TunnelServerResourceID].PortSuffix = false
 	asp := &common.AuthServiceProviderData{
 		AuthSvcId: "agent",
 		ResourceGroups: common.ResourceGroupMap{
-			TunnelServerResourceID: testTunnelResource(TunnelServerResourceID, 7000),
+			TunnelServerResourceID: direct,
 		},
 	}
 
@@ -152,7 +180,10 @@ func TestResolveResource_DirectTunnelServerRowFallback(t *testing.T) {
 		t.Fatalf("ResolveResource returned %+v", res)
 	}
 	if got := res.Resources[TunnelServerResourceID].DestHost(); got != "connect.test:7000" {
-		t.Fatalf("DestHost()=%q want connect.test:7000", got)
+		t.Fatalf("DestHost()=%q want direct row host with forced port suffix", got)
+	}
+	if !res.Resources[TunnelServerResourceID].PortSuffix {
+		t.Fatal("direct-row fallback preserved PortSuffix=false; want forced true")
 	}
 }
 
