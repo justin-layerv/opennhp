@@ -316,7 +316,19 @@ locals {
     for zone_id in var.route53_change_record_hosted_zone_ids :
     "arn:aws:route53:::hostedzone/${zone_id}"
   ]
-  ecr_repos = var.deploy_qurl_ecr ? concat(local.core_ecr_repos, ["nhp-qurl"]) : local.core_ecr_repos
+  # `nhp-qurl` is the API container; `qurl-scanner-lambda` is the
+  # EventBridge-driven Lambda image. Both gate on `deploy_qurl_ecr`
+  # (not on the Lambda enable flag) — the repo + SSM image-tag must
+  # exist before qurl-service CI can publish anything, and the Lambda
+  # function itself is the only resource that gates on
+  # `qurl_scanner_lambda_enabled` (see `scanner_lambda.tf` in the
+  # qurl-service module). That ordering navigates the chicken-and-egg
+  # between `package_type = "Image"` validating the image at Lambda
+  # create time and CI being the publisher: first apply (flag OFF)
+  # creates the repo + SSM param, CI publishes its first image + writes
+  # the SHA to SSM, then a second apply (flag ON) creates the Lambda
+  # referencing the now-existing image.
+  ecr_repos = var.deploy_qurl_ecr ? concat(local.core_ecr_repos, ["nhp-qurl", "qurl-scanner-lambda"]) : local.core_ecr_repos
 
   # Single source of truth for "this account is the source of cross-
   # account ECR replication." Referenced by both
@@ -2511,6 +2523,25 @@ output "qurl_repo_url" {
 output "qurl_repo_arn" {
   description = "QURL Service ECR repository ARN"
   value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["nhp-qurl"].arn : var.deploy_qurl_ecr ? "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/nhp-qurl" : null
+}
+
+# Scanner Lambda ECR repo (`layerv/qurl-scanner-lambda`).
+#
+# Mirrors the `qurl_repo_*` shape above so the consumer surface is symmetric.
+# Threaded into `module.qurl_service` (root main.tf) as inputs that feed:
+#   - `aws_lambda_function.qurl_scanner.image_uri = "<url>:<tag>"`
+#   - a `terraform_data` shim whose `input = <arn>` lets the scanner SSM
+#     image-tag param `depends_on` the repo creation. Without this, an
+#     apply that lands the SSM param before the repo trips qurl-service
+#     CI's `exists=true → push → fails` branch on the next main push.
+output "qurl_scanner_lambda_repo_url" {
+  description = "QURL scanner Lambda ECR repository URL (consumed by the scanner Lambda's image_uri)."
+  value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["qurl-scanner-lambda"].repository_url : var.deploy_qurl_ecr ? "${local.secondary_ecr_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/qurl-scanner-lambda" : null
+}
+
+output "qurl_scanner_lambda_repo_arn" {
+  description = "QURL scanner Lambda ECR repository ARN (consumed by the scanner module's terraform_data shim to manufacture a depends_on edge from the SSM image-tag param to the repo)."
+  value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["qurl-scanner-lambda"].arn : var.deploy_qurl_ecr ? "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/qurl-scanner-lambda" : null
 }
 
 output "repository_names" {

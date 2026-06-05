@@ -96,6 +96,224 @@ Entries stay here while any pre-rollout, rollout, post-rollout, rollback, or
 deferred task remains. `Ready` and `Deferred` entries are still active; move an
 entry to Completed Entries only after `Status: Verified`.
 
+### 2026-06-05 - PR #2326 - qurl-scanner Lambda + EventBridge + IAM
+
+- Ledger PR: [#2326](https://github.com/layervai/nhp/pull/2326)
+- Source PR / issue: [PR #2326](https://github.com/layervai/nhp/pull/2326) /
+  [layervai/qurl-service#852](https://github.com/layervai/qurl-service/pull/852)
+- Component: `terraform/modules/qurl-service` (scanner Lambda + cron + alarm),
+  `terraform/modules/ecr` (scanner-lambda repo)
+- Task owner: prod rollout coordinator
+- Pre-rollout tasks:
+  - Confirm qurl-service `main` build has published at least one
+    `layerv/qurl-scanner-lambda` image to ECR and written its SHA to
+    `/<name_prefix>/qurl-scanner-lambda-image-tag` SSM. The Lambda's
+    `package_type = "Image"` validates the image at create time, so a flag-ON
+    apply against an empty repo fails with
+    `InvalidParameterValueException: Source image ... does not exist`.
+  - Confirm the qurl-service repo's branch-protection check requires the
+    `Docker Build (scanner-lambda)` job before merge to main (pre-merge task A
+    from PR #852 cr round 3). Without it, a later qurl-service main merge can
+    push a broken image whose deploy here fails-loud on next apply.
+  - **Prod SSM image-tag write (HARD PROD PRECONDITION — cr round 6 on
+    PR #2326)**: qurl-service `build-and-deploy.yml` writes ONLY the
+    SANDBOX SSM image-tag path (`SSM_SCANNER_LAMBDA_IMAGE_TAG_SANDBOX`);
+    the prod path (`/layerv-nhp-prod/qurl-scanner-lambda-image-tag`) is
+    seeded `"latest"` by Terraform and never touched by qurl-service
+    CI. If the prod flag flips while the SSM param still says
+    `"latest"`, `image_uri` resolves to `<prod-ecr>:latest` — and
+    ECR replication copies images by tag, so unless a `latest` tag
+    happens to exist in prod ECR (qurl-service CI doesn't push one),
+    the Lambda create fails with `InvalidParameterValueException:
+    Source image ... does not exist`. Three valid resolutions:
+    1. **Operator manual write before flag flip (current intent)**:
+       `aws ssm put-parameter --name /layerv-nhp-prod/qurl-scanner-lambda-image-tag \
+         --value <sandbox-SHA-verified-via-replication-preflight-below> \
+         --overwrite --profile <prod-profile>` BEFORE the
+       second prod apply with `qurl_scanner_lambda_enabled = true`.
+    2. **promote-to-prod workflow step** (mirrors how
+       `qurl-reverse-tunnel-server` propagates its SSM image-tag
+       across envs — see `terraform/modules/qurl-reverse-tunnel-server`
+       for the precedent). Track as a qurl-service follow-up if the
+       manual write proves error-prone.
+    3. **`latest` tag replication**: have qurl-service CI push a
+       `latest` tag alongside the SHA; ECR replication would copy it
+       to prod. Not recommended — defeats the "explicit SHA pin per
+       apply" property the data-source pattern provides.
+    Default to (1) until prod rollout is happening at a cadence that
+    motivates automating it.
+  - **Reserved-concurrency account-pool check (cr round 8 low/ops)**:
+    `reserved_concurrent_executions = 1` on the scanner Lambda
+    permanently subtracts 1 from the account's unreserved-concurrency
+    budget. AWS rejects the apply at create time with
+    `InvalidParameterValueException: Specified ReservedConcurrentExecutions
+    for function decreases account's UnreservedConcurrentExecution below
+    its minimum value of 100` if the account is near its quota. Almost
+    certainly fine in these accounts today, but worth a preflight in
+    near-quota envs:
+
+    ```
+    aws lambda get-account-settings --query 'AccountLimit.UnreservedConcurrentExecutions' \
+      --profile <env-profile>
+    ```
+
+    Should report ≥ 101 before flipping `qurl_scanner_lambda_enabled = true`.
+    If lower, request a concurrency-quota increase via AWS support
+    BEFORE the second apply.
+  - **Cross-account image pull (HARD PROD PRECONDITION — cr round 3 #3
+    on PR #2326)**: Lambda container-image pull requires the image in
+    the SAME ACCOUNT + REGION as the function. ECS pulls cross-account
+    freely; Lambda does NOT. In prod (`is_primary_account = false`),
+    the `qurl_scanner_lambda_repo_url` output points at the secondary-
+    account ECR by design — so prod relies on ECR replication
+    (`aws_ecr_replication_configuration.cross_account` in
+    `modules/ecr/main.tf`, filter `layerv/` prefix) having actually
+    propagated the image from sandbox to prod BEFORE the flag-ON apply.
+    Without that, the apply fails at create time with
+    `InvalidParameterValueException: Lambda does not have permission
+    to access the ECR image`. Concrete check before flipping
+    `qurl_scanner_lambda_enabled = true` in prod tfvars:
+
+    ```
+    aws ecr describe-images --repository-name layerv/qurl-scanner-lambda \
+      --image-ids imageTag=<SHA-from-sandbox-SSM-param> \
+      --profile <prod-profile> --region <prod-region>
+    ```
+
+    Should return the same digest as sandbox. If it returns
+    `ImageNotFoundException`, replication hasn't caught up — wait
+    ~5 minutes (typical replication lag), re-check, then proceed. If
+    it still doesn't show up, check
+    `docs/runbooks/ecr-replication-failure.md` for the standard
+    replication-debugging path.
+- Rollout tasks:
+  - Sandbox first apply with `qurl_scanner_lambda_enabled = false` (default).
+    Creates `layerv/qurl-scanner-lambda` ECR repo +
+    `/layerv-nhp-sandbox/qurl-scanner-lambda-image-tag` SSM param. No Lambda,
+    no cron, no alarm.
+  - Sandbox second apply with `qurl_scanner_lambda_enabled = true` in
+    `terraform/environments/sandbox/terraform.tfvars` AFTER qurl-service CI
+    has published at least one image. Creates Lambda + EventBridge cron +
+    scan-gap alarm. The `data.aws_ssm_parameter.scanner_lambda_image_tag_current`
+    reads the CI-written SHA at plan time; each subsequent apply picks up
+    fresh SHAs.
+  - Manual entrypoint smoke (pre-merge task B from PR #852 cr round 3):
+    from administrator console, run `aws lambda invoke
+    --function-name layerv-nhp-sandbox-cell0-qurl-scanner /dev/null` against
+    the deployed Lambda. Confirm:
+    1. `provided.al2023` entrypoint executes `/var/runtime/bootstrap`.
+    2. `AWS_LAMBDA_RUNTIME_API` runtime detection dispatches to
+       `lambda.Start(handler)` rather than CLI flag parsing.
+    3. `scanner starting` log fires in CloudWatch.
+    4. `scanner tick complete` log fires for an empty bucket (no DDB
+       throttle errors, no panic).
+  - **Data-path smoke (PR #2326 cr round 4 #2 — REQUIRED BEFORE PROD
+    FLAG FLIP)**: the entrypoint smoke above exercises NONE of the IAM
+    write path, GSI Query grants, or `kms:Decrypt` (empty bucket →
+    zero items → zero decryption). To close that gap before flipping
+    the flag in prod tfvars, in sandbox:
+    1. Use the qurl-service API to mint a qURL with a short expiry
+       (e.g. `expires_in = 60s`) against a transit-style resource so
+       the row carries the bucket-shard composite key.
+    2. Wait the minute + a tick.
+    3. Trigger an operator-replay invoke against the bucket that just
+       expired:
+       `aws lambda invoke --function-name layerv-nhp-sandbox-cell0-qurl-scanner \
+         --payload '{"bucket": <bucket-int>}' --cli-binary-format raw-in-base64-out /dev/null`
+    4. Confirm CloudWatch logs show the GSI Query returned non-zero
+       items, the UpdateItem write succeeded (no KMSAccessDeniedException,
+       no IAM denial), and `scanner_errors_burning` alarm stayed in OK.
+    Recovery if it fails: read the error message; common cases are
+    `KMSAccessDeniedException` (KMS grant missing → check
+    `aws_iam_role_policy.scanner_lambda_dynamodb`'s `KMSDecryptDynamoDB`
+    statement), `AccessDeniedException` on a GSI Query (index ARN not
+    listed → check the `time-bucket-index` / `resource-token-index`
+    entries), `TooManyRequestsException` (a cron tick is currently
+    running and consuming the single concurrency slot — retry the
+    invoke after ~50s, or temporarily disable the EventBridge rule via
+    `aws events disable-rule --name <scanner-tick-rule>` for the
+    duration of the smoke and re-enable afterward), or a panic
+    (binary-side bug → roll back the SSM image-tag to the prior SHA +
+    re-apply).
+  - Prod rollout: repeats the two-apply sequence in
+    `terraform/environments/prod/`. NOT covered by this PR's merge — gated by
+    the hard preconditions on task #85 in the qurl-service work tracker (SQS
+    queue infra, qurl-service consumer dedupe, `--allow-prod-emit` opt-in,
+    additional CloudWatch alarms on `TombstoneErrors` /
+    `CandidatesUnprocessed` / etc.).
+- Post-rollout tasks:
+  - Confirm scan-gap CloudWatch alarm
+    (`layerv-nhp-<env>-cell0-qurl-scanner-invocation-gap`) is in OK state
+    after first apply with flag ON — alarm fires on
+    `Sum(Invocations) ≤ 3 over 5 min × 2 periods` (i.e. ≥ 4 missed ticks
+    across a 10-min window), so OK means at least 4 invocations landed
+    in each of the last two 5-min windows. The `≤ 3` threshold (rather
+    than `≤ 4`) absorbs legitimate `5,4,5,4` jitter from `rate(1 minute)`
+    drift against CloudWatch's fixed 5-min wall-clock windows.
+  - Confirm log group `/aws/lambda/layerv-nhp-<env>-cell0-qurl-scanner` is
+    KMS-encrypted and has 30-day retention (not Lambda's default Never-expire).
+  - Confirm Lambda is operating in log-only emit mode (no `EMIT_MODE` env var
+    set, no `--allow-prod-emit`). Operator emit-mode flip is a SEPARATE
+    Terraform apply with explicit tfvars edits and is NOT part of this PR's
+    rollout.
+  - On next Terraform apply that includes a new qurl-service main push,
+    confirm the Lambda's `image_uri` updates to the new SHA (via the SSM
+    data-source read) without manual intervention.
+- Rollback tasks:
+  - Flip `qurl_scanner_lambda_enabled = false` in the env's tfvars and
+    re-apply. Destroys Lambda + EventBridge cron + scan-gap alarm. Leaves
+    ECR repo + SSM image-tag param intact (so qurl-service CI keeps
+    publishing; nothing consumes the images during the rollback window).
+  - Per-event kill switch: when `EMIT_MODE=sqs` is later set, an operator
+    can unset it (or set it to `log-only`) and re-apply to silence emissions
+    without destroying the Lambda. Sub-second kill via the SQS-grant-conditional
+    posture if needed.
+  - Full unwind: if the ECR repo must go too, remove
+    `qurl-scanner-lambda` from `local.ecr_repos` in
+    `terraform/modules/ecr/main.tf` AND delete the SSM param via console
+    (Terraform will plan-destroy after the next apply but the ECR repo has
+    `prevent_destroy = true` — operator must `terraform state rm` + manual
+    `aws ecr delete-repository --force`).
+- Follow-ups / deferred tasks:
+  - [layervai/qurl-service#853](https://github.com/layervai/qurl-service/issues/853)
+    — memoize AWS clients at cold start to reduce per-tick latency.
+  - [layervai/qurl-service#854](https://github.com/layervai/qurl-service/issues/854)
+    — retire ECR-probe scaffolding in `qurl-service` `build-and-deploy.yml`
+    once this PR is applied in sandbox AND prod for at least one cycle.
+  - **SQS+KMS grant on activation PR (cr round 12 on PR #2326)**: when
+    the SQS queue activation PR wires `resource_lifecycle_queue_arn` to
+    the queue's ARN, it MUST also thread the queue's KMS key ARN through
+    the module and add `kms:GenerateDataKey` + `kms:Decrypt` to
+    `aws_iam_role_policy.scanner_lambda_sqs` against that key. Without
+    it, `SendMessage` to the SSE-KMS-encrypted queue fails with
+    `KMSAccessDeniedException` at runtime. Mirror the
+    `task_usage_events` policy's `Sid = "QueueAccess"` +
+    `Sid = "KMSEncryptSQS"` shape in `modules/qurl-service/main.tf`. An
+    inline TODO is on the `aws_iam_role_policy.scanner_lambda_sqs`
+    resource pointing at the precedent.
+  - Hard precondition (1) on qurl-service task #85: ship the SQS
+    `resource-lifecycle` queue (separate PR) before any operator flips
+    `--emit-mode=sqs` env vars. When that lands, wire
+    `resource_lifecycle_queue_arn` in this module to activate the
+    `sqs:SendMessage` IAM grant + alarm SNS topic ARN.
+  - **SNS-wiring binary-error-handling verify (cr round 13 #2)**:
+    BEFORE wiring `scanner_lambda_alarm_sns_topic_arn` to a paging
+    topic, audit the qurl-scanner binary's error-handling path. The
+    `scanner_errors_burning` alarm pages on `Sum(Errors) >= 1` over
+    a single 5-min window — so any handler-level error bubbling out
+    of `lambdaHandler` will fire the alarm. If the binary surfaces
+    transient DynamoDB throttles as handler errors (rather than
+    retrying them internally), expect occasional pages on healthy
+    operation. Either confirm the binary retries transient infra
+    errors before returning, or accept the noise consciously
+    (`ok_actions` is wired so it self-clears). Out of scope here
+    because the binary lives in qurl-service; track as a verify
+    step in the SNS-wiring follow-up PR.
+- Status: Open
+- Status note: Awaiting sandbox first apply (flag OFF) post-merge, then
+  qurl-service CI image publish, then sandbox second apply (flag ON), then
+  manual smoke (pre-merge task B from PR #852).
+
 ### 2026-05-31 - PR #2268 - Internal Knock HMAC Prod Tasks
 
 - Ledger PR: [#2281](https://github.com/layervai/nhp/pull/2281)

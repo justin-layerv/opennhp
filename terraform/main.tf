@@ -2377,6 +2377,21 @@ module "qurl_service" {
   nhp_resources_table_arn          = module.dynamodb.resources_table_arn
   nhp_resources_customer_id_prefix = local.nhp_qurl_dynamic_customer_id_prefix
 
+  # Scanner Lambda (modules/qurl-service/scanner_lambda.tf). Two-apply
+  # rollout — the ECR repo + SSM image-tag param are created whenever
+  # `deploy_qurl_service = true` (so qurl-service CI can publish images
+  # without this flag flipped); the Lambda function + cron + alarm gate
+  # on `qurl_scanner_lambda_enabled`.
+  qurl_scanner_lambda_enabled             = var.qurl_scanner_lambda_enabled
+  qurl_scanner_lambda_ecr_repo_url        = module.ecr.qurl_scanner_lambda_repo_url
+  qurl_scanner_lambda_ecr_repo_arn        = module.ecr.qurl_scanner_lambda_repo_arn
+  qurl_scanner_lambda_image_tag_ssm_param = "/${local.name_prefix}/qurl-scanner-lambda-image-tag"
+  qurl_resources_table_arn                = module.dynamodb.qurl_resources_table_arn
+  qurl_access_tokens_table_arn            = module.dynamodb.qurl_access_tokens_table_arn
+  qurl_sessions_table_arn                 = module.dynamodb.qurl_sessions_table_arn
+  resource_lifecycle_queue_arn            = var.resource_lifecycle_queue_arn
+  scanner_lambda_alarm_sns_topic_arn      = var.scanner_lambda_alarm_sns_topic_arn
+
   # Auth0
   auth0_domain                     = var.qurl_auth0_domain
   auth0_audience                   = var.qurl_auth0_audience

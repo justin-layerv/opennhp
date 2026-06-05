@@ -778,6 +778,24 @@ variable "deploy_qurl_service" {
   default     = false
 }
 
+variable "qurl_scanner_lambda_enabled" {
+  description = "Deploy the scheduled qurl-scanner Lambda + EventBridge cron + scan-gap alarm. Default OFF. Two-apply rollout: ECR repo + SSM image-tag param are created unconditionally with `deploy_qurl_service` so qurl-service CI can publish images BEFORE this flag flips; second apply with this flag ON creates the Lambda (which validates the image at create time). See `modules/qurl-service/scanner_lambda.tf` for the full sequence and gating boundary; prod rollout preconditions are tracked in the prod rollout task ledger."
+  type        = bool
+  default     = false
+}
+
+variable "resource_lifecycle_queue_arn" {
+  description = "SQS queue ARN the scanner Lambda emits `qurl.expired` / `resource.closed` events to when run with `--emit-mode=sqs`. Empty omits the `sqs:SendMessage` grant; the binary defaults to log-only emit when EMIT_MODE is unset, so empty is correct until the queue lands in a follow-up PR."
+  type        = string
+  default     = ""
+}
+
+variable "scanner_lambda_alarm_sns_topic_arn" {
+  description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits the wiring (alarm still fires + appears in CloudWatch, no notification). Defaults empty — wire in a follow-up that creates the topic alongside the SQS queue."
+  type        = string
+  default     = ""
+}
+
 variable "qurl_service_domain" {
   description = "Domain for QURL API (e.g., api.qurl.link)"
   type        = string

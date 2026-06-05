@@ -101,6 +101,9 @@ module "nhp" {
   qurl_tunnel_active_registrations_enabled = var.qurl_tunnel_active_registrations_enabled
   deploy_qurl_bootstrap_chain              = var.deploy_qurl_bootstrap_chain
   enable_qurl_agent_bootstrap              = var.enable_qurl_agent_bootstrap
+  qurl_scanner_lambda_enabled              = var.qurl_scanner_lambda_enabled
+  resource_lifecycle_queue_arn             = var.resource_lifecycle_queue_arn
+  scanner_lambda_alarm_sns_topic_arn       = var.scanner_lambda_alarm_sns_topic_arn
   qurl_service_domain                      = var.qurl_service_domain
   qurl_hosted_zone_id                      = var.qurl_hosted_zone_id
   qurl_jwt_secret_arn                      = var.qurl_jwt_secret_arn

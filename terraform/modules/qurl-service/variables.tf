@@ -1021,3 +1021,126 @@ variable "nhp_server_port" {
     error_message = "nhp_server_port must be a numeric string in [1, 65535] with no leading zeros (e.g., \"62206\")."
   }
 }
+
+# ==================== Scanner Lambda ====================
+#
+# Drives `scanner_lambda.tf`. The repo + SSM image-tag param gate on
+# `deploy_qurl_service` (so qurl-service CI can publish images regardless
+# of the Lambda enable flag); the Lambda + cron + alarm gate on
+# `qurl_scanner_lambda_enabled`. See `scanner_lambda.tf` for the full
+# rollout sequence and the resource list each gate covers.
+
+variable "qurl_scanner_lambda_enabled" {
+  description = "Create the scheduled qurl-scanner Lambda + EventBridge cron + scan-gap alarm. Default OFF. Setting true on a greenfield env fails with `InvalidParameterValueException: Source image ... does not exist` until qurl-service CI has published its first image — the two-apply rollout sequences this. Sandbox-only on first applies; prod rollout preconditions are tracked in the prod rollout task ledger."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_scanner_lambda_ecr_repo_url" {
+  description = "ECR repository URL for the qurl-scanner Lambda image (e.g. `<acct>.dkr.ecr.<region>.amazonaws.com/layerv/qurl-scanner-lambda`). Threaded from `module.ecr.qurl_scanner_lambda_repo_url`. Empty is the gate-OFF default; the Lambda's `lifecycle { precondition }` block fails plan with a copy-pasteable error if `qurl_scanner_lambda_enabled = true` and this is empty (so an enabled Lambda can never reference a malformed `image_uri`)."
+  type        = string
+  default     = ""
+}
+
+variable "qurl_scanner_lambda_ecr_repo_arn" {
+  description = <<-EOT
+    ECR repository ARN for the qurl-scanner Lambda image. Threaded from
+    `module.ecr.qurl_scanner_lambda_repo_arn`.
+
+    Consumed by `terraform_data.scanner_ecr_ready` to manufacture the
+    `depends_on` edge from the SSM image-tag param to the ECR repo
+    (Terraform forbids `depends_on = [var.x]` directly). Without this
+    edge, a greenfield apply could schedule the SSM param BEFORE the
+    repo, tripping qurl-service CI's `exists=true → push → fails`
+    branch on the next main push. Self-heals on the subsequent push,
+    but the depends_on closes the race deterministically on first apply.
+
+    Empty string skips the shim (no Lambda + no SSM param to depend on).
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "qurl_scanner_lambda_image_tag_ssm_param" {
+  description = "SSM parameter name carrying the qurl-scanner Lambda image tag (e.g. `/layerv-nhp-sandbox/qurl-scanner-lambda-image-tag`). Must match the path qurl-service `build-and-deploy.yml` writes to (`SSM_SCANNER_LAMBDA_IMAGE_TAG_SANDBOX`). This module creates the param seeded `\"latest\"` with `ignore_changes = [value]` and reads its CURRENT value via `data.aws_ssm_parameter` at plan time so each apply picks up the latest CI-written SHA."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_scanner_lambda_image_tag_ssm_param == "" || can(regex("^/[A-Za-z0-9._/-]+$", var.qurl_scanner_lambda_image_tag_ssm_param))
+    error_message = "qurl_scanner_lambda_image_tag_ssm_param must be empty (gate off) or a leading-slash SSM parameter name (e.g., \"/layerv-nhp-sandbox/qurl-scanner-lambda-image-tag\")."
+  }
+}
+
+variable "qurl_resources_table_arn" {
+  description = "ARN of the qurl-resources DynamoDB table (UpdateItem + GetItem from the scanner Lambda). Threaded from `module.dynamodb.qurl_resources_table_arn`. Empty is the gate-OFF default; the Lambda precondition fails plan if `qurl_scanner_lambda_enabled = true` and this is empty."
+  type        = string
+  default     = ""
+}
+
+variable "qurl_access_tokens_table_arn" {
+  description = "ARN of the qurl-access-tokens DynamoDB table (Query on `time-bucket-index` GSI for the per-minute scan, Query on `resource-token-index` for active-qurl precondition, UpdateItem to set per-qurl `expired_webhook_fired_at`). Threaded from `module.dynamodb.qurl_access_tokens_table_arn`. Empty is the gate-OFF default; the Lambda precondition fails plan if `qurl_scanner_lambda_enabled = true` and this is empty."
+  type        = string
+  default     = ""
+}
+
+variable "qurl_sessions_table_arn" {
+  description = "ARN of the qurl-sessions DynamoDB table (Query by `resource_id` PK with TTL filter for the session-active precondition — the session counter has a documented TTL-drift bug that rules out the simpler counter-based check). Threaded from `module.dynamodb.qurl_sessions_table_arn`. Empty is the gate-OFF default; the Lambda precondition fails plan if `qurl_scanner_lambda_enabled = true` and this is empty."
+  type        = string
+  default     = ""
+}
+
+variable "resource_lifecycle_queue_arn" {
+  description = "ARN of the SQS queue the scanner emits `qurl.expired` / `resource.closed` events to when run with `--emit-mode=sqs`. Empty omits the `sqs:SendMessage` grant entirely; correct on the first sandbox apply because the binary defaults to log-only when `EMIT_MODE` is unset. Queue itself lands in a follow-up — see the prod rollout task ledger."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.resource_lifecycle_queue_arn == "" || can(regex("^arn:aws:sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9._-]+$", var.resource_lifecycle_queue_arn))
+    error_message = "resource_lifecycle_queue_arn must be empty or a standard SQS queue ARN (arn:aws:sqs:<region>:<account>:<name>)."
+  }
+}
+
+variable "scanner_lambda_memory_mb" {
+  description = "Memory size for the qurl-scanner Lambda. 512 MB matches the per-tick working set of ~16 parallel shard Queries + JSON marshal of up to MaxEventsPerShard events; no measured pressure to raise it. Set higher only if CloudWatch shows OOM kills."
+  type        = number
+  default     = 512
+
+  validation {
+    condition     = var.scanner_lambda_memory_mb >= 128 && var.scanner_lambda_memory_mb <= 10240
+    error_message = "scanner_lambda_memory_mb must be in [128, 10240] per the Lambda quota for the `provided.al2023` runtime."
+  }
+}
+
+variable "scanner_lambda_timeout_seconds" {
+  description = "Per-invocation timeout (seconds) for the qurl-scanner Lambda. Defaulted to 50s — gives a ~10s headroom under the EventBridge `rate(1 minute)` cadence so a long-running tick aborts and frees the reserved-concurrency slot BEFORE the next cron fire (a tick that ran the full 60s under `reserved_concurrent_executions = 1` would race the next invocation and throttle it). The binary's carry-over cursor recovers the aborted bucket on the next tick. Cap is 60 (would collide with the next tick on every run)."
+  type        = number
+  default     = 50
+
+  validation {
+    condition     = var.scanner_lambda_timeout_seconds >= 1 && var.scanner_lambda_timeout_seconds <= 60
+    error_message = "scanner_lambda_timeout_seconds must be in [1, 60] to stay under the rate(1 minute) cadence."
+  }
+}
+
+variable "scanner_lambda_log_retention_days" {
+  description = "CloudWatch Logs retention (days) for the qurl-scanner Lambda's log group. Null (default) lets the module pick `local.is_prod ? 365 : 30`, mirroring the ECS task log group's per-env shape. Override only to pin a specific retention in a multi-tenant test env."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.scanner_lambda_log_retention_days == null || contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 2192, 2557, 2922, 3288, 3653], var.scanner_lambda_log_retention_days == null ? 30 : var.scanner_lambda_log_retention_days)
+    error_message = "scanner_lambda_log_retention_days must be null (auto) or one of the CloudWatch-Logs-supported retention values (see aws_cloudwatch_log_group.retention_in_days docs)."
+  }
+}
+
+variable "scanner_lambda_alarm_sns_topic_arn" {
+  description = "SNS topic ARN for the scanner Lambda's scan-gap alarm action. Empty string omits the alarm_actions wiring; the alarm still fires + appears in CloudWatch, but no notification is published. Defaults empty — wire in a follow-up that creates the topic alongside the SQS queue."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.scanner_lambda_alarm_sns_topic_arn == "" || can(regex("^arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9._-]+$", var.scanner_lambda_alarm_sns_topic_arn))
+    error_message = "scanner_lambda_alarm_sns_topic_arn must be empty or a standard SNS topic ARN (arn:aws:sns:<region>:<account>:<name>)."
+  }
+}
