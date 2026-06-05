@@ -73,12 +73,32 @@ resource "aws_ssm_parameter" "scanner_lambda_image_tag" {
 # `depends_on` whose creation Terraform knows must precede the ECR
 # repo's. Without this, the only way to enforce ordering would be a
 # coarse module-level `depends_on = [module.ecr]` at the root.
+#
+# COUNT GATE: no `count` predicate on this resource. Outer
+# `module.qurl_service` is already `count = var.deploy_qurl_service
+# ? 1 : 0` at the root, so this whole module — including the shim —
+# only instantiates when the ECR repo is being provisioned in the
+# same apply. There is no caller path where this shim should exist
+# but the ECR repo shouldn't.
+#
+# What the predicate on `count` CANNOT be: anything derived from
+# `var.qurl_scanner_lambda_ecr_repo_arn` (the ECR ARN itself). It is
+# a computed `aws_ecr_repository.main[...].arn` attribute and is
+# unknown-at-plan on the apply that creates the repo, so a
+# string-shaped count predicate like `var.X != "" ? 1 : 0` fails
+# plan with "Invalid count argument: the count value depends on
+# resource attributes that cannot be determined until apply".
+# `terraform_data.input`, by contrast, accepts unknown values just
+# fine — the shim resource itself becomes "known after apply", but
+# the SSM param's `depends_on = [terraform_data.scanner_ecr_ready]`
+# is a static reference at plan time so the ordering edge still
+# materializes. Regression trail:
+# https://github.com/layervai/nhp/actions/runs/27030298517 (#2326
+# sandbox-deploy failure → hotfix #2327). #2328 tracks a lint to
+# flag the bug-prone `count = <module-output-arn> != ""` pattern at
+# PR time, since `terraform validate` doesn't evaluate counts
+# against real attributes.
 resource "terraform_data" "scanner_ecr_ready" {
-  count = var.qurl_scanner_lambda_ecr_repo_arn != "" ? 1 : 0
-
-  # The var carries an attribute that becomes known after `module.ecr`
-  # creates the repo, so Terraform schedules this shim AFTER the repo
-  # — which in turn forces the SSM param to wait, closing the race.
   input = var.qurl_scanner_lambda_ecr_repo_arn
 }
 

@@ -1043,20 +1043,7 @@ variable "qurl_scanner_lambda_ecr_repo_url" {
 }
 
 variable "qurl_scanner_lambda_ecr_repo_arn" {
-  description = <<-EOT
-    ECR repository ARN for the qurl-scanner Lambda image. Threaded from
-    `module.ecr.qurl_scanner_lambda_repo_arn`.
-
-    Consumed by `terraform_data.scanner_ecr_ready` to manufacture the
-    `depends_on` edge from the SSM image-tag param to the ECR repo
-    (Terraform forbids `depends_on = [var.x]` directly). Without this
-    edge, a greenfield apply could schedule the SSM param BEFORE the
-    repo, tripping qurl-service CI's `exists=true → push → fails`
-    branch on the next main push. Self-heals on the subsequent push,
-    but the depends_on closes the race deterministically on first apply.
-
-    Empty string skips the shim (no Lambda + no SSM param to depend on).
-  EOT
+  description = "ECR repository ARN for the qurl-scanner Lambda image (threaded from `module.ecr.qurl_scanner_lambda_repo_arn`). Consumed as the `input` of `terraform_data.scanner_ecr_ready`; see the COUNT GATE block on that resource in `scanner_lambda.tf` for the apply-time ordering rationale and the regression trail (#2326 -> #2327, lint follow-up #2328)."
   type        = string
   default     = ""
 }
