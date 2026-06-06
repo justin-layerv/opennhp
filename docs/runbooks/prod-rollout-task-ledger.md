@@ -1186,6 +1186,103 @@ entry to Completed Entries only after `Status: Verified`.
 - Completed date:
 - Evidence:
 
+### 2026-06-05 - PR #2350 - MFA console-login alarm, require-MFA policy, IAM audit
+
+- Ledger PR: [#2350](https://github.com/layervai/nhp/pull/2350)
+- Source PR / issue: [PR #2350](https://github.com/layervai/nhp/pull/2350) /
+  [issue #1138](https://github.com/layervai/nhp/issues/1138)
+- Component: `terraform/modules/security` (console-login MFA metric filter +
+  alarm, `require_mfa` IAM policy, account password policy, IAM MFA audit
+  Lambda + EventBridge + alarms)
+- Task owner: prod rollout coordinator
+- Pre-rollout tasks:
+  - **Account password policy is an account SINGLETON (opt-in;
+    `enable_account_password_policy` DEFAULTS FALSE)**: this PR ships the
+    `aws_iam_account_password_policy.main` resource but leaves it OFF, so the
+    merge does not touch the account policy. Enabling it is a SEPARATE,
+    deliberately-reviewed apply because it OVERWRITES any password policy
+    already set in the account (manually or by another stack) and tightening
+    `max_password_age` (90) / `password_reuse_prevention` (24) can force
+    existing IAM console users to reset their password at next sign-in. Before
+    flipping `enable_account_password_policy = true` in an env's tfvars,
+    capture the current policy so the rollback is exact:
+    `aws iam get-account-password-policy --profile <prod-profile>` (returns
+    `NoSuchEntity` if none is set — that absence is itself the rollback target),
+    and confirm the human IAM console users (few; managed outside this repo)
+    are reachable to reset if prompted.
+  - Confirm alerting is wired so the alarm/audit actually page: the module
+    gates both on `local.security_alerting_enabled = enable_guardduty_alerts`,
+    and the root call site sets
+    `enable_guardduty_alerts = length(guardduty_alert_emails) > 0`. Both env
+    tfvars set `guardduty_alert_emails`, so the gate is true and the
+    `<prefix>-console-login-no-mfa` alarm + `<prefix>-iam-mfa-audit` Lambda
+    deploy. If a future tfvars change empties `guardduty_alert_emails`, the
+    metric filter still applies (metric accrues) but the alarm and audit Lambda
+    silently do not deploy — the #1138 detection gap reopens.
+  - **Validate the console-login filter pattern at a desk before the prod
+    promote.** The filter is prod-only (sandbox has `enable_cloudtrail = false`),
+    so a CloudWatch filter-pattern syntax typo would first surface mid-prod
+    apply rather than in sandbox. Pre-check the value of
+    `var.console_login_mfa_filter_pattern` with, e.g.:
+    `aws logs test-metric-filter --filter-pattern '<pattern>'
+    --log-event-messages '{"eventName":"ConsoleLogin","additionalEventData":{"MFAUsed":"No"},"responseElements":{"ConsoleLogin":"Success"}}'`
+    and confirm it matches the no-MFA Success sample (and does NOT match an
+    `MFAUsed":"Yes"` or `ConsoleLogin":"Failure"` sample).
+- Rollout tasks:
+  - Sandbox apply first (shared terraform via `module "nhp"`). Sandbox sets
+    `enable_cloudtrail = false`, so the console-login metric filter + alarm are
+    NOT created there (they read the CloudTrail log group, which doesn't exist
+    in sandbox) — the console-login detection leg is prod-only, like the CIS
+    filters in `cloudtrail_metric_filters.tf`. The sandbox apply creates only the
+    `<prefix>-require-mfa` IAM policy (unattached) and the `<prefix>-iam-mfa-audit`
+    Lambda + weekly EventBridge rule + alarms. The account password policy is
+    NOT created (opt-in, default false).
+  - Prod apply via the promote path (prod sets `enable_cloudtrail = true`). No
+    deploy ordering / ASG refresh required (security-account resources only).
+    This is where the `<prefix>-console-login-no-mfa` metric filter + alarm are
+    created — the change that closes the issue's "prod CloudTrail has zero metric
+    filters" gap — alongside require_mfa and the audit Lambda.
+  - Account password policy (separate, deliberate apply, after the capture
+    precondition above): flip `enable_account_password_policy = true` in the
+    env tfvars and apply.
+- Post-rollout tasks:
+  - PROD ONLY (sandbox has `enable_cloudtrail = false`, so these resources do
+    not exist there): confirm the `<prefix>-console-login-no-mfa` alarm exists
+    and is in OK, and that `LayerV/NHP/Security` / `ConsoleLoginWithoutMFA` is
+    publishing (`default_value = 0` means it emits every period even with no
+    logins).
+  - Confirm the `<prefix>-iam-mfa-audit` Lambda's first weekly run succeeded
+    (no `<prefix>-iam-mfa-audit-errors` alarm) and review the
+    `IAMUsersWithoutMFA` metric / alert output.
+  - **Attach `require_mfa` to the human IAM users/groups** (enforcement leg of
+    #1138): the policy ships created-but-unattached because human IAM identities
+    are not managed in this Terraform. Attach `require_mfa_policy_arn` to the
+    real console users/groups; until then Step 2 of #1138 enforces nothing.
+    Tracked in the follow-up below.
+- Rollback tasks:
+  - Set `enable_console_login_mfa_alarm = false`, `enable_iam_mfa_audit = false`,
+    `enable_require_mfa_policy = false`, and/or `enable_account_password_policy
+    = false` in the env tfvars and re-apply to destroy the corresponding
+    resources. For the password policy specifically, re-applying with the flag
+    off leaves the account with NO managed policy — if the account previously
+    had one, restore it from the `get-account-password-policy` capture above (or
+    `aws iam delete-account-password-policy` to confirm the no-policy target).
+  - Detaching `require_mfa` (if attached during post-rollout) is a console/CLI
+    action on the out-of-repo principals, not a terraform revert.
+- Follow-ups / deferred tasks:
+  - [#2351](https://github.com/layervai/nhp/issues/2351) — attach the
+    `require_mfa` policy to the human IAM users/groups that hold console access;
+    the enforcement leg of #1138 that cannot be closed in this repo because the
+    human principals are managed outside it.
+  - [#2369](https://github.com/layervai/nhp/issues/2369) — alarm on
+    CloudTrail→CWLogs delivery liveness so a blind detection pipe (no events
+    arriving) is not mistaken for "no MFA-less logins" (cr round 3; out of scope
+    for the MFA detection leg itself).
+- Status: Open
+- Status note: Waiting for sandbox apply, then prod promote. The password-policy
+  singleton precondition must be resolved before the prod apply; `require_mfa`
+  attachment is a post-rollout task tracked in [#2351](https://github.com/layervai/nhp/issues/2351).
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries

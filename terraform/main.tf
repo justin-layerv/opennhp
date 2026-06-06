@@ -1015,7 +1015,12 @@ module "security" {
   config_resource_types      = var.config_resource_types
   tags                       = local.common_tags
 
-  # GuardDuty alerting - sends findings to SNS for email/Slack notifications
+  # GuardDuty alerting - sends findings to SNS for email/Slack notifications.
+  # SHARP EDGE: enable_guardduty_alerts also gates the #1138 MFA detection leg
+  # (security module local.security_alerting_enabled). Emptying
+  # guardduty_alert_emails here flips it false and silently stops deploying the
+  # console-login-no-mfa alarm and the IAM MFA audit Lambda — reopening the
+  # #1138 detection gap with no signal. Keep this list populated.
   enable_guardduty_alerts = length(var.guardduty_alert_emails) > 0
   alerts_sns_topic_arn    = module.monitoring.sns_topic_arn
   guardduty_alert_emails  = var.guardduty_alert_emails

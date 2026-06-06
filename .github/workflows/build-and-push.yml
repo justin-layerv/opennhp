@@ -923,6 +923,13 @@ jobs:
           echo '::group::Security Lambda Tests'
           (cd terraform/modules/security/lambda && python -m pytest test_stale_finding_watchdog.py -v)
           echo '::endgroup::'
+          # IAM MFA audit (#1138). Separate pytest invocation from the watchdog
+          # above: mfa_audit.py uses the same import-time sys.modules['boto3']
+          # swap + `assert 'boto3' not in sys.modules` guard, so globbing both in
+          # one process would trip that assert.
+          echo '::group::Security MFA Audit Lambda Tests'
+          (cd terraform/modules/security/lambda && python -m pytest test_mfa_audit.py -v)
+          echo '::endgroup::'
           # qurl-reverse-tunnel-server empty-AZ watchdog (#1542). Same sys.modules-swap
           # pattern as security/test_stale_finding_watchdog.py — runs
           # in its own pytest invocation so a transitive boto3 import

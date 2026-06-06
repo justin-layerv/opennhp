@@ -243,6 +243,32 @@ locals {
   enable_guardduty_alerts       = var.enable_guardduty && var.enable_guardduty_alerts
   enable_guardduty_email_alerts = local.enable_guardduty_alerts && length(var.guardduty_alert_emails) > 0
 
+  # Shared security-alerting gate + CloudWatch-alarm destination for the MFA
+  # features in console_login_mfa_alarm.tf and iam_mfa_audit.tf (#1138), defined
+  # here next to the GuardDuty-alerting locals as the single source of truth for
+  # those two features. (The stale-finding watchdog intentionally keeps its own
+  # destination local — its self-failure alarm wants the email topic as a
+  # fallback, whereas these alarms follow the module convention of routing only
+  # to the Chatbot/Slack topic, so they are deliberately not unified.)
+  #
+  # enable_guardduty_email_alerts is defined above as
+  # (enable_guardduty_alerts && emails>0), so it implies enable_guardduty_alerts
+  # — there is no email-only path, and this gate is exactly enable_guardduty_alerts.
+  # Named for intent so both features gate on one local. Built ONLY from var.*
+  # booleans, so it is safe in count/for_each (an SNS ARN value is unknown at
+  # plan on the apply that creates the topic — the #2327 bug class).
+  security_alerting_enabled = local.enable_guardduty_alerts
+
+  # Destination for the security CloudWatch alarms: the Chatbot/Slack topic, per
+  # the module convention that alarms route to alerts_sns_topic_arn while the
+  # dedicated GuardDuty email topic is reserved for findings. The
+  # alerts_sns_topic_arn validation guarantees this is non-null whenever the gate
+  # is on, so the alarms are never actionless. ARN VALUE — used only in
+  # alarm_actions, NEVER in count; compact() drops the empty leg defensively.
+  security_alert_destination_arns = compact([
+    local.enable_guardduty_alerts ? var.alerts_sns_topic_arn : ""
+  ])
+
   # Single source of truth for the triage-runbook link embedded in every
   # GuardDuty alert body (email + Slack EventBridge targets below, and the
   # stale-finding watchdog Lambda via its TRIAGE_RUNBOOK_URL env var). Built

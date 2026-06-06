@@ -27,3 +27,8 @@ output "cloudtrail_s3_bucket_name" {
   description = "CloudTrail S3 bucket name"
   value       = var.enable_cloudtrail ? aws_s3_bucket.cloudtrail[0].id : null
 }
+
+output "require_mfa_policy_arn" {
+  description = "ARN of the require_mfa IAM policy (#1138). Attach this to the human IAM users/groups that log into this account to deny any session that did not present MFA. Not attached automatically — those principals are managed outside this Terraform. Null when enable_require_mfa_policy is false."
+  value       = var.enable_require_mfa_policy ? aws_iam_policy.require_mfa[0].arn : null
+}

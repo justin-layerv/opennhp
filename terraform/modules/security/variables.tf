@@ -140,6 +140,18 @@ variable "alerts_sns_topic_arn" {
   description = "SNS topic ARN for Slack notifications via Chatbot (GuardDuty Slack + CloudWatch alarms). Email alerts use a separate dedicated topic."
   type        = string
   default     = null
+
+  validation {
+    # When GuardDuty alerting is on, this topic is the destination for the
+    # security CloudWatch alarms and the MFA audit Lambda's Slack channel. A
+    # null here would create actionless alarms and emit Resource=null in the
+    # audit Lambda's role policy (MalformedPolicyDocument at apply). Require it
+    # explicitly so the misconfig fails loudly at plan instead of silently.
+    # (Skipped automatically while the ARN is unknown at plan; re-checked at
+    # apply once module.monitoring.sns_topic_arn resolves.)
+    condition     = !(var.enable_guardduty && var.enable_guardduty_alerts) || var.alerts_sns_topic_arn != null
+    error_message = "alerts_sns_topic_arn must be non-null when enable_guardduty and enable_guardduty_alerts are true — the security alarms and MFA audit Lambda need a destination."
+  }
 }
 
 variable "guardduty_alert_emails" {
@@ -196,6 +208,70 @@ variable "stale_finding_watchdog_schedule" {
   validation {
     condition     = can(regex("^(cron|rate)\\(", var.stale_finding_watchdog_schedule))
     error_message = "stale_finding_watchdog_schedule must start with cron(...) or rate(...). See https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html"
+  }
+}
+
+# MFA detection + enforcement (#1138)
+variable "enable_console_login_mfa_alarm" {
+  description = "Create the CloudTrail metric filter + alarm that fires on a ConsoleLogin completed without MFA (#1138). Requires enable_cloudtrail (the filter reads the CloudTrail CloudWatch log group). The alarm only attaches if an SNS destination is available (alerts_sns_topic_arn or the GuardDuty email topic)."
+  type        = bool
+  default     = true
+}
+
+variable "console_login_mfa_filter_pattern" {
+  description = "CloudWatch Logs metric-filter pattern for MFA-less ConsoleLogin events. Default is the CIS-3.2 pattern (#1138) plus a Success guard: MFAUsed!=Yes also matches FAILED password attempts (which carry no MFA field), so without the responseElements.ConsoleLogin=Success leg a single fat-fingered login would page; the issue is about *successful* MFA-less logins, so the Success guard targets that and cuts failed-attempt noise. AWS IAM Identity Center (SSO) logs ConsoleLogin with MFAUsed=No because MFA happens at the IdP — none exists in this account today, but if one is added, tighten this (e.g. add `($.userIdentity.type = \"IAMUser\")`)."
+  type        = string
+  default     = "{ ($.eventName = \"ConsoleLogin\") && ($.additionalEventData.MFAUsed != \"Yes\") && ($.responseElements.ConsoleLogin = \"Success\") }"
+}
+
+variable "enable_require_mfa_policy" {
+  description = "Create the require_mfa managed IAM policy (#1138). The policy denies all actions for a session that did not present MFA, except self-service MFA enrollment. NOTE: this only ships the policy artifact — it is NOT attached here, because the human IAM users/roles that log into this account are managed outside this Terraform. Attach it to those principals manually; its ARN is exported as require_mfa_policy_arn."
+  type        = bool
+  default     = true
+}
+
+variable "enable_account_password_policy" {
+  description = "Manage the account-wide IAM password policy (#1138 Step 3). An account password policy is a SINGLETON and CANNOT require MFA (that is the require_mfa policy's job) — this hardens password length/complexity/rotation/reuse only. DEFAULT false: applying it OVERWRITES any externally-managed account password policy and tightening rotation/reuse can force existing IAM users to reset their password at next sign-in, so enabling it is a deliberate, separately-reviewed apply (capture the current policy first — see the prod rollout ledger). Flip to true once that's been coordinated."
+  type        = bool
+  default     = false
+}
+
+variable "password_minimum_length" {
+  description = "Minimum length for the account IAM password policy. 14 aligns with CIS AWS Foundations 1.8."
+  type        = number
+  default     = 14
+
+  validation {
+    condition     = var.password_minimum_length >= 8 && var.password_minimum_length <= 128
+    error_message = "password_minimum_length must be between 8 and 128 (AWS account password policy bounds)."
+  }
+}
+
+variable "password_max_age_days" {
+  description = "Maximum age in days before an IAM console password must be rotated. 90 aligns with CIS AWS Foundations 1.11."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.password_max_age_days >= 1 && var.password_max_age_days <= 1095
+    error_message = "password_max_age_days must be between 1 and 1095 (AWS account password policy bounds)."
+  }
+}
+
+variable "enable_iam_mfa_audit" {
+  description = "Enable the weekly Lambda that lists IAM users and alerts on any without an MFA device (#1138). Complements AWS Config's IAM_USER_MFA_ENABLED rule by actively paging rather than only recording. Only deploys when an SNS destination is available (alerts_sns_topic_arn or the GuardDuty email topic)."
+  type        = bool
+  default     = true
+}
+
+variable "iam_mfa_audit_schedule" {
+  description = "EventBridge schedule expression for the IAM MFA audit Lambda (#1138). Default is weekly on Monday at 13:30 UTC — offset from the GuardDuty stale-finding watchdog (13:00) so the two don't contend, and timezone-fixed to avoid DST drift."
+  type        = string
+  default     = "cron(30 13 ? * MON *)"
+
+  validation {
+    condition     = can(regex("^(cron|rate)\\(", var.iam_mfa_audit_schedule))
+    error_message = "iam_mfa_audit_schedule must start with cron(...) or rate(...). See https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html"
   }
 }
 

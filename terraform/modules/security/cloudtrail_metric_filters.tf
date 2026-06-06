@@ -39,7 +39,9 @@
 #     manual checks, so a metric filter does not move a control. They
 #     are detection-useful but out of scope for the "flip every graded
 #     v1.4.0 monitoring control" goal — track separately if their
-#     real-time signal is wanted.
+#     real-time signal is wanted. (CloudWatch.3, console sign-in without
+#     MFA, IS now tracked separately — see console_login_mfa_alarm.tf,
+#     #1138.)
 #   * Finding-specific filters from #1140 (iam:UpdateAssumeRolePolicy,
 #     kms:Decrypt) are deferred: UpdateAssumeRolePolicy is subsumed by
 #     CloudWatch.4 (IAM policy changes) below, and a bare kms:Decrypt
