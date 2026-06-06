@@ -550,17 +550,6 @@ resource "aws_iam_role_policy" "server" {
         ]
         Resource = aws_service_discovery_service.server.arn
       },
-      # Route 53 permissions required for Cloud Map DNS integration with custom health checks
-      {
-        Effect = "Allow"
-        Action = [
-          "route53:CreateHealthCheck",
-          "route53:DeleteHealthCheck",
-          "route53:UpdateHealthCheck",
-          "route53:GetHealthCheck"
-        ]
-        Resource = "*"
-      },
       {
         Effect = "Allow"
         Action = [
