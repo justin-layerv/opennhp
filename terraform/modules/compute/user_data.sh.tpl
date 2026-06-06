@@ -916,6 +916,19 @@ INSTANCE_ID=$INSTANCE_ID
 NHP_STDERR_LOG_GROUP=${server_stderr_log_group}
 AWS_REGION=${region}
 AWS_DEFAULT_REGION=${region}
+# KBS (confidential-containers key broker) has a package-level init() that, at
+# server startup, generates a cosign keypair under
+# /opt/confidential-containers/kbs/repository (root-owned in the image) and
+# panics on failure — under the non-root --user (#1090) that MkdirAll would
+# EACCES -> panic -> crash-loop the server. We skip it: the /kbs/v0/* routes
+# are upstream-OpenNHP TEE attestation endpoints, not part of the qURL flow (no
+# LayerV client routes to them), and the key was regenerated on every container
+# start (ephemeral --rm overlay), so it could never have backed a real
+# attestation consumer anyway. The routes stay registered but inert
+# (GetResource is request-time and simply finds no repository). If KBS is ever
+# made a real prod feature, drop KBS_SKIP_INIT and give it a persistent,
+# uid-owned repository dir.
+KBS_SKIP_INIT=1
 %{ if qurl_enabled ~}
 QURL_API_URL=${qurl_api_url}
 QURL_ALLOWED_REDIRECT_DOMAIN=${qurl_allowed_redirect_domain}
@@ -1075,6 +1088,9 @@ ExecStartPre=-/usr/bin/docker stop nhp-server
 ExecStartPre=-/usr/bin/docker rm nhp-server
 ExecStart=/bin/bash -c "docker run --rm --name nhp-server \
   --net=host \
+  --user ${nhp_server_uid}:${nhp_server_gid} \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges:true \
   --log-driver=awslogs \
   --log-opt awslogs-region=$${AWS_REGION} \
   --log-opt awslogs-group=$${NHP_STDERR_LOG_GROUP} \
@@ -1249,6 +1265,79 @@ iptables -D INPUT -p udp --dport 62206 -j DROP 2>/dev/null || true
 iptables -A INPUT -p udp --dport 62206 -j DROP
 
 echo "iptables per-IP rate limiting configured: 100 pps sustained, burst 50 per source IP"
+
+# ============================================================================
+# Dedicated unprivileged user for the nhp-server container (#1090)
+#
+# The container drops to uid:gid ${nhp_server_uid}:${nhp_server_gid} via
+# `--user` in the systemd unit above so that an upstream-CVE RCE inside the
+# container lands on an unprivileged uid rather than root. No Linux
+# capabilities are required: the listener binds 8888/TCP + 62206/UDP (both >
+# 1024) and the UDP receive buffer is sized host-side via net.core.rmem_max
+# (the server uses SetReadBuffer/SO_RCVBUF, not SO_RCVBUFFORCE which would need
+# CAP_NET_ADMIN — see the rmem_max drop-in above). Because no caps are needed,
+# the run line also `--cap-drop=ALL` and `--security-opt=no-new-privileges:true`
+# to reinforce the same post-RCE threat model. (Dev-only caveat: the `--prof`
+# flag writes cpu.prf into the root-owned WORKDIR and would fail under --user;
+# the prod ENTRYPOINT runs `run`, which never sets it.)
+#
+# Why a fixed numeric uid (not `User=`/name like the native frps unit): docker
+# `--user` resolves names against the CONTAINER's /etc/passwd, and the
+# ubuntu:26.04 runtime image has no nhp-server entry — so a name would fail to
+# start. We pin the uid:gid from the nhp_server_uid/nhp_server_gid locals on
+# the host (a named account for `ps`/`ls` auditability, well above the
+# system-uid range to avoid AMI package collisions); Terraform renders the same
+# numerics into `--user` at plan time, so the two cannot drift. Resolving the
+# uid at runtime is not an option because systemd performs its own
+# `$`-expansion on ExecStart before bash runs, so `$(id -u …)` is undefined.
+#
+# Ownership the non-root process needs (must run AFTER all etc files exist and
+# BEFORE the service starts):
+#   - etc (:ro mount): the uid must own the 0600 files it reads (config.toml
+#     always; tls/client.key only when storage_backend=etcd). We chown the
+#     whole etc tree rather than an explicit file list because client.key/tls
+#     are absent under the dynamodb backend, and a future 0600 addition should
+#     not silently become unreadable. The :ro mount means even owned files
+#     cannot be rewritten from inside a compromised container.
+#   - We then RE-ASSERT root on env/secrets.env: those are consumed only by the
+#     root docker CLI via --env-file, never by the container, so secrets.env
+#     (0600) stays container-unreadable on the mount.
+#   - log (rw mount): the server writes its logs here.
+# Mirrors the frps service-user pattern in
+# terraform/modules/qurl-reverse-tunnel-server/user_data.sh.tpl.
+# ============================================================================
+# Pin uid:gid to match the `--user` numerics rendered above (both come from the
+# nhp_server_uid/nhp_server_gid locals). Guard by name (idempotent re-run) AND
+# by number: if the gid/uid is already held by an unrelated account on the AMI,
+# fail loudly here rather than emit an opaque groupadd/useradd error under
+# `set -e` that would boot the instance with no server (and crash-loop the ASG
+# against the same AMI).
+if ! getent group nhp-server >/dev/null 2>&1; then
+  if getent group ${nhp_server_gid} >/dev/null 2>&1; then
+    echo "FATAL: gid ${nhp_server_gid} already held by '$(getent group ${nhp_server_gid} | cut -d: -f1)'; cannot pin nhp-server" >&2
+    exit 1
+  fi
+  groupadd --gid ${nhp_server_gid} nhp-server
+fi
+if ! getent passwd nhp-server >/dev/null 2>&1; then
+  if getent passwd ${nhp_server_uid} >/dev/null 2>&1; then
+    echo "FATAL: uid ${nhp_server_uid} already held by '$(getent passwd ${nhp_server_uid} | cut -d: -f1)'; cannot pin nhp-server" >&2
+    exit 1
+  fi
+  useradd --uid ${nhp_server_uid} --gid ${nhp_server_gid} --no-create-home --shell /usr/sbin/nologin nhp-server
+fi
+chown -R nhp-server:nhp-server /opt/layerv/nhp-server/etc /opt/layerv/nhp-server/log
+for f in env secrets.env; do
+  [ -e "/opt/layerv/nhp-server/etc/$f" ] && chown root:root "/opt/layerv/nhp-server/etc/$f"
+done
+%{ if length(server_plugins) > 0 ~}
+# Plugins are statically compiled into the server binary now (PluginPath=""),
+# but per-plugin CONFIG is still staged here and mounted :ro — e.g. the passcode
+# plugin's etc/config.toml is mode 0600, so the uid must own it to read it.
+# Only chown when plugins were actually staged — with no plugins the dir is
+# docker-auto-created 0755 root and an empty :ro mount is still traversable.
+chown -R nhp-server:nhp-server /opt/layerv/nhp-server/plugins
+%{ endif ~}
 
 systemctl daemon-reload
 systemctl enable nhp-cloudmap-register nhp-health-monitor nhp-server

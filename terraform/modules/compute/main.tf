@@ -44,6 +44,12 @@ locals {
 
   # Fail fast: either var.server_ami_id is set, or SSM parameter must exist.
   server_ami_id = var.server_ami_id != null ? var.server_ami_id : data.aws_ssm_parameter.server_ami[0].value
+
+  # Pinned uid:gid for the non-root nhp-server container (#1090). Single source
+  # of truth: rendered into BOTH `docker run --user` and the host useradd in
+  # user_data.sh.tpl, which must agree or the container can't read its mounts.
+  nhp_server_uid = 10001
+  nhp_server_gid = 10001
 }
 
 # Lambda for generating Curve25519 keys (same approach as CDK)
@@ -721,6 +727,9 @@ locals {
     environment         = var.environment
     cell_id             = var.cell_id
     multi_tenant        = var.multi_tenant
+    # Non-root container service account (#1090) — same numerics in --user and useradd.
+    nhp_server_uid      = local.nhp_server_uid
+    nhp_server_gid      = local.nhp_server_gid
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
     # Pass the stderr log group name directly from the TF resource so

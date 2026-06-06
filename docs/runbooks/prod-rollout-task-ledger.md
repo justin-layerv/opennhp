@@ -812,6 +812,64 @@ entry to Completed Entries only after `Status: Verified`.
 - Status note: Waiting for prod apply, then the `security@layerv.ai` SNS
   confirmation click, then the synthetic-finding link check.
 
+### 2026-06-06 - PR #2336 - nhp-server container runs as non-root user
+
+- Ledger PR: [#2336](https://github.com/layervai/nhp/pull/2336)
+- Source PR / issue: [PR #2336](https://github.com/layervai/nhp/pull/2336) /
+  [issue #1090](https://github.com/layervai/nhp/issues/1090)
+- Component: `terraform` (compute / nhp-server), `server` runtime
+- Task owner: prod rollout coordinator
+- Pre-rollout tasks:
+  - Sandbox functional validation after the compute ASG instance refresh
+    (a `terraform plan`/`apply` does not exercise this runtime change):
+    - `docker inspect nhp-server` shows the process user as `10001`.
+    - Server starts and reads its 0600 config as uid 10001 from the `:ro` etc
+      mount (config.toml always; tls/client.key only under the etcd backend) —
+      this is the whole reason the chown is load-bearing — and binds 8888/TCP
+      + 62206/UDP.
+    - `ls -l /opt/layerv/nhp-server/etc/{secrets.env,config.toml}` confirms the
+      shipped ownership: secrets.env stays `root:root` (0600), config.toml is
+      `10001` — i.e. the recursive chown + root re-assert behaved as intended.
+    - Logs write to `/opt/layerv/nhp-server/log`, and if the file-tail
+      CloudWatch stream (`server-*.log`) is relied on, confirm it still ships
+      (files are now 10001-owned 0600; the agent reads as root).
+    - A knock round-trip succeeds end-to-end.
+    - The in-container Docker HEALTHCHECK still reports healthy under the
+      dropped privileges: `docker inspect --format '{{.State.Health.Status}}'
+      nhp-server` == `healthy` (the curl probe runs inside the unprivileged,
+      cap-dropped container).
+    - If/when deploying with the etcd storage backend (LayerV prod is dynamodb,
+      so this is N/A there): additionally confirm the 0600 `tls/client.key` is
+      readable as uid 10001 — that file exists only on the etcd path and is the
+      reason the etc chown is recursive rather than an explicit file list.
+- Rollout tasks:
+  - Deploy is a launch-template bump: roll the `nhp-server` ASG via instance
+    refresh per environment (sandbox first, then prod). No data migration, no
+    cross-repo ordering.
+- Post-rollout tasks:
+  - Confirm prod NHP server `/health` reports the expected image tag for this
+    PR's merge commit and the NLB target group stays healthy through the
+    refresh.
+- Rollback tasks:
+  - Revert this PR and instance-refresh the `nhp-server` ASG to the prior
+    launch-template version. The change is self-contained to compute
+    `user_data`; no other component depends on it.
+  - AMI-collision failure mode: if a future base AMI ever ships an account at
+    uid/gid 10001, the fail-loud `FATAL ... exit 1` guard boots the instance
+    with no server and crash-loops the ASG against that AMI. The surfaced
+    signal is NLB targets going unhealthy → the existing
+    `servers_healthy_low`/target-group health alarms page on it; the fix is to
+    repin `nhp_server_uid`/`nhp_server_gid` to a free id and re-bake/refresh.
+- Follow-ups / deferred tasks:
+  - PR 2 (Traefik non-root) and PR 3 (nhp-acd non-root) remain open under
+    [#1090](https://github.com/layervai/nhp/issues/1090); each ships its own
+    ledger entry.
+- Status: Open
+- Status note: awaiting sandbox functional validation post-merge before prod
+  instance refresh.
+- Completed date:
+- Evidence:
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries

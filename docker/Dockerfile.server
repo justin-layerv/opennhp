@@ -75,9 +75,13 @@ COPY docker/nhp-server/templates /nhp-server/templates
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8888/health/live || exit 1
 
-# Run as non-root user (optional, requires NET_ADMIN capability)
-# RUN useradd -r -s /bin/false nhp
-# USER nhp
+# This image runs as root by default. In the LayerV deployment the container is
+# dropped to a non-root uid at runtime via `docker run --user` in the
+# nhp-server systemd unit (terraform/modules/compute/user_data.sh.tpl, #1090) —
+# no capabilities are needed (the server binds ports >1024 and sizes its UDP
+# receive buffer with SO_RCVBUF, not SO_RCVBUFFORCE). A baked-in USER is
+# intentionally avoided: the host bind-mounts (config/logs) are owned by the
+# host uid that `--user` matches, which an image-baked uid could not guarantee.
 
 ENTRYPOINT ["/nhp-server/nhp-serverd"]
 CMD ["run"]
