@@ -869,7 +869,7 @@ resource "aws_s3_bucket_policy" "cloudtrail" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid       = "AWSCloudTrailAclCheck"
         Effect    = "Allow"
@@ -895,7 +895,30 @@ resource "aws_s3_bucket_policy" "cloudtrail" {
           }
         }
       }
-    ]
+      ],
+      # Break-glass delete guard (#1143): deny log-object deletion to every
+      # principal except the configured break-glass roles. CloudTrail PutObject
+      # (above) is unaffected, and S3 lifecycle expiration is unaffected because
+      # lifecycle actions are performed by the S3 service and are not evaluated
+      # against the bucket policy at all. Scoped to object deletion only —
+      # s3:PutBucketPolicy is intentionally left out so this Terraform keeps
+      # managing the policy; the residual "strip the guard, then delete" path is
+      # closed by S3 Object Lock (the stronger follow-up). Attached only when an
+      # allowlist is set, so the default never risks locking out the account.
+      length(var.cloudtrail_bucket_delete_guard_role_arns) > 0 ? [
+        {
+          Sid       = "DenyLogDeletionExceptBreakGlass"
+          Effect    = "Deny"
+          Principal = "*"
+          Action    = ["s3:DeleteObject", "s3:DeleteObjectVersion"]
+          Resource  = "${aws_s3_bucket.cloudtrail[0].arn}/*"
+          Condition = {
+            ArnNotLike = {
+              "aws:PrincipalArn" = var.cloudtrail_bucket_delete_guard_role_arns
+            }
+          }
+        }
+    ] : [])
   })
 }
 
@@ -968,5 +991,105 @@ resource "aws_cloudtrail" "main" {
   # Ignore kms_key_id changes when SCP blocks CloudTrail updates
   lifecycle {
     ignore_changes = [kms_key_id]
+  }
+}
+
+# ==================== CloudTrail Tamper Detection ====================
+# Page on-call when anyone disables, deletes, or reconfigures a CloudTrail
+# trail — the "attacker disables logging" kill-chain step from #1143.
+#
+# Intentionally NOT gated on enable_cloudtrail: it must protect trails this
+# module does not own. The independence is from *this module's* trail
+# specifically — the "AWS API Call via CloudTrail" events reach the us-east-2
+# default event bus while *some* us-east-2 trail is logging management events
+# (this module's trail, the org trail, or the SCP-locked sandbox trails).
+# The call that disables the last such trail is itself captured and pages
+# (best-effort — EventBridge delivery is at-least-once and the event must be
+# emitted while a trail is still logging in us-east-2; not a hard guarantee).
+#
+# Region scope: control-plane CloudTrail calls (StopLogging/DeleteTrail/...)
+# are emitted in the trail's home region. This rule runs in the module's region
+# (us-east-2), which is the home region of every trail in the #1143 target
+# state. The trails homed elsewhere (sandbox-audit us-west-2, layerv-prod-trail
+# us-east-1) are NOT covered — acceptable because those are being deleted.
+# Revisit if a surviving trail is ever homed outside us-east-2.
+locals {
+  # "effective" = the var folded together with the other preconditions
+  # (Slack/Chatbot target enabled + a real alerts topic), not just the var.
+  cloudtrail_tamper_effective = var.enable_cloudtrail_tamper_alerts && var.enable_slack_target && var.alerts_sns_topic_arn != null && var.alerts_sns_topic_arn != ""
+}
+
+resource "aws_cloudwatch_event_rule" "cloudtrail_tamper" {
+  count       = local.cloudtrail_tamper_effective ? 1 : 0
+  name        = "${var.name_prefix}-cloudtrail-tamper"
+  description = "Alert when CloudTrail logging is disabled, deleted, or reconfigured (#1143)"
+
+  event_pattern = jsonencode({
+    source      = ["aws.cloudtrail"]
+    detail-type = ["AWS API Call via CloudTrail"]
+    detail = {
+      eventSource = ["cloudtrail.amazonaws.com"]
+      # PutEventSelectors is included alongside the three eventNames named in
+      # #1143 because narrowing a trail's selectors is an equivalent way to
+      # blind it without StopLogging/DeleteTrail.
+      eventName = [
+        "StopLogging",
+        "DeleteTrail",
+        "UpdateTrail",
+        "PutEventSelectors",
+      ]
+    }
+  })
+
+  tags = merge(var.tags, { Component = "security" })
+}
+
+# Slack/Chatbot target on the main alerts topic — the on-call "page" path in
+# this infra (the alerts topic already permits events.amazonaws.com:Publish).
+resource "aws_cloudwatch_event_target" "cloudtrail_tamper_slack" {
+  count     = local.cloudtrail_tamper_effective ? 1 : 0
+  rule      = aws_cloudwatch_event_rule.cloudtrail_tamper[0].name
+  target_id = "cloudtrail-tamper-to-slack"
+  arn       = var.alerts_sns_topic_arn
+
+  # AWS Chatbot-optimized JSON format (literal <placeholder> tokens, so no
+  # jsonencode()). An unmatched input path renders as an empty string, which
+  # two fields rely on:
+  #   - errorCode is blank when the call succeeded — that blank is the
+  #     high-signal case (logging actually stopped), not an error. A populated
+  #     code (e.g. AccessDenied, expected where an SCP blocks the call) means a
+  #     blocked attempt still worth investigating.
+  #   - The trail name lives under requestParameters.name for StopLogging/
+  #     DeleteTrail/UpdateTrail but under requestParameters.trailName for
+  #     PutEventSelectors. Input transformers can't coalesce two paths into one
+  #     variable, so both are emitted adjacently (<trailName><trailNameSel>) —
+  #     exactly one is populated per event, so the concatenation is the name.
+  input_transformer {
+    input_paths = {
+      eventName    = "$.detail.eventName"
+      trailName    = "$.detail.requestParameters.name"
+      trailNameSel = "$.detail.requestParameters.trailName"
+      userArn      = "$.detail.userIdentity.arn"
+      sourceIp     = "$.detail.sourceIPAddress"
+      region       = "$.region"
+      account      = "$.account"
+      time         = "$.time"
+      errorCode    = "$.detail.errorCode"
+    }
+    input_template = join("", [
+      "{",
+      "\"version\":\"1.0\",",
+      "\"source\":\"custom\",",
+      "\"content\":{",
+      "\"textType\":\"client-markdown\",",
+      "\"title\":\":rotating_light: CloudTrail tampering: <eventName>\",",
+      "\"description\":\"*<eventName>* on trail `<trailName><trailNameSel>` by `<userArn>`\\nError code (blank = the call succeeded): `<errorCode>`\",",
+      "\"nextSteps\":[",
+      "\"Account: `<account>` | Region: `<region>` | Source IP: `<sourceIp>` | Time: `<time>`\",",
+      "\"If unplanned, treat as active intrusion: rotate credentials for the caller and re-enable logging.\"",
+      "]",
+      "}",
+      "}",
+    ])
   }
 }

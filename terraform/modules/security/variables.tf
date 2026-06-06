@@ -117,6 +117,18 @@ variable "enable_cloudtrail" {
   default     = true
 }
 
+variable "enable_cloudtrail_tamper_alerts" {
+  description = "Page on-call (via the Slack alerts topic) when a CloudTrail trail is disabled, deleted, or reconfigured (#1143). Deliberately independent of enable_cloudtrail: the alert watches API-call events on the default event bus, so it protects trails this module does not own (e.g. the SCP-locked sandbox trails). Requires enable_slack_target and a non-empty alerts_sns_topic_arn."
+  type        = bool
+  default     = true
+}
+
+variable "cloudtrail_bucket_delete_guard_role_arns" {
+  description = "Break-glass IAM role ARNs exempt from the CloudTrail log-delete guard (#1143). When non-empty, a bucket-policy Deny blocks s3:DeleteObject/DeleteObjectVersion for every other principal; empty (default) attaches no Deny (no lockout). Caller gotchas: (1) use the role-ARN form arn:aws:iam::ACCT:role/NAME (ArnLike wildcards ok, e.g. .../role/break-glass-*) — an STS assumed-role session ARN will NOT match aws:PrincipalArn and fails silently; (2) the account root is matched like any principal, so list arn:aws:iam::ACCT:root to keep it as an escape hatch; (3) include the deploy/destroy role if the versioned bucket must ever be emptied (cleanup needs DeleteObjectVersion, which the Deny blocks); (4) only applies when enable_cloudtrail=true (otherwise a silent no-op). See docs/SECURITY.md § CloudTrail Log Integrity for design rationale (PutBucketPolicy residual, Object Lock follow-up)."
+  type        = list(string)
+  default     = []
+}
+
 # GuardDuty alerting configuration
 variable "enable_guardduty_alerts" {
   description = "Enable GuardDuty finding alerts (Slack via main topic, email via dedicated topic)"

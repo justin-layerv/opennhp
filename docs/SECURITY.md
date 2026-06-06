@@ -223,6 +223,133 @@ Alternatively, create the budget via AWS Console: Billing → Budgets → Create
 
 ---
 
+## CloudTrail Tamper Detection
+
+An EventBridge rule pages on-call when anyone disables, deletes, or reconfigures
+a CloudTrail trail — the "attacker disables logging" step in an intrusion. Added
+in [#1143](https://github.com/layervai/nhp/issues/1143).
+
+Watched API calls (`eventSource = cloudtrail.amazonaws.com`):
+
+| Event | Why it matters |
+|-------|----------------|
+| `StopLogging` | Halts log delivery without deleting the trail |
+| `DeleteTrail` | Removes the trail entirely |
+| `UpdateTrail` | Can redirect logs to an attacker bucket or disable validation |
+| `PutEventSelectors` | Narrows a trail's scope to blind it without stopping it |
+
+### Delivery
+
+The rule targets the main alerts SNS topic (the on-call page path), formatted
+for AWS Chatbot — the same delivery shape as the GuardDuty Slack target, and
+gated on the same `enable_slack_target`. It is deliberately independent of
+**this module's** trail (`enable_cloudtrail`): the API-call events reach the
+default event bus while *some* us-east-2 trail is logging management events
+(this module's trail, the org trail, or the SCP-locked sandbox trails), so it
+also protects trails this module does not own. The call that stops the *last*
+such trail is itself captured and pages (best-effort — EventBridge delivery is
+at-least-once and the event must be emitted while a trail is still logging, so
+treat this as closing the obvious blind spot, not a hard guarantee).
+
+> **Region scope:** control-plane CloudTrail calls are emitted in the trail's
+> home region. The rule runs in the module's region (`us-east-2`), which is the
+> home region of the canonical, hardened trails — `layerv-nhp-prod-trail` and
+> `layerv-nhp-sandbox-trail` — so those **are** covered today. The one trail not
+> covered is the redundant, unhardened `layerv-prod-trail` (homed in `us-east-1`),
+> which #1143 Bucket B deletes; tampering with it alone blinds nothing, because
+> the canonical and org trails still capture the same management events. The
+> tamper defense is fully effective for prod's relied-upon trail now, and the
+> us-east-1 residue closes out with Bucket B.
+
+### Expected pages (legitimate trail changes)
+
+The rule matches **any** principal — including the Terraform/CI deploy role —
+on purpose: a compromised deploy role is exactly the threat a tamper alert
+exists to catch, so it is deliberately *not* excluded (an `anything-but` carve
+on `userIdentity.arn` would create a blind spot, and the assumed-role session
+ARN format makes such a carve fragile anyway). The practical consequences:
+
+- A normal `terraform apply` only emits `UpdateTrail` when it actually changes
+  the account-local trail's config — rare in steady state, so day-to-day noise
+  is low. `StopLogging`/`DeleteTrail` are the high-signal events; `UpdateTrail`
+  is the noisy one.
+- The **#1143 Bucket B consolidation** deletes/reconfigures trails and *will*
+  page repeatedly. Run it in an announced maintenance window and expect the
+  pages — do not let on-call tune them out as a standing pattern.
+
+### Responding to a Tamper Alert
+
+1. **Confirm intent.** A blank `errorCode` in the alert means the call
+   *succeeded* — logging actually changed. A populated `errorCode` (e.g.
+   `AccessDenied`, expected in sandbox where an SCP blocks trail mutation) means
+   the attempt was *blocked* but still worth investigating.
+2. **Identify the caller** from the alert's `userArn` and source IP. If it isn't
+   a known operator or pipeline, treat as an active intrusion.
+3. **Contain:** rotate the caller's credentials and re-enable logging
+   (`aws cloudtrail start-logging --name <trail>`).
+
+### Testing
+
+Trigger a benign watched call and confirm the page lands:
+
+```bash
+# Prod (no SCP on trail mutation): a successful change → blank errorCode.
+AWS_PROFILE=layerv-prod aws cloudtrail update-trail \
+  --name layerv-nhp-prod-trail --no-include-global-service-events  # then revert
+
+# Sandbox: cloudtrail:UpdateTrail is SCP-blocked, so the call is DENIED — but
+# the denied attempt still emits a CloudTrail event, so the alert STILL fires
+# (with errorCode=AccessDenied). This is the better test: it proves blocked
+# attempts are caught, not just successful ones.
+AWS_PROFILE=layerv aws cloudtrail update-trail --name layerv-nhp-sandbox-trail \
+  --no-include-global-service-events
+
+# PutEventSelectors render check: re-apply the trail's CURRENT selectors (a
+# config no-op that still emits the event). This is the one event whose trail
+# name comes from requestParameters.trailName, so it proves the
+# <trailName><trailNameSel> coalescing renders correctly (not `nullname`).
+sel=$(AWS_PROFILE=layerv-prod aws cloudtrail get-event-selectors \
+  --trail-name layerv-nhp-prod-trail --query EventSelectors --output json)
+AWS_PROFILE=layerv-prod aws cloudtrail put-event-selectors \
+  --trail-name layerv-nhp-prod-trail --event-selectors "$sel"
+```
+
+On the **first** successful (prod) test, confirm the Chatbot message renders the
+`Error code` field as blank rather than a literal `null` — the "blank = call
+succeeded" UX depends on EventBridge substituting an absent `$.detail.errorCode`
+with an empty string. The placeholder sits inside a quoted JSON value, so even an
+odd substitution can't malform the message, but verify the wording reads right.
+Also confirm a `PutEventSelectors` event shows the trail name (it is sourced from
+`requestParameters.trailName`, not `.name` like the other three events).
+
+> The `trail` field is expected to look different across event types:
+> `StopLogging`/`DeleteTrail`/`UpdateTrail` usually render the **full trail ARN**
+> (CloudTrail populates `requestParameters.name` with the ARN), while
+> `PutEventSelectors` renders the **short name**. Both are correct — don't flag
+> the ARN form as a bug. A blank or literal `nullname`/`namenull`, however, *is*
+> a transformer regression.
+
+## CloudTrail Log Integrity
+
+The trail this module owns writes to a versioned, KMS-encrypted S3 bucket. An
+optional break-glass delete guard
+(`cloudtrail_bucket_delete_guard_role_arns`) attaches a bucket-policy `Deny` on
+`s3:DeleteObject`/`DeleteObjectVersion` for every principal except the listed
+roles, so an attacker holding `s3:Delete*` cannot destroy audit history.
+CloudTrail's own writes and S3 lifecycle expiration are unaffected (lifecycle
+deletes are performed by the S3 service, not evaluated against the bucket
+policy). The guard is **off by default** (empty list) to avoid a lockout when no
+break-glass role is defined.
+
+The guard intentionally scopes to object deletion only — it does **not** cover
+`s3:PutBucketPolicy`, so this Terraform keeps managing the policy, but a
+principal with bucket-policy-write could strip the guard before deleting. **S3
+Object Lock** is the stronger follow-up that closes that residual path. Also note
+the guard is keyed on `aws:PrincipalArn`, which is the IAM **role** ARN (not the
+STS `assumed-role/…/SESSION` session ARN) and is present for the account root —
+see the `cloudtrail_bucket_delete_guard_role_arns` variable for the allowlist
+format gotchas.
+
 ## Related Services
 
 ### Security Hub
@@ -247,6 +374,7 @@ API audit logging:
 - All AWS API calls logged
 - Logs encrypted with KMS
 - Archived to S3 with lifecycle policies
+- Tamper detection + log-integrity guard — see [CloudTrail Tamper Detection](#cloudtrail-tamper-detection) and [CloudTrail Log Integrity](#cloudtrail-log-integrity)
 
 ---
 
@@ -260,7 +388,10 @@ API audit logging:
 | `enable_guardduty_alerts` | `false` | Enable EventBridge alerting |
 | `guardduty_alert_severity_threshold` | `4` | Minimum severity (1-8) |
 | `guardduty_alert_emails` | `[]` | Email addresses for alerts |
-| `enable_slack_target` | `true` | Enable Slack-optimized target |
+| `enable_slack_target` | `true` | Enable Slack-optimized target (also gates CloudTrail tamper alerts) |
+| `enable_cloudtrail` | `true` | Enable the account-local CloudTrail trail |
+| `enable_cloudtrail_tamper_alerts` | `true` | Page on-call when a trail is disabled/deleted/reconfigured |
+| `cloudtrail_bucket_delete_guard_role_arns` | `[]` | Break-glass roles exempt from the log-delete `Deny`; empty = guard off |
 
 ### Example Configuration
 

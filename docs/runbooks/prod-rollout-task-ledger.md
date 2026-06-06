@@ -592,6 +592,45 @@ entry to Completed Entries only after `Status: Verified`.
 - Completed date:
 - Evidence:
 
+### 2026-06-05 - PR #2338 - CloudTrail Tamper-Detection Alerting
+
+- Ledger PR: [#2338](https://github.com/layervai/nhp/pull/2338)
+- Source PR / issue: [PR #2338](https://github.com/layervai/nhp/pull/2338) /
+  [issue #1143](https://github.com/layervai/nhp/issues/1143)
+- Component: `terraform`, security module (CloudTrail tamper alert + delete guard)
+- Task owner: prod rollout coordinator
+- Post-rollout tasks:
+  - After the prod apply lands the EventBridge rule, run the Slack-page smoke
+    test in `docs/SECURITY.md` → "CloudTrail Tamper Detection" → Testing:
+    trigger a benign `update-trail` on `layerv-nhp-prod-trail` and confirm the
+    `:rotating_light: CloudTrail tampering` page reaches the on-call Slack
+    channel. This is the only end-to-end proof that the EventBridge input
+    transformer renders and the alert delivers — required, not optional.
+  - On that first page, confirm the `Error code` field renders blank (not the
+    literal `null`) for the successful call.
+  - Also exercise a `PutEventSelectors` event (re-apply the trail's current
+    selectors — a config no-op; command in `docs/SECURITY.md` Testing) and
+    confirm the page renders the trail name, not `nullname`/`namenull`. This is
+    the only event sourced from `requestParameters.trailName` and is what proves
+    the `<trailName><trailNameSel>` coalescing works in the live transformer.
+- Rollback tasks:
+  - The rule and target are additive and side-effect-free; to disable, set
+    `enable_cloudtrail_tamper_alerts = false` (or revert the apply). No data or
+    traffic impact.
+- Follow-ups / deferred tasks:
+  - Interim coverage gap: the rule runs in us-east-2 and covers the canonical
+    `layerv-nhp-prod-trail` (us-east-2, hardened). The redundant
+    `layerv-prod-trail` (us-east-1, unhardened) is not covered until #1143
+    Bucket B deletes it — tracked on
+    [#1143](https://github.com/layervai/nhp/issues/1143). Tampering with that
+    trail alone blinds nothing (canonical + org trails still capture the same
+    management events).
+- Status: Open
+- Status note: Additive, default-on resources apply through the normal promote
+  pipeline; the post-rollout Slack-page smoke is the only required task.
+- Completed date:
+- Evidence:
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries
