@@ -66,11 +66,6 @@ linters:
           - gosec
         text: "G602:"
         path: "nhp/core/ztdo/"
-      # Suppress G404 (weak random) for UUIDs - not security-sensitive
-      - linters:
-          - gosec
-        text: "G404:"
-        path: "nhp/utils/(uuid|utils)\\.go"
       # Suppress G404 (weak random) for jitter timing - not security-sensitive
       - linters:
           - gosec

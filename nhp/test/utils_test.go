@@ -23,6 +23,32 @@ func TestGenerateUUIDv4(t *testing.T) {
 	fmt.Println("uuid: ", uuid)
 }
 
+// TestGetRandomUint32 fences the two contracts callers rely on after
+// the math/rand → crypto/rand swap (issue #1133): the result is never
+// zero (so it is safe as an XOR mask / preamble), and it varies between
+// draws. The old implementation re-seeded math/rand from
+// time.Now().UnixNano() on every call, so two draws within the same
+// nanosecond could collide; a regression back to a per-call-seeded or
+// otherwise stuck source would fail the uniqueness check below.
+func TestGetRandomUint32(t *testing.T) {
+	const draws = 1000
+	seen := make(map[uint32]struct{}, draws)
+	for i := 0; i < draws; i++ {
+		v := utils.GetRandomUint32()
+		if v == 0 {
+			t.Fatalf("GetRandomUint32 returned 0; the non-zero contract is broken")
+		}
+		seen[v] = struct{}{}
+	}
+	// With a CSPRNG over 2^32, the birthday-bound expected number of
+	// collisions across 1000 draws is ~1e-4, so this never flakes; a
+	// stuck or low-entropy source is what makes it fire. Allow one
+	// collision of slack purely as belt-and-suspenders.
+	if len(seen) < draws-1 {
+		t.Errorf("GetRandomUint32 produced %d unique values across %d draws; source may be stuck or low-entropy", len(seen), draws)
+	}
+}
+
 func TestIPTables(t *testing.T) {
 	// Skip if iptables is not available (e.g., in CI environments)
 	if _, err := os.Stat("/sbin/iptables"); os.IsNotExist(err) {

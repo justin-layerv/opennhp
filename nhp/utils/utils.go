@@ -1,31 +1,47 @@
 package utils
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"strings"
-	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
-func GetRandomUint32() (r uint32) {
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+// GetRandomUint32 returns a uniformly random non-zero uint32 drawn from
+// the system CSPRNG (crypto/rand). Zero is excluded so the result is
+// safe to use directly as an XOR mask / header preamble without a
+// degenerate all-zero value.
+//
+// It uses crypto/rand rather than math/rand because nhp/utils is an
+// exported package: today's only caller (curve header obfuscation in
+// SetTypeAndPayloadSize) does not depend on unpredictability, but a
+// future caller reaching for this helper as a nonce/identifier source
+// gets a CSPRNG by default rather than a footgun. See issue #1133.
+//
+// crypto/rand.Read does not fail on supported platforms (Go 1.24+); a
+// read error indicates a catastrophically broken CSPRNG, so we panic
+// rather than return a predictable value from a function whose contract
+// is unpredictability.
+func GetRandomUint32() uint32 {
+	var b [4]byte
 	for {
-		r = rng.Uint32()
-		if r != 0 {
-			break
+		if _, err := rand.Read(b[:]); err != nil {
+			panic(fmt.Sprintf("utils.GetRandomUint32: crypto/rand failed: %v", err))
+		}
+		if r := binary.BigEndian.Uint32(b[:]); r != 0 {
+			return r
 		}
 	}
-	return r
 }
 
 func CatchPanic() {
