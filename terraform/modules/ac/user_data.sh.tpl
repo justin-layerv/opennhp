@@ -359,7 +359,53 @@ mkdir -p /opt/layerv/nhp-ac/log
 mkdir -p /home/ubuntu/traefik
 mkdir -p /home/ubuntu/traefik/plugins-local
 mkdir -p /var/log/traefik
-mkdir -p /acme
+# (No `mkdir -p /acme`: that path belongs to the container variant in
+# docker/Dockerfile.ac.aws — the native Traefik here stores ACME state at
+# /home/ubuntu/traefik/acme.json, and /acme is unreachable under
+# ProtectSystem=strict anyway. Removed so it doesn't read as load-bearing.)
+
+# ============================================================================
+# Dedicated unprivileged user for Traefik (#1090)
+#
+# Traefik runs internet-facing on :80/:443, so an upstream RCE as root is the
+# scariest blast radius on this host. Drop it to a service account that keeps
+# only CAP_NET_BIND_SERVICE (granted on the traefik.service unit below).
+# Mirrors the frps service-user pattern in
+# terraform/modules/qurl-reverse-tunnel-server/user_data.sh.tpl.
+#
+# The working dir + all certs/config stay under /home/ubuntu/traefik because
+# the traefik-plugins repo deploys middleware there via SSM against that
+# hardcoded path (relocating to /opt/layerv is a cross-repo change tracked
+# separately). nhp-traefik therefore needs to TRAVERSE /home/ubuntu: grant
+# o+x only (traverse, not read/list). Note this is a WORLD grant (every local
+# uid gains traverse, not just nhp-traefik); acceptable because the traefik
+# subtree's secrets are 0600 and nothing else under /home/ubuntu is world-
+# readable. A precisely-scoped `setfacl -m u:nhp-traefik:--x` is the tighter
+# alternative, folded into the /opt/layerv relocation follow-up (#2382). The
+# traefik subtree itself is chowned to nhp-traefik at each cert/config write
+# site below and the periodic
+# custom-domain-cert-sync.sh. Traefik only READS the deployed plugin sources
+# (world-readable), so their owner is not load-bearing; the 0600 secrets
+# (privkey.pem, acme.json, dynamic.toml) are what must be nhp-traefik-owned.
+# ============================================================================
+if ! getent group nhp-traefik >/dev/null 2>&1; then
+  groupadd --system nhp-traefik
+fi
+if ! getent passwd nhp-traefik >/dev/null 2>&1; then
+  # --home-dir matches WorkingDirectory (a ReadWritePath) so $HOME points at a
+  # real, writable dir rather than a nonexistent /home/nhp-traefik; --no-create-home
+  # because mkdir above already created it.
+  useradd --system --gid nhp-traefik --no-create-home --home-dir /home/ubuntu/traefik --shell /usr/sbin/nologin nhp-traefik
+fi
+# Sentinel marking this as a post-#1090 non-root-Traefik instance. The periodic
+# custom-domain-cert-sync.sh uses it to tell "nhp-traefik legitimately absent
+# (pre-#1090 box → benign ubuntu fallback)" apart from "nhp-traefik
+# unexpectedly absent on a refreshed box (partial user_data → fail LOUD instead
+# of silently re-owning the 0600 privkey to ubuntu and breaking TLS)". Written
+# only after the useradd above succeeds, so its presence implies the user exists.
+touch /etc/nhp-traefik-nonroot
+chmod o+x /home/ubuntu
+chown nhp-traefik:nhp-traefik /home/ubuntu/traefik /var/log/traefik
 
 # ============================================================================
 # AC Deployment - Fully Infrastructure Driven
@@ -1018,12 +1064,13 @@ jq -e -r '.fullchain // empty' "$CERT_TEMP" > /home/ubuntu/traefik/certs/fullcha
 # Securely delete temp file (keep EXIT trap - rm -f on non-existent file is harmless)
 rm -f "$CERT_TEMP"
 
-# Secure permissions - only ubuntu (Traefik user) can read private key
+# Secure permissions - only nhp-traefik (the Traefik service user) can read the
+# private key (mode 0600, so ownership is load-bearing here).
 chmod 600 /home/ubuntu/traefik/certs/privkey.pem
 chmod 644 /home/ubuntu/traefik/certs/cert.pem
 chmod 644 /home/ubuntu/traefik/certs/chain.pem
 chmod 644 /home/ubuntu/traefik/certs/fullchain.pem
-chown ubuntu:ubuntu /home/ubuntu/traefik/certs /home/ubuntu/traefik/certs/*.pem
+chown nhp-traefik:nhp-traefik /home/ubuntu/traefik/certs /home/ubuntu/traefik/certs/*.pem
 
 # Verify certificate is valid and log info (single openssl invocation)
 CERT_INFO=$(openssl x509 -in /home/ubuntu/traefik/certs/cert.pem -noout -checkend 0 -subject -enddate 2>/dev/null) || {
@@ -1564,8 +1611,17 @@ echo "# No custom domains configured" > /home/ubuntu/traefik/custom-domains.toml
 
 # dynamic.toml mode is set to 600 at creation time above (before the heredoc
 # writes), so no late chmod is needed here.
-# Set ownership on config files (certs already owned from earlier; plugins set after download)
-chown ubuntu:ubuntu /home/ubuntu/traefik /home/ubuntu/traefik/*.toml /home/ubuntu/traefik/*.json 2>/dev/null || true
+# Set ownership on the config files Traefik reads (the dir itself is already
+# nhp-traefik-owned from the user-creation block above; certs are owned
+# earlier, plugins after download). acme.json and dynamic.toml are mode 0600,
+# so nhp-traefik ownership is load-bearing — a genuine chown failure must
+# surface under set -e rather than be masked by a blanket `|| true`. The
+# per-file existence check handles the only legitimate "missing" case
+# (acme.json exists only when !centralized_cert_enabled; the *.toml glob
+# always matches).
+for f in /home/ubuntu/traefik/*.toml /home/ubuntu/traefik/*.json; do
+  [ -e "$f" ] && chown nhp-traefik:nhp-traefik "$f"
+done
 
 # ============================================================================
 # Systemd Services
@@ -1587,7 +1643,40 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=nhp-traefik
+Group=nhp-traefik
+# Bind :80/:443 as a non-root user by keeping only the privileged-port
+# capability (#1090). NoNewPrivileges is compatible with AmbientCapabilities:
+# systemd raises the ambient set before exec.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+PrivateTmp=yes
+# strict makes the whole filesystem read-only except ReadWritePaths. Traefik
+# writes ACME state (acme.json) under the working dir and its logs to
+# /var/log/traefik. ProtectHome is intentionally omitted: the working dir
+# lives under /home/ubuntu/traefik (kept there for the traefik-plugins SSM
+# contract), and ProtectSystem=strict already renders /home read-only — the
+# ReadWritePaths below re-grant write only to the two dirs Traefik needs.
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/traefik /var/log/traefik
+# Carve the plugin sources back to read-only inside the ReadWritePaths parent so
+# a compromised Traefik cannot rewrite its own Yaegi plugin code for
+# persistence. Supported: a ReadOnlyPaths subtree under a ReadWritePaths parent
+# applies to the subtree. The root-running SSM plugin deploy is outside this
+# namespace and still updates the real dir.
+ReadOnlyPaths=/home/ubuntu/traefik/plugins-local
+# (ReadOnlyPaths=/usr/local/bin/traefik would be redundant under
+# ProtectSystem=strict, which already mounts the whole FS read-only — dropped
+# in favor of the directives below.) These add real defense-in-depth and are
+# all safe for a userspace HTTP proxy that never tunes the kernel, loads
+# modules, manages cgroups, or creates suid files. RestrictAddressFamilies is
+# intentionally NOT set: Go's resolver/netlink usage makes scoping it
+# runtime-risky without sandbox validation.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 # WorkingDirectory required for local plugins - Traefik looks for plugins at
 # plugins-local/src/{moduleName}/ relative to this directory
 WorkingDirectory=/home/ubuntu/traefik
@@ -1770,6 +1859,13 @@ aws s3 cp "s3://$PLUGIN_BUCKET/${plugin.config_key}" \
 echo "Traefik plugin ${plugin_name} installed"
 %{ endfor ~}
 
+# Keep plugins-local owned by ubuntu (NOT nhp-traefik): Traefik only READS the
+# world-readable Yaegi plugin sources, so it needn't own them — and owning +
+# ReadWritePaths would let a compromised Traefik rewrite its own plugin code
+# (a clean RCE persistence vector, the exact blast radius this PR shrinks). The
+# unit additionally pins plugins-local ReadOnlyPaths. The cross-repo
+# traefik-plugins SSM deploy runs as root outside Traefik's namespace, so it is
+# unaffected by either.
 chown -R ubuntu:ubuntu /home/ubuntu/traefik/plugins-local
 echo "All Traefik plugins downloaded from S3"
 %{ else }

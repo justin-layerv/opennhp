@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Local fixture test for custom-domain-cert-sync.sh --delete mode (#1994).
+# Local fixture test for custom-domain-cert-sync.sh: --delete mode (#1994) and
+# the non-root transition-safety / sentinel fail-loud logic (#1090, Test 7).
 #
 # Runs in a tmp dir, no AWS calls, no sudo. Designed to be runnable on a dev
 # laptop and in CI (lint workflow). Not a smoke test — that's tests/smoke/.
@@ -7,7 +8,8 @@
 # Invocation:
 #   bash terraform/modules/ac/scripts/test-cert-sync-delete.sh
 #
-# The AC script chowns its outputs to ubuntu:ubuntu and calls `aws cloudwatch`.
+# The AC script chowns its outputs to $TRAEFIK_USER (default nhp-traefik, which
+# is absent on a dev box so it falls back to ubuntu) and calls `aws cloudwatch`.
 # Both would explode on a dev box, so we override them via PATH shim.
 
 set -euo pipefail
@@ -233,6 +235,38 @@ bash "$TARGET_SCRIPT" --delete e.example.com > "$WORKDIR/t6.out" 2>&1 || {
 assert_present "already absent" "$WORKDIR/t6.out" "logged 'already absent' for missing cert dir"
 assert_absent "e.example.com/fullchain.pem" "$CONFIG_FILE" "orphan e.example.com TOML block spliced out"
 assert_present "sibling.example.com" "$CONFIG_FILE" "sibling TOML block preserved through block-only delete"
+
+# --- Test 7: non-root user fallback + sentinel fail-loud (#1090) -------------
+# The transition-safety logic at the top of the script: when $TRAEFIK_USER is
+# absent it either benignly falls back to `ubuntu` (genuine pre-#1090 box, no
+# sentinel) or fails LOUD (sentinel present => refreshed box with partial
+# user_data; must not silently re-own the 0600 privkey to ubuntu). `id -u` on a
+# guaranteed-absent user drives the branch without a shim.
+log "Test 7a: sentinel ABSENT + nhp user absent -> benign WARN fallback to ubuntu"
+SENTINEL="$WORKDIR/nonroot-sentinel"
+rm -f "$SENTINEL"
+mkdir -p "$CERT_DIR/f.example.com"
+echo "fake" > "$CERT_DIR/f.example.com/fullchain.pem"
+if SENTINEL_FILE="$SENTINEL" TRAEFIK_USER="nhp-absent-test-user" \
+     bash "$TARGET_SCRIPT" --delete f.example.com > "$WORKDIR/t7a.out" 2>&1; then
+    assert_present "WARN: user 'nhp-absent-test-user' absent" "$WORKDIR/t7a.out" "benign fallback logs WARN and continues"
+else
+    log "FAIL: benign fallback (no sentinel) exited non-zero"
+    cat "$WORKDIR/t7a.out"
+    FAIL=$((FAIL + 1))
+fi
+
+log "Test 7b: sentinel PRESENT + nhp user absent -> FATAL exit 1 (no silent re-own)"
+touch "$SENTINEL"
+mkdir -p "$CERT_DIR/g.example.com"
+if SENTINEL_FILE="$SENTINEL" TRAEFIK_USER="nhp-absent-test-user" \
+     bash "$TARGET_SCRIPT" --delete g.example.com > "$WORKDIR/t7b.out" 2>&1; then
+    log "FAIL: sentinel-present + absent user did NOT fail loud"
+    cat "$WORKDIR/t7b.out"
+    FAIL=$((FAIL + 1))
+else
+    assert_present "FATAL" "$WORKDIR/t7b.out" "sentinel-present + absent user fails loud (FATAL, exit 1)"
+fi
 
 # --- Summary -----------------------------------------------------------------
 log "--------------------------------------------------"

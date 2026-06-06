@@ -1092,6 +1092,100 @@ entry to Completed Entries only after `Status: Verified`.
 - Completed date:
 - Evidence:
 
+### 2026-06-06 - PR #2343 - Traefik runs as non-root nhp-traefik user
+
+- Ledger PR: [#2343](https://github.com/layervai/nhp/pull/2343)
+- Source PR / issue: [PR #2343](https://github.com/layervai/nhp/pull/2343) /
+  [issue #1090](https://github.com/layervai/nhp/issues/1090)
+- Component: `terraform` (ac / Traefik), AC Traefik runtime
+- Task owner: prod rollout coordinator
+- Cross-repo contract: `traefik-plugins`. After this change Traefik runs as
+  `nhp-traefik`, which only READS the SSM-deployed plugin sources under
+  `/home/ubuntu/traefik/plugins-local`. Those files must remain
+  world-readable (644 files / 755 dirs — the default). Verify a
+  `traefik-plugins` SSM plugin redeploy still loads after rollout; if that
+  repo ever tightens plugin file perms, it must chown to `nhp-traefik`.
+- Pre-rollout tasks:
+  - Sandbox functional validation after the AC ASG instance refresh
+    (`terraform plan`/`apply` does not exercise this runtime/capability
+    change, and a missed perm is a prod-TLS-outage class failure):
+    - `systemctl show traefik -p User -p AmbientCapabilities` reports
+      `nhp-traefik` + `CAP_NET_BIND_SERVICE`; unit is `active`.
+    - HTTPS serves on `:443` (centralized cert, and ACME `acme.json`
+      read/write if per-instance ACME is enabled).
+    - Auth middleware plugin loads (read by `nhp-traefik`) — hit a protected
+      route and confirm the middleware runs.
+    - Trigger the `*-ac-custom-domain-cert-sync` SSM association and confirm
+      the re-synced `privkey.pem` (0600) is owned by `nhp-traefik` and the
+      custom-domain route (not just the centralized cert) serves correctly.
+    - `:8080` ping endpoint healthy (the AC target-group health check).
+    - frps-control bind-wait loop still passes under the new user, and Traefik
+      creates `/var/log/traefik/{traefik,access}.log` cleanly as `nhp-traefik`
+      on a fresh boot (the dir-only chown is sufficient; nothing pre-creates a
+      root-owned log file Traefik then can't reopen).
+    - Mixed-version SSM case: trigger the cert-sync association against an ASG
+      mid-refresh and confirm no `CertSyncFailures` / cert_sync_failures alarm
+      noise (the `ubuntu` fallback handles not-yet-refreshed instances). Inverse
+      window (self-healing, no action needed): if the 6h association fires on a
+      *refreshing* post-#1090 instance after mkdir but before the useradd+sentinel
+      block, both user and sentinel are absent → benign `ubuntu` fallback that
+      briefly owns custom-domain privkeys as ubuntu; the in-boot cert-sync after
+      user creation (and the next 6h run) re-chown to nhp-traefik, so it
+      self-corrects within one cycle.
+    - Under `ProtectSystem=strict`, confirm outbound TLS still works: ACME /
+      Route53 / Secrets Manager reads `/etc/ssl/certs` (readable under strict),
+      and the cross-account assume-role (`AWS_ASSUME_ROLE_ARN`) DNS-challenge
+      path succeeds on a per-instance-ACME instance.
+    - Confirm `plugins-local` is read-only to Traefik (now `ReadOnlyPaths` +
+      ubuntu-owned) yet the auth middleware still loads — i.e. the read-only
+      carve-out didn't break Yaegi plugin loading.
+- Rollout tasks:
+  - Launch-template bump: roll the AC ASG via instance refresh per
+    environment (sandbox first, then prod).
+  - NOTE: the `custom-domain-cert-sync.sh` change takes effect at `terraform
+    apply` (it ships in the SSM document; the association re-runs on all AC
+    instances on doc change + every 6h), i.e. BEFORE instance refresh. It is
+    written to be transition-safe — it falls back to the `ubuntu` owner when
+    the `nhp-traefik` user is absent (old launch template) — so apply does not
+    regress cert sync on not-yet-refreshed instances. No separate ordering
+    step required.
+- Post-rollout tasks:
+  - Confirm AC target groups stay healthy through the refresh and no TLS /
+    middleware errors appear in `traefik.log`.
+  - Cert-sync now fails LOUD (exit 1) rather than silently re-owning the 0600
+    privkey to `ubuntu` when `nhp-traefik` is absent on a refreshed instance —
+    it keys off the `/etc/nhp-traefik-nonroot` sentinel user_data drops after
+    the useradd. IMPORTANT: this early exit fires BEFORE the `CertSyncFailures`
+    put-metric-data, so the `cert_sync_failures` alarm does NOT catch it — it
+    surfaces only as SSM State Manager association non-compliance + the `FATAL`
+    log line. So: (a) confirm the cert-sync association's non-compliance is
+    actually routed somewhere a human sees it, and (b) post-rollout confirm no
+    refreshed instance logs `FATAL: '...' absent but non-root sentinel present`
+    (would mean a partial user_data). A dedicated fail-loud metric/alarm is
+    tracked in #2387.
+  - Plugin redeploy: `plugins-local` is now a `ReadOnlyPaths` bind mount in the
+    unit. Validate that a `traefik-plugins` SSM redeploy's UPDATED code is
+    actually served by the running Traefik after the deploy's restart (Yaegi
+    loads plugins at startup, so a restart is required regardless; this confirms
+    the read-only carve-out didn't introduce bind-mount staleness).
+  - Sanity: nothing world-readable and sensitive sits directly under
+    `/home/ubuntu` (the `chmod o+x` is traverse-only, but traverse still
+    exposes known filenames to other local uids).
+- Rollback tasks:
+  - Revert this PR and instance-refresh the AC ASG to the prior
+    launch-template version. Self-contained to AC `user_data` +
+    `custom-domain-cert-sync.sh`.
+- Follow-ups / deferred tasks:
+  - PR 3 (nhp-acd non-root) deferred under
+    [#1090](https://github.com/layervai/nhp/issues/1090): nhp-acd must retain
+    `CAP_NET_ADMIN`/`CAP_NET_RAW` to drive iptables, so non-root buys only
+    filesystem/process isolation at high fail-open/closed risk.
+- Status: Open
+- Status note: awaiting sandbox functional validation (TLS + middleware +
+  custom-domain cert sync) before prod instance refresh.
+- Completed date:
+- Evidence:
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries

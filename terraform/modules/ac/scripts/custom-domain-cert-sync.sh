@@ -19,6 +19,42 @@ set -euo pipefail
 
 SSM_CERT_PREFIX="${SSM_CERT_PREFIX:-/nhp/certs}"
 TRAEFIK_DIR="${TRAEFIK_DIR:-/home/ubuntu/traefik}"
+# Owner of the cert/config files Traefik reads. Traefik runs as a dedicated
+# non-root service user (#1090); the per-domain privkey.pem is mode 0600, so it
+# must be owned by that user or Traefik cannot read it. Overridable for tests.
+TRAEFIK_USER="${TRAEFIK_USER:-nhp-traefik}"
+# Sentinel that user_data drops after it creates nhp-traefik. Overridable so the
+# fail-loud branch below is fixture-testable (see test-cert-sync-delete.sh / #2390).
+SENTINEL_FILE="${SENTINEL_FILE:-/etc/nhp-traefik-nonroot}"
+# Transition + ordering safety: this script ships in the SSM document and the
+# association re-runs it on ALL AC instances when the doc changes — including
+# instances still on the pre-#1090 launch template that have no nhp-traefik
+# user yet (it is created in user_data, which only runs on refreshed
+# instances). Without this fallback, `set -euo pipefail` + chown against a
+# missing user would abort the sync on those live instances and stale their
+# custom-domain certs. Old instances still run Traefik as root, which reads
+# ubuntu-owned certs fine, so fall back to ubuntu there.
+if ! id -u "$TRAEFIK_USER" >/dev/null 2>&1; then
+  # Discriminate the two "user absent" cases via the sentinel user_data drops
+  # after it creates nhp-traefik (/etc/nhp-traefik-nonroot):
+  #   - sentinel PRESENT but user absent => a refreshed (post-#1090) instance
+  #     with a partial user_data. Falling back to ubuntu would chown the 0600
+  #     privkey.pem to ubuntu, a non-root Traefik couldn't read it, and
+  #     custom-domain TLS would break while we exit 0. Fail LOUD instead.
+  #     NOTE: this early exit fires BEFORE the CertSyncFailures put-metric-data
+  #     (which only runs at normal completion), so the cert_sync_failures alarm
+  #     does NOT catch this path — it surfaces via SSM State Manager association
+  #     non-compliance (and the FATAL log line). A dedicated fail-loud metric +
+  #     alarm is tracked in #2387.
+  #   - sentinel ABSENT => a genuine pre-#1090 instance still running Traefik as
+  #     root (reads ubuntu-owned certs fine). Benign — fall back to ubuntu.
+  if [ -e "$SENTINEL_FILE" ]; then
+    echo "FATAL: '$TRAEFIK_USER' absent but non-root sentinel present (partial user_data on a refreshed instance); refusing to re-own certs to ubuntu" >&2
+    exit 1
+  fi
+  echo "WARN: user '$TRAEFIK_USER' absent and no non-root sentinel (pre-#1090 instance); falling back to 'ubuntu' cert owner" >&2
+  TRAEFIK_USER=ubuntu
+fi
 CERT_DIR="${TRAEFIK_DIR}/certs/custom-domains"
 CONFIG_FILE="${TRAEFIK_DIR}/custom-domains.toml"
 REGION="${AWS_REGION:-us-east-2}"
@@ -51,8 +87,19 @@ LIB_SH="${LIB_SH:-/home/ubuntu/scripts/lib.sh}"
 trap 'rm -f "$TEMP_CONFIG" 2>/dev/null' EXIT
 TEMP_CONFIG=""
 
-# Create directories
+# Create directories. chown every level this mkdir creates to $TRAEFIK_USER so a
+# non-root Traefik can traverse them regardless of the SSM-agent umask: the 0600
+# leaf privkey.pem is only reachable if every parent dir is traversable, and
+# relying on mkdir's default 0755 (o+x) would silently break custom-domain TLS
+# if that umask were ever tightened to 077. Owning the dirs makes traversal
+# independent of mode. The `certs` parent is boot-chowned only in the
+# centralized-cert path, so chown it here too for the per-instance-ACME path.
 mkdir -p "$CERT_DIR"
+chown "$TRAEFIK_USER:$TRAEFIK_USER" "$TRAEFIK_DIR/certs" "$CERT_DIR"
+# Match the centralized-cert path's `chmod 700` on the certs parent so the
+# 700-owner-only-parent defense holds on the per-instance-ACME path too (where
+# this script, not boot, first creates certs/ under the SSM-agent umask).
+chmod 700 "$TRAEFIK_DIR/certs"
 
 # ==============================================================================
 # Append a [[tls.certificates]] entry to a TOML config file
@@ -146,9 +193,11 @@ process_domain_cert() {
 
     echo "Processing certificate for: $DOMAIN"
 
-    # Create domain cert directory
+    # Create domain cert directory (chown so the 0600 privkey.pem leaf stays
+    # traversable by a non-root Traefik regardless of umask — see $CERT_DIR above).
     local DOMAIN_CERT_DIR="$CERT_DIR/$DOMAIN"
     mkdir -p "$DOMAIN_CERT_DIR"
+    chown "$TRAEFIK_USER:$TRAEFIK_USER" "$DOMAIN_CERT_DIR"
 
     # Write cert files
     echo "$CHAIN_VALUE" > "$DOMAIN_CERT_DIR/fullchain.pem"
@@ -157,7 +206,7 @@ process_domain_cert() {
     # Set permissions and ownership
     chmod 600 "$DOMAIN_CERT_DIR/privkey.pem"
     chmod 644 "$DOMAIN_CERT_DIR/fullchain.pem"
-    chown ubuntu:ubuntu "$DOMAIN_CERT_DIR/privkey.pem" "$DOMAIN_CERT_DIR/fullchain.pem"
+    chown "$TRAEFIK_USER:$TRAEFIK_USER" "$DOMAIN_CERT_DIR/privkey.pem" "$DOMAIN_CERT_DIR/fullchain.pem"
 
     # Verify cert is not expired and extract expiry date
     local CERT_INFO
@@ -235,7 +284,7 @@ if [ "$SYNC_MODE" = "delete" ] && [ -n "$TARGET_DOMAIN" ]; then
         TEMP_CONFIG=$(mktemp)
         splice_tls_block_for_dir "$DOMAIN_CERT_DIR" "$CONFIG_FILE" "$TEMP_CONFIG"
         chmod 644 "$TEMP_CONFIG"
-        chown ubuntu:ubuntu "$TEMP_CONFIG"
+        chown "$TRAEFIK_USER:$TRAEFIK_USER" "$TEMP_CONFIG"
         mv "$TEMP_CONFIG" "$CONFIG_FILE"
         echo "Spliced TLS block (if present) for $TARGET_DOMAIN from $CONFIG_FILE"
     else
@@ -318,7 +367,7 @@ if [ "$SYNC_MODE" = "incremental" ] && [ -n "$TARGET_DOMAIN" ]; then
         fi
         append_tls_entry "$DOMAIN_CERT_DIR" "$TEMP_CONFIG"
         chmod 644 "$TEMP_CONFIG"
-        chown ubuntu:ubuntu "$TEMP_CONFIG"
+        chown "$TRAEFIK_USER:$TRAEFIK_USER" "$TEMP_CONFIG"
         mv "$TEMP_CONFIG" "$CONFIG_FILE"
 
         echo "Incremental sync complete for $TARGET_DOMAIN"
@@ -363,7 +412,7 @@ DOMAINS_JSON=$(echo "$ALL_PARAMS" | jq '
 if [ "$(echo "$DOMAINS_JSON" | jq 'length')" = "0" ] || [ -z "$DOMAINS_JSON" ]; then
     echo "No custom domain certificates found"
     echo "# No custom domains configured" > "$CONFIG_FILE"
-    chown ubuntu:ubuntu "$CONFIG_FILE"
+    chown "$TRAEFIK_USER:$TRAEFIK_USER" "$CONFIG_FILE"
     echo "Done"
     exit 0
 fi
@@ -415,7 +464,7 @@ fi
 # Set ownership and permissions before atomic replace so Traefik
 # never sees incorrect ownership between mv and chown.
 chmod 644 "$TEMP_CONFIG"
-chown ubuntu:ubuntu "$TEMP_CONFIG"
+chown "$TRAEFIK_USER:$TRAEFIK_USER" "$TEMP_CONFIG"
 if ! mv "$TEMP_CONFIG" "$CONFIG_FILE"; then
     echo "ERROR: Failed to update config file"
     exit 1
