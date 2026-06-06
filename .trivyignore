@@ -23,11 +23,11 @@ CVE-2025-45582
 CVE-2025-66382
 
 # Go stdlib CVEs in vendored Traefik v3.6.16 binary (Dockerfile.ac.aws).
-# Our binaries are built with Go 1.26.3 (see PR #1911), but the pre-built
+# Our binaries are built with Go 1.26.4 (see #1911, #2356), but the pre-built
 # Traefik binary is still compiled with Go 1.25.0. Wait for a Traefik
-# release built with Go >= 1.26.3 (covering all nine CVEs) to remove
-# these entries. Re-check after 2026-06-15 if no Traefik release has
-# shipped by then.
+# release built with Go >= 1.25.11 / 1.26.4 (covering all thirteen
+# Traefik-scoped CVEs in the blocks below) to remove these entries.
+# Re-check after 2026-06-15 if no Traefik release has shipped by then.
 # https://avd.aquasec.com/nvd/cve-2026-32280
 CVE-2026-32280
 # https://avd.aquasec.com/nvd/cve-2026-32281
@@ -62,18 +62,21 @@ CVE-2026-39825
 # https://nvd.nist.gov/vuln/detail/CVE-2026-39826 (html/template <script> escaping)
 CVE-2026-39826
 
+# CVE-2026-42504 landed in Trivy's DB on 2026-06-02 — mime.WordDecoder
+# CPU-exhaustion DoS, fixed in Go 1.25.11 / 1.26.4 — authoritatively per
+# the Go vuln DB GO-2026-5038 (fixed: go1.25.11, go1.26.4) and the Go
+# 1.26.4 security-release announcement, NOT merely "milestone Go 1.27"
+# (that is the upstream tip; the fix was backported). So our own binaries
+# (now on Go 1.26.4) are patched; only the Traefik v3.6.16 binary (Go
+# 1.25.0 < 1.25.11) still flags it. Re-check with the block above after
+# 2026-06-15 if no Traefik release built with Go >= 1.25.11 has shipped.
+# https://pkg.go.dev/vuln/GO-2026-5038
+# https://nvd.nist.gov/vuln/detail/CVE-2026-42504
+CVE-2026-42504
+
 # go.opentelemetry.io/otel/sdk - FALSE POSITIVE
 # CVE-2026-39883 (PATH hijacking via kenv on BSD) is fixed in v1.43.0.
 # We are on v1.43.0. Trivy's database incorrectly flags it — the affected
 # range is < 1.43.0. Remove this entry once Trivy's DB is corrected.
 # https://avd.aquasec.com/nvd/cve-2026-39883
 CVE-2026-39883
-
-# Go stdlib `mime` DoS, landed in Trivy's DB ~2026-06-06. Unlike the stdlib
-# entries above, the fix is NOT in any released Go version yet — golang/go#79217
-# is FixPending, milestone Go 1.27 — so it flags BOTH our own nhp-server binary
-# (Go 1.26.3) and the vendored Traefik v3.6.16 binary, and no toolchain bump
-# clears it today. Remove after a fixed Go release ships and GO_VERSION is
-# bumped. Tracked in #2357.
-# https://nvd.nist.gov/vuln/detail/CVE-2026-42504 (mime WordDecoder.DecodeHeader quadratic DoS)
-CVE-2026-42504

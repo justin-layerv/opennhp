@@ -242,11 +242,11 @@ checksum_args=(GO_LINUX_AMD64_SHA256 GO_LINUX_ARM64_SHA256 GO_LINUX_ARMV6L_SHA25
 # Keep this table, GO_VERSION, and the dev Dockerfile ARGs together on each
 # Go bump. The armv6l checksum stays here because Dockerfile.app/base still
 # accept TARGETARCH=arm.
-checksum_version="1.26.3"
+checksum_version="1.26.4"
 expected_checksums=(
-  2b2cfc7148493da5e73981bffbf3353af381d5f93e789c82c79aff64962eb556
-  9d89a3ea57d141c2b22d70083f2c8459ba3890f2d9e818e7e933b75614936565
-  d44133d4c66b1451a1e247da26db7716f76a081c0169a75e6c84e1871e394320
+  1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f
+  ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768
+  8db458e995f18a9427a745cefe7a3323962fa2548c4715148963311f300d3b1a
 )
 
 checked=$((checked + 1))

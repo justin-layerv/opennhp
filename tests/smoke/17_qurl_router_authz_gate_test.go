@@ -193,7 +193,7 @@ func TestQurlRouterAuthzGate_SilentDropsUnauthenticatedRequests(t *testing.T) {
 	// EOF variants in a url.Error whose underlying err satisfies
 	// errors.Is — no Go-version-specific string-matching fallback
 	// is needed on Go 1.21+. (smoke module go.mod is pinned to
-	// 1.26.3 today, well past the floor.)
+	// 1.26.4 today, well past the floor.)
 	//
 	// We deliberately do NOT accept "connection reset by peer" (TCP
 	// RST) as a silentDrop signal — RST is a different kernel-level

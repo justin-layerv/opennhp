@@ -1,3 +1,3 @@
 module github.com/layervai/nhp/internalauth
 
-go 1.26.3
+go 1.26.4
