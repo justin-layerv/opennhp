@@ -760,6 +760,58 @@ entry to Completed Entries only after `Status: Verified`.
 - Status note: Waiting for prod rollout. Not validatable in sandbox
   (`enable_cloudtrail = false`); first creation is the prod apply.
 
+### 2026-06-05 - PR #2345 - GuardDuty security alias + triage-runbook links
+
+- Ledger PR: [#2345](https://github.com/layervai/nhp/pull/2345)
+- Source PR / issue: [PR #2345](https://github.com/layervai/nhp/pull/2345) /
+  [#2334](https://github.com/layervai/nhp/issues/2334)
+- Component: `terraform/modules/security`, `terraform/environments/{prod,sandbox}`
+- Task owner: prod rollout coordinator
+- Rollout tasks:
+  - Adds `security@layerv.ai` to `guardduty_alert_emails`, which creates one new
+    `email` subscription on the `layerv-nhp-prod-guardduty-email` SNS topic. SNS
+    email subscriptions start as `PendingConfirmation`; the alias receives no
+    findings until someone clicks the confirmation link delivered to the
+    `security@layerv.ai` inbox. No total-blackout window — the three existing
+    individual subscribers and the Slack/Chatbot path keep delivering during the
+    pending period. Confirm the subscription after the prod apply:
+
+    ```
+    aws sns list-subscriptions-by-topic \
+      --topic-arn arn:aws:sns:<region>:<acct>:layerv-nhp-prod-guardduty-email \
+      --profile layerv-prod \
+      --query "Subscriptions[?Endpoint=='security@layerv.ai'].SubscriptionArn"
+    ```
+
+    A `PendingConfirmation` value (not a real ARN) means the link is unclicked.
+  - The EventBridge email/Slack input-transformer change and the watchdog
+    Lambda's `TRIAGE_RUNBOOK_URL` env var apply with no manual step — they take
+    effect on the next finding/weekly run after apply.
+- Post-rollout tasks:
+  - Confirm the next real or synthetic GuardDuty alert (email + Slack) carries
+    the triage-runbook link. A cheap synthetic check: GuardDuty console →
+    Settings → generate sample findings, then confirm the alert body links to
+    `docs/runbooks/guardduty-finding-triage.md`. Archive the samples afterward
+    so the stale-finding watchdog does not re-alert on them.
+- Rollback tasks:
+  - Revert this PR (remove `security@layerv.ai` from `guardduty_alert_emails`
+    and the runbook-link additions) and re-apply. Removing the alias deletes its
+    SNS subscription; no data migration. The pending/confirmed subscription is
+    harmless if left in place.
+- Follow-ups / deferred tasks:
+  - Sandbox carries the same new `security@layerv.ai` subscription on
+    `layerv-nhp-sandbox-guardduty-email` (applied via build-and-push on merge);
+    it also needs one confirmation click from the alias inbox. Not a prod task,
+    tracked here so it is not dropped.
+  - Issue [#2334](https://github.com/layervai/nhp/issues/2334) remains open for
+    its lower-priority items (severity-tiered SNS topics; confirming the
+    externally-owned Chatbot routes GuardDuty alerts to a dedicated security
+    channel). The pager-escalation item is won't-do — no pager facility exists;
+    the stale-finding watchdog is the compensating control.
+- Status: Open
+- Status note: Waiting for prod apply, then the `security@layerv.ai` SNS
+  confirmation click, then the synthetic-finding link check.
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries

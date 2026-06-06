@@ -1502,9 +1502,28 @@ variable "qurl_alerts_paused" {
 }
 
 variable "qurl_alerts_runbook_base_url" {
-  description = "Base URL for the alert runbooks. Default points at the layervai/nhp main branch."
+  description = "Base URL for the alert runbooks. Default points at the layervai/nhp main branch. Consumed unescaped by both the grafana-dashboards module (Grafana alert JSON) and the security module's GuardDuty alert templates, so it must be literal-safe (no double-quote, `<`, `>`, `|`, backslash, or whitespace) and must not end in `/` (consumers append `/<file>.md`). This variable is the single validation point — the consuming modules are internal to this repo and trust this value."
   type        = string
   default     = "https://github.com/layervai/nhp/blob/main/docs/runbooks"
+
+  # SINGLE enforcement point. This value enters the system here and is threaded
+  # unescaped to the grafana-dashboards and security modules, where it is
+  # concatenated into Grafana alert JSON and the GuardDuty Slack `<url|text>`
+  # link. A `"`, `<`, `>`, `|`, backslash, whitespace, or trailing `/` would
+  # silently malform that output (a dropped GuardDuty Slack alert is a
+  # fail-closed-without-noise monitoring blind spot). Those modules are internal
+  # to this repo and only ever receive this validated value, so they deliberately
+  # do NOT repeat the check — one guard here beats three hand-synced regexes that
+  # rot. If a module is ever extracted for external reuse, add a guard at its new
+  # root.
+  validation {
+    condition     = can(regex("^https://[^\\s\"<>|\\\\]+$", var.qurl_alerts_runbook_base_url))
+    error_message = "qurl_alerts_runbook_base_url must be an https:// URL containing no double-quote, <, >, |, backslash, or whitespace — those characters would malform the Grafana alert JSON and the GuardDuty Slack <url|text> link it is concatenated into."
+  }
+  validation {
+    condition     = !endswith(var.qurl_alerts_runbook_base_url, "/")
+    error_message = "qurl_alerts_runbook_base_url must not end with a trailing slash — consumers append `/<file>.md`, so a trailing slash yields a `//` in the runbook link."
+  }
 }
 
 variable "qurl_alerts_slo_target_percent" {

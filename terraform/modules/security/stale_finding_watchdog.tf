@@ -190,6 +190,7 @@ resource "aws_lambda_function" "stale_finding_watchdog" {
       EMAIL_SNS_TOPIC_ARN  = local.enable_guardduty_email_alerts ? aws_sns_topic.guardduty_email[0].arn : ""
       SEVERITY_THRESHOLD   = tostring(var.guardduty_alert_severity_threshold)
       STALE_AGE_DAYS       = tostring(var.stale_finding_age_days)
+      TRIAGE_RUNBOOK_URL   = local.guardduty_triage_runbook_url
     }
   }
 

@@ -157,7 +157,13 @@ variable "qurl_alerts_sns_topic_arn" {
 }
 
 variable "qurl_alerts_runbook_base_url" {
-  description = "Base URL for the alert runbooks. Each rule's annotations.runbook_url is constructed by appending the runbook filename. Default points at the layervai/nhp main branch."
+  # Concatenated unescaped into Grafana alert JSON (and a trailing-slash would
+  # double up when the filename is appended), so it must be literal-safe and
+  # slash-free. That invariant is validated once at the caller's root
+  # qurl_alerts_runbook_base_url; this module is internal to this repo and trusts
+  # that validated value rather than repeating the regex. If reused outside this
+  # repo, validate at the new root.
+  description = "Base URL for the alert runbooks. Each rule's annotations.runbook_url is constructed by appending the runbook filename. Default points at the layervai/nhp main branch. Validated at (and threaded from) the root qurl_alerts_runbook_base_url."
   type        = string
   default     = "https://github.com/layervai/nhp/blob/main/docs/runbooks"
 }

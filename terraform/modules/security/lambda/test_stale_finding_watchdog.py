@@ -24,6 +24,7 @@ os.environ.update({
     'EMAIL_SNS_TOPIC_ARN': 'arn:aws:sns:us-east-2:123456789012:test-email',
     'SEVERITY_THRESHOLD': '4',
     'STALE_AGE_DAYS': '7',
+    'TRIAGE_RUNBOOK_URL': 'https://example.test/runbook',
     'AWS_REGION': 'us-east-2',
 })
 
@@ -480,6 +481,11 @@ class TestMessageFormat(WatchdogTestCase):
         self.assertIn('test', msg['content']['title'])
         self.assertIn('f1', msg['content']['description'])
         self.assertIn('nextSteps', msg['content'])
+        # Triage-runbook link is appended as a Slack <url|text> next step.
+        self.assertTrue(
+            any('https://example.test/runbook' in step for step in msg['content']['nextSteps']),
+            'expected triage-runbook link in Slack nextSteps',
+        )
 
     def test_slack_message_truncates_with_overflow(self):
         findings = [_finding(f'f{i}') for i in range(watchdog.ALERT_SHOWN_MAX)]
@@ -519,7 +525,20 @@ class TestMessageFormat(WatchdogTestCase):
         self.assertIn('Test finding f1', body)
         self.assertIn('us-west-2', body)
         self.assertIn('archive', body.lower())
+        self.assertIn('https://example.test/runbook', body)
         self.assertNotIn('client-markdown', body)
+
+    def test_runbook_link_omitted_when_unconfigured(self):
+        # A misconfigured deploy (empty TRIAGE_RUNBOOK_URL) must degrade to no
+        # link rather than emitting a blank `<|Triage runbook>` / dangling URL.
+        with patch.object(watchdog, 'TRIAGE_RUNBOOK_URL', ''):
+            slack = watchdog._slack_message([_finding('f1')], 0, 1)
+            email = watchdog._email_message([_finding('f1')], 0, 1)
+        self.assertFalse(
+            any('Triage runbook' in step for step in slack['content']['nextSteps']),
+            'runbook next step should be absent when URL is unset',
+        )
+        self.assertNotIn('Triage runbook', email)
 
     def test_format_timestamp_normalises_datetime_and_string(self):
         # boto3 hands Python `datetime` objects for GuardDuty

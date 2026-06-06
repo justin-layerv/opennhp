@@ -105,8 +105,12 @@ slack_channel_id           = "C0A9S0VCAU9" # #alerts-sandbox
 # whoever's on-call knows the channel is briefly silent.
 chatbot_owned_externally = true
 
-# GuardDuty security alerts (email + Slack via same SNS topic)
+# GuardDuty security alerts (email + Slack via same SNS topic).
+# security@layerv.ai is the canonical, non-personal destination (see #2334);
+# the individual addresses are kept as redundant delivery. Each new address must
+# confirm its SNS subscription via the email link before it receives findings.
 guardduty_alert_emails = [
+  "security@layerv.ai",
   "justin@layerv.ai",
   "benc@layerv.ai",
   "joe@layerv.ai"

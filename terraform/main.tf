@@ -1019,6 +1019,9 @@ module "security" {
   enable_guardduty_alerts = length(var.guardduty_alert_emails) > 0
   alerts_sns_topic_arn    = module.monitoring.sns_topic_arn
   guardduty_alert_emails  = var.guardduty_alert_emails
+
+  # Runbook links in GuardDuty alert bodies - shares the repo-wide base URL
+  runbook_base_url = var.qurl_alerts_runbook_base_url
 }
 
 # AC Module - Access Controller with embedded Traefik for TLS termination

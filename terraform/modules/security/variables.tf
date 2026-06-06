@@ -198,3 +198,16 @@ variable "stale_finding_watchdog_schedule" {
     error_message = "stale_finding_watchdog_schedule must start with cron(...) or rate(...). See https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html"
   }
 }
+
+variable "runbook_base_url" {
+  # Concatenated unescaped into the EventBridge input templates and a Slack
+  # `<url|text>` link, so it must be literal-safe (no double-quote, `<`, `>`,
+  # `|`, backslash, whitespace) and free of a trailing `/`. That invariant is
+  # validated once at the caller's root qurl_alerts_runbook_base_url; this module
+  # is internal to this repo and trusts that validated value rather than
+  # repeating the regex (which would have to be hand-kept in sync). If this
+  # module is ever reused outside this repo, validate at the new root.
+  description = "Base URL for runbook links embedded in GuardDuty alert bodies. Threaded from (and validated at) the root qurl_alerts_runbook_base_url."
+  type        = string
+  default     = "https://github.com/layervai/nhp/blob/main/docs/runbooks"
+}

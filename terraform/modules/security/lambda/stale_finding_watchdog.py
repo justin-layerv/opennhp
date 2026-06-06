@@ -48,6 +48,14 @@ ALERTS_SNS_TOPIC_ARN = os.environ.get('ALERTS_SNS_TOPIC_ARN', '')
 EMAIL_SNS_TOPIC_ARN = os.environ.get('EMAIL_SNS_TOPIC_ARN', '')
 SEVERITY_THRESHOLD = _parse_severity_threshold(os.environ['SEVERITY_THRESHOLD'])
 STALE_AGE_DAYS = int(os.environ['STALE_AGE_DAYS'])
+# Triage-runbook link appended to alert bodies. Sourced from the
+# guardduty_triage_runbook_url Terraform local so the EventBridge alert
+# templates and this watchdog stay in lockstep. Under Terraform this is always
+# set (runbook_base_url is validation-guaranteed non-empty), so the empty-string
+# guard below is belt-and-suspenders for standalone / raw-JSON-replay invocation
+# rather than a reachable TF deploy state — it omits the line instead of
+# emitting a blank `<|Triage runbook>` link.
+TRIAGE_RUNBOOK_URL = os.environ.get('TRIAGE_RUNBOOK_URL', '')
 
 # get_findings caps at 50 IDs per call per the AWS API contract.
 GET_FINDINGS_BATCH = 50
@@ -341,6 +349,13 @@ def _slack_message(shown, overflow, total):
     if overflow > 0:
         lines.append(f'... and {overflow} more')
 
+    next_steps = [
+        'Investigate each finding at the linked console page.',
+        'Archive via `aws guardduty archive-findings` once triaged, or remediate the underlying issue.',
+    ]
+    if TRIAGE_RUNBOOK_URL:
+        next_steps.append(f'<{TRIAGE_RUNBOOK_URL}|Triage runbook>')
+
     return {
         'version': '1.0',
         'source': 'custom',
@@ -348,10 +363,7 @@ def _slack_message(shown, overflow, total):
             'textType': 'client-markdown',
             'title': f':rotating_light: Stale GuardDuty findings - {ENVIRONMENT}',
             'description': '\n'.join(lines),
-            'nextSteps': [
-                'Investigate each finding at the linked console page.',
-                'Archive via `aws guardduty archive-findings` once triaged, or remediate the underlying issue.',
-            ],
+            'nextSteps': next_steps,
         },
     }
 
@@ -377,6 +389,8 @@ def _email_message(shown, overflow, total):
         '',
         'Archive via `aws guardduty archive-findings` once triaged, or remediate the underlying issue.',
     ])
+    if TRIAGE_RUNBOOK_URL:
+        lines.append(f'Triage runbook: {TRIAGE_RUNBOOK_URL}')
     return '\n'.join(lines)
 
 

@@ -104,8 +104,14 @@ slack_channel_id           = "C09UP62A8F4" # #all-layerv
 # on the chatbot config before any prod apply touches it.
 chatbot_owned_externally = true
 
-# GuardDuty security alerts
+# GuardDuty security alerts.
+# security@layerv.ai is the canonical, non-personal destination (resilient to
+# any one person being OOO — see #2334). The individual addresses are kept as
+# redundant delivery; Slack (via Chatbot) remains the primary real-time channel.
+# Each new address must confirm its SNS subscription via the email link before
+# it receives findings (prod-rollout-task-ledger entry for #2334).
 guardduty_alert_emails = [
+  "security@layerv.ai",
   "justin@layerv.ai",
   "benc@layerv.ai",
   "joe@layerv.ai"

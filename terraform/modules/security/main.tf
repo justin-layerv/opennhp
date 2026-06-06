@@ -242,6 +242,13 @@ resource "aws_guardduty_detector_feature" "runtime_monitoring" {
 locals {
   enable_guardduty_alerts       = var.enable_guardduty && var.enable_guardduty_alerts
   enable_guardduty_email_alerts = local.enable_guardduty_alerts && length(var.guardduty_alert_emails) > 0
+
+  # Single source of truth for the triage-runbook link embedded in every
+  # GuardDuty alert body (email + Slack EventBridge targets below, and the
+  # stale-finding watchdog Lambda via its TRIAGE_RUNBOOK_URL env var). Built
+  # from the repo-wide runbook base URL (var.runbook_base_url) so docs moves are
+  # a one-variable edit; the base is required to be literal-safe (#2334).
+  guardduty_triage_runbook_url = "${var.runbook_base_url}/guardduty-finding-triage.md"
 }
 
 # Dedicated SNS topic for GuardDuty email alerts
@@ -339,7 +346,8 @@ resource "aws_cloudwatch_event_target" "guardduty_email" {
       "- Time: <time>\\n",
       "- Finding ID: <findingId>\\n\\n",
       "View in Console:\\n",
-      "https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>\"",
+      "https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>\\n\\n",
+      "Triage Runbook:\\n${local.guardduty_triage_runbook_url}\"",
     ])
   }
 }
@@ -374,7 +382,8 @@ resource "aws_cloudwatch_event_target" "guardduty_slack" {
       "\"description\":\"*<type>*\\n<title>\\n\\n<description>\",",
       "\"nextSteps\":[",
       "\"Account: `<account>` | Region: `<region>` | Time: `<time>`\",",
-      "\"<https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>|View in GuardDuty Console>\"",
+      "\"<https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>|View in GuardDuty Console>\",",
+      "\"<${local.guardduty_triage_runbook_url}|Triage runbook>\"",
       "]",
       "}",
       "}",
