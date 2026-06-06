@@ -870,6 +870,147 @@ entry to Completed Entries only after `Status: Verified`.
 - Completed date:
 - Evidence:
 
+### 2026-06-05 - PR #2349 - DNS hygiene: CAA + SPF/DMARC across apex domains
+
+- Ledger PR: [#2349](https://github.com/layervai/nhp/pull/2349)
+- Source PR / issue: [PR #2349](https://github.com/layervai/nhp/pull/2349) /
+  [issue #1149](https://github.com/layervai/nhp/issues/1149)
+- Component: `terraform` (Route53 records:
+  `terraform/environments/prod/dns_hygiene.tf` for the layerv-mgmt apexes
+  layerv.ai / qurl.site / qurl.link, and
+  `terraform/environments/sandbox/dns_hygiene.tf` for layerv.xyz; shared CAA
+  issuer constants in `terraform/modules/dns-hygiene-constants`)
+- Task owner: prod rollout coordinator
+- Pre-rollout tasks:
+  - **CAA completeness re-check (HARD PRECONDITION).** A CAA that omits any CA
+    actively issuing for a domain silently breaks that CA's next renewal. The
+    issuer sets in the two `dns_hygiene.tf` files were derived from each
+    domain's live crt.sh history at PR time (ACM `amazon.com`/`amazontrust.com`/
+    `awstrust.com`/`amazonaws.com`; `letsencrypt.org`; GoDaddy `godaddy.com`/
+    `starfieldtech.com` on layerv.ai + layerv.xyz only). Re-run before apply to
+    catch any CA added since:
+    `for d in layerv.ai layerv.xyz qurl.link qurl.site; do curl -s "https://crt.sh/?q=%25.$d&output=json" | jq -r '.[]|select(.not_after>"<today>")|.issuer_name' | sort -u; done`
+    and add any new issuer's CAA identifier in the same change. The issuer
+    building blocks are a single source of truth in
+    `terraform/modules/dns-hygiene-constants` — add a new CA THERE and it lands
+    in both envs at once (no two-file sync). Note `crt.sh?q=%25.<domain>` covers
+    subdomain certs too, so a CDN/SaaS fronting e.g. `status.layerv.xyz` via
+    Google Trust Services / Cloudflare would show up — at PR time only
+    {ACM, Let's Encrypt, GoDaddy} were active across all four trees.
+  - ✅ **CONFIRMED — layerv.xyz deliverability gate.** layerv.xyz is a live
+    sender; this PR hardens it to SPF `-all` + DMARC `p=reject`. The domain
+    owner confirmed spf.improvmx.com + amazonses.com are the ONLY senders, so
+    the hardfail SPF drops no legitimate mail. (Still watch the post-rollout
+    DMARC aggregate reports for any unexpected `fail` from a forgotten sender.)
+  - **SUBDOMAIN senders (HARD PRECONDITION).** The `p=none → p=reject` flip
+    applies to EVERY `*.layerv.xyz` subdomain (DMARC subdomains inherit `p`, and
+    the record also states `sp=reject` explicitly), not just the apex. The apex
+    sign-off above does not cover subdomains. Before the sandbox apply, confirm
+    no layerv.xyz subdomain sends mail under its own envelope domain (e.g. a
+    `mail.`/`newsletter.`/marketing or status host) — any that does starts
+    bouncing at `p=reject`. If one exists, give it an aligned SPF/DKIM + its own
+    `_dmarc` record, or scope this DMARC down, before flipping.
+  - ✅ **VERIFIED — qurl.link / qurl.site are non-senders.** They get
+    `v=spf1 -all` + `p=reject` on the premise they emit no mail. Confirmed at PR
+    time: neither has an MX record, an `_amazonses` SES verification TXT, nor any
+    DKIM selector (`s1`/`default`/`google._domainkey`), and nothing in the repo
+    sends mail from them. qurl.link is the login portal, but its magic-link /
+    transactional mail (if any) originates from layerv.ai's SES identity, not
+    `@qurl.link`. If qurl.* is ever wired to send mail, this SPF/DMARC must be
+    revisited first.
+  - **Apex TXT single-set clobber check (HARD PRECONDITION).** The layerv.xyz
+    SPF + DMARC records use `allow_overwrite = true` and a Route53 TXT name holds
+    ONE record set, so the apply replaces the WHOLE set at that name. At PR time
+    the layerv.xyz apex TXT held only the SPF string and `_dmarc.layerv.xyz` held
+    only DMARC. Immediately before apply, re-run `dig +short TXT layerv.xyz` and
+    `dig +short TXT _dmarc.layerv.xyz`; if any non-SPF / non-DMARC value (e.g. a
+    `google-site-verification` / `MS=` token) has since appeared, add it to the
+    resource's `records` list in `sandbox/dns_hygiene.tf` or the overwrite will
+    delete it. Also `dig +short TXT qurl.link qurl.site` and
+    `dig +short TXT _dmarc.qurl.link _dmarc.qurl.site` before the prod apply:
+    those records use `allow_overwrite = false`, so an out-of-band TXT/DMARC that
+    appeared since PR time won't clobber anything but WILL fail the apply loud
+    (`record already exists`) mid-rollout — fold any such value into the matching
+    `records` list in `prod/dns_hygiene.tf` first.
+  - **Confirm the iodef / rua mailboxes are real and monitored.** CAA `iodef`
+    points at `security@layerv.ai` and DMARC `rua` at `dmarc@layerv.ai`. The
+    rua mailbox is already live (the existing layerv.ai DMARC uses it); confirm
+    `security@layerv.ai` is a monitored inbox before CAs start delivering policy-
+    violation reports there.
+  - ✅ **VERIFIED (no action needed) — cross-account role permits CAA/TXT.**
+    The layerv-mgmt role `nhp-ac-route53-access` (acct 165115313779) has one
+    inline policy `route53-acme-access` granting `route53:ChangeResourceRecordSets`
+    on the full zone ARNs for layerv.ai (Z0748438C8EK6UAW94ST), qurl.site
+    (Z06942509AYXSB91X7CD), and qurl.link (Z0693053DKJ8S3XN9WPG) with **no**
+    `Condition` block — i.e. no `route53:ChangeResourceRecordSetsRecordTypes` /
+    `...NormalizedRecordNames` restriction, so all record types (incl. CAA/TXT)
+    are permitted zone-wide. No permissions boundary, no managed policies, no
+    Deny. `aws iam simulate-principal-policy` returns `allowed` for
+    ChangeResourceRecordSets on all three zone ARNs. (SCP at the org level not
+    separately audited, but the existing CNAME/A records via this same role
+    apply cleanly, and IAM here is zone-scoped not type-scoped.)
+- Rollout tasks:
+  - Sandbox apply (`build-and-push` shared terraform) writes the layerv.xyz
+    CAA/SPF/DMARC records (same-account, zone-id-scoped CI grant). SPF + DMARC
+    use `allow_overwrite` to upsert the existing unmanaged live records.
+  - Prod apply (`promote-to-prod`, `run_terraform=true`) writes the layerv.ai /
+    qurl.site / qurl.link CAA, the qurl.* SPF/DMARC, and the three
+    `_report._dmarc` cross-domain authorization records, all cross-account via
+    `aws.route53_mgmt`.
+  - **Apply ordering — run the prod apply before (or together with) the sandbox
+    apply.** layerv.xyz's `p=reject; rua=...` lands in sandbox, but its
+    `layerv.xyz._report._dmarc.layerv.ai` authorization record lands in prod. If
+    sandbox goes first, RFC-7489 receivers drop layerv.xyz aggregate reports
+    until the prod apply runs — i.e. you lose DMARC visibility in exactly the
+    window right after flipping a live sender to `p=reject`. The qurl.* domains
+    have no such gap (their reject + auth records are both in prod).
+- Post-rollout tasks:
+  - **Verify cert renewals still succeed after CAA.** Watch the centralized
+    `acme-cert` renewal Lambda + any ACM `RenewalEligibility` and confirm no
+    `CAA` errors. Specifically confirm GoDaddy's `email.layerv.ai` cert (next
+    renewal ~2026-08/09) renews — the CAA must keep `godaddy.com`/
+    `starfieldtech.com` for layerv.ai.
+  - Confirm DNS resolves: `dig CAA <each apex>`, `dig TXT qurl.link`,
+    `dig TXT _dmarc.qurl.link`, `dig TXT qurl.link._report._dmarc.layerv.ai`.
+  - **DMARC aggregate monitoring must be live on day 1.** Confirm reports begin
+    arriving at dmarc@layerv.ai for qurl.link / qurl.site / layerv.xyz (proves
+    the `_report._dmarc` auth records work) starting at the apply, not days
+    later — with `p=reject` from the first minute, a forgotten qurl.link or
+    layerv.xyz-subdomain sender otherwise surfaces as a user-visible bounce
+    instead of a report line. Watch for any rise in legitimate-mail rejections.
+- Rollback tasks:
+  - SPF/DMARC: the layerv.xyz revert is an IN-PLACE update — set SPF back to
+    `~all` / DMARC back to `p=none` and re-apply (`prevent_destroy` allows
+    updates; `allow_overwrite` restores the value). To remove the qurl.* SPF/DMARC
+    records entirely, use the same drop-`prevent_destroy`-then-delete dance as the
+    CAA rollback below.
+  - CAA: the fast rollback is an IN-PLACE update — add the missing CA to
+    `terraform/modules/dns-hygiene-constants` and re-apply; `prevent_destroy`
+    does not block updates, so a widened issuer set lands immediately. To remove
+    a CAA record entirely, first delete its `lifecycle { prevent_destroy = true }`
+    block, apply, then delete the resource block (a bare deletion while
+    `prevent_destroy` is set fails the apply rather than rolling back).
+- Follow-ups / deferred tasks:
+  - issue [#1149](https://github.com/layervai/nhp/issues/1149) stays OPEN after
+    this PR. Item 4 (DNSSEC parity on layerv.xyz/qurl.link/qurl.site — needs
+    `aws_route53_key_signing_key` + registrar DS upload) and item 5 (Namecheap
+    registrar locks — console action) are NOT addressed here.
+  - **Raise the TTL after bake-in.** `dns_hygiene_ttl` is 300s for fast rollback
+    during initial rollout. Once the records are stable, bump the `ttl` output in
+    `terraform/modules/dns-hygiene-constants` (e.g. to 3600) so permanent hygiene
+    records don't pay 300s-TTL query volume.
+  - **Null-MX (RFC 7505) on the non-sending qurl domains** — tracked under
+    [#1149](https://github.com/layervai/nhp/issues/1149) as additional DNS
+    hygiene. A `0 .` MX on qurl.link / qurl.site would complete the "neither
+    sends nor receives" signal alongside `v=spf1 -all`. NOT for layerv.xyz, which
+    receives inbound via improvmx. Out of scope for this PR (MX ≠ CAA/SPF/DMARC).
+- Status: Ready
+- Status note: Waiting for rollout. Both merge-blocking preconditions are
+  cleared — cross-account role CAA/TXT grant VERIFIED, and layerv.xyz senders
+  CONFIRMED (improvmx + Amazon SES only). The two remaining pre-rollout items
+  (CAA-completeness re-check + apex-TXT clobber re-check) are at-apply
+  re-verifications owned by the rollout coordinator.
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries
