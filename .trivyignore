@@ -68,3 +68,12 @@ CVE-2026-39826
 # range is < 1.43.0. Remove this entry once Trivy's DB is corrected.
 # https://avd.aquasec.com/nvd/cve-2026-39883
 CVE-2026-39883
+
+# Go stdlib `mime` DoS, landed in Trivy's DB ~2026-06-06. Unlike the stdlib
+# entries above, the fix is NOT in any released Go version yet — golang/go#79217
+# is FixPending, milestone Go 1.27 — so it flags BOTH our own nhp-server binary
+# (Go 1.26.3) and the vendored Traefik v3.6.16 binary, and no toolchain bump
+# clears it today. Remove after a fixed Go release ships and GO_VERSION is
+# bumped. Tracked in #2357.
+# https://nvd.nist.gov/vuln/detail/CVE-2026-42504 (mime WordDecoder.DecodeHeader quadratic DoS)
+CVE-2026-42504
