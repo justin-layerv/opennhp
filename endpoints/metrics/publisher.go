@@ -77,6 +77,28 @@ const (
 	// regular CloudWatch counter on the next flush so operators can alarm on
 	// "checkpointing has been silently broken for N intervals".
 	MetricCheckpointWriteFailure = "CheckpointWriteFailure"
+
+	// MetricPublisherFailure counts PutMetricData batches that returned an
+	// error during flush. It is incremented into the live counter map (same
+	// path as MetricCheckpointWriteFailure) so the count rides the NEXT
+	// successful flush, letting operators alarm on a publisher that is
+	// partially or intermittently failing to publish.
+	//
+	// Coverage boundary (intentional): this counter only surfaces a PARTIALLY
+	// failing publisher — one where enough flushes still succeed to carry the
+	// accumulated count to CloudWatch (throttling, a transient IAM/STS hiccup,
+	// one bad batch). It CANNOT surface a TOTALLY failing publisher, in either
+	// form: (a) a nil publisher — NewPublisher returned nil because
+	// loadAWSConfig failed (missing AWS_REGION/creds, IMDS unreachable; the
+	// #1659 incident) — whose metric methods are nil-safe no-ops; or (b) a
+	// non-nil publisher whose every PutMetricData persistently fails, which can
+	// never publish this self-reported counter either. Both ride the same dead
+	// channel. Total failure is instead caught by the absence-of-metric alarms
+	// (treat_missing_data="breaching"), which fire precisely because the
+	// success metrics they watch share that same broken publish path:
+	// ac-registration-stale on the AC and
+	// server-cloudmap-register-refresh-heartbeat on the server. See #1707.
+	MetricPublisherFailure = "PublisherFailures"
 )
 
 // HealthProbe is a function that returns true if the storage backend is healthy.
@@ -520,6 +542,14 @@ func (mp *Publisher) flush() {
 			log.Warning("Failed to publish CloudWatch metrics (batch %d/%d, %d datums): %v",
 				i/batchSize+1, (len(metricData)+batchSize-1)/batchSize,
 				end-i, err)
+			// Self-report the batch failure so a partially/intermittently
+			// failing publisher is observable. IncrCounter writes into the
+			// fresh counter map this flush already swapped in (above), so the
+			// count rides the next successful flush. Under sustained failure
+			// the running total is best-effort and may undercount (it is lost
+			// if the carrying flush also fails) — fine for a presence alarm.
+			// See MetricPublisherFailure for the total-death coverage boundary.
+			mp.IncrCounter(MetricPublisherFailure)
 		}
 	}
 }

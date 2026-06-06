@@ -564,6 +564,34 @@ entry to Completed Entries only after `Status: Verified`.
 - Completed date:
 - Evidence:
 
+### 2026-06-05 - PR #2366 - Metric publisher failure alarms (#1707)
+
+- Ledger PR: [PR #2366](https://github.com/layervai/nhp/pull/2366)
+- Source PR / issue: [PR #2366](https://github.com/layervai/nhp/pull/2366) / [#1707](https://github.com/layervai/nhp/issues/1707)
+- Component: ac, server, terraform
+- Task owner: PR author
+- Post-rollout tasks:
+  - After the terraform apply that creates `${name_prefix}-ac-publisher-failures`
+    and `${name_prefix}-${cell_id}-server-publisher-failures`, confirm both
+    alarms settle in `OK` and NOT `INSUFFICIENT_DATA`. `INSUFFICIENT_DATA`
+    means the alarm dim set does not match the live publisher's emitted dims
+    (the silent-selector failure this very alarm class exists to prevent) —
+    audit `dimensions {}` against `acBaseDims` / `buildServerMetricDimensions`
+    before considering the rollout done.
+  - Optional validation: temporarily revoke `cloudwatch:PutMetricData` on a
+    sandbox AC/server (or rely on a natural throttle) and confirm
+    `PublisherFailures` increments and the alarm transitions to `ALARM`.
+- Rollback tasks: alarms are purely additive (no behavior change); `terraform
+  apply` of the revert removes them. The Go counter is inert when no batch
+  fails.
+- Follow-ups / deferred tasks: none. Total-publisher-death coverage stays on
+  the pre-existing absence alarms (`ac-registration-stale`,
+  `server-cloudmap-register-refresh-heartbeat`); not in scope here.
+- Status: Open
+- Status note:
+- Completed date:
+- Evidence:
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries

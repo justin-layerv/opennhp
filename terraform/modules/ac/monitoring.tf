@@ -384,6 +384,65 @@ resource "aws_cloudwatch_metric_alarm" "l3_flush_schedule_wait_timeout" {
   })
 }
 
+# ==================== Metric Publisher Failure Alarm ====================
+#
+# PublisherFailures is a counter the AC's CloudWatch publisher increments once
+# per PutMetricData batch that returns an error (endpoints/metrics/publisher.go
+# ::flush -> MetricPublisherFailure). It is the meta-alarm from #1707: it pages
+# when the publisher itself is partially/intermittently failing to publish —
+# throttling, a transient IAM/STS hiccup, one bad batch — a class that was
+# otherwise only a log.Warning and silently dropped all metrics.
+#
+# Coverage boundary (the honest framing #1707 step 3 calls out): this catches
+# the case where the client EXISTS but some PutMetricData calls fail. It does
+# NOT catch total publisher death — when NewACRegistration/NewPublisher can't
+# load AWS config (missing AWS_REGION/creds; the #1659 incident) the publisher
+# is nil and emits nothing, so this self-reported counter rides the same dead
+# channel. That blackout is caught by the absence-of-metric alarm
+# `ac-registration-stale` above (treat_missing_data="breaching" on
+# RegistrationSuccess) — the two alarms are complementary, not redundant.
+#
+# Dim set {Component, Environment, Region} mirrors the AC publisher base dims
+# (endpoints/ac/registration.go::acBaseDims) exactly, per the dim-set rule in
+# terraform/CLAUDE.md — the `registration_stale` precedent, NOT the partial-set
+# `registration_failure` style (#239).
+#
+# Sensitivity: 2 failing 5-min windows within 15 min (evaluation_periods=3,
+# datapoints_to_alarm=2). A single isolated transient PutMetricData throttle is
+# absorbed; sustained creds/IAM/throttle degradation pages in <=10 min. Leans
+# more sensitive than registration_failure's threshold-5 because a degraded
+# observability pipeline is rare-and-serious. notBreaching because the counter
+# is sparse (only emitted on a flush that had a failed batch); missing windows
+# are healthy, not breaching.
+resource "aws_cloudwatch_metric_alarm" "publisher_failures" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-publisher-failures"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 2
+  metric_name         = "PublisherFailures"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "AC CloudWatch metric publisher reported PutMetricData batch failures in 2 of the last 3 five-minute windows. Metrics are being partially/intermittently dropped (throttling, IAM/STS, transient AWS). Does NOT cover total publisher death (missing AWS_REGION/creds) — see ac-registration-stale. #1707."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-publisher-failures"
+  })
+}
+
 # ==================== CloudWatch Dashboard ====================
 
 locals {

@@ -795,12 +795,94 @@ func TestPublisher_Flush_PutMetricDataError(t *testing.T) {
 	mp.IncrCounter("KnockRequest")
 	mp.flush() // must not panic on API error
 
-	// Verify state was reset despite the error (metrics are best-effort)
 	mp.mu.Lock()
-	count := len(mp.counters)
+	knock := mp.counters["KnockRequest"]
+	pubFail := mp.counters[MetricPublisherFailure]
+	total := len(mp.counters)
 	mp.mu.Unlock()
-	if count != 0 {
-		t.Errorf("expected counters reset after flush, got %d entries", count)
+
+	// The flushed metric is dropped, not retried (best-effort; see flush()).
+	if knock != 0 {
+		t.Errorf("expected flushed KnockRequest counter dropped, got %v", knock)
+	}
+	// The failed batch self-reports via MetricPublisherFailure into the fresh
+	// counter map, to be carried by the next (hopefully successful) flush.
+	if pubFail != 1 {
+		t.Errorf("expected %s=1 after one failed batch, got %v", MetricPublisherFailure, pubFail)
+	}
+	if total != 1 {
+		t.Errorf("expected only %s left in counter map, got %d entries", MetricPublisherFailure, total)
+	}
+}
+
+// TestPublisher_Flush_PutMetricDataError_CountsPerBatch verifies the failure
+// counter is incremented once per failed PutMetricData batch, not once per
+// flush — so the alarm's Sum reflects the true number of failed API calls.
+func TestPublisher_Flush_PutMetricDataError_CountsPerBatch(t *testing.T) {
+	errClient := &errorCloudWatchClient{err: errors.New("throttled")}
+	mp := newTestPublisher(t, errClient)
+
+	// batchSize+1 distinct counters force exactly 2 PutMetricData batches.
+	for i := 0; i < batchSize+1; i++ {
+		mp.IncrCounter(fmt.Sprintf("Metric_%d", i))
+	}
+	mp.flush()
+
+	mp.mu.Lock()
+	pubFail := mp.counters[MetricPublisherFailure]
+	mp.mu.Unlock()
+	if pubFail != 2 {
+		t.Errorf("expected %s=2 (one per failed batch), got %v", MetricPublisherFailure, pubFail)
+	}
+}
+
+// TestPublisher_Flush_PublisherFailure_RoundTrip locks the end-to-end contract
+// the PublisherFailures alarm depends on: a failure self-reported by a failing
+// flush is actually emitted to CloudWatch on the NEXT successful flush, carrying
+// the publisher's base dims (the alarm's metric-stream selector).
+func TestPublisher_Flush_PublisherFailure_RoundTrip(t *testing.T) {
+	baseDims := []types.Dimension{
+		{Name: aws.String("Component"), Value: aws.String("AC")},
+		{Name: aws.String("Environment"), Value: aws.String("sandbox")},
+		{Name: aws.String("Region"), Value: aws.String("us-east-2")},
+	}
+
+	// Flush 1 fails -> PublisherFailures lands in the freshly-swapped map.
+	errClient := &errorCloudWatchClient{err: errors.New("throttled")}
+	mp := newTestPublisher(t, errClient)
+	mp.dims = baseDims
+	mp.IncrCounter("KnockRequest")
+	mp.flush()
+
+	// Flush 2 succeeds -> the carried PublisherFailures counter is published.
+	mockCW := &mockCloudWatchClient{}
+	mp.client = mockCW
+	mp.flush()
+
+	if len(mockCW.calls) != 1 {
+		t.Fatalf("expected 1 PutMetricData call on the successful flush, got %d", len(mockCW.calls))
+	}
+	datum, ok := indexByName(mockCW.calls[0].MetricData)[MetricPublisherFailure]
+	if !ok {
+		t.Fatalf("expected %s datum emitted on the successful flush", MetricPublisherFailure)
+	}
+	if datum.Value == nil || *datum.Value != 1 {
+		t.Errorf("expected %s value 1, got %v", MetricPublisherFailure, datum.Value)
+	}
+	// The datum must carry the base dims, or the alarm selects a non-existent
+	// stream and sits in INSUFFICIENT_DATA forever (the #239 trap). CloudWatch
+	// treats dimensions as an unordered set, so compare as a set, not by order.
+	if len(datum.Dimensions) != len(baseDims) {
+		t.Fatalf("expected %d base dims on %s, got %d", len(baseDims), MetricPublisherFailure, len(datum.Dimensions))
+	}
+	got := make(map[string]string, len(datum.Dimensions))
+	for _, d := range datum.Dimensions {
+		got[*d.Name] = *d.Value
+	}
+	for _, want := range baseDims {
+		if got[*want.Name] != *want.Value {
+			t.Errorf("base dim %s: got %q, want %q", *want.Name, got[*want.Name], *want.Value)
+		}
 	}
 }
 

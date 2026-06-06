@@ -1165,3 +1165,55 @@ resource "aws_cloudwatch_metric_alarm" "server_cloudmap_register_refresh_failure
     Cell      = var.cell_id
   })
 }
+
+# ============================================================================
+# Metric publisher failure alarm (#1707)
+#
+# PublisherFailures is incremented once per PutMetricData batch error by the
+# server's CloudWatch publisher (endpoints/metrics/publisher.go::flush ->
+# MetricPublisherFailure). It pages when the publisher is partially or
+# intermittently failing to publish — throttling, transient IAM/STS, one bad
+# batch — a class that was otherwise only a log.Warning that silently dropped
+# metrics.
+#
+# Coverage boundary (intentional, per #1707 step 3): catches the case where the
+# CloudWatch client EXISTS but some calls fail. It does NOT catch total
+# publisher death — when NewPublisher can't load AWS config the publisher is
+# nil and emits nothing, so this self-reported counter rides the same dead
+# channel. That blackout is caught by the absence alarm
+# `server-cloudmap-register-refresh-heartbeat` above (treat_missing_data
+# ="breaching"). The two are complementary, not redundant.
+#
+# Dim set {Environment, Cell} matches buildServerMetricDimensions
+# (endpoints/server/udpserver.go) — same selector as the Cloud Map alarms;
+# Sum aggregates the cell's server fleet.
+#
+# Sensitivity: 2 failing 5-min windows within 15 min absorbs a single isolated
+# transient throttle while paging on sustained degradation in <=10 min.
+# notBreaching because the counter is sparse (only emitted on a flush that had
+# a failed batch).
+resource "aws_cloudwatch_metric_alarm" "server_publisher_failures" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-publisher-failures"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 2
+  metric_name         = "PublisherFailures"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "nhp-server CloudWatch metric publisher reported PutMetricData batch failures in 2 of the last 3 five-minute windows; metrics partially/intermittently dropped (throttling, IAM/STS, transient AWS). Does NOT cover total publisher death — see server-cloudmap-register-refresh-heartbeat. #1707."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}

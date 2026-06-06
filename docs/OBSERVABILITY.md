@@ -67,6 +67,23 @@ The `classifyReason()` function bounds re-registration trigger reasons:
 | `connection_timeout` | General connection timeout |
 | `other` | Any unrecognized reason |
 
+## Publisher Infrastructure Metrics
+
+Emitted by the CloudWatch publisher itself (`endpoints/metrics/publisher.go`),
+carrying each component's base dimension set (Server: `{Environment, Cell}`;
+AC: `{Component, Environment, Region}`).
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `PublisherFailures` | Counter | One per `PutMetricData` batch that errored during flush. Surfaces a publisher that is partially/intermittently dropping metrics. Does **not** cover total publisher death (nil publisher from missing AWS config) — that rides the same dead channel and is caught by the absence alarms (`ac-registration-stale`, `server-cloudmap-register-refresh-heartbeat`). See #1707. |
+| `CheckpointWriteFailure` | Counter | One per failed periodic checkpoint write to disk (disk full, perms, unmounted dir). |
+
+> **`PublisherFailures` is a presence signal, not a rate.** Its per-flush
+> magnitude scales with the number of metric series (batch count), and a failure
+> is attributed to the CloudWatch window of the *next successful* flush that
+> carries it — so the alarms key on `Sum > 0`, not on magnitude. Don't threshold
+> on or chart the value as a "failure rate"; it isn't one.
+
 ## Cardinality Design
 
 CloudWatch charges per unique metric time series (unique combination of namespace + metric name + dimensions). To control costs:
@@ -95,3 +112,5 @@ Both server and AC IAM roles need `cloudwatch:PutMetricData` for the `LayerV/NHP
 | `DiskUsagePercent` | `DiskUsagePercent` | AC (shell script) |
 | `RegistrationFailure` | `RegistrationFailure` | AC (>5 failures in 5 min) |
 | `ServerConnectionFailure` | `ServerConnectionFailure` | AC (>10 failures in 10 min, 2 consecutive periods) |
+| `ac-publisher-failures` | `PublisherFailures` | AC (>0 in 2 of last 3 five-min windows) |
+| `server-publisher-failures` | `PublisherFailures` | Server (>0 in 2 of last 3 five-min windows) |
