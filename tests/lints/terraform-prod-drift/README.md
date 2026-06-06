@@ -1,9 +1,13 @@
 # terraform-prod-drift lint fixtures
 
-Regression fixtures for the two PR-time terraform drift detectors:
+Regression fixtures for the PR-time terraform drift detectors. There are two
+scripts; the second carries three logical guards:
 
 - `.github/scripts/check-terraform-iam-coverage.py` — Class A (#1323).
-- `.github/scripts/check-terraform-policy-conditions.py` — Class B (#1316).
+- `.github/scripts/check-terraform-policy-conditions.py` — Class B (#1316,
+  banned Condition keys), plus the nhp#1146 Route53 guard (wildcard-record
+  mutations and the github_actions permission-boundary check) and the #1523 KMS
+  wildcard-decrypt guard (Class C below).
 
 Each fixture is a minimal terraform tree that the lints run against. The
 test harness (`run-fixtures.sh`) asserts each lint produces the expected
@@ -75,6 +79,30 @@ intentionally duplicated in the Python condition lint and
 | `route53-recordset-narrow-condition` | B — nhp#1146 valid computed-zone wildcard with narrow name condition | exit 0 | exit 0 |
 | `route53-recordset-unreviewed-variable-condition` | B — nhp#1146 wildcard zone with an unreviewed variable-sourced name condition | exit 0 | exit 1 (only reviewed variable refs may defer to Terraform validation) |
 | `route53-recordset-variable-condition` | B — nhp#1146 valid computed-zone wildcard with variable-sourced name condition | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-unconditioned` | C — #1523 `kms:Decrypt` + `Resource="*"` with no Condition | exit 0 | exit 1 (unconditioned decrypt grant) |
+| `kms-wildcard-decrypt-calleraccount` | C — #1523 `kms:CallerAccount`-only scope | exit 0 | exit 1 (tautology does not scope identity policies) |
+| `kms-wildcard-decrypt-resourceaccount` | C — #1523 valid `aws:ResourceAccount` scope | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-viaservice` | C — #1523 valid `kms:ViaService` scope (AWS-managed keys) | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-scoped-resource` | C — #1523 concrete key ARN is not `Resource="*"` | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-deny` | C — #1523 `Deny` is a guardrail, not a grant | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-key-policy` | C — #1523 resource-based `aws_kms_key` policy is out of scope | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-ifexists` | C — #1523 `*IfExists` operator does not scope | exit 0 | exit 1 (absent-key operator is a hole) |
+| `kms-wildcard-decrypt-action-glob` | C — #1523 `kms:*` action glob covers `kms:Decrypt` | exit 0 | exit 1 (glob match trips the trigger) |
+| `kms-wildcard-decrypt-role-inline` | C — #1523 `aws_iam_role.inline_policy` is scanned | exit 0 | exit 1 (inline role policies are scanned) |
+| `kms-wildcard-decrypt-reencrypt` | C — #1523 `kms:ReEncryptFrom` is decrypt-capable | exit 0 | exit 1 (second trigger action) |
+| `kms-wildcard-decrypt-managed-policy` | C — #1523 standalone `aws_iam_policy` is scanned | exit 0 | exit 1 (managed policies are scanned) |
+| `kms-wildcard-decrypt-negated-condition` | C — #1523 `StringNotEquals aws:ResourceAccount` does not bind | exit 0 | exit 1 (negated operator is not scope) |
+| `kms-wildcard-decrypt-stringlike-wildcard` | C — #1523 `StringLike aws:ResourceAccount = "*"` | exit 0 | exit 1 (pure-wildcard value is no bound) |
+| `kms-wildcard-decrypt-viaservice-stringlike` | C — #1523 valid `StringLike kms:ViaService` region wildcard | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-identity-principal` | C — #1523 statement `Principal` in an identity policy hits the in-finder guard | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-notresource` | C — #1523 `Allow` + `NotResource` is wildcard-equivalent | exit 0 | exit 1 (broad complement) |
+| `kms-wildcard-decrypt-stringlike-mixed` | C — #1523 `StringLike = ["<acct>", "*"]` wildcard arm unbinds the OR-list | exit 0 | exit 1 (StringLike wildcard matches every account) |
+| `kms-wildcard-decrypt-stringequals-deadwildcard` | C — #1523 `StringEquals = ["<acct>", "*"]` `"*"` arm is a dead literal | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-account-wildcard-arn` | C — #1523 `arn:aws:kms:*:*:key/*` account-wildcard ARN reaches every account | exit 0 | exit 1 (account-wildcard ARN is broad) |
+| `kms-wildcard-decrypt-notaction` | C — #1523 `Allow` + `NotAction` allows `kms:Decrypt` on `Resource="*"` | exit 0 | exit 1 (NotAction branch is scanned) |
+| `kms-wildcard-decrypt-forallvalues-scope` | C — #1523 valid `ForAllValues:StringEquals aws:ResourceAccount` scope | exit 0 | exit 0 |
+| `kms-wildcard-decrypt-user-policy` | C — #1523 `aws_iam_user_policy` is scanned | exit 0 | exit 1 (user policies are scanned) |
+| `kms-wildcard-decrypt-group-policy` | C — #1523 `aws_iam_group_policy` is scanned | exit 0 | exit 1 (group policies are scanned) |
 
 The `clean` fixture additionally exercises `count`-gated `aws_iam_role_policy` (the `cloudformation_website_api` grant is gated on `var.deploy_website_api_dns`, mirroring the real `terraform/modules/ecr/main.tf` shape that landed in #1414). `indexed-managed-policy` covers the same gating shape for `aws_iam_policy`.
 

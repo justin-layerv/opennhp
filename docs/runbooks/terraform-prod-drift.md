@@ -383,6 +383,81 @@ no-ops on the unpopulated key (rare), refactor to make the intent
 explicit (e.g., a different condition operator like `BoolIfExists`)
 rather than relying on AWS's omission.
 
+## KMS wildcard-decrypt finding
+
+Format:
+
+```
+resource `aws_<type>.<name>` statement `<Sid>` grants a decrypt-capable
+KMS action on a broad resource (`Resource = "*"`, an account-wildcard
+ARN, or `NotResource`) with no same-account-resource condition.
+```
+
+### What the lint is asserting
+
+The Class-C guard added for #1523 (regression-prevention for #1125 /
+PR #1520). In an **identity** policy, an `Allow` statement granting a
+decrypt-capable KMS action (`kms:Decrypt` / `kms:ReEncryptFrom`,
+IAM-glob-aware so `kms:*`/`*` count) on a broad resource lets a
+same-account principal decrypt across account boundaries unless the
+statement is scoped to same-account resources. A resource is "broad" when
+it is `Resource = "*"`, an ARN whose account-id field is `*`
+(`arn:aws:kms:*:*:key/*`, reaches every account) or empty
+(`arn:aws:kms:us-east-1::key/*`, denotes no real key — flagged
+conservatively as malformed), or any `NotResource`.
+
+### Action
+
+1. **Scope `Resource` to explicit same-account key ARNs** (e.g.
+   `[var.kms_key_arn]`), or
+2. **Add a same-account condition**: `aws:ResourceAccount`
+   (`= data.aws_caller_identity.current.account_id`) — or, for AWS-managed
+   keys whose ARN isn't known at plan time (SecretsManager/SSM),
+   `kms:ViaService` — in a positive `StringEquals`/`StringLike` condition.
+   `kms:CallerAccount` does **not** count: in an identity policy it
+   resolves to the principal's own account, so it never constrains the
+   *resource's* account (the #1125 trap). `*IfExists`, negated operators,
+   and a pure-`*` value don't count either.
+
+### What this lint does and does not prove
+
+- It proves the **presence** of same-account-scoping *syntax*, not the
+  **correctness** of the bound account value. The real account is usually
+  `data.aws_caller_identity.current.account_id`, resolved at apply, so a
+  hardcoded *foreign* concrete account
+  (`StringEquals aws:ResourceAccount = "<foreign-acct>"`) passes the lint
+  clean. A reviewer must still confirm the account literal — a green check
+  is not "the account value is verified."
+- Only `aws:ResourceAccount` and `kms:ViaService` are recognized as scope.
+  Tag conditions (`aws:ResourceTag/...`) and `aws:ResourceOrgID` are
+  **not** same-account bounds (a foreign key can carry a matching tag;
+  same-org spans accounts), so such grants are flagged and must refactor
+  to explicit ARNs or `aws:ResourceAccount`.
+- `kms:ViaService` pins the call to a service endpoint, not strictly to an
+  account; a same-account secret referencing a foreign KMS key is a
+  documented residual gap (accepted per #1523 as the AWS-managed-key
+  pattern).
+
+### Full-admin grants
+
+A legitimate break-glass / admin role with `Action = "*"` (or a broad
+`NotAction`) on `Resource = "*"` **will** trip this finding, because it
+*can* decrypt cross-account. There is intentionally **no exception
+mechanism** today (the tree is clean). The first real admin-shaped grant
+needs a deliberate decision, not a reflexive scoping edit: either narrow
+the grant, or add an explicit, reviewed exception path to
+`kms_wildcard_decrypt_findings` (e.g. an allowlist of `(type, name, Sid)`
+with a rationale, mirroring how `BANNED_CONDITIONS` is documented) plus a
+fixture. Don't bolt `aws:ResourceAccount` onto a grant that genuinely
+needs admin breadth.
+
+### Adding coverage
+
+New shapes get a fixture under
+`tests/lints/terraform-prod-drift/fixtures/` (one dir, `terraform/` tree)
+plus a row in `run-fixtures.sh`'s `FIXTURES` array and the README table,
+kept in lockstep (the suite asserts dir/row parity).
+
 ## Diagnostic — how to see what the lint actually saw
 
 Both scripts support `--json` for machine-readable output:

@@ -758,9 +758,16 @@ resource "aws_iam_policy" "permission_boundary" {
           "kms:CreateGrant"
         ]
         Resource = "*"
+        # aws:ResourceAccount (not kms:CallerAccount) is the load-bearing key:
+        # it resolves to the account that owns the key being acted on, so the
+        # boundary actually caps KMS use to same-account keys. kms:CallerAccount
+        # resolves to the principal's own account — always this account in an
+        # identity policy — a tautology that advertises a cross-account bound it
+        # never enforces. See #1125 / PR #1520 and the KMS wildcard-decrypt
+        # guard in .github/scripts/check-terraform-policy-conditions.py.
         Condition = {
           StringEquals = {
-            "kms:CallerAccount" = data.aws_caller_identity.current.account_id
+            "aws:ResourceAccount" = data.aws_caller_identity.current.account_id
           }
         }
       },
