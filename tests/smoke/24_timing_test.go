@@ -27,6 +27,7 @@ package smoke
 import (
 	"context"
 	"math"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -80,8 +81,8 @@ func TestTiming_ResolveMax(t *testing.T) {
 	for i := 0; i < samples; i++ {
 		start := time.Now()
 		minted := mintSmokeQURL(ctx, t, "https://example.com")
-		resp, _ := doGetNoRedirect(t, testConfig.NHPServerBaseURL,
-			"/plugins/qurl?token="+minted.AccessToken(), nil)
+		resp, _ := doPostFormNoRedirect(t, testConfig.NHPServerBaseURL,
+			"/plugins/qurl", "token="+url.QueryEscape(minted.AccessToken()), nil)
 		elapsed := time.Since(start)
 		if resp.StatusCode == 302 {
 			durations = append(durations, elapsed)
