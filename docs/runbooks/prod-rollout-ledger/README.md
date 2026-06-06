@@ -1,0 +1,88 @@
+# Prod Rollout Ledger
+
+Tracks concrete, PR-specific tasks that must happen **before, during, or after a
+production rollout** — and nothing else. It is not a behavior-change log.
+
+Each entry is its own file in this directory, so PRs never contend on a shared
+file. When an entry's tasks are done, **delete the file.** There is no archive
+and no "completed" section; git history is the record.
+
+## When to add an entry
+
+Add an entry **only** when a person or automation must *do* something, *verify*
+something, or *own a rollback step* for prod:
+
+- Pre-rollout: smoke checks, config/secret/migration readiness, customer-risk review.
+- Rollout: deploy ordering, feature-flag flips, migrations, manual console work,
+  secret/config writes.
+- Post-rollout: smoke checks, metrics, dashboards, logs, alarms, customer probes.
+- Rollback: exact revert/rollback steps, or a known rollback limitation.
+- Cross-repo contracts with qurl-service, qurl-reverse-tunnel-server/client, or traefik-plugins.
+
+If a PR only changes behavior with no such task, **do not add an entry** — check
+"Confirmed this PR has no prod rollout tasks" in the PR body instead. Keep
+entries succinct: a one-line summary plus the task checkboxes. Detail belongs in
+the linked PR/issue, not here.
+
+## Adding an entry
+
+Create one file per entry, named `YYYY-MM-DD-pr-NNNN-short-slug.md` — or, for an
+entry driven by another repo's PR/issue, named after that source instead (e.g.
+`2026-06-05-qurl-service-852-scanner-image.md`). Use this template:
+
+```markdown
+# YYYY-MM-DD · PR #NNNN · Short title
+
+- **Owner:** prod rollout coordinator
+- **Source:** <PR / issue links>
+
+One or two sentences: what must happen and when, relative to rollout.
+
+- [ ] Pre-rollout: ...
+- [ ] Rollout: ...
+- [ ] Post-rollout: ...
+- [ ] Rollback: ...
+- [ ] Cross-repo: ...
+```
+
+Keep only the task lines that apply. Never paste secrets, customer data, or
+private production hostnames — link parameter names, check names, metrics, and
+run URLs instead.
+
+## Completing an entry
+
+When every task is done, **delete the entry file** (in the PR that performs the
+last task, or a small follow-up docs PR). Do not move it to a "completed"
+section. Record post-rollout evidence (what verification ran, run/dashboard
+links) in the entry's PR or tracking issue *before* deleting — that, plus git
+history, is the durable record.
+
+A PR whose only ledger change is deleting a completed entry has no new rollout
+task, so it selects **Confirmed this PR has no prod rollout tasks** — a deletion
+does not satisfy the "Added a prod rollout ledger entry" choice.
+
+If a task is intentionally deferred, link a tracking GitHub issue in the entry
+and leave the file until that issue closes. Label the issue with existing
+component/type/priority labels; do not invent release-only labels.
+
+## CI enforcement
+
+`.github/workflows/prod-rollout-tasks.yml` (status `prod-rollout-tasks / Check
+PR body`) requires ready, non-draft PRs to check exactly one box in the PR
+body's `## Prod Rollout Tasks` section:
+
+- **Added a prod rollout ledger entry** — the PR must add (or amend) a file
+  under `docs/runbooks/prod-rollout-ledger/` other than this README. The gate
+  checks only that such a file changed — not that the entry is genuinely new or
+  named `YYYY-MM-DD-pr-NNNN-slug.md`; reviewers confirm that.
+- **Confirmed this PR has no prod rollout tasks.**
+
+This status is currently **advisory** — it is not yet a required check or part
+of the aggregate merge gate, so reviewers enforce truthfulness. Draft PRs pass
+early and are re-checked when marked ready. The checkbox label text must stay
+identical across the PR template, this README, and the workflow — the workflow
+matches the labels exactly.
+
+Bot- and automation-authored PRs (release and dependency automation included)
+must carry this section once ready for review; if the automation cannot populate
+the PR body, a maintainer edits it before merge.

@@ -109,7 +109,7 @@ chatbot_owned_externally = true
 # any one person being OOO — see #2334). The individual addresses are kept as
 # redundant delivery; Slack (via Chatbot) remains the primary real-time channel.
 # Each new address must confirm its SNS subscription via the email link before
-# it receives findings (prod-rollout-task-ledger entry for #2334).
+# it receives findings (prod rollout ledger entry for #2334).
 guardduty_alert_emails = [
   "security@layerv.ai",
   "justin@layerv.ai",
@@ -216,7 +216,7 @@ enable_resolve_cloudfront = true
 # is token-gated and RateLimit/CommonRuleSet/KnownBadInputs stay enforcing, while
 # the IP-reputation list false-positives legitimate datacenter-origin traffic
 # (CI smoke, VPN, proxies, link-unfurlers). WAF logging captures what it would
-# block; flip to true to restore blocking. See docs/runbooks/prod-rollout-task-ledger.md.
+# block; flip to true to restore blocking. See docs/runbooks/prod-rollout-ledger/README.md.
 resolve_waf_ip_reputation_block = false
 
 # Keep resolve WAF logging on (explicit, matching the posture decision above) so

@@ -11,8 +11,7 @@
 # Gating: the ECR repo + SSM image-tag param gate on `deploy_qurl_service`
 # (so qurl-service CI can publish images regardless of the Lambda enable
 # flag); the Lambda + cron + alarms gate on `qurl_scanner_lambda_enabled`.
-# See the prod rollout task ledger
-# (`docs/runbooks/prod-rollout-task-ledger.md`, entry for PR #2326) for
+# See PR #2326 for
 # the canonical two-apply rollout sequence, preflight checks, smoke tests,
 # rollback steps, and prod flag-flip preconditions — this file deliberately
 # does NOT duplicate that here to avoid drift.

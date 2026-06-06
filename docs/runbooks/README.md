@@ -14,7 +14,7 @@ runbook file is added, renamed, or removed.
 - [L3 flush schedule wait timeout](l3-flush-schedule-wait-timeout.md)
 - [License pubkey gate — provisioning & strict flip](license-pubkey-strict-flip.md)
 - [NHP ACK token shared-store failures](nhp-ack-token-shared-store.md)
-- [Prod Rollout Task Ledger](prod-rollout-task-ledger.md)
+- [Prod Rollout Ledger](prod-rollout-ledger/README.md)
 - [promote-to-prod Lambda artifact-pass invariant](promote-to-prod-lambda-artifacts.md)
 - [promote-to-prod partial deploy / split state](promote-to-prod-partial-deploy.md)
 - [qurl-api 5xx burn rate](qurl-5xx.md)

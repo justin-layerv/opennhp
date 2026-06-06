@@ -39,15 +39,16 @@ Commit format and full details: see [`docs/COMMIT_CONVENTION.md`](docs/COMMIT_CO
 > `.github/workflows/validate-workflows.yml`); add a new scope to both
 > places in the same PR.
 
-## Prod Rollout Task Ledger
+## Prod Rollout Ledger
 
 Any PR that creates a concrete task that must happen before, during, or after
-prod rollout must add an entry to
-[`docs/runbooks/prod-rollout-task-ledger.md`](docs/runbooks/prod-rollout-task-ledger.md)
-following its PR Update Rule before merge. The ledger is not a behavior-change
-log. The CI PR-body check enforces the checkbox choice for ready, non-draft PRs;
-reviewers enforce whether the selected checkbox is truthful and the ledger
-contains only required rollout tasks.
+prod rollout adds a succinct entry file under
+[`docs/runbooks/prod-rollout-ledger/`](docs/runbooks/prod-rollout-ledger/)
+(one file per entry — see the README there) before merge. **Delete the entry
+file once its tasks are done**; the ledger is not a behavior-change log or an
+archive. The CI PR-body check enforces the checkbox choice for ready, non-draft
+PRs; reviewers enforce whether the selected checkbox is truthful and the entry
+covers only required rollout tasks.
 
 ---
 
@@ -215,7 +216,7 @@ This file stays light. Subtree-scoped rules live in nested `CLAUDE.md` files (au
 | Runbooks index | `docs/runbooks/README.md` |
 | Security monitoring + secrets / `NHP_INTERNAL_AUTH_SECRET` / KMS exception | `docs/SECURITY.md` |
 | GuardDuty finding triage (alert routing + stale-finding watchdog) | `docs/runbooks/guardduty-finding-triage.md` |
-| Prod Rollout Task Ledger | `docs/runbooks/prod-rollout-task-ledger.md` |
+| Prod Rollout Ledger | `docs/runbooks/prod-rollout-ledger/README.md` |
 | qurl-service `/internal/v1/*` triage | `docs/runbooks/qurl-internal-v1-triage.md` |
 | Create a QURL via API | `docs/runbooks/create-qurl.md` |
 | Renew a LayerV-owned domain (+ Domain Expiry Watchdog) | `docs/runbooks/domain-renewal.md` |

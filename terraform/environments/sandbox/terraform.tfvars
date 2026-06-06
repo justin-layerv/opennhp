@@ -500,7 +500,7 @@ qurl_link_external_dns    = false
 enable_resolve_cloudfront = true
 
 # Resolve WAF: run the Amazon IP-reputation rule in COUNT (observe, don't block).
-# See prod tfvars / docs/runbooks/prod-rollout-task-ledger.md for rationale; flip
+# See prod tfvars / docs/runbooks/prod-rollout-ledger/README.md for rationale; flip
 # to true to restore blocking.
 resolve_waf_ip_reputation_block = false
 

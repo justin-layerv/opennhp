@@ -1,0 +1,14 @@
+# 2026-06-04 · PR #2318 · qURL internal knock placement hotfix
+
+- **Owner:** prod rollout coordinator
+- **Source:** [#2318](https://github.com/layervai/nhp/pull/2318) · [layervai/qurl-service#821](https://github.com/layervai/qurl-service/pull/821) · [layervai/qurl-service#827](https://github.com/layervai/qurl-service/pull/827) · [#2322](https://github.com/layervai/nhp/issues/2322)
+
+NHP server hotfix so route-less internal knocks resolve dynamic `q_` resource rows via direct exact-resource lookup. Not yet in prod: deploy this NHP server fix before any qurl-service prod rollout depending on #821/#827.
+
+- [ ] Pre-rollout: confirm the qurl-service build being smoked preserves #821's headless contract (`PublicResolveHandler` derives `srcIP` from `c.ClientIP()`; empty `srcIp` fails closed as `InternalKnockResourceNotFound`) and that #827 dynamic `q_` rows are visible via direct exact-resource lookup, with elapsed app-level `ttl` rejected before the DynamoDB TTL sweeper runs.
+- [ ] Pre-rollout: confirm `KnockSrcIP` validation compares the same canonical IP shape qurl-service sends; confirm Terraform passes `local.nhp_qurl_dynamic_customer_id_prefix` as the qurl-service module's `nhp_resources_customer_id_prefix` (IAM `dynamodb:LeadingKeys` admits only `<prefix>-??` dynamic shards); confirm writer and reader share the same regional `nhp_resources` replica (`ConsistentRead`, no cross-region RAW).
+- [ ] Rollout: deploy this NHP server hotfix to sandbox before re-running the #821 smoke and validating #827 publishing; promote to prod before any qurl-service prod rollout depending on #821/#827.
+- [ ] Post-rollout: re-run #821 smoke (headless `/v1/resolve` succeeds, no `knock_failed`) and #827 smoke (fresh dynamic `q_` resolves with no catalog-cache delay); confirm no sustained `InternalKnockResourceNotFound` / strict-auth failures and no qurl-service `NHP resource catalog publish failed` / `nhp_resources` PutItem errors.
+- [ ] Post-rollout: confirm `ResourceLookupExpiredDirectRow` near zero (sustained multi-row rate = qurl-service leaking expired rows), `ResourceLookupMissingDirectTTL` zero (nonzero = malformed dynamic rows failing closed); confirm direct `q_` lookups read the resource_id-derived shard only; watch `ac_id-index` read/write capacity during burn-in and per-AZ tunnel-server selection concentration.
+- [ ] Rollback: roll back this NHP server image if headless resolves still fail post-hotfix. If failures show `ResourceLookupDirectAspMismatch`/`ResourceLookupMissingDirectTTL`, roll back the qurl-service writer and inspect the affected shard before re-enabling catalog writes.
+- [ ] Follow-ups: [#2319](https://github.com/layervai/nhp/issues/2319) (short-TTL cache for dynamic `q_` lookups after QPS measured); [#2322](https://github.com/layervai/nhp/issues/2322) resolved once #2318 + qurl-service#827 merge.

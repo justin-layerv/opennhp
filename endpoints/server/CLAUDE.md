@@ -1,13 +1,13 @@
 # endpoints/server — Local Guidance
 
-## Prod Rollout Task Ledger
+## Prod Rollout Ledger
 
 Server changes often create concrete prod rollout tasks such as internal
 endpoint smoke tests, HMAC secret checks, metric/alarm verification,
 shutdown/drain coordination, qurl-service coordination, or
-qurl-reverse-tunnel-server coordination. When they do, update
-[`../../docs/runbooks/prod-rollout-task-ledger.md`](../../docs/runbooks/prod-rollout-task-ledger.md)
-by adding an entry following its PR Update Rule before merge.
+qurl-reverse-tunnel-server coordination. When they do, add a succinct entry file under
+[`../../docs/runbooks/prod-rollout-ledger/`](../../docs/runbooks/prod-rollout-ledger/)
+before merge (delete it once its tasks are done).
 
 During review, confirm either the task ledger was updated or the PR has no
 pre-rollout, rollout, or post-rollout tasks. Do not add entries just to

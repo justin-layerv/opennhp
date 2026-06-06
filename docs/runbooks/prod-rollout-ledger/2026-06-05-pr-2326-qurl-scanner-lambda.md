@@ -1,0 +1,19 @@
+# 2026-06-05 · PR #2326 · qurl-scanner Lambda + EventBridge + IAM
+
+- **Owner:** prod rollout coordinator
+- **Source:** [#2326](https://github.com/layervai/nhp/pull/2326) · [layervai/qurl-service#852](https://github.com/layervai/qurl-service/pull/852)
+
+Adds the qurl-scanner Lambda + cron + alarms behind `qurl_scanner_lambda_enabled` (default off). Not yet in prod: ships disabled, rolled out via a two-apply (flag off → flag on) sequence per env after qurl-service CI publishes an image. See the PR for full preconditions.
+
+- [ ] Pre-rollout: confirm qurl-service `main` has published a `layerv/qurl-scanner-lambda` image to ECR and written its SHA to `/<name_prefix>/qurl-scanner-lambda-image-tag` SSM (Lambda `package_type = "Image"` fails create against an empty repo).
+- [ ] Pre-rollout: confirm qurl-service branch protection requires the `Docker Build (scanner-lambda)` job before merge to main.
+- [ ] Pre-rollout (HARD PROD): operator manually writes the prod SSM image-tag (`/layerv-nhp-prod/qurl-scanner-lambda-image-tag`) to a replication-verified sandbox SHA BEFORE the flag-on apply — qurl-service CI only writes the sandbox path; prod is Terraform-seeded `"latest"` (see PR for the 3 resolution options).
+- [ ] Pre-rollout (HARD PROD): confirm ECR replication propagated the image to the prod (secondary) account/region — `aws ecr describe-images --repository-name layerv/qurl-scanner-lambda --image-ids imageTag=<SHA>` returns the same digest (Lambda cannot pull cross-account; wait ~5 min for replication lag).
+- [ ] Pre-rollout: `aws lambda get-account-settings` → `UnreservedConcurrentExecutions` ≥ 101 before flipping (reserved-concurrency=1 subtracts from the pool; request a quota bump if near 100).
+- [ ] Rollout: per env, first apply with flag off (creates ECR repo + SSM param), then second apply with `qurl_scanner_lambda_enabled = true` (creates Lambda + EventBridge cron + scan-gap alarm). Prod repeats the sequence; gated by qurl-service task #85 (SQS/consumer/`--allow-prod-emit`).
+- [ ] Rollout: entrypoint smoke — `aws lambda invoke --function-name layerv-nhp-sandbox-cell0-qurl-scanner` and confirm `scanner starting` + `scanner tick complete` logs (empty bucket, no panic).
+- [ ] Rollout (REQUIRED BEFORE PROD FLAG FLIP): data-path smoke — mint a short-expiry transit qURL, then operator-replay invoke with `--payload '{"bucket": <int>}'`; confirm GSI Query returned items, UpdateItem succeeded (no KMSAccessDeniedException / IAM denial), `scanner_errors_burning` stayed OK.
+- [ ] Post-rollout: confirm scan-gap alarm `layerv-nhp-<env>-cell0-qurl-scanner-invocation-gap` is OK (fires on `Sum(Invocations) ≤ 3 over 5 min × 2 periods`).
+- [ ] Post-rollout: confirm log group `/aws/lambda/layerv-nhp-<env>-cell0-qurl-scanner` is KMS-encrypted with 30-day retention, and the Lambda is in log-only emit mode (no `EMIT_MODE` env var, no `--allow-prod-emit`).
+- [ ] Rollback: flip `qurl_scanner_lambda_enabled = false` and re-apply (destroys Lambda + cron + alarm; leaves ECR repo + SSM param). Per-event kill: unset `EMIT_MODE` (or set `log-only`) and re-apply.
+- [ ] Cross-repo follow-ups: [qurl-service#853](https://github.com/layervai/qurl-service/issues/853) (memoize AWS clients), [qurl-service#854](https://github.com/layervai/qurl-service/issues/854) (retire ECR-probe scaffolding). On SQS-activation PR, thread the queue KMS key ARN + add `kms:GenerateDataKey`/`kms:Decrypt` to `scanner_lambda_sqs`; audit binary error handling before wiring `scanner_lambda_alarm_sns_topic_arn` to a paging topic (see PR).
