@@ -156,6 +156,27 @@ class TestPublishFailureMetricSynthetic(unittest.TestCase):
         assert mock_cw.called
 
 
+class TestPublishRecoveryMetricSynthetic(unittest.TestCase):
+    """publish_recovery_metric() suppresses recoveries for synthetic domains so a
+    non-customer domain can't feed the cert_recovery_storm alarm (mirrors
+    publish_failure_metric)."""
+
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    def test_skips_synthetic_domain(self, mock_cw):
+        cm.publish_recovery_metric(domain='smoke-cleanup-x.example.invalid')
+        mock_cw.assert_not_called()
+
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    def test_emits_for_real_domain(self, mock_cw):
+        cm.publish_recovery_metric(domain='secure.customer.com')
+        assert mock_cw.called
+
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    def test_emits_when_no_domain(self, mock_cw):
+        cm.publish_recovery_metric()
+        assert mock_cw.called
+
+
 class TestDomainToAcmeSubdomain(unittest.TestCase):
     """Tests for domain_to_acme_subdomain() helper."""
 
@@ -212,7 +233,7 @@ class TestProvisionPendingDomains(unittest.TestCase):
         cm.QURL_DOMAINS_TABLE = None
         try:
             result = cm.provision_pending_domains()
-            assert result == {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'skipped': 0}
+            assert result == {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'recovered': 0, 'skipped': 0}
         finally:
             cm.QURL_DOMAINS_TABLE = original
 
@@ -312,7 +333,12 @@ class TestProvisioningTimeout(unittest.TestCase):
     @patch('custom_domain_cert_manager.publish_failure_metric')
     @patch('custom_domain_cert_manager.update_domain_status')
     @patch.object(cm.dynamodb_client, 'query')
-    def test_auto_fails_stuck_domain(self, mock_query, mock_status, mock_metric, mock_alert):
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_auto_fails_stuck_domain(self, mock_get_param, mock_query, mock_status, mock_metric, mock_alert):
+        # No cert in SSM → the nhp#977 recovery check finds nothing, so the
+        # auto-fail proceeds exactly as before.
+        mock_get_param.side_effect = cm.ssm_client.exceptions.ParameterNotFound(
+            {'Error': {'Code': 'ParameterNotFound', 'Message': 'not found'}}, 'GetParameter')
         old_time = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
         mock_query.return_value = {
             'Items': [
@@ -325,6 +351,7 @@ class TestProvisioningTimeout(unittest.TestCase):
         result = cm.provision_pending_domains()
         assert result['timed_out'] == 1
         assert result['provisioned'] == 0
+        assert result['recovered'] == 0
         mock_status.assert_called_once()
         assert mock_status.call_args.args[0] == 'stuck.example.com'
         assert mock_status.call_args.args[1] == cm.STATUS_FAILED
@@ -427,6 +454,298 @@ class TestProvisioningTimeout(unittest.TestCase):
         )
 
 
+class TestProvisioningTimeoutRecovery(unittest.TestCase):
+    """Tests for the pre-auto-fail cert recovery path (_recover_provisioned_cert, nhp#977).
+
+    A domain can be stuck in provisioning_tls because update_domain_status(active)
+    lost a race with a DynamoDB blip *after* the cert was issued and stored in SSM.
+    Before auto-failing such a domain, provision_pending_domains() reconciles it
+    against SSM and recovers the row to active when a healthy cert exists.
+    """
+
+    @staticmethod
+    def _param_not_found():
+        return cm.ssm_client.exceptions.ParameterNotFound(
+            {'Error': {'Code': 'ParameterNotFound', 'Message': 'not found'}}, 'GetParameter')
+
+    @staticmethod
+    def _throttle_error():
+        return ClientError(
+            {'Error': {'Code': 'ThrottlingException', 'Message': 'slow down'}}, 'GetParameter')
+
+    @staticmethod
+    def _meta_response(days_until_expiry, now=None):
+        """Build a get_parameter response for a cert expiring in N days.
+
+        Returns (response, expires_at_str) so callers can assert the exact
+        expires_at threaded into update_domain_status. Pass ``now`` to anchor
+        the expiry to a caller-supplied clock with no drift — needed to pin the
+        boundary exactly at RENEWAL_DAYS_BEFORE_EXPIRY; otherwise it defaults to
+        the current time.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(days=days_until_expiry)).isoformat()
+        response = {'Parameter': {'Value': json.dumps({
+            'domain': 'whatever.example.com',
+            'expires_at': expires_at,
+            'acme_subdomain': 'whatever--example--com',
+        })}}
+        return response, expires_at
+
+    # ---- helper-level branch logic ----
+
+    @patch('custom_domain_cert_manager.publish_recovery_metric')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_recovers_valid_cert(self, mock_get, mock_status, mock_recovery_metric):
+        now = datetime.now(timezone.utc)
+        resp, expires_at = self._meta_response(89)
+        mock_get.return_value = resp
+        outcome = cm._recover_provisioned_cert('valid.example.com', now)
+        assert outcome == cm.RECOVER_RECOVERED
+        mock_status.assert_called_once_with(
+            'valid.example.com', cm.STATUS_ACTIVE,
+            cert_param_prefix='/nhp/certs/valid.example.com', cert_expires_at=expires_at)
+        # /meta is a plain String param — recovery must not pay a KMS decrypt.
+        assert mock_get.call_args.kwargs['WithDecryption'] is False
+        assert mock_get.call_args.kwargs['Name'] == '/nhp/certs/valid.example.com/meta'
+        # Recovery is metered (with the domain, for synthetic-domain suppression)
+        # so the #977 race is measurable in prod.
+        mock_recovery_metric.assert_called_once_with('valid.example.com')
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_no_cert_on_parameter_not_found(self, mock_get, mock_status):
+        mock_get.side_effect = self._param_not_found()
+        outcome = cm._recover_provisioned_cert('missing.example.com', datetime.now(timezone.utc))
+        assert outcome == cm.RECOVER_NO_CERT
+        mock_status.assert_not_called()
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_defers_on_transient_ssm_error(self, mock_get, mock_status):
+        mock_get.side_effect = self._throttle_error()
+        outcome = cm._recover_provisioned_cert('throttled.example.com', datetime.now(timezone.utc))
+        assert outcome == cm.RECOVER_DEFER
+        mock_status.assert_not_called()
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_no_recover_when_cert_near_expiry(self, mock_get, mock_status):
+        now = datetime.now(timezone.utc)
+        resp, _ = self._meta_response(cm.RENEWAL_DAYS_BEFORE_EXPIRY - 5)
+        mock_get.return_value = resp
+        outcome = cm._recover_provisioned_cert('expiring.example.com', now)
+        assert outcome == cm.RECOVER_NO_CERT
+        mock_status.assert_not_called()
+
+    @patch('custom_domain_cert_manager.publish_recovery_metric')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_no_recover_at_exactly_renewal_threshold(self, mock_get, mock_status, mock_recovery_metric):
+        """days_until_expiry == RENEWAL_DAYS_BEFORE_EXPIRY is <= threshold, so it
+        is NOT recovered. Pins the `<=` boundary (one day either side flips it)."""
+        now = datetime.now(timezone.utc)
+        # Anchor expiry to `now` so it lands exactly on the threshold (no drift).
+        mock_get.return_value, _ = self._meta_response(cm.RENEWAL_DAYS_BEFORE_EXPIRY, now=now)
+        outcome = cm._recover_provisioned_cert('boundary.example.com', now)
+        assert outcome == cm.RECOVER_NO_CERT
+        mock_status.assert_not_called()
+        mock_recovery_metric.assert_not_called()
+
+    @patch('custom_domain_cert_manager.publish_recovery_metric')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_recovers_just_above_renewal_threshold(self, mock_get, mock_status, mock_recovery_metric):
+        """One day past the threshold flips to recovery — the other side of `<=`."""
+        now = datetime.now(timezone.utc)
+        mock_get.return_value, _ = self._meta_response(cm.RENEWAL_DAYS_BEFORE_EXPIRY + 1, now=now)
+        outcome = cm._recover_provisioned_cert('boundary.example.com', now)
+        assert outcome == cm.RECOVER_RECOVERED
+        mock_status.assert_called_once()
+        mock_recovery_metric.assert_called_once_with('boundary.example.com')
+
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.publish_recovery_metric')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_defers_when_recovery_write_raises(self, mock_get, mock_status, mock_recovery_metric, mock_failure_metric):
+        """If the recovery write raises (defensive against a future
+        update_domain_status contract change), defer rather than crash the scan
+        or miscount the domain as recovered — and emit a DynamoDB failure metric
+        so the defer-on-raise path isn't a dashboard blind spot."""
+        now = datetime.now(timezone.utc)
+        resp, _ = self._meta_response(89)
+        mock_get.return_value = resp
+        mock_status.side_effect = RuntimeError('ddb unavailable')
+        outcome = cm._recover_provisioned_cert('writefail.example.com', now)
+        assert outcome == cm.RECOVER_DEFER
+        mock_recovery_metric.assert_not_called()
+        mock_failure_metric.assert_called_once_with(cm.FAILURE_DYNAMODB)
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_no_recover_on_malformed_meta(self, mock_get, mock_status):
+        mock_get.return_value = {'Parameter': {'Value': 'not-json{'}}
+        outcome = cm._recover_provisioned_cert('garbled.example.com', datetime.now(timezone.utc))
+        assert outcome == cm.RECOVER_NO_CERT
+        mock_status.assert_not_called()
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_no_recover_on_non_object_meta(self, mock_get, mock_status):
+        """Valid JSON that isn't an object (null/number/string/array) must fall
+        through to auto-fail, not crash the scan with AttributeError on .get()."""
+        for value in ('null', '42', '"a-string"', '[1, 2, 3]'):
+            with self.subTest(value=value):
+                mock_status.reset_mock()
+                mock_get.return_value = {'Parameter': {'Value': value}}
+                outcome = cm._recover_provisioned_cert('nonobj.example.com', datetime.now(timezone.utc))
+                assert outcome == cm.RECOVER_NO_CERT
+                mock_status.assert_not_called()
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_helper_no_recover_when_expires_at_missing(self, mock_get, mock_status):
+        mock_get.return_value = {'Parameter': {'Value': json.dumps(
+            {'domain': 'noexp.example.com', 'acme_subdomain': 'noexp--example--com'})}}
+        outcome = cm._recover_provisioned_cert('noexp.example.com', datetime.now(timezone.utc))
+        assert outcome == cm.RECOVER_NO_CERT
+        mock_status.assert_not_called()
+
+    # ---- integration through provision_pending_domains ----
+
+    @patch('custom_domain_cert_manager.publish_recovery_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.dynamodb_client, 'query')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_recovers_stuck_domain_with_valid_cert(
+        self, mock_get, mock_query, mock_status, mock_metric, mock_alert, mock_sync, mock_recovery_metric,
+    ):
+        """A timed-out domain whose cert is already in SSM is recovered to active,
+        not auto-failed — and a full cert sync fires so the AC fleet picks up the
+        cert the failed provisioning never synced."""
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+        mock_query.return_value = {
+            'Items': [{
+                'domain': {'S': 'recovered.example.com'},
+                'provisioning_started_at': {'S': old_time},
+            }]
+        }
+        resp, expires_at = self._meta_response(89)
+        mock_get.return_value = resp
+
+        result = cm.provision_pending_domains()
+
+        assert result['recovered'] == 1
+        assert result['timed_out'] == 0
+        assert result['failed'] == 0
+        # Row reconciled to active with the existing cert values...
+        mock_status.assert_called_once_with(
+            'recovered.example.com', cm.STATUS_ACTIVE,
+            cert_param_prefix='/nhp/certs/recovered.example.com', cert_expires_at=expires_at)
+        # ...not auto-failed: no timeout metric, no SNS alert (recovery only logs WARNING).
+        mock_metric.assert_not_called()
+        mock_alert.assert_not_called()
+        # Recovery is metered, and exactly once for the one recovered domain.
+        mock_recovery_metric.assert_called_once_with('recovered.example.com')
+        # The original provisioning's sync never ran; recovery must trigger one.
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_PROVISION)
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.dynamodb_client, 'query')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_defers_stuck_domain_on_transient_ssm_error(
+        self, mock_get, mock_query, mock_status, mock_metric, mock_alert, mock_sync,
+    ):
+        """A transient SSM read error must NOT auto-fail the domain — leave it in
+        provisioning_tls so the next scan re-evaluates."""
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+        mock_query.return_value = {
+            'Items': [{
+                'domain': {'S': 'blip.example.com'},
+                'provisioning_started_at': {'S': old_time},
+            }]
+        }
+        mock_get.side_effect = self._throttle_error()
+
+        result = cm.provision_pending_domains()
+
+        assert result['recovered'] == 0
+        assert result['timed_out'] == 0
+        # Neither recovered nor failed — the row is left untouched this round.
+        mock_status.assert_not_called()
+        mock_metric.assert_not_called()
+        mock_alert.assert_not_called()
+        mock_sync.assert_not_called()
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.dynamodb_client, 'query')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_within_timeout_row_skips_recovery_ssm_read(self, mock_get, mock_query, mock_provision, mock_sync):
+        """Recovery (and its /meta read) runs only on timed-out rows. A
+        within-timeout row goes straight to provision_certificate and must NOT
+        touch SSM via the recovery path — locks the `if timeout_check is not None`
+        guard."""
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        mock_query.return_value = {
+            'Items': [{
+                'domain': {'S': 'fresh.example.com'},
+                'provisioning_started_at': {'S': recent},
+            }]
+        }
+        mock_provision.return_value = {'status': 'provisioned'}
+
+        result = cm.provision_pending_domains()
+
+        assert result['provisioned'] == 1
+        assert result['recovered'] == 0
+        assert result['timed_out'] == 0
+        mock_provision.assert_called_once()
+        mock_get.assert_not_called()
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_PROVISION)
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.dynamodb_client, 'query')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_auto_fails_when_cert_near_expiry(
+        self, mock_get, mock_query, mock_status, mock_metric, mock_alert, mock_sync,
+    ):
+        """A stale cert inside the renewal window is not papered over — auto-fail
+        so the reprovision path mints a fresh one."""
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+        mock_query.return_value = {
+            'Items': [{
+                'domain': {'S': 'stale.example.com'},
+                'provisioning_started_at': {'S': old_time},
+            }]
+        }
+        resp, _ = self._meta_response(cm.RENEWAL_DAYS_BEFORE_EXPIRY - 5)
+        mock_get.return_value = resp
+
+        result = cm.provision_pending_domains()
+
+        assert result['recovered'] == 0
+        assert result['timed_out'] == 1
+        assert mock_status.call_args.args[0] == 'stale.example.com'
+        assert mock_status.call_args.args[1] == cm.STATUS_FAILED
+        mock_metric.assert_called_once_with(cm.FAILURE_PROVISIONING_TIMEOUT)
+        # Auto-fail still pages on-call with the operator-facing reason.
+        assert 'auto-failed' in mock_alert.call_args.args[0].lower()
+        mock_sync.assert_not_called()
+
+
 class TestStoreCertificate(unittest.TestCase):
     """Tests for store_certificate() SSM parameter storage."""
 
@@ -450,6 +769,14 @@ class TestStoreCertificate(unittest.TestCase):
         assert '/nhp/certs/example.com/key' in names
         assert '/nhp/certs/example.com/chain' in names
         assert '/nhp/certs/example.com/meta' in names
+
+        # Lock the write-order invariant: /meta MUST be written last. The
+        # nhp#977 recovery path (_recover_provisioned_cert) trusts a present
+        # /meta as proof that key+chain were already stored; if a refactor wrote
+        # /meta first, recovery could mark a row active before its cert material
+        # exists. This pins that contract so such a reorder fails the suite.
+        assert names[-1].endswith('/meta'), (
+            "meta must be the final SSM write — nhp#977 recovery depends on it")
 
         # Verify key and chain are SecureString, meta is String
         for call in mock_put.call_args_list:

@@ -586,6 +586,51 @@ resource "aws_cloudwatch_metric_alarm" "cert_provisioning_failures" {
   })
 }
 
+# Recovery-storm alarm for the #977 cert-recovery path (publish_recovery_metric).
+#
+# A *single* recovery is benign — it is the #977 fix working as intended (a
+# domain whose SSM cert exists but whose DynamoDB status-write lost a race is
+# reconciled to active, once). So unlike the failure alarms above, this does NOT
+# page on `> 0` in a single period; that would alert on the fix succeeding.
+#
+# What must page is recoveries *sustained across scans*. update_domain_status()
+# swallows its own exceptions, so if a row's status-write keeps failing it
+# recovers — and re-fires a full BATCH_SYNC_PROVISION — on every 15-minute scan
+# indefinitely. That shows up as ProvisioningRecoveries being non-zero across
+# consecutive scans. Keying on persistence (recoveries in >=3 of the last 4
+# scans, ~1h) rather than magnitude separates that from a one-off without needing
+# a tuned baseline: a single recovery is one datapoint then zeros and can't reach
+# 3-of-4.
+#
+# The metric is dimensionless (publish_metric(..., 1)), so the alarm keys on the
+# no-dimension stream (consistent with the aggregate ProvisioningFailures alarm)
+# and therefore cannot tell "one row looping every scan" from "several distinct
+# rows each recovering once during a broad DynamoDB degradation." That's
+# acceptable — both are sustained, both warrant a look — so the semantics are
+# deliberately "recoveries persisted across ~1h," not "one row is looping." A
+# per-row signal would need a Domain dimension (high-cardinality + per-domain
+# alarms); not worth it here.
+resource "aws_cloudwatch_metric_alarm" "cert_recovery_storm" {
+  alarm_name          = "${var.name_prefix}-custom-domain-cert-recovery-storm"
+  alarm_description   = "Sustained custom domain cert recoveries (nhp#977) across consecutive scans — a silent DynamoDB status-write loop or a broader DDB incident; both worth investigating"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 4
+  datapoints_to_alarm = 3
+  metric_name         = "ProvisioningRecoveries"
+  namespace           = "NHP/CustomDomainCerts"
+  period              = 900 # one renewal_scan cadence (rate(15 minutes))
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [local.sns_topic_arn]
+  ok_actions    = [local.sns_topic_arn]
+
+  tags = merge(local.common_tags, {
+    Name = "${var.name_prefix}-custom-domain-cert-recovery-storm"
+  })
+}
+
 # Per-category failure alarms for diagnosing provisioning issues without logs
 locals {
   failure_categories = {

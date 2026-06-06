@@ -104,6 +104,15 @@ DDB_ABSENT = 'absent'
 DDB_RACE = 'race'
 DDB_ERROR = 'error'
 
+# Outcomes from _recover_provisioned_cert() (nhp#977). The recovery check runs
+# in provision_pending_domains() just before the auto-fail: a domain stuck in
+# provisioning_tls may actually hold a valid cert in SSM whose
+# update_domain_status(STATUS_ACTIVE) write lost a race with a DynamoDB blip
+# after issuance + storage already succeeded.
+RECOVER_RECOVERED = 'recovered'  # valid cert found; DDB row reconciled to active
+RECOVER_NO_CERT = 'no_cert'      # no usable cert; caller proceeds with auto-fail
+RECOVER_DEFER = 'defer'          # transient SSM read error; re-check next scan
+
 # Batch sync trigger identifiers (not real domain names). Membership in
 # BATCH_SYNCS keeps trigger_cert_sync's full-mode-vs-incremental dispatch
 # in sync as new batch modes are added.
@@ -160,6 +169,11 @@ FIELD_ACME_SUBDOMAIN = 'acme_subdomain'
 CW_NAMESPACE = 'NHP/CustomDomainCerts'
 CW_METRIC_DAYS_UNTIL_EXPIRY = 'DaysUntilExpiry'
 CW_METRIC_PROVISIONING_FAILURES = 'ProvisioningFailures'
+# Emitted when a stuck provisioning_tls row is reconciled to active against an
+# existing valid SSM cert instead of being auto-failed (nhp#977). Lets operators
+# measure how often the SSM-write-succeeded / DynamoDB-write-failed race fires
+# and detect a recovery storm (same domain recovering every scan).
+CW_METRIC_PROVISIONING_RECOVERIES = 'ProvisioningRecoveries'
 
 # Failure category constants — published as the FailureCategory dimension on
 # the ProvisioningFailures metric so alarms identify the root cause at a glance.
@@ -916,6 +930,19 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
         raise
 
 
+def _parse_iso_expiry(expires_at_str: str) -> datetime:
+    """Parse a cert /meta expires_at string into a timezone-aware datetime.
+
+    Naive timestamps are assumed UTC. Shared by renewal_scan() and
+    _recover_provisioned_cert() so both interpret stored expiry identically.
+    Raises ValueError/TypeError on a malformed value — callers handle it.
+    """
+    expires_at = datetime.fromisoformat(expires_at_str)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at
+
+
 def renewal_scan() -> Dict[str, Any]:
     """
     Scan all custom domain certificates and renew those approaching expiry.
@@ -988,10 +1015,7 @@ def renewal_scan() -> Dict[str, Any]:
                 results['skipped'] += 1
                 continue
 
-            expires_at = datetime.fromisoformat(expires_at_str)
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-
+            expires_at = _parse_iso_expiry(expires_at_str)
             now = datetime.now(timezone.utc)
             days_until_expiry = (expires_at - now).days
 
@@ -1121,7 +1145,7 @@ def provision_pending_domains() -> Dict[str, Any]:
     repo's DynamoDB module (terraform/modules/dynamodb/main.tf).
     """
     if not QURL_DOMAINS_TABLE:
-        return {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'skipped': 0}
+        return {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'recovered': 0, 'skipped': 0}
 
     try:
         items = []
@@ -1142,16 +1166,17 @@ def provision_pending_domains() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to query pending domains: {e}")
         publish_failure_metric(FAILURE_DYNAMODB)
-        return {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'skipped': 0, 'error': str(e)}
+        return {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'recovered': 0, 'skipped': 0, 'error': str(e)}
 
     if not items:
         logger.info("No domains pending TLS provisioning")
-        return {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'skipped': 0}
+        return {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'recovered': 0, 'skipped': 0}
 
     logger.info(f"Found {len(items)} domains pending TLS provisioning")
     provisioned = 0
     failed = 0
     timed_out_domains: List[str] = []
+    recovered_domains: List[str] = []
     skipped = 0
     now = datetime.now(timezone.utc)
 
@@ -1176,6 +1201,21 @@ def provision_pending_domains() -> Dict[str, Any]:
         timeout_check = _check_provisioning_timeout(domain_name, started_at_str, now)
         if timeout_check is not None:
             customer_reason, operator_reason = timeout_check
+            # Before auto-failing, reconcile against SSM (nhp#977): the row may
+            # be stuck only because update_domain_status(STATUS_ACTIVE) lost a
+            # race with a DynamoDB blip after the cert was already issued and
+            # stored. Auto-failing such a domain shows the customer a spurious
+            # "failed" and orphans a valid cert in SSM.
+            recovery = _recover_provisioned_cert(domain_name, now)
+            if recovery == RECOVER_RECOVERED:
+                recovered_domains.append(domain_name)
+                continue
+            if recovery == RECOVER_DEFER:
+                # Transient SSM read error — can't confirm whether a valid cert
+                # exists, so leave the row in provisioning_tls and re-evaluate
+                # next scan rather than risk the spurious auto-fail above.
+                continue
+            # RECOVER_NO_CERT: provisioning genuinely didn't finish — auto-fail.
             # customer_reason → DynamoDB → dashboard. Plain English, actionable.
             update_domain_status(domain_name, STATUS_FAILED, error=customer_reason)
             publish_failure_metric(FAILURE_PROVISIONING_TIMEOUT)
@@ -1203,9 +1243,26 @@ def provision_pending_domains() -> Dict[str, Any]:
             logger.error(f"Failed to provision {domain_name}: {e}")
             failed += 1
 
-    if provisioned > 0:
-        logger.info(f"Triggering cert sync after provisioning {provisioned} domain(s)")
+    recovered = len(recovered_domains)
+    # A full batch sync covers both freshly provisioned and recovered domains.
+    # For recovered domains the re-sync is load-bearing only when the original
+    # attempt was interrupted (Lambda timeout/crash) before its sync ran; when
+    # the row was stuck by a swallowed DDB status-write the original batch sync
+    # already fired, so the re-sync is idempotent belt-and-suspenders (nhp#977).
+    # BATCH_SYNC_PROVISION is a full rebuild from all SSM certs, so one call
+    # serves both sets.
+    if provisioned > 0 or recovered > 0:
+        logger.info(
+            f"Triggering cert sync after provisioning {provisioned} and "
+            f"recovering {recovered} domain(s)"
+        )
         trigger_cert_sync(BATCH_SYNC_PROVISION)
+
+    if recovered > 0:
+        logger.warning(
+            f"Recovered {recovered} domain(s) from provisioning_tls with a valid "
+            f"existing cert instead of auto-failing (nhp#977): {', '.join(recovered_domains)}"
+        )
 
     timed_out = len(timed_out_domains)
     if timed_out > 0:
@@ -1214,7 +1271,13 @@ def provision_pending_domains() -> Dict[str, Any]:
             f"{', '.join(timed_out_domains)}"
         )
 
-    return {'provisioned': provisioned, 'failed': failed, 'timed_out': timed_out, 'skipped': skipped}
+    return {
+        'provisioned': provisioned,
+        'failed': failed,
+        'timed_out': timed_out,
+        'recovered': recovered,
+        'skipped': skipped,
+    }
 
 
 def _check_provisioning_timeout(
@@ -1261,6 +1324,191 @@ def _check_provisioning_timeout(
     )
     logger.warning(f"Domain {domain_name} stuck in provisioning_tls: {operator_reason}")
     return customer_reason, operator_reason
+
+
+def _recover_provisioned_cert(domain: str, now: datetime) -> str:
+    """Reconcile a timed-out provisioning_tls row against SSM before auto-failing (nhp#977).
+
+    There is a narrow race in the provisioning flow. ACME succeeds and
+    store_certificate() writes key/chain/meta to SSM, but the row is then left in
+    provisioning_tls — its STATUS_ACTIVE write never lands — for one of two
+    reasons:
+
+      - update_domain_status() *swallows* its own exceptions (logs, never
+        re-raises). A DynamoDB throttle/blip during that write is therefore
+        dropped: the row stays provisioning_tls while provision_certificate()
+        still returns "provisioned", so the end-of-scan BATCH_SYNC_PROVISION
+        still fires and the cert does reach the AC fleet.
+      - or the Lambda is interrupted (hard timeout / OOM / crash) between the SSM
+        store and the status update — not a Python exception, so nothing catches
+        it; the row stays provisioning_tls and the cert may not have been synced.
+
+    Either way _check_provisioning_timeout() eventually auto-fails the row even
+    though a valid certificate already exists in SSM — the customer sees a
+    spurious "failed" and the cert is orphaned, costing KMS storage indefinitely.
+
+    This check reads the /meta param (plain String, no KMS cost) and, when a
+    cert exists that is valid for more than RENEWAL_DAYS_BEFORE_EXPIRY, recovers
+    the DynamoDB row to STATUS_ACTIVE with the stored cert_param_prefix and
+    expires_at instead of auto-failing. Callers that recover trigger a cert sync:
+    load-bearing in the interrupted-Lambda case (the original sync may never have
+    run), and harmless belt-and-suspenders in the swallowed-DDB case (it already
+    did) — BATCH_SYNC_PROVISION is an idempotent full rebuild.
+
+    Trusting /meta as a proxy for "the cert material exists" is sound because of
+    a write/delete-ordering invariant: store_certificate() writes key → chain →
+    meta (meta last), and _delete_ssm_cert_params() removes all three in a single
+    delete_parameters() batch call. So a present /meta implies key+chain were
+    written, and there is no sequential delete window that strands /meta after
+    key/chain are gone. Keep meta the last write in store_certificate() — a
+    refactor that wrote it first would let recovery mark a row active before its
+    cert material exists.
+
+    Only initial provisioning rows ever reach this path: renewals call
+    provision_certificate() on status=active rows and only touch
+    provisioning_started_at (via _acquire_provisioning_lock) — they never write
+    status=provisioning_tls, so they are not in the partition
+    provision_pending_domains() queries. A timed-out provisioning_tls row that
+    nonetheless has a healthy SSM cert is therefore the #977 race, not an
+    in-flight renewal.
+
+    Trust model: recovery skips verify_dns_ownership because it grants no new
+    trust — a cert binds to a domain *name*, and authorization to use the
+    underlying resource is enforced by qurl authz, not by cert existence. This
+    holds even for the cleanup/re-register race (a late domain.cleanup SNS retry
+    whose conditional delete no-ops on a re-registered row can leave an older
+    valid /meta beside a fresh provisioning_tls row): recovering the new row off
+    the prior cert only reconciles bookkeeping for the domain name. A registrant
+    who does not control the domain's DNS cannot route traffic to it regardless,
+    and is gated at the authz layer — so recovery extends no authorization the
+    cert didn't already represent.
+
+    Known edge (nhp#2352): the recovery write is an unconditional upsert, so if a
+    domain.cleanup deletes the DDB row in the narrow window between this scan's
+    GSI query and the write, the deleted row is recreated as a partial active row
+    (no verification_token). It self-corrects — check_orphan_for_meta flags it as
+    drift on the next scan — and the window is tiny (the SSM /meta delete is in
+    the same batch as the row delete, so /meta is usually already gone → no
+    recovery). A conditional write keyed on status=provisioning_tls would close
+    it; deferred to nhp#2352 because update_domain_status is shared.
+
+    Returns one of:
+        RECOVER_RECOVERED — a valid cert was found and the row was reconciled to
+            active; the caller must NOT auto-fail.
+        RECOVER_NO_CERT — no cert, or one too close to expiry / too malformed to
+            trust; the caller proceeds with auto-fail as before.
+        RECOVER_DEFER — a transient SSM error prevented a determination, OR the
+            recovery write itself raised; either way the caller should skip this
+            domain and let the next scan re-evaluate. The SSM case mirrors
+            check_orphan_for_meta()'s defer-on-ClientError contract so a momentary
+            SSM blip can't manufacture the very spurious failure this function
+            exists to prevent.
+
+    Note: update_domain_status() swallows its own exceptions today, so a write
+    that *fails silently* still returns RECOVER_RECOVERED — best-effort, matching
+    how the auto-fail path calls it. publish_recovery_metric() fires on every
+    such return, so a row that recovers-and-resyncs every scan (because the write
+    keeps losing) is visible as a sustained ProvisioningRecoveries rate rather
+    than only in logs. That loop also re-fires a full BATCH_SYNC_PROVISION every
+    scan (not just a re-metered counter), so a persistent silent DDB write
+    failure means a repeated fleet-wide sync until DDB heals — acceptable because
+    a sustained silent DDB write failure is a larger incident in its own right,
+    and the metric makes the loop visible. A write that *raises* (defensive
+    against a future contract change where update_domain_status re-raises)
+    returns RECOVER_DEFER and emits a FAILURE_DYNAMODB metric (not the recovery
+    metric — nothing was recovered), so that path isn't a dashboard blind spot
+    either.
+    """
+    meta_name = f"{SSM_CERT_PREFIX}/{domain}/meta"
+    try:
+        response = ssm_client.get_parameter(Name=meta_name, WithDecryption=False)
+    except ssm_client.exceptions.ParameterNotFound:
+        # No cert material — provisioning genuinely never finished.
+        return RECOVER_NO_CERT
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        logger.warning(
+            f"Cert-recovery GetParameter failed for {domain}: code={error_code}; "
+            f"deferring auto-fail to next scan"
+        )
+        return RECOVER_DEFER
+
+    try:
+        meta_data = json.loads(response['Parameter']['Value'])
+        # Valid JSON that isn't an object (null/number/string/array) has no
+        # .get(), so the next line would raise AttributeError. A corrupted /meta
+        # must fall through to auto-fail, never crash the scan, so reject
+        # non-dicts explicitly here (clear log) — and AttributeError is in the
+        # except tuple below as a backstop for any other non-dict access.
+        if not isinstance(meta_data, dict):
+            logger.warning(
+                f"Cert meta for {domain} is not a JSON object; "
+                f"cannot confirm a valid cert, proceeding with auto-fail"
+            )
+            return RECOVER_NO_CERT
+        expires_at_str = meta_data.get(FIELD_EXPIRES_AT)
+        if not expires_at_str:
+            logger.warning(
+                f"Cert meta for {domain} has no '{FIELD_EXPIRES_AT}' field; "
+                f"cannot confirm a valid cert, proceeding with auto-fail"
+            )
+            return RECOVER_NO_CERT
+        expires_at = _parse_iso_expiry(expires_at_str)
+    except (KeyError, AttributeError, ValueError, TypeError, json.JSONDecodeError) as e:
+        logger.warning(
+            f"Cert meta for {domain} is malformed ({e}); "
+            f"cannot confirm a valid cert, proceeding with auto-fail"
+        )
+        return RECOVER_NO_CERT
+
+    days_until_expiry = (expires_at - now).days
+    if days_until_expiry <= RENEWAL_DAYS_BEFORE_EXPIRY:
+        # A cert exists but it's already inside the renewal window (or expired).
+        # Don't paper over stale material as active — auto-fail it. (Auto-fail
+        # does not itself reprovision: the row leaves the provisioning_tls
+        # partition and any fresh attempt is customer/operator-driven.) In the
+        # #977 race a just-issued Let's Encrypt cert is ~90 days out and the
+        # timeout is ~30 min, so this branch effectively only fires on the
+        # cleanup/re-register stale-/meta case, where auto-fail is the right call.
+        logger.warning(
+            f"Cert for {domain} exists but expires in {days_until_expiry} day(s) "
+            f"(<= {RENEWAL_DAYS_BEFORE_EXPIRY}); not recovering, proceeding with auto-fail"
+        )
+        return RECOVER_NO_CERT
+
+    cert_param_prefix = f"{SSM_CERT_PREFIX}/{domain}"
+    logger.warning(
+        f"Recovering {domain} from provisioning_tls (nhp#977): a valid cert "
+        f"already exists in SSM (expires {expires_at_str}, {days_until_expiry} "
+        f"day(s) out). The status update after provisioning must have failed; "
+        f"reconciling the DynamoDB row to {STATUS_ACTIVE} instead of auto-failing."
+    )
+    try:
+        # Keyword the optional args so a future update_domain_status signature
+        # change can't silently reorder cert_param_prefix / cert_expires_at. Note
+        # a kwarg *rename* would raise TypeError at call-binding time — before
+        # update_domain_status's own body runs, so its internal except can't
+        # swallow it. This call is wrapped (unlike the auto-fail/invalid-domain
+        # update_domain_status calls in provision_pending_domains) precisely
+        # because recovery has a return contract to protect: a write that didn't
+        # land must DEFER, not be miscounted as RECOVERED. The other calls just
+        # `continue` regardless, so they have no outcome to corrupt.
+        update_domain_status(
+            domain, STATUS_ACTIVE,
+            cert_param_prefix=cert_param_prefix,
+            cert_expires_at=expires_at_str,
+        )
+    except Exception as e:
+        logger.warning(f"Recovery write for {domain} raised ({e}); deferring to next scan")
+        # Defensive-only today (update_domain_status swallows), but if a future
+        # contract change makes it re-raise, emit a DynamoDB failure metric so a
+        # row deferring every scan pages via the existing DynamoDB-failure alarm
+        # instead of being a WARNING-log-only blind spot. (Not the recovery
+        # metric — nothing was recovered.)
+        publish_failure_metric(FAILURE_DYNAMODB)
+        return RECOVER_DEFER
+    publish_recovery_metric(domain)
+    return RECOVER_RECOVERED
 
 
 def get_or_create_acme_account() -> Any:
@@ -1607,6 +1855,12 @@ def store_certificate(domain: str, private_key_pem: str, cert_pem: str, chain_pe
 
     logger.info(f"Storing certificate in SSM Parameter Store: {param_prefix}")
 
+    # Write order is load-bearing: key → chain → meta, with /meta LAST.
+    # _recover_provisioned_cert() (nhp#977) treats a present /meta as proof that
+    # the key+chain material was already written, so it can reconcile a stuck row
+    # to active off /meta alone (a plain String — no KMS decrypt). Writing /meta
+    # before key/chain would let recovery mark a domain active before its cert
+    # material exists. Keep /meta the final write here.
     _put_ssm_secure_param(f"{param_prefix}/key", private_key_pem)
     _put_ssm_secure_param(f"{param_prefix}/chain", fullchain)
 
@@ -2090,3 +2344,28 @@ def publish_failure_metric(category: Optional[str] = None, domain: Optional[str]
             CW_METRIC_PROVISIONING_FAILURES, 1,
             dimensions=[{'Name': 'FailureCategory', 'Value': category}]
         )
+
+
+def publish_recovery_metric(domain: Optional[str] = None):
+    """Publish a provisioning-recovery metric to CloudWatch (nhp#977).
+
+    Emitted each time a domain stuck in provisioning_tls is reconciled to active
+    against an existing valid SSM cert (see _recover_provisioned_cert) instead of
+    being auto-failed. Two things make this worth a metric rather than only a
+    WARNING log:
+
+    - It measures how often the SSM-write-succeeded / DynamoDB-write-failed race
+      actually fires in prod, so #977 stops being invisible to dashboards.
+    - update_domain_status() swallows its own exceptions, so a row whose status
+      write keeps losing would recover-and-resync on *every* scan. Because this
+      metric fires on each such attempt, a recovery storm shows up as a sustained
+      non-zero rate rather than staying buried in logs.
+
+    Mirrors publish_failure_metric()'s synthetic-domain suppression: a recovery on
+    an RFC-reserved smoke/test domain is skipped so a non-customer domain can't
+    feed the cert_recovery_storm alarm.
+    """
+    if domain and is_synthetic_domain(domain):
+        logger.info(f"Skipping ProvisioningRecoveries metric for synthetic domain: {domain}")
+        return
+    publish_metric(CW_METRIC_PROVISIONING_RECOVERIES, 1)
