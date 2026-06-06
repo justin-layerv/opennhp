@@ -374,7 +374,63 @@ API audit logging:
 - All AWS API calls logged
 - Logs encrypted with KMS
 - Archived to S3 with lifecycle policies
+- Streamed to a CloudWatch Logs group for real-time metric filters/alarms
 - Tamper detection + log-integrity guard — see [CloudTrail Tamper Detection](#cloudtrail-tamper-detection) and [CloudTrail Log Integrity](#cloudtrail-log-integrity)
+
+#### CloudTrail CIS alarms
+
+`terraform/modules/security/cloudtrail_metric_filters.tf` defines the CIS
+AWS Foundations Benchmark **v1.4.0** CloudWatch monitoring controls as
+metric filters + alarms on the CloudTrail log group. Implementing them
+flips the corresponding Security Hub controls (CloudWatch.1/4/5/6/7/8/9/
+10/11/12/13/14) from FAILED to PASSED.
+
+- **Gating:** created only when `enable_cloudtrail = true`. That is prod
+  today (sandbox has CloudTrail disabled), so these are prod-only until
+  sandbox enables a trail.
+- **Routing:** all alarms notify `alerts_sns_topic_arn` (the shared
+  monitoring topic — email + Slack via Chatbot). A control only PASSes
+  when its alarm notifies a subscribed topic, so this is part of the
+  control, not cosmetic.
+- **Expect a paired page on trail tampering.** The `cloudtrail_config_changes`
+  alarm (CloudWatch.5) overlaps by design with the
+  `enable_cloudtrail_tamper_alerts` EventBridge rule (see
+  [CloudTrail Tamper Detection](#cloudtrail-tamper-detection)): a real
+  Stop/Delete/Update trail event fires **both**. This is intentional
+  defense-in-depth (the EventBridge rule also covers SCP-locked /
+  cross-region trails, and CloudWatch.5 is required for the CIS control),
+  not a misconfiguration — don't "fix" the duplicate by removing either.
+- **Frozen patterns:** Security Hub fails the control if the exact
+  CIS-prescribed filter pattern is not used and forbids extra terms. Do
+  **not** add noise-reduction terms to a `pattern` — a "helpful" edit
+  silently reverts the control to FAILED. Tune noise via `Severity` /
+  downstream subscription filtering instead. This invariant is enforced
+  at PR time by the `cis-metric-filter-patterns` lint
+  (`.github/scripts/check-cis-metric-filter-patterns.py` +
+  `tests/lints/cis-metric-filter-patterns/golden.json`): editing a
+  `pattern` fails CI unless the golden is updated in the same PR (a
+  deliberate, re-validated change), so a typo can't slip through to a
+  FAILED control ~18h after the prod apply.
+- **Severity:** `page` for rare high-signal events (root usage,
+  CloudTrail tampering, CMK disable/delete); `ticket` for the
+  change-detection controls (IAM/SG/NACL/VPC/route/gateway/config/
+  S3-policy), which fire on routine `terraform apply` from CI and exist
+  primarily for CIS posture + forensics. To halve routine-apply noise,
+  `ok_actions` (the "resolved" notification) is wired only for `page`
+  alarms; `ticket` alarms notify on ALARM only and self-clear silently.
+  Splitting the `ticket` stream onto its own lower-urgency destination
+  (so apply noise can't desensitize operators to the `page` stream) is a
+  near-term follow-up tracked in
+  [#2353](https://github.com/layervai/nhp/issues/2353).
+- **Not included:** CloudWatch.2 (unauthorized API) and CloudWatch.3
+  (console sign-in without MFA) are manual-only controls under CIS
+  v1.4.0, so a metric filter does not move them; they are omitted from
+  the auto-PASS set. Console-sign-in-without-MFA also depends on MFA
+  enforcement, tracked separately.
+
+To verify after a prod apply: in Security Hub, filter the CIS v1.4.0
+standard by the `CloudWatch.*` controls and confirm they report PASSED
+(allow up to ~18 hours for the first periodic evaluation).
 
 ---
 

@@ -1320,6 +1320,7 @@ jobs:
           shellcheck ./tests/lints/ac-apt-guard/run-fixtures.sh
           shellcheck ./tests/lints/terraform-prod-drift/run-fixtures.sh
           shellcheck ./tests/lints/terraform-tag-charset/run-fixtures.sh
+          shellcheck ./tests/lints/cis-metric-filter-patterns/run-fixtures.sh
 
       - name: Run AC apt guard fixture suite
         # Regression fence for the AC user_data no-runtime-apt invariant in
@@ -1349,6 +1350,18 @@ jobs:
 
       - name: Check terraform tag charset (#1915 regression fence)
         run: python3 ./.github/scripts/check-terraform-tag-charset.py terraform
+
+      - name: Run cis-metric-filter-patterns fixture suite
+        # Fixtures first (a checker regression surfaces before the real
+        # check), then the production freeze check below.
+        run: ./tests/lints/cis-metric-filter-patterns/run-fixtures.sh
+
+      - name: Check CIS metric-filter patterns are frozen (#1140)
+        # Security Hub matches the CIS v1.4.0 CloudWatch.N filter patterns
+        # verbatim; an edit to cloudtrail_metric_filters.tf that diverges
+        # from the golden silently FAILS the control ~18h after the prod
+        # apply (sandbox has no trail). Catch it on the PR instead.
+        run: python3 ./.github/scripts/check-cis-metric-filter-patterns.py
 
   # ============================================================================
   # REDIRECT_URL DRIFT LINT (PR) - #1325

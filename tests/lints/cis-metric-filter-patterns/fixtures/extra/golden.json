@@ -1,0 +1,6 @@
+{
+  "_comment": "fixture: filters.tf has beta but golden does not -> exit 1 (added/extra)",
+  "patterns": {
+    "alpha": "{ ($.eventName = CreateTrail) || ($.eventName = DeleteTrail) }"
+  }
+}

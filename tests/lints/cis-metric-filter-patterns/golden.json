@@ -1,0 +1,31 @@
+{
+  "_comment": "FROZEN: canonical CIS AWS Foundations Benchmark v1.4.0 CloudWatch metric-filter patterns. Each was validated verbatim against the AWS Security Hub CloudWatch.N remediation page named in _controls (see terraform/modules/security/cloudtrail_metric_filters.tf header). Security Hub fails the control on ANY divergence from the canonical term set, so do NOT edit these or the .tf patterns without re-validating against the named AWS page and updating both in the same PR. _controls is provenance for that re-validation (not compared). Enforced by .github/scripts/check-cis-metric-filter-patterns.py.",
+  "_controls": {
+    "aws_config_changes": "CloudWatch.9 / CIS v1.4.0 4.9",
+    "cloudtrail_config_changes": "CloudWatch.5 / CIS v1.4.0 4.5",
+    "cmk_disable_or_delete": "CloudWatch.7 / CIS v1.4.0 4.7",
+    "console_auth_failures": "CloudWatch.6 / CIS v1.4.0 4.6",
+    "iam_policy_changes": "CloudWatch.4 / CIS v1.4.0 4.4",
+    "network_acl_changes": "CloudWatch.11 / CIS v1.4.0 4.11",
+    "network_gateway_changes": "CloudWatch.12 / CIS v1.4.0 4.12",
+    "root_account_usage": "CloudWatch.1 / CIS v1.4.0 4.3",
+    "route_table_changes": "CloudWatch.13 / CIS v1.4.0 4.13",
+    "s3_bucket_policy_changes": "CloudWatch.8 / CIS v1.4.0 4.8",
+    "security_group_changes": "CloudWatch.10 / CIS v1.4.0 4.10",
+    "vpc_changes": "CloudWatch.14 / CIS v1.4.0 4.14"
+  },
+  "patterns": {
+    "aws_config_changes": "{ ($.eventSource = config.amazonaws.com) && (($.eventName = StopConfigurationRecorder) || ($.eventName = DeleteDeliveryChannel) || ($.eventName = PutDeliveryChannel) || ($.eventName = PutConfigurationRecorder)) }",
+    "cloudtrail_config_changes": "{ ($.eventName = CreateTrail) || ($.eventName = UpdateTrail) || ($.eventName = DeleteTrail) || ($.eventName = StartLogging) || ($.eventName = StopLogging) }",
+    "cmk_disable_or_delete": "{ ($.eventSource = kms.amazonaws.com) && (($.eventName = DisableKey) || ($.eventName = ScheduleKeyDeletion)) }",
+    "console_auth_failures": "{ ($.eventName = ConsoleLogin) && ($.errorMessage = \"Failed authentication\") }",
+    "iam_policy_changes": "{ ($.eventName = DeleteGroupPolicy) || ($.eventName = DeleteRolePolicy) || ($.eventName = DeleteUserPolicy) || ($.eventName = PutGroupPolicy) || ($.eventName = PutRolePolicy) || ($.eventName = PutUserPolicy) || ($.eventName = CreatePolicy) || ($.eventName = DeletePolicy) || ($.eventName = CreatePolicyVersion) || ($.eventName = DeletePolicyVersion) || ($.eventName = AttachRolePolicy) || ($.eventName = DetachRolePolicy) || ($.eventName = AttachUserPolicy) || ($.eventName = DetachUserPolicy) || ($.eventName = AttachGroupPolicy) || ($.eventName = DetachGroupPolicy) }",
+    "network_acl_changes": "{ ($.eventName = CreateNetworkAcl) || ($.eventName = CreateNetworkAclEntry) || ($.eventName = DeleteNetworkAcl) || ($.eventName = DeleteNetworkAclEntry) || ($.eventName = ReplaceNetworkAclEntry) || ($.eventName = ReplaceNetworkAclAssociation) }",
+    "network_gateway_changes": "{ ($.eventName = CreateCustomerGateway) || ($.eventName = DeleteCustomerGateway) || ($.eventName = AttachInternetGateway) || ($.eventName = CreateInternetGateway) || ($.eventName = DeleteInternetGateway) || ($.eventName = DetachInternetGateway) }",
+    "root_account_usage": "{ $.userIdentity.type = \"Root\" && $.userIdentity.invokedBy NOT EXISTS && $.eventType != \"AwsServiceEvent\" }",
+    "route_table_changes": "{ ($.eventName = CreateRoute) || ($.eventName = CreateRouteTable) || ($.eventName = ReplaceRoute) || ($.eventName = ReplaceRouteTableAssociation) || ($.eventName = DeleteRouteTable) || ($.eventName = DeleteRoute) || ($.eventName = DisassociateRouteTable) }",
+    "s3_bucket_policy_changes": "{ ($.eventSource = s3.amazonaws.com) && (($.eventName = PutBucketAcl) || ($.eventName = PutBucketPolicy) || ($.eventName = PutBucketCors) || ($.eventName = PutBucketLifecycle) || ($.eventName = PutBucketReplication) || ($.eventName = DeleteBucketPolicy) || ($.eventName = DeleteBucketCors) || ($.eventName = DeleteBucketLifecycle) || ($.eventName = DeleteBucketReplication)) }",
+    "security_group_changes": "{ ($.eventName = AuthorizeSecurityGroupIngress) || ($.eventName = AuthorizeSecurityGroupEgress) || ($.eventName = RevokeSecurityGroupIngress) || ($.eventName = RevokeSecurityGroupEgress) || ($.eventName = CreateSecurityGroup) || ($.eventName = DeleteSecurityGroup) }",
+    "vpc_changes": "{ ($.eventName = CreateVpc) || ($.eventName = DeleteVpc) || ($.eventName = ModifyVpcAttribute) || ($.eventName = AcceptVpcPeeringConnection) || ($.eventName = CreateVpcPeeringConnection) || ($.eventName = DeleteVpcPeeringConnection) || ($.eventName = RejectVpcPeeringConnection) || ($.eventName = AttachClassicLinkVpc) || ($.eventName = DetachClassicLinkVpc) || ($.eventName = DisableVpcClassicLink) || ($.eventName = EnableVpcClassicLink) }"
+  }
+}

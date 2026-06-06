@@ -1,0 +1,7 @@
+{
+  "_comment": "fixture: beta pattern differs from filters.tf -> exit 1 (changed)",
+  "patterns": {
+    "alpha": "{ ($.eventName = CreateTrail) || ($.eventName = DeleteTrail) }",
+    "beta": "{ $.userIdentity.type = \"Root\" && $.eventType != \"AwsServiceEvent\" }"
+  }
+}

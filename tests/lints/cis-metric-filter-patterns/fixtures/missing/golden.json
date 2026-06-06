@@ -1,0 +1,7 @@
+{
+  "_comment": "fixture: golden has beta but filters.tf does not -> exit 1 (removed/missing)",
+  "patterns": {
+    "alpha": "{ ($.eventName = CreateTrail) || ($.eventName = DeleteTrail) }",
+    "beta": "{ $.userIdentity.type = \"Root\" }"
+  }
+}

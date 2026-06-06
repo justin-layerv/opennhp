@@ -193,7 +193,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-redirect-url-drift lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard
+lint: lint-redirect-url-drift lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
@@ -268,6 +268,26 @@ lint-ac-apt-guard:
 	fi
 	@./tests/lints/ac-apt-guard/run-fixtures.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] AC boot-time apt guard passed!$(END_COLOUR)"
+
+# Freeze the CIS v1.4.0 CloudWatch metric-filter patterns in
+# terraform/modules/security/cloudtrail_metric_filters.tf against the golden
+# in tests/lints/cis-metric-filter-patterns/golden.json (#1140 / PR #2344).
+# Security Hub matches these verbatim; an accidental edit silently FAILS the
+# CloudWatch.N control ~18h after the prod apply (sandbox has no trail to
+# pre-validate against). Fixtures run first so a checker regression surfaces
+# before the production check. CI runs the same in build-and-push.yml's
+# terraform-prod-drift-lint job (PR-gated).
+.PHONY: lint-cis-metric-filter-patterns
+lint-cis-metric-filter-patterns:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking CIS metric-filter patterns (#1140)...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck tests/lints/cis-metric-filter-patterns/run-fixtures.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@./tests/lints/cis-metric-filter-patterns/run-fixtures.sh
+	@python3 ./.github/scripts/check-cis-metric-filter-patterns.py
+	@echo "$(COLOUR_GREEN)[OpenNHP] CIS metric-filter pattern check passed!$(END_COLOUR)"
 
 # Run the same checks CI runs for .github/workflows/**,
 # .github/ISSUE_TEMPLATE/**, and CLAUDE.md's Scopes table.

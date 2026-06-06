@@ -666,6 +666,100 @@ entry to Completed Entries only after `Status: Verified`.
 - Completed date:
 - Evidence:
 
+### 2026-06-05 - PR #2344 - CloudTrail CIS metric-filter alarms (#1140)
+
+- Ledger PR: [#2344](https://github.com/layervai/nhp/pull/2344)
+- Source PR / issue: [PR #2344](https://github.com/layervai/nhp/pull/2344) /
+  [issue #1140](https://github.com/layervai/nhp/issues/1140)
+- Component: `terraform/modules/security`
+- Task owner: prod rollout coordinator
+- Pre-rollout tasks:
+  - Confirm the prod monitoring `alerts` SNS topic
+    (`module.monitoring.sns_topic_arn`) has at least one **confirmed**
+    subscriber (email subscription confirmed and/or Chatbot config
+    active). A CIS CloudWatch.x control only reports PASSED when its
+    alarm notifies a topic with a subscriber; an unconfirmed email-only
+    topic leaves the controls FAILED even though the alarms exist.
+  - **Sandbox cannot pre-validate this change.** Sandbox sets
+    `enable_cloudtrail = false`, so the `for_each` is empty there and
+    the standard "sandbox first" promote step is a no-op for these
+    resources — first real creation is the prod apply. Review the plan
+    diff carefully (12 metric filters + 12 alarms, all additive) before
+    the prod apply rather than relying on a sandbox dry run.
+  - **Decide the #2353 routing sequencing (deliberate, not default).**
+    The 8 `ticket` change-detection alarms (IAM/SG/route/gateway/NACL/
+    VPC/config/S3-policy) notify on ALARM on **every** `terraform apply`
+    from the CI role, on the same `alerts` topic that carries the 3
+    `page` alarms. `ok_actions` is already `page`-only (halves the
+    chatter), but the ALARM-side noise is predictable from day one.
+    **Recommended:** land the
+    [#2353](https://github.com/layervai/nhp/issues/2353) routing /
+    subscription-filter split first or in the same window so apply noise
+    never reaches the `page` audience — repeated apply-driven ticket
+    noise on the page channel is exactly the desensitization that defeats
+    a paging control. Only fall back to consciously accepting the
+    day-one shared-topic noise (until #2353 lands) if #2353 can't make
+    the same window. Record the choice here.
+- Rollout tasks:
+  - Pure observability change, applied by the normal prod promote
+    terraform apply. No deploy ordering, no ASG refresh, no data
+    migration. Resources are additive (no replacements/deletions).
+  - The apply itself emits IAM/security-group/route-table change events
+    from the CI role, which will trip the corresponding `ticket`
+    alarms during/after the apply — expected, not a failure.
+- Post-rollout tasks:
+  - **Hard gate (the only real test of the frozen patterns):** in
+    Security Hub (prod), filter the CIS AWS Foundations v1.4.0 standard
+    for the `CloudWatch.*` controls and confirm
+    CloudWatch.1/4/5/6/7/8/9/10/11/12/13/14 report PASSED. Allow up to
+    ~18h for the first periodic evaluation. A control still FAILED here
+    despite the alarm existing means a filter-pattern divergence (typo/
+    whitespace vs the canonical CIS term set) or an unconfirmed SNS
+    subscriber — treat this as a release-blocking check, not a
+    formality, since sandbox cannot pre-validate it. The
+    `cis-metric-filter-patterns` PR lint now catches the pattern-typo
+    class before merge, but the confirmed-subscriber + live-eval proof
+    still only exists post-apply.
+  - Confirm delivery end-to-end: verify the apply-driven
+    `*-cis-iam_policy_changes` / `*-cis-security_group_changes` alarms
+    transitioned to ALARM and that a notification landed in the alert
+    email and Slack channel. These are `ticket`-severity, so they do NOT
+    emit an OK notification (only `page` alarms wire `ok_actions`); they
+    self-clear in the console after the 5-min window with no events.
+  - Confirm the `page`-severity alarms (`*-cis-root_account_usage`,
+    `*-cis-cloudtrail_config_changes`, `*-cis-cmk_disable_or_delete`)
+    are in OK/INSUFFICIENT_DATA and did not fire spuriously on the apply.
+    Note: a real trail-tamper will page **twice** (this CloudWatch.5
+    alarm + the `enable_cloudtrail_tamper_alerts` EventBridge rule) — by
+    design, not a misconfiguration.
+- Rollback tasks:
+  - Revert this PR (or delete
+    `terraform/modules/security/cloudtrail_metric_filters.tf`) and apply.
+    Removes the filters + alarms only; CloudTrail logging, the log
+    group, and S3 archival are untouched. Do NOT roll back by setting
+    `enable_cloudtrail = false` — that disables the trail itself, a much
+    broader change.
+- Follow-ups / deferred tasks:
+  - #1140 remains open after this PR. Still outstanding: the four
+    application-level metrics (`resolve_xff_mismatch_total`,
+    `internal_knock_total`, `nhp_replay_detected_total`,
+    `token_verify_fail_total`), the CI prod-⊇-sandbox metric-filter
+    parity test, and the manual-only CIS controls CloudWatch.2
+    (unauthorized API) / CloudWatch.3 (console sign-in without MFA).
+  - Sandbox CloudTrail enablement decision: enabling
+    `enable_cloudtrail` in sandbox would give genuine prod/sandbox
+    parity (and a real testbed for these alarms) at the cost of
+    CloudWatch Logs ingestion. Deferred pending that cost/value call.
+  - [#2353](https://github.com/layervai/nhp/issues/2353) — severity-based
+    SNS routing to split the `ticket` stream off the `page` topic (see
+    the sequencing pre-rollout task above).
+  - If apply-time noise on the `ticket`-severity alarms is excessive,
+    filter by the `Severity` tag in the Chatbot/email subscription —
+    do not edit the (Security-Hub-frozen) filter patterns.
+- Status: Open
+- Status note: Waiting for prod rollout. Not validatable in sandbox
+  (`enable_cloudtrail = false`); first creation is the prod apply.
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries
