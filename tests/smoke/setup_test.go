@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
@@ -97,6 +98,7 @@ func TestMain(m *testing.M) {
 	testConfig.ASGClient = autoscaling.NewFromConfig(awsCfg)
 	testConfig.CWClient = cloudwatch.NewFromConfig(awsCfg)
 	testConfig.CWLogsClient = cloudwatchlogs.NewFromConfig(awsCfg)
+	testConfig.DDBClient = dynamodb.NewFromConfig(awsCfg)
 	testConfig.ELBClient = elasticloadbalancingv2.NewFromConfig(awsCfg)
 	testConfig.SNSClient = sns.NewFromConfig(awsCfg)
 

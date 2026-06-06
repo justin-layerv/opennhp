@@ -23,6 +23,7 @@ module "nhp" {
   }
 
   environment                 = var.environment
+  cell_id                     = var.cell_id
   aws_region                  = var.aws_region
   aws_account_id              = var.aws_account_id
   domain_name                 = var.domain_name
@@ -495,6 +496,7 @@ module "custom_domain_cert" {
 
   name_prefix         = local.name_prefix
   environment         = var.environment
+  cell_id             = var.cell_id
   acme_base_domain    = var.hosted_zone         # layerv.ai for prod
   parent_zone_id      = var.qurl_hosted_zone_id # layerv.ai zone — NS delegation for acme sub-zone
   acme_email          = var.acme_email

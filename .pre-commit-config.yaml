@@ -56,6 +56,8 @@ repos:
         #
         # - terraform/modules/ac/: uses configuration_aliases = [aws.us_east_1]
         #   for CloudFront ACM certs and WAF (must be in us-east-1).
+        # - terraform/modules/custom-domain-cert/: uses configuration_aliases = [aws.parent_dns]
+        #   for parent-zone NS delegation.
         # - terraform/modules/grafana-dashboards/: uses configuration_aliases = [grafana]
         #   (non-AWS provider, configured in environment modules).
         # - terraform/*.tf (root module .tf files): root module uses
@@ -77,4 +79,4 @@ repos:
         # block) crafted to exercise the tag-charset scanner; they're not
         # meant to plan/apply. The lint's regression fence is in
         # `run-fixtures.sh`.
-        exclude: '^(terraform/(modules/(ac|grafana-dashboards)/|[^/]+\.tf$)|tests/lints/terraform-prod-drift/fixtures/heredoc-jsonencode-error/|tests/lints/terraform-tag-charset/fixtures/)'
+        exclude: '^(terraform/(modules/(ac|custom-domain-cert|grafana-dashboards)/|[^/]+\.tf$)|tests/lints/terraform-prod-drift/fixtures/heredoc-jsonencode-error/|tests/lints/terraform-tag-charset/fixtures/)'

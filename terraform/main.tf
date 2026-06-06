@@ -2778,7 +2778,7 @@ resource "aws_iam_role_policy" "smoke_custom_domain_cleanup" {
   count = var.deploy_custom_domain_cert ? 1 : 0
 
   lifecycle {
-    # Deliberately duplicates the precondition on
+    # Deliberately duplicates the topic-ARN precondition on
     # aws_ssm_parameter.custom_domain_cleanup_topic_arn_for_smoke above:
     # they share the same `var.deploy_custom_domain_cert ? 1 : 0` count
     # gate so they always fire together, and this is not a missed
@@ -2790,6 +2790,11 @@ resource "aws_iam_role_policy" "smoke_custom_domain_cleanup" {
     precondition {
       condition     = var.qurl_custom_domain_cleanup_topic_arn != ""
       error_message = "deploy_custom_domain_cert=true requires qurl_custom_domain_cleanup_topic_arn to be a non-empty SNS topic ARN. Check the env-level wiring."
+    }
+
+    precondition {
+      condition     = module.dynamodb.qurl_domains_table_arn != null
+      error_message = "deploy_custom_domain_cert=true requires deploy_qurl_service=true so the smoke ownership fence can read qurl-domains rows."
     }
   }
 
@@ -2804,6 +2809,17 @@ resource "aws_iam_role_policy" "smoke_custom_domain_cleanup" {
         Effect   = "Allow"
         Action   = ["sns:Publish"]
         Resource = [var.qurl_custom_domain_cleanup_topic_arn]
+      },
+      {
+        # The ownership smoke fence reads the live qurl-domains row for
+        # every cert still present in /nhp/certs and compares its
+        # verification_token with public DNS. Scope this to the actual
+        # domains table the cert Lambda uses rather than the broader qURL
+        # table set.
+        Sid      = "ReadQurlDomainsForOwnershipSmoke"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = [module.dynamodb.qurl_domains_table_arn]
       },
       {
         # Reads/writes/deletes scoped to the smoke-cleanup-* prefix only,
@@ -3043,7 +3059,7 @@ resource "terraform_data" "billing_preconditions" {
     }
     precondition {
       condition     = module.dynamodb.qurl_billing_audit_table_name != null
-      error_message = "QURL DynamoDB tables (including billing_audit) must be deployed when deploy_billing = true. Set deploy_qurl_tables = true."
+      error_message = "QURL DynamoDB tables (including billing_audit) must be deployed when deploy_billing = true. Set deploy_qurl_service = true."
     }
   }
 }

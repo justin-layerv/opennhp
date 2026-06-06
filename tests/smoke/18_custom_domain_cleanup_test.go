@@ -108,11 +108,10 @@ func TestCustomDomainCleanup_LambdaProcessesPublishedEvent(t *testing.T) {
 	if !ok {
 		t.Skipf("skipped: env %q has not deployed the custom-domain cert lambda (no cleanup topic ARN in SSM)", testConfig.Environment)
 	}
-	// getSSMParameter returns ("", false) on a nil Parameter/Value
-	// and ("", true) only when a literal empty string is the param
-	// value. AWS SSM PutParameter rejects empty strings at the API,
-	// so this branch is unreachable through normal terraform — but
-	// fail loud rather than letting sns.Publish see "" if it ever is.
+	// getSSMParameter returns ("", true) only when a literal empty string
+	// is the param value. AWS SSM PutParameter rejects empty strings at the
+	// API, so this branch is unreachable through normal terraform — but fail
+	// loud rather than letting sns.Publish see "" if it ever is.
 	if topicArn == "" {
 		t.Fatalf("cleanup topic ARN SSM param exists but is empty — terraform drift")
 	}
@@ -281,26 +280,17 @@ func publishCleanupEvent(t *testing.T, topicArn, domain string) {
 // here.
 func assertSSMParamsAbsent(t *testing.T, names []string) {
 	t.Helper()
-	get := func(name string) (*ssm.GetParameterOutput, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return testConfig.SSMClient.GetParameter(ctx, &ssm.GetParameterInput{
-			Name:           aws.String(name),
-			WithDecryption: aws.Bool(false),
-		})
-	}
 	for _, n := range names {
-		_, err := get(n)
+		_, ok, err := readSSMParameterWithContext(context.Background(), n)
 		if err != nil {
-			var notFound *ssmtypes.ParameterNotFound
-			if errors.As(err, &notFound) {
-				continue // expected — lambda cleaned it up
-			}
 			// "harness:" prefix vs "regression:" lets CI triage tell at
 			// a glance whether the cert lambda actually regressed or
 			// AWS is throttling SSM under us.
 			t.Errorf("harness: ssm get-parameter %s during absent-check: %v", n, err)
 			continue
+		}
+		if !ok {
+			continue // expected — lambda cleaned it up
 		}
 		// Deliberately don't echo the value: the existence claim IS the
 		// failure, and a future IAM-scope broadening shouldn't make this

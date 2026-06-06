@@ -33,6 +33,7 @@
 #
 #     name_prefix             = "layerv-nhp-sandbox"
 #     environment             = "sandbox"
+#     cell_id                 = "cell0"
 #     acme_base_domain        = "layerv.xyz"
 #     acme_email              = "admin@layerv.xyz"
 #     use_production_acme     = true
@@ -227,6 +228,8 @@ resource "aws_lambda_function" "cert_manager" {
       QURL_DOMAINS_TABLE      = var.qurl_domains_table_name
       SSM_CERT_PREFIX         = var.ssm_cert_prefix
       AC_INSTANCE_TAG         = var.ac_instance_tag
+      ENVIRONMENT             = var.environment
+      CELL_ID                 = var.cell_id
     }
   }
 
@@ -508,6 +511,11 @@ resource "aws_iam_role_policy" "lambda_kms_wildcard" {
 # With reserved_concurrent_executions=1, overlapping invocations are throttled
 # (not queued) — a long ACME challenge (~60s) may delay the next scan by one
 # cycle, which is acceptable.
+# Lambda function errors from this async target use Lambda's default async retry
+# behavior. Keep it: renewal scans are idempotent, retries can recover before
+# the next scheduled scan, and reserved concurrency bounds duplicate full-scan
+# work while the Lambda Errors alarm remains the first-failure operator
+# backstop for function/runtime or scan-metric-publish faults.
 
 resource "aws_cloudwatch_event_rule" "renewal_scan" {
   name                = "${var.name_prefix}-custom-domain-cert-scan"
@@ -644,7 +652,7 @@ locals {
     }
     "DnsOwnershipError" = {
       slug        = "dns-ownership"
-      description = "DNS ownership re-verification failed (DDB row missing/corrupt or _layerv-verify TXT mismatch)"
+      description = "DNS ownership re-verification failed (DDB row missing/corrupt or _layerv-verify TXT mismatch; see docs/runbooks/custom-domain-cert-dns-ownership.md)"
     }
     "AcmeChallengeError" = {
       slug        = "acme-challenge"
@@ -666,17 +674,48 @@ locals {
       slug        = "domain-validation"
       description = "Invalid domain format rejected"
     }
-    "RenewalScanError" = {
-      slug        = "renewal-scan"
-      description = "Certificate renewal scan processing failure"
-    }
     "ProvisioningTimeoutError" = {
       slug        = "provisioning-timeout"
       description = "Domain stuck in provisioning_tls status past timeout threshold"
     }
-    "OrphanedCert" = {
-      slug        = "orphaned-cert"
-      description = "SSM cert exists with no managed qurl-domains row (cleanup contract gap; see nhp#1990)"
+  }
+
+  renewal_scan_metrics = {
+    # Renewal scan metrics emit once per aws_cloudwatch_event_rule.renewal_scan
+    # run, so each alarm uses one 15-minute period per scheduled scan. Clean
+    # scans publish 0, dirty scans publish a positive count, and alarms clear
+    # only on the Lambda's explicit 0.
+    #
+    # DNS ownership is classified after resolver retries and stays broken until
+    # DNS is fixed, so it pages on the first nonzero scan. Orphaned certs are
+    # deterministic SSM/DDB state, but normal offboarding can briefly delete the
+    # row before cert cleanup removes SSM metadata; debounce them by one scan to
+    # avoid paging on that expected handoff window.
+    #
+    # RenewalProcessingFailures debounces to two consecutive nonzero scans so a
+    # single cert's transient ACME/KMS/DDB/SSM blip can self-clear while
+    # recurring processing failures still page once per environment/cell instead
+    # of once per cert.
+    "RenewalDnsOwnershipFailures" = {
+      slug                = "renewal-dns-ownership-failures"
+      description         = "Scheduled renewal scan found certs blocked by customer DNS ownership drift (per-environment/cell scan-level count; see docs/runbooks/custom-domain-cert-dns-ownership.md)"
+      period              = 900
+      evaluation_periods  = 1
+      datapoints_to_alarm = 1
+    }
+    "RenewalOrphanedCerts" = {
+      slug                = "renewal-orphaned-certs"
+      description         = "Scheduled renewal scan found SSM cert material with no managed qurl-domains row in two consecutive scans (per-environment/cell scan-level count; see docs/runbooks/custom-domain-cert-dns-ownership.md)"
+      period              = 900
+      evaluation_periods  = 2
+      datapoints_to_alarm = 2
+    }
+    "RenewalProcessingFailures" = {
+      slug                = "renewal-processing-failures"
+      description         = "Scheduled renewal scan hit non-ownership processing failures such as ACME challenge setup/validation, KMS, DDB, or SSM faults in two consecutive scans (per-environment/cell scan-level count; see docs/runbooks/custom-domain-cert-dns-ownership.md)"
+      period              = 900
+      evaluation_periods  = 2
+      datapoints_to_alarm = 2
     }
   }
 }
@@ -704,6 +743,72 @@ resource "aws_cloudwatch_metric_alarm" "cert_failure_by_category" {
 
   tags = merge(local.common_tags, {
     Name = "${var.name_prefix}-cert-failure-${each.value.slug}"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "cert_renewal_scan_counts" {
+  for_each = local.renewal_scan_metrics
+
+  alarm_name          = "${var.name_prefix}-cert-${each.value.slug}"
+  alarm_description   = each.value.description
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = each.value.evaluation_periods
+  datapoints_to_alarm = each.value.datapoints_to_alarm
+  metric_name         = each.key
+  namespace           = "NHP/CustomDomainCerts"
+  period              = each.value.period
+  # Each metric value is a complete scheduled-scan count. Use Maximum so an
+  # async retry in the same period cannot inflate the displayed count; the
+  # alarm remains a simple >0 fleet-state signal.
+  statistic = "Maximum"
+  threshold = 0
+  # Renewal scans are scheduled, not continuous. Keep the previous state when
+  # there is no datapoint so long-lived customer DNS drift does not flap
+  # OK/ALARM on every scan interval; the Lambda emits an explicit 0 to clear.
+  treat_missing_data = "ignore"
+
+  dimensions = {
+    Environment = var.environment
+    CellID      = var.cell_id
+  }
+
+  # Three OKs per env/cell clear (one per renewal metric), not one per cert.
+  alarm_actions = [local.sns_topic_arn]
+  ok_actions    = [local.sns_topic_arn]
+
+  tags = merge(local.common_tags, {
+    Name = "${var.name_prefix}-cert-${each.value.slug}"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "cert_renewal_scan_heartbeat" {
+  alarm_name          = "${var.name_prefix}-cert-renewal-scan-missing"
+  alarm_description   = "Scheduled renewal scan heartbeat missing for three consecutive scan periods (per-environment/cell; detects disabled schedule or telemetry path before certs expire; see docs/runbooks/custom-domain-cert-dns-ownership.md)"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  metric_name         = "RenewalScanRuns"
+  namespace           = "NHP/CustomDomainCerts"
+  period              = 900
+  # One heartbeat per scheduled scan; Maximum tolerates async retries in the
+  # same period while keeping the question simple: did at least one scan report?
+  statistic = "Maximum"
+  threshold = 1
+  # Unlike the scan-count alarms, missing data here is the failure mode. Require
+  # three consecutive missed periods so first deploy, EventBridge jitter, or
+  # period-boundary alignment does not page on a single empty bucket.
+  treat_missing_data = "breaching"
+
+  dimensions = {
+    Environment = var.environment
+    CellID      = var.cell_id
+  }
+
+  alarm_actions = [local.sns_topic_arn]
+  ok_actions    = [local.sns_topic_arn]
+
+  tags = merge(local.common_tags, {
+    Name = "${var.name_prefix}-cert-renewal-scan-missing"
   })
 }
 

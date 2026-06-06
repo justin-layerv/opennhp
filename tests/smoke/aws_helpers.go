@@ -248,17 +248,17 @@ func fetchDeployDiscovery(ctx context.Context, client *ssm.Client, env string) (
 	return out, nil
 }
 
-// getSSMParameter reads a single plain-text SSM parameter. Returns
-// (value, true) on success, ("", false) if the parameter is missing.
-// Any OTHER AWS error (permissions, network) fails the test — those
-// are bugs in the smoke-suite setup, not missing-data conditions.
+// readSSMParameterWithContext reads a single plain-text SSM parameter. Returns
+// (value, true, nil) on success and ("", false, nil) only for
+// ParameterNotFound. Malformed AWS responses, including a nil Parameter or nil
+// Parameter.Value, are returned as errors so skip-gate callers fail loud instead
+// of treating corrupt payloads as "environment not deployed".
 //
 // Intentionally does NOT decrypt SecureStrings — tests that need to
 // read secrets should fail loudly rather than silently dragging them
 // into test output.
-func getSSMParameter(t *testing.T, name string) (string, bool) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func readSSMParameterWithContext(ctx context.Context, name string) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	resp, err := testConfig.SSMClient.GetParameter(ctx, &ssm.GetParameterInput{
@@ -268,12 +268,27 @@ func getSSMParameter(t *testing.T, name string) (string, bool) {
 	if err != nil {
 		var notFound *ssmtypes.ParameterNotFound
 		if errors.As(err, &notFound) {
-			return "", false
+			return "", false, nil
 		}
+		return "", false, err
+	}
+	if resp.Parameter == nil {
+		return "", false, fmt.Errorf("SSM GetParameter %s returned nil Parameter", name)
+	}
+	if resp.Parameter.Value == nil {
+		return "", false, fmt.Errorf("SSM GetParameter %s returned nil Parameter.Value", name)
+	}
+	return *resp.Parameter.Value, true, nil
+}
+
+// getSSMParameter wraps readSSMParameterWithContext for callers where any AWS
+// error other than ParameterNotFound is a smoke-suite setup bug.
+func getSSMParameter(t *testing.T, name string) (string, bool) {
+	t.Helper()
+
+	value, ok, err := readSSMParameterWithContext(context.Background(), name)
+	if err != nil {
 		t.Fatalf("ssm get-parameter %s: %v", name, err)
 	}
-	if resp.Parameter == nil || resp.Parameter.Value == nil {
-		return "", false
-	}
-	return *resp.Parameter.Value, true
+	return value, ok
 }

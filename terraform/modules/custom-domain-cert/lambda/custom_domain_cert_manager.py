@@ -157,6 +157,11 @@ class DnsOwnershipError(Exception):
     """
     pass
 
+
+class RenewalScanMetricPublishError(Exception):
+    """Raised after renewal work when scan-level CloudWatch telemetry failed."""
+    pass
+
 # ACME account secret field names (Secrets Manager — single secret, no scale issue)
 FIELD_ACCOUNT_KEY = 'account_key'
 
@@ -174,6 +179,11 @@ CW_METRIC_PROVISIONING_FAILURES = 'ProvisioningFailures'
 # measure how often the SSM-write-succeeded / DynamoDB-write-failed race fires
 # and detect a recovery storm (same domain recovering every scan).
 CW_METRIC_PROVISIONING_RECOVERIES = 'ProvisioningRecoveries'
+CW_METRIC_RENEWAL_SCAN_RUNS = 'RenewalScanRuns'
+CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES = 'RenewalDnsOwnershipFailures'
+CW_METRIC_RENEWAL_ORPHANED_CERTS = 'RenewalOrphanedCerts'
+CW_METRIC_RENEWAL_PROCESSING_FAILURES = 'RenewalProcessingFailures'
+RENEWAL_SCAN_METRIC_RETRY_DELAYS_SECONDS = (1, 2)
 
 # Failure category constants — published as the FailureCategory dimension on
 # the ProvisioningFailures metric so alarms identify the root cause at a glance.
@@ -188,10 +198,7 @@ CW_METRIC_PROVISIONING_RECOVERIES = 'ProvisioningRecoveries'
 #   DynamoDBError            Domain status query or update
 #   CertSyncError            SSM SendCommand to AC instances
 #   DomainValidationError    Invalid domain format rejected at handler level
-#   RenewalScanError         Per-domain failure during renewal scan
 #   ProvisioningTimeoutError Domain stuck in provisioning_tls past timeout
-#   OrphanedCert             SSM cert exists with no managed qurl-domains row
-#                            (reconciliation safety net, nhp#1990 / qurl-service#148)
 #
 FAILURE_ACME_ACCOUNT = 'AcmeAccountError'
 FAILURE_DNS_OWNERSHIP = 'DnsOwnershipError'
@@ -201,9 +208,7 @@ FAILURE_CERT_STORAGE = 'CertStorageError'
 FAILURE_DYNAMODB = 'DynamoDBError'
 FAILURE_CERT_SYNC = 'CertSyncError'
 FAILURE_DOMAIN_VALIDATION = 'DomainValidationError'
-FAILURE_RENEWAL_SCAN = 'RenewalScanError'
 FAILURE_PROVISIONING_TIMEOUT = 'ProvisioningTimeoutError'
-FAILURE_ORPHANED_CERT = 'OrphanedCert'
 FAILURE_SNS_DECODE = 'SnsDecodeError'
 
 # DNS ownership re-verification tunables. Centralized so the resolver
@@ -297,6 +302,31 @@ ACME_DIRECTORY = os.environ.get('ACME_DIRECTORY', 'https://acme-v02.api.letsencr
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
 QURL_DOMAINS_TABLE = os.environ.get('QURL_DOMAINS_TABLE')
 SSM_CERT_PREFIX = os.environ.get('SSM_CERT_PREFIX', '/nhp/certs')
+
+
+def _required_env(name: str) -> str:
+    """Fail fast for deployment invariants that form alarm dimensions."""
+    try:
+        return os.environ[name]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Missing required environment variable {name}; renewal scan metrics "
+            "would not match Terraform alarm dimensions"
+        ) from exc
+
+
+# ENVIRONMENT and CELL_ID are module-level deployment invariants; Terraform sets
+# them for every event type. Validate at cold start, even for immediate
+# provisioning, so a miswired deployment trips Lambda Errors instead of letting
+# scheduled renewal scans publish to a silently unpaged metric stream. This
+# deliberately makes the blast radius the whole Lambda when deployment metadata
+# is missing; the alternative is quieter but loses the prod renewal alarm fence.
+ENVIRONMENT = _required_env('ENVIRONMENT')
+CELL_ID = _required_env('CELL_ID')
+RENEWAL_SCAN_METRIC_DIMENSIONS: List[Dict[str, str]] = [
+    {'Name': 'Environment', 'Value': ENVIRONMENT},
+    {'Name': 'CellID', 'Value': CELL_ID},
+]
 
 # Cached ACME client (reused across multiple renewals in a single invocation)
 _cached_acme_client = None
@@ -466,13 +496,30 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             return provision_certificate(domain, acme_subdomain)
         elif event_type == EVENT_RENEWAL_SCAN:
             results = renewal_scan()
+            # Do not skip customer-facing pending work just because scan
+            # telemetry failed. A pending-processing exception remains the
+            # invocation error with its normal alert/metric; if pending work
+            # succeeds, the telemetry failure raises after it and trips only
+            # the Lambda Errors backstop.
             results['pending'] = provision_pending_domains()
+            if results.get('metric_publish_failed'):
+                raise RenewalScanMetricPublishError(
+                    "Renewal scan metrics failed to publish; renewal work and "
+                    "pending-domain processing completed before raising"
+                )
             return results
         else:
             raise ValueError(f"Unknown event type: {event_type}")
 
     except (DnsValidationError, DnsOwnershipError):
         # Already metricked in provision_certificate()
+        raise
+    except RenewalScanMetricPublishError:
+        # Renewal work already ran. Re-raise so the Lambda Errors alarm is the
+        # single backstop for renewal scan telemetry publish failures; don't also
+        # emit SNS/ProvisioningFailures and turn one CloudWatch blip into three
+        # operational signals.
+        logger.error("Renewal scan telemetry publish failed after renewal work completed", exc_info=True)
         raise
     except ValueError as e:
         logger.error(f"Custom domain cert manager validation failed: {str(e)}", exc_info=True)
@@ -811,7 +858,12 @@ def verify_dns_ownership(domain: str) -> None:
     )
 
 
-def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = False) -> Dict[str, Any]:
+def provision_certificate(
+    domain: str,
+    acme_subdomain: str,
+    skip_sync: bool = False,
+    emit_per_domain_signals: bool = True,
+) -> Dict[str, Any]:
     """
     Provision a new TLS certificate for a custom domain.
 
@@ -824,6 +876,11 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
         acme_subdomain: The subdomain in our ACME zone for the TXT record
                         (e.g., "secure--example--com")
         skip_sync: If True, skip triggering cert sync (caller will batch it)
+        emit_per_domain_signals: If False, suppress per-domain SNS and
+                        ProvisioningFailures metrics. Scheduled renewal scans
+                        use aggregate scan metrics instead so one bad fleet
+                        state does not page once per cert; domain status and
+                        failure_reason still update for per-domain triage.
 
     Returns:
         Status dict with provisioning outcome
@@ -898,7 +955,8 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
         _release_provisioning_lock(domain)
 
         logger.info(f"Certificate provisioned successfully for {domain}, expires: {expires_at}")
-        send_alert(f"Certificate provisioned for {domain}. Expires: {expires_at}", is_error=False)
+        if emit_per_domain_signals:
+            send_alert(f"Certificate provisioned for {domain}. Expires: {expires_at}", is_error=False)
 
         return {
             'status': RESULT_PROVISIONED,
@@ -910,22 +968,25 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
     except DnsOwnershipError as e:
         logger.error(f"DNS ownership re-verification failed for {domain}: {str(e)}", exc_info=True)
         update_domain_status(domain, STATUS_FAILED, error=str(e))
-        send_alert(f"Certificate provisioning BLOCKED for {domain}: {str(e)}")
-        publish_failure_metric(FAILURE_DNS_OWNERSHIP)
+        if emit_per_domain_signals:
+            send_alert(f"Certificate provisioning BLOCKED for {domain}: {str(e)}")
+            publish_failure_metric(FAILURE_DNS_OWNERSHIP)
         _release_provisioning_lock(domain)
         raise
     except DnsValidationError as e:
         logger.error(f"Certificate provisioning failed for {domain}: {str(e)}", exc_info=True)
         update_domain_status(domain, STATUS_FAILED, error=str(e))
-        send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
-        publish_failure_metric(FAILURE_DNS_VALIDATION)
+        if emit_per_domain_signals:
+            send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
+            publish_failure_metric(FAILURE_DNS_VALIDATION)
         _release_provisioning_lock(domain)
         raise
     except Exception as e:
         logger.error(f"Certificate provisioning failed for {domain}: {str(e)}", exc_info=True)
         update_domain_status(domain, STATUS_FAILED, error=str(e))
-        send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
-        publish_failure_metric(failure_category)
+        if emit_per_domain_signals:
+            send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
+            publish_failure_metric(failure_category)
         _release_provisioning_lock(domain)
         raise
 
@@ -959,16 +1020,26 @@ def renewal_scan() -> Dict[str, Any]:
         'scanned': 0,
         'renewed': 0,
         'failed': 0,
+        'dns_ownership_failed': 0,
         'skipped': 0,
         'orphaned': 0,
+        'heartbeat_publish_failed': False,
+        'metric_publish_failed': False,
         'details': []
     }
+
+    # Emit the heartbeat before listing/scanning certs. This makes
+    # RenewalScanRuns mean "the schedule invoked the scanner" even if a large
+    # fleet later times out or final count publishing fails. A heartbeat-only
+    # publish miss is handled by the breaching missing-scan alarm after three
+    # periods rather than raising here and async-retrying the full renewal scan.
+    results['heartbeat_publish_failed'] = not publish_renewal_scan_heartbeat()
 
     # List all /meta params (non-encrypted) to check expiry without KMS cost
     meta_params = list_cert_meta_params()
     results['scanned'] = len(meta_params)
     expiry_metrics = []  # Batch metrics for a single put_metric_data call
-    orphans = []  # (domain, reason) — aggregated into a single SNS alert after the loop
+    orphans = []  # (domain, reason) — sampled into logs; counts go to scan-level metrics
 
     # Pre-compute prefix depth for domain extraction (constant across all params)
     prefix_depth = len(SSM_CERT_PREFIX.strip('/').split('/')) + 1
@@ -993,11 +1064,6 @@ def renewal_scan() -> Dict[str, Any]:
             orphan_reason = check_orphan_for_meta(domain)
             if orphan_reason:
                 logger.error(f"Orphan cert detected for {domain}: {orphan_reason}")
-                # Per-orphan failure metric still fires so the alarm reflects
-                # the true orphan count. SNS publish is deferred to a single
-                # summary message after the loop to avoid paging spam when a
-                # botched bulk cleanup leaves many orphans simultaneously.
-                publish_failure_metric(FAILURE_ORPHANED_CERT)
                 orphans.append((domain, orphan_reason))
                 results['orphaned'] += 1
                 results['details'].append({
@@ -1034,7 +1100,12 @@ def renewal_scan() -> Dict[str, Any]:
                     logger.warning(f"Meta for {domain} missing '{FIELD_ACME_SUBDOMAIN}' field, deriving from domain name")
                     acme_subdomain = domain_to_acme_subdomain(domain)
 
-                result = provision_certificate(domain, acme_subdomain, skip_sync=True)
+                result = provision_certificate(
+                    domain,
+                    acme_subdomain,
+                    skip_sync=True,
+                    emit_per_domain_signals=False,
+                )
                 if result.get('status') == RESULT_SKIPPED:
                     results['skipped'] += 1
                     results['details'].append({
@@ -1058,9 +1129,21 @@ def renewal_scan() -> Dict[str, Any]:
                     'days_until_expiry': days_until_expiry
                 })
 
+        except DnsOwnershipError as e:
+            logger.error(f"DNS ownership blocked renewal for {domain}: {str(e)}", exc_info=True)
+            results['dns_ownership_failed'] += 1
+            results['details'].append({
+                'domain': domain,
+                'action': 'dns_ownership_failed',
+                'error': str(e)
+            })
+
         except Exception as e:
+            # DnsValidationError intentionally lands here rather than in
+            # dns_ownership_failed. Ownership drift is the _layerv-verify TXT
+            # contract; ACME challenge setup/validation is an operational
+            # renewal processing fault.
             logger.error(f"Failed to process certificate for {domain}: {str(e)}", exc_info=True)
-            publish_failure_metric(FAILURE_RENEWAL_SCAN)
             results['failed'] += 1
             results['details'].append({
                 'domain': domain,
@@ -1081,6 +1164,8 @@ def renewal_scan() -> Dict[str, Any]:
         except Exception as e:
             logger.error(f"Failed to publish batched expiry metrics: {e}")
 
+    results['metric_publish_failed'] = not publish_renewal_scan_metrics(results)
+
     # Trigger a single cert sync after all renewals (instead of per-domain)
     if results['renewed'] > 0:
         logger.info(f"Triggering cert sync after {results['renewed']} renewal(s)")
@@ -1088,24 +1173,117 @@ def renewal_scan() -> Dict[str, Any]:
 
     logger.info(f"Renewal scan complete: {results['scanned']} scanned, "
                 f"{results['renewed']} renewed, {results['failed']} failed, "
+                f"{results['dns_ownership_failed']} DNS ownership blocked, "
                 f"{results['skipped']} skipped, {results['orphaned']} orphaned")
 
     if results['failed'] > 0:
-        send_alert(f"Renewal scan completed with {results['failed']} failure(s)")
+        logger.error(f"Renewal scan completed with {results['failed']} non-ownership processing failure(s)")
+
+    if results['dns_ownership_failed'] > 0:
+        logger.error(
+            f"Renewal scan found {results['dns_ownership_failed']} DNS ownership renewal failure(s)"
+        )
 
     if orphans:
-        # Single summary alert regardless of orphan count — see comment in the
-        # orphan-detection branch above for the spam-mitigation rationale.
-        lines = [f"- {d}: {r}" for d, r in orphans]
-        send_alert(
+        sample = ", ".join(f"{d} ({r})" for d, r in orphans[:20])
+        if len(orphans) > 20:
+            sample += f", ... {len(orphans) - 20} more"
+        logger.error(
             f"Renewal scan detected {len(orphans)} orphan cert(s) "
-            f"(SSM cert material with no managed qurl-domains row). "
-            f"Manual cleanup required: delete /nhp/certs/<domain>/{{key,chain,meta}} "
-            f"from SSM for each (see nhp#1990).\n"
-            + "\n".join(lines)
+            f"(SSM cert material with no managed qurl-domains row): {sample}"
         )
 
     return results
+
+
+def _put_renewal_scan_metric_data(metric_data: List[Dict[str, Any]], description: str) -> bool:
+    """Publish renewal scan telemetry with a small in-process retry."""
+    attempts = len(RENEWAL_SCAN_METRIC_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            cloudwatch_client.put_metric_data(
+                Namespace=CW_NAMESPACE,
+                MetricData=metric_data,
+            )
+            if attempt > 1:
+                logger.info(
+                    f"Published {description} after {attempt} CloudWatch attempt(s)"
+                )
+            return True
+        except Exception as e:
+            if attempt == attempts:
+                logger.error(
+                    f"Failed to publish {description} after {attempt} CloudWatch attempt(s): {e}"
+                )
+                return False
+            delay = RENEWAL_SCAN_METRIC_RETRY_DELAYS_SECONDS[attempt - 1]
+            logger.warning(
+                f"Failed to publish {description} on CloudWatch attempt "
+                f"{attempt}/{attempts}; retrying in {delay}s: {e}"
+            )
+            time.sleep(delay)
+    return False
+
+
+def publish_renewal_scan_heartbeat() -> bool:
+    """Publish the scheduled-scan invocation heartbeat.
+
+    This is intentionally separate from the end-of-scan fleet-state counts. The
+    heartbeat alarm should identify a disabled EventBridge rule or non-invoked
+    Lambda, while Lambda Errors and the count alarms cover scans that invoked
+    but failed or timed out during work.
+    """
+    return _put_renewal_scan_metric_data(
+        [
+            {
+                'MetricName': CW_METRIC_RENEWAL_SCAN_RUNS,
+                'Dimensions': RENEWAL_SCAN_METRIC_DIMENSIONS,
+                'Value': 1,
+                'Unit': 'Count',
+            },
+        ],
+        'renewal scan heartbeat',
+    )
+
+
+def publish_renewal_scan_metrics(results: Dict[str, Any]) -> bool:
+    """Publish scan-level renewal fleet-state count metrics.
+
+    These are fleet-state gauges, not per-domain provisioning failures. Emit a
+    value every scan, including zeroes, so alarms with treat_missing_data=ignore
+    stay ALARM between scheduled scans and return OK only after a clean scan. A
+    separate start-of-scan heartbeat catches disabled schedules without coupling
+    that alarm to scan completion or count-publish success.
+    Returns True on success; False lets handler raise after renewal work so the
+    Lambda Errors alarm backstops repeated telemetry publish failures.
+    """
+    # Best-effort telemetry: with treat_missing_data=ignore, a missed zero can
+    # leave an alarm stale until the next successful scheduled scan. Retry small
+    # CloudWatch blips in-process before letting handler raise and trigger Lambda
+    # async retry of the full renewal scan.
+    return _put_renewal_scan_metric_data(
+        [
+            {
+                'MetricName': CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES,
+                'Dimensions': RENEWAL_SCAN_METRIC_DIMENSIONS,
+                'Value': results['dns_ownership_failed'],
+                'Unit': 'Count',
+            },
+            {
+                'MetricName': CW_METRIC_RENEWAL_ORPHANED_CERTS,
+                'Dimensions': RENEWAL_SCAN_METRIC_DIMENSIONS,
+                'Value': results['orphaned'],
+                'Unit': 'Count',
+            },
+            {
+                'MetricName': CW_METRIC_RENEWAL_PROCESSING_FAILURES,
+                'Dimensions': RENEWAL_SCAN_METRIC_DIMENSIONS,
+                'Value': results['failed'],
+                'Unit': 'Count',
+            },
+        ],
+        'renewal scan count metrics',
+    )
 
 
 def list_cert_meta_params() -> list:
@@ -2321,17 +2499,12 @@ def publish_failure_metric(category: Optional[str] = None, domain: Optional[str]
     Scoping is deliberate: only the cert sync/delete trigger paths pass
     ``domain``, because that is the sole surface the smoke suite exercises with
     reserved-name domains (cleanup of smoke-cleanup-*.example.invalid). The
-    other callers (provisioning, DNS validation, renewal-scan, orphan-cleanup)
-    omit ``domain`` and always emit — a reserved-name domain doesn't reach those
-    paths in practice, and suppressing there would only widen the blind spot (a
-    genuine infra fault on a synthetic domain would then emit nothing) for no
-    real-world benefit. A real customer domain always alarms on every path
-    regardless.
-
-    Revisit this boundary if smoke ever starts exercising the renewal-scan or
-    orphan-cleanup paths (FAILURE_RENEWAL_SCAN / FAILURE_ORPHANED_CERT) against
-    reserved-name domains: those callers would then need ``domain`` too, or the
-    prod alarm could re-trip on a synthetic failure.
+    other immediate provisioning callers omit ``domain`` and always emit — a
+    reserved-name domain doesn't reach those paths in practice, and suppressing
+    there would only widen the blind spot (a genuine infra fault on a synthetic
+    domain would then emit nothing) for no real-world benefit. Scheduled renewal
+    scans publish aggregate scan metrics instead of ProvisioningFailures so one
+    bad fleet state does not page once per cert.
     """
     if domain and is_synthetic_domain(domain):
         logger.info(f"Skipping ProvisioningFailures metric for synthetic domain: {domain}")

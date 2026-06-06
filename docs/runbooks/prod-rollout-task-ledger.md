@@ -631,6 +631,41 @@ entry to Completed Entries only after `Status: Verified`.
 - Completed date:
 - Evidence:
 
+### 2026-06-06 - PR #2329 - Custom-domain renewal alarm aggregation
+
+- Ledger PR: [#2329](https://github.com/layervai/nhp/pull/2329)
+- Source PR / issue: [PR #2329](https://github.com/layervai/nhp/pull/2329)
+- Component: `terraform/modules/custom-domain-cert`,
+  `tests/smoke/19_custom_domain_dns_ownership_test.go`,
+  `docs/runbooks/custom-domain-cert-dns-ownership.md`
+- Task owner: prod rollout coordinator
+- Rollout tasks:
+  - Promote the custom-domain cert Lambda, renewal scan alarms, heartbeat alarm,
+    and smoke IAM/test wiring through the normal prod promote flow.
+- Post-rollout tasks:
+  - Watch `layerv-nhp-prod-cert-renewal-scan-missing`; acknowledge a one-time
+    first-deploy or alarm-replacement page if it fires before the first
+    heartbeat datapoint, wait one scan interval, and escalate if it does not
+    clear within an hour or re-enters `ALARM` after reaching OK.
+  - Confirm `RenewalScanRuns` publishes for `Environment=prod` and the prod
+    `CellID`, and confirm the three renewal count alarms move to OK or to an
+    expected ALARM backed by explicit scan-count datapoints.
+  - If the heartbeat alarm fires alongside Lambda Errors, treat it as a
+    telemetry publish outage first and inspect the cert Lambda logs before
+    starting customer DNS cleanup.
+- Rollback tasks:
+  - Roll back the custom-domain cert Lambda/alarm Terraform change to the prior
+    release if renewal scan telemetry cannot be stabilized. Expect the old
+    scheduled-renewal failure signals to return until the rollback is recovered.
+- Follow-ups / deferred tasks:
+  - Scale the scheduled renewal scanner for thousands of certs:
+    [#2379](https://github.com/layervai/nhp/issues/2379).
+- Status: Open
+- Status note: waiting for prod rollout and post-deploy heartbeat/alarm
+  verification.
+- Completed date:
+- Evidence:
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries

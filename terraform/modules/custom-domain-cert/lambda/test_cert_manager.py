@@ -16,9 +16,11 @@ Uses unittest.mock to patch boto3 clients — no moto dependency needed.
 # pyright: reportMissingImports=false
 import json
 import os
+import re
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch, MagicMock
+from pathlib import Path
+from unittest.mock import call, patch, MagicMock
 
 import pytest
 from botocore.exceptions import ClientError
@@ -33,8 +35,178 @@ os.environ.setdefault('ACME_ZONE_ID', 'Z0000000000000')
 os.environ.setdefault('ACME_ZONE_NAME', 'acme.example.com')
 os.environ.setdefault('SSM_CERT_PREFIX', '/nhp/certs')
 os.environ.setdefault('QURL_DOMAINS_TABLE', 'test-qurl-domains')
+os.environ.setdefault('ENVIRONMENT', 'test')
+os.environ.setdefault('CELL_ID', 'cell0')
 
 import custom_domain_cert_manager as cm
+
+
+def test_required_env_fails_loud(monkeypatch):
+    monkeypatch.delenv('ENVIRONMENT', raising=False)
+
+    with pytest.raises(RuntimeError, match='Missing required environment variable ENVIRONMENT'):
+        cm._required_env('ENVIRONMENT')
+
+
+def _metric_values(mock_put_metric_data):
+    values = {}
+    for call in mock_put_metric_data.call_args_list:
+        for metric in call.kwargs['MetricData']:
+            values[metric['MetricName']] = metric['Value']
+    return values
+
+
+def _metric_dimensions(mock_put_metric_data):
+    dimensions = {}
+    for call in mock_put_metric_data.call_args_list:
+        for metric in call.kwargs['MetricData']:
+            dimensions[metric['MetricName']] = {
+                dim['Name']: dim['Value'] for dim in metric.get('Dimensions', [])
+            }
+    return dimensions
+
+
+def _assert_renewal_metric_dimensions(mock_put_metric_data):
+    expected = {'Environment': 'test', 'CellID': 'cell0'}
+    dimensions = _metric_dimensions(mock_put_metric_data)
+    for metric_name in (
+        cm.CW_METRIC_RENEWAL_SCAN_RUNS,
+        cm.CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES,
+        cm.CW_METRIC_RENEWAL_ORPHANED_CERTS,
+        cm.CW_METRIC_RENEWAL_PROCESSING_FAILURES,
+    ):
+        assert dimensions[metric_name] == expected
+
+
+def _hcl_block(text, marker):
+    start = text.index(marker)
+    brace = text.index('{', start)
+    depth = 0
+    index = brace
+    in_string = False
+    escape = False
+    in_line_comment = False
+    in_block_comment = False
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ''
+
+        if in_line_comment:
+            if char == '\n':
+                in_line_comment = False
+            index += 1
+            continue
+        if in_block_comment:
+            if char == '*' and next_char == '/':
+                in_block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if in_string:
+            if escape:
+                escape = False
+            elif char == '\\':
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == '#':
+            in_line_comment = True
+        elif char == '/' and next_char == '/':
+            in_line_comment = True
+            index += 1
+        elif char == '/' and next_char == '*':
+            in_block_comment = True
+            index += 1
+        elif char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                return text[brace + 1:index]
+        index += 1
+    raise AssertionError(f"unterminated HCL block for {marker}")
+
+
+def test_hcl_block_ignores_braces_inside_strings_and_comments():
+    text = '''
+resource "aws_cloudwatch_metric_alarm" "example" {
+  alarm_description = "literal { brace"
+  # comment with } brace
+  dimensions = {
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "next" {
+  metric_name = "Other"
+}
+'''
+
+    block = _hcl_block(text, 'resource "aws_cloudwatch_metric_alarm" "example"')
+
+    assert 'literal { brace' in block
+    assert 'comment with } brace' in block
+    assert 'dimensions = {' in block
+    assert 'metric_name = "Other"' not in block
+
+
+def test_renewal_metric_contract_matches_terraform_alarms():
+    """Guard the Python metric publisher and Terraform alarms from drifting."""
+    module_main = Path(__file__).resolve().parents[1] / 'main.tf'
+    terraform = module_main.read_text()
+    renewal_metrics = _hcl_block(terraform, 'renewal_scan_metrics = {')
+    count_alarm = _hcl_block(
+        terraform,
+        'resource "aws_cloudwatch_metric_alarm" "cert_renewal_scan_counts"',
+    )
+    heartbeat_alarm = _hcl_block(
+        terraform,
+        'resource "aws_cloudwatch_metric_alarm" "cert_renewal_scan_heartbeat"',
+    )
+
+    expected_count_alarm_contract = {
+        cm.CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES: {
+            'period': 900,
+            'evaluation_periods': 1,
+            'datapoints_to_alarm': 1,
+        },
+        cm.CW_METRIC_RENEWAL_ORPHANED_CERTS: {
+            'period': 900,
+            'evaluation_periods': 2,
+            'datapoints_to_alarm': 2,
+        },
+        cm.CW_METRIC_RENEWAL_PROCESSING_FAILURES: {
+            'period': 900,
+            'evaluation_periods': 2,
+            'datapoints_to_alarm': 2,
+        },
+    }
+    for metric_name, contract in expected_count_alarm_contract.items():
+        assert f'"{metric_name}" = {{' in renewal_metrics
+        metric_block = _hcl_block(renewal_metrics, f'"{metric_name}" = {{')
+        for attr, expected in contract.items():
+            assert re.search(rf'\b{attr}\s*=\s*{expected}\b', metric_block)
+
+    assert re.search(r'metric_name\s*=\s*each\.key\b', count_alarm)
+    assert re.search(
+        rf'metric_name\s*=\s*"{re.escape(cm.CW_METRIC_RENEWAL_SCAN_RUNS)}"',
+        heartbeat_alarm,
+    )
+    for alarm_block in (count_alarm, heartbeat_alarm):
+        assert re.search(rf'namespace\s*=\s*"{re.escape(cm.CW_NAMESPACE)}"', alarm_block)
+        dimensions = _hcl_block(alarm_block, 'dimensions = {')
+        assert re.search(r'\bEnvironment\s*=\s*var\.environment\b', dimensions)
+        assert re.search(r'\bCellID\s*=\s*var\.cell_id\b', dimensions)
+
+    assert re.search(r'\bevaluation_periods\s*=\s*3\b', heartbeat_alarm)
+    assert re.search(r'\bdatapoints_to_alarm\s*=\s*3\b', heartbeat_alarm)
+    assert re.search(r'\bperiod\s*=\s*900\b', heartbeat_alarm)
 
 
 @pytest.fixture(autouse=True)
@@ -915,7 +1087,210 @@ class TestRenewalScan(unittest.TestCase):
 
         cm.renewal_scan()
         # Should have called provision with derived acme_subdomain
-        mock_provision.assert_called_once_with('no-acme.com', 'no-acme--com', skip_sync=True)
+        mock_provision.assert_called_once_with(
+            'no-acme.com',
+            'no-acme--com',
+            skip_sync=True,
+            emit_per_domain_signals=False,
+        )
+
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_heartbeat_publishes_before_scan_work(self, mock_list, mock_cw):
+        """RenewalScanRuns should mean the scheduled scanner was invoked."""
+        mock_list.side_effect = RuntimeError('ssm pagination timeout')
+
+        with pytest.raises(RuntimeError, match='ssm pagination timeout'):
+            cm.renewal_scan()
+
+        mock_cw.assert_called_once()
+        assert mock_cw.call_args.kwargs['MetricData'] == [
+            {
+                'MetricName': cm.CW_METRIC_RENEWAL_SCAN_RUNS,
+                'Dimensions': cm.RENEWAL_SCAN_METRIC_DIMENSIONS,
+                'Value': 1,
+                'Unit': 'Count',
+            },
+        ]
+
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_final_count_metric_publish_retries_transient_cloudwatch_failure(
+        self, mock_list, mock_cw,
+    ):
+        """A transient final metric blip should not force an async full re-scan."""
+        mock_list.return_value = []
+        mock_cw.side_effect = [
+            None,  # start-of-scan heartbeat
+            Exception('cloudwatch blip 1'),
+            Exception('cloudwatch blip 2'),
+            None,
+        ]
+
+        with patch('custom_domain_cert_manager.time.sleep') as mock_sleep:
+            result = cm.renewal_scan()
+
+        assert result['heartbeat_publish_failed'] is False
+        assert result['metric_publish_failed'] is False
+        assert [
+            metric_call.kwargs['MetricData'][0]['MetricName']
+            for metric_call in mock_cw.call_args_list
+        ] == [
+            cm.CW_METRIC_RENEWAL_SCAN_RUNS,
+            cm.CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES,
+            cm.CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES,
+            cm.CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES,
+        ]
+        mock_sleep.assert_has_calls([
+            call(cm.RENEWAL_SCAN_METRIC_RETRY_DELAYS_SECONDS[0]),
+            call(cm.RENEWAL_SCAN_METRIC_RETRY_DELAYS_SECONDS[1]),
+        ])
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_successful_renewal_suppresses_per_domain_alerts(
+        self, mock_list, mock_get, mock_cw, mock_provision, mock_sync,
+        mock_failure_metric, mock_alert,
+    ):
+        """Scheduled renewal success should sync once without per-domain alerting."""
+        del mock_cw
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        mock_list.return_value = [
+            {
+                'Name': '/nhp/certs/renewed.com/meta',
+                'Value': json.dumps({
+                    'expires_at': expiring,
+                    'acme_subdomain': 'renewed--com',
+                }),
+            },
+        ]
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_renewed'}}}
+        mock_provision.return_value = {'status': cm.RESULT_PROVISIONED}
+
+        result = cm.renewal_scan()
+
+        assert result['renewed'] == 1
+        assert result['failed'] == 0
+        assert result['dns_ownership_failed'] == 0
+        assert result['orphaned'] == 0
+        mock_provision.assert_called_once_with(
+            'renewed.com',
+            'renewed--com',
+            skip_sync=True,
+            emit_per_domain_signals=False,
+        )
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_RENEWAL)
+        mock_failure_metric.assert_not_called()
+        mock_alert.assert_not_called()
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_metric_publish_failure_does_not_skip_renewal_sync(
+        self, mock_list, mock_cw, mock_provision, mock_sync,
+    ):
+        """Telemetry failure should be recorded only after renewal sync can run."""
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        mock_list.return_value = [
+            {
+                'Name': '/nhp/certs/renewed.com/meta',
+                'Value': json.dumps({
+                    'expires_at': expiring,
+                    'acme_subdomain': 'renewed--com',
+                }),
+            },
+        ]
+        mock_provision.return_value = {'status': cm.RESULT_PROVISIONED}
+        mock_cw.side_effect = Exception('cloudwatch denied')
+
+        with patch('custom_domain_cert_manager.time.sleep'):
+            result = cm.renewal_scan()
+
+        assert result['renewed'] == 1
+        assert result['heartbeat_publish_failed'] is True
+        assert result['metric_publish_failed'] is True
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_RENEWAL)
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_dns_ownership_failure_is_scan_aggregate(
+        self, mock_list, mock_cw, mock_provision, mock_sync, mock_failure_metric, mock_alert,
+    ):
+        """Scheduled renewal DNS drift should count once, not page per domain."""
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        mock_list.return_value = [
+            {
+                'Name': '/nhp/certs/drifted.com/meta',
+                'Value': json.dumps({
+                    'expires_at': expiring,
+                    'acme_subdomain': 'drifted--com',
+                }),
+            },
+        ]
+        mock_provision.side_effect = cm.DnsOwnershipError('TXT mismatch')
+
+        result = cm.renewal_scan()
+
+        assert result['dns_ownership_failed'] == 1
+        assert result['failed'] == 0
+        assert result['renewed'] == 0
+        assert result['orphaned'] == 0
+        mock_sync.assert_not_called()
+        mock_failure_metric.assert_not_called()
+        mock_alert.assert_not_called()
+        metric_values = _metric_values(mock_cw)
+        assert metric_values[cm.CW_METRIC_RENEWAL_SCAN_RUNS] == 1
+        assert metric_values[cm.CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES] == 1
+        assert metric_values[cm.CW_METRIC_RENEWAL_ORPHANED_CERTS] == 0
+        _assert_renewal_metric_dimensions(mock_cw)
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_processing_failure_is_scan_aggregate(
+        self, mock_list, mock_cw, mock_provision, mock_sync, mock_failure_metric,
+        mock_alert,
+    ):
+        """Scheduled renewal infra faults should aggregate without per-domain paging."""
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        mock_list.return_value = [
+            {
+                'Name': '/nhp/certs/failed.com/meta',
+                'Value': json.dumps({
+                    'expires_at': expiring,
+                    'acme_subdomain': 'failed--com',
+                }),
+            },
+        ]
+        mock_provision.side_effect = Exception('kms throttle')
+
+        result = cm.renewal_scan()
+
+        assert result['failed'] == 1
+        assert result['dns_ownership_failed'] == 0
+        assert result['renewed'] == 0
+        assert result['orphaned'] == 0
+        mock_sync.assert_not_called()
+        mock_failure_metric.assert_not_called()
+        mock_alert.assert_not_called()
+        metric_values = _metric_values(mock_cw)
+        assert metric_values[cm.CW_METRIC_RENEWAL_SCAN_RUNS] == 1
+        assert metric_values[cm.CW_METRIC_RENEWAL_ORPHANED_CERTS] == 0
+        assert metric_values[cm.CW_METRIC_RENEWAL_PROCESSING_FAILURES] == 1
+        _assert_renewal_metric_dimensions(mock_cw)
 
     @patch.object(cm.cloudwatch_client, 'put_metric_data')
     @patch('custom_domain_cert_manager.list_cert_meta_params')
@@ -926,7 +1301,78 @@ class TestRenewalScan(unittest.TestCase):
         result = cm.renewal_scan()
         assert result['scanned'] == 0
         assert result['renewed'] == 0
-        mock_cw.assert_not_called()
+        assert _metric_values(mock_cw) == {
+            cm.CW_METRIC_RENEWAL_SCAN_RUNS: 1,
+            cm.CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES: 0,
+            cm.CW_METRIC_RENEWAL_ORPHANED_CERTS: 0,
+            cm.CW_METRIC_RENEWAL_PROCESSING_FAILURES: 0,
+        }
+        _assert_renewal_metric_dimensions(mock_cw)
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.provision_pending_domains')
+    @patch('custom_domain_cert_manager.renewal_scan')
+    def test_handler_raises_after_pending_when_scan_metrics_fail(
+        self, mock_scan, mock_pending, mock_failure_metric, mock_alert,
+    ):
+        """Metric publish failure should trip only Lambda Errors after renewal work."""
+        mock_scan.return_value = {
+            'renewed': 1,
+            'metric_publish_failed': True,
+        }
+        mock_pending.return_value = {'provisioned': 0, 'failed': 0}
+
+        with pytest.raises(cm.RenewalScanMetricPublishError):
+            cm.handler({'type': cm.EVENT_RENEWAL_SCAN}, None)
+
+        mock_pending.assert_called_once()
+        mock_alert.assert_not_called()
+        mock_failure_metric.assert_not_called()
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.provision_pending_domains')
+    @patch('custom_domain_cert_manager.renewal_scan')
+    def test_handler_returns_after_pending_when_scan_metrics_succeed(
+        self, mock_scan, mock_pending, mock_failure_metric, mock_alert,
+    ):
+        """Successful scan metric publish should not trip the Lambda Errors backstop."""
+        mock_scan.return_value = {
+            'renewed': 1,
+            'metric_publish_failed': False,
+        }
+        mock_pending.return_value = {'provisioned': 1, 'failed': 0}
+
+        result = cm.handler({'type': cm.EVENT_RENEWAL_SCAN}, None)
+
+        assert result['renewed'] == 1
+        assert result['metric_publish_failed'] is False
+        assert result['pending'] == {'provisioned': 1, 'failed': 0}
+        mock_pending.assert_called_once()
+        mock_alert.assert_not_called()
+        mock_failure_metric.assert_not_called()
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.provision_pending_domains')
+    @patch('custom_domain_cert_manager.renewal_scan')
+    def test_pending_error_takes_precedence_after_scan_metrics_fail(
+        self, mock_scan, mock_pending, mock_failure_metric, mock_alert,
+    ):
+        """Pending work keeps its own invocation error even if scan metrics failed."""
+        mock_scan.return_value = {
+            'renewed': 1,
+            'metric_publish_failed': True,
+        }
+        mock_pending.side_effect = RuntimeError('pending ddb throttle')
+
+        with pytest.raises(RuntimeError, match='pending ddb throttle'):
+            cm.handler({'type': cm.EVENT_RENEWAL_SCAN}, None)
+
+        mock_pending.assert_called_once()
+        mock_alert.assert_called_once_with('Custom domain cert manager FAILED: pending ddb throttle')
+        mock_failure_metric.assert_called_once_with()
 
 
 class TestCheckOrphanForMeta(unittest.TestCase):
@@ -1016,7 +1462,6 @@ class TestRenewalScanOrphanDetection(unittest.TestCase):
         mock_failure_metric, mock_alert,
     ):
         """Orphan detection runs BEFORE expiry check and prevents renewal."""
-        del mock_cw  # only suppressed, not asserted
         expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
         mock_list.return_value = [
             {'Name': '/nhp/certs/orphan.com/meta', 'Value': json.dumps({
@@ -1034,19 +1479,14 @@ class TestRenewalScanOrphanDetection(unittest.TestCase):
         # The expensive paths must NOT run for orphans.
         mock_provision.assert_not_called()
         mock_sync.assert_not_called()
-        mock_failure_metric.assert_called_once_with(cm.FAILURE_ORPHANED_CERT)
-        # Operator-facing alert references the manual cleanup path.
-        assert mock_alert.called
-        alert_msg = mock_alert.call_args[0][0]
-        assert 'orphan.com' in alert_msg
-        assert 'manual cleanup' in alert_msg.lower()
+        mock_failure_metric.assert_not_called()
+        mock_alert.assert_not_called()
+        assert _metric_values(mock_cw)[cm.CW_METRIC_RENEWAL_ORPHANED_CERTS] == 1
+        _assert_renewal_metric_dimensions(mock_cw)
 
         detail = result['details'][0]
         assert detail['action'] == 'orphaned'
         assert detail['domain'] == 'orphan.com'
-
-        # Aggregated summary alert: a single send_alert call regardless of count.
-        assert mock_alert.call_count == 1
 
     @patch.object(cm, 'send_alert')
     @patch.object(cm, 'publish_failure_metric')
@@ -1090,7 +1530,7 @@ class TestRenewalScanOrphanDetection(unittest.TestCase):
         mock_failure_metric, mock_alert,
     ):
         """Orphans and managed certs in the same scan are counted separately."""
-        del mock_cw, mock_sync, mock_alert
+        del mock_sync
         expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
         not_expiring = (datetime.now(timezone.utc) + timedelta(days=180)).isoformat()
         mock_list.return_value = [
@@ -1121,8 +1561,10 @@ class TestRenewalScanOrphanDetection(unittest.TestCase):
         assert result['renewed'] == 1   # expiring.com
         assert result['skipped'] == 1   # healthy.com (not in renewal window)
         mock_provision.assert_called_once()
-        # Exactly one orphan metric publish, for orphan.com.
-        mock_failure_metric.assert_called_once_with(cm.FAILURE_ORPHANED_CERT)
+        mock_failure_metric.assert_not_called()
+        mock_alert.assert_not_called()
+        assert _metric_values(mock_cw)[cm.CW_METRIC_RENEWAL_ORPHANED_CERTS] == 1
+        _assert_renewal_metric_dimensions(mock_cw)
 
     @patch.object(cm, 'send_alert')
     @patch.object(cm, 'publish_failure_metric')
@@ -1131,12 +1573,12 @@ class TestRenewalScanOrphanDetection(unittest.TestCase):
     @patch.object(cm.cloudwatch_client, 'put_metric_data')
     @patch.object(cm.dynamodb_client, 'get_item')
     @patch('custom_domain_cert_manager.list_cert_meta_params')
-    def test_multiple_orphans_emit_single_summary_alert(
+    def test_multiple_orphans_emit_single_scan_metric(
         self, mock_list, mock_get, mock_cw, mock_provision, mock_sync,
         mock_failure_metric, mock_alert,
     ):
-        """Many orphans in one scan → one summary SNS, N metric publishes."""
-        del mock_cw, mock_sync, mock_provision
+        """Many orphans in one scan → one scan-level metric, no per-domain signals."""
+        del mock_sync, mock_provision
         expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
         mock_list.return_value = [
             {'Name': f'/nhp/certs/orphan{i}.com/meta', 'Value': json.dumps({
@@ -1149,13 +1591,10 @@ class TestRenewalScanOrphanDetection(unittest.TestCase):
         result = cm.renewal_scan()
 
         assert result['orphaned'] == 3
-        # Metric still fires per-orphan so the alarm reflects the true count.
-        assert mock_failure_metric.call_count == 3
-        # SNS publish is aggregated to a single message.
-        assert mock_alert.call_count == 1
-        msg = mock_alert.call_args[0][0]
-        for i in range(3):
-            assert f'orphan{i}.com' in msg
+        mock_failure_metric.assert_not_called()
+        mock_alert.assert_not_called()
+        assert _metric_values(mock_cw)[cm.CW_METRIC_RENEWAL_ORPHANED_CERTS] == 3
+        _assert_renewal_metric_dimensions(mock_cw)
 
 
 class TestTriggerCertSync(unittest.TestCase):
@@ -1501,13 +1940,15 @@ class TestVerifyDnsOwnership(unittest.TestCase):
     @patch('custom_domain_cert_manager.send_alert')
     @patch('custom_domain_cert_manager.update_domain_status')
     @patch.object(cm.dynamodb_client, 'get_item')
-    def test_ownership_failure_publishes_correct_metric(
+    def test_immediate_ownership_failure_publishes_per_domain_signals(
         self, mock_get, mock_status, mock_alert, mock_metric, mock_lock, mock_release
     ):
-        del mock_status, mock_alert, mock_lock  # @patch suppresses side effects only
+        del mock_status, mock_lock  # @patch suppresses side effects only
         mock_get.return_value = {}
         with self.assertRaises(cm.DnsOwnershipError):
             cm.provision_certificate("missing.com", "missing--com")
+        mock_alert.assert_called_once()
+        assert "missing.com" in mock_alert.call_args.args[0]
         mock_metric.assert_called_once_with(cm.FAILURE_DNS_OWNERSHIP)
         mock_release.assert_called_once_with("missing.com")
 

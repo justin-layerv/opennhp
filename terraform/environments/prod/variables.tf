@@ -17,6 +17,14 @@ variable "environment" {
   type = string
 }
 
+variable "cell_id" {
+  description = "Cell identifier for resource naming, tags, and per-cell alarm dimensions."
+  type        = string
+  default     = "cell0"
+  # Validation is enforced at module input boundaries; keep env files free of
+  # duplicate regex blocks.
+}
+
 variable "aws_region" {
   type = string
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
@@ -142,6 +143,7 @@ type TestConfig struct {
 	ASGClient    *autoscaling.Client
 	CWClient     *cloudwatch.Client
 	CWLogsClient *cloudwatchlogs.Client
+	DDBClient    *dynamodb.Client
 	ELBClient    *elasticloadbalancingv2.Client
 	SNSClient    *sns.Client
 }

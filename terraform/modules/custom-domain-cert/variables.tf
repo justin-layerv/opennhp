@@ -12,6 +12,16 @@ variable "environment" {
   type        = string
 }
 
+variable "cell_id" {
+  description = "Cell identifier for dimensioning renewal scan metrics"
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9]+(-[a-z0-9]+)*$", var.cell_id)) && length(var.cell_id) <= 32
+    error_message = "cell_id must be lowercase alphanumeric (max 32 chars) with optional internal single dashes (e.g., cell0, cell-01); leading/trailing dashes and double-dashes are rejected."
+  }
+}
+
 # ------------------------------------------------------------------------------
 # ACME Configuration
 # ------------------------------------------------------------------------------

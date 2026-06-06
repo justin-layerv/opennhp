@@ -4,6 +4,7 @@ This index is manually maintained and sorted by filename. Update it when a
 runbook file is added, renamed, or removed.
 
 - [Create a QURL via the API](create-qurl.md)
+- [Custom-domain cert DNS ownership alarms](custom-domain-cert-dns-ownership.md)
 - [Renew a LayerV-owned domain](domain-renewal.md)
 - [ECR cross-account replication failure](ecr-replication-failure.md)
 - [F5 revoked-pubkey alarm](f5-revoked-pubkey-paging.md)
