@@ -1011,6 +1011,87 @@ entry to Completed Entries only after `Status: Verified`.
   (CAA-completeness re-check + apex-TXT clobber re-check) are at-apply
   re-verifications owned by the rollout coordinator.
 
+### 2026-06-05 - PR #2341 - AC alarm dimension-mismatch fix (#968)
+
+- Ledger PR: [#2341](https://github.com/layervai/nhp/pull/2341)
+- Source PR / issue: [PR #2341](https://github.com/layervai/nhp/pull/2341) /
+  [issue #968](https://github.com/layervai/nhp/issues/968)
+- Component: `ac`, `terraform`
+- Task owner: prod rollout coordinator
+- Summary: three AC CloudWatch alarms (`registration_failure`,
+  `server_connection_failure`, `disk_usage_high`) had been silently
+  non-functional because their dimension set matched no published metric
+  stream. This PR makes the Go failure paths dual-publish a base counter at
+  `{Component, Environment, Region}`, points those two alarms at that set, and
+  drops `InstanceId` from `disk-monitor.sh` so `disk_usage_high` (and the
+  dashboard widget) match the `{Component=AC}` stream. `cert_sync_failures` was
+  already functional and is unchanged.
+- Pre-rollout tasks: none.
+- Rollout tasks:
+  - Standard `terraform apply` recreates the three alarms with their corrected
+    dimension sets. No ordering constraints.
+  - The `disk-monitor` SSM document content changes; the next scheduled
+    association run (30-min cadence) is the first to publish
+    `DiskUsagePercent` at `{Component=AC}` (no `InstanceId`).
+- Post-rollout tasks (alarm/metric verification — this is the whole point of
+  the PR, so verify rather than assume):
+  - Confirm the Go base-dim publish path exists in prod:
+    `AWS_PROFILE=layerv-prod aws cloudwatch list-metrics --namespace LayerV/NHP
+    --metric-name RegistrationSuccess` returns a stream whose dimensions are
+    exactly `{Component=AC, Environment=prod, Region=<prod-region>}`.
+  - Confirm `DiskUsagePercent` has a `{Component=AC}` stream and NO stream
+    carrying an `InstanceId` dim after the disk-monitor association re-runs.
+  - Confirm the three alarms are in `OK`/`ALARM` (not the historical
+    permanent-`OK`-on-no-data) by inducing or waiting for real data; the Tier 1
+    smoke fences `TestACAlarms_DimensionsMatchPublisher` and
+    `TestACAlarms_PublisherStreamsExistForAlarmDims` assert the contract and run
+    in the promote-to-prod smoke leg (report-only/burn-in).
+  - Calibration watch — `server_connection_failure` has NO lifecycle/transport
+    drop exclusion (unlike `registration_failure`), so connection `timeout`s feed
+    the base counter it watches during BOTH a server blue/green flip (timeouts to
+    torn-down old-color servers) AND an AC-side instance refresh (in-flight
+    `connectToServer` calls failing as the AC tears down). It also increments on
+    the ~90s periodic NLB re-registration path, so a single persistently-
+    unreachable assigned server produces steady-state fleet-wide increments.
+    Confirm neither the first sandbox blue/green flip nor a fleet instance refresh
+    pushes >10 `ServerConnectionFailure` across two consecutive 5-min windows
+    before treating that alarm as load-bearing; raise the threshold or
+    `evaluation_periods` if it cry-wolfs.
+  - Threshold scope — the base counters carry no `ACId`, so `Sum` aggregates
+    fleet-wide; the absolute thresholds (5 / 10) scale with fleet size, not per
+    AC. A fleet-size change (capacity bump) is therefore a re-calibration trigger,
+    not just the first flip. Thresholds for all three newly-live alarms are
+    unvalidated (they never fired before #968).
+  - Day-1 false-page option (coordinator choice) — to avoid a brand-new alarm
+    crying wolf on the first refresh before a baseline exists, the coordinator MAY
+    stage `server_connection_failure` (and optionally `registration_failure`) with
+    its SNS action removed, or a deliberately high initial threshold, until the
+    first sandbox flip is observed, then dial in. Note `registration_failure`'s
+    day-1 exposure is already low: as of #968 the dominant flip-time transient
+    (transaction `timeout`) is dropped off its alarmable counter, so only genuine
+    server-side rejections feed it. `server_connection_failure` is the residual
+    risk (timeouts there cannot be dropped without losing real-outage detection —
+    a sustained reach failure is the fault, distinguished only by the threshold).
+  - All-timeout outage detection — because timeout-classified registration
+    response errors now drop (breakdown only), a "servers all timing out"
+    condition no longer feeds `registration_failure`; it is detected by
+    `registration_stale` instead (`RegistrationSuccess < 1` Sum over two 5-min
+    periods, `treat_missing_data=breaching` → fires after ~10 min with no
+    success). Confirm that 10-min window is acceptable as the sole detector for
+    that case.
+- Rollback tasks:
+  - Revert the PR and re-apply. The alarms revert to their prior dimension
+    sets; this is harmless because those alarms were already non-functional
+    before this PR (no monitoring is lost relative to the pre-PR baseline).
+- Follow-ups / deferred tasks:
+  - [issue #946](https://github.com/layervai/nhp/issues/946) remains for the
+    separate `ServersHealthy` gauge work — out of scope here.
+- Status: Open
+- Status note: post-rollout verification owns confirming the alarms are now
+  load-bearing.
+- Completed date:
+- Evidence:
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries

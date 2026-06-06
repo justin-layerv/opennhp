@@ -4,6 +4,17 @@
 
 # ==================== CloudWatch Alarms ====================
 
+# DELIBERATE `{Component = "AC"}` dim set (do NOT "upgrade" to the
+# {Component, Environment, Region} set the Go-published alarms use):
+# DiskUsagePercent is published by the user_data bash script
+# (terraform/modules/ac/scripts/disk-monitor.sh) via the
+# `aws cloudwatch put-metric-data` CLI with `{Component = "AC"}` only —
+# the bash path has no Environment/Region dims (terraform/CLAUDE.md
+# "Metric / Alarm Dim-Set Rules" exempts CLI-published metrics). The
+# script previously also tagged InstanceId, which made this alarm and the
+# dashboard widget watch a non-existent {Component=AC} stream — fixed in
+# #968 by dropping InstanceId so the fleet aggregates into one stream and
+# `statistic = Maximum` pages on the worst instance's disk usage.
 resource "aws_cloudwatch_metric_alarm" "disk_usage_high" {
   count = var.enable_ssm_maintenance && var.enable_cloudwatch_alarms ? 1 : 0
 
@@ -15,7 +26,7 @@ resource "aws_cloudwatch_metric_alarm" "disk_usage_high" {
   period              = 900 # 15 minutes
   statistic           = "Maximum"
   threshold           = var.disk_usage_threshold_percent
-  alarm_description   = "Disk usage exceeds ${var.disk_usage_threshold_percent}% on AC instances"
+  alarm_description   = "Disk usage exceeds ${var.disk_usage_threshold_percent}% on AC instances. Metric is fleet-aggregated ({Component=AC}, statistic=Maximum) so it does not name the instance — for per-instance attribution pull the disk-monitor SSM run-command output (it echoes Instance/Disk usage), or query the AC fleet's df via SSM."
   treat_missing_data  = "notBreaching"
 
   dimensions = {
@@ -31,15 +42,24 @@ resource "aws_cloudwatch_metric_alarm" "disk_usage_high" {
   })
 }
 
-# NOTE: This alarm and `server_connection_failure` below intentionally use the
-# loose `{Component = "AC"}` dimension set rather than the full
-# `{Component, Environment, Region}` set that the newer registration health
-# alarms use. The reason is historical: these counters were emitted via the AC
-# publisher BEFORE the publisher was given Environment/Region dimensions, so
-# the loose dimension set is the only metric stream that has data going back
-# in time. Aligning them with the full dimension set is tracked as cleanup
-# follow-up work — see issue #239 — and would lose historical alarm continuity
-# if done in this PR.
+# Dim set MUST be the AC publisher base set [Component, Environment, Region]:
+# CloudWatch alarms select a stream by exact dimension match. RegistrationFailure
+# was historically published ONLY with extra dims (ACId, ErrorCode), so this
+# alarm watched a {Component=AC} stream that never existed and sat in permanent
+# OK (treat_missing_data=notBreaching) for months. Fixed in #968:
+# recordRegistrationFailure (endpoints/ac/registration.go) now dual-publishes an
+# unbreakdown base counter at exactly these three dims, while the ErrorCode/ACId
+# breakdown stream remains queryable for dashboards.
+#
+# The base counter this alarm watches counts ONLY page-worthy server-side
+# rejections (error response, NHP_AAK ErrCode, Registered=false). Lifecycle and
+# transport drops (canceled / timeout / stopped) go to the breakdown stream only
+# (recordRegistrationDrop) so the alarm does not false-fire on the failure burst
+# every instance refresh / blue/green flip produces. A total "AC can't reach any
+# server" outage is covered by registration_stale (absence of RegistrationSuccess)
+# and servers_healthy_low, not by this counter. NOTE: this alarm has never fired
+# before — its threshold (Sum>5 over one 5-min period) is unvalidated; calibrate
+# against the post-#968 sandbox baseline before treating it as load-bearing.
 resource "aws_cloudwatch_metric_alarm" "registration_failure" {
   count = var.enable_cloudwatch_alarms ? 1 : 0
 
@@ -55,7 +75,9 @@ resource "aws_cloudwatch_metric_alarm" "registration_failure" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    Component = "AC"
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
   }
 
   alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
@@ -80,8 +102,26 @@ resource "aws_cloudwatch_metric_alarm" "server_connection_failure" {
   alarm_description   = "AC server connection failures exceeded 10 in 10 minutes (2 consecutive periods)"
   treat_missing_data  = "notBreaching"
 
+  # Base dim set — see registration_failure above. recordServerConnectionFailure
+  # dual-publishes the unbreakdown base counter at these three dims (#968).
+  #
+  # Asymmetry vs registration_failure (intentional): this counter has NO
+  # lifecycle/transport drop exclusion — every connectToServer failure, incl.
+  # classifyError -> "timeout", is alarmable. A sustained inability to reach
+  # assigned servers IS the fault this alarm targets, so the exclusion machinery
+  # the registration path uses is deliberately absent. Note that means BOTH a
+  # server blue/green flip (timeouts to torn-down old-color servers) AND an
+  # AC-side instance refresh (in-flight connectToServer calls failing as the AC
+  # tears down — their errors are demoted to Debug but still record this metric)
+  # feed this counter. The Sum>10-over-2-consecutive-periods threshold (vs
+  # registration's Sum>5/1 period) is meant to ride both out. CALIBRATION: this
+  # alarm has never fired; confirm neither the first sandbox blue/green flip nor
+  # a fleet instance refresh pushes >10 across two 5-min windows before treating
+  # it as load-bearing (see #968 ledger entry).
   dimensions = {
-    Component = "AC"
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
   }
 
   alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
@@ -121,8 +161,11 @@ resource "aws_cloudwatch_metric_alarm" "udp_handler_panic" {
   # alarms select streams by exact dimension match, and a partial set
   # silently lands in INSUFFICIENT_DATA forever. The publisher is
   # guaranteed to emit all three dims because NewACRegistration hard-fails
-  # without AWS_REGION (#1659). Older partial-set alarms in this file are
-  # tracked in #239.
+  # without AWS_REGION (#1659). The registration_failure /
+  # server_connection_failure alarms above were fixed to this same set in
+  # #968; the only remaining {Component=AC} alarms (disk_usage_high,
+  # cert_sync_failures) are bash/CLI-published and intentionally use that
+  # narrower set (terraform/CLAUDE.md "Metric / Alarm Dim-Set Rules").
   dimensions = {
     Component   = "AC"
     Environment = var.environment
@@ -147,6 +190,12 @@ resource "aws_cloudwatch_metric_alarm" "cert_sync_failures" {
   evaluation_periods  = 1
   metric_name         = "CertSyncFailures"
   namespace           = "LayerV/NHP"
+  # DELIBERATE {Component=AC} set (do NOT add Environment/Region):
+  # CertSyncFailures is published by custom-domain-cert-sync.sh via the
+  # `aws cloudwatch put-metric-data` CLI with {Component=AC} only — the
+  # bash path carries no Environment/Region dims and this alarm has always
+  # matched it (it was the one of the four #968 audited that was already
+  # functional). terraform/CLAUDE.md exempts CLI-published metrics.
   dimensions = {
     Component = "AC"
   }
@@ -166,27 +215,24 @@ resource "aws_cloudwatch_metric_alarm" "cert_sync_failures" {
 
 # ==================== EIP Pool Monitoring ====================
 #
-# Dimension schema note: the EIP alarms below use [Component, Environment]
-# while the existing alarms above (disk_usage_high, registration_failure,
-# server_connection_failure, cert_sync_failures) use [Component] only.
+# Dimension schema note: every AC alarm now keys on exactly the dim set its
+# publisher emits — CloudWatch alarms select a stream by exact dimension match,
+# so this is a correctness requirement, not a style choice. The conventions:
 #
-# This is intentional but inconsistent. The EIP metrics are published from
-# user_data.sh.tpl with both Component AND Environment dimensions
-# (search for `MetricName=EIPClaimSuccess` in user_data.sh.tpl), so the
-# alarms must match that exact set or they would never fire. The existing
-# Go-side metrics (RegistrationFailure, ServerConnectionFailure, etc.) use
-# the older publishing convention and the alarms above match THEIR set.
+#   - Go-published metrics (RegistrationFailure, ServerConnectionFailure,
+#     RegistrationSuccess, UDPHandlerPanic, ...) carry the publisher base set
+#     [Component, Environment, Region] — see endpoints/ac/registration.go
+#     ::acBaseDims. Their alarms list all three. (#968 fixed the last two
+#     that lagged this convention.)
+#   - EIP metrics published from user_data.sh.tpl carry [Component, Environment]
+#     (search `MetricName=EIPClaimSuccess`); the EIP alarms below match that.
+#   - Pure-CLI metrics from the maintenance bash scripts (DiskUsagePercent,
+#     CertSyncFailures) carry [Component] only; their alarms match that
+#     (terraform/CLAUDE.md "Metric / Alarm Dim-Set Rules" exempts these).
 #
-# Unifying the schema would require either:
-#   1. Adding Environment to the Go-side IncrCounter calls AND adding it
-#      to the existing alarms in the same change (so the alarms keep
-#      matching), OR
-#   2. Removing Environment from the EIP user_data publishes AND from the
-#      EIP alarms (loses per-environment isolation when multiple envs
-#      share an account)
-#
-# Both are out of scope for this PR. Tracked in issue #946 alongside the
-# RegistrationSuccess dimension-mismatch follow-up.
+# The split is per-publisher, not arbitrary. Issue #946 tracks the remaining
+# registration-health observability work (a ServersHealthy gauge), not a
+# dimension-schema unification — there is no unification left to do.
 
 # Alarm: EIP pool utilization exceeds threshold (default 80%) for 15 min.
 # Fires when pool usage is SUSTAINED high, warning before exhaustion blocks
@@ -691,15 +737,22 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
         properties = {
           title  = "AC Registration Events"
           region = data.aws_region.current.id
-          # RegistrationSuccess is emitted twice by recordRegistrationSuccess:
-          # once via IncrCounter (base dims, matched here) and once via
-          # IncrCounterWithDims with a RegistrationType breakdown.
-          # RegistrationFailure is only emitted with extra ACId dimension —
-          # use a SEARCH expression so the widget aggregates across all ACs
-          # without hard-coding instance IDs.
+          # Both lines read the publisher base-dim stream
+          # {Component, Environment, Region} directly: RegistrationSuccess and (as
+          # of #968) RegistrationFailure each dual-publish an unbreakdown base
+          # counter, so a single fleet-wide stream exists for each without
+          # hard-coding ACs. This replaces a prior
+          # SEARCH('{...,Component,Environment,Region,ACId}') for Failure that
+          # never matched: the breakdown stream carries ACId AND ErrorCode (5 dim
+          # names), and CloudWatch SEARCH matches the exact dimension-name set, so
+          # the 4-name schema returned nothing and the Failure line was blank. The
+          # Failure line is the alarmable count — lifecycle/transport drops
+          # (canceled/timeout/stopped) are excluded from the base counter (see
+          # recordRegistrationFailure); the per-ErrorCode breakdown remains
+          # queryable ad hoc.
           metrics = [
             ["LayerV/NHP", "RegistrationSuccess", "Component", "AC", "Environment", var.environment, "Region", data.aws_region.current.id, { "stat" : "Sum", "label" : "Success" }],
-            [{ "expression" : "SUM(SEARCH('{LayerV/NHP,Component,Environment,Region,ACId} MetricName=\"RegistrationFailure\" Component=\"AC\" Environment=\"${var.environment}\" Region=\"${data.aws_region.current.id}\"', 'Sum', 300))", "label" : "Failure", "id" : "regfail" }]
+            ["LayerV/NHP", "RegistrationFailure", "Component", "AC", "Environment", var.environment, "Region", data.aws_region.current.id, { "stat" : "Sum", "label" : "Failure" }]
           ]
           view    = "timeSeries"
           stacked = false

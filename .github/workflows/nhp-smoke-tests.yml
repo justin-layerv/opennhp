@@ -209,10 +209,10 @@ jobs:
               # real-test prefixes — catches both directions of
               # silent skip. Add a new test prefix → run the script
               # locally → it prints the missing token before CI does.
-              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|PublicALB|ResolveOrigin)_'
+              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|PublicALB|ResolveOrigin)_'
               ;;
             tier1+tier2)
-              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|QurlRouterAuthzGate|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
+              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|QurlRouterAuthzGate|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
               ;;
             tier3-no-ssm)
               # The Test<Prefix>_ tokens listed are exactly the
@@ -230,7 +230,7 @@ jobs:
               # requires updating tier3_no_ssm_expected_omissions
               # there; adding a non-SSM test requires adding the
               # token here. The script fails CI on either omission.
-              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|QurlRouterAuthzGate|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
+              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|QurlRouterAuthzGate|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
               ;;
             all)
               RUN_FILTER=''

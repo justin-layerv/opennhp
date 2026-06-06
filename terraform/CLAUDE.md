@@ -309,15 +309,24 @@ for this rule.
 - **New AC alarms must mirror the publisher's dim set.** When adding a new
   Region-keyed alarm, audit the metric's emit path and confirm it lands on
   `IncrCounter` / `IncrCounterWithDims` with the publisher base dims. If a
-  metric is emitted with extra dims (e.g., `ACId` on failure metrics), the
-  alarm must either match all dims exactly, use a SEARCH expression (what
-  the registration-event widgets do), or aggregate via `MetricMath` to
-  collapse the extra dim into a fleet-wide series.
+  metric is only emitted with extra dims (e.g., `ACId`/`ErrorCode` on the
+  failure metrics), the alarm cannot match it — the cleanest fix is to
+  dual-publish: a base `IncrCounter(name)` for the alarm PLUS the
+  `IncrCounterWithDims` breakdown for dashboards (the
+  `recordRegistrationSuccess` / `recordRegistrationFailure` /
+  `recordServerConnectionFailure` helpers in `endpoints/ac/registration.go`).
+  Alternatives: match all extra dims exactly, use a SEARCH expression (what
+  the registration-event widgets do), or aggregate via `MetricMath`.
 
-- **Older AC alarms with the partial-set bug** (`registration_failure`,
-  `server_connection_failure`) are tracked in issue #239. Don't add new
-  alarms in that style; the `servers_healthy_low` / `registration_stale`
-  block is the correct precedent.
+- **The `registration_failure` / `server_connection_failure` partial-set bug
+  is fixed** (#968): both now dual-publish a base counter and their alarms key
+  on `{Component, Environment, Region}`. The `servers_healthy_low` /
+  `registration_stale` / dual-publish block is the correct precedent for new
+  Go-side alarms. `disk_usage_high` and `cert_sync_failures` intentionally
+  stay at `{Component}` because they are CLI-published from the maintenance
+  bash scripts (exempt, per the top of this section). Issue #239 (the original
+  tracking issue) is closed; #946 is now scoped to the remaining
+  `ServersHealthy` gauge work, not a dimension-schema cleanup.
 
 - **`MetricACConnEviction` baseline shifted at PR #1968.** Pre-#1968 the
   metric fired on *any* FIFO eviction, which included a steady stream

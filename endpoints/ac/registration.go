@@ -600,6 +600,143 @@ func (r *ACRegistration) recordRegistrationSuccess(regType *string) {
 	})
 }
 
+// recordRegistrationBreakdown emits the per-ErrorCode/ACId breakdown stream for
+// MetricRegistrationFailure. This stream carries the extra dims (ACId, ErrorCode)
+// and is for dashboards/analysis — it is NOT the stream the registration_failure
+// alarm watches (that is the base counter at [Component, Environment, Region]).
+// Shared by both recordRegistrationFailure (alarmable) and recordRegistrationDrop
+// (non-alarmable); on its own it says nothing about alarmability.
+func (r *ACRegistration) recordRegistrationBreakdown(errorCode *string) {
+	r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
+		r.acIdDimension(),
+		{Name: dimNameErrorCode, Value: errorCode},
+	})
+}
+
+// recordRegistrationFailure records a registration failure that SHOULD page —
+// a server-side rejection or error on an actual NHP_AOL response (the server
+// returned an error response, an NHP_AAK ErrCode, or Registered=false). It
+// dual-publishes:
+//   - an unbreakdown base counter at the publisher base dim set
+//     [Component, Environment, Region] — the stream the registration_failure
+//     alarm evaluates, and
+//   - the ErrorCode/ACId breakdown counter for dashboards.
+//
+// CloudWatch alarms select a stream by exact dimension match, so before #968
+// (no base counter) the alarm watched a never-published stream and sat in
+// permanent OK (treat_missing_data=notBreaching) even while registrations were
+// failing. The base counter is what makes the alarm able to fire.
+//
+// Transport/lifecycle drops (our own shutdown "canceled", a no-response
+// "timeout", or "stopped") are recorded via recordRegistrationDrop (breakdown
+// only) instead: they are not page-worthy and burst during every instance
+// refresh / blue/green flip, which with the alarm's Sum>5-over-one-period config
+// would guarantee false pages. A genuine "AC can't reach any server" outage is
+// still caught — registration_stale alarms on the ABSENCE of RegistrationSuccess
+// and servers_healthy_low on the connected-server count.
+func (r *ACRegistration) recordRegistrationFailure(errorCode *string) {
+	r.metrics.IncrCounter(MetricRegistrationFailure)
+	r.recordRegistrationBreakdown(errorCode)
+}
+
+// recordRegistrationDrop records a non-alarmable registration drop: it emits the
+// ErrorCode/ACId breakdown stream ONLY (no base counter), so it stays out of the
+// registration_failure alarm while remaining queryable for accounting and
+// dashboards. Used for lifecycle/transport outcomes (canceled, timeout, stopped)
+// that fire in bursts during AC teardown and blue/green flips. See
+// recordRegistrationFailure for the alarmable counterpart and why the split
+// exists (#968).
+func (r *ACRegistration) recordRegistrationDrop(errorCode *string) {
+	r.recordRegistrationBreakdown(errorCode)
+}
+
+// teardownRegistrationDropCodes is the explicit allow-list of teardown ErrorCode
+// values that classifyResponseError can return and that are NOT page-worthy.
+// recordRegistrationOutcomeByCode drops any code in this set and routes every
+// other code to the alarmable path. That fail-safe default is the point: if a
+// future change makes classifyResponseError return a new page-worthy code, it
+// stays visible to the registration_failure alarm instead of silently landing
+// breakdown-only and re-introducing the #968 non-functional-alarm bug class.
+//
+// Only "stopped" is here because classifyResponseError is the sole producer
+// routed through recordRegistrationOutcomeByCode (it returns "" or "stopped"
+// today). The register() select records its statically-known "canceled"/"timeout"
+// drops directly via recordRegistrationDrop, and the ppd.Error path is always
+// alarmable (a response WAS received) — neither flows through this set.
+var teardownRegistrationDropCodes = map[string]struct{}{
+	"stopped": {},
+}
+
+// recordRegistrationOutcomeByCode routes a classifyResponseError-derived
+// ErrorCode to the breakdown-only drop stream (if it is a known teardown code)
+// or the alarmable base counter (everything else, including a future code).
+// Scoped to classifyResponseError specifically: its output is the only
+// classification routed through the teardown-code set. The ppd.Error path uses
+// recordResponseError (timeout = drop, real error = alarmable), and server-
+// controlled or explicit-failure codes (NHP_AAK ErrCode, "registered_false")
+// call recordRegistrationFailure directly so a server value can never masquerade
+// as a teardown drop.
+func (r *ACRegistration) recordRegistrationOutcomeByCode(code string) {
+	if _, isDrop := teardownRegistrationDropCodes[code]; isDrop {
+		r.recordRegistrationDrop(aws.String(code))
+		return
+	}
+	r.recordRegistrationFailure(aws.String(code))
+}
+
+// recordResponseError records the failure for a non-nil PacketParserData.Error
+// on the NHP_AOL response path. It distinguishes the two ways that error arises:
+//
+//   - A transaction-layer TIMEOUT, where no response was actually received: the
+//     transaction's defer fabricates a PPD carrying common.ErrTransactionFailedByTimeout
+//     (nhp/core/transaction.go) after the ~4.7s local-transaction timer fires —
+//     which beats register()'s 30s RegistrationTimeout select, so this, not the
+//     regTimer.C branch, is the path a blue/green-flip / unreachable-server
+//     timeout actually takes. It is a transport drop (breakdown only, NOT
+//     alarmable) so it can't false-page registration_failure on flips; a true
+//     "AC can't reach any server" outage is still caught by registration_stale.
+//   - Any OTHER error is a genuine server-returned error response and is
+//     alarmable.
+//
+// Type-checked via errors.Is rather than the classifyError string so a genuine
+// server error that merely classifies as "timeout" still pages.
+func (r *ACRegistration) recordResponseError(err error) {
+	if errors.Is(err, common.ErrTransactionFailedByTimeout) {
+		r.recordRegistrationDrop(aws.String("timeout"))
+		return
+	}
+	r.recordRegistrationFailure(aws.String(classifyError(err)))
+}
+
+// recordServerConnectionBreakdown emits the per-ErrorCode/ACId breakdown stream
+// for MetricServerConnectionFailure (for dashboards/analysis). The counterpart
+// of recordRegistrationBreakdown; there is no drop variant because every
+// connectToServer failure is alarmable (see recordServerConnectionFailure).
+func (r *ACRegistration) recordServerConnectionBreakdown(errorCode *string) {
+	r.metrics.IncrCounterWithDims(MetricServerConnectionFailure, []types.Dimension{
+		r.acIdDimension(),
+		{Name: dimNameErrorCode, Value: errorCode},
+	})
+}
+
+// recordServerConnectionFailure emits a MetricServerConnectionFailure counter,
+// broken down by ErrorCode and ACId, plus an unbreakdown base counter so the
+// server_connection_failure alarm (keyed on [Component, Environment, Region])
+// has a matching stream. Same rationale as recordRegistrationFailure (#968).
+// Unlike registration there is no drop exclusion: every connectToServer failure
+// is alarmable, including the in-flight failures during an AC instance refresh,
+// which the Sum>10-over-2-periods threshold is meant to ride out.
+//
+// Concurrency: the per-server connect attempts run on separate goroutines and
+// each publisher call takes the publisher mutex, so individual increments are
+// race-safe. The base and breakdown writes are two separate increments, not one
+// atomic unit — at a flush snapshot the base total and the breakdown sum can
+// differ by in-flight increments. That is harmless for alarming and accounting.
+func (r *ACRegistration) recordServerConnectionFailure(errorCode *string) {
+	r.metrics.IncrCounter(MetricServerConnectionFailure)
+	r.recordServerConnectionBreakdown(errorCode)
+}
+
 // ACRegistration manages AC registration with NHP servers.
 //
 // New public state-mutating methods on this type must add an
@@ -1301,17 +1438,18 @@ func (r *ACRegistration) register() error {
 	select {
 	case <-r.stopCh:
 		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
-		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
-			r.acIdDimension(),
-			{Name: dimNameErrorCode, Value: aws.String("canceled")},
-		})
+		// Statically-known lifecycle drop (AC shutting down) — breakdown only.
+		r.recordRegistrationDrop(aws.String("canceled"))
 		return errors.New("registration canceled")
 	case <-regTimer.C:
 		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
-		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
-			r.acIdDimension(),
-			{Name: dimNameErrorCode, Value: aws.String("timeout")},
-		})
+		// Backstop only: this 30s RegistrationTimeout is almost always beaten by
+		// the ~4.7s local-transaction timeout, which arrives on ResponseMsgCh as
+		// ErrTransactionFailedByTimeout and is dropped by recordResponseError. This
+		// branch covers the rare case the transaction timer didn't fire. Transport
+		// drop (no response) — breakdown only; registration_stale covers a true
+		// reach-nothing outage.
+		r.recordRegistrationDrop(aws.String("timeout"))
 		return errors.New("registration timeout")
 	case ppd := <-md.ResponseMsgCh:
 		err := r.handleRegistrationResponse(ppd, registrationPeer)
@@ -1325,10 +1463,12 @@ func (r *ACRegistration) register() error {
 			// wrap-and-return paths (e.g., NHP_ARD's fmt.Errorf "failed
 			// to handle redispatch") still leak attempts; #1672 tracks
 			// closing those gaps.
-			r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
-				r.acIdDimension(),
-				{Name: dimNameErrorCode, Value: aws.String(code)},
-			})
+			//
+			// Routed by code, not hardcoded: classifyResponseError returns
+			// "stopped" (a teardown drop) today, but if it ever returns a
+			// page-worthy code, recordRegistrationOutcomeByCode defaults it
+			// to alarmable rather than silently dropping it (#968 fail-safe).
+			r.recordRegistrationOutcomeByCode(code)
 		}
 		return err
 	}
@@ -1345,12 +1485,13 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 	if ppd.Error != nil {
 		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 
-		// Send registration failure metric with error category (not raw message)
-		// to keep dimension cardinality bounded.
-		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
-			r.acIdDimension(),
-			{Name: dimNameErrorCode, Value: aws.String(classifyError(ppd.Error))},
-		})
+		// Record the failure with a bounded error category. A transaction-layer
+		// timeout arrives here as ErrTransactionFailedByTimeout (no response was
+		// received — the transaction defer fabricated this PPD), which is the
+		// dominant flip-time / unreachable-server transient and must NOT page;
+		// recordResponseError drops it (breakdown only) and alarms genuine
+		// server-returned error responses. See recordResponseError.
+		r.recordResponseError(ppd.Error)
 
 		return fmt.Errorf("registration failed: %w", ppd.Error)
 	}
@@ -1403,10 +1544,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			if errCode == "" {
 				errCode = "unknown"
 			}
-			r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
-				r.acIdDimension(),
-				{Name: dimNameErrorCode, Value: aws.String(errCode)},
-			})
+			r.recordRegistrationFailure(aws.String(errCode))
 
 			return fmt.Errorf("registration rejected: %s - %s", aakMsg.ErrCode, aakMsg.ErrMsg)
 		}
@@ -1415,10 +1553,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 
 			// Send registration failure metric for server-side rejection.
-			r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
-				r.acIdDimension(),
-				{Name: dimNameErrorCode, Value: aws.String("registered_false")},
-			})
+			r.recordRegistrationFailure(aws.String("registered_false"))
 
 			return errors.New("server returned NHP_AAK with Registered=false")
 		}
@@ -1814,10 +1949,7 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 				log.Warning("Failed to connect to assigned server %s: %v", s.Target.Address(), err)
 
 				// Track individual connection failures for alerting on partial connectivity.
-				r.metrics.IncrCounterWithDims(MetricServerConnectionFailure, []types.Dimension{
-					r.acIdDimension(),
-					{Name: dimNameErrorCode, Value: aws.String(classifyError(err))},
-				})
+				r.recordServerConnectionFailure(aws.String(classifyError(err)))
 			} else {
 				atomic.AddInt32(&successCount, 1)
 			}

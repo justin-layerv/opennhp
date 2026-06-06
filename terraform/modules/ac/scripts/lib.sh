@@ -31,7 +31,11 @@ retry_with_backoff() {
 
 # publish_cw_metric — Publish a single CloudWatch metric to the LayerV/NHP namespace.
 #   Usage: publish_cw_metric <metric_name> <value> [unit] [dimensions]
-#   Example: publish_cw_metric "DiskUsagePercent" "85" "Percent" "Component=AC,InstanceId=i-123"
+#   Example: publish_cw_metric "CertSyncFailures" "0" "Count" "Component=AC"
+#   Note: CloudWatch alarms match a metric stream by its EXACT dimension set, so
+#   choose dims deliberately. Do NOT add a per-instance dim (e.g. InstanceId) to a
+#   metric a fleet-wide {Component=AC} alarm watches — that splits it onto
+#   per-instance streams the alarm never sees (the #968 DiskUsagePercent bug).
 #   Requires: AWS CLI. Uses $REGION if set, falls back to us-east-1.
 #   Fails silently if aws CLI unavailable or put-metric-data fails.
 publish_cw_metric() {

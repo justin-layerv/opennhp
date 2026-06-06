@@ -20,15 +20,25 @@ echo "Instance: $INSTANCE_ID"
 echo "Disk usage: $DISK_USAGE%"
 echo "Threshold: $THRESHOLD%"
 
-# Publish metric to CloudWatch (unified namespace with Go app metrics)
+# Publish metric to CloudWatch (unified namespace with Go app metrics).
+#
+# Dimension set is {Component=AC} ONLY — deliberately no InstanceId. The
+# disk_usage_high alarm and the dashboard widget both read {Component=AC};
+# tagging InstanceId here put every instance on its own per-instance stream,
+# so the {Component=AC} stream the alarm/widget watch never existed and the
+# alarm sat in permanent OK (issue #968). With InstanceId dropped, the fleet
+# aggregates into one stream and `statistic = Maximum` on the alarm pages on
+# the worst instance's disk usage. Per-instance identification is still
+# available from this script's echo output captured by SSM run-command — the
+# InstanceId CW dimension was not consumed by any alarm or dashboard.
 if declare -f publish_cw_metric &>/dev/null; then
-  publish_cw_metric "DiskUsagePercent" "$DISK_USAGE" "Percent" "Component=AC,InstanceId=$INSTANCE_ID"
+  publish_cw_metric "DiskUsagePercent" "$DISK_USAGE" "Percent" "Component=AC"
 else
   aws cloudwatch put-metric-data \
     --region "$REGION" \
     --namespace "LayerV/NHP" \
     --metric-name "DiskUsagePercent" \
-    --dimensions Component=AC,InstanceId="$INSTANCE_ID" \
+    --dimensions Component=AC \
     --value "$DISK_USAGE" \
     --unit Percent
 fi
