@@ -196,8 +196,9 @@ type License struct {
 	// warning and accepts (so the gate can roll out without breaking
 	// existing deployments); strict mode rejects with 52013 so
 	// operators can't quietly keep shipping unbound licenses once the
-	// gate is flipped. Populate via the console / admin tooling
-	// (separate workstream — follow-up issue on provisioning UX).
+	// gate is flipped. Populate with the nhp-license-admin CLI
+	// (endpoints/licenseadmin/main, #1262); strict-flip runbook at
+	// docs/runbooks/license-pubkey-strict-flip.md.
 	//
 	// Canonical encoding: entries MUST be padded standard base64
 	// (RFC 4648 §4 — alphabet A-Z a-z 0-9 + /, with = padding). The
@@ -207,8 +208,8 @@ type License struct {
 	// with leading/trailing whitespace will NOT match a legitimate
 	// registration and the AC will be rejected with
 	// ErrLicensePubkeyMismatch — indistinguishable from an actual
-	// attack. Admin tooling / provisioning UX must enforce this at
-	// write-time (tracked in #1262).
+	// attack. nhp-license-admin enforces this canonical encoding at
+	// write time (see licenseadmin.CanonicalizeBoundPubKey, #1262).
 	BoundPubKeys []string `json:"bound_pubkeys,omitempty" dynamodbav:"bound_pubkeys,omitempty"`
 }
 

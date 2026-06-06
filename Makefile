@@ -81,6 +81,7 @@ generate-version-and-build:
 	@$(MAKE) acd
 	@$(MAKE) serverd
 	@$(MAKE) db
+	@$(MAKE) licenseadmin
 	@$(MAKE) linuxagentsdk
 	@$(MAKE) androidagentsdk
 	@$(MAKE) macosagentsdk
@@ -125,6 +126,12 @@ db:
 	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-db/nhp-db ./db/main/main.go && \
 	mkdir -p ../release/nhp-db/etc; \
 	cp ./db/main/etc/*.toml ../release/nhp-db/etc/
+
+licenseadmin:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-license-admin... $(END_COLOUR)"
+	cd endpoints && \
+	mkdir -p ../release/nhp-license-admin && \
+	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-license-admin/nhp-license-admin ./licenseadmin/main/
 
 linuxagentsdk:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building Linux agent SDK... $(END_COLOUR)"
@@ -534,4 +541,4 @@ archive:
 	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server
 	@echo "$(COLOUR_GREEN)[OpenNHP] Package ${PACKAGE_FILE} archived!$(END_COLOUR)"
 
-.PHONY: all generate-version-and-build init agentd acd serverd db linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-smoke-sandbox test-smoke-prod test-all fuzz fuzz-quick archive ebpf clean_ebpf
+.PHONY: all generate-version-and-build init agentd acd serverd db licenseadmin linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-smoke-sandbox test-smoke-prod test-all fuzz fuzz-quick archive ebpf clean_ebpf

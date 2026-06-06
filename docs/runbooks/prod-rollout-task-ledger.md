@@ -1283,6 +1283,49 @@ entry to Completed Entries only after `Status: Verified`.
   singleton precondition must be resolved before the prod apply; `require_mfa`
   attachment is a post-rollout task tracked in [#2351](https://github.com/layervai/nhp/issues/2351).
 
+### 2026-06-06 - PR #2375 - License.BoundPubKeys provisioning tooling (nhp-license-admin)
+
+- Ledger PR: [#2375](https://github.com/layervai/nhp/pull/2375)
+- Source PR / issue: [PR #2375](https://github.com/layervai/nhp/pull/2375) /
+  [issue #1262](https://github.com/layervai/nhp/issues/1262)
+- Component: `endpoints/licenseadmin` (new operator CLI), `nhp-licenses`
+  DynamoDB table (data writes only; no table/IaC/schema change)
+- Task owner: prod rollout coordinator
+- Pre-rollout tasks:
+  - None for this PR's merge. It ships an operator CLI + runbook + docstring
+    edits only — no `server`/`ac`/`agent` behavior change, no deploy, no flag
+    flip, no migration. The `nhp-license-admin` binary is built by `make` but
+    intentionally excluded from the release `archive` target.
+- Rollout tasks:
+  - None at merge. The downstream prod activity this PR enables — provision
+    `License.BoundPubKeys` for all live licenses, then flip
+    `NHP_LICENSE_PUBKEY_VERIFY=true` (permit→strict) — is a separate, future
+    rollout governed by `docs/runbooks/license-pubkey-strict-flip.md` and must
+    NOT be performed as part of merging this PR.
+- Post-rollout tasks:
+  - None for this PR.
+- Rollback tasks:
+  - None — no deployed artifact changes. `BoundPubKeys` rows written later by
+    the tool are inert in permit mode; the strict-flip rollback (unset
+    `NHP_LICENSE_PUBKEY_VERIFY`) is documented in the runbook.
+- Follow-ups / deferred tasks:
+  - The eventual strict flip is coordinated alongside
+    [#1514](https://github.com/layervai/nhp/issues/1514). NOTE: #1514 gates a
+    DIFFERENT env var (`NHP_LICENSE_ACID_CUSTOMER_VERIFY`, the F4 CustomerID
+    gate); the pubkey-gate flip this PR enables is `NHP_LICENSE_PUBKEY_VERIFY`,
+    governed by the new runbook. Pre-flip precondition: `LicensePubkeyUnbound`
+    = 0 across all ingress for 7 days.
+  - Durable audit sink: [#2392](https://github.com/layervai/nhp/issues/2392).
+    Deprecated AWS endpoint-resolver migration: [#2391](https://github.com/layervai/nhp/issues/2391).
+    Build-tagged-test CI compile-check: [#2396](https://github.com/layervai/nhp/issues/2396).
+  - etcd backend not covered by the tool (DynamoDB only).
+- Status: Deferred
+- Status note: This PR creates no merge-time prod task; the provisioning +
+  strict-flip rollout is deferred to the runbook-governed workstream in the
+  follow-ups above.
+- Completed date:
+- Evidence:
+
 <!-- New active entries go immediately ABOVE this comment, newest last. Keep this comment in place. -->
 
 ## Completed Entries

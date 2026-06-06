@@ -97,10 +97,11 @@ import (
 // Operators reading the strict-mode mismatch counter would see
 // exactly the same signal as an actual attack. Correct rotation
 // order MUST be codified in the rollout runbook alongside the
-// unbound-counter-drains-before-flipping-strict precondition;
-// the runbook is tracked in the provisioning workstream (#1262) —
-// that issue's acceptance criteria will include publishing the
-// runbook + linking it from this docstring once it lands.
+// unbound-counter-drains-before-flipping-strict precondition. Both
+// are now documented (#1262):
+// docs/runbooks/license-pubkey-strict-flip.md. Provisioning is done
+// with the nhp-license-admin CLI (endpoints/licenseadmin/main), which
+// enforces the canonical-encoding contract at write time.
 //
 // Metric mode-semantics (runbook concern):
 // MetricLicensePubkeyUnbound means different things in each mode —

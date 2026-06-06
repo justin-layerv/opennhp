@@ -12,6 +12,7 @@ runbook file is added, renamed, or removed.
 - [GuardDuty finding triage](guardduty-finding-triage.md)
 - [L3 flush circuit breaker recovery](l3-flush-breaker-recovery.md)
 - [L3 flush schedule wait timeout](l3-flush-schedule-wait-timeout.md)
+- [License pubkey gate — provisioning & strict flip](license-pubkey-strict-flip.md)
 - [NHP ACK token shared-store failures](nhp-ack-token-shared-store.md)
 - [Prod Rollout Task Ledger](prod-rollout-task-ledger.md)
 - [promote-to-prod Lambda artifact-pass invariant](promote-to-prod-lambda-artifacts.md)
