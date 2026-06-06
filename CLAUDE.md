@@ -217,6 +217,7 @@ This file stays light. Subtree-scoped rules live in nested `CLAUDE.md` files (au
 | Prod Rollout Task Ledger | `docs/runbooks/prod-rollout-task-ledger.md` |
 | qurl-service `/internal/v1/*` triage | `docs/runbooks/qurl-internal-v1-triage.md` |
 | Create a QURL via API | `docs/runbooks/create-qurl.md` |
+| Renew a LayerV-owned domain (+ Domain Expiry Watchdog) | `docs/runbooks/domain-renewal.md` |
 | L3 flush scheduler breaker open — recovery | `docs/runbooks/l3-flush-breaker-recovery.md` |
 | L3 flush scheduler ScheduleWaitTimeout firing | `docs/runbooks/l3-flush-schedule-wait-timeout.md` |
 | L3 flush quiet-stream residual + backend-keepalive recipe | `docs/design/QUIET_STREAM_RESIDUAL.md` |
