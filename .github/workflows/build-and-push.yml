@@ -949,6 +949,16 @@ jobs:
     name: Build ${{ matrix.image }}
     needs: [changes, setup, terraform-validate, terraform-plan]
     runs-on: ubuntu-latest
+    # attestations: write + id-token: write let the post-push attest steps
+    # (SLSA provenance + SBOM) mint keyless Sigstore attestations and push
+    # them to ECR as OCI referrers. The top-level block grants id-token but
+    # not attestations, so this narrows privilege to the one job that needs it
+    # rather than widening the workflow-wide default. See the "Generate SBOM"
+    # / "Attest" steps below (#1333, #1335).
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
     # Run if terraform jobs succeeded or were skipped (dependabot PRs, non-deploy dispatch)
     # Note: We still skip at step level to ensure matrix expands and check names are created
     if: |
@@ -1036,6 +1046,45 @@ jobs:
             echo "name=local/${{ matrix.repo }}:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           fi
 
+      # SBOM (#1333). Generated BEFORE the Trivy scan so it is produced on
+      # every build — including a PR whose image has HIGH/CRITICAL findings,
+      # where the scan fails the job but the SBOM is exactly what triage needs.
+      # Runs off the same local image Trivy scans (steps.image.outputs.name
+      # resolves to local/<repo>:<tag> on PRs, ECR registry empty), so the
+      # generation path is exercised on every app-code PR — not just post-merge.
+      # On main the ref is the ECR tag, but syft still reads it from the local
+      # daemon because the build step uses `load: true`; if that ever becomes
+      # `push: true`/no-load, syft would pull from the registry instead.
+      # continue-on-error keeps it non-blocking: a syft failure must never break
+      # build -> scan -> push. The registry attach (by digest) happens post-push.
+      - name: Generate SBOM
+        id: sbom
+        if: needs.changes.outputs.app == 'true'
+        continue-on-error: true
+        # renovate: datasource=github-releases depName=anchore/sbom-action
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.image.outputs.name }}
+          format: spdx-json
+          output-file: '${{ matrix.image }}-sbom.spdx.json'
+          # We upload the artifact ourselves (next step) for a stable,
+          # per-matrix-leg name; the action's own uploader is redundant here.
+          upload-artifact: false
+
+      # PRIMARY, unconditional retrieval path: the SBOM is always available as
+      # a workflow-run artifact (PRs and pushes), independent of whether ECR
+      # supports the OCI 1.1 referrers API. always() so a later scan failure
+      # (which fails the job) still publishes the SBOM. Retrieval is documented
+      # in docs/SECURITY.md.
+      - name: Upload SBOM artifact
+        if: always() && needs.changes.outputs.app == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-${{ matrix.image }}
+          path: '${{ matrix.image }}-sbom.spdx.json'
+          retention-days: 30
+          if-no-files-found: warn
+
       - name: Scan image
         id: trivy
         if: needs.changes.outputs.app == 'true'
@@ -1101,6 +1150,122 @@ jobs:
           docker push "$ECR_REGISTRY/${{ matrix.repo }}:$ENV_TAG"
           docker push "$ECR_REGISTRY/${{ matrix.repo }}:latest"
           echo "::notice::Image pushed: $ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG"
+
+      # Resolve the manifest digest of the just-pushed image. All three tags
+      # (sha, env, latest) push the same content, so they share one digest; we
+      # read it from the image's RepoDigests entry and strip everything up to
+      # and including '@' to get the bare sha256:... value. The attest steps
+      # below are keyed on the digest, not a mutable tag, so the attestation
+      # binds to immutable bytes. Main-only (gated like the push).
+      # continue-on-error keeps this step from ever reddening the build *after*
+      # a successful push. The `{{range .RepoDigests}}` form is out-of-range-safe
+      # (empty RepoDigests -> empty output, no index error under the default
+      # `bash -e -o pipefail` shell), and grepping for this repo's own
+      # registry/repo prefix pins the digest to our image instead of assuming
+      # the first RepoDigests entry is ours — so a same-content image the daemon
+      # happens to hold under another repo name can't shadow it. `|| true` keeps the pipe graceful on
+      # no-match; an empty digest output makes the attest steps below skip via
+      # their `steps.digest.outputs.digest != ''` gate.
+      - name: Capture pushed image digest
+        id: digest
+        if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'
+        continue-on-error: true
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
+          IMAGE_REPO: ${{ matrix.repo }}
+        run: |
+          REF="$ECR_REGISTRY/$IMAGE_REPO:$IMAGE_TAG"
+          DIGEST=$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "$REF" \
+            | grep -F -m1 -- "$ECR_REGISTRY/$IMAGE_REPO@" | sed 's/.*@//' || true)
+          if [[ "$DIGEST" != sha256:* ]]; then
+            echo "::warning::Could not resolve a sha256 digest for $REF (got '${DIGEST:-<empty>}'); skipping attestations"
+            DIGEST=""
+          else
+            echo "::notice::Resolved digest for $IMAGE_REPO: $DIGEST"
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      # SLSA build provenance (#1335): keyless Sigstore attestation binding
+      # image digest -> workflow run -> commit SHA. push-to-registry stores it
+      # as an OCI referrer on the ECR image. continue-on-error so a registry
+      # that lacks the referrers API (or a transient failure) never blocks the
+      # build; the provenance is also retained in the GitHub attestation store
+      # regardless. Deploy-time VERIFICATION of this attestation is the
+      # follow-up tracked in #1334 (it lands in the deploy/boot path, which
+      # needs live sandbox validation).
+      # Gated solely on a captured digest: the "Capture pushed image digest"
+      # step is the single gate for "an image was actually pushed" (it carries
+      # the app-changed + main-only conditions), and a skipped or empty-result
+      # digest step leaves this output empty — so this one check subsumes them.
+      - name: Attest build provenance (SLSA)
+        id: provenance
+        if: steps.digest.outputs.digest != ''
+        continue-on-error: true
+        # renovate: datasource=github-releases depName=actions/attest-build-provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/${{ matrix.repo }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+      # SBOM attestation (#1333): attach the SPDX SBOM generated above to the
+      # pushed image as a signed OCI referrer. Best-effort/non-blocking; the
+      # workflow-artifact path above remains the guaranteed retrieval route.
+      - name: Attest SBOM
+        id: attest-sbom
+        if: steps.digest.outputs.digest != '' && steps.sbom.outcome == 'success'
+        continue-on-error: true
+        # renovate: datasource=github-releases depName=actions/attest-sbom
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/${{ matrix.repo }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          sbom-path: '${{ matrix.image }}-sbom.spdx.json'
+          push-to-registry: true
+
+      # Observability for the post-merge-only, continue-on-error attest path.
+      # These steps can't be exercised pre-merge (#1334), so a bad action pin,
+      # a missing permission, or an ECR referrer rejection would otherwise
+      # produce zero attestations behind a green check with no signal. Surface
+      # the per-image outcome in the run summary and ::warning:: loudly when an
+      # attestation was expected (digest resolved) but did not get produced.
+      - name: Attestation summary
+        if: always() && needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          PROVENANCE_OUTCOME: ${{ steps.provenance.outcome }}
+          SBOM_ATTEST_OUTCOME: ${{ steps.attest-sbom.outcome }}
+          SBOM_GEN_OUTCOME: ${{ steps.sbom.outcome }}
+        run: |
+          {
+            echo "### Supply-chain attestations — $IMAGE"
+            if [[ -z "$DIGEST" ]]; then
+              echo "- :warning: image digest unresolved → provenance + SBOM attestation **SKIPPED**"
+            else
+              echo "- digest: \`$DIGEST\`"
+              echo "- SLSA provenance: \`${PROVENANCE_OUTCOME:-skipped}\`"
+              echo "- SBOM attestation: \`${SBOM_ATTEST_OUTCOME:-skipped}\` (SBOM generation: \`${SBOM_GEN_OUTCOME:-skipped}\`)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Loud signal when attestation was expected but failed — continue-on-error
+          # on the attest steps would otherwise hide it behind a green check.
+          if [[ -z "$DIGEST" ]]; then
+            echo "::warning::No image digest resolved for $IMAGE — NO attestations produced for this build (non-blocking; deploy-time enforcement tracked in #1334)."
+          else
+            if [[ "$PROVENANCE_OUTCOME" == "failure" ]]; then
+              echo "::warning::SLSA provenance attestation FAILED for $IMAGE ($DIGEST) — image shipped without provenance (non-blocking; see #1334)."
+            fi
+            # SBOM generation failing gates off the attestation (which then
+            # resolves to 'skipped', not 'failure'), so report the root cause
+            # here rather than letting the missing SBOM pass silently.
+            if [[ "$SBOM_GEN_OUTCOME" == "failure" ]]; then
+              echo "::warning::SBOM generation FAILED for $IMAGE — no SBOM artifact or attestation produced for this build (non-blocking)."
+            elif [[ "$SBOM_ATTEST_OUTCOME" == "failure" ]]; then
+              echo "::warning::SBOM attestation FAILED for $IMAGE ($DIGEST) — SBOM not attached as an OCI referrer (workflow artifact still uploaded; non-blocking)."
+            fi
+          fi
 
       # The builder used to also write /${env}/nhp/<component>/image-tag here.
       # That write was wrong on two independent axes:
