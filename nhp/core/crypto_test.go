@@ -129,7 +129,7 @@ func TestHashSumScratchBufferDoesNotAllocate(t *testing.T) {
 	}
 }
 
-func TestCheckHMACDoesNotAllocateHashScratch(t *testing.T) {
+func TestCheckHeaderDigestDoesNotAllocateHashScratch(t *testing.T) {
 	ciphers := NewCipherSuite()
 
 	var packetBuf PacketBuffer
@@ -144,7 +144,7 @@ func TestCheckHMACDoesNotAllocateHashScratch(t *testing.T) {
 
 	seed := []byte("test-hmac-seed")
 	prefixLen := header.Size() - HashSize
-	writeExpectedHMAC := func(cookie []byte) {
+	writeExpectedDigest := func(cookie []byte) {
 		expectedHash, err := NewHash(ciphers.HashType)
 		if err != nil {
 			t.Fatalf("NewHash failed: %v", err)
@@ -154,9 +154,9 @@ func TestCheckHMACDoesNotAllocateHashScratch(t *testing.T) {
 		if cookie != nil {
 			expectedHash.Write(cookie)
 		}
-		expectedHash.Sum(header.HMACBytes()[:0])
+		expectedHash.Sum(header.HeaderDigestBytes()[:0])
 	}
-	writeExpectedHMAC(nil)
+	writeExpectedDigest(nil)
 
 	ppd := &PacketParserData{header: header}
 	h, err := NewHash(ciphers.HashType)
@@ -167,12 +167,12 @@ func TestCheckHMACDoesNotAllocateHashScratch(t *testing.T) {
 	runCheck := func(sumCookie bool) bool {
 		h.Reset()
 		h.Write(seed)
-		ppd.hmacHash = h
-		return ppd.checkHMAC(sumCookie)
+		ppd.digestHash = h
+		return ppd.checkHeaderDigest(sumCookie)
 	}
 
 	if !runCheck(false) {
-		t.Fatal("checkHMAC returned false")
+		t.Fatal("checkHeaderDigest returned false")
 	}
 
 	ok := true
@@ -182,15 +182,15 @@ func TestCheckHMACDoesNotAllocateHashScratch(t *testing.T) {
 		}
 	})
 	if !ok {
-		t.Fatal("checkHMAC returned false")
+		t.Fatal("checkHeaderDigest returned false")
 	}
 	if allocs != 0 {
-		t.Fatalf("checkHMAC allocated %.0f times, want 0", allocs)
+		t.Fatalf("checkHeaderDigest allocated %.0f times, want 0", allocs)
 	}
 
-	header.HMACBytes()[0] ^= 0xff
+	header.HeaderDigestBytes()[0] ^= 0xff
 	if runCheck(false) {
-		t.Fatal("checkHMAC returned true for tampered HMAC")
+		t.Fatal("checkHeaderDigest returned true for tampered digest")
 	}
 
 	cookieStore := &CookieStore{}
@@ -221,10 +221,10 @@ func TestCheckHMACDoesNotAllocateHashScratch(t *testing.T) {
 	for _, tt := range cookieTests {
 		t.Run(tt.name, func(t *testing.T) {
 			ppd.LocalInitTime = tt.localInitTime
-			writeExpectedHMAC(tt.cookie)
+			writeExpectedDigest(tt.cookie)
 
 			if !runCheck(true) {
-				t.Fatal("checkHMAC returned false")
+				t.Fatal("checkHeaderDigest returned false")
 			}
 
 			ok := true
@@ -234,15 +234,15 @@ func TestCheckHMACDoesNotAllocateHashScratch(t *testing.T) {
 				}
 			})
 			if !ok {
-				t.Fatal("checkHMAC returned false")
+				t.Fatal("checkHeaderDigest returned false")
 			}
 			if allocs != 0 {
-				t.Fatalf("checkHMAC allocated %.0f times, want 0", allocs)
+				t.Fatalf("checkHeaderDigest allocated %.0f times, want 0", allocs)
 			}
 
-			header.HMACBytes()[0] ^= 0xff
+			header.HeaderDigestBytes()[0] ^= 0xff
 			if runCheck(true) {
-				t.Fatal("checkHMAC returned true for tampered HMAC")
+				t.Fatal("checkHeaderDigest returned true for tampered digest")
 			}
 		})
 	}

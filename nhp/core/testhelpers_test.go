@@ -23,14 +23,14 @@ func testPeerPk() []byte {
 	return peerPk
 }
 
-// runResponderWithPrevHMACFailure builds a prev MAD and a junk
+// runResponderWithPrevHeaderDigestFailure builds a prev MAD and a junk
 // packet, calls createPacketParserData with PrevAssemblerData set
 // plus any extra config the caller applies via `configure`, asserts
-// the HMAC-failure / bare-return contract (err is ErrHMACCheckFailed,
+// the header-digest-failure / bare-return contract (err is ErrHeaderDigestCheckFailed,
 // ppd is non-nil), and returns the populated ppd for further
 // inspection. Shared by the responder-side chain-key tests in
 // derive_chainkey_test.go.
-func runResponderWithPrevHMACFailure(t *testing.T, dev *Device, configure func(*PacketData)) *PacketParserData {
+func runResponderWithPrevHeaderDigestFailure(t *testing.T, dev *Device, configure func(*PacketData)) *PacketParserData {
 	t.Helper()
 	silenceGlobalLogger(t)
 
@@ -61,8 +61,8 @@ func runResponderWithPrevHMACFailure(t *testing.T, dev *Device, configure func(*
 	}
 
 	ppd, err := dev.createPacketParserData(pd)
-	if !errors.Is(err, ErrHMACCheckFailed) {
-		t.Fatalf("expected ErrHMACCheckFailed, got %v", err)
+	if !errors.Is(err, ErrHeaderDigestCheckFailed) {
+		t.Fatalf("expected ErrHeaderDigestCheckFailed, got %v", err)
 	}
 	if ppd == nil {
 		t.Fatal("ppd nil — createPacketParserData did not populate named return on err path")

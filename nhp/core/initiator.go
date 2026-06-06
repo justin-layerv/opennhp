@@ -61,7 +61,7 @@ type MsgAssemblerData struct {
 	deviceEcdh     Ecdh
 	ephermeralEcdh Ecdh
 	header         Header
-	hmacHash       hash.Hash
+	digestHash     hash.Hash
 	chainHash      hash.Hash
 	bodyAead       cipher.AEAD
 	chainKey       [SymmetricKeySize]byte
@@ -163,13 +163,13 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 	// init timestamp
 	mad.LocalInitTime = time.Now().UnixNano()
 
-	// init hmac hash -> HmacHash0
-	mad.hmacHash, err = NewHash(mad.ciphers.HashType)
+	// init header digest hash -> DigestHash0
+	mad.digestHash, err = NewHash(mad.ciphers.HashType)
 	if err != nil {
-		err = fmt.Errorf("failed to create hmac hash: %w", err)
+		err = fmt.Errorf("failed to create header digest hash: %w", err)
 		return
 	}
-	mad.hmacHash.Write(initialHashBytes)
+	mad.digestHash.Write(initialHashBytes)
 
 	// create ephermeral key
 	ephermalEccType := mad.ciphers.EccType
@@ -256,8 +256,8 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 		return err
 	}
 
-	// evolve hmac hash HmacHash0 -> HmacHash1
-	mad.hmacHash.Write(mad.RemotePubKey)
+	// evolve header digest hash DigestHash0 -> DigestHash1
+	mad.digestHash.Write(mad.RemotePubKey)
 
 	// evolve chain hash ChainHash0 -> ChainHash1
 	mad.chainHash.Write(mad.RemotePubKey)
@@ -335,12 +335,12 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 		SetZero(mad.hashBuf[:])
 	}()
 
-	// message body is empty, skip encryption. Set header and calculate HMAC
+	// message body is empty, skip encryption. Set header and compute the header digest
 	if len(mad.bodyMessage) == 0 {
 		// set header type and payload size
 		mad.header.SetTypeAndPayloadSize(mad.HeaderType, 0)
-		// set HMAC
-		mad.addHMAC(mad.HeaderType == NHP_RKN)
+		// set header digest
+		mad.addHeaderDigest(mad.HeaderType == NHP_RKN)
 		mad.BasePacket.Content = mad.BasePacket.Buf[:mad.header.Size()]
 		return nil
 	}
@@ -397,8 +397,8 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 	// set header type and payload size
 	mad.header.SetTypeAndPayloadSize(mad.HeaderType, mad.BodySize)
 
-	// set HMAC
-	mad.addHMAC(mad.HeaderType == NHP_RKN)
+	// set header digest
+	mad.addHeaderDigest(mad.HeaderType == NHP_RKN)
 
 	// encrypt body and write into mad.BasePacket.Buf space
 	ciphertext := mad.bodyAead.Seal(mad.BasePacket.Buf[mad.header.Size():mad.header.Size()], mad.header.NonceBytes(), body, mad.chainHash.Sum(mad.hashBuf[:0]))
@@ -411,34 +411,36 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 	return nil
 }
 
-// must be called after header is filled
-func (mad *MsgAssemblerData) addHMAC(sumCookie bool) {
+// must be called after header is filled.
+// Computes the unkeyed header digest (see curve.HeaderCurve.HeaderDigest);
+// not an authenticator.
+func (mad *MsgAssemblerData) addHeaderDigest(sumCookie bool) {
 	defer func() {
-		mad.hmacHash.Reset()
-		mad.hmacHash = nil
+		mad.digestHash.Reset()
+		mad.digestHash = nil
 	}()
 
 	prefixLen := mad.header.Size() - HashSize
-	mad.hmacHash.Write(mad.header.Bytes()[0:prefixLen])
+	mad.digestHash.Write(mad.header.Bytes()[0:prefixLen])
 
 	if sumCookie {
 		// use specified cookie, otherwise use connection's cookie
 		if mad.ExternalCookie != nil {
-			mad.hmacHash.Write((*mad.ExternalCookie)[:])
+			mad.digestHash.Write((*mad.ExternalCookie)[:])
 		} else {
 			mad.connData.Lock()
-			mad.hmacHash.Write(mad.connData.CookieStore.CurrCookie[:])
+			mad.digestHash.Write(mad.connData.CookieStore.CurrCookie[:])
 			mad.connData.Unlock()
 		}
 	}
-	mad.hmacHash.Sum(mad.header.HMACBytes()[:0])
+	mad.digestHash.Sum(mad.header.HeaderDigestBytes()[:0])
 }
 
 func (mad *MsgAssemblerData) Destroy() {
 	mad.device.ReleasePoolPacket(mad.BasePacket)
-	if mad.hmacHash != nil {
-		mad.hmacHash.Reset()
-		mad.hmacHash = nil
+	if mad.digestHash != nil {
+		mad.digestHash.Reset()
+		mad.digestHash = nil
 	}
 	if mad.chainHash != nil {
 		mad.chainHash.Reset()

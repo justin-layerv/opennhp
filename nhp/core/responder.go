@@ -61,7 +61,7 @@ type PacketParserData struct {
 
 	deviceEcdh Ecdh
 	header     Header
-	hmacHash   hash.Hash
+	digestHash hash.Hash
 	chainHash  hash.Hash
 	bodyAead   cipher.AEAD
 	chainKey   [SymmetricKeySize]byte
@@ -158,18 +158,18 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 
 	ppd.HeaderType, ppd.BodySize = ppd.header.TypeAndPayloadSize()
 
-	// init hmac hash -> HmacHash0
-	ppd.hmacHash, err = NewHash(ppd.Ciphers.HashType)
+	// init header digest hash -> DigestHash0
+	ppd.digestHash, err = NewHash(ppd.Ciphers.HashType)
 	if err != nil {
-		err = fmt.Errorf("failed to create hmac hash: %w", err)
+		err = fmt.Errorf("failed to create header digest hash: %w", err)
 		return
 	}
-	ppd.hmacHash.Write(initialHashBytes)
+	ppd.digestHash.Write(initialHashBytes)
 
-	// evolve hmac hash HmacHash0 -> HmacHash1
-	ppd.hmacHash.Write(ppd.deviceEcdh.PublicKey())
+	// evolve header digest hash DigestHash0 -> DigestHash1
+	ppd.digestHash.Write(ppd.deviceEcdh.PublicKey())
 
-	// check hmac
+	// check header digest
 	if ppd.device.deviceType == NHP_SERVER {
 		// server overload handling
 		overload := ppd.device.IsOverload()
@@ -183,19 +183,22 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 			}
 		}
 
-		// for RKN, check HMAC with cookie. For remaining allowed key messages, check HMAC without cookie.
+		// for RKN, check the header digest with cookie. For remaining allowed key messages, check it without cookie.
 		sumCookie := overload && ppd.HeaderType == NHP_RKN
-		if !ppd.checkHMAC(sumCookie) {
+		if !ppd.checkHeaderDigest(sumCookie) {
+			// "HMAC" string kept deliberately (#1126): operator-facing log
+			// breadcrumb, matches the preserved ErrServer... message + terraform.
 			log.Error("HMAC validation failed on server side. sumCookie: %v", sumCookie)
-			err = ErrServerHMACCheckFailed
+			err = ErrServerHeaderDigestCheckFailed
 			// bare return: caller's err defer expects named ppd populated
 			return
 		}
 
 	} else {
-		if !ppd.checkHMAC(false) {
+		if !ppd.checkHeaderDigest(false) {
+			// "HMAC" string kept deliberately (#1126) — see note above.
 			log.Error("HMAC validation failed.")
-			err = ErrHMACCheckFailed
+			err = ErrHeaderDigestCheckFailed
 			// bare return: caller's err defer expects named ppd populated
 			return
 		}
@@ -644,14 +647,20 @@ func (ppd *PacketParserData) sendCookie() {
 	ppd.device.SendMsgToPacket(md)
 }
 
-func (ppd *PacketParserData) checkHMAC(sumCookie bool) bool {
+// checkHeaderDigest recomputes the unkeyed header digest (see
+// curve.HeaderCurve.HeaderDigest) and compares it to the value on the wire.
+// hmac.Equal is used only for constant-time comparison (#2033); it does not
+// imply the digest is a keyed MAC. A passing check proves header integrity,
+// not peer identity — real authentication is the static-decrypt + validatePeer
+// path below.
+func (ppd *PacketParserData) checkHeaderDigest(sumCookie bool) bool {
 	defer func() {
-		ppd.hmacHash.Reset()
-		ppd.hmacHash = nil
+		ppd.digestHash.Reset()
+		ppd.digestHash = nil
 	}()
 
 	prefixLen := ppd.header.Size() - HashSize
-	ppd.hmacHash.Write(ppd.header.Bytes()[0:prefixLen])
+	ppd.digestHash.Write(ppd.header.Bytes()[0:prefixLen])
 
 	if sumCookie {
 		ppd.ConnData.Lock()
@@ -659,22 +668,22 @@ func (ppd *PacketParserData) checkHMAC(sumCookie bool) bool {
 
 		if ppd.LocalInitTime < ppd.ConnData.CookieStore.LastCookieTime+CookieRoundTripTimeMs*int64(time.Millisecond) {
 			// cookie has already or nearly been updated, use previous cookie
-			ppd.hmacHash.Write(ppd.ConnData.CookieStore.PrevCookie[:])
-			return hmac.Equal(ppd.hmacHash.Sum(ppd.hashBuf[:0]), ppd.header.HMACBytes())
+			ppd.digestHash.Write(ppd.ConnData.CookieStore.PrevCookie[:])
+			return hmac.Equal(ppd.digestHash.Sum(ppd.hashBuf[:0]), ppd.header.HeaderDigestBytes())
 		}
 		// use current cookie
-		ppd.hmacHash.Write(ppd.ConnData.CookieStore.CurrCookie[:])
-		return hmac.Equal(ppd.hmacHash.Sum(ppd.hashBuf[:0]), ppd.header.HMACBytes())
+		ppd.digestHash.Write(ppd.ConnData.CookieStore.CurrCookie[:])
+		return hmac.Equal(ppd.digestHash.Sum(ppd.hashBuf[:0]), ppd.header.HeaderDigestBytes())
 	}
 
-	return hmac.Equal(ppd.hmacHash.Sum(ppd.hashBuf[:0]), ppd.header.HMACBytes())
+	return hmac.Equal(ppd.digestHash.Sum(ppd.hashBuf[:0]), ppd.header.HeaderDigestBytes())
 }
 
 func (ppd *PacketParserData) Destroy() {
 	ppd.device.ReleasePoolPacket(ppd.basePacket)
-	if ppd.hmacHash != nil {
-		ppd.hmacHash.Reset()
-		ppd.hmacHash = nil
+	if ppd.digestHash != nil {
+		ppd.digestHash.Reset()
+		ppd.digestHash = nil
 	}
 	if ppd.chainHash != nil {
 		ppd.chainHash.Reset()

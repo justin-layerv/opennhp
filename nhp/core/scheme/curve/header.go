@@ -24,7 +24,29 @@ type HeaderCurve struct {
 	Identity     [MaximumIdentitySize + GCMTagSize]byte
 	Static       [PublicKeySize + GCMTagSize]byte
 	Timestamp    [TimestampSize + GCMTagSize]byte
-	HMAC         [HashSize]byte
+	// HeaderDigest is an UNKEYED hash over the header inputs that precede it
+	// (an initial constant, the responder's static public key, and the
+	// serialized header prefix — plus the connection cookie in NHP_RKN cookie
+	// mode). It provides integrity / tamper-evidence on the header, NOT
+	// authentication: none of these inputs is a secret key. The constant and
+	// static pubkey are public, and the NHP_RKN cookie is a server-issued
+	// value an on-path attacker can observe — so an attacker who sees the
+	// packet (and, in cookie mode, the cookie) can recompute a valid digest
+	// for a forged header. A passing digest check is therefore not proof of
+	// peer identity — do not rely on it as an authenticator.
+	//
+	// Real peer authentication happens elsewhere: the responder AEAD-opens
+	// the Static field against the noise chain hash and looks the decrypted
+	// static public key up in the peer map (see the static-decrypt path in
+	// responder.go + validatePeer). Wire-HeaderType integrity against the
+	// #1154 NHP_KNK->NHP_EXT type-flip is enforced separately by the
+	// NHP_KNOCK_HEADERTYPE_VERIFY gate in endpoints/server, not by this field.
+	//
+	// Named "HMAC" upstream (OpenNHP); renamed here per #1126 because the
+	// value is a plain hash, not a MAC. The verify site (checkHeaderDigest)
+	// uses crypto/hmac.Equal purely for constant-time comparison (#2033),
+	// which does not imply the digest is keyed.
+	HeaderDigest [HashSize]byte
 }
 
 // curve header implementations
@@ -105,8 +127,8 @@ func (h *HeaderCurve) IdentityBytes() []byte {
 	return h.Identity[:]
 }
 
-func (h *HeaderCurve) HMACBytes() []byte {
-	return h.HMAC[:]
+func (h *HeaderCurve) HeaderDigestBytes() []byte {
+	return h.HeaderDigest[:]
 }
 
 func (h *HeaderCurve) CipherScheme() int {

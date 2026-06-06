@@ -178,7 +178,7 @@ func TestCreateMsgAssemblerData_WithPrevPropagatesChannels(t *testing.T) {
 func TestCreatePacketParserData_WithPrevPropagatesChannels(t *testing.T) {
 	// Channel is identity-compared; nothing is ever sent/received.
 	decryptedMsgCh := make(chan *PacketParserData, 1)
-	ppd := runResponderWithPrevHMACFailure(t, newDeviceForChainKeyTest(t), func(pd *PacketData) {
+	ppd := runResponderWithPrevHeaderDigestFailure(t, newDeviceForChainKeyTest(t), func(pd *PacketData) {
 		pd.DecryptedMsgCh = decryptedMsgCh
 	})
 
@@ -189,16 +189,16 @@ func TestCreatePacketParserData_WithPrevPropagatesChannels(t *testing.T) {
 
 // TestCreatePacketParserData_InitsCanonicalChainKey is the responder-
 // side twin of TestCreateMsgAssemblerData_InitsCanonicalChainKey.
-// The packet has no valid HMAC so the function returns
-// ErrHMACCheckFailed — but chain-key init runs BEFORE HMAC
-// validation (see createPacketParserData), and the function uses
-// named returns so ppd is populated even on the HMAC failure path.
+// The packet has no valid header digest so the function returns
+// ErrHeaderDigestCheckFailed — but chain-key init runs BEFORE the
+// digest validation (see createPacketParserData), and the function uses
+// named returns so ppd is populated even on the digest-failure path.
 func TestCreatePacketParserData_InitsCanonicalChainKey(t *testing.T) {
-	// runResponderWithPrevHMACFailure pins the
-	// errors.Is(err, ErrHMACCheckFailed) + ppd != nil contract; we
+	// runResponderWithPrevHeaderDigestFailure pins the
+	// errors.Is(err, ErrHeaderDigestCheckFailed) + ppd != nil contract; we
 	// inspect chainKey on the returned ppd to confirm the init block
-	// ran above the HMAC check.
-	ppd := runResponderWithPrevHMACFailure(t, newDeviceForChainKeyTest(t), nil)
+	// ran above the header-digest check.
+	ppd := runResponderWithPrevHeaderDigestFailure(t, newDeviceForChainKeyTest(t), nil)
 
 	var zero [SymmetricKeySize]byte
 	if ppd.chainKey == zero {

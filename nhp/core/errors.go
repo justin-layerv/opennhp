@@ -65,12 +65,17 @@ var (
 	ErrPacketSizeExceedsBuffer = newError(errNhpPacketSizeExceedsBuffer, "packet size longer than send buffer")
 
 	// responder and decryption
-	ErrCloseConnection                = newError(errNhpCloseConnection, "disengage nhp access immediately")
-	ErrIncorrectPacketSize            = newError(errNhpIncorrectPacketSize, "incorrect packet size")
-	ErrMessageTypeNotMatchDevice      = newError(errNhpMessageTypeNotMatchDevice, "message type does not match device")
-	ErrServerOverload                 = newError(errNhpServerOverload, "the packet is dropped due to server overload")
-	ErrHMACCheckFailed                = newError(errNhpHmacCheckFailed, "HMAC validation failed")
-	ErrServerHMACCheckFailed          = newError(errNhpServerHmacCheckFailed, "server HMAC validation failed")
+	ErrCloseConnection           = newError(errNhpCloseConnection, "disengage nhp access immediately")
+	ErrIncorrectPacketSize       = newError(errNhpIncorrectPacketSize, "incorrect packet size")
+	ErrMessageTypeNotMatchDevice = newError(errNhpMessageTypeNotMatchDevice, "message type does not match device")
+	ErrServerOverload            = newError(errNhpServerOverload, "the packet is dropped due to server overload")
+	// Renamed from ErrHMACCheckFailed per #1126: the verified value is an
+	// unkeyed header digest, not a MAC (see curve.HeaderCurve.HeaderDigest).
+	// The message string + error code (32005/32006) are intentionally kept
+	// as-is — "HMAC validation failed" is an operator-facing log breadcrumb
+	// documented in terraform; renaming it would churn runbooks for no gain.
+	ErrHeaderDigestCheckFailed        = newError(errNhpHmacCheckFailed, "HMAC validation failed")
+	ErrServerHeaderDigestCheckFailed  = newError(errNhpServerHmacCheckFailed, "server HMAC validation failed")
 	ErrDeviceECDHEphermalFailed       = newError(errNhpDeviceEcdhEphermalFailed, "device ECDH failed with ephermal")
 	ErrPeerIdentityVerificationFailed = newError(errNhpPeerIdentityVerificationFailed, "failed to verify peer's identity with apk")
 	ErrAEADDecryptionFailed           = newError(errNhpAeadDecryptionFailed, "aead decryption failed")

@@ -165,7 +165,7 @@ type Header interface {
 	StaticBytes() []byte
 	TimestampBytes() []byte
 	IdentityBytes() []byte
-	HMACBytes() []byte
+	HeaderDigestBytes() []byte
 	CipherScheme() int
 }
 
