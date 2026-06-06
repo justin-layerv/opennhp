@@ -116,6 +116,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  attestations: read  # gh attestation verify in the deploy-time image gate (#1334)
 
 # Serialize ALL blue/green deploys per environment. Using environment-only
 # concurrency ensures component=both conflicts with component=server and
@@ -561,6 +562,7 @@ jobs:
 
       # ---- Server Deploy Steps ----
       - name: "[Server] Validate Image Exists in ECR"
+        id: server-image
         if: needs.prepare.outputs.deploy_server == 'true'
         env:
           IMAGE_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
@@ -583,6 +585,19 @@ jobs:
             exit 1
           fi
           echo "Image verified: $REPO_NAME:$IMAGE_TAG exists"
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+
+      # Pipeline-side attestation gate (#1334 Phase 1). audit by default; flip
+      # to enforce fleet-wide via the IMAGE_ATTESTATION_VERIFY_MODE variable
+      # after post-#2339 attested images have soaked.
+      - name: "[Server] Verify Image Attestation"
+        if: needs.prepare.outputs.deploy_server == 'true'
+        uses: ./.github/actions/verify-image-attestation
+        with:
+          repository: ${{ steps.server-image.outputs.repo_name }}
+          image-tag: ${{ needs.prepare.outputs.server_target_image_tag }}
+          region: ${{ env.AWS_REGION }}
+          mode: ${{ vars.IMAGE_ATTESTATION_VERIFY_MODE || 'audit' }}
 
       - name: "[Server] Update Standby Image Tag"
         if: needs.prepare.outputs.deploy_server == 'true'
@@ -625,6 +640,7 @@ jobs:
 
       # ---- AC Setup Steps (moved before refresh to enable parallel refresh) ----
       - name: "[AC] Validate Image Exists in ECR"
+        id: ac-image
         if: needs.prepare.outputs.deploy_ac == 'true'
         env:
           IMAGE_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
@@ -647,6 +663,16 @@ jobs:
             exit 1
           fi
           echo "Image verified: $REPO_NAME:$IMAGE_TAG exists"
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: "[AC] Verify Image Attestation"
+        if: needs.prepare.outputs.deploy_ac == 'true'
+        uses: ./.github/actions/verify-image-attestation
+        with:
+          repository: ${{ steps.ac-image.outputs.repo_name }}
+          image-tag: ${{ needs.prepare.outputs.ac_target_image_tag }}
+          region: ${{ env.AWS_REGION }}
+          mode: ${{ vars.IMAGE_ATTESTATION_VERIFY_MODE || 'audit' }}
 
       - name: "[AC] Update Standby Image Tag"
         if: needs.prepare.outputs.deploy_ac == 'true'

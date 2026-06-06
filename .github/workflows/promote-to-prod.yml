@@ -113,6 +113,7 @@ permissions:
   id-token: write
   contents: read
   actions: write  # needed for gh workflow run dispatch
+  attestations: read  # gh attestation verify in the deploy-time image gate (#1334)
   # Note: the preflight force-push-protection check needs
   # `administration: read` to read branch-protection. That scope IS a
   # valid `permissions:` key (per GitHub docs), but two separate
@@ -840,6 +841,38 @@ jobs:
             exit 1
           fi
           echo "All required images verified."
+
+      # Pipeline-side attestation gate (#1334 Phase 1). Verified against the
+      # sandbox ECR digest (same digest replication carries to prod ECR), under
+      # the sandbox creds above and before the prod switch below. audit by
+      # default; flip fleet-wide via the IMAGE_ATTESTATION_VERIFY_MODE variable
+      # after post-#2339 attested images have soaked. A failure here (enforce)
+      # aborts the promotion before any prod image-tag is written.
+      # Only server + AC are gated: the qurl image is built by qurl-service's CI,
+      # not this repo's build-and-push.yml, so it carries no attestation from us
+      # and is intentionally out of scope for this gate.
+      # Trust note: this verifies the SANDBOX digest; the image actually rolled
+      # is the prod-ECR copy for the same tag, which prod-ECR replication is
+      # trusted to carry byte-for-byte (content-addressed digest, replication-
+      # only registry). The post-apply prod-ECR existence check (below) is the
+      # corroborating signal that the replicated copy is present.
+      - name: Verify server image attestation
+        if: inputs.deploy_server == 'true'
+        uses: ./.github/actions/verify-image-attestation
+        with:
+          repository: ${{ env.ECR_SERVER_REPO }}
+          image-tag: ${{ needs.manifest.outputs.effective_image_tag }}
+          region: ${{ env.AWS_REGION }}
+          mode: ${{ vars.IMAGE_ATTESTATION_VERIFY_MODE || 'audit' }}
+
+      - name: Verify AC image attestation
+        if: inputs.deploy_ac == 'true'
+        uses: ./.github/actions/verify-image-attestation
+        with:
+          repository: ${{ env.ECR_AC_REPO }}
+          image-tag: ${{ needs.manifest.outputs.effective_image_tag }}
+          region: ${{ env.AWS_REGION }}
+          mode: ${{ vars.IMAGE_ATTESTATION_VERIFY_MODE || 'audit' }}
 
       - name: Configure AWS credentials (prod)
         uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3

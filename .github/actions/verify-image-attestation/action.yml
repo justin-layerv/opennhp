@@ -1,0 +1,231 @@
+name: Verify image attestation
+description: >-
+  Verify a server/AC image's SLSA build-provenance attestation (produced by
+  build-and-push.yml in #2339, advancing #1335) before a deploy rolls it. This
+  is the pipeline-side
+  half of #1334 Phase 1: it gates the deploy *job*, not instance boot, so a
+  misconfiguration aborts a deploy rather than crash-looping a running fleet.
+
+  Modes (value is trimmed + lowercased; an unrecognized value -> audit + warn,
+  so a typo can't wedge every deploy):
+    audit   - run the verification, log the outcome, NEVER fail the step. The
+              default, and the only safe default until enough attested images
+              (post-#2339) have soaked: pre-#2339 images have no attestation and
+              would all fail an enforcing gate.
+    enforce - fail the step (block the deploy) only on a genuine
+              no-valid-attestation verdict. Infra/tooling errors (AWS throttle,
+              docker-login blip, gh API 403/5xx) fail OPEN with a warning even
+              under enforce — a transient error must not block a prod promotion.
+              Flip fleet-wide via the IMAGE_ATTESTATION_VERIFY_MODE repo/env
+              variable after soak. Each run emits ATTEST_RESULT=pass|fail|error.
+
+inputs:
+  repository:
+    description: ECR repository name (e.g. layerv/nhp-server).
+    required: true
+  image-tag:
+    description: Image tag being deployed; its immutable digest is resolved and verified.
+    required: true
+  region:
+    description: AWS region of the ECR registry.
+    required: false
+    default: us-east-2
+  registry-id:
+    description: >-
+      ECR registry account ID. Set for cross-account verification — prod deploys
+      pull images from the sandbox account's ECR. Empty = the caller's account.
+    required: false
+    default: ""
+  mode:
+    description: >-
+      audit (log only, never blocks) | enforce (block on a real
+      no-attestation verdict; infra errors fail open). Trimmed + lowercased;
+      unrecognized -> audit.
+    required: false
+    default: audit
+  github-repository:
+    description: owner/repo whose CI is the expected attestation source.
+    required: false
+    default: ${{ github.repository }}
+  signer-workflow:
+    description: >-
+      Repo-relative workflow path that must have signed the attestation. Used to
+      build a `gh attestation verify --cert-identity-regex` pinning the signer to
+      this workflow on the `main` ref, so a different workflow (or a non-main
+      ref) can't satisfy the gate.
+    required: false
+    default: .github/workflows/build-and-push.yml
+
+runs:
+  using: composite
+  steps:
+    - name: Verify image attestation (${{ inputs.mode }})
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        REGION: ${{ inputs.region }}
+        REGISTRY_ID: ${{ inputs.registry-id }}
+        MODE: ${{ inputs.mode }}
+        GH_REPO: ${{ inputs.github-repository }}
+        SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # set -e is also supplied by GitHub's composite-shell default
+        # (bash --noprofile --norc -eo pipefail {0}); we set it explicitly so the
+        # EXIT-trap safety net below doesn't silently weaken if that default ever
+        # changes or the script is reused. The script is written to be -e-safe
+        # (if-guards, `|| true`, `|| VRC=$?`), and the fixture runs it under -e.
+        set -euo pipefail
+
+        # Arm the audit safety net FIRST — before mode normalization — so even a
+        # failure in that early block can't bypass it (closes the pre-trap
+        # window). It fails OPEN unless the mode is unambiguously 'enforce',
+        # re-normalizing MODE itself (trim + lowercase) so a raw 'Enforce' /
+        # ' audit ' / typo present this early is still judged correctly. Under
+        # enforce an unforeseen non-zero propagates (fail-closed is safe there).
+        # shellcheck disable=SC2154  # _rc/_m are assigned inside the single-quoted trap string
+        trap '_rc=$?; if [[ $_rc -ne 0 ]]; then _m="$(printf "%s" "${MODE:-}" | tr -d "[:space:]" | tr "[:upper:]" "[:lower:]")"; if [[ "$_m" != enforce ]]; then echo "::warning::verify-image-attestation exited $_rc; treating as non-blocking (mode=${_m:-audit})"; exit 0; fi; fi' EXIT
+
+        DIGEST=""
+
+        # Normalize the human-set mode variable (trim whitespace + lowercase) so
+        # a stray capital or space ('Enforce', ' audit ') can't wedge a deploy.
+        MODE="$(printf '%s' "${MODE:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        case "$MODE" in
+          audit|enforce) ;;
+          *)
+            # Fail SAFE for availability: an unrecognized mode must never block
+            # deploys. Default to audit and shout — a typo during an enforce-flip
+            # is then a loud, greppable warning rather than a wedged promotion.
+            echo "::warning::verify-image-attestation: unrecognized mode '${MODE}'; defaulting to audit (non-blocking). Set IMAGE_ATTESTATION_VERIFY_MODE to exactly 'audit' or 'enforce'."
+            MODE=audit
+            ;;
+        esac
+
+        # One greppable marker per run so a soak-readiness check can assert
+        # "N clean PASSes across server/AC/canary/promote" mechanically before an
+        # enforce-flip. kind: pass | fail | error.
+        emit() { echo "::notice::ATTEST_RESULT=$1 repo=${REPOSITORY} tag=${IMAGE_TAG} digest=${DIGEST:-none} mode=${MODE}"; }
+
+        # INFRASTRUCTURE error — we could not complete the check (missing creds,
+        # AWS throttle, docker-login blip, gh API 403/5xx/network). Fail OPEN even
+        # under enforce: a transient tooling/permission error must not block a
+        # prod promotion the way a genuine missing-attestation verdict does.
+        fail_infra() {
+          emit error
+          echo "::warning::Attestation verify could not complete (${MODE}; NON-blocking even under enforce): $1"
+          exit 0
+        }
+
+        # VERDICT failure — the check ran and the image has no valid provenance
+        # from our CI. Fail CLOSED under enforce; warn under audit.
+        fail_verdict() {
+          emit fail
+          if [[ "$MODE" == "enforce" ]]; then
+            echo "::error::Attestation verify FAILED (enforce): $1"
+            exit 1
+          fi
+          echo "::warning::Attestation verify FAILED (audit, not blocking): $1"
+          echo "::warning::This WILL block once IMAGE_ATTESTATION_VERIFY_MODE=enforce. Expected for images built before SBOM/provenance (#2339) shipped."
+          exit 0
+        }
+
+        # Resolve registry host + cross-account describe args. The cross-account
+        # path (prod creds -> sandbox registry, for prod canary/promote) relies on
+        # the sandbox ECR repo policy granting the prod account
+        # ecr:BatchGetImage/GetDownloadUrlForLayer (verified present), not just
+        # DescribeImages — gh fetches the manifest, which needs pull, not describe.
+        REG_ARGS=()
+        if [[ -n "$REGISTRY_ID" ]]; then
+          ACCOUNT="$REGISTRY_ID"
+          REG_ARGS=(--registry-id "$REGISTRY_ID")
+        else
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+        fi
+        if [[ -z "$ACCOUNT" ]]; then fail_infra "could not determine ECR account id (AWS creds?)"; fi
+        REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
+
+        # Resolve the tag to its immutable digest, retrying transient AWS errors
+        # (up to 3 attempts, linear backoff). Inlined rather than a helper-by-name
+        # so every shellcheck version sees the aws call as reached (an indirectly-
+        # invoked function trips SC2329/SC2317). The retry notice goes to STDERR so
+        # it never lands in the captured DIGEST. ${REG_ARGS[@]+"${REG_ARGS[@]}"} is
+        # the safe-empty-array expansion under set -u.
+        DIGEST=""
+        for attempt in 1 2 3; do
+          DIGEST="$(aws ecr describe-images ${REG_ARGS[@]+"${REG_ARGS[@]}"} \
+            --repository-name "$REPOSITORY" --image-ids imageTag="$IMAGE_TAG" \
+            --region "$REGION" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
+          if [[ "$DIGEST" == sha256:* ]]; then break; fi
+          if [[ "$attempt" -lt 3 ]]; then
+            echo "::notice::verify-image-attestation: describe attempt ${attempt}/3 failed; retrying in $(( attempt * 3 ))s" >&2
+            sleep "$(( attempt * 3 ))"
+          fi
+        done
+        if [[ "$DIGEST" != sha256:* ]]; then
+          fail_infra "could not resolve a sha256 digest for ${REPOSITORY}:${IMAGE_TAG} (transient AWS error or image absent)"
+        fi
+        REF="oci://${REGISTRY}/${REPOSITORY}@${DIGEST}"
+
+        # gh fetches the OCI manifest, so ECR needs docker auth (cross-account-
+        # capable: caller creds against the sandbox registry, like the instance
+        # pull path in compute/user_data.sh.tpl).
+        if ! aws ecr get-login-password --region "$REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null 2>&1; then
+          fail_infra "docker login to $REGISTRY failed (cannot fetch manifest to verify)"
+        fi
+
+        # cert-identity-regex pins BOTH the signer workflow path AND the ref to
+        # main (defense in depth atop the OIDC main-only restriction in #1121),
+        # so only an attestation minted by build-and-push.yml on main passes.
+        # Escape EVERY regex metacharacter in the interpolated path (whitelist
+        # the literal-safe chars; escape the rest), so the anchored identity is
+        # an exact match even if a caller passes a path containing + * ( etc. —
+        # not just dots. build-and-push.yml, never build-and-pushXyml.
+        # '#' delimiter (not '/') so the '/' inside the bracket expression is
+        # unambiguous on any sed (GNU and BSD/macOS), not just GNU's.
+        ESC_REPO="$(printf '%s' "$GH_REPO" | sed 's#[^a-zA-Z0-9/_@:-]#\\&#g')"
+        ESC_WF="$(printf '%s' "$SIGNER_WORKFLOW" | sed 's#[^a-zA-Z0-9/_@:-]#\\&#g')"
+        IDENTITY="^https://github\\.com/${ESC_REPO}/${ESC_WF}@refs/heads/main\$"
+        echo "Verifying $REF"
+        echo "  expected signer : ${GH_REPO}/${SIGNER_WORKFLOW} @ refs/heads/main"
+        echo "  identity-regex  : ${IDENTITY}"
+        # NB: the flag is gh's --cert-identity-regex (cosign spells the same
+        # concept with a trailing 'p' — that name makes gh error on an unknown
+        # flag before it ever checks attestations, so every image would classify
+        # as an infra error and the gate would silently never verify). The exact
+        # spelling is locked by run-fixtures.sh.
+        VRC=0
+        VOUT="$(gh attestation verify "$REF" --repo "$GH_REPO" \
+                  --cert-identity-regex "$IDENTITY" \
+                  --cert-oidc-issuer "https://token.actions.githubusercontent.com" 2>&1)" || VRC=$?
+        printf '%s\n' "$VOUT"
+        if [[ "$VRC" -eq 0 ]]; then
+          emit pass
+          echo "::notice::Attestation verify OK (${MODE}): ${REPOSITORY}@${DIGEST}"
+          exit 0
+        fi
+        # Classify the failure: a genuine "no matching attestation" is a verdict
+        # (fail-closed under enforce); a permission/network/5xx error means we
+        # could not complete the check (infra -> fail-open even under enforce).
+        # gh's attestation API returns 404 when no attestation exists for the
+        # digest (vs 403/5xx for permission/transient). NB: this matches gh's
+        # human-readable wording — if a future gh release rephrases it, an
+        # unmatched verdict reclassifies as infra (fails OPEN under enforce, and
+        # is visible as ATTEST_RESULT=error during soak), never silently CLOSED.
+        #
+        # KNOWN GAP — pre-enforce-flip, tracked in #1334: an attestation that
+        # EXISTS but whose signer identity/ref doesn't match (wrong workflow or a
+        # non-main ref) currently also falls through to infra (fail-OPEN). The
+        # security-correct enforce default is fail-CLOSED on anything that isn't a
+        # *recognized* transient/permission error — but the exact gh wording for
+        # the identity-mismatch and infra cases can't be observed until #2339's
+        # attested images exist, so finalizing this verdict-vs-infra split against
+        # real gh output is a #1334 acceptance item, not a guess baked in here.
+        # This is inert today: audit mode exits 0 on every path.
+        if printf '%s' "$VOUT" | grep -qiE 'no attestations|http 404|no matching attestation'; then
+          fail_verdict "no valid SLSA provenance from ${GH_REPO}/${SIGNER_WORKFLOW}@main for ${REPOSITORY}:${IMAGE_TAG} (${DIGEST})"
+        else
+          fail_infra "could not complete attestation verify for ${REPOSITORY}:${IMAGE_TAG} (API/permission/network error — see output above)"
+        fi

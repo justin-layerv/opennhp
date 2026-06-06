@@ -539,6 +539,98 @@ build → scan → push path.
    the workflow artifact in (1). The provenance is also retained in GitHub's
    attestation store regardless of the registry push.
 
+**Deploy-time verification (#1334 Phase 1)**
+
+The deploy paths verify the SLSA provenance of the image they are about to roll,
+before it ships. The shared composite action
+[`.github/actions/verify-image-attestation`](../.github/actions/verify-image-attestation/action.yml)
+resolves the tag's immutable digest in ECR and runs `gh attestation verify` with
+a `--cert-identity-regex` pinned to `build-and-push.yml` **on `main`**, so only
+an image built by *this repo's* CI on main passes. It is wired
+into the **deploy jobs** of `blue-green-deploy.yml` (sandbox server/AC),
+`canary-deploy.yml` (prod canary, cross-account to sandbox ECR), and
+`promote-to-prod.yml` (the prod-promotion gate) — pipeline-side, so a failure
+aborts a deploy rather than crash-looping a running fleet. Instance-boot
+verification (`user_data.sh.tpl`) is the separate, later Phase 2.
+
+This is a **two-stage burn-in**, mirroring `NHP_INTERNAL_AUTH_REQUIRE`:
+
+- **`audit` (default).** Runs the verification, logs the outcome, and **never
+  blocks a deploy**. Pre-#2339 images have no attestation and would all fail an
+  enforcing gate, so audit is the only safe default until attested images
+  accumulate.
+- **`enforce`.** A genuine *no-valid-attestation verdict* **fails the deploy
+  job**. Infrastructure/tooling errors (AWS throttle, `docker login` blip,
+  GitHub API 403/5xx) **fail open** with a loud warning even under enforce — a
+  transient error must not block a prod promotion the way a real missing
+  attestation does. The mode value is normalized (trimmed + lowercased); an
+  unrecognized value defaults to `audit` with a warning, so a typo during the
+  flip can't wedge every deploy.
+
+The mode is read from the `IMAGE_ATTESTATION_VERIFY_MODE` repo/environment
+variable (unset → `audit`). To flip fleet-wide after soak:
+
+```bash
+# Pre-req: confirm recent server+AC images carry provenance (post-#2339 builds).
+gh attestation verify \
+  "oci://<sandbox-ecr>/layerv/nhp-server@sha256:<recent-digest>" \
+  --repo layervai/nhp \
+  --cert-identity-regex '^https://github\.com/layervai/nhp/\.github/workflows/build-and-push\.yml@refs/heads/main$' \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com   # expect: success
+
+# Flip to enforce — ONLY after the hard gates below are all satisfied:
+gh variable set IMAGE_ATTESTATION_VERIFY_MODE --repo layervai/nhp --body enforce
+# Rollback: gh variable set IMAGE_ATTESTATION_VERIFY_MODE --body audit
+```
+
+**Hard gates before flipping to `enforce` (all must hold — not just a clean
+soak):**
+
+1. The identity/ref-mismatch classifier is **finalized and fail-closed**
+   (the [#1334](https://github.com/layervai/nhp/issues/1334) acceptance item).
+   Until then, `enforce` does **not** actually guarantee built-by-this-repo's-CI-
+   on-`main` — an attestation signed by the wrong workflow/ref currently
+   classifies as `error` (fail-open). This is the load-bearing gate.
+2. A soak window with `ATTEST_RESULT=pass` across all deploy paths and **no**
+   `fail`/`error` (see below).
+3. The cross-account ECR pull grant is confirmed present (see below).
+
+The verify step uses the default `GITHUB_TOKEN`; each deploy workflow grants it
+`attestations: read`. Each run emits one greppable marker —
+`ATTEST_RESULT=pass|fail|error` — so soak-readiness is mechanical rather than a
+visual log scan. Before flipping to `enforce`, confirm recent audit runs across
+all deploy paths (server, AC, canary, promote) show `ATTEST_RESULT=pass` with no
+`fail` (a real no-attestation verdict, which *would* block under enforce) and no
+`error` (an infra/permission issue — fails open under enforce, but means the
+gate isn't actually verifying and must be fixed first). The verify step needs
+ECR **login + pull** (`ecr:GetAuthorizationToken` + `BatchGetImage`/
+`GetDownloadUrlForLayer`), not just `DescribeImages`, so the manifest fetch can
+run:
+
+- **Same-account paths (blue-green, promote)** use `AWS_ROLE_ARN` — the same
+  role `build-and-push.yml` uses to `amazon-ecr-login` and `docker push`, which
+  inherently has login + pull, so no extra grant is needed.
+- **Cross-account prod canary** authenticates with the prod role against the
+  sandbox registry, so confirm the **sandbox ECR repo policy** still grants the
+  prod account `ecr:BatchGetImage`/`GetDownloadUrlForLayer`.
+
+A permission gap on either surfaces only as `ATTEST_RESULT=error` (fail-open).
+
+Two classifier caveats to resolve **before** flipping to `enforce` (tracked in
+[#1334](https://github.com/layervai/nhp/issues/1334)):
+
+- **Identity/ref-mismatch is unvalidated.** Today an attestation that exists but
+  whose signer identity/ref doesn't match classifies as `error` (fail-open), not
+  a blocking verdict. The exact `gh` wording for that case (and for the various
+  infra errors) can't be observed until attested images exist. Against a real
+  post-#2339 image, capture `gh`'s output for an identity mismatch and finalize
+  the verdict-vs-infra split so a wrong-CI attestation fails **closed** under
+  enforce.
+- **The verdict classification greps `gh`'s human-readable output**, so it is
+  coupled to the installed `gh` version. Re-validate the verdict grep against the
+  runner's `gh` after a `gh`/runner image bump (mirrors the `run-fuzz.sh`
+  deadline-race-signature caveat in `CLAUDE.md`).
+
 ### `NHP_INTERNAL_AUTH_SECRET`
 
 `NHP_INTERNAL_AUTH_SECRET` (≥ 32 bytes) signs internal requests between LayerV

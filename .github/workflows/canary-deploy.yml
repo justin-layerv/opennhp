@@ -56,6 +56,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  attestations: read  # gh attestation verify in the deploy-time image gate (#1334)
 
 concurrency:
   group: canary-deploy-${{ inputs.environment }}-${{ inputs.component }}
@@ -139,6 +140,19 @@ jobs:
             exit 1
           fi
           echo "Image verified: $REPO_NAME:$IMAGE_TAG exists"
+
+      # Pipeline-side attestation gate (#1334 Phase 1). Prod canary pulls from
+      # the sandbox account's ECR, so verification is cross-account via
+      # registry-id. audit by default; flip fleet-wide via the
+      # IMAGE_ATTESTATION_VERIFY_MODE variable after soak.
+      - name: Verify Image Attestation
+        uses: ./.github/actions/verify-image-attestation
+        with:
+          repository: ${{ steps.ecr-info.outputs.repo_name }}
+          image-tag: ${{ inputs.image_tag }}
+          region: ${{ env.AWS_REGION }}
+          registry-id: ${{ inputs.environment == 'prod' && env.SANDBOX_ACCOUNT_ID || '' }}
+          mode: ${{ vars.IMAGE_ATTESTATION_VERIFY_MODE || 'audit' }}
 
       - name: Check Canary State is Idle
         env:

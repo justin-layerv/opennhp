@@ -48,6 +48,8 @@ on:
       - "tests/lints/paths-filter-coverage/**"
       - "tests/lints/dispatch-ref-error/**"
       - "tests/lints/lockdown-body-drift/**"
+      - "tests/lints/verify-image-attestation/**"
+      - ".github/actions/verify-image-attestation/**"
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
       - "terraform/environments/sandbox/**"
@@ -298,6 +300,16 @@ jobs:
       # operator's first explanation of why the dispatch failed.
       - name: Test dispatch-ref-error fixtures
         run: bash tests/lints/dispatch-ref-error/run-fixtures.sh
+
+      # Lock the #1334 Phase 1 attestation-gate composite action's bash
+      # contract (audit never blocks; enforce blocks only on a real
+      # no-attestation verdict; infra/tooling errors fail OPEN even under
+      # enforce; mode normalization). The action can't be exercised pre-merge
+      # via its `uses:`, so this stubbed-PATH fixture is the regression lock.
+      - name: Test verify-image-attestation fixtures
+        run: |
+          shellcheck tests/lints/verify-image-attestation/run-fixtures.sh
+          bash tests/lints/verify-image-attestation/run-fixtures.sh
 
       # Two cross-module lockstep contracts that surfaced as #1976
       # cutover follow-ups (PR #2141): the Go-side
