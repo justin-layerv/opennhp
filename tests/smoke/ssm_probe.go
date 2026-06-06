@@ -17,7 +17,8 @@ import (
 )
 
 // ssm_probe.go is the single place in the smoke suite that sends SSM
-// RunShellScript commands. It exists to enforce two invariants:
+// RunShellScript commands. It rests on one hard invariant plus one
+// best-effort safety net:
 //
 //  1. Tests cannot express an arbitrary command. Every probe is a
 //     named Go function with the command baked in as a string constant.
@@ -25,11 +26,21 @@ import (
 //     parameter. Adding a probe means adding a new named function
 //     reviewed under CODEOWNERS.
 //
-//  2. Defense in depth: the private sendShellScript function regex-checks
-//     every command string against a reject-list before sending it to
-//     SSM. This catches refactoring mistakes (someone bypasses the
-//     named-helper API) and stops the smoke suite from being the thing
-//     that ever mutates a production instance.
+//  2. Defense in depth — a best-effort tripwire, NOT a sandbox: the
+//     private sendShellScript function regex-checks every command string
+//     against the rejectPatterns list (below) before sending it to SSM.
+//     The list catches the common mutation verbs (rm, mv, systemctl
+//     restart, ...) and the common shell metacharacters — command
+//     chaining (; and &&), substitution ($(...) and backticks), piping
+//     (|), and I/O redirection (> and >>) — so a probe that slips past
+//     invariant 1 during a refactor may be caught, but that is NOT
+//     guaranteed. The list is deliberately non-exhaustive and makes no
+//     completeness claim: bare process/network mutation (kill, ip route),
+//     interpreter one-liners (python3 -c), and commands separated by a
+//     newline or a bare & all pass it. Treat it as a
+//     catch-the-obvious-mistake tripwire; invariant 1 — the
+//     named-helper-only API — is the actual fence. See #1012 for the
+//     full rationale.
 //
 // Probes are read-only. None of them install packages, modify files,
 // start/stop services, or change iptables/ipset. If you need a new
@@ -181,16 +192,16 @@ const (
 	cmdGrepQurlAPIURL = "grep -m1 '^QURL_API_URL=' " + nhpServerEnvFilePath
 )
 
-// rejectPatterns are command substrings that must never appear in any
-// probe, even if someone bypasses the named-helper API. This list fires
-// only as a safety net — it should never be the only thing catching a
-// bad command.
+// rejectPatterns are the command substrings that must never appear in
+// any probe even if someone bypasses the named-helper API — the
+// best-effort safety net described in invariant 2 above, which lists
+// what it does and does not catch.
 //
-// The list is deliberately broad; the cost of a false-positive
-// (rejecting a harmless probe) is that someone has to rewrite the
-// probe, which is a good conversation to have.
+// The patterns err deliberately toward false-positives: the cost of
+// rejecting a harmless probe is that someone rewrites it, which is a
+// good conversation to have.
 var rejectPatterns = []*regexp.Regexp{
-	// State mutation
+	// State mutation (> and >> redirect output to files)
 	regexp.MustCompile(`\brm\b`),
 	regexp.MustCompile(`\bmv\b`),
 	regexp.MustCompile(`\bcp\b`),
@@ -218,9 +229,9 @@ var rejectPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\byum\s+(install|remove|update)\b`),
 	regexp.MustCompile(`\bdpkg\s+-i\b`),
 
-	// Shell control chars: command chaining and substitution. Reject any
-	// probe containing these — every legitimate probe today is a single
-	// command with no chaining or substitution. If a future probe needs
+	// Shell control chars: chaining, substitution, and piping. Reject
+	// any probe containing these — every legitimate probe today is a
+	// single command with none of them. If a future probe needs
 	// piping or chaining, write it as a multi-line script invoked via
 	// the named-helper API and audit it explicitly. The regex on
 	// operator-controlled inputs (e.g., qurl_internal_service_domain)
