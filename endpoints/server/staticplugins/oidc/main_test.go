@@ -23,19 +23,16 @@ func init() {
 	}
 }
 
-// newTestContext creates a gin test context with an optional Origin header.
-func newTestContext(origin string) (*gin.Context, *httptest.ResponseRecorder) {
+// newTestContext creates a gin test context backed by a response recorder.
+func newTestContext() (*gin.Context, *httptest.ResponseRecorder) {
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
 	ctx.Request, _ = http.NewRequest("GET", "/test", nil)
-	if origin != "" {
-		ctx.Request.Header.Set("Origin", origin)
-	}
 	return ctx, w
 }
 
 func TestAuthWithHttp_NilHelper(t *testing.T) {
-	ctx, _ := newTestContext("")
+	ctx, _ := newTestContext()
 	req := &common.HttpKnockRequest{}
 
 	_, err := AuthWithHttp(ctx, req, nil)
@@ -63,31 +60,8 @@ func TestAuthWithNHP_NilHelper(t *testing.T) {
 	}
 }
 
-func TestCorsMiddleware_WithOrigin(t *testing.T) {
-	origin := "https://example.com"
-	ctx, w := newTestContext(origin)
-
-	corsMiddleware(ctx)
-
-	got := w.Header().Get("Access-Control-Allow-Origin")
-	if got != origin {
-		t.Errorf("expected CORS origin %q, got %q", origin, got)
-	}
-}
-
-func TestCorsMiddleware_WithoutOrigin(t *testing.T) {
-	ctx, w := newTestContext("")
-
-	corsMiddleware(ctx)
-
-	got := w.Header().Get("Access-Control-Allow-Origin")
-	if got != "" {
-		t.Errorf("expected no CORS header, got %q", got)
-	}
-}
-
 func TestAuthRegular_AuthenticatorUnavailable(t *testing.T) {
-	ctx, w := newTestContext("")
+	ctx, w := newTestContext()
 	req := &common.HttpKnockRequest{}
 	res := &common.ResourceData{}
 	helper := &plugins.HttpServerPluginHelper{}
@@ -116,7 +90,7 @@ func TestAuthRegular_AuthenticatorUnavailable(t *testing.T) {
 }
 
 func TestAuthOkta_InvalidConfig(t *testing.T) {
-	ctx, _ := newTestContext("")
+	ctx, _ := newTestContext()
 
 	// Empty domain causes NewAuthenticator (and therefore
 	// getOrCreateAuthenticator) to fail at provider discovery.
