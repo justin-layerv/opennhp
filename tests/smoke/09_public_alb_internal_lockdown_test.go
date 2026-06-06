@@ -106,12 +106,15 @@ import (
 // AWS rejects priority collisions at apply. Per CLAUDE.md smoke-rule
 // #5, no fence here for that class.)
 //
-// The check is a single-curl from the CI runner — no SSM, no AWS API.
-// It runs unconditionally when the rollout's
-// `NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED` env var is set (sourced by
-// the smoke harness in setup_test.go); on greenfield envs without
-// the lockdown wired the test skips cleanly via
-// skipIfQurlInternalALBDisabled.
+// Each per-path check is a single curl from the CI runner. The expected
+// lockdown body is resolved ONCE at startup from the Terraform-owned SSM
+// parameter — see aws_helpers.go::resolvePublicALBLockdownExpectedBody for the
+// #1645 / Path-B rationale (why SSM-sourced, and how it catches out-of-band
+// edits). The suite runs these tests when the rollout's
+// `NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED` env var is set (sourced in
+// setup_test.go); on greenfield envs without the lockdown wired the test skips
+// cleanly via skipIfQurlInternalALBDisabled and the startup resolve is skipped
+// too.
 
 const (
 	publicALBLockdownExpectedStatus = http.StatusNotFound
@@ -149,23 +152,48 @@ var httpListenerOptOutEnvs = map[string]bool{}
 // "the body decodes to {error: not found}", not "the body is one specific
 // byte sequence".
 //
-// Coordinated change required: the lockdown body shape is duplicated in
-// `terraform/modules/qurl-service/main.tf::aws_lb_listener_rule.public_internal_block`'s
-// `fixed_response.message_body`. If that ever changes (e.g., switching
-// to gin's text/plain to close the body-shape fingerprint leak — see
-// resource header), this constant + the type of `publicALBLockdownExpectedBody`
-// + every test that asserts it must be updated in the SAME PR. There
-// is no compile-time link between the TF and Go sides of this contract.
+// RUNTIME-RESOLVED, not a compile-time literal (#1645, Path B): TestMain
+// populates it from the Terraform-owned SSM parameter (see
+// aws_helpers.go::resolvePublicALBLockdownExpectedBody for the full rationale —
+// shared TF local, out-of-band-edit detection). Nil until then; every fence
+// that reads it first calls requirePublicALBLockdownExpectedBody(t) (after
+// skipIfQurlInternalALBDisabled), which fails the fence if the startup resolve
+// errored or left it nil — so it is never nil at an assertion site.
 //
 // Type is `map[string]string` — load-bearing. A future body-shape change
 // adding a numeric or object field (e.g.,
-// `{"error":"not found","retry_after":30}`) would fail to decode into
-// this map. That's the desired behavior — a body-shape change should
-// fail the test loudly so the maintainer revisits the contract — but
-// the failure surfaces as a parse error, not a body-mismatch. New
-// string-valued keys (e.g., `request_id`) decode fine and fail loudly
-// on `maps.Equal`.
-var publicALBLockdownExpectedBody = map[string]string{"error": "not found"}
+// `{"error":"not found","retry_after":30}`) would fail to decode in the
+// resolver. That's the desired behavior — a body-shape change should fail
+// loudly so the maintainer revisits the contract — but the failure surfaces
+// at resolve time as a parse error, not a body-mismatch. If #1642 switches
+// the body to text/plain, the resolver and this type must change together.
+// New string-valued keys (e.g., `request_id`) decode fine and fail loudly on
+// `maps.Equal` at the assertion sites.
+var publicALBLockdownExpectedBody map[string]string
+
+// publicALBLockdownBodyResolveErr captures a startup resolve failure
+// (setup_test.go) so it can be surfaced as a hard failure of exactly the
+// lockdown fences that depend on the body — see
+// requirePublicALBLockdownExpectedBody — instead of a suite-wide abort.
+var publicALBLockdownBodyResolveErr error
+
+// requirePublicALBLockdownExpectedBody fails the calling lockdown fence if
+// TestMain could not resolve the IaC-pinned expected body (#1645, Path B).
+// Call it after skipIfQurlInternalALBDisabled(t) in every test that compares a
+// wire response against publicALBLockdownExpectedBody. Tests that assert only
+// "not 2xx/3xx" (the backend-backstop fences) don't read the body and don't
+// call this. Fails (not skips): when the rule is wired in this env, the SSM
+// parameter MUST be readable — a missing one is terraform-out-of-date or a
+// mis-gated env, which we want red, not silently green.
+func requirePublicALBLockdownExpectedBody(t *testing.T) {
+	t.Helper()
+	if publicALBLockdownBodyResolveErr != nil {
+		t.Fatalf("public-ALB lockdown expected body unresolved at startup: %v", publicALBLockdownBodyResolveErr)
+	}
+	if publicALBLockdownExpectedBody == nil {
+		t.Fatal("public-ALB lockdown expected body is nil — TestMain did not resolve it (QURLInternalALBEnabled unset at startup while this fence ran?)")
+	}
+}
 
 // TestPublicALB_InternalPathReturns404 covers each regression class
 // enumerated above with its own subtest. Adding a new bypass class
@@ -205,6 +233,7 @@ var publicALBLockdownExpectedBody = map[string]string{"error": "not found"}
 // Regression fence for PR #1635 (qurl-service #335 PR4).
 func TestPublicALB_InternalPathReturns404(t *testing.T) {
 	skipIfQurlInternalALBDisabled(t)
+	requirePublicALBLockdownExpectedBody(t)
 
 	// Slash-spanning `*` semantics — triage routing:
 	// AWS ALB's `path_pattern` `*` matches ANY character including `/`
@@ -450,6 +479,7 @@ func assertPublicLockdownReturns404(t *testing.T, method, path, why string) {
 // Regression fence for PR #1635 (qurl-service #335 PR4).
 func TestPublicALB_PublicPathNotLockdownShaped(t *testing.T) {
 	skipIfQurlInternalALBDisabled(t)
+	requirePublicALBLockdownExpectedBody(t)
 
 	cases := []struct {
 		name string
@@ -786,6 +816,7 @@ func assertPercentEncodedPathNotSuccessful(t *testing.T, path string) {
 func TestPublicALB_HTTPRedirectStillReachesLockdown(t *testing.T) {
 	t.Parallel()
 	skipIfQurlInternalALBDisabled(t)
+	requirePublicALBLockdownExpectedBody(t)
 
 	// Use url.Parse so a future QURLAPIBaseURL that includes a path
 	// segment (e.g., `https://api.layerv.xyz/api`) doesn't silently

@@ -4,6 +4,7 @@ package smoke
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -279,6 +280,53 @@ func readSSMParameterWithContext(ctx context.Context, name string) (string, bool
 		return "", false, fmt.Errorf("SSM GetParameter %s returned nil Parameter.Value", name)
 	}
 	return *resp.Parameter.Value, true, nil
+}
+
+// resolvePublicALBLockdownExpectedBody reads the qurl-service public-ALB
+// /internal/* lockdown fixed-response body from the SSM parameter Terraform
+// publishes at /{env}/nhp/qurl/internal-lockdown-body, and parses it into the
+// expected-shape map the 09_public_alb_internal_lockdown_test.go wire
+// assertions compare against.
+//
+// #1645, Path B. Terraform sets that parameter from the SAME local that drives
+// the listener rule's fixed_response.message_body
+// (terraform/modules/qurl-service/main.tf::local.public_internal_lockdown_body),
+// so the served body and this expected body cannot drift across an apply. The
+// fence then compares the live wire response against THIS IaC-pinned value —
+// not against a DescribeRules read of the rule it probes — which is what makes
+// it flip red on an out-of-band rule edit (acceptance criterion #5): the edit
+// moves the wire response but not this parameter. A DescribeRules-sourced
+// expected value (Path A) would read the edited rule and move both sides
+// together, so it could never fail on a body edit.
+//
+// Called from TestMain only when QURLInternalALBEnabled is set; on envs where
+// the lockdown rule isn't wired the parameter doesn't exist and the read is
+// skipped. When it IS enabled the read MUST succeed — a missing/unparseable
+// parameter is a hard error (Terraform out of date, env mis-gated, or the body
+// shape changed without updating this resolver). TestMain records that error
+// rather than os.Exit-ing, and the 09_* lockdown fences surface it via
+// requirePublicALBLockdownExpectedBody, so the failure stays scoped to the
+// fences that depend on the body instead of aborting the whole suite (mode/cell
+// in fetchDeployDiscovery is universal, so that one is fatal; this is not).
+func resolvePublicALBLockdownExpectedBody(ctx context.Context, env string) (map[string]string, error) {
+	name := "/" + env + "/nhp/qurl/internal-lockdown-body"
+
+	value, ok, err := readSSMParameterWithContext(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("ssm get-parameter %s: %w", name, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("SSM parameter %s missing — qurl-service terraform out of date (the module publishes it whenever domain_name+internal_alb_enabled), or this env is mis-gated as internal-ALB-enabled", name)
+	}
+
+	var body map[string]string
+	if err := json.Unmarshal([]byte(value), &body); err != nil {
+		return nil, fmt.Errorf("SSM parameter %s value %q does not decode into map[string]string — if #1642 switched the lockdown body to text/plain, this resolver and publicALBLockdownExpectedBody's type must change in the same PR: %w", name, value, err)
+	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("SSM parameter %s decoded to an empty object — expected the lockdown body shape", name)
+	}
+	return body, nil
 }
 
 // getSSMParameter wraps readSSMParameterWithContext for callers where any AWS

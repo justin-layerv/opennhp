@@ -1432,6 +1432,34 @@ resource "aws_lb_listener" "https" {
 # against the public-path baseline regardless. If this leak ever
 # matters, change the body to mimic gin's plain text and keep the
 # triage signal in a header instead.
+#
+# ── Lockdown body: single source of truth (#1645, Path B) ───────────────────
+# This is the CANONICAL explanation; the message_body and SSM-parameter
+# comments below carry only their site-local facts and refer back here.
+#
+# local.public_internal_lockdown_body is the one place the body is authored. It
+# feeds BOTH the rule's fixed_response.message_body AND
+# aws_ssm_parameter.public_internal_lockdown_body, so an apply can never leave
+# the served body and the smoke fence's expected body out of sync. The fence
+# reads the SSM parameter — NOT a DescribeRules read of the rule it probes — so
+# an out-of-band edit to the live rule moves the wire response but not the
+# parameter, and the fence flips red (acceptance criterion #5); a self-sourced
+# expected value never could.
+#
+# Trust model (cf. the cellIDPattern note elsewhere in this file): the
+# guarantee rests on Terraform re-pinning the parameter every apply. An
+# out-of-band `aws ssm put-parameter` could move the expected value to match a
+# tampered rule and mask a body edit until the next apply re-pins it. Note this
+# is a small REDUCTION in tamper-resistance vs. the prior Go-literal expected
+# value, not a wash: before #1645 the expected body lived in version control, so
+# masking a body edit meant tampering the live rule AND landing a reviewed code
+# change; now both the rule and the expected value are movable with the same AWS
+# write creds, no PR. Acceptable because this is a post-deploy smoke fence (not a
+# runtime control) and the next apply reverts the mask — but state it plainly.
+locals {
+  public_internal_lockdown_body = jsonencode({ error = "not found" })
+}
+
 resource "aws_lb_listener_rule" "public_internal_block" {
   count = var.domain_name != null && var.internal_alb_enabled ? 1 : 0
 
@@ -1445,15 +1473,17 @@ resource "aws_lb_listener_rule" "public_internal_block" {
 
   action {
     type = "fixed-response"
-    # COORDINATED CHANGE: the body shape below is duplicated in
-    # `tests/smoke/09_public_alb_internal_lockdown_test.go::publicALBLockdownExpectedBody`
-    # (no compile-time link — only the smoke fence catches drift).
-    # If you change `content_type` or `message_body`, update both
-    # the Go constant AND the type of `publicALBLockdownExpectedBody`
-    # AND every test asserting against it, in the SAME PR.
+    # message_body comes from local.public_internal_lockdown_body (the single
+    # source of truth — see the local's comment above); the body shape is no
+    # longer duplicated as a Go literal, so changing it needs no Go edit.
+    # content_type and status_code, however, ARE still mirrored as Go literals
+    # (publicALBLockdownExpectedCT / publicALBLockdownExpectedStatus): status
+    # deliberately — an independent 404 invariant the fence must not source from
+    # the rule it probes — and content_type pending the #1642 text/plain switch.
+    # Change either of those two → update the matching Go literal in the SAME PR.
     fixed_response {
       content_type = "application/json"
-      message_body = jsonencode({ error = "not found" })
+      message_body = local.public_internal_lockdown_body
       status_code  = "404"
     }
   }
@@ -1487,6 +1517,38 @@ resource "aws_lb_listener_rule" "public_internal_block" {
 
   tags = merge(var.tags, {
     Name      = "${local.service_name}-internal-lockdown"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+}
+
+# Smoke-fence source of truth for the lockdown body (#1645, Path B — see
+# local.public_internal_lockdown_body's comment above for WHY this exists and
+# how it makes the fence catch out-of-band edits). Read at startup by
+# tests/smoke/setup_test.go via
+# aws_helpers.go::resolvePublicALBLockdownExpectedBody; no runtime consumer
+# other than smoke. Site-local facts:
+#   - Gated on the EXACT condition as the rule above, so it exists iff the rule
+#     does; value sources the shared local, so it can't drift from the rule.
+#   - No new IAM: the smoke runner role already has ssm:Get*
+#     (terraform/modules/ecr/main.tf "SSMRead").
+#   - Env-scoped (/${var.environment}/nhp/...) to match the smoke suite's other
+#     reads (/{env}/nhp/deploy/*, .../server/*), NOT this module's
+#     /${var.name_prefix}/qurl-* params — smoke is uniformly bare-{env} scoped
+#     and must not have to know name_prefix. One qurl-service instance per env
+#     today makes this unambiguous; cell-scoping is deferred to #1448 with the rest.
+#   - No lifecycle.ignore_changes: Terraform-owned end to end (no CI/CD writer),
+#     so every apply re-pins it to the local.
+resource "aws_ssm_parameter" "public_internal_lockdown_body" {
+  count = var.domain_name != null && var.internal_alb_enabled ? 1 : 0
+
+  name        = "/${var.environment}/nhp/qurl/internal-lockdown-body"
+  description = "qurl-service public-ALB /internal/* lockdown fixed-response body; smoke-fence expected-value source (#1645)"
+  type        = "String"
+  value       = local.public_internal_lockdown_body
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-internal-lockdown-body"
     Component = "qurl-service"
     Cell      = var.cell_id
   })

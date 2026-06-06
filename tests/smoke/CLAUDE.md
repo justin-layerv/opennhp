@@ -70,6 +70,16 @@ collapsing the coordination to a single Terraform-owned parameter
 per gate. Until that lands, adding a new env to the suite is a
 five-place edit.
 
+`TestMain` also resolves the #1645 lockdown-body fence's expected
+value from the Terraform-owned SSM parameter
+`/{env}/nhp/qurl/internal-lockdown-body` (see
+`aws_helpers.go::resolvePublicALBLockdownExpectedBody`). This is **not**
+one of the five env-gating points above — it's a body-shape source read
+only by `09_public_alb_internal_lockdown_test.go`, and a missing/parse-fail
+reds just those fences (scoped via `requirePublicALBLockdownExpectedBody`,
+not a suite abort). It already follows the #1640 shape (SSM-sourced read at
+`TestMain`), so #1640's consolidation needn't touch it.
+
 The `scripts/check-smoke-tier-filter-coverage.sh::tier3_no_ssm_expected_omissions`
 list is a sixth env-independent maintenance list — it documents
 which Test prefixes are SSM-required and so legitimately omitted

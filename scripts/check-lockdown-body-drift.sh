@@ -1,238 +1,264 @@
 #!/usr/bin/env bash
 # check-lockdown-body-drift.sh
 # ----------------------------------------------------------------------------
-# Fence drift between the lockdown fixed-response body shape declared in:
+# Fence drift in the qurl-service /internal/* public-ALB lockdown body
+# contract across:
 #
 #   - terraform/modules/qurl-service/main.tf
-#       (aws_lb_listener_rule.public_internal_block — emits this body
-#        to the wire on /internal/* on the public ALB)
+#       * local.public_internal_lockdown_body — the SINGLE source of truth
+#         for the lockdown fixed-response body shape.
+#       * aws_lb_listener_rule.public_internal_block — emits that body to
+#         the wire on /internal/* on the public ALB
+#         (fixed_response.message_body).
+#       * aws_ssm_parameter.public_internal_lockdown_body — publishes that
+#         body to SSM so the smoke fence can read it.
+#   - tests/smoke/aws_helpers.go
+#       (resolvePublicALBLockdownExpectedBody — reads the SSM parameter at
+#        /{env}/nhp/qurl/internal-lockdown-body and parses it).
 #   - tests/smoke/09_public_alb_internal_lockdown_test.go
-#       (publicALBLockdownExpectedBody — smoke asserts the same shape
-#        on the wire against the deployed ALB)
+#       (publicALBLockdownExpectedBody — the resolved value the wire
+#        assertions compare against).
 #
-# The duplication is intentional (the smoke suite cannot import a
-# Terraform-rendered string). Both files have "COORDINATED CHANGE"
-# comments naming each other. The risk this lint addresses: a one-
-# sided edit to the body shape — e.g., switching to gin's text/plain
-# to close the body-shape fingerprint leak documented at the TF
-# header — would leave the smoke fence asserting against the prior
-# JSON shape and silently false-positive.
+# Architecture (#1645, Path B). Before #1645 the body shape was duplicated
+# as a Go literal that mirrored the TF rule with no compile-time link, and
+# this lint compared the two literals. That coupling is gone: the smoke
+# fence now sources its expected body from the SSM parameter, and Terraform
+# authors BOTH the rule's message_body AND that SSM parameter from one
+# shared local. So the served body and the fence's expected body provably
+# share a source and cannot drift across an apply — PROVIDED both keep
+# referencing the local, and PROVIDED Terraform and smoke agree on the SSM
+# parameter name. Those two are exactly what this lint now fences:
 #
-# Strategy: extract a canonical normalized body shape from each file
-# and compare. The normalized form strips whitespace and quote-style
-# differences so a refactor that switches single → double quotes (Go
-# isn't a JSON file, but the map literal can be rewritten) doesn't
-# trip a false drift.
+#   1. local.public_internal_lockdown_body is defined as jsonencode({...}).
+#      (The smoke resolver json.Unmarshal-s the value into map[string]string;
+#      a switch to a non-JSON body — e.g. gin's text/plain per #1642 — must
+#      trip this lint so the resolver and the Go type get updated too.)
+#   2. The rule's fixed_response.message_body references that local
+#      (not a re-inlined literal that would diverge from the SSM value).
+#   3. The SSM parameter's value references that same local.
+#   4. The smoke side carries NO compile-time body literal anymore, and
+#      Terraform + the smoke resolver name the SAME SSM parameter.
 #
-# Soft spot: the extractor's regex (`jsonencode\(\{[^}]+\}\)`) is
-# single-level brace matching. NESTED jsonencode bodies — e.g.,
-# `jsonencode({ error = "not found", details = { code = 1 } })` —
-# truncate at the inner `}` and produce a malformed match that the
-# downstream `normalize_tf` would fail to parse. Additive flat
-# keys (e.g., `{ error = "not found", request_id = "" }`) are
-# unaffected: that body has exactly one closing brace before the
-# closing paren so the regex matches it fully.
-#
-# Acceptable trade because the structural risk is one-sided
-# removal/rename (caught), not nested-evolution; if a future
-# response body grows nested structure, harden the extractor to
-# bracket-count or scope it tighter inside the `fixed_response`
-# sub-block.
+# If 2 and 3 both reference the one local, the wire body and the SSM-sourced
+# expected body are identical by construction; if 4 holds, the fence reads
+# the parameter Terraform actually publishes. A one-sided edit to any of
+# these is what reopens silent drift, and is what fails here at PR time.
 #
 # Usage:
-#   ./scripts/check-lockdown-body-drift.sh                    # production paths
-#   ./scripts/check-lockdown-body-drift.sh TF_FILE GO_FILE    # override paths
-#                                                             # (used by the
-#                                                             # fixture suite,
-#                                                             # if added later)
+#   ./scripts/check-lockdown-body-drift.sh
+#       # canonical production paths
+#   ./scripts/check-lockdown-body-drift.sh TF_FILE GO_RESOLVER_FILE GO_FENCE_FILE
+#       # override all three (for a future fixture suite)
 # ============================================================================
 
 set -euo pipefail
 
-if [ $# -ne 0 ] && [ $# -ne 2 ]; then
-  echo "usage: $0 [TF_FILE GO_FILE]" >&2
+if [ "$#" -ne 0 ] && [ "$#" -ne 3 ]; then
+  echo "usage: $0 [TF_FILE GO_RESOLVER_FILE GO_FENCE_FILE]" >&2
   echo "  with no args: check the canonical production paths" >&2
-  echo "  with two args: check the supplied paths" >&2
+  echo "  with three args: check the supplied paths" >&2
   exit 2
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TF_FILE="${1:-${REPO_ROOT}/terraform/modules/qurl-service/main.tf}"
-GO_FILE="${2:-${REPO_ROOT}/tests/smoke/09_public_alb_internal_lockdown_test.go}"
+GO_RESOLVER_FILE="${2:-${REPO_ROOT}/tests/smoke/aws_helpers.go}"
+GO_FENCE_FILE="${3:-${REPO_ROOT}/tests/smoke/09_public_alb_internal_lockdown_test.go}"
 
-for f in "$TF_FILE" "$GO_FILE"; do
+for f in "$TF_FILE" "$GO_RESOLVER_FILE" "$GO_FENCE_FILE"; do
   if [ ! -f "$f" ]; then
     echo "ERROR: missing $f" >&2
     exit 1
   fi
 done
 
-# Extract the TF body from `jsonencode({ error = "not found" })`,
-# anchored on the `aws_lb_listener_rule.public_internal_block` block.
-#
-# The narrow anchor matters because the file has multiple other
-# `jsonencode({...})` calls (qurl-link static + canary lambdas, etc.).
-# Today they happen to be multi-line so a single-line `[^}]+` regex
-# misses them by coincidence — fragile. The awk range-pattern below
-# scopes the grep to only the lockdown rule, so a future single-line
-# `jsonencode({...})` added elsewhere in the file (or a `terraform
-# fmt` rule change that collapses an existing one) does not trip
-# this lint.
-#
-# Range delimiters:
-#   - Start: `resource "aws_lb_listener_rule" "public_internal_block"`
-#     line.
-#   - End: the first line that is exactly `}` at column 0. Terraform's
-#     formatter writes top-level resources this way; any deviation
-#     would surface as a "could not find" error below rather than a
-#     silent narrow-extract.
-#
-# `-E -o` returns the matched substring per line. We further narrow
-# from the resource block to its `fixed_response { ... }` sub-block,
-# which is the only place the lockdown wire body lives. The inner
-# anchor means a future refactor that adds a sibling `jsonencode({...})`
-# inside the same rule (e.g., a tags helper, an action precondition)
-# does not trip this lint. We accept exactly one match within the
-# sub-block; multiple is suspicious (two body assignments inside one
-# fixed_response — invalid HCL today, but the lint fails loud if a
-# future Terraform language change ever allows it).
-block_extract=$(awk '
-  /^resource "aws_lb_listener_rule" "public_internal_block"/ { in_block=1 }
-  in_block { print }
-  in_block && /^}/ { in_block=0 }
-' "$TF_FILE")
+# The SSM parameter name (minus the per-env "/{env}" prefix) that Terraform
+# publishes and the smoke resolver reads. Both sides must contain this exact
+# substring or the fence reads a parameter that does not exist.
+PARAM_NAME_SUFFIX="/nhp/qurl/internal-lockdown-body"
 
-if [ -z "$block_extract" ]; then
-  echo "ERROR: could not locate the \`aws_lb_listener_rule.public_internal_block\` block in $TF_FILE" >&2
-  echo "       The lockdown rule resource was either renamed, removed, or its" >&2
-  echo "       opening line no longer matches the canonical \`resource \"aws_lb_listener_rule\" \"public_internal_block\"\` form." >&2
-  echo "       If the rename is intentional, update this script's awk range pattern." >&2
-  exit 1
-fi
-
-# Narrow further to the `fixed_response { ... }` sub-block. The
-# sub-block delimiter is a closing `}` indented by exactly 4 spaces
-# (Terraform fmt's canonical 2-space indent times 2 levels: rule → action).
-# An inner brace at a different indent would surface as a missing
-# match downstream, not a silent narrow-extract.
-fixed_response_extract=$(printf '%s\n' "$block_extract" | awk '
-  /^    fixed_response \{/ { in_fr=1; next }
-  in_fr && /^    \}/ { in_fr=0; next }
-  in_fr { print }
-')
-
-if [ -z "$fixed_response_extract" ]; then
-  echo "ERROR: could not locate the \`fixed_response { ... }\` sub-block inside the lockdown rule in $TF_FILE" >&2
-  echo "       Either the action type changed (away from fixed-response), the" >&2
-  echo "       sub-block indentation changed, or the rule was restructured." >&2
-  echo "       If intentional, update this script's awk sub-block extractor." >&2
-  exit 1
-fi
-
-tf_matches=()
+# ---- 1. local.public_internal_lockdown_body = jsonencode({...}) ------------
+# Match the single-level flat jsonencode form (additive flat keys like
+# `{ error = "not found", request_id = "" }` are fine; nested objects would
+# need the extractor hardened to brace-count — same soft spot the original
+# lint documented). A switch to a non-jsonencode value (raw string for
+# text/plain) does not match and trips the "missing local" error below — by
+# design, so #1642 also updates the resolver + Go type.
+local_matches=()
 while IFS= read -r line; do
-  [ -n "$line" ] && tf_matches+=("$line")
-done < <(printf '%s\n' "$fixed_response_extract" | grep -E -o 'jsonencode\(\{[^}]+\}\)' || true)
+  [ -n "$line" ] && local_matches+=("$line")
+done < <(grep -E -o 'public_internal_lockdown_body[[:space:]]*=[[:space:]]*jsonencode\(\{[^}]+\}\)' "$TF_FILE" || true)
 
-if [ "${#tf_matches[@]}" -eq 0 ]; then
-  echo "ERROR: could not find \`jsonencode({...})\` in $TF_FILE" >&2
-  echo "       The lockdown rule's fixed-response body is expected to use" >&2
-  echo "       jsonencode() — either it was rewritten to a literal JSON string" >&2
-  echo "       or the resource was removed. This lint exists to catch drift" >&2
-  echo "       between the TF body and the smoke fence; please confirm both" >&2
-  echo "       sides intentionally and update this script if so." >&2
+if [ "${#local_matches[@]}" -eq 0 ]; then
+  echo "ERROR: could not find \`local.public_internal_lockdown_body = jsonencode({...})\` in $TF_FILE" >&2
+  echo "       This local is the single source of truth for the lockdown body" >&2
+  echo "       (#1645). If it was renamed, removed, or switched to a non-JSON" >&2
+  echo "       value (e.g. text/plain per #1642), update both this lint AND" >&2
+  echo "       tests/smoke/aws_helpers.go::resolvePublicALBLockdownExpectedBody" >&2
+  echo "       (which json.Unmarshal-s the value) in the same PR." >&2
   exit 1
 fi
-if [ "${#tf_matches[@]}" -gt 1 ]; then
-  echo "ERROR: multiple \`jsonencode({...})\` inside the \`aws_lb_listener_rule.public_internal_block\` block in $TF_FILE:" >&2
-  for m in "${tf_matches[@]}"; do
-    echo "    $m" >&2
-  done
-  echo "  The block scope is already in place (awk range pattern above)." >&2
-  echo "  A second jsonencode here likely means a second fixed-response" >&2
-  echo "  sub-action or a sibling header/audit-trail addition was made" >&2
-  echo "  inside the same rule. Sharpen further to anchor on the" >&2
-  echo "  \`message_body =\` assignment (or scope to the \`fixed_response\`" >&2
-  echo "  sub-block) so the lint compares the exact wire body, not a" >&2
-  echo "  collateral jsonencode call." >&2
+if [ "${#local_matches[@]}" -gt 1 ]; then
+  echo "ERROR: multiple \`public_internal_lockdown_body = jsonencode({...})\` in $TF_FILE" >&2
   exit 1
 fi
-tf_body="${tf_matches[0]}"
+local_body="${local_matches[0]}"
 
-# Extract the Go body from `map[string]string{"error": "not found"}`
-# (the publicALBLockdownExpectedBody declaration). Anchor on the
-# `map[string]string{` prefix to avoid matching other maps in the
-# file; capture through the closing `}`.
-go_matches=()
-while IFS= read -r line; do
-  [ -n "$line" ] && go_matches+=("$line")
-done < <(grep -E -o 'publicALBLockdownExpectedBody[[:space:]]*=[[:space:]]*map\[string\]string\{[^}]+\}' "$GO_FILE" || true)
-
-if [ "${#go_matches[@]}" -eq 0 ]; then
-  echo "ERROR: could not find \`publicALBLockdownExpectedBody = map[string]string{...}\` in $GO_FILE" >&2
-  echo "       Either the constant was renamed, its type was widened to" >&2
-  echo "       map[string]any, or the declaration moved out of this file." >&2
-  echo "       Update this lint if that change is intentional." >&2
-  exit 1
-fi
-if [ "${#go_matches[@]}" -gt 1 ]; then
-  echo "ERROR: multiple \`publicALBLockdownExpectedBody = map[string]string{...}\` in $GO_FILE" >&2
-  exit 1
-fi
-go_body="${go_matches[0]}"
-
-# Normalize each side to a comparable shape: extract the {key, value}
-# pairs and re-render as `key=value` lines, lowercased. This collapses
-# whitespace, key-order, and TF-HCL-vs-Go-map syntax differences.
+# ---- 2 & 3. rule message_body AND SSM param value both reference the local --
+# Both attributes must be assigned from local.public_internal_lockdown_body
+# (not a re-inlined literal) so the served body and the SSM-published expected
+# body share one source (#1645). $1 = attribute, $2 = human-readable site.
 #
-# TF normalize: pull `key = "value"` pairs out of `jsonencode({...})`.
-# Go normalize: pull `"key": "value"` pairs out of `map[string]string{...}`.
-normalize_tf() {
-  local s="$1"
-  s="${s#jsonencode\(\{}"
-  s="${s%\}\)}"
-  # `sort` makes the comparison key-order-insensitive — a deliberate
-  # reorder of the body keys must not trip drift.
-  printf '%s\n' "$s" | grep -E -o '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*"[^"]*"' \
-    | sed -E 's/[[:space:]]*=[[:space:]]*"/=/' \
-    | sed -E 's/"$//' \
-    | sort
-}
-normalize_go() {
-  local s="$1"
-  s="${s#*map\[string\]string\{}"
-  s="${s%\}}"
-  printf '%s\n' "$s" | grep -E -o '"[^"]*"[[:space:]]*:[[:space:]]*"[^"]*"' \
-    | sed -E 's/^"//; s/"[[:space:]]*:[[:space:]]*"/=/; s/"$//' \
-    | sort
+# The match is file-wide, NOT scoped to a single resource block — intentionally.
+# A future priority-2 lockdown rule (the slot-budget expansion the TF resource
+# header describes) would legitimately add a SECOND
+# `message_body = local.public_internal_lockdown_body` line, which a block-scoped
+# or exactly-once assertion would wrongly reject. The accepted gap: if a second
+# resource referenced the local AND the real rule's reference were swapped to an
+# inline literal in the same edit, this check could be masked. The block-scoped
+# rule<=>param guard is check 5 (resource_count_expr); together they keep the
+# single-consumer case (today) tight. Revisit if a real second consumer lands.
+#
+# The two attributes' guarantees differ: a priority-2 rule is a real, documented
+# future second `message_body` consumer; `value` has NO analogous second
+# consumer (only aws_ssm_parameter assigns it), so its file-wide match is merely
+# "no unrelated resource happens to also carry `value = local.<this>`" — weaker
+# in theory but unconditional today. If a second `value` consumer ever appears,
+# scope the `value` check to the SSM resource block rather than relaxing it.
+require_local_ref() {
+  local attr="$1" site="$2"
+  if ! grep -E -q "^[[:space:]]*${attr}[[:space:]]*=[[:space:]]*local\.public_internal_lockdown_body[[:space:]]*\$" "$TF_FILE"; then
+    echo "ERROR: ${site} does not reference local.public_internal_lockdown_body in $TF_FILE." >&2
+    echo "       It MUST stay \`${attr} = local.public_internal_lockdown_body\` so the served" >&2
+    echo "       body and the SSM-published expected body share one source (#1645); a" >&2
+    echo "       re-inlined literal here would diverge and silently false-positive the fence." >&2
+    exit 1
+  fi
 }
 
-tf_normalized="$(normalize_tf "$tf_body")"
-go_normalized="$(normalize_go "$go_body")"
+require_local_ref "message_body" "the lockdown rule's fixed_response.message_body"
+require_local_ref "value" "aws_ssm_parameter.public_internal_lockdown_body's value"
 
-if [ -z "$tf_normalized" ] || [ -z "$go_normalized" ]; then
-  echo "ERROR: extracted lockdown body normalized to an empty pair set." >&2
-  echo "  TF   ($TF_FILE): \"$tf_body\" → normalized: \"$tf_normalized\"" >&2
-  echo "  Go   ($GO_FILE): \"$go_body\" → normalized: \"$go_normalized\"" >&2
-  echo "  An empty body would break the smoke fence's assertion contract." >&2
+# ---- 4a. no re-introduced Go body literal ----------------------------------
+# publicALBLockdownExpectedBody is runtime-resolved from SSM now; a `= map[
+# string]string{...}` literal would resurrect the exact drift class #1645
+# eliminated.
+if grep -E -q 'publicALBLockdownExpectedBody[[:space:]]*=[[:space:]]*map\[string\]string\{' "$GO_FENCE_FILE"; then
+  echo "ERROR: $GO_FENCE_FILE re-introduces a compile-time literal" >&2
+  echo "       \`publicALBLockdownExpectedBody = map[string]string{...}\`." >&2
+  echo "       Under #1645 (Path B) this value is resolved at startup from the" >&2
+  echo "       SSM parameter Terraform publishes; a hardcoded literal here would" >&2
+  echo "       re-couple the fence to a value that can go stale against the rule." >&2
   exit 1
 fi
 
-if [ "$tf_normalized" != "$go_normalized" ]; then
-  echo "ERROR: lockdown body shape drift between TF and smoke test." >&2
-  echo "  $TF_FILE:" >&2
-  echo "    $tf_body" >&2
-  echo "    normalized → $(echo "$tf_normalized" | tr '\n' '|')" >&2
-  echo "  $GO_FILE:" >&2
-  echo "    $go_body" >&2
-  echo "    normalized → $(echo "$go_normalized" | tr '\n' '|')" >&2
-  echo "" >&2
-  echo "The two body shapes must match. The smoke test asserts the ALB" >&2
-  echo "listener rule emits a body matching publicALBLockdownExpectedBody;" >&2
-  echo "if they diverge, the smoke test passes against a rule that no" >&2
-  echo "longer emits that shape. See PR #1635 and the COORDINATED CHANGE" >&2
-  echo "comments at both call sites." >&2
+# ---- 4b. Terraform and smoke name the same SSM parameter -------------------
+# Anchor on the suffix followed by a closing double-quote. The suffix is always
+# the TAIL of the param-name string literal — `"/${var.environment}/nhp/qurl/
+# internal-lockdown-body"` in TF and `"/" + env + "/nhp/qurl/internal-lockdown-body"`
+# in the resolver — so it is immediately followed by `"` in both. A free-floating
+# substring match would also be satisfied by a DOC-COMMENT mention of the path
+# (the resolver's comment spells it out), so renaming only the load-bearing code
+# string would slip past — the gap the `resolver-comment-only` fixture pins.
+for f in "$TF_FILE" "$GO_RESOLVER_FILE"; do
+  if ! grep -F -q "${PARAM_NAME_SUFFIX}\"" "$f"; then
+    echo "ERROR: SSM parameter name drift — \`${PARAM_NAME_SUFFIX}\"\` (the param-name" >&2
+    echo "       string literal) not found in $f." >&2
+    echo "       Terraform (aws_ssm_parameter.public_internal_lockdown_body) and the" >&2
+    echo "       smoke resolver (resolvePublicALBLockdownExpectedBody) must name the" >&2
+    echo "       SAME parameter in code (a doc-comment mention does not count), or the" >&2
+    echo "       fence reads one that does not exist (#1645)." >&2
+    exit 1
+  fi
+done
+
+# ---- 5. rule and SSM param share the same count gate -----------------------
+# The parameter must exist iff the rule exists (param-exists <=> rule-exists),
+# which holds only while both `count` on the SAME expression. A one-sided count
+# edit would otherwise surface as a confusing runtime red (rule deployed, param
+# absent -> resolver hard-errors) or a silent gap (param present, rule absent).
+# Both resources happen to put `count` first today, but the awk doesn't rely on
+# that: it grabs the first `count =` line ANYWHERE within each resource block
+# (interposed comments don't match `^count`, so they're skipped). If the target
+# block ends (next top-level `resource "` line) before a `count` is seen, it
+# stops with no output rather than grabbing a LATER resource's count — the
+# caller's empty guard then fails loud instead of silently comparing the wrong
+# resource.
+resource_count_expr() {
+  awk -v hdr="resource \"$1\" \"$2\"" '
+    index($0, hdr) { in_block = 1; next }
+    in_block && /^resource "/ { exit }
+    in_block && /^[[:space:]]*count[[:space:]]*=/ {
+      sub(/^[[:space:]]*count[[:space:]]*=[[:space:]]*/, "")
+      print
+      exit
+    }
+  ' "$TF_FILE"
+}
+
+rule_count="$(resource_count_expr "aws_lb_listener_rule" "public_internal_block")"
+param_count="$(resource_count_expr "aws_ssm_parameter" "public_internal_lockdown_body")"
+
+if [ -z "$rule_count" ] || [ -z "$param_count" ]; then
+  echo "ERROR: could not extract a \`count = ...\` gate from the lockdown rule and/or the" >&2
+  echo "       SSM parameter in $TF_FILE (rule=\"$rule_count\" param=\"$param_count\")." >&2
+  echo "       If one lost its count, the param-exists <=> rule-exists invariant broke (#1645)." >&2
+  exit 1
+fi
+if [ "$rule_count" != "$param_count" ]; then
+  echo "ERROR: count-gate drift between the lockdown rule and its SSM parameter in $TF_FILE:" >&2
+  echo "         rule  count = $rule_count" >&2
+  echo "         param count = $param_count" >&2
+  echo "       They MUST share the same count so the parameter exists iff the rule does" >&2
+  echo "       (#1645); a mismatch yields a deployed rule with no parameter (resolver" >&2
+  echo "       hard-errors) or a parameter with no rule (silent gap)." >&2
   exit 1
 fi
 
-echo "lockdown body shape in sync: $(echo "$tf_normalized" | tr '\n' '|')"
+# ---- 6. content_type matches between the TF rule and the Go fence literal ---
+# Unlike the body (now SSM-sourced), content_type is still a duplicated TF<->Go
+# literal: the rule's `content_type = "..."` and the fence's
+# publicALBLockdownExpectedCT. The message_body comment requires they move in
+# lockstep (until #1642's text/plain switch can fold CT into the SSM source);
+# fence that here so a one-sided CT edit can't silently false-positive.
+#
+# Extract content_type from WITHIN the lockdown rule's block only — NOT
+# file-wide. qurl-service/main.tf is a large module; an unrelated future
+# content_type (a CDN/header/other fixed_response block) must not trip this lint
+# with an off-topic error. Anchor on the rule header, stop at the next
+# top-level `resource "`, and match the first `content_type = "..."` (the
+# `= "..."` form skips the prose "content_type" mentions in the rule comment).
+rule_content_type() {
+  awk '
+    index($0, "resource \"aws_lb_listener_rule\" \"public_internal_block\"") { in_rule = 1; next }
+    in_rule && /^resource "/ { exit }
+    in_rule && match($0, /content_type[[:space:]]*=[[:space:]]*"[^"]*"/) {
+      ct = substr($0, RSTART, RLENGTH)
+      sub(/^content_type[[:space:]]*=[[:space:]]*"/, "", ct)
+      sub(/"$/, "", ct)
+      print ct
+      exit
+    }
+  ' "$TF_FILE"
+}
+tf_ct="$(rule_content_type)"
+if [ -z "$tf_ct" ]; then
+  echo "ERROR: could not extract \`content_type = \"...\"\` from the lockdown rule" >&2
+  echo "       (aws_lb_listener_rule.public_internal_block) in $TF_FILE — was the" >&2
+  echo "       fixed_response content_type removed or the rule renamed? (#1645)." >&2
+  exit 1
+fi
+
+go_ct="$(grep -E -o 'publicALBLockdownExpectedCT[[:space:]]*=[[:space:]]*"[^"]*"' "$GO_FENCE_FILE" | head -1 | sed -E 's/.*"([^"]*)"/\1/')"
+if [ -z "$go_ct" ]; then
+  echo "ERROR: could not find \`publicALBLockdownExpectedCT = \"...\"\` in $GO_FENCE_FILE (#1645)." >&2
+  exit 1
+fi
+if [ "$tf_ct" != "$go_ct" ]; then
+  echo "ERROR: content_type drift — TF rule content_type=\"$tf_ct\" but the fence's" >&2
+  echo "       publicALBLockdownExpectedCT=\"$go_ct\". They must match (update both in the" >&2
+  echo "       same PR); #1642's text/plain switch must change both in lockstep (#1645)." >&2
+  exit 1
+fi
+
+echo "lockdown body contract in sync (#1645): rule + SSM param both source local.public_internal_lockdown_body = ${local_body}, share count gate (${rule_count}); content_type=\"${tf_ct}\" matches the fence; smoke reads ${PARAM_NAME_SUFFIX}, no Go literal."

@@ -47,6 +47,7 @@ on:
       - "tests/lints/disable-agent-validation/**"
       - "tests/lints/paths-filter-coverage/**"
       - "tests/lints/dispatch-ref-error/**"
+      - "tests/lints/lockdown-body-drift/**"
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
       - "terraform/environments/sandbox/**"
@@ -245,18 +246,31 @@ jobs:
         run: bash scripts/check-cleanup-event-type-lockstep.sh
 
       # Structural fence for the qurl-service /internal/* public-ALB
-      # lockdown body shape (PR #1635). The fixed-response body in
-      # terraform/modules/qurl-service/main.tf (jsonencode({error="not found"}))
-      # is duplicated in tests/smoke/09_public_alb_internal_lockdown_test.go
-      # as publicALBLockdownExpectedBody. The smoke suite is a separate
-      # Go module with no `replace` line back to terraform-rendered
-      # output, so the duplication is structural. A one-sided edit
-      # (e.g., switching to gin's text/plain to close the body-shape
-      # fingerprint leak) would leave the smoke fence asserting on the
-      # prior shape — silently false-positive — until the next live
-      # smoke run flagged it. This lint catches the drift at PR time.
+      # lockdown body contract (PR #1635; rearchitected by #1645). The
+      # smoke fence no longer carries a Go body literal — it resolves its
+      # expected body from the SSM parameter Terraform publishes, and
+      # Terraform authors BOTH the rule's message_body AND that parameter
+      # from one shared local (local.public_internal_lockdown_body). This
+      # lint fences the invariants that keep that drift-free: rule
+      # message_body and the SSM param value both reference the local, the
+      # local stays jsonencode({...}) (a text/plain switch per #1642 must
+      # also update the smoke resolver + Go type), no Go literal is
+      # re-introduced, and Terraform + the smoke resolver name the same
+      # SSM parameter. A one-sided edit fails here at PR time.
       - name: Check lockdown body shape drift (TF ↔ smoke)
         run: bash scripts/check-lockdown-body-drift.sh
+
+      # Fixtures for the lockdown body drift lint: exercise its 3-arg override
+      # against golden + broken TF/Go inputs so a regression in any of the five
+      # invariants it enforces (or the count-gate awk extractor drifting after a
+      # TF fmt change) surfaces here against known answers, not only when a real
+      # drift coincides with the bug. shellcheck both scripts — actionlint's
+      # -shellcheck only covers workflow-embedded scripts, and the lint itself
+      # was previously unchecked.
+      - name: Shellcheck + test lockdown-body-drift fixtures
+        run: |
+          shellcheck scripts/check-lockdown-body-drift.sh tests/lints/lockdown-body-drift/run-fixtures.sh
+          bash tests/lints/lockdown-body-drift/run-fixtures.sh
 
       # Structural fence for the two-layer path filter pattern
       # (push.paths + dorny/paths-filter inside a job). Every

@@ -121,6 +121,31 @@ func TestMain(m *testing.M) {
 	fmt.Fprintf(os.Stderr, "smoke: env=%s mode=%s cell_id=%s region=%s\n",
 		env, discovery.Mode, discovery.CellID, region)
 
+	// Resolve the public-ALB /internal/* lockdown expected body from the
+	// Terraform-owned SSM parameter, so 09_public_alb_internal_lockdown_test.go
+	// asserts the live wire response against an IaC-pinned value rather than a
+	// stale Go literal (#1645, Path B — see
+	// aws_helpers.go::resolvePublicALBLockdownExpectedBody). Only when the
+	// lockdown rule is wired in this env.
+	//
+	// SCOPED failure (not a suite-wide os.Exit): unlike deploy mode/cell —
+	// which every test needs, so fetchDeployDiscovery is fatal — the lockdown
+	// body is consumed only by the 09_* fences. A missing/unparseable parameter
+	// (terraform out of date, env mis-gated, or the body shape changed without
+	// updating the resolver) is recorded here and surfaced as a hard failure of
+	// exactly those fences via requirePublicALBLockdownExpectedBody, rather than
+	// collateral-aborting unrelated tiers (health, blue/green, resolve, ...).
+	if testConfig.QURLInternalALBEnabled {
+		body, err := resolvePublicALBLockdownExpectedBody(ctx, env)
+		if err != nil {
+			publicALBLockdownBodyResolveErr = err
+			fmt.Fprintf(os.Stderr, "WARNING: public-ALB lockdown expected body unresolved — 09_* lockdown fences will fail (other tiers unaffected): %v\n", err)
+		} else {
+			publicALBLockdownExpectedBody = body
+			fmt.Fprintf(os.Stderr, "smoke: public-ALB lockdown expected body resolved from SSM: %v\n", body)
+		}
+	}
+
 	// Pre-fetch (or cache-hit) the Auth0 bearer. Failure is non-fatal
 	// for Tier 1 — Auth0-dependent tests will call requireAuth0 and
 	// fail explicitly if the token is missing.
