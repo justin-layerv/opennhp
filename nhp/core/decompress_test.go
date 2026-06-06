@@ -7,10 +7,14 @@ import (
 	"testing"
 )
 
-// TestDecompressionSizeLimit tests the decompression bomb protection logic.
-// This mirrors the implementation in responder.go:DecryptBody()
+// TestDecompressionSizeLimit is a focused unit test of the size-guard
+// arithmetic (io.LimitReader + the n > limit check), keyed off the real
+// MaxDecompressedBodySize constant. It does NOT drive decryptBody — the real
+// decode path, including the warn threshold, is exercised end-to-end by
+// TestDecryptBodyBoundarySizes; this only pins the limit math independently
+// of the noise-handshake setup that path requires (#1131).
 func TestDecompressionSizeLimit(t *testing.T) {
-	const maxDecompressedSize = 10 * 1024 * 1024 // 10MB - same as responder.go
+	const maxDecompressedSize = MaxDecompressedBodySize
 
 	tests := []struct {
 		name          string
@@ -25,12 +29,12 @@ func TestDecompressionSizeLimit(t *testing.T) {
 		},
 		{
 			name:        "data at 90% of limit",
-			dataSize:    9 * 1024 * 1024, // 9MB
+			dataSize:    maxDecompressedSize * 9 / 10,
 			expectError: false,
 		},
 		{
 			name:        "data exactly at limit",
-			dataSize:    maxDecompressedSize, // 10MB
+			dataSize:    maxDecompressedSize,
 			expectError: false,
 		},
 		{
@@ -41,7 +45,7 @@ func TestDecompressionSizeLimit(t *testing.T) {
 		},
 		{
 			name:          "data significantly exceeds limit",
-			dataSize:      maxDecompressedSize + 1024*1024, // 11MB
+			dataSize:      maxDecompressedSize + 64*1024,
 			expectError:   true,
 			errorContains: "exceeds limit",
 		},

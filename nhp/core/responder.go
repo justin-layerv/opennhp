@@ -522,6 +522,28 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	return nil
 }
 
+// lastDecompressWarnNano throttles the near-ceiling decompression warning
+// below to at most one line per decompressWarnInterval, process-wide. The
+// throttle is deliberate and global: decryptBody is a per-packet path, this
+// deployment ships logs to files with no downstream sampling to lean on, and
+// the signal is an anomalous-ratio canary rather than a per-peer event — a
+// hard-ceiling breach already logs Critical and fails the decode on every
+// occurrence. The warning reports size only, matching that sibling Critical:
+// decryptBody is a pure decoder intentionally decoupled from connection
+// identity, so its unit tests can drive it without a full ConnData.
+var lastDecompressWarnNano atomic.Int64
+
+const decompressWarnInterval = int64(time.Minute)
+
+// decompressWarnAllowed reports whether the near-ceiling warning may log at
+// nowNano, CAS-claiming the throttle slot so at most one caller per
+// decompressWarnInterval wins. Split out so the throttle gate is unit-testable
+// without log capture or wall-clock timing (TestDecompressWarnAllowedThrottle).
+func decompressWarnAllowed(nowNano int64) bool {
+	last := lastDecompressWarnNano.Load()
+	return nowNano-last >= decompressWarnInterval && lastDecompressWarnNano.CompareAndSwap(last, nowNano)
+}
+
 func (ppd *PacketParserData) decryptBody() (err error) {
 	defer func() {
 		// clear secrets
@@ -567,17 +589,31 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 			putZlibReader(r)
 		}()
 
-		// Limit decompressed size to 10MB to prevent DoS via decompression bomb.
-		const maxDecompressedSize = 10 * 1024 * 1024
-		limitedReader := io.LimitReader(r, maxDecompressedSize+1) // +1 to detect overflow
+		// Cap the inflated size as a decompression-bomb guard (#1131). The
+		// on-wire packet is hard-capped at PacketBufferSize, so a single packet
+		// can never reach the former 10 MiB ceiling anyway; MaxDecompressedBodySize
+		// bounds the per-packet decode an order of magnitude below that while
+		// leaving ample headroom over legitimate payloads. See its doc in
+		// constants.go for the measured sizing.
+		limitedReader := io.LimitReader(r, MaxDecompressedBodySize+1) // +1 to detect overflow
 		n, err := io.Copy(buf, limitedReader)
 		if err != nil {
 			log.Critical("message decompression failed: %v", err)
 			return ErrDataDecompressionFailed.WithExtra(err)
 		}
-		if n > maxDecompressedSize {
-			log.Critical("decompressed data exceeds maximum size limit (%d bytes)", maxDecompressedSize)
-			return ErrDataDecompressionFailed.WithExtra(fmt.Errorf("decompressed size %d exceeds limit %d", n, maxDecompressedSize))
+		if n > MaxDecompressedBodySize {
+			log.Critical("decompressed data exceeds maximum size limit (%d bytes)", MaxDecompressedBodySize)
+			return ErrDataDecompressionFailed.WithExtra(fmt.Errorf("decompressed size %d exceeds limit %d", n, MaxDecompressedBodySize))
+		}
+		// Anomaly canary: the warn band (MaxDecompressedBodyWarnSize..ceiling, ~819
+		// KiB–1 MiB) is unreachable by legitimate traffic (~73 KiB max; see
+		// constants.go), so a decode here signals an anomalous compression ratio
+		// (pathological near-duplicate list or a bomb probe under the ceiling), not
+		// growth. Throttled so this per-packet path can't flood the file logs. The
+		// sibling over-ceiling Critical stays per-occurrence by contrast: a rejected
+		// bomb is an actionable security event worth logging every time.
+		if n >= MaxDecompressedBodyWarnSize && decompressWarnAllowed(time.Now().UnixNano()) {
+			log.Warning("decompressed body %d B reached the %d-byte warn threshold — anomalous compression ratio nearing the %d-byte ceiling", n, MaxDecompressedBodyWarnSize, MaxDecompressedBodySize)
 		}
 
 		// Deep-copy out of the pooled buffer; buf.Bytes() aliases pool storage.

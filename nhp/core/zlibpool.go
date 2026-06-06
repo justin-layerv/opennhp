@@ -12,11 +12,12 @@ import (
 // Well-formed NHP packets fit within PacketBufferSize (4 KiB); the 16×
 // multiplier leaves headroom for compressible payloads that expand
 // temporarily during decompression while still capping retention well
-// below the 10 MiB decompression-bomb ceiling. Legitimate payloads
-// that decompress to >64 KiB are uncommon in NHP (the on-wire packet
-// is itself capped at PacketBufferSize) but not illegal; such buffers
-// are scrubbed and dropped rather than retained. The cap is about
-// bounding steady-state pool memory, not rejecting traffic.
+// below the MaxDecompressedBodySize decompression ceiling.
+// Legitimate payloads that decompress to >64 KiB are uncommon in NHP
+// (the on-wire packet is itself capped at PacketBufferSize) but not
+// illegal; such buffers are scrubbed and dropped rather than retained.
+// The cap is about bounding steady-state pool memory, not rejecting
+// traffic.
 const maxPooledBufferSize = 16 * PacketBufferSize
 
 // zlibWriterPool reuses zlib.Writer instances across encryptBody() calls.
@@ -150,16 +151,16 @@ func putBytesBuffer(buf *bytes.Buffer) {
 	// Scrub the full backing array on every call — including the
 	// bomb path below where we drop the buffer from the pool. NHP is
 	// security-critical; plaintext (including decompression-bomb
-	// output up to 10 MiB) is cleared before the buffer becomes
-	// GC-eligible. Reset first to realign the read offset so the
-	// returned view spans the entire backing slice.
+	// output up to MaxDecompressedBodySize) is cleared before the
+	// buffer becomes GC-eligible. Reset first to realign the read
+	// offset so the returned view spans the entire backing slice.
 	buf.Reset()
 	b := buf.Bytes()
 	SetZero(b[:cap(b)])
 
 	if buf.Cap() > maxPooledBufferSize {
 		// Oversize buffer: dropped from the pool to bound retention
-		// well below the 10 MiB decompression-bomb ceiling. Already
+		// well below the MaxDecompressedBodySize ceiling. Already
 		// scrubbed above, so it can become GC-eligible safely. Keep
 		// buf alive across the SetZero call so a sufficiently clever
 		// compiler cannot elide the zeroing as dead stores to

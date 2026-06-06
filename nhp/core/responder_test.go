@@ -214,3 +214,153 @@ func validatePeerConnectionData(device *Device, localPort int, remotePort int) *
 		StopSignal:       make(chan struct{}),
 	}
 }
+
+// overloadKnockFixture builds a real knock packet (NHP_KNK or DHP_KNK) from an
+// agent plus the server device that parses it, to exercise the NHP-COK
+// early-drop cookie path in validatePeer. registerAgent controls whether the
+// agent's pubkey is in the server's peer pool — with agent peer validation on
+// (the NHP_SERVER default), that decides whether the knock passes the peer-pool
+// gate. These tests fence the behavior the #1131 review confirmed must hold: the
+// overload cookie is issued for valid peers but never reflected to a pubkey that
+// fails the peer-pool gate.
+type overloadKnockFixture struct {
+	server        *Device
+	serverConn    *ConnectionData
+	packetContent []byte
+	initTime      int64
+	headerType    int
+}
+
+func newOverloadKnockFixture(tb testing.TB, registerAgent bool, headerType int) overloadKnockFixture {
+	tb.Helper()
+	silenceGlobalLogger(tb)
+
+	agentPrivKey := validatePeerPrivateKey(70)
+	serverPrivKey := validatePeerPrivateKey(33)
+	agentDevice := NewDevice(NHP_AGENT, agentPrivKey, nil)
+	if agentDevice == nil {
+		tb.Fatal("failed to create agent device")
+	}
+	serverDevice := NewDevice(NHP_SERVER, serverPrivKey, nil)
+	if serverDevice == nil {
+		tb.Fatal("failed to create server device")
+	}
+
+	serverPeer := &UdpPeer{
+		PubKeyBase64: serverDevice.PublicKeyBase64(),
+		Ip:           "127.0.0.1",
+		Port:         12346,
+		Type:         NHP_SERVER,
+	}
+	agentDevice.AddPeer(serverPeer)
+
+	if registerAgent {
+		serverDevice.AddPeer(&UdpPeer{
+			PubKeyBase64: agentDevice.PublicKeyBase64(),
+			Ip:           "127.0.0.1",
+			Port:         12345,
+			Type:         NHP_AGENT,
+		})
+	}
+
+	agentConn := validatePeerConnectionData(agentDevice, 12345, 12346)
+	mad, err := agentDevice.MsgToPacket(&MsgData{
+		ConnData:      agentConn,
+		PeerPk:        serverPeer.PublicKey(),
+		HeaderType:    headerType,
+		TransactionId: 1,
+	})
+	if err != nil {
+		tb.Fatalf("MsgToPacket(%s) failed: %v", HeaderTypeToString(headerType), err)
+	}
+
+	return overloadKnockFixture{
+		server:        serverDevice,
+		serverConn:    validatePeerConnectionData(serverDevice, 12346, 12345),
+		packetContent: append([]byte(nil), mad.BasePacket.Content...),
+		initTime:      time.Now().UnixNano(),
+		headerType:    headerType,
+	}
+}
+
+// parse runs createPacketParserData + validatePeer and returns the resulting
+// ppd together with the validatePeer error. Unlike validatePeerFixture's
+// parseAndValidate, it never t.Fatal()s on that error — these tests assert on
+// it directly.
+func (f overloadKnockFixture) parse(tb testing.TB) (*PacketParserData, error) {
+	tb.Helper()
+	pkt := Packet{
+		Content:    f.packetContent,
+		HeaderType: f.headerType,
+	}
+	pd := PacketData{
+		BasePacket: &pkt,
+		ConnData:   f.serverConn,
+		InitTime:   f.initTime,
+	}
+	ppd, err := f.server.createPacketParserData(&pd)
+	if err != nil {
+		return ppd, err
+	}
+	return ppd, ppd.validatePeer()
+}
+
+// TestValidatePeerOverloadKnockIssuesCookie pins the spec's NHP-COK early-drop
+// (NHP.pdf §NHP-COK): under server overload, a registered agent's knock is
+// answered with a cookie challenge (ErrServerRejectWithCookie) and the cookie
+// is generated, so the agent can re-knock (NHP-RKN) carrying it. Covers both
+// knock header types the overload short-circuit handles (NHP_KNK and DHP_KNK).
+func TestValidatePeerOverloadKnockIssuesCookie(t *testing.T) {
+	for _, headerType := range []int{NHP_KNK, DHP_KNK} {
+		t.Run(HeaderTypeToString(headerType), func(t *testing.T) {
+			fixture := newOverloadKnockFixture(t, true, headerType)
+			fixture.server.SetOverload(true)
+
+			ppd, err := fixture.parse(t)
+			defer ppd.Destroy()
+
+			assertNHPError(t, err, ErrServerRejectWithCookie)
+			if IsZero(fixture.serverConn.CookieStore.CurrCookie[:]) {
+				t.Fatal("overload knock: cookie was not generated (CookieStore.CurrCookie still zero)")
+			}
+		})
+	}
+}
+
+// TestValidatePeerOverloadKnockUnregisteredNoCookie is the reflection-safety
+// fence flagged by the #1131 review. With agent peer validation on (the
+// NHP_SERVER default), an unregistered pubkey must be dropped at the peer-pool
+// gate (ErrPeerNotFound) and must NOT elicit a cookie. A COK reply (~1.23x the
+// minimal KNK that triggers it) sent to a forged source would be an
+// amplification primitive — exactly the vector #1131 item 1 warns about — so a
+// future refactor that moves the cookie emit ahead of this gate must fail here.
+func TestValidatePeerOverloadKnockUnregisteredNoCookie(t *testing.T) {
+	fixture := newOverloadKnockFixture(t, false, NHP_KNK)
+	fixture.server.SetOverload(true)
+
+	ppd, err := fixture.parse(t)
+	defer ppd.Destroy()
+
+	assertNHPError(t, err, ErrPeerNotFound)
+	if !IsZero(fixture.serverConn.CookieStore.CurrCookie[:]) {
+		t.Fatal("unregistered overload KNK must not generate a cookie (reflection guard)")
+	}
+}
+
+// TestValidatePeerKnockNotOverloadCompletesHandshake confirms the cookie
+// short-circuit is overload-gated: with the server NOT overloaded, a registered
+// agent's KNK runs validatePeer to completion and no cookie is generated.
+func TestValidatePeerKnockNotOverloadCompletesHandshake(t *testing.T) {
+	fixture := newOverloadKnockFixture(t, true, NHP_KNK)
+	// server overload deliberately left false
+
+	ppd, err := fixture.parse(t)
+	defer ppd.Destroy()
+
+	if err != nil {
+		t.Fatalf("non-overload KNK: validatePeer returned %v, want nil", err)
+	}
+	if !IsZero(fixture.serverConn.CookieStore.CurrCookie[:]) {
+		t.Fatal("non-overload KNK must not generate a cookie")
+	}
+}

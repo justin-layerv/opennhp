@@ -14,10 +14,11 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/core/scheme/curve"
 )
 
-// testMaxDecompressedSize mirrors the unexported maxDecompressedSize constant
-// defined in responder.go (inside decryptBody(), around line 466). If the
-// production limit changes, this constant must be updated to match.
-const testMaxDecompressedSize = 10 * 1024 * 1024
+// testMaxDecompressedSize tracks the production decompression ceiling so these
+// tests can never silently pass against a stale value — it is the real
+// constant, not a hand-copied mirror. See MaxDecompressedBodySize in
+// constants.go for the sizing rationale (#1131).
+const testMaxDecompressedSize = MaxDecompressedBodySize
 
 // assertNHPError checks that err is a *core.Error with the expected error code.
 func assertNHPError(t testing.TB, err error, expected *Error) {
@@ -142,7 +143,7 @@ func buildDecryptBodyPPD(t testing.TB, body []byte, compress bool) *PacketParser
 }
 
 // TestDecryptBodyCompressedWithinLimit verifies that decryptBody() successfully
-// decompresses a payload that is within the 10 MB limit.
+// decompresses a payload that is within the MaxDecompressedBodySize limit.
 func TestDecryptBodyCompressedWithinLimit(t *testing.T) {
 	// Create a payload that compresses well but stays within the limit.
 	originalData := bytes.Repeat([]byte("ABCDEFGHIJ"), 100)
@@ -360,8 +361,9 @@ func TestDecryptBodyRoundTrip(t *testing.T) {
 }
 
 // TestDecryptBodyBoundarySizes tests decryptBody() behavior at sizes around
-// the 10 MB decompression limit to verify exact boundary enforcement.
-// Includes decompression bomb cases (10MB+1, 20MB) and the exact boundary.
+// the MaxDecompressedBodySize decompression limit to verify exact boundary
+// enforcement. Includes decompression bomb cases (limit+1, 2×limit) and the
+// exact boundary.
 func TestDecryptBodyBoundarySizes(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -369,22 +371,27 @@ func TestDecryptBodyBoundarySizes(t *testing.T) {
 		expectError bool
 	}{
 		{
-			name:        "exactly at 10MB limit",
+			name:        "at warning threshold (still succeeds)",
+			dataSize:    MaxDecompressedBodyWarnSize,
+			expectError: false,
+		},
+		{
+			name:        "exactly at limit",
 			dataSize:    testMaxDecompressedSize,
 			expectError: false,
 		},
 		{
-			name:        "1 byte over 10MB limit",
+			name:        "1 byte over limit",
 			dataSize:    testMaxDecompressedSize + 1,
 			expectError: true,
 		},
 		{
-			name:        "1KB over 10MB limit",
+			name:        "1KB over limit",
 			dataSize:    testMaxDecompressedSize + 1024,
 			expectError: true,
 		},
 		{
-			name:        "20MB decompression bomb",
+			name:        "2x limit decompression bomb",
 			dataSize:    2 * testMaxDecompressedSize,
 			expectError: true,
 		},
@@ -419,6 +426,28 @@ func TestDecryptBodyBoundarySizes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestDecompressWarnAllowedThrottle covers the near-ceiling warning throttle
+// gate used by decryptBody (#1131): the first call in a fresh interval is
+// allowed, repeats within the interval are suppressed, and the next interval
+// re-opens the gate. Directly exercises the CAS branch that the boundary tests
+// run but don't assert on, and resets the process-global throttle so it is
+// order-independent of other tests that cross the warn threshold.
+func TestDecompressWarnAllowedThrottle(t *testing.T) {
+	lastDecompressWarnNano.Store(0)
+	t.Cleanup(func() { lastDecompressWarnNano.Store(0) })
+
+	const t0 = int64(1_700_000_000_000_000_000) // fixed synthetic ns
+	if !decompressWarnAllowed(t0) {
+		t.Fatal("first call in a fresh interval must be allowed")
+	}
+	if decompressWarnAllowed(t0 + decompressWarnInterval - 1) {
+		t.Fatal("a second call within the interval must be throttled")
+	}
+	if !decompressWarnAllowed(t0 + decompressWarnInterval) {
+		t.Fatal("a call at the interval boundary must re-open the gate")
 	}
 }
 
