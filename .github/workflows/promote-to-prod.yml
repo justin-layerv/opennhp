@@ -2994,6 +2994,13 @@ jobs:
   # =============================================================================
   # DEPLOY QURL - ECS task definition re-registration
   # =============================================================================
+  # Sandbox counterpart: deploy-sandbox-qurl in build-and-push.yml (#1634).
+  # The two roll paths intentionally differ — prod takes the image tag from
+  # needs.manifest.outputs.qurl_image_tag and always rolls on an operator-driven
+  # promotion; sandbox sources the tag from the /<prefix>/qurl-api-image-tag SSM
+  # param and adds a running-vs-latest idempotency guard (it runs on every push
+  # to main). Both reuse deploy-ecs-service.sh, so a change to the shared
+  # deployer / ECS contract should prompt a look at the other path.
   deploy-qurl:
     name: Deploy QURL Service
     needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac]

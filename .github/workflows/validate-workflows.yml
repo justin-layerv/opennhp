@@ -155,6 +155,15 @@ jobs:
       - name: Test promote-to-prod gating (issue #1322)
         run: python3 tests/scripts/test_promote_to_prod_gating.py
 
+      # Regression guard for #1634: build-and-push.yml's sandbox deploy must
+      # roll qurl-service onto the latest TF-registered task def after apply
+      # (aws_ecs_service.qurl ignores task_definition changes, so the service
+      # never advances on its own). Fails if the deploy-sandbox-qurl job or its
+      # idempotency guard / SSM-sourced image tag regress. actionlint can't
+      # catch a silent removal; this asserts it against the real workflow.
+      - name: Test sandbox qurl ECS roll (issue #1634)
+        run: bash tests/scripts/check-sandbox-qurl-roll_test.sh
+
       # Fence against re-introducing per-build writes to the blue/green
       # image-tag SSM slots — see scripts/check-image-tag-writer-allowlist.sh
       # for the contract. The test's final case scans the real repo,

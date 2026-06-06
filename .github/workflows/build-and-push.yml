@@ -1845,6 +1845,197 @@ jobs:
             echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')"
           } >> "$GITHUB_OUTPUT"
 
+  # =============================================================================
+  # DEPLOY SANDBOX - QURL ECS task-def roll (#1634)
+  # =============================================================================
+  # deploy-sandbox-infra's TF apply registers a new qurl-service task-def
+  # revision whenever a qurl env var changes, but aws_ecs_service.qurl carries
+  # lifecycle.ignore_changes = [task_definition] ("managed by CI" — see
+  # terraform/modules/qurl-service/main.tf). Until #1634, only prod CI
+  # (promote-to-prod.yml deploy-qurl) advanced the service; sandbox never did,
+  # so env-var changes silently no-op'd on the running service and only
+  # surfaced when a downstream consumer exercised the path (qurl-service #335,
+  # which 403'd customer flows for ~30h on a stale sandbox revision).
+  #
+  # This job mirrors prod's deploy-qurl, reusing deploy-ecs-service.sh (ECS
+  # circuit-breaker auto-rollback + post-roll task-def verify). Two deliberate
+  # choices:
+  #   - Image tag comes from SSM (qurl-service CI's source of truth), NOT the
+  #     latest task def: TF's latest revision image can lag SSM because TF only
+  #     re-reads it on apply, so deriving the tag from the task def could
+  #     downgrade the running image if qurl-CI pushed between apply and roll.
+  #   - Parallel to blue-green, gated only on deploy-sandbox-infra — NOT ordered
+  #     before server. Prod's deploy-qurl runs AFTER deploy-server, so "qurl
+  #     before server" is not a correctness invariant; coupling blue-green's
+  #     gating to this job would be unjustified.
+  #
+  # Idempotency: deploy-sandbox-infra runs TF apply on every push to main, but
+  # only a qurl change bumps the revision. The roll is gated on
+  # running-task-def != latest-task-def, so the common no-qurl-change deploy is
+  # a fast no-op rather than a redundant rolling restart. (The scheduled-release
+  # path, ensure-sandbox-deployed.sh, does not run terraform apply and so
+  # cannot create qurl revisions — it does not share this gap.)
+  deploy-sandbox-qurl:
+    name: Deploy Sandbox - QURL Service
+    needs: [deploy-sandbox-infra]
+    if: always() && needs.deploy-sandbox-infra.result == 'success'
+    runs-on: ubuntu-latest
+    environment: sandbox
+    # Roll budget: deploy-ecs-service.sh waits up to 600s for stability + 30s
+    # ALB settle. 15m leaves headroom over the worst case (matches prod's
+    # deploy-qurl) without masking a genuine hang.
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: deploy-sandbox-qurl
+      cancel-in-progress: false  # Never cancel an in-flight ECS roll.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # Reuses AWS_ROLE_ARN (the sandbox apply role). It already manages the
+      # qurl ECS service / task def / SSM params via TF, so it holds the
+      # ecs:RegisterTaskDefinition / UpdateService / Describe*, iam:PassRole,
+      # and ssm:Get/PutParameter permissions deploy-ecs-service.sh needs.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # SSM prefix = local.name_prefix = "layerv-nhp-${environment}"
+      # (terraform/main.tf), the same prefix the qurl module writes its
+      # cluster/service/image-tag params under. Mirror of prod's
+      # PROD_SSM_PREFIX: 'layerv-nhp-prod'.
+      - name: Roll qurl-service to latest task def
+        env:
+          SANDBOX_SSM_PREFIX: layerv-nhp-sandbox
+        run: |
+          set -euo pipefail
+          # AWS_REGION is always set by the workflow-level env: block.
+
+          # Bounded retry for the LOUD-FAIL read-only AWS calls (the two ECS
+          # describes + the image-tag SSM read). 3 attempts, linear backoff
+          # (3s, 6s). Non-final attempts swallow stderr (a transient error we'll
+          # retry); the FINAL attempt lets stderr through so a genuine exhausted
+          # failure is self-explaining (e.g. an IAM-denied describe) rather than
+          # dying as a bare non-zero exit — #1634 is about not hiding failures.
+          # Callers have no `|| fallback`, so an exhausted failure exits the job
+          # red under set -e. (The is-qurl-deployed probe is NOT loud-fail — it
+          # uses ssm_probe below, which alone may resolve to a skip.)
+          aws_read() {
+            local attempt out
+            for attempt in 1 2 3; do
+              if [[ "$attempt" -eq 3 ]]; then
+                # Final attempt: stderr through (self-explaining on exhaustion).
+                out=$("$@") || return 1
+              else
+                # Earlier attempts: swallow the transient error we'll retry.
+                out=$("$@" 2>/dev/null) || { sleep "$((attempt * 3))"; continue; }
+              fi
+              printf '%s' "$out"
+              return 0
+            done
+          }
+
+          # Probe an SSM param that MAY be legitimately absent (qurl not
+          # deployed). Prints the value (rc 0) on success; prints nothing
+          # (rc 0) ONLY on a genuine ParameterNotFound — the "not deployed"
+          # skip signal. ANY OTHER error retries the transient case and then
+          # fails loud (rc 1, last stderr shown), so a sustained SSM outage
+          # during deploy goes red instead of masquerading as "not deployed"
+          # (the #1634 hidden-skip class — a roll that should happen must never
+          # be silently skipped). Stderr -> tempfile (not 2>&1) so a CLI warning
+          # on a successful read can't contaminate the returned value.
+          ssm_probe() {
+            local attempt err out
+            err=$(mktemp)
+            for attempt in 1 2 3; do
+              if out=$(aws ssm get-parameter \
+                  --name "/${SANDBOX_SSM_PREFIX}/$1" \
+                  --query "Parameter.Value" --output text \
+                  --region "$AWS_REGION" 2>"$err"); then
+                rm -f "$err"; printf '%s' "$out"; return 0
+              fi
+              if grep -q 'ParameterNotFound' "$err"; then
+                rm -f "$err"; return 0  # deterministic absence -> skip signal
+              fi
+              if [[ "$attempt" -lt 3 ]]; then sleep "$((attempt * 3))"; fi
+            done
+            cat "$err" >&2; rm -f "$err"; return 1  # exhausted, non-not-found -> loud
+          }
+
+          # Is qurl deployed in this env? The cluster/service SSM params are
+          # created by modules/qurl-service only when deploy_qurl_service=true.
+          # ssm_probe returns empty ONLY on a genuine ParameterNotFound (=> not
+          # deployed => skip); a sustained SSM error fails the job loud instead
+          # of being mistaken for "not deployed". #1634 is about a roll failure
+          # being hidden, so never degrade an error into a silent skip.
+          ECS_SERVICE=$(ssm_probe qurl-ecs-service)
+          ECS_CLUSTER=$(ssm_probe qurl-ecs-cluster)
+          if [[ -z "$ECS_SERVICE" || "$ECS_SERVICE" == "None" \
+             || -z "$ECS_CLUSTER" || "$ECS_CLUSTER" == "None" ]]; then
+            echo "::notice::qurl-service cluster/service SSM params absent under /${SANDBOX_SSM_PREFIX}/ — qurl not deployed in sandbox; skipping roll."
+            echo "- QURL roll: **skipped** (qurl not deployed in sandbox)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Idempotency guard. TF env-var changes always bump the task-def
+          # revision; compare running vs latest and advance only on a
+          # difference, so a no-qurl-change deploy is a fast no-op. (Image-only
+          # changes — a new tag with no TF env change, hence no new revision —
+          # are rolled by qurl-service CI's own pipeline, not here; this job
+          # only advances the service onto revisions Terraform created.)
+          #
+          # A persistently-broken revision (the circuit breaker rolls back to
+          # the prior good one) leaves running != latest, so this re-attempts
+          # the roll on every push and stays red until the bad TF change is
+          # reverted. That loud re-attempt is intentional — do NOT add a "skip
+          # the known-failed revision" short-circuit: it would silently strand
+          # the service on the old revision, the exact hidden-staleness #1634
+          # exists to prevent.
+          RUNNING=$(aws_read aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query "services[0].taskDefinition" --output text \
+            --region "$AWS_REGION")
+          if [[ -z "$RUNNING" || "$RUNNING" == "None" ]]; then
+            echo "::error::Could not read running task definition for service $ECS_SERVICE."
+            exit 1
+          fi
+          FAMILY="${RUNNING##*task-definition/}"  # strip ARN prefix -> family:rev
+          FAMILY="${FAMILY%:*}"                   # strip :rev -> family
+          LATEST=$(aws_read aws ecs describe-task-definition \
+            --task-definition "$FAMILY" \
+            --query "taskDefinition.taskDefinitionArn" --output text \
+            --region "$AWS_REGION")
+          echo "Running task def: $RUNNING"
+          echo "Latest task def:  $LATEST"
+          if [[ "$RUNNING" == "$LATEST" ]]; then
+            echo "::notice::qurl-service already on latest task-def revision; nothing to advance."
+            echo "- QURL roll: **no-op** (already on latest revision \`${LATEST##*/}\`)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # A newer TF-registered revision exists. Roll to it via the shared
+          # deploy-ecs-service.sh (rather than a plain `update-service` onto the
+          # latest revision) to inherit its ECS circuit-breaker auto-rollback +
+          # post-roll task-def verify. It re-registers a revision with the SSM
+          # image tag (newest image + newest env vars); the duplicate revision
+          # is an acceptable cost for reusing the hardened, prod-shared deployer.
+          IMAGE_TAG=$(aws_read aws ssm get-parameter \
+            --name "/${SANDBOX_SSM_PREFIX}/qurl-api-image-tag" \
+            --query "Parameter.Value" --output text \
+            --region "$AWS_REGION")
+          if [[ -z "$IMAGE_TAG" || "$IMAGE_TAG" == "None" ]]; then
+            echo "::error::/${SANDBOX_SSM_PREFIX}/qurl-api-image-tag is empty; cannot roll qurl-service."
+            exit 1
+          fi
+          echo "Advancing qurl-service (${RUNNING##*/} -> latest; image tag: $IMAGE_TAG)..."
+          ./.github/scripts/deploy-ecs-service.sh "$SANDBOX_SSM_PREFIX" "$IMAGE_TAG"
+          echo "- QURL roll: **advanced** to latest revision (image tag \`$IMAGE_TAG\`)" >> "$GITHUB_STEP_SUMMARY"
+
   # Dispatch blue/green deployment instead of doing direct instance refresh.
   # This ensures every CI deploy alternates between blue and green ASGs,
   # includes the knock-readiness gate, and uses instant NLB listener
@@ -1965,11 +2156,29 @@ jobs:
 
   deploy-sandbox-validate:
     name: Deploy Sandbox - Validate
-    needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green]
+    # deploy-sandbox-qurl is in needs (#1634) so validation never runs against
+    # a stale qurl service: this job's E2E demo flow — and the nhp-smoke-sandbox
+    # job that needs it (tier: all, which exercises the qurl resolve path that
+    # 403'd in the incident) — must observe the rolled task def, not race it.
+    # deploy-sandbox-qurl runs parallel to blue-green (both need only infra), so
+    # without this edge a fast blue-green + a slow roll (circuit-breaker retry,
+    # up to 600s) could let smoke test the old revision and go red on a healthy
+    # deploy — the misattributed-failure class #1634 is about.
+    #
+    # The `if` ORDERS after the roll but does NOT gate on its success: a roll
+    # FAILURE means the ECS circuit breaker rolled back to the previous healthy
+    # revision, so validate+smoke still run against a known-good qurl and — more
+    # importantly — server/AC smoke coverage (independent of qurl) is preserved
+    # instead of being suppressed by an unrelated qurl problem. The roll failure
+    # is still loud: deploy-sandbox-qurl goes red and is in notify's
+    # DEPLOY_FAILED loop. Only `cancelled` (indeterminate/half-rolled, run being
+    # torn down) skips validation.
+    needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green, deploy-sandbox-qurl]
     if: |
       always() &&
       needs.deploy-sandbox-infra.result == 'success' &&
-      needs.deploy-sandbox-blue-green.result == 'success'
+      needs.deploy-sandbox-blue-green.result == 'success' &&
+      needs.deploy-sandbox-qurl.result != 'cancelled'
     runs-on: ubuntu-latest
     environment: sandbox
     timeout-minutes: 10
@@ -2188,6 +2397,10 @@ jobs:
       # Sandbox deploy jobs
       - deploy-sandbox-infra
       - deploy-sandbox-blue-green
+      # qurl ECS roll (#1634). Included so a failed roll surfaces in Slack
+      # instead of being masked by a green build/blue-green — the same
+      # surface-the-failure rationale as packer-build above.
+      - deploy-sandbox-qurl
       - deploy-sandbox-validate
       - nhp-smoke-sandbox
     # Skip Slack when the waiter was cancelled (concurrency preempt or
@@ -2220,6 +2433,7 @@ jobs:
           # Sandbox deploy components
           SANDBOX_INFRA: ${{ needs.deploy-sandbox-infra.result }}
           SANDBOX_BLUE_GREEN: ${{ needs.deploy-sandbox-blue-green.result }}
+          SANDBOX_QURL: ${{ needs.deploy-sandbox-qurl.result }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-sandbox.result }}
           # true when a new app image was built this run (vs. a re-roll of the
@@ -2294,7 +2508,7 @@ jobs:
           # Build component status strings with visual pipeline
           SANDBOX_STATUS=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke"
+            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_QURL") QURL → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke"
           fi
 
           # Determine overall status and header.
@@ -2317,7 +2531,7 @@ jobs:
           elif [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
-            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
+            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_QURL" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
               if [[ "$result" == "failure" ]]; then
                 DEPLOY_FAILED="true"
                 break
