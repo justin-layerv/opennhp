@@ -42,7 +42,13 @@ locals {
   # pattern in the prod sibling. Looked up post-PR-A apply via
   # `aws elbv2 describe-load-balancers` or `terraform output -raw
   # alb_dns_name` against qurl-integrations-infra#421's workspace.
-  discord_bot_alb_dns_name = "qurl-bot-discord-sandbox-2094914143.us-east-2.elb.amazonaws.com"
+  # Re-homed onto the dedicated discord VPC (vpc-03a677ef13dfb3153, 10.4/16) in
+  # qurl-integrations-infra#927 (issue #394). The cross-VPC ALB move forced a
+  # destroy+recreate, so the ALB got a new DNSName (the old
+  # ...-2094914143... name is dead). CanonicalHostedZoneId stays the us-east-2
+  # ELB constant Z3AADJGX6KTTL2 (the alias `zone_id` below), so only this line
+  # changes on a re-home.
+  discord_bot_alb_dns_name = "qurl-bot-discord-sandbox-1482978767.us-east-2.elb.amazonaws.com"
 }
 
 # Env-root bot DNS records are same-account Route53 writers that consume the
