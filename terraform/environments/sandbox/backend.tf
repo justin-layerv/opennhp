@@ -23,6 +23,12 @@ terraform {
     region       = "us-east-2"
     use_lockfile = true
     encrypt      = true
+    # SSE-KMS for state (#1128): with encrypt=true, kms_key_id overrides the
+    # explicit-AES256 header so the state object is encrypted under the CMK.
+    # alias/terraform-state must exist in this account before `init` resolves
+    # it. See docs/runbooks/tfstate-kms-migration.md (incl. the
+    # `init -reconfigure` step and the .tflock vs state-object Phase D check).
+    kms_key_id = "alias/terraform-state"
     # Note: Uses AWS_PROFILE env var locally, or IAM role in CI/CD
   }
 }

@@ -1696,7 +1696,10 @@ jobs:
         run: |
           mkdir -p "$HOME/.terraform.d/plugin-cache"
           export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
-          terraform init
+          # -reconfigure: backend.tf gained kms_key_id (#1128) — harmless no-op on
+          # this fresh CI checkout, required for a local stale .terraform/. State
+          # does not move (not -migrate-state). See tfstate-kms-migration runbook.
+          terraform init -reconfigure
 
       - name: Fetch Auth0 Token
         id: auth0
@@ -2320,7 +2323,10 @@ jobs:
         run: |
           mkdir -p "$HOME/.terraform.d/plugin-cache"
           export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
-          terraform init
+          # -reconfigure: backend.tf gained kms_key_id (#1128) — harmless no-op on
+          # this fresh CI checkout, required for a local stale .terraform/. State
+          # does not move (not -migrate-state). See tfstate-kms-migration runbook.
+          terraform init -reconfigure
 
       - name: Fetch Auth0 Token
         id: auth0
