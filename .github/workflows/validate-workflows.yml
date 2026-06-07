@@ -167,6 +167,15 @@ jobs:
       - name: Test sandbox qurl ECS roll (issue #1634)
         run: bash tests/scripts/check-sandbox-qurl-roll_test.sh
 
+      # Behavioral fence for the shared ECS deploy helper used by sandbox and
+      # prod qurl rolls. It must reject real rollbacks, while accepting a newer
+      # same-family task def only when a concurrent qurl-service deploy has
+      # advanced the service to the current SSM image tag.
+      - name: Test ECS service deploy helper
+        run: |
+          shellcheck .github/scripts/deploy-ecs-service.sh tests/scripts/deploy-ecs-service_test.sh
+          bash tests/scripts/deploy-ecs-service_test.sh
+
       # Fence against re-introducing per-build writes to the blue/green
       # image-tag SSM slots — see scripts/check-image-tag-writer-allowlist.sh
       # for the contract. The test's final case scans the real repo,

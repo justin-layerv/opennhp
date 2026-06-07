@@ -95,6 +95,8 @@ assert_in "$JOB" deploy-sandbox-qurl "skips when running == latest (no-op guard)
 # (deriving could downgrade the image if qurl-CI pushed between apply and roll).
 assert_in "$JOB" deploy-sandbox-qurl "reads image tag from SSM qurl-api-image-tag" \
   'qurl-api-image-tag'
+assert_in "$JOB" deploy-sandbox-qurl "preserves qurl-service SSM image writer" \
+  'PRESERVE_SSM_IMAGE_TAG: "true"'
 
 # Loud-fail / quiet-skip: genuine absence of the cluster/service params skips;
 # everything else fails the job. Guard the skip notice so it cannot be deleted

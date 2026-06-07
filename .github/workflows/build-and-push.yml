@@ -2053,9 +2053,10 @@ jobs:
     if: always() && needs.deploy-sandbox-infra.result == 'success'
     runs-on: ubuntu-latest
     environment: sandbox
-    # Roll budget: deploy-ecs-service.sh waits up to 600s for stability + 30s
-    # ALB settle. 15m leaves headroom over the worst case (matches prod's
-    # deploy-qurl) without masking a genuine hang.
+    # Roll budget: deploy-ecs-service.sh waits up to 600s for stability, can add
+    # a 30s two-read floor when verifying a concurrent sandbox roll, then waits
+    # 30s for ALB settle. 15m leaves headroom over that worst case (matches
+    # prod's deploy-qurl) without masking a genuine hang.
     timeout-minutes: 15
     permissions:
       id-token: write
@@ -2082,8 +2083,10 @@ jobs:
       # cluster/service/image-tag params under. Mirror of prod's
       # PROD_SSM_PREFIX: 'layerv-nhp-prod'.
       - name: Roll qurl-service to latest task def
+        id: roll-qurl
         env:
           SANDBOX_SSM_PREFIX: layerv-nhp-sandbox
+          PRESERVE_SSM_IMAGE_TAG: "true"
         run: |
           set -euo pipefail
           # AWS_REGION is always set by the workflow-level env: block.
@@ -2193,8 +2196,11 @@ jobs:
           # A newer TF-registered revision exists. Roll to it via the shared
           # deploy-ecs-service.sh (rather than a plain `update-service` onto the
           # latest revision) to inherit its ECS circuit-breaker auto-rollback +
-          # post-roll task-def verify. It re-registers a revision with the SSM
-          # image tag (newest image + newest env vars); the duplicate revision
+          # post-roll task-def verify. PRESERVE_SSM_IMAGE_TAG makes the helper
+          # re-read the current SSM image tag and leave qurl-service's own SSM
+          # writer authoritative, avoiding a stale overwrite between this
+          # workflow's read and the helper's Step 1. It still re-registers a
+          # duplicate task-def revision (newest image + newest env vars), which
           # is an acceptable cost for reusing the hardened, prod-shared deployer.
           IMAGE_TAG=$(aws_read aws ssm get-parameter \
             --name "/${SANDBOX_SSM_PREFIX}/qurl-api-image-tag" \
@@ -2206,7 +2212,21 @@ jobs:
           fi
           echo "Advancing qurl-service (${RUNNING##*/} -> latest; image tag: $IMAGE_TAG)..."
           ./.github/scripts/deploy-ecs-service.sh "$SANDBOX_SSM_PREFIX" "$IMAGE_TAG"
-          echo "- QURL roll: **advanced** to latest revision (image tag \`$IMAGE_TAG\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "requested_image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: QURL roll summary
+        if: steps.roll-qurl.outcome == 'success' && steps.roll-qurl.outputs.requested_image_tag != ''
+        env:
+          DEPLOYED_IMAGE: ${{ steps.roll-qurl.outputs.deployed_image }}
+          DEPLOYED_TASK_DEF_ARN: ${{ steps.roll-qurl.outputs.deployed_task_def_arn }}
+          REQUESTED_IMAGE_TAG: ${{ steps.roll-qurl.outputs.requested_image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$DEPLOYED_IMAGE" && -n "$DEPLOYED_TASK_DEF_ARN" ]]; then
+            echo "- QURL roll: **advanced** (actual image \`$DEPLOYED_IMAGE\`, task def \`${DEPLOYED_TASK_DEF_ARN##*/}\`; requested SSM tag \`$REQUESTED_IMAGE_TAG\`)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- QURL roll: **advanced** (requested SSM tag \`$REQUESTED_IMAGE_TAG\`; helper did not emit deployed outputs)" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # Dispatch blue/green deployment instead of doing direct instance refresh.
   # This ensures every CI deploy alternates between blue and green ASGs,

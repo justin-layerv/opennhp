@@ -363,6 +363,8 @@ lint-workflows:
 	}
 	@python3 tests/scripts/test_promote_to_prod_gating.py
 	@bash tests/scripts/check-sandbox-qurl-roll_test.sh
+	@shellcheck .github/scripts/deploy-ecs-service.sh tests/scripts/deploy-ecs-service_test.sh
+	@bash tests/scripts/deploy-ecs-service_test.sh
 	@bash tests/scripts/dependabot-go-tidy_test.sh
 	@bash tests/lints/paths-filter-coverage/run-fixtures.sh
 	@python3 scripts/check-paths-filter-coverage.py

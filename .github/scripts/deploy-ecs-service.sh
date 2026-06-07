@@ -25,6 +25,15 @@
 #   3. Replaces the image tag and registers a new task definition revision
 #   4. Updates ECS service to use new task definition
 #   5. Waits for service stability (ECS circuit breaker handles rollback)
+#
+# Success contract:
+#   - Default/prod path: exit 0 means the requested task definition is stable.
+#   - Sandbox-only concurrent path: exit 0 may mean qurl-service's own deploy
+#     won the last-writer race and the service is stable on the current SSM
+#     image. The final summary logs the actual active image/task definition.
+#   - PRESERVE_SSM_IMAGE_TAG=true is sandbox-only and leaves qurl-service's SSM
+#     tag as the source of truth instead of rewriting it from the caller's
+#     earlier read.
 
 set -euo pipefail
 
@@ -38,6 +47,16 @@ fi
 SSM_PREFIX="$1"
 NEW_IMAGE_TAG="$2"
 AWS_REGION="${AWS_REGION:-us-east-2}"
+PRESERVE_SSM_IMAGE_TAG="${PRESERVE_SSM_IMAGE_TAG:-false}"
+ALLOW_CONCURRENT_FORWARD_DEPLOY=false
+if [[ "$SSM_PREFIX" == "layerv-nhp-sandbox" ]]; then
+  # Sandbox qurl-service has an independent main-branch deploy workflow that
+  # writes /layerv-nhp-sandbox/qurl-api-image-tag before ECS update-service.
+  # That cross-repo ordering lets this helper distinguish a healthy concurrent
+  # forward deploy from a circuit-breaker rollback. Prod promote-to-prod is
+  # serialized by workflow concurrency, so keep prod on strict exact-match.
+  ALLOW_CONCURRENT_FORWARD_DEPLOY=true
+fi
 
 if [[ -z "$NEW_IMAGE_TAG" ]]; then
   echo "ERROR: new-image-tag cannot be empty"
@@ -113,6 +132,196 @@ dump_ecs_events() {
   return 0
 }
 
+normalize_token_output() {
+  local label="$1"
+  local value="$2"
+
+  # AWS CLI --output text can include harmless surrounding whitespace. Interior
+  # whitespace is corrupt for image tags and ARNs, so reject instead of repairing.
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+
+  if [[ "$value" == *[[:space:]]* ]]; then
+    echo "ERROR: $label contains interior whitespace; refusing to silently repair it." >&2
+    return 1
+  fi
+
+  printf '%s\n' "$value"
+}
+
+extract_primary_image() {
+  local task_def_json="$1"
+  local label="$2"
+  local list_available="${3:-false}"
+  local missing_hint="${4:-}"
+  local image
+
+  if ! image=$(jq -r --arg name "$PRIMARY_CONTAINER" '
+    [.containerDefinitions[] | select(.name == $name)] as $matches
+    | if ($matches | length) == 0 then "MISSING"
+      elif ($matches | length) > 1 then "AMBIGUOUS"
+      else $matches[0].image
+      end' <<< "$task_def_json"); then
+    echo "ERROR: Could not extract primary container image from $label (task definition JSON parse failed)." >&2
+    return 1
+  fi
+  if [[ -z "$image" || "$image" == "null" ]]; then
+    echo "ERROR: Could not extract primary container image from $label (empty image value)." >&2
+    return 1
+  fi
+  if [[ "$image" == "MISSING" ]]; then
+    echo "ERROR: No container named '$PRIMARY_CONTAINER' in $label." >&2
+    if [[ "$list_available" == "true" ]]; then
+      echo "Available containers:" >&2
+      echo "$task_def_json" | jq -r '.containerDefinitions[].name | "  - \(.)"' >&2
+    fi
+    if [[ -n "$missing_hint" ]]; then
+      echo "$missing_hint" >&2
+    fi
+    return 1
+  fi
+  if [[ "$image" == "AMBIGUOUS" ]]; then
+    echo "ERROR: Multiple containers named '$PRIMARY_CONTAINER' in $label." >&2
+    return 1
+  fi
+
+  printf '%s\n' "$image"
+}
+
+STABILITY_WAIT_ELAPSED=0
+# Precondition: callers have resolved ECS_CLUSTER/ECS_SERVICE/AWS_REGION and
+# WAIT_INTERVAL; failure diagnostics include NEW_TASK_DEF_ARN when available.
+wait_for_stable_deployment() {
+  local timeout="$1"
+  local expected_task_def="${2:-}"
+  local elapsed=0
+  local describe_fail_streak=0
+  local supersede_mismatch_streak=0
+  local describe_fail_warn_threshold="${DESCRIBE_FAIL_WARN_THRESHOLD:-3}"
+  local deployment_status
+  local primary_task_def primary_running primary_desired primary_pending active_count rollout
+
+  while [[ $elapsed -lt $timeout ]]; do
+    deployment_status=$(aws ecs describe-services \
+      --cluster "$ECS_CLUSTER" \
+      --services "$ECS_SERVICE" \
+      --query "services[0].deployments" --output json \
+      --region "$AWS_REGION" 2>/dev/null || echo "[]")
+
+    if [[ "$deployment_status" == "[]" || "$deployment_status" == "null" || -z "$deployment_status" ]]; then
+      describe_fail_streak=$((describe_fail_streak + 1))
+      # Warn at the threshold, then re-warn every Nth iteration after.
+      # `% THRESHOLD == 0` re-emits at threshold, 2xthreshold, 3xthreshold,
+      # ... so an operator debugging a sustained outage live keeps getting
+      # signal instead of one warning followed by silent minutes.
+      if (( describe_fail_streak >= describe_fail_warn_threshold \
+         && describe_fail_streak % describe_fail_warn_threshold == 0 )); then
+        if [[ -n "$expected_task_def" ]]; then
+          echo "::warning::aws ecs describe-services has returned empty/missing data $describe_fail_streak consecutive iterations during concurrent deploy verification — likely IAM/network/throttle issue. Wait-loop continues; check CloudTrail if the concurrent wait times out."
+        else
+          echo "::warning::aws ecs describe-services has returned empty/missing data $describe_fail_streak consecutive iterations — likely IAM/network/throttle issue. Wait-loop continues; check CloudTrail if the wait times out."
+        fi
+      fi
+      deployment_status="[]"
+    else
+      describe_fail_streak=0
+    fi
+
+    # pendingCount is progress-log-only; stability is desired/running plus
+    # zero draining ACTIVE deployments.
+    if ! read -r primary_task_def primary_running primary_desired primary_pending active_count rollout < <(
+      jq -r '
+        if type != "array" then empty
+        else
+          ([.[] | select(.status == "PRIMARY")] | .[0]) as $primary
+          | [
+              ($primary.taskDefinition // "__MISSING_TASK_DEF__"),
+              (($primary.runningCount // 0) | tostring),
+              (($primary.desiredCount // 0) | tostring),
+              (($primary.pendingCount // 0) | tostring),
+              (([.[] | select(.status == "ACTIVE")] | length) | tostring),
+              ($primary.rolloutState // "unknown")
+            ]
+          | @tsv
+        end
+      ' <<< "$deployment_status"
+    ); then
+      echo "ERROR: Could not parse ECS deployment status JSON while waiting for stability."
+      dump_ecs_events
+      exit 1
+    fi
+    if [[ "$primary_task_def" == "__MISSING_TASK_DEF__" ]]; then
+      primary_task_def=""
+    fi
+
+    if [[ -n "$expected_task_def" ]]; then
+      echo "  [concurrent ${elapsed}s] PRIMARY: ${primary_running}/${primary_desired} running, ${primary_pending} pending | rollout: ${rollout} | draining: ${active_count} | taskDef: ${primary_task_def##*/}"
+
+      if [[ -n "$primary_task_def" && "$primary_task_def" != "$expected_task_def" ]]; then
+        supersede_mismatch_streak=$((supersede_mismatch_streak + 1))
+        if (( supersede_mismatch_streak >= 2 )); then
+          echo "ERROR: Concurrent task def $expected_task_def was superseded by another task def while verifying stability: $primary_task_def"
+          echo "  Refusing to chase multiple deploys in one run; rerun after the service settles."
+          dump_ecs_events
+          exit 1
+        fi
+        echo "::warning::aws ecs describe-services returned non-matching PRIMARY task def while verifying $expected_task_def: $primary_task_def. Waiting one more interval to rule out an eventually-consistent stale read."
+      elif [[ "$primary_task_def" == "$expected_task_def" ]]; then
+        supersede_mismatch_streak=0
+      fi
+    else
+      echo "  [${elapsed}s] PRIMARY: ${primary_running}/${primary_desired} running, ${primary_pending} pending | rollout: ${rollout} | draining: ${active_count}"
+    fi
+
+    # `primary_desired -gt 0` guards against a degenerate scaled-to-zero
+    # service: 0/0 running + COMPLETED would otherwise satisfy the
+    # `running == desired` test and report "stable" on a service with
+    # no tasks. qurl-service runs >=1 today; this guard future-proofs
+    # against a manual scale-to-zero through this script.
+    if [[ "$rollout" == "COMPLETED" \
+       && "$primary_desired" -gt 0 \
+       && "$primary_running" -eq "$primary_desired" \
+       && "$active_count" -eq 0 ]]; then
+      if [[ -z "$expected_task_def" ]]; then
+        echo "  Service stable: all tasks running, rollout complete."
+        break
+      fi
+      if [[ "$primary_task_def" == "$expected_task_def" ]]; then
+        break
+      fi
+    fi
+
+    if [[ "$rollout" == "FAILED" ]]; then
+      if [[ -n "$expected_task_def" ]]; then
+        echo "ERROR: Concurrent ECS deployment rollout FAILED while verifying $expected_task_def."
+      else
+        echo "ERROR: ECS deployment rollout FAILED (circuit breaker triggered rollback)"
+        if [[ -n "${NEW_TASK_DEF_ARN:-}" && -n "$primary_task_def" ]]; then
+          echo "  PRIMARY task def at failure: $primary_task_def (registered by this run: $NEW_TASK_DEF_ARN)"
+        fi
+      fi
+      dump_ecs_events
+      exit 1
+    fi
+
+    sleep "$WAIT_INTERVAL"
+    elapsed=$((elapsed + WAIT_INTERVAL))
+  done
+
+  if [[ $elapsed -ge $timeout ]]; then
+    if [[ -n "$expected_task_def" ]]; then
+      echo "ERROR: Timed out waiting for concurrent task def $expected_task_def to stabilize (remaining budget ${timeout}s)."
+    else
+      echo "ERROR: Timed out waiting for ECS service stability (${timeout}s)"
+      echo "  Check ECS console for deployment status."
+    fi
+    dump_ecs_events
+    exit 1
+  fi
+
+  STABILITY_WAIT_ELAPSED=$elapsed
+}
+
 echo "============================================"
 echo "ECS Service Deploy"
 echo "============================================"
@@ -120,16 +329,43 @@ echo "SSM Prefix:  $SSM_PREFIX"
 echo "Image Tag:   $NEW_IMAGE_TAG"
 echo ""
 
-# Step 1: Update SSM parameter with new image tag
+# Step 1: Update or preserve the SSM image tag
 SSM_IMAGE_TAG_PARAM="/${SSM_PREFIX}/qurl-api-image-tag"
-echo "Step 1: Updating SSM parameter: $SSM_IMAGE_TAG_PARAM"
-aws ssm put-parameter \
-  --name "$SSM_IMAGE_TAG_PARAM" \
-  --value "$NEW_IMAGE_TAG" \
-  --type String \
-  --overwrite \
-  --region "$AWS_REGION"
-echo "  SSM parameter updated: $SSM_IMAGE_TAG_PARAM = $NEW_IMAGE_TAG"
+if [[ "$PRESERVE_SSM_IMAGE_TAG" == "true" ]]; then
+  if [[ "$ALLOW_CONCURRENT_FORWARD_DEPLOY" != "true" ]]; then
+    echo "ERROR: PRESERVE_SSM_IMAGE_TAG=true is supported only for sandbox concurrent qurl rolls."
+    exit 1
+  fi
+  echo "Step 1: Preserving SSM parameter and refreshing current image tag: $SSM_IMAGE_TAG_PARAM"
+  if ! PRESERVED_IMAGE_TAG=$(aws ssm get-parameter \
+      --name "$SSM_IMAGE_TAG_PARAM" \
+      --query "Parameter.Value" --output text \
+      --region "$AWS_REGION"); then
+    echo "ERROR: Could not read SSM image tag from $SSM_IMAGE_TAG_PARAM while PRESERVE_SSM_IMAGE_TAG=true."
+    exit 1
+  fi
+  if ! PRESERVED_IMAGE_TAG=$(normalize_token_output "SSM image tag in $SSM_IMAGE_TAG_PARAM" "$PRESERVED_IMAGE_TAG"); then
+    exit 1
+  fi
+  if [[ -z "$PRESERVED_IMAGE_TAG" || "$PRESERVED_IMAGE_TAG" == "None" ]]; then
+    echo "ERROR: SSM image tag in $SSM_IMAGE_TAG_PARAM is empty while PRESERVE_SSM_IMAGE_TAG=true."
+    exit 1
+  fi
+  if [[ "$PRESERVED_IMAGE_TAG" != "$NEW_IMAGE_TAG" ]]; then
+    echo "  SSM image tag changed since caller read it: requested $NEW_IMAGE_TAG, current $PRESERVED_IMAGE_TAG."
+  fi
+  NEW_IMAGE_TAG="$PRESERVED_IMAGE_TAG"
+  echo "  SSM parameter preserved: $SSM_IMAGE_TAG_PARAM = $NEW_IMAGE_TAG"
+else
+  echo "Step 1: Updating SSM parameter: $SSM_IMAGE_TAG_PARAM"
+  aws ssm put-parameter \
+    --name "$SSM_IMAGE_TAG_PARAM" \
+    --value "$NEW_IMAGE_TAG" \
+    --type String \
+    --overwrite \
+    --region "$AWS_REGION"
+  echo "  SSM parameter updated: $SSM_IMAGE_TAG_PARAM = $NEW_IMAGE_TAG"
+fi
 echo ""
 
 # Step 2: Read ECS cluster and service names from SSM
@@ -176,10 +412,12 @@ DESC_ERR_FILE=""
 VERIFY_ERR_FILE=""
 TASK_DEF_FILE=""
 REGISTER_ERR_FILE=""
+SSM_VERIFY_ERR_FILE=""
+ACTIVE_TASK_DEF_ERR_FILE=""
 EVENTS_ERR_FILE=""  # used inside dump_ecs_events helper; covered here for signal-safety
 # EXIT covers normal exits + set-e exits; INT/TERM cover Ctrl-C / kill.
 # CI runners shouldn't see signals in practice but explicit > implicit.
-trap 'rm -f "${DESC_ERR_FILE:-}" "${VERIFY_ERR_FILE:-}" "${TASK_DEF_FILE:-}" "${REGISTER_ERR_FILE:-}" "${EVENTS_ERR_FILE:-}"' EXIT INT TERM
+trap 'rm -f "${DESC_ERR_FILE:-}" "${VERIFY_ERR_FILE:-}" "${TASK_DEF_FILE:-}" "${REGISTER_ERR_FILE:-}" "${SSM_VERIFY_ERR_FILE:-}" "${ACTIVE_TASK_DEF_ERR_FILE:-}" "${EVENTS_ERR_FILE:-}"' EXIT INT TERM
 DESC_ERR_FILE=$(mktemp)
 if ! RUNNING_TASK_DEF_ARN=$(aws ecs describe-services \
     --cluster "$ECS_CLUSTER" \
@@ -225,23 +463,7 @@ CURRENT_TASK_DEF=$(aws ecs describe-task-definition \
 # discussion lives at the MATCHING_REPO_COUNT guard below.
 PRIMARY_CONTAINER="${PRIMARY_CONTAINER:-qurl-api}"
 
-CURRENT_IMAGE=$(echo "$CURRENT_TASK_DEF" | jq -r --arg name "$PRIMARY_CONTAINER" '
-  [.containerDefinitions[] | select(.name == $name)] as $matches
-  | if ($matches | length) == 0 then "MISSING"
-    elif ($matches | length) > 1 then "AMBIGUOUS"
-    else $matches[0].image
-    end')
-if [[ "$CURRENT_IMAGE" == "MISSING" ]]; then
-  echo "ERROR: No container named '$PRIMARY_CONTAINER' in task definition. Available containers:"
-  echo "$CURRENT_TASK_DEF" | jq -r '.containerDefinitions[].name | "  - \(.)"'
-  echo "  Set PRIMARY_CONTAINER env var to match the desired container."
-  exit 1
-fi
-if [[ "$CURRENT_IMAGE" == "AMBIGUOUS" ]]; then
-  # ECS rejects duplicate container names at register-task-definition
-  # time, but be loud-on-paranoid: a malformed-but-accepted task def
-  # would silently update only the first match below.
-  echo "ERROR: Multiple containers named '$PRIMARY_CONTAINER' in task definition (should be impossible per ECS validation; failing loud)."
+if ! CURRENT_IMAGE=$(extract_primary_image "$CURRENT_TASK_DEF" "task definition" true "  Set PRIMARY_CONTAINER env var to match the desired container."); then
   exit 1
 fi
 
@@ -320,6 +542,9 @@ if ! NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
   done < "$REGISTER_ERR_FILE"
   exit 1
 fi
+if ! NEW_TASK_DEF_ARN=$(normalize_token_output "registered task definition ARN" "$NEW_TASK_DEF_ARN"); then
+  exit 1
+fi
 
 echo "  New task definition: $NEW_TASK_DEF_ARN"
 echo ""
@@ -342,82 +567,34 @@ echo "  (ECS circuit breaker will auto-rollback if health checks fail)"
 WAIT_TIMEOUT=600  # 10 minutes
 WAIT_INTERVAL=15
 WAIT_ELAPSED=0
-# Counter for consecutive describe-services parse failures. Empty
-# stdout (set when 2>/dev/null swallows an IAM/network/throttle error)
-# would otherwise cascade to PRIMARY_DESIRED=0 and silently log
-# "0/0 running" for the full WAIT_TIMEOUT before the timeout branch
-# fires. After 3 consecutive failures, surface a ::warning:: so an
-# operator watching the run log gets a hint that AWS calls are
-# failing — without abandoning the loop (transient throttles do
-# resolve within the budget).
-DESCRIBE_FAIL_STREAK=0
+# Empty stdout from describe-services (set when 2>/dev/null swallows an
+# IAM/network/throttle error) would otherwise look like "0/0 running" until the
+# timeout. Surface a warning after repeated empty reads while still allowing
+# transient throttles to resolve within the budget.
 DESCRIBE_FAIL_WARN_THRESHOLD=3
 
-while [[ $WAIT_ELAPSED -lt $WAIT_TIMEOUT ]]; do
-  DEPLOYMENT_STATUS=$(aws ecs describe-services \
-    --cluster "$ECS_CLUSTER" \
-    --services "$ECS_SERVICE" \
-    --query "services[0].deployments" --output json \
-    --region "$AWS_REGION" 2>/dev/null || echo "[]")
-
-  if [[ "$DEPLOYMENT_STATUS" == "[]" || -z "$DEPLOYMENT_STATUS" ]]; then
-    DESCRIBE_FAIL_STREAK=$((DESCRIBE_FAIL_STREAK + 1))
-    # Warn at the threshold, then re-warn every Nth iteration after.
-    # `% THRESHOLD == 0` re-emits at threshold, 2×threshold, 3×threshold,
-    # ... so an operator debugging a sustained outage live keeps getting
-    # signal instead of one warning followed by silent minutes.
-    if (( DESCRIBE_FAIL_STREAK >= DESCRIBE_FAIL_WARN_THRESHOLD \
-       && DESCRIBE_FAIL_STREAK % DESCRIBE_FAIL_WARN_THRESHOLD == 0 )); then
-      echo "::warning::aws ecs describe-services has returned empty/missing data $DESCRIBE_FAIL_STREAK consecutive iterations — likely IAM/network/throttle issue. Wait-loop continues; check CloudTrail if WAIT_TIMEOUT trips."
-    fi
-  else
-    DESCRIBE_FAIL_STREAK=0
-  fi
-
-  PRIMARY_RUNNING=$(echo "$DEPLOYMENT_STATUS" | jq '[.[] | select(.status == "PRIMARY")] | .[0].runningCount // 0')
-  PRIMARY_DESIRED=$(echo "$DEPLOYMENT_STATUS" | jq '[.[] | select(.status == "PRIMARY")] | .[0].desiredCount // 0')
-  PRIMARY_PENDING=$(echo "$DEPLOYMENT_STATUS" | jq '[.[] | select(.status == "PRIMARY")] | .[0].pendingCount // 0')
-  ACTIVE_COUNT=$(echo "$DEPLOYMENT_STATUS" | jq '[.[] | select(.status == "ACTIVE")] | length')
-  ROLLOUT=$(echo "$DEPLOYMENT_STATUS" | jq -r '[.[] | select(.status == "PRIMARY")] | .[0].rolloutState // "unknown"')
-
-  echo "  [${WAIT_ELAPSED}s] PRIMARY: ${PRIMARY_RUNNING}/${PRIMARY_DESIRED} running, ${PRIMARY_PENDING} pending | rollout: ${ROLLOUT} | draining: ${ACTIVE_COUNT}"
-
-  # `PRIMARY_DESIRED -gt 0` guards against a degenerate scaled-to-zero
-  # service: 0/0 running + COMPLETED would otherwise satisfy the
-  # `RUNNING -eq DESIRED` test and report "stable" on a service with
-  # no tasks. qurl-service runs ≥1 today; this guard future-proofs
-  # against a manual scale-to-zero through this script.
-  if [[ "$ROLLOUT" == "COMPLETED" \
-     && "$PRIMARY_DESIRED" -gt 0 \
-     && "$PRIMARY_RUNNING" -eq "$PRIMARY_DESIRED" \
-     && "$ACTIVE_COUNT" -eq 0 ]]; then
-    echo "  Service stable: all tasks running, rollout complete."
-    break
-  fi
-
-  if [[ "$ROLLOUT" == "FAILED" ]]; then
-    echo "ERROR: ECS deployment rollout FAILED (circuit breaker triggered rollback)"
-    dump_ecs_events
-    exit 1
-  fi
-
-  sleep "$WAIT_INTERVAL"
-  WAIT_ELAPSED=$((WAIT_ELAPSED + WAIT_INTERVAL))
-done
-
-if [[ $WAIT_ELAPSED -ge $WAIT_TIMEOUT ]]; then
-  echo "ERROR: Timed out waiting for ECS service stability (${WAIT_TIMEOUT}s)"
-  echo "  Check ECS console for deployment status."
-  dump_ecs_events
-  exit 1
-fi
+# The first wait settles the service before the exact task-def check below. If a
+# sandbox qurl-service deploy became PRIMARY during the wait, the post-loop
+# verification routes it through the fail-closed concurrent path.
+wait_for_stable_deployment "$WAIT_TIMEOUT"
+WAIT_ELAPSED=$STABILITY_WAIT_ELAPSED
 
 # rolloutState=COMPLETED is also the terminal state of a circuit-breaker
 # rollback (running the *previous* task def), so the wait-loop's stability
 # check is necessary but not sufficient. Compare the service's current task
-# def to the one we registered; if they differ, ECS rolled back. Empty /
-# "None" output triggers the same fail-loud branch as a mismatch — if we
-# cannot verify, we cannot claim success.
+# def to the one we registered. Exact match proves this rollout. Older or
+# different-family task defs remain a rollback failure. In sandbox only, a newer
+# same-family task def can also happen when qurl-service's own CI deploy advances
+# the service while this helper is waiting. That sandbox path is accepted only
+# after verifying the newer task def's primary image against the current SSM
+# source of truth and confirming the newer deployment is stable. Prod stays on
+# strict exact-match semantics because promote-to-prod is serialized by workflow
+# concurrency. The sandbox tolerance depends on the concurrent deploy also being
+# the last SSM writer; if the ECS winner and SSM winner differ, the image compare
+# below fails closed. In the sandbox concurrent path, green means "the service is
+# settled on the current SSM image", not "this invocation's registered task def
+# stayed active." Empty / "None" output triggers the same fail-loud branch as a
+# mismatch — if we cannot verify, we cannot claim success.
 #
 # Invariant the single-shot verify relies on: this code only runs after
 # ROLLOUT=COMPLETED, which is when ECS guarantees `services[0].
@@ -455,13 +632,11 @@ for attempt in 1 2 3; do
     --services "$ECS_SERVICE" \
     --query "services[0].taskDefinition" --output text \
     --region "$AWS_REGION" 2>"$VERIFY_ERR_FILE" || echo "")
-  # Belt-and-suspenders: strip ALL whitespace (interior + trailing).
-  # `--output text` could emit trailing whitespace that would slip
-  # past the ARN shape regex below as a phantom rollback alarm
-  # (string compare against $NEW_TASK_DEF_ARN which has no whitespace).
-  # The shape regex would catch interior whitespace anyway, so the
-  # global strip is simpler than a trailing-only loop.
-  RUNNING_TASK_DEF_AFTER="${RUNNING_TASK_DEF_AFTER//[[:space:]]/}"
+  # Normalize AWS CLI --output text surrounding whitespace before empty/None
+  # checks; reject interior whitespace instead of silently repairing an ARN.
+  if ! RUNNING_TASK_DEF_AFTER=$(normalize_token_output "running task definition ARN after rollout" "$RUNNING_TASK_DEF_AFTER"); then
+    exit 1
+  fi
   if [[ -n "$RUNNING_TASK_DEF_AFTER" && "$RUNNING_TASK_DEF_AFTER" != "None" ]]; then
     break
   fi
@@ -521,13 +696,117 @@ if ! [[ "$RUNNING_TASK_DEF_AFTER" =~ ^arn:[a-z0-9-]+:ecs:[^:]+:[0-9]{12}:task-de
   exit 1
 fi
 
+DEPLOYED_TASK_DEF_ARN="$NEW_TASK_DEF_ARN"
+DEPLOYED_IMAGE="$NEW_IMAGE"
+
 if [[ "$RUNNING_TASK_DEF_AFTER" != "$NEW_TASK_DEF_ARN" ]]; then
-  echo "ERROR: ECS service is running $RUNNING_TASK_DEF_AFTER, not the registered $NEW_TASK_DEF_ARN."
-  echo "  ECS circuit breaker rolled back. The rollout reached COMPLETED on the previous task def, masking the failure."
-  dump_ecs_events
-  exit 1
+  NEW_TASK_DEF_FAMILY_ARN="${NEW_TASK_DEF_ARN%:*}"
+  RUNNING_TASK_DEF_FAMILY_ARN="${RUNNING_TASK_DEF_AFTER%:*}"
+  NEW_TASK_DEF_REVISION="${NEW_TASK_DEF_ARN##*:}"
+  RUNNING_TASK_DEF_REVISION="${RUNNING_TASK_DEF_AFTER##*:}"
+
+  FORWARD_SAME_FAMILY=false
+  if [[ "$RUNNING_TASK_DEF_FAMILY_ARN" == "$NEW_TASK_DEF_FAMILY_ARN" \
+     && "$NEW_TASK_DEF_REVISION" =~ ^[0-9]+$ \
+     && "$RUNNING_TASK_DEF_REVISION" =~ ^[0-9]+$ ]] \
+     && (( 10#$RUNNING_TASK_DEF_REVISION > 10#$NEW_TASK_DEF_REVISION )); then
+    FORWARD_SAME_FAMILY=true
+  fi
+
+  if [[ "$FORWARD_SAME_FAMILY" == "true" && "$ALLOW_CONCURRENT_FORWARD_DEPLOY" == "true" ]]; then
+    echo "::notice::ECS service advanced past the task def registered by this run ($NEW_TASK_DEF_ARN -> $RUNNING_TASK_DEF_AFTER); verifying as a concurrent deploy."
+
+    SSM_VERIFY_ERR_FILE=$(mktemp)  # cleanup via the EXIT trap above
+    if ! CURRENT_SSM_IMAGE_TAG=$(aws ssm get-parameter \
+        --name "$SSM_IMAGE_TAG_PARAM" \
+        --query "Parameter.Value" --output text \
+        --region "$AWS_REGION" 2>"$SSM_VERIFY_ERR_FILE"); then
+      echo "ERROR: Could not read current image tag from $SSM_IMAGE_TAG_PARAM while verifying concurrent deploy:"
+      while IFS= read -r line; do
+        printf '  %s\n' "$line"
+      done < "$SSM_VERIFY_ERR_FILE"
+      dump_ecs_events
+      exit 1
+    fi
+    rm -f "$SSM_VERIFY_ERR_FILE"
+    SSM_VERIFY_ERR_FILE=""
+    if ! CURRENT_SSM_IMAGE_TAG=$(normalize_token_output "current SSM image tag in $SSM_IMAGE_TAG_PARAM" "$CURRENT_SSM_IMAGE_TAG"); then
+      exit 1
+    fi
+    if [[ -z "$CURRENT_SSM_IMAGE_TAG" || "$CURRENT_SSM_IMAGE_TAG" == "None" ]]; then
+      echo "ERROR: Current image tag in $SSM_IMAGE_TAG_PARAM is empty while verifying concurrent deploy."
+      dump_ecs_events
+      exit 1
+    fi
+
+    ACTIVE_TASK_DEF_ERR_FILE=$(mktemp)  # cleanup via the EXIT trap above
+    if ! ACTIVE_TASK_DEF=$(aws ecs describe-task-definition \
+        --task-definition "$RUNNING_TASK_DEF_AFTER" \
+        --query "taskDefinition" --output json \
+        --region "$AWS_REGION" 2>"$ACTIVE_TASK_DEF_ERR_FILE"); then
+      echo "ERROR: Could not describe newer running task def $RUNNING_TASK_DEF_AFTER while verifying concurrent deploy:"
+      while IFS= read -r line; do
+        printf '  %s\n' "$line"
+      done < "$ACTIVE_TASK_DEF_ERR_FILE"
+      dump_ecs_events
+      exit 1
+    fi
+    rm -f "$ACTIVE_TASK_DEF_ERR_FILE"
+    ACTIVE_TASK_DEF_ERR_FILE=""
+
+    if ! ACTIVE_IMAGE=$(extract_primary_image "$ACTIVE_TASK_DEF" "newer running task definition $RUNNING_TASK_DEF_AFTER" true "  Check the qurl-service task definition container name or set PRIMARY_CONTAINER for this workflow."); then
+      dump_ecs_events
+      exit 1
+    fi
+
+    # Deliberately use tag form and the repo from the task def this helper read
+    # earlier. This sandbox-only branch relies on qurl-service writing the same
+    # short SHA tag to SSM before update-service; a concurrent deploy that
+    # changes repos, switches to digest pinning, or regresses that ordering fails
+    # closed rather than being accepted as a same-image race.
+    EXPECTED_CONCURRENT_IMAGE="${IMAGE_REPO}:${CURRENT_SSM_IMAGE_TAG}"
+    if [[ "$ACTIVE_IMAGE" != "$EXPECTED_CONCURRENT_IMAGE" ]]; then
+      echo "ERROR: ECS service advanced to newer task def $RUNNING_TASK_DEF_AFTER, but '$PRIMARY_CONTAINER' uses $ACTIVE_IMAGE."
+      echo "  Expected current SSM image: $EXPECTED_CONCURRENT_IMAGE"
+      echo "  This is neither the registered task def nor a verified current-image concurrent deploy."
+      dump_ecs_events
+      exit 1
+    fi
+
+    echo "  Concurrent task def image matches current SSM tag; waiting for that deployment to be stable."
+    # Best-effort stay inside the original 600s roll budget. The main wait loop
+    # already consumed WAIT_ELAPSED seconds; a superseding deploy gets the
+    # remaining time, floored to two intervals for the immediate post-verify
+    # race (two reads spanning one interval). The job-level timeout has headroom
+    # for that floor plus the 30s ALB settle, rather than two independent 600s
+    # waits.
+    CONCURRENT_WAIT_TIMEOUT=$((WAIT_TIMEOUT - WAIT_ELAPSED))
+    MIN_CONCURRENT_WAIT_TIMEOUT=$((2 * WAIT_INTERVAL))
+    if (( CONCURRENT_WAIT_TIMEOUT < MIN_CONCURRENT_WAIT_TIMEOUT )); then
+      CONCURRENT_WAIT_TIMEOUT=$MIN_CONCURRENT_WAIT_TIMEOUT
+    fi
+    wait_for_stable_deployment "$CONCURRENT_WAIT_TIMEOUT" "$RUNNING_TASK_DEF_AFTER"
+
+    DEPLOYED_TASK_DEF_ARN="$RUNNING_TASK_DEF_AFTER"
+    DEPLOYED_IMAGE="$ACTIVE_IMAGE"
+    echo "  Verified: service is running newer task def $DEPLOYED_TASK_DEF_ARN with current image $DEPLOYED_IMAGE."
+    echo "  This run's registered task def $NEW_TASK_DEF_ARN was superseded by a concurrent deploy; treating the service as healthy on the current SSM image."
+  else
+    if [[ "$FORWARD_SAME_FAMILY" == "true" ]]; then
+      echo "ERROR: ECS service advanced to newer task def $RUNNING_TASK_DEF_AFTER, but concurrent forward-deploy tolerance is enabled only for sandbox (prefix: layerv-nhp-sandbox; got: $SSM_PREFIX)."
+      echo "  Prod keeps strict exact-match semantics because promote-to-prod is serialized by workflow concurrency."
+      dump_ecs_events
+      exit 1
+    fi
+    echo "ERROR: ECS service is running $RUNNING_TASK_DEF_AFTER, not the registered $NEW_TASK_DEF_ARN."
+    echo "  ECS circuit breaker rolled back or another deploy moved the service to an unrelated/stale task def."
+    echo "  ECS rolloutState=COMPLETED can still mean rollback to a previous task def; exact task-def verification is required before success."
+    dump_ecs_events
+    exit 1
+  fi
+else
+  echo "  Verified: service is running the new task def $NEW_TASK_DEF_ARN."
 fi
-echo "  Verified: service is running the new task def $NEW_TASK_DEF_ARN."
 
 # Step 8: Post-stability settling period
 # After ECS reports stability, ALB target deregistration and connection draining
@@ -545,7 +824,14 @@ echo "============================================"
 echo "ECS Service Deploy Complete"
 echo "============================================"
 echo "SSM Prefix:  $SSM_PREFIX"
-echo "Image:       $NEW_IMAGE"
-echo "Task Def:    $NEW_TASK_DEF_ARN"
+echo "Image:       $DEPLOYED_IMAGE"
+echo "Task Def:    $DEPLOYED_TASK_DEF_ARN"
 echo "Service:     $ECS_SERVICE"
 echo "Cluster:     $ECS_CLUSTER"
+
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  {
+    echo "deployed_image=$DEPLOYED_IMAGE"
+    echo "deployed_task_def_arn=$DEPLOYED_TASK_DEF_ARN"
+  } >> "$GITHUB_OUTPUT"
+fi
