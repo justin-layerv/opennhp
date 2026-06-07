@@ -371,3 +371,27 @@ lands in either `*.sh.tpl`, re-add a `terraform_data` precondition
 analogous to the prior `frps_overlay_comment_escape_fence` that
 regex-checked the rendered template. Generalization to a single
 allowlist-based fence across both templates is tracked in #2045.
+
+## Terraform state backend encryption (SSE-KMS)
+
+The remote-state buckets (`layerv-terraform-state-<acct>`) are bootstrap-layer:
+created out-of-band, **unmanaged by any Terraform here**, referenced only by
+name in `environments/<env>/backend.tf`. The CI Terraform role has object-only
+access to them (no `s3:PutEncryptionConfiguration`, no `kms:EnableKeyRotation`)
+— do **not** widen that to manage their encryption from CI. The CMK and any
+bucket-default change are operator/admin out-of-band steps. Full procedure:
+[`../docs/runbooks/tfstate-kms-migration.md`](../docs/runbooks/tfstate-kms-migration.md).
+
+Two durable invariants that outlive that runbook:
+
+- **`backend "s3"` `encrypt = true` forces AES256 unless `kms_key_id` is set.**
+  With `encrypt = true` and no `kms_key_id`, the backend sends an explicit
+  `x-amz-server-side-encryption: AES256` header that overrides the bucket
+  default. So a bucket-default-only KMS change does **not** encrypt state
+  objects — only `kms_key_id` in the backend block does. Editing `backend.tf`
+  here is a backend-config change, so CI/local `terraform init` needs
+  `-reconfigure` (state does not move → not `-migrate-state`).
+- **Never disable or schedule deletion of the state CMK** while any state
+  object/version is encrypted with it — that bricks state after the deletion
+  window. The key uses a root-delegation policy, so an account admin can always
+  recover a locked-out principal by granting `kms:Decrypt`/`kms:GenerateDataKey`.

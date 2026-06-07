@@ -470,15 +470,29 @@ enable_slack_target                = true
 ### Secrets and Encryption
 
 - Never commit secrets — use AWS Secrets Manager.
-- All storage encrypted with KMS CMKs (documented exception:
-  `terraform/modules/bootstrap-alb/`'s access-log + Athena-results
-  buckets are SSE-S3, not CMK. AWS ALB log delivery does NOT
-  support cross-account CMKs, and the Athena bucket follows the
-  same shape for consistency. Rationale + suppression target lives
-  inline at `access_logs.tf` — point AWS Config / scanner
-  suppressions there. Relevant AWS Config rule names:
-  `s3-default-encryption-kms` /
-  `s3-bucket-server-side-encryption-enabled`.)
+- All storage encrypted with KMS CMKs (documented exceptions below).
+  - `terraform/modules/bootstrap-alb/`'s access-log + Athena-results
+    buckets are SSE-S3, not CMK. AWS ALB log delivery does NOT
+    support cross-account CMKs, and the Athena bucket follows the
+    same shape for consistency. Rationale + suppression target lives
+    inline at `access_logs.tf` — point AWS Config / scanner
+    suppressions there. Relevant AWS Config rule names:
+    `s3-default-encryption-kms` /
+    `s3-bucket-server-side-encryption-enabled`.
+  - The Terraform remote-state buckets (`layerv-terraform-state-<acct>`)
+    are SSE-S3/AES256 (finding [#1128](https://github.com/layervai/nhp/issues/1128)).
+    These are bootstrap-layer and unmanaged by Terraform, so the move to
+    SSE-KMS is an operator/out-of-band migration tracked in
+    [`runbooks/tfstate-kms-migration.md`](runbooks/tfstate-kms-migration.md).
+    Until then, this is a known AES256 exception: the `s3-default-encryption-kms`
+    AWS Config rule (which evaluates the bucket *default*, not individual
+    objects) keeps flagging both state buckets through the (possibly multi-week)
+    migration window — accept it as known-noise tracked by #1128 (suppress
+    against #1128 if it pages), not a new regression. Note the rule clears only
+    when the bucket *default* flips to `aws:kms` (the runbook's **Phase B**); the
+    backend `kms_key_id` cutover (Phase C) encrypts the state *objects* for the
+    audit trail but does not by itself flip this Config rule. Remove this bullet
+    when #1128 closes (i.e. after Phase B has run in both accounts).
 - IMDSv2 required on EC2.
 - AC private keys NEVER in etcd — only Secrets Manager.
 
