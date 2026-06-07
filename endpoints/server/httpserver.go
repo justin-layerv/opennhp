@@ -75,6 +75,22 @@ type HttpServer struct {
 	// metrics Publisher. Nil is fine (no-op).
 	internalAuthEmit MetricCounter
 
+	// forwardHopRequire is the strict/permit toggle for cross-server
+	// hop attestation (issue #1127), read once from
+	// NHP_INTERNAL_FORWARD_ATTEST_REQUIRE at Start. false (permit) warns
+	// and allows an unverifiable hop during rollout; true (strict)
+	// rejects it. Verification itself is only attempted in cloud mode
+	// (device + Cloud Map present) — see hopVerifyEcdh. Same
+	// happens-before edge as internalAuthRequire (Start → goroutine).
+	forwardHopRequire bool
+
+	// fleetTrust is the hop-attestation trust anchor (the sticky set of
+	// fleet pubkeys trusted as forward senders). nil when verification is
+	// inactive (legacy/local mode, no device or Cloud Map). Constructed in
+	// Start; tests construct one with an injected discovery source + clock.
+	// See fleetTrustAnchor in forward_hop_attest.go.
+	fleetTrust *fleetTrustAnchor
+
 	wg      sync.WaitGroup
 	running atomic.Bool
 
@@ -188,6 +204,28 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		log.Info("internal auth enabled (mode=%s)", mode)
 	}
 
+	// Cross-server hop attestation gate (issue #1127). Independent of the
+	// shared-secret gate above: it binds each server-to-server forward to
+	// the forwarding server's NHP identity. Same permit→strict rollout
+	// discipline — ship permit so a mixed-version fleet keeps forwarding,
+	// confirm ForwardHopAttestPermit drops to zero, then flip
+	// NHP_INTERNAL_FORWARD_ATTEST_REQUIRE=true. Verification only runs in
+	// cloud mode (device + Cloud Map present); the parsed value is inert
+	// otherwise.
+	//
+	// Kept as a separate gate (not unified with the shared-secret gate)
+	// deliberately: the two protect the same endpoint but with different
+	// trust models — a fleet-wide shared secret vs. per-pair ECDH identity
+	// — and roll out on independent env flags so one can flip to strict
+	// without the other. A premature "rollout gate" abstraction over two
+	// instances would couple their lifecycles; revisit if a third gate
+	// appears.
+	forwardHopRequire, fhErr := parsePermitStrictEnv(os.Getenv("NHP_INTERNAL_FORWARD_ATTEST_REQUIRE"))
+	if fhErr != nil {
+		return fmt.Errorf("NHP_INTERNAL_FORWARD_ATTEST_REQUIRE: %w", fhErr)
+	}
+	hs.forwardHopRequire = forwardHopRequire
+
 	cookieKeys, err := parseCookieKeys(os.Getenv("NHP_COOKIE_KEYS"))
 	if err != nil {
 		return fmt.Errorf("NHP_COOKIE_KEYS: %w", err)
@@ -218,6 +256,13 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		hs.httpForwarder = NewHttpKnockForwarder(us.storage, us.cloudMap, us.localIp, listenPort, emitMetric, hs.internalAuthSigner)
 		log.Info("HTTP knock forwarder initialized (localIP=%s, port=%d, cloudMap=%t, signed=%t)", us.localIp, listenPort, us.cloudMap != nil, hs.internalAuthSigner != nil)
 	}
+
+	// Wire both sides of cross-server hop attestation (issue #1127) — the
+	// forwarder signs outgoing hops and the receiver builds its trust anchor.
+	// Extracted so the wiring is unit-tested (TestInitForwardHopAttestation):
+	// a regression that dropped it would silently disable the security gate,
+	// surfacing only as permanently-flat ForwardHopAttest* metrics.
+	hs.initForwardHopAttestation(us)
 
 	hs.initRouter()
 
@@ -1285,8 +1330,12 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 				knkMsg.UserId, knkMsg.DeviceId, srcIp, acId, droppedStale, s.staleACConnThreshold())
 		}
 		if len(connsCopy) == 0 {
-			// No local AC connection — try HTTP forwarding to an assigned server
-			if hs.httpForwarder != nil && !req.Forwarded {
+			// No local AC connection — try HTTP forwarding to an assigned
+			// server. The forwardHopFromContext guard is defensive: an
+			// onward forward would emit verifiedHop+1, so refuse to start
+			// one once the incoming hop is already at the ceiling (issue
+			// #1127) rather than emit a forward the next server will 403.
+			if hs.httpForwarder != nil && !req.Forwarded && forwardHopFromContext(ctx) < maxForwardHops {
 				fwdCtx, fwdCancel := context.WithTimeout(ctx, DefaultForwardTimeout)
 				fwdAck, fwdErr := hs.httpForwarder.ForwardHttpKnock(fwdCtx, acId, req, res)
 				fwdCancel() // cancel immediately; defer would accumulate across loop iterations
@@ -1603,6 +1652,83 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 		return
 	}
 
+	// Verify the cross-server hop attestation (issue #1127). This binds a
+	// server-to-server forward to the forwarding server's NHP identity so
+	// a compromised fleet member cannot forge or conceal the forward
+	// chain, and bounds re-forwarding via maxForwardHops. API origins
+	// (Source==SourceAPI) start the chain and carry no attestation. Only
+	// runs in cloud mode (device + Cloud Map present); legacy/local mode
+	// skips it entirely. See docs/design/INTERNAL_FORWARD_HOP_ATTESTATION.md.
+	verifiedHop := 0
+	// hopVerifyEcdh returns nil unless udpServer/device/fleetTrust are all set.
+	// Fetch the static ECDH once (also reused below). A constructed device
+	// always has a scheme-0 ECDH (core.NewDevice returns nil otherwise), so
+	// the nil branch is defensive — if it were ever nil, skip verification
+	// (legacy posture) rather than strict-reject every forward on
+	// errForwardHopECDHFailed. Both sender and receiver hardcode scheme 0.
+	if selfEcdh := hs.hopVerifyEcdh(); selfEcdh != nil {
+		// fwdReq.Source is bound into the MAC, so a verified attestation is
+		// pinned to the Source it was minted with (a flip is a MAC mismatch).
+		//
+		// Resolve the trust set only when an attestation is actually present:
+		// the common API-origin path (Attestation == nil) is rejected on the
+		// nil check inside verify before the set is consulted, so computing it
+		// eagerly would copy the sticky map on every origin knock for nothing.
+		var trusted map[string]bool
+		if fwdReq.Attestation != nil {
+			trusted = hs.fleetTrust.known(ctx.Request.Context())
+		}
+		hopErr := verifyForwardHopAttestation(
+			selfEcdh,
+			fwdReq.Attestation,
+			trusted,
+			time.Now(),
+			forwardHopMaxSkew,
+			fwdReq.Source,
+			fwdReq.Request,
+		)
+		reqID := GetRequestID(ctx)
+		switch {
+		case hopErr == nil:
+			// A valid attestation governs even on an API origin: a legitimate
+			// origin (qurl-service) never attests, so an attestation carried
+			// with Source="api" can only come from a fleet member, and its
+			// hop is bounded by maxForwardHops like any other.
+			verifiedHop = fwdReq.Attestation.Hop
+			hs.emitForwardHop(MetricForwardHopAttestSuccess)
+		case errors.Is(hopErr, errForwardHopMissing) && fwdReq.Source == SourceAPI:
+			// Origin request: no attestation expected. Hop stays 0.
+			// Deliberately keyed on errForwardHopMissing specifically, not
+			// "any error when Source==api": an API origin that somehow
+			// carried a malformed attestation should NOT be waved through —
+			// it falls to the default branch and is permit/strict-judged
+			// like any other unverifiable hop.
+		case errors.Is(hopErr, errForwardHopBadHop):
+			// Over the loop ceiling (or hop < 1) — a hard loop bound;
+			// refuse regardless of rollout mode. Only an attestation that
+			// explicitly claimed an out-of-range hop reaches here. Counted
+			// separately from the strict reject so this real loop signal
+			// isn't masked by rollout-window noise.
+			log.Warning("internal knock rejected: forward hop ceiling src=%s reqID=%s", srcIP, reqID)
+			hs.emitForwardHop(MetricForwardHopCeilingReject)
+			ctx.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+			return
+		default:
+			if hs.forwardHopRequire {
+				log.Warning("internal knock rejected (strict hop): src=%s reqID=%s stage=%s", srcIP, reqID, forwardHopStage(hopErr))
+				hs.emitForwardHop(MetricForwardHopAttestReject)
+				ctx.JSON(http.StatusUnauthorized, gin.H{"error": internalauth.ErrInternalAuth.Error()})
+				return
+			}
+			// Permit mode: warn-and-allow during rollout. The counter is
+			// the rollout signal — alarm on ForwardHopAttestPermit > 0;
+			// when it holds at zero across a stable window it's safe to
+			// flip NHP_INTERNAL_FORWARD_ATTEST_REQUIRE=true.
+			log.Info("internal knock permit-mode hop unverified (allowing): src=%s reqID=%s stage=%s", srcIP, reqID, forwardHopStage(hopErr))
+			hs.emitForwardHop(MetricForwardHopAttestPermit)
+		}
+	}
+
 	// Decide whether to mark as forwarded based on the request source.
 	// API callers (e.g., qurl-service) set Source="api" so the receiving server
 	// can forward to the correct server if the AC isn't connected locally.
@@ -1617,7 +1743,10 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 		log.Warning("handleInternalKnock: unexpected Source value %q, treating as server-to-server", fwdReq.Source)
 		fwdReq.Request.Forwarded = true
 	}
-	fwdReq.Request.Ctx = ctx.Request.Context()
+	// Carry the verified hop down to handleHttpOpenResource → the
+	// forwarder, which emits verifiedHop+1 on any onward forward so the
+	// hop counter stays monotonic across the chain.
+	fwdReq.Request.Ctx = contextWithForwardHop(ctx.Request.Context(), verifiedHop)
 
 	ackMsg, err := hs.handleHttpOpenResource(fwdReq.Request, resolvedResource)
 	resp := HttpKnockForwardResponse{AckMsg: ackMsg}

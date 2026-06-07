@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/layervai/nhp/internalauth"
 )
@@ -79,6 +80,24 @@ type HttpKnockForwardRequest struct {
 	Request  *common.HttpKnockRequest `json:"request"`
 	Resource *common.ResourceData     `json:"resource"`
 	Source   string                   `json:"source,omitempty"` // See SourceAPI const
+
+	// Attestation cryptographically binds a server-to-server forward hop
+	// to the forwarding server's NHP identity (issue #1127). nil on
+	// API-origin requests (the start of the chain) and on legacy senders
+	// during rollout. See forward_hop_attest.go and
+	// docs/design/INTERNAL_FORWARD_HOP_ATTESTATION.md.
+	Attestation *ForwardHopAttestation `json:"hop_attestation,omitempty"`
+}
+
+// ForwardHopAttestation is the per-hop identity binding carried on
+// server-to-server forwards. The MAC is HMAC-SHA256 under a per-pair key
+// derived from ECDH(senderPriv, recipientPub), so only the sender and the
+// named recipient can compute it. See verifyForwardHopAttestation.
+type ForwardHopAttestation struct {
+	SenderPubKey string `json:"sender_pubkey"` // base64 NHP static pubkey of the forwarding server
+	Hop          int    `json:"hop"`           // server-to-server hop count (origin=0; first forward=1)
+	Timestamp    int64  `json:"ts"`            // unix seconds; freshness bound
+	MAC          string `json:"mac"`           // lowercase hex HMAC-SHA256 under the per-pair ECDH key
 }
 
 // HttpKnockForwardResponse is the JSON response from an internal knock forward.
@@ -126,6 +145,14 @@ type HttpKnockForwarder struct {
 	// NHP_INTERNAL_AUTH_SECRET env var.
 	internalAuthSigner *internalauth.Signer
 
+	// selfEcdh / selfPubKey, when set, make the forwarder attest each
+	// outgoing server-to-server hop with this server's NHP identity
+	// (issue #1127). selfEcdh nil = attestation disabled (local/test mode
+	// with no device keypair). Set once via EnableForwardHopAttestation
+	// at Start, before any forward fires; read-only thereafter.
+	selfEcdh   core.Ecdh
+	selfPubKey string
+
 	// failedServers tracks servers that recently failed forward attempts.
 	// Key: InternalIP, Value: time of last failure.
 	// Servers are considered unhealthy for httpForwardHealthDecay after failure.
@@ -161,6 +188,19 @@ func NewHttpKnockForwarder(storage StorageBackend, cloudMap HealthChecker, local
 		internalAuthSigner: internalAuthSigner,
 		failedServers:      make(map[string]time.Time),
 	}
+}
+
+// EnableForwardHopAttestation makes the forwarder sign each outgoing
+// server-to-server hop with this server's NHP identity (issue #1127).
+// Pass the server's static ECDH (device.GetEcdhByCipherScheme) and its
+// base64 pubkey (device.PublicKeyBase64). A nil selfEcdh leaves
+// attestation disabled — the legacy/local posture. Call once at Start
+// before serving; the fields are read by forward goroutines without
+// further synchronization (the happens-before edge is the Start →
+// goroutine launch, identical to internalAuthSigner).
+func (f *HttpKnockForwarder) EnableForwardHopAttestation(selfEcdh core.Ecdh, selfPubKey string) {
+	f.selfEcdh = selfEcdh
+	f.selfPubKey = selfPubKey
 }
 
 // Stop stops the forwarder and waits for in-flight forwards to complete.
@@ -329,6 +369,41 @@ func (f *HttpKnockForwarder) forwardToServer(
 	fwdReq := &HttpKnockForwardRequest{
 		Request:  req,
 		Resource: res,
+	}
+
+	// Attest this server-to-server hop with our NHP identity (issue
+	// #1127) so the receiving server can attribute it and refuse a
+	// spoofed or over-hop forward. Requires our own keypair AND a target
+	// pubkey — the latter is briefly empty in the Cloud Map propagation
+	// window just after a new server joins; we fall back to an
+	// unattested forward there (the receiver's permit mode tolerates it,
+	// strict mode rejects it as designed). The hop is the verified
+	// incoming hop (0 for an API origin) + 1.
+	//
+	// Dual-registry invariant: srv.PubKey here comes from the AC
+	// assignment / ServerInfo (storage), while the RECEIVER's trust anchor
+	// derives the same peer's key from Cloud Map (fleetTrustAnchor). Both
+	// must equal the peer's real device.PublicKeyBase64() or the per-pair
+	// ECDH MAC silently fails to verify. Both are populated from each
+	// server's own device key at registration, so they agree in steady
+	// state; a divergence (stale assignment / mismatched registration)
+	// surfaces as ForwardHopAttestPermit that never drains — see the
+	// rollout-ledger pre-task and design doc. Do not source one side from a
+	// different key than the other.
+	if f.selfEcdh != nil && srv.PubKey != "" {
+		hop := forwardHopFromContext(ctx) + 1
+		// Bind the outgoing envelope Source (always "" here — forwardToServer
+		// never propagates Source) so the attestation can't be replayed with
+		// Source flipped to "api".
+		att, attErr := buildForwardHopAttestation(f.selfEcdh, f.selfPubKey, srv.PubKey, hop, time.Now(), fwdReq.Source, req)
+		if attErr != nil {
+			// Non-fatal: emit unattested and let the receiver's rollout
+			// mode decide. A persistent failure here shows up as the
+			// receiver's permit/strict counters climbing.
+			log.Warning("forward hop attest: build failed for %s (%s): %v", srv.ID, srv.InternalIP, attErr)
+		} else {
+			fwdReq.Attestation = att
+		}
 	}
 
 	body, err := json.Marshal(fwdReq)

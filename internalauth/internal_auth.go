@@ -384,14 +384,25 @@ func (s *Signer) Verify(header, method, path string, body []byte, maxSkew time.D
 	return nil
 }
 
+// ComputeHMACHex runs HMAC-SHA256(key, data) and returns lowercase hex.
+// Exported so other internal-surface signers in the nhp repo (e.g. the
+// cross-server forward hop attestation in endpoints/server) share one
+// HMAC-hex implementation rather than re-deriving the primitive — drift
+// between two copies of a security MAC is exactly the class of bug this
+// module exists to prevent. Lowercase hex is a wire contract; see the
+// package doc.
+func ComputeHMACHex(key []byte, data string) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(data))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // computeMAC runs HMAC-SHA256(secret, data) and returns lowercase hex.
 // Named deliberately to not shadow the crypto/hmac package imported
 // into this file — `s.hmac(...)` next to `hmac.New(...)` inside the
 // same method body reads ambiguously to a skimming reviewer.
 func (s *Signer) computeMAC(data string) string {
-	mac := hmac.New(sha256.New, s.secret)
-	mac.Write([]byte(data))
-	return hex.EncodeToString(mac.Sum(nil))
+	return ComputeHMACHex(s.secret, data)
 }
 
 // signingString is the canonical input to HMAC. Test vectors that

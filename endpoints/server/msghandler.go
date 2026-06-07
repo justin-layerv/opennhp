@@ -172,6 +172,29 @@ const (
 	// Watching Success rise while FailPermit drops is the positive
 	// signal operators need before flipping NHP_INTERNAL_AUTH_REQUIRE=true.
 	MetricInternalAuthSuccess = "InternalAuthSuccess"
+
+	// Cross-server hop attestation counters (issue #1127). Mirror the
+	// internal-auth rollout signals: alarm on ForwardHopAttestPermit > 0
+	// during rollout; when it holds at zero (and Success is rising) it's
+	// safe to flip NHP_INTERNAL_FORWARD_ATTEST_REQUIRE=true.
+	MetricForwardHopAttestSuccess = "ForwardHopAttestSuccess"
+	MetricForwardHopAttestPermit  = "ForwardHopAttestPermit"
+	// MetricForwardHopAttestReject is the strict-mode auth reject — its
+	// dominant cause during rollout is an un-upgraded (non-signing) sender,
+	// not an attack. Kept distinct from the ceiling counter below so an
+	// operator alarming on a real loop signal isn't drowned by rollout noise.
+	MetricForwardHopAttestReject = "ForwardHopAttestReject"
+	// MetricForwardHopCeilingReject is the always-on hop-ceiling 403 (hop
+	// out of [1, maxForwardHops]), independent of this gate's rollout mode.
+	// Legitimate traffic never trips it, so a nonzero value is a real
+	// over-hop / loop signal worth investigating on its own — BUT only once
+	// the upstream shared-secret gate (NHP_INTERNAL_AUTH_REQUIRE) is itself
+	// strict. The hop-range check runs before the trust/MAC checks, so while
+	// that gate is in permit any private-network actor reaching
+	// /nhp/internal/knock can drive this counter with a garbage hop. Alarm on
+	// it only after #1122's gate is strict; until then treat spikes as
+	// unauthenticated noise, not confirmed loops.
+	MetricForwardHopCeilingReject = "ForwardHopCeilingReject"
 	// MetricInternalKnockASPNotFound fires when an authenticated
 	// /nhp/internal/knock request reaches catalog resolution but the
 	// requested aspId is absent. Kept separate from MetricAuthFailure
