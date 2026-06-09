@@ -109,7 +109,7 @@ jobs:
       packer_ac: ${{ steps.filter.outputs.packer_ac }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0  # Full history needed for paths-filter to compare commits
 
@@ -218,7 +218,7 @@ jobs:
       # we don't want.
       - name: Checkout (guard only)
         if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: Validate dispatch ref
         if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
         env:
@@ -316,7 +316,7 @@ jobs:
     # one-line edit at the top of the workflow.
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Configure AWS credentials (AMI parameter read)
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
@@ -711,7 +711,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       # Sets up Go on the runner solely to manage the module/build cache
       # across runs. Tests themselves still execute in the
@@ -878,7 +878,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.lambdas == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Set up Python
         if: needs.changes.outputs.lambdas == 'true'
@@ -994,7 +994,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.app == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       # ECR is hosted in the sandbox account (primary_account). Prod pulls cross-account
       # via ECR repository policy (see terraform/modules/ecr/main.tf). Images are always
@@ -1331,7 +1331,7 @@ jobs:
         environment: [sandbox, prod]
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         # fetch-depth: 2 is enough: the "Check for Terraform changes" step
         # below uses `git diff BASE_SHA HEAD_SHA`. For a PR branch, HEAD_SHA
         # is the tip and BASE_SHA is reachable via the merge-base fetched
@@ -1468,7 +1468,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 1
 
@@ -1556,7 +1556,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 1
 
@@ -1610,7 +1610,7 @@ jobs:
         environment: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.environment)) || fromJSON('["sandbox"]') }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
@@ -1697,7 +1697,7 @@ jobs:
       etcd_endpoint: ${{ steps.outputs.outputs.etcd_endpoint }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
@@ -2072,7 +2072,7 @@ jobs:
       cancel-in-progress: false  # Never cancel an in-flight ECS roll.
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       # Reuses AWS_ROLE_ARN (the sandbox apply role). It already manages the
       # qurl ECS service / task def / SSM params via TF, so it holds the
@@ -2270,7 +2270,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
@@ -2382,7 +2382,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
