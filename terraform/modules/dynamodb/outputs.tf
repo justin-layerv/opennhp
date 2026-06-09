@@ -205,6 +205,7 @@ output "qurl_table_arns" {
     aws_dynamodb_table.qurl_audit_log[0].arn,
     aws_dynamodb_table.qurl_webhooks[0].arn,
     aws_dynamodb_table.qurl_webhook_deliveries[0].arn,
+    aws_dynamodb_table.qurl_webhook_event_dedupe[0].arn,
     aws_dynamodb_table.qurl_api_keys[0].arn,
     aws_dynamodb_table.qurl_customers[0].arn,
     aws_dynamodb_table.qurl_billing_audit[0].arn,

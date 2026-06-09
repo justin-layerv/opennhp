@@ -1093,6 +1093,58 @@ resource "aws_dynamodb_table" "qurl_webhook_deliveries" {
   })
 }
 
+# qurl-webhook-event-dedupe: 24h "already published" markers for the
+# qurl-api SQS consumer that pops scanner-emitted events off the
+# scanner→qurl-api queue (qurl-service #874 / closes #819).
+#
+# The markers exist so operator `qurl-scanner --bucket=N` replays —
+# the recovery path for the EmittedNoFence scanner-failure class
+# (PR #666) — don't double-deliver to downstream webhook subscribers.
+# 24h matches the longest realistic replay window.
+#
+# Schema MUST mirror qurl-service `internal/repository/dynamodb/
+# schema.go::TableWebhookEventDedupe` exactly — PK `pk` (S), TTL
+# attribute `ttl`, no sort key, no GSIs. The qurl-service schema
+# reconciler runs DescribeTable against every entry in `dbclient.Tables`
+# every 60s; the dedupe table being absent fails `/health/ready` and
+# triggers an ECS deploy rollback. The dedupe table is a hard
+# prerequisite for any qurl-service deploy past 08cc47f, even with
+# `WEBHOOK_EVENTS_CONSUMER_ENABLED=false`.
+resource "aws_dynamodb_table" "qurl_webhook_event_dedupe" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-webhook-event-dedupe"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-webhook-event-dedupe"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "qurl-api SQS-consumer 24h publish-once dedupe markers"
+  })
+}
+
 # qurl-api-keys: Stores API key hashes and metadata
 # PK: key_hash (SHA-256 of plaintext key)
 # GSI: owner-index (list keys by owner), key-id-index (lookup by public key ID)
