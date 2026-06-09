@@ -17,9 +17,11 @@
 # `allow_overwrite = true` would replace the WHOLE set, silently clobbering any
 # value created out-of-band in the interim (e.g. a domain-verification token).
 # Failing loud on a name collision is the right posture, matching the
-# `discord_bot_alias` rationale in `qurl_bot_dns.tf`. (The two layerv.xyz
-# records that already exist and must be modified — SPF + DMARC — DO use
-# `allow_overwrite` and live in the sandbox sibling file.)
+# `discord_bot_alias` rationale in the sandbox sibling `qurl_bot_dns.tf`
+# (prod's copy was retired when discord DNS moved in-account to the
+# `connector.layerv.ai` subzone). (The two layerv.xyz records that already
+# exist and must be modified — SPF + DMARC — DO use `allow_overwrite` and live
+# in the sandbox sibling file.)
 #
 # Every record also carries `lifecycle { prevent_destroy = true }` (matching the
 # durable-record posture of `qurl_bot_dns.tf`): combined with the `count` gates,
@@ -27,7 +29,8 @@
 # silently destroying the apex CAA/SPF/DMARC set and reverting this hardening.
 # To intentionally retire a record — or to apply a force-new change such as a
 # zone_id repoint — delete the resource block, apply, then re-add it (the same
-# retire-and-recreate dance the sibling `qurl_bot_dns.tf` records use).
+# retire-and-recreate dance the sandbox sibling `qurl_bot_dns.tf` records use
+# for their prevent_destroy'd validation records).
 #
 # CAA issuer sets were derived from the live certificate-transparency history
 # (crt.sh) of each domain, NOT guessed from Terraform — a CAA that omits any CA
