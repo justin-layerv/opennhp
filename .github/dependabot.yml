@@ -63,6 +63,42 @@ updates:
       - "dependencies"
       - "go"
 
+  # Go modules - docker/web-app
+  # Runtime app container (the nhp-app image), not a test helper: pulls
+  # gin-gonic/gin plus golang.org/x/crypto and x/net transitively. A CVE
+  # in that web stack ships straight into a deployed image, so it gets the
+  # same silent-supply-chain coverage as the modules above. Outside the
+  # `make init` auto-tidy set (#1290), so nothing else watches it.
+  - package-ecosystem: "gomod"
+    directory: "/docker/web-app"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "go"
+
+  # Go modules - remaining test modules (e2e, integration, smoke)
+  # Each is a separate module with its own indirect graph (AWS SDK v2
+  # family, etcd client). Same rationale as tests/local: without coverage a
+  # supply-chain CVE in anything they transitively pull lands silently.
+  # tests/e2e has no non-stdlib deps today but is listed for symmetry so the
+  # moment one lands it is already watched. Outside the `make init` auto-tidy
+  # set (#1290) — the dependabot exposure is independent of that tracking.
+  - package-ecosystem: "gomod"
+    directories:
+      - "/tests/e2e"
+      - "/tests/integration"
+      - "/tests/smoke"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "go"
+
   # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -118,6 +154,28 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # Python — Lambda function dependencies under terraform/modules/*/lambda.
+  # The acme-cert and custom-domain-cert requirements.txt are DEPLOYED runtime
+  # deps (cryptography, pyOpenSSL, requests, urllib3, certifi) that ship into
+  # the prod cert-management Lambdas — exactly the security-sensitive packages
+  # that get CVEs regularly. The glob also sweeps the developer-portal and
+  # status-page dev/test requirements in the same modules. Patch + minor only;
+  # a major cryptography/urllib3 bump needs a human read of the changelog, same
+  # policy as the .github/scripts block above.
+  - package-ecosystem: "pip"
+    directories:
+      - "/terraform/modules/*/lambda"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "terraform"
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
