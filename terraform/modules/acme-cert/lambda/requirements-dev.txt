@@ -5,8 +5,8 @@
 pytest==9.0.3
 
 # AWS SDK (provided by Lambda runtime, needed for testing)
-boto3==1.36.7
-botocore==1.36.7
+boto3==1.43.25
+botocore==1.43.25
 
 # The Lambda dependencies (for running tests)
 -r requirements.txt
