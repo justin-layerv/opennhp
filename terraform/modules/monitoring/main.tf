@@ -794,25 +794,63 @@ resource "aws_cloudwatch_metric_alarm" "ac_registration_latency" {
 
 # ==================== DynamoDB Monitoring ====================
 
-# DynamoDB Throttled Requests - indicates capacity issues
+# DynamoDB throttling — per-table read+write throttle events.
+#
+# Uses ReadThrottleEvents + WriteThrottleEvents (combined via FILL metric math),
+# NOT ThrottledRequests. AWS publishes ThrottledRequests only at the
+# {TableName, Operation} granularity, so the previous {TableName}-only alarm
+# selected a non-existent metric stream and — with treat_missing_data =
+# "notBreaching" — sat OK forever and NEVER fired (the silent-alarm failure mode
+# in terraform/CLAUDE.md's "Metric / Alarm Dim-Set Rules"; confirmed via
+# `aws cloudwatch list-metrics` in #1912). Read/WriteThrottleEvents ARE published
+# at {TableName} alone (per the AWS docs), so they are the correct table-level
+# primitive. This mirrors the proven pattern already used for the QURL hot-path
+# tables in modules/dynamodb/alarms.tf (qurl_api_keys / qurl_agent_keys).
 resource "aws_cloudwatch_metric_alarm" "dynamodb_throttled" {
   for_each = var.enable_dynamodb_monitoring ? toset(var.dynamodb_table_names) : toset([])
 
   alarm_name          = "${var.name_prefix}-${var.cell_id}-dynamodb-throttled-${each.value}"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
-  metric_name         = "ThrottledRequests"
-  namespace           = "AWS/DynamoDB"
-  period              = 300
-  statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "DynamoDB table ${each.value} experiencing throttling"
+  alarm_description   = "DynamoDB table ${each.value} throttling (read+write throttle events) sustained 2 consecutive minutes — a sustained throttle on a PAY_PER_REQUEST table means adaptive capacity hasn't caught up and requests are failing."
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"
 
-  dimensions = {
-    TableName = each.value
+  # FILL(reads,0)+FILL(writes,0): DynamoDB only publishes Read/WriteThrottleEvents
+  # in periods where a throttle actually lands, so a read-only burst yields
+  # reads=N, writes=<empty>. FILL substitutes 0 for the empty series so the sum
+  # is well-defined (see modules/dynamodb/alarms.tf for the same rationale).
+  metric_query {
+    id          = "throttles"
+    expression  = "FILL(reads, 0) + FILL(writes, 0)"
+    label       = "Throttle events"
+    return_data = true
+  }
+  metric_query {
+    id = "reads"
+    metric {
+      metric_name = "ReadThrottleEvents"
+      namespace   = "AWS/DynamoDB"
+      period      = 60
+      stat        = "Sum"
+      dimensions = {
+        TableName = each.value
+      }
+    }
+  }
+  metric_query {
+    id = "writes"
+    metric {
+      metric_name = "WriteThrottleEvents"
+      namespace   = "AWS/DynamoDB"
+      period      = 60
+      stat        = "Sum"
+      dimensions = {
+        TableName = each.value
+      }
+    }
   }
 
   tags = merge(var.tags, {
@@ -821,32 +859,13 @@ resource "aws_cloudwatch_metric_alarm" "dynamodb_throttled" {
   })
 }
 
-# DynamoDB System Errors - backend errors from DynamoDB
-resource "aws_cloudwatch_metric_alarm" "dynamodb_system_errors" {
-  for_each = var.enable_dynamodb_monitoring ? toset(var.dynamodb_table_names) : toset([])
-
-  alarm_name          = "${var.name_prefix}-${var.cell_id}-dynamodb-errors-${each.value}"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "SystemErrors"
-  namespace           = "AWS/DynamoDB"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 5
-  alarm_description   = "DynamoDB table ${each.value} experiencing system errors"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-  ok_actions          = [aws_sns_topic.alerts.arn]
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    TableName = each.value
-  }
-
-  tags = merge(var.tags, {
-    Component = "monitoring"
-    Cell      = var.cell_id
-  })
-}
+# The former `dynamodb_system_errors` alarm (SystemErrors, {TableName}) was
+# REMOVED in #1912: SystemErrors is published only at {TableName, Operation}
+# (same as ThrottledRequests), so the {TableName}-only alarm never matched a
+# stream and never fired — it gave zero real coverage. A working per-table
+# SystemErrors alarm needs SUM(SEARCH(...)) across operations, and DDB-side HTTP
+# 500s on PAY_PER_REQUEST are SDK-retried, low-value noise — not worth a novel
+# alarm shape. Tracked in #2445 if per-table 5xx coverage is ever needed.
 
 # DynamoDB Read Latency - high latency may indicate issues
 resource "aws_cloudwatch_metric_alarm" "dynamodb_read_latency" {
