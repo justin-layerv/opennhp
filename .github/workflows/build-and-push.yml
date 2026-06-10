@@ -300,12 +300,12 @@ jobs:
       # AWS_ROLE_ARN / AWS_PROD_ROLE_ARN that the rest of the workflow
       # uses. They have the amazon-ebs builder permissions plus scoped
       # ssm:PutParameter on /{env}/nhp/{server,ac}/ami-id, defined in
-      # terraform/modules/ecr/packer.tf. The workflow still reads/verifies
-      # AMI parameters through the environment deploy role, and publishes
-      # the AC AMI from that role, so the first main run that adds the new
-      # AC parameter path is not blocked waiting for the Packer role's
-      # updated SSM policy to apply. See terraform/modules/ecr/packer.tf
-      # for why packer-build is separate from the terraform-apply role.
+      # terraform/modules/ecr/packer.tf. Both the Server and AC AMI IDs are
+      # published by their Packer shell-local post-processors under this
+      # dedicated Packer role; the workflow only reads/verifies the resulting
+      # parameters through the environment deploy role. See
+      # terraform/modules/ecr/packer.tf for why packer-build is separate from
+      # the terraform-apply role.
       #
       # The Terraform output `github_actions_packer_role_arn` (in both
       # terraform/environments/sandbox and terraform/environments/prod)
@@ -565,16 +565,13 @@ jobs:
               nhp-server-docker.pkr.hcl
           fi
           if [[ "$BUILD_AC_AMI" == "true" ]]; then
-            # Temporary first-merge IAM-ordering workaround: AC publishes from
-            # the deploy role below while the Packer role's new scoped
-            # /<env>/nhp/ac/ami-id grant lands. Collapse back to Packer
-            # publishing in #2248.
+            # Same -var set as the AC packer build below (which publishes via
+            # the post-processor — see that step's comment).
             packer validate \
               -var "environment=${ENVIRONMENT}" \
               -var "aws_region=${AWS_BUILD_REGION}" \
               -var "git_sha=${GIT_SHA}" \
               -var "runtime_packages_only=true" \
-              -var "publish_ssm=false" \
               nhp-ac.pkr.hcl
           fi
 
@@ -604,52 +601,25 @@ jobs:
               nhp-server-docker.pkr.hcl
           fi
           if [[ "$BUILD_AC_AMI" == "true" ]]; then
-            # See #2248: CI keeps publish_ssm=false until the dedicated Packer
-            # role's AC SSM grant is steady-state in every environment.
+            # AC publishes /<env>/nhp/ac/ami-id from its Packer shell-local
+            # post-processor under the dedicated Packer role, same as the
+            # Server build above (#2248 collapsed the former workflow-side
+            # publish workaround now that the role's ac/ami-id grant is
+            # steady-state in every environment).
             packer build \
               -on-error=cleanup \
               -var "environment=${ENVIRONMENT}" \
               -var "aws_region=${AWS_BUILD_REGION}" \
               -var "git_sha=${GIT_SHA}" \
               -var "runtime_packages_only=true" \
-              -var "publish_ssm=false" \
               nhp-ac.pkr.hcl
           fi
 
-      - name: Configure AWS credentials (AMI parameter publish/verify)
+      - name: Configure AWS credentials (AMI parameter verify)
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
           role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Publish AC AMI Parameter
-        if: steps.should-build.outputs.ac == 'true'
-        working-directory: packer
-        env:
-          ENVIRONMENT: ${{ matrix.environment }}
-          AWS_BUILD_REGION: ${{ env.AWS_REGION }}
-        run: |
-          set -euo pipefail
-          MANIFEST="manifest-ac-${ENVIRONMENT}.json"
-          SSM_PARAM="/${ENVIRONMENT}/nhp/ac/ami-id"
-
-          if [[ ! -f "$MANIFEST" ]]; then
-            echo "::error::AC Packer manifest $MANIFEST not found; cannot publish $SSM_PARAM"
-            exit 1
-          fi
-
-          trap 'rm -f "$MANIFEST"' EXIT
-          if ! AMI_ID=$("../scripts/ami-id-from-manifest.sh" "$MANIFEST" "$AWS_BUILD_REGION"); then
-            echo "::error::Could not parse AC AMI ID from $MANIFEST for $AWS_BUILD_REGION"
-            exit 1
-          fi
-
-          aws ssm put-parameter \
-            --name "$SSM_PARAM" \
-            --value "$AMI_ID" \
-            --type String \
-            --overwrite
-          echo "Published AC AMI $AMI_ID to $SSM_PARAM"
 
       - name: Verify SSM Parameter
         env:

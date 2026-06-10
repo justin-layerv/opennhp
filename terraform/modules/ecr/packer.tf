@@ -81,15 +81,14 @@ resource "aws_iam_role" "github_actions_packer" {
 #   - snapshot + register the AMI (CreateSnapshot + CreateImage + RegisterImage)
 #   - clean up on success or failure (Terminate + Delete + Deregister)
 #
-# Plus scoped ssm:PutParameter grants for shell-local post-processors that
+# Plus scoped ssm:PutParameter grants for the shell-local post-processors that
 # publish resulting AMI IDs to /{env}/nhp/server/ami-id and
-# /{env}/nhp/ac/ami-id. CI currently publishes the AC parameter from the
-# environment deploy role after the build so the first main run adding this new
-# path is not blocked by IAM propagation/ordering, but the scoped grant keeps
-# standalone and steady-state Packer publishes least-privileged. The SSM grant
-# is scoped to the exact parameter paths so this role cannot write to any other
-# SSM parameter, even within /{env}/nhp/{server,ac}/* (e.g. it can't touch
-# image-tag or asg-name).
+# /{env}/nhp/ac/ami-id. Both the Server and AC builds publish their own
+# parameter through this role (the prior workflow-side AC publish was collapsed
+# back into the Packer post-processor in #2248, once this grant was steady-state
+# in every env). The SSM grant is scoped to the exact parameter paths so this
+# role cannot write to any other SSM parameter, even within
+# /{env}/nhp/{server,ac}/* (e.g. it can't touch image-tag or asg-name).
 resource "aws_iam_policy" "github_actions_packer_build" {
   name = "nhp-${var.environment}-github-actions-packer-build"
   # description is ForceNew on aws_iam_policy: an edit forces a destroy+recreate

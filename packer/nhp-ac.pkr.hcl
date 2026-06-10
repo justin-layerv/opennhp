@@ -113,9 +113,13 @@ variable "runtime_packages_only" {
 }
 
 variable "publish_ssm" {
-  type        = bool
-  default     = true
-  description = "Publish the built AC AMI ID to /{environment}/nhp/ac/ami-id from the Packer shell-local post-processor. CI can disable this and publish from the workflow after switching to the environment deploy role."
+  type    = bool
+  default = true
+  # Set false only for local / out-of-band AC builds (e.g. emergency recovery)
+  # that manage the SSM parameter themselves; nhp-server-docker has no equivalent
+  # knob because it is only ever built in CI. Marketplace builds skip the publish
+  # via the separate var.marketplace guard below.
+  description = "Publish the built AC AMI ID to /{environment}/nhp/ac/ami-id from the Packer shell-local post-processor (default true; CI always does). Set false only for local/out-of-band builds that manage the parameter themselves."
 }
 
 # Marketplace-specific variables
@@ -575,7 +579,7 @@ build {
         "set -euo pipefail",
         "echo '=== Publishing AC AMI ID to SSM ==='",
         "MANIFEST=\"manifest-ac-$ENVIRONMENT.json\"",
-        "if [ \"${var.publish_ssm}\" != \"true\" ]; then echo 'publish_ssm=false; leaving manifest for caller-managed SSM publish'; exit 0; fi",
+        "if [ \"${var.publish_ssm}\" != \"true\" ]; then echo 'publish_ssm=false; skipping SSM publish (out-of-band/local build manages the parameter)'; exit 0; fi",
         "trap 'rm -f \"$MANIFEST\"' EXIT",
         "if [ \"${var.marketplace}\" = \"true\" ]; then echo 'Marketplace build; skipping /$ENVIRONMENT/nhp/ac/ami-id publish'; exit 0; fi",
         "AMI_ID=$(\"${path.root}/../scripts/ami-id-from-manifest.sh\" \"$MANIFEST\" \"$AWS_REGION\")",

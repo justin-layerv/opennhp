@@ -74,18 +74,11 @@ accounts use the **us-east-2** region (matches `terraform/variables.tf`,
 
 The CI workflow (`.github/workflows/build-and-push.yml::packer-build`)
 handles steady-state builds: when packer files change on `main`, CI builds a
-new AMI in the target account and publishes the ID to SSM. CI passes
-`publish_ssm=false` to the AC Packer template and publishes
-`/<env>/nhp/ac/ami-id` from the workflow after switching back to the
-environment deploy role; this avoids a first-merge ordering trap while the
-dedicated Packer role's new AC SSM permission is being applied. The
-`promote-to-prod` workflow refuses to deploy if `/prod/nhp/{server,ac}/ami-id`
-is missing — by design, since neither launch template has a fallback to vanilla
-Ubuntu.
-
-First prod rollout checklist: publish `/prod/nhp/ac/ami-id` before the first
-post-merge `promote-to-prod` run with `run_terraform=true`, or the AMI preflight
-will block the deploy by design.
+new AMI in the target account and both the Server and AC templates publish
+their AMI ID to `/<env>/nhp/{server,ac}/ami-id` from their Packer shell-local
+post-processors, under the dedicated Packer role. The `promote-to-prod`
+workflow refuses to deploy if `/prod/nhp/{server,ac}/ami-id` is missing — by
+design, since neither launch template has a fallback to vanilla Ubuntu.
 
 You only need this section in two situations:
 
@@ -188,9 +181,8 @@ For reference, the CI packer-build job is roughly:
 1. Detect if the Server or AC Packer template changed on `main` (or if that
    component's SSM parameter is missing).
 2. Run `packer build` only for the component(s) that need a fresh AMI.
-3. The Server Packer post-processor publishes `/<env>/nhp/server/ami-id`;
-   the workflow parses the AC manifest and publishes `/<env>/nhp/ac/ami-id`
-   after switching back to the environment deploy role.
+3. The Server and AC Packer post-processors each publish their own
+   `/<env>/nhp/{server,ac}/ami-id` under the dedicated Packer role.
 4. The terraform-plan job waits for packer-build to complete before reading
    the SSM parameter.
 
