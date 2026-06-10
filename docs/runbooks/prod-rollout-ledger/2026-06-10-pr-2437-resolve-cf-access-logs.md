@@ -1,7 +1,20 @@
 # 2026-06-10 · PR #2437 · Resolve CloudFront access logging (v2 → S3)
 
 - **Owner:** prod rollout coordinator
-- **Source:** [#2437](https://github.com/layervai/nhp/pull/2437), [#1799](https://github.com/layervai/nhp/issues/1799)
+- **Source:** [#2437](https://github.com/layervai/nhp/pull/2437), [#1799](https://github.com/layervai/nhp/issues/1799); CI-grant follow-up: [#2444](https://github.com/layervai/nhp/pull/2444)
+
+> **Correction (post-#2437 sandbox apply).** #2437's CI grant was
+> **incomplete**: it added the `logs:*` delivery verbs but not
+> `cloudfront:AllowVendedLogDeliveryForResource`, which `PutDeliverySource`
+> requires on the distribution when the delivery-source `resource_arn` is a
+> CloudFront distribution. The first post-#2437 sandbox apply red-balled on
+> `AccessDenied` for **that** action — a genuinely missing grant, which a
+> re-run never clears. Fixed in the follow-up PR above (adds the
+> `CloudFrontVendedLogDelivery` Sid to `qurl_link_static`). This is distinct
+> from the resource-prefix propagation wait described below: that wait is real
+> and remains for prod's fresh apply; the cloudfront grant was a bug, not a
+> race. Prod must promote *after* the follow-up fix is on main, or it hits the
+> same permanent wall.
 
 Enables CloudFront standard logging v2 for the resolve distribution → new
 `layerv-nhp-prod-qurl-resolve-logs` S3 bucket. Applies via promote with
@@ -22,7 +35,7 @@ expected — re-run the apply and it clears (the grant has propagated). It is NO
 a config error and a re-run is safe (these creates are idempotent).
 
 - [ ] Rollout: validate in sandbox first (sandbox applies on merge to main), then promote to prod with `run_terraform=true`.
-- [ ] Rollout (sandbox): if the first apply hits `AccessDenied` on `logs:PutDeliverySource`/`PutDeliveryDestination`, re-run — expected per above. Confirm the second apply completes before promoting.
+- [ ] Rollout (sandbox): the post-#2437 apply already failed on the missing `cloudfront:AllowVendedLogDeliveryForResource` grant (see Correction). After the follow-up fix merges, the sandbox apply adds only that one `*`-scoped grant fresh (the `logs:Put*` resource-prefix grants from #2437 have long since propagated), so it should complete in a single apply within the 60s shim. If it still `AccessDenied`s, re-run once and confirm completion before promoting.
 - [ ] Rollout (**prod promote — the disruptive case**): the promote runs the same first-grant apply, so it may half-apply on the propagation `AccessDenied`. Treat a re-run as the **expected** path: re-run the promote (or its terraform step) once; do **not** treat the first `AccessDenied` as a failure to roll back. A half-applied prod promote here is recoverable by re-running, not by reverting.
 - [ ] Post-rollout (delivery wired): `aws logs get-delivery-source --name layerv-nhp-prod-qurl-resolve --region us-east-1` shows `service=cloudfront`, `logType=ACCESS_LOGS`; `aws logs describe-deliveries --region us-east-1` shows the delivery into destination `layerv-nhp-prod-qurl-resolve-s3`.
 - [ ] Post-rollout (logs land): a first object appears under `s3://layerv-nhp-prod-qurl-resolve-logs/AWSLogs/<account-id>/CloudFront/` within ~1h (v2 delivery is typically 5–15 min).

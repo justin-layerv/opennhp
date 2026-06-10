@@ -2364,6 +2364,38 @@ resource "aws_iam_policy" "qurl_link_static" {
         Resource = "*"
       },
       {
+        # `PutDeliverySource` (the `aws_cloudwatch_log_delivery_source.qurl_resolve`
+        # create, root main.tf) passes the resolve distribution's ARN as the
+        # source `resource_arn`. CloudWatch vended-logs evaluates a *cross-service*
+        # authorization on that source resource: the calling principal must hold
+        # `cloudfront:AllowVendedLogDeliveryForResource` on the distribution, in
+        # ADDITION to `logs:PutDeliverySource` (granted in the Endpoints Sid above).
+        # The S3 *destination* side needs no identity twin of this — it is
+        # authorized by the bucket's resource policy (the
+        # `delivery.logs.amazonaws.com` grant on `aws_s3_bucket.qurl_resolve_logs`),
+        # which Terraform manages directly. So this CloudFront action is the only
+        # cross-service grant the delivery chain needs. Omitting it was the gap that
+        # red-balled the first post-#2437 apply (PutDeliverySource AccessDenied on
+        # exactly this action — a missing grant, not a propagation race, so re-runs
+        # never cleared it).
+        #
+        # Resource = "*" is deliberate, and for a sharper reason than the
+        # bootstrap-circularity rationale on the sibling CloudFront Sids: a blanket
+        # `*` grant propagates through the IAM evaluator well inside the 60s
+        # `qurl_link_static_iam_propagation` shim the delivery source depends_on,
+        # whereas a resource-prefix ARN (`arn:aws:cloudfront::${acct}:distribution/*`)
+        # is exactly the freshly-scoped-prefix case terraform/CLAUDE.md flags as
+        # needing ~180s — which the 60s shim would NOT cover, re-introducing the red.
+        # The action is CloudFront-distribution-scoped regardless, and the resolve
+        # distribution's ID is AWS-generated (unknown at policy-author time, and not
+        # visible to this module), so `*` is both narrower than it looks and the only
+        # workable scope here.
+        Sid      = "CloudFrontVendedLogDelivery"
+        Effect   = "Allow"
+        Action   = ["cloudfront:AllowVendedLogDeliveryForResource"]
+        Resource = "*"
+      },
+      {
         Sid    = "CloudFrontCachePolicy"
         Effect = "Allow"
         Action = [
