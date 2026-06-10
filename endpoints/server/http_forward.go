@@ -464,6 +464,52 @@ func (f *HttpKnockForwarder) forwardToServer(
 	return fwdResp.AckMsg, nil
 }
 
+// buildForwardedKnock returns the knock request and caller resource to
+// forward when this server has no local AC connection for the resolved
+// resource.
+//
+// The /plugins/:aspid entrypoint (httpserver.go) builds req with only
+// AuthServiceId populated — the resId is resolved into res and never copied
+// onto req. The internal-knock receiver resolves a resource by (aspId, resId)
+// and rejects any forward whose request omits either with 400 "missing aspId
+// or resId" (resolveInternalKnockResource → errInvalidInternalKnockRequest).
+// So forwarding the bare req silently 400'd every cross-server knock on the
+// qURL resolve path: an InService server that lacked a local AC connection
+// could not be rescued by a peer that had one, surfacing as
+// ErrACConnectionNotFound 500s during AC-connection churn.
+//
+// resId is taken from res.ResourceId — the resolved resource the receiver
+// resolves by, the same value handleHttpOpenResource feeds to
+// knkMsg.ResourceId — not from an inner res.Resources key, so it carries the
+// correct identity without depending on the catalog's "inner Resources key ==
+// resId" shape (resource_lookup.go). This is deliberately the group-level
+// resId, not the per-iteration inner resName: a forward triggered by one
+// missing AC in a (hypothetical) multi-resource group carries the group id and
+// the receiver re-resolves the whole group — matching the pre-existing
+// whole-res forward semantics. On the qURL resolve path the group is a single
+// resource, so the distinction is moot today.
+//
+// callerResource carries only the scalars the receiver's
+// resolveInternalKnockResource consults — (aspId, resId) for its consistency
+// check and OpenTime for the bounded-open override; it never reads Resources,
+// so none are attached.
+//
+// Only scalar fields may be set on the returned request copy: it shallow-
+// copies req, so reference fields (Url, Ctx) still alias the caller's req and
+// writing one would leak back into the shared request mid-loop.
+func buildForwardedKnock(req *common.HttpKnockRequest, res *common.ResourceData) (*common.HttpKnockRequest, *common.ResourceData) {
+	fwdReq := *req
+	fwdReq.ResourceId = res.ResourceId
+	fwdRes := &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			AuthServiceId: req.AuthServiceId,
+			ResourceId:    res.ResourceId,
+			OpenTime:      res.OpenTime,
+		},
+	}
+	return &fwdReq, fwdRes
+}
+
 // isPrivateIP checks if an IP address is in RFC 1918 private or loopback address space.
 func isPrivateIP(ipStr string) bool {
 	ip := net.ParseIP(ipStr)

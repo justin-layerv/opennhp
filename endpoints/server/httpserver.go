@@ -1335,13 +1335,37 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 			// onward forward would emit verifiedHop+1, so refuse to start
 			// one once the incoming hop is already at the ceiling (issue
 			// #1127) rather than emit a forward the next server will 403.
-			if hs.httpForwarder != nil && !req.Forwarded && forwardHopFromContext(ctx) < maxForwardHops {
+			// A forward carries res.ResourceId as the resId the peer
+			// resolves by; an empty group id would 400 "missing aspId or
+			// resId" at the peer — the same silent failure this forward fix
+			// addresses, reintroduced from a malformed catalog entry. Don't
+			// burn a doomed forward: warn so a regression is observable
+			// (this path has no alarm yet, #2449) and fall through to the
+			// no-AC result, which counts KnockNoAC.
+			canForward := hs.httpForwarder != nil && !req.Forwarded && forwardHopFromContext(ctx) < maxForwardHops
+			if canForward && res.ResourceId == "" {
+				log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] skipping forward: resolved resource has empty ResourceId", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId)
+				canForward = false
+			}
+			if canForward {
 				fwdCtx, fwdCancel := context.WithTimeout(ctx, DefaultForwardTimeout)
-				fwdAck, fwdErr := hs.httpForwarder.ForwardHttpKnock(fwdCtx, acId, req, res)
+				// req from the /plugins/:aspid path carries only aspId; the
+				// resId lives in res. The internal-knock receiver resolves by
+				// (aspId, resId) and 400s "missing aspId or resId" on a bare
+				// req, so forward a copy that carries the identity. See
+				// buildForwardedKnock for the full rationale.
+				fwdReq, fwdRes := buildForwardedKnock(req, res)
+				fwdAck, fwdErr := hs.httpForwarder.ForwardHttpKnock(fwdCtx, acId, fwdReq, fwdRes)
 				fwdCancel() // cancel immediately; defer would accumulate across loop iterations
 				if fwdErr == nil && fwdAck != nil && fwdAck.ErrCode == common.ErrSuccess.ErrorCode() {
 					log.Info("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] knock forwarded successfully", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId)
 					s.metrics.IncrCounter(MetricKnockForwardSuccess)
+					// Complete on the single-resource qURL path. For a
+					// multi-resource group this returns the peer's whole-group
+					// ack and skips siblings servable locally; the re-resolve
+					// equivalence (AC placement, per-sub-resource OpenTime) is
+					// tracked in #2452. Newly reachable, not new control flow —
+					// the forward branch was dead (always 400'd) before this fix.
 					return fwdAck, nil
 				}
 				if fwdErr != nil {

@@ -31,8 +31,11 @@ func newForwardingTestServer(storage StorageBackend) *HttpServer {
 							AuthServiceId: "qurl",
 							ResourceId:    "r_test",
 							OpenTime:      77,
+							// Inner Resources key is the resId on the catalog
+							// path (resource_lookup.go) — key it that way here so
+							// the fixture mirrors the production shape.
 							Resources: map[string]*common.ResourceInfo{
-								"default": {
+								"r_test": {
 									ACId: "test-ac",
 									Addr: &common.NetAddress{Ip: "10.0.2.100", Port: 443},
 								},
