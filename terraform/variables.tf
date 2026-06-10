@@ -734,6 +734,23 @@ variable "enable_resolve_waf_logging" {
   default     = true
 }
 
+variable "enable_resolve_access_logs" {
+  description = <<-EOT
+    Enable CloudFront access logging (standard logging v2 -> S3) for the resolve
+    distribution (issue #1799). Default true so per-request x-edge-detailed-
+    result-type is available for origin-error RCA without waiting to enable it
+    mid-incident. Mirrors enable_resolve_waf_logging: gated on top of
+    enable_resolve_cloudfront so logs can be turned off without tearing down the
+    resolve edge. The delivered record_fields deliberately omit cs-uri-query so
+    the ?token= access credential is never logged; see the delivery resources in
+    main.tf. Storage is a short-retention S3 bucket (90d prod / 30d non-prod,
+    matching the resolve WAF log group), bounded cost at resolve traffic; this is
+    the explicit off-switch.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "traefik_plugins" {
   description = <<-EOT
     Map of Traefik plugins to deploy.

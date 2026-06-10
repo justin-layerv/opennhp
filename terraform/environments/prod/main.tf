@@ -151,6 +151,7 @@ module "nhp" {
   enable_resolve_cloudfront       = var.enable_resolve_cloudfront
   resolve_waf_ip_reputation_block = var.resolve_waf_ip_reputation_block
   enable_resolve_waf_logging      = var.enable_resolve_waf_logging
+  enable_resolve_access_logs      = var.enable_resolve_access_logs
 
   # QURL Router plugin
   qurl_router_enabled            = var.qurl_router_enabled

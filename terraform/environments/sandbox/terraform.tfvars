@@ -508,6 +508,12 @@ resolve_waf_ip_reputation_block = false
 # IP-reputation rule stays observable.
 enable_resolve_waf_logging = true
 
+# CloudFront access logging (v2 -> S3) for the resolve distribution (#1799),
+# mirroring prod. Sandbox applies first, so it validates the delivery wiring +
+# the new CI IAM grant before prod. Delivered fields omit cs-uri-query, so the
+# ?token= credential is never logged. Set false to disable.
+enable_resolve_access_logs = true
+
 # ==============================================================================
 # QURL Router Plugin Configuration
 # Traefik plugin that routes *.qurl.site.layerv.xyz requests to target backends

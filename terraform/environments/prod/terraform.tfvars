@@ -224,6 +224,12 @@ resolve_waf_ip_reputation_block = false
 # it to IP-reputation-matched + BLOCKed requests; set false only under log-cost pressure.
 enable_resolve_waf_logging = true
 
+# CloudFront access logging (v2 -> S3) for the resolve distribution (#1799), so
+# per-request x-edge-detailed-result-type is on hand for origin-error RCA. The
+# delivered fields omit cs-uri-query, so the ?token= credential is never logged.
+# 90-day-expiry bucket; bounded cost at resolve traffic. Set false to disable.
+enable_resolve_access_logs = true
+
 # Traefik plugins (downloaded from S3 at boot time)
 # Plugin source files are uploaded by traefik-plugins repo CI to s3://layerv-nhp-prod-plugins/
 # Key names must match moduleName in traefik.toml for Traefik local plugin resolution

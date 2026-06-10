@@ -2308,6 +2308,62 @@ resource "aws_iam_policy" "qurl_link_static" {
         Resource = "*"
       },
       {
+        # CloudFront standard logging (v2) for the resolve distribution's access
+        # logs (issue #1799) — delivery source/destination management. These
+        # resources have deterministic, author-chosen names, so the grant is
+        # resource-scoped (us-east-1 because CF vended-logs delivery is managed
+        # there; account from local.account_id). The Get*/List* read path is
+        # covered by `terraform_read`'s CloudWatchRead Sid (`logs:Get*`/`List*`
+        # on `*`), so only writes live here.
+        #
+        # v2 (not legacy `logging_config`) is deliberate: the resolve edge
+        # carries the access token in the `?token=` query string during the
+        # GET->POST migration, so it is redacted from both the WAF logs and the
+        # server's Gin logs. Legacy CF logging has no field selection and would
+        # write `cs-uri-query` unredacted; v2's `record_fields` lets us drop
+        # `cs-uri-query` while still capturing `x-edge-detailed-result-type`.
+        #
+        # The inline `tags` on the source/destination apply via `logs:TagResource`
+        # / `logs:UntagResource`, which `terraform_apply_services`' CloudWatch Sid
+        # already grants on `Resource = "*"` (same github_actions role) — that's a
+        # pre-existing grant, so it neither races this apply nor needs repeating
+        # here. The only freshly-granted verbs (the Put*/Delete* below) are what
+        # the propagation shim covers.
+        Sid    = "CloudFrontStandardLoggingV2Endpoints"
+        Effect = "Allow"
+        Action = [
+          "logs:PutDeliverySource",
+          "logs:DeleteDeliverySource",
+          "logs:PutDeliveryDestination",
+          "logs:DeleteDeliveryDestination"
+        ]
+        Resource = [
+          "arn:aws:logs:us-east-1:${local.account_id}:delivery-source:layerv-nhp-*-qurl-resolve",
+          "arn:aws:logs:us-east-1:${local.account_id}:delivery-destination:layerv-nhp-*-qurl-resolve-s3"
+        ]
+      },
+      {
+        # The delivery itself (links source -> destination). `CreateDelivery`
+        # mints an AWS-generated delivery ID, so the delivery ARN can't be
+        # predicted at policy-author time — these three stay on `Resource = "*"`.
+        # Same single-distribution blast-radius trade-off as the CloudFront
+        # statements above. The delivery resources depend_on the existing
+        # `time_sleep.qurl_link_static_iam_propagation` shim — but note that shim
+        # is 60s (action-list-edit calibration), whereas the Endpoints grant adds
+        # *new resource-prefix ARN targets*, which per terraform/CLAUDE.md (#2072)
+        # can take ~180s. We reuse the 60s shim rather than add a dedicated 180s
+        # one (attended, sandbox-first rollout); the prod-rollout ledger documents
+        # the expected first-apply AccessDenied + re-run, esp. for the prod promote.
+        Sid    = "CloudFrontStandardLoggingV2Delivery"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateDelivery",
+          "logs:UpdateDeliveryConfiguration",
+          "logs:DeleteDelivery"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "CloudFrontCachePolicy"
         Effect = "Allow"
         Action = [
@@ -2380,6 +2436,31 @@ resource "aws_iam_policy" "qurl_link_static" {
         Resource = [
           "arn:aws:s3:::layerv-nhp-*-qurl-link",
           "arn:aws:s3:::layerv-nhp-*-qurl-link/*"
+        ]
+      },
+      {
+        # Resolve access-logs bucket object cleanup, so `terraform` can empty it
+        # under `force_destroy = true` when enable_resolve_access_logs is turned
+        # off or the resolve edge is torn down (issue #1799) — a path that runs
+        # in CI on a promote with run_terraform=true. Bucket
+        # create/encrypt/lifecycle/policy perms already come from the generic
+        # `layerv-nhp-*` S3Buckets statement in terraform-apply-services; only
+        # the object list+delete verbs for force_destroy are missing there.
+        # force_destroy empties via the ListObjectVersions API (s3:ListBucketVersions)
+        # even on a never-versioned bucket and issues version-aware deletes, so
+        # both *Versions verbs are required alongside the unversioned pair, or the
+        # documented rollback hits AccessDenied while emptying. Scoped to the logs bucket.
+        Sid    = "S3QURLResolveLogsCleanup"
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket",
+          "s3:ListBucketVersions",
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion"
+        ]
+        Resource = [
+          "arn:aws:s3:::layerv-nhp-*-qurl-resolve-logs",
+          "arn:aws:s3:::layerv-nhp-*-qurl-resolve-logs/*"
         ]
       },
       {

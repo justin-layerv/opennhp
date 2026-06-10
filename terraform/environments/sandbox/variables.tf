@@ -373,6 +373,12 @@ variable "enable_resolve_waf_logging" {
   default     = true
 }
 
+variable "enable_resolve_access_logs" {
+  description = "Enable CloudFront access logging (v2 -> S3) for the resolve distribution. See root module variable for rationale (token never logged; #1799)."
+  type        = bool
+  default     = true
+}
+
 # QURL Service deployment
 variable "deploy_qurl_service" {
   description = "Deploy the QURL API service on ECS Fargate"

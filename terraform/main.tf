@@ -3811,6 +3811,19 @@ locals {
   # so logs can be turned off without tearing down the edge (used by the resolve
   # WAF log group + logging configuration).
   deploy_qurl_resolve_waf_logging = local.deploy_qurl_resolve_cf && var.enable_resolve_waf_logging
+
+  # Resolve CloudFront access logging (standard logging v2 -> S3) gates on its
+  # own toggle on top of the resolve-CF gate, mirroring the WAF-logging shape so
+  # access logs can be turned off without tearing down the edge (used by the
+  # resolve logs bucket + the vended-logs delivery source/destination/delivery).
+  deploy_qurl_resolve_access_logs = local.deploy_qurl_resolve_cf && var.enable_resolve_access_logs
+
+  # Single source of truth for the resolve delivery-source name: the bucket
+  # policy's aws:SourceArn condition references it as a string literal (not the
+  # resource attribute) so the policy and the delivery source apply independently
+  # instead of taking an extra ordering edge; both sites must agree or delivery
+  # silently breaks.
+  qurl_resolve_delivery_source_name = "${local.name_prefix}-qurl-resolve"
 }
 
 # IAM eventual-consistency shim for the qurl_link_static CI policy.
@@ -3931,6 +3944,284 @@ resource "aws_cloudfront_monitoring_subscription" "qurl_link" {
   }
 
   depends_on = [time_sleep.qurl_link_static_iam_propagation]
+}
+
+# CloudFront access logging for the resolve distribution (issue #1799).
+#
+# Standard logging v2 (vended-logs delivery), NOT the legacy `logging_config`
+# block: the resolve edge carries the access token in the `?token=` query
+# string during the GET->POST migration (see endpoints/server/httpserver.go
+# redactSensitiveQuery + the WAF logging_configuration's redacted_fields above,
+# both of which strip it). Legacy CF logging has no field selection and would
+# write `cs-uri-query` — the token — unredacted into S3. v2's record_fields
+# lets us OMIT cs-uri-query (and cs(Cookie)/cs(Referer)) while still capturing
+# x-edge-detailed-result-type, the per-request signal #1799 wanted for origin-
+# error RCA. The sibling qurl_link static distribution can safely use legacy
+# logging because its token rides in the URL fragment, which never reaches CF.
+#
+# Encryption is SSE-S3 (AES256), not KMS: field curation — not at-rest
+# encryption — is what removes the sensitivity here, the delivered fields hold
+# no secrets, and this matches the qurl_link module's CF-logs-bucket precedent
+# (modules/qurl-link/main.tf aws_s3_bucket.logs, also AES256). (module.kms
+# is main-region and could not encrypt this us-east-1 bucket anyway, and a
+# customer-managed key would otherwise need a delivery.logs.amazonaws.com
+# key-policy grant for no benefit on token-free logs.)
+#
+# Co-located in us-east-1 with the delivery resources below (CF vended-logs
+# delivery is managed in us-east-1) so delivery is same-region, not cross-region
+# — that removes the one delivery-region question terraform plan can't settle.
+# Every config sub-resource below carries the same provider for that reason.
+resource "aws_s3_bucket" "qurl_resolve_logs" {
+  count    = local.deploy_qurl_resolve_access_logs ? 1 : 0
+  provider = aws.us_east_1
+  bucket   = "${local.name_prefix}-qurl-resolve-logs"
+
+  # Disposable RCA logs (expiry rule below), so force_destroy is true: flipping
+  # enable_resolve_access_logs off (or tearing down the edge) cleanly removes the
+  # bucket instead of failing on a non-empty delete — symmetric with the WAF-
+  # logging off-switch, which likewise discards its CloudWatch logs on disable.
+  # Contrast modules/bootstrap-alb's access-log bucket (force_destroy = false):
+  # those are irrecoverable forensics with no expiration; these are not.
+  force_destroy = true
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-qurl-resolve-logs"
+    Component = "qurl-resolve"
+  })
+}
+
+# ACLs disabled. v2 vended-logs delivery authorizes via the bucket policy below
+# (delivery.logs.amazonaws.com), not an ACL grant — the opposite of legacy CF
+# logging, which requires BucketOwnerPreferred + an awslogsdelivery ACL. Pinned
+# explicitly rather than relying on the post-2023 S3 default.
+resource "aws_s3_bucket_ownership_controls" "qurl_resolve_logs" {
+  count    = local.deploy_qurl_resolve_access_logs ? 1 : 0
+  provider = aws.us_east_1
+  bucket   = aws_s3_bucket.qurl_resolve_logs[0].id
+
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "qurl_resolve_logs" {
+  count    = local.deploy_qurl_resolve_access_logs ? 1 : 0
+  provider = aws.us_east_1
+  bucket   = aws_s3_bucket.qurl_resolve_logs[0].id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "qurl_resolve_logs" {
+  count    = local.deploy_qurl_resolve_access_logs ? 1 : 0
+  provider = aws.us_east_1
+  bucket   = aws_s3_bucket.qurl_resolve_logs[0].id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "qurl_resolve_logs" {
+  count    = local.deploy_qurl_resolve_access_logs ? 1 : 0
+  provider = aws.us_east_1
+  bucket   = aws_s3_bucket.qurl_resolve_logs[0].id
+
+  rule {
+    id     = "expire-logs"
+    status = "Enabled"
+    filter {} # Empty filter = applies to all objects (required for forward compatibility)
+
+    # prod 90d / non-prod 30d — same retention shape as the resolve WAF log
+    # group (aws_cloudwatch_log_group.qurl_resolve_waf) so the two resolve log
+    # sinks don't diverge on how long client-identity fields (c-ip,
+    # x-forwarded-for, ...) persist. 90d is the prod RCA window #1799 asked for.
+    expiration {
+      days = var.environment == "prod" ? 90 : 30
+    }
+  }
+
+  # Reap any incomplete multipart uploads the delivery service leaves behind so
+  # they don't accrue silent storage cost — the usual companion to an expiry
+  # rule on a write-only logs bucket.
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
+# Bucket policy granting the vended-logs delivery service write access. Modeled
+# on the AWS standard-logging-v2 S3 permissions: PutObject by the delivery
+# service principal, gated by SourceAccount + SourceArn so only THIS account's
+# resolve delivery source can write. The SourceArn is built from the known
+# delivery-source name string (not the resource attribute) so the policy and the
+# delivery source apply independently instead of taking an extra ordering edge;
+# us-east-1 because CF vended-logs delivery is always managed there.
+resource "aws_s3_bucket_policy" "qurl_resolve_logs" {
+  count    = local.deploy_qurl_resolve_access_logs ? 1 : 0
+  provider = aws.us_east_1
+  bucket   = aws_s3_bucket.qurl_resolve_logs[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AWSLogsDeliveryWrite"
+        Effect = "Allow"
+        Principal = {
+          Service = "delivery.logs.amazonaws.com"
+        }
+        Action = "s3:PutObject"
+        # Whole-bucket scope on purpose: this is a dedicated single-purpose logs
+        # bucket, and the SourceAccount/SourceArn conditions below are the real
+        # boundary (only our account's resolve delivery source can write). Not
+        # prefix-scoped to the v2 delivery key path — coupling the policy to that
+        # path would silently fail every PutObject if the delivered prefix differs.
+        Resource = "${aws_s3_bucket.qurl_resolve_logs[0].arn}/*"
+        # The s3:x-amz-acl condition looks contradictory next to BucketOwnerEnforced
+        # (ACLs disabled) but is correct: S3 still accepts a PUT carrying exactly the
+        # `bucket-owner-full-control` canned ACL under enforced ownership (the one
+        # exception), and the vended-logs delivery service always sends that header.
+        # It's the AWS-documented v2-to-S3 policy shape. SourceAccount + SourceArn
+        # (scoped to this account's resolve delivery source) are the real boundary.
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-acl"      = "bucket-owner-full-control"
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+          ArnLike = {
+            "aws:SourceArn" = "arn:aws:logs:us-east-1:${data.aws_caller_identity.current.account_id}:delivery-source:${local.qurl_resolve_delivery_source_name}"
+          }
+        }
+      }
+    ]
+  })
+
+  # The PAB must land before the policy so the policy write isn't evaluated
+  # against an open bucket, and so a future public statement can't slip in
+  # ahead of restrict_public_buckets.
+  depends_on = [aws_s3_bucket_public_access_block.qurl_resolve_logs]
+}
+
+# --- Standard logging v2 delivery chain (all us-east-1: CF vended-logs
+# delivery is global-managed in us-east-1). IAM writes for these resources are
+# granted by the qurl_link_static policy's CloudFrontStandardLoggingV2* Sids;
+# the delivery resources depend_on time_sleep.qurl_link_static_iam_propagation
+# (the same shim the resolve monitoring subscription uses) — see that comment +
+# the prod-rollout ledger for the expected first-apply re-run on the new
+# resource-prefix grants. ---
+
+resource "aws_cloudwatch_log_delivery_source" "qurl_resolve" {
+  count        = local.deploy_qurl_resolve_access_logs ? 1 : 0
+  provider     = aws.us_east_1
+  name         = local.qurl_resolve_delivery_source_name
+  log_type     = "ACCESS_LOGS"
+  resource_arn = aws_cloudfront_distribution.qurl_resolve[0].arn
+
+  tags = merge(local.common_tags, {
+    Name      = local.qurl_resolve_delivery_source_name
+    Component = "qurl-resolve"
+  })
+
+  depends_on = [time_sleep.qurl_link_static_iam_propagation]
+}
+
+resource "aws_cloudwatch_log_delivery_destination" "qurl_resolve" {
+  count    = local.deploy_qurl_resolve_access_logs ? 1 : 0
+  provider = aws.us_east_1
+  name     = "${local.name_prefix}-qurl-resolve-s3"
+
+  # JSON output, not the classic tab-delimited CF format: the curated
+  # record_fields below are already a non-standard subset, so a self-describing
+  # format is more robust than positional columns. NOTE for the deferred Athena
+  # follow-up (#1799): the table must use a JSON SerDe keyed on exactly these
+  # fields, NOT the standard 33-column CloudFront access-log DDL.
+  output_format = "json"
+
+  delivery_destination_configuration {
+    destination_resource_arn = aws_s3_bucket.qurl_resolve_logs[0].arn
+  }
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-qurl-resolve-s3"
+    Component = "qurl-resolve"
+  })
+
+  depends_on = [time_sleep.qurl_link_static_iam_propagation]
+}
+
+resource "aws_cloudwatch_log_delivery" "qurl_resolve" {
+  count                    = local.deploy_qurl_resolve_access_logs ? 1 : 0
+  provider                 = aws.us_east_1
+  delivery_source_name     = aws_cloudwatch_log_delivery_source.qurl_resolve[0].name
+  delivery_destination_arn = aws_cloudwatch_log_delivery_destination.qurl_resolve[0].arn
+
+  # Curated field set. EXCLUDED on purpose: cs-uri-query (carries the ?token=
+  # access credential), cs(Cookie) and cs(Referer) (can carry the same token /
+  # PII via a client-side hop from the token URL). INCLUDED: request identity,
+  # client identity, the x-edge-*-result-type RCA triplet (#1799), and origin
+  # latency (origin-fbl/origin-lbl, time-to-first-byte) for the 502/origin-stall
+  # debugging this endpoint is prone to. Changing this list changes the log
+  # schema — keep the Athena follow-up in sync.
+  #
+  # Curation targets the secret (the token), not ordinary access-log PII: the
+  # included c-ip / x-forwarded-for / cs(User-Agent) / c-country are standard
+  # access-log fields and DO land here, bounded by the expiry rule (90d prod /
+  # 30d non-prod, matching the resolve WAF log group) + full public-access block
+  # + BucketOwnerEnforced. This bucket is not PII-free; it is token-free.
+  #
+  # INVARIANT: cs-uri-stem (path only) is safe to log ONLY because the token
+  # rides in the query string (?token=), never the path — see
+  # endpoints/server/httpserver.go::redactSensitiveQuery and the WAF
+  # query_string redaction. If the token is ever path-embedded (e.g.
+  # /resolve/<token>), drop cs-uri-stem here too, or it becomes the leak this
+  # whole field-curation exists to prevent.
+  record_fields = [
+    "date",
+    "time",
+    "x-edge-location",
+    "sc-status",
+    "sc-bytes",
+    "cs-method",
+    "cs-protocol",
+    "cs-protocol-version",
+    "cs(Host)",
+    "cs-uri-stem",
+    "cs(User-Agent)",
+    "cs-bytes",
+    "c-ip",
+    "c-port",
+    "c-country",
+    "x-forwarded-for",
+    "x-host-header",
+    "x-edge-request-id",
+    "x-edge-result-type",
+    "x-edge-response-result-type",
+    "x-edge-detailed-result-type",
+    "ssl-protocol",
+    "ssl-cipher",
+    "time-taken",
+    "time-to-first-byte",
+    "origin-fbl",
+    "origin-lbl",
+  ]
+
+  # The delivery validates the destination is writable, so the bucket policy
+  # granting delivery.logs.amazonaws.com must exist first.
+  depends_on = [
+    aws_s3_bucket_policy.qurl_resolve_logs,
+    time_sleep.qurl_link_static_iam_propagation,
+  ]
 }
 
 # Auto-invalidate qurl-link static files on every content edit so the

@@ -555,6 +555,12 @@ variable "enable_resolve_waf_logging" {
   default     = true
 }
 
+variable "enable_resolve_access_logs" {
+  description = "Enable CloudFront access logging (v2 -> S3) for the resolve distribution. See root module variable for rationale (token never logged; #1799)."
+  type        = bool
+  default     = true
+}
+
 variable "qurl_router_enabled" {
   type    = bool
   default = false
