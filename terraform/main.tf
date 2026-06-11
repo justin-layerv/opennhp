@@ -2397,7 +2397,6 @@ module "qurl_service" {
   qurl_resources_table_arn                = module.dynamodb.qurl_resources_table_arn
   qurl_access_tokens_table_arn            = module.dynamodb.qurl_access_tokens_table_arn
   qurl_sessions_table_arn                 = module.dynamodb.qurl_sessions_table_arn
-  resource_lifecycle_queue_arn            = var.resource_lifecycle_queue_arn
   scanner_lambda_alarm_sns_topic_arn      = var.scanner_lambda_alarm_sns_topic_arn
 
   # Auth0

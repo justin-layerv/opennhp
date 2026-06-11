@@ -391,12 +391,6 @@ variable "qurl_scanner_lambda_enabled" {
   default     = false
 }
 
-variable "resource_lifecycle_queue_arn" {
-  description = "ARN of the SQS queue the scanner Lambda emits `qurl.expired` / `resource.closed` events to when run with `--emit-mode=sqs`. Empty omits the `sqs:SendMessage` IAM grant; correct on the first sandbox apply since the binary defaults to log-only."
-  type        = string
-  default     = ""
-}
-
 variable "scanner_lambda_alarm_sns_topic_arn" {
   description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits the wiring (alarm still fires + appears in CloudWatch, no notification). Wire when the SNS topic lands alongside the SQS queue."
   type        = string

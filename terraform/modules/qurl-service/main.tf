@@ -734,6 +734,50 @@ resource "aws_iam_role_policy" "task_usage_events" {
   })
 }
 
+# Resource-lifecycle queue consumer policy: grants the qurl-api task role
+# `Receive`/`Delete`/`GetQueueAttributes` on the resource-lifecycle SQS
+# queue (defined in resource_lifecycle_queue.tf) and `kms:Decrypt` on the
+# same `secrets` CMK the queue is encrypted with. Powers the qurl-api
+# webhook-event drainer goroutine (qurl-service PR #874) once the
+# activation PR sets `WEBHOOK_EVENTS_CONSUMER_ENABLED=true` +
+# `WEBHOOK_EVENTS_SQS_QUEUE_URL=<this queue's URL>` on the ECS task. The
+# drainer stays dormant when those env vars are absent, so this grant
+# pre-positions the IAM without changing runtime behavior. (Same-account,
+# cross-service — qurl-api task role + scanner Lambda role + queue all
+# live in the qurl-service module in the same workload account; no
+# assume-role hop here.)
+#
+# Gated identically to the queue itself: `qurl_scanner_lambda_enabled`.
+# In an env without the producer Lambda, the queue doesn't exist and
+# this grant has no target.
+resource "aws_iam_role_policy" "task_resource_lifecycle_queue_consumer" {
+  count = var.qurl_scanner_lambda_enabled ? 1 : 0
+  name  = "resource-lifecycle-sqs-consume"
+  role  = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "SQSConsumeResourceLifecycle"
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+        ]
+        Resource = [aws_sqs_queue.resource_lifecycle_queue[0].arn]
+      },
+      {
+        Sid      = "KMSDecryptResourceLifecycleSQS"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [var.secrets_kms_key_arn]
+      },
+    ]
+  })
+}
+
 # Publish to the custom-domain cleanup topic on domain deletion. The Go side
 # (cmd/qurl-api/main.go) gates the publisher on CUSTOM_DOMAIN_CLEANUP_TOPIC_ARN,
 # so when the topic ARN is empty this resource is also absent — no idle role

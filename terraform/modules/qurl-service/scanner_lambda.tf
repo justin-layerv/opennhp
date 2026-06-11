@@ -189,7 +189,7 @@ resource "aws_iam_role" "scanner_lambda" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
   name        = "${local.scanner_lambda_function_name}-execution"
-  description = "Execution role for the qurl-scanner Lambda — DDB Query/UpdateItem on qURL tables + optional SQS SendMessage + CloudWatch Logs."
+  description = "Execution role for the qurl-scanner Lambda -- DDB Query/UpdateItem on qURL tables + optional SQS SendMessage + CloudWatch Logs."
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -324,37 +324,45 @@ resource "aws_iam_role_policy" "scanner_lambda_logs" {
   })
 }
 
-# SQS `SendMessage` — created ONLY when `resource_lifecycle_queue_arn`
-# is non-empty. Empty default + `count = 0` keeps an empty-Resource
-# statement (which would fail at apply with `Resource ... is invalid`)
-# out of the policy entirely. Wire `resource_lifecycle_queue_arn` to
-# the queue's ARN once the queue exists; until then the binary defaults
-# to log-only emit so the absent grant is correct.
+# SQS `SendMessage` + KMS `GenerateDataKey` for the resource-lifecycle
+# queue (defined in `resource_lifecycle_queue.tf`). Gated on the same
+# `qurl_scanner_lambda_enabled` flag as the queue itself — both come
+# into existence in the same apply, so a half-state where the policy
+# references a non-existent queue or vice versa is structurally
+# impossible.
 #
-# ACTIVATION-PR TODO: the resource-lifecycle queue is created SSE-KMS-
-# encrypted (it sits on the regulated emit path). When this gate flips
-# non-empty, this policy will also need a `kms:GenerateDataKey` +
-# `kms:Decrypt` statement against the QUEUE's KMS key — otherwise
-# `SendMessage` fails with `KMSAccessDeniedException` at runtime. See
-# the `task_usage_events` policy in main.tf for the precedent pairing
-# (`Sid = "QueueAccess"` + `Sid = "KMSEncryptSQS"`). That key ARN
-# will need its own input variable threaded from the queue's KMS key
-# at the root, mirroring the `usage_events_queue_arn` /
-# `usage_events_queue_url` pair already in this module.
+# The Lambda still defaults to log-only emit (`EMIT_MODE` is absent from
+# the function's env vars) — this grant is pre-positioned so the
+# activation PR that sets `EMIT_MODE=sqs` only needs to flip an env var
+# rather than land new IAM at the same time as a behavior change.
+#
+# KMS reuses `var.secrets_kms_key_arn` — the same CMK the queue is
+# encrypted with (see `resource_lifecycle_queue.tf`). `GenerateDataKey`
+# is the SendMessage-side action AWS SQS calls behind the scenes when
+# the queue has SSE-KMS enabled; `Decrypt` covers the response path.
+# Mirrors `task_usage_events` in main.tf (`Sid = "KMSEncryptSQS"`).
 resource "aws_iam_role_policy" "scanner_lambda_sqs" {
-  count = var.qurl_scanner_lambda_enabled && var.resource_lifecycle_queue_arn != "" ? 1 : 0
+  count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
   name = "sqs-send-message"
   role = aws_iam_role.scanner_lambda[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid      = "SQSSendMessage"
-      Effect   = "Allow"
-      Action   = ["sqs:SendMessage"]
-      Resource = var.resource_lifecycle_queue_arn
-    }]
+    Statement = [
+      {
+        Sid      = "SQSSendMessage"
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.resource_lifecycle_queue[0].arn
+      },
+      {
+        Sid      = "KMSEncryptSQS"
+        Effect   = "Allow"
+        Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Resource = [var.secrets_kms_key_arn]
+      },
+    ]
   })
 }
 
@@ -443,10 +451,9 @@ resource "aws_lambda_function" "scanner" {
   # invocation after function-create can't hit an Access-Denied window;
   # AWS Lambda IAM policies take effect at invoke time, not create time,
   # so without these depends_on the cron rule could fire before
-  # policies propagate. The SQS policy is included conditionally so the
-  # full grant set is in place before any tick — but its `count` gate
-  # means the reference resolves to a zero-instance no-op edge when
-  # `resource_lifecycle_queue_arn` is empty (no spurious dep then).
+  # policies propagate. The SQS policy is gated identically to the
+  # Lambda itself (`var.qurl_scanner_lambda_enabled`), so when the flag
+  # is off the reference resolves to a zero-instance no-op edge.
   # The image-tag data source is an implicit dep already via
   # `image_uri`.
   depends_on = [

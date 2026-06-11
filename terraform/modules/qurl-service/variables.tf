@@ -1077,17 +1077,6 @@ variable "qurl_sessions_table_arn" {
   default     = ""
 }
 
-variable "resource_lifecycle_queue_arn" {
-  description = "ARN of the SQS queue the scanner emits `qurl.expired` / `resource.closed` events to when run with `--emit-mode=sqs`. Empty omits the `sqs:SendMessage` grant entirely; correct on the first sandbox apply because the binary defaults to log-only when `EMIT_MODE` is unset. Queue itself lands in a follow-up — see the prod rollout task ledger."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.resource_lifecycle_queue_arn == "" || can(regex("^arn:aws:sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9._-]+$", var.resource_lifecycle_queue_arn))
-    error_message = "resource_lifecycle_queue_arn must be empty or a standard SQS queue ARN (arn:aws:sqs:<region>:<account>:<name>)."
-  }
-}
-
 variable "scanner_lambda_memory_mb" {
   description = "Memory size for the qurl-scanner Lambda. 512 MB matches the per-tick working set of ~16 parallel shard Queries + JSON marshal of up to MaxEventsPerShard events; no measured pressure to raise it. Set higher only if CloudWatch shows OOM kills."
   type        = number

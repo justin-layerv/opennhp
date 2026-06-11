@@ -370,12 +370,6 @@ variable "qurl_scanner_lambda_enabled" {
   default     = false
 }
 
-variable "resource_lifecycle_queue_arn" {
-  description = "ARN of the prod SQS queue the scanner emits `qurl.expired` / `resource.closed` events to when run with `--emit-mode=sqs`. Empty omits the `sqs:SendMessage` grant. Wire only after the phased-rollout preconditions in the prod rollout task ledger are met."
-  type        = string
-  default     = ""
-}
-
 variable "scanner_lambda_alarm_sns_topic_arn" {
   description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits paging."
   type        = string

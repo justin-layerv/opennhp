@@ -92,3 +92,36 @@ output "bootstrap_alb_security_group_id" {
   description = "Echo of var.bootstrap_alb_security_group_id — consumed by the root-level attachment-fence check. Null when no attachment is configured."
   value       = var.bootstrap_alb_security_group_id
 }
+
+# ============================================================================
+# Resource-lifecycle SQS queue outputs
+# ============================================================================
+# Lit only when `qurl_scanner_lambda_enabled` is true; otherwise the queue
+# resource has `count = 0` and these outputs resolve to `null` via the
+# `try()` fallback. The activation PR consumes the URL output to wire
+# `WEBHOOK_EVENTS_SQS_QUEUE_URL` on the qurl-api ECS task.
+
+output "resource_lifecycle_queue_arn" {
+  description = "ARN of the resource-lifecycle SQS queue. Null when `qurl_scanner_lambda_enabled = false`."
+  value       = try(aws_sqs_queue.resource_lifecycle_queue[0].arn, null)
+}
+
+output "resource_lifecycle_queue_url" {
+  description = "URL of the resource-lifecycle SQS queue (for `WEBHOOK_EVENTS_SQS_QUEUE_URL` on qurl-api). Null when `qurl_scanner_lambda_enabled = false`."
+  value       = try(aws_sqs_queue.resource_lifecycle_queue[0].url, null)
+}
+
+output "resource_lifecycle_queue_name" {
+  description = "Name of the resource-lifecycle SQS queue (for CloudWatch dashboards). Null when `qurl_scanner_lambda_enabled = false`."
+  value       = try(aws_sqs_queue.resource_lifecycle_queue[0].name, null)
+}
+
+output "resource_lifecycle_queue_dlq_arn" {
+  description = "ARN of the resource-lifecycle DLQ. Null when `qurl_scanner_lambda_enabled = false`."
+  value       = try(aws_sqs_queue.resource_lifecycle_queue_dlq[0].arn, null)
+}
+
+output "resource_lifecycle_queue_dlq_url" {
+  description = "URL of the resource-lifecycle DLQ. Null when `qurl_scanner_lambda_enabled = false`."
+  value       = try(aws_sqs_queue.resource_lifecycle_queue_dlq[0].url, null)
+}
