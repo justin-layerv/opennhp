@@ -74,7 +74,5 @@ services:
       - nhp-ac
     volumes:
       - ./nhp-enter-nginx.conf:/etc/nginx/nginx.conf:rw
-      - ./certs/server.crt:/cert.pem:r
-      - ./certs/server.key:/key.pem:r
       - ./nhp-agent/etc:/nhp-agent/etc:rw
       - ./nhp-agent/logs:/nhp-agent/logs:rw

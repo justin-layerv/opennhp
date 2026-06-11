@@ -219,6 +219,15 @@ For high-availability deployments, consider:
    - Enable HTTPS in `http.toml` with valid TLS certificates
    - Configure `TLSCertFile` and `TLSKeyFile` paths
    - Use certificates from a trusted CA for production
+   - DHP Web Console (agent): for native installs, ensure the agent can create and write `<agent-binary-dir>/etc/certs`, or set `NHP_AGENT_CERT_DIR` to a writable agent-managed directory.
+     Files in the default directory or `NHP_AGENT_CERT_DIR` are agent-managed and may be regenerated.
+     If you set `NHP_AGENT_CERT_FILE` or `NHP_AGENT_KEY_FILE` to existing files, they must already satisfy the local web-console identity (`CN=localhost` plus SANs for `localhost`, `loginlocal.opennhp.org`, `127.0.0.1`, and `::1`); unexpected existing files are preserved and rejected instead of overwritten.
+     Missing explicit cert/key file paths are treated as agent-managed generation targets.
+     The cert and key file overrides are independent, so set both when they should live outside `NHP_AGENT_CERT_DIR`.
+     Setting either file override enables preserve mode for both resolved files, including the path that falls back to `NHP_AGENT_CERT_DIR` (or the default agent cert dir) when only one override is set.
+     Certificate readiness is checked on process/container start; restart the agent to regenerate an expired local web-console certificate.
+     Binding the native web console to port 443 requires root or `CAP_NET_BIND_SERVICE`.
+     If certificate preparation or web-console startup fails, the web console logs the error and stays down while the agent continues running.
 
 3. **Network Security**
    - Run `iptables_default.sh` before starting NHP-AC to ensure deny-all policy

@@ -187,6 +187,10 @@ docker-compose.local.yml
 id_rsa
 id_ed25519
 
+# Generated local/demo TLS material
+docker/nhp-agent/etc/certs/
+endpoints/agent/main/etc/certs/
+
 # AWS
 .aws/
 credentials

@@ -12,6 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y  wget \
     ca-certificates \
+    openssl \
     iptables \
     tcpdump \
     clang \
@@ -26,8 +27,10 @@ RUN groupadd -r nginx && \
     useradd -r -g nginx -s /bin/bash -d /home/nginx -m nginx
 
 RUN mv /workdir/release/nhp-agent /nhp-agent
+RUN install -m 755 /workdir/docker/agent-entrypoint.sh /usr/local/bin/nhp-agent-entrypoint
 USER root
 
+ENTRYPOINT ["nhp-agent-entrypoint"]
 CMD ["tail", "-f", "/dev/null"]
 #CMD ["nginx && /nhp-agent/nhp-agentd run"]
 #CMD ["nginx"]

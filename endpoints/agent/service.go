@@ -90,12 +90,46 @@ func (a *UdpAgent) CreateDHPWebConsole() {
 		log.Info("===  DHP Web Console (%s) started  ===", id)
 		log.Info("==================================================")
 
-		if err := router.RunTLS(
-			":443", filepath.Join(common.ExeDirPath, "etc", "certs", "server.crt"), filepath.Join(common.ExeDirPath, "etc", "certs", "server.key"),
-		); err != nil {
-			panic(err)
+		certFile, keyFile, preserveExistingCerts := webConsoleTLSFiles()
+		// Local web-console cert renewal is checked on process/container start.
+		generated, err := ensureWebConsoleTLSCert(certFile, keyFile, preserveExistingCerts)
+		if err != nil {
+			log.Error("failed to prepare DHP Web Console TLS certificate: %v", err)
+			return
+		}
+		if generated {
+			log.Info("Generated local self-signed TLS certificate for DHP Web Console")
+		}
+
+		if err := router.RunTLS(":443", certFile, keyFile); err != nil {
+			log.Error("failed to run DHP Web Console TLS server: %v", err)
+			return
 		}
 	}()
+}
+
+// webConsoleTLSFiles resolves cert and key file overrides independently; explicit file overrides win over NHP_AGENT_CERT_DIR.
+// The returned bool reports whether any explicit file override is set, which enables preserve-existing-cert mode.
+func webConsoleTLSFiles() (string, string, bool) {
+	certDir := os.Getenv("NHP_AGENT_CERT_DIR")
+	if certDir == "" {
+		certDir = filepath.Join(common.ExeDirPath, "etc", "certs")
+	}
+
+	certEnv := os.Getenv("NHP_AGENT_CERT_FILE")
+	keyEnv := os.Getenv("NHP_AGENT_KEY_FILE")
+
+	certFile := certEnv
+	if certFile == "" {
+		certFile = filepath.Join(certDir, "server.crt")
+	}
+
+	keyFile := keyEnv
+	if keyFile == "" {
+		keyFile = filepath.Join(certDir, "server.key")
+	}
+
+	return certFile, keyFile, certEnv != "" || keyEnv != ""
 }
 
 func (a *UdpAgent) registerTAService(c *gin.Context) {
