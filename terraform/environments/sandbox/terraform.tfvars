@@ -214,6 +214,23 @@ deploy_qurl_service = true
 deploy_qurl_bootstrap_chain = true
 enable_qurl_agent_bootstrap = true
 
+# qurl-scanner Lambda — sandbox second-apply of the two-apply rollout
+# documented in the prod-rollout ledger entry for #2326. First apply
+# (gated on `deploy_qurl_service = true` above) created the
+# `layerv/qurl-scanner-lambda` ECR repo + the
+# `/layerv-nhp-sandbox/qurl-scanner-lambda-image-tag` SSM param; qurl-service
+# CI has published its first image and the SSM param carries a real SHA.
+# This flag-on apply creates the Lambda function itself + the EventBridge
+# 1-minute cron + the `qurl-scanner-invocation-gap` alarm. Lambda boots in
+# log-only mode (no `EMIT_MODE` env var, no `--allow-prod-emit`) — it scans
+# the time-bucket-index GSI and slog-logs what it would have emitted, with
+# no SQS / no downstream webhook fan-out yet. SQS activation is a separate
+# downstream PR gated on qurl-service SQS queue infra + consumer dedupe.
+# Rollback: flip to `false` and re-apply (destroys Lambda + cron + alarm;
+# leaves ECR repo + SSM param). Prod tfvars deliberately omits this until
+# the HARD PROD preconditions in the #2326 ledger entry are met.
+qurl_scanner_lambda_enabled = true
+
 # Domain configuration for QURL API
 # Certificate is created automatically via Terraform when domain is set
 qurl_service_domain = "api.layerv.xyz"
