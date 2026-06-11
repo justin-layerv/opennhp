@@ -640,6 +640,11 @@ output "github_actions_role_arn" {
   value       = module.nhp.github_actions_role_arn
 }
 
+output "github_actions_terraform_plan_pr_role_arn" {
+  description = "Sandbox-only read-only IAM role ARN for terraform-plan-pr.yml; prod returns null by design."
+  value       = module.nhp.github_actions_terraform_plan_pr_role_arn
+}
+
 output "github_actions_packer_role_arn" {
   description = "Dedicated IAM role ARN for the build-and-push.yml::packer-build Server and AC AMI builds. Store in GitHub Actions secret AWS_PACKER_PROD_ROLE_ARN."
   value       = module.nhp.github_actions_packer_role_arn

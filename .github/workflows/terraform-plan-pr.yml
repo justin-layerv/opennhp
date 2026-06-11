@@ -1,0 +1,297 @@
+name: Terraform Plan (PR)
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: terraform-plan-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-2
+  TF_VERSION: '1.14.3'
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan (PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 2
+
+      - name: Check for Terraform changes
+        id: changes
+        run: |
+          set -euo pipefail
+
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          git fetch --depth 1 origin "$base_sha" >/dev/null 2>&1 || true
+
+          if git diff --name-only "$base_sha" "$head_sha" | grep -qE '^(terraform/|\.github/workflows/terraform-plan-pr\.yml|\.github/actions/build-lambda-packages/|\.github/scripts/fetch-auth0-token\.sh)'; then
+            echo "terraform_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Terraform plan inputs changed - running sandbox plan"
+          else
+            echo "terraform_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No Terraform plan inputs changed - reporting success without AWS credentials"
+          fi
+
+      - name: No Terraform changes
+        if: steps.changes.outputs.terraform_changed != 'true'
+        run: |
+          echo "No Terraform plan inputs changed; sandbox plan skipped." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Reject fork PRs
+        if: steps.changes.outputs.terraform_changed == 'true' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::Terraform Plan (PR) needs repo secrets and a read-only AWS OIDC role, so it only runs for branches in this repository."
+          exit 1
+
+      - name: Setup Terraform
+        if: steps.changes.outputs.terraform_changed == 'true'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        if: steps.changes.outputs.terraform_changed == 'true'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
+      # Build packages before assuming AWS credentials; the composite action
+      # also forces dummy AWS env vars for its Python unit tests.
+      - name: Build Lambda Packages
+        if: steps.changes.outputs.terraform_changed == 'true'
+        uses: ./.github/actions/build-lambda-packages
+
+      - name: Fetch Auth0 Token
+        if: steps.changes.outputs.terraform_changed == 'true'
+        id: auth0
+        env:
+          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
+        run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/sandbox/terraform.tfvars sandbox
+
+      - name: Configure AWS credentials
+        if: steps.changes.outputs.terraform_changed == 'true'
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_PLAN_PR_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        if: steps.changes.outputs.terraform_changed == 'true'
+        working-directory: terraform/environments/sandbox
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure
+
+      - name: Resolve qurl-reverse-tunnel-server Image Tag
+        if: steps.changes.outputs.terraform_changed == 'true'
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          set -euo pipefail
+
+          ssm_param="/sandbox/nhp/reverse-tunnel-server/image-tag"
+          err_file="/tmp/frps-ssm-err"
+          tag_re='^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+          rm -f "$err_file"
+
+          if frps_tag=$(aws ssm get-parameter \
+              --region "$AWS_REGION" \
+              --name "$ssm_param" \
+              --query "Parameter.Value" \
+              --output text 2>"$err_file"); then
+            if [[ -z "$frps_tag" || "$frps_tag" == "None" ]]; then
+              echo "::notice::SSM $ssm_param returned empty/None; falling back to tfvars."
+            elif [[ "$frps_tag" =~ ^v0\.0\.0-bootstrap ]]; then
+              echo "::notice::SSM $ssm_param still holds bootstrap placeholder ($frps_tag); falling back to tfvars."
+            elif [[ ! "$frps_tag" =~ $tag_re ]]; then
+              echo "::error::SSM $ssm_param holds a value that is not a valid Docker tag: $(printf %q "$frps_tag")"
+              exit 1
+            else
+              echo "::notice::Resolved qurl-reverse-tunnel-server image tag from SSM: $frps_tag"
+              echo "TF_VAR_frps_image_tag=$frps_tag" >> "$GITHUB_ENV"
+            fi
+            exit 0
+          fi
+
+          if grep -q "ParameterNotFound" "$err_file"; then
+            echo "::notice::SSM $ssm_param not found (greenfield or deploy_frps=false); falling back to tfvars."
+            exit 0
+          fi
+
+          echo "::error::Unexpected SSM error reading $ssm_param:"
+          cat "$err_file"
+          exit 1
+
+      - name: Terraform Plan
+        if: steps.changes.outputs.terraform_changed == 'true'
+        id: plan
+        working-directory: terraform/environments/sandbox
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
+          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
+          TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
+          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
+          TF_VAR_image_tag: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          rm -f tfplan tfplan.json plan.txt
+
+          set +e
+          terraform plan -lock=false -out=tfplan -no-color 2>&1 | tee plan.txt
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ "$status" -eq 0 ]]; then
+            if ! terraform show -json tfplan > tfplan.json; then
+              echo "::error::terraform show -json tfplan failed"
+              status=1
+            fi
+          fi
+
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize Terraform Plan
+        if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan.outputs.exit_code != ''
+        working-directory: terraform/environments/sandbox
+        env:
+          PLAN_EXIT_CODE: ${{ steps.plan.outputs.exit_code }}
+          PLAN_COMMENT_MARKER: "<!-- nhp-terraform-plan-pr -->"
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          exit_code = int(os.environ["PLAN_EXIT_CODE"])
+          marker = os.environ["PLAN_COMMENT_MARKER"]
+          plan_text = Path("plan.txt").read_text(errors="replace") if Path("plan.txt").exists() else ""
+          plan_json = Path("tfplan.json")
+
+          counts = {"add": 0, "change": 0, "destroy": 0}
+          if plan_json.exists():
+              data = json.loads(plan_json.read_text())
+              for change in data.get("resource_changes", []):
+                  actions = change.get("change", {}).get("actions", [])
+                  if actions == ["no-op"]:
+                      continue
+                  if "create" in actions:
+                      counts["add"] += 1
+                  if actions == ["update"]:
+                      counts["change"] += 1
+                  if "delete" in actions:
+                      counts["destroy"] += 1
+          else:
+              match = re.search(r"Plan:\s+(\d+) to add,\s+(\d+) to change,\s+(\d+) to destroy\.", plan_text)
+              if match:
+                  counts = {
+                      "add": int(match.group(1)),
+                      "change": int(match.group(2)),
+                      "destroy": int(match.group(3)),
+                  }
+
+          status = "passed" if exit_code == 0 else "failed"
+          body = [
+              marker,
+              "### Terraform Plan (sandbox)",
+              "",
+              "| Field | Value |",
+              "| --- | --- |",
+              f"| Result | `{status}` |",
+              f"| Add | `{counts['add']}` |",
+              f"| Change | `{counts['change']}` |",
+              f"| Destroy | `{counts['destroy']}` |",
+              f"| Run | [{os.environ['GITHUB_RUN_ID']}]({os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}) |",
+              "",
+              "`terraform plan -lock=false -out=tfplan -no-color` ran against the sandbox remote state using the read-only PR plan role.",
+          ]
+
+          if exit_code != 0:
+              interesting = []
+              lines = plan_text.splitlines()
+              for index, line in enumerate(lines):
+                  if "Error:" in line:
+                      interesting.extend(lines[max(0, index - 2): index + 18])
+                      break
+              excerpt = "\n".join(interesting).strip() or "\n".join(lines[-80:]).strip()
+              if len(excerpt) > 5000:
+                  excerpt = excerpt[-5000:]
+              body.extend([
+                  "",
+                  "#### Failure Excerpt",
+                  "",
+                  "```text",
+                  excerpt or "Terraform exited non-zero before producing plan output.",
+                  "```",
+              ])
+
+          output = "\n".join(body) + "\n"
+          Path("plan-summary.md").write_text(output)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(output)
+          PY
+
+      - name: Comment Terraform Plan
+        if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan.outputs.exit_code != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- nhp-terraform-plan-pr -->';
+            const body = fs.readFileSync('terraform/environments/sandbox/plan-summary.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const previous = comments.find((comment) =>
+              comment.user.type === 'Bot' && comment.body && comment.body.includes(marker)
+            );
+
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+      - name: Fail on plan error
+        if: steps.changes.outputs.terraform_changed == 'true' && steps.plan.outputs.exit_code != '0'
+        run: exit 1

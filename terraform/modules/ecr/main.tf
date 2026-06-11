@@ -339,6 +339,12 @@ locals {
   # earlier output-precondition assertion approach.
   is_replication_source = var.is_primary_account && var.enable_replication && length(var.secondary_account_ids) > 0
 
+  # PR-time Terraform plan is intentionally sandbox-only. The workflow this
+  # role serves reads live sandbox state so reviewers catch API/provider
+  # failures before merge, but prod remains behind the promote-to-prod approval
+  # path.
+  enable_terraform_plan_pr_role = var.environment == "sandbox"
+
   # Hoisted so consumers (the replication-check Lambda's `lifecycle.
   # precondition`) can enforce the lookback↔expiry cushion at plan
   # time instead of relying on prose. Bumping this value here AND
@@ -1266,6 +1272,42 @@ resource "aws_iam_policy" "terraform_read" {
 
 resource "aws_iam_role_policy_attachment" "terraform_read" {
   role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.terraform_read.arn
+}
+
+resource "aws_iam_role" "github_actions_terraform_plan_pr" {
+  count = local.enable_terraform_plan_pr_role ? 1 : 0
+
+  name        = "nhp-${var.environment}-github-actions-terraform-plan-pr"
+  description = "Read-only GitHub Actions role for PR Terraform plans (${var.environment})"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = local.oidc_provider_arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:pull_request"
+        }
+      }
+    }]
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-github-actions-terraform-plan-pr"
+    Component = "ecr"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "terraform_plan_pr_read" {
+  count = local.enable_terraform_plan_pr_role ? 1 : 0
+
+  role       = aws_iam_role.github_actions_terraform_plan_pr[0].name
   policy_arn = aws_iam_policy.terraform_read.arn
 }
 
@@ -2621,6 +2663,11 @@ output "github_actions_role_arn" {
 output "github_actions_role_name" {
   description = "GitHub Actions IAM role name"
   value       = aws_iam_role.github_actions.name
+}
+
+output "github_actions_terraform_plan_pr_role_arn" {
+  description = "Sandbox-only read-only IAM role ARN for terraform-plan-pr.yml. Store in GitHub Actions repo secret AWS_TERRAFORM_PLAN_PR_ROLE_ARN."
+  value       = try(aws_iam_role.github_actions_terraform_plan_pr[0].arn, null)
 }
 
 output "github_oidc_provider_arn" {

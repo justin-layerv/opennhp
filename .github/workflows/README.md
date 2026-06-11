@@ -6,6 +6,10 @@
 
 Triggered on every push to `main` with app or infra changes. Builds Docker images, pushes to ECR, runs Terraform apply, and triggers instance refresh. Also runs on PRs (plan only, no deploy).
 
+### `terraform-plan-pr.yml` — Terraform Plan (Sandbox PR)
+
+Runs on every PR so branch protection can require the check, but skips without AWS credentials unless the PR touches Terraform plan inputs. For Terraform PRs, assumes the sandbox-only read-only `AWS_TERRAFORM_PLAN_PR_ROLE_ARN` OIDC role, runs `terraform plan -lock=false`, and updates a structured PR comment with add/change/destroy counts or the failure excerpt. It never applies.
+
 ### `promote-to-prod.yml` — Promote to Production
 
 > **Preferred method:** Use `./scripts/trigger-prod-deploy.sh` instead of running `gh workflow run` manually. The script reads SSM state from both accounts, validates sandbox health, auto-detects which components changed, and generates the correct command. Run with `--dry-run` to preview without executing.
