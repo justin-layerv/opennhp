@@ -146,6 +146,12 @@ type UdpServer struct {
 	//
 	// Concurrency: same contract as licensePubkeyVerifyRequire.
 	acPubkeyRevokeVerifyRequire bool
+	// acPubkeyRevokeSweepInterval controls the F5 mid-session drop
+	// sweeper. Parsed once at Start from
+	// NHP_AC_PUBKEY_REVOKE_SWEEP_INTERVAL_SECONDS; zero disables the
+	// background sweep. The sweeper itself only starts when the F5
+	// revoke gate is strict and the server is in DynamoDB cloud mode.
+	acPubkeyRevokeSweepInterval time.Duration
 
 	// connection and remote transaction management
 
@@ -552,6 +558,16 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	} else {
 		log.Info("AC pubkey revoke gate: permit mode (#1507); watch %s (revoked-pubkey hits) and %s (storage flap) before flipping NHP_AC_PUBKEY_REVOKE_VERIFY=true",
 			MetricACPubkeyRevoked, MetricACPubkeyRevokedLookupErr)
+	}
+	s.acPubkeyRevokeSweepInterval, err = parseACPubkeyRevokeSweepInterval(os.Getenv(ACPubkeyRevokeSweepIntervalEnvVar))
+	if err != nil {
+		return fmt.Errorf("%s: %w", ACPubkeyRevokeSweepIntervalEnvVar, err)
+	}
+	if s.acPubkeyRevokeSweepInterval == 0 {
+		log.Info("AC pubkey revoke mid-session sweep disabled (%s=0)", ACPubkeyRevokeSweepIntervalEnvVar)
+	} else {
+		log.Info("AC pubkey revoke mid-session sweep interval: %s (starts only in strict DynamoDB cloud mode)",
+			s.acPubkeyRevokeSweepInterval)
 	}
 
 	// Initialize pluggable storage backend (DynamoDB or etcd)
@@ -1013,6 +1029,14 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	if cloudMode && s.cloudMap != nil {
 		s.wg.Add(1)
 		go s.cloudMapRegisterRefreshRoutine()
+	}
+	if s.acPubkeyRevokeDropEnabled() && s.acPubkeyRevokeSweepInterval > 0 {
+		s.wg.Add(1)
+		go s.acPubkeyRevokeSweepRoutine()
+		log.Info("AC pubkey revoke mid-session sweeper started (interval=%s)", s.acPubkeyRevokeSweepInterval)
+	} else if s.acPubkeyRevokeSweepInterval > 0 && !s.acPubkeyRevokeVerifyRequire {
+		log.Info("AC pubkey revoke mid-session sweeper not started because %s is permit mode",
+			ACPubkeyRevokeVerifyEnvVar)
 	}
 
 	s.running.Store(true)

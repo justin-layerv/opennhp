@@ -37,6 +37,20 @@ must update this list and audit all existing call sites.
   routine's defer would invert against it (it removes from
   `acConnectionMap` first, then from `remoteConnectionMap` via
   `removeConnection`).
+- **Revoked-AC live-drop cleanup keeps the same sequencing.**
+  `dropRevokedACPubkeyConnections` removes matching `ACConn` entries
+  under `acConnectionMapMutex`, releases it, then touches
+  `remoteConnectionMapMutex`, and only later holds
+  `acConnectionMapMutex.RLock()` through the no-live-conn scan and
+  `removeACPeer` (`device.peerMapMutex` then `acPeerMapMutex`). This
+  serializes the remove decision with `ACConn` appends. Cloud-mode
+  `HandleACOnline` publishes/re-publishes its peer after the `ACConn`
+  append via `ensureACPeerForLiveConn`, which holds the same RLock
+  while calling `AddACPeer`; if cleanup removes the peer before the
+  append, the registration restores it after the conn is live, and if
+  the append wins first cleanup observes the live conn and keeps the
+  peer. Do not take `remoteConnectionMapMutex` in either nested
+  section.
 - **`authServiceMapMutex` is leaf-most; never held while taking
   `pluginHandlerMapMutex`.** `applyAspMapDelta` (`udpserver.go`)
   takes `authServiceMapMutex.Lock()`, performs the build-fresh-then-

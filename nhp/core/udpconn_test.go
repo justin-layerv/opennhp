@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -44,4 +45,36 @@ func TestSetTimeout_StoresAtomicValue(t *testing.T) {
 	default:
 		t.Error("SetTimeout did not signal SetTimeoutSignal")
 	}
+}
+
+func TestConnectionDataCloseConcurrentIsIdempotent(t *testing.T) {
+	cd := &ConnectionData{
+		StopSignal:       make(chan struct{}),
+		SendQueue:        make(chan *Packet, 1),
+		RecvQueue:        make(chan *Packet, 1),
+		BlockSignal:      make(chan struct{}),
+		SetTimeoutSignal: make(chan struct{}, 1),
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cd.Close()
+		}()
+	}
+	wg.Wait()
+
+	if !cd.IsClosed() {
+		t.Fatal("Close did not mark connection closed")
+	}
+	select {
+	case <-cd.StopSignal:
+		// expected
+	default:
+		t.Fatal("Close did not close StopSignal")
+	}
+
+	cd.Close()
 }

@@ -1075,17 +1075,6 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// We need to validate the AC via license check and create the peer dynamically.
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
 	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
-	// addedNewPeer scopes the in-lock TOCTOU cleanup to peers we
-	// insert in *this* call. Without it the cleanup would also evict
-	// pre-existing acPeerMap entries (a prior AddACPeer whose ACConn
-	// was later cleaned up by removeACConnectionRecord), turning a
-	// transient race-induced reject into a legitimate-AC disconnect.
-	// Set true ONLY after the actual AddACPeer call below, so an
-	// early-return from validateACLicense (which short-circuits before
-	// AddACPeer) cannot leave addedNewPeer in a state that would
-	// trigger the cleanup on a peer we never inserted.
-	var addedNewPeer bool
-
 	// #1157 F3 pre-check. Authoritative F3 gate runs inside the
 	// acConnectionMapMutex.Lock() further below; pre-fix that path was
 	// only reached AFTER validateACLicense (bcrypt) and AddACPeer in
@@ -1237,9 +1226,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		// is disabled (DisableACPeerValidation=true) so we must do it here.
 		// Without this, processACOperation fails with nil peer address.
 		acPeer.UpdateRecv(ppd.LocalInitTime, ppd.ConnData.RemoteAddr)
-		s.AddACPeer(acPeer)
-		addedNewPeer = true
-		log.Info("server-ac(%s#%d@%s)[HandleACOnline] Cloud mode: created AC peer after license validation", acId, transactionId, addrStr)
+		log.Info("server-ac(%s#%d@%s)[HandleACOnline] Cloud mode: created AC peer after license validation; publishing after ACConn append", acId, transactionId, addrStr)
 	} else if acPeer != nil {
 		// Existing peer found - update its receive address to handle re-registration
 		// from a different source port (e.g., after socket recreation).
@@ -1286,15 +1273,10 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		// through but a concurrent registration to this acId pushed
 		// the distinct count past the cap before we acquired the
 		// write lock. acConnectionMap[acId] is unchanged at this
-		// point (we haven't written yet), but if THIS call inserted
-		// a new acPeerMap entry above (cloud mode + prior absence),
-		// remove it. Don't gate on `cloudMode && acPeer != nil` —
-		// that would also evict a pre-existing peer whose ACConn
-		// was cleaned up earlier (legitimate AC reconnect).
+		// point (we haven't written yet), and cloud-mode peer publish
+		// is intentionally delayed until after the successful append,
+		// so there is no peer-map cleanup for this call.
 		s.acConnectionMapMutex.Unlock()
-		if addedNewPeer {
-			s.removeACPeer(acPubkeyBase64)
-		}
 		s.recordLicenseFailure(addrStr, acId)
 		s.sendACOnlineRejectAAK(ppd, transactionId, capRejectErr, acId, addrStr, "cap-reject")
 		return capRejectErr
@@ -1375,6 +1357,17 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 
 	s.acConnectionMap[acId] = existingConns
 	s.acConnectionMapMutex.Unlock()
+
+	if cloudMode {
+		// Publish/re-publish the peer only after its ACConn is visible.
+		// The revoked-pubkey live-drop cleanup removes a peer only when
+		// no live ACConn with that pubkey is visible; delaying AddACPeer
+		// until after this append, and holding the read lock while
+		// re-adding, closes the race where cleanup could remove a peer
+		// that a concurrent registration had added before its ACConn
+		// append.
+		s.ensureACPeerForLiveConn(acId, acConn)
+	}
 
 	// Clean up stale connection outside the lock (if any). With
 	// pubkey-keyed admission, staleConn can now be a same-pubkey

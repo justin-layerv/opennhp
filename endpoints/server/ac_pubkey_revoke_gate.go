@@ -63,6 +63,7 @@ import (
 //   - MetricACPubkeyRevokedLookupErr   — F5 lookup storage error
 //   - MetricACPubkeyRevokeListOversize — runaway list length sentinel
 //   - MetricACPubkeyRevokeGateBug      — fail-closed dispatch-bug fence
+//   - MetricACPubkeyRevokedConnDropped — live connection severed by runtime revocation
 
 // ACPubkeyRevokeVerifyEnvVar gates the strict-mode reject. Accepts
 // the same truthy/falsy tokens as the other server gates.
@@ -105,6 +106,12 @@ const (
 	MetricACPubkeyRevokedLookupErr   = "ACPubkeyRevokedLookupErr"
 	MetricACPubkeyRevokeListOversize = "ACPubkeyRevokeListOversize"
 	MetricACPubkeyRevokeGateBug      = "ACPubkeyRevokeGateBug"
+	// MetricACPubkeyRevokedConnDropped fires once per live ACConn
+	// removed by the F5 mid-session revocation path (#1535, parent
+	// #1157 F5). Incident-worthy when the operator did not just add
+	// that pubkey to ACAssignment.RevokedPubKeys: a stolen AC key was
+	// live and the server found it outside the registration path.
+	MetricACPubkeyRevokedConnDropped = "ACPubkeyRevokedConnDropped"
 )
 
 // acPubkeyRevokeListLengthWarn is the size at which evaluate logs a

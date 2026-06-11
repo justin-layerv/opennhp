@@ -74,14 +74,12 @@ func (c *ConnectionData) SetTimeout(ms int) {
 }
 
 func (c *ConnectionData) Close() {
-	if c.IsClosed() {
+	if !c.closed.CompareAndSwap(false, true) {
 		return
 	}
 
 	// close all running transactions
 	close(c.StopSignal)
-
-	c.closed.Store(true)
 
 	// flush connection remaining packet and close connection thread channels
 flush:
