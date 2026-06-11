@@ -365,10 +365,15 @@ resource "aws_cloudwatch_dashboard" "main" {
         properties = {
           title  = "NHP Custom Metrics (when available)"
           region = data.aws_region.current.id
+          # Dims must be {Environment, Cell} to match the server publisher's
+          # emitted stream (buildServerMetricDimensions, endpoints/server/
+          # udpserver.go); an Environment-only row selects a non-existent
+          # stream and renders empty. Metric is KnockRequest (singular — the
+          # MetricKnockRequest constant), not KnockRequests. See #2454.
           metrics = [
-            ["LayerV/NHP", "KnockRequests", "Environment", var.environment],
-            [".", "AuthSuccess", ".", "."],
-            [".", "AuthFailure", ".", "."]
+            ["LayerV/NHP", "KnockRequest", "Environment", var.environment, "Cell", var.cell_id],
+            [".", "AuthSuccess", ".", ".", ".", "."],
+            [".", "AuthFailure", ".", ".", ".", "."]
           ]
           period = 60
           stat   = "Sum"
@@ -384,8 +389,10 @@ resource "aws_cloudwatch_dashboard" "main" {
         properties = {
           title  = "NHP Knock Latency p99 (when available)"
           region = data.aws_region.current.id
+          # {Environment, Cell} to match the publisher stream — see the NHP
+          # Custom Metrics widget above and #2454.
           metrics = [
-            ["LayerV/NHP", "KnockLatency", "Environment", var.environment]
+            ["LayerV/NHP", "KnockLatency", "Environment", var.environment, "Cell", var.cell_id]
           ]
           period = 60
           stat   = "p99"
