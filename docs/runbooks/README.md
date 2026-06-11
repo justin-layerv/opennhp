@@ -10,6 +10,7 @@ runbook file is added, renamed, or removed.
 - [F5 revoked-pubkey alarm](f5-revoked-pubkey-paging.md)
 - [FRPS Cloud Map routing policy flip](frps-cloud-map-routing-policy.md)
 - [GuardDuty finding triage](guardduty-finding-triage.md)
+- [Knock forward-path failures](knock-forward-path.md)
 - [L3 flush circuit breaker recovery](l3-flush-breaker-recovery.md)
 - [L3 flush schedule wait timeout](l3-flush-schedule-wait-timeout.md)
 - [License pubkey gate — provisioning & strict flip](license-pubkey-strict-flip.md)

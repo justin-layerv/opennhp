@@ -49,6 +49,33 @@ locals {
       description = "NHP internal token validation missed the local cache and failed to read the ACK token shared store; FRPS validation returns infrastructure failure."
     }
   }
+
+  # Knock forward-path health alarms (issue #2449). Both share the
+  # single-event-detector shape below (see the resource for the calibration
+  # rationale); they differ only in which counter they watch. A map + for_each
+  # (the ack_token_shared_store_failure_alarms pattern above) keeps their
+  # identical tuning in one place so the anticipated "raise datapoints_to_alarm
+  # once traffic grows" edit is a single change, not two that can drift.
+  knock_forward_path_alarms = {
+    # The "forward machinery broke" signal: ForwardHttpKnock errored after every
+    # assigned peer failed (a non-2xx peer response — the original 400 — lands
+    # here). Does NOT fire when the forward is never attempted or a peer returns
+    # a structured no-AC ack over HTTP 200 — those land only on KnockNoAC.
+    forward_failure = {
+      metric_name = "KnockForwardFailure"
+      suffix      = "knock-forward-failure"
+      description = "nhp-server cross-server knock forwarding failed in the trailing hour. The forward is the no-local-AC safety net; baseline is zero (path is cold), so any failure is the first sign it is breaking and resolves risk user-facing 500s."
+    }
+    # The user-facing 500 driver and broad superset catch. Most plausible benign
+    # single event: a back-to-back AC deploy briefly leaving an AC uncovered on
+    # every replica → one self-healing 500 — correlate an isolated page with the
+    # deploy timeline (cannot be tuned out at this traffic; accepted).
+    no_ac = {
+      metric_name = "KnockNoAC"
+      suffix      = "knock-no-ac"
+      description = "nhp-server served a knock with no AC in the trailing hour (user-facing 500, ErrACConnectionNotFound — neither a local AC connection nor a forward could serve it). Baseline is zero; correlate an isolated page with AC deploys."
+    }
+  }
 }
 
 # SNS Topic for Alerts
@@ -380,6 +407,31 @@ resource "aws_cloudwatch_dashboard" "main" {
             ["LayerV/NHP", "ACRegistrationFailure", "Environment", var.environment, "Cell", var.cell_id, { "stat" : "Sum", "label" : "Reg Failure" }]
           ]
           period  = 300
+          view    = "timeSeries"
+          stacked = false
+        }
+      },
+      {
+        # Knock forward-path health (issue #2449) — surfaces the safety-net
+        # forwarding whose silent 100%-failure this dashboard previously hid.
+        # All three counters rest at zero (the path is cold), so the signal is
+        # any line lifting off zero; see the runbook for what each means. Dims
+        # {Environment, Cell} match the server publisher's stream.
+        type   = "metric"
+        x      = 12
+        y      = 18
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Knock Forward Health (when available)"
+          region = data.aws_region.current.id
+          metrics = [
+            ["LayerV/NHP", "KnockForwardSuccess", "Environment", var.environment, "Cell", var.cell_id, { "label" : "Forward Success" }],
+            [".", "KnockForwardFailure", ".", ".", ".", ".", { "label" : "Forward Failure" }],
+            [".", "KnockNoAC", ".", ".", ".", ".", { "label" : "No AC (500)" }]
+          ]
+          period  = 300
+          stat    = "Sum"
           view    = "timeSeries"
           stacked = false
         }
@@ -715,6 +767,88 @@ resource "aws_cloudwatch_metric_alarm" "ack_token_shared_store_failure" {
   statistic           = "Sum"
   threshold           = 1
   alarm_description   = "${each.value.description} Runbook: docs/runbooks/nhp-ack-token-shared-store.md."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# ==================== Knock Forward Path Health (issue #2449) ====================
+#
+# The server-to-server HTTP knock forward is the safety net for "this server
+# lacks a local AC connection": when the NLB hashes a resolve to a server with
+# no local AC for the requested resource, the server forwards the knock to an
+# assigned peer that does hold it (intended to cover blue/green AC-connection
+# churn). That path was silently 100% broken for an unknown period — the
+# forwarder shipped a request missing `resId`, every receiver replied 400, and
+# the resolve fell through to a user-facing 500 (ErrACConnectionNotFound). It
+# went unnoticed because neither failure signal was alarmed. These two alarms
+# close that gap.
+#
+# Both counters are emitted via Publisher.IncrCounter (endpoints/metrics/
+# publisher.go), so they carry the publisher's base dim set {Environment,
+# Cell} — identical selector to buildServerMetricDimensions
+# (endpoints/server/udpserver.go) and the server-publisher-failures alarm
+# above. Keep the dimensions {} blocks in lockstep with it.
+#
+# TUNING — these are single-event detectors, by necessity. Calibration query
+# (2026-06-10, prod/cell0, 13 days): KnockNoAC, KnockForwardFailure, AND
+# KnockForwardSuccess were ALL flat zero; KnockRequest ran ~1-2 knocks/hour.
+# Two consequences drive the shape below:
+#   1. At ~1 knock/hr a "consecutive nonzero 5-min windows" alarm can never
+#      accumulate — it would be permanently inert even with forwarding 100%
+#      broken (the exact dead-alarm this issue exists to kill). So M-of-N with
+#      datapoints_to_alarm=1 over a 1-hour lookback (eval=12 @ period=300):
+#      page on the FIRST breaching 5-min window in the trailing hour.
+#   2. KnockForwardSuccess=0 means the forward path was never exercised in
+#      that window — it is COLD, not proven-healthy. The zero baseline does
+#      NOT prove these alarms stay quiet through deploys (there were no
+#      forwards to succeed or fail). Treat a single benign transient page as
+#      an accepted tradeoff at this traffic, not something the data rules out.
+# Raise datapoints_to_alarm (and/or threshold) once prod sustains multiple
+# knocks per 5-min window and a benign transient baseline actually appears.
+# Note for that retune: the two counters have different granularity —
+# KnockForwardFailure increments per failed RESOURCE (inside httpserver.go's
+# `for resName` loop) while KnockNoAC increments once per KNOCK, so on a
+# multi-resource knock KnockForwardFailure's Sum can exceed the knock count;
+# they are not directly comparable as rates. Irrelevant to these threshold>0
+# single-event alarms, but it matters for a rate model.
+# The reliable long-term detector for a cold path is a synthetic forward probe
+# (how this bug was found); these passive counters only fire when real traffic
+# happens to hit the broken path. Tracked as a follow-up on #2449.
+
+# No composite (KnockForwardSuccess == 0 while KnockForwardFailure > 0): KnockNoAC
+# is already a superset of KnockForwardFailure (it also fires when no server holds
+# the AC or a forward is skipped), so this pair covers the broken-forward
+# signature and user impact without a third alarm. Per-counter semantics are on
+# the knock_forward_path_alarms map entries.
+resource "aws_cloudwatch_metric_alarm" "knock_forward_path" {
+  for_each = local.knock_forward_path_alarms
+
+  alarm_name = "${var.name_prefix}-${var.cell_id}-${each.value.suffix}"
+  # `> 0` (rather than the ack-token map's `>= 1`) deliberately matches
+  # server_publisher_failures — the behavioral sibling whose sparse-counter +
+  # datapoints_to_alarm + notBreaching shape these alarms mirror. Identical to
+  # `>= 1` for an integer Sum counter; we copy ack-token only for the for_each
+  # structure, not its single-period tuning.
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 12
+  datapoints_to_alarm = 1
+  metric_name         = each.value.metric_name
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "${each.value.description} Runbook: docs/runbooks/knock-forward-path.md. #2449."
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"
