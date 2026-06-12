@@ -35,9 +35,10 @@ import (
 // Strict mode does NOT escalate; otherwise a storage flap becomes
 // a fleet-wide outage. Operators alarm on the metric.
 //
-// Scope: registration-time admission only. Mid-session connection
-// drop on revocation (parent #1157 F5 second half) is tracked as
-// a separate follow-up.
+// Runtime enforcement: registration-time admission happens here.
+// Mid-session connection drop for already-connected revoked pubkeys
+// lives in ac_pubkey_revoke_sweep.go and emits
+// MetricACPubkeyRevokedConnDropped.
 //
 // Audit log: every Revoked verdict emits a Warning line tagged
 // [ACPubkeyRevoked]. Strict-mode rejects log unconditionally;

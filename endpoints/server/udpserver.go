@@ -997,6 +997,16 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	s.recvMsgCh = s.device.DecryptedMsgQueue
 	s.sendMsgCh = make(chan *core.MsgData, core.SendQueueSize)
 
+	startACPubkeyRevokeSweep := false
+	var acPubkeyRevokeSweepInterval time.Duration
+	if s.storage != nil && s.acPubkeyRevokeVerifyRequire {
+		acPubkeyRevokeSweepInterval, err = parseACPubkeyRevokeSweepInterval(os.Getenv(ACPubkeyRevokeSweepIntervalEnvVar))
+		if err != nil {
+			return fmt.Errorf("%s: %w", ACPubkeyRevokeSweepIntervalEnvVar, err)
+		}
+		startACPubkeyRevokeSweep = true
+	}
+
 	// start device routines
 	s.device.Start()
 
@@ -1013,6 +1023,10 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	if cloudMode && s.cloudMap != nil {
 		s.wg.Add(1)
 		go s.cloudMapRegisterRefreshRoutine()
+	}
+	if startACPubkeyRevokeSweep {
+		s.wg.Add(1)
+		go s.acPubkeyRevokeSweepRoutine(acPubkeyRevokeSweepInterval)
 	}
 
 	s.running.Store(true)

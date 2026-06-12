@@ -787,6 +787,7 @@ func (hs *HttpServer) initRouter() {
 	nhpInternal := g.Group("/nhp/internal")
 	nhpInternal.POST("/knock", hs.handleInternalKnock)
 	nhpInternal.POST("/token/validate", hs.handleInternalTokenValidate)
+	nhpInternal.POST("/ac/revocations/sweep", hs.handleInternalACRevocationSweep)
 
 	hs.initStorageRouter()
 

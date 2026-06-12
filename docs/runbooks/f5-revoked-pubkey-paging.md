@@ -5,11 +5,12 @@
 One of:
 
 - **`ACPubkeyRevoked`** non-zero — a registration was rejected (or in permit mode, would have been rejected) because the presented AC pubkey is on its acId's `RevokedPubKeys` denylist.
+- **`ACPubkeyRevokedConnDropped`** non-zero — a strict-mode sweep or on-demand internal trigger severed an already-connected AC because its pubkey is now on its acId's `RevokedPubKeys` denylist.
 - **`ACPubkeyRevokedLookupErr`** non-zero — F5 GetACAssignment storage error; the gate degraded to skip-the-gate. Strict mode does NOT escalate this to a reject.
 - **`ACPubkeyRevokeListOversize`** non-zero — an `ACAssignment.RevokedPubKeys` list crossed the 50-entry sanity threshold. Operator workflow is one-pubkey-at-a-time during incident response; lists this large suggest a runaway-append admin tool or F5 misuse as a license-wide kill switch.
 - **`ACPubkeyRevokeGateBug`** non-zero — `applyACPubkeyRevokeVerdict` hit its fail-closed default branch, indicating a server-side dispatch-table bug. Page-worthy independent of `ACPubkeyRevoked`.
 
-The implementation lives in `endpoints/server/ac_pubkey_revoke_gate.go` (kernel + apply + evaluate split mirroring F3/F4). PR #1538 is the original implementation context.
+Registration-time enforcement lives in `endpoints/server/ac_pubkey_revoke_gate.go` (kernel + apply + evaluate split mirroring F3/F4). Mid-session connection drop lives in `endpoints/server/ac_pubkey_revoke_sweep.go`. PR #1538 is the original registration-gate implementation context.
 
 ## How to read a 52019 spike — most-important section
 
@@ -34,7 +35,8 @@ The information-disclosure asymmetry is documented at the top of `ac_pubkey_revo
 
 | Metric pattern | Likely cause | Action |
 |---|---|---|
-| `ACPubkeyRevoked` rises, operator just revoked | Expected enforcement | Confirm the AC's session terminated within `MaxACConnsPerID` keepalive window. No action. |
+| `ACPubkeyRevoked` rises, operator just revoked | Expected registration-time enforcement | Confirm the AC re-registered after revocation and was rejected. No action. |
+| `ACPubkeyRevokedConnDropped` rises, operator just revoked | Expected mid-session enforcement | Confirm the drop count matches the planned revoked AC connection count. The AC should reconnect and then hit the registration-time `ACPubkeyRevoked` gate. |
 | `ACPubkeyRevoked` rises from unfamiliar IP, operator did NOT revoke | Stolen pubkey being presented (high signal) OR attacker probing acId namespace (low signal — see "How to read" above) | Check `LicenseValidationRateLimited` from same IP. Cross-reference operator timeline. |
 | `ACPubkeyRevokedLookupErr` sustained | DDB flap — gate is silently bypassed | Page DDB ops. The metric is the only signal that strict-mode F5 is degraded; do NOT wait for a customer-visible regression. |
 | `ACPubkeyRevokeListOversize` non-zero | Runaway admin tool / F5 misused as license-wide kill switch | Check the offending acId's `RevokedPubKeys` length. Operator workflow is one-pubkey-at-a-time; if length > 50, consider whether `License.Active=false` is the right primitive instead. #1547 tracks adding a hard upper bound. |
@@ -60,7 +62,7 @@ AWS_PROFILE=layerv aws dynamodb update-item \
   --expression-attribute-values '{":pk":{"SS":["<base64-pubkey>"]},":one":{"N":"1"}}'
 ```
 
-Wait up to `CachedStorage.DefaultTTL` (60s normally, 5s during a console-driven reassignment) for in-flight servers to observe the change.
+Wait up to `CachedStorage.DefaultTTL` (60s normally, 5s during a console-driven reassignment) for in-flight servers to observe the change. In strict mode, the background sweep then severs matching already-connected ACs on the next `NHP_AC_PUBKEY_REVOKE_SWEEP_INTERVAL_SECONDS` tick (default 60s). To avoid waiting for that tick, call signed internal `POST /nhp/internal/ac/revocations/sweep` on the NHP server; it returns `{"dropped": <count>}`.
 
 **Pubkey encoding**: standard padded base64 (RFC 4648 §4, alphabet `A-Z a-z 0-9 + /`, `=` padding). URL-safe base64 is **not** normalized at gate-evaluation time and would cause a silent miss. Pin via `base64.StdEncoding.EncodeToString` from a Go script or copy directly from sources that emit std base64 (Secrets Manager, `aws ec2 describe-instances`).
 
@@ -74,7 +76,7 @@ Wait up to `CachedStorage.DefaultTTL` (60s normally, 5s during a console-driven 
 
 ## Related issues
 
-- #1535 — F5 mid-session connection drop (kick already-connected ACs whose pubkey was just revoked). Out of scope for #1538.
+- #1535 — F5 mid-session connection drop (kick already-connected ACs whose pubkey was just revoked). Implemented by the strict-mode sweep and internal trigger.
 - #1536 — Operator CLI for managing `RevokedPubKeys`. Replaces the manual DDB stopgap above.
 - #1537 — Smoke Tier 2 contract test fencing the propagation window.
 - #1541 — `handleACServerAssignment` rate-limit hardening (separate amplification surface).
