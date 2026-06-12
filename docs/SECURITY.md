@@ -425,12 +425,29 @@ flips the corresponding Security Hub controls (CloudWatch.1/4/5/6/7/8/9/
 - **Not included:** CloudWatch.2 (unauthorized API) and CloudWatch.3
   (console sign-in without MFA) are manual-only controls under CIS
   v1.4.0, so a metric filter does not move them; they are omitted from
-  the auto-PASS set. Console-sign-in-without-MFA also depends on MFA
-  enforcement, tracked separately.
+  the auto-PASS set. CloudWatch.2 is still covered as a custom
+  detection below; console-sign-in-without-MFA is covered separately by
+  `console_login_mfa_alarm.tf`.
 
 To verify after a prod apply: in Security Hub, filter the CIS v1.4.0
 standard by the `CloudWatch.*` controls and confirm they report PASSED
 (allow up to ~18 hours for the first periodic evaluation).
+
+#### CloudTrail custom detections
+
+`terraform/modules/security/cloudtrail_custom_detection_filters.tf` adds
+the #1140 finding-specific signals that are useful for detection but are
+not part of the CIS exact-pattern set:
+
+- Unauthorized API calls (`UnauthorizedAPICallCount`)
+- IAM trust policy edits via `UpdateAssumeRolePolicy`
+- Direct `kms:Decrypt` calls against the sensitive CMKs passed in
+  `cloudtrail_sensitive_kms_key_arns` (root wires the NHP secrets and logs
+  keys by default)
+
+These filters use the same CloudTrail log group, metric namespace, and
+alerts SNS topic as the CIS alarms. They stay in a separate file so tuning
+custom patterns cannot accidentally break Security Hub's CIS grading.
 
 ---
 

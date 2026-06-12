@@ -189,6 +189,7 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 		// it. The pubkey fingerprint is base64-truncated to keep the
 		// line short while remaining sufficient to distinguish one
 		// misbehaving server from a fleet-wide signal.
+		a.incrMetric(MetricAOPReplayDetected)
 		log.Warning("ac(%s#%d)[HandleUdpACOperations] duplicate transaction id, drop replayed %s packet (pubkey=%s, sendTime=%d)", acId, transactionId, core.HeaderTypeToString(ppd.HeaderType), pubkeyFingerprint(ppd.RemotePubKey), ppd.RemoteSendTime)
 		return common.ErrACDuplicateTransaction
 	}

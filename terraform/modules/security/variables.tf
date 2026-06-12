@@ -117,6 +117,12 @@ variable "enable_cloudtrail" {
   default     = true
 }
 
+variable "cloudtrail_sensitive_kms_key_arns" {
+  description = "Sensitive KMS key ARNs whose direct Decrypt API calls should emit a CloudTrail metric-filter alarm (#1140). Keep this scoped to keys where direct decrypts are unusual; service-mediated decrypts are filtered out by the pattern."
+  type        = list(string)
+  default     = []
+}
+
 variable "enable_cloudtrail_tamper_alerts" {
   description = "Page on-call (via the Slack alerts topic) when a CloudTrail trail is disabled, deleted, or reconfigured (#1143). Deliberately independent of enable_cloudtrail: the alert watches API-call events on the default event bus, so it protects trails this module does not own (e.g. the SCP-locked sandbox trails). Requires enable_slack_target and a non-empty alerts_sns_topic_arn."
   type        = bool

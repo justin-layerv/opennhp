@@ -67,6 +67,7 @@ func newTokenValidateRouter(t *testing.T, require bool) (*gin.Engine, *internala
 	emit := func(string) {}
 	us := &UdpServer{
 		tokenStore: common.NewTokenStore[*ACTokenEntry](),
+		metrics:    metrics.NewPublisherForTest(t),
 	}
 	hs := &HttpServer{
 		udpServer:           us,
@@ -108,6 +109,7 @@ func newTokenValidateRouterWithCounters(t *testing.T, require bool) (*gin.Engine
 	}
 	us := &UdpServer{
 		tokenStore: common.NewTokenStore[*ACTokenEntry](),
+		metrics:    metrics.NewPublisherForTest(t),
 	}
 	hs := &HttpServer{
 		udpServer:           us,
@@ -161,6 +163,23 @@ func verifyValidateResponseSignature(t *testing.T, signer *internalauth.Signer, 
 	if err := signer.Verify(rec.Header().Get(internalauth.Header), http.MethodPost, authPath, rec.Body.Bytes(), 0); err != nil {
 		t.Fatalf("response signature did not verify: %v\nheader=%q\nbody=%s", err, rec.Header().Get(internalauth.Header), rec.Body.String())
 	}
+}
+
+func sumDimCounterMatching(dimCounters map[string]float64, substrings ...string) float64 {
+	var total float64
+	for key, value := range dimCounters {
+		matches := true
+		for _, substring := range substrings {
+			if !strings.Contains(key, substring) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			total += value
+		}
+	}
+	return total
 }
 
 func TestInternalTokenValidate_ResponseAuthWireContract(t *testing.T) {
@@ -1724,6 +1743,53 @@ func TestInternalTokenValidate_CounterEmission_PermitUnsigned(t *testing.T) {
 	}
 	if counts[MetricInternalAuthFailStrict] != 0 {
 		t.Errorf("MetricInternalAuthFailStrict = %d, want 0 (permit mode)", counts[MetricInternalAuthFailStrict])
+	}
+}
+
+// TestInternalTokenValidate_CounterEmission_NotFoundByCallerIP fences the
+// grinding-detection signal requested in #1140: authoritative negative
+// token validations must hit both the base alarm stream and the
+// CallerIP/Reason breakdown stream.
+func TestInternalTokenValidate_CounterEmission_NotFoundByCallerIP(t *testing.T) {
+	r, signer, us, _ := newTokenValidateRouterWithCounters(t, true)
+	body := `{"token":"missing-token","agent_run_id":"run-miss"}`
+
+	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+
+	counters, dimCounters := us.metrics.CountersForTest(t)
+	if got := counters[MetricInternalTokenValidateFailure]; got != 1 {
+		t.Fatalf("%s base counter = %v, want 1", MetricInternalTokenValidateFailure, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricInternalTokenValidateFailure, "CallerIP=127.0.0.1", "Reason=not_found"); got != 1 {
+		t.Fatalf("%s not_found CallerIP breakdown = %v, want 1 (dimCounters=%v)", MetricInternalTokenValidateFailure, got, dimCounters)
+	}
+}
+
+func TestInternalTokenValidate_CounterEmission_ExpiredByCallerIP(t *testing.T) {
+	r, signer, us, _ := newTokenValidateRouterWithCounters(t, true)
+	storeTestACToken(t, us, "expired-token-counter", &ACTokenEntry{
+		User:       &common.AgentUser{UserId: "u"},
+		ResourceId: "r",
+		KnockSrcIP: "10.0.0.99",
+		OpenTime:   60,
+		ExpireTime: time.Now().Add(-time.Second),
+	})
+	body := `{"token":"expired-token-counter","agent_run_id":"run-expired"}`
+
+	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+
+	counters, dimCounters := us.metrics.CountersForTest(t)
+	if got := counters[MetricInternalTokenValidateFailure]; got != 1 {
+		t.Fatalf("%s base counter = %v, want 1", MetricInternalTokenValidateFailure, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricInternalTokenValidateFailure, "CallerIP=127.0.0.1", "Reason=expired"); got != 1 {
+		t.Fatalf("%s expired CallerIP breakdown = %v, want 1 (dimCounters=%v)", MetricInternalTokenValidateFailure, got, dimCounters)
 	}
 }
 

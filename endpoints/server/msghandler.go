@@ -210,13 +210,24 @@ const (
 	// so internal service-to-service catalog misses do not page the
 	// UDP knock auth-policy alarm.
 	MetricInternalKnockASPNotFound = "InternalKnockASPNotFound"
+	// MetricInternalKnockRequest counts parsed, authenticated/accepted
+	// /nhp/internal/knock requests before resource resolution. It is
+	// dual-published as a base counter for alarms and as a
+	// Source/CallerIP breakdown stream for investigation of VPC-internal
+	// callers that should not be driving the internal surface.
+	MetricInternalKnockRequest = "InternalKnockRequest"
 	// MetricInternalTokenValidateBadNonce fires when an authenticated
 	// /nhp/internal/token/validate caller opts in to response auth with
 	// a malformed X-Nhp-Nonce. It is deliberately separate from the
 	// request-auth success/fail trio so rollout dashboards can catch
 	// verifier nonce-shape bugs without redefining request-auth success.
 	MetricInternalTokenValidateBadNonce = "InternalTokenValidateBadNonce"
-	MetricACPeerCount                   = "ACPeerCount"
+	// MetricInternalTokenValidateFailure counts authoritative negative
+	// /nhp/internal/token/validate results (not_found or expired). It is
+	// dual-published as a base counter for a grinding alarm and as a
+	// CallerIP/Reason breakdown stream for attribution.
+	MetricInternalTokenValidateFailure = "InternalTokenValidateFailure"
+	MetricACPeerCount                  = "ACPeerCount"
 	// MetricACGraceAbsorbed increments once per /health/knock-ready probe
 	// where ACPeerChecker returned pass from the grace-window branch
 	// (live count was zero but the last-non-zero timestamp was inside

@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/layervai/nhp/internalauth"
 )
@@ -269,6 +270,41 @@ func TestInternalKnock_IncrementsSuccess(t *testing.T) {
 	}
 	if counts[MetricInternalAuthFailPermit] != 0 {
 		t.Errorf("MetricInternalAuthFailPermit = %d, want 0 (valid sig is not a failure)", counts[MetricInternalAuthFailPermit])
+	}
+}
+
+// TestInternalKnock_CounterEmission_RequestBySourceAndCallerIP fences the
+// #1140 internal-surface visibility signal: once a /nhp/internal/knock
+// request is parsed and accepted by the auth gate, operators should get a
+// base request counter plus Source/CallerIP attribution, even if catalog
+// resolution later rejects it.
+func TestInternalKnock_CounterEmission_RequestBySourceAndCallerIP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	us := &UdpServer{
+		metrics:        metrics.NewPublisherForTest(t),
+		authServiceMap: common.AuthSvcProviderMap{},
+	}
+	hs := &HttpServer{udpServer: us}
+	fwdReq := HttpKnockForwardRequest{
+		Request: &common.HttpKnockRequest{
+			AuthServiceId: "qurl",
+			ResourceId:    "nhp-resource",
+			SrcIp:         "203.0.113.25",
+		},
+		Source: SourceAPI,
+	}
+
+	rec := callHandleInternalKnock(t, hs, fwdReq)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 from missing ASP. body=%s", rec.Code, rec.Body.String())
+	}
+
+	counters, dimCounters := us.metrics.CountersForTest(t)
+	if got := counters[MetricInternalKnockRequest]; got != 1 {
+		t.Fatalf("%s base counter = %v, want 1", MetricInternalKnockRequest, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricInternalKnockRequest, "Source=api", "CallerIP=10.0.1.100"); got != 1 {
+		t.Fatalf("%s Source/CallerIP breakdown = %v, want 1 (dimCounters=%v)", MetricInternalKnockRequest, got, dimCounters)
 	}
 }
 

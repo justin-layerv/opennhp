@@ -1005,11 +1005,15 @@ module "dns" {
 module "security" {
   source = "./modules/security"
 
-  environment                = var.environment
-  name_prefix                = local.name_prefix
-  rate_limit_requests        = var.environment == "prod" ? 5000 : 2000
-  logs_kms_key_arn           = module.kms.logs_key_arn
-  enable_cloudtrail          = var.enable_cloudtrail
+  environment         = var.environment
+  name_prefix         = local.name_prefix
+  rate_limit_requests = var.environment == "prod" ? 5000 : 2000
+  logs_kms_key_arn    = module.kms.logs_key_arn
+  enable_cloudtrail   = var.enable_cloudtrail
+  cloudtrail_sensitive_kms_key_arns = [
+    module.kms.secrets_key_arn,
+    module.kms.logs_key_arn,
+  ]
   enable_waf_logging         = var.enable_waf_logging
   config_recording_frequency = var.config_recording_frequency
   config_resource_types      = var.config_resource_types

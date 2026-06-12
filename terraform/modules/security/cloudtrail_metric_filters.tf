@@ -42,13 +42,10 @@
 #     real-time signal is wanted. (CloudWatch.3, console sign-in without
 #     MFA, IS now tracked separately — see console_login_mfa_alarm.tf,
 #     #1138.)
-#   * Finding-specific filters from #1140 (iam:UpdateAssumeRolePolicy,
-#     kms:Decrypt) are deferred: UpdateAssumeRolePolicy is subsumed by
-#     CloudWatch.4 (IAM policy changes) below, and a bare kms:Decrypt
-#     filter is pure noise (every secret read / encrypted-log write) —
-#     it needs cross-account/cross-region scoping to specific key ARNs,
-#     a separate design. Both underlying findings (#1121, #1125) are now
-#     closed, so these are defense-in-depth, not active exposure.
+#   * Finding-specific filters from #1140 live in
+#     cloudtrail_custom_detection_filters.tf, not in this CIS file. Keep
+#     the CIS set exact so Security Hub continues to auto-grade it, and
+#     add non-CIS defense-in-depth filters separately.
 #
 # **Routing.** Alarms fan out to `var.alerts_sns_topic_arn` — the shared
 # monitoring `alerts` topic, which already subscribes both email and

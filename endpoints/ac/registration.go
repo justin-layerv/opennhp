@@ -182,7 +182,11 @@ const (
 	// Emitted in the same LayerV/NHP namespace as the server-side
 	// counter; separated by AC dimensions so AC and server rates are
 	// distinguishable in alarms / dashboards.
-	MetricTransactionClosed       = "TransactionClosed"
+	MetricTransactionClosed = "TransactionClosed"
+	// MetricAOPReplayDetected counts replay-dedupe drops of already-seen
+	// (sender pubkey, transaction id, send time) AOP packets. Any sustained
+	// non-zero rate is a security signal or a broken retry/failover path.
+	MetricAOPReplayDetected       = "AOPReplayDetected"
 	MetricServerConnections       = "ServerConnections"
 	MetricServerConnectionFailure = "ServerConnectionFailure"
 	MetricServerHealthFailures    = "ServerHealthFailures"

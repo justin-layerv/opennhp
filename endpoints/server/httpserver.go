@@ -1667,6 +1667,8 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 		return
 	}
 
+	hs.recordInternalKnockRequest(fwdReq.Source, srcIP)
+
 	resolvedResource, err := hs.resolveInternalKnockResource(hs.internalKnockResourceLookupContext(), fwdReq.Request, fwdReq.Resource)
 	if err != nil {
 		switch {

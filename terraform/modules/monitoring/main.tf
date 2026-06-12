@@ -50,6 +50,15 @@ locals {
     }
   }
 
+  internal_security_failure_alarms = {
+    token_validate_failure = {
+      metric_name = "InternalTokenValidateFailure"
+      suffix      = "internal-token-validate-failure"
+      threshold   = 10
+      description = "NHP internal token validation returned not_found/expired more than 10 times in 5 minutes. Check CallerIP/Reason breakdown streams for token grinding, replay, or a caller routing to the wrong server."
+    }
+  }
+
   # Knock forward-path health alarms (issue #2449). Both share the
   # single-event-detector shape below (see the resource for the calibration
   # rationale); they differ only in which counter they watch. A map + for_each
@@ -786,6 +795,38 @@ resource "aws_cloudwatch_metric_alarm" "ack_token_shared_store_failure" {
   tags = merge(var.tags, {
     Component = "monitoring"
     Cell      = var.cell_id
+  })
+}
+
+# Internal-surface security failures. The Go publisher dual-publishes
+# these as:
+#   - a base stream at {Environment, Cell}, which alarms can match, and
+#   - dimensioned breakdown streams (CallerIP/Reason) for attribution.
+resource "aws_cloudwatch_metric_alarm" "internal_security_failure" {
+  for_each = local.internal_security_failure_alarms
+
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-${each.value.suffix}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = each.value.metric_name
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = each.value.threshold
+  alarm_description   = each.value.description
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+    Issue     = "1140"
   })
 }
 
