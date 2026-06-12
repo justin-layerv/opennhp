@@ -52,11 +52,17 @@ const (
 // test as the single source of truth for the error-page marker.
 const accessLinkInvalidMarker = "Access Link Invalid"
 
-// mintSmokeQURL is a small wrapper that mints a QURL with a label
-// derived from the test name and registers cleanup. Returns the
-// mint response so the test can read qurl_link / access token /
-// qurl_site.
+// mintSmokeQURL mints a QURL with a label derived from the test name and
+// registers cleanup. Returns the mint response so the test can read qurl_link /
+// access token / qurl_site.
 func mintSmokeQURL(ctx context.Context, t *testing.T, targetURL string) *QURLResponse {
+	t.Helper()
+	return mintSmokeQURLLabeled(ctx, t, targetURL, "")
+}
+
+// mintSmokeQURLLabeled keeps setup/precondition failures grep-friendly for
+// tests where a later assertion is the actual gate under test.
+func mintSmokeQURLLabeled(ctx context.Context, t *testing.T, targetURL, failureContext string) *QURLResponse {
 	t.Helper()
 	resp, err := MintQURL(ctx, t, MintOptions{
 		Label:     t.Name(),
@@ -64,18 +70,27 @@ func mintSmokeQURL(ctx context.Context, t *testing.T, targetURL string) *QURLRes
 		ExpiresIn: "120s", // long enough for the test body + a follow-redirect chain
 	})
 	if err != nil {
-		t.Fatalf("mint QURL: %v", err)
+		fatalWithContextLabel(t, failureContext, "mint QURL: %v", err)
 	}
 	if resp.Data.ResourceID == "" {
-		t.Fatalf("mint returned empty resource_id: %+v", resp)
+		fatalWithContextLabel(t, failureContext, "mint returned empty resource_id: %+v", resp)
 	}
 	if resp.AccessToken() == "" {
-		t.Fatalf("mint returned qurl_link with no access token fragment: %s", resp.Data.QURLLink)
+		fatalWithContextLabel(t, failureContext, "mint returned qurl_link with no access token fragment: %s", resp.Data.QURLLink)
 	}
 	t.Cleanup(func() {
 		DeleteQURL(context.Background(), t, resp.Data.ResourceID)
 	})
 	return resp
+}
+
+func fatalWithContextLabel(t *testing.T, contextLabel, format string, args ...any) {
+	t.Helper()
+	if contextLabel != "" {
+		args = append([]any{contextLabel}, args...)
+		format = "%s: " + format
+	}
+	t.Fatalf(format, args...)
 }
 
 // resolveRetryBudget is the total wall-clock time resolveWithRetries
@@ -117,6 +132,13 @@ const resolvePerAttemptTimeout = 5 * time.Second
 // them separate keeps both call sites locally clear.
 func resolveWithRetries(ctx context.Context, t *testing.T, mintFunc func() *QURLResponse) *http.Response {
 	t.Helper()
+	return resolveWithRetriesLabeled(ctx, t, mintFunc, "")
+}
+
+// resolveWithRetriesLabeled labels setup/precondition failures without changing
+// cleanup timing on freshly minted QURLs.
+func resolveWithRetriesLabeled(ctx context.Context, t *testing.T, mintFunc func() *QURLResponse, failureContext string) *http.Response {
+	t.Helper()
 
 	deadline := time.Now().Add(resolveRetryBudget)
 	var lastErr error
@@ -132,7 +154,7 @@ func resolveWithRetries(ctx context.Context, t *testing.T, mintFunc func() *QURL
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, reqURL, strings.NewReader(formData))
 		if err != nil {
 			cancel()
-			t.Fatalf("resolveWithRetries: build request: %v", err)
+			fatalWithContextLabel(t, failureContext, "resolveWithRetries: build request: %v", err)
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		resp, err := testConfig.NoRedirectClient.Do(req)
@@ -164,7 +186,7 @@ func resolveWithRetries(ctx context.Context, t *testing.T, mintFunc func() *QURL
 				// 4xx or unexpected: the server made a decision. Fail
 				// immediately — do not mask an access regression with
 				// retries.
-				t.Fatalf("resolveWithRetries: non-retryable status %d on attempt %d", resp.StatusCode, attempt)
+				fatalWithContextLabel(t, failureContext, "resolveWithRetries: non-retryable status %d on attempt %d", resp.StatusCode, attempt)
 			}
 		}
 
@@ -173,11 +195,11 @@ func resolveWithRetries(ctx context.Context, t *testing.T, mintFunc func() *QURL
 		// Auth0+qurl-service. maxResolveAttempts is shared via
 		// assertions.go.
 		if attempt >= maxResolveAttempts {
-			t.Fatalf("resolveWithRetries: exhausted %d attempts: %v",
+			fatalWithContextLabel(t, failureContext, "resolveWithRetries: exhausted %d attempts: %v",
 				maxResolveAttempts, lastErr)
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("resolveWithRetries: exhausted %s budget after %d attempts: %v",
+			fatalWithContextLabel(t, failureContext, "resolveWithRetries: exhausted %s budget after %d attempts: %v",
 				resolveRetryBudget, attempt, lastErr)
 		}
 		time.Sleep(postFlipPollInterval)

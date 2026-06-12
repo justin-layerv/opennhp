@@ -86,6 +86,27 @@ which Test prefixes are SSM-required and so legitimately omitted
 from the tier3-no-ssm RUN_FILTER. Update it when a test gains or
 loses a hard SSM dependency.
 
+`10_`, `15_`, and `17_` intentionally exercise the qURL resolve path,
+which opens the AC `defaultset` pinhole for the smoke runner's source
+IP for the env's OpenTime window. `17_qurl_router_authz_gate_test.go`
+is the source of truth for the detailed L3 precondition assumptions.
+Do not add a later `18_+` smoke test that expects public
+`*.qurl.site:443` to be L3-closed from the same runner IP unless the
+test runs before those resolve-path files or isolates its egress/source
+IP; otherwise it will inherit the still-open pinhole and false-pass.
+When PR3 makes smoke required, explicitly revisit whether `17_` should
+remain one fail-loud required status or split qURL resolve precondition
+and no-cookie gate assertion into separate statuses. The current default
+is fail-loud with the `L3 precondition for qurl-router authz smoke`
+context so an Auth0 M2M/qurl-service outage cannot skip a security fence.
+Include the Auth0/qurl-service capacity footprint and worst-case runtime
+(45s resolve retry budget plus 15s post-resolve probe budget) in that
+PR3 decision instead of inheriting today's report-only trade-off silently.
+During burn-in, track `17_` failures that mention pre-TLS EOF/timeout retries
+exhausting or timeouts after TLS completion; those are the likely AC
+drain/slow-path noise shapes to understand before promoting the smoke to
+required.
+
 ### Deploy-mode tier mapping
 
 NHP runs two deployment regimes side-by-side. The runtime source of
