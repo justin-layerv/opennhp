@@ -238,14 +238,40 @@ qurl_scanner_lambda_enabled = true
 # for the full rationale (ordering / rollback de-atomization risk /
 # operator gates).
 #
-# STAYS FALSE in this PR — plumbing-only. The actual sandbox flip
-# rides a tiny follow-up PR (1-line change to true) merged only
-# after qurl-service main ships a confirmed-healthy qurl-api image.
-# The build-and-push.yml workflow auto-applies any `terraform/**`
-# change on push to main, so merging this PR with the flag at true
-# would auto-activate the producer immediately, before any operator
-# gate could fire — exactly the unsafe path cr round-5 flagged.
-qurl_scanner_sqs_emit_enabled = false
+# Gate met 2026-06-12: qurl-service main is pinned at 7791fcc
+# (`fix(ci): publish scanner lambda image without attestations (#914)`),
+# the SSM-tracked `/layerv-nhp-sandbox/qurl-api-image-tag` carries that
+# SHA, and the qurl-api ECS deployment under
+# `layerv-nhp-sandbox-cell0-qurl-api` completed cleanly with zero failed
+# tasks at 2026-06-12T00:53Z. Operator-verified healthy → flipping the
+# data-path on.
+#
+# On merge, build-and-push.yml auto-applies the `terraform/**` change
+# on push to main, which:
+#   1. Updates the scanner Lambda env to `QURL_SCANNER_EMIT_MODE=sqs` +
+#      `QURL_SCANNER_SQS_QUEUE_URL=<resource_lifecycle_queue.url>` —
+#      next 1-min EventBridge tick emits to SQS.
+#   2. Rolls the qurl-api ECS task def to add
+#      `WEBHOOK_EVENTS_CONSUMER_ENABLED=true` +
+#      `WEBHOOK_EVENTS_SQS_QUEUE_URL=<same URL>` — consumer goroutine
+#      wakes and starts draining.
+#
+# Ordering note: the Lambda env update and the ECS task-def revision
+# are independent resources in the Terraform graph, but in wall-clock
+# the Lambda env applies near-instantly while the ECS rolling deploy
+# takes minutes — so producer effectively flips ahead of consumer. A
+# short window where the scanner emits to SQS before the consumer is
+# draining is harmless: the main `resource_lifecycle` queue retains
+# `message_retention_seconds = 345600` (4 days), well past the
+# minutes-scale ECS roll. Per `modules/qurl-service/resource_lifecycle_queue.tf`
+# the 4-day bound is "long enough for an ops incident to investigate,
+# short enough that any logical-bug leak evaporates" — the matching DLQ
+# carries 14d for forensic triage past the long weekend.
+#
+# Rollback: flip back to `false` and re-apply. Lambda goes log-only,
+# main queue retains buffered messages until 4d retention reaps them
+# (14d for the DLQ if the consumer fails 3× redeliveries first).
+qurl_scanner_sqs_emit_enabled = true
 
 # Domain configuration for QURL API
 # Certificate is created automatically via Terraform when domain is set
