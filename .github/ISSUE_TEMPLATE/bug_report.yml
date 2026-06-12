@@ -66,6 +66,7 @@ body:
         - agent
         - server
         - ac
+        - admin
         - db
         - nhp
         - internalauth

@@ -23,6 +23,7 @@ Commit format and full details: see [`docs/COMMIT_CONVENTION.md`](docs/COMMIT_CO
 | Scope | Component |
 |-------|-----------|
 | `ac` | Access Controller |
+| `admin` | Operator/admin tooling (including `endpoints/licenseadmin`) |
 | `server` | NHP Server |
 | `agent` | NHP Agent |
 | `db` | Database service |

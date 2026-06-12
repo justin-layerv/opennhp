@@ -27,8 +27,10 @@ provisioned key can never silently mismatch a legitimate AC registration.
 
 > The tool is intentionally **decoupled from package server**: it does not
 > import the NHP server runtime (and so does not inherit the KBS /
-> confidential-containers init side-effects). It talks only to the
-> `nhp-licenses` DynamoDB table.
+> confidential-containers init side-effects). These license subcommands talk
+> only to the `nhp-licenses` DynamoDB table; the same binary also carries
+> separate F5 AC-assignment commands documented in
+> `docs/runbooks/f5-revoked-pubkey-paging.md`.
 
 > **Maintainer caveat:** this tool mutates `bound_pubkeys` with `UpdateItem`
 > (partial update), which is what lets it preserve the server-owned attributes
@@ -50,7 +52,9 @@ read-only by design — use an operator/admin role, not the server role.
 Flags go **after** the subcommand (e.g. `bind --operator x --license-sha256 …`):
 `--region` (default `us-east-2`), `--licenses-table` (default `nhp-licenses`),
 `--endpoint` (local dev only), `--operator` (your identity, required for
-mutations; recorded in the audit line).
+mutations; recorded in the audit line). For shared admin shells,
+`NHP_ADMIN_OPERATOR` / `NHP_ADMIN_AUDIT_FILE` intentionally win over the legacy
+`NHP_LICENSE_ADMIN_*` aliases; legacy-only scripts keep working via fallback.
 
 A license is selected by **either** `--license-sha256` (the table partition key,
 which is all you can read back from the table — the plaintext key is shown only
@@ -211,8 +215,8 @@ live **only** in this record, so:
 
 - Always pass `--audit-file <path>` (or capture stderr) into your ops log —
   otherwise a script that discards stderr loses the entire mutation record.
-- `--operator` is a **self-asserted, advisory** label (any string the caller
-  passes); it is not authenticated.
+- `--operator` is a **self-asserted, advisory** label (up to 256 bytes after
+  trimming); it is not authenticated.
 
 For a durable, non-repudiable **who/when** (the IAM principal that performed the
 write), rely on CloudTrail — but note two caveats:
@@ -235,6 +239,9 @@ line — including to `--audit-file` — by design, mirroring CloudTrail, which 
 no `UpdateItem` to record in those cases. So `--audit-file` is a record of
 mutations, not a complete invocation log; if you need the latter, also capture
 stdout/stderr.
+
+The F5 `revoke` / `unrevoke` commands have a separate incident-response audit
+contract: they emit an audit line for no-op attempts too, with `changed:false`.
 
 ## Known gap: etcd backend
 

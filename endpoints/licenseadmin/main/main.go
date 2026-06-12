@@ -1,5 +1,5 @@
-// Command nhp-license-admin provisions the License.BoundPubKeys allowlist that
-// the server-side license_pubkey_gate (#1155) enforces.
+// Command nhp-license-admin provisions security-critical license and
+// AC-assignment pubkey lists that server-side gates enforce.
 //
 // Background: the console repo that historically wrote nhp-licenses rows was
 // archived, so the BoundPubKeys provisioning workflow (#1262) now lives here.
@@ -14,12 +14,15 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -30,14 +33,24 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/version"
 )
 
+const (
+	acAssignmentDefaultCacheTTL      = "60s"
+	acAssignmentReassignmentCacheTTL = "5s"
+	maxOperatorLabelBytes            = 256
+)
+
 func main() {
 	app := &cli.App{
 		Name:    "nhp-license-admin",
-		Usage:   "provision License.BoundPubKeys allowlists for the #1155 license_pubkey_gate",
+		Usage:   "manage NHP license pubkey allowlists and AC revoked-pubkey denylists",
 		Version: version.Version,
 		Description: strings.TrimSpace(`
 Binds AC static public keys to NHP license records so the server-side
 license_pubkey_gate (#1155) can be flipped from permit to strict.
+
+Also manages ACAssignment.RevokedPubKeys for the F5 runtime-revocation gate
+(#1507): revoke adds a compromised AC pubkey to one acId's denylist, unrevoke
+removes it, and list-revoked inspects the current set.
 
 Writes the bound_pubkeys allowlist on the nhp-licenses DynamoDB table. Every
 pubkey is validated as padded standard base64 (RFC 4648 §4) of a 32-byte
@@ -45,12 +58,14 @@ curve25519 key and stored in canonical form, so a provisioned key can never
 silently mismatch a legitimate AC registration (which would look exactly like
 a #1155 attack).
 
-Run with AWS credentials for a role holding dynamodb:GetItem + dynamodb:UpdateItem
-on the licenses table. Flags go AFTER the subcommand (e.g. "bind --operator x
---license-sha256 ..."). The before/after audit record is the JSON line on stderr
-(and --audit-file, if set) — capture it: CloudTrail does NOT carry the before/after
-allowlist values, and DynamoDB data-plane events (the IAM-principal who/when) are
-off by default on the table. --operator is a self-asserted, advisory label.
+Run with AWS credentials for a role holding dynamodb:GetItem plus
+dynamodb:UpdateItem on the target table: nhp-licenses for license mutations and
+nhp-ac-assignments for revoke/unrevoke. Flags go AFTER the subcommand (e.g.
+"bind --operator x --license-sha256 ..."). The mutation audit record is the JSON
+line on stderr (and --audit-file, if set) — capture it. CloudTrail does NOT carry
+the before/after license allowlist values or the resulting revoked-pubkey set,
+and DynamoDB data-plane events (the IAM-principal who/when) are off by default on
+the table. --operator is a self-asserted, advisory label capped at 256 bytes.
 
 Strict-flip runbook: docs/runbooks/license-pubkey-strict-flip.md`),
 		Commands: []*cli.Command{
@@ -58,6 +73,9 @@ Strict-flip runbook: docs/runbooks/license-pubkey-strict-flip.md`),
 			bindCommand(),
 			unbindCommand(),
 			resetCommand(),
+			listRevokedCommand(),
+			revokeCommand(),
+			unrevokeCommand(),
 		},
 	}
 
@@ -90,25 +108,49 @@ func selectorFlags() []cli.Flag {
 
 // connectionFlags configure which table the command talks to.
 func connectionFlags() []cli.Flag {
-	return []cli.Flag{
-		&cli.StringFlag{Name: "region", Value: "us-east-2", EnvVars: []string{"AWS_REGION"}, Usage: "AWS region of the licenses table"},
+	return dynamoConnectionFlags(
+		"AWS region of the licenses table",
 		&cli.StringFlag{Name: "licenses-table", Value: "nhp-licenses", Usage: "DynamoDB licenses table name"},
-		&cli.StringFlag{Name: "endpoint", Usage: "custom DynamoDB endpoint (local development only)"},
-	}
+	)
 }
 
 func operatorFlag() cli.Flag {
-	return &cli.StringFlag{Name: "operator", EnvVars: []string{"NHP_LICENSE_ADMIN_OPERATOR"}, Usage: "identity of the admin running the command (recorded in the audit log)"}
+	// NHP_ADMIN_* is the preferred cross-admin namespace. The older
+	// NHP_LICENSE_ADMIN_* names remain as fallback-only compatibility aliases,
+	// so a shell exporting both intentionally gets the generic value.
+	return &cli.StringFlag{Name: "operator", EnvVars: []string{"NHP_ADMIN_OPERATOR", "NHP_LICENSE_ADMIN_OPERATOR"}, Usage: "identity of the admin running the command (recorded in the audit log; max 256 bytes)"}
 }
 
 func auditFileFlag() cli.Flag {
-	return &cli.StringFlag{Name: "audit-file", EnvVars: []string{"NHP_LICENSE_ADMIN_AUDIT_FILE"}, Usage: "append the JSON audit line to this file for a durable record (stderr always gets it too)"}
+	return &cli.StringFlag{Name: "audit-file", EnvVars: []string{"NHP_ADMIN_AUDIT_FILE", "NHP_LICENSE_ADMIN_AUDIT_FILE"}, Usage: "append the JSON audit line to this file for a durable record (stderr always gets it too)"}
 }
 
 // commandFlags composes the selector + connection flags shared by every command
 // with any command-specific extras.
 func commandFlags(extra ...cli.Flag) []cli.Flag {
 	flags := append(selectorFlags(), connectionFlags()...)
+	return append(flags, extra...)
+}
+
+func assignmentConnectionFlags() []cli.Flag {
+	return dynamoConnectionFlags(
+		"AWS region of the AC assignments table (set --region or AWS_REGION if the incident profile points elsewhere)",
+		&cli.StringFlag{Name: "ac-assignments-table", Value: "nhp-ac-assignments", Usage: "DynamoDB AC assignments table name"},
+	)
+}
+
+func dynamoConnectionFlags(regionUsage string, tableFlag cli.Flag) []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{Name: "region", Value: "us-east-2", EnvVars: []string{"AWS_REGION"}, Usage: regionUsage},
+		tableFlag,
+		&cli.StringFlag{Name: "endpoint", Usage: "custom DynamoDB endpoint (local development only)"},
+	}
+}
+
+func assignmentCommandFlags(extra ...cli.Flag) []cli.Flag {
+	flags := append(assignmentConnectionFlags(),
+		&cli.StringFlag{Name: "ac-id", Required: true, Usage: "AC assignment id (ac_id partition key)"},
+	)
 	return append(flags, extra...)
 }
 
@@ -215,6 +257,125 @@ func resetCommand() *cli.Command {
 	}
 }
 
+func listRevokedCommand() *cli.Command {
+	return listRevokedCommandWithDeps(func(c *cli.Context) (assignmentReader, error) {
+		return openAssignmentClient(c)
+	}, os.Stdout)
+}
+
+func listRevokedCommandWithDeps(open func(*cli.Context) (assignmentReader, error), out io.Writer) *cli.Command {
+	return &cli.Command{
+		Name:  "list-revoked",
+		Usage: "print the revoked_pubkeys denylist for an AC assignment",
+		Flags: assignmentCommandFlags(),
+		Action: func(c *cli.Context) error {
+			client, err := open(c)
+			if err != nil {
+				return cli.Exit(err, 1)
+			}
+			if err := runListRevoked(c.Context, client, out, c.String("ac-id")); err != nil {
+				return cli.Exit(err, 1)
+			}
+			return nil
+		},
+	}
+}
+
+func revokeCommand() *cli.Command {
+	return revokeCommandWithDeps(openAssignmentStore, os.Stdout)
+}
+
+func revokeCommandWithDeps(open func(*cli.Context) (assignmentStore, error), out io.Writer) *cli.Command {
+	return &cli.Command{
+		Name:  "revoke",
+		Usage: "add an AC pubkey to one AC assignment's revoked-pubkey denylist",
+		Flags: assignmentCommandFlags(operatorFlag(), auditFileFlag(),
+			&cli.StringFlag{Name: "pubkey", Aliases: []string{"k"}, Required: true, Usage: "AC static pubkey to revoke (padded standard base64)"},
+		),
+		Action: func(c *cli.Context) error {
+			operator, acID, pubkey, client, err := assignmentPubKeyMutationSetupWithDeps(c, "revoke", open)
+			if err != nil {
+				return cli.Exit(err, 1)
+			}
+			return withRetryOnExhaust(c.Context, func() error {
+				return runRevoke(c.Context, client, out, c.String("audit-file"), operator, acID, pubkey)
+			}, acRetryExhaustionAudit(c, "revoke", operator, acID, pubkey))
+		},
+	}
+}
+
+func openAssignmentStore(c *cli.Context) (assignmentStore, error) {
+	return openAssignmentClient(c)
+}
+
+func acRetryExhaustionAudit(c *cli.Context, action, operator, acID, pubkey string) func(error) {
+	return func(err error) {
+		emitACErrorAudit(c.String("audit-file"), action, operator, acID, pubkey, err)
+	}
+}
+
+func unrevokeCommand() *cli.Command {
+	return unrevokeCommandWithDeps(openAssignmentStore, os.Stdout)
+}
+
+func unrevokeCommandWithDeps(open func(*cli.Context) (assignmentStore, error), out io.Writer) *cli.Command {
+	return &cli.Command{
+		Name:  "unrevoke",
+		Usage: "remove an AC pubkey from one AC assignment's revoked-pubkey denylist",
+		Flags: assignmentCommandFlags(operatorFlag(), auditFileFlag(),
+			&cli.StringFlag{Name: "pubkey", Aliases: []string{"k"}, Required: true, Usage: "AC static pubkey to unrevoke (padded standard base64)"},
+		),
+		Action: func(c *cli.Context) error {
+			operator, acID, pubkey, client, err := assignmentPubKeyMutationSetupWithDeps(c, "unrevoke", open)
+			if err != nil {
+				return cli.Exit(err, 1)
+			}
+			return withRetryOnExhaust(c.Context, func() error {
+				return runUnrevoke(c.Context, client, out, c.String("audit-file"), operator, acID, pubkey)
+			}, acRetryExhaustionAudit(c, "unrevoke", operator, acID, pubkey))
+		},
+	}
+}
+
+func assignmentPubKeyMutationSetupWithDeps(c *cli.Context, action string, open func(*cli.Context) (assignmentStore, error)) (operator, acID, pubkey string, client assignmentStore, err error) {
+	if operator, acID, pubkey, err = assignmentPubKeyMutationInputs(c, action); err != nil {
+		return "", "", "", nil, err
+	}
+	if client, err = open(c); err != nil {
+		emitACErrorAudit(c.String("audit-file"), action, operator, acID, pubkey, err)
+		return "", "", "", nil, err
+	}
+	return operator, acID, pubkey, client, nil
+}
+
+func assignmentPubKeyMutationInputs(c *cli.Context, action string) (operator, acID, pubkey string, err error) {
+	if operator, err = requireOperator(c); err != nil {
+		// Without a valid operator label there is no useful AC-audit subject; fail
+		// before emitting the rejected attempt.
+		return "", "", "", err
+	}
+	acID = strings.TrimSpace(c.String("ac-id"))
+	if acID == "" {
+		// cli/v2 Required catches an absent flag; keep this trim check for
+		// whitespace-only values so rejected attempts still get an audit line.
+		err = errors.New("--ac-id is required")
+		emitACErrorAudit(c.String("audit-file"), action, operator, acID, c.String("pubkey"), err)
+		return "", "", "", err
+	}
+	// Canonicalize before AWS config/client construction so malformed pubkey
+	// input fails fast and can be audited without making any network calls. The
+	// store layer still revalidates to keep AssignmentClient safe for non-CLI
+	// callers.
+	if pubkey, err = licenseadmin.CanonicalizeBoundPubKey(c.String("pubkey")); err != nil {
+		emitACErrorAudit(c.String("audit-file"), action, operator, acID, c.String("pubkey"), err)
+		return "", "", "", err
+	}
+	if strings.TrimSpace(c.String("audit-file")) == "" {
+		fmt.Fprintln(os.Stderr, "warning: no --audit-file set; the mutation audit record will go only to stderr — capture stderr, or set --audit-file / NHP_ADMIN_AUDIT_FILE / NHP_LICENSE_ADMIN_AUDIT_FILE for a durable record")
+	}
+	return operator, acID, pubkey, nil
+}
+
 // resolveSHA256 derives the licenses-table partition key from the selector
 // flags and the NHP_LICENSE_KEY env fallback. The flag-free logic lives in
 // resolveLicenseSHA256 so it is unit-testable without a cli.Context.
@@ -274,11 +435,7 @@ func isHex64(s string) bool {
 
 func openClient(c *cli.Context) (*licenseadmin.Client, error) {
 	endpoint := c.String("endpoint")
-	if endpoint != "" {
-		// Make a local-dev override loud — a mis-set endpoint silently points
-		// writes at the wrong DynamoDB.
-		fmt.Fprintf(os.Stderr, "warning: using custom DynamoDB endpoint %q (local-development override)\n", endpoint)
-	}
+	warnIfCustomEndpoint(endpoint)
 	return licenseadmin.NewClient(c.Context, licenseadmin.Config{
 		Region:        c.String("region"),
 		LicensesTable: c.String("licenses-table"),
@@ -286,10 +443,31 @@ func openClient(c *cli.Context) (*licenseadmin.Client, error) {
 	})
 }
 
+func openAssignmentClient(c *cli.Context) (*licenseadmin.AssignmentClient, error) {
+	endpoint := c.String("endpoint")
+	warnIfCustomEndpoint(endpoint)
+	return licenseadmin.NewAssignmentClient(c.Context, licenseadmin.AssignmentConfig{
+		Region:             c.String("region"),
+		ACAssignmentsTable: c.String("ac-assignments-table"),
+		Endpoint:           endpoint,
+	})
+}
+
+// warnIfCustomEndpoint makes a local-dev --endpoint override loud — a mis-set
+// endpoint silently points writes at the wrong DynamoDB.
+func warnIfCustomEndpoint(endpoint string) {
+	if endpoint != "" {
+		fmt.Fprintf(os.Stderr, "warning: using custom DynamoDB endpoint %q (local-development override)\n", endpoint)
+	}
+}
+
 func requireOperator(c *cli.Context) (string, error) {
 	op := strings.TrimSpace(c.String("operator"))
 	if op == "" {
-		return "", errors.New("--operator is required for mutations (set --operator or NHP_LICENSE_ADMIN_OPERATOR)")
+		return "", errors.New("--operator is required for mutations (set --operator, NHP_ADMIN_OPERATOR, or NHP_LICENSE_ADMIN_OPERATOR)")
+	}
+	if len(op) > maxOperatorLabelBytes {
+		return "", fmt.Errorf("--operator must be at most %d bytes after trimming", maxOperatorLabelBytes)
 	}
 	return op, nil
 }
@@ -304,7 +482,7 @@ func mutationSetup(c *cli.Context) (operator, sha string, client *licenseadmin.C
 	// --audit-file the before/after lives only on stderr (CloudTrail doesn't
 	// carry it), so a script that discards stderr loses the mutation record.
 	if strings.TrimSpace(c.String("audit-file")) == "" {
-		fmt.Fprintln(os.Stderr, "warning: no --audit-file set; the before/after audit record will go only to stderr — capture stderr, or set --audit-file / NHP_LICENSE_ADMIN_AUDIT_FILE for a durable record")
+		fmt.Fprintln(os.Stderr, "warning: no --audit-file set; the before/after audit record will go only to stderr — capture stderr, or set --audit-file / NHP_ADMIN_AUDIT_FILE / NHP_LICENSE_ADMIN_AUDIT_FILE for a durable record")
 	}
 	if sha, err = resolveSHA256(c); err != nil {
 		return "", "", nil, err
@@ -321,6 +499,10 @@ func mutationSetup(c *cli.Context) (operator, sha string, client *licenseadmin.C
 // aborts immediately. The backoff honors ctx, so Ctrl-C / SIGTERM interrupts it
 // crisply instead of waiting out the sleep.
 func withRetry(ctx context.Context, fn func() error) error {
+	return withRetryOnExhaust(ctx, fn, nil)
+}
+
+func withRetryOnExhaust(ctx context.Context, fn func() error, onExhaust func(error)) error {
 	const maxAttempts = 4
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -335,12 +517,32 @@ func withRetry(ctx context.Context, fn func() error) error {
 		if attempt < maxAttempts {
 			select {
 			case <-ctx.Done():
-				return cli.Exit(fmt.Errorf("interrupted during retry backoff: %w", ctx.Err()), 1)
-			case <-time.After(time.Duration(attempt) * 50 * time.Millisecond):
+				err := fmt.Errorf("interrupted during retry backoff: %w", ctx.Err())
+				if onExhaust != nil {
+					onExhaust(err)
+				}
+				return cli.Exit(err, 1)
+			case <-time.After(retryBackoff(attempt)):
 			}
 		}
 	}
-	return cli.Exit(fmt.Errorf("aborted after %d retries due to concurrent modification: %w", maxAttempts, lastErr), 1)
+	err := fmt.Errorf("aborted after %d retries due to concurrent modification: %w", maxAttempts, lastErr)
+	if onExhaust != nil {
+		onExhaust(err)
+	}
+	return cli.Exit(err, 1)
+}
+
+func retryBackoff(attempt int) time.Duration {
+	base := time.Duration(attempt) * 50 * time.Millisecond
+	return base + retryJitter()
+}
+
+func retryJitter() time.Duration {
+	// Backoff jitter is only scheduling decorrelation; cryptographic
+	// unpredictability is irrelevant and would just burn entropy.
+	// #nosec G404 -- decorrelation only; not security-sensitive.
+	return rand.N(25 * time.Millisecond)
 }
 
 func printList(out io.Writer, label string, keys []string) {
@@ -361,9 +563,31 @@ type licenseStore interface {
 	UpdateBoundPubKeys(ctx context.Context, licenseKeySHA256 string, boundPubKeys []string, expectedUpdatedAt int64) (int64, error)
 }
 
+type assignmentReader interface {
+	GetACAssignment(ctx context.Context, acID string) (*licenseadmin.ACAssignment, error)
+}
+
+type assignmentStore interface {
+	assignmentReader
+	AddRevokedPubKey(ctx context.Context, acID, pubkey string) (*licenseadmin.ACAssignment, string, bool, error)
+	RemoveRevokedPubKey(ctx context.Context, acID, pubkey string) (*licenseadmin.ACAssignment, string, bool, error)
+}
+
 // runBind / runUnbind / runReset are the command cores: one read-modify-write
 // pass each, returning raw errors so withRetry can classify conflicts. They take
 // a licenseStore + io.Writer so the no-op and guard branches are unit-testable.
+
+func runListRevoked(ctx context.Context, store assignmentReader, out io.Writer, acID string) error {
+	assignment, err := store.GetACAssignment(ctx, acID)
+	if err != nil {
+		if errors.Is(err, licenseadmin.ErrACAssignmentNotFound) {
+			return fmt.Errorf("%w (assigned ACs with an empty denylist print revoked_pubkeys: none)", err)
+		}
+		return err
+	}
+	printRevokedAssignment(out, assignment)
+	return nil
+}
 
 func runBind(ctx context.Context, store licenseStore, out io.Writer, auditFile, operator, sha string, canonPubkeys []string) error {
 	lic, err := store.GetLicense(ctx, sha)
@@ -442,6 +666,94 @@ func runReset(ctx context.Context, store licenseStore, out io.Writer, auditFile,
 	return nil
 }
 
+func runRevoke(ctx context.Context, store assignmentStore, out io.Writer, auditFile, operator, acID, pubkey string) error {
+	assignment, canon, changed, err := store.AddRevokedPubKey(ctx, acID, pubkey)
+	if err != nil {
+		if !errors.Is(err, licenseadmin.ErrConcurrentModification) {
+			emitACErrorAudit(auditFile, "revoke", operator, acID, pubkey, err)
+		}
+		return err
+	}
+	emitACAudit(auditFile, "revoke", operator, acID, canon, changed, assignment.Version, assignment.RevokedPubKeys)
+	if !changed {
+		fmt.Fprintf(out, "no change: pubkey already revoked for AC %s (version unchanged)\n", acID)
+		if revokedPubKeyDirtyTrimPresent(assignment.RevokedPubKeys, canon) {
+			fmt.Fprintln(out, "note: a legacy non-canonical revoked_pubkeys entry also matches this pubkey; direct DynamoDB cleanup of the legacy member may still be needed")
+		}
+		printRevokedAssignment(out, assignment)
+		return nil
+	}
+	fmt.Fprintf(out, "revoked pubkey for AC %s (version %d)\n", acID, assignment.Version)
+	if revokedPubKeyDirtyTrimPresent(assignment.RevokedPubKeys, canon) {
+		fmt.Fprintln(out, "note: a legacy non-canonical revoked_pubkeys entry already matched this pubkey at the gate; canonical duplicate was added, but direct DynamoDB cleanup of the legacy member may still be needed")
+	} else {
+		printACAssignmentPropagation(out, "reject the next registration")
+	}
+	printRevokedAssignment(out, assignment)
+	return nil
+}
+
+func runUnrevoke(ctx context.Context, store assignmentStore, out io.Writer, auditFile, operator, acID, pubkey string) error {
+	assignment, canon, changed, err := store.RemoveRevokedPubKey(ctx, acID, pubkey)
+	if err != nil {
+		if !errors.Is(err, licenseadmin.ErrConcurrentModification) {
+			emitACErrorAudit(auditFile, "unrevoke", operator, acID, pubkey, err)
+		}
+		return err
+	}
+	emitACAudit(auditFile, "unrevoke", operator, acID, canon, changed, assignment.Version, assignment.RevokedPubKeys)
+	if !changed {
+		fmt.Fprintf(out, "no change: pubkey was not revoked for AC %s (version unchanged)\n", acID)
+		printRevokedAssignment(out, assignment)
+		return nil
+	}
+	fmt.Fprintf(out, "unrevoked pubkey for AC %s (version %d)\n", acID, assignment.Version)
+	if revokedPubKeyDirtyTrimPresent(assignment.RevokedPubKeys, canon) {
+		fmt.Fprintln(out, "warning: a non-canonical revoked_pubkeys entry still matches this pubkey after trimming; servers may keep rejecting until that legacy entry is cleaned directly in DynamoDB")
+	} else {
+		printACAssignmentPropagation(out, "stop rejecting")
+	}
+	printRevokedAssignment(out, assignment)
+	return nil
+}
+
+func printACAssignmentPropagation(out io.Writer, behavior string) {
+	// These strings mirror the F5 runbook and the server-side assignment-cache
+	// TTLs without importing package server, whose init side effects are not
+	// appropriate for the operator CLI.
+	fmt.Fprintf(out, "propagation: servers %s after their AC-assignment cache refreshes (normally <=%s; <=%s during reassignment)\n",
+		behavior, acAssignmentDefaultCacheTTL, acAssignmentReassignmentCacheTTL)
+}
+
+func printRevokedAssignment(out io.Writer, assignment *licenseadmin.ACAssignment) {
+	if assignment == nil {
+		fmt.Fprintln(out, "revoked_pubkeys: (unknown)")
+		return
+	}
+	fmt.Fprintf(out, "ac_id: %s\nversion: %d\n", assignment.ACID, assignment.Version)
+	keys := sortedNonNil(assignment.RevokedPubKeys)
+	if len(keys) == 0 {
+		fmt.Fprintln(out, "revoked_pubkeys: (none)")
+		return
+	}
+	fmt.Fprintf(out, "revoked_pubkeys (%d):\n", len(keys))
+	for _, k := range keys {
+		fmt.Fprintf(out, "  - %s\n", k)
+	}
+}
+
+// revokedPubKeyDirtyTrimPresent detects legacy entries that still match the
+// server gate's trim semantics after DynamoDB's exact-match ADD/DELETE.
+func revokedPubKeyDirtyTrimPresent(keys []string, pubkey string) bool {
+	target := strings.TrimSpace(pubkey)
+	for _, key := range keys {
+		if strings.TrimSpace(key) == target && key != target {
+			return true
+		}
+	}
+	return false
+}
+
 // emitAudit writes a structured audit line to stderr. It complements — does not
 // replace — the CloudTrail record of the DynamoDB mutation, which is the
 // authoritative tamper-evident who/when source.
@@ -489,16 +801,93 @@ func emitAudit(auditFile, action, operator, sha string, before, after, changed [
 	b, err := json.Marshal(rec)
 	if err != nil {
 		// Never silently drop the audit record — fall back to a readable form.
-		fmt.Fprintf(os.Stderr, "audit(json-marshal-failed) action=%s operator=%s license=%s before=%v after=%v changed=%v: %v\n",
-			action, operator, sha, before, after, changed, err)
+		writeAuditLine(auditFile, fmt.Sprintf("audit(json-marshal-failed) action=%s operator=%s license=%s before=%v after=%v changed=%v: %v",
+			action, operator, sha, before, after, changed, err))
 		return
 	}
-	fmt.Fprintln(os.Stderr, string(b))
-	if auditFile != "" {
-		if ferr := appendAuditLine(auditFile, string(b)); ferr != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to append audit line to %s: %v (the line above on stderr is the only record)\n", auditFile, ferr)
-		}
+	writeAuditLine(auditFile, string(b))
+}
+
+// writeAuditLine emits one JSON audit line to stderr and, if auditFile is set,
+// appends it there too. A file-append failure is surfaced as a warning on
+// stderr so the operator sees the missing-durable-sink condition without
+// losing the record itself.
+func writeAuditLine(auditFile, line string) {
+	fmt.Fprintln(os.Stderr, line)
+	if auditFile == "" {
+		return
 	}
+	if ferr := appendAuditLine(auditFile, line); ferr != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to append audit line to %s: %v (the line above on stderr is the only record)\n", auditFile, ferr)
+	}
+}
+
+type acAuditRecord struct {
+	Audit    string `json:"audit"`
+	Action   string `json:"action"`
+	Operator string `json:"operator"`
+	ACID     string `json:"ac_id"`
+	PubKey   string `json:"pubkey"`
+	Changed  bool   `json:"changed"`
+	Result   string `json:"result"`
+	// Version is the observed assignment version; terminal failure records use 0.
+	Version        int      `json:"version"`
+	RevokedPubKeys []string `json:"revoked_pubkeys"`
+	TS             string   `json:"ts"`
+	Error          string   `json:"error,omitempty"`
+}
+
+func buildACAuditRecord(action, operator, acID, pubkey string, changed bool, version int, revokedPubKeys []string, ts string) acAuditRecord {
+	return acAuditRecord{
+		Audit:          "nhp-license-admin",
+		Action:         action,
+		Operator:       operator,
+		ACID:           acID,
+		PubKey:         pubkey,
+		Changed:        changed,
+		Result:         acAuditResult(changed),
+		Version:        version,
+		RevokedPubKeys: sortedNonNil(revokedPubKeys),
+		TS:             ts,
+	}
+}
+
+func acAuditResult(changed bool) string {
+	if changed {
+		return "mutated"
+	}
+	return "noop"
+}
+
+func buildACErrorAuditRecord(action, operator, acID, pubkey string, err error, ts string) acAuditRecord {
+	rec := buildACAuditRecord(action, operator, acID, canonicalPubKeyForAudit(pubkey), false, 0, nil, ts)
+	rec.Result = "error"
+	if err != nil {
+		rec.Error = err.Error()
+	}
+	return rec
+}
+
+func emitACAudit(auditFile, action, operator, acID, pubkey string, changed bool, version int, revokedPubKeys []string) {
+	rec := buildACAuditRecord(action, operator, acID, pubkey, changed, version, revokedPubKeys, time.Now().UTC().Format(time.RFC3339))
+	b, err := json.Marshal(rec)
+	if err != nil {
+		writeAuditLine(auditFile, fmt.Sprintf("audit(json-marshal-failed) action=%s operator=%s ac_id=%s pubkey=%s changed=%t version=%d revoked_pubkeys=%v: %v",
+			action, operator, acID, pubkey, changed, version, revokedPubKeys, err))
+		return
+	}
+	writeAuditLine(auditFile, string(b))
+}
+
+func emitACErrorAudit(auditFile, action, operator, acID, pubkey string, mutationErr error) {
+	rec := buildACErrorAuditRecord(action, operator, acID, pubkey, mutationErr, time.Now().UTC().Format(time.RFC3339))
+	b, err := json.Marshal(rec)
+	if err != nil {
+		writeAuditLine(auditFile, fmt.Sprintf("audit(json-marshal-failed) action=%s operator=%s ac_id=%s pubkey=%s error=%q: %v",
+			action, operator, acID, pubkey, mutationErr, err))
+		return
+	}
+	writeAuditLine(auditFile, string(b))
 }
 
 // appendAuditLine appends one line to path, creating it if needed. The write
@@ -524,6 +913,22 @@ func nonNil(s []string) []string {
 		return []string{}
 	}
 	return s
+}
+
+func sortedNonNil(s []string) []string {
+	out := slices.Clone(nonNil(s))
+	slices.Sort(out)
+	return out
+}
+
+func canonicalPubKeyForAudit(pubkey string) string {
+	canon, err := licenseadmin.CanonicalizeBoundPubKey(pubkey)
+	if err != nil {
+		trimmed := strings.TrimSpace(pubkey)
+		sum := sha256.Sum256([]byte(trimmed))
+		return fmt.Sprintf("<invalid pubkey len=%d sha256=%x>", len(trimmed), sum[:8])
+	}
+	return canon
 }
 
 // gatherCanonicalPubkeys merges the repeatable --pubkey values with the

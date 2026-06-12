@@ -2,12 +2,16 @@ package licenseadmin
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
@@ -44,6 +48,34 @@ func testPubkeyB64(seed byte) string {
 		k[i] = seed + byte(i)
 	}
 	return base64.StdEncoding.EncodeToString(k)
+}
+
+type fakeAssignmentDDB struct {
+	updateErr error
+	updateOut *dynamodb.UpdateItemOutput
+	getOut    *dynamodb.GetItemOutput
+	getErr    error
+
+	updateCalls int
+	getCalls    int
+	lastGetKey  map[string]types.AttributeValue
+}
+
+func (f *fakeAssignmentDDB) UpdateItem(context.Context, *dynamodb.UpdateItemInput, ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	f.updateCalls++
+	if f.updateErr != nil {
+		return nil, f.updateErr
+	}
+	return f.updateOut, nil
+}
+
+func (f *fakeAssignmentDDB) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	f.getCalls++
+	f.lastGetKey = in.Key
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	return f.getOut, nil
 }
 
 func TestCanonicalizeBoundPubKey(t *testing.T) {
@@ -251,6 +283,399 @@ func TestBuildBoundPubKeysUpdateOptimisticLock(t *testing.T) {
 	}
 }
 
+func TestACAssignmentUnmarshalToleratesStringSet(t *testing.T) {
+	k1, k2 := testPubkeyB64(1), testPubkeyB64(2)
+	item := map[string]types.AttributeValue{
+		"ac_id":           &types.AttributeValueMemberS{Value: "ac-1"},
+		"version":         &types.AttributeValueMemberN{Value: "7"},
+		"revoked_pubkeys": &types.AttributeValueMemberSS{Value: []string{k1, k2}},
+	}
+	var assignment ACAssignment
+	if err := attributevalue.UnmarshalMap(item, &assignment); err != nil {
+		t.Fatalf("unmarshal SS: %v", err)
+	}
+	if assignment.ACID != "ac-1" || assignment.Version != 7 {
+		t.Fatalf("assignment = %+v", assignment)
+	}
+	seen := map[string]bool{assignment.RevokedPubKeys[0]: true, assignment.RevokedPubKeys[1]: true}
+	if !seen[k1] || !seen[k2] {
+		t.Fatalf("got %v, want {%s, %s}", assignment.RevokedPubKeys, k1, k2)
+	}
+}
+
+func TestGetACAssignmentNotFound(t *testing.T) {
+	ddb := &fakeAssignmentDDB{getOut: &dynamodb.GetItemOutput{}}
+	client := &AssignmentClient{ddb: ddb, table: "nhp-ac-assignments", region: "us-west-2"}
+
+	got, err := client.GetACAssignment(context.Background(), " ac-1 ")
+	if !errors.Is(err, ErrACAssignmentNotFound) {
+		t.Fatalf("err = %v, want wrapping %v", err, ErrACAssignmentNotFound)
+	}
+	if !strings.Contains(err.Error(), `region="us-west-2" table="nhp-ac-assignments"`) {
+		t.Fatalf("err = %v, want region/table context", err)
+	}
+	if got != nil {
+		t.Fatalf("assignment = %#v, want nil", got)
+	}
+	if ddb.getCalls != 1 || ddb.updateCalls != 0 {
+		t.Fatalf("calls get=%d update=%d, want 1/0", ddb.getCalls, ddb.updateCalls)
+	}
+	assertS(t, ddb.lastGetKey, "ac_id", "ac-1")
+}
+
+func TestGetACAssignmentUnmarshalError(t *testing.T) {
+	ddb := &fakeAssignmentDDB{
+		getOut: &dynamodb.GetItemOutput{Item: map[string]types.AttributeValue{
+			"ac_id":   &types.AttributeValueMemberS{Value: "ac-1"},
+			"version": &types.AttributeValueMemberS{Value: "not-a-number"},
+		}},
+	}
+	client := &AssignmentClient{ddb: ddb, table: "nhp-ac-assignments"}
+
+	got, err := client.GetACAssignment(context.Background(), "ac-1")
+	if err == nil || !strings.Contains(err.Error(), "unmarshal AC assignment ac-1") {
+		t.Fatalf("err = %v, want unmarshal AC assignment context", err)
+	}
+	if got != nil {
+		t.Fatalf("assignment = %#v, want nil", got)
+	}
+	if ddb.getCalls != 1 || ddb.updateCalls != 0 {
+		t.Fatalf("calls get=%d update=%d, want 1/0", ddb.getCalls, ddb.updateCalls)
+	}
+}
+
+func TestBuildRevokedPubKeyUpdateAdd(t *testing.T) {
+	k1 := testPubkeyB64(1)
+	in, canon, err := buildRevokedPubKeyUpdate("nhp-ac-assignments", " ac-1 ", k1, revokedPubKeyAdd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canon != k1 {
+		t.Fatalf("canonical pubkey = %q, want %q", canon, k1)
+	}
+	if got := aws.ToString(in.TableName); got != "nhp-ac-assignments" {
+		t.Errorf("table = %q", got)
+	}
+	wantCondition := "attribute_exists(ac_id) AND (attribute_not_exists(revoked_pubkeys) OR NOT contains(revoked_pubkeys, :pk))"
+	if got := aws.ToString(in.ConditionExpression); got != wantCondition {
+		t.Errorf("condition = %q, want %q", got, wantCondition)
+	}
+	wantUpdate := "SET version = if_not_exists(version, :zero) + :one ADD revoked_pubkeys :pk_set"
+	if got := aws.ToString(in.UpdateExpression); got != wantUpdate {
+		t.Errorf("update = %q, want %q", got, wantUpdate)
+	}
+	if got := in.ReturnValues; got != types.ReturnValueAllNew {
+		t.Errorf("return values = %q, want %q", got, types.ReturnValueAllNew)
+	}
+	if got := in.ReturnValuesOnConditionCheckFailure; got != types.ReturnValuesOnConditionCheckFailureAllOld {
+		t.Errorf("return values on condition failure = %q, want %q", got, types.ReturnValuesOnConditionCheckFailureAllOld)
+	}
+	if keyAV, ok := in.Key["ac_id"].(*types.AttributeValueMemberS); !ok || keyAV.Value != "ac-1" {
+		t.Errorf("key = %#v", in.Key)
+	}
+	assertS(t, in.ExpressionAttributeValues, ":pk", k1)
+	assertSS(t, in.ExpressionAttributeValues, ":pk_set", []string{k1})
+	assertN(t, in.ExpressionAttributeValues, ":zero", "0")
+	assertN(t, in.ExpressionAttributeValues, ":one", "1")
+}
+
+func TestBuildRevokedPubKeyUpdateDelete(t *testing.T) {
+	k1 := testPubkeyB64(1)
+	in, canon, err := buildRevokedPubKeyUpdate("nhp-ac-assignments", "ac-1", k1, revokedPubKeyDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canon != k1 {
+		t.Fatalf("canonical pubkey = %q, want %q", canon, k1)
+	}
+	wantCondition := "attribute_exists(ac_id) AND contains(revoked_pubkeys, :pk)"
+	if got := aws.ToString(in.ConditionExpression); got != wantCondition {
+		t.Errorf("condition = %q, want %q", got, wantCondition)
+	}
+	wantUpdate := "SET version = if_not_exists(version, :zero) + :one DELETE revoked_pubkeys :pk_set"
+	if got := aws.ToString(in.UpdateExpression); got != wantUpdate {
+		t.Errorf("update = %q, want %q", got, wantUpdate)
+	}
+	assertS(t, in.ExpressionAttributeValues, ":pk", k1)
+	assertSS(t, in.ExpressionAttributeValues, ":pk_set", []string{k1})
+}
+
+func TestBuildRevokedPubKeyUpdateRejectsInvalidInput(t *testing.T) {
+	if _, _, err := buildRevokedPubKeyUpdate("", "ac-1", testPubkeyB64(1), revokedPubKeyAdd); err == nil {
+		t.Fatal("expected empty table error")
+	}
+	if _, _, err := buildRevokedPubKeyUpdate("t", " ", testPubkeyB64(1), revokedPubKeyAdd); err == nil {
+		t.Fatal("expected empty ac_id error")
+	}
+	if _, _, err := buildRevokedPubKeyUpdate("t", "ac-1", "bad!!", revokedPubKeyAdd); err == nil {
+		t.Fatal("expected invalid pubkey error")
+	}
+	if _, _, err := buildRevokedPubKeyUpdate("t", "ac-1", testPubkeyB64(1), revokedPubKeyAction("bogus")); err == nil {
+		t.Fatal("expected unknown action error")
+	}
+}
+
+func TestClassifyRevokedPubKeyState(t *testing.T) {
+	k1, k2 := testPubkeyB64(1), testPubkeyB64(2)
+
+	tests := []struct {
+		name        string
+		keys        []string
+		action      revokedPubKeyAction
+		pubkey      string
+		wantChanged bool
+		wantErr     error
+	}{
+		{
+			name:        "add no-op when pubkey already present",
+			action:      revokedPubKeyAdd,
+			pubkey:      k1,
+			wantChanged: false,
+		},
+		{
+			name:    "add conflict when pubkey still absent",
+			action:  revokedPubKeyAdd,
+			pubkey:  k2,
+			wantErr: ErrConcurrentModification,
+		},
+		{
+			name:    "delete legacy whitespace entry is terminal",
+			action:  revokedPubKeyDelete,
+			pubkey:  k1,
+			wantErr: ErrLegacyRevokedPubKeyWhitespace,
+		},
+		{
+			name:    "delete conflict when exact pubkey still present",
+			keys:    []string{k1},
+			action:  revokedPubKeyDelete,
+			pubkey:  k1,
+			wantErr: ErrConcurrentModification,
+		},
+		{
+			name:        "delete no-op when pubkey absent",
+			action:      revokedPubKeyDelete,
+			pubkey:      k2,
+			wantChanged: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			keys := []string{"  " + k1 + "\n"}
+			if tc.keys != nil {
+				keys = tc.keys
+			}
+			assignment := &ACAssignment{ACID: "ac-1", Version: 9, RevokedPubKeys: keys}
+			got, changed, err := classifyRevokedPubKeyState(assignment, "ac-1", tc.pubkey, tc.action)
+			if tc.wantErr != nil {
+				if err == nil || !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want wrapping %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != assignment || changed != tc.wantChanged {
+				t.Fatalf("got assignment=%p changed=%t, want assignment=%p changed=%t", got, changed, assignment, tc.wantChanged)
+			}
+		})
+	}
+}
+
+func TestRevokedPubKeyClientSuccessUnmarshalsUpdatedAssignment(t *testing.T) {
+	k1, k2 := testPubkeyB64(1), testPubkeyB64(2)
+
+	tests := []struct {
+		name       string
+		updateItem ACAssignment
+		call       func(context.Context, *AssignmentClient) (*ACAssignment, string, bool, error)
+		wantCanon  string
+		wantKeys   []string
+	}{
+		{
+			name: "add",
+			updateItem: ACAssignment{
+				ACID:           "ac-1",
+				Version:        8,
+				RevokedPubKeys: []string{k1, k2},
+			},
+			call: func(ctx context.Context, client *AssignmentClient) (*ACAssignment, string, bool, error) {
+				return client.AddRevokedPubKey(ctx, " ac-1 ", k2)
+			},
+			wantCanon: k2,
+			wantKeys:  []string{k1, k2},
+		},
+		{
+			name: "remove",
+			updateItem: ACAssignment{
+				ACID:    "ac-1",
+				Version: 8,
+			},
+			call: func(ctx context.Context, client *AssignmentClient) (*ACAssignment, string, bool, error) {
+				return client.RemoveRevokedPubKey(ctx, " ac-1 ", k1)
+			},
+			wantCanon: k1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ddb := &fakeAssignmentDDB{
+				updateOut: &dynamodb.UpdateItemOutput{Attributes: mustAssignmentItem(t, tc.updateItem)},
+			}
+			client := &AssignmentClient{ddb: ddb, table: "nhp-ac-assignments"}
+
+			got, canon, changed, err := tc.call(context.Background(), client)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !changed {
+				t.Fatal("expected changed=true after successful conditional update")
+			}
+			if got == nil || got.ACID != "ac-1" || got.Version != 8 || !slices.Equal(got.RevokedPubKeys, tc.wantKeys) {
+				t.Fatalf("assignment = %#v, want ac-1 version 8 keys %v", got, tc.wantKeys)
+			}
+			if canon != tc.wantCanon {
+				t.Fatalf("canonical pubkey = %q, want %q", canon, tc.wantCanon)
+			}
+			if ddb.updateCalls != 1 || ddb.getCalls != 0 {
+				t.Fatalf("calls update=%d get=%d, want 1/0", ddb.updateCalls, ddb.getCalls)
+			}
+		})
+	}
+}
+
+func TestAddRevokedPubKeyClassifiesConditionalFailureWithReturnedItem(t *testing.T) {
+	k1 := testPubkeyB64(1)
+	ddb := &fakeAssignmentDDB{
+		updateErr: &types.ConditionalCheckFailedException{Item: mustAssignmentItem(t, ACAssignment{
+			ACID:           "ac-1",
+			Version:        7,
+			RevokedPubKeys: []string{k1},
+		})},
+	}
+	client := &AssignmentClient{ddb: ddb, table: "nhp-ac-assignments"}
+
+	got, canon, changed, err := client.AddRevokedPubKey(context.Background(), " ac-1 ", k1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if canon != k1 {
+		t.Fatalf("canonical pubkey = %q, want %q", canon, k1)
+	}
+	if changed {
+		t.Fatal("expected changed=false after returned item confirms add no-op")
+	}
+	if got == nil || got.Version != 7 || got.ACID != "ac-1" {
+		t.Fatalf("assignment = %#v, want returned ac-1 version 7", got)
+	}
+	if ddb.updateCalls != 1 || ddb.getCalls != 0 {
+		t.Fatalf("calls update=%d get=%d, want 1/0", ddb.updateCalls, ddb.getCalls)
+	}
+}
+
+func TestAddRevokedPubKeyClassifiesConditionalFailureWithFallbackRead(t *testing.T) {
+	k1 := testPubkeyB64(1)
+	ddb := &fakeAssignmentDDB{
+		updateErr: &types.ConditionalCheckFailedException{},
+		getOut: &dynamodb.GetItemOutput{Item: mustAssignmentItem(t, ACAssignment{
+			ACID:           "ac-1",
+			Version:        7,
+			RevokedPubKeys: []string{k1},
+		})},
+	}
+	client := &AssignmentClient{ddb: ddb, table: "nhp-ac-assignments"}
+
+	got, canon, changed, err := client.AddRevokedPubKey(context.Background(), " ac-1 ", k1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if canon != k1 {
+		t.Fatalf("canonical pubkey = %q, want %q", canon, k1)
+	}
+	if changed {
+		t.Fatal("expected changed=false after fallback read confirms add no-op")
+	}
+	if got == nil || got.Version != 7 || got.ACID != "ac-1" {
+		t.Fatalf("assignment = %#v, want fallback-read ac-1 version 7", got)
+	}
+	if ddb.updateCalls != 1 || ddb.getCalls != 1 {
+		t.Fatalf("calls update=%d get=%d, want 1/1", ddb.updateCalls, ddb.getCalls)
+	}
+	assertS(t, ddb.lastGetKey, "ac_id", "ac-1")
+}
+
+func TestAddRevokedPubKeyConditionalFailureMissingAssignment(t *testing.T) {
+	k1 := testPubkeyB64(1)
+	ddb := &fakeAssignmentDDB{
+		updateErr: &types.ConditionalCheckFailedException{},
+		getOut:    &dynamodb.GetItemOutput{},
+	}
+	client := &AssignmentClient{ddb: ddb, region: "us-east-2", table: "nhp-ac-assignments"}
+
+	assignment, canon, changed, err := client.AddRevokedPubKey(context.Background(), " ac-missing ", k1)
+	if !errors.Is(err, ErrACAssignmentNotFound) {
+		t.Fatalf("err = %v, want ErrACAssignmentNotFound", err)
+	}
+	if assignment != nil || changed {
+		t.Fatalf("assignment=%#v changed=%t, want nil/false", assignment, changed)
+	}
+	if canon != k1 {
+		t.Fatalf("canonical pubkey = %q, want %q", canon, k1)
+	}
+	if !strings.Contains(err.Error(), `region="us-east-2" table="nhp-ac-assignments"`) {
+		t.Fatalf("not-found error lacks lookup context: %v", err)
+	}
+	if ddb.updateCalls != 1 || ddb.getCalls != 1 {
+		t.Fatalf("calls update=%d get=%d, want 1/1", ddb.updateCalls, ddb.getCalls)
+	}
+	assertS(t, ddb.lastGetKey, "ac_id", "ac-missing")
+}
+
+func TestRemoveRevokedPubKeyClassifiesLegacyWhitespaceAfterConditionalFailure(t *testing.T) {
+	k1 := testPubkeyB64(1)
+	ddb := &fakeAssignmentDDB{
+		updateErr: &types.ConditionalCheckFailedException{Item: mustAssignmentItem(t, ACAssignment{
+			ACID:           "ac-1",
+			Version:        7,
+			RevokedPubKeys: []string{"  " + k1 + "\n"},
+		})},
+	}
+	client := &AssignmentClient{ddb: ddb, table: "nhp-ac-assignments"}
+
+	_, canon, changed, err := client.RemoveRevokedPubKey(context.Background(), "ac-1", k1)
+	if !errors.Is(err, ErrLegacyRevokedPubKeyWhitespace) {
+		t.Fatalf("err = %v, want wrapping %v", err, ErrLegacyRevokedPubKeyWhitespace)
+	}
+	if canon != k1 {
+		t.Fatalf("canonical pubkey = %q, want %q", canon, k1)
+	}
+	if changed {
+		t.Fatal("expected changed=false on terminal legacy-whitespace classification")
+	}
+	if ddb.updateCalls != 1 || ddb.getCalls != 0 {
+		t.Fatalf("calls update=%d get=%d, want 1/0", ddb.updateCalls, ddb.getCalls)
+	}
+}
+
+func TestRevokedPubKeyPresentTrimsWhitespaceOnly(t *testing.T) {
+	k1 := testPubkeyB64(1)
+	if !revokedPubKeyPresent([]string{"  " + k1 + "\n"}, k1) {
+		t.Fatal("expected whitespace-trimmed match")
+	}
+	if revokedPubKeyPresent([]string{"AB+/"}, "AB-_") {
+		t.Fatal("URL-safe/std-base64 variants must not be normalized together")
+	}
+}
+
+func mustAssignmentItem(t *testing.T, assignment ACAssignment) map[string]types.AttributeValue {
+	t.Helper()
+	item, err := attributevalue.MarshalMap(assignment)
+	if err != nil {
+		t.Fatalf("marshal AC assignment: %v", err)
+	}
+	return item
+}
+
 func assertN(t *testing.T, m map[string]types.AttributeValue, key, want string) {
 	t.Helper()
 	v, ok := m[key].(*types.AttributeValueMemberN)
@@ -259,6 +684,32 @@ func assertN(t *testing.T, m map[string]types.AttributeValue, key, want string) 
 	}
 	if v.Value != want {
 		t.Errorf("%s = %q, want %q", key, v.Value, want)
+	}
+}
+
+func assertS(t *testing.T, m map[string]types.AttributeValue, key, want string) {
+	t.Helper()
+	v, ok := m[key].(*types.AttributeValueMemberS)
+	if !ok {
+		t.Fatalf("%s is not a String: %T", key, m[key])
+	}
+	if v.Value != want {
+		t.Errorf("%s = %q, want %q", key, v.Value, want)
+	}
+}
+
+func assertSS(t *testing.T, m map[string]types.AttributeValue, key string, want []string) {
+	t.Helper()
+	v, ok := m[key].(*types.AttributeValueMemberSS)
+	if !ok {
+		t.Fatalf("%s is not a String Set: %T", key, m[key])
+	}
+	got := slices.Clone(v.Value)
+	want = slices.Clone(want)
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s = %v, want %v", key, v.Value, want)
 	}
 }
 

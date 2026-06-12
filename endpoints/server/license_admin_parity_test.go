@@ -59,6 +59,34 @@ func TestLicenseAdminSchemaParity(t *testing.T) {
 	}
 }
 
+// TestLicenseAdminACAssignmentSchemaParity provides the same drift fence for
+// the F5 operator CLI's ACAssignment mirror. The CLI only needs ac_id, version,
+// and revoked_pubkeys, but those three tags/types are load-bearing: a mismatch
+// would make the CLI mutate a row shape the server-side F5 gate does not read.
+func TestLicenseAdminACAssignmentSchemaParity(t *testing.T) {
+	serverByAttr := dynamodbavByAttr(reflect.TypeOf(ACAssignment{}))
+	adminByAttr := dynamodbavByAttr(reflect.TypeOf(licenseadmin.ACAssignment{}))
+
+	for _, attr := range []string{"ac_id", "version", "revoked_pubkeys"} {
+		if _, ok := adminByAttr[attr]; !ok {
+			t.Fatalf("licenseadmin.ACAssignment must carry %s", attr)
+		}
+	}
+	for attr, admin := range adminByAttr {
+		server, ok := serverByAttr[attr]
+		if !ok {
+			t.Errorf("licenseadmin.ACAssignment uses dynamodbav attribute %q with no counterpart in server.ACAssignment", attr)
+			continue
+		}
+		if server.tag != admin.tag {
+			t.Errorf("dynamodbav tag mismatch for attribute %q: server=%q licenseadmin=%q", attr, server.tag, admin.tag)
+		}
+		if server.goType != admin.goType {
+			t.Errorf("Go type mismatch for attribute %q: server=%s licenseadmin=%s", attr, server.goType, admin.goType)
+		}
+	}
+}
+
 type attrSchema struct {
 	tag    string
 	goType string

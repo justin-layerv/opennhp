@@ -1,13 +1,14 @@
-// Package licenseadmin provisions the License.BoundPubKeys allowlist that the
-// server-side license_pubkey_gate (#1155) enforces.
+// Package licenseadmin provisions the pubkey lists that server-side NHP gates
+// enforce: License.BoundPubKeys for #1155 and ACAssignment.RevokedPubKeys for
+// #1507's F5 runtime-revocation gate.
 //
 // The console repo that historically wrote nhp-licenses rows was archived, so
 // the BoundPubKeys provisioning workflow (#1262) now lives in this repo. This
 // package is deliberately decoupled from package server: importing server
 // drags in the KBS / confidential-containers init side-effects (an init() that
 // generates cosign keys under /opt/confidential-containers), which have no
-// business running inside a license-provisioning CLI. It therefore carries its
-// own minimal License mirror and DynamoDB client.
+// business running inside an operator CLI. It therefore carries its own minimal
+// License / ACAssignment mirrors and DynamoDB clients.
 //
 // The License struct here MUST keep its dynamodbav tags in lockstep with
 // server.License — enforced by TestLicenseAdminSchemaParity in package server.
@@ -46,10 +47,18 @@ const operationTimeout = 5 * time.Second
 var (
 	// ErrLicenseNotFound means no nhp-licenses row exists for the key.
 	ErrLicenseNotFound = errors.New("license not found")
+	// ErrACAssignmentNotFound means no nhp-ac-assignments row exists for the ac_id.
+	ErrACAssignmentNotFound = errors.New("AC assignment not found")
 	// ErrConcurrentModification means the optimistic-lock condition failed:
-	// another writer changed the license (or it was deleted) between our read
-	// and write. Callers re-read and retry.
-	ErrConcurrentModification = errors.New("license changed concurrently")
+	// another writer changed the row (or it was deleted) between our read and
+	// write. The message is generic because license and AC-assignment commands
+	// share the sentinel. Callers re-read and retry.
+	ErrConcurrentModification = errors.New("row changed concurrently")
+	// ErrLegacyRevokedPubKeyWhitespace means an externally-written revoked
+	// pubkey entry has surrounding whitespace. The CLI never writes this shape;
+	// operators must clean up the legacy row directly before unrevoke can match
+	// DynamoDB's exact String Set member.
+	ErrLegacyRevokedPubKeyWhitespace = errors.New("revoked pubkey entry has non-canonical whitespace")
 )
 
 // License mirrors the subset of the nhp-licenses item this tool reads and
@@ -69,6 +78,18 @@ type License struct {
 	CustomerID string `dynamodbav:"customer_id"`
 	Tier       string `dynamodbav:"tier"`
 	Active     bool   `dynamodbav:"active"`
+}
+
+// ACAssignment mirrors the subset of the nhp-ac-assignments item this tool
+// reads and writes for F5 revoked-pubkey management. The dynamodbav tags MUST
+// match server.ACAssignment; parity is enforced by
+// TestLicenseAdminACAssignmentSchemaParity in package server. UpdateItem asks
+// DynamoDB for ALL_NEW, but this partial mirror deliberately drops server-owned
+// attributes and never writes the returned item back.
+type ACAssignment struct {
+	ACID           string   `dynamodbav:"ac_id"`
+	Version        int      `dynamodbav:"version"`
+	RevokedPubKeys []string `dynamodbav:"revoked_pubkeys,omitempty,stringset"`
 }
 
 // CanonicalizeBoundPubKey validates raw as the canonical encoding the
@@ -204,6 +225,13 @@ type Config struct {
 	Endpoint      string // optional: custom endpoint for local development
 }
 
+// AssignmentConfig configures the DynamoDB client for AC assignment mutations.
+type AssignmentConfig struct {
+	Region             string
+	ACAssignmentsTable string
+	Endpoint           string // optional: custom endpoint for local development
+}
+
 // Client is a minimal DynamoDB accessor for the nhp-licenses table, scoped to
 // what license provisioning needs (read a license, overwrite its allowlist).
 type Client struct {
@@ -217,13 +245,47 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.LicensesTable == "" {
 		return nil, errors.New("licenses table name is required")
 	}
-	opts := []func(*config.LoadOptions) error{
-		config.WithRegion(cfg.Region),
+	ddb, err := newDynamoClient(ctx, cfg.Region, cfg.Endpoint)
+	if err != nil {
+		return nil, err
 	}
-	if cfg.Endpoint != "" {
+	return &Client{ddb: ddb, table: cfg.LicensesTable}, nil
+}
+
+// AssignmentClient is a minimal DynamoDB accessor for the nhp-ac-assignments
+// table, scoped to the F5 RevokedPubKeys operator workflow.
+type AssignmentClient struct {
+	ddb    assignmentDynamoAPI
+	table  string
+	region string
+}
+
+type assignmentDynamoAPI interface {
+	GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
+	UpdateItem(context.Context, *dynamodb.UpdateItemInput, ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
+}
+
+// NewAssignmentClient builds a DynamoDB AC-assignment client. It does NOT ping;
+// command errors surface on the first real call.
+func NewAssignmentClient(ctx context.Context, cfg AssignmentConfig) (*AssignmentClient, error) {
+	if cfg.ACAssignmentsTable == "" {
+		return nil, errors.New("AC assignments table name is required")
+	}
+	ddb, err := newDynamoClient(ctx, cfg.Region, cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return &AssignmentClient{ddb: ddb, table: cfg.ACAssignmentsTable, region: cfg.Region}, nil
+}
+
+func newDynamoClient(ctx context.Context, region, endpoint string) (*dynamodb.Client, error) {
+	opts := []func(*config.LoadOptions) error{
+		config.WithRegion(region),
+	}
+	if endpoint != "" {
 		resolver := aws.EndpointResolverWithOptionsFunc(
 			func(service, region string, options ...any) (aws.Endpoint, error) {
-				return aws.Endpoint{URL: cfg.Endpoint, SigningRegion: cfg.Region}, nil
+				return aws.Endpoint{URL: endpoint, SigningRegion: region}, nil
 			},
 		)
 		opts = append(opts, config.WithEndpointResolverWithOptions(resolver))
@@ -232,7 +294,7 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
-	return &Client{ddb: dynamodb.NewFromConfig(awsCfg), table: cfg.LicensesTable}, nil
+	return dynamodb.NewFromConfig(awsCfg), nil
 }
 
 // GetLicense retrieves a license by its partition key (hex SHA256). Returns
@@ -380,4 +442,194 @@ func buildBoundPubKeysUpdate(table, licenseKeySHA256 string, boundPubKeys []stri
 	in.UpdateExpression = aws.String("SET bound_pubkeys = :bpk, updated_at = :now")
 	in.ExpressionAttributeValues[":bpk"] = av
 	return in, nil
+}
+
+// GetACAssignment retrieves an AC assignment by ac_id. Returns
+// ErrACAssignmentNotFound if absent.
+func (c *AssignmentClient) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {
+	acID = strings.TrimSpace(acID)
+	if acID == "" {
+		return nil, errors.New("ac_id is required")
+	}
+	ctx, cancel := context.WithTimeout(ctx, operationTimeout)
+	defer cancel()
+
+	out, err := c.ddb.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(c.table),
+		Key: map[string]types.AttributeValue{
+			"ac_id": &types.AttributeValueMemberS{Value: acID},
+		},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dynamodb GetItem: %w", err)
+	}
+	if out.Item == nil {
+		return nil, fmt.Errorf("%w: %s (region=%q table=%q)", ErrACAssignmentNotFound, acID, c.region, c.table)
+	}
+	var assignment ACAssignment
+	if err := attributevalue.UnmarshalMap(out.Item, &assignment); err != nil {
+		return nil, fmt.Errorf("unmarshal AC assignment %s: %w", acID, err)
+	}
+	return &assignment, nil
+}
+
+// AddRevokedPubKey adds pubkey to ACAssignment.RevokedPubKeys if it is not
+// already present. The version bump is conditional on the String Set actually
+// changing; a repeat revoke returns changed=false and leaves version untouched.
+// The returned pubkey is the canonical string that was compared/written.
+func (c *AssignmentClient) AddRevokedPubKey(ctx context.Context, acID, pubkey string) (*ACAssignment, string, bool, error) {
+	return c.updateRevokedPubKey(ctx, acID, pubkey, revokedPubKeyAdd)
+}
+
+// RemoveRevokedPubKey removes pubkey from ACAssignment.RevokedPubKeys if it is
+// present. The version bump is conditional on the String Set actually changing;
+// a repeat unrevoke returns changed=false and leaves version untouched. The
+// returned pubkey is the canonical string that was compared/written.
+func (c *AssignmentClient) RemoveRevokedPubKey(ctx context.Context, acID, pubkey string) (*ACAssignment, string, bool, error) {
+	return c.updateRevokedPubKey(ctx, acID, pubkey, revokedPubKeyDelete)
+}
+
+type revokedPubKeyAction string
+
+const (
+	revokedPubKeyAdd    revokedPubKeyAction = "add"
+	revokedPubKeyDelete revokedPubKeyAction = "delete"
+)
+
+func (c *AssignmentClient) updateRevokedPubKey(ctx context.Context, acID, pubkey string, action revokedPubKeyAction) (*ACAssignment, string, bool, error) {
+	acID = strings.TrimSpace(acID)
+	in, canon, err := buildRevokedPubKeyUpdate(c.table, acID, pubkey, action)
+	if err != nil {
+		return nil, "", false, err
+	}
+	updateCtx, cancel := context.WithTimeout(ctx, operationTimeout)
+	defer cancel()
+
+	out, err := c.ddb.UpdateItem(updateCtx, in)
+	if err != nil {
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			assignment, changed, err := c.classifyRevokedPubKeyCondition(ctx, acID, canon, action, ccf.Item)
+			return assignment, canon, changed, err
+		}
+		return nil, "", false, fmt.Errorf("dynamodb UpdateItem: %w", err)
+	}
+	var assignment ACAssignment
+	if err := attributevalue.UnmarshalMap(out.Attributes, &assignment); err != nil {
+		return nil, "", false, fmt.Errorf("unmarshal updated AC assignment %s: %w", acID, err)
+	}
+	return &assignment, canon, true, nil
+}
+
+func (c *AssignmentClient) classifyRevokedPubKeyCondition(ctx context.Context, acID, pubkey string, action revokedPubKeyAction, failedItem map[string]types.AttributeValue) (*ACAssignment, bool, error) {
+	if len(failedItem) > 0 {
+		var assignment ACAssignment
+		if err := attributevalue.UnmarshalMap(failedItem, &assignment); err != nil {
+			return nil, false, fmt.Errorf("unmarshal condition-failed AC assignment %s: %w", acID, err)
+		}
+		return classifyRevokedPubKeyState(&assignment, acID, pubkey, action)
+	}
+	assignment, err := c.GetACAssignment(ctx, acID)
+	if err != nil {
+		return nil, false, err
+	}
+	return classifyRevokedPubKeyState(assignment, acID, pubkey, action)
+}
+
+func classifyRevokedPubKeyState(assignment *ACAssignment, acID, pubkey string, action revokedPubKeyAction) (*ACAssignment, bool, error) {
+	present := revokedPubKeyPresent(assignment.RevokedPubKeys, pubkey)
+	switch action {
+	case revokedPubKeyAdd:
+		// ADD conditions fail only when DynamoDB already has the exact canonical
+		// member, so trimmed membership cannot hide a dirty legacy variant here.
+		if present {
+			return assignment, false, nil
+		}
+	case revokedPubKeyDelete:
+		if !present {
+			return assignment, false, nil
+		}
+		if !revokedPubKeyExactPresent(assignment.RevokedPubKeys, pubkey) {
+			return nil, false, fmt.Errorf("%w: AC assignment %s has a whitespace-padded revoked_pubkeys entry for pubkey %s", ErrLegacyRevokedPubKeyWhitespace, acID, pubkey)
+		}
+	}
+	return nil, false, fmt.Errorf("%w: AC assignment %s revoked_pubkeys changed during update", ErrConcurrentModification, acID)
+}
+
+// Membership helpers are intentionally split by comparison contract. Exact
+// membership mirrors DynamoDB contains(), while trimmed membership mirrors the
+// server gate; the CLI owns the dirty-trim helper because it only reports
+// operator warnings after observing post-mutation state.
+func revokedPubKeyExactPresent(list []string, pubkey string) bool {
+	for _, entry := range list {
+		if entry == pubkey {
+			return true
+		}
+	}
+	return false
+}
+
+func revokedPubKeyPresent(list []string, pubkey string) bool {
+	target := strings.TrimSpace(pubkey)
+	for _, entry := range list {
+		if strings.TrimSpace(entry) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// buildRevokedPubKeyUpdate constructs the conditional UpdateItem used by the
+// F5 operator workflow. ADD/DELETE mutate the DynamoDB String Set, while the
+// version SET is guarded by the same condition so no-op revoke/unrevoke runs do
+// not bump version.
+func buildRevokedPubKeyUpdate(table, acID, pubkey string, action revokedPubKeyAction) (*dynamodb.UpdateItemInput, string, error) {
+	if table == "" {
+		return nil, "", errors.New("AC assignments table name is required")
+	}
+	if strings.TrimSpace(acID) == "" {
+		return nil, "", errors.New("ac_id is required")
+	}
+	canon, err := CanonicalizeBoundPubKey(pubkey)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// DynamoDB's contains() check is exact-match. The read-side helpers trim
+	// whitespace only to tolerate externally-written legacy junk; this tool
+	// writes canonical strings, so a whitespace-laden manual entry may be
+	// normalized by adding the clean duplicate on revoke, or require manual
+	// cleanup on unrevoke because DELETE exact-match misses the dirty value.
+	// ADD/DELETE also preserves the nil-vs-empty storage shape: the CLI never
+	// overwrites the whole set, and DynamoDB removes the attribute when DELETE
+	// empties the String Set instead of storing an empty set.
+	var condition, update string
+	switch action {
+	case revokedPubKeyAdd:
+		condition = "attribute_exists(ac_id) AND (attribute_not_exists(revoked_pubkeys) OR NOT contains(revoked_pubkeys, :pk))"
+		update = "SET version = if_not_exists(version, :zero) + :one ADD revoked_pubkeys :pk_set"
+	case revokedPubKeyDelete:
+		condition = "attribute_exists(ac_id) AND contains(revoked_pubkeys, :pk)"
+		update = "SET version = if_not_exists(version, :zero) + :one DELETE revoked_pubkeys :pk_set"
+	default:
+		return nil, "", fmt.Errorf("unknown revoked pubkey action %q", action)
+	}
+
+	return &dynamodb.UpdateItemInput{
+		TableName: aws.String(table),
+		Key: map[string]types.AttributeValue{
+			"ac_id": &types.AttributeValueMemberS{Value: strings.TrimSpace(acID)},
+		},
+		ConditionExpression: aws.String(condition),
+		UpdateExpression:    aws.String(update),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":     &types.AttributeValueMemberS{Value: canon},
+			":pk_set": &types.AttributeValueMemberSS{Value: []string{canon}},
+			":zero":   &types.AttributeValueMemberN{Value: "0"},
+			":one":    &types.AttributeValueMemberN{Value: "1"},
+		},
+		ReturnValues:                        types.ReturnValueAllNew,
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	}, canon, nil
 }

@@ -128,7 +128,7 @@ db:
 	cp ./db/main/etc/*.toml ../release/nhp-db/etc/
 
 licenseadmin:
-	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-license-admin... $(END_COLOUR)"
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-license-admin (license + F5 pubkey admin)... $(END_COLOUR)"
 	cd endpoints && \
 	mkdir -p ../release/nhp-license-admin && \
 	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-license-admin/nhp-license-admin ./licenseadmin/main/
