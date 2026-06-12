@@ -2699,7 +2699,7 @@ module "cost_analytics" {
 # CI role needs sts:AssumeRole permission to assume into mgmt account
 # for cost analytics resources (same pattern as cross-account-route53)
 resource "aws_iam_role_policy" "ci_cross_account_cost_analytics" {
-  count = var.deploy_cost_analytics && var.cross_account_cost_analytics_role_arn != null ? 1 : 0
+  count = var.deploy_cost_analytics && var.cross_account_cost_analytics_role_arn != null && var.cross_account_cost_analytics_role_arn != "" ? 1 : 0
 
   name = "cross-account-cost-analytics"
   role = module.ecr.github_actions_role_name

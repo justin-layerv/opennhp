@@ -269,6 +269,16 @@ locals {
   # alb_subnet_cidrs with private_subnet_ids when var.internal_alb_enabled.
   alb_subnet_cidrs = sort([for s in data.aws_subnet.alb : s.cidr_block])
 
+  # DynamoDB tables owned by this module are folded into the same task-role
+  # policy as the shared qurl tables passed in from module.dynamodb.
+  qurl_service_owned_dynamodb_table_arns = [
+    aws_dynamodb_table.qurl_external_identities.arn,
+  ]
+  qurl_service_dynamodb_table_arns = concat(
+    var.dynamodb_table_arns,
+    local.qurl_service_owned_dynamodb_table_arns,
+  )
+
   # Container environment variables
   container_env = concat([
     { name = "QURL_ENV", value = local.is_prod ? "production" : "development" },
@@ -633,8 +643,8 @@ resource "aws_iam_role_policy" "task_dynamodb" {
             "dynamodb:DescribeTable",
           ]
           Resource = concat(
-            var.dynamodb_table_arns,
-            [for arn in var.dynamodb_table_arns : "${arn}/index/*"],
+            local.qurl_service_dynamodb_table_arns,
+            [for arn in local.qurl_service_dynamodb_table_arns : "${arn}/index/*"],
             # Idempotency table (if configured)
             var.idempotency_table_arn != "" ? [var.idempotency_table_arn] : [],
             # API key idempotency table (if configured)

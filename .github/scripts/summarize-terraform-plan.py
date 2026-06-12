@@ -149,9 +149,9 @@ def build_summary(
         f"| Destroy | `{counts['destroy']}` |",
         f"| Run | [{run_id}]({server_url}/{repository}/actions/runs/{run_id}) |",
         "",
-        "`terraform plan -lock=false -out=tfplan -no-color` ran against the sandbox remote state using the read-only PR plan role.",
+        "`terraform plan -refresh=false -lock=false -out=tfplan -no-color -var='cross_account_cost_analytics_role_arn='` ran against the sandbox remote state using the read-only PR plan role.",
         "",
-        "Plan counts are review signals, not exact deploy drift: this PR plan uses the PR head SHA for NHP images, the current qurl-reverse-tunnel-server SSM tag when available, and deterministic placeholders for app-level secrets.",
+        "Plan counts are review signals, not exact deploy drift: this PR plan does not refresh live resources, disables the cross-account billing provider assume-role, uses the PR head SHA for NHP images, the current qurl-reverse-tunnel-server SSM tag when available, and deterministic placeholders for app-level secrets.",
     ]
 
     if parse_warning:

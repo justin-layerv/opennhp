@@ -90,10 +90,13 @@ locals {
   # from measured qurl-service traffic — **qurl-service owner: confirm or
   # correct it in review** (#1912). Deliberately EXCLUDED as not on a customer-
   # blocking read path: qurl-audit-log + qurl-billing-audit (write-audit),
-  # qurl-webhooks / qurl-webhook-deliveries / qurl-webhook-event-dedupe (async
-  # delivery), qurl-customers (config), qurl-idempotency / qurl-apikey-
-  # idempotency (write-path idempotency — promote if a mutation surface proves
-  # hot). Flag any of these that should be paged.
+  # qurl-webhooks / qurl-webhook-deliveries / qurl-webhook-event-dedupe
+  # (async delivery), qurl-customers (config), qurl-idempotency /
+  # qurl-apikey-idempotency (write-path idempotency — promote if a mutation
+  # surface proves hot). The qurl-service-owned qurl-external-identities table
+  # lives in modules/qurl-service/dynamodb.tf and is also intentionally outside
+  # this resolve-path throttle alarm set. Flag any of these that should be
+  # paged.
   qurl_resolve_throttle_tables = local.ddb_alarms_enabled ? {
     "qurl-resources"     = aws_dynamodb_table.qurl_resources[0].name
     "qurl-access-tokens" = aws_dynamodb_table.qurl_access_tokens[0].name

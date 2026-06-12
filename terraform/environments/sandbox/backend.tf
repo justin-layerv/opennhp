@@ -98,7 +98,7 @@ provider "aws" {
   region = "us-east-1" # Data Exports is us-east-1 only
 
   dynamic "assume_role" {
-    for_each = var.cross_account_cost_analytics_role_arn != null ? [1] : []
+    for_each = var.cross_account_cost_analytics_role_arn != null && var.cross_account_cost_analytics_role_arn != "" ? [1] : []
     content {
       role_arn     = var.cross_account_cost_analytics_role_arn
       session_name = "TerraformCostAnalytics"

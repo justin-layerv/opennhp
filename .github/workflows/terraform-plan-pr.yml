@@ -329,7 +329,12 @@ jobs:
           rm -f tfplan tfplan.json plan.txt
 
           set +e
-          terraform plan -lock=false -out=tfplan -no-color 2>&1 | tee plan.txt
+          terraform plan \
+            -refresh=false \
+            -lock=false \
+            -out=tfplan \
+            -no-color \
+            -var='cross_account_cost_analytics_role_arn=' 2>&1 | tee plan.txt
           status=${PIPESTATUS[0]}
           set -e
 

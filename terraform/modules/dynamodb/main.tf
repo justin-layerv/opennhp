@@ -1102,9 +1102,11 @@ resource "aws_dynamodb_table" "qurl_webhook_deliveries" {
 # (PR #666) — don't double-deliver to downstream webhook subscribers.
 # 24h matches the longest realistic replay window.
 #
-# Schema MUST mirror qurl-service `internal/repository/dynamodb/
-# schema.go::TableWebhookEventDedupe` exactly — PK `pk` (S), TTL
-# attribute `ttl`, no sort key, no GSIs. The qurl-service schema
+# Schema MUST mirror qurl-service PR #874 commit
+# 08cc47fca6c556e2c23b04e43af6d50332e939dc
+# `internal/repository/dynamodb/schema.go::TableWebhookEventDedupe`
+# exactly — PK `pk` (S), TTL attribute `ttl`, no sort key, no GSIs.
+# The qurl-service schema
 # reconciler runs DescribeTable against every entry in `dbclient.Tables`
 # every 60s; the dedupe table being absent fails `/health/ready` and
 # triggers an ECS deploy rollback. The dedupe table is a hard
