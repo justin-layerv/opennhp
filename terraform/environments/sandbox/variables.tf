@@ -273,6 +273,12 @@ variable "slack_channel_id" {
   default = ""
 }
 
+variable "chatbot_owned_externally" {
+  description = "Sandbox's #alerts-sandbox Chatbot config is owned by alerts-infra's sandbox-alerts-sandbox module, which subscribes our layerv-nhp-sandbox-cell0-alerts SNS topic. Default true keeps NHP from re-colliding on the (workspace, channel) pair."
+  type        = bool
+  default     = true
+}
+
 # Production domains
 variable "production_domains" {
   type    = list(string)

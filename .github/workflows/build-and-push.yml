@@ -1522,6 +1522,20 @@ jobs:
         # apply (sandbox has no trail). Catch it on the PR instead.
         run: python3 ./.github/scripts/check-cis-metric-filter-patterns.py
 
+      - name: Run observability parity fixture tests
+        # Regression fixtures for #1141's prod-vs-sandbox observability guard.
+        # They run before the real tree scan so extractor drift fails against
+        # synthetic inputs with known answers. This prod-drift job has no
+        # environment matrix, so the env-agnostic scan runs once per PR.
+        run: python3 ./tests/scripts/test_observability_parity.py
+
+      - name: Check prod/sandbox observability parity (#1141)
+        # Prod and sandbox share the root monitoring module, but env-wrapper
+        # pass-through drift can still turn tfvars values into silent no-ops.
+        # Keep the stderr log group, ServerPanic filter, restart/registration
+        # alarms, AC registration-stale alarm, and alert routing wired in both.
+        run: python3 ./scripts/check-observability-parity.py
+
   # ============================================================================
   # REDIRECT_URL DRIFT LINT (PR) - #1325
   # Static fence between the plugin handler's `redirectURLField` const

@@ -645,9 +645,11 @@ module "monitoring" {
   https_target_group_arn_suffix       = module.compute.https_target_group_arn_suffix
   https_green_target_group_arn_suffix = module.compute.https_green_target_group_arn_suffix
   asg_name                            = module.compute.asg_name
-  server_stderr_log_group_name        = module.compute.log_group_stderr_name
-  name_prefix                         = local.name_prefix
-  tags                                = local.common_tags
+  # Observability parity expressions are fenced by
+  # scripts/check-observability-parity.py.
+  server_stderr_log_group_name = module.compute.log_group_stderr_name
+  name_prefix                  = local.name_prefix
+  tags                         = local.common_tags
 
   # Slack integration
   enable_slack_notifications = var.enable_slack_notifications
@@ -1194,7 +1196,14 @@ module "ac" {
   # Blue/Green deployment configuration
   enable_blue_green      = var.enable_ac_blue_green
   green_standby_min_size = var.ac_green_standby_min_size
-  alerts_sns_topic_arn   = module.monitoring.sns_topic_arn
+
+  # AC alarm routing. These expressions are fenced by
+  # scripts/check-observability-parity.py. `alarm_sns_topic_arn` feeds the core
+  # AC alarms in monitoring.tf; `alerts_sns_topic_arn` feeds
+  # deployment/reconciliation alarms.
+  enable_cloudwatch_alarms = true
+  alarm_sns_topic_arn      = module.monitoring.sns_topic_arn
+  alerts_sns_topic_arn     = module.monitoring.sns_topic_arn
 
   # Secret reconciliation (cleanup orphaned per-instance secrets)
   enable_secret_reconciliation = var.enable_secret_reconciliation
