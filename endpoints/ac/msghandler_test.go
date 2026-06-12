@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
@@ -27,8 +28,9 @@ import (
 // ordering-invariant assertion would pass for the wrong reason.
 func TestHandleUdpACOperations_DedupeRunsBeforeUnmarshal(t *testing.T) {
 	a := &UdpAC{
-		config:    &Config{ACId: "test-ac"},
-		aopReplay: newAOPReplayCache(),
+		config:       &Config{ACId: "test-ac"},
+		aopReplay:    newAOPReplayCache(),
+		registration: &ACRegistration{metrics: metrics.NewPublisherForTest(t)},
 	}
 
 	const txid uint64 = 100
@@ -52,6 +54,11 @@ func TestHandleUdpACOperations_DedupeRunsBeforeUnmarshal(t *testing.T) {
 
 	if !errors.Is(err, common.ErrACDuplicateTransaction) {
 		t.Fatalf("got err=%v, want ErrACDuplicateTransaction (dedupe must run before json.Unmarshal)", err)
+	}
+
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if got := counters[MetricAOPReplayDetected]; got != 1 {
+		t.Fatalf("%s counter = %v, want 1", MetricAOPReplayDetected, got)
 	}
 }
 

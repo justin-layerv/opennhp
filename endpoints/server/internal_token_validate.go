@@ -491,6 +491,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 			// fleet-visible fallback. Echo the supplied run_id so the
 			// caller can correlate request/response without keeping
 			// per-call state.
+			hs.recordInternalTokenValidateFailure(srcIP, "not_found")
 			respond(http.StatusOK, internalTokenValidateResponse{
 				Valid: false,
 				RunID: req.AgentRunID,
@@ -519,6 +520,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		// pinhole; the expired branch has no live pinhole, so the
 		// echoed run_id is purely a request/response correlation
 		// key and the caller's value is the safer default.
+		hs.recordInternalTokenValidateFailure(srcIP, "expired")
 		respond(http.StatusOK, internalTokenValidateResponse{
 			Valid: false,
 			RunID: req.AgentRunID,

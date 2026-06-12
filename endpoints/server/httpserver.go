@@ -1667,6 +1667,13 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 		return
 	}
 
+	// Count internal knock requests after the request-auth gate, but before
+	// resource resolution and forwarded-hop attestation. In permit mode, the
+	// gate logs invalid/missing signatures and continues during rollout, so
+	// this includes permitted unsigned callers. Downstream reject logs/metrics
+	// carry the outcome.
+	hs.recordInternalKnockRequest(fwdReq.Source, srcIP)
+
 	resolvedResource, err := hs.resolveInternalKnockResource(hs.internalKnockResourceLookupContext(), fwdReq.Request, fwdReq.Resource)
 	if err != nil {
 		switch {

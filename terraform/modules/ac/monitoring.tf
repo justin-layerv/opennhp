@@ -132,6 +132,40 @@ resource "aws_cloudwatch_metric_alarm" "server_connection_failure" {
   })
 }
 
+# AOPReplayDetected is emitted by the AC replay-dedupe gate before JSON
+# unmarshal / access-control handling. The stream uses the AC publisher base
+# dimensions [Component, Environment, Region]; keep this alarm on that exact
+# set so it matches the alarmable base counter and leaves any future
+# breakdown stream free for dashboards.
+resource "aws_cloudwatch_metric_alarm" "aop_replay_detected" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-aop-replay-detected"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "AOPReplayDetected"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 3
+  alarm_description   = "AC dropped at least 3 replayed/duplicate AOP packets within 5 minutes. A single isolated event can follow restart/failover retries; this threshold targets repeated drops that indicate replay attempts or a broken retry path."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name  = "${var.name_prefix}-ac-aop-replay-detected"
+    Issue = "1140"
+  })
+}
+
 # ==================== UDP Handler Panic Alarm ====================
 #
 # Pages on any panic recovered by the top-level guard on the AC's UDP
@@ -679,6 +713,7 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
             aws_cloudwatch_metric_alarm.disk_usage_high[0].arn,
             aws_cloudwatch_metric_alarm.registration_failure[0].arn,
             aws_cloudwatch_metric_alarm.server_connection_failure[0].arn,
+            aws_cloudwatch_metric_alarm.aop_replay_detected[0].arn,
             aws_cloudwatch_metric_alarm.servers_healthy_low[0].arn,
             aws_cloudwatch_metric_alarm.registration_stale[0].arn,
             aws_cloudwatch_metric_alarm.udp_handler_panic[0].arn,

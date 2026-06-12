@@ -1005,11 +1005,25 @@ module "dns" {
 module "security" {
   source = "./modules/security"
 
-  environment                = var.environment
-  name_prefix                = local.name_prefix
-  rate_limit_requests        = var.environment == "prod" ? 5000 : 2000
-  logs_kms_key_arn           = module.kms.logs_key_arn
-  enable_cloudtrail          = var.enable_cloudtrail
+  environment         = var.environment
+  name_prefix         = local.name_prefix
+  rate_limit_requests = var.environment == "prod" ? 5000 : 2000
+  logs_kms_key_arn    = module.kms.logs_key_arn
+  enable_cloudtrail   = var.enable_cloudtrail
+  cloudtrail_sensitive_kms_direct_decrypt_detections = {
+    sensitive_kms_decrypt_secrets = {
+      arn         = module.kms.secrets_key_arn
+      metric_name = "SensitiveKMSDecryptSecretsCount"
+      threshold   = 1
+      description = "A direct KMS Decrypt call targeted the NHP secrets CMK. Service-mediated decrypts are excluded; investigate unexpected caller roles."
+    }
+    sensitive_kms_decrypt_logs = {
+      arn         = module.kms.logs_key_arn
+      metric_name = "SensitiveKMSDecryptLogsCount"
+      threshold   = 5
+      description = "At least 5 direct KMS Decrypt calls targeted the NHP logs CMK within 5 minutes. Service-mediated decrypts are excluded; investigate sustained direct caller-role access."
+    }
+  }
   enable_waf_logging         = var.enable_waf_logging
   config_recording_frequency = var.config_recording_frequency
   config_resource_types      = var.config_resource_types

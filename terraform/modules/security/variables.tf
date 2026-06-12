@@ -117,6 +117,29 @@ variable "enable_cloudtrail" {
   default     = true
 }
 
+variable "cloudtrail_sensitive_kms_direct_decrypt_detections" {
+  description = "Sensitive KMS direct-Decrypt detections keyed by stable filter/alarm suffix (#1140). Keep scoped to keys where direct decrypts are unusual; service-mediated decrypts are filtered out by the pattern. Use higher thresholds for expected-noisier ticket-class keys."
+  type = map(object({
+    arn         = string
+    metric_name = string
+    threshold   = number
+    description = string
+  }))
+  default = {}
+
+  validation {
+    condition = alltrue([
+      for detection in values(var.cloudtrail_sensitive_kms_direct_decrypt_detections) :
+      detection.threshold >= 1
+      && floor(detection.threshold) == detection.threshold
+      && trimspace(detection.arn) != ""
+      && trimspace(detection.metric_name) != ""
+      && trimspace(detection.description) != ""
+    ])
+    error_message = "Each sensitive KMS direct-Decrypt detection must use a positive integer threshold and non-empty arn/metric_name/description."
+  }
+}
+
 variable "enable_cloudtrail_tamper_alerts" {
   description = "Page on-call (via the Slack alerts topic) when a CloudTrail trail is disabled, deleted, or reconfigured (#1143). Deliberately independent of enable_cloudtrail: the alert watches API-call events on the default event bus, so it protects trails this module does not own (e.g. the SCP-locked sandbox trails). Requires enable_slack_target and a non-empty alerts_sns_topic_arn."
   type        = bool
