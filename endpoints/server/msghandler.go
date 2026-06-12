@@ -161,12 +161,21 @@ const (
 	// instances.
 	MetricACKTokenSharedStoreHit = "ACKTokenSharedStoreHit"
 	// MetricInternalAuthFailPermit / MetricInternalAuthFailStrict count
-	// /nhp/internal/knock requests whose HMAC verification failed.
-	// Permit-mode failures still pass through (warn + allow); strict-
-	// mode failures get 401. Operators alarm on Permit > 0 to know
-	// when it's safe to flip require=true (signals all callers signing).
+	// signed /nhp/internal requests whose HMAC verification failed.
+	// /knock and /token/validate follow the rollout flag: permit-mode
+	// failures warn + allow, strict-mode failures get 401. The
+	// destructive AC revocation sweep endpoint is permanently strict and
+	// always emits FailStrict on HMAC verification failure. Operators
+	// alarm on Permit > 0 to know when it's safe to flip require=true
+	// (signals all rollout-gated callers signing).
 	MetricInternalAuthFailPermit = "InternalAuthFailPermit"
 	MetricInternalAuthFailStrict = "InternalAuthFailStrict"
+	// MetricInternalAuthSignerUnavailable fires when a permanently-strict
+	// internal endpoint rejects before HMAC verification because the
+	// server has no signer configured. Keep this distinct from FailStrict:
+	// this is an operator/configuration problem, not evidence of a caller
+	// presenting a bad signature.
+	MetricInternalAuthSignerUnavailable = "InternalAuthSignerUnavailable"
 	// MetricInternalAuthSuccess pairs with the Fail counters above.
 	// FailPermit → 0 alone can mean "everyone signed" OR "no traffic".
 	// Watching Success rise while FailPermit drops is the positive

@@ -47,7 +47,10 @@ type HttpServer struct {
 	httpForwarder *HttpKnockForwarder
 
 	// internalAuthSigner and internalAuthRequire together specify the
-	// internal-auth rollout state for /nhp/internal/*. Both are set
+	// internal-auth rollout state for rollout-gated /nhp/internal
+	// handlers. Permanently strict handlers such as
+	// /nhp/internal/ac-revocations/sweep require a signer regardless of
+	// internalAuthRequire. Both fields are set
 	// once in Start before request serving begins and read concurrently
 	// by request-handler goroutines thereafter. The happens-before edge
 	// is the `go func(){ ListenAndServe() }()` launch in Start — the
@@ -62,6 +65,7 @@ type HttpServer struct {
 	//   signer == nil              → legacy (source-IP gate only)
 	//   signer != nil, require=false → permit (verify + warn + allow)
 	//   signer != nil, require=true  → strict (verify + reject unsigned)
+	// Permanently strict handlers skip legacy/permit behavior.
 	// The {signer=nil, require=true} combo is unreachable — Start only
 	// reads internalAuthRequire when a signer was constructed successfully
 	// — but even if it were reached, handleInternalKnock short-circuits

@@ -22,8 +22,26 @@ func newACRevocationSweepRouter(hs *HttpServer) *gin.Engine {
 	return router
 }
 
+func newACRevocationSweepSigner(t *testing.T) *internalauth.Signer {
+	t.Helper()
+	signer, err := internalauth.New("0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatalf("internalauth.New: %v", err)
+	}
+	return signer
+}
+
+func newSignedACRevocationSweepRequest(t *testing.T, signer *internalauth.Signer, path string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, nil)
+	req.RemoteAddr = "10.0.0.5:53100"
+	req.Header.Set(internalauth.Header, signer.Sign(http.MethodPost, path, nil))
+	return req
+}
+
 func TestInternalACRevocationSweepEndpoint_TriggersDrop(t *testing.T) {
 	const acID = "ac-1535-http"
+	signer := newACRevocationSweepSigner(t)
 	s := newRevokeDropTestServer(t)
 	revoked, _ := putRevokeDropConn(s, acID, 0xC1, &net.UDPAddr{IP: net.ParseIP("10.0.0.21"), Port: 47021})
 
@@ -37,11 +55,10 @@ func TestInternalACRevocationSweepEndpoint_TriggersDrop(t *testing.T) {
 	s.storageConfig = &StorageConfig{Backend: StorageBackendDynamoDB}
 	s.acPubkeyRevokeVerifyRequire = true
 
-	hs := &HttpServer{udpServer: s}
+	hs := &HttpServer{udpServer: s, internalAuthSigner: signer}
 	router := newACRevocationSweepRouter(hs)
 
-	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/ac-revocations/sweep/"+acID, nil)
-	req.RemoteAddr = "10.0.0.5:53100"
+	req := newSignedACRevocationSweepRequest(t, signer, "/nhp/internal/ac-revocations/sweep/"+acID)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -62,6 +79,7 @@ func TestInternalACRevocationSweepEndpoint_SuffixlessSweepsActiveACIDs(t *testin
 		firstACID  = "ac-1535-http-all-a"
 		secondACID = "ac-1535-http-all-b"
 	)
+	signer := newACRevocationSweepSigner(t)
 	s := newRevokeDropTestServer(t)
 	first, _ := putRevokeDropConn(s, firstACID, 0xC6, &net.UDPAddr{IP: net.ParseIP("10.0.0.26"), Port: 47026})
 	second, _ := putRevokeDropConn(s, secondACID, 0xC7, &net.UDPAddr{IP: net.ParseIP("10.0.0.27"), Port: 47027})
@@ -81,11 +99,10 @@ func TestInternalACRevocationSweepEndpoint_SuffixlessSweepsActiveACIDs(t *testin
 	s.storageConfig = &StorageConfig{Backend: StorageBackendDynamoDB}
 	s.acPubkeyRevokeVerifyRequire = true
 
-	hs := &HttpServer{udpServer: s}
+	hs := &HttpServer{udpServer: s, internalAuthSigner: signer}
 	router := newACRevocationSweepRouter(hs)
 
-	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/ac-revocations/sweep", nil)
-	req.RemoteAddr = "10.0.0.5:53105"
+	req := newSignedACRevocationSweepRequest(t, signer, "/nhp/internal/ac-revocations/sweep")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -118,6 +135,7 @@ func TestInternalACRevocationSweepEndpoint_SuffixlessSweepsActiveACIDs(t *testin
 
 func TestInternalACRevocationSweepEndpoint_CanceledRequestReportsTruncated(t *testing.T) {
 	const acID = "ac-1535-http-canceled"
+	signer := newACRevocationSweepSigner(t)
 	s := newRevokeDropTestServer(t)
 	putRevokeDropConn(s, acID, 0xC8, &net.UDPAddr{IP: net.ParseIP("10.0.0.28"), Port: 47028})
 
@@ -125,13 +143,12 @@ func TestInternalACRevocationSweepEndpoint_CanceledRequestReportsTruncated(t *te
 	s.storageConfig = &StorageConfig{Backend: StorageBackendDynamoDB}
 	s.acPubkeyRevokeVerifyRequire = true
 
-	hs := &HttpServer{udpServer: s}
+	hs := &HttpServer{udpServer: s, internalAuthSigner: signer}
 	router := newACRevocationSweepRouter(hs)
 
 	requestCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/ac-revocations/sweep", nil).WithContext(requestCtx)
-	req.RemoteAddr = "10.0.0.5:53106"
+	req := newSignedACRevocationSweepRequest(t, signer, "/nhp/internal/ac-revocations/sweep").WithContext(requestCtx)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -151,16 +168,16 @@ func TestInternalACRevocationSweepEndpoint_CanceledRequestReportsTruncated(t *te
 }
 
 func TestInternalACRevocationSweepEndpoint_DisabledWhenStrictGateOff(t *testing.T) {
+	signer := newACRevocationSweepSigner(t)
 	s := newRevokeDropTestServer(t)
 	s.storage = NewMemoryStorage()
 	s.storageConfig = &StorageConfig{Backend: StorageBackendDynamoDB}
 	s.acPubkeyRevokeVerifyRequire = false
 
-	hs := &HttpServer{udpServer: s}
+	hs := &HttpServer{udpServer: s, internalAuthSigner: signer}
 	router := newACRevocationSweepRouter(hs)
 
-	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/ac-revocations/sweep", nil)
-	req.RemoteAddr = "10.0.0.5:53101"
+	req := newSignedACRevocationSweepRequest(t, signer, "/nhp/internal/ac-revocations/sweep")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -170,7 +187,13 @@ func TestInternalACRevocationSweepEndpoint_DisabledWhenStrictGateOff(t *testing.
 }
 
 func TestInternalACRevocationSweepEndpoint_RejectsPublicSource(t *testing.T) {
-	hs := &HttpServer{udpServer: newRevokeDropTestServer(t)}
+	counts := map[string]int{}
+	hs := &HttpServer{
+		udpServer: newRevokeDropTestServer(t),
+		internalAuthEmit: func(name string) {
+			counts[name]++
+		},
+	}
 	router := newACRevocationSweepRouter(hs)
 
 	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/ac-revocations/sweep", nil)
@@ -181,13 +204,24 @@ func TestInternalACRevocationSweepEndpoint_RejectsPublicSource(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status=%d body=%s, want 403", rec.Code, rec.Body.String())
 	}
+	if counts[MetricInternalAuthSuccess] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthSuccess, counts[MetricInternalAuthSuccess])
+	}
+	if counts[MetricInternalAuthFailStrict] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthFailStrict, counts[MetricInternalAuthFailStrict])
+	}
+	if counts[MetricInternalAuthFailPermit] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthFailPermit, counts[MetricInternalAuthFailPermit])
+	}
+	if counts[MetricInternalAuthSignerUnavailable] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthSignerUnavailable, counts[MetricInternalAuthSignerUnavailable])
+	}
 }
 
-func TestInternalACRevocationSweepEndpoint_StrictAuthRejectsUnsigned(t *testing.T) {
-	signer, err := internalauth.New("0123456789abcdef0123456789abcdef")
-	if err != nil {
-		t.Fatalf("internalauth.New: %v", err)
-	}
+func TestInternalACRevocationSweepEndpoint_RejectsUnsignedWithRequireFlagTrue(t *testing.T) {
+	// internalAuthRequire is intentionally ignored here: the AC sweep
+	// endpoint is permanently strict because it triggers destructive drops.
+	signer := newACRevocationSweepSigner(t)
 	counts := map[string]int{}
 	hs := &HttpServer{
 		udpServer:           newRevokeDropTestServer(t),
@@ -210,25 +244,95 @@ func TestInternalACRevocationSweepEndpoint_StrictAuthRejectsUnsigned(t *testing.
 	if counts[MetricInternalAuthFailStrict] != 1 {
 		t.Errorf("%s count=%d, want 1", MetricInternalAuthFailStrict, counts[MetricInternalAuthFailStrict])
 	}
+	if counts[MetricInternalAuthFailPermit] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthFailPermit, counts[MetricInternalAuthFailPermit])
+	}
+	if counts[MetricInternalAuthSuccess] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthSuccess, counts[MetricInternalAuthSuccess])
+	}
+	if counts[MetricInternalAuthSignerUnavailable] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthSignerUnavailable, counts[MetricInternalAuthSignerUnavailable])
+	}
+}
+
+func TestInternalACRevocationSweepEndpoint_RejectsUnsignedWithRequireFlagFalse(t *testing.T) {
+	// The false rollout flag is also intentionally ignored; unsigned
+	// requests still fail closed for this destructive endpoint.
+	signer := newACRevocationSweepSigner(t)
+	counts := map[string]int{}
+	hs := &HttpServer{
+		udpServer:          newRevokeDropTestServer(t),
+		internalAuthSigner: signer,
+		internalAuthEmit: func(name string) {
+			counts[name]++
+		},
+	}
+	router := newACRevocationSweepRouter(hs)
+
+	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/ac-revocations/sweep", nil)
+	req.RemoteAddr = "10.0.0.5:53107"
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401", rec.Code, rec.Body.String())
+	}
+	if counts[MetricInternalAuthFailStrict] != 1 {
+		t.Errorf("%s count=%d, want 1", MetricInternalAuthFailStrict, counts[MetricInternalAuthFailStrict])
+	}
+	if counts[MetricInternalAuthFailPermit] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthFailPermit, counts[MetricInternalAuthFailPermit])
+	}
+	if counts[MetricInternalAuthSuccess] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthSuccess, counts[MetricInternalAuthSuccess])
+	}
+	if counts[MetricInternalAuthSignerUnavailable] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthSignerUnavailable, counts[MetricInternalAuthSignerUnavailable])
+	}
+}
+
+func TestInternalACRevocationSweepEndpoint_RejectsMissingSigner(t *testing.T) {
+	counts := map[string]int{}
+	hs := &HttpServer{
+		udpServer: newRevokeDropTestServer(t),
+		internalAuthEmit: func(name string) {
+			counts[name]++
+		},
+	}
+	router := newACRevocationSweepRouter(hs)
+
+	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/ac-revocations/sweep", nil)
+	req.RemoteAddr = "10.0.0.5:53108"
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401", rec.Code, rec.Body.String())
+	}
+	if counts[MetricInternalAuthSignerUnavailable] != 1 {
+		t.Errorf("%s count=%d, want 1", MetricInternalAuthSignerUnavailable, counts[MetricInternalAuthSignerUnavailable])
+	}
+	if counts[MetricInternalAuthFailStrict] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthFailStrict, counts[MetricInternalAuthFailStrict])
+	}
+	if counts[MetricInternalAuthFailPermit] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthFailPermit, counts[MetricInternalAuthFailPermit])
+	}
 	if counts[MetricInternalAuthSuccess] != 0 {
 		t.Errorf("%s count=%d, want 0", MetricInternalAuthSuccess, counts[MetricInternalAuthSuccess])
 	}
 }
 
-func TestInternalACRevocationSweepEndpoint_StrictAuthSignedSuccess(t *testing.T) {
-	signer, err := internalauth.New("0123456789abcdef0123456789abcdef")
-	if err != nil {
-		t.Fatalf("internalauth.New: %v", err)
-	}
+func TestInternalACRevocationSweepEndpoint_SignedSuccess(t *testing.T) {
+	signer := newACRevocationSweepSigner(t)
 	counts := map[string]int{}
 	s := newRevokeDropTestServer(t)
 	s.storage = NewMemoryStorage()
 	s.storageConfig = &StorageConfig{Backend: StorageBackendDynamoDB}
 	s.acPubkeyRevokeVerifyRequire = true
 	hs := &HttpServer{
-		udpServer:           s,
-		internalAuthSigner:  signer,
-		internalAuthRequire: true,
+		udpServer:          s,
+		internalAuthSigner: signer,
 		internalAuthEmit: func(name string) {
 			counts[name]++
 		},
@@ -236,9 +340,7 @@ func TestInternalACRevocationSweepEndpoint_StrictAuthSignedSuccess(t *testing.T)
 	router := newACRevocationSweepRouter(hs)
 
 	const path = "/nhp/internal/ac-revocations/sweep"
-	req := httptest.NewRequest(http.MethodPost, path, nil)
-	req.RemoteAddr = "10.0.0.5:53104"
-	req.Header.Set(internalauth.Header, signer.Sign(http.MethodPost, path, nil))
+	req := newSignedACRevocationSweepRequest(t, signer, path)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -250,5 +352,11 @@ func TestInternalACRevocationSweepEndpoint_StrictAuthSignedSuccess(t *testing.T)
 	}
 	if counts[MetricInternalAuthFailStrict] != 0 {
 		t.Errorf("%s count=%d, want 0", MetricInternalAuthFailStrict, counts[MetricInternalAuthFailStrict])
+	}
+	if counts[MetricInternalAuthFailPermit] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthFailPermit, counts[MetricInternalAuthFailPermit])
+	}
+	if counts[MetricInternalAuthSignerUnavailable] != 0 {
+		t.Errorf("%s count=%d, want 0", MetricInternalAuthSignerUnavailable, counts[MetricInternalAuthSignerUnavailable])
 	}
 }

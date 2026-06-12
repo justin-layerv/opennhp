@@ -702,6 +702,13 @@ Operational notes:
   `InternalAuthFailStrict` are aggregate counters across the strict-gated
   nhp-server endpoints; use server logs or a future endpoint-dimensioned metric
   when you need per-route proof for `/nhp/internal/token/validate`.
+  `/nhp/internal/ac-revocations/sweep[/<acId>]` is permanently strict because
+  it triggers destructive AC disconnects; its HMAC verification failures
+  increment `InternalAuthFailStrict` even before the broader
+  `NHP_INTERNAL_AUTH_REQUIRE` rollout flag flips to strict. A server missing
+  signer configuration rejects the sweep before verification and emits
+  `InternalAuthSignerUnavailable` instead, so dashboards can separate operator
+  misconfiguration from bad caller signatures.
   If a new signer fleet is introduced after an environment is already strict
   (for example, first prod qurl-reverse-tunnel-server deployment), roll it with
   the shared secret and verify its signed `/nhp/internal/token/validate` calls

@@ -9,6 +9,7 @@ One of:
 - **`ACPubkeyRevokedLookupErr`** non-zero — F5 GetACAssignment storage error; the gate degraded to skip-the-gate. Strict mode does NOT escalate this to a reject.
 - **`ACPubkeyRevokeListOversize`** non-zero — an `ACAssignment.RevokedPubKeys` list crossed the 50-entry sanity threshold. Operator workflow is one-pubkey-at-a-time during incident response; lists this large suggest a runaway-append admin tool or F5 misuse as a license-wide kill switch.
 - **`ACPubkeyRevokeGateBug`** non-zero — `applyACPubkeyRevokeVerdict` hit its fail-closed default branch, indicating a server-side dispatch-table bug. Page-worthy independent of `ACPubkeyRevoked`.
+- **`InternalAuthSignerUnavailable`** non-zero during an operator-triggered sweep — the server is reachable but lacks `NHP_INTERNAL_AUTH_SECRET`, so the signed fast path returns 401. Treat this as deployment/config drift and alert the platform owner before relying on the endpoint during an incident.
 
 The registration gate lives in `endpoints/server/ac_pubkey_revoke_gate.go` (kernel + apply + evaluate split mirroring F3/F4). The mid-session drop path lives in `endpoints/server/ac_pubkey_revoke_drop.go` and is exposed for operator-triggered sweeps by `POST /nhp/internal/ac-revocations/sweep[/<acId>]`.
 
@@ -43,6 +44,7 @@ The information-disclosure asymmetry is documented at the top of `ac_pubkey_revo
 | `ACPubkeyRevokedLookupErr` sustained | DDB flap — gate is silently bypassed | Page DDB ops. The metric is the only signal that strict-mode F5 is degraded; do NOT wait for a customer-visible regression. |
 | `ACPubkeyRevokeListOversize` non-zero | Runaway admin tool / F5 misused as license-wide kill switch | Check the offending acId's `RevokedPubKeys` length. Operator workflow is one-pubkey-at-a-time; if length > 50, consider whether `License.Active=false` is the right primitive instead. #1547 tracks adding a hard upper bound. |
 | `ACPubkeyRevokeGateBug` non-zero | Server-side dispatch-table bug — a future PR added a verdict constant without registering it in the switch | Page on-call dev. Read recent `ac_pubkey_revoke_gate.go` commits; the bug is in `applyACPubkeyRevokeVerdict`. |
+| `InternalAuthSignerUnavailable` non-zero during a sweep attempt | Missing or misrotated `NHP_INTERNAL_AUTH_SECRET` on the target server | Alert the platform owner and redeploy/fix the secret before depending on the on-demand sweep. Background sweeps still enforce revocations when F5 strict mode is on. |
 
 ## Adding / removing a revoked pubkey
 
@@ -66,11 +68,23 @@ AWS_PROFILE=layerv aws dynamodb update-item \
 
 Wait up to `CachedStorage.DefaultTTL` (60s normally, 5s during a console-driven reassignment) for in-flight servers to observe the change.
 
-In strict DynamoDB cloud mode, connected ACs are also checked by the mid-session sweeper. The default interval is 60s; set `NHP_AC_PUBKEY_REVOKE_SWEEP_INTERVAL_SECONDS=0` to disable the background sweep or to a whole-second value of at least 5 to tune it. Cloud deployments wrap DynamoDB in `CachedStorage`, so backend reads are normally bounded by the assignment cache TTL; lowering the sweep interval mostly adds cache reads until the TTL expires, while shortening the TTL or repeatedly using suffixless sweeps can increase DynamoDB read pressure. For incident response that cannot wait for the next tick, call the signed, private-source internal endpoint with no body and no query string:
+In strict DynamoDB cloud mode, connected ACs are also checked by the mid-session sweeper. The default interval is 60s; set `NHP_AC_PUBKEY_REVOKE_SWEEP_INTERVAL_SECONDS=0` to disable the background sweep or to a whole-second value of at least 5 to tune it. Cloud deployments wrap DynamoDB in `CachedStorage`, so backend reads are normally bounded by the assignment cache TTL; lowering the sweep interval mostly adds cache reads until the TTL expires, while shortening the TTL or repeatedly using suffixless sweeps can increase DynamoDB read pressure. For incident response that cannot wait for the next tick, call the signed, private-source internal endpoint with no body and no query string. The endpoint rejects unsigned calls even while the broader `/nhp/internal` auth rollout is in permit mode; it uses the normal internal-auth timestamp window but no nonce tracking because replaying a valid sweep within that window is idempotent:
 
 ```text
 POST /nhp/internal/ac-revocations/sweep/<ACID>
 ```
+
+To generate the `X-Nhp-Auth` header for the empty-body POST, run from a trusted operator shell that already has the current `NHP_INTERNAL_AUTH_SECRET`:
+
+```bash
+path="/nhp/internal/ac-revocations/sweep/<ACID>"
+ts="$(date +%s)"
+body_sha="$(printf '' | sha256sum | awk '{print $1}')"
+sig="$(printf 'NHPv1\n%s\nPOST\n%s\n%s' "$ts" "$path" "$body_sha" | openssl dgst -sha256 -hmac "$NHP_INTERNAL_AUTH_SECRET" -binary | xxd -p -c 256)"
+curl -fsS -X POST -H "X-Nhp-Auth: NHPv1 timestamp=$ts,signature=$sig" "http://<nhp-server-internal-ip>:8888${path}"
+```
+
+If a legacy environment has no internal-auth signer configured, this endpoint returns 401; deploy the shared internal-auth secret or wait for the background sweep.
 
 Use the suffixless `/nhp/internal/ac-revocations/sweep` form only when intentionally sweeping every currently connected acId on that server; it performs one assignment lookup per active acId. If the JSON response includes `truncated: true`, the caller's request context ended before every active acId was checked; rerun the per-ACID form for the affected AC or rerun the suffixless sweep and do not treat the partial counts as complete.
 

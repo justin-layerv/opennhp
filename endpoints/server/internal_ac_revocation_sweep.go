@@ -17,7 +17,7 @@ import (
 // rejected like the other /nhp/internal endpoints because they are
 // not part of the signing string.
 func (hs *HttpServer) handleInternalACRevocationSweep(ctx *gin.Context) {
-	if !hs.authorizeInternalNoBodyRequest(ctx, "internal ac-revocation sweep") {
+	if !hs.authorizeInternalSignedNoBodyRequest(ctx, "internal ac-revocation sweep") {
 		return
 	}
 	if hs.udpServer == nil {
@@ -46,7 +46,7 @@ func (hs *HttpServer) handleInternalACRevocationSweep(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, stats)
 }
 
-func (hs *HttpServer) authorizeInternalNoBodyRequest(ctx *gin.Context, operation string) bool {
+func (hs *HttpServer) authorizeInternalSignedNoBodyRequest(ctx *gin.Context, operation string) bool {
 	srcIP := extractIP(ctx.Request.RemoteAddr)
 	if !isPrivateIP(srcIP) {
 		log.Warning("%s rejected: non-private source IP %s", operation, srcIP)
@@ -66,7 +66,12 @@ func (hs *HttpServer) authorizeInternalNoBodyRequest(ctx *gin.Context, operation
 		return false
 	}
 	if hs.internalAuthSigner == nil {
-		return true
+		log.Warning("%s rejected: internal auth signer unavailable src=%s reqID=%s", operation, srcIP, GetRequestID(ctx))
+		if hs.internalAuthEmit != nil {
+			hs.internalAuthEmit(MetricInternalAuthSignerUnavailable)
+		}
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": internalauth.ErrInternalAuth.Error()})
+		return false
 	}
 
 	authErr := hs.internalAuthSigner.Verify(
@@ -85,18 +90,10 @@ func (hs *HttpServer) authorizeInternalNoBodyRequest(ctx *gin.Context, operation
 
 	stage := internalauth.ClassifyAuthFailure(authErr)
 	reqID := GetRequestID(ctx)
-	if hs.internalAuthRequire {
-		log.Warning("%s rejected (strict): src=%s stage=%s reqID=%s", operation, srcIP, stage, reqID)
-		if hs.internalAuthEmit != nil {
-			hs.internalAuthEmit(MetricInternalAuthFailStrict)
-		}
-		ctx.JSON(http.StatusUnauthorized, gin.H{"error": internalauth.ErrInternalAuth.Error()})
-		return false
-	}
-
-	log.Info("%s permit-mode unverified (allowing through): src=%s stage=%s reqID=%s", operation, srcIP, stage, reqID)
+	log.Warning("%s rejected: src=%s stage=%s reqID=%s", operation, srcIP, stage, reqID)
 	if hs.internalAuthEmit != nil {
-		hs.internalAuthEmit(MetricInternalAuthFailPermit)
+		hs.internalAuthEmit(MetricInternalAuthFailStrict)
 	}
-	return true
+	ctx.JSON(http.StatusUnauthorized, gin.H{"error": internalauth.ErrInternalAuth.Error()})
+	return false
 }
