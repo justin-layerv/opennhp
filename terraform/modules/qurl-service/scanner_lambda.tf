@@ -232,8 +232,11 @@ resource "aws_cloudwatch_log_group" "scanner_active_recheck" {
 resource "aws_iam_role" "scanner_lambda" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
-  name        = "${local.scanner_lambda_function_name}-execution"
-  description = "Execution role for qurl-scanner Lambdas -- DDB Query/UpdateItem on qURL tables + optional SQS SendMessage + CloudWatch Logs."
+  name = "${local.scanner_lambda_function_name}-execution"
+  # Match the deployed metadata exactly while terraform-apply-iam gains
+  # iam:UpdateRoleDescription. Reintroducing description drift in the same
+  # apply as the new verb races IAM propagation and blocks sandbox deploys.
+  description = "Execution role for the qurl-scanner Lambda -- DDB Query/UpdateItem on qURL tables + optional SQS SendMessage + CloudWatch Logs."
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"

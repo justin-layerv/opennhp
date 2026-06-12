@@ -615,6 +615,12 @@ class TerraformPlanPrBootstrapTests(unittest.TestCase):
             resources,
         )
 
+    def test_apply_role_can_update_role_descriptions(self) -> None:
+        stmt = find_policy_statement(REPO_ROOT / "terraform", "terraform_apply_iam", "IAMRoles")
+        actions = set(normalized_strings(stmt.get("Action")))
+
+        self.assertIn("iam:UpdateRoleDescription", actions)
+
     def test_apply_role_does_not_broaden_github_actions_role_scope(self) -> None:
         stmt = find_policy_statement(REPO_ROOT / "terraform", "terraform_apply_iam", "IAMRoles")
         resources = set(normalized_strings(stmt.get("Resource")))

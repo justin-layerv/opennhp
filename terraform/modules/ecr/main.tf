@@ -1816,6 +1816,7 @@ resource "aws_iam_policy" "terraform_apply_iam" {
           "iam:CreateRole",
           "iam:DeleteRole",
           "iam:UpdateRole",
+          "iam:UpdateRoleDescription",
           "iam:UpdateAssumeRolePolicy",
           "iam:TagRole",
           "iam:UntagRole",
