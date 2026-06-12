@@ -12,6 +12,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / ".github" / "scripts" / "check-terraform-plan-pr-policy-readonly.py"
+sys.path.insert(0, str(REPO_ROOT / ".github" / "scripts"))
+from _tf_lint_lib import extract_policy_body, iter_resources, parse_tf_files, unquote  # noqa: E402
 
 DEFAULT_SSM_RESOURCES = (
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/*",
@@ -25,6 +27,30 @@ DEFAULT_SSM_RESOURCES = (
 def hcl_string_list(values: tuple[str, ...]) -> str:
     body = ",\n".join(f'            "{value}"' for value in values)
     return f"[\n{body}\n          ]"
+
+
+def as_list(value: object) -> list[object]:
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def normalized_strings(value: object) -> list[str]:
+    return [unquote(item) for item in as_list(value) if isinstance(item, str)]
+
+
+def find_policy_statement(terraform_root: Path, policy_name: str, sid: str) -> dict:
+    for _file, rtype, name, body in iter_resources(parse_tf_files(terraform_root)):
+        if rtype != "aws_iam_policy" or name != policy_name:
+            continue
+        policy = extract_policy_body(body.get("policy"))
+        if policy is None:
+            raise AssertionError(f"aws_iam_policy.{policy_name} policy could not be decoded")
+        for stmt in policy.get("Statement", []) or []:
+            if isinstance(stmt, dict) and unquote(stmt.get("Sid")) == sid:
+                return stmt
+        raise AssertionError(f"aws_iam_policy.{policy_name} has no Sid={sid}")
+    raise AssertionError(f"aws_iam_policy.{policy_name} not found")
 
 
 def policy_fixture(
@@ -327,6 +353,28 @@ class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
         self.assertIn("Allow statements must not use NotAction", result.stderr)
+
+
+class TerraformPlanPrBootstrapTests(unittest.TestCase):
+    def test_apply_role_can_create_dedicated_plan_pr_role(self) -> None:
+        stmt = find_policy_statement(REPO_ROOT / "terraform", "terraform_apply_iam", "IAMRoles")
+        resources = set(normalized_strings(stmt.get("Resource")))
+
+        self.assertIn(
+            "arn:aws:iam::${local.account_id}:role/nhp-${var.environment}-github-actions-terraform-plan-pr",
+            resources,
+        )
+
+    def test_apply_role_does_not_broaden_github_actions_role_scope(self) -> None:
+        stmt = find_policy_statement(REPO_ROOT / "terraform", "terraform_apply_iam", "IAMRoles")
+        resources = set(normalized_strings(stmt.get("Resource")))
+
+        self.assertNotIn(
+            "arn:aws:iam::${local.account_id}:role/nhp-*-github-actions-terraform-plan-pr",
+            resources,
+        )
+        self.assertNotIn("arn:aws:iam::${local.account_id}:role/nhp-*-github-actions*", resources)
+        self.assertNotIn("arn:aws:iam::${local.account_id}:role/nhp-*", resources)
 
 
 if __name__ == "__main__":

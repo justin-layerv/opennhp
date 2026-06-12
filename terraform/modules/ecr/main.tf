@@ -1795,6 +1795,9 @@ resource "aws_iam_policy" "terraform_apply_iam" {
         Resource = [
           "arn:aws:iam::${local.account_id}:role/layerv-nhp-*",
           "arn:aws:iam::${local.account_id}:role/nhp-*-github-actions",
+          # The wildcard above anchors "-github-actions" at the ARN suffix;
+          # it does not match the dedicated PR plan role's extra suffix.
+          "arn:aws:iam::${local.account_id}:role/nhp-${var.environment}-github-actions-terraform-plan-pr",
           "arn:aws:iam::${local.account_id}:role/traefik-plugins-*",
           "arn:aws:iam::${local.account_id}:instance-profile/layerv-nhp-*",
           "arn:aws:iam::${local.account_id}:oidc-provider/*"

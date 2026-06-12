@@ -93,8 +93,8 @@ resource "aws_iam_policy" "github_actions_packer_build" {
   name = "nhp-${var.environment}-github-actions-packer-build"
   # description is ForceNew on aws_iam_policy: an edit forces a destroy+recreate
   # that needs iam:DetachRolePolicy on the -packer role, which the deploy role
-  # lacks (its "IAMRoles" statement in main.tf scopes to role/nhp-*-github-actions,
-  # excluding "-packer") — so the replace 403s and wedges the apply (it did, for
+  # lacks (its "IAMRoles" statement in main.tf scopes to GitHub Actions CI roles,
+  # but still excludes "-packer") — so the replace 403s and wedges the apply (it did, for
   # ~2 days, until #2259). Frozen via ignore_changes below; the policy's real
   # scope (Server + AC AMIs) is in the block comment above. Policy-document edits
   # are NOT frozen and apply in-place via iam:CreatePolicyVersion.
