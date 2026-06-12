@@ -354,6 +354,9 @@ lint-workflows:
 	@shellcheck scripts/check-app-image-line-rendered.sh tests/scripts/check-app-image-line-rendered_test.sh
 	@bash tests/scripts/check-app-image-line-rendered_test.sh
 	@bash tests/scripts/ami-id-from-manifest_test.sh
+	@shellcheck .github/scripts/classify-terraform-plan-pr-changes.sh tests/scripts/classify-terraform-plan-pr-changes_test.sh
+	@bash tests/scripts/classify-terraform-plan-pr-changes_test.sh
+	@python3 tests/scripts/test_summarize_terraform_plan.py
 	@python3 -c 'import yaml' 2>/dev/null || { \
 		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \
 		echo "$(COLOUR_RED)  Match the CI install: python3 -m pip install --no-cache-dir pyyaml$(END_COLOUR)"; \
@@ -395,6 +398,8 @@ lint-terraform-drift:
 	@./tests/lints/terraform-prod-drift/run-fixtures.sh
 	@python3 .github/scripts/check-terraform-iam-coverage.py
 	@python3 .github/scripts/check-terraform-policy-conditions.py
+	@python3 tests/scripts/test_check_terraform_plan_pr_policy_readonly.py
+	@python3 .github/scripts/check-terraform-plan-pr-policy-readonly.py
 	@./tests/lints/terraform-tag-charset/run-fixtures.sh
 	@python3 .github/scripts/check-terraform-tag-charset.py terraform
 	@echo "$(COLOUR_GREEN)[OpenNHP] terraform-prod-drift checks passed!$(END_COLOUR)"

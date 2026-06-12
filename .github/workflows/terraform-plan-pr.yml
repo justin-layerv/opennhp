@@ -1,0 +1,507 @@
+name: Terraform Plan (PR)
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: terraform-plan-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-2
+  TF_VERSION: '1.14.3'
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan (PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      terraform_changed: ${{ steps.changes.outputs.terraform_changed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          # Change detection decides whether AWS credentials are used. Keep the
+          # full graph here so unusual PR histories cannot confuse merge-base
+          # classification into a silent skip.
+          fetch-depth: 0
+
+      - name: Check for Terraform changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          if ! merge_base=$(git merge-base "$BASE_SHA" HEAD); then
+            echo "::error::Unable to find a merge-base between PR HEAD and base SHA $BASE_SHA."
+            exit 1
+          fi
+
+          # Use the local git graph instead of the PR files API. The API caps
+          # the files list at 3000 entries, which would make this gate fail
+          # open for very large PRs.
+          git diff --name-status --no-renames "$merge_base" HEAD > changed-files.tsv
+
+          # After this PR is merged, classify future PRs with the trusted
+          # base-copy classifier so a PR-head edit to the classifier cannot
+          # silently skip a Terraform plan. Keep this classifier's plan-input
+          # globs in review with the trusted helper restore list below; the
+          # lists are intentionally not identical because some restored helpers
+          # affect output formatting rather than plan inputs. This bootstrap PR
+          # falls back to the checked-out copy because the script does not exist
+          # on the base.
+          if git cat-file -e "$merge_base:.github/scripts/classify-terraform-plan-pr-changes.sh" 2>/dev/null; then
+            git show "$merge_base:.github/scripts/classify-terraform-plan-pr-changes.sh" > .github/scripts/classify-terraform-plan-pr-changes.sh
+            chmod +x .github/scripts/classify-terraform-plan-pr-changes.sh
+          fi
+
+          .github/scripts/classify-terraform-plan-pr-changes.sh changed-files.tsv "$merge_base"
+
+      - name: No Terraform changes
+        if: steps.changes.outputs.terraform_changed != 'true'
+        working-directory: terraform/environments/sandbox
+        env:
+          PLAN_COMMENT_MARKER: "<!-- nhp-terraform-plan-pr -->"
+        run: |
+          {
+            echo "$PLAN_COMMENT_MARKER"
+            echo "### Terraform Plan (sandbox)"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Result | \`skipped\` |"
+            echo "| Run | [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) |"
+            echo
+            echo "No Terraform plan inputs changed in the current PR diff, so the sandbox plan was skipped without AWS credentials."
+          } | tee plan-summary.md plan-comment-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Reject fork PRs
+        if: steps.changes.outputs.terraform_changed == 'true' && steps.changes.outputs.prod_only_terraform_changed != 'true' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::Expected fork limitation: Terraform Plan (PR) needs repo secrets and a read-only AWS OIDC role, so forked Terraform PRs cannot run this required sandbox plan. A maintainer must re-push the branch inside layervai/nhp to run the gate."
+          exit 1
+
+      - name: Summarize unsupported PR source
+        if: failure() && steps.changes.outputs.terraform_changed == 'true' && steps.changes.outputs.prod_only_terraform_changed != 'true' && github.event.pull_request.head.repo.full_name != github.repository
+        working-directory: terraform/environments/sandbox
+        env:
+          PLAN_COMMENT_MARKER: "<!-- nhp-terraform-plan-pr -->"
+        run: |
+          {
+            echo "$PLAN_COMMENT_MARKER"
+            echo "### Terraform Plan (sandbox)"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Result | \`unsupported fork PR\` |"
+            echo "| Run | [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) |"
+            echo
+            echo "Expected for forked Terraform PRs: Terraform Plan (PR) needs repo secrets and a read-only AWS OIDC role, so the sandbox plan cannot run from a fork. This is not a code failure in the fork. A maintainer must re-push the branch inside \`layervai/nhp\` to run this required gate."
+          } | tee plan-summary.md plan-comment-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check plan role configuration
+        id: plan_config
+        if: success() && steps.changes.outputs.terraform_changed == 'true'
+        env:
+          PLAN_ROLE_ARN: ${{ secrets.AWS_TERRAFORM_PLAN_PR_ROLE_ARN }}
+          WORKFLOW_ADDED: ${{ steps.changes.outputs.terraform_plan_workflow_added }}
+          PROD_ONLY_TERRAFORM_CHANGED: ${{ steps.changes.outputs.prod_only_terraform_changed }}
+          PR_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$PROD_ONLY_TERRAFORM_CHANGED" == "true" ]]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "reason=prod_only" >> "$GITHUB_OUTPUT"
+            echo "Only terraform/environments/prod/** changed, so the sandbox plan is skipped instead of gating this PR on unrelated sandbox state." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$PR_ACTOR" == "dependabot[bot]" ]]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "reason=dependabot" >> "$GITHUB_OUTPUT"
+            echo "Dependabot pull_request runs cannot read regular repository secrets, so the sandbox plan is skipped without AWS credentials." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ -n "$PLAN_ROLE_ARN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Terraform plan role secret is configured; running sandbox plan."
+            exit 0
+          fi
+
+          if [[ "$WORKFLOW_ADDED" == "true" ]]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "reason=bootstrap" >> "$GITHUB_OUTPUT"
+            echo "Terraform Plan (PR) is being introduced by this PR; AWS plan is skipped until the role is applied and AWS_TERRAFORM_PLAN_PR_ROLE_ARN is configured." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::error::AWS_TERRAFORM_PLAN_PR_ROLE_ARN is not configured; Terraform Plan (PR) cannot run."
+          exit 1
+
+      - name: Summarize plan skipped
+        if: steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'false'
+        working-directory: terraform/environments/sandbox
+        env:
+          PLAN_COMMENT_MARKER: "<!-- nhp-terraform-plan-pr -->"
+          PLAN_CONFIG_REASON: ${{ steps.plan_config.outputs.reason }}
+        run: |
+          result="skipped"
+          message="Terraform Plan (PR) was skipped without AWS credentials."
+
+          case "$PLAN_CONFIG_REASON" in
+            bootstrap)
+              result="bootstrap pending"
+              message="This PR adds the Terraform Plan (PR) workflow, so the sandbox role and AWS_TERRAFORM_PLAN_PR_ROLE_ARN secret do not exist yet. The rollout ledger for this PR tracks applying the role, setting the secret, then making the check required. Future Terraform-touching PRs fail if the secret is missing."
+              ;;
+            dependabot)
+              result="dependabot skipped"
+              message="Dependabot Terraform PRs cannot read regular repository secrets in pull_request runs, so this required check reports skipped without AWS credentials. Provider lockfile updates still get Terraform validation, and a maintainer can re-push the branch inside layervai/nhp if a full sandbox plan is needed."
+              ;;
+            prod_only)
+              result="prod-only skipped"
+              message="Only terraform/environments/prod/** changed, so this required check skips the sandbox plan instead of gating the PR on unrelated sandbox state. Terraform Validate (PR) (prod) still validates the prod configuration."
+              ;;
+          esac
+
+          {
+            echo "$PLAN_COMMENT_MARKER"
+            echo "### Terraform Plan (sandbox)"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Result | \`$result\` |"
+            echo "| Run | [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) |"
+            echo
+            echo "$message"
+          } | tee plan-summary.md plan-comment-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore trusted plan helper paths
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fi
+
+          # Security tradeoff: the secrets-bearing plan gate intentionally uses
+          # base versions of these helpers. PRs that change them are covered by
+          # lint/review here, then exercised by this gate after merge. Review
+          # this list alongside the classifier's plan-input globs above; the
+          # lists are intentionally not identical because the summarizer is
+          # restored for output safety but is not itself a plan input. Keep this
+          # before local `uses: ./.github/actions/build-lambda-packages`; GitHub
+          # reads local action bodies from the workspace when the step executes.
+          trusted_paths=(
+            .github/actions/build-lambda-packages
+            .github/scripts/fetch-auth0-token.sh
+            .github/scripts/summarize-terraform-plan.py
+          )
+          for trusted_path in "${trusted_paths[@]}"; do
+            if git cat-file -e "$BASE_SHA:$trusted_path" 2>/dev/null; then
+              git checkout "$BASE_SHA" -- "$trusted_path"
+            else
+              echo "::notice::Trusted helper path $trusted_path is not present in base commit $BASE_SHA; leaving the PR-head path for this run."
+            fi
+          done
+
+          mkdir -p "$RUNNER_TEMP/terraform-plan-pr"
+          git show "$BASE_SHA:terraform/environments/sandbox/terraform.tfvars" > "$RUNNER_TEMP/terraform-plan-pr/sandbox.base.tfvars"
+          echo "TRUSTED_AUTH0_TFVARS=$RUNNER_TEMP/terraform-plan-pr/sandbox.base.tfvars" >> "$GITHUB_ENV"
+
+      - name: Fetch Auth0 Token
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        id: auth0
+        env:
+          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
+        run: ./.github/scripts/fetch-auth0-token.sh "$TRUSTED_AUTH0_TFVARS" sandbox
+
+      - name: Setup Terraform
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
+      # Build packages before assuming AWS credentials; the composite action
+      # also forces dummy AWS env vars for its Python unit tests. Keep this
+      # after Fetch Auth0 Token so PR-head build scripts cannot re-tamper with
+      # the restored Auth0 helper before the long-lived client secret is used.
+      - name: Build Lambda Packages
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        uses: ./.github/actions/build-lambda-packages
+
+      - name: Configure AWS credentials
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_PLAN_PR_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        working-directory: terraform/environments/sandbox
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure
+
+      - name: Resolve qurl-reverse-tunnel-server Image Tag
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+
+          ssm_param="/sandbox/nhp/reverse-tunnel-server/image-tag"
+          err_file="/tmp/frps-ssm-err"
+          tag_re='^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+          rm -f "$err_file"
+
+          if frps_tag=$(aws ssm get-parameter \
+              --region "$AWS_REGION" \
+              --name "$ssm_param" \
+              --query "Parameter.Value" \
+              --output text 2>"$err_file"); then
+            if [[ -z "$frps_tag" || "$frps_tag" == "None" ]]; then
+              echo "::notice::SSM $ssm_param returned empty/None; falling back to tfvars."
+            elif [[ "$frps_tag" =~ ^v0\.0\.0-bootstrap ]]; then
+              echo "::notice::SSM $ssm_param still holds bootstrap placeholder ($frps_tag); falling back to tfvars."
+            elif [[ ! "$frps_tag" =~ $tag_re ]]; then
+              echo "::error::SSM $ssm_param holds a value that is not a valid Docker tag: $(printf %q "$frps_tag")"
+              exit 1
+            else
+              echo "::notice::Resolved qurl-reverse-tunnel-server image tag from SSM: $frps_tag"
+              echo "TF_VAR_frps_image_tag=$frps_tag" >> "$GITHUB_ENV"
+            fi
+            exit 0
+          fi
+
+          if grep -q "ParameterNotFound" "$err_file"; then
+            echo "::notice::SSM $ssm_param not found (greenfield or deploy_frps=false); falling back to tfvars."
+            exit 0
+          fi
+
+          echo "::error::Unexpected SSM error reading $ssm_param:"
+          cat "$err_file"
+          exit 1
+
+      - name: Terraform Plan
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        id: plan
+        working-directory: terraform/environments/sandbox
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+          # App-level secret values are not needed for provider authentication
+          # during plan. Stable placeholders keep the variable graph populated
+          # without exposing live application credentials to PR-time runners.
+          TF_VAR_auth_signing_key: pr-plan-placeholder-signing-key
+          TF_VAR_auth_aes_key: 0123456789abcdef0123456789abcdef
+          TF_VAR_ac_license_key: pr-plan-placeholder-ac-license-key
+          TF_VAR_grafana_auth: pr-plan-placeholder-grafana-token
+          TF_VAR_auth0_tf_client_id: pr-plan-token-authenticated
+          TF_VAR_auth0_tf_client_secret: pr-plan-token-authenticated
+          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
+          TF_VAR_image_tag: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          rm -f tfplan tfplan.json plan.txt
+
+          set +e
+          terraform plan -lock=false -out=tfplan -no-color 2>&1 | tee plan.txt
+          status=${PIPESTATUS[0]}
+          set -e
+
+          show_json_failed=false
+          if [[ "$status" -eq 0 ]]; then
+            if ! terraform show -json tfplan > tfplan.json; then
+              echo "::error::terraform show -json tfplan failed"
+              status=1
+              show_json_failed=true
+            fi
+          fi
+
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          echo "show_json_failed=$show_json_failed" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize Terraform Plan
+        if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.plan.outputs.exit_code != ''
+        working-directory: terraform/environments/sandbox
+        env:
+          PLAN_EXIT_CODE: ${{ steps.plan.outputs.exit_code }}
+          SHOW_JSON_FAILED: ${{ steps.plan.outputs.show_json_failed }}
+          PLAN_COMMENT_MARKER: "<!-- nhp-terraform-plan-pr -->"
+        run: |
+          if ! python3 ../../../.github/scripts/summarize-terraform-plan.py
+          then
+            result="failed"
+            if [[ "$PLAN_EXIT_CODE" == "0" ]]; then
+              result="passed"
+            fi
+            {
+              echo "$PLAN_COMMENT_MARKER"
+              echo "### Terraform Plan (sandbox)"
+              echo
+              echo "| Field | Value |"
+              echo "| --- | --- |"
+              echo "| Result | \`$result\` |"
+              echo "| Summary | \`summary generation failed\` |"
+              echo "| Run | [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) |"
+              echo
+              echo "The Terraform plan command completed, but the summary formatter failed. Open the linked run and inspect the \`Summarize Terraform Plan\` step for the formatter error."
+              if [[ "$PLAN_EXIT_CODE" != "0" ]]; then
+                echo
+                echo "The separate failure gate will still fail this check because \`terraform plan\` exited non-zero."
+              fi
+            } | tee plan-summary.md plan-comment-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Summarize plan setup failure
+        id: setup_failure
+        if: failure() && steps.changes.outputs.terraform_changed == 'true' && (steps.plan_config.outcome == 'failure' || (steps.plan_config.outputs.enabled == 'true' && steps.plan.outcome == 'skipped'))
+        working-directory: terraform/environments/sandbox
+        env:
+          PLAN_COMMENT_MARKER: "<!-- nhp-terraform-plan-pr -->"
+        run: |
+          {
+            echo "$PLAN_COMMENT_MARKER"
+            echo "### Terraform Plan (sandbox)"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Result | \`setup failed\` |"
+            echo "| Run | [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) |"
+            echo
+            echo "The sandbox plan did not start because a setup step failed before \`terraform plan\`. Open the linked run and inspect the first failed step."
+          } | tee plan-summary.md plan-comment-summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "comment_ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Terraform plan summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: terraform-plan-pr-summary
+          path: |
+            terraform/environments/sandbox/plan-summary.md
+            terraform/environments/sandbox/plan-comment-summary.md
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Summarize Terraform Plan must keep converting formatter errors into a
+      # fallback summary and exiting 0. This gate owns the captured non-zero
+      # terraform plan exit so setup and formatter failures stay distinguishable.
+      - name: Fail on plan error
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.plan.outputs.exit_code != '' && steps.plan.outputs.exit_code != '0'
+        run: exit 1
+
+  comment:
+    name: Comment Terraform Plan (PR)
+    needs: terraform-plan
+    if: always() && needs.terraform-plan.result != 'cancelled' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Download Terraform plan summary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: terraform-plan-pr-summary
+          path: terraform-plan-pr-summary
+
+      - name: Comment Terraform Plan
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TERRAFORM_CHANGED: ${{ needs.terraform-plan.outputs.terraform_changed }}
+          TERRAFORM_PLAN_RESULT: ${{ needs.terraform-plan.result }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- nhp-terraform-plan-pr -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            let body = '';
+            let writeAttempted = false;
+            const shouldCreate =
+              process.env.TERRAFORM_CHANGED === 'true' || process.env.TERRAFORM_PLAN_RESULT === 'failure';
+            try {
+              const summaryPaths = [
+                'terraform-plan-pr-summary/plan-comment-summary.md',
+                'terraform-plan-pr-summary/terraform/environments/sandbox/plan-comment-summary.md',
+              ];
+              const summaryPath = summaryPaths.find((candidate) => fs.existsSync(candidate));
+              body = summaryPath
+                ? fs.readFileSync(summaryPath, 'utf8')
+                : [
+                    marker,
+                    '### Terraform Plan (sandbox)',
+                    '',
+                    '| Field | Value |',
+                    '| --- | --- |',
+                    '| Result | `summary unavailable` |',
+                    `| Run | [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) |`,
+                    '',
+                    'The workflow reached the comment step before a plan summary file was written. Open the linked run and inspect the first failed step.',
+                  ].join('\n') + '\n';
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number,
+                per_page: 100,
+              });
+              const previous = comments.find((comment) =>
+                comment.user.type === 'Bot' && comment.body && comment.body.includes(marker)
+              );
+
+              if (previous) {
+                writeAttempted = true;
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: previous.id,
+                  body,
+                });
+              } else if (shouldCreate) {
+                writeAttempted = true;
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number,
+                  body,
+                });
+              } else {
+                core.info('No previous Terraform Plan PR comment exists; no no-change comment created.');
+              }
+            } catch (error) {
+              core.warning(`Unable to write Terraform Plan PR comment: ${error.message}`);
+              if (body) {
+                await core.summary.addRaw(body).write();
+              }
+              if (writeAttempted || shouldCreate) {
+                core.setFailed(`Unable to write Terraform Plan PR comment: ${error.message}`);
+              }
+            }

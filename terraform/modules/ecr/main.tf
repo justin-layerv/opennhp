@@ -316,6 +316,14 @@ locals {
     for zone_id in var.route53_change_record_hosted_zone_ids :
     "arn:aws:route53:::hostedzone/${zone_id}"
   ]
+  terraform_plan_pr_s3_object_arns = distinct(compact([
+    var.terraform_state_bucket != "" ? "arn:aws:s3:::${var.terraform_state_bucket}/*" : "",
+    var.plugin_bucket_arn != "" ? "${var.plugin_bucket_arn}/*" : "",
+    "arn:aws:s3:::${var.name_prefix}-*/*",
+    "arn:aws:s3:::layerv-nhp-*/*",
+    "arn:aws:s3:::bootstrap-alb-*/*",
+    "arn:aws:s3:::traefik-plugins-*/*"
+  ]))
   # `nhp-qurl` is the API container; `qurl-scanner-lambda` is the
   # EventBridge-driven Lambda image. Both gate on `deploy_qurl_ecr`
   # (not on the Lambda enable flag) — the repo + SSM image-tag must
@@ -338,6 +346,12 @@ locals {
   # flag to the gate) only has to update this local. Replaces the
   # earlier output-precondition assertion approach.
   is_replication_source = var.is_primary_account && var.enable_replication && length(var.secondary_account_ids) > 0
+
+  # PR-time Terraform plan is intentionally sandbox-only. The workflow this
+  # role serves reads live sandbox state so reviewers catch API/provider
+  # failures before merge, but prod remains behind the promote-to-prod approval
+  # path.
+  enable_terraform_plan_pr_role = var.environment == "sandbox"
 
   # Hoisted so consumers (the replication-check Lambda's `lifecycle.
   # precondition`) can enforce the lookback↔expiry cushion at plan
@@ -1267,6 +1281,365 @@ resource "aws_iam_policy" "terraform_read" {
 resource "aws_iam_role_policy_attachment" "terraform_read" {
   role       = aws_iam_role.github_actions.name
   policy_arn = aws_iam_policy.terraform_read.arn
+}
+
+resource "aws_iam_role" "github_actions_terraform_plan_pr" {
+  count = local.enable_terraform_plan_pr_role ? 1 : 0
+
+  name        = "nhp-${var.environment}-github-actions-terraform-plan-pr"
+  description = "Read-only GitHub Actions role for PR Terraform plans (${var.environment})"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = local.oidc_provider_arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        # AWS IAM can evaluate the GitHub OIDC audience and subject here, but
+        # GitHub custom claims such as `workflow_ref` and `job_workflow_ref`
+        # are not available in AWS trust policies. Tighter workflow scoping
+        # requires a separate environment-scoped or custom-sub rollout.
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:pull_request"
+        }
+      }
+    }]
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-github-actions-terraform-plan-pr"
+    Component = "ecr"
+  })
+}
+
+resource "aws_iam_policy" "terraform_plan_pr_read" {
+  count = local.enable_terraform_plan_pr_role ? 1 : 0
+
+  name        = "nhp-${var.environment}-github-actions-terraform-plan-pr-read"
+  description = "Dedicated read-only permissions for PR Terraform plans (${var.environment})"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EC2Read"
+        Effect = "Allow"
+        Action = [
+          "ec2:Describe*",
+          "ec2:GetEbsDefaultKmsKeyId",
+          "ec2:GetEbsEncryptionByDefault",
+          "ec2:GetManagedPrefixListEntries"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "S3MetadataRead"
+        Effect = "Allow"
+        Action = [
+          "s3:GetAccelerateConfiguration",
+          "s3:GetAccountPublicAccessBlock",
+          "s3:GetAnalyticsConfiguration",
+          "s3:GetBucket*",
+          "s3:GetEncryptionConfiguration",
+          "s3:GetIntelligentTieringConfiguration",
+          "s3:GetInventoryConfiguration",
+          "s3:GetLifecycleConfiguration",
+          "s3:GetMetricsConfiguration",
+          "s3:GetObjectLockConfiguration",
+          "s3:GetPublicAccessBlock",
+          "s3:GetReplicationConfiguration",
+          "s3:GetStorageLensConfiguration",
+          "s3:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "S3ObjectRead"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject*"
+        ]
+        Resource = local.terraform_plan_pr_s3_object_arns
+        Condition = {
+          StringEquals = {
+            "aws:ResourceAccount" = local.account_id
+          }
+        }
+      },
+      {
+        Sid    = "IAMRead"
+        Effect = "Allow"
+        Action = [
+          "iam:Get*",
+          "iam:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "Route53Read"
+        Effect = "Allow"
+        Action = [
+          "route53:Get*",
+          "route53:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CloudWatchRead"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:Describe*",
+          "cloudwatch:Get*",
+          "cloudwatch:List*",
+          "logs:Describe*",
+          "logs:Get*",
+          "logs:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "EFSRead"
+        Effect = "Allow"
+        Action = [
+          "elasticfilesystem:Describe*",
+          "elasticfilesystem:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "LambdaRead"
+        Effect = "Allow"
+        Action = [
+          "lambda:Get*",
+          "lambda:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "AutoScalingRead"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:Describe*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ELBRead"
+        Effect = "Allow"
+        Action = [
+          "elasticloadbalancing:Describe*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SSMMetadataRead"
+        Effect = "Allow"
+        Action = [
+          "ssm:Describe*",
+          "ssm:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SSMParameterRead"
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+          "ssm:GetParametersByPath"
+        ]
+        Resource = [
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/*",
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/layerv/nhp/${var.environment}/*",
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.name_prefix}/*",
+          # Shared registration keypair path; this intentionally has no
+          # environment segment.
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/nhp/pool/*",
+          "arn:aws:ssm:${local.region}::parameter/aws/service/canonical/ubuntu/*"
+        ]
+      },
+      {
+        Sid    = "CloudTrailRead"
+        Effect = "Allow"
+        Action = [
+          "cloudtrail:Describe*",
+          "cloudtrail:Get*",
+          "cloudtrail:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SecurityServicesRead"
+        Effect = "Allow"
+        Action = [
+          "guardduty:Get*",
+          "guardduty:List*",
+          "securityhub:Describe*",
+          "securityhub:Get*",
+          "securityhub:List*",
+          "config:Describe*",
+          "config:Get*",
+          "config:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        # Some KMS metadata/list APIs are account-level and do not carry
+        # aws:ResourceAccount. Keep IfExists here; decrypt below uses a strict
+        # account match plus alias allowlist.
+        Sid    = "KMSMetadataRead"
+        Effect = "Allow"
+        Action = [
+          "kms:Describe*",
+          "kms:Get*",
+          "kms:List*"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEqualsIfExists = {
+            "aws:ResourceAccount" = local.account_id
+          }
+        }
+      },
+      {
+        Sid    = "KMSDecryptInAccount"
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:ResourceAccount" = local.account_id
+          }
+          "ForAnyValue:StringLike" = {
+            "kms:ResourceAliases" = [
+              "alias/terraform-state",
+              "alias/${var.name_prefix}-ebs",
+              "alias/${var.name_prefix}-efs",
+              "alias/${var.name_prefix}-secrets",
+              "alias/${var.name_prefix}-logs",
+              "alias/${var.name_prefix}-rds",
+              "alias/${var.name_prefix}-cert"
+            ]
+          }
+        }
+      },
+      {
+        Sid    = "EventBridgeRead"
+        Effect = "Allow"
+        Action = [
+          "events:Describe*",
+          "events:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SNSRead"
+        Effect = "Allow"
+        Action = [
+          "sns:Get*",
+          "sns:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ACMRead"
+        Effect = "Allow"
+        Action = [
+          "acm:Describe*",
+          "acm:Get*",
+          "acm:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ServiceDiscoveryRead"
+        Effect = "Allow"
+        Action = [
+          "servicediscovery:Get*",
+          "servicediscovery:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SecretsManagerRead"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:Describe*",
+          "secretsmanager:Get*"
+        ]
+        Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:layerv-nhp-*"
+      },
+      {
+        Sid    = "WAFRead"
+        Effect = "Allow"
+        Action = [
+          "wafv2:Get*",
+          "wafv2:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CloudFrontRead"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:Get*",
+          "cloudfront:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ECRRead"
+        Effect = "Allow"
+        Action = [
+          "ecr:Describe*",
+          "ecr:Get*",
+          "ecr:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ECSRead"
+        Effect = "Allow"
+        Action = [
+          "ecs:Describe*",
+          "ecs:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "DynamoDBRead"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:Describe*",
+          "dynamodb:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ChatbotRead"
+        Effect = "Allow"
+        Action = [
+          "chatbot:Describe*",
+          "chatbot:Get*",
+          "chatbot:List*"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "terraform_plan_pr_read" {
+  count = local.enable_terraform_plan_pr_role ? 1 : 0
+
+  role       = aws_iam_role.github_actions_terraform_plan_pr[0].name
+  policy_arn = aws_iam_policy.terraform_plan_pr_read[0].arn
 }
 
 # Terraform apply permissions - split into customer-managed policies
@@ -2621,6 +2994,11 @@ output "github_actions_role_arn" {
 output "github_actions_role_name" {
   description = "GitHub Actions IAM role name"
   value       = aws_iam_role.github_actions.name
+}
+
+output "github_actions_terraform_plan_pr_role_arn" {
+  description = "Sandbox-only read-only IAM role ARN for terraform-plan-pr.yml. Store in GitHub Actions repo secret AWS_TERRAFORM_PLAN_PR_ROLE_ARN."
+  value       = try(aws_iam_role.github_actions_terraform_plan_pr[0].arn, null)
 }
 
 output "github_oidc_provider_arn" {

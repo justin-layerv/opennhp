@@ -23,6 +23,11 @@ output "github_actions_role_arn" {
   value       = module.ecr.github_actions_role_arn
 }
 
+output "github_actions_terraform_plan_pr_role_arn" {
+  description = "Sandbox-only read-only IAM role ARN for terraform-plan-pr.yml. Store in GitHub Actions repo secret AWS_TERRAFORM_PLAN_PR_ROLE_ARN."
+  value       = module.ecr.github_actions_terraform_plan_pr_role_arn
+}
+
 output "github_actions_packer_role_arn" {
   description = "Dedicated IAM role ARN for the build-and-push.yml::packer-build Server and AC AMI builds. Store in GitHub Actions repo secret AWS_PACKER_SANDBOX_ROLE_ARN (sandbox) or AWS_PACKER_PROD_ROLE_ARN (prod). See terraform/modules/ecr/packer.tf for the rationale."
   value       = module.ecr.github_actions_packer_role_arn

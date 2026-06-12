@@ -12,6 +12,41 @@ During review, confirm either the task ledger was updated or the PR has no
 pre-rollout, rollout, or post-rollout tasks. Do not add entries just to
 describe behavior changes.
 
+## PR-Time Terraform Plan Security
+
+`terraform-plan-pr.yml` is an explicit, same-repo exception to the #1121
+"no PR-time AWS credentials" posture. The plan role is non-mutating and
+sandbox-only, but it can still read sandbox state, SSM values including
+SecureStrings, Secrets Manager values, and KMS-decrypted material needed for
+refresh. The role uses a dedicated plan-read managed policy rather than the
+normal CI `terraform_read` policy so future apply-role read expansions do not
+implicitly widen the PR identity; SSM value reads are scoped to NHP environment
+paths, the shared registration public-key path, and the public Canonical AMI
+path, S3 object reads are scoped to Terraform state plus NHP-managed/plugin
+bucket patterns, and KMS decrypt is constrained to the Terraform state alias
+plus NHP key aliases with `kms:ResourceAliases`. The workflow also fetches
+Auth0 Terraform credentials before planning, so the rollout sign-off must
+confirm that PR-head code execution with the short-lived Auth0 token and
+sandbox read role is accepted, including plan-time exfil paths such as
+`data.http`, the `external` provider, and provider endpoint overrides. It must
+also confirm that the Auth0
+Terraform client grant is read-only or any write-capable exposure is explicitly
+accepted. The workflow restores its helper action/script paths from the trusted
+base commit before exposing the long-lived Auth0 client secret, and it fetches
+the Auth0 token using a base-commit copy of sandbox `terraform.tfvars` so
+PR-head `auth0_domain` edits cannot redirect the client-secret POST. Terraform
+HCL and tfvars still execute from the PR head during plan.
+AWS IAM cannot evaluate GitHub `workflow_ref`/`job_workflow_ref` custom claims,
+so the IAM trust is repo-wide `pull_request` and the fork/secret gates are
+workflow-level controls. Before making `Terraform Plan (PR)` required, confirm
+the PR #2464 rollout-ledger security sign-off accepts that push access to
+`layervai/nhp` is inside this sandbox-secret-read trust boundary; otherwise
+replace the gate with an environment-approval, trusted-author, or narrower-policy
+design first. A GitHub Environment is the standard tighter OIDC path because it
+changes the AWS-matchable `sub` to `repo:ORG/REPO:environment:NAME`. Prod-only
+Terraform PRs should skip the sandbox plan and rely on prod validation rather
+than being blocked by unrelated sandbox state.
+
 ## State Drift Protection for CI/CD-Managed Values
 
 Some SSM parameters are created by Terraform but updated by CI/CD (e.g., image tags, blue/green deployment state). These use `lifecycle { ignore_changes = [value] }` to prevent Terraform from overwriting CI/CD updates:

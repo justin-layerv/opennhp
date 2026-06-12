@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_PATH = REPO_ROOT / ".github" / "scripts" / "check-terraform-plan-pr-policy-readonly.py"
+
+DEFAULT_SSM_RESOURCES = (
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/*",
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/layerv/nhp/${var.environment}/*",
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.name_prefix}/*",
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/nhp/pool/*",
+    "arn:aws:ssm:${local.region}::parameter/aws/service/canonical/ubuntu/*",
+)
+
+
+def hcl_string_list(values: tuple[str, ...]) -> str:
+    body = ",\n".join(f'            "{value}"' for value in values)
+    return f"[\n{body}\n          ]"
+
+
+def policy_fixture(
+    *extra_statements: str,
+    ssm_resources: tuple[str, ...] = DEFAULT_SSM_RESOURCES,
+) -> str:
+    statements = [
+        """
+        {
+          Sid    = "SSMParameterRead"
+          Effect = "Allow"
+          Action = [
+            "ssm:GetParameter",
+            "ssm:GetParameters"
+          ]
+          Resource = __SSM_RESOURCES__
+        }
+        """.replace("__SSM_RESOURCES__", hcl_string_list(ssm_resources)),
+        """
+        {
+          Sid    = "SecretsManagerRead"
+          Effect = "Allow"
+          Action = [
+            "secretsmanager:GetSecretValue"
+          ]
+          Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:layerv-nhp-*"
+        }
+        """,
+        """
+        {
+          Sid    = "S3ObjectRead"
+          Effect = "Allow"
+          Action = [
+            "s3:GetObject"
+          ]
+          Resource = local.terraform_plan_pr_s3_object_arns
+          Condition = {
+            StringEquals = {
+              "aws:ResourceAccount" = local.account_id
+            }
+          }
+        }
+        """,
+        """
+        {
+          Sid    = "KMSDecryptInAccount"
+          Effect = "Allow"
+          Action = [
+            "kms:Decrypt"
+          ]
+          Resource = "*"
+          Condition = {
+            StringEquals = {
+              "aws:ResourceAccount" = local.account_id
+            }
+            "ForAnyValue:StringLike" = {
+              "kms:ResourceAliases" = [
+                "alias/terraform-state",
+                "alias/${var.name_prefix}-ebs",
+                "alias/${var.name_prefix}-efs",
+                "alias/${var.name_prefix}-secrets",
+                "alias/${var.name_prefix}-logs",
+                "alias/${var.name_prefix}-rds",
+                "alias/${var.name_prefix}-cert"
+              ]
+            }
+          }
+        }
+        """,
+        """
+        {
+          Sid    = "DynamoDBRead"
+          Effect = "Allow"
+          Action = [
+            "dynamodb:DescribeTable",
+            "dynamodb:ListTables"
+          ]
+          Resource = "*"
+        }
+        """,
+        *extra_statements,
+    ]
+    rendered_statements = ",\n".join(textwrap.dedent(stmt).strip() for stmt in statements)
+    return textwrap.dedent(
+        f"""
+        resource "aws_iam_policy" "terraform_plan_pr_read" {{
+          policy = jsonencode({{
+            Version = "2012-10-17"
+            Statement = [
+        {textwrap.indent(rendered_statements, "      ")}
+            ]
+          }})
+        }}
+        """
+    ).lstrip()
+
+
+class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
+    def run_lint(self, terraform_text: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            terraform_root = Path(tmpdir)
+            (terraform_root / "main.tf").write_text(terraform_text, encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), str(terraform_root)],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+    def run_lint_with_replacement(self, old: str, new: str) -> subprocess.CompletedProcess[str]:
+        terraform_text = policy_fixture()
+        self.assertIn(old, terraform_text)
+        return self.run_lint(terraform_text.replace(old, new))
+
+    def test_fixture_policy_passes(self) -> None:
+        result = self.run_lint(policy_fixture())
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("terraform_plan_pr_read policy actions", result.stdout)
+
+    def test_dynamodb_getitem_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid    = "DynamoDBGetItem"
+                  Effect = "Allow"
+                  Action = [
+                    "dynamodb:GetItem"
+                  ]
+                  Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-*"
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("dynamodb:getitem", result.stderr)
+
+    def test_sensitive_ec2_get_wildcard_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid    = "EC2GetWildcard"
+                  Effect = "Allow"
+                  Action = [
+                    "ec2:Get*"
+                  ]
+                  Resource = "*"
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("ec2:get*", result.stderr)
+
+    def test_sensitive_ec2_console_read_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid      = "EC2ConsoleOutput"
+                  Effect   = "Allow"
+                  Action   = "ec2:GetConsoleOutput"
+                  Resource = "*"
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("ec2:getconsoleoutput", result.stderr)
+
+    def test_sensitive_ec2_launch_template_data_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid      = "EC2LaunchTemplateData"
+                  Effect   = "Allow"
+                  Action   = "ec2:GetLaunchTemplateData"
+                  Resource = "*"
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("ec2:getlaunchtemplatedata", result.stderr)
+
+    def test_value_bearing_reads_must_use_scoped_sids(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid    = "AccidentalBroadSecretRead"
+                  Effect = "Allow"
+                  Action = [
+                    "secretsmanager:GetSecretValue"
+                  ]
+                  Resource = "*"
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("value-bearing read action", result.stderr)
+        self.assertIn("secretsmanager:getsecretvalue", result.stderr)
+
+    def test_iam_passrole_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid      = "PassRole"
+                  Effect   = "Allow"
+                  Action   = "iam:PassRole"
+                  Resource = "*"
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("iam:passrole", result.stderr)
+
+    def test_broad_ssm_parameter_scope_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                ssm_resources=(
+                    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/*",
+                    "arn:aws:ssm:${local.region}::parameter/aws/service/canonical/ubuntu/*",
+                )
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SSMParameterRead resources", result.stderr)
+
+    def test_s3_resource_account_condition_is_required(self) -> None:
+        result = self.run_lint_with_replacement(
+            """Condition = {
+    StringEquals = {
+      "aws:ResourceAccount" = local.account_id
+    }
+  }""",
+            "",
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("S3ObjectRead must require aws:ResourceAccount", result.stderr)
+
+    def test_broad_secretsmanager_secret_scope_is_rejected(self) -> None:
+        result = self.run_lint_with_replacement(
+            'Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:layerv-nhp-*"',
+            'Resource = "*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SecretsManagerRead must stay scoped", result.stderr)
+
+    def test_secretsmanager_list_actions_are_rejected(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"secretsmanager:GetSecretValue"',
+            '"secretsmanager:GetSecretValue",\n            "secretsmanager:ListSecrets"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SecretsManagerRead must not include Secrets Manager List", result.stderr)
+
+    def test_kms_alias_allowlist_is_enforced(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"alias/${var.name_prefix}-cert"',
+            '"alias/${var.name_prefix}-admin"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("KMSDecryptInAccount aliases", result.stderr)
+
+    def test_allow_notaction_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid       = "NotAction"
+                  Effect    = "Allow"
+                  NotAction = [
+                    "iam:DeleteRole"
+                  ]
+                  Resource = "*"
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("Allow statements must not use NotAction", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

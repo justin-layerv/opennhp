@@ -200,6 +200,13 @@ jobs:
       - name: Test AMI ID manifest parser
         run: bash tests/scripts/ami-id-from-manifest_test.sh
 
+      # The Terraform Plan (PR) gate is requireable, so its change classifier
+      # must not silently misclassify Terraform changes as docs-only or prod-only.
+      - name: Test Terraform Plan PR change classifier
+        run: |
+          shellcheck .github/scripts/classify-terraform-plan-pr-changes.sh tests/scripts/classify-terraform-plan-pr-changes_test.sh
+          bash tests/scripts/classify-terraform-plan-pr-changes_test.sh
+
       # Structural fence for the dependabot-go-tidy bot-identity preflight
       # (PR #1777). PR #1384 used `gh api /user`, which 403s on App
       # installation tokens; PR #1777 swapped to the action's `app-slug`

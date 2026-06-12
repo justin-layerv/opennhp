@@ -128,6 +128,30 @@ short-lived STS credentials). The setup job's `Validate dispatch
 ref` step fails fast with this guidance; don't loosen the trust
 policy to "fix" a feature-branch dispatch.
 
+`terraform-plan-pr.yml` is the narrow PR-time exception for sandbox
+planning. Its OIDC trust uses the `pull_request` subject, so same-repo
+PR authors are inside the trust boundary; fork PRs are rejected before
+secrets or AWS credentials are used. AWS IAM cannot scope this trust to
+`workflow_ref`, so the file-level controls are workflow-side, not IAM-side.
+Keep that workflow sandbox-only and non-mutating, but remember the role can
+read sandbox tfstate, NHP-scoped SSM SecureStrings, Secrets Manager values, and
+KMS-decrypted material from the Terraform state alias and NHP KMS aliases. S3
+object reads are scoped to Terraform state plus NHP-managed/plugin bucket
+patterns, while S3 metadata/list and IAM reads remain broad for Terraform
+refresh. It uses a dedicated plan-read policy, not the normal CI
+`terraform_read` policy.
+Avoid passing live app-level secrets unless a provider actually needs them for
+plan accuracy. Before exposing the long-lived Auth0 client secret, the workflow
+restores its local helper action/script paths and the Auth0 token-fetch tfvars
+from the trusted base commit, but `terraform plan` still executes PR-head
+HCL/tfvars with the short-lived Auth0 token and sandbox read role. Security
+sign-off must explicitly accept plan-time exfil paths such as `data.http`, the
+`external` provider, and provider endpoint overrides. The Auth0 Terraform
+client grant must be explicitly accepted before the check is made required,
+especially if the grant can mutate Auth0. Prod-only Terraform PRs should remain
+an informational skip in this workflow instead of gating unrelated prod changes
+on sandbox state.
+
 ```bash
 # Force a sandbox build/deploy after a path-only merge (e.g.,
 # .trivyignore-only PRs that didn't trigger the workflow on push):
