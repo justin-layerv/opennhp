@@ -27,12 +27,15 @@ EXACT_ALLOWED_ACTIONS = {
     "kms:decrypt",
 }
 VALUE_BEARING_SCOPED_SIDS = {
+    "APIGatewayRead",
     "KMSDecryptInAccount",
     "S3ObjectRead",
     "SecretsManagerRead",
+    "SSMDocumentRead",
     "SSMParameterRead",
 }
 VALUE_BEARING_ACTIONS = {
+    "apigateway:get",
     "kms:decrypt",
     "s3:get*",
     "s3:getobject",
@@ -40,14 +43,15 @@ VALUE_BEARING_ACTIONS = {
     "secretsmanager:get*",
     "secretsmanager:getsecretvalue",
     "ssm:get*",
+    "ssm:getdocument",
     "ssm:getparameter",
     "ssm:getparameter*",
     "ssm:getparameters",
     "ssm:getparametersbypath",
 }
 FORBIDDEN_ACTIONS = {
-    # The PR plan role refreshes DynamoDB table metadata only. Item reads expose
-    # application data and are not needed for sandbox plans with S3 locking.
+    # The PR plan role does not perform live state refresh; item reads expose
+    # application data and role pivots are outside the PR-time trust boundary.
     "dynamodb:getitem",
     "ec2:get*",
     "ec2:getconsoleoutput",
@@ -60,12 +64,52 @@ FORBIDDEN_ACTIONS = {
 }
 POLICY_RESOURCE_TYPE = "aws_iam_policy"
 POLICY_RESOURCE_NAME = "terraform_plan_pr_read"
+SSM_PARAMETER_READ_ACTIONS = {
+    "ssm:getparameter",
+    "ssm:getparameters",
+    "ssm:getparametersbypath",
+}
 SSM_PARAMETER_READ_RESOURCES = {
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/*",
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/api-audience",
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/domain",
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/spa-client-id",
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/layerv/nhp/${var.environment}/*",
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.name_prefix}/*",
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/nhp/pool/*",
     "arn:aws:ssm:${local.region}::parameter/aws/service/canonical/ubuntu/*",
+}
+SSM_DOCUMENT_READ_RESOURCES = {
+    "arn:aws:ssm:${local.region}:${local.account_id}:document/${var.name_prefix}-*",
+    "arn:aws:ssm:${local.region}:${local.account_id}:document/traefik-plugins-${var.environment}-*",
+}
+SECRETS_MANAGER_READ_ACTIONS = {
+    "secretsmanager:describe*",
+    "secretsmanager:get*",
+}
+S3_OBJECT_READ_ACTIONS = {
+    "s3:getobject*",
+}
+KMS_DECRYPT_ACTIONS = {
+    "kms:decrypt",
+}
+APIGATEWAY_READ_ACTIONS = {
+    "apigateway:get",
+}
+APIGATEWAY_READ_RESOURCES = {
+    "arn:aws:apigateway:${local.region}::/*",
+}
+SQS_READ_ACTIONS = {
+    "sqs:getqueueattributes",
+    "sqs:getqueueurl",
+    "sqs:listqueuetags",
+}
+SQS_READ_RESOURCES = {
+    "arn:aws:sqs:${local.region}:${local.account_id}:layerv-nhp-*",
+}
+ELASTICACHE_READ_ACTIONS = {
+    "elasticache:describe*",
+    "elasticache:list*",
 }
 KMS_DECRYPT_ALIASES = {
     "alias/terraform-state",
@@ -114,13 +158,22 @@ def condition_values(stmt: dict, operator: str, key: str) -> list[str]:
     return normalized_strings(raw)
 
 
+def statement_effect(stmt: dict) -> str:
+    effect = stmt.get("Effect", "Allow")
+    return unquote(effect).lower() if isinstance(effect, str) else ""
+
+
+def is_allow_statement(stmt: dict) -> bool:
+    return statement_effect(stmt) == "allow"
+
+
 def statements_by_sid(policy: dict) -> dict[str, dict]:
     by_sid: dict[str, dict] = {}
     for stmt in policy.get("Statement", []) or []:
         if not isinstance(stmt, dict):
             continue
         sid = stmt.get("Sid")
-        if isinstance(sid, str):
+        if isinstance(sid, str) and is_allow_statement(stmt):
             by_sid[unquote(sid)] = stmt
     return by_sid
 
@@ -135,6 +188,8 @@ def validate_sensitive_statement_scopes(file: Path, policy: dict) -> list[str]:
 
     for stmt in policy.get("Statement", []) or []:
         if not isinstance(stmt, dict):
+            continue
+        if not is_allow_statement(stmt):
             continue
         sid = unquote(stmt.get("Sid", "<missing Sid>")) if isinstance(stmt.get("Sid"), str) else "<missing Sid>"
         if sid in VALUE_BEARING_SCOPED_SIDS:
@@ -154,17 +209,30 @@ def validate_sensitive_statement_scopes(file: Path, policy: dict) -> list[str]:
     if not ssm:
         violations.append("missing SSMParameterRead")
     else:
+        ssm_actions = {action.lower() for action in normalized_strings(ssm.get("Action"))}
+        if ssm_actions != SSM_PARAMETER_READ_ACTIONS:
+            violations.append("SSMParameterRead actions must stay on the reviewed SSM parameter read allowlist")
         ssm_resources = set(normalized_strings(ssm.get("Resource")))
         if ssm_resources != SSM_PARAMETER_READ_RESOURCES:
             violations.append("SSMParameterRead resources must stay on the reviewed SSM path allowlist")
+
+    ssm_document = statements.get("SSMDocumentRead")
+    if not ssm_document:
+        violations.append("missing SSMDocumentRead")
+    else:
+        ssm_document_actions = {action.lower() for action in normalized_strings(ssm_document.get("Action"))}
+        if ssm_document_actions != {"ssm:getdocument"}:
+            violations.append("SSMDocumentRead must only include ssm:GetDocument")
+        if set(normalized_strings(ssm_document.get("Resource"))) != SSM_DOCUMENT_READ_RESOURCES:
+            violations.append("SSMDocumentRead resources must stay on the reviewed SSM document allowlist")
 
     secrets = statements.get("SecretsManagerRead")
     if not secrets:
         violations.append("missing SecretsManagerRead")
     else:
         secrets_actions = {action.lower() for action in normalized_strings(secrets.get("Action"))}
-        if any(action.startswith("secretsmanager:list") for action in secrets_actions):
-            violations.append("SecretsManagerRead must not include Secrets Manager List* actions")
+        if secrets_actions != SECRETS_MANAGER_READ_ACTIONS:
+            violations.append("SecretsManagerRead actions must stay on Describe*/Get* only")
         secrets_resources = normalized_strings(secrets.get("Resource"))
         if secrets_resources != [
             "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:layerv-nhp-*"
@@ -175,6 +243,9 @@ def validate_sensitive_statement_scopes(file: Path, policy: dict) -> list[str]:
     if not s3:
         violations.append("missing S3ObjectRead")
     else:
+        s3_actions = {action.lower() for action in normalized_strings(s3.get("Action"))}
+        if s3_actions != S3_OBJECT_READ_ACTIONS:
+            violations.append("S3ObjectRead actions must stay on s3:GetObject* only")
         if normalized_strings(s3.get("Resource")) != ["${local.terraform_plan_pr_s3_object_arns}"]:
             violations.append("S3ObjectRead must use local.terraform_plan_pr_s3_object_arns")
         if condition_values(s3, "StringEquals", "aws:ResourceAccount") != ["${local.account_id}"]:
@@ -184,6 +255,9 @@ def validate_sensitive_statement_scopes(file: Path, policy: dict) -> list[str]:
     if not kms:
         violations.append("missing KMSDecryptInAccount")
     else:
+        kms_actions = {action.lower() for action in normalized_strings(kms.get("Action"))}
+        if kms_actions != KMS_DECRYPT_ACTIONS:
+            violations.append("KMSDecryptInAccount must only include kms:Decrypt")
         if normalized_strings(kms.get("Resource")) != ["*"]:
             violations.append("KMSDecryptInAccount resource shape changed; update this lint intentionally")
         if condition_values(kms, "StringEquals", "aws:ResourceAccount") != ["${local.account_id}"]:
@@ -191,6 +265,36 @@ def validate_sensitive_statement_scopes(file: Path, policy: dict) -> list[str]:
         aliases = set(condition_values(kms, "ForAnyValue:StringLike", "kms:ResourceAliases"))
         if aliases != KMS_DECRYPT_ALIASES:
             violations.append("KMSDecryptInAccount aliases must stay on the reviewed NHP alias allowlist")
+
+    apigateway = statements.get("APIGatewayRead")
+    if not apigateway:
+        violations.append("missing APIGatewayRead")
+    else:
+        apigateway_actions = {action.lower() for action in normalized_strings(apigateway.get("Action"))}
+        if apigateway_actions != APIGATEWAY_READ_ACTIONS:
+            violations.append("APIGatewayRead must only include apigateway:GET")
+        if set(normalized_strings(apigateway.get("Resource"))) != APIGATEWAY_READ_RESOURCES:
+            violations.append("APIGatewayRead resources must stay on the reviewed API Gateway refresh path")
+
+    sqs = statements.get("SQSRead")
+    if not sqs:
+        violations.append("missing SQSRead")
+    else:
+        sqs_actions = {action.lower() for action in normalized_strings(sqs.get("Action"))}
+        if sqs_actions != SQS_READ_ACTIONS:
+            violations.append("SQSRead actions must stay on queue-attribute reads only")
+        if set(normalized_strings(sqs.get("Resource"))) != SQS_READ_RESOURCES:
+            violations.append("SQSRead resources must stay scoped to layerv-nhp queues")
+
+    elasticache = statements.get("ElastiCacheRead")
+    if not elasticache:
+        violations.append("missing ElastiCacheRead")
+    else:
+        elasticache_actions = {action.lower() for action in normalized_strings(elasticache.get("Action"))}
+        if elasticache_actions != ELASTICACHE_READ_ACTIONS:
+            violations.append("ElastiCacheRead actions must stay on Describe*/List* only")
+        if normalized_strings(elasticache.get("Resource")) != ["*"]:
+            violations.append("ElastiCacheRead resource shape changed; update this lint intentionally")
 
     if violations:
         for violation in violations:

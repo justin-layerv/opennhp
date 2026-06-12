@@ -17,6 +17,9 @@ from _tf_lint_lib import extract_policy_body, iter_resources, parse_tf_files, un
 
 DEFAULT_SSM_RESOURCES = (
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/*",
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/api-audience",
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/domain",
+    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/spa-client-id",
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/layerv/nhp/${var.environment}/*",
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.name_prefix}/*",
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/nhp/pool/*",
@@ -64,17 +67,32 @@ def policy_fixture(
           Effect = "Allow"
           Action = [
             "ssm:GetParameter",
-            "ssm:GetParameters"
+            "ssm:GetParameters",
+            "ssm:GetParametersByPath"
           ]
           Resource = __SSM_RESOURCES__
         }
         """.replace("__SSM_RESOURCES__", hcl_string_list(ssm_resources)),
         """
         {
+          Sid    = "SSMDocumentRead"
+          Effect = "Allow"
+          Action = [
+            "ssm:GetDocument"
+          ]
+          Resource = [
+            "arn:aws:ssm:${local.region}:${local.account_id}:document/${var.name_prefix}-*",
+            "arn:aws:ssm:${local.region}:${local.account_id}:document/traefik-plugins-${var.environment}-*"
+          ]
+        }
+        """,
+        """
+        {
           Sid    = "SecretsManagerRead"
           Effect = "Allow"
           Action = [
-            "secretsmanager:GetSecretValue"
+            "secretsmanager:Describe*",
+            "secretsmanager:Get*"
           ]
           Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:layerv-nhp-*"
         }
@@ -84,7 +102,7 @@ def policy_fixture(
           Sid    = "S3ObjectRead"
           Effect = "Allow"
           Action = [
-            "s3:GetObject"
+            "s3:GetObject*"
           ]
           Resource = local.terraform_plan_pr_s3_object_arns
           Condition = {
@@ -127,6 +145,39 @@ def policy_fixture(
           Action = [
             "dynamodb:DescribeTable",
             "dynamodb:ListTables"
+          ]
+          Resource = "*"
+        }
+        """,
+        """
+        {
+          Sid    = "APIGatewayRead"
+          Effect = "Allow"
+          Action = [
+            "apigateway:GET"
+          ]
+          Resource = "arn:aws:apigateway:${local.region}::/*"
+        }
+        """,
+        """
+        {
+          Sid    = "SQSRead"
+          Effect = "Allow"
+          Action = [
+            "sqs:GetQueueAttributes",
+            "sqs:GetQueueUrl",
+            "sqs:ListQueueTags"
+          ]
+          Resource = "arn:aws:sqs:${local.region}:${local.account_id}:layerv-nhp-*"
+        }
+        """,
+        """
+        {
+          Sid    = "ElastiCacheRead"
+          Effect = "Allow"
+          Action = [
+            "elasticache:Describe*",
+            "elasticache:List*"
           ]
           Resource = "*"
         }
@@ -191,6 +242,151 @@ class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
         self.assertIn("dynamodb:getitem", result.stderr)
+
+    def test_sts_assume_role_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid      = "GeneralAssumeRole"
+                  Effect   = "Allow"
+                  Action   = "sts:AssumeRole"
+                  Resource = "arn:aws:iam::165115313779:role/nhp-cost-analytics-plan-readonly"
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("sts:assumerole", result.stderr)
+
+    def test_sts_assume_role_inside_scoped_sid_is_rejected(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"kms:Decrypt"',
+            '"kms:Decrypt",\n            "sts:AssumeRole"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("sts:assumerole", result.stderr)
+
+    def test_ssm_document_broad_scope_is_rejected(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:ssm:${local.region}:${local.account_id}:document/${var.name_prefix}-*"',
+            '"arn:aws:ssm:${local.region}:${local.account_id}:document/*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SSMDocumentRead resources", result.stderr)
+
+    def test_ssm_document_extra_action_is_rejected(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"ssm:GetDocument"',
+            '"ssm:GetDocument",\n            "ssm:GetParameter"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SSMDocumentRead must only include", result.stderr)
+
+    def test_apigateway_read_action_is_pinned(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"apigateway:GET"',
+            '"apigateway:GET",\n            "apigateway:List*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("APIGatewayRead must only include", result.stderr)
+
+    def test_apigateway_read_resource_is_pinned(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:apigateway:${local.region}::/*"',
+            '"*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("APIGatewayRead resources", result.stderr)
+
+    def test_apigateway_read_sid_is_required(self) -> None:
+        result = self.run_lint_with_replacement(
+            'Sid    = "APIGatewayRead"',
+            'Sid    = "APIGatewayRenamed"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("missing APIGatewayRead", result.stderr)
+
+    def test_sqs_read_action_is_pinned(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"sqs:ListQueueTags"',
+            '"sqs:ListQueueTags",\n            "sqs:ListQueues"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SQSRead actions", result.stderr)
+
+    def test_sqs_read_resource_is_pinned(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:sqs:${local.region}:${local.account_id}:layerv-nhp-*"',
+            '"arn:aws:sqs:${local.region}:${local.account_id}:*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SQSRead resources", result.stderr)
+
+    def test_sqs_read_sid_is_required(self) -> None:
+        result = self.run_lint_with_replacement(
+            'Sid    = "SQSRead"',
+            'Sid    = "SQSRenamed"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("missing SQSRead", result.stderr)
+
+    def test_elasticache_read_action_is_pinned(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"elasticache:List*"',
+            '"elasticache:List*",\n            "elasticache:ListTagsForResource"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("ElastiCacheRead actions", result.stderr)
+
+    def test_elasticache_read_resource_is_pinned(self) -> None:
+        result = self.run_lint_with_replacement(
+            textwrap.dedent(
+                """
+                Sid    = "ElastiCacheRead"
+                  Effect = "Allow"
+                  Action = [
+                    "elasticache:Describe*",
+                    "elasticache:List*"
+                  ]
+                  Resource = "*"
+                """
+            ).strip(),
+            textwrap.dedent(
+                """
+                Sid    = "ElastiCacheRead"
+                  Effect = "Allow"
+                  Action = [
+                    "elasticache:Describe*",
+                    "elasticache:List*"
+                  ]
+                  Resource = "arn:aws:elasticache:${local.region}:${local.account_id}:cluster/*"
+                """
+            ).strip(),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("ElastiCacheRead resource shape changed", result.stderr)
+
+    def test_elasticache_read_sid_is_required(self) -> None:
+        result = self.run_lint_with_replacement(
+            'Sid    = "ElastiCacheRead"',
+            'Sid    = "ElastiCacheRenamed"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("missing ElastiCacheRead", result.stderr)
 
     def test_sensitive_ec2_get_wildcard_is_rejected(self) -> None:
         result = self.run_lint(
@@ -265,6 +461,22 @@ class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
         self.assertIn("value-bearing read action", result.stderr)
         self.assertIn("secretsmanager:getsecretvalue", result.stderr)
 
+    def test_duplicate_deny_sid_does_not_override_allow_scope(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid      = "SSMParameterRead"
+                  Effect   = "Deny"
+                  Action   = "ssm:GetParameter"
+                  Resource = "*"
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
     def test_iam_passrole_is_rejected(self) -> None:
         result = self.run_lint(
             policy_fixture(
@@ -295,6 +507,44 @@ class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
         self.assertIn("SSMParameterRead resources", result.stderr)
 
+    def test_auth0_ssm_parameter_scope_is_required(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                ssm_resources=tuple(
+                    resource for resource in DEFAULT_SSM_RESOURCES if "/auth0/" not in resource
+                )
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SSMParameterRead resources", result.stderr)
+
+    def test_auth0_ssm_parameter_wildcard_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                ssm_resources=(
+                    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/*",
+                    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/*",
+                    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/layerv/nhp/${var.environment}/*",
+                    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.name_prefix}/*",
+                    "arn:aws:ssm:${local.region}:${local.account_id}:parameter/nhp/pool/*",
+                    "arn:aws:ssm:${local.region}::parameter/aws/service/canonical/ubuntu/*",
+                )
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SSMParameterRead resources", result.stderr)
+
+    def test_ssm_parameter_extra_action_is_rejected(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"ssm:GetParameters"',
+            '"ssm:GetParameters",\n            "ssm:GetDocument"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("SSMParameterRead actions", result.stderr)
+
     def test_s3_resource_account_condition_is_required(self) -> None:
         result = self.run_lint_with_replacement(
             """Condition = {
@@ -319,12 +569,12 @@ class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
 
     def test_secretsmanager_list_actions_are_rejected(self) -> None:
         result = self.run_lint_with_replacement(
-            '"secretsmanager:GetSecretValue"',
-            '"secretsmanager:GetSecretValue",\n            "secretsmanager:ListSecrets"',
+            '"secretsmanager:Get*"',
+            '"secretsmanager:Get*",\n            "secretsmanager:ListSecrets"',
         )
 
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
-        self.assertIn("SecretsManagerRead must not include Secrets Manager List", result.stderr)
+        self.assertIn("SecretsManagerRead actions", result.stderr)
 
     def test_kms_alias_allowlist_is_enforced(self) -> None:
         result = self.run_lint_with_replacement(

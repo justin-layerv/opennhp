@@ -21,10 +21,16 @@ SecureStrings, Secrets Manager values, and KMS-decrypted material needed for
 refresh. The role uses a dedicated plan-read managed policy rather than the
 normal CI `terraform_read` policy so future apply-role read expansions do not
 implicitly widen the PR identity; SSM value reads are scoped to NHP environment
-paths, the shared registration public-key path, and the public Canonical AMI
-path, S3 object reads are scoped to Terraform state plus NHP-managed/plugin
-bucket patterns, and KMS decrypt is constrained to the Terraform state alias
-plus NHP key aliases with `kms:ResourceAliases`. The workflow also fetches
+paths, the three Auth0 public SPA-output parameters (`api-audience`, `domain`,
+`spa-client-id`), the shared registration public-key path, and the public
+Canonical AMI path. `ssm:GetDocument` is scoped to NHP and traefik-plugins
+sandbox documents. S3 object reads are scoped to Terraform state plus
+NHP-managed/plugin bucket patterns, SQS reads are limited to queue attributes,
+queue URLs, and queue tags on `layerv-nhp-*` queues, ElastiCache reads are
+`Describe*`/`List*`, and API Gateway reads use `apigateway:GET` and are treated
+as value-bearing because API Gateway can return plaintext API key values. KMS
+decrypt is constrained to the Terraform state alias plus NHP key aliases with
+`kms:ResourceAliases`. The workflow also fetches
 Auth0 Terraform credentials before planning, so the rollout sign-off must
 confirm that PR-head code execution with the short-lived Auth0 token and
 sandbox read role is accepted, including plan-time exfil paths such as

@@ -1454,12 +1454,26 @@ resource "aws_iam_policy" "terraform_plan_pr_read" {
         ]
         Resource = [
           "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/*",
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/api-audience",
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/domain",
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/auth0/spa-client-id",
           "arn:aws:ssm:${local.region}:${local.account_id}:parameter/layerv/nhp/${var.environment}/*",
           "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.name_prefix}/*",
           # Shared registration keypair path; this intentionally has no
           # environment segment.
           "arn:aws:ssm:${local.region}:${local.account_id}:parameter/nhp/pool/*",
           "arn:aws:ssm:${local.region}::parameter/aws/service/canonical/ubuntu/*"
+        ]
+      },
+      {
+        Sid    = "SSMDocumentRead"
+        Effect = "Allow"
+        Action = [
+          "ssm:GetDocument"
+        ]
+        Resource = [
+          "arn:aws:ssm:${local.region}:${local.account_id}:document/${var.name_prefix}-*",
+          "arn:aws:ssm:${local.region}:${local.account_id}:document/traefik-plugins-${var.environment}-*"
         ]
       },
       {
@@ -1620,6 +1634,33 @@ resource "aws_iam_policy" "terraform_plan_pr_read" {
           "dynamodb:List*"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "SQSRead"
+        Effect = "Allow"
+        Action = [
+          "sqs:GetQueueAttributes",
+          "sqs:GetQueueUrl",
+          "sqs:ListQueueTags"
+        ]
+        Resource = "arn:aws:sqs:${local.region}:${local.account_id}:layerv-nhp-*"
+      },
+      {
+        Sid    = "ElastiCacheRead"
+        Effect = "Allow"
+        Action = [
+          "elasticache:Describe*",
+          "elasticache:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "APIGatewayRead"
+        Effect = "Allow"
+        Action = [
+          "apigateway:GET"
+        ]
+        Resource = "arn:aws:apigateway:${local.region}::/*"
       },
       {
         Sid    = "ChatbotRead"
