@@ -387,9 +387,9 @@ resource "aws_autoscaling_group" "frps_green" {
 # =============================================================================
 # CloudWatch Alarms — Green Standby Health
 # =============================================================================
-# Mirrors the AC green-side alarms. We only emit the ASG-shape alarm
-# (GroupUnHealthyInstanceCount); qurl-reverse-tunnel-server has no NLB, so the AC's
-# target-group health alarm has no analog here.
+# Mirrors the AC green-side alarms. We only emit the ASG-shape capacity
+# deficit alarm; qurl-reverse-tunnel-server has no NLB, so the AC target-group
+# health alarm has no analog here.
 #
 # Coverage gap (tracked in #1755): the empty-AZ watchdog (#1542)
 # currently iterates only `frps-${suffix}.${namespace}` (blue)
@@ -398,17 +398,21 @@ resource "aws_autoscaling_group" "frps_green" {
 # fleet, an "empty green AZ" failure during a flip would not page
 # until either traffic shifts to green (at which point the existing
 # per-AZ Cloud Map alarms fire because they're now in-band) or this
-# alarm fires on the ASG unhealthy count. The standby-side alarm
+# alarm fires on a sustained ASG capacity deficit. The standby-side alarm
 # here is the bridge until #1755 extends the watchdog to walk both
 # colors.
 
 # Asymmetric responsiveness vs. the canary's `canary_asg_unhealthy`
-# alarm (`modules/canary-deployment/alarms.tf` -- evaluation_periods=1,
-# period=60s). The green standby has no live traffic, so paging at
-# 60s would surface a same-fault-class transient that the active
-# canary needs to react to immediately but the standby can absorb
-# silently. 10-min window (2 × 300s) trades a slower page for fewer
-# false alarms during deploy churn (instance refreshes, AMI rolls).
+# alarm (`modules/canary-deployment/alarms.tf` -- 60s periods for
+# instance-warmup + one extra period). The green standby has no live
+# traffic, so paging on the canary cadence would surface a same-fault-
+# class transient that the standby can absorb silently. The 10-min
+# window (2 x 300s) trades a slower page for fewer false alarms during
+# deploy churn (instance refreshes, AMI rolls). The input stats are
+# intentionally asymmetric: `desired` Minimum and `in_service` Maximum
+# only declare a deficit when capacity stayed short across the period.
+# Revisit after the first sandbox green refresh; lengthen the window only
+# if this still pages on healthy refresh noise.
 # A sustained green-side fault still pages within the same eval
 # window the empty-AZ watchdog (#1542) uses, so an "unrecoverable
 # green fleet during a blue→green flip rehearsal" surfaces on both
@@ -417,18 +421,49 @@ resource "aws_cloudwatch_metric_alarm" "frps_green_asg_unhealthy" {
   count = var.enable_blue_green && var.enable_cloudwatch_alarms && var.alarm_sns_topic_arn != "" ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-frps-green-asg-unhealthy"
-  alarm_description   = "qurl-reverse-tunnel-server Green ASG has unhealthy instances — may affect rollback capability during a blue/green flip."
+  alarm_description   = "qurl-reverse-tunnel-server Green ASG has sustained capacity deficit — may affect rollback capability during a blue/green flip."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
-  metric_name         = "GroupUnHealthyInstanceCount"
-  namespace           = "AWS/AutoScaling"
-  period              = 300
-  statistic           = "Average"
   threshold           = 0
-  treat_missing_data  = "notBreaching"
+  # Belt-and-suspenders for whole-expression no-data states; the FILLs
+  # make normal partial input gaps explicit.
+  treat_missing_data = "notBreaching"
 
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.frps_green[0].name
+  metric_query {
+    id = "capacity_deficit"
+    # FILL bias is intentional for one-sided gaps: missing desired is treated
+    # as "nothing wanted"; missing in-service with desired present should read
+    # as a full deficit. The rollout ledger verifies CloudWatch's fresh-series
+    # and one-input-missing behavior after apply.
+    expression  = "FILL(desired, 0) - FILL(in_service, 0)"
+    label       = "ASG desired capacity minus in-service instances"
+    return_data = true
+  }
+
+  metric_query {
+    id = "desired"
+    metric {
+      metric_name = "GroupDesiredCapacity"
+      namespace   = "AWS/AutoScaling"
+      period      = 300
+      stat        = "Minimum"
+      dimensions = {
+        AutoScalingGroupName = aws_autoscaling_group.frps_green[0].name
+      }
+    }
+  }
+
+  metric_query {
+    id = "in_service"
+    metric {
+      metric_name = "GroupInServiceInstances"
+      namespace   = "AWS/AutoScaling"
+      period      = 300
+      stat        = "Maximum"
+      dimensions = {
+        AutoScalingGroupName = aws_autoscaling_group.frps_green[0].name
+      }
+    }
   }
 
   alarm_actions = [var.alarm_sns_topic_arn]

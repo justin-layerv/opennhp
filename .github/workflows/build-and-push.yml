@@ -1464,6 +1464,7 @@ jobs:
           shellcheck ./tests/lints/ac-apt-guard/run-fixtures.sh
           shellcheck ./tests/lints/terraform-prod-drift/run-fixtures.sh
           shellcheck ./tests/lints/terraform-tag-charset/run-fixtures.sh
+          shellcheck ./tests/lints/asg-capacity-deficit-alarms/run-fixtures.sh
           shellcheck ./tests/lints/cis-metric-filter-patterns/run-fixtures.sh
 
       - name: Run AC apt guard fixture suite
@@ -1500,6 +1501,14 @@ jobs:
 
       - name: Check terraform tag charset (#1915 regression fence)
         run: python3 ./.github/scripts/check-terraform-tag-charset.py terraform
+
+      - name: Run ASG capacity-deficit alarm fixture suite
+        # Fixtures first so a checker regression surfaces before it can
+        # mask a real drift back to the non-published #2041 metric.
+        run: ./tests/lints/asg-capacity-deficit-alarms/run-fixtures.sh
+
+      - name: Check ASG capacity-deficit alarm shape (#2041 regression fence)
+        run: python3 ./.github/scripts/check-asg-capacity-deficit-alarms.py
 
       - name: Run cis-metric-filter-patterns fixture suite
         # Fixtures first (a checker regression surfaces before the real

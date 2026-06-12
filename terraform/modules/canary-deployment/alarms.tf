@@ -86,39 +86,74 @@ resource "aws_cloudwatch_metric_alarm" "canary_low_healthy" {
   })
 }
 
-# Alarm: ASG unhealthy instance count > 0 (NLB-disabled path).
+# Alarm: ASG capacity deficit > 0 (NLB-disabled path).
 #
 # Closes the cr-flagged auto-rollback gap on the frps path: with
 # `disable_nlb_health_checks = true` the NLB-keyed alarms are skipped
 # and the composite alarm rule degenerates to CPU-only — but a binary
 # that boots, fails Cloud Map registration, then crash-loops never
-# spikes CPU. Adding `GroupUnHealthyInstanceCount > 0` here gives the
-# EventBridge auto-rollback path a fast (60s × 1 evaluation period)
-# trigger that doesn't depend on the SFN reaching its next checkpoint.
+# spikes CPU. Adding a capacity-deficit alarm here gives the EventBridge
+# auto-rollback path a signal that does not depend on the SFN reaching
+# its next checkpoint.
 #
-# Pre-existing-fleet noise: `GroupUnHealthyInstanceCount` is the ASG's
-# count of EC2-health-check-failed instances, not user_data-failure
-# instances. A spurious EC2 health hiccup on an unrelated instance
-# would also fire this alarm and roll back the canary. The 1-period
-# evaluation window is tight enough to catch a real failure within
-# ~60s but loose enough that a transient EC2 status-check flap usually
-# clears before alarming. If false rollbacks become a problem, raise
-# evaluation_periods to 2.
+# `GroupUnHealthyInstanceCount` is not an AWS/AutoScaling enabled metric.
+# Use the accepted ASG metrics instead: `GroupDesiredCapacity -
+# GroupInServiceInstances` is positive while the ASG has fewer in-service
+# instances than it wants. The window is the instance warmup rounded up to
+# whole minutes plus one extra period so normal refresh warmup has a
+# chance to settle before the asynchronous rollback tripwire fires. At the
+# default 180s warmup this is 4 consecutive 60s periods: one period of
+# margin after warmup, with the #2041 failure-injection gate validating
+# the real canary-window behavior after apply. The lifecycle precondition
+# below keeps that tripwire faster than the SFN checkpoint cadence; equal
+# windows are rejected because they leave no rollback margin.
 resource "aws_cloudwatch_metric_alarm" "canary_asg_unhealthy" {
   count               = var.disable_nlb_health_checks ? 1 : 0
   alarm_name          = "${var.name_prefix}-canary-${var.component}-asg-unhealthy"
-  alarm_description   = "Canary deployment (${var.component}): ASG reports unhealthy instance(s). Closes the auto-rollback gap on the NLB-disabled path."
+  alarm_description   = "Canary deployment (${var.component}): ASG capacity deficit persists after instance warmup. Closes the auto-rollback gap on the NLB-disabled path."
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "GroupUnHealthyInstanceCount"
-  namespace           = "AWS/AutoScaling"
-  period              = 60
-  statistic           = "Maximum"
+  evaluation_periods  = local.canary_asg_capacity_deficit_evaluation_periods
+  datapoints_to_alarm = local.canary_asg_capacity_deficit_evaluation_periods
   threshold           = 0
-  treat_missing_data  = "notBreaching"
+  # Belt-and-suspenders for whole-expression no-data states; the FILLs
+  # make normal partial input gaps explicit.
+  treat_missing_data = "notBreaching"
 
-  dimensions = {
-    AutoScalingGroupName = var.asg_name
+  metric_query {
+    id = "capacity_deficit"
+    # FILL bias is intentional for one-sided gaps: missing desired is treated
+    # as "nothing wanted"; missing in-service with desired present should read
+    # as a full deficit. The rollout ledger verifies CloudWatch's fresh-series
+    # and one-input-missing behavior after apply.
+    expression  = "FILL(desired, 0) - FILL(in_service, 0)"
+    label       = "ASG desired capacity minus in-service instances"
+    return_data = true
+  }
+
+  metric_query {
+    id = "desired"
+    metric {
+      metric_name = "GroupDesiredCapacity"
+      namespace   = "AWS/AutoScaling"
+      period      = 60
+      stat        = "Average"
+      dimensions = {
+        AutoScalingGroupName = var.asg_name
+      }
+    }
+  }
+
+  metric_query {
+    id = "in_service"
+    metric {
+      metric_name = "GroupInServiceInstances"
+      namespace   = "AWS/AutoScaling"
+      period      = 60
+      stat        = "Average"
+      dimensions = {
+        AutoScalingGroupName = var.asg_name
+      }
+    }
   }
 
   tags = merge(var.tags, {
@@ -126,6 +161,13 @@ resource "aws_cloudwatch_metric_alarm" "canary_asg_unhealthy" {
     Component = "canary"
     Cell      = var.cell_id
   })
+
+  lifecycle {
+    precondition {
+      condition     = local.canary_asg_capacity_deficit_window_seconds < var.checkpoint_delay_seconds
+      error_message = "canary_asg_unhealthy alarm window (${local.canary_asg_capacity_deficit_window_seconds}s) must be shorter than checkpoint_delay_seconds (${var.checkpoint_delay_seconds}s). Lower instance_warmup_seconds, raise checkpoint_delay_seconds, or add a separate fast rollback signal before enabling the NLB-disabled canary path."
+    }
+  }
 }
 
 # ==============================================================================
@@ -133,24 +175,25 @@ resource "aws_cloudwatch_metric_alarm" "canary_asg_unhealthy" {
 # ==============================================================================
 
 locals {
+  canary_asg_capacity_deficit_evaluation_periods = ceil(var.instance_warmup_seconds / 60) + 1
+  canary_asg_capacity_deficit_window_seconds     = local.canary_asg_capacity_deficit_evaluation_periods * 60
+
   # Composite alarm rule: ANY constituent alarm in ALARM state triggers
   # rollback. NLB-keyed clauses are dropped when
   # `disable_nlb_health_checks = true` (frps path) — there's nothing
   # publishing NLB metrics for those alarms to evaluate against. The
-  # ASG-unhealthy alarm replaces them on the frps path so the composite
-  # never collapses to CPU-only (which would miss crash-loop / failed-
-  # registration regressions that don't spike CPU).
+  # ASG capacity-deficit alarm replaces them on the frps path so the
+  # composite never collapses to CPU-only (which would miss stuck launch,
+  # capacity, or EC2 health replacement failures that don't spike CPU).
   #
   # NLB-vs-ASG alarm subsumption posture (cr-flagged check):
   #   - NLB path:  unhealthy_hosts > 0       OR cpu OR low_healthy(<1)
-  #   - ASG path:  GroupUnHealthyInstanceCount > 0 OR cpu
-  # ASG `GroupUnHealthyInstanceCount > 0` fully subsumes NLB
-  # `unhealthy_hosts > 0` (every NLB-unhealthy instance is also
-  # ASG-unhealthy once the EC2 health check trips), and matches NLB
-  # `low_healthy < N` only at N=1 (which is the canary's actual
-  # constant — `canary_low_healthy.threshold = 1` in this same file).
-  # If a future change raises that threshold, the ASG path needs an
-  # additional explicit `low_healthy` clause to maintain equivalence.
+  #   - ASG path:  DesiredCapacity - InServiceInstances > 0 OR cpu
+  # The ASG path uses a capacity-deficit signal because frps has no NLB
+  # target group. It catches sustained stuck launch, capacity, or EC2
+  # health replacement failures. App-level registration/routing failures
+  # remain covered by the canary Lambda health gate and the qurl-reverse-
+  # tunnel-server empty-AZ watchdog.
   canary_alarm_rule = (
     var.disable_nlb_health_checks
     ? join(" OR ", [
@@ -165,7 +208,7 @@ locals {
   )
   canary_alarm_description = (
     var.disable_nlb_health_checks
-    ? "Canary deployment health (${var.component}): triggers on high CPU OR ASG unhealthy instance(s). NLB-keyed health checks disabled — the ASG-unhealthy alarm closes the gap on crash-loop / failed-registration regressions that don't spike CPU."
+    ? "Canary deployment health (${var.component}): triggers on high CPU OR sustained ASG capacity deficit. NLB-keyed health checks disabled."
     : "Canary deployment health (${var.component}): triggers on unhealthy hosts, high CPU, or no healthy hosts"
   )
 }

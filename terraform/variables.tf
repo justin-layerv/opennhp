@@ -1829,7 +1829,7 @@ variable "canary_checkpoint_delay_seconds" {
 }
 
 variable "canary_instance_warmup_seconds" {
-  description = "Instance warmup time in seconds for canary refresh."
+  description = "Instance warmup time in seconds for canary refresh. NLB-disabled canaries also require the ASG capacity-deficit alarm window to stay shorter than canary_checkpoint_delay_seconds."
   type        = number
   default     = 180
 }

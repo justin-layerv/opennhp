@@ -402,7 +402,9 @@ lint-terraform-drift:
 	@python3 .github/scripts/check-terraform-plan-pr-policy-readonly.py
 	@./tests/lints/terraform-tag-charset/run-fixtures.sh
 	@python3 .github/scripts/check-terraform-tag-charset.py terraform
-	@echo "$(COLOUR_GREEN)[OpenNHP] terraform-prod-drift checks passed!$(END_COLOUR)"
+	@./tests/lints/asg-capacity-deficit-alarms/run-fixtures.sh
+	@python3 .github/scripts/check-asg-capacity-deficit-alarms.py
+	@echo "$(COLOUR_GREEN)[OpenNHP] terraform drift and alarm-shape checks passed!$(END_COLOUR)"
 
 test:
 	@echo "[OpenNHP] Running Unit Tests..."

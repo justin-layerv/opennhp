@@ -150,14 +150,12 @@ locals {
   #
   # `GroupUnHealthyInstanceCount` is deliberately omitted: AWS
   # rejects it from `EnableMetricsCollection` with ValidationError
-  # 400 (not a valid metric type). The four `*_asg_unhealthy`
-  # alarms (frps_green, canary, ac_green, server's green) all key
-  # on this non-existent metric and have sat silently
-  # INSUFFICIENT_DATA → notBreaching since creation — meant to
-  # close the canary auto-rollback's NLB-disabled-path coverage,
-  # which is currently unwired. Rewiring them to a real signal is
-  # a separate cross-module change (tracking: #2041). Don't re-add
-  # this name here.
+  # 400 (not a valid metric type). The historical `*_asg_unhealthy`
+  # alarms keep their names for dashboards/SNS routing, but #2041
+  # rewires them to metric math over accepted ASG metrics
+  # (`GroupDesiredCapacity - GroupInServiceInstances`). Don't
+  # re-add this name here, and don't remove either metric from this
+  # list without rewiring the capacity-deficit alarms too.
   asg_enabled_metrics = [
     "GroupInServiceInstances",
     "GroupDesiredCapacity",

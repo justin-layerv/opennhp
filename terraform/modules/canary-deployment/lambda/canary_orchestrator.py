@@ -466,13 +466,11 @@ def handle_check_health(event, _context):
                         # Pull `GroupTotalInstances` here and compute
                         # implicit-unhealthy = Total - InService client-
                         # side after both queries return (see the
-                        # post-processing block below). Direct
-                        # GroupUnHealthyInstanceCount also exists but
-                        # lags `InService` by one period in our
-                        # experience — `Total - InService` is identical
-                        # to it within the same period and avoids a
-                        # missing-metric race on fresh ASGs that haven't
-                        # published the dedicated unhealthy series yet.
+                        # post-processing block below). There is no direct
+                        # `GroupUnHealthyInstanceCount` ASG group metric:
+                        # AWS rejects that name from EnableMetricsCollection,
+                        # so the NLB-disabled path must compose the accepted
+                        # ASG metrics instead.
                         # A CloudWatch math expression (`m1 - m2`) would
                         # work too, but keeping the subtraction in
                         # Python lets the partial-data race handler
@@ -580,7 +578,7 @@ def handle_check_health(event, _context):
     # the blast-radius window of a bad deploy. Instead, return
     # `healthy=False` immediately. The SFN's check_health step retries
     # on the next poll and a sustained describe failure trips the
-    # ASG-unhealthy / CPU composite alarm via the alarm-driven
+    # ASG capacity-deficit / CPU composite alarm via the alarm-driven
     # rollback path. The legacy "asg_desired = None ⇒ floor = 1"
     # path remains for the NLB (server/ac) regime, which has its own
     # NLB-target-group safety net.
@@ -629,8 +627,8 @@ def handle_check_health(event, _context):
         # falling back to the legacy "any healthy" floor would silently
         # drop the safety threshold during the blast radius window.
         # The SFN's check_health step retries on the next poll; a
-        # sustained anomaly trips the ASG-unhealthy / CPU composite
-        # alarm via the alarm-driven rollback path.
+        # sustained anomaly trips the ASG capacity-deficit / CPU
+        # composite alarm via the alarm-driven rollback path.
         logger.error(
             "NLB-disabled path: describe_auto_scaling_groups returned an "
             "unexpected shape (no DesiredCapacity). Failing closed — this "

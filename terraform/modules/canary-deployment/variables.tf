@@ -75,7 +75,7 @@ variable "target_group_arn_suffix" {
 #
 # `disable_nlb_health_checks = true` makes the module:
 #   - Skip the two NLB-keyed alarms (canary_unhealthy, canary_low_healthy).
-#   - Build the composite alarm rule from CPU only.
+#   - Build the composite alarm rule from CPU + ASG capacity deficit.
 #   - Pass empty NLB_ARN_SUFFIX / TARGET_GROUP_ARN_SUFFIX env vars to the
 #     orchestrator Lambda; canary_orchestrator.py treats empty values as
 #     "skip NLB metric queries; advance on CPU + ASG-instance health
@@ -146,7 +146,7 @@ variable "checkpoint_delay_seconds" {
 }
 
 variable "instance_warmup_seconds" {
-  description = "Instance warmup time in seconds. New instances are not counted toward health until this elapses."
+  description = "Instance warmup time in seconds. New instances are not counted toward health until this elapses. NLB-disabled canaries also require the ASG capacity-deficit alarm window to stay shorter than checkpoint_delay_seconds."
   type        = number
   default     = 180
 

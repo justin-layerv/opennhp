@@ -1375,6 +1375,9 @@ resource "aws_autoscaling_group" "ac" {
 
   # Publish ASG group metrics to CloudWatch (AWS/AutoScaling namespace).
   # Without this, metrics like GroupInServiceInstances are not emitted.
+  # Keep GroupDesiredCapacity + GroupInServiceInstances: green standby
+  # capacity-deficit alarms use them as their publishable replacement for
+  # AWS's non-existent GroupUnHealthyInstanceCount ASG group metric.
   enabled_metrics = [
     "GroupInServiceInstances",
     "GroupDesiredCapacity",

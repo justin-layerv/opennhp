@@ -328,6 +328,12 @@ publisher that emits a partial dim set selects a different (non-existent)
 stream and the alarm sits in `INSUFFICIENT_DATA` forever — the operator never
 gets paged on a real fault.
 
+AWS-managed metrics can fail the same way when the metric name is not actually
+published or enableable for that service. For Auto Scaling group alarms, stay
+inside the accepted `enabled_metrics` set; compose missing concepts with metric
+math (for example, `GroupDesiredCapacity - GroupInServiceInstances`) instead of
+inventing names like `GroupUnHealthyInstanceCount`.
+
 The AC publisher's base dim set is `{Component, Environment, Region}` (see
 `endpoints/ac/registration.go::NewACRegistration` and `metrics/publisher.go`).
 Every alarm in `terraform/modules/ac/monitoring.tf` that keys on the AC

@@ -363,6 +363,8 @@ resource "aws_autoscaling_group" "server_green" {
 
   # Publish ASG group metrics to CloudWatch (AWS/AutoScaling namespace).
   # Without this, metrics like GroupInServiceInstances are not emitted.
+  # Keep GroupDesiredCapacity + GroupInServiceInstances: the green standby
+  # capacity-deficit alarm below depends on both metric streams.
   enabled_metrics = [
     "GroupInServiceInstances",
     "GroupDesiredCapacity",
@@ -530,23 +532,62 @@ resource "aws_iam_role_policy" "termination_cleanup_asg_green" {
 # CloudWatch Alarms for Blue/Green Deployment Monitoring
 # =============================================================================
 
-# Alarm: Green ASG has unhealthy instances (fires when standby has issues)
+# Alarm: Green ASG has sustained capacity deficit (fires when standby has issues)
+#
+# Green standby has no live traffic, so this uses the same 10-min window
+# as the AC/frps standby alarms (2 x 300s): slower page, fewer false
+# positives during instance refreshes and AMI rolls. The input stats are
+# intentionally asymmetric: `desired` Minimum and `in_service` Maximum
+# only declare a deficit when capacity stayed short across the period.
+# Revisit after the first sandbox green refresh; lengthen the window only
+# if this still pages on healthy refresh noise.
 resource "aws_cloudwatch_metric_alarm" "green_asg_unhealthy" {
   count = var.enable_blue_green && var.alerts_sns_topic_arn != null ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-green-asg-unhealthy"
-  alarm_description   = "Green ASG has unhealthy instances - may affect rollback capability"
+  alarm_description   = "Green ASG has sustained capacity deficit - may affect rollback capability"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
-  metric_name         = "GroupUnHealthyInstanceCount"
-  namespace           = "AWS/AutoScaling"
-  period              = 300
-  statistic           = "Average"
   threshold           = 0
-  treat_missing_data  = "notBreaching"
+  # Belt-and-suspenders for whole-expression no-data states; the FILLs
+  # make normal partial input gaps explicit.
+  treat_missing_data = "notBreaching"
 
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.server_green[0].name
+  metric_query {
+    id = "capacity_deficit"
+    # FILL bias is intentional for one-sided gaps: missing desired is treated
+    # as "nothing wanted"; missing in-service with desired present should read
+    # as a full deficit. The rollout ledger verifies CloudWatch's fresh-series
+    # and one-input-missing behavior after apply.
+    expression  = "FILL(desired, 0) - FILL(in_service, 0)"
+    label       = "ASG desired capacity minus in-service instances"
+    return_data = true
+  }
+
+  metric_query {
+    id = "desired"
+    metric {
+      metric_name = "GroupDesiredCapacity"
+      namespace   = "AWS/AutoScaling"
+      period      = 300
+      stat        = "Minimum"
+      dimensions = {
+        AutoScalingGroupName = aws_autoscaling_group.server_green[0].name
+      }
+    }
+  }
+
+  metric_query {
+    id = "in_service"
+    metric {
+      metric_name = "GroupInServiceInstances"
+      namespace   = "AWS/AutoScaling"
+      period      = 300
+      stat        = "Maximum"
+      dimensions = {
+        AutoScalingGroupName = aws_autoscaling_group.server_green[0].name
+      }
+    }
   }
 
   alarm_actions = [var.alerts_sns_topic_arn]
