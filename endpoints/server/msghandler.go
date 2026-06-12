@@ -72,16 +72,41 @@ const (
 // Metric counter names for CloudWatch. Using constants prevents typos
 // and enables discoverability across the codebase.
 const (
-	MetricKnockRequest              = "KnockRequest"
-	MetricKnockLatency              = "KnockLatency"
-	MetricAuthSuccess               = "AuthSuccess"
-	MetricAuthFailure               = "AuthFailure"
-	MetricAutoAssignment            = "AutoAssignment"
-	MetricKnockForwardSuccess       = "KnockForwardSuccess"
-	MetricKnockForwardFailure       = "KnockForwardFailure"
-	MetricKnockForwardSkippedDead   = "KnockForwardSkippedDead"
-	MetricKnockForwardFallback      = "KnockForwardFallback"
-	MetricCloudMapDeregisterFailure = "CloudMapDeregisterFailure"
+	MetricKnockRequest   = "KnockRequest"
+	MetricKnockLatency   = "KnockLatency"
+	MetricAuthSuccess    = "AuthSuccess"
+	MetricAuthFailure    = "AuthFailure"
+	MetricAutoAssignment = "AutoAssignment"
+	// MetricACAssignmentColorMigration fires once each time an AC that
+	// re-registered onto this server is *successfully* migrated wholesale
+	// off a stale cross-color (old blue/green) assignment onto this
+	// server's own color — it counts durable migrations (a persisted
+	// reassignment), not attempts, so an autoAssignAC fall-through (e.g.
+	// save conflict-cap exhausted) does NOT tick it. Expected to spike to
+	// ~one-per-AC during a blue/green switch and sit at zero in steady
+	// state. A SUSTAINED non-zero rate outside a deploy window means ACs
+	// keep landing on a color that disagrees with their persisted
+	// assignment — i.e., assignments are not converging (investigate
+	// Cloud Map staleness or a stuck scale-down). Occasional ISOLATED ticks
+	// are benign — e.g. a cache straddle between the FilterHealthyServers
+	// read and this check can reassign an already-same-color AC to its own
+	// color — so read the rate, not single events. Surfaced today by the
+	// manual post-rollout ledger check, not an automated CloudWatch alarm;
+	// a bounded-window alarm (spike-then-zero within the switch window) is
+	// tracked in issue #2497.
+	//
+	// Scope: this counts ONLY the post-switch/pre-scale-down graft-avoidance
+	// path (handleACServerAssignment's not-assigned branch). The
+	// all-assigned-unhealthy reassign (post-scale-down) also re-homes an AC
+	// onto the surviving color but is NOT counted here — it is the expected
+	// steady-state recovery path, not the convergence signal this counter
+	// tracks.
+	MetricACAssignmentColorMigration = "ACAssignmentColorMigration"
+	MetricKnockForwardSuccess        = "KnockForwardSuccess"
+	MetricKnockForwardFailure        = "KnockForwardFailure"
+	MetricKnockForwardSkippedDead    = "KnockForwardSkippedDead"
+	MetricKnockForwardFallback       = "KnockForwardFallback"
+	MetricCloudMapDeregisterFailure  = "CloudMapDeregisterFailure"
 	// MetricShutdownTransactionDrainTimeout increments when graceful shutdown's
 	// in-flight transaction drain exhausts its budget with non-zero local
 	// transactions still outstanding — those transactions will return
@@ -1514,8 +1539,8 @@ func (s *UdpServer) handleACServerAssignment(
 		if IsNotFoundError(err) {
 			// AC not found in storage — perform auto-assignment
 			log.Info("server-ac(%s#%d@%s)[HandleACOnline] AC not in storage, auto-assigning", acId, transactionId, addrStr)
-			redirected, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, 0)
-			return redirected, nil, autoErr
+			_, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, 0, nil)
+			return false, nil, autoErr
 		}
 		log.Error("server-ac(%s#%d@%s)[HandleACOnline] storage error looking up AC assignment: %v", acId, transactionId, addrStr, err)
 		return false, nil, err
@@ -1524,8 +1549,8 @@ func (s *UdpServer) handleACServerAssignment(
 	// Check TTL expiry (DynamoDB TTL deletion is async — expired items may still exist)
 	if assignment.TTL != nil && *assignment.TTL < time.Now().Unix() {
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] assignment expired (TTL=%d), re-assigning", acId, transactionId, addrStr, *assignment.TTL)
-		redirected, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version)
-		return redirected, nil, autoErr
+		_, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version, nil)
+		return false, nil, autoErr
 	}
 
 	// Filter assignment to only healthy servers (via Cloud Map health discovery).
@@ -1536,8 +1561,8 @@ func (s *UdpServer) handleACServerAssignment(
 		// All assigned servers are unhealthy — re-assign with fresh servers
 		log.Warning("server-ac(%s#%d@%s)[HandleACOnline] all %d assigned servers unhealthy, re-assigning",
 			acId, transactionId, addrStr, len(assignment.AssignedServers))
-		redirected, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version)
-		return redirected, nil, autoErr
+		_, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version, nil)
+		return false, nil, autoErr
 	}
 
 	// Determine this server's identity
@@ -1568,8 +1593,57 @@ func (s *UdpServer) handleACServerAssignment(
 	}
 
 	// This server is NOT in the assignment but the AC connected here.
-	// Update assignment: add self, keep existing healthy ones (up to 3 total).
-	// This rebuilds redundancy when assigned servers die and AC reconnects to a new server.
+	//
+	// Blue/green migration fast-path: if the AC's still-healthy assigned
+	// servers are a different color (ASG) than this server, the AC is pinned
+	// to the old color and grafting (updateAssignmentWithSelf) would migrate
+	// only one new server per re-registration — the slow coupon-collector that
+	// trips the post-switch knock-ready gate. Reassign wholesale to the current
+	// color instead. See assignmentIsCrossColor's docstring for the full
+	// rationale and the >MaxServersPerAssignment residual; the notes below are
+	// the call-site-specific caveats (symmetric with the all-assigned-unhealthy
+	// reassign branch above, which is the post-scale-down case).
+	//
+	// Load-bearing precondition: this fires only when an AC's periodic NLB
+	// re-registration actually reaches a NEW-color server. Switch-Traffic
+	// repoints the NLB knock target group to the new color before validation,
+	// so post-switch re-registrations land on the new color and trigger
+	// migration; the "deterministic" claim rests on that repoint, not on
+	// anything this function does.
+	//
+	// Degrades-below-graft under save contention: unlike the same-color
+	// updateAssignmentWithSelf path (which still sends an ARD even when its
+	// save is a version-conflict no-op), autoAssignAC sends NO ARD if its
+	// save-conflict retry cap is exhausted — the AC is then accepted on self
+	// alone, briefly thinner fan-out than the old graft's self+old. Bounded,
+	// ticks no metric, and self-heals on the next ≤90s re-registration (same as
+	// the expired/unhealthy autoAssignAC fallbacks).
+	//
+	// Transient redundancy: with only a SUBSET of the new color propagated, the
+	// reassign drops to the visible subset (as few as one server, and may omit
+	// THIS server if it hasn't propagated — selectServersForAssignment injects
+	// self only when self is in the snapshot). Still never cross-color
+	// (assignmentIsCrossColor guarantees ≥1 same-color server). The deploy gates
+	// on the new ASG being in-service before the switch and ACs re-grow on
+	// re-registration; watched by the ledger's ACAssignmentColorMigration
+	// spike-then-zero check.
+	if crossColor, discovered := s.assignmentIsCrossColor(cloudMapCtx, healthyServers); crossColor {
+		log.Info("server-ac(%s#%d@%s)[HandleACOnline] assignment is cross-color (this server %s differs from assigned color), reassigning to current color", acId, transactionId, addrStr, serverID)
+		persisted, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version, discovered)
+		// Count only durable migrations: autoAssignAC can fall through to
+		// "accept directly" (e.g. save conflict-cap exhausted) without
+		// persisting, and the post-rollout ledger check keys on this counter.
+		// IncrCounter is nil-safe, so no s.metrics guard (matches the
+		// MetricAutoAssignment call inside autoAssignAC).
+		if persisted {
+			s.metrics.IncrCounter(MetricACAssignmentColorMigration)
+		}
+		return false, nil, autoErr
+	}
+
+	// Otherwise (same-color reconnect): add self, keep existing healthy ones
+	// (up to 3 total). This rebuilds redundancy when assigned servers die and
+	// the AC reconnects to a new server.
 	log.Info("server-ac(%s#%d@%s)[HandleACOnline] this server (%s) not assigned, updating assignment", acId, transactionId, addrStr, serverID)
 	updated := s.updateAssignmentWithSelf(assignment, healthyServers)
 	if updated != nil {
@@ -1592,14 +1666,27 @@ func (s *UdpServer) handleACServerAssignment(
 // existingVersion is the version of any existing assignment in storage (0 for new).
 // When replacing an expired or stale assignment, pass its version so the conditional
 // write uses the correct expected version instead of attribute_not_exists.
-// Returns (false, nil) to let this server also handle the AC directly.
+//
+// preDiscovered, when non-nil, is a Cloud Map snapshot the caller already
+// fetched; nil means discover here. The blue/green migration path passes the
+// same snapshot assignmentIsCrossColor used for its decision, so the decision
+// and this reassignment can't straddle a cache refresh and act on disagreeing
+// views (and it saves a redundant DiscoverServerInstances call).
+//
+// This server always also handles the AC locally (it never redirects the AC
+// away), so the only result worth reporting is `persisted`: whether a new
+// assignment was actually written to storage. It is false on every "accept
+// directly" fallback (no Cloud Map, discovery error/empty, save conflict-cap
+// exhausted), so callers can gate success-only side effects (e.g. the
+// color-migration counter) on it.
 func (s *UdpServer) autoAssignAC(
 	ppd *core.PacketParserData,
 	aolMsg *common.ACOnlineMsg,
 	transactionId uint64,
 	addrStr string,
 	existingVersion int,
-) (bool, error) {
+	preDiscovered []ServerInfo,
+) (persisted bool, err error) {
 	acId := aolMsg.ACId
 
 	// Cloud Map required for auto-assignment
@@ -1608,13 +1695,16 @@ func (s *UdpServer) autoAssignAC(
 		return false, nil
 	}
 
-	cloudMapCtx, cloudMapCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
-	defer cloudMapCancel()
-
-	allServers, err := s.cloudMap.DiscoverServerInstances(cloudMapCtx)
-	if err != nil {
-		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] Cloud Map discovery failed: %v, accepting directly", acId, transactionId, addrStr, err)
-		return false, nil
+	allServers := preDiscovered
+	if allServers == nil {
+		cloudMapCtx, cloudMapCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
+		defer cloudMapCancel()
+		discovered, derr := s.cloudMap.DiscoverServerInstances(cloudMapCtx)
+		if derr != nil {
+			log.Warning("server-ac(%s#%d@%s)[autoAssignAC] Cloud Map discovery failed: %v, accepting directly", acId, transactionId, addrStr, derr)
+			return false, nil
+		}
+		allServers = discovered
 	}
 
 	if len(allServers) == 0 {
@@ -1717,8 +1807,10 @@ func (s *UdpServer) autoAssignAC(
 		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] failed to send ARD: %v", acId, transactionId, addrStr, ardErr)
 	}
 
-	// Return false so this server also processes the AC registration locally
-	return false, nil
+	// A fresh assignment was persisted; report it so the caller can count a
+	// durable migration. This server still also handles the AC locally (the
+	// ARD above does not redirect the AC away).
+	return true, nil
 }
 
 // saveAssignmentMaxAttempts caps the autoAssignAC retry loop on
@@ -2208,6 +2300,97 @@ func (s *UdpServer) sendARD(
 	ardMd := makeMsgData(ppd, core.NHP_ARD, ardBytes)
 
 	return s.forwardToTransaction(ppd.ConnData, transactionId, ardMd, "server-ac", "HandleACOnline/ARD", acId, addrStr)
+}
+
+// assignmentIsCrossColor reports whether any of an AC's currently-healthy
+// assigned servers belongs to a DIFFERENT color (ASG) than this server.
+//
+// This is the blue/green-switch signal. Post-switch but pre-scale-down the
+// old-color servers stay Cloud Map-healthy (they deregister only at
+// scale-down, which runs AFTER deploy validation), so an AC's persisted
+// assignment still lists them and FilterHealthyServers keeps them. When the
+// AC's periodic NLB re-registration lands on a freshly-switched new-color
+// server, updateAssignmentWithSelf would graft just this one server on while
+// keeping two old-color servers (cap = MaxServersPerAssignment), so each AC
+// adopts only ONE new server per re-registration and the new fleet converges
+// as a slow coupon-collector over NLB flow-hashing — long enough to trip the
+// post-switch knock-ready gate (.github/scripts/verify-knock-ready.sh). When
+// this returns true the caller reassigns the AC wholesale to the current color
+// instead, so one re-registration adopts a full new-color set (self + AZ-spread,
+// up to MaxServersPerAssignment) and drops every old-color server.
+//
+// Coverage: for the steady-state one-instance-per-AZ fleet
+// (MaxServersPerAssignment = 3 = AZ count) that single re-registration covers
+// every new-color server, so convergence is deterministic. A new-active fleet
+// LARGER than MaxServersPerAssignment (autoscaling past the AZ count, or a
+// deploy stacked on a not-yet-scaled-down color) still converges far faster
+// than before — each re-registration now adopts MaxServersPerAssignment new
+// servers and discards all old ones, versus one new server per re-registration
+// pre-fix — but full coverage of the extra servers stays a (faster)
+// coupon-collector over which servers ACs' NLB packets land on. That residual
+// is the pre-existing MaxServersPerAssignment < fleet-size limit, not something
+// this path closes.
+//
+// Returns false (preserving the legacy updateAssignmentWithSelf path) on every
+// path where color can't be established with confidence: no Cloud Map client,
+// empty input, discovery error/empty result, this server's own ASG unknown, or
+// the ASG filter failing open. Membership is by IP/InternalIP because the
+// persisted assignment has ASGName stripped (autoAssignAC strips it before
+// write), so color must be re-derived from a live Cloud Map view. An old-color
+// server whose Cloud Map ASGName is empty (IMDS failed to populate ASG_NAME) is
+// treated as same-color by filterServersByASG, so migration won't fire for it —
+// the conservative bias: never churn an assignment on ambiguous color.
+//
+// On a true result it also returns the Cloud Map snapshot it discovered so the
+// caller can hand the SAME snapshot to autoAssignAC — the decision and the
+// reassignment then act on one consistent view instead of two independent
+// reads. (The healthyAssigned set still comes from a separate, earlier
+// FilterHealthyServers read; a cache refresh straddling the two could flag a
+// briefly-absent same-color server as cross-color, but the only consequence is
+// a one-off reassign of an already-same-color AC to its current color — safe,
+// just a stray counter tick.) Returns nil on every false result.
+//
+// Cost: this adds one DiscoverServerInstances to every not-assigned
+// re-registration (including the common same-color reconnect that ends up
+// falling through to updateAssignmentWithSelf). It is unavoidable — color
+// can't be read off the stored assignment — but it is a 30s-cached read
+// (instancesExpiry), so in steady state it is a cache hit, not an API call.
+// Only a cold/expired cache under heavy reconnect churn turns it into an
+// extra discovery round-trip.
+func (s *UdpServer) assignmentIsCrossColor(ctx context.Context, healthyAssigned []ServerInfo) (bool, []ServerInfo) {
+	if s.cloudMap == nil || len(healthyAssigned) == 0 {
+		return false, nil
+	}
+	selfASG := s.ASGName()
+	if selfASG == "" {
+		return false, nil // own color unknown — don't churn assignments
+	}
+	allServers, err := s.cloudMap.DiscoverServerInstances(ctx)
+	if err != nil || len(allServers) == 0 {
+		return false, nil
+	}
+	sameColor, failOpen := filterServersByASG(allServers, selfASG)
+	if failOpen {
+		return false, nil // every candidate is cross-color → ASG view unreliable
+	}
+	sameColorIPs := make(map[string]bool, len(sameColor))
+	for _, srv := range sameColor {
+		if srv.IP != "" {
+			sameColorIPs[srv.IP] = true
+		}
+		if srv.InternalIP != "" {
+			sameColorIPs[srv.InternalIP] = true
+		}
+	}
+	for _, srv := range healthyAssigned {
+		if srv.IP == "" && srv.InternalIP == "" {
+			continue // no IP to compare — conservative: don't treat as cross-color
+		}
+		if !sameColorIPs[srv.IP] && !sameColorIPs[srv.InternalIP] {
+			return true, allServers // at least one assigned server is a different color
+		}
+	}
+	return false, nil
 }
 
 // updateAssignmentWithSelf adds this server to an existing AC assignment,

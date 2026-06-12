@@ -160,7 +160,7 @@ func TestAutoAssignAC_VersionIncrement(t *testing.T) {
 				device:     device,
 			}
 
-			_, err := srv.autoAssignAC(ppd, aolMsg, 12345, "10.99.0.1:62206", tc.existingVersion)
+			_, err := srv.autoAssignAC(ppd, aolMsg, 12345, "10.99.0.1:62206", tc.existingVersion, nil)
 			if err != nil {
 				t.Fatalf("autoAssignAC returned error: %v", err)
 			}
@@ -260,7 +260,7 @@ func TestAutoAssignAC_FiltersByASG(t *testing.T) {
 				device:     device,
 			}
 
-			_, err := srv.autoAssignAC(ppd, aolMsg, 99999, "10.99.0.1:62206", 0)
+			_, err := srv.autoAssignAC(ppd, aolMsg, 99999, "10.99.0.1:62206", 0, nil)
 			if err != nil {
 				t.Fatalf("autoAssignAC returned error: %v", err)
 			}
@@ -292,6 +292,435 @@ func TestAutoAssignAC_FiltersByASG(t *testing.T) {
 				if !tc.wantIDs[s.ID] {
 					t.Errorf("Unexpected server %s in assignment", s.ID)
 				}
+			}
+		})
+	}
+}
+
+// newColorTestServer builds a UdpServer wired for the blue/green
+// color-migration tests: a real device (stopped via t.Cleanup), a test metrics
+// publisher, and the given storage / Cloud Map / identity. Returns the server
+// and its publisher so the test can assert on counters.
+func newColorTestServer(t *testing.T, storage StorageBackend, cloudMap *CloudMapClient, instanceID, asgName, localIP string) (*UdpServer, *metrics.Publisher) {
+	t.Helper()
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("failed to create device")
+	}
+	t.Cleanup(device.Stop)
+	mp := metrics.NewPublisherForTest(t)
+	return &UdpServer{
+		storage:    storage,
+		cloudMap:   cloudMap,
+		instanceID: instanceID,
+		asgName:    asgName,
+		localIp:    localIP,
+		config:     &Config{Hostname: instanceID, ListenPort: 62206},
+		device:     device,
+		metrics:    mp,
+	}, mp
+}
+
+// newACOnlinePPD returns a minimal PacketParserData for AC-online handler
+// tests. sendARD has no real transaction to target, so it logs a warning and
+// the handler proceeds — matching the prod accept-locally path.
+func newACOnlinePPD() *core.PacketParserData {
+	return &core.PacketParserData{
+		ConnData: &core.ConnectionData{
+			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+		},
+	}
+}
+
+// TestHandleACServerAssignment_MigratesCrossColorAssignment fences the
+// blue/green convergence fix. When an AC whose persisted assignment still
+// points at old-color (cross-ASG) servers re-registers onto a freshly
+// switched new-color server, the server must reassign it WHOLESALE to the
+// new color (so a single re-registration connects the AC to every new-color
+// server) instead of grafting only itself onto the stale set. The graft
+// behavior left one new server AC-starved past the post-switch knock-ready
+// gate — the deploy flake this fixes.
+func TestHandleACServerAssignment_MigratesCrossColorAssignment(t *testing.T) {
+	const (
+		blueASG  = "layerv-nhp-sandbox-server"
+		greenASG = "layerv-nhp-sandbox-server-green"
+		acID     = "layerv-ac-bluegreen"
+	)
+	// Cloud Map sees BOTH colors healthy — old (blue) servers have not yet
+	// scaled down (scale-down runs after deploy validation).
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba", ASGName: blueASG},
+			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-bb", ASGName: blueASG},
+			{ID: "i-blue-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-bc", ASGName: blueASG},
+			{ID: "i-green-a", IP: "10.0.1.1", InternalIP: "10.0.1.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ga", ASGName: greenASG},
+			{ID: "i-green-b", IP: "10.0.1.2", InternalIP: "10.0.1.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-gb", ASGName: greenASG},
+			{ID: "i-green-c", IP: "10.0.1.3", InternalIP: "10.0.1.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-gc", ASGName: greenASG},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	// AC is currently pinned to all three OLD (blue) servers (ASGName stripped,
+	// as it is on persist).
+	storage.assignments[acID] = &ACAssignment{
+		ACID:    acID,
+		Version: 5,
+		AssignedServers: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba"},
+			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-bb"},
+			{ID: "i-blue-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-bc"},
+		},
+		CreatedAt: now,
+		LastSeen:  now,
+		TTL:       &ttl,
+	}
+
+	// The AC's NLB re-registration lands on a NEW (green) server.
+	srv, mp := newColorTestServer(t, storage, cloudMap, "i-green-a", greenASG, "10.0.1.1")
+	aolMsg := &common.ACOnlineMsg{ACId: acID}
+
+	if _, _, err := srv.handleACServerAssignment(newACOnlinePPD(), aolMsg, 12345, "10.99.0.1:62206"); err != nil {
+		t.Fatalf("handleACServerAssignment returned error: %v", err)
+	}
+
+	storage.mu.Lock()
+	saved := storage.assignments[acID]
+	storage.mu.Unlock()
+	if saved == nil {
+		t.Fatal("assignment missing after migration")
+	}
+	if saved.Version != 6 {
+		t.Errorf("expected Version 6 (existing 5 + 1), got %d", saved.Version)
+	}
+	if len(saved.AssignedServers) != MaxServersPerAssignment {
+		t.Errorf("expected %d assigned servers, got %d", MaxServersPerAssignment, len(saved.AssignedServers))
+	}
+	blueIDs := map[string]bool{"i-blue-a": true, "i-blue-b": true, "i-blue-c": true}
+	foundSelf := false
+	for _, srvInfo := range saved.AssignedServers {
+		if blueIDs[srvInfo.ID] {
+			t.Errorf("old-color server %s survived migration — assignment not fully migrated to new color", srvInfo.ID)
+		}
+		if srvInfo.ID == "i-green-a" {
+			foundSelf = true
+		}
+	}
+	if !foundSelf {
+		t.Error("answering server i-green-a not included in migrated assignment (self-first guarantee broken)")
+	}
+
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricACAssignmentColorMigration] != 1 {
+		t.Errorf("expected %s=1, got %v", MetricACAssignmentColorMigration, counters[MetricACAssignmentColorMigration])
+	}
+}
+
+// TestHandleACServerAssignment_SameColorReconnectDoesNotMigrate guards the
+// steady-state path: an AC reconnecting to a same-color server that isn't in
+// its assignment (e.g., a sibling that just registered) must take the
+// add-self-keep-existing path (updateAssignmentWithSelf), NOT a wholesale
+// reassignment. Over-triggering migration would churn assignments on every
+// ordinary intra-color reconnect.
+func TestHandleACServerAssignment_SameColorReconnectDoesNotMigrate(t *testing.T) {
+	const (
+		greenASG = "layerv-nhp-sandbox-server-green"
+		acID     = "layerv-ac-samecolor"
+	)
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-green-a", IP: "10.0.1.1", InternalIP: "10.0.1.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ga", ASGName: greenASG},
+			{ID: "i-green-b", IP: "10.0.1.2", InternalIP: "10.0.1.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-gb", ASGName: greenASG},
+			{ID: "i-green-c", IP: "10.0.1.3", InternalIP: "10.0.1.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-gc", ASGName: greenASG},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	// AC assigned to two same-color (green) servers; reconnects to the third.
+	storage.assignments[acID] = &ACAssignment{
+		ACID:    acID,
+		Version: 2,
+		AssignedServers: []ServerInfo{
+			{ID: "i-green-b", IP: "10.0.1.2", InternalIP: "10.0.1.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-gb"},
+			{ID: "i-green-c", IP: "10.0.1.3", InternalIP: "10.0.1.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-gc"},
+		},
+		CreatedAt: now,
+		LastSeen:  now,
+		TTL:       &ttl,
+	}
+
+	srv, mp := newColorTestServer(t, storage, cloudMap, "i-green-a", greenASG, "10.0.1.1")
+	aolMsg := &common.ACOnlineMsg{ACId: acID}
+
+	if _, _, err := srv.handleACServerAssignment(newACOnlinePPD(), aolMsg, 22222, "10.99.0.2:62206"); err != nil {
+		t.Fatalf("handleACServerAssignment returned error: %v", err)
+	}
+
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricACAssignmentColorMigration] != 0 {
+		t.Errorf("expected %s=0 for same-color reconnect, got %v", MetricACAssignmentColorMigration, counters[MetricACAssignmentColorMigration])
+	}
+
+	storage.mu.Lock()
+	saved := storage.assignments[acID]
+	storage.mu.Unlock()
+	if saved == nil {
+		t.Fatal("assignment missing")
+	}
+	// add-self-keep-existing: self + the two existing greens.
+	foundSelf := false
+	for _, srvInfo := range saved.AssignedServers {
+		if srvInfo.ID == "i-green-a" {
+			foundSelf = true
+		}
+	}
+	if !foundSelf {
+		t.Error("expected self (i-green-a) added to assignment via updateAssignmentWithSelf")
+	}
+}
+
+// TestHandleACServerAssignment_CrossColorSaveFailureDoesNotCountMigration pins
+// the metric semantics: ACAssignmentColorMigration counts only DURABLE
+// migrations. When cross-color is detected but autoAssignAC can't persist
+// (version-conflict cap exhausted), the counter must NOT tick — otherwise the
+// rollout-ledger alert ("sustained non-zero = assignments not converging")
+// would fire on the very failure mode it is meant to detect, masking it.
+func TestHandleACServerAssignment_CrossColorSaveFailureDoesNotCountMigration(t *testing.T) {
+	const (
+		blueASG  = "layerv-nhp-sandbox-server"
+		greenASG = "layerv-nhp-sandbox-server-green"
+		acID     = "layerv-ac-savefail"
+	)
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba", ASGName: blueASG},
+			{ID: "i-green-a", IP: "10.0.1.1", InternalIP: "10.0.1.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ga", ASGName: greenASG},
+			{ID: "i-green-b", IP: "10.0.1.2", InternalIP: "10.0.1.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-gb", ASGName: greenASG},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments[acID] = &ACAssignment{
+		ACID:            acID,
+		Version:         5,
+		AssignedServers: []ServerInfo{{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba"}},
+		CreatedAt:       now,
+		LastSeen:        now,
+		TTL:             &ttl,
+	}
+	// Force every SaveACAssignment to fail with a version conflict so
+	// autoAssignAC exhausts its retry cap and falls through without persisting.
+	storage.saveOverride = func(*ACAssignment) error {
+		return NewVersionConflictError("forced conflict")
+	}
+
+	srv, mp := newColorTestServer(t, storage, cloudMap, "i-green-a", greenASG, "10.0.1.1")
+	aolMsg := &common.ACOnlineMsg{ACId: acID}
+
+	if _, _, err := srv.handleACServerAssignment(newACOnlinePPD(), aolMsg, 33333, "10.99.0.3:62206"); err != nil {
+		t.Fatalf("handleACServerAssignment returned error: %v", err)
+	}
+
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricACAssignmentColorMigration] != 0 {
+		t.Errorf("expected %s=0 when the migration save failed (counts durable migrations only), got %v",
+			MetricACAssignmentColorMigration, counters[MetricACAssignmentColorMigration])
+	}
+}
+
+// TestHandleACServerAssignment_MigratesWhenSelfNotYetInSnapshot fences the
+// subtlest edge of the migration path: when this server (the answering
+// new-color server) has not yet propagated to Cloud Map, the wholesale
+// reassign builds the new assignment from the visible new-color subset and
+// can legitimately EXCLUDE self. The result must still be all-new-color (never
+// re-create a cross-color set) and non-empty; the AC picks up the rest —
+// including self — on a later re-registration once it propagates.
+func TestHandleACServerAssignment_MigratesWhenSelfNotYetInSnapshot(t *testing.T) {
+	const (
+		blueASG  = "layerv-nhp-sandbox-server"
+		greenASG = "layerv-nhp-sandbox-server-green"
+		acID     = "layerv-ac-selfmissing"
+	)
+	// Cloud Map shows the old (blue) servers + two NEW (green) servers, but NOT
+	// this server (i-green-a) — it hasn't registered/propagated yet.
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba", ASGName: blueASG},
+			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-bb", ASGName: blueASG},
+			{ID: "i-blue-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-bc", ASGName: blueASG},
+			{ID: "i-green-b", IP: "10.0.1.2", InternalIP: "10.0.1.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-gb", ASGName: greenASG},
+			{ID: "i-green-c", IP: "10.0.1.3", InternalIP: "10.0.1.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-gc", ASGName: greenASG},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments[acID] = &ACAssignment{
+		ACID:    acID,
+		Version: 5,
+		AssignedServers: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba"},
+			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-bb"},
+			{ID: "i-blue-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-bc"},
+		},
+		CreatedAt: now,
+		LastSeen:  now,
+		TTL:       &ttl,
+	}
+
+	// Answering server is i-green-a, which is NOT in the Cloud Map snapshot.
+	srv, mp := newColorTestServer(t, storage, cloudMap, "i-green-a", greenASG, "10.0.1.1")
+	aolMsg := &common.ACOnlineMsg{ACId: acID}
+
+	if _, _, err := srv.handleACServerAssignment(newACOnlinePPD(), aolMsg, 44444, "10.99.0.4:62206"); err != nil {
+		t.Fatalf("handleACServerAssignment returned error: %v", err)
+	}
+
+	storage.mu.Lock()
+	saved := storage.assignments[acID]
+	storage.mu.Unlock()
+	if saved == nil {
+		t.Fatal("assignment missing after migration")
+	}
+	if len(saved.AssignedServers) == 0 {
+		t.Fatal("migration produced an empty assignment")
+	}
+	// All NEW color, no blue survivors → never cross-color.
+	blueIDs := map[string]bool{"i-blue-a": true, "i-blue-b": true, "i-blue-c": true}
+	for _, srvInfo := range saved.AssignedServers {
+		if blueIDs[srvInfo.ID] {
+			t.Errorf("old-color server %s survived migration", srvInfo.ID)
+		}
+		// Self legitimately absent: it's not in the snapshot, so
+		// selectServersForAssignment can't inject it (documented edge).
+		if srvInfo.ID == "i-green-a" {
+			t.Error("did not expect self (i-green-a) in the assignment when it is absent from the Cloud Map snapshot")
+		}
+	}
+	// The reassign still persisted, so the migration counter ticks once.
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricACAssignmentColorMigration] != 1 {
+		t.Errorf("expected %s=1 (durable migration persisted), got %v", MetricACAssignmentColorMigration, counters[MetricACAssignmentColorMigration])
+	}
+}
+
+// TestAssignmentIsCrossColor_FailSafePaths confirms the detector returns false
+// (preserving the legacy add-self-keep-existing path) on every uncertain
+// input, so it never churns assignments when color can't be established.
+func TestAssignmentIsCrossColor_FailSafePaths(t *testing.T) {
+	const greenASG = "layerv-nhp-sandbox-server-green"
+	blueAssigned := []ServerInfo{{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1"}}
+
+	bothColors := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", ASGName: "layerv-nhp-sandbox-server"},
+			{ID: "i-green-a", IP: "10.0.1.1", InternalIP: "10.0.1.1", AZ: "us-east-2a", ASGName: greenASG},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+	// Non-nil but empty cached slice → DiscoverServerInstances returns an
+	// empty list from the cache (no live AWS call), exercising the
+	// "discovery error/empty result → false" branch.
+	emptyDiscovery := &CloudMapClient{
+		cachedInstances: []ServerInfo{},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+	// Every candidate is a different color than self (green) and none has an
+	// empty ASGName, so filterServersByASG fails open — a realistic deploy
+	// window where the new color hasn't propagated to Cloud Map yet. The
+	// detector must still return false (never churn on an unreliable view).
+	allCrossColor := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", ASGName: "layerv-nhp-sandbox-server"},
+			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", ASGName: "layerv-nhp-sandbox-server"},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	tests := []struct {
+		name     string
+		srv      *UdpServer
+		assigned []ServerInfo
+		want     bool
+	}{
+		{
+			name:     "nil cloud map → false",
+			srv:      &UdpServer{cloudMap: nil, asgName: greenASG},
+			assigned: blueAssigned,
+			want:     false,
+		},
+		{
+			name:     "empty input → false",
+			srv:      &UdpServer{cloudMap: bothColors, asgName: greenASG},
+			assigned: nil,
+			want:     false,
+		},
+		{
+			name:     "own ASG unknown → false",
+			srv:      &UdpServer{cloudMap: bothColors, asgName: ""},
+			assigned: blueAssigned,
+			want:     false,
+		},
+		{
+			name: "all assigned same color → false",
+			srv:  &UdpServer{cloudMap: bothColors, asgName: greenASG},
+			assigned: []ServerInfo{
+				{ID: "i-green-a", IP: "10.0.1.1", InternalIP: "10.0.1.1"},
+			},
+			want: false,
+		},
+		{
+			name:     "discovery returns empty → false",
+			srv:      &UdpServer{cloudMap: emptyDiscovery, asgName: greenASG},
+			assigned: blueAssigned,
+			want:     false,
+		},
+		{
+			name:     "ASG filter fail-open (all candidates cross-color) → false",
+			srv:      &UdpServer{cloudMap: allCrossColor, asgName: greenASG},
+			assigned: blueAssigned,
+			want:     false,
+		},
+		{
+			name: "assigned server with no IP → skipped, not treated as cross-color",
+			srv:  &UdpServer{cloudMap: bothColors, asgName: greenASG},
+			assigned: []ServerInfo{
+				{ID: "i-green-a", IP: "10.0.1.1", InternalIP: "10.0.1.1"}, // same color
+				{ID: "i-ghost"}, // no IP at all
+			},
+			want: false,
+		},
+		{
+			name:     "genuine cross-color → true",
+			srv:      &UdpServer{cloudMap: bothColors, asgName: greenASG},
+			assigned: blueAssigned,
+			want:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, discovered := tc.srv.assignmentIsCrossColor(context.Background(), tc.assigned)
+			if got != tc.want {
+				t.Errorf("assignmentIsCrossColor = %v, want %v", got, tc.want)
+			}
+			// The discovered snapshot is returned only on a true result (for the
+			// caller to reuse) and must be nil otherwise.
+			if got && discovered == nil {
+				t.Error("expected discovered snapshot on a true result, got nil")
+			}
+			if !got && discovered != nil {
+				t.Errorf("expected nil discovered snapshot on a false result, got %d servers", len(discovered))
 			}
 		})
 	}
