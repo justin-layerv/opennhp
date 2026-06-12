@@ -2406,6 +2406,8 @@ module "qurl_service" {
   # on `qurl_scanner_lambda_enabled`.
   qurl_scanner_lambda_enabled             = var.qurl_scanner_lambda_enabled
   qurl_scanner_sqs_emit_enabled           = var.qurl_scanner_sqs_emit_enabled
+  qurl_scanner_tombstone_write_enabled    = var.qurl_scanner_tombstone_write_enabled
+  qurl_scanner_active_recheck_enabled     = var.qurl_scanner_active_recheck_enabled
   qurl_scanner_lambda_ecr_repo_url        = module.ecr.qurl_scanner_lambda_repo_url
   qurl_scanner_lambda_ecr_repo_arn        = module.ecr.qurl_scanner_lambda_repo_arn
   qurl_scanner_lambda_image_tag_ssm_param = "/${local.name_prefix}/qurl-scanner-lambda-image-tag"

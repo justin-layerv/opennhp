@@ -1,5 +1,5 @@
-# qurl-scanner Lambda — scheduled EventBridge-driven scan of the qURL
-# time-bucket-index GSI.
+# qurl-scanner Lambdas — scheduled EventBridge-driven scans for the qURL
+# time-bucket-index GSI and active-resource rechecks.
 #
 # The Lambda runs the same `cmd/qurl-scanner` binary the CLI uses, packaged
 # as a container image (`provided.al2023` base) published by qurl-service
@@ -10,7 +10,12 @@
 #
 # Gating: the ECR repo + SSM image-tag param gate on `deploy_qurl_service`
 # (so qurl-service CI can publish images regardless of the Lambda enable
-# flag); the Lambda + cron + alarms gate on `qurl_scanner_lambda_enabled`.
+# flag); the per-minute Lambda + schedule + alarm gate on
+# `qurl_scanner_lambda_enabled`. The hourly active-resource recheck is an
+# explicit later flip: it also requires SQS emit/consumer wiring,
+# tombstone-write activation, and `qurl_scanner_active_recheck_enabled` so
+# operators can burn in per-minute tombstone writes before turning on the
+# broad status-index sweep.
 # See PR #2326 for
 # the canonical two-apply rollout sequence, preflight checks, smoke tests,
 # rollback steps, and prod flag-flip preconditions — this file deliberately
@@ -142,7 +147,9 @@ data "aws_ssm_parameter" "scanner_lambda_image_tag_current" {
 # ============================================================================
 
 locals {
-  scanner_lambda_function_name = "${var.name_prefix}-${var.cell_id}-qurl-scanner"
+  scanner_lambda_function_name         = "${var.name_prefix}-${var.cell_id}-qurl-scanner"
+  scanner_active_recheck_function_name = "${var.name_prefix}-${var.cell_id}-qurl-scanner-active-recheck"
+  scanner_active_recheck_enabled       = var.qurl_scanner_lambda_enabled && var.qurl_scanner_sqs_emit_enabled && var.qurl_scanner_tombstone_write_enabled && var.qurl_scanner_active_recheck_enabled
 
   # Shared tags carried by every scanner Lambda resource. `Name` is
   # per-resource (each gets a distinct suffix), so it stays in the
@@ -151,6 +158,24 @@ locals {
     Component = "qurl-scanner-lambda"
     Cell      = var.cell_id
   }
+
+  scanner_lambda_base_env = {
+    QURL_SCANNER_TABLE_PREFIX = "${var.name_prefix}-${var.cell_id}"
+  }
+
+  # Conditional combines BOTH gates so the `[0]` lookup is unreachable when
+  # `qurl_scanner_lambda_enabled = false`. The Lambda resources are count-gated
+  # on `qurl_scanner_lambda_enabled`, so this is technically
+  # belt-and-suspenders; it matches main.tf's consumer-side defensive pattern
+  # and keeps the producer/consumer emit gates visibly paired.
+  scanner_lambda_sqs_env = (var.qurl_scanner_sqs_emit_enabled && var.qurl_scanner_lambda_enabled) ? {
+    QURL_SCANNER_EMIT_MODE     = "sqs"
+    QURL_SCANNER_SQS_QUEUE_URL = aws_sqs_queue.resource_lifecycle_queue[0].url
+  } : {}
+
+  scanner_lambda_tombstone_env = var.qurl_scanner_tombstone_write_enabled ? {
+    QURL_SCANNER_ENABLE_TOMBSTONE_WRITE = "true"
+  } : {}
 }
 
 # Encrypted CloudWatch Log Group for the scanner Lambda.
@@ -179,6 +204,25 @@ resource "aws_cloudwatch_log_group" "scanner_lambda" {
   })
 }
 
+# Encrypted CloudWatch Log Group for the active-resource recheck Lambda.
+#
+# This sibling function uses the same scanner image as the per-minute
+# expiry scanner, but it runs on an hourly cadence and has its own reserved
+# concurrency. Keeping the log groups separate gives the active-recheck
+# alarms an independent FunctionName dimension, so an outage in this
+# catch-up path cannot be hidden by healthy per-minute expiry ticks.
+resource "aws_cloudwatch_log_group" "scanner_active_recheck" {
+  count = local.scanner_active_recheck_enabled ? 1 : 0
+
+  name              = "/aws/lambda/${local.scanner_active_recheck_function_name}"
+  retention_in_days = coalesce(var.scanner_lambda_log_retention_days, local.is_prod ? 365 : 30)
+  kms_key_id        = var.logs_kms_key_arn
+
+  tags = merge(var.tags, local.scanner_lambda_common_tags, {
+    Name = "${local.scanner_active_recheck_function_name}-logs"
+  })
+}
+
 # ============================================================================
 # IAM execution role
 # ============================================================================
@@ -189,7 +233,7 @@ resource "aws_iam_role" "scanner_lambda" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
   name        = "${local.scanner_lambda_function_name}-execution"
-  description = "Execution role for the qurl-scanner Lambda -- DDB Query/UpdateItem on qURL tables + optional SQS SendMessage + CloudWatch Logs."
+  description = "Execution role for qurl-scanner Lambdas -- DDB Query/UpdateItem on qURL tables + optional SQS SendMessage + CloudWatch Logs."
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -224,6 +268,10 @@ resource "aws_iam_role" "scanner_lambda" {
 #                                          `resource_tombstoned_at`,
 #                                          `tombstone_ttl`,
 #                                          `final_access_count`)
+#   * `qurl_resources/status-index` GSI  : Query (hourly active-resource
+#                                          recheck for resources blocked by
+#                                          viewer sessions after the last
+#                                          qURL expired)
 #   * `qurl_sessions` table              : Query (PK = resource_id, with
 #                                          TTL filter — see PR-A4a-3
 #                                          design note on counter drift
@@ -234,6 +282,11 @@ resource "aws_iam_role" "scanner_lambda" {
 # permits operations on the base table; `${table_arn}/index/<name>` is a
 # distinct ARN and must be listed separately, or Query against the GSI
 # returns AccessDeniedException at runtime.
+#
+# The execution role is intentionally shared by both scanner Lambdas. This
+# grant is absent until the active-recheck phase is enabled; at that point it
+# lands on the shared role, so the per-minute scanner carries the same
+# superset permission even though only active-resource-recheck mode uses it.
 resource "aws_iam_role_policy" "scanner_lambda_dynamodb" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
@@ -291,6 +344,12 @@ resource "aws_iam_role_policy" "scanner_lambda_dynamodb" {
           Resource = [var.qurl_sessions_table_arn]
         },
       ],
+      local.scanner_active_recheck_enabled ? [{
+        Sid      = "QurlResourcesStatusIndexQuery"
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = ["${var.qurl_resources_table_arn}/index/status-index"]
+      }] : [],
       var.secrets_kms_key_arn != null && var.secrets_kms_key_arn != "" ? [{
         Sid      = "KMSDecryptDynamoDB"
         Effect   = "Allow"
@@ -301,7 +360,7 @@ resource "aws_iam_role_policy" "scanner_lambda_dynamodb" {
   })
 }
 
-# CloudWatch Logs writer — scoped to the scanner's log group only (not the
+# CloudWatch Logs writer — scoped to the scanner log groups only (not the
 # broad `arn:aws:logs:*:*:*` shape AWS's managed `AWSLambdaBasicExecutionRole`
 # would grant).
 resource "aws_iam_role_policy" "scanner_lambda_logs" {
@@ -319,7 +378,10 @@ resource "aws_iam_role_policy" "scanner_lambda_logs" {
         "logs:CreateLogStream",
         "logs:PutLogEvents",
       ]
-      Resource = "${aws_cloudwatch_log_group.scanner_lambda[0].arn}:*"
+      Resource = concat(
+        ["${aws_cloudwatch_log_group.scanner_lambda[0].arn}:*"],
+        local.scanner_active_recheck_enabled ? ["${aws_cloudwatch_log_group.scanner_active_recheck[0].arn}:*"] : [],
+      )
     }]
   })
 }
@@ -431,28 +493,14 @@ resource "aws_lambda_function" "scanner" {
   # QURL_SCANNER_TABLE_PREFIX threads the same `<name_prefix>-<cell>`
   # shape the API container uses.
   #
-  # Other emit-mode-specific env vars (QURL_SCANNER_ENABLE_TOMBSTONE_WRITE,
-  # QURL_SCANNER_ALLOW_PROD_EMIT) stay absent in sandbox — tombstone
-  # writes and prod-emit are separately gated downstream flags.
+  # QURL_SCANNER_ENABLE_TOMBSTONE_WRITE flips only when
+  # qurl_scanner_tombstone_write_enabled is true. This can burn in on the
+  # existing per-minute scanner before qurl_scanner_active_recheck_enabled
+  # creates the hourly status-index sweep. The module precondition in main.tf
+  # requires SQS emit/consumer wiring first, so a tombstone-write run cannot
+  # fall back to log-only delivery.
   environment {
-    variables = merge(
-      {
-        QURL_SCANNER_TABLE_PREFIX = "${var.name_prefix}-${var.cell_id}"
-      },
-      # Conditional combines BOTH gates so the `[0]` lookup is
-      # unreachable when `qurl_scanner_lambda_enabled = false`. The
-      # scanner Lambda itself is count-gated on
-      # `qurl_scanner_lambda_enabled`, so this resource's environment
-      # block doesn't evaluate when the Lambda is disabled — meaning
-      # the AND'd gate is technically belt-and-suspenders here. Matches
-      # the consumer-side defensive pattern in main.tf's container_env
-      # for consistency. The operator-misconfig case fails via the
-      # precondition on aws_ecs_task_definition.qurl below.
-      (var.qurl_scanner_sqs_emit_enabled && var.qurl_scanner_lambda_enabled) ? {
-        QURL_SCANNER_EMIT_MODE     = "sqs"
-        QURL_SCANNER_SQS_QUEUE_URL = aws_sqs_queue.resource_lifecycle_queue[0].url
-      } : {},
-    )
+    variables = merge(local.scanner_lambda_base_env, local.scanner_lambda_sqs_env, local.scanner_lambda_tombstone_env)
   }
 
   # The Lambda runtime expects the image's CMD to map to a `bootstrap`
@@ -531,6 +579,74 @@ resource "aws_lambda_function" "scanner" {
   }
 }
 
+# Hourly active-resource catch-up scanner.
+#
+# Issue layervai/qurl-service#850 found a real liveness gap in the
+# expiry-bucket-only workflow: a resource can be blocked by an active viewer
+# session after its final qURL expires, then never become a future expiry
+# candidate again after the session drains. This sibling function runs the
+# same scanner image in `active-resource-recheck` mode so it scans the
+# resources status-index directly and feeds candidates back through the same
+# close/tombstone code path.
+#
+# This is deliberately NOT a second EventBridge target on the per-minute
+# Lambda. The minute scanner has reserved concurrency 1 by design; a broad
+# active-resource sweep sharing that slot could throttle expiry ticks and
+# create missed buckets. Separate reserved concurrency keeps the catch-up path
+# from interfering with normal qURL expiry processing.
+#
+# COUNT GATE: active recheck exists only after the explicit scheduler flip:
+# Lambda enabled + SQS producer/consumer enabled + tombstone-write enabled +
+# qurl_scanner_active_recheck_enabled.
+# qurl-service rejects real active recheck runs without tombstone-write, because
+# scanning the active partition during emit-only rollout would re-emit the same
+# close-eligible resources every hour without removing them from the index.
+#
+# Cross-variable preconditions live on the always-planned qurl-api task
+# definition below. This count gate implies the per-minute scanner Lambda is
+# also planned, so its Lambda-specific image/table/KMS/SSM preconditions fire
+# on the same inputs before this sibling can be created.
+resource "aws_lambda_function" "scanner_active_recheck" {
+  count = local.scanner_active_recheck_enabled ? 1 : 0
+
+  function_name = local.scanner_active_recheck_function_name
+  description   = "qURL active-resource recheck scanner -- runs hourly, scans the resources status-index, and closes resources once active viewer sessions drain."
+  role          = aws_iam_role.scanner_lambda[0].arn
+
+  package_type  = "Image"
+  image_uri     = "${var.qurl_scanner_lambda_ecr_repo_url}:${nonsensitive(data.aws_ssm_parameter.scanner_lambda_image_tag_current[0].value)}"
+  architectures = ["x86_64"]
+
+  memory_size = var.scanner_lambda_memory_mb
+  timeout     = var.scanner_active_recheck_timeout_seconds
+
+  # Independent concurrency prevents broad active-resource sweeps from
+  # consuming the expiry scanner's single reserved slot.
+  reserved_concurrent_executions = 1
+
+  environment {
+    variables = merge(
+      local.scanner_lambda_base_env,
+      {
+        QURL_SCANNER_SCAN_MODE = "active-resource-recheck"
+      },
+      local.scanner_lambda_sqs_env,
+      local.scanner_lambda_tombstone_env,
+    )
+  }
+
+  tags = merge(var.tags, local.scanner_lambda_common_tags, {
+    Name = local.scanner_active_recheck_function_name
+  })
+
+  depends_on = [
+    aws_cloudwatch_log_group.scanner_active_recheck,
+    aws_iam_role_policy.scanner_lambda_dynamodb,
+    aws_iam_role_policy.scanner_lambda_logs,
+    aws_iam_role_policy.scanner_lambda_sqs, # count-gated: a zero-instance ref here is a no-op edge
+  ]
+}
+
 # Async-invocation failure-handling fence.
 #
 # EventBridge invokes Lambda asynchronously. Two retry surfaces have to
@@ -587,6 +703,28 @@ resource "aws_lambda_function_event_invoke_config" "scanner" {
   maximum_event_age_in_seconds = 60
 }
 
+# Async invoke fence for the hourly active-resource recheck.
+#
+# The active recheck is not bucket-replayable the way the per-minute
+# expiry scanner is, so the event age can be wider than one minute. Retry
+# attempts stay disabled: if a scan fails because of IAM, KMS, or a code
+# bug, immediately retrying the same full-table sweep is unlikely to
+# succeed and can mask the first failure behind duplicated work. The
+# companion error alarm below pages on the first function error.
+#
+# With the timeout defaulted to 300s (and variable-capped at Lambda's 900s
+# maximum) on a 1h cadence, a normal run frees the function well before the
+# next tick. If AWS ever redelivers near the next tick anyway,
+# qurl-service#919's pass-2 path is idempotent: already tombstoned resources
+# short-circuit before emit, and the tombstone write is conditional.
+resource "aws_lambda_function_event_invoke_config" "scanner_active_recheck" {
+  count = local.scanner_active_recheck_enabled ? 1 : 0
+
+  function_name                = aws_lambda_function.scanner_active_recheck[0].function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 3600
+}
+
 # ============================================================================
 # EventBridge cron — `rate(1 minute)` tick
 # ============================================================================
@@ -635,6 +773,48 @@ resource "aws_lambda_permission" "scanner_tick" {
   function_name = aws_lambda_function.scanner[0].function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.scanner_tick[0].arn
+}
+
+# ============================================================================
+# EventBridge cron — `rate(1 hour)` active-resource recheck
+# ============================================================================
+
+resource "aws_cloudwatch_event_rule" "scanner_active_recheck" {
+  count = local.scanner_active_recheck_enabled ? 1 : 0
+
+  name                = "${local.scanner_active_recheck_function_name}-tick"
+  description         = "Hourly qurl-scanner active-resource recheck — scans resources status-index candidates after viewer sessions drain."
+  schedule_expression = "rate(1 hour)"
+
+  tags = merge(var.tags, local.scanner_lambda_common_tags, {
+    Name = "${local.scanner_active_recheck_function_name}-tick"
+  })
+}
+
+resource "aws_cloudwatch_event_target" "scanner_active_recheck" {
+  count = local.scanner_active_recheck_enabled ? 1 : 0
+
+  rule = aws_cloudwatch_event_rule.scanner_active_recheck[0].name
+  arn  = aws_lambda_function.scanner_active_recheck[0].arn
+
+  # The mode override must live at the JSON ROOT. qurl-service's ScannerEvent
+  # reads `scan_mode` from the root alongside `bucket`, and the event value
+  # overrides the env-derived default if they ever diverge. Keeping the env var
+  # and event input aligned makes empty manual test invokes safe while this
+  # scheduled path stays explicit.
+  input = jsonencode({
+    scan_mode = "active-resource-recheck"
+  })
+}
+
+resource "aws_lambda_permission" "scanner_active_recheck" {
+  count = local.scanner_active_recheck_enabled ? 1 : 0
+
+  statement_id  = "AllowEventBridgeInvokeActiveRecheck"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.scanner_active_recheck[0].function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.scanner_active_recheck[0].arn
 }
 
 # ============================================================================
@@ -761,5 +941,86 @@ resource "aws_cloudwatch_metric_alarm" "scanner_errors_burning" {
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
     Name = "${local.scanner_lambda_function_name}-errors-burning"
+  })
+}
+
+# Active-resource recheck invocation-gap alarm.
+#
+# The per-minute scanner's invocation alarm cannot prove that the hourly
+# catch-up path is running, because both functions would otherwise publish
+# healthy `Invocations` metrics under different FunctionName dimensions.
+# This alarm fires when the active-recheck function has no invocations for
+# two consecutive one-hour windows.
+#
+# Lambda does not publish a zero-valued `Invocations` datapoint for quiet
+# windows, so `treat_missing_data = "breaching"` is the load-bearing gap
+# detector. The zero threshold is still set for explicit zero datapoints, but
+# missing-data treatment is what catches a disabled rule or deleted function.
+# Do not "fix" this to a non-zero threshold, and do not copy this shape into
+# per-minute alarms where low-but-present invocation datapoints need their own
+# threshold semantics.
+#
+# First-enable behavior: this alarm can sit in ALARM for up to 2 hours after a
+# fresh create/replacement until two hourly windows have real invocation data.
+# Keep `evaluation_periods = 2`: a single delayed hourly invocation can leave
+# one aligned one-hour window empty, but two consecutive missing windows means
+# a real delivery gap. Wire SNS with the startup breach in mind.
+resource "aws_cloudwatch_metric_alarm" "scanner_active_recheck_invocation_gap" {
+  count = local.scanner_active_recheck_enabled ? 1 : 0
+
+  alarm_name        = "${local.scanner_active_recheck_function_name}-invocation-gap"
+  alarm_description = "qurl-scanner active-resource recheck Lambda has not been invoked for 2 consecutive 1-hour windows. Indicates EventBridge delivery gap, disabled rule, throttling, or deleted/dimension-drifted function."
+
+  namespace   = "AWS/Lambda"
+  metric_name = "Invocations"
+  statistic   = "Sum"
+  period      = 3600
+
+  evaluation_periods  = 2
+  threshold           = 0
+  comparison_operator = "LessThanOrEqualToThreshold"
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    FunctionName = aws_lambda_function.scanner_active_recheck[0].function_name
+  }
+
+  alarm_actions = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
+  # ok_actions intentionally omitted for parity with the per-minute gap alarm.
+
+  tags = merge(var.tags, local.scanner_lambda_common_tags, {
+    Name = "${local.scanner_active_recheck_function_name}-invocation-gap"
+  })
+}
+
+# Active-resource recheck error alarm.
+#
+# Any function error means this catch-up path did not prove all
+# session-drained resources were reconsidered in that hour.
+resource "aws_cloudwatch_metric_alarm" "scanner_active_recheck_errors_burning" {
+  count = local.scanner_active_recheck_enabled ? 1 : 0
+
+  alarm_name        = "${local.scanner_active_recheck_function_name}-errors-burning"
+  alarm_description = "qurl-scanner active-resource recheck Lambda is producing function errors (Sum(Errors) >= 1 over 5 min). Recovery: read CloudWatch Logs and either fix-forward or roll both scanner Lambdas back to the prior shared image tag via the SSM image-tag param."
+
+  namespace   = "AWS/Lambda"
+  metric_name = "Errors"
+  statistic   = "Sum"
+  period      = 300
+
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_lambda_function.scanner_active_recheck[0].function_name
+  }
+
+  alarm_actions = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
+  ok_actions    = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, local.scanner_lambda_common_tags, {
+    Name = "${local.scanner_active_recheck_function_name}-errors-burning"
   })
 }

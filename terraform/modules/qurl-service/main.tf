@@ -1301,6 +1301,14 @@ resource "aws_ecs_task_definition" "qurl" {
       condition     = !var.qurl_scanner_sqs_emit_enabled || var.qurl_scanner_lambda_enabled
       error_message = "qurl_scanner_sqs_emit_enabled=true requires qurl_scanner_lambda_enabled=true. Without the Lambda the resource_lifecycle_queue doesn't exist, so the qurl-api task def's WEBHOOK_EVENTS_SQS_QUEUE_URL env var (and the scanner Lambda's QURL_SCANNER_SQS_QUEUE_URL) reference `aws_sqs_queue.resource_lifecycle_queue[0].url` against count=0 → `Invalid index`. Set qurl_scanner_lambda_enabled = true (or leave qurl_scanner_sqs_emit_enabled = false until the Lambda is enabled)."
     }
+    precondition {
+      condition     = !var.qurl_scanner_tombstone_write_enabled || var.qurl_scanner_sqs_emit_enabled
+      error_message = "qurl_scanner_tombstone_write_enabled=true requires qurl_scanner_sqs_emit_enabled=true. Tombstone writes are destructive and qurl-scanner rejects tombstone-write runs without the SQS consumer path; flip SQS emit/consumer first, then enable tombstone writes in a later apply."
+    }
+    precondition {
+      condition     = !var.qurl_scanner_active_recheck_enabled || var.qurl_scanner_tombstone_write_enabled
+      error_message = "qurl_scanner_active_recheck_enabled=true requires qurl_scanner_tombstone_write_enabled=true. Burn in SQS emit/consumer and per-minute tombstone writes first, then enable the broad active-resource recheck scheduler in a later apply."
+    }
   }
 }
 

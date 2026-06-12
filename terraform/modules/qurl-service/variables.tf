@@ -1031,7 +1031,7 @@ variable "nhp_server_port" {
 # rollout sequence and the resource list each gate covers.
 
 variable "qurl_scanner_lambda_enabled" {
-  description = "Create the scheduled qurl-scanner Lambda + EventBridge cron + scan-gap alarm. Default OFF. Setting true on a greenfield env fails with `InvalidParameterValueException: Source image ... does not exist` until qurl-service CI has published its first image — the two-apply rollout sequences this. Sandbox-only on first applies; prod rollout preconditions are tracked in the prod rollout task ledger."
+  description = "Create the scheduled qurl-scanner Lambdas + EventBridge schedules + scan-gap alarms. Default OFF. Setting true on a greenfield env fails with `InvalidParameterValueException: Source image ... does not exist` until qurl-service CI has published its first image — the two-apply rollout sequences this. Sandbox-only on first applies; prod rollout preconditions are tracked in the prod rollout task ledger."
   type        = bool
   default     = false
 }
@@ -1128,6 +1128,18 @@ variable "qurl_scanner_sqs_emit_enabled" {
   default     = false
 }
 
+variable "qurl_scanner_tombstone_write_enabled" {
+  description = "Enable destructive scanner tombstone writes (`QURL_SCANNER_ENABLE_TOMBSTONE_WRITE=true`). Requires `qurl_scanner_sqs_emit_enabled = true` so resource.closed is delivered to the SQS consumer before any resource is flipped to 410-Gone. The active-resource recheck scheduler has its own later flag so this per-minute tombstone-write phase can burn in first."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_scanner_active_recheck_enabled" {
+  description = "Create the hourly active-resource recheck scheduler. Requires `qurl_scanner_tombstone_write_enabled = true` so each broad status-index sweep can tombstone close-eligible resources instead of repeatedly re-emitting them. Keep false while SQS and per-minute tombstone writes burn in."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_scanner_lambda_ecr_repo_url" {
   description = "ECR repository URL for the qurl-scanner Lambda image (e.g. `<acct>.dkr.ecr.<region>.amazonaws.com/layerv/qurl-scanner-lambda`). Threaded from `module.ecr.qurl_scanner_lambda_repo_url`. Empty is the gate-OFF default; the Lambda's `lifecycle { precondition }` block fails plan with a copy-pasteable error if `qurl_scanner_lambda_enabled = true` and this is empty (so an enabled Lambda can never reference a malformed `image_uri`)."
   type        = string
@@ -1152,7 +1164,7 @@ variable "qurl_scanner_lambda_image_tag_ssm_param" {
 }
 
 variable "qurl_resources_table_arn" {
-  description = "ARN of the qurl-resources DynamoDB table (UpdateItem + GetItem from the scanner Lambda). Threaded from `module.dynamodb.qurl_resources_table_arn`. Empty is the gate-OFF default; the Lambda precondition fails plan if `qurl_scanner_lambda_enabled = true` and this is empty."
+  description = "ARN of the qurl-resources DynamoDB table (UpdateItem + GetItem from the scanner Lambdas, plus Query on `status-index` for active-resource rechecks). Threaded from `module.dynamodb.qurl_resources_table_arn`. Empty is the gate-OFF default; the Lambda precondition fails plan if `qurl_scanner_lambda_enabled = true` and this is empty."
   type        = string
   default     = ""
 }
@@ -1188,6 +1200,17 @@ variable "scanner_lambda_timeout_seconds" {
   validation {
     condition     = var.scanner_lambda_timeout_seconds >= 1 && var.scanner_lambda_timeout_seconds <= 60
     error_message = "scanner_lambda_timeout_seconds must be in [1, 60] to stay under the rate(1 minute) cadence."
+  }
+}
+
+variable "scanner_active_recheck_timeout_seconds" {
+  description = "Per-invocation timeout (seconds) for the hourly active-resource recheck Lambda. Default 300s gives the status-index sweep room to close session-drained resources without sharing the per-minute expiry scanner's strict 60s cadence budget. Keep below the hourly schedule interval; raise only with measured CloudWatch duration data."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.scanner_active_recheck_timeout_seconds >= 1 && var.scanner_active_recheck_timeout_seconds <= 900
+    error_message = "scanner_active_recheck_timeout_seconds must be in [1, 900] per the Lambda maximum timeout."
   }
 }
 

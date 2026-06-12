@@ -397,6 +397,18 @@ variable "qurl_scanner_sqs_emit_enabled" {
   default     = false
 }
 
+variable "qurl_scanner_tombstone_write_enabled" {
+  description = "Enable destructive qurl-scanner tombstone writes in sandbox after the SQS producer/consumer path is active. See `modules/qurl-service/variables.tf::qurl_scanner_tombstone_write_enabled`."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_scanner_active_recheck_enabled" {
+  description = "Create the hourly active-resource recheck scheduler in sandbox after SQS and per-minute tombstone writes have burned in. See `modules/qurl-service/variables.tf::qurl_scanner_active_recheck_enabled`."
+  type        = bool
+  default     = false
+}
+
 variable "scanner_lambda_alarm_sns_topic_arn" {
   description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits the wiring (alarm still fires + appears in CloudWatch, no notification). Wire when the SNS topic lands alongside the SQS queue."
   type        = string

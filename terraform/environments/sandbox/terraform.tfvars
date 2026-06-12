@@ -273,6 +273,16 @@ qurl_scanner_lambda_enabled = true
 # (14d for the DLQ if the consumer fails 3× redeliveries first).
 qurl_scanner_sqs_emit_enabled = true
 
+# Destructive scanner tombstone-write phase. Stays false until the
+# SQS producer/consumer flip above is already active and burn-in is
+# healthy.
+qurl_scanner_tombstone_write_enabled = false
+
+# Hourly active-resource recheck scheduler. Stays false until the
+# per-minute tombstone-write phase above has burned in and qurl-service
+# #919 hard gates confirm the broad status-index sweep fits the cell.
+qurl_scanner_active_recheck_enabled = false
+
 # Domain configuration for QURL API
 # Certificate is created automatically via Terraform when domain is set
 qurl_service_domain = "api.layerv.xyz"

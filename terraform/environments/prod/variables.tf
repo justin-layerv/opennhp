@@ -376,6 +376,18 @@ variable "qurl_scanner_sqs_emit_enabled" {
   default     = false
 }
 
+variable "qurl_scanner_tombstone_write_enabled" {
+  description = "Enable destructive qurl-scanner tombstone writes in prod. Default OFF — keep absent from prod tfvars until SQS emit/consumer is active, sandbox tombstone-write burn-in is green, and HARD PROD preconditions clear."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_scanner_active_recheck_enabled" {
+  description = "Create the hourly active-resource recheck scheduler in prod. Default OFF — keep absent from prod tfvars until SQS, per-minute tombstone writes, sandbox active-recheck burn-in, and HARD PROD preconditions clear."
+  type        = bool
+  default     = false
+}
+
 variable "scanner_lambda_alarm_sns_topic_arn" {
   description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits paging."
   type        = string

@@ -89,6 +89,8 @@ module "nhp" {
   enable_qurl_agent_bootstrap              = var.enable_qurl_agent_bootstrap
   qurl_scanner_lambda_enabled              = var.qurl_scanner_lambda_enabled
   qurl_scanner_sqs_emit_enabled            = var.qurl_scanner_sqs_emit_enabled
+  qurl_scanner_tombstone_write_enabled     = var.qurl_scanner_tombstone_write_enabled
+  qurl_scanner_active_recheck_enabled      = var.qurl_scanner_active_recheck_enabled
   scanner_lambda_alarm_sns_topic_arn       = var.scanner_lambda_alarm_sns_topic_arn
   qurl_tunnel_auth_enabled                 = var.qurl_tunnel_auth_enabled
   qurl_tunnel_active_registrations_enabled = var.qurl_tunnel_active_registrations_enabled
