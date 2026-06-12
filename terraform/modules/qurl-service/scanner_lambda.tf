@@ -417,18 +417,42 @@ resource "aws_lambda_function" "scanner" {
   reserved_concurrent_executions = 1
 
   # Env vars default to the safest posture:
-  #   - EMIT_MODE absent       → binary defaults to log-only (no SQS write)
+  #   - QURL_SCANNER_EMIT_MODE absent          → binary defaults to log-only (no SQS write)
   #   - QURL_SCANNER_ENABLE_TOMBSTONE_WRITE absent → no resource tombstoning
-  #   - QURL_SCANNER_ALLOW_PROD_EMIT absent        → no prod emit
-  # An operator flips these in a separate `terraform apply` after the
-  # smoke test, SQS queue, and paging alarms are in place — see the
-  # prod rollout task ledger. AWS_REGION is auto-populated by the
-  # Lambda runtime; QURL_SCANNER_TABLE_PREFIX threads the same
-  # `<name_prefix>-<cell>` shape the API container uses.
+  #   - QURL_SCANNER_ALLOW_PROD_EMIT absent    → no prod emit
+  # `qurl_scanner_sqs_emit_enabled` flips QURL_SCANNER_EMIT_MODE +
+  # QURL_SCANNER_SQS_QUEUE_URL together — the producer activation. The
+  # consumer (qurl-api ECS task) flips on the same variable in main.tf's
+  # `local.container_env` — but NOT atomically; see the ordering nuance
+  # in `variables.tf::qurl_scanner_sqs_emit_enabled` (the CI workflow
+  # runs deploy-sandbox-infra → deploy-sandbox-qurl in series, so
+  # producer flips first, consumer flips on the later ECS roll).
+  # AWS_REGION is auto-populated by the Lambda runtime;
+  # QURL_SCANNER_TABLE_PREFIX threads the same `<name_prefix>-<cell>`
+  # shape the API container uses.
+  #
+  # Other emit-mode-specific env vars (QURL_SCANNER_ENABLE_TOMBSTONE_WRITE,
+  # QURL_SCANNER_ALLOW_PROD_EMIT) stay absent in sandbox — tombstone
+  # writes and prod-emit are separately gated downstream flags.
   environment {
-    variables = {
-      QURL_SCANNER_TABLE_PREFIX = "${var.name_prefix}-${var.cell_id}"
-    }
+    variables = merge(
+      {
+        QURL_SCANNER_TABLE_PREFIX = "${var.name_prefix}-${var.cell_id}"
+      },
+      # Conditional combines BOTH gates so the `[0]` lookup is
+      # unreachable when `qurl_scanner_lambda_enabled = false`. The
+      # scanner Lambda itself is count-gated on
+      # `qurl_scanner_lambda_enabled`, so this resource's environment
+      # block doesn't evaluate when the Lambda is disabled — meaning
+      # the AND'd gate is technically belt-and-suspenders here. Matches
+      # the consumer-side defensive pattern in main.tf's container_env
+      # for consistency. The operator-misconfig case fails via the
+      # precondition on aws_ecs_task_definition.qurl below.
+      (var.qurl_scanner_sqs_emit_enabled && var.qurl_scanner_lambda_enabled) ? {
+        QURL_SCANNER_EMIT_MODE     = "sqs"
+        QURL_SCANNER_SQS_QUEUE_URL = aws_sqs_queue.resource_lifecycle_queue[0].url
+      } : {},
+    )
   }
 
   # The Lambda runtime expects the image's CMD to map to a `bootstrap`
@@ -495,6 +519,15 @@ resource "aws_lambda_function" "scanner" {
       condition     = var.qurl_scanner_lambda_image_tag_ssm_param != ""
       error_message = "qurl_scanner_lambda_enabled=true but qurl_scanner_lambda_image_tag_ssm_param is empty. The image-tag SSM resource is gated off (count=0), so the `data.aws_ssm_parameter[0]` reference would fail plan with a bare 'Invalid index'. Thread a non-empty SSM parameter name from the root (e.g. `/<name_prefix>/qurl-scanner-lambda-image-tag`) and confirm qurl-service `build-and-deploy.yml` writes to the same path."
     }
+    # Activation-flag coherence (emit-enabled requires Lambda-enabled)
+    # is enforced on the qurl-api task definition's lifecycle block in
+    # main.tf — not here. The scanner Lambda is count-gated on
+    # `qurl_scanner_lambda_enabled`, so its preconditions don't
+    # evaluate when the Lambda is disabled. The task def is always
+    # present (no count gate) AND it consumes the
+    # `aws_sqs_queue.resource_lifecycle_queue[0].url` reference whose
+    # bare `Invalid index` we want to replace with a copy-pasteable
+    # error.
   }
 }
 

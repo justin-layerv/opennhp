@@ -391,6 +391,12 @@ variable "qurl_scanner_lambda_enabled" {
   default     = false
 }
 
+variable "qurl_scanner_sqs_emit_enabled" {
+  description = "Activate the resource-lifecycle SQS data path (sandbox). See `modules/qurl-service/variables.tf::qurl_scanner_sqs_emit_enabled` for the canonical rationale."
+  type        = bool
+  default     = false
+}
+
 variable "scanner_lambda_alarm_sns_topic_arn" {
   description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits the wiring (alarm still fires + appears in CloudWatch, no notification). Wire when the SNS topic lands alongside the SQS queue."
   type        = string

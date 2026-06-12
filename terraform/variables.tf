@@ -801,6 +801,12 @@ variable "qurl_scanner_lambda_enabled" {
   default     = false
 }
 
+variable "qurl_scanner_sqs_emit_enabled" {
+  description = "Activate the resource-lifecycle SQS data path. See `modules/qurl-service/variables.tf::qurl_scanner_sqs_emit_enabled` for the full rationale (producer/consumer ordering under ECS rollback, operator gates, when to flip)."
+  type        = bool
+  default     = false
+}
+
 variable "scanner_lambda_alarm_sns_topic_arn" {
   description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits the wiring (alarm still fires + appears in CloudWatch, no notification). Defaults empty — wire in a follow-up that creates the topic alongside the SQS queue."
   type        = string

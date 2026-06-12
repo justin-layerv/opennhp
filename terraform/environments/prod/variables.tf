@@ -370,6 +370,12 @@ variable "qurl_scanner_lambda_enabled" {
   default     = false
 }
 
+variable "qurl_scanner_sqs_emit_enabled" {
+  description = "Activate the resource-lifecycle SQS data path (prod). Default OFF — keep absent from prod tfvars until sandbox e2e + load-test gates clear AND HARD PROD preconditions clear. See `modules/qurl-service/variables.tf::qurl_scanner_sqs_emit_enabled` for the canonical rationale."
+  type        = bool
+  default     = false
+}
+
 variable "scanner_lambda_alarm_sns_topic_arn" {
   description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits paging."
   type        = string

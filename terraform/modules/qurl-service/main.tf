@@ -347,6 +347,26 @@ locals {
       { name = "USAGE_EVENTS_ENABLED", value = "true" },
       { name = "USAGE_SQS_QUEUE_URL", value = var.usage_events_queue_url },
     ] : [],
+    # Webhook-events SQS consumer (qurl-service PR #874 drainer goroutine).
+    # Activated by `qurl_scanner_sqs_emit_enabled` — see
+    # `modules/qurl-service/variables.tf::qurl_scanner_sqs_emit_enabled`
+    # for the canonical rationale (producer/consumer ordering, rollback
+    # de-atomization risk, when to flip).
+    #
+    # Conditional ANDs both flags so the `[0]` lookup against
+    # `aws_sqs_queue.resource_lifecycle_queue` (count-gated on
+    # `qurl_scanner_lambda_enabled`) is structurally unreachable in the
+    # operator-misconfig case (`emit=true, lambda=false`). Terraform
+    # evaluates the ternary lazily, so the `[0]` reference is simply
+    # never reached when the AND'd condition is false — no `Invalid
+    # index`. The lifecycle precondition below is then the
+    # friendly-error layer: it prints the copy-pasteable misconfig
+    # message so the operator sees what's wrong, instead of a silent
+    # plan-passes-with-empty-env-vars no-op.
+    (var.qurl_scanner_sqs_emit_enabled && var.qurl_scanner_lambda_enabled) ? [
+      { name = "WEBHOOK_EVENTS_CONSUMER_ENABLED", value = "true" },
+      { name = "WEBHOOK_EVENTS_SQS_QUEUE_URL", value = aws_sqs_queue.resource_lifecycle_queue[0].url },
+    ] : [],
     # Idempotency table (for distributed idempotency)
     var.idempotency_table_name != "" ? [
       { name = "IDEMPOTENCY_TABLE_NAME", value = var.idempotency_table_name },
@@ -1254,6 +1274,22 @@ resource "aws_ecs_task_definition" "qurl" {
     precondition {
       condition     = length(local.alb_subnet_cidrs) > 0
       error_message = "QURL_TRUSTED_PROXY_CIDRS would be empty: var.public_subnet_ids must resolve to at least one subnet with a cidr_block (qurl-service hard-fails startup in prod on an empty trust list)."
+    }
+
+    # Activation-flag coherence: `local.container_env` above conditionally
+    # references `aws_sqs_queue.resource_lifecycle_queue[0].url` when
+    # `qurl_scanner_sqs_emit_enabled = true`. The queue resource has
+    # `count = qurl_scanner_lambda_enabled ? 1 : 0` (see
+    # resource_lifecycle_queue.tf), so flipping emit-enabled with
+    # Lambda-disabled would fail plan with a bare `Invalid index` on
+    # the `[0]` lookup. Catch it here with a copy-pasteable error
+    # instead. This task def resource has NO count gate (always
+    # planned), so the precondition always evaluates — unlike the
+    # scanner Lambda which is count-gated on `qurl_scanner_lambda_enabled`
+    # and would skip its own preconditions when disabled. cr #2471 r1.
+    precondition {
+      condition     = !var.qurl_scanner_sqs_emit_enabled || var.qurl_scanner_lambda_enabled
+      error_message = "qurl_scanner_sqs_emit_enabled=true requires qurl_scanner_lambda_enabled=true. Without the Lambda the resource_lifecycle_queue doesn't exist, so the qurl-api task def's WEBHOOK_EVENTS_SQS_QUEUE_URL env var (and the scanner Lambda's QURL_SCANNER_SQS_QUEUE_URL) reference `aws_sqs_queue.resource_lifecycle_queue[0].url` against count=0 → `Invalid index`. Set qurl_scanner_lambda_enabled = true (or leave qurl_scanner_sqs_emit_enabled = false until the Lambda is enabled)."
     }
   }
 }

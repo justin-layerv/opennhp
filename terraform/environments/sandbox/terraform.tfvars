@@ -231,6 +231,22 @@ enable_qurl_agent_bootstrap = true
 # the HARD PROD preconditions in the #2326 ledger entry are met.
 qurl_scanner_lambda_enabled = true
 
+# Activation flag — flips scanner Lambda emit mode (log-only → sqs)
+# AND the qurl-api consumer goroutine (dormant → draining) on the
+# resource-lifecycle queue. See
+# `modules/qurl-service/variables.tf::qurl_scanner_sqs_emit_enabled`
+# for the full rationale (ordering / rollback de-atomization risk /
+# operator gates).
+#
+# STAYS FALSE in this PR — plumbing-only. The actual sandbox flip
+# rides a tiny follow-up PR (1-line change to true) merged only
+# after qurl-service main ships a confirmed-healthy qurl-api image.
+# The build-and-push.yml workflow auto-applies any `terraform/**`
+# change on push to main, so merging this PR with the flag at true
+# would auto-activate the producer immediately, before any operator
+# gate could fire — exactly the unsafe path cr round-5 flagged.
+qurl_scanner_sqs_emit_enabled = false
+
 # Domain configuration for QURL API
 # Certificate is created automatically via Terraform when domain is set
 qurl_service_domain = "api.layerv.xyz"

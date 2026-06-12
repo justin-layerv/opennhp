@@ -1036,6 +1036,98 @@ variable "qurl_scanner_lambda_enabled" {
   default     = false
 }
 
+# CANONICAL RATIONALE for the activation flag — all other-layer
+# declarations of `qurl_scanner_sqs_emit_enabled` (root,
+# sandbox/prod env vars, sandbox tfvars) cross-reference this block.
+#
+# # What it does
+#
+# Flips the producer (scanner Lambda) AND consumer (qurl-api ECS task)
+# wiring of the `resource_lifecycle_queue`. When true:
+#
+#   - Scanner Lambda gets `QURL_SCANNER_EMIT_MODE=sqs` +
+#     `QURL_SCANNER_SQS_QUEUE_URL=<resource-lifecycle queue URL>`
+#     (binary publishes `qurl.expired` / `resource.closed` envelopes
+#     via SQS SendMessage instead of slog-only).
+#   - qurl-api task def gets `WEBHOOK_EVENTS_CONSUMER_ENABLED=true` +
+#     `WEBHOOK_EVENTS_SQS_QUEUE_URL=<same URL>` (qurl-service PR #874
+#     drainer goroutine wakes up and starts dequeueing).
+#
+# # Ordering (NOT atomic in one apply — important nuance)
+#
+# Conceptually a "both-at-once" flip, but the CI workflow splits the
+# apply into stages — producer flips during `deploy-sandbox-infra` (a
+# plain Lambda env update with no rollback), consumer flips during the
+# LATER `deploy-sandbox-qurl` ECS roll (circuit-breaker protected).
+# So there's an inherent producer-first ordering, plus a short window
+# where a scheduled scanner tick could publish to SQS before the
+# consumer is draining. While the consumer is starting up, accumulated
+# messages stay in the MAIN queue (consumer not yet receiving, so
+# `maxReceiveCount` doesn't trip and the DLQ stays empty); the window
+# is bounded by `message_retention_seconds = 345600` (4 days) and
+# alarmed via `resource_lifecycle_queue_backlog` (`Sum > 1000 for
+# 3 × 5min`). Harmless in normal operation.
+#
+# # Rollback de-atomization risk
+#
+# If the qurl-api task def fails `/health/live` on the new revision,
+# ECS `deployment_circuit_breaker { rollback = true }` reverts to the
+# prior task def — which does NOT carry the consumer env vars. The
+# scanner Lambda's config update, however, has no rollback. Net:
+# producer ON, consumer OFF → main-queue backlog accumulates (NOT
+# DLQ — consumer isn't receiving, so retries never trip; bounded by
+# `message_retention_seconds = 345600` / 4 days, watched by
+# `resource_lifecycle_queue_backlog` alarm). This is the exact
+# unsafe direction the design tried to avoid. The DLQ + redrive
+# policy bound the orthogonal consumer-running-but-failing case.
+#
+# # When to flip
+#
+# `build-and-push.yml` triggers on push to main with paths
+# `terraform/**`, so MERGING a tfvar flip auto-applies — there is no
+# manual dispatch to hold. The safe rollout is:
+#
+#   1. Land the variable plumbing with `qurl_scanner_sqs_emit_enabled
+#      = false` everywhere (this PR).
+#   2. Verify qurl-service main has shipped a confirmed-healthy
+#      qurl-api image (the current 7791fcc-class image fails
+#      `/health/live` per the dispatched run that landed the scanner
+#      Lambda). `aws ssm get-parameter --name
+#      /layerv-nhp-sandbox/qurl-api-image-tag --query
+#      'Parameter.Value' --output text` should return that SHA, and
+#      its `/health/live` should be green when the task boots.
+#   3. Flip the sandbox tfvar to true in a tiny follow-up PR. The
+#      merge auto-applies; the apply lands the env-var changes
+#      cleanly because the upstream image boots.
+#   4. POST-APPLY: verify the active task def revision is the new one
+#      (not a rolled-back prior) — `aws ecs describe-services ...
+#      --query 'services[].deployments[?status==\`PRIMARY\`].taskDefinition'`.
+#      If it returns a rolled-back prior, the producer is ON but
+#      consumer is OFF — flip the tfvar back to false + re-apply to
+#      close the skew gap.
+#
+# # Default + prod
+#
+# Default false: the queue + DLQ exist (gated on
+# `qurl_scanner_lambda_enabled`) but are unused. Setting true requires
+# `qurl_scanner_lambda_enabled = true` — without the Lambda, there's
+# nothing to emit, so the `resource_lifecycle_queue` resource doesn't
+# exist (count=0). Enforcement: the qurl-api task def's `lifecycle {
+# precondition }` block in `main.tf` covers BOTH the producer and
+# consumer sides with a single check (the task def is always planned,
+# unlike the count-gated scanner Lambda). Belt-and-suspenders on top:
+# both env-var conditionals AND `qurl_scanner_lambda_enabled` so the
+# `[0]` lookups against the queue resource are structurally unreachable
+# under the operator-misconfig case (`emit=true, lambda=false`).
+#
+# Prod: stays false until sandbox e2e + load-test gates clear. The
+# #2326 ledger entry tracks the prod preconditions.
+variable "qurl_scanner_sqs_emit_enabled" {
+  description = "Activate the resource-lifecycle SQS data path — flips scanner Lambda emit-mode to `sqs` + wakes the qurl-api consumer goroutine. Requires `qurl_scanner_lambda_enabled = true`. Default false (queue + DLQ exist but are unused). See `scanner_lambda.tf`'s `environment.variables` merge for the producer wiring, `main.tf`'s `local.container_env` for the consumer wiring."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_scanner_lambda_ecr_repo_url" {
   description = "ECR repository URL for the qurl-scanner Lambda image (e.g. `<acct>.dkr.ecr.<region>.amazonaws.com/layerv/qurl-scanner-lambda`). Threaded from `module.ecr.qurl_scanner_lambda_repo_url`. Empty is the gate-OFF default; the Lambda's `lifecycle { precondition }` block fails plan with a copy-pasteable error if `qurl_scanner_lambda_enabled = true` and this is empty (so an enabled Lambda can never reference a malformed `image_uri`)."
   type        = string
