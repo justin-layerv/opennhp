@@ -6,6 +6,7 @@ stale-finding re-alert). This runbook is the triage procedure for that alert.
 
 There is **no pager** for security alerts. The compensating control against a
 finding being silently missed is the **stale-finding watchdog** (issue
+[#1211](https://github.com/layervai/nhp/issues/1211), split from
 [#1137](https://github.com/layervai/nhp/issues/1137)): a Lambda that re-alerts
 weekly on any non-archived finding older than `stale_finding_age_days`
 (default 7). That means an un-triaged finding keeps nagging — but it also means
@@ -62,6 +63,15 @@ anything you receive is at least Medium:
    the AWS finding-type reference:
    <https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_finding-types-active.html>.
 
+   Capture these fields before taking action:
+
+   | Finding class | Fields to record |
+   |---------------|------------------|
+   | All findings | Finding ID, `Type`, `Severity`, `Title`, `CreatedAt`, `UpdatedAt`, `Service.Archived`, account, region, detector ID, console URL. |
+   | IAM credential findings | `resource.accessKeyDetails.userName`, access key ID, principal ID, `service.action.*`, API names, source IP, ASN/ISP, country/city, user agent. |
+   | EC2 / network findings | Instance ID, ENI/private IP, public IP, security groups, VPC/subnet, remote IP/domain, port/protocol, direction, flow/action metadata. |
+   | S3 / RDS / Lambda findings | Resource ARN/name, action/API, caller principal, source IP/user agent, object/key or database/function identifier if present. |
+
 3. **Decide true vs. false positive.** Correlate the `service.action`,
    resource (`resource.*`), and actor against CloudTrail and the expected
    behavior of that resource. Known-benign sources (a scheduled scanner, a
@@ -85,7 +95,8 @@ anything you receive is at least Medium:
    the security owner directly and posting in the security Slack channel with
    the finding link and what you've done so far. For a High finding you can't
    contain quickly, treat it as a P0 and pull in whoever owns the affected
-   resource.
+   resource. For Critical severity, do that immediately through the available
+   on-call path before continuing analysis.
 
 6. **Archive once resolved.** Archiving is what stops the watchdog re-alert.
    Only archive after you've investigated and (if needed) remediated:
@@ -105,8 +116,63 @@ lists only `service.archived = false` findings, so any nag means the archive
 didn't take or a new finding of the same type was generated. Do not silence the
 watchdog by lowering its cadence; archive the underlying finding instead.
 
+## IR ticket template
+
+Open an incident ticket for every confirmed incident and for any High/Critical
+finding that remains unclear after the first pass. Use one ticket per GuardDuty
+finding unless multiple findings clearly describe the same incident.
+
+```markdown
+# GuardDuty IR: <finding type> / <resource or principal>
+
+## Summary
+- Finding ID:
+- Account / region:
+- Severity:
+- First observed:
+- Last updated:
+- Current archived state:
+- Current disposition: true positive / false positive / unclear
+
+## GuardDuty details
+- Type:
+- Title:
+- Resource:
+- Actor / principal:
+- Access key ID, if any:
+- Source IP / ASN / country:
+- User agent:
+- GuardDuty console URL:
+
+## Timeline
+- <UTC timestamp> - Alert received in Slack/email/watchdog.
+- <UTC timestamp> - Finding pulled with `aws guardduty get-findings`.
+- <UTC timestamp> - CloudTrail / resource-owner correlation started.
+- <UTC timestamp> - Containment or archive decision.
+
+## Evidence
+- GuardDuty fields reviewed:
+- CloudTrail query:
+- Resource-owner confirmation:
+- Related deploy, scanner, or operator activity:
+
+## Decision
+- Known-intentional: yes / no / unknown
+- If true positive: containment taken and owner paged:
+- If false positive: suppression rule needed:
+- Archive decision and reason:
+
+## Follow-ups
+- Credential rotation:
+- Resource hardening:
+- Suppression rule:
+- Runbook or alert changes:
+```
+
 ## Related
 
+- [#1211](https://github.com/layervai/nhp/issues/1211) — structural
+  GuardDuty alert-routing, stale-finding watchdog, and runbook closure.
 - [#1137](https://github.com/layervai/nhp/issues/1137) — the un-triaged
   access-key finding that motivated the watchdog.
 - [#2334](https://github.com/layervai/nhp/issues/2334) — security alert-routing
