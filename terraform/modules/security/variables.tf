@@ -161,7 +161,19 @@ variable "guardduty_alert_emails" {
 }
 
 variable "guardduty_alert_severity_threshold" {
-  description = "Minimum severity for GuardDuty alerts (1-8 integer; AWS bands: HIGH 7.0+, MEDIUM 4.0-6.9, LOW 1.0-3.9). Integer-only because the stale-finding watchdog Lambda (#1137) calls GuardDuty ListFindings, which rejects float for severity.Gte. Shared with the EventBridge initial-alert rule; raising silences both."
+  description = <<-EOT
+  Minimum severity for GuardDuty alerts. Use integer thresholds from 1 to 8.
+  Common choices are 4 for Medium+, 7 for High+, or 8 for findings 8.0+
+  (highest-severity High plus Critical); intermediate integers are valid for
+  finer cutoffs.
+  Critical findings (9.0-10.0) are still caught at threshold 8 because the
+  EventBridge and ListFindings filters are >=; validation caps the threshold at
+  8, so this setting cannot exclude Critical findings. Integer-only because
+  the stale-finding watchdog Lambda (tracked under #1211, split from #1137)
+  calls GuardDuty ListFindings, which rejects float for the severity Gte
+  criterion. Shared with the EventBridge initial-alert rule; raising silences
+  both.
+  EOT
   type        = number
   default     = 4
 
@@ -182,9 +194,9 @@ variable "enable_slack_target" {
   default     = true
 }
 
-# GuardDuty stale-finding watchdog (#1137)
+# GuardDuty stale-finding watchdog (#1137 origin; #1211 structural follow-up)
 variable "enable_stale_finding_watchdog" {
-  description = "Enable weekly watchdog Lambda that re-alerts on non-archived GuardDuty findings (#1137). Requires enable_guardduty."
+  description = "Enable weekly watchdog Lambda that re-alerts on non-archived GuardDuty findings (originated in #1137; structural follow-up tracked under #1211). Requires enable_guardduty."
   type        = bool
   default     = true
 }

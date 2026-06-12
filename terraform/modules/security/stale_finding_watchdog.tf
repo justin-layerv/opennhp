@@ -1,4 +1,4 @@
-# GuardDuty stale-finding watchdog (#1137)
+# GuardDuty stale-finding watchdog (#1137 origin; #1211 structural follow-up)
 #
 # A HIGH-severity GuardDuty finding sat Archived=false for ~2 months
 # before anyone noticed. The initial EventBridge → SNS → Chatbot alert
@@ -208,7 +208,7 @@ resource "aws_lambda_function" "stale_finding_watchdog" {
 # ---------------------------------------------------------------------------
 # EventBridge schedule
 # ---------------------------------------------------------------------------
-# Runs weekly (Monday 13:00 UTC by default) — matches the #1137 issue's
+# Runs weekly (Monday 13:00 UTC by default) — matches the #1137/#1211
 # recommended cadence and avoids alert-fatigue from daily re-pings on the
 # same un-archived finding. With a 7-day staleness threshold, weekly
 # re-alerts catch a newly-stale finding within 7–14 days, which is well
