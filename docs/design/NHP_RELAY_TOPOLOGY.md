@@ -218,7 +218,8 @@ fileviewer page. It also owns the **re-knock scheduler** (renew at `Access Durat
 ### The canonical flow
 
 With the JS agent and relay in place, the qURL flow becomes the canonical NHP
-workflow (spec pages 18–19, Steps 1–8) rather than a server-side synthesis:
+workflow (spec pages 22–23, Steps 1–8; see [Spec compliance](#spec-compliance))
+rather than a server-side synthesis:
 
 1. JS agent performs the Noise handshake and sends `NHP_KNK` → relay → server.
 2. Server authorizes (consults qurl-service), emits NHP-AOP to the AC, replies
@@ -229,6 +230,33 @@ workflow (spec pages 18–19, Steps 1–8) rather than a server-side synthesis:
    (`NHP_RKN`) → relay → server (spec Step 8).
 6. Server **re-consults qurl-service** (option *a*; see below), emits a fresh
    NHP-AOP, the AC re-Schedules the firewall window through its existing handler.
+
+## Spec compliance
+
+This topology *implements* the canonical NHP workflow rather than deviating from
+it. References below are to the CSA whitepaper **"Stealth Mode SDP for Zero Trust
+Network Infrastructure — Introducing the Network-infrastructure Hiding Protocol
+(NHP)"** (CSA Zero Trust Working Group, 2026) — verifiable against the PDF.
+
+| Design choice here | Spec backing |
+|---|---|
+| **Browser JS NHP-Agent** | *NHP Core Components* (p. 21): the NHP-Agent "can exist as a client, SDK, **browser**, application, or other similar entity." |
+| **`common.RelayForwardMsg{SourceAddr, InnerPacket}` as the `NHP-RLY` (type 9) body** | Appendix 2, *NHP-RLY (Relay) Message* (p. 53): "initiated by the NHP relay server… forward messages that require the **NHP proxy source address to be retained**… the carried message is the **original NHP protocol request packet… without additional encryption or compression**." That is exactly `SourceAddr` + opaque `InnerPacket`. |
+| **`NHP_RKN` (type 8) = cookie-retry re-knock** | Appendix 2, *NHP-RKN (Re-Knock) Message* (p. 53): "a second knock using a cookie… same fields as NHP-KNK; however, the HMAC calculation must also use the cookie value obtained from NHP-COK." |
+| **No new reply wire type** (server replies with the normal `NHP-ACK`, matched by the inner-packet counter) | `NHP-RLY` carries the *request*; the spec defines no separate relay-reply type — the server's `NHP-ACK` (type 2) is the response. |
+| **Agent-driven renewal** (replacing the AC `/refresh` L7 plane) | Workflow **Step 8** (p. 23): "the NHP-Agent must negotiate a renewal of the open-door session by **repeating steps 1–7**." |
+| **Relay `X-Real-IP` source-address preservation** | Workflow **Step 4** (p. 23): intermediaries perform "**source IP preservation (via PROXY protocol or X-Forwarded-For headers)**… as supported by modern proxies like NGINX or HAProxy." Reinforced by the NHP-AOP NAT note (p. 50) on per-session tokens for NAT'd agents — which the qURL session model supplies. |
+| **NHP-Server (auth) decoupled from NHP-AC (enforcement)** | pp. 8, 16, 20–21: NHP "decouples the authentication and access control features"; Server = Policy Engine, AC = Policy Enforcement Point (NIST SP 800-207). |
+| **Taking the server private behind the relay** | The protocol's purpose — *Network-infrastructure Hiding* — and threat model (pp. 8, 12): "hiding all ports and services," DDoS mitigation by "concealing IP addresses." A non-internet-reachable server is the strongest form of this. |
+
+**One spec nuance (not a deviation).** The *summary* message-type table (Table 4,
+p. 29) words NHP-RKN/NHP-RLY loosely ("forward requests" / "forward responses"),
+which reads slightly differently from the **authoritative Appendix-2 detail**
+(p. 53) cited above. The two are internally inconsistent within the spec itself;
+this design follows the detailed Appendix-2 definition — which is also exactly
+what **OpenNHP**, the spec's official open-source reference implementation
+(Appendix 1, p. 47), does. Matching the reference implementation keeps us
+interoperable with the canonical NHP ecosystem.
 
 ## Decision: re-knock authorization
 
