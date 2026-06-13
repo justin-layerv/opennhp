@@ -11,7 +11,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.57.0
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.3
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.39.28
-	github.com/aws/smithy-go v1.27.1
+	github.com/aws/smithy-go v1.27.2
 	github.com/cilium/ebpf v0.21.0
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/fengyily/nhp-plugins-sdk v0.1.30
