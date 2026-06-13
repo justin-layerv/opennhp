@@ -404,6 +404,24 @@ type ServerForwardResultMsg struct {
 	ErrMsg        string `json:"errMsg,omitempty"`  // Error message if failed
 }
 
+// RelayForwardMsg is the AEAD body of an NHP_RLY packet (relay -> private
+// server), ported verbatim from OpenNHP upstream (#2208). The relay wraps a
+// browser-originated, end-to-end-encrypted NHP packet (opaque to the relay) in
+// InnerPacket and stamps SourceAddr -- the client address the relay observed at
+// its TLS/TCP edge. SourceAddr is the sole trusted source of the AC pinhole IP
+// (AgentKnockMsg carries no source-IP field). There is no result message type:
+// the server replies with the normal NHP_ACK/NHP_COK, which the relay matches
+// back to the originating request by the inner packet's counter.
+//
+// InnerPacket is a base64 string (not []byte) for parity with upstream and the
+// TypeScript js-agent, which exchange a pre-encoded base64 string. encoding/json
+// would base64 a []byte to a wire-identical value, but we keep the encoding
+// explicit -- do not "simplify" it to []byte.
+type RelayForwardMsg struct {
+	SourceAddr  *NetAddress `json:"srcAddr"`  // real client address (relay-observed)
+	InnerPacket string      `json:"innerPkt"` // base64-encoded inner NHP packet
+}
+
 // RedirectTarget represents an assigned server that the AC should connect to.
 // Used in ACRedispatchMsg to redirect AC to its assigned servers.
 type RedirectTarget struct {
