@@ -16,6 +16,13 @@ This document tracks the synchronization status between this fork (LayerV NHP) a
 > ```
 > This shows ONLY new commits since last review. Update the SHA after each review.
 
+> **NHP plugins SDK bumps:** Before updating
+> `github.com/fengyily/nhp-plugins-sdk`, re-run the redirect helper parity
+> tests in `endpoints/server/staticplugins/internal/redirecturl`. That helper
+> intentionally mirrors `GetRedirectUrlByResource` while removing token-bearing
+> logs, so SDK behavior drift must be reviewed before changing the pinned
+> parity version.
+
 ---
 
 ## Relay + JS-Agent: now ADOPTED (was skipped) — #2208

@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v4"
 
+	"github.com/OpenNHP/opennhp/endpoints/server/staticplugins/internal/redirecturl"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
@@ -511,15 +512,13 @@ func knockByToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 		return result.AckMsg, nil
 	}
 
-	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHandler.GetConfig(), "knock", "anonymous")
+	ackMsg, redirectUrl, err := redirecturl.GetByResource(result.AckMsg, res, resourceHandler.GetConfig(), "knock", "anonymous")
 	if err != nil {
 		log.Error("failed to get redirect url: %v", err)
 		return ackMsg, nil
 	}
 
-	if len(redirectUrl) == 0 {
-		log.Error("RedirectUrl is not provided.")
-	} else {
+	if len(redirectUrl) > 0 {
 		ctx.Redirect(http.StatusFound, redirectUrl)
 		return ackMsg, nil
 	}
@@ -609,17 +608,13 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	redirectUrl := ""
 	if sharingRedirectUrl := getSharingLinkRedirectUrl(passcode, result.AckMsg.ResourceHost); len(sharingRedirectUrl) > 0 {
 		redirectUrl = sharingRedirectUrl
-		log.Info("Using sharing link redirect url: %s", redirectUrl)
+		log.Info("Using sharing link redirect url: %s", redirecturl.SafeForLog(redirectUrl))
 	} else {
-		result.AckMsg, redirectUrl, err = nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHandler.GetConfig(), "valid", "anonymous")
+		result.AckMsg, redirectUrl, err = redirecturl.GetByResource(result.AckMsg, res, resourceHandler.GetConfig(), "valid", "anonymous")
 		if err != nil {
 			log.Error("failed to get redirect url: %v", err)
 			return result.AckMsg, "404", err
 		}
-	}
-
-	if len(redirectUrl) == 0 {
-		log.Error("RedirectUrl is not provided.")
 	}
 
 	resp := &nhpplugins.RefreshResponse{
@@ -690,15 +685,12 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 	}
 
 	user := GetUserFromAuthHeader(authHeader)
-	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHandler.GetConfig(), "access", user)
+	ackMsg, redirectUrl, err := redirecturl.GetByResource(result.AckMsg, res, resourceHandler.GetConfig(), "access", user)
 	if err != nil {
 		log.Error("failed to get redirect url: %v", err)
 		return ackMsg, "404", err
 	}
-	log.Info("redirectUrl: %s", redirectUrl)
-	if len(redirectUrl) == 0 {
-		log.Error("RedirectUrl is not provided.")
-	}
+	log.Info("redirectUrl: %s", redirecturl.SafeForLog(redirectUrl))
 
 	resp := &nhpplugins.RefreshResponse{
 		RedirectUrl:     redirectUrl,
@@ -710,7 +702,7 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 
 	log.Info("ackMsg.ResourceHost: %+v", ackMsg.ResourceHost)
 	ctx.JSON(http.StatusOK, resp)
-	log.Info("refresh response sent (redirectUrl=%s)", resp.RedirectUrl)
+	log.Info("refresh response sent (redirectUrl=%s)", redirecturl.SafeForLog(resp.RedirectUrl))
 	return ackMsg, "", nil
 }
 
@@ -774,7 +766,7 @@ func getSharingLinkRedirectUrl(passcode string, resourceHost map[string]string) 
 
 	// Construct redirect URL: https://hostname/webgate/#/?key=sharing_key
 	redirectUrl := fmt.Sprintf("https://%s/webgate/#/?key=%s", host, sharingKeyStr)
-	log.Info("Constructed sharing link redirect URL: %s", redirectUrl)
+	log.Info("Constructed sharing link redirect URL: %s", redirecturl.SafeForLog(redirectUrl))
 
 	return redirectUrl
 }

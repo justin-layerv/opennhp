@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"golang.org/x/oauth2"
 
+	"github.com/OpenNHP/opennhp/endpoints/server/staticplugins/internal/redirecturl"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	nhplog "github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
@@ -295,14 +296,13 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		return nil, fmt.Errorf("knock failed: %s", ackMsg.ErrMsg)
 	}
 
-	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(ackMsg, res, resourceHandler.GetConfig(), "oidc", "")
+	ackMsg, redirectUrl, err := redirecturl.GetByResource(ackMsg, res, resourceHandler.GetConfig(), "oidc", "")
 	if err != nil {
 		log.Error("failed to get redirect url: %v", err)
 		return ackMsg, err
 	}
 
 	if len(redirectUrl) == 0 {
-		log.Error("RedirectUrl is not provided.")
 		resp.RedirectUrl = ackMsg.RedirectUrl
 	} else {
 		resp.RedirectUrl = redirectUrl

@@ -62,7 +62,8 @@ Status legend: **FIXED** = changed in the PR that introduced this doc; **SAFE**
 | Site | Token reachable | How touched | Status |
 |---|---|---|---|
 | [`endpoints/server/staticplugins/passcode/main.go`](../endpoints/server/staticplugins/passcode/main.go) `AuthWithHttpRefresh` (invalid-token branch) | NHP session JWT (validated then rejected) | `%s` of full `nHPToken` — **active leak** | **FIXED** → `common.RedactToken` |
-| [`endpoints/server/staticplugins/passcode/main.go`](../endpoints/server/staticplugins/passcode/main.go) `log.Info("Done %+v", resp)` | `RefreshResponse.NHPToken` + `.NHPRefreshToken` | `%+v` struct dump — **active leak** | **FIXED** → log `redirectUrl` only |
+| [`endpoints/server/staticplugins/passcode/main.go`](../endpoints/server/staticplugins/passcode/main.go) `log.Info("Done %+v", resp)` | `RefreshResponse.NHPToken` + `.NHPRefreshToken` | `%+v` struct dump — **active leak** | **FIXED** → log only the sanitized redirect URL (scheme/host/path) |
+| `nhpplugins.GetRedirectUrlByResource` calls from passcode/OIDC | redirect `access_token` JWT | SDK `v0.1.30` always appends `access_token` to the redirect query and logs the generated token internally (`ServiceInfo JSON...`) — **active leak** | **FIXED** → in-repo `staticplugins/internal/redirecturl.GetByResource` preserves the client URL but emits only sanitized, query/fragment-free logs |
 | [`endpoints/server/staticplugins/passcode/main.go`](../endpoints/server/staticplugins/passcode/main.go) ×2 (`GenerateAll`, refresh) | NHP session JWT | ad-hoc 10-char prefix `nhpToken[:min(10,…)]` | **FIXED** → `common.RedactToken` |
 | [`endpoints/server/staticplugins/passcode/main.go`](../endpoints/server/staticplugins/passcode/main.go) (`AuthWithHttpRefresh` empty branch) | none | logged `nHPToken` inside `len==0` guard (always empty) + misleading "expired" wording | **FIXED** → `nhp_token cookie missing`, value dropped |
 | [`endpoints/server/staticplugins/passcode/main.go`](../endpoints/server/staticplugins/passcode/main.go) `authAccessFromRaaS` | upstream IAM config payload | `%s` of full `string(body)` — the IAM `200` portal-site response, logged verbatim at Info; body is otherwise **unused** (defense-in-depth: may carry config secrets/tokens) | **FIXED** → log `len(body)` only |
@@ -133,12 +134,6 @@ changed here, to keep the audit scoped to #1426:
   portal-sites, QURL resolve API) — logged only on **non-200**; issued tokens
   appear only in 200 bodies. The IAM **200** body was the one exception and is
   now FIXED above.
-- **Redirect URL in passcode logs** (`authAccessFromRaaS` logs `redirectUrl`
-  pre-existing at the `redirectUrl:` line and in the response-sent line). The
-  URL is built by the external `nhpplugins.GetRedirectUrlByResource` SDK, which
-  is not inspectable from this repo; if any flow appends token/session query
-  params to the redirect, both log lines would leak them. Tracked for
-  verify-and-redact in [#2514](https://github.com/layervai/nhp/issues/2514).
 
 ## Remaining cross-repo work — tracked in [#1426](https://github.com/layervai/nhp/issues/1426)
 
