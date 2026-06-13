@@ -12,12 +12,16 @@ description: >-
               default, and the only safe default until enough attested images
               (post-#2339) have soaked: pre-#2339 images have no attestation and
               would all fail an enforcing gate.
-    enforce - fail the step (block the deploy) only on a genuine
-              no-valid-attestation verdict. Infra/tooling errors (AWS throttle,
-              docker-login blip, gh API 403/5xx) fail OPEN with a warning even
-              under enforce — a transient error must not block a prod promotion.
-              Flip fleet-wide via the IMAGE_ATTESTATION_VERIFY_MODE repo/env
-              variable after soak. Each run emits ATTEST_RESULT=pass|fail|error.
+    enforce - fail the step (block the deploy) on ANY verify failure that is not a
+              recognized transient/permission infra error — i.e. fail-CLOSED by
+              default. An image that is unattested, signed by the wrong
+              workflow/ref, or genuinely absent all block. Only a recognized infra
+              signal (AWS throttle, docker-login blip, gh API 401/403/408/429/5xx,
+              network/DNS/TLS/credential error) fails OPEN with a warning even
+              under enforce — a transient error must not block a prod promotion the
+              way a real verdict does. Flip fleet-wide via the
+              IMAGE_ATTESTATION_VERIFY_MODE repo/env variable after soak. Each run
+              emits ATTEST_RESULT=pass|fail|error.
 
 inputs:
   repository:
@@ -38,9 +42,9 @@ inputs:
     default: ""
   mode:
     description: >-
-      audit (log only, never blocks) | enforce (block on a real
-      no-attestation verdict; infra errors fail open). Trimmed + lowercased;
-      unrecognized -> audit.
+      audit (log only, never blocks) | enforce (fail-closed by default — block on
+      any verify failure that is not a recognized transient/permission infra
+      error). Trimmed + lowercased; unrecognized -> audit.
     required: false
     default: audit
   github-repository:
@@ -131,6 +135,46 @@ runs:
           exit 0
         }
 
+        # Recognized-infra allowlist — the ONLY signals that fail OPEN even under
+        # enforce. Everything NOT matched here fails CLOSED (fail-closed-by-default):
+        # an image that is unattested, signed by the wrong workflow/ref, or
+        # genuinely absent is a verdict, not infra. One regex covers the
+        # transient/permission errors of BOTH layers this gate touches (aws ecr
+        # describe + gh attestation verify): HTTP 401/403/408/429/5xx (and the
+        # registry's "HTTP status: 5xx" phrasing), AWS throttle/limit/timeout/5xx,
+        # network/DNS, TLS *handshake* (transport, before any attestation logic),
+        # and AWS auth/permission (expired/invalid/unrecognized token, sigv4
+        # signature, AccessDenied, AuthFailure, missing creds). Grounded in observed
+        # aws/gh wording — the
+        # fixtures in tests/lints/verify-image-attestation/run-fixtures.sh assert
+        # real captured strings classify correctly.
+        #
+        # Every token here must UNAMBIGUOUSLY mean "could not complete the check."
+        # Deliberately EXCLUDED, because each is (or can be) a VERDICT that must fail
+        # CLOSED — adding any of them back opens a silent hole under enforce:
+        #   - 'http 404', ImageNotFound/RepositoryNotFound, MANIFEST_UNKNOWN
+        #     -> "no attestation" / "no image" is a verdict.
+        #   - x509 / "unknown authority" / certificate-chain wording -> a signing
+        #     cert that doesn't chain to a trusted root is a BAD ATTESTATION
+        #     (verification is intrinsically a cert-chain check), and that wording
+        #     is indistinguishable from a transport cert error — so it fails closed.
+        #     A genuine transport cert failure then blocks the deploy and surfaces
+        #     in soak (the safe direction). 'tls handshake' IS transport-only.
+        #   - bare 'credential' -> too broad, and 'unable to locate' already covers
+        #     "Unable to locate credentials".
+        # Matched case-insensitively (grep -i); patterns kept specific so a genuine
+        # verdict cannot match one. The INFRA side stays coupled to gh/aws
+        # human-readable wording, so re-validate after a gh/runner-image or aws-CLI
+        # bump (mirrors the run-fuzz.sh deadline-race caveat in CLAUDE.md). A wording
+        # drift here fails CLOSED (safe), never silently open.
+        INFRA_RE='http (401|403|408|429|5[0-9][0-9])|http status: 5[0-9][0-9]|too many requests|rate.?limit|throttl|requestlimitexceeded|slow ?down|serverexception|internal(error| server error)|service unavailable|bad gateway|gateway time|timeout|timed out|deadline exceeded|connection (refused|reset|aborted)|broken pipe|unexpected eof|no such host|name resolution|temporary failure|network is unreachable|no route to host|dial (tcp|udp)|endpointconnection|could not connect|unable to (locate|connect)|expiredtoken|invalidclienttoken|unrecognizedclient|invalidsignature|incompletesignature|signaturedoesnotmatch|authfailure|access ?denied|tls[: ]+handshake'
+
+        # Genuinely-absent-image markers from `aws ecr describe-images`. One source
+        # for the retry-break and the describe-path classifier, which matches this
+        # BEFORE INFRA_RE (see there for why "no image to verify" must fail closed
+        # first), so the two can't drift.
+        ABSENT_RE='ImageNotFound|RepositoryNotFound'
+
         # Resolve registry host + cross-account describe args. The cross-account
         # path (prod creds -> sandbox registry, for prod canary/promote) relies on
         # the sandbox ECR repo policy granting the prod account
@@ -149,22 +193,52 @@ runs:
         # Resolve the tag to its immutable digest, retrying transient AWS errors
         # (up to 3 attempts, linear backoff). Inlined rather than a helper-by-name
         # so every shellcheck version sees the aws call as reached (an indirectly-
-        # invoked function trips SC2329/SC2317). The retry notice goes to STDERR so
-        # it never lands in the captured DIGEST. ${REG_ARGS[@]+"${REG_ARGS[@]}"} is
-        # the safe-empty-array expansion under set -u.
+        # invoked function trips SC2329/SC2317). Capture stdout+stderr together
+        # (2>&1) and extract the digest with an anchored, whole-line match, so an
+        # aws stderr warning can't be mistaken for the digest AND the error text is
+        # retained (DESCRIBE_OUT) to classify a failure WITHOUT a second describe
+        # call. The retry ::notice:: goes to the STEP's stderr (>&2), a separate
+        # stream from this $() capture, so it never lands in DESCRIBE_OUT.
+        # ${REG_ARGS[@]+"${REG_ARGS[@]}"} is the safe-empty-array expansion (set -u).
         DIGEST=""
+        DESCRIBE_OUT=""
         for attempt in 1 2 3; do
-          DIGEST="$(aws ecr describe-images ${REG_ARGS[@]+"${REG_ARGS[@]}"} \
+          DESCRIBE_OUT="$(aws ecr describe-images ${REG_ARGS[@]+"${REG_ARGS[@]}"} \
             --repository-name "$REPOSITORY" --image-ids imageTag="$IMAGE_TAG" \
-            --region "$REGION" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
-          if [[ "$DIGEST" == sha256:* ]]; then break; fi
+            --region "$REGION" --query 'imageDetails[0].imageDigest' --output text 2>&1 || true)"
+          DIGEST="$(printf '%s\n' "$DESCRIBE_OUT" | grep -m1 -iE '^sha256:[0-9a-f]+$' || true)"
+          if [[ -n "$DIGEST" ]]; then break; fi
+          # A genuinely-absent tag/repo is a verdict, not a transient blip — stop
+          # retrying; the classifier below fails it CLOSED under enforce.
+          if printf '%s' "$DESCRIBE_OUT" | grep -qiE "$ABSENT_RE"; then break; fi
           if [[ "$attempt" -lt 3 ]]; then
             echo "::notice::verify-image-attestation: describe attempt ${attempt}/3 failed; retrying in $(( attempt * 3 ))s" >&2
             sleep "$(( attempt * 3 ))"
           fi
         done
-        if [[ "$DIGEST" != sha256:* ]]; then
-          fail_infra "could not resolve a sha256 digest for ${REPOSITORY}:${IMAGE_TAG} (transient AWS error or image absent)"
+        if [[ -z "$DIGEST" ]]; then
+          # No digest. Classify the retained error text, FAIL-CLOSED by default.
+          # aws echoes the requested image TAG back in some errors (e.g.
+          # ImageNotFound's imageTag:'<tag>'), and the deploy tag is operator/
+          # dispatch-settable (canary-deploy.yml passes a workflow_dispatch input;
+          # ECR tags permit ._-). Scrub the tag before the INFRA_RE grep so a tag
+          # like 'rate-limit-fix' / 'timeout-debug' can't match an infra token and
+          # flip a verdict to fail-OPEN — the describe-side analogue of the gh-side
+          # Error:-line scoping, so the classification depends only on aws's error
+          # semantics, never on operator input. (Quoting "$IMAGE_TAG" makes // a
+          # literal, glob-safe replacement.) The genuinely-absent verdict
+          # (ABSENT_RE) is checked FIRST, on the raw text — an exception name, never
+          # the tag — so "no image to verify" (#1334) fails closed regardless. Only
+          # THEN fail OPEN on a recognized transient/permission signal; anything
+          # else fails CLOSED. Inert under audit (every fail_* path exits 0).
+          if printf '%s' "$DESCRIBE_OUT" | grep -qiE "$ABSENT_RE"; then
+            fail_verdict "no image to verify for ${REPOSITORY}:${IMAGE_TAG} (absent tag/repo): ${DESCRIBE_OUT}"
+          fi
+          SCRUBBED_OUT="${DESCRIBE_OUT//"$IMAGE_TAG"/<image-tag>}"
+          if printf '%s' "$SCRUBBED_OUT" | grep -qiE "$INFRA_RE"; then
+            fail_infra "could not resolve digest for ${REPOSITORY}:${IMAGE_TAG} (transient AWS/permission error): ${DESCRIBE_OUT}"
+          fi
+          fail_verdict "no image to verify for ${REPOSITORY}:${IMAGE_TAG} (unrecognized describe error): ${DESCRIBE_OUT}"
         fi
         REF="oci://${REGISTRY}/${REPOSITORY}@${DIGEST}"
 
@@ -206,26 +280,35 @@ runs:
           echo "::notice::Attestation verify OK (${MODE}): ${REPOSITORY}@${DIGEST}"
           exit 0
         fi
-        # Classify the failure: a genuine "no matching attestation" is a verdict
-        # (fail-closed under enforce); a permission/network/5xx error means we
-        # could not complete the check (infra -> fail-open even under enforce).
-        # gh's attestation API returns 404 when no attestation exists for the
-        # digest (vs 403/5xx for permission/transient). NB: this matches gh's
-        # human-readable wording — if a future gh release rephrases it, an
-        # unmatched verdict reclassifies as infra (fails OPEN under enforce, and
-        # is visible as ATTEST_RESULT=error during soak), never silently CLOSED.
+        # Classify the failure. Fail CLOSED by default: an image that is unattested,
+        # signed by the wrong workflow/ref, or whose manifest is gone has no valid
+        # provenance from our CI and MUST block under enforce. Fail OPEN only on a
+        # RECOGNIZED transient/permission infra signal (INFRA_RE) — a transient must
+        # not block a prod promotion the way a real verdict does. This inverts the
+        # old "match the no-attestation wording, else infra" logic, under which an
+        # identity/ref mismatch fell through to fail-OPEN (the #1334 gap). Grounded
+        # in observed gh 2.92.0 wording (complete output, locked by run-fixtures.sh):
+        #   - identity/ref/workflow mismatch -> 'Error: verifying with issuer "GitHub, Inc."'
+        #     -> no INFRA_RE match -> verdict (fail-closed). THIS is the gap, fixed.
+        #   - no attestation at all          -> 'Error: HTTP 404 ... /attestations/...'
+        #     (404 deliberately NOT in INFRA_RE) -> verdict (fail-closed).
+        #   - manifest gone                  -> 'Error: ... MANIFEST_UNKNOWN ...' -> verdict.
+        #   - permission/throttle/5xx/network-> 'Error: HTTP 401/403/408/429/5xx',
+        #     'Error: failed to fetch ... dial tcp ... no such host' -> INFRA -> infra.
         #
-        # KNOWN GAP — pre-enforce-flip, tracked in #1334: an attestation that
-        # EXISTS but whose signer identity/ref doesn't match (wrong workflow or a
-        # non-main ref) currently also falls through to infra (fail-OPEN). The
-        # security-correct enforce default is fail-CLOSED on anything that isn't a
-        # *recognized* transient/permission error — but the exact gh wording for
-        # the identity-mismatch and infra cases can't be observed until #2339's
-        # attested images exist, so finalizing this verdict-vs-infra split against
-        # real gh output is a #1334 acceptance item, not a guess baked in here.
-        # This is inert today: audit mode exits 0 on every path.
-        if printf '%s' "$VOUT" | grep -qiE 'no attestations|http 404|no matching attestation'; then
-          fail_verdict "no valid SLSA provenance from ${GH_REPO}/${SIGNER_WORKFLOW}@main for ${REPOSITORY}:${IMAGE_TAG} (${DIGEST})"
-        else
-          fail_infra "could not complete attestation verify for ${REPOSITORY}:${IMAGE_TAG} (API/permission/network error — see output above)"
+        # Match INFRA_RE only against gh's terminal error line(s) — gh emits its
+        # failure as a single `Error: <...>` line (confirmed for every case above),
+        # so the candidate attestation's identity, if a future gh prints it, lands
+        # on a separate INFORMATIONAL line that we do NOT scan. That identity is an
+        # attacker-influenceable branch/workflow ref (e.g. a branch named
+        # 'fix-503-timeout'); scanning the whole blob would let such echoed text
+        # flip a verdict to fail-OPEN — the exact hole this PR closes. A gh failure
+        # we can't see an `Error:` line for fails CLOSED (the safe direction). The
+        # describe layer greps its full output because aws only ever echoes OUR
+        # inputs (repo/tag), never attacker-controlled attestation identity.
+        # Inert under audit (every fail_* path exits 0).
+        GH_ERR="$(printf '%s\n' "$VOUT" | grep -iE '^[[:space:]]*Error:' || true)"
+        if printf '%s' "$GH_ERR" | grep -qiE "$INFRA_RE"; then
+          fail_infra "could not complete attestation verify for ${REPOSITORY}:${IMAGE_TAG} (${DIGEST}) — transient/permission error (see output above)"
         fi
+        fail_verdict "no valid SLSA provenance from ${GH_REPO}/${SIGNER_WORKFLOW}@main for ${REPOSITORY}:${IMAGE_TAG} (${DIGEST}) — unattested, or signed by a different workflow/ref"

@@ -602,13 +602,16 @@ This is a **two-stage burn-in**, mirroring `NHP_INTERNAL_AUTH_REQUIRE`:
   blocks a deploy**. Pre-#2339 images have no attestation and would all fail an
   enforcing gate, so audit is the only safe default until attested images
   accumulate.
-- **`enforce`.** A genuine *no-valid-attestation verdict* **fails the deploy
-  job**. Infrastructure/tooling errors (AWS throttle, `docker login` blip,
-  GitHub API 403/5xx) **fail open** with a loud warning even under enforce — a
-  transient error must not block a prod promotion the way a real missing
-  attestation does. The mode value is normalized (trimmed + lowercased); an
-  unrecognized value defaults to `audit` with a warning, so a typo during the
-  flip can't wedge every deploy.
+- **`enforce`.** **Fail-closed by default:** any verify failure that is *not* a
+  recognized transient/permission infra error **fails the deploy job** — an
+  unattested image, one signed by the wrong workflow/ref, or a genuinely-absent
+  image (deleted tag/repo) all block. Only a recognized infra signal (AWS
+  throttle, `docker login` blip, GitHub API 401/403/408/429/5xx, network/DNS/TLS,
+  or credential/permission error — `INFRA_RE` in the action) **fails open** with a
+  loud warning even under enforce: a transient error must not block a prod
+  promotion the way a real verdict does. The mode value is normalized (trimmed +
+  lowercased); an unrecognized value defaults to `audit` with a warning, so a typo
+  during the flip can't wedge every deploy.
 
 The mode is read from the `IMAGE_ATTESTATION_VERIFY_MODE` repo/environment
 variable (unset → `audit`). To flip fleet-wide after soak:
@@ -629,11 +632,12 @@ gh variable set IMAGE_ATTESTATION_VERIFY_MODE --repo layervai/nhp --body enforce
 **Hard gates before flipping to `enforce` (all must hold — not just a clean
 soak):**
 
-1. The identity/ref-mismatch classifier is **finalized and fail-closed**
-   (the [#1334](https://github.com/layervai/nhp/issues/1334) acceptance item).
-   Until then, `enforce` does **not** actually guarantee built-by-this-repo's-CI-
-   on-`main` — an attestation signed by the wrong workflow/ref currently
-   classifies as `error` (fail-open). This is the load-bearing gate.
+1. ✅ **Done.** The verdict classifier is **fail-closed by default** (finalized
+   for [#1334](https://github.com/layervai/nhp/issues/1334)): an unattested image,
+   one signed by the wrong workflow/ref, or a genuinely-absent image all fail
+   **closed**; only a recognized transient/permission infra signal fails open. So
+   `enforce` now genuinely guarantees built-by-this-repo's-CI-on-`main`. This was
+   the load-bearing gate.
 2. A soak window with `ATTEST_RESULT=pass` across all deploy paths and **no**
    `fail`/`error` (see below).
 3. The cross-account ECR pull grant is confirmed present (see below).
@@ -643,9 +647,14 @@ The verify step uses the default `GITHUB_TOKEN`; each deploy workflow grants it
 `ATTEST_RESULT=pass|fail|error` — so soak-readiness is mechanical rather than a
 visual log scan. Before flipping to `enforce`, confirm recent audit runs across
 all deploy paths (server, AC, canary, promote) show `ATTEST_RESULT=pass` with no
-`fail` (a real no-attestation verdict, which *would* block under enforce) and no
-`error` (an infra/permission issue — fails open under enforce, but means the
-gate isn't actually verifying and must be fixed first). The verify step needs
+`fail` (a real verdict — unattested, wrong workflow/ref, or absent image — which
+*would* block under enforce) and no `error` (an infra/permission issue — fails
+open under enforce, but means the gate isn't actually verifying and must be fixed
+first). Because the classifier is now fail-closed-by-default, watch the `fail`s
+as closely as the `error`s: a `fail` on an image you know **is** attested (a
+post-#2339 build, not a legacy image) means `INFRA_RE` *under-matched* a real
+transient and mis-classified it as a verdict — expand `INFRA_RE` to cover that
+wording before flipping, don't just re-run. The verify step needs
 ECR **login + pull** (`ecr:GetAuthorizationToken` + `BatchGetImage`/
 `GetDownloadUrlForLayer`), not just `DescribeImages`, so the manifest fetch can
 run:
@@ -659,20 +668,23 @@ run:
 
 A permission gap on either surfaces only as `ATTEST_RESULT=error` (fail-open).
 
-Two classifier caveats to resolve **before** flipping to `enforce` (tracked in
-[#1334](https://github.com/layervai/nhp/issues/1334)):
+Classifier maintenance note:
 
-- **Identity/ref-mismatch is unvalidated.** Today an attestation that exists but
-  whose signer identity/ref doesn't match classifies as `error` (fail-open), not
-  a blocking verdict. The exact `gh` wording for that case (and for the various
-  infra errors) can't be observed until attested images exist. Against a real
-  post-#2339 image, capture `gh`'s output for an identity mismatch and finalize
-  the verdict-vs-infra split so a wrong-CI attestation fails **closed** under
-  enforce.
-- **The verdict classification greps `gh`'s human-readable output**, so it is
-  coupled to the installed `gh` version. Re-validate the verdict grep against the
-  runner's `gh` after a `gh`/runner image bump (mirrors the `run-fuzz.sh`
-  deadline-race-signature caveat in `CLAUDE.md`).
+- **The fail-open allowlist greps `gh`/`aws` human-readable output**, so it stays
+  coupled to the installed `gh`/AWS-CLI versions. The classifier now fails
+  **closed** by default — only a recognized transient/permission signal
+  (`INFRA_RE` in the action) fails open — so a wording drift fails *safe*: a
+  missed infra pattern blocks a deploy rather than letting an unverified image
+  ship. The infra match is also scoped away from operator-influenceable text: on
+  the `gh` side to gh's terminal `Error:` line (so a future gh that prints the
+  candidate attestation's identity — an attacker-influenceable branch/workflow
+  ref — on an informational line can't flip a verdict to fail-open), and on the
+  `aws` describe side by scrubbing the operator-settable image tag before the
+  match. Still, re-validate `INFRA_RE` against the runner's `gh`/`aws` after a
+  `gh`/runner-image/AWS-CLI bump (mirrors the `run-fuzz.sh` deadline-race-signature
+  caveat in `CLAUDE.md`). The fixtures in
+  `tests/lints/verify-image-attestation/run-fixtures.sh` assert the verdict-vs-infra
+  split against the real `gh`/`aws` wording captured for #1334.
 
 ### `NHP_INTERNAL_AUTH_SECRET`
 
