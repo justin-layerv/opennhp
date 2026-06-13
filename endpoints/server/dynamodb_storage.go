@@ -20,6 +20,8 @@ import (
 const (
 	// DynamoDBOperationTimeout is the maximum time for a single DynamoDB operation.
 	// This provides predictable latency and prevents hung requests.
+	// (endpoints/internal/acktoken.OperationTimeout mirrors this for the AC's
+	// read-only reader — keep the two values in sync.)
 	DynamoDBOperationTimeout = 5 * time.Second
 
 	// healthCheckSentinelKey is the well-known key used for DynamoDB health checks.

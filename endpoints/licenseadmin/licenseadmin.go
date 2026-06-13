@@ -19,9 +19,7 @@ package licenseadmin
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -33,6 +31,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/OpenNHP/opennhp/nhp/utils"
 )
 
 // BoundPubKeyRawLen is the byte length of a curve25519 static public key.
@@ -214,8 +214,7 @@ func RemoveBoundPubKey(existing []string, target string) (result []string, remov
 // once at issuance, so operators typically work with this partition key
 // directly.
 func LicenseKeySHA256(licenseKey string) string {
-	h := sha256.Sum256([]byte(licenseKey))
-	return hex.EncodeToString(h[:])
+	return utils.SHA256(licenseKey)
 }
 
 // Config configures the DynamoDB License client.

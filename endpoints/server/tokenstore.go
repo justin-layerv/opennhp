@@ -6,62 +6,39 @@ import (
 	"maps"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/internal/acktoken"
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
-// ACTokenEntry represents a server access token entry with user and AC token information.
+// ACTokenEntry is the server-side alias of the shared acktoken.ACTokenEntry.
+// The canonical struct, its GetExpireTime method, and the DynamoDB
+// marshalers/hasher live in endpoints/internal/acktoken so the AC daemon can
+// read the shared store without importing package server. This is a true
+// type alias (=), so server.ACTokenEntry and acktoken.ACTokenEntry are the
+// same type — common.TokenStore[*ACTokenEntry] and every existing call site
+// are unchanged. nhp-server remains the sole WRITER of these entries (it
+// stamps the fields the AC cannot derive); see the acktoken.ACTokenEntry
+// godoc for the RunID + no-post-store-mutation invariants.
 //
-// KnockSrcIP is the IP the agent knocked from. PR-2b's
-// /nhp/internal/token/validate exposes this so a downstream FRP login can
-// be cross-checked against the IP that earned the pinhole.
-//
-// Source-of-truth varies by code path:
+// KnockSrcIP source-of-truth (kept on the writer side, since that is where
+// the field is stamped): /nhp/internal/token/validate exposes it so a
+// downstream FRP login can be cross-checked against the IP that earned the
+// pinhole. Trustworthiness varies by write path:
 //   - UDP knock (handleNhpOpenResource): the real UDP packet source IP
-//     observed by the listener (trustworthy — adversary cannot spoof
+//     observed by the listener (trustworthy — an adversary cannot spoof
 //     without a UDP send-spoof primitive, which doesn't survive the
 //     return-path handshake).
 //   - HTTP knock (handleHttpOpenResource): ctx.ClientIP() under gin's
-//     SetTrustedProxies configuration (see httpserver.go). Production
-//     either trusts a CIDR list (NHP_TRUSTED_PROXY_CIDRS, e.g.
-//     CloudFront origin) or trusts nobody, in which case ClientIP
-//     returns the TCP RemoteAddr — both trustworthy. X-Forwarded-For
-//     from an untrusted hop is ignored.
-//   - Forward receiver (forward.go): forwarder-supplied via
-//     fwdMsg.UserAddr. Trusted transitively through the forwarder's
-//     Noise authentication (forwarders are peers, not arbitrary
-//     clients), not from-the-wire verified. A compromised forwarder
-//     could put anything here; that's a strictly broader threat model
-//     than the cross-check this field feeds.
-//
-// RunID is the agent's run-scope identifier (nullable; populated by PR-2c
-// via the agent registration path). Backwards-compat: legacy ACK paths
-// that do not carry a RunID write the empty string here.
-//
-// User is *common.AgentUser and is legitimately nil during the ACK-
-// path window before the agent identity is captured. Readers (the
-// /token/validate handler) defensively nil-check; future
-// construction paths MUST treat nil User as a valid transitional
-// state, not a server bug.
-//
-// Post-store mutation is forbidden. tokenStore.Load returns the
-// same pointer that was stored, and readers (the validate handler,
-// any future reader) access fields lock-free under that invariant.
-// GenerateAccessToken sets ExpireTime BEFORE the Store call;
-// NewACKTokenEntry returns a fresh value. A future caller that
-// writes to a stored entry (e.g., to populate RunID after the
-// fact) must either swap a new entry in via Store (preserving the
-// invariant) or introduce a mutex on the entry — without one of
-// those, the race detector will fire and lock-free readers will
-// need to start cloning.
-type ACTokenEntry struct {
-	User       *common.AgentUser
-	ResourceId string
-	ACTokens   map[string]string
-	KnockSrcIP string
-	RunID      string
-	OpenTime   int
-	ExpireTime time.Time
-}
+//     SetTrustedProxies configuration (see httpserver.go). Production either
+//     trusts a CIDR list (NHP_TRUSTED_PROXY_CIDRS, e.g. CloudFront origin) or
+//     trusts nobody, in which case ClientIP returns the TCP RemoteAddr — both
+//     trustworthy. X-Forwarded-For from an untrusted hop is ignored.
+//   - Forward receiver (forward.go): forwarder-supplied via fwdMsg.UserAddr,
+//     trusted transitively through the forwarder's Noise authentication
+//     (forwarders are peers, not arbitrary clients), not from-the-wire
+//     verified. A compromised forwarder could put anything here — a strictly
+//     broader threat model than the cross-check this field feeds.
+type ACTokenEntry = acktoken.ACTokenEntry
 
 // accessTokenLatePacketBufferSeconds matches the AC's identically-named
 // constant in endpoints/ac/tokenstore.go. The value lives in nhp/common
@@ -139,11 +116,6 @@ func NewACKTokenEntry(
 		OpenTime:   openTime,
 		ExpireTime: time.Now().Add(time.Duration(openTime+accessTokenLatePacketBufferSeconds) * time.Second),
 	}
-}
-
-// GetExpireTime implements the common.TokenEntry interface.
-func (e *ACTokenEntry) GetExpireTime() time.Time {
-	return e.ExpireTime
 }
 
 // GenerateAccessToken issues an opaque random access token for the given

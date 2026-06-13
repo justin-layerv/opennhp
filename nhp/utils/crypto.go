@@ -16,6 +16,14 @@ func MD5(value string) string {
 	return hex.EncodeToString(_16bytes[:])
 }
 
+// SHA256 returns the lowercase hex-encoded SHA-256 of value. Shared by callers
+// that key/identify by a token or key hash (e.g. acktoken.HashToken,
+// licenseadmin.LicenseKeySHA256) so the sha256→hex idiom lives in one place.
+func SHA256(value string) string {
+	_32bytes := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(_32bytes[:])
+}
+
 func Base64(value []byte) string {
 	return base64.StdEncoding.EncodeToString(value)
 }
