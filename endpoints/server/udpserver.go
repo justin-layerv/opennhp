@@ -270,6 +270,15 @@ type UdpServer struct {
 	// CloudWatch metrics publisher for NHP operational metrics.
 	metrics *metrics.Publisher
 
+	// artReplay dedupes recently observed NHP_ART packets by
+	// (sender_pubkey, txid, sendTime) (#1457). Wired into the core
+	// Device via SetRecvReplayDedupe(s.dedupeRecvART) in Start, so the
+	// check runs at the post-validation chokepoint that sees every ART.
+	// See art_replay_cache.go for the threat model. nil until Start
+	// constructs it; dedupeRecvART is only reachable via the hook, which
+	// Start installs after this is set.
+	artReplay *artReplayCache
+
 	// Per-source-IP rate limiter for UDP knock packets.
 	// Drops packets that exceed the configured rate to mitigate DoS attacks
 	// before any cryptographic processing occurs.
@@ -924,6 +933,14 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		log.Critical("failed to create device")
 		return errors.New("failed to create device")
 	}
+
+	// NHP_ART replay dedupe (#1457). Construct the cache and install the
+	// post-validation dedupe hook BEFORE s.device.Start() spawns the
+	// packetToMsgRoutine workers — the `go` in Start establishes the
+	// happens-before that lets those workers read recvReplayDedupeFn
+	// lock-free (see the field doc on core.Device).
+	s.artReplay = newARTReplayCache()
+	s.device.SetRecvReplayDedupe(s.dedupeRecvART)
 
 	// retrieve local ip and mac
 	localAddr := utils.GetLocalOutboundAddress()
@@ -3239,6 +3256,64 @@ func (s *UdpServer) resolveAuthSvcProvider(ctx context.Context, aspId, logPrefix
 	}
 }
 
+// dedupeRecvART is the core.Device recvReplayDedupe hook (installed in
+// Start, #1457): packetToMsgRoutine calls it after validatePeer, the one
+// point where both forks of every NHP_ART reconverge (matched →
+// transaction, unmatched → generic queue), so a replay is recognized
+// whether or not it matched a transaction. Returning a non-nil error
+// drops the packet via the responder's error-delivery path. See the
+// recvReplayDedupeFn field doc in nhp/core/device.go for why a RESPONSE
+// needs this chokepoint.
+//
+// No spurious error to a live knock: the error path surfaces on a MATCHED
+// transaction's response channel, but a duplicate never reaches one. The
+// original consumes the transaction's single (unbuffered) NextPacketCh
+// slot and removes the transaction, so a duplicate racing in the in-flight
+// window is dropped at recvPacketRoutine's SendPacket via the closed-
+// transaction branch BEFORE this hook, and a later duplicate is unmatched
+// (FindLocalTransaction nil) and silently destroyed. A duplicate is thus
+// always a silent drop, never a spurious ErrServerDuplicateTransaction
+// delivered to a waiting knock.
+//
+// Scope — only NHP_ART is deduped (it is the one AC→server response, and
+// the only type whose replay can feed a stale access result into a live
+// knock flow — see art_replay_cache.go); every other type returns nil.
+//
+// Fail-closed on a missing/wrong-length pubkey: validatePeer must have
+// populated a core.PublicKeySize-byte ppd.RemotePubKey before this hook,
+// so any other length means the upstream invariant broke (parser
+// regression, or a harness bypassing validatePeer). The cache cannot
+// scope dedupe state without the authenticated key, so the packet is
+// refused with a distinct error (ErrServerMissingPeerPubkey) so an
+// oncall chasing a duplicate-spike alert is not misled. Mirrors the AC's
+// HandleUdpACOperations guard.
+func (s *UdpServer) dedupeRecvART(ppd *core.PacketParserData) error {
+	if ppd.HeaderType != core.NHP_ART {
+		return nil
+	}
+
+	if len(ppd.RemotePubKey) != core.PublicKeySize {
+		log.Critical("server[dedupeRecvART] missing or wrong-length peer pubkey (len=%d, want %d), drop %s packet (txid=%d)", len(ppd.RemotePubKey), core.PublicKeySize, core.HeaderTypeToString(ppd.HeaderType), ppd.SenderTrxId)
+		return common.ErrServerMissingPeerPubkey
+	}
+
+	if !s.artReplay.MarkSeen(ppd.RemotePubKey, ppd.SenderTrxId, ppd.RemoteSendTime) {
+		// Warning, not Critical: this fires on replay attempts (the
+		// security signal) and on benign in-flight ARTs that reach the
+		// server twice after an AC failover / NAT-table rebind. The
+		// MetricARTReplayDetected counter is the primary alert surface;
+		// the log is the breadcrumb (txid, pubkey fingerprint, sendTime)
+		// telling the operator which transaction saw it. Drop silently —
+		// no NHP reply — so the response side cannot be used as a
+		// replay-success oracle.
+		s.metrics.IncrCounter(MetricARTReplayDetected)
+		log.Warning("server[dedupeRecvART] duplicate transaction id, drop replayed %s packet (txid=%d, pubkey=%s, sendTime=%d)", core.HeaderTypeToString(ppd.HeaderType), ppd.SenderTrxId, pubkeyFingerprint(ppd.RemotePubKey), ppd.RemoteSendTime)
+		return common.ErrServerDuplicateTransaction
+	}
+
+	return nil
+}
+
 func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32) (artMsg *common.ACOpsResultMsg, err error) {
 	// should not happen
 	if knkMsg == nil || conn == nil {
@@ -3342,6 +3417,14 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 		err = acPpd.Error
 		artMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
 		artMsg.ErrMsg = err.Error()
+		// A matched ART dropped by the per-connection replay gate (a
+		// timestamp regression, #1457) surfaces here as
+		// core.ErrReplayPacketReceived; count it on its own gate-drop
+		// counter — see MetricARTReplayGateDrop for why it is kept distinct
+		// from the cross-connection cache counter.
+		if errors.Is(acPpd.Error, core.ErrReplayPacketReceived) {
+			s.metrics.IncrCounter(MetricARTReplayGateDrop)
+		}
 		// If the transaction timed out, the connection is likely unhealthy
 		// (e.g., AC unreachable, network path broken). Close it so that
 		// retry attempts filter it out via IsClosed() instead of sending

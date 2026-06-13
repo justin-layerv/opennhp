@@ -23,15 +23,19 @@ func TestShouldCheckRecvAttack_AOPNoLongerExempt(t *testing.T) {
 	}
 }
 
-// TestShouldCheckRecvAttack_ARTStillExempt pins the remaining
-// exemption: NHP_ART (AC → server response) skips the gate because
-// the server-side transaction layer already correlates by
-// TransactionId and the AC→server hop occasionally exceeds the
-// flood-gate threshold (MinimalRecvIntervalMs in constants.go).
-// Tracked for follow-up dedupe in #1457.
-func TestShouldCheckRecvAttack_ARTStillExempt(t *testing.T) {
-	if shouldCheckRecvAttack(NHP_SERVER, NHP_AC, NHP_ART) {
-		t.Fatal("NHP_ART on server must remain exempt from the LastRemoteSendTime gate")
+// TestShouldCheckRecvAttack_ARTNoLongerExempt is the regression fence
+// for issue #1457 — the symmetric server-side counterpart of #1123.
+// NHP_ART (AC → server response) was previously skipped by the
+// per-connection LastRemoteSendTime gate; the fix removes that
+// exemption so an in-connection ART timestamp regression is rejected
+// at the cryptographic gate, not (only) the transaction-correlation
+// layer. The cross-connection cousin lives in
+// endpoints/server/art_replay_cache.go. ART remains exempt from the
+// 20 ms FLOOD gate (see TestShouldCheckFlood_ARTExempt) — only the
+// replay gate changed.
+func TestShouldCheckRecvAttack_ARTNoLongerExempt(t *testing.T) {
+	if !shouldCheckRecvAttack(NHP_SERVER, NHP_AC, NHP_ART) {
+		t.Fatal("NHP_ART on server must be subject to the LastRemoteSendTime gate (#1457)")
 	}
 }
 
@@ -59,9 +63,14 @@ func TestShouldCheckFlood_AOPExempt(t *testing.T) {
 	}
 }
 
-// TestShouldCheckFlood_ARTExempt mirrors the existing replay-gate
-// exemption on the flood gate so the AC→server hop's legitimate
-// latency does not flood-block a connection.
+// TestShouldCheckFlood_ARTExempt pins the ART flood-gate exemption.
+// ART (AC → server) stays exempt from the 20 ms rate floor because a
+// server knock burst makes the AC emit back-to-back ARTs µs apart, and
+// the floor would false-flood-block the trusted AC→server connection.
+// This is independent of the replay gate — ART is NO LONGER
+// replay-exempt after #1457 (see
+// TestShouldCheckRecvAttack_ARTNoLongerExempt); only the rate floor is
+// waived.
 func TestShouldCheckFlood_ARTExempt(t *testing.T) {
 	if shouldCheckFlood(NHP_SERVER, NHP_AC, NHP_ART) {
 		t.Fatal("NHP_ART on server must remain exempt from the 20 ms flood gate")
@@ -105,6 +114,41 @@ func TestShouldEscalateStale_DefaultEnforced(t *testing.T) {
 	for _, tc := range cases {
 		if !shouldEscalateStale(tc.deviceType, tc.peerType, tc.msgType) {
 			t.Errorf("%s: stale drop must escalate to threat/block", tc.name)
+		}
+	}
+}
+
+// TestShouldEscalateReplay_ARTExempt fences the #1457 escalation
+// exemption: a dropped in-connection ART replay (timestamp regression)
+// must NOT escalate toward a connection block. ART send-times are stamped
+// by concurrent msgToPacketRoutine workers, so a benign knock-burst
+// reorder (reachable without any network reorder) must not be able to
+// self-block the trusted AC→server connection.
+func TestShouldEscalateReplay_ARTExempt(t *testing.T) {
+	if shouldEscalateReplay(NHP_SERVER, NHP_AC, NHP_ART) {
+		t.Fatal("dropped NHP_ART replay on server must NOT escalate to threat/block (#1457)")
+	}
+}
+
+// TestShouldEscalateReplay_DefaultEnforced asserts every other
+// (deviceType, peerType, msgType) — including server→AC AOP, whose
+// symmetric concurrent-stamping exposure is routed to #2518 rather than
+// changed here — still escalates a dropped replay, so the ART exemption
+// stays narrowly scoped and a refactor cannot silently disable the block
+// path.
+func TestShouldEscalateReplay_DefaultEnforced(t *testing.T) {
+	cases := []struct {
+		name                          string
+		deviceType, peerType, msgType int
+	}{
+		{"agent knock", NHP_SERVER, NHP_AGENT, NHP_KNK},
+		{"server→AC AOP", NHP_AC, NHP_SERVER, NHP_AOP},
+		// ART on a non-server device must NOT pick up the server-scoped exemption.
+		{"ART wrong device scope", NHP_AC, NHP_AC, NHP_ART},
+	}
+	for _, tc := range cases {
+		if !shouldEscalateReplay(tc.deviceType, tc.peerType, tc.msgType) {
+			t.Errorf("%s: dropped replay must escalate to threat/block", tc.name)
 		}
 	}
 }
@@ -332,8 +376,93 @@ func TestValidatePeer_StaleAOPDropsWithoutBlock(t *testing.T) {
 	}
 }
 
-// BenchmarkValidatePeer uses ART so one encrypted packet can be replayed through
-// validatePeer without tripping the server-side replay/flood gates.
+// TestValidatePeer_ReplayARTDropsWithoutBlock is the call-site fence for
+// the #1457 replay-escalation exemption — the replay-gate analog of
+// TestValidatePeer_StaleAOPDropsWithoutBlock, and the behavioral fence the
+// cr asked for (a pure shouldEscalateReplay unit test would not catch a
+// wiring regression). It drives timestamp-regressed packets through
+// validatePeer on an explicit connection and inspects threat/block state:
+//
+//   - two regressed ARTs (AC→server) are each dropped
+//     (ErrReplayPacketReceived) but leave RecvThreatCount at 0 and never
+//     fire SendBlockSignal — so a benign burst reorder (reachable WITHOUT
+//     network reorder, since ART send-times are stamped by concurrent
+//     msgToPacketRoutine workers) cannot sever the trusted AC→server link;
+//   - two regressed AOPs (server→AC) at the same setup ARE escalated
+//     (RecvThreatCount clamps to ThreatCountBeforeBlock and SendBlockSignal
+//     fires), proving the exemption is ART-scoped and the block path is
+//     otherwise intact. (#1461's AOP decision is unchanged; #2518 tracks
+//     revisiting it.)
+//
+// The high-water-mark is seeded directly on LastRemoteSendTime so each
+// fresh (age-0) packet regresses deterministically without depending on
+// wall-clock ordering between sends — and a dropped replay does not advance
+// LastRemoteSendTime, so both packets in a pair regress.
+func TestValidatePeer_ReplayARTDropsWithoutBlock(t *testing.T) {
+	silenceGlobalLogger(t)
+
+	acDevice := NewDevice(NHP_AC, validatePeerPrivateKey(1), nil)
+	serverDevice := NewDevice(NHP_SERVER, validatePeerPrivateKey(33), nil)
+	if acDevice == nil || serverDevice == nil {
+		t.Fatal("failed to create AC/server devices")
+	}
+	acPeer := &UdpPeer{PubKeyBase64: acDevice.PublicKeyBase64(), Ip: "127.0.0.1", Port: 12345, Type: NHP_AC}
+	serverPeer := &UdpPeer{PubKeyBase64: serverDevice.PublicKeyBase64(), Ip: "127.0.0.1", Port: 12346, Type: NHP_SERVER}
+	serverDevice.AddPeer(acPeer)
+	acDevice.AddPeer(serverPeer)
+
+	validateOn := func(receiver *Device, conn *ConnectionData, pkt *Packet, initTime int64) error {
+		t.Helper()
+		ppd, err := receiver.createPacketParserData(&PacketData{BasePacket: pkt, ConnData: conn, InitTime: initTime})
+		if err != nil {
+			t.Fatalf("createPacketParserData failed: %v", err)
+		}
+		defer ppd.Destroy()
+		return ppd.validatePeer()
+	}
+
+	const highWater = time.Hour // far enough that any age-0 send time regresses below it
+
+	// Two regressed ARTs (server is the receiver) → dropped, NOT escalated.
+	srvConn := validatePeerConnectionData(serverDevice, 12346, 12345)
+	atomic.StoreInt64(&srvConn.LastRemoteSendTime, time.Now().Add(highWater).UnixNano())
+	for i := 1; i <= 2; i++ {
+		pkt, initTime := buildAgedPacket(t, acDevice, validatePeerConnectionData(acDevice, 12345, 12346), serverPeer.PublicKey(), NHP_ART, 0)
+		if err := validateOn(serverDevice, srvConn, pkt, initTime); !errors.Is(err, ErrReplayPacketReceived) {
+			t.Fatalf("regressed ART #%d: got %v, want ErrReplayPacketReceived", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&srvConn.RecvThreatCount); got != 0 {
+		t.Fatalf("two regressed ARTs must NOT bump RecvThreatCount (got %d) — ART is exempt from replay escalation (#1457)", got)
+	}
+	if len(srvConn.BlockSignal) != 0 {
+		t.Fatal("two regressed ARTs must NOT fire SendBlockSignal — without the exemption the 2nd would cross ThreatCountBeforeBlock and sever the trusted AC→server connection")
+	}
+
+	// Two regressed AOPs (AC is the receiver) → dropped AND escalated,
+	// proving the exemption is ART-scoped.
+	acConn := validatePeerConnectionData(acDevice, 12345, 12346)
+	atomic.StoreInt64(&acConn.LastRemoteSendTime, time.Now().Add(highWater).UnixNano())
+	for i := 1; i <= 2; i++ {
+		pkt, initTime := buildAgedPacket(t, serverDevice, validatePeerConnectionData(serverDevice, 12346, 12345), acPeer.PublicKey(), NHP_AOP, 0)
+		if err := validateOn(acDevice, acConn, pkt, initTime); !errors.Is(err, ErrReplayPacketReceived) {
+			t.Fatalf("regressed AOP #%d: got %v, want ErrReplayPacketReceived", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&acConn.RecvThreatCount); got != ThreatCountBeforeBlock {
+		t.Fatalf("two regressed AOPs must escalate (RecvThreatCount clamped to %d); got %d — the ART exemption must be scoped, not global", ThreatCountBeforeBlock, got)
+	}
+	if len(acConn.BlockSignal) != 1 {
+		t.Fatal("two regressed AOPs must fire SendBlockSignal (the 2nd crosses ThreatCountBeforeBlock)")
+	}
+}
+
+// BenchmarkValidatePeer replays one byte-identical encrypted ART through
+// validatePeer N times. ART is now subject to the replay gate (#1457), but a
+// byte-identical replay carries an EQUAL send timestamp, which the strict
+// less-than check (remoteSendTime < LastRemoteSendTime) does not trip, and
+// ART stays flood-exempt — so the same packet can be re-driven without a
+// gate rejection skewing the benchmark.
 func BenchmarkValidatePeer(b *testing.B) {
 	fixture := newValidatePeerFixture(b)
 

@@ -133,6 +133,37 @@ const (
 	// new assignments.
 	MetricCloudMapRegisterRefreshFailure = "CloudMapRegisterRefreshFailure"
 	MetricKnockNoAC                      = "KnockNoAC"
+	// MetricARTReplayDetected counts replay-dedupe drops of already-seen
+	// NHP_ART packets at the server's post-validation chokepoint (#1457)
+	// — the symmetric counterpart of the AC's AOPReplayDetected. A drop is
+	// a (sender_pubkey, txid, sendTime) triple seen again within the cache
+	// TTL: either a replay attempt (the security signal) or a benign
+	// in-flight ART arriving twice across an AC failover / NAT rebind.
+	// Like the AC counter it fires at human-paced cadence, so a sustained
+	// non-zero rate is the actionable signal while a single isolated event
+	// can follow restart/failover retries.
+	MetricARTReplayDetected = "ARTReplayDetected"
+	// MetricARTReplayGateDrop counts matched ARTs dropped by the
+	// per-connection replay GATE (core.ErrReplayPacketReceived, a
+	// LastRemoteSendTime timestamp regression) — the new behavior #1457's
+	// exemption removal introduces, observed where the dropped response
+	// surfaces in processACOperation. Kept DISTINCT from
+	// MetricARTReplayDetected (the cross-connection cache drop): a gate drop
+	// is most often a benign burst reorder (ART send-times are stamped by
+	// concurrent msgToPacketRoutine workers, so non-monotonic arrival needs
+	// no network reorder), whereas a cache drop is a clean cross-connection
+	// replay signal. Conflating them would poison the replay security alarm
+	// (#2512). A sustained non-zero rate here means the strict-less-than
+	// gate is false-rejecting legitimately reordered ARTs.
+	//
+	// Scope — this counts only gate-drops on the MATCHED-transaction path
+	// (processACOperation). A gate-drop of an UNMATCHED ART (its
+	// transaction already completed → the packet is silently destroyed and
+	// never reaches here) did NOT fail a live knock, so it is intentionally
+	// uncounted. So this is an under-count of TOTAL gate-drops by design —
+	// read a near-zero rate as "no live knocks failing to burst reorder"
+	// (the availability question), not "zero gate-drops total."
+	MetricARTReplayGateDrop = "ARTReplayGateDrop"
 	// MetricACTokenStored fires once per AC-issued token persisted to
 	// the server tokenStore via UdpServer.storeACToken. Operators use
 	// this rate to fence PR-2b's /nhp/internal/token/validate: a

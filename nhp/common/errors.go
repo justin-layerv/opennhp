@@ -188,6 +188,24 @@ var (
 	// ErrServerACOpsFailed so agent logs and on-call triage do not blame
 	// the AC path for a server-side token-store dependency failure.
 	ErrServerTokenPersistFailed = newError("52021", "server token persistence failed")
+	// ErrServerDuplicateTransaction — emitted by the server's NHP_ART
+	// replay dedupe (#1457, the mirror of the AC's #1123) when the
+	// (sender_pubkey, txid, sendTime) triple was already processed inside
+	// the cache TTL. The packet is dropped at the post-validation
+	// chokepoint so a replayed ART cannot feed a stale access result into
+	// a live knock flow. Message reads "replayed packet" rather than
+	// "duplicate transaction id" alone so an oncall reading the error does
+	// not infer the dedupe key is txid-only and chase the wrong direction.
+	ErrServerDuplicateTransaction = newError("52022", "server duplicate transaction (replayed packet)")
+	// ErrServerMissingPeerPubkey — fail-closed on the upstream invariant
+	// that core.responder.validatePeer populates ppd.RemotePubKey before
+	// the server dedupe hook runs. A wrong-length pubkey here means either
+	// a parser regression or a test harness that bypasses validatePeer; in
+	// both cases the server cannot scope replay-dedupe state and so refuses
+	// the packet. Distinct from ErrServerDuplicateTransaction so an oncall
+	// chasing a duplicate-spike alert is not misled by an upstream
+	// invariant violation.
+	ErrServerMissingPeerPubkey = newError("52023", "missing peer pubkey on server transaction")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")

@@ -242,38 +242,63 @@ func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, messag
 	return mad
 }
 
-// shouldCheckRecvAttack gates the per-connection
-// LastRemoteSendTime *replay* check (timestamp regression). Split
-// from shouldCheckFlood (#1123 round-7) so a peer-msgType pair can
-// participate in the replay gate without also being subject to the
-// 20 ms flood interval — see shouldCheckFlood for why AOP needs
-// that asymmetry.
+// shouldCheckRecvAttack gates the per-connection LastRemoteSendTime
+// *replay* check (timestamp regression), split from shouldCheckFlood
+// (#1123 round-7) so a type can be replay-gated without also taking the
+// 20 ms flood interval.
 //
-// NHP_ART (AC → server) remains exempt because the server's
-// transaction layer already correlates responses by TransactionId
-// and the AC→server hop occasionally exceeds the flood-gate
-// threshold (MinimalRecvIntervalMs in nhp/core/constants.go) under
-// legitimate latency. Symmetric dedupe is tracked in #1457.
+// It now returns true for every (deviceType, peerType, msgType): the
+// replay gate has NO exemptions — both historical ones are gone (NHP_AOP
+// under #1123, NHP_ART under #1457). The predicate is kept rather than
+// inlined as the tested invariant anchor (re-introducing an exemption
+// must consciously edit this function and its pins in responder_test.go)
+// and to stay parallel with its still-selective siblings shouldCheckFlood
+// / shouldEscalateStale.
 //
-// NHP_AOP (server → AC) was previously exempt; #1123 removed it so
-// in-connection replays are caught here. The cross-connection cousin
-// (server restart / AC failover / NAT flush) lives in
-// endpoints/ac/aop_replay_cache.go.
-//
-// AOP-specific trade-off — the strict less-than comparison at the
-// replay site means a UDP reorder of two µs-spaced AOPs from the
-// same server arrives with the earlier-stamped one rejected as a
-// "replay" by this gate. In sandbox/prod (single-VPC, NLB)
-// reordering is rare so this is tolerable; #1463 (deployed-binary
-// smoke) and any future #1458 (duplicate-drop counter) work should
-// keep an eye on the AOP-drop rate to catch any reorder pattern
-// that turns this into an availability issue. ART (#1457) will
-// face the symmetric concern when its own dedupe lands.
+// Two caveats: (1) the strict less-than rejects even a benign reorder of
+// two µs-spaced packets as a "replay" — reachable for bursty types (AOP,
+// ART) with NO network reorder, because send timestamps are stamped by the
+// concurrent msgToPacketRoutine workers. The drop is unconditional, but
+// whether it ALSO escalates toward a connection block is gated per type by
+// shouldEscalateReplay (ART is drop-only, #1457). (2) it only sees
+// in-connection replays — the cross-connection ones (restart / failover /
+// NAT flush reset the state) are caught by the endpoint dedupe caches
+// (endpoints/ac/aop_replay_cache.go, endpoints/server/art_replay_cache.go).
 func shouldCheckRecvAttack(deviceType int, peerType int, msgType int) bool {
+	return true
+}
+
+// shouldEscalateReplay reports whether a dropped in-connection replay (a
+// timestamp regression caught by shouldCheckRecvAttack) should ALSO
+// escalate toward a connection block — bump ConnData.RecvThreatCount and,
+// past ThreatCountBeforeBlock, SendBlockSignal. The replay packet is
+// dropped either way; this gates only the punitive escalation, mirroring
+// shouldEscalateStale for the stale gate.
+//
+// NHP_ART (AC→server) is exempt (#1457). ART send timestamps are stamped
+// inside the concurrent msgToPacketRoutine workers
+// (initiator.createMsgAssemblerData sets mad.LocalInitTime), so during a
+// knock burst the AC can emit ARTs whose timestamps are non-monotonic
+// relative to arrival order WITHOUT any network reorder. With
+// ThreatCountBeforeBlock = 1, a >=2-in-a-row regression (e.g. a burst
+// arriving t3, t2, t1) would otherwise cross the threshold and
+// SendBlockSignal, severing the trusted AEAD-authenticated AC->server
+// connection — far worse than the single dropped packet the regression
+// actually represents. The drop still rejects the replay, and the real
+// cross-connection defense is the dedupe cache
+// (endpoints/server/art_replay_cache.go), not this per-connection block.
+//
+// NHP_AOP (server->AC) is NOT exempt here even though it has the symmetric
+// concurrent-stamping exposure: #1461 deliberately kept the replay gate as
+// AOP's sole remaining auto-block trigger ("a deliberate trade, not a side
+// effect" — see shouldEscalateStale), so revisiting that owned decision is
+// routed to its owner in #2518 rather than changed as a side effect of the
+// ART fix. Every other (deviceType, peerType, msgType) keeps the default
+// escalation.
+func shouldEscalateReplay(deviceType int, peerType int, msgType int) bool {
 	if deviceType == NHP_SERVER && peerType == NHP_AC && msgType == NHP_ART {
 		return false
 	}
-
 	return true
 }
 
@@ -291,8 +316,14 @@ func shouldCheckRecvAttack(deviceType int, peerType int, msgType int) bool {
 // load. The replay gate (shouldCheckRecvAttack) still catches any
 // timestamp regression.
 //
-// NHP_ART (AC → server) keeps the same exemption it has from the
-// replay gate — same legitimate-latency rationale.
+// NHP_ART (AC → server) is flood-exempt for the symmetric reason:
+// during a knock burst the server sends back-to-back AOPs to one AC,
+// so the AC's ARTs (one per AOP) leave µs apart and would
+// false-flood-block the trusted AC→server connection under the 20 ms
+// floor. Note the asymmetry with the replay gate: ART is NO LONGER
+// replay-exempt (#1457 removed that), so shouldCheckRecvAttack still
+// catches an ART timestamp regression — only the 20 ms rate floor is
+// waived here, exactly as for AOP.
 func shouldCheckFlood(deviceType int, peerType int, msgType int) bool {
 	if deviceType == NHP_AC && peerType == NHP_SERVER && msgType == NHP_AOP {
 		return false
@@ -513,18 +544,31 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	remoteSendTime := int64(binary.BigEndian.Uint64(tsBytes[:]))
 
 	if shouldCheckRecvAttack(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
-		// block remote if threat level is reached
 		if remoteSendTime < ppd.ConnData.LastRemoteSendTime {
 			// replay packet, drop
 			log.Critical("received replay packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
-			// threat plus 1
-			threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
-			// with high queue number, the device may use ConnData channels when conn is already closed
-			if threat > ThreatCountBeforeBlock && !ppd.ConnData.IsClosed() {
-				// clamp threat count to avoid overflow
-				atomic.StoreInt32(&ppd.ConnData.RecvThreatCount, ThreatCountBeforeBlock)
-				// block source address
-				ppd.ConnData.SendBlockSignal()
+			// Escalate the drop toward a connection block only where an
+			// in-connection timestamp regression is an attack signal rather
+			// than a likely benign reorder. NHP_ART (AC→server) is exempt
+			// (#1457): its send timestamp is stamped inside the concurrent
+			// msgToPacketRoutine workers (initiator.createMsgAssemblerData),
+			// so a knock burst can deliver regressed ARTs with NO network
+			// reorder at all, and a >=2-in-a-row regression would otherwise
+			// cross ThreatCountBeforeBlock and SendBlockSignal — severing the
+			// trusted AC->server connection. The packet is still dropped
+			// (the replay is rejected) and the cross-connection cache is the
+			// real cross-connection defense; only the punitive block is
+			// waived. See shouldEscalateReplay.
+			if shouldEscalateReplay(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
+				// threat plus 1
+				threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
+				// with high queue number, the device may use ConnData channels when conn is already closed
+				if threat > ThreatCountBeforeBlock && !ppd.ConnData.IsClosed() {
+					// clamp threat count to avoid overflow
+					atomic.StoreInt32(&ppd.ConnData.RecvThreatCount, ThreatCountBeforeBlock)
+					// block source address
+					ppd.ConnData.SendBlockSignal()
+				}
 			}
 			err = ErrReplayPacketReceived
 			return err
@@ -574,25 +618,26 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	// update remote last send time
 	atomic.StoreInt64(&ppd.ConnData.LastRemoteSendTime, remoteSendTime)
 	// Surface the AEAD-authenticated per-packet timestamp to
-	// downstream handlers — set here (not inside the
-	// shouldCheckRecvAttack branch) so the AC AOP dedupe and any
-	// future ART consumer get a populated value on every accepted
-	// packet, including the ART/AOP exemption paths.
+	// downstream handlers — set here unconditionally, on every
+	// accepted packet, so both endpoint replay caches get a populated
+	// value: the AC AOP dedupe (endpoints/ac/aop_replay_cache.go) and
+	// the server ART dedupe (endpoints/server/art_replay_cache.go,
+	// invoked via the Device recvReplayDedupe hook). It is assigned
+	// after the gate branches above rather than inside any one of them,
+	// so the value is populated even on a path a gate lets through.
 	//
-	// Cross-package contract: the AC AOP replay cache in
-	// endpoints/ac/aop_replay_cache.go keys on this field. A
-	// refactor that moves or skips this assignment silently
-	// degrades the AC dedupe to (pubkey, txid, 0) keying — the
-	// post-restart counter-collision regression test in
-	// aop_replay_cache_test.go fences the cache layer but not the
-	// responder wire-up. Issue #1468 tracks an integration-style
-	// test that drives a real AOP through validatePeer to fence
-	// this assignment end-to-end (a minimal-fixture unit test
-	// would require the full noise-handshake context — Device,
-	// Peer, ECDH, AEAD chain — which is substantively heavier
-	// than this assignment justifies as a unit test). Until #1468
-	// lands, the next reviewer of validatePeer must catch any
-	// reordering here.
+	// Cross-package contract: both replay caches key on this field. A
+	// refactor that moves or skips this assignment silently degrades
+	// either dedupe to (pubkey, txid, 0) keying — the post-restart
+	// counter-collision regression tests in aop_replay_cache_test.go /
+	// art_replay_cache_test.go fence the cache layer but not the
+	// responder wire-up. Issue #1468 tracks an integration-style test
+	// that drives a real packet through validatePeer to fence this
+	// assignment end-to-end (a minimal-fixture unit test would require
+	// the full noise-handshake context — Device, Peer, ECDH, AEAD
+	// chain — substantively heavier than this assignment justifies as a
+	// unit test). Until #1468 lands, the next reviewer of validatePeer
+	// must catch any reordering here.
 	ppd.RemoteSendTime = remoteSendTime
 	// clear threat
 	atomic.StoreInt32(&ppd.ConnData.RecvThreatCount, 0)

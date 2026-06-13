@@ -77,6 +77,36 @@ type Device struct {
 	DecryptedMsgQueue chan *PacketParserData
 	packetToMsgQueue  chan *PacketData
 	msgToPacketQueue  chan *MsgData
+
+	// recvReplayDedupeFn, when non-nil, is invoked by
+	// packetToMsgRoutine immediately after validatePeer succeeds and
+	// BEFORE body decryption, for every inbound packet that clears the
+	// per-connection replay/flood/stale gates. Returning a non-nil
+	// error drops the packet through the same error-delivery path a
+	// validatePeer failure takes (so a matched transaction sees the
+	// error on its response channel, an unmatched packet is silently
+	// destroyed).
+	//
+	// It is the cross-connection replay-dedupe chokepoint. A
+	// transaction REQUEST (e.g. NHP_AOP on the AC) is consumed in one
+	// endpoint handler, so the AC dedupes there directly. A transaction
+	// RESPONSE (NHP_ART on the server) is forked by
+	// transaction-correlation BEFORE decryption — matched responses go
+	// to the waiting transaction, unmatched ones to the generic queue —
+	// so no single endpoint-side hook observes every response. This is
+	// that single point, the one place every ART (matched originals and
+	// unmatched replays alike) is recorded so a replay is recognized.
+	// The endpoint owns the cache, the metric, and the message-type
+	// scoping; core only provides the call site. See
+	// endpoints/server/art_replay_cache.go (#1457) for the production
+	// consumer.
+	//
+	// Concurrency: set once via SetRecvReplayDedupe BEFORE Start spawns
+	// the packetToMsgRoutine workers; the `go` in Start establishes the
+	// happens-before, so the lock-free read in packetToMsgRoutine is
+	// safe. A future caller needing live reconfiguration must promote
+	// this to an atomic.Pointer.
+	recvReplayDedupeFn func(*PacketParserData) error
 }
 
 func NewDevice(t int, prk []byte, option *DeviceOptions) *Device {
@@ -127,6 +157,15 @@ func (d *Device) Option() DeviceOptions {
 	defer d.optionMutex.Unlock()
 
 	return d.option
+}
+
+// SetRecvReplayDedupe installs the post-validation replay-dedupe hook
+// invoked by packetToMsgRoutine. Call it before Start — see the
+// recvReplayDedupeFn field doc for the happens-before contract and why
+// this chokepoint exists. Devices that do not dedupe (agent, db, AC)
+// leave it unset.
+func (d *Device) SetRecvReplayDedupe(fn func(*PacketParserData) error) {
+	d.recvReplayDedupeFn = fn
 }
 
 func (d *Device) Start() {
@@ -364,6 +403,21 @@ func (d *Device) packetToMsgRoutine(id int) {
 					log.Debug("packetToMsgRoutine %d: [%s] packet validation failed: %v", id, msgType, err)
 					log.Evaluate("packetToMsgRoutine %d: [%s] packet validation failed: %v", id, msgType, err)
 					return
+				}
+
+				// Cross-connection replay-dedupe chokepoint (#1457): runs
+				// after validatePeer authenticates ppd.RemotePubKey /
+				// ppd.RemoteSendTime and before the body decrypt, so a
+				// recognized replay costs no decrypt work. A non-nil error
+				// drops the packet via the validation-failure path. Unset
+				// on agent/db/AC → skipped. See the recvReplayDedupeFn
+				// field doc for why a RESPONSE needs this chokepoint.
+				if d.recvReplayDedupeFn != nil {
+					if err = d.recvReplayDedupeFn(ppd); err != nil {
+						log.Debug("packetToMsgRoutine %d: [%s] packet dropped by replay dedupe: %v", id, msgType, err)
+						log.Evaluate("packetToMsgRoutine %d: [%s] packet dropped by replay dedupe: %v", id, msgType, err)
+						return
+					}
 				}
 
 				err = ppd.decryptBody()
