@@ -241,6 +241,7 @@ This file stays light. Subtree-scoped rules live in nested `CLAUDE.md` files (au
 | Commit convention + scopes table | `docs/COMMIT_CONVENTION.md` |
 | Runbooks index | `docs/runbooks/README.md` |
 | Security monitoring + secrets / `NHP_INTERNAL_AUTH_SECRET` / KMS exception | `docs/SECURITY.md` |
+| Access-token touch inventory (log/persist/transport sites + replay-window decision) | `docs/SECURITY_TOKEN_TOUCH_INVENTORY.md` |
 | GuardDuty finding triage (alert routing + stale-finding watchdog) | `docs/runbooks/guardduty-finding-triage.md` |
 | Prod Rollout Ledger | `docs/runbooks/prod-rollout-ledger/README.md` |
 | qurl-service `/internal/v1/*` triage | `docs/runbooks/qurl-internal-v1-triage.md` |

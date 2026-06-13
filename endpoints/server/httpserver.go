@@ -752,7 +752,7 @@ func (hs *HttpServer) initRouter() {
 		// parse url parameters
 		aspId := ctx.Param("aspid")
 		resId := ctx.Param("resid")
-		log.Info("get plugins request. aspId: %s, resId: %s, query: %v", aspId, resId, ctx.Request.URL.RawQuery)
+		log.Info("get plugins request. aspId: %s, resId: %s, query: %v", aspId, resId, redactSensitiveQuery(ctx.Request.URL.RawQuery))
 
 		if len(aspId) == 0 {
 			log.Error("no aspId provided")
@@ -1026,18 +1026,40 @@ func matchOrigin(origin string, exact map[string]bool, wildcards []wildcardPatte
 // redactSensitiveQuery replaces the value of the "token" query parameter with
 // "[REDACTED]" to prevent access tokens from leaking into server logs during
 // the GET→POST migration period.
+//
+// Behavior notes: only a query that actually carries a non-empty token= is
+// rewritten; in that case the result is re-encoded and key-sorted
+// (url.Values.Encode) so it won't match the raw wire form byte-for-byte. A
+// query with nothing to redact (no token, empty token=, or a "to%6ben="-style
+// lookalike that passed the substring gate) is returned unchanged to keep
+// operator-facing query logs faithful. The gate matches a literal "token=" —
+// the form the legacy GET plugin path and legitimate clients send; a
+// percent-encoded key falls through unredacted, which is not a real-client
+// shape and a self-encoding attacker gains nothing by hiding their own key.
 func redactSensitiveQuery(rawQuery string) string {
 	if rawQuery == "" || !strings.Contains(rawQuery, "token=") {
 		return rawQuery
 	}
-	v, err := url.ParseQuery(rawQuery)
-	if err != nil {
-		return rawQuery
-	}
-	if v.Get("token") != "" {
+	if v, err := url.ParseQuery(rawQuery); err == nil {
+		if v.Get("token") == "" {
+			return rawQuery // nothing to redact — preserve the wire form
+		}
 		v.Set("token", "[REDACTED]")
+		return v.Encode()
 	}
-	return v.Encode()
+	// url.ParseQuery fails on a malformed percent-escape in ANY param (e.g.
+	// ?token=<secret>&x=%ZZ), so we must NOT fall through to the raw string —
+	// it still contains the token. Strip the token param by hand; an access
+	// token value never contains '&', so splitting on '&' isolates it.
+	parts := strings.Split(rawQuery, "&")
+	for i, p := range parts {
+		// Redact only a non-empty token value, matching the parse-ok branch
+		// (an empty "token=" carries no secret).
+		if strings.HasPrefix(p, "token=") && p != "token=" {
+			parts[i] = "token=[REDACTED]"
+		}
+	}
+	return strings.Join(parts, "&")
 }
 
 // ginLogFormatter formats Gin access log lines with request ID and error context.
@@ -1548,7 +1570,7 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 	// to reject up front than to audit every client library's
 	// fragment-handling behavior.
 	if ctx.Request.URL.RawQuery != "" || ctx.Request.URL.Fragment != "" {
-		log.Warning("internal knock rejected: URL must have no query or fragment (got query=%q fragment=%q)", ctx.Request.URL.RawQuery, ctx.Request.URL.Fragment)
+		log.Warning("internal knock rejected: URL must have no query or fragment (got query=%q fragment=%q)", redactSensitiveQuery(ctx.Request.URL.RawQuery), ctx.Request.URL.Fragment)
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": "bad request"})
 		return
 	}

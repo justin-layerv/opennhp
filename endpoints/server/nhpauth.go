@@ -175,7 +175,8 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 			return
 		}
 
-		log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] succeed: %+v", knkMsg.UserId, transactionId, addrStr)
+		// Do not add %+v ackMsg here — ackMsg carries ACTokens (token leak).
+		log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] succeed", knkMsg.UserId, transactionId, addrStr)
 		s.metrics.IncrCounter(MetricAuthSuccess)
 	}()
 

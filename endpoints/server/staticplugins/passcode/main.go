@@ -113,7 +113,7 @@ func knockAndIssueTokens(ctx *gin.Context, req *common.HttpKnockRequest, res *co
 		log.Error("failed to generate token: %v", err)
 		return knockTokenResult{}, "410", err
 	}
-	log.Info("token: %s...", nhpToken[:min(10, len(nhpToken))])
+	log.Info("token: %s", common.RedactToken(nhpToken))
 
 	tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire")
 	ctx.SetCookie("nhp_token", nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
@@ -181,7 +181,7 @@ func exchangeAndKnock(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	}
 
 	log.Info("knock succeeded.%+v", res.Resources)
-	log.Info("token: %s...", nhpToken[:min(10, len(nhpToken))])
+	log.Info("token: %s", common.RedactToken(nhpToken))
 
 	tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire")
 	ctx.SetSameSite(http.SameSiteNoneMode)
@@ -299,7 +299,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	nHPToken := nhpplugins.GetCookie("nhp_token", ctx)
 	if len(nHPToken) == 0 {
-		log.Warning("nhp_token expired. %s", nHPToken)
+		log.Warning("nhp_token cookie missing")
 		return
 	}
 	payload, err := nhpplugins.ParseJWTToken(nHPToken)
@@ -327,7 +327,7 @@ func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockR
 
 	isOk, err := jwt.Validate(nHPToken, nhpplugins.TokenTypeNHPToken)
 	if err != nil {
-		log.Warning("nhp token is invalid nHPToken = %s err:%s", nHPToken, err.Error())
+		log.Warning("nhp token is invalid nHPToken=%s err:%s", common.RedactToken(nHPToken), err.Error())
 		return nil, err
 	}
 	if !isOk {
@@ -678,7 +678,11 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 		return nil, "606", fmt.Errorf("failed to read IAM response body: %w", err)
 	}
 
-	log.Info("Successfully got response from real IAM: %s", string(body))
+	// Do not log the IAM 200 body: it is an upstream portal-site config
+	// payload that may carry credentials, and it is otherwise unused (the
+	// read just drains the response for connection reuse). Log only its
+	// size. See docs/SECURITY_TOKEN_TOUCH_INVENTORY.md.
+	log.Info("Successfully got response from real IAM (%d bytes)", len(body))
 
 	result, errCode, knockErr := knockAndIssueTokens(ctx, req, res, helper)
 	if knockErr != nil {
@@ -706,7 +710,7 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 
 	log.Info("ackMsg.ResourceHost: %+v", ackMsg.ResourceHost)
 	ctx.JSON(http.StatusOK, resp)
-	log.Info("Done %+v", resp)
+	log.Info("refresh response sent (redirectUrl=%s)", resp.RedirectUrl)
 	return ackMsg, "", nil
 }
 

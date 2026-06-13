@@ -303,7 +303,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	// so accepting them would let a future endpoint silently leave
 	// a parameter unsigned.
 	if ctx.Request.URL.RawQuery != "" || ctx.Request.URL.Fragment != "" {
-		log.Warning("internal token validate rejected: URL must have no query or fragment (got query=%q fragment=%q)", ctx.Request.URL.RawQuery, ctx.Request.URL.Fragment)
+		log.Warning("internal token validate rejected: URL must have no query or fragment (got query=%q fragment=%q)", redactSensitiveQuery(ctx.Request.URL.RawQuery), ctx.Request.URL.Fragment)
 		respond(http.StatusBadRequest, gin.H{"error": "bad request"})
 		return
 	}

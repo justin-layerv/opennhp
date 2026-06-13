@@ -218,3 +218,58 @@ func TestHandleNhpOpenResource_PublishACKTokens_NoLeakOnFail(t *testing.T) {
 		t.Errorf("ackMsg.ACTokens[r-fail] = %q, want \"\" on failure", got)
 	}
 }
+
+// TestHandleNhpOpenResource_NilBroadcastResult fences the nil-guard in the
+// AC broadcast goroutine: processACOperationBroadcast can return (nil, err)
+// on a marshal/guard path, and the artMsgs map must never hold nil — both
+// the successCount loop and the failure-log loop deref entries
+// unconditionally. Without the guard this panics; with it, the handler
+// synthesizes a failure entry and returns the all-failed error cleanly.
+func TestHandleNhpOpenResource_NilBroadcastResult(t *testing.T) {
+	const acId = "ac-nil-result"
+
+	s := &UdpServer{
+		tokenStore: common.NewTokenStore[*ACTokenEntry](),
+		acConnectionMap: map[string][]*ACConn{
+			acId: {newACConnWithLastRecv(time.Now().UnixNano())},
+		},
+		processACOperationBroadcastFn: func(
+			_ context.Context,
+			_ *common.AgentKnockMsg,
+			_ []*ACConn,
+			_ *common.NetAddress,
+			_ []*common.NetAddress,
+			_ uint32,
+		) (*common.ACOpsResultMsg, error) {
+			// nil artMsg with an error — the marshal/guard shape that the
+			// store-site guard must absorb before the deref loops run.
+			return nil, common.ErrACOperationFailed
+		},
+	}
+
+	knkMsg := &common.AgentKnockMsg{UserId: "u-nil", ResourceId: "r-nil"}
+	srcAddr := &common.NetAddress{Ip: "198.51.100.9"}
+	ackMsg := &common.ServerKnockAckMsg{}
+	req := &common.NhpAuthRequest{Msg: knkMsg, SrcAddr: srcAddr, Ack: ackMsg}
+	res := &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			ResourceId: "r-nil",
+			OpenTime:   30,
+			Resources: map[string]*common.ResourceInfo{
+				"r-nil": {
+					ACId: acId,
+					Addr: &common.NetAddress{Ip: "10.0.0.7"},
+				},
+			},
+		},
+	}
+
+	// Must not panic on the nil broadcast result, and must report failure.
+	_, err := s.handleNhpOpenResource(req, res)
+	if err == nil {
+		t.Fatal("expected handleNhpOpenResource to return error when the AC broadcast returns a nil result")
+	}
+	if ackMsg.ErrCode != common.ErrServerACOpsFailed.ErrorCode() {
+		t.Errorf("ackMsg.ErrCode = %q, want %q (all-failed shape)", ackMsg.ErrCode, common.ErrServerACOpsFailed.ErrorCode())
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"strconv"
@@ -3369,7 +3370,10 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 	}
 
 	if artMsg.ErrCode != common.ErrSuccess.ErrorCode() {
-		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] response error: %+v", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr, artMsg)
+		// ACOpsResultMsg carries ACToken (empty on this error path today —
+		// defensive fence). Log only ErrCode/ErrMsg, never %+v the struct;
+		// ErrMsg is token-free. See docs/SECURITY_TOKEN_TOUCH_INVENTORY.md.
+		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] response error: errCode=%s errMsg=%s", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr, artMsg.ErrCode, artMsg.ErrMsg)
 		err = common.ErrACOperationFailed
 		return
 	}
@@ -3634,6 +3638,18 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			// tests inject a fake AC response — see
 			// udpserver_publish_acktokens_test.go.
 			artMsg, err := s.resolveProcessACOperationBroadcast()(context.Background(), knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
+			if artMsg == nil {
+				// Keep the artMsgs map nil-free — the successCount loop and the
+				// failure-log loop below deref entries unconditionally (mirrors the
+				// ErrACConnectionNotFound synthesis above). Every return path that
+				// yields a nil artMsg also sets a non-nil err (none returns
+				// (nil, nil)), so the err==nil success branch below never treats a
+				// synthesized failure entry as a success.
+				artMsg = &common.ACOpsResultMsg{ErrCode: common.ErrACOperationFailed.ErrorCode()}
+				if err != nil {
+					artMsg.ErrMsg = err.Error()
+				}
+			}
 			artMsgsMutex.Lock()
 			artMsgs[name] = artMsg
 			if err == nil {
@@ -3689,7 +3705,15 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	}
 
 	if successCount == 0 {
-		log.Info("server-agent(%s@%s)[handleNhpOpenResource] failed: %+v", knkMsg.UserId, addrStr, artMsgs)
+		// Log per-resource ErrCodes (sorted for stable oncall output),
+		// never %+v the artMsgs map — each entry carries ACToken (see
+		// docs/SECURITY_TOKEN_TOUCH_INVENTORY.md).
+		resErrs := make([]string, 0, len(artMsgs))
+		for name, m := range artMsgs {
+			resErrs = append(resErrs, name+"="+m.ErrCode)
+		}
+		sort.Strings(resErrs)
+		log.Info("server-agent(%s@%s)[handleNhpOpenResource] failed: resErrs=%v", knkMsg.UserId, addrStr, resErrs)
 		err = common.ErrServerACOpsFailed
 		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
 		ackMsg.ErrMsg = err.Error()

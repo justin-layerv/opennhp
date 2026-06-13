@@ -149,7 +149,10 @@ func (ha *HttpAC) initRouter() {
 		}
 
 		if token, err = url.QueryUnescape(token); err != nil {
-			log.Error("token unescape failed: %v", err)
+			// Do not log err: url.QueryUnescape's EscapeError echoes the
+			// malformed percent-escape (1-3 token bytes), and post-1124 the
+			// token is the auth secret. See #1424 and docs/SECURITY_TOKEN_TOUCH_INVENTORY.md.
+			log.Error("token unescape failed: malformed percent-encoding in path")
 			err = common.ErrUrlPathInvalid
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("token error: %v", err)})
 			return
