@@ -53,6 +53,35 @@ No new NHP wire message types are introduced. `NHP_RKN` (agent re-knock) and
 [`nhp/core/packet.go`](../../nhp/core/packet.go), as does the `NHP_RELAY` device
 type. The NHP-AOP wire format is reused as-is.
 
+## Implementation approach: adopt upstream via port
+
+OpenNHP upstream already ships this entire feature — the relay
+(`endpoints/relay/`), the server-side `HandleRelayForward`, the
+`common.RelayForwardMsg` envelope, and a browser JS agent (`endpoints/js-agent/`
+with an HTTPS-POST `relay.ts` transport). Our fork merely stubbed the relay out
+during the "separate modules" refactor and marked the relay commits **SKIP** in
+`docs/UPSTREAM_SYNC.md`. So we **adopt** upstream's design rather than build a
+parallel one. (An abandoned from-scratch attempt — PR #2523, which minted an
+incompatible envelope plus a needless reply type — was closed.)
+
+Honest scope: this is a **port (~3–4 focused days for the Go side), not a verbatim
+sync** — our `nhp/core` has diverged (no `loadbalance` package, no
+`utils.PubKeyFingerprint`, and `core.ConnectionData` lacks the `RealRemoteAddr` /
+source-stickiness fields upstream's handler uses). The port:
+
+- **Transport is HTTPS POST** (upstream's). WebSocket was quantified and rejected:
+  it saves ~100 ms on invisible background re-knocks but costs ~300× concurrent
+  connections at scale and permanent upstream divergence, and its one unique
+  benefit (server push) is unused by our pull-based revocation model.
+- **Avoids touching `core.ConnectionData`** by adapting `HandleRelayForward` to our
+  existing `endpoints/server/forward.go` synthetic-`ConnData` pattern (how the
+  `NHP_FWD` path already injects an externally-supplied source address). A core
+  change is the last resort — isolated and `-race`-tested if forced.
+- **Ports upstream's relay security fixes** — relay DoS + source-IP validation
+  (`e2c5336a`) and the X-Forwarded-For tightening (`ad98e1f4`) — which our
+  `UPSTREAM_SYNC.md` previously skipped. These provide the relay-edge hardening the
+  Relay threat model section below requires.
+
 ## Background
 
 ### Why nhp-server is exposed today
@@ -115,22 +144,23 @@ the spec's `9`/`10` would be wrong *today*.
 
 ### NHP-Relay
 
-A new internet-facing service (planned home: `endpoints/relay/`, today a bare
-`package relay` stub) that:
+We **adopt the upstream OpenNHP relay** (`endpoints/relay/`, today a bare
+`package relay` stub in our fork) rather than build one — see
+[Implementation approach](#implementation-approach-adopt-upstream-via-port). It
+is an internet-facing service that:
 
-- Accepts browser-originated NHP traffic over a browser-reachable transport
-  (WebSocket or HTTPS-tunnelled NHP — browsers cannot send UDP). The Noise
-  handshake and AEAD bodies are **end-to-end between the JS agent and the
+- Accepts browser-originated NHP traffic over **HTTPS POST** (`POST
+  /relay/{serverId}`, body = one inner NHP packet; browsers cannot send UDP). The
+  Noise handshake and AEAD bodies are **end-to-end between the JS agent and the
   server**; the relay does not hold session keys.
-- Wraps inbound agent packets as `NHP_RLY` to the **private** `nhp-server` and
-  unwraps the server's replies back to the agent.
+- Forwards each inner packet to the **private** `nhp-server` inside an
+  authenticated `NHP_RLY` envelope (`common.RelayForwardMsg{SourceAddr,
+  InnerPacket}`) over a persistent UDP/Noise connection, and returns the server's
+  reply — matched back to the originating request by the **inner packet's
+  counter** (the server replies with the normal `NHP_ACK`/`NHP_COK`; no new reply
+  wire type).
 - Is sized for initial knock + periodic renewals only. It replaces the public
   NLB as the single internet-facing NHP surface.
-
-> The stub's current filename `tcprelay.go` predates this design and does **not**
-> decide the transport — raw TCP is no more browser-reachable than UDP. The
-> transport (the first bullet above) is an open item-2 decision; the file is
-> renamed to match whatever item 2 chooses.
 
 Because keys are end-to-end (above), the relay is a **forwarder, not a trust
 anchor**: it never sees plaintext or the AOP signing key, and validates only what
@@ -143,13 +173,17 @@ The "forwarder, not a trust anchor" framing is about **confidentiality and
 integrity**: keys stay end-to-end and the signing authority stays private, so a
 relay compromise cannot forge AOPs. It is *not* a statement about
 **availability**. Moving the public surface from `nhp-server` to the relay
-**relocates the DoS/abuse burden; it does not remove it.** The relay now runs
-the `NHP_RLY` wrap/unwrap parse path on attacker-controlled bytes, and is the
-service that absorbs knock-flood, spec-fuzzing, and any packet-parsing zero-day
-that motivated taking `nhp-server` private in the first place.
+**relocates the DoS/abuse burden; it does not remove it.** The relay now runs the
+HTTP + `NHP_RLY`-framing path on attacker-controlled bytes (it forwards the inner
+packet opaquely, but still parses the HTTP body, extracts the inner-packet counter,
+and is the front door), so it is the service that absorbs knock-flood, spec-fuzzing,
+and any packet-parsing zero-day that motivated taking `nhp-server` private in the
+first place.
 
-These are therefore **non-optional inputs to the Phase-1 relay PR (item 2)**, not
-"forwarder" details a reader can discount:
+These are therefore **non-optional properties of the relay**, not "forwarder"
+details a reader can discount. Adopting upstream's relay (plus its previously-skipped
+security fixes `e2c5336a` / `ad98e1f4`) is what supplies them — they are inherited and
+verified, not reinvented:
 
 - **Rate-limiting / flood control** at the relay edge (per-IP and global),
   sized for initial-knock + renewal volume with headroom for abuse.
@@ -238,6 +272,24 @@ current prod knock volume is far lower (single-digit knocks/hour), and the
 This keeps the renewal authz model **identical** to the per-request authz model:
 qurl-service is the single source of session truth, consulted on a bounded
 cadence, with no server-trusted bearer token in the loop.
+
+#### Mechanism (no new knock field, no new qurl-service endpoint)
+
+The consult **reuses the existing** `GET /internal/v1/resource/:id/authorize?client_ip=X`
+— the same endpoint `qurl-router` already calls per request
+([`SESSION_ENFORCEMENT_ARCHITECTURE.md`](SESSION_ENFORCEMENT_ARCHITECTURE.md)). The
+`at_*` access token is consumed at the `qurl.link` `/resolve` step and is **gone** by
+knock time (the browser carries only NHP cookies to `qurl.site`), so the knock cannot
+and need not carry a token. Identity is **`AgentKnockMsg.ResourceId`** (already on the
+wire) plus the **relay-forwarded client IP** (`common.RelayForwardMsg.SourceAddr`). The
+server-side QURL `AuthWithNHP` — today an `ErrPluginNotRegistered` stub
+([`endpoints/server/staticplugins/qurl/plugin.go`](../../endpoints/server/staticplugins/qurl/plugin.go))
+— calls that endpoint and dispatches the AOP via `handleNhpOpenResource`. Because
+`NHP_KNK` and `NHP_RKN` both route through `HandleKnockRequest`→`AuthWithNHP`, renewal
+re-consults automatically. (Three small `/authorize`-contract items live in the
+qurl-service repo and must be confirmed before implementation: lookup by
+`resource_id`+`client_ip`+TTL, whether a `session_id` must be preserved across renewal,
+and IP-scoping under `max_sessions`.)
 
 ### Conditions for revisiting (when (b) would win)
 

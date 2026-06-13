@@ -18,6 +18,27 @@ This document tracks the synchronization status between this fork (LayerV NHP) a
 
 ---
 
+## Relay + JS-Agent: now ADOPTED (was skipped) — #2208
+
+**Policy reversal (2026-06).** Earlier syncs marked the upstream **relay**
+(`endpoints/relay/`, server `HandleRelayForward`, `common.RelayForwardMsg`) and
+**JS agent** (`endpoints/js-agent/`) as SKIP ("fork doesn't use relay"). That is
+no longer true: issue #2208 adopts them (browser → relay → private nhp-server).
+The historical per-commit log below still records the original SKIP decisions —
+those are not rewritten — but do **not** skip these going forward. The following
+previously-skipped commits must be **ported** (tracked under #2208):
+
+| Commit | What | Action |
+|--------|------|--------|
+| `bf927049` | feat(relay): add nhp-relay component | Port (the relay; HTTPS POST). |
+| `e2c5336a` | fix(security): relay DoS + source IP validation | **Port — security; lands with the relay/handler.** |
+| `ad98e1f4` | fix(server-http): tighten XFF defence | **Port — security; adapt to our X-Real-IP front door.** |
+| `d0836539` | feat(relay): multi-cluster via pubkey-derived id | Port the `/relay/{serverId}` addressing; the multi-cluster load-balancer is intentionally **stripped** (we target one logical server via CloudMap + the `NHP_FWD` mesh). |
+| `6709d00c`, `cc36a684` | feat(js-agent): browser SDK + CBOR | Port the JS agent (`relay.ts` HTTPS transport). |
+
+GMSM/SM2/SM3/SM4 paths inside these commits remain auto-skipped per the catalog
+above.
+
 ## Auto-Skip Categories
 
 These are PERMANENTLY skipped. Don't waste time reviewing them:
