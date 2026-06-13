@@ -61,7 +61,8 @@ import (
 // Metrics (also see per-const docs below):
 //   - MetricACPubkeyRevoked            — revoked-pubkey hit
 //   - MetricACPubkeyRevokedLookupErr   — F5 lookup storage error
-//   - MetricACPubkeyRevokeListOversize — runaway list length sentinel
+//   - MetricACPubkeyRevokeListOversize — runaway list length sentinel (warn threshold)
+//   - MetricACPubkeyRevokeListCapped   — list past the hard cap; scan skipped
 //   - MetricACPubkeyRevokeGateBug      — fail-closed dispatch-bug fence
 //   - MetricACPubkeyRevokedConnDropped — live connection severed by runtime revocation
 
@@ -90,8 +91,20 @@ const ACPubkeyRevokeVerifyEnvVar = "NHP_AC_PUBKEY_REVOKE_VERIFY"
 // across acIds — operators see a non-zero rate for ANY long-list
 // observation regardless of which acId, so a runaway-append on
 // acId-Y still surfaces even after acId-X consumed the log anchor.
-// Drives the standing dashboard signal; #1547 tracks adding a
-// hard upper bound.
+// Drives the standing dashboard signal.
+//
+// MetricACPubkeyRevokeListCapped fires once per AOL whose
+// RevokedPubKeys list exceeds the hard cap acPubkeyRevokeListLengthMax
+// (#1547). Past the cap, evaluate skips the linear scan and degrades to
+// OK — see acPubkeyRevokeListLengthMax for the availability-first policy
+// and the exact boundary. Such a list also trips
+// MetricACPubkeyRevokeListOversize (cap > warn); this counter is the
+// more-severe "and the gate was skipped" escalation layered on top.
+// Page-worthy independently of the revocation counter: a non-zero rate
+// means an operator-visible runaway list / typo has silently disabled
+// registration-time revocation enforcement for that acId until the list
+// is trimmed back within the cap (the mid-session sweep still drops
+// over-cap revocations in strict mode — see acPubkeyRevokeListLengthMax).
 //
 // MetricACPubkeyRevokeGateBug fires when applyACPubkeyRevokeVerdict
 // hits its fail-closed default branch — reachable only when a future
@@ -105,6 +118,7 @@ const (
 	MetricACPubkeyRevoked            = "ACPubkeyRevoked"
 	MetricACPubkeyRevokedLookupErr   = "ACPubkeyRevokedLookupErr"
 	MetricACPubkeyRevokeListOversize = "ACPubkeyRevokeListOversize"
+	MetricACPubkeyRevokeListCapped   = "ACPubkeyRevokeListCapped"
 	MetricACPubkeyRevokeGateBug      = "ACPubkeyRevokeGateBug"
 	// MetricACPubkeyRevokedConnDropped fires once per live ACConn
 	// removed by the F5 mid-session revocation path (#1535, parent
@@ -125,6 +139,48 @@ const (
 // use F5 as a license-wide kill switch (where License.Active=false
 // is the right primitive). Either way the operator should see it.
 const acPubkeyRevokeListLengthWarn = 50
+
+// acPubkeyRevokeListLengthMax is the hard cap on RevokedPubKeys length
+// (#1547). The check is exclusive (n > max): a list of exactly 256 is
+// still scanned and enforced; only a strictly larger list makes
+// evaluateACPubkeyRevokeVerdict skip the linear scan (verifyACPubkeyRevoked)
+// and degrade to OK rather than scanning an unbounded list per AOL.
+//
+// Scope of the bound: the cap is checked AFTER GetACAssignment returns,
+// so it bounds ONLY the gate's own linear scan — not the backend
+// deserialize nor the CachedStorage.GetACAssignment Clone, both of
+// which run before the cap check and are O(list) on every call. Those
+// remain backstopped by DDB's 400KB item limit (~5K base64 entries) and
+// prevented at source by #1536's write-time validation, not by this
+// cap. The scan is what this function controls, so it is what this
+// function bounds; a runaway admin tool / hand-edited `aws dynamodb
+// update-item` typo could otherwise impose a per-AOL scan over thousands
+// of entries. 256 is far above any realistic one-pubkey-at-a-time
+// incident-response list yet well under the DDB ceiling.
+//
+// Registration-path only: this cap lives in evaluateACPubkeyRevokeVerdict
+// (the AOL admission path). The mid-session drop sweep
+// (dropRevokedACPubkeyConnections, ac_pubkey_revoke_drop.go) scans the
+// FULL uncapped list, so in strict mode an over-cap revocation still
+// severs a live connection — only the registration-time check is
+// bypassed, and a just-accepted over-cap AC is then dropped by the next
+// sweep. The asymmetry is intentional: the sweep is periodic and
+// per-acId, not per-knock, so the per-call scan-cost rationale above does
+// not apply, and keeping the sweep enforcing means an over-cap list does
+// not fully disable F5.
+//
+// Policy on exceed is AVAILABILITY-FIRST: skip the gate (accept the
+// registration) + MetricACPubkeyRevokeListCapped rather than
+// fail-closed — the same trade the storage-error path makes (see
+// package doc). Rationale: only operators with AWS write access can
+// grow this list, so an over-cap list is operator error, not an attack
+// vector — and it's operator-visible (the metric + log surface it), so
+// the operator fixes the list rather than a single pathological acId
+// wedging its own registrations closed. The contrary security-first
+// reading ("reject anything we can't fully evaluate") was considered
+// and rejected on that basis. #1536's CLI is the primary defense
+// (write-time validation); this cap is runtime defense-in-depth.
+const acPubkeyRevokeListLengthMax = 256
 
 // acPubkeyRevokeVerdict captures what verifyACPubkeyRevoked
 // recommends.
@@ -150,7 +206,7 @@ const (
 
 // Per-process forensic anchors. Each guarantees at least one log
 // line for its event class, so a shared-NAT-noise burst can't drown
-// the audit stream entirely. All three are package-level sync.Once
+// the audit stream entirely. All are package-level sync.Once
 // — that's the same pattern as F3/F4 today and means tests sharing
 // a binary can consume the anchor in test order.
 //
@@ -166,6 +222,11 @@ var (
 	// Once-per-process keeps log volume bounded; the metric
 	// (MetricACPubkeyRevokeListOversize) is the standing signal.
 	firstLongRevokeListLog sync.Once
+	// firstRevokeListCappedLog: hard-cap-exceeded Warning (#1547). The
+	// list grew past acPubkeyRevokeListLengthMax and the scan was
+	// skipped; once-per-process anchor, MetricACPubkeyRevokeListCapped
+	// is the standing signal.
+	firstRevokeListCappedLog sync.Once
 	// firstLookupErrLog: storage-error anchor. Pre-#1507-r14 the log
 	// was unsampled and would emit per AOL during a DDB flap.
 	// Non-anchor occurrences now sample at 1/permitModeLogSampleMod.
@@ -340,17 +401,30 @@ func (s *UdpServer) evaluateACPubkeyRevokeVerdict(
 	if assignment == nil {
 		return verdictACPubkeyRevokeOK
 	}
-	if len(assignment.RevokedPubKeys) >= acPubkeyRevokeListLengthWarn {
+	n := len(assignment.RevokedPubKeys)
+	if n >= acPubkeyRevokeListLengthWarn {
 		// Counter fires every observation across all acIds (standing
 		// dashboard signal — survives an early-process anchor consumed
-		// by a different acId).
+		// by a different acId). Intentionally above the hard-cap check
+		// below so a capped list still trips this existing alarm.
 		s.metrics.IncrCounter(MetricACPubkeyRevokeListOversize)
 		// Log fires once per process as a forensic anchor; operators
 		// alarm on the metric, not the log.
 		firstLongRevokeListLog.Do(func() {
-			log.Warning("server-ac(%s#%d@%s)[ACPubkeyRevoked] revoked-pubkey list length %d — operator workflow is one-pubkey-at-a-time, license-wide kills should use License.Active=false (per-process forensic anchor; alarm on %s; see #1507, #1547)",
-				acId, transactionId, addrStr, len(assignment.RevokedPubKeys), MetricACPubkeyRevokeListOversize)
+			log.Warning("server-ac(%s#%d@%s)[ACPubkeyRevoked] revoked-pubkey list length %d — operator workflow is one-pubkey-at-a-time, license-wide kills should use License.Active=false (per-process forensic anchor; alarm on %s; see #1507)",
+				acId, transactionId, addrStr, n, MetricACPubkeyRevokeListOversize)
 		})
+	}
+	// Hard cap (#1547): above acPubkeyRevokeListLengthMax, skip the
+	// linear scan and degrade to OK (availability-first; see the const
+	// doc for rationale and the metric doc for the oversize relationship).
+	if n > acPubkeyRevokeListLengthMax {
+		s.metrics.IncrCounter(MetricACPubkeyRevokeListCapped)
+		firstRevokeListCappedLog.Do(func() {
+			log.Warning("server-ac(%s#%d@%s)[ACPubkeyRevoked] revoked-pubkey list length %d exceeds hard cap %d — skipping revocation scan and ACCEPTING registration (availability-first); trim the list to restore enforcement (per-process forensic anchor; alarm on %s; see #1547)",
+				acId, transactionId, addrStr, n, acPubkeyRevokeListLengthMax, MetricACPubkeyRevokeListCapped)
+		})
+		return verdictACPubkeyRevokeOK
 	}
 	return verifyACPubkeyRevoked(presentedPubkey, assignment.RevokedPubKeys)
 }

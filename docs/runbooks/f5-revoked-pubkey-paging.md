@@ -8,6 +8,7 @@ One of:
 - **`ACPubkeyRevokedConnDropped`** non-zero — a strict-mode runtime sweep severed an already-connected AC whose pubkey is now on that acId's `RevokedPubKeys` denylist.
 - **`ACPubkeyRevokedLookupErr`** non-zero — F5 GetACAssignment storage error; the gate degraded to skip-the-gate. Strict mode does NOT escalate this to a reject.
 - **`ACPubkeyRevokeListOversize`** non-zero — an `ACAssignment.RevokedPubKeys` list crossed the 50-entry sanity threshold. Operator workflow is one-pubkey-at-a-time during incident response; lists this large suggest a runaway-append admin tool or F5 misuse as a license-wide kill switch.
+- **`ACPubkeyRevokeListCapped`** non-zero — an `ACAssignment.RevokedPubKeys` list exceeded the **hard cap of 256** (`acPubkeyRevokeListLengthMax`, #1547). Past the cap the server **skips the F5 revocation scan at registration and accepts the AOL** (availability-first), so **registration-time** revocation is **silently not enforced for that acId** until the list is trimmed to 256 or fewer (a list of exactly 256 still enforces; only >256 skips). The cap is registration-path only: in strict mode the mid-session drop sweep still scans the full uncapped list, so an over-cap revoked AC that knocks through is then severed by the next sweep (`ACPubkeyRevokedConnDropped`). Blast radius is bounded to F5: the license-validity, bound-pubkey allowlist (F-#1155), and CustomerID (F4) gates still run, so this is not an open door — only the per-acId registration-time revocation denylist is bypassed. Remediation: trim the offending acId's list (almost certainly a runaway admin tool / hand-edited `aws dynamodb update-item` typo, since the operator workflow is one-pubkey-at-a-time).
 - **`ACPubkeyRevokeGateBug`** non-zero — `applyACPubkeyRevokeVerdict` hit its fail-closed default branch, indicating a server-side dispatch-table bug. Page-worthy independent of `ACPubkeyRevoked`.
 - **`InternalAuthSignerUnavailable`** non-zero during an operator-triggered sweep — the server is reachable but lacks `NHP_INTERNAL_AUTH_SECRET`, so the signed fast path returns 401. Treat this as deployment/config drift and alert the platform owner before relying on the endpoint during an incident.
 
@@ -42,7 +43,8 @@ The information-disclosure asymmetry is documented at the top of `ac_pubkey_revo
 | `ACPubkeyRevokedConnDropped` rises, operator did NOT revoke | Live AC key appeared on a denylist unexpectedly | Treat as high-signal compromise until disproven. Cross-reference DDB write audit, source IP, and AC logs. |
 | `ACPubkeyRevoked` rises from unfamiliar IP, operator did NOT revoke | Stolen pubkey being presented (high signal) OR attacker probing acId namespace (low signal — see "How to read" above) | Check `LicenseValidationRateLimited` from same IP. Cross-reference operator timeline. |
 | `ACPubkeyRevokedLookupErr` sustained | DDB flap — gate is silently bypassed | Page DDB ops. The metric is the only signal that strict-mode F5 is degraded; do NOT wait for a customer-visible regression. |
-| `ACPubkeyRevokeListOversize` non-zero | Runaway admin tool / F5 misused as license-wide kill switch | Check the offending acId's `RevokedPubKeys` length. Operator workflow is one-pubkey-at-a-time; if length > 50, consider whether `License.Active=false` is the right primitive instead. #1547 tracks adding a hard upper bound. |
+| `ACPubkeyRevokeListOversize` non-zero | Runaway admin tool / F5 misused as license-wide kill switch | Check the offending acId's `RevokedPubKeys` length. Operator workflow is one-pubkey-at-a-time; if length > 50, consider whether `License.Active=false` is the right primitive instead. The hard cap is 256 (`ACPubkeyRevokeListCapped` below); a list between 50 and 256 is still enforced. |
+| `ACPubkeyRevokeListCapped` non-zero | `RevokedPubKeys` list past the 256 hard cap (#1547) — F5 **registration** revocation scan **skipped** for that acId | Treat as an enforcement gap, not just a sanity warning: a revoked pubkey on that acId will be **accepted at registration** until the list is trimmed to 256 or fewer (in strict mode the mid-session sweep still drops it — expect a paired `ACPubkeyRevokedConnDropped`). Find the offending acId (the metric fires per AOL; the once-per-process log line names it), audit how the list grew (runaway admin tool / hand-edited DDB row), and trim it. The license/allowlist/F4 gates still enforce, so the AC is not unauthenticated — only its registration-time revocation denylist is bypassed. |
 | `ACPubkeyRevokeGateBug` non-zero | Server-side dispatch-table bug — a future PR added a verdict constant without registering it in the switch | Page on-call dev. Read recent `ac_pubkey_revoke_gate.go` commits; the bug is in `applyACPubkeyRevokeVerdict`. |
 | `InternalAuthSignerUnavailable` non-zero during a sweep attempt | Missing or misrotated `NHP_INTERNAL_AUTH_SECRET` on the target server | Alert the platform owner and redeploy/fix the secret before depending on the on-demand sweep. Background sweeps still enforce revocations when F5 strict mode is on. |
 
@@ -192,7 +194,7 @@ non-canonical input before writing.
 Flip to `true` only after:
 
 - The `ACPubkeyRevoked` metric stays at zero in permit mode through a full deploy cycle.
-- All four CloudWatch alarms (#1543) are provisioned and in `OK` state.
+- All F5 CloudWatch alarms (#1543) are provisioned and in `OK` state. The expected set is exactly: `ACPubkeyRevoked`, `ACPubkeyRevokedConnDropped`, `ACPubkeyRevokedLookupErr`, `LicenseValidationRateLimited`, and `ACPubkeyRevokeListCapped` (#1547). If you add an F5 metric, extend this list and #1543 together.
 - ACAssignment pre-provisioning lands (#1262) so F4 + F5 strict can flip together without TOFU race issues.
 
 The mid-session drop path only performs destructive drops when
@@ -206,6 +208,6 @@ the sweep interval is non-zero.
 - #1537 — Smoke Tier 2 contract test fencing the propagation window.
 - #1541 — `handleACServerAssignment` rate-limit hardening (separate amplification surface).
 - #1543 — CloudWatch alarms (provisioned in Terraform) for all F5 metrics.
-- #1545 — Storage write-boundary normalization for `RevokedPubKeys`.
-- #1547 — Hard upper bound on `RevokedPubKeys` length.
+- #1545 — Storage write-boundary normalization for `RevokedPubKeys` (implemented: `CachedStorage.SaveACAssignment` Clones at the boundary).
+- #1547 — Hard upper bound (256) on `RevokedPubKeys` length (implemented: `acPubkeyRevokeListLengthMax`; over-cap skips the scan and fires `ACPubkeyRevokeListCapped`).
 - #1548 — Admin invalidation signal to shrink propagation window below 60s.

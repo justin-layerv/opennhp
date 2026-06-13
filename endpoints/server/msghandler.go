@@ -2097,7 +2097,9 @@ func (s *UdpServer) refreshAssignmentTTL(acID string) {
 			return
 		}
 
-		// Clone to avoid mutating the cached pointer
+		// existing is already an owned copy (GetACAssignment clones,
+		// #1540); the clone just keeps it pristine while refreshed is
+		// mutated — defensive, not load-bearing for cache safety.
 		ttl := time.Now().Unix() + AssignmentTTLSeconds
 		refreshed := existing.Clone()
 		refreshed.LastSeen = time.Now().Unix()
@@ -2421,8 +2423,11 @@ func (s *UdpServer) updateAssignmentWithSelf(assignment *ACAssignment, healthySe
 		}
 	}
 
-	// Clone to avoid mutating the cached pointer.
-	// If Save fails, the cache retains the original unmodified assignment.
+	// assignment is already an owned copy (GetACAssignment clones,
+	// #1540); the clone just keeps it pristine while newAssignment is
+	// mutated — defensive, not load-bearing for cache safety. On Save
+	// failure the cache is untouched regardless (SaveACAssignment only
+	// updates it on success).
 	ttl := time.Now().Unix() + AssignmentTTLSeconds
 	newAssignment := assignment.Clone()
 	newAssignment.AssignedServers = updated

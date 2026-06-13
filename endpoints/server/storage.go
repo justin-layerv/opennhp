@@ -29,6 +29,11 @@ import (
 type StorageBackend interface {
 	// GetACAssignment retrieves the server assignment for an AC.
 	// Returns ErrNotFound if the AC has no assignment.
+	//
+	// Ownership contract: the returned *ACAssignment is exclusively
+	// owned by the caller and safe to mutate. Implementations must
+	// return a freshly-allocated copy per call, never a pointer aliased
+	// with internal state (#1540). Every mutating caller depends on this.
 	GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error)
 
 	// GetACsByServer retrieves all ACs assigned to a specific server.
@@ -50,6 +55,12 @@ type StorageBackend interface {
 
 	// SaveACAssignment stores or updates an AC assignment.
 	// Used by server-side auto-assignment to persist AC-to-server mappings.
+	//
+	// The assignment is read-only to the backend: CachedStorage passes a
+	// Clone (#1545), so an implementation must not communicate results
+	// back by mutating the input in place (e.g. stamping a generated
+	// field) — the caller would not observe it. Return such state by
+	// other means.
 	SaveACAssignment(ctx context.Context, assignment *ACAssignment) error
 
 	// Close releases any resources held by the storage backend.
@@ -86,12 +97,15 @@ type ACAssignment struct {
 	// silently fail to unmarshal hand-written SS rows, so the test
 	// surfaces the regression at PR time.
 	//
-	// Construction contract: callers MUST use nil for the empty
+	// Construction contract: callers SHOULD use nil for the empty
 	// case, NOT []string{}. The SDK encodes nil as "attribute
 	// omitted" and []string{} as "attribute NULL"; both are
 	// DDB-accepted but create silent shape divergence between rows.
-	// Clone() normalizes empty → nil; #1536's CLI must do the same
-	// on the write path so this isn't load-bearing.
+	// This is enforced, not just documented: Clone() normalizes
+	// empty → nil, and CachedStorage.SaveACAssignment Clones every
+	// write at the boundary (#1545), so a direct
+	// ACAssignment{RevokedPubKeys: []string{}} save still round-trips
+	// as nil. #1536's CLI normalizes on the operator-tooling side too.
 	RevokedPubKeys []string `json:"revoked_pubkeys,omitempty" dynamodbav:"revoked_pubkeys,omitempty,stringset"`
 }
 
@@ -420,21 +434,42 @@ func NewCachedStorage(backend StorageBackend, config CacheConfig) *CachedStorage
 }
 
 // GetACAssignment retrieves the AC assignment, using cache when available.
+//
+// Per the StorageBackend.GetACAssignment ownership contract, the
+// returned *ACAssignment is an exclusively-owned copy. The single tail
+// Clone enforces this on BOTH the cache-hit and cache-miss paths — on a
+// miss the freshly-fetched pointer is aliased by the cache entry just
+// Set, so it can no more be returned raw than the hit pointer can. (The
+// issue's AssignmentCache.Get-only sketch missed the miss path; cloning
+// at this boundary covers both.) Without it, a future in-place mutator
+// would race the F4/F5 registration kernels reading the cached entry on
+// a concurrent AOL (#1540). The cost is one Clone per call — a shallow
+// struct copy plus small slice copies — immaterial next to the work each
+// call fronts: a storage round-trip on a cache miss, and on the forward
+// path (http_forward.go, udpserver.go) the cross-server forward
+// round-trip. Those forward lookups do run per knock that needs
+// forwarding, but prod forward traffic is sparse and the registration
+// kernels are periodic, so the rate is low regardless.
 func (cs *CachedStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {
-	// Check cache first
-	if assignment := cs.cache.Get(acID); assignment != nil {
-		return assignment, nil
+	assignment := cs.cache.Get(acID)
+	if assignment == nil {
+		fetched, err := cs.backend.GetACAssignment(ctx, acID)
+		if err != nil {
+			return nil, err
+		}
+		// Defense against a backend (nil, nil) contract violation:
+		// return gracefully rather than caching nil or nil-derefing in
+		// the tail Clone. A compliant backend returns ErrNotFound, never
+		// (nil, nil); this preserves the pre-clone behavior and mirrors
+		// the same guard in evaluateACPubkeyRevokeVerdict so the gate's
+		// documented nil-defense stays reachable through the cache layer.
+		if fetched == nil {
+			return nil, nil
+		}
+		cs.cache.Set(acID, fetched)
+		assignment = fetched
 	}
-
-	// Cache miss - fetch from backend
-	assignment, err := cs.backend.GetACAssignment(ctx, acID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Store in cache
-	cs.cache.Set(acID, assignment)
-	return assignment, nil
+	return assignment.Clone(), nil
 }
 
 // GetACsByServer retrieves ACs assigned to a server (not cached, used rarely).
@@ -458,11 +493,23 @@ func (cs *CachedStorage) GetResourceByACID(ctx context.Context, acID string) ([]
 }
 
 // SaveACAssignment stores an AC assignment (write-through: backend then cache).
+//
+// The assignment is Cloned once at this boundary, which does two jobs:
+// it normalizes RevokedPubKeys per the field's construction contract
+// (see ACAssignment.RevokedPubKeys) so a direct save that skips Clone
+// still round-trips correctly (#1545), and it de-aliases the cached
+// entry from the caller's pointer — the write-side mirror of
+// GetACAssignment's owned-copy contract (#1540).
 func (cs *CachedStorage) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
-	if err := cs.backend.SaveACAssignment(ctx, assignment); err != nil {
+	toSave := assignment.Clone()
+	if err := cs.backend.SaveACAssignment(ctx, toSave); err != nil {
 		return err
 	}
-	cs.cache.Set(assignment.ACID, assignment)
+	// toSave is deliberately shared between the backend write and the
+	// cache entry: the StorageBackend.SaveACAssignment contract forbids
+	// backends from mutating the input, so this aliasing can't
+	// reintroduce the cache/caller sharing #1540 removed.
+	cs.cache.Set(toSave.ACID, toSave)
 	return nil
 }
 
@@ -545,6 +592,11 @@ func NewAssignmentCache(config CacheConfig) *AssignmentCache {
 }
 
 // Get retrieves an assignment from cache if valid.
+//
+// It returns the cache's INTERNAL pointer, not a copy — the sole caller
+// is CachedStorage.GetACAssignment, which Clones before handing the
+// value to application code (#1540). Do not return this pointer to a
+// caller that may mutate it without cloning first.
 func (c *AssignmentCache) Get(acID string) *ACAssignment {
 	entry, ok := c.cache.Get(acID)
 	if !ok {

@@ -1226,7 +1226,10 @@ func (s *UdpServer) cleanupOwnedAssignments() {
 			continue // This server wasn't in the assignment
 		}
 
-		// Clone to avoid mutating cached pointer
+		// assignment is already an owned copy (GetACAssignment clones,
+		// #1540); the clone just keeps it pristine as the "before" while
+		// newAssignment is the mutated "after" — defensive, not
+		// load-bearing for cache safety.
 		newAssignment := assignment.Clone()
 		newAssignment.AssignedServers = updated
 		newAssignment.Version = assignment.Version + 1

@@ -392,6 +392,149 @@ func TestCachedStorage_Backend(t *testing.T) {
 	}
 }
 
+// TestCachedStorage_SaveACAssignment_NormalizesEmptyRevokedPubKeys fences
+// #1545: a caller that builds the empty case as []string{} (violating
+// the nil construction contract on ACAssignment.RevokedPubKeys) and
+// saves directly — without going through Clone — must still persist the
+// field as an omitted attribute, not a DDB NULL. SaveACAssignment Clones
+// at the boundary and Clone normalizes empty→nil, so the backend never
+// sees a non-nil empty slice and the rule stops being load-bearing on
+// every write caller remembering to Clone.
+func TestCachedStorage_SaveACAssignment_NormalizesEmptyRevokedPubKeys(t *testing.T) {
+	backend := newMockStorageBackend()
+	cached := NewCachedStorage(backend, CacheConfig{MaxEntries: 100, DefaultTTL: 60})
+	ctx := context.Background()
+
+	if err := cached.SaveACAssignment(ctx, &ACAssignment{
+		ACID:           "ac-1545",
+		Version:        1,
+		RevokedPubKeys: []string{},
+	}); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	// What the backend actually received must be nil, not []string{}.
+	saved := backend.assignments["ac-1545"]
+	if saved == nil {
+		t.Fatal("assignment not persisted to backend")
+	}
+	if saved.RevokedPubKeys != nil {
+		t.Errorf("backend RevokedPubKeys = %#v, want nil (empty must normalize at the write boundary)", saved.RevokedPubKeys)
+	}
+
+	// A cache-served read must agree with a backend-served read.
+	got, err := cached.GetACAssignment(ctx, "ac-1545")
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if got.RevokedPubKeys != nil {
+		t.Errorf("cached RevokedPubKeys = %#v, want nil", got.RevokedPubKeys)
+	}
+}
+
+// TestCachedStorage_SaveACAssignment_PreservesNonEmptyRevokedPubKeys is
+// the companion to the normalization fence: the empty→nil rule must NOT
+// drop a real revocation list.
+func TestCachedStorage_SaveACAssignment_PreservesNonEmptyRevokedPubKeys(t *testing.T) {
+	backend := newMockStorageBackend()
+	cached := NewCachedStorage(backend, CacheConfig{MaxEntries: 100, DefaultTTL: 60})
+	ctx := context.Background()
+
+	want := []string{"pk-a", "pk-b"}
+	if err := cached.SaveACAssignment(ctx, &ACAssignment{
+		ACID:           "ac-1545-nonempty",
+		Version:        1,
+		RevokedPubKeys: want,
+	}); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+	saved := backend.assignments["ac-1545-nonempty"]
+	if saved == nil {
+		t.Fatal("assignment not persisted to backend")
+	}
+	if len(saved.RevokedPubKeys) != 2 || saved.RevokedPubKeys[0] != "pk-a" || saved.RevokedPubKeys[1] != "pk-b" {
+		t.Errorf("backend RevokedPubKeys = %#v, want %#v", saved.RevokedPubKeys, want)
+	}
+}
+
+// TestCachedStorage_GetACAssignment_ReturnsOwnedCopy fences #1540:
+// GetACAssignment must hand callers an exclusively-owned copy, never the
+// cache's internal pointer, on BOTH the cache-miss and cache-hit paths.
+// A caller mutating the result must not affect what a subsequent caller
+// reads — otherwise a future in-place mutator races the F4/F5
+// registration kernels reading the same cached entry on a concurrent
+// AOL. The backend here is intentionally non-cloning (mockStorageBackend
+// returns its stored pointer), so any surviving aliasing would be
+// CachedStorage's own.
+func TestCachedStorage_GetACAssignment_ReturnsOwnedCopy(t *testing.T) {
+	backend := newMockStorageBackend()
+	backend.assignments["ac-1540"] = &ACAssignment{
+		ACID:            "ac-1540",
+		RevokedPubKeys:  []string{"pk-orig"},
+		AssignedServers: []ServerInfo{{ID: "srv-1", IP: "10.0.0.1"}},
+	}
+	cached := NewCachedStorage(backend, CacheConfig{MaxEntries: 100, DefaultTTL: 60})
+	ctx := context.Background()
+
+	// First call is a cache MISS (populates the cache from the backend).
+	got1, err := cached.GetACAssignment(ctx, "ac-1540")
+	if err != nil {
+		t.Fatalf("get1 failed: %v", err)
+	}
+	// Tamper with every reference-typed field of the returned copy.
+	got1.RevokedPubKeys[0] = "pk-TAMPERED"
+	got1.RevokedPubKeys = append(got1.RevokedPubKeys, "pk-EXTRA")
+	got1.AssignedServers[0].IP = "6.6.6.6"
+
+	// Second call is a cache HIT — must be pristine, proving got1's
+	// mutations did not reach the cached entry (miss-path clone).
+	got2, err := cached.GetACAssignment(ctx, "ac-1540")
+	if err != nil {
+		t.Fatalf("get2 failed: %v", err)
+	}
+	if got2 == got1 {
+		t.Error("GetACAssignment returned the same pointer twice; expected independent copies")
+	}
+	if len(got2.RevokedPubKeys) != 1 || got2.RevokedPubKeys[0] != "pk-orig" {
+		t.Errorf("cached RevokedPubKeys corrupted by caller mutation: %#v", got2.RevokedPubKeys)
+	}
+	if got2.AssignedServers[0].IP != "10.0.0.1" {
+		t.Errorf("cached AssignedServers corrupted by caller mutation: IP=%q", got2.AssignedServers[0].IP)
+	}
+
+	// Tamper with the HIT-path copy and confirm a third HIT is still
+	// pristine (hit-path clone).
+	got2.RevokedPubKeys[0] = "pk-TAMPERED-AGAIN"
+	got3, err := cached.GetACAssignment(ctx, "ac-1540")
+	if err != nil {
+		t.Fatalf("get3 failed: %v", err)
+	}
+	if got3.RevokedPubKeys[0] != "pk-orig" {
+		t.Errorf("cached RevokedPubKeys corrupted via hit-path copy: %#v", got3.RevokedPubKeys)
+	}
+}
+
+// TestCachedStorage_GetACAssignment_BackendNilNilDoesNotPanic guards the
+// owned-copy clone against a backend (nil, nil) contract violation. A
+// compliant backend returns ErrNotFound, never (nil, nil), but the gate
+// and msghandler explicitly defend against the contract violation — so
+// the tail Clone in GetACAssignment must not nil-panic before those
+// caller-side guards run. Returns (nil, nil) gracefully, as the
+// pre-clone code did. (nilNilStorage is defined in
+// ac_pubkey_revoke_gate_test.go.)
+func TestCachedStorage_GetACAssignment_BackendNilNilDoesNotPanic(t *testing.T) {
+	backend := &nilNilStorage{MemoryStorage: NewMemoryStorage()}
+	cached := NewCachedStorage(backend, CacheConfig{MaxEntries: 100, DefaultTTL: 60})
+
+	got, err := cached.GetACAssignment(context.Background(), "ac-nilnil")
+	if err != nil {
+		t.Fatalf("expected nil error for (nil, nil) backend return, got %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected (nil, nil) graceful return, got %#v", got)
+	}
+}
+
 // ============================================================================
 // StorageError Tests
 // ============================================================================

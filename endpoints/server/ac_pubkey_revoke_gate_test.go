@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -478,6 +479,80 @@ func TestEvaluateACPubkeyRevokeVerdict_BelowWarnDoesNotEmitOversize(t *testing.T
 	if c := counters[MetricACPubkeyRevokeListOversize]; c != 0 {
 		t.Errorf("below-warn list (len=%d, threshold=%d): %s=%v, want 0",
 			len(revoked), acPubkeyRevokeListLengthWarn, MetricACPubkeyRevokeListOversize, c)
+	}
+}
+
+// revokedListWithHead returns a RevokedPubKeys list of length n whose
+// first entry is head and whose remaining entries are distinct filler
+// base64 pubkeys (none equal to head). Used by the #1547 hard-cap tests
+// to build lists longer than 255 entries without the byte-wrap
+// collisions a testPubkeyB64(byte(i)) loop would hit.
+func revokedListWithHead(head string, n int) []string {
+	out := make([]string, 0, n)
+	out = append(out, head)
+	// 3-byte fillers can never equal head (the base64 of a 32-byte
+	// testPubkey), and (byte(i), byte(i>>8)) is unique for i in 1..n.
+	for i := 1; i < n; i++ {
+		out = append(out, base64.StdEncoding.EncodeToString([]byte{byte(i), byte(i >> 8), 0xEE}))
+	}
+	return out
+}
+
+// TestEvaluateACPubkeyRevokeVerdict_OverCapSkipsScanAndAccepts is THE
+// availability-first trade-off fence for the #1547 hard cap. A list
+// past acPubkeyRevokeListLengthMax skips the linear scan and ACCEPTS
+// the registration — even when the presented pubkey is on the list. A
+// reviewer changing the cap policy to fail-closed (reject) must update
+// this test and consciously accept that a single runaway acId can wedge
+// its own registrations shut.
+func TestEvaluateACPubkeyRevokeVerdict_OverCapSkipsScanAndAccepts(t *testing.T) {
+	const acId = "ac-1547-over-cap"
+	pkRevoked := testPubkeyB64(0xAA)
+	// Head entry is the revoked pubkey, so without the cap this would
+	// verdict Revoked. Length is one past the cap.
+	revoked := revokedListWithHead(pkRevoked, acPubkeyRevokeListLengthMax+1)
+	mem := NewMemoryStorage()
+	mem.PutACAssignment(&ACAssignment{ACID: acId, Version: 1, RevokedPubKeys: revoked})
+	s := newTestServerForLicenseGate(t, mem)
+
+	verdict := s.evaluateACPubkeyRevokeVerdict(context.Background(), acId, pkRevoked, 1, "10.0.0.1:62206")
+	if verdict != verdictACPubkeyRevokeOK {
+		t.Errorf("over-cap list (len=%d, cap=%d), presented pubkey ON the list: verdict=%v, want OK (scan skipped, availability-first)",
+			len(revoked), acPubkeyRevokeListLengthMax, verdict)
+	}
+	counters, _ := s.metrics.CountersForTest(t)
+	if c := counters[MetricACPubkeyRevokeListCapped]; c != 1 {
+		t.Errorf("%s=%v, want 1 (cap exceeded)", MetricACPubkeyRevokeListCapped, c)
+	}
+	// A capped list is also oversize, so the pre-existing dashboard
+	// alarm must still fire — the cap escalation does not silence it.
+	if c := counters[MetricACPubkeyRevokeListOversize]; c != 1 {
+		t.Errorf("%s=%v, want 1 (capped list must still trip the oversize alarm)", MetricACPubkeyRevokeListOversize, c)
+	}
+}
+
+// TestEvaluateACPubkeyRevokeVerdict_AtCapStillEnforces pins the boundary:
+// a list of exactly acPubkeyRevokeListLengthMax entries is still scanned
+// and enforced. Together with the over-cap test this fences the off-by-
+// one: 256 enforces, 257 skips.
+func TestEvaluateACPubkeyRevokeVerdict_AtCapStillEnforces(t *testing.T) {
+	const acId = "ac-1547-at-cap"
+	pkRevoked := testPubkeyB64(0xAA)
+	revoked := revokedListWithHead(pkRevoked, acPubkeyRevokeListLengthMax)
+	mem := NewMemoryStorage()
+	mem.PutACAssignment(&ACAssignment{ACID: acId, Version: 1, RevokedPubKeys: revoked})
+	s := newTestServerForLicenseGate(t, mem)
+
+	verdict := s.evaluateACPubkeyRevokeVerdict(context.Background(), acId, pkRevoked, 1, "10.0.0.1:62206")
+	if verdict != verdictACPubkeyRevokeRevoked {
+		t.Errorf("at-cap list (len=%d == cap): verdict=%v, want Revoked (still enforced at the boundary)", len(revoked), verdict)
+	}
+	counters, _ := s.metrics.CountersForTest(t)
+	if c := counters[MetricACPubkeyRevokeListCapped]; c != 0 {
+		t.Errorf("%s=%v, want 0 (at the cap, not past it)", MetricACPubkeyRevokeListCapped, c)
+	}
+	if c := counters[MetricACPubkeyRevokeListOversize]; c != 1 {
+		t.Errorf("%s=%v, want 1 (at-cap list is oversize)", MetricACPubkeyRevokeListOversize, c)
 	}
 }
 
