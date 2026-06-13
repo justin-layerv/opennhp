@@ -873,7 +873,9 @@ resource "aws_dynamodb_table" "qurl_access_tokens" {
 
 # qurl-sessions: Stores active sessions per resource
 # PK: resource_id, SK: session_id
-# Uses composite key for efficient per-resource session queries
+# Base access pattern: per-resource session queries, single-session updates,
+# and token-scoped counter rows all use the table PK/SK directly.
+# GSI: resource-token-ip-index (max_sessions reuse by token + canonical src_ip)
 resource "aws_dynamodb_table" "qurl_sessions" {
   count = var.deploy_qurl_tables ? 1 : 0
 
@@ -891,6 +893,49 @@ resource "aws_dynamodb_table" "qurl_sessions" {
   attribute {
     name = "session_id"
     type = "S"
+  }
+
+  # session_lookup_key — the resource-token-ip-index GSI sort key.
+  # qurl-service owns the canonical composition
+  # (`{qurl_token_hash}#{canonical_src_ip}`) in its schema registry and
+  # repository writer. The generic attribute name is intentional: this is the
+  # reusable per-session lookup key that the GSI names by its current query
+  # shape.
+  #
+  # The GSI is sparse by design. Rows written before qurl-service starts
+  # populating session_lookup_key will not appear in the index; the rollout
+  # ledger relies on session TTL to drain that bounded window instead of a DDB
+  # backfill. (Counters also omit this attribute and therefore stay out of the
+  # index.)
+  #
+  # SK is NOT unique: concurrent sessions for the same resource, token, and
+  # canonical IP can share the same GSI key. DynamoDB permits duplicate GSI
+  # keys, and qurl-service pages the query while filtering active rows.
+  attribute {
+    name = "session_lookup_key"
+    type = "S"
+  }
+
+  # INCLUDE projection: qurl-service only needs the token/IP fields and active
+  # session timing attributes to decide whether a row can be reused. The base
+  # table keys (resource_id, session_id) are auto-projected, so this avoids an
+  # extra GetItem without paying for ALL. `src_ip` is projected separately from
+  # the canonical IP embedded in session_lookup_key because qurl-service still
+  # calls MatchesIP against the stored raw source IP after the key narrows the
+  # candidate set.
+  global_secondary_index {
+    name            = "resource-token-ip-index"
+    hash_key        = "resource_id"
+    range_key       = "session_lookup_key"
+    projection_type = "INCLUDE"
+    non_key_attributes = [
+      "access_token_id",
+      "created_at",
+      "first_authorized_at",
+      "session_duration_seconds",
+      "src_ip",
+      "ttl",
+    ]
   }
 
   # Enable point-in-time recovery for production
