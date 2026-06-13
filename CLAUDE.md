@@ -237,6 +237,7 @@ This file stays light. Subtree-scoped rules live in nested `CLAUDE.md` files (au
 | Plugin development | `docs/server_plugin.md` |
 | Upstream sync process | `docs/UPSTREAM_SYNC.md` |
 | Session enforcement (server-side authz) | `docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md` |
+| NHP-Relay topology + re-knock authz (taking nhp-server private, #2208) | `docs/design/NHP_RELAY_TOPOLOGY.md` |
 | Commit convention + scopes table | `docs/COMMIT_CONVENTION.md` |
 | Runbooks index | `docs/runbooks/README.md` |
 | Security monitoring + secrets / `NHP_INTERNAL_AUTH_SECRET` / KMS exception | `docs/SECURITY.md` |
