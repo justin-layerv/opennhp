@@ -29,6 +29,7 @@ var (
 	resConfigWatch   io.Closer
 	srcipConfigWatch io.Closer
 	dbConfigWatch    io.Closer
+	relayConfigWatch io.Closer
 	teeWatch         io.Closer
 	errLoadConfig    = errors.New("config load error")
 )
@@ -144,6 +145,7 @@ type Peers struct {
 	ACs    []*core.UdpPeer
 	Agents []*core.UdpPeer
 	DBs    []*core.UdpPeer
+	Relays []*core.UdpPeer
 }
 
 func (s *UdpServer) loadBaseConfig() error {
@@ -315,6 +317,38 @@ func (s *UdpServer) loadPeers() error {
 				if err = toml.Unmarshal(contentDE, &dePeers); err == nil {
 					if updateErr := s.updateDePeers(dePeers.DBs); updateErr != nil {
 						log.Error("[Server] failed to apply DB peer update from %s: %v", fileNameDE, updateErr)
+					}
+				}
+			}
+		})
+	}
+
+	// relay.toml - optional, contains NHP_RELAY peer configurations (#2208).
+	// Registering the relay's static pubkey lets the server authenticate the
+	// NHP_RLY packets it forwards. The handler that processes NHP_RLY lands
+	// in a follow-up PR; until then a registered relay is authenticated but
+	// its NHP_RLY falls through to the default (unhandled) dispatch.
+	fileNameRelay := filepath.Join(ExeDirPath, "etc", "relay.toml")
+	contentRelay, err := s.loadConfigFile(fileNameRelay)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to read relay peer config %s: %w", fileNameRelay, err)
+		}
+		log.Info("relay.toml not found, no relay peers configured")
+	} else {
+		var relayPeers Peers
+		if err := toml.Unmarshal(contentRelay, &relayPeers); err != nil {
+			return fmt.Errorf("failed to parse relay peer config %s: %w", fileNameRelay, err)
+		}
+		if err := s.updateRelayPeers(relayPeers.Relays); err != nil {
+			return fmt.Errorf("failed to apply relay peers: %w", err)
+		}
+		relayConfigWatch = utils.WatchFile(fileNameRelay, func() {
+			log.Info("[Server] relay peer config %s has been updated, reloading", fileNameRelay)
+			if contentRelay, err = s.loadConfigFile(fileNameRelay); err == nil {
+				if err = toml.Unmarshal(contentRelay, &relayPeers); err == nil {
+					if updateErr := s.updateRelayPeers(relayPeers.Relays); updateErr != nil {
+						log.Error("[Server] failed to apply relay peer update from %s: %v", fileNameRelay, updateErr)
 					}
 				}
 			}
@@ -767,6 +801,12 @@ func (s *UdpServer) updateAgentPeers(peers []*core.UdpPeer) error {
 	return s.updatePeers(peers, core.NHP_AGENT, &s.agentPeerMapMutex, &s.agentPeerMap)
 }
 
+// updateRelayPeers registers the configured NHP_RELAY peers (relay.toml) with
+// the device so their forwarded NHP_RLY packets can be authenticated (#2208).
+func (s *UdpServer) updateRelayPeers(peers []*core.UdpPeer) error {
+	return s.updatePeers(peers, core.NHP_RELAY, &s.relayPeerMapMutex, &s.relayPeerMap)
+}
+
 func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error) {
 	utils.CatchPanicThenRun(func() {
 		err = errLoadConfig
@@ -875,7 +915,7 @@ func (s *UdpServer) StopConfigWatch() {
 	for _, w := range []io.Closer{
 		baseConfigWatch, httpConfigWatch, acConfigWatch,
 		agentConfigWatch, resConfigWatch, srcipConfigWatch,
-		dbConfigWatch, teeWatch,
+		dbConfigWatch, relayConfigWatch, teeWatch,
 	} {
 		if w != nil {
 			_ = w.Close()

@@ -234,6 +234,10 @@ type UdpServer struct {
 	dbPeerMapMutex sync.Mutex
 	dbPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
 
+	// NHP-RELAY (#2208)
+	relayPeerMapMutex sync.Mutex
+	relayPeerMap      map[string]*core.UdpPeer // NHP_RELAY peers (relay.toml), indexed by public key base64
+
 	teeMapMutex sync.Mutex
 	teeMap      map[string]*TeeAttestationReport // indexed by tee's measure
 
