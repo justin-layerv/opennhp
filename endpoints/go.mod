@@ -4,14 +4,14 @@ go 1.26.4
 
 require (
 	github.com/OpenNHP/opennhp/nhp v0.6.0
-	github.com/aws/aws-sdk-go-v2 v1.41.7
+	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.18
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.17
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.39
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.57.0
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.3
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.39.28
-	github.com/aws/smithy-go v1.25.1
+	github.com/aws/smithy-go v1.27.1
 	github.com/cilium/ebpf v0.21.0
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/fengyily/nhp-plugins-sdk v0.1.30
