@@ -1580,6 +1580,40 @@ jobs:
         run: ./scripts/check-redirect-url-drift.sh
 
   # ============================================================================
+  # QURL LINK SOCIAL CARD LINT (PR)
+  # Static PR-time fence for the generated qurl.link social preview PNG. The
+  # smoke suite verifies the deployed origin; this catches a committed image
+  # that lost the LayerV wordmark before it reaches CloudFront.
+  # ============================================================================
+  qurl-link-og-image-lint:
+    name: qURL Link Social Card Lint (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+
+      - name: Install ImageMagick if needed
+        run: |
+          if command -v magick >/dev/null 2>&1 || { command -v convert >/dev/null 2>&1 && command -v identify >/dev/null 2>&1; }; then
+            echo "ImageMagick already available."
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+
+      - name: Shellcheck qURL link social card lint
+        run: shellcheck ./scripts/check-qurl-link-og-image.sh
+
+      - name: Check qURL link social card PNG
+        run: ./scripts/check-qurl-link-og-image.sh
+
+  # ============================================================================
   # TERRAFORM VALIDATE (main) - Lightweight validation before deploy
   # No terraform plan here — deploy-sandbox-infra runs plan+apply in one job,
   # saving 1 M2M token per merge (the old plan artifact was never consumed).

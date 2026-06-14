@@ -1,43 +1,58 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
-  <!-- Source for og-image.png. Regenerate the PNG after edits with ImageMagick. -->
+  <!-- Source for og-image.png. The PNG composites layerv-wordmark.svg on top;
+    see README.md for the ImageMagick command. -->
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#070907"/>
-      <stop offset="0.58" stop-color="#0d1713"/>
-      <stop offset="1" stop-color="#101914"/>
+    <radialGradient id="washA" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(930 130) rotate(126) scale(560 420)">
+      <stop offset="0" stop-color="#f5f5f0" stop-opacity="0.055"/>
+      <stop offset="1" stop-color="#f5f5f0" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="washB" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(250 560) rotate(-24) scale(460 320)">
+      <stop offset="0" stop-color="#a6ff00" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#a6ff00" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="limePath" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#a6ff00" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#a6ff00"/>
+      <stop offset="1" stop-color="#a6ff00" stop-opacity="0"/>
     </linearGradient>
-    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#1ce8c3"/>
-      <stop offset="0.52" stop-color="#d9ff5d"/>
-      <stop offset="1" stop-color="#ff735c"/>
-    </linearGradient>
-    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="12" result="blur"/>
-      <feMerge>
-        <feMergeNode in="blur"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
   </defs>
 
-  <rect width="1200" height="630" fill="url(#bg)"/>
-  <g opacity="0.18">
-    <path d="M0 120H1200M0 240H1200M0 360H1200M0 480H1200M120 0V630M300 0V630M480 0V630M660 0V630M840 0V630M1020 0V630" stroke="#f6f0df" stroke-width="1"/>
-  </g>
-  <path d="M146 405C281 240 366 392 498 256C629 121 759 396 914 224C984 146 1058 147 1126 173" fill="none" stroke="url(#line)" stroke-width="10" stroke-linecap="round" filter="url(#glow)"/>
-  <circle cx="146" cy="405" r="18" fill="#1ce8c3"/>
-  <circle cx="498" cy="256" r="18" fill="#d9ff5d"/>
-  <circle cx="914" cy="224" r="18" fill="#ff735c"/>
+  <rect width="1200" height="630" fill="#0a0a0a"/>
+  <rect width="1200" height="630" fill="url(#washA)"/>
+  <rect width="1200" height="630" fill="url(#washB)"/>
 
-  <g font-family="Arial, Helvetica, sans-serif" fill="#f6f0df">
-    <text x="96" y="166" font-size="28" font-weight="700" letter-spacing="3">PRIVATE ACCESS LINKS</text>
-    <text x="92" y="286" font-size="136" font-weight="800">qURL</text>
-    <text x="100" y="374" font-size="46" font-weight="700">Share the link. Not the exposure.</text>
-    <text x="100" y="446" font-size="30" fill="#b9b8aa">One-time, time-limited links for sensitive pages, files, portals, and dashboards.</text>
+  <g opacity="0.36" stroke="#f5f5f0" stroke-opacity="0.055" stroke-width="1">
+    <path d="M0 104H1200M0 208H1200M0 312H1200M0 416H1200M0 520H1200"/>
+    <path d="M104 0V630M208 0V630M312 0V630M416 0V630M520 0V630M624 0V630M728 0V630M832 0V630M936 0V630M1040 0V630M1144 0V630"/>
   </g>
 
-  <g transform="translate(874 488)">
-    <rect width="196" height="88" rx="24" fill="#f6f0df"/>
-    <text x="34" y="58" font-family="Arial, Helvetica, sans-serif" font-size="40" font-weight="800" fill="#070907">qurl.link</text>
+  <g font-family="Helvetica, Arial, sans-serif">
+    <text x="82" y="190" fill="#a6ff00" font-size="26" font-weight="700">Private access links</text>
+    <text x="78" y="338" fill="#f5f5f0" font-family="Helvetica, Arial, sans-serif" font-size="134" font-weight="400">qURL™</text>
+    <text x="86" y="404" fill="#f5f5f0" font-size="42" font-weight="800">Share the link.</text>
+    <text x="86" y="454" fill="#f5f5f0" font-size="42" font-weight="800">Not the exposure.</text>
+    <text x="86" y="510" fill="#c9c9c4" font-size="28" font-weight="500">One-time, time-limited links for sensitive pages,</text>
+    <text x="86" y="548" fill="#c9c9c4" font-size="28" font-weight="500">files, portals, previews, and dashboards.</text>
+  </g>
+
+  <g transform="translate(720 170)">
+    <rect x="0" y="0" width="360" height="260" rx="8" fill="#16161a" fill-opacity="0.92" stroke="#f5f5f0" stroke-opacity="0.14"/>
+    <path d="M52 130H308" stroke="url(#limePath)" stroke-width="4" stroke-linecap="round"/>
+    <g font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="700">
+      <rect x="32" y="66" width="118" height="78" rx="8" fill="#0a0a0a" stroke="#f5f5f0" stroke-opacity="0.16"/>
+      <text x="56" y="101" fill="#f5f5f0">qurl.link</text>
+      <text x="56" y="126" fill="#939390" font-size="14" font-weight="500">shared access</text>
+
+      <rect x="122" y="152" width="118" height="78" rx="8" fill="#0a0a0a" stroke="#a6ff00" stroke-opacity="0.35"/>
+      <text x="148" y="187" fill="#f5f5f0">Verify</text>
+      <text x="148" y="212" fill="#939390" font-size="14" font-weight="500">token gate</text>
+
+      <rect x="210" y="66" width="118" height="78" rx="8" fill="#0a0a0a" stroke="#f5f5f0" stroke-opacity="0.16"/>
+      <text x="236" y="101" fill="#f5f5f0">Resource</text>
+      <text x="236" y="126" fill="#939390" font-size="14" font-weight="500">opens briefly</text>
+    </g>
+    <circle cx="92" cy="130" r="9" fill="#a6ff00"/>
+    <circle cx="181" cy="130" r="9" fill="#a6ff00"/>
+    <circle cx="270" cy="130" r="9" fill="#10b981"/>
   </g>
 </svg>

@@ -200,12 +200,27 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-redirect-url-drift lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns
+lint: lint-redirect-url-drift lint-qurl-link-og-image lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
 	cd endpoints && golangci-lint run ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Lint passed!$(END_COLOUR)"
+
+# Fence the generated qurl.link social preview PNG before deploy-time smoke.
+# The SVG source uses editable text, so this checks the committed PNG's stable
+# contract (dimensions + visible LayerV wordmark pixels) instead of re-rendering
+# font-dependent text in CI.
+.PHONY: lint-qurl-link-og-image
+lint-qurl-link-og-image:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking qURL link social preview image...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/check-qurl-link-og-image.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@./scripts/check-qurl-link-og-image.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] qURL link social preview image check passed!$(END_COLOUR)"
 
 # Fence DisableAgentValidation=true from any deployable config (#1157 F9).
 # The flag turns off agent static-pubkey validation entirely; setting

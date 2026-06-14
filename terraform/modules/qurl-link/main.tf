@@ -26,23 +26,28 @@ locals {
   robots_txt = var.robots_tag == null ? "User-agent: *\nAllow: /\n" : "User-agent: *\nDisallow: /\n"
 
   favicon_svg  = file("${path.module}/frontend/favicon.svg")
+  wordmark_svg = file("${path.module}/frontend/layerv-wordmark.svg")
   og_image_png = filebase64("${path.module}/frontend/og-image.png")
 
   index_content_type     = "text/html"
   robots_content_type    = "text/plain; charset=utf-8"
   favicon_content_type   = "image/svg+xml"
+  wordmark_content_type  = "image/svg+xml"
   og_image_content_type  = "image/png"
   html_cache_control     = "max-age=3600, must-revalidate"
   robots_cache_control   = "max-age=3600, must-revalidate"
   favicon_cache_control  = "max-age=86400, must-revalidate"
+  wordmark_cache_control = "max-age=86400, must-revalidate"
   og_image_cache_control = "max-age=86400, must-revalidate"
 
   favicon_keys = ["favicon.ico", "favicon.svg"]
+  wordmark_key = "layerv-wordmark.svg"
   og_image_key = "og-image.png"
 
   static_invalidation_paths = concat(
     ["/", "/index.html", "/robots.txt"],
     [for key in local.favicon_keys : "/${key}"],
+    ["/${local.wordmark_key}"],
     ["/${local.og_image_key}"],
   )
 
@@ -63,6 +68,12 @@ locals {
       cache_control = local.favicon_cache_control
       content_type  = local.favicon_content_type
       keys          = local.favicon_keys
+    }
+    wordmark = {
+      body          = local.wordmark_svg
+      cache_control = local.wordmark_cache_control
+      content_type  = local.wordmark_content_type
+      key           = local.wordmark_key
     }
     og_image = {
       body_base64   = local.og_image_png
@@ -421,6 +432,17 @@ resource "aws_s3_object" "favicon" {
   content_type  = local.favicon_content_type
   etag          = md5(local.favicon_svg)
   cache_control = local.favicon_cache_control
+
+  tags = merge(var.tags, { Component = "qurl-link" })
+}
+
+resource "aws_s3_object" "wordmark" {
+  bucket        = aws_s3_bucket.qurl_link.id
+  key           = local.wordmark_key
+  content       = local.wordmark_svg
+  content_type  = local.wordmark_content_type
+  etag          = md5(local.wordmark_svg)
+  cache_control = local.wordmark_cache_control
 
   tags = merge(var.tags, { Component = "qurl-link" })
 }

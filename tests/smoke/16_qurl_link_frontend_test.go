@@ -47,6 +47,8 @@ package smoke
 
 import (
 	"bytes"
+	"image"
+	"image/png"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -116,6 +118,7 @@ func TestQurlLinkFrontend_RootServesConsumerLandingPage(t *testing.T) {
 
 	wantCopy := []string{
 		"Share the link. Not the exposure.",
+		"layerv-wordmark.svg",
 		"Create a secure link",
 		"Access link invalid",
 		// Source-text proxy for behavior smoke cannot execute; update it with
@@ -201,6 +204,60 @@ func TestQurlLinkFrontend_ServesCrawlerAssets(t *testing.T) {
 	if !bytes.HasPrefix(body, []byte("\x89PNG\r\n\x1a\n")) {
 		t.Fatal("qurl.link /og-image.png did not return a PNG body.")
 	}
+	assertQurlOGImageHasLayerVWordmark(t, body)
+
+	resp, body = doGet(t, testConfig.QURLLinkOrigin, "/layerv-wordmark.svg", nil)
+	assertStatusCode(t, resp, http.StatusOK)
+
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "image/svg+xml") {
+		t.Fatalf("Content-Type = %q, want image/svg+xml* (qurl.link /layerv-wordmark.svg must not fall back to index.html)", ct)
+	}
+	if !strings.Contains(string(body), "<svg") || !strings.Contains(string(body), "viewBox=") {
+		t.Fatal("qurl.link /layerv-wordmark.svg did not return the LayerV wordmark SVG body.")
+	}
+}
+
+func assertQurlOGImageHasLayerVWordmark(t *testing.T, body []byte) {
+	t.Helper()
+
+	img, err := png.Decode(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("qurl.link /og-image.png did not decode as a PNG image: %v", err)
+	}
+	if w, h := img.Bounds().Dx(), img.Bounds().Dy(); w != 1200 || h != 630 {
+		t.Fatalf("qurl.link /og-image.png dimensions = %dx%d, want 1200x630.", w, h)
+	}
+	if !qurlOGImageHasLayerVWordmarkPixels(img) {
+		t.Fatal("qurl.link /og-image.png is missing visible LayerV wordmark pixels in the expected social-preview brand area.")
+	}
+}
+
+func qurlOGImageHasLayerVWordmarkPixels(img image.Image) bool {
+	bounds := img.Bounds()
+	// README.md composites the width-preserved 244px wordmark at +80+74. Keep
+	// this deployed-origin tripwire in sync with scripts/check-qurl-link-og-image.sh,
+	// which checks the committed PNG before it reaches CloudFront.
+	// This generous region contains the placement while tolerating anti-aliasing
+	// and minor reexports; the untouched SVG source paints only a dark background here.
+	brandRegion := image.Rect(bounds.Min.X+70, bounds.Min.Y+55, bounds.Min.X+360, bounds.Min.Y+140).Intersect(bounds)
+	brandPixels := 0
+
+	for y := brandRegion.Min.Y; y < brandRegion.Max.Y; y += 2 {
+		for x := brandRegion.Min.X; x < brandRegion.Max.X; x += 2 {
+			r, g, b, a := img.At(x, y).RGBA()
+			if a < 0x8000 {
+				continue
+			}
+			r8, g8, b8 := int(r>>8), int(g>>8), int(b>>8)
+			maxChannel := max(r8, g8, b8)
+			minChannel := min(r8, g8, b8)
+			if maxChannel > 180 || (maxChannel > 80 && maxChannel-minChannel > 40) {
+				brandPixels++
+			}
+		}
+	}
+
+	return brandPixels >= 120
 }
 
 // TestQurlLinkFrontend_PostsToHostnameDerivedResolveURL fences the
