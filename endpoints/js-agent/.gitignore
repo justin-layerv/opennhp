@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# The repo root .gitignore globally ignores package-lock.json (this was a
+# Go-only repo). Re-include it here: `npm ci` in CI needs a committed lockfile
+# for reproducible, integrity-pinned installs.
+!package-lock.json

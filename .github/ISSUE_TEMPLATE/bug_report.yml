@@ -64,6 +64,7 @@ body:
       description: Match one of the commit scopes in CLAUDE.md (or pick `other` for cross-cutting). Keeps downstream triage scriptable.
       options:
         - agent
+        - js-agent
         - server
         - ac
         - admin

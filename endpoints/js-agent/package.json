@@ -1,0 +1,24 @@
+{
+  "name": "@layervai/nhp-js-agent",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Browser NHP agent (#2208): knocks the NHP-Relay over HTTPS to open access to a qURL-protected resource. Wire-compatible with the Go nhp/core implementation in this repo.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.8"
+  }
+}

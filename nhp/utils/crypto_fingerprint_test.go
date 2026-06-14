@@ -35,15 +35,13 @@ func TestPubKeyFingerprintDistinct(t *testing.T) {
 }
 
 // TestPubKeyFingerprintCrossLanguageVectors locks in the exact strings the
-// TypeScript js-agent must assert (its own fingerprint test, ported in a later
-// #2208 phase -- the js-agent does not exist in this repo yet, so for now these
-// vectors stand on their own). Once both sides exist they assert the same
-// constants; if either changes algorithm -- hash, prefix length, or base64
-// variant -- they break before a divergent build can ship.
+// TypeScript js-agent also asserts (endpoints/js-agent/test/fingerprint.test.ts,
+// landed in #2208 P6). Each suite pins its own implementation to the same two
+// constants, in its own toolchain -- the Go test never runs the TS code and the
+// js-agent CI job never runs Go. So a one-sided algorithm change (hash, prefix
+// length, or base64 variant) is caught on its own side but not cross-checked
+// here; keep the two copies equal by hand and update both files together.
 func TestPubKeyFingerprintCrossLanguageVectors(t *testing.T) {
-	// TODO(#2208): once the js-agent lands (P6), assert these same vectors in
-	// its fingerprint test so the cross-language contract is enforced on both
-	// sides, not just Go.
 	filled := make([]byte, 32)
 	for i := range filled {
 		filled[i] = 0x42

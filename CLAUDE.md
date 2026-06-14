@@ -26,6 +26,7 @@ Commit format and full details: see [`docs/COMMIT_CONVENTION.md`](docs/COMMIT_CO
 | `admin` | Operator/admin tooling (including `endpoints/licenseadmin`) |
 | `server` | NHP Server |
 | `agent` | NHP Agent |
+| `js-agent` | Browser NHP agent (`endpoints/js-agent`) |
 | `db` | Database service |
 | `nhp` | Core protocol library |
 | `internalauth` | Shared HMAC canonicalization module (cross-repo) |
