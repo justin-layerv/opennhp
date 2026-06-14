@@ -2319,6 +2319,33 @@ variable "frps_desired_capacity" {
   }
 }
 
+# FRPS ASG launch-readiness gate (qurl-reverse-tunnel-server#195). Root
+# passthroughs for the module knobs so an env can flip CONTINUE->ABANDON and
+# tune the timeout from tfvars without a code change. Defaults match the module
+# defaults exactly, so leaving them unset is a no-op. See the module's
+# variables.tf for the full rationale and the CONTINUE-first rollout phasing.
+variable "frps_launch_readiness_default_result" {
+  description = "FRPS launch-readiness hook default_result: \"CONTINUE\" (safe default) or \"ABANDON\" (post-sandbox-validation target). Passed to module.qurl_reverse_tunnel_server."
+  type        = string
+  default     = "CONTINUE"
+
+  validation {
+    condition     = contains(["CONTINUE", "ABANDON"], var.frps_launch_readiness_default_result)
+    error_message = "frps_launch_readiness_default_result must be \"CONTINUE\" or \"ABANDON\"."
+  }
+}
+
+variable "frps_launch_readiness_heartbeat_timeout" {
+  description = "FRPS launch-readiness hook heartbeat_timeout (seconds); the validator sets this from measured cold-boot. Passed to module.qurl_reverse_tunnel_server."
+  type        = number
+  default     = 600
+
+  validation {
+    condition     = var.frps_launch_readiness_heartbeat_timeout >= 60 && var.frps_launch_readiness_heartbeat_timeout <= 7200
+    error_message = "frps_launch_readiness_heartbeat_timeout must be 60-7200 seconds."
+  }
+}
+
 # Per-AZ sizing form. Default null preserves the legacy explicit triple
 # (frps_min_size / frps_max_size / frps_desired_capacity) as the source
 # of truth so existing tfvars keep working unchanged. When set, the

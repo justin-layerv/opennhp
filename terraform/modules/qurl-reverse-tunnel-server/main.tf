@@ -116,6 +116,14 @@ locals {
   # IAM boundary that lets FRPS register only to qurl reverse-tunnel services.
   frps_cloudmap_service_tags = merge(var.tags, local.frps_cloudmap_required_tags)
 
+  # Name of the EC2_INSTANCE_LAUNCHING readiness hook (qurl-reverse-tunnel-server#195).
+  # Single-sourced so the blue + green `aws_autoscaling_lifecycle_hook` resources and
+  # the `frps_launch_lifecycle_hook_name` user_data template var cannot drift — a
+  # mismatch would make `complete-lifecycle-action` target a non-existent hook and
+  # every instance would wait out `heartbeat_timeout`. Same string on both ASGs is
+  # fine: hook names are scoped per Auto Scaling group.
+  frps_launch_lifecycle_hook_name = "${var.name_prefix}-frps-launch-readiness"
+
   # ==================== Effective ASG Sizing ====================
   # Resolve the legacy explicit triple (`min_size`/`max_size`/
   # `desired_capacity`) against the new per-AZ form (`min_size_per_az`/
@@ -176,22 +184,25 @@ locals {
     # on aws_service_discovery_service would propagate that lifecycle bit
     # into the Cloud Map services. Static service names plus CBD cannot
     # replace routing_policy (AWS marks it ForceNew).
-    namespace_id                   = var.namespace_id
-    frps_az_suffixes               = var.frps_az_suffixes
-    namespace_name                 = var.namespace_name
-    log_group_name                 = aws_cloudwatch_log_group.frps.name
-    frps_bind_port                 = var.frps_bind_port
-    frps_vhost_http_port           = var.frps_vhost_http_port
-    frps_dashboard_port            = var.frps_dashboard_port
-    frps_subdomain_host            = var.frps_subdomain_host
-    qurl_api_internal_url          = var.qurl_api_internal_url
-    qurl_api_token_secret_arn      = var.qurl_api_token_secret_arn
-    nhp_server_internal_url        = var.nhp_server_internal_url
-    nhp_internal_auth_secret_arn   = var.nhp_internal_auth_secret_arn
-    connect_layerv_host            = var.connect_layerv_host
-    qurl_tunnel_auth_mode          = var.qurl_tunnel_auth_mode
-    tunnel_server_az_control_ports = var.tunnel_server_az_control_ports
-    ssm_image_tag_param            = local.ssm_image_tag_param_name
+    namespace_id         = var.namespace_id
+    frps_az_suffixes     = var.frps_az_suffixes
+    namespace_name       = var.namespace_name
+    log_group_name       = aws_cloudwatch_log_group.frps.name
+    frps_bind_port       = var.frps_bind_port
+    frps_vhost_http_port = var.frps_vhost_http_port
+    frps_dashboard_port  = var.frps_dashboard_port
+    # EC2_INSTANCE_LAUNCHING hook name user_data passes to complete-lifecycle-action
+    # (qurl-reverse-tunnel-server#195). Single-sourced with the hook resources.
+    frps_launch_lifecycle_hook_name = local.frps_launch_lifecycle_hook_name
+    frps_subdomain_host             = var.frps_subdomain_host
+    qurl_api_internal_url           = var.qurl_api_internal_url
+    qurl_api_token_secret_arn       = var.qurl_api_token_secret_arn
+    nhp_server_internal_url         = var.nhp_server_internal_url
+    nhp_internal_auth_secret_arn    = var.nhp_internal_auth_secret_arn
+    connect_layerv_host             = var.connect_layerv_host
+    qurl_tunnel_auth_mode           = var.qurl_tunnel_auth_mode
+    tunnel_server_az_control_ports  = var.tunnel_server_az_control_ports
+    ssm_image_tag_param             = local.ssm_image_tag_param_name
     # The user_data fallback command and the IAM grant must point at the
     # same bucket. Threading both from root (plugin_bucket_name + _arn)
     # instead of hardcoding the legacy `layerv-nhp-${env}-plugins` name
@@ -436,6 +447,33 @@ resource "aws_iam_role_policy" "frps" {
           "ecr:BatchGetImage"
         ]
         Resource = coalesce(var.frps_ecr_repo_arn, "arn:aws:ecr:${local.region}:${local.account_id}:repository/layerv/qurl-reverse-tunnel-server")
+      },
+      # ASG launch-readiness gate (qurl-reverse-tunnel-server#195). user_data
+      # self-completes the EC2_INSTANCE_LAUNCHING hook after the FRP readiness
+      # probe passes, so the instance reaches InService only when serving.
+      # CompleteLifecycleAction is scoped to the blue + green frps ASGs. Both
+      # colors share this role (color isolation is IMDS-driven, not IAM), so the
+      # two ASG-name ARNs are listed explicitly. The `:*:` segment wildcards the
+      # ASG's generated UUID; the name suffix is exact.
+      {
+        Sid    = "ASGCompleteLifecycleAction"
+        Effect = "Allow"
+        Action = ["autoscaling:CompleteLifecycleAction"]
+        Resource = [
+          "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.name_prefix}-frps",
+          "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.name_prefix}-frps-green",
+        ]
+      },
+      # user_data derives its own ASG name (blue vs green) at boot to target the
+      # CompleteLifecycleAction call. DescribeAutoScalingInstances does not
+      # support resource-level permissions (AWS returns AccessDenied for a
+      # non-`*` resource), so it is account-wide read-only — consistent with the
+      # CloudMapListServices `*` grant above.
+      {
+        Sid      = "ASGDescribeForReadiness"
+        Effect   = "Allow"
+        Action   = ["autoscaling:DescribeAutoScalingInstances"]
+        Resource = "*"
       },
     ]
   })
@@ -1039,4 +1077,25 @@ resource "aws_autoscaling_group" "frps" {
       error_message = "Pick exactly one ASG-sizing form: per-AZ form requires ALL THREE of {min_size_per_az, max_size_per_az, desired_capacity_per_az} to be set AND equal; legacy form requires *_per_az to be null AND uses {min_size, max_size, desired_capacity}. Half-mixes (e.g., only desired_capacity_per_az set) silently fall back to legacy `min_size` for the unset half."
     }
   }
+}
+
+# EC2_INSTANCE_LAUNCHING readiness hook for the blue frps ASG
+# (qurl-reverse-tunnel-server#195). Holds a launching/refreshed instance in
+# Pending:Wait (NOT InService) until user_data signals after the FRP readiness
+# probe passes, so ASG-health consumers (the post-deploy smoke) never select a
+# still-starting box. Separate resource (PutLifecycleHook) rather than the ASG's
+# `initial_lifecycle_hook`: the frps ASG is fixed-name and long-lived, so an
+# inline initial hook would only attach at ASG *creation* and be a no-op on the
+# existing fleet. This shares only the separate-resource *shape* with the compute
+# module's `aws_autoscaling_lifecycle_hook.termination`; the completion mechanism
+# is new — compute completes its TERMINATING hook via SNS/EventBridge -> Lambda,
+# whereas this LAUNCHING hook is self-completed by the instance's user_data (no
+# notification_target_arn/role_arn, no Lambda), since the instance is the sole
+# authority on its own readiness. The IAM grant above scopes that self-complete.
+resource "aws_autoscaling_lifecycle_hook" "frps_launch" {
+  name                   = local.frps_launch_lifecycle_hook_name
+  autoscaling_group_name = aws_autoscaling_group.frps.name
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_LAUNCHING"
+  default_result         = var.frps_launch_readiness_default_result
+  heartbeat_timeout      = var.frps_launch_readiness_heartbeat_timeout
 }

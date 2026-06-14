@@ -664,6 +664,11 @@ done
 
 if [ "$FRP_READY" != "true" ]; then
   echo "FATAL: FRP server failed to start after 60 seconds"
+  # Exit without completing the launch hook: the instance never leaves
+  # Pending:Wait, and the hook applies its default_result at heartbeat_timeout
+  # (qurl-reverse-tunnel-server#195). We deliberately do NOT signal ABANDON here
+  # — see the launch-readiness block near the end of this script for why all
+  # failures fall through to default_result uniformly.
   exit 1
 fi
 
@@ -1063,5 +1068,62 @@ systemctl daemon-reload
 systemctl enable frps-cloudmap-register
 systemctl start frps-cloudmap-register
 echo "Registered with Cloud Map as frps.${namespace_name} (with deregistration on shutdown)"
+
+# ============================================================================
+# ASG launch-readiness gate — release to InService (qurl-reverse-tunnel-server#195)
+# ============================================================================
+# The instance launched into an EC2_INSTANCE_LAUNCHING hook and has sat in
+# Pending:Wait (NOT InService) for this whole bootstrap. FRP is now serving (the
+# readiness probe above) and Cloud Map registration succeeded, so we complete the
+# hook with CONTINUE — the first point at which an ASG-health consumer (the
+# post-deploy smoke selects InService && Healthy) may safely select this box.
+#
+# This is the ONLY hook signal user_data sends, and only ever CONTINUE. Every
+# failure path before here `exit 1`s WITHOUT signaling, so a broken boot stays in
+# Pending:Wait and the hook applies its `default_result` at `heartbeat_timeout`,
+# uniformly. We never signal ABANDON from user_data (full rationale + the
+# CONTINUE-safe-default story: see `var.frps_launch_readiness_default_result`):
+# chiefly so the CONTINUE phase can't loop a broken steady-state scale-out into
+# ABANDON->relaunch, and so no EXIT trap is needed (the docker-extraction block's
+# scoped trap would clobber one). Trade-off: broken boots resolve at
+# heartbeat_timeout latency, not promptly.
+#
+# Identity is resolved at the point of use; describe-asg + complete-lifecycle-action
+# both retry, and either failing falls through to default_result (never fails boot).
+if systemctl is-active --quiet frps-cloudmap-register; then
+  FRPS_LC_IMDS=(curl -sf --max-time 5 --retry 3)
+  FRPS_LC_TOKEN=$("$${FRPS_LC_IMDS[@]}" -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)
+  FRPS_INSTANCE_ID=$("$${FRPS_LC_IMDS[@]}" -H "X-aws-ec2-metadata-token: $FRPS_LC_TOKEN" http://169.254.169.254/latest/meta-data/instance-id || true)
+  FRPS_ASG_NAME=""
+  __frps_resolve_asg_name() {
+    FRPS_ASG_NAME=$(aws autoscaling describe-auto-scaling-instances \
+      --region "$REGION" \
+      --instance-ids "$FRPS_INSTANCE_ID" \
+      --query 'AutoScalingInstances[0].AutoScalingGroupName' \
+      --output text)
+    [ -n "$FRPS_ASG_NAME" ] && [ "$FRPS_ASG_NAME" != "None" ]
+  }
+  if [ -n "$FRPS_INSTANCE_ID" ] && retry_with_backoff 5 2 20 __frps_resolve_asg_name; then
+    # A WARN below can also be a lost-ack on an ALREADY-applied CONTINUE: if the
+    # first call succeeded AWS-side but the response was dropped, the retry hits
+    # "no pending lifecycle action" and returns non-zero. The instance still
+    # proceeds to InService, so treat this WARN as informational, not a failure.
+    retry_with_backoff 5 2 20 aws autoscaling complete-lifecycle-action \
+      --region "$REGION" \
+      --auto-scaling-group-name "$FRPS_ASG_NAME" \
+      --lifecycle-hook-name "${frps_launch_lifecycle_hook_name}" \
+      --instance-id "$FRPS_INSTANCE_ID" \
+      --lifecycle-action-result CONTINUE \
+      || echo "WARN: complete-lifecycle-action CONTINUE failed after retries; instance falls through to the hook default_result at heartbeat_timeout (or a lost-ack on an already-applied CONTINUE — harmless)"
+  else
+    echo "WARN: could not resolve instance-id/ASG name; instance falls through to the hook default_result at heartbeat_timeout"
+  fi
+else
+  # Defensive/unreachable: `systemctl start frps-cloudmap-register` above runs
+  # under set -e and the unit is Type=oneshot, so a failed register already
+  # aborts the script there (unsignaled => default_result). Kept as a guard.
+  echo "FATAL: frps-cloudmap-register is not active after start; exiting without completing the hook (instance falls through to default_result at heartbeat_timeout)."
+  exit 1
+fi
 
 echo "QURL FRP server installation complete at $(date)"

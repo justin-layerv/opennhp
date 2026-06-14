@@ -385,6 +385,26 @@ resource "aws_autoscaling_group" "frps_green" {
 }
 
 # =============================================================================
+# Green Launch-Readiness Hook
+# =============================================================================
+# EC2_INSTANCE_LAUNCHING readiness hook for the green frps ASG
+# (qurl-reverse-tunnel-server#195). Same self-completed launch gate as the blue
+# `aws_autoscaling_lifecycle_hook.frps_launch` in main.tf; count-gated on
+# enable_blue_green so it exists exactly when the green ASG does. The same hook
+# name as blue is intentional — hook names are scoped per Auto Scaling group, and
+# single-sourcing via `local.frps_launch_lifecycle_hook_name` keeps user_data's
+# `complete-lifecycle-action --lifecycle-hook-name` correct for both colors.
+resource "aws_autoscaling_lifecycle_hook" "frps_launch_green" {
+  count = var.enable_blue_green ? 1 : 0
+
+  name                   = local.frps_launch_lifecycle_hook_name
+  autoscaling_group_name = aws_autoscaling_group.frps_green[0].name
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_LAUNCHING"
+  default_result         = var.frps_launch_readiness_default_result
+  heartbeat_timeout      = var.frps_launch_readiness_heartbeat_timeout
+}
+
+# =============================================================================
 # CloudWatch Alarms — Green Standby Health
 # =============================================================================
 # Mirrors the AC green-side alarms. We only emit the ASG-shape capacity

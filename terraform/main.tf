@@ -1923,6 +1923,13 @@ module "qurl_reverse_tunnel_server" {
   # See module variable doc for the full env-shape contract.
   qurl_tunnel_auth_mode = var.qurl_reverse_tunnel_server_tunnel_auth_mode
 
+  # FRPS ASG launch-readiness gate (qurl-reverse-tunnel-server#195). Defaults
+  # match the module defaults (CONTINUE / 600), so leaving these unset is a
+  # no-op; an env flips to ABANDON / tunes the timeout from tfvars after the
+  # sandbox validation in the prod-rollout ledger.
+  frps_launch_readiness_default_result    = var.frps_launch_readiness_default_result
+  frps_launch_readiness_heartbeat_timeout = var.frps_launch_readiness_heartbeat_timeout
+
   # Instance configuration
   instance_type = var.frps_instance_type
 

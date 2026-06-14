@@ -195,6 +195,65 @@ variable "frps_dashboard_port" {
   }
 }
 
+# --- FRPS ASG launch-readiness gate (qurl-reverse-tunnel-server#195) ---------
+# An EC2_INSTANCE_LAUNCHING lifecycle hook holds a refreshed/launched instance
+# in Pending:Wait (NOT InService) until user_data signals CONTINUE after the FRP
+# readiness probe passes, so ASG-health consumers (the post-deploy smoke) never
+# select a still-starting box. See the frps launch hook resources and the
+# launch-readiness gate near the end of user_data.sh.tpl.
+
+variable "frps_launch_readiness_default_result" {
+  description = <<-EOT
+    Lifecycle-hook `default_result` for the FRPS launch-readiness hook. user_data
+    only ever signals CONTINUE (on a fully healthy boot); EVERY failure path exits
+    without signaling and falls through to this `default_result` at
+    `heartbeat_timeout`. So this is the single knob governing what happens to any
+    boot that never reached the CONTINUE signal.
+
+    Defaults to the SAFE value "CONTINUE": a broken or misconfigured boot waits out
+    the timeout and is then admitted ungated (today's behavior). Because user_data
+    signals no explicit ABANDON anywhere, the CONTINUE default cannot turn a
+    steady-state scale-out of a broken image (no instance-refresh => no
+    auto_rollback) into an ABANDON->relaunch->ABANDON loop.
+
+    Flip to "ABANDON" only AFTER sandbox validation confirms (a) a healthy instance
+    actively emits CONTINUE before `heartbeat_timeout` (not a timeout fallthrough),
+    and (b) a forced-broken boot is replaced at the timeout and trips
+    instance-refresh `auto_rollback` (health_check_type=EC2 cannot otherwise detect
+    a dead FRP). ABANDON is the post-validation target because it is what lets
+    auto_rollback catch FRP-readiness failures.
+  EOT
+  type        = string
+  default     = "CONTINUE"
+
+  validation {
+    condition     = contains(["CONTINUE", "ABANDON"], var.frps_launch_readiness_default_result)
+    error_message = "frps_launch_readiness_default_result must be \"CONTINUE\" (safe default) or \"ABANDON\" (post-sandbox-validation target)."
+  }
+}
+
+variable "frps_launch_readiness_heartbeat_timeout" {
+  description = <<-EOT
+    `heartbeat_timeout` (seconds) — the maximum time an instance may sit in
+    Pending:Wait before `default_result` is applied. The clock starts at instance
+    launch, so this must exceed worst-case cold-boot for the ENTIRE user_data: apt,
+    the AWS CLI install, the container image pull (the dominant cost), config, the
+    ~60s FRP readiness window, and Cloud Map registration. Because user_data signals
+    only CONTINUE, this timeout is ALSO the latency before a broken boot resolves to
+    `default_result`. Default 600 is a starting point; the sandbox validator should
+    measure real cold-boot from launch and set this from data.
+  EOT
+  type        = number
+  default     = 600
+
+  validation {
+    # AWS allows 30..7200s; floor at 60 so a fat-fingered tiny value can't
+    # ABANDON every healthy-but-still-booting instance.
+    condition     = var.frps_launch_readiness_heartbeat_timeout >= 60 && var.frps_launch_readiness_heartbeat_timeout <= 7200
+    error_message = "frps_launch_readiness_heartbeat_timeout must be 60-7200 seconds (AWS lifecycle-hook bound; floored at 60 to leave room for cold-boot)."
+  }
+}
+
 variable "frps_subdomain_host" {
   description = "Subdomain host for FRP vhost routing (e.g., qurl.site). MUST match the qurl-router base domain (`qurl_router_config.base_domain` in root main.tf) so customer tunnel registrations resolve correctly. Threaded from `var.qurl_site_domain` at the root so sandbox (qurl.site.layerv.xyz) and prod (qurl.site) don't drift. The default below exists for isolated-module testing only."
   type        = string
