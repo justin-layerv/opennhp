@@ -106,7 +106,27 @@ const (
 	MetricKnockForwardFailure        = "KnockForwardFailure"
 	MetricKnockForwardSkippedDead    = "KnockForwardSkippedDead"
 	MetricKnockForwardFallback       = "KnockForwardFallback"
-	MetricCloudMapDeregisterFailure  = "CloudMapDeregisterFailure"
+	// MetricRelayForward counts every NHP_RLY packet (relay-forwarded agent
+	// knock, #2208) RECEIVED past the outer Noise auth. It is incremented at
+	// handler entry, BEFORE the relay-peer / source / inner-packet validation,
+	// so it includes forwards that are then dropped (MetricRelayForwardReject).
+	// processed = RelayForward − RelayForwardReject is the count that REACHED the
+	// knock pipeline (buildKnockAck), and only those also tick MetricKnockRequest
+	// — so relay traffic stays separable from direct knocks without double-
+	// counting. Note: processed means "reached the pipeline", NOT "delivered" —
+	// the two rare post-auth internal-failure paths (ack marshal failure,
+	// relay-ack send failure) land in processed but deliver no ack. They aren't
+	// worth a dedicated counter. (P5/P7 alarm authors: read processed as the
+	// difference, and treat it as ~delivered modulo those rare internal failures.)
+	MetricRelayForward = "RelayForward"
+	// MetricRelayForwardReject counts NHP_RLY packets dropped before the inner
+	// knock is authenticated — unregistered relay peer, bad relay-reported
+	// SourceAddr, malformed/oversize inner packet, non-knock inner type, or a
+	// missing inner agent pubkey. These are pre-auth drops with no ack sent
+	// (there is no authenticated agent to encrypt one for); auth REJECTS after
+	// the inner decrypt are delivered as acks and counted by MetricAuthFailure.
+	MetricRelayForwardReject        = "RelayForwardReject"
+	MetricCloudMapDeregisterFailure = "CloudMapDeregisterFailure"
 	// MetricShutdownTransactionDrainTimeout increments when graceful shutdown's
 	// in-flight transaction drain exhausts its budget with non-zero local
 	// transactions still outstanding — those transactions will return

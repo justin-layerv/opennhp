@@ -2581,6 +2581,10 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 	case core.NHP_FRT:
 		go s.HandleForwardResult(ppd)
 
+	// NHP-Relay forwarded agent knock (#2208)
+	case core.NHP_RLY:
+		go s.HandleRelayForward(ppd)
+
 	default:
 		// An unknown HeaderType reaching here means the upstream
 		// parser accepted a type this dispatcher doesn't route —
