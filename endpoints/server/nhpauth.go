@@ -15,10 +15,41 @@ import (
 
 // HandleKnockRequest
 // Server will respond with success or error with NHP_ACK message
-func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
+func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) error {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
+	ackBytes, userId, err := s.buildKnockAck(ppd)
+	if err != nil {
+		// Only a marshal failure reaches here; the ack cannot be sent.
+		// An auth REJECT is not this error — it rides inside ackBytes
+		// (ackMsg.ErrCode) and is still delivered below, matching the
+		// pre-extraction behavior where the closure's error was overwritten
+		// by the send result.
+		return err
+	}
+
+	ackMd := makeMsgData(ppd, core.NHP_ACK, ackBytes)
+	return s.forwardToTransaction(ppd.ConnData, ppd.SenderTrxId, ackMd, "server-agent", "HandleKnockRequest", userId, ppd.ConnData.RemoteAddr.String())
+}
+
+// buildKnockAck runs the knock authorization pipeline for ppd and returns the
+// marshaled ACK bytes (NHP_ACK, or the DHP ack for DHP_KNK), the agent user id
+// (for the caller's send-path log tag), and a non-nil error ONLY when the ack
+// itself cannot be marshaled. An auth REJECT is not such an error: the verdict
+// is encoded in the returned bytes (ackMsg.ErrCode) and the caller still sends
+// it so the agent sees the reject.
+//
+// The source address used for the AC pinhole, the echoed AgentAddr, and the log
+// tags is ppd.ConnData.RemoteAddr. The NHP_RLY relay path (#2208) decrypts the
+// forwarded inner knock onto a synthetic ppd whose ConnData.RemoteAddr is the
+// relay-reported client IP, so this pipeline needs no source-address parameter
+// to serve both the direct and the relayed knock paths.
+//
+// Extracted from HandleKnockRequest so the relay handler can reuse the exact
+// knock pipeline while replying through the relay (EncryptedPktCh + WriteToUDP)
+// instead of forwardToTransaction.
+func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, error) {
 	knockStart := time.Now()
 	s.metrics.IncrCounter(MetricKnockRequest)
 
@@ -42,18 +73,26 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		OpenTime: 30, // currently, use fixed value, unit is seconds.
 	}
 
+	// closureErr is the closure's internal control-flow signal ONLY — it is
+	// deliberately a local, NOT a named return. An auth reject rides in
+	// ackMsg.ErrCode and must still be delivered, so buildKnockAck returns an
+	// explicit nil error on the success-marshal path; only a marshal failure
+	// returns non-nil. Keeping this a local makes a stray bare `return` a
+	// compile error rather than a silent ack-suppression regression.
+	var closureErr error
+
 	func() {
 		// parse knockMsg
 		if ppd.HeaderType == core.DHP_KNK { // dhp knock
-			err = json.Unmarshal(ppd.BodyMessage, dhpKnkMsg)
+			closureErr = json.Unmarshal(ppd.BodyMessage, dhpKnkMsg)
 		} else {
-			err = json.Unmarshal(ppd.BodyMessage, knkMsg)
+			closureErr = json.Unmarshal(ppd.BodyMessage, knkMsg)
 		}
 
-		if err != nil {
-			log.Error("server-agent(#%d@%s)[HandleKnockRequest] failed to parse %s message: %v", transactionId, addrStr, core.HeaderTypeToString(ppd.HeaderType), err)
+		if closureErr != nil {
+			log.Error("server-agent(#%d@%s)[HandleKnockRequest] failed to parse %s message: %v", transactionId, addrStr, core.HeaderTypeToString(ppd.HeaderType), closureErr)
 			ackMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
-			ackMsg.ErrMsg = err.Error()
+			ackMsg.ErrMsg = closureErr.Error()
 			return
 		}
 
@@ -91,9 +130,9 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 			// →52011. Centralizing the error in the side-effect
 			// wrapper means the caller can't get the mapping
 			// wrong on a future refactor.
-			err = rejectErr
+			closureErr = rejectErr
 			ackMsg.ErrCode = rejectErr.ErrorCode()
-			ackMsg.ErrMsg = err.Error()
+			ackMsg.ErrMsg = closureErr.Error()
 			// Closure return: the outer HandleKnockRequest flow still
 			// marshals ackMsg and forwards NHP_ACK via the normal ack
 			// path. A legitimate agent sees 52009/52010/52011 and
@@ -118,7 +157,8 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		// through to the auth handler unchanged.
 		if s.agentPeerLookup != nil {
 			if resolveErr := s.resolveAgentPeerForKnock(ppd, knkMsg, ackMsg, transactionId, addrStr); resolveErr != nil {
-				err = resolveErr
+				// resolveAgentPeerForKnock has already populated ackMsg.ErrCode/
+				// ErrMsg; the reject rides in the ack, so just stop the pipeline.
 				return
 			}
 		}
@@ -133,9 +173,9 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 				fmt.Sprintf("HandleKnockRequest-Auth agent=%s tx=%d remote=%s", knkMsg.UserId, transactionId, addrStr))
 		}
 		if aspData == nil {
-			err = common.ErrAuthServiceProviderNotFound
+			closureErr = common.ErrAuthServiceProviderNotFound
 			ackMsg.ErrCode = common.ErrAuthServiceProviderNotFound.ErrorCode()
-			ackMsg.ErrMsg = err.Error()
+			ackMsg.ErrMsg = closureErr.Error()
 			// MetricAuthFailure attribution is owned by
 			// ResolveAuthSvcProvider: it fires on auth-policy-outcome
 			// branches (unknown aspId, no resource lookup wired AND no
@@ -150,9 +190,9 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		handler := s.FindPluginHandler(knkMsg.AuthServiceId)
 		if handler == nil {
 			log.Error("server-agent(%s#%d@%s)[HandleKnockRequest-Auth] failed to find service provider with %s", knkMsg.UserId, transactionId, addrStr, knkMsg.AuthServiceId)
-			err = common.ErrAuthServiceProviderNotFound
+			closureErr = common.ErrAuthServiceProviderNotFound
 			ackMsg.ErrCode = common.ErrAuthServiceProviderNotFound.ErrorCode()
-			ackMsg.ErrMsg = err.Error()
+			ackMsg.ErrMsg = closureErr.Error()
 			return
 		}
 
@@ -168,9 +208,9 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		}
 
 		// perform knock auth and open ip rule from the agent src address and resource dst address
-		ackMsg, err = handler.AuthWithNHP(authReq, s.NewNhpServerHelper(ppd, aspData))
-		if err != nil {
-			log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] failed: %+v", knkMsg.UserId, transactionId, addrStr, err)
+		ackMsg, closureErr = handler.AuthWithNHP(authReq, s.NewNhpServerHelper(ppd, aspData))
+		if closureErr != nil {
+			log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] failed: %+v", knkMsg.UserId, transactionId, addrStr, closureErr)
 			s.metrics.IncrCounter(MetricAuthFailure)
 			return
 		}
@@ -183,11 +223,11 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 	// Record knock processing latency
 	s.metrics.RecordLatency(MetricKnockLatency, float64(time.Since(knockStart).Milliseconds()))
 
-	// send back knock ack response
+	// marshal the knock ack response; the caller sends it
 	ackBytes, marshalErr := json.Marshal(ackMsg)
 	if marshalErr != nil {
 		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] failed to marshal ack message: %v", knkMsg.UserId, transactionId, addrStr, marshalErr)
-		return marshalErr
+		return nil, knkMsg.UserId, marshalErr
 	}
 
 	// DHP knock
@@ -195,13 +235,11 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		ackBytes, marshalErr = json.Marshal(dhpAckMsg)
 		if marshalErr != nil {
 			log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] failed to marshal DHP ack message: %v", knkMsg.UserId, transactionId, addrStr, marshalErr)
-			return marshalErr
+			return nil, knkMsg.UserId, marshalErr
 		}
 	}
 
-	ackMd := makeMsgData(ppd, core.NHP_ACK, ackBytes)
-
-	return s.forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleKnockRequest", knkMsg.UserId, addrStr)
+	return ackBytes, knkMsg.UserId, nil
 }
 
 // resolveAgentPeerForKnock looks the presented agent pubkey up
