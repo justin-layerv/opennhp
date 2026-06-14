@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	nhpserver "github.com/OpenNHP/opennhp/endpoints/server"
@@ -34,7 +35,24 @@ var (
 	// invalid data (e.g., missing resources, nil addresses). This is distinct
 	// from token/policy errors and indicates a configuration issue.
 	ErrInvalidResolveResponse = errors.New("invalid resolve response")
+
+	// ErrQurlAccessDenied indicates qurl-service has no active session for the
+	// (resource_id, client_ip) pair — the knock is cryptographically
+	// authenticated but the client is not authorized right now (403/404/410
+	// from the /authorize endpoint). The agent must re-resolve via the qURL
+	// link to mint a fresh session. Distinct from a transient API failure.
+	ErrQurlAccessDenied = errors.New("qurl access denied: no active session")
 )
+
+// AuthorizeResult is the decision returned by qurl-service
+// GET /internal/v1/resource/:id/authorize. RemainingSeconds is the session's
+// remaining lifetime (used to cap the AC pinhole). Tunnel marks a reverse-
+// tunnel resource, which is authorized via a different flow and not servable
+// on the browser knock path.
+type AuthorizeResult struct {
+	RemainingSeconds uint32 `json:"remaining_seconds"`
+	Tunnel           bool   `json:"tunnel,omitempty"`
+}
 
 // ResolveRequest represents a request to validate and consume a QURL access token.
 // This is sent to the QURL API internal endpoint for token resolution.
@@ -242,6 +260,58 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 	}
 
 	return internalResp.Data, nil
+}
+
+// Authorize asks qurl-service whether clientIP currently holds an active
+// session for resourceID (an r_ resource id). This is the token-less,
+// idempotent, IP-scoped session check the NHP knock path uses — the same one
+// qurl-router runs per HTTP request — so a re-knock or relay-forwarded knock
+// (#2208) re-consults the live session without a token.
+//
+// Returns the decision on HTTP 200; ErrQurlAccessDenied on 403/404/410 (no
+// active session / unknown / expired); ErrInvalidResolveResponse on a
+// malformed 200 body; and a wrapped transient error otherwise.
+func (r *QurlResolver) Authorize(ctx context.Context, resourceID, clientIP, requestID string) (*AuthorizeResult, error) {
+	if r.serviceToken == "" {
+		return nil, errors.New("service token is empty - cannot authenticate with QURL API")
+	}
+
+	authURL := fmt.Sprintf("%s/internal/v1/resource/%s/authorize?client_ip=%s",
+		r.baseURL, url.PathEscape(resourceID), url.QueryEscape(clientIP))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, authURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create authorize request: %w", err)
+	}
+	httpReq.Header.Set(ServiceTokenHeader, r.serviceToken)
+	if requestID != "" {
+		httpReq.Header.Set(nhpserver.RequestIDHeader, requestID)
+	}
+
+	resp, err := r.httpClient.Do(httpReq) //nolint:gosec // G704: baseURL from QURL_API_URL env var with schema validation
+	if err != nil {
+		return nil, fmt.Errorf("failed to call QURL authorize API: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read authorize response: %w", err)
+	}
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var out AuthorizeResult
+		if err := json.Unmarshal(body, &out); err != nil {
+			return nil, fmt.Errorf("%w: %s", ErrInvalidResolveResponse, err.Error())
+		}
+		return &out, nil
+	case http.StatusForbidden, http.StatusNotFound, http.StatusGone:
+		// 403 no active session for this client; 404 unknown resource; 410
+		// expired/consumed/revoked — all map to "not authorized now".
+		return nil, ErrQurlAccessDenied
+	default:
+		return nil, fmt.Errorf("qurl authorize returned status %d", resp.StatusCode)
+	}
 }
 
 // validateResolveResponse checks that the QURL API returned all fields

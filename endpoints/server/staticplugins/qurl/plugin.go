@@ -57,10 +57,13 @@ func (p *Plugin) ListService(req *common.NhpListRequest, helper *plugins.NhpServ
 	return nil, plugins.ErrPluginNotRegistered
 }
 
-// AuthWithNHP handles NHP protocol authentication (not implemented for QURL plugin)
-// QURL uses HTTP-based authentication via qurl.link SPA
+// AuthWithNHP authorizes an NHP knock for a qURL resource and opens the AC
+// pinhole. It is the knock-path counterpart of AuthWithHttp: the token-based
+// HTTP path resolves+mints a session via /resolve, while the knock path (direct
+// re-knock or relay-forwarded, #2208) carries no token and instead consults the
+// existing session via qurl-service /authorize. See authnhp.go.
 func (p *Plugin) AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
-	return nil, plugins.ErrPluginNotRegistered
+	return AuthWithNHP(req, helper)
 }
 
 // AuthWithHttp handles HTTP-based authentication for QURL access tokens

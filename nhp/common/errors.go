@@ -206,6 +206,15 @@ var (
 	// chasing a duplicate-spike alert is not misled by an upstream
 	// invariant violation.
 	ErrServerMissingPeerPubkey = newError("52023", "missing peer pubkey on server transaction")
+	// ErrQurlSessionExpired — the qURL plugin's AuthWithNHP (#2208) got a deny
+	// from qurl-service /authorize: the knock is cryptographically authenticated
+	// but the client IP has no active session for the resource (session expired,
+	// revoked, or never established from this IP). Distinct from
+	// ErrBackendAuthRequired (52007, "supply backend credentials like a
+	// passcode") because the agent's correct reaction is to RE-RESOLVE via the
+	// qURL link to mint a fresh session, not to present a credential. The
+	// js-agent (P6) branches on this code.
+	ErrQurlSessionExpired = newError("52024", "qurl session expired or not authorized for this client")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")
