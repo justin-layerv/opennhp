@@ -21,9 +21,10 @@ import (
 //
 // The persisted item shape (acktoken.PersistedItem), the marshalers
 // (acktoken.ItemFromEntry / EntryFromItem), and the token hasher
-// (acktoken.HashToken) live in endpoints/internal/acktoken so the AC daemon
-// can read this same store without importing package server. nhp-server
-// remains the sole WRITER (StoreACToken); the AC is read-only.
+// (acktoken.HashToken) live in endpoints/internal/acktoken so the wire schema
+// has a single definition that a future fleet-visible reader could share
+// without importing package server. Today nhp-server is the only writer
+// (StoreACToken) and reader (its /token/validate handler).
 type ackTokenStore interface {
 	StoreACToken(ctx context.Context, token string, entry *ACTokenEntry) error
 	LoadACToken(ctx context.Context, token string) (*ACTokenEntry, bool, error)

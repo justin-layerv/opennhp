@@ -1,6 +1,16 @@
 # Knock-Token Validator Placement (AC vs. nhp-server)
 
-## Status: Proposed (2026-06)
+## Status: Withdrawn (2026-06)
+
+> **Withdrawn — not pursued.** The AC-side validator (PR #2528) was closed
+> unbuilt. An end-to-end trace found its only would-be consumer
+> (qurl-reverse-tunnel-server#98) validates against **nhp-server's**
+> `/nhp/internal/token/validate`, not the AC; and end-agent access is already
+> enforced spec-compliantly by the AC's L3 pinhole (NHP-AOP), so no AC validator
+> was needed. nhp-server remains the sole validator. The
+> `endpoints/internal/acktoken` type extraction (PR #2527) was kept; its dead AC
+> read store was removed in PR #2544. The Fork A vs. Fork B analysis below is
+> preserved as design history.
 
 **Author:** Justin
 **Issue:** [layervai/nhp#2032](https://github.com/layervai/nhp/issues/2032)

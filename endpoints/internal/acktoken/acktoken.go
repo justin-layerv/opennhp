@@ -1,12 +1,13 @@
-// Package acktoken holds the shared AC-issued ACK-token entry type and its
-// fleet-visible DynamoDB read path, so both nhp-server (which WRITES the
-// entries) and the AC daemon (which validates against them) share one
-// definition of the wire schema without the AC importing package server.
+// Package acktoken holds the AC-issued ACK-token entry type and its
+// DynamoDB wire/marshaling helpers. nhp-server uses it to WRITE entries to
+// the shared store on ACK issuance and to read them back in its own
+// /nhp/internal/token/validate handler. The type lives here (rather than in
+// package server) so the wire schema has a single definition that a future
+// fleet-visible reader could share without importing package server.
 //
-// nhp-server remains the sole WRITER of these entries — it stamps
-// server-resolved fields (KnockSrcIP, owner_id, RunID) the AC cannot derive
-// from the NHP-AOP message. The AC is read-only against this store. See
-// docs/design/KNOCK_TOKEN_VALIDATOR_PLACEMENT.md.
+// nhp-server stamps server-resolved fields (KnockSrcIP, owner_id, RunID) that
+// downstream consumers of /nhp/internal/token/validate cross-check against the
+// presented token.
 package acktoken
 
 import (
@@ -25,8 +26,8 @@ const ttlGraceSeconds int64 = 60
 
 // ACTokenEntry represents an AC-issued ACK token entry with user and AC
 // token information. It is the value nhp-server stores in
-// common.TokenStore[*ACTokenEntry] and persists to the shared store; the
-// AC validator reads it back via a Reader.
+// common.TokenStore[*ACTokenEntry] and persists to the shared store, then
+// reads back in its /nhp/internal/token/validate handler.
 //
 // KnockSrcIP is the IP the agent knocked from — a server-stamped field the
 // AC cannot derive from NHP-AOP (the AOP source IP can differ from the
