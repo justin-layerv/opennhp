@@ -258,6 +258,99 @@ what **OpenNHP**, the spec's official open-source reference implementation
 (Appendix 1, p. 47), does. Matching the reference implementation keeps us
 interoperable with the canonical NHP ecosystem.
 
+## Cloud deployment: cells & autoscaling
+
+### Cell routing
+
+The relay is LayerV's **cell router**. We run one cloud cell today and will add
+more; each cell is an independent stack (its own NHP-Server + AC fleet,
+qurl-service, DynamoDB). Because the relay is the single internet-facing surface,
+it is the natural place to route a browser's knock to the customer's cell — which
+is exactly upstream's **multi-cluster relay model**: `POST /relay/{serverId}`,
+where `serverId` is a cell's **server-pubkey fingerprint**, and the relay holds one
+config entry per cell (fingerprint → that cell's endpoint + server pubkey). So
+**one cell = one entry**; adding a cell is a config change, not a protocol change.
+This is why P2's `utils.PubKeyFingerprint` is the cell-routing key, and why the
+multi-cluster routing is **ported, not stripped** (upstream `d0836539`).
+
+**Customer→cell mapping lives in the control plane, not the relay.** The knock is
+end-to-end encrypted and opaque to the relay, so the relay *cannot* see the
+customer — it routes by the opaque `serverId` only ("forwarder, not trust anchor").
+The customer→cell decision belongs in **qurl-service**, which already owns the
+customer→resource resolve: at `qurl.link` resolve time it returns the cell's
+`serverId` + server pubkey, and the JS-agent then `POST`s to `/relay/{serverId}`.
+A customer is "homed" to one cell (their resources/AC live there); qurl-service's
+mapping must stay consistent with that homing — a wrong `serverId` routes to a cell
+without the customer's resource and the knock fails.
+
+**Build the seam now, deploy single-cell.** With one cell, the JS-agent still
+addresses `/relay/{serverId}` and resolve still returns a `serverId` — just a
+constant today. The per-customer mapping and extra relay config entries activate
+when cell 2 arrives, with no protocol or relay change. This keeps the contract
+multi-cell-ready without building the mapping logic yet.
+
+This seam is already partly real in the IaC, not just aspirational:
+`terraform/modules/compute` carries a `cell_id` variable, tags resources with
+`Cell = var.cell_id`, and documents the `${name_prefix}[-${cell_id}]-server` secret
+convention (current cell today, `cell{N}` next) — so the relay's per-cell config and
+secret naming slot into an existing cell model.
+
+### Autoscaling
+
+The relay composes with NHP-Server/AC autoscaling because it rides today's
+shared-key model ([`PER_INSTANCE_SERVER_KEYS.md`](PER_INSTANCE_SERVER_KEYS.md): all
+servers in an ASG share one keypair, so any instance behind the NLB decrypts). That
+doc plans to migrate *direct* connections to per-instance keys, but **retains** the
+shared key for the NLB/registration path the relay uses (see coupling #1 below), so
+the relay's footing is stable:
+
+- **Relay fleet** — now availability-critical (the only internet-facing surface), so
+  it must autoscale. Give the relay fleet a **single shared keypair**, mirroring the
+  server's shared-ASG-key in Secrets Manager. The real convention is
+  `${name_prefix}[-${cell_id}]-<component>` (`terraform/modules/compute/main.tf:9-14`):
+  the *server* secret is per-cell (`nhp-{env}-server` for the current cell,
+  `nhp-{env}-cell{N}-server` for future ones, since server fleets are per-cell). The
+  relay secret stays **singular** — `nhp-{env}-relay`, with no `cell{N}` variant —
+  because one relay fleet fronts *all* cells and routes by `serverId`; a per-cell
+  relay secret would imply a per-cell relay identity, contradicting the shared-router
+  model (the stale assumption P5/P6 must not bake in). Then `relay.toml` stays a
+  one-entry trust list and relay scale-out
+  is a non-issue. The relay holds no session keys (inner crypto is end-to-end), so
+  the shared identity's blast radius is just its source-IP trust. **Avoid
+  per-instance relay keys** — they would force a dynamic registry.
+- **Relay→cell-server handshake** — the relay handshakes to each cell's **shared
+  server endpoint key** (the same one agents/ACs use via the NLB/CloudMap), so any
+  healthy instance in that cell decrypts; server scale/refresh is transparent.
+- **`relay.toml` under server autoscaling** — the shared relay pubkey is delivered to
+  **every** server instance (and every cell) via the normal config path, so each
+  scaled-out / blue-green / refreshed server trusts the relay from boot; no
+  registration race.
+
+**Two forward-looking couplings to not lose:**
+
+1. The relay forwards through the NLB/CloudMap to each cell's **shared
+   registration/endpoint key** — the same path the planned
+   **per-instance-server-keys** migration explicitly *retains* (that doc's collision
+   is specific to an AC opening *direct* connections to multiple per-instance
+   servers, which the relay never does). So the relay is implicitly covered **as long
+   as that shared key is retained**; the watch-item is the converse — if the shared
+   registration key is ever dropped entirely, the relay→server path needs its own
+   per-cell-key story.
+2. The static `relay.toml` load path already exists (P3a — `updateRelayPeers` /
+   `relayPeerMap`), so the wipe hazard below is a real path, not hypothetical. If a
+   **dynamic relay registry** (DDB / `NHP_AOL`-style) ever replaces `relay.toml`, it
+   would need the *same kind* of boot guard `agent.toml` already has — the
+   server-side check in [`endpoints/server/config.go`](../../endpoints/server/config.go)
+   that refuses boot when `agent.toml` coexists with a cloud DDB *agent* registry (a
+   pattern to replicate; there is **no** equivalent `relay.toml` guard today) —
+   otherwise a `relay.toml` watcher fire would wipe DDB-resolved relay peers. Tracked
+   as a tripwire in #2541.
+
+**The relay is cross-cell shared infra:** its availability and routing affect all
+cells (its blast radius is cross-cell *routing / source-IP*, never sessions), and a
+new cell must be in the relay's config **before** qurl-service assigns customers to
+it.
+
 ## Decision: re-knock authorization
 
 **Decision: option (a) — the server re-consults qurl-service on every re-knock.**

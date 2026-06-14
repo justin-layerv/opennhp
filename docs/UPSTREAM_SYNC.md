@@ -40,7 +40,7 @@ previously-skipped commits must be **ported** (tracked under #2208):
 | `bf927049` | feat(relay): add nhp-relay component | Port (the relay; HTTPS POST). |
 | `e2c5336a` | fix(security): relay DoS + source IP validation | **Port — security; lands with the relay/handler.** |
 | `ad98e1f4` | fix(server-http): tighten XFF defence | **Port — security; adapt to our X-Real-IP front door.** |
-| `d0836539` | feat(relay): multi-cluster via pubkey-derived id | Port the `/relay/{serverId}` addressing; the multi-cluster load-balancer is intentionally **stripped** (we target one logical server via CloudMap + the `NHP_FWD` mesh). |
+| `d0836539` | feat(relay): multi-cluster via pubkey-derived id | **Port as the cell router** (reverses the earlier "strip the multi-cluster load-balancer" call) — `/relay/{serverId}` routes per cell. Rationale + the per-cell-LB-retained detail: `docs/design/NHP_RELAY_TOPOLOGY.md` → Cloud deployment. |
 | `6709d00c`, `cc36a684` | feat(js-agent): browser SDK + CBOR | Port the JS agent (`relay.ts` HTTPS transport). |
 
 GMSM/SM2/SM3/SM4 paths inside these commits remain auto-skipped per the catalog
