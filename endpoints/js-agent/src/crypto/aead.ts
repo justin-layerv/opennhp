@@ -31,10 +31,14 @@ export const AEAD_TAG_SIZE = 16;
 // change the wire crypto without erroring.
 function assertKeyAndNonce(key: Uint8Array, nonce: Uint8Array): void {
   if (key.length !== AEAD_KEY_SIZE) {
-    throw new Error(`AES-256-GCM key must be ${AEAD_KEY_SIZE} bytes, got ${key.length}`);
+    throw new Error(
+      `AES-256-GCM key must be ${AEAD_KEY_SIZE} bytes, got ${key.length}`,
+    );
   }
   if (nonce.length !== AEAD_NONCE_SIZE) {
-    throw new Error(`AES-256-GCM nonce must be ${AEAD_NONCE_SIZE} bytes, got ${nonce.length}`);
+    throw new Error(
+      `AES-256-GCM nonce must be ${AEAD_NONCE_SIZE} bytes, got ${nonce.length}`,
+    );
   }
 }
 

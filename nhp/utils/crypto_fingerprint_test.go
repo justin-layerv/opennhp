@@ -38,24 +38,29 @@ func TestPubKeyFingerprintDistinct(t *testing.T) {
 // TypeScript js-agent also asserts (endpoints/js-agent/test/fingerprint.test.ts,
 // landed in #2208 P6). Each suite pins its own implementation to the same two
 // constants, in its own toolchain -- the Go test never runs the TS code and the
-// js-agent CI job never runs Go. So a one-sided algorithm change (hash, prefix
-// length, or base64 variant) is caught on its own side but not cross-checked
-// here; keep the two copies equal by hand and update both files together.
+// js-agent CI job never runs Go. The two copies no longer drift silently:
+// scripts/check-golden-vectors.sh (wired into CI) extracts the marked
+// consts below and the js-agent test's, and fails if they disagree -- so a
+// one-sided algorithm change (hash, prefix length, or base64 variant) is caught
+// at PR time. Keep each nhp-golden-vector label matched with the TS test.
 func TestPubKeyFingerprintCrossLanguageVectors(t *testing.T) {
+	const wantFill0x42 = "Ql7U5KNrMOo" // nhp-golden-vector: fill-0x42
+	const wantSeq1To32 = "riFsLvUkejc" // nhp-golden-vector: seq-1to32
+
 	filled := make([]byte, 32)
 	for i := range filled {
 		filled[i] = 0x42
 	}
-	if got := PubKeyFingerprint(filled); got != "Ql7U5KNrMOo" {
-		t.Fatalf("fill(0x42) fingerprint = %q, want %q", got, "Ql7U5KNrMOo")
+	if got := PubKeyFingerprint(filled); got != wantFill0x42 {
+		t.Fatalf("fill(0x42) fingerprint = %q, want %q", got, wantFill0x42)
 	}
 
 	seq := make([]byte, 32)
 	for i := range seq {
 		seq[i] = byte(i + 1)
 	}
-	if got := PubKeyFingerprint(seq); got != "riFsLvUkejc" {
-		t.Fatalf("[1..32] fingerprint = %q, want %q", got, "riFsLvUkejc")
+	if got := PubKeyFingerprint(seq); got != wantSeq1To32 {
+		t.Fatalf("[1..32] fingerprint = %q, want %q", got, wantSeq1To32)
 	}
 }
 

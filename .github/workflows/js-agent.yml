@@ -1,16 +1,25 @@
 name: js-agent
 
-# Build + test the browser NHP agent (endpoints/js-agent, #2208). Path-scoped to
-# that directory so it does not run on unrelated Go/Terraform changes. The
-# fingerprint test asserts the same golden vectors as the Go test in
-# nhp/utils/crypto_fingerprint_test.go, so it catches a regression in the
-# TypeScript wire-addressing; the two vector copies are kept in sync by hand
-# (this job never runs Go — see that test's comment).
+# Build, lint, and test the browser NHP agent (endpoints/js-agent, #2208).
+# Path-scoped to that directory so it does not run on unrelated Go/Terraform
+# changes.
 #
-# Branch-protection note: because this workflow is path-filtered, do NOT make it
-# a *required* status check as-is — GitHub leaves a required path-filtered check
-# "pending" forever on PRs that don't touch endpoints/js-agent/**. Keep it
-# non-required, or pair it with a path-aware always-green shim.
+# Two jobs:
+#   test    — runs the vitest suite on every supported Node: the declared
+#             engines.node floor (20) and the toolchain pin (22), so a
+#             version-specific regression is actually caught.
+#   quality — runs the version-independent gates once (npm audit, ESLint,
+#             Prettier, tsc typecheck).
+#
+# The Go↔TS golden-vector parity check (fingerprint + KDF) is intentionally NOT
+# here: it lives in validate-workflows.yml (scripts/check-golden-vectors.sh),
+# which triggers on edits to any of the vector files — including the Go-side
+# ones, which this path-scoped workflow never sees.
+#
+# Branch-protection note: because this workflow is path-filtered, do NOT make
+# its checks *required* as-is — GitHub leaves a required path-filtered check
+# "pending" forever on PRs that don't touch endpoints/js-agent/**. Keep them
+# non-required, or pair with a path-aware always-green shim.
 on:
   push:
     branches: [main]
@@ -31,7 +40,35 @@ concurrency:
 
 jobs:
   test:
-    name: js-agent build + test
+    name: js-agent test (node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't cancel the 22 run if 20 fails (or vice versa) — a floor-only
+      # regression is exactly what this matrix exists to surface, so show both.
+      fail-fast: false
+      matrix:
+        # Keep to the even LTS lines vitest 4 supports
+        # (^20 || ^22 || >=24). '20' is the engines.node floor; '22' is the pin.
+        node-version: ['20', '22']
+    defaults:
+      run:
+        working-directory: endpoints/js-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Set up Node ${{ matrix.node-version }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: endpoints/js-agent/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Test
+        run: npm test
+
+  quality:
+    name: js-agent quality (lint + typecheck + audit)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -49,12 +86,14 @@ jobs:
         run: npm ci
       - name: Audit (production deps)
         # Gate the shipped browser surface — runtime deps only. The dev
-        # toolchain (vitest/esbuild/tsc) never reaches users, and pinning the
-        # build to dev-only advisories that often have no fix would flap this
-        # job; the runtime surface is what must stay clean. --audit-level=high
-        # fails on high + critical.
+        # toolchain (vitest/esbuild/tsc/eslint/prettier) never reaches users,
+        # and pinning the build to dev-only advisories that often have no fix
+        # would flap this job; the runtime surface is what must stay clean.
+        # --audit-level=high fails on high + critical.
         run: npm audit --omit=dev --audit-level=high
+      - name: Lint (ESLint)
+        run: npm run lint
+      - name: Format check (Prettier)
+        run: npm run format:check
       - name: Typecheck
         run: npm run build
-      - name: Test
-        run: npm test

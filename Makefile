@@ -359,6 +359,9 @@ lint-workflows:
 	@bash scripts/check-smoke-tier-filter-coverage.sh
 	@bash scripts/check-cert-cleanup-log-gate-unique.sh
 	@bash scripts/check-cleanup-event-type-lockstep.sh
+	@shellcheck scripts/check-golden-vectors.sh tests/scripts/check-golden-vectors_test.sh
+	@bash tests/scripts/check-golden-vectors_test.sh
+	@bash scripts/check-golden-vectors.sh
 	@bash scripts/check-lockdown-body-drift.sh
 	@bash scripts/check-frps-az-suffixes-validation-drift.sh
 	@bash tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh

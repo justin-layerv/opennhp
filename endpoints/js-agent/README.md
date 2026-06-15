@@ -48,6 +48,19 @@ SHA-256 / HMAC), `@noble/curves` (X25519), and `@noble/ciphers` (AES-256-GCM).
 ```sh
 cd endpoints/js-agent
 npm ci
-npm test        # vitest — Go-golden-vector fences (fingerprint, KDF) + crypto KATs
-npm run build   # tsc --noEmit typecheck
+npm test           # vitest — Go-golden-vector fences (fingerprint, KDF) + crypto KATs
+npm run build      # typecheck: tsc over the src (browser-only) AND test (Node) configs
+npm run lint       # ESLint (flat config; mirrors the Go golangci-lint gate)
+npm run format     # Prettier --write (CI runs `format:check` to verify)
 ```
+
+`src/` typechecks against browser/DOM types only; Node globals (`Buffer`,
+`process`, …) are scoped to `test/` via `tsconfig.test.json`. A `Buffer` in
+`src/` therefore fails `npm run build` — enforced permanently by
+`src/node-isolation.guard.ts`.
+
+The Go-golden-vector fences are no longer kept in sync by hand: the marked
+vectors here and in their Go counterparts (`nhp/utils/crypto_fingerprint_test.go`
+for the fingerprint, `nhp/core/kdf_test.go` for the KDF) are cross-checked by
+`scripts/check-golden-vectors.sh` (run in CI via `validate-workflows.yml`), so a
+one-sided change fails the build.

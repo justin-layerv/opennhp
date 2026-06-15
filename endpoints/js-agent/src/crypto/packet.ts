@@ -52,8 +52,12 @@ export const PROTOCOL_VERSION_MAJOR = 1;
 export const PROTOCOL_VERSION_MINOR = 0;
 
 // Noise init constants (`nhp/core/constants.go`) — the literal UTF-8 bytes.
-export const INITIAL_HASH = new TextEncoder().encode("NHP hashgen v.20230421@deepcloudsdp.com");
-export const INITIAL_CHAIN_KEY = new TextEncoder().encode("NHP keygen v.20230421@clouddeep.cn");
+export const INITIAL_HASH = new TextEncoder().encode(
+  "NHP hashgen v.20230421@deepcloudsdp.com",
+);
+export const INITIAL_CHAIN_KEY = new TextEncoder().encode(
+  "NHP keygen v.20230421@clouddeep.cn",
+);
 
 function headerView(header: Uint8Array): DataView {
   return new DataView(header.buffer, header.byteOffset, header.byteLength);
@@ -78,7 +82,10 @@ export function setTypeAndPayloadSize(
 }
 
 /** Decode the type + payload size written by {@link setTypeAndPayloadSize}. */
-export function getTypeAndPayloadSize(header: Uint8Array): { type: number; size: number } {
+export function getTypeAndPayloadSize(header: Uint8Array): {
+  type: number;
+  size: number;
+} {
   const dv = headerView(header);
   const preamble = dv.getUint32(0, false);
   const tns = (preamble ^ dv.getUint32(4, false)) >>> 0;
@@ -86,7 +93,11 @@ export function getTypeAndPayloadSize(header: Uint8Array): { type: number; size:
 }
 
 /** HeaderCommon[8] = major, [9] = minor. Mirrors `HeaderCurve.SetVersion`. */
-export function setVersion(header: Uint8Array, major: number, minor: number): void {
+export function setVersion(
+  header: Uint8Array,
+  major: number,
+  minor: number,
+): void {
   header[8] = major & 0xff;
   header[9] = minor & 0xff;
 }
@@ -133,7 +144,11 @@ export function nonceForCounter(counter: bigint): Uint8Array {
  * key the responder opens and looks up. Same caveat as the Go side
  * (`scheme/curve/header.go`).
  */
-export function headerDigest(serverPubKey: Uint8Array, header: Uint8Array, cookie?: Uint8Array): Uint8Array {
+export function headerDigest(
+  serverPubKey: Uint8Array,
+  header: Uint8Array,
+  cookie?: Uint8Array,
+): Uint8Array {
   const prefix = header.subarray(0, OFF_DIGEST);
   return cookie === undefined
     ? hash(HashType.BLAKE2S, INITIAL_HASH, serverPubKey, prefix)

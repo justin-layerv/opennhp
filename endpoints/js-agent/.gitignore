@@ -7,3 +7,9 @@ coverage/
 # Go-only repo). Re-include it here: `npm ci` in CI needs a committed lockfile
 # for reproducible, integrity-pinned installs.
 !package-lock.json
+
+# The root .gitignore's `.*` rule also sweeps up dotfiles like .prettierignore;
+# re-include it so the Prettier CI gate (format:check) has it on a fresh
+# checkout (the Prettier config itself is prettier.config.js — not a dotfile —
+# so it is tracked without an exception).
+!.prettierignore

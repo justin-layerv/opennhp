@@ -29,6 +29,15 @@ on:
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
       - "scripts/check-packer-failure-surfaced.sh"
       - "scripts/check-app-image-line-rendered.sh"
+      - "scripts/check-golden-vectors.sh"
+      # All cross-language golden-vector files are listed so a one-sided edit to
+      # ANY of them fires the Go↔TS cross-check (scripts/check-golden-vectors.sh)
+      # — including the Go-side files, which the path-scoped js-agent.yml never
+      # sees. Keep these entries in sync with the PAIRS array in that script.
+      - "endpoints/js-agent/test/fingerprint.test.ts"
+      - "nhp/utils/crypto_fingerprint_test.go"
+      - "endpoints/js-agent/test/kdf.test.ts"
+      - "nhp/core/kdf_test.go"
       - "terraform/modules/qurl-reverse-tunnel-server/variables.tf"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
@@ -263,6 +272,19 @@ jobs:
       # drifted.
       - name: Check cleanup event-type lockstep (Go ↔ Python)
         run: bash scripts/check-cleanup-event-type-lockstep.sh
+
+      # Cross-language fence (#2556): NHP-custom golden vectors (the
+      # pubKeyFingerprint routing id and the KDF/NoiseFactory transcript) are
+      # hand-copied into both a Go test and the js-agent TS test and must not
+      # drift. The fixture suite runs first so a marker extractor regression
+      # (e.g. one that parses a file to an empty set and passes vacuously)
+      # surfaces against known inputs before the real files run. shellcheck both
+      # — actionlint's -shellcheck only covers workflow-embedded scripts.
+      - name: Test + check golden vector lockstep (Go ↔ TS, #2556)
+        run: |
+          shellcheck scripts/check-golden-vectors.sh tests/scripts/check-golden-vectors_test.sh
+          bash tests/scripts/check-golden-vectors_test.sh
+          bash scripts/check-golden-vectors.sh
 
       # Structural fence for the qurl-service /internal/* public-ALB
       # lockdown body contract (PR #1635; rearchitected by #1645). The

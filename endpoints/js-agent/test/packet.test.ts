@@ -22,9 +22,14 @@ import { toHex } from "./hex";
 describe("packet wire format", () => {
   it("has the Go HeaderCurve layout (240 bytes, fixed offsets)", () => {
     expect(HEADER_SIZE).toBe(240);
-    expect([OFF_HEADER_COMMON, OFF_EPHEMERAL, OFF_IDENTITY, OFF_STATIC, OFF_TIMESTAMP, OFF_DIGEST]).toEqual([
-      0, 24, 56, 136, 184, 208,
-    ]);
+    expect([
+      OFF_HEADER_COMMON,
+      OFF_EPHEMERAL,
+      OFF_IDENTITY,
+      OFF_STATIC,
+      OFF_TIMESTAMP,
+      OFF_DIGEST,
+    ]).toEqual([0, 24, 56, 136, 184, 208]);
   });
 
   it("computes the header digest matching the Go KAT (nhp/core/header_digest_kat_test.go)", () => {
@@ -50,7 +55,10 @@ describe("packet wire format", () => {
     // NHP_RKN cookie branch: the cookie is appended to the digest input. The Go
     // KAT uses currCookie[i]=i and prevCookie[i]=0x80+i.
     const currCookie = Uint8Array.from({ length: COOKIE_SIZE }, (_, i) => i);
-    const prevCookie = Uint8Array.from({ length: COOKIE_SIZE }, (_, i) => 0x80 + i);
+    const prevCookie = Uint8Array.from(
+      { length: COOKIE_SIZE },
+      (_, i) => 0x80 + i,
+    );
     expect(toHex(headerDigest(serverPub, header, currCookie))).toBe(
       "1ff84595443585febc28a313876531337d47793924ea6f69079e7c5125bedbfd",
     );
@@ -61,7 +69,9 @@ describe("packet wire format", () => {
 
   it("derives the nonce as 4 zero bytes ‖ big-endian counter (Go NonceBytes)", () => {
     expect(toHex(nonceForCounter(0n))).toBe("000000000000000000000000");
-    expect(toHex(nonceForCounter(0x0102030405060708n))).toBe("000000000102030405060708");
+    expect(toHex(nonceForCounter(0x0102030405060708n))).toBe(
+      "000000000102030405060708",
+    );
     expect(nonceForCounter(0n).length).toBe(12);
   });
 
@@ -71,7 +81,10 @@ describe("packet wire format", () => {
     // them regardless of its value (it's random in production).
     for (const preamble of [0x00000000, 0xdeadbeef, 0x12345678, 0xffffffff]) {
       setTypeAndPayloadSize(header, NHP_KNK, 1234, preamble);
-      expect(getTypeAndPayloadSize(header)).toEqual({ type: NHP_KNK, size: 1234 });
+      expect(getTypeAndPayloadSize(header)).toEqual({
+        type: NHP_KNK,
+        size: 1234,
+      });
     }
   });
 

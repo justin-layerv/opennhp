@@ -23,7 +23,11 @@ const TAG3 = Uint8Array.of(0x03);
  * different bytes; using the keyed form would silently break interop with the
  * Go server. The `kdf.test.ts` golden vectors are the guard against that.
  */
-function mac(type: HashType, key: Uint8Array, ...inputs: Uint8Array[]): Uint8Array {
+function mac(
+  type: HashType,
+  key: Uint8Array,
+  ...inputs: Uint8Array[]
+): Uint8Array {
   const m = hmac.create(nobleHash(type), key);
   for (const input of inputs) m.update(input);
   return m.digest();
@@ -41,7 +45,11 @@ function mac(type: HashType, key: Uint8Array, ...inputs: Uint8Array[]): Uint8Arr
  * HKDF-Extract (`prk = HMAC(key, input)`) then HKDF-Expand with counter 1.
  * Mirrors Go `NoiseFactory.KeyGen1`.
  */
-export function keyGen1(type: HashType, key: Uint8Array, input: Uint8Array): Uint8Array {
+export function keyGen1(
+  type: HashType,
+  key: Uint8Array,
+  input: Uint8Array,
+): Uint8Array {
   const prk = mac(type, key, input);
   return mac(type, prk, TAG1);
 }

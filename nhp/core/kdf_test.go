@@ -26,22 +26,26 @@ type kdfVectorCase struct {
 	dst2     string
 }
 
+// kdfVectorCases pins the NHP KDF (NoiseFactory) byte transcript. The dst*
+// digests are hand-copied, identical, into the js-agent test
+// (endpoints/js-agent/test/kdf.test.ts); the nhp-golden-vector markers let
+// scripts/check-golden-vectors.sh fail CI if the two copies drift (#2556).
 var kdfVectorCases = []kdfVectorCase{
 	{
 		name:     "BLAKE2s",
 		hashType: HASH_BLAKE2S,
 		newHash:  mustNewBlake2sHash,
-		dst0:     "5603731d8149d45d1100909addb244063ab505e04288c9f2632fb0e167af0b95",
-		dst1:     "75c6a3037c6ac51ac536f94ce239b275d5d098092d6776b905cde91491d16807",
-		dst2:     "83c6cf425a88b426e3e92b1e9cd14ddb31066aeeb2071597a8106a36a4055a7d",
+		dst0:     "5603731d8149d45d1100909addb244063ab505e04288c9f2632fb0e167af0b95", // nhp-golden-vector: kdf-blake2s-dst0
+		dst1:     "75c6a3037c6ac51ac536f94ce239b275d5d098092d6776b905cde91491d16807", // nhp-golden-vector: kdf-blake2s-dst1
+		dst2:     "83c6cf425a88b426e3e92b1e9cd14ddb31066aeeb2071597a8106a36a4055a7d", // nhp-golden-vector: kdf-blake2s-dst2
 	},
 	{
 		name:     "SHA256",
 		hashType: HASH_SHA256,
 		newHash:  mustNewSHA256Hash,
-		dst0:     "f296bc34384ca0d49ab2bede40c5ddb126aca8ec5da639b8f631d4dc3ed42ac7",
-		dst1:     "243c77a97d9402ffc50215ced8572d2784d61929bacedbbedceda91410564ab6",
-		dst2:     "14dec35f867351badeb4bdd7ca7be63bd84338571d74e05f586872e28f3374a3",
+		dst0:     "f296bc34384ca0d49ab2bede40c5ddb126aca8ec5da639b8f631d4dc3ed42ac7", // nhp-golden-vector: kdf-sha256-dst0
+		dst1:     "243c77a97d9402ffc50215ced8572d2784d61929bacedbbedceda91410564ab6", // nhp-golden-vector: kdf-sha256-dst1
+		dst2:     "14dec35f867351badeb4bdd7ca7be63bd84338571d74e05f586872e28f3374a3", // nhp-golden-vector: kdf-sha256-dst2
 	},
 }
 

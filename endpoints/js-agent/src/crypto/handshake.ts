@@ -66,7 +66,9 @@ export interface KnockInputs {
 export function buildKnock(inp: KnockInputs): Uint8Array {
   // Only the two knock header types are valid here — fail loud on a miswire.
   if (inp.headerType !== NHP_KNK && inp.headerType !== NHP_RKN) {
-    throw new Error(`unsupported header type ${inp.headerType}: expected NHP_KNK or NHP_RKN`);
+    throw new Error(
+      `unsupported header type ${inp.headerType}: expected NHP_KNK or NHP_RKN`,
+    );
   }
   // The server folds a cookie into the digest iff NHP_RKN (addHeaderDigest), so a
   // type/cookie mismatch here produces a digest it silently rejects. Catch it at
@@ -107,7 +109,12 @@ export function buildKnock(inp: KnockInputs): Uint8Array {
   const ess = x25519SharedSecret(inp.ephemeralPriv, inp.serverStaticPub);
   let aeadKey: Uint8Array;
   [chainKey, aeadKey] = keyGen2(T, chainKey, ess);
-  const sealedStatic = aeadSeal(aeadKey, nonce, deviceStaticPub, chainHash.sum());
+  const sealedStatic = aeadSeal(
+    aeadKey,
+    nonce,
+    deviceStaticPub,
+    chainHash.sum(),
+  );
   header.set(sealedStatic, OFF_STATIC);
   chainHash.update(sealedStatic);
 
@@ -122,12 +129,16 @@ export function buildKnock(inp: KnockInputs): Uint8Array {
   chainHash.update(sealedTs);
 
   // Body AAD is ChainHash3 (captured before the final key derivation, which does
-  // not touch the chain hash). Then derive the body key from the ts ciphertext.
+  // not touch the chain hash). Then derive the body key from the ts ciphertext;
+  // this is the terminal derivation, so the evolved chain key is discarded
+  // (unlike the es/ss steps above, whose chain key feeds the next KeyGen2).
   const bodyAad = chainHash.sum();
-  [chainKey, aeadKey] = keyGen2(T, chainKey, sealedTs);
+  [, aeadKey] = keyGen2(T, chainKey, sealedTs);
   // Empty body: skip the seal entirely (payload size 0), matching Go encryptBody.
   const sealedBody =
-    inp.body.length === 0 ? new Uint8Array(0) : aeadSeal(aeadKey, nonce, inp.body, bodyAad);
+    inp.body.length === 0
+      ? new Uint8Array(0)
+      : aeadSeal(aeadKey, nonce, inp.body, bodyAad);
   if (sealedBody.length > MAX_SEALED_BODY_SIZE) {
     // Fail loud rather than emit a packet the server's fixed buffer rejects.
     throw new Error(
@@ -140,7 +151,12 @@ export function buildKnock(inp: KnockInputs): Uint8Array {
   setVersion(header, PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR);
   setCounter(header, inp.counter);
   setFlag(header, 0);
-  setTypeAndPayloadSize(header, inp.headerType, sealedBody.length, inp.preamble);
+  setTypeAndPayloadSize(
+    header,
+    inp.headerType,
+    sealedBody.length,
+    inp.preamble,
+  );
 
   // Unkeyed header digest over header[0:208] (+ cookie for NHP_RKN).
   header.set(headerDigest(inp.serverStaticPub, header, inp.cookie), OFF_DIGEST);

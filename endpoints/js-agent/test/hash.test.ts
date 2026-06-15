@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { HashType, HASH_SIZE, hash, createChainHash, nobleHash } from "../src/crypto/hash";
+import {
+  HashType,
+  HASH_SIZE,
+  hash,
+  createChainHash,
+  nobleHash,
+} from "../src/crypto/hash";
 import { toHex, utf8 } from "./hex";
 
 describe("hash primitives", () => {
@@ -19,7 +25,9 @@ describe("hash primitives", () => {
     const a = utf8("foo");
     const b = utf8("bar");
     const concat = new Uint8Array([...a, ...b]);
-    expect(toHex(hash(HashType.BLAKE2S, a, b))).toBe(toHex(hash(HashType.BLAKE2S, concat)));
+    expect(toHex(hash(HashType.BLAKE2S, a, b))).toBe(
+      toHex(hash(HashType.BLAKE2S, concat)),
+    );
   });
 
   it("chain hash sum() peeks non-destructively (Go chainHash.Sum semantics)", () => {

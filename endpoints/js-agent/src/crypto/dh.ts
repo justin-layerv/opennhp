@@ -5,7 +5,9 @@ export const X25519_KEY_SIZE = 32;
 
 function assertKeySize(label: string, key: Uint8Array): void {
   if (key.length !== X25519_KEY_SIZE) {
-    throw new Error(`x25519 ${label} must be ${X25519_KEY_SIZE} bytes, got ${key.length}`);
+    throw new Error(
+      `x25519 ${label} must be ${X25519_KEY_SIZE} bytes, got ${key.length}`,
+    );
   }
 }
 
@@ -30,7 +32,10 @@ export function x25519PublicKey(privateKey: Uint8Array): Uint8Array {
  * a malformed key fails the knock loudly instead of silently proceeding with a
  * zero key.
  */
-export function x25519SharedSecret(privateKey: Uint8Array, peerPublicKey: Uint8Array): Uint8Array {
+export function x25519SharedSecret(
+  privateKey: Uint8Array,
+  peerPublicKey: Uint8Array,
+): Uint8Array {
   assertKeySize("private key", privateKey);
   assertKeySize("peer public key", peerPublicKey);
   return x25519.getSharedSecret(privateKey, peerPublicKey);

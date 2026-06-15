@@ -62,15 +62,22 @@ describe("NHP knock handshake (cross-language fixture)", () => {
   });
 
   it("derives the pubkeys + body recorded in the fixture", () => {
-    expect(toHex(x25519PublicKey(SERVER_PRIV))).toBe(fixture.serverStaticPubHex);
-    expect(toHex(x25519PublicKey(DEVICE_PRIV))).toBe(fixture.deviceStaticPubHex);
+    expect(toHex(x25519PublicKey(SERVER_PRIV))).toBe(
+      fixture.serverStaticPubHex,
+    );
+    expect(toHex(x25519PublicKey(DEVICE_PRIV))).toBe(
+      fixture.deviceStaticPubHex,
+    );
     expect(toHex(BODY)).toBe(fixture.bodyHex);
   });
 
   it("frames the packet as a 240-byte header + sealed body with a decodable HeaderCommon", () => {
     const pkt = knock();
     expect(pkt.length).toBe(HEADER_SIZE + BODY.length + GCM_TAG_SIZE);
-    expect(getTypeAndPayloadSize(pkt)).toEqual({ type: NHP_KNK, size: BODY.length + GCM_TAG_SIZE });
+    expect(getTypeAndPayloadSize(pkt)).toEqual({
+      type: NHP_KNK,
+      size: BODY.length + GCM_TAG_SIZE,
+    });
     expect(getCounter(pkt)).toBe(COUNTER);
   });
 
@@ -86,7 +93,9 @@ describe("NHP knock handshake (cross-language fixture)", () => {
   it("rejects a body that overflows the server's payload buffer", () => {
     // A body of MAX_SEALED_BODY_SIZE bytes seals to MAX_SEALED_BODY_SIZE + tag — just over
     // the limit — so buildKnock throws instead of silently truncating the frame.
-    expect(() => knock({ body: new Uint8Array(MAX_SEALED_BODY_SIZE) })).toThrow();
+    expect(() =>
+      knock({ body: new Uint8Array(MAX_SEALED_BODY_SIZE) }),
+    ).toThrow();
   });
 
   it("enforces the cookie / header-type invariant", () => {

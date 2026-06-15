@@ -1,0 +1,5 @@
+# Generated / build artifacts — Prettier must not own these.
+# (node_modules is covered by Prettier's built-in defaults.)
+dist
+coverage
+package-lock.json

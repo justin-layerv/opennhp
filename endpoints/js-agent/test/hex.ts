@@ -12,7 +12,9 @@ export const fromHex = (s: string): Uint8Array => {
     throw new Error(`invalid hex string: ${JSON.stringify(s)}`);
   }
   const pairs = s.match(/../g);
-  return pairs ? Uint8Array.from(pairs, (h) => parseInt(h, 16)) : new Uint8Array(0);
+  return pairs
+    ? Uint8Array.from(pairs, (h) => parseInt(h, 16))
+    : new Uint8Array(0);
 };
 
 export const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
