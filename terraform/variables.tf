@@ -819,12 +819,6 @@ variable "qurl_scanner_active_recheck_enabled" {
   default     = false
 }
 
-variable "scanner_lambda_alarm_sns_topic_arn" {
-  description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits the wiring (alarm still fires + appears in CloudWatch, no notification). Defaults empty — wire in a follow-up that creates the topic alongside the SQS queue."
-  type        = string
-  default     = ""
-}
-
 variable "qurl_service_domain" {
   description = "Domain for QURL API (e.g., api.qurl.link)"
   type        = string

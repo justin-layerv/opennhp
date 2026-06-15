@@ -158,10 +158,16 @@ resource "aws_sqs_queue_redrive_policy" "resource_lifecycle_queue" {
 #
 # Both alarms wire `alarm_actions` to the same SNS topic the scanner
 # Lambda's `scan-gap` / `errors-burning` alarms use
-# (`var.scanner_lambda_alarm_sns_topic_arn`). Empty topic ARN → alarm
-# still fires + appears in CloudWatch, just no notification — same
-# safe-degrade posture as the scanner Lambda alarms today. The follow-up
-# that wires the topic ARN lights up all three alarms simultaneously.
+# (`var.scanner_lambda_alarm_sns_topic_arn`), which the root module feeds
+# from the cell-wide alerts topic (`module.monitoring.sns_topic_arn`) —
+# the topic every other alarm in the cell routes to (#2491). The module
+# keeps the empty-string safe-degrade seam (empty ARN → alarm still fires
+# + appears in CloudWatch, just no notification) so it stays reusable —
+# the same `var.x != "" ? [x] : []` seam the AC alarms use
+# (`modules/ac/monitoring.tf`), which `check-observability-parity.py`
+# enforces. (Note: `modules/billing/sqs.tf`, cited below for the `Sum`
+# statistic, takes the other tack — `default = null` + `count` gating —
+# so it is not the seam precedent.)
 #
 # STATISTIC CHOICE — both alarms use `Sum` on
 # `ApproximateNumberOfMessagesVisible`, a gauge. AWS's own SQS dashboards

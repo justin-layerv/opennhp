@@ -862,9 +862,11 @@ resource "aws_lambda_permission" "scanner_active_recheck" {
 #
 # First-enable behavior: the alarm enters ALARM immediately after the
 # function is created and stays there until `evaluation_periods ×
-# period` (10 min) of data accrue. Harmless today (`alarm_actions` is
-# empty), but the operator wiring SNS later should expect a 10-min
-# initial breach window on every fresh enable / function replacement.
+# period` (10 min) of data accrue. Now that `alarm_actions` routes to
+# the cell alerts topic (#2491), expect a ~10-min initial breach page on
+# every fresh enable / function replacement — benign: the alarm returns
+# to OK once the cadence accrues, though no clear notification follows
+# (ok_actions intentionally unset, above).
 resource "aws_cloudwatch_metric_alarm" "scanner_invocation_gap" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 

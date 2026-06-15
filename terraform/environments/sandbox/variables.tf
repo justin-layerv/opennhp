@@ -415,12 +415,6 @@ variable "qurl_scanner_active_recheck_enabled" {
   default     = false
 }
 
-variable "scanner_lambda_alarm_sns_topic_arn" {
-  description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits the wiring (alarm still fires + appears in CloudWatch, no notification). Wire when the SNS topic lands alongside the SQS queue."
-  type        = string
-  default     = ""
-}
-
 # Wave 5 dark-launch gate for the qurl-service ↔ nhp-server agent
 # bootstrap chain (NHP_SERVER_PUBLIC_KEY_B64 / NHP_SERVER_HOST /
 # NHP_SERVER_PORT / QURL_AGENT_BOOTSTRAP_ENABLED). See root variable

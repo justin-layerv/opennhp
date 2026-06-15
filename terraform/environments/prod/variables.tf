@@ -388,12 +388,6 @@ variable "qurl_scanner_active_recheck_enabled" {
   default     = false
 }
 
-variable "scanner_lambda_alarm_sns_topic_arn" {
-  description = "SNS topic ARN for the scanner Lambda's scan-gap alarm `alarm_actions`. Empty omits paging."
-  type        = string
-  default     = ""
-}
-
 variable "qurl_service_domain" {
   type    = string
   default = null

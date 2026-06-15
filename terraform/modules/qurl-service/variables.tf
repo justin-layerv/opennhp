@@ -1226,7 +1226,7 @@ variable "scanner_lambda_log_retention_days" {
 }
 
 variable "scanner_lambda_alarm_sns_topic_arn" {
-  description = "SNS topic ARN for the scanner Lambda's scan-gap alarm action. Empty string omits the alarm_actions wiring; the alarm still fires + appears in CloudWatch, but no notification is published. Defaults empty — wire in a follow-up that creates the topic alongside the SQS queue."
+  description = "SNS topic ARN for the scanner Lambda + resource-lifecycle queue alarm actions. The root module wires this to the cell-wide alerts topic (`module.monitoring.sns_topic_arn`), the same topic every other alarm in the cell routes to (#2491). Empty string keeps the safe-degrade seam — the alarm still fires + appears in CloudWatch, but publishes no notification — so the module stays reusable by a caller with no alerts topic."
   type        = string
   default     = ""
 
