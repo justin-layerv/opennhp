@@ -49,7 +49,7 @@ Ported incrementally, each step its own PR:
      and header preamble, plus the send timestamp (capped to Go's int64
      `UnixNano`). `buildKnock` stays fixture-fenced; the wrapper is
      property-tested (distinct ephemeral / counter / nonce per knock).
-   - **b. Relay transport + knock loop (this PR)** — `agent/relay.ts`
+   - **b. Relay transport + knock loop** (#2609) — `agent/relay.ts`
      (`relayPost`: `POST /relay/{serverId}`, octet-stream, mirroring
      `endpoints/relay/relay.go`), `agent/knock.ts` (`buildKnockBody`: the
      `AgentKnockMsg` body, owning the #1154 `headerType`), and `agent/loop.ts`
@@ -61,11 +61,25 @@ Ported incrementally, each step its own PR:
      the body and the success/`52024`/cookie dispatch are Go-fenced
      (`nhp/core/js_agent_loop_roundtrip_test.go`).
    - **c. Overload cookie-challenge** — `NHP_COK` → `NHP_RKN` re-knock folding in
-     the server cookie (`responder.go` sends it only when overloaded; it is _not_
-     the renewal path).
-   - **d. Re-knock renewal scheduler** — re-knock (a fresh `NHP_KNK`, spec Step 8)
-     before Access Duration expires; the background-tab renewal contract is a
-     product decision, deferred.
+     the server cookie. **Deferred (blocked, #2611):** the overload COK is not
+     routable through the relay today (the fork's `sendCookie` regressed to a
+     server-side counter, so the relay drops it) and the fork lacks upstream's
+     stateless cookies. The agent handles a COK gracefully meanwhile via the
+     `cookieChallenge` result (timeout → re-resolve). Lands once #2611 does.
+   - **d. Re-knock renewal scheduler (this PR)** — `agent/scheduler.ts`
+     (`startRenewal`): keeps an open grant alive by re-knocking a fresh `NHP_KNK`
+     (via the loop's `knock`, so it's live-reachable — no relay-COK dependency) at
+     `openTime × (1 − margin) ± jitter`, rescheduling off each new grant. The
+     `margin` is a **retry budget**: a transient transport/server fault is an
+     unknown outcome with session left, so it retries within the budget (a
+     re-knock is idempotent) and only signals `onExpired` on a `52024` deny or an
+     exhausted budget. **Background-tab limitation** (the hard part): clamped /
+     suspended background timers can miss the deadline, and the JS-side fix is
+     **foreground recovery** (a Page Visibility handler re-knocks on return if
+     overdue) — so a backgrounded session may need a fresh knock on return. The
+     server/relay-side **grace window** that would avoid that is a separate
+     follow-up. No Go fence — pure browser orchestration; the load-bearing tests
+     are the foreground-recovery and single-flight paths.
 6. **Bundling** for the qurl.link page.
 
 GMSM (SM2/SM3/SM4) is intentionally **not** ported — this fork strips it, so the
