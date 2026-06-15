@@ -326,6 +326,48 @@ resource "aws_wafv2_web_acl" "this" {
               }
             }
           }
+
+          # **`HostingProviderIPList` rule_action_override.** AWS's
+          # AnonymousIpList bundles two sub-rules: `AnonymousIPList`
+          # (Tor / VPN / open-proxy exits — bootstrapping through one is
+          # a genuine abuse signal, kept enforceable) and
+          # `HostingProviderIPList`, which categorically blocks cloud /
+          # hosting / datacenter source IPs. But the qurl-connector is a
+          # CLOUD-DEPLOYED sidecar: customers run it as a Docker sidecar
+          # inside their own AWS / GCP infra (AWS Nitro, GCP Confidential
+          # Space — see the connector's attested-key-provider
+          # onboarding), so `POST /v1/agent/bootstrap` legitimately
+          # originates from hosting-provider IPs. Enforcing
+          # HostingProviderIPList therefore 403s real customers — and the
+          # live-sandbox CI smoke, which runs from a GitHub-hosted/Azure
+          # runner — at the ALB with no qurl-service log entry, the SAME
+          # silent-403 the SignalNonBrowserUserAgent override above
+          # exists to prevent, for the same reason: a legitimate
+          # non-interactive sidecar request a managed rule flags as
+          # suspicious.
+          #
+          # Override to `Count` (observable in sampled-requests, not
+          # blocking); `AnonymousIPList` keeps the group action so Tor /
+          # VPN egress can still be enforced. Gated on the group not
+          # already being whole-group count-only, mirroring the
+          # SignalNonBrowserUserAgent guard: while prod's
+          # `waf_count_only_rule_groups` lists AnonymousIpList the whole
+          # group is already Count so this override is redundant; when
+          # that list later drops AnonymousIpList to enforce, this
+          # override keeps HostingProviderIPList from re-blocking every
+          # cloud sidecar.
+          dynamic "rule_action_override" {
+            for_each = (
+              rule.value == "AWSManagedRulesAnonymousIpList" &&
+              !contains(var.waf_count_only_rule_groups, rule.value)
+            ) ? [1] : []
+            content {
+              name = "HostingProviderIPList"
+              action_to_use {
+                count {}
+              }
+            }
+          }
         }
       }
 
