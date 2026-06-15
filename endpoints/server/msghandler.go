@@ -341,10 +341,27 @@ const (
 	//                        success-only proxy (e.g. KnockMs +
 	//                        TokenValidateMs) for SLO panels.
 	//   *TokenValidateMs   — RTT to qurl-service /internal/v1/resolve.
+	//   *CatalogResolveMs  — catalog routing resolution after token validate
+	//                        (NHP-owned (aspId, q_resId) lookup, #2540).
+	//                        Cache-hit p50 is sub-ms; a fresh-mint miss adds
+	//                        one DynamoDB GetItem.
 	//   *KnockMs           — sum of knock attempts including retries.
 	//   *KnockAttemptMs    — single attempt; diff vs KnockMs = retry cost.
 	//   *Success           — successful resolve + knock + redirect.
 	//   *FailValidate      — token rejected (invalid, expired, revoked).
+	//   *FailResolveCatalog — token validated, but AC routing could not be
+	//                        resolved from the NHP catalog (miss or lookup
+	//                        error) before the knock (#2540). Pre-knock, so
+	//                        like FailValidate it never exercises the retry
+	//                        loop and is NOT in the KnockRetry denominator. A
+	//                        sustained non-zero rate during the #2540 rollout
+	//                        means qurl-service is not publishing q_ catalog
+	//                        rows (upsertNHPCatalogForToken) the plugin now
+	//                        requires — the load-bearing rollout-ordering
+	//                        signal, graphed on the "Resolve Outcomes" panel of
+	//                        qurl-operations.json (a CloudWatch alarm is tracked
+	//                        in #2577). Fails closed: never falls back to the
+	//                        qurl-service response body's routing.
 	//   *FailKnock         — knock exhausted MaxAttempts retries (and
 	//                        only that). Calls counted here exercised
 	//                        the retry policy — that's what makes them
@@ -386,17 +403,19 @@ const (
 	//                        already succeeded (post-knock failure). Only
 	//                        Success + FailKnock count call attempts that
 	//                        exercised the retry policy.
-	MetricQurlResolveDurationMs      = "QurlResolveDurationMs"
-	MetricQurlResolveTokenValidateMs = "QurlResolveTokenValidateMs"
-	MetricQurlResolveKnockMs         = "QurlResolveKnockMs"
-	MetricQurlResolveKnockAttemptMs  = "QurlResolveKnockAttemptMs"
-	MetricQurlResolveSuccess         = "QurlResolveSuccess"
-	MetricQurlResolveFailValidate    = "QurlResolveFailValidate"
-	MetricQurlResolveFailKnock       = "QurlResolveFailKnock"
-	MetricQurlResolveFailPostKnock   = "QurlResolveFailPostKnock"
-	MetricQurlResolveFailCanceled    = "QurlResolveFailCanceled"
-	MetricQurlResolveFailUnknown     = "QurlResolveFailUnknown"
-	MetricQurlResolveKnockRetry      = "QurlResolveKnockRetry"
+	MetricQurlResolveDurationMs         = "QurlResolveDurationMs"
+	MetricQurlResolveTokenValidateMs    = "QurlResolveTokenValidateMs"
+	MetricQurlResolveCatalogResolveMs   = "QurlResolveCatalogResolveMs"
+	MetricQurlResolveKnockMs            = "QurlResolveKnockMs"
+	MetricQurlResolveKnockAttemptMs     = "QurlResolveKnockAttemptMs"
+	MetricQurlResolveSuccess            = "QurlResolveSuccess"
+	MetricQurlResolveFailValidate       = "QurlResolveFailValidate"
+	MetricQurlResolveFailResolveCatalog = "QurlResolveFailResolveCatalog"
+	MetricQurlResolveFailKnock          = "QurlResolveFailKnock"
+	MetricQurlResolveFailPostKnock      = "QurlResolveFailPostKnock"
+	MetricQurlResolveFailCanceled       = "QurlResolveFailCanceled"
+	MetricQurlResolveFailUnknown        = "QurlResolveFailUnknown"
+	MetricQurlResolveKnockRetry         = "QurlResolveKnockRetry"
 	// QURL browser-side navigation timings — RUM-class data posted by
 	// the qurl.link interstitial as additional form fields on the same
 	// resolve POST. Values originate in the user's browser via

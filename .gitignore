@@ -26,6 +26,8 @@ nhp-agent
 endpoints/nhp-acd
 endpoints/nhp-server
 endpoints/nhp-agent
+# Example plugin binary (produced by `go build ./...` in examples/server_plugin)
+examples/server_plugin/server_plugin
 
 # Test binary, build with `go test -c`
 *.test

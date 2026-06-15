@@ -928,3 +928,25 @@ func TestResolveInternalKnockResourceRejectsMismatchedCallerResource(t *testing.
 		t.Fatalf("error = %v, want errInvalidInternalKnockRequest", err)
 	}
 }
+
+func TestClampOpenTimeDownward(t *testing.T) {
+	cases := []struct {
+		name     string
+		ceiling  uint32
+		override uint32
+		want     uint32
+	}{
+		{"override below ceiling lowers it", 300, 60, 60},
+		{"override above ceiling capped to ceiling", 120, 300, 120},
+		{"override equal to ceiling stays ceiling", 120, 120, 120},
+		{"zero override falls back to ceiling", 300, 0, 300},
+		{"one second override is allowed (no floor)", 300, 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClampOpenTimeDownward(tc.ceiling, tc.override); got != tc.want {
+				t.Errorf("ClampOpenTimeDownward(%d, %d) = %d, want %d", tc.ceiling, tc.override, got, tc.want)
+			}
+		})
+	}
+}

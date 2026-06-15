@@ -1501,6 +1501,26 @@ func (hs *HttpServer) NewHttpServerHelper() *plugins.HttpServerPluginHelper {
 		return hs.handleHttpOpenResource(req, res)
 	}
 
+	// ResolveResourceFunc mirrors the headless /nhp/internal/knock resolver:
+	// it routes (aspId, resId) through the server-owned catalog
+	// (resolveInternalKnockResource) so an HTTP plugin can open pinholes
+	// against catalog-authoritative routing instead of trusting routing it
+	// received in its own upstream response body (#2540).
+	//
+	// The lookup context is the lifecycle context (internalKnockResourceLookupContext),
+	// NOT the plugin's per-request context — same as the headless caller. The
+	// catalog lookup singleflights concurrent knocks for the same hot resource
+	// and its closure captures the first caller's context (see LookupResource's
+	// CONTRACT), so a per-request context would fan one client's disconnect out
+	// to every piggybacked live caller. callerResource is nil because the plugin
+	// supplies no override here (qURL clamps its own OpenTime locally). The
+	// throwaway lookup request carries only the lookup identity;
+	// resolveInternalKnockResource never retains it.
+	h.ResolveResourceFunc = func(aspId, resId, srcIP string) (*common.ResourceData, error) {
+		lookup := &common.HttpKnockRequest{AuthServiceId: aspId, ResourceId: resId, SrcIp: srcIP}
+		return hs.resolveInternalKnockResource(hs.internalKnockResourceLookupContext(), lookup, nil)
+	}
+
 	// Bind metric emitters for plugins (mirrors the internalAuthEmit /
 	// emitMetric precedents above — gate on metrics != nil before binding).
 	if hs.udpServer != nil && hs.udpServer.metrics != nil {

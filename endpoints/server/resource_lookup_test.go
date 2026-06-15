@@ -1232,6 +1232,13 @@ func TestResourceLookup_SkipsMalformedRow_ContinuesWithRest(t *testing.T) {
 			},
 		},
 		{
+			name:       "empty ac_id",
+			resourceID: "empty-acid",
+			seed: func(q *fakeResourcesQuerier) {
+				q.putWithPortSuffix(nhpSystemCustomerID, "empty-acid", "agent", "", "connect.layerv.xyz", "frps-d.nhp.sandbox.internal", 7001, 120, true)
+			},
+		},
+		{
 			name:       "port_suffix non-positive dest_port",
 			resourceID: "bad-port-suffix-zero",
 			seed: func(q *fakeResourcesQuerier) {

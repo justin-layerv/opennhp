@@ -46,9 +46,10 @@ func TestQurlResolver_Resolve_Success(t *testing.T) {
 		resp := internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:  "r_test123",
-				TargetURL:   "https://backend.example.com",
-				QurlSiteURL: "https://r_test123.qurl.site",
+				ResourceID:    "r_test123",
+				NHPResourceID: "q_0123456789a",
+				TargetURL:     "https://backend.example.com",
+				QurlSiteURL:   "https://r_test123.qurl.site",
 				Resources: map[string]*common.ResourceInfo{
 					"default": {
 						ACId:     "ac-001",
@@ -347,92 +348,72 @@ func TestValidateResolveResponse(t *testing.T) {
 		{
 			name: "valid response",
 			resp: &ResolveResponse{
+				NHPResourceID: "q_0123456789a",
+			},
+			wantErr: false,
+		},
+		{
+			// As of #2540 AC routing is resolved from the NHP catalog, so the
+			// response's resources map is no longer validated (or required). A
+			// response with no resources but a valid nhp_resource_id is accepted
+			// — this fences the removal of the old empty-resources rejection.
+			name: "empty resources is now valid",
+			resp: &ResolveResponse{
+				NHPResourceID: "q_0123456789a",
+				Resources:     map[string]*common.ResourceInfo{},
+			},
+			wantErr: false,
+		},
+		{
+			// Malformed routing in the body is likewise ignored — only the
+			// catalog key matters now.
+			name: "malformed resources ignored when nhp_resource_id present",
+			resp: &ResolveResponse{
+				NHPResourceID: "q_0123456789a",
 				Resources: map[string]*common.ResourceInfo{
-					"default": {
-						ACId: "ac-001",
-						Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443},
-					},
+					"default": {ACId: "", Addr: nil},
 				},
 			},
 			wantErr: false,
 		},
 		{
-			name: "empty resources",
-			resp: &ResolveResponse{
-				Resources: map[string]*common.ResourceInfo{},
-			},
+			name:    "missing nhp_resource_id",
+			resp:    &ResolveResponse{},
 			wantErr: true,
-			errMsg:  "empty resources",
+			errMsg:  "empty nhp_resource_id",
 		},
 		{
-			name: "nil resources",
+			// A non-q_ id passes the empty check but is not a dynamic catalog
+			// key — reject it here (FailValidate) rather than letting it fall
+			// through to the ASP-placement branch and miss as a generic
+			// FailResolveCatalog (#2540 cr).
+			name: "non-q_ nhp_resource_id rejected",
 			resp: &ResolveResponse{
-				Resources: nil,
+				NHPResourceID: "r_not_dynamic",
 			},
 			wantErr: true,
-			errMsg:  "empty resources",
+			errMsg:  "not a dynamic qURL catalog key",
 		},
 		{
-			name: "nil resource entry",
+			name: "q_ prefix but malformed nhp_resource_id rejected",
 			resp: &ResolveResponse{
-				Resources: map[string]*common.ResourceInfo{
-					"default": nil,
-				},
+				NHPResourceID: "q_tooshort",
 			},
 			wantErr: true,
-			errMsg:  "is nil",
+			errMsg:  "not a dynamic qURL catalog key",
 		},
 		{
-			name: "empty ACId",
+			name: "missing nhp_resource_id even with valid resources",
 			resp: &ResolveResponse{
 				Resources: map[string]*common.ResourceInfo{
 					"default": {
-						ACId: "",
+						ACId: "ac-001",
 						Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443},
 					},
 				},
 			},
 			wantErr: true,
-			errMsg:  "empty ACId",
-		},
-		{
-			name: "nil address",
-			resp: &ResolveResponse{
-				Resources: map[string]*common.ResourceInfo{
-					"default": {
-						ACId: "ac-001",
-						Addr: nil,
-					},
-				},
-			},
-			wantErr: true,
-			errMsg:  "nil address",
-		},
-		{
-			name: "empty IP",
-			resp: &ResolveResponse{
-				Resources: map[string]*common.ResourceInfo{
-					"default": {
-						ACId: "ac-001",
-						Addr: &common.NetAddress{Ip: "", Port: 443},
-					},
-				},
-			},
-			wantErr: true,
-			errMsg:  "empty IP",
-		},
-		{
-			name: "zero port",
-			resp: &ResolveResponse{
-				Resources: map[string]*common.ResourceInfo{
-					"default": {
-						ACId: "ac-001",
-						Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 0},
-					},
-				},
-			},
-			wantErr: true,
-			errMsg:  "zero port",
+			errMsg:  "empty nhp_resource_id",
 		},
 	}
 

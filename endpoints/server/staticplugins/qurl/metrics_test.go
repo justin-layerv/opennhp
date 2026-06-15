@@ -82,8 +82,12 @@ func (m *metricCapture) counter(name string) int {
 func instrumentedHelper(capture *metricCapture, knock plugins.HttpPluginPostAuthFunc) *plugins.HttpServerPluginHelper {
 	return &plugins.HttpServerPluginHelper{
 		AuthWithHttpCallbackFunc: knock,
-		RecordLatency:            capture.recordLatency,
-		IncrCounter:              capture.incrCounter,
+		// #2540: AuthWithHttp resolves AC routing from the catalog before the
+		// knock. Wire the default resolver so success-path metrics tests reach
+		// the knock; failure-path tests fail earlier and never call it.
+		ResolveResourceFunc: defaultCatalogResolver(),
+		RecordLatency:       capture.recordLatency,
+		IncrCounter:         capture.incrCounter,
 	}
 }
 
@@ -96,9 +100,10 @@ func startSuccessfulResolveServer(t *testing.T) *httptest.Server {
 		_ = json.NewEncoder(w).Encode(internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:  "r_metrics_test",
-				TargetURL:   "https://backend.example.com",
-				QurlSiteURL: "https://r_metrics_test.qurl.site",
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_metrics_test",
+				TargetURL:     "https://backend.example.com",
+				QurlSiteURL:   "https://r_metrics_test.qurl.site",
 				Resources: map[string]*common.ResourceInfo{
 					"default": {
 						ACId:     "ac-001",
@@ -191,6 +196,303 @@ func TestAuthWithHttp_Metrics_SuccessPath(t *testing.T) {
 		if got := capture.counter(name); got != 0 {
 			t.Errorf("%s: want 0 (success path), got %d", name, got)
 		}
+	}
+}
+
+// TestAuthWithHttp_UsesCatalogRoutingNotBody asserts the core #2540 invariant:
+// the AC routing the knock opens against comes from the catalog resolver, never
+// from the qurl-service response body. The mock response carries a decoy
+// routing map; the callback must observe only the catalog routing.
+func TestAuthWithHttp_UsesCatalogRoutingNotBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(internalResolveResponse{
+			Success: true,
+			Data: &ResolveResponse{
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_routing",
+				QurlSiteURL:   "https://r_routing.qurl.site",
+				JWTSecret:     "test-jwt-secret-key-for-signing",
+				TokenExpire:   3600,
+				OpenTime:      300,
+				CookieDomain:  ".qurl.site",
+				// Decoy body routing — must be ignored in favor of the catalog.
+				Resources: map[string]*common.ResourceInfo{
+					"body": {ACId: "ac-from-body", Addr: &common.NetAddress{Ip: "9.9.9.9", Port: 1}},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+	withResolverPointingAt(t, srv.URL)
+
+	var gotAspID, gotResID string
+	var knockACIDs []string
+	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: func(aspID, resID, _ string) (*common.ResourceData, error) {
+			gotAspID, gotResID = aspID, resID
+			return &common.ResourceData{
+				ResourceGroup: common.ResourceGroup{
+					AuthServiceId: aspID,
+					ResourceId:    resID,
+					OpenTime:      300,
+					Resources: map[string]*common.ResourceInfo{
+						resID: {ACId: "ac-from-catalog", Hostname: "catalog.example", PortSuffix: true, Addr: &common.NetAddress{Port: 443}},
+					},
+				},
+			}, nil
+		},
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			for _, info := range res.Resources {
+				knockACIDs = append(knockACIDs, info.ACId)
+			}
+			return &common.ServerKnockAckMsg{ResourceHost: map[string]string{"r": "h:443"}}, nil
+		},
+	}
+
+	ctx, _ := formPostContext("valid_test_token_123")
+	if _, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper); err != nil {
+		t.Fatalf("AuthWithHttp: %v", err)
+	}
+
+	// Resolver is keyed by (qurl, NHPResourceID) — the catalog identity.
+	if gotAspID != PluginID {
+		t.Errorf("catalog resolver aspId = %q, want %q", gotAspID, PluginID)
+	}
+	if gotResID != testNHPResourceID {
+		t.Errorf("catalog resolver resId = %q, want NHPResourceID %q", gotResID, testNHPResourceID)
+	}
+	// The knock opened against the catalog AC, not the decoy body AC.
+	if len(knockACIDs) != 1 || knockACIDs[0] != "ac-from-catalog" {
+		t.Errorf("knock opened against ACIds %v; want exactly [ac-from-catalog] — body routing must be ignored (#2540)", knockACIDs)
+	}
+}
+
+// TestAuthWithHttp_CatalogMiss_FailsClosed asserts that when catalog routing
+// resolution errors, the knock is NOT attempted and the request fails closed
+// with FailResolveCatalog — it must never fall back to body routing (#2540).
+func TestAuthWithHttp_CatalogMiss_FailsClosed(t *testing.T) {
+	srv := startSuccessfulResolveServer(t)
+	defer srv.Close()
+	withResolverPointingAt(t, srv.URL)
+
+	capture := newMetricCapture()
+	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: func(_, _, _ string) (*common.ResourceData, error) {
+			return nil, errors.New("catalog unavailable")
+		},
+		AuthWithHttpCallbackFunc: func(*common.HttpKnockRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			t.Fatal("knock callback must not run when catalog routing is unresolved")
+			return nil, nil
+		},
+		RecordLatency: capture.recordLatency,
+		IncrCounter:   capture.incrCounter,
+	}
+
+	ctx, w := formPostContext("valid_test_token_123")
+	if _, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper); err == nil {
+		t.Fatal("expected error when catalog routing resolution fails")
+	}
+	if got := capture.counter(nhpserver.MetricQurlResolveFailResolveCatalog); got != 1 {
+		t.Errorf("FailResolveCatalog: want 1, got %d", got)
+	}
+	if got := capture.counter(nhpserver.MetricQurlResolveSuccess); got != 0 {
+		t.Errorf("Success: want 0, got %d", got)
+	}
+	// Latency is recorded even on the miss path (timed around the resolver call).
+	if got := capture.latencyCount(nhpserver.MetricQurlResolveCatalogResolveMs); got != 1 {
+		t.Errorf("CatalogResolveMs: want 1 sample, got %d", got)
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status: want 500, got %d", w.Code)
+	}
+}
+
+// TestAuthWithHttp_CatalogResolverNil_FailsClosed asserts a helper without a
+// wired catalog resolver fails closed rather than knocking against unverified
+// body routing (#2540). This is the defensive-wiring twin of the miss path.
+// Unlike the miss path it attributes to FailUnknown, not FailResolveCatalog: a
+// nil resolver is an NHP wiring regression, not a qurl-service catalog-publish
+// gap, so it must not pollute the load-bearing rollout signal.
+func TestAuthWithHttp_CatalogResolverNil_FailsClosed(t *testing.T) {
+	srv := startSuccessfulResolveServer(t)
+	defer srv.Close()
+	withResolverPointingAt(t, srv.URL)
+
+	capture := newMetricCapture()
+	helper := &plugins.HttpServerPluginHelper{
+		// ResolveResourceFunc intentionally nil.
+		AuthWithHttpCallbackFunc: func(*common.HttpKnockRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			t.Fatal("knock callback must not run when the catalog resolver is unwired")
+			return nil, nil
+		},
+		RecordLatency: capture.recordLatency,
+		IncrCounter:   capture.incrCounter,
+	}
+
+	ctx, w := formPostContext("valid_test_token_123")
+	if _, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper); err == nil {
+		t.Fatal("expected error when catalog resolver is nil")
+	}
+	if got := capture.counter(nhpserver.MetricQurlResolveFailUnknown); got != 1 {
+		t.Errorf("FailUnknown: want 1, got %d", got)
+	}
+	if got := capture.counter(nhpserver.MetricQurlResolveFailResolveCatalog); got != 0 {
+		t.Errorf("FailResolveCatalog: want 0 (nil resolver is an NHP wiring bug, not a rollout signal), got %d", got)
+	}
+	if got := capture.counter(nhpserver.MetricQurlResolveSuccess); got != 0 {
+		t.Errorf("Success: want 0, got %d", got)
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status: want 500, got %d", w.Code)
+	}
+}
+
+// TestAuthWithHttp_OpenTimeClampedToCatalogCeiling verifies the effective
+// pinhole window is min(catalog ceiling, response value): the qurl-service
+// response may only LOWER the catalog's OpenTime, never widen it past the
+// catalog cap (#2540, mirroring the headless downward override). The minted
+// token is signed from the same effective value, so the knock callback's
+// res.OpenTime is the assertion point.
+func TestAuthWithHttp_OpenTimeClampedToCatalogCeiling(t *testing.T) {
+	cases := []struct {
+		name        string
+		respOpen    uint32
+		catalogOpen uint32
+		wantOpen    uint32
+	}{
+		{"response over ceiling is capped to catalog", 300, 120, 120},
+		{"response under ceiling lowers the window", 60, 300, 60},
+		{"zero response falls back to catalog ceiling", 0, 300, 300},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(internalResolveResponse{
+					Success: true,
+					Data: &ResolveResponse{
+						NHPResourceID: testNHPResourceID,
+						ResourceID:    "r_opentime",
+						QurlSiteURL:   "https://r_opentime.qurl.site",
+						JWTSecret:     "test-jwt-secret-key-for-signing",
+						TokenExpire:   3600,
+						OpenTime:      tc.respOpen,
+						CookieDomain:  ".qurl.site",
+					},
+				})
+			}))
+			defer srv.Close()
+			withResolverPointingAt(t, srv.URL)
+
+			var gotOpen uint32
+			helper := &plugins.HttpServerPluginHelper{
+				ResolveResourceFunc: func(aspID, resID, _ string) (*common.ResourceData, error) {
+					return &common.ResourceData{
+						ResourceGroup: common.ResourceGroup{
+							AuthServiceId: aspID,
+							ResourceId:    resID,
+							OpenTime:      tc.catalogOpen,
+							Resources: map[string]*common.ResourceInfo{
+								resID: {ACId: "ac-catalog", Hostname: "h", PortSuffix: true, Addr: &common.NetAddress{Port: 443}},
+							},
+						},
+					}, nil
+				},
+				AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+					gotOpen = res.OpenTime
+					return &common.ServerKnockAckMsg{ResourceHost: map[string]string{"r": "h:443"}}, nil
+				},
+			}
+
+			ctx, _ := formPostContext("valid_test_token_123")
+			if _, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper); err != nil {
+				t.Fatalf("AuthWithHttp: %v", err)
+			}
+			if gotOpen != tc.wantOpen {
+				t.Errorf("effective OpenTime = %d, want %d (catalog=%d, response=%d)", gotOpen, tc.wantOpen, tc.catalogOpen, tc.respOpen)
+			}
+		})
+	}
+}
+
+// TestAuthWithHttp_CatalogResolveCanceled_IsFailCanceled verifies a
+// context.Canceled from the catalog lookup is attributed to FailCanceled, NOT
+// the load-bearing FailResolveCatalog rollout signal (#2540 cr). The lookup runs
+// on the host's lifecycle context (it is uncancelable by a browser close — see
+// ResolveResourceFunc), so a context.Canceled can only mean graceful shutdown
+// canceled it; that's a drain race, not a qurl-service catalog-publish gap.
+func TestAuthWithHttp_CatalogResolveCanceled_IsFailCanceled(t *testing.T) {
+	srv := startSuccessfulResolveServer(t)
+	defer srv.Close()
+	withResolverPointingAt(t, srv.URL)
+
+	capture := newMetricCapture()
+	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: func(_, _, _ string) (*common.ResourceData, error) {
+			return nil, context.Canceled // lifecycle context canceled by shutdown
+		},
+		AuthWithHttpCallbackFunc: func(*common.HttpKnockRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			t.Fatal("knock callback must not run when catalog resolution is canceled")
+			return nil, nil
+		},
+		RecordLatency: capture.recordLatency,
+		IncrCounter:   capture.incrCounter,
+	}
+
+	ctx, w := formPostContext("valid_test_token_123")
+	if _, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper); err == nil {
+		t.Fatal("expected error when catalog resolution is canceled")
+	}
+	if got := capture.counter(nhpserver.MetricQurlResolveFailCanceled); got != 1 {
+		t.Errorf("FailCanceled: want 1, got %d", got)
+	}
+	if got := capture.counter(nhpserver.MetricQurlResolveFailResolveCatalog); got != 0 {
+		t.Errorf("FailResolveCatalog: want 0 (a shutdown cancel must not pollute the rollout signal), got %d", got)
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status: want 500, got %d", w.Code)
+	}
+}
+
+// TestAuthWithHttp_EmptyClientIP_IsFailUnknown verifies an empty client IP (an
+// ingress/proxy misconfiguration) is attributed up front to FailUnknown, not the
+// load-bearing FailResolveCatalog rollout signal (#2540 cr). Neither the catalog
+// resolver nor the knock callback should run.
+func TestAuthWithHttp_EmptyClientIP_IsFailUnknown(t *testing.T) {
+	srv := startSuccessfulResolveServer(t)
+	defer srv.Close()
+	withResolverPointingAt(t, srv.URL)
+
+	capture := newMetricCapture()
+	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: func(_, _, _ string) (*common.ResourceData, error) {
+			t.Fatal("catalog resolver must not run when the client IP is empty")
+			return nil, nil
+		},
+		AuthWithHttpCallbackFunc: func(*common.HttpKnockRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			t.Fatal("knock callback must not run when the client IP is empty")
+			return nil, nil
+		},
+		RecordLatency: capture.recordLatency,
+		IncrCounter:   capture.incrCounter,
+	}
+
+	ctx, w := formPostContext("valid_test_token_123")
+	// gin ClientIP() returns "" with no RemoteAddr and no forwarded headers.
+	ctx.Request.RemoteAddr = ""
+	ctx.Request.Header.Del("X-Forwarded-For")
+	ctx.Request.Header.Del("X-Real-Ip")
+
+	if _, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper); err == nil {
+		t.Fatal("expected error when client IP is empty")
+	}
+	if got := capture.counter(nhpserver.MetricQurlResolveFailUnknown); got != 1 {
+		t.Errorf("FailUnknown: want 1, got %d", got)
+	}
+	if got := capture.counter(nhpserver.MetricQurlResolveFailResolveCatalog); got != 0 {
+		t.Errorf("FailResolveCatalog: want 0 (empty client IP is an ingress issue, not a publish gap), got %d", got)
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status: want 500, got %d", w.Code)
 	}
 }
 
@@ -367,9 +669,10 @@ func TestAuthWithHttp_Metrics_PostKnockRejected(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(internalResolveResponse{
 				Success: true,
 				Data: &ResolveResponse{
-					ResourceID:  "r_pk",
-					TargetURL:   "https://backend.example.com",
-					QurlSiteURL: qurlSiteURL,
+					NHPResourceID: testNHPResourceID,
+					ResourceID:    "r_pk",
+					TargetURL:     "https://backend.example.com",
+					QurlSiteURL:   qurlSiteURL,
 					Resources: map[string]*common.ResourceInfo{
 						"default": {ACId: "ac-001", Hostname: "h", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}},
 					},
@@ -445,9 +748,10 @@ func TestAuthWithHttp_Metrics_EmptyJWTSecretIsPostKnock(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:  "r_nojwt",
-				TargetURL:   "https://backend.example.com",
-				QurlSiteURL: "https://r_nojwt.qurl.site",
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_nojwt",
+				TargetURL:     "https://backend.example.com",
+				QurlSiteURL:   "https://r_nojwt.qurl.site",
 				Resources: map[string]*common.ResourceInfo{
 					"default": {ACId: "ac-001", Hostname: "h", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}},
 				},
@@ -597,6 +901,7 @@ func TestAuthWithHttp_Metrics_NilCallbacksDoNotPanic(t *testing.T) {
 		AuthWithHttpCallbackFunc: func(*common.HttpKnockRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 			return &common.ServerKnockAckMsg{ResourceHost: map[string]string{"default": "10.0.0.1:443"}}, nil
 		},
+		ResolveResourceFunc: defaultCatalogResolver(),
 		// RecordLatency and IncrCounter intentionally nil.
 	}
 

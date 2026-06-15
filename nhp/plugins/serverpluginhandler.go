@@ -216,6 +216,34 @@ type NhpPluginPostAuthFunc func(*common.NhpAuthRequest, *common.ResourceData) (*
 
 type HttpPluginPostAuthFunc func(*common.HttpKnockRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error)
 
+// HttpPluginResolveResourceFunc resolves AC routing for (aspId, resId) from the
+// host server's own resource catalog — the same storage-backed resolution the
+// headless /nhp/internal/knock path uses. It exists so an HTTP plugin can open
+// pinholes against catalog-authoritative routing instead of trusting routing
+// data carried in its own upstream response body (layervai/nhp#2540).
+//
+// No ctx parameter by design: the host wires this to a shutdown-scoped
+// (lifecycle) context, NOT the plugin's per-request context. The underlying
+// catalog lookup singleflights concurrent knocks for the same hot resource, and
+// its closure captures the first caller's context — a per-request context would
+// fan a single client's disconnect out to every piggybacked live caller (and to
+// the headless path, which shares the singleflight group). So the lookup is
+// uncancelable by a browser close; the plugin attributes a client disconnect at
+// the knock step instead.
+//
+// srcIP is the client IP; its role depends on the row type. For the static/ASP-
+// placement branch it is the source-identity placement key that selects an AC.
+// For the dynamic qURL (q_) rows the qURL plugin actually resolves, the lookup
+// is an exact (aspId, resId) match, so srcIP is NOT an AC-selection key there and
+// does NOT become the pinhole key — the resolver writes it onto a throwaway
+// lookup request and discards it; it only satisfies the resolver's fail-closed
+// non-empty check (the actual L3 pinhole source key is the knock request's own
+// SrcIp). Returns the resolved ResourceData (caller reads its Resources map and
+// OpenTime — the latter as the catalog ceiling for its own downward clamp) or an
+// error on a catalog miss / lookup failure — callers MUST fail closed rather
+// than fall back to body-supplied routing.
+type HttpPluginResolveResourceFunc func(aspId, resId, srcIP string) (*common.ResourceData, error)
+
 type NhpServerPluginHelper struct {
 	StopSignal              <-chan struct{}
 	AuthWithNhpCallbackFunc NhpPluginPostAuthFunc
@@ -248,6 +276,14 @@ type NhpServerPluginHelper struct {
 type HttpServerPluginHelper struct {
 	StopSignal               <-chan struct{}
 	AuthWithHttpCallbackFunc HttpPluginPostAuthFunc
+
+	// ResolveResourceFunc resolves AC routing from the host server's
+	// catalog (see HttpPluginResolveResourceFunc). The qURL plugin uses it
+	// so AC pinhole routing comes from the NHP catalog rather than the
+	// qurl-service resolve-response body (#2540). nil-safe: like the metric
+	// emitters below, hand-built helpers (unit tests) may leave it nil, so
+	// callers must branch on `!= nil` and fail closed when it is.
+	ResolveResourceFunc HttpPluginResolveResourceFunc
 
 	// Metric emitters routed through the host server's CloudWatch
 	// publisher. Plugins must treat these as nil-safe — the publisher

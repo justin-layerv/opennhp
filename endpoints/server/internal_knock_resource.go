@@ -49,7 +49,7 @@ func (hs *HttpServer) resolveInternalKnockResource(ctx context.Context, req *com
 		return nil, errInternalKnockServerNotReady
 	}
 	srcIP := strings.TrimSpace(req.SrcIp)
-	dynamicQURLResource := aspID == qurlInternalKnockAuthServiceID && isQURLDynamicResourceID(resourceID)
+	dynamicQURLResource := aspID == qurlInternalKnockAuthServiceID && IsQURLDynamicResourceID(resourceID)
 	if dynamicQURLResource && srcIP == "" {
 		// Dynamic rows choose the AC directly from storage, but the downstream
 		// L3 pinhole still needs qurl-service's caller IP as its source key.
@@ -102,12 +102,29 @@ func (hs *HttpServer) resolveInternalKnockResource(ctx context.Context, req *com
 	if resolved.OpenTime == 0 {
 		resolved.OpenTime = DefaultIpOpenTime
 	}
-	// No lower floor: any positive caller value below the stored cap is a
-	// stricter pinhole window, so allowing 1s is intentionally safe.
-	if callerResource != nil && callerResource.OpenTime > 0 && callerResource.OpenTime < resolved.OpenTime {
-		resolved.OpenTime = callerResource.OpenTime
+	// The caller value may only LOWER the stored cap (a stricter pinhole window);
+	// no lower floor, so allowing 1s is intentionally safe. ClampOpenTimeDownward
+	// is the single source of truth for this rule — the qURL plugin applies it to
+	// the same effect (it passes callerResource=nil here and clamps locally,
+	// since ResolveResourceFunc carries no override).
+	if callerResource != nil {
+		resolved.OpenTime = ClampOpenTimeDownward(resolved.OpenTime, callerResource.OpenTime)
 	}
 	return resolved, nil
+}
+
+// ClampOpenTimeDownward applies the "an override may only LOWER the ceiling"
+// rule that governs AC pinhole windows (#2540): it returns override when it is a
+// positive value strictly below ceiling (a stricter window), otherwise ceiling.
+// Shared by the headless resolver (callerResource override) and the qURL plugin
+// (qurl-service response OpenTime vs. catalog cap) so the two cannot drift; a
+// caller minting an NHP-token open-time claim from the result keeps it coupled
+// to the pinhole window.
+func ClampOpenTimeDownward(ceiling, override uint32) uint32 {
+	if override > 0 && override < ceiling {
+		return override
+	}
+	return ceiling
 }
 
 func (hs *HttpServer) internalKnockResourceLookupContext() context.Context {
@@ -117,7 +134,12 @@ func (hs *HttpServer) internalKnockResourceLookupContext() context.Context {
 	return hs.udpServer.LifecycleCtx()
 }
 
-func isQURLDynamicResourceID(resourceID string) bool {
+// IsQURLDynamicResourceID reports whether resourceID is a dynamic qURL catalog
+// key — the "q_" + 11-hex-char display id qurl-service mints (QurlDisplayID).
+// Exported so the qURL plugin can fail fast on a malformed NHPResourceID at
+// response-validation time using the same predicate the resolver uses to select
+// the dynamic-row lookup, so the two cannot drift (#2540).
+func IsQURLDynamicResourceID(resourceID string) bool {
 	if len(resourceID) != len(qurlDynamicResourcePrefix)+qurlDynamicResourceHexLength ||
 		!strings.HasPrefix(resourceID, qurlDynamicResourcePrefix) {
 		return false

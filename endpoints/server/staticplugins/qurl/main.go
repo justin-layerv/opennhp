@@ -1,6 +1,7 @@
 package qurl
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -228,17 +229,118 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		return nil, err
 	}
 
-	log.Info("[QURL] [req_id=%s] Token resolved successfully: resource_id=%s, resources=%d", requestID, resolveResp.ResourceID, len(resolveResp.Resources))
+	log.Info("[QURL] [req_id=%s] Token resolved successfully: resource_id=%s, nhp_resource_id=%s", requestID, resolveResp.ResourceID, resolveResp.NHPResourceID)
 
-	// Build ResourceData from the resolved response
-	res := buildResourceData(resolveResp)
+	// Resolve AC pinhole routing from the server-owned catalog, NOT from the
+	// qurl-service resolve response. The response's `resources` map is
+	// qurl-service's own mint-time copy mirrored into NHP's catalog; consuming
+	// it here makes the qurl-service body a redundant routing authority that
+	// can silently drift from the catalog the headless /nhp/internal/knock path
+	// already trusts (#2540, mirror of #1209/#2310). NHPResourceID is the q_
+	// display id qurl-service publishes as the catalog key at mint
+	// (upsertNHPCatalogForToken); for these dynamic q_ rows the lookup is by
+	// exact (aspId, resId), so ctx.ClientIP() passed here is not an AC-selection
+	// key and does not become the pinhole key — the resolver writes it onto a
+	// throwaway lookup request and discards it; it only satisfies the resolver's
+	// fail-closed non-empty SrcIp guard. The actual L3 pinhole source key is the
+	// knock request's own SrcIp (set to ctx.ClientIP() by the plugin router —
+	// same value, different field). Fail closed on any miss/error — do not fall
+	// back to body-supplied routing, which would reintroduce the drift authority
+	// this closes.
+	if helper.ResolveResourceFunc == nil {
+		// Unreachable in production: NewHttpServerHelper always wires this. A nil
+		// here is an NHP wiring regression, not a qurl-service catalog-publish
+		// gap — so attribute it to FailUnknown (the "this shouldn't happen"
+		// sentinel) and keep FailResolveCatalog a pure rollout signal.
+		log.Error("[QURL] [req_id=%s] catalog resolver not wired; cannot resolve AC routing", requestID)
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "resource_routing_unavailable",
+			"message": "Resource routing is temporarily unavailable",
+		})
+		outcome = nhpserver.MetricQurlResolveFailUnknown
+		return nil, errors.New("catalog resolver not configured")
+	}
+	// An empty client IP is an ingress/proxy misconfiguration (the NLB/CloudFront
+	// edge always populates it), not a qurl-service catalog gap. The resolver
+	// would reject the empty SrcIp on the dynamic q_ row as a generic
+	// ErrResourceNotFound; attribute it up front to FailUnknown instead so
+	// FailResolveCatalog stays a pure publish-gap signal.
+	srcIP := ctx.ClientIP()
+	if srcIP == "" {
+		log.Error("[QURL] [req_id=%s] empty client IP; cannot resolve AC routing", requestID)
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "resource_routing_unavailable",
+			"message": "Resource routing is temporarily unavailable",
+		})
+		outcome = nhpserver.MetricQurlResolveFailUnknown
+		return nil, errors.New("empty client IP")
+	}
+	// PluginID ("qurl") must equal the server's qurlInternalKnockAuthServiceID
+	// for resolveInternalKnockResource to select the dynamic q_ exact-row branch;
+	// if they ever diverge every resolve misses into ASP-placement and surfaces
+	// as FailResolveCatalog. Both are the stable literal "qurl".
+	catalogStart := time.Now()
+	catalogRes, err := helper.ResolveResourceFunc(PluginID, resolveResp.NHPResourceID, srcIP)
+	recordSince(nhpserver.MetricQurlResolveCatalogResolveMs, catalogStart)
+	if err != nil || catalogRes == nil || len(catalogRes.Resources) == 0 {
+		// A context.Canceled here means the lookup's lifecycle context was
+		// canceled by graceful shutdown — the lookup is intentionally
+		// uncancelable by a browser close (see ResolveResourceFunc), so this is a
+		// drain race, not a qurl-service catalog-publish gap. Attribute it to
+		// FailCanceled and keep FailResolveCatalog — the load-bearing rollout
+		// signal — pure. A DynamoDB timeout surfaces as DeadlineExceeded (not
+		// Canceled) and correctly falls through to FailResolveCatalog.
+		if errors.Is(err, context.Canceled) {
+			log.Warning("[QURL] [req_id=%s] catalog routing resolution canceled (server shutting down): %v", requestID, err)
+			ctx.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "request_canceled",
+				"message": "Request canceled before access was opened",
+			})
+			outcome = nhpserver.MetricQurlResolveFailCanceled
+			return nil, fmt.Errorf("catalog resolution canceled: %w", err)
+		}
+		// Distinguish "resolver errored" from "resolver returned no routing" so the
+		// log doesn't read as a failure with a <nil> cause in the empty-map case.
+		if err != nil {
+			log.Error("[QURL] [req_id=%s] catalog routing resolution failed for nhp_resource_id=%s: %v", requestID, resolveResp.NHPResourceID, err)
+		} else {
+			log.Error("[QURL] [req_id=%s] catalog returned no routing for nhp_resource_id=%s", requestID, resolveResp.NHPResourceID)
+		}
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "resource_routing_unresolved",
+			"message": "Failed to resolve resource routing",
+		})
+		outcome = nhpserver.MetricQurlResolveFailResolveCatalog
+		if err != nil {
+			return nil, fmt.Errorf("catalog routing resolution failed: %w", err)
+		}
+		return nil, errors.New("catalog routing resolution returned no resources")
+	}
+
+	// Effective pinhole window: the catalog row's OpenTime is the ceiling; the
+	// qurl-service response value (computed per-qURL, coupled to session_duration)
+	// may only LOWER it. ClampOpenTimeDownward is the shared rule the headless
+	// resolver applies via its callerResource override — using it here keeps the
+	// pinhole session-coupled AND defends against any response OpenTime that
+	// exceeds the catalog row's value, with no drift between the two paths.
+	// catalogRes.OpenTime is > 0 (the resolver floors it to DefaultIpOpenTime), so
+	// a zero/absent response OpenTime falls back to the catalog value rather than
+	// minting a zero-second token.
+	openTime := nhpserver.ClampOpenTimeDownward(catalogRes.OpenTime, resolveResp.OpenTime)
+
+	// Build ResourceData for the knock. Routing (Resources) is catalog-owned;
+	// ResourceId (public r_ id) stays from the resolve response so the minted
+	// NHP-token claims match it.
+	res := buildResourceData(resolveResp, catalogRes.Resources, openTime)
 
 	// Trigger NHP knock via helper callback.
 	// Retry on failure: timed-out connections are closed after the first failure,
 	// so subsequent attempts use fresh connections. This handles transient AC
 	// connectivity issues during blue/green deployments or network blips.
 	// The retry loop is context-aware: if the client disconnects or the HTTP
-	// write deadline passes, retries stop to avoid wasted work.
+	// write deadline passes, retries stop to avoid wasted work. The knock (unlike
+	// the catalog lookup) is per-request and not singleflighted, so the request
+	// context is the right scope here.
 	reqCtx := ctx.Request.Context()
 	knockTotalStart := time.Now()
 	for attempt := 1; attempt <= knockMaxAttempts; attempt++ {
@@ -472,14 +574,30 @@ func getOrCreateRequestID(ctx *gin.Context) string {
 	return id
 }
 
-// buildResourceData constructs a ResourceData from the QURL API response
-func buildResourceData(resp *ResolveResponse) *common.ResourceData {
+// buildResourceData constructs a ResourceData for the NHP knock from the QURL
+// API response and the catalog-resolved AC routing.
+//
+// catalogResources is the server-owned routing map (ACId + dst addr per
+// resource) resolved from the NHP catalog by AuthWithHttp — NOT resp.Resources.
+// The qurl-service response is trusted only for non-routing metadata: the
+// public ResourceId (carried into the minted NHP-token claim), the JWT/cookie
+// ExInfo, and the redirect target.
+//
+// openTime is the effective pinhole window the caller computed as
+// min(catalog row OpenTime, response value) — see AuthWithHttp. qurl-service
+// couples the response OpenTime to session_duration; the caller clamps it to the
+// catalog row's value defensively so a response value can never widen the
+// pinhole past what the catalog intends — the same downward override the
+// headless /nhp/internal/knock path enforces. The NHP token minted below is
+// signed from this same value, keeping its open-time claim coupled to the
+// pinhole window.
+func buildResourceData(resp *ResolveResponse, catalogResources map[string]*common.ResourceInfo, openTime uint32) *common.ResourceData {
 	return &common.ResourceData{
 		ResourceGroup: common.ResourceGroup{
 			ResourceId:    resp.ResourceID,
 			AuthServiceId: PluginID,
-			OpenTime:      resp.OpenTime,
-			Resources:     resp.Resources,
+			OpenTime:      openTime,
+			Resources:     catalogResources,
 		},
 		ExInfo: map[string]any{
 			ExInfoKeyJWTSecret:       resp.JWTSecret,

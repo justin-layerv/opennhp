@@ -19,6 +19,48 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/plugins"
 )
 
+// testNHPResourceID is the q_ display id used by tests as the catalog key the
+// #2540 plugin path resolves AC routing by. It matches qurl-service's
+// QurlDisplayID format (q_ + 11 hex) so IsQURLDynamicResourceID accepts it.
+const testNHPResourceID = "q_0123456789a"
+
+// defaultCatalogResolver returns a ResolveResourceFunc that stands in for the
+// host server's catalog lookup (#2540): given (aspId, resId) it returns a valid
+// single-AC routing map, mirroring the shape resolveInternalKnockResource
+// produces from a dynamic q_ catalog row. AuthWithHttp's catalog step needs a
+// non-empty Resources map to proceed to the knock; the content is otherwise
+// inert (no test inspects res.Resources).
+func defaultCatalogResolver() plugins.HttpPluginResolveResourceFunc {
+	return func(aspId, resId, _ string) (*common.ResourceData, error) {
+		return &common.ResourceData{
+			ResourceGroup: common.ResourceGroup{
+				AuthServiceId: aspId,
+				ResourceId:    resId,
+				OpenTime:      300,
+				Resources: map[string]*common.ResourceInfo{
+					resId: {
+						ACId:       "ac-catalog",
+						Hostname:   "catalog.example.com",
+						PortSuffix: true,
+						Addr:       &common.NetAddress{Port: 443, Protocol: "tcp"},
+					},
+				},
+			},
+			SkipAuth: true,
+		}, nil
+	}
+}
+
+// knockHelper builds a full-flow HTTP plugin helper: the given success/knock
+// callback plus the default #2540 catalog resolver so AuthWithHttp reaches the
+// knock instead of failing closed at the catalog step.
+func knockHelper(cb plugins.HttpPluginPostAuthFunc) *plugins.HttpServerPluginHelper {
+	return &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: cb,
+		ResolveResourceFunc:      defaultCatalogResolver(),
+	}
+}
+
 func init() {
 	gin.SetMode(gin.TestMode)
 }
@@ -260,16 +302,28 @@ func TestNhpDrop(t *testing.T) {
 
 func TestBuildResourceData(t *testing.T) {
 	resp := &ResolveResponse{
-		ResourceID:   "r_test123",
-		TargetURL:    "https://backend.example.com",
-		QurlSiteURL:  "https://r_test123.qurl.site",
-		JWTSecret:    "test-secret",
-		TokenExpire:  3600,
-		OpenTime:     300,
-		CookieDomain: ".qurl.site",
+		ResourceID:    "r_test123",
+		NHPResourceID: testNHPResourceID,
+		TargetURL:     "https://backend.example.com",
+		QurlSiteURL:   "https://r_test123.qurl.site",
+		JWTSecret:     "test-secret",
+		TokenExpire:   3600,
+		OpenTime:      300,
+		CookieDomain:  ".qurl.site",
+		// Body-supplied routing that MUST be ignored (#2540): buildResourceData
+		// takes its Resources from the catalog argument, never from resp.
+		Resources: map[string]*common.ResourceInfo{
+			"body-should-be-ignored": {ACId: "ac-body", Addr: &common.NetAddress{Ip: "9.9.9.9", Port: 1}},
+		},
+	}
+	catalogResources := map[string]*common.ResourceInfo{
+		testNHPResourceID: {ACId: "ac-catalog", Hostname: "catalog.example.com", Addr: &common.NetAddress{Port: 443}},
 	}
 
-	res := buildResourceData(resp)
+	// openTime is the caller-computed effective window (passed in), NOT
+	// resp.OpenTime — use a distinct value so a regression that reads
+	// resp.OpenTime (300) instead of the argument (180) is caught.
+	res := buildResourceData(resp, catalogResources, 180)
 
 	if res.ResourceId != "r_test123" {
 		t.Errorf("ResourceId = %q, want %q", res.ResourceId, "r_test123")
@@ -277,14 +331,26 @@ func TestBuildResourceData(t *testing.T) {
 	if res.AuthServiceId != PluginID {
 		t.Errorf("AuthServiceId = %q, want %q", res.AuthServiceId, PluginID)
 	}
-	if res.OpenTime != 300 {
-		t.Errorf("OpenTime = %d, want %d", res.OpenTime, 300)
+	if res.OpenTime != 180 {
+		t.Errorf("OpenTime = %d, want caller-supplied %d (not resp.OpenTime)", res.OpenTime, 180)
 	}
 	if res.RedirectUrl != "https://r_test123.qurl.site" {
 		t.Errorf("RedirectUrl = %q, want %q", res.RedirectUrl, "https://r_test123.qurl.site")
 	}
 	if res.CookieDomain != ".qurl.site" {
 		t.Errorf("CookieDomain = %q, want %q", res.CookieDomain, ".qurl.site")
+	}
+
+	// Routing must come from the catalog argument, not resp.Resources.
+	if _, leaked := res.Resources["body-should-be-ignored"]; leaked {
+		t.Error("buildResourceData used resp.Resources; it must use the catalog argument (#2540)")
+	}
+	info, ok := res.Resources[testNHPResourceID]
+	if !ok {
+		t.Fatalf("catalog routing missing: res.Resources = %v", res.Resources)
+	}
+	if info.ACId != "ac-catalog" {
+		t.Errorf("ACId = %q, want catalog-supplied %q", info.ACId, "ac-catalog")
 	}
 
 	// Check ExInfo
@@ -320,9 +386,10 @@ func TestAuthWithHttp_FullFlow_POST(t *testing.T) {
 		resp := internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:  "r_test123",
-				TargetURL:   "https://backend.example.com",
-				QurlSiteURL: "https://r_test123.qurl.site",
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_test123",
+				TargetURL:     "https://backend.example.com",
+				QurlSiteURL:   "https://r_test123.qurl.site",
 				Resources: map[string]*common.ResourceInfo{
 					"default": {
 						ACId:     "ac-001",
@@ -362,6 +429,7 @@ func TestAuthWithHttp_FullFlow_POST(t *testing.T) {
 	// Create mock helper with callback
 	callbackCalled := false
 	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: defaultCatalogResolver(),
 		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 			callbackCalled = true
 			// Verify resource data was passed correctly
@@ -442,9 +510,10 @@ func TestAuthWithHttp_FullFlow_GET_BackwardCompat(t *testing.T) {
 		resp := internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:  "r_test123",
-				TargetURL:   "https://backend.example.com",
-				QurlSiteURL: "https://r_test123.qurl.site",
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_test123",
+				TargetURL:     "https://backend.example.com",
+				QurlSiteURL:   "https://r_test123.qurl.site",
 				Resources: map[string]*common.ResourceInfo{
 					"default": {
 						ACId:     "ac-001",
@@ -495,9 +564,10 @@ func TestAuthWithHttp_POST_EmptyBody_FallsBackToQuery(t *testing.T) {
 		resp := internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:  "r_test123",
-				TargetURL:   "https://backend.example.com",
-				QurlSiteURL: "https://r_test123.qurl.site",
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_test123",
+				TargetURL:     "https://backend.example.com",
+				QurlSiteURL:   "https://r_test123.qurl.site",
 				Resources: map[string]*common.ResourceInfo{
 					"default": {
 						ACId:     "ac-001",
@@ -575,6 +645,12 @@ type customDomainTestSetup struct {
 func setupCustomDomainTest(t *testing.T, resp *ResolveResponse) *customDomainTestSetup {
 	t.Helper()
 
+	// validateResolveResponse now requires nhp_resource_id (#2540); default it
+	// so existing fixtures that predate the field still resolve successfully.
+	if resp.NHPResourceID == "" {
+		resp.NHPResourceID = testNHPResourceID
+	}
+
 	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(internalResolveResponse{Success: true, Data: resp})
@@ -607,13 +683,11 @@ func setupCustomDomainTest(t *testing.T, resp *ResolveResponse) *customDomainTes
 
 // successKnockHelper returns a helper whose callback always succeeds.
 func successKnockHelper() *plugins.HttpServerPluginHelper {
-	return &plugins.HttpServerPluginHelper{
-		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
-			return &common.ServerKnockAckMsg{
-				ResourceHost: map[string]string{"default": "10.0.0.1:443"},
-			}, nil
-		},
-	}
+	return knockHelper(func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+		return &common.ServerKnockAckMsg{
+			ResourceHost: map[string]string{"default": "10.0.0.1:443"},
+		}, nil
+	})
 }
 
 func TestAuthWithHttp_CustomDomain_FullFlow(t *testing.T) {
@@ -636,6 +710,7 @@ func TestAuthWithHttp_CustomDomain_FullFlow(t *testing.T) {
 	})
 
 	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: defaultCatalogResolver(),
 		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 			if res.CookieDomain != ".mycorp.com" {
 				t.Errorf("callback received wrong CookieDomain: %s", res.CookieDomain)
@@ -751,8 +826,9 @@ func TestAuthWithHttp_GeneratesRequestIDWhenMissing(t *testing.T) {
 		resp := internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:  "r_generated",
-				QurlSiteURL: "https://r_generated.qurl.site",
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_generated",
+				QurlSiteURL:   "https://r_generated.qurl.site",
 				Resources: map[string]*common.ResourceInfo{
 					"default": {
 						ACId:     "ac-001",
@@ -787,6 +863,7 @@ func TestAuthWithHttp_GeneratesRequestIDWhenMissing(t *testing.T) {
 	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: defaultCatalogResolver(),
 		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 			return &common.ServerKnockAckMsg{
 				ResourceHost: map[string]string{"default": "10.0.0.1:443"},
@@ -924,9 +1001,10 @@ func TestAuthWithHttp_KnockRetrySuccess(t *testing.T) {
 		resp := internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:  "r_retry",
-				TargetURL:   "https://backend.example.com",
-				QurlSiteURL: "https://r_retry.qurl.site",
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_retry",
+				TargetURL:     "https://backend.example.com",
+				QurlSiteURL:   "https://r_retry.qurl.site",
 				Resources: map[string]*common.ResourceInfo{
 					"default": {
 						ACId:     "ac-001",
@@ -963,6 +1041,7 @@ func TestAuthWithHttp_KnockRetrySuccess(t *testing.T) {
 	// First knock fails, second succeeds
 	var attempts int
 	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: defaultCatalogResolver(),
 		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 			attempts++
 			if attempts == 1 {
@@ -997,9 +1076,10 @@ func TestAuthWithHttp_KnockRetryExhausted(t *testing.T) {
 		resp := internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:  "r_fail",
-				TargetURL:   "https://backend.example.com",
-				QurlSiteURL: "https://r_fail.qurl.site",
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_fail",
+				TargetURL:     "https://backend.example.com",
+				QurlSiteURL:   "https://r_fail.qurl.site",
 				Resources: map[string]*common.ResourceInfo{
 					"default": {
 						ACId:     "ac-001",
@@ -1036,6 +1116,7 @@ func TestAuthWithHttp_KnockRetryExhausted(t *testing.T) {
 	// Both knock attempts fail
 	var attempts int
 	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: defaultCatalogResolver(),
 		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 			attempts++
 			return nil, errors.New("AC connection closed")
@@ -1115,13 +1196,14 @@ func TestAuthWithHttp_AcceptJSON_KnockFailedStaysJSON(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(internalResolveResponse{
 			Success: true,
 			Data: &ResolveResponse{
-				ResourceID:   "r_knockfail",
-				QurlSiteURL:  "https://r_knockfail.qurl.site",
-				Resources:    map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
-				JWTSecret:    "test-jwt-secret-key-for-signing",
-				TokenExpire:  3600,
-				OpenTime:     300,
-				CookieDomain: ".qurl.site",
+				NHPResourceID: testNHPResourceID,
+				ResourceID:    "r_knockfail",
+				QurlSiteURL:   "https://r_knockfail.qurl.site",
+				Resources:     map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+				JWTSecret:     "test-jwt-secret-key-for-signing",
+				TokenExpire:   3600,
+				OpenTime:      300,
+				CookieDomain:  ".qurl.site",
 			},
 		})
 	}))
@@ -1146,6 +1228,7 @@ func TestAuthWithHttp_AcceptJSON_KnockFailedStaysJSON(t *testing.T) {
 	// Helper that always fails the knock — exhausts retries and
 	// triggers the 5xx knock_failed branch.
 	helper := &plugins.HttpServerPluginHelper{
+		ResolveResourceFunc: defaultCatalogResolver(),
 		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 			return nil, errors.New("AC connection closed")
 		},
@@ -1632,7 +1715,7 @@ func TestBuildResourceData_ExInfoKeys(t *testing.T) {
 		Resources:       map[string]*common.ResourceInfo{},
 	}
 
-	data := buildResourceData(resp)
+	data := buildResourceData(resp, nil, resp.OpenTime)
 
 	// Verify all ExInfo keys are present
 	if data.ExInfo[ExInfoKeyJWTSecret] != "secret" {
@@ -1647,7 +1730,7 @@ func TestBuildResourceData_ExInfoKeys(t *testing.T) {
 
 	// Verify SessionDuration=0 is also propagated (NHP server needs to see it)
 	resp.SessionDuration = 0
-	data = buildResourceData(resp)
+	data = buildResourceData(resp, nil, resp.OpenTime)
 	if data.ExInfo[ExInfoKeySessionDuration] != 0 {
 		t.Errorf("ExInfo[SessionDuration] = %v, want 0", data.ExInfo[ExInfoKeySessionDuration])
 	}

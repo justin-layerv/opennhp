@@ -32,8 +32,8 @@ var (
 	// ErrServiceError indicates an internal error in the QURL service
 	ErrServiceError = errors.New("qurl service error")
 	// ErrInvalidResolveResponse indicates the QURL API returned structurally
-	// invalid data (e.g., missing resources, nil addresses). This is distinct
-	// from token/policy errors and indicates a configuration issue.
+	// invalid data (e.g., missing nhp_resource_id). This is distinct from
+	// token/policy errors and indicates a configuration issue.
 	ErrInvalidResolveResponse = errors.New("invalid resolve response")
 
 	// ErrQurlAccessDenied indicates qurl-service has no active session for the
@@ -82,9 +82,18 @@ type ResolveResponse struct {
 	// QurlSiteURL is the URL to redirect the user to (e.g., "https://r_9f3a2c8e.qurl.site")
 	QurlSiteURL string `json:"qurl_site_url"`
 
-	// NHPResourceID is the mapping to NHP resource configuration
+	// NHPResourceID is the qURL display id (q_…) qurl-service publishes as
+	// the key of the per-qURL routing row in NHP's catalog at mint
+	// (upsertNHPCatalogForToken). The plugin resolves AC routing from the
+	// catalog by this id (#2540), so it is required (validateResolveResponse).
 	NHPResourceID string `json:"nhp_resource_id"`
-	// Resources contains NHP resource info for the knock
+	// Resources is qurl-service's mint-time copy of the NHP routing map. As of
+	// #2540 the plugin no longer consumes it — AC routing is resolved from the
+	// server-owned catalog by NHPResourceID instead. The field is retained only
+	// to deserialize current qurl-service responses; layervai/qurl-service#823
+	// removes it from the wire once this change is deployed. (No omitempty: this
+	// struct is only ever deserialized from qurl-service, never re-serialized,
+	// so the tag option would be a no-op.)
 	Resources map[string]*common.ResourceInfo `json:"resources"`
 
 	// JWTSecret is the secret used to sign NHP tokens for this resource
@@ -314,30 +323,25 @@ func (r *QurlResolver) Authorize(ctx context.Context, resourceID, clientIP, requ
 	}
 }
 
-// validateResolveResponse checks that the QURL API returned all fields
-// required for a successful NHP knock. Missing fields here would cause
-// a downstream knock failure with a less actionable error message.
+// validateResolveResponse checks that the QURL API returned the fields the
+// plugin still depends on for a successful NHP knock. Missing fields here would
+// cause a downstream failure with a less actionable error message.
+//
+// AC routing is deliberately NOT validated here: as of #2540 the plugin
+// resolves routing from the server-owned catalog keyed by NHPResourceID, so the
+// response's `resources` map is ignored (and removed entirely by qurl-service
+// in layervai/qurl-service#823). NHPResourceID is now the load-bearing field:
+// without it there is no catalog key, and it must be a dynamic qURL key (q_ +
+// 11 hex) so the resolver takes the exact-row lookup the plugin's qURLs use. A
+// malformed id would otherwise pass, fall through to the ASP-placement branch,
+// and surface as a generic FailResolveCatalog miss — so fail fast here with an
+// actionable FailValidate using the resolver's own predicate (no drift).
 func validateResolveResponse(resp *ResolveResponse) error {
-	if len(resp.Resources) == 0 {
-		return errors.New("QURL API returned empty resources — ensure the resource has NHP configuration")
+	if resp.NHPResourceID == "" {
+		return errors.New("QURL API returned empty nhp_resource_id — required to resolve AC routing from the NHP catalog")
 	}
-
-	for name, info := range resp.Resources {
-		if info == nil {
-			return fmt.Errorf("resource %q is nil", name)
-		}
-		if info.ACId == "" {
-			return fmt.Errorf("resource %q has empty ACId", name)
-		}
-		if info.Addr == nil {
-			return fmt.Errorf("resource %q has nil address — QURL API must include addr with ip and port", name)
-		}
-		if info.Addr.Ip == "" {
-			return fmt.Errorf("resource %q has empty IP address", name)
-		}
-		if info.Addr.Port == 0 {
-			return fmt.Errorf("resource %q has zero port", name)
-		}
+	if !nhpserver.IsQURLDynamicResourceID(resp.NHPResourceID) {
+		return fmt.Errorf("QURL API returned nhp_resource_id %q that is not a dynamic qURL catalog key (expected q_ + 11 hex)", resp.NHPResourceID)
 	}
 
 	return nil

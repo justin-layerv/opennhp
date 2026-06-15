@@ -1966,7 +1966,7 @@
     {
       "id": 121,
       "title": "qURL Resolve p999 (server-side)",
-      "description": "Server-side p999 latency for the /plugins/qurl resolve endpoint. Overall = total handler duration; Token-validate = Auth0 introspection; Knock = all knock attempts + inter-attempt retry sleeps; Knock-attempt = a single AuthWithHttpCallback invocation (the wire knock + post-knock wait that one attempt does). A spike in Knock with stable Knock-attempt means retries are doing the work; a Knock-attempt spike points at AC/NHP itself. Period: 300s to match the existing KnockLatency panels in nhp-infrastructure.json — at sandbox traffic rates, 60s p99.9 buckets are too sparse. No thresholds: the four metrics are nested (Overall = TokenValidate + Knock + handler work), so any uniform threshold would either trip on Overall in steady state (Auth0 tail + knock tail are additive) or under-fire on the components. Read the lines. At <200 req/min the 5-min p99.9 bucket holds <1000 samples and the percentile is mathematically max-dominated — treat it as an outlier detector at sandbox traffic, not a true tail. Cell filter: $cell_id is sourced from qurl-api Prometheus labels and piped here into the CloudWatch Cell dim on NHP server metrics; this works because qurl-api and nhp-server in any given env are deployed from the same per-cell tfvars and share the cell0/cell1/... naming. A future divergence would silently produce empty panels — same caveat applies to every CloudWatch panel in nhp-infrastructure.json.",
+      "description": "Server-side p999 latency for the /plugins/qurl resolve endpoint. Overall = total handler duration; Token-validate = Auth0 introspection; Catalog-resolve = NHP catalog routing lookup by (qurl, q_resId) after token-validate (#2540, cache-hit sub-ms, fresh-mint miss adds one DynamoDB GetItem); Knock = all knock attempts + inter-attempt retry sleeps; Knock-attempt = a single AuthWithHttpCallback invocation (the wire knock + post-knock wait that one attempt does). A spike in Knock with stable Knock-attempt means retries are doing the work; a Knock-attempt spike points at AC/NHP itself. Period: 300s to match the existing KnockLatency panels in nhp-infrastructure.json — at sandbox traffic rates, 60s p99.9 buckets are too sparse. No thresholds: the five metrics are nested (Overall = TokenValidate + CatalogResolve + Knock + handler work), so any uniform threshold would either trip on Overall in steady state (Auth0 tail + knock tail are additive) or under-fire on the components. Read the lines. At <200 req/min the 5-min p99.9 bucket holds <1000 samples and the percentile is mathematically max-dominated — treat it as an outlier detector at sandbox traffic, not a true tail. Cell filter: $cell_id is sourced from qurl-api Prometheus labels and piped here into the CloudWatch Cell dim on NHP server metrics; this works because qurl-api and nhp-server in any given env are deployed from the same per-cell tfvars and share the cell0/cell1/... naming. A future divergence would silently produce empty panels — same caveat applies to every CloudWatch panel in nhp-infrastructure.json.",
       "type": "timeseries",
       "datasource": {
         "type": "cloudwatch",
@@ -2064,6 +2064,23 @@
           "period": "300",
           "region": "default",
           "label": "Knock-attempt p999",
+          "statistic": "p99.9",
+          "queryMode": "Metrics",
+          "metricQueryType": 0,
+          "metricEditorMode": 0
+        },
+        {
+          "refId": "E",
+          "namespace": "LayerV/NHP",
+          "metricName": "QurlResolveCatalogResolveMs",
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Cell": ["$cell_id"]
+          },
+          "matchExact": false,
+          "period": "300",
+          "region": "default",
+          "label": "Catalog-resolve p999",
           "statistic": "p99.9",
           "queryMode": "Metrics",
           "metricQueryType": 0,
@@ -2219,7 +2236,7 @@
     {
       "id": 123,
       "title": "Resolve Outcomes & Knock Retries",
-      "description": "Sum (per 5-min CloudWatch period) of resolve outcomes: Success vs each terminal failure (Fail{Validate,Knock,PostKnock,Canceled,Unknown}), plus KnockRetry. KnockRetry increments once per failed knock attempt that still has retries remaining — a resolve succeeding on attempt 3 contributes 2; a resolve failing all attempts contributes (knockMaxAttempts - 1) and drags FailKnock up with it. Reading: a KnockRetry spike with Success flat and FailKnock flat means retries are silently masking transient AC flakiness — investigate the underlying knock-attempt latency. FailCanceled rising (NOT FailKnock) is the \"retries gave up early\" signal — it means the request context died mid-retry-loop. Eyeball error rate by comparing the Fail* lines against the Success line on the same axes. Quiet periods show as no line at all (CloudWatch returns gaps, not zeros, for absent observations); 'no line' is not a broken metric. Browser-side validation rejections (QurlResolveBrowserRejected{Malformed,OutOfRange}) are tracked separately in CloudWatch and not surfaced here yet. Colors are pinned (Success green; Fail* warm red/orange; KnockRetry yellow) so an operator scanning the panel sees a red/orange swell without reading labels.",
+      "description": "Sum (per 5-min CloudWatch period) of resolve outcomes: Success vs each terminal failure (Fail{Validate,ResolveCatalog,Knock,PostKnock,Canceled,Unknown}), plus KnockRetry. FailResolveCatalog (#2540) fires when a validated token's AC routing can't be resolved from the NHP catalog before the knock — a sustained non-zero rate during the #2540 rollout means qurl-service is not publishing the q_ catalog rows the plugin now requires; it must stay ~0 in steady state. KnockRetry increments once per failed knock attempt that still has retries remaining — a resolve succeeding on attempt 3 contributes 2; a resolve failing all attempts contributes (knockMaxAttempts - 1) and drags FailKnock up with it. Reading: a KnockRetry spike with Success flat and FailKnock flat means retries are silently masking transient AC flakiness — investigate the underlying knock-attempt latency. FailCanceled rising (NOT FailKnock) is the \"retries gave up early\" signal — it means the request context died mid-retry-loop. Eyeball error rate by comparing the Fail* lines against the Success line on the same axes. Quiet periods show as no line at all (CloudWatch returns gaps, not zeros, for absent observations); 'no line' is not a broken metric. Browser-side validation rejections (QurlResolveBrowserRejected{Malformed,OutOfRange}) are tracked separately in CloudWatch and not surfaced here yet. Colors are pinned (Success green; Fail* warm red/orange; KnockRetry yellow) so an operator scanning the panel sees a red/orange swell without reading labels.",
       "type": "timeseries",
       "datasource": {
         "type": "cloudwatch",
@@ -2345,6 +2362,21 @@
                 "value": {
                   "mode": "fixed",
                   "fixedColor": "magenta"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "FailResolveCatalog"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "semi-dark-orange"
                 }
               }
             ]
@@ -2475,6 +2507,23 @@
           "period": "300",
           "region": "default",
           "label": "FailUnknown",
+          "statistic": "Sum",
+          "queryMode": "Metrics",
+          "metricQueryType": 0,
+          "metricEditorMode": 0
+        },
+        {
+          "refId": "H",
+          "namespace": "LayerV/NHP",
+          "metricName": "QurlResolveFailResolveCatalog",
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Cell": ["$cell_id"]
+          },
+          "matchExact": false,
+          "period": "300",
+          "region": "default",
+          "label": "FailResolveCatalog",
           "statistic": "Sum",
           "queryMode": "Metrics",
           "metricQueryType": 0,

@@ -400,7 +400,7 @@ func (l *ResourceLookup) LookupResource(ctx context.Context, aspId, resourceID s
 	if l == nil || aspId == "" || resourceID == "" || l.querier == nil {
 		return nil, ErrResourceUnknownResource
 	}
-	if aspId != qurlInternalKnockAuthServiceID || !isQURLDynamicResourceID(resourceID) {
+	if aspId != qurlInternalKnockAuthServiceID || !IsQURLDynamicResourceID(resourceID) {
 		return nil, ErrResourceUnknownResource
 	}
 
@@ -667,6 +667,20 @@ func (l *ResourceLookup) resourceDataFromRow(aspId string, row Resource, direct 
 	if row.ResourceFQDN == "" {
 		log.Warning("resource lookup: skipping %s with empty resource_fqdn partition=%q aspId=%q resource_id=%q ac_id=%q",
 			rowKind, partitionID, aspId, row.ResourceID, row.ACID)
+		if l.metrics != nil {
+			l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
+		}
+		return nil, false
+	}
+	if row.ACID == "" {
+		// An empty ac_id leaves the knock with no AC to open a pinhole on; the
+		// open path would otherwise reach the AC dispatch and fail with a less
+		// actionable error. Reject the malformed row at the lookup boundary so
+		// both the headless /nhp/internal/knock path and the qURL plugin path
+		// (#2540) fail closed here — the local empty-ACId guard the plugin's
+		// validateResolveResponse used to provide now lives here for both.
+		log.Warning("resource lookup: skipping %s with empty ac_id partition=%q aspId=%q resource_id=%q",
+			rowKind, partitionID, aspId, row.ResourceID)
 		if l.metrics != nil {
 			l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
 		}
