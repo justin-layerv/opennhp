@@ -33,7 +33,7 @@ Ported incrementally, each step its own PR:
    (`test/testdata/knock.json`): the TS side pins the bytes
    (`handshake.test.ts`) and the **real Go responder decrypts them**
    (`nhp/core/js_agent_roundtrip_test.go`). Test-only — no Go production change.
-4. **ACK decrypt (this PR)** — `ack.ts` (`decryptReply`), the responder side:
+4. **ACK decrypt** (#2600) — `ack.ts` (`decryptReply`), the responder side:
    the browser decrypts the server's `NHP_ACK` / `NHP_COK` reply
    (`responder.go` from the agent's perspective). The recovered server static
    key is checked against the one knocked — pinning the server identity, with the
@@ -42,9 +42,23 @@ Ported incrementally, each step its own PR:
    by a frozen Go-generated
    fixture (`test/testdata/ack.json`) decrypted by **both** TS (`ack.test.ts`)
    and the Go responder (`nhp/core/js_agent_ack_roundtrip_test.go`).
-5. **Agent loop** — knock / re-knock, the HTTPS relay transport, and the
-   qurl-service contracts the server pinned: the `r_` resource id and the
-   `52024` "session expired → re-resolve" deny code (#2550).
+5. **Agent loop** — landing incrementally:
+   - **a. Production knock builder (this PR)** — `agent/knock.ts` (`createKnock`)
+     wraps the fixture-fenced `buildKnock` with the per-knock values the agent
+     randomises/stamps at runtime: a fresh CSPRNG ephemeral, transaction counter,
+     and header preamble, plus the send timestamp (capped to Go's int64
+     `UnixNano`). `buildKnock` stays fixture-fenced; the wrapper is
+     property-tested (distinct ephemeral / counter / nonce per knock).
+   - **b. Relay transport + knock loop** — `POST /relay/{serverId}`
+     (octet-stream), then dispatch the `NHP_ACK` reply (tokens on success, the
+     `52024` "session expired → re-resolve" deny code #2550) and correlate the
+     reply counter back to the knock (anti-replay, #2603).
+   - **c. Overload cookie-challenge** — `NHP_COK` → `NHP_RKN` re-knock folding in
+     the server cookie (`responder.go` sends it only when overloaded; it is _not_
+     the renewal path).
+   - **d. Re-knock renewal scheduler** — re-knock (a fresh `NHP_KNK`, spec Step 8)
+     before Access Duration expires; the background-tab renewal contract is a
+     product decision, deferred.
 6. **Bundling** for the qurl.link page.
 
 GMSM (SM2/SM3/SM4) is intentionally **not** ported — this fork strips it, so the
