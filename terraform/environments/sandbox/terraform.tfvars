@@ -816,23 +816,23 @@ bootstrap_alb_manage_dns_alias      = true
 # Closes #2084.
 bootstrap_alb_elb_5xx_threshold_per_minute = 1
 
-# `bootstrap_alb_waf_count_only_rule_groups` deliberately omitted
-# (empty default = full enforce) for this dark-launch window. The
-# variable description in `terraform/variables.tf` recommends
-# `["AWSManagedRulesAnonymousIpList", "AWSManagedRulesCommonRuleSet"]`
-# for the first 2-4 weeks of sandbox bootstrap traffic
-# (AnonymousIpList false-positives on customer VPN egress; CRS body-
-# inspection false-positives on PEM-wrapped public keys). It's
-# deferred here because there's NO real bootstrap traffic during the
-# window between this PR and the paired qurl-service data-plane PR —
-# the ALB returns 503 on `/v1/agent/bootstrap` (no healthy targets)
-# and nothing produces the PEM payloads the recommendation guards
-# against. The count-only flip lands in the same PR that wires
-# qurl-service ECS against this ALB's target group, so AnonymousIpList
-# + CRS land in count-only observation mode the moment real traffic
-# first hits the surface; they flip to enforce after the 2-4 week
-# watch (per the variable description's recommendation). Tracked at
-# nhp #1982.
+# Count-only AWSManagedRulesAmazonIpReputationList: its IP-reputation sub-rules
+# categorically false-positive on cloud / hosting / datacenter source IPs —
+# both the live-sandbox connector smoke run from GitHub-hosted (Azure) runners
+# (layervai/qurl-connector#347) and real cloud-deployed connector sidecars —
+# 403'ing them at the ALB with no qurl-service log entry. This mirrors the
+# qurl_resolve edge WAF, which already counts this exact rule for the same
+# public-edge false-positive (see aws_wafv2_web_acl.qurl_resolve in
+# terraform/main.tf). The load-bearing defenses still enforce: the per-API-key
+# bootstrap rate limit (10/hr, in qurl-service) and the per-source-IP WAF
+# rate-limit rule. HostingProviderIPList (the AnonymousIpList cloud sub-rule) is
+# separately count-only'd via the bootstrap-alb module's rule_action_override
+# (nhp #2604).
+#
+# AnonymousIpList + CommonRuleSet stay at full enforce here; their separate
+# count-only watch-period flip (customer-VPN-egress / PEM-body CRS
+# false-positives) remains tracked at nhp #1982.
+bootstrap_alb_waf_count_only_rule_groups = ["AWSManagedRulesAmazonIpReputationList"]
 
 tags = {
   Organization = "LayerV"

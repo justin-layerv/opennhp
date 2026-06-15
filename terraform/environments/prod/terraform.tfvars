@@ -410,7 +410,17 @@ bootstrap_alb_elb_5xx_threshold_per_minute = 1
 # body-inspection false-positives on PEM-wrapped public keys. Flip to enforce
 # after the watch period — tracked in #2238 (also covers populating
 # bootstrap_alb_cross_account_subscriber_arns post-activation).
-bootstrap_alb_waf_count_only_rule_groups = ["AWSManagedRulesAnonymousIpList", "AWSManagedRulesCommonRuleSet"]
+#
+# AWSManagedRulesAmazonIpReputationList is count-only for a DIFFERENT, durable
+# reason — NOT the watch period: its IP-reputation sub-rules categorically
+# false-positive on cloud / hosting / datacenter source IPs, which is where
+# connector sidecars run (AWS Nitro / GCP Confidential Space). Enforcing it 403s
+# legitimate cloud-deployed agents at the ALB with no qurl-service log entry.
+# This mirrors the qurl_resolve edge WAF (aws_wafv2_web_acl.qurl_resolve,
+# terraform/main.tf), which counts the same rule for the same reason. The
+# #2238 flip-to-enforce applies to AnonymousIpList + CRS only — leave
+# AmazonIpReputationList count-only.
+bootstrap_alb_waf_count_only_rule_groups = ["AWSManagedRulesAmazonIpReputationList", "AWSManagedRulesAnonymousIpList", "AWSManagedRulesCommonRuleSet"]
 
 # Interim alarm routing for go-live. Unlike sandbox's dark launch (where the
 # bootstrap-alb alarms had nowhere to go ON PURPOSE), this PR activates real
