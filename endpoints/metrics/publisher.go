@@ -195,6 +195,15 @@ func (mp *Publisher) recoverFromCheckpoint() {
 	mp.mergeCheckpoint(cp)
 	// Merge succeeded; the on-disk copy has been absorbed into in-memory
 	// state and any subsequent flush will publish (or re-checkpoint) it.
+	//
+	// Replay-stamping caveat: recovered metrics are re-stamped at the next
+	// flush()'s flushStart, not their original event time, so the
+	// "within one flushInterval of true event time" property does not hold for
+	// them. The staleness drop above bounds the error — a checkpoint older than
+	// 2*flushInterval is discarded, so replayed events are at most ~staleness +
+	// one flush interval (~3 min) stale and can never approach CloudWatch's
+	// ~2-week past-validity window. Seeding the stamp from cp.Timestamp would
+	// close the gap; tracked in #2602.
 	removeCheckpoint(mp.checkpointDir)
 	log.Info("recovered metrics checkpoint from %s (age=%s)",
 		mp.checkpointDir, cpAge.Truncate(time.Second))
@@ -484,6 +493,36 @@ func (mp *Publisher) probeHealth() {
 // observability data is best-effort, and merging failed metrics back into the
 // live maps would add complexity and risk double-counting.
 func (mp *Publisher) flush() {
+	// Stamp every datapoint in this batch with one wall-clock instant,
+	// captured here just before the lock. The map swap a few microseconds later
+	// is the precise close of the accumulation window, so an event arriving in
+	// that sliver is included in this batch yet stamped marginally (sub-ms)
+	// before it occurred — negligible negative skew against the ~60s tolerance.
+	// Without an explicit MetricDatum.Timestamp,
+	// CloudWatch stamps each datapoint at PutMetricData *receive* time, which
+	// is not event time and — with sparse traffic plus get-metric-data period
+	// alignment — makes forensic correlation unreliable (#1257). Events in this
+	// batch occurred roughly one flushInterval (60s) before this instant — a
+	// little more if a preceding flush ran long, since flush() is synchronous
+	// on the ticker goroutine and PutMetricData can block up to apiTimeout per
+	// batch while the ticker coalesces — but batches are tiny in practice, so
+	// the window stays close to 60s.
+	//
+	// This is host-clock-derived (time.Now), so datapoint time now tracks EC2
+	// NTP health rather than the CloudWatch ingest clock — an intentional
+	// trade, since receive time was never event time. Sharper consequence: an
+	// explicit timestamp is subject to CloudWatch's validity window
+	// (PutMetricData rejects datums more than ~2h in the future or ~2 weeks in
+	// the past), which receive-time stamping could never trip — so a host clock
+	// skewed past that window gets its whole batch rejected. We deliberately do
+	// NOT clamp to the window: the only reference available here is this same
+	// (skewed) clock, so a clamp would be tautological. The rejection is not
+	// silent — the PutMetricData error path below logs it and bumps
+	// MetricPublisherFailure, and a persistently skewed clock degrades to the
+	// absence-of-metric alarms (treat_missing_data="breaching") that already
+	// backstop total publish failure.
+	flushStart := time.Now()
+
 	mp.mu.Lock()
 	counters := mp.counters
 	dimCounters := mp.dimCounters
@@ -513,9 +552,9 @@ func (mp *Publisher) flush() {
 		removeCheckpoint(mp.checkpointDir)
 	}
 
-	mp.emitEMF(latencies)
+	mp.emitEMF(flushStart, latencies)
 
-	metricData := mp.buildMetricData(counters, dimCounters, gauges, latencies)
+	metricData := mp.buildMetricData(flushStart, counters, dimCounters, gauges, latencies)
 
 	if len(metricData) == 0 {
 		return
@@ -607,11 +646,17 @@ func (mp *Publisher) writeEMFEvent(event map[string]any, warnContext string) {
 	}
 }
 
-func (mp *Publisher) emitEMF(latencies map[string][]float64) {
+// emitEMF writes accumulated latency observations as EMF events. ts is the
+// flush instant captured once by flush() and shared with buildMetricData, so
+// the EMF latency events and the PutMetricData statistic set for the same
+// latencies in the same flush carry an identical timestamp (one flush → one
+// event time). The one-shot EmitEMFMetricNow path keeps its own time.Now()
+// because it emits immediately rather than at flush.
+func (mp *Publisher) emitEMF(ts time.Time, latencies map[string][]float64) {
 	if mp.emfWriter == nil {
 		return
 	}
-	ts := time.Now().UnixMilli()
+	tsMs := ts.UnixMilli()
 	dimNames, dimValues := packDims(mp.dims)
 	for name, values := range latencies {
 		if len(values) == 0 {
@@ -622,7 +667,7 @@ func (mp *Publisher) emitEMF(latencies map[string][]float64) {
 			if end > len(values) {
 				end = len(values)
 			}
-			event := buildEMFEvent(mp.namespace, name, emfUnitMilliseconds, dimNames, dimValues, values[i:end], ts)
+			event := buildEMFEvent(mp.namespace, name, emfUnitMilliseconds, dimNames, dimValues, values[i:end], tsMs)
 			mp.writeEMFEvent(event, "EMF latency event for "+name)
 		}
 	}
@@ -687,13 +732,23 @@ func buildEMFEvent(namespace, metricName, unit string, dimNames []string, dimVal
 
 // buildMetricData converts accumulated metrics into CloudWatch MetricDatum slices.
 // Extracted from flush() to enable testing the metric data pipeline without an API call.
+// Every datum is stamped with ts — the single wall-clock instant flush() captures at the
+// start of the flush — so all datums in a batch share one (approximately) event time
+// instead of PutMetricData receive time.
 func (mp *Publisher) buildMetricData(
+	ts time.Time,
 	counters map[string]float64,
 	dimCounters map[string]*dimCounterEntry,
 	gauges map[string]float64,
 	latencies map[string][]float64,
 ) []types.MetricDatum {
 	var metricData []types.MetricDatum
+
+	// Every datum in this flush shares the one captured instant, so build the
+	// pointer once and reuse it across all kinds below. Safe because the SDK
+	// treats MetricDatum.Timestamp as read-only request input — it is never
+	// mutated after construction.
+	tsPtr := aws.Time(ts)
 
 	// Flush counters (skip 0 — means the counter wasn't incremented this interval)
 	for name, value := range counters {
@@ -705,6 +760,7 @@ func (mp *Publisher) buildMetricData(
 			Dimensions: mp.dims,
 			Value:      aws.Float64(value),
 			Unit:       types.StandardUnitCount,
+			Timestamp:  tsPtr,
 		})
 	}
 
@@ -718,6 +774,7 @@ func (mp *Publisher) buildMetricData(
 			Dimensions: entry.dims,
 			Value:      aws.Float64(entry.value),
 			Unit:       types.StandardUnitCount,
+			Timestamp:  tsPtr,
 		})
 	}
 
@@ -728,6 +785,7 @@ func (mp *Publisher) buildMetricData(
 			Dimensions: mp.dims,
 			Value:      aws.Float64(value),
 			Unit:       types.StandardUnitNone,
+			Timestamp:  tsPtr,
 		})
 	}
 
@@ -757,7 +815,8 @@ func (mp *Publisher) buildMetricData(
 				Sum:         aws.Float64(sum),
 				SampleCount: aws.Float64(float64(len(values))),
 			},
-			Unit: types.StandardUnitMilliseconds,
+			Unit:      types.StandardUnitMilliseconds,
+			Timestamp: tsPtr,
 		})
 	}
 

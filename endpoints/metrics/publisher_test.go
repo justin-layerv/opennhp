@@ -16,6 +16,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 )
 
+// testFlushInstant is the deterministic flush time threaded through the
+// metric-build and EMF tests so they can assert datums carry an exact,
+// reproducible timestamp (rather than a live time.Now). Shared so the fixture
+// lives in one place instead of being re-spelled at each call site.
+var testFlushInstant = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
 func TestNewPublisher_AWSUnavailable(t *testing.T) {
 	original := loadAWSConfig
 	loadAWSConfig = func(ctx context.Context, optFns ...func(*awsconfig.LoadOptions) error) (aws.Config, error) {
@@ -644,12 +650,30 @@ func TestPublisher_BuildMetricData(t *testing.T) {
 		},
 	}
 
+	// knownTS is the single flush instant threaded through buildMetricData.
+	// Every emitted datum — regardless of metric type — must carry exactly
+	// this timestamp. That is the "capture once per flush" property: it is what
+	// makes CloudWatch record each datapoint at (approximately) event time
+	// instead of PutMetricData receive time (#1257), and it is what regresses
+	// if someone later moves the capture into a per-datum loop.
+	knownTS := testFlushInstant
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mp := &Publisher{dims: sharedDims, stop: make(chan struct{})}
-			data := mp.buildMetricData(tt.counters, tt.dimCounters, tt.gauges, tt.latencies)
+			data := mp.buildMetricData(knownTS, tt.counters, tt.dimCounters, tt.gauges, tt.latencies)
 			if len(data) != tt.wantCount {
 				t.Fatalf("expected %d metric datums, got %d", tt.wantCount, len(data))
+			}
+			for _, d := range data {
+				if d.Timestamp == nil {
+					t.Errorf("metric %q: Timestamp is nil, want the captured flush instant", aws.ToString(d.MetricName))
+					continue
+				}
+				if !d.Timestamp.Equal(knownTS) {
+					t.Errorf("metric %q: Timestamp = %s, want %s (every datum must carry the single captured flush instant)",
+						aws.ToString(d.MetricName), d.Timestamp.Format(time.RFC3339Nano), knownTS.Format(time.RFC3339Nano))
+				}
 			}
 			if tt.verify != nil {
 				tt.verify(t, data)
@@ -745,7 +769,13 @@ func TestPublisher_Flush_PutMetricDataPayload(t *testing.T) {
 	mp.RecordLatency("KnockLatency", 20)
 	mp.RecordLatency("KnockLatency", 30)
 
+	// Bracket flush() so we can assert it stamps each datum with a real
+	// event-time instant (a recent time.Now), not the zero value or
+	// CloudWatch receive time. before/after bound the window flushStart
+	// must fall within.
+	before := time.Now()
 	mp.flush()
+	after := time.Now()
 
 	if len(mockCW.calls) != 1 {
 		t.Fatalf("expected 1 PutMetricData call, got %d", len(mockCW.calls))
@@ -762,6 +792,18 @@ func TestPublisher_Flush_PutMetricDataPayload(t *testing.T) {
 	for _, name := range []string{"KnockRequest", "RegistrationFailure", "KnockLatency"} {
 		if _, ok := byName[name]; !ok {
 			t.Errorf("missing expected metric %q in PutMetricData payload", name)
+		}
+	}
+	// Every datum carries a flush-time timestamp within [before, after].
+	for _, d := range call.MetricData {
+		if d.Timestamp == nil {
+			t.Errorf("metric %q: Timestamp is nil, want a flush-time instant", aws.ToString(d.MetricName))
+			continue
+		}
+		if d.Timestamp.Before(before) || d.Timestamp.After(after) {
+			t.Errorf("metric %q: Timestamp %s outside flush window [%s, %s]",
+				aws.ToString(d.MetricName), d.Timestamp.Format(time.RFC3339Nano),
+				before.Format(time.RFC3339Nano), after.Format(time.RFC3339Nano))
 		}
 	}
 }
@@ -888,7 +930,7 @@ func TestPublisher_Flush_PublisherFailure_RoundTrip(t *testing.T) {
 
 func TestEmitEMF_SingleMetric(t *testing.T) {
 	mp, buf := newTestPublisherWithEMF(t, nil)
-	mp.emitEMF(map[string][]float64{"KnockLatency": {10.5, 20.3, 5.1}})
+	mp.emitEMF(testFlushInstant, map[string][]float64{"KnockLatency": {10.5, 20.3, 5.1}})
 	events := parseEMFLines(t, buf.Bytes())
 	if len(events) != 1 {
 		t.Fatalf("expected 1 EMF event, got %d", len(events))
@@ -911,7 +953,7 @@ func TestEmitEMF_SingleMetric(t *testing.T) {
 
 func TestEmitEMF_SingleValue(t *testing.T) {
 	mp, buf := newTestPublisherWithEMF(t, nil)
-	mp.emitEMF(map[string][]float64{"KnockLatency": {42.5}})
+	mp.emitEMF(testFlushInstant, map[string][]float64{"KnockLatency": {42.5}})
 	events := parseEMFLines(t, buf.Bytes())
 	val, ok := events[0]["KnockLatency"].(float64)
 	if !ok {
@@ -919,6 +961,12 @@ func TestEmitEMF_SingleValue(t *testing.T) {
 	}
 	if val != 42.5 {
 		t.Errorf("expected 42.5, got %v", val)
+	}
+	// EMF events must carry the flush instant emitEMF was given — the same
+	// instant buildMetricData stamps onto the PutMetricData statistic set
+	// (one flush → one event time).
+	if got := emfTimestampMs(t, events[0]); got != testFlushInstant.UnixMilli() {
+		t.Errorf("EMF _aws.Timestamp = %d, want %d", got, testFlushInstant.UnixMilli())
 	}
 }
 
@@ -928,7 +976,7 @@ func TestEmitEMF_ChunkingOver150(t *testing.T) {
 	for i := range values {
 		values[i] = float64(i)
 	}
-	mp.emitEMF(map[string][]float64{"KnockLatency": values})
+	mp.emitEMF(testFlushInstant, map[string][]float64{"KnockLatency": values})
 	events := parseEMFLines(t, buf.Bytes())
 	if len(events) != 2 {
 		t.Fatalf("expected 2 EMF events, got %d", len(events))
@@ -938,7 +986,7 @@ func TestEmitEMF_ChunkingOver150(t *testing.T) {
 func TestEmitEMF_NilWriter(t *testing.T) {
 	mp := newTestPublisher(t, nil)
 	mp.emfWriter = nil
-	mp.emitEMF(map[string][]float64{"KnockLatency": {10.0}})
+	mp.emitEMF(testFlushInstant, map[string][]float64{"KnockLatency": {10.0}})
 }
 
 func TestFlush_EmitsEMFAlongsideStatisticSets(t *testing.T) {
@@ -963,6 +1011,37 @@ func TestFlush_EmitsEMFAlongsideStatisticSets(t *testing.T) {
 	if len(vals) != 2 {
 		t.Errorf("expected 2 EMF values, got %d", len(vals))
 	}
+
+	// Cross-sink invariant: the EMF latency event and the PutMetricData
+	// statistic-set datum for the same latency in the same flush must carry one
+	// identical timestamp (one flush -> one event time). flush() stamps both
+	// from a single flushStart, so the datum's Timestamp (UnixMilli) must equal
+	// the EMF event's _aws.Timestamp. Each sink is also checked against the
+	// injected instant elsewhere; this pins the two sinks to each other.
+	statDatum := byName["KnockLatency"]
+	if statDatum.Timestamp == nil {
+		t.Fatal("KnockLatency statistic-set datum missing Timestamp")
+	}
+	if emfTSMs := emfTimestampMs(t, events[0]); emfTSMs != statDatum.Timestamp.UnixMilli() {
+		t.Errorf("cross-sink timestamp mismatch: EMF _aws.Timestamp=%d, PutMetricData datum=%d (must be equal — one flush, one event time)",
+			emfTSMs, statDatum.Timestamp.UnixMilli())
+	}
+}
+
+// emfTimestampMs extracts the _aws.Timestamp (epoch millis) from a parsed EMF
+// event, failing the test if the block or field is missing or mistyped. JSON
+// numbers decode to float64.
+func emfTimestampMs(t *testing.T, event map[string]any) int64 {
+	t.Helper()
+	awsBlock, ok := event["_aws"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing _aws block, got %T", event["_aws"])
+	}
+	ts, ok := awsBlock["Timestamp"].(float64)
+	if !ok {
+		t.Fatalf("expected _aws.Timestamp number, got %T", awsBlock["Timestamp"])
+	}
+	return int64(ts)
 }
 
 func parseEMFLines(t *testing.T, data []byte) []map[string]any {
