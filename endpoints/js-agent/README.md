@@ -66,7 +66,7 @@ Ported incrementally, each step its own PR:
      server-side counter, so the relay drops it) and the fork lacks upstream's
      stateless cookies. The agent handles a COK gracefully meanwhile via the
      `cookieChallenge` result (timeout → re-resolve). Lands once #2611 does.
-   - **d. Re-knock renewal scheduler (this PR)** — `agent/scheduler.ts`
+   - **d. Re-knock renewal scheduler** (#2612) — `agent/scheduler.ts`
      (`startRenewal`): keeps an open grant alive by re-knocking a fresh `NHP_KNK`
      (via the loop's `knock`, so it's live-reachable — no relay-COK dependency) at
      `openTime × (1 − margin) ± jitter`, rescheduling off each new grant. The
@@ -80,7 +80,28 @@ Ported incrementally, each step its own PR:
      server/relay-side **grace window** that would avoid that is a separate
      follow-up. No Go fence — pure browser orchestration; the load-bearing tests
      are the foreground-recovery and single-flight paths.
-6. **Bundling** for the qurl.link page.
+6. **Bundling (this PR)** — `npm run bundle` (esbuild) emits one self-contained
+   ESM file, `dist/nhp-agent.min.js` (~23 KB gzipped), with the `@noble` suite
+   inlined, for the qurl.link page to load as a same-origin
+   `<script type="module" src>`. This is the Phase-1 packaging deliverable of
+   #2208 — a `dist/`-gitignored artifact built on demand by the deploy pipeline;
+   **nothing imports it yet**, it is consumed by the Phase-2 page migration
+   (Phase-2 #6, which also needs the relay deployed first). `test/bundle.test.ts`
+   gates the gzip budget and the runtime public-export surface via esbuild's
+   metafile (no execution — node has no DOM; that end-to-end seam is #2616).
+   **Phase-2 prerequisites:** (1) the qurl-link CloudFront CSP is
+   `script-src 'unsafe-inline'` today (no `'self'`), so mounting the external
+   module needs `'self'` added to `script-src` in
+   `terraform/modules/qurl-link/main.tf` — a deliberately separate change; and
+   (2) pin the artifact with **Subresource Integrity** (`integrity="sha384-…"` on
+   the `<script>` + a matching CSP hash-source), not just `'self'` — the bundle is
+   built on demand and uncommitted, so for a crypto agent that gates resource
+   access, pinning the exact bytes beats trusting the origin. The SRI hash is only
+   reproducible if the bundler is pinned: the lockfile is authoritative for
+   `npm ci`, but esbuild's `^` floats on a bare `npm install`, and a bundler bump
+   silently changes the emitted bytes (and the hash) — exact-pin esbuild or compute
+   the hash from the deploy build. (Relatedly, `npm audit --omit=dev` doesn't watch
+   esbuild, so its advisories ride the lockfile + Dependabot, not the runtime audit.)
 
 GMSM (SM2/SM3/SM4) is intentionally **not** ported — this fork strips it, so the
 runtime dependency surface is the noble suite only: `@noble/hashes` (BLAKE2s /
@@ -93,6 +114,7 @@ cd endpoints/js-agent
 npm ci
 npm test           # vitest — Go-golden-vector fences (fingerprint, KDF) + crypto KATs
 npm run build      # typecheck: tsc over the src (browser-only) AND test (Node) configs
+npm run bundle     # esbuild → dist/nhp-agent.min.js (ESM, @noble inlined), gzip-budget gated
 npm run lint       # ESLint (flat config; mirrors the Go golangci-lint gate)
 npm run format     # Prettier --write (CI runs `format:check` to verify)
 ```

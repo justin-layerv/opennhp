@@ -1,7 +1,10 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "types": ["node"]
+    "types": ["node"],
+    // Follow the test's import of the plain-JS build script so its `// @ts-check`
+    // JSDoc is verified here (no separate .d.mts to drift from the implementation).
+    "allowJs": true
   },
   "include": ["test"]
 }

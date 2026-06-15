@@ -12,5 +12,14 @@ export default tseslint.config(
   { ignores: ["dist", "coverage", "node_modules"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
+  // The Node build script (`scripts/bundle.mjs`) is plain JS, so typescript-eslint's
+  // no-undef-off (it trusts tsc) doesn't apply — declare the Node globals it uses.
+  {
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      sourceType: "module",
+      globals: { process: "readonly", console: "readonly" },
+    },
+  },
   prettier,
 );

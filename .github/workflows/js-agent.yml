@@ -97,3 +97,8 @@ jobs:
         run: npm run format:check
       - name: Typecheck
         run: npm run build
+      - name: Bundle (size budget)
+        # Build the real dist/ artifact and fail if it exceeds the gzip budget.
+        # bundle.test.ts checks the same via the shared options in-memory, but the
+        # script's own disk-write + process.exit(1) gate path runs only here in CI.
+        run: npm run bundle
