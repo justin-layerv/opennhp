@@ -20,18 +20,20 @@ Ported incrementally, each step its own PR:
 
 1. **Fingerprint foundation** (#2555) — `pubKeyFingerprint`, the
    `POST /relay/{serverId}` routing id, fenced against the Go golden vectors.
-2. **Cipher-suite primitives (this PR)** — X25519, AES-256-GCM,
+2. **Cipher-suite primitives** (#2560) — X25519, AES-256-GCM,
    BLAKE2s/SHA-256, and the NHP HKDF (`NoiseFactory`) under `src/crypto/`. Each
    primitive is fenced against the Go golden vectors / known-answer tests it
    must agree with (`nhp/core/kdf_test.go` for the KDF; RFC 7748 / RFC 7693 /
    FIPS 180-4 / a standard AES-256-GCM KAT for the rest). Deterministic, so no
    handshake state yet.
-3. **Noise IK handshake + packet wire format** — assemble a knock from the
-   primitives (the 240-byte header + encrypted body). Interop is proven by
-   having Go **decrypt a TS-produced knock** (a committed round-trip fixture):
-   TS owns the ephemeral/timestamp/counter and emits the bytes; a Go test
-   decrypts them and asserts the recovered static key / timestamp / payload. No
-   Go production change, no fragile byte-reproduction.
+3. **Noise IK handshake + packet wire format (this PR)** — `packet.ts` (the
+   240-byte `HeaderCurve` codec + nonce + header digest) and `handshake.ts`
+   (`buildKnock`, the Noise IK key schedule from `nhp/core/initiator.go`).
+   Interop is proven mechanically by a committed fixture
+   (`test/testdata/knock.json`): the TS side pins the bytes
+   (`handshake.test.ts`) and the **real Go responder decrypts them**
+   (`nhp/core/js_agent_roundtrip_test.go` recovers the static key / timestamp /
+   body). The Go test is test-only — no Go production change.
 4. **Agent loop** — knock / re-knock, ACK handling, and the qurl-service
    contracts the server pinned: the `r_` resource id and the `52024`
    "session expired → re-resolve" deny code (#2550).
