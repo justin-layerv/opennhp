@@ -273,10 +273,50 @@ qurl_scanner_lambda_enabled = true
 # (14d for the DLQ if the consumer fails 3× redeliveries first).
 qurl_scanner_sqs_emit_enabled = true
 
-# Destructive scanner tombstone-write phase. Stays false until the
-# SQS producer/consumer flip above is already active and burn-in is
-# healthy.
-qurl_scanner_tombstone_write_enabled = false
+# Destructive scanner tombstone-write phase — flips the scanner Lambda
+# env to `QURL_SCANNER_ENABLE_TOMBSTONE_WRITE=true` so the per-minute
+# scan, after emitting `resource.closed`, also writes the qurl-service
+# DDB tombstone (`resource_tombstoned_at` / `tombstone_ttl`). That
+# tombstone is what makes a re-mint to a closed transit resource return
+# 410 Gone instead of silently re-opening it. See
+# `modules/qurl-service/variables.tf::qurl_scanner_tombstone_write_enabled`
+# and issue #2490 for the full chain.
+#
+# Requires `qurl_scanner_sqs_emit_enabled = true` (above) — enforced by
+# the module precondition in `modules/qurl-service/main.tf`: tombstoning
+# without the SQS consumer draining `resource.closed` would flip
+# resources to 410-Gone before the connector/bot cleanup ran.
+#
+# Gate met 2026-06-14: #2489 activated the SQS data path on 2026-06-12,
+# and the ~2-day burn-in is clean (sandbox, us-east-2):
+#   * scanner Lambda `Errors` = 0 across 2026-06-12 → 2026-06-14
+#   * scanner Lambda `Invocations` ≈ 1440/day (steady 1-per-minute tick)
+#   * `*-qurl-resource-lifecycle` queue `NumberOfMessagesSent` ==
+#     `NumberOfMessagesDeleted` each day (consumer fully draining)
+#   * main queue + `*-qurl-resource-lifecycle-dlq` both at depth 0
+# No DLQ accumulation, no errored ticks → the emit/consumer path the
+# tombstone write rides on is healthy. (`tombstone_errors` can't exist
+# yet — this flag is what first turns tombstone writes on.)
+#
+# On merge, build-and-push.yml auto-applies the `terraform/**` change on
+# push to main. This flag's only effect is the scanner Lambda env-var
+# add — no IAM, no new resources (the DDB grants landed with the
+# Lambda). The next 1-minute EventBridge tick begins writing tombstones
+# for resources it closes.
+#
+# Rollback is NOT fully reversible. Flipping back to `false` and
+# re-applying removes the env var so the scanner stops writing NEW
+# tombstones, but resources already tombstoned during the active window
+# stay tombstoned (the write is a durable DDB mutation with its own
+# `tombstone_ttl`; it is not un-done by removing the env var). Treat
+# re-mint-returns-410 as the expected, intended steady state once this
+# is on.
+#
+# Prod tfvars deliberately omits this var (defaults false) — prod
+# activation rides a separate follow-up after the sandbox e2e 410
+# verification, the #2326 HARD PROD preconditions, and #2491 (SNS alarm
+# wiring) all clear.
+qurl_scanner_tombstone_write_enabled = true
 
 # Hourly active-resource recheck scheduler. Stays false until the
 # per-minute tombstone-write phase above has burned in and qurl-service
