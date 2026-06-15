@@ -24,7 +24,7 @@ type MsgData struct {
 	RemoteAddr     *net.UDPAddr      // used by agent and ac create a new connection or pick an existing connection for msg sending
 	ConnData       *ConnectionData   // used by server to pick an existing connection for msg sending
 	PrevParserData *PacketParserData // when PrevParserData is set, CipherScheme, RemoteAddr, ConnData, TransactionId and PeerPk will be overridden
-	CipherScheme   int               // 0: curve25519/chacha20/blake2s
+	CipherScheme   int               // 0: curve25519/aes-256-gcm/blake2s
 	TransactionId  uint64
 	HeaderType     int
 	Compress       bool
