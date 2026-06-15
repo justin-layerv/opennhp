@@ -6,7 +6,7 @@
   "type": "module",
   "main": "./src/index.ts",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.19.0"
   },
   "scripts": {
     "build": "tsc --noEmit",
@@ -14,7 +14,9 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@noble/hashes": "^1.7.0"
+    "@noble/ciphers": "^2.2.0",
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.21",

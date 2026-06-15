@@ -1,7 +1,7 @@
-// `@noble/hashes/sha2` is the stable entry point; the per-algorithm
-// `@noble/hashes/sha256` subpath is deprecated in the 1.7+ line and removed in
-// 2.0. Both resolve to the identical implementation.
-import { sha256 } from "@noble/hashes/sha2";
+// `sha2` is the stable entry point (the per-algorithm `sha256` subpath was
+// removed in @noble/hashes 2.0). v2 requires the explicit `.js` extension on
+// subpath imports — its `exports` map no longer exposes the extensionless form.
+import { sha256 } from "@noble/hashes/sha2.js";
 
 /**
  * Length of a pubkey fingerprint string: base64url (no padding) of the first 8
