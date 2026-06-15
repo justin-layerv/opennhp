@@ -244,7 +244,18 @@ func TestHandleInternalKnock_HopPermit_InvalidAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build attestation: %v", err)
 	}
-	att.MAC = "00" + att.MAC[2:] // corrupt the MAC → verification fails
+	// Tamper one hex digit so the MAC always changes. The old
+	// "00"+att.MAC[2:] silently no-op'd whenever the time-keyed MAC already
+	// began with "00" (~1/256 of seconds, since the MAC signs time.Now via
+	// the signing string), letting the "corrupted" attestation verify clean,
+	// take the success branch instead of permit, and flake this assertion
+	// (#2558). '0'→'f' / else→'0' always differs from the original digit, so
+	// the MAC can never accidentally stay valid regardless of runner timing.
+	if att.MAC[0] == '0' {
+		att.MAC = "f" + att.MAC[1:]
+	} else {
+		att.MAC = "0" + att.MAC[1:]
+	}
 	fwdReq.Attestation = att
 
 	w := callHandleInternalKnock(t, hs, fwdReq)
