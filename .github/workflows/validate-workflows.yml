@@ -205,6 +205,17 @@ jobs:
           shellcheck .github/scripts/resolve-active-image-tag.sh tests/scripts/resolve-active-image-tag_test.sh
           bash tests/scripts/resolve-active-image-tag_test.sh
 
+      # Fence the blue/green dispatch planner (build-and-push.yml's infra-only
+      # deploy path). Pins that drifted server/AC tags fan out to one dispatch
+      # per component at its OWN tag — never one component at the other's tag —
+      # and that a blank tag fails closed instead of dispatching an empty
+      # image_tag. shellcheck both since actionlint's -shellcheck only covers
+      # workflow-embedded scripts.
+      - name: Test blue/green dispatch planner
+        run: |
+          shellcheck .github/scripts/plan-blue-green-dispatch.sh tests/scripts/plan-blue-green-dispatch_test.sh
+          bash tests/scripts/plan-blue-green-dispatch_test.sh
+
       # Shared by the Server and AC Packer post-processors. This keeps
       # Packer's region:ami-* artifact_id parsing from drifting across both
       # callers.

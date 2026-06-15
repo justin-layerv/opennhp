@@ -2281,9 +2281,18 @@ jobs:
     if: always() && needs.deploy-sandbox-infra.result == 'success' && needs.deploy-sandbox-infra.outputs.server_asg != ''
     runs-on: ubuntu-latest
     environment: sandbox
-    # Job timeout = poll timeout (40m) + 5min buffer so the dispatch script
-    # has room to print its final error before GitHub kills the job.
-    timeout-minutes: 45
+    # Job timeout must cover the dispatch step's worst case plus a buffer for
+    # the dispatch script to print its final timeout error before GitHub kills
+    # the job. The infra-only path dispatches blue/green twice in sequence when
+    # the server and AC active tags have drifted (plan-blue-green-dispatch.sh).
+    # Each dispatch-and-poll-blue-green.sh call can take its full find-run
+    # window (FIND_RETRIES 24 x 5s = 120s) before polling, plus the poll timeout
+    # (POLL_TIMEOUT 2400s = 40m) — ~42m — so two sequential dispatches reach
+    # ~84m, ~85m with this job's pre-steps (checkout / AWS / resolve). 90m keeps
+    # a ~5min buffer. The common single-dispatch path still finishes in ~10m;
+    # this ceiling only bites the rare double-deploy worst case, where a clean
+    # timeout error beats a runner kill.
+    timeout-minutes: 90
     # Job-level permissions REPLACE the workflow-level block in GitHub
     # Actions, so every scope this job needs has to be re-listed here even
     # if the workflow-level grants it.
@@ -2333,10 +2342,16 @@ jobs:
       #     built to avoid.
       #
       # Server and AC have independent active colours in SSM, so we read
-      # each one's current active tag separately. If they disagree, bail
-      # loudly — blue-green-deploy.yml only accepts a single image_tag
-      # input today, and the correct recovery is a manual dispatch with
-      # explicit per-component tags.
+      # each one's current active tag separately. They usually match (an
+      # app-changing commit deploys both at one github.sha), but can drift:
+      # a per-component manual dispatch, or a `both` deploy where only one
+      # colour's SSM tag advanced before the other failed/rolled back, leaves
+      # the two on different active tags. When they drift, the dispatch step
+      # below fans out to one blue/green dispatch per component at its own tag
+      # (plan-blue-green-dispatch.sh) instead of failing the deploy —
+      # blue-green-deploy.yml takes a single image_tag per dispatch, so two
+      # tags need two dispatches. (Previously this step hard-failed on drift,
+      # which wedged every infra-only commit until someone healed it by hand.)
       - name: Resolve Image Tag
         id: resolve-tag
         env:
@@ -2346,8 +2361,12 @@ jobs:
           set -euo pipefail
 
           if [[ "$APP_CHANGED" == "true" ]]; then
-            IMAGE_TAG="$GITHUB_SHA_INPUT"
-            echo "App code changed on this commit — dispatching with freshly-built tag: $IMAGE_TAG"
+            # Both components were freshly built and pushed at this github.sha,
+            # so both deploy the same tag (the planner collapses this to a
+            # single component=both dispatch).
+            SERVER_TAG="$GITHUB_SHA_INPUT"
+            AC_TAG="$GITHUB_SHA_INPUT"
+            echo "App code changed on this commit — dispatching both components with freshly-built tag: $GITHUB_SHA_INPUT"
             echo "source=github-sha" >> "$GITHUB_OUTPUT"
           else
             echo "No app code changes on this commit — resolving current active image tags from SSM so the blue/green refresh picks up any launch-template / user_data / boot-config changes from terraform apply."
@@ -2355,37 +2374,57 @@ jobs:
             AC_TAG=$(./.github/scripts/resolve-active-image-tag.sh sandbox ac)
             echo "  server active tag: $SERVER_TAG"
             echo "  ac     active tag: $AC_TAG"
-            if [[ "$SERVER_TAG" != "$AC_TAG" ]]; then
-              echo "::error::Server and AC active image tags differ (server=$SERVER_TAG, ac=$AC_TAG)."
-              echo "::error::blue-green-deploy.yml only accepts a single image_tag input today."
-              echo "::error::Dispatch blue-green-deploy.yml manually with the correct per-component tag, or bring the two colours back in sync with a component=both deploy."
-              exit 1
-            fi
-            IMAGE_TAG="$SERVER_TAG"
-            echo "Dispatching with resolved current tag: $IMAGE_TAG"
             echo "source=ssm-current" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "server_tag=$SERVER_TAG"
+            echo "ac_tag=$AC_TAG"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Dispatch Blue/Green Deploy
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          IMAGE_TAG: ${{ steps.resolve-tag.outputs.image_tag }}
+          SERVER_TAG: ${{ steps.resolve-tag.outputs.server_tag }}
+          AC_TAG: ${{ steps.resolve-tag.outputs.ac_tag }}
           IMAGE_TAG_SOURCE: ${{ steps.resolve-tag.outputs.source }}
-          # Poll budget MUST be lower than the job timeout above so the
-          # script can exit cleanly with an error message before GitHub
-          # kills the runner. 2400s (40m) leaves a 5min buffer under
-          # timeout-minutes: 45.
+          # Per-dispatch poll budget. MUST stay below the job timeout above so
+          # the script exits cleanly with an error before GitHub kills the
+          # runner. The drift path dispatches twice in sequence, so the 90m job
+          # timeout covers 2x this 40m budget (plus each dispatch's find-run
+          # window) + buffer (see timeout-minutes).
           POLL_TIMEOUT: "2400"
         run: |
+          set -euo pipefail
           echo "============================================"
           echo "DISPATCHING BLUE/GREEN DEPLOYMENT"
-          echo "  image_tag: $IMAGE_TAG"
-          echo "  source:    $IMAGE_TAG_SOURCE"
+          echo "  server tag: $SERVER_TAG"
+          echo "  ac tag:     $AC_TAG"
+          echo "  source:     $IMAGE_TAG_SOURCE"
           echo "============================================"
-          ./.github/scripts/dispatch-and-poll-blue-green.sh sandbox both "$IMAGE_TAG"
+
+          # plan-blue-green-dispatch.sh emits one non-blank "<component> <tag>"
+          # line per dispatch (fixture-tested): a single `both <tag>` when the
+          # tags match, or `server <s>` + `ac <a>` when they've drifted.
+          PLAN=$(./.github/scripts/plan-blue-green-dispatch.sh "$SERVER_TAG" "$AC_TAG")
+          echo "Dispatch plan:"
+          echo "$PLAN"
+
+          # Each dispatch blocks until its run completes, so the two drift-path
+          # dispatches run one at a time — serialised by the loop, not the
+          # blue-green-<env> concurrency group (which only guards against *other*
+          # triggers overlapping). Under set -e a failed dispatch aborts the loop
+          # and fails the step; a re-run re-dispatches an already-refreshed
+          # component at its tag — a full blue/green cycle (colour flip + ASG
+          # refresh) that is a no-op at the same image but not free. `< /dev/null`
+          # stops the called script from consuming the here-string and skipping
+          # the second component (gh doesn't read stdin today; the inner script
+          # evolves independently).
+          while read -r COMPONENT TAG; do
+            echo "--- Dispatching component=$COMPONENT tag=$TAG ---"
+            ./.github/scripts/dispatch-and-poll-blue-green.sh sandbox "$COMPONENT" "$TAG" </dev/null
+          done <<< "$PLAN"
 
   deploy-sandbox-validate:
     name: Deploy Sandbox - Validate
