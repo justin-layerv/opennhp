@@ -260,10 +260,11 @@ func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, messag
 // ART) with NO network reorder, because send timestamps are stamped by the
 // concurrent msgToPacketRoutine workers. The drop is unconditional, but
 // whether it ALSO escalates toward a connection block is gated per type by
-// shouldEscalateReplay (ART is drop-only, #1457). (2) it only sees
-// in-connection replays — the cross-connection ones (restart / failover /
-// NAT flush reset the state) are caught by the endpoint dedupe caches
-// (endpoints/ac/aop_replay_cache.go, endpoints/server/art_replay_cache.go).
+// shouldEscalateReplay (ART and AOP are drop-only, #1457/#2518).
+// (2) it only sees in-connection replays — the cross-connection ones
+// (restart / failover / NAT flush reset the state) are caught by the
+// endpoint dedupe caches (endpoints/ac/aop_replay_cache.go,
+// endpoints/server/art_replay_cache.go).
 func shouldCheckRecvAttack(deviceType int, peerType int, msgType int) bool {
 	return true
 }
@@ -288,15 +289,24 @@ func shouldCheckRecvAttack(deviceType int, peerType int, msgType int) bool {
 // cross-connection defense is the dedupe cache
 // (endpoints/server/art_replay_cache.go), not this per-connection block.
 //
-// NHP_AOP (server->AC) is NOT exempt here even though it has the symmetric
-// concurrent-stamping exposure: #1461 deliberately kept the replay gate as
-// AOP's sole remaining auto-block trigger ("a deliberate trade, not a side
-// effect" — see shouldEscalateStale), so revisiting that owned decision is
-// routed to its owner in #2518 rather than changed as a side effect of the
-// ART fix. Every other (deviceType, peerType, msgType) keeps the default
-// escalation.
+// NHP_AOP (server->AC) is exempt for the symmetric reason (#2518): its
+// send timestamp is stamped by the same concurrent msgToPacketRoutine
+// workers, so a server knock burst can deliver AOPs whose timestamps are
+// non-monotonic relative to arrival order with NO network reorder, and a
+// >=2-in-a-row regression would otherwise cross ThreatCountBeforeBlock and
+// SendBlockSignal — severing the trusted AEAD-authenticated server->AC
+// connection that the flood- and stale-escalation exemptions
+// (shouldCheckFlood, shouldEscalateStale) already protect. The drop still
+// rejects the replay; the cross-connection AC dedupe cache
+// (endpoints/ac/aop_replay_cache.go) is the real cross-connection defense.
+// #1461 deliberately deferred this symmetric step; #2518 takes it, removing
+// AOP's last per-connection auto-block. Every other (deviceType, peerType,
+// msgType) keeps the default escalation.
 func shouldEscalateReplay(deviceType int, peerType int, msgType int) bool {
 	if deviceType == NHP_SERVER && peerType == NHP_AC && msgType == NHP_ART {
+		return false
+	}
+	if deviceType == NHP_AC && peerType == NHP_SERVER && msgType == NHP_AOP {
 		return false
 	}
 	return true
@@ -399,15 +409,20 @@ func recvStalenessFloor(deviceType int, peerType int, msgType int) int64 {
 // weak rate-limit on a low-payoff stale-AOP flood — already largely
 // forgone by the flood-gate exemption.
 //
-// Accepted residual — with this exemption AOP is now exempt from both
-// the flood gate and the stale gate, leaving the replay gate
-// (shouldCheckRecvAttack, in-connection timestamp regression) as AOP's
-// SOLE remaining auto-block trigger. A replay flood on a *fresh*
-// connection (LastRemoteSendTime == 0, no regression) therefore can no
-// longer be source-blocked by any gate — but every such packet is
-// still dropped (no authz bypass) and the attacker is bounded by their
-// finite captured packets, each costing one already-required AEAD
-// decrypt. This is a deliberate trade, not a side effect.
+// Accepted residual — AOP is exempt from the flood gate
+// (shouldCheckFlood) and the stale gate (this predicate), and now also
+// from the replay-gate escalation (shouldEscalateReplay, #2518), so AOP
+// has NO remaining per-connection auto-block trigger: the replay gate
+// (shouldCheckRecvAttack) still DROPS an in-connection timestamp
+// regression, but no longer escalates it. An in-connection regression or
+// a replay flood on a *fresh* connection (LastRemoteSendTime == 0, no
+// regression) therefore can no longer be source-blocked by any gate —
+// but every such packet is still dropped (ErrReplayPacketReceived, no
+// authz bypass), the attacker is bounded by their finite captured
+// packets (each costing one already-required AEAD decrypt), and the
+// cross-connection AC dedupe cache (endpoints/ac/aop_replay_cache.go)
+// remains AOP's real replay defense. This is a deliberate trade, not a
+// side effect.
 //
 // NHP_ART (AC → server) keeps the default escalation: it is exempt
 // from the replay/flood gates but a genuinely stale ART is not an
@@ -545,21 +560,28 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 
 	if shouldCheckRecvAttack(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
 		if remoteSendTime < ppd.ConnData.LastRemoteSendTime {
-			// replay packet, drop
-			log.Critical("received replay packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
-			// Escalate the drop toward a connection block only where an
-			// in-connection timestamp regression is an attack signal rather
-			// than a likely benign reorder. NHP_ART (AC→server) is exempt
-			// (#1457): its send timestamp is stamped inside the concurrent
-			// msgToPacketRoutine workers (initiator.createMsgAssemblerData),
-			// so a knock burst can deliver regressed ARTs with NO network
+			// replay packet, drop. Escalate the drop toward a connection
+			// block only where an in-connection timestamp regression is an
+			// attack signal rather than a likely benign reorder. NHP_ART
+			// (AC→server, #1457) and NHP_AOP (server→AC, #2518) are both
+			// exempt: their send timestamps are stamped inside the concurrent
+			// msgToPacketRoutine workers (initiator.createMsgAssemblerData), so
+			// a knock burst can deliver regressed ARTs/AOPs with NO network
 			// reorder at all, and a >=2-in-a-row regression would otherwise
 			// cross ThreatCountBeforeBlock and SendBlockSignal — severing the
-			// trusted AC->server connection. The packet is still dropped
-			// (the replay is rejected) and the cross-connection cache is the
-			// real cross-connection defense; only the punitive block is
-			// waived. See shouldEscalateReplay.
-			if shouldEscalateReplay(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
+			// trusted, AEAD-authenticated AC↔server connection. The packet is
+			// still dropped (the replay is rejected) and the cross-connection
+			// dedupe caches are the real cross-connection defense; only the
+			// punitive block is waived. See shouldEscalateReplay.
+			escalate := shouldEscalateReplay(ppd.device.deviceType, peerDeviceType, ppd.HeaderType)
+			// Log severity tracks the escalation decision: for the drop-only
+			// exempt types an in-connection regression is an EXPECTED benign
+			// burst-reorder, so log at Warning to avoid Critical-level spam on
+			// healthy bursty connections (the AC dedupe cache already uses
+			// Warning for the same benign-retry reason); for escalating types
+			// the regression is a genuine attack signal and stays Critical.
+			if escalate {
+				log.Critical("received replay packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
 				// threat plus 1
 				threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
 				// with high queue number, the device may use ConnData channels when conn is already closed
@@ -569,6 +591,8 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 					// block source address
 					ppd.ConnData.SendBlockSignal()
 				}
+			} else {
+				log.Warning("received replay packet from %s, drop packet (drop-only type, not escalated)", ppd.ConnData.RemoteAddr.String())
 			}
 			err = ErrReplayPacketReceived
 			return err
