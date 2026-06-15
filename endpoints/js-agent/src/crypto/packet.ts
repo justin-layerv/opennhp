@@ -39,8 +39,10 @@ export const PACKET_BUFFER_SIZE = 4096;
 // plaintext body a caller can pass is `MAX_SEALED_BODY_SIZE - GCM_TAG_SIZE`.
 export const MAX_SEALED_BODY_SIZE = PACKET_BUFFER_SIZE - HEADER_SIZE;
 
-// Header types (`nhp/core/packet.go` iota: KPL=0, KNK=1, …, RKN=8).
+// Header types (`nhp/core/packet.go` iota: KPL=0, KNK=1, ACK=2, …, COK=7, RKN=8).
 export const NHP_KNK = 1;
+export const NHP_ACK = 2; // server → agent: knock result
+export const NHP_COK = 7; // server → agent: re-knock cookie
 export const NHP_RKN = 8;
 
 // Header flags (`nhp/common/packet.go`): EXTENDEDLENGTH = 1<<0, COMPRESS = 1<<1.
@@ -109,6 +111,15 @@ export function setVersion(
 export function setFlag(header: Uint8Array, flag: number): void {
   const masked = flag & ~(1 << 0) & 0x0fff;
   headerView(header).setUint16(10, masked, false);
+}
+
+/** Read the flag bits at HeaderCommon[10:12] — e.g. to test NHP_FLAG_COMPRESS on
+ * a received packet. Returns the raw uint16, mirroring Go `HeaderCurve.Flag()`
+ * (also unmasked); the value is ≤ 12 bits because `SetFlag` masks `0x0fff` on
+ * write, and the upper nibble is unused (the cipher scheme is a separate hardcoded
+ * constant — Go's `CipherScheme()` — not stored in these bits). */
+export function getFlag(header: Uint8Array): number {
+  return headerView(header).getUint16(10, false);
 }
 
 /** HeaderCommon[16:24] = counter (big-endian uint64). `HeaderCurve.SetCounter`. */
