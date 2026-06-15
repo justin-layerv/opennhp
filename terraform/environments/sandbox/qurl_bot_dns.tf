@@ -48,7 +48,15 @@ locals {
   # ...-2094914143... name is dead). CanonicalHostedZoneId stays the us-east-2
   # ELB constant Z3AADJGX6KTTL2 (the alias `zone_id` below), so only this line
   # changes on a re-home.
-  discord_bot_alb_dns_name = "qurl-bot-discord-sandbox-1482978767.us-east-2.elb.amazonaws.com"
+  #
+  # 2026-06-15 topology cutover: sandbox discord now serves from the v2 ALB
+  # (`qurl-bot-discord-sandbox-v2`, fronting the `http-v2` ECS service in the
+  # dedicated discord VPC) — matching prod's v2 topology. The old greenfield
+  # ALB (...-1482978767...) is decommissioned in a follow-up qurl-bot-discord
+  # teardown PR; this alias must point at v2 FIRST so the greenfield delete
+  # cannot dangle discord.layerv.xyz. Same us-east-2 ELB zone_id, so (as
+  # designed) only this one line changes.
+  discord_bot_alb_dns_name = "qurl-bot-discord-sandbox-v2-1393387203.us-east-2.elb.amazonaws.com"
 }
 
 # Env-root bot DNS records are same-account Route53 writers that consume the
@@ -169,7 +177,7 @@ resource "aws_route53_record" "slack_bot_alias" {
 }
 
 # Public alias for the discord bot — points discord.layerv.xyz at the
-# `qurl-bot-discord-sandbox` ALB in the qurl-integrations sandbox
+# `qurl-bot-discord-sandbox-v2` ALB in the qurl-integrations sandbox
 # account (730883236711, us-east-2). Same posture as the slack alias
 # above: cross-account, no provider alias, ALB DNSName + ELB hosted-
 # zone ID hardcoded.
@@ -179,7 +187,7 @@ resource "aws_route53_record" "slack_bot_alias" {
 #
 # ALB DNSName lookup post-PR-A apply (qurl-integrations-infra#421):
 #   AWS_PROFILE=layerv-integrations aws elbv2 describe-load-balancers \
-#     --names qurl-bot-discord-sandbox --region us-east-2 \
+#     --names qurl-bot-discord-sandbox-v2 --region us-east-2 \
 #     --query 'LoadBalancers[0].DNSName' --output text
 # OR from the qurl-integrations-infra workspace:
 #   `terraform output -raw alb_dns_name`  (PR A added this output)
