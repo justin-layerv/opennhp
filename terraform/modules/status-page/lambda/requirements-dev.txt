@@ -2,7 +2,7 @@
 # Install with: pip install -r requirements-dev.txt
 
 # Testing framework
-pytest>=8.0.0
+pytest>=8.4.2
 
 # AWS SDK (provided by Lambda runtime, needed for testing)
 boto3>=1.43.29
