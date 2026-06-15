@@ -43,16 +43,23 @@ Ported incrementally, each step its own PR:
    fixture (`test/testdata/ack.json`) decrypted by **both** TS (`ack.test.ts`)
    and the Go responder (`nhp/core/js_agent_ack_roundtrip_test.go`).
 5. **Agent loop** — landing incrementally:
-   - **a. Production knock builder (this PR)** — `agent/knock.ts` (`createKnock`)
+   - **a. Production knock builder** (#2606) — `agent/knock.ts` (`createKnock`)
      wraps the fixture-fenced `buildKnock` with the per-knock values the agent
      randomises/stamps at runtime: a fresh CSPRNG ephemeral, transaction counter,
      and header preamble, plus the send timestamp (capped to Go's int64
      `UnixNano`). `buildKnock` stays fixture-fenced; the wrapper is
      property-tested (distinct ephemeral / counter / nonce per knock).
-   - **b. Relay transport + knock loop** — `POST /relay/{serverId}`
-     (octet-stream), then dispatch the `NHP_ACK` reply (tokens on success, the
-     `52024` "session expired → re-resolve" deny code #2550) and correlate the
-     reply counter back to the knock (anti-replay, #2603).
+   - **b. Relay transport + knock loop (this PR)** — `agent/relay.ts`
+     (`relayPost`: `POST /relay/{serverId}`, octet-stream, mirroring
+     `endpoints/relay/relay.go`), `agent/knock.ts` (`buildKnockBody`: the
+     `AgentKnockMsg` body, owning the #1154 `headerType`), and `agent/loop.ts`
+     (`knock`: build → POST → `decryptReply` → dispatch). Dispatch returns a
+     discriminated `KnockResult` — `success` (resource hosts + AC tokens),
+     `reResolve` (the `52024` session-expired deny, #2550), `serverError`, or
+     `cookieChallenge` — and `throw`s only on faults (transport, crypto, the
+     ACK-counter correlation #2603). The transport is injectable (mock-tested);
+     the body and the success/`52024`/cookie dispatch are Go-fenced
+     (`nhp/core/js_agent_loop_roundtrip_test.go`).
    - **c. Overload cookie-challenge** — `NHP_COK` → `NHP_RKN` re-knock folding in
      the server cookie (`responder.go` sends it only when overloaded; it is _not_
      the renewal path).

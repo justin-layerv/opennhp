@@ -118,3 +118,35 @@ export function createKnock(
   });
   return { packet, counter };
 }
+
+/**
+ * The two fields the qURL knock body must carry. The server's qURL path reads
+ * only these: `authServiceId` routes the knock to the qURL plugin
+ * (`FindAuthSvcProvider` rejects an empty one) and `resourceId` is the `r_` id the
+ * plugin resolves and authorizes. The client IP comes from the relay-forwarded
+ * source address, not the body, and the other `AgentKnockMsg` fields
+ * (`usrId`/`devId`/…) are inert on this path, so the browser omits them.
+ */
+export interface KnockBodyParams {
+  authServiceId: string;
+  resourceId: string;
+}
+
+/**
+ * Serializes the qURL knock body — Go `common.AgentKnockMsg` (`nhp/common/nhpmsg.go`).
+ *
+ * `headerType` is set to `NHP_KNK` here, *not* by the caller: per the #1154
+ * invariant it must equal the wire header type, and the server's
+ * `knock_headertype_gate` rejects a mismatch (and a legacy zero). Owning it here
+ * means a caller cannot miswire the body-vs-wire type. The JSON field names
+ * (`headerType`/`aspId`/`resId`) are pinned to Go's struct tags; a drift fails
+ * the cross-language body fence.
+ */
+export function buildKnockBody(params: KnockBodyParams): Uint8Array {
+  const msg = {
+    headerType: NHP_KNK,
+    aspId: params.authServiceId,
+    resId: params.resourceId,
+  };
+  return new TextEncoder().encode(JSON.stringify(msg));
+}

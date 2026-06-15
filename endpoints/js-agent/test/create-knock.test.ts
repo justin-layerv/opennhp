@@ -1,9 +1,5 @@
 import { describe, it, expect } from "vitest";
-import {
-  createKnock,
-  browserEntropy,
-  type KnockEntropy,
-} from "../src/agent/knock";
+import { createKnock, browserEntropy } from "../src/agent/knock";
 import { buildKnock } from "../src/crypto/handshake";
 import { x25519PublicKey } from "../src/crypto/dh";
 import {
@@ -16,26 +12,11 @@ import {
   getTypeAndPayloadSize,
 } from "../src/crypto/packet";
 import { toHex, fromHex, utf8 } from "./hex";
+import { fixedEntropy } from "./entropy";
 
 const DEVICE_PRIV = fromHex("41".repeat(32));
 const SERVER_PUB = x25519PublicKey(fromHex("01".repeat(32)));
 const BODY = utf8(JSON.stringify({ headerType: NHP_KNK, resId: "r_jsagent" }));
-
-/**
- * Entropy that hands out the queued byte chunks in order, then a fixed clock.
- * The order is load-bearing: the wiring test relies on `createKnock` consuming
- * the chunks as [ephemeral (32 B), counter (8 B), preamble (4 B)] — if that read
- * order changes in `createKnock`, the queued chunks here must move with it.
- */
-function fixedEntropy(chunks: Uint8Array[], nowNanos: bigint): KnockEntropy {
-  let i = 0;
-  return {
-    randomBytes: (out) => {
-      out.set(chunks[i++] ?? new Uint8Array(out.length));
-    },
-    nowNanos: () => nowNanos,
-  };
-}
 
 const header = (p: Uint8Array) => p.subarray(0, HEADER_SIZE);
 
