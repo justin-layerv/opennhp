@@ -830,6 +830,64 @@ resource "aws_cloudwatch_metric_alarm" "internal_security_failure" {
   })
 }
 
+# Internal-auth signer unavailable on the destructive AC revocation sweep fast
+# path (issue #2475). The on-demand sweep endpoint
+# (POST /nhp/internal/ac-revocations/sweep[/<acId>]) is permanently strict;
+# when it is hit while the server has no NHP_INTERNAL_AUTH_SECRET configured it
+# rejects with 401 BEFORE HMAC verification and emits this counter — kept
+# distinct from InternalAuthFailStrict (a bad caller signature). A non-zero
+# value is deployment/secret drift, not an attack, so this automates the F5
+# runbook's "alert the platform owner" step (docs/runbooks/f5-revoked-pubkey-paging.md).
+#
+# REACTIVE by construction: the counter only increments when an operator
+# actually invokes the sweep during an incident — it cannot surface the missing
+# secret BEFORE the endpoint is needed. Its value is (1) paging the platform
+# owner who holds the secret and may not be the operator running the sweep, and
+# (2) an alarm trail. A proactive detector would need a synthetic signed probe
+# (cf. the knock-forward-path synthetic-probe follow-up on #2449); out of scope
+# for this low-threshold alarm.
+#
+# Emitted via Publisher.IncrCounter (endpoints/metrics/publisher.go) with the
+# base server dim set {Environment, Cell} (buildServerMetricDimensions,
+# endpoints/server/udpserver.go) — the same selector knock_forward_path /
+# server_publisher_failures rely on. Key on exactly those two dims or the alarm
+# sits in INSUFFICIENT_DATA forever (terraform/CLAUDE.md "Metric / Alarm
+# Dim-Set Rules").
+#
+# Single-event detector (datapoints_to_alarm=1 over a 1-hour lookback),
+# mirroring knock_forward_path: at this traffic a "consecutive nonzero windows"
+# alarm could never accumulate, so one breaching 5-min window in the trailing
+# hour pages. eval=12 keeps the alarm visibly RED through the incident hour and
+# suppresses a re-page on operator sweep retries. treat_missing_data is
+# hardcoded "notBreaching" — NOT the module's alarm_missing_data local, which
+# resolves to "breaching" in prod and would turn this always-absent event
+# counter into a permanent false page.
+resource "aws_cloudwatch_metric_alarm" "internal_auth_signer_unavailable" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-internal-auth-signer-unavailable"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 12
+  datapoints_to_alarm = 1
+  metric_name         = "InternalAuthSignerUnavailable"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "nhp-server rejected an operator-triggered AC revocation sweep because NHP_INTERNAL_AUTH_SECRET is not configured (signed fast path returned 401) in the trailing hour. Deployment/secret drift, not a bad caller signature — alert the platform owner to restore the secret before depending on the on-demand sweep. Reactive: fires only once an operator hits the endpoint. Runbook: docs/runbooks/f5-revoked-pubkey-paging.md. #2475."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
 # ==================== Knock Forward Path Health (issue #2449) ====================
 #
 # The server-to-server HTTP knock forward is the safety net for "this server

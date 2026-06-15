@@ -749,7 +749,11 @@ Operational notes:
   `NHP_INTERNAL_AUTH_REQUIRE` rollout flag flips to strict. A server missing
   signer configuration rejects the sweep before verification and emits
   `InternalAuthSignerUnavailable` instead, so dashboards can separate operator
-  misconfiguration from bad caller signatures.
+  misconfiguration from bad caller signatures. A Terraform-managed CloudWatch
+  alarm pages the alerts SNS topic on any non-zero `InternalAuthSignerUnavailable`
+  in the trailing hour (reactive — it fires only when an operator triggers the
+  sweep with the secret already missing); see
+  [`docs/runbooks/f5-revoked-pubkey-paging.md`](runbooks/f5-revoked-pubkey-paging.md) (#2475).
   If a new signer fleet is introduced after an environment is already strict
   (for example, first prod qurl-reverse-tunnel-server deployment), roll it with
   the shared secret and verify its signed `/nhp/internal/token/validate` calls
