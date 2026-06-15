@@ -263,6 +263,8 @@ Non-obvious skips that don't fit Auto-Skip Categories:
 | 3e4a8172 | fix(terraform): mark demo_nhp_cert as sensitive | SKIP | Upstream demo Terraform | 2026-06-01 |
 | 9501ba23 | fix(terraform): mark derived-from-sensitive outputs | SKIP | Upstream demo Terraform | 2026-06-01 |
 | cc36a684 | feat(js-agent): CBOR token support | SKIP | Upstream-only JS agent component | 2026-06-01 |
+| cfa08718 | fix(server,agent): authenticate knock HeaderType (reject on-path flips) | SKIP — fork is the SOURCE | Our own #1154/#1257 work, re-contributed upstream as [OpenNHP#1584](https://github.com/OpenNHP/opennhp/pull/1584) (author justin-layerv). Merged 2026-06-15, **after** the e903f92c baseline, so it WILL surface in the next `git log e903f92c..upstream/main` walk — and the Decision Matrix would mis-classify it "security → SYNC IMMEDIATELY." The fork already carries a strict SUPERSET: the gated permit→strict `endpoints/server/knock_headertype_gate.go` + errors 52009/52010/**52011** (landed in #1249). **Do NOT replace the gate with upstream's unconditional reject** — it would lock out fork-only non-agent knock clients (qurl-tunnel-client/fileviewer/e2e) that still emit a legacy zero headerType (#1257). | 2026-06-15 |
+| d10afec2 | fix(js-agent): authenticate knock HeaderType (mirror wire type in body) | SKIP — fork is the SOURCE | js-agent half of OpenNHP#1584. The fork's js-agent already sets the body `headerType`, in different files (`endpoints/js-agent/src/agent/knock.ts`, not upstream's `NHPAgent.ts`). Upstream's cookie-resend RKN mutation fix is N/A here — the fork's RKN re-knock path isn't built yet (#2208 PR-5c, gated on #2611, where the body-`headerType`=`NHP_RKN` requirement is recorded). | 2026-06-15 |
 
 ---
 
@@ -359,6 +361,7 @@ A change is a good upstream candidate if it:
 | #93 | DNS cache invalidation on failures | - | CANDIDATE | Pairs with #75 |
 | #86 | Crypto error handling improvements | - | CANDIDATE | Already adapted from upstream #1338 |
 | #2010 | Noise intermediate chain key fix | [OpenNHP#1557](https://github.com/OpenNHP/opennhp/pull/1557) | MERGED | Cherry-picked the existing `enable_webrtc` commit `03619015` onto `upstream/main`; merged 2026-05-23 (`e7886f8e`). Downstream follow-up **resolved**: [qurl-reverse-tunnel-client#178](https://github.com/layervai/qurl-reverse-tunnel-client/pull/178) bumped the OpenNHP submodule straight to the post-fix merge commit and stayed on the public OpenNHP pin (no `layervai/nhp` binary-distribution fingerprint) — pinning the merge commit avoided any wait on an upstream release. |
+| #1249 | Authenticate knock HeaderType — block on-path NHP_KNK↔NHP_EXT flips (#1154/#1257) | [OpenNHP#1584](https://github.com/OpenNHP/opennhp/pull/1584) | MERGED | Secure-by-default re-contribution of the fork's gated work; merged 2026-06-15 (merge `306a73f0`; substantive commits `cfa08718` server+agent, `d10afec2` js-agent). Fork keeps its permit→strict gate (it has fork-only legacy knock clients, #1257); upstream went unconditional (two first-party agents only). SKIP guard rows added under Individual Commit Decisions so a future sync doesn't port it back over the gate. |
 
 ### Fork-Only (Never Contribute)
 
@@ -413,6 +416,7 @@ Record all contribution attempts here:
 | Date | Description | Upstream PR | Result |
 |------|-------------|-------------|--------|
 | 2026-05-22 | Backport noise intermediate chain key fix to `upstream/main` (cherry-pick of `03619015` from `enable_webrtc`) | [OpenNHP#1557](https://github.com/OpenNHP/opennhp/pull/1557) | MERGED 2026-05-23 (`e7886f8e`) |
+| 2026-06-15 | Authenticate knock HeaderType — reject on-path NHP_KNK↔NHP_EXT flips (secure-by-default version of the fork's #1154/#1257 gate, #1249) | [OpenNHP#1584](https://github.com/OpenNHP/opennhp/pull/1584) | MERGED 2026-06-15 (merge `306a73f0`) |
 
 ---
 
