@@ -389,6 +389,8 @@ lint-workflows:
 	@bash tests/lints/dispatch-ref-error/run-fixtures.sh
 	@shellcheck tests/lints/verify-image-attestation/run-fixtures.sh
 	@bash tests/lints/verify-image-attestation/run-fixtures.sh
+	@shellcheck .github/scripts/scan-attestation-soak.sh tests/lints/attestation-verify-watchdog/run-fixtures.sh
+	@bash tests/lints/attestation-verify-watchdog/run-fixtures.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] Workflow lint passed!$(END_COLOUR)"
 
 # Run the terraform-prod-drift detectors (#1324). Static, AWS-creds-free

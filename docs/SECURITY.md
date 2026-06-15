@@ -641,11 +641,24 @@ soak):**
 2. A soak window with `ATTEST_RESULT=pass` across all deploy paths and **no**
    `fail`/`error` (see below).
 3. The cross-account ECR pull grant is confirmed present (see below).
+4. The **Attestation Verify Watchdog** (`.github/workflows/attestation-verify-watchdog.yml`)
+   is live and its latest run is clean — it is the *automated* form of gate 2's
+   scan (described below), turning a silent fail-open under enforce into a page
+   instead of something that waits to be eyeballed.
 
 The verify step uses the default `GITHUB_TOKEN`; each deploy workflow grants it
 `attestations: read`. Each run emits one greppable marker —
 `ATTEST_RESULT=pass|fail|error` — so soak-readiness is mechanical rather than a
-visual log scan. Before flipping to `enforce`, confirm recent audit runs across
+visual log scan. The **Attestation Verify Watchdog** runs that scan daily and
+opens a tracking issue on any `error` (any mode) or enforce-`fail` lane; see its
+header for the exact fire rules. It does **not** page on a `fail` under `audit`
+(expected for legacy/pre-#2339 images), so the known-attested-image `INFRA_RE`
+under-match described below stays a manual pre-flip check, not a watchdog page.
+Note too that **"no marker" ≠ "healthy"**: a lane whose verify step crashes
+*before* `emit()` (the audit EXIT-trap converts it to `exit 0` with no
+`ATTEST_RESULT`) produces no marker, so the watchdog has nothing to fire on — a
+chronically marker-less deploy lane warrants a manual glance even when the
+watchdog is quiet. Before flipping to `enforce`, confirm recent audit runs across
 all deploy paths (server, AC, canary, promote) show `ATTEST_RESULT=pass` with no
 `fail` (a real verdict — unattested, wrong workflow/ref, or absent image — which
 *would* block under enforce) and no `error` (an infra/permission issue — fails

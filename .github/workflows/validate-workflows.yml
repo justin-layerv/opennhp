@@ -50,6 +50,8 @@ on:
       - "tests/lints/lockdown-body-drift/**"
       - "tests/lints/verify-image-attestation/**"
       - ".github/actions/verify-image-attestation/**"
+      - "tests/lints/attestation-verify-watchdog/**"
+      - ".github/scripts/scan-attestation-soak.sh"
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
       - "terraform/environments/sandbox/**"
@@ -325,6 +327,18 @@ jobs:
         run: |
           shellcheck tests/lints/verify-image-attestation/run-fixtures.sh
           bash tests/lints/verify-image-attestation/run-fixtures.sh
+
+      # Lock the parser half of the Attestation Verify Watchdog
+      # (attestation-verify-watchdog.yml): the per-lane error/fail/pass
+      # classification that decides whether the #1334 verify gate is silently
+      # failing open. A miss means the watchdog stays quiet while the gate
+      # verifies nothing under enforce — so this fixture pins the verdict against
+      # the real captured ATTEST_RESULT marker wording. shellcheck the script too
+      # (actionlint's -shellcheck only covers workflow-embedded scripts).
+      - name: Test attestation-verify-watchdog fixtures
+        run: |
+          shellcheck .github/scripts/scan-attestation-soak.sh tests/lints/attestation-verify-watchdog/run-fixtures.sh
+          bash tests/lints/attestation-verify-watchdog/run-fixtures.sh
 
       # Two cross-module lockstep contracts that surfaced as #1976
       # cutover follow-ups (PR #2141): the Go-side

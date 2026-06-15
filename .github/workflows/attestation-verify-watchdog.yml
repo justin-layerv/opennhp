@@ -1,0 +1,404 @@
+name: Attestation Verify Watchdog
+
+# Daily sweep of the image-attestation verify gate's results across the deploy
+# paths (#1334 Phase 1). The gate (.github/actions/verify-image-attestation)
+# emits one greppable marker per run —
+#   ::notice::ATTEST_RESULT=<pass|fail|error> repo=<ecr-repo> ... mode=<audit|enforce>
+# — but today soak-readiness, and "is the gate actually verifying," is a MANUAL
+# grep of deploy logs (docs/SECURITY.md). Under `enforce` a persistent `error`
+# (the gate could not complete verification, so it fails OPEN) provides zero
+# protection until a human notices. This watchdog automates that grep into a
+# paging tracker issue — the pre-enforce-flip prerequisite captured on #1334.
+#
+# Fires (per deploy lane, on the LATEST run that produced a marker):
+#   - result=error (ANY mode): verification could not complete and FAILED OPEN.
+#     The case this watchdog exists for — a silent fail-open under enforce.
+#   - result=fail AND mode=enforce: a verdict blocked a deploy (a real miss, or an
+#     under-matched INFRA_RE spuriously blocking a known-attested image).
+# Does NOT fire on result=fail under mode=audit — that is the EXPECTED state for
+# legacy/pre-#2339 images during the audit soak; such lanes are shown for context
+# only when the tracker is already open for a firing lane. Known limitation: a
+# `fail` under audit on a KNOWN-ATTESTED image (an under-matched INFRA_RE
+# mis-classifying a real transient as a verdict) also won't page here — that case
+# stays caught by the manual pre-flip soak check in docs/SECURITY.md, not this
+# watchdog, because audit-fails can't be told apart from legacy-image fails from
+# the log line alone.
+#
+# On fire, opens a title-dedup'd tracking issue and rewrites its body with the
+# current lane table; comments only on a meaningful state change (new/changed
+# firing lane), not on every daily run. On a confirmed-clean sweep it auto-closes
+# the tracker. The classification lives in .github/scripts/scan-attestation-soak.sh
+# (unit-tested by tests/lints/attestation-verify-watchdog/run-fixtures.sh); this
+# workflow is the thin gh I/O + issue plumbing around it.
+
+on:
+  schedule:
+    # Daily 14:00 UTC — offset from the Monday-12:00 domain-expiry slot so the
+    # two watchdogs don't contend, and daily (not weekly) because a silent
+    # fail-open should surface within a day, not after up to a week.
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+
+# Serialize cron + manual dispatches so two runs can't race on issues.create.
+concurrency:
+  group: attestation-verify-watchdog
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # The deploy paths whose runs carry the verify gate (#2355). Space-separated.
+  DEPLOY_WORKFLOWS: "blue-green-deploy.yml canary-deploy.yml promote-to-prod.yml"
+  # Only consider runs newer than this — a lane with no deploy in the window has
+  # no current signal (the soak is about recent deploys). Keeps log downloads
+  # bounded too.
+  LOOKBACK_DAYS: "21"
+  # Newest completed runs to inspect per workflow. NOTE: this cap is applied by
+  # `gh run list` BEFORE the LOOKBACK_DAYS window filter, so it must be large
+  # enough that an alternating-lane workflow's *other* lane isn't pushed past the
+  # cutoff. blue-green emits both lanes per run (its newest run always covers
+  # both); canary alternates server/AC across separate runs, so a burst on one
+  # lane could otherwise hide the other lane's latest marker. 15 comfortably
+  # covers canary's both lanes at its real cadence while keeping daily downloads
+  # bounded; the gather step's truncation guard fails safe if the cap ever binds.
+  PER_WF_LIMIT: "15"
+
+jobs:
+  sweep:
+    name: Sweep attestation verify results
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read   # gh run list / gh run view --log over the deploy workflows
+      issues: write    # open / update / close the tracking issue
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Gather recent deploy-path run logs
+        id: gather
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          LOG_DIR="$RUNNER_TEMP/attest-logs"
+          mkdir -p "$LOG_DIR"
+          window_start=$(( $(date -u +%s) - LOOKBACK_DAYS * 86400 ))
+
+          # scan_error distinguishes "scanned cleanly, nothing firing" from
+          # "could not scan" — the issue step must NOT auto-close the tracker on
+          # the latter, or a gh/permission outage would silently hide a real
+          # firing lane (the watchdog failing open on itself).
+          scan_error=0
+
+          for wf in $DEPLOY_WORKFLOWS; do
+            runs_json=""
+            # A `gh run list` blip must not look like "no runs" -> retry once.
+            # Validate the JSON parses too: `gh` exiting 0 with output `jq` can't
+            # parse would yield zero rows below with NO scan_error — a silent
+            # fail-open asymmetric with the other incomplete-scan paths. `jq empty`
+            # accepts a valid empty array `[]` (genuinely no runs) and rejects only
+            # malformed JSON, which then retries and ends as scan_error.
+            for attempt in 1 2; do
+              if runs_json=$(gh run list --repo "$REPO" --workflow "$wf" \
+                               --status completed --limit "$PER_WF_LIMIT" \
+                               --json databaseId,createdAt 2>/dev/null) \
+                 && printf '%s' "$runs_json" | jq empty 2>/dev/null; then
+                break
+              fi
+              runs_json=""
+              [[ "$attempt" -lt 2 ]] && sleep 5
+            done
+            # Empty (not "[]") means every attempt errored — a genuine "no recent
+            # runs" returns the literal empty-array JSON and is clean, not error.
+            if [[ -z "$runs_json" ]]; then
+              echo "::warning::watchdog: could not list runs for ${wf}; scan incomplete"
+              scan_error=1
+              continue
+            fi
+
+            # `< <(...)` (not a pipe) so returned/oldest_epoch/scan_error set in
+            # the loop persist. Input is newest-first, so the LAST row iterated is
+            # the oldest returned run.
+            returned=0
+            oldest_epoch=0
+            newest_log=""
+            while IFS=$'\t' read -r rid created; do
+              [[ -n "$rid" ]] || continue
+              returned=$((returned + 1))
+              # A timestamp we can't parse is "can't confirm", not epoch 0 — a 0
+              # would silently suppress the truncation guard below if it landed on
+              # the oldest run. Treat it as an incomplete scan and skip the run.
+              if ! epoch=$(date -u -d "$created" +%s 2>/dev/null); then
+                echo "::warning::watchdog: could not parse run timestamp '${created}' for ${wf}; treating scan as incomplete"
+                scan_error=1
+                continue
+              fi
+              oldest_epoch=$epoch
+              [[ "$epoch" -ge "$window_start" ]] || continue
+              out="$LOG_DIR/${wf%.yml}__${epoch}__${rid}.log"
+              # Fetch the in-window run's log, retry once on a transient blip (like
+              # the run-list call above). A persistent failure is NOT a silent skip:
+              # if it lands on a firing lane's LATEST run and the other lanes parse
+              # clean, the close path would close a real tracker — the one
+              # asymmetry that could fail OPEN. So a failed in-window fetch counts as
+              # an incomplete scan (scan_error), the same fail-safe-by-default
+              # posture as the truncation guard: conservative on rare old-run fetch
+              # failures (logs are retained ~90d, so a post-retry failure is itself
+              # worth a non-auto-close), never silently fail-open.
+              fetched=0
+              for vattempt in 1 2; do
+                if gh run view "$rid" --repo "$REPO" --log > "$out" 2>/dev/null; then
+                  fetched=1
+                  break
+                fi
+                [[ "$vattempt" -lt 2 ]] && sleep 5
+              done
+              if [[ "$fetched" -ne 1 ]]; then
+                rm -f "$out"
+                echo "::warning::watchdog: could not fetch logs for ${wf} run ${rid} after retry; treating scan as incomplete (won't auto-close)"
+                scan_error=1
+              elif [[ -z "$newest_log" ]]; then
+                # Newest-first iteration -> the first successful download is the
+                # newest gathered run; kept for the lane-count check below.
+                newest_log="$out"
+              fi
+            done < <(printf '%s' "$runs_json" | jq -r '.[] | [.databaseId, .createdAt] | @tsv')
+
+            # Truncation guard (fail-safe-by-default), scoped to where truncation
+            # can ACTUALLY hide a lane. If the cap bound the result (returned ==
+            # cap) AND the oldest returned run is still in-window, `gh run list` may
+            # have hidden an OLDER in-window run. Whether that can hide a lane's
+            # *latest* marker depends on the workflow:
+            #   - blue-green / promote emit BOTH lanes in EVERY run, so their newest
+            #     run already carries every lane's latest marker — a cap can't hide
+            #     one. This is the steady state for blue-green (it tracks every main
+            #     merge via build-and-push), so flagging it would disable auto-close
+            #     for no safety benefit.
+            #   - canary emits ONE lane per run (alternates), so a truncated older
+            #     run could hold the other lane's latest — possibly firing — marker,
+            #     which the present lane parsing "clean" would mask.
+            # So only treat a cap-hit as incomplete when the workflow's NEWEST run
+            # is single-lane. That is derived from the data (distinct repo= markers
+            # in the newest gathered log), NOT a hardcoded "which workflows
+            # alternate" list — which would fail OPEN for a future single-lane
+            # workflow nobody added. The grep mirrors the parser's marker anchor; if
+            # it ever miscounts (e.g. an emit() format change — which the fixture's
+            # emit() lockstep catches in CI) it yields 0 and still flags (the safe
+            # direction).
+            if [[ "$returned" -ge "$PER_WF_LIMIT" && "$oldest_epoch" -ge "$window_start" ]]; then
+              newest_lanes=0
+              if [[ -n "$newest_log" && -f "$newest_log" ]]; then
+                # `|| true` on BOTH greps is load-bearing: under `set -o pipefail`
+                # a marker-less newest log (deploy failed before the verify step, or
+                # the step crashed before emit() — the "no marker != healthy" case)
+                # makes a grep exit 1, which without the guard would abort the whole
+                # gather step. Letting it yield 0 lanes flows into the `< 2` check ->
+                # scan_error, the intended safe fallback. `[[:space:]]` before repo=
+                # matches the parser's `[ \t]repo=` anchor (not a bare literal space).
+                newest_lanes=$( { grep -oE '(::notice::|##\[notice\])ATTEST_RESULT=(pass|fail|error)[[:space:]]repo=[^[:space:]]+' "$newest_log" || true; } \
+                  | { grep -oE 'repo=[^[:space:]]+' || true; } | sort -u | wc -l | tr -d ' ')
+              fi
+              if [[ "$newest_lanes" -lt 2 ]]; then
+                echo "::warning::watchdog: ${wf} hit the ${PER_WF_LIMIT}-run cap (oldest still inside the ${LOOKBACK_DAYS}d window) and its newest run is single-lane (alternating) — an older lane's latest marker may be truncated; treating scan as incomplete (won't auto-close). Consider raising PER_WF_LIMIT."
+                scan_error=1
+              fi
+            fi
+          done
+
+          gathered=$(find "$LOG_DIR" -maxdepth 1 -name '*.log' | wc -l | tr -d ' ')
+          echo "Gathered ${gathered} run log(s) into $LOG_DIR (scan_error=${scan_error})"
+          {
+            echo "log_dir=$LOG_DIR"
+            echo "scan_error=$scan_error"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Scan markers and decide
+        id: scan
+        env:
+          LOG_DIR: ${{ steps.gather.outputs.log_dir }}
+        run: |
+          set -euo pipefail
+
+          report="$(.github/scripts/scan-attestation-soak.sh "$LOG_DIR")"
+          # Overall fire = any lane the script flagged (column 7 == 1). The
+          # per-lane decision is the script's (and the fixture's) job; this is
+          # only the OR that gates open-vs-close.
+          fire=$(printf '%s\n' "$report" | awk -F'\t' '$7==1 {f=1} END {print f+0}')
+
+          echo "fire=${fire}"
+          printf '%s\n' "$report"
+
+          delim="REPORT_$(openssl rand -hex 16)"
+          {
+            echo "report<<$delim"
+            printf '%s\n' "$report"
+            echo "$delim"
+            echo "fire=$fire"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open / update / close tracking issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          FIRE: ${{ steps.scan.outputs.fire }}
+          REPORT: ${{ steps.scan.outputs.report }}
+          SCAN_ERROR: ${{ steps.gather.outputs.scan_error }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const title = 'Attestation verify gate: deploy lane(s) need attention';
+            const { owner, repo } = context.repo;
+
+            // Find the existing tracker (search API rather than paginating all
+            // 1200+ issues). in:title is exact enough for our single-title case;
+            // still post-filter on an exact title match.
+            const { data: search } = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${owner}/${repo} is:issue in:title "${title}"`,
+              per_page: 10,
+            });
+            // Prefer the OPEN exact-title tracker if one exists, deterministically:
+            // `find` alone returns search's first match in an order GitHub doesn't
+            // guarantee, so a stale CLOSED duplicate with the same title could
+            // shadow the live open one and get re-opened instead. (Broader dedup
+            // hardening for both watchdogs is tracked in #2576.)
+            const exact = search.items.filter(i => i.title === title);
+            const match = exact.find(i => i.state === 'open') || exact[0];
+
+            // Not firing this run.
+            if (process.env.FIRE !== '1') {
+              // Only auto-close on a CONFIRMED-clean scan. If gathering was
+              // incomplete (a gh/permission outage), leave any open tracker as-is
+              // rather than hiding a real firing lane behind a scan we couldn't
+              // complete.
+              if (process.env.SCAN_ERROR === '1') {
+                core.warning('Scan incomplete (could not list some deploy runs); leaving tracker unchanged.');
+                return;
+              }
+              // Require POSITIVE clean evidence to auto-close: at least one lane
+              // parsed and none firing. An empty report means we parsed zero
+              // ATTEST_RESULT markers — either no recent verified deploy, or the
+              // marker format drifted out from under the parser. Both are "we
+              // can't confirm health," so don't auto-close a real tracker on it
+              // (the same fail-safe direction as SCAN_ERROR).
+              if (!(process.env.REPORT || '').trim()) {
+                core.warning('No ATTEST_RESULT markers parsed across gathered runs (no recent verified deploy, or marker drift); leaving tracker unchanged.');
+                return;
+              }
+              if (match && match.state === 'open') {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: match.number,
+                  body: `All attestation verify lanes returned clean on ${new Date().toISOString()}. Auto-closing. Run: ${process.env.RUN_URL}`,
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: match.number, state: 'closed',
+                });
+              }
+              return;
+            }
+
+            // Parse the per-lane TSV report. Columns:
+            //   result  workflow  repo  mode  run_id  epoch  fire
+            const lanes = (process.env.REPORT || '').trim().split('\n')
+              .map(line => line.split('\t'))
+              .filter(c => c.length >= 7)
+              .map(([result, workflow, repoName, mode, runId, epoch, fire]) =>
+                ({ result, workflow, repo: repoName, mode, runId, epoch, fire }));
+
+            // Show non-pass lanes: the firing ones (fire=1) plus any audit `fail`
+            // lanes (fire=0) for soak context now that the tracker is open anyway.
+            const shown = lanes.filter(l => l.result !== 'pass');
+
+            // Belt-and-suspenders: FIRE=1 from the shell should always correspond
+            // to at least one fire=1 lane. If they ever drift, fail safe rather
+            // than opening an empty tracker.
+            if (!shown.some(l => l.fire === '1')) {
+              core.warning('FIRE=1 but no firing lane parsed from the report — skipping.');
+              return;
+            }
+
+            // State key for meaningful-change detection: the set of FIRING lanes
+            // and their verdict, order-independent. Run id / age are deliberately
+            // excluded so a new deploy of the same bad lane isn't re-pinged — and
+            // only firing (fire=1) lanes count, so an audit-`fail` context row
+            // appearing/disappearing during the soak (expected noise) doesn't churn
+            // a "State changed" comment. Those rows still render in the body table.
+            const stateKey = JSON.stringify(
+              shown.filter(l => l.fire === '1')
+                .sort((a, b) => (a.workflow + a.repo).localeCompare(b.workflow + b.repo))
+                .map(l => `${l.workflow}:${l.repo}:${l.result}:${l.mode}`)
+            );
+
+            const nowSec = Math.floor(Date.now() / 1000);
+            const ageCell = epoch => {
+              const n = parseInt(epoch, 10);
+              if (!Number.isFinite(n) || n <= 0) return '?';
+              const days = Math.floor((nowSec - n) / 86400);
+              return days <= 0 ? '<1d' : `${days}d`;
+            };
+            const rows = shown.map(l => {
+              const icon = l.fire === '1' ? ':rotating_light:' : ':information_source:';
+              const note = l.fire === '1' ? l.result : `${l.result} (audit — context)`;
+              const runLink = `[${l.runId}](${context.serverUrl}/${owner}/${repo}/actions/runs/${l.runId})`;
+              return `| ${icon} ${note} | \`${l.workflow}\` | \`${l.repo}\` | ${l.mode} | ${runLink} | ${ageCell(l.epoch)} |`;
+            });
+
+            const markerOpen = '<!-- attest-watchdog:state ';
+            const markerClose = ' -->';
+            const body = [
+              `${markerOpen}${stateKey}${markerClose}`,
+              'The daily Attestation Verify Watchdog flagged one or more deploy lanes.',
+              'Each row is the **latest** run that produced an `ATTEST_RESULT` marker for that lane.',
+              '',
+              '_The table (incl. the age + run link) reflects the last **state change** — the watchdog rewrites it only when the set of firing lanes changes, not on every same-state daily re-fire, so edit history stays meaningful. A still-firing lane re-confirmed today will show its age/run from that last change, not from today._',
+              '',
+              '| result | workflow | image | mode | latest run | age |',
+              '| --- | --- | --- | --- | --- | --- |',
+              ...rows,
+              '',
+              'What fires:',
+              '- :rotating_light: `error` (any mode) — the gate could **not complete** verification, so it **failed open**. Under `enforce` it is silently not protecting. Find the root cause (often a cross-account ECR pull / token / `INFRA_RE` under-match) before flipping `IMAGE_ATTESTATION_VERIFY_MODE=enforce`.',
+              '- :rotating_light: `fail` under `enforce` — a verdict blocked the deploy: an unattested image / wrong signer-ref / absent image, **or** an under-matched `INFRA_RE` spuriously blocking a known-attested image. Confirm which.',
+              '- :information_source: `fail` under `audit` — expected for legacy / pre-#2339 images during the soak; shown for context, does not page on its own.',
+              '',
+              'Soak + enforce-flip runbook: [`docs/SECURITY.md`](https://github.com/layervai/nhp/blob/main/docs/SECURITY.md) (search "ATTEST_RESULT"). Tracking issue: https://github.com/layervai/nhp/issues/1334.',
+              '',
+              '> Do not rename this issue — the watchdog uses the title as the dedup key. A renamed title spawns a duplicate on the next fire.',
+            ].join('\n');
+
+            if (!match) {
+              await github.rest.issues.create({
+                owner, repo, title, body,
+                labels: ['type: security', 'area: ci', 'priority: high'],
+              });
+              return;
+            }
+
+            // Only rewrite the body + comment on a meaningful change (or to
+            // re-open a tracker that was closed while a lane is still firing), so
+            // a daily re-fire of the same state stays a silent confirmation.
+            const priorMarker = (match.body || '').match(/<!-- attest-watchdog:state (.*?) -->/);
+            const priorStateKey = priorMarker ? priorMarker[1] : null;
+            const wasClosed = match.state === 'closed';
+            const stateChanged = priorStateKey !== stateKey;
+
+            if (wasClosed || stateChanged) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: match.number,
+                body,
+                ...(wasClosed ? { state: 'open' } : {}),
+              });
+            }
+            if (wasClosed) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: match.number,
+                body: `Re-opened: watchdog fired again while this tracker was closed. See body for the current lane table. Run: ${process.env.RUN_URL}`,
+              });
+            } else if (stateChanged) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: match.number,
+                body: `State changed since last run. See issue body for the current lane table. Run: ${process.env.RUN_URL}`,
+              });
+            }
