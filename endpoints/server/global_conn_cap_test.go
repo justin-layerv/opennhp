@@ -108,6 +108,40 @@ func TestGlobalCapAdmits_AboveCapRejectsAndFlipsOverload(t *testing.T) {
 	}
 }
 
+// The reject path must meter MetricGlobalCapRejections so operators get
+// a numeric tripwire, not just a greppable log line (#1570). Steady
+// state is zero (MaxConcurrentConnection sits far above legitimate
+// load), so any non-zero value flags attack-shaped or misbehaved load.
+func TestGlobalCapAdmits_EmitsRejectionMetricOnReject(t *testing.T) {
+	s := newTestUdpServer(t)
+	fillRemoteConnectionMap(s, MaxConcurrentConnection)
+
+	if s.globalCapAdmits() {
+		t.Fatalf("globalCapAdmits at len=%d: got admitted, want rejected", MaxConcurrentConnection)
+	}
+
+	counters, _ := s.metrics.CountersForTest(t)
+	if got := counters[MetricGlobalCapRejections]; got != 1 {
+		t.Errorf("MetricGlobalCapRejections after one reject: got %v, want 1", got)
+	}
+}
+
+// The admit path must NOT meter the reject counter — a false increment
+// on every healthy knock would turn the operator tripwire into noise.
+func TestGlobalCapAdmits_NoRejectionMetricOnAdmit(t *testing.T) {
+	s := newTestUdpServer(t)
+	fillRemoteConnectionMap(s, MaxConcurrentConnection-1)
+
+	if !s.globalCapAdmits() {
+		t.Fatalf("globalCapAdmits at len=%d: got rejected, want admitted", MaxConcurrentConnection-1)
+	}
+
+	counters, _ := s.metrics.CountersForTest(t)
+	if got := counters[MetricGlobalCapRejections]; got != 0 {
+		t.Errorf("MetricGlobalCapRejections after one admit: got %v, want 0", got)
+	}
+}
+
 // recvPacketRoutine is single-threaded today, so globalCapAdmits is
 // only called from one goroutine. This test pins the helper's lock
 // discipline against a future inlining mistake or a second admit

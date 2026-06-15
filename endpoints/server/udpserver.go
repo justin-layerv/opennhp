@@ -2051,20 +2051,20 @@ func (s *UdpServer) isKnownDBPeerIP(ipStr string) bool {
 }
 
 // globalCapAdmits reports whether the global MaxConcurrentConnection
-// cap admits a new connection, and as a side effect flips overload
-// mode on when the map crosses OverloadConnectionThreshold.
+// cap admits a new connection. As side effects it flips overload mode
+// on when the map crosses OverloadConnectionThreshold (under the lock)
+// and, on the reject path, increments MetricGlobalCapRejections (after
+// releasing the lock — see below).
 //
-// Use two independent `if` statements, not `if/else if`. The
-// pre-fix bug was `if overload { ... } else if cap { reject }`,
-// which made the cap branch unreachable once the map crossed the
-// (lower) overload threshold. With independent `if`s the order is
-// not load-bearing for the admit/reject decision (both checks see
-// the same n) but IS load-bearing for the overload flag's accuracy
-// on the rejection path — see the next paragraph. Fusing them back
-// into `if/else if` re-introduces #1525 — do not fuse.
+// The overload flip and the cap decision are independent reads of the
+// same map-size snapshot n; neither gates the other. The pre-fix bug
+// (#1525) was `if overload { ... } else if cap { reject }`, which made
+// the cap branch unreachable once the map crossed the (lower) overload
+// threshold. Keep them independent — do NOT fuse the two back into
+// `if/else if`, which re-introduces #1525.
 //
-// Overload is checked BEFORE the cap reject so the flag still
-// reflects map size on the rejection path. recvPacketRoutine alone
+// Overload is flipped BEFORE the cap decision so the flag still
+// reflects map size on the reject path. recvPacketRoutine alone
 // would always set overload on a prior admit before reaching the
 // cap; webrtcserver's DataChannel admit (#1569) bypasses this
 // helper entirely, so the map can land above OverloadConnectionThreshold
@@ -2073,21 +2073,40 @@ func (s *UdpServer) isKnownDBPeerIP(ipStr string) bool {
 // updates the flag honestly. Revisit when #1569 lands and webrtc
 // routes through this helper — at that point the rationale weakens.
 //
+// MetricGlobalCapRejections is incremented AFTER Unlock, not before
+// the return, because IncrCounter takes the publisher mutex and
+// remoteConnectionMapMutex is leaf-most for the conn lifecycle (see
+// endpoints/server/CLAUDE.md). This mirrors admitNewConnection's
+// eviction counter: mutate-under-lock, unlock, then increment. The
+// counter treats every false return as a dropped packet, so callers
+// MUST discard on false — do not reuse this as a non-dropping capacity
+// probe, or the operator tripwire over-counts. recvPacketRoutine is the
+// sole caller today and does exactly that.
+//
+// The deferred Unlock is dropped (explicit Unlock) so the increment
+// lands outside the lock. That is safe only because the remaining
+// under-lock work — len() and SetOverload's atomic store — cannot
+// panic, so there is no leaked-mutex path. A future edit that adds
+// panic-able work under this lock must restore a defer (or unlock on
+// the panic path) before doing so.
+//
 // "Admits" not "reserves": the function does not insert into the
 // map. admitNewConnection re-acquires remoteConnectionMapMutex
 // before mutating it; the brief unlocked window between is the same
 // TOCTOU window that lived inline in recvPacketRoutine.
 func (s *UdpServer) globalCapAdmits() bool {
 	s.remoteConnectionMapMutex.Lock()
-	defer s.remoteConnectionMapMutex.Unlock()
 	n := len(s.remoteConnectionMap)
 	if n > OverloadConnectionThreshold {
 		s.device.SetOverload(true)
 	}
-	if n >= MaxConcurrentConnection {
-		return false
+	admit := n < MaxConcurrentConnection
+	s.remoteConnectionMapMutex.Unlock()
+
+	if !admit {
+		s.metrics.IncrCounter(MetricGlobalCapRejections)
 	}
-	return true
+	return admit
 }
 
 // admitNewConnection registers conn in remoteConnectionMap. For agent

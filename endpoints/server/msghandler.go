@@ -846,6 +846,20 @@ const (
 	MetricACConnEviction          = "ACConnEviction"          // MaxACConnsPerID eviction events
 	MetricAgentConnPerIPEvictions = "AgentConnPerIPEvictions" // MaxAgentConnsPerIP eviction events
 
+	// MetricGlobalCapRejections counts new-connection packets rejected
+	// because remoteConnectionMap is at the global MaxConcurrentConnection
+	// cap — the rejection branch reachable again only after #1525. Emitted
+	// by globalCapAdmits on the reject path (see its doc for the lock
+	// discipline behind where the increment lands).
+	//
+	// Operator guidance: steady-state value is zero. MaxConcurrentConnection
+	// (20480) sits far above any legitimate load, so a non-zero value is a
+	// strong signal that something attack-shaped or misbehaved is hammering
+	// the server. The counter auto-surfaces in CloudWatch via the publisher
+	// flush loop (no registration needed); a `>= 1` single-event alarm is
+	// deferred to #2563.
+	MetricGlobalCapRejections = "GlobalCapRejections"
+
 	// MetricACConnStaleFiltered counts AC connections skipped by the
 	// broadcast-time staleness filter (DefaultStaleACConnThreshold or its
 	// per-server override). A non-zero rate is expected during AC
