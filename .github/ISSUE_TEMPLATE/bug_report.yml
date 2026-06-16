@@ -65,6 +65,7 @@ body:
       options:
         - agent
         - js-agent
+        - relay
         - server
         - ac
         - admin

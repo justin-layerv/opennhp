@@ -51,6 +51,12 @@ type Config struct {
 
 	// TrustedHeader names the HTTP header carrying the real client IP when
 	// SourceAddrMode == SourceAddrModeTrustedHeader. Defaults to "X-Real-IP".
+	// SECURITY: deriveSourceAddr takes the RIGHTMOST comma-separated entry, which
+	// is the trusted value only for an APPEND-style proxy that appends its
+	// observation last (the deployment's ALB X-Forwarded-For; single-value headers
+	// like X-Real-IP are also fine). Pointing this at a PREPEND-style header —
+	// where the trusted value is leftmost — would silently adopt an
+	// attacker-supplied rightmost entry.
 	TrustedHeader string `toml:"trusted_header"`
 }
 

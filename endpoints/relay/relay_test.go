@@ -449,4 +449,115 @@ func TestDeriveSourceAddr(t *testing.T) {
 			t.Errorf("ip = %s, want fallback to peer 198.51.100.9 when trusted header absent", got.IP)
 		}
 	})
+
+	// #2622: behind the ALB (X-Forwarded-For append mode) the trusted header is
+	// multi-entry. The RIGHTMOST entry is the AWS-attested client IP; entries to
+	// its left are attacker-supplied. These fence that deriveSourceAddr takes the
+	// rightmost entry only, and fails safe to RemoteAddr if it does not parse.
+	t.Run("XFF multi-entry takes rightmost (AWS-attested)", func(t *testing.T) {
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
+		rs.config.TrustedHeader = "X-Forwarded-For"
+		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
+		req.RemoteAddr = "10.0.0.1:5555" // the ALB
+		req.Header.Set("X-Forwarded-For", "192.0.2.50, 203.0.113.7")
+		got := rs.deriveSourceAddr(req)
+		if got.IP.String() != "203.0.113.7" {
+			t.Errorf("ip = %s, want rightmost XFF entry 203.0.113.7", got.IP)
+		}
+	})
+
+	t.Run("XFF forged leftmost is ignored", func(t *testing.T) {
+		// An attacker sets X-Forwarded-For before the ALB; the ALB appends the
+		// real client IP on the right. The forged leftmost must NOT win.
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
+		rs.config.TrustedHeader = "X-Forwarded-For"
+		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
+		req.RemoteAddr = "10.0.0.1:5555"
+		req.Header.Set("X-Forwarded-For", "198.51.100.66, 203.0.113.7")
+		got := rs.deriveSourceAddr(req)
+		if got.IP.String() != "203.0.113.7" {
+			t.Errorf("ip = %s, want AWS-attested rightmost 203.0.113.7 (forged leftmost 198.51.100.66 must be ignored)", got.IP)
+		}
+	})
+
+	t.Run("XFF unparseable rightmost falls back to peer (no walking left)", func(t *testing.T) {
+		// If the rightmost (trusted) entry is garbage, fall back to RemoteAddr —
+		// do NOT adopt the left-of-rightmost entry, which is attacker-supplied.
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
+		rs.config.TrustedHeader = "X-Forwarded-For"
+		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
+		req.RemoteAddr = "198.51.100.9:5555"
+		req.Header.Set("X-Forwarded-For", "203.0.113.7, not-an-ip")
+		got := rs.deriveSourceAddr(req)
+		if got.IP.String() != "198.51.100.9" {
+			t.Errorf("ip = %s, want fallback to peer 198.51.100.9 (rightmost unparseable; must NOT walk left to 203.0.113.7)", got.IP)
+		}
+	})
+
+	t.Run("XFF rightmost IPv6", func(t *testing.T) {
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
+		rs.config.TrustedHeader = "X-Forwarded-For"
+		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
+		req.RemoteAddr = "10.0.0.1:5555"
+		req.Header.Set("X-Forwarded-For", "192.0.2.50, 2001:db8::1")
+		got := rs.deriveSourceAddr(req)
+		if got.IP.String() != "2001:db8::1" {
+			t.Errorf("ip = %s, want rightmost IPv6 2001:db8::1", got.IP)
+		}
+	})
+
+	t.Run("XFF rightmost trims surrounding whitespace", func(t *testing.T) {
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
+		rs.config.TrustedHeader = "X-Forwarded-For"
+		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
+		req.RemoteAddr = "10.0.0.1:5555"
+		req.Header.Set("X-Forwarded-For", "192.0.2.50 ,  203.0.113.7  ")
+		got := rs.deriveSourceAddr(req)
+		if got.IP.String() != "203.0.113.7" {
+			t.Errorf("ip = %s, want trimmed rightmost 203.0.113.7", got.IP)
+		}
+	})
+
+	t.Run("XFF trailing comma (empty rightmost) falls back to peer", func(t *testing.T) {
+		// A trailing comma yields an empty rightmost entry; it must fall back to
+		// RemoteAddr, NOT walk left to the preceding entry.
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
+		rs.config.TrustedHeader = "X-Forwarded-For"
+		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
+		req.RemoteAddr = "198.51.100.9:5555"
+		req.Header.Set("X-Forwarded-For", "203.0.113.7,")
+		got := rs.deriveSourceAddr(req)
+		if got.IP.String() != "198.51.100.9" {
+			t.Errorf("ip = %s, want fallback to peer 198.51.100.9 (empty rightmost; must NOT walk left to 203.0.113.7)", got.IP)
+		}
+	})
+
+	t.Run("XFF whitespace-only rightmost falls back to peer", func(t *testing.T) {
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
+		rs.config.TrustedHeader = "X-Forwarded-For"
+		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
+		req.RemoteAddr = "198.51.100.9:5555"
+		req.Header.Set("X-Forwarded-For", "203.0.113.7,   ")
+		got := rs.deriveSourceAddr(req)
+		if got.IP.String() != "198.51.100.9" {
+			t.Errorf("ip = %s, want fallback to peer 198.51.100.9 (whitespace-only rightmost; must NOT walk left)", got.IP)
+		}
+	})
+
+	t.Run("XFF multiple header lines: global rightmost across all lines wins", func(t *testing.T) {
+		// A client can send several X-Forwarded-For header LINES. The ALB appends
+		// the attested IP last; deriveSourceAddr joins ALL lines so it's the global
+		// rightmost. A bare r.Header.Get would read only the first (attacker) line
+		// and return 9.9.9.9 — this fences that we join instead.
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
+		rs.config.TrustedHeader = "X-Forwarded-For"
+		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
+		req.RemoteAddr = "10.0.0.1:5555"
+		req.Header.Add("X-Forwarded-For", "9.9.9.9")              // attacker's first line
+		req.Header.Add("X-Forwarded-For", "8.8.8.8, 203.0.113.7") // ALB-appended attested last
+		got := rs.deriveSourceAddr(req)
+		if got.IP.String() != "203.0.113.7" {
+			t.Errorf("ip = %s, want global rightmost 203.0.113.7 across all XFF lines (attacker first line 9.9.9.9 must NOT win)", got.IP)
+		}
+	})
 }

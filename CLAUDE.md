@@ -27,6 +27,7 @@ Commit format and full details: see [`docs/COMMIT_CONVENTION.md`](docs/COMMIT_CO
 | `server` | NHP Server |
 | `agent` | NHP Agent |
 | `js-agent` | Browser NHP agent (`endpoints/js-agent`) |
+| `relay` | NHP-Relay forwarder (`endpoints/relay`) |
 | `db` | Database service |
 | `nhp` | Core protocol library |
 | `internalauth` | Shared HMAC canonicalization module (cross-repo) |

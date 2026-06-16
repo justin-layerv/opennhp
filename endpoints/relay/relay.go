@@ -460,9 +460,34 @@ func (rs *RelayServer) deriveSourceAddr(r *http.Request) *net.UDPAddr {
 		if header == "" {
 			header = defaultTrustedHeader
 		}
-		if ipStr := strings.TrimSpace(r.Header.Get(header)); ipStr != "" {
-			if ip := net.ParseIP(ipStr); ip != nil {
-				return &net.UDPAddr{IP: ip, Port: placeholderSourcePort}
+		// Trust root: trusting any X-Forwarded-For entry is only safe because the
+		// relay HTTP listener accepts ingress ONLY from the ALB security group
+		// (terraform/modules/relay/compute.tf: relay_http_from_alb) — an attacker
+		// who could reach the relay directly would control the header too. That SG
+		// rule is as load-bearing as append mode below.
+		//
+		// The fronting ALB runs X-Forwarded-For in APPEND mode
+		// (terraform/modules/relay/alb.tf: xff_header_processing_mode="append"),
+		// so the AWS-observed source IP is the entry the ALB appends LAST. A client
+		// can send several X-Forwarded-For header LINES, so JOIN them all before
+		// splitting — that makes the appended entry the GLOBAL rightmost no matter
+		// whether the ALB consolidates the lines or appends to the last one.
+		// (r.Header.Get would read only the FIRST line, whose rightmost can be
+		// fully attacker-controlled.) Take ONLY that rightmost entry; entries to
+		// its left are attacker-supplied (a caller can put anything in
+		// X-Forwarded-For), so never walk left. If the rightmost entry fails to
+		// parse, fail safe to RemoteAddr rather than trusting a left-of-rightmost
+		// value. A single-value header (e.g. X-Real-IP) joins to one entry, so this
+		// is correct there too. The rightmost is assumed PORTLESS: the relay ALB
+		// leaves routing.http.xff_client_port disabled (AWS default), so the appended
+		// entry is a bare IP; enabling it (ip:port) would fail ParseIP and fall back
+		// to RemoteAddr — the #2622 symptom via a different trigger. (#2622)
+		if raw := strings.Join(r.Header.Values(header), ","); raw != "" {
+			parts := strings.Split(raw, ",")
+			if ipStr := strings.TrimSpace(parts[len(parts)-1]); ipStr != "" {
+				if ip := net.ParseIP(ipStr); ip != nil {
+					return &net.UDPAddr{IP: ip, Port: placeholderSourcePort}
+				}
 			}
 		}
 		// Fail safe: a trusted-header deployment with a missing/garbage header
