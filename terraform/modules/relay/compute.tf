@@ -369,4 +369,9 @@ resource "aws_autoscaling_policy" "relay_requests" {
     }
     target_value = var.scale_requests_per_target
   }
+
+  # PutScalingPolicy validates that the ALB routes to the target group named in
+  # resource_label. The label only references the ALB/TG, so Terraform otherwise
+  # may create this policy before the listener rule has made the TG routable.
+  depends_on = [aws_lb_listener_rule.relay]
 }
