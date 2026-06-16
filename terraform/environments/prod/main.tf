@@ -211,6 +211,18 @@ module "nhp" {
   bootstrap_alb_alarm_email_subscriptions     = var.bootstrap_alb_alarm_email_subscriptions
   bootstrap_alb_elb_5xx_threshold_per_minute  = var.bootstrap_alb_elb_5xx_threshold_per_minute
 
+  # NHP-Relay (#2208) — dark in prod (deploy_relay defaults false; sandbox-only
+  # until the relay is validated end-to-end and a prod-enable PR flips it).
+  deploy_relay                   = var.deploy_relay
+  relay_dns_name                 = var.relay_dns_name
+  relay_route53_zone_id          = var.relay_route53_zone_id
+  relay_provision_certificate    = var.relay_provision_certificate
+  relay_manage_dns_alias         = var.relay_manage_dns_alias
+  relay_existing_certificate_arn = var.relay_existing_certificate_arn
+
+  relay_waf_rate_limit_per_source_ip = var.relay_waf_rate_limit_per_source_ip
+  relay_scale_requests_per_target    = var.relay_scale_requests_per_target
+
   # QURL Idempotency Cache
   qurl_idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds
   qurl_idempotency_cache_max_size           = var.qurl_idempotency_cache_max_size

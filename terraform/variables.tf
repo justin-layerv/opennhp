@@ -2756,3 +2756,84 @@ variable "knock_token_reject_threshold_per_minute" {
     error_message = "knock_token_reject_threshold_per_minute must be 1 ≤ x ≤ 1000 (floor catches the 0-trap; ceiling catches typo-class mistakes that would effectively disable the alarm)."
   }
 }
+
+# ── NHP-Relay (#2208 Phase-2 #5) ──
+# Internet-facing relay that forwards browser knocks to the (private) cell
+# server. Ships DARK: until 5c registers the relay pubkey in the server's
+# relay.toml, every forward is rejected at the server's Noise layer, so the
+# relay is internet-reachable but inert (cannot pivot into the private network).
+# DNS/cert vars mirror the bootstrap_alb pattern (same provision-or-existing,
+# same-account-vs-cross-account posture).
+
+variable "deploy_relay" {
+  description = "Deploy the NHP-Relay stack (autoscaling fleet + internet-facing ALB). Default off; sandbox flips it true for the dark launch. The fleet shares one keypair and authenticates by Noise IK pubkey + relay.toml registration (NOT source IP) once the server runs DisableRelayPeerValidation=true (5c, #2627); baseline one instance per AZ. See modules/relay/variables.tf and the tracking issue #2629."
+  type        = bool
+  default     = false
+}
+
+variable "relay_dns_name" {
+  description = "Public DNS name for the relay ALB. Sandbox: `relay.qurl.link.layerv.xyz`. Only read when `deploy_relay = true`."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.relay_dns_name == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.relay_dns_name))
+    error_message = "relay_dns_name must be empty (when `deploy_relay=false`) or a valid lowercase FQDN like `relay.qurl.link.layerv.xyz`."
+  }
+}
+
+variable "relay_route53_zone_id" {
+  description = "Hosted zone ID for the parent of `relay_dns_name`. Required when `relay_provision_certificate` or `relay_manage_dns_alias` is true. Sandbox: the `layerv.xyz` zone (same account). Empty when both are false (cross-account, operator-managed DNS)."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.relay_route53_zone_id == "" || can(regex("^Z[A-Z0-9]{8,}$", var.relay_route53_zone_id))
+    error_message = "relay_route53_zone_id must be empty or a valid Route53 zone ID (uppercase, starts with Z)."
+  }
+}
+
+variable "relay_provision_certificate" {
+  description = "Whether the relay module provisions+validates a regional ACM cert for `relay_dns_name`. True only when the parent zone is same-account (DNS validation writes CNAMEs there). Sandbox: true (same-account `layerv.xyz`). Prod: false (operator pre-provisions cross-account; supply `relay_existing_certificate_arn`)."
+  type        = bool
+  default     = false
+}
+
+variable "relay_manage_dns_alias" {
+  description = "Whether the relay module writes the A-alias from `relay_dns_name` to the ALB. True when the parent zone is same-account. Sandbox: true. Prod: false (operator writes the alias cross-account)."
+  type        = bool
+  default     = false
+}
+
+variable "relay_existing_certificate_arn" {
+  description = "Regional ACM cert ARN to attach when `relay_provision_certificate=false`. Must be same region+account as the ALB. Empty for the sandbox same-account provision path."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.relay_existing_certificate_arn == "" || can(regex("^arn:(aws|aws-us-gov|aws-cn):acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9-]{36}$", var.relay_existing_certificate_arn))
+    error_message = "relay_existing_certificate_arn must be empty or a valid regional ACM ARN."
+  }
+}
+
+variable "relay_waf_rate_limit_per_source_ip" {
+  description = "Relay WAF per-source-IP rate limit (requests per 5-min window, scoped to `/relay/*`) — the first-line relay DoS control. Surfaced to the env layer so #6 tuning (with real browser traffic; watch NAT/CGNAT concentration) is a tfvars change, not a code change. Default 300."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.relay_waf_rate_limit_per_source_ip >= 100 && var.relay_waf_rate_limit_per_source_ip <= 2000
+    error_message = "relay_waf_rate_limit_per_source_ip must be 100-2000 (matches the module floor/ceiling)."
+  }
+}
+
+variable "relay_scale_requests_per_target" {
+  description = "Relay ASG target-tracking threshold: ALB request count per relay target (per-target sum over the metric period). Surfaced to the env layer for #6 tuning. Default 1000."
+  type        = number
+  default     = 1000
+
+  validation {
+    condition     = var.relay_scale_requests_per_target >= 50
+    error_message = "relay_scale_requests_per_target must be >= 50."
+  }
+}

@@ -5004,6 +5004,67 @@ module "bootstrap_alb" {
   depends_on = [time_sleep.bootstrap_alb_iam_propagation]
 }
 
+# NHP-Relay (#2208 Phase-2 #5): internet-facing autoscaling relay fleet (one
+# instance per AZ baseline) that forwards browser knocks to the (private) cell
+# servers. Ships DARK — until 5c (#2627) registers
+# `module.relay[0].relay_public_key_b64` in the server's relay.toml AND sets
+# DisableRelayPeerValidation=true, every forward is rejected at the server's
+# Noise layer, so the surface is internet-reachable but inert. The fleet
+# authenticates by pubkey + relay.toml, not source IP. See
+# docs/design/NHP_RELAY_TOPOLOGY.md + the tracking issue #2629.
+module "relay" {
+  count  = var.deploy_relay ? 1 : 0
+  source = "./modules/relay"
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  tags        = merge(local.common_tags, { Service = "nhp-relay" })
+
+  # Networking — direct refs (intra-repo).
+  vpc_id             = module.networking.vpc_id
+  vpc_cidr_block     = module.networking.vpc_cidr
+  public_subnet_ids  = module.networking.public_subnet_ids
+  private_subnet_ids = module.networking.private_subnet_ids
+
+  # Relay image (5b-1 ECR repo) + AMI (reuse the server AMI: Docker + awscli +
+  # the systemd-resolved stub fix the relay's startup CloudMap resolve needs).
+  relay_repo_url = module.ecr.relay_repo_url
+  relay_repo_arn = module.ecr.relay_repo_arn
+  server_ami_id  = var.server_ami_id
+  image_tag      = var.image_tag
+
+  # Cell routing: one entry per cell. Today there is a single cell (the cell0
+  # compute module); the relay forwards to it via in-VPC CloudMap DNS (the host
+  # survives the server going private, #8 — VPC-internal, not the public NLB).
+  # The serverId in /relay/{id} is the cell pubkey's fingerprint. Append entries
+  # here as cells are added; one relay fleet fronts all cells.
+  cell_servers = [{
+    name       = "${var.environment}-${var.cell_id}"
+    public_key = module.compute.server_public_key_b64
+    host       = "server.${module.data.namespace_name}"
+    port       = 62206
+  }]
+
+  # KMS
+  ebs_kms_key_arn     = module.kms.ebs_key_arn
+  logs_kms_key_arn    = module.kms.logs_key_arn
+  secrets_kms_key_arn = module.kms.secrets_key_arn
+
+  # DNS + cert (mirrors the bootstrap_alb provision-or-existing posture).
+  dns_name                 = var.relay_dns_name
+  route53_zone_id          = var.relay_route53_zone_id
+  provision_certificate    = var.relay_provision_certificate
+  manage_dns_alias         = var.relay_manage_dns_alias
+  existing_certificate_arn = var.relay_existing_certificate_arn
+
+  # WAF + scaling knobs surfaced to the env layer so #6 tuning is a tfvars change.
+  waf_rate_limit_per_source_ip = var.relay_waf_rate_limit_per_source_ip
+  scale_requests_per_target    = var.relay_scale_requests_per_target
+
+  route53_record_change_iam_propagation_triggers = local.route53_record_change_iam_propagation_triggers
+  route53_record_change_iam_propagation_duration = local.iam_propagation_duration
+}
+
 # IAM eventual-consistency shim for the bootstrap-alb consumers of the
 # terraform-apply-services CI policy. Same pattern + rationale as
 # `time_sleep.qurl_link_static_iam_propagation` above (read that block

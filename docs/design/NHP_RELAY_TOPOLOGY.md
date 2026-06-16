@@ -318,6 +318,26 @@ the relay's footing is stable:
   is a non-issue. The relay holds no session keys (inner crypto is end-to-end), so
   the shared identity's blast radius is just its source-IP trust. **Avoid
   per-instance relay keys** — they would force a dynamic registry.
+
+  > **Scale-out works, with one server-side dependency — `DisableRelayPeerValidation =
+  > true`.** The shared keypair means N relay instances present N source IPs but a single
+  > peer entry. The server's default `CheckRecvAddress`
+  > ([`nhp/core/peer.go`](../../nhp/core/peer.go)) pins a peer to one source IP within a 5s
+  > `MinimalPeerAddressHoldTime` window, so with validation ON a fleet would have
+  > all-but-one instance's `NHP_RLY` rejected under load. Setting
+  > `DisableRelayPeerValidation = true` — a *per-peer-type* device option set via the
+  > server's `SetOption` config path ([`endpoints/server/config.go`](../../endpoints/server/config.go),
+  > affecting NHP_RELAY peers only) — skips that source-IP pin. The relay stays
+  > authenticated by the Noise IK handshake (which cryptographically decrypts its pubkey)
+  > **plus** `HandleRelayForward`'s `lookupRelayPeer` registration check
+  > ([`endpoints/server/relay.go`](../../endpoints/server/relay.go) — *"the only gate if
+  > DisableRelayPeerValidation is ever flipped on"*). So the fleet authenticates by pubkey
+  > + `relay.toml` registration, **not** by address — exactly the "source-IP trust is the
+  > blast radius" posture above. **5b-2 (#2208) deploys the relay as an autoscaling fleet
+  > (one instance per AZ baseline, 2/AZ ceiling, ALB-request-count target tracking); 5c sets
+  > the flag and registers the relay pubkey.** The relay's IP is never registered — the contract to the server's
+  > `relay.toml` is the **pubkey**. #2541 (a dynamic DDB relay registry replacing static
+  > `relay.toml`) is a *separate* enhancement, NOT a prerequisite for the fleet.
 - **Relay→cell-server handshake** — the relay handshakes to each cell's **shared
   server endpoint key** (the same one agents/ACs use via the NLB/CloudMap), so any
   healthy instance in that cell decrypts; server scale/refresh is transparent.

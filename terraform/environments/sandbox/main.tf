@@ -172,6 +172,17 @@ module "nhp" {
   bootstrap_alb_alarm_email_subscriptions     = var.bootstrap_alb_alarm_email_subscriptions
   bootstrap_alb_elb_5xx_threshold_per_minute  = var.bootstrap_alb_elb_5xx_threshold_per_minute
 
+  # NHP-Relay (#2208)
+  deploy_relay                   = var.deploy_relay
+  relay_dns_name                 = var.relay_dns_name
+  relay_route53_zone_id          = var.relay_route53_zone_id
+  relay_provision_certificate    = var.relay_provision_certificate
+  relay_manage_dns_alias         = var.relay_manage_dns_alias
+  relay_existing_certificate_arn = var.relay_existing_certificate_arn
+
+  relay_waf_rate_limit_per_source_ip = var.relay_waf_rate_limit_per_source_ip
+  relay_scale_requests_per_target    = var.relay_scale_requests_per_target
+
   # qurl-service bootstrap-outcome 401/429 spike alarms (#2102, root-
   # level `terraform/qurl_service_outcomes.tf`). Threshold defaults
   # 3/min mirror the existing `alb_target_5xx` shape; env-tunable to

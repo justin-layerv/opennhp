@@ -834,6 +834,26 @@ bootstrap_alb_elb_5xx_threshold_per_minute = 1
 # false-positives) remains tracked at nhp #1982.
 bootstrap_alb_waf_count_only_rule_groups = ["AWSManagedRulesAmazonIpReputationList"]
 
+# ── NHP-Relay (#2208 Phase-2 #5) — sandbox dark launch ──
+# Autoscaling internet-facing relay fleet (one instance per AZ) fronting
+# relay.qurl.link.layerv.xyz, forwarding browser knocks to the (private) cell
+# servers. One-per-AZ in sandbox is deliberate (validates the multi-instance
+# fleet + per the one-per-AZ directive), accepting the dark-launch cost of N
+# inert instances until #6. Ships DARK: until 5c (#2627) registers the relay
+# pubkey in the server's relay.toml AND sets DisableRelayPeerValidation=true,
+# every POST /relay/{id} is rejected at the server's Noise layer (504) — the
+# surface is internet-reachable but cannot pivot into the private network. relay.qurl.link.layerv.xyz
+# is a subdomain of the layerv.xyz zone (same account → Path 2: the module
+# provisions the regional ACM cert + writes the A-alias). The CI deploy leg
+# (SSM image-tag update + ASG refresh) and the rightmost-XFF relay-code fix are
+# tracked follow-ups (both #6 blockers). `relay_existing_certificate_arn` stays
+# empty (Path 2 requires it).
+deploy_relay                = true
+relay_dns_name              = "relay.qurl.link.layerv.xyz"
+relay_route53_zone_id       = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
+relay_provision_certificate = true
+relay_manage_dns_alias      = true
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

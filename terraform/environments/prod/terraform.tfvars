@@ -402,6 +402,12 @@ bootstrap_alb_manage_dns_alias             = false                              
 bootstrap_alb_existing_certificate_arn     = "arn:aws:acm:us-east-2:235500187906:certificate/baf58cbf-b14d-454e-a13a-988a81594eb3" # bootstrap.layerv.ai, ISSUED (Step 0)
 bootstrap_alb_elb_5xx_threshold_per_minute = 1
 
+# ── NHP-Relay (#2208) — intentionally DARK in prod ──
+# deploy_relay stays false until the relay is validated end-to-end in sandbox
+# (5c registers it on the server + #6 migrates the page) and a dedicated
+# prod-enable PR flips it. Explicit here so the dark posture reads as deliberate.
+deploy_relay = false
+
 # WAF go-live watch period (count-only). Unlike sandbox's dark launch, this PR
 # flips enable_qurl_agent_bootstrap=true simultaneously, so real customer agents
 # can hit bootstrap.layerv.ai on day 1. Per var.bootstrap_alb_waf_count_only_rule_groups's

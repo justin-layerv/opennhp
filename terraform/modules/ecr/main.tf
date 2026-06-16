@@ -3021,6 +3021,16 @@ output "server_repo_arn" {
   value       = var.is_primary_account ? aws_ecr_repository.main["nhp-server"].arn : "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/nhp-server"
 }
 
+output "relay_repo_url" {
+  description = "NHP Relay ECR repository URL (#2208)"
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-relay"].repository_url : "${local.secondary_ecr_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-relay"
+}
+
+output "relay_repo_arn" {
+  description = "NHP Relay ECR repository ARN (#2208)"
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-relay"].arn : "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/nhp-relay"
+}
+
 output "ac_repo_url" {
   description = "NHP AC ECR repository URL"
   value       = var.is_primary_account ? aws_ecr_repository.main["nhp-ac"].repository_url : "${local.secondary_ecr_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-ac"

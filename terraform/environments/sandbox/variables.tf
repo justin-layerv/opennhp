@@ -2082,3 +2082,77 @@ variable "qurl_tunnel_active_registrations_enabled" {
   type        = bool
   default     = false
 }
+
+# ── NHP-Relay (#2208) — mirrored from parent terraform/variables.tf ──
+variable "deploy_relay" {
+  description = "Deploy the NHP-Relay stack (autoscaling fleet + internet-facing ALB). Default off; sandbox enables for the dark launch. The fleet shares one keypair and authenticates by pubkey + relay.toml registration (not source IP) once the server runs DisableRelayPeerValidation=true (5c, #2627); baseline one instance per AZ. See #2629."
+  type        = bool
+  default     = false
+}
+
+variable "relay_dns_name" {
+  description = "Public DNS name for the relay ALB. Sandbox: `relay.qurl.link.layerv.xyz`. Only read when `deploy_relay = true`."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.relay_dns_name == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.relay_dns_name))
+    error_message = "relay_dns_name must be empty (when `deploy_relay=false`) or a valid lowercase FQDN like `relay.qurl.link.layerv.xyz`."
+  }
+}
+
+variable "relay_route53_zone_id" {
+  description = "Hosted zone ID for the parent of `relay_dns_name`. Required when `relay_provision_certificate` or `relay_manage_dns_alias` is true. Empty otherwise."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.relay_route53_zone_id == "" || can(regex("^Z[A-Z0-9]{8,}$", var.relay_route53_zone_id))
+    error_message = "relay_route53_zone_id must be empty or a valid Route53 zone ID (uppercase, starts with Z)."
+  }
+}
+
+variable "relay_provision_certificate" {
+  description = "Whether the relay module provisions+validates a regional ACM cert for `relay_dns_name`. Sandbox: true (same-account). Prod: false (operator pre-provisions cross-account)."
+  type        = bool
+  default     = false
+}
+
+variable "relay_manage_dns_alias" {
+  description = "Whether the relay module writes the A-alias from `relay_dns_name` to the ALB. Sandbox: true. Prod: false."
+  type        = bool
+  default     = false
+}
+
+variable "relay_existing_certificate_arn" {
+  description = "Regional ACM cert ARN to attach when `relay_provision_certificate=false`. Same region+account as the ALB."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.relay_existing_certificate_arn == "" || can(regex("^arn:(aws|aws-us-gov|aws-cn):acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9-]{36}$", var.relay_existing_certificate_arn))
+    error_message = "relay_existing_certificate_arn must be empty or a valid regional ACM ARN."
+  }
+}
+
+variable "relay_waf_rate_limit_per_source_ip" {
+  description = "Relay WAF per-source-IP rate limit (req/5min on /relay/*) — env-tunable for #6. Default 300."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.relay_waf_rate_limit_per_source_ip >= 100 && var.relay_waf_rate_limit_per_source_ip <= 2000
+    error_message = "relay_waf_rate_limit_per_source_ip must be 100-2000."
+  }
+}
+
+variable "relay_scale_requests_per_target" {
+  description = "Relay ASG target-tracking threshold (ALB request count per target) — env-tunable for #6. Default 1000."
+  type        = number
+  default     = 1000
+
+  validation {
+    condition     = var.relay_scale_requests_per_target >= 50
+    error_message = "relay_scale_requests_per_target must be >= 50."
+  }
+}
