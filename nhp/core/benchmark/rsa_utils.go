@@ -8,7 +8,7 @@ import (
 	"fmt"
 )
 
-func GenerateRSAKeys() (priv *rsa.PrivateKey, pub *rsa.PublicKey) {
+func generateRSAKeys() (priv *rsa.PrivateKey, pub *rsa.PublicKey) {
 	var err error
 	priv, err = rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -40,7 +40,7 @@ func GenerateRSAKeys() (priv *rsa.PrivateKey, pub *rsa.PublicKey) {
 	return
 }
 
-func SignWithRSAPrivateKey(priv *rsa.PrivateKey, msg []byte) (hashed []byte, signature []byte, err error) {
+func signWithRSAPrivateKey(priv *rsa.PrivateKey, msg []byte) (hashed []byte, signature []byte, err error) {
 	hash := sha256.New()
 	hash.Write(msg)
 	hashed = hash.Sum(nil)
@@ -49,6 +49,6 @@ func SignWithRSAPrivateKey(priv *rsa.PrivateKey, msg []byte) (hashed []byte, sig
 	return
 }
 
-func VerifyWithRSAPublicKey(pub *rsa.PublicKey, hashed []byte, signature []byte) error {
+func verifyWithRSAPublicKey(pub *rsa.PublicKey, hashed []byte, signature []byte) error {
 	return rsa.VerifyPKCS1v15(pub, crypto.SHA256, hashed, signature)
 }

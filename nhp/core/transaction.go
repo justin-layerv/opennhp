@@ -16,7 +16,6 @@ type LocalTransaction struct {
 	ExternalMsgCh chan *PacketParserData // a channel to receive an external msg to complete the transaction
 	done          chan struct{}          // closed by Run() on exit; used by Send*() to avoid sending on a closed channel
 	timeout       int
-	testCloseOnce *sync.Once // test-only; nil for real transactions (see NewLocalTransactionForTest)
 }
 
 type RemoteTransaction struct {

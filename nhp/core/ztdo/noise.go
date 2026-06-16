@@ -168,24 +168,6 @@ func (d DataKeyPairECCMode) ToHashType() core.HashTypeEnum {
 	return core.HASH_SHA256
 }
 
-func NewDataKeyPairECCModeWithName(mode string) (DataKeyPairECCMode, error) {
-	switch mode {
-	case "CURVE25519":
-		return CURVE25519, nil
-	default:
-		return 0, fmt.Errorf("unknown mode: %s", mode)
-	}
-}
-
-func NewDataKeyPairECCMode(eccMode core.EccTypeEnum) (DataKeyPairECCMode, error) {
-	switch eccMode {
-	case core.ECC_CURVE25519:
-		return CURVE25519, nil
-	default:
-		return 0, fmt.Errorf("unknown mode: %d", eccMode)
-	}
-}
-
 // MessagePattern defines a set of tokens which are used during symmetric key agreement
 type MessagePattern int
 

@@ -20,15 +20,15 @@ func TestRSASignAndVerify(t *testing.T) {
 	now := time.Now()
 
 	for i := 0; i < 10; i++ {
-		priv, pub := GenerateRSAKeys()
-		hashed, signature, err := SignWithRSAPrivateKey(priv, []byte(msg))
+		priv, pub := generateRSAKeys()
+		hashed, signature, err := signWithRSAPrivateKey(priv, []byte(msg))
 
 		if err != nil {
 			fmt.Printf("RSA sign error: %v", err)
 			return
 		}
 
-		err = VerifyWithRSAPublicKey(pub, hashed, signature)
+		err = verifyWithRSAPublicKey(pub, hashed, signature)
 		if err != nil {
 			fmt.Printf("RSA verify error: %v", err)
 			return
