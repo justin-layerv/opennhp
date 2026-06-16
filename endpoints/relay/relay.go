@@ -168,6 +168,13 @@ func New(cfg *Config) (*RelayServer, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/relay/", rs.handleRelay)
+	// Liveness probe for the container HEALTHCHECK and the deploy's LB target
+	// group (the relay path itself is POST-only, so it can't double as a GET
+	// health check). Path matches nhp-server's /health/live so the fleet has one
+	// health convention (one LB target-group + dashboard pattern). Cheap and
+	// unauthenticated — it reveals only that the process is up, never any
+	// routing/peer state.
+	mux.HandleFunc("/health/live", rs.handleHealthLive)
 	rs.httpServer = &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           mux,
@@ -232,6 +239,19 @@ func (rs *RelayServer) Stop(ctx context.Context) error {
 	rs.wg.Wait()
 	rs.device.Stop()
 	return err
+}
+
+// handleHealthLive is the liveness probe (GET /health/live -> 200 "ok").
+// Process-up only — it does not check server reachability, so the relay reports
+// healthy even when a cell server is down (the relay is still correctly
+// forwarding; a down server is the server's health concern, not the relay's).
+func (rs *RelayServer) handleHealthLive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
 }
 
 // handleRelay handles POST /relay/{serverId}.

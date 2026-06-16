@@ -1,0 +1,72 @@
+# Multi-stage build for the NHP-Relay (#2208) — the internet-facing bridge that
+# forwards browser-agent knocks to the private NHP-Server. Mirrors
+# Dockerfile.server (same pinned bases, apt hardening, layer-caching COPY order).
+# Stage 1: build the relay binary.
+# Tag participates in the GO_VERSION lockstep (see #1337). Canonical source of
+# all locations is .github/workflows/build-and-push.yml's env.GO_VERSION block.
+FROM golang:1.26.4-bookworm@sha256:5d2b868674b57c9e48cdd39e891acce4196b6926ca6d11e9c270a8f85106203d AS builder
+
+WORKDIR /nhp-relay
+
+# Install build dependencies (minimal — no CGO). Retries + short timeout so a
+# transient APT mirror outage retries instead of failing the build (see
+# Dockerfile.ac.aws for the CI-flake instance that motivated this).
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency files first (better layer caching).
+COPY nhp/go.mod nhp/go.sum ./nhp/
+# internalauth/ has no go.sum today (pure-stdlib module). When the first
+# non-stdlib dep lands, ALSO add internalauth/go.sum to this COPY — see
+# Dockerfile.server for the caching-drift caveat.
+COPY internalauth/go.mod ./internalauth/
+COPY endpoints/go.mod endpoints/go.sum ./endpoints/
+
+# Download dependencies (cached unless go.mod/go.sum change).
+RUN cd nhp && go mod download
+RUN cd endpoints && go mod download
+
+# Copy source code.
+COPY . .
+
+RUN echo "Building for architecture: ${TARGETARCH}"
+
+# Build the relay with CGO disabled.
+ENV CGO_ENABLED=0
+RUN make init relayd
+
+# Stage 2: runtime image.
+FROM ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+# Swap to Canonical's Azure mirror — GitHub Actions runners are in Azure, so
+# azure.archive.ubuntu.com is geo-local and more reliable (see Dockerfile.ac.aws
+# for the outage history that motivated this).
+RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ubuntu.com|//azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
+    grep -q azure.archive.ubuntu.com /etc/apt/sources.list.d/ubuntu.sources || \
+        { echo "ERROR: ubuntu.sources mirror substitution failed — file format may have changed"; exit 1; } && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the built binary + example config (the deploy overwrites etc/relay.toml).
+COPY --from=builder /nhp-relay/release/nhp-relay /nhp-relay
+
+# Liveness probe on /health/live (matches nhp-server's convention). The default
+# listen_addr is :8080 and the intended deployment binds plaintext behind a
+# TLS-terminating front door (source_addr_mode = trusted_header); a deploy that
+# overrides listen_addr's port or sets enable_tls must adjust this CMD to match
+# (the LB target-group health check is the authoritative one — see relay.toml).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8080/health/live || exit 1
+
+# Runs as root by default; dropped to a non-root uid at runtime via
+# `docker run --user` in the deployment (matching Dockerfile.server, #1090). The
+# relay binds ports >1024 and needs no capabilities.
+
+ENTRYPOINT ["/nhp-relay/nhp-relayd"]
+CMD ["run"]

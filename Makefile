@@ -80,6 +80,7 @@ generate-version-and-build:
 	@$(MAKE) agentd
 	@$(MAKE) acd
 	@$(MAKE) serverd
+	@$(MAKE) relayd
 	@$(MAKE) db
 	@$(MAKE) licenseadmin
 	@$(MAKE) linuxagentsdk
@@ -119,6 +120,13 @@ serverd:
 	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-server/nhp-serverd ./server/main/main.go && \
 	mkdir -p ../release/nhp-server/etc; \
 	cp ./server/main/etc/*.toml ../release/nhp-server/etc/
+
+relayd:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-relay... $(END_COLOUR)"
+	cd endpoints && \
+	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-relay/nhp-relayd ./relay/main/main.go && \
+	mkdir -p ../release/nhp-relay/etc; \
+	cp ./relay/main/etc/*.toml ../release/nhp-relay/etc/
 
 db:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-db... $(END_COLOUR)"
@@ -571,7 +579,7 @@ fuzz-quick:
 
 archive:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Start archiving... $(END_COLOUR)"
-	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server
+	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server nhp-relay
 	@echo "$(COLOUR_GREEN)[OpenNHP] Package ${PACKAGE_FILE} archived!$(END_COLOUR)"
 
-.PHONY: all generate-version-and-build init agentd acd serverd db licenseadmin linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-smoke-sandbox test-smoke-prod test-all fuzz fuzz-quick archive ebpf clean_ebpf
+.PHONY: all generate-version-and-build init agentd acd serverd relayd db licenseadmin linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-smoke-sandbox test-smoke-prod test-all fuzz fuzz-quick archive ebpf clean_ebpf

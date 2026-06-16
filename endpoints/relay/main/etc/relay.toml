@@ -1,0 +1,49 @@
+# NHP-Relay configuration (#2208). The relay bridges browser JS-agents
+# (HTTPS POST /relay/{serverId}) to the private NHP-Server over NHP_RLY.
+# See docs/design/NHP_RELAY_TOPOLOGY.md. This is the example shipped with the
+# binary; the deployment overwrites it (the private_key + servers come from
+# Secrets Manager / per-cell config, P5/P6).
+
+# host:port the HTTP(S) /relay/ endpoint binds (the internet-facing surface).
+# NOTE: the container HEALTHCHECK (docker/Dockerfile.relay) is pinned to
+# http://localhost:8080/health/live — if you change this port or set enable_tls
+# below, update the Dockerfile CMD too (the LB target-group check is authoritative).
+listen_addr = "0.0.0.0:8080"
+
+# host:port the relay's UDP socket binds to send NHP_RLY to cell servers and
+# receive their ACKs on the same socket. Must be stable + reachable from the
+# (private) server and match what the server registered as the relay peer — the
+# server pins the relay's source address (CheckRecvAddress).
+udp_listen_addr = "0.0.0.0:62207"
+
+# Relay identity: NHP static private key (base64 of 32 bytes). Generate with
+#   nhp-relayd keygen
+# then register the matching PUBLIC key as the relay's NHP_RELAY peer on each
+# cell server. NEVER commit a real key — left blank here on purpose (the deploy
+# injects it from the nhp-{env}-relay secret).
+private_key = ""
+
+# How the relay derives the client source IP it stamps into the forwarded knock
+# (the IP the server opens the AC pinhole for). SECURITY-CRITICAL.
+#   ""              = RemoteAddr — the actual TCP peer. Fail-safe; use when the
+#                     relay terminates TLS directly and is the client's true peer.
+#   "trusted_header" = read `trusted_header` below. ONLY safe behind a trusted
+#                     front door that overwrites the header AND to which the relay
+#                     is the sole path; otherwise any client can spoof the IP.
+source_addr_mode = ""
+trusted_header = "X-Real-IP"
+
+# Terminate TLS on the relay itself (direct internet HTTPS). Leave false when a
+# front door terminates TLS and the relay binds private/loopback.
+enable_tls = false
+tls_cert_file = ""
+tls_key_file = ""
+
+# Cell-routing table: one entry per reachable cell server. Clients address a cell
+# by its server pubkey fingerprint: POST /relay/{serverId}. Single-cell today
+# (one entry); adding a cell is a config change, not a protocol change.
+[[servers]]
+name = "sandbox-cell0"
+public_key = ""                       # cell server's NHP static public key (base64)
+host = "server.nhp.sandbox.internal"  # the server's UDP host (CloudMap DNS)
+port = 62206                          # the server's NHP knock UDP port

@@ -1,5 +1,13 @@
 package relay
 
+import (
+	"bytes"
+	"fmt"
+	"os"
+
+	"github.com/pelletier/go-toml/v2"
+)
+
 // Config configures the NHP-Relay service (#2208). The relay is the
 // internet-facing component of the off-internet topology:
 //
@@ -96,4 +104,28 @@ func (c *Config) ListenUDPAddr() string {
 		return c.UDPListenAddr
 	}
 	return ":0"
+}
+
+// LoadConfig reads the relay configuration from the TOML file at path. It is the
+// thin IO + decode seam the nhp-relayd daemon (endpoints/relay/main) uses; the
+// load-bearing validation — private-key size, source_addr_mode, per-server
+// pubkeys and reachability — is deferred to New, which fails closed on bad
+// values. Kept in package relay (not main) so it stays unit-testable.
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("relay: read config %q: %w", path, err)
+	}
+	// Strict decode: this config is security-critical (source_addr_mode, the UDP
+	// bind the server pins via CheckRecvAddress), and an ignored typo fails *unsafe*
+	// — e.g. `udp_listen_adr` would leave UDPListenAddr empty, bind an ephemeral
+	// port, and the relay would be silently unreachable from the server. Reject
+	// unknown keys at startup instead.
+	dec := toml.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var cfg Config
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("relay: parse config %q: %w", path, err)
+	}
+	return &cfg, nil
 }
