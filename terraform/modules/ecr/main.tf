@@ -310,7 +310,7 @@ locals {
   # docs/runbooks/ecr-replication-failure.md. **#1489 tracks a CI lint
   # to enforce the SHA-backbone convention** so this prose guard
   # doesn't rot.
-  core_ecr_repos = ["nhp-server", "nhp-ac", "nhp-console", "qurl-reverse-tunnel-server"]
+  core_ecr_repos = ["nhp-server", "nhp-ac", "nhp-console", "qurl-reverse-tunnel-server", "nhp-relay"]
 
   route53_change_record_hosted_zone_arns = [
     for zone_id in var.route53_change_record_hosted_zone_ids :

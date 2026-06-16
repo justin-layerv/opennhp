@@ -953,6 +953,12 @@ jobs:
           - image: ac
             dockerfile: docker/Dockerfile.ac.aws
             repo: layerv/nhp-ac
+          # The NHP-Relay (#2208). Build + scan + push only — nothing deploys it
+          # yet (no relay ASG; the SSM image-tag + instance refresh land with the
+          # relay compute module in a follow-up). Mirrors the server/ac legs.
+          - image: relay
+            dockerfile: docker/Dockerfile.relay
+            repo: layerv/nhp-relay
     steps:
       # Skip at step level (not job level) so matrix expands and check names are created
       # Build only when app code changes (nhp/**, endpoints/**, docker/**)

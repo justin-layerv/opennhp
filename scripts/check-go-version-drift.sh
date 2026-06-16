@@ -191,6 +191,7 @@ golang_from_files=(
   "docker/Dockerfile.server"
   "docker/Dockerfile.ac"
   "docker/Dockerfile.ac.aws"
+  "docker/Dockerfile.relay"
 )
 
 dev_go_dockerfiles=(

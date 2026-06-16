@@ -60,7 +60,7 @@ EOF
   GO_TEST_IMAGE: 'golang:${version}-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 EOF
 
-  for dockerfile in Dockerfile.server Dockerfile.ac Dockerfile.ac.aws; do
+  for dockerfile in Dockerfile.server Dockerfile.ac Dockerfile.ac.aws Dockerfile.relay; do
     cat > "$dir/docker/$dockerfile" <<EOF
 FROM golang:${version}-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
 EOF
