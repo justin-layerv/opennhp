@@ -527,7 +527,14 @@ resource "aws_iam_role_policy" "server" {
           [var.etcd_secret_arn],
           [var.etcd_tls_secret_arn],
           [var.qurl_service_token_secret_arn],
-          [var.nhp_internal_auth_secret_arn]
+          [var.nhp_internal_auth_secret_arn],
+          # #2208 5c: read the relay fleet's keypair to render relay.toml at boot
+          # (the server trusts the relay's pubkey). Constructed ARN by name — NOT
+          # module.relay.secret_arn, which would close a compute→relay module
+          # cycle (relay already consumes module.compute.server_public_key_b64).
+          # `-*` matches Secrets Manager's random suffix; compact() drops the ""
+          # when the relay is not deployed (relay_enabled=false).
+          [var.relay_enabled ? "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-relay-*" : ""]
         ))
       },
       {
@@ -794,6 +801,14 @@ locals {
     http_read_timeout_ms  = var.http_timeouts_ms.read
     http_write_timeout_ms = var.http_timeouts_ms.write
     http_idle_timeout_ms  = var.http_timeouts_ms.idle
+    # #2208 5c: server trusts the relay. relay_enabled (= deploy_relay) drives
+    # DisableRelayValidation in config.toml AND gates the relay.toml render (the
+    # server fetches the relay fleet pubkey from Secrets Manager at boot). Prod
+    # (deploy_relay=false) → DisableRelayValidation=false + no relay.toml, so it
+    # stays behaviorally dark. relay_secret_name is the deterministic relay secret
+    # name (constructed, not a module ref → no compute→relay cycle).
+    relay_enabled     = var.relay_enabled
+    relay_secret_name = "${var.name_prefix}-relay"
   })
 
   # Launch template user_data — small fetcher when the plugin bucket exists,

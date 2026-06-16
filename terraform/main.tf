@@ -536,6 +536,13 @@ module "compute" {
   # Deployment configuration
   image_tag = var.image_tag
 
+  # #2208 5c: gate the server's relay trust on whether a relay is deployed (what
+  # the flag renders is documented on the module's relay_enabled variable). Pass a
+  # plain bool, NOT module.relay.* — module.relay already consumes
+  # module.compute.server_public_key_b64, so a back-reference would close a
+  # compute<->relay cycle.
+  relay_enabled = var.deploy_relay
+
   # Plugin configuration (plugins baked into Docker image, just need names for etcd seeding)
   server_plugins  = var.server_plugins
   auth_service_id = var.ac_auth_service_id
@@ -5006,12 +5013,16 @@ module "bootstrap_alb" {
 
 # NHP-Relay (#2208 Phase-2 #5): internet-facing autoscaling relay fleet (one
 # instance per AZ baseline) that forwards browser knocks to the (private) cell
-# servers. Ships DARK — until 5c (#2627) registers
-# `module.relay[0].relay_public_key_b64` in the server's relay.toml AND sets
-# DisableRelayPeerValidation=true, every forward is rejected at the server's
-# Noise layer, so the surface is internet-reachable but inert. The fleet
-# authenticates by pubkey + relay.toml, not source IP. See
-# docs/design/NHP_RELAY_TOPOLOGY.md + the tracking issue #2629.
+# servers. Shipped DARK until 5c (#2627): until the server boot-reads the relay
+# fleet pubkey from Secrets Manager into its relay.toml AND sets
+# DisableRelayValidation=true, every forward is rejected at the server's Noise
+# layer, so the surface is internet-reachable but inert. 5c gates both on
+# var.deploy_relay (module "compute" relay_enabled) and reconstructs the secret
+# name by convention rather than consuming module.relay.* — a back-reference
+# would close a compute<->relay cycle (this module already consumes
+# module.compute.server_public_key_b64). The fleet authenticates by pubkey +
+# relay.toml, not source IP. See docs/design/NHP_RELAY_TOPOLOGY.md + the tracking
+# issue #2629.
 module "relay" {
   count  = var.deploy_relay ? 1 : 0
   source = "./modules/relay"
@@ -5063,6 +5074,42 @@ module "relay" {
 
   route53_record_change_iam_propagation_triggers = local.route53_record_change_iam_propagation_triggers
   route53_record_change_iam_propagation_duration = local.iam_propagation_duration
+}
+
+# #2208 5c: guardrail for the relay-secret name coupling. module.compute does NOT
+# reference module.relay (that would close a compute<->relay module cycle —
+# module.relay already consumes module.compute.server_public_key_b64). Instead the
+# server reconstructs the relay secret name as "${local.name_prefix}-relay" by
+# convention (config.toml DisableRelayValidation, the relay.toml boot-read, and
+# the secret:${local.name_prefix}-relay-* IAM grant all derive from it). Nothing
+# else keeps the two sides in lockstep, so a relay-side rename would silently
+# darken the server's relay trust at boot (relay.toml skipped, every NHP_RLY
+# rejected, only a WARNING in user-data.log). This check SURFACES that drift as a
+# plan-time WARNING — terraform `check` assertions are advisory (they don't fail
+# plan/apply), so it's a visibility aid, not a hard gate. `one(module.relay[*].secret_arn)`
+# is null when deploy_relay=false (index-safe), so the disabled case passes. #2634
+# is the structural fence: hoist the name to a shared root local threaded into both
+# modules (cycle-free), making drift impossible and retiring this advisory check.
+check "relay_secret_name_convention" {
+  assert {
+    condition = (
+      var.deploy_relay == false ||
+      can(regex(":secret:${local.name_prefix}-relay-", one(module.relay[*].secret_arn)))
+    )
+    error_message = <<-EOT
+      module.relay's secret ARN no longer matches the name
+      "${local.name_prefix}-relay" that module.compute reconstructs by
+      convention. The server fleet would boot, find no readable relay secret,
+      skip writing relay.toml, and reject every NHP_RLY (relay path dark) with
+      only a WARNING in user-data.log.
+
+      Fix: keep modules/relay's aws_secretsmanager_secret "relay" name in
+      lockstep with the "${local.name_prefix}-relay" reconstruction in module
+      "compute" (relay_secret_name + the IAM grant), or thread the name
+      explicitly. The name is reconstructed rather than referenced to avoid a
+      compute<->relay module cycle.
+    EOT
+  }
 }
 
 # IAM eventual-consistency shim for the bootstrap-alb consumers of the

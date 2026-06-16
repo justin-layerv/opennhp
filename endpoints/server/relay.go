@@ -39,11 +39,16 @@ import (
 // relay_ack_roundtrip_spike_test.go.
 //
 // Trust model: the relay is authenticated by Noise IK while the OUTER NHP_RLY
-// packet is decrypted (DisableRelayPeerValidation=false -> validatePeer requires
-// a registered NHP_RELAY peer and pins its source address via CheckRecvAddress).
-// SourceAddr is therefore asserted by an authenticated relay and is the SOLE
-// trusted source of the AC-pinhole client IP. See
-// docs/design/NHP_RELAY_TOPOLOGY.md.
+// packet is decrypted — it cannot complete the handshake without the fleet
+// private key, regardless of the DisableRelayPeerValidation setting. The #2208
+// shared-keypair fleet runs DisableRelayPeerValidation=true (its per-AZ
+// instances share one keypair but present distinct source IPs, so the
+// responder's CheckRecvAddress pin must be off), which makes the lookupRelayPeer
+// gate below load-bearing rather than belt-and-suspenders. With validation on
+// (legacy/default) the responder additionally requires a registered NHP_RELAY
+// peer and pins its source address. Either way SourceAddr is asserted by a
+// Noise-authenticated, relay.toml-registered relay and is the SOLE trusted
+// source of the AC-pinhole client IP. See docs/design/NHP_RELAY_TOPOLOGY.md.
 //
 // Deployment assumption: this path needs CLOUD-MODE agent resolution
 // (DisableAgentPeerValidation=true, which cloud mode forces). The INNER knock is
@@ -87,14 +92,17 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 	relayAddr := outerPpd.ConnData.RemoteAddr
 	relayPubKey := base64.StdEncoding.EncodeToString(outerPpd.RemotePubKey)
 
-	// Defense-in-depth: the core responder already rejected unknown pubkeys
-	// (DisableRelayPeerValidation=false -> validatePeer LookupPeer), but it does
-	// NOT check peer.DeviceType()==NHP_RELAY, so a registered AC/agent pubkey
-	// could otherwise inject an NHP_RLY with a spoofed SourceAddr. Require the
-	// sender to be specifically a registered relay peer before trusting its
-	// SourceAddr to open an AC pinhole. validatePeer is the primary gate; this
-	// is belt-and-suspenders (and the only gate if DisableRelayPeerValidation is
-	// ever flipped on for a future dynamic relay registry — see #2541).
+	// Authorization gate: require the sender to be a specifically registered
+	// NHP_RELAY peer before trusting its SourceAddr to open an AC pinhole.
+	//   - #2208 shared-keypair fleet (DisableRelayPeerValidation=true): the core
+	//     responder skipped its peer-validation block entirely, so THIS is the
+	//     sole gate authorizing the (Noise-IK-authenticated) relay pubkey.
+	//   - validation on (legacy/default): the responder's validatePeer already
+	//     rejected unknown pubkeys via LookupPeer, but does NOT check
+	//     peer.DeviceType()==NHP_RELAY, so a registered AC/agent pubkey could
+	//     otherwise inject an NHP_RLY with a spoofed SourceAddr — this closes that
+	//     by requiring specifically a relay peer.
+	// Also the sole gate for a future dynamic relay registry (see #2541).
 	if s.lookupRelayPeer(relayPubKey) == nil {
 		s.metrics.IncrCounter(MetricRelayForwardReject)
 		log.Error("server-relay(@%s)[HandleRelayForward] sender pubkey_b64_prefix=%q is not a registered NHP_RELAY peer; dropping",

@@ -164,6 +164,14 @@ resource "aws_lambda_function" "keygen" {
   tags = local.tags
 }
 
+# NAME COUPLING (#2208 5c): modules/compute reconstructs this exact secret name
+# ("${var.name_prefix}-relay") by convention — it cannot reference this resource
+# without closing a compute<->relay module cycle (modules/relay already consumes
+# module.compute.server_public_key_b64). The server's config.toml flag, relay.toml
+# boot-read, and IAM grant all derive from this name. Renaming it silently darkens
+# the server's relay trust. Keep in lockstep; the root `check
+# "relay_secret_name_convention"` (terraform/main.tf) surfaces drift as a plan-time
+# warning (advisory, not a hard gate; #2634 tracks the structural fence).
 resource "aws_secretsmanager_secret" "relay" {
   name                    = "${var.name_prefix}-relay"
   description             = "NHP Relay fleet private key (one keypair per env; #2208)"

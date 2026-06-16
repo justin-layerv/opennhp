@@ -199,6 +199,116 @@ func TestUpdateBaseConfig_DisableAgentValidationHotReloadPreservesCloudModeOverr
 	}
 }
 
+// TestUpdateBaseConfig_DisableRelayValidationHotReload fences the #2208 relay
+// flag wiring against the SetOption-REPLACE trap: a hot-reload that toggles
+// DisableRelayValidation must apply the relay option WITHOUT resetting the agent
+// or AC options (deviceOptions() is the single source of truth), and the relay
+// flag is threaded DIRECTLY from the operator config (no cloud-mode override —
+// the relay is deployed only where configured, so prod with no relay stays dark).
+func TestUpdateBaseConfig_DisableRelayValidationHotReload(t *testing.T) {
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	// As Start() leaves it in cloud mode: agent + AC validation disabled, relay
+	// not yet.
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), &core.DeviceOptions{
+		DisableAgentPeerValidation: true,
+		DisableACPeerValidation:    true,
+	})
+	if device == nil {
+		t.Fatal("core.NewDevice returned nil")
+	}
+	defer device.Stop()
+
+	inner := newFakeAgentKeysQuerier()
+	lookup, err := NewAgentPeerLookup(inner, "qurl-agent-keys-test")
+	if err != nil {
+		t.Fatalf("NewAgentPeerLookup: %v", err)
+	}
+
+	s := &UdpServer{
+		log:             logger,
+		config:          &Config{DisableAgentValidation: true, DisableRelayValidation: false},
+		device:          device,
+		agentPeerLookup: lookup,
+		storageConfig:   &StorageConfig{Backend: StorageBackendDynamoDB},
+	}
+
+	// Reload: relay validation disabled (false→true), agent unchanged. The reload
+	// must fire on the relay delta and SetOption must apply the FULL option set.
+	if err := s.updateBaseConfig(Config{DisableAgentValidation: true, DisableRelayValidation: true}); err != nil {
+		t.Fatalf("updateBaseConfig (relay on): %v", err)
+	}
+	opt := device.Option()
+	if !opt.DisableRelayPeerValidation {
+		t.Error("DisableRelayPeerValidation=false after reload to true; relay flag did not apply")
+	}
+	if !opt.DisableAgentPeerValidation {
+		t.Error("DisableAgentPeerValidation reset to false when the relay flag changed — SetOption replaces the whole struct; deviceOptions() must re-apply it")
+	}
+	if !opt.DisableACPeerValidation {
+		t.Error("DisableACPeerValidation reset to false when the relay flag changed — SetOption replaces the whole struct; deviceOptions() must re-apply it")
+	}
+	if !s.config.DisableRelayValidation {
+		t.Error("s.config.DisableRelayValidation=false; cached state must reflect the reload for the next delta-compare")
+	}
+
+	// Reload back: relay validation re-enabled (true→false). The relay flag is
+	// threaded directly (no cloud-mode override), so it follows the operator.
+	if err := s.updateBaseConfig(Config{DisableAgentValidation: true, DisableRelayValidation: false}); err != nil {
+		t.Fatalf("updateBaseConfig (relay off): %v", err)
+	}
+	opt = device.Option()
+	if opt.DisableRelayPeerValidation {
+		t.Error("DisableRelayPeerValidation=true after reload to false; relay flag must follow the operator config (no cloud-mode override)")
+	}
+	// Fence the SetOption-replace in this direction too: toggling relay off must
+	// not reset the agent/AC options either.
+	if !opt.DisableAgentPeerValidation {
+		t.Error("DisableAgentPeerValidation reset to false when the relay flag toggled off — SetOption replaces the whole struct; deviceOptions() must re-apply it")
+	}
+	if !opt.DisableACPeerValidation {
+		t.Error("DisableACPeerValidation reset to false when the relay flag toggled off — SetOption replaces the whole struct; deviceOptions() must re-apply it")
+	}
+}
+
+// TestDeviceOptions_RelayFromConfig locks the Start (boot) path: deviceOptions()
+// is the single source of truth NewDevice consumes at Start, and must render
+// DisableRelayPeerValidation directly from config (no cloud-mode override) while
+// keeping the cloud-mode agent + AC options. The hot-reload test above exercises
+// the SetOption path; this fences the boot path the two share.
+func TestDeviceOptions_RelayFromConfig(t *testing.T) {
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	inner := newFakeAgentKeysQuerier()
+	lookup, err := NewAgentPeerLookup(inner, "qurl-agent-keys-test")
+	if err != nil {
+		t.Fatalf("NewAgentPeerLookup: %v", err)
+	}
+
+	// Cloud mode (DynamoDB) with the agent peer lookup wired, as Start() leaves
+	// it: agent + AC validation disabled independent of the relay flag.
+	s := &UdpServer{
+		log:             logger,
+		agentPeerLookup: lookup,
+		storageConfig:   &StorageConfig{Backend: StorageBackendDynamoDB},
+	}
+
+	for _, relayOn := range []bool{true, false} {
+		opt := s.deviceOptions(&Config{DisableRelayValidation: relayOn})
+		if opt.DisableRelayPeerValidation != relayOn {
+			t.Errorf("DisableRelayPeerValidation=%v, want %v — boot path must follow config directly (no cloud-mode override)", opt.DisableRelayPeerValidation, relayOn)
+		}
+		if !opt.DisableAgentPeerValidation {
+			t.Errorf("DisableAgentPeerValidation=false with relayOn=%v; the cloud-mode agent override must hold regardless of the relay flag", relayOn)
+		}
+		if !opt.DisableACPeerValidation {
+			t.Errorf("DisableACPeerValidation=false with relayOn=%v; cloud mode must disable AC validation regardless of the relay flag", relayOn)
+		}
+	}
+}
+
 // TestLoadPeers_RefusesCloudModeWithAgentTomlCoexistence fences
 // the agent.toml + cloud-mode coexistence guard. The two paths
 // cannot coexist: updateAgentPeers (called from loadPeers and the

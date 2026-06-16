@@ -80,8 +80,36 @@ type Config struct {
 	// scripts/check-disable-agent-validation.sh is the structural
 	// fence (intentionally `grep -Ei`). Do not add a toml: tag here
 	// expecting defense in depth; it provides none.
-	DisableAgentValidation bool         `json:"disableAgentValidation"`
-	WebRTC                 WebRTCConfig `toml:"webrtc"`
+	DisableAgentValidation bool `json:"disableAgentValidation"`
+
+	// DisableRelayValidation, when true, makes the responder skip its NHP_RELAY
+	// peer-validation block (responder.go: the registered-peer LookupPeer + expiry
+	// + CheckRecvAddress source-IP pin) for the #2208 shared-keypair relay fleet.
+	// REQUIRED there because the fleet's instances (one per AZ, one keypair)
+	// present distinct source IPs that the pin would reject. This is NOT a
+	// "trust any relay" hole: the relay is still cryptographically authenticated
+	// by the Noise IK handshake (a sender cannot produce a server-accepted NHP_RLY
+	// under the relay's pubkey without the fleet private key), and authorized by
+	// HandleRelayForward.lookupRelayPeer against relay.toml — so the pubkey gate
+	// survives; only the source-IP pin drops (incompatible with a multi-IP fleet).
+	// Threaded into the device option via deviceOptions().
+	//
+	// Two deliberate differences from DisableAgentValidation:
+	//   - NO cloud-mode override: the relay is deployed only where configured, so
+	//     terraform sets this true exactly when it renders relay.toml (both gated
+	//     on deploy_relay). Forcing it on every cloud server would drop relay
+	//     validation on servers that have no relay.
+	//   - NO check-disable-* lint fence: DisableAgentValidation=true is a
+	//     never-in-a-deploy "trust any agent, no key check" hole, so a fail-on-true
+	//     fence is correct for it. Here true is the REQUIRED value wherever a relay
+	//     runs, is gated on deploy_relay, and is inert without relay.toml
+	//     (lookupRelayPeer is empty → HandleRelayForward fails closed). A
+	//     fail-on-true fence would reject the legitimate relay config; the
+	//     deploy_relay gate is the structural control instead.
+	// See docs/design/NHP_RELAY_TOPOLOGY.md + endpoints/server/relay.go.
+	DisableRelayValidation bool `json:"disableRelayValidation"`
+
+	WebRTC WebRTCConfig `toml:"webrtc"`
 
 	// StaleACConnThresholdSeconds overrides the default DefaultStaleACConnThreshold
 	// (30s) for filtering AC connections out of NHP-AOP broadcast targeting.
@@ -325,9 +353,9 @@ func (s *UdpServer) loadPeers() error {
 
 	// relay.toml - optional, contains NHP_RELAY peer configurations (#2208).
 	// Registering the relay's static pubkey lets the server authenticate the
-	// NHP_RLY packets it forwards. The handler that processes NHP_RLY lands
-	// in a follow-up PR; until then a registered relay is authenticated but
-	// its NHP_RLY falls through to the default (unhandled) dispatch.
+	// NHP_RLY packets it forwards: udpserver.go dispatches NHP_RLY to
+	// HandleRelayForward, whose lookupRelayPeer gate consults this relayPeerMap.
+	// Absent relay.toml the map is empty and every NHP_RLY is rejected.
 	fileNameRelay := filepath.Join(ExeDirPath, "etc", "relay.toml")
 	contentRelay, err := s.loadConfigFile(fileNameRelay)
 	if err != nil {
@@ -633,20 +661,21 @@ func (s *UdpServer) updateBaseConfig(conf Config) (err error) {
 		s.config.LogLevel = conf.LogLevel
 	}
 
-	if s.config.DisableAgentValidation != conf.DisableAgentValidation {
+	if s.config.DisableAgentValidation != conf.DisableAgentValidation ||
+		s.config.DisableRelayValidation != conf.DisableRelayValidation {
 		if s.device != nil {
-			// Re-apply the cloud-mode override on hot-reload —
-			// without this, an operator edit that flips
-			// DisableAgentValidation back to false silently undoes
-			// the override that Start() applied (every cloud-mode
-			// agent first-knock then fails at the responder layer
-			// with no metric to alarm on, because the lookup is
-			// still wired but never reached).
-			s.device.SetOption(core.DeviceOptions{
-				DisableAgentPeerValidation: s.computeEffectiveDisableAgentValidation(conf.DisableAgentValidation),
-			})
+			// SetOption REPLACES the whole DeviceOptions struct, so apply the
+			// full set via deviceOptions() — the single source of truth shared
+			// with Start(). This re-applies the cloud-mode agent override on
+			// hot-reload (without it, an operator edit that flips
+			// DisableAgentValidation back to false silently undoes the override
+			// Start() applied — every cloud-mode agent first-knock then fails at
+			// the responder layer with no metric to alarm on) AND keeps the AC
+			// and relay options from resetting to false.
+			s.device.SetOption(s.deviceOptions(&conf))
 		}
 		s.config.DisableAgentValidation = conf.DisableAgentValidation
+		s.config.DisableRelayValidation = conf.DisableRelayValidation
 	}
 
 	if s.config.DefaultCipherScheme != conf.DefaultCipherScheme {

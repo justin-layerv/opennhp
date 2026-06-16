@@ -327,11 +327,14 @@ the relay's footing is stable:
   > all-but-one instance's `NHP_RLY` rejected under load. Setting
   > `DisableRelayPeerValidation = true` — a *per-peer-type* device option set via the
   > server's `SetOption` config path ([`endpoints/server/config.go`](../../endpoints/server/config.go),
-  > affecting NHP_RELAY peers only) — skips that source-IP pin. The relay stays
-  > authenticated by the Noise IK handshake (which cryptographically decrypts its pubkey)
+  > affecting NHP_RELAY peers only) — skips that source-IP pin (and the rest of the
+  > responder's per-peer validation block; incompatible with a multi-IP fleet). The
+  > relay stays authenticated by the Noise IK handshake (a sender cannot produce a
+  > server-accepted `NHP_RLY` under the relay's pubkey without the fleet private key)
   > **plus** `HandleRelayForward`'s `lookupRelayPeer` registration check
-  > ([`endpoints/server/relay.go`](../../endpoints/server/relay.go) — *"the only gate if
-  > DisableRelayPeerValidation is ever flipped on"*). So the fleet authenticates by pubkey
+  > ([`endpoints/server/relay.go`](../../endpoints/server/relay.go) — with the flag on,
+  > `lookupRelayPeer` is the load-bearing relay-pubkey authz gate, not
+  > belt-and-suspenders). So the fleet authenticates by pubkey
   > + `relay.toml` registration, **not** by address — exactly the "source-IP trust is the
   > blast radius" posture above. **5b-2 (#2208) deploys the relay as an autoscaling fleet
   > (one instance per AZ baseline, 2/AZ ceiling, ALB-request-count target tracking); 5c sets

@@ -462,6 +462,12 @@ variable "enable_qurl_resolve_endpoint" {
   default     = false
 }
 
+variable "relay_enabled" {
+  description = "#2208 5c: whether an NHP-Relay is deployed (= var.deploy_relay). When true, the server renders relay.toml with the relay fleet's pubkey (boot-read from Secrets Manager) and sets DisableRelayValidation=true so it trusts the shared-keypair relay fleet. A plain bool (NOT a module.relay ref) to avoid a compute→relay module cycle. Default false → server stays behaviorally dark (no relay peers, validation at default)."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_resolve_certificate_arn" {
   description = "ACM certificate ARN for the QURL resolve endpoint (resolve.qurl.link). Required when enable_qurl_resolve_endpoint is true."
   type        = string

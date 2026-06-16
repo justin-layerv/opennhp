@@ -928,11 +928,11 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		s.metrics.IncrCounter(MetricResourceLookupNotConfigured)
 	}
 
-	option := &core.DeviceOptions{
-		DisableAgentPeerValidation: disableAgentValidation,
-		DisableACPeerValidation:    cloudMode,
-	}
-	s.device = core.NewDevice(core.NHP_SERVER, prk, option)
+	// deviceOptions() is the single source of truth shared with the hot-reload
+	// SetOption (it recomputes the same effective agent value logged above and
+	// AC=cloudMode, plus the relay option) — so Start and reload never diverge.
+	opts := s.deviceOptions(s.config)
+	s.device = core.NewDevice(core.NHP_SERVER, prk, &opts)
 	if s.device == nil {
 		log.Critical("failed to create device")
 		return errors.New("failed to create device")
@@ -2668,6 +2668,25 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 func (s *UdpServer) computeEffectiveDisableAgentValidation(operatorVal bool) bool {
 	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
 	return operatorVal || (cloudMode && s.agentPeerLookup != nil)
+}
+
+// deviceOptions computes the complete DeviceOptions for the server device from
+// conf + cloud mode. SINGLE SOURCE OF TRUTH: core.Device.SetOption REPLACES the
+// whole DeviceOptions struct, so the Start-time NewDevice and the hot-reload
+// SetOption (updateBaseConfig) must apply the SAME complete set — an option set
+// in one path but omitted in the other silently resets to false on reload (this
+// is what previously let a hot-reload reset DisableACPeerValidation). Add any new
+// server device option here, not at the call sites.
+func (s *UdpServer) deviceOptions(conf *Config) core.DeviceOptions {
+	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
+	return core.DeviceOptions{
+		DisableAgentPeerValidation: s.computeEffectiveDisableAgentValidation(conf.DisableAgentValidation),
+		DisableACPeerValidation:    cloudMode,
+		// #2208: skip the relay source-IP pin so the shared-keypair fleet
+		// authenticates by pubkey + relay.toml. No cloud-mode override — see the
+		// Config.DisableRelayValidation doc.
+		DisableRelayPeerValidation: conf.DisableRelayValidation,
+	}
 }
 
 func (s *UdpServer) AddAgentPeer(agent *core.UdpPeer) (added bool) {
