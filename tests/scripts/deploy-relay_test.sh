@@ -170,6 +170,25 @@ case "$1 $2" in
       echo "unexpected ASG name: got '$ASG_NAME', expected '$EXPECTED_ASG_NAME'" >&2
       exit 2
     fi
+    # The readiness-gate work (#2646) pins refresh behavior for the tiny relay
+    # fleet via --preferences; assert it's present so a future drop is caught.
+    PREFERENCES=$(arg_after --preferences "$@" || true)
+    if [[ -z "$PREFERENCES" ]]; then
+      echo "start-instance-refresh missing --preferences" >&2
+      exit 2
+    fi
+    printf '%s' "$PREFERENCES" > "$STATE_DIR/preferences"
+    # Mirror the real StartInstanceRefresh constraint: when both bounds are given,
+    # MaxHealthyPercentage - MinHealthyPercentage must be <= 100 or AWS rejects
+    # with a ValidationException. Enforcing it here catches an invalid blob (e.g.
+    # 50/200) that would otherwise ride green through CI and only blow up at real
+    # deploy time, and guards future edits to the --preferences JSON.
+    MIN_HP=$(printf '%s' "$PREFERENCES" | grep -oE '"MinHealthyPercentage"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)
+    MAX_HP=$(printf '%s' "$PREFERENCES" | grep -oE '"MaxHealthyPercentage"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)
+    if [[ -n "$MIN_HP" && -n "$MAX_HP" ]] && ((MAX_HP - MIN_HP > 100)); then
+      echo "An error occurred (ValidationException) when calling the StartInstanceRefresh operation: The MaxHealthyPercentage minus the MinHealthyPercentage cannot be greater than 100. (got Min=$MIN_HP Max=$MAX_HP)" >&2
+      exit 251
+    fi
     printf '%s\n' "$ASG_NAME" > "$STATE_DIR/refresh"
     case "${FAKE_REFRESH_MODE:-success}" in
       success)
@@ -185,6 +204,76 @@ case "$1 $2" in
         ;;
       *)
         echo "unsupported FAKE_REFRESH_MODE: ${FAKE_REFRESH_MODE:-}" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+
+  "autoscaling describe-instance-refreshes")
+    if [[ "$ASG_NAME" != "$EXPECTED_ASG_NAME" ]]; then
+      echo "unexpected ASG name: got '$ASG_NAME', expected '$EXPECTED_ASG_NAME'" >&2
+      exit 2
+    fi
+    # Two distinct call sites; discriminate on --max-records (UNAMBIGUOUS, not a
+    # query-substring match that the poll's [Status,PercentageComplete] could
+    # also hit):
+    #   - in-flight most-recent lookup: --max-records 1, query
+    #     InstanceRefreshes[0].[InstanceRefreshId,Status]
+    #   - completion poll: --instance-refresh-ids <id>, query
+    #     InstanceRefreshes[0].[Status,PercentageComplete]
+    if has_arg --max-records "$@"; then
+      # Most-recent-refresh lookup (the InstanceRefreshInProgress path). Modes:
+      #   ok (default) → id + FAKE_RECENT_STATUS (default InProgress, so the
+      #                  caller falls through to the poll); set Failed/Cancelled/
+      #                  Successful to exercise the converged-race terminal cases.
+      #   error        → persistent describe failure → caller must fail loud.
+      case "${FAKE_INFLIGHT_DESCRIBE_MODE:-ok}" in
+        ok)
+          printf '%s\t%s\n' "${FAKE_RECENT_ID:-refresh-inflight}" "${FAKE_RECENT_STATUS:-InProgress}"
+          ;;
+        error)
+          echo "An error occurred (ThrottlingException) when calling DescribeInstanceRefreshes" >&2
+          exit 251
+          ;;
+        *)
+          echo "unsupported FAKE_INFLIGHT_DESCRIBE_MODE: ${FAKE_INFLIGHT_DESCRIBE_MODE:-}" >&2
+          exit 2
+          ;;
+      esac
+      exit 0
+    fi
+    # Completion poll. Each invocation advances a counter so a mode can return a
+    # non-terminal status first, then a terminal one — exercising the loop.
+    poll_count_file="$STATE_DIR/describe-count"
+    poll_count=0
+    [[ -f "$poll_count_file" ]] && poll_count=$(cat "$poll_count_file")
+    poll_count=$((poll_count + 1))
+    printf '%s' "$poll_count" > "$poll_count_file"
+    case "${FAKE_DESCRIBE_MODE:-successful}" in
+      successful)
+        # One non-terminal poll, then Successful — proves the loop iterates.
+        if [[ "$poll_count" -lt 2 ]]; then
+          printf 'InProgress\t50\n'
+        else
+          printf 'Successful\t100\n'
+        fi
+        ;;
+      failed)
+        if [[ "$poll_count" -lt 2 ]]; then
+          printf 'InProgress\t50\n'
+        else
+          printf 'Failed\t50\n'
+        fi
+        ;;
+      cancelled)
+        printf 'Cancelled\tNone\n'
+        ;;
+      never-terminal)
+        # Always non-terminal → drives the bounded-wait timeout branch.
+        printf 'InProgress\t10\n'
+        ;;
+      *)
+        echo "unsupported FAKE_DESCRIBE_MODE: ${FAKE_DESCRIBE_MODE:-}" >&2
         exit 2
         ;;
     esac
@@ -320,6 +409,7 @@ assert_rc "SSM retry-then-success deploy succeeds" 0
 assert_file_equals "SSM retry-then-success retries three times" "$LAST_STATE_DIR/get-count" "3"
 assert_file_equals "SSM retry-then-success writes image tag" "$LAST_STATE_DIR/put" "/sandbox/nhp/relay/image-tag=cafe1234"
 assert_file_equals "SSM retry-then-success starts refresh" "$LAST_STATE_DIR/refresh" "layerv-nhp-sandbox-relay"
+assert_contains "SSM retry-then-success polls refresh to completion" "completed successfully on layerv-nhp-sandbox-relay"
 
 run_case empty-image-tag-loud-fail true "" FAKE_GET_MODE=success
 assert_rc "empty image tag fails loud" 1
@@ -333,12 +423,17 @@ assert_rc "lit app-changed deploy succeeds" 0
 assert_file_equals "app-changed writes the new image tag" "$LAST_STATE_DIR/put" "/sandbox/nhp/relay/image-tag=cafe1234"
 assert_file_equals "app-changed starts instance refresh" "$LAST_STATE_DIR/refresh" "layerv-nhp-sandbox-relay"
 assert_contains "app-changed records refresh id" "Started relay instance refresh: refresh-123"
+assert_file_contains "app-changed pins MinHealthyPercentage" "$LAST_STATE_DIR/preferences" "MinHealthyPercentage"
+assert_file_contains "app-changed pins SkipMatching false" "$LAST_STATE_DIR/preferences" '"SkipMatching": false'
+assert_contains "app-changed polls refresh to completion" "completed successfully on layerv-nhp-sandbox-relay"
+assert_file_contains "app-changed summary records completion" "$LAST_SUMMARY" "completed successfully"
 
 run_case lit-infra-only false cafe1234 FAKE_GET_MODE=success
 assert_rc "lit infra-only refresh succeeds" 0
 assert_file_absent "infra-only does not write github.sha tag" "$LAST_STATE_DIR/put"
 assert_file_equals "infra-only still refreshes fleet" "$LAST_STATE_DIR/refresh" "layerv-nhp-sandbox-relay"
 assert_contains "infra-only emits unchanged-tag notice" "keeping the current relay image tag"
+assert_contains "infra-only polls refresh to completion" "completed successfully on layerv-nhp-sandbox-relay"
 
 run_case ssm-loud-fail true cafe1234 FAKE_GET_MODE=error FAKE_EXPECT_PUT=true
 assert_rc "non-not-found SSM failure fails loud" 1
@@ -379,14 +474,136 @@ assert_contains "refresh failure emits Actions error" "::error::Failed to start 
 assert_contains "refresh failure surfaces AWS error" "ValidationError"
 assert_file_contains "refresh failure writes step summary" "$LAST_SUMMARY" "could not start instance refresh on \`layerv-nhp-sandbox-relay\`"
 
+# InstanceRefreshInProgress, most-recent refresh still InProgress → resolve its
+# id and poll it to completion (gated identically to the start path).
 run_case refresh-in-progress true cafe1234 \
   FAKE_GET_MODE=success \
   FAKE_EXPECT_PUT=true \
-  FAKE_REFRESH_MODE=inprogress
-assert_rc "existing instance refresh is accepted" 0
+  FAKE_REFRESH_MODE=inprogress \
+  FAKE_RECENT_STATUS=InProgress
+assert_rc "existing instance refresh is polled to completion" 0
 assert_file_equals "refresh-in-progress still writes app tag first" "$LAST_STATE_DIR/put" "/sandbox/nhp/relay/image-tag=cafe1234"
 assert_file_equals "refresh-in-progress attempts ASG refresh" "$LAST_STATE_DIR/refresh" "layerv-nhp-sandbox-relay"
 assert_contains "refresh-in-progress emits notice" "already in progress"
+assert_contains "refresh-in-progress resolves the most-recent id" "Polling in-flight relay instance refresh: refresh-inflight"
+assert_contains "refresh-in-progress polls the in-flight refresh to completion" "completed successfully on layerv-nhp-sandbox-relay"
+
+# InstanceRefreshInProgress, but the most-recent refresh already converged to
+# Successful in the race window → clean success without polling further.
+run_case refresh-in-progress-already-converged true cafe1234 \
+  FAKE_GET_MODE=success \
+  FAKE_EXPECT_PUT=true \
+  FAKE_REFRESH_MODE=inprogress \
+  FAKE_RECENT_STATUS=Successful
+assert_rc "refresh-in-progress that already converged succeeds" 0
+assert_contains "already-converged emits notice" "already completed successfully"
+assert_file_contains "already-converged writes step summary" "$LAST_SUMMARY" "completed successfully"
+assert_file_absent "already-converged does not poll (no poll count)" "$LAST_STATE_DIR/describe-count"
+
+# #2646 cr item 1 — in-flight branch with a PERSISTENT describe error must FAIL
+# LOUD (exit 1), never degrade into a silent success (the #1634 hidden-skip
+# class). We reached here because StartInstanceRefresh said InstanceRefreshInProgress.
+run_case refresh-in-progress-describe-error true cafe1234 \
+  FAKE_GET_MODE=success \
+  FAKE_EXPECT_PUT=true \
+  FAKE_REFRESH_MODE=inprogress \
+  FAKE_INFLIGHT_DESCRIBE_MODE=error
+assert_rc "in-flight describe error fails loud" 1
+assert_contains "in-flight describe error emits Actions error" "::error::Failed to describe the in-flight relay refresh on layerv-nhp-sandbox-relay"
+assert_contains "in-flight describe error surfaces AWS error" "ThrottlingException"
+assert_file_absent "in-flight describe error does not poll" "$LAST_STATE_DIR/describe-count"
+assert_file_contains "in-flight describe error writes step summary" "$LAST_SUMMARY" "could not describe the in-flight refresh"
+
+# #2646 cr item 2 — the most-recent refresh resolving to Failed in the converged
+# race window must FAIL LOUD (exit 1), not be reported as a pass just because
+# nothing InProgress/Pending remains.
+run_case refresh-in-progress-recent-failed true cafe1234 \
+  FAKE_GET_MODE=success \
+  FAKE_EXPECT_PUT=true \
+  FAKE_REFRESH_MODE=inprogress \
+  FAKE_RECENT_STATUS=Failed
+assert_rc "in-flight most-recent Failed fails loud" 1
+assert_contains "in-flight most-recent Failed emits Actions error" "ended Failed"
+assert_file_absent "in-flight most-recent Failed does not poll" "$LAST_STATE_DIR/describe-count"
+assert_file_contains "in-flight most-recent Failed writes step summary" "$LAST_SUMMARY" "ended Failed"
+
+# Same for Cancelled.
+run_case refresh-in-progress-recent-cancelled true cafe1234 \
+  FAKE_GET_MODE=success \
+  FAKE_EXPECT_PUT=true \
+  FAKE_REFRESH_MODE=inprogress \
+  FAKE_RECENT_STATUS=Cancelled
+assert_rc "in-flight most-recent Cancelled fails loud" 1
+assert_contains "in-flight most-recent Cancelled emits Actions error" "ended Cancelled"
+assert_file_absent "in-flight most-recent Cancelled does not poll" "$LAST_STATE_DIR/describe-count"
+
+# An unexpected/unresolvable most-recent status (e.g. empty/None) must also fail
+# loud — we KNOW a refresh existed, so we refuse to report success.
+run_case refresh-in-progress-recent-none true cafe1234 \
+  FAKE_GET_MODE=success \
+  FAKE_EXPECT_PUT=true \
+  FAKE_REFRESH_MODE=inprogress \
+  FAKE_RECENT_ID=None \
+  FAKE_RECENT_STATUS=None
+assert_rc "in-flight unresolved status fails loud" 1
+assert_contains "in-flight unresolved status emits Actions error" "refusing to report success"
+assert_file_absent "in-flight unresolved status does not poll" "$LAST_STATE_DIR/describe-count"
+
+# Refresh starts cleanly but reports Failed mid-roll → the readiness gate must
+# fail the deploy LOUD (the #2646 core item / #6 prerequisite).
+run_case refresh-reports-failed true cafe1234 \
+  FAKE_GET_MODE=success \
+  FAKE_EXPECT_PUT=true \
+  FAKE_REFRESH_MODE=success \
+  FAKE_DESCRIBE_MODE=failed
+assert_rc "refresh that reports Failed fails the deploy" 1
+assert_file_equals "failed-refresh still wrote app tag first" "$LAST_STATE_DIR/put" "/sandbox/nhp/relay/image-tag=cafe1234"
+assert_contains "failed-refresh emits Actions error" "::error::Relay instance refresh refresh-123 on layerv-nhp-sandbox-relay ended Failed"
+assert_file_contains "failed-refresh writes step summary" "$LAST_SUMMARY" "did not complete successfully"
+
+# Refresh reports Cancelled → also a loud failure.
+run_case refresh-reports-cancelled true cafe1234 \
+  FAKE_GET_MODE=success \
+  FAKE_EXPECT_PUT=true \
+  FAKE_REFRESH_MODE=success \
+  FAKE_DESCRIBE_MODE=cancelled
+assert_rc "refresh that reports Cancelled fails the deploy" 1
+assert_contains "cancelled-refresh emits Actions error" "ended Cancelled"
+assert_file_contains "cancelled-refresh writes step summary" "$LAST_SUMMARY" "did not complete successfully"
+
+# Refresh never reaches a terminal state within the iteration cap → bounded-wait
+# timeout fails the deploy LOUD (must not hang CI). MAX_ITERATIONS=3 + a no-op
+# sleep keeps the case fast.
+run_case refresh-times-out true cafe1234 \
+  FAKE_GET_MODE=success \
+  FAKE_EXPECT_PUT=true \
+  FAKE_REFRESH_MODE=success \
+  FAKE_DESCRIBE_MODE=never-terminal \
+  RELAY_REFRESH_POLL_INTERVAL_SECS=0 \
+  RELAY_REFRESH_MAX_ITERATIONS=3
+assert_rc "refresh that never converges times out and fails" 1
+assert_contains "timeout emits Actions error" "did not converge within"
+assert_file_equals "timeout polled exactly MAX_ITERATIONS times" "$LAST_STATE_DIR/describe-count" "3"
+assert_file_contains "timeout writes step summary" "$LAST_SUMMARY" "did not complete successfully"
+
+# --- Mock guard: invalid --preferences (the #2674 cr blocking bug) -------------
+# The fake aws enforces the real StartInstanceRefresh constraint
+# (MaxHealthyPercentage - MinHealthyPercentage <= 100). Exercise the rejection
+# branch directly — every case above sends the valid default, so a regression in
+# the guard (or a future invalid --preferences edit) would otherwise ride green.
+# This is the check that would have caught the original 50/200 blob.
+mkdir -p "$TMP_ROOT/mock-bad-prefs/bin" "$TMP_ROOT/mock-bad-prefs/state"
+make_fake_commands "$TMP_ROOT/mock-bad-prefs/bin"
+if bad_prefs_out=$(FAKE_AWS_STATE_DIR="$TMP_ROOT/mock-bad-prefs/state" \
+    "$TMP_ROOT/mock-bad-prefs/bin/aws" autoscaling start-instance-refresh \
+    --auto-scaling-group-name layerv-nhp-sandbox-relay \
+    --preferences '{"MinHealthyPercentage": 50, "MaxHealthyPercentage": 200, "InstanceWarmup": 120, "SkipMatching": false}' 2>&1); then
+  report_fail "mock rejects --preferences with Max-Min>100" "expected non-zero exit, got 0; output: $bad_prefs_out"
+elif [[ "$bad_prefs_out" == *ValidationException* ]]; then
+  report_pass "mock rejects --preferences with Max-Min>100"
+else
+  report_fail "mock rejects --preferences with Max-Min>100" "non-zero exit but no ValidationException; output: $bad_prefs_out"
+fi
 
 echo ""
 echo "Passed: $pass"

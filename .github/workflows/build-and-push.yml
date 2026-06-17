@@ -2343,10 +2343,14 @@ jobs:
     if: always() && needs.deploy-sandbox-infra.result == 'success'
     runs-on: ubuntu-latest
     environment: sandbox
-    # Instance refresh is dispatched async (we don't poll it to completion here,
-    # matching the relay's fire-and-forget rolling replacement); the steps are a
-    # couple of AWS calls. 15m is generous headroom for SSM/ASG API latency.
-    timeout-minutes: 15
+    # deploy-relay.sh starts the instance refresh and POLLS it to completion (the
+    # #2646 readiness gate) — it is NOT fire-and-forget: SSM calls + the start,
+    # then a bounded poll (RELAY_REFRESH_MAX_ITERATIONS × interval, default 15
+    # min). This job timeout is therefore load-bearing for the poll ceiling, not
+    # just SSM/ASG API headroom: an observed healthy 3-instance roll took ~8m15s,
+    # the script caps the poll at 15 min, and 20m keeps a margin so the script's
+    # own poll timeout fails the deploy loudly before this job timeout can bite.
+    timeout-minutes: 20
     # Direct AWS calls only (no sub-workflow dispatch), so unlike
     # deploy-sandbox-blue-green this needs id-token + contents, NOT actions:write.
     permissions:
@@ -2558,11 +2562,16 @@ jobs:
     # DEPLOY_FAILED loop. Only `cancelled` (indeterminate/half-rolled, run being
     # torn down) skips validation.
     #
-    # deploy-sandbox-relay is deliberately NOT in needs here: the relay is dark,
-    # validate/smoke do not exercise it, and its ASG refresh is fire-and-forget
-    # until the #2646 readiness/completion gate lands. Ordering validation after
-    # relay would imply a readiness guarantee this job does not have; relay
-    # failures are still loud through notify's DEPLOY_FAILED loop.
+    # deploy-sandbox-relay is deliberately NOT in needs here. As of #2646
+    # deploy-relay.sh polls its instance refresh to completion and FAILS LOUD on
+    # a bad roll, so a broken relay deploy already surfaces on its own red
+    # deploy-sandbox-relay job + notify's DEPLOY_FAILED loop — validate does not
+    # need to wait for it to make a bad roll observable. And the relay is dark
+    # (validate/smoke don't exercise it), so ordering validate after the relay
+    # roll would only add latency (up to the relay poll's 15-min ceiling) to
+    # every sandbox deploy for no coverage. The real relay post-deploy smoke
+    # (HTTP/forward reachability) and its validate-ordering land with #6, where
+    # they have teeth.
     needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green, deploy-sandbox-qurl]
     if: |
       always() &&

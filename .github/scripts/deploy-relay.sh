@@ -39,13 +39,29 @@
 # a sustained / permission SSM error fails LOUD — never degrade an error
 # into a silent skip (the #1634 hidden-skip class).
 #
+# READINESS GATE (#2646, gates #6): after starting the refresh we POLL it to a
+# terminal state instead of returning fire-and-forget — succeed on `Successful`,
+# FAIL LOUD on `Failed`/`Cancelled` or a bounded-wait timeout. Because the relay
+# ASG uses health_check_type=ELB (modules/relay/compute.tf), a `Successful`
+# refresh means every replaced instance passed the ALB target group's
+# /health/live check, so the poll doubles as the post-deploy reachability signal
+# (the relay equivalent of blue-green's knock-readiness gate). This converts a
+# boot-failed / crash-looping new relay image from a silent ELB-replacement loop
+# into a red CI job — the prerequisite for putting browser traffic on the relay.
+#
 # Environment variables:
 #   AWS_REGION:   AWS region (default: us-east-2).
 #   GITHUB_STEP_SUMMARY: appended to when set (no-op outside Actions).
+#   RELAY_REFRESH_POLL_INTERVAL_SECS: seconds between refresh-status polls
+#                 (default: 10). Lowered to 0 by the test harness for speed.
+#   RELAY_REFRESH_MAX_ITERATIONS: max status polls before a timeout failure
+#                 (default: 90 → 15 min at the 10s interval; ~7-min cushion over
+#                 the observed ~8-min healthy-roll baseline).
 #
 # Exit codes:
-#   0 - success (deployed, or a clean dark skip)
-#   1 - invalid args / loud SSM, SSM write, or ASG failure
+#   0 - success (deployed + refresh converged, or a clean dark skip)
+#   1 - invalid args / loud SSM, SSM write, ASG, or refresh failure (incl. a
+#       Failed/Cancelled refresh or a poll-to-completion timeout)
 
 set -euo pipefail
 
@@ -62,6 +78,23 @@ IMAGE_TAG="$3"
 # fallback and won't silently diverge if the workflow region ever changes.
 AWS_REGION="${AWS_REGION:-us-east-2}"
 SSM_PARAM_NOT_FOUND="__NHP_RELAY_SSM_PARAMETER_NOT_FOUND__"
+
+# Refresh completion-poll cadence (#2646). 90 × 10s = 15 min ceiling. Baseline:
+# an observed healthy sandbox roll of the 3-instance one-per-AZ fleet took
+# ~8m15s — one-at-a-time at MinHealthyPercentage=50, each instance = ECR pull +
+# boot + the 120s warmup. A 10-min cap left too little margin (a slightly slower
+# pull could tip past it and false-fail a healthy roll), so 15 min gives a
+# comfortable ~7-min cushion over the ~8-min baseline while still failing LOUD on
+# a genuinely wedged/boot-looping roll rather than hanging CI. Stays inside the
+# deploy-sandbox-relay job's 20-min timeout (build-and-push.yml). The interval is
+# overridable so the fixture suite can drive the poll with a no-op sleep.
+RELAY_REFRESH_POLL_INTERVAL_SECS="${RELAY_REFRESH_POLL_INTERVAL_SECS:-10}"
+RELAY_REFRESH_MAX_ITERATIONS="${RELAY_REFRESH_MAX_ITERATIONS:-90}"
+# Consecutive describe-instance-refreshes errors (throttle/IAM) tolerated before
+# poll_refresh fails LOUD with the captured cause — a one-off blip is absorbed,
+# but a persistent break fails fast + informatively instead of riding the full
+# poll ceiling to a generic "did not converge" (mirrors the in-flight branch).
+RELAY_REFRESH_MAX_DESCRIBE_ERRORS="${RELAY_REFRESH_MAX_DESCRIBE_ERRORS:-3}"
 
 # The relay image lives in the sandbox-account ECR repo layerv/nhp-relay
 # (cross-account pull in prod), tagged by the build matrix with the same SHA
@@ -181,30 +214,178 @@ else
 fi
 
 # Trigger a rolling instance refresh so the fleet picks up the (new or
-# unchanged) image tag + any launch-template change. Fire-and-forget: we
-# don't poll to completion (single AZ-baseline fleet rolls quickly). A
-# refresh already in progress returns InstanceRefreshInProgress, which we
-# treat as success (a roll is already happening — the desired end state).
+# unchanged) image tag + any launch-template change, then POLL it to completion
+# (the #2646 readiness gate — see the header). A refresh already in progress
+# returns InstanceRefreshInProgress; rather than blindly treating that as
+# success, we resolve the in-flight refresh id and poll IT too, so that path is
+# gated identically (a roll a prior run started must still converge).
+#
+# --preferences (#2646): the relay ASG is a tiny one-per-AZ fleet, so we pin
+# refresh behavior rather than inherit the API default (MinHealthyPercentage=90,
+# which on a 3-instance fleet rounds the min-healthy floor up to 3 and can stall
+# a roll on "cannot honor min healthy percentage"). 50 rolls one instance at a
+# time while keeping the rest in service (matches update-ssm-image-tag.sh's small
+# fleets); MaxHealthyPercentage=150 lets the ASG launch a replacement BEFORE
+# terminating the old (launch-before-terminate). AWS requires
+# MaxHealthyPercentage - MinHealthyPercentage <= 100, so 50/150 is the valid
+# pairing that keeps the one-at-a-time floor AND the surge (50/200 is rejected
+# with a ValidationException). InstanceWarmup=120 matches the ASG's health_check_grace_period; SkipMatching is
+# false because the image tag lives in SSM (read at boot), not the launch
+# template — a tag-only change leaves the template identical, so SkipMatching
+# would wrongly skip the replacement (same reason as update-ssm-image-tag.sh).
 #
 # Unconditional roll (accepted): this fires on every successful
 # deploy-sandbox-infra, so even an UNRELATED infra change (e.g. a server-only
 # terraform apply) rolls the relay fleet. That's deliberate — same rationale as
 # blue-green's "refresh on every build" — and accepted: the relay forwards an
-# opaque, version-stable protocol and is dark until #6, so a churned roll is
-# benign. Adding a readiness gate / completion poll (the blue-green knock-ready
-# equivalent) is a #6-time concern, tracked separately; it's unneeded while dark.
+# opaque, version-stable protocol, so a churned roll is benign.
+
+# Poll an instance refresh to a terminal state. Succeeds (rc 0) on `Successful`,
+# fails LOUD (rc 1) on `Failed`/`Cancelled` or a bounded-wait timeout. Mirrors
+# wait-for-instance-refresh.sh and blue-green-deploy.yml's poll_refresh: a
+# timeout is a FAILURE, not a warning — a roll that won't converge inside the
+# window is exactly the boot-loop this gate exists to catch. Health verification
+# is implicit: the relay ASG is health_check_type=ELB, so a `Successful` refresh
+# means each replaced instance passed the ALB /health/live check.
+poll_refresh() {
+  local asg="$1" refresh_id="$2" iteration status percentage refresh_data
+  local describe_err consecutive_errors=0
+  describe_err=$(mktemp)
+  for ((iteration = 1; iteration <= RELAY_REFRESH_MAX_ITERATIONS; iteration++)); do
+    sleep "$RELAY_REFRESH_POLL_INTERVAL_SECS"
+    # Single call for both fields; query a one-element list so a vanished refresh
+    # id yields empty text on a SUCCESSFUL describe (rc 0) — treated as a
+    # non-terminal poll. Only an actual CLI error (rc != 0: throttle/IAM) counts
+    # toward the consecutive-error budget: a one-off blip is absorbed (a healthy
+    # ~8-min roll survives an API hiccup), but a persistent break fails LOUD with
+    # the captured cause rather than riding the cap to a generic timeout. Stderr
+    # to a tempfile (not 2>&1) so a warning can't contaminate the status parse.
+    # Fail-closed: only an explicit `Successful` returns 0.
+    if refresh_data=$(aws autoscaling describe-instance-refreshes \
+      --auto-scaling-group-name "$asg" \
+      --instance-refresh-ids "$refresh_id" \
+      --query "InstanceRefreshes[0].[Status,PercentageComplete]" \
+      --output text \
+      --region "$AWS_REGION" 2>"$describe_err"); then
+      consecutive_errors=0
+    else
+      consecutive_errors=$((consecutive_errors + 1))
+      if ((consecutive_errors >= RELAY_REFRESH_MAX_DESCRIBE_ERRORS)); then
+        echo "::error::Relay refresh poll: describe-instance-refreshes failed ${consecutive_errors}x in a row on $asg (IAM/throttle?):"
+        cat "$describe_err" >&2
+        rm -f "$describe_err"
+        return 1
+      fi
+      refresh_data=""
+    fi
+    status=$(printf '%s' "$refresh_data" | awk '{print $1}')
+    percentage=$(printf '%s' "$refresh_data" | awk '{print $2}')
+    # AWS reports PercentageComplete as "None" before progress starts; print 0
+    # rather than a confusing "None%". Only a non-negative integer is real.
+    if [[ ! "$percentage" =~ ^[0-9]+$ ]]; then percentage=0; fi
+    echo "[relay refresh $refresh_id] iter $iteration/$RELAY_REFRESH_MAX_ITERATIONS — status=${status:-<none>} progress=${percentage}%"
+    case "$status" in
+      Successful)
+        rm -f "$describe_err"
+        return 0
+        ;;
+      Failed | Cancelled)
+        echo "::error::Relay instance refresh $refresh_id on $asg ended $status before converging."
+        rm -f "$describe_err"
+        return 1
+        ;;
+      *)
+        : # Pending / InProgress / (transient empty) — keep polling.
+        ;;
+    esac
+  done
+  rm -f "$describe_err"
+  echo "::error::Relay instance refresh $refresh_id on $asg did not converge within $((RELAY_REFRESH_MAX_ITERATIONS * RELAY_REFRESH_POLL_INTERVAL_SECS))s; failing the deploy."
+  return 1
+}
+
 echo ""
 echo "Starting instance refresh on $ASG_NAME ..."
 REFRESH_ERR=$(mktemp)
+REFRESH_ID=""
 if REFRESH_ID=$(aws autoscaling start-instance-refresh \
     --auto-scaling-group-name "$ASG_NAME" \
+    --preferences '{"MinHealthyPercentage": 50, "MaxHealthyPercentage": 150, "InstanceWarmup": 120, "SkipMatching": false}' \
     --query "InstanceRefreshId" --output text \
     --region "$AWS_REGION" 2>"$REFRESH_ERR"); then
   echo "Started relay instance refresh: $REFRESH_ID"
   summary "- Relay deploy: instance refresh \`$REFRESH_ID\` started on \`$ASG_NAME\`"
 elif grep -q 'InstanceRefreshInProgress' "$REFRESH_ERR"; then
-  echo "::notice::A relay instance refresh is already in progress on $ASG_NAME; treating as success."
-  summary "- Relay deploy: instance refresh already in progress on \`$ASG_NAME\`"
+  # A roll a prior run started is already cycling (StartInstanceRefresh refused
+  # because one is in flight). We don't have its id, so describe the MOST-RECENT
+  # refresh and gate on its terminal status. `describe-instance-refreshes` sorts
+  # by start time descending (most recent first, in-progress ones first), so
+  # --max-records 1 + InstanceRefreshes[0] is that refresh.
+  #
+  # CRITICAL (no silent-skip, no green-a-failed-roll): this lookup must NOT
+  # degrade a transient describe error into a clean success the way 2>/dev/null
+  # + "empty == converged" would (the #1634 hidden-skip class) — and it must NOT
+  # assume a vanished/most-recent refresh SUCCEEDED. So: retry like ssm_probe,
+  # fail LOUD on a persistent describe error, and branch on the actual Status —
+  # only `Successful` passes; `Failed`/`Cancelled`/empty fail loud.
+  echo "::notice::A relay instance refresh is already in progress on $ASG_NAME; resolving the most-recent refresh to gate on."
+  summary "- Relay deploy: instance refresh already in progress on \`$ASG_NAME\` — gating on the most-recent refresh"
+  DESC_ERR=$(mktemp)
+  RECENT=""
+  for desc_attempt in 1 2 3; do
+    if RECENT=$(aws autoscaling describe-instance-refreshes \
+        --auto-scaling-group-name "$ASG_NAME" \
+        --max-records 1 \
+        --query "InstanceRefreshes[0].[InstanceRefreshId,Status]" \
+        --output text \
+        --region "$AWS_REGION" 2>"$DESC_ERR"); then
+      break
+    fi
+    RECENT=""
+    if [[ "$desc_attempt" -lt 3 ]]; then sleep "$((desc_attempt * 3))"; fi
+  done
+  if [[ -z "$RECENT" ]]; then
+    # Persistent describe error (IAM/throttle) — surface it loudly, never skip.
+    echo "::error::Failed to describe the in-flight relay refresh on $ASG_NAME after retries (IAM/throttle?):"
+    cat "$DESC_ERR" >&2
+    summary "- Relay deploy: **failed** — could not describe the in-flight refresh on \`$ASG_NAME\`"
+    rm -f "$DESC_ERR" "$REFRESH_ERR"
+    exit 1
+  fi
+  rm -f "$DESC_ERR"
+  REFRESH_ID=$(printf '%s' "$RECENT" | awk '{print $1}')
+  RECENT_STATUS=$(printf '%s' "$RECENT" | awk '{print $2}')
+  echo "Most-recent relay refresh on $ASG_NAME: id=$REFRESH_ID status=$RECENT_STATUS"
+  case "$RECENT_STATUS" in
+    Successful)
+      # The in-flight roll converged between the start attempt and this lookup.
+      echo "::notice::The in-flight relay refresh ($REFRESH_ID) already completed successfully on $ASG_NAME."
+      summary "- Relay deploy: in-flight refresh \`$REFRESH_ID\` **completed successfully** on \`$ASG_NAME\`"
+      rm -f "$REFRESH_ERR"
+      exit 0
+      ;;
+    Failed | Cancelled)
+      # A failed roll in the race window leaves nothing InProgress/Pending too —
+      # do NOT report it green.
+      echo "::error::The in-flight relay refresh ($REFRESH_ID) on $ASG_NAME ended $RECENT_STATUS."
+      summary "- Relay deploy: **failed** — in-flight refresh \`$REFRESH_ID\` ended $RECENT_STATUS on \`$ASG_NAME\`"
+      rm -f "$REFRESH_ERR"
+      exit 1
+      ;;
+    Pending | InProgress)
+      # Still rolling — fall through to poll it to completion.
+      echo "Polling in-flight relay instance refresh: $REFRESH_ID"
+      ;;
+    *)
+      # Empty id / None / RollbackInProgress / Cancelling / any unexpected token:
+      # we KNOW a refresh existed (StartInstanceRefresh said InstanceRefreshInProgress),
+      # so an unresolvable or unexpected status is a loud failure, not a pass.
+      echo "::error::Could not resolve a usable status for the in-flight relay refresh on $ASG_NAME (got id='$REFRESH_ID' status='$RECENT_STATUS'); refusing to report success."
+      summary "- Relay deploy: **failed** — unresolved in-flight refresh status (\`$RECENT_STATUS\`) on \`$ASG_NAME\`"
+      rm -f "$REFRESH_ERR"
+      exit 1
+      ;;
+  esac
 else
   echo "::error::Failed to start relay instance refresh on $ASG_NAME:"
   cat "$REFRESH_ERR" >&2
@@ -213,3 +394,15 @@ else
   exit 1
 fi
 rm -f "$REFRESH_ERR"
+
+# Readiness gate: poll the refresh to a terminal state. A Failed/Cancelled
+# refresh or a timeout fails the deploy LOUD (the #6 prerequisite).
+echo ""
+echo "Waiting for relay instance refresh $REFRESH_ID to converge on $ASG_NAME ..."
+if poll_refresh "$ASG_NAME" "$REFRESH_ID"; then
+  echo "Relay instance refresh $REFRESH_ID completed successfully on $ASG_NAME."
+  summary "- Relay deploy: instance refresh \`$REFRESH_ID\` **completed successfully** on \`$ASG_NAME\`"
+else
+  summary "- Relay deploy: **failed** — instance refresh \`$REFRESH_ID\` did not complete successfully on \`$ASG_NAME\`"
+  exit 1
+fi
