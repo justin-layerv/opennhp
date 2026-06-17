@@ -19,6 +19,7 @@
 #   - BootstrapFailure: user_data.sh.tpl (aws cloudwatch put-metric-data)
 #   - UnHealthyHostCount / HealthyHostCount: AWS/ApplicationELB (TG + LB ARN suffixes)
 #   - GroupInServiceInstances: AWS/AutoScaling (the ASG's enabled_metrics)
+#   - RelayShed: endpoints/relay/relay.go (the relay's endpoints/metrics publisher, #2649)
 #
 # Action routing mirrors modules/ac: a single optional SNS topic ARN threaded in
 # from the root (module.monitoring.sns_topic_arn), with the same
@@ -236,5 +237,76 @@ resource "aws_cloudwatch_metric_alarm" "relay_capacity_below_baseline" {
   tags = merge(local.tags, {
     Name  = "${var.name_prefix}-relay-capacity-below-baseline"
     Issue = "2630"
+  })
+}
+
+# ── 5. Backpressure shedding (the relay-is-shedding incident signal #2649) ──
+#
+# The relay daemon emits a LayerV/NHP "RelayShed" counter on every backpressure
+# 503 (endpoints/relay/relay.go::recordShed, via the same endpoints/metrics
+# publisher nhp-server uses). A shed means a cell's in-flight cap
+# (maxInFlightPerServer=256) was reached — a real incident signal: the target
+# cell is stuck/slow, or the relay is under flood. Until #2649 a shed was only a
+# throttled Warning in the relay logs (logShed); this alarm makes it alertable,
+# pairing with #2640's relay alarms and #2643's server-side reject alarm.
+#
+# DIM SET — {Environment=<env>}, NO Region/Cell: this is a GO-published metric
+# (PutMetricData via the metrics publisher), NOT a CLI put-metric-data like
+# BootstrapFailure above. recordShed DUAL-PUBLISHES — a base counter at the
+# publisher's [Environment] dims (matched here) PLUS a per-cell breakdown that
+# adds a Cell dim (dashboards/attribution only). The alarm keys on the clean
+# [Environment] base because (a) the relay fleet fronts all cells, so there is
+# no single Cell value for the process, and (b) CloudWatch metric alarms can't
+# aggregate the per-cell streams (no SEARCH on alarms — see modules/compute's
+# server_instance_restart note). NO Region dim: the relay publisher's base set is
+# [Environment] only (buildRelayMetricDimensions), unlike the AC publisher's
+# {Component,Environment,Region} — match the emit site, per terraform/CLAUDE.md.
+# `terraform validate` cannot catch a dim-set mismatch; correctness rests on
+# matching buildRelayMetricDimensions + recordShed.
+#
+# Single-event detector (threshold=0, datapoints_to_alarm=1 over a 5-min
+# lookback, Sum), NOT a consecutive-window rate alarm — same shape as
+# relay_bootstrap_failure above and per the repo's sparse-fleet alarm rule: prod
+# knock traffic is sparse (~1-2/hr) and the cap (256) sits orders of magnitude
+# above real peak, so a HEALTHY relay never sheds and the FIRST shed must page.
+# notBreaching: the counter is only emitted on an actual shed (it's skipped at 0
+# by the publisher's flush), so quiet periods are genuinely shed-free, and a dark
+# relay carrying no traffic correctly stays green. No OK notification: returning
+# to OK means no new sheds in the lookback, not that the overloaded cell
+# recovered — same posture as relay_bootstrap_failure.
+#
+# GATING — actions only, NOT count: mirrors the four alarms above (and the file
+# header) — the alarm always exists when the relay is deployed (module-level
+# `count = var.deploy_relay`), and its actions are gated on the static `!= ""`
+# ARN guard. Deliberately does NOT gate `count` on the (computed)
+# alarm_sns_topic_arn: gating count on a computed value is the greenfield
+# "Invalid count argument" trap (#2665). The relay module sidesteps that for all
+# its alarms by action-gating instead of count-gating.
+resource "aws_cloudwatch_metric_alarm" "relay_shedding" {
+  alarm_name          = "${var.name_prefix}-relay-shedding"
+  alarm_description   = "The relay shed >=1 request with a backpressure 503 (RelayShed) in the last 5 minutes — a cell's in-flight cap (256) was reached, meaning the target cell is stuck/slow or the relay is under flood. A healthy relay never sheds (sparse knock traffic sits far below the cap), so the first shed pages. Check the relay logs for the throttled 'relay: shed N request(s) to <cell>' Warning and the per-cell RelayShed breakdown, then the target cell's NHP server/AC health and the relay's request volume (WAF / ALB metrics)."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  metric_name         = "RelayShed"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+  }
+
+  alarm_actions = local.relay_alarm_actions
+  # No OK notification: returning to OK means no new sheds arrived in the
+  # lookback window, not that the overloaded cell recovered (same as
+  # relay_bootstrap_failure).
+  ok_actions = []
+
+  tags = merge(local.tags, {
+    Name  = "${var.name_prefix}-relay-shedding"
+    Issue = "2649"
   })
 }

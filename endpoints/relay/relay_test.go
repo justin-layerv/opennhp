@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/utils"
@@ -88,6 +89,7 @@ func testStop(rs *RelayServer) {
 	_ = rs.udpConn.Close()
 	rs.wg.Wait()
 	rs.device.Stop()
+	rs.metrics.Stop() // New() boots the publisher; reap its flush goroutine (nil-safe), mirroring Stop()
 }
 
 func newTestRelay(t *testing.T, serverPub []byte, serverPort int, mode SourceAddrMode) *RelayServer {
@@ -390,6 +392,55 @@ func TestRelay_InFlightCap_Sheds(t *testing.T) {
 	rs.pendingMu.Unlock()
 	if pendingAfter != pendingBefore {
 		t.Errorf("pending grew from %d to %d on a shed request; the cap must shed BEFORE registering a waiter", pendingBefore, pendingAfter)
+	}
+}
+
+// TestRelay_Shed_IncrementsMetric fences the #2649 shed counter: a backpressure
+// 503 must bump the RelayShed metric — the graphable/alertable signal the relay
+// alarm (terraform/modules/relay/monitoring.tf) keys on. Asserts BOTH published
+// series: the base counter (clean [Environment] dims, what the alarm matches) and
+// the per-cell breakdown carrying the target Cell. Replaces rs.metrics with an
+// in-memory test publisher so the increment is inspectable via CountersForTest
+// without a real CloudWatch client.
+func TestRelay_Shed_IncrementsMetric(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	innerKnock := makeInnerKnock(t, serverPub, 4242)
+	// Dead port so the handler would PARK absent shedding — makes "did it shed?"
+	// unambiguous (same setup as TestRelay_InFlightCap_Sheds).
+	rs := newTestRelay(t, serverPub, 62299, SourceAddrModeRemoteAddr)
+
+	// Swap in an inspectable in-memory publisher (no CloudWatch client / flush
+	// goroutine). newTestRelay's New() already booted a real publisher; Stop it
+	// first so we don't leak its flush goroutine, then install the test one.
+	rs.metrics.Stop()
+	rs.metrics = metrics.NewPublisherForTest(t)
+
+	serverID := utils.PubKeyFingerprint(serverPub)
+	srv := rs.servers[serverID]
+
+	// Saturate the cell's in-flight semaphore so the next POST is shed.
+	for i := 0; i < maxInFlightPerServer; i++ {
+		srv.inFlight <- struct{}{}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerKnock))
+	req.RemoteAddr = "203.0.113.7:44444"
+	w := httptest.NewRecorder()
+	rs.handleRelay(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (precondition: the request must be shed)", w.Code)
+	}
+
+	counters, dimCounters := rs.metrics.CountersForTest(t)
+	if got := counters[MetricRelayShed]; got != 1 {
+		t.Errorf("base %s counter = %v, want 1 (one shed → one increment)", MetricRelayShed, got)
+	}
+	// The per-cell breakdown is keyed by "<metric>\x00Cell=<cell name>" (see
+	// buildDimCounterKey). srv.name is the routing table's cell name ("test-cell").
+	perCellKey := MetricRelayShed + "\x00Cell=" + srv.name
+	if got := dimCounters[perCellKey]; got != 1 {
+		t.Errorf("per-cell %s counter (key %q) = %v, want 1; got dimCounters=%v", MetricRelayShed, perCellKey, got, dimCounters)
 	}
 }
 

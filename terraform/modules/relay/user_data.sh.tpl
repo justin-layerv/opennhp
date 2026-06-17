@@ -121,6 +121,14 @@ unset PRIVATE_KEY
 #   mounted relay.toml is chowned to this uid above so the container can read it.
 # --log-driver awslogs: stdout/stderr → CloudWatch (the instance role grants
 #   CreateLogStream/PutLogEvents on the group).
+# -e AWS_REGION / NHP_ENVIRONMENT (#2649): the relay's CloudWatch metrics
+#   publisher (endpoints/metrics, mirroring nhp-server) needs AWS_REGION to
+#   resolve the CloudWatch endpoint for PutMetricData — the instance role already
+#   grants cloudwatch:PutMetricData scoped to the LayerV/NHP namespace (this
+#   file's BootstrapFailure emit + compute.tf) — and NHP_ENVIRONMENT for the
+#   metric's Environment dimension (the cell is attached per-shed; the relay
+#   fronts all cells, so there is no single NHP_CELL_ID here). Both are
+#   single-line scalars rendered by templatefile.
 cat > /etc/systemd/system/nhp-relayd.service << SVCEOF
 [Unit]
 Description=NHP-Relay daemon (#2208)
@@ -136,6 +144,8 @@ ExecStartPre=-/usr/bin/docker rm -f nhp-relay
 ExecStart=/usr/bin/docker run --rm --name nhp-relay \\
   --network host \\
   --user $RELAY_UID:$RELAY_GID \\
+  -e AWS_REGION=${region} \\
+  -e NHP_ENVIRONMENT=${environment} \\
   -v /opt/layerv/nhp-relay/etc/relay.toml:/nhp-relay/etc/relay.toml:ro \\
   --log-driver=awslogs \\
   --log-opt awslogs-region=${region} \\

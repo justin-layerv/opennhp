@@ -34,17 +34,41 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
+
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/utils"
 )
+
+// MetricRelayShed counts backpressure sheds: each POST /relay/{serverId} the
+// relay rejects with 503 because the target cell's in-flight cap is reached
+// (see maxInFlightPerServer). A shed is a real incident signal — a cell is
+// stuck/slow or the relay is under flood — so this is the graphable/alertable
+// counterpart to logShed's throttled Warning, alarmed in
+// terraform/modules/relay/monitoring.tf (#2649). Published into the shared
+// LayerV/NHP namespace via the same endpoints/metrics publisher nhp-server uses
+// (recordShed below), so the relay's first metric is consistent with the rest
+// of the fleet rather than a parallel convention.
+const MetricRelayShed = "RelayShed"
+
+// dimNameCell is the CloudWatch dimension naming the cell a shed was routed to.
+// Its value is the relay's configured cell_servers[].Name; a per-cell relay shed
+// series sits alongside that cell's server metrics ONLY insofar as that name
+// matches the server's NHP_CELL_ID (e.g. "cell0") — a config-consistency
+// assumption, not an enforced guarantee. Dashboard attribution only; the
+// relay_shedding alarm keys on the base [Environment] stream, unaffected.
+var dimNameCell = aws.String("Cell")
 
 const (
 	// relayResponseTimeout bounds how long an HTTP request waits for the
@@ -140,6 +164,13 @@ type serverRuntime struct {
 	// relay.go's existing lock-free idioms on the hot path. See logShed.
 	shedCount       atomic.Uint64
 	lastShedLogNano atomic.Int64
+
+	// shedDims is the per-cell CloudWatch breakdown dimension ([Cell=name]),
+	// built once at construction because it's constant per cell — recordShed
+	// reuses it rather than allocating a fresh slice + aws.String on every shed
+	// (the backpressure path runs hot under exactly the flood the cap targets).
+	// Safe to share: the publisher's AddCounterWithDims copies extraDims.
+	shedDims []types.Dimension
 }
 
 // logShed records one shed and emits a throttled Warning: at most one line per
@@ -170,6 +201,49 @@ func (srv *serverRuntime) logShed() {
 		n, srv.name, shedLogWindow, maxInFlightPerServer)
 }
 
+// buildRelayMetricDimensions returns the relay publisher's base CloudWatch
+// dimensions, read from the same NHP_ENVIRONMENT env var nhp-server reads
+// (endpoints/server/udpserver.go::buildServerMetricDimensions). The relay base
+// set is [Environment] ONLY — deliberately NOT the server's [Environment, Cell],
+// because a relay fleet fronts ALL cells (it routes per-cell by serverId), so
+// there is no single Cell value for the process. The target Cell is attached
+// per-shed as an extra dimension instead (see recordShed), which both keeps the
+// base counter the alarm matches on at a clean [Environment] dim set and gives
+// dashboards a per-cell breakdown — the dual-publish pattern terraform/CLAUDE.md
+// prescribes for Go-side alarms.
+//
+// NB: NHP_ENVIRONMENT is load-bearing — the relay_shedding alarm matches on this
+// Environment value (sourced from the same var.environment via user_data). If a
+// future boot path drops it, the metric lands at Environment="unknown", the alarm
+// stops matching, and treat_missing_data="notBreaching" keeps it green — a shed
+// storm would go invisible. Keep the user_data -e NHP_ENVIRONMENT wiring intact.
+func buildRelayMetricDimensions() []types.Dimension {
+	environment := os.Getenv("NHP_ENVIRONMENT")
+	if environment == "" {
+		environment = "unknown"
+	}
+	return []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String(environment)},
+	}
+}
+
+// recordShed increments the RelayShed counter on each backpressure 503 (#2649).
+// It DUAL-PUBLISHES, exactly as terraform/CLAUDE.md prescribes for Go-side
+// alarms: a base counter at the publisher's [Environment] dims (the clean stream
+// the relay_shedding alarm matches on) PLUS a per-cell breakdown carrying the
+// target Cell (for dashboards / attribution). nil-safe via the publisher's nil
+// receiver, so it is unconditional on the shed hot path.
+//
+// Counted per shed (every 503), independently of logShed's throttled Warning:
+// the log is rate-limited to once per window to avoid flooding CloudWatch Logs,
+// but the metric is a cheap in-memory atomic add batched by the publisher's
+// flush loop, so it carries the exact shed rate the alarm needs.
+func (rs *RelayServer) recordShed(srv *serverRuntime) {
+	rs.metrics.IncrCounter(MetricRelayShed)
+	// srv.shedDims is prebuilt (constant per cell) — see the field comment.
+	rs.metrics.IncrCounterWithDims(MetricRelayShed, srv.shedDims)
+}
+
 // RelayServer is the NHP-Relay HTTP front backed by an NHP_RELAY device.
 type RelayServer struct {
 	config     *Config
@@ -178,6 +252,13 @@ type RelayServer struct {
 	udpConn    *net.UDPConn              // shared send+recv socket
 	servers    map[string]*serverRuntime // by pubkey fingerprint
 	cors       corsAllowlist             // browser CORS allowlist (#2631)
+
+	// metrics publishes the relay's CloudWatch metrics into the shared
+	// LayerV/NHP namespace (the relay's first metrics emission, #2649). Booted in
+	// New via the same endpoints/metrics publisher nhp-server uses; nil when AWS
+	// config is unavailable (local/dev) — the publisher's methods are nil-safe
+	// no-ops, so recordShed never needs a guard. See recordShed.
+	metrics *metrics.Publisher
 
 	responseTimeout time.Duration // how long a handler waits for the server ACK
 
@@ -255,6 +336,7 @@ func New(cfg *Config) (*RelayServer, error) {
 			pubKey:   pub,
 			addr:     udpAddr,
 			inFlight: make(chan struct{}, maxInFlightPerServer),
+			shedDims: []types.Dimension{{Name: dimNameCell, Value: aws.String(sc.Name)}},
 		}
 		log.Info("relay: routing %s (fingerprint=%s) -> %s", sc.Name, id, udpAddr)
 	}
@@ -278,6 +360,20 @@ func New(cfg *Config) (*RelayServer, error) {
 		responseTimeout: relayResponseTimeout,
 		stopCh:          make(chan struct{}),
 	}
+
+	// Boot the CloudWatch metrics publisher (#2649) — the relay's first metrics
+	// emission. Same endpoints/metrics.Publisher + LayerV/NHP namespace nhp-server
+	// uses (endpoints/server/udpserver.go), so the relay's metric is consistent
+	// with the rest of the fleet and Terraform can alarm on it the same way.
+	// NewPublisher returns nil if AWS config can't load (local/dev with no
+	// region/creds); every publisher method is then a nil-safe no-op, so the relay
+	// runs fine without metrics off-cloud. Checkpointing is intentionally NOT
+	// enabled: the shed counter is a best-effort observability signal, and the
+	// relay is a stateless forwarder with no checkpoint dir in its container.
+	rs.metrics = metrics.NewPublisher(metrics.Config{
+		Namespace:  "LayerV/NHP",
+		Dimensions: buildRelayMetricDimensions(),
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/relay/", rs.handleRelay)
@@ -340,6 +436,10 @@ func (rs *RelayServer) Stop(ctx context.Context) error {
 		// Never started (or already stopped) — still release the socket New
 		// opened, so a New()-then-Stop() bring-up error path doesn't leak it.
 		rs.closeOnce.Do(func() { _ = rs.udpConn.Close() })
+		// New always boots the publisher, so flush it on the never-started path
+		// too (idempotent; nil-safe). Otherwise a New()-then-Stop() bring-up
+		// failure would leak the publisher's flush goroutine.
+		rs.metrics.Stop()
 		return nil
 	}
 	// Close stopCh FIRST so handlers parked in their select (on respCh / timeout
@@ -351,6 +451,8 @@ func (rs *RelayServer) Stop(ctx context.Context) error {
 	rs.closeOnce.Do(func() { _ = rs.udpConn.Close() }) // unblocks recvLoop's ReadFromUDP
 	rs.wg.Wait()
 	rs.device.Stop()
+	// Flush any sheds accumulated since the last 60s flush before exit (nil-safe).
+	rs.metrics.Stop()
 	return err
 }
 
@@ -410,6 +512,10 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		defer func() { <-srv.inFlight }()
 	default:
 		srv.logShed()
+		// Graphable/alertable counterpart to the throttled logShed Warning (#2649):
+		// counted on EVERY 503 so the alarm sees the true shed rate, not the
+		// once-per-window log cadence.
+		rs.recordShed(srv)
 		// 1s is intentional, not arbitrary headroom: knock cadence is sparse
 		// (~1-2/hr) and shedding is the rare pathological case, so a well-behaved
 		// client retrying after 1s is fine.
