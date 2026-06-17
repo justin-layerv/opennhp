@@ -1293,6 +1293,142 @@ resource "aws_lb_listener" "udp" {
 }
 
 # =============================================================================
+# Internal UDP NLB for the relay -> cell-server hop (#2208 #8 / #2628 steps 1-2;
+# closes #2626)
+# =============================================================================
+# The relay forwards NHP_RLY to the cell server over UDP 62206. Pointing it at
+# CloudMap (`server.<namespace>`) resolves ONCE at the relay's boot to a single
+# IP, which goes stale when the server fleet churns (#2626 — relay stale-IP on
+# churn). This internal NLB gives the relay a stable, load-balanced,
+# churn-resilient target whose DNS name never changes.
+#
+# This is a NON-BREAKING ADD that runs in parallel with the PUBLIC
+# `aws_lb.server` above — that one stays untouched (legacy UDP agents, the
+# resolver HTTPS listener, and external ACs still depend on it). Gated on
+# var.relay_enabled (= deploy_relay): created ONLY where the relay is deployed,
+# so there is no idle NLB in prod (deploy_relay=false → no relay to dial it; the
+# NLB is created when prod enables the relay). The matching host flip lives in the
+# root `module "relay"` call, which is likewise count-gated on deploy_relay.
+#
+# Mirrors the public UDP path's per-resource config (cross-zone, deletion
+# protection per env, UDP 62206, instance target type, /health/live HTTP health
+# check on 8888, deregistration_delay, tags) with these deliberate divergences:
+#   - internal = true + private subnets (this is the in-VPC relay->server hop,
+#     not an internet edge);
+#   - UDP-only: NO resolver HTTPS listener/TG (the relay speaks only UDP knock);
+#   - blue/green: a SINGLE internal TG fronts BOTH colors — the blue ASG via
+#     aws_autoscaling_attachment.server_internal below, the green ASG via its
+#     target_group_arns (blue_green.tf) — and the listener forwards statically to
+#     it. The public path instead keeps per-color TGs and FLIPS its listener's
+#     default_action in blue-green-deploy.yml's switch-traffic. Both-attach keeps
+#     the internal NLB pointed at the active color's fleet across a flip (a
+#     blue-only attach would route the relay to the stale warm-standby after a
+#     green-active deploy). Trade-off: a fraction of knocks reach the warm-standby
+#     (min=1, maybe old-image) color — benign, the NHP protocol is version-stable
+#     and the relay forwards opaque packets. Active-color-only routing (full
+#     public-path parity: green internal TG + listener flip) is tracked for #6 in
+#     #2645.
+#
+# preserve_client_ip = true (mirrors the public TG's behaviour, see below): the
+# server sees the relay INSTANCE's IP as the packet source and replies DIRECTLY
+# to it, bypassing an NLB return hop. That is correct here — the relay's recvLoop
+# reads the ACK from any source address and dispatches by inner counter, and the
+# relay SG already admits this return (modules/relay/compute.tf
+# ::aws_vpc_security_group_ingress_rule.relay_udp_ack_return, UDP from the VPC
+# CIDR). The server-side inbound is already covered by
+# aws_vpc_security_group_ingress_rule.server_nhp_udp (UDP 62206 from 0.0.0.0/0).
+resource "aws_lb" "server_internal" {
+  count              = var.relay_enabled ? 1 : 0
+  name               = replace("${var.name_prefix}-srv-int", "_", "-")
+  internal           = true
+  load_balancer_type = "network"
+  # Private subnets: the in-VPC relay->server hop lives with the ASG, not on the
+  # public edge (see the divergences note in the block header above).
+  subnets = var.private_subnet_ids
+
+  # Cross-zone is correctness-relevant here, not just cost/parity: Go resolves
+  # the relay.toml host ONCE at boot, so the relay may lock onto a single NLB
+  # node IP (one AZ). With cross-zone disabled that node would only reach
+  # same-AZ targets; enabling it lets the once-resolved relay reach the whole
+  # fleet across AZs.
+  enable_cross_zone_load_balancing = true
+  enable_deletion_protection       = local.is_prod
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-srv-int-nlb"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+# Internal UDP Target Group (mirrors aws_lb_target_group.udp).
+resource "aws_lb_target_group" "udp_internal" {
+  count       = var.relay_enabled ? 1 : 0
+  name        = replace("${var.name_prefix}-srv-int-udp", "_", "-")
+  port        = 62206
+  protocol    = "UDP"
+  vpc_id      = var.vpc_id
+  target_type = "instance"
+  # Explicit (not relying on the AWS UDP-instance-TG default) because the
+  # relay->server return path depends on it — see the NLB block comment above.
+  preserve_client_ip = true
+
+  # HTTP health check on port 8888 — same /health/live liveness probe the public
+  # UDP TG uses (NOT the HTTPS TG's /health/knock-ready: this is the knock data
+  # path, which works before the local server has AC peers via HTTP forwarding).
+  health_check {
+    enabled             = true
+    protocol            = "HTTP"
+    port                = "8888"
+    path                = "/health/live"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    interval            = 30
+    matcher             = "200" # Expect HTTP 200 OK
+  }
+
+  deregistration_delay = 30
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-tg-srv-int-udp"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+# Attach the BLUE server ASG to the internal TG (multi-TG attach on this ASG is
+# already in use — aws_autoscaling_attachment.https alongside .server). The GREEN
+# ASG attaches to the SAME internal TG via its target_group_arns (blue_green.tf),
+# see the udp_internal block comment above for the both-attach blue/green rationale.
+resource "aws_autoscaling_attachment" "server_internal" {
+  count                  = var.relay_enabled ? 1 : 0
+  autoscaling_group_name = aws_autoscaling_group.server.name
+  lb_target_group_arn    = aws_lb_target_group.udp_internal[0].arn
+}
+
+# Internal UDP Listener. Forwards statically to the single internal TG (which
+# fronts both colors), so — unlike the public UDP listener — it is NOT flipped by
+# the blue/green switch and needs no ignore_changes. Active-color-only routing via
+# a per-color listener flip is the #2645 refinement.
+resource "aws_lb_listener" "udp_internal" {
+  count             = var.relay_enabled ? 1 : 0
+  load_balancer_arn = aws_lb.server_internal[0].arn
+  port              = 62206
+  protocol          = "UDP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.udp_internal[0].arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-listener-srv-int-udp"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+# =============================================================================
 # TLS/HTTPS Target Group and Listener (for QURL resolve endpoint)
 # =============================================================================
 # When enable_qurl_resolve_endpoint is true, these resources create an HTTPS

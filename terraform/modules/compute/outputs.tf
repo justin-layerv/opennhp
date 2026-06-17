@@ -18,6 +18,19 @@ output "nlb_zone_id" {
   value       = aws_lb.server.zone_id
 }
 
+# Internal NLB DNS name for the relay -> cell-server UDP hop (#2208 #8 / #2628;
+# closes #2626). The root module's `module "relay"` cell_servers[].host points
+# here so the relay forwards NHP_RLY to a stable, load-balanced, churn-resilient
+# target instead of a once-resolved CloudMap IP. Distinct from `nlb_dns_name`
+# (the public, internet-facing NLB used by legacy UDP agents, the resolver, and
+# external ACs). This is UDP-only; the in-VPC HTTP token-validation path
+# (qurl-service / qurl-reverse-tunnel-server) still uses CloudMap
+# `server.<namespace>:8888` and is unaffected.
+output "internal_nlb_dns_name" {
+  description = "Internal (private) NLB DNS name for the relay -> cell-server UDP knock hop. Points the relay at a stable, load-balanced target that survives server-fleet churn (#2626). Distinct from nlb_dns_name (the public NLB). null when relay_enabled=false (the NLB is gated on it); the consumer (root cell_servers[].host) is likewise gated on deploy_relay, so the null is never dialed."
+  value       = one(aws_lb.server_internal[*].dns_name)
+}
+
 output "asg_name" {
   description = "Auto Scaling Group name"
   value       = aws_autoscaling_group.server.name

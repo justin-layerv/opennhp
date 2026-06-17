@@ -375,10 +375,15 @@ resource "aws_autoscaling_group" "server_green" {
     "GroupTotalInstances",
   ]
 
-  # Attach to green target groups
+  # Attach to green target groups. Includes the internal UDP NLB's TG (#2208 #8)
+  # when relay_enabled, so the relay->server internal NLB reaches the GREEN fleet
+  # too (the blue ASG attaches to the same TG via aws_autoscaling_attachment.server_internal).
+  # See the aws_lb_target_group.udp_internal block in main.tf for the both-attach
+  # rationale + the active-color-only refinement (#2645).
   target_group_arns = compact(concat(
     [aws_lb_target_group.udp_green[0].arn],
-    var.enable_qurl_resolve_endpoint ? [aws_lb_target_group.https_green[0].arn] : []
+    var.enable_qurl_resolve_endpoint ? [aws_lb_target_group.https_green[0].arn] : [],
+    var.relay_enabled ? [aws_lb_target_group.udp_internal[0].arn] : []
   ))
 
   tag {

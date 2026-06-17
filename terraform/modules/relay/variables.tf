@@ -158,11 +158,11 @@ variable "scale_requests_per_target" {
 # One entry per CELL the relay fronts. The browser's POST /relay/{serverId}
 # selects the cell by the cell server's pubkey fingerprint. One relay fleet
 # fronts all cells; a cell's many server instances share the cell keypair, so a
-# single entry (the shared pubkey + the cell's in-VPC server endpoint) routes to
-# the whole cell — the cell's CloudMap/NLB distributes across its server fleet.
+# single entry (the shared pubkey + the cell's stable in-VPC server endpoint)
+# routes to the whole cell; the endpoint distributes across its server fleet.
 
 variable "cell_servers" {
-  description = "Cell-routing table rendered into relay.toml. One object per cell: name, public_key (the cell's shared NHP server X25519 pubkey, 44-char std base64 — its fingerprint is the {serverId} in POST /relay/{serverId}), host (in-VPC CloudMap DNS, e.g. server.nhp.sandbox.internal — survives the server going private, #8), port (NHP knock UDP, 62206). Pass a one-element list for the single current cell; append entries as cells are added."
+  description = "Cell-routing table rendered into relay.toml. One object per cell: name, public_key (the cell's shared NHP server X25519 pubkey, 44-char std base64 — its fingerprint is the {serverId} in POST /relay/{serverId}), host (stable in-VPC server endpoint; #2208 #8 uses the cell's internal UDP NLB DNS rather than raw CloudMap), port (NHP knock UDP, 62206). Pass a one-element list for the single current cell; append entries as cells are added."
   type = list(object({
     name       = string
     public_key = string

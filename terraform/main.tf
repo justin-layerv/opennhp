@@ -5049,15 +5049,22 @@ module "relay" {
   image_tag      = var.image_tag
 
   # Cell routing: one entry per cell. Today there is a single cell (the cell0
-  # compute module); the relay forwards to it via in-VPC CloudMap DNS (the host
-  # survives the server going private, #8 — VPC-internal, not the public NLB).
-  # The serverId in /relay/{id} is the cell pubkey's fingerprint. Append entries
-  # here as cells are added; one relay fleet fronts all cells.
+  # compute module). The serverId in /relay/{id} is the cell pubkey's
+  # fingerprint. Append entries here as cells are added; one relay fleet fronts
+  # all cells. How each host is resolved (the internal NLB, not CloudMap) is
+  # explained on the host line below.
   cell_servers = [{
     name       = "${var.environment}-${var.cell_id}"
     public_key = module.compute.server_public_key_b64
-    host       = "server.${module.data.namespace_name}"
-    port       = 62206
+    # Internal UDP NLB (modules/compute) instead of raw CloudMap DNS. Go resolves
+    # the relay.toml host ONCE at relay boot, so a CloudMap A-record returned a
+    # single server IP that went stale on fleet churn (#2626). The internal NLB
+    # is a stable, load-balanced, churn-resilient target and survives the server
+    # going private (#8 / #2628). This is the relay's UDP knock hop only — the
+    # in-VPC HTTP token-validation path (qurl-service / qurl-reverse-tunnel-server)
+    # still uses server.<namespace>:8888 and is untouched.
+    host = module.compute.internal_nlb_dns_name
+    port = 62206
   }]
 
   # KMS
