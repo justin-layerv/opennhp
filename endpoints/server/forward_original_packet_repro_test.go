@@ -11,9 +11,9 @@ import (
 )
 
 // TestForwardOriginalPacket_ReDecryptableAfterDecrypt is a tight reproducer for
-// the cross-server-forward bug surfaced while building the #2546 e2e
-// (TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay, which
-// is t.Skip'd on this bug).
+// the cross-server-forward bug (#2651) surfaced while building the #2546 e2e
+// (TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay), which
+// exercises the full composed relay path.
 //
 // The server-to-server forward path captures the inner knock to re-send to the
 // assigned server via exactly one production line:
@@ -26,34 +26,24 @@ import (
 // key via ServerForwarder.decryptForwardedKnock (forward.go:506).
 //
 // BasePacketContent()'s godoc promises "a copy of the original ENCRYPTED packet
-// content" (nhp/core/responder.go:908). But decryptBody (responder.go:712)
-// decrypts the body IN PLACE — its AEAD Open writes plaintext back into
-// ppd.basePacket.Content[header.Size():] (the "reuse ... Content space" line at
-// responder.go:727). By the time buildKnockAck calls BasePacketContent(), the
-// knock has already been decrypted, so the body region is plaintext, not the
-// original ciphertext. The captured bytes therefore fail AEAD authentication
-// when the assigned server tries to re-decrypt them — every cross-server
-// forward returns DECRYPT_FAILED and the knock is denied.
+// content". But decryptBody decrypts the body IN PLACE — its AEAD Open writes
+// plaintext back into ppd.basePacket.Content[header.Size():] (the "reuse ...
+// Content space" line). Before the #2651 fix, by the time buildKnockAck called
+// BasePacketContent() the knock had already been decrypted, so the body region
+// was plaintext, not the original ciphertext: the captured bytes failed AEAD
+// authentication on the assigned server — every cross-server forward returned
+// DECRYPT_FAILED and the knock was denied.
 //
-// This test reproduces the corruption with no networking and no forwarder: it
+// This test reproduces that path with no networking and no forwarder: it
 // decrypts a knock through the real core path exactly as a server does, then
 // asserts the contract BasePacketContent() promises and the forward path
 // depends on — that the returned bytes still equal the original ciphertext and
 // remain re-decryptable by a second server holding the same registration key.
 //
-// It FAILS today (documenting the bug) and will pass once the capture preserves
-// the pre-decrypt ciphertext (snapshot the raw packet before decryptBody, or
-// decrypt the body out-of-place). Fix is intentionally out of scope here — this
-// is a test-only change reporting a real bug; the orchestrator decides scope.
+// The #2651 fix snapshots the raw packet before decryptBody's in-place Open and
+// returns that pristine ciphertext from BasePacketContent(); this test is the
+// regression fence — if it fails again, the cross-server-forward capture broke.
 func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
-	// Skipped because it FAILS today: it documents a real, unfixed bug in the
-	// shared cross-server-forward capture (nhpauth.go:207 + responder.go:727).
-	// The fix is out of scope for this test-only change (#2546); remove this
-	// Skip in the PR that preserves the pre-decrypt ciphertext so this becomes
-	// the regression fence. Verified failing as of this commit (see the PR body
-	// / bug #2651 for the captured failure output).
-	t.Skip("documents unfixed cross-server-forward bug #2651: BasePacketContent() returns post-decrypt bytes; remove Skip in the #2651 fix that preserves the pre-decrypt ciphertext")
-
 	// Two servers sharing one registration keypair — the production
 	// multi-instance posture (docs/design/PER_INSTANCE_SERVER_KEYS.md §1): any
 	// server behind the NLB decrypts agent traffic with the shared key. serverA
@@ -129,8 +119,9 @@ func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
 	forwarded := ppd.BasePacketContent()
 
 	// Contract 1: BasePacketContent() must return the ORIGINAL encrypted bytes
-	// (per its godoc). Today it returns the in-place-decrypted buffer, so the
-	// body region differs.
+	// (per its godoc). If this regresses, decryptBody's in-place AEAD decrypt is
+	// leaking into the bytes buildKnockAck forwards as req.OriginalPacket again
+	// (the #2651 bug).
 	if !bytes.Equal(forwarded, originalCiphertext) {
 		firstDiff := -1
 		for i := 0; i < len(forwarded) && i < len(originalCiphertext); i++ {
@@ -139,7 +130,7 @@ func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
 				break
 			}
 		}
-		t.Errorf("BasePacketContent() != original ciphertext (first differing byte at index %d): decryptBody decrypted the body in place into basePacket.Content, so the bytes forwarded as req.OriginalPacket are no longer the original ciphertext. See nhpauth.go:207 + responder.go:727.",
+		t.Errorf("BasePacketContent() != original ciphertext (first differing byte at index %d): the bytes forwarded as req.OriginalPacket must be the pre-decrypt ciphertext, not decryptBody's in-place-decrypted buffer — #2651 regression.",
 			firstDiff)
 	}
 

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"slices"
 	"sync/atomic"
 	"time"
 
@@ -46,11 +45,21 @@ type PacketData struct {
 }
 
 type PacketParserData struct {
-	device       *Device
-	basePacket   *Packet
-	ConnData     *ConnectionData
-	CipherScheme int
-	Ciphers      *CipherSuite
+	device     *Device
+	basePacket *Packet
+	// originalContent is a pristine snapshot of basePacket.Content captured
+	// before decryptBody's in-place AEAD Open overwrites the body region with
+	// plaintext. BasePacketContent() returns it so cross-server knock
+	// forwarding re-sends the ORIGINAL ciphertext that the assigned server can
+	// re-decrypt with the shared registration key (issue #2651). It is a
+	// separate heap slice, so it stays valid after Destroy() releases
+	// basePacket to the pool (the knock path reads it post-Destroy, like
+	// remotePubKeyBuf), and it is ciphertext, not key material, so it is
+	// intentionally not zeroed on Destroy.
+	originalContent []byte
+	ConnData        *ConnectionData
+	CipherScheme    int
+	Ciphers         *CipherSuite
 
 	deviceEcdh Ecdh
 	header     Header
@@ -716,6 +725,15 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 		return nil
 	}
 
+	// Snapshot the original ciphertext before the in-place AEAD Open below
+	// overwrites the body region with plaintext (see the originalContent field
+	// for why the forward path needs it, #2651). decryptBody runs once per
+	// packet, so the snapshot is unconditional; it is one more clone of similar
+	// size alongside the ppd.BodyMessage clone below and does not undo the
+	// in-place "reuse Content space" optimization (no separate plaintext buffer
+	// is introduced).
+	ppd.originalContent = bytes.Clone(ppd.basePacket.Content)
+
 	// decrypt body and reuse ppd.BasePacket.Content space
 	body, err := ppd.bodyAead.Open(ppd.basePacket.Content[ppd.header.Size():ppd.header.Size()], ppd.header.NonceBytes(), ppd.basePacket.Content[ppd.header.Size():], ppd.chainHash.Sum(ppd.hashBuf[:0]))
 	if err != nil {
@@ -909,14 +927,19 @@ func (ppd *PacketParserData) IsAllowedAtOverload() bool {
 	}
 }
 
-// BasePacketContent returns a copy of the original encrypted packet content.
-// This is used for server-to-server knock forwarding where the receiving server
-// needs to decrypt the original packet using the shared registration keypair.
-// Returns nil if the base packet is not available.
+// BasePacketContent returns a clone of the original encrypted packet content
+// captured by decryptBody (originalContent) before its in-place AEAD Open
+// overwrote the body region with plaintext (#2651). It is used for
+// server-to-server knock forwarding, where the assigned server re-decrypts the
+// original packet with the shared registration keypair. The snapshot is a
+// separate heap slice, so it stays valid even after Destroy() releases
+// basePacket to the pool — the knock path reads this post-Destroy. The clone
+// keeps the "caller cannot modify our internal state" contract. Returns nil
+// when no body was decrypted (an empty-body packet, or decryptBody never ran);
+// every forwardable knock carries a body, so the snapshot is always present.
 func (ppd *PacketParserData) BasePacketContent() []byte {
-	if ppd == nil || ppd.basePacket == nil || len(ppd.basePacket.Content) == 0 {
+	if ppd.originalContent == nil {
 		return nil
 	}
-	// Return a copy to prevent modification of the original
-	return slices.Clone(ppd.basePacket.Content)
+	return bytes.Clone(ppd.originalContent)
 }

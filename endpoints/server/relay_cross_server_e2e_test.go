@@ -64,22 +64,19 @@ var relayClientAddr = &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444}
 // TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay drives
 // the full composed relay -> NHP_FWD -> ack-via-relay path with a remote AC.
 //
-// SKIPPED here: this composed e2e needs the #2651 cross-server-forward crypto
-// fix — preserve the pre-decrypt ciphertext so the assigned server can
-// re-decrypt the forwarded inner knock — which is NOT in this PR. It lands in
-// the #2651 fix, where this test is unskipped. The minimal, network-free proof
-// of that crypto bug is TestForwardOriginalPacket_ReDecryptableAfterDecrypt
-// (also unskipped in #2651). This PR fixes the test-harness bugs that ALSO
-// blocked the composed path — #2653 (NHP_FWD ppd lifecycle), #2654 (server B
-// deps never transmit NHP_FRT), #2655 (NHP_FWD handled on the recv loop ->
-// NHP_ART timeout + pool-release race), #2656 (mock-AC id != resource ACId) —
-// so once #2651 lands the unskip is a one-liner. See #2546 for the coverage
-// rationale (de-risks taking nhp-server private, #2208 #8 / #2628).
+// This is the end-to-end fence for the cross-server-forward crypto fix (#2651):
+// buildKnockAck must forward the ORIGINAL ciphertext so the assigned server can
+// re-decrypt the inner knock. The minimal, network-free proof of that crypto
+// bug is TestForwardOriginalPacket_ReDecryptableAfterDecrypt. The test-harness
+// bugs that also blocked this composed path — #2654 (server B deps never
+// transmit NHP_FRT), #2655 (NHP_FWD handled on the recv loop -> NHP_ART timeout
+// + pool-release race), #2656 (mock-AC id != resource ACId) — were fixed in
+// #2650 (#2653 was investigated and closed as not-a-bug). See #2546 for the
+// coverage rationale (de-risks taking nhp-server private, #2208 #8 / #2628).
 func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping cross-server relay e2e test in short mode")
 	}
-	t.Skip("needs the #2651 cross-server-forward crypto fix in main (not in this PR); the e2e harness bugs #2653-#2656 are fixed here. Unskipped in the #2651 fix PR.")
 
 	const (
 		aspID         = "agent" // the umbrella agent-knock aspId (served here by relayCrossServerPlugin)
