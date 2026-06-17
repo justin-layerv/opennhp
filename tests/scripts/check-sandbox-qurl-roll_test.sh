@@ -107,7 +107,11 @@ assert_in "$JOB" deploy-sandbox-qurl "skips cleanly when qurl not deployed (::no
 # ParameterNotFound is the skip signal, everything else fails loud (#1634
 # hidden-skip class). Fences the ssm_probe not-found-vs-other-error distinction.
 assert_in "$JOB" deploy-sandbox-qurl "is-deployed probe distinguishes ParameterNotFound" \
-  'ParameterNotFound'
+  '(ParameterNotFound)'
+assert_in "$JOB" deploy-sandbox-qurl "is-deployed probe uses an explicit not-found sentinel" \
+  'SSM_PARAM_NOT_FOUND'
+assert_in "$JOB" deploy-sandbox-qurl "empty qurl SSM params fail loud" \
+  'returned empty/None'
 
 # Ordering guard (#1634): deploy-sandbox-validate — and nhp-smoke-sandbox, which
 # needs it (tier: all exercises the qurl resolve path that 403'd in the

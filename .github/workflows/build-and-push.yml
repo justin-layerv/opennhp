@@ -953,9 +953,12 @@ jobs:
           - image: ac
             dockerfile: docker/Dockerfile.ac.aws
             repo: layerv/nhp-ac
-          # The NHP-Relay (#2208). Build + scan + push only — nothing deploys it
-          # yet (no relay ASG; the SSM image-tag + instance refresh land with the
-          # relay compute module in a follow-up). Mirrors the server/ac legs.
+          # The NHP-Relay (#2208). Build + scan + push, mirroring the server/ac
+          # legs. The CD deploy leg (#2624) is the `deploy-sandbox-relay` job
+          # below: it puts this freshly-built tag into /sandbox/nhp/relay/image-tag
+          # and triggers an instance refresh on the relay ASG. That job is a clean
+          # no-op while the relay is dark (deploy_relay=false → the relay module's
+          # SSM params don't exist → ParameterNotFound → skip).
           - image: relay
             dockerfile: docker/Dockerfile.relay
             repo: layerv/nhp-relay
@@ -1610,7 +1613,13 @@ jobs:
             echo "ImageMagick already available."
             exit 0
           fi
-          sudo apt-get update
+          sudo apt-get update || {
+            echo "::warning::apt-get update failed; disabling hosted-runner Microsoft apt sources and retrying."
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+              \( -name 'azure-cli*' -o -name 'microsoft-prod*' -o -name 'packages-microsoft-prod*' \) \
+              -print -delete
+            sudo apt-get update
+          }
           sudo apt-get install -y imagemagick
 
       - name: Shellcheck qURL link social card lint
@@ -2161,16 +2170,18 @@ jobs:
               return 0
             done
           }
+          SSM_PARAM_NOT_FOUND="__NHP_QURL_SSM_PARAMETER_NOT_FOUND__"
 
           # Probe an SSM param that MAY be legitimately absent (qurl not
-          # deployed). Prints the value (rc 0) on success; prints nothing
-          # (rc 0) ONLY on a genuine ParameterNotFound — the "not deployed"
-          # skip signal. ANY OTHER error retries the transient case and then
-          # fails loud (rc 1, last stderr shown), so a sustained SSM outage
-          # during deploy goes red instead of masquerading as "not deployed"
-          # (the #1634 hidden-skip class — a roll that should happen must never
-          # be silently skipped). Stderr -> tempfile (not 2>&1) so a CLI warning
-          # on a successful read can't contaminate the returned value.
+          # deployed). Prints the value (rc 0) on success; prints
+          # SSM_PARAM_NOT_FOUND (rc 0) ONLY on a genuine `(ParameterNotFound)`
+          # AWS error-code token — the "not deployed" skip signal. ANY OTHER
+          # error retries the transient case and then fails loud (rc 1, last
+          # stderr shown), so a sustained SSM outage during deploy goes red
+          # instead of masquerading as "not deployed" (the #1634 hidden-skip
+          # class — a roll that should happen must never be silently skipped).
+          # Stderr -> tempfile (not 2>&1) so a CLI warning on a successful read
+          # can't contaminate the returned value.
           ssm_probe() {
             local attempt err out
             err=$(mktemp)
@@ -2181,8 +2192,8 @@ jobs:
                   --region "$AWS_REGION" 2>"$err"); then
                 rm -f "$err"; printf '%s' "$out"; return 0
               fi
-              if grep -q 'ParameterNotFound' "$err"; then
-                rm -f "$err"; return 0  # deterministic absence -> skip signal
+              if grep -q '(ParameterNotFound)' "$err"; then
+                rm -f "$err"; printf '%s' "$SSM_PARAM_NOT_FOUND"; return 0
               fi
               if [[ "$attempt" -lt 3 ]]; then sleep "$((attempt * 3))"; fi
             done
@@ -2191,17 +2202,28 @@ jobs:
 
           # Is qurl deployed in this env? The cluster/service SSM params are
           # created by modules/qurl-service only when deploy_qurl_service=true.
-          # ssm_probe returns empty ONLY on a genuine ParameterNotFound (=> not
-          # deployed => skip); a sustained SSM error fails the job loud instead
-          # of being mistaken for "not deployed". #1634 is about a roll failure
-          # being hidden, so never degrade an error into a silent skip.
+          # ssm_probe returns SSM_PARAM_NOT_FOUND ONLY on a genuine
+          # ParameterNotFound (=> not deployed => skip); a sustained SSM error
+          # fails the job loud instead of being mistaken for "not deployed".
+          # #1634 is about a roll failure being hidden, so never degrade an
+          # error into a silent skip.
           ECS_SERVICE=$(ssm_probe qurl-ecs-service)
           ECS_CLUSTER=$(ssm_probe qurl-ecs-cluster)
-          if [[ -z "$ECS_SERVICE" || "$ECS_SERVICE" == "None" \
-             || -z "$ECS_CLUSTER" || "$ECS_CLUSTER" == "None" ]]; then
+          if [[ "$ECS_SERVICE" == "$SSM_PARAM_NOT_FOUND" && "$ECS_CLUSTER" == "$SSM_PARAM_NOT_FOUND" ]]; then
             echo "::notice::qurl-service cluster/service SSM params absent under /${SANDBOX_SSM_PREFIX}/ — qurl not deployed in sandbox; skipping roll."
             echo "- QURL roll: **skipped** (qurl not deployed in sandbox)" >> "$GITHUB_STEP_SUMMARY"
             exit 0
+          fi
+          if [[ "$ECS_SERVICE" == "$SSM_PARAM_NOT_FOUND" || "$ECS_CLUSTER" == "$SSM_PARAM_NOT_FOUND" ]]; then
+            echo "::error::qurl-service SSM params are partially absent under /${SANDBOX_SSM_PREFIX}/; expected both cluster/service params or neither."
+            echo "- QURL roll: **failed** — qurl-service cluster/service SSM params are partially absent" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [[ -z "$ECS_SERVICE" || "$ECS_SERVICE" == "None" \
+             || -z "$ECS_CLUSTER" || "$ECS_CLUSTER" == "None" ]]; then
+            echo "::error::qurl-service cluster/service SSM params returned empty/None under /${SANDBOX_SSM_PREFIX}/."
+            echo "- QURL roll: **failed** — qurl-service cluster/service SSM params returned empty/None" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
           # Idempotency guard. TF env-var changes always bump the task-def
@@ -2274,6 +2296,90 @@ jobs:
           else
             echo "- QURL roll: **advanced** (requested SSM tag \`$REQUESTED_IMAGE_TAG\`; helper did not emit deployed outputs)" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  # =============================================================================
+  # DEPLOY SANDBOX - NHP-Relay CD deploy leg (#2624, part of #2208)
+  # =============================================================================
+  # The relay's CD deploy leg: on each main build, push the freshly-built image
+  # tag into the relay's SSM image-tag param and trigger an ASG instance refresh
+  # so the fleet rolls onto it. The relay user_data reads the image tag FROM SSM
+  # at boot (modules/relay/user_data.sh.tpl: `aws ssm get-parameter ... ->
+  # docker pull $ECR_REPO:$IMAGE_TAG`), so put-parameter + instance-refresh is
+  # the whole deploy — no task-def / blue-green machinery (the relay is a plain
+  # single ASG, one instance per AZ).
+  #
+  # Unlike server/ac (blue/green via blue-green-deploy.yml), the relay does a
+  # direct instance refresh — the same put-parameter + start-instance-refresh
+  # shape the server/ac legs used before they moved to blue/green, and what the
+  # relay module's compute.tf comments anticipate ("updated by the CI deploy
+  # leg"; "for the CI deploy leg's instance-refresh").
+  #
+  # NO-OP WHEN DARK (deploy_relay=false): `module "relay"` is count-gated on
+  # var.deploy_relay (terraform/main.tf), so when the relay is off the ASG and
+  # BOTH SSM params simply don't exist. A single get-parameter on the asg-name
+  # param therefore both (a) detects the dark case (ParameterNotFound -> skip
+  # cleanly) and (b) yields the refresh target when lit. This mirrors the FRPS
+  # ParameterNotFound handling and deploy-sandbox-qurl's ssm_probe: a genuine
+  # absence is a clean skip, but a sustained/permission SSM error fails loud
+  # (never degrade an error into a silent skip). Prod stays dark and is handled
+  # by promote-to-prod.yml regardless; this sandbox leg is a no-op until #6
+  # flips deploy_relay=true.
+  #
+  # IMAGE TAG: only written when app code changed this commit (the build matrix
+  # actually pushed layerv/nhp-relay:${github.sha} to ECR). On an infra-only
+  # commit github.sha was NOT pushed, so we must NOT write it — the SSM param
+  # keeps the currently-running tag and the refresh still propagates any
+  # launch-template / user_data / relay.toml change from terraform apply (the
+  # same "refresh on every build" rationale as blue-green, PR #820/#994).
+  #
+  # IAM: reuses AWS_ROLE_ARN (the github_actions role). It already grants
+  # ssm:GetParameter (Resource=*), ssm:PutParameter (Resource=*), and
+  # autoscaling:StartInstanceRefresh on autoScalingGroupName/layerv-nhp-* — the
+  # relay ASG is layerv-nhp-${env}-relay, inside that wildcard. No IAM change.
+  deploy-sandbox-relay:
+    name: Deploy Sandbox - Relay
+    # changes + setup: needed for the app-changed gate + the freshly-built tag.
+    needs: [changes, setup, deploy-sandbox-infra]
+    if: always() && needs.deploy-sandbox-infra.result == 'success'
+    runs-on: ubuntu-latest
+    environment: sandbox
+    # Instance refresh is dispatched async (we don't poll it to completion here,
+    # matching the relay's fire-and-forget rolling replacement); the steps are a
+    # couple of AWS calls. 15m is generous headroom for SSM/ASG API latency.
+    timeout-minutes: 15
+    # Direct AWS calls only (no sub-workflow dispatch), so unlike
+    # deploy-sandbox-blue-green this needs id-token + contents, NOT actions:write.
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: deploy-sandbox-relay
+      cancel-in-progress: false  # Never cancel an in-flight relay roll.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The probe + put-parameter + instance-refresh body lives in
+      # .github/scripts/deploy-relay.sh. It writes /sandbox/nhp/relay/image-tag,
+      # which matches the image-tag slot regex policed by
+      # scripts/check-image-tag-writer-allowlist.{py,sh}; keeping the write in
+      # that single-purpose, allowlisted helper (rather than allowlisting this
+      # whole build workflow) preserves the fence's ability to catch a future
+      # build-matrix re-introduction of an image-tag write — the original race
+      # the fence exists to prevent (run 26130904414). The helper also no-ops
+      # cleanly when the relay is dark (deploy_relay=false → asg-name param
+      # absent → ParameterNotFound → skip).
+      - name: Deploy relay (SSM image-tag + ASG instance refresh)
+        env:
+          APP_CHANGED: ${{ needs.changes.outputs.app }}
+          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
+        run: ./.github/scripts/deploy-relay.sh sandbox "$APP_CHANGED" "$IMAGE_TAG"
 
   # Dispatch blue/green deployment instead of doing direct instance refresh.
   # This ensures every CI deploy alternates between blue and green ASGs,
@@ -2451,6 +2557,12 @@ jobs:
     # is still loud: deploy-sandbox-qurl goes red and is in notify's
     # DEPLOY_FAILED loop. Only `cancelled` (indeterminate/half-rolled, run being
     # torn down) skips validation.
+    #
+    # deploy-sandbox-relay is deliberately NOT in needs here: the relay is dark,
+    # validate/smoke do not exercise it, and its ASG refresh is fire-and-forget
+    # until the #2646 readiness/completion gate lands. Ordering validation after
+    # relay would imply a readiness guarantee this job does not have; relay
+    # failures are still loud through notify's DEPLOY_FAILED loop.
     needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green, deploy-sandbox-qurl]
     if: |
       always() &&
@@ -2679,6 +2791,10 @@ jobs:
       # instead of being masked by a green build/blue-green — the same
       # surface-the-failure rationale as packer-build above.
       - deploy-sandbox-qurl
+      # Relay CD deploy leg (#2624). Same surface-the-failure rationale: a
+      # failed relay roll should not be masked by a green build/blue-green.
+      # Skips (success) cleanly while the relay is dark (deploy_relay=false).
+      - deploy-sandbox-relay
       - deploy-sandbox-validate
       - nhp-smoke-sandbox
     # Skip Slack when the waiter was cancelled (concurrency preempt or
@@ -2712,6 +2828,7 @@ jobs:
           SANDBOX_INFRA: ${{ needs.deploy-sandbox-infra.result }}
           SANDBOX_BLUE_GREEN: ${{ needs.deploy-sandbox-blue-green.result }}
           SANDBOX_QURL: ${{ needs.deploy-sandbox-qurl.result }}
+          SANDBOX_RELAY: ${{ needs.deploy-sandbox-relay.result }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-sandbox.result }}
           # true when a new app image was built this run (vs. a re-roll of the
@@ -2786,7 +2903,7 @@ jobs:
           # Build component status strings with visual pipeline
           SANDBOX_STATUS=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_QURL") QURL → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke"
+            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_QURL") QURL → $(status_emoji "$SANDBOX_RELAY") Relay → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke"
           fi
 
           # Determine overall status and header.
@@ -2809,7 +2926,7 @@ jobs:
           elif [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
-            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_QURL" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
+            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_QURL" "$SANDBOX_RELAY" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
               if [[ "$result" == "failure" ]]; then
                 DEPLOY_FAILED="true"
                 break

@@ -195,6 +195,14 @@ jobs:
       - name: Test + enforce image-tag writer allowlist
         run: bash tests/scripts/check-image-tag-writer-allowlist_test.sh
 
+      # Regression fence for the NHP-Relay CD deploy helper. Mocked-AWS cases
+      # cover dark skip, app-changed tag write, infra-only refresh, loud SSM
+      # failure, and an already-running instance refresh.
+      - name: Test relay deploy helper
+        run: |
+          shellcheck .github/scripts/deploy-relay.sh tests/scripts/deploy-relay_test.sh
+          bash tests/scripts/deploy-relay_test.sh
+
       # Fence the canonical active-color → slot resolver (shared by
       # build-and-push.yml, promote-to-prod.yml, blue-green-deploy.yml, and
       # trigger-prod-deploy.sh). green→green-image-tag / blue→image-tag, and

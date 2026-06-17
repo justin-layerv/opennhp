@@ -109,7 +109,7 @@ variable "server_ami_id" {
 }
 
 variable "image_tag" {
-  description = "Initial relay Docker image tag seeded into the SSM image-tag parameter. CI updates the SSM value on deploy (the param has `ignore_changes=[value]`), so this is only the bootstrap value. Use the deploying commit SHA — the relay build leg (build-and-push.yml) tags `layerv/nhp-relay` by the same SHA as the server/ac images."
+  description = "Initial relay Docker image tag seeded into the SSM image-tag parameter. CI updates the SSM value on deploy (the param has `ignore_changes=[value]`), so this is only the bootstrap value. Use a pullable deploying commit SHA — the relay build leg (build-and-push.yml) tags `layerv/nhp-relay` by the same SHA as the server/ac images. Do not apply the relay module with a placeholder/non-existent seed tag: infra-only refreshes intentionally keep the current SSM tag and roll the fleet on it."
   type        = string
 }
 

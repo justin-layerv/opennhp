@@ -4,7 +4,7 @@
 # Fail if anything outside the deployer family writes
 #   /<env>/nhp/<component>/image-tag
 #   /<env>/nhp/<component>/green-image-tag
-# where <component> ∈ {server, ac, reverse-tunnel-server}.
+# where <component> ∈ {server, ac, reverse-tunnel-server, relay}.
 #
 # Background: until 2026-05-19 the build matrix in build-and-push.yml
 # also wrote /<env>/nhp/<component>/image-tag at the end of each
@@ -22,6 +22,18 @@
 #                              for prod canary (server/ac) and the
 #                              prod reverse-tunnel-server deploy-qrts
 #                              job; same single-slot contract)
+#   - deploy-relay.sh         (NHP-Relay CD deploy leg, #2624; called by
+#                              build-and-push.yml's deploy-sandbox-relay
+#                              job. The relay is a plain single ASG, not
+#                              blue/green, so it can't route through
+#                              blue-green-deploy.yml; it writes the relay's
+#                              own /<env>/nhp/relay/image-tag slot — no
+#                              other writer touches that param — in a
+#                              serialized job, then refreshes the relay ASG.
+#                              A dedicated single-purpose writer keeps this
+#                              file (not build-and-push.yml) on the
+#                              allowlist, so a build-matrix re-introduction
+#                              of an image-tag write is still caught.)
 #
 # Anything else that writes these slots can recreate the original
 # race or another flavour of it. This script keeps that contract

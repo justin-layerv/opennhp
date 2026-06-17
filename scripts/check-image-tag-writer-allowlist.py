@@ -52,6 +52,14 @@ ALLOWLIST = {
     ".github/workflows/blue-green-deploy.yml",
     ".github/workflows/canary-deploy.yml",
     ".github/scripts/update-ssm-image-tag.sh",
+    # NHP-Relay CD deploy leg (#2624). The relay is a plain single ASG
+    # (not blue/green), so it cannot route through blue-green-deploy.yml;
+    # this dedicated, single-purpose helper writes /<env>/nhp/relay/image-tag
+    # and triggers the relay ASG instance refresh. Keeping the write here
+    # (rather than allowlisting build-and-push.yml itself) preserves the
+    # fence's ability to catch a build-matrix re-introduction of the
+    # image-tag write — the original race this guard exists to prevent.
+    ".github/scripts/deploy-relay.sh",
     "scripts/check-image-tag-writer-allowlist.sh",
     "scripts/check-image-tag-writer-allowlist.py",
 }
