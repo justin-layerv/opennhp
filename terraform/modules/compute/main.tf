@@ -1428,6 +1428,50 @@ resource "aws_lb_listener" "udp_internal" {
   })
 }
 
+# Alarm: the internal cell-NLB target group has no healthy targets. Mirrors
+# green_tg_no_healthy_targets (blue_green.tf) for the relay->server hop — the
+# internal NLB is the relay's ONLY path to the cell servers, so a fully unhealthy
+# internal TG silently fails every relayed knock once the relay is live (#2645;
+# flagged in the #2641 review). treat_missing_data=breaching matches that
+# sibling: a TG reporting no HealthyHostCount is itself the failure to page on.
+#
+# Count gates on relay_enabled (the internal NLB only exists where the relay is
+# deployed) + the STATIC enable_sns_alerts — NOT green_tg's computed
+# alerts_sns_topic_arn != null. alerts_sns_topic_arn is module.monitoring's
+# (computed) ARN, so gating count on it risks "Invalid count argument" on a
+# greenfield relay_enabled=true apply before the ARN is in state; enable_sns_alerts
+# is the static boolean that exists to avoid exactly that (variables.tf), and is
+# what termination_cleanup_errors uses. alarm_actions still uses the ARN — valid
+# because enable_sns_alerts=true means it's provided.
+resource "aws_cloudwatch_metric_alarm" "internal_tg_no_healthy_targets" {
+  count = var.relay_enabled && var.enable_sns_alerts ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-srv-int-tg-no-healthy"
+  alarm_description   = "Internal cell-NLB target group has no healthy targets - the relay->server knock hop is down"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "HealthyHostCount"
+  namespace           = "AWS/NetworkELB"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    TargetGroup  = aws_lb_target_group.udp_internal[0].arn_suffix
+    LoadBalancer = aws_lb.server_internal[0].arn_suffix
+  }
+
+  alarm_actions = [var.alerts_sns_topic_arn]
+  ok_actions    = [var.alerts_sns_topic_arn]
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-srv-int-tg-health-alarm"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
 # =============================================================================
 # TLS/HTTPS Target Group and Listener (for QURL resolve endpoint)
 # =============================================================================
