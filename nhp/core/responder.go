@@ -18,13 +18,6 @@ import (
 	log "github.com/OpenNHP/opennhp/nhp/log"
 )
 
-type ResponderScheme interface {
-	CreatePacketParserData(d *Device, pd *PacketData) (ppd *PacketParserData, err error)
-	DerivePacketParserDataFromPrevAssemblerData(mad *MsgAssemblerData, pkt *Packet, initTime int64) (ppd *PacketParserData)
-	validatePeer(d *Device, ppd *PacketParserData) (err error)
-	decryptBody(d *Device, ppd *PacketParserData) (err error)
-}
-
 type CookieStore struct {
 	CurrCookie     [CookieSize]byte
 	PrevCookie     [CookieSize]byte
