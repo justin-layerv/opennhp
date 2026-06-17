@@ -11,7 +11,7 @@ acme==2.11.0
 josepy==1.14.0
 
 # Cryptography for key generation and certificate handling
-cryptography==46.0.7
+cryptography==48.0.1
 
 # DNS resolver for propagation verification
 dnspython==2.8.0
