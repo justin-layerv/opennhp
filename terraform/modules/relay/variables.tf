@@ -209,6 +209,14 @@ variable "cors_allowed_origins" {
   default     = ""
 }
 
+# ── Monitoring (#2630) ──
+
+variable "alarm_sns_topic_arn" {
+  description = "SNS topic ARN for relay CloudWatch alarm notifications (#2630). Pass `module.monitoring.sns_topic_arn` from the root (mirrors how modules/ac wires its alarm_actions). Empty (default) leaves the alarms action-less — they still evaluate and show in the console, but page nobody — so a misconfigured root doesn't fail apply."
+  type        = string
+  default     = ""
+}
+
 # ── KMS ──
 
 variable "ebs_kms_key_arn" {

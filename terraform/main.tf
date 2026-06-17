@@ -5098,6 +5098,11 @@ module "relay" {
   waf_rate_limit_per_source_ip = var.relay_waf_rate_limit_per_source_ip
   scale_requests_per_target    = var.relay_scale_requests_per_target
 
+  # Relay CloudWatch alarms route to the shared alert SNS topic (#2630), the same
+  # topic modules/ac uses for its alarm_actions. module.monitoring is
+  # unconditional, so passing it into the count-gated relay module is safe.
+  alarm_sns_topic_arn = module.monitoring.sns_topic_arn
+
   route53_record_change_iam_propagation_triggers = local.route53_record_change_iam_propagation_triggers
   route53_record_change_iam_propagation_duration = local.iam_propagation_duration
 }

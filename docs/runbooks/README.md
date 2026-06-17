@@ -23,6 +23,7 @@ runbook file is added, renamed, or removed.
 - [qurl-api error log spike](qurl-error-logs.md)
 - [qurl-service internal v1 triage](qurl-internal-v1-triage.md)
 - [qurl-api webhook events dropped](qurl-webhook-suppressed-lookup-failed.md)
+- [Relay CloudWatch alarms](relay-alarms.md)
 - [terraform-prod-drift detector findings](terraform-prod-drift.md)
 - [Terraform state bucket KMS migration (SSE-S3 → SSE-KMS)](tfstate-kms-migration.md)
 - [qurl-service schema-drift prevention verification](verify-qurl-schema-prevention.md)
