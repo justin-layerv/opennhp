@@ -60,6 +60,48 @@ const (
 	// — but the server's validateRelaySourceAddr requires a non-zero port, so we
 	// supply one.
 	placeholderSourcePort = 1
+
+	// maxInFlightPerServer bounds the concurrent POST /relay/{serverId} requests
+	// the relay will hold open for one cell server (#2553). Each in-flight request
+	// parks a goroutine and a `pending` map entry for up to relayResponseTimeout
+	// (5s); without a cap, a slow or unreachable cell under re-knock volume grows
+	// both UNBOUNDED — and a stuck cell is exactly when that bites (an
+	// unbounded-goroutine DoS). When this cap is reached the relay sheds the
+	// request (503) instead of queueing more work behind a backend that is already
+	// failing — fast-fail beats unbounded growth. (Upstream OpenNHP had a
+	// per-instance in-flight semaphore that was stripped when we dropped its
+	// `loadbalance` package; this restores that backpressure for our routing model.)
+	//
+	// The bound is PER cell server (a buffered channel on each serverRuntime), so a
+	// stuck cell sheds its own load without starving healthy cells. The total
+	// goroutine bound is maxInFlightPerServer × len(servers) (= one cell today).
+	//
+	// WHY 256: prod knock traffic is sparse (~1–2 knocks/hr) and each forward
+	// resolves in well under the 5s timeout, so legitimate concurrent in-flight is
+	// effectively ~0. 256 is orders of magnitude above any real peak — a healthy
+	// relay never sheds — yet it bounds the handlers that PARK on the forward wait
+	// (~5s) and the `pending` map at a few hundred entries even when a cell is fully
+	// stuck or under a flood. (net/http still spawns a goroutine per accepted
+	// connection; a shed returns immediately — what's capped is the long-lived
+	// parked growth, which is the actual DoS vector.) It is not an
+	// operator knob on purpose: the safe value is "comfortably above real peak, far
+	// below unbounded", which this is, and a config surface would just be one more
+	// thing to misconfigure (cf. relay.toml's deliberately small surface).
+	//
+	// The cap's effectiveness leans on the server timeouts that bound how long a
+	// slot is held: ReadTimeout (10s) caps a slow body read and responseTimeout
+	// (5s) caps the forward wait, so a slot is held ~15s worst case — a slow sender
+	// cannot pin the cap indefinitely. Keep those bounded if this cap is to hold.
+	maxInFlightPerServer = 256
+
+	// shedLogWindow throttles the per-shed Warning log. Shedding happens exactly
+	// under a flood or a stuck cell, so a log per shed request would itself flood
+	// CloudWatch (one Warning per inbound request). Instead the relay logs at most
+	// once per window PER cell, carrying the count of sheds since the last log, so a
+	// flood produces a steady trickle rather than a torrent. A graphable shed
+	// counter + alarm is the better long-term signal, but the relay has no metrics
+	// infrastructure yet — tracked in #2649.
+	shedLogWindow = 10 * time.Second
 )
 
 // pendingKey correlates a server ACK to a waiting HTTP handler. A per-request
@@ -82,6 +124,50 @@ type serverRuntime struct {
 	name   string
 	pubKey []byte
 	addr   *net.UDPAddr
+	// inFlight is a counting semaphore (buffered channel) bounding the concurrent
+	// in-flight POST /relay/ requests for THIS cell at maxInFlightPerServer. A
+	// non-blocking send acquires a slot; a full channel means the cap is reached
+	// and the request is shed (503). See maxInFlightPerServer for the rationale.
+	// MUST be non-nil: a nil channel is never ready in the acquire select, so the
+	// default (shed) branch would fire and the cell would shed 100% of traffic
+	// silently. Both construction sites (New + the test) initialize it.
+	inFlight chan struct{}
+
+	// shedCount and lastShedLogNano throttle the shed Warning to once per
+	// shedLogWindow per cell. Every shed bumps shedCount; the first shedder in a
+	// window wins a CAS on lastShedLogNano, swaps shedCount to 0, and logs the
+	// drained total (which includes its own shed). atomics — not a mutex — to match
+	// relay.go's existing lock-free idioms on the hot path. See logShed.
+	shedCount       atomic.Uint64
+	lastShedLogNano atomic.Int64
+}
+
+// logShed records one shed and emits a throttled Warning: at most one line per
+// shedLogWindow per cell, carrying the count of sheds drained since the last
+// emit. Concurrency-safe and lock-free (sheds are the flood/stuck-cell hot path):
+//   - Add(1) FIRST so this shed is counted no matter who logs it.
+//   - The first shedder past the window wins the CompareAndSwap on lastShedLogNano
+//     and is the sole emitter for the window; concurrent shedders either fail the
+//     window check or lose the CAS and stay silent (their shed still counted).
+//   - The winner Swaps shedCount to 0 and logs the drained total (which includes
+//     its own +1). lastShedLogNano's zero value makes the very first shed — and
+//     the first shed after any quiet period — log immediately.
+func (srv *serverRuntime) logShed() {
+	srv.shedCount.Add(1)
+	// Wall clock (not monotonic): a backward NTP step can briefly suppress an emit
+	// until the clock catches up, but shedCount is never lost (drained by the next
+	// Swap(0)), so only the log cadence can drift — the count stays accurate.
+	now := time.Now().UnixNano()
+	last := srv.lastShedLogNano.Load()
+	if now-last < int64(shedLogWindow) {
+		return // within the window; another shedder already logged (or will)
+	}
+	if !srv.lastShedLogNano.CompareAndSwap(last, now) {
+		return // lost the race to another shedder this window
+	}
+	n := srv.shedCount.Swap(0)
+	log.Warning("relay: shed %d request(s) to %s in the last %s — in-flight cap (%d) reached",
+		n, srv.name, shedLogWindow, maxInFlightPerServer)
 }
 
 // RelayServer is the NHP-Relay HTTP front backed by an NHP_RELAY device.
@@ -128,6 +214,25 @@ func New(cfg *Config) (*RelayServer, error) {
 		return nil, fmt.Errorf("relay: unknown source_addr_mode %q (want \"\" or %q)", cfg.SourceAddrMode, SourceAddrModeTrustedHeader)
 	}
 
+	// Boot-time guard against the documented source-IP-spoofing combo (#2553).
+	// SourceAddr is the SOLE trusted source of the AC-pinhole client IP; in
+	// trusted_header mode the relay reads it from a client-supplied header, which
+	// is only safe when a trusted front door OVERWRITES (or attests) that header
+	// and is the relay's ONLY ingress path. Refuse to even start on a config that
+	// provably defeats that precondition, so a deploy can't silently stand up a
+	// spoofing hole that opens AC pinholes for arbitrary victim IPs.
+	if err := assertTrustedHeaderBindCoherent(cfg); err != nil {
+		return nil, err
+	}
+	if cfg.SourceAddrMode == SourceAddrModeTrustedHeader {
+		// Surface the load-bearing security dependency at boot / for incident
+		// triage, not only in code comments: in trusted_header mode the source IP
+		// comes from a client-supplied header, safe ONLY because a trusted front
+		// door overwrites it and the relay_http_from_alb SG rule is the sole
+		// ingress — the residual the boot guard cannot verify in-process.
+		log.Info("relay: source_addr_mode=trusted_header — source IP read from a client header; the trusted front door + relay_http_from_alb SG rule (sole ingress) is the load-bearing control")
+	}
+
 	device := core.NewDevice(core.NHP_RELAY, prk, nil)
 	if device == nil {
 		return nil, errors.New("relay: failed to create NHP device")
@@ -144,7 +249,13 @@ func New(cfg *Config) (*RelayServer, error) {
 			return nil, fmt.Errorf("relay: server %q unresolvable %s:%d: %w", sc.Name, sc.Host, sc.Port, err)
 		}
 		id := utils.PubKeyFingerprint(pub)
-		servers[id] = &serverRuntime{id: id, name: sc.Name, pubKey: pub, addr: udpAddr}
+		servers[id] = &serverRuntime{
+			id:       id,
+			name:     sc.Name,
+			pubKey:   pub,
+			addr:     udpAddr,
+			inFlight: make(chan struct{}, maxInFlightPerServer),
+		}
 		log.Info("relay: routing %s (fingerprint=%s) -> %s", sc.Name, id, udpAddr)
 	}
 
@@ -284,6 +395,26 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	srv := rs.servers[serverID]
 	if srv == nil {
 		http.Error(w, "unknown server", http.StatusNotFound)
+		return
+	}
+
+	// Backpressure (#2553): try to claim an in-flight slot for this cell BEFORE
+	// doing any work (reading the body, registering a pending waiter, forwarding).
+	// A non-blocking send sheds the request with 503 the instant the cap is hit,
+	// rather than parking another goroutine + map entry behind a cell that is
+	// already slow/stuck. Releasing on the SAME path the slot was taken (defer)
+	// keeps the count exact across every return below. Retry-After tells a
+	// well-behaved client to back off instead of hot-looping the overloaded relay.
+	select {
+	case srv.inFlight <- struct{}{}:
+		defer func() { <-srv.inFlight }()
+	default:
+		srv.logShed()
+		// 1s is intentional, not arbitrary headroom: knock cadence is sparse
+		// (~1-2/hr) and shedding is the rare pathological case, so a well-behaved
+		// client retrying after 1s is fine.
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "relay busy", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -470,6 +601,100 @@ func (rs *RelayServer) innerCounter(raw []byte) (uint64, error) {
 		return 0, err
 	}
 	return pkt.Counter(), nil
+}
+
+// assertTrustedHeaderBindCoherent fails closed (#2553) on a relay config that
+// provably defeats the precondition for SourceAddrModeTrustedHeader being safe:
+// that the relay sits behind a trusted front door which overwrites/attests the
+// source-IP header and is the relay's ONLY ingress path. In RemoteAddr mode the
+// source IP is the spoof-proof TCP peer, so none of this applies — return nil.
+//
+// We reject two configs we can prove are dangerous at the process level:
+//
+//  1. trusted_header + enable_tls=true. We cannot tell a relay that terminates
+//     client TLS itself (the direct internet front — any client is the relay's
+//     TCP peer and sets the header freely, a spoofing hole) from a trusted front
+//     door that terminates client TLS, attests/overwrites the header, and
+//     re-encrypts to this backend over TLS (safe — both present enable_tls=true).
+//     The attestation is not observable at the process level (same limitation as
+//     the bind RESIDUAL below), so we FAIL CLOSED on the ambiguous combo.
+//     RemoteAddr is correct for a direct-terminating relay; the safe re-encrypt
+//     topology is unsupported by design until an explicit trusted-proxy opt-in
+//     exists (#2663).
+//
+//  2. trusted_header + a ListenAddr host that parses to a concrete routable
+//     PUBLIC IP. Binding a public address means clients can reach the relay
+//     directly (no front door in front of that interface), so a client-supplied
+//     header is attacker-controlled.
+//
+// What we deliberately ALLOW (these are coherent, and #2 below is the actual
+// production config — see terraform/modules/relay/user_data.sh.tpl):
+//   - loopback (127.0.0.0/8, ::1) or RFC1918/private host — a private/loopback
+//     interface is not directly internet-reachable.
+//   - an UNSPECIFIED / empty host ("", ":8080", "0.0.0.0:8080", "[::]:8080") —
+//     binding all interfaces is how the relay listens behind the ALB whose SG
+//     rule (relay_http_from_alb) is the real "sole path" control. The relay
+//     process cannot introspect that SG, so we cannot verify it here.
+//   - a non-IP hostname — we cannot classify it without resolving (and a resolve
+//     at boot is brittle), so we do not block on it.
+//
+// DEVIATION FROM THE LITERAL #2553 ACCEPTANCE: the issue says to require a
+// loopback/private bind for trusted_header. A literal loopback requirement is
+// IMPOSSIBLE in this deployment — the ALB target group is target_type="instance"
+// (terraform/modules/relay/alb.tf), so the ALB reaches the relay over the network
+// at the instance IP; a loopback-only bind would be unreachable by the ALB. The
+// real "sole path" guarantee is the ALB-only security-group rule, not a loopback
+// bind. So this guard enforces the issue's INTENT (fail closed on the provable
+// spoofing combos) while permitting the unspecified-bind-behind-an-ALB config the
+// deployment actually uses.
+//
+// RESIDUAL (not detectable here): trusted_header + enable_tls=false + a
+// 0.0.0.0 bind with NO security-group fence in front is still a spoofing hole,
+// but it is indistinguishable at the process level from the safe behind-an-ALB
+// config above. That last mile is enforced by terraform (the relay_http_from_alb
+// SG rule), not by this assertion.
+func assertTrustedHeaderBindCoherent(cfg *Config) error {
+	if cfg.SourceAddrMode != SourceAddrModeTrustedHeader {
+		return nil
+	}
+	if cfg.EnableTLS {
+		return fmt.Errorf("relay: source_addr_mode=%q with enable_tls=true is rejected (fail-closed): the relay cannot "+
+			"verify whether a trusted front door attests the source-IP header (the safe TLS-re-encrypt topology) or the relay "+
+			"is the direct internet front (any client sets the header — spoofable), so it refuses the ambiguous combo. Use "+
+			"source_addr_mode=\"\" (RemoteAddr), or run this leg as enable_tls=false behind a trusted proxy. End-to-end TLS "+
+			"re-encryption with trusted_header is unsupported by design (#2663)",
+			SourceAddrModeTrustedHeader)
+	}
+	// Classify the bind host. SplitHostPort fails for a bare host with no port;
+	// fall back to treating the whole string as the host so "127.0.0.1" (no port)
+	// is still classified rather than skipped.
+	host := cfg.ListenAddr
+	if h, _, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
+		host = h
+	}
+	if host == "" {
+		return nil // unspecified bind (":8080" / "") — the behind-an-ALB config
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil // a hostname (or already-rejected garbage) — not classifiable here
+	}
+	// The allowlist is deliberately CONSERVATIVE / fail-closed: only a provably
+	// unspecified, loopback, or RFC1918/ULA-private (Go's IsPrivate) bind is
+	// allowed. Anything else — including IPv4 link-local (169.254.0.0/16), CGNAT
+	// shared space (100.64.0.0/10), and IPv6 link-local (fe80::/10), none of which
+	// IsPrivate covers — is treated as "public" and therefore REJECTED under
+	// trusted_header. None are plausible relay binds; rejecting them just means a
+	// future operator who picks one gets a clear boot failure instead of a silent
+	// spoofing hole. Do NOT broaden this set to "fix" such a config — fail-closed
+	// is the intended posture.
+	if ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() {
+		return nil // 0.0.0.0 / ::, loopback, RFC1918 — not directly internet-reachable
+	}
+	return fmt.Errorf("relay: source_addr_mode=%q while listen_addr %q binds a routable public IP %s is a source-IP-spoofing hole: "+
+		"a directly-reachable relay lets any client spoof the source-IP header. "+
+		"Bind loopback/private (behind a trusted front door that overwrites the header) or use source_addr_mode=\"\" (RemoteAddr)",
+		SourceAddrModeTrustedHeader, cfg.ListenAddr, ip)
 }
 
 // deriveSourceAddr returns the client address the server should open the AC

@@ -30,6 +30,11 @@ private_key = ""
 #   "trusted_header" = read `trusted_header` below. ONLY safe behind a trusted
 #                     front door that overwrites the header AND to which the relay
 #                     is the sole path; otherwise any client can spoof the IP.
+# Boot guard (#2553): the relay REFUSES to start with source_addr_mode="trusted_header"
+# when it can prove the front-door precondition is defeated — i.e. enable_tls=true
+# (the relay is then the direct TLS front, so no proxy attests the header) or
+# listen_addr binds a routable PUBLIC IP. A loopback/private/unspecified bind
+# (e.g. ":8080" behind the ALB, whose SG is the real sole-path control) is allowed.
 source_addr_mode = ""
 trusted_header = "X-Real-IP"
 

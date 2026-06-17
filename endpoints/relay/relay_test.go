@@ -328,6 +328,216 @@ func TestRelay_UnknownServer_404(t *testing.T) {
 	}
 }
 
+// TestRelay_InFlightCap_Sheds fences the backpressure cap (#2553): when a cell's
+// in-flight slots are all taken, a new POST is SHED (503) rather than parking
+// another goroutine + pending entry. Deterministic — it pre-fills the semaphore
+// to the cap under no concurrency, so it asserts the shedding behavior directly
+// without racing real goroutines (and without waiting out a 5s timeout). It also
+// asserts the shed happens BEFORE any work: no pending entry is registered, a
+// Retry-After hint is set, and the CORS headers are present (#2631) so a browser
+// can read the 503.
+func TestRelay_InFlightCap_Sheds(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	innerKnock := makeInnerKnock(t, serverPub, 4242)
+	// Route to a dead port so that, absent shedding, the handler WOULD park on
+	// respCh — making "did it shed?" unambiguous (a non-shed path would block,
+	// not return 503 immediately).
+	rs := newTestRelay(t, serverPub, 62299, SourceAddrModeRemoteAddr)
+	rs.cors = newCORSAllowlist(testKnockOrigin)
+	serverID := utils.PubKeyFingerprint(serverPub)
+	srv := rs.servers[serverID]
+
+	// Saturate the cell's in-flight semaphore (simulating maxInFlightPerServer
+	// requests already in flight). cap(...) proves we fill exactly the cap.
+	if cap(srv.inFlight) != maxInFlightPerServer {
+		t.Fatalf("inFlight cap = %d, want %d", cap(srv.inFlight), maxInFlightPerServer)
+	}
+	for i := 0; i < maxInFlightPerServer; i++ {
+		srv.inFlight <- struct{}{}
+	}
+
+	rs.pendingMu.Lock()
+	pendingBefore := len(rs.pending)
+	rs.pendingMu.Unlock()
+	req := httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerKnock))
+	req.RemoteAddr = "203.0.113.7:44444"
+	req.Header.Set("Origin", testKnockOrigin)
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() { rs.handleRelay(w, req); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleRelay did not return — it parked instead of shedding at the in-flight cap")
+	}
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when the in-flight cap is reached", w.Code)
+	}
+	if got := w.Header().Get("Retry-After"); got == "" {
+		t.Error("shed response missing Retry-After hint")
+	}
+	// CORS headers must be set before the shed branch (#2631) so a browser can read
+	// the 503 — guards against a future reorder that sheds above the CORS block.
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != testKnockOrigin {
+		t.Errorf("Allow-Origin = %q on the 503 shed, want %q (CORS must precede the shed)", got, testKnockOrigin)
+	}
+	// The shed must happen before any pending registration — otherwise the map
+	// (and goroutine count) would still grow under a stuck cell, defeating the cap.
+	rs.pendingMu.Lock()
+	pendingAfter := len(rs.pending)
+	rs.pendingMu.Unlock()
+	if pendingAfter != pendingBefore {
+		t.Errorf("pending grew from %d to %d on a shed request; the cap must shed BEFORE registering a waiter", pendingBefore, pendingAfter)
+	}
+}
+
+// TestRelay_InFlightSlotReleased fences that a slot is returned after the handler
+// completes: a request that runs to its (timeout) completion must free its
+// in-flight slot so the cap is not permanently consumed by transient load.
+func TestRelay_InFlightSlotReleased(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	innerKnock := makeInnerKnock(t, serverPub, 4243)
+	rs := newTestRelay(t, serverPub, 62299, SourceAddrModeRemoteAddr) // dead port -> 504
+	rs.responseTimeout = 50 * time.Millisecond
+	serverID := utils.PubKeyFingerprint(serverPub)
+	srv := rs.servers[serverID]
+
+	req := httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerKnock))
+	req.RemoteAddr = "203.0.113.7:44444"
+	rs.handleRelay(httptest.NewRecorder(), req)
+
+	if got := len(srv.inFlight); got != 0 {
+		t.Errorf("in-flight slots held after handler returned = %d, want 0 (slot must be released on every exit path)", got)
+	}
+}
+
+// TestRelay_RejectedRequestConsumesNoSlot locks in the load-bearing ordering: the
+// in-flight slot is acquired only AFTER the serverID lookup, so a request that is
+// rejected earlier (wrong method, unknown server) consumes none. A future
+// reordering that moved acquisition before the lookup would let unroutable junk
+// burn the cap; this catches that.
+func TestRelay_RejectedRequestConsumesNoSlot(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
+	serverID := utils.PubKeyFingerprint(serverPub)
+	srv := rs.servers[serverID]
+
+	// Wrong method: the 405 method gate runs BEFORE the serverID lookup, so a GET
+	// never reaches slot acquisition. (The known serverID in the path just gives
+	// the assertion below a per-cell semaphore to inspect; the 405 is independent
+	// of the cell. The 404 unknown-server path resolves no serverRuntime at all.)
+	getReq := httptest.NewRequest(http.MethodGet, "/relay/"+serverID, nil)
+	rs.handleRelay(httptest.NewRecorder(), getReq)
+
+	// Unknown server: 404 before any acquisition; the known cell must be untouched.
+	unknownReq := httptest.NewRequest(http.MethodPost, "/relay/not-a-real-fingerprint", bytes.NewReader([]byte("x")))
+	unknownReq.RemoteAddr = "203.0.113.7:44444"
+	rs.handleRelay(httptest.NewRecorder(), unknownReq)
+
+	if got := len(srv.inFlight); got != 0 {
+		t.Errorf("known cell holds %d in-flight slots after rejected requests, want 0 (slot must be acquired only after the serverID lookup)", got)
+	}
+}
+
+// TestRelay_ShedLogThrottle fences the throttled shed log (#2553 cr): many sheds
+// in a window must drain into ONE log carrying the full count, and the first shed
+// after a quiet period must log immediately. Driven by Store-ing lastShedLogNano
+// directly (not by sleeping the 10s window) so it is deterministic and fast.
+func TestRelay_ShedLogThrottle(t *testing.T) {
+	srv := &serverRuntime{name: "cell", inFlight: make(chan struct{}, 1)}
+
+	// Fresh runtime: lastShedLogNano==0, so the first shed logs immediately and
+	// drains the count to 0 (it logged "1"). shedCount returns to 0 post-emit.
+	srv.logShed()
+	if got := srv.shedCount.Load(); got != 0 {
+		t.Errorf("after the first (immediately-logged) shed, shedCount = %d, want 0 (drained by the emit)", got)
+	}
+	if srv.lastShedLogNano.Load() == 0 {
+		t.Error("first shed did not stamp lastShedLogNano (it should have logged + stamped)")
+	}
+
+	// Force "inside the window": pin lastShedLogNano to now. Subsequent sheds must
+	// only accumulate the counter, never emit (so never drain it).
+	srv.lastShedLogNano.Store(time.Now().UnixNano())
+	const suppressed = 5
+	for i := 0; i < suppressed; i++ {
+		srv.logShed()
+	}
+	if got := srv.shedCount.Load(); got != suppressed {
+		t.Errorf("in-window sheds accumulated to %d, want %d (they must count but not emit/drain)", got, suppressed)
+	}
+
+	// Force "past the window": the next shed wins the CAS, emits, and drains the
+	// accumulated 5 + its own 1 = 6 in one log line.
+	srv.lastShedLogNano.Store(time.Now().Add(-2 * shedLogWindow).UnixNano())
+	srv.logShed()
+	if got := srv.shedCount.Load(); got != 0 {
+		t.Errorf("post-window shed did not drain the counter: shedCount = %d, want 0 (the emit should have swapped it, logging 6)", got)
+	}
+}
+
+// TestNew_TrustedHeaderBindCoherence fences the boot-time spoofing-combo guard
+// (#2553): New must REFUSE trusted_header configs that provably defeat its safety
+// precondition (a TLS-terminating relay, or a public bind), and must ACCEPT the
+// coherent ones — including the unspecified bind the production deployment uses
+// (terraform/modules/relay/user_data.sh.tpl renders listen_addr=":8080").
+func TestNew_TrustedHeaderBindCoherence(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	base := func() *Config {
+		return &Config{
+			PrivateKeyBase64: base64.StdEncoding.EncodeToString(keyBytes(0x80)),
+			UDPListenAddr:    "127.0.0.1:0",
+			Servers:          []ServerConfig{{Name: "c", PubKeyBase64: base64.StdEncoding.EncodeToString(serverPub), Host: "127.0.0.1", Port: 62206}},
+		}
+	}
+	tests := []struct {
+		name       string
+		mode       SourceAddrMode
+		listenAddr string
+		enableTLS  bool
+		wantErr    bool
+	}{
+		// Dangerous combos — must fail closed.
+		{"trusted_header + TLS terminate is rejected", SourceAddrModeTrustedHeader, ":8080", true, true},
+		{"trusted_header + public IPv4 bind is rejected", SourceAddrModeTrustedHeader, "203.0.113.7:8080", false, true},
+		{"trusted_header + public IPv6 bind is rejected", SourceAddrModeTrustedHeader, "[2001:db8::1]:8080", false, true},
+		// Conservative fail-closed: not IsPrivate/IsLoopback/IsUnspecified, so
+		// treated as public and rejected. Locks the posture against accidental
+		// broadening of the allowlist (see assertTrustedHeaderBindCoherent doc).
+		{"trusted_header + IPv4 link-local bind is rejected", SourceAddrModeTrustedHeader, "169.254.1.1:8080", false, true},
+		{"trusted_header + CGNAT bind is rejected", SourceAddrModeTrustedHeader, "100.64.0.1:8080", false, true},
+		{"trusted_header + IPv6 link-local bind is rejected", SourceAddrModeTrustedHeader, "[fe80::1]:8080", false, true},
+		// Coherent combos — must start.
+		{"trusted_header + unspecified host (prod :8080) is allowed", SourceAddrModeTrustedHeader, ":8080", false, false},
+		{"trusted_header + 0.0.0.0 bind is allowed", SourceAddrModeTrustedHeader, "0.0.0.0:8080", false, false},
+		{"trusted_header + loopback bind is allowed", SourceAddrModeTrustedHeader, "127.0.0.1:8080", false, false},
+		{"trusted_header + private bind is allowed", SourceAddrModeTrustedHeader, "10.0.0.5:8080", false, false},
+		{"trusted_header + hostname bind is allowed (not classifiable)", SourceAddrModeTrustedHeader, "relay.internal:8080", false, false},
+		// RemoteAddr mode is spoof-proof regardless of bind/TLS — never gated.
+		{"remoteaddr + public bind + TLS is allowed", SourceAddrModeRemoteAddr, "203.0.113.7:8080", true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			cfg.SourceAddrMode = tc.mode
+			cfg.ListenAddr = tc.listenAddr
+			cfg.EnableTLS = tc.enableTLS
+			rs, err := New(cfg)
+			if rs != nil {
+				_ = rs.udpConn.Close() // release the socket New bound on the accept path
+			}
+			if tc.wantErr && err == nil {
+				t.Fatalf("New accepted a dangerous trusted_header combo (%s); it must fail closed", tc.name)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("New rejected a coherent combo (%s): %v", tc.name, err)
+			}
+		})
+	}
+}
+
 func TestNew_UnknownSourceMode_Rejected(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
 	cfg := &Config{
