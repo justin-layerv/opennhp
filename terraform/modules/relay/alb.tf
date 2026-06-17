@@ -163,15 +163,20 @@ resource "aws_lb_listener" "https" {
   tags = merge(local.tags, { Name = "${local.alb_name}-https" })
 }
 
-# The ONLY forwarding rule: POST /relay/* → relay TG. Everything else hits the
-# listener's fixed-response 404 and never reaches the fleet. Keep `/relay/*` in
-# lockstep with the WAF rate-limit scope-down (STARTS_WITH /relay/) below — both
-# must describe the same forwarded set.
-# CORS NOTE: POST-only means a cross-origin browser OPTIONS preflight 404s here
-# (the qURL page and the relay are different origins). Dark-safe today; it
-# surfaces at #6 (real browser traffic) and is tracked in #2631 — that fix adds an
-# OPTIONS allowance here PAIRED WITH CORS headers in the relay daemon (don't add
-# OPTIONS forwarding alone; the daemon would 405 it without the headers).
+# The ONLY forwarding rule: POST and OPTIONS on /relay/* → relay TG. Everything
+# else hits the listener's fixed-response 404 and never reaches the fleet. Keep
+# `/relay/*` in lockstep with the WAF rate-limit scope-down (STARTS_WITH /relay/)
+# below — both must describe the same forwarded set.
+# CORS (#2631): the qURL knock portal (qurl.link) and the relay are different
+# origins, and the js-agent POSTs an application/octet-stream body, so the browser
+# fires an OPTIONS preflight first. OPTIONS is forwarded here PAIRED WITH the relay
+# daemon's CORS headers (handleRelay answers OPTIONS with 204 + the echoed allowed
+# origin). The two MUST land together — forwarding OPTIONS while the daemon lacks
+# CORS handling is no better than the 404. The allowlist is the knock portal only
+# (the resource domains *.qurl.site / custom whitelabel are the data plane —
+# direct connect through the AC, never the relay; see endpoints/relay/cors.go). The
+# WAF rate rule counts OPTIONS too; the daemon sets Access-Control-Max-Age so the
+# browser caches the preflight rather than re-sending it per knock.
 resource "aws_lb_listener_rule" "relay" {
   listener_arn = aws_lb_listener.https.arn
   priority     = 1
@@ -189,7 +194,8 @@ resource "aws_lb_listener_rule" "relay" {
 
   condition {
     http_request_method {
-      values = ["POST"]
+      # POST = the knock; OPTIONS = the CORS preflight the browser sends first.
+      values = ["POST", "OPTIONS"]
     }
   }
 

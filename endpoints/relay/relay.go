@@ -91,6 +91,7 @@ type RelayServer struct {
 	httpServer *http.Server
 	udpConn    *net.UDPConn              // shared send+recv socket
 	servers    map[string]*serverRuntime // by pubkey fingerprint
+	cors       corsAllowlist             // browser CORS allowlist (#2631)
 
 	responseTimeout time.Duration // how long a handler waits for the server ACK
 
@@ -161,6 +162,7 @@ func New(cfg *Config) (*RelayServer, error) {
 		device:          device,
 		udpConn:         udpConn,
 		servers:         servers,
+		cors:            newCORSAllowlist(cfg.CORSAllowedOrigins),
 		pending:         make(map[pendingKey]chan []byte),
 		responseTimeout: relayResponseTimeout,
 		stopCh:          make(chan struct{}),
@@ -254,8 +256,26 @@ func (rs *RelayServer) handleHealthLive(w http.ResponseWriter, r *http.Request) 
 	_, _ = w.Write([]byte("ok"))
 }
 
-// handleRelay handles POST /relay/{serverId}.
+// handleRelay handles POST and OPTIONS (CORS preflight) on /relay/{serverId}.
 func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
+	// CORS (#2631): the relay's only cross-origin caller is the qURL knock page
+	// (qurl.link, per env) — see cors.go. Echo it back for an allowlisted origin
+	// (never "*"); the resource domains (*.qurl.site / custom whitelabel) are the
+	// data plane and never call the relay. Set the headers first so every path
+	// (preflight, success, AND the http.Error failures below) carries them, letting
+	// the browser read failure statuses. Vary: Origin UNCONDITIONALLY — the response
+	// varies by Origin (a matched origin gets Access-Control-Allow-Origin, others
+	// don't), so a shared cache must not serve one origin's response to another.
+	w.Header().Set("Vary", "Origin")
+	if origin := r.Header.Get("Origin"); rs.cors.allowed(origin) {
+		rs.cors.setHeaders(w, origin)
+	}
+	// Answer the preflight BEFORE the serverId lookup — a preflight asks about
+	// method/headers, not resource existence, so an unknown serverId must not 404 it.
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return

@@ -41,9 +41,10 @@ locals {
     ssm_image_tag_parameter = aws_ssm_parameter.image_tag.name
     log_group               = aws_cloudwatch_log_group.relay.name
     # relay.toml render inputs
-    listen_port     = var.listen_port
-    udp_listen_port = var.udp_listen_port
-    cell_servers    = var.cell_servers
+    listen_port          = var.listen_port
+    udp_listen_port      = var.udp_listen_port
+    cell_servers         = var.cell_servers
+    cors_allowed_origins = var.cors_allowed_origins
   })
 }
 

@@ -189,10 +189,12 @@ func TestRelay_RoundTrip(t *testing.T) {
 	}()
 
 	rs := newTestRelay(t, serverPub, fakeServer.LocalAddr().(*net.UDPAddr).Port, SourceAddrModeRemoteAddr)
+	rs.cors = newCORSAllowlist(testKnockOrigin) // fence CORS on the production 200 path too
 
 	serverID := utils.PubKeyFingerprint(serverPub)
 	req := httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerKnock))
 	req.RemoteAddr = "203.0.113.7:44444"
+	req.Header.Set("Origin", testKnockOrigin)
 	w := httptest.NewRecorder()
 	rs.handleRelay(w, req)
 
@@ -201,6 +203,11 @@ func TestRelay_RoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(w.Body.Bytes(), realAck) {
 		t.Errorf("relayed NHP_ACK bytes mismatch (got %d bytes, want %d)", w.Body.Len(), len(realAck))
+	}
+	// The actual production flow: a successful 200 also carries the echoed CORS
+	// header so the browser can read the ACK.
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != testKnockOrigin {
+		t.Errorf("Allow-Origin = %q on the 200 ACK, want %q", got, testKnockOrigin)
 	}
 }
 

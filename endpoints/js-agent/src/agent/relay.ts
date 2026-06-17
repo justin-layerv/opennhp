@@ -56,6 +56,11 @@ export function relayPost(
     try {
       resp = await fetch(url, {
         method: "POST",
+        // Cross-origin: this triggers a CORS preflight (octet-stream is not a
+        // safelisted Content-Type). The relay's Access-Control-Allow-Headers
+        // (endpoints/relay/cors.go) must list every header sent here — adding a
+        // request header (auth, trace, idempotency-key, …) WITHOUT updating it
+        // makes the browser preflight fail with no server-side error. Keep in sync.
         headers: { "Content-Type": "application/octet-stream" },
         // Fresh ArrayBuffer-backed copy: BodyInit rejects Uint8Array<ArrayBufferLike>
         // (the backing buffer may be a SharedArrayBuffer). The packet is small.

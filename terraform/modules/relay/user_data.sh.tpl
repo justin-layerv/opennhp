@@ -99,6 +99,10 @@ private_key = "$PRIVATE_KEY"
 source_addr_mode = "trusted_header"
 trusted_header = "X-Forwarded-For"
 enable_tls = false
+# #2631: browser Origins allowed to call the relay cross-origin — the qURL knock
+# portal only (qurl.link). Exact-match, comma-separated. Empty disables CORS. The
+# relay echoes the matched origin, never "*".
+cors_allowed_origins = "${cors_allowed_origins}"
 %{ for s in cell_servers ~}
 
 [[servers]]

@@ -58,6 +58,17 @@ type Config struct {
 	// where the trusted value is leftmost — would silently adopt an
 	// attacker-supplied rightmost entry.
 	TrustedHeader string `toml:"trusted_header"`
+
+	// CORSAllowedOrigins is a comma-separated exact-match allowlist of browser
+	// Origins permitted to call the relay cross-origin. In practice this is the
+	// qURL knock portal only — `https://qurl.link` (per env) — since that is the
+	// sole page that POSTs a knock to the relay; the resource domains
+	// (`*.qurl.site`, custom whitelabel domains) are the data plane and connect
+	// directly through the AC, never via the relay. Exact match (the knock page is
+	// always qurl.link, so no wildcards). The matched origin is echoed back; the
+	// relay NEVER emits "*". Empty (default) disables CORS (no Access-Control-*
+	// headers → a browser cross-origin POST is blocked). See cors.go. (#2631)
+	CORSAllowedOrigins string `toml:"cors_allowed_origins"`
 }
 
 // ServerConfig is one cell server the relay can route to.

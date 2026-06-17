@@ -189,6 +189,12 @@ variable "udp_listen_port" {
   default     = 62207
 }
 
+variable "cors_allowed_origins" {
+  description = "#2631: comma-separated exact-match allowlist of browser Origins permitted to call the relay cross-origin. In practice the qURL knock portal only (`https://qurl.link`, per env) — the sole page that POSTs a knock to the relay. The resource domains (`*.qurl.site`, custom whitelabel) are the data plane and connect directly through the AC, never the relay, so they are NOT listed. The relay echoes the matched origin (never `*`). Empty (default) disables CORS (no Access-Control-* headers → a browser cross-origin POST is blocked), so the relay stays behaviorally dark until set. The ALB also forwards OPTIONS /relay/* (alb.tf) so the daemon can answer the preflight."
+  type        = string
+  default     = ""
+}
+
 # ── KMS ──
 
 variable "ebs_kms_key_arn" {

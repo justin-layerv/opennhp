@@ -5061,6 +5061,21 @@ module "relay" {
   logs_kms_key_arn    = module.kms.logs_key_arn
   secrets_kms_key_arn = module.kms.secrets_key_arn
 
+  # #2631 CORS: the relay's only cross-origin caller is the qURL KNOCK PORTAL
+  # (qurl.link/#at_xxx) — the page that POSTs the browser knock. Derived from the
+  # portal domain var (not hardcoded). The resource domains (*.qurl.site, custom
+  # whitelabel) are the data plane — direct connect through the AC, never the relay
+  # — so they are deliberately NOT here. The relay echoes the matched origin, never
+  # "*". Guard the null case (portal domain unset) → empty allowlist (CORS off,
+  # dark-safe) rather than a bogus "https://null" origin.
+  #
+  # The whole path is comma-separated / multi-origin capable (the tf var, the
+  # relay.toml field, and the daemon's newCORSAllowlist). This derivation collapses
+  # to the single prod knock portal; if a second legitimate KNOCK origin ever
+  # appears (e.g. a staging/console portal — NOT a resource domain), widen it here,
+  # e.g. join("," [...]) — the daemon already accepts a list.
+  cors_allowed_origins = var.qurl_link_frontend_domain != null ? "https://${var.qurl_link_frontend_domain}" : ""
+
   # DNS + cert (mirrors the bootstrap_alb provision-or-existing posture).
   dns_name                 = var.relay_dns_name
   route53_zone_id          = var.relay_route53_zone_id
