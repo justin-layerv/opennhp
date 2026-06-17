@@ -669,6 +669,12 @@ module "monitoring" {
 
   # DynamoDB monitoring
   dynamodb_table_names = module.dynamodb.all_table_names
+
+  # Gates the server-side relay-forward-reject alarm (#2643): the
+  # RelayForwardReject counter only increments when a relay sends NHP_RLY
+  # forwards, so the alarm is inert without a relay. Same flag that drives
+  # compute's relay_enabled and the root `module "relay"` count.
+  deploy_relay = var.deploy_relay
 }
 
 # Deploy-mode marker: lets out-of-band tooling (smoke tests, runbooks)

@@ -130,3 +130,17 @@ variable "alert_emails" {
   type        = list(string)
   default     = []
 }
+
+# Mirrors the root var.deploy_relay (= compute's relay_enabled). Static input
+# boolean, so it is safe to use directly in an alarm `count` (no
+# count-depends-on-computed problem — contrast compute's enable_sns_alerts,
+# which exists only because compute receives a COMPUTED SNS ARN across a module
+# boundary; this module owns aws_sns_topic.alerts in-module, so its ARN is
+# plan-time-known and no static SNS gate is needed). Gates the
+# relay-forward-reject alarm so it only exists where a relay is actually wired
+# (#2643, part of #2208).
+variable "deploy_relay" {
+  description = "Whether the NHP-Relay stack is deployed for this cell (mirrors the root var.deploy_relay / compute's relay_enabled). Gates the relay-forward-reject server-side alarm, which is inert without a relay sending NHP_RLY forwards."
+  type        = bool
+  default     = false
+}

@@ -970,6 +970,82 @@ resource "aws_cloudwatch_metric_alarm" "knock_forward_path" {
   })
 }
 
+# Relay-forward rejects: "relay enabled but forwards rejected" (#2643, part of
+# #2208). nhp-server emits RelayForwardReject (MetricRelayForwardReject,
+# endpoints/server/relay.go) on every NHP_RLY forward it drops PRE-AUTH — most
+# operationally, the empty-relayPeerMap rejection (relay.go lookupRelayPeer
+# gate) that a server booting WITHOUT relay.toml produces. The boot trap: with
+# deploy_relay=true a transient Secrets Manager / IAM-lag failure makes
+# user_data skip writing relay.toml, the server starts with a nil relayPeerMap,
+# and it rejects EVERY relayed knock while only logging a user-data WARNING — a
+# silent misconfiguration. A sustained nonzero rate while the relay is wired is
+# also an attack signal (a non-relay peer injecting NHP_RLY, or a spoofed
+# SourceAddr). Either way: page.
+#
+# DIM SET — {Environment, Cell}: emitted via Publisher.IncrCounter
+# (endpoints/metrics/publisher.go) with the publisher's base dims only (no extra
+# dims), i.e. EXACTLY buildServerMetricDimensions() in
+# endpoints/server/udpserver.go. Identical selector to knock_forward_path /
+# server_publisher_failures above. Keep this dimensions{} block in lockstep with
+# buildServerMetricDimensions() — a wrong/partial dim set sits in
+# INSUFFICIENT_DATA forever and never pages (terraform/CLAUDE.md "Metric / Alarm
+# Dim-Set Rules"); `terraform validate` cannot catch a dim mismatch.
+#
+# SHAPE — single-event detector matching knock_forward_path, NOT the relay
+# module's bootstrap-failure (eval=1) shape. BootstrapFailure is boot-driven
+# (emits reliably the instant an instance fails to boot), so one 5-min window
+# suffices. RelayForwardReject is TRAFFIC-gated and sparse — same profile as
+# KnockForwardFailure (prod knock traffic ~1-2/hr, repo memory). At that rate a
+# single 5-min window would flap between sparse rejects and sit OK in most
+# windows even during an active misconfiguration, so we use the
+# knock_forward_path lookback: datapoints_to_alarm=1 over evaluation_periods=12
+# @ period=300 (a 1-hour trailing window) — page on the FIRST breaching 5-min
+# bucket in the trailing hour. threshold=0 + GreaterThanThreshold reads "fire on
+# Sum > 0" (>= 1 reject). Both are datapoints_to_alarm=1 single-event detectors;
+# they differ only in lookback, which follows the traffic profile. Raise
+# datapoints_to_alarm / threshold once a relay carries real traffic (#6) and a
+# benign transient reject baseline appears.
+#
+# GATING — count on the STATIC var.deploy_relay only (not enable_sns_alerts: the
+# SNS topic is created in THIS module, so its ARN is plan-time-known and no
+# count-depends-on-computed guard is needed — that guard lives in compute purely
+# because compute receives a computed cross-module ARN, #2664/#2665). With
+# deploy_relay=false (prod today) the counter can never increment, so the alarm
+# would be a permanently-dead INSUFFICIENT_DATA fixture there; gating keeps it
+# only where a relay is wired. notBreaching: the counter is traffic-gated, so a
+# quiet window is genuinely reject-free, not a broken publisher (that case is
+# backstopped by server_publisher_failures / the absence-of-metric alarms).
+resource "aws_cloudwatch_metric_alarm" "relay_forward_reject" {
+  count = var.deploy_relay ? 1 : 0
+
+  alarm_name = "${var.name_prefix}-${var.cell_id}-relay-forward-reject"
+  # `> 0` matches knock_forward_path / server_publisher_failures (identical to
+  # `>= 1` for an integer Sum counter); copied for behavioral-sibling parity.
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 12
+  datapoints_to_alarm = 1
+  metric_name         = "RelayForwardReject"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "nhp-server rejected >=1 NHP_RLY relay forward in the trailing hour while the relay is deployed. Most likely the server booted without relay.toml (transient Secrets Manager / IAM lag → user_data skipped writing it → empty relayPeerMap rejects every relayed knock, logged only as a user-data WARNING); a sustained rate can also be a spoofed/unregistered NHP_RLY sender. Check the cell server's user-data.log for the relay-secret fetch and that relay.toml exists, and server logs for HandleRelayForward drops. #2643."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+    Issue     = "2643"
+  })
+}
+
 # ==================== AC Registration Health (issue #239) ====================
 
 # evaluation_periods=2 at period=600 (20 minutes total) is load-bearing:
