@@ -13,6 +13,7 @@
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {} # used by access_logs.tf (ELB delivery policy ARNs)
 
 # AMI: default to the SSM-published server AMI (Docker + awscli + the
 # systemd-resolved stub-disable fix the relay's startup CloudMap resolve needs).

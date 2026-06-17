@@ -81,7 +81,21 @@ resource "aws_lb" "relay" {
 
   enable_deletion_protection = local.is_prod
 
+  # Per-request access logs to the dedicated S3 bucket (#2623) — forensics for the
+  # internet-facing knock surface, which can't be backfilled once #6 routes real
+  # traffic. No `prefix`: the bucket policy's `AWSLogs/<acct>/*` resource matches
+  # the default empty-prefix key shape; setting a prefix without widening the
+  # policy Resource in lockstep would break delivery with AccessDenied.
+  access_logs {
+    bucket  = aws_s3_bucket.alb_access_logs.bucket
+    enabled = true
+  }
+
   tags = merge(local.tags, { Name = local.alb_name })
+
+  # The bucket policy (legacy + modern delivery principals) must exist before the
+  # enable test-write ModifyLoadBalancerAttributes runs, or it AccessDenies.
+  depends_on = [aws_s3_bucket_policy.alb_access_logs]
 }
 
 # ── Target group → relay nodes ──

@@ -33,6 +33,20 @@ variable "name_prefix" {
   type        = string
 }
 
+variable "account_id" {
+  description = "AWS account ID (passed in, not data.aws_caller_identity, so the prevent_destroy access-log bucket names stay known at plan). See access_logs.tf for the full rationale. #2623."
+  type        = string
+
+  validation {
+    # It lands directly in a prevent_destroy bucket name; a malformed value
+    # (trailing space, literal "default") otherwise fails as a confusing
+    # malformed-ARN/bucket error mid-apply instead of a clear plan-time error.
+    # Mirrors modules/bootstrap-alb/variables.tf::account_id.
+    condition     = can(regex("^[0-9]{12}$", var.account_id))
+    error_message = "account_id must be a 12-digit AWS account ID."
+  }
+}
+
 variable "tags" {
   description = "Base tags applied to every resource."
   type        = map(string)
@@ -319,5 +333,31 @@ variable "waf_rate_limit_per_source_ip" {
   validation {
     condition     = var.waf_rate_limit_per_source_ip >= 100 && var.waf_rate_limit_per_source_ip <= 2000
     error_message = "waf_rate_limit_per_source_ip must be 100–2000 (module policy; AWS hard floor is 10 but <100 false-positives a normal session's retries)."
+  }
+}
+
+# ── Access logs (#2623) ──
+
+variable "access_log_glacier_transition_days" {
+  description = "Days after which relay ALB access-log objects TRANSITION to Glacier (not expire). The hot tier (S3 Standard) covers the typical incident window; older logs land in Glacier (cheaper at rest, operator-explicit retrieval). Objects then live in Glacier indefinitely (no expiration — relay forensics retention is years-long). The ceiling bounds the TRANSITION timing only, not object lifetime."
+  type        = number
+  default     = 90
+
+  validation {
+    # AWS lifecycle floor is 30 (lower fails apply). Ceiling 365 is module policy:
+    # past a year is cold-archive timing, not investigation retention.
+    condition     = var.access_log_glacier_transition_days >= 30 && var.access_log_glacier_transition_days <= 365
+    error_message = "access_log_glacier_transition_days must be 30–365 (AWS lifecycle floor is 30; module-policy ceiling is 365 for the TRANSITION timing — object lifetime in Glacier is unbounded by design)."
+  }
+}
+
+variable "access_log_athena_query_retention_days" {
+  description = "Days the separate Athena query-results bucket retains output. Athena results are derived fan-out from the access-log bucket — useful in the post-incident triage window, re-runnable after."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.access_log_athena_query_retention_days >= 7 && var.access_log_athena_query_retention_days <= 90
+    error_message = "access_log_athena_query_retention_days must be 7–90 (derived, re-runnable query output; no need to retain past the triage window)."
   }
 }

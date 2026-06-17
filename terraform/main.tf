@@ -5029,7 +5029,11 @@ module "relay" {
 
   environment = var.environment
   name_prefix = local.name_prefix
-  tags        = merge(local.common_tags, { Service = "nhp-relay" })
+  # Passed (not data.aws_caller_identity in-module) so the access-log/Athena
+  # bucket names stay known at plan despite prevent_destroy (#2623 / mirrors
+  # module.bootstrap_alb).
+  account_id = data.aws_caller_identity.current.account_id
+  tags       = merge(local.common_tags, { Service = "nhp-relay" })
 
   # Networking — direct refs (intra-repo).
   vpc_id             = module.networking.vpc_id
