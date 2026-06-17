@@ -194,6 +194,7 @@ module "nhp" {
   qurl_reverse_tunnel_server_green_standby_capacity_per_az = var.qurl_reverse_tunnel_server_green_standby_capacity_per_az
   enable_qurl_reverse_tunnel_server_canary                 = var.enable_qurl_reverse_tunnel_server_canary
   qurl_reverse_tunnel_server_tunnel_auth_mode              = var.qurl_reverse_tunnel_server_tunnel_auth_mode
+  qurl_reverse_tunnel_server_min_client_version            = var.qurl_reverse_tunnel_server_min_client_version
 
   # bootstrap-alb (agent-bootstrap knock-flow ingress) — prod env-root
   # close-out, mirror of sandbox #2054. Declared + threaded so prod tfvars

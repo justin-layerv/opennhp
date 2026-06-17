@@ -692,6 +692,17 @@ variable "qurl_reverse_tunnel_server_tunnel_auth_mode" {
   }
 }
 
+variable "qurl_reverse_tunnel_server_min_client_version" {
+  description = "Env-root pass-through for the qurl-reverse-tunnel-server runtime min-client-version SSM seed. Empty seeds the parameter as disabled. Values may include the v prefix because qurl-reverse-tunnel-server normalizes it before comparison. After first apply this tfvar is write-once; operators update the SSM value directly for hot changes."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_reverse_tunnel_server_min_client_version == "" || can(regex("^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$", var.qurl_reverse_tunnel_server_min_client_version))
+    error_message = "qurl_reverse_tunnel_server_min_client_version must be empty or a semantic version like 1.2.3, v1.2.3, or 1.2.3-beta.1; build metadata is not supported by qurl-reverse-tunnel-server."
+  }
+}
+
 # ==================== FRPS passthroughs (parent variables, env-root mirror) ====================
 # Closes the gap noted by #1745: tfvars values for `deploy_frps`,
 # `connect_layerv_host`, `frps_az_suffixes`, and the legacy

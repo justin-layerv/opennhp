@@ -1935,6 +1935,7 @@ module "qurl_reverse_tunnel_server" {
   # plan-gated into "tunnel-auth".
   # See module variable doc for the full env-shape contract.
   qurl_tunnel_auth_mode = var.qurl_reverse_tunnel_server_tunnel_auth_mode
+  min_client_version    = var.qurl_reverse_tunnel_server_min_client_version
 
   # FRPS ASG launch-readiness gate (qurl-reverse-tunnel-server#195). Defaults
   # match the module defaults (CONTINUE / 600), so leaving these unset is a

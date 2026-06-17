@@ -210,7 +210,8 @@ module "nhp" {
   # the piece that was missing in #2131: the var was declared at the root and
   # set in sandbox tfvars, but the env wrapper didn't forward it, so Terraform
   # silently kept FRPS on the root default regardless of tfvars.
-  qurl_reverse_tunnel_server_tunnel_auth_mode = var.qurl_reverse_tunnel_server_tunnel_auth_mode
+  qurl_reverse_tunnel_server_tunnel_auth_mode   = var.qurl_reverse_tunnel_server_tunnel_auth_mode
+  qurl_reverse_tunnel_server_min_client_version = var.qurl_reverse_tunnel_server_min_client_version
 
   # QURL Idempotency Cache
   qurl_idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds

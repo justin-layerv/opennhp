@@ -265,6 +265,40 @@ resource "aws_cloudwatch_metric_alarm" "log_error_rate" {
   })
 }
 
+# The min-client-version SSM sync is a runtime kill-switch control plane:
+# an empty local file means "disabled", so a wedged timer can otherwise look
+# identical to an intentional disabled policy. The sync script emits this
+# counter from its failure trap, covering both boot retries and periodic timer
+# runs; the alarm pages on any nonzero 5-minute Sum.
+resource "aws_cloudwatch_metric_alarm" "min_client_version_sync_failure" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-frps-min-client-version-sync-failure"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "FRPSMinClientVersionSyncFailure"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "qurl-reverse-tunnel-server failed to sync the FRPS min-client-version SSM policy after retries. Boot fallback seeds an empty disabled policy so FRPS can start, which is a temporary fail-open window until the timer recovers; check qurl-min-client-version-sync.service and the SSM parameter before raising a client-version floor."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "frps"
+    Environment = var.environment
+  }
+
+  alarm_actions = local.sns_actions
+  ok_actions    = local.sns_actions
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-frps-min-client-version-sync-failure"
+    Component = "qurl-reverse-tunnel-server"
+    Severity  = "ticket"
+  })
+}
+
 # ==================== Knock-token validation outcomes ====================
 #
 # Per `qurl-reverse-tunnel-server` CLAUDE.md "Knock-event tag taxonomy",

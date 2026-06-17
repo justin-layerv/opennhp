@@ -203,6 +203,9 @@ locals {
     qurl_tunnel_auth_mode           = var.qurl_tunnel_auth_mode
     tunnel_server_az_control_ports  = var.tunnel_server_az_control_ports
     ssm_image_tag_param             = local.ssm_image_tag_param_name
+    ssm_min_client_version_param    = local.ssm_min_client_version_param_name
+    min_client_version_file         = local.min_client_version_file_path
+    min_client_version_disabled     = local.min_client_version_disabled_value
     # The user_data fallback command and the IAM grant must point at the
     # same bucket. Threading both from root (plugin_bucket_name + _arn)
     # instead of hardcoding the legacy `layerv-nhp-${env}-plugins` name
@@ -371,11 +374,11 @@ resource "aws_iam_role_policy" "frps" {
           }
         }
       },
-      # SSM Parameters (read FRP config). user_data makes a single
-      # `aws ssm get-parameter` call on boot; `GetParameters` (batch) and
-      # `GetParametersByPath` (prefix scan) are intentionally omitted —
-      # least-privilege, and widening is a one-line change if a future need
-      # arises.
+      # SSM Parameters (read FRP config). user_data reads exact parameter
+      # names: image-tag once at boot, and min-client-version at boot plus
+      # via a timer. `GetParameters` (batch) and `GetParametersByPath`
+      # (prefix scan) are intentionally omitted — least-privilege, and
+      # widening is a one-line change if a future need arises.
       #
       # Both the canonical /<env>/nhp/reverse-tunnel-server/* path and the
       # legacy /<env>/nhp/frps/* path are listed during #1668 phase 1.

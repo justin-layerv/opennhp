@@ -59,6 +59,11 @@ output "ssm_image_tag_parameter" {
   value       = local.ssm_image_tag_param_name
 }
 
+output "ssm_min_client_version_parameter" {
+  description = "SSM parameter name for the runtime qurl-connector minimum-version gate."
+  value       = local.ssm_min_client_version_param_name
+}
+
 # Per-AZ empty-registration alarms (#1542). Map keyed by AZ suffix so root
 # wiring / dashboards can target the alarm for a specific suffix without
 # index-arithmetic or list-order assumptions. Empty map when the watchdog

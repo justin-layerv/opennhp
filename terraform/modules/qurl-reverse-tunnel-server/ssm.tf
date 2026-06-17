@@ -49,7 +49,10 @@ locals {
   # both reference a single source-of-truth without re-typing the path
   # string and without indirecting through a `data.aws_ssm_parameter`
   # (which would force a runtime existence dependency at plan time).
-  ssm_image_tag_param_name = "/${var.environment}/nhp/reverse-tunnel-server/image-tag"
+  ssm_image_tag_param_name          = "/${var.environment}/nhp/reverse-tunnel-server/image-tag"
+  ssm_min_client_version_param_name = "/${var.environment}/nhp/reverse-tunnel-server/min-client-version"
+  min_client_version_disabled_value = "disabled"
+  min_client_version_file_path      = "/opt/layerv/qurl-reverse-tunnel-server/etc/min-client-version"
 }
 
 resource "aws_ssm_parameter" "asg_name" {
@@ -65,6 +68,26 @@ resource "aws_ssm_parameter" "asg_name" {
   # in #1668's acceptance criteria) and lands as a separate PR.
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-frps-ssm-asg-name"
+    Component = "frps"
+  })
+}
+
+resource "aws_ssm_parameter" "min_client_version" {
+  name        = local.ssm_min_client_version_param_name
+  description = "Minimum qurl-connector version allowed by qurl-reverse-tunnel-server. Ops may update this value at runtime; set to \"${local.min_client_version_disabled_value}\" to disable the gate."
+  type        = "String"
+  value       = var.min_client_version == "" ? local.min_client_version_disabled_value : var.min_client_version
+
+  # The parameter is a runtime kill switch. Terraform seeds the path, but
+  # incident response may raise/lower it directly in SSM without waiting for
+  # a Terraform apply; do not revert those operator changes on unrelated
+  # infrastructure applies.
+  lifecycle {
+    ignore_changes = [value]
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-frps-ssm-min-client-version"
     Component = "frps"
   })
 }

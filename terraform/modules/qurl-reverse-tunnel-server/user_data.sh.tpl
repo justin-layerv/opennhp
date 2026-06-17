@@ -356,6 +356,113 @@ chown -R frps:frps /opt/layerv/qurl-reverse-tunnel-server
 chmod 755 /opt/layerv/qurl-reverse-tunnel-server/nhp-frps
 
 # ============================================================================
+# Runtime min-client-version gate.
+# qurl-reverse-tunnel-server reads MIN_CLIENT_VERSION_FILE and hot-reloads it
+# internally. This timer keeps the local file synced with SSM so ops can raise
+# or lower the connector floor without an instance refresh. The server polls
+# and reopens the path, so the atomic rename below is observed by the running
+# process rather than depending on an inode-scoped file watch.
+# ============================================================================
+MIN_CLIENT_VERSION_FILE="${min_client_version_file}"
+MIN_CLIENT_VERSION_SYNC_SCRIPT="/usr/local/bin/qurl-min-client-version-sync.sh"
+
+cat > "$MIN_CLIENT_VERSION_SYNC_SCRIPT" << 'MINCLIENTEOF'
+#!/bin/bash
+set -euo pipefail
+
+REGION="${region}"
+PARAM_NAME="${ssm_min_client_version_param}"
+DISABLED_VALUE="${min_client_version_disabled}"
+TARGET="${min_client_version_file}"
+TMP=$(mktemp "$TARGET.XXXXXX")
+
+emit_sync_failure_metric() {
+  command -v aws &>/dev/null && aws cloudwatch put-metric-data \
+    --namespace "LayerV/NHP" \
+    --metric-name "FRPSMinClientVersionSyncFailure" \
+    --value 1 --unit Count \
+    --dimensions "Component=frps,Environment=${environment}" \
+    --region "$REGION" 2>/dev/null || true
+}
+
+cleanup() {
+  local status=$?
+  rm -f "$TMP"
+  if [ "$status" -ne 0 ]; then
+    emit_sync_failure_metric
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+
+raw=$(aws ssm get-parameter \
+  --name "$PARAM_NAME" \
+  --query "Parameter.Value" \
+  --output text \
+  --region "$REGION")
+raw=$(printf '%s' "$raw" | tr -d '\r\n')
+
+if [ "$raw" = "$DISABLED_VALUE" ]; then
+  raw=""
+fi
+
+# Runtime SSM edits bypass Terraform validation; reject malformed updates here
+# so operator typos keep the prior known-good file instead of poisoning FRPS.
+SEMVER_RE='^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+if [ -n "$raw" ] && [[ ! "$raw" =~ $SEMVER_RE ]]; then
+  echo "ERROR: $PARAM_NAME value must be disabled or semantic version MAJOR.MINOR.PATCH without build metadata; got '$raw'" >&2
+  exit 1
+fi
+
+printf '%s' "$raw" > "$TMP"
+chown frps:frps "$TMP"
+chmod 0640 "$TMP"
+mv "$TMP" "$TARGET"
+trap - EXIT
+MINCLIENTEOF
+chmod 755 "$MIN_CLIENT_VERSION_SYNC_SCRIPT"
+
+cat > /etc/systemd/system/qurl-min-client-version-sync.service << 'MINCLIENTSERVICEEOF'
+[Unit]
+Description=Sync qURL connector minimum version from SSM
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/qurl-min-client-version-sync.sh
+MINCLIENTSERVICEEOF
+
+cat > /etc/systemd/system/qurl-min-client-version-sync.timer << 'MINCLIENTTIMEREOF'
+[Unit]
+Description=Refresh qURL connector minimum version from SSM
+
+[Timer]
+# 30s is the intended kill-switch propagation target. RandomizedDelaySec avoids
+# every FRPS instance polling SSM at exactly the same second.
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+RandomizedDelaySec=10s
+Unit=qurl-min-client-version-sync.service
+
+[Install]
+WantedBy=timers.target
+MINCLIENTTIMEREOF
+
+if retry_with_backoff 3 2 10 "$MIN_CLIENT_VERSION_SYNC_SCRIPT"; then
+  echo "min-client-version synced from SSM"
+else
+  # Availability wins during boot: seed "disabled" so FRPS can start, then let
+  # the timer recover the intended floor. The sync-failure metric alarms during
+  # this temporary fail-open window.
+  echo "WARN: Could not sync min-client-version from SSM during boot after retries. Seeding disabled policy; timer will keep retrying."
+  : > "$MIN_CLIENT_VERSION_FILE"
+  chown frps:frps "$MIN_CLIENT_VERSION_FILE"
+  chmod 0640 "$MIN_CLIENT_VERSION_FILE"
+fi
+
+# ============================================================================
 # Fetch shared secrets and create systemd service.
 # In tunnel-auth mode the binary reads QURL_API_URL +
 # QURL_INTERNAL_SERVICE_TOKEN for qurl-service auth and
@@ -544,6 +651,7 @@ QURL_TUNNEL_BOUNDARY_VALUE="${connect_layerv_host}:$${QURL_TUNNEL_PUBLIC_CONTROL
   # local.qurl_consumer_api_url). The variable name describes the use
   # case; the env-var name is what nhp-frps reads at runtime.
   printf 'QURL_API_URL=%s\n' '${qurl_api_internal_url}' >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
+  printf 'MIN_CLIENT_VERSION_FILE=%s\n' "$MIN_CLIENT_VERSION_FILE" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
 %{ if qurl_tunnel_auth_mode == "tunnel-auth" ~}
   # Reaching this branch with $QURL_API_TOKEN unset/empty would write
   # QURL_INTERNAL_SERVICE_TOKEN= silently — qurl-reverse-tunnel-server would then boot
@@ -636,6 +744,7 @@ cat > /etc/logrotate.d/qurl-reverse-tunnel-server << 'LOGROTATEEOF'
 LOGROTATEEOF
 
 systemctl daemon-reload
+systemctl enable --now qurl-min-client-version-sync.timer
 systemctl enable qurl-reverse-tunnel-server
 systemctl start qurl-reverse-tunnel-server
 echo "qurl-reverse-tunnel-server systemd service started"

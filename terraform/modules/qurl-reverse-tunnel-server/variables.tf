@@ -408,6 +408,17 @@ variable "qurl_tunnel_auth_mode" {
   }
 }
 
+variable "min_client_version" {
+  description = "Initial qurl-connector minimum version for the qurl-reverse-tunnel-server runtime gate. Empty seeds the SSM parameter as disabled. Values may include the v prefix because qurl-reverse-tunnel-server normalizes it before comparison. After first apply, ignore_changes makes this seed write-once; update the SSM value directly for hot changes."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.min_client_version == "" || can(regex("^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$", var.min_client_version))
+    error_message = "min_client_version must be empty or a semantic version like 1.2.3, v1.2.3, or 1.2.3-beta.1; build metadata is not supported by qurl-reverse-tunnel-server."
+  }
+}
+
 # ==================== Per-AZ Cloud Map ====================
 # Each suffix produces a Cloud Map service `frps-${suffix}.${namespace_name}`.
 # Each ASG instance reads its AZ from IMDS at boot and registers with the

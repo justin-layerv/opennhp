@@ -2162,6 +2162,17 @@ variable "qurl_reverse_tunnel_server_tunnel_auth_mode" {
   }
 }
 
+variable "qurl_reverse_tunnel_server_min_client_version" {
+  description = "Initial qurl-connector minimum version for qurl-reverse-tunnel-server. Empty seeds the runtime SSM parameter as disabled. Values may include the v prefix because qurl-reverse-tunnel-server normalizes it before comparison. After first apply this tfvar is write-once because the SSM value is ignored by Terraform; operators update /<env>/nhp/reverse-tunnel-server/min-client-version directly."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_reverse_tunnel_server_min_client_version == "" || can(regex("^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$", var.qurl_reverse_tunnel_server_min_client_version))
+    error_message = "qurl_reverse_tunnel_server_min_client_version must be empty or a semantic version like 1.2.3, v1.2.3, or 1.2.3-beta.1; build metadata is not supported by qurl-reverse-tunnel-server."
+  }
+}
+
 variable "frps_instance_type" {
   description = "EC2 instance type for FRP server"
   type        = string
