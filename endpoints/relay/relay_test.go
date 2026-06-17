@@ -121,7 +121,7 @@ func makeRealAck(t *testing.T, serverDev *core.Device, innerKnock []byte, srcAdd
 	t.Helper()
 	pd := &core.PacketData{
 		BasePacket: &core.Packet{Content: innerKnock},
-		ConnData:   &core.ConnectionData{Device: serverDev, RemoteAddr: srcAddr, InitTime: time.Now().UnixNano()},
+		ConnData:   &core.ConnectionData{Device: serverDev, RemoteAddr: srcAddr},
 		InitTime:   time.Now().UnixNano(),
 	}
 	innerPpd, err := serverDev.PacketToMsg(pd)
@@ -155,10 +155,54 @@ func makeRealAck(t *testing.T, serverDev *core.Device, innerKnock []byte, srcAdd
 	}
 }
 
-// TestRelay_RoundTrip drives the full path: HTTPS POST -> NHP_RLY to the (fake)
-// cell server on the shared socket -> a REAL NHP_ACK, counter-correlated,
-// returned to the HTTP response.
-func TestRelay_RoundTrip(t *testing.T) {
+// makeRealCookie drives the server's real overload path: an overloaded server
+// decrypts the inner knock and, in validatePeer, emits a genuine NHP_COK
+// (overload cookie) via sendCookie. It returns the encrypted COK bytes the
+// server would put on the wire. This exercises the exact production path #2529 /
+// #2611 concern — the COK must carry the inner KNK's counter so the one-shot
+// relay can correlate it — rather than a hand-built lookalike.
+func makeRealCookie(t *testing.T, serverDev *core.Device, innerKnock []byte, srcAddr *net.UDPAddr) []byte {
+	t.Helper()
+	serverDev.SetOverload(true)
+	t.Cleanup(func() { serverDev.SetOverload(false) })
+
+	// The COK is encrypted on the normal send path and routed to this connection's
+	// SendQueue by ForwardOutboundPacket (sendCookie does not divert via
+	// EncryptedPktCh). Device + RemoteAddr identify and address the reply;
+	// SendQueue (where the COK lands) and CookieStore (generateCookie/sendCookie
+	// read+write it) are the only channels/stores this path exercises.
+	conn := &core.ConnectionData{
+		Device:      serverDev,
+		RemoteAddr:  srcAddr,
+		CookieStore: &core.CookieStore{},
+		SendQueue:   make(chan *core.Packet, 1),
+	}
+	pd := &core.PacketData{
+		BasePacket: &core.Packet{Content: innerKnock},
+		ConnData:   conn,
+		InitTime:   time.Now().UnixNano(),
+	}
+	// An overloaded server rejects the knock with a cookie; PacketToMsg surfaces
+	// ErrServerRejectWithCookie and sendCookie has queued the encrypted COK.
+	if _, err := serverDev.PacketToMsg(pd); err == nil {
+		t.Fatal("overloaded server accepted the knock; expected a cookie rejection")
+	}
+	select {
+	case pkt := <-conn.SendQueue:
+		return append([]byte(nil), pkt.Content...)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for the server to emit an overload cookie")
+		return nil
+	}
+}
+
+// driveRelayRoundTrip exercises the relay's full forward path for one
+// server->agent reply type: it POSTs a fresh inner knock to handleRelay while a
+// one-shot fake cell server echoes back a real reply built from serverDev. It
+// returns the relay, recorded HTTP response, and reply bytes so each test keeps
+// only its reply-specific assertions.
+func driveRelayRoundTrip(t *testing.T, counter uint64, makeReply func(*testing.T, *core.Device, []byte, *net.UDPAddr) []byte) (*RelayServer, *httptest.ResponseRecorder, []byte) {
+	t.Helper()
 	serverDev := core.NewDevice(core.NHP_SERVER, keyBytes(0x40), &core.DeviceOptions{DisableAgentPeerValidation: true})
 	serverDev.Start()
 	t.Cleanup(serverDev.Stop)
@@ -171,13 +215,13 @@ func TestRelay_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fake server listen: %v", err)
 	}
-	defer func() { _ = fakeServer.Close() }()
+	t.Cleanup(func() { _ = fakeServer.Close() })
 
-	const counter = uint64(7777)
+	srcAddr := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444}
 	innerKnock := makeInnerKnock(t, serverPub, counter)
-	realAck := makeRealAck(t, serverDev, innerKnock, &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444})
+	reply := makeReply(t, serverDev, innerKnock, srcAddr)
 
-	// Fake server: read the NHP_RLY, reply with the real NHP_ACK to the relay's
+	// Fake server: read the NHP_RLY, reply with the real NHP reply to the relay's
 	// source addr (the server replies to the packet's source).
 	go func() {
 		buf := make([]byte, 65536)
@@ -185,11 +229,11 @@ func TestRelay_RoundTrip(t *testing.T) {
 		if rerr != nil {
 			return
 		}
-		_, _ = fakeServer.WriteToUDP(realAck, from)
+		_, _ = fakeServer.WriteToUDP(reply, from)
 	}()
 
 	rs := newTestRelay(t, serverPub, fakeServer.LocalAddr().(*net.UDPAddr).Port, SourceAddrModeRemoteAddr)
-	rs.cors = newCORSAllowlist(testKnockOrigin) // fence CORS on the production 200 path too
+	rs.cors = newCORSAllowlist(testKnockOrigin)
 
 	serverID := utils.PubKeyFingerprint(serverPub)
 	req := httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerKnock))
@@ -197,6 +241,41 @@ func TestRelay_RoundTrip(t *testing.T) {
 	req.Header.Set("Origin", testKnockOrigin)
 	w := httptest.NewRecorder()
 	rs.handleRelay(w, req)
+	return rs, w, reply
+}
+
+// TestRelay_OverloadCookie_RoundTrip is the #2529 proof: an overloaded cell
+// server's NHP_COK reply is correctly dispatched back to the waiting HTTP
+// handler through the one-shot relay path. Before the #2611 fix the COK carried
+// a fresh server-side counter, so the relay (which matches replies to pending
+// requests by the inner KNK counter) silently dropped it and the browser timed
+// out instead of receiving the cookie challenge. The COK challenge is now
+// live-reachable through the relay, unblocking the COK->RKN follow-up.
+func TestRelay_OverloadCookie_RoundTrip(t *testing.T) {
+	const counter = uint64(6611)
+	rs, w, realCookie := driveRelayRoundTrip(t, counter, makeRealCookie)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q — the overload COK was not dispatched back through the relay (counter-correlation regression)", w.Code, w.Body.String())
+	}
+	if !bytes.Equal(w.Body.Bytes(), realCookie) {
+		t.Errorf("relayed NHP_COK bytes mismatch (got %d bytes, want %d)", w.Body.Len(), len(realCookie))
+	}
+	// Independently confirm the COK's cleartext counter is the inner KNK counter
+	// the relay keyed its pending request on — the property the dispatch relies on.
+	if cokCounter, cerr := rs.innerCounter(realCookie); cerr != nil {
+		t.Fatalf("innerCounter(COK): %v", cerr)
+	} else if cokCounter != counter {
+		t.Errorf("COK wire counter = %d, want inner KNK counter %d (relay matches replies by this counter)", cokCounter, counter)
+	}
+}
+
+// TestRelay_RoundTrip drives the full path: HTTPS POST -> NHP_RLY to the (fake)
+// cell server on the shared socket -> a REAL NHP_ACK, counter-correlated,
+// returned to the HTTP response.
+func TestRelay_RoundTrip(t *testing.T) {
+	const counter = uint64(7777)
+	_, w, realAck := driveRelayRoundTrip(t, counter, makeRealAck)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %q", w.Code, w.Body.String())

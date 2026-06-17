@@ -31,11 +31,14 @@ const ackWrongType = fixture<{ replyPacketHex: string }>("ack-wrongtype.json");
 const ackBadJson = fixture<{ replyPacketHex: string }>("ack-badjson.json");
 
 // The fixtures share the Go generator's keys (0x41 agent, 0x01 server). The ACK
-// fixtures echo KNOCK_COUNTER (the COK carries a distinct fresh one). KNOCK_COUNTER
-// MUST equal the counter baked into ack.json (PR-4's TransactionId): the success
-// test reuses that fixture, and the loop's reply-counter correlation only passes
-// when the injected knock counter matches it. If ack.json is ever regenerated with
-// a different counter, update this constant.
+// fixtures echo KNOCK_COUNTER. The COK fixture deliberately carries a distinct
+// legacy counter because the current loop returns cookieChallenge before the
+// NHP_RKN cookie-answer path; real server COK packets now echo KNOCK_COUNTER for
+// relay dispatch (#2648). KNOCK_COUNTER MUST equal the counter baked into
+// ack.json (PR-4's TransactionId): the success test reuses that fixture, and the
+// loop's reply-counter correlation only passes when the injected knock counter
+// matches it. If ack.json is ever regenerated with a different counter, update
+// this constant.
 const AGENT_PRIV = fromHex(ackSuccess.agentStaticPrivHex);
 const SERVER_PUB = fromHex(ackSuccess.serverStaticPubHex);
 const KNOCK_COUNTER = 0x1122334455667788n;
@@ -119,7 +122,7 @@ describe("knock (qURL agent loop)", () => {
     });
   });
 
-  it("returns cookieChallenge on an NHP_COK reply (correlation skipped)", async () => {
+  it("returns cookieChallenge on an NHP_COK reply before cookie-answer handling", async () => {
     const result = await knock(REQ, {
       transport: replyWith(cok.replyPacketHex),
       entropy: entropyWithCounter(KNOCK_COUNTER),

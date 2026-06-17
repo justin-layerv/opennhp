@@ -825,6 +825,9 @@ func (ppd *PacketParserData) generateCookie() {
 func (ppd *PacketParserData) sendCookie() {
 	cokStr := base64.StdEncoding.EncodeToString(ppd.ConnData.CookieStore.CurrCookie[:])
 	cokMsg := &common.ServerCookieMsg{
+		// Native agents correlate COK by this payload TransactionId. The relay
+		// correlates by the cleartext wire counter, which PrevParserData below
+		// also derives from SenderTrxId; the equality is intentional.
 		TransactionId: ppd.SenderTrxId,
 		Cookie:        cokStr,
 	}
@@ -834,14 +837,22 @@ func (ppd *PacketParserData) sendCookie() {
 		return
 	}
 
+	// Route through PrevParserData so the wire counter is the agent's
+	// SenderTrxId — matching every other server→agent response (the ACK at
+	// transaction.go SendMsgToPacket, which sets PrevParserData = t.parserData).
+	// The HTTP relay (endpoints/relay) matches a pending request to its reply by
+	// the cleartext header counter of the agent's inbound KNK, so a COK stamped
+	// with a fresh server-side NextCounterIndex() never correlates: the relay
+	// drops it and the browser times out under Overload (#2611 / #2529). Per
+	// MsgData's with-prev contract derives the reply context from ppd instead
+	// of standalone fields: CipherScheme, ConnData, TransactionId and PeerPk
+	// are sourced from ppd, and RemoteAddr is represented through ppd.ConnData
+	// on this server reply path. Those fields are omitted here.
 	md := &MsgData{
-		HeaderType:    NHP_COK,
-		CipherScheme:  ppd.CipherScheme,
-		TransactionId: ppd.device.NextCounterIndex(),
-		Compress:      true,
-		ConnData:      ppd.ConnData,
-		PeerPk:        ppd.RemotePubKey,
-		Message:       cokBytes,
+		HeaderType:     NHP_COK,
+		PrevParserData: ppd,
+		Compress:       true,
+		Message:        cokBytes,
 	}
 
 	log.Debug("Send cookie back to %s: %s ", ppd.ConnData.RemoteAddr, string(md.Message))

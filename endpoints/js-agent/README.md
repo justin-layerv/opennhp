@@ -56,16 +56,16 @@ Ported incrementally, each step its own PR:
      (`knock`: build → POST → `decryptReply` → dispatch). Dispatch returns a
      discriminated `KnockResult` — `success` (resource hosts + AC tokens),
      `reResolve` (the `52024` session-expired deny, #2550), `serverError`, or
-     `cookieChallenge` — and `throw`s only on faults (transport, crypto, the
+     `cookieChallenge` — and `throw`s only on faults (transport, crypto, or
      ACK-counter correlation #2603). The transport is injectable (mock-tested);
      the body and the success/`52024`/cookie dispatch are Go-fenced
      (`nhp/core/js_agent_loop_roundtrip_test.go`).
    - **c. Overload cookie-challenge** — `NHP_COK` → `NHP_RKN` re-knock folding in
-     the server cookie. **Deferred (blocked, #2611):** the overload COK is not
-     routable through the relay today (the fork's `sendCookie` regressed to a
-     server-side counter, so the relay drops it) and the fork lacks upstream's
-     stateless cookies. The agent handles a COK gracefully meanwhile via the
-     `cookieChallenge` result (timeout → re-resolve). Lands once #2611 does.
+     the server cookie. **Deferred (tracked by #2611):** #2648 makes the
+     overload COK routable through the relay again; the remaining work is the
+     agent's COK→RKN handling plus the fork's stateless-cookie follow-up. The
+     agent handles a delivered COK gracefully meanwhile via the `cookieChallenge`
+     result. Lands once the rest of #2611 does.
    - **d. Re-knock renewal scheduler** (#2612) — `agent/scheduler.ts`
      (`startRenewal`): keeps an open grant alive by re-knocking a fresh `NHP_KNK`
      (via the loop's `knock`, so it's live-reachable — no relay-COK dependency) at

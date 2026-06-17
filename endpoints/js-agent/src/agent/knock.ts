@@ -39,9 +39,9 @@ export interface CreatedKnock {
   /** The wire packet to POST to the relay. */
   packet: Uint8Array;
   /**
-   * The per-knock counter (transaction id). The server echoes it in the reply's
-   * header counter, so the agent loop matches the ACK/COK back to this knock by
-   * it — the basis for the anti-replay correlation tracked in #2603.
+   * The per-knock counter (transaction id). Server replies echo it in the header
+   * counter; the loop enforces ACK correlation today, and the COK→RKN path will
+   * consume the same invariant once cookie handling lands.
    */
   counter: bigint;
 }

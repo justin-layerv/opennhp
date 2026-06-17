@@ -109,8 +109,8 @@ interface ServerKnockAck {
  *   - `NHP_COK` → cookieChallenge (overload; the re-knock is PR-5c).
  *
  * Returns a discriminated {@link KnockResult}. Throws only on faults: a transport
- * error ({@link RelayError}), a crypto failure (`decryptReply`), a reply that
- * does not correlate to this knock, an unexpected (authenticated) reply type, or a
+ * error ({@link RelayError}), a crypto failure (`decryptReply`), an ACK that does
+ * not correlate to this knock, an unexpected (authenticated) reply type, or a
  * malformed ACK body (the `JSON.parse` — a TCB-level fault, since the body is
  * server-authenticated by the time it is parsed, not attacker-reachable).
  */
@@ -147,9 +147,9 @@ export async function knock(
 
   if (reply.headerType === NHP_COK) {
     // Overload cookie-challenge — already authenticated by decryptReply. The
-    // re-knock (NHP_RKN with the cookie) is PR-5c. A COK uses a fresh packet
-    // counter and echoes the knock's counter in its body `trxId` instead, so it
-    // is deliberately not subject to the ACK counter-correlation below.
+    // server now echoes the knock counter on the wire so the relay can dispatch
+    // it (#2648), while this loop still only surfaces the challenge until the
+    // NHP_RKN cookie-answer path lands.
     return { kind: "cookieChallenge" };
   }
   if (reply.headerType !== NHP_ACK) {

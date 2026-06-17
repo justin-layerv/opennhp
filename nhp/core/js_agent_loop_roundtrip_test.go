@@ -71,9 +71,12 @@ func sampleEmptySuccessAckMsg() *common.ServerKnockAckMsg {
 	return m
 }
 
-// sampleCookieMsg mirrors what responder.go sendCookie emits: the request's
-// transaction id (so the agent can correlate it on re-knock, PR-5c) plus a
-// base64 cookie. The COK packet itself carries a *fresh* counter (below).
+// sampleCookieMsg mirrors what responder.go sendCookie emits in the encrypted
+// body: the request transaction id (so the agent can correlate it on re-knock,
+// PR-5c) plus a base64 cookie. The fixture below deliberately seals the COK with
+// a legacy distinct packet counter because the current JS loop surfaces
+// cookieChallenge before the NHP_RKN cookie-answer path; real server COK packets
+// now echo the KNK counter on the wire for relay dispatch (#2648).
 func sampleCookieMsg() *common.ServerCookieMsg {
 	cookie := make([]byte, CookieSize)
 	for i := range cookie {
@@ -86,11 +89,12 @@ func sampleCookieMsg() *common.ServerCookieMsg {
 }
 
 // jsAgentKnockCounter is the knock counter ack-52024.json echoes (the TS loop
-// test injects it so the ACK correlation passes). The COK packet uses a distinct
-// fresh counter to prove the loop does NOT correlate a cookie reply by it.
+// test injects it so the ACK correlation passes). The COK fixture keeps a
+// distinct legacy counter to prove today's loop does not require ACK-style COK
+// correlation before the cookie-answer path exists.
 const (
-	jsAgentKnockCounter uint64 = 0x1122334455667788
-	jsAgentCokCounter   uint64 = 0x9988776655443322
+	jsAgentKnockCounter     uint64 = 0x1122334455667788
+	jsAgentLegacyCokCounter uint64 = 0x9988776655443322
 )
 
 // sealReply builds a server->agent reply packet (NHP_ACK or NHP_COK) sealed to
@@ -158,7 +162,7 @@ func TestJsAgentLoopGenerateFixtures(t *testing.T) {
 	writeFixture(t, ack52024FixturePath, sealReply(t, serverDev, agentPub, NHP_ACK, jsAgentKnockCounter, sample52024AckMsg()))
 	writeFixture(t, ackErrorFixturePath, sealReply(t, serverDev, agentPub, NHP_ACK, jsAgentKnockCounter, sampleErrorAckMsg()))
 	writeFixture(t, ackEmptySuccessFixturePath, sealReply(t, serverDev, agentPub, NHP_ACK, jsAgentKnockCounter, sampleEmptySuccessAckMsg()))
-	writeFixture(t, cokFixturePath, sealReply(t, serverDev, agentPub, NHP_COK, jsAgentCokCounter, sampleCookieMsg()))
+	writeFixture(t, cokFixturePath, sealReply(t, serverDev, agentPub, NHP_COK, jsAgentLegacyCokCounter, sampleCookieMsg()))
 	// Throw-path fixtures (the loop rejects these, so only TS asserts the throw):
 	// an unexpected (authenticated) reply type, and a malformed (non-JSON) body.
 	writeFixture(t, ackWrongTypeFixturePath, sealReply(t, serverDev, agentPub, NHP_LRT, jsAgentKnockCounter, sampleAckMsg()))
