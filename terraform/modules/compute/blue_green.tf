@@ -547,7 +547,12 @@ resource "aws_iam_role_policy" "termination_cleanup_asg_green" {
 # Revisit after the first sandbox green refresh; lengthen the window only
 # if this still pages on healthy refresh noise.
 resource "aws_cloudwatch_metric_alarm" "green_asg_unhealthy" {
-  count = var.enable_blue_green && var.alerts_sns_topic_arn != null ? 1 : 0
+  # Gate on the STATIC enable_sns_alerts, not the computed
+  # alerts_sns_topic_arn != null (module.monitoring's ARN), to avoid
+  # "Invalid count argument" on a greenfield apply before the ARN is in
+  # state. alarm_actions still uses the ARN — the variable contract
+  # guarantees it's non-null when enable_sns_alerts=true (cf. #2664 / #2665).
+  count = var.enable_blue_green && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-green-asg-unhealthy"
   alarm_description   = "Green ASG has sustained capacity deficit - may affect rollback capability"
@@ -607,7 +612,10 @@ resource "aws_cloudwatch_metric_alarm" "green_asg_unhealthy" {
 
 # Alarm: Green target group has no healthy targets (critical for rollback)
 resource "aws_cloudwatch_metric_alarm" "green_tg_no_healthy_targets" {
-  count = var.enable_blue_green && var.alerts_sns_topic_arn != null ? 1 : 0
+  # Gate on the STATIC enable_sns_alerts, not the computed
+  # alerts_sns_topic_arn != null, to avoid count-depends-on-computed
+  # "Invalid count argument" on a greenfield apply (cf. #2664 / #2665).
+  count = var.enable_blue_green && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-green-tg-no-healthy"
   alarm_description   = "Green target group has no healthy targets - rollback capability impaired"
@@ -644,7 +652,11 @@ resource "aws_cloudwatch_metric_alarm" "green_tg_no_healthy_targets" {
 # evaluation_periods to check over a configurable window.
 # Set deployment_stale_threshold_days=0 to disable this alarm.
 resource "aws_cloudwatch_metric_alarm" "deployment_stale" {
-  count = var.enable_blue_green && var.alerts_sns_topic_arn != null && var.deployment_stale_threshold_days > 0 ? 1 : 0
+  # Gate on the STATIC enable_sns_alerts, not the computed
+  # alerts_sns_topic_arn != null, to avoid count-depends-on-computed
+  # "Invalid count argument" on a greenfield apply (cf. #2664 / #2665).
+  # The threshold-days>0 disable switch is preserved.
+  count = var.enable_blue_green && var.enable_sns_alerts && var.deployment_stale_threshold_days > 0 ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-deployment-stale"
   alarm_description   = "No blue/green deployments in past ${var.deployment_stale_threshold_days} days - check if deployments are stalled"
