@@ -78,17 +78,39 @@ func newE2ETestNode(t *testing.T, id string) *E2ETestNode {
 // newE2ETestNodeWithType creates a test node with the specified device type.
 // Use NHP_SERVER for server nodes and NHP_AC for AC nodes.
 func newE2ETestNodeWithType(t *testing.T, id string, deviceType int) *E2ETestNode {
-	t.Helper()
+	return newE2ETestNodeWithOptions(t, id, deviceType, nil)
+}
 
-	// Generate a deterministic test private key (32 bytes for Curve25519)
+// newE2ETestNodeWithOptions is newE2ETestNodeWithType with explicit
+// core.DeviceOptions. The NHP-Relay forward path (#2208) requires cloud-mode
+// servers (DisableAgentPeerValidation=true) so the synthetically-decrypted
+// inner agent knock authenticates on its learned pubkey without a pre-registered
+// agent peer — see relay.go's header and relay_cross_server_e2e_test.go. The
+// nil-options variants above keep every existing caller unchanged.
+func newE2ETestNodeWithOptions(t *testing.T, id string, deviceType int, opt *core.DeviceOptions) *E2ETestNode {
+	// Per-id deterministic key — the default identity for nodes that don't need
+	// to share one. byte(i + len(id)) matches the historical scheme so existing
+	// callers' keys (and any hardcoded expectations) are unchanged.
 	privateKey := make([]byte, 32)
-	// Use a simple deterministic key for testing
 	for i := range privateKey {
 		privateKey[i] = byte(i + len(id))
 	}
+	return newE2ETestNodeFull(t, id, deviceType, privateKey, opt)
+}
+
+// newE2ETestNodeFull is the full constructor: explicit private key AND device
+// options. The explicit-key form lets a test stand up TWO server nodes that
+// share one registration keypair — the production multi-instance posture where
+// every server behind the NLB decrypts agent/AC traffic with the same shared
+// key (docs/design/PER_INSTANCE_SERVER_KEYS.md §1; per-instance operational keys
+// are a future draft). The cross-server relay e2e (#2546) needs this so server B
+// can re-decrypt the inner knock that the agent encrypted to the shared key and
+// server A forwarded verbatim.
+func newE2ETestNodeFull(t *testing.T, id string, deviceType int, privateKey []byte, opt *core.DeviceOptions) *E2ETestNode {
+	t.Helper()
 
 	// Create device with specified type
-	device := core.NewDevice(deviceType, privateKey, nil)
+	device := core.NewDevice(deviceType, privateKey, opt)
 	if device == nil {
 		t.Fatalf("Failed to create device for node %s", id)
 	}
