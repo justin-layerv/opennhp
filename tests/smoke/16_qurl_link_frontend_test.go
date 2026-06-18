@@ -300,25 +300,26 @@ func TestQurlLinkFrontend_AllowlistContainsServingHost(t *testing.T) {
 	}
 }
 
-// TestQurlLinkFrontend_CSPAllowsInlineScript fences both halves of the
-// `script-src` posture the response_headers_policy declares:
+// TestQurlLinkFrontend_CSPAllowsInlineScript fences both supported halves of
+// the `script-src` posture the response_headers_policy declares:
 //
 //  1. 'unsafe-inline' is present — without it, the inline IIFE refuses
 //     to execute in any modern browser and users see the loading
 //     spinner forever.
-//  2. NO other sources are listed — the PR's stated posture is that
-//     the bucket only ever serves this one inline-script page, so
-//     same-origin .js loads should be blocked. A "hardening" PR that
-//     adds 'self' or a CDN should also update this assertion.
+//  2. Envs without the browser NHP agent keep NO other sources listed: the
+//     bucket only serves the inline-script page, so same-origin .js loads
+//     stay blocked.
+//  3. Envs with the browser NHP agent explicitly allow 'self', matching the
+//     Terraform switch that uploads nhp-agent.min.js beside the verifier shell.
 //
 // If a future PR moves to a hash- or nonce-based CSP, that PR must
 // update this assertion in lockstep.
 //
-// Regex anchor: `script-src` value is exactly `'unsafe-inline'`, ending
-// either with `;` (directive separator) or end-of-string. Anchored on
-// start-of-string or a preceding directive separator instead of `\b`
-// so a future CSP shape with hyphenated tokens before the directive
-// can't accidentally satisfy the boundary.
+// Regex anchor: `script-src` value must be exactly one of the supported
+// postures, ending either with `;` (directive separator) or end-of-string.
+// Anchored on start-of-string or a preceding directive separator instead of
+// `\b` so a future CSP shape with hyphenated tokens before the directive can't
+// accidentally satisfy the boundary.
 var (
 	// Order-independent detection of a robots meta tag whose content asks
 	// crawlers not to index the page. Go's RE2 engine has no lookahead, so
@@ -330,6 +331,7 @@ var (
 	noindexContentAttrRE          = regexp.MustCompile(`(?i)\bcontent=["'][^"']*noindex`)
 	staticBodyClassAttrRE         = regexp.MustCompile(`(?is)<body\b[^>]*\bclass=["']([^"']*)["'][^>]*>`)
 	scriptSrcOnlyInlineRE         = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s*(?:;|$)`)
+	scriptSrcInlineAndSelfRE      = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s+'self'\s*(?:;|$)`)
 	reducedMotionScrollBehaviorRE = regexp.MustCompile(
 		`(?is)@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)\s*\{[^{}]*html\s*\{[^{}]*scroll-behavior\s*:\s*auto\s*;`,
 	)
@@ -337,6 +339,14 @@ var (
 		`(?is)<noscript>.*?\.access-shell\s*\{[^{}]*display\s*:\s*grid\s*;.*?\.access-noscript\s*\{[^{}]*display\s*:\s*block\s*;`,
 	)
 )
+
+// qurlLinkJSAgentEnabledEnvs mirrors the env-level
+// qurl_link_js_agent_enabled tfvars switch. The smoke CSP fence allows
+// same-origin script loads only while Terraform is intentionally serving the
+// browser NHP agent bundle in that env.
+var qurlLinkJSAgentEnabledEnvs = map[string]bool{
+	"sandbox": true,
+}
 
 // hasRobotsNoindexMeta reports whether body contains a <meta> element that
 // carries both name="robots" and a content value including "noindex", in any
@@ -359,9 +369,16 @@ func TestQurlLinkFrontend_CSPAllowsInlineScript(t *testing.T) {
 	if csp == "" {
 		t.Fatal("Content-Security-Policy response header is empty — the response_headers_policy is not attached, or CloudFront stopped emitting it.")
 	}
-	if !scriptSrcOnlyInlineRE.MatchString(csp) {
-		t.Fatalf("CSP script-src directive does not match the expected `'unsafe-inline'`-only posture. "+
-			"Either 'unsafe-inline' is missing (SPA won't execute) or extra sources are listed (posture loosened from the inline-only design). "+
-			"CSP: %q", csp)
+
+	wantPosture := "'unsafe-inline'-only"
+	wantRE := scriptSrcOnlyInlineRE
+	if qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
+		wantPosture = "'unsafe-inline' plus 'self' for the same-origin browser NHP agent bundle"
+		wantRE = scriptSrcInlineAndSelfRE
+	}
+	if !wantRE.MatchString(csp) {
+		t.Fatalf("CSP script-src directive does not match the expected %s posture. "+
+			"Either 'unsafe-inline' is missing (SPA won't execute) or the allowed script sources drifted from the env's Terraform switch. "+
+			"CSP: %q", wantPosture, csp)
 	}
 }

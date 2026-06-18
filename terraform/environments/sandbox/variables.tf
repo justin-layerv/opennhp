@@ -361,6 +361,12 @@ variable "qurl_link_enable_access_logs" {
   default     = false
 }
 
+variable "qurl_link_js_agent_enabled" {
+  description = "Upload the browser NHP JS-agent bundle to qurl.link for sandbox relay cutover staging (#2208/#2680)."
+  type        = bool
+  default     = false
+}
+
 variable "enable_resolve_cloudfront" {
   description = "Enable CloudFront + WAF in front of resolve.qurl.link for ISP compatibility"
   type        = bool

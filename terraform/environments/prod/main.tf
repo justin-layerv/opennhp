@@ -149,6 +149,7 @@ module "nhp" {
   qurl_link_hosted_zone_id        = var.qurl_link_hosted_zone_id
   qurl_link_external_dns          = var.qurl_link_external_dns
   qurl_link_enable_access_logs    = var.qurl_link_enable_access_logs
+  qurl_link_js_agent_enabled      = var.qurl_link_js_agent_enabled
   enable_resolve_cloudfront       = var.enable_resolve_cloudfront
   resolve_waf_ip_reputation_block = var.resolve_waf_ip_reputation_block
   enable_resolve_waf_logging      = var.enable_resolve_waf_logging

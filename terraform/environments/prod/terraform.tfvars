@@ -207,6 +207,10 @@ deploy_qurl_link          = true
 qurl_link_frontend_domain = "qurl.link"
 qurl_link_hosted_zone_id  = "Z0693053DKJ8S3XN9WPG" # qurl.link zone (in layerv-mgmt account)
 qurl_link_external_dns    = false                  # DNS via route53_mgmt cross-account provider
+# Keep prod dark until the sandbox relay browser cutover is proven and a
+# dedicated prod-enable PR flips both the qurl.link client flow and this static
+# bundle/CSP switch together.
+qurl_link_js_agent_enabled = false
 
 # CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
 enable_resolve_cloudfront = true

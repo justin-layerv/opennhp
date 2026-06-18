@@ -1,8 +1,9 @@
 name: js-agent
 
 # Build, lint, and test the browser NHP agent (endpoints/js-agent, #2208).
-# Path-scoped to that directory so it does not run on unrelated Go/Terraform
-# changes.
+# Path-scoped to that directory plus the committed qurl.link bundle copy, so it
+# does not run on unrelated Go/Terraform changes but still catches asset-only
+# drift in the Terraform-served bundle.
 #
 # Two jobs:
 #   test    — runs the vitest suite on every supported Node: the declared
@@ -25,10 +26,12 @@ on:
     branches: [main]
     paths:
       - 'endpoints/js-agent/**'
+      - 'terraform/modules/qurl-link/frontend/nhp-agent.min.js'
       - '.github/workflows/js-agent.yml'
   pull_request:
     paths:
       - 'endpoints/js-agent/**'
+      - 'terraform/modules/qurl-link/frontend/nhp-agent.min.js'
       - '.github/workflows/js-agent.yml'
 
 permissions:

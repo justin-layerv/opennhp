@@ -1,7 +1,16 @@
 import { describe, it, expect } from "vitest";
 import { build } from "esbuild";
+import { readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { bundleOptions, BUNDLE_BUDGET_GZIP_BYTES } from "../scripts/bundle.mjs";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const QURL_LINK_BUNDLE_PATH = resolve(
+  __dirname,
+  "../../../terraform/modules/qurl-link/frontend/nhp-agent.min.js",
+);
 
 // Verifies the production bundle (the exact `npm run bundle` config) without
 // executing it: the bundle targets the browser (document/window/fetch), and
@@ -44,5 +53,19 @@ describe("production bundle", () => {
       "pubKeyFingerprint",
       "startRenewal",
     ]);
+  });
+
+  it("matches the qurl-link static bundle served by Terraform", async () => {
+    const result = await build({
+      ...bundleOptions,
+      write: false,
+    });
+
+    expect(result.errors).toEqual([]);
+    expect(result.outputFiles).toHaveLength(1);
+
+    const generated = Buffer.from(result.outputFiles![0]!.contents);
+    const deployed = await readFile(QURL_LINK_BUNDLE_PATH);
+    expect(deployed.equals(generated)).toBe(true);
   });
 });

@@ -3314,6 +3314,7 @@ module "qurl_link" {
   bucket_name         = "${local.name_prefix}-qurl-link"
   acm_certificate_arn = aws_acm_certificate_validation.qurl_link[0].certificate_arn
   enable_access_logs  = var.qurl_link_enable_access_logs
+  js_agent_enabled    = var.qurl_link_js_agent_enabled
   robots_tag          = var.environment == "prod" ? null : "noindex, nofollow"
 
   tags = merge(local.common_tags, { Service = "qurl" })

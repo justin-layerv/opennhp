@@ -28,27 +28,32 @@ locals {
   favicon_svg  = file("${path.module}/frontend/favicon.svg")
   wordmark_svg = file("${path.module}/frontend/layerv-wordmark.svg")
   og_image_png = filebase64("${path.module}/frontend/og-image.png")
+  js_agent_js  = var.js_agent_enabled ? file("${path.module}/frontend/nhp-agent.min.js") : ""
 
   index_content_type     = "text/html"
   robots_content_type    = "text/plain; charset=utf-8"
   favicon_content_type   = "image/svg+xml"
   wordmark_content_type  = "image/svg+xml"
   og_image_content_type  = "image/png"
+  js_agent_content_type  = "text/javascript; charset=utf-8"
   html_cache_control     = "max-age=3600, must-revalidate"
   robots_cache_control   = "max-age=3600, must-revalidate"
   favicon_cache_control  = "max-age=86400, must-revalidate"
   wordmark_cache_control = "max-age=86400, must-revalidate"
   og_image_cache_control = "max-age=86400, must-revalidate"
+  js_agent_cache_control = "max-age=3600, must-revalidate"
 
   favicon_keys = ["favicon.ico", "favicon.svg"]
   wordmark_key = "layerv-wordmark.svg"
   og_image_key = "og-image.png"
+  js_agent_key = "nhp-agent.min.js"
 
   static_invalidation_paths = concat(
     ["/", "/index.html", "/robots.txt"],
     [for key in local.favicon_keys : "/${key}"],
     ["/${local.wordmark_key}"],
     ["/${local.og_image_key}"],
+    ["/${local.js_agent_key}"],
   )
 
   static_content_hash = md5(jsonencode({
@@ -80,6 +85,13 @@ locals {
       cache_control = local.og_image_cache_control
       content_type  = local.og_image_content_type
       key           = local.og_image_key
+    }
+    js_agent = {
+      enabled       = var.js_agent_enabled
+      body          = local.js_agent_js
+      cache_control = local.js_agent_cache_control
+      content_type  = local.js_agent_content_type
+      key           = local.js_agent_key
     }
   }))
 }
@@ -260,11 +272,13 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
       # the qurl-router authorize check at the resource host, not by this CSP.
       # script-src omits 'self' on purpose: the bucket only ever serves
       # this one inline-script page, so disallowing same-origin .js
-      # loads is the tighter, accurate posture.
+      # loads is the tighter, accurate posture. The sandbox relay cutover is the
+      # exception: js_agent_enabled uploads the browser NHP agent as a same-origin
+      # module, so 'self' is added only while that bundle is intentionally served.
       # style-src keeps 'unsafe-inline' because the marketing rows use
       # inline style attributes for per-card CSS custom properties, and the
       # no-JS verifier fallback keeps its state flip in a noscript style.
-      content_security_policy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+      content_security_policy = var.js_agent_enabled ? "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'" : "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
       override                = true
     }
     strict_transport_security {
@@ -454,6 +468,19 @@ resource "aws_s3_object" "og_image" {
   content_type   = local.og_image_content_type
   source_hash    = filemd5("${path.module}/frontend/og-image.png")
   cache_control  = local.og_image_cache_control
+
+  tags = merge(var.tags, { Component = "qurl-link" })
+}
+
+resource "aws_s3_object" "js_agent" {
+  count = var.js_agent_enabled ? 1 : 0
+
+  bucket        = aws_s3_bucket.qurl_link.id
+  key           = local.js_agent_key
+  content       = local.js_agent_js
+  content_type  = local.js_agent_content_type
+  etag          = md5(local.js_agent_js)
+  cache_control = local.js_agent_cache_control
 
   tags = merge(var.tags, { Component = "qurl-link" })
 }

@@ -604,6 +604,13 @@ deploy_qurl_link          = true
 qurl_link_frontend_domain = "qurl.link.layerv.xyz"
 qurl_link_hosted_zone_id  = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
 qurl_link_external_dns    = false
+# #2208/#2680 sandbox staging: serve the browser NHP agent bundle from the same
+# qurl.link origin so the relay browser cutover can mount it without adding a
+# new public host. The page still uses the legacy resolve form until #2680's
+# browser handoff flips the client-side control flow; this only makes the
+# reviewed bundle available behind the sandbox distribution and adjusts CSP
+# for that same-origin module load.
+qurl_link_js_agent_enabled = true
 
 # CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
 enable_resolve_cloudfront = true

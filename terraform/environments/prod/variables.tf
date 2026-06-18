@@ -544,6 +544,12 @@ variable "qurl_link_enable_access_logs" {
   default = false
 }
 
+variable "qurl_link_js_agent_enabled" {
+  description = "Upload the browser NHP JS-agent bundle to qurl.link. Prod remains false until the sandbox relay browser cutover is proven and a dedicated prod cutover PR flips it."
+  type        = bool
+  default     = false
+}
+
 variable "enable_resolve_cloudfront" {
   type    = bool
   default = false

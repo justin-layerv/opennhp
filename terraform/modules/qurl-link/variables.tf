@@ -19,6 +19,12 @@ variable "enable_access_logs" {
   default     = false
 }
 
+variable "js_agent_enabled" {
+  description = "Upload the browser NHP JS-agent bundle beside the qurl.link verifier shell. Sandbox enables this to make the relay agent available for the #2208/#2680 cutover; prod stays false until the sandbox browser cutover is proven."
+  type        = bool
+  default     = false
+}
+
 variable "robots_tag" {
   description = "Optional X-Robots-Tag response header value. Deliberately locked to null or 'noindex, nofollow' so non-prod qurl-link hosts that serve byte-identical HTML cannot broaden crawler directives without a module change."
   type        = string
