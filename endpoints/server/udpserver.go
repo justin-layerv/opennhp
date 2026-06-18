@@ -3,6 +3,7 @@ package server
 import (
 	"container/list"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -90,6 +91,15 @@ type UdpServer struct {
 	httpServer   *HttpServer
 	webrtcServer *WebRTCServer
 	wg           sync.WaitGroup
+	// cookieSigningKeyClearedWarned suppresses repeated SIGHUP noise after an
+	// operator clears CookieSigningKeyBase64. The running key intentionally
+	// stays in memory until restart, so the cached config keeps the last known
+	// good key and would otherwise look changed forever.
+	cookieSigningKeyClearedWarned bool
+	// overloadCookieProcessLocalKey tracks whether this process currently uses
+	// a random fallback overload-cookie key. It backs the CloudWatch gauge, so
+	// reload paths that install a shared key must clear it.
+	overloadCookieProcessLocalKey atomic.Bool
 	// outboundConnStartMutex serializes connDataForOutboundAddr's late
 	// server-peer connectionRoutine wg.Add calls with Stop's transition
 	// to wg.Wait. Static Start-time Add calls don't use it.
@@ -953,6 +963,10 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		return errors.New("failed to create device")
 	}
 
+	if err := s.configureStatelessCookieParams(); err != nil {
+		return err
+	}
+
 	// NHP_ART replay dedupe (#1457). Construct the cache and install the
 	// post-validation dedupe hook BEFORE s.device.Start() spawns the
 	// packetToMsgRoutine workers — the `go` in Start establishes the
@@ -960,6 +974,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	// lock-free (see the field doc on core.Device).
 	s.artReplay = newARTReplayCache()
 	s.device.SetRecvReplayDedupe(s.dedupeRecvART)
+	s.device.SetCookieMintFailureHook(s.recordOverloadCookieMintFailure)
 
 	// retrieve local ip and mac
 	localAddr := utils.GetLocalOutboundAddress()
@@ -1078,6 +1093,53 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 
 	s.running.Store(true)
 	return nil
+}
+
+func (s *UdpServer) configureStatelessCookieParams() error {
+	cookieKey, cookieKeyErr := decodeCookieSigningKey(s.config.CookieSigningKeyBase64)
+	if cookieKeyErr != nil {
+		log.Critical("invalid CookieSigningKeyBase64 in config: %v", cookieKeyErr)
+		return fmt.Errorf("invalid CookieSigningKeyBase64: %w", cookieKeyErr)
+	}
+	defer func() {
+		core.SetZero(cookieKey)
+	}()
+
+	processLocalCookieKey := false
+	if len(cookieKey) == 0 {
+		cookieKey = make([]byte, core.SymmetricKeySize)
+		if _, err := rand.Read(cookieKey); err != nil {
+			log.Critical("failed to generate random cookie signing key: %v", err)
+			return fmt.Errorf("failed to generate random cookie signing key: %w", err)
+		}
+		processLocalCookieKey = true
+		log.Warning("CookieSigningKeyBase64 not set; using a random per-process overload-cookie key; cross-instance RKN verification requires a shared configured key")
+	} else {
+		log.Info("CookieSigningKeyBase64 configured; overload cookies can verify across server instances")
+	}
+	s.overloadCookieProcessLocalKey.Store(processLocalCookieKey)
+	s.metrics.RegisterGaugeFunc(MetricOverloadCookieProcessLocalKey, func() float64 {
+		if s.overloadCookieProcessLocalKey.Load() {
+			return 1
+		}
+		return 0
+	})
+
+	s.device.SetStatelessCookieParams(cookieKey, effectiveCookieTimeWindow(s.config.CookieTimeWindowSeconds))
+	return nil
+}
+
+func (s *UdpServer) recordOverloadCookieMintFailure(reason string) {
+	if s == nil || s.metrics == nil {
+		return
+	}
+	s.metrics.IncrCounter(MetricOverloadCookieMintFailure)
+	s.metrics.IncrCounterWithDims(MetricOverloadCookieMintFailure, []types.Dimension{
+		{
+			Name:  aws.String("Reason"),
+			Value: aws.String(reason),
+		},
+	})
 }
 
 func (s *UdpServer) Stop() {

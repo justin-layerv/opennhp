@@ -64,7 +64,8 @@ const (
 
 // knock
 const (
-	DefaultIpOpenTime         = 120 // second, align with ipset default timeout
-	ACOpenCompensationTime    = 5   // second
-	TokenStoreRefreshInterval = common.TokenStoreRefreshInterval
+	DefaultIpOpenTime              = 120 // second, align with ipset default timeout
+	ACOpenCompensationTime         = 5   // second
+	TokenStoreRefreshInterval      = common.TokenStoreRefreshInterval
+	DefaultCookieTimeWindowSeconds = 60
 )

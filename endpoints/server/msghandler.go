@@ -119,6 +119,19 @@ const (
 	// worth a dedicated counter. (P5/P7 alarm authors: read processed as the
 	// difference, and treat it as ~delivered modulo those rare internal failures.)
 	MetricRelayForward = "RelayForward"
+	// MetricOverloadCookieProcessLocalKey is 1 while this server is using a
+	// random per-process overload-cookie signing key and 0 when a shared key is
+	// configured. Process-local mode is valid only for single-instance
+	// deployments; any non-zero value in a load-balanced fleet means
+	// cross-instance COK->RKN verification can fail.
+	MetricOverloadCookieProcessLocalKey = "OverloadCookieProcessLocalKey"
+	// MetricOverloadCookieMintFailure counts overload rejects where the server
+	// intended to return a COK but could not mint or marshal one. A non-zero
+	// rate means agents are receiving ErrServerRejectWithCookie without a usable
+	// cookie to re-knock with. The base stream drives the CloudWatch alarm; the
+	// Reason breakdown identifies missing source binding, wrong peer-pubkey
+	// length, missing legacy CookieStore, or marshal failure.
+	MetricOverloadCookieMintFailure = "OverloadCookieMintFailure"
 	// MetricRelayForwardReject counts NHP_RLY packets dropped before the inner
 	// knock is authenticated — unregistered relay peer, bad relay-reported
 	// SourceAddr, malformed/oversize inner packet, non-knock inner type, or a

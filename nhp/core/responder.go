@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -16,6 +17,153 @@ import (
 	common "github.com/OpenNHP/opennhp/nhp/common"
 	log "github.com/OpenNHP/opennhp/nhp/log"
 )
+
+func cookieRemoteKey(connData *ConnectionData) string {
+	if connData == nil {
+		return ""
+	}
+	addr := connData.RealRemoteAddr
+	if addr == nil {
+		addr = connData.RemoteAddr
+	}
+	if addr == nil || addr.IP == nil {
+		log.Debug("cookieRemoteKey: missing remote address; stateless cookie will fail closed")
+		return ""
+	}
+	if v4 := addr.IP.To4(); v4 != nil {
+		return v4.String()
+	}
+	return addr.IP.String()
+}
+
+// Stateless cookies are opaque 32-byte HMAC-SHA256 outputs. CookieSize must
+// stay pinned to sha256.Size because agents round-trip COK bytes through a
+// fixed [CookieSize] buffer before stamping the RKN header digest.
+var _ [CookieSize - sha256.Size]byte
+var _ [sha256.Size - CookieSize]byte
+
+const (
+	statelessCookieDomain       = "nhp-overload-cookie-v1\x00"
+	maxStatelessCookieRemoteKey = 64
+	maxStatelessCookieInput     = len(statelessCookieDomain) + 4 + maxStatelessCookieRemoteKey + 4 + PublicKeySize + 8
+)
+
+// deriveStatelessCookieInto is a stack-only HMAC-SHA256 implementation for the
+// overloaded RKN flood path so cookie checks add no steady-state heap pressure
+// while a server is already shedding work. Keep it byte-for-byte with
+// TestDeriveStatelessCookieIntoMatchesReferenceHMAC.
+func deriveStatelessCookieInto(out *[CookieSize]byte, signingKey []byte, remoteKey string, peerPk []byte, windowIndex int64) {
+	if len(remoteKey) > maxStatelessCookieRemoteKey || len(peerPk) > PublicKeySize {
+		deriveStatelessCookieHMACInto(out, signingKey, remoteKey, peerPk, windowIndex)
+		return
+	}
+
+	var msg [maxStatelessCookieInput]byte
+	n := copy(msg[:], statelessCookieDomain)
+	binary.BigEndian.PutUint32(msg[n:n+4], uint32(len(remoteKey)))
+	n += 4
+	n += copy(msg[n:], remoteKey)
+	binary.BigEndian.PutUint32(msg[n:n+4], uint32(len(peerPk)))
+	n += 4
+	n += copy(msg[n:], peerPk)
+	binary.BigEndian.PutUint64(msg[n:n+8], uint64(windowIndex))
+	n += 8
+
+	var ipad, opad [sha256.BlockSize]byte
+	var keyHash [sha256.Size]byte
+	key := signingKey
+	if len(key) > sha256.BlockSize {
+		keyHash = sha256.Sum256(key)
+		key = keyHash[:]
+	}
+	copy(ipad[:], key)
+	copy(opad[:], key)
+	for i := range ipad {
+		ipad[i] ^= 0x36
+		opad[i] ^= 0x5c
+	}
+
+	var innerInput [sha256.BlockSize + maxStatelessCookieInput]byte
+	copy(innerInput[:sha256.BlockSize], ipad[:])
+	copy(innerInput[sha256.BlockSize:], msg[:n])
+	inner := sha256.Sum256(innerInput[:sha256.BlockSize+n])
+
+	var outerInput [sha256.BlockSize + sha256.Size]byte
+	copy(outerInput[:sha256.BlockSize], opad[:])
+	copy(outerInput[sha256.BlockSize:], inner[:])
+	sum := sha256.Sum256(outerInput[:])
+	copy(out[:], sum[:])
+
+	SetZero(keyHash[:])
+	SetZero(ipad[:])
+	SetZero(opad[:])
+	SetZero(innerInput[:])
+	SetZero(outerInput[:])
+	SetZero(inner[:])
+	SetZero(sum[:])
+}
+
+func deriveStatelessCookieHMACInto(out *[CookieSize]byte, signingKey []byte, remoteKey string, peerPk []byte, windowIndex int64) {
+	mac := hmac.New(sha256.New, signingKey)
+	_, _ = io.WriteString(mac, statelessCookieDomain)
+	var rb [4]byte
+	binary.BigEndian.PutUint32(rb[:], uint32(len(remoteKey)))
+	mac.Write(rb[:])
+	_, _ = io.WriteString(mac, remoteKey)
+	binary.BigEndian.PutUint32(rb[:], uint32(len(peerPk)))
+	mac.Write(rb[:])
+	mac.Write(peerPk)
+	var wb [8]byte
+	binary.BigEndian.PutUint64(wb[:], uint64(windowIndex))
+	mac.Write(wb[:])
+	mac.Sum(out[:0])
+}
+
+// decryptInitiatorStaticPubKey advances the normal Noise IK transcript through
+// the initiator-static decrypt and caches the result. Overload RKN cookie
+// verification calls this before validatePeer, so validatePeer must reuse the
+// cached key instead of replaying the ECDH. TestCookieVerifyEndToEnd is the
+// load-bearing regression for that handoff. Failure may partially advance the
+// transcript; callers must reject the packet and discard the ppd.
+func (ppd *PacketParserData) decryptInitiatorStaticPubKey() ([]byte, error) {
+	if ppd.peerStaticPubKeyDecrypted {
+		return ppd.RemotePubKey, nil
+	}
+
+	// evolve chain hash ChainHash0 -> ChainHash1
+	ppd.chainHash.Write(ppd.deviceEcdh.PublicKey())
+	ppd.chainHash.Write(ppd.header.EphermeralBytes())
+
+	// evolve chain key ChainKey0 -> ChainKey1
+	ppd.noise.MixKey(&ppd.chainKey, ppd.chainKey[:], ppd.header.EphermeralBytes())
+
+	// get ephermeral shared key
+	ess := ppd.deviceEcdh.SharedSecret(ppd.header.EphermeralBytes())
+	if ess == nil {
+		return nil, ErrDeviceECDHEphermalFailed
+	}
+	defer SetZero(ess[:])
+
+	var key [SymmetricKeySize]byte
+	defer SetZero(key[:])
+	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ess[:])
+
+	aead, err := AeadFromKey(ppd.Ciphers.GcmType, &key)
+	if err != nil {
+		return nil, fmt.Errorf("decryptInitiatorStaticPubKey: aead: %w", err)
+	}
+	peerPk, err := aead.Open(ppd.remotePubKeyBuf[:0], ppd.header.NonceBytes(), ppd.header.StaticBytes(), ppd.chainHash.Sum(ppd.hashBuf[:0]))
+	if err != nil {
+		return nil, fmt.Errorf("decryptInitiatorStaticPubKey: open: %w", err)
+	}
+	if len(peerPk) != PublicKeySize {
+		return nil, fmt.Errorf("decryptInitiatorStaticPubKey: expected %d-byte pubkey, got %d", PublicKeySize, len(peerPk))
+	}
+
+	ppd.RemotePubKey = ppd.remotePubKeyBuf[:]
+	ppd.peerStaticPubKeyDecrypted = true
+	return peerPk, nil
+}
 
 type CookieStore struct {
 	CurrCookie     [CookieSize]byte
@@ -92,12 +240,13 @@ type PacketParserData struct {
 	BodyCompress bool
 	Overload     bool
 
-	SenderIdentity         []byte
-	SenderMidPublicKey     []byte
-	ConnLastRemoteSendTime *int64
-	ConnCookieStore        *CookieStore
-	ConnPeerPublicKey      *[PublicKeySizeEx]byte
-	RemotePubKey           []byte
+	SenderIdentity            []byte
+	SenderMidPublicKey        []byte
+	ConnLastRemoteSendTime    *int64
+	ConnCookieStore           *CookieStore
+	ConnPeerPublicKey         *[PublicKeySizeEx]byte
+	RemotePubKey              []byte
+	peerStaticPubKeyDecrypted bool
 	// remotePubKeyBuf lives inside the PacketParserData allocation; it avoids
 	// a separate heap object for RemotePubKey. Because RemotePubKey slices into
 	// this array, downstream aliases extend this struct's lifetime. See Destroy
@@ -185,8 +334,13 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 			}
 		}
 
-		// for RKN, check the header digest with cookie. For remaining allowed key messages, check it without cookie.
-		sumCookie := overload && ppd.HeaderType == NHP_RKN
+		// Agents stamp overload cookies into every RKN digest. When stateless
+		// params are configured, verify that cookie even if this replica has
+		// already recovered below its local overload threshold; otherwise a COK
+		// minted by a hot sibling can be rejected by a cooler verifier. Servers
+		// install stateless params at startup; the CookieStore path remains for
+		// embedded/tests that intentionally leave the params disabled.
+		sumCookie := ppd.HeaderType == NHP_RKN && (overload || ppd.device.statelessCookieParamsConfigured())
 		if !ppd.checkHeaderDigest(sumCookie) {
 			// "HMAC" string kept deliberately (#1126): operator-facing log
 			// breadcrumb, matches the preserved ErrServer... message + terraform.
@@ -438,36 +592,9 @@ func shouldEscalateStale(deviceType int, peerType int, msgType int) bool {
 }
 
 func (ppd *PacketParserData) validatePeer() (err error) {
-	// evolve chain hash ChainHash0 -> ChainHash1
-	ppd.chainHash.Write(ppd.deviceEcdh.PublicKey())
-	ppd.chainHash.Write(ppd.header.EphermeralBytes())
-
-	// evolve chain key ChainKey0 -> ChainKey1
-	ppd.noise.MixKey(&ppd.chainKey, ppd.chainKey[:], ppd.header.EphermeralBytes())
-	// get ephermeral shared key
-	ess := ppd.deviceEcdh.SharedSecret(ppd.header.EphermeralBytes())
-	if ess == nil {
-		log.Error("device ECDH failed with ephermal")
-		err = ErrDeviceECDHEphermalFailed
-		return err
-	}
-
-	// prepare key for aead
-	var key [SymmetricKeySize]byte
-	var aead cipher.AEAD
-
-	// generate gcm key and decrypt device pubkey ChainKey1 -> ChainKey2
-	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ess[:])
-	SetZero(ess[:])
-	peerPk := ppd.remotePubKeyBuf[:]
-	aead, err = AeadFromKey(ppd.Ciphers.GcmType, &key)
+	peerPk, err := ppd.decryptInitiatorStaticPubKey()
 	if err != nil {
-		log.Error("failed to create AEAD for peer pubkey decryption: %v", err)
-		return err
-	}
-	_, err = aead.Open(peerPk[:0], ppd.header.NonceBytes(), ppd.header.StaticBytes(), ppd.chainHash.Sum(ppd.hashBuf[:0]))
-	if err != nil {
-		log.Error("failed to decrypt peer pubkey")
+		log.Error("failed to decrypt peer pubkey: %v", err)
 		return err
 	}
 
@@ -526,7 +653,6 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 		peer.UpdateRecv(ppd.LocalInitTime, ppd.ConnData.RemoteAddr)
 	}
 
-	ppd.RemotePubKey = peerPk
 	if ppd.ConnPeerPublicKey != nil {
 		copy((*ppd.ConnPeerPublicKey)[:], peerPk)
 	}
@@ -541,6 +667,10 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 		err = ErrDeviceECDHObtainedPeerFailed
 		return err
 	}
+
+	// prepare key for aead
+	var key [SymmetricKeySize]byte
+	var aead cipher.AEAD
 
 	// generate gcm key and decrypt timestamp ChainKey2 -> ChainKey3
 	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ss[:])
@@ -670,7 +800,6 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 
 	// handle knock packet at overload before going into body decryption
 	if ppd.device.deviceType == NHP_SERVER && ppd.Overload && (ppd.HeaderType == NHP_KNK || ppd.HeaderType == DHP_KNK) {
-		ppd.generateCookie()
 		ppd.sendCookie()
 		return ErrServerRejectWithCookie
 	}
@@ -833,8 +962,58 @@ func (ppd *PacketParserData) generateCookie() {
 	}
 }
 
+const (
+	cookieMintFailureMissingCookieStore    = "missing_cookie_store"
+	cookieMintFailureMissingRemoteBinding  = "missing_remote_binding"
+	cookieMintFailureMarshalFailed         = "marshal_failed"
+	cookieMintFailureWrongPeerPubkeyLength = "wrong_peer_pubkey_length"
+)
+
 func (ppd *PacketParserData) sendCookie() {
-	cokStr := base64.StdEncoding.EncodeToString(ppd.ConnData.CookieStore.CurrCookie[:])
+	var cookie []byte
+	var statelessCookie [CookieSize]byte
+	statelessConfigured := false
+	if ppd.device != nil {
+		var keyBuf [SymmetricKeySize]byte
+		key, win := ppd.device.statelessCookieParamsInto(keyBuf[:])
+		if len(key) > 0 && win > 0 {
+			defer SetZero(key)
+			statelessConfigured = true
+			if len(ppd.RemotePubKey) != PublicKeySize {
+				log.Error("sendCookie: cannot mint stateless cookie with peer pubkey length %d", len(ppd.RemotePubKey))
+				ppd.device.recordCookieMintFailure(cookieMintFailureWrongPeerPubkeyLength)
+				return
+			}
+			// COK mint and RKN verify must derive the same remote key. A
+			// future relay that populates RealRemoteAddr must do it on both
+			// paths; one-sided population fails closed as a cookie mismatch.
+			remoteKey := cookieRemoteKey(ppd.ConnData)
+			if remoteKey == "" {
+				log.Error("sendCookie: cannot mint stateless cookie without a remote address binding")
+				ppd.device.recordCookieMintFailure(cookieMintFailureMissingRemoteBinding)
+				return
+			}
+			window := time.Now().Unix() / win
+			deriveStatelessCookieInto(&statelessCookie, key, remoteKey, ppd.RemotePubKey, window)
+			cookie = statelessCookie[:]
+		}
+	}
+	if len(cookie) == 0 {
+		if statelessConfigured {
+			return
+		}
+		if ppd.ConnData == nil || ppd.ConnData.CookieStore == nil {
+			log.Error("sendCookie: stateless cookies disabled and no connection CookieStore is available")
+			ppd.device.recordCookieMintFailure(cookieMintFailureMissingCookieStore)
+			return
+		}
+		if ppd.header != nil {
+			ppd.generateCookie()
+		}
+		cookie = ppd.ConnData.CookieStore.CurrCookie[:]
+	}
+
+	cokStr := base64.StdEncoding.EncodeToString(cookie)
 	cokMsg := &common.ServerCookieMsg{
 		// Native agents correlate COK by this payload TransactionId. The relay
 		// correlates by the cleartext wire counter, which PrevParserData below
@@ -845,6 +1024,7 @@ func (ppd *PacketParserData) sendCookie() {
 	cokBytes, err := json.Marshal(cokMsg)
 	if err != nil {
 		log.Error("sendCookie: failed to marshal cookie message: %v", err)
+		ppd.device.recordCookieMintFailure(cookieMintFailureMarshalFailed)
 		return
 	}
 
@@ -883,9 +1063,58 @@ func (ppd *PacketParserData) checkHeaderDigest(sumCookie bool) bool {
 	}()
 
 	prefixLen := ppd.header.Size() - HashSize
-	ppd.digestHash.Write(ppd.header.Bytes()[0:prefixLen])
 
 	if sumCookie {
+		if ppd.device != nil && ppd.device.statelessCookieParamsConfigured() {
+			peerPk, err := ppd.decryptInitiatorStaticPubKey()
+			if err != nil {
+				log.Debug("checkHeaderDigest(sumCookie): cannot recover peer static pubkey: %v", err)
+				return false
+			}
+
+			serverPubKey := ppd.deviceEcdh.PublicKey()
+			headerPrefix := ppd.header.Bytes()[0:prefixLen]
+			headerDigest := ppd.header.HeaderDigestBytes()
+			// COK mint and RKN verify must derive the same remote key. A
+			// future relay that populates RealRemoteAddr must do it on both
+			// paths; one-sided population fails closed as a cookie mismatch.
+			remoteKey := cookieRemoteKey(ppd.ConnData)
+			if remoteKey == "" {
+				log.Debug("checkHeaderDigest(sumCookie): missing remote address binding")
+				return false
+			}
+			var keyBuf [SymmetricKeySize]byte
+			key, win := ppd.device.statelessCookieParamsInto(keyBuf[:])
+			if len(key) == 0 || win <= 0 {
+				return false
+			}
+			defer SetZero(key)
+			h := ppd.digestHash
+			matched := false
+			currWindow := time.Now().Unix() / win
+			// Accept current and previous windows only. That absorbs a minter
+			// clock behind the verifier; minter-ahead skew fails closed so the
+			// replay window does not extend into the future.
+			var cookie [CookieSize]byte
+			for _, window := range [2]int64{currWindow, currWindow - 1} {
+				deriveStatelessCookieInto(&cookie, key, remoteKey, peerPk, window)
+				h.Reset()
+				h.Write(initialHashBytes)
+				h.Write(serverPubKey)
+				h.Write(headerPrefix)
+				h.Write(cookie[:])
+				if hmac.Equal(h.Sum(ppd.hashBuf[:0]), headerDigest) {
+					matched = true
+					break
+				}
+			}
+			return matched
+		}
+
+		if ppd.ConnData == nil || ppd.ConnData.CookieStore == nil {
+			return false
+		}
+		ppd.digestHash.Write(ppd.header.Bytes()[0:prefixLen])
 		ppd.ConnData.Lock()
 		defer ppd.ConnData.Unlock()
 
@@ -899,6 +1128,7 @@ func (ppd *PacketParserData) checkHeaderDigest(sumCookie bool) bool {
 		return hmac.Equal(ppd.digestHash.Sum(ppd.hashBuf[:0]), ppd.header.HeaderDigestBytes())
 	}
 
+	ppd.digestHash.Write(ppd.header.Bytes()[0:prefixLen])
 	return hmac.Equal(ppd.digestHash.Sum(ppd.hashBuf[:0]), ppd.header.HeaderDigestBytes())
 }
 

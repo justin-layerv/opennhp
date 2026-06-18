@@ -189,6 +189,17 @@ variable "dev_mode" {
   default     = false
 }
 
+variable "overload_cookie_time_window_seconds" {
+  description = "Rolling verification window for stateless NHP overload cookies. The server accepts the current and previous window, so cross-instance clocks must remain synchronized within this budget."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.overload_cookie_time_window_seconds > 0
+    error_message = "overload_cookie_time_window_seconds must be positive."
+  }
+}
+
 variable "resource_mode" {
   description = "Resource management mode: 'local' (config file) or 'api' (external auth service)"
   type        = string

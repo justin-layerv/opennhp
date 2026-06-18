@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +34,27 @@ var (
 	teeWatch         io.Closer
 	errLoadConfig    = errors.New("config load error")
 )
+
+func decodeCookieSigningKey(b64 string) ([]byte, error) {
+	if b64 == "" {
+		return nil, nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode failed: %w", err)
+	}
+	if len(raw) != core.SymmetricKeySize {
+		return nil, fmt.Errorf("cookie signing key must decode to %d bytes, got %d", core.SymmetricKeySize, len(raw))
+	}
+	return raw, nil
+}
+
+func effectiveCookieTimeWindow(seconds int) int {
+	if seconds <= 0 {
+		return DefaultCookieTimeWindowSeconds
+	}
+	return seconds
+}
 
 // ACRegistryPrefix is the etcd prefix for AC registration entries
 const ACRegistryPrefix = "/nhp/ac-registry/"
@@ -108,6 +130,18 @@ type Config struct {
 	//     deploy_relay gate is the structural control instead.
 	// See docs/design/NHP_RELAY_TOPOLOGY.md + endpoints/server/relay.go.
 	DisableRelayValidation bool `json:"disableRelayValidation"`
+
+	// CookieSigningKeyBase64 is a base64-encoded 32-byte key used to derive
+	// overload cookies statelessly. Clusters must configure the same key on
+	// every server so a cookie minted by one instance verifies on another.
+	// Empty means generate a random process-local key at startup, which is fine
+	// only for single-instance deployments.
+	CookieSigningKeyBase64 string `json:"cookieSigningKey"`
+
+	// CookieTimeWindowSeconds is the rolling derivation window for stateless
+	// overload cookies. The verifier accepts the current and previous windows.
+	// Non-positive values default to DefaultCookieTimeWindowSeconds.
+	CookieTimeWindowSeconds int `json:"cookieTimeWindowSeconds"`
 
 	WebRTC WebRTCConfig `toml:"webrtc"`
 
@@ -683,6 +717,8 @@ func (s *UdpServer) updateBaseConfig(conf Config) (err error) {
 		s.config.DefaultCipherScheme = conf.DefaultCipherScheme
 	}
 
+	s.reconcileCookieParams(conf)
+
 	// handle WebRTC configuration change
 	if conf.WebRTC.Enable && s.webrtcServer == nil {
 		s.webrtcServer = NewWebRTCServer(s, &conf.WebRTC)
@@ -697,6 +733,86 @@ func (s *UdpServer) updateBaseConfig(conf Config) (err error) {
 	s.config.WebRTC = conf.WebRTC
 
 	return nil
+}
+
+func (s *UdpServer) reconcileCookieParams(conf Config) {
+	keyChanged := s.config.CookieSigningKeyBase64 != conf.CookieSigningKeyBase64
+	windowChanged := s.config.CookieTimeWindowSeconds != conf.CookieTimeWindowSeconds
+	if !keyChanged && !windowChanged {
+		return
+	}
+
+	// Reload state table:
+	//   - valid non-empty key: install it, cache it, clear cleared-key warning.
+	//   - malformed key: keep running key, update only the window, warn each reload.
+	//   - cleared key + same window: warn once, keep live key and last-good cached key.
+	//   - cleared key + new window: copy the live key only to update the device window.
+	newWindow := effectiveCookieTimeWindow(conf.CookieTimeWindowSeconds)
+	newKey, keyErr := decodeCookieSigningKey(conf.CookieSigningKeyBase64)
+	if keyErr != nil {
+		s.keepRunningCookieKeyAfterInvalidReload(keyErr, windowChanged, newWindow)
+	} else {
+		s.applyCookieSigningKeyReload(conf.CookieSigningKeyBase64, newKey, keyChanged, windowChanged, newWindow)
+	}
+
+	// Cache the operator's raw TOML value for future reload comparisons. The
+	// device stores the effective defaulted window used at runtime.
+	s.config.CookieTimeWindowSeconds = conf.CookieTimeWindowSeconds
+}
+
+func (s *UdpServer) keepRunningCookieKeyAfterInvalidReload(keyErr error, windowChanged bool, newWindow int) {
+	log.Warning("ignoring CookieSigningKeyBase64 change: %v (keeping running key)", keyErr)
+	// Malformed key warnings intentionally remain per-reload: they indicate an
+	// operator-supplied secret that still needs correction.
+	s.cookieSigningKeyClearedWarned = false
+	if !windowChanged || s.device == nil {
+		return
+	}
+
+	currKey, _ := s.device.StatelessCookieParams()
+	defer core.SetZero(currKey)
+	s.device.SetStatelessCookieParams(currKey, newWindow)
+	log.Info("stateless cookie window updated (window=%ds, keyConfigured=%v)", newWindow, s.config.CookieSigningKeyBase64 != "")
+}
+
+func (s *UdpServer) applyCookieSigningKeyReload(confKey string, newKey []byte, keyChanged bool, windowChanged bool, newWindow int) {
+	deviceKey := newKey
+	defer core.SetZero(deviceKey)
+
+	if s.device != nil {
+		skipDeviceUpdate := false
+		if len(deviceKey) == 0 {
+			if keyChanged {
+				if !s.cookieSigningKeyClearedWarned {
+					log.Warning("CookieSigningKeyBase64 cleared on reload; keeping previous key in memory")
+				}
+				s.cookieSigningKeyClearedWarned = true
+			}
+			if !windowChanged {
+				skipDeviceUpdate = true
+			} else {
+				currKey, currWindow := s.device.StatelessCookieParams()
+				deviceKey = currKey
+				// The earlier defer captured newKey's slice header before this
+				// reassignment; this defer covers the live-key copy.
+				defer core.SetZero(currKey)
+				skipDeviceUpdate = currWindow == int64(newWindow)
+			}
+		} else {
+			s.cookieSigningKeyClearedWarned = false
+			s.overloadCookieProcessLocalKey.Store(false)
+		}
+
+		if skipDeviceUpdate {
+			log.Debug("stateless cookie params unchanged after cleared-key reload")
+		} else {
+			s.device.SetStatelessCookieParams(deviceKey, newWindow)
+			log.Info("stateless cookie params updated (window=%ds, keyConfigured=%v)", newWindow, confKey != "")
+		}
+	}
+	if confKey != "" {
+		s.config.CookieSigningKeyBase64 = confKey
+	}
 }
 
 // applyHttpTimeoutDefaults floors any zero-or-too-small timeout in conf to

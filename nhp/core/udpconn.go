@@ -39,9 +39,14 @@ type ConnectionData struct {
 	channelSendWg sync.WaitGroup
 
 	// common
-	Device           *Device
-	LocalAddr        *net.UDPAddr
-	RemoteAddr       *net.UDPAddr
+	Device     *Device
+	LocalAddr  *net.UDPAddr
+	RemoteAddr *net.UDPAddr
+	// RealRemoteAddr is reserved for relay implementations that keep RemoteAddr
+	// as the relay transport peer and carry the original client separately.
+	// LayerV's current relay handler stamps the client IP into RemoteAddr, so
+	// this is a forward-compatible fallback rather than the live production path.
+	RealRemoteAddr   *net.UDPAddr
 	CookieStore      *CookieStore
 	SendQueue        chan *Packet
 	RecvQueue        chan *Packet

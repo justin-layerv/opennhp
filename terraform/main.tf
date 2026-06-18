@@ -623,8 +623,9 @@ module "compute" {
   # CloudFront trusted proxy CIDRs (for correct client IP extraction from X-Forwarded-For)
   cloudfront_cidrs_ssm_parameter = var.deploy_qurl_link && var.enable_resolve_cloudfront ? aws_ssm_parameter.cloudfront_cidrs[0].name : null
 
-  knock_headertype_verify_require = var.nhp_knock_headertype_verify_require
-  internal_auth_require           = var.nhp_internal_auth_require
+  knock_headertype_verify_require     = var.nhp_knock_headertype_verify_require
+  internal_auth_require               = var.nhp_internal_auth_require
+  overload_cookie_time_window_seconds = var.nhp_overload_cookie_time_window_seconds
 
   # Knock-port DoS hardening (#1159)
   knock_global_rate_limit_pps   = var.nhp_knock_global_rate_limit_pps

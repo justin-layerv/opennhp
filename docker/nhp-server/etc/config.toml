@@ -8,6 +8,8 @@
 # Hostname (-): server domain name.
 # LogLevel: 0: silent, 1: error, 2: info, 3: audit, 4: debug, 5: trace.
 # DisableAgentValidation: whether for the server to skip the agent's public key validation.
+# CookieSigningKeyBase64: optional base64 32-byte overload-cookie signing key. Empty = random process-local key for single-instance only.
+# CookieTimeWindowSeconds: overload-cookie rolling verification window in seconds.
 PrivateKeyBase64 = "I9UzYO3skKYmDykz9DRBbV+cEebSw/L5yIvzHI4jz+o="
 DefaultCipherScheme = 0
 ListenIp = "0.0.0.0"    # empty for ipv4 + ipv6, "0.0.0.0" for ipv4 only
@@ -15,4 +17,5 @@ ListenPort = 62206
 Hostname = "localhost:62206" # the hostname of NHP-Server
 LogLevel = 5
 DisableAgentValidation = false
-
+CookieSigningKeyBase64 = ""
+CookieTimeWindowSeconds = 60

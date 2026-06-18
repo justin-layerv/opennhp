@@ -206,6 +206,65 @@ verified, not reinvented:
   trust root that replaces the pre-cutover qurl-service caller-asserted
   `HttpKnockRequest.SrcIp` vector tracked in #1210.
 
+Overload-cookie verification is deliberately state-light, not cost-free: once
+stateless cookie params are configured, every `NHP_RKN` must decrypt the
+initiator static field once so the stateless cookie can bind to the agent public
+key before the normal peer-validation chain continues. This load-independent
+check is the fix for cross-replica overload retry: a cooler server must accept
+the `COK` that a hotter sibling minted. The cookie input is framed as a domain
+tag plus length-prefixed client source key, length-prefixed agent public key,
+and rolling window index. That keeps `COK` usable across server replicas, but it
+also means any forged `RKN` can force the server through one ECDH+AEAD attempt
+before the cookie HMAC fails. Relay and network rate limits are therefore
+load-bearing controls for this path, not optional hardening:
+`terraform/modules/relay/alb.tf` declares the WAF per-source-IP rate limit on
+`/relay/*` (default 300 requests per 5-minute window), and
+`endpoints/relay/relay.go` sheds at `maxInFlightPerServer=256` when a target
+cell is already backed up. Malformed `RKN` floods must be throttled there before
+they can force repeated server-side ECDH work. We accept that extra decrypt
+because binding the cookie to the agent static key prevents an IP+window-only
+cookie from becoming reusable by every client behind the same NAT or proxy
+during overload. Without the peer-public-key input, one client behind a shared
+egress IP could redeem a `COK` minted for another client before the responder
+reaches Noise peer authentication. Keeping the peer binding makes the cookie a
+return-routability plus same-agent challenge; the tradeoff is that the responder
+must decrypt the initiator static key before it can verify the cookie HMAC.
+
+The cookie is a cost/liveness challenge, not an anti-replay token. It
+deliberately does not bind the transaction counter or ephemeral key; `RKN`
+freshness still comes from the Noise timestamp check. The #1457
+cross-connection replay cache is scoped to `NHP_ART`, not `NHP_RKN`, so a
+captured `RKN` can be accepted by a fresh replica while both the cookie window
+and the normal timestamp staleness floor remain valid. That is intentional for
+this overload challenge: the cookie sheds unauthenticated cost, then the normal
+static-peer validation and token issuance path still decide whether the request
+is allowed. Rollout threat-model sign-off must explicitly accept this bounded
+`RKN` replay behavior alongside the pre-cookie static decrypt tradeoff.
+
+Cross-replica verification also has three operational dependencies. First,
+every server in the fleet must share the same static server private key and the
+same `CookieSigningKeyBase64`: the cookie is portable, but the `RKN` header
+digest and inner Noise decrypt still target `ppd.deviceEcdh.PublicKey()`. An
+empty cookie-signing key generates a random process-local fallback that is
+acceptable only for single-instance deployments and will fail cross-instance
+`RKN` verification when a load balancer splits `COK` mint and `RKN` verify.
+Second, fleet clocks
+must be NTP-synced with margin for the configured window (default 60s): the
+verifier accepts current and previous windows only, so a minter-ahead clock near
+a boundary fails closed rather than extending future replay. Third, the relay
+must derive the same authenticated client source IP for both `KNK` mint and
+`RKN` verify. Today it stamps that value into `ConnectionData.RemoteAddr`;
+`RealRemoteAddr` is a forward-compatible field for a future relay shape. If
+browser/js-agent egress IP changes between `COK` mint and `RKN` verify, or if a
+future relay NATs or derives those addresses inconsistently, stateless cookies
+fail closed.
+During the transition before the `nhp-server` UDP listener is private, direct
+UDP/62206 traffic does not pass through relay WAF; that path is bounded by the
+#1159 kernel guards in `terraform/modules/compute/user_data.sh.tpl`: a 100
+pps-per-source hashlimit plus the default 5000 pps per-instance global cap
+sized below measured ECDH throughput. Those rules match all UDP traffic on port
+62206, so the cap applies to both `KNK` and `RKN` packets before protocol parse.
+
 The win is real but specific: the *blast radius* of an edge compromise shrinks
 from "policy + signing authority" to "packet forwarder," and the hardened
 surface is a small, single-purpose service instead of the full server.

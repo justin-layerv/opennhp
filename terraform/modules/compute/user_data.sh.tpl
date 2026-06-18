@@ -247,6 +247,50 @@ HOSTNAME=$(echo "$SECRET" | jq -er ".hostname") || {
 unset SECRET
 set -x
 
+echo "Fetching overload-cookie signing key from Secrets Manager..."
+set +x
+COOKIE_SIGNING_KEY_SECRET=$(aws secretsmanager get-secret-value \
+  --secret-id "${overload_cookie_secret_arn}" \
+  --region "$REGION" \
+  --query SecretString --output text) || {
+    set -x
+    echo "FATAL: Could not fetch overload-cookie signing key from Secrets Manager"
+    exit 1
+}
+COOKIE_SIGNING_KEY_B64=$(COOKIE_SIGNING_KEY_SECRET="$COOKIE_SIGNING_KEY_SECRET" python3 - <<'PY'
+import base64
+import os
+import sys
+
+secret = os.environ["COOKIE_SIGNING_KEY_SECRET"]
+try:
+    decoded = base64.b64decode(secret, validate=True)
+except Exception:
+    decoded = None
+
+# Prefer the seeded base64 form when it decodes to exactly 32 bytes. Legacy
+# raw 32-character strings are accepted only when they are not valid 32-byte
+# base64 secrets.
+if decoded is not None and len(decoded) == 32:
+    print(secret)
+elif len(secret.encode("utf-8")) == 32:
+    print(base64.b64encode(secret.encode("utf-8")).decode("ascii"))
+else:
+    print(
+        "FATAL: overload-cookie signing key secret must be base64-encoded 32 bytes "
+        f"or a legacy 32-byte string (got {len(secret)} chars)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+) || {
+  set -x
+  echo "FATAL: invalid overload-cookie signing key in Secrets Manager"
+  exit 1
+}
+unset COOKIE_SIGNING_KEY_SECRET
+set -x
+
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 
 # Fail fast at each IMDS stage with a precise diagnostic so the operator
@@ -285,7 +329,8 @@ mkdir -p /opt/layerv/nhp-server/log
 # `>` does not reset mode. Closes #1389.
 touch /opt/layerv/nhp-server/etc/config.toml
 chmod 600 /opt/layerv/nhp-server/etc/config.toml
-cat > /opt/layerv/nhp-server/etc/config.toml << CONFIGEOF
+set +x
+if ! cat > /opt/layerv/nhp-server/etc/config.toml << CONFIGEOF
 PrivateKeyBase64 = "$PRIVATE_KEY"
 DefaultCipherScheme = 0
 ListenIp = ""
@@ -294,6 +339,8 @@ Hostname = "$HOSTNAME"
 LogLevel = ${log_level}
 DisableAgentValidation = false
 DisableRelayValidation = ${relay_enabled}
+CookieSigningKeyBase64 = "$COOKIE_SIGNING_KEY_B64"
+CookieTimeWindowSeconds = ${overload_cookie_time_window_seconds}
 %{ if dev_mode }
 Dev = true
 %{ endif }
@@ -313,6 +360,12 @@ AesKey = "${auth_aes_key}"
 [webrtc]
 Enable = false
 CONFIGEOF
+then
+  set -x
+  echo "FATAL: Could not write nhp-server config.toml"
+  exit 1
+fi
+set -x
 # Scrub $PRIVATE_KEY: prevents any future edit (e.g. `<<<` here-string or
 # `--key "$PRIVATE_KEY"` invocation, neither of which are heredoc-trace-safe)
 # from silently reintroducing the xtrace-leak class this PR closes.
@@ -320,7 +373,7 @@ CONFIGEOF
 # sensitive and has no consumer past this heredoc — left alone (an `unset`
 # here would not restore bash's auto-populated built-in, just leave it
 # empty for any subsequent read).
-unset PRIVATE_KEY
+unset PRIVATE_KEY COOKIE_SIGNING_KEY_B64
 
 # ============================================================================
 # relay.toml — NHP_RELAY peer registration (#2208 5c). When a relay is deployed
@@ -1219,6 +1272,8 @@ echo "Configured UDP receive-buffer ceiling: requested ${udp_recv_buffer_bytes},
 # Kernel-level rate limiting to mitigate UDP flood DoS attacks before packets
 # reach the application. This is the first line of defense; the Go server
 # has additional per-source-IP application-level rate limiting as defense-in-depth.
+# These rules are packet-type agnostic: every UDP packet to 62206 is capped,
+# including both initial KNK and follow-up RKN packets.
 #
 # Layered limits, evaluated top-down (first match wins):
 # 1. Global cap: drop all UDP knock packets above ${knock_global_rate_limit_pps}

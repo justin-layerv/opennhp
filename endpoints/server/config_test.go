@@ -1,15 +1,40 @@
 package server
 
 import (
+	"bytes"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
+
+func newServerForCookieReloadTest(t *testing.T, initialKey []byte, initialKeyBase64 string) (*UdpServer, *core.Device) {
+	t.Helper()
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	dev := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if dev == nil {
+		t.Fatal("core.NewDevice returned nil")
+	}
+	t.Cleanup(dev.Stop)
+	dev.SetStatelessCookieParams(initialKey, DefaultCookieTimeWindowSeconds)
+
+	return &UdpServer{
+		log:    logger,
+		device: dev,
+		config: &Config{
+			CookieSigningKeyBase64:  initialKeyBase64,
+			CookieTimeWindowSeconds: DefaultCookieTimeWindowSeconds,
+		},
+	}, dev
+}
 
 func TestParseACRegistryEntry(t *testing.T) {
 	tests := []struct {
@@ -71,6 +96,258 @@ func TestACRegistryPrefix(t *testing.T) {
 	if ACRegistryPrefix != "/nhp/ac-registry/" {
 		t.Errorf("ACRegistryPrefix = %q, want %q", ACRegistryPrefix, "/nhp/ac-registry/")
 	}
+}
+
+func TestDecodeCookieSigningKey(t *testing.T) {
+	key := bytes.Repeat([]byte{0x42}, core.SymmetricKeySize)
+	got, err := decodeCookieSigningKey(base64.StdEncoding.EncodeToString(key))
+	if err != nil {
+		t.Fatalf("decodeCookieSigningKey: %v", err)
+	}
+	if !bytes.Equal(got, key) {
+		t.Fatalf("decoded key = %x, want %x", got, key)
+	}
+
+	if _, err := decodeCookieSigningKey("not-valid-base64!!!"); err == nil {
+		t.Fatal("malformed base64 was accepted")
+	}
+	short := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x01}, core.SymmetricKeySize-1))
+	if _, err := decodeCookieSigningKey(short); err == nil {
+		t.Fatal("wrong-length key was accepted")
+	}
+}
+
+func TestUpdateBaseConfigCookieClearedKeyPreservesRunningKey(t *testing.T) {
+	key := bytes.Repeat([]byte{0x11}, core.SymmetricKeySize)
+	keyBase64 := base64.StdEncoding.EncodeToString(key)
+	s, dev := newServerForCookieReloadTest(t, key, keyBase64)
+
+	if err := s.updateBaseConfig(Config{CookieSigningKeyBase64: "", CookieTimeWindowSeconds: DefaultCookieTimeWindowSeconds}); err != nil {
+		t.Fatalf("updateBaseConfig: %v", err)
+	}
+	devKey, _ := dev.StatelessCookieParams()
+	if !bytes.Equal(devKey, key) {
+		t.Fatalf("cleared reload changed running key: got %x want %x", devKey, key)
+	}
+	if s.config.CookieSigningKeyBase64 != keyBase64 {
+		t.Fatalf("cleared reload poisoned cached key: got %q want %q", s.config.CookieSigningKeyBase64, keyBase64)
+	}
+	if !s.cookieSigningKeyClearedWarned {
+		t.Fatal("cleared reload did not record warning suppression")
+	}
+
+	if err := s.updateBaseConfig(Config{CookieSigningKeyBase64: "", CookieTimeWindowSeconds: DefaultCookieTimeWindowSeconds}); err != nil {
+		t.Fatalf("second updateBaseConfig: %v", err)
+	}
+	if !s.cookieSigningKeyClearedWarned {
+		t.Fatal("second cleared reload lost warning suppression")
+	}
+}
+
+func TestUpdateBaseConfigCookieMalformedKeyPreservesRunningKey(t *testing.T) {
+	key := bytes.Repeat([]byte{0x11}, core.SymmetricKeySize)
+	keyBase64 := base64.StdEncoding.EncodeToString(key)
+	s, dev := newServerForCookieReloadTest(t, key, keyBase64)
+	s.cookieSigningKeyClearedWarned = true
+
+	if err := s.updateBaseConfig(Config{CookieSigningKeyBase64: "not-valid-base64!!!", CookieTimeWindowSeconds: DefaultCookieTimeWindowSeconds}); err != nil {
+		t.Fatalf("updateBaseConfig: %v", err)
+	}
+	devKey, _ := dev.StatelessCookieParams()
+	if !bytes.Equal(devKey, key) {
+		t.Fatalf("malformed reload changed running key: got %x want %x", devKey, key)
+	}
+	if s.config.CookieSigningKeyBase64 != keyBase64 {
+		t.Fatalf("malformed reload poisoned cached key: got %q want %q", s.config.CookieSigningKeyBase64, keyBase64)
+	}
+	if s.cookieSigningKeyClearedWarned {
+		t.Fatal("malformed non-empty key should reset cleared-key warning suppression")
+	}
+}
+
+func TestUpdateBaseConfigCookieMalformedKeyStillAppliesWindow(t *testing.T) {
+	key := bytes.Repeat([]byte{0x11}, core.SymmetricKeySize)
+	keyBase64 := base64.StdEncoding.EncodeToString(key)
+	s, dev := newServerForCookieReloadTest(t, key, keyBase64)
+
+	const newWindow = DefaultCookieTimeWindowSeconds + 15
+	if err := s.updateBaseConfig(Config{CookieSigningKeyBase64: "not-valid-base64!!!", CookieTimeWindowSeconds: newWindow}); err != nil {
+		t.Fatalf("updateBaseConfig: %v", err)
+	}
+	devKey, devWin := dev.StatelessCookieParams()
+	if !bytes.Equal(devKey, key) {
+		t.Fatalf("malformed reload changed running key: got %x want %x", devKey, key)
+	}
+	if devWin != int64(newWindow) {
+		t.Fatalf("malformed reload did not apply valid window: got %d want %d", devWin, newWindow)
+	}
+	if s.config.CookieSigningKeyBase64 != keyBase64 {
+		t.Fatalf("malformed reload poisoned cached key: got %q want %q", s.config.CookieSigningKeyBase64, keyBase64)
+	}
+	if s.config.CookieTimeWindowSeconds != newWindow {
+		t.Fatalf("cached window = %d, want %d", s.config.CookieTimeWindowSeconds, newWindow)
+	}
+}
+
+func TestUpdateBaseConfigCookieWindowOnlyPreservesRandomKey(t *testing.T) {
+	randomKey := bytes.Repeat([]byte{0xAB}, core.SymmetricKeySize)
+	s, dev := newServerForCookieReloadTest(t, randomKey, "")
+
+	const newWindow = DefaultCookieTimeWindowSeconds + 30
+	if err := s.updateBaseConfig(Config{CookieSigningKeyBase64: "", CookieTimeWindowSeconds: newWindow}); err != nil {
+		t.Fatalf("updateBaseConfig: %v", err)
+	}
+	devKey, devWin := dev.StatelessCookieParams()
+	if !bytes.Equal(devKey, randomKey) {
+		t.Fatalf("window-only reload changed random key: got %x want %x", devKey, randomKey)
+	}
+	if devWin != int64(newWindow) {
+		t.Fatalf("device window = %d, want %d", devWin, newWindow)
+	}
+	if s.config.CookieSigningKeyBase64 != "" {
+		t.Fatalf("empty configured key should stay empty in cached config, got %q", s.config.CookieSigningKeyBase64)
+	}
+	if s.cookieSigningKeyClearedWarned {
+		t.Fatal("window-only random-key reload should not mark a configured key as cleared")
+	}
+}
+
+func TestConfigureStatelessCookieParamsEmitsMetricForProcessLocalFallback(t *testing.T) {
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	dev := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if dev == nil {
+		t.Fatal("core.NewDevice returned nil")
+	}
+	t.Cleanup(dev.Stop)
+
+	pub := metrics.NewPublisherForTest(t)
+	s := &UdpServer{
+		log:     logger,
+		device:  dev,
+		config:  &Config{},
+		metrics: pub,
+	}
+
+	if err := s.configureStatelessCookieParams(); err != nil {
+		t.Fatalf("configureStatelessCookieParams: %v", err)
+	}
+
+	devKey, win := dev.StatelessCookieParams()
+	defer core.SetZero(devKey)
+	if len(devKey) != core.SymmetricKeySize {
+		t.Fatalf("device key length = %d, want %d", len(devKey), core.SymmetricKeySize)
+	}
+	if win != DefaultCookieTimeWindowSeconds {
+		t.Fatalf("cookie window = %d, want %d", win, DefaultCookieTimeWindowSeconds)
+	}
+	gauges := pub.GaugesForTest(t)
+	if got := gauges[MetricOverloadCookieProcessLocalKey]; got != 1 {
+		t.Fatalf("%s = %v, want 1", MetricOverloadCookieProcessLocalKey, got)
+	}
+}
+
+func TestConfigureStatelessCookieParamsConfiguredKeyDoesNotEmitFallbackMetric(t *testing.T) {
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	dev := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if dev == nil {
+		t.Fatal("core.NewDevice returned nil")
+	}
+	t.Cleanup(dev.Stop)
+
+	key := bytes.Repeat([]byte{0x42}, core.SymmetricKeySize)
+	pub := metrics.NewPublisherForTest(t)
+	s := &UdpServer{
+		log:    logger,
+		device: dev,
+		config: &Config{
+			CookieSigningKeyBase64:  base64.StdEncoding.EncodeToString(key),
+			CookieTimeWindowSeconds: DefaultCookieTimeWindowSeconds + 7,
+		},
+		metrics: pub,
+	}
+
+	if err := s.configureStatelessCookieParams(); err != nil {
+		t.Fatalf("configureStatelessCookieParams: %v", err)
+	}
+
+	devKey, win := dev.StatelessCookieParams()
+	defer core.SetZero(devKey)
+	if !bytes.Equal(devKey, key) {
+		t.Fatalf("device key = %x, want %x", devKey, key)
+	}
+	if win != DefaultCookieTimeWindowSeconds+7 {
+		t.Fatalf("cookie window = %d, want %d", win, DefaultCookieTimeWindowSeconds+7)
+	}
+	gauges := pub.GaugesForTest(t)
+	if got := gauges[MetricOverloadCookieProcessLocalKey]; got != 0 {
+		t.Fatalf("%s = %v, want 0", MetricOverloadCookieProcessLocalKey, got)
+	}
+}
+
+func TestOverloadCookieProcessLocalGaugeClearsAfterSharedKeyReload(t *testing.T) {
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	dev := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if dev == nil {
+		t.Fatal("core.NewDevice returned nil")
+	}
+	t.Cleanup(dev.Stop)
+
+	pub := metrics.NewPublisherForTest(t)
+	s := &UdpServer{
+		log:     logger,
+		device:  dev,
+		config:  &Config{},
+		metrics: pub,
+	}
+
+	if err := s.configureStatelessCookieParams(); err != nil {
+		t.Fatalf("configureStatelessCookieParams: %v", err)
+	}
+	if got := pub.GaugesForTest(t)[MetricOverloadCookieProcessLocalKey]; got != 1 {
+		t.Fatalf("startup %s = %v, want 1", MetricOverloadCookieProcessLocalKey, got)
+	}
+
+	sharedKey := bytes.Repeat([]byte{0x24}, core.SymmetricKeySize)
+	if err := s.updateBaseConfig(Config{
+		CookieSigningKeyBase64:  base64.StdEncoding.EncodeToString(sharedKey),
+		CookieTimeWindowSeconds: DefaultCookieTimeWindowSeconds,
+	}); err != nil {
+		t.Fatalf("updateBaseConfig: %v", err)
+	}
+	if got := pub.GaugesForTest(t)[MetricOverloadCookieProcessLocalKey]; got != 0 {
+		t.Fatalf("after shared-key reload %s = %v, want 0", MetricOverloadCookieProcessLocalKey, got)
+	}
+}
+
+func TestRecordOverloadCookieMintFailureEmitsReasonMetric(t *testing.T) {
+	pub := metrics.NewPublisherForTest(t)
+	s := &UdpServer{metrics: pub}
+
+	s.recordOverloadCookieMintFailure("missing_remote_binding")
+
+	counters, dimCounters := pub.CountersForTest(t)
+	if got := counters[MetricOverloadCookieMintFailure]; got != 1 {
+		t.Fatalf("%s base counter = %v, want 1", MetricOverloadCookieMintFailure, got)
+	}
+	for key, value := range dimCounters {
+		if strings.Contains(key, MetricOverloadCookieMintFailure) &&
+			strings.Contains(key, "Reason=missing_remote_binding") &&
+			value == 1 {
+			return
+		}
+	}
+	t.Fatalf("did not find %s counter with Reason=missing_remote_binding in %v", MetricOverloadCookieMintFailure, dimCounters)
+}
+
+func TestRecordOverloadCookieMintFailureNilMetricsIsNoop(t *testing.T) {
+	s := &UdpServer{}
+	s.recordOverloadCookieMintFailure("missing_remote_binding")
 }
 
 // TestUpdateBaseConfig_DoesNotHotReloadACPeerGracePeriodSeconds fences

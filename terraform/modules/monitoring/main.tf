@@ -766,6 +766,73 @@ resource "aws_cloudwatch_metric_alarm" "auth_failures" {
   })
 }
 
+# Overload-cookie shared-key drift. The nhp-server publisher reports this as a
+# persistent gauge with the exact base dim set {Environment, Cell}: 1 means an
+# instance booted with a random per-process overload-cookie signing key, 0 means
+# CookieSigningKeyBase64 was configured. Any non-zero value in a load-balanced
+# cell breaks cross-instance COK->RKN verification during overload (#2611), so
+# alert on the first breaching window. treat_missing_data stays notBreaching so
+# brand-new envs and metric-publisher outages are handled by the existing
+# publisher/heartbeat alarms rather than this sparse state signal.
+resource "aws_cloudwatch_metric_alarm" "overload_cookie_process_local_key" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-overload-cookie-process-local-key"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "OverloadCookieProcessLocalKey"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 1
+  alarm_description   = "nhp-server is running with a random per-process overload-cookie signing key. Multi-instance COK->RKN verification requires CookieSigningKeyBase64 to be configured consistently across the cell. #2611."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Overload-cookie mint failures. Core fails closed when it cannot enqueue a
+# usable COK after deciding to reject-with-cookie, so any base-counter event
+# means at least one client was told to retry without receiving a cookie it can
+# satisfy. The Go publisher also emits a Reason-dimensioned breakdown for
+# attribution; this alarm intentionally keys on the base {Environment, Cell}
+# stream so it does not miss sparse or newly-added reason values.
+resource "aws_cloudwatch_metric_alarm" "overload_cookie_mint_failure" {
+  alarm_name = "${var.name_prefix}-${var.cell_id}-overload-cookie-mint-failure"
+  # Match the sparse-counter shape used by knock_forward_path: any non-zero
+  # 5-minute bucket in the trailing hour pages, while missing data is normal.
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 12
+  datapoints_to_alarm = 1
+  metric_name         = "OverloadCookieMintFailure"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "nhp-server failed to mint or marshal an overload COK after returning ErrServerRejectWithCookie, so affected agents cannot complete the retry. Inspect the Reason dimension for missing_remote_binding, wrong_peer_pubkey_length, missing_cookie_store, or marshal_failed. #2611."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
 # Knock Latency p99
 resource "aws_cloudwatch_metric_alarm" "high_latency" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-high-latency"

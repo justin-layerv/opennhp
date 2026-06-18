@@ -340,6 +340,36 @@ resource "terraform_data" "cookie_secret_seed" {
   }
 }
 
+# Signing key for NHP overload cookies (KNK -> COK -> RKN). Kept separate
+# from HTTP session-cookie keys so the UDP/browser-agent protocol does not
+# share HMAC material with the web session layer. The value is read at boot and
+# written into config.toml as CookieSigningKeyBase64.
+resource "aws_secretsmanager_secret" "overload_cookie_secret" {
+  name                    = "${var.name_prefix}-overload-cookie-secret"
+  description             = "NHP overload-cookie signing key shared across server instances"
+  recovery_window_in_days = local.is_prod ? 30 : 0
+  kms_key_id              = var.secrets_kms_key_arn
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-overload-cookie-secret"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+resource "terraform_data" "overload_cookie_secret_seed" {
+  triggers_replace = [aws_secretsmanager_secret.overload_cookie_secret.arn]
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+			set -euo pipefail
+			COOKIE_KEY=$(openssl rand -base64 32)
+			aws secretsmanager put-secret-value --secret-id "${aws_secretsmanager_secret.overload_cookie_secret.id}" --secret-string "$COOKIE_KEY"
+		EOT
+  }
+}
+
 # CloudWatch Log Group for servers
 resource "aws_cloudwatch_log_group" "server" {
   name              = "/layerv/nhp/${var.environment}/${var.cell_id}/server"
@@ -550,6 +580,7 @@ resource "aws_iam_role_policy" "server" {
         Resource = compact(concat(
           [aws_secretsmanager_secret.server.arn],
           [aws_secretsmanager_secret.cookie_secret.arn],
+          [aws_secretsmanager_secret.overload_cookie_secret.arn],
           [var.etcd_secret_arn],
           [var.etcd_tls_secret_arn],
           [var.qurl_service_token_secret_arn],
@@ -805,7 +836,9 @@ locals {
     # Blue/Green deployment configuration
     enable_blue_green = var.enable_blue_green
     # Cookie signing secret (shared across all instances)
-    cookie_secret_arn = aws_secretsmanager_secret.cookie_secret.arn
+    cookie_secret_arn                   = aws_secretsmanager_secret.cookie_secret.arn
+    overload_cookie_secret_arn          = aws_secretsmanager_secret.overload_cookie_secret.arn
+    overload_cookie_time_window_seconds = var.overload_cookie_time_window_seconds
     # Shared HMAC secret for /nhp/internal/knock verification (matches qurl-service signer)
     nhp_internal_auth_secret_arn = var.nhp_internal_auth_secret_arn
     # CORS allowed origins for NHP HTTP server
@@ -1071,6 +1104,8 @@ resource "aws_launch_template" "server" {
   # is no longer an attribute reference for TF to infer this from.)
   depends_on = [
     aws_lambda_invocation.keygen,
+    terraform_data.cookie_secret_seed,
+    terraform_data.overload_cookie_secret_seed,
     aws_iam_role_policy_attachment.server_plugins,
     time_sleep.dynamodb_read_iam_propagation,
     aws_s3_object.server_init_script,

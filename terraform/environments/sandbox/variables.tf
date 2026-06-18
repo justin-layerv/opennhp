@@ -215,6 +215,17 @@ variable "nhp_internal_auth_require" {
   default     = false
 }
 
+variable "nhp_overload_cookie_time_window_seconds" {
+  description = "Wrapper passthrough for the root nhp_overload_cookie_time_window_seconds. Default 60s; tune only with NTP/clock-skew evidence."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.nhp_overload_cookie_time_window_seconds > 0
+    error_message = "nhp_overload_cookie_time_window_seconds must be positive."
+  }
+}
+
 variable "nhp_knock_global_rate_limit_pps" {
   description = "Wrapper passthrough for the root nhp_knock_global_rate_limit_pps (#1159). Aggregate UDP knock pps cap."
   type        = number

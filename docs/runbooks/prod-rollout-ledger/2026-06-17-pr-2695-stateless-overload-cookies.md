@@ -1,0 +1,23 @@
+# 2026-06-17 · PR #2695 · Stateless overload cookies
+
+- **Owner:** prod rollout coordinator
+- **Source:** https://github.com/layervai/nhp/pull/2695, https://github.com/layervai/nhp/issues/2611
+
+Deploy the shared overload-cookie signing key before relying on relay-backed
+overload re-knock flows across a multi-instance server fleet.
+
+- [ ] Pre-rollout: confirm Terraform plan creates or preserves the `${name_prefix}-overload-cookie-secret` Secrets Manager secret and grants the server instance role `secretsmanager:GetSecretValue`.
+- [ ] Pre-rollout: confirm Terraform plan creates the `${name_prefix}-${cell_id}-overload-cookie-process-local-key` CloudWatch alarm on `LayerV/NHP::OverloadCookieProcessLocalKey` with `{Environment, Cell}` dimensions and SNS actions wired.
+- [ ] Pre-rollout: confirm Terraform plan creates the `${name_prefix}-${cell_id}-overload-cookie-mint-failure` CloudWatch alarm on the base `LayerV/NHP::OverloadCookieMintFailure` stream with `{Environment, Cell}` dimensions and SNS actions wired; use the `Reason` dimensioned breakdown for attribution if it fires.
+- [ ] Pre-rollout security: while direct UDP/62206 remains reachable before the private-server end state, record the measured per-instance ECDH throughput for the deployed instance type and confirm the #1159 packet-type-agnostic kernel caps (`100` pps/source and `nhp_knock_global_rate_limit_pps`, default `5000` pps per instance, applied to all UDP/62206 packets including `KNK` and `RKN`) are below that number; lower the cap or finish the private-server rollout before relying on multi-instance overload re-knock if they are not.
+- [ ] Pre-rollout security: treat the all-`RKN` pre-auth static decrypt as an accepted DoS-surface change; proving the #1159 caps stay below measured per-instance ECDH throughput is a release gate, not an advisory check, until direct UDP/62206 is private behind the relay.
+- [ ] Pre-rollout security: explicitly sign off that the stateless cookie is a cost/liveness challenge, not an anti-replay token; a captured `RKN` can be accepted by a fresh replica while the cookie window and normal timestamp staleness floor remain valid, and downstream static-peer validation plus token issuance still gate access.
+- [ ] Pre-rollout relay/browser gate: confirm the target browser/js-agent path preserves the same authenticated client source IP across the `COK` -> `RKN` round-trip; carrier/proxy egress churn fails closed and can look like clock skew unless validated separately.
+- [ ] Rollout: apply the launch-template update, then refresh the server ASG so every instance reads the same shared secret and user data writes `CookieSigningKeyBase64` and `CookieTimeWindowSeconds` (default 60s, from `nhp_overload_cookie_time_window_seconds`) into `config.toml`.
+- [ ] Rollout: expect mixed-version instances to reject some cross-instance `RKN` packets until every server is on this code path; old-code instances mint legacy `CookieStore` cookies and new-code instances verify stateless cookies.
+- [ ] Rollout: if a future relay writes an authenticated source IP into `RealRemoteAddr`, confirm both the COK minter and RKN verifier receive that field consistently; missing remote bindings now fail closed instead of weakening cookies to peer+window only.
+- [ ] Rollout: monitor `LayerV/NHP::OverloadCookieMintFailure` by `Reason`; any non-zero value means a server intended to reject-with-cookie but could not enqueue a usable `COK` challenge.
+- [ ] Post-rollout: under overload, verify a relay-backed browser/js-agent client receives `COK` and completes the follow-up `RKN` even when requests can land on different server instances; if `RKN` rejects cluster-wide, confirm server clocks are NTP-synced with enough margin for the configured cookie window (default 60s, verifier accepts current and previous windows only, so minter-ahead skew near a boundary fails closed).
+- [ ] Post-rollout: confirm `${name_prefix}-${cell_id}-overload-cookie-process-local-key` is `OK` after the refreshed server fleet has published metrics. `ALARM` means at least one instance booted without the shared cookie key and cross-instance `RKN` verification is not safe.
+- [ ] Rotation: rotate in place with `aws secretsmanager put-secret-value --secret-id ${name_prefix}-overload-cookie-secret --secret-string "$(openssl rand -base64 32)"`, then refresh the full server fleet in one window; mixed keys reject cross-instance `RKN` until every instance has restarted. Do not delete/recreate the prod secret by name because the recovery window keeps the name reserved.
+- [ ] Rollback: revert this PR and refresh the server ASG; the secret can remain unused until the follow-up cleanup window.

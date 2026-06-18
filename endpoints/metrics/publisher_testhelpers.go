@@ -151,3 +151,22 @@ func (mp *Publisher) CountersForTest(t testing.TB) (counters map[string]float64,
 	}
 	return counters, dimCounters
 }
+
+// GaugesForTest collects registered gauge functions and returns a snapshot of
+// the in-memory gauge state. Intended only for tests that need to assert state
+// indicators registered via RegisterGaugeFunc.
+func (mp *Publisher) GaugesForTest(t testing.TB) map[string]float64 {
+	t.Helper()
+	if mp == nil {
+		return map[string]float64{}
+	}
+	mp.collectGauges()
+
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	gauges := make(map[string]float64, len(mp.gauges))
+	for k, v := range mp.gauges {
+		gauges[k] = v
+	}
+	return gauges
+}

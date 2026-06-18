@@ -66,15 +66,16 @@ module "nhp" {
   create_oidc_provider = var.create_oidc_provider
 
   # Server configuration
-  log_level                           = var.log_level
-  dev_mode                            = var.dev_mode
-  resource_mode                       = var.resource_mode
-  auth_url                            = var.auth_url
-  auth_signing_key                    = var.auth_signing_key
-  auth_aes_key                        = var.auth_aes_key
-  nhp_cors_allowed_origins            = var.nhp_cors_allowed_origins
-  nhp_knock_headertype_verify_require = var.nhp_knock_headertype_verify_require
-  nhp_internal_auth_require           = var.nhp_internal_auth_require
+  log_level                               = var.log_level
+  dev_mode                                = var.dev_mode
+  resource_mode                           = var.resource_mode
+  auth_url                                = var.auth_url
+  auth_signing_key                        = var.auth_signing_key
+  auth_aes_key                            = var.auth_aes_key
+  nhp_cors_allowed_origins                = var.nhp_cors_allowed_origins
+  nhp_knock_headertype_verify_require     = var.nhp_knock_headertype_verify_require
+  nhp_internal_auth_require               = var.nhp_internal_auth_require
+  nhp_overload_cookie_time_window_seconds = var.nhp_overload_cookie_time_window_seconds
 
   # Knock-port DoS hardening (#1159)
   nhp_knock_global_rate_limit_pps   = var.nhp_knock_global_rate_limit_pps

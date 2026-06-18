@@ -69,6 +69,14 @@ type Device struct {
 	pool     *PacketBufferPool
 	Overload atomic.Bool
 
+	// cookieSigningKey enables stateless overload cookies for servers. A
+	// cluster that shares this key can validate an agent's RKN on any sibling
+	// instance without relying on per-connection CookieStore state.
+	cookieSigningMu         sync.RWMutex
+	cookieSigningKey        []byte
+	cookieTimeWindowSec     int64
+	cookieSigningConfigured atomic.Bool
+
 	wg      sync.WaitGroup
 	signals struct {
 		stop chan struct{}
@@ -107,6 +115,14 @@ type Device struct {
 	// safe. A future caller needing live reconfiguration must promote
 	// this to an atomic.Pointer.
 	recvReplayDedupeFn func(*PacketParserData) error
+
+	// cookieMintFailureFn, when non-nil, is invoked when a server rejects a
+	// knock under overload but cannot enqueue the COK challenge it intended to
+	// send. Core owns the fail-closed decision; endpoints own the metric.
+	//
+	// Concurrency: set once via SetCookieMintFailureHook BEFORE Start spawns
+	// workers, matching recvReplayDedupeFn's happens-before contract.
+	cookieMintFailureFn func(reason string)
 }
 
 func NewDevice(t int, prk []byte, option *DeviceOptions) *Device {
@@ -166,6 +182,78 @@ func (d *Device) Option() DeviceOptions {
 // leave it unset.
 func (d *Device) SetRecvReplayDedupe(fn func(*PacketParserData) error) {
 	d.recvReplayDedupeFn = fn
+}
+
+// SetCookieMintFailureHook installs the observability hook invoked when a
+// server intended to return a COK but could not mint or marshal one. Call it
+// before Start; devices that do not care about this signal leave it unset.
+func (d *Device) SetCookieMintFailureHook(fn func(reason string)) {
+	d.cookieMintFailureFn = fn
+}
+
+func (d *Device) recordCookieMintFailure(reason string) {
+	if d == nil || d.cookieMintFailureFn == nil {
+		return
+	}
+	d.cookieMintFailureFn(reason)
+}
+
+// SetStatelessCookieParams installs the signing key and rolling window used by
+// server overload cookies. Empty keys or non-positive windows disable the
+// stateless path; callers may still use legacy per-connection CookieStore state.
+func (d *Device) SetStatelessCookieParams(key []byte, windowSec int) {
+	d.cookieSigningMu.Lock()
+	defer d.cookieSigningMu.Unlock()
+
+	if len(key) == 0 || windowSec <= 0 {
+		if d.cookieSigningKey != nil {
+			SetZero(d.cookieSigningKey)
+		}
+		d.cookieSigningKey = nil
+		d.cookieTimeWindowSec = 0
+		d.cookieSigningConfigured.Store(false)
+		return
+	}
+	if d.cookieSigningKey != nil {
+		SetZero(d.cookieSigningKey)
+	}
+	d.cookieSigningKey = append([]byte(nil), key...)
+	d.cookieTimeWindowSec = int64(windowSec)
+	d.cookieSigningConfigured.Store(true)
+}
+
+// StatelessCookieParams returns an independent copy of the configured signing
+// key and its window. A nil key with a zero window means stateless cookies are
+// disabled on this device.
+func (d *Device) StatelessCookieParams() ([]byte, int64) {
+	d.cookieSigningMu.RLock()
+	defer d.cookieSigningMu.RUnlock()
+	if d.cookieSigningKey == nil {
+		return nil, d.cookieTimeWindowSec
+	}
+	return append([]byte(nil), d.cookieSigningKey...), d.cookieTimeWindowSec
+}
+
+func (d *Device) statelessCookieParamsConfigured() bool {
+	return d != nil && d.cookieSigningConfigured.Load()
+}
+
+// statelessCookieParamsInto copies the configured cookie key into dst while
+// holding the device lock, then lets callers do HMAC work after the lock is
+// released. Production keys are SymmetricKeySize bytes, so the stack buffers at
+// call sites avoid heap churn while keeping the critical section to a memcpy.
+func (d *Device) statelessCookieParamsInto(dst []byte) ([]byte, int64) {
+	d.cookieSigningMu.RLock()
+	defer d.cookieSigningMu.RUnlock()
+	if len(d.cookieSigningKey) == 0 {
+		return nil, d.cookieTimeWindowSec
+	}
+	if len(dst) < len(d.cookieSigningKey) {
+		return append([]byte(nil), d.cookieSigningKey...), d.cookieTimeWindowSec
+	}
+	key := dst[:len(d.cookieSigningKey)]
+	copy(key, d.cookieSigningKey)
+	return key, d.cookieTimeWindowSec
 }
 
 func (d *Device) Start() {
