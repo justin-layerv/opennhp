@@ -21,7 +21,8 @@ locals {
 # ignore that wording-only drift so TLS-backend migrations do not try to destroy
 # the static-named live ALB SG while ALB ENIs still depend on it. Existing SGs
 # may keep older description text in AWS; the HCL description is authoritative
-# for new environments only.
+# for new environments only. The relay node SG mirrors this description freeze in
+# compute.tf for the same ForceNew/deposed-SG reason.
 resource "aws_security_group" "alb" {
   name        = "${local.alb_name}-alb"
   description = "Relay ALB: ingress 443 from internet; egress to relay nodes on the HTTPS backend port."

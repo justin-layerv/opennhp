@@ -24,12 +24,14 @@
 #
 # Usage: deploy-relay.sh <environment> <app_changed> <image_tag>
 #   environment:  sandbox | prod  (prod stays dark; promote-to-prod owns it)
-#   app_changed:  "true" if the relay image was (re)built+pushed this run.
+#   app_changed:  "true" if the relay image was (re)built+pushed this run, or
+#                 if the caller has already verified the tag exists in ECR.
 #                 Only then do we advance the SSM tag — on an infra-only
-#                 commit <image_tag> (=github.sha) was NOT pushed to ECR,
-#                 so writing it would crash-loop the refresh on docker pull.
-#                 We still refresh (to propagate launch-template / user_data
-#                 / relay.toml changes from terraform apply) on every build.
+#                 commit <image_tag> (=github.sha) usually was NOT pushed to
+#                 ECR, so writing it would crash-loop the refresh on docker
+#                 pull. We still refresh (to propagate launch-template /
+#                 user_data / relay.toml changes from terraform apply) on
+#                 every build.
 #   image_tag:    Docker image tag to deploy (typically the commit SHA).
 #
 # NO-OP WHEN DARK (deploy_relay=false): `module "relay"` is count-gated on
@@ -178,10 +180,11 @@ fi
 echo "Relay ASG: $ASG_NAME"
 
 # Only advance the image tag when this commit actually built+pushed
-# layerv/nhp-relay:<IMAGE_TAG>. On an infra-only commit the build matrix
-# step-skipped, so IMAGE_TAG (=github.sha) is NOT in ECR; writing it would
-# crash-loop the refresh on `docker pull`. Leave the param on the running
-# tag and let the refresh below still propagate any terraform change.
+# layerv/nhp-relay:<IMAGE_TAG>, or a caller has already verified the tag exists.
+# On an ordinary infra-only commit the build matrix step-skipped, so IMAGE_TAG
+# (=github.sha) is NOT in ECR; writing it would crash-loop the refresh on
+# `docker pull`. Leave the param on the running tag and let the refresh below
+# still propagate any terraform change.
 if [[ "$APP_CHANGED" == "true" ]]; then
   if [[ -z "$IMAGE_TAG" ]]; then
     echo "::error::Image tag is empty on the app-changed deploy path; refusing to update $RELAY_IMAGE_TAG_PARAM"
@@ -189,15 +192,17 @@ if [[ "$APP_CHANGED" == "true" ]]; then
     exit 1
   fi
 
-  # No ECR-existence pre-check (unlike update-ssm-image-tag.sh): this job's
-  # `needs` chain (deploy-sandbox-relay -> deploy-sandbox-infra ->
-  # build.result == 'success', build matrix fail-fast: false) guarantees the
-  # relay image at this tag was pushed to ECR earlier in THIS run on the
-  # app-changed path, and same-run eviction is impossible. This depends on the
-  # matrix staying all-app-images-on-app-change; if a future workflow gives
-  # relay its own narrower path filter, add a relay ECR existence/readiness
-  # check before writing github.sha here. Adding the check today would be dead
-  # defense plus a stderr-swallowing footgun for no real gain.
+  # No ECR-existence pre-check on the normal deploy path (unlike
+  # update-ssm-image-tag.sh): this job's `needs` chain
+  # (deploy-sandbox-relay -> deploy-sandbox-infra -> build.result == 'success',
+  # build matrix fail-fast: false) guarantees the relay image at this tag was
+  # pushed to ECR earlier in THIS run on the app-changed path, and same-run
+  # eviction is impossible. The deposed-SG recovery caller is the exception: it
+  # verifies ECR first, then passes app_changed=true to reuse this SSM write
+  # path. If a future workflow gives relay its own narrower path filter, add a
+  # relay ECR existence/readiness check before writing github.sha here. Adding
+  # the check today would be dead defense plus a stderr-swallowing footgun for
+  # the normal same-run path.
   echo "Pinning relay image tag $IMAGE_TAG into $RELAY_IMAGE_TAG_PARAM"
   # --overwrite: the param has lifecycle.ignore_changes=[value] in TF, so
   # CI is the authoritative writer after the bootstrap seed.

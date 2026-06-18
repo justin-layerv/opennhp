@@ -20,6 +20,24 @@ fleet still boots, health checks, and emits bootstrap failure metrics.
 
 ## Expected Transients
 
+Terraform intentionally ignores changes to the relay node security group's
+`description` attribute. Security group descriptions are ForceNew in AWS, and a
+wording-only edit can otherwise create a replacement SG whose deposed predecessor
+cannot be deleted until live relay ENIs move. Future intentional description
+rewording requires a deliberate manual recreate/taint plan or an out-of-band
+description edit; Terraform still reconciles ingress and egress rule resources.
+
+Deposed relay security-group recovery can also roll the relay fleet onto the
+first date-ordered recent CI-built relay image found in ECR, matching the deploy
+leg that a blocked app-changing apply never reached. The workflow emits a warning
+if that infra-only recovery would replace a different current SSM image tag;
+during an incident, confirm this is not overwriting an intentional hotfix pin.
+After the relay instance refresh reaches `Successful`, EC2 can still take a short
+tail to delete terminated-instance ENIs. The recovery gate waits for that cleanup
+before retrying Terraform's deposed SG delete; if it fails closed on lingering
+ENIs after an otherwise healthy refresh, re-run the workflow so the next plan can
+observe the now-detached security group.
+
 `relay-tg-unhealthy-hosts` can briefly alarm while a newly launched relay target
 is still pulling the image, starting the container, and passing its first target
 group health checks. This is most likely during instance refreshes or server AMI

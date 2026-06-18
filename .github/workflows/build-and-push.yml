@@ -1768,7 +1768,7 @@ jobs:
       )
     runs-on: ubuntu-latest
     environment: sandbox
-    timeout-minutes: 30
+    timeout-minutes: 45  # Rare relay SG recovery may spend ~15m refreshing, then a short ENI grace check, before apply.
     concurrency:
       group: deploy-sandbox-infra
       cancel-in-progress: false  # Let current TF apply finish, queue the next
@@ -1780,6 +1780,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 300  # Relay SG recovery scans up to 200 commit tags; keep headroom without a full clone.
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
@@ -1955,46 +1957,75 @@ jobs:
           set -euo pipefail
 
           # Clean up any stale plan files from previous failed runs
-          rm -f tfplan plan.txt plan-show.txt
+          rm -f tfplan plan.txt plan-show.txt plan-show.json
 
-          # When migrating from aws_autoscaling_attachment to inline target_group_arns,
-          # Terraform's refresh timing can cause a race condition:
-          # 1. Refresh sees ASG has TG (from attachment) - matches new inline config
-          # 2. No diff detected for ASG
-          # 3. Attachment destroyed - removes TG from ASG
-          # 4. ASG now missing TG but Terraform thinks it has it
-          #
-          # Fix: Remove attachments from state before apply so Terraform sees the
-          # actual diff and updates the ASG's target_group_arns.
-          #
-          # Why plan twice? The first plan detects attachments to remove. After state
-          # removal, we re-plan to capture the ASG update that Terraform now sees.
+          plan_with_attachment_migration_guard() {
+            local context="$1"
+            local attachments
+            local context_suffix=""
 
-          terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt
+            if [[ -n "$context" ]]; then
+              context_suffix=" ($context)"
+            fi
 
-          # Find any aws_autoscaling_attachment resources being destroyed
-          # Pattern matches both indexed (foo[0]) and non-indexed (foo) resources
-          ATTACHMENTS=$(grep -E "aws_autoscaling_attachment\.[^ ]+ will be destroyed" plan.txt | \
-            sed 's/.*# //' | sed 's/ will be destroyed//' || true)
-
-          # Warn if we found attachment references but failed to parse them (format may have changed)
-          if grep -q "aws_autoscaling_attachment" plan.txt && [[ -z "$ATTACHMENTS" ]]; then
-            echo "::warning::Found aws_autoscaling_attachment in plan but no destructions detected (this is normal if not migrating)"
-          fi
-
-          if [[ -n "$ATTACHMENTS" ]]; then
-            echo "::warning::Detected ASG attachment migration - removing from state to prevent race condition"
-            for att in $ATTACHMENTS; do
-              echo "Removing from state: $att"
-              terraform state rm "$att" || true
-            done
-            # Re-plan after state removal to capture ASG updates
-            rm -f tfplan
-            if ! terraform plan -out=tfplan -no-color; then
-              echo "::error::Re-plan failed after state removal. Manual intervention may be required."
+            # When migrating from aws_autoscaling_attachment to inline
+            # target_group_arns, Terraform's refresh timing can race:
+            # 1. Refresh sees ASG has TG (from attachment) and matches inline config.
+            # 2. No ASG diff is detected.
+            # 3. Attachment destroy removes the TG from the ASG.
+            # 4. Terraform thinks the ASG still has the TG.
+            #
+            # Fix: remove attachment resources from state before apply so Terraform
+            # sees the actual ASG target_group_arns diff. Why plan twice? The first
+            # plan detects attachments to remove; the second captures the ASG update
+            # now visible after state removal. Use the same guard on post-recovery
+            # re-plans so the rare relay SG recovery path preserves this migration
+            # safety net too.
+            if ! terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt; then
+              echo "::error::Terraform plan failed${context_suffix}. Manual intervention may be required."
               exit 1
             fi
-          fi
+
+            # Find any aws_autoscaling_attachment resources being destroyed.
+            # Pattern matches both indexed (foo[0]) and non-indexed (foo) resources.
+            attachments=$(grep -E "aws_autoscaling_attachment\.[^ ]+ will be destroyed" plan.txt | \
+              sed 's/.*# //' | sed 's/ will be destroyed//' || true)
+
+            # Warn if we found attachment references but failed to parse them
+            # (format may have changed).
+            if grep -q "aws_autoscaling_attachment" plan.txt && [[ -z "$attachments" ]]; then
+              echo "::warning::Found aws_autoscaling_attachment in plan${context_suffix} but no destructions detected (this is normal if not migrating)"
+            fi
+
+            if [[ -n "$attachments" ]]; then
+              echo "::warning::Detected ASG attachment migration${context_suffix} - removing from state to prevent race condition"
+              for att in $attachments; do
+                echo "Removing from state: $att"
+                terraform state rm "$att" || true
+              done
+
+              # Re-plan after state removal to capture ASG updates.
+              rm -f tfplan plan.txt
+              if ! terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt; then
+                echo "::error::Re-plan failed after ASG attachment state removal${context_suffix}. Manual intervention may be required."
+                exit 1
+              fi
+            fi
+          }
+
+          plan_with_attachment_migration_guard "initial plan"
+
+          show_current_plan() {
+            local context="$1"
+            if ! terraform show -no-color tfplan > plan-show.txt; then
+              echo "::error::terraform show tfplan failed${context}; cannot detect tainted ASGs"
+              exit 1
+            fi
+            if ! terraform show -json tfplan > plan-show.json; then
+              echo "::error::terraform show -json tfplan failed${context}; cannot inspect deposed relay SGs"
+              exit 1
+            fi
+          }
 
           # Handle ASGs left tainted by a prior partial-create failure.
           # The repo's static-named ASGs (server, AC, FRPS — see
@@ -2005,16 +2036,68 @@ jobs:
           # static name (`AlreadyExists`), and `create_before_destroy`
           # blocks the destroy-first ordering that would otherwise work.
           # Untaint to recover the in-place reconciliation path.
-          # Hard-fail rather than fall back to plan.txt: if the attachment
-          # branch above re-planned, plan.txt is stale (only the initial
-          # plan was tee-piped to it), and a silent fallback would scan an
-          # outdated plan and miss a tainted ASG. The hard-fail is
+          # Hard-fail rather than fall back to plan.txt: a silent fallback would
+          # scan the rendered plan format, which is not the durable artifact the
+          # tainted-ASG recovery path is meant to consume. The hard-fail is
           # genuinely load-bearing — `terraform show` can fail on corrupt
           # tfplan, disk full mid-write, or plan-format incompatibility
           # after a Terraform version bump.
-          if ! terraform show -no-color tfplan > plan-show.txt; then
-            echo "::error::terraform show tfplan failed; cannot detect tainted ASGs"
-            exit 1
+          show_current_plan ""
+
+          # Recover the partial state left by a relay node SG ForceNew replacement:
+          # Terraform can create the replacement SG + launch template, then fail
+          # deleting the deposed SG because existing relay instance ENIs still use
+          # it. The normal deploy-sandbox-relay job would refresh those instances,
+          # but it is downstream of this apply, so it never runs while the deposed
+          # DeleteSecurityGroup is blocking apply. If this exact deposed destroy is
+          # present and still has attached ENIs, refresh the relay ASG here,
+          # wait for it to converge, then re-plan so Terraform retries the
+          # delete after the ENIs have moved. If a retry finds the deposed SG is
+          # already ENI-clear, skip the refresh and let apply delete it directly.
+          # The downstream deploy-sandbox-relay job may then run a second refresh
+          # on this rare recovery path; keeping that normal deploy leg intact is
+          # preferable to special-casing the job graph during an incident.
+          # This hook is intentionally sandbox-only because this job only deploys
+          # sandbox; promote-to-prod owns prod, and a future prod relay rollout
+          # should add the equivalent prod recovery gate before enabling relay.
+          # Keep this job's checkout fetch-depth above RECOVERY_CANDIDATE_LIMIT
+          # (default 200 in recover-relay-deposed-sg.sh) so infra-only recovery
+          # can inspect its full configured candidate set.
+          # Keep this block before the tainted-ASG scan: if one plan contains
+          # both a deposed relay SG and a tainted ASG, recovery re-plans first
+          # and TAINTED_ASGS is derived from the fresh post-recovery plan.
+          # Give the live AWS ENI probe a small retry budget for transient CLI/API
+          # failures. In --needs-recovery mode the helper returns immediately once
+          # it confirms attached ENIs, so this does not delay real recovery.
+          set +e
+          RELAY_DEPOSED_SG_CHECK_MAX_ITERATIONS=3 \
+          RELAY_DEPOSED_SG_CHECK_INTERVAL_SECS=5 \
+            ../../../.github/scripts/check-relay-deposed-sg-clear.sh --needs-recovery plan-show.json
+          RELAY_DEPOSED_STATUS=$?
+          set -e
+
+          if [[ "$RELAY_DEPOSED_STATUS" -eq 0 ]]; then
+            echo "::warning::Detected deposed relay node security group pending destroy; refreshing relay ASG before Terraform retries DeleteSecurityGroup"
+            ../../../.github/scripts/recover-relay-deposed-sg.sh \
+              sandbox \
+              "${{ needs.changes.outputs.app }}" \
+              "${{ needs.setup.outputs.image_tag }}"
+
+            # Refreshing the ASG changes live instance attachments and may update
+            # the relay image-tag SSM param (ignored by Terraform), so discard the
+            # old saved plan and re-plan against the post-recovery state.
+            rm -f tfplan plan.txt plan-show.txt plan-show.json
+            plan_with_attachment_migration_guard "after relay deposed-SG recovery"
+            show_current_plan " after relay deposed-SG recovery"
+
+            # EC2 deletes terminated instance ENIs asynchronously after the relay
+            # refresh has reached Successful. Give that eventual-consistency tail
+            # a rare-path three-minute grace window before failing closed.
+            RELAY_DEPOSED_SG_CHECK_MAX_ITERATIONS=18 \
+            RELAY_DEPOSED_SG_CHECK_INTERVAL_SECS=10 \
+              ../../../.github/scripts/check-relay-deposed-sg-clear.sh plan-show.json
+          elif [[ "$RELAY_DEPOSED_STATUS" -ne 1 ]]; then
+            exit "$RELAY_DEPOSED_STATUS"
           fi
           TAINTED_ASGS=$(grep -E "aws_autoscaling_group\.[^ ]+ is tainted, so must be replaced" plan-show.txt | \
             sed -E 's/^[[:space:]]*#[[:space:]]+//; s/ is tainted.*$//' || true)

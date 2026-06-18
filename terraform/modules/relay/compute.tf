@@ -132,8 +132,15 @@ resource "aws_security_group" "relay" {
 
   tags = merge(local.tags, { Name = "${var.name_prefix}-sg-relay" })
 
+  # `description` is ForceNew. A wording-only replacement creates a new SG, then
+  # tries to delete the old one before the CI-driven relay instance refresh has
+  # moved existing instance ENIs off it. Mirror the relay ALB SG's description
+  # freeze, keep rule reconciliation Terraform-owned, and freeze only description
+  # drift after create. Intentional future re-description requires an explicit
+  # manual taint/recreate or out-of-band SG edit.
   lifecycle {
     create_before_destroy = true
+    ignore_changes        = [description]
   }
 }
 
