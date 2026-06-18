@@ -49,9 +49,12 @@ describe("production bundle", () => {
     expect([...output.exports].sort()).toEqual([
       "PUBKEY_FINGERPRINT_LEN",
       "RelayError",
+      "generateDeviceKeyPair",
       "knock",
       "pubKeyFingerprint",
       "startRenewal",
+      "x25519KeyFromBase64",
+      "x25519KeyToBase64",
     ]);
   });
 

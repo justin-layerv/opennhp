@@ -2,10 +2,11 @@
 #
 # Hosts the qurl.link (or sandbox equivalent) consumer landing page. When the
 # URL contains a qURL access token fragment, the same page switches into the
-# access-verification flow: it extracts the token and POSTs it to the NHP
-# Server QURL plugin for token resolution.
+# access-verification flow. In JS-agent mode it extracts the fragment token,
+# knocks through the relay, and redirects using the ACK. Legacy mode keeps the
+# old resolve POST only for environments not yet cut over.
 #
-# Flow: User visits link.domain/#at_xxx → Page redirects to NHP Server → NHP knock → Protected resource
+# Flow: User visits link.domain/#at_xxx → JS agent knocks relay → NHP opens access → Protected resource
 
 terraform {
   required_version = ">= 1.5"
@@ -18,10 +19,12 @@ terraform {
 }
 
 locals {
-  # Resolve URL is derived at runtime from window.location.hostname
-  # (see frontend/index.html), so this landing/verifier file deploys verbatim
-  # to every env.
-  index_html = file("${path.module}/frontend/index.html")
+  index_html = templatefile("${path.module}/frontend/index.html", {
+    allowed_hosts_json    = jsonencode([var.domain_name])
+    js_agent_enabled      = var.js_agent_enabled
+    relay_base_url        = local.relay_connect_src_origin
+    server_static_pub_b64 = var.server_public_key_b64
+  })
 
   robots_txt = var.robots_tag == null ? "User-agent: *\nAllow: /\n" : "User-agent: *\nDisallow: /\n"
 
@@ -49,15 +52,10 @@ locals {
   js_agent_key = "nhp-agent.min.js"
 
   relay_connect_src_origin = var.relay_connect_src_origin == null ? "" : var.relay_connect_src_origin
-  # Mirrors frontend/index.html's RESOLVE_URL convention:
-  # https://resolve.<qurl-link-host>/plugins/qurl. The #2680 browser cutover
-  # fetches this origin for relay inputs before posting knocks to the relay.
-  # domain_name is the same lowercase DNS host used for CloudFront aliases.
-  resolve_connect_src_origin = "https://resolve.${var.domain_name}"
-  js_agent_connect_src       = join(" ", compact(["'self'", local.resolve_connect_src_origin, local.relay_connect_src_origin]))
-  legacy_csp                 = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
-  js_agent_csp               = "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'; connect-src ${local.js_agent_connect_src}"
-  content_security_policy    = var.js_agent_enabled ? local.js_agent_csp : local.legacy_csp
+  js_agent_connect_src     = join(" ", compact(["'self'", local.relay_connect_src_origin]))
+  legacy_csp               = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+  js_agent_csp             = "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'; connect-src ${local.js_agent_connect_src}"
+  content_security_policy  = var.js_agent_enabled ? local.js_agent_csp : local.legacy_csp
 
   static_invalidation_paths = concat(
     ["/", "/index.html", "/robots.txt"],
@@ -320,6 +318,10 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
       condition     = !var.js_agent_enabled || local.relay_connect_src_origin != ""
       error_message = "js_agent_enabled requires relay_connect_src_origin so qurl.link CSP permits browser relay fetches. Root callers derive that origin from deploy_relay=true and relay_dns_name; set both before enabling qurl_link_js_agent_enabled."
     }
+    precondition {
+      condition     = !var.js_agent_enabled || var.server_public_key_b64 != ""
+      error_message = "js_agent_enabled requires server_public_key_b64 so the browser JS agent can authenticate relay replies from the NHP server cell."
+    }
   }
 }
 
@@ -418,28 +420,18 @@ resource "aws_s3_object" "index" {
 
   tags = merge(var.tags, { Component = "qurl-link" })
 
-  # A domain not in the SPA's ALLOWED_HOSTS array makes every visit show
+  # A domain not in the SPA's rendered allowedHosts array makes every visit show
   # the error page (fail-loud at the right layer, but undiagnosed until
   # a human loads it). A greenfield env or domain rename must edit
-  # frontend/index.html alongside tfvars — this hard-fails plan if the
-  # paired edit is missed.
-  #
-  # Anchoring on `ALLOWED_HOSTS = [` AND the quoted hostname pins this
-  # to the array's identity: an SVG/comment edit that happens to
-  # contain the hostname won't satisfy the fence, and a JS-style change
-  # (double quotes / template literals) trips the fence loudly instead
-  # of passing on a coincidence.
-  #
-  # Intentionally asymmetric: we don't fence stale entries (e.g. a
-  # retired domain still in the array). CloudFront only serves one
-  # domain per distribution, so a stale extra entry is benign.
+  # the template inputs alongside tfvars — this hard-fails plan if the
+  # rendered verifier would refuse the serving host.
   lifecycle {
     precondition {
       condition = (
-        strcontains(local.index_html, "ALLOWED_HOSTS = [") &&
-        strcontains(local.index_html, "'${var.domain_name}'")
+        strcontains(local.index_html, "allowedHosts") &&
+        strcontains(local.index_html, "\"${var.domain_name}\"")
       )
-      error_message = "frontend/index.html ALLOWED_HOSTS does not contain '${var.domain_name}' (or the array literal's shape changed). Add the new hostname to the array in frontend/index.html — without it, this CloudFront distribution will serve the error page for every visit."
+      error_message = "Rendered qurl.link verifier allowedHosts does not contain '${var.domain_name}' (or the config literal's shape changed). Without it, this CloudFront distribution will serve the error page for every verifier visit."
     }
   }
 }

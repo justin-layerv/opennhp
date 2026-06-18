@@ -8,8 +8,8 @@ import (
 // CORS for the browser relay endpoint (#2631).
 //
 // The relay's ONLY caller is the qURL knock page — `qurl.link/#at_xxx`, the page
-// that (in the browser-knock model) POSTs the NHP knock to the relay in place of
-// today's server-side resolve. It is a different origin from the relay
+// that POSTs the browser JS-agent's encrypted NHP knock to the relay. It is a
+// different origin from the relay
 // (`relay.qurl.link`), so the browser preflights. Everything else is the DATA
 // PLANE: once the knock opens the AC pinhole, the browser connects DIRECTLY to
 // the resource (`{appId}.qurl.site` or a customer whitelabel domain) through the

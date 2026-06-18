@@ -67,6 +67,17 @@ type ResolveRequest struct {
 	RequestID string `json:"-"`
 }
 
+// BrowserRelayResolveRequest is the NHP-only relay bootstrap request. The
+// AuthenticatedAgentPublicKey is the Noise peer public key NHP authenticated on
+// the relay-forwarded knock; it is not browser-submitted JSON to qurl-service.
+type BrowserRelayResolveRequest struct {
+	AccessToken                 string `json:"access_token"` //nolint:gosec // G117: JSON tag required — sent to QURL API for token resolution
+	SrcIP                       string `json:"src_ip"`
+	UserAgent                   string `json:"user_agent"`
+	AuthenticatedAgentPublicKey string `json:"authenticated_agent_public_key"`
+	RequestID                   string `json:"-"`
+}
+
 // ResolveResponse represents the response from QURL API token resolution.
 // It contains all data needed to perform the NHP knock and redirect the user.
 // For custom domains, IsCustomDomain is true and QurlSiteURL/CookieDomain
@@ -190,11 +201,23 @@ func (r *QurlResolver) Close() error {
 	return nil
 }
 
-// Resolve validates an access token and returns resource data
-// This calls the QURL API internal endpoint: POST /internal/v1/resolve
+// Resolve validates an access token and returns resource data.
+// This calls the legacy QURL API internal endpoint: POST /internal/v1/resolve.
 func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*ResolveResponse, error) {
+	return r.resolvePath(ctx, "/internal/v1/resolve", req, req.RequestID)
+}
+
+// ResolveBrowserRelay validates a qURL token and binds the authenticated JS
+// agent pubkey for the relay-first browser flow. This endpoint is called only by
+// nhp-server after it decrypts a relay-forwarded browser knock; the browser
+// never calls qurl-service directly.
+func (r *QurlResolver) ResolveBrowserRelay(ctx context.Context, req *BrowserRelayResolveRequest) (*ResolveResponse, error) {
+	return r.resolvePath(ctx, "/internal/v1/browser-relay/resolve", req, req.RequestID)
+}
+
+func (r *QurlResolver) resolvePath(ctx context.Context, path string, req any, requestID string) (*ResolveResponse, error) {
 	// Build request body. G117 (secret-in-json): ResolveRequest carries
-	// AccessToken — marshaling into the /internal/v1/resolve POST is
+	// AccessToken — marshaling into the internal resolve POST is
 	// the whole point of this call. Newer gosec flags the Marshal
 	// callsite via taint analysis even when the field has its own
 	// nolint; suppress here with the protocol-required rationale.
@@ -204,15 +227,15 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 	}
 
 	// Build HTTP request
-	url := fmt.Sprintf("%s/internal/v1/resolve", r.baseURL)
+	url := fmt.Sprintf("%s%s", r.baseURL, path)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	if req.RequestID != "" {
-		httpReq.Header.Set(nhpserver.RequestIDHeader, req.RequestID)
+	if requestID != "" {
+		httpReq.Header.Set(nhpserver.RequestIDHeader, requestID)
 	}
 
 	// Add service token authentication header
@@ -224,10 +247,10 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 	httpReq.Header.Set(ServiceTokenHeader, r.serviceToken)
 
 	// Execute request
-	log.Debug("[QURL] [req_id=%s] Calling QURL API: %s", req.RequestID, url)
+	log.Debug("[QURL] [req_id=%s] Calling QURL API: %s", requestID, url)
 	resp, err := r.httpClient.Do(httpReq) //nolint:gosec // G704: URL from QURL_API_URL env var with schema validation
 	if err != nil {
-		log.Error("[QURL] [req_id=%s] HTTP request failed: %v", req.RequestID, err)
+		log.Error("[QURL] [req_id=%s] HTTP request failed: %v", requestID, err)
 		return nil, fmt.Errorf("failed to call QURL API: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -240,14 +263,14 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 
 	// Handle HTTP-level errors
 	if resp.StatusCode != http.StatusOK {
-		log.Error("[QURL] [req_id=%s] QURL API returned status %d: %s", req.RequestID, resp.StatusCode, string(respBody))
+		log.Error("[QURL] [req_id=%s] QURL API returned status %d: %s", requestID, resp.StatusCode, string(respBody))
 		return nil, r.parseErrorResponse(resp.StatusCode, respBody)
 	}
 
 	// Parse response
 	var internalResp internalResolveResponse
 	if err := json.Unmarshal(respBody, &internalResp); err != nil {
-		log.Error("[QURL] [req_id=%s] Failed to parse response: %v", req.RequestID, err)
+		log.Error("[QURL] [req_id=%s] Failed to parse response: %v", requestID, err)
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
@@ -264,7 +287,7 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 	}
 
 	if err := validateResolveResponse(internalResp.Data); err != nil {
-		log.Error("[QURL] [req_id=%s] Invalid resolve response: %v", req.RequestID, err)
+		log.Error("[QURL] [req_id=%s] Invalid resolve response: %v", requestID, err)
 		return nil, fmt.Errorf("%w: %s", ErrInvalidResolveResponse, err.Error())
 	}
 

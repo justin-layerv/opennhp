@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -155,12 +157,21 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 		// qurl-agent-keys DDB table. Nil lookup = DDB-backed agent
 		// path disabled (legacy etcd / file deployments); fall
 		// through to the auth handler unchanged.
-		if s.agentPeerLookup != nil {
+		if s.agentPeerLookup != nil && !isQurlRelayBootstrapKnock(ppd, knkMsg) {
 			if resolveErr := s.resolveAgentPeerForKnock(ppd, knkMsg, ackMsg, transactionId, addrStr); resolveErr != nil {
 				// resolveAgentPeerForKnock has already populated ackMsg.ErrCode/
 				// ErrMsg; the reject rides in the ack, so just stop the pipeline.
 				return
 			}
+		} else if s.agentPeerLookup != nil {
+			// qurl.link's first browser knock presents a freshly generated
+			// JS-agent pubkey that qurl-service cannot have registered yet.
+			// The encrypted qURL access token is the bootstrap credential; the
+			// qURL plugin validates it and binds ppd.RemotePubKey through the
+			// internal browser-relay resolve endpoint before opening access.
+			log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"qurl_bootstrap_unknown_pubkey_allowed\" pubkey_b64_prefix=%q",
+				knkMsg.UserId, transactionId, addrStr,
+				pubkeyLogPrefix(base64.StdEncoding.EncodeToString(ppd.RemotePubKey)))
 		}
 
 		// find out auth service provider. Try the in-memory map first
@@ -240,6 +251,51 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 	}
 
 	return ackBytes, knkMsg.UserId, nil
+}
+
+const (
+	qurlRelayBootstrapAuthServiceID = "qurl"
+	qurlRelayBootstrapResourceID    = "qurl-bootstrap"
+	qurlAccessTokenUserDataKey      = "qurl_access_token"
+)
+
+func isQurlRelayBootstrapKnock(ppd *core.PacketParserData, knkMsg *common.AgentKnockMsg) bool {
+	if ppd == nil || knkMsg == nil {
+		return false
+	}
+	if ppd.HeaderType != core.NHP_KNK {
+		return false
+	}
+	if knkMsg.AuthServiceId != qurlRelayBootstrapAuthServiceID {
+		return false
+	}
+	if knkMsg.ResourceId != qurlRelayBootstrapResourceID {
+		return false
+	}
+	if len(ppd.RemotePubKey) == 0 {
+		return false
+	}
+	raw, ok := knkMsg.UserData[qurlAccessTokenUserDataKey]
+	if !ok {
+		return false
+	}
+	token, ok := raw.(string)
+	if !ok {
+		return false
+	}
+	return looksLikeQurlAccessTokenForBootstrap(strings.TrimSpace(token))
+}
+
+func looksLikeQurlAccessTokenForBootstrap(token string) bool {
+	if !strings.HasPrefix(token, "at_") || len(token) < 8 || len(token) > 512 {
+		return false
+	}
+	for _, c := range token {
+		if !(unicode.IsLetter(c) || unicode.IsDigit(c) || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveAgentPeerForKnock looks the presented agent pubkey up

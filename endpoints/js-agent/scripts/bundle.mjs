@@ -6,8 +6,8 @@
 //
 // This is the Phase-1 packaging deliverable of #2208; it is *consumed* by the
 // Phase-2 page migration (Phase-2 #6), not wired here. The qurl-link Terraform
-// module deliberately adds `script-src 'self'` and resolve/relay `connect-src`
-// only while this bundle is enabled.
+// module deliberately adds `script-src 'self'` and relay-only `connect-src`
+// while this bundle is enabled.
 //
 // `bundle.test.ts` imports the same options so the test verifies the exact
 // production build (in-memory, via esbuild's metafile — no execution, since the

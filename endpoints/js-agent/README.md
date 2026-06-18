@@ -82,18 +82,16 @@ Ported incrementally, each step its own PR:
      are the foreground-recovery and single-flight paths.
 6. **Bundling** — `npm run bundle` (esbuild) emits one self-contained
    ESM file, `dist/nhp-agent.min.js` (~23 KB gzipped), with the `@noble` suite
-   inlined, for the qurl.link page to load as a same-origin
-   `<script type="module" src>`. This is the Phase-1 packaging deliverable of
-   #2208 — a `dist/`-gitignored artifact built on demand by the deploy pipeline;
-   **nothing imports it yet**, it is consumed by the Phase-2 page migration
-   (Phase-2 #6, which also needs the relay deployed first). `test/bundle.test.ts`
+   inlined, for the qurl.link page to load as a same-origin module. The
+   qurl-link Terraform module renders the relay origin and server static pubkey
+   into the page when `js_agent_enabled` is true, then the page imports this
+   bundle and performs the bootstrap knock through the relay. `test/bundle.test.ts`
    gates the gzip budget and the runtime public-export surface via esbuild's
    metafile (no execution — node has no DOM; that end-to-end seam is #2616).
    The qurl-link Terraform module now relaxes CSP only when the bundle is
    intentionally served: `script-src` gains `'self'` for the same-origin module,
-   and `connect-src` gains the resolve and relay origins so browser `fetch` calls
-   for relay inputs and `POST /relay/{serverId}` are not blocked by
-   `default-src 'self'`. The remaining
+   and `connect-src` gains the relay origin so `POST /relay/{serverId}` is not
+   blocked by `default-src 'self'`. The remaining
    Phase-2 page-migration prerequisite is tracked in #2700: pin the artifact with **Subresource
    Integrity** (`integrity="sha384-…"` on the `<script>` + a matching CSP
    hash-source), not just `'self'` — for a crypto agent that gates resource

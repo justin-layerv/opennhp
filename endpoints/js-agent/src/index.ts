@@ -13,6 +13,12 @@ export { knock } from "./agent/loop.js";
 // so a PR-6 consumer writing that callback can name it from the package root.
 export type { KnockRequest, KnockResult, KnockSuccess } from "./agent/loop.js";
 export { RelayError } from "./agent/relay.js";
+export {
+  generateDeviceKeyPair,
+  x25519KeyFromBase64,
+  x25519KeyToBase64,
+} from "./agent/keys.js";
+export type { DeviceKeyPair, KeyPairEntropy } from "./agent/keys.js";
 
 // The renewal scheduler (#2208 PR-5d): keep an open grant alive by re-knocking
 // before the access duration expires, with foreground recovery for backgrounded

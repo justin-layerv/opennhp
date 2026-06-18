@@ -58,10 +58,10 @@ func (p *Plugin) ListService(req *common.NhpListRequest, helper *plugins.NhpServ
 }
 
 // AuthWithNHP authorizes an NHP knock for a qURL resource and opens the AC
-// pinhole. It is the knock-path counterpart of AuthWithHttp: the token-based
-// HTTP path resolves+mints a session via /resolve, while the knock path (direct
-// re-knock or relay-forwarded, #2208) carries no token and instead consults the
-// existing session via qurl-service /authorize. See authnhp.go.
+// pinhole. Initial qurl.link relay bootstrap carries the access token inside the
+// encrypted AgentKnockMsg usrData; after qurl-service validates that token and
+// binds the authenticated JS-agent pubkey, steady-state re-knocks are tokenless
+// and consult the live session via qurl-service /authorize. See authnhp.go.
 func (p *Plugin) AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
 	return AuthWithNHP(req, helper)
 }

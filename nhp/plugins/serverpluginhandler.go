@@ -247,6 +247,12 @@ type HttpPluginResolveResourceFunc func(aspId, resId, srcIP string) (*common.Res
 type NhpServerPluginHelper struct {
 	StopSignal              <-chan struct{}
 	AuthWithNhpCallbackFunc NhpPluginPostAuthFunc
+	// ResolveResourceFunc resolves AC routing from the host server's catalog
+	// (see HttpPluginResolveResourceFunc). qURL relay bootstrap uses it after
+	// qurl-service validates the encrypted access token and returns the dynamic
+	// q_ catalog key. nil-safe: hand-built test helpers may leave it nil, so
+	// callers must branch on `!= nil` and fail closed when it is.
+	ResolveResourceFunc HttpPluginResolveResourceFunc
 
 	// AspData is the AuthServiceProviderData matched for the incoming
 	// knock's AuthServiceId. Plugins that don't carry a per-plugin

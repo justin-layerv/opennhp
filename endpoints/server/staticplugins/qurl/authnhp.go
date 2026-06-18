@@ -3,27 +3,42 @@ package qurl
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
+	nhpserver "github.com/OpenNHP/opennhp/endpoints/server"
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
 )
 
-// qurlAuthorizeTimeout bounds the qurl-service /authorize call on the knock
-// path. Unlike AuthWithHttp (which inherits the gin request context), the knock
-// handler has no request context to inherit, so we derive a bounded one.
-const qurlAuthorizeTimeout = 5 * time.Second
+const (
+	// qurlAuthorizeTimeout bounds qurl-service calls on the knock path. Unlike
+	// AuthWithHttp (which inherits the gin request context), the knock handler has
+	// no request context to inherit, so we derive a bounded one.
+	qurlAuthorizeTimeout = 5 * time.Second
+
+	qurlBootstrapResourceID    = "qurl-bootstrap"
+	qurlAccessTokenUserDataKey = "qurl_access_token"
+	qurlUserAgentUserDataKey   = "qurl_user_agent"
+)
 
 // AuthWithNHP authorizes an NHP knock for a qURL resource and opens the AC
 // pinhole. It is the knock-path counterpart of AuthWithHttp.
 //
-// AuthWithHttp resolves an access TOKEN via POST /internal/v1/resolve (which
-// also mints the session). The knock path carries NO token — the token was
-// consumed at qurl.link. So this path instead:
+// Initial qurl.link bootstrap carries the qURL access token inside the
+// encrypted AgentKnockMsg usrData and uses a sentinel resource id. NHP validates
+// the token with qurl-service, binds the authenticated browser pubkey, resolves
+// AC routing from the NHP catalog, opens the AC, and returns redirectUrl in the
+// ACK. The browser never calls qurl-service / resolve directly.
+//
+// Steady-state re-knocks carry no token — the token was consumed at bootstrap.
+// That path instead:
 //
 //  1. Resolves the resource -> AC mapping from the server's catalog
 //     (helper.AspData), keyed on the knock's ResourceId.
@@ -70,6 +85,10 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 	}
 	if clientIP == "" {
 		return failAck(ackMsg, common.ErrInvalidInput, "qurl.AuthWithNHP: missing source address")
+	}
+
+	if accessToken, ok := qurlBootstrapAccessToken(req.Msg); ok {
+		return authWithNHPBootstrap(req, helper, accessToken, clientIP)
 	}
 
 	// Resolve the resource -> AC mapping from the catalog. The same resourceID
@@ -178,9 +197,129 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 	return helper.AuthWithNhpCallbackFunc(req, openRes)
 }
 
+func authWithNHPBootstrap(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper, accessToken, clientIP string) (*common.ServerKnockAckMsg, error) {
+	ackMsg := req.Ack
+	if err := ValidateAccessToken(accessToken); err != nil {
+		return failAck(ackMsg, common.ErrInvalidInput, "qurl.AuthWithNHP: invalid bootstrap access token")
+	}
+	if helper.ResolveResourceFunc == nil {
+		log.Error("[QURL] AuthWithNHP bootstrap: catalog resolver not wired; cannot resolve AC routing")
+		return failAck(ackMsg, common.ErrKnockApiRequestFailed, "qurl resource routing unavailable")
+	}
+
+	requestID := uuid.NewString()
+	ctx, cancel := context.WithTimeout(context.Background(), qurlAuthorizeTimeout)
+	defer cancel()
+
+	resolveResp, resolveErr := resolver.ResolveBrowserRelay(ctx, &BrowserRelayResolveRequest{
+		AccessToken:                 accessToken,
+		SrcIP:                       clientIP,
+		UserAgent:                   qurlBootstrapUserAgent(req.Msg),
+		AuthenticatedAgentPublicKey: req.PublicKey,
+		RequestID:                   requestID,
+	})
+	if resolveErr != nil {
+		if isTerminalResolveDeny(resolveErr) {
+			log.Info("[QURL] AuthWithNHP bootstrap: access denied client=%s err=%v", clientIP, resolveErr)
+			return failAck(ackMsg, common.ErrQurlSessionExpired, "qurl bootstrap denied")
+		}
+		log.Error("[QURL] AuthWithNHP bootstrap: resolve call failed client=%s: %v", clientIP, resolveErr)
+		return failAck(ackMsg, common.ErrKnockApiRequestFailed, common.ErrKnockApiRequestFailed.Error())
+	}
+
+	catalogRes, err := helper.ResolveResourceFunc(PluginID, resolveResp.NHPResourceID, clientIP)
+	if err != nil || catalogRes == nil || len(catalogRes.Resources) == 0 {
+		if errors.Is(err, context.Canceled) {
+			log.Warning("[QURL] AuthWithNHP bootstrap: catalog routing resolution canceled for nhp_resource_id=%s: %v", resolveResp.NHPResourceID, err)
+		} else if err != nil {
+			log.Error("[QURL] AuthWithNHP bootstrap: catalog routing resolution failed for nhp_resource_id=%s: %v", resolveResp.NHPResourceID, err)
+		} else {
+			log.Error("[QURL] AuthWithNHP bootstrap: catalog returned no routing for nhp_resource_id=%s", resolveResp.NHPResourceID)
+		}
+		return failAck(ackMsg, common.ErrResourceNotFound, "qurl resource routing unresolved")
+	}
+
+	openTime := nhpserver.ClampOpenTimeDownward(catalogRes.OpenTime, resolveResp.OpenTime)
+	openRes := buildResourceData(resolveResp, catalogRes.Resources, openTime)
+	req.Msg.ResourceId = resolveResp.ResourceID
+	ackMsg.OpenTime = openRes.OpenTime
+	ackMsg.RedirectUrl = resolveResp.QurlSiteURL
+
+	log.Info("[QURL] AuthWithNHP bootstrap: authorized resource=%s nhp_resource=%s client=%s open_time=%d",
+		resolveResp.ResourceID, resolveResp.NHPResourceID, clientIP, openRes.OpenTime)
+	openedAck, err := helper.AuthWithNhpCallbackFunc(req, openRes)
+	if err != nil {
+		return openedAck, err
+	}
+	if openedAck != nil {
+		openedAck.RedirectUrl = resolveResp.QurlSiteURL
+	}
+	return openedAck, nil
+}
+
+func isTerminalResolveDeny(err error) bool {
+	return errors.Is(err, ErrTokenNotFound) ||
+		errors.Is(err, ErrTokenConsumed) ||
+		errors.Is(err, ErrTokenExpired) ||
+		errors.Is(err, ErrPolicyViolation)
+}
+
+func qurlBootstrapAccessToken(msg *common.AgentKnockMsg) (string, bool) {
+	if msg == nil || msg.UserData == nil {
+		return "", false
+	}
+	raw, ok := msg.UserData[qurlAccessTokenUserDataKey]
+	if !ok {
+		return "", false
+	}
+	token, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	token = strings.TrimSpace(token)
+	if !looksLikeQurlAccessToken(token) {
+		return "", false
+	}
+	return token, true
+}
+
+func qurlBootstrapUserAgent(msg *common.AgentKnockMsg) string {
+	if msg == nil || msg.UserData == nil {
+		return ""
+	}
+	raw, ok := msg.UserData[qurlUserAgentUserDataKey]
+	if !ok {
+		return ""
+	}
+	userAgent, ok := raw.(string)
+	if !ok {
+		return ""
+	}
+	userAgent = strings.TrimSpace(userAgent)
+	if len(userAgent) > 1024 {
+		return userAgent[:1024]
+	}
+	return userAgent
+}
+
+func looksLikeQurlAccessToken(token string) bool {
+	if !strings.HasPrefix(token, "at_") || len(token) < minTokenLength || len(token) > maxTokenLength {
+		return false
+	}
+	for _, c := range token {
+		if !(unicode.IsLetter(c) || unicode.IsDigit(c) || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 // failAck stamps the ack with the error and returns it alongside the error,
 // matching the (ackMsg, err) contract HandleKnockRequest expects on a reject.
 func failAck(ackMsg *common.ServerKnockAckMsg, e *common.Error, msg string) (*common.ServerKnockAckMsg, error) {
+	if ackMsg == nil {
+		return nil, fmt.Errorf("%w: %s", e, msg)
+	}
 	ackMsg.ErrCode = e.ErrorCode()
 	ackMsg.ErrMsg = msg
 	return ackMsg, e

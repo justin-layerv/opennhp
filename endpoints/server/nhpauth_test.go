@@ -455,6 +455,89 @@ func TestResolveAgentPeerForKnock_EmptyPubkeyRejects(t *testing.T) {
 	}
 }
 
+func TestIsQurlRelayBootstrapKnock_NarrowBypass(t *testing.T) {
+	rawPubkey := decodeB64(t, pubkeyB64(0x42))
+	validPPD := &core.PacketParserData{
+		HeaderType:   core.NHP_KNK,
+		RemotePubKey: rawPubkey,
+	}
+	validKnock := &common.AgentKnockMsg{
+		AuthServiceId: qurlRelayBootstrapAuthServiceID,
+		ResourceId:    qurlRelayBootstrapResourceID,
+		UserData: map[string]any{
+			qurlAccessTokenUserDataKey: "at_1234567890123456789012",
+		},
+	}
+
+	tests := []struct {
+		name string
+		ppd  *core.PacketParserData
+		knk  *common.AgentKnockMsg
+		want bool
+	}{
+		{name: "valid bootstrap", ppd: validPPD, knk: validKnock, want: true},
+		{
+			name: "renegotiation knock is not bootstrap",
+			ppd:  &core.PacketParserData{HeaderType: core.NHP_RKN, RemotePubKey: rawPubkey},
+			knk:  validKnock,
+			want: false,
+		},
+		{
+			name: "non qurl asp is not bootstrap",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: "agent",
+				ResourceId:    qurlRelayBootstrapResourceID,
+				UserData:      validKnock.UserData,
+			},
+			want: false,
+		},
+		{
+			name: "real resource id is not bootstrap",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    "r_steady00000",
+				UserData:      validKnock.UserData,
+			},
+			want: false,
+		},
+		{
+			name: "empty authenticated pubkey is not bootstrap",
+			ppd:  &core.PacketParserData{HeaderType: core.NHP_KNK},
+			knk:  validKnock,
+			want: false,
+		},
+		{
+			name: "missing token is not bootstrap",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    qurlRelayBootstrapResourceID,
+			},
+			want: false,
+		},
+		{
+			name: "malformed token is not bootstrap",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    qurlRelayBootstrapResourceID,
+				UserData:      map[string]any{qurlAccessTokenUserDataKey: "resolve-me"},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isQurlRelayBootstrapKnock(tt.ppd, tt.knk); got != tt.want {
+				t.Errorf("isQurlRelayBootstrapKnock() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestResolveAgentPeerForKnock_AddsToCoreDevice asserts that the
 // resolved peer is registered with core.Device's peer map (via
 // AddAgentPeer), so subsequent packets that go through the noise

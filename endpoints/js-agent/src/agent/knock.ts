@@ -119,17 +119,21 @@ export function createKnock(
   return { packet, counter };
 }
 
+export const QURL_BOOTSTRAP_RESOURCE_ID = "qurl-bootstrap";
+export const QURL_ACCESS_TOKEN_USER_DATA_KEY = "qurl_access_token";
+export const QURL_USER_AGENT_USER_DATA_KEY = "qurl_user_agent";
+
 /**
- * The two fields the qURL knock body must carry. The server's qURL path reads
- * only these: `authServiceId` routes the knock to the qURL plugin
- * (`FindAuthSvcProvider` rejects an empty one) and `resourceId` is the `r_` id the
- * plugin resolves and authorizes. The client IP comes from the relay-forwarded
- * source address, not the body, and the other `AgentKnockMsg` fields
- * (`usrId`/`devId`/…) are inert on this path, so the browser omits them.
+ * The qURL knock body always routes by `authServiceId`. A steady-state re-knock
+ * carries a real `resourceId`; the initial qurl.link bootstrap carries the qURL
+ * token inside encrypted `usrData` and uses a sentinel resource id because the
+ * browser must not call a resolve endpoint to learn the resource before knocking.
  */
 export interface KnockBodyParams {
   authServiceId: string;
-  resourceId: string;
+  resourceId?: string;
+  qurlAccessToken?: string;
+  qurlUserAgent?: string;
 }
 
 /**
@@ -143,10 +147,26 @@ export interface KnockBodyParams {
  * the cross-language body fence.
  */
 export function buildKnockBody(params: KnockBodyParams): Uint8Array {
-  const msg = {
+  if (!params.resourceId && !params.qurlAccessToken) {
+    throw new Error("resourceId or qurlAccessToken is required");
+  }
+  const msg: {
+    headerType: number;
+    aspId: string;
+    resId: string;
+    usrData?: Record<string, string>;
+  } = {
     headerType: NHP_KNK,
     aspId: params.authServiceId,
-    resId: params.resourceId,
+    resId: params.resourceId ?? QURL_BOOTSTRAP_RESOURCE_ID,
   };
+  if (params.qurlAccessToken) {
+    msg.usrData = {
+      [QURL_ACCESS_TOKEN_USER_DATA_KEY]: params.qurlAccessToken,
+    };
+    if (params.qurlUserAgent) {
+      msg.usrData[QURL_USER_AGENT_USER_DATA_KEY] = params.qurlUserAgent;
+    }
+  }
   return new TextEncoder().encode(JSON.stringify(msg));
 }

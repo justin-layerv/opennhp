@@ -1,5 +1,5 @@
 variable "domain_name" {
-  description = "Lowercase DNS name for the QURL link redirect page (e.g., qurl.link.layerv.xyz). Used directly to derive the resolve.<domain> CSP origin when the browser agent is enabled."
+  description = "Lowercase DNS name for the QURL link redirect page (e.g., qurl.link.layerv.xyz). Rendered into the verifier host allowlist."
   type        = string
 
   validation {
@@ -25,7 +25,7 @@ variable "enable_access_logs" {
 }
 
 variable "js_agent_enabled" {
-  description = "Upload the browser NHP JS-agent bundle beside the qurl.link verifier shell and emit its CSP network allowlist. Enabling this requires relay_connect_src_origin so the served page can fetch resolve inputs and POST relay knocks. Sandbox enables this for #2208/#2680; prod stays false until the sandbox browser cutover is proven."
+  description = "Upload the browser NHP JS-agent bundle beside the qurl.link verifier shell and render the relay-first verifier. Enabling this requires relay_connect_src_origin and server_public_key_b64. Sandbox enables this for #2208/#2680; prod stays false until the sandbox browser cutover is proven."
   type        = bool
   default     = false
 }
@@ -38,6 +38,17 @@ variable "relay_connect_src_origin" {
   validation {
     condition     = var.relay_connect_src_origin == null || can(regex("^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.relay_connect_src_origin))
     error_message = "relay_connect_src_origin must be null or an HTTPS origin with no port/path, for example https://relay.qurl.link.layerv.xyz."
+  }
+}
+
+variable "server_public_key_b64" {
+  description = "Standard-base64 32-byte NHP server static public key rendered into qurl.link when js_agent_enabled is true. Empty only while js_agent_enabled is false."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.server_public_key_b64 == "" || can(regex("^[A-Za-z0-9+/]{43}=$", var.server_public_key_b64))
+    error_message = "server_public_key_b64 must be empty or a 44-character standard-base64 encoded 32-byte X25519 public key."
   }
 }
 

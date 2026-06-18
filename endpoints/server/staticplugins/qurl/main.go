@@ -86,11 +86,11 @@ func Close() error {
 	return nil
 }
 
-// AuthWithHttp handles HTTP-based QURL token resolution and NHP knock
+// AuthWithHttp handles the legacy browser-to-resolve QURL token path.
 //
 // Flow:
 //  1. User visits qurl.link/#<access_token>
-//  2. qurl.link SPA extracts fragment and submits a form POST to /plugins/qurl
+//  2. Legacy qurl.link verifier extracts fragment and submits a form POST to /plugins/qurl
 //     with token=<access_token> in the request body (not the URL)
 //  3. This handler validates the token via QURL API
 //  4. On success, triggers NHP knock via helper callback

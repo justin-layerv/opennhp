@@ -102,6 +102,75 @@ func TestQurlResolver_Resolve_Success(t *testing.T) {
 	}
 }
 
+func TestQurlResolver_ResolveBrowserRelay_UsesDedicatedEndpointAndAuthenticatedKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/browser-relay/resolve" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected method: %s", r.Method)
+		}
+		if r.Header.Get(ServiceTokenHeader) != "test-token" {
+			t.Errorf("unexpected service token: %s", r.Header.Get(ServiceTokenHeader))
+		}
+		if r.Header.Get("X-Request-ID") != "rid-relay-123" {
+			t.Errorf("unexpected request ID header: %s", r.Header.Get("X-Request-ID"))
+		}
+
+		var req BrowserRelayResolveRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("failed to decode request: %v", err)
+		}
+		if req.AccessToken != "at_1234567890123456789012" {
+			t.Errorf("unexpected access token: %s", req.AccessToken)
+		}
+		if req.SrcIP != "203.0.113.7" {
+			t.Errorf("unexpected src_ip: %s", req.SrcIP)
+		}
+		if req.UserAgent != "Mozilla/5.0 qurl-link-test" {
+			t.Errorf("unexpected user_agent: %s", req.UserAgent)
+		}
+		if req.AuthenticatedAgentPublicKey != "agent-pub-b64" {
+			t.Errorf("unexpected authenticated_agent_public_key: %s", req.AuthenticatedAgentPublicKey)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(internalResolveResponse{
+			Success: true,
+			Data: &ResolveResponse{
+				ResourceID:    "r_test123",
+				NHPResourceID: "q_0123456789a",
+				QurlSiteURL:   "https://r_test123.qurl.site",
+				JWTSecret:     "test-jwt-secret",
+				TokenExpire:   3600,
+				OpenTime:      300,
+				CookieDomain:  ".qurl.site",
+			},
+		})
+	}))
+	defer server.Close()
+
+	resolver := &QurlResolver{
+		httpClient:   &http.Client{Timeout: 5 * time.Second},
+		baseURL:      server.URL,
+		serviceToken: "test-token",
+	}
+
+	resp, err := resolver.ResolveBrowserRelay(context.Background(), &BrowserRelayResolveRequest{
+		AccessToken:                 "at_1234567890123456789012",
+		SrcIP:                       "203.0.113.7",
+		UserAgent:                   "Mozilla/5.0 qurl-link-test",
+		AuthenticatedAgentPublicKey: "agent-pub-b64",
+		RequestID:                   "rid-relay-123",
+	})
+	if err != nil {
+		t.Fatalf("ResolveBrowserRelay: %v", err)
+	}
+	if resp.ResourceID != "r_test123" {
+		t.Errorf("ResourceID = %q, want r_test123", resp.ResourceID)
+	}
+}
+
 func TestQurlResolver_Resolve_TokenNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)

@@ -229,8 +229,9 @@ locals {
   # The compute module's `var.http_timeouts_ms` validation enforces the
   # in-object relationships (idle > read, idle > write) independently.
   # See the precondition for the bug-class rationale.
-  cf_origin_keepalive_seconds = 30
-  cf_origin_read_timeout      = 60
+  cf_origin_keepalive_seconds   = 30
+  cf_origin_read_timeout        = 60
+  qurl_resolve_endpoint_enabled = var.deploy_qurl_link && !var.qurl_link_js_agent_enabled
   # cf_keepalive_buffer_seconds is the MINIMUM slack required between the
   # server's IdleTimeout and CF's origin_keepalive_timeout. The actual
   # gap (http_idle_timeout_ms - cf_origin_keepalive_seconds*1000) is
@@ -565,12 +566,12 @@ module "compute" {
   # Shared HMAC secret; seed ordering enforced via depends_on below.
   nhp_internal_auth_secret_arn = aws_secretsmanager_secret.nhp_internal_auth.arn
 
-  # QURL resolve endpoint - TLS listener for resolve.qurl.link
-  # Routes HTTPS traffic directly to NHP Server plugin endpoint
+  # Legacy QURL resolve endpoint - TLS listener for resolve.qurl.link.
+  # Disabled when qurl.link uses the browser JS-agent relay flow.
   # Note: enable_qurl_resolve_endpoint uses a static boolean to avoid "count depends on
   # resource attributes" errors. The certificate_arn is only used at apply time.
-  enable_qurl_resolve_endpoint = var.deploy_qurl_link
-  qurl_resolve_certificate_arn = var.deploy_qurl_link ? aws_acm_certificate_validation.qurl_resolve[0].certificate_arn : null
+  enable_qurl_resolve_endpoint = local.qurl_resolve_endpoint_enabled
+  qurl_resolve_certificate_arn = local.qurl_resolve_endpoint_enabled ? aws_acm_certificate_validation.qurl_resolve[0].certificate_arn : null
 
   # HTTP server timeouts — CF↔server keep-alive contract (see top-of-file
   # locals + `terraform_data.http_keepalive_contract`'s preconditions). The
@@ -631,7 +632,7 @@ module "compute" {
   cors_allowed_origins = var.nhp_cors_allowed_origins
 
   # CloudFront trusted proxy CIDRs (for correct client IP extraction from X-Forwarded-For)
-  cloudfront_cidrs_ssm_parameter = var.deploy_qurl_link && var.enable_resolve_cloudfront ? aws_ssm_parameter.cloudfront_cidrs[0].name : null
+  cloudfront_cidrs_ssm_parameter = local.deploy_qurl_resolve_cf ? aws_ssm_parameter.cloudfront_cidrs[0].name : null
 
   knock_headertype_verify_require     = var.nhp_knock_headertype_verify_require
   internal_auth_require               = var.nhp_internal_auth_require
@@ -3310,11 +3311,12 @@ module "qurl_link" {
   count  = var.deploy_qurl_link ? 1 : 0
   source = "./modules/qurl-link"
 
-  domain_name         = var.qurl_link_frontend_domain
-  bucket_name         = "${local.name_prefix}-qurl-link"
-  acm_certificate_arn = aws_acm_certificate_validation.qurl_link[0].certificate_arn
-  enable_access_logs  = var.qurl_link_enable_access_logs
-  js_agent_enabled    = var.qurl_link_js_agent_enabled
+  domain_name           = var.qurl_link_frontend_domain
+  bucket_name           = "${local.name_prefix}-qurl-link"
+  acm_certificate_arn   = aws_acm_certificate_validation.qurl_link[0].certificate_arn
+  enable_access_logs    = var.qurl_link_enable_access_logs
+  js_agent_enabled      = var.qurl_link_js_agent_enabled
+  server_public_key_b64 = var.qurl_link_js_agent_enabled ? module.compute.server_public_key_b64 : ""
   relay_connect_src_origin = (
     var.qurl_link_js_agent_enabled && var.deploy_relay && var.relay_dns_name != ""
     ? "https://${var.relay_dns_name}"
@@ -3367,22 +3369,22 @@ resource "aws_route53_record" "qurl_link_ipv6" {
 # ==============================================================================
 # QURL Resolve Endpoint - Direct to NHP Server
 # ==============================================================================
-# The resolve.qurl.link endpoint must route DIRECTLY to the NHP Server NLB,
+# Legacy resolve.qurl.link endpoint. When enabled, it routes DIRECTLY to the NHP Server NLB,
 # NOT through the AC. This is because:
 # 1. AC port 443 is blocked by iptables until NHP knock authenticates (zero-trust)
 # 2. The QURL plugin runs on the NHP Server, not the AC
-# 3. resolve.qurl.link is called BEFORE authentication to initiate the NHP knock
+# 3. resolve.qurl.link is called BEFORE authentication to initiate the legacy NHP knock
 #
 # Traffic flow:
-#   qurl.link → CloudFront → resolve.qurl.link → NHP Server NLB:443 → Server:8888
+#   legacy qurl.link → CloudFront → resolve.qurl.link → NHP Server NLB:443 → Server:8888
 
 # ACM Certificate for resolve.qurl.link (must be in same region as NLB)
 # When CloudFront is enabled, includes an origin-specific SAN so CloudFront's
 # TLS verification passes (CloudFront checks the cert against the origin domain).
 resource "aws_acm_certificate" "qurl_resolve" {
-  count       = var.deploy_qurl_link ? 1 : 0
+  count       = local.qurl_resolve_endpoint_enabled ? 1 : 0
   domain_name = "resolve.${var.qurl_link_frontend_domain}"
-  subject_alternative_names = var.enable_resolve_cloudfront ? [
+  subject_alternative_names = local.deploy_qurl_resolve_cf ? [
     "resolve-origin.${var.qurl_link_frontend_domain}"
   ] : []
   validation_method = "DNS"
@@ -3398,7 +3400,7 @@ resource "aws_acm_certificate" "qurl_resolve" {
 
 # DNS validation records for QURL resolve certificate
 resource "aws_route53_record" "qurl_resolve_cert_validation" {
-  for_each = var.deploy_qurl_link && !var.qurl_link_external_dns ? {
+  for_each = local.qurl_resolve_endpoint_enabled && !var.qurl_link_external_dns ? {
     for dvo in aws_acm_certificate.qurl_resolve[0].domain_validation_options : dvo.domain_name => {
       name   = dvo.resource_record_name
       record = dvo.resource_record_value
@@ -3420,7 +3422,7 @@ resource "aws_route53_record" "qurl_resolve_cert_validation" {
 
 # Wait for certificate validation to complete
 resource "aws_acm_certificate_validation" "qurl_resolve" {
-  count                   = var.deploy_qurl_link ? 1 : 0
+  count                   = local.qurl_resolve_endpoint_enabled ? 1 : 0
   certificate_arn         = aws_acm_certificate.qurl_resolve[0].arn
   validation_record_fqdns = var.qurl_link_external_dns ? null : [for record in aws_route53_record.qurl_resolve_cert_validation : record.fqdn]
 }
@@ -3435,7 +3437,7 @@ resource "aws_acm_certificate_validation" "qurl_resolve" {
 # When CloudFront is disabled:
 #   Flow: Browser → NLB → Server:8888
 resource "aws_route53_record" "qurl_link_resolve" {
-  count    = var.deploy_qurl_link && !var.qurl_link_external_dns ? 1 : 0
+  count    = local.qurl_resolve_endpoint_enabled && !var.qurl_link_external_dns ? 1 : 0
   provider = aws.route53_mgmt
 
   allow_overwrite = true
@@ -3444,9 +3446,9 @@ resource "aws_route53_record" "qurl_link_resolve" {
   type            = "A"
 
   alias {
-    name                   = var.enable_resolve_cloudfront ? aws_cloudfront_distribution.qurl_resolve[0].domain_name : module.compute.nlb_dns_name
-    zone_id                = var.enable_resolve_cloudfront ? aws_cloudfront_distribution.qurl_resolve[0].hosted_zone_id : module.compute.nlb_zone_id
-    evaluate_target_health = !var.enable_resolve_cloudfront
+    name                   = local.deploy_qurl_resolve_cf ? aws_cloudfront_distribution.qurl_resolve[0].domain_name : module.compute.nlb_dns_name
+    zone_id                = local.deploy_qurl_resolve_cf ? aws_cloudfront_distribution.qurl_resolve[0].hosted_zone_id : module.compute.nlb_zone_id
+    evaluate_target_health = !local.deploy_qurl_resolve_cf
   }
 
   depends_on = [time_sleep.route53_record_change_iam_propagation]
@@ -3465,7 +3467,7 @@ resource "aws_route53_record" "qurl_link_resolve" {
 # resolve.qurl.link, not the NLB's auto-generated hostname.
 # This record provides a stable domain that matches the NLB cert's SAN.
 resource "aws_route53_record" "qurl_link_resolve_origin" {
-  count    = var.deploy_qurl_link && var.enable_resolve_cloudfront && !var.qurl_link_external_dns ? 1 : 0
+  count    = local.deploy_qurl_resolve_cf && !var.qurl_link_external_dns ? 1 : 0
   provider = aws.route53_mgmt
 
   allow_overwrite = true
@@ -3492,7 +3494,7 @@ resource "aws_route53_record" "qurl_link_resolve_origin" {
 
 # ACM Certificate for CloudFront (must be in us-east-1)
 resource "aws_acm_certificate" "qurl_resolve_cloudfront" {
-  count             = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  count             = local.deploy_qurl_resolve_cf ? 1 : 0
   provider          = aws.us_east_1
   domain_name       = "resolve.${var.qurl_link_frontend_domain}"
   validation_method = "DNS"
@@ -3508,7 +3510,7 @@ resource "aws_acm_certificate" "qurl_resolve_cloudfront" {
 
 # DNS validation records for CloudFront certificate
 resource "aws_route53_record" "qurl_resolve_cf_cert_validation" {
-  for_each = var.deploy_qurl_link && var.enable_resolve_cloudfront && !var.qurl_link_external_dns ? {
+  for_each = local.deploy_qurl_resolve_cf && !var.qurl_link_external_dns ? {
     for dvo in aws_acm_certificate.qurl_resolve_cloudfront[0].domain_validation_options : dvo.domain_name => {
       name   = dvo.resource_record_name
       record = dvo.resource_record_value
@@ -3530,7 +3532,7 @@ resource "aws_route53_record" "qurl_resolve_cf_cert_validation" {
 
 # Wait for CloudFront certificate validation
 resource "aws_acm_certificate_validation" "qurl_resolve_cloudfront" {
-  count                   = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  count                   = local.deploy_qurl_resolve_cf ? 1 : 0
   provider                = aws.us_east_1
   certificate_arn         = aws_acm_certificate.qurl_resolve_cloudfront[0].arn
   validation_record_fqdns = var.qurl_link_external_dns ? null : [for record in aws_route53_record.qurl_resolve_cf_cert_validation : record.fqdn]
@@ -3538,7 +3540,7 @@ resource "aws_acm_certificate_validation" "qurl_resolve_cloudfront" {
 
 # WAF Web ACL for CloudFront (must be in us-east-1, CLOUDFRONT scope)
 resource "aws_wafv2_web_acl" "qurl_resolve" {
-  count       = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  count       = local.deploy_qurl_resolve_cf ? 1 : 0
   provider    = aws.us_east_1
   name        = "${local.name_prefix}-resolve-cf-waf"
   description = "WAF for CloudFront - QURL resolve endpoint"
@@ -3747,7 +3749,7 @@ resource "aws_wafv2_web_acl_logging_configuration" "qurl_resolve" {
 
 # CloudFront Distribution for resolve.qurl.link
 resource "aws_cloudfront_distribution" "qurl_resolve" {
-  count           = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  count           = local.deploy_qurl_resolve_cf ? 1 : 0
   enabled         = true
   is_ipv6_enabled = false # Must be false: resolve endpoint captures client IP for NHP knock.
   # IPv6 clients would get their IPv6 in X-Forwarded-For, but the AC NLB is IPv4-only,
@@ -3862,7 +3864,7 @@ locals {
   # and its monitoring subscription). The IAM-propagation shim has
   # its own broader gate per terraform/CLAUDE.md → "IAM eventual-
   # consistency shim pattern": OR of every consumer's condition.
-  deploy_qurl_resolve_cf = var.deploy_qurl_link && var.enable_resolve_cloudfront
+  deploy_qurl_resolve_cf = local.qurl_resolve_endpoint_enabled && var.enable_resolve_cloudfront
 
   # Resolve WAF logging gates on its own toggle on top of the resolve-CF gate,
   # so logs can be turned off without tearing down the edge (used by the resolve
@@ -4391,14 +4393,14 @@ resource "terraform_data" "qurl_link_invalidation" {
 # Only IPv4 cidr_blocks are used: CloudFront connects to origins over IPv4 even when
 # the viewer connection is IPv6, so ipv6_cidr_blocks are not needed for trusted proxies.
 data "aws_ip_ranges" "cloudfront_origin" {
-  count    = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  count    = local.deploy_qurl_resolve_cf ? 1 : 0
   services = ["cloudfront_origin_facing"]
 }
 
 # SSM Parameter for CloudFront CIDRs (consumed by NHP Server for SetTrustedProxies)
 # Covered by existing IAM wildcard: ssm:GetParameter on parameter/${env}/nhp/server/*
 resource "aws_ssm_parameter" "cloudfront_cidrs" {
-  count = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  count = local.deploy_qurl_resolve_cf ? 1 : 0
   name  = "/${var.environment}/nhp/server/cloudfront-cidrs"
   type  = "String"
   value = join(",", data.aws_ip_ranges.cloudfront_origin[0].cidr_blocks)
@@ -4413,7 +4415,7 @@ resource "aws_ssm_parameter" "cloudfront_cidrs" {
 # will be untrusted. This Lambda runs daily to detect drift and alarm.
 
 locals {
-  cf_drift_enabled = var.deploy_qurl_link && var.enable_resolve_cloudfront
+  cf_drift_enabled = local.deploy_qurl_resolve_cf
 }
 
 data "archive_file" "cloudfront_cidr_drift" {

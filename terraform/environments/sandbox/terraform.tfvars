@@ -571,8 +571,9 @@ qurl_reverse_tunnel_server_tunnel_auth_mode = "tunnel-auth"
 # QURL Plugin Configuration (NHP Server)
 # Enables qurl.link.layerv.xyz → qurl.site.layerv.xyz authentication flow in NHP Server
 # ==============================================================================
-# QURL plugin handles token resolution: SPA redirects to /plugins/qurl
-# which validates tokens via QURL API and performs NHP knock
+# QURL plugin handles qurl.link relay bootstrap and steady-state re-knock
+# authorization. In sandbox, browsers reach it through the JS agent + relay;
+# qurl-service is called only from NHP over the internal API.
 # api_url points at the internal-ALB hostname (workload-account PHZ
 # alias). NHP server is in private subnets and resolves the PHZ via the
 # VPC Route 53 Resolver. The plugin only calls /internal/v1/*, which is
@@ -604,15 +605,13 @@ deploy_qurl_link          = true
 qurl_link_frontend_domain = "qurl.link.layerv.xyz"
 qurl_link_hosted_zone_id  = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
 qurl_link_external_dns    = false
-# #2208/#2680 sandbox staging: serve the browser NHP agent bundle from the same
-# qurl.link origin so the relay browser cutover can mount it without adding a
-# new public host. The page still uses the legacy resolve form until #2680's
-# browser handoff flips the client-side control flow; this only makes the
-# reviewed bundle available behind the sandbox distribution and adjusts CSP
-# for that same-origin module load plus relay fetches.
+# #2208/#2680 sandbox cutover: serve the browser NHP agent bundle from the same
+# qurl.link origin, render relay bootstrap config into the verifier, and disable
+# the public resolve endpoint so browser ingress is relay-only.
 qurl_link_js_agent_enabled = true
 
-# CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
+# Legacy resolve CloudFront toggle. Inert while qurl_link_js_agent_enabled=true
+# because the root module disables resolve ingress for the JS-agent flow.
 enable_resolve_cloudfront = true
 
 # Resolve WAF: run the Amazon IP-reputation rule in COUNT (observe, don't block).

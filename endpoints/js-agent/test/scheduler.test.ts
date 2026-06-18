@@ -9,6 +9,7 @@ function grant(openTimeSeconds: number): KnockSuccess {
     acTokens: {},
     openTimeSeconds,
     agentAddr: "",
+    redirectUrl: "",
   };
 }
 

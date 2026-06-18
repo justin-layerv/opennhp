@@ -82,6 +82,7 @@ describe("knock (qURL agent loop)", () => {
       acTokens: { r_jsagent: "tok-abc123" },
       openTimeSeconds: 900,
       agentAddr: "203.0.113.9",
+      redirectUrl: "",
     });
   });
 
@@ -96,6 +97,7 @@ describe("knock (qURL agent loop)", () => {
       acTokens: { r_jsagent: "tok-abc123" },
       openTimeSeconds: 900,
       agentAddr: "203.0.113.9",
+      redirectUrl: "",
     });
   });
 

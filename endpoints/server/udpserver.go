@@ -3991,6 +3991,10 @@ func (us *UdpServer) NewNhpServerHelper(ppd *core.PacketParserData, aspData *com
 	h.AuthWithNhpCallbackFunc = func(req *common.NhpAuthRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 		return us.handleNhpOpenResource(req, res)
 	}
+	h.ResolveResourceFunc = func(aspId, resId, srcIP string) (*common.ResourceData, error) {
+		_ = srcIP // Dynamic qURL rows resolve by exact (aspId, resId).
+		return us.ResolveInternalKnockResource(us.LifecycleCtx(), aspId, resId, "HandleKnockRequest-resource")
+	}
 
 	return h
 }

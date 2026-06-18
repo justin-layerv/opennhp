@@ -6,11 +6,11 @@ package smoke
 //
 // This file lives in the Tier 2 range deliberately. The dominant
 // framing is the consumer contract NHP makes: the deployed SPA must
-// contain the JS that constructs and submits the six t_*_ms fields,
-// must POST to a hostname-derived resolve endpoint, must include the
-// serving host in the allowlist, and must serve the CSP that lets the
-// inline IIFE execute. The PR #1842 "regression fence" framing is a
-// secondary reading of the same contract from a Tier 1 angle.
+// contain the verifier JS for the environment's selected qurl.link ingress:
+// sandbox uses the same-origin JS agent and HTTPS relay, while legacy envs
+// still POST to a hostname-derived resolve endpoint. The deployed page must
+// include the serving host in the allowlist and must serve the CSP that lets
+// the inline IIFE execute.
 //
 // Capability added in PR #1824. A drift where terraform uploads a
 // stripped-down build loses the wire silently — visits stay up,
@@ -57,16 +57,12 @@ import (
 	"testing"
 )
 
-// TestQurlLinkFrontend_DeploysBrowserTimingInstrumentation fences
-// the structural drift class introduced and fenced by PR #1842.
-//
-// Bytes, not behavior: a syntax error in the SPA that breaks
-// execution would still pass this test as long as the source strings
-// are present. Headless-browser execution is out of scope for smoke
-// per CLAUDE.md; the end-to-end wire is verified by
-// 12_qurl_browser_timings_test.go (server contract) +
-// post-deploy click-through (acceptance gate).
-func TestQurlLinkFrontend_DeploysBrowserTimingInstrumentation(t *testing.T) {
+// TestQurlLinkFrontend_VerifierWireContract fences the verifier ingress shape.
+// Bytes, not behavior: a syntax error in the SPA that breaks execution would
+// still pass this test as long as the source strings are present. Headless
+// browser execution is out of scope for smoke per CLAUDE.md; this is a deployed
+// byte tripwire.
+func TestQurlLinkFrontend_VerifierWireContract(t *testing.T) {
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
 	bodyStr := string(body)
@@ -75,8 +71,34 @@ func TestQurlLinkFrontend_DeploysBrowserTimingInstrumentation(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want text/html* (qurl.link / must serve the SPA, not a JSON / redirect)", ct)
 	}
 
-	// appendBrowserTimings is the load-bearing entry point. A build
-	// that drops it has no path to constructing the t_*_ms fields.
+	if qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
+		wantSnippets := []string{
+			"QURL_LINK_CONFIG",
+			"import('/nhp-agent.min.js')",
+			"agent.generateDeviceKeyPair()",
+			"agent.knock({",
+			"qurlAccessToken: accessToken",
+			"qurlUserAgent:",
+			"serverStaticPubB64",
+			"relayBaseUrl",
+		}
+		var missing []string
+		for _, want := range wantSnippets {
+			if !strings.Contains(bodyStr, want) {
+				missing = append(missing, want)
+			}
+		}
+		if len(missing) > 0 {
+			t.Fatalf("deployed JS-agent qurl.link verifier is missing snippet(s): %v", missing)
+		}
+		if strings.Contains(bodyStr, "https://resolve.") || strings.Contains(bodyStr, "/plugins/qurl") || strings.Contains(bodyStr, "appendBrowserTimings") {
+			t.Fatalf("deployed JS-agent qurl.link verifier still contains legacy browser-to-resolve code; browser ingress must be relay-only in env %q.", testConfig.Environment)
+		}
+		return
+	}
+
+	// Legacy envs still use the browser timing form POST until their JS-agent
+	// cutover flag flips. appendBrowserTimings is the load-bearing entry point.
 	if !strings.Contains(bodyStr, "appendBrowserTimings") {
 		t.Fatalf("deployed SPA does not contain appendBrowserTimings — frontend timing instrumentation regressed.")
 	}
@@ -261,17 +283,29 @@ func qurlOGImageHasLayerVWordmarkPixels(img image.Image) bool {
 	return brandPixels >= 120
 }
 
-// TestQurlLinkFrontend_PostsToHostnameDerivedResolveURL fences the
-// hostname-derivation invariant. Reintroducing a baked-in URL (e.g.,
-// the dropped var.nhp_resolve_url) would re-couple every new env to a
-// frontend rebuild — exactly the coupling this PR removed.
-func TestQurlLinkFrontend_PostsToHostnameDerivedResolveURL(t *testing.T) {
+// TestQurlLinkFrontend_UsesExpectedIngress fences the environment-specific
+// ingress: JS-agent environments must use relay only; legacy environments keep
+// the hostname-derived resolve endpoint until their cutover flag flips.
+func TestQurlLinkFrontend_UsesExpectedIngress(t *testing.T) {
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
 
+	bodyStr := string(body)
+	if qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
+		for _, want := range qurlLinkJSAgentNetworkOrigins[testConfig.Environment] {
+			if !strings.Contains(bodyStr, want) {
+				t.Fatalf("deployed JS-agent qurl.link verifier does not contain relay origin %q.", want)
+			}
+		}
+		if strings.Contains(bodyStr, "'https://resolve.' + hostname + '/plugins/qurl'") {
+			t.Fatalf("deployed JS-agent qurl.link verifier still derives resolve URL from window.location.hostname.")
+		}
+		return
+	}
+
 	want := "'https://resolve.' + hostname + '/plugins/qurl'"
-	if !strings.Contains(string(body), want) {
-		t.Fatalf("deployed SPA does not derive RESOLVE_URL from window.location.hostname; expected substring %q.", want)
+	if !strings.Contains(bodyStr, want) {
+		t.Fatalf("legacy deployed SPA does not derive resolve URL from window.location.hostname; expected substring %q.", want)
 	}
 }
 
@@ -313,9 +347,8 @@ func TestQurlLinkFrontend_AllowlistContainsServingHost(t *testing.T) {
 //  3. Envs with the browser NHP agent explicitly allow 'self', matching the
 //     Terraform switch that uploads nhp-agent.min.js beside the verifier shell.
 //  4. Envs with the browser NHP agent also list the relay origin in
-//     connect-src, plus the resolve origin that hands the browser those relay
-//     inputs; otherwise the first cross-origin fetch is blocked by default-src
-//     'self' before resolve, relay, or server can see it.
+//     connect-src; otherwise the cross-origin relay POST is blocked by
+//     default-src 'self' before relay or server can see it.
 //
 // If a future PR moves to a hash- or nonce-based CSP, that PR must
 // update this assertion in lockstep.
@@ -355,15 +388,14 @@ var qurlLinkJSAgentEnabledEnvs = map[string]bool{
 	"sandbox": true,
 }
 
-// qurlLinkJSAgentNetworkOrigins mirrors the resolve.<qurl-link-host> convention
-// and the relay_dns_name Terraform input used to derive relay_connect_src_origin
-// for qurl-link. This is the full non-self browser connection set allowed by
-// CSP on the agent path; future telemetry or agent fetches to another host must
-// update Terraform and this smoke mirror together. Keep this in lockstep with
-// the env tfvars when the browser agent is enabled in another env.
+// qurlLinkJSAgentNetworkOrigins mirrors the relay_dns_name Terraform input used
+// to derive relay_connect_src_origin for qurl-link. This is the full non-self
+// browser connection set allowed by CSP on the agent path; future telemetry or
+// agent fetches to another host must update Terraform and this smoke mirror
+// together. Keep this in lockstep with the env tfvars when the browser agent is
+// enabled in another env.
 var qurlLinkJSAgentNetworkOrigins = map[string][]string{
 	"sandbox": {
-		"https://resolve.qurl.link.layerv.xyz",
 		"https://relay.qurl.link.layerv.xyz",
 	},
 }
@@ -437,7 +469,7 @@ func TestQurlLinkFrontend_CSPAllowsInlineScript(t *testing.T) {
 		}
 		wantConnectSrcFields := append([]string{"'self'"}, networkOrigins...)
 		if !sameStringSet(connectSrc, wantConnectSrcFields) {
-			t.Fatalf("CSP connect-src directive fields = %q, want set %q so the browser cutover can fetch resolve inputs and POST knocks to the relay. CSP: %q",
+			t.Fatalf("CSP connect-src directive fields = %q, want set %q so the browser cutover can POST knocks to the relay. CSP: %q",
 				connectSrc, wantConnectSrcFields, csp)
 		}
 	} else if connectSrc != nil {

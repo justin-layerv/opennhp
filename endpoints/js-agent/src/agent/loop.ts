@@ -10,25 +10,23 @@ import {
 import { relayPost, type RelayTransport } from "./relay.js";
 
 /** The server granted access: the resource-host and AC-token maps (keyed by
- * resource id), the granted duration, and the agent's source address as the
- * server saw it — from `ServerKnockAckMsg` (`nhp/common/nhpmsg.go`).
- *
- * The success ACK also carries `redirectUrl` (the `*.qurl.site` destination) and
- * `preActions` (pre-access steps); both are deliberately not surfaced yet —
- * whether the page needs the ACK's copy or already holds them from the qURL
- * resolve step is a PR-6 design question, and the field is backward-compatible to
- * add later. `aspToken` is AC-internal and intentionally dropped. */
+ * resource id), the granted duration, the relay-observed source address, and the
+ * qURL destination to navigate to — from `ServerKnockAckMsg`
+ * (`nhp/common/nhpmsg.go`). `aspToken` is AC-internal and intentionally
+ * dropped. */
 export interface KnockSuccess {
   kind: "success";
   resourceHosts: Record<string, string>;
   acTokens: Record<string, string>;
   openTimeSeconds: number;
   agentAddr: string;
+  redirectUrl: string;
 }
 
 /** The server authenticated the knock but has no active session for this client
- * (deny code 52024, `ErrQurlSessionExpired`). The caller must re-resolve the
- * qURL link to mint a fresh session and knock again — *not* retry this knock. */
+ * (deny code 52024, `ErrQurlSessionExpired`). The caller must restart qURL
+ * bootstrap with the original token when it still has one; retrying a tokenless
+ * re-knock cannot mint a new session. */
 export interface KnockReResolve {
   kind: "reResolve";
 }
@@ -55,15 +53,18 @@ export type KnockResult =
   | KnockServerError
   | KnockCookieChallenge;
 
-/** A single knock's inputs. `serverStaticPub`, `relayBaseUrl`, `authServiceId`,
- * and `resourceId` come from the qURL resolve; `deviceStaticPriv` is the agent's
- * static key. */
+/** A single knock's inputs. `serverStaticPub` and `relayBaseUrl` are static
+ * qurl.link deployment config. The initial qURL bootstrap passes
+ * `qurlAccessToken` plus browser metadata that NHP forwards internally;
+ * steady-state renewals pass `resourceId`. */
 export interface KnockRequest {
   deviceStaticPriv: Uint8Array;
   serverStaticPub: Uint8Array;
   relayBaseUrl: string;
   authServiceId: string;
-  resourceId: string;
+  resourceId?: string;
+  qurlAccessToken?: string;
+  qurlUserAgent?: string;
 }
 
 /** Injectable seams: a mock relay transport and pinned entropy. Production
@@ -95,6 +96,7 @@ interface ServerKnockAck {
   acTokens?: Record<string, string>;
   opnTime?: number;
   agentAddr?: string;
+  redirectUrl?: string;
 }
 
 /**
@@ -124,6 +126,8 @@ export async function knock(
   const body = buildKnockBody({
     authServiceId: req.authServiceId,
     resourceId: req.resourceId,
+    qurlAccessToken: req.qurlAccessToken,
+    qurlUserAgent: req.qurlUserAgent,
   });
   const { packet, counter } = createKnock(
     req.deviceStaticPriv,
@@ -134,9 +138,8 @@ export async function knock(
 
   // serverId is PR-1's relay routing id — the cell's server-pubkey fingerprint,
   // the key relay.toml is indexed by. Derived from `serverStaticPub` rather than
-  // taken from the resolve separately, so the cell we route to can't diverge from
-  // the key the crypto authenticates against. (qurl-service returns both at
-  // resolve; the design contract is that they agree — serverId == fingerprint.)
+  // carried as separate config, so the cell we route to can't diverge from the
+  // key the crypto authenticates against.
   const serverId = pubKeyFingerprint(req.serverStaticPub);
   const replyBytes = await transport(serverId, packet);
   const reply = await decryptReply(
@@ -191,5 +194,6 @@ export async function knock(
     acTokens: ack.acTokens ?? {},
     openTimeSeconds: ack.opnTime ?? 0,
     agentAddr: ack.agentAddr ?? "",
+    redirectUrl: ack.redirectUrl ?? "",
   };
 }

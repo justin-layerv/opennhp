@@ -1,6 +1,7 @@
 package qurl
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,6 +89,170 @@ func TestAuthWithNHP_Allow_OpensPinhole_CapsOpenTime(t *testing.T) {
 	}
 	if ack.ErrCode != common.ErrSuccess.ErrorCode() {
 		t.Errorf("ack.ErrCode = %q, want success", ack.ErrCode)
+	}
+}
+
+func TestAuthWithNHP_Bootstrap_ResolvesTokenRegistersPubkeyAndOpens(t *testing.T) {
+	const (
+		accessToken = "at_1234567890123456789012"
+		userAgent   = "Mozilla/5.0 qurl-link-test"
+		publicKey   = "mN5hEQiIhhwAhpiIxbgMsAqf6x9SZB8Z1Z4h6q67AD4="
+		resourceID  = "r_bootstrap01"
+		redirectURL = "https://r_bootstrap01.qurl.site"
+	)
+
+	setTestResolver(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/browser-relay/resolve" {
+			t.Errorf("resolve path = %s, want /internal/v1/browser-relay/resolve", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if got := r.Header.Get(ServiceTokenHeader); got != "test-token" {
+			t.Errorf("%s = %q, want test-token", ServiceTokenHeader, got)
+		}
+
+		var got BrowserRelayResolveRequest
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode browser relay resolve request: %v", err)
+		}
+		if got.AccessToken != accessToken {
+			t.Errorf("access_token = %q, want %q", got.AccessToken, accessToken)
+		}
+		if got.SrcIP != "203.0.113.7" {
+			t.Errorf("src_ip = %q, want 203.0.113.7", got.SrcIP)
+		}
+		if got.UserAgent != userAgent {
+			t.Errorf("user_agent = %q, want %q", got.UserAgent, userAgent)
+		}
+		if got.AuthenticatedAgentPublicKey != publicKey {
+			t.Errorf("authenticated_agent_public_key = %q, want %q", got.AuthenticatedAgentPublicKey, publicKey)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(internalResolveResponse{
+			Success: true,
+			Data: &ResolveResponse{
+				ResourceID:    resourceID,
+				NHPResourceID: testNHPResourceID,
+				QurlSiteURL:   redirectURL,
+				JWTSecret:     "test-jwt-secret",
+				TokenExpire:   3600,
+				OpenTime:      20,
+				CookieDomain:  ".qurl.site",
+			},
+		})
+	})
+
+	req := testAuthReq(qurlBootstrapResourceID)
+	req.PublicKey = publicKey
+	req.Msg.AuthServiceId = PluginID
+	req.Msg.UserData = map[string]any{
+		qurlAccessTokenUserDataKey: accessToken,
+		qurlUserAgentUserDataKey:   userAgent,
+	}
+
+	var catalogResolved bool
+	var opened bool
+	helper := &plugins.NhpServerPluginHelper{
+		AspData: testAspData("unused-bootstrap-sentinel", 60),
+		ResolveResourceFunc: func(aspID, resID, srcIP string) (*common.ResourceData, error) {
+			catalogResolved = true
+			if aspID != PluginID {
+				t.Errorf("catalog aspID = %q, want %q", aspID, PluginID)
+			}
+			if resID != testNHPResourceID {
+				t.Errorf("catalog resID = %q, want %q", resID, testNHPResourceID)
+			}
+			if srcIP != "203.0.113.7" {
+				t.Errorf("catalog srcIP = %q, want 203.0.113.7", srcIP)
+			}
+			return &common.ResourceData{
+				ResourceGroup: common.ResourceGroup{
+					AuthServiceId: aspID,
+					ResourceId:    resID,
+					OpenTime:      60,
+					Resources: map[string]*common.ResourceInfo{
+						"ac-1": {ACId: "ac-1", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}},
+					},
+				},
+				SkipAuth: true,
+			}, nil
+		},
+		AuthWithNhpCallbackFunc: func(req *common.NhpAuthRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			opened = true
+			if req.Msg.ResourceId != resourceID {
+				t.Errorf("knock ResourceId passed to callback = %q, want public resource id %q", req.Msg.ResourceId, resourceID)
+			}
+			if res.ResourceId != resourceID {
+				t.Errorf("opened ResourceId = %q, want %q", res.ResourceId, resourceID)
+			}
+			if res.OpenTime != 20 {
+				t.Errorf("opened OpenTime = %d, want qurl-service clamp 20", res.OpenTime)
+			}
+			if res.RedirectUrl != redirectURL {
+				t.Errorf("opened RedirectUrl = %q, want %q", res.RedirectUrl, redirectURL)
+			}
+			req.Ack.ErrCode = common.ErrSuccess.ErrorCode()
+			return req.Ack, nil
+		},
+	}
+
+	ack, err := AuthWithNHP(req, helper)
+	if err != nil {
+		t.Fatalf("AuthWithNHP bootstrap: %v", err)
+	}
+	if !catalogResolved {
+		t.Fatal("bootstrap did not resolve AC routing from the NHP catalog")
+	}
+	if !opened {
+		t.Fatal("bootstrap did not open the AC pinhole")
+	}
+	if ack.OpenTime != 20 {
+		t.Errorf("ack.OpenTime = %d, want 20", ack.OpenTime)
+	}
+	if ack.RedirectUrl != redirectURL {
+		t.Errorf("ack.RedirectUrl = %q, want %q", ack.RedirectUrl, redirectURL)
+	}
+}
+
+func TestAuthWithNHP_BootstrapTerminalDeny_NoPinhole(t *testing.T) {
+	setTestResolver(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/browser-relay/resolve" {
+			t.Errorf("resolve path = %s, want browser-relay endpoint", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusGone)
+		_ = json.NewEncoder(w).Encode(internalResolveResponse{
+			Success: false,
+			Error:   &resolveError{Code: "token_consumed", Message: "token consumed"},
+		})
+	})
+
+	req := testAuthReq(qurlBootstrapResourceID)
+	req.Msg.AuthServiceId = PluginID
+	req.Msg.UserData = map[string]any{
+		qurlAccessTokenUserDataKey: "at_1234567890123456789012",
+		qurlUserAgentUserDataKey:   "Mozilla/5.0 qurl-link-test",
+	}
+
+	opened := false
+	helper := &plugins.NhpServerPluginHelper{
+		AspData:             testAspData("unused-bootstrap-sentinel", 60),
+		ResolveResourceFunc: defaultCatalogResolver(),
+		AuthWithNhpCallbackFunc: func(*common.NhpAuthRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			opened = true
+			return nil, nil
+		},
+	}
+	ack, err := AuthWithNHP(req, helper)
+	if err == nil {
+		t.Fatal("expected bootstrap terminal deny")
+	}
+	if opened {
+		t.Fatal("terminal token denial must not open the AC pinhole")
+	}
+	if ack.ErrCode != common.ErrQurlSessionExpired.ErrorCode() {
+		t.Errorf("ack.ErrCode = %q, want qurl-session-expired", ack.ErrCode)
 	}
 }
 
