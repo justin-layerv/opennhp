@@ -128,7 +128,7 @@ resource "aws_iam_instance_profile" "relay" {
 resource "aws_security_group" "relay" {
   name_prefix = "${var.name_prefix}-relay-"
   vpc_id      = var.vpc_id
-  description = "NHP Relay node: ALB ingress on the HTTPS backend port; server UDP-ACK return ingress; all egress."
+  description = "NHP Relay node: ALB ingress, NHP UDP return from servers, scoped control-plane egress."
 
   tags = merge(local.tags, { Name = "${var.name_prefix}-sg-relay" })
 
@@ -154,33 +154,64 @@ resource "aws_vpc_security_group_ingress_rule" "relay_http_from_alb" {
   tags = { Name = "${var.name_prefix}-relay-https-from-alb" }
 }
 
-# Inbound UDP-ACK return from the cell server. SGs are stateful, so for today's
-# DIRECT relay→server path (the relay initiates the flow) conntrack already
-# allows the ACK — this rule is belt-and-suspenders there. It becomes
-# LOAD-BEARING under #8 (#2628): once the relay forwards through the cell's
-# internal NLB, the server replies from its own address (not the NLB address the
-# relay sent to), so the return is a new flow conntrack won't auto-allow. Scoped
-# to the VPC CIDR — the server is in-VPC.
+# Inbound UDP-ACK return from the cell server. SGs are stateful, but the
+# relay->server hop uses the cell's internal UDP NLB with preserve_client_ip=true:
+# the relay sends to an NLB node, while the server replies from its own ENI. That
+# source differs from the original destination, so conntrack does not reliably
+# classify the ACK as return traffic. Keep the explicit return hole, but scope it
+# to the NHP server SG instead of the whole VPC.
 resource "aws_vpc_security_group_ingress_rule" "relay_udp_ack_return" {
-  security_group_id = aws_security_group.relay.id
-  description       = "NHP_RLY ACK return from the cell server"
-  from_port         = var.udp_listen_port
-  to_port           = var.udp_listen_port
-  ip_protocol       = "udp"
-  cidr_ipv4         = var.vpc_cidr_block
+  security_group_id            = aws_security_group.relay.id
+  description                  = "NHP_RLY ACK return from cell server instances"
+  from_port                    = var.udp_listen_port
+  to_port                      = var.udp_listen_port
+  ip_protocol                  = "udp"
+  referenced_security_group_id = var.server_security_group_id
 
   tags = { Name = "${var.name_prefix}-relay-udp-ack-return" }
 }
 
-# All egress: in-VPC UDP to the server (62206) + internet (NAT) for ECR / SSM /
-# Secrets Manager pulls. Mirrors the server SG's single broad egress rule.
-resource "aws_vpc_security_group_egress_rule" "relay_all" {
-  security_group_id = aws_security_group.relay.id
-  description       = "All outbound (server UDP in-VPC + ECR/SSM/Secrets via NAT)"
-  ip_protocol       = "-1"
-  cidr_ipv4         = "0.0.0.0/0"
+# Data-plane egress: NHP_RLY only, UDP 62206, to the private subnet CIDRs that
+# host the internal cell NLB and server fleet. The relay does not get generic
+# internet egress.
+resource "aws_vpc_security_group_egress_rule" "relay_to_nhp_udp" {
+  for_each = local.private_subnet_cidr_blocks
 
-  tags = { Name = "${var.name_prefix}-relay-egress" }
+  security_group_id = aws_security_group.relay.id
+  description       = "NHP_RLY to cell servers on UDP 62206"
+  from_port         = local.nhp_server_udp_port
+  to_port           = local.nhp_server_udp_port
+  ip_protocol       = "udp"
+  cidr_ipv4         = each.value
+
+  tags = { Name = "${var.name_prefix}-relay-egress-nhp-${replace(each.value, "/", "-")}" }
+}
+
+# Control-plane bootstrap egress. Relay instances pull their image, read SSM and
+# Secrets Manager, and emit logs/metrics through interface VPC endpoints. This is
+# intentionally SG-referenced and TCP/443-only; no NAT-wide egress.
+resource "aws_vpc_security_group_egress_rule" "relay_to_vpc_endpoints_https" {
+  security_group_id            = aws_security_group.relay.id
+  description                  = "AWS control-plane endpoints over HTTPS"
+  from_port                    = 443
+  to_port                      = 443
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = var.vpc_endpoint_security_group_id
+
+  tags = { Name = "${var.name_prefix}-relay-egress-vpce-https" }
+}
+
+# ECR image layer downloads resolve to S3. S3 is a gateway endpoint (no endpoint
+# SG), so scope HTTPS egress to AWS's regional S3 prefix list instead of 0/0.
+resource "aws_vpc_security_group_egress_rule" "relay_to_s3_https" {
+  security_group_id = aws_security_group.relay.id
+  description       = "S3 gateway endpoint over HTTPS for ECR layer downloads"
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+  prefix_list_id    = data.aws_prefix_list.s3.id
+
+  tags = { Name = "${var.name_prefix}-relay-egress-s3-https" }
 }
 
 # ── Launch template ──

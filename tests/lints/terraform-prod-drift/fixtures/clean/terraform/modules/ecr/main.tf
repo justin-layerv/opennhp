@@ -20,7 +20,8 @@ resource "aws_iam_role_policy" "cloudformation_website_api" {
         Effect = "Allow"
         Action = [
           "cloudformation:DescribeStacks",
-          "cloudformation:GetTemplate"
+          "cloudformation:GetTemplate",
+          "ec2:DescribePrefixLists"
         ]
         Resource = "*"
       }

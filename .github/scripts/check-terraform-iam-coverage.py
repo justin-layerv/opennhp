@@ -117,6 +117,9 @@ DATA_SOURCE_ACTIONS: dict[str, DataSourceActions] = {
     # internal/service/ec2/availability_zones_data_source.go calls
     # ec2:DescribeAvailabilityZones.
     "aws_availability_zones": ["ec2:DescribeAvailabilityZones"],
+    # internal/service/ec2/vpc_prefix_list_data_source.go calls
+    # ec2:DescribePrefixLists.
+    "aws_prefix_list": ["ec2:DescribePrefixLists"],
     # internal/service/ec2/subnet_data_source.go calls ec2:DescribeSubnets.
     "aws_subnet": ["ec2:DescribeSubnets"],
     # internal/service/cloudformation/stack_data_source.go: findStackByName

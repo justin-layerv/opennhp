@@ -5049,10 +5049,12 @@ module "relay" {
   tags       = merge(local.common_tags, { Service = "nhp-relay" })
 
   # Networking — direct refs (intra-repo).
-  vpc_id             = module.networking.vpc_id
-  vpc_cidr_block     = module.networking.vpc_cidr
-  public_subnet_ids  = module.networking.public_subnet_ids
-  private_subnet_ids = module.networking.private_subnet_ids
+  vpc_id                         = module.networking.vpc_id
+  public_subnet_ids              = module.networking.public_subnet_ids
+  private_subnet_ids             = module.networking.private_subnet_ids
+  private_subnet_cidr_blocks     = module.networking.private_subnet_cidr_blocks
+  server_security_group_id       = module.compute.security_group_id
+  vpc_endpoint_security_group_id = module.networking.vpc_endpoint_security_group_id
 
   # Relay image (5b-1 ECR repo) + AMI (reuse the server AMI: Docker + awscli +
   # the systemd-resolved stub fix the relay's startup CloudMap resolve needs).

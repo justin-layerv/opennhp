@@ -14,6 +14,9 @@
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {} # used by access_logs.tf (ELB delivery policy ARNs)
+data "aws_prefix_list" "s3" {
+  name = "com.amazonaws.${data.aws_region.current.id}.s3"
+}
 
 # AMI: default to the SSM-published server AMI (Docker + awscli + the
 # systemd-resolved stub-disable fix the relay's startup CloudMap resolve needs).
@@ -28,6 +31,10 @@ locals {
   is_prod = var.environment == "prod"
 
   ami_id = var.server_ami_id != null ? var.server_ami_id : data.aws_ssm_parameter.server_ami[0].value
+
+  nhp_server_udp_port = 62206
+
+  private_subnet_cidr_blocks = toset(var.private_subnet_cidr_blocks)
 
   tags = merge(var.tags, {
     Environment = var.environment

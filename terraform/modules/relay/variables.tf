@@ -60,13 +60,23 @@ variable "vpc_id" {
   type        = string
 }
 
-variable "vpc_cidr_block" {
-  description = "CIDR of `vpc_id`. Used by the ALB→relay and server→relay (UDP return) SG rules. Pass `module.networking.vpc_cidr`."
+variable "vpc_endpoint_security_group_id" {
+  description = "Security group ID shared by interface VPC endpoints. Relay instances use this for tightly scoped AWS control-plane egress (ECR, SSM, Secrets Manager, CloudWatch Logs/Metrics) instead of internet-wide outbound."
   type        = string
 
   validation {
-    condition     = can(cidrhost(var.vpc_cidr_block, 0))
-    error_message = "vpc_cidr_block must be valid CIDR notation (e.g. `10.0.0.0/16`)."
+    condition     = can(regex("^sg-[0-9a-f]+$", var.vpc_endpoint_security_group_id))
+    error_message = "vpc_endpoint_security_group_id must be a security group ID."
+  }
+}
+
+variable "server_security_group_id" {
+  description = "NHP server instance security group ID. Relay nodes accept only UDP ACK return traffic from this SG."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sg-[0-9a-f]+$", var.server_security_group_id))
+    error_message = "server_security_group_id must be a security group ID."
   }
 }
 
@@ -87,6 +97,21 @@ variable "private_subnet_ids" {
   validation {
     condition     = length(var.private_subnet_ids) >= 1
     error_message = "private_subnet_ids must include at least 1 subnet."
+  }
+}
+
+variable "private_subnet_cidr_blocks" {
+  description = "Private subnet CIDR blocks that host the internal NHP server/NLB path. Relay nodes get UDP 62206 egress only to these CIDRs."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.private_subnet_cidr_blocks) >= 1
+    error_message = "private_subnet_cidr_blocks must include at least 1 CIDR."
+  }
+
+  validation {
+    condition     = alltrue([for cidr in var.private_subnet_cidr_blocks : can(cidrhost(cidr, 0))])
+    error_message = "private_subnet_cidr_blocks entries must be valid CIDR notation."
   }
 }
 
@@ -186,6 +211,11 @@ variable "cell_servers" {
   validation {
     condition     = alltrue([for s in var.cell_servers : s.port > 0 && s.port < 65536])
     error_message = "each cell_servers[*].port must be a valid UDP port (1-65535)."
+  }
+
+  validation {
+    condition     = alltrue([for s in var.cell_servers : s.port == 62206])
+    error_message = "each cell_servers[*].port must be 62206. The relay data plane is intentionally locked to NHP UDP only."
   }
 }
 

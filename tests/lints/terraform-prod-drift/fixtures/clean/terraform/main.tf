@@ -1,4 +1,4 @@
-# Clean fixture: a data source paired with the matching IAM grant on the
+# Clean fixture: data sources paired with matching IAM grants on the
 # canonical github_actions role (declared under modules/ecr/, mirroring
 # the real terraform tree). Both lints expect exit 0.
 #
@@ -12,6 +12,10 @@
 data "aws_cloudformation_stack" "website_api" {
   count = var.deploy_website_api_dns ? 1 : 0
   name  = "fixture-stack"
+}
+
+data "aws_prefix_list" "s3" {
+  name = "com.amazonaws.us-east-1.s3"
 }
 
 variable "deploy_website_api_dns" {

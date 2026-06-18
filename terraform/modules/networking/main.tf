@@ -25,6 +25,7 @@ locals {
       "ecr-dkr"          = "ecr.dkr"
       "guardduty-data"   = "guardduty-data" # Required for Runtime Monitoring agent on EC2
       "logs"             = "logs"
+      "monitoring"       = "monitoring"
       "secretsmanager"   = "secretsmanager"
       "servicediscovery" = "servicediscovery"
       "ssm"              = "ssm"
