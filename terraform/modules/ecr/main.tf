@@ -417,24 +417,100 @@ locals {
     ]
   })
 
-  # Cross-account ECR policy (shared across repos)
-  # Note: secondary_account_ids should be passed from tfvars for cross-account pull
-  ecr_cross_account_policy = length(var.secondary_account_ids) > 0 ? jsonencode({
+  # Cross-account ECR policy statement (shared across repos).
+  # Note: secondary_account_ids should be passed from tfvars for cross-account pull.
+  ecr_cross_account_policy_statements = length(var.secondary_account_ids) > 0 ? [{
+    Sid    = "AllowCrossAccountPull"
+    Effect = "Allow"
+    Principal = {
+      AWS = [for account_id in var.secondary_account_ids : "arn:aws:iam::${account_id}:root"]
+    }
+    Action = [
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:BatchGetImage",
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:DescribeImages"
+    ]
+  }] : []
+
+  ecr_cross_account_policy = length(local.ecr_cross_account_policy_statements) > 0 ? jsonencode({
+    Version   = "2012-10-17"
+    Statement = local.ecr_cross_account_policy_statements
+  }) : null
+
+  ecr_qurl_scanner_lambda_actions = [
+    "ecr:BatchGetImage",
+    "ecr:GetDownloadUrlForLayer"
+  ]
+
+  # The ECR module has no cell_id input, so the wildcard after the literal
+  # name_prefix separator intentionally covers every scanner cell in this
+  # primary account/region, even if future function names change or drop the
+  # current `cellN` segment. The trailing `*` also covers the active-recheck
+  # sibling Lambda and any future scanner-prefixed sibling in the same
+  # account/region. Issue #2705 tracks narrowing this once exact scanner
+  # function identity is available here without introducing a module cycle.
+  # Keep this pattern in lockstep with `scanner_lambda_function_name` and
+  # `scanner_active_recheck_function_name` in modules/qurl-service/scanner_lambda.tf.
+  # Both modules are wired from terraform/main.tf with the same
+  # `local.name_prefix`; do not split those root inputs without also narrowing
+  # or reworking this SourceArn.
+  ecr_qurl_scanner_lambda_source_arn = "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-*qurl-scanner*"
+
+  # Lambda functions need the ECR service principal to retrieve images for
+  # inactive image-backed functions. Without this, the qurl-scanner Lambda can
+  # enter ImageAccessDenied after the first idle cycle even though EventBridge
+  # keeps firing the schedule.
+  ecr_qurl_scanner_lambda_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid    = "AllowCrossAccountPull"
+    Statement = concat(local.ecr_cross_account_policy_statements, [{
+      Sid    = "LambdaECRImageRetrievalPolicy"
       Effect = "Allow"
       Principal = {
-        AWS = [for account_id in var.secondary_account_ids : "arn:aws:iam::${account_id}:root"]
+        Service = "lambda.amazonaws.com"
       }
-      Action = [
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:DescribeImages"
-      ]
-    }]
-  }) : null
+      Action = local.ecr_qurl_scanner_lambda_actions
+      Condition = {
+        StringLike = {
+          # SourceArn already pins account and region. aws:SourceAccount would
+          # be defense-in-depth here, but it does not change confinement and
+          # would make Terraform own a broader condition shape than needed.
+          "aws:SourceArn" = local.ecr_qurl_scanner_lambda_source_arn
+        }
+      }
+    }])
+  })
+
+  # Repository policies are Terraform-owned only in the primary account because
+  # prod repositories are replication-created in the secondary account. Issue
+  # #2699 tracks Terraform ownership for the replicated qurl-scanner Lambda policy.
+  # Keep non-scanner repos behind the `secondary_account_ids` branch: their
+  # policy is `local.ecr_cross_account_policy`, which is null without
+  # secondary pull accounts. The scanner repo is the only entry unconditional
+  # with respect to secondary pull accounts because it uses the always-non-null
+  # Lambda retrieval policy.
+  ecr_repository_policy_repos = var.is_primary_account ? distinct(concat(
+    length(var.secondary_account_ids) > 0 ? local.ecr_repos : [],
+    var.deploy_qurl_ecr ? ["qurl-scanner-lambda"] : []
+  )) : []
+
+  # Shared matcher for the scanner policy fences below. `generated` guards the
+  # rendered local policy against future structural drift; `wired` is the
+  # load-bearing primary-account check that the scanner repo uses that policy.
+  ecr_qurl_scanner_lambda_policy_match_sources = {
+    generated = jsondecode(local.ecr_qurl_scanner_lambda_policy).Statement
+    wired     = try(jsondecode(aws_ecr_repository_policy.cross_account["qurl-scanner-lambda"].policy).Statement, [])
+  }
+
+  ecr_qurl_scanner_lambda_policy_has_expected_retrieval_grant = {
+    for source, statements in local.ecr_qurl_scanner_lambda_policy_match_sources : source => anytrue([
+      for statement in statements :
+      try(statement.Sid, "") == "LambdaECRImageRetrievalPolicy" &&
+      contains(flatten([try(statement.Principal.Service, [])]), "lambda.amazonaws.com") &&
+      toset(flatten([try(statement.Action, [])])) == toset(local.ecr_qurl_scanner_lambda_actions) &&
+      try(statement.Condition.StringLike["aws:SourceArn"], "") == local.ecr_qurl_scanner_lambda_source_arn
+    ])
+  }
 
   # Account ID to use in ECR URLs and IAM resource ARNs for SECONDARY accounts:
   # - With replication enabled: use the local account (images live here, replicated
@@ -486,7 +562,9 @@ resource "aws_ecr_lifecycle_policy" "main" {
   policy     = local.ecr_lifecycle_policy
 }
 
-# Cross-account pull policy (allows specific accounts to pull).
+# Repository policy. Non-scanner repos use the cross-account pull policy; the
+# qurl-scanner Lambda repo also gets the Lambda service-principal image
+# retrieval grant that prevents ImageAccessDenied after idle/reactivation.
 #
 # Kept active even when var.enable_replication is true so that:
 #   - secondary accounts can still pull from the primary registry as a
@@ -499,10 +577,38 @@ resource "aws_ecr_lifecycle_policy" "main" {
 # this resource can be removed in a follow-up PR -- track in the same
 # follow-up that adds destination-side lifecycle policies (issue #901).
 resource "aws_ecr_repository_policy" "cross_account" {
-  for_each = var.is_primary_account && length(var.secondary_account_ids) > 0 ? toset(local.ecr_repos) : []
+  for_each = toset(local.ecr_repository_policy_repos)
 
   repository = aws_ecr_repository.main[each.key].name
-  policy     = local.ecr_cross_account_policy
+  policy     = each.key == "qurl-scanner-lambda" ? local.ecr_qurl_scanner_lambda_policy : local.ecr_cross_account_policy
+}
+
+# Regression fences for the sandbox incident fixed by PR #2698: the generated
+# scanner repository policy must keep the Lambda service-principal image
+# retrieval grant, and the scanner repo resource must actually use that policy.
+# Runtime policy drift is still covered by the rollout ledger's
+# idle/reactivation check.
+resource "terraform_data" "qurl_scanner_lambda_policy_fence" {
+  # Deliberately keep one stable, guarded fence resource instead of switching
+  # addresses with count/for_each. Secondary/prod remains inert for repo wiring
+  # until issue #2699 brings replicated scanner policy ownership into Terraform.
+  #
+  # `input` surfaces the watched value in the plan and re-runs the fence
+  # whenever it changes. The rendered policy already embeds the actions and
+  # source ARN, so it alone subsumes every input the preconditions check.
+  input = local.ecr_qurl_scanner_lambda_policy
+
+  lifecycle {
+    precondition {
+      condition     = !var.deploy_qurl_ecr || local.ecr_qurl_scanner_lambda_policy_has_expected_retrieval_grant.generated
+      error_message = "qurl-scanner Lambda ECR policy must include LambdaECRImageRetrievalPolicy for lambda.amazonaws.com with only the expected scanner Lambda ECR actions scoped by aws:SourceArn."
+    }
+
+    precondition {
+      condition     = !var.deploy_qurl_ecr || !var.is_primary_account || local.ecr_qurl_scanner_lambda_policy_has_expected_retrieval_grant.wired
+      error_message = "qurl-scanner-lambda must be wired to local.ecr_qurl_scanner_lambda_policy so Terraform applies the Lambda retrieval grant to the scanner repository."
+    }
+  }
 }
 
 # ============================================================================

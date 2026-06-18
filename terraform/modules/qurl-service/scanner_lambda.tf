@@ -147,6 +147,11 @@ data "aws_ssm_parameter" "scanner_lambda_image_tag_current" {
 # ============================================================================
 
 locals {
+  # Keep these names in lockstep with
+  # modules/ecr/main.tf::ecr_qurl_scanner_lambda_source_arn, which grants
+  # Lambda image retrieval by matching `qurl-scanner` function names.
+  # terraform/main.tf passes the same `local.name_prefix` to both modules; if
+  # that root wiring ever splits, update the ECR SourceArn at the same time.
   scanner_lambda_function_name         = "${var.name_prefix}-${var.cell_id}-qurl-scanner"
   scanner_active_recheck_function_name = "${var.name_prefix}-${var.cell_id}-qurl-scanner-active-recheck"
   scanner_active_recheck_enabled       = var.qurl_scanner_lambda_enabled && var.qurl_scanner_sqs_emit_enabled && var.qurl_scanner_tombstone_write_enabled && var.qurl_scanner_active_recheck_enabled

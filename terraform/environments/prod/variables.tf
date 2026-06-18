@@ -364,8 +364,12 @@ variable "deploy_qurl_service" {
   default = false
 }
 
+# Prod is a replication/secondary account, so modules/ecr does not manage the
+# qurl-scanner-lambda ECR repository policy here yet. Keep this default off and
+# do not add a prod tfvars override until issue #2699 lands, or until the
+# equivalent manual LambdaECRImageRetrievalPolicy is confirmed before rollout.
 variable "qurl_scanner_lambda_enabled" {
-  description = "Deploy the scheduled qurl-scanner Lambda + EventBridge cron + scan-gap alarm. Default OFF — keep absent from prod tfvars until the hard preconditions in the prod rollout task ledger are met (sandbox soak + SQS queue infra + consumer dedupe + `--allow-prod-emit` opt-in)."
+  description = "Deploy the scheduled qurl-scanner Lambda + EventBridge cron + scan-gap alarm. Default OFF — keep absent from prod tfvars until the hard preconditions in the prod rollout task ledger are met (sandbox soak + SQS queue infra + consumer dedupe + `--allow-prod-emit` opt-in + qurl-scanner-lambda ECR retrieval policy via issue #2699 or a confirmed manual policy)."
   type        = bool
   default     = false
 }
