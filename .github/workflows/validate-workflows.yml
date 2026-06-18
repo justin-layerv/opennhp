@@ -200,7 +200,8 @@ jobs:
       # failure, and an already-running instance refresh.
       - name: Test relay deploy helper
         run: |
-          shellcheck .github/scripts/deploy-relay.sh tests/scripts/deploy-relay_test.sh
+          shellcheck .github/scripts/wait-for-instance-refresh.sh .github/scripts/deploy-relay.sh tests/scripts/wait-for-instance-refresh_test.sh tests/scripts/deploy-relay_test.sh
+          bash tests/scripts/wait-for-instance-refresh_test.sh
           bash tests/scripts/deploy-relay_test.sh
 
       # Fence the canonical active-color → slot resolver (shared by

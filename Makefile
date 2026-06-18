@@ -375,7 +375,8 @@ lint-workflows:
 	@bash tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh
 	@bash scripts/check-nhp-server-internal-url-validation-drift.sh
 	@bash tests/scripts/check-image-tag-writer-allowlist_test.sh
-	@shellcheck .github/scripts/deploy-relay.sh tests/scripts/deploy-relay_test.sh
+	@shellcheck .github/scripts/wait-for-instance-refresh.sh .github/scripts/deploy-relay.sh tests/scripts/wait-for-instance-refresh_test.sh tests/scripts/deploy-relay_test.sh
+	@bash tests/scripts/wait-for-instance-refresh_test.sh
 	@bash tests/scripts/deploy-relay_test.sh
 	@shellcheck .github/scripts/resolve-active-image-tag.sh tests/scripts/resolve-active-image-tag_test.sh
 	@bash tests/scripts/resolve-active-image-tag_test.sh

@@ -728,6 +728,8 @@ jobs:
           REFRESH_TIMEOUT_MINUTES: ${{ inputs.refresh_timeout_minutes }}
         run: |
           set -euo pipefail
+          # shellcheck source=.github/scripts/wait-for-instance-refresh.sh
+          source .github/scripts/wait-for-instance-refresh.sh
 
           start_refresh() {
             local asg=$1 label=$2
@@ -749,23 +751,15 @@ jobs:
 
           poll_refresh() {
             local asg=$1 refresh_id=$2 label=$3 deadline=$4
-            local iteration=0
-            while [[ $(date +%s) -lt $deadline ]]; do
-              iteration=$((iteration + 1))
-              remaining=$(( (deadline - $(date +%s)) / 60 ))
-              status=$(aws autoscaling describe-instance-refreshes \
-                --auto-scaling-group-name "$asg" \
-                --instance-refresh-ids "$refresh_id" \
-                --query "InstanceRefreshes[0].Status" --output text)
-              echo "[$label] [iter $iteration, ${remaining}m remaining] Refresh status: $status"
-              case "$status" in
-                Successful) echo "$label instance refresh completed successfully"; return 0 ;;
-                Failed|Cancelled) echo "::error::$label instance refresh $status"; return 1 ;;
-                *) sleep 10 ;;
-              esac
-            done
-            echo "::error::$label instance refresh timed out after ${REFRESH_TIMEOUT_MINUTES} minutes"
-            return 1
+            local now remaining_seconds max_iterations
+            now=$(date +%s)
+            if ((now >= deadline)); then
+              echo "::error::$label instance refresh timed out before polling could start"
+              return 1
+            fi
+            remaining_seconds=$((deadline - now))
+            max_iterations=$(((remaining_seconds + 9) / 10))
+            wait_for_instance_refresh "$asg" "$refresh_id" "" "$max_iterations" "$label" 10 3
           }
 
           DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_MINUTES * 60))

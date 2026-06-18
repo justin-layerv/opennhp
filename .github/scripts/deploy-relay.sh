@@ -77,6 +77,7 @@ IMAGE_TAG="$3"
 # in CI this inherits the workflow region; the us-east-2 literal is only a local
 # fallback and won't silently diverge if the workflow region ever changes.
 AWS_REGION="${AWS_REGION:-us-east-2}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSM_PARAM_NOT_FOUND="__NHP_RELAY_SSM_PARAMETER_NOT_FOUND__"
 
 # Refresh completion-poll cadence (#2646). 90 × 10s = 15 min ceiling. Baseline:
@@ -103,6 +104,9 @@ RELAY_REFRESH_MAX_DESCRIBE_ERRORS="${RELAY_REFRESH_MAX_DESCRIBE_ERRORS:-3}"
 
 RELAY_ASG_PARAM="/${ENVIRONMENT}/nhp/relay/asg-name"
 RELAY_IMAGE_TAG_PARAM="/${ENVIRONMENT}/nhp/relay/image-tag"
+
+# shellcheck source=.github/scripts/wait-for-instance-refresh.sh
+source "$SCRIPT_DIR/wait-for-instance-refresh.sh"
 
 # Append a line to the GitHub Actions step summary when running in CI.
 summary() {
@@ -240,68 +244,19 @@ fi
 # blue-green's "refresh on every build" — and accepted: the relay forwards an
 # opaque, version-stable protocol, so a churned roll is benign.
 
-# Poll an instance refresh to a terminal state. Succeeds (rc 0) on `Successful`,
-# fails LOUD (rc 1) on `Failed`/`Cancelled` or a bounded-wait timeout. Mirrors
-# wait-for-instance-refresh.sh and blue-green-deploy.yml's poll_refresh: a
-# timeout is a FAILURE, not a warning — a roll that won't converge inside the
-# window is exactly the boot-loop this gate exists to catch. Health verification
-# is implicit: the relay ASG is health_check_type=ELB, so a `Successful` refresh
-# means each replaced instance passed the ALB /health/live check.
+# Poll an instance refresh to a terminal state through the shared helper. Health
+# verification is implicit: the relay ASG is health_check_type=ELB, so a
+# `Successful` refresh means each replaced instance passed the ALB /health/live
+# check.
 poll_refresh() {
-  local asg="$1" refresh_id="$2" iteration status percentage refresh_data
-  local describe_err consecutive_errors=0
-  describe_err=$(mktemp)
-  for ((iteration = 1; iteration <= RELAY_REFRESH_MAX_ITERATIONS; iteration++)); do
-    sleep "$RELAY_REFRESH_POLL_INTERVAL_SECS"
-    # Single call for both fields; query a one-element list so a vanished refresh
-    # id yields empty text on a SUCCESSFUL describe (rc 0) — treated as a
-    # non-terminal poll. Only an actual CLI error (rc != 0: throttle/IAM) counts
-    # toward the consecutive-error budget: a one-off blip is absorbed (a healthy
-    # ~8-min roll survives an API hiccup), but a persistent break fails LOUD with
-    # the captured cause rather than riding the cap to a generic timeout. Stderr
-    # to a tempfile (not 2>&1) so a warning can't contaminate the status parse.
-    # Fail-closed: only an explicit `Successful` returns 0.
-    if refresh_data=$(aws autoscaling describe-instance-refreshes \
-      --auto-scaling-group-name "$asg" \
-      --instance-refresh-ids "$refresh_id" \
-      --query "InstanceRefreshes[0].[Status,PercentageComplete]" \
-      --output text \
-      --region "$AWS_REGION" 2>"$describe_err"); then
-      consecutive_errors=0
-    else
-      consecutive_errors=$((consecutive_errors + 1))
-      if ((consecutive_errors >= RELAY_REFRESH_MAX_DESCRIBE_ERRORS)); then
-        echo "::error::Relay refresh poll: describe-instance-refreshes failed ${consecutive_errors}x in a row on $asg (IAM/throttle?):"
-        cat "$describe_err" >&2
-        rm -f "$describe_err"
-        return 1
-      fi
-      refresh_data=""
-    fi
-    status=$(printf '%s' "$refresh_data" | awk '{print $1}')
-    percentage=$(printf '%s' "$refresh_data" | awk '{print $2}')
-    # AWS reports PercentageComplete as "None" before progress starts; print 0
-    # rather than a confusing "None%". Only a non-negative integer is real.
-    if [[ ! "$percentage" =~ ^[0-9]+$ ]]; then percentage=0; fi
-    echo "[relay refresh $refresh_id] iter $iteration/$RELAY_REFRESH_MAX_ITERATIONS — status=${status:-<none>} progress=${percentage}%"
-    case "$status" in
-      Successful)
-        rm -f "$describe_err"
-        return 0
-        ;;
-      Failed | Cancelled)
-        echo "::error::Relay instance refresh $refresh_id on $asg ended $status before converging."
-        rm -f "$describe_err"
-        return 1
-        ;;
-      *)
-        : # Pending / InProgress / (transient empty) — keep polling.
-        ;;
-    esac
-  done
-  rm -f "$describe_err"
-  echo "::error::Relay instance refresh $refresh_id on $asg did not converge within $((RELAY_REFRESH_MAX_ITERATIONS * RELAY_REFRESH_POLL_INTERVAL_SECS))s; failing the deploy."
-  return 1
+  wait_for_instance_refresh \
+    "$1" \
+    "$2" \
+    "" \
+    "$RELAY_REFRESH_MAX_ITERATIONS" \
+    "Relay" \
+    "$RELAY_REFRESH_POLL_INTERVAL_SECS" \
+    "$RELAY_REFRESH_MAX_DESCRIBE_ERRORS"
 }
 
 echo ""
