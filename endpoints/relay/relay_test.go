@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -92,7 +93,25 @@ func testStop(rs *RelayServer) {
 	rs.metrics.Stop() // New() boots the publisher; reap its flush goroutine (nil-safe), mirroring Stop()
 }
 
-func newTestRelay(t *testing.T, serverPub []byte, serverPort int, mode SourceAddrMode) *RelayServer {
+type testRelayOption func(*RelayServer)
+
+func withTestRelayTrustedHeader(header string) testRelayOption {
+	return func(rs *RelayServer) {
+		rs.config.TrustedHeader = header
+	}
+}
+
+func withTestRelayXForwardedFor() testRelayOption {
+	return withTestRelayTrustedHeader("X-Forwarded-For")
+}
+
+func withTestRelayResponseTimeout(timeout time.Duration) testRelayOption {
+	return func(rs *RelayServer) {
+		rs.responseTimeout = timeout
+	}
+}
+
+func newTestRelay(t *testing.T, serverPub []byte, serverPort int, mode SourceAddrMode, opts ...testRelayOption) *RelayServer {
 	t.Helper()
 	cfg := &Config{
 		PrivateKeyBase64: base64.StdEncoding.EncodeToString(keyBytes(0x80)),
@@ -108,6 +127,9 @@ func newTestRelay(t *testing.T, serverPub []byte, serverPort int, mode SourceAdd
 	rs, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
+	}
+	for _, opt := range opts {
+		opt(rs)
 	}
 	rs.startBackground()
 	t.Cleanup(func() { testStop(rs) })
@@ -292,6 +314,133 @@ func TestRelay_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestRelay_TrustedHeaderForwardStampsAttestedRightmostXFF fences the #1210
+// relay trust boundary end to end: in the post-cutover path, the server must see
+// the relay-edge client IP in RelayForwardMsg.SourceAddr, not an attacker-supplied
+// left XFF entry and not the ALB TCP peer. The deriveSourceAddr unit tests below
+// fence parsing; this test proves the derived value survives relay encryption.
+// Server-side acceptance is fenced by the TestValidateRelaySourceAddr and
+// TestHandleRelayForward tests in the server package.
+func TestRelay_TrustedHeaderForwardStampsAttestedRightmostXFF(t *testing.T) {
+	const (
+		counter        = uint64(1210)
+		ackTimeout     = 5 * time.Second
+		captureTimeout = ackTimeout + time.Second
+	)
+
+	serverDev := core.NewDevice(core.NHP_SERVER, keyBytes(0x40), &core.DeviceOptions{
+		DisableAgentPeerValidation: true,
+		DisableRelayPeerValidation: true,
+	})
+	serverDev.Start()
+	t.Cleanup(serverDev.Stop)
+	serverPub, err := base64.StdEncoding.DecodeString(serverDev.PublicKeyBase64())
+	if err != nil {
+		t.Fatalf("decode server pubkey: %v", err)
+	}
+
+	fakeServer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("fake server listen: %v", err)
+	}
+	t.Cleanup(func() { _ = fakeServer.Close() })
+
+	expectedSource := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: placeholderSourcePort}
+	innerKnock := makeInnerKnock(t, serverPub, counter)
+	ackPeer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206}
+	// makeRealAck only needs a RemoteAddr for decrypt context; the assertion
+	// below proves the relay independently derives expectedSource from XFF.
+	reply := makeRealAck(t, serverDev, innerKnock, ackPeer)
+
+	rlyCh := make(chan *common.RelayForwardMsg, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 65536)
+		n, from, rerr := fakeServer.ReadFromUDP(buf)
+		if rerr != nil {
+			errCh <- rerr
+			return
+		}
+
+		ppd, perr := serverDev.PacketToMsg(&core.PacketData{
+			BasePacket: &core.Packet{Content: buf[:n]},
+			ConnData:   &core.ConnectionData{Device: serverDev, RemoteAddr: from},
+			InitTime:   time.Now().UnixNano(),
+		})
+		if perr != nil {
+			errCh <- fmt.Errorf("decrypt outer NHP_RLY: %w", perr)
+			return
+		}
+		if ppd == nil {
+			errCh <- fmt.Errorf("decrypt outer NHP_RLY returned nil")
+			return
+		}
+		if ppd.HeaderType != core.NHP_RLY {
+			errCh <- fmt.Errorf("outer header = %s, want NHP_RLY", core.HeaderTypeToString(ppd.HeaderType))
+			return
+		}
+		var rlyMsg common.RelayForwardMsg
+		if err := json.Unmarshal(ppd.BodyMessage, &rlyMsg); err != nil {
+			errCh <- fmt.Errorf("unmarshal RelayForwardMsg: %w", err)
+			return
+		}
+		rlyCh <- &rlyMsg
+
+		_, _ = fakeServer.WriteToUDP(reply, from)
+	}()
+
+	rs := newTestRelay(
+		t,
+		serverPub,
+		fakeServer.LocalAddr().(*net.UDPAddr).Port,
+		SourceAddrModeTrustedHeader,
+		withTestRelayXForwardedFor(),
+		withTestRelayResponseTimeout(ackTimeout),
+	)
+
+	serverID := utils.PubKeyFingerprint(serverPub)
+	req := httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerKnock))
+	req.RemoteAddr = "10.0.0.25:5555"                            // the private ALB hop, not the browser
+	req.Header.Add("X-Forwarded-For", "198.51.100.66")           // attacker supplied
+	req.Header.Add("X-Forwarded-For", "192.0.2.50, 203.0.113.7") // ALB appends the attested IP last
+	w := httptest.NewRecorder()
+	rs.handleRelay(w, req)
+
+	if w.Code != http.StatusOK {
+		select {
+		case err := <-errCh:
+			t.Fatalf("fake server failed before relay response: %v", err)
+		default:
+		}
+		t.Fatalf("status = %d, body = %q", w.Code, w.Body.String())
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("fake server failed: %v", err)
+	case got := <-rlyCh:
+		if got.SourceAddr == nil {
+			t.Fatal("RelayForwardMsg.SourceAddr = nil")
+		}
+		if got.SourceAddr.Ip != expectedSource.IP.String() {
+			t.Fatalf("RelayForwardMsg.SourceAddr.Ip = %q, want %q (rightmost ALB-attested XFF; forged left entries and ALB RemoteAddr must not win)",
+				got.SourceAddr.Ip, expectedSource.IP.String())
+		}
+		if got.SourceAddr.Port != expectedSource.Port {
+			t.Fatalf("RelayForwardMsg.SourceAddr.Port = %d, want placeholder %d", got.SourceAddr.Port, expectedSource.Port)
+		}
+		gotInner, err := base64.StdEncoding.DecodeString(got.InnerPacket)
+		if err != nil {
+			t.Fatalf("RelayForwardMsg.InnerPacket is not valid base64: %v", err)
+		}
+		if !bytes.Equal(gotInner, innerKnock) {
+			t.Fatal("RelayForwardMsg.InnerPacket changed while forwarding")
+		}
+	case <-time.After(captureTimeout):
+		t.Fatal("fake server did not capture the RelayForwardMsg")
+	}
+}
+
 // TestRelay_DispatchToConcurrentWaiters fences the composite-key design: two
 // clients sharing a transaction counter both receive the dispatched ACK (the
 // reason registration is (counter, client) but dispatch is by counter).
@@ -450,8 +599,13 @@ func TestRelay_Shed_IncrementsMetric(t *testing.T) {
 func TestRelay_InFlightSlotReleased(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
 	innerKnock := makeInnerKnock(t, serverPub, 4243)
-	rs := newTestRelay(t, serverPub, 62299, SourceAddrModeRemoteAddr) // dead port -> 504
-	rs.responseTimeout = 50 * time.Millisecond
+	rs := newTestRelay(
+		t,
+		serverPub,
+		62299,
+		SourceAddrModeRemoteAddr,
+		withTestRelayResponseTimeout(50*time.Millisecond),
+	) // dead port -> 504
 	serverID := utils.PubKeyFingerprint(serverPub)
 	srv := rs.servers[serverID]
 
@@ -632,8 +786,13 @@ func TestRelay_OversizeBody_400(t *testing.T) {
 func TestRelay_Timeout_504(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
 	innerKnock := makeInnerKnock(t, serverPub, 8888)
-	rs := newTestRelay(t, serverPub, 62299, SourceAddrModeRemoteAddr) // nothing listening -> no ACK
-	rs.responseTimeout = 80 * time.Millisecond                        // keep the test fast
+	rs := newTestRelay(
+		t,
+		serverPub,
+		62299,
+		SourceAddrModeRemoteAddr,
+		withTestRelayResponseTimeout(80*time.Millisecond),
+	) // nothing listening -> no ACK; keep the test fast
 
 	req := httptest.NewRequest(http.MethodPost, "/relay/"+utils.PubKeyFingerprint(serverPub), bytes.NewReader(innerKnock))
 	req.RemoteAddr = "203.0.113.7:44444"
@@ -802,8 +961,7 @@ func TestDeriveSourceAddr(t *testing.T) {
 	// its left are attacker-supplied. These fence that deriveSourceAddr takes the
 	// rightmost entry only, and fails safe to RemoteAddr if it does not parse.
 	t.Run("XFF multi-entry takes rightmost (AWS-attested)", func(t *testing.T) {
-		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
-		rs.config.TrustedHeader = "X-Forwarded-For"
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader, withTestRelayXForwardedFor())
 		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
 		req.RemoteAddr = "10.0.0.1:5555" // the ALB
 		req.Header.Set("X-Forwarded-For", "192.0.2.50, 203.0.113.7")
@@ -816,8 +974,7 @@ func TestDeriveSourceAddr(t *testing.T) {
 	t.Run("XFF forged leftmost is ignored", func(t *testing.T) {
 		// An attacker sets X-Forwarded-For before the ALB; the ALB appends the
 		// real client IP on the right. The forged leftmost must NOT win.
-		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
-		rs.config.TrustedHeader = "X-Forwarded-For"
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader, withTestRelayXForwardedFor())
 		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
 		req.RemoteAddr = "10.0.0.1:5555"
 		req.Header.Set("X-Forwarded-For", "198.51.100.66, 203.0.113.7")
@@ -830,8 +987,7 @@ func TestDeriveSourceAddr(t *testing.T) {
 	t.Run("XFF unparseable rightmost falls back to peer (no walking left)", func(t *testing.T) {
 		// If the rightmost (trusted) entry is garbage, fall back to RemoteAddr —
 		// do NOT adopt the left-of-rightmost entry, which is attacker-supplied.
-		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
-		rs.config.TrustedHeader = "X-Forwarded-For"
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader, withTestRelayXForwardedFor())
 		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
 		req.RemoteAddr = "198.51.100.9:5555"
 		req.Header.Set("X-Forwarded-For", "203.0.113.7, not-an-ip")
@@ -842,8 +998,7 @@ func TestDeriveSourceAddr(t *testing.T) {
 	})
 
 	t.Run("XFF rightmost IPv6", func(t *testing.T) {
-		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
-		rs.config.TrustedHeader = "X-Forwarded-For"
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader, withTestRelayXForwardedFor())
 		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
 		req.RemoteAddr = "10.0.0.1:5555"
 		req.Header.Set("X-Forwarded-For", "192.0.2.50, 2001:db8::1")
@@ -854,8 +1009,7 @@ func TestDeriveSourceAddr(t *testing.T) {
 	})
 
 	t.Run("XFF rightmost trims surrounding whitespace", func(t *testing.T) {
-		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
-		rs.config.TrustedHeader = "X-Forwarded-For"
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader, withTestRelayXForwardedFor())
 		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
 		req.RemoteAddr = "10.0.0.1:5555"
 		req.Header.Set("X-Forwarded-For", "192.0.2.50 ,  203.0.113.7  ")
@@ -868,8 +1022,7 @@ func TestDeriveSourceAddr(t *testing.T) {
 	t.Run("XFF trailing comma (empty rightmost) falls back to peer", func(t *testing.T) {
 		// A trailing comma yields an empty rightmost entry; it must fall back to
 		// RemoteAddr, NOT walk left to the preceding entry.
-		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
-		rs.config.TrustedHeader = "X-Forwarded-For"
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader, withTestRelayXForwardedFor())
 		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
 		req.RemoteAddr = "198.51.100.9:5555"
 		req.Header.Set("X-Forwarded-For", "203.0.113.7,")
@@ -880,8 +1033,7 @@ func TestDeriveSourceAddr(t *testing.T) {
 	})
 
 	t.Run("XFF whitespace-only rightmost falls back to peer", func(t *testing.T) {
-		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
-		rs.config.TrustedHeader = "X-Forwarded-For"
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader, withTestRelayXForwardedFor())
 		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
 		req.RemoteAddr = "198.51.100.9:5555"
 		req.Header.Set("X-Forwarded-For", "203.0.113.7,   ")
@@ -896,8 +1048,7 @@ func TestDeriveSourceAddr(t *testing.T) {
 		// the attested IP last; deriveSourceAddr joins ALL lines so it's the global
 		// rightmost. A bare r.Header.Get would read only the first (attacker) line
 		// and return 9.9.9.9 — this fences that we join instead.
-		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader)
-		rs.config.TrustedHeader = "X-Forwarded-For"
+		rs := newTestRelay(t, serverPub, 62206, SourceAddrModeTrustedHeader, withTestRelayXForwardedFor())
 		req := httptest.NewRequest(http.MethodPost, "/relay/x", nil)
 		req.RemoteAddr = "10.0.0.1:5555"
 		req.Header.Add("X-Forwarded-For", "9.9.9.9")              // attacker's first line

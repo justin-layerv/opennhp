@@ -72,11 +72,11 @@ resource "aws_lb" "relay" {
 
   # `append`: the ALB appends the observed client IP to the END of
   # X-Forwarded-For. The relay's deriveSourceAddr reads X-Forwarded-For for the
-  # AC-pinhole client IP. SECURITY: a multi-entry XFF (upstream proxy present)
-  # currently fails the relay's bare ParseIP and fail-safes to the ALB IP — the
-  # rightmost-entry parse fix is tracked as a #6 blocker (relay-code, not TF).
-  # drop_invalid_header_fields above strips control-char/RFC-7230-violating XFF
-  # before append, closing the smuggled-XFF class.
+  # AC-pinhole client IP and deliberately takes the RIGHTMOST entry, because
+  # entries to the left can be caller supplied while the rightmost entry is the
+  # ALB-observed client IP. drop_invalid_header_fields above strips
+  # control-char/RFC-7230-violating XFF before append, closing the smuggled-XFF
+  # class.
   xff_header_processing_mode = "append"
 
   enable_deletion_protection = local.is_prod

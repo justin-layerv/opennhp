@@ -193,6 +193,13 @@ verified, not reinvented:
   [`endpoints/server/knock_headertype_gate.go`](../../endpoints/server/knock_headertype_gate.go)).
 - **Resource sizing under flood** and a degradation story that fails closed
   without taking the private `nhp-server` down with it.
+- **Source-IP integrity** for the AC pinhole. The relay stamps
+  `RelayForwardMsg.SourceAddr` from the edge-observed client IP (deployment:
+  ALB-appended, rightmost `X-Forwarded-For`), and `nhp-server` accepts that
+  value only from a Noise-authenticated, `relay.toml`-registered `NHP_RELAY`
+  peer before using it as the synthetic knock source. This is the independent
+  trust root that replaces the pre-cutover qurl-service caller-asserted
+  `HttpKnockRequest.SrcIp` vector tracked in #1210.
 
 The win is real but specific: the *blast radius* of an edge compromise shrinks
 from "policy + signing authority" to "packet forwarder," and the hardened
@@ -245,7 +252,7 @@ Network Infrastructure — Introducing the Network-infrastructure Hiding Protoco
 | **`NHP_RKN` (type 8) = cookie-retry re-knock** | Appendix 2, *NHP-RKN (Re-Knock) Message* (p. 53): "a second knock using a cookie… same fields as NHP-KNK; however, the HMAC calculation must also use the cookie value obtained from NHP-COK." |
 | **No new reply wire type** (server replies with the normal `NHP-ACK`, matched by the inner-packet counter) | `NHP-RLY` carries the *request*; the spec defines no separate relay-reply type — the server's `NHP-ACK` (type 2) is the response. |
 | **Agent-driven renewal** (replacing the AC `/refresh` L7 plane) | Workflow **Step 8** (p. 23): "the NHP-Agent must negotiate a renewal of the open-door session by **repeating steps 1–7**." |
-| **Relay `X-Real-IP` source-address preservation** | Workflow **Step 4** (p. 23): intermediaries perform "**source IP preservation (via PROXY protocol or X-Forwarded-For headers)**… as supported by modern proxies like NGINX or HAProxy." Reinforced by the NHP-AOP NAT note (p. 50) on per-session tokens for NAT'd agents — which the qURL session model supplies. |
+| **Relay source-address preservation via `X-Forwarded-For`** | Workflow **Step 4** (p. 23): intermediaries perform "**source IP preservation (via PROXY protocol or X-Forwarded-For headers)**… as supported by modern proxies like NGINX or HAProxy." Reinforced by the NHP-AOP NAT note (p. 50) on per-session tokens for NAT'd agents — which the qURL session model supplies. |
 | **NHP-Server (auth) decoupled from NHP-AC (enforcement)** | pp. 8, 16, 20–21: NHP "decouples the authentication and access control features"; Server = Policy Engine, AC = Policy Enforcement Point (NIST SP 800-207). |
 | **Taking the server private behind the relay** | The protocol's purpose — *Network-infrastructure Hiding* — and threat model (pp. 8, 12): "hiding all ports and services," DDoS mitigation by "concealing IP addresses." A non-internet-reachable server is the strongest form of this. |
 
