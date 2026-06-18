@@ -15,6 +15,8 @@ fleet still boots, health checks, and emits bootstrap failure metrics.
 | `relay-tg-zero-healthy-targets` | The relay target group had zero healthy targets for two consecutive one-minute windows. | Check target registration, ASG activity history, instance boot progress, relay container logs, and `/var/log/user-data.log`. |
 | `relay-bootstrap-failure` | A relay instance emitted `BootstrapFailure` during user-data. | Search `/var/log/user-data.log` for `BOOTSTRAP FAILED:` and verify IMDS, the relay image tag, ECR pull, and Secrets Manager relay key access. |
 | `relay-capacity-below-baseline` | In-service relay instances stayed below `relay_min_capacity` for two consecutive five-minute windows. | Check ASG activity history, instance refresh state, target health, and per-instance user-data logs. |
+| `relay-shedding` | The relay emitted `RelayShed` after returning a backpressure 503. | Check relay logs for `relay: shed N request(s) to <cell>`, the per-cell `RelayShed` breakdown, target cell NHP server/AC health, and WAF/ALB request volume. |
+| `relay-shedding-unknown-environment` | The relay emitted `RelayShed` with `Environment=unknown`, so the process likely missed `NHP_ENVIRONMENT` and the primary shed alarm will not match. | Check the `nhp-relayd` systemd unit for `-e NHP_ENVIRONMENT`, then inspect the relay boot path before trusting the primary shed alarm. |
 
 ## Expected Transients
 
@@ -36,6 +38,17 @@ there are no healthy relay targets, and the unhealthy-host alarm explains why.
 `relay-capacity-below-baseline` can briefly alarm on the first `deploy_relay`
 enable or a terminate-first full-fleet roll if in-service capacity takes longer
 than the alarm window to climb back to baseline.
+
+`relay-shedding` and `relay-shedding-unknown-environment` are single-event
+detectors. They page on the first shed in the lookback and return to OK
+silently after a quiet period; OK means no new sheds arrived, not that the
+overloaded cell recovered.
+
+`relay-shedding-unknown-environment` is account-wide because the fallback stream
+has no `Cell` dimension. If more than one cell's copy of the alarm fires, treat
+them as one incident: the firing alarm name does not localize the relay that
+missed `NHP_ENVIRONMENT`; use the relay logs and per-cell `RelayShed` breakdown
+to identify the affected path.
 
 `relay-bootstrap-failure` is a single-event detector. The first failed boot
 transitions the alarm to ALARM and emits one notification. Additional failures
@@ -60,9 +73,11 @@ capacity alarms are the backstop.
 
 - Server-side "relay enabled but forwards rejected" coverage belongs to the
   server monitoring surface because `MetricRelayForwardReject` is emitted by
-  `endpoints/server`; it is tracked in
+  `endpoints/server`; the parity lint verifies the current shared server
+  dimension builder still emits `Environment` and `Cell`, so revisit that fence
+  if `RelayForwardReject` ever moves to a separate publisher path. It is tracked in
   [#2643](https://github.com/layervai/nhp/issues/2643).
 - #6-time alarm tuning, including the zero-healthy-target alarm window and
-  statistic, plus dim-set parity linting are tracked in
-  [#2644](https://github.com/layervai/nhp/issues/2644), after real relay boot
+  statistic, is tracked in
+  [#2682](https://github.com/layervai/nhp/issues/2682), after real relay boot
   and traffic baselines exist.

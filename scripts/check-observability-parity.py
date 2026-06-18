@@ -45,6 +45,10 @@ class HclBlock:
     body: str
 
 
+def _block_location(block: HclBlock) -> str:
+    return f'{block.path}: {block.kind} "{block.name}"'
+
+
 AC_ALARM_ACTION_EXPR = 'var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []'
 # These alarms intentionally do not all share the same `count` expression:
 # some are feature-gated, some are maintenance-gated, and some are always
@@ -69,6 +73,30 @@ AC_CORE_ALARM_NAMES = (
 # should join AC_CORE_ALARM_NAMES so it cannot lose SNS routing by omission.
 AC_ALARM_EXEMPTIONS: tuple[str, ...] = ()
 
+RELAY_ALARM_ACTION_EXPR = "local.relay_alarm_actions"
+RELAY_CORE_ALARM_NAMES = (
+    "relay_tg_unhealthy_hosts",
+    "relay_tg_zero_healthy_targets",
+    "relay_bootstrap_failure",
+    "relay_capacity_below_baseline",
+    "relay_shedding",
+    "relay_shedding_unknown_environment",
+)
+# Mirror AC_ALARM_EXEMPTIONS: a relay alarm here intentionally opts out of the
+# shared relay SNS action contract; otherwise a new relay alarm should join
+# RELAY_CORE_ALARM_NAMES so it cannot escape the parity fences by omission.
+RELAY_ALARM_EXEMPTIONS: tuple[str, ...] = ()
+# Single-event detectors set ok_actions=[]: returning to OK means no new event
+# arrived in the lookback window, not that the underlying fault cleared. The
+# remaining relay alarms keep symmetric action routing. The paired fixture
+# imports this set so the checker and test cannot drift on which alarms are
+# single-event.
+RELAY_SINGLE_EVENT_ALARM_NAMES = (
+    "relay_bootstrap_failure",
+    "relay_shedding",
+    "relay_shedding_unknown_environment",
+)
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -81,12 +109,17 @@ def _read(path: Path) -> str:
         raise LintError(f"missing required file: {path}") from exc
 
 
-def _scan_block_end(text: str, open_brace: int) -> int:
-    # This parser is intentionally narrow for the module/variable/output blocks
-    # it scans today. If a targeted block grows an HCL heredoc, add heredoc
-    # support and fixtures in the same PR so braces inside heredocs stay inert.
+def _scan_block_end(text: str, open_brace: int, *, language: str = "hcl") -> int:
+    # This parser is intentionally narrow for the Terraform blocks and small Go
+    # functions it scans today. If a targeted Terraform block grows an HCL
+    # heredoc, add heredoc support and fixtures in the same PR so braces inside
+    # heredocs stay inert.
+    if language not in {"hcl", "go"}:
+        raise LintError(f"unsupported block scan language: {language}")
     depth = 0
     in_string = False
+    in_raw_string = False
+    in_rune = False
     escaped = False
     in_line_comment = False
     in_block_comment = False
@@ -110,6 +143,22 @@ def _scan_block_end(text: str, open_brace: int) -> int:
                 i += 1
             continue
 
+        if in_raw_string:
+            if ch == "`":
+                in_raw_string = False
+            i += 1
+            continue
+
+        if in_rune:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == "'":
+                in_rune = False
+            i += 1
+            continue
+
         if in_string:
             if escaped:
                 escaped = False
@@ -120,7 +169,7 @@ def _scan_block_end(text: str, open_brace: int) -> int:
             i += 1
             continue
 
-        if ch == "#":
+        if language == "hcl" and ch == "#":
             in_line_comment = True
             i += 1
             continue
@@ -136,6 +185,14 @@ def _scan_block_end(text: str, open_brace: int) -> int:
             in_string = True
             i += 1
             continue
+        if language == "go" and ch == "`":
+            in_raw_string = True
+            i += 1
+            continue
+        if language == "go" and ch == "'":
+            in_rune = True
+            i += 1
+            continue
         if ch == "{":
             depth += 1
         elif ch == "}":
@@ -144,7 +201,7 @@ def _scan_block_end(text: str, open_brace: int) -> int:
                 return i + 1
         i += 1
 
-    raise LintError("unterminated HCL block")
+    raise LintError(f"unterminated {language} block")
 
 
 def find_block(path: Path, kind: str, name: str) -> HclBlock:
@@ -179,13 +236,43 @@ def find_blocks(path: Path, kind: str) -> list[HclBlock]:
     return blocks
 
 
+def _strip_line_comment(
+    expr: str,
+    comment_prefixes: tuple[str, ...] = ("#", "//"),
+    string_quotes: tuple[str, ...] = ('"',),
+) -> str:
+    in_string: str | None = None
+    escaped = False
+    for i, ch in enumerate(expr):
+        prev = expr[i - 1] if i > 0 else ""
+
+        if in_string:
+            # Shell callers only pin simple single-quoted literals today; if a
+            # pinned single-quoted shell string needs POSIX backslash semantics,
+            # add a fixture and split the quote handling here.
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+            continue
+
+        if ch in string_quotes:
+            in_string = ch
+            continue
+        for prefix in comment_prefixes:
+            if expr.startswith(prefix, i) and (i == 0 or prev.isspace()):
+                return expr[:i]
+    return expr
+
+
 def _normalise_expr(expr: str) -> str:
     # This is not a general HCL expression normalizer; it is only safe for the
-    # simple pinned expressions in this file. If a future pin includes string
-    # literals with ` #` or ` //`, teach the scanner about that shape and add a
-    # fixture before relying on this helper.
-    expr = re.sub(r"\s+#.*$", "", expr)
-    expr = re.sub(r"\s+//.*$", "", expr)
+    # simple pinned expressions in this file. Inline comments are stripped only
+    # outside quoted strings so literal values such as "https://example.com" stay
+    # intact.
+    expr = _strip_line_comment(expr)
     return re.sub(r"\s+", " ", expr.strip())
 
 
@@ -203,9 +290,48 @@ def require_assignment(block: HclBlock, key: str, expected: str) -> None:
     actual = assignment(block, key)
     expected_norm = _normalise_expr(expected)
     if actual != expected_norm:
-        where = f'{block.path}: {block.kind} "{block.name}"'
+        where = _block_location(block)
         if actual is None:
             raise LintError(f"{where} must set `{key} = {expected_norm}`")
+        raise LintError(
+            f"{where} has `{key} = {actual}`, want `{key} = {expected_norm}`"
+        )
+
+
+def map_assignment(block: HclBlock, key: str) -> dict[str, str] | None:
+    # Deliberately narrow like assignment(): relay/monitoring dimensions are
+    # simple string expressions today. If a pinned map grows multi-line values,
+    # update this extractor and its fixtures in the same PR. Terraform fmt
+    # canonicalizes the maps this lint pins to the multi-line form below.
+    match = re.search(
+        rf"(?ms)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*\{{(?P<body>.*?)^[ \t]*\}}",
+        block.body,
+    )
+    if not match:
+        return None
+
+    result: dict[str, str] = {}
+    for line in match.group("body").splitlines():
+        line = _strip_line_comment(line).strip()
+        if not line:
+            continue
+        item = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", line)
+        if not item:
+            where = _block_location(block)
+            raise LintError(f"{where} has unsupported `{key}` entry: {line}")
+        result[item.group(1)] = _normalise_expr(item.group(2))
+    return result
+
+
+def require_map_assignment(
+    block: HclBlock, key: str, expected: dict[str, str]
+) -> None:
+    actual = map_assignment(block, key)
+    expected_norm = {name: _normalise_expr(value) for name, value in expected.items()}
+    where = _block_location(block)
+    if actual is None:
+        raise LintError(f"{where} must set `{key} = {expected_norm}`")
+    if actual != expected_norm:
         raise LintError(
             f"{where} has `{key} = {actual}`, want `{key} = {expected_norm}`"
         )
@@ -223,10 +349,7 @@ def require_absent_assignment(
             reason
             or "the monitoring module should be unconditional for prod/sandbox parity"
         )
-        raise LintError(
-            f'{block.path}: {block.kind} "{block.name}" must not set `{key}`; '
-            f"{reason}"
-        )
+        raise LintError(f"{_block_location(block)} must not set `{key}`; {reason}")
 
 
 def require_alarm_actions(
@@ -239,6 +362,109 @@ def require_alarm_actions(
     require_assignment(block, "ok_actions", expected)
     if insufficient_data:
         require_assignment(block, "insufficient_data_actions", expected)
+
+
+def require_shell_arg(path: Path, arg: str, reason: str) -> None:
+    pattern = re.compile(r"(?<!\S)" + re.escape(arg) + r"(?=\s|\\|$)")
+    for line in _read(path).splitlines():
+        line = _strip_line_comment(line, ("#",), ('"', "'"))
+        if pattern.search(line):
+            return
+    raise LintError(f"{path}: missing `{arg}` ({reason})")
+
+
+def go_function_body(path: Path, name: str) -> str:
+    text = _read(path)
+    match = re.search(rf"(?m)^func {re.escape(name)}\([^)]*\)[^{{]*\{{", text)
+    if not match:
+        raise LintError(f"{path}: missing Go function `{name}`")
+    # The regex ends at the opening brace ([^{]* admits no earlier one), so the
+    # match's last char is that brace.
+    open_brace = match.end() - 1
+    end = _scan_block_end(text, open_brace, language="go")
+    return text[open_brace + 1 : end - 1]
+
+
+def require_go_function_text(path: Path, function: str, needle: str, reason: str) -> None:
+    for line in go_function_body(path, function).splitlines():
+        # The pinned dim builders have no raw strings; add a fixture before
+        # matching a future Go needle that can contain `//` inside backticks.
+        line = _strip_line_comment(line, ("//",))
+        if needle in line:
+            return
+    raise LintError(f"{path}: {function}: missing `{needle}` ({reason})")
+
+
+def list_assignment(block: HclBlock, key: str) -> tuple[str, ...] | None:
+    # Terraform fmt canonicalizes the lists this lint pins to the multi-line
+    # form below.
+    match = re.search(
+        rf"(?ms)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*\[(?P<body>.*?)^[ \t]*\]",
+        block.body,
+    )
+    if not match:
+        return None
+
+    items: list[str] = []
+    for line in match.group("body").splitlines():
+        line = _strip_line_comment(line).strip().rstrip(",").strip()
+        if line:
+            items.append(_normalise_expr(line))
+    return tuple(items)
+
+
+def require_list_contains(block: HclBlock, key: str, expected: str) -> None:
+    items = list_assignment(block, key)
+    expected_norm = _normalise_expr(expected)
+    where = _block_location(block)
+    if items is None:
+        raise LintError(f"{where} must set `{key}` including {expected_norm}")
+    if expected_norm not in items:
+        raise LintError(
+            f"{where} has `{key} = {list(items)}`, want it to include {expected_norm}"
+        )
+
+
+def require_name_subset(
+    values: tuple[str, ...],
+    allowed: tuple[str, ...],
+    values_name: str,
+    allowed_name: str,
+) -> None:
+    unknown = sorted(set(values) - set(allowed))
+    if unknown:
+        raise LintError(
+            f"{values_name} must be a subset of {allowed_name}: " + ", ".join(unknown)
+        )
+
+
+def require_cloudwatch_dimension_arg(
+    path: Path,
+    expected: dict[str, str],
+    reason: str,
+) -> None:
+    # Narrow by file convention, not by a full shell parser: relay_user_data has
+    # one put-metric-data --dimensions emitter today (BootstrapFailure). If a
+    # second one appears, scope this helper to a command block in the same PR.
+    for line in _read(path).splitlines():
+        line = _strip_line_comment(line, ("#",), ('"', "'"))
+        match = re.search(r"--dimensions[ \t]+([\"'])(?P<body>.*?)\1", line)
+        if not match:
+            continue
+        actual: dict[str, str] = {}
+        for item in match.group("body").split(","):
+            if "=" not in item:
+                raise LintError(
+                    f"{path}: malformed --dimensions token `{item.strip()}` ({reason})"
+                )
+            key, value = item.split("=", 1)
+            actual[key.strip()] = value.strip()
+        if actual == expected:
+            return
+        raise LintError(
+            f"{path}: --dimensions has {actual}, want {expected} ({reason})"
+        )
+    raise LintError(f"{path}: missing `{expected}` ({reason})")
 
 
 def require_variable(path: Path, name: str) -> None:
@@ -267,6 +493,36 @@ def require_resource(path: Path, resource_type: str, name: str) -> None:
     find_block(path, f'resource "{resource_type}"', name)
 
 
+def require_alarm_registry(
+    monitoring: Path,
+    label: str,
+    core_names: tuple[str, ...],
+    exemptions: tuple[str, ...],
+    names_hint: str,
+) -> dict[str, HclBlock]:
+    # Every alarm in the monitoring file must be tracked: missing core alarms
+    # fail loudly, and a newly added alarm must join core_names or an explicit
+    # exemption so it cannot escape the parity fences by omission.
+    blocks = {
+        block.name: block
+        for block in find_blocks(monitoring, 'resource "aws_cloudwatch_metric_alarm"')
+    }
+    missing = sorted(set(core_names) - set(blocks))
+    if missing:
+        raise LintError(
+            f"{monitoring}: missing {label} CloudWatch alarm resource(s): "
+            + ", ".join(missing)
+        )
+    untracked = sorted(set(blocks) - set(core_names) - set(exemptions))
+    if untracked:
+        raise LintError(
+            f"{monitoring}: {label} CloudWatch alarm(s) must be added to "
+            f"{names_hint}: "
+            + ", ".join(untracked)
+        )
+    return blocks
+
+
 def deployable_env_names(repo: Path) -> tuple[str, ...]:
     env_root = repo / "terraform" / "environments"
     try:
@@ -286,6 +542,7 @@ def check_env_root(repo: Path, env: str) -> None:
 
     passthroughs = [
         "deploy_ac",
+        "deploy_relay",
         "enable_slack_notifications",
         "slack_workspace_id",
         "slack_channel_id",
@@ -321,6 +578,7 @@ def check_root_module(repo: Path) -> None:
     require_assignment(
         monitoring, "chatbot_owned_externally", "var.chatbot_owned_externally"
     )
+    require_assignment(monitoring, "deploy_relay", "var.deploy_relay")
 
     ac = find_block(root_main, "module", "ac")
     require_assignment(ac, "count", "var.deploy_ac ? 1 : 0")
@@ -335,6 +593,11 @@ def check_shared_resources(repo: Path) -> None:
     ac_variables = repo / "terraform" / "modules" / "ac" / "variables.tf"
     compute_main = repo / "terraform" / "modules" / "compute" / "main.tf"
     compute_outputs = repo / "terraform" / "modules" / "compute" / "outputs.tf"
+    relay_monitoring = repo / "terraform" / "modules" / "relay" / "monitoring.tf"
+    relay_compute = repo / "terraform" / "modules" / "relay" / "compute.tf"
+    relay_user_data = repo / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+    server_udp = repo / "endpoints" / "server" / "udpserver.go"
+    relay_go = repo / "endpoints" / "relay" / "relay.go"
 
     alerts_topic = find_block(monitoring_main, 'resource "aws_sns_topic"', "alerts")
     for key in ("count", "for_each"):
@@ -375,25 +638,46 @@ def check_shared_resources(repo: Path) -> None:
         ),
         "[aws_sns_topic.alerts.arn]",
     )
-    ac_alarm_blocks = {
-        block.name: block
-        for block in find_blocks(ac_monitoring, 'resource "aws_cloudwatch_metric_alarm"')
-    }
-    missing_ac_alarms = sorted(set(AC_CORE_ALARM_NAMES) - set(ac_alarm_blocks))
-    if missing_ac_alarms:
-        raise LintError(
-            f"{ac_monitoring}: missing AC CloudWatch alarm resource(s): "
-            + ", ".join(missing_ac_alarms)
-        )
-    untracked_ac_alarms = sorted(
-        set(ac_alarm_blocks) - set(AC_CORE_ALARM_NAMES) - set(AC_ALARM_EXEMPTIONS)
+    relay_forward_reject = find_block(
+        monitoring_main,
+        'resource "aws_cloudwatch_metric_alarm"',
+        "relay_forward_reject",
     )
-    if untracked_ac_alarms:
-        raise LintError(
-            f"{ac_monitoring}: AC CloudWatch alarm(s) must be added to "
-            "AC_CORE_ALARM_NAMES or AC_ALARM_EXEMPTIONS: "
-            + ", ".join(untracked_ac_alarms)
-        )
+    require_assignment(relay_forward_reject, "count", "var.deploy_relay ? 1 : 0")
+    require_assignment(
+        relay_forward_reject, "alarm_actions", "[aws_sns_topic.alerts.arn]"
+    )
+    require_assignment(relay_forward_reject, "ok_actions", "[aws_sns_topic.alerts.arn]")
+    require_assignment(relay_forward_reject, "metric_name", '"RelayForwardReject"')
+    require_assignment(relay_forward_reject, "namespace", '"LayerV/NHP"')
+    require_assignment(relay_forward_reject, "statistic", '"Sum"')
+    require_map_assignment(
+        relay_forward_reject,
+        "dimensions",
+        {"Environment": "var.environment", "Cell": "var.cell_id"},
+    )
+    # Go-side checks scope to the metric-dimension builders the Terraform
+    # selectors depend on. They catch simple emitter renames without pulling a Go
+    # parser into this small static lint.
+    require_go_function_text(
+        server_udp,
+        "buildServerMetricDimensions",
+        'Name: aws.String("Environment")',
+        "server-side relay_forward_reject alarm depends on the Go emitter Environment dimension name",
+    )
+    require_go_function_text(
+        server_udp,
+        "buildServerMetricDimensions",
+        'Name: aws.String("Cell")',
+        "server-side relay_forward_reject alarm depends on the Go emitter Cell dimension name",
+    )
+    ac_alarm_blocks = require_alarm_registry(
+        ac_monitoring,
+        "AC",
+        AC_CORE_ALARM_NAMES,
+        AC_ALARM_EXEMPTIONS,
+        "AC_CORE_ALARM_NAMES or AC_ALARM_EXEMPTIONS",
+    )
     # AC alarms intentionally pin only alarm/ok actions; insufficient-data
     # handling differs by alarm and is not the #1141 SNS-routing contract.
     for name in AC_CORE_ALARM_NAMES:
@@ -411,6 +695,119 @@ def check_shared_resources(repo: Path) -> None:
         "default",
         "true",
     )
+
+    relay_alarm_blocks = require_alarm_registry(
+        relay_monitoring,
+        "relay",
+        RELAY_CORE_ALARM_NAMES,
+        RELAY_ALARM_EXEMPTIONS,
+        "RELAY_CORE_ALARM_NAMES or RELAY_ALARM_EXEMPTIONS",
+    )
+
+    # #2644: relay alarms are only useful if their dimensions exactly match the
+    # emitters. Terraform validates syntax, not metric-stream selectors.
+    require_map_assignment(
+        relay_alarm_blocks["relay_bootstrap_failure"],
+        "dimensions",
+        {"Component": '"relay"', "Environment": "var.environment"},
+    )
+    require_cloudwatch_dimension_arg(
+        relay_user_data,
+        {"Component": "relay", "Environment": "${environment}"},
+        "BootstrapFailure alarm dimensions must match the CLI publisher tokens",
+    )
+
+    for name in ("relay_tg_unhealthy_hosts", "relay_tg_zero_healthy_targets"):
+        require_map_assignment(
+            relay_alarm_blocks[name],
+            "dimensions",
+            {
+                "LoadBalancer": "aws_lb.relay.arn_suffix",
+                "TargetGroup": "aws_lb_target_group.relay.arn_suffix",
+            },
+        )
+    require_assignment(
+        relay_alarm_blocks["relay_tg_zero_healthy_targets"],
+        "treat_missing_data",
+        '"breaching"',
+    )
+
+    require_map_assignment(
+        relay_alarm_blocks["relay_capacity_below_baseline"],
+        "dimensions",
+        {"AutoScalingGroupName": "aws_autoscaling_group.relay.name"},
+    )
+    require_assignment(
+        relay_alarm_blocks["relay_capacity_below_baseline"],
+        "metric_name",
+        '"GroupInServiceInstances"',
+    )
+    relay_asg = find_block(relay_compute, 'resource "aws_autoscaling_group"', "relay")
+    require_list_contains(
+        relay_asg,
+        "enabled_metrics",
+        '"GroupInServiceInstances"',
+    )
+
+    require_map_assignment(
+        relay_alarm_blocks["relay_shedding"],
+        "dimensions",
+        {"Environment": "var.environment"},
+    )
+    require_map_assignment(
+        relay_alarm_blocks["relay_shedding_unknown_environment"],
+        "dimensions",
+        {"Environment": '"unknown"'},
+    )
+    for name in ("relay_shedding", "relay_shedding_unknown_environment"):
+        require_assignment(relay_alarm_blocks[name], "metric_name", '"RelayShed"')
+        require_assignment(relay_alarm_blocks[name], "namespace", '"LayerV/NHP"')
+        require_assignment(relay_alarm_blocks[name], "statistic", '"Sum"')
+        require_assignment(
+            relay_alarm_blocks[name], "comparison_operator", '"GreaterThanThreshold"'
+        )
+        require_assignment(relay_alarm_blocks[name], "threshold", "0")
+        require_assignment(
+            relay_alarm_blocks[name],
+            "treat_missing_data",
+            '"notBreaching"',
+        )
+    require_shell_arg(
+        relay_user_data,
+        "-e NHP_ENVIRONMENT=${environment}",
+        "primary RelayShed alarm depends on the relay process receiving NHP_ENVIRONMENT",
+    )
+    # Deliberately source-shaped, not AST-shaped: a benign Go refactor that
+    # renames these builders or moves dim names to constants should update this
+    # fence with the metric-emitter contract in the same PR.
+    require_go_function_text(
+        relay_go,
+        "buildRelayMetricDimensions",
+        'Name: aws.String("Environment")',
+        "relay_shedding alarms depend on the Go emitter Environment dimension name",
+    )
+    require_go_function_text(
+        relay_go,
+        "buildRelayMetricDimensions",
+        'environment = "unknown"',
+        "relay_shedding_unknown_environment alarm matches the Go fallback Environment value",
+    )
+    require_name_subset(
+        RELAY_SINGLE_EVENT_ALARM_NAMES,
+        RELAY_CORE_ALARM_NAMES,
+        "RELAY_SINGLE_EVENT_ALARM_NAMES",
+        "RELAY_CORE_ALARM_NAMES",
+    )
+    for name in RELAY_CORE_ALARM_NAMES:
+        require_assignment(
+            relay_alarm_blocks[name], "alarm_actions", RELAY_ALARM_ACTION_EXPR
+        )
+        if name in RELAY_SINGLE_EVENT_ALARM_NAMES:
+            require_assignment(relay_alarm_blocks[name], "ok_actions", "[]")
+        else:
+            require_assignment(
+                relay_alarm_blocks[name], "ok_actions", RELAY_ALARM_ACTION_EXPR
+            )
 
 
 def run(repo: Path) -> None:

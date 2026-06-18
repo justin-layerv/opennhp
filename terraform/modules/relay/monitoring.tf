@@ -19,7 +19,10 @@
 #   - BootstrapFailure: user_data.sh.tpl (aws cloudwatch put-metric-data)
 #   - UnHealthyHostCount / HealthyHostCount: AWS/ApplicationELB (TG + LB ARN suffixes)
 #   - GroupInServiceInstances: AWS/AutoScaling (the ASG's enabled_metrics)
-#   - RelayShed: endpoints/relay/relay.go (the relay's endpoints/metrics publisher, #2649)
+#   - RelayShed: endpoints/relay/relay.go (the relay's endpoints/metrics publisher, #2649).
+#     The normal alarm watches Environment=<env>; the unknown-environment alarm
+#     watches Environment="unknown" so a boot path that drops NHP_ENVIRONMENT
+#     cannot silently strand shed events off the main alarm stream.
 #
 # Action routing mirrors modules/ac: a single optional SNS topic ARN threaded in
 # from the root (module.monitoring.sns_topic_arn), with the same
@@ -269,6 +272,8 @@ resource "aws_cloudwatch_metric_alarm" "relay_capacity_below_baseline" {
 # relay_bootstrap_failure above and per the repo's sparse-fleet alarm rule: prod
 # knock traffic is sparse (~1-2/hr) and the cap (256) sits orders of magnitude
 # above real peak, so a HEALTHY relay never sheds and the FIRST shed must page.
+# The parity checker pins dim-set, routing, and static first-event semantics;
+# live timing calibration is tracked separately under #2682.
 # notBreaching: the counter is only emitted on an actual shed (it's skipped at 0
 # by the publisher's flush), so quiet periods are genuinely shed-free, and a dark
 # relay carrying no traffic correctly stays green. No OK notification: returning
@@ -308,5 +313,51 @@ resource "aws_cloudwatch_metric_alarm" "relay_shedding" {
   tags = merge(local.tags, {
     Name  = "${var.name_prefix}-relay-shedding"
     Issue = "2649"
+  })
+}
+
+# ── 6. Backpressure shedding with missing relay environment (dim-set tripwire) ──
+#
+# buildRelayMetricDimensions deliberately falls back to Environment="unknown"
+# when NHP_ENVIRONMENT is absent (endpoints/relay/relay.go), which keeps local
+# dev metrics publishable but is dangerous in cloud: the primary relay_shedding
+# alarm above keys on Environment=<env> and treat_missing_data="notBreaching".
+# If a future relay boot path drops the systemd `-e NHP_ENVIRONMENT=...`, a shed
+# storm would land on the unknown stream and the primary alarm would stay green.
+#
+# This second alarm watches that fallback stream directly. A production relay
+# should never publish RelayShed with Environment="unknown"; if it does, page on
+# the first shed because the primary shed alarm is no longer attached to the
+# stream carrying the incident signal. The fallback stream has no Cell dimension,
+# so every relay cell in the account intentionally watches the same tripwire;
+# today's topology has one relay module per environment, so the env-scoped
+# name_prefix is unique. If relay becomes per-cell within one environment,
+# centralize or cell-scope this alarm before duplicate alarm_name collisions
+# (#2690).
+# This is a load-gated shed-stream tripwire, not a proactive env-var config audit:
+# a missing-env relay that never sheds emits no RelayShed sample and stays quiet.
+resource "aws_cloudwatch_metric_alarm" "relay_shedding_unknown_environment" {
+  alarm_name          = "${var.name_prefix}-relay-shedding-unknown-environment"
+  alarm_description   = "The relay published RelayShed with Environment=unknown, which means NHP_ENVIRONMENT was missing from the relay process and the primary relay-shedding alarm (Environment=${var.environment}) will not match shed events. Check the nhp-relayd systemd unit for -e NHP_ENVIRONMENT and the relay boot path before trusting the main shed alarm."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  metric_name         = "RelayShed"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = "unknown"
+  }
+
+  alarm_actions = local.relay_alarm_actions
+  ok_actions    = []
+
+  tags = merge(local.tags, {
+    Name  = "${var.name_prefix}-relay-shedding-unknown-environment"
+    Issue = "2644"
   })
 }

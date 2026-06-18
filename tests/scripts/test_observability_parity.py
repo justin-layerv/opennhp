@@ -28,6 +28,9 @@ def load_checker_module():
 CHECKER = load_checker_module()
 AC_ALARM_ACTION_EXPR = CHECKER.AC_ALARM_ACTION_EXPR
 AC_CORE_ALARMS = CHECKER.AC_CORE_ALARM_NAMES
+RELAY_ALARM_ACTION_EXPR = CHECKER.RELAY_ALARM_ACTION_EXPR
+RELAY_CORE_ALARMS = CHECKER.RELAY_CORE_ALARM_NAMES
+RELAY_SINGLE_EVENT_ALARMS = CHECKER.RELAY_SINGLE_EVENT_ALARM_NAMES
 
 
 def write(path: Path, body: str) -> None:
@@ -48,6 +51,90 @@ def ac_alarm_block(name: str) -> str:
     ).strip()
 
 
+def relay_alarm_block(name: str) -> str:
+    tg_dimensions = """
+          dimensions = {
+            LoadBalancer = aws_lb.relay.arn_suffix
+            TargetGroup  = aws_lb_target_group.relay.arn_suffix
+          }
+        """
+    dimensions = {
+        "relay_tg_unhealthy_hosts": tg_dimensions,
+        "relay_tg_zero_healthy_targets": """
+          treat_missing_data = "breaching"
+
+        """
+        + tg_dimensions,
+        "relay_bootstrap_failure": """
+          dimensions = {
+            Component   = "relay"
+            Environment = var.environment
+          }
+        """,
+        "relay_capacity_below_baseline": """
+          metric_name = "GroupInServiceInstances"
+
+          dimensions = {
+            AutoScalingGroupName = aws_autoscaling_group.relay.name
+          }
+        """,
+        "relay_shedding": """
+          comparison_operator = "GreaterThanThreshold"
+          metric_name         = "RelayShed"
+          namespace           = "LayerV/NHP"
+          statistic           = "Sum"
+          threshold           = 0
+          treat_missing_data  = "notBreaching"
+
+          dimensions = {
+            Environment = var.environment
+          }
+        """,
+        "relay_shedding_unknown_environment": """
+          comparison_operator = "GreaterThanThreshold"
+          metric_name         = "RelayShed"
+          namespace           = "LayerV/NHP"
+          statistic           = "Sum"
+          threshold           = 0
+          treat_missing_data  = "notBreaching"
+
+          dimensions = {
+            Environment = "unknown"
+          }
+        """,
+    }[name]
+    ok_actions = "[]" if name in RELAY_SINGLE_EVENT_ALARMS else RELAY_ALARM_ACTION_EXPR
+    return textwrap.dedent(
+        f"""
+        resource "aws_cloudwatch_metric_alarm" "{name}" {{
+          alarm_actions = {RELAY_ALARM_ACTION_EXPR}
+          ok_actions    = {ok_actions}
+        {dimensions.rstrip()}
+        }}
+        """
+    ).strip()
+
+
+RELAY_FORWARD_REJECT_BLOCK = textwrap.dedent(
+    """
+    resource "aws_cloudwatch_metric_alarm" "relay_forward_reject" {
+      count = var.deploy_relay ? 1 : 0
+
+      alarm_actions = [aws_sns_topic.alerts.arn]
+      metric_name   = "RelayForwardReject"
+      namespace     = "LayerV/NHP"
+      ok_actions    = [aws_sns_topic.alerts.arn]
+      statistic     = "Sum"
+
+      dimensions = {
+        Environment = var.environment
+        Cell        = var.cell_id
+      }
+    }
+    """
+).strip()
+
+
 def build_fixture(root: Path) -> None:
     write(
         root / "terraform" / "main.tf",
@@ -60,6 +147,7 @@ def build_fixture(root: Path) -> None:
           server_stderr_log_group_name = module.compute.log_group_stderr_name
           name_prefix                  = local.name_prefix
           chatbot_owned_externally     = var.chatbot_owned_externally
+          deploy_relay                 = var.deploy_relay
         }
 
         module "ac" {
@@ -74,31 +162,95 @@ def build_fixture(root: Path) -> None:
     )
     write(
         root / "terraform" / "modules" / "monitoring" / "main.tf",
+        textwrap.dedent(
+            """
+            resource "aws_sns_topic" "alerts" {}
+
+            resource "aws_cloudwatch_log_metric_filter" "server_panic" {}
+
+            resource "aws_cloudwatch_metric_alarm" "server_panic" {
+              alarm_actions             = [aws_sns_topic.alerts.arn]
+              ok_actions                = [aws_sns_topic.alerts.arn]
+              insufficient_data_actions = [aws_sns_topic.alerts.arn]
+            }
+
+            resource "aws_cloudwatch_metric_alarm" "server_instance_restart" {
+              alarm_actions = [aws_sns_topic.alerts.arn]
+              ok_actions    = [aws_sns_topic.alerts.arn]
+            }
+
+            resource "aws_cloudwatch_metric_alarm" "ac_registration_latency" {
+              alarm_actions = [aws_sns_topic.alerts.arn]
+              ok_actions    = [aws_sns_topic.alerts.arn]
+            }
+            """
+        ).strip()
+        # relay_forward_reject is the block the forward-reject drift tests mutate,
+        # so build it from the shared constant; otherwise the fixture and the
+        # replacement anchor could drift and silently no-op those tests.
+        + "\n\n"
+        + RELAY_FORWARD_REJECT_BLOCK
+        + "\n",
+    )
+    write(
+        root / "endpoints" / "server" / "udpserver.go",
         """
-        resource "aws_sns_topic" "alerts" {}
+        package server
 
-        resource "aws_cloudwatch_log_metric_filter" "server_panic" {}
-
-        resource "aws_cloudwatch_metric_alarm" "server_panic" {
-          alarm_actions             = [aws_sns_topic.alerts.arn]
-          ok_actions                = [aws_sns_topic.alerts.arn]
-          insufficient_data_actions = [aws_sns_topic.alerts.arn]
+        func buildServerMetricDimensions() {
+          _ = []types.Dimension{
+            {Name: aws.String("Environment"), Value: aws.String(environment)},
+            {Name: aws.String("Cell"), Value: aws.String(cellID)},
+          }
         }
+        """,
+    )
+    write(
+        root / "endpoints" / "relay" / "relay.go",
+        """
+        package relay
 
-        resource "aws_cloudwatch_metric_alarm" "server_instance_restart" {
-          alarm_actions = [aws_sns_topic.alerts.arn]
-          ok_actions    = [aws_sns_topic.alerts.arn]
-        }
-
-        resource "aws_cloudwatch_metric_alarm" "ac_registration_latency" {
-          alarm_actions = [aws_sns_topic.alerts.arn]
-          ok_actions    = [aws_sns_topic.alerts.arn]
+        func buildRelayMetricDimensions() {
+          environment := os.Getenv("NHP_ENVIRONMENT")
+          if environment == "" {
+            environment = "unknown"
+          }
+          _ = []types.Dimension{
+            {Name: aws.String("Environment"), Value: aws.String(environment)},
+          }
         }
         """,
     )
     write(
         root / "terraform" / "modules" / "ac" / "monitoring.tf",
         "\n\n".join(ac_alarm_block(name) for name in AC_CORE_ALARMS),
+    )
+    write(
+        root / "terraform" / "modules" / "relay" / "monitoring.tf",
+        "\n\n".join(relay_alarm_block(name) for name in RELAY_CORE_ALARMS),
+    )
+    write(
+        root / "terraform" / "modules" / "relay" / "compute.tf",
+        """
+        resource "aws_autoscaling_group" "relay" {
+          enabled_metrics = [
+            "GroupInServiceInstances",
+          ]
+        }
+        """,
+    )
+    write(
+        root / "terraform" / "modules" / "relay" / "user_data.sh.tpl",
+        """
+        aws cloudwatch put-metric-data \\
+          --namespace "LayerV/NHP" \\
+          --metric-name "BootstrapFailure" \\
+          --dimensions "Component=relay,Environment=${environment}"
+
+        ExecStart=/usr/bin/docker run \\
+          -e NHP_ENVIRONMENT=${environment} \\
+          image run
+        """,
     )
     write(
         root / "terraform" / "modules" / "ac" / "variables.tf",
@@ -132,6 +284,7 @@ def build_fixture(root: Path) -> None:
               source = "../.."
 
               deploy_ac                  = var.deploy_ac
+              deploy_relay               = var.deploy_relay
               enable_slack_notifications = var.enable_slack_notifications
               slack_workspace_id         = var.slack_workspace_id
               slack_channel_id           = var.slack_channel_id
@@ -143,6 +296,11 @@ def build_fixture(root: Path) -> None:
             root / "terraform" / "environments" / env / "variables.tf",
             """
             variable "deploy_ac" {
+              type    = bool
+              default = true
+            }
+
+            variable "deploy_relay" {
               type    = bool
               default = true
             }
@@ -202,6 +360,9 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("observability parity surfaces are wired", result.stdout)
 
+    def test_relay_unknown_environment_alarm_is_fenced(self) -> None:
+        self.assertIn("relay_shedding_unknown_environment", RELAY_CORE_ALARMS)
+
     def test_inline_comment_on_pinned_expression_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -211,6 +372,28 @@ class ObservabilityParityTests(unittest.TestCase):
                 main_tf.read_text(encoding="utf-8").replace(
                     "  chatbot_owned_externally     = var.chatbot_owned_externally\n",
                     "  chatbot_owned_externally     = var.chatbot_owned_externally # fixture note\n",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_inline_comment_tokens_inside_string_literal_pass(self) -> None:
+        self.assertEqual(
+            CHECKER._normalise_expr('"https://example.com/a#b" # fixture note'),
+            '"https://example.com/a#b"',
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    'Environment = "unknown"',
+                    'Environment = "unknown" // https://example.com/a#b',
                 ),
                 encoding="utf-8",
             )
@@ -250,6 +433,7 @@ class ObservabilityParityTests(unittest.TestCase):
                   source = "../.."
 
                   deploy_ac                  = var.deploy_ac
+                  deploy_relay               = var.deploy_relay
                   enable_slack_notifications = var.enable_slack_notifications
                   slack_workspace_id         = var.slack_workspace_id
                   slack_channel_id           = var.slack_channel_id
@@ -260,6 +444,7 @@ class ObservabilityParityTests(unittest.TestCase):
                 env_dir / "variables.tf",
                 """
                 variable "deploy_ac" {}
+                variable "deploy_relay" {}
                 variable "enable_slack_notifications" {}
                 variable "slack_workspace_id" {}
                 variable "slack_channel_id" {}
@@ -298,6 +483,43 @@ class ObservabilityParityTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("server_stderr_log_group_name", result.stderr)
+
+    def test_missing_monitoring_deploy_relay_wiring_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            main_tf = root / "terraform" / "main.tf"
+            main_tf.write_text(
+                main_tf.read_text(encoding="utf-8").replace(
+                    "  deploy_relay                 = var.deploy_relay\n",
+                    "",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("deploy_relay", result.stderr)
+
+    def test_missing_env_deploy_relay_passthrough_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            prod_main = root / "terraform" / "environments" / "prod" / "main.tf"
+            prod_main.write_text(
+                prod_main.read_text(encoding="utf-8").replace(
+                    "  deploy_relay               = var.deploy_relay\n",
+                    "",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("prod/main.tf", result.stderr)
+        self.assertIn("deploy_relay", result.stderr)
 
     def test_monitoring_module_count_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -527,6 +749,841 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("enable_cloudwatch_alarms", result.stderr)
         self.assertIn("want `default = true`", result.stderr)
+
+    def test_missing_relay_alarm_resource_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    'resource "aws_cloudwatch_metric_alarm" "relay_shedding_unknown_environment"',
+                    'resource "aws_cloudwatch_metric_alarm" "relay_shedding_unknown_environment_missing"',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing relay CloudWatch alarm", result.stderr)
+        self.assertIn("relay_shedding_unknown_environment", result.stderr)
+
+    def test_untracked_relay_alarm_resource_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8")
+                + textwrap.dedent(
+                    """
+
+                    resource "aws_cloudwatch_metric_alarm" "new_unfenced_relay_alarm" {
+                      alarm_actions = local.relay_alarm_actions
+                      ok_actions    = local.relay_alarm_actions
+
+                      dimensions = {
+                        Environment = var.environment
+                      }
+                    }
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay CloudWatch alarm(s) must be added", result.stderr)
+        self.assertIn("new_unfenced_relay_alarm", result.stderr)
+
+    def test_relay_bootstrap_dimension_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    'Component   = "relay"\n',
+                    'Component   = "nhp-relay"\n',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_bootstrap_failure", result.stderr)
+        self.assertIn("Component", result.stderr)
+
+    def test_relay_alarm_action_routing_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    "  alarm_actions = local.relay_alarm_actions\n",
+                    "  alarm_actions = []\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_tg_unhealthy_hosts", result.stderr)
+        self.assertIn("alarm_actions", result.stderr)
+
+    def test_relay_single_event_alarm_ok_action_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    "  ok_actions    = []\n",
+                    "  ok_actions    = local.relay_alarm_actions\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_bootstrap_failure", result.stderr)
+        self.assertIn("ok_actions", result.stderr)
+
+    def test_server_relay_forward_reject_action_routing_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            good_block = RELAY_FORWARD_REJECT_BLOCK
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    good_block,
+                    good_block.replace(
+                        "  ok_actions    = [aws_sns_topic.alerts.arn]",
+                        "  ok_actions    = []",
+                    ),
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_forward_reject", result.stderr)
+        self.assertIn("ok_actions", result.stderr)
+
+    def test_server_relay_forward_reject_alarm_action_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            good_block = RELAY_FORWARD_REJECT_BLOCK
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    good_block,
+                    good_block.replace(
+                        "  alarm_actions = [aws_sns_topic.alerts.arn]",
+                        "  alarm_actions = []",
+                    ),
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_forward_reject", result.stderr)
+        self.assertIn("alarm_actions", result.stderr)
+
+    def test_server_relay_forward_reject_metric_name_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            good_block = RELAY_FORWARD_REJECT_BLOCK
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    good_block,
+                    good_block.replace(
+                        '  metric_name   = "RelayForwardReject"',
+                        '  metric_name   = "RelayForwardRejected"',
+                    ),
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_forward_reject", result.stderr)
+        self.assertIn("metric_name", result.stderr)
+
+    def test_server_relay_forward_reject_namespace_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            good_block = RELAY_FORWARD_REJECT_BLOCK
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    good_block,
+                    good_block.replace(
+                        '  namespace     = "LayerV/NHP"',
+                        '  namespace     = "LayerV/NHPRelay"',
+                    ),
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_forward_reject", result.stderr)
+        self.assertIn("namespace", result.stderr)
+
+    def test_server_relay_forward_reject_statistic_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            good_block = RELAY_FORWARD_REJECT_BLOCK
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    good_block,
+                    good_block.replace(
+                        '  statistic     = "Sum"',
+                        '  statistic     = "Average"',
+                    ),
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_forward_reject", result.stderr)
+        self.assertIn("statistic", result.stderr)
+
+    def test_server_relay_forward_reject_count_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    "  count = var.deploy_relay ? 1 : 0\n",
+                    "  count = 1\n",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_forward_reject", result.stderr)
+        self.assertIn("count", result.stderr)
+
+    def test_server_metric_environment_dimension_name_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            server_udp = root / "endpoints" / "server" / "udpserver.go"
+            server_udp.write_text(
+                server_udp.read_text(encoding="utf-8").replace(
+                    'Name: aws.String("Environment")',
+                    'Name: aws.String("Env")',
+                    1,
+                )
+                + '\nvar unrelatedEnvironmentDimension = aws.String("Environment")\n',
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_forward_reject", result.stderr)
+        self.assertIn("Environment", result.stderr)
+
+    def test_server_metric_cell_dimension_name_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            server_udp = root / "endpoints" / "server" / "udpserver.go"
+            server_udp.write_text(
+                server_udp.read_text(encoding="utf-8").replace(
+                    'Name: aws.String("Cell")',
+                    'Name: aws.String("CellId")',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_forward_reject", result.stderr)
+        self.assertIn("Cell", result.stderr)
+
+    def test_go_function_scanner_ignores_raw_strings_and_rune_braces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            for go_path in (
+                root / "endpoints" / "server" / "udpserver.go",
+                root / "endpoints" / "relay" / "relay.go",
+            ):
+                go_path.write_text(
+                    go_path.read_text(encoding="utf-8").replace(
+                        "  _ = []types.Dimension{",
+                        "  _ = `raw } brace`\n"
+                        "  _ = '}'\n"
+                        "  _ = []types.Dimension{",
+                        1,
+                    ),
+                    encoding="utf-8",
+                )
+
+            result = run_check(root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_relay_user_data_bootstrap_dimension_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    "--dimensions \"Component=relay,Environment=${environment}\"",
+                    "--dimensions \"Component=relay\"",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("BootstrapFailure alarm dimensions", result.stderr)
+        self.assertIn("--dimensions has", result.stderr)
+
+    def test_relay_user_data_bootstrap_dimension_malformed_token_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    "Component=relay,Environment=${environment}",
+                    "Component=relay,Environment:${environment}",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed --dimensions token", result.stderr)
+
+    def test_relay_user_data_bootstrap_dimension_reorder_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    "Component=relay,Environment=${environment}",
+                    "Environment=${environment},Component=relay",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_relay_user_data_bootstrap_dimension_substring_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    "Component=relay,Environment=${environment}",
+                    "Component=relay-x,Environment=${environment}",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("BootstrapFailure alarm dimensions", result.stderr)
+
+    def test_relay_user_data_bootstrap_dimension_comment_only_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    '  --dimensions "Component=relay,Environment=${environment}"',
+                    '  --dimensions "Component=relay"\n'
+                    '# --dimensions "Component=relay,Environment=${environment}"',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("BootstrapFailure alarm dimensions", result.stderr)
+
+    def test_relay_user_data_bootstrap_dimension_shell_single_quote_hash_passes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    '  --dimensions "Component=relay,Environment=${environment}"',
+                    "  echo 'literal # not a shell comment' && "
+                    'aws cloudwatch put-metric-data --dimensions '
+                    '"Component=relay,Environment=${environment}"',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_relay_alb_dimension_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    "    TargetGroup  = aws_lb_target_group.relay.arn_suffix\n",
+                    "",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_tg_unhealthy_hosts", result.stderr)
+        self.assertIn("TargetGroup", result.stderr)
+
+    def test_relay_zero_healthy_missing_data_semantic_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    'treat_missing_data = "breaching"',
+                    'treat_missing_data = "notBreaching"',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_tg_zero_healthy_targets", result.stderr)
+        self.assertIn("treat_missing_data", result.stderr)
+
+    def test_relay_asg_enabled_metric_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_compute = root / "terraform" / "modules" / "relay" / "compute.tf"
+            relay_compute.write_text(
+                relay_compute.read_text(encoding="utf-8").replace(
+                    '"GroupInServiceInstances"',
+                    '"GroupDesiredCapacity"',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GroupInServiceInstances", result.stderr)
+
+    def test_relay_asg_enabled_metric_stray_occurrence_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_compute = root / "terraform" / "modules" / "relay" / "compute.tf"
+            relay_compute.write_text(
+                relay_compute.read_text(encoding="utf-8").replace(
+                    '"GroupInServiceInstances"',
+                    '"GroupDesiredCapacity"',
+                )
+                + textwrap.dedent(
+                    """
+
+                    resource "null_resource" "fixture_metric_string" {
+                      triggers = {
+                        metric = "GroupInServiceInstances"
+                      }
+                    }
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("aws_autoscaling_group", result.stderr)
+        self.assertIn("GroupInServiceInstances", result.stderr)
+
+    def test_relay_capacity_metric_name_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    'metric_name = "GroupInServiceInstances"',
+                    'metric_name = "GroupDesiredCapacity"',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_capacity_below_baseline", result.stderr)
+        self.assertIn("metric_name", result.stderr)
+
+    def test_relay_shed_unknown_dimension_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    'Environment = "unknown"',
+                    "Environment = var.environment",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_shedding_unknown_environment", result.stderr)
+        self.assertIn("unknown", result.stderr)
+
+    def test_relay_shed_dimension_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            good_block = relay_alarm_block("relay_shedding")
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    good_block,
+                    good_block.replace(
+                        "    Environment = var.environment",
+                        '    Environment = "unknown"',
+                    ),
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_shedding", result.stderr)
+        self.assertIn("Environment", result.stderr)
+
+    def test_relay_shed_static_semantic_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    'comparison_operator = "GreaterThanThreshold"',
+                    'comparison_operator = "GreaterThanOrEqualToThreshold"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_shedding", result.stderr)
+        self.assertIn("comparison_operator", result.stderr)
+
+    def test_relay_shed_metric_name_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    'metric_name         = "RelayShed"',
+                    'metric_name         = "RelayShedded"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_shedding", result.stderr)
+        self.assertIn("metric_name", result.stderr)
+
+    def test_relay_shed_statistic_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring.write_text(
+                relay_monitoring.read_text(encoding="utf-8").replace(
+                    'statistic           = "Sum"',
+                    'statistic           = "Average"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_shedding", result.stderr)
+        self.assertIn("statistic", result.stderr)
+
+    def test_relay_shed_unknown_static_semantic_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            monitoring_text = relay_monitoring.read_text(encoding="utf-8")
+            unknown_alarm_start = monitoring_text.index(
+                'resource "aws_cloudwatch_metric_alarm" '
+                '"relay_shedding_unknown_environment"'
+            )
+            relay_monitoring.write_text(
+                monitoring_text[:unknown_alarm_start]
+                + monitoring_text[unknown_alarm_start:].replace(
+                    'treat_missing_data  = "notBreaching"',
+                    'treat_missing_data  = "breaching"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_shedding_unknown_environment", result.stderr)
+        self.assertIn("treat_missing_data", result.stderr)
+
+    def test_relay_shed_unknown_namespace_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            monitoring_text = relay_monitoring.read_text(encoding="utf-8")
+            unknown_alarm_start = monitoring_text.index(
+                'resource "aws_cloudwatch_metric_alarm" '
+                '"relay_shedding_unknown_environment"'
+            )
+            relay_monitoring.write_text(
+                monitoring_text[:unknown_alarm_start]
+                + monitoring_text[unknown_alarm_start:].replace(
+                    'namespace           = "LayerV/NHP"',
+                    'namespace           = "LayerV/NHPRelay"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_shedding_unknown_environment", result.stderr)
+        self.assertIn("namespace", result.stderr)
+
+    def test_relay_metric_environment_dimension_name_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_go = root / "endpoints" / "relay" / "relay.go"
+            relay_go.write_text(
+                relay_go.read_text(encoding="utf-8").replace(
+                    'Name: aws.String("Environment")',
+                    'Name: aws.String("Env")',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_shedding", result.stderr)
+        self.assertIn("Environment", result.stderr)
+
+    def test_relay_metric_unknown_environment_fallback_value_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_go = root / "endpoints" / "relay" / "relay.go"
+            relay_go.write_text(
+                relay_go.read_text(encoding="utf-8").replace(
+                    'environment = "unknown"',
+                    'environment = "unset"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_shedding_unknown_environment", result.stderr)
+        self.assertIn("unknown", result.stderr)
+
+    def test_relay_process_environment_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    "-e NHP_ENVIRONMENT=${environment}",
+                    "",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("NHP_ENVIRONMENT", result.stderr)
+
+    def test_relay_process_environment_value_suffix_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    "-e NHP_ENVIRONMENT=${environment}",
+                    "-e NHP_ENVIRONMENT=${environment}_TYPO",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("NHP_ENVIRONMENT", result.stderr)
+
+    def test_relay_process_environment_comment_only_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    "-e NHP_ENVIRONMENT=${environment}",
+                    "# -e NHP_ENVIRONMENT=${environment}",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("NHP_ENVIRONMENT", result.stderr)
+
+    def test_relay_process_environment_trailing_comment_only_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    "-e NHP_ENVIRONMENT=${environment}",
+                    '-e OTHER_ENVIRONMENT=${environment} # -e NHP_ENVIRONMENT=${environment}',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("NHP_ENVIRONMENT", result.stderr)
+
+    def test_relay_process_environment_shell_slashes_are_not_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data.write_text(
+                relay_user_data.read_text(encoding="utf-8").replace(
+                    "-e NHP_ENVIRONMENT=${environment}",
+                    "-e NHP_ENVIRONMENT=${environment} // shell literal, not a comment",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_relay_single_event_names_must_be_core_alarm_names(self) -> None:
+        with self.assertRaises(CHECKER.LintError) as ctx:
+            CHECKER.require_name_subset(
+                ("relay_shedding", "relay_shedding_typo"),
+                RELAY_CORE_ALARMS,
+                "RELAY_SINGLE_EVENT_ALARM_NAMES",
+                "RELAY_CORE_ALARM_NAMES",
+            )
+
+        self.assertIn("relay_shedding_typo", str(ctx.exception))
+
+    def test_server_relay_forward_reject_dimension_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    "    Cell        = var.cell_id\n",
+                    "",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relay_forward_reject", result.stderr)
+        self.assertIn("Cell", result.stderr)
 
     def test_tfvars_noop_variable_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
