@@ -19,9 +19,17 @@ migration. Deploy this NHP server change **before** qurl-service #823 drops the
       the body. Before cutover confirm **either** #855 has been live in prod ≥
       the maximum qURL lifetime (so every still-valid qURL was minted post-#855),
       **or** a one-time backfill populated `nhp_resources` for pre-#855 tokens.
-- [ ] Pre-rollout: confirm qurl-service #823 stays draft/blocked until this NHP
+      _Current 2026-06-18: this gate is **not satisfied**. Prod qurl-service is
+      still SSM-pinned to `db5d703` from 2026-06-02, before #855. Prod
+      `layerv-nhp-prod-cell0-resources` has `Count=0` rows whose
+      `resource_id` begins with `q_`, while prod `qurl-resources` has 772 active
+      non-expired resources. Do not cut over the plugin path until #855 has
+      lived past max qURL lifetime or a backfill populates those catalog rows._
+- [x] Pre-rollout: confirm qurl-service #823 stays draft/blocked until this NHP
       change deploys (its current `resources` response is no longer consumed but
-      is still sent).
+      is still sent). _Done/current 2026-06-17: qurl-service #823 remains OPEN
+      and prod qurl-service is still pinned to SSM image tag `db5d703`, predating
+      the cleanup._
 - [ ] Rollout: deploy this NHP server change before qurl-service #823. No flag —
       the plugin path resolves from the catalog as soon as the image is live.
 - [ ] Shared-path note (validate alongside the headless path): this PR also adds

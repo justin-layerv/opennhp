@@ -11,8 +11,12 @@ low-sensitivity: the role can read sandbox state, SSM SecureStrings, Secrets
 Manager values, and KMS-decrypted material. Prod-only Terraform PRs are
 reported as skipped so unrelated sandbox state does not block prod-only changes.
 
-- [ ] Pre-rollout: confirm the latest sandbox apply has converged successfully
-      after the failures linked from issue #2463.
+- [x] Pre-rollout: confirm the latest sandbox apply has converged successfully
+      after the failures linked from issue #2463. _Done/current 2026-06-18:
+      Build and Deploy NHP run
+      [27734080658](https://github.com/layervai/nhp/actions/runs/27734080658)
+      succeeded, including sandbox infrastructure apply, deploy validate, and
+      NHP smoke._
 - [ ] Pre-rollout: get security-owner sign-off that same-repo PR authors are
       inside the accepted trust boundary for long-lived Auth0 Terraform client
       credentials, short-lived Auth0 API tokens, PR-head Terraform HCL execution

@@ -8,12 +8,20 @@ topic and adds PR-time parity fences for the prod/sandbox observability surfaces
 from #1141. Coordinate the normal prod Terraform rollout with the sandbox
 Chatbot ownership handoff note in the PR body.
 
-- [ ] Pre-rollout: describe the prod core AC alarms before applying and confirm
+- [x] Pre-rollout: describe the prod core AC alarms before applying and confirm
       none are already in an unexpected `ALARM` or `INSUFFICIENT_DATA` state that
-      would page or mask a newly-live alarm action.
-- [ ] Pre-rollout: confirm the core AC alarms' dimension sets still match their
+      would page or mask a newly-live alarm action. _Done/current 2026-06-17:
+      `aws cloudwatch describe-alarms --profile layerv-prod` shows the prod core
+      AC alarm suite in `OK`._
+- [ ] Post-rollout: after the prod Terraform apply, confirm the core AC alarms'
+      dimension sets match their
       publishers (`terraform/CLAUDE.md` "Metric / Alarm Dim-Set Rules"; smoke
       test `TestACAlarms_DimensionsMatchPublisher` covers the audited subset).
+      _Current pre-apply 2026-06-17: this smoke test fails in prod because
+      `registration-failure` and `server-connection-failure` still have
+      `{Component=AC}` but expect `{Component=AC, Environment=prod,
+      Region=us-east-2}`. Treat this as a release-apply/post-apply verification
+      item, not a separate pre-release manual fix._
 - [ ] Cross-repo/sandbox: before the sandbox apply that activates both AC alarm
       actions and external Chatbot ownership, describe the sandbox core AC alarm
       states and confirm no unexpected `ALARM` or `INSUFFICIENT_DATA` state will

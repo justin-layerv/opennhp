@@ -10,10 +10,13 @@ concurrent `msgToPacketRoutine` workers, a knock burst can false-drop a
 reordered ART with no network reorder. Get a load number behind the "rare"
 assumption via `MetricARTReplayGateDrop` before relying on the strict gate.
 
-- [ ] Pre-reliance: stand up a CloudWatch alarm (or at least a dashboard panel)
+- [ ] Rollout (prod Terraform): stand up a CloudWatch alarm (or at least a dashboard panel)
       on `ARTReplayGateDrop` (namespace `LayerV/NHP`) so a burst-reorder
       availability regression pages rather than requiring a manual metric read —
       tracked alongside the `ARTReplayDetected` security-parity alarm in #2512.
+      _Repo-side implemented by this PR's `terraform/modules/monitoring/main.tf`
+      `aws_cloudwatch_metric_alarm.art_replay_gate_drop`; remains open until prod
+      Terraform creates the alarm._
 - [ ] Post-rollout: with that alarm/panel live, watch the `ARTReplayGateDrop`
       rate under a multi-knock burst through one AC; a near-zero rate confirms
       the strict gate is safe under real burst load. Note this counter only

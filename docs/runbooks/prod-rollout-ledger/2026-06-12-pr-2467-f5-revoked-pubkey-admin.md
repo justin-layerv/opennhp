@@ -13,9 +13,9 @@ incident.
       `nhp-license-admin revoke` / `unrevoke` has `dynamodb:GetItem` and
       `dynamodb:UpdateItem` on the prod AC assignments table via
       `dynamodb_write_policy_arn` or an equivalent least-privilege grant (#2477).
-- [ ] Pre-rollout: from a trusted operator shell, run
+- [x] Pre-rollout: from a trusted operator shell or current prod admin profile, run
       `nhp-license-admin list-revoked --region <prod-region> --ac-assignments-table <prod-table> --ac-id <known-ac-id>`
-      to confirm region, table, and IAM wiring before an incident.
+      to confirm region, table, and IAM wiring before an incident. _Done/current 2026-06-18: `AWS_PROFILE=layerv-prod AWS_REGION=us-east-2 go run ./licenseadmin/main list-revoked --region us-east-2 --ac-assignments-table layerv-nhp-prod-cell0-ac-assignments --ac-id layerv-ac-tf` returned `version: 36688` and `revoked_pubkeys: (none)`, proving the CLI/table/region/read path. The separate incident operator/admin role attachment check remains open._
 - [ ] Strict-mode flip: keep `NHP_AC_PUBKEY_REVOKE_VERIFY=false` until the F5
       alarms are OK and ACAssignment pre-provisioning is ready, as described in
       the F5 runbook.

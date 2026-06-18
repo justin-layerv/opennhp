@@ -5,7 +5,7 @@
 
 Deploy the SSM-backed min-client-version sync with the gate disabled, then verify the timer before any production floor is set.
 
-- [ ] Pre-rollout: confirm qurl-reverse-tunnel-server #208 and qurl-connector #371 are deployed or scheduled before setting a non-disabled floor.
+- [x] Pre-rollout: confirm qurl-reverse-tunnel-server #208 and qurl-connector #371 are deployed or scheduled before setting a non-disabled floor. _Done/current 2026-06-17: qurl-reverse-tunnel-server #208 merged at `d5d2dc9`; qurl-connector #371 merged at `a87eeef`; sandbox SSM `/<env>/nhp/reverse-tunnel-server/min-client-version` is currently `disabled`._
 - [ ] Rollout: apply with `/<env>/nhp/reverse-tunnel-server/min-client-version` value `disabled`.
 - [ ] Post-rollout: verify FRPS user-data logs show `min-client-version synced from SSM`, the server logs show `min_client_version=disabled`, and a sandbox SSM change to a test floor then back to `disabled` is observed by the running qurl-reverse-tunnel-server logs without restarting the instance.
 - [ ] Guardrail check: in sandbox, write an invalid SSM value and confirm `qurl-min-client-version-sync.service` fails without replacing the prior min-client-version file, then restore `disabled`.

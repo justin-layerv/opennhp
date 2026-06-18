@@ -970,6 +970,47 @@ resource "aws_cloudwatch_metric_alarm" "knock_forward_path" {
   })
 }
 
+# ART replay-gate drops (#2513). nhp-server emits ARTReplayGateDrop when the
+# per-connection strict-less-than replay gate drops a matched NHP_ART packet,
+# i.e. a live knock transaction was affected. It is an availability signal, not
+# just a replay-defense signal: a nonzero rate during bursty legitimate knocks
+# means the strict gate is too twitchy and should be loosened while the ART
+# dedupe cache remains the replay defense.
+#
+# DIM SET — {Environment, Cell}: emitted via Publisher.IncrCounter from
+# endpoints/server/udpserver.go with buildServerMetricDimensions(), matching the
+# other server sparse-counter alarms in this module.
+#
+# SHAPE — same traffic-gated sparse-counter detector as knock_forward_path:
+# page on the first breaching 5-minute bucket in a trailing hour, then tune only
+# after real traffic establishes a benign baseline.
+resource "aws_cloudwatch_metric_alarm" "art_replay_gate_drop" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-art-replay-gate-drop"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 12
+  datapoints_to_alarm = 1
+  metric_name         = "ARTReplayGateDrop"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "nhp-server dropped >=1 matched NHP_ART packet at the replay gate in the trailing hour. This can fail a live knock; if it appears during legitimate burst traffic, loosen the strict replay gate tolerance while keeping the ART dedupe cache. #2513."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+    Issue     = "2513"
+  })
+}
+
 # Relay-forward rejects: "relay enabled but forwards rejected" (#2643, part of
 # #2208). nhp-server emits RelayForwardReject (MetricRelayForwardReject,
 # endpoints/server/relay.go) on every NHP_RLY forward it drops PRE-AUTH — most
