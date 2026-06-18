@@ -237,11 +237,8 @@ resource "aws_cloudwatch_log_group" "scanner_active_recheck" {
 resource "aws_iam_role" "scanner_lambda" {
   count = var.qurl_scanner_lambda_enabled ? 1 : 0
 
-  name = "${local.scanner_lambda_function_name}-execution"
-  # Match the deployed metadata exactly while terraform-apply-iam gains
-  # iam:UpdateRoleDescription. Reintroducing description drift in the same
-  # apply as the new verb races IAM propagation and blocks sandbox deploys.
-  description = "Execution role for the qurl-scanner Lambda -- DDB Query/UpdateItem on qURL tables + optional SQS SendMessage + CloudWatch Logs."
+  name        = "${local.scanner_lambda_function_name}-execution"
+  description = "Execution role for the qurl-scanner Lambda -- DDB Query/GetItem/UpdateItem/DeleteItem on qURL tables + optional SQS SendMessage + CloudWatch Logs."
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -271,11 +268,16 @@ resource "aws_iam_role" "scanner_lambda" {
 #   * `qurl_access_tokens/resource-token-index` GSI : Query (active-qurl
 #                                          precondition before
 #                                          `resource.closed` emission)
-#   * `qurl_resources` table             : GetItem + UpdateItem
+#   * `qurl_resources` table             : GetItem + UpdateItem +
+#                                          DeleteItem
 #                                          (`resource_closed_fired_at`,
 #                                          `resource_tombstoned_at`,
 #                                          `tombstone_ttl`,
-#                                          `final_access_count`)
+#                                          `final_access_count`; tombstone
+#                                          transactions also delete the
+#                                          owner-target dedup sentinel so the
+#                                          closed transit target can be
+#                                          re-created cleanly)
 #   * `qurl_resources/status-index` GSI  : Query (hourly active-resource
 #                                          recheck for resources blocked by
 #                                          viewer sessions after the last
@@ -340,6 +342,7 @@ resource "aws_iam_role_policy" "scanner_lambda_dynamodb" {
           Sid    = "QurlResourcesReadWrite"
           Effect = "Allow"
           Action = [
+            "dynamodb:DeleteItem",
             "dynamodb:GetItem",
             "dynamodb:UpdateItem",
           ]

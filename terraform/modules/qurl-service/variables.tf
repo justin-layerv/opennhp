@@ -1164,7 +1164,7 @@ variable "qurl_scanner_lambda_image_tag_ssm_param" {
 }
 
 variable "qurl_resources_table_arn" {
-  description = "ARN of the qurl-resources DynamoDB table (UpdateItem + GetItem from the scanner Lambdas, plus Query on `status-index` for active-resource rechecks). Threaded from `module.dynamodb.qurl_resources_table_arn`. Empty is the gate-OFF default; the Lambda precondition fails plan if `qurl_scanner_lambda_enabled = true` and this is empty."
+  description = "ARN of the qurl-resources DynamoDB table (UpdateItem + GetItem + DeleteItem from the scanner Lambdas, plus Query on `status-index` for active-resource rechecks). Threaded from `module.dynamodb.qurl_resources_table_arn`. Empty is the gate-OFF default; the Lambda precondition fails plan if `qurl_scanner_lambda_enabled = true` and this is empty."
   type        = string
   default     = ""
 }
