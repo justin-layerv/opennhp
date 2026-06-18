@@ -128,7 +128,7 @@ resource "aws_iam_instance_profile" "relay" {
 resource "aws_security_group" "relay" {
   name_prefix = "${var.name_prefix}-relay-"
   vpc_id      = var.vpc_id
-  description = "NHP Relay node: ALB ingress on the HTTP port; server UDP-ACK return ingress; all egress."
+  description = "NHP Relay node: ALB ingress on the HTTPS backend port; server UDP-ACK return ingress; all egress."
 
   tags = merge(local.tags, { Name = "${var.name_prefix}-sg-relay" })
 
@@ -137,19 +137,21 @@ resource "aws_security_group" "relay" {
   }
 }
 
-# Inbound HTTP from the ALB only (the relay is never directly internet-reachable;
-# the ALB terminates TLS and is the trusted hop that APPENDS the real client IP to
-# X-Forwarded-For — its RIGHTMOST entry is ALB-attested, the precondition for
-# source_addr_mode=trusted_header being safe; the rightmost-entry parse is #2622).
+# Inbound HTTPS from the ALB only (the relay is never directly internet-reachable;
+# the ALB terminates client TLS, re-encrypts to the relay backend, and is the
+# trusted hop that APPENDS the real client IP to X-Forwarded-For — its RIGHTMOST
+# entry is ALB-attested, the precondition for source_addr_mode=trusted_header
+# being safe; the rightmost-entry parse is #2622). The Terraform resource name is
+# kept stable to avoid needless state churn.
 resource "aws_vpc_security_group_ingress_rule" "relay_http_from_alb" {
   security_group_id            = aws_security_group.relay.id
-  description                  = "HTTP from the relay ALB"
+  description                  = "HTTPS backend traffic from the relay ALB"
   from_port                    = var.listen_port
   to_port                      = var.listen_port
   ip_protocol                  = "tcp"
   referenced_security_group_id = aws_security_group.alb.id
 
-  tags = { Name = "${var.name_prefix}-relay-http-from-alb" }
+  tags = { Name = "${var.name_prefix}-relay-https-from-alb" }
 }
 
 # Inbound UDP-ACK return from the cell server. SGs are stateful, so for today's

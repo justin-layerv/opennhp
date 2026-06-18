@@ -42,6 +42,10 @@ INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.2
 if [ -z "$INSTANCE_ID" ]; then
   fatal "IMDS returned empty instance-id; cannot continue"
 fi
+INSTANCE_PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+if [ -z "$INSTANCE_PRIVATE_IP" ]; then
+  fatal "IMDS returned empty local-ipv4; cannot continue"
+fi
 
 # ECR login (handles cross-account: registry domain is the repo URL's host).
 ECR_REPO="${relay_repo_url}"
@@ -60,7 +64,7 @@ echo "Using relay image tag from SSM: $IMAGE_TAG"
 docker pull "$ECR_REPO:$IMAGE_TAG" ||
   fatal "could not pull relay image $ECR_REPO:$IMAGE_TAG"
 
-# ── relay.toml ──
+# ── relay TLS + relay.toml ──
 # Pinned uid:gid for the non-root relay container (#1090). The mounted
 # relay.toml carries the fleet private key, so create the inode + chmod 600 +
 # chown to the runtime uid BEFORE the secret lands, then keep the heredoc body
@@ -69,9 +73,35 @@ docker pull "$ECR_REPO:$IMAGE_TAG" ||
 RELAY_UID=10001
 RELAY_GID=10001
 mkdir -p /opt/layerv/nhp-relay/etc
+mkdir -p /opt/layerv/nhp-relay/tls
 touch /opt/layerv/nhp-relay/etc/relay.toml
 chmod 600 /opt/layerv/nhp-relay/etc/relay.toml
-chown "$RELAY_UID:$RELAY_GID" /opt/layerv/nhp-relay/etc/relay.toml
+chmod 700 /opt/layerv/nhp-relay/tls
+chown "$RELAY_UID:$RELAY_GID" \
+  /opt/layerv/nhp-relay/etc \
+  /opt/layerv/nhp-relay/etc/relay.toml \
+  /opt/layerv/nhp-relay/tls
+
+# ALB HTTPS target groups encrypt to the relay backend but do not validate the
+# target certificate, so a per-instance self-signed cert is sufficient for the
+# in-VPC backend leg. ALB target-side cert validation is irrelevant today; SANs
+# are included anyway so future validating probes do not inherit a CN-only cert.
+# The bounded lifetime is hygiene, not an availability guard. The ALB-only SG
+# path remains the authenticated boundary.
+command -v openssl >/dev/null 2>&1 || fatal "openssl is required to generate relay backend TLS cert"
+openssl req -help 2>&1 | grep -q -- "-addext" ||
+  fatal "openssl req -addext support (OpenSSL >= 1.1.1) is required to generate relay backend TLS cert SANs"
+(
+  umask 077
+  openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 397 \
+    -subj "/CN=nhp-relay.${environment}.internal" \
+    -addext "subjectAltName=DNS:nhp-relay.${environment}.internal,DNS:localhost,IP:$INSTANCE_PRIVATE_IP,IP:127.0.0.1" \
+    -keyout /opt/layerv/nhp-relay/tls/tls.key \
+    -out /opt/layerv/nhp-relay/tls/tls.crt
+)
+chmod 600 /opt/layerv/nhp-relay/tls/tls.key
+chmod 644 /opt/layerv/nhp-relay/tls/tls.crt
+chown "$RELAY_UID:$RELAY_GID" /opt/layerv/nhp-relay/tls/tls.key /opt/layerv/nhp-relay/tls/tls.crt
 
 # SECURITY: the relay private key is the fleet-wide NHP_RELAY identity. Under
 # set -x the `SECRET=$(aws ...)` assignment and the jq pipe would trace it into
@@ -91,14 +121,18 @@ cat > /opt/layerv/nhp-relay/etc/relay.toml << CONFIGEOF
 listen_addr = ":${listen_port}"
 udp_listen_addr = "0.0.0.0:${udp_listen_port}"
 private_key = "$PRIVATE_KEY"
-# Behind the TLS-terminating ALB, which APPENDS the real client IP to the END of
-# X-Forwarded-For (so the RIGHTMOST entry is the ALB-attested IP) and is the only
-# path to the relay (relay SG ingress = ALB only). The relay reads this header for
-# the AC-pinhole client IP — it MUST take the rightmost entry, not the leftmost
-# (a client can pre-seed a spoofed leftmost value); the rightmost parse is #2622.
+# Behind the ALB, which terminates client TLS, re-encrypts to this relay over
+# backend TLS, APPENDS the real client IP to the END of X-Forwarded-For (so the
+# RIGHTMOST entry is the ALB-attested IP), and is the only path to the relay
+# (relay SG ingress = ALB only). The relay reads this header for the AC-pinhole
+# client IP — it MUST take the rightmost entry, not the leftmost (a client can
+# pre-seed a spoofed leftmost value); the rightmost parse is #2622.
 source_addr_mode = "trusted_header"
 trusted_header = "X-Forwarded-For"
-enable_tls = false
+enable_tls = true
+tls_cert_file = "/nhp-relay/tls/tls.crt"
+tls_key_file = "/nhp-relay/tls/tls.key"
+trusted_proxy = true
 # #2631: browser Origins allowed to call the relay cross-origin — the qURL knock
 # portal only (qurl.link). Exact-match, comma-separated. Empty disables CORS. The
 # relay echoes the matched origin, never "*".
@@ -127,8 +161,9 @@ unset PRIVATE_KEY
 #   grants cloudwatch:PutMetricData scoped to the LayerV/NHP namespace (this
 #   file's BootstrapFailure emit + compute.tf) — and NHP_ENVIRONMENT for the
 #   metric's Environment dimension (the cell is attached per-shed; the relay
-#   fronts all cells, so there is no single NHP_CELL_ID here). Both are
-#   single-line scalars rendered by templatefile.
+#   fronts all cells, so there is no single NHP_CELL_ID here). The healthcheck URL
+#   is rendered from listen_port so the container liveness probe follows the same
+#   port as relay.toml and the ALB target group.
 cat > /etc/systemd/system/nhp-relayd.service << SVCEOF
 [Unit]
 Description=NHP-Relay daemon (#2208)
@@ -146,7 +181,9 @@ ExecStart=/usr/bin/docker run --rm --name nhp-relay \\
   --user $RELAY_UID:$RELAY_GID \\
   -e AWS_REGION=${region} \\
   -e NHP_ENVIRONMENT=${environment} \\
+  -e NHP_RELAY_HEALTHCHECK_URL=https://localhost:${listen_port}/health/live \\
   -v /opt/layerv/nhp-relay/etc/relay.toml:/nhp-relay/etc/relay.toml:ro \\
+  -v /opt/layerv/nhp-relay/tls:/nhp-relay/tls:ro \\
   --log-driver=awslogs \\
   --log-opt awslogs-region=${region} \\
   --log-opt awslogs-group=${log_group} \\

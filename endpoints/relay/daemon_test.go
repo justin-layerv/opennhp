@@ -29,6 +29,7 @@ trusted_header = "X-Real-IP"
 enable_tls = true
 tls_cert_file = "/c.pem"
 tls_key_file = "/k.pem"
+trusted_proxy = true
 
 [[servers]]
 name = "cell0"
@@ -53,6 +54,9 @@ port = 62206
 	}
 	if !cfg.EnableTLS || cfg.TLSCertFile != "/c.pem" || cfg.TLSKeyFile != "/k.pem" {
 		t.Errorf("tls fields decoded wrong: %v / %q / %q", cfg.EnableTLS, cfg.TLSCertFile, cfg.TLSKeyFile)
+	}
+	if !cfg.TrustedProxy {
+		t.Error("trusted_proxy decoded false, want true")
 	}
 	if len(cfg.Servers) != 1 {
 		t.Fatalf("want 1 server, got %d", len(cfg.Servers))

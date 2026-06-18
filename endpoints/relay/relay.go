@@ -279,6 +279,11 @@ func New(cfg *Config) (*RelayServer, error) {
 	if cfg == nil {
 		return nil, errors.New("relay: nil config")
 	}
+	// Shallow-copy cfg before normalizing scalar fields; New only reads slice
+	// fields (Servers/CORSAllowedOrigins), so a deep copy would not buy safety.
+	cfgCopy := *cfg
+	cfg = &cfgCopy
+
 	prk, err := base64.StdEncoding.DecodeString(cfg.PrivateKeyBase64)
 	if err != nil || len(prk) != 32 {
 		return nil, fmt.Errorf("relay: invalid private_key (want base64 of 32 bytes): %w", err)
@@ -293,6 +298,15 @@ func New(cfg *Config) (*RelayServer, error) {
 	case SourceAddrModeRemoteAddr, SourceAddrModeTrustedHeader:
 	default:
 		return nil, fmt.Errorf("relay: unknown source_addr_mode %q (want \"\" or %q)", cfg.SourceAddrMode, SourceAddrModeTrustedHeader)
+	}
+	if cfg.EnableTLS {
+		cfg.TLSCertFile = strings.TrimSpace(cfg.TLSCertFile)
+		cfg.TLSKeyFile = strings.TrimSpace(cfg.TLSKeyFile)
+		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
+			return nil, errors.New("relay: enable_tls=true requires non-empty tls_cert_file and tls_key_file")
+		}
+		// File existence/readability is validated lazily by ListenAndServeTLS in
+		// Start, after New has bound the shared UDP socket but before HTTP serving.
 	}
 
 	// Boot-time guard against the documented source-IP-spoofing combo (#2553).
@@ -312,6 +326,13 @@ func New(cfg *Config) (*RelayServer, error) {
 		// door overwrites it and the relay_http_from_alb SG rule is the sole
 		// ingress — the residual the boot guard cannot verify in-process.
 		log.Info("relay: source_addr_mode=trusted_header — source IP read from a client header; the trusted front door + relay_http_from_alb SG rule (sole ingress) is the load-bearing control")
+	}
+	if cfg.TrustedProxy {
+		if cfg.SourceAddrMode == SourceAddrModeTrustedHeader && cfg.EnableTLS {
+			log.Info("relay: trusted_proxy=true is enabling source_addr_mode=trusted_header with enable_tls=true — the trusted front door must overwrite/attest the header and be the relay's sole ingress path")
+		} else {
+			log.Info("relay: trusted_proxy=true is inert unless source_addr_mode=trusted_header and enable_tls=true")
+		}
 	}
 
 	device := core.NewDevice(core.NHP_RELAY, prk, nil)
@@ -395,7 +416,8 @@ func New(cfg *Config) (*RelayServer, error) {
 		IdleTimeout:  60 * time.Second,
 	}
 	if cfg.EnableTLS {
-		// Pin a TLS floor for the internet-facing direct-terminate path.
+		// Pin a TLS floor for both direct termination and trusted-proxy
+		// backend re-encryption.
 		rs.httpServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
 	return rs, nil
@@ -717,24 +739,28 @@ func (rs *RelayServer) innerCounter(raw []byte) (uint64, error) {
 //
 // We reject two configs we can prove are dangerous at the process level:
 //
-//  1. trusted_header + enable_tls=true. We cannot tell a relay that terminates
-//     client TLS itself (the direct internet front — any client is the relay's
-//     TCP peer and sets the header freely, a spoofing hole) from a trusted front
-//     door that terminates client TLS, attests/overwrites the header, and
-//     re-encrypts to this backend over TLS (safe — both present enable_tls=true).
+//  1. trusted_header + enable_tls=true without trusted_proxy=true. We cannot
+//     tell a relay that terminates client TLS itself (the direct internet front
+//     — any client is the relay's TCP peer and sets the header freely, a
+//     spoofing hole) from a trusted front door that terminates client TLS,
+//     attests/overwrites the header, and re-encrypts to this backend over TLS
+//     (safe — both present enable_tls=true).
 //     The attestation is not observable at the process level (same limitation as
-//     the bind RESIDUAL below), so we FAIL CLOSED on the ambiguous combo.
+//     the bind RESIDUAL below), so we FAIL CLOSED on the ambiguous combo unless
+//     the operator explicitly asserts the trusted front-door precondition.
 //     RemoteAddr is correct for a direct-terminating relay; the safe re-encrypt
-//     topology is unsupported by design until an explicit trusted-proxy opt-in
-//     exists (#2663).
+//     topology must set trusted_proxy=true (#2663).
 //
 //  2. trusted_header + a ListenAddr host that parses to a concrete routable
 //     PUBLIC IP. Binding a public address means clients can reach the relay
 //     directly (no front door in front of that interface), so a client-supplied
 //     header is attacker-controlled.
+//     trusted_proxy=true intentionally does NOT override this check; the opt-in
+//     only resolves the TLS re-encryption ambiguity.
 //
-// What we deliberately ALLOW (these are coherent, and #2 below is the actual
-// production config — see terraform/modules/relay/user_data.sh.tpl):
+// What we deliberately ALLOW (these are coherent; production uses the
+// trusted_proxy re-encrypt exception from #1 plus the unspecified bind below —
+// see terraform/modules/relay/user_data.sh.tpl):
 //   - loopback (127.0.0.0/8, ::1) or RFC1918/private host — a private/loopback
 //     interface is not directly internet-reachable.
 //   - an UNSPECIFIED / empty host ("", ":8080", "0.0.0.0:8080", "[::]:8080") —
@@ -763,12 +789,12 @@ func assertTrustedHeaderBindCoherent(cfg *Config) error {
 	if cfg.SourceAddrMode != SourceAddrModeTrustedHeader {
 		return nil
 	}
-	if cfg.EnableTLS {
+	if cfg.EnableTLS && !cfg.TrustedProxy {
 		return fmt.Errorf("relay: source_addr_mode=%q with enable_tls=true is rejected (fail-closed): the relay cannot "+
 			"verify whether a trusted front door attests the source-IP header (the safe TLS-re-encrypt topology) or the relay "+
 			"is the direct internet front (any client sets the header — spoofable), so it refuses the ambiguous combo. Use "+
-			"source_addr_mode=\"\" (RemoteAddr), or run this leg as enable_tls=false behind a trusted proxy. End-to-end TLS "+
-			"re-encryption with trusted_header is unsupported by design (#2663)",
+			"source_addr_mode=\"\" (RemoteAddr), run this leg as enable_tls=false behind a trusted proxy, or set "+
+			"trusted_proxy=true only when a trusted front door overwrites/attests the header and is the relay's sole ingress path (#2663)",
 			SourceAddrModeTrustedHeader)
 	}
 	// Classify the bind host. SplitHostPort fails for a bare host with no port;

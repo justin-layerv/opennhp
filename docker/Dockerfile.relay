@@ -53,16 +53,21 @@ RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ub
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+ENV NHP_RELAY_HEALTHCHECK_URL=https://localhost:8080/health/live
+
 # Copy the built binary + example config (the deploy overwrites etc/relay.toml).
 COPY --from=builder /nhp-relay/release/nhp-relay /nhp-relay
 
-# Liveness probe on /health/live (matches nhp-server's convention). The default
-# listen_addr is :8080 and the intended deployment binds plaintext behind a
-# TLS-terminating front door (source_addr_mode = trusted_header); a deploy that
-# overrides listen_addr's port or sets enable_tls must adjust this CMD to match
-# (the LB target-group health check is the authoritative one — see relay.toml).
+# Liveness probe on /health/live (matches nhp-server's convention). The deploy
+# runs HTTPS behind the ALB on the default listen port (:8080). Local plaintext
+# configs using the sample relay.toml should run with
+# -e NHP_RELAY_HEALTHCHECK_URL=http://localhost:8080/health/live; there is no
+# implicit HTTP fallback, so a plaintext relay cannot mask a prod HTTPS
+# misconfiguration at the container-health layer. Terraform deploys override this
+# env var from listen_port, and the LB target-group health check on traffic-port
+# remains authoritative for ASG health.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8080/health/live || exit 1
+    CMD curl -fk "$NHP_RELAY_HEALTHCHECK_URL" || exit 1
 
 # Runs as root by default; dropped to a non-root uid at runtime via
 # `docker run --user` in the deployment (matching Dockerfile.server, #1090). The

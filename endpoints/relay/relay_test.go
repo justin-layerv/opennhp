@@ -3,12 +3,23 @@ package relay
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +35,52 @@ func keyBytes(seed byte) []byte {
 		k[i] = byte(i) + seed
 	}
 	return k
+}
+
+func writeTestTLSCert(t *testing.T) (certFile, keyFile string, roots *x509.CertPool) {
+	t.Helper()
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate test TLS key: %v", err)
+	}
+	serial, err := rand.Int(rand.Reader, big.NewInt(1<<62))
+	if err != nil {
+		t.Fatalf("generate test TLS serial: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create test TLS cert: %v", err)
+	}
+	keyDER := x509.MarshalPKCS1PrivateKey(priv)
+
+	dir := t.TempDir()
+	certFile = dir + "/tls.crt"
+	keyFile = dir + "/tls.key"
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(certFile, certPEM, 0o644); err != nil {
+		t.Fatalf("write test TLS cert: %v", err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		t.Fatalf("write test TLS key: %v", err)
+	}
+
+	roots = x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(certPEM) {
+		t.Fatal("append test TLS cert to root pool")
+	}
+	return certFile, keyFile, roots
 }
 
 // devicePubKey returns the NHP static public key for a private key.
@@ -698,30 +755,36 @@ func TestNew_TrustedHeaderBindCoherence(t *testing.T) {
 		}
 	}
 	tests := []struct {
-		name       string
-		mode       SourceAddrMode
-		listenAddr string
-		enableTLS  bool
-		wantErr    bool
+		name         string
+		mode         SourceAddrMode
+		listenAddr   string
+		enableTLS    bool
+		trustedProxy bool
+		wantErr      bool
 	}{
 		// Dangerous combos — must fail closed.
-		{"trusted_header + TLS terminate is rejected", SourceAddrModeTrustedHeader, ":8080", true, true},
-		{"trusted_header + public IPv4 bind is rejected", SourceAddrModeTrustedHeader, "203.0.113.7:8080", false, true},
-		{"trusted_header + public IPv6 bind is rejected", SourceAddrModeTrustedHeader, "[2001:db8::1]:8080", false, true},
+		{"trusted_header + TLS terminate without trusted_proxy is rejected", SourceAddrModeTrustedHeader, ":8080", true, false, true},
+		{"trusted_header + trusted_proxy + public IPv4 bind is rejected", SourceAddrModeTrustedHeader, "203.0.113.7:8080", true, true, true},
+		{"trusted_header + trusted_proxy + public IPv4 bind without TLS is rejected", SourceAddrModeTrustedHeader, "203.0.113.7:8080", false, true, true},
+		{"trusted_header + public IPv4 bind is rejected", SourceAddrModeTrustedHeader, "203.0.113.7:8080", false, false, true},
+		{"trusted_header + public IPv6 bind is rejected", SourceAddrModeTrustedHeader, "[2001:db8::1]:8080", false, false, true},
 		// Conservative fail-closed: not IsPrivate/IsLoopback/IsUnspecified, so
 		// treated as public and rejected. Locks the posture against accidental
 		// broadening of the allowlist (see assertTrustedHeaderBindCoherent doc).
-		{"trusted_header + IPv4 link-local bind is rejected", SourceAddrModeTrustedHeader, "169.254.1.1:8080", false, true},
-		{"trusted_header + CGNAT bind is rejected", SourceAddrModeTrustedHeader, "100.64.0.1:8080", false, true},
-		{"trusted_header + IPv6 link-local bind is rejected", SourceAddrModeTrustedHeader, "[fe80::1]:8080", false, true},
+		{"trusted_header + IPv4 link-local bind is rejected", SourceAddrModeTrustedHeader, "169.254.1.1:8080", false, false, true},
+		{"trusted_header + CGNAT bind is rejected", SourceAddrModeTrustedHeader, "100.64.0.1:8080", false, false, true},
+		{"trusted_header + IPv6 link-local bind is rejected", SourceAddrModeTrustedHeader, "[fe80::1]:8080", false, false, true},
 		// Coherent combos — must start.
-		{"trusted_header + unspecified host (prod :8080) is allowed", SourceAddrModeTrustedHeader, ":8080", false, false},
-		{"trusted_header + 0.0.0.0 bind is allowed", SourceAddrModeTrustedHeader, "0.0.0.0:8080", false, false},
-		{"trusted_header + loopback bind is allowed", SourceAddrModeTrustedHeader, "127.0.0.1:8080", false, false},
-		{"trusted_header + private bind is allowed", SourceAddrModeTrustedHeader, "10.0.0.5:8080", false, false},
-		{"trusted_header + hostname bind is allowed (not classifiable)", SourceAddrModeTrustedHeader, "relay.internal:8080", false, false},
+		{"trusted_header + trusted_proxy + TLS re-encrypt is allowed", SourceAddrModeTrustedHeader, ":8080", true, true, false},
+		{"trusted_header + trusted_proxy without TLS is allowed (inert opt-in)", SourceAddrModeTrustedHeader, ":8080", false, true, false},
+		{"trusted_header + unspecified host (prod :8080) is allowed", SourceAddrModeTrustedHeader, ":8080", false, false, false},
+		{"trusted_header + 0.0.0.0 bind is allowed", SourceAddrModeTrustedHeader, "0.0.0.0:8080", false, false, false},
+		{"trusted_header + loopback bind is allowed", SourceAddrModeTrustedHeader, "127.0.0.1:8080", false, false, false},
+		{"trusted_header + private bind is allowed", SourceAddrModeTrustedHeader, "10.0.0.5:8080", false, false, false},
+		{"trusted_header + hostname bind is allowed (not classifiable)", SourceAddrModeTrustedHeader, "relay.internal:8080", false, false, false},
 		// RemoteAddr mode is spoof-proof regardless of bind/TLS — never gated.
-		{"remoteaddr + public bind + TLS is allowed", SourceAddrModeRemoteAddr, "203.0.113.7:8080", true, false},
+		{"remoteaddr + public bind + TLS is allowed", SourceAddrModeRemoteAddr, "203.0.113.7:8080", true, false, false},
+		{"remoteaddr + trusted_proxy is allowed (inert opt-in)", SourceAddrModeRemoteAddr, ":8080", false, true, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -729,6 +792,11 @@ func TestNew_TrustedHeaderBindCoherence(t *testing.T) {
 			cfg.SourceAddrMode = tc.mode
 			cfg.ListenAddr = tc.listenAddr
 			cfg.EnableTLS = tc.enableTLS
+			if tc.enableTLS {
+				cfg.TLSCertFile = "/tmp/relay.crt"
+				cfg.TLSKeyFile = "/tmp/relay.key"
+			}
+			cfg.TrustedProxy = tc.trustedProxy
 			rs, err := New(cfg)
 			if rs != nil {
 				_ = rs.udpConn.Close() // release the socket New bound on the accept path
@@ -740,6 +808,177 @@ func TestNew_TrustedHeaderBindCoherence(t *testing.T) {
 				t.Fatalf("New rejected a coherent combo (%s): %v", tc.name, err)
 			}
 		})
+	}
+}
+
+func TestNew_EnableTLSRequiresCertKeyPaths(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	base := func() *Config {
+		return &Config{
+			PrivateKeyBase64: base64.StdEncoding.EncodeToString(keyBytes(0x80)),
+			ListenAddr:       ":8080",
+			UDPListenAddr:    "127.0.0.1:0",
+			EnableTLS:        true,
+			TLSCertFile:      "/tmp/relay.crt",
+			TLSKeyFile:       "/tmp/relay.key",
+			Servers:          []ServerConfig{{Name: "c", PubKeyBase64: base64.StdEncoding.EncodeToString(serverPub), Host: "127.0.0.1", Port: 62206}},
+		}
+	}
+	tests := []struct {
+		name string
+		edit func(*Config)
+	}{
+		{"missing cert path", func(cfg *Config) { cfg.TLSCertFile = "" }},
+		{"blank cert path", func(cfg *Config) { cfg.TLSCertFile = " \t" }},
+		{"missing key path", func(cfg *Config) { cfg.TLSKeyFile = "" }},
+		{"blank key path", func(cfg *Config) { cfg.TLSKeyFile = " \t" }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.edit(cfg)
+			rs, err := New(cfg)
+			if rs != nil {
+				_ = rs.udpConn.Close()
+			}
+			if err == nil {
+				t.Fatalf("New accepted enable_tls=true without complete cert/key paths")
+			}
+			if !strings.Contains(err.Error(), "enable_tls=true requires non-empty tls_cert_file and tls_key_file") {
+				t.Fatalf("New error = %v, want cert/key path validation", err)
+			}
+		})
+	}
+
+	t.Run("trims surrounding whitespace before serving", func(t *testing.T) {
+		cfg := base()
+		cfg.TLSCertFile = " /tmp/relay.crt \t"
+		cfg.TLSKeyFile = "\t/tmp/relay.key "
+		origCertFile := cfg.TLSCertFile
+		origKeyFile := cfg.TLSKeyFile
+		rs, err := New(cfg)
+		if rs != nil {
+			_ = rs.udpConn.Close()
+		}
+		if err != nil {
+			t.Fatalf("New rejected cert/key paths with surrounding whitespace: %v", err)
+		}
+		if cfg.TLSCertFile != origCertFile || cfg.TLSKeyFile != origKeyFile {
+			t.Fatalf("New mutated caller config: cert=%q key=%q", cfg.TLSCertFile, cfg.TLSKeyFile)
+		}
+		if rs.config.TLSCertFile != "/tmp/relay.crt" || rs.config.TLSKeyFile != "/tmp/relay.key" {
+			t.Fatalf("served TLS paths were not trimmed: cert=%q key=%q", rs.config.TLSCertFile, rs.config.TLSKeyFile)
+		}
+	})
+}
+
+func TestRelay_StartServesHealthLiveOverTLS(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	certFile, keyFile, roots := writeTestTLSCert(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve TLS listen addr: %v", err)
+	}
+	listenAddr := ln.Addr().String()
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("release TLS listen addr: %v", err)
+	}
+
+	cfg := &Config{
+		PrivateKeyBase64: base64.StdEncoding.EncodeToString(keyBytes(0x80)),
+		ListenAddr:       listenAddr,
+		UDPListenAddr:    "127.0.0.1:0",
+		EnableTLS:        true,
+		TLSCertFile:      certFile,
+		TLSKeyFile:       keyFile,
+		Servers:          []ServerConfig{{Name: "c", PubKeyBase64: base64.StdEncoding.EncodeToString(serverPub), Host: "127.0.0.1", Port: 62206}},
+	}
+	rs, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- rs.Start() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := rs.Stop(ctx); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Errorf("Start returned error after Stop: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timeout waiting for Start to exit")
+		}
+	})
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				RootCAs:    roots,
+				ServerName: "localhost",
+			},
+		},
+		Timeout: time.Second,
+	}
+	url := "https://localhost:" + strconv.Itoa(port) + "/health/live"
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("Start returned before TLS health probe succeeded: %v", err)
+		default:
+		}
+		resp, err := client.Get(url)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+			t.Fatalf("GET %s status = %d, want 200", url, resp.StatusCode)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for TLS health probe at %s", url)
+}
+
+func TestRelay_StartReturnsMissingTLSFileError(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	missingDir := t.TempDir()
+	cfg := &Config{
+		PrivateKeyBase64: base64.StdEncoding.EncodeToString(keyBytes(0x80)),
+		ListenAddr:       "127.0.0.1:0",
+		UDPListenAddr:    "127.0.0.1:0",
+		EnableTLS:        true,
+		TLSCertFile:      filepath.Join(missingDir, "missing.crt"),
+		TLSKeyFile:       filepath.Join(missingDir, "missing.key"),
+		Servers:          []ServerConfig{{Name: "c", PubKeyBase64: base64.StdEncoding.EncodeToString(serverPub), Host: "127.0.0.1", Port: 62206}},
+	}
+	rs, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New rejected non-empty TLS paths before Start could validate files: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := rs.Stop(ctx); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+
+	err = rs.Start()
+	if err == nil {
+		t.Fatal("Start succeeded with missing TLS files")
+	}
+	if !strings.Contains(err.Error(), "missing.crt") {
+		t.Fatalf("Start error = %v, want missing cert file path", err)
 	}
 }
 

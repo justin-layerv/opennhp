@@ -49,6 +49,12 @@ type Config struct {
 	TLSCertFile string `toml:"tls_cert_file"`
 	TLSKeyFile  string `toml:"tls_key_file"`
 
+	// TrustedProxy asserts that a trusted front door is the relay's sole ingress
+	// path and overwrites/attests TrustedHeader. It is required only for the
+	// trusted_header + enable_tls re-encryption topology; leave false otherwise.
+	// It does not relax the public-IP bind guard in assertTrustedHeaderBindCoherent.
+	TrustedProxy bool `toml:"trusted_proxy"`
+
 	// TrustedHeader names the HTTP header carrying the real client IP when
 	// SourceAddrMode == SourceAddrModeTrustedHeader. Defaults to "X-Real-IP".
 	// SECURITY: deriveSourceAddr takes the RIGHTMOST comma-separated entry, which

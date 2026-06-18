@@ -103,7 +103,7 @@ variable "relay_repo_arn" {
 }
 
 variable "server_ami_id" {
-  description = "AMI for the relay node. Defaults to the SSM-published server AMI (`/$${environment}/nhp/server/ami-id`) when null — that AMI ships Docker + awscli + the systemd-resolved stub-disable fix the relay needs (the relay resolves CloudMap DNS at startup via Go's pure resolver, which fails against the systemd-resolved stub; a stock Ubuntu AMI crash-loops). Override only with an AMI that carries the same baked-in fixes."
+  description = "AMI for the relay node. Defaults to the SSM-published server AMI (`/$${environment}/nhp/server/ami-id`) when null — that AMI ships Docker + awscli + openssl + the systemd-resolved stub-disable fix the relay needs (the relay resolves CloudMap DNS at startup via Go's pure resolver, which fails against the systemd-resolved stub; a stock Ubuntu AMI crash-loops). Override only with an AMI that carries the same baked-in fixes."
   type        = string
   default     = null
 }

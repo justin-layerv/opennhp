@@ -1,6 +1,6 @@
 # Packer template for NHP Server Docker-optimized AMI
-# Pre-installs Docker, AWS CLI, and dependencies to reduce instance startup time
-# from ~5-6 minutes to ~30 seconds.
+# Pre-installs Docker, AWS CLI, OpenSSL, and dependencies to reduce instance
+# startup time from ~5-6 minutes to ~30 seconds.
 #
 # Usage:
 #   packer init nhp-server-docker.pkr.hcl
@@ -145,10 +145,12 @@ build {
     inline = [
       "echo '=== Installing Docker and dependencies ==='",
       "sudo apt-get update",
-      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io jq curl unzip ca-certificates",
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io jq curl unzip ca-certificates openssl",
       "sudo systemctl enable docker",
       "sudo systemctl start docker",
       "sudo usermod -aG docker ubuntu",
+      "openssl version",
+      "openssl req -help 2>&1 | grep -q -- -addext",
     ]
   }
 

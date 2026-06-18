@@ -153,6 +153,11 @@ is an internet-facing service that:
   /relay/{serverId}`, body = one inner NHP packet; browsers cannot send UDP). The
   Noise handshake and AEAD bodies are **end-to-end between the JS agent and the
   server**; the relay does not hold session keys.
+- In the AWS relay deployment, the public ALB terminates client TLS and
+  re-encrypts the ALB-to-relay backend leg over HTTPS. The relay treats the
+  ALB-only security group path as the trusted ingress/authz boundary; the
+  per-instance backend certificate is an in-VPC encryption control, not a target
+  identity proof, because the ALB does not validate target certificates today.
 - Forwards each inner packet to the **private** `nhp-server` inside an
   authenticated `NHP_RLY` envelope (`common.RelayForwardMsg{SourceAddr,
   InnerPacket}`) over a persistent UDP/Noise connection, and returns the server's

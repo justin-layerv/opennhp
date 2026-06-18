@@ -5,9 +5,12 @@
 # Secrets Manager / per-cell config, P5/P6).
 
 # host:port the HTTP(S) /relay/ endpoint binds (the internet-facing surface).
-# NOTE: the container HEALTHCHECK (docker/Dockerfile.relay) is pinned to
-# http://localhost:8080/health/live — if you change this port or set enable_tls
-# below, update the Dockerfile CMD too (the LB target-group check is authoritative).
+# NOTE: the container HEALTHCHECK (docker/Dockerfile.relay) defaults to
+# NHP_RELAY_HEALTHCHECK_URL=https://localhost:8080/health/live. If local/dev runs
+# this plaintext sample config, set
+# NHP_RELAY_HEALTHCHECK_URL=http://localhost:8080/health/live; Terraform deploys
+# render the HTTPS URL from listen_port, and the LB target-group check is
+# authoritative.
 listen_addr = "0.0.0.0:8080"
 
 # host:port the relay's UDP socket binds to send NHP_RLY to cell servers and
@@ -30,11 +33,12 @@ private_key = ""
 #   "trusted_header" = read `trusted_header` below. ONLY safe behind a trusted
 #                     front door that overwrites the header AND to which the relay
 #                     is the sole path; otherwise any client can spoof the IP.
-# Boot guard (#2553): the relay REFUSES to start with source_addr_mode="trusted_header"
-# when it can prove the front-door precondition is defeated — i.e. enable_tls=true
-# (the relay is then the direct TLS front, so no proxy attests the header) or
-# listen_addr binds a routable PUBLIC IP. A loopback/private/unspecified bind
-# (e.g. ":8080" behind the ALB, whose SG is the real sole-path control) is allowed.
+# Boot guard (#2553/#2663): the relay REFUSES to start with
+# source_addr_mode="trusted_header" when it can prove the front-door precondition
+# is defeated — i.e. enable_tls=true without trusted_proxy=true (the relay may be
+# the direct TLS front, so no proxy attests the header) or listen_addr binds a
+# routable PUBLIC IP. A loopback/private/unspecified bind (e.g. ":8080" behind
+# the ALB, whose SG is the real sole-path control) is allowed.
 source_addr_mode = ""
 trusted_header = "X-Real-IP"
 
@@ -43,6 +47,12 @@ trusted_header = "X-Real-IP"
 enable_tls = false
 tls_cert_file = ""
 tls_key_file = ""
+
+# Explicit opt-in for the niche TLS re-encryption topology:
+# trusted front door terminates client TLS, overwrites/attests trusted_header,
+# is the relay's sole ingress path, then re-encrypts to this relay over TLS.
+# Required only when source_addr_mode="trusted_header" and enable_tls=true.
+trusted_proxy = false
 
 # Cell-routing table: one entry per reachable cell server. Clients address a cell
 # by its server pubkey fingerprint: POST /relay/{serverId}. Single-cell today
