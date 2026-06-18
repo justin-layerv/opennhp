@@ -1598,7 +1598,7 @@ jobs:
     name: qURL Link Social Card Lint (PR)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:

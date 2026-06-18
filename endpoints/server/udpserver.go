@@ -38,6 +38,11 @@ import (
 
 var (
 	ExeDirPath string
+
+	errUnknownServerPeerTarget = errors.New("outbound address is not a known server peer target")
+	errServerPeerTupleOwned    = errors.New("outbound server-peer address already owned by non-promotable connection")
+	errOutboundServerGlobalCap = errors.New("outbound server-peer global cap reached")
+	errOutboundServerStopping  = errors.New("server stopping")
 )
 
 // dimNameInstanceId is the canonical CloudWatch dimension name for
@@ -85,7 +90,11 @@ type UdpServer struct {
 	httpServer   *HttpServer
 	webrtcServer *WebRTCServer
 	wg           sync.WaitGroup
-	running      atomic.Bool
+	// outboundConnStartMutex serializes connDataForOutboundAddr's late
+	// server-peer connectionRoutine wg.Add calls with Stop's transition
+	// to wg.Wait. Static Start-time Add calls don't use it.
+	outboundConnStartMutex sync.Mutex
+	running                atomic.Bool
 
 	// knockHeaderTypeVerifyRequire gates strict-mode rejection of
 	// knocks whose AEAD-authenticated body.HeaderType disagrees with
@@ -158,7 +167,7 @@ type UdpServer struct {
 
 	remoteConnectionMapMutex sync.Mutex
 	remoteConnectionMap      map[string]*UdpConn   // indexed by remote UDP address
-	connectionsByIP          map[string]*list.List // per-IP FIFO of agent *UdpConn for MaxAgentConnsPerIP eviction; AC/DB excluded
+	connectionsByIP          map[string]*list.List // per-IP FIFO of capped agent UDP conns; infra conns excluded
 
 	agentPeerMapMutex sync.Mutex
 	agentPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
@@ -406,10 +415,16 @@ type UdpConn struct {
 	ConnData       *core.ConnectionData
 	isACConnection bool // Immutable. Don't change it after creation. Conn object is also stored in acConnectionMap which is indexed by ACId
 	isDBConnection bool // Immutable. Don't change it after creation. Conn object is also stored in dbConnectionMap which is indexed by DBId
-	isWebRTC       bool
-	dc             *webrtc.DataChannel
+	// isServerPeer marks trusted server-to-server forward traffic. It is set at
+	// construction for outbound synthetic conns, or promoted under
+	// remoteConnectionMapMutex when a reciprocal forward reuses an inbound
+	// generic conn from the same known server peer tuple.
+	isServerPeer bool
+	isWebRTC     bool
+	dc           *webrtc.DataChannel
 
-	// perIPElem is the conn's slot in connectionsByIP[ip]; nil for AC/DB.
+	// perIPElem is the conn's slot in connectionsByIP[ip]; nil for
+	// trusted infra conns (AC/DB/server-peer/WebRTC).
 	// Cleared on eviction so the cleanup defer doesn't double-pop.
 	perIPElem *list.Element
 
@@ -418,7 +433,7 @@ type UdpConn struct {
 	//     or admitNewConnection. admitNewConnection panics on nil.
 	//   - Closed exactly once by admitNewConnection on per-IP cap
 	//     eviction; never closed by any other path.
-	//   - For AC/DB conns and WebRTC conns, the channel is allocated
+	//   - For infra conns and WebRTC conns, the channel is allocated
 	//     for select-shape consistency but never closed (those paths
 	//     bypass the per-IP cap).
 	// Dedicated channel (rather than reusing SetTimeoutSignal) so the
@@ -1147,6 +1162,10 @@ func (s *UdpServer) Stop() {
 	_ = s.listenConn.Close()
 	s.device.Stop()
 	s.StopConfigWatch()
+	// Barrier with startOutboundConnectionRoutine: any outbound launch that
+	// passed the pre-stop check finishes its wg.Add before Stop enters wg.Wait.
+	s.outboundConnStartMutex.Lock()
+	s.outboundConnStartMutex.Unlock()
 	s.wg.Wait()
 	// Close storage backend AFTER wg.Wait() so in-flight goroutines
 	// (e.g., refreshAssignmentTTL) finish their storage operations first.
@@ -2096,11 +2115,7 @@ func (s *UdpServer) isKnownDBPeerIP(ipStr string) bool {
 // TOCTOU window that lived inline in recvPacketRoutine.
 func (s *UdpServer) globalCapAdmits() bool {
 	s.remoteConnectionMapMutex.Lock()
-	n := len(s.remoteConnectionMap)
-	if n > OverloadConnectionThreshold {
-		s.device.SetOverload(true)
-	}
-	admit := n < MaxConcurrentConnection
+	admit := s.globalCapAdmitsLocked()
 	s.remoteConnectionMapMutex.Unlock()
 
 	if !admit {
@@ -2109,12 +2124,25 @@ func (s *UdpServer) globalCapAdmits() bool {
 	return admit
 }
 
+// globalCapAdmitsLocked applies the global-cap decision while
+// remoteConnectionMapMutex is already held. Callers must increment
+// MetricGlobalCapRejections after unlocking when this returns false.
+func (s *UdpServer) globalCapAdmitsLocked() bool {
+	n := len(s.remoteConnectionMap)
+	if n > OverloadConnectionThreshold {
+		s.device.SetOverload(true)
+	}
+	return n < MaxConcurrentConnection
+}
+
 // admitNewConnection registers conn in remoteConnectionMap. For agent
 // conns it also enforces MaxAgentConnsPerIP via a FIFO list per source
 // IP, closing the oldest entry's evictSignal when the bucket is full.
-// AC and DB conns bypass the per-IP cap because (a) they pass an
-// identity gate before being trusted and (b) capping them would risk
-// evicting the live AC during blue/green NAT churn from one source IP.
+// Trusted infra conns (AC, DB, synthetic outbound server-peer, and WebRTC)
+// bypass the per-IP cap because (a) they pass an identity gate before
+// being trusted or are selected from server assignment state, and (b)
+// capping them would risk evicting live infra traffic during NAT churn
+// or forwarded-knock fan-in from one source IP.
 // The caller is responsible for the global MaxConcurrentConnection
 // check upstream.
 //
@@ -2157,10 +2185,18 @@ func (s *UdpServer) admitNewConnection(conn *UdpConn, addrStr string) {
 		// instead of as a slow conn leak under attack.
 		panic("admitNewConnection: conn.evictSignal must be initialized")
 	}
-	var evictedAddr string
 	s.remoteConnectionMapMutex.Lock()
+	evictedAddr := s.admitNewConnectionLocked(conn, addrStr)
+	s.remoteConnectionMapMutex.Unlock()
+
+	s.recordPerIPEviction(evictedAddr)
+}
+
+// admitNewConnectionLocked registers conn while remoteConnectionMapMutex
+// is held. Use this when the caller needs check-and-insert to be atomic.
+func (s *UdpServer) admitNewConnectionLocked(conn *UdpConn, addrStr string) (evictedAddr string) {
 	s.remoteConnectionMap[addrStr] = conn
-	if !conn.isACConnection && !conn.isDBConnection {
+	if conn.isPerIPCapped() {
 		ipStr := conn.ConnData.RemoteAddr.IP.String()
 		bucket, ok := s.connectionsByIP[ipStr]
 		if !ok {
@@ -2179,8 +2215,14 @@ func (s *UdpServer) admitNewConnection(conn *UdpConn, addrStr string) {
 		}
 		conn.perIPElem = bucket.PushBack(conn)
 	}
-	s.remoteConnectionMapMutex.Unlock()
+	return evictedAddr
+}
 
+func (conn *UdpConn) isPerIPCapped() bool {
+	return !conn.isACConnection && !conn.isDBConnection && !conn.isServerPeer && !conn.isWebRTC
+}
+
+func (s *UdpServer) recordPerIPEviction(evictedAddr string) {
 	if evictedAddr != "" {
 		// evictedAddr is set only when the lock-held branch popped a
 		// front entry from a full bucket — i.e. an eviction occurred.
@@ -4042,9 +4084,237 @@ func (s *UdpServer) GetDevice() *core.Device {
 	return s.device
 }
 
-// SendMessage queues a message for sending via the server's send channel.
-func (s *UdpServer) SendMessage(md *core.MsgData) {
+func (s *UdpServer) connDataForOutboundAddr(remoteAddr *net.UDPAddr, peerPk []byte) (*core.ConnectionData, error) {
+	if remoteAddr == nil {
+		return nil, errors.New("missing remote address")
+	}
+	addrStr := remoteAddr.String()
+	if !s.isKnownServerPeerTarget(remoteAddr, peerPk) {
+		return nil, fmt.Errorf("%w: %s", errUnknownServerPeerTarget, addrStr)
+	}
+
+	s.remoteConnectionMapMutex.Lock()
+	// Server assignment gives us a known server-peer UDP tuple and pubkey.
+	// A reciprocal NHP_FWD may have already admitted the same tuple as a
+	// generic inbound conn; promote only that trusted tuple so arbitrary live
+	// conns are never reused as server peers. Promotion is intentionally
+	// tuple+pubkey-gated; NHP encryption still gates real data, and the
+	// accounting blast radius is this one tuple leaving per-IP eviction.
+	connData, err := s.tryReuseServerPeerConnLocked(addrStr)
+	if err != nil || connData != nil {
+		s.remoteConnectionMapMutex.Unlock()
+		return connData, err
+	}
+	s.remoteConnectionMapMutex.Unlock()
+
+	recvTime := time.Now().UnixNano()
+	conn := &UdpConn{
+		isServerPeer: true,
+		evictSignal:  make(chan struct{}),
+	}
+	conn.ConnData = &core.ConnectionData{
+		InitTime:             recvTime,
+		LastLocalRecvTime:    recvTime,
+		Device:               s.device,
+		LocalAddr:            s.listenAddr,
+		RemoteAddr:           remoteAddr,
+		CookieStore:          &core.CookieStore{},
+		RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+		SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+		RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+		BlockSignal:          make(chan struct{}),
+		SetTimeoutSignal:     make(chan struct{}),
+		StopSignal:           make(chan struct{}),
+	}
+	// Server-peer conns are trusted infra but intentionally keep the
+	// short agent idle timeout: ForwardTimeout is 2s, so 30s covers the
+	// transaction while letting sparse peer traffic tear down cleanly.
+	conn.ConnData.InitTimeoutMs(DefaultAgentConnectionTimeoutMs)
+
+	s.remoteConnectionMapMutex.Lock()
+	connData, err = s.tryReuseServerPeerConnLocked(addrStr)
+	if err != nil || connData != nil {
+		s.remoteConnectionMapMutex.Unlock()
+		return connData, err
+	}
+	if !s.globalCapAdmitsLocked() {
+		s.remoteConnectionMapMutex.Unlock()
+		s.metrics.IncrCounter(MetricGlobalCapRejections)
+		return nil, fmt.Errorf("%w: maximum concurrent connection cap reached for outbound address %s", errOutboundServerGlobalCap, addrStr)
+	}
+	// Server-peer conns bypass the per-IP cap, so admitting one cannot evict
+	// from connectionsByIP.
+	s.admitNewConnectionLocked(conn, addrStr)
+	s.remoteConnectionMapMutex.Unlock()
+	if !s.startOutboundConnectionRoutine(conn) {
+		// Shutdown-only race note: another forward can briefly observe this
+		// just-admitted conn before this cleanup runs and queue one packet
+		// against a conn that is immediately closed while Stop quiesces.
+		s.remoteConnectionMapMutex.Lock()
+		if s.remoteConnectionMap[addrStr] == conn {
+			delete(s.remoteConnectionMap, addrStr)
+		}
+		s.remoteConnectionMapMutex.Unlock()
+		conn.Close()
+		return nil, errOutboundServerStopping
+	}
+
+	log.Debug("Created outbound UDP connection from %s to %s", s.listenAddrStr, addrStr)
+	return conn.ConnData, nil
+}
+
+func (s *UdpServer) tryReuseServerPeerConnLocked(addrStr string) (*core.ConnectionData, error) {
+	conn, found := s.remoteConnectionMap[addrStr]
+	if !found {
+		return nil, nil
+	}
+	connData, err := s.serverPeerConnDataLocked(addrStr, conn)
+	if err != nil || connData == nil {
+		return connData, err
+	}
+	// The routine's SendQueue case resets the idle timer for reused
+	// server-peer conns; no timestamp poke is needed here.
+	return connData, nil
+}
+
+func (s *UdpServer) isKnownServerPeerTarget(remoteAddr *net.UDPAddr, peerPk []byte) bool {
+	if remoteAddr == nil || len(peerPk) == 0 {
+		return false
+	}
+	peer := s.device.LookupPeer(peerPk)
+	if peer == nil || peer.DeviceType() != core.NHP_SERVER {
+		return false
+	}
+	return peerSendAddrMatches(peer, remoteAddr)
+}
+
+func peerSendAddrMatches(peer core.Peer, remoteAddr *net.UDPAddr) bool {
+	if remoteAddr == nil {
+		return false
+	}
+	if group, ok := peer.(*core.PeerGroup); ok {
+		for _, member := range group.Members() {
+			if udpPeerSendAddrMatches(member, remoteAddr) {
+				return true
+			}
+		}
+		return false
+	}
+	if udpPeer, ok := peer.(*core.UdpPeer); ok {
+		return udpPeerSendAddrMatches(udpPeer, remoteAddr)
+	}
+	addr, ok := peer.SendAddr().(*net.UDPAddr)
+	return ok && udpAddrEqual(addr, remoteAddr)
+}
+
+func udpPeerSendAddrMatches(peer *core.UdpPeer, remoteAddr *net.UDPAddr) bool {
+	if peer == nil {
+		return false
+	}
+	addr, ok := peer.SendAddr().(*net.UDPAddr)
+	return ok && udpAddrEqual(addr, remoteAddr)
+}
+
+func udpAddrEqual(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Port == b.Port && a.Zone == b.Zone && a.IP.Equal(b.IP)
+}
+
+func (s *UdpServer) startOutboundConnectionRoutine(conn *UdpConn) bool {
+	s.outboundConnStartMutex.Lock()
+	defer s.outboundConnStartMutex.Unlock()
+
+	select {
+	case <-s.signals.stop:
+		return false
+	default:
+	}
+
+	s.wg.Add(1)
+	go s.connectionRoutine(conn)
+	return true
+}
+
+func (s *UdpServer) serverPeerConnDataLocked(addrStr string, conn *UdpConn) (*core.ConnectionData, error) {
+	if conn == nil || conn.ConnData == nil {
+		return nil, nil
+	}
+	if !conn.isServerPeer {
+		if conn.isACConnection || conn.isDBConnection || conn.isWebRTC {
+			return nil, fmt.Errorf("%w: %s", errServerPeerTupleOwned, addrStr)
+		}
+		if conn.ConnData.IsClosed() {
+			return nil, nil
+		}
+		s.promoteServerPeerConnLocked(conn)
+	}
+	if conn.ConnData.IsClosed() {
+		return nil, nil
+	}
+	return conn.ConnData, nil
+}
+
+func (s *UdpServer) promoteServerPeerConnLocked(conn *UdpConn) {
+	if conn.isServerPeer {
+		return
+	}
+	if conn.perIPElem != nil {
+		ipKey := conn.ConnData.RemoteAddr.IP.String()
+		if bucket := s.connectionsByIP[ipKey]; bucket != nil {
+			bucket.Remove(conn.perIPElem)
+			if bucket.Len() == 0 {
+				delete(s.connectionsByIP, ipKey)
+			}
+		}
+		conn.perIPElem = nil
+	}
+	conn.isServerPeer = true
+}
+
+// SendMessage prepares and queues a message for sending via the server's send
+// channel. For outbound server-to-server forwards, it may synchronously
+// synthesize/reuse ConnData before queueing, or drop when the peer/tuple is not
+// safe to use. It returns local/prequeue failures only; successful queueing does
+// not imply a protocol-level response.
+func (s *UdpServer) SendMessage(md *core.MsgData) error {
+	if md == nil {
+		log.Warning("SendMessage called with nil MsgData")
+		return errors.New("nil MsgData")
+	}
+	// Today RemoteAddr-without-ConnData is only the server-to-server NHP_FWD
+	// path. Future callers that set RemoteAddr and omit both ConnData and
+	// PrevParserData must target a known NHP_SERVER peer and will get the
+	// same synthetic server-peer UDP lifecycle.
+	if md.ConnData == nil && md.PrevParserData == nil && md.RemoteAddr != nil {
+		connData, err := s.connDataForOutboundAddr(md.RemoteAddr, md.PeerPk)
+		if err != nil {
+			switch {
+			case errors.Is(err, errUnknownServerPeerTarget):
+				s.metrics.IncrCounter(MetricServerForwardTargetDrop)
+				log.Warning("SendMessage dropping outbound connection to %s: %v", md.RemoteAddr, err)
+			case errors.Is(err, errServerPeerTupleOwned):
+				s.metrics.IncrCounter(MetricServerForwardTargetDrop)
+				log.Error("SendMessage failed to prepare outbound connection to %s: %v", md.RemoteAddr, err)
+			case errors.Is(err, errOutboundServerGlobalCap):
+				log.Warning("SendMessage dropping outbound connection to %s under global connection cap: %v", md.RemoteAddr, err)
+			case errors.Is(err, errOutboundServerStopping):
+				log.Debug("SendMessage dropping outbound connection to %s during shutdown: %v", md.RemoteAddr, err)
+			default:
+				log.Error("SendMessage failed to prepare outbound connection to %s: %v", md.RemoteAddr, err)
+			}
+			return err
+		}
+		md.ConnData = connData
+	}
+	if md.ConnData == nil && md.PrevParserData == nil {
+		err := fmt.Errorf("missing connection data for %s outbound packet", core.HeaderTypeToString(md.HeaderType))
+		log.Error("SendMessage dropping %s without ConnData or PrevParserData", core.HeaderTypeToString(md.HeaderType))
+		return err
+	}
 	s.sendMsgCh <- md
+	return nil
 }
 
 // ProcessACOperation wraps the internal processACOperation method.

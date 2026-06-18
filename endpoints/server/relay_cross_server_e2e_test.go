@@ -516,13 +516,14 @@ type relayServerBForwarderDeps struct {
 	*mockACForwarderDeps
 }
 
-func (d *relayServerBForwarderDeps) SendMessage(md *core.MsgData) {
+func (d *relayServerBForwarderDeps) SendMessage(md *core.MsgData) error {
 	// sendForwardResult sets md.PrevParserData = the NHP_FWD ppd, which overrides
 	// ConnData/RemoteAddr/PeerPk/CipherScheme/TransactionId (see initiator.go), so
 	// the NHP_FRT routes back to server A over the connection server B accepted the
 	// NHP_FWD on. The response is re-derived from the ppd's retained fields, so it
 	// is valid even though PacketToMsg already Destroyed the ppd's base packet.
 	d.serverNode.device.SendMsgToPacket(md)
+	return nil
 }
 
 // crossServerForwarderDeps is the ForwarderDeps for server A's ServerForwarder
@@ -539,13 +540,15 @@ type crossServerForwarderDeps struct {
 func (d *crossServerForwarderDeps) GetHostname() string     { return d.node.id }
 func (d *crossServerForwarderDeps) GetDevice() *core.Device { return d.node.device }
 
-func (d *crossServerForwarderDeps) SendMessage(md *core.MsgData) {
-	// forwardToServer sets md.RemoteAddr + md.PeerPk; create the connection for
-	// that remote so the encrypted NHP_FWD actually leaves server A's socket.
+func (d *crossServerForwarderDeps) SendMessage(md *core.MsgData) error {
+	// This E2E transport double writes packets directly, so it mirrors
+	// production UdpServer.connDataForOutboundAddr by creating the test socket
+	// connection before the encrypted NHP_FWD leaves server A.
 	if md.ConnData == nil && md.RemoteAddr != nil {
 		md.ConnData = d.node.GetOrCreateConnection(md.RemoteAddr)
 	}
 	d.node.device.SendMsgToPacket(md)
+	return nil
 }
 
 func (d *crossServerForwarderDeps) FindACConnectionsForResource(*common.AgentKnockMsg, *common.ResourceData) []*ACConn {

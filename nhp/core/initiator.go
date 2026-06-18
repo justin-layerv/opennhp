@@ -203,6 +203,9 @@ func (d *Device) createKeepalivePacket(md *MsgData) (mad *MsgAssemblerData, err 
 	mad.HeaderType = NHP_KPL
 	mad.TransactionId = md.TransactionId
 	mad.connData = md.ConnData
+	// Keepalive callers are usually fire-and-forget, but tests and future
+	// callers that provide a response channel should receive assembly errors.
+	mad.ResponseMsgCh = md.ResponseMsgCh
 
 	// init packet buffer
 	if md.ExternalPacket != nil {

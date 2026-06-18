@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -323,6 +324,59 @@ func TestForwardKnock_SkipsUnhealthyServers(t *testing.T) {
 	}
 	if err.Error() != "all assigned servers unreachable or unhealthy" {
 		t.Errorf("Unexpected error: %v", err)
+	}
+}
+
+func TestForwardKnock_SendFailureReturnsImmediately(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	deps := &sendFailureForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		err:               errors.New("prequeue drop"),
+	}
+	forwarder := NewServerForwarder(deps)
+	assignment := &ACAssignment{
+		ACID: "ac-send-fail",
+		AssignedServers: []ServerInfo{
+			{
+				ID:         "srv-send-fail",
+				InternalIP: "10.0.0.50",
+				Port:       common.DefaultNHPPort,
+				PubKey:     device.PublicKeyBase64(),
+			},
+		},
+	}
+
+	start := time.Now()
+	_, err := forwarder.ForwardKnock(
+		context.Background(),
+		assignment,
+		[]byte("knock"),
+		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+	)
+
+	if err == nil {
+		t.Fatal("ForwardKnock returned nil error, want send failure")
+	}
+	if !strings.Contains(err.Error(), "forward send failed: prequeue drop") {
+		t.Fatalf("ForwardKnock error = %q, want prequeue send failure", err)
+	}
+	if elapsed := time.Since(start); elapsed >= ForwardTimeout/2 {
+		t.Fatalf("ForwardKnock waited %v after immediate send failure, want less than %v", elapsed, ForwardTimeout/2)
+	}
+	if forwarder.health.IsUnhealthy("srv-send-fail") {
+		t.Fatal("local send failure marked remote server unhealthy")
 	}
 }
 
@@ -1395,15 +1449,24 @@ func TestGetOrCreateServerPeer_UsesStaticIP(t *testing.T) {
 	}
 }
 
+type sendFailureForwarderDeps struct {
+	*MockForwarderDeps
+	err error
+}
+
+func (d *sendFailureForwarderDeps) SendMessage(*core.MsgData) error {
+	return d.err
+}
+
 // testForwarderDepsWithDevice is a minimal ForwarderDeps for unit tests that
 // only need GetDevice().
 type testForwarderDepsWithDevice struct {
 	device *core.Device
 }
 
-func (d *testForwarderDepsWithDevice) GetHostname() string       { return "test-server" }
-func (d *testForwarderDepsWithDevice) GetDevice() *core.Device   { return d.device }
-func (d *testForwarderDepsWithDevice) SendMessage(*core.MsgData) {}
+func (d *testForwarderDepsWithDevice) GetHostname() string             { return "test-server" }
+func (d *testForwarderDepsWithDevice) GetDevice() *core.Device         { return d.device }
+func (d *testForwarderDepsWithDevice) SendMessage(*core.MsgData) error { return nil }
 func (d *testForwarderDepsWithDevice) FindACConnectionsForResource(*common.AgentKnockMsg, *common.ResourceData) []*ACConn {
 	return nil
 }

@@ -49,6 +49,23 @@ const (
 	MaxPendingForwards = 10000
 )
 
+type localForwardSendError struct {
+	err error
+}
+
+func (e *localForwardSendError) Error() string {
+	return e.err.Error()
+}
+
+func (e *localForwardSendError) Unwrap() error {
+	return e.err
+}
+
+func isLocalForwardSendError(err error) bool {
+	var localErr *localForwardSendError
+	return errors.As(err, &localErr)
+}
+
 // ServerForwarder handles server-to-server knock forwarding.
 type ServerForwarder struct {
 	deps         ForwarderDeps
@@ -152,7 +169,9 @@ func (f *ServerForwarder) ForwardKnock(
 		result, err := f.forwardToServer(ctx, target, assignment.ACID, knockData, userAddr)
 		if err != nil {
 			log.Warning("Forward to server %s failed for AC %s: %v", target.ID, assignment.ACID, err)
-			f.health.RecordFailure(target.ID)
+			if !isLocalForwardSendError(err) {
+				f.health.RecordFailure(target.ID)
+			}
 			lastErr = err
 			continue
 		}
@@ -244,7 +263,15 @@ func (f *ServerForwarder) forwardToServer(
 	md.PeerPk = peer.PublicKey()
 
 	// Send message
-	f.deps.SendMessage(md)
+	if err := f.deps.SendMessage(md); err != nil {
+		// SendMessage failures are local/prequeue outcomes: backpressure,
+		// shutdown, or assignment/peer-map drift before a packet reaches the
+		// target. Do not mark the remote server unhealthy; persistent target
+		// drift is surfaced by ServerForwardTargetDrop.
+		return nil, &localForwardSendError{
+			err: fmt.Errorf("forward send failed: %w", err),
+		}
+	}
 
 	// Wait for response with timeout
 	select {
@@ -607,7 +634,9 @@ func (f *ServerForwarder) sendForwardResult(
 		Message:        msgBytes,
 	}
 
-	f.deps.SendMessage(md)
+	if err := f.deps.SendMessage(md); err != nil {
+		log.Warning("failed to send NHP_FRT for txID %d: %v", txID, err)
+	}
 }
 
 // getOrCreateServerPeer gets or creates a peer for a target server.

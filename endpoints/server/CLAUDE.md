@@ -28,6 +28,10 @@ must update this list and audit all existing call sites.
 - **`remoteConnectionMapMutex` is leaf-most for the conn lifecycle**:
   no other mutex is acquired while holding it. The connection
   routine's defer takes it briefly to remove the global-map entry.
+- **`outboundConnStartMutex` is not nested with server data locks.**
+  `connDataForOutboundAddr` takes it only after releasing
+  `remoteConnectionMapMutex`; `Stop()` takes it alone as a barrier before
+  `wg.Wait`. Do not hold it while acquiring map, peer, or plugin locks.
 - **`acConnectionMapMutex` then `remoteConnectionMapMutex`, never
   reversed AND never nested.** `HandleACOnline`'s stale-conn cleanup
   acquires `acConnectionMapMutex` first to find the stale entry,

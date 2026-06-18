@@ -227,10 +227,32 @@ func (d *Device) msgToPacketRoutine(id int) {
 
 				var mad *MsgAssemblerData
 				var err error
+				var localTransaction *LocalTransaction
 
 				// error handling
 				defer func() {
+					if x := recover(); x != nil {
+						recovered := fmt.Errorf("!!!recovered from panic: %v\n%s", x, string(debug.Stack()))
+						err = ErrRuntimePanic.WithExtra(recovered)
+						log.Error("msgToPacketRoutine %d: [%s] recovered from panic: %v", id, msgType, err)
+					}
 					if err != nil {
+						if mad == nil {
+							if md.ResponseMsgCh != nil {
+								md.ResponseMsgCh <- &PacketParserData{Error: err}
+							}
+							return
+						}
+
+						if localTransaction != nil {
+							// Once a local transaction owns mad, complete it through the
+							// transaction path so its defer remains the single cleanup owner.
+							if txErr := localTransaction.SendExternalMsg(&PacketParserData{Error: err}); txErr != nil {
+								log.Debug("msgToPacketRoutine %d: [%s] recovered error after local transaction closed: %v", id, msgType, txErr)
+							}
+							return
+						}
+
 						mad.Error = err
 						mad.Destroy()
 
@@ -240,6 +262,9 @@ func (d *Device) msgToPacketRoutine(id int) {
 								Error: err,
 							}
 						}
+						// This reports ordinary pre-divert errors. If the
+						// encryptedPktCh send below can panic in the future,
+						// recover at that send site instead of relying on this defer.
 						if mad.encryptedPktCh != nil {
 							mad.encryptedPktCh <- mad
 						}
@@ -248,7 +273,14 @@ func (d *Device) msgToPacketRoutine(id int) {
 
 				// process keepalive separately
 				if md.HeaderType == NHP_KPL {
+					// createKeepalivePacket returns non-nil mad even on error, so
+					// the deferred err handler above is nil-safe.
 					mad, _ = d.createKeepalivePacket(md)
+					if mad.connData == nil {
+						err = fmt.Errorf("missing connection data for %s outbound packet", msgType)
+						log.Error("msgToPacketRoutine %d: [%s] %v", id, msgType, err)
+						return
+					}
 					// send out keepalive packet
 					mad.connData.ForwardOutboundPacket(mad.BasePacket)
 					return
@@ -283,6 +315,13 @@ func (d *Device) msgToPacketRoutine(id int) {
 					return
 				}
 
+				// The encryptedPktCh divert above is the legitimate nil-connData path.
+				if mad.connData == nil {
+					err = fmt.Errorf("missing connection data for %s outbound packet", msgType)
+					log.Error("msgToPacketRoutine %d: [%s] %v", id, msgType, err)
+					return
+				}
+
 				// create local transaction if needed
 				log.Debug("msgToPacketRoutine IsTransactionRequest:deviceType:%d HeaderType:%d", d.deviceType, mad.HeaderType)
 				if d.IsTransactionRequest(mad.HeaderType) {
@@ -290,6 +329,7 @@ func (d *Device) msgToPacketRoutine(id int) {
 					mad.BasePacket.KeepAfterSend = true // packet is kept after sending and deleted at transaction level
 					t := newLocalTransaction(mad.header.Counter(), mad.connData, mad, d.LocalTransactionTimeout())
 					d.AddLocalTransaction(t)
+					localTransaction = t
 					log.Debug("AddLocalTransaction:deviceType=%d,HeaderType=%d", d.deviceType, mad.HeaderType)
 				}
 

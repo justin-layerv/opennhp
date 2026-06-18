@@ -865,10 +865,18 @@ const (
 	MetricACConnEviction          = "ACConnEviction"          // MaxACConnsPerID eviction events
 	MetricAgentConnPerIPEvictions = "AgentConnPerIPEvictions" // MaxAgentConnsPerIP eviction events
 
-	// MetricGlobalCapRejections counts new-connection packets rejected
-	// because remoteConnectionMap is at the global MaxConcurrentConnection
-	// cap — the rejection branch reachable again only after #1525. Emitted
-	// by globalCapAdmits on the reject path (see its doc for the lock
+	// MetricServerForwardTargetDrop counts outbound NHP_FWD connection
+	// attempts dropped because the requested peer/tuple is not a configured
+	// server-peer target or the tuple is already owned by a non-promotable
+	// AC/DB/WebRTC connection. Steady state should be zero; a non-zero value
+	// points at assignment/peer-map drift or a tuple-owner collision.
+	MetricServerForwardTargetDrop = "ServerForwardTargetDrop"
+
+	// MetricGlobalCapRejections counts new inbound packet admits and
+	// outbound server-peer forward connection attempts rejected because
+	// remoteConnectionMap is at the global MaxConcurrentConnection cap.
+	// Emitted by globalCapAdmits and connDataForOutboundAddr on reject
+	// paths after dropping the map mutex (see globalCapAdmits for the lock
 	// discipline behind where the increment lands).
 	//
 	// Operator guidance: steady-state value is zero. MaxConcurrentConnection

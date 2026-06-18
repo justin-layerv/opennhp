@@ -761,12 +761,15 @@ func (d *e2eForwarderDeps) GetDevice() *core.Device {
 	return d.device
 }
 
-func (d *e2eForwarderDeps) SendMessage(md *core.MsgData) {
-	// If ConnData is not set, create one based on RemoteAddr
+func (d *e2eForwarderDeps) SendMessage(md *core.MsgData) error {
+	// This E2E transport double must attach ConnData before calling the core
+	// packet writer directly. Production UdpServer does the corresponding
+	// server-peer synthesis in connDataForOutboundAddr before queueing.
 	if md.ConnData == nil && md.RemoteAddr != nil {
 		md.ConnData = d.node.GetOrCreateConnection(md.RemoteAddr)
 	}
 	d.device.SendMsgToPacket(md)
+	return nil
 }
 
 func (d *e2eForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
@@ -1098,13 +1101,14 @@ func (d *capturingForwarderDeps) GetDevice() *core.Device {
 	return d.device
 }
 
-func (d *capturingForwarderDeps) SendMessage(md *core.MsgData) {
+func (d *capturingForwarderDeps) SendMessage(md *core.MsgData) error {
 	// Capture the message via callback (we don't need to actually send it)
 	if d.onSend != nil {
 		d.onSend(md)
 	}
 	// Note: We intentionally don't call device.SendMsgToPacket here
 	// since we're only testing decryption, not the full network round-trip.
+	return nil
 }
 
 func (d *capturingForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
@@ -1247,7 +1251,7 @@ func (d *mockACForwarderDeps) GetDevice() *core.Device {
 	return d.device
 }
 
-func (d *mockACForwarderDeps) SendMessage(md *core.MsgData) {
+func (d *mockACForwarderDeps) SendMessage(md *core.MsgData) error {
 	// Capture NHP_FRT responses
 	if md.HeaderType == core.NHP_FRT && d.onSendResult != nil {
 		var result common.ServerForwardResultMsg
@@ -1255,6 +1259,7 @@ func (d *mockACForwarderDeps) SendMessage(md *core.MsgData) {
 			d.onSendResult(&result)
 		}
 	}
+	return nil
 }
 
 func (d *mockACForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, res *common.ResourceData) []*ACConn {
@@ -1806,13 +1811,14 @@ type errorACForwarderDeps struct {
 func (d *errorACForwarderDeps) GetHostname() string     { return d.hostname }
 func (d *errorACForwarderDeps) GetDevice() *core.Device { return d.device }
 
-func (d *errorACForwarderDeps) SendMessage(md *core.MsgData) {
+func (d *errorACForwarderDeps) SendMessage(md *core.MsgData) error {
 	if md.HeaderType == core.NHP_FRT && d.onSendResult != nil {
 		var result common.ServerForwardResultMsg
 		if err := json.Unmarshal(md.Message, &result); err == nil {
 			d.onSendResult(&result)
 		}
 	}
+	return nil
 }
 
 func (d *errorACForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
@@ -2002,13 +2008,14 @@ type timeoutACForwarderDeps struct {
 func (d *timeoutACForwarderDeps) GetHostname() string     { return d.hostname }
 func (d *timeoutACForwarderDeps) GetDevice() *core.Device { return d.device }
 
-func (d *timeoutACForwarderDeps) SendMessage(md *core.MsgData) {
+func (d *timeoutACForwarderDeps) SendMessage(md *core.MsgData) error {
 	if md.HeaderType == core.NHP_FRT && d.onSendResult != nil {
 		var result common.ServerForwardResultMsg
 		if err := json.Unmarshal(md.Message, &result); err == nil {
 			d.onSendResult(&result)
 		}
 	}
+	return nil
 }
 
 func (d *timeoutACForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {

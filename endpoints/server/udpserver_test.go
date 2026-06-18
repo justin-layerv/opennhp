@@ -21,6 +21,406 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
+func newSendMessageTestServer(t *testing.T, sendCh chan *core.MsgData) *UdpServer {
+	t.Helper()
+	server := newTestUdpServer(t)
+	server.listenAddr = &net.UDPAddr{IP: net.ParseIP("10.0.0.10"), Port: common.DefaultNHPPort}
+	server.listenAddrStr = "10.0.0.10:62206"
+	server.sendMsgCh = sendCh
+	server.signals.stop = make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-server.signals.stop:
+		default:
+			close(server.signals.stop)
+		}
+		server.wg.Wait()
+	})
+	return server
+}
+
+func testServerPeerPk(seed byte) []byte {
+	peerPk := make([]byte, core.PublicKeySize)
+	for i := range peerPk {
+		peerPk[i] = seed
+	}
+	return peerPk
+}
+
+func addServerPeerTarget(t *testing.T, server *UdpServer, remoteAddr *net.UDPAddr) []byte {
+	t.Helper()
+	peerPk := testServerPeerPk(byte(remoteAddr.Port))
+	server.device.AddPeer(&core.UdpPeer{
+		Ip:           remoteAddr.IP.String(),
+		Port:         remoteAddr.Port,
+		PubKeyBase64: base64.StdEncoding.EncodeToString(peerPk),
+		Type:         core.NHP_SERVER,
+	})
+	return peerPk
+}
+
+func newForwardMsgData(remoteAddr *net.UDPAddr, transactionID uint64, peerPk []byte) *core.MsgData {
+	return &core.MsgData{
+		RemoteAddr:    remoteAddr,
+		HeaderType:    core.NHP_FWD,
+		CipherScheme:  common.CIPHER_SCHEME_CURVE,
+		TransactionId: transactionID,
+		PeerPk:        peerPk,
+		Message:       []byte(`{"probe":true}`),
+	}
+}
+
+func requireSendMessageFailure(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("SendMessage failure = nil, want error containing %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("SendMessage failure = %q, want containing %q", err, want)
+	}
+}
+
+func TestSendMessageCreatesOutboundConnectionForRemoteAddr(t *testing.T) {
+	sendCh := make(chan *core.MsgData, 1)
+	server := newSendMessageTestServer(t, sendCh)
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.50"), Port: common.DefaultNHPPort}
+	peerPk := addServerPeerTarget(t, server, remoteAddr)
+	md := newForwardMsgData(remoteAddr, 42, peerPk)
+
+	if err := server.SendMessage(md); err != nil {
+		t.Fatalf("SendMessage failed: %v", err)
+	}
+
+	select {
+	case got := <-sendCh:
+		if got != md {
+			t.Fatalf("queued MsgData pointer = %p, want %p", got, md)
+		}
+		if got.ConnData == nil {
+			t.Fatal("SendMessage queued outbound server message with nil ConnData")
+		}
+		if got.ConnData.RemoteAddr.String() != remoteAddr.String() {
+			t.Fatalf("ConnData.RemoteAddr = %s, want %s", got.ConnData.RemoteAddr, remoteAddr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendMessage did not queue outbound message")
+	}
+
+	server.remoteConnectionMapMutex.Lock()
+	stored := server.remoteConnectionMap[remoteAddr.String()]
+	server.remoteConnectionMapMutex.Unlock()
+	if stored == nil {
+		t.Fatalf("remoteConnectionMap missing outbound connection for %s", remoteAddr)
+	}
+	if stored.ConnData != md.ConnData {
+		t.Fatal("remoteConnectionMap stored a different ConnData than the queued outbound message")
+	}
+	if !stored.isServerPeer {
+		t.Fatal("outbound server-peer connection was not marked as trusted server peer")
+	}
+	if stored.perIPElem != nil {
+		t.Fatal("server-peer connection should bypass agent per-IP eviction bucket")
+	}
+	if _, found := server.connectionsByIP[remoteAddr.IP.String()]; found {
+		t.Fatal("server-peer connection leaked into connectionsByIP")
+	}
+}
+
+func TestSendMessageOutboundConnectionRoutineWritesUDP(t *testing.T) {
+	serverListen, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("ListenUDP server: %v", err)
+	}
+	remote, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		_ = serverListen.Close()
+		t.Fatalf("ListenUDP remote: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = remote.Close()
+		_ = serverListen.Close()
+	})
+
+	sendCh := make(chan *core.MsgData, 1)
+	server := newSendMessageTestServer(t, sendCh)
+	server.listenConn = serverListen
+	server.listenAddr = serverListen.LocalAddr().(*net.UDPAddr)
+	server.listenAddrStr = server.listenAddr.String()
+
+	remoteAddr := remote.LocalAddr().(*net.UDPAddr)
+	peerPk := addServerPeerTarget(t, server, remoteAddr)
+	md := newForwardMsgData(remoteAddr, 42, peerPk)
+	if err := server.SendMessage(md); err != nil {
+		t.Fatalf("SendMessage failed: %v", err)
+	}
+	select {
+	case <-sendCh:
+	case <-time.After(time.Second):
+		t.Fatal("SendMessage did not queue outbound message")
+	}
+	if md.ConnData == nil {
+		t.Fatal("SendMessage did not attach ConnData")
+	}
+
+	payload := []byte("server-peer-routine-send")
+	md.ConnData.ForwardOutboundPacket(&core.Packet{
+		HeaderType: core.NHP_FWD,
+		Content:    payload,
+	})
+
+	if err := remote.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 128)
+	n, from, err := remote.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("remote did not receive packet from connectionRoutine: %v", err)
+	}
+	if got := string(buf[:n]); got != string(payload) {
+		t.Fatalf("remote payload = %q, want %q", got, payload)
+	}
+	if from.String() != server.listenAddr.String() {
+		t.Fatalf("remote saw sender %s, want server listen addr %s", from, server.listenAddr)
+	}
+}
+
+func TestSendMessageReusesOutboundConnectionForRemoteAddr(t *testing.T) {
+	sendCh := make(chan *core.MsgData, 2)
+	server := newSendMessageTestServer(t, sendCh)
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.50"), Port: common.DefaultNHPPort}
+	peerPk := addServerPeerTarget(t, server, remoteAddr)
+	first := newForwardMsgData(remoteAddr, 42, peerPk)
+	second := newForwardMsgData(remoteAddr, 43, peerPk)
+
+	if err := server.SendMessage(first); err != nil {
+		t.Fatalf("first SendMessage failed: %v", err)
+	}
+	if err := server.SendMessage(second); err != nil {
+		t.Fatalf("second SendMessage failed: %v", err)
+	}
+
+	var queued []*core.MsgData
+	for len(queued) < 2 {
+		select {
+		case got := <-sendCh:
+			queued = append(queued, got)
+		case <-time.After(time.Second):
+			t.Fatalf("queued %d messages, want 2", len(queued))
+		}
+	}
+	if queued[0].ConnData == nil || queued[1].ConnData == nil {
+		t.Fatalf("queued ConnData = (%v, %v), want both non-nil", queued[0].ConnData, queued[1].ConnData)
+	}
+	if queued[0].ConnData != queued[1].ConnData {
+		t.Fatal("SendMessage created a new outbound ConnData instead of reusing the live connection")
+	}
+	server.remoteConnectionMapMutex.Lock()
+	mapLen := len(server.remoteConnectionMap)
+	stored := server.remoteConnectionMap[remoteAddr.String()]
+	server.remoteConnectionMapMutex.Unlock()
+	if mapLen != 1 {
+		t.Fatalf("remoteConnectionMap len = %d, want 1", mapLen)
+	}
+	if stored == nil || stored.ConnData != first.ConnData {
+		t.Fatal("remoteConnectionMap did not keep the reused outbound connection")
+	}
+}
+
+func TestSendMessagePromotesInboundServerPeerConnectionForReciprocalForward(t *testing.T) {
+	sendCh := make(chan *core.MsgData, 1)
+	server := newSendMessageTestServer(t, sendCh)
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.50"), Port: common.DefaultNHPPort}
+	existing := &UdpConn{
+		evictSignal: make(chan struct{}),
+		ConnData: &core.ConnectionData{
+			Device:               server.device,
+			LocalAddr:            server.listenAddr,
+			RemoteAddr:           remoteAddr,
+			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+			SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+			RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+			BlockSignal:          make(chan struct{}),
+			SetTimeoutSignal:     make(chan struct{}),
+			StopSignal:           make(chan struct{}),
+		},
+	}
+	existing.ConnData.InitTimeoutMs(DefaultAgentConnectionTimeoutMs)
+	server.admitNewConnection(existing, remoteAddr.String())
+	if existing.perIPElem == nil {
+		t.Fatal("generic inbound conn was not inserted into the per-IP bucket")
+	}
+
+	peerPk := addServerPeerTarget(t, server, remoteAddr)
+	md := newForwardMsgData(remoteAddr, 44, peerPk)
+	if err := server.SendMessage(md); err != nil {
+		t.Fatalf("SendMessage failed: %v", err)
+	}
+
+	select {
+	case got := <-sendCh:
+		if got != md {
+			t.Fatalf("queued MsgData pointer = %p, want %p", got, md)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendMessage did not queue reciprocal forward")
+	}
+	if md.ConnData != existing.ConnData {
+		t.Fatal("SendMessage did not reuse the inbound server-peer tuple")
+	}
+	if !existing.isServerPeer {
+		t.Fatal("reciprocal forward did not promote tuple to server-peer")
+	}
+	if existing.perIPElem != nil {
+		t.Fatal("promoted server-peer tuple remained in the per-IP bucket")
+	}
+	if _, found := server.connectionsByIP[remoteAddr.IP.String()]; found {
+		t.Fatal("promoted server-peer tuple left an empty per-IP bucket behind")
+	}
+}
+
+func TestSendMessageDropsOutboundForUnknownServerPeerTarget(t *testing.T) {
+	sendCh := make(chan *core.MsgData, 1)
+	server := newSendMessageTestServer(t, sendCh)
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.50"), Port: common.DefaultNHPPort}
+	existing := &UdpConn{
+		evictSignal: make(chan struct{}),
+		ConnData: &core.ConnectionData{
+			Device:               server.device,
+			LocalAddr:            server.listenAddr,
+			RemoteAddr:           remoteAddr,
+			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+			SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+			RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+			BlockSignal:          make(chan struct{}),
+			SetTimeoutSignal:     make(chan struct{}),
+			StopSignal:           make(chan struct{}),
+		},
+	}
+	server.remoteConnectionMap[remoteAddr.String()] = existing
+
+	md := newForwardMsgData(remoteAddr, 44, testServerPeerPk(0x44))
+	err := server.SendMessage(md)
+
+	select {
+	case got := <-sendCh:
+		t.Fatalf("queued MsgData %#v for unknown server peer target, want drop", got)
+	default:
+	}
+	requireSendMessageFailure(t, err, "not a known server peer target")
+	if md.ConnData != nil {
+		t.Fatal("SendMessage attached ConnData for unknown server peer target")
+	}
+	if server.remoteConnectionMap[remoteAddr.String()] != existing {
+		t.Fatal("SendMessage replaced the existing tuple owner")
+	}
+	counters, _ := server.metrics.CountersForTest(t)
+	if got := counters[MetricServerForwardTargetDrop]; got != 1 {
+		t.Fatalf("MetricServerForwardTargetDrop = %v, want 1", got)
+	}
+}
+
+func TestSendMessageDropsOutboundWhenTupleOwnedByNonPromotableConn(t *testing.T) {
+	sendCh := make(chan *core.MsgData, 1)
+	server := newSendMessageTestServer(t, sendCh)
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.50"), Port: common.DefaultNHPPort}
+	existing := &UdpConn{
+		isACConnection: true,
+		evictSignal:    make(chan struct{}),
+		ConnData: &core.ConnectionData{
+			Device:               server.device,
+			LocalAddr:            server.listenAddr,
+			RemoteAddr:           remoteAddr,
+			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+			SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+			RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+			BlockSignal:          make(chan struct{}),
+			SetTimeoutSignal:     make(chan struct{}),
+			StopSignal:           make(chan struct{}),
+		},
+	}
+	server.remoteConnectionMap[remoteAddr.String()] = existing
+
+	peerPk := addServerPeerTarget(t, server, remoteAddr)
+	md := newForwardMsgData(remoteAddr, 45, peerPk)
+	err := server.SendMessage(md)
+
+	select {
+	case got := <-sendCh:
+		t.Fatalf("queued MsgData %#v for AC-owned tuple, want drop", got)
+	default:
+	}
+	requireSendMessageFailure(t, err, "already owned by non-promotable connection")
+	if md.ConnData != nil {
+		t.Fatal("SendMessage attached ConnData from non-promotable tuple owner")
+	}
+	if server.remoteConnectionMap[remoteAddr.String()] != existing {
+		t.Fatal("SendMessage replaced the non-promotable tuple owner")
+	}
+	counters, _ := server.metrics.CountersForTest(t)
+	if got := counters[MetricServerForwardTargetDrop]; got != 1 {
+		t.Fatalf("MetricServerForwardTargetDrop = %v, want 1", got)
+	}
+}
+
+func TestSendMessageDropsOutboundConnectionAtGlobalCap(t *testing.T) {
+	sendCh := make(chan *core.MsgData, 1)
+	server := newSendMessageTestServer(t, sendCh)
+	server.device.SetOverload(false)
+	fillRemoteConnectionMap(server, MaxConcurrentConnection)
+
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.50"), Port: common.DefaultNHPPort}
+	peerPk := addServerPeerTarget(t, server, remoteAddr)
+	md := newForwardMsgData(remoteAddr, 42, peerPk)
+	err := server.SendMessage(md)
+
+	select {
+	case got := <-sendCh:
+		t.Fatalf("queued MsgData %#v at global cap, want drop", got)
+	default:
+	}
+	requireSendMessageFailure(t, err, "maximum concurrent connection cap reached")
+	if md.ConnData != nil {
+		t.Fatal("SendMessage attached ConnData at global cap, want nil/drop")
+	}
+	if !server.device.IsOverload() {
+		t.Fatal("device overload flag was not set at global cap")
+	}
+	counters, _ := server.metrics.CountersForTest(t)
+	if got := counters[MetricGlobalCapRejections]; got != 1 {
+		t.Fatalf("MetricGlobalCapRejections = %v, want 1", got)
+	}
+}
+
+func TestSendMessageDropsOutboundWhenServerStopping(t *testing.T) {
+	sendCh := make(chan *core.MsgData, 1)
+	server := newSendMessageTestServer(t, sendCh)
+	close(server.signals.stop)
+
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.50"), Port: common.DefaultNHPPort}
+	peerPk := addServerPeerTarget(t, server, remoteAddr)
+	md := newForwardMsgData(remoteAddr, 42, peerPk)
+	err := server.SendMessage(md)
+
+	select {
+	case got := <-sendCh:
+		t.Fatalf("queued MsgData %#v while server stopping, want drop", got)
+	default:
+	}
+	requireSendMessageFailure(t, err, "server stopping")
+	if !errors.Is(err, errOutboundServerStopping) {
+		t.Fatalf("SendMessage error = %v, want errOutboundServerStopping", err)
+	}
+	if md.ConnData != nil {
+		t.Fatal("SendMessage attached ConnData while server stopping, want nil/drop")
+	}
+	server.remoteConnectionMapMutex.Lock()
+	_, found := server.remoteConnectionMap[remoteAddr.String()]
+	server.remoteConnectionMapMutex.Unlock()
+	if found {
+		t.Fatal("server stopping path left synthetic outbound connection in remoteConnectionMap")
+	}
+}
+
 // TestBuildServerMetricDimensions tests that buildServerMetricDimensions returns
 // correct CloudWatch dimensions based on environment variables, including the
 // default fallback values ("unknown" and "cell0") when env vars are unset.

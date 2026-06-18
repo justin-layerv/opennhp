@@ -60,10 +60,15 @@ func (m *MockForwarderDeps) GetDevice() *core.Device {
 	return m.device
 }
 
-func (m *MockForwarderDeps) SendMessage(md *core.MsgData) {
+func (m *MockForwarderDeps) SendMessage(md *core.MsgData) error {
+	// This unit-test mock only captures the MsgData. Production UdpServer
+	// synthesizes outbound server-peer ConnData in connDataForOutboundAddr;
+	// E2E transport doubles that need packets to leave a socket do their own
+	// test-only connection synthesis.
 	if m.sendCh != nil {
 		m.sendCh <- md
 	}
+	return nil
 }
 
 func (m *MockForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {

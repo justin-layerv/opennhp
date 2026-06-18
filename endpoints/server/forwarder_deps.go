@@ -28,7 +28,9 @@ type ForwarderDeps interface {
 	GetDevice() *core.Device
 
 	// SendMessage queues a message for sending via the server's send channel.
-	SendMessage(md *core.MsgData)
+	// It returns only local/prequeue failures; protocol responses still arrive
+	// through NHP_FRT handling.
+	SendMessage(md *core.MsgData) error
 
 	// FindACConnectionsForResource finds all AC connections that can handle a
 	// knock for an already-resolved resource. The forward receiver resolves

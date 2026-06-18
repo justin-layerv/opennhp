@@ -520,7 +520,7 @@ func (ztdo *Ztdo) DecryptZtdoFile(ciphertextPath, plaintextPath string, gcmKey [
 // marshal searilizs Go struct into bytes buffer
 func marshal(buf *bytes.Buffer, data any) error {
 	rData := reflect.ValueOf(data)
-	if rData.Kind() == reflect.Ptr {
+	if rData.Kind() == reflect.Pointer {
 		rData = rData.Elem()
 	}
 
@@ -572,7 +572,7 @@ func marshal(buf *bytes.Buffer, data any) error {
 func unmarshal(f *os.File, data any) error {
 	rValues := reflect.ValueOf(data)
 	rTypes := reflect.TypeOf(data)
-	if rValues.Kind() == reflect.Ptr {
+	if rValues.Kind() == reflect.Pointer {
 		rTypes = rTypes.Elem()
 		rValues = rValues.Elem()
 	}
@@ -667,7 +667,7 @@ func toBuffer(data any) (*bytes.Buffer, error) {
 func toStructure(f *os.File, data any) error {
 	lengthMap = make(map[string]uint32)
 	rValues := reflect.ValueOf(data)
-	if rValues.Kind() != reflect.Ptr {
+	if rValues.Kind() != reflect.Pointer {
 		return errors.New("data must be a pointer")
 	}
 	return unmarshal(f, data)
