@@ -433,12 +433,11 @@ the relay's footing is stable:
 2. The static `relay.toml` load path already exists (P3a — `updateRelayPeers` /
    `relayPeerMap`), so the wipe hazard below is a real path, not hypothetical. If a
    **dynamic relay registry** (DDB / `NHP_AOL`-style) ever replaces `relay.toml`, it
-   would need the *same kind* of boot guard `agent.toml` already has — the
-   server-side check in [`endpoints/server/config.go`](../../endpoints/server/config.go)
-   that refuses boot when `agent.toml` coexists with a cloud DDB *agent* registry (a
-   pattern to replicate; there is **no** equivalent `relay.toml` guard today) —
-   otherwise a `relay.toml` watcher fire would wipe DDB-resolved relay peers. Tracked
-   as a tripwire in #2541.
+   must wire through the reserved `RelayKeysTable` config path and keep static
+   `relay.toml` absent. [`endpoints/server/config.go`](../../endpoints/server/config.go)
+   now mirrors the `agent.toml` coexistence guard: `relay.toml` plus a configured
+   `RelayKeysTable` is rejected before the file watcher can rebuild `relayPeerMap`
+   from static contents and wipe dynamically resolved relay peers. Tracked by #2541.
 
 **The relay is cross-cell shared infra:** its availability and routing affect all
 cells (its blast radius is cross-cell *routing / source-IP*, never sessions), and a

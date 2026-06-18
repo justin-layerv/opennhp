@@ -1004,6 +1004,9 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 			// Fall back to local config files for HTTP, peers, resources
 			if loadErr := s.loadPeers(); loadErr != nil {
 				log.Error("[Server] failed to load peers: %v", loadErr)
+				if errors.Is(loadErr, errPeerRegistryConflict) {
+					return loadErr
+				}
 			}
 			if loadErr := s.loadHttpConfig(); loadErr != nil {
 				log.Error("[Server] failed to load HTTP config: %v", loadErr)
@@ -1027,6 +1030,9 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		// load peers
 		if err := s.loadPeers(); err != nil {
 			log.Error("[Server] failed to load peers: %v", err)
+			if errors.Is(err, errPeerRegistryConflict) {
+				return err
+			}
 		}
 
 		// load http config and turn on http server if needed

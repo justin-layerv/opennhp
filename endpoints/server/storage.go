@@ -356,6 +356,11 @@ type DynamoDBConfig struct {
 	// disables the lookup (legacy etcd/file path stays in effect).
 	// PR-1b plan reference.
 	AgentKeysTable string `toml:"AgentKeysTable"`
+	// RelayKeysTable is the reserved dynamic relay registry table. It is
+	// intentionally empty today because relay authorization still comes from
+	// relay.toml; if a future registry wires this, relay.toml must not coexist
+	// with it or the file watcher can wipe dynamically resolved relay peers.
+	RelayKeysTable string `toml:"RelayKeysTable"`
 	// AckTokensTable holds short-lived AC-issued ACK token metadata.
 	// nhp-server writes an item when it publishes ackMsg.ACTokens and
 	// /nhp/internal/token/validate reads it on a local tokenStore miss

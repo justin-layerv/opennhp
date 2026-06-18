@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -636,6 +637,111 @@ func TestLoadPeers_RefusesCloudModeWithAgentTomlCoexistence(t *testing.T) {
 	}
 	if !strings.Contains(loadErr.Error(), "agent peer registry conflict") {
 		t.Errorf("loadPeers err=%q does not mention 'agent peer registry conflict' — guard message regressed", loadErr.Error())
+	}
+	if !errors.Is(loadErr, errPeerRegistryConflict) {
+		t.Errorf("loadPeers err=%q does not wrap errPeerRegistryConflict", loadErr.Error())
+	}
+}
+
+func writeRelayTomlFixture(t *testing.T, etcDir string) string {
+	t.Helper()
+
+	relayPubKey := testRelayPubKeyBase64()
+	relayToml := "[[Relays]]\n" +
+		"Ip = \"203.0.113.50\"\n" +
+		"Port = 62206\n" +
+		"PubKeyBase64 = \"" + relayPubKey + "\"\n" +
+		"ExpireTime = 1924991999\n"
+	if err := os.WriteFile(filepath.Join(etcDir, "relay.toml"), []byte(relayToml), 0o644); err != nil {
+		t.Fatalf("write relay.toml: %v", err)
+	}
+	return relayPubKey
+}
+
+// TestLoadPeers_RefusesCloudModeWithRelayTomlDynamicRegistryConflict fences #2541.
+// relay.toml and a future DDB-backed relay registry cannot coexist: updateRelayPeers
+// (called from loadPeers and the relay.toml WatchFile callback) rebuilds relayPeerMap
+// wholesale from the file and removes missing pubkeys from the device peer map. If a
+// future RelayKeysTable-backed registry is wired, loadPeers must reject the static
+// file before the watcher can fire and wipe dynamically resolved relay peers.
+func TestLoadPeers_RefusesCloudModeWithRelayTomlDynamicRegistryConflict(t *testing.T) {
+	tmpDir := t.TempDir()
+	etcDir := filepath.Join(tmpDir, "etc")
+	if err := os.MkdirAll(etcDir, 0o755); err != nil {
+		t.Fatalf("mkdir etc: %v", err)
+	}
+	writeRelayTomlFixture(t, etcDir)
+
+	orig := ExeDirPath
+	t.Cleanup(func() { ExeDirPath = orig })
+	ExeDirPath = tmpDir
+
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	s := &UdpServer{
+		log:    logger,
+		config: &Config{},
+		storageConfig: &StorageConfig{
+			Backend: StorageBackendDynamoDB,
+			DynamoDB: DynamoDBConfig{
+				RelayKeysTable: "qurl-relay-keys-test",
+			},
+		},
+	}
+
+	loadErr := s.loadPeers()
+	if loadErr == nil {
+		t.Fatal("loadPeers returned nil error; expected relay-registry coexistence refusal")
+	}
+	if !strings.Contains(loadErr.Error(), "relay peer registry conflict") {
+		t.Errorf("loadPeers err=%q does not mention 'relay peer registry conflict' — guard message regressed", loadErr.Error())
+	}
+	if !strings.Contains(loadErr.Error(), "RelayKeysTable") {
+		t.Errorf("loadPeers err=%q does not tell the operator which dynamic relay config to clear", loadErr.Error())
+	}
+	if !errors.Is(loadErr, errPeerRegistryConflict) {
+		t.Errorf("loadPeers err=%q does not wrap errPeerRegistryConflict", loadErr.Error())
+	}
+}
+
+func TestLoadPeers_AllowsCloudModeStaticRelayTomlWithoutDynamicRegistry(t *testing.T) {
+	tmpDir := t.TempDir()
+	etcDir := filepath.Join(tmpDir, "etc")
+	if err := os.MkdirAll(etcDir, 0o755); err != nil {
+		t.Fatalf("mkdir etc: %v", err)
+	}
+	relayPubKey := writeRelayTomlFixture(t, etcDir)
+
+	orig := ExeDirPath
+	t.Cleanup(func() { ExeDirPath = orig })
+	ExeDirPath = tmpDir
+
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("core.NewDevice returned nil")
+	}
+	t.Cleanup(device.Stop)
+
+	s := &UdpServer{
+		log:           logger,
+		config:        &Config{},
+		device:        device,
+		storageConfig: &StorageConfig{Backend: StorageBackendDynamoDB},
+	}
+	t.Cleanup(s.StopConfigWatch)
+
+	if err := s.loadPeers(); err != nil {
+		t.Fatalf("loadPeers returned error for static relay.toml without dynamic registry: %v", err)
+	}
+	if got := len(s.relayPeerMap); got != 1 {
+		t.Fatalf("relayPeerMap len = %d; want 1", got)
+	}
+	if s.lookupRelayPeer(relayPubKey) == nil {
+		t.Fatal("lookupRelayPeer did not return the static relay peer")
 	}
 }
 

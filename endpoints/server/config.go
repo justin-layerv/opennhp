@@ -33,6 +33,8 @@ var (
 	relayConfigWatch io.Closer
 	teeWatch         io.Closer
 	errLoadConfig    = errors.New("config load error")
+
+	errPeerRegistryConflict = errors.New("peer registry conflict")
 )
 
 func decodeCookieSigningKey(b64 string) ([]byte, error) {
@@ -334,8 +336,8 @@ func (s *UdpServer) loadPeers() error {
 		// drift between that template and the deployed filesystem.
 		cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
 		if cloudMode && s.agentPeerLookup != nil {
-			return fmt.Errorf("agent peer registry conflict: %s exists AND cloud-mode agent peer DDB lookup is wired (storage_backend=%q, AgentKeysTable set). The two registries cannot coexist — every agent.toml watcher fire would wipe DDB-resolved peers from agentPeerMap and device.peerMap. Remove %s from this deployment, or disable the cloud-mode agent path by clearing AgentKeysTable in storage.toml",
-				fileNameAgent, s.storageConfig.Backend, fileNameAgent)
+			return fmt.Errorf("%w: agent peer registry conflict: %s exists AND cloud-mode agent peer DDB lookup is wired (storage_backend=%q, AgentKeysTable set). The two registries cannot coexist — every agent.toml watcher fire would wipe DDB-resolved peers from agentPeerMap and device.peerMap. Remove %s from this deployment, or disable the cloud-mode agent path by clearing AgentKeysTable in storage.toml",
+				errPeerRegistryConflict, fileNameAgent, s.storageConfig.Backend, fileNameAgent)
 		}
 
 		var agentPeers Peers
@@ -398,6 +400,14 @@ func (s *UdpServer) loadPeers() error {
 		}
 		log.Info("relay.toml not found, no relay peers configured")
 	} else {
+		if s.dynamicRelayRegistryConfigured() {
+			return fmt.Errorf("%w: relay peer registry conflict: %s exists AND cloud-mode relay peer DDB registry is configured "+
+				"(storage_backend=%q, RelayKeysTable set). The two registries cannot coexist — every relay.toml watcher fire would "+
+				"rebuild relayPeerMap from the file and wipe dynamically resolved relay peers from relayPeerMap and device.peerMap. "+
+				"Remove %s from this deployment, or disable the dynamic relay registry by clearing RelayKeysTable in storage.toml",
+				errPeerRegistryConflict, fileNameRelay, s.storageConfig.Backend, fileNameRelay)
+		}
+
 		var relayPeers Peers
 		if err := toml.Unmarshal(contentRelay, &relayPeers); err != nil {
 			return fmt.Errorf("failed to parse relay peer config %s: %w", fileNameRelay, err)
@@ -546,6 +556,14 @@ func (s *UdpServer) initRemoteConn() error {
 	}
 
 	return errors.New("unknown remote provider")
+}
+
+func (s *UdpServer) dynamicRelayRegistryConfigured() bool {
+	// No consumer reads RelayKeysTable yet; until the dynamic registry lands, a
+	// non-empty value is the explicit conflict signal that the registry is being wired.
+	return s.storageConfig != nil &&
+		s.storageConfig.Backend == StorageBackendDynamoDB &&
+		strings.TrimSpace(s.storageConfig.DynamoDB.RelayKeysTable) != ""
 }
 
 func (s *UdpServer) loadRemoteConfig() error {

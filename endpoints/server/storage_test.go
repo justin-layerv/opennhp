@@ -584,6 +584,9 @@ func TestDefaultStorageConfig(t *testing.T) {
 	if cfg.DynamoDB.Region != "us-east-2" {
 		t.Errorf("Expected region 'us-east-2', got '%s'", cfg.DynamoDB.Region)
 	}
+	if cfg.DynamoDB.RelayKeysTable != "" {
+		t.Errorf("Expected RelayKeysTable empty by default, got '%s'", cfg.DynamoDB.RelayKeysTable)
+	}
 	if cfg.Cache.MaxEntries != 10000 {
 		t.Errorf("Expected MaxEntries 10000, got %d", cfg.Cache.MaxEntries)
 	}
