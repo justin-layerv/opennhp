@@ -545,7 +545,7 @@ variable "qurl_link_enable_access_logs" {
 }
 
 variable "qurl_link_js_agent_enabled" {
-  description = "Upload the browser NHP JS-agent bundle to qurl.link. Prod remains false until the sandbox relay browser cutover is proven and a dedicated prod cutover PR flips it."
+  description = "Upload the browser NHP JS-agent bundle to qurl.link and relax CSP for the same-origin module plus resolve/relay fetches. Requires deploy_relay and relay_dns_name when true. Prod remains false until the sandbox relay browser cutover is proven and a dedicated prod cutover PR flips it."
   type        = bool
   default     = false
 }

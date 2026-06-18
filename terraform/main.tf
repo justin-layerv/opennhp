@@ -3318,7 +3318,12 @@ module "qurl_link" {
   acm_certificate_arn = aws_acm_certificate_validation.qurl_link[0].certificate_arn
   enable_access_logs  = var.qurl_link_enable_access_logs
   js_agent_enabled    = var.qurl_link_js_agent_enabled
-  robots_tag          = var.environment == "prod" ? null : "noindex, nofollow"
+  relay_connect_src_origin = (
+    var.qurl_link_js_agent_enabled && var.deploy_relay && var.relay_dns_name != ""
+    ? "https://${var.relay_dns_name}"
+    : null
+  )
+  robots_tag = var.environment == "prod" ? null : "noindex, nofollow"
 
   tags = merge(local.common_tags, { Service = "qurl" })
 }

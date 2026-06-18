@@ -609,7 +609,7 @@ qurl_link_external_dns    = false
 # new public host. The page still uses the legacy resolve form until #2680's
 # browser handoff flips the client-side control flow; this only makes the
 # reviewed bundle available behind the sandbox distribution and adjusts CSP
-# for that same-origin module load.
+# for that same-origin module load plus relay fetches.
 qurl_link_js_agent_enabled = true
 
 # CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)

@@ -37,6 +37,13 @@ agent from the existing same-origin `qurl.link` distribution without introducing
 a new public host; prod keeps the upload disabled until the full browser cutover
 is proven and deliberately enabled.
 
+When `js_agent_enabled` is true, Terraform also requires
+`relay_connect_src_origin` and emits a `connect-src` directive for both
+`https://resolve.<qurl-link-host>` and that relay origin. Keep the relay value
+paired with the relay DNS the browser receives from the qURL resolve contract;
+without it, the browser blocks the cutover's cross-origin resolve/fetch flow or
+the agent's `POST /relay/{serverId}` before the backend sees the request.
+
 After changing the JS agent source or bundle configuration, regenerate and copy
 the bundle from the repository root:
 

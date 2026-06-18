@@ -300,17 +300,21 @@ func TestQurlLinkFrontend_AllowlistContainsServingHost(t *testing.T) {
 	}
 }
 
-// TestQurlLinkFrontend_CSPAllowsInlineScript fences both supported halves of
-// the `script-src` posture the response_headers_policy declares:
+// TestQurlLinkFrontend_CSPAllowsInlineScript fences both supported CSP postures
+// the response_headers_policy declares:
 //
 //  1. 'unsafe-inline' is present — without it, the inline IIFE refuses
 //     to execute in any modern browser and users see the loading
 //     spinner forever.
 //  2. Envs without the browser NHP agent keep NO other sources listed: the
 //     bucket only serves the inline-script page, so same-origin .js loads
-//     stay blocked.
+//     stay blocked and connect-src falls back to default-src 'self'.
 //  3. Envs with the browser NHP agent explicitly allow 'self', matching the
 //     Terraform switch that uploads nhp-agent.min.js beside the verifier shell.
+//  4. Envs with the browser NHP agent also list the relay origin in
+//     connect-src, plus the resolve origin that hands the browser those relay
+//     inputs; otherwise the first cross-origin fetch is blocked by default-src
+//     'self' before resolve, relay, or server can see it.
 //
 // If a future PR moves to a hash- or nonce-based CSP, that PR must
 // update this assertion in lockstep.
@@ -348,6 +352,19 @@ var qurlLinkJSAgentEnabledEnvs = map[string]bool{
 	"sandbox": true,
 }
 
+// qurlLinkJSAgentNetworkOrigins mirrors the resolve.<qurl-link-host> convention
+// and the relay_dns_name Terraform input used to derive relay_connect_src_origin
+// for qurl-link. This is the full non-self browser connection set allowed by
+// CSP on the agent path; future telemetry or agent fetches to another host must
+// update Terraform and this smoke mirror together. Keep this in lockstep with
+// the env tfvars when the browser agent is enabled in another env.
+var qurlLinkJSAgentNetworkOrigins = map[string][]string{
+	"sandbox": {
+		"https://resolve.qurl.link.layerv.xyz",
+		"https://relay.qurl.link.layerv.xyz",
+	},
+}
+
 // hasRobotsNoindexMeta reports whether body contains a <meta> element that
 // carries both name="robots" and a content value including "noindex", in any
 // attribute order. RE2 lacks lookahead, so we enumerate meta tags and test the
@@ -359,6 +376,33 @@ func hasRobotsNoindexMeta(body string) bool {
 		}
 	}
 	return false
+}
+
+func cspDirectiveFields(csp, directiveName string) []string {
+	for _, directive := range strings.Split(csp, ";") {
+		fields := strings.Fields(strings.TrimSpace(directive))
+		if len(fields) > 0 && strings.EqualFold(fields[0], directiveName) {
+			return fields[1:]
+		}
+	}
+	return nil
+}
+
+func sameStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	counts := make(map[string]int, len(want))
+	for _, field := range want {
+		counts[field]++
+	}
+	for _, field := range got {
+		if counts[field] == 0 {
+			return false
+		}
+		counts[field]--
+	}
+	return true
 }
 
 func TestQurlLinkFrontend_CSPAllowsInlineScript(t *testing.T) {
@@ -380,5 +424,21 @@ func TestQurlLinkFrontend_CSPAllowsInlineScript(t *testing.T) {
 		t.Fatalf("CSP script-src directive does not match the expected %s posture. "+
 			"Either 'unsafe-inline' is missing (SPA won't execute) or the allowed script sources drifted from the env's Terraform switch. "+
 			"CSP: %q", wantPosture, csp)
+	}
+
+	connectSrc := cspDirectiveFields(csp, "connect-src")
+	if qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
+		networkOrigins := qurlLinkJSAgentNetworkOrigins[testConfig.Environment]
+		if len(networkOrigins) == 0 {
+			t.Fatalf("qurlLinkJSAgentEnabledEnvs marks env %q enabled but no network connect-src origins are configured in the smoke mirror.", testConfig.Environment)
+		}
+		wantConnectSrcFields := append([]string{"'self'"}, networkOrigins...)
+		if !sameStringSet(connectSrc, wantConnectSrcFields) {
+			t.Fatalf("CSP connect-src directive fields = %q, want set %q so the browser cutover can fetch resolve inputs and POST knocks to the relay. CSP: %q",
+				connectSrc, wantConnectSrcFields, csp)
+		}
+	} else if connectSrc != nil {
+		t.Fatalf("CSP connect-src directive is present in env %q while qurl-link JS agent is disabled; legacy qurl-link should rely on default-src 'self'. CSP: %q",
+			testConfig.Environment, csp)
 	}
 }

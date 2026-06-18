@@ -48,6 +48,17 @@ locals {
   og_image_key = "og-image.png"
   js_agent_key = "nhp-agent.min.js"
 
+  relay_connect_src_origin = var.relay_connect_src_origin == null ? "" : var.relay_connect_src_origin
+  # Mirrors frontend/index.html's RESOLVE_URL convention:
+  # https://resolve.<qurl-link-host>/plugins/qurl. The #2680 browser cutover
+  # fetches this origin for relay inputs before posting knocks to the relay.
+  # domain_name is the same lowercase DNS host used for CloudFront aliases.
+  resolve_connect_src_origin = "https://resolve.${var.domain_name}"
+  js_agent_connect_src       = join(" ", compact(["'self'", local.resolve_connect_src_origin, local.relay_connect_src_origin]))
+  legacy_csp                 = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+  js_agent_csp               = "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'; connect-src ${local.js_agent_connect_src}"
+  content_security_policy    = var.js_agent_enabled ? local.js_agent_csp : local.legacy_csp
+
   static_invalidation_paths = concat(
     ["/", "/index.html", "/robots.txt"],
     [for key in local.favicon_keys : "/${key}"],
@@ -270,15 +281,19 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
       # allowlist — so restricting form-action here breaks the post-resolve
       # redirect. Auth is gated by the NHP knock (source-IP firewall open) plus
       # the qurl-router authorize check at the resource host, not by this CSP.
-      # script-src omits 'self' on purpose: the bucket only ever serves
-      # this one inline-script page, so disallowing same-origin .js
-      # loads is the tighter, accurate posture. The sandbox relay cutover is the
+      # script-src omits 'self' on purpose in the legacy path: the bucket only
+      # ever serves this one inline-script page, so disallowing same-origin .js
+      # loads is the tighter, accurate posture. The relay browser cutover is the
       # exception: js_agent_enabled uploads the browser NHP agent as a same-origin
       # module, so 'self' is added only while that bundle is intentionally served.
+      # connect-src is likewise explicit only for the agent path: the cutover
+      # fetches the cross-origin resolve endpoint for relay inputs and the
+      # bundled agent fetches the cross-origin relay over HTTPS. default-src
+      # 'self' would otherwise block the first real in-browser cutover request.
       # style-src keeps 'unsafe-inline' because the marketing rows use
       # inline style attributes for per-card CSS custom properties, and the
       # no-JS verifier fallback keeps its state flip in a noscript style.
-      content_security_policy = var.js_agent_enabled ? "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'" : "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+      content_security_policy = local.content_security_policy
       override                = true
     }
     strict_transport_security {
@@ -297,6 +312,13 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
     referrer_policy {
       referrer_policy = "strict-origin-when-cross-origin"
       override        = true
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = !var.js_agent_enabled || local.relay_connect_src_origin != ""
+      error_message = "js_agent_enabled requires relay_connect_src_origin so qurl.link CSP permits browser relay fetches. Root callers derive that origin from deploy_relay=true and relay_dns_name; set both before enabling qurl_link_js_agent_enabled."
     }
   }
 }

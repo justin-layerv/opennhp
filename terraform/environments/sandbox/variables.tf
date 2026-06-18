@@ -362,7 +362,7 @@ variable "qurl_link_enable_access_logs" {
 }
 
 variable "qurl_link_js_agent_enabled" {
-  description = "Upload the browser NHP JS-agent bundle to qurl.link for sandbox relay cutover staging (#2208/#2680)."
+  description = "Upload the browser NHP JS-agent bundle to qurl.link and relax CSP for the same-origin module plus resolve/relay fetches during sandbox relay cutover staging (#2208/#2680). Requires deploy_relay and relay_dns_name when true."
   type        = bool
   default     = false
 }

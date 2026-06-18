@@ -80,7 +80,7 @@ Ported incrementally, each step its own PR:
      server/relay-side **grace window** that would avoid that is a separate
      follow-up. No Go fence — pure browser orchestration; the load-bearing tests
      are the foreground-recovery and single-flight paths.
-6. **Bundling (this PR)** — `npm run bundle` (esbuild) emits one self-contained
+6. **Bundling** — `npm run bundle` (esbuild) emits one self-contained
    ESM file, `dist/nhp-agent.min.js` (~23 KB gzipped), with the `@noble` suite
    inlined, for the qurl.link page to load as a same-origin
    `<script type="module" src>`. This is the Phase-1 packaging deliverable of
@@ -89,13 +89,14 @@ Ported incrementally, each step its own PR:
    (Phase-2 #6, which also needs the relay deployed first). `test/bundle.test.ts`
    gates the gzip budget and the runtime public-export surface via esbuild's
    metafile (no execution — node has no DOM; that end-to-end seam is #2616).
-   **Phase-2 prerequisites:** (1) the qurl-link CloudFront CSP is
-   `script-src 'unsafe-inline'` today (no `'self'`), so mounting the external
-   module needs `'self'` added to `script-src` in
-   `terraform/modules/qurl-link/main.tf` — a deliberately separate change; and
-   (2) pin the artifact with **Subresource Integrity** (`integrity="sha384-…"` on
-   the `<script>` + a matching CSP hash-source), not just `'self'` — the bundle is
-   built on demand and uncommitted, so for a crypto agent that gates resource
+   The qurl-link Terraform module now relaxes CSP only when the bundle is
+   intentionally served: `script-src` gains `'self'` for the same-origin module,
+   and `connect-src` gains the resolve and relay origins so browser `fetch` calls
+   for relay inputs and `POST /relay/{serverId}` are not blocked by
+   `default-src 'self'`. The remaining
+   Phase-2 page-migration prerequisite is tracked in #2700: pin the artifact with **Subresource
+   Integrity** (`integrity="sha384-…"` on the `<script>` + a matching CSP
+   hash-source), not just `'self'` — for a crypto agent that gates resource
    access, pinning the exact bytes beats trusting the origin. The SRI hash is only
    reproducible if the bundler is pinned: the lockfile is authoritative for
    `npm ci`, but esbuild's `^` floats on a bare `npm install`, and a bundler bump

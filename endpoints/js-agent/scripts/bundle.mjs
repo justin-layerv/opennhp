@@ -5,10 +5,9 @@
 // that the qurl.link page loads as a same-origin `<script type="module" src>`.
 //
 // This is the Phase-1 packaging deliverable of #2208; it is *consumed* by the
-// Phase-2 page migration (Phase-2 #6), not wired here. Note for Phase-2: the
-// qurl-link CloudFront CSP is `script-src 'unsafe-inline'` today (no `'self'`),
-// so loading this external module needs `'self'` added to `script-src` in
-// terraform/modules/qurl-link/main.tf — a deliberately separate change.
+// Phase-2 page migration (Phase-2 #6), not wired here. The qurl-link Terraform
+// module deliberately adds `script-src 'self'` and resolve/relay `connect-src`
+// only while this bundle is enabled.
 //
 // `bundle.test.ts` imports the same options so the test verifies the exact
 // production build (in-memory, via esbuild's metafile — no execution, since the

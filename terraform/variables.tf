@@ -695,7 +695,7 @@ variable "qurl_link_enable_access_logs" {
 }
 
 variable "qurl_link_js_agent_enabled" {
-  description = "Upload the browser NHP JS-agent bundle to the qurl.link static site and relax the qurl-link CSP to allow same-origin script loads. Sandbox enables this for #2208/#2680 relay cutover staging; prod must remain false until a dedicated prod cutover PR."
+  description = "Upload the browser NHP JS-agent bundle to the qurl.link static site and relax the qurl-link CSP to allow the same-origin module plus resolve/relay fetches. Requires deploy_relay and relay_dns_name when true. Sandbox enables this for #2208/#2680 relay cutover staging; prod must remain false until a dedicated prod cutover PR."
   type        = bool
   default     = false
 }
