@@ -39,11 +39,12 @@ package smoke
 //
 // Cache window: terraform_data.qurl_link_invalidation (root) blocks
 // apply on `aws cloudfront wait invalidation-completed`, so by the
-// time smoke runs the new bytes are live at every CF edge. The
-// stale-cache race that motivated the original caveat (filed as
-// #1843) is now closed structurally, not operationally. If a future
-// change tears out the invalidation, this caveat returns — re-add a
-// doc note when that happens.
+// time smoke runs the new bytes are live at every CF edge. CloudFront
+// response-header policy changes have their own propagation path; the
+// sandbox deploy workflow polls the live CSP before this smoke suite
+// runs so CSP-only drift fails at the deploy gate, not as a late smoke
+// surprise. If a future change tears out either guard, re-add the
+// corresponding cache/propagation caveat here.
 
 import (
 	"bytes"
@@ -330,11 +331,13 @@ var (
 	// the "both attributes present, any order" check can't live in a single
 	// pattern — instead we enumerate <meta> elements (metaTagRE) and test
 	// each for the two attributes independently (see hasRobotsNoindexMeta).
-	metaTagRE                     = regexp.MustCompile(`(?is)<meta\b[^>]*>`)
-	robotsNameAttrRE              = regexp.MustCompile(`(?i)\bname=["']robots["']`)
-	noindexContentAttrRE          = regexp.MustCompile(`(?i)\bcontent=["'][^"']*noindex`)
-	staticBodyClassAttrRE         = regexp.MustCompile(`(?is)<body\b[^>]*\bclass=["']([^"']*)["'][^>]*>`)
-	scriptSrcOnlyInlineRE         = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s*(?:;|$)`)
+	metaTagRE             = regexp.MustCompile(`(?is)<meta\b[^>]*>`)
+	robotsNameAttrRE      = regexp.MustCompile(`(?i)\bname=["']robots["']`)
+	noindexContentAttrRE  = regexp.MustCompile(`(?i)\bcontent=["'][^"']*noindex`)
+	staticBodyClassAttrRE = regexp.MustCompile(`(?is)<body\b[^>]*\bclass=["']([^"']*)["'][^>]*>`)
+	scriptSrcOnlyInlineRE = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s*(?:;|$)`)
+	// Keep this directive-level posture in lockstep with build-and-push.yml's
+	// qurl.link CSP propagation gate.
 	scriptSrcInlineAndSelfRE      = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s+'self'\s*(?:;|$)`)
 	reducedMotionScrollBehaviorRE = regexp.MustCompile(
 		`(?is)@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)\s*\{[^{}]*html\s*\{[^{}]*scroll-behavior\s*:\s*auto\s*;`,

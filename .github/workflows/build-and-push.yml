@@ -1589,6 +1589,38 @@ jobs:
         run: ./scripts/check-redirect-url-drift.sh
 
   # ============================================================================
+  # QURL CSP GATE DRIFT LINT (PR)
+  # Static fence between the sandbox deploy gate's qurl.link CSP regex and the
+  # smoke suite's post-deploy CSP regex. The deploy gate absorbs CloudFront
+  # response-header-policy propagation; the smoke suite verifies the same
+  # contract on the wire.
+  # ============================================================================
+  qurl-csp-gate-drift-lint:
+    name: qURL CSP Gate Drift Lint (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+
+      - name: Shellcheck the CSP drift script and fixture runner
+        run: |
+          shellcheck ./scripts/check-qurl-csp-gate-drift.sh
+          shellcheck ./scripts/parse-qurl-csp-probe-output.sh
+          shellcheck ./tests/lints/qurl-csp-gate-drift/run-fixtures.sh
+
+      - name: Run qurl.link CSP gate drift fixture suite
+        run: ./tests/lints/qurl-csp-gate-drift/run-fixtures.sh
+
+      - name: Check qurl.link CSP gate drift
+        run: ./scripts/check-qurl-csp-gate-drift.sh
+
+  # ============================================================================
   # QURL LINK SOCIAL CARD LINT (PR)
   # Static PR-time fence for the generated qurl.link social preview PNG. The
   # smoke suite verifies the deployed origin; this catches a committed image
@@ -2561,6 +2593,14 @@ jobs:
     # is still loud: deploy-sandbox-qurl goes red and is in notify's
     # DEPLOY_FAILED loop. Only `cancelled` (indeterminate/half-rolled, run being
     # torn down) skips validation.
+    # The qurl.link CSP propagation gate below follows the same rule. It is a
+    # CloudFront/S3 contract, not a qurl ECS roll contract, and should still
+    # pass quickly on skipped or rolled-back qurl-service deploys while keeping
+    # the smoke handoff from seeing stale response-header-policy state.
+    # A permanent qurl.link CSP/origin break is left to the strict smoke suite
+    # as the hard failure so unrelated smoke coverage still runs. This validate
+    # job only waits out the common CloudFront policy propagation window before
+    # handing off to smoke.
     #
     # deploy-sandbox-relay is deliberately NOT in needs here. As of #2646
     # deploy-relay.sh polls its instance refresh to completion and FAILS LOUD on
@@ -2580,7 +2620,14 @@ jobs:
       needs.deploy-sandbox-qurl.result != 'cancelled'
     runs-on: ubuntu-latest
     environment: sandbox
-    timeout-minutes: 10
+    # Overall budget covers the existing validation/integration/E2E phases plus
+    # the bounded CSP propagation wait. Individual long-running run steps also
+    # carry step-level timeouts so a hang in pre-existing validation does not
+    # inherit the full CSP propagation budget. The remaining headroom is for
+    # checkout, AWS setup, SSM reads, and summary steps.
+    timeout-minutes: 60
+    outputs:
+      qurl_link_url: ${{ steps.qurl-domain-sandbox.outputs.qurl_link_url }}
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -2592,6 +2639,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Post-Deployment Validation
+        timeout-minutes: 6
         run: |
           echo "============================================"
           echo "POST-DEPLOYMENT VALIDATION"
@@ -2616,6 +2664,7 @@ jobs:
             endpoints/go.sum
 
       - name: Run Integration Tests
+        timeout-minutes: 7
         env:
           NHP_SERVER_ENDPOINT: "${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}:62206"
           ETCD_ENDPOINTS: ${{ needs.deploy-sandbox-infra.outputs.etcd_endpoint }}
@@ -2659,6 +2708,7 @@ jobs:
           echo "Using QURL link URL: $QURL_LINK_URL"
 
       - name: Run E2E Tests (Demo Flow)
+        timeout-minutes: 7
         env:
           CONSOLE_API_URL: "https://home.secure.layerv.xyz"
           LOGIN_PORTAL_DOMAIN: ${{ steps.qurl-domain-sandbox.outputs.login_portal_domain }}
@@ -2680,6 +2730,70 @@ jobs:
           go test -v -tags=e2e -timeout 5m ./... 2>&1 || {
             echo "::warning::Some E2E tests failed - see output above"
           }
+
+      # This stays after the independent E2E step so CloudFront policy
+      # propagation gets that E2E runtime to converge before the bounded CSP
+      # wait starts. On a permanent qurl.link break, this spends the E2E time
+      # before warning, but normal deploys avoid waiting while propagation is
+      # already complete.
+      - name: Wait for qURL link CSP propagation
+        timeout-minutes: 22
+        env:
+          QURL_LINK_URL: ${{ steps.qurl-domain-sandbox.outputs.qurl_link_url }}
+          EXPECTED_SCRIPT_SRC_RE: "(^|;[[:space:]]*)script-src[[:space:]]+'unsafe-inline'[[:space:]]+'self'([[:space:]]*;|[[:space:]]*$)"
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for qurl.link CloudFront script-src propagation at $QURL_LINK_URL"
+          echo "Retry budget: 60 attempts, 15 seconds between attempts, 5 seconds max per curl probe."
+          echo "Step timeout must stay above the retry budget: 59*15s sleeps plus 60*5s probes is about 20 minutes."
+          LAST_CSP="<missing>"
+          LAST_CURL_EXIT=0
+          LAST_HTTP_STATUS=000
+          PROBE_URL="${QURL_LINK_URL%/}/"
+
+          # Keep this directive-level check aligned with
+          # tests/smoke/16_qurl_link_frontend_test.go::scriptSrcInlineAndSelfRE.
+          # This validate job is sandbox-only, so the expected posture is the
+          # sandbox qurl_link_js_agent_enabled=true posture. If sandbox flips
+          # that tfvar, update this gate and qurlLinkJSAgentEnabledEnvs in the
+          # same PR.
+          # QURL_LINK_URL normally comes from SSM, which is the live deploy
+          # source of truth. deploy-sandbox-validate exposes that resolved
+          # value to nhp-smoke-sandbox as QURL_LINK_ORIGIN so this gate and
+          # smoke probe the same origin. Its hardcoded fallback must stay
+          # aligned with the smoke sandbox QURLLinkOrigin default for manual
+          # smoke runs or missing-SSM fallback paths.
+          # scripts/check-qurl-csp-gate-drift.sh fences the static couplings
+          # at PR time.
+          for attempt in $(seq 1 60); do
+            if [[ "$attempt" -gt 1 ]]; then
+              sleep 15
+            fi
+
+            CURL_EXIT=0
+            CURL_OUTPUT=$(curl --connect-timeout 5 --max-time 5 -sS -o /dev/null -D - -w '\n__nhp_http_status__:%{http_code}\n' "$PROBE_URL" 2>&1) || CURL_EXIT=$?
+            PARSED_PROBE=$(printf '%s\n' "$CURL_OUTPUT" | ./scripts/parse-qurl-csp-probe-output.sh)
+            HTTP_STATUS=$(sed -n 's/^http_status=//p' <<<"$PARSED_PROBE")
+            CSP=$(sed -n 's/^csp=//p' <<<"$PARSED_PROBE")
+            LAST_CSP="${CSP:-<missing>}"
+            LAST_CURL_EXIT="$CURL_EXIT"
+            LAST_HTTP_STATUS="$HTTP_STATUS"
+
+            if grep -qiE "$EXPECTED_SCRIPT_SRC_RE" <<<"$CSP"; then
+              echo "qurl.link CSP propagated after attempt $attempt."
+              exit 0
+            fi
+
+            echo "Attempt $attempt/60: curl_exit=$LAST_CURL_EXIT http_status=$LAST_HTTP_STATUS CSP is $LAST_CSP; waiting for script-src 'unsafe-inline' 'self'"
+          done
+
+          if [[ "$LAST_CURL_EXIT" -ne 0 ]]; then
+            echo "::warning::qurl.link CSP probe could not reach $PROBE_URL after 60 bounded attempts; last curl_exit: $LAST_CURL_EXIT; last http_status: $LAST_HTTP_STATUS; last observed CSP: $LAST_CSP"
+          else
+            echo "::warning::qurl.link CSP did not propagate to the expected sandbox js-agent posture after 60 bounded attempts; last http_status: $LAST_HTTP_STATUS; last observed CSP: $LAST_CSP"
+          fi
+          echo "Continuing so the full smoke suite still runs; TestQurlLinkFrontend_CSPAllowsInlineScript remains the hard CSP gate."
 
       - name: Deployment Summary
         run: |
@@ -2765,6 +2879,7 @@ jobs:
       environment: sandbox
       tier: all
       allow_ssm_probes: true
+      qurl_link_origin: ${{ needs.deploy-sandbox-validate.outputs.qurl_link_url }}
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
 

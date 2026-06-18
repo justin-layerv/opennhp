@@ -37,6 +37,11 @@ on:
         required: false
         type: string
         default: 'us-east-2'
+      qurl_link_origin:
+        description: 'Optional qurl.link origin override resolved by the caller'
+        required: false
+        type: string
+        default: ''
     secrets:
       AWS_ROLE_ARN:
         required: true
@@ -165,6 +170,7 @@ jobs:
           AUTH0_CLIENT_SECRET: ${{ steps.auth0.outputs.client_secret }}
           AWS_REGION: ${{ inputs.aws_region }}
           NHP_SMOKE_ALLOW_SSM_PROBES: ${{ inputs.allow_ssm_probes }}
+          QURL_LINK_ORIGIN: ${{ inputs.qurl_link_origin }}
           # Both sandbox and prod have the qurl-service internal ALB
           # wired (qurl-service #335 rollout, PRs #1588/#1596/#1608/
           # #1628/#1635). The 07_/08_/09_ tests gate on this flag via

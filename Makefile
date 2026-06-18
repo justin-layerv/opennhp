@@ -208,7 +208,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-redirect-url-drift lint-qurl-link-og-image lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns
+lint: lint-redirect-url-drift lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
@@ -267,6 +267,23 @@ lint-redirect-url-drift:
 	@./tests/lints/redirect-url-drift/run-fixtures.sh
 	@./scripts/check-redirect-url-drift.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] redirect_url drift check passed!$(END_COLOUR)"
+
+# Fence qurl.link CSP propagation wait drift from the smoke assertion it is
+# trying to de-flake. Wired into `make lint` so local runs catch a one-sided
+# workflow/smoke/tfvar/origin edit before CI.
+# CI runs the same script + fixtures in `qurl-csp-gate-drift-lint` in
+# build-and-push.yml.
+.PHONY: lint-qurl-csp-gate-drift
+lint-qurl-csp-gate-drift:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking qurl.link CSP gate drift...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/check-qurl-csp-gate-drift.sh scripts/parse-qurl-csp-probe-output.sh tests/lints/qurl-csp-gate-drift/run-fixtures.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@./tests/lints/qurl-csp-gate-drift/run-fixtures.sh
+	@./scripts/check-qurl-csp-gate-drift.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] qurl.link CSP gate drift check passed!$(END_COLOUR)"
 
 # Fence the decision tree of scripts/run-fuzz.sh (#1653). The wrapper
 # is the only thing distinguishing a real Go-fuzz crasher from the
