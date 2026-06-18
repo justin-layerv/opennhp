@@ -209,6 +209,16 @@ locals {
     Repository  = "layervai/nhp"
     Service     = "shared"
   })
+  status_page_server_alarm_prefixes = compact([
+    "${local.name_prefix}-${var.cell_id}",
+    var.enable_blue_green ? "${local.name_prefix}-green-" : "",
+    var.deploy_relay ? "${local.name_prefix}-srv-int-" : "",
+    var.enable_canary_deployment ? "${local.name_prefix}-canary-server-" : "",
+  ])
+  status_page_ac_alarm_prefixes = compact([
+    var.deploy_ac ? "${local.name_prefix}-ac-" : "",
+    var.enable_canary_deployment && var.deploy_ac ? "${local.name_prefix}-canary-ac-" : "",
+  ])
 
   # CloudFront ↔ NHP server keep-alive contract values. The
   # `terraform_data.http_keepalive_contract` resource carries
@@ -951,26 +961,11 @@ module "status_page" {
   ]) : []
 
   # Monitoring
-  alarm_name_prefix = "${local.name_prefix}-${var.cell_id}"
-  sns_topic_arn     = module.monitoring.sns_topic_arn
-  logs_kms_key_arn  = module.kms.logs_key_arn
-  ssm_prefix        = "/${var.environment}/nhp"
-
-  # Metrics & ASG
-  server_nlb_arn_suffix = module.compute.nlb_arn_suffix
-  ac_nlb_arn_suffix     = var.deploy_ac ? module.ac[0].nlb_arn_suffix : ""
-  server_asg_name       = module.compute.asg_name
-  ac_asg_name           = var.deploy_ac ? module.ac[0].asg_name : ""
-  grafana_dashboard_url = var.grafana_dashboards_enabled && var.grafana_cloudwatch_enabled && var.grafana_create_dashboards ? module.grafana_dashboards[0].nhp_infrastructure_dashboard_url : var.grafana_nhp_dashboard_url
-
-  # Deployment model
-  deployment_model       = var.enable_canary_deployment ? "canary" : "blue_green"
-  canary_state_ssm_param = var.enable_canary_deployment ? module.canary_deployment[0].ssm_canary_state_parameter : ""
-
-  # Dependent services
-  dependent_service_urls = var.qurl_service_domain != null ? {
-    qurl_api = "https://${var.qurl_service_domain}/health/ready"
-  } : {}
+  server_alarm_prefixes = local.status_page_server_alarm_prefixes
+  ac_alarm_prefixes     = local.status_page_ac_alarm_prefixes
+  alarm_name_prefixes   = concat(local.status_page_server_alarm_prefixes, local.status_page_ac_alarm_prefixes)
+  sns_topic_arn         = module.monitoring.sns_topic_arn
+  logs_kms_key_arn      = module.kms.logs_key_arn
 
   # NHP Authentication (dogfooding)
   enable_nhp_auth   = var.status_page_nhp_auth_enabled

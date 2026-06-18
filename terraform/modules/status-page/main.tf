@@ -1,7 +1,7 @@
 # Status Page Module
 #
-# Deploys a status page for NHP deployment visibility:
-# - Lambda function aggregates status from SSM, ELB, CloudWatch
+# Deploys a public status page for NHP availability visibility:
+# - Lambda function aggregates redacted status from ELB and CloudWatch
 # - API Gateway (HTTP API) exposes the Lambda as a REST endpoint
 # - S3 + CloudFront hosts the static frontend
 # - Optional Route53 record for custom domain
@@ -30,9 +30,14 @@ locals {
   bucket_name = "${var.name_prefix}-status-page-${data.aws_caller_identity.current.account_id}"
   has_domain  = var.status_domain != null && var.acm_certificate_arn != null
   frontend_content = templatefile("${path.module}/frontend/index.html", {
-    api_url               = "${aws_apigatewayv2_stage.default.invoke_url}/status"
-    grafana_dashboard_url = var.grafana_dashboard_url
+    api_url = "${aws_apigatewayv2_stage.default.invoke_url}/status"
   })
+  status_target_group_arns = distinct(compact(concat(var.server_nlb_tg_arns, var.ac_nlb_tg_arns)))
+  # No configured target groups means the Lambda makes no ELB calls; the wildcard
+  # fallback keeps the IAM JSON valid for that inert module-default case.
+  status_target_health_resources = length(local.status_target_group_arns) > 0 ? local.status_target_group_arns : [
+    "*"
+  ]
 
   # NHP auth: CloudFront Function code with QURL URL and cookie name injected
   nhp_auth_function_code = var.enable_nhp_auth ? templatefile(
@@ -68,19 +73,12 @@ resource "aws_lambda_function" "status_aggregator" {
 
   environment {
     variables = {
-      ENVIRONMENT            = var.environment
-      SSM_PREFIX             = var.ssm_prefix
-      SERVER_NLB_TG_ARNS     = join(",", var.server_nlb_tg_arns)
-      AC_NLB_TG_ARNS         = join(",", var.ac_nlb_tg_arns)
-      ALARM_NAME_PREFIX      = var.alarm_name_prefix
-      SERVER_NLB_ARN_SUFFIX  = var.server_nlb_arn_suffix
-      AC_NLB_ARN_SUFFIX      = var.ac_nlb_arn_suffix
-      SERVER_ASG_NAME        = var.server_asg_name
-      AC_ASG_NAME            = var.ac_asg_name
-      DEPLOYMENT_MODEL       = var.deployment_model
-      CANARY_STATE_SSM_PARAM = var.canary_state_ssm_param
-      DEPENDENT_SERVICE_URLS = jsonencode(var.dependent_service_urls)
-      SSL_CERT_ARNS          = jsonencode(var.ssl_cert_arns)
+      ENVIRONMENT           = var.environment
+      SERVER_NLB_TG_ARNS    = join(",", var.server_nlb_tg_arns)
+      AC_NLB_TG_ARNS        = join(",", var.ac_nlb_tg_arns)
+      ALARM_NAME_PREFIXES   = join(",", var.alarm_name_prefixes)
+      SERVER_ALARM_PREFIXES = join(",", var.server_alarm_prefixes)
+      AC_ALARM_PREFIXES     = join(",", var.ac_alarm_prefixes)
     }
   }
 
@@ -140,21 +138,12 @@ resource "aws_iam_role_policy" "status_aggregator" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "ReadSSMParameters"
-        Effect = "Allow"
-        Action = ["ssm:GetParameters", "ssm:GetParameter"]
-        Resource = [
-          "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_prefix}/*",
-          "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter/${var.environment}/nhp/*/canary/*",
-        ]
-      },
-      {
         Sid    = "DescribeTargetHealth"
         Effect = "Allow"
         Action = [
           "elasticloadbalancing:DescribeTargetHealth"
         ]
-        Resource = "*"
+        Resource = local.status_target_health_resources
         Condition = {
           StringEquals = {
             "aws:RequestedRegion" = data.aws_region.current.id
@@ -174,40 +163,6 @@ resource "aws_iam_role_policy" "status_aggregator" {
           }
         }
       },
-      {
-        Sid    = "GetMetricData"
-        Effect = "Allow"
-        Action = [
-          "cloudwatch:GetMetricData"
-        ]
-        Resource = "*"
-        Condition = {
-          StringEquals = {
-            "aws:RequestedRegion" = data.aws_region.current.id
-          }
-        }
-      },
-      {
-        Sid    = "DescribeASGs"
-        Effect = "Allow"
-        Action = [
-          "autoscaling:DescribeAutoScalingGroups"
-        ]
-        Resource = "*"
-        Condition = {
-          StringEquals = {
-            "aws:RequestedRegion" = data.aws_region.current.id
-          }
-        }
-      },
-      {
-        Sid    = "DescribeACMCertificates"
-        Effect = "Allow"
-        Action = [
-          "acm:DescribeCertificate"
-        ]
-        Resource = "arn:aws:acm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:certificate/*"
-      }
     ]
   })
 }
