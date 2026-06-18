@@ -144,6 +144,7 @@ def build_fixture(root: Path) -> None:
 
           environment                  = var.environment
           cell_id                      = var.cell_id
+          server_log_group_name        = module.compute.log_group_name
           server_stderr_log_group_name = module.compute.log_group_stderr_name
           name_prefix                  = local.name_prefix
           chatbot_owned_externally     = var.chatbot_owned_externally
@@ -167,11 +168,24 @@ def build_fixture(root: Path) -> None:
             resource "aws_sns_topic" "alerts" {}
 
             resource "aws_cloudwatch_log_metric_filter" "server_panic" {}
+            resource "aws_cloudwatch_log_metric_filter" "server_async_runtime_panic" {
+              pattern = "\\"msgToPacketRoutine\\" \\"runtime panic encountered\\""
+            }
 
             resource "aws_cloudwatch_metric_alarm" "server_panic" {
               alarm_actions             = [aws_sns_topic.alerts.arn]
               ok_actions                = [aws_sns_topic.alerts.arn]
               insufficient_data_actions = [aws_sns_topic.alerts.arn]
+            }
+
+            resource "aws_cloudwatch_metric_alarm" "server_async_runtime_panic" {
+              alarm_actions = [aws_sns_topic.alerts.arn]
+              ok_actions    = [aws_sns_topic.alerts.arn]
+            }
+
+            resource "aws_cloudwatch_metric_alarm" "server_forward_target_drop" {
+              alarm_actions = [aws_sns_topic.alerts.arn]
+              ok_actions    = [aws_sns_topic.alerts.arn]
             }
 
             resource "aws_cloudwatch_metric_alarm" "server_instance_restart" {
@@ -203,6 +217,16 @@ def build_fixture(root: Path) -> None:
             {Name: aws.String("Cell"), Value: aws.String(cellID)},
           }
         }
+        """,
+    )
+    write(
+        root / "nhp" / "core" / "errors.go",
+        """
+        package core
+
+        var (
+          ErrRuntimePanic = newError(errNhpSdkRuntimePanic, "runtime panic encountered")
+        )
         """,
     )
     write(
@@ -270,6 +294,10 @@ def build_fixture(root: Path) -> None:
     write(
         root / "terraform" / "modules" / "compute" / "outputs.tf",
         """
+        output "log_group_name" {
+          value = aws_cloudwatch_log_group.server.name
+        }
+
         output "log_group_stderr_name" {
           value = aws_cloudwatch_log_group.server_stderr.name
         }
@@ -521,6 +549,24 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertIn("prod/main.tf", result.stderr)
         self.assertIn("deploy_relay", result.stderr)
 
+    def test_missing_root_structured_log_wiring_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            main_tf = root / "terraform" / "main.tf"
+            main_tf.write_text(
+                main_tf.read_text(encoding="utf-8").replace(
+                    "  server_log_group_name        = module.compute.log_group_name\n",
+                    "",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server_log_group_name", result.stderr)
+
     def test_monitoring_module_count_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -688,6 +734,100 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertIn("server_panic", result.stderr)
         self.assertIn("alarm_actions", result.stderr)
 
+    def test_missing_async_runtime_panic_filter_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    textwrap.dedent(
+                        """
+                    resource "aws_cloudwatch_log_metric_filter" "server_async_runtime_panic" {
+                      pattern = "\\"msgToPacketRoutine\\" \\"runtime panic encountered\\""
+                    }
+                    """
+                    ).lstrip(),
+                    "",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server_async_runtime_panic", result.stderr)
+
+    def test_async_runtime_panic_filter_pattern_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    '\\"msgToPacketRoutine\\"',
+                    '\\"msgPacketRoutine\\"',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server_async_runtime_panic", result.stderr)
+        self.assertIn("pattern", result.stderr)
+
+    def test_async_runtime_panic_go_message_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            errors_go = root / "nhp" / "core" / "errors.go"
+            errors_go.write_text(
+                errors_go.read_text(encoding="utf-8").replace(
+                    "runtime panic encountered",
+                    "runtime panic renamed",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ErrRuntimePanic", result.stderr)
+        self.assertIn("runtime panic encountered", result.stderr)
+
+    def test_forward_target_drop_alarm_routing_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    textwrap.dedent(
+                        """
+                    resource "aws_cloudwatch_metric_alarm" "server_forward_target_drop" {
+                      alarm_actions = [aws_sns_topic.alerts.arn]
+                      ok_actions    = [aws_sns_topic.alerts.arn]
+                    }
+                    """
+                    ).lstrip(),
+                    textwrap.dedent(
+                        """
+                    resource "aws_cloudwatch_metric_alarm" "server_forward_target_drop" {
+                      ok_actions    = [aws_sns_topic.alerts.arn]
+                    }
+                    """
+                    ).lstrip(),
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server_forward_target_drop", result.stderr)
+        self.assertIn("alarm_actions", result.stderr)
+
     def test_ac_registration_stale_action_wiring_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -730,6 +870,25 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("log_group_stderr_name", result.stderr)
         self.assertIn("aws_cloudwatch_log_group.server_stderr.name", result.stderr)
+
+    def test_compute_structured_log_output_wiring_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            compute_outputs = root / "terraform" / "modules" / "compute" / "outputs.tf"
+            compute_outputs.write_text(
+                compute_outputs.read_text(encoding="utf-8").replace(
+                    "  value = aws_cloudwatch_log_group.server.name\n",
+                    "  value = aws_cloudwatch_log_group.server_stderr.name\n",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("log_group_name", result.stderr)
+        self.assertIn("aws_cloudwatch_log_group.server.name", result.stderr)
 
     def test_ac_cloudwatch_alarm_default_false_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

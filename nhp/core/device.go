@@ -234,6 +234,9 @@ func (d *Device) msgToPacketRoutine(id int) {
 					if x := recover(); x != nil {
 						recovered := fmt.Errorf("!!!recovered from panic: %v\n%s", x, string(debug.Stack()))
 						err = ErrRuntimePanic.WithExtra(recovered)
+						// Keep "msgToPacketRoutine" plus ErrRuntimePanic's
+						// message text in this line; Terraform's
+						// server-async-runtime-panic log filter keys on both.
 						log.Error("msgToPacketRoutine %d: [%s] recovered from panic: %v", id, msgType, err)
 					}
 					if err != nil {

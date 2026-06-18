@@ -96,6 +96,10 @@ RELAY_SINGLE_EVENT_ALARM_NAMES = (
     "relay_shedding",
     "relay_shedding_unknown_environment",
 )
+ASYNC_RUNTIME_PANIC_MESSAGE = "runtime panic encountered"
+ASYNC_RUNTIME_PANIC_FILTER_PATTERN = (
+    r'"\"msgToPacketRoutine\" \"runtime panic encountered\""'
+)
 
 
 def _repo_root() -> Path:
@@ -395,6 +399,18 @@ def require_go_function_text(path: Path, function: str, needle: str, reason: str
     raise LintError(f"{path}: {function}: missing `{needle}` ({reason})")
 
 
+def go_new_error_message(path: Path, name: str) -> str:
+    text = _read(path)
+    pattern = (
+        rf'(?ms)^[ \t]*{re.escape(name)}[ \t]*=[ \t]*'
+        r'newError\([^,]+,[ \t]*"(?P<message>[^"]+)"\)'
+    )
+    match = re.search(pattern, text)
+    if not match:
+        raise LintError(f"{path}: missing Go error message for `{name}`")
+    return match.group("message")
+
+
 def list_assignment(block: HclBlock, key: str) -> tuple[str, ...] | None:
     # Terraform fmt canonicalizes the lists this lint pins to the multi-line
     # form below.
@@ -571,6 +587,11 @@ def check_root_module(repo: Path) -> None:
     require_assignment(monitoring, "cell_id", "var.cell_id")
     require_assignment(
         monitoring,
+        "server_log_group_name",
+        "module.compute.log_group_name",
+    )
+    require_assignment(
+        monitoring,
         "server_stderr_log_group_name",
         "module.compute.log_group_stderr_name",
     )
@@ -598,6 +619,7 @@ def check_shared_resources(repo: Path) -> None:
     relay_user_data = repo / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
     server_udp = repo / "endpoints" / "server" / "udpserver.go"
     relay_go = repo / "endpoints" / "relay" / "relay.go"
+    core_errors = repo / "nhp" / "core" / "errors.go"
 
     alerts_topic = find_block(monitoring_main, 'resource "aws_sns_topic"', "alerts")
     for key in ("count", "for_each"):
@@ -609,18 +631,56 @@ def check_shared_resources(repo: Path) -> None:
 
     require_resource(compute_main, "aws_cloudwatch_log_group", "server_stderr")
     require_assignment(
+        find_block(compute_outputs, "output", "log_group_name"),
+        "value",
+        "aws_cloudwatch_log_group.server.name",
+    )
+    require_assignment(
         find_block(compute_outputs, "output", "log_group_stderr_name"),
         "value",
         "aws_cloudwatch_log_group.server_stderr.name",
     )
 
     require_resource(monitoring_main, "aws_cloudwatch_log_metric_filter", "server_panic")
+    async_panic_filter = find_block(
+        monitoring_main,
+        'resource "aws_cloudwatch_log_metric_filter"',
+        "server_async_runtime_panic",
+    )
+    async_runtime_panic_message = go_new_error_message(core_errors, "ErrRuntimePanic")
+    if async_runtime_panic_message != ASYNC_RUNTIME_PANIC_MESSAGE:
+        raise LintError(
+            f"{core_errors}: ErrRuntimePanic message is "
+            f"`{async_runtime_panic_message}`, want `{ASYNC_RUNTIME_PANIC_MESSAGE}` "
+            "(CloudWatch server_async_runtime_panic filter depends on this string)"
+        )
+    require_assignment(
+        async_panic_filter,
+        "pattern",
+        ASYNC_RUNTIME_PANIC_FILTER_PATTERN,
+    )
     require_alarm_actions(
         find_block(
             monitoring_main, 'resource "aws_cloudwatch_metric_alarm"', "server_panic"
         ),
         "[aws_sns_topic.alerts.arn]",
         insufficient_data=True,
+    )
+    require_alarm_actions(
+        find_block(
+            monitoring_main,
+            'resource "aws_cloudwatch_metric_alarm"',
+            "server_async_runtime_panic",
+        ),
+        "[aws_sns_topic.alerts.arn]",
+    )
+    require_alarm_actions(
+        find_block(
+            monitoring_main,
+            'resource "aws_cloudwatch_metric_alarm"',
+            "server_forward_target_drop",
+        ),
+        "[aws_sns_topic.alerts.arn]",
     )
     require_alarm_actions(
         find_block(

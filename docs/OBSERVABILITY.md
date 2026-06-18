@@ -26,6 +26,20 @@ Components add their own dimensions on top:
 | `AuthFailure` | Counter | — | Failed authentication attempts |
 | `KnockLatency` | Latency (ms) | — | End-to-end knock processing time |
 | `StorageHealthy` | Gauge (0/1) | — | etcd storage health probe |
+| `ServerForwardTargetDrop` | Counter | — | Outbound NHP_FWD target preparation dropped because the peer/tuple was not a configured server target or was owned by a non-promotable connection. Steady state is zero; see [server forward-send safety](runbooks/server-forward-safety.md). |
+
+## Server Log-Derived Metrics
+
+The monitoring module also derives cell-scoped server metrics from CloudWatch
+Logs. These metric names bake `Environment` and `Cell` into the metric name
+because the log group, not the JSON event body, carries those values.
+They are not emitted by the server CloudWatch publisher, so fleet-wide rollups
+must enumerate the cell-scoped metric names instead of grouping by dimensions.
+
+| Metric | Source Log Group | Description |
+|--------|------------------|-------------|
+| `ServerPanic-<environment>-<cell>` | `/layerv/nhp/<env>/<cell>/server-stderr` | Raw Go `panic:` output written to stderr. Each match normally means the process restarted. |
+| `ServerAsyncRuntimePanic-<environment>-<cell>` | `/layerv/nhp/<env>/<cell>/server` | Structured `msgToPacketRoutine` async `ErrRuntimePanic` recovery. The process stayed up, but the outbound message was dropped. |
 
 ## AC Registration Metrics
 
@@ -110,6 +124,8 @@ Both server and AC IAM roles need `cloudwatch:PutMetricData` for the `LayerV/NHP
 | `AuthFailure` | `AuthFailure` | Server |
 | `KnockLatency` | `KnockLatency` | Server |
 | `DiskUsagePercent` | `DiskUsagePercent` | AC (shell script) |
+| `server-forward-target-drop` | `ServerForwardTargetDrop` | Server direct counter |
+| `server-async-runtime-panic` | `ServerAsyncRuntimePanic-<environment>-<cell>` | Server log-derived filter |
 | `RegistrationFailure` | `RegistrationFailure` | AC (>5 failures in 5 min) |
 | `ServerConnectionFailure` | `ServerConnectionFailure` | AC (>10 failures in 10 min, 2 consecutive periods) |
 | `ac-publisher-failures` | `PublisherFailures` | AC (>0 in 2 of last 3 five-min windows) |

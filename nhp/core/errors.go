@@ -53,7 +53,11 @@ var (
 	ErrCipherNotSupported = newError(errNhpCipherNotSupported, "cipher scheme not supported")
 	ErrCreateDeviceFailed = newError(errNhpCreateDeviceFailed, "failed to create nhp device")
 	ErrCloseDeviceFailed  = newError(errNhpCloseDeviceFailed, "attempt to close a non-initialized nhp device")
-	ErrRuntimePanic       = newError(errNhpSdkRuntimePanic, "runtime panic encountered")
+	// ErrRuntimePanic's message text is load-bearing for the
+	// server-async-runtime-panic CloudWatch log metric filter in
+	// terraform/modules/monitoring/main.tf. Keep it in lockstep with the
+	// msgToPacketRoutine recovery log in device.go and the Terraform pattern.
+	ErrRuntimePanic = newError(errNhpSdkRuntimePanic, "runtime panic encountered")
 
 	// initiator and encryption
 	ErrWrongCipherScheme       = newError(errNhpWrongCipherScheme, "a wrong cipher scheme is used")

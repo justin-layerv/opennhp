@@ -451,6 +451,31 @@ resource "aws_cloudwatch_dashboard" "main" {
           view    = "timeSeries"
           stacked = false
         }
+      },
+      {
+        # Server forward-send safety (issue #2679). ServerForwardTargetDrop is
+        # emitted by the server publisher with {Environment, Cell}; the async
+        # runtime panic recovery is log-filter-derived and bakes env/cell into
+        # the metric name because quoted/JSON log-filter patterns cannot use
+        # CloudWatch metric dimensions. Target Drop is healthy when absent or
+        # zero; Async Runtime Panic Recovery should stay flat zero.
+        type   = "metric"
+        x      = 0
+        y      = 24
+        width  = 24
+        height = 6
+        properties = {
+          title  = "Server Forward Safety"
+          region = data.aws_region.current.id
+          metrics = [
+            ["LayerV/NHP", "ServerForwardTargetDrop", "Environment", var.environment, "Cell", var.cell_id, { "label" : "Target Drop" }],
+            [aws_cloudwatch_log_metric_filter.server_async_runtime_panic.metric_transformation[0].namespace, aws_cloudwatch_log_metric_filter.server_async_runtime_panic.metric_transformation[0].name, { "label" : "Async Runtime Panic Recovery" }]
+          ]
+          period  = 300
+          stat    = "Sum"
+          view    = "timeSeries"
+          stacked = false
+        }
       }
     ]
   })
@@ -1011,6 +1036,49 @@ resource "aws_cloudwatch_metric_alarm" "art_replay_gate_drop" {
   })
 }
 
+# Server-forward target drops (issue #2679, follow-up from PR #2673). The
+# counter increments when the server-to-server NHP_FWD send path refuses to
+# synthesize/reuse ConnData because the peer tuple is not a safe configured
+# server target or because that UDP tuple is owned by a non-promotable
+# AC/DB/WebRTC connection. Steady state is exactly zero; a non-zero value means
+# assignment/peer-map drift or a tuple-owner collision that would otherwise only
+# live in logs.
+#
+# DIM SET: {Environment, Cell}, emitted via Publisher.IncrCounter with the
+# server publisher's base dimensions (buildServerMetricDimensions in
+# endpoints/server/udpserver.go). Keep this selector in lockstep with the Go
+# publisher.
+#
+# SHAPE: same sparse-counter, single-event detector as knock_forward_path. The
+# failure class is traffic-gated and should never happen in steady state, so one
+# breaching 5-minute bucket in the trailing hour is actionable.
+resource "aws_cloudwatch_metric_alarm" "server_forward_target_drop" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-forward-target-drop"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 12
+  datapoints_to_alarm = 1
+  metric_name         = "ServerForwardTargetDrop"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "nhp-server dropped >=1 outbound NHP_FWD target in the trailing hour. Steady state is zero; investigate server assignment/peer-map drift or a tuple-owner collision. Runbook: docs/runbooks/server-forward-safety.md. #2679 / PR #2673."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+    Issue     = "2679"
+  })
+}
+
 # Relay-forward rejects: "relay enabled but forwards rejected" (#2643, part of
 # #2208). nhp-server emits RelayForwardReject (MetricRelayForwardReject,
 # endpoints/server/relay.go) on every NHP_RLY forward it drops PRE-AUTH — most
@@ -1304,6 +1372,36 @@ resource "aws_cloudwatch_log_metric_filter" "server_panic" {
   }
 }
 
+# Async ErrRuntimePanic recoveries (issue #2679, follow-up from PR #2673).
+# PR #2673 made msgToPacketRoutine recover residual packet-send panics so they
+# become dropped messages instead of process restarts. That means the raw
+# stderr "panic:" detector above no longer sees this class; the structured
+# logger writes the recovery line to var.server_log_group_name instead.
+#
+# Match the stable routine name plus ErrRuntimePanic's operator-facing message
+# string in the raw JSON log line, not a broad "panic" substring, so ordinary
+# explanatory log lines do not increment the alarm metric. This intentionally
+# uses CloudWatch's quoted-term syntax instead of a JSON selector: env/cell are
+# carried by the log group/metric name, and the stable terms are guarded by Go
+# and parity tests without coupling the alarm to a field path. The scope is
+# intentionally limited to msgToPacketRoutine; add or widen a filter if another
+# structured recover() site starts converting ErrRuntimePanic into dropped work.
+# The raw AND match is deliberate: only the recovery line should emit both terms.
+resource "aws_cloudwatch_log_metric_filter" "server_async_runtime_panic" {
+  name           = "${var.name_prefix}-${var.cell_id}-server-async-runtime-panic"
+  log_group_name = var.server_log_group_name
+  pattern        = "\"msgToPacketRoutine\" \"runtime panic encountered\""
+
+  metric_transformation {
+    # Cell-scoped metric name because the Environment/Cell values are supplied
+    # by the log group and not by fields in the JSON log event.
+    name          = "ServerAsyncRuntimePanic-${local.metric_name_suffix}"
+    namespace     = "LayerV/NHP"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
 # NOTE: The ServerStartupEvent log-metric-filter that previously lived
 # here (substring match on the startup banner) was removed in the EMF
 # migration (issue #1106). The Go server now emits the metric directly
@@ -1357,6 +1455,40 @@ resource "aws_cloudwatch_metric_alarm" "server_panic" {
   tags = merge(var.tags, {
     Component = "monitoring"
     Cell      = var.cell_id
+  })
+}
+
+# A recovered async runtime panic is still a zero-baseline availability signal:
+# the process stayed up, but the specific outbound message was dropped. Page
+# intentionally on the first recovery in a 5-minute bucket, then auto-resolve
+# after one clean bucket; use the structured log line's stack trace to identify
+# the residual packet-send panic.
+resource "aws_cloudwatch_metric_alarm" "server_async_runtime_panic" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-async-runtime-panic"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = aws_cloudwatch_log_metric_filter.server_async_runtime_panic.metric_transformation[0].name
+  namespace           = aws_cloudwatch_log_metric_filter.server_async_runtime_panic.metric_transformation[0].namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "nhp-server recovered >=1 async ErrRuntimePanic in msgToPacketRoutine in the last 5 minutes; the process stayed up but outbound messages were dropped. Inspect the structured server log stack trace. Runbook: docs/runbooks/server-forward-safety.md. #2679 / PR #2673."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  # The filter's default_value emits zero while structured logs are flowing;
+  # keep missing data quiet as a silence fallback rather than paging on a
+  # naturally quiet log window. Unlike server_panic, this event detector omits
+  # insufficient_data_actions because losing the stderr panic stream is a
+  # stronger blackout signal than a quiet structured recovery metric.
+  treat_missing_data = "notBreaching"
+
+  # No dimensions block: env/cell are baked into the metric_name
+  # (see server_async_runtime_panic filter's metric_transformation above).
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+    Issue     = "2679"
   })
 }
 

@@ -655,6 +655,7 @@ module "monitoring" {
   asg_name                            = module.compute.asg_name
   # Observability parity expressions are fenced by
   # scripts/check-observability-parity.py.
+  server_log_group_name        = module.compute.log_group_name
   server_stderr_log_group_name = module.compute.log_group_stderr_name
   name_prefix                  = local.name_prefix
   tags                         = local.common_tags

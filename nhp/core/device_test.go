@@ -2,11 +2,14 @@ package core
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
 func TestMsgToPacketRoutineMissingConnDataReturnsError(t *testing.T) {
@@ -63,8 +66,6 @@ func TestMsgToPacketRoutineMissingConnDataReturnsError(t *testing.T) {
 }
 
 func TestMsgToPacketRoutineRecoversForwardOutboundPanic(t *testing.T) {
-	silenceGlobalLogger(t)
-
 	for _, tc := range []struct {
 		name       string
 		headerType int
@@ -73,6 +74,14 @@ func TestMsgToPacketRoutineRecoversForwardOutboundPanic(t *testing.T) {
 		{name: "forward-transaction", headerType: NHP_FWD},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			logDir := t.TempDir()
+			logger := log.NewLogger("", log.LogLevelError, logDir, "server")
+			prevLogger := log.SwapGlobalLogger(logger)
+			t.Cleanup(func() {
+				log.SwapGlobalLogger(prevLogger)
+				logger.Close()
+			})
+
 			serverKey := make([]byte, PrivateKeySize)
 			serverKey[0] = 1
 			peerKey := make([]byte, PrivateKeySize)
@@ -132,6 +141,45 @@ func TestMsgToPacketRoutineRecoversForwardOutboundPanic(t *testing.T) {
 					t.Fatalf("local transactions still active: %d", device.LocalTransactionCount())
 				case <-time.After(10 * time.Millisecond):
 				}
+			}
+
+			logger.Close()
+			logPattern := filepath.Join(logDir, "server-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].log")
+			logFiles, err := filepath.Glob(logPattern)
+			if err != nil {
+				t.Fatalf("glob recovery logs: %v", err)
+			}
+			if len(logFiles) == 0 {
+				t.Fatalf("recovery logs = %v, want at least one server log", logFiles)
+			}
+
+			var combinedLog strings.Builder
+			for _, logPath := range logFiles {
+				logBytes, err := os.ReadFile(logPath)
+				if err != nil {
+					t.Fatalf("read recovery log %s: %v", logPath, err)
+				}
+				combinedLog.WriteString(logPath)
+				combinedLog.WriteByte('\n')
+				combinedLog.Write(logBytes)
+				combinedLog.WriteByte('\n')
+			}
+			logText := combinedLog.String()
+			if !strings.Contains(logText, "msgToPacketRoutine") {
+				t.Fatalf("recovery log = %q, want msgToPacketRoutine for CloudWatch filter", logText)
+			}
+			if !strings.Contains(logText, "runtime panic encountered") {
+				t.Fatalf("recovery log = %q, want runtime panic encountered for CloudWatch filter", logText)
+			}
+			foundFilterLine := false
+			for _, line := range strings.Split(logText, "\n") {
+				if strings.Contains(line, "msgToPacketRoutine") && strings.Contains(line, "runtime panic encountered") {
+					foundFilterLine = true
+					break
+				}
+			}
+			if !foundFilterLine {
+				t.Fatalf("recovery log = %q, want CloudWatch filter terms on one log event", logText)
 			}
 		})
 	}
