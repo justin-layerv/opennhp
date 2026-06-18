@@ -41,6 +41,10 @@
 # drift against the empty inline declaration, and REVOKES them as part
 # of the SG modify — a hidden first-apply-vs-refresh trap that produces
 # a self-healing-on-first-apply / self-breaking-on-refresh oscillation.
+#
+# Security group descriptions are also ForceNew. This SG has a deterministic
+# name and is attached to live ALB ENIs, so ignore description drift too; wording
+# edits should not plan a destroy/recreate that AWS rejects with dependencies.
 resource "aws_security_group" "alb" {
   name        = "${local.alb_name}-alb"
   description = "Bootstrap ALB ingress 443 from internet; egress to qurl-service VPC on target port"
@@ -54,7 +58,7 @@ resource "aws_security_group" "alb" {
   # No `create_before_destroy`: deterministic name + CBD would fail
   # any future replacement on `InvalidGroup.Duplicate`.
   lifecycle {
-    ignore_changes = [ingress, egress]
+    ignore_changes = [description, ingress, egress]
   }
 }
 
