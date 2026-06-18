@@ -47,6 +47,7 @@ IMAGE_TAG="${3}"
 DO_REFRESH="${4:-}"
 
 AWS_REGION="${AWS_REGION:-us-east-2}"
+export AWS_REGION
 
 # Validate environment.
 #
@@ -202,17 +203,19 @@ declare -A COMPONENT_MIN_HEALTHY=(
 )
 MIN_HEALTHY="${COMPONENT_MIN_HEALTHY[$COMPONENT]}"
 
-# Max wait iterations for wait-for-instance-refresh.sh (each sleeps 10s), per
-# component. Explicit per-component (like COMPONENT_MIN_HEALTHY above) rather
-# than the script's 60-iteration (600s) default: the reverse-tunnel-server
-# 3/3/3 fleet rolls one instance at a time at 50% min-healthy with a 180s
-# warmup, so a full refresh runs ~11 min — the 600s default timed out mid-roll
-# and false-failed deploy-qrts even though the refresh had succeeded (prod run
-# 26736875324). 150 (=1500s/25m) clears that with headroom, under deploy-qrts's
-# 30-min job timeout. server/ac deploy via canary in mature prod and only reach
-# this wait on a greenfield first-deploy fallback, where 600s holds — bump their
-# entry if a larger first-deploy fleet ever needs it. `set -u` makes a missing
-# key fail loud (caught by the component validation above).
+# Max status polls for wait-for-instance-refresh.sh, per component. The helper
+# polls immediately, then sleeps 10s between attempts, so the default 60 polls
+# allow 59 sleeps (~590s) plus describe latency. Explicit per-component (like
+# COMPONENT_MIN_HEALTHY above) rather than the script default: the
+# reverse-tunnel-server 3/3/3 fleet rolls one instance at a time at 50%
+# min-healthy with a 180s warmup, so a full refresh runs ~11 min — the old
+# ~10-min default timed out mid-roll and false-failed deploy-qrts even though
+# the refresh had succeeded (prod run 26736875324). 150 polls (~1490s plus
+# describe latency) clears that with headroom, under deploy-qrts's 30-min job
+# timeout. server/ac deploy via canary in mature prod and only reach this wait
+# on a greenfield first-deploy fallback, where ~590s holds — bump their entry if
+# a larger first-deploy fleet ever needs it. `set -u` makes a missing key fail
+# loud (caught by the component validation above).
 declare -A COMPONENT_REFRESH_MAX_ITERATIONS=(
   ["server"]="60"
   ["ac"]="60"
@@ -263,11 +266,13 @@ REFRESH_ID=$(aws autoscaling start-instance-refresh \
 
 echo "Instance Refresh ID: $REFRESH_ID"
 
-# Wait for instance refresh to complete. Arg 3 ("") is the optional health-check
-# command (unused here); arg 4 is the per-component max-iterations (see
-# COMPONENT_REFRESH_MAX_ITERATIONS above) — must be passed positionally after it.
+# Wait for instance refresh to complete. Source the helper instead of invoking
+# its standalone CLI so this CI path can keep GitHub annotations on failures
+# while the helper still preserves legacy CLI output for direct callers.
 if [[ -x "$SCRIPT_DIR/wait-for-instance-refresh.sh" ]]; then
-  "$SCRIPT_DIR/wait-for-instance-refresh.sh" "$ASG_NAME" "$REFRESH_ID" "" "$REFRESH_MAX_ITERATIONS"
+  # shellcheck source=.github/scripts/wait-for-instance-refresh.sh
+  source "$SCRIPT_DIR/wait-for-instance-refresh.sh"
+  wait_for_instance_refresh "$ASG_NAME" "$REFRESH_ID" "" "$REFRESH_MAX_ITERATIONS" "Instance" 10 3 "" true
 else
   echo "WARNING: wait-for-instance-refresh.sh not found, refresh started but not monitored"
   echo "Check AWS console for refresh status: $REFRESH_ID"
