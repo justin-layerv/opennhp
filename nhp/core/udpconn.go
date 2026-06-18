@@ -33,6 +33,11 @@ type ConnectionData struct {
 	sync.Mutex
 	sync.WaitGroup
 
+	// Serializes channelSendWg.Add with Close's transition to closed so Close can
+	// wait for in-flight send selects before it closes the queue channels.
+	channelSendMu sync.Mutex
+	channelSendWg sync.WaitGroup
+
 	// common
 	Device           *Device
 	LocalAddr        *net.UDPAddr
@@ -65,21 +70,42 @@ func (c *ConnectionData) TimeoutMs() int { return int(c.timeoutMs.Load()) }
 // InitTimeoutMs sets the timeout at construction. Use SetTimeout once connectionRoutine is running.
 func (c *ConnectionData) InitTimeoutMs(ms int) { c.timeoutMs.Store(int64(ms)) }
 
-// SetTimeout updates the timeout and signals connectionRoutine to re-arm; blocks until the routine selects.
-// TODO(#1675): not safe to call concurrently with Close() — send panics on closed channel.
-// No production callers as of PR #1491; retained as the documented re-arm contract for #1675.
+// SetTimeout updates the timeout and queues a coalesced signal for connectionRoutine to re-arm.
+// No production callers yet; retained as the documented re-arm contract for #1675.
 func (c *ConnectionData) SetTimeout(ms int) {
+	if !c.beginChannelSend() {
+		log.Warning("connection %s is closed, discard timeout update", c.RemoteAddr.String())
+		return
+	}
+	defer c.channelSendWg.Done()
+
+	select {
+	case <-c.StopSignal:
+		log.Warning("connection %s stopped, discard timeout update", c.RemoteAddr.String())
+		return
+	default:
+	}
+
 	c.timeoutMs.Store(int64(ms))
-	c.SetTimeoutSignal <- struct{}{}
+	select {
+	case c.SetTimeoutSignal <- struct{}{}:
+	default:
+		log.Debug("connection %s timeout update already pending", c.RemoteAddr.String())
+	}
 }
 
 func (c *ConnectionData) Close() {
+	c.channelSendMu.Lock()
 	if !c.closed.CompareAndSwap(false, true) {
+		c.channelSendMu.Unlock()
 		return
 	}
 
 	// close all running transactions
 	close(c.StopSignal)
+	c.channelSendMu.Unlock()
+
+	c.channelSendWg.Wait()
 
 	// flush connection remaining packet and close connection thread channels
 flush:
@@ -89,20 +115,19 @@ flush:
 			c.Device.ReleasePoolPacket(pkt)
 		case pkt := <-c.RecvQueue:
 			c.Device.ReleasePoolPacket(pkt)
-		case <-c.BlockSignal:
 		default:
 			break flush
 		}
 	}
 
+	// SetTimeoutSignal carries only coalesced struct{} notifications; all senders
+	// are drained by channelSendWg.Wait, and no packet resource needs flushing.
 	close(c.SendQueue)
 	close(c.RecvQueue)
 	close(c.BlockSignal)
 	close(c.SetTimeoutSignal)
-	c.SendQueue = nil
-	c.RecvQueue = nil
-	c.BlockSignal = nil
-	c.SetTimeoutSignal = nil
+	// Keep channel fields stable after close. Endpoint connection routines select
+	// on these fields and use ok=false to exit; closed prevents future guarded sends.
 
 	c.Wait()
 }
@@ -111,12 +136,23 @@ func (c *ConnectionData) IsClosed() bool {
 	return c.closed.Load()
 }
 
+func (c *ConnectionData) beginChannelSend() bool {
+	c.channelSendMu.Lock()
+	defer c.channelSendMu.Unlock()
+	if c.closed.Load() {
+		return false
+	}
+	c.channelSendWg.Add(1)
+	return true
+}
+
 func (c *ConnectionData) ForwardOutboundPacket(pkt *Packet) {
-	if c.IsClosed() {
+	if !c.beginChannelSend() {
 		log.Warning("connection %s is closed, discard outbound packet", c.RemoteAddr.String())
 		c.Device.ReleasePoolPacket(pkt)
 		return
 	}
+	defer c.channelSendWg.Done()
 
 	select {
 	case c.SendQueue <- pkt:
@@ -130,11 +166,12 @@ func (c *ConnectionData) ForwardOutboundPacket(pkt *Packet) {
 }
 
 func (c *ConnectionData) ForwardInboundPacket(pkt *Packet) {
-	if c.IsClosed() {
+	if !c.beginChannelSend() {
 		log.Warning("connection %s is closed, discard inbound packet", c.RemoteAddr.String())
 		c.Device.ReleasePoolPacket(pkt)
 		return
 	}
+	defer c.channelSendWg.Done()
 
 	select {
 	case c.RecvQueue <- pkt:
@@ -148,10 +185,11 @@ func (c *ConnectionData) ForwardInboundPacket(pkt *Packet) {
 }
 
 func (c *ConnectionData) SendBlockSignal() {
-	if c.IsClosed() {
+	if !c.beginChannelSend() {
 		log.Warning("connection is closed, discard block signal")
 		return
 	}
+	defer c.channelSendWg.Done()
 
 	select {
 	case c.BlockSignal <- struct{}{}:

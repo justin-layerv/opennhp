@@ -75,7 +75,7 @@ func newConnRoutineHarness(t *testing.T, timeoutMs int) *connRoutineHarness {
 			RecvQueue:        make(chan *core.Packet, 16),
 			BlockSignal:      make(chan struct{}),
 			StopSignal:       make(chan struct{}),
-			SetTimeoutSignal: make(chan struct{}), // matches production (unbuffered)
+			SetTimeoutSignal: make(chan struct{}, 1),
 		},
 	}
 	conn.ConnData.InitTimeoutMs(timeoutMs)
@@ -884,7 +884,7 @@ func TestConnectionTimeout_TriggersReregistration(t *testing.T) {
 			RecvQueue:        make(chan *core.Packet, 16),
 			BlockSignal:      make(chan struct{}),
 			StopSignal:       make(chan struct{}),
-			SetTimeoutSignal: make(chan struct{}),
+			SetTimeoutSignal: make(chan struct{}, 1),
 		},
 	}
 	conn.ConnData.InitTimeoutMs(50) // Very short timeout
@@ -981,7 +981,7 @@ func TestConnectionTimeout_NonServerConnection(t *testing.T) {
 			RecvQueue:        make(chan *core.Packet, 16),
 			BlockSignal:      make(chan struct{}),
 			StopSignal:       make(chan struct{}),
-			SetTimeoutSignal: make(chan struct{}),
+			SetTimeoutSignal: make(chan struct{}, 1),
 		},
 	}
 	conn.ConnData.InitTimeoutMs(50)

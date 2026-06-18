@@ -2014,13 +2014,13 @@ func (s *UdpServer) recvPacketRoutine() {
 				SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 				RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 				BlockSignal:          make(chan struct{}),
-				SetTimeoutSignal:     make(chan struct{}),
+				SetTimeoutSignal:     make(chan struct{}, 1),
 				StopSignal:           make(chan struct{}),
 			}
 			conn.ConnData.InitTimeoutMs(timeoutMs)
 			s.admitNewConnection(conn, addrStr)
 
-			conn.ConnData.RecvQueue <- pkt
+			conn.ConnData.ForwardInboundPacket(pkt)
 
 			log.Info("Accept new UDP connection from %s to %s", addrStr, s.listenAddrStr)
 
@@ -2332,7 +2332,10 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 			log.Debug("Connection routine: %s evicted by per-IP cap", addrStr)
 			return
 
-		case <-conn.ConnData.SetTimeoutSignal:
+		case _, ok := <-conn.ConnData.SetTimeoutSignal:
+			if !ok {
+				return
+			}
 			newTimeoutMs := conn.ConnData.TimeoutMs()
 			if newTimeoutMs <= 0 {
 				log.Debug("Connection routine closed immediately")
@@ -2346,7 +2349,10 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 			log.Debug("Connection routine idle timeout")
 			return
 
-		case <-conn.ConnData.BlockSignal:
+		case _, ok := <-conn.ConnData.BlockSignal:
+			if !ok {
+				return
+			}
 			s.AddBlockAddr(conn.ConnData.RemoteAddr)
 			return
 
@@ -4123,7 +4129,7 @@ func (s *UdpServer) connDataForOutboundAddr(remoteAddr *net.UDPAddr, peerPk []by
 		SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		BlockSignal:          make(chan struct{}),
-		SetTimeoutSignal:     make(chan struct{}),
+		SetTimeoutSignal:     make(chan struct{}, 1),
 		StopSignal:           make(chan struct{}),
 	}
 	// Server-peer conns are trusted infra but intentionally keep the

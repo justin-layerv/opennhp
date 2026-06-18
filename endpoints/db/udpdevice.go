@@ -232,7 +232,7 @@ func (a *UdpDevice) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 		SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		BlockSignal:          make(chan struct{}),
-		SetTimeoutSignal:     make(chan struct{}),
+		SetTimeoutSignal:     make(chan struct{}, 1),
 		StopSignal:           make(chan struct{}),
 	}
 	conn.ConnData.InitTimeoutMs(DefaultConnectionTimeoutMs)
@@ -401,7 +401,10 @@ func (a *UdpDevice) connectionRoutine(conn *UdpConn) {
 		case <-a.signals.stop:
 			return
 
-		case <-conn.ConnData.SetTimeoutSignal:
+		case _, ok := <-conn.ConnData.SetTimeoutSignal:
+			if !ok {
+				return
+			}
 			newTimeoutMs := conn.ConnData.TimeoutMs()
 			if newTimeoutMs <= 0 {
 				log.Debug("Connection routine closed immediately")
@@ -462,7 +465,10 @@ func (a *UdpDevice) connectionRoutine(conn *UdpConn) {
 			// generic receive
 			a.device.RecvPacketToMsg(pd)
 
-		case <-conn.ConnData.BlockSignal:
+		case _, ok := <-conn.ConnData.BlockSignal:
+			if !ok {
+				return
+			}
 			log.Critical("blocking address %s", addrStr)
 			return
 		}

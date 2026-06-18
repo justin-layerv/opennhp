@@ -240,7 +240,7 @@ func TestSendMessagePromotesInboundServerPeerConnectionForReciprocalForward(t *t
 			SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 			RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 			BlockSignal:          make(chan struct{}),
-			SetTimeoutSignal:     make(chan struct{}),
+			SetTimeoutSignal:     make(chan struct{}, 1),
 			StopSignal:           make(chan struct{}),
 		},
 	}
@@ -292,7 +292,7 @@ func TestSendMessageDropsOutboundForUnknownServerPeerTarget(t *testing.T) {
 			SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 			RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 			BlockSignal:          make(chan struct{}),
-			SetTimeoutSignal:     make(chan struct{}),
+			SetTimeoutSignal:     make(chan struct{}, 1),
 			StopSignal:           make(chan struct{}),
 		},
 	}
@@ -334,7 +334,7 @@ func TestSendMessageDropsOutboundWhenTupleOwnedByNonPromotableConn(t *testing.T)
 			SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 			RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 			BlockSignal:          make(chan struct{}),
-			SetTimeoutSignal:     make(chan struct{}),
+			SetTimeoutSignal:     make(chan struct{}, 1),
 			StopSignal:           make(chan struct{}),
 		},
 	}
