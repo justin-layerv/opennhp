@@ -13,10 +13,36 @@
 # New cells should include cell_id in the secret name for clear isolation.
 # IAM policies can then use ARN patterns: arn:aws:secretsmanager:*:*:secret:nhp-*-cell1-*
 
+terraform {
+  required_version = ">= 1.5"
+}
+
 # ==================== Data Sources ====================
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
+
+locals {
+  # True when an SNS alert destination is actually wired. trimspace guards
+  # against a whitespace-only ARN; try() handles the null default.
+  sns_destination_present = try(trimspace(var.alerts_sns_topic_arn) != "", false)
+}
+
+resource "terraform_data" "sns_alerts_contract" {
+  lifecycle {
+    precondition {
+      condition     = !var.enable_sns_alerts || local.sns_destination_present
+      error_message = "enable_sns_alerts=true requires a non-empty alerts_sns_topic_arn. Keep alarm resource counts gated on enable_sns_alerts, but wire the SNS ARN before enabling the gate."
+    }
+  }
+}
+
+check "sns_alerts_gate_matches_destination" {
+  assert {
+    condition     = var.enable_sns_alerts || !local.sns_destination_present
+    error_message = "alerts_sns_topic_arn is set but enable_sns_alerts=false, so compute SNS alarms will not be created. Set enable_sns_alerts=true or clear alerts_sns_topic_arn."
+  }
+}
 
 # AMI Selection (fail-fast, no fallback):
 # 1. If var.server_ami_id is set directly, use it

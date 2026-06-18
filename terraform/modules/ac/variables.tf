@@ -760,6 +760,12 @@ variable "alerts_sns_topic_arn" {
   default     = null
 }
 
+variable "enable_sns_alerts" {
+  description = "Static boolean: set true when this module's SNS-routed blue/green deployment and reconciliation alarms should be created and alerts_sns_topic_arn is wired. Those alarms require a destination, unlike core monitoring alarms that may be created with no actions, and gate count on this value to avoid count-depends-on-computed."
+  type        = bool
+  default     = false
+}
+
 variable "enable_secret_reconciliation" {
   description = "Enable scheduled cleanup of orphaned per-instance AC secrets"
   type        = bool

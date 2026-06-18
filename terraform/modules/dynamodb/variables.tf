@@ -41,3 +41,9 @@ variable "alarm_sns_topic_arn" {
   type        = string
   default     = null
 }
+
+variable "enable_sns_alerts" {
+  description = "Static boolean: set true when this module's SNS-routed DynamoDB throttle alarms should be created and alarm_sns_topic_arn is wired. DynamoDB throttle alarm counts gate on this value to avoid count-depends-on-computed."
+  type        = bool
+  default     = false
+}

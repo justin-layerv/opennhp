@@ -34,7 +34,7 @@ output "rotation_enabled" {
 # Rotation alarm outputs
 output "rotation_alarm_arns" {
   description = "ARNs of CloudWatch alarms for Auth0 secret rotation (empty list if rotation or alarms disabled)"
-  value = var.enable_rotation && var.alarm_sns_topic_arn != null ? [
+  value = var.enable_rotation && var.enable_sns_alerts ? [
     aws_cloudwatch_metric_alarm.rotation_lambda_errors[0].arn,
     aws_cloudwatch_metric_alarm.rotation_lambda_duration[0].arn,
     aws_cloudwatch_metric_alarm.rotation_overdue[0].arn,

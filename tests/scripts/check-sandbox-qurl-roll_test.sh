@@ -53,7 +53,7 @@ extract_job() {
 # the job fails loud.
 assert_in() {
   local block="$1" job="$2" label="$3" re="$4"
-  if printf '%s\n' "$block" | grep -Eq -- "$re"; then
+  if grep -Eq -- "$re" <<< "$block"; then
     report_pass "$label"
   else
     report_fail "$label" "pattern not found in $job job: $re"

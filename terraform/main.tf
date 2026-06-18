@@ -405,6 +405,7 @@ module "dynamodb" {
   # `modules/dynamodb/alarms.tf` — shared monitoring topic so the
   # `alerts-infra` Chatbot subscription covers all module producers.
   alarm_sns_topic_arn = module.monitoring.sns_topic_arn
+  enable_sns_alerts   = var.deploy_qurl_service
 }
 
 # NHP Keypair Module - Registration keypair for AC initial connection
@@ -1217,6 +1218,7 @@ module "ac" {
   enable_cloudwatch_alarms = true
   alarm_sns_topic_arn      = module.monitoring.sns_topic_arn
   alerts_sns_topic_arn     = module.monitoring.sns_topic_arn
+  enable_sns_alerts        = true
 
   # Secret reconciliation (cleanup orphaned per-instance secrets)
   enable_secret_reconciliation = var.enable_secret_reconciliation
@@ -2017,6 +2019,7 @@ module "qurl_reverse_tunnel_server" {
   # Monitoring
   enable_cloudwatch_alarms = true
   alarm_sns_topic_arn      = module.monitoring.sns_topic_arn
+  enable_sns_alerts        = true
 
   # Threshold for the knock-token reject-rate alarm. Default 3 (page at
   # 4+/min sustained 3-of-5 minutes); env-tunable via the root var so an

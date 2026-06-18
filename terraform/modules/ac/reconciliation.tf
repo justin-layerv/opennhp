@@ -204,8 +204,11 @@ resource "aws_lambda_permission" "secret_reconciliation" {
 
 # ==================== CloudWatch Alarm ====================
 
+# Gate these alarm counts on the static enable_sns_alerts flag, not on
+# alerts_sns_topic_arn. The ARN remains the alarm action destination; the
+# module-level sns_alerts_contract precondition enforces it when alerts are on.
 resource "aws_cloudwatch_metric_alarm" "secret_reconciliation_errors" {
-  count = var.enable_secret_reconciliation && var.alerts_sns_topic_arn != null ? 1 : 0
+  count = var.enable_secret_reconciliation && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-ac-secret-reconciliation-errors"
   comparison_operator = "GreaterThanThreshold"
@@ -237,7 +240,7 @@ resource "aws_cloudwatch_metric_alarm" "secret_reconciliation_errors" {
 # much lower instance churn. See variables.tf::secret_reconciliation_deletion_spike_threshold for
 # the calibration baseline and re-tuning procedure.
 resource "aws_cloudwatch_metric_alarm" "secret_reconciliation_deletion_spike" {
-  count = var.enable_secret_reconciliation && var.alerts_sns_topic_arn != null ? 1 : 0
+  count = var.enable_secret_reconciliation && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-ac-secret-reconciliation-deletion-spike"
   comparison_operator = "GreaterThanThreshold"

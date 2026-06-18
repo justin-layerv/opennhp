@@ -395,7 +395,7 @@ variable "alerts_sns_topic_arn" {
 }
 
 variable "enable_sns_alerts" {
-  description = "Static boolean: set true when alerts_sns_topic_arn is provided (avoids count-depends-on-computed)"
+  description = "Static boolean: set true when this module's SNS-routed alarms should be created and alerts_sns_topic_arn is wired. SNS-routed alarm counts gate on this value to avoid count-depends-on-computed."
   type        = bool
   default     = false
 }

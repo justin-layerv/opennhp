@@ -340,8 +340,12 @@ resource "aws_autoscaling_policy" "cpu_green" {
 # only declare a deficit when capacity stayed short across the period.
 # Revisit after the first sandbox green refresh; lengthen the window only
 # if this still pages on healthy refresh noise.
+#
+# Gate these alarm counts on the static enable_sns_alerts flag, not on
+# alerts_sns_topic_arn. The ARN is computed from module.monitoring in root, so
+# using it in count reintroduces the greenfield "Invalid count argument" trap.
 resource "aws_cloudwatch_metric_alarm" "ac_green_asg_unhealthy" {
-  count = var.enable_blue_green && var.alerts_sns_topic_arn != null ? 1 : 0
+  count = var.enable_blue_green && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-ac-green-asg-unhealthy"
   alarm_description   = "AC Green ASG has sustained capacity deficit - may affect rollback capability"
@@ -400,7 +404,7 @@ resource "aws_cloudwatch_metric_alarm" "ac_green_asg_unhealthy" {
 
 # Alarm: Green target group has no healthy targets (critical for rollback)
 resource "aws_cloudwatch_metric_alarm" "ac_green_tg_no_healthy_targets" {
-  count = var.enable_blue_green && var.alerts_sns_topic_arn != null ? 1 : 0
+  count = var.enable_blue_green && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-ac-green-tg-no-healthy"
   alarm_description   = "AC Green target group has no healthy targets - rollback capability impaired"

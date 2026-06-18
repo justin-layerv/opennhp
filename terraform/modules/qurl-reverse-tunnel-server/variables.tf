@@ -108,6 +108,12 @@ variable "alarm_sns_topic_arn" {
   default     = ""
 }
 
+variable "enable_sns_alerts" {
+  description = "Static boolean: set true when this module's SNS-routed alarms should be created and alarm_sns_topic_arn is wired. SNS-routed alarm counts gate on this value to avoid count-depends-on-computed."
+  type        = bool
+  default     = false
+}
+
 # Per-AZ Cloud Map empty-registration watchdog (#1542) — detection layer
 # that catches the (a=2, b=1, c=0) ASG distribution that satisfies
 # `GroupInServiceInstances < 1` while leaving one AZ's Cloud Map service

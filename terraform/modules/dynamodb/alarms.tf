@@ -80,7 +80,7 @@
 # https://github.com/layervai/nhp/issues/2108.
 
 locals {
-  ddb_alarms_enabled = var.deploy_qurl_tables && var.alarm_sns_topic_arn != null
+  ddb_alarms_enabled = var.deploy_qurl_tables && var.enable_sns_alerts
   ddb_alarm_actions  = local.ddb_alarms_enabled ? [var.alarm_sns_topic_arn] : []
 
   # Additional QURL tables on the customer *resolve* read path that warrant a

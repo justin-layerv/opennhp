@@ -437,8 +437,11 @@ resource "aws_autoscaling_lifecycle_hook" "frps_launch_green" {
 # window the empty-AZ watchdog (#1542) uses, so an "unrecoverable
 # green fleet during a blue→green flip rehearsal" surfaces on both
 # detection layers in the same 10-15 min window.
+#
+# Gate this SNS-routed alarm count on the static enable_sns_alerts flag, not
+# on alarm_sns_topic_arn. The ARN is computed by the root monitoring module.
 resource "aws_cloudwatch_metric_alarm" "frps_green_asg_unhealthy" {
-  count = var.enable_blue_green && var.enable_cloudwatch_alarms && var.alarm_sns_topic_arn != "" ? 1 : 0
+  count = var.enable_blue_green && var.enable_cloudwatch_alarms && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-frps-green-asg-unhealthy"
   alarm_description   = "qurl-reverse-tunnel-server Green ASG has sustained capacity deficit — may affect rollback capability during a blue/green flip."

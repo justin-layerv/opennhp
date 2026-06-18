@@ -52,10 +52,36 @@
 # `Terminating:Wait` blocking until deregister completes — is tracked
 # in #1089 alongside the custom health-check work.
 
+terraform {
+  required_version = ">= 1.5"
+}
+
 # ==================== Data Sources ====================
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
+
+locals {
+  # True when an SNS alert destination is actually wired. trimspace guards
+  # against a whitespace-only ARN; try() handles the null default.
+  sns_destination_present = try(trimspace(var.alarm_sns_topic_arn) != "", false)
+}
+
+resource "terraform_data" "sns_alerts_contract" {
+  lifecycle {
+    precondition {
+      condition     = !var.enable_sns_alerts || local.sns_destination_present
+      error_message = "enable_sns_alerts=true requires a non-empty alarm_sns_topic_arn. Keep SNS-routed alarm resource counts gated on enable_sns_alerts, but wire the SNS ARN before enabling the gate."
+    }
+  }
+}
+
+check "sns_alerts_gate_matches_destination" {
+  assert {
+    condition     = var.enable_sns_alerts || !local.sns_destination_present
+    error_message = "alarm_sns_topic_arn is set but enable_sns_alerts=false, so qurl-reverse-tunnel-server SNS alarms will not be created. Set enable_sns_alerts=true or clear alarm_sns_topic_arn."
+  }
+}
 
 # Ubuntu 24.04 LTS (Noble Numbat) - consistent with AC module.
 # The public SSM parameters from Canonical carry the `SecureString` attribute

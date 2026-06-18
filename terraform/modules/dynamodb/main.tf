@@ -14,6 +14,10 @@
 # NOTE: GSIs use hash_key/range_key attributes instead of key_schema blocks.
 # The key_schema syntax causes perpetual plan diffs in the AWS provider (PR #399).
 
+terraform {
+  required_version = ">= 1.5"
+}
+
 # ==================== Data Sources ====================
 
 data "aws_region" "current" {}
@@ -22,7 +26,24 @@ data "aws_caller_identity" "current" {}
 # ==================== Locals ====================
 
 locals {
-  is_prod = var.environment == "prod"
+  is_prod                 = var.environment == "prod"
+  sns_destination_present = try(trimspace(var.alarm_sns_topic_arn) != "", false)
+}
+
+resource "terraform_data" "sns_alerts_contract" {
+  lifecycle {
+    precondition {
+      condition     = !var.deploy_qurl_tables || !var.enable_sns_alerts || local.sns_destination_present
+      error_message = "deploy_qurl_tables=true and enable_sns_alerts=true require a non-empty alarm_sns_topic_arn. Keep DynamoDB alarm resource counts gated on enable_sns_alerts, but wire the SNS ARN before enabling the gate."
+    }
+  }
+}
+
+check "sns_alerts_gate_matches_destination" {
+  assert {
+    condition     = !var.deploy_qurl_tables || var.enable_sns_alerts || !local.sns_destination_present
+    error_message = "alarm_sns_topic_arn is set but enable_sns_alerts=false, so DynamoDB SNS throttle alarms will not be created. Set enable_sns_alerts=true or clear alarm_sns_topic_arn."
+  }
 }
 
 # ==================== nhp_licenses Table ====================

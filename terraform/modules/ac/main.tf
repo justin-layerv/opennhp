@@ -14,6 +14,8 @@
 
 # CloudFront WAF requires us-east-1 provider
 terraform {
+  required_version = ">= 1.5"
+
   required_providers {
     aws = {
       source                = "hashicorp/aws"
@@ -31,6 +33,29 @@ terraform {
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
+
+locals {
+  # True when an SNS alert destination is actually wired. trimspace guards
+  # against a whitespace-only ARN; try() handles the null default.
+  sns_destination_present = try(trimspace(var.alerts_sns_topic_arn) != "", false)
+}
+
+resource "terraform_data" "sns_alerts_contract" {
+  lifecycle {
+    precondition {
+      # Core monitoring alarms can be action-less; only blue/green and reconciliation alarms require this SNS destination.
+      condition     = !(var.enable_blue_green || var.enable_secret_reconciliation) || !var.enable_sns_alerts || local.sns_destination_present
+      error_message = "enable_sns_alerts=true requires a non-empty alerts_sns_topic_arn. Keep alarm resource counts gated on enable_sns_alerts, but wire the SNS ARN before enabling the gate."
+    }
+  }
+}
+
+check "sns_alerts_gate_matches_destination" {
+  assert {
+    condition     = !(var.enable_blue_green || var.enable_secret_reconciliation) || var.enable_sns_alerts || !local.sns_destination_present
+    error_message = "alerts_sns_topic_arn is set but enable_sns_alerts=false, so blue/green deployment and reconciliation SNS alarms will not be created. Set enable_sns_alerts=true or clear alerts_sns_topic_arn."
+  }
+}
 
 # ==================== AC Secret (Private Key) ====================
 # The AC needs a Curve25519 private key to operate.

@@ -7,9 +7,16 @@
 # Fires when the rotation Lambda encounters unhandled errors. Any single error
 # is concerning because a failed rotation leaves secrets in a partial state
 # (AWSPENDING exists but was never promoted to AWSCURRENT).
+#
+# Gate these alarm counts on the static enable_sns_alerts flag, not on
+# alarm_sns_topic_arn. The ARN may be computed by the caller, so using it in
+# count reintroduces the greenfield "Invalid count argument" trap.
+# Callers intentionally tie enable_sns_alerts to enable_rotation because these
+# SNS alarms do not exist when rotation is off; keep both terms so count gates
+# and outputs stay aligned if a future caller decouples the feature and destination.
 
 resource "aws_cloudwatch_metric_alarm" "rotation_lambda_errors" {
-  count = var.enable_rotation && var.alarm_sns_topic_arn != null ? 1 : 0
+  count = var.enable_rotation && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-auth0-rotation-errors"
   comparison_operator = "GreaterThanThreshold"
@@ -43,7 +50,7 @@ resource "aws_cloudwatch_metric_alarm" "rotation_lambda_errors" {
 # they cause timeouts.
 
 resource "aws_cloudwatch_metric_alarm" "rotation_lambda_duration" {
-  count = var.enable_rotation && var.alarm_sns_topic_arn != null ? 1 : 0
+  count = var.enable_rotation && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-auth0-rotation-duration"
   comparison_operator = "GreaterThanThreshold"
@@ -81,7 +88,7 @@ resource "aws_cloudwatch_metric_alarm" "rotation_lambda_duration" {
 # automatically when rotation is configured on a secret.
 
 resource "aws_cloudwatch_metric_alarm" "rotation_overdue" {
-  count = var.enable_rotation && var.alarm_sns_topic_arn != null ? 1 : 0
+  count = var.enable_rotation && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-auth0-rotation-overdue"
   comparison_operator = "GreaterThanThreshold"
@@ -115,7 +122,7 @@ resource "aws_cloudwatch_metric_alarm" "rotation_overdue" {
 # (SM retries) but sustained throttling indicates a stuck rotation.
 
 resource "aws_cloudwatch_metric_alarm" "rotation_lambda_throttles" {
-  count = var.enable_rotation && var.alarm_sns_topic_arn != null ? 1 : 0
+  count = var.enable_rotation && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-auth0-rotation-throttles"
   comparison_operator = "GreaterThanThreshold"

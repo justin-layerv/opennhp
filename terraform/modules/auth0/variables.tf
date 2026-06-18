@@ -144,7 +144,7 @@ variable "auth0_management_secret_arn" {
 # ==============================================================================
 
 variable "alarm_sns_topic_arn" {
-  description = "SNS topic ARN for CloudWatch alarm notifications. If null, rotation alarms are not created."
+  description = "SNS topic ARN for CloudWatch alarm notifications."
   type        = string
   default     = null
 
@@ -152,6 +152,12 @@ variable "alarm_sns_topic_arn" {
     condition     = var.alarm_sns_topic_arn == null || can(regex("^arn:aws:sns:", var.alarm_sns_topic_arn))
     error_message = "alarm_sns_topic_arn must be a valid SNS topic ARN"
   }
+}
+
+variable "enable_sns_alerts" {
+  description = "Static boolean: set true when this module's SNS-routed Auth0 rotation alarms should be created and alarm_sns_topic_arn is wired. Rotation alarms require a destination and gate count on this value to avoid count-depends-on-computed."
+  type        = bool
+  default     = false
 }
 
 variable "rotation_alarm_duration_threshold_ms" {
