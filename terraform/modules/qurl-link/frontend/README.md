@@ -59,6 +59,16 @@ into `index.html`, and emits a `connect-src` directive for the relay origin
 only. Keep the relay value paired with `relay_dns_name`; without it, the browser
 blocks the agent's `POST /relay/{serverId}` before the backend sees the request.
 
+Terraform reads `nhp-agent.min.js.sri` to render the browser agent script tag's
+`integrity="sha384-..."` metadata. Do not hand-edit the hash. Regenerate the
+bundle instead; the package test and deploy smoke test recompute SHA-384 from
+the bundle bytes and fail if the served artifact and HTML metadata drift. CSP
+hash-pins the inline verifier scripts with `sha256` source expressions; when the
+agent is mounted, `script-src` adds `'self'` for this same-origin module. The
+external bundle's exact-byte pin stays on the script tag's SRI metadata rather
+than as a CSP hash-source. Terraform serves the HTML and bundle with `no-cache`
+so browsers revalidate the SRI-pinned pair during bundle rotations.
+
 After changing the JS agent source or bundle configuration, regenerate and copy
 the bundle from the repository root:
 
@@ -66,7 +76,7 @@ the bundle from the repository root:
 cd endpoints/js-agent
 npm ci
 npm run bundle
-cp dist/nhp-agent.min.js ../../terraform/modules/qurl-link/frontend/nhp-agent.min.js
+npm run sync:qurl-link
 ```
 
 Then run `npm test` from `endpoints/js-agent`. The bundle test rebuilds the

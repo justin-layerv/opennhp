@@ -97,6 +97,7 @@ cases = [
     ("script-src 'self' 'unsafe-inline' 'sha256-abc123+/='", False),
     ("script-src 'self' 'sha256-abc123+/=' 'unsafe-inline'", False),
     ("script-src 'self' https://example.invalid 'sha256-abc123+/='", False),
+    ("script-src 'self' 'sha256-abc123+/=' 'sha384-AbC012+/='", False),
     ("script-src 'sha256-abc123+/='", False),
     ("x-script-src 'self'", False),
     ("default-src 'self'; script-src 'selfish'", False),

@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
     "bundle": "node scripts/bundle.mjs",
+    "sync:qurl-link": "node scripts/sync-qurl-link-bundle.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",
@@ -18,14 +19,14 @@
     "format:check": "prettier --check ."
   },
   "dependencies": {
-    "@noble/ciphers": "^2.2.0",
-    "@noble/curves": "^2.2.0",
-    "@noble/hashes": "^2.2.0"
+    "@noble/ciphers": "2.2.0",
+    "@noble/curves": "2.2.0",
+    "@noble/hashes": "2.2.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.15.21",
-    "esbuild": "^0.28.1",
+    "esbuild": "0.28.1",
     "eslint": "^10.5.0",
     "eslint-config-prettier": "^10.1.8",
     "prettier": "^3.8.4",

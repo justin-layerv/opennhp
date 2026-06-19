@@ -22,6 +22,8 @@ locals {
   index_html = templatefile("${path.module}/frontend/index.html", {
     allowed_hosts_json    = jsonencode([var.domain_name])
     js_agent_enabled      = var.js_agent_enabled
+    js_agent_key          = local.js_agent_key
+    js_agent_sri          = local.js_agent_sri
     relay_base_url        = local.relay_connect_src_origin
     server_static_pub_b64 = var.server_public_key_b64
   })
@@ -33,23 +35,35 @@ locals {
   og_image_png = filebase64("${path.module}/frontend/og-image.png")
   js_agent_js  = var.js_agent_enabled ? file("${path.module}/frontend/nhp-agent.min.js") : ""
 
-  index_content_type     = "text/html"
-  robots_content_type    = "text/plain; charset=utf-8"
-  favicon_content_type   = "image/svg+xml"
-  wordmark_content_type  = "image/svg+xml"
-  og_image_content_type  = "image/png"
-  js_agent_content_type  = "text/javascript; charset=utf-8"
-  html_cache_control     = "max-age=3600, must-revalidate"
+  index_content_type       = "text/html"
+  robots_content_type      = "text/plain; charset=utf-8"
+  favicon_content_type     = "image/svg+xml"
+  wordmark_content_type    = "image/svg+xml"
+  og_image_content_type    = "image/png"
+  js_agent_content_type    = "text/javascript; charset=utf-8"
+  sri_pinned_cache_control = "no-cache"
+  # Legacy HTML keeps the historical one-hour cache window. When the SRI-pinned
+  # browser agent is mounted, HTML and bundle both use no-cache so browsers
+  # revalidate the pair during rotations instead of mixing new integrity metadata
+  # with a stale bundle. A mid-deploy HTML/bundle race fails closed at browser
+  # SRI; #2687 moves the #2680 cutover to content-hashed bundle keys.
+  html_cache_control     = var.js_agent_enabled ? local.sri_pinned_cache_control : "max-age=3600, must-revalidate"
   robots_cache_control   = "max-age=3600, must-revalidate"
   favicon_cache_control  = "max-age=86400, must-revalidate"
   wordmark_cache_control = "max-age=86400, must-revalidate"
   og_image_cache_control = "max-age=86400, must-revalidate"
-  js_agent_cache_control = "max-age=3600, must-revalidate"
+  # aws_s3_object.js_agent is count-gated on js_agent_enabled, so this is only
+  # materialized when the SRI-pinned bundle is mounted.
+  js_agent_cache_control = local.sri_pinned_cache_control
 
   favicon_keys = ["favicon.ico", "favicon.svg"]
   wordmark_key = "layerv-wordmark.svg"
   og_image_key = "og-image.png"
   js_agent_key = "nhp-agent.min.js"
+  # Read the sidecar unconditionally so dark envs still plan-validate the
+  # committed SRI artifact. Only the bundle body/upload is gated on
+  # js_agent_enabled.
+  js_agent_sri = trimspace(file("${path.module}/frontend/nhp-agent.min.js.sri"))
 
   relay_connect_src_origin          = var.relay_connect_src_origin == null ? "" : var.relay_connect_src_origin
   js_agent_connect_src              = join(" ", compact(["'self'", local.relay_connect_src_origin]))
@@ -280,9 +294,36 @@ resource "aws_s3_bucket_policy" "qurl_link" {
   })
 }
 
-# AWS managed cache policy for static content
-data "aws_cloudfront_cache_policy" "caching_optimized" {
-  name = "Managed-CachingOptimized"
+# Module-owned cache policy for static content. Keep min_ttl at zero so the
+# SRI-pinned HTML and JS-agent objects can use origin Cache-Control: no-cache
+# without CloudFront forcing an edge minimum TTL during bundle rotations.
+resource "aws_cloudfront_cache_policy" "qurl_link" {
+  # CloudFront cache-policy names are account-unique; the qurl-link module's
+  # env callers pass distinct frontend domains (sandbox vs prod) into this name.
+  name    = replace("${var.domain_name}-origin-cache-control", ".", "-")
+  comment = "qurl.link static cache policy; origin Cache-Control owns object TTLs"
+  # Match AWS Managed-CachingOptimized's default TTL for any future object that
+  # forgets Cache-Control; min_ttl is the intentional divergence below.
+  default_ttl = 86400
+  max_ttl     = 31536000
+  min_ttl     = 0
+
+  parameters_in_cache_key_and_forwarded_to_origin {
+    enable_accept_encoding_brotli = true
+    enable_accept_encoding_gzip   = true
+
+    cookies_config {
+      cookie_behavior = "none"
+    }
+
+    headers_config {
+      header_behavior = "none"
+    }
+
+    query_strings_config {
+      query_string_behavior = "none"
+    }
+  }
 }
 
 # CloudFront response headers policy with security headers (CSP, HSTS, etc.)
@@ -313,10 +354,11 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
       # the qurl-router authorize check at the resource host, not by this CSP.
       # script-src never includes 'unsafe-inline'. The qurl.link verifier is
       # inlined into index.html and protected by sha256 source expressions so
-      # the page avoids both inline-anything CSP and a parser-blocking network
-      # fetch before token pages can set the verifying class. When
-      # js_agent_enabled uploads nhp-agent.min.js, 'self' is added only for
-      # that reviewed same-origin bundle.
+      # the page avoids inline-anything CSP and a parser-blocking network fetch
+      # before token pages can set the verifying class. When js_agent_enabled
+      # uploads nhp-agent.min.js, 'self' is added only for that reviewed
+      # same-origin bundle; the script tag's integrity attribute owns exact-byte
+      # pinning for the external bundle.
       # connect-src is likewise explicit only for the agent path: the bundled
       # agent fetches the cross-origin relay over HTTPS. default-src 'self'
       # would otherwise block the real in-browser cutover request.
@@ -395,8 +437,7 @@ resource "aws_cloudfront_distribution" "qurl_link" {
     cached_methods   = ["GET", "HEAD"]
     target_origin_id = "S3-${var.bucket_name}"
 
-    # Use managed CachingOptimized policy instead of deprecated forwarded_values
-    cache_policy_id            = data.aws_cloudfront_cache_policy.caching_optimized.id
+    cache_policy_id            = aws_cloudfront_cache_policy.qurl_link.id
     response_headers_policy_id = aws_cloudfront_response_headers_policy.qurl_link.id
 
     viewer_protocol_policy = "redirect-to-https"
@@ -457,7 +498,7 @@ resource "aws_s3_object" "index" {
   content       = local.index_html
   content_type  = local.index_content_type
   etag          = md5(local.index_html)
-  cache_control = local.html_cache_control # 1 hour, easier to invalidate than 24h default
+  cache_control = local.html_cache_control
 
   tags = merge(var.tags, { Component = "qurl-link" })
 
@@ -467,6 +508,19 @@ resource "aws_s3_object" "index" {
   # the template inputs alongside tfvars — this hard-fails plan if the
   # rendered verifier would refuse the serving host.
   lifecycle {
+    precondition {
+      # SHA-384 is 48 bytes, so base64 is exactly 64 chars with no padding.
+      # Terraform cannot recompute sha384 from file bytes; CI and smoke tests
+      # own the sidecar-vs-bundle equality check.
+      condition     = can(regex("^sha384-[A-Za-z0-9+/]{64}$", local.js_agent_sri))
+      error_message = "frontend/nhp-agent.min.js.sri must contain the sha384 SRI value for frontend/nhp-agent.min.js, for example sha384-<base64>. Regenerate it with endpoints/js-agent's sync:qurl-link script."
+    }
+
+    precondition {
+      condition     = !var.js_agent_enabled || strcontains(local.index_html, "src=\"/${local.js_agent_key}\" integrity=\"${local.js_agent_sri}\"")
+      error_message = "frontend/index.html did not render the SRI-pinned browser agent script tag even though js_agent_enabled is true. Keep the js_agent_enabled template block wired to js_agent_key and js_agent_sri."
+    }
+
     precondition {
       condition = (
         strcontains(local.index_html, "allowedHosts") &&

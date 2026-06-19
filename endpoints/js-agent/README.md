@@ -82,29 +82,32 @@ Ported incrementally, each step its own PR:
      are the foreground-recovery and single-flight paths.
 6. **Bundling** — `npm run bundle` (esbuild) emits one self-contained
    ESM file, `dist/nhp-agent.min.js` (~23 KB gzipped), with the `@noble` suite
-   inlined, for the qurl.link page to load as a same-origin module. The
+   inlined, for the qurl.link page to load as a same-origin
+   `<script type="module" src>` with `integrity="sha384-..."`. The
    qurl-link Terraform module renders the relay origin and server static pubkey
    into the page when `js_agent_enabled` is true, then the page imports this
    bundle and performs the bootstrap knock through the relay. `test/bundle.test.ts`
    gates the gzip budget and the runtime public-export surface via esbuild's
    metafile (no execution — node has no DOM; that end-to-end seam is #2616).
-   The qurl-link Terraform module hash-pins its inline verifier script and
+   The qurl-link Terraform module hash-pins its inline verifier scripts with
+   CSP `sha256` source expressions and
    relaxes CSP only when the bundle is intentionally served: `script-src` gains
    `'self'` for the same-origin module, and `connect-src` gains the relay origin
-   so `POST /relay/{serverId}` is not blocked by `default-src 'self'`. The remaining
-   Phase-2 page-migration prerequisite is tracked in #2700: pin the artifact with **Subresource
-   Integrity** (`integrity="sha384-…"` on the `<script>` + a matching CSP
-   hash-source), not just `'self'` — for a crypto agent that gates resource
-   access, pinning the exact bytes beats trusting the origin. The SRI hash is only
-   reproducible if the bundler is pinned: the lockfile is authoritative for
-   `npm ci`, but esbuild's `^` floats on a bare `npm install`, and a bundler bump
-   silently changes the emitted bytes (and the hash) — exact-pin esbuild or compute
-   the hash from the deploy build. (Relatedly, `npm audit --omit=dev` doesn't watch
-   esbuild, so its advisories ride the lockfile + Dependabot, not the runtime audit.)
+   so `POST /relay/{serverId}` is not blocked by `default-src 'self'`. The
+   external bundle's exact-byte pin lives on the script tag's SRI metadata, not
+   as a CSP source expression. Terraform consumes the generated
+   `nhp-agent.min.js.sri` sidecar to render the `integrity` metadata. When the
+   agent is mounted, qurl.link serves the HTML and bundle with `no-cache` so
+   browsers revalidate the SRI-pinned pair during bundle rotations. The package
+   test and deployed smoke coverage recompute SHA-384 from the bundle bytes so
+   artifact and HTML metadata drift fails loudly.
 
 GMSM (SM2/SM3/SM4) is intentionally **not** ported — this fork strips it, so the
 runtime dependency surface is the noble suite only: `@noble/hashes` (BLAKE2s /
 SHA-256 / HMAC), `@noble/curves` (X25519), and `@noble/ciphers` (AES-256-GCM).
+The runtime deps and esbuild are exact-pinned for bundle/SRI reproducibility;
+`.github/dependabot.yml` watches `/endpoints/js-agent` so security and version
+bumps still arrive as explicit PRs.
 
 ## Develop
 
@@ -114,6 +117,7 @@ npm ci
 npm test           # vitest — Go-golden-vector fences (fingerprint, KDF) + crypto KATs
 npm run build      # typecheck: tsc over the src (browser-only) AND test (Node) configs
 npm run bundle     # esbuild → dist/nhp-agent.min.js (ESM, @noble inlined), gzip-budget gated
+npm run sync:qurl-link # rebuild, copy to Terraform qurl-link assets, and write nhp-agent.min.js.sri
 npm run lint       # ESLint (flat config; mirrors the Go golangci-lint gate)
 npm run format     # Prettier --write (CI runs `format:check` to verify)
 ```

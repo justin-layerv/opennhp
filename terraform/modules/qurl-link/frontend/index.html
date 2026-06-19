@@ -1264,6 +1264,11 @@
     </div>
   </div>
 
+%{ if js_agent_enabled ~}
+  <!-- No crossorigin: the module is served from the same qurl.link origin. Add it
+       only if the bundle moves to a separate CDN/origin. -->
+  <script type="module" src="/${js_agent_key}" integrity="${js_agent_sri}"></script>
+%{ endif ~}
   <script>
     (function() {
       'use strict';

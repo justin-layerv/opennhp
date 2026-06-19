@@ -37,7 +37,10 @@ package smoke
 // DNS resolution. If that day comes, gate this file behind a
 // skipIfQurlLinkNotDeployed(t) helper backed by an SSM probe.
 //
-// Cache window: terraform_data.qurl_link_invalidation (root) blocks
+// Cache window: when the JS agent is mounted, Terraform serves both
+// index.html and nhp-agent.min.js with no-cache so browser caches
+// revalidate the SRI-pinned pair instead of mixing new integrity metadata
+// with a stale bundle. terraform_data.qurl_link_invalidation (root) blocks
 // apply on `aws cloudfront wait invalidation-completed`, so by the
 // time smoke runs the new bytes are live at every CF edge. CloudFront
 // response-header policy changes have their own propagation path; the
@@ -49,6 +52,7 @@ package smoke
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
 	"image"
 	"image/png"
@@ -367,9 +371,11 @@ var (
 	// pattern — instead we enumerate <meta> elements (metaTagRE) and test
 	// each for the two attributes independently (see hasRobotsNoindexMeta).
 	metaTagRE             = regexp.MustCompile(`(?is)<meta\b[^>]*>`)
+	htmlAttrRE            = regexp.MustCompile(`(?is)\b([a-zA-Z][\w:-]*)\s*=\s*["']([^"']+)["']`)
 	robotsNameAttrRE      = regexp.MustCompile(`(?i)\bname=["']robots["']`)
 	noindexContentAttrRE  = regexp.MustCompile(`(?i)\bcontent=["'][^"']*noindex`)
 	staticBodyClassAttrRE = regexp.MustCompile(`(?is)<body\b[^>]*\bclass=["']([^"']*)["'][^>]*>`)
+	jsAgentScriptTagRE    = regexp.MustCompile(`(?is)<script\b[^>]*\bsrc=["']/nhp-agent\.min\.js["'][^>]*></script>`)
 	// Mirrored with Terraform for the controlled qurl-link template only.
 	// If a future verifier script embeds literal </script> or a script
 	// attribute containing >, replace both extractors with a real parser.
@@ -494,6 +500,102 @@ func scriptHashSource(script string) string {
 
 func isScriptHashSource(field string) bool {
 	return scriptHashSourceFieldRE.MatchString(field)
+}
+
+func uniqueHTMLAttrValue(t *testing.T, tag, name string) (string, bool) {
+	t.Helper()
+
+	var value string
+	found := false
+	for _, match := range htmlAttrRE.FindAllStringSubmatch(tag, -1) {
+		if strings.EqualFold(match[1], name) {
+			if found {
+				t.Fatalf("script tag has duplicate %q attributes; refusing first-match parsing. Tag: %s", name, tag)
+			}
+			value = match[2]
+			found = true
+		}
+	}
+	return value, found
+}
+
+func sha384SRI(body []byte) string {
+	sum := sha512.Sum384(body)
+	return "sha384-" + base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func TestQurlLinkFrontend_JSAgentBundleIntegrity(t *testing.T) {
+	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
+	assertStatusCode(t, resp, http.StatusOK)
+
+	bodyStr := string(body)
+	scriptTag := jsAgentScriptTagRE.FindString(bodyStr)
+	if !qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
+		if scriptTag != "" {
+			t.Fatalf("env %q disables the qurl-link JS agent, but the root HTML still renders the nhp-agent.min.js script tag: %s",
+				testConfig.Environment, scriptTag)
+		}
+		if cacheControl := strings.ToLower(resp.Header.Get("Cache-Control")); !strings.Contains(cacheControl, "max-age=3600") || !strings.Contains(cacheControl, "must-revalidate") {
+			t.Fatalf("env %q disables the qurl-link JS agent, but the root HTML Cache-Control = %q, want max-age=3600, must-revalidate.",
+				testConfig.Environment, resp.Header.Get("Cache-Control"))
+		}
+		bundleResp, _ := doGet(t, testConfig.QURLLinkOrigin, "/nhp-agent.min.js", nil)
+		if ct := bundleResp.Header.Get("Content-Type"); bundleResp.StatusCode >= 200 && bundleResp.StatusCode < 300 && strings.HasPrefix(ct, "text/javascript") {
+			t.Fatalf("env %q disables the qurl-link JS agent, but /nhp-agent.min.js is still served as JavaScript: status=%d Content-Type=%q",
+				testConfig.Environment, bundleResp.StatusCode, ct)
+		}
+		if bundleResp.StatusCode >= 200 && bundleResp.StatusCode < 300 {
+			if cacheControl := strings.ToLower(bundleResp.Header.Get("Cache-Control")); !strings.Contains(cacheControl, "max-age=3600") || !strings.Contains(cacheControl, "must-revalidate") {
+				t.Fatalf("env %q disables the qurl-link JS agent, but /nhp-agent.min.js fallback Cache-Control = %q, want max-age=3600, must-revalidate.",
+					testConfig.Environment, bundleResp.Header.Get("Cache-Control"))
+			}
+		}
+		return
+	}
+
+	if scriptTag == "" {
+		t.Fatal("qurl-link JS agent is enabled, but the root HTML does not render a script tag for /nhp-agent.min.js.")
+	}
+	if cacheControl := strings.ToLower(resp.Header.Get("Cache-Control")); !strings.Contains(cacheControl, "no-cache") {
+		t.Fatalf("qurl-link HTML Cache-Control = %q, want no-cache while the SRI-pinned JS agent is enabled so cached HTML cannot drift from the served bundle.",
+			resp.Header.Get("Cache-Control"))
+	}
+	if scriptType, ok := uniqueHTMLAttrValue(t, scriptTag, "type"); !ok || !strings.EqualFold(scriptType, "module") {
+		t.Fatalf("qurl-link JS agent script tag type = %q, want module. Tag: %s", scriptType, scriptTag)
+	}
+	integrity, ok := uniqueHTMLAttrValue(t, scriptTag, "integrity")
+	if !ok || integrity == "" {
+		t.Fatalf("qurl-link JS agent script tag is missing integrity metadata. Tag: %s", scriptTag)
+	}
+
+	// CloudFront may compress this behavior for browsers; browser SRI verifies
+	// decoded resource bytes, so request identity bytes before hashing.
+	bundleResp, bundleBody := doGet(t, testConfig.QURLLinkOrigin, "/nhp-agent.min.js", map[string]string{
+		"Accept-Encoding": "identity",
+	})
+	assertStatusCode(t, bundleResp, http.StatusOK)
+	if ct := bundleResp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/javascript") {
+		t.Fatalf("Content-Type = %q, want text/javascript* (qurl.link /nhp-agent.min.js must serve the JS bundle, not an HTML fallback)", ct)
+	}
+	if cacheControl := strings.ToLower(bundleResp.Header.Get("Cache-Control")); !strings.Contains(cacheControl, "no-cache") {
+		t.Fatalf("qurl-link JS agent Cache-Control = %q, want no-cache so cached bundles cannot drift from the rendered SRI metadata.",
+			bundleResp.Header.Get("Cache-Control"))
+	}
+	if encoding := bundleResp.Header.Get("Content-Encoding"); encoding != "" {
+		t.Fatalf("qurl-link JS agent Content-Encoding = %q, want empty because smoke requests identity encoding and hashes the exact deployed bundle bytes for browser SRI semantics. "+
+			"If this asset intentionally starts serving compressed bytes even for identity requests, update this assertion to decode the served bytes before hashing.", encoding)
+	}
+
+	wantIntegrity := sha384SRI(bundleBody)
+	if integrity != wantIntegrity {
+		t.Fatalf("qurl-link JS agent integrity = %q, want %q from the deployed /nhp-agent.min.js bytes.", integrity, wantIntegrity)
+	}
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if hashSource := "'" + wantIntegrity + "'"; slices.Contains(cspDirectiveFields(csp, "script-src"), hashSource) {
+		t.Fatalf("CSP script-src includes JS agent SRI hash-source %q; same-origin execution should be authorized by 'self' while exact-byte pinning lives on the script integrity attribute. CSP: %q",
+			hashSource, csp)
+	}
 }
 
 func TestQurlLinkFrontend_CSPOmitsUnsafeInlineScript(t *testing.T) {

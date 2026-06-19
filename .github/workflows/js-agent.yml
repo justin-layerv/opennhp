@@ -27,11 +27,13 @@ on:
     paths:
       - 'endpoints/js-agent/**'
       - 'terraform/modules/qurl-link/frontend/nhp-agent.min.js'
+      - 'terraform/modules/qurl-link/frontend/nhp-agent.min.js.sri'
       - '.github/workflows/js-agent.yml'
   pull_request:
     paths:
       - 'endpoints/js-agent/**'
       - 'terraform/modules/qurl-link/frontend/nhp-agent.min.js'
+      - 'terraform/modules/qurl-link/frontend/nhp-agent.min.js.sri'
       - '.github/workflows/js-agent.yml'
 
 permissions:
