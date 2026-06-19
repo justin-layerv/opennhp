@@ -1608,6 +1608,9 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Fetch legacy qurl.link CSP source
+        run: git fetch --no-tags --depth=1 origin e908489ee8d90a16075cd722a81191d7c23a1954
+
       - name: Shellcheck the CSP drift script and fixture runner
         run: |
           shellcheck ./scripts/check-qurl-csp-gate-drift.sh
@@ -2823,7 +2826,7 @@ jobs:
         timeout-minutes: 22
         env:
           QURL_LINK_URL: ${{ steps.qurl-domain-sandbox.outputs.qurl_link_url }}
-          EXPECTED_SCRIPT_SRC_RE: "(^|;[[:space:]]*)script-src[[:space:]]+'unsafe-inline'[[:space:]]+'self'([[:space:]]*;|[[:space:]]*$)"
+          EXPECTED_SCRIPT_SRC_RE: "(^|;[[:space:]]*)script-src[[:space:]]+'self'([[:space:]]+'sha256-[A-Za-z0-9+/]+={0,2}')+([[:space:]]*;|[[:space:]]*$)"
         run: |
           set -euo pipefail
 
@@ -2836,11 +2839,10 @@ jobs:
           PROBE_URL="${QURL_LINK_URL%/}/"
 
           # Keep this directive-level check aligned with
-          # tests/smoke/16_qurl_link_frontend_test.go::scriptSrcInlineAndSelfRE.
-          # This validate job is sandbox-only, so the expected posture is the
-          # sandbox qurl_link_js_agent_enabled=true posture. If sandbox flips
-          # that tfvar, update this gate and qurlLinkJSAgentEnabledEnvs in the
-          # same PR.
+          # tests/smoke/16_qurl_link_frontend_test.go::scriptSrcSandboxHashRE.
+          # This validate job is sandbox-only. If sandbox flips
+          # qurl_link_js_agent_enabled, update qurlLinkJSAgentEnabledEnvs in the
+          # same PR so the smoke connect-src fence stays aligned.
           # QURL_LINK_URL normally comes from SSM, which is the live deploy
           # source of truth. deploy-sandbox-validate exposes that resolved
           # value to nhp-smoke-sandbox as QURL_LINK_ORIGIN so this gate and
@@ -2868,15 +2870,15 @@ jobs:
               exit 0
             fi
 
-            echo "Attempt $attempt/60: curl_exit=$LAST_CURL_EXIT http_status=$LAST_HTTP_STATUS CSP is $LAST_CSP; waiting for script-src 'unsafe-inline' 'self'"
+            echo "Attempt $attempt/60: curl_exit=$LAST_CURL_EXIT http_status=$LAST_HTTP_STATUS CSP is $LAST_CSP; waiting for script-src 'self' plus verifier hashes"
           done
 
           if [[ "$LAST_CURL_EXIT" -ne 0 ]]; then
             echo "::warning::qurl.link CSP probe could not reach $PROBE_URL after 60 bounded attempts; last curl_exit: $LAST_CURL_EXIT; last http_status: $LAST_HTTP_STATUS; last observed CSP: $LAST_CSP"
           else
-            echo "::warning::qurl.link CSP did not propagate to the expected sandbox js-agent posture after 60 bounded attempts; last http_status: $LAST_HTTP_STATUS; last observed CSP: $LAST_CSP"
+            echo "::warning::qurl.link CSP did not propagate to the expected hash-based sandbox script-src posture after 60 bounded attempts; last http_status: $LAST_HTTP_STATUS; last observed CSP: $LAST_CSP"
           fi
-          echo "Continuing so the full smoke suite still runs; TestQurlLinkFrontend_CSPAllowsInlineScript remains the hard CSP gate."
+          echo "Continuing so the full smoke suite still runs; TestQurlLinkFrontend_CSPOmitsUnsafeInlineScript remains the hard CSP gate."
 
       - name: Deployment Summary
         run: |

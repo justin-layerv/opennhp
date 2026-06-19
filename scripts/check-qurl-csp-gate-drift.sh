@@ -6,11 +6,10 @@
 #
 # The workflow cannot import the Go smoke regex, and the smoke module cannot
 # import workflow YAML. This lint keeps the duplicated contract honest:
-#   - workflow EXPECTED_SCRIPT_SRC_RE and scriptSrcInlineAndSelfRE must agree
+#   - workflow EXPECTED_SCRIPT_SRC_RE and scriptSrcSandboxHashRE must agree
 #     on realistic CSP inputs;
-#   - sandbox qurl_link_js_agent_enabled must stay true while the sandbox-only
-#     gate expects the js-agent posture; prod posture is intentionally out of
-#     scope for this lint because the propagation wait does not run in prod;
+#   - sandbox qurl_link_js_agent_enabled must stay aligned with the smoke mirror
+#     because sandbox also fences the js-agent connect-src posture;
 #   - the workflow fallback origin must match the smoke sandbox default.
 
 set -euo pipefail
@@ -20,6 +19,8 @@ WORKFLOW_FILE="${1:-${REPO_ROOT}/.github/workflows/build-and-push.yml}"
 SMOKE_FILE="${2:-${REPO_ROOT}/tests/smoke/16_qurl_link_frontend_test.go}"
 DNS_FILE="${3:-${REPO_ROOT}/tests/smoke/dns.go}"
 SANDBOX_TFVARS="${4:-${REPO_ROOT}/terraform/environments/sandbox/terraform.tfvars}"
+QURL_LINK_MODULE_FILE="${5:-${REPO_ROOT}/terraform/modules/qurl-link/main.tf}"
+LEGACY_ROLLOUT_INDEX_REF="${6:-e908489ee8d90a16075cd722a81191d7c23a1954:terraform/modules/qurl-link/frontend/index.html}"
 
 require_file() {
   local file="$1"
@@ -46,7 +47,7 @@ single_match() {
   printf '%s\n' "$non_empty"
 }
 
-for file in "$WORKFLOW_FILE" "$SMOKE_FILE" "$DNS_FILE" "$SANDBOX_TFVARS"; do
+for file in "$WORKFLOW_FILE" "$SMOKE_FILE" "$DNS_FILE" "$SANDBOX_TFVARS" "$QURL_LINK_MODULE_FILE"; do
   require_file "$file"
 done
 
@@ -61,9 +62,9 @@ workflow_re="$(
   )"
 )"
 smoke_re="$(
-  single_match "smoke scriptSrcInlineAndSelfRE" "$(
+  single_match "smoke scriptSrcSandboxHashRE" "$(
     # shellcheck disable=SC2016 # backticks are literal Go raw-string delimiters
-    sed -nE 's/^[[:space:]]*scriptSrcInlineAndSelfRE[[:space:]]*=[[:space:]]*regexp\.MustCompile\(`([^`]+)`\).*$/\1/p' "$SMOKE_FILE"
+    sed -nE 's/^[[:space:]]*scriptSrcSandboxHashRE[[:space:]]*=[[:space:]]*regexp\.MustCompile\(`([^`]+)`\).*$/\1/p' "$SMOKE_FILE"
   )"
 )"
 
@@ -86,14 +87,19 @@ if "[[:" in workflow_re or ":]]" in workflow_re:
     sys.exit(1)
 
 cases = [
-    ("script-src 'unsafe-inline' 'self'", True),
-    ("script-src   'unsafe-inline'   'self'   ", True),
-    ("default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'", True),
-    ("style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self';", True),
+    ("script-src 'self' 'sha256-abc123+/='", True),
+    ("script-src   'self'   'sha256-abc123+/='   ", True),
+    ("default-src 'self'; script-src 'self' 'sha256-abc123+/='; style-src 'unsafe-inline'", True),
+    ("style-src 'unsafe-inline'; script-src 'self' 'sha256-abc123+/=' 'sha256-def456+/=';", True),
+    ("script-src 'self'", False),
     ("script-src 'unsafe-inline'", False),
-    ("script-src 'self' 'unsafe-inline'", False),
-    ("x-script-src 'unsafe-inline' 'self'", False),
-    ("default-src 'self'; script-src 'unsafe-inline' 'selfish'", False),
+    ("script-src 'unsafe-inline' 'self'", False),
+    ("script-src 'self' 'unsafe-inline' 'sha256-abc123+/='", False),
+    ("script-src 'self' 'sha256-abc123+/=' 'unsafe-inline'", False),
+    ("script-src 'self' https://example.invalid 'sha256-abc123+/='", False),
+    ("script-src 'sha256-abc123+/='", False),
+    ("x-script-src 'self'", False),
+    ("default-src 'self'; script-src 'selfish'", False),
 ]
 
 def matches(pattern: str, value: str) -> bool:
@@ -116,6 +122,79 @@ if failures:
     print("ERROR: qurl.link CSP gate drift:", file=sys.stderr)
     for failure in failures:
         print(f"  - {failure}", file=sys.stderr)
+    sys.exit(1)
+PY
+
+if ! git -C "$REPO_ROOT" cat-file -e "$LEGACY_ROLLOUT_INDEX_REF"; then
+  echo "ERROR: legacy qurl.link rollout source is missing from git history: $LEGACY_ROLLOUT_INDEX_REF" >&2
+  echo "       Fetch e908489ee8d90a16075cd722a81191d7c23a1954 before running this lint." >&2
+  exit 1
+fi
+
+python3 - "$QURL_LINK_MODULE_FILE" "$REPO_ROOT" "$LEGACY_ROLLOUT_INDEX_REF" <<'PY'
+import base64
+import hashlib
+import re
+import subprocess
+import sys
+
+module_file, repo_root, legacy_index_ref = sys.argv[1], sys.argv[2], sys.argv[3]
+module_text = open(module_file, encoding="utf-8").read()
+legacy_index_html = subprocess.check_output(
+    ["git", "-C", repo_root, "cat-file", "-p", legacy_index_ref],
+    encoding="utf-8",
+)
+
+block_match = re.search(
+    r"legacy_rollout_script_hashes\s*=\s*\[(.*?)\]",
+    module_text,
+    re.DOTALL,
+)
+if not block_match:
+    print(
+        f"ERROR: legacy_rollout_script_hashes block not found in {module_file}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+configured_hashes = [
+    value
+    for value in re.findall(r'"([^"]+)"', block_match.group(1))
+    if value.startswith("'sha256-")
+]
+
+executable_types = {"", "text/javascript", "application/javascript", "module"}
+script_bodies = []
+for attrs, body in re.findall(r"(?is)<script\b([^>]*)>(.*?)</script>", legacy_index_html):
+    if body.strip() == "":
+        continue
+    if re.search(r"(?i)(?:^|\s)src\s*=", attrs):
+        continue
+    type_match = re.search(r"(?i)(?:^|\s)type\s*=\s*[\"']?([^\"'\s>]+)", attrs)
+    script_type = type_match.group(1).strip().lower() if type_match else ""
+    if script_type not in executable_types:
+        continue
+    script_bodies.append(body.encode("utf-8"))
+
+# Keep this count in lockstep with the Terraform qurl-link precondition and
+# Go smoke CSP test; all three mirror the controlled template shape.
+if len(script_bodies) != 2:
+    print(
+        f"ERROR: {legacy_index_ref}: expected exactly 2 executable inline scripts, found {len(script_bodies)}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+computed_hashes = []
+for body in script_bodies:
+    computed_hashes.append(
+        "'sha256-" + base64.b64encode(hashlib.sha256(body).digest()).decode("ascii") + "'"
+    )
+
+if configured_hashes != computed_hashes:
+    print("ERROR: legacy_rollout_script_hashes do not match legacy git blob-derived hashes:", file=sys.stderr)
+    print(f"  configured ({module_file}): {configured_hashes}", file=sys.stderr)
+    print(f"  computed   ({legacy_index_ref}): {computed_hashes}", file=sys.stderr)
     sys.exit(1)
 PY
 
@@ -147,7 +226,7 @@ if [ "$sandbox_tf_enabled" != "$smoke_map_enabled" ]; then
   exit 1
 fi
 if [ "$sandbox_tf_enabled" != "true" ]; then
-  echo "ERROR: qurl.link CSP gate expects sandbox js-agent posture, but sandbox tfvars disables it." >&2
+  echo "ERROR: qurl.link CSP smoke mirror expects sandbox js-agent connect-src posture, but sandbox tfvars disables it." >&2
   echo "       Update the workflow gate and smoke map in the same PR as any tfvar flip." >&2
   exit 1
 fi

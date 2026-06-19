@@ -1,0 +1,14 @@
+# 2026-06-18 · PR #2713 · qurl.link strict script CSP
+
+- **Owner:** prod rollout coordinator
+- **Source:** [PR #2713](https://github.com/layervai/nhp/pull/2713), [issue #2701](https://github.com/layervai/nhp/issues/2701), [cleanup issue #2717](https://github.com/layervai/nhp/issues/2717)
+
+The first prod rollout of PR #2713 removes `script-src 'unsafe-inline'` from qurl.link and keeps two temporary compatibility hashes for the exact pre-#2701 inline verifier scripts while CloudFront HTML object and response-header propagation converges. The compatibility hashes only restore old script execution during propagation; this PR does not change legacy prod `connect-src`, so old cached HTML keeps using the same `default-src 'self'` fallback for the resolve POST. After that strict-CSP rollout and normal cache window complete, remove the compatibility hashes through #2717 and delete this ledger entry.
+
+Live prod provenance check on 2026-06-18: `GET https://qurl.link/` returned status 200, `Cache-Control: max-age=3600, must-revalidate`, and the old `script-src 'unsafe-inline'` header. The full HTML is not byte-identical to the `e908489e` blob because the theme bytes differ, but the two executable inline script bodies are byte-identical to `e908489ee8d90a16075cd722a81191d7c23a1954:terraform/modules/qurl-link/frontend/index.html`; their live hashes are `sha256-lQZ5xt5AMAT1GGKf9WfLPyJL393SyPoCqdlUSIDYdy0=` and `sha256-NV09DWZPPAO4Bua9v9d9oQmHfucTzi5onwG88dNPYnU=`.
+
+The smoke suite positively verifies the currently served HTML script hashes against the live CSP. It does not fetch old cached HTML, so the temporary legacy compatibility hashes are intentionally guarded by the PR-time git-blob drift lint until #2717 removes them.
+
+- [ ] Post-rollout: after prod has served the strict qurl.link CSP for one normal CloudFront/cache propagation window, verify qurl.link still emits no `script-src 'unsafe-inline'` and that access-token verification still reaches the expected resolver/relay path.
+- [ ] Post-rollout: remove `legacy_rollout_script_hashes` and its concat shim via #2717, then confirm the rendered qurl.link CSP still contains only the current rendered script hashes plus optional JS-agent `'self'` when enabled, with no stale `lQZ5xt5...` or `NV09DWZ...` compatibility hash left behind. That cleanup must also remove the legacy-blob hash check from `scripts/check-qurl-csp-gate-drift.sh`, the qURL CSP lint job's `Fetch legacy qurl.link CSP source` step, and the local shallow-clone fetch note in `tests/lints/qurl-csp-gate-drift/README.md`.
+- [ ] Rollback: if the strict-CSP rollout blocks qurl.link token verification, revert PR #2713 or temporarily restore the previous qurl-link response-header policy while investigating the rendered script hash mismatch, then re-apply only after the Terraform console and smoke hash checks match served bytes.

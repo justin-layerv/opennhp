@@ -30,6 +30,19 @@ the documented brand region before the smoke suite sees the deployed asset.
 
 ## Browser NHP Agent Bundle
 
+`index.html` is the verifier source that Terraform renders and pins with
+`script-src 'sha256-...'` source expressions. Terraform computes active hashes
+from every non-empty executable inline script body in the rendered template,
+then carries two pre-#2701 compatibility hashes so cached old HTML keeps working
+while the first strict-CSP response-header rollout propagates. Remove those
+temporary compatibility hashes via #2717 after the first prod strict-CSP rollout
+completes.
+
+Prod does not run a qurl.link deploy-time smoke for this CSP posture; the prod
+safety property is structural. Terraform hashes the same rendered `index.html`
+script bodies that it uploads as S3 object content, so the emitted CSP and
+served bytes share one source value.
+
 `nhp-agent.min.js` is generated from the `endpoints/js-agent` package and is
 only uploaded by the qURL link Terraform module when `js_agent_enabled` is true.
 Sandbox enables it so the qURL relay browser cutover can load the reviewed

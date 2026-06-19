@@ -10,7 +10,7 @@ package smoke
 // sandbox uses the same-origin JS agent and HTTPS relay, while legacy envs
 // still POST to a hostname-derived resolve endpoint. The deployed page must
 // include the serving host in the allowlist and must serve the CSP that lets
-// the inline IIFE execute.
+// only hash-authorized inline scripts execute.
 //
 // Capability added in PR #1824. A drift where terraform uploads a
 // stripped-down build loses the wire silently — visits stay up,
@@ -28,8 +28,8 @@ package smoke
 // not a behavioral check. If you're touching the SPA's instrumentation
 // API and this fails, update the test in the same commit.
 //
-// Source of truth: terraform/modules/qurl-link/frontend/index.html
-// (deploys via terraform/modules/qurl-link/main.tf::aws_s3_object.index).
+// Source of truth: terraform/modules/qurl-link/frontend/index.html (rendered
+// and hash-pinned by terraform/modules/qurl-link/main.tf).
 //
 // Assumption: both deployed envs always set var.deploy_qurl_link=true.
 // All four tests below GET testConfig.QURLLinkOrigin unconditionally;
@@ -48,11 +48,14 @@ package smoke
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"image"
 	"image/png"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -65,11 +68,12 @@ import (
 func TestQurlLinkFrontend_VerifierWireContract(t *testing.T) {
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
-	bodyStr := string(body)
+	htmlStr := string(body)
 
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Fatalf("Content-Type = %q, want text/html* (qurl.link / must serve the SPA, not a JSON / redirect)", ct)
 	}
+	bodyStr := inlineVerifierScript(t, htmlStr)
 
 	if qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
 		wantSnippets := []string{
@@ -289,22 +293,22 @@ func qurlOGImageHasLayerVWordmarkPixels(img image.Image) bool {
 func TestQurlLinkFrontend_UsesExpectedIngress(t *testing.T) {
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
+	script := inlineVerifierScript(t, string(body))
 
-	bodyStr := string(body)
 	if qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
 		for _, want := range qurlLinkJSAgentNetworkOrigins[testConfig.Environment] {
-			if !strings.Contains(bodyStr, want) {
+			if !strings.Contains(script, want) {
 				t.Fatalf("deployed JS-agent qurl.link verifier does not contain relay origin %q.", want)
 			}
 		}
-		if strings.Contains(bodyStr, "'https://resolve.' + hostname + '/plugins/qurl'") {
+		if strings.Contains(script, "'https://resolve.' + hostname + '/plugins/qurl'") {
 			t.Fatalf("deployed JS-agent qurl.link verifier still derives resolve URL from window.location.hostname.")
 		}
 		return
 	}
 
 	want := "'https://resolve.' + hostname + '/plugins/qurl'"
-	if !strings.Contains(bodyStr, want) {
+	if !strings.Contains(script, want) {
 		t.Fatalf("legacy deployed SPA does not derive resolve URL from window.location.hostname; expected substring %q.", want)
 	}
 }
@@ -324,37 +328,35 @@ func TestQurlLinkFrontend_AllowlistContainsServingHost(t *testing.T) {
 	}
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
+	script := inlineVerifierScript(t, string(body))
 
 	// u.Hostname() strips a port if present; the SPA's ALLOWED_HOSTS
 	// contains the bare hostname, so QURL_LINK_ORIGIN=https://host:443
 	// (debugging / mitm proxy) still matches.
-	want := "'" + u.Hostname() + "'"
-	if !strings.Contains(string(body), want) {
+	want := "\"" + u.Hostname() + "\""
+	if !strings.Contains(script, want) {
 		t.Fatalf("deployed SPA's ALLOWED_HOSTS does not include %q — every visit would hit the branded error page. "+
 			"This means terraform plan accepted the upload but the deployed bytes don't match what the precondition validated.", want)
 	}
 }
 
-// TestQurlLinkFrontend_CSPAllowsInlineScript fences both supported CSP postures
+// TestQurlLinkFrontend_CSPOmitsUnsafeInlineScript fences both supported CSP postures
 // the response_headers_policy declares:
 //
-//  1. 'unsafe-inline' is present — without it, the inline IIFE refuses
-//     to execute in any modern browser and users see the loading
-//     spinner forever.
-//  2. Envs without the browser NHP agent keep NO other sources listed: the
-//     bucket only serves the inline-script page, so same-origin .js loads
-//     stay blocked and connect-src falls back to default-src 'self'.
-//  3. Envs with the browser NHP agent explicitly allow 'self', matching the
-//     Terraform switch that uploads nhp-agent.min.js beside the verifier shell.
-//  4. Envs with the browser NHP agent also list the relay origin in
-//     connect-src; otherwise the cross-origin relay POST is blocked by
-//     default-src 'self' before relay or server can see it.
+//  1. script-src omits 'unsafe-inline' and includes a sha256 source for every
+//     executable inline script served in index.html.
+//  2. Envs with the browser NHP agent additionally include 'self' so the
+//     same-origin NHP agent bundle can execute.
+//  3. Envs without the browser NHP agent keep connect-src unset, so legacy
+//     qurl-link falls back to default-src 'self' for fetch/XHR.
+//  4. Envs with the browser NHP agent list the relay origin in connect-src;
+//     otherwise the cross-origin relay POST is blocked by default-src 'self'
+//     before relay or server can see it.
 //
-// If a future PR moves to a hash- or nonce-based CSP, that PR must
-// update this assertion in lockstep.
-//
-// Regex anchor: `script-src` value must be exactly one of the supported
-// postures, ending either with `;` (directive separator) or end-of-string.
+// Regex anchor: sandbox's script-src value must be 'self' followed by one or
+// more sha256 hashes, ending either with `;` (directive separator) or
+// end-of-string. This mirrors the workflow propagation gate; the parser checks
+// below perform the exact source-list assertions.
 // Anchored on start-of-string or a preceding directive separator instead of
 // `\b` so a future CSP shape with hyphenated tokens before the directive can't
 // accidentally satisfy the boundary.
@@ -368,10 +370,16 @@ var (
 	robotsNameAttrRE      = regexp.MustCompile(`(?i)\bname=["']robots["']`)
 	noindexContentAttrRE  = regexp.MustCompile(`(?i)\bcontent=["'][^"']*noindex`)
 	staticBodyClassAttrRE = regexp.MustCompile(`(?is)<body\b[^>]*\bclass=["']([^"']*)["'][^>]*>`)
-	scriptSrcOnlyInlineRE = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s*(?:;|$)`)
+	// Mirrored with Terraform for the controlled qurl-link template only.
+	// If a future verifier script embeds literal </script> or a script
+	// attribute containing >, replace both extractors with a real parser.
+	scriptElementRE  = regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`)
+	scriptSrcAttrRE  = regexp.MustCompile(`(?i)(?:^|\s)src\s*=`)
+	scriptTypeAttrRE = regexp.MustCompile(`(?i)(?:^|\s)type\s*=\s*["']?([^"'\s>]+)`)
 	// Keep this directive-level posture in lockstep with build-and-push.yml's
 	// qurl.link CSP propagation gate.
-	scriptSrcInlineAndSelfRE      = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s+'self'\s*(?:;|$)`)
+	scriptSrcSandboxHashRE        = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'self'(?:\s+'sha256-[A-Za-z0-9+/]+={0,2}')+\s*(?:;|$)`)
+	scriptHashSourceFieldRE       = regexp.MustCompile(`^'sha256-[A-Za-z0-9+/]+={0,2}'$`)
 	reducedMotionScrollBehaviorRE = regexp.MustCompile(
 		`(?is)@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)\s*\{[^{}]*html\s*\{[^{}]*scroll-behavior\s*:\s*auto\s*;`,
 	)
@@ -381,9 +389,9 @@ var (
 )
 
 // qurlLinkJSAgentEnabledEnvs mirrors the env-level
-// qurl_link_js_agent_enabled tfvars switch. The smoke CSP fence allows
-// same-origin script loads only while Terraform is intentionally serving the
-// browser NHP agent bundle in that env.
+// qurl_link_js_agent_enabled tfvars switch. Enabled envs allow the same-origin
+// NHP agent bundle via 'self' and require the browser-agent connect-src network
+// allowlist.
 var qurlLinkJSAgentEnabledEnvs = map[string]bool{
 	"sandbox": true,
 }
@@ -413,6 +421,45 @@ func hasRobotsNoindexMeta(body string) bool {
 	return false
 }
 
+func inlineVerifierScript(t *testing.T, body string) string {
+	t.Helper()
+
+	scripts := inlineExecutableScripts(body)
+	for _, script := range scripts {
+		if strings.Contains(script, "QURL_LINK_CONFIG") {
+			return script
+		}
+	}
+	t.Fatalf("deployed SPA has %d executable inline script block(s), but none contains the qurl.link verifier config.", len(scripts))
+	return ""
+}
+
+func inlineExecutableScripts(body string) []string {
+	var scripts []string
+	for _, match := range scriptElementRE.FindAllStringSubmatch(body, -1) {
+		attrs, scriptBody := match[1], match[2]
+		if scriptSrcAttrRE.MatchString(attrs) || isNonExecutableScriptElement(attrs) {
+			continue
+		}
+		if strings.TrimSpace(scriptBody) != "" {
+			scripts = append(scripts, scriptBody)
+		}
+	}
+	return scripts
+}
+
+func isNonExecutableScriptElement(attrs string) bool {
+	match := scriptTypeAttrRE.FindStringSubmatch(attrs)
+	if len(match) != 2 {
+		return false
+	}
+	scriptType := strings.ToLower(strings.TrimSpace(match[1]))
+	return scriptType != "" &&
+		scriptType != "text/javascript" &&
+		scriptType != "application/javascript" &&
+		scriptType != "module"
+}
+
 func cspDirectiveFields(csp, directiveName string) []string {
 	for _, directive := range strings.Split(csp, ";") {
 		fields := strings.Fields(strings.TrimSpace(directive))
@@ -440,8 +487,17 @@ func sameStringSet(got, want []string) bool {
 	return true
 }
 
-func TestQurlLinkFrontend_CSPAllowsInlineScript(t *testing.T) {
-	resp, _ := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
+func scriptHashSource(script string) string {
+	sum := sha256.Sum256([]byte(script))
+	return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
+}
+
+func isScriptHashSource(field string) bool {
+	return scriptHashSourceFieldRE.MatchString(field)
+}
+
+func TestQurlLinkFrontend_CSPOmitsUnsafeInlineScript(t *testing.T) {
+	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
 
 	csp := resp.Header.Get("Content-Security-Policy")
@@ -449,20 +505,47 @@ func TestQurlLinkFrontend_CSPAllowsInlineScript(t *testing.T) {
 		t.Fatal("Content-Security-Policy response header is empty — the response_headers_policy is not attached, or CloudFront stopped emitting it.")
 	}
 
-	wantPosture := "'unsafe-inline'-only"
-	wantRE := scriptSrcOnlyInlineRE
-	if qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
-		wantPosture = "'unsafe-inline' plus 'self' for the same-origin browser NHP agent bundle"
-		wantRE = scriptSrcInlineAndSelfRE
+	scriptSrc := cspDirectiveFields(csp, "script-src")
+	if len(scriptSrc) == 0 {
+		t.Fatalf("CSP script-src directive is missing; qurl.link must explicitly authorize only hash-pinned verifier scripts. CSP: %q", csp)
 	}
-	if !wantRE.MatchString(csp) {
-		t.Fatalf("CSP script-src directive does not match the expected %s posture. "+
-			"Either 'unsafe-inline' is missing (SPA won't execute) or the allowed script sources drifted from the env's Terraform switch. "+
-			"CSP: %q", wantPosture, csp)
+	if slices.Contains(scriptSrc, "'unsafe-inline'") {
+		t.Fatalf("CSP script-src still contains 'unsafe-inline'; qurl.link verifier scripts must be hash-authorized. CSP: %q", csp)
+	}
+
+	scripts := inlineExecutableScripts(string(body))
+	// Keep this count in lockstep with the Terraform qurl-link precondition and
+	// Python CSP drift lint; all three mirror the controlled template shape.
+	if len(scripts) != 2 {
+		t.Fatalf("deployed SPA has %d executable inline script block(s), want exactly 2 hash-authorized verifier scripts.", len(scripts))
+	}
+	for _, script := range scripts {
+		wantHash := scriptHashSource(script)
+		if !slices.Contains(scriptSrc, wantHash) {
+			t.Fatalf("CSP script-src does not include hash %s for a deployed inline verifier script. script-src=%q CSP=%q", wantHash, scriptSrc, csp)
+		}
+	}
+
+	agentEnabled := qurlLinkJSAgentEnabledEnvs[testConfig.Environment]
+	if agentEnabled {
+		if !scriptSrcSandboxHashRE.MatchString(csp) {
+			t.Fatalf("CSP script-src directive does not match the sandbox workflow propagation posture ('self' plus sha256 hashes). CSP: %q", csp)
+		}
+		if !slices.Contains(scriptSrc, "'self'") {
+			t.Fatalf("CSP script-src directive omits 'self' while qurl-link JS agent is enabled; the same-origin agent bundle would be blocked. CSP: %q", csp)
+		}
+	} else if slices.Contains(scriptSrc, "'self'") {
+		t.Fatalf("CSP script-src directive includes 'self' in env %q while qurl-link JS agent is disabled; legacy qurl.link should allow only hash-pinned inline verifier scripts. CSP: %q",
+			testConfig.Environment, csp)
+	}
+	for _, field := range scriptSrc {
+		if field != "'self'" && !isScriptHashSource(field) {
+			t.Fatalf("CSP script-src directive has unsupported field %q; want only sha256 hashes plus optional 'self' for the JS-agent bundle. CSP: %q", field, csp)
+		}
 	}
 
 	connectSrc := cspDirectiveFields(csp, "connect-src")
-	if qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
+	if agentEnabled {
 		networkOrigins := qurlLinkJSAgentNetworkOrigins[testConfig.Environment]
 		if len(networkOrigins) == 0 {
 			t.Fatalf("qurlLinkJSAgentEnabledEnvs marks env %q enabled but no network connect-src origins are configured in the smoke mirror.", testConfig.Environment)

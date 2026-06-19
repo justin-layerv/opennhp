@@ -88,10 +88,10 @@ Ported incrementally, each step its own PR:
    bundle and performs the bootstrap knock through the relay. `test/bundle.test.ts`
    gates the gzip budget and the runtime public-export surface via esbuild's
    metafile (no execution — node has no DOM; that end-to-end seam is #2616).
-   The qurl-link Terraform module now relaxes CSP only when the bundle is
-   intentionally served: `script-src` gains `'self'` for the same-origin module,
-   and `connect-src` gains the relay origin so `POST /relay/{serverId}` is not
-   blocked by `default-src 'self'`. The remaining
+   The qurl-link Terraform module hash-pins its inline verifier script and
+   relaxes CSP only when the bundle is intentionally served: `script-src` gains
+   `'self'` for the same-origin module, and `connect-src` gains the relay origin
+   so `POST /relay/{serverId}` is not blocked by `default-src 'self'`. The remaining
    Phase-2 page-migration prerequisite is tracked in #2700: pin the artifact with **Subresource
    Integrity** (`integrity="sha384-…"` on the `<script>` + a matching CSP
    hash-source), not just `'self'` — for a crypto agent that gates resource

@@ -12,6 +12,14 @@ files for each case and invokes the lint through its four-argument override
 interface. This keeps parser and equivalence regressions from hiding until a
 real source edit happens to exercise them.
 
+The lint also verifies the temporary legacy compatibility hashes against the
+`e908489ee8d90a16075cd722a81191d7c23a1954` qurl.link HTML blob. In local
+shallow clones, fetch that commit first:
+
+```bash
+git fetch --no-tags --depth=1 origin e908489ee8d90a16075cd722a81191d7c23a1954
+```
+
 ## Fixtures
 
 | Fixture | Expected exit | Why |

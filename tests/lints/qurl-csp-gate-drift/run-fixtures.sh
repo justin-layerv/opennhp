@@ -22,10 +22,10 @@ if [ ! -x "$PROBE_PARSE_SCRIPT" ]; then
   exit 1
 fi
 
-GOOD_WORKFLOW_RE="(^|;[[:space:]]*)script-src[[:space:]]+'unsafe-inline'[[:space:]]+'self'([[:space:]]*;|[[:space:]]*$)"
-INLINE_ONLY_WORKFLOW_RE="(^|;[[:space:]]*)script-src[[:space:]]+'unsafe-inline'([[:space:]]*;|[[:space:]]*$)"
-UNTRANSLATED_POSIX_RE="(^|;[[:blank:]]*)script-src[[:blank:]]+'unsafe-inline'[[:blank:]]+'self'([[:blank:]]*;|[[:blank:]]*$)"
-GOOD_SMOKE_RE="(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s+'self'\s*(?:;|$)"
+GOOD_WORKFLOW_RE="(^|;[[:space:]]*)script-src[[:space:]]+'self'([[:space:]]+'sha256-[A-Za-z0-9+/]+={0,2}')+([[:space:]]*;|[[:space:]]*$)"
+UNSAFE_WORKFLOW_RE="(^|;[[:space:]]*)script-src[[:space:]]+'self'[[:space:]]+'unsafe-inline'([[:space:]]+'sha256-[A-Za-z0-9+/]+={0,2}')*([[:space:]]*;|[[:space:]]*$)"
+UNTRANSLATED_POSIX_RE="(^|;[[:blank:]]*)script-src[[:blank:]]+'self'([[:blank:]]+'sha256-[A-Za-z0-9+/]+={0,2}')+([[:blank:]]*;|[[:blank:]]*$)"
+GOOD_SMOKE_RE="(?i)(?:^|;\s*)script-src\s+'self'(?:\s+'sha256-[A-Za-z0-9+/]+={0,2}')+\s*(?:;|$)"
 ORIGIN="https://qurl.link.layerv.xyz"
 
 TMP="$(mktemp -d)"
@@ -57,7 +57,7 @@ write_fixture() {
     printf 'package smoke\n\n'
     printf 'var (\n'
     # shellcheck disable=SC2016 # backticks are literal Go raw-string delimiters
-    printf '\tscriptSrcInlineAndSelfRE = regexp.MustCompile(`%s`)\n' "$smoke_re"
+    printf '\tscriptSrcSandboxHashRE = regexp.MustCompile(`%s`)\n' "$smoke_re"
     printf ')\n\n'
     if [ "$extra_map" = "true" ]; then
       printf 'var unrelatedSandboxFlags = map[string]bool{\n'
@@ -146,16 +146,16 @@ PASS=0
 FAIL=0
 run_case "in-sync" 0 "$GOOD_WORKFLOW_RE" "$GOOD_SMOKE_RE" true true "$ORIGIN" "$ORIGIN" false
 run_case "extra-sandbox-map" 0 "$GOOD_WORKFLOW_RE" "$GOOD_SMOKE_RE" true true "$ORIGIN" "$ORIGIN" true
-run_case "regex-drift" 1 "$INLINE_ONLY_WORKFLOW_RE" "$GOOD_SMOKE_RE" true true "$ORIGIN" "$ORIGIN" false
+run_case "regex-drift" 1 "$UNSAFE_WORKFLOW_RE" "$GOOD_SMOKE_RE" true true "$ORIGIN" "$ORIGIN" false
 run_case "tfvar-drift" 1 "$GOOD_WORKFLOW_RE" "$GOOD_SMOKE_RE" false true "$ORIGIN" "$ORIGIN" false
 run_case "smoke-map-drift" 1 "$GOOD_WORKFLOW_RE" "$GOOD_SMOKE_RE" true false "$ORIGIN" "$ORIGIN" false
 run_case "fallback-origin-drift" 1 "$GOOD_WORKFLOW_RE" "$GOOD_SMOKE_RE" true true "https://other.example" "$ORIGIN" false
 run_case "untranslated-posix-class" 1 "$UNTRANSLATED_POSIX_RE" "$GOOD_SMOKE_RE" true true "$ORIGIN" "$ORIGIN" false
 
 run_probe_case "crlf-success" \
-  "HTTP/2 200\r\ncontent-type: text/html\r\nContent-Security-Policy: default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'\r\n\r\n__nhp_http_status__:200\n" \
+  "HTTP/2 200\r\ncontent-type: text/html\r\nContent-Security-Policy: default-src 'self'; script-src 'self' 'sha256-abc123+/='; style-src 'unsafe-inline'\r\n\r\n__nhp_http_status__:200\n" \
   "200" \
-  "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'"
+  "default-src 'self'; script-src 'self' 'sha256-abc123+/='; style-src 'unsafe-inline'"
 run_probe_case "missing-csp" \
   "HTTP/2 200\r\ncontent-type: text/html\r\n\r\n__nhp_http_status__:200\n" \
   "200" \

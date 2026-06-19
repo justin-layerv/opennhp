@@ -51,11 +51,43 @@ locals {
   og_image_key = "og-image.png"
   js_agent_key = "nhp-agent.min.js"
 
-  relay_connect_src_origin = var.relay_connect_src_origin == null ? "" : var.relay_connect_src_origin
-  js_agent_connect_src     = join(" ", compact(["'self'", local.relay_connect_src_origin]))
-  legacy_csp               = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
-  js_agent_csp             = "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'; connect-src ${local.js_agent_connect_src}"
-  content_security_policy  = var.js_agent_enabled ? local.js_agent_csp : local.legacy_csp
+  relay_connect_src_origin          = var.relay_connect_src_origin == null ? "" : var.relay_connect_src_origin
+  js_agent_connect_src              = join(" ", compact(["'self'", local.relay_connect_src_origin]))
+  qurl_link_executable_script_types = toset(["", "text/javascript", "application/javascript", "module"])
+  # Scoped to the controlled qurl-link template. If a future script embeds a
+  # literal </script> or a script attribute containing >, switch this and the
+  # smoke mirror to a real parser before relying on hash parity.
+  qurl_link_script_matches = regexall("(?is)<script\\b([^>]*)>(.*?)</script>", local.index_html)
+  qurl_link_inline_script_bodies = [
+    for match in local.qurl_link_script_matches : match[1]
+    if trimspace(match[1]) != "" &&
+    length(regexall("(?i)(?:^|\\s)src\\s*=", match[0])) == 0 &&
+    contains(local.qurl_link_executable_script_types, lower(trimspace(try(regex("(?i)(?:^|\\s)type\\s*=\\s*[\"']?([^\"'\\s>]+)", match[0])[0], ""))))
+  ]
+  # Rollout compatibility only: the current rendered index_html is hash-pinned
+  # per environment above. These extra hashes cover the two exact inline scripts
+  # served by the older pre-template, pre-#2701 index.html while old cached HTML
+  # and new CSP headers can overlap during CloudFront propagation. Remove after
+  # the first prod strict-CSP rollout via #2717.
+  #
+  # Provenance: derived from the two executable inline <script> bodies in
+  # e908489e:terraform/modules/qurl-link/frontend/index.html, which used literal
+  # ALLOWED_HOSTS values and no Terraform template substitutions, so the bodies
+  # were env-independent. Hashes are SHA-256 over each exact script body,
+  # including leading/trailing whitespace, recomputed with a Node crypto script
+  # matching the smoke test's executable-script extraction.
+  legacy_rollout_script_hashes = [
+    "'sha256-lQZ5xt5AMAT1GGKf9WfLPyJL393SyPoCqdlUSIDYdy0='",
+    "'sha256-NV09DWZPPAO4Bua9v9d9oQmHfucTzi5onwG88dNPYnU='",
+  ]
+  qurl_link_script_hashes = distinct(concat([
+    for script_body in local.qurl_link_inline_script_bodies : "'sha256-${base64sha256(script_body)}'"
+  ], local.legacy_rollout_script_hashes))
+  legacy_script_src       = join(" ", local.qurl_link_script_hashes)
+  js_agent_script_src     = join(" ", concat(["'self'"], local.qurl_link_script_hashes))
+  legacy_csp              = "default-src 'self'; script-src ${local.legacy_script_src}; style-src 'unsafe-inline'"
+  js_agent_csp            = "default-src 'self'; script-src ${local.js_agent_script_src}; style-src 'unsafe-inline'; connect-src ${local.js_agent_connect_src}"
+  content_security_policy = var.js_agent_enabled ? local.js_agent_csp : local.legacy_csp
 
   static_invalidation_paths = concat(
     ["/", "/index.html", "/robots.txt"],
@@ -279,15 +311,15 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
       # allowlist — so restricting form-action here breaks the post-resolve
       # redirect. Auth is gated by the NHP knock (source-IP firewall open) plus
       # the qurl-router authorize check at the resource host, not by this CSP.
-      # script-src omits 'self' on purpose in the legacy path: the bucket only
-      # ever serves this one inline-script page, so disallowing same-origin .js
-      # loads is the tighter, accurate posture. The relay browser cutover is the
-      # exception: js_agent_enabled uploads the browser NHP agent as a same-origin
-      # module, so 'self' is added only while that bundle is intentionally served.
-      # connect-src is likewise explicit only for the agent path: the cutover
-      # fetches the cross-origin resolve endpoint for relay inputs and the
-      # bundled agent fetches the cross-origin relay over HTTPS. default-src
-      # 'self' would otherwise block the first real in-browser cutover request.
+      # script-src never includes 'unsafe-inline'. The qurl.link verifier is
+      # inlined into index.html and protected by sha256 source expressions so
+      # the page avoids both inline-anything CSP and a parser-blocking network
+      # fetch before token pages can set the verifying class. When
+      # js_agent_enabled uploads nhp-agent.min.js, 'self' is added only for
+      # that reviewed same-origin bundle.
+      # connect-src is likewise explicit only for the agent path: the bundled
+      # agent fetches the cross-origin relay over HTTPS. default-src 'self'
+      # would otherwise block the real in-browser cutover request.
       # style-src keeps 'unsafe-inline' because the marketing rows use
       # inline style attributes for per-card CSS custom properties, and the
       # no-JS verifier fallback keeps its state flip in a noscript style.
@@ -322,6 +354,12 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
       condition     = !var.js_agent_enabled || var.server_public_key_b64 != ""
       error_message = "js_agent_enabled requires server_public_key_b64 so the browser JS agent can authenticate relay replies from the NHP server cell."
     }
+    precondition {
+      # Keep this count in lockstep with the Go smoke CSP test and the Python
+      # legacy-hash drift lint; all three mirror the controlled template shape.
+      condition     = length(local.qurl_link_inline_script_bodies) == 2
+      error_message = "qurl.link index.html must contain exactly two inline executable scripts so Terraform can hash-pin the current template shape in script-src."
+    }
   }
 }
 
@@ -331,14 +369,14 @@ resource "aws_cloudfront_distribution" "qurl_link" {
   is_ipv6_enabled     = true
   default_root_object = "index.html"
   # Single alias per distribution is load-bearing: the precondition on
-  # aws_s3_object.index fences only that var.domain_name appears in the
-  # SPA's ALLOWED_HOSTS array (additions). It does NOT fence stale
-  # entries — fine while we keep one alias per distribution, since a
-  # stale extra is benign. Adding a second alias here requires growing
-  # BOTH the precondition (strcontains becomes a per-alias check) AND
+  # aws_s3_object.index fences only that var.domain_name appears in the SPA's
+  # ALLOWED_HOSTS array (additions). It does NOT fence stale entries — fine
+  # while we keep one alias per distribution, since a stale extra is benign.
+  # Adding a second alias here requires growing BOTH the precondition
+  # (strcontains becomes a per-alias check) AND
   # tests/smoke/16_qurl_link_frontend_test.go::TestQurlLinkFrontend_-
-  # AllowlistContainsServingHost (currently asserts a single serving
-  # host) into list checks in the same PR.
+  # AllowlistContainsServingHost (currently asserts a single serving host) into
+  # list checks in the same PR.
   aliases     = [var.domain_name]
   price_class = "PriceClass_100" # US, Canada, Europe
   comment     = "QURL Link Redirect - ${var.domain_name}"
@@ -349,6 +387,9 @@ resource "aws_cloudfront_distribution" "qurl_link" {
     origin_access_control_id = aws_cloudfront_origin_access_control.qurl_link.id
   }
 
+  # qurl.link CSP hashes assume CloudFront serves the S3 HTML body byte-for-byte.
+  # Any future response-body transform on this distribution must re-derive the
+  # script hashes from transformed bytes and update the smoke/lint fences.
   default_cache_behavior {
     allowed_methods  = ["GET", "HEAD"]
     cached_methods   = ["GET", "HEAD"]
