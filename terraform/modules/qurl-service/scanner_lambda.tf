@@ -268,16 +268,18 @@ resource "aws_iam_role" "scanner_lambda" {
 #   * `qurl_access_tokens/resource-token-index` GSI : Query (active-qurl
 #                                          precondition before
 #                                          `resource.closed` emission)
-#   * `qurl_resources` table             : GetItem + UpdateItem +
-#                                          DeleteItem
-#                                          (`resource_closed_fired_at`,
-#                                          `resource_tombstoned_at`,
-#                                          `tombstone_ttl`,
-#                                          `final_access_count`; tombstone
-#                                          transactions also delete the
-#                                          owner-target dedup sentinel so the
-#                                          closed transit target can be
-#                                          re-created cleanly)
+#   * `qurl_resources` table             : DeleteItem + GetItem +
+#                                          UpdateItem
+#                                          Scanner execution uses:
+#       - GetItem: consistent resource read before TombstoneTransit's
+#                  tombstone decision
+#       - UpdateItem attrs:
+#           `resource_closed_fired_at`,
+#           `resource_tombstoned_at`,
+#           `tombstone_ttl`,
+#           `final_access_count`
+#       - DeleteItem: owner-target dedup sentinel release inside
+#                     TombstoneTransit's transaction
 #   * `qurl_resources/status-index` GSI  : Query (hourly active-resource
 #                                          recheck for resources blocked by
 #                                          viewer sessions after the last
