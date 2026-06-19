@@ -198,17 +198,20 @@ jobs:
       # Regression fence for the NHP-Relay CD deploy helper. Mocked-AWS cases
       # cover dark skip, app-changed tag write, infra-only refresh, loud SSM
       # failure, and an already-running instance refresh.
-      - name: Test relay deploy helper
+      - name: Test deploy helper scripts
         run: |
           shellcheck \
+            .github/scripts/prune-missing-asg-target-groups.sh \
             .github/scripts/wait-for-instance-refresh.sh \
             .github/scripts/deploy-relay.sh \
             .github/scripts/recover-relay-deposed-sg.sh \
             .github/scripts/check-relay-deposed-sg-clear.sh \
+            tests/scripts/prune-missing-asg-target-groups_test.sh \
             tests/scripts/wait-for-instance-refresh_test.sh \
             tests/scripts/deploy-relay_test.sh \
             tests/scripts/recover-relay-deposed-sg_test.sh \
             tests/scripts/check-relay-deposed-sg-clear_test.sh
+          bash tests/scripts/prune-missing-asg-target-groups_test.sh
           bash tests/scripts/wait-for-instance-refresh_test.sh
           bash tests/scripts/deploy-relay_test.sh
           bash tests/scripts/recover-relay-deposed-sg_test.sh

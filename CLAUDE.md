@@ -118,6 +118,8 @@ trivy image nhp-server --severity HIGH,CRITICAL
 
 Both fuzz targets route through `scripts/run-fuzz.sh`, which distinguishes a real crasher (writes `testdata/fuzz/<NAME>/<sha>`) from the upstream Go-fuzz coordinator deadline-race flake (no reproducer file). If `fuzz-quick` ever goes red on a PR that didn't touch Go code, check the wrapper first — and after a Go toolchain bump, re-validate the deadline-race signature it greps for. The wrapper's decision tree is fenced by `tests/lints/run-fuzz/run-fixtures.sh`.
 
+The blue/green stale-target-group preflight in `.github/scripts/prune-missing-asg-target-groups.sh` uses an AWS CLI JMESPath query with JSON string literals for tab/newline output and classifies retryable AWS CLI failures from stderr text. Its shell fixtures cover the parsed `count<TAB>ARNs` layout and representative error strings, but not the real AWS CLI evaluator/output formatter; after an AWS CLI or jmespath major bump, re-run the script in `DRY_RUN=true` against a real standby ASG before trusting that path.
+
 ### Sandbox dispatch contract
 
 `build-and-push.yml`'s `workflow_dispatch` is **only valid from

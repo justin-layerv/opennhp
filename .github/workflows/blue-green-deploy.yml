@@ -619,6 +619,16 @@ jobs:
             aws ssm put-parameter --name "$SSM_PARAM" --value "$IMAGE_TAG" --type String --overwrite
           fi
 
+      - name: "[Server] Prune Missing Standby Target Groups"
+        if: needs.prepare.outputs.deploy_server == 'true'
+        timeout-minutes: 5
+        env:
+          STANDBY_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        # Prune repairs stale ASG target-group associations before Auto Scaling's
+        # capacity reconciliation, scale-up, and refresh try to launch instances.
+        run: ./.github/scripts/prune-missing-asg-target-groups.sh "$STANDBY_ASG"
+
       - name: "[Server] Scale Up Standby ASG"
         if: needs.prepare.outputs.deploy_server == 'true'
         env:
@@ -693,6 +703,16 @@ jobs:
           else
             aws ssm put-parameter --name "$SSM_PARAM" --value "$IMAGE_TAG" --type String --overwrite
           fi
+
+      - name: "[AC] Prune Missing Standby Target Groups"
+        if: needs.prepare.outputs.deploy_ac == 'true'
+        timeout-minutes: 5
+        env:
+          STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        # Prune repairs stale ASG target-group associations before Auto Scaling's
+        # capacity reconciliation, scale-up, and refresh try to launch instances.
+        run: ./.github/scripts/prune-missing-asg-target-groups.sh "$STANDBY_ASG"
 
       - name: "[AC] Scale Up Standby ASG"
         if: needs.prepare.outputs.deploy_ac == 'true'

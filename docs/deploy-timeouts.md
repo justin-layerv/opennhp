@@ -32,6 +32,18 @@ Budgets fall into three categories:
   for a problem to manifest before failing the deploy. Traffic is live,
   so these should be tight — a slow fail keeps the fleet degraded longer.
 
+## Standby ASG target-group invariant
+
+Before server or AC standby scale-up, `blue-green-deploy.yml` runs the
+stale-target-group preflight in
+`.github/scripts/prune-missing-asg-target-groups.sh`. Server and AC
+standby ASGs must have at least one ELBv2-valid target group attached.
+If the preflight reports no target groups, or reports that every
+attached target group was already deleted, the deploy fails closed by
+design, including dry-run dispatches; run Terraform to reattach valid
+target groups before scaling or switching traffic. The TG-less frps ASG
+is not passed to this preflight.
+
 ## `refresh_timeout_minutes` (default 15)
 
 Bounds how long the workflow waits for `aws autoscaling
