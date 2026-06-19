@@ -20,6 +20,9 @@ content.
 
 The SVG is authored at 1200x630; the command preserves source dimensions, so
 verify `og-image.png` is still 1200x630 after regeneration.
+Keep the regenerated PNG 8-bit and non-interlaced; the repository lint uses a
+small stdlib decoder with those constraints so hosted runners do not need
+ImageMagick installed.
 
 The SVG must paint its own full-canvas background. `-background none` will not
 hide a transparent or undersized background shape.

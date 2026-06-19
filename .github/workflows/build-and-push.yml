@@ -1642,21 +1642,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install ImageMagick if needed
-        run: |
-          if command -v magick >/dev/null 2>&1 || { command -v convert >/dev/null 2>&1 && command -v identify >/dev/null 2>&1; }; then
-            echo "ImageMagick already available."
-            exit 0
-          fi
-          sudo apt-get update || {
-            echo "::warning::apt-get update failed; disabling hosted-runner Microsoft apt sources and retrying."
-            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
-              \( -name 'azure-cli*' -o -name 'microsoft-prod*' -o -name 'packages-microsoft-prod*' \) \
-              -print -delete
-            sudo apt-get update
-          }
-          sudo apt-get install -y imagemagick
-
       - name: Shellcheck qURL link social card lint
         run: shellcheck ./scripts/check-qurl-link-og-image.sh
 

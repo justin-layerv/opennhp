@@ -32,6 +32,10 @@ export interface DecryptedReply {
    * caller must reject any other (authenticated) type: `decryptReply` decrypts
    * and authenticates but does not dispatch, leaving that to the PR-5 loop. */
   headerType: number;
+  /** Header counter / transaction id. Server replies echo the outstanding
+   * knock's counter here, so consumers can correlate without re-parsing the
+   * packet header. */
+  counter: bigint;
   /** The server static public key recovered from the packet — verified to equal
    * the expected one. This pins the server identity; the `ss`-keyed opens (below)
    * complete the authentication. */
@@ -86,7 +90,9 @@ async function inflateZlib(compressed: Uint8Array): Promise<Uint8Array> {
  * and the peer-pool lookup are intentionally not ported.
  *
  * Throws if the header digest, either header AEAD tag, the server-key check, or
- * the body AEAD tag fails — staged in that order, which also localizes a drift.
+ * a present body AEAD tag fails — staged in that order, which also localizes a
+ * drift. A zero-length body carries no body tag to open; dispatchers decide
+ * whether that is valid for the authenticated reply type.
  */
 export async function decryptReply(
   devicePriv: Uint8Array,
@@ -127,7 +133,8 @@ export async function decryptReply(
     );
   }
 
-  const nonce = nonceForCounter(getCounter(header));
+  const counter = getCounter(header);
+  const nonce = nonceForCounter(counter);
   const serverEph = header.subarray(
     OFF_EPHEMERAL,
     OFF_EPHEMERAL + PUBLIC_KEY_SIZE,
@@ -198,6 +205,7 @@ export async function decryptReply(
 
   return {
     headerType: getTypeAndPayloadSize(header).type,
+    counter,
     serverStaticPub,
     timestampNanos,
     body,

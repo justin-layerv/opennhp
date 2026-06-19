@@ -1,7 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { decryptReply } from "../src/crypto/ack";
-import { NHP_ACK, HEADER_SIZE, PACKET_BUFFER_SIZE } from "../src/crypto/packet";
+import {
+  NHP_ACK,
+  NHP_COK,
+  HEADER_SIZE,
+  PACKET_BUFFER_SIZE,
+} from "../src/crypto/packet";
 import { toHex, fromHex } from "./hex";
 
 // The TS half of the cross-language ACK fence. The committed fixture
@@ -22,12 +27,31 @@ const fixture = JSON.parse(
 const AGENT_PRIV = fromHex(fixture.agentStaticPrivHex);
 const SERVER_PUB = fromHex(fixture.serverStaticPubHex);
 const ACK_PACKET = fromHex(fixture.ackPacketHex);
+// Keep synced with jsAgentKnockCounter/jsAgentLegacyCokCounter in
+// nhp/core/js_agent_loop_roundtrip_test.go; committed packet bytes also fence drift.
+const ACK_COUNTER = 0x1122334455667788n;
+const LEGACY_COK_COUNTER = 0x9988776655443322n;
+
+type ReplyFixture = {
+  serverStaticPubHex: string;
+  agentStaticPrivHex: string;
+  timestampNanos: string;
+  bodyHex: string;
+  replyPacketHex: string;
+};
+
+function replyFixture(name: string): ReplyFixture {
+  return JSON.parse(
+    readFileSync(new URL(`./testdata/${name}`, import.meta.url), "utf8"),
+  ) as ReplyFixture;
+}
 
 describe("decryptReply (server ACK, cross-language fixture)", () => {
   it("decrypts the Go-produced ACK and recovers the ServerKnockAckMsg", async () => {
     const reply = await decryptReply(AGENT_PRIV, SERVER_PUB, ACK_PACKET);
 
     expect(reply.headerType).toBe(NHP_ACK);
+    expect(reply.counter).toBe(ACK_COUNTER);
     expect(toHex(reply.serverStaticPub)).toBe(fixture.serverStaticPubHex); // the auth check passed
     expect(reply.timestampNanos).toBe(BigInt(fixture.timestampNanos));
     expect(toHex(reply.body)).toBe(fixture.bodyHex); // decrypted + inflated == committed body
@@ -39,6 +63,48 @@ describe("decryptReply (server ACK, cross-language fixture)", () => {
     expect(msg.resHost.r_jsagent).toBe("10.0.0.7");
     expect(msg.acTokens.r_jsagent).toBe("tok-abc123");
     expect(msg.agentAddr).toBe("203.0.113.9");
+  });
+
+  it("surfaces the Go-produced NHP_COK header type and counter", async () => {
+    const fx = replyFixture("cok.json");
+    const reply = await decryptReply(
+      fromHex(fx.agentStaticPrivHex),
+      fromHex(fx.serverStaticPubHex),
+      fromHex(fx.replyPacketHex),
+    );
+
+    expect(reply.headerType).toBe(NHP_COK);
+    expect(reply.counter).toBe(LEGACY_COK_COUNTER);
+    expect(reply.timestampNanos).toBe(BigInt(fx.timestampNanos));
+    expect(toHex(reply.body)).toBe(fx.bodyHex);
+  });
+
+  it("decrypts a Go-produced uncompressed ACK body", async () => {
+    const fx = replyFixture("ack-uncompressed.json");
+    const reply = await decryptReply(
+      fromHex(fx.agentStaticPrivHex),
+      fromHex(fx.serverStaticPubHex),
+      fromHex(fx.replyPacketHex),
+    );
+
+    expect(reply.headerType).toBe(NHP_ACK);
+    expect(reply.counter).toBe(ACK_COUNTER);
+    expect(reply.timestampNanos).toBe(BigInt(fx.timestampNanos));
+    expect(toHex(reply.body)).toBe(fx.bodyHex);
+  });
+
+  it("accepts a Go-produced empty-body ACK packet", async () => {
+    const fx = replyFixture("ack-empty-body.json");
+    const reply = await decryptReply(
+      fromHex(fx.agentStaticPrivHex),
+      fromHex(fx.serverStaticPubHex),
+      fromHex(fx.replyPacketHex),
+    );
+
+    expect(reply.headerType).toBe(NHP_ACK);
+    expect(reply.counter).toBe(ACK_COUNTER);
+    expect(reply.timestampNanos).toBe(BigInt(fx.timestampNanos));
+    expect(reply.body).toHaveLength(0);
   });
 
   it("rejects packets outside the [HEADER_SIZE, PACKET_BUFFER_SIZE] range", async () => {

@@ -23,6 +23,7 @@ const ack52024 = fixture<{ replyPacketHex: string }>("ack-52024.json");
 const ackError = fixture<{ replyPacketHex: string; bodyHex: string }>(
   "ack-error.json",
 );
+const ackEmptyBody = fixture<{ replyPacketHex: string }>("ack-empty-body.json");
 const ackSuccessEmpty = fixture<{ replyPacketHex: string }>(
   "ack-success-empty.json",
 );
@@ -144,13 +145,22 @@ describe("knock (qURL agent loop)", () => {
     expect(seenId).toBe(pubKeyFingerprint(SERVER_PUB));
   });
 
-  it("throws when the ACK counter does not correlate to the knock", async () => {
+  it("rejects a replayed captured ACK whose counter belongs to another knock", async () => {
     await expect(
       knock(REQ, {
         transport: replyWith(ackSuccess.ackPacketHex),
         entropy: entropyWithCounter(KNOCK_COUNTER + 1n), // wrong knock counter
       }),
     ).rejects.toThrow(/counter/i);
+  });
+
+  it("throws a domain error on a header-only ACK body", async () => {
+    await expect(
+      knock(REQ, {
+        transport: replyWith(ackEmptyBody.replyPacketHex),
+        entropy: entropyWithCounter(KNOCK_COUNTER),
+      }),
+    ).rejects.toThrow(/ACK body is empty \(header-only reply\)/i);
   });
 
   it("propagates a transport fault", async () => {

@@ -1,6 +1,6 @@
 import { pubKeyFingerprint } from "../crypto/fingerprint.js";
 import { decryptReply } from "../crypto/ack.js";
-import { NHP_ACK, NHP_COK, HEADER_SIZE, getCounter } from "../crypto/packet.js";
+import { NHP_ACK, NHP_COK } from "../crypto/packet.js";
 import {
   createKnock,
   buildKnockBody,
@@ -113,8 +113,8 @@ interface ServerKnockAck {
  * Returns a discriminated {@link KnockResult}. Throws only on faults: a transport
  * error ({@link RelayError}), a crypto failure (`decryptReply`), an ACK that does
  * not correlate to this knock, an unexpected (authenticated) reply type, or a
- * malformed ACK body (the `JSON.parse` — a TCB-level fault, since the body is
- * server-authenticated by the time it is parsed, not attacker-reachable).
+ * malformed ACK body (empty or invalid JSON — a TCB-level fault, since the body
+ * is server-authenticated by the time it is parsed, not attacker-reachable).
  */
 export async function knock(
   req: KnockRequest,
@@ -152,7 +152,9 @@ export async function knock(
     // Overload cookie-challenge — already authenticated by decryptReply. The
     // server now echoes the knock counter on the wire so the relay can dispatch
     // it (#2648), while this loop still only surfaces the challenge until the
-    // NHP_RKN cookie-answer path lands.
+    // NHP_RKN cookie-answer path lands. COK counter correlation belongs on that
+    // path, along with validation that the cookie body is present; replaying a
+    // COK here cannot grant access.
     return { kind: "cookieChallenge" };
   }
   if (reply.headerType !== NHP_ACK) {
@@ -165,11 +167,13 @@ export async function knock(
   // reply counter to the request's). decryptReply already proved the reply came
   // from the knocked server and HTTPS already pairs response to request, so this
   // only catches a buggy/misrouting relay or a stale-ACK replay.
-  const replyCounter = getCounter(replyBytes.subarray(0, HEADER_SIZE));
-  if (replyCounter !== counter) {
+  if (reply.counter !== counter) {
     throw new Error(
-      `ACK counter ${replyCounter} does not match knock ${counter}`,
+      `ACK counter ${reply.counter} does not match knock ${counter}`,
     );
+  }
+  if (reply.body.length === 0) {
+    throw new Error("ACK body is empty (header-only reply)");
   }
 
   const ack = JSON.parse(
