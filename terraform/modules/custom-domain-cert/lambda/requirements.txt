@@ -17,7 +17,7 @@ cryptography==48.0.1
 dnspython==2.8.0
 
 # Required transitive dependencies (with manylinux wheels)
-pyOpenSSL==26.2.0
+pyOpenSSL==26.3.0
 cffi>=2.0.0
 pycparser==2.22
 pyrfc3339==1.1
