@@ -29,6 +29,9 @@ var (
 	ErrTokenExpired = errors.New("token expired")
 	// ErrPolicyViolation indicates access was denied by policy (IP, time, etc.)
 	ErrPolicyViolation = errors.New("access denied by policy")
+	// ErrAgentIdentityConflict indicates qurl-service rejected the relay's
+	// authenticated browser public key for this access link.
+	ErrAgentIdentityConflict = errors.New("qurl browser agent identity conflict")
 	// ErrServiceError indicates an internal error in the QURL service
 	ErrServiceError = errors.New("qurl service error")
 	// ErrInvalidResolveResponse indicates the QURL API returned structurally
@@ -378,12 +381,22 @@ func (r *QurlResolver) parseErrorResponse(statusCode int, body []byte) error {
 		return r.mapErrorCode(internalResp.Error.Code)
 	}
 
-	// Fall back to HTTP status code mapping
+	// Fall back to HTTP status code mapping. qurl-service always sends a
+	// structured error body (handled above), so this branch only fires on a
+	// bodiless/unparseable response. 409 is the browser-relay resolve
+	// endpoint's agent-identity-conflict status, so map it terminally for
+	// symmetry with the structured-body path; without this a bare 409 would
+	// fall through to ErrServiceError and be retried as transient. NOTE: this
+	// resolver is shared across qurl-service endpoints — revisit this mapping
+	// if any endpoint reachable through it ever returns 409 for a retryable
+	// reason (the structured-body path would still classify those correctly).
 	switch statusCode {
 	case http.StatusNotFound:
 		return ErrTokenNotFound
 	case http.StatusGone:
 		return ErrTokenConsumed
+	case http.StatusConflict:
+		return ErrAgentIdentityConflict
 	case http.StatusForbidden:
 		return ErrPolicyViolation
 	default:
@@ -405,6 +418,8 @@ func (r *QurlResolver) mapErrorCode(code string) error {
 		return ErrTokenExpired
 	case "policy_violation", "max_sessions_reached":
 		return ErrPolicyViolation
+	case "agent_identity_conflict":
+		return ErrAgentIdentityConflict
 	default:
 		return ErrServiceError
 	}

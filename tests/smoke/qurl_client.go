@@ -5,6 +5,7 @@ package smoke
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,15 +89,54 @@ func uniqueSmokeTarget(rawTarget string) string {
 type QURLResponse struct {
 	Data struct {
 		ResourceID string `json:"resource_id"`
-		QURLLink   string `json:"qurl_link"` // e.g. https://qurl.link.layerv.xyz/#at_xxx
+		QURLLink   string `json:"qurl_link"` // e.g. #at_xxx legacy or #qv1.<bundle>
 		ExpiresAt  string `json:"expires_at"`
 	} `json:"data"`
 }
 
+type QURLBootstrapBundle struct {
+	Version            int    `json:"v"`
+	AccessToken        string `json:"access_token"`
+	NHPResourceID      string `json:"nhp_resource_id"`
+	AgentPrivateKeyB64 string `json:"agent_private_key_b64"`
+	AgentPublicKeyB64  string `json:"agent_public_key_b64"`
+	ServerPublicKeyB64 string `json:"server_public_key_b64"`
+	RelayURL           string `json:"relay_url"`
+	AuthServiceID      string `json:"auth_service_id"`
+}
+
 // AccessToken extracts the "at_..." access token from the fragment
-// of QURLLink. Returns empty string if the link has no fragment.
+// of QURLLink, including qv1 bootstrap bundles. Returns empty string if
+// the link has no recognized fragment.
 // The access token is what gets passed to /plugins/qurl?token=...
 func (r *QURLResponse) AccessToken() string {
+	fragment := r.fragment()
+	if strings.HasPrefix(fragment, "at_") {
+		return fragment
+	}
+	if bundle, ok := r.BootstrapBundle(); ok {
+		return bundle.AccessToken
+	}
+	return ""
+}
+
+func (r *QURLResponse) BootstrapBundle() (QURLBootstrapBundle, bool) {
+	fragment := r.fragment()
+	if !strings.HasPrefix(fragment, "qv1.") {
+		return QURLBootstrapBundle{}, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(fragment, "qv1."))
+	if err != nil {
+		return QURLBootstrapBundle{}, false
+	}
+	var bundle QURLBootstrapBundle
+	if err := json.Unmarshal(raw, &bundle); err != nil {
+		return QURLBootstrapBundle{}, false
+	}
+	return bundle, true
+}
+
+func (r *QURLResponse) fragment() string {
 	link := r.Data.QURLLink
 	if i := strings.Index(link, "#"); i >= 0 {
 		return link[i+1:]

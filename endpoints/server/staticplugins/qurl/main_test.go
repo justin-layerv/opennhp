@@ -202,6 +202,7 @@ func TestHandleResolveError_KnownErrors_Return403(t *testing.T) {
 		{"token consumed", ErrTokenConsumed},
 		{"token expired", ErrTokenExpired},
 		{"policy violation", ErrPolicyViolation},
+		{"agent identity conflict", ErrAgentIdentityConflict},
 	}
 
 	for _, tt := range testCases {

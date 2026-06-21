@@ -256,6 +256,46 @@ func TestAuthWithNHP_BootstrapTerminalDeny_NoPinhole(t *testing.T) {
 	}
 }
 
+func TestAuthWithNHP_BootstrapAgentIdentityConflict_NoPinhole(t *testing.T) {
+	setTestResolver(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/browser-relay/resolve" {
+			t.Errorf("resolve path = %s, want browser-relay endpoint", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(internalResolveResponse{
+			Success: false,
+			Error:   &resolveError{Code: "agent_identity_conflict", Message: "agent identity conflict"},
+		})
+	})
+
+	req := testAuthReq(qurlBootstrapResourceID)
+	req.Msg.AuthServiceId = PluginID
+	req.Msg.UserData = map[string]any{
+		qurlAccessTokenUserDataKey: "at_1234567890123456789012",
+		qurlUserAgentUserDataKey:   "Mozilla/5.0 qurl-link-test",
+	}
+
+	opened := false
+	helper := &plugins.NhpServerPluginHelper{
+		AspData:             testAspData("unused-bootstrap-sentinel", 60),
+		ResolveResourceFunc: defaultCatalogResolver(),
+		AuthWithNhpCallbackFunc: func(*common.NhpAuthRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			opened = true
+			return nil, nil
+		},
+	}
+	ack, err := AuthWithNHP(req, helper)
+	if err == nil {
+		t.Fatal("expected bootstrap terminal deny")
+	}
+	if opened {
+		t.Fatal("agent identity conflict must not open the AC pinhole")
+	}
+	if ack.ErrCode != common.ErrQurlSessionExpired.ErrorCode() {
+		t.Errorf("ack.ErrCode = %q, want qurl-session-expired", ack.ErrCode)
+	}
+}
+
 func TestAuthWithNHP_TransientError_MapsToApiFailed(t *testing.T) {
 	setTestResolver(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

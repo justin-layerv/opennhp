@@ -261,7 +261,8 @@ func isTerminalResolveDeny(err error) bool {
 	return errors.Is(err, ErrTokenNotFound) ||
 		errors.Is(err, ErrTokenConsumed) ||
 		errors.Is(err, ErrTokenExpired) ||
-		errors.Is(err, ErrPolicyViolation)
+		errors.Is(err, ErrPolicyViolation) ||
+		errors.Is(err, ErrAgentIdentityConflict)
 }
 
 func qurlBootstrapAccessToken(msg *common.AgentKnockMsg) (string, bool) {

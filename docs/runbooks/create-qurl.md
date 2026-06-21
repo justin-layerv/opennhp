@@ -33,4 +33,4 @@ curl -s --request POST \
   }' | jq '.data.qurl_link'
 ```
 
-**Response structure:** `{ "data": { "resource_id": "...", "qurl_link": "https://qurl.link/#at_xxx", "qurl_site": "..." } }`
+**Response structure:** `{ "data": { "resource_id": "...", "qurl_link": "https://qurl.link/#qv1.<bundle>", "qurl_site": "..." } }` in JS-agent environments. Legacy environments still return `https://qurl.link/#at_xxx`.

@@ -2,11 +2,12 @@
 #
 # Hosts the qurl.link (or sandbox equivalent) consumer landing page. When the
 # URL contains a qURL access token fragment, the same page switches into the
-# access-verification flow. In JS-agent mode it extracts the fragment token,
-# knocks through the relay, and redirects using the ACK. Legacy mode keeps the
-# old resolve POST only for environments not yet cut over.
+# access-verification flow. In JS-agent mode it extracts the qv1 bootstrap
+# bundle, knocks through the relay with the qURL-scoped agent key, and redirects
+# using the ACK. Legacy mode keeps the old resolve POST only for environments not
+# yet cut over.
 #
-# Flow: User visits link.domain/#at_xxx → JS agent knocks relay → NHP opens access → Protected resource
+# Flow: User visits link.domain/#qv1.<bundle> → JS agent knocks relay → NHP opens access → Protected resource
 
 terraform {
   required_version = ">= 1.5"

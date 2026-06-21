@@ -392,6 +392,7 @@ func TestMapErrorCode(t *testing.T) {
 		// Policy errors
 		{"policy_violation", ErrPolicyViolation},
 		{"max_sessions_reached", ErrPolicyViolation},
+		{"agent_identity_conflict", ErrAgentIdentityConflict},
 		// Unknown codes
 		{"unknown_error", ErrServiceError},
 		{"", ErrServiceError},
@@ -527,6 +528,20 @@ func TestParseErrorResponse(t *testing.T) {
 			statusCode: http.StatusGone,
 			body:       "",
 			expected:   ErrTokenConsumed,
+		},
+		{
+			name:       "409 with agent_identity_conflict body",
+			statusCode: http.StatusConflict,
+			body:       `{"success":false,"error":{"code":"agent_identity_conflict","message":"Agent identity conflict"}}`,
+			expected:   ErrAgentIdentityConflict,
+		},
+		{
+			// Bodiless/unparseable 409 must still map terminally via the
+			// status fallback, not fall through to transient ErrServiceError.
+			name:       "409 without body",
+			statusCode: http.StatusConflict,
+			body:       "",
+			expected:   ErrAgentIdentityConflict,
 		},
 		{
 			name:       "403 status fallback",
