@@ -58,6 +58,28 @@ type ResourceData struct {
 	RedirectWithParams bool           `json:"redirectWithParams,omitempty"`
 	SkipAuth           bool           `json:"skipAuth,omitempty"`
 	CookieDomain       string         `json:"cookieDomain,omitempty"`
+
+	// qURL v2 protected-resource public key (P1b), surfaced from the NHP
+	// catalog row (endpoints/server.Resource) so later admission phases
+	// (P3/P4) can key routing/admission on the resource public key. Carried
+	// here — alongside the other layerv-local catalog extensions above —
+	// rather than on the upstream-synced ResourceGroup/ResourceInfo in
+	// nhpmsg.go. Empty for v1 / feature-off resources.
+	//
+	// UNVALIDATED — consumers MUST verify before trusting. P1b is a dumb
+	// carrier: it passes these through without decoding or hashing, so the
+	// value can be empty, malformed, or (once it gates admission) attacker-
+	// influenced. The admission-gate phase MUST base64url-decode
+	// ResourcePublicKeyB64, length-check the DER, and recompute the hash from
+	// the decoded bytes — i.e. verify ResourcePublicKeyHash ==
+	// SHA-256(decode(ResourcePublicKeyB64)) — rather than trusting the stored
+	// hash. Do not use either field as an identity/routing key without that
+	// verification.
+	//
+	//   ResourcePublicKeyB64:  unpadded base64url DER SPKI of the resource pubkey
+	//   ResourcePublicKeyHash: lowercase hex SHA-256 of the DECODED DER bytes
+	ResourcePublicKeyB64  string `json:"resourcePublicKeyB64,omitempty"`
+	ResourcePublicKeyHash string `json:"resourcePublicKeyHash,omitempty"`
 }
 
 type ResourceGroupMap map[string]*ResourceData

@@ -239,6 +239,32 @@ type Resource struct {
 	OpenTime      int    `json:"open_time" dynamodbav:"open_time"` // Seconds
 	AuthServiceID string `json:"auth_service_id" dynamodbav:"auth_service_id"`
 	TTL           int64  `json:"ttl,omitempty" dynamodbav:"ttl,omitempty"`
+
+	// qURL v2 protected-resource public key (read side, P1b). qurl-service
+	// (P1a) writes these as ADDITIVE attributes on the catalog row using the
+	// exact attribute names below; they do NOT change the (customer_id,
+	// resource_id) key schema. `omitempty` + tolerant UnmarshalMap keep legacy
+	// / feature-off rows (which carry neither attribute) decoding unchanged.
+	//
+	// CONTRACT — these two `dynamodbav` names are the entire cross-repo wire
+	// contract and must stay byte-identical to the writer. The writer is
+	// qurl-service `internal/repository/dynamodb/nhp_resource_catalog_repo.go`
+	// (qURL v2 P1a, qurl-service PR #993). Because P1b is a dumb carrier with
+	// no validation, a name typo/drift on either side surfaces an EMPTY value
+	// rather than erroring — a failure mode that escapes both repos' unit
+	// tests. If you rename either attribute, change both repos in lockstep.
+	// (A cross-repo mint→read e2e test is the durable guard; deferred to the
+	// phase that first makes this value load-bearing — P3/P4.)
+	//
+	// P1b only READS and SURFACES these (onto common.ResourceData) so later
+	// admission phases (P3/P4) can key on the resource public key. P1b does NOT
+	// validate, decode, or admission-gate on them — a malformed value still
+	// surfaces; verification is a later phase.
+	//
+	//   ResourcePublicKeyB64:  unpadded base64url DER SPKI of the resource pubkey
+	//   ResourcePublicKeyHash: lowercase hex SHA-256 of the DECODED DER bytes
+	ResourcePublicKeyB64  string `json:"resource_public_key_b64,omitempty" dynamodbav:"resource_public_key_b64,omitempty"`
+	ResourcePublicKeyHash string `json:"resource_public_key_hash,omitempty" dynamodbav:"resource_public_key_hash,omitempty"`
 }
 
 // ============================================================================
