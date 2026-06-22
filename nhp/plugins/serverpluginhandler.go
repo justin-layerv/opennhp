@@ -277,6 +277,17 @@ type NhpServerPluginHelper struct {
 	// THAT PATH — the lock-free read sees a stable snapshot.
 	//
 	AspData *common.AuthServiceProviderData
+
+	// ServerCellPublicKeyB64 is this NHP server's own static public key
+	// (the "cell public key" in qURL v2 terms), standard-base64 encoded —
+	// the same encoding the device emits for peer keys and the same the
+	// authenticated agent key (NhpAuthRequest.PublicKey) uses. The qURL v2
+	// admission path binds the signed claims' cell_public_key_b64 against
+	// this value (decoding both sides to raw bytes) so a qURL minted for a
+	// DIFFERENT cell cannot be admitted here. Empty when the host did not
+	// plumb it (hand-built test helpers); the qv2 admission path fails
+	// closed on an empty cell key.
+	ServerCellPublicKeyB64 string
 }
 
 type HttpServerPluginHelper struct {

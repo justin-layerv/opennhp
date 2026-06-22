@@ -65,11 +65,32 @@ func Init(in *plugins.PluginParamsIn) error {
 	_ = in // unused but required by plugin interface
 
 	initOnce.Do(func() {
+		var cfg *Config
+		cfg, initErr = LoadConfig()
+		if initErr != nil {
+			initErr = fmt.Errorf("[QURL] failed to initialize: %w", initErr)
+			return
+		}
+
 		resolver, initErr = NewQurlResolver()
 		if initErr != nil {
 			initErr = fmt.Errorf("[QURL] failed to initialize: %w", initErr)
 			return
 		}
+
+		// qURL v2 admission feature. Off by default; when on, the issuer trust
+		// store MUST parse or Init fails closed (validateConfig already asserted
+		// it is non-empty). When off, the qv2 claims knock path is a total no-op.
+		v2AdmissionEnabled = cfg.V2AdmissionEnabled
+		if v2AdmissionEnabled {
+			v2TrustStore, initErr = LoadV2TrustStore(cfg.V2IssuerTrustStoreJSON)
+			if initErr != nil {
+				initErr = fmt.Errorf("[QURL] failed to load qURL v2 issuer trust store: %w", initErr)
+				return
+			}
+			log.Info("[QURL] qURL v2 admission ENABLED")
+		}
+
 		log.Info("[QURL] Plugin initialized: %s", Version())
 	})
 

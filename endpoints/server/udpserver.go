@@ -3987,6 +3987,10 @@ func (us *UdpServer) NewNhpServerHelper(ppd *core.PacketParserData, aspData *com
 	h := &plugins.NhpServerPluginHelper{}
 	h.StopSignal = ppd.ConnData.StopSignal
 	h.AspData = aspData
+	// Expose this server's own static (cell) public key so qURL v2 admission can
+	// bind the signed claims' cell_public_key_b64 to THIS cell. Std-base64, the
+	// same encoding the authenticated agent key (req.PublicKey) carries.
+	h.ServerCellPublicKeyB64 = us.device.PublicKeyBase64()
 
 	h.AuthWithNhpCallbackFunc = func(req *common.NhpAuthRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 		return us.handleNhpOpenResource(req, res)

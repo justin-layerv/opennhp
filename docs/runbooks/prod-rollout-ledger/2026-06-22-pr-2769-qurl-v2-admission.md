@@ -1,0 +1,19 @@
+# 2026-06-22 · PR #2769 · qURL v2 signed-claims admission (NHP side)
+
+- **Owner:** prod rollout coordinator
+- **Source:** [#2769](https://github.com/layervai/nhp/pull/2769) · qurl-service P3c (prepare/commit/cancel admission endpoints)
+
+Adds the flag-gated qURL v2 admission path on the NHP knock side
+(`authWithNHPClaims`) behind `QURL_V2_ADMISSION_ENABLED` (default off). Ships
+disabled and inert: with the flag off a qv2 knock is a no-op (the qv1 `at_` path
+is unchanged). The flag cannot be flipped on in an env until that env's NHP
+server has an issuer trust store and qurl-service's v2 admission endpoints are
+live there.
+
+- [ ] Rollout: wire two new NHP-server env vars via Terraform/SSM (do not hand-write): `QURL_V2_ADMISSION_ENABLED` (truthy to enable) and `QURL_V2_ISSUER_TRUST_STORE` (JSON `{kid: base64(DER SPKI P-256 issuer public key)}`). Init fails closed at boot if the flag is on but the trust store is empty/unparseable, so land the trust store in the same apply that flips the flag.
+- [ ] Pre-rollout (HARD, before flag flip): confirm qurl-service's v2 admission endpoints (`POST /internal/v2/qurl/admissions/prepare`, `/{id}/commit`, `/{id}/cancel`) are deployed and reachable in the target env. With the flag on but those endpoints absent, every qv2 knock fails prepare and denies — keep the flag off until P3c is live in that env.
+- [ ] Pre-rollout: confirm the `QURL_V2_ISSUER_TRUST_STORE` kid(s) match the issuer signing kid qurl-service mints under in that env (kid mismatch → `ErrUnknownKID` → every qv2 admission denied). The shared golden vectors keep the crypto in agreement; the trust-store kid wiring is the operational join.
+- [ ] Post-rollout: watch handler-duration / graceful-drain headroom during a qurl-service brownout. The qv2 path makes up to two sequential 5s calls on the happy path (prepare + commit ≈ 10s) and three on the commit-failure path (prepare + commit + cancel ≈ 15s); `shutdownTransactionDrainTimeout` is also 15s. When these timeouts bite (a brownout), a qv2 knock landing just before SIGTERM can hold a handler goroutine for most of the drain window. Confirm the drain still completes with qv1 knocks in flight; if it doesn't, lower `qurlAuthorizeTimeout` for the qv2 path or shed qv2 knocks earlier during shutdown. (qv1 bootstrap is a single 5s call by contrast.)
+- [ ] Rollback: set `QURL_V2_ADMISSION_ENABLED=false` (or remove it) and re-apply. The path becomes a total no-op again with no qv1 impact; no state migration to undo (admission state is qurl-service-owned).
+- [ ] Cross-repo: this PR builds to the "NHP Server Contract" request/response shapes in `docs/design/QURL_V2_KEYED_IDENTITY.md`; the qurl-service P3c side implements them. If either side changes a field name (e.g. the prepare blobs `qurl_claims_b64`/`qurl_issuer_sig_b64`, the `ac_routing` shape, or the admission error codes), update both in lockstep before enabling in any shared env.
+- [ ] Cross-repo (HARD, before flag flip): the knock resource identity (`AgentKnockMsg.ResourceId`) MUST be the protected-resource public key as **canonical unpadded base64url** — the same encoding as the signed `resource_public_key_b64`. NHP binds them with a strict decoder (`ClaimResourceKeyMatches`), so if the js-agent emits std-base64, padded, or hex, EVERY qv2 knock fails closed with an opaque resource-mismatch deny (indistinguishable from a genuine mismatch — a silent total outage). Add a shared conformance vector that round-trips a resource id through the exact encoding the js-agent emits before enabling the flag in any shared env.

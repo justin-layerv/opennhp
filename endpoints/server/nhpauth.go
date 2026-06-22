@@ -157,7 +157,7 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 		// qurl-agent-keys DDB table. Nil lookup = DDB-backed agent
 		// path disabled (legacy etcd / file deployments); fall
 		// through to the auth handler unchanged.
-		if s.agentPeerLookup != nil && !isQurlRelayBootstrapKnock(ppd, knkMsg) {
+		if s.agentPeerLookup != nil && !isQurlRelaySelfAuthKnock(ppd, knkMsg) {
 			if resolveErr := s.resolveAgentPeerForKnock(ppd, knkMsg, ackMsg, transactionId, addrStr); resolveErr != nil {
 				// resolveAgentPeerForKnock has already populated ackMsg.ErrCode/
 				// ErrMsg; the reject rides in the ack, so just stop the pipeline.
@@ -165,10 +165,12 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 			}
 		} else if s.agentPeerLookup != nil {
 			// qurl.link's first browser knock presents a freshly generated
-			// JS-agent pubkey that qurl-service cannot have registered yet.
-			// The encrypted qURL access token is the bootstrap credential; the
-			// qURL plugin validates it and binds ppd.RemotePubKey through the
-			// internal browser-relay resolve endpoint before opening access.
+			// JS-agent / per-qURL pubkey that qurl-service cannot have registered
+			// as an agent row. For qv1 the encrypted qURL access token is the
+			// bootstrap credential; for qv2 the encrypted signed claims plus
+			// proof-of-possession are. Either way the qURL plugin validates the
+			// credential and binds ppd.RemotePubKey before opening access, so the
+			// DDB agent-key resolution above is skipped.
 			log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"qurl_bootstrap_unknown_pubkey_allowed\" pubkey_b64_prefix=%q",
 				knkMsg.UserId, transactionId, addrStr,
 				pubkeyLogPrefix(base64.StdEncoding.EncodeToString(ppd.RemotePubKey)))
@@ -259,6 +261,34 @@ const (
 	qurlAccessTokenUserDataKey      = "qurl_access_token"
 )
 
+// qURL v2 signed-claims knock carries the issuer-signed claims (Part 1) and the
+// issuer signature (Part 3) in two separate encrypted-UserData blobs — NO
+// unsigned secret part (the per-qURL private key never leaves the client;
+// possession is proven by completing the Noise IK handshake). The field names
+// match the NHP Server Contract's prepare request blobs verbatim
+// (docs/design/QURL_V2_KEYED_IDENTITY.md → "NHP Server Contract").
+//
+// Exported because the qURL plugin (which imports this package) keys its qv2
+// dispatch on the same UserData blobs; sharing the constant keeps the
+// HandleKnockRequest skip-DDB predicate and the plugin dispatch from drifting.
+const (
+	QurlV2ClaimsUserDataKey    = "qurl_claims_b64"
+	QurlV2IssuerSigUserDataKey = "qurl_issuer_sig_b64"
+)
+
+// isQurlRelaySelfAuthKnock reports whether a knock is a qURL knock that the
+// browser/headless client self-authenticates (qURL access token or qv2 signed
+// claims) rather than one whose agent key is pre-registered in the
+// qurl-agent-keys DDB table. Both qURL flows present a freshly generated
+// per-qURL/JS-agent pubkey that qurl-service cannot have registered as an agent
+// row, so HandleKnockRequest skips the DDB agent-key resolution for them; the
+// qURL plugin establishes identity from the bootstrap credential (qv1 token) or
+// from the signed claims + proof-of-possession (qv2) instead. (Per-qURL key
+// authorization model: identity is NOT a catalog row.)
+func isQurlRelaySelfAuthKnock(ppd *core.PacketParserData, knkMsg *common.AgentKnockMsg) bool {
+	return isQurlRelayBootstrapKnock(ppd, knkMsg) || isQurlV2ClaimsKnock(ppd, knkMsg)
+}
+
 func isQurlRelayBootstrapKnock(ppd *core.PacketParserData, knkMsg *common.AgentKnockMsg) bool {
 	if ppd == nil || knkMsg == nil {
 		return false
@@ -284,6 +314,67 @@ func isQurlRelayBootstrapKnock(ppd *core.PacketParserData, knkMsg *common.AgentK
 		return false
 	}
 	return looksLikeQurlAccessTokenForBootstrap(strings.TrimSpace(token))
+}
+
+// isQurlV2ClaimsKnock reports whether a knock is a qURL v2 signed-claims knock.
+// It is recognized DISTINCTLY from the qv1 access-token bootstrap: a qv2 knock
+// carries the signed claims + issuer signature blobs in encrypted UserData and
+// its ResourceId is the protected-resource public key (gospel step 5), NOT the
+// "qurl-bootstrap" sentinel. So this predicate keys on the qv2 UserData blobs
+// being present and non-empty strings — it deliberately does NOT check
+// ResourceId against a sentinel (there is none) and does NOT verify the
+// signature here. This is only the cheap "should HandleKnockRequest skip DDB
+// agent-key registration?" gate; the qURL plugin's authWithNHPClaims performs
+// the authoritative independent signature/binding/liveness verification before
+// any AC is opened. A knock that trips this predicate but fails verification is
+// rejected there, having merely skipped a DDB lookup it would have missed anyway
+// (the per-qURL key is never an agent-keys row).
+//
+// This predicate is intentionally INDEPENDENT of the qURL v2 admission feature
+// flag (which lives in the qURL plugin package and is not readable here). That is
+// safe because the plugin's AuthWithNHP decides a qv2-shaped knock either way: it
+// runs the full verify when the flag is on and FAILS CLOSED (denies) when the
+// flag is off. A qv2-shaped knock never reaches the steady-state path, so the DDB
+// lookup this predicate skips can never gate anything — skipping it with the flag
+// off changes no outcome.
+func isQurlV2ClaimsKnock(ppd *core.PacketParserData, knkMsg *common.AgentKnockMsg) bool {
+	if ppd == nil || knkMsg == nil {
+		return false
+	}
+	if ppd.HeaderType != core.NHP_KNK {
+		return false
+	}
+	if knkMsg.AuthServiceId != qurlRelayBootstrapAuthServiceID {
+		return false
+	}
+	if len(ppd.RemotePubKey) == 0 {
+		return false
+	}
+	_, claimsOK := TrimmedStringUserData(knkMsg.UserData, QurlV2ClaimsUserDataKey)
+	_, sigOK := TrimmedStringUserData(knkMsg.UserData, QurlV2IssuerSigUserDataKey)
+	return claimsOK && sigOK
+}
+
+// TrimmedStringUserData returns userData[key] with surrounding whitespace
+// trimmed, and ok=true only if it is present, a string, and non-empty after
+// trimming. Exported so the qURL plugin's qv2 dispatch reads the same UserData
+// blobs the HandleKnockRequest skip-DDB predicate (isQurlV2ClaimsKnock) keys on,
+// from a single definition — the predicate and the dispatch must agree on what a
+// present, usable qv2 blob is.
+func TrimmedStringUserData(userData map[string]any, key string) (string, bool) {
+	raw, ok := userData[key]
+	if !ok {
+		return "", false
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	return s, true
 }
 
 func looksLikeQurlAccessTokenForBootstrap(token string) bool {
