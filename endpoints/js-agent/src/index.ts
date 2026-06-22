@@ -29,3 +29,33 @@ export type {
   RenewalController,
   RenewalOptions,
 } from "./agent/scheduler.js";
+
+// qURL v2 client (keyed-identity bootstrap): parse the `#qv2.…` fragment, verify
+// the issuer signature locally (mandatory — before acting on relay_url/cell key),
+// validate relay_url, and knock through the relay using the per-qURL private key.
+//
+// The public surface is deliberately construct/call/catch only: the qurl.link page
+// CALLS `knockQurlV2`, CONSTRUCTS a `TrustStore` + `RelayAllowlist`, and CATCHES
+// the error bases it branches on. The strict parser, signature, and fragment
+// internals stay package-private (tests import them by direct path) so the
+// size-budgeted browser bundle exposes only what a consumer needs. Type exports
+// are erased from the bundle, so they are free.
+export { knockQurlV2 } from "./qurl/knock.js";
+export type {
+  QurlV2KnockOptions,
+  QurlV2KnockBodyParams,
+} from "./qurl/knock.js";
+export type { Fragment } from "./qurl/fragment.js";
+export { FragmentError } from "./qurl/fragment.js";
+export type { Claims, Secret } from "./qurl/claims.js";
+// Parse/encoding/key-length failures can surface from knockQurlV2 (a malformed
+// claims JSON, a wrong-length key, or non-canonical base64 in a part), so a
+// consumer branching on error class can catch them too — not just FragmentError.
+export { StrictParseError, KeyLengthError } from "./qurl/claims.js";
+export { Base64UrlError } from "./qurl/base64url.js";
+export { TrustStore, UnknownKidError } from "./qurl/truststore.js";
+export type { EcPublicJwk } from "./qurl/truststore.js";
+// The base SignatureError catches every signature failure (length/high-S/range
+// subclasses extend it); a consumer branching on the class needs only the base.
+export { SignatureError } from "./qurl/signature.js";
+export { RelayAllowlist, RelayUrlError } from "./qurl/relay-url.js";

@@ -65,6 +65,17 @@ export interface KnockRequest {
   resourceId?: string;
   qurlAccessToken?: string;
   qurlUserAgent?: string;
+  /**
+   * A pre-serialized `AgentKnockMsg` body to seal as-is, bypassing the v1 body
+   * builder. The qURL v2 path supplies its own body (signed claims + issuer
+   * signature in `usrData`, `resId` = resource public key); when set, the
+   * v1-only `resourceId`/`qurlAccessToken`/`qurlUserAgent` fields are ignored. The
+   * caller owns serialization and MUST set the body's `headerType` to `NHP_KNK`
+   * (the #1154 wire-vs-body invariant) — {@link buildQurlV2KnockBody} does. The
+   * seal/POST/dispatch path is otherwise unchanged, so v2 routes through the same
+   * `createKnock`/relay/`decryptReply` machinery as v1.
+   */
+  body?: Uint8Array;
 }
 
 /** Injectable seams: a mock relay transport and pinned entropy. Production
@@ -123,12 +134,15 @@ export async function knock(
   const entropy = deps.entropy ?? browserEntropy;
   const transport = deps.transport ?? relayPost(req.relayBaseUrl);
 
-  const body = buildKnockBody({
-    authServiceId: req.authServiceId,
-    resourceId: req.resourceId,
-    qurlAccessToken: req.qurlAccessToken,
-    qurlUserAgent: req.qurlUserAgent,
-  });
+  // The qURL v2 path supplies a fully-formed body; v1 builds one from the request.
+  const body =
+    req.body ??
+    buildKnockBody({
+      authServiceId: req.authServiceId,
+      resourceId: req.resourceId,
+      qurlAccessToken: req.qurlAccessToken,
+      qurlUserAgent: req.qurlUserAgent,
+    });
   const { packet, counter } = createKnock(
     req.deviceStaticPriv,
     req.serverStaticPub,
