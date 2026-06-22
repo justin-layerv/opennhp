@@ -138,6 +138,19 @@ type ServerACOpsMsg struct {
 	SourceAddrs      []*NetAddress `json:"srcAddrs"`
 	DestinationAddrs []*NetAddress `json:"dstAddrs"`
 	OpenTime         uint32        `json:"opnTime"`
+
+	// qURL v2 keyed-identity revocation metadata (additive; populated only by
+	// the v2 signed-claims admission path, omitted for every legacy admission).
+	// Carried from the server's admission decision down to the AC so the AC can
+	// store it on the access/flow entry for immediate, targeted revocation.
+	// Indexing these for O(1) revoke lookup is P4b; P4a only carries + stores.
+	// See docs/design/QURL_V2_KEYED_IDENTITY.md → "AC Admission and Immediate Revocation".
+	QurlUserPublicKeyHash string `json:"qurlUsrPubKeyHash,omitempty"` // hash of the qURL user's keyed-identity public key
+	ResourcePublicKeyHash string `json:"resPubKeyHash,omitempty"`     // hash of the protected resource's public key
+	SessionId             string `json:"sessId,omitempty"`            // qURL v2 session identifier
+	AdmissionId           string `json:"admId,omitempty"`             // unique id of the admission decision that opened this access
+	RevocationEpoch       uint64 `json:"revEpoch,omitempty"`          // monotonic epoch used to invalidate access on revoke
+	Deadline              int64  `json:"deadline,omitempty"`          // unix seconds; admission validity deadline
 }
 
 type ACOpsResultMsg struct {
