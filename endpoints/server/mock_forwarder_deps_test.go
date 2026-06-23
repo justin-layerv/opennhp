@@ -128,6 +128,7 @@ func (m *MockForwarderDeps) ProcessACOperation(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	return m.processResult, m.processErr
 }
@@ -139,9 +140,10 @@ func (m *MockForwarderDeps) ProcessACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	if len(conns) > 0 {
-		return m.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		return m.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime, res)
 	}
 	return m.processResult, m.processErr
 }

@@ -447,7 +447,12 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	// dispatch today), but threading lifecycle ctx keeps log correlation
 	// and any future cancellation-respecting code path consistent across
 	// the forward-receiver call sites.
-	artMsg, err := f.deps.ProcessACOperationBroadcast(f.deps.LifecycleCtx(), knkMsg, acConns, srcAddr, dstAddrs, openTime)
+	//
+	// resData here is the catalog ResourceData from ResolveResource (not a v2
+	// admission decision), so it carries ResourcePublicKeyHash but not the
+	// per-admission revocation fields. Passing it lets the resource hash reach
+	// the AOP on the forward path; the rest stay omitted (see deps interface).
+	artMsg, err := f.deps.ProcessACOperationBroadcast(f.deps.LifecycleCtx(), knkMsg, acConns, srcAddr, dstAddrs, openTime, resData)
 	if err != nil {
 		log.Error("AC operation failed for forwarded knock: %v", err)
 		errCode := "AC_OP_FAILED"

@@ -565,11 +565,11 @@ func (d *crossServerForwarderDeps) ResolveAuthSvcProvider(context.Context, strin
 
 func (d *crossServerForwarderDeps) LifecycleCtx() context.Context { return context.Background() }
 
-func (d *crossServerForwarderDeps) ProcessACOperation(*common.AgentKnockMsg, *ACConn, *common.NetAddress, []*common.NetAddress, uint32) (*common.ACOpsResultMsg, error) {
+func (d *crossServerForwarderDeps) ProcessACOperation(*common.AgentKnockMsg, *ACConn, *common.NetAddress, []*common.NetAddress, uint32, *common.ResourceData) (*common.ACOpsResultMsg, error) {
 	return nil, nil
 }
 
-func (d *crossServerForwarderDeps) ProcessACOperationBroadcast(context.Context, *common.AgentKnockMsg, []*ACConn, *common.NetAddress, []*common.NetAddress, uint32) (*common.ACOpsResultMsg, error) {
+func (d *crossServerForwarderDeps) ProcessACOperationBroadcast(context.Context, *common.AgentKnockMsg, []*ACConn, *common.NetAddress, []*common.NetAddress, uint32, *common.ResourceData) (*common.ACOpsResultMsg, error) {
 	return nil, nil
 }
 

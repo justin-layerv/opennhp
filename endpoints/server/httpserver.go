@@ -1421,7 +1421,8 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 			// resolveProcessACOperationBroadcast lets handler-site
 			// integration tests inject a fake AC response — see
 			// httpserver_publish_acktokens_test.go.
-			artMsg, err := s.resolveProcessACOperationBroadcast()(ctx, knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
+			// res carries qURL v2 revocation metadata (P4a) for the AOP; nil-safe.
+			artMsg, err := s.resolveProcessACOperationBroadcast()(ctx, knkMsg, connsCopy, srcAddr, dstAddrs, openTime, res)
 			artMsgsMutex.Lock()
 			artMsgs[name] = artMsg
 			if err == nil {

@@ -65,12 +65,15 @@ type ForwarderDeps interface {
 	LifecycleCtx() context.Context
 
 	// ProcessACOperation sends an AOP to an AC and waits for the ART response.
+	// res carries qURL v2 revocation metadata (P4a) to stamp onto the AOP, or
+	// nil for legacy callers.
 	ProcessACOperation(
 		knkMsg *common.AgentKnockMsg,
 		acConn *ACConn,
 		srcAddr *common.NetAddress,
 		dstAddrs []*common.NetAddress,
 		openTime uint32,
+		res *common.ResourceData,
 	) (*common.ACOpsResultMsg, error)
 
 	// ProcessACOperationBroadcast sends AOP to all AC connections in parallel.
@@ -79,6 +82,13 @@ type ForwarderDeps interface {
 	// must run independently to open pinholes on every AC. Callers without a
 	// request context should pass context.Background(); never pass nil.
 	// Returns the first successful result.
+	//
+	// res carries qURL v2 revocation metadata (P4a) to stamp onto the AOP, or
+	// nil for legacy paths. On the forward-receiver path it is the catalog
+	// ResourceData (resData), which carries ResourcePublicKeyHash but not the
+	// per-admission fields — the forward path re-resolves the resource rather
+	// than re-running v2 admission, so admission_id / deadline / qurl-user hash
+	// are not available there and stay omitted.
 	ProcessACOperationBroadcast(
 		parentCtx context.Context,
 		knkMsg *common.AgentKnockMsg,
@@ -86,6 +96,7 @@ type ForwarderDeps interface {
 		srcAddr *common.NetAddress,
 		dstAddrs []*common.NetAddress,
 		openTime uint32,
+		res *common.ResourceData,
 	) (*common.ACOpsResultMsg, error)
 
 	// PublishACKTokens persists every AC token in ackMsg.ACTokens so

@@ -136,6 +136,43 @@ func (a *UdpAC) admitAndIssueToken(entry *AccessEntry, openTimeSec int, artMsgIn
 	return
 }
 
+// accessEntryFromAOP maps a decoded NHP-AOP message onto the AccessEntry the AC
+// admits. Pure (no receiver, no side effects) so the field mapping — including
+// the qURL v2 revocation metadata carried by P4a — is unit-testable without the
+// kernel-write admission machinery.
+//
+// OwnerId (the server-resolved tenant identity, see common.AgentUser godoc) is
+// INTENTIONALLY not populated on the AC side: the NHP-AOP wire (dopMsg) carries
+// only the client-supplied fields, and the AC is not a consumer of
+// /nhp/internal/token/validate (which is where server-resolved OwnerId surfaces
+// downstream). A future contributor "fixing" this by guessing an OwnerId from
+// dopMsg would inject a non-authoritative value into the AC-side AgentUser and
+// break the field's "server-resolved-only" invariant. If the AC ever needs
+// OwnerId, extend the NHP-AOP wire to carry it from the resolved server state.
+func accessEntryFromAOP(dopMsg *common.ServerACOpsMsg) *AccessEntry {
+	return &AccessEntry{
+		User: &common.AgentUser{
+			UserId:         dopMsg.UserId,
+			DeviceId:       dopMsg.DeviceId,
+			OrganizationId: dopMsg.OrganizationId,
+			AuthServiceId:  dopMsg.AuthServiceId,
+		},
+		SrcAddrs: dopMsg.SourceAddrs,
+		DstAddrs: dopMsg.DestinationAddrs,
+		OpenTime: int(dopMsg.OpenTime),
+		// qURL v2 keyed-identity revocation metadata (P4a): stored verbatim from
+		// the AOP onto the access entry so P4b can index live flows for immediate
+		// revocation. Stored as received — NOT recomputed AC-side (see AccessEntry
+		// godoc). Zero-valued for legacy admissions, where the AOP omits them.
+		QurlUserPublicKeyHash: dopMsg.QurlUserPublicKeyHash,
+		ResourcePublicKeyHash: dopMsg.ResourcePublicKeyHash,
+		SessionId:             dopMsg.SessionId,
+		AdmissionId:           dopMsg.AdmissionId,
+		RevocationEpoch:       dopMsg.RevocationEpoch,
+		Deadline:              dopMsg.Deadline,
+	}
+}
+
 // HandleUdpACOperations processes a single NHP_AOP packet. Synchronous —
 // callers own goroutine and wg accounting. The production caller is the
 // NHP_AOP arm of recvMessageRoutine in udpac.go, which spawns this in a
@@ -205,31 +242,8 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 		return
 	}
 
-	srcAddrs := dopMsg.SourceAddrs
-	dstAddrs := dopMsg.DestinationAddrs
 	openTimeSec := int(dopMsg.OpenTime)
-	// OwnerId (the server-resolved tenant identity, see common.AgentUser
-	// godoc) is INTENTIONALLY not populated on the AC side: the
-	// NHP-AOP wire (dopMsg) carries only the client-supplied fields,
-	// and the AC is not a consumer of /nhp/internal/token/validate
-	// (which is where server-resolved OwnerId surfaces downstream).
-	// A future contributor "fixing" this by guessing an OwnerId from
-	// dopMsg would inject a non-authoritative value into the
-	// AC-side AgentUser and break the field's "server-resolved-only"
-	// invariant. If the AC ever needs OwnerId, extend NHP-AOP wire
-	// to carry it from the resolved server-side state.
-	agentUser := &common.AgentUser{
-		UserId:         dopMsg.UserId,
-		DeviceId:       dopMsg.DeviceId,
-		OrganizationId: dopMsg.OrganizationId,
-		AuthServiceId:  dopMsg.AuthServiceId,
-	}
-	entry := &AccessEntry{
-		User:     agentUser,
-		SrcAddrs: srcAddrs,
-		DstAddrs: dstAddrs,
-		OpenTime: openTimeSec,
-	}
+	entry := accessEntryFromAOP(dopMsg)
 	artMsg, err = a.admitAndIssueToken(entry, openTimeSec, artMsg)
 	if err != nil {
 		log.Error("ac(%s#%d)[HandleUdpACOperations] HandleAccessControl failed, err: %v", acId, transactionId, err)

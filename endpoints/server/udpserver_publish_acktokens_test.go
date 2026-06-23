@@ -59,6 +59,7 @@ func TestHandleNhpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 			srcAddr *common.NetAddress,
 			_ []*common.NetAddress,
 			openTime uint32,
+			_ *common.ResourceData,
 		) (*common.ACOpsResultMsg, error) {
 			gotConnsLen = len(conns)
 			gotSrcIp = srcAddr.Ip
@@ -177,6 +178,7 @@ func TestHandleNhpOpenResource_PublishACKTokens_NoLeakOnFail(t *testing.T) {
 			_ *common.NetAddress,
 			_ []*common.NetAddress,
 			_ uint32,
+			_ *common.ResourceData,
 		) (*common.ACOpsResultMsg, error) {
 			// Failure shape: error and an artMsg the production code
 			// uses to signal the failure to the agent.
@@ -240,6 +242,7 @@ func TestHandleNhpOpenResource_NilBroadcastResult(t *testing.T) {
 			_ *common.NetAddress,
 			_ []*common.NetAddress,
 			_ uint32,
+			_ *common.ResourceData,
 		) (*common.ACOpsResultMsg, error) {
 			// nil artMsg with an error — the marshal/guard shape that the
 			// store-site guard must absorb before the deref loops run.

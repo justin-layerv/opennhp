@@ -509,6 +509,19 @@ const (
 	MetricQurlResolveBrowserTimeToSubmitMs     = "QurlResolveBrowserTimeToSubmitMs"
 	MetricQurlResolveBrowserRejectedMalformed  = "QurlResolveBrowserRejectedMalformed"
 	MetricQurlResolveBrowserRejectedOutOfRange = "QurlResolveBrowserRejectedOutOfRange"
+	// MetricQurlV2RevocationHashError fires when the qURL v2 admission path
+	// (buildV2ResourceData) fails to hash a VERIFIED claim key into its
+	// revocation-index digest. The keys already decoded during VerifyClaims, so
+	// this should be unreachable; if it ever fires, the admission still completes
+	// (we do not fail an already-committed, one-time-use admission over
+	// revocation-INDEX metadata — see buildV2ResourceData), but the resulting
+	// flow lands with an empty hash and is therefore invisible to P4b's targeted
+	// revocation, downgrading it to scheduled timer-wheel expiry only. A single
+	// log line is easy to miss in aggregate, so this counter makes the
+	// decode/hash regression alertable: a non-zero rate means admitted v2 flows
+	// are silently becoming un-revocable-by-key. Emitted on the knock-path helper
+	// (NewNhpServerHelper binds IncrCounter), so it is live on the real v2 path.
+	MetricQurlV2RevocationHashError = "QurlV2RevocationHashError"
 	// MetricLicenseValidationRateLimited fires from BOTH call sites:
 	// the hoisted preflight check (closes the F5 amplification
 	// surface) AND the deeper in-validateACLicense check. It's the

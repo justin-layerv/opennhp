@@ -21,6 +21,7 @@ package qurlv2
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 )
@@ -282,6 +283,27 @@ func decodeResourcePublicKey(b64 string) ([]byte, error) {
 			ErrKeyLength, len(der), minResourcePublicKeyDERBytes, maxResourcePublicKeyDERBytes)
 	}
 	return der, nil
+}
+
+// PublicKeyHashFromB64 is the canonical revocation-index hash of a qURL v2
+// public key: lowercase-hex SHA-256 of the DECODED key bytes. The input is the
+// unpadded base64url form carried in the signed claims (qurl_user_public_key_b64
+// and resource_public_key_b64), decoded with the same strict base64url decoder
+// the parser uses, so the hash preimage is exactly the bytes the issuer signed.
+//
+// This MUST be the single source of the hash format. The AOP revocation metadata
+// (ServerACOpsMsg.QurlUserPublicKeyHash / ResourcePublicKeyHash, P4a) and the
+// AC's secondary revocation indexes (P4b) both key off it; if a second hasher
+// computed a different digest the indexes would never match a revoke. It mirrors
+// the format documented on common.ResourceData.ResourcePublicKeyHash
+// ("lowercase hex SHA-256 of the DECODED DER bytes").
+func PublicKeyHashFromB64(b64 string) (string, error) {
+	raw, err := decodeB64(b64)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // signingInput builds the exact bytes the issuer signs and verifiers verify:

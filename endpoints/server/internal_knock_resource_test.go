@@ -324,6 +324,7 @@ func TestResolveInternalKnockResourceQURLDynamicResourceDrivesACOpenWithoutASPWa
 			srcAddr *common.NetAddress,
 			dstAddrs []*common.NetAddress,
 			openTime uint32,
+			_ *common.ResourceData,
 		) (*common.ACOpsResultMsg, error) {
 			gotASP = knkMsg.AuthServiceId
 			gotResource = knkMsg.ResourceId

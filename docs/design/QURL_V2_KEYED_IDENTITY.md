@@ -713,6 +713,16 @@ On immediate revoke:
    reschedules them with deadline `now`.
 6. AC removes tokenStore/access entries so refresh/re-knock cannot extend them.
 
+Implementation caveat (forwarded flows): the carrier of this metadata onto the
+AOP/AccessEntry (P4a, nhp PR #2772) populates the per-admission fields
+(`qurl_user_public_key_hash`, `admission_id`, `deadline`) only on the local
+admission path. A flow admitted via the **server-to-server forward path** carries
+`resource_public_key_hash` only (from the catalog row), because the forward
+receiver re-resolves the resource rather than re-running v2 admission. Until the
+forward path carries the per-admission fields, **forwarded flows are revocable by
+resource key only** — a `qurl`/`session`/`admission`-scoped revoke will not match
+them. Tracked in #2774; may be mooted by #2208 (which removes the forward path).
+
 Use the existing "Kafka / Netty pattern" hashed wheel algorithm; do not add
 Kafka infrastructure. The new work is the revocation fanout and the immediate
 fire path, not a new timer architecture.
@@ -774,6 +784,16 @@ Event shape:
   "reason": "creator_revoke"
 }
 ```
+
+Hash-preimage contract (load-bearing across repos): `qurl_user_public_key_hash`
+and `resource_public_key_hash` here MUST be computed with the SAME preimage the
+AC indexes under — lowercase-hex SHA-256 of the **decoded** key bytes (raw key
+for the qURL-user key; decoded DER for the resource key), matching NHP's single
+canonical hasher `qurlv2.PublicKeyHashFromB64` (P4a). If the revoke side ever
+hashes the base64 string, a padded variant, or a DER-renormalized form, the AC's
+P4b indexes silently never match and the revoke misses every flow. The in-repo
+producers are pinned by tests; the residual risk is the qurl-service revoke
+emitter. Tracked: qurl-service #1010, nhp #2752.
 
 Supported scopes:
 

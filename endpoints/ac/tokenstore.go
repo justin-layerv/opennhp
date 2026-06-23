@@ -83,7 +83,46 @@ type AccessEntry struct {
 	DstAddrs       []*common.NetAddress
 	OpenTime       int
 	FirstKnockTime time.Time `json:"-"`
-	ExpireTime     time.Time
+	// ExpireTime is the AC-authoritative firewall/pinhole expiry the timer wheel
+	// schedules teardown against. Distinct from the qURL v2 Deadline field below
+	// (the signed-claim exp, advisory revocation metadata): ExpireTime is what
+	// the AC enforces; Deadline is carried for P4b indexing and is not an
+	// enforcement input until a later slice wires it.
+	ExpireTime time.Time
+
+	// qURL v2 keyed-identity revocation metadata (P4a), carried verbatim from
+	// the NHP-AOP (common.ServerACOpsMsg) onto the entry at admission. P4a only
+	// stores these; the secondary indexes that key off them for immediate,
+	// targeted revocation (qurl_user_public_key_hash / resource_public_key_hash /
+	// session_id -> flow keys) are built in P4b. They are stored EXACTLY as
+	// received from the AOP and are NOT recomputed on the AC side: the hashes are
+	// produced once by the canonical server-side hasher
+	// (qurlv2.PublicKeyHashFromB64), and re-hashing here would risk a divergent
+	// digest that P4b's index match could never reconcile against the revoke
+	// event's hash. Empty for legacy / non-qURL-v2 admissions, where the AOP
+	// omits them (omitempty). See docs/design/QURL_V2_KEYED_IDENTITY.md ->
+	// "AC Admission and Immediate Revocation".
+	//
+	// json:"-" on all six: httpac.go's /refresh handler returns the whole
+	// AccessEntry via c.JSON, and these are internal revocation-index metadata
+	// with no client consumer (the AC reads them in-process for P4b indexing).
+	// Without the tag, untagged fields would emit on EVERY /refresh response —
+	// including legacy entries, as present-but-zero PascalCase keys — re-opening
+	// exactly the wire-shape leak that the FirstKnockTime json:"-" and the
+	// OwnerId omitempty tags exist to prevent, and exposing per-admission
+	// metadata to the refreshing client. If a future persistence path needs
+	// these, switch to named ,omitempty tags rather than dropping json:"-".
+	QurlUserPublicKeyHash string `json:"-"`
+	ResourcePublicKeyHash string `json:"-"`
+	SessionId             string `json:"-"`
+	AdmissionId           string `json:"-"`
+	RevocationEpoch       uint64 `json:"-"`
+	// Deadline is the signed-claim exp (unix seconds) carried from admission for
+	// P4b — NOT the AC's firewall expiry. ExpireTime (above) is what the timer
+	// wheel enforces; a future slice that gates on Deadline must reconcile the two
+	// (they can differ: ExpireTime is clamped to the AC pinhole open-time, Deadline
+	// is the claim's validity horizon).
+	Deadline int64 `json:"-"`
 
 	// mu is RWMutex so holdsScheduledKey (pure read, called from
 	// latestOtherFirewallDeadline's per-peer loop) doesn't serialize

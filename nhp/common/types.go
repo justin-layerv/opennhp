@@ -80,6 +80,28 @@ type ResourceData struct {
 	//   ResourcePublicKeyHash: lowercase hex SHA-256 of the DECODED DER bytes
 	ResourcePublicKeyB64  string `json:"resourcePublicKeyB64,omitempty"`
 	ResourcePublicKeyHash string `json:"resourcePublicKeyHash,omitempty"`
+
+	// qURL v2 keyed-identity revocation metadata (P4a). Populated only by the v2
+	// signed-claims admission path (qurl plugin authWithNHPClaims), carried here
+	// from the admission decision down to the AOP builder, which stamps the
+	// matching ServerACOpsMsg fields so the AC can store them on the access/flow
+	// entry for immediate, targeted revocation. These three are empty for v1 /
+	// feature-off admissions (they are not on the catalog row), so the AOP omits
+	// them (omitempty) and stays additive/wire-compatible for pre-v2 ACs.
+	// (ResourcePublicKeyHash above doubles as the resource revocation key and,
+	// unlike these three, can ride a catalog ResourceData for a v2-provisioned
+	// resource even on a non-v2 knock — see processACOperation.)
+	// session_id and revocation_epoch are intentionally NOT carried yet: the
+	// admission prepare contract does not return them, so they await a contract
+	// field and are populated in a later slice. See
+	// docs/design/QURL_V2_KEYED_IDENTITY.md → "AC Admission and Immediate Revocation".
+	//
+	//   QurlUserPublicKeyHash: lowercase hex SHA-256 of the DECODED qURL-user pubkey
+	//   AdmissionId:           id of the admission decision that opened this access
+	//   Deadline:              unix seconds; admission validity deadline (claim exp)
+	QurlUserPublicKeyHash string `json:"qurlUserPublicKeyHash,omitempty"`
+	AdmissionId           string `json:"admissionId,omitempty"`
+	Deadline              int64  `json:"deadline,omitempty"`
 }
 
 type ResourceGroupMap map[string]*ResourceData

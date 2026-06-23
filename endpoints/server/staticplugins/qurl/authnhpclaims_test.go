@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	nhpserver "github.com/OpenNHP/opennhp/endpoints/server"
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlv2"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
@@ -765,5 +766,235 @@ func TestAuthWithNHPClaims_ResourceIDEncodingContract(t *testing.T) {
 	}
 	if len(rec2.callOrder()) != 0 {
 		t.Errorf("no qurl-service admission call may happen on a resource-binding mismatch; got %v", rec2.callOrder())
+	}
+}
+
+// TestAuthWithNHPClaims_PopulatesRevocationMetadata proves the v2 admission path
+// stamps the qURL v2 revocation metadata (P4a) onto the ResourceData handed to
+// AuthWithNhpCallbackFunc (which the server then carries to the AOP and the AC):
+//
+//   - qurl_user_public_key_hash and resource_public_key_hash are the canonical
+//     hashes of the VERIFIED claim keys (recomputed via the same canonical hasher
+//     the production path uses, asserting the value flows through correctly;
+//     the hasher's FORMAT is pinned independently in qurlv2 claims_hash_test.go);
+//   - admission_id is the id prepare returned;
+//   - deadline is the claim exp;
+//   - session_id and revocation_epoch are intentionally not carried on
+//     ResourceData at all (the admission prepare contract does not return them),
+//     so the deferral is structurally enforced, not merely left unset.
+func TestAuthWithNHPClaims_PopulatesRevocationMetadata(t *testing.T) {
+	issuer := newV2TestIssuer(t)
+	cellURL, cellStd := x25519KeyPair(t, 0x10)
+	agentURL, agentStd := x25519KeyPair(t, 0x40)
+	resB64 := resourceKeyB64URL(t)
+
+	now := time.Now().Unix()
+	exp := now + 300
+	claims := map[string]any{
+		"v":                        2,
+		"iss":                      "qurl-service",
+		"kid":                      testV2KID,
+		"iat":                      now - 10,
+		"nbf":                      now - 10,
+		"exp":                      exp,
+		"jti":                      "qurl_meta_test",
+		"cell_public_key_b64":      cellURL,
+		"relay_url":                "https://relay.example.com",
+		"resource_public_key_b64":  resB64,
+		"qurl_user_public_key_b64": agentURL,
+	}
+	claimsB64, sigB64 := issuer.sign(t, claims)
+	enableV2(t, issuer.trustStore(t))
+	setRecordingResolver(t, newAdmissionRecorder(t, defaultACRouting()))
+
+	// Canonical expected hashes for the verified claim keys.
+	wantUserHash, err := qurlv2.PublicKeyHashFromB64(agentURL)
+	if err != nil {
+		t.Fatalf("hash agent key: %v", err)
+	}
+	wantResHash, err := qurlv2.PublicKeyHashFromB64(resB64)
+	if err != nil {
+		t.Fatalf("hash resource key: %v", err)
+	}
+
+	var captured *common.ResourceData
+	helper := &plugins.NhpServerPluginHelper{
+		AspData:                testAspData(resB64, 60),
+		ServerCellPublicKeyB64: cellStd,
+		AuthWithNhpCallbackFunc: func(req *common.NhpAuthRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			captured = res
+			req.Ack.ErrCode = common.ErrSuccess.ErrorCode()
+			return req.Ack, nil
+		},
+	}
+
+	req := &common.NhpAuthRequest{
+		Msg: &common.AgentKnockMsg{
+			AuthServiceId: PluginID,
+			ResourceId:    resB64,
+			UserId:        "u",
+			UserData: map[string]any{
+				qurlV2ClaimsUserDataKey:    claimsB64,
+				qurlV2IssuerSigUserDataKey: sigB64,
+			},
+		},
+		Ack:       &common.ServerKnockAckMsg{},
+		PublicKey: agentStd,
+		SrcAddr:   &common.NetAddress{Ip: "203.0.113.9", Port: 5555},
+	}
+
+	if _, err := AuthWithNHP(req, helper); err != nil {
+		t.Fatalf("AuthWithNHP qv2: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("AC-open callback never fired; ResourceData not captured")
+	}
+
+	if captured.QurlUserPublicKeyHash != wantUserHash {
+		t.Errorf("QurlUserPublicKeyHash = %q, want %q", captured.QurlUserPublicKeyHash, wantUserHash)
+	}
+	if captured.ResourcePublicKeyHash != wantResHash {
+		t.Errorf("ResourcePublicKeyHash = %q, want %q", captured.ResourcePublicKeyHash, wantResHash)
+	}
+	if captured.AdmissionId != "adm_test123" {
+		t.Errorf("AdmissionId = %q, want %q (from prepare)", captured.AdmissionId, "adm_test123")
+	}
+	if captured.Deadline != exp {
+		t.Errorf("Deadline = %d, want claim exp %d", captured.Deadline, exp)
+	}
+	// session_id and revocation_epoch are deferred and have NO field on
+	// ResourceData by design (the prepare contract does not return them), so the
+	// deferral is structurally enforced here, not just left unset.
+}
+
+// TestBuildV2ResourceData_HashError_FailsOpenAndCounts pins the deliberate
+// fail-open-but-observable behavior of the hash branch in buildV2ResourceData:
+// when a claim key cannot be hashed (e.g. a non-base64url value that should be
+// unreachable post-VerifyClaims), the admission is NOT failed — the returned
+// ResourceData carries an EMPTY hash for that key — AND the
+// MetricQurlV2RevocationHashError counter fires so the regression is alertable
+// rather than log-only. This is the test that would break if someone removed the
+// counter or "hardened" the branch into a fail-closed return.
+func TestBuildV2ResourceData_HashError_FailsOpenAndCounts(t *testing.T) {
+	resB64 := resourceKeyB64URL(t)
+	goodResHash, err := qurlv2.PublicKeyHashFromB64(resB64)
+	if err != nil {
+		t.Fatalf("hash good resource key: %v", err)
+	}
+
+	resp := &AdmissionPrepareResponse{
+		AdmissionID: "adm_failopen",
+		QurlID:      "q_failopen",
+		OpenTime:    60,
+		ACRouting:   defaultACRouting(),
+	}
+	// qurl-user key is invalid base64url (padding is rejected by the strict
+	// decoder); resource key is valid. Only the qurl-user hash should fail.
+	claims := &qurlv2.Claims{
+		QurlUserPublicKeyB64: "not_base64url====",
+		ResourcePublicKeyB64: resB64,
+		Exp:                  1781910300,
+	}
+
+	var hashErrCount int
+	got := buildV2ResourceData(resp, claims, func(name string) {
+		if name == nhpserver.MetricQurlV2RevocationHashError {
+			hashErrCount++
+		}
+	})
+
+	if got == nil {
+		t.Fatal("buildV2ResourceData returned nil on hash error; must fail open, not abort")
+	}
+	// Fail-open: the bad key yields an empty hash, the admission still produces a
+	// ResourceData (the AC pinhole + per-admission fields are intact).
+	if got.QurlUserPublicKeyHash != "" {
+		t.Errorf("QurlUserPublicKeyHash = %q, want empty on hash failure (fail-open)", got.QurlUserPublicKeyHash)
+	}
+	if got.ResourcePublicKeyHash != goodResHash {
+		t.Errorf("ResourcePublicKeyHash = %q, want %q (the valid key still hashes)", got.ResourcePublicKeyHash, goodResHash)
+	}
+	if got.AdmissionId != "adm_failopen" {
+		t.Errorf("AdmissionId = %q, want %q (admission metadata intact)", got.AdmissionId, "adm_failopen")
+	}
+	if got.Deadline != 1781910300 {
+		t.Errorf("Deadline = %d, want 1781910300 (admission metadata intact)", got.Deadline)
+	}
+	// Observable: exactly one counter emission, for the one bad key.
+	if hashErrCount != 1 {
+		t.Errorf("MetricQurlV2RevocationHashError fired %d times, want 1 (one bad key)", hashErrCount)
+	}
+}
+
+// TestBuildV2ResourceData_NoHashError_DoesNotCount is the negative control: with
+// both claim keys valid, the hash-error counter must NOT fire, so the metric is
+// a true regression signal and not noise on the happy path.
+func TestBuildV2ResourceData_NoHashError_DoesNotCount(t *testing.T) {
+	resB64 := resourceKeyB64URL(t)
+	userURL, _ := x25519KeyPair(t, 0x40)
+
+	resp := &AdmissionPrepareResponse{
+		AdmissionID: "adm_ok",
+		OpenTime:    60,
+		ACRouting:   defaultACRouting(),
+	}
+	claims := &qurlv2.Claims{
+		QurlUserPublicKeyB64: userURL,
+		ResourcePublicKeyB64: resB64,
+		Exp:                  1781910300,
+	}
+
+	var hashErrCount int
+	got := buildV2ResourceData(resp, claims, func(name string) {
+		if name == nhpserver.MetricQurlV2RevocationHashError {
+			hashErrCount++
+		}
+	})
+	if got.QurlUserPublicKeyHash == "" || got.ResourcePublicKeyHash == "" {
+		t.Fatalf("valid keys must hash non-empty; got user=%q res=%q", got.QurlUserPublicKeyHash, got.ResourcePublicKeyHash)
+	}
+	if hashErrCount != 0 {
+		t.Errorf("MetricQurlV2RevocationHashError fired %d times on valid keys, want 0", hashErrCount)
+	}
+}
+
+// TestBuildV2ResourceData_NilClaims_GuardedNotPanic pins the defensive guard at
+// this now-test-reachable seam: a nil claims (documented invariant violation)
+// must NOT panic — it builds the pinhole-only ResourceData (the AC still opens)
+// with empty revocation hashes and bumps the same counter so the anomaly is
+// observable. The AC pinhole fields (from resp, not claims) stay intact.
+func TestBuildV2ResourceData_NilClaims_GuardedNotPanic(t *testing.T) {
+	resp := &AdmissionPrepareResponse{
+		AdmissionID: "adm_nilclaims",
+		QurlID:      "q_nilclaims",
+		OpenTime:    60,
+		ACRouting:   defaultACRouting(),
+	}
+
+	var hashErrCount int
+	got := buildV2ResourceData(resp, nil, func(name string) {
+		if name == nhpserver.MetricQurlV2RevocationHashError {
+			hashErrCount++
+		}
+	})
+
+	if got == nil {
+		t.Fatal("buildV2ResourceData returned nil on nil claims; must build pinhole-only, not abort")
+	}
+	// Pinhole / AC-open fields come from resp and must be intact.
+	if got.ResourceId != "q_nilclaims" || got.AdmissionId != "adm_nilclaims" {
+		t.Errorf("pinhole/admission fields wrong: ResourceId=%q AdmissionId=%q", got.ResourceId, got.AdmissionId)
+	}
+	if _, ok := got.Resources[defaultACRouting().ACId]; !ok {
+		t.Errorf("AC routing missing from pinhole ResourceData: %#v", got.Resources)
+	}
+	// Revocation hashes + claim-derived deadline are empty/zero (no claims).
+	if got.QurlUserPublicKeyHash != "" || got.ResourcePublicKeyHash != "" || got.Deadline != 0 {
+		t.Errorf("nil claims must yield empty hashes + zero deadline; got user=%q res=%q deadline=%d",
+			got.QurlUserPublicKeyHash, got.ResourcePublicKeyHash, got.Deadline)
+	}
+	// Observable: the counter fires once for the nil-claims anomaly.
+	if hashErrCount != 1 {
+		t.Errorf("MetricQurlV2RevocationHashError fired %d times on nil claims, want 1", hashErrCount)
 	}
 }

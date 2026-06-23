@@ -288,6 +288,16 @@ type NhpServerPluginHelper struct {
 	// plumb it (hand-built test helpers); the qv2 admission path fails
 	// closed on an empty cell key.
 	ServerCellPublicKeyB64 string
+
+	// IncrCounter routes a counter increment through the host server's CloudWatch
+	// publisher (mirrors HttpServerPluginHelper, which carries the same emitter).
+	// The knock path runs qURL v2 admission (authWithNHPClaims), so admission-path
+	// counters such as MetricQurlV2RevocationHashError must be emitted through
+	// THIS helper to be live. Nil-safe: the publisher is not always plumbed
+	// (notably hand-built unit-test helpers), so callers must branch on `!= nil`
+	// rather than relying on a no-op default. (HttpServerPluginHelper also exposes
+	// RecordLatency; add it here when the knock path first records a latency.)
+	IncrCounter func(name string)
 }
 
 type HttpServerPluginHelper struct {

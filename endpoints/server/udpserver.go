@@ -338,6 +338,7 @@ type UdpServer struct {
 		srcAddr *common.NetAddress,
 		dstAddrs []*common.NetAddress,
 		openTime uint32,
+		res *common.ResourceData,
 	) (*common.ACOpsResultMsg, error)
 
 	// agentPeerLookup resolves a knock's RemotePubKey to a registered
@@ -410,6 +411,7 @@ func (s *UdpServer) resolveProcessACOperationBroadcast() func(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	if s.processACOperationBroadcastFn != nil {
 		return s.processACOperationBroadcastFn
@@ -3476,7 +3478,49 @@ func (s *UdpServer) dedupeRecvART(ppd *core.PacketParserData) error {
 	return nil
 }
 
-func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32) (artMsg *common.ACOpsResultMsg, err error) {
+// stampQurlV2RevocationMetadata copies the qURL v2 revocation metadata (P4a)
+// from res onto the AOP. Pure + nil-safe so the production stamp and the test
+// doubles share ONE mapping and cannot drift (mirrors the AC-side
+// accessEntryFromAOP extraction). res is nil on the local non-v2 path and a
+// catalog ResourceData on the forward/http paths. All four fields are omitempty,
+// so the AOP stays additive/wire-compatible (pre-v2 ACs ignore unknown keys).
+// Only the v2 admission path (authWithNHPClaims/buildV2ResourceData) sets
+// qurl_user hash / admission_id / deadline on a ResourceData;
+// resource_public_key_hash can ride a catalog ResourceData for a v2-provisioned
+// resource even on a non-v2 knock (it is the resource revocation key).
+// session_id / revocation_epoch are not carried yet (the prepare contract does
+// not return them) and have no ResourceData field; they await a later contract +
+// slice.
+//
+// INVARIANT (forward-safety): the per-admission trio (admission_id / deadline /
+// qurl_user hash) must ONLY ever originate from v2 admission, never from a
+// catalog/storage producer. Today that holds — buildV2ResourceData is the sole
+// writer of those three fields onto any ResourceData (no resource_lookup /
+// storage path sets them) — so stamping unconditionally from a non-nil res is
+// safe on the forward/http catalog paths (they leave the trio empty). If a
+// future change ever persists any of the trio onto a catalog row, a non-v2
+// forwarded knock would emit stale per-admission metadata; at that point this
+// stamp must gate the trio on v2-admission provenance. See #2774 (the forward
+// path is where a v2-fields-on-forward change would land).
+func stampQurlV2RevocationMetadata(aopMsg *common.ServerACOpsMsg, res *common.ResourceData) {
+	if aopMsg == nil || res == nil {
+		return
+	}
+	aopMsg.QurlUserPublicKeyHash = res.QurlUserPublicKeyHash
+	aopMsg.ResourcePublicKeyHash = res.ResourcePublicKeyHash
+	aopMsg.AdmissionId = res.AdmissionId
+	aopMsg.Deadline = res.Deadline
+}
+
+// res carries the qURL v2 revocation metadata (P4a) to stamp onto the AOP. It is
+// nil on the local admission path for non-qURL-v2 knocks, and a catalog
+// ResourceData on the forward/http paths. The stamped fields are all omitempty,
+// so the AOP stays additive and wire-compatible: pre-v2 ACs simply ignore keys
+// they don't know. No flag check is needed here — only the v2 admission path
+// (authWithNHPClaims, gated by v2AdmissionEnabled) sets the per-admission fields
+// (qurl_user hash, admission_id, deadline); resource_public_key_hash rides the
+// catalog ResourceData for v2-provisioned resources (see stampQurlV2RevocationMetadata).
+func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32, res *common.ResourceData) (artMsg *common.ACOpsResultMsg, err error) {
 	// should not happen
 	if knkMsg == nil || conn == nil {
 		log.Critical("processACOperation with nil input argument")
@@ -3524,6 +3568,9 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 		DestinationAddrs: dstAddrs,
 		OpenTime:         openTime + ACOpenCompensationTime, // compensate ac open time
 	}
+	// qURL v2 revocation metadata (P4a): stamp from res via the shared pure
+	// helper so prod and the test doubles can't diverge (see its godoc).
+	stampQurlV2RevocationMetadata(aopMsg, res)
 	aopBytes, marshalErr := json.Marshal(aopMsg)
 	if marshalErr != nil {
 		log.Error("server-agent(%s@%s)[processACOperation] failed to marshal AOP message: %v", knkMsg.UserId, srcAddr.String(), marshalErr)
@@ -3642,6 +3689,7 @@ func (s *UdpServer) processACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	s.metrics.IncrCounter(MetricBroadcastTotal)
 
@@ -3655,7 +3703,7 @@ func (s *UdpServer) processACOperationBroadcast(
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(baseCtx, DefaultBroadcastTimeout)
 		defer cancel()
-		artMsg, err := s.processACOperation(ctx, knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		artMsg, err := s.processACOperation(ctx, knkMsg, conns[0], srcAddr, dstAddrs, openTime, res)
 		elapsed := float64(time.Since(start).Milliseconds())
 		s.metrics.RecordLatency(MetricBroadcastDurationMs, elapsed)
 		s.metrics.RecordLatency(MetricBroadcastACLatencyMs, elapsed)
@@ -3688,7 +3736,7 @@ func (s *UdpServer) processACOperationBroadcast(
 			acStart := time.Now()
 			ctx, cancel := context.WithTimeout(baseCtx, DefaultBroadcastTimeout)
 			defer cancel()
-			artMsg, err := s.processACOperation(ctx, knkMsg, c, srcAddr, dstAddrs, openTime)
+			artMsg, err := s.processACOperation(ctx, knkMsg, c, srcAddr, dstAddrs, openTime, res)
 			s.metrics.RecordLatency(MetricBroadcastACLatencyMs, float64(time.Since(acStart).Milliseconds()))
 			results <- broadcastResult{artMsg, err, c.ACPeer.RecvAddr().String()}
 		}(conn)
@@ -3882,7 +3930,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			// resolveProcessACOperationBroadcast lets handler-site integration
 			// tests inject a fake AC response — see
 			// udpserver_publish_acktokens_test.go.
-			artMsg, err := s.resolveProcessACOperationBroadcast()(context.Background(), knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
+			artMsg, err := s.resolveProcessACOperationBroadcast()(context.Background(), knkMsg, connsCopy, srcAddr, dstAddrs, openTime, res)
 			if artMsg == nil {
 				// Keep the artMsgs map nil-free — the successCount loop and the
 				// failure-log loop below deref entries unconditionally (mirrors the
@@ -3998,6 +4046,16 @@ func (us *UdpServer) NewNhpServerHelper(ppd *core.PacketParserData, aspData *com
 	h.ResolveResourceFunc = func(aspId, resId, srcIP string) (*common.ResourceData, error) {
 		_ = srcIP // Dynamic qURL rows resolve by exact (aspId, resId).
 		return us.ResolveInternalKnockResource(us.LifecycleCtx(), aspId, resId, "HandleKnockRequest-resource")
+	}
+
+	// Bind the metric emitter for plugins (mirrors the HTTP helper in
+	// httpserver.go; gate on metrics != nil before binding). The knock path
+	// — where qURL v2 admission runs (authWithNHPClaims) — uses THIS helper, so
+	// without this binding any helper.IncrCounter from the plugin (e.g.
+	// MetricQurlV2RevocationHashError) would be a silent no-op on the real v2
+	// admission path. The bound method value is also nil-receiver-safe.
+	if us.metrics != nil {
+		h.IncrCounter = us.metrics.IncrCounter
 	}
 
 	return h
@@ -4399,18 +4457,23 @@ func (s *UdpServer) SendMessage(md *core.MsgData) error {
 	return nil
 }
 
-// ProcessACOperation wraps the internal processACOperation method.
+// ProcessACOperation wraps the internal processACOperation method. res carries
+// qURL v2 revocation metadata (P4a) to stamp onto the AOP, or nil for legacy
+// callers.
 func (s *UdpServer) ProcessACOperation(
 	knkMsg *common.AgentKnockMsg,
 	acConn *ACConn,
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
-	return s.processACOperation(context.Background(), knkMsg, acConn, srcAddr, dstAddrs, openTime)
+	return s.processACOperation(context.Background(), knkMsg, acConn, srcAddr, dstAddrs, openTime, res)
 }
 
-// ProcessACOperationBroadcast wraps the internal processACOperationBroadcast method.
+// ProcessACOperationBroadcast wraps the internal processACOperationBroadcast
+// method. res carries qURL v2 revocation metadata (P4a) to stamp onto the AOP,
+// or nil for legacy callers.
 func (s *UdpServer) ProcessACOperationBroadcast(
 	parentCtx context.Context,
 	knkMsg *common.AgentKnockMsg,
@@ -4418,6 +4481,7 @@ func (s *UdpServer) ProcessACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
-	return s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, openTime)
+	return s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, openTime, res)
 }

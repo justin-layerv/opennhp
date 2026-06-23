@@ -109,6 +109,7 @@ func newForwardE2E(t *testing.T) (sender *HttpServer, peerOpenTime *atomic.Uint3
 		_ *common.NetAddress,
 		_ []*common.NetAddress,
 		openTime uint32,
+		_ *common.ResourceData,
 	) (*common.ACOpsResultMsg, error) {
 		peerOpenTime.Store(openTime)
 		return &common.ACOpsResultMsg{

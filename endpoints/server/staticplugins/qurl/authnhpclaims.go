@@ -176,7 +176,16 @@ func authWithNHPClaims(req *common.NhpAuthRequest, helper *plugins.NhpServerPlug
 	// AllowedRedirectDomain here would reject every custom-domain qURL; that gate
 	// belongs with a custom-domain signal in the contract (tracked for the
 	// flag-flip rollout), not as a blanket reject that breaks custom domains.
-	openRes := buildV2ResourceData(prepResp)
+	// incrCounter mirrors the nil-guarded helper.IncrCounter idiom used across
+	// the qURL plugin (see main.go): a no-op when the helper did not bind a
+	// metric emitter (e.g. unit tests), live on the knock path where
+	// NewNhpServerHelper binds udpServer.metrics.IncrCounter.
+	incrCounter := func(name string) {
+		if helper.IncrCounter != nil {
+			helper.IncrCounter(name)
+		}
+	}
+	openRes := buildV2ResourceData(prepResp, claims, incrCounter)
 	ackMsg.OpenTime = openRes.OpenTime
 
 	openedAck, openErr := helper.AuthWithNhpCallbackFunc(req, openRes)
@@ -209,7 +218,65 @@ func authWithNHPClaims(req *common.NhpAuthRequest, helper *plugins.NhpServerPlug
 // opened AC matches the ac_id commit recorded into admitted_ac_ids — keeping a
 // targeted revoke's target set complete by construction. handleNhpOpenResource
 // resolves the live AC connection by ACId; dest host/port come from ac_routing.
-func buildV2ResourceData(resp *AdmissionPrepareResponse) *common.ResourceData {
+//
+// It also stamps the P4a revocation metadata onto the ResourceData so it flows
+// down to the AOP builder and on to the AC. The two key hashes are recomputed
+// here from the VERIFIED claim key bytes (not trusted from any stored value) via
+// the single canonical hasher qurlv2.PublicKeyHashFromB64, so the AC's eventual
+// P4b indexes key off exactly the same digest. claims is the verified Claims
+// returned by VerifyClaims earlier in authWithNHPClaims; the sole production
+// caller passes the post-VerifyClaims (non-nil) value. As a defensive guard at
+// this now-test-reachable seam, a nil claims is treated like a hash failure
+// (pinhole-only ResourceData with empty hashes + the same counter) rather than a
+// panic. The keys here have already passed proof-of-possession and
+// resource-binding; a hash error would
+// mean a key that decoded for the match checks no longer decodes, which should
+// not happen — we log and proceed with an empty hash rather than fail an
+// already-committed admission (the hash is revocation-index metadata, not an
+// admission gate).
+//
+// Deliberate fail-open, but observable: an empty hash means the admitted flow
+// is invisible to P4b's targeted revocation (it degrades to scheduled
+// timer-wheel expiry only), which is a security-relevant degradation. Failing
+// the admission closed here would be worse — it would tear down an
+// already-committed, one-time-use admission over revocation-INDEX metadata — so
+// we keep the flow but bump MetricQurlV2RevocationHashError so the regression is
+// alertable in aggregate rather than buried in one log line. incrCounter is the
+// plugin's nil-guarded helper.IncrCounter (no-op when unset, e.g. in unit
+// tests); the knock-path helper (NewNhpServerHelper) binds it, so this is live
+// on the real v2 admission path.
+//
+// session_id and revocation_epoch are intentionally left unset: the prepare
+// contract (AdmissionPrepareResponse) does not return them yet. They await a
+// contract field and a later slice; the AOP fields exist already and stay
+// omitted until then.
+func buildV2ResourceData(resp *AdmissionPrepareResponse, claims *qurlv2.Claims, incrCounter func(string)) *common.ResourceData {
+	var qurlUserKeyHash, resourceKeyHash string
+	var deadline int64
+	if claims == nil {
+		// Documented invariant violation (the sole production caller passes the
+		// post-VerifyClaims value). Treat it like a hash failure rather than
+		// panicking at a now-test-reachable seam: build the pinhole-only
+		// ResourceData (the AC still opens) with empty hashes, and make the
+		// anomaly observable on the same counter — an empty-hash flow is
+		// un-revocable-by-key either way.
+		log.Error("[QURL] buildV2ResourceData: nil claims (invariant violation) admission=%s; proceeding with empty revocation hashes", resp.AdmissionID)
+		incrCounter(nhpserver.MetricQurlV2RevocationHashError)
+	} else {
+		var err error
+		qurlUserKeyHash, err = qurlv2.PublicKeyHashFromB64(claims.QurlUserPublicKeyB64)
+		if err != nil {
+			log.Error("[QURL] buildV2ResourceData: hashing qurl-user public key failed admission=%s: %v", resp.AdmissionID, err)
+			incrCounter(nhpserver.MetricQurlV2RevocationHashError)
+		}
+		resourceKeyHash, err = qurlv2.PublicKeyHashFromB64(claims.ResourcePublicKeyB64)
+		if err != nil {
+			log.Error("[QURL] buildV2ResourceData: hashing resource public key failed admission=%s: %v", resp.AdmissionID, err)
+			incrCounter(nhpserver.MetricQurlV2RevocationHashError)
+		}
+		deadline = claims.Exp
+	}
+
 	return &common.ResourceData{
 		ResourceGroup: common.ResourceGroup{
 			ResourceId:    resp.QurlID,
@@ -226,6 +293,12 @@ func buildV2ResourceData(resp *AdmissionPrepareResponse) *common.ResourceData {
 			},
 		},
 		RedirectUrl: resp.QurlSiteURL,
+
+		// P4a revocation metadata (see ResourceData field docs).
+		QurlUserPublicKeyHash: qurlUserKeyHash,
+		ResourcePublicKeyHash: resourceKeyHash,
+		AdmissionId:           resp.AdmissionID,
+		Deadline:              deadline,
 	}
 }
 

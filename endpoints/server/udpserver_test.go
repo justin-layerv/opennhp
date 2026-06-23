@@ -1765,7 +1765,7 @@ func TestBroadcast_ReturnsOnFirstSuccess(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err != nil {
 		t.Fatalf("Expected success, got error: %v", err)
@@ -1828,7 +1828,7 @@ func TestBroadcast_PartialFailureStillSucceeds(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err != nil {
 		t.Fatalf("Expected success (partial), got error: %v", err)
@@ -1870,7 +1870,7 @@ func TestBroadcastCancellation_AllFail(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	_, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	_, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err == nil {
 		t.Fatal("Expected error when all ACs fail")
@@ -1891,7 +1891,7 @@ func TestBroadcastCancellation_SingleConn(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err != nil {
 		t.Fatalf("Expected success for single conn, got: %v", err)
@@ -1953,7 +1953,7 @@ func TestBroadcast_TimeoutReturnsFirstSuccess(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err != nil {
 		t.Fatalf("Expected success (first AC responded), got error: %v", err)
@@ -2014,7 +2014,7 @@ func TestBroadcast_ParentContextCancellationDoesNotAbort(t *testing.T) {
 	parentCtx, cancel := context.WithCancel(ContextWithRequestID(context.Background(), "req-broadcast-777"))
 	cancel()
 
-	artMsg, err := s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 	if err != nil {
 		t.Fatalf("broadcast must succeed even with canceled parent ctx, got err=%v", err)
 	}
@@ -2054,7 +2054,7 @@ func TestProcessACOperation_ContextAlreadyCanceled(t *testing.T) {
 	cancel() // cancel immediately
 
 	start := time.Now()
-	_, err := s.processACOperation(ctx, knkMsg, conn, srcAddr, dstAddrs, 60)
+	_, err := s.processACOperation(ctx, knkMsg, conn, srcAddr, dstAddrs, 60, nil)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.Canceled) {

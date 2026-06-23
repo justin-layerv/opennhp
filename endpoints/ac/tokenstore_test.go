@@ -834,6 +834,50 @@ func TestAccessEntry_JSONOmitsEmptyOwnerId(t *testing.T) {
 	}
 }
 
+// TestAccessEntry_JSONOmitsQurlV2Metadata pins the json:"-" tag on all six
+// P4a qURL v2 revocation-metadata fields. httpac.go's /refresh handler returns
+// the whole AccessEntry via c.JSON; these are internal revocation-index fields
+// with no client consumer, so they must never ride out on the /refresh wire —
+// not even as present-but-zero PascalCase keys on legacy entries. This mirrors
+// the FirstKnockTime json:"-" and OwnerId omitempty fences. The test sets every
+// field to a non-zero value so a dropped tag is caught (a zero value would be
+// absent under ,omitempty but PascalCase-present under no tag; json:"-" keeps it
+// absent either way).
+func TestAccessEntry_JSONOmitsQurlV2Metadata(t *testing.T) {
+	entry := &AccessEntry{
+		User:                  &common.AgentUser{UserId: "u"},
+		OpenTime:              60,
+		QurlUserPublicKeyHash: "a1b2c3",
+		ResourcePublicKeyHash: "d4e5f6",
+		SessionId:             "sess_123",
+		AdmissionId:           "adm_test123",
+		RevocationEpoch:       42,
+		Deadline:              1781910300,
+	}
+	buf, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(buf, &m); err != nil {
+		t.Fatalf("Unmarshal back: %v (body=%s)", err, buf)
+	}
+	for _, field := range []string{
+		"QurlUserPublicKeyHash",
+		"ResourcePublicKeyHash",
+		"SessionId",
+		"AdmissionId",
+		"RevocationEpoch",
+		"Deadline",
+	} {
+		for k := range m {
+			if strings.EqualFold(k, field) {
+				t.Fatalf("AccessEntry /refresh JSON leaks %q as key %q — json:\"-\" tag removed? body=%s", field, k, buf)
+			}
+		}
+	}
+}
+
 // TestBufferAsymmetry_TokenStillValidButFirewallClosed pins the
 // asymmetry between the two #1942 deadlines: there is a window after
 // FirstKnockTime + OpenTime but before FirstKnockTime + OpenTime + buffer
