@@ -78,6 +78,16 @@ type BpfFlusher struct {
 	// SkippedCount for observability — see the Flush godoc; this
 	// branch should be unreachable in production, so any non-zero
 	// reading indicates an upstream regression.
+	//
+	// CONFLATION NOTE: this single counter is incremented by BOTH
+	// Flush (scheduled-expiry path — a v6 skip is a benign leak the
+	// kernel TTL closes) AND FlushConn (revocation path — a v6 skip is
+	// a FAILED REVOKE, the worse signal). An operator can't tell which
+	// fired from this counter alone. Splitting it into expiry-skip vs
+	// revoke-skip is folded into the P4e follow-up issue (#2778; P4e owns the
+	// revoke breaker/accounting that needs the distinct signal, and the
+	// metrics publisher that consumes this lives in registration.go,
+	// outside this slice's scope).
 	metricSkipped atomic.Uint64
 }
 
@@ -144,10 +154,7 @@ func (f *BpfFlusher) Flush(ctx context.Context, key FlowKey) error {
 
 	switch key.Protocol {
 	case FlowProtoTCP, FlowProtoUDP:
-		proto := uint8(6) // TCP
-		if key.Protocol == FlowProtoUDP {
-			proto = 17
-		}
+		proto, _ := key.Protocol.ianaL4Proto() // ok by case guard
 		return utilebpf.DelEbpfRuleForSrcDstPortProto(srcIP, dstIP, proto, key.DstPort)
 
 	case FlowProtoICMP:
@@ -160,6 +167,75 @@ func (f *BpfFlusher) Flush(ctx context.Context, key FlowKey) error {
 	default:
 		return fmt.Errorf("BpfFlusher: unsupported protocol %s for %s", key.Protocol, key)
 	}
+}
+
+// FlushConn surgically tears down a SINGLE established flow by its full
+// conntrack 5-tuple (the allow-rule FlowKey plus the per-flow source
+// port). This is the P4c immediate-revocation primitive: unlike Flush
+// above (which deletes the coarse allow-rule entry shared by every
+// admission on the same {src,dst,dport,proto} tuple), FlushConn deletes
+// exactly the target admission's conntrack entry and leaves a sibling
+// flow on the same tuple — but with a different source port — passing.
+//
+// It is ALSO what makes revocation immediate for an established flow.
+// Flush (allow-rule delete) blocks only NEW flows; an already-established
+// flow keeps passing the XDP conntrack short-circuit until the conntrack
+// entry's ttl_ns — anchored to the allow-rule's ORIGINAL remaining
+// lifetime at flow creation — elapses, i.e. up to the full session
+// duration after a revoke. Deleting the conntrack entry here forces the
+// next packet back through the allow-rule path; a revoke removes that too,
+// so the flow drops immediately. P4e calls both (allow-rule Flush to bar
+// re-open + FlushConn per live 5-tuple to kill established flows).
+//
+// CONTRACT (mirrors Flush): returns nil on success OR on missing-entry
+// (idempotent ENOENT no-op). The kernel's own check_conn_expiry GC or a
+// concurrent flush may have already removed the entry — that MUST NOT be
+// treated as an error by a future revocation breaker.
+//
+// Only TCP and UDP create conntrack entries in the XDP program (the
+// established-flow short-circuit is port-keyed); ICMP and "any" allow
+// rules have no conntrack entry, so a non-TCP/UDP protocol here is a
+// caller bug, surfaced as an error rather than a silent no-op.
+//
+// REVOCATION-SEMANTICS CAVEAT — a nil return does NOT prove the flow was
+// torn down on the IPv6 branch. The conntrack map is IPv4-only (struct
+// ipv4_ct_tuple uses __be32), so a v6 ConnFlowKey has no entry to delete:
+// the no-op is the CORRECT outcome, but the nil return is indistinguishable
+// from a real delete. For scheduled expiry a missed flush is a leak the
+// kernel TTL eventually closes; for a REVOCATION primitive, a v6 qURL
+// admission therefore has no immediate-teardown path here at all. The v6
+// case is counted on metricSkipped (see SkippedCount), but the caller
+// (P4e's revoke wiring) MUST NOT read this nil as "flow killed" — it must
+// treat a v6 flow as an explicit hard-fail or coarse allow-rule fallback.
+// Tracked for the revoke path in the P4e follow-up issue (#2778); until then this
+// is a documented IPv6 immediate-revocation gap (see the gospel's
+// "Filter-mode/IPv6 caveat" + DE Risk #6).
+//
+// ctx-honoring: symmetric to Flush — honored at entry only, since the
+// cilium/ebpf LoadPinnedMap/Delete path takes no context. Per-call
+// latency is sub-ms (single pinned-map open + Delete).
+func (f *BpfFlusher) FlushConn(ctx context.Context, conn ConnFlowKey) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key := conn.Flow
+
+	// conntrack keys are IPv4-only (struct ipv4_ct_tuple uses __be32),
+	// matching the allow-rule maps. FlowKey carries v4 and v6 in
+	// [16]byte form; surface the constraint the same way Flush does so a
+	// leaked v6 key is observable rather than a silent map-load failure.
+	if !isIPv4Mapped(key.SrcIP) || !isIPv4Mapped(key.DstIP) {
+		f.metricSkipped.Add(1)
+		log.Warning("[BpfFlusher] non-IPv4 conn key %s reached IPv4-only eBPF conntrack flusher — upstream regression? (silently no-op'd; tracked in metricSkipped)", conn)
+		return nil
+	}
+
+	proto, ok := key.Protocol.ianaL4Proto()
+	if !ok {
+		return fmt.Errorf("BpfFlusher.FlushConn: protocol %s for %s has no conntrack entry (only TCP/UDP do)", key.Protocol, conn)
+	}
+
+	return utilebpf.DelEbpfConnTrackEntry(key.SrcIPString(), key.DstIPString(), proto, conn.SrcPort, key.DstPort)
 }
 
 // isIPv4Mapped returns true if the [16]byte holds an IPv4-mapped

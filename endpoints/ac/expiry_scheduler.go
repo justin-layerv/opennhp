@@ -147,6 +147,23 @@ func (p FlowProto) String() string {
 	}
 }
 
+// ianaL4Proto maps the AC's FlowProto enum to the IANA L4 protocol number
+// the eBPF map keys use (TCP=6, UDP=17), returning ok=false for protocols
+// that have no L4 number in that sense (ICMP, "any"). Single source of the
+// TCP/UDP→IANA mapping: both the allow-rule flusher (BpfFlusher.Flush) and
+// the surgical conntrack flusher (BpfFlusher.FlushConn) need it, and a
+// divergent second copy could silently encode the wrong protocol byte.
+func (p FlowProto) ianaL4Proto() (uint8, bool) {
+	switch p {
+	case FlowProtoTCP:
+		return 6, true
+	case FlowProtoUDP:
+		return 17, true
+	default:
+		return 0, false
+	}
+}
+
 // FlowKey identifies a single allow-rule flow at the AC. Both IPv4
 // and IPv6 are stored in 16-byte form: IPv4 addresses are stored in
 // IPv4-mapped IPv6 form (::ffff:a.b.c.d), matching the kernel
@@ -228,6 +245,40 @@ func netIPFrom16(b [16]byte) net.IP {
 // String renders a FlowKey in `src→dst:port/proto` form for logging.
 func (k FlowKey) String() string {
 	return fmt.Sprintf("%s→%s:%d/%s", k.SrcIPString(), k.DstIPString(), k.DstPort, k.Protocol)
+}
+
+// ConnFlowKey identifies a single ESTABLISHED flow — the allow-rule
+// FlowKey plus the per-flow source port. The source port is the
+// kernel-visible "per-admission discriminator" (P4c): the allow-rule
+// FlowKey alone cannot distinguish two admissions that share one
+// {src,dst,dport,proto} network tuple (NAT'd clients behind one IP),
+// because they collapse to a single allow-rule map entry — but the
+// kernel's conntrack map keys on the full 5-tuple incl. source port, and
+// two concurrent flows behind one NAT to the same destination always have
+// distinct source ports. So this is the granularity at which a revoke can
+// surgically kill EXACTLY one admission's established flow while leaving a
+// same-tuple sibling (different source port) alive.
+//
+// SrcPort is host byte order (0..65535); the eBPF helper converts it to
+// the on-wire network order the kernel conntrack key uses.
+//
+// Why this is a parallel key and NOT a widening of FlowKey: FlowKey has a
+// documented per-entry memory budget (SCHEDULER_SCALING.md) and is used as
+// the timer-wheel map key across the whole scheduler; adding a source-port
+// dimension there would inflate every scheduled allow-rule entry and is
+// pointless for scheduled expiry (the allow-rule maps have no source-port
+// slot). ConnFlowKey is confined to the surgical-teardown path, which P4e
+// wires to the revocation index. The normal scheduled-expiry FlowFlusher
+// contract (Flush(ctx, FlowKey)) is untouched.
+type ConnFlowKey struct {
+	Flow    FlowKey
+	SrcPort uint16
+}
+
+// String renders a ConnFlowKey in `src:sport→dst:dport/proto` form.
+func (c ConnFlowKey) String() string {
+	return fmt.Sprintf("%s:%d→%s:%d/%s",
+		c.Flow.SrcIPString(), c.SrcPort, c.Flow.DstIPString(), c.Flow.DstPort, c.Flow.Protocol)
 }
 
 // shard returns the shard index for this key. Inlines FNV-1a over

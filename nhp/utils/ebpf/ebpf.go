@@ -42,6 +42,82 @@ type procoPortKey struct {
 	Protocol uint8  `ebpf:"protocol"`
 }
 
+// connTrackKey mirrors `struct ipv4_ct_tuple` in
+// nhp/ebpf/xdp/nhp_ebpf_xdp.c byte-for-byte. It is the key of the
+// established-flow conntrack map (PinPathConnTrack) and is the ONLY
+// kernel-visible structure that distinguishes two sessions sharing the
+// same {src_ip, dst_ip, dst_port, protocol} allow-rule tuple: it carries
+// the per-flow source port, which two concurrent flows behind one NAT to
+// the same destination necessarily have distinct values of (the NAT/stack
+// demuxes replies by it). That source-port dimension is the P4c surgical
+// discriminator — see DelEbpfConnTrackEntry.
+//
+// Layout discipline (a mismatch silently makes Delete a no-op — wrong key
+// bytes hash to a different bucket, the kernel returns ENOENT, and the
+// targeted flow is never torn down):
+//
+//   - Field ORDER is daddr, saddr, dport, sport, nexthdr, flags — note
+//     destination-before-source, the opposite of the allow-rule keys. This
+//     matches the C struct exactly; the kernel builds its lookup key in
+//     this order on every packet.
+//   - All multi-byte fields are NETWORK byte order (__be32 / __be16 in C).
+//     The IP fields are stored exactly as parseIP returns them (the same
+//     network-order-preserving uint32 the allow-rule keys use); the ports
+//     are written big-endian to reproduce the on-wire __be16 the XDP
+//     program copies straight from the TCP/UDP header.
+//   - The struct is __packed in C (no trailing/interior padding): 4+4+2+2+
+//     1+1 = 14 bytes. ToCtKey emits exactly those 14 bytes.
+//   - flags selects the conntrack DIRECTION. The XDP program inserts the
+//     ESTABLISHED entry with flags = CT_DIR_INGRESS (0) keyed on the
+//     ingress orientation (saddr=client, daddr=resource). P4c deletes that
+//     ingress entry; CT_DIR_INGRESS is the correct and only orientation to
+//     delete for an inbound-admitted flow.
+//
+// Field tags mirror the kernel struct member names for consistency with
+// the sibling key structs (whitelistKey/srcDestKey/etc.). They are
+// decorative here — all serialization is hand-packed by ToCtKey, not
+// reflection-driven — but keep the family uniform.
+type connTrackKey struct {
+	DstIP   uint32 `ebpf:"daddr"`   // __be32 daddr (network order, as parseIP returns)
+	SrcIP   uint32 `ebpf:"saddr"`   // __be32 saddr (network order, as parseIP returns)
+	DstPort uint16 `ebpf:"dport"`   // __be16 dport (network order)
+	SrcPort uint16 `ebpf:"sport"`   // __be16 sport (network order)
+	NextHdr uint8  `ebpf:"nexthdr"` // __u8 nexthdr (IPPROTO_TCP=6 / IPPROTO_UDP=17)
+	Flags   uint8  `ebpf:"flags"`   // __u8 flags (CT_DIR_INGRESS=0)
+}
+
+// ctDirIngress mirrors CT_DIR_INGRESS in the XDP program. The conntrack
+// entry for an inbound-admitted flow is inserted with this direction
+// (saddr=client, daddr=protected resource); it is the orientation P4c
+// deletes.
+const ctDirIngress uint8 = 0
+
+// connTrackKeySize is the on-wire size of the packed ipv4_ct_tuple
+// (14 bytes). Derived so ToCtKey's hand-packed buffer length and the
+// kernel key size cannot silently diverge. NOTE: this is the SUM of field
+// sizes, not unsafe.Sizeof(connTrackKey{}) — the Go struct is NOT packed
+// (it carries Go alignment padding), whereas the kernel struct is
+// __packed. ToCtKey emits the packed form; this const fences that form.
+const connTrackKeySize = 4 + 4 + 2 + 2 + 1 + 1
+
+// ToCtKey serializes the conntrack tuple into the exact 14 packed bytes
+// the kernel `ipv4_ct_tuple` map key expects. IP fields are written
+// little-endian because parseIP already returns the network-order bytes
+// packed into a uint32 via LittleEndian (matching ToWlKey's __be32
+// handling); ports are written big-endian to reproduce the on-wire
+// __be16. See connTrackKey's godoc for why every byte here is
+// load-bearing.
+func (r *connTrackKey) ToCtKey() []byte {
+	keyBytes := make([]byte, connTrackKeySize)
+	binary.LittleEndian.PutUint32(keyBytes[0:4], r.DstIP)
+	binary.LittleEndian.PutUint32(keyBytes[4:8], r.SrcIP)
+	binary.BigEndian.PutUint16(keyBytes[8:10], r.DstPort)
+	binary.BigEndian.PutUint16(keyBytes[10:12], r.SrcPort)
+	keyBytes[12] = r.NextHdr
+	keyBytes[13] = r.Flags
+	return keyBytes
+}
+
 type whitelistValue struct {
 	Allowed    uint8
 	_          [7]byte
@@ -71,6 +147,18 @@ const (
 	PinPathWhitelist     = "/sys/fs/bpf/spp"           // TCP/UDP per-port allow-rules (whitelistKey)
 	PinPathSdWhitelist   = "/sys/fs/bpf/sdwhitelist"   // any-proto src+dst allow-rules (srcDestKey)
 	PinPathIcmpWhitelist = "/sys/fs/bpf/icmpwhitelist" // ICMP allow-rules (srcDestKey)
+	// PinPathConnTrack is the established-flow conntrack map. The XDP
+	// program (nhp/ebpf/xdp/nhp_ebpf_xdp.c) pins it BY_NAME under its
+	// map variable name `conn_track`, and short-circuits established
+	// flows on it BEFORE consulting any allow-rule map. Deleting the
+	// allow-rule alone therefore does NOT tear an established flow down
+	// immediately: the conn_track entry's ttl_ns was anchored to the
+	// allow-rule's remaining lifetime at flow creation, so the flow keeps
+	// passing the conn_track short-circuit until that original deadline.
+	// Surgical, immediate revocation (P4c) requires deleting the
+	// conn_track 5-tuple entry directly — see DelEbpfConnTrackEntry and
+	// docs/design/QURL_V2_KEYED_IDENTITY.md -> "Flow granularity caveat".
+	PinPathConnTrack = "/sys/fs/bpf/conn_track"
 )
 
 // WhitelistValueSize is the on-wire size of whitelistValue
@@ -489,6 +577,93 @@ func DelEbpfIcmpRuleForSrcDst(srcIPStr, dstIPStr string) error {
 	rule := &srcDestKey{SrcIP: srcIP, DstIP: dstIP}
 	if err := m.Delete(rule.ToSdKey()); err != nil && !isEbpfNoEntry(err) {
 		return fmt.Errorf("delete from icmpwhitelist: %w", err)
+	}
+	return nil
+}
+
+// DelEbpfConnTrackEntry removes a single established-flow entry from the
+// conntrack map (PinPathConnTrack) by its full 5-tuple, including the
+// per-flow source port. This is the P4c surgical-revocation primitive:
+// unlike the allow-rule Del* helpers above (which key only on
+// {src_ip,dst_ip,dst_port,proto} and so cannot distinguish two sessions
+// behind one NAT), deleting the conntrack entry by 5-tuple tears down
+// EXACTLY the target flow and leaves a sibling flow on the same
+// allow-rule tuple — but with a different source port — untouched.
+//
+// It is also what makes revocation IMMEDIATE for an established flow:
+// the XDP program short-circuits established flows on this map before any
+// allow-rule lookup, and the entry's ttl_ns was anchored to the
+// allow-rule's ORIGINAL remaining lifetime at flow creation. So deleting
+// the allow-rule alone leaves the flow passing until that original
+// deadline; deleting the conntrack entry forces the very next packet back
+// through the allow-rule path (which a revoke also removes) → XDP_DROP.
+//
+// srcPort/dstPort are host-order (0..65535); they are written network
+// order into the key to match the on-wire __be16 the XDP program copies
+// from the packet. protocol is the IANA number (6=TCP, 17=UDP). Only
+// connection-oriented / port-bearing protocols have conntrack entries;
+// ICMP and "any" allow-rules create no conntrack short-circuit, so this
+// helper is not called for them.
+//
+// Idempotent on no-match (ENOENT → nil): the kernel's own
+// check_conn_expiry may have GC'd the entry, or a concurrent flush may
+// have removed it. Mirrors the allow-rule Del* contract the L3 flush
+// scheduler depends on (a flush against already-gone state must NOT trip
+// the breaker).
+//
+// TEARDOWN-COMPLETENESS ASSUMPTION (code-verified, must be re-checked if
+// the datapath changes): there is exactly ONE conntrack entry per flow,
+// inserted by the XDP ingress program in the CT_DIR_INGRESS orientation
+// (it reverses its working tuple back to ingress before the allow-rule
+// checks — nhp_ebpf_xdp.c, and all five conn_track inserts use that one
+// ingress-oriented key). The TC egress program (tc_egress.c) does NOT
+// touch conn_track at all — it only writes a reverse-direction ALLOW-RULE
+// to spp so reply traffic is permitted. Therefore deleting the single
+// ingress-oriented conntrack entry is sufficient to drop the flow; there
+// is no reversed/egress conntrack entry left behind. NOTE for P4e: the
+// reverse allow-rule that tc_egress writes to spp is a separate object
+// from this conntrack entry — barring re-open after a revoke requires
+// removing that reverse allow-rule too (an allow-rule concern, out of
+// scope for this conntrack-teardown primitive). If a future change makes
+// tc_egress (or any program) insert a conntrack entry in the egress
+// orientation, this helper must also delete the reversed tuple
+// (daddr/saddr + dport/sport swapped, flags = egress).
+func DelEbpfConnTrackEntry(srcIPStr, dstIPStr string, protocol uint8, srcPort, dstPort uint16) error {
+	m, err := ebpf.LoadPinnedMap(PinPathConnTrack, nil)
+	if err != nil {
+		return fmt.Errorf("load pinned conn_track: %w", err)
+	}
+	defer func() { _ = m.Close() }()
+	return delEbpfConnTrackOnMap(m, srcIPStr, dstIPStr, protocol, srcPort, dstPort)
+}
+
+// delEbpfConnTrackOnMap is the map-handle-injectable core of
+// DelEbpfConnTrackEntry: it builds the conntrack 5-tuple key and issues
+// the idempotent Delete against the supplied map. Splitting the pinned-map
+// open out of the delete lets the surgical-revocation behavior be tested
+// against a real in-test ebpf.Map of the conntrack shape (no /sys/fs/bpf
+// pin required), proving that a 5-tuple delete removes EXACTLY the target
+// flow and leaves a same-allow-rule-tuple sibling (different source port)
+// intact. The public wrapper above keeps the production pin-path contract.
+func delEbpfConnTrackOnMap(m *ebpf.Map, srcIPStr, dstIPStr string, protocol uint8, srcPort, dstPort uint16) error {
+	srcIP, err := parseIP(srcIPStr)
+	if err != nil {
+		return err
+	}
+	dstIP, err := parseIP(dstIPStr)
+	if err != nil {
+		return err
+	}
+	key := &connTrackKey{
+		DstIP:   dstIP,
+		SrcIP:   srcIP,
+		DstPort: dstPort,
+		SrcPort: srcPort,
+		NextHdr: protocol,
+		Flags:   ctDirIngress,
+	}
+	if err := m.Delete(key.ToCtKey()); err != nil && !isEbpfNoEntry(err) {
+		return fmt.Errorf("delete from conn_track: %w", err)
 	}
 	return nil
 }
