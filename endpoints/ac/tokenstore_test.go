@@ -1743,61 +1743,314 @@ func TestUdpAC_CancelAllScheduledFlows_OtherEntryPastFirewall(t *testing.T) {
 	}
 }
 
-// TestUdpAC_ScheduleFlushOrphan_SurvivesTempEntryExpiry fences the
-// temp-handler lifetime-mismatch fix: temp-handler-written kernel
-// rules are scheduled via scheduleFlushOrphan (no per-entry
-// tracking), so a subsequent cancelAllScheduledFlows(tempEntry) at
-// tempEntry's ~35s tokenStore expiry MUST NOT cancel the scheduled
-// flush. The scheduler entry has to survive past tempEntry's
-// expiry and fire Flush at the kernel rule's actual deadline
-// (often hours later, anchored on the long outer openTimeSec).
-//
-// Recording on tempEntry (the abandoned #2205 design) would Cancel
-// the scheduled flush at tempEntry expiry — kernel rule live, no
-// queued flush, ESTABLISHED-bypass under L3-only enforcement. Fixed
-// by routing temp handlers through scheduleFlushOrphan instead;
-// proper revocation-aware fix tracked in #2213.
-func TestUdpAC_ScheduleFlushOrphan_SurvivesTempEntryExpiry(t *testing.T) {
+// Shared temp-access fixture coordinates. natIP is the kernel-observed
+// (NAT'd) source the temp handler Schedules with; aolIP is the
+// AOL-declared agent address carried on the entry's SrcAddrs.
+const (
+	tempAccessAolIP   = "10.99.0.5"
+	tempAccessNatIP   = "203.0.113.42"
+	tempAccessDstIP   = "10.0.0.1"
+	tempAccessDstPort = 443
+	// Long outer openTimeSec written to the kernel. Large so its
+	// firewallDeadline/OnExpire sit far past the test's wall clock.
+	tempAccessOpenTimeSec = 3600
+)
+
+// newTempAccessTestAC builds a UdpAC with a live scheduler + tokenStore
+// for the temp-access ownership tests, registering the scheduler
+// shutdown on cleanup.
+func newTempAccessTestAC(t *testing.T) (*UdpAC, *Scheduler) {
+	t.Helper()
 	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
 	sched.Start()
-	defer func() {
+	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		if err := sched.Shutdown(ctx); err != nil {
 			t.Errorf("scheduler shutdown: %v", err)
 		}
-	}()
-
-	a := &UdpAC{
+	})
+	return &UdpAC{
 		tokenStore:  common.NewTokenStore[*AccessEntry](),
 		expirySched: sched,
+	}, sched
+}
+
+// TestUdpAC_RegisterTempAccessFlushEntry_OwnsAndIsCancelable fences the
+// #2213 fix that retires the orphan flush path: temp-handler-written
+// kernel rules are scheduled against a long-lived AccessEntry minted by
+// registerTempAccessFlushEntry, so the scheduled flush is OWNED and an
+// explicit admin Cancel (#2172) — modeled here by cancelAllScheduledFlows
+// on that same entry — terminates it early. The pre-#2213 orphan path had
+// no owner to walk to, so its scheduler entry could never be canceled
+// before its deadline.
+func TestUdpAC_RegisterTempAccessFlushEntry_OwnsAndIsCancelable(t *testing.T) {
+	a, sched := newTempAccessTestAC(t)
+
+	dstAddrs := []*common.NetAddress{{Ip: tempAccessDstIP, Port: tempAccessDstPort}}
+	flushEntry := a.registerTempAccessFlushEntry(
+		&common.AgentUser{UserId: "u-temp-nat"},
+		[]*common.NetAddress{{Ip: tempAccessAolIP}},
+		dstAddrs,
+		tempAccessOpenTimeSec,
+	)
+
+	// The entry must carry the kernel rule's actual lifetime so its
+	// expiry (and thus OnExpire's cancel) lands after the flush deadline
+	// — see the timing-preservation test below.
+	if flushEntry.OpenTime != tempAccessOpenTimeSec {
+		t.Fatalf("flushEntry.OpenTime = %d, want %d", flushEntry.OpenTime, tempAccessOpenTimeSec)
+	}
+	// Registered in tokenStore so OnExpire self-cleans it AND an admin
+	// Cancel walking tokenStore.Snapshot() can reach it.
+	if got := a.tokenStore.Size(); got != 1 {
+		t.Fatalf("tokenStore.Size after register = %d, want 1 (entry must be stored for OnExpire/admin-Cancel reachability)", got)
 	}
 
-	// tempEntry as constructed at msghandler.go's HandleAccessControl
-	// PASS_PRE_ACCESS_IP branch — SrcAddrs holds the AOL-declared
-	// agent IP; OpenTime is the short TempPortOpenTime (~30s) for the
-	// auth-gate token, NOT the long openTimeSec written to the kernel.
-	const aolIP, natIP, dstIP, dstPort = "10.99.0.5", "203.0.113.42", "10.0.0.1", 443
+	// Temp handler Schedules using the kernel-observed natIP and the
+	// LONG openTimeSec deadline — exactly the path the rewired
+	// tcp/udpTempAccessHandler take.
+	a.scheduleFlushIfEnabled(flushEntry, tempAccessNatIP, tempAccessDstIP, tempAccessDstPort, FlowProtoTCP, time.Now().Add(time.Hour))
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1", got)
+	}
+
+	// Explicit admin Cancel: cancelAllScheduledFlows on the OWNING entry
+	// drains its tracked key and cancels the scheduler entry. This is the
+	// capability the orphan path lacked.
+	a.cancelAllScheduledFlows(flushEntry)
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after cancelAllScheduledFlows(flushEntry) = %d, want 0 — owned temp-access flush must be cancelable (#2172/#2213)", got)
+	}
+}
+
+// TestUdpAC_RegisterTempAccessFlushEntry_TempEntryExpiryDoesNotCancel
+// fences the ESTABLISHED-bypass protection the orphan path provided and
+// the #2213 fix preserves: the flush is owned by the LONG-lived entry,
+// NOT by the short auth-gate tempEntry (OpenTime ~30s). When tempEntry's
+// ~35s tokenStore expiry fires OnExpire, cancelAllScheduledFlows(tempEntry)
+// must NOT cancel the temp-access flush — tempEntry holds no scheduled
+// keys, so the long entry's scheduler entry survives until its own
+// deadline. Recording the key on tempEntry instead (the abandoned #2205
+// design) would Cancel here, leaving the kernel rule live with no queued
+// flush.
+func TestUdpAC_RegisterTempAccessFlushEntry_TempEntryExpiryDoesNotCancel(t *testing.T) {
+	a, sched := newTempAccessTestAC(t)
+
+	dstAddrs := []*common.NetAddress{{Ip: tempAccessDstIP, Port: tempAccessDstPort}}
+
+	// tempEntry as constructed at msghandler.go's PASS_PRE_ACCESS_IP
+	// branch: short TempPortOpenTime, AOL-declared SrcAddrs, no scheduled
+	// keys of its own.
 	tempEntry := &AccessEntry{
 		User:     &common.AgentUser{UserId: "u-temp-nat"},
-		SrcAddrs: []*common.NetAddress{{Ip: aolIP}},
-		DstAddrs: []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
-		OpenTime: 30,
+		SrcAddrs: []*common.NetAddress{{Ip: tempAccessAolIP}},
+		DstAddrs: dstAddrs,
+		OpenTime: TempPortOpenTime,
 	}
-	// Temp handler Schedules using the kernel-observed remoteAddr.IP
-	// (= natIP under NAT) and the LONG openTimeSec deadline — exactly
-	// the path tcpTempAccessHandler / udpTempAccessHandler take.
-	a.scheduleFlushOrphan(natIP, dstIP, dstPort, FlowProtoTCP, time.Now().Add(1*time.Hour))
+
+	// Long-lived owner mints + Schedules the flush, exactly as the
+	// rewired temp handler does.
+	flushEntry := a.registerTempAccessFlushEntry(
+		tempEntry.User,
+		tempEntry.SrcAddrs,
+		dstAddrs,
+		tempAccessOpenTimeSec,
+	)
+	a.scheduleFlushIfEnabled(flushEntry, tempAccessNatIP, tempAccessDstIP, tempAccessDstPort, FlowProtoTCP, time.Now().Add(time.Hour))
 	if got := sched.EntryCount(); got != 1 {
 		t.Fatalf("precondition: EntryCount = %d, want 1", got)
 	}
 
 	// Simulate OnExpire(tempEntry) firing at tempEntry's tokenStore
-	// expiry. Scheduler entry MUST survive — no per-entry tracking
-	// means no FlowKey for Cancel to walk to.
+	// expiry. The flush is owned by flushEntry, so this must be a no-op
+	// for the scheduler entry.
 	a.cancelAllScheduledFlows(tempEntry)
 	if got := sched.EntryCount(); got != 1 {
-		t.Errorf("EntryCount after cancelAllScheduledFlows(tempEntry) = %d, want 1 — orphan scheduler entry must survive tempEntry expiry (#2213 ESTABLISHED-bypass regression if canceled)", got)
+		t.Errorf("EntryCount after cancelAllScheduledFlows(tempEntry) = %d, want 1 — temp flush is owned by the long entry; tempEntry expiry must not cancel it (ESTABLISHED-bypass regression)", got)
+	}
+}
+
+// TestUdpAC_RegisterTempAccessFlushEntry_NaturalExpiryAfterFlushDeadline
+// fences the timing-preservation guarantee of #2213: the change is
+// OWNERSHIP, not timing. The OnExpire hook that drives
+// cancelAllScheduledFlows fires from TokenStore.CleanExpired when
+// now.After(entry.GetExpireTime()) — i.e. at ExpireTime ==
+// absoluteTokenDeadline (FirstKnockTime + openTimeSec + late-packet
+// buffer), NOT at firewallDeadline. That OnExpire moment must land
+// AFTER the flush deadline computeFlushDeadline(openTimeSec) the handler
+// schedules, so OnExpire only ever drains an already-fired scheduler
+// entry (idempotent no-op Cancel). The buffer (5s) dominates the flush
+// safety margin (50ms) and the sub-ms ε between GenerateAccessToken
+// stamping FirstKnockTime and computeFlushDeadline running, so the
+// ordering holds with comfortable slack. A regression that shortened the
+// owning entry's OpenTime would pull ExpireTime before the flush and
+// re-open the ESTABLISHED-bypass.
+func TestUdpAC_RegisterTempAccessFlushEntry_NaturalExpiryAfterFlushDeadline(t *testing.T) {
+	a, _ := newTempAccessTestAC(t)
+
+	dstAddrs := []*common.NetAddress{{Ip: tempAccessDstIP, Port: tempAccessDstPort}}
+	flushEntry := a.registerTempAccessFlushEntry(
+		&common.AgentUser{UserId: "u-temp-nat"},
+		[]*common.NetAddress{{Ip: tempAccessAolIP}},
+		dstAddrs,
+		tempAccessOpenTimeSec,
+	)
+
+	// The handler anchors the flush at computeFlushDeadline(openTimeSec)
+	// immediately after registering the entry; reproduce that ordering.
+	flushDeadline := computeFlushDeadline(tempAccessOpenTimeSec)
+
+	// ExpireTime (what CleanExpired/OnExpire fire on) must be at/after the
+	// flush deadline so the flush always fires first. absoluteTokenDeadline
+	// is the immutable formula behind ExpireTime; assert on it directly.
+	onExpireMoment := flushEntry.absoluteTokenDeadline()
+	if onExpireMoment.Before(flushDeadline) {
+		t.Errorf("OnExpire moment (absoluteTokenDeadline) %v is before flushDeadline %v — tokenStore expiry could cancel the temp flush before it fires (timing regression)",
+			onExpireMoment, flushDeadline)
+	}
+	// Slack must be ~the late-packet buffer minus the safety margin (5s -
+	// 50ms), give or take the sub-ms stamp ε. Assert a healthy lower bound
+	// so a future buffer/margin retune that erases the slack is caught.
+	if slack := onExpireMoment.Sub(flushDeadline); slack < 4*time.Second {
+		t.Errorf("OnExpire-vs-flush slack = %v, want ≥ 4s (buffer %ds dominates margin %v) — slack erosion risks an early cancel",
+			slack, accessTokenLatePacketBufferSeconds, flushSafetyMargin)
+	}
+}
+
+// TestUdpAC_RegisterTempAccessFlushEntry_OneEntryOwnsAllTuples fences
+// the "single entry owns every per-tuple key" contract the temp handlers
+// rely on (one flushEntry is hoisted out of the dstAddrs loop and all
+// TCP/UDP/ANY/ICMP keys record on it). A single cancelAllScheduledFlows
+// on that entry must drain ALL of them — the property that makes an admin
+// Cancel terminate the whole flow, not just one tuple. The unit covers
+// the multi-tuple ownership wiring that the handlers' au/srcAddrs
+// threading exercises only under Linux CI integration.
+func TestUdpAC_RegisterTempAccessFlushEntry_OneEntryOwnsAllTuples(t *testing.T) {
+	a, sched := newTempAccessTestAC(t)
+
+	dstAddrs := []*common.NetAddress{
+		{Ip: tempAccessDstIP, Port: tempAccessDstPort},
+		{Ip: "10.0.0.2", Port: 8443},
+	}
+	flushEntry := a.registerTempAccessFlushEntry(
+		&common.AgentUser{UserId: "u-temp-nat"},
+		[]*common.NetAddress{{Ip: tempAccessAolIP}},
+		dstAddrs,
+		tempAccessOpenTimeSec,
+	)
+
+	deadline := time.Now().Add(time.Hour)
+	// Distinct keys spanning the per-tuple shapes the handlers schedule:
+	// TCP+port, UDP+port, the port=0 ANY form, and ICMP — all on the one
+	// entry, as the handler loop does.
+	a.scheduleFlushIfEnabled(flushEntry, tempAccessNatIP, dstAddrs[0].Ip, dstAddrs[0].Port, FlowProtoTCP, deadline)
+	a.scheduleFlushIfEnabled(flushEntry, tempAccessNatIP, dstAddrs[1].Ip, dstAddrs[1].Port, FlowProtoUDP, deadline)
+	a.scheduleFlushIfEnabled(flushEntry, tempAccessNatIP, dstAddrs[0].Ip, 0, FlowProtoAny, deadline)
+	a.scheduleFlushIfEnabled(flushEntry, tempAccessNatIP, dstAddrs[0].Ip, 0, FlowProtoICMP, deadline)
+	if got := sched.EntryCount(); got != 4 {
+		t.Fatalf("precondition: EntryCount = %d, want 4 (one per distinct FlowKey)", got)
+	}
+
+	// One cancel drains every key the entry owns.
+	a.cancelAllScheduledFlows(flushEntry)
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after one cancelAllScheduledFlows(flushEntry) = %d, want 0 — a single admin Cancel must terminate ALL tuples the entry owns", got)
+	}
+}
+
+// TestUdpAC_RegisterTempAccessFlushEntry_NoSchedulerStoresNothing fences
+// the disabled-scheduler short-circuit: when EnableL3FlushOnExpiry is off
+// (a.expirySched == nil) there is no flush to own and no admin-Cancel
+// target, so registerTempAccessFlushEntry must store NOTHING — matching
+// the retired orphan path, which stored nothing in either config. A
+// regression that minted+stored an entry here would park a useless
+// long-lived tokenStore entry per temp flow. The returned nil must also
+// be safe to feed to scheduleFlushIfEnabled (no Critical / metric tick),
+// since the handlers pass it unconditionally.
+func TestUdpAC_RegisterTempAccessFlushEntry_NoSchedulerStoresNothing(t *testing.T) {
+	a := &UdpAC{
+		tokenStore: common.NewTokenStore[*AccessEntry](),
+		// expirySched intentionally nil (feature disabled).
+	}
+
+	dstAddrs := []*common.NetAddress{{Ip: tempAccessDstIP, Port: tempAccessDstPort}}
+	flushEntry := a.registerTempAccessFlushEntry(
+		&common.AgentUser{UserId: "u-temp-nat"},
+		[]*common.NetAddress{{Ip: tempAccessAolIP}},
+		dstAddrs,
+		tempAccessOpenTimeSec,
+	)
+
+	if flushEntry != nil {
+		t.Errorf("registerTempAccessFlushEntry returned non-nil with scheduler disabled — must store nothing (orphan-path parity)")
+	}
+	if got := a.tokenStore.Size(); got != 0 {
+		t.Errorf("tokenStore.Size with scheduler disabled = %d, want 0 — no entry should be parked", got)
+	}
+	// Feeding the nil entry to scheduleFlushIfEnabled must be a silent
+	// no-op (disabled-scheduler short-circuit precedes the nil-entry
+	// guard), not a Critical/metric tick.
+	a.scheduleFlushIfEnabled(flushEntry, tempAccessNatIP, tempAccessDstIP, tempAccessDstPort, FlowProtoTCP, time.Now().Add(time.Hour))
+}
+
+// TestUdpAC_RegisterTempAccessFlushEntry_KeysOnNatIPNotSrcAddrs fences
+// the #2205 NAT'd-vs-AOL divergence at the helper boundary the temp
+// handlers use: the owning entry carries the AOL-declared SrcAddrs (for
+// log/refresh parity), but the scheduled FlowKey must be keyed on the
+// kernel-observed (NAT'd) source IP — the address the kernel rule was
+// written for — NOT the AOL IP. Keying on SrcAddrs would make the
+// flusher's lookup miss the NAT'd kernel rule and the entry would
+// survive past timeout (the whole point of #2205).
+//
+// COVERAGE NOTE: this asserts the contract at the registerTempAccessFlushEntry
+// + scheduleFlushIfEnabled seam — it does NOT drive tcp/udpTempAccessHandler
+// end-to-end (deriving srcAddrIp from a live conn.RemoteAddr() needs the
+// device/crypto/decrypt path, which the package deliberately leaves to the
+// Linux smoke suite, #1656; see udp_handler_panic_test.go's preamble for
+// the same boundary). The handler-level wiring that au/srcAddrs are threaded
+// in and that srcAddrIp == remoteAddr.IP.String() is keyed (not SrcAddrs)
+// is tracked for smoke coverage in #1656. This unit locks the half that CAN
+// be exercised hermetically: given the NAT'd IP, the key lands on it.
+func TestUdpAC_RegisterTempAccessFlushEntry_KeysOnNatIPNotSrcAddrs(t *testing.T) {
+	a, _ := newTempAccessTestAC(t)
+
+	// natIP (kernel-observed) deliberately differs from aolIP (declared).
+	if tempAccessNatIP == tempAccessAolIP {
+		t.Fatalf("test fixture broken: natIP must differ from aolIP to exercise the divergence")
+	}
+
+	dstAddrs := []*common.NetAddress{{Ip: tempAccessDstIP, Port: tempAccessDstPort}}
+	flushEntry := a.registerTempAccessFlushEntry(
+		&common.AgentUser{UserId: "u-temp-nat"},
+		[]*common.NetAddress{{Ip: tempAccessAolIP}},
+		dstAddrs,
+		tempAccessOpenTimeSec,
+	)
+
+	// The entry carries the AOL-declared source (parity/log shape)...
+	if len(flushEntry.SrcAddrs) != 1 || flushEntry.SrcAddrs[0].Ip != tempAccessAolIP {
+		t.Fatalf("flushEntry.SrcAddrs = %+v, want the AOL IP %s", flushEntry.SrcAddrs, tempAccessAolIP)
+	}
+
+	// ...but the flush is scheduled on the NAT'd IP, exactly as the
+	// handler does (srcAddrIp = remoteAddr.IP.String()).
+	a.scheduleFlushIfEnabled(flushEntry, tempAccessNatIP, tempAccessDstIP, tempAccessDstPort, FlowProtoTCP, time.Now().Add(time.Hour))
+
+	natKey, err := MakeFlowKey(tempAccessNatIP, tempAccessDstIP, tempAccessDstPort, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey(natIP): %v", err)
+	}
+	aolKey, err := MakeFlowKey(tempAccessAolIP, tempAccessDstIP, tempAccessDstPort, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey(aolIP): %v", err)
+	}
+
+	if !flushEntry.holdsScheduledKey(natKey) {
+		t.Errorf("entry does not hold the NAT'd-IP FlowKey — flush must key on the kernel-observed source (#2205)")
+	}
+	if flushEntry.holdsScheduledKey(aolKey) {
+		t.Errorf("entry holds the AOL-IP FlowKey — flush must NOT key on SrcAddrs (would miss the NAT'd kernel rule, #2205)")
 	}
 }
 

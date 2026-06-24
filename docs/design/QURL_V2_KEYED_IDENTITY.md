@@ -747,7 +747,15 @@ kernel-visible session tag. Without that, L3 only sees the shared flow.
 Before relying on immediate revocation, also audit and retire the current orphan
 flush paths used for temp access. Orphan scheduler entries are not tied to an
 `AccessEntry`, so they are weak ownership points for explicit admin cancel. This
-is already tracked as a precision gap by #2172 / #2213, which must land first.
+was tracked as a precision gap by #2172 / #2213. The orphan-retirement half
+(#2213, slice P4g) has landed: temp-access (NAT'd / `PASS_PRE_ACCESS_IP`) flows
+now own their scheduled flush via a long-lived `AccessEntry`
+(`registerTempAccessFlushEntry`), so they are walkable by an admin Cancel. Each
+admission parks up to two such entries — the TCP and UDP temp handlers each mint
+one — so the admin-Cancel *selection* surface (#2172) must enumerate both. That
+surface remains to be built, and it must match these entries by their
+kernel-keyed (NAT'd) `FlowKey`, not by `SrcAddrs` (the AOL-declared IP), since
+the two deliberately diverge for NAT'd temp access.
 
 Filter-mode/IPv6 caveat: the current conntrack flusher is IPv4-only, and
 established-flow teardown differs by filter mode (iptables conntrack delete vs
@@ -1010,7 +1018,13 @@ Smoke:
    product-complete, so the discriminator is a Phase 4 deliverable and an
    acceptance gate, not an optional enhancement.
 7. Existing orphan flush paths must be fixed or proven irrelevant before admin
-   revocation can claim comprehensive AC cleanup.
+   revocation can claim comprehensive AC cleanup. (Temp-access orphan flush
+   retired in #2213 / slice P4g — temp flows now own their flush via a
+   long-lived `AccessEntry`. The boot-enumeration `Schedule` calls in
+   `expiry_enumerate_*_linux.go` remain deliberately owner-less; they
+   reconstruct scheduler state for kernel rules that outlived the AC process,
+   where no in-memory `AccessEntry` exists — proven irrelevant to admin Cancel,
+   which targets live in-memory entries.)
 8. Removing "plugins" from NHP is a target architecture change. It should be
    staged after qURL v2 behavior is proven behind the current static package.
 9. KMS lookup cannot replace qurl-service's hot state store unless we choose a

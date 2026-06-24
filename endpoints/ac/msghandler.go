@@ -884,12 +884,12 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 
 		if tcpListener != nil {
 			a.wg.Add(1)
-			go a.tcpTempAccessHandler(tcpListener, tempOpenTimeSec, dstAddrs, openTimeSec)
+			go a.tcpTempAccessHandler(tcpListener, tempOpenTimeSec, au, srcAddrs, dstAddrs, openTimeSec)
 		}
 
 		if udpListener != nil {
 			a.wg.Add(1)
-			go a.udpTempAccessHandler(udpListener, tempOpenTimeSec, dstAddrs, openTimeSec)
+			go a.udpTempAccessHandler(udpListener, tempOpenTimeSec, au, srcAddrs, dstAddrs, openTimeSec)
 		}
 	}
 
@@ -901,7 +901,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 	return
 }
 
-func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, dstAddrs []*common.NetAddress, openTimeSec int) {
+func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, au *common.AgentUser, srcAddrs, dstAddrs []*common.NetAddress, openTimeSec int) {
 	defer a.wg.Done()
 	// Spawned from HandleAccessControl on the NHP_AOP path; same
 	// blast radius as the per-packet recover seam in
@@ -999,17 +999,16 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 		return
 	}
 
-	// Per-entry tracking on tempEntry (the #2205 proposal) introduces
-	// an ESTABLISHED-bypass: tempEntry's tokenStore expiry (~35s)
-	// fires Cancel on the scheduled flush long before the kernel rule
-	// (lifetime openTimeSec, often hours) GCs. Routed through
-	// scheduleFlushOrphan instead — the scheduler entry has no
-	// per-entry owner, fires Flush at the scheduled deadline, and
-	// matches the kernel rule's natural TTL. See scheduleFlushOrphan
-	// godoc + #2213 for the lifetime-mismatch analysis and the
-	// proper fix (long-lived AccessEntry whose OpenTime matches the
-	// kernel rule's actual lifetime, restoring revocation precision
-	// before L7 removal).
+	// The kernel rule this handler writes lives for the long outer
+	// openTimeSec (often hours), so its scheduled L3 flush must be
+	// OWNED by an AccessEntry with a matching lifetime — not recorded
+	// on tempEntry (OpenTime ~30s, would Cancel the flush at its ~35s
+	// expiry → ESTABLISHED-bypass). registerTempAccessFlushEntry mints
+	// that long-lived owner (#2213, retiring the prior orphan path) so
+	// the flush is cancelable by an explicit admin Cancel (#2172). The
+	// flush deadline is unchanged (computeFlushDeadline(openTimeSec)):
+	// only OWNERSHIP changed, not timing. See registerTempAccessFlushEntry
+	// godoc for the lifetime-mismatch analysis.
 	if a.VerifyAccessToken(accMsg.ACToken) != nil {
 		remoteAddr, _ := net.ResolveTCPAddr(conn.RemoteAddr().Network(), conn.RemoteAddr().String())
 		srcAddrIp := remoteAddr.IP.String()
@@ -1020,6 +1019,12 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 			log.Error("[tcpTempAccessHandler] invalid destination IP: %s", dstAddrs[0].Ip)
 			return
 		}
+
+		// All per-tuple keys below record on this one entry, mirroring
+		// HandleAccessControl's single-entry multi-tuple admission (hence
+		// hoisted out of the loop). Ownership/timing rationale: see the
+		// block comment above + registerTempAccessFlushEntry godoc.
+		flushEntry := a.registerTempAccessFlushEntry(au, srcAddrs, dstAddrs, openTimeSec)
 
 		// Anchor flushDeadline at the moment the temp handler is about
 		// to write kernel state — the kernel timer starts NOW, not at
@@ -1036,7 +1041,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 				// Wildcard port (Port==0) maps to the FlowKey port=0
 				// no-port-filter form; ConntrackFlusher skips --dport
 				// in that case, which is the right partial-tuple shape.
-				a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
+				a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
 				_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 				if err != nil {
 					log.Error("[tcpTempAccessHandler] add ipset %s error: %v", ipHashStr, err)
@@ -1059,7 +1064,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 				// past timeout. A future change that swaps the
 				// eBPF mapType here MUST also update the FlowKey
 				// shape to match.
-				a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
+				a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 				err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
 				if err != nil {
 					log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
@@ -1073,7 +1078,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 	}
 }
 
-func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs []*common.NetAddress, openTimeSec int) {
+func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *common.AgentUser, srcAddrs, dstAddrs []*common.NetAddress, openTimeSec int) {
 	defer a.wg.Done()
 	// Same per-packet panic-recover discipline as tcpTempAccessHandler.
 	defer a.recoverUDPHandler(core.NHP_AOP)
@@ -1154,9 +1159,12 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 		return
 	}
 
-	// Routed through scheduleFlushOrphan (NOT per-entry tracking) —
-	// see tcpTempAccessHandler's matching note + scheduleFlushOrphan
-	// godoc + #2213 for the lifetime-mismatch analysis.
+	// Flushes scheduled below are OWNED by a long-lived AccessEntry
+	// (registerTempAccessFlushEntry, #2213) instead of the retired
+	// orphan path — making them cancelable by an explicit admin Cancel
+	// (#2172). See tcpTempAccessHandler's matching note +
+	// registerTempAccessFlushEntry godoc for the lifetime-mismatch
+	// analysis; timing is unchanged (only OWNERSHIP changed).
 	if a.VerifyAccessToken(accMsg.ACToken) != nil {
 		srcAddrIp := remoteAddr.IP.String()
 
@@ -1166,6 +1174,13 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 			log.Error("[udpTempAccessHandler] invalid destination IP: %s", dstAddrs[0].Ip)
 			return
 		}
+
+		// One entry owns every flush scheduled below (TCP/UDP/ANY + the
+		// ICMP ping branch), mirroring HandleAccessControl's single-entry
+		// admission (hence hoisted out of the loop). Ownership/timing
+		// rationale: see the comment above + registerTempAccessFlushEntry
+		// godoc.
+		flushEntry := a.registerTempAccessFlushEntry(au, srcAddrs, dstAddrs, openTimeSec)
 
 		// Anchor flushDeadline at the moment the temp handler is about
 		// to write kernel state — the kernel timer starts NOW, not at
@@ -1180,7 +1195,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 				}
 				switch a.config.FilterMode {
 				case FilterMode_IPTABLES:
-					a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
+					a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 					_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 					if err != nil {
 						log.Error("[udpTempAccessHandler] add ipset %s error: %v", ipHashStr, err)
@@ -1192,7 +1207,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 							SrcIP: srcAddrIp,
 							DstIP: dstAddr.Ip,
 						}
-						a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
+						a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 						err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
 						if err != nil {
 							log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
@@ -1206,7 +1221,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 							DstPort:  dstAddr.Port,
 							Protocol: dstAddr.Protocol,
 						}
-						a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
+						a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 						err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
 
 						if err != nil {
@@ -1238,7 +1253,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 					// in-flight Flush barrier holds; if the
 					// non-fatal write below fails the flush is a
 					// no-op against an absent entry.
-					a.scheduleFlushOrphan(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
+					a.scheduleFlushIfEnabled(flushEntry, remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 					_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 					if err != nil {
 						log.Warning("[udpTempAccessHandler] failed to add ICMP rule %s: %v", ipHashStr, err)
@@ -1248,7 +1263,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 						SrcIP: remoteAddr.IP.String(),
 						DstIP: dstAddr.Ip,
 					}
-					a.scheduleFlushOrphan(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
+					a.scheduleFlushIfEnabled(flushEntry, remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 					err = ebpf.EbpfRuleAdd(3, ebpfHashStr, openTimeSec)
 					if err != nil {
 						log.Error("[EbpfRuleAdd] add ebpf icmp src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
