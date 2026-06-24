@@ -49,6 +49,13 @@ const (
 	NHP_FWD // server forwards knock to assigned server (server-to-server, LayerV extension)
 	NHP_FRT // server returns forward result (server-to-server, LayerV extension)
 	NHP_ARD // server sends AC redispatch with assigned servers (NHP spec message)
+
+	// NHP_REV: server pushes a qURL v2 immediate-revocation event to the AC
+	// (server-to-AC, LayerV extension). Mirrors the NHP_ARD precedent — the
+	// revoke path is a distinct fire-and-forget message, NOT a verb on the
+	// admission state machine. See docs/design/QURL_V2_KEYED_IDENTITY.md ->
+	// "AC Admission and Immediate Revocation" (P4e receive side).
+	NHP_REV
 )
 
 var nhpHeaderTypeStrings []string = []string{
@@ -84,6 +91,7 @@ var nhpHeaderTypeStrings []string = []string{
 	"NHP-FWD", // server forwards knock to assigned server (server-to-server)
 	"NHP-FRT", // server returns forward result (server-to-server)
 	"NHP-ARD", // server sends AC redispatch with assigned servers
+	"NHP-REV", // server pushes a qURL v2 immediate-revocation event to the AC
 }
 
 func HeaderTypeToString(t int) string {
@@ -98,7 +106,8 @@ func HeaderTypeToDeviceType(t int) int {
 	case NHP_KNK, NHP_LST, NHP_RKN, NHP_OTP, NHP_REG, NHP_ACC, NHP_EXT:
 		return NHP_AGENT
 	case NHP_ACK, NHP_AOP, NHP_LRT, NHP_COK, NHP_AAK, NHP_RAK, NHP_DAK, NHP_DAG, NHP_DBA, NHP_DWR, NHP_DSA,
-		NHP_FWD, NHP_FRT, NHP_ARD: // Per-AC Server Assignment Messages (Phase 2)
+		NHP_FWD, NHP_FRT, NHP_ARD, // Per-AC Server Assignment Messages (Phase 2)
+		NHP_REV: // server-to-AC qURL v2 revocation push (P4e)
 		return NHP_SERVER
 
 	case NHP_AOL, NHP_ART:
@@ -218,7 +227,8 @@ func (d *Device) CheckRecvHeaderType(t int) bool {
 	case NHP_AC:
 		switch t {
 		// NHP_ARD: AC Redispatch - server redirects AC to assigned servers (Phase 2)
-		case NHP_AOP, NHP_LRT, NHP_AAK, NHP_ARD:
+		// NHP_REV: qURL v2 immediate-revocation push from the server (P4e)
+		case NHP_AOP, NHP_LRT, NHP_AAK, NHP_ARD, NHP_REV:
 			return true
 		}
 	case NHP_RELAY:

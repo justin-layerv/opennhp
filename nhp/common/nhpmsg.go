@@ -500,3 +500,49 @@ type ACRedispatchMsg struct {
 	ErrCode string           `json:"errCode,omitempty"` // Error code if assignment lookup failed
 	ErrMsg  string           `json:"errMsg,omitempty"`  // Error message if failed
 }
+
+// ACRevocationMsg carries a qURL v2 immediate-revocation event from the NHP
+// Server to an AC over NHP_REV (server-to-AC, LayerV extension). The server
+// relays it fire-and-forget after receiving the event from qurl-service; the AC
+// resolves Scope+ScopeKey to its secondary revocation index and tears down the
+// matching live access entries immediately (see (*UdpAC).HandleUdpACRevocation
+// → ApplyRevocation, P4b).
+//
+// Wire contract (CROSS-REPO). The json tags and field semantics mirror
+// qurl-service's revocation event (`internal/revocation/event.go`, P4d) so the
+// server send side (P4e Slice 2) can field-copy from the qurl-service Event into
+// this struct without a semantic transform — that is why the tags are snake_case
+// (matching qurl-service) rather than the camelCase used elsewhere in this file.
+// Keep the tags stable; they cannot change after Slice 2 ships.
+//
+//   - Scope is the revocation dimension. qurl-service emits one of "qurl",
+//     "resource", "session", or "cell"; this struct's string values mirror those
+//     byte-for-byte so the two ends agree without a translation table. The AC
+//     handler applies only "qurl"/"resource"/"session" — "cell" is a
+//     server-side fanout selector with no AC-local index (the AC drops it), and
+//     "admission" is an AC-internal index dimension that is never a wire scope
+//     (the handler rejects both as unsupported).
+//   - ScopeKey is the scope-PREFIXED key exactly as qurl-service emits it:
+//     "<scope>:<identity-hash-or-id>", e.g. "resource:<resource_public_key_hash>"
+//     or "qurl:<qurl_user_public_key_hash>" (qurl-service
+//     `internal/revocation/scopekey.go` `ScopeKey`). The AC handler strips the
+//     "<scope>:" transport prefix before calling ApplyRevocation, which requires
+//     the BARE identity (its index is keyed on the bare hash carried onto each
+//     AccessEntry at admission). The scope and the prefix MUST agree (qurl-service
+//     builds the prefix from the same scope); a mismatch is treated as malformed.
+//   - RevocationEpoch is the per-(scope, scope_key) monotonic counter used for
+//     idempotency/ordering; the AC applies an event only when its epoch is
+//     strictly greater than the last applied for that (Scope, ScopeKey). MUST be
+//     non-negative; a negative value is rejected (it would convert to a near-max
+//     uint64 and poison the epoch watermark). int64 (not uint64) to match
+//     qurl-service's wire type; the handler's negative guard covers the only
+//     unsafe input before the uint64 conversion.
+//   - EventId is an opaque producer-assigned id (qurl-service "evt_..."), carried
+//     for log correlation / tracing across the qurl-service→server→AC hops; it
+//     does not affect apply.
+type ACRevocationMsg struct {
+	Scope           string `json:"scope"`            // "qurl" | "resource" | "session" | "cell" (AC applies the first three)
+	ScopeKey        string `json:"scope_key"`        // scope-prefixed "<scope>:<hash>"; handler strips the prefix
+	RevocationEpoch int64  `json:"revocation_epoch"` // monotonic epoch (must be >= 0)
+	EventId         string `json:"event_id,omitempty"`
+}

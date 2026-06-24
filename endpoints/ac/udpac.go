@@ -943,7 +943,7 @@ func (a *UdpAC) recordTransactionClosed(err error) {
 
 // recoverUDPHandler catches panics on every per-packet goroutine on
 // the AC's UDP message-handler path: the recvMessageRoutine entries
-// (NHP_AOP, NHP_ARD) and every goroutine they transitively spawn
+// (NHP_AOP, NHP_ARD, NHP_REV) and every goroutine they transitively spawn
 // (HandleAccessControl's tcpTempAccessHandler / udpTempAccessHandler
 // and the tempConnTerminator nested inside each of those). It logs
 // the panic value + stack at Error and increments
@@ -1378,6 +1378,26 @@ func (a *UdpAC) recvMessageRoutine() {
 					defer a.wg.Done()
 					defer a.recoverUDPHandler(core.NHP_ARD)
 					a.HandleACRedispatch(ppd)
+				}()
+
+			case core.NHP_REV:
+				// Handle a qURL v2 immediate-revocation push from the
+				// server (P4e). wg-tracked like NHP_ARD so Stop()'s
+				// wg.Wait() blocks until an in-flight revoke apply
+				// returns. HandleUdpACRevocation validates the event and
+				// calls the P4b ApplyRevocation primitive; it logs every
+				// outcome (parse/validation reject AND apply result) with
+				// full context itself, so — like the NHP_ARD seam — this
+				// dispatch arm does not re-log the returned error (the
+				// NHP_AOP seam comment above: re-logging here adds noise
+				// without information). The error return exists for the
+				// direct test callers. There is no NHP_ART response path,
+				// so nothing to forward.
+				a.wg.Add(1)
+				go func() {
+					defer a.wg.Done()
+					defer a.recoverUDPHandler(core.NHP_REV)
+					_ = a.HandleUdpACRevocation(ppd)
 				}()
 			}
 		}

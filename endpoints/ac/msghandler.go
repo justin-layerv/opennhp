@@ -3,9 +3,11 @@ package ac
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -13,6 +15,34 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/utils"
 	"github.com/OpenNHP/opennhp/nhp/utils/ebpf"
+)
+
+// NHP_REV (qURL v2 immediate-revocation) handler rejection sentinels. Returned
+// by HandleUdpACRevocation so the dispatch seam and tests can distinguish a
+// validation reject from an apply. All are fail-closed: the event is dropped
+// without calling ApplyRevocation, and each reject increments
+// MetricRevocationRejected.
+var (
+	// ErrRevocationUnsupportedScope is returned when an NHP_REV carries a scope
+	// that is not one of the wire scopes qurl-service emits (qurl/resource/
+	// session) — including the AC-internal-only "admission" dimension.
+	ErrRevocationUnsupportedScope = errors.New("unsupported revocation scope")
+	// ErrRevocationNegativeEpoch is returned when an NHP_REV carries a negative
+	// epoch, which would convert to a near-max uint64 and poison the apply
+	// watermark.
+	ErrRevocationNegativeEpoch = errors.New("negative revocation epoch")
+	// ErrRevocationEmptyScopeKey is returned when an NHP_REV carries an empty or
+	// prefix-only scope_key (e.g. "qurl:"). ApplyRevocation already no-ops an
+	// empty key, but a well-formed scope with no identity is a malformed event
+	// from a correct producer's perspective; rejecting it explicitly (rather than
+	// silently no-opping) keeps it on the counted-reject path so a producer bug is
+	// visible in the metric, not just absent from the flush counts.
+	ErrRevocationEmptyScopeKey = errors.New("empty revocation scope key")
+	// ErrRevocationScopeKeyPrefixMismatch is returned when the scope_key's
+	// "<scope>:" prefix disagrees with the event's scope field (e.g.
+	// scope="qurl" with scope_key="resource:..."). qurl-service builds the prefix
+	// from the same scope, so a mismatch is a malformed or forged event.
+	ErrRevocationScopeKeyPrefixMismatch = errors.New("revocation scope_key prefix does not match scope")
 )
 
 // IP pass mode
@@ -278,6 +308,167 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 		log.Error("ac(%s#%d)[HandleUdpACOperations] transaction closed before forward: %v", acId, transactionId, sendErr)
 		a.recordTransactionClosed(sendErr)
 		return sendErr
+	}
+
+	return nil
+}
+
+// wireRevocationScope maps a qurl-service revocation-event wire scope string to
+// the AC's internal revocationScope, returning ok=false for any scope the AC
+// does not apply locally. qurl-service emits four scopes ("qurl", "resource",
+// "session", "cell"); the AC applies only the first three. "cell" is a
+// server-side fanout selector with no AC-local index, so the AC drops it here
+// (its job is done once the server fans the event out to the cell's ACs); Slice 3
+// folds the explicit cell-drop + epoch conversion into a shared scopeFromWire.
+// The string VALUES are identical to the revocationScope constants by
+// construction (P4b mirrored qurl-service byte-for-byte, see revocation_index.go),
+// so this is an allowlist GATE, not a translation table — equal bytes in,
+// validated typed value out.
+//
+// The allowlist is load-bearing, not defensive boilerplate: a raw
+// revocationScope(s) cast would also accept "admission", and scopeAdmission is a
+// populated index dimension (scopeKeysForEntry stamps every admission with an
+// AdmissionId under it). An inbound scope=="admission" would therefore flush by
+// admission-id — a capability qurl-service never grants over the wire and the
+// design reserves for a future AC-internal cancel seam. Rejecting it (and the
+// server-only "cell") here keeps the AC apply path to qurl/resource/session only.
+func wireRevocationScope(s string) (revocationScope, bool) {
+	switch revocationScope(s) {
+	case scopeQurl, scopeResource, scopeSession:
+		return revocationScope(s), true
+	default:
+		return "", false
+	}
+}
+
+// bareScopeKey strips the "<scope>:" transport prefix qurl-service puts on its
+// scope_key ("<scope>:<identity>", see qurl-service
+// internal/revocation/scopekey.go) and returns the bare identity hash/id that
+// ApplyRevocation indexes on. The identity itself may legitimately contain ':'
+// (a session id is opaque), so only the single leading "<scope>:" is removed via
+// TrimPrefix — not a split on the last colon.
+//
+// It is the single source of truth for the malformed-key classification, so the
+// handler does not re-derive the prefix check: a non-nil error is the exact
+// reject sentinel to return —
+//   - ErrRevocationScopeKeyPrefixMismatch: a non-empty prefix that disagrees with
+//     scope (qurl-service always builds the prefix from the same scope, so this is
+//     a producer bug / forgery). Checked first so "" classifies as empty, not
+//     mismatch.
+//   - ErrRevocationEmptyScopeKey: an empty scopeKey or a prefix-only key ("qurl:")
+//     — no identity to act on.
+func bareScopeKey(scope revocationScope, scopeKey string) (bare string, err error) {
+	prefix := string(scope) + ":"
+	if scopeKey != "" && !strings.HasPrefix(scopeKey, prefix) {
+		return "", ErrRevocationScopeKeyPrefixMismatch
+	}
+	bare = strings.TrimPrefix(scopeKey, prefix)
+	if bare == "" {
+		return "", ErrRevocationEmptyScopeKey
+	}
+	return bare, nil
+}
+
+// HandleUdpACRevocation processes a single NHP_REV packet: a qURL v2 immediate-
+// revocation event the NHP Server relayed from qurl-service. It unmarshals the
+// ACRevocationMsg, validates the scope, strips the "<scope>:" transport prefix
+// off scope_key to the bare identity, validates the epoch, and calls the P4b
+// apply primitive (*UdpAC).ApplyRevocation, which finds the matching live
+// AccessEntries via the secondary revocation index and tears their L3 flow state
+// down now (coarse RescheduleEarlier flush — surgical precision is the deferred
+// P4c/#2784 follow-up; this handler does NOT touch that path).
+//
+// Synchronous — the caller owns goroutine + wg accounting, mirroring
+// HandleUdpACOperations. The production caller is the NHP_REV arm of
+// recvMessageRoutine in udpac.go, which spawns this wrapped by
+// `defer a.wg.Done(); defer a.recoverUDPHandler(core.NHP_REV)`. Tests call it
+// directly without that ceremony.
+//
+// No replay/dedupe cache here (unlike the NHP_AOP handler): there is no NHP_ART
+// response to be used as a replay-success oracle, and ApplyRevocation is already
+// replay-safe — its admitEpoch watermark drops a duplicate/stale epoch and a
+// no-live-match event is a no-op without advancing state. A redelivered NHP_REV
+// is therefore harmless.
+//
+// Delivery-guarantee dependency (do not lose across the slice boundary): NHP_REV
+// is fire-and-forget UDP with no ack, so a lost packet leaves the entry alive to
+// natural expiry — a fail-open outcome. The replay-safety reasoning above assumes
+// the sender provides redelivery. depends on: Slice 2 at-least-once send (the
+// server→AC fanout must retry); tracked in the P4e plan.
+//
+// Every reject path is fail-closed (drops without calling ApplyRevocation) and
+// increments MetricRevocationRejected so a malformed/forged-event spike is
+// alarmable. Errors are logged + returned per the admission-handler convention;
+// the dispatch seam does not re-log (the handler's log is richer), matching the
+// NHP_ARD/NHP_AOP precedent.
+func (a *UdpAC) HandleUdpACRevocation(ppd *core.PacketParserData) error {
+	acId := a.config.ACId
+
+	revMsg := &common.ACRevocationMsg{}
+	if err := json.Unmarshal(ppd.BodyMessage, revMsg); err != nil {
+		log.Error("ac(%s)[HandleUdpACRevocation] failed to parse NHP_REV message: %v", acId, err)
+		a.incrMetric(MetricRevocationRejected)
+		return err
+	}
+
+	scope, ok := wireRevocationScope(revMsg.Scope)
+	if !ok {
+		// Unknown, server-only ("cell"), or AC-internal-only ("admission") scope.
+		// The AC applies only qurl/resource/session; anything else is dropped
+		// without applying (a producer bug or a malformed/forged event for
+		// unknown/admission, or a correctly-ignored cell selector).
+		log.Error("ac(%s)[HandleUdpACRevocation] rejecting NHP_REV with unsupported scope=%q (key=%q epoch=%d eventId=%q)",
+			acId, revMsg.Scope, revMsg.ScopeKey, revMsg.RevocationEpoch, revMsg.EventId)
+		a.incrMetric(MetricRevocationRejected)
+		return fmt.Errorf("%w: scope=%q", ErrRevocationUnsupportedScope, revMsg.Scope)
+	}
+
+	// Strip the "<scope>:" transport prefix to the bare identity ApplyRevocation
+	// indexes on. This is the load-bearing translation across the slice boundary:
+	// qurl-service emits the prefixed form, ApplyRevocation requires the bare hash
+	// (its index is keyed on the bare hash stamped onto each AccessEntry at
+	// admission), so forwarding the prefixed key verbatim would never match and
+	// silently fail revocation open. bareScopeKey is the single source of truth
+	// for the malformed-key classification — its returned sentinel
+	// (ErrRevocationEmptyScopeKey for empty / prefix-only, or
+	// ErrRevocationScopeKeyPrefixMismatch for a prefix that disagrees with scope)
+	// is returned verbatim, so the handler does not re-derive the prefix check.
+	scopeKey, keyErr := bareScopeKey(scope, revMsg.ScopeKey)
+	if keyErr != nil {
+		log.Error("ac(%s)[HandleUdpACRevocation] rejecting NHP_REV scope_key=%q: %v (scope=%q epoch=%d eventId=%q)",
+			acId, revMsg.ScopeKey, keyErr, revMsg.Scope, revMsg.RevocationEpoch, revMsg.EventId)
+		a.incrMetric(MetricRevocationRejected)
+		return keyErr
+	}
+
+	if revMsg.RevocationEpoch < 0 {
+		// A negative wire epoch would convert to a near-max uint64 and, on a
+		// matched key, pin lastEpoch so high that every subsequent legitimate
+		// revoke is dropped as stale (epoch <= last) — a fail-open
+		// watermark-poisoning vector. Reject before the uint64 conversion.
+		log.Error("ac(%s)[HandleUdpACRevocation] rejecting NHP_REV with negative epoch=%d (scope=%q key=%q eventId=%q)",
+			acId, revMsg.RevocationEpoch, revMsg.Scope, revMsg.ScopeKey, revMsg.EventId)
+		a.incrMetric(MetricRevocationRejected)
+		return fmt.Errorf("%w: epoch=%d", ErrRevocationNegativeEpoch, revMsg.RevocationEpoch)
+	}
+
+	// The receive breadcrumb carries eventId for cross-hop correlation (the
+	// qurl-service→server→AC trace), which ApplyRevocation's own outcome log does
+	// not. It is at Debug because under cell-wide fan-out every AC receives every
+	// revoke — including the keys it never admitted — so at Info this would be the
+	// dominant no-op log line (count × AC count). ApplyRevocation is the P4b seam:
+	// it epoch-gates, flushes matching live entries' L3 flow state immediately,
+	// removes them from tokenStore, and logs the applied / stale-drop / no-match
+	// outcome with counts + metrics itself — so this handler never re-logs the
+	// count. The single Info below fires only when something was actually torn
+	// down, attaching the eventId breadcrumb to the applied case (where an
+	// operator wants the correlation id) without inflating the common no-op path.
+	// scopeKey is the BARE identity here (prefix already stripped).
+	log.Debug("ac(%s)[HandleUdpACRevocation] received NHP_REV scope=%s key=%q epoch=%d eventId=%q",
+		acId, scope, scopeKey, revMsg.RevocationEpoch, revMsg.EventId)
+	if flushed := a.ApplyRevocation(scope, scopeKey, uint64(revMsg.RevocationEpoch)); flushed > 0 {
+		log.Info("ac(%s)[HandleUdpACRevocation] applied NHP_REV scope=%s key=%q epoch=%d eventId=%q",
+			acId, scope, scopeKey, revMsg.RevocationEpoch, revMsg.EventId)
 	}
 
 	return nil

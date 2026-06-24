@@ -483,9 +483,17 @@ const (
 	//     tracked FlowKeys were rescheduled to fire now. Distinguishes "entry
 	//     had live L3 flows we forced down" from "entry had no scheduled flows"
 	//     (e.g. scheduler disabled), which Flushed alone cannot.
+	//   - MetricRevocationRejected — incremented once per NHP_REV the AC handler
+	//     (HandleUdpACRevocation, P4e) drops at validation BEFORE reaching
+	//     ApplyRevocation: malformed body, an unsupported/AC-internal scope, an
+	//     empty scope_key, or a negative epoch. NHP_REV is post-handshake
+	//     authenticated (the sender is a known server peer), so a spike here is a
+	//     producer bug or a malformed/forged event worth alarming on rather than
+	//     leaving only in logs — distinct from the benign StaleDropped rate.
 	MetricRevocationStaleDropped   = "RevocationStaleDropped"
 	MetricRevocationEntriesFlushed = "RevocationEntriesFlushed"
 	MetricRevocationFlushScheduled = "RevocationFlushScheduled"
+	MetricRevocationRejected       = "RevocationRejected"
 )
 
 // Re-registration reason constants. These are the only values that
