@@ -118,6 +118,39 @@ func (r *connTrackKey) ToCtKey() []byte {
 	return keyBytes
 }
 
+// connTrackKeyFromBytes is the EXACT inverse of ToCtKey: it decodes the 14
+// packed bytes of a kernel `ipv4_ct_tuple` map key back into a connTrackKey.
+// The conntrack-enumeration path (P4e slice 5,
+// conntrack_enumerate_linux.go) walks the pinned conn_track map and must
+// recover each entry's per-flow SOURCE PORT — the surgical discriminator —
+// from the raw key bytes the BPF iterator yields, so it can FlushConn
+// exactly the revoked flow and leave same-allow-tuple siblings alive.
+//
+// Layout discipline (must stay byte-for-byte symmetric with ToCtKey — a
+// wrong offset here silently decodes the wrong source port, the enumeration
+// then filters the target out, and the "surgical" revoke degrades to the
+// coarse over-flush this slice exists to remove). The two functions are a
+// matched pair fenced by the ToCtKey golden-bytes test plus a round-trip
+// test (parse(ToCtKey(k)) == k); change one, change the other.
+//
+// Returns an error if buf is not exactly connTrackKeySize bytes — a
+// short/long buffer means the wrong map was pinned at the path or the
+// kernel struct changed, both of which must fail loud rather than decode
+// garbage from an out-of-bounds or truncated slice.
+func connTrackKeyFromBytes(buf []byte) (connTrackKey, error) {
+	if len(buf) != connTrackKeySize {
+		return connTrackKey{}, fmt.Errorf("conntrack key length %d, want %d (packed ipv4_ct_tuple)", len(buf), connTrackKeySize)
+	}
+	return connTrackKey{
+		DstIP:   binary.LittleEndian.Uint32(buf[0:4]),
+		SrcIP:   binary.LittleEndian.Uint32(buf[4:8]),
+		DstPort: binary.BigEndian.Uint16(buf[8:10]),
+		SrcPort: binary.BigEndian.Uint16(buf[10:12]),
+		NextHdr: buf[12],
+		Flags:   buf[13],
+	}, nil
+}
+
 type whitelistValue struct {
 	Allowed    uint8
 	_          [7]byte

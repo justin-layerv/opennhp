@@ -1,10 +1,14 @@
 package ac
 
 import (
+	"context"
+	"errors"
+	"net"
 	"sync"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/log"
+	utilebpf "github.com/OpenNHP/opennhp/nhp/utils/ebpf"
 )
 
 // P4b: AC secondary revocation indexes + immediate-flush apply.
@@ -364,29 +368,48 @@ func (a *UdpAC) ApplyRevocation(scope revocationScope, scopeKey string, epoch ui
 }
 
 // flushEntryNow forces every FlowKey the entry has scheduled to fire its flush
-// immediately by rescheduling each to a now-deadline. It reuses the existing
-// scheduler/flusher (and its circuit breaker) rather than calling the flusher
-// directly, so revocation flushes share the same kernel-teardown path, metrics,
-// and back-pressure as expiry flushes — and so this file does not touch the
-// conntrack/bpf flusher implementations (P4c territory).
+// immediately. It drains the tracked keys ONCE (drainScheduledKeys empties the
+// set under e.mu and returns the keys), then drives BOTH teardown directions
+// off that single slice:
 //
-// It drains the tracked keys via drainScheduledKeys (empties the set under e.mu
-// and returns the keys), mirroring cancelAllScheduledFlows: draining means the
-// subsequent tokenStore.Delete's absence of an OnExpire hook does not strand
-// keys, and a concurrent cancelAllScheduledFlows for the same entry drains nil
-// and no-ops. It uses Scheduler.RescheduleEarlier (not plain Schedule, which is
-// longest-wins and would no-op against a flow's later firewall deadline; and not
-// Cancel, which only unlinks and lets the kernel rule self-expire by TTL rather
-// than flushing now). Pulling the deadline earlier is what distinguishes revoke
-// from /refresh-shorten: shorten wants the flow to survive to a peer's deadline,
-// revoke wants it dead now.
+//  1. COARSE allow-rule teardown (always, every mode): Scheduler.RescheduleEarlier
+//     pulls each FlowKey's deadline to now so the scheduler/flusher (and its
+//     circuit breaker) tears the allow-rule entry down on the next tick. This
+//     BARS RE-OPEN — a packet on a revoked tuple can no longer re-create a
+//     conntrack short-circuit — and is the ONLY teardown available in iptables
+//     mode and the fallback when the surgical path is unavailable.
+//  2. SURGICAL conntrack teardown (eBPF/XDP + IPv4 only): for each drained v4
+//     TCP/UDP key, enumerate the live conntrack 5-tuples on that allow-rule
+//     tuple and FlushConn EXACTLY each one. Deleting the allow-rule alone does
+//     NOT immediately drop an ESTABLISHED flow — the XDP conn_track
+//     short-circuit keeps it passing until the entry's ttl_ns (anchored to the
+//     allow-rule's ORIGINAL remaining lifetime) elapses, up to a full session
+//     after the revoke. FlushConn deletes the conntrack entry so the very next
+//     packet falls back through the (now-removed) allow-rule path → XDP_DROP.
+//     Crucially it kills only the revoked admission's flow and leaves a
+//     same-allow-tuple sibling (different source port, e.g. a second client
+//     behind the same NAT) ALIVE — resolving the coarse over-flush #2784.
 //
-// Over-flush note: rescheduling a shared FlowKey to now tears it down for every
-// session on that tuple, including non-revoked siblings. Accepted interim per
-// the design; P4c adds the kernel-visible discriminator that makes this
-// surgical. The symmetric UNDER-flush direction — a concurrent sibling expiry
-// can push the just-pulled deadline back off a stale tokenStore snapshot — is
-// the same interim and tracked in #2784 (see ApplyRevocation).
+// drain-once-feed-both: the coarse RescheduleEarlier loop must NOT re-drain
+// (drainScheduledKeys is destructive — a second call returns nil and the
+// surgical step would silently no-op). Both steps iterate the same `keys`
+// slice.
+//
+// Why RescheduleEarlier and not Schedule/Cancel for the coarse step: a live
+// admitted flow is already scheduled at its future firewall deadline; Schedule
+// is longest-wins so Schedule(key, now) no-ops against it, and Cancel only
+// unlinks and lets the kernel rule self-expire by TTL rather than flushing now.
+// RescheduleEarlier pulls the deadline earlier (preserving Schedule's in-flight
+// barrier so a flow already being torn down isn't double-flushed) — the inverse
+// of /refresh-shorten, which wants the flow to survive to a peer's deadline.
+//
+// IPv6 (#2778): conn_track is IPv4-only (struct ipv4_ct_tuple uses __be32), so
+// a v6 admission under EBPFXDP has NO surgical immediate-teardown path — and the
+// coarse allow-rule maps are v4-only too, so the v6 flow only dies at kernel
+// TTL. surgicalFlushFlowKey ticks MetricRevocationIPv6HardFail for each such key
+// and does NOT treat the absence of a v6 conntrack entry as "killed". iptables
+// mode is unaffected (its ConntrackFlusher uses netlink, which IS v6-capable),
+// so the hard-fail is scoped to EBPFXDP via the surgicalConnFlush != nil gate.
 func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 	if a.expirySched == nil || entry == nil {
 		return
@@ -396,17 +419,102 @@ func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 		return
 	}
 	now := time.Now()
+	// surgicalConnFlush is non-nil ONLY in EBPFXDP-on-Linux mode (bound in
+	// Start()); that is the single signal that the surgical path + v6 hard-fail
+	// accounting apply. Build the ctx once for the whole entry's flushes.
+	surgicalAvailable := a.surgicalConnFlush != nil
+	var ctx context.Context
+	if surgicalAvailable {
+		ctx = context.Background()
+	}
 	for _, key := range keys {
-		// RescheduleEarlier, NOT Schedule: a live admitted flow is already
-		// scheduled at its future firewall deadline, and Schedule is
-		// longest-wins — Schedule(key, now) would be a no-op against any
-		// later-scheduled key (i.e. every live flow), so the flush would
-		// never fire. RescheduleEarlier is the deliberate inverse: it pulls
-		// the existing entry to a now-deadline so the scheduler fires the
-		// flusher on its next tick (<= wheel resolution), the "immediate"
-		// bound. It preserves Schedule's in-flight barrier, so a flow already
-		// being torn down is left to finish rather than double-flushed.
+		// COARSE first: bar re-open in every mode. See godoc — additive, never
+		// gated by the surgical outcome.
 		a.expirySched.RescheduleEarlier(key, now)
+		// SURGICAL: kill established flows on this tuple without over-flushing
+		// siblings. Only when the eBPF/XDP+IPv4 path is wired.
+		if surgicalAvailable {
+			a.surgicalFlushFlowKey(ctx, key)
+		}
 	}
 	a.incrMetric(MetricRevocationFlushScheduled)
+}
+
+// surgicalFlushFlowKey enumerates the live conntrack 5-tuples sharing the given
+// allow-rule FlowKey and surgically FlushConn's each, so a revoke kills EXACTLY
+// the revoked admission's established flows and leaves same-allow-tuple siblings
+// (different source port) alive. Called only when the eBPF/XDP+IPv4 surgical
+// path is wired (a.surgicalConnFlush != nil, i.e. EBPFXDP-on-Linux).
+//
+// Per-key decision tree (the order matters for getting the v6 metric right —
+// see the IPv6 note on flushEntryNow):
+//
+//   - IPv6 key → MetricRevocationIPv6HardFail and RETURN. conn_track is v4-only;
+//     there is no entry to enumerate or delete, and the coarse allow-rule flush
+//     (also v4-only) won't drop it either — the flow dies at kernel TTL. This is
+//     an explicit hard-fail, NOT a silent success.
+//   - IPv4 + ICMP / "any" → no conntrack entry exists by design (the XDP
+//     established-flow short-circuit is port-keyed), so there is nothing to
+//     surgically tear down; the coarse allow-rule teardown already done in
+//     flushEntryNow suffices. No hard-fail.
+//   - IPv4 + TCP/UDP → enumerate the conn_track source ports on this tuple and
+//     FlushConn each full 5-tuple.
+//
+// Enumeration "map not pinned" (XDP not attached) is a soft fallback: the
+// coarse allow-rule reschedule already ran, so there is nothing more to do —
+// log at debug and return rather than erroring. Any other enumeration error is
+// logged (best-effort: the coarse path already fired; revoke must not be taken
+// down by an enumeration hiccup) but does not panic.
+func (a *UdpAC) surgicalFlushFlowKey(ctx context.Context, key FlowKey) {
+	if !isFlowKeyIPv4(key) {
+		// v6 under EBPFXDP: no surgical path, coarse path is v4-only too.
+		a.incrMetric(MetricRevocationIPv6HardFail)
+		log.Warning("[Revocation] IPv6 flow %s under eBPF/XDP has no surgical conntrack teardown (conn_track is IPv4-only); flow will persist until kernel TTL (#2778)", key)
+		return
+	}
+	proto, ok := key.Protocol.ianaL4Proto()
+	if !ok {
+		// ICMP / "any": no conntrack short-circuit, coarse allow-rule teardown
+		// is sufficient. Nothing surgical to do.
+		return
+	}
+	if a.enumerateConnSrcPorts == nil {
+		// Defensive: surgicalConnFlush and enumerateConnSrcPorts are bound as a
+		// pair in Start(), so this is unreachable in production. If a future
+		// edit ever leaves them out of sync, fall back to coarse-only rather
+		// than nil-panic — the allow-rule reschedule already ran.
+		log.Error("[Revocation] surgical flush wired without an enumerator for %s; coarse allow-rule flush only", key)
+		return
+	}
+	sports, err := a.enumerateConnSrcPorts(key.SrcIPString(), key.DstIPString(), proto, key.DstPort)
+	if err != nil {
+		if errors.Is(err, utilebpf.ErrConnTrackMapNotPinned) {
+			// XDP not attached at the conn_track pin path — feature inert. The
+			// coarse reschedule already ran; nothing else to do.
+			log.Debug("[Revocation] conn_track not pinned, surgical flush skipped for %s (coarse allow-rule flush already scheduled): %v", key, err)
+			return
+		}
+		log.Error("[Revocation] conntrack enumeration failed for %s; relying on coarse allow-rule flush only: %v", key, err)
+		return
+	}
+	for _, sport := range sports {
+		conn := ConnFlowKey{Flow: key, SrcPort: sport}
+		if ferr := a.surgicalConnFlush(ctx, conn); ferr != nil {
+			// FlushConn is idempotent on ENOENT (returns nil); a non-nil error
+			// is a real teardown failure. The coarse path still bars re-open,
+			// so log rather than abort the remaining siblings' flushes.
+			log.Error("[Revocation] surgical FlushConn failed for %s: %v", conn, ferr)
+			continue
+		}
+		a.incrMetric(MetricRevocationSurgicalFlushed)
+	}
+}
+
+// isFlowKeyIPv4 reports whether both endpoints of a FlowKey are IPv4 (stored in
+// IPv4-mapped [16]byte form). The conntrack map and the eBPF allow-rule maps are
+// IPv4-only; this is the cross-platform gate the surgical-revocation path uses
+// to split v4 (enumerate + FlushConn) from v6 (hard-fail). net.IP.To4 returns
+// non-nil exactly for the IPv4-mapped form MakeFlowKey produces for v4 inputs.
+func isFlowKeyIPv4(key FlowKey) bool {
+	return net.IP(key.SrcIP[:]).To4() != nil && net.IP(key.DstIP[:]).To4() != nil
 }

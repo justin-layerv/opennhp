@@ -490,10 +490,29 @@ const (
 	//     authenticated (the sender is a known server peer), so a spike here is a
 	//     producer bug or a malformed/forged event worth alarming on rather than
 	//     leaving only in logs — distinct from the benign StaleDropped rate.
-	MetricRevocationStaleDropped   = "RevocationStaleDropped"
-	MetricRevocationEntriesFlushed = "RevocationEntriesFlushed"
-	MetricRevocationFlushScheduled = "RevocationFlushScheduled"
-	MetricRevocationRejected       = "RevocationRejected"
+	//   - MetricRevocationSurgicalFlushed — incremented once per established
+	//     conntrack flow surgically torn down by FlushConn on the eBPF/XDP+IPv4
+	//     revocation path (P4e slice 5). This is the per-FLOW analog of the
+	//     per-ENTRY EntriesFlushed: one revoked AccessEntry can have multiple
+	//     live 5-tuples (one per source port / client behind a NAT), each killed
+	//     individually so same-allow-tuple siblings survive. A zero count while
+	//     EntriesFlushed is nonzero means the revoked entries had no live
+	//     established flows (only quiet/new pinholes) — expected, not an error.
+	//   - MetricRevocationIPv6HardFail — incremented once per IPv6 FlowKey that
+	//     reached the eBPF/XDP surgical revocation path and could NOT be
+	//     surgically torn down: conn_track is IPv4-only (struct ipv4_ct_tuple),
+	//     and the eBPF allow-rule maps are v4-only too, so a v6 flow under
+	//     EBPFXDP survives a revoke until kernel TTL. ANY nonzero reading is a
+	//     real immediate-revocation gap worth alarming on (#2778) — it is NOT
+	//     the benign skip-counter BpfFlusherSkippedCount tracks for scheduled
+	//     expiry. Scoped to EBPFXDP: iptables mode tears v6 down via the netlink
+	//     ConntrackFlusher and never ticks this.
+	MetricRevocationStaleDropped    = "RevocationStaleDropped"
+	MetricRevocationEntriesFlushed  = "RevocationEntriesFlushed"
+	MetricRevocationFlushScheduled  = "RevocationFlushScheduled"
+	MetricRevocationRejected        = "RevocationRejected"
+	MetricRevocationSurgicalFlushed = "RevocationSurgicalFlushed"
+	MetricRevocationIPv6HardFail    = "RevocationIPv6HardFail"
 )
 
 // Re-registration reason constants. These are the only values that

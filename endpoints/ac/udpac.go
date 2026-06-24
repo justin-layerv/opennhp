@@ -120,6 +120,33 @@ type UdpAC struct {
 	// metrics publisher read the counter from registration.go
 	// without taking a build-tag dependency
 	bpfFlusherSkippedCount func() uint64
+
+	// surgicalConnFlush is the per-flow surgical conntrack-teardown seam
+	// used by the revocation apply path (flushEntryNow). Set to
+	// BpfFlusher.FlushConn ONLY when the scheduler is constructed in EBPFXDP
+	// mode on Linux (same gate as bpfFlusherSkippedCount); nil otherwise —
+	// in iptables mode, on non-Linux, or when L3 flush is disabled, where
+	// flushEntryNow falls back to the coarse allow-rule reschedule alone.
+	// A non-nil value is the signal that the eBPF/XDP+IPv4 surgical path is
+	// available: flushEntryNow enumerates each revoked flow's conntrack
+	// 5-tuples and calls this to kill EXACTLY the revoked admission's flow,
+	// leaving same-allow-tuple siblings (different source port) alive — the
+	// surgical precision P4c's primitives enable and #2784 needs. The
+	// func-field indirection (rather than a typed *BpfFlusher) keeps
+	// revocation_index.go build-tag-free and lets an AC-level test inject a
+	// fake to prove the wiring drives surgical-per-v4-key + v6-hard-fail.
+	surgicalConnFlush func(context.Context, ConnFlowKey) error
+
+	// enumerateConnSrcPorts recovers the live conn_track source ports on an
+	// allow-rule tuple {srcIP,dstIP,proto,dstPort}, feeding the surgical flush
+	// above. Bound to utilebpf.EnumerateConnTrackSrcPorts in the same
+	// EBPFXDP-on-Linux Start() block as surgicalConnFlush. The func-field seam
+	// (rather than calling the package function directly from
+	// surgicalFlushFlowKey) lets an AC-level test inject a fake enumerator: the
+	// pinned conn_track map is absent in unit tests, so without this seam the
+	// surgical FlushConn-per-source-port drive could not be proven off a kernel
+	// rig. Only read when surgicalConnFlush != nil.
+	enumerateConnSrcPorts func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
 }
 
 // BpfFlusherSkippedCount returns the BpfFlusher's non-IPv4 skip
@@ -279,6 +306,16 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 		// non-Linux stub returns 0 from SkippedCount.
 		if bf, ok := flusher.(*BpfFlusher); ok && bf != nil {
 			a.bpfFlusherSkippedCount = bf.SkippedCount
+			// Bind the surgical conntrack-teardown seam to the same
+			// EBPFXDP-on-Linux BpfFlusher. This is what flips
+			// flushEntryNow from coarse-only allow-rule reschedule to the
+			// surgical FlushConn-per-5-tuple path. iptables mode
+			// (ConntrackFlusher) and non-Linux leave it nil → coarse path.
+			a.surgicalConnFlush = bf.FlushConn
+			// Pair the enumerator that recovers the source ports FlushConn
+			// needs. Bound here (not called directly) so a unit test can swap
+			// in a fake — the pinned conn_track map is absent off a kernel rig.
+			a.enumerateConnSrcPorts = ebpf.EnumerateConnTrackSrcPorts
 		}
 		a.expirySched = NewScheduler(flusher,
 			WithDryRun(a.config.L3FlushDryRun),
@@ -316,6 +353,8 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			// fence: round 11 minor — nil-write safety pinned).
 			a.expirySched = nil
 			a.bpfFlusherSkippedCount = nil
+			a.surgicalConnFlush = nil
+			a.enumerateConnSrcPorts = nil
 			return fmt.Errorf("L3 flush boot enumeration: %w", err)
 		}
 	}
