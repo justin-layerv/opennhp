@@ -22,58 +22,6 @@ CVE-2025-45582
 # libexpat1 - waiting for Ubuntu patches
 CVE-2025-66382
 
-# Go stdlib CVEs in vendored Traefik v3.6.16 binary (Dockerfile.ac.aws).
-# Our binaries are built with Go 1.26.4 (see #1911, #2356), but the pre-built
-# Traefik binary is still compiled with Go 1.25.0. Wait for a Traefik
-# release built with Go >= 1.25.11 / 1.26.4 (covering all thirteen
-# Traefik-scoped CVEs in the blocks below) to remove these entries.
-# Re-check after 2026-06-15 if no Traefik release has shipped by then.
-# https://avd.aquasec.com/nvd/cve-2026-32280
-CVE-2026-32280
-# https://avd.aquasec.com/nvd/cve-2026-32281
-CVE-2026-32281
-# https://avd.aquasec.com/nvd/cve-2026-32282
-CVE-2026-32282
-# https://avd.aquasec.com/nvd/cve-2026-32283
-CVE-2026-32283
-# Five further stdlib CVEs landed in Trivy's DB on 2026-05-12 — fixed
-# upstream by Go 1.26.3 (this repo's bump in PR #1911) but Traefik's
-# vendored Go 1.25.0 copies still flag.
-# https://avd.aquasec.com/nvd/cve-2026-33811
-CVE-2026-33811
-# https://avd.aquasec.com/nvd/cve-2026-33814
-CVE-2026-33814
-# https://avd.aquasec.com/nvd/cve-2026-39820
-CVE-2026-39820
-# https://avd.aquasec.com/nvd/cve-2026-39836
-CVE-2026-39836
-# https://avd.aquasec.com/nvd/cve-2026-42499
-CVE-2026-42499
-
-# Three further stdlib CVEs landed in Trivy's DB on 2026-05-28 — same
-# story: fixed in Go 1.25.10 / 1.26.3 (per NVD) so our own binary is
-# patched, but the Traefik v3.6.16 binary is still built with
-# Go 1.25.0 and continues to flag. Will go away when Traefik publishes
-# a release built with Go >= 1.25.10.
-# https://nvd.nist.gov/vuln/detail/CVE-2026-39823 (html/template URL escaping)
-CVE-2026-39823
-# https://nvd.nist.gov/vuln/detail/CVE-2026-39825 (net/http/httputil ReverseProxy)
-CVE-2026-39825
-# https://nvd.nist.gov/vuln/detail/CVE-2026-39826 (html/template <script> escaping)
-CVE-2026-39826
-
-# CVE-2026-42504 landed in Trivy's DB on 2026-06-02 — mime.WordDecoder
-# CPU-exhaustion DoS, fixed in Go 1.25.11 / 1.26.4 — authoritatively per
-# the Go vuln DB GO-2026-5038 (fixed: go1.25.11, go1.26.4) and the Go
-# 1.26.4 security-release announcement, NOT merely "milestone Go 1.27"
-# (that is the upstream tip; the fix was backported). So our own binaries
-# (now on Go 1.26.4) are patched; only the Traefik v3.6.16 binary (Go
-# 1.25.0 < 1.25.11) still flags it. Re-check with the block above after
-# 2026-06-15 if no Traefik release built with Go >= 1.25.11 has shipped.
-# https://pkg.go.dev/vuln/GO-2026-5038
-# https://nvd.nist.gov/vuln/detail/CVE-2026-42504
-CVE-2026-42504
-
 # go.opentelemetry.io/otel/sdk - FALSE POSITIVE
 # CVE-2026-39883 (PATH hijacking via kenv on BSD) is fixed in v1.43.0.
 # We are on v1.43.0. Trivy's database incorrectly flags it — the affected
