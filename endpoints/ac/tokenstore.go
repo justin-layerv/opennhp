@@ -194,6 +194,29 @@ func (e *AccessEntry) GetExpireTime() time.Time {
 	return e.ExpireTime
 }
 
+// storeToken stores (token, entry) in tokenStore and adds it to the qURL v2
+// revocation index (P4b). Single funnel for every admission/refresh Store so
+// the index can never drift from tokenStore membership. revIndex.add is a
+// no-op for legacy entries (no qURL v2 metadata) and idempotent on re-Store of
+// the same pair (the /refresh re-store path). The index op runs AFTER
+// tokenStore.Store has released its lock, so revIndex.mu is taken outside
+// tokenStore.mu — consistent with the lock order (revIndex.mu leaf-most).
+func (a *UdpAC) storeToken(token string, entry *AccessEntry) {
+	a.tokenStore.Store(token, entry)
+	a.revIndex.add(token, entry)
+}
+
+// deleteToken removes token from tokenStore and the revocation index. Single
+// funnel for every explicit Delete (failure cleanup, revocation). tokenStore's
+// own CleanExpired path does NOT route through here — it fires the OnExpire
+// hook, which deindexes instead (see installExpiryHook). entry is the
+// AccessEntry being removed, needed because the index keys off its metadata;
+// callers that already hold the entry pass it to avoid a re-Load.
+func (a *UdpAC) deleteToken(token string, entry *AccessEntry) {
+	a.tokenStore.Delete(token)
+	a.revIndex.remove(token, entry)
+}
+
 // GenerateAccessToken creates a new access token for the given entry. The
 // token is opaque random bytes (see common.GenerateOpaqueToken) — not a hash
 // of metadata. This closes nhp#1124: the prior SHA-256-over-public-inputs
@@ -205,7 +228,7 @@ func (a *UdpAC) GenerateAccessToken(entry *AccessEntry) string {
 	now := time.Now()
 	entry.FirstKnockTime = now
 	entry.ExpireTime = now.Add(time.Duration(entry.OpenTime+accessTokenLatePacketBufferSeconds) * time.Second)
-	a.tokenStore.Store(token, entry)
+	a.storeToken(token, entry)
 	return token
 }
 
@@ -345,7 +368,12 @@ func (a *UdpAC) emitOrCleanupPreMintedToken(artMsg *common.ACOpsResultMsg, token
 	// either would model the wrong self-filter mechanism. Tracked
 	// in cr round 21.
 	a.cancelAllScheduledFlows(entry)
-	a.tokenStore.Delete(token)
+	// deleteToken (Delete + revIndex deindex) preserves the documented
+	// cancel-first ordering above: it does NOT itself cancel, so
+	// cancelAllScheduledFlows still runs first. The deindex keeps the P4b
+	// revocation index from retaining a token whose entry just failed
+	// admission (a no-op for legacy / non-qURL-v2 entries).
+	a.deleteToken(token, entry)
 }
 
 // VerifyAccessToken validates a token and extends its expiry time if
@@ -389,6 +417,9 @@ func (a *UdpAC) VerifyAccessToken(token string) *AccessEntry {
 		newExpire = deadline
 	}
 	entry.ExpireTime = newExpire
-	a.tokenStore.Store(token, entry)
+	// Re-store through storeToken so the revocation index stays consistent.
+	// add is idempotent: the entry was already indexed at admission, so a
+	// refresh re-store is a no-op on the index side (same token, same keys).
+	a.storeToken(token, entry)
 	return entry
 }

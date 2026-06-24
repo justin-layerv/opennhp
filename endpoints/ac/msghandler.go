@@ -127,7 +127,11 @@ func (a *UdpAC) admitAndIssueToken(entry *AccessEntry, openTimeSec int, artMsgIn
 	defer func() {
 		if !cleaned {
 			a.cancelAllScheduledFlows(entry)
-			a.tokenStore.Delete(preMintedToken)
+			// deleteToken (Delete + revIndex deindex) preserves the
+			// cancel-first order; GenerateAccessToken indexed the entry via
+			// storeToken, so this panic-cleanup path must deindex too. No-op
+			// on the index for legacy / non-qURL-v2 entries.
+			a.deleteToken(preMintedToken, entry)
 		}
 	}()
 	artMsg, err = a.HandleAccessControl(entry, openTimeSec, artMsgIn)

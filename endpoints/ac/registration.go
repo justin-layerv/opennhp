@@ -465,6 +465,27 @@ const (
 	// to a dashboard alert before L3FlushDryRun=false rollout
 	// (#2189 tracks the terraform side).
 	MetricL3FlushScheduleWaitTimeout = "L3FlushScheduleWaitTimeout"
+
+	// qURL v2 immediate-revocation metrics (P4b). The revocation apply
+	// primitive (ApplyRevocation) reuses the L3 flush scheduler, so these sit
+	// alongside the L3Flush counters.
+	//
+	//   - MetricRevocationStaleDropped — a revoke event whose epoch was <= the
+	//     last applied epoch for its (scope, scope_key); dropped as a stale /
+	//     duplicate per the at-least-once + idempotency contract (mirrors P4d).
+	//     A nonzero rate is expected and benign under at-least-once delivery;
+	//     a SPIKE can indicate event-bus replay or a producer-side epoch bug.
+	//   - MetricRevocationEntriesFlushed — count of tokenStore AccessEntries
+	//     torn down by revocation (the revocation analog of an admission
+	//     count). Drives the revocation-delivery / flush-completion proof the
+	//     design requires.
+	//   - MetricRevocationFlushScheduled — incremented once per entry whose
+	//     tracked FlowKeys were rescheduled to fire now. Distinguishes "entry
+	//     had live L3 flows we forced down" from "entry had no scheduled flows"
+	//     (e.g. scheduler disabled), which Flushed alone cannot.
+	MetricRevocationStaleDropped   = "RevocationStaleDropped"
+	MetricRevocationEntriesFlushed = "RevocationEntriesFlushed"
+	MetricRevocationFlushScheduled = "RevocationFlushScheduled"
 )
 
 // Re-registration reason constants. These are the only values that

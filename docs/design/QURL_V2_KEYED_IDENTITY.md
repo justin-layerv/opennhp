@@ -739,6 +739,17 @@ the shared `FlowKey`, which may interrupt other sessions from the same source to
 the same destination. qurl-service/NHP/L7 then prevent the revoked qURL from
 re-opening. This preserves confidentiality but may have availability collateral.
 
+The same network-shaped `FlowKey` produces a symmetric **under-flush** race in
+the P4b apply primitive (`ApplyRevocation`). It pulls the shared key's deadline
+to now and then removes the revoked entry from the token store; in that window a
+concurrent natural expiry of a sibling holding the same `FlowKey` can re-derive
+the key's deadline from a token-store snapshot that still lists the revoked
+entry and push the deadline back (longest-wins `Schedule`), leaving the revoked
+flow alive to natural expiry. This is non-urgent (no production caller until the
+P4e receive path; microsecond window) and is closed by the same per-session
+kernel discriminator below — both the over-flush and under-flush directions
+dissolve once revoke is surgical. Tracked in #2784.
+
 Because the product requires "kill exactly this qURL and preserve every other
 holder of the same src/dst tuple," AC needs a new kernel-visible discriminator
 before we can make that claim: for example BPF flow metadata or another

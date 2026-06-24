@@ -54,6 +54,16 @@ type UdpAC struct {
 
 	tokenStore *common.TokenStore[*AccessEntry]
 
+	// revIndex is the qURL v2 secondary revocation index (P4b): reverse
+	// lookups from a revocation key (qurl_user_public_key_hash /
+	// resource_public_key_hash / session_id / admission_id) to the tokenStore
+	// tokens whose AccessEntry carries it, plus the per-(scope,key) applied-
+	// epoch watermark for idempotency. Maintained by storeToken/deleteToken and
+	// the OnExpire hook so it tracks tokenStore membership; driven by
+	// ApplyRevocation. Constructed in Start alongside tokenStore. See
+	// revocation_index.go and docs/design/QURL_V2_KEYED_IDENTITY.md.
+	revIndex *revocationIndex
+
 	// aopReplay dedupes recently observed NHP_AOP packets by
 	// (sender_pubkey, txid, send_time) so a captured-and-replayed
 	// packet cannot re-open ipset entries on a fresh connection.
@@ -203,6 +213,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	// ServerPubKeyAllowlist entries and leave source 3 of the
 	// allowlist dead until the next config.toml touch (see #1239).
 	a.tokenStore = common.NewTokenStore[*AccessEntry]()
+	a.revIndex = newRevocationIndex()
 	// Registered BEFORE a.expirySched is constructed below. Safe
 	// for two reasons: (1) the hook closure captures `a` rather
 	// than the scheduler pointer, so it reads a.expirySched at
@@ -657,7 +668,12 @@ func (a *UdpAC) registerTempAccessFlushEntry(au *common.AgentUser, srcAddrs, dst
 // outside tokenStore.mu (see SetOnExpire godoc), so scheduler
 // shard locks taken inside are never held with tokenStore.mu.
 func (a *UdpAC) installExpiryHook() {
-	a.tokenStore.SetOnExpire(func(_ string, entry *AccessEntry) {
+	a.tokenStore.SetOnExpire(func(token string, entry *AccessEntry) {
+		// Deindex BEFORE the scheduler cancel so a concurrent
+		// ApplyRevocation snapshot taken after this point cannot include a
+		// token whose entry is already expiring. revIndex.remove is a no-op
+		// for legacy entries (no qURL v2 metadata) and nil-safe pre-Start.
+		a.revIndex.remove(token, entry)
 		a.cancelAllScheduledFlows(entry)
 	})
 }
@@ -900,6 +916,16 @@ func (a *UdpAC) latestOtherFirewallDeadline(candidates []*AccessEntry, self *Acc
 func (a *UdpAC) incrMetric(name string) {
 	if reg := a.registration; reg != nil {
 		reg.metrics.IncrCounter(name)
+	}
+}
+
+// addMetric adds value to an AC counter in one publish, the batched analog
+// of incrMetric. Same nil-discipline (nil registration / nil publisher are
+// no-ops). Used by the revocation apply path to report N entries flushed
+// without N separate IncrCounter calls.
+func (a *UdpAC) addMetric(name string, value uint64) {
+	if reg := a.registration; reg != nil {
+		reg.metrics.AddCounterWithDims(name, float64(value), nil)
 	}
 }
 
