@@ -62,7 +62,28 @@ RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ub
     iptables \
     ipset \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    # Pull libssl3t64 + openssl-provider-legacy explicitly so `install` upgrades
+    # them from the pinned base's 3.5.5-1ubuntu3 to >= 3.5.5-1ubuntu3.2, which
+    # fixes CVE-2026-45447 (openssl PKCS7_verify heap UAF, HIGH). We patch the
+    # package in this layer rather than bumping the base digest because the
+    # patched ubuntu:26.04 digest is still < the docker dep-age window
+    # (min_age_days=14); the apt layer is invisible to that check. Drop this once
+    # an age-compliant base digest ships the fix.
+    libssl3t64 \
+    openssl-provider-legacy \
+    # Fail the build loudly if the openssl upgrade didn't land (e.g. a stale
+    # mirror still serving 3.5.5-1ubuntu3) — otherwise the image would ship the
+    # CVE-2026-45447-vulnerable libssl while the build stays green.
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libssl3t64)" ge 3.5.5-1ubuntu3.2 \
+        || { echo "ERROR: libssl3t64 < 3.5.5-1ubuntu3.2 — CVE-2026-45447 not patched"; exit 1; } \
+    && rm -rf /var/lib/apt/lists/* \
+    # Drop Canonical's Pebble service manager (a stray Go binary the ubuntu
+    # base ships in /usr/bin/pebble). We never invoke it — our entrypoint is
+    # nhp-server — and it vendors an old golang.org/x/net + Go stdlib, so Trivy
+    # flags a cluster of HIGH CVEs against it (x/net CVE-2026-25680/25681/27136/
+    # 39821/42502/42506 + stdlib CVE-2026-27145; newer base digests add more).
+    # Removing the binary clears the whole gobinary scan target. See .trivyignore.
+    && rm -f /usr/bin/pebble && rm -rf /var/lib/pebble
 
 # Copy built binary
 COPY --from=builder /nhp-server/release/nhp-server /nhp-server

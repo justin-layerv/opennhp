@@ -85,7 +85,20 @@ RUN apt-get update && \
     clang \
     iptables \
     tcpdump \
-    && rm -rf /var/lib/apt/lists/*
+    # Upgrade libssl3t64 + openssl-provider-legacy to >= 3.5.5-1ubuntu3.2
+    # (fixes CVE-2026-45447). See Dockerfile.relay for the rationale (patched
+    # base digest is < the docker dep-age window, so we patch the package here).
+    libssl3t64 \
+    openssl-provider-legacy \
+    # Fail the build loudly if the openssl upgrade didn't land - this image is
+    # NOT Trivy-scanned in CI, so this assertion is its only CVE-2026-45447 guard.
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libssl3t64)" ge 3.5.5-1ubuntu3.2 \
+        || { echo "ERROR: libssl3t64 < 3.5.5-1ubuntu3.2 - CVE-2026-45447 not patched"; exit 1; } \
+    && rm -rf /var/lib/apt/lists/* \
+    # Drop Canonical's Pebble (unused stray Go binary the ubuntu base ships in
+    # /usr/bin/pebble) - it flags HIGH x/net + stdlib CVEs. See Dockerfile.relay
+    # and .trivyignore. (Not Trivy-scanned in CI today, kept consistent.)
+    && rm -f /usr/bin/pebble && rm -rf /var/lib/pebble
 
 # Set working directory
 WORKDIR /root/
