@@ -836,6 +836,19 @@ Delivery requirements:
   complete targeted event;
 - NHP MUST reject or safely upgrade an incomplete targeted event to cell-wide
   fanout rather than deliver to a known-partial AC subset;
+- `target_ac_ids` is matched on the NHP server by string equality against
+  `ACConn.ACId` (the AC's configured id) — the same identifier space qurl-service
+  records in a session's `admitted_ac_ids` and copies into `target_ac_ids`. This
+  is a cross-repo, string-equality contract with no shared schema: if either side
+  ever changes what it stores in that field (a pubkey hash, a DB row id, a
+  blue/green-suffixed id, a re-normalized form), targeted fanout silently matches
+  nothing and **fails open** (the missed `NHP_REV` leaves the AC entry to expire).
+  The server side (P4e Slice 2, nhp #2789) builds and unit-tests the targeted
+  path, but qurl-service emits **cell-wide only** until the P3c `admitted_ac_ids`
+  wiring lands; targeted fanout MUST NOT be enabled cross-repo until the
+  id-correspondence is verified end-to-end and a "targeted matched zero ACs"
+  observability guard exists. Tracked: nhp #2790. The incomplete-targeted reject
+  is the interim backstop;
 - bounded retry with dead-letter visibility;
 - AC ack recorded for operational proof;
 - a defined end-to-end revocation-latency SLO (e.g. p99 from revoke API to AC

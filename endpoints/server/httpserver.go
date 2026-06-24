@@ -793,6 +793,7 @@ func (hs *HttpServer) initRouter() {
 	nhpInternal.POST("/token/validate", hs.handleInternalTokenValidate)
 	nhpInternal.POST("/ac-revocations/sweep", hs.handleInternalACRevocationSweep)
 	nhpInternal.POST("/ac-revocations/sweep/:ac_id", hs.handleInternalACRevocationSweep)
+	nhpInternal.POST("/revocation", hs.handleInternalRevocation)
 
 	hs.initStorageRouter()
 

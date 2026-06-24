@@ -1474,16 +1474,7 @@ func (s *UdpServer) drainACConnections() {
 	}
 
 	// Snapshot connections under read lock — check before doing any work
-	s.acConnectionMapMutex.RLock()
-	totalConns := 0
-	for _, acConns := range s.acConnectionMap {
-		totalConns += len(acConns)
-	}
-	conns := make([]*ACConn, 0, totalConns)
-	for _, acConns := range s.acConnectionMap {
-		conns = append(conns, acConns...)
-	}
-	s.acConnectionMapMutex.RUnlock()
+	conns := s.snapshotAllACConnections()
 
 	if len(conns) == 0 {
 		return
@@ -1536,6 +1527,137 @@ func (s *UdpServer) drainACConnections() {
 	time.Sleep(drainFlushDelay)
 
 	log.Info("Shutdown: drained %d/%d AC connections", sent, len(conns))
+}
+
+// Revocation fanout mode wire strings. These mirror qurl-service's
+// revocation.FanoutMode constants byte-for-byte (internal/revocation/event.go:
+// FanoutTargeted / FanoutCellWide) so the server selects the AC set without a
+// translation table. Keep them stable; they are part of the cross-repo wire
+// contract.
+const (
+	// revocationFanoutTargeted delivers only to the ACs whose ACId is in the
+	// event's target_ac_ids. Honored ONLY when target_set_complete=true (the
+	// handler rejects an incomplete targeted event before reaching fanout).
+	revocationFanoutTargeted = "targeted"
+	// revocationFanoutCellWide delivers to every connected AC. It is the safe
+	// fallback qurl-service emits whenever the admitted-AC set cannot be proven
+	// complete (and the only mode qurl-service emits until the P3c admitted-AC
+	// wiring lands).
+	revocationFanoutCellWide = "cell-wide"
+)
+
+// snapshotAllACConnections returns every live AC connection (all acIds, all
+// blue/green slots per acId) as a flat slice, taken under acConnectionMapMutex.
+// RLock. The returned *ACConn pointers are read lock-free by callers; the slice
+// itself is a fresh copy so iterating it never races a concurrent map mutation.
+// This is the shared snapshot primitive behind the graceful-drain (NHP_ARD) and
+// cell-wide revocation (NHP_REV) fanouts — keep the lock-hold to this pure map
+// walk (no I/O, no send) so it never serializes the receive path.
+func (s *UdpServer) snapshotAllACConnections() []*ACConn {
+	s.acConnectionMapMutex.RLock()
+	defer s.acConnectionMapMutex.RUnlock()
+	totalConns := 0
+	for _, acConns := range s.acConnectionMap {
+		totalConns += len(acConns)
+	}
+	conns := make([]*ACConn, 0, totalConns)
+	for _, acConns := range s.acConnectionMap {
+		conns = append(conns, acConns...)
+	}
+	return conns
+}
+
+// findACConnectionsForRevocation snapshots the AC connection map and returns
+// the ACConn entries an NHP_REV fanout should target, selected purely by
+// fanoutMode (orthogonal to the revocation scope — a resource-scoped revoke can
+// ship cell-wide):
+//
+//   - cell-wide: every connected AC connection (all colors / all blue-green
+//     slots), via snapshotAllACConnections (the same snapshot the NHP_ARD drain
+//     uses).
+//   - targeted: only connections whose ACId is in targetACIDs. ACConn.ACId is
+//     the AC's configured id string, the SAME identifier space qurl-service
+//     records in a session's admitted_ac_ids and copies into target_ac_ids
+//     (verified cross-repo); an empty targetACIDs therefore matches nothing.
+//
+// The returned slice holds *ACConn pointers the caller reads lock-free.
+// fanoutMode is assumed pre-validated by the handler (revocationFanoutTargeted /
+// revocationFanoutCellWide); any other value selects nothing (defensive — the
+// handler rejects unknown modes with 400 before calling this).
+//
+// An empty result is a legitimate success case (cell-wide with no connected
+// ACs, or targeted with no matching ACId on this server): there is simply
+// nothing to flush here. The caller treats it as "nothing to do," not an error.
+func (s *UdpServer) findACConnectionsForRevocation(fanoutMode string, targetACIDs []string) []*ACConn {
+	switch fanoutMode {
+	case revocationFanoutCellWide:
+		return s.snapshotAllACConnections()
+	case revocationFanoutTargeted:
+		// Build the targeted-id lookup outside the lock to keep the critical
+		// section to a pure map walk; index by ACId so we resolve each wanted
+		// id to its connection slice rather than scanning every connection.
+		wanted := make(map[string]struct{}, len(targetACIDs))
+		for _, id := range targetACIDs {
+			wanted[id] = struct{}{}
+		}
+		s.acConnectionMapMutex.RLock()
+		defer s.acConnectionMapMutex.RUnlock()
+		conns := make([]*ACConn, 0, len(wanted))
+		for id := range wanted {
+			conns = append(conns, s.acConnectionMap[id]...)
+		}
+		return conns
+	default:
+		return nil
+	}
+}
+
+// fanoutRevocation pushes an NHP_REV carrying revBytes (a marshaled
+// common.ACRevocationMsg) to each AC connection fire-and-forget, mirroring
+// drainACConnections' per-connection MsgData construction. revBytes is marshaled
+// once by the caller and reused for every AC (the message is identical
+// per-connection; only the transport envelope — ConnData, PeerPk, cipher,
+// counter — differs).
+//
+// Backpressure is fail-CLOSED: the send is a non-blocking enqueue onto the
+// shared sendMsgCh, and if any AC's enqueue would block (queue full) the method
+// stops and returns ok=false so the handler can answer 503 and let
+// qurl-service's at-least-once Publisher retry the whole event. This is safe
+// despite a possible partial fanout (some ACs already enqueued before the full
+// queue) because NHP_REV apply is epoch-idempotent on the AC (Slice 1 watermark:
+// a re-delivered event at the same revocation_epoch is a no-op), so the retry
+// re-sending to already-served ACs causes no double-teardown. The alternative —
+// silently dropping — would lose the revocation with no retry signal (fail-open).
+//
+// conns may be empty (cell-wide with no connected ACs / targeted with no match
+// here); that returns sent=0, ok=true (nothing to do is success, not 503).
+func (s *UdpServer) fanoutRevocation(conns []*ACConn, revBytes []byte) (sent int, ok bool) {
+	for _, conn := range conns {
+		md := &core.MsgData{
+			ConnData:      conn.ConnData,
+			HeaderType:    core.NHP_REV,
+			CipherScheme:  conn.ACCipherScheme,
+			TransactionId: s.device.NextCounterIndex(),
+			Compress:      true,
+			PeerPk:        conn.ACPeer.PublicKey(),
+			Message:       revBytes,
+			// No ResponseMsgCh — fire-and-forget (server→AC push, like NHP_ARD).
+		}
+		select {
+		case s.sendMsgCh <- md:
+			sent++
+		default:
+			// Fail closed: report backpressure so the caller returns 503 and
+			// the producer retries, rather than dropping this (and any
+			// remaining) AC's revocation.
+			if s.metrics != nil {
+				s.metrics.IncrCounter(MetricRevocationFanoutBackpressure)
+			}
+			log.Warning("revocation fanout: sendMsgCh full after %d/%d ACs; returning 503 for producer retry", sent, len(conns))
+			return sent, false
+		}
+	}
+	return sent, true
 }
 
 // Cloud Map registration self-healing tunables (issue #1681). Boot retry +

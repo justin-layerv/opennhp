@@ -336,6 +336,21 @@ const (
 	MetricACRegistrationLatency = "ACRegistrationLatency"
 	MetricBroadcastPartialFail  = "BroadcastPartialFail"
 	MetricBroadcastDurationMs   = "BroadcastDurationMs"
+	// qURL v2 revocation fanout telemetry (P4e). The server receives a
+	// revocation event from qurl-service on /nhp/internal/revocation and pushes
+	// NHP_REV to the matching connected ACs fire-and-forget.
+	//
+	// MetricRevocationReceived counts events that pass the request-auth gate and
+	// validation (one per accepted POST, before fanout). MetricRevocationFanoutSent
+	// is the per-event count of ACs an NHP_REV was enqueued for (0 on a
+	// no-matching-AC no-op). MetricRevocationFanoutBackpressure fires when the
+	// shared send queue is full mid-fanout and the handler fails closed with 503
+	// so qurl-service's at-least-once Publisher retries; a nonzero value means
+	// the send pipeline is saturated and revocations are being deferred (page if
+	// sustained — a revoke is security-relevant and the retry budget is finite).
+	MetricRevocationReceived           = "RevocationReceived"
+	MetricRevocationFanoutSent         = "RevocationFanoutSent"
+	MetricRevocationFanoutBackpressure = "RevocationFanoutBackpressure"
 	// QURL plugin resolve telemetry. The qurl plugin orchestrates the
 	// browser-side qurl.link → qurl.site redirect — token validate via
 	// qurl-service, NHP knock to AC, JWT cookie set, 302 redirect — and
