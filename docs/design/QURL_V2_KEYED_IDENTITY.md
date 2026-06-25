@@ -768,11 +768,34 @@ surface remains to be built, and it must match these entries by their
 kernel-keyed (NAT'd) `FlowKey`, not by `SrcAddrs` (the AOL-declared IP), since
 the two deliberately diverge for NAT'd temp access.
 
-Filter-mode/IPv6 caveat: the current conntrack flusher is IPv4-only, and
-established-flow teardown differs by filter mode (iptables conntrack delete vs
-eBPF/XDP map delete). Immediate revocation of IPv6 established flows must either be
-confirmed reachable in the eBPF/XDP path or be declared out of scope for the
-iptables path.
+Filter-mode/IPv6 caveat — DECLARED DISPOSITION (#2778/#2794): immediate
+revocation of IPv6 established flows is **OUT OF SCOPE in BOTH filter modes**
+today; a revoked v6 flow is not torn down immediately and dies only at its
+kernel TTL. Established-flow teardown is IPv4-only in each mode:
+
+- **iptables (`FilterMode_IPTABLES`)**: the `ConntrackFlusher` shells
+  `conntrack -D` with no `-f ipv6`, so it rejects a v6 key at its boundary and
+  tears nothing down. The v6-capable netlink (CTA_FILTER) replacement is **#2165
+  (unbuilt)** — there is no netlink flusher today, despite earlier comments that
+  claimed otherwise.
+- **eBPF/XDP (`FilterMode_EBPFXDP`)**: `conn_track` (struct `ipv4_ct_tuple`) and
+  the allow-rule maps are IPv4-only, so the surgical FlushConn path cannot
+  address a v6 flow.
+
+This gap is **surfaced, not silently swallowed**: `(*UdpAC).flushEntryNow` ticks
+the dedicated `MetricRevocationIPv6HardFail` for every v6 key in *either* mode
+(eBPF via `surgicalFlushFlowKey`, iptables via its explicit `FilterMode_IPTABLES`
+branch), distinct from the benign per-flusher skip counters
+(`BpfFlusherSkippedCount` / `ConntrackFlusher` `metricSkipped`) that track
+scheduled-expiry v6 leaks. ANY nonzero reading is a real immediate-revocation
+gap to alarm on. Closing the gap requires #2165 (iptables netlink, partial-tuple
+v6 delete) and a v6 conntrack/allow-rule representation on the eBPF path; until
+then v6 immediate revoke is intentionally bounded by kernel TTL, not enforced.
+
+Note this is a teardown-of-*established*-flows gap only: the coarse allow-rule
+reschedule still runs for v6 (barring re-open), and the entry is removed from the
+token store so a refresh / re-knock cannot extend it — the established flow's
+residual lifetime is the exposure.
 
 Backpressure rule:
 

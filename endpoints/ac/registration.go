@@ -498,15 +498,22 @@ const (
 	//     individually so same-allow-tuple siblings survive. A zero count while
 	//     EntriesFlushed is nonzero means the revoked entries had no live
 	//     established flows (only quiet/new pinholes) — expected, not an error.
-	//   - MetricRevocationIPv6HardFail — incremented once per IPv6 FlowKey that
-	//     reached the eBPF/XDP surgical revocation path and could NOT be
-	//     surgically torn down: conn_track is IPv4-only (struct ipv4_ct_tuple),
-	//     and the eBPF allow-rule maps are v4-only too, so a v6 flow under
-	//     EBPFXDP survives a revoke until kernel TTL. ANY nonzero reading is a
-	//     real immediate-revocation gap worth alarming on (#2778) — it is NOT
-	//     the benign skip-counter BpfFlusherSkippedCount tracks for scheduled
-	//     expiry. Scoped to EBPFXDP: iptables mode tears v6 down via the netlink
-	//     ConntrackFlusher and never ticks this.
+	//   - MetricRevocationIPv6HardFail — incremented once per IPv6 FlowKey a
+	//     revoke could NOT immediately tear down, in BOTH filter modes (#2794):
+	//     under EBPFXDP the surgical path can't address it (conn_track is
+	//     IPv4-only, struct ipv4_ct_tuple) and the eBPF allow-rule maps are
+	//     v4-only too; under FilterMode_IPTABLES the coarse reschedule hands the
+	//     v6 key to the `conntrack -D` flusher, which is IPv4-only (no
+	//     `-f ipv6`) and rejects it at its boundary (the netlink CTA_FILTER
+	//     replacement that would be v6-capable is #2165, UNbuilt). Either way the
+	//     v6 flow survives the revoke until kernel TTL — v6 immediate revoke is
+	//     a DECLARED out-of-scope gap (see the gospel Filter-mode/IPv6 caveat).
+	//     flushEntryNow ticks this directly (eBPF via surgicalFlushFlowKey,
+	//     iptables via its explicit FilterMode_IPTABLES branch) so the signal is
+	//     revocation-specific and NOT conflated with the benign per-flusher skip
+	//     counters (BpfFlusherSkippedCount / ConntrackFlusher metricSkipped) that
+	//     track scheduled-expiry v6 leaks. ANY nonzero reading is a real
+	//     immediate-revocation gap worth alarming on (#2778).
 	MetricRevocationStaleDropped    = "RevocationStaleDropped"
 	MetricRevocationEntriesFlushed  = "RevocationEntriesFlushed"
 	MetricRevocationFlushScheduled  = "RevocationFlushScheduled"

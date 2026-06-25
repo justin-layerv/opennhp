@@ -222,11 +222,14 @@ func TestFlushEntryNow_ICMPandAny_NoSurgicalNoHardFail(t *testing.T) {
 	}
 }
 
-// TestFlushEntryNow_CoarseOnlyWhenSurgicalUnwired proves the fallback: when the
-// surgical seam is NOT bound (iptables mode / non-Linux / L3 disabled in the
-// real Start(); surgicalConnFlush == nil here), flushEntryNow runs the coarse
-// allow-rule reschedule alone and never touches the surgical path or the v6
-// hard-fail metric — the pre-slice-5 behavior, preserved.
+// TestFlushEntryNow_CoarseOnlyWhenSurgicalUnwired proves the fallback for a v4
+// key: when the surgical seam is NOT bound (non-Linux / L3 disabled in the real
+// Start(); surgicalConnFlush == nil and config nil here), flushEntryNow runs the
+// coarse allow-rule reschedule alone and ticks no surgical accounting. The v6
+// hard-fail stays 0 because the key is v4 AND config is nil — NOT merely because
+// the surgical seam is unwired: a v6 key under FilterMode_IPTABLES with the
+// surgical seam unwired DOES hard-fail (#2794), which
+// revocation_iptables_v6_test.go covers.
 func TestFlushEntryNow_CoarseOnlyWhenSurgicalUnwired(t *testing.T) {
 	a, _ := newTestACWithScheduler(t) // leaves surgicalConnFlush + registration nil
 	a.registration = &ACRegistration{metrics: metrics.NewPublisherForTest(t)}
@@ -245,7 +248,7 @@ func TestFlushEntryNow_CoarseOnlyWhenSurgicalUnwired(t *testing.T) {
 		t.Errorf("%s = %v, want 0 when surgical seam is unwired", MetricRevocationSurgicalFlushed, got)
 	}
 	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
-		t.Errorf("%s = %v, want 0 when surgical seam is unwired", MetricRevocationIPv6HardFail, got)
+		t.Errorf("%s = %v, want 0 for a v4 key with nil config (no v6 gap, no iptables-mode attribution)", MetricRevocationIPv6HardFail, got)
 	}
 	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (coarse path runs)", MetricRevocationFlushScheduled, got)

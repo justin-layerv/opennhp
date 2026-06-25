@@ -403,13 +403,30 @@ func (a *UdpAC) ApplyRevocation(scope revocationScope, scopeKey string, epoch ui
 // barrier so a flow already being torn down isn't double-flushed) — the inverse
 // of /refresh-shorten, which wants the flow to survive to a peer's deadline.
 //
-// IPv6 (#2778): conn_track is IPv4-only (struct ipv4_ct_tuple uses __be32), so
-// a v6 admission under EBPFXDP has NO surgical immediate-teardown path — and the
-// coarse allow-rule maps are v4-only too, so the v6 flow only dies at kernel
-// TTL. surgicalFlushFlowKey ticks MetricRevocationIPv6HardFail for each such key
-// and does NOT treat the absence of a v6 conntrack entry as "killed". iptables
-// mode is unaffected (its ConntrackFlusher uses netlink, which IS v6-capable),
-// so the hard-fail is scoped to EBPFXDP via the surgicalConnFlush != nil gate.
+// IPv6 (#2778/#2794): a v6 immediate revoke has NO real teardown in EITHER mode,
+// so flushEntryNow ticks MetricRevocationIPv6HardFail (a revocation-specific
+// failure signal, NOT a benign skip) for every v6 key and the flow only dies at
+// kernel TTL:
+//
+//   - EBPFXDP: conn_track is IPv4-only (struct ipv4_ct_tuple uses __be32) so the
+//     surgical FlushConn path can't address it, and the coarse allow-rule maps
+//     are v4-only too. surgicalFlushFlowKey ticks the hard-fail per key and does
+//     NOT treat the absence of a v6 conntrack entry as "killed".
+//   - FilterMode_IPTABLES: the coarse RescheduleEarlier reschedules the v6 key
+//     into the ConntrackFlusher, whose Flush is `conntrack -D` IPv4-ONLY (no
+//     `-f ipv6`) — it rejects the v6 key at its boundary and ticks its own
+//     conflated metricSkipped ("benign expiry leak"), returning nil. That skip
+//     CANNOT distinguish "v6 revoke not torn down" from a benign expiry skip, so
+//     flushEntryNow ALSO ticks MetricRevocationIPv6HardFail directly here. The
+//     IPv4-only-netlink replacement is #2165 (UNbuilt); until it lands, v6
+//     immediate revoke under iptables is DECLARED OUT OF SCOPE (see the gospel
+//     "Filter-mode/IPv6 caveat" in docs/design/QURL_V2_KEYED_IDENTITY.md),
+//     surfaced — not silently swallowed — via this hard-fail metric.
+//
+// The hard-fail is therefore raised in BOTH modes: EBPFXDP via the surgical path
+// (surgicalConnFlush != nil), iptables via the explicit FilterMode_IPTABLES
+// branch below. Either way ANY nonzero reading is a real immediate-revocation
+// gap to alarm on, distinct from the benign expiry skip counters.
 func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 	if a.expirySched == nil || entry == nil {
 		return
@@ -427,14 +444,41 @@ func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 	if surgicalAvailable {
 		ctx = context.Background()
 	}
+	// iptables mode (ConntrackFlusher) when the eBPF surgical seam is unwired.
+	// Gate on FilterMode_IPTABLES explicitly rather than the bare !surgical
+	// else, whose job is to EXCLUDE the EBPFXDP path from this hard-fail (that
+	// path ticks the metric itself in surgicalFlushFlowKey). The other
+	// surgical-nil cases reach this branch but are already inert by construction:
+	// L3-flush-disabled schedules nothing (drainScheduledKeys returned empty →
+	// we early-returned above), and ConntrackFlusher is //go:build linux so an
+	// iptables-configured AC off-Linux can't wire L3 flush at all (same empty-
+	// keys return). Because FilterMode_IPTABLES is the iota-zero default, a
+	// partially-initialized non-nil config would also land here — harmless under
+	// that same empty-keys guard, but the reason it's safe is the empty-keys
+	// return, not the gate. config is non-nil for any real AC; the nil guard
+	// keeps the surgical-seam-injecting unit helpers (config nil but
+	// surgicalConnFlush set, so they never reach here) and the coarse-only v4
+	// fallback test nil-safe.
+	iptablesMode := a.config != nil && a.config.FilterMode == FilterMode_IPTABLES
 	for _, key := range keys {
 		// COARSE first: bar re-open in every mode. See godoc — additive, never
 		// gated by the surgical outcome.
 		a.expirySched.RescheduleEarlier(key, now)
-		// SURGICAL: kill established flows on this tuple without over-flushing
-		// siblings. Only when the eBPF/XDP+IPv4 path is wired.
-		if surgicalAvailable {
+		switch {
+		case surgicalAvailable:
+			// SURGICAL: kill established flows on this tuple without over-flushing
+			// siblings. Only when the eBPF/XDP+IPv4 path is wired. v6 keys hard-fail
+			// inside surgicalFlushFlowKey.
 			a.surgicalFlushFlowKey(ctx, key)
+		case iptablesMode && !isFlowKeyIPv4(key):
+			// v6 under iptables: the coarse RescheduleEarlier above just handed this
+			// key to the IPv4-only `conntrack -D` flusher, which rejects it at its
+			// boundary (conflated metricSkipped) and tears nothing down. Raise the
+			// revocation-specific hard-fail so the breaker/observability can tell
+			// "v6 revoke not torn down" apart from a benign expiry skip. Out of
+			// scope until #2165 netlink — see godoc + design doc. (#2778/#2794)
+			a.incrMetric(MetricRevocationIPv6HardFail)
+			log.Warning("[Revocation] IPv6 flow %s under iptables has no immediate conntrack teardown (conntrack -D is IPv4-only; netlink is #2165); flow will persist until kernel TTL (#2778/#2794)", key)
 		}
 	}
 	a.incrMetric(MetricRevocationFlushScheduled)
