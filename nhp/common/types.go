@@ -85,21 +85,29 @@ type ResourceData struct {
 	// signed-claims admission path (qurl plugin authWithNHPClaims), carried here
 	// from the admission decision down to the AOP builder, which stamps the
 	// matching ServerACOpsMsg fields so the AC can store them on the access/flow
-	// entry for immediate, targeted revocation. These three are empty for v1 /
+	// entry for immediate, targeted revocation. These are empty for v1 /
 	// feature-off admissions (they are not on the catalog row), so the AOP omits
 	// them (omitempty) and stays additive/wire-compatible for pre-v2 ACs.
 	// (ResourcePublicKeyHash above doubles as the resource revocation key and,
-	// unlike these three, can ride a catalog ResourceData for a v2-provisioned
-	// resource even on a non-v2 knock — see processACOperation.)
-	// session_id and revocation_epoch are intentionally NOT carried yet: the
-	// admission prepare contract does not return them, so they await a contract
-	// field and are populated in a later slice. See
+	// unlike the per-admission fields, can ride a catalog ResourceData for a
+	// v2-provisioned resource even on a non-v2 knock — see processACOperation.)
+	//
+	// SessionId is carried ONLY by the steady-state re-knock (authorize) path:
+	// the authorize response returns the matched live session, so the refresh
+	// stamps it here for the AC's session_id secondary index. The first-knock
+	// (prepare) path leaves it empty — prepare does not return a session id — so a
+	// freshly-admitted flow is indexed by qurl-user / resource hash only until its
+	// first re-knock refreshes it under the session key. revocation_epoch is still
+	// NOT carried: neither prepare nor authorize returns it, so it awaits a
+	// contract field and a later slice. See
 	// docs/design/QURL_V2_KEYED_IDENTITY.md → "AC Admission and Immediate Revocation".
 	//
 	//   QurlUserPublicKeyHash: lowercase hex SHA-256 of the DECODED qURL-user pubkey
+	//   SessionId:             qURL v2 session id (authorize/re-knock path only)
 	//   AdmissionId:           id of the admission decision that opened this access
 	//   Deadline:              unix seconds; admission validity deadline (claim exp)
 	QurlUserPublicKeyHash string `json:"qurlUserPublicKeyHash,omitempty"`
+	SessionId             string `json:"sessionId,omitempty"`
 	AdmissionId           string `json:"admissionId,omitempty"`
 	Deadline              int64  `json:"deadline,omitempty"`
 }

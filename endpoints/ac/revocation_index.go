@@ -71,9 +71,12 @@ type indexKey struct {
 
 // scopeKeysForEntry returns the (scope, scopeKey) pairs an AccessEntry should be
 // indexed under, derived from its P4a revocation metadata. Empty values are
-// skipped: legacy / non-qURL-v2 admissions carry no metadata (the AOP omits it),
-// and SessionId is empty until qurl-service #1010 starts returning it — so the
-// session index is a live seam that simply has no members yet, NOT dead code.
+// skipped: legacy / non-qURL-v2 admissions carry no metadata (the AOP omits it).
+// SessionId is populated only on the qURL v2 steady-state authorize (re-knock)
+// path — the first place a session id exists (prepare returns none); a
+// freshly-admitted flow has no session index member until its first re-knock
+// refreshes it under the session key. So the session index is a live seam that
+// is empty for first-knock-only flows, NOT dead code.
 func scopeKeysForEntry(entry *AccessEntry) []indexKey {
 	if entry == nil {
 		return nil

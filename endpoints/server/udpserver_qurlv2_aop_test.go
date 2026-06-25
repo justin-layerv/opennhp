@@ -28,11 +28,13 @@ import (
 // res -> AOP mapping directly (the same helper processACOperation and the
 // forward-path mock both call). Previously this mapping was only exercised
 // through a live AC round-trip, so a field-copy bug or a mock/prod drift could
-// slip through; this pins the four populated fields field-for-field.
+// slip through; this pins the populated fields field-for-field — including
+// session_id, which the steady-state authorize (re-knock) path carries.
 func TestStampQurlV2RevocationMetadata_FromResourceData(t *testing.T) {
 	res := &common.ResourceData{
 		QurlUserPublicKeyHash: "a1b2c3",
 		ResourcePublicKeyHash: "d4e5f6",
+		SessionId:             "sess_live_1",
 		AdmissionId:           "adm_test123",
 		Deadline:              1781910300,
 	}
@@ -46,16 +48,19 @@ func TestStampQurlV2RevocationMetadata_FromResourceData(t *testing.T) {
 	if aop.ResourcePublicKeyHash != "d4e5f6" {
 		t.Errorf("ResourcePublicKeyHash = %q, want %q", aop.ResourcePublicKeyHash, "d4e5f6")
 	}
+	if aop.SessionId != "sess_live_1" {
+		t.Errorf("SessionId = %q, want %q (carried on the authorize/re-knock path)", aop.SessionId, "sess_live_1")
+	}
 	if aop.AdmissionId != "adm_test123" {
 		t.Errorf("AdmissionId = %q, want %q", aop.AdmissionId, "adm_test123")
 	}
 	if aop.Deadline != 1781910300 {
 		t.Errorf("Deadline = %d, want %d", aop.Deadline, 1781910300)
 	}
-	// session_id / revocation_epoch are not carried from ResourceData by design
-	// (no field on ResourceData), so they must stay zero even via this stamp.
-	if aop.SessionId != "" || aop.RevocationEpoch != 0 {
-		t.Errorf("SessionId/RevocationEpoch must stay zero (not carried in P4a); got %q/%d", aop.SessionId, aop.RevocationEpoch)
+	// revocation_epoch is still not carried from ResourceData (no field on
+	// ResourceData; no admission response returns it), so it must stay zero.
+	if aop.RevocationEpoch != 0 {
+		t.Errorf("RevocationEpoch must stay zero (not carried yet); got %d", aop.RevocationEpoch)
 	}
 }
 

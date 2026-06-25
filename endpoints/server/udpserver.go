@@ -3610,26 +3610,30 @@ func (s *UdpServer) dedupeRecvART(ppd *core.PacketParserData) error {
 // qurl_user hash / admission_id / deadline on a ResourceData;
 // resource_public_key_hash can ride a catalog ResourceData for a v2-provisioned
 // resource even on a non-v2 knock (it is the resource revocation key).
-// session_id / revocation_epoch are not carried yet (the prepare contract does
-// not return them) and have no ResourceData field; they await a later contract +
-// slice.
+// session_id is carried only by the steady-state authorize (re-knock) path,
+// which is the first place a session id exists (prepare returns none); the
+// first-knock path leaves it empty. revocation_epoch is still not carried (no
+// admission response returns it) and has no ResourceData field; it awaits a
+// later contract + slice.
 //
-// INVARIANT (forward-safety): the per-admission trio (admission_id / deadline /
-// qurl_user hash) must ONLY ever originate from v2 admission, never from a
-// catalog/storage producer. Today that holds — buildV2ResourceData is the sole
-// writer of those three fields onto any ResourceData (no resource_lookup /
-// storage path sets them) — so stamping unconditionally from a non-nil res is
-// safe on the forward/http catalog paths (they leave the trio empty). If a
-// future change ever persists any of the trio onto a catalog row, a non-v2
-// forwarded knock would emit stale per-admission metadata; at that point this
-// stamp must gate the trio on v2-admission provenance. See #2774 (the forward
-// path is where a v2-fields-on-forward change would land).
+// INVARIANT (forward-safety): the per-admission fields (admission_id / deadline /
+// qurl_user hash / session_id) must ONLY ever originate from v2 admission, never
+// from a catalog/storage producer. Today that holds — buildV2ResourceData and
+// buildV2RefreshResourceData (the prepare and authorize paths) are the sole
+// writers of those fields onto any ResourceData (no resource_lookup / storage
+// path sets them) — so stamping unconditionally from a non-nil res is safe on the
+// forward/http catalog paths (they leave the fields empty). If a future change
+// ever persists any of them onto a catalog row, a non-v2 forwarded knock would
+// emit stale per-admission metadata; at that point this stamp must gate them on
+// v2-admission provenance. See #2774 (the forward path is where a v2-fields-on-
+// forward change would land).
 func stampQurlV2RevocationMetadata(aopMsg *common.ServerACOpsMsg, res *common.ResourceData) {
 	if aopMsg == nil || res == nil {
 		return
 	}
 	aopMsg.QurlUserPublicKeyHash = res.QurlUserPublicKeyHash
 	aopMsg.ResourcePublicKeyHash = res.ResourcePublicKeyHash
+	aopMsg.SessionId = res.SessionId
 	aopMsg.AdmissionId = res.AdmissionId
 	aopMsg.Deadline = res.Deadline
 }

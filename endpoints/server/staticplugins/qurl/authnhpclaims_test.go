@@ -139,26 +139,38 @@ func resourceKeyB64URL(t *testing.T) string {
 // ---- recording admission server ----
 
 // admissionRecorder is a fake qurl-service admission endpoint that records the
-// ORDER of prepare/commit/cancel calls so a test can assert commit-before-AC-open
-// and no-cancel-after-commit.
+// ORDER of authorize/prepare/commit/cancel calls so a test can assert the
+// authorize-first dispatch, commit-before-AC-open, and no-cancel-after-commit.
+//
+// By DEFAULT authorize returns 403 access_denied (ErrNoLiveSession), so the
+// recorder models a FIRST knock: authorize → fall through → prepare → commit →
+// open. A re-knock test overrides authorizeStatus/authorizeBody with a live-
+// session 200 (and typically sets prepareStatus to a consumed/revoked terminal so
+// a regression that wrongly routes the re-knock to prepare is caught).
 type admissionRecorder struct {
 	mu     sync.Mutex
 	calls  []string
 	server *httptest.Server
 
 	// configurable behavior
-	prepareStatus int
-	prepareBody   string
-	commitStatus  int
-	cancelStatus  int
+	authorizeStatus int
+	authorizeBody   string
+	prepareStatus   int
+	prepareBody     string
+	commitStatus    int
+	cancelStatus    int
 }
 
 func newAdmissionRecorder(t *testing.T, ac *ACRouting) *admissionRecorder {
 	t.Helper()
 	rec := &admissionRecorder{
-		prepareStatus: http.StatusOK,
-		commitStatus:  http.StatusOK,
-		cancelStatus:  http.StatusOK,
+		// Default: authorize denies (no live session) so the flow falls through to
+		// the first-knock prepare path. Re-knock tests override this.
+		authorizeStatus: http.StatusForbidden,
+		authorizeBody:   `{"success":false,"error":{"code":"access_denied"}}`,
+		prepareStatus:   http.StatusOK,
+		commitStatus:    http.StatusOK,
+		cancelStatus:    http.StatusOK,
 	}
 	body, _ := json.Marshal(internalAdmissionPrepareResponse{
 		Success: true,
@@ -172,6 +184,22 @@ func newAdmissionRecorder(t *testing.T, ac *ACRouting) *admissionRecorder {
 	})
 	rec.prepareBody = string(body)
 	return rec
+}
+
+// liveAuthorize configures the recorder so authorize returns a live session 200
+// (the steady-state re-knock case): remaining_seconds + the matched session id +
+// the AC routing to refresh. Used by the consumed-session-survives test.
+func (rec *admissionRecorder) liveAuthorize(sessionID string, remaining uint32, ac *ACRouting) {
+	body, _ := json.Marshal(internalAdmissionAuthorizeResponse{
+		Success: true,
+		Data: &AdmissionAuthorizeResponse{
+			SessionID:        sessionID,
+			RemainingSeconds: remaining,
+			ACRouting:        ac,
+		},
+	})
+	rec.authorizeStatus = http.StatusOK
+	rec.authorizeBody = string(body)
 }
 
 func (rec *admissionRecorder) record(op string) {
@@ -191,6 +219,11 @@ func (rec *admissionRecorder) callOrder() []string {
 func (rec *admissionRecorder) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.URL.Path == admissionAuthorizePath:
+			rec.record("authorize")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(rec.authorizeStatus)
+			_, _ = w.Write([]byte(rec.authorizeBody))
 		case r.URL.Path == admissionPreparePath:
 			rec.record("prepare")
 			w.Header().Set("Content-Type", "application/json")
@@ -329,10 +362,12 @@ func defaultACRouting() *ACRouting {
 
 // ---- tests ----
 
-// TestAuthWithNHPClaims_HappyPath_CommitBeforeACOpen is the load-bearing test:
-// on a fully-valid qv2 knock the admission calls prepare, THEN commit, THEN opens
-// the AC (in that order), and never calls cancel.
-func TestAuthWithNHPClaims_HappyPath_CommitBeforeACOpen(t *testing.T) {
+// TestAuthWithNHPClaims_FirstKnock_AuthorizeThenPrepareCommitBeforeACOpen is the
+// load-bearing first-knock test: a fully-valid qv2 knock with NO live session
+// calls authorize (which 403s — ErrNoLiveSession), falls through to prepare, THEN
+// commit, THEN opens the AC (in that order), and never calls cancel. The leading
+// authorize is the new steady-state gate; a first knock correctly falls through it.
+func TestAuthWithNHPClaims_FirstKnock_AuthorizeThenPrepareCommitBeforeACOpen(t *testing.T) {
 	f := newV2Fixture(t, nil)
 	enableV2(t, f.issuer.trustStore(t))
 
@@ -375,14 +410,14 @@ func TestAuthWithNHPClaims_HappyPath_CommitBeforeACOpen(t *testing.T) {
 		t.Errorf("ack.RedirectUrl = %q, want the prepare qurl_site_url", ack.RedirectUrl)
 	}
 
-	want := []string{"prepare", "commit", "ac_open"}
+	want := []string{"authorize", "prepare", "commit", "ac_open"}
 	got := rec.callOrder()
 	if len(got) != len(want) {
 		t.Fatalf("call order = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("call order = %v, want %v (commit MUST precede ac_open; cancel MUST NOT appear)", got, want)
+			t.Fatalf("call order = %v, want %v (authorize MUST precede prepare; commit MUST precede ac_open; cancel MUST NOT appear)", got, want)
 		}
 	}
 }
@@ -408,7 +443,7 @@ func TestAuthWithNHPClaims_CommitFailure_CancelsLease_NoACOpen(t *testing.T) {
 		t.Error("AC must NOT be opened when commit fails")
 	}
 	order := rec.callOrder()
-	want := []string{"prepare", "commit", "cancel"}
+	want := []string{"authorize", "prepare", "commit", "cancel"}
 	if len(order) != len(want) {
 		t.Fatalf("call order = %v, want %v", order, want)
 	}
@@ -442,9 +477,10 @@ func TestAuthWithNHPClaims_ACOpenFailureAfterCommit_NoCancel(t *testing.T) {
 		t.Error("AC open should have been attempted (after commit)")
 	}
 	order := rec.callOrder()
-	// prepare + commit must both have happened.
-	if len(order) < 2 || order[0] != "prepare" || order[1] != "commit" {
-		t.Fatalf("call order = %v, want prepare,commit before the failed open", order)
+	// authorize (fall-through) + prepare + commit must all have happened before
+	// the failed open.
+	if len(order) < 3 || order[0] != "authorize" || order[1] != "prepare" || order[2] != "commit" {
+		t.Fatalf("call order = %v, want authorize,prepare,commit before the failed open", order)
 	}
 	for _, c := range order {
 		if c == "cancel" {
@@ -484,6 +520,180 @@ func TestAuthWithNHPClaims_AdmissionDenied_NoCommit(t *testing.T) {
 		if c == "commit" || c == "ac_open" {
 			t.Errorf("unexpected call %q after a denied prepare", c)
 		}
+	}
+}
+
+// TestAuthWithNHPClaims_ConsumedReKnock_AuthorizeRefreshes_SessionSurvives is the
+// MAJOR-closing proof. A CONSUMED one-time-use qURL re-knocks: its session is
+// still live, so authorize returns 200 (the refresh) and the AC re-opens for the
+// session's remaining lifetime — the session SURVIVES. It is NOT routed to
+// prepare (which would 410 `consumed` and kill the still-live session at the first
+// OpenTime expiry — the exact MAJOR being closed).
+//
+// Non-vacuous BY CONSTRUCTION: prepare is wired to 410 `qurl_consumed`. The
+// correct authorize-first impl never touches it; a regression that routes a
+// consumed re-knock to prepare hits the 410 and the test fails (session denied,
+// no AC open, prepare recorded). The assertions pin: AC opened, OpenTime ==
+// authorize remaining_seconds, the AOP carries authorize's session_id, and prepare
+// was NEVER called.
+func TestAuthWithNHPClaims_ConsumedReKnock_AuthorizeRefreshes_SessionSurvives(t *testing.T) {
+	f := newV2Fixture(t, nil)
+	enableV2(t, f.issuer.trustStore(t))
+
+	refreshAC := &ACRouting{ACId: "ac-refresh-7", DestHost: "10.0.0.9", DestPort: 9443}
+	rec := newAdmissionRecorder(t, defaultACRouting())
+	// Live session -> authorize 200 refresh (remaining 120s, session sess_live_1).
+	rec.liveAuthorize("sess_live_1", 120, refreshAC)
+	// HOSTILE: prepare would 410 `consumed`. If the impl ever routes this consumed
+	// re-knock to prepare, it dies here — exactly the regression we are guarding.
+	rec.prepareStatus = http.StatusGone
+	rec.prepareBody = `{"success":false,"error":{"code":"qurl_consumed","message":"already consumed"}}`
+
+	var captured *common.ResourceData
+	helper := &plugins.NhpServerPluginHelper{
+		AspData:                testAspData(f.resourceB64, 60),
+		ServerCellPublicKeyB64: f.cellStdB64,
+		AuthWithNhpCallbackFunc: func(req *common.NhpAuthRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			captured = res
+			req.Ack.ErrCode = common.ErrSuccess.ErrorCode()
+			return req.Ack, nil
+		},
+	}
+	setRecordingResolver(t, rec)
+
+	ack, err := AuthWithNHP(f.req, helper)
+	if err != nil {
+		t.Fatalf("consumed re-knock must REFRESH (session survives), got error: %v", err)
+	}
+	if ack.ErrCode != common.ErrSuccess.ErrorCode() {
+		t.Errorf("ack.ErrCode = %q, want success (the live session refreshed)", ack.ErrCode)
+	}
+	if captured == nil {
+		t.Fatal("AC refresh callback never fired; the session was NOT refreshed (likely routed to prepare)")
+	}
+
+	// The refresh must open the AC authorize selected, for the session's remaining
+	// lifetime, and carry the session id into the AOP revocation metadata.
+	if _, ok := captured.Resources[refreshAC.ACId]; !ok {
+		t.Errorf("refreshed ResourceData missing authorize ac_routing %q; got %#v", refreshAC.ACId, captured.Resources)
+	}
+	if captured.OpenTime != 120 {
+		t.Errorf("OpenTime = %d, want 120 (clamped to authorize remaining_seconds)", captured.OpenTime)
+	}
+	if ack.OpenTime != 120 {
+		t.Errorf("ack.OpenTime = %d, want 120 (agent paces re-knock to the refreshed pinhole)", ack.OpenTime)
+	}
+	if captured.SessionId != "sess_live_1" {
+		t.Errorf("SessionId = %q, want sess_live_1 (authorize's matched session, stamped into the AOP)", captured.SessionId)
+	}
+	// A re-knock refresh does not re-navigate the browser.
+	if ack.RedirectUrl != "" {
+		t.Errorf("ack.RedirectUrl = %q, want empty on a re-knock refresh", ack.RedirectUrl)
+	}
+
+	// THE non-vacuity assertion: authorize alone admitted; prepare/commit/cancel
+	// were never called. If this fails with "prepare" present, the impl is routing
+	// consumed re-knocks to prepare and the MAJOR is reopened.
+	order := rec.callOrder()
+	if len(order) != 1 || order[0] != "authorize" {
+		t.Fatalf("call order = %v, want [authorize] only (a consumed re-knock must refresh via authorize, NOT prepare)", order)
+	}
+}
+
+// TestAuthWithNHPClaims_RevokedQurlReKnock_AuthorizeDenies_PrepareReDenies proves
+// the safe side of authorize's 403-conflation: when the qURL itself is revoked,
+// authorize finds no live session (403 -> fall through) AND prepare re-denies
+// (410 `qurl_revoked`), so the knock is terminally denied with no AC open. This is
+// the conflation working correctly — a genuinely-dead qURL that 403s on authorize
+// is caught by prepare's stronger qURL-state gate.
+func TestAuthWithNHPClaims_RevokedQurlReKnock_AuthorizeDenies_PrepareReDenies(t *testing.T) {
+	f := newV2Fixture(t, nil)
+	enableV2(t, f.issuer.trustStore(t))
+
+	rec := newAdmissionRecorder(t, defaultACRouting())
+	// authorize 403 (default: no live session) -> fall through to prepare.
+	// prepare re-denies: the qURL is revoked.
+	rec.prepareStatus = http.StatusGone
+	rec.prepareBody = `{"success":false,"error":{"code":"qurl_revoked","message":"revoked"}}`
+	setRecordingResolver(t, rec)
+
+	ack, err := AuthWithNHP(f.req, f.helper(nil))
+	if err == nil {
+		t.Fatal("a revoked qURL re-knock must be denied")
+	}
+	if ack.ErrCode != common.ErrQurlSessionExpired.ErrorCode() {
+		t.Errorf("ack.ErrCode = %q, want ErrQurlSessionExpired", ack.ErrCode)
+	}
+	if *f.openedCalled {
+		t.Error("no AC may open for a revoked qURL")
+	}
+	// authorize then prepare (the fall-through), then a terminal deny — no commit,
+	// no open.
+	order := rec.callOrder()
+	want := []string{"authorize", "prepare"}
+	if len(order) != len(want) || order[0] != want[0] || order[1] != want[1] {
+		t.Fatalf("call order = %v, want %v (authorize falls through, prepare re-denies)", order, want)
+	}
+}
+
+// TestAuthWithNHPClaims_AuthorizeTerminalDeny_NoFallthrough proves a TERMINAL
+// authorize denial (not the access_denied/no-session 403, but e.g. a structured
+// qurl_revoked code) denies immediately and does NOT fall through to prepare. Only
+// ErrNoLiveSession falls through; a provably-not-admissible authorize result is a
+// hard deny.
+func TestAuthWithNHPClaims_AuthorizeTerminalDeny_NoFallthrough(t *testing.T) {
+	f := newV2Fixture(t, nil)
+	enableV2(t, f.issuer.trustStore(t))
+
+	rec := newAdmissionRecorder(t, defaultACRouting())
+	rec.authorizeStatus = http.StatusGone
+	rec.authorizeBody = `{"success":false,"error":{"code":"qurl_revoked","message":"revoked"}}`
+	setRecordingResolver(t, rec)
+
+	ack, err := AuthWithNHP(f.req, f.helper(nil))
+	if err == nil {
+		t.Fatal("a terminal authorize deny must error")
+	}
+	if ack.ErrCode != common.ErrQurlSessionExpired.ErrorCode() {
+		t.Errorf("ack.ErrCode = %q, want ErrQurlSessionExpired", ack.ErrCode)
+	}
+	if *f.openedCalled {
+		t.Error("no AC may open on a terminal authorize deny")
+	}
+	order := rec.callOrder()
+	if len(order) != 1 || order[0] != "authorize" {
+		t.Fatalf("call order = %v, want [authorize] only (a terminal authorize deny must NOT fall through to prepare)", order)
+	}
+}
+
+// TestAuthWithNHPClaims_AuthorizeTransient_NoFallthrough proves the security-
+// critical no-fallthrough-on-transient rule: a 5xx/transport authorize failure
+// must NOT fall through to prepare. If it did, a consumed-but-live one-time-use
+// session would be re-denied at prepare's status gate on every transient blip —
+// reopening the MAJOR through the back door. The knock returns a retryable error
+// ack (the agent's next re-knock refreshes cleanly), and prepare is never called.
+func TestAuthWithNHPClaims_AuthorizeTransient_NoFallthrough(t *testing.T) {
+	f := newV2Fixture(t, nil)
+	enableV2(t, f.issuer.trustStore(t))
+
+	rec := newAdmissionRecorder(t, defaultACRouting())
+	rec.authorizeStatus = http.StatusInternalServerError
+	rec.authorizeBody = `{"success":false,"error":{"code":"internal_error"}}`
+	setRecordingResolver(t, rec)
+
+	ack, err := AuthWithNHP(f.req, f.helper(nil))
+	if err == nil {
+		t.Fatal("a transient authorize failure must surface a (retryable) error")
+	}
+	if ack.ErrCode != common.ErrKnockApiRequestFailed.ErrorCode() {
+		t.Errorf("ack.ErrCode = %q, want ErrKnockApiRequestFailed (retryable, not a hard deny)", ack.ErrCode)
+	}
+	if *f.openedCalled {
+		t.Error("no AC may open on a transient authorize failure")
+	}
+	order := rec.callOrder()
+	if len(order) != 1 || order[0] != "authorize" {
+		t.Fatalf("call order = %v, want [authorize] only (a transient authorize failure must NOT fall through to prepare — that would re-deny a consumed-but-live session)", order)
 	}
 }
 
@@ -663,6 +873,14 @@ func TestAuthWithNHPClaims_PrepareRequestShape(t *testing.T) {
 
 	var gotBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == admissionAuthorizePath {
+			// First knock: no live session -> 403 access_denied -> fall through to
+			// prepare (the path this test asserts the request shape of).
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"success":false,"error":{"code":"access_denied"}}`))
+			return
+		}
 		if r.URL.Path == admissionPreparePath {
 			_ = json.NewDecoder(r.Body).Decode(&gotBody)
 			if got := r.Header.Get(ServiceTokenHeader); got != "test-token" {
@@ -862,9 +1080,14 @@ func TestAuthWithNHPClaims_PopulatesRevocationMetadata(t *testing.T) {
 	if captured.Deadline != exp {
 		t.Errorf("Deadline = %d, want claim exp %d", captured.Deadline, exp)
 	}
-	// session_id and revocation_epoch are deferred and have NO field on
-	// ResourceData by design (the prepare contract does not return them), so the
-	// deferral is structurally enforced here, not just left unset.
+	// SessionId MUST be empty on the FIRST-KNOCK (prepare) path: prepare returns no
+	// session id, and only the steady-state authorize/refresh path carries one.
+	// This locks in that a first knock never leaks a session id into the AOP.
+	if captured.SessionId != "" {
+		t.Errorf("SessionId = %q, want empty on the first-knock (prepare) path", captured.SessionId)
+	}
+	// revocation_epoch is deferred and has NO field on ResourceData by design (no
+	// admission response returns it), so the deferral is structurally enforced.
 }
 
 // TestBuildV2ResourceData_HashError_FailsOpenAndCounts pins the deliberate

@@ -113,15 +113,71 @@ func authWithNHPClaims(req *common.NhpAuthRequest, helper *plugins.NhpServerPlug
 	// envelope and is verified — but there is nothing for admission to act on here.
 	// qurlv2.ValidateRelayURL exists for the client/issuer side, not this path.
 
-	// ---- Liveness/policy admission: prepare → commit → open AC ----
+	// ---- Steady-state re-knock gate: authorize-first, prepare-fallback ----
+	//
+	// The integrity boundary (checks 1-5) has passed, so the inner identity is
+	// proven. Now ask qurl-service's idempotent, SESSION-keyed authorize endpoint
+	// whether this is a steady-state re-knock with a still-live session
+	// (QURL_V2_KEYED_IDENTITY.md L643: "Steady-state re-knocks should call an
+	// idempotent authorize endpoint"). This is what closes the admission-audit
+	// MAJOR: a CONSUMED one-time-use qURL whose session is still live must REFRESH
+	// here instead of being re-denied by prepare's status-gated IsAdmissibleAt.
+	//
+	// The switch below maps the four authorize outcomes; two of those branches turn
+	// on non-obvious safety arguments worth stating once here:
+	//
+	//   - ONLY ErrNoLiveSession (403 access_denied) falls through to prepare. That
+	//     403 conflates a genuine FIRST knock with a revoked/expired session, but
+	//     the conflation is SAFE: a revoked/expired qURL that 403s here is then
+	//     re-denied by prepare (a strictly stronger gate on qURL state), while a
+	//     still-admissible first knock is correctly admitted by prepare.
+	//   - A transient/transport authorize failure (ErrAdmissionService) must NOT
+	//     fall through. Routing a transient blip to prepare would re-deny a
+	//     CONSUMED-but-live one-time-use session at the status gate — reopening the
+	//     exact MAJOR this path closes. A re-knock retries cleanly instead.
+	//
+	// authorize gets its own bounded context (the knock path has no inheritable
+	// request context); the fall-through prepare/commit each get a fresh one too.
+	requestID := uuid.NewString()
+
+	authzCtx, authzDone := context.WithTimeout(context.Background(), qurlAuthorizeTimeout)
+	authzResp, authzErr := resolver.AuthorizeAdmission(authzCtx, &AdmissionAuthorizeRequest{
+		AuthenticatedQurlPublicKeyB64: req.PublicKey,
+		ClientIP:                      clientIP,
+		// VisitorSessionID and ACID are intentionally empty: the browser knock path
+		// has no visitor-session id to present (authorize falls back to ClientIP
+		// matching), and we let authorize re-open the AC it already recorded for the
+		// winning session (ACID empty), which keeps the session's admitted-AC set
+		// complete without NHP picking a possibly-different AC here.
+		RequestID: requestID,
+	})
+	authzDone()
+	switch {
+	case authzErr == nil:
+		// Live session matched -> refresh the AC for its remaining lifetime.
+		return refreshV2Admission(req, helper, claims, authzResp, clientIP)
+	case errors.Is(authzErr, ErrNoLiveSession):
+		// Not a steady-state re-knock (no live session, OR no state row at all).
+		// Fall through to the first-knock prepare path. A revoked/expired qURL that
+		// lands here is correctly re-denied by prepare's stronger qURL-state gate.
+		log.Info("[QURL] authWithNHPClaims: no live session for re-knock client=%s; falling through to prepare", clientIP)
+	case errors.Is(authzErr, ErrAdmissionDenied):
+		log.Info("[QURL] authWithNHPClaims: authorize terminally denied client=%s: %v", clientIP, authzErr)
+		return failAck(ackMsg, common.ErrQurlSessionExpired, "qurl v2 admission denied")
+	default:
+		// Transient/transport authorize failure. Do NOT fall through to prepare —
+		// prepare's status gate would wrongly re-deny a consumed-but-live session.
+		log.Error("[QURL] authWithNHPClaims: authorize failed client=%s: %v", clientIP, authzErr)
+		return failAck(ackMsg, common.ErrKnockApiRequestFailed, common.ErrKnockApiRequestFailed.Error())
+	}
+
+	// ---- First-knock admission: prepare → commit → open AC ----
 	//
 	// prepare and commit each get their OWN bounded context (not one shared
 	// budget) so a slow prepare cannot starve commit's deadline — which would turn
 	// a healthy admission into a failed commit → cancel, and a re-knock into a
 	// lease-conflict deny. The cancel-on-commit-failure path uses its own fresh
 	// context too (see cancelPendingAdmission).
-
-	requestID := uuid.NewString()
 
 	prepCtx, prepDone := context.WithTimeout(context.Background(), qurlAuthorizeTimeout)
 	prepResp, prepErr := resolver.PrepareAdmission(prepCtx, &AdmissionPrepareRequest{
@@ -212,6 +268,147 @@ func authWithNHPClaims(req *common.NhpAuthRequest, helper *plugins.NhpServerPlug
 	return openedAck, nil
 }
 
+// refreshV2Admission is the steady-state re-knock path: a live session matched
+// authorize, so we re-open (refresh) the AC pinhole for the session's REMAINING
+// lifetime instead of re-minting via prepare/commit. There is NO prepare lease
+// and NO commit to undo here — authorize is idempotent and already recorded the
+// landing AC into the session's admitted set — so an AC-open failure is simply a
+// retryable error ack (the next re-knock refreshes again); there is nothing to
+// cancel. This is what keeps a CONSUMED one-time-use qURL's still-live session
+// alive across OpenTime expiries, closing the admission-audit MAJOR.
+//
+// authorize's response carries no OpenTime/QurlSiteURL (those are first-knock
+// concepts): the pinhole duration is remaining_seconds (validated > 0 by the
+// authorize client), and — exactly like the v1 tokenless re-knock — no
+// RedirectUrl is stamped (the browser already has the page; re-knocks only
+// refresh the pinhole). session_id (which prepare cannot return) flows from the
+// authorize response into the AOP revocation metadata here.
+func refreshV2Admission(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper, claims *qurlv2.Claims, authzResp *AdmissionAuthorizeResponse, clientIP string) (*common.ServerKnockAckMsg, error) {
+	ackMsg := req.Ack
+
+	incrCounter := func(name string) {
+		if helper.IncrCounter != nil {
+			helper.IncrCounter(name)
+		}
+	}
+	openRes := buildV2RefreshResourceData(authzResp, claims, incrCounter)
+	ackMsg.OpenTime = openRes.OpenTime
+
+	openedAck, openErr := helper.AuthWithNhpCallbackFunc(req, openRes)
+	if openErr != nil {
+		// Refresh AC-open failure. Unlike the first-knock commit path there is no
+		// durable lease/consume to reconcile (authorize did not consume anything), so
+		// this is a plain retryable error ack — the agent's next re-knock refreshes
+		// again. We prefer the callback's ack if it carries a specific AC error code.
+		log.Error("[QURL] refreshV2Admission: AC refresh open failed session=%s client=%s ac=%s: %v",
+			authzResp.SessionID, clientIP, authzResp.ACRouting.ACId, openErr)
+		if openedAck != nil {
+			return openedAck, openErr
+		}
+		return failAck(ackMsg, common.ErrKnockApiRequestFailed, "qurl v2 AC refresh open failed")
+	}
+
+	// Re-knock refresh: no RedirectUrl (the browser already navigated at bootstrap;
+	// this only refreshes the pinhole), mirroring the v1 tokenless re-knock path.
+	log.Info("[QURL] refreshV2Admission: refreshed session=%s client=%s ac=%s open_time=%d",
+		authzResp.SessionID, clientIP, authzResp.ACRouting.ACId, openRes.OpenTime)
+	return openedAck, nil
+}
+
+// buildV2RefreshResourceData maps an authorize (re-knock) response's ac_routing
+// into the ResourceData the AC-open callback consumes, mirroring
+// buildV2ResourceData but for the refresh path. Differences from the first-knock
+// builder:
+//
+//   - OpenTime is the session's remaining_seconds (authorize is the session-
+//     lifetime authority; there is no catalog ceiling in v2). The authorize client
+//     already rejects a 200 with remaining_seconds == 0, so OpenTime is > 0 here.
+//   - ResourceId is the authorize ac_routing's ac_id is NOT a qURL id; we have no
+//     qurl_id on the refresh response, so the pinhole ResourceGroup is keyed by the
+//     AC's ac_id. (The qURL/resource identity that matters for revocation rides the
+//     hashes below, not this group id.)
+//   - SessionId is set from the authorize response (the first slice where a
+//     session id exists); AdmissionId is empty (authorize records no new admission).
+//   - There is no RedirectUrl (re-knocks do not re-navigate).
+//
+// The two revocation key hashes are recomputed from the VERIFIED claim key bytes
+// via the shared revocationHashesFromClaims helper (same fail-open-but-observable
+// nil-claims / hash-error behavior as the first-knock buildV2ResourceData), so a
+// hash anomaly degrades targeted revocation to timer-wheel expiry rather than
+// tearing down a live session over revocation-INDEX metadata.
+func buildV2RefreshResourceData(resp *AdmissionAuthorizeResponse, claims *qurlv2.Claims, incrCounter func(string)) *common.ResourceData {
+	qurlUserKeyHash, resourceKeyHash, deadline := revocationHashesFromClaims(
+		claims, "session="+resp.SessionID, incrCounter)
+
+	return &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			// No qurl_id on the refresh response; key the pinhole group by the AC id.
+			// The revocation identity rides the hashes + session_id below.
+			ResourceId:    resp.ACRouting.ACId,
+			AuthServiceId: PluginID,
+			OpenTime:      resp.RemainingSeconds,
+			Resources: map[string]*common.ResourceInfo{
+				resp.ACRouting.ACId: {
+					ACId: resp.ACRouting.ACId,
+					Addr: &common.NetAddress{
+						Ip:   resp.ACRouting.DestHost,
+						Port: resp.ACRouting.DestPort,
+					},
+				},
+			},
+		},
+		// No RedirectUrl on a re-knock refresh.
+
+		// P4a revocation metadata. session_id is carried here (and ONLY here) — the
+		// authorize response is the first place it exists. admission_id stays empty
+		// (no new admission decision on a refresh).
+		QurlUserPublicKeyHash: qurlUserKeyHash,
+		ResourcePublicKeyHash: resourceKeyHash,
+		SessionId:             resp.SessionID,
+		Deadline:              deadline,
+	}
+}
+
+// revocationHashesFromClaims recomputes the two P4a revocation key hashes (and the
+// claim-exp deadline) from the VERIFIED claim key bytes, via the single canonical
+// hasher qurlv2.PublicKeyHashFromB64 — so the AC's P4b indexes key off exactly the
+// same digest. It is the shared core of buildV2ResourceData (first knock) and
+// buildV2RefreshResourceData (re-knock); logCtx is the caller's id label
+// ("admission=..." or "session=...") so the fail-open log lines stay attributable.
+//
+// Fail-open, but observable: claims is the post-VerifyClaims value at both call
+// sites, so claims == nil (or a key that no longer decodes after passing
+// proof-of-possession / resource-binding) is a documented invariant violation, not
+// an expected input. Rather than panic at this now-test-reachable seam or fail an
+// already-committed / already-authorized admission over revocation-INDEX metadata,
+// we return an EMPTY hash for the offending key and bump
+// MetricQurlV2RevocationHashError so the regression is alertable in aggregate. An
+// empty hash means the flow is invisible to P4b's targeted revocation (it degrades
+// to scheduled timer-wheel expiry only) — a security-relevant degradation, but a
+// strictly better outcome than tearing the flow down. incrCounter is the plugin's
+// nil-guarded helper.IncrCounter (no-op when unset, e.g. in unit tests); the
+// knock-path helper (NewNhpServerHelper) binds it, so this is live on the real v2
+// admission path.
+func revocationHashesFromClaims(claims *qurlv2.Claims, logCtx string, incrCounter func(string)) (qurlUserKeyHash, resourceKeyHash string, deadline int64) {
+	if claims == nil {
+		log.Error("[QURL] revocationHashesFromClaims: nil claims (invariant violation) %s; proceeding with empty revocation hashes", logCtx)
+		incrCounter(nhpserver.MetricQurlV2RevocationHashError)
+		return "", "", 0
+	}
+	var err error
+	qurlUserKeyHash, err = qurlv2.PublicKeyHashFromB64(claims.QurlUserPublicKeyB64)
+	if err != nil {
+		log.Error("[QURL] revocationHashesFromClaims: hashing qurl-user public key failed %s: %v", logCtx, err)
+		incrCounter(nhpserver.MetricQurlV2RevocationHashError)
+	}
+	resourceKeyHash, err = qurlv2.PublicKeyHashFromB64(claims.ResourcePublicKeyB64)
+	if err != nil {
+		log.Error("[QURL] revocationHashesFromClaims: hashing resource public key failed %s: %v", logCtx, err)
+		incrCounter(nhpserver.MetricQurlV2RevocationHashError)
+	}
+	return qurlUserKeyHash, resourceKeyHash, claims.Exp
+}
+
 // buildV2ResourceData maps the prepare response's selected ac_routing into the
 // ResourceData the AC-open callback consumes. NHP opens the AC named in
 // ac_routing (the contract: "NHP opens the AC named in that ac_routing"), so the
@@ -220,62 +417,18 @@ func authWithNHPClaims(req *common.NhpAuthRequest, helper *plugins.NhpServerPlug
 // resolves the live AC connection by ACId; dest host/port come from ac_routing.
 //
 // It also stamps the P4a revocation metadata onto the ResourceData so it flows
-// down to the AOP builder and on to the AC. The two key hashes are recomputed
-// here from the VERIFIED claim key bytes (not trusted from any stored value) via
-// the single canonical hasher qurlv2.PublicKeyHashFromB64, so the AC's eventual
-// P4b indexes key off exactly the same digest. claims is the verified Claims
-// returned by VerifyClaims earlier in authWithNHPClaims; the sole production
-// caller passes the post-VerifyClaims (non-nil) value. As a defensive guard at
-// this now-test-reachable seam, a nil claims is treated like a hash failure
-// (pinhole-only ResourceData with empty hashes + the same counter) rather than a
-// panic. The keys here have already passed proof-of-possession and
-// resource-binding; a hash error would
-// mean a key that decoded for the match checks no longer decodes, which should
-// not happen — we log and proceed with an empty hash rather than fail an
-// already-committed admission (the hash is revocation-index metadata, not an
-// admission gate).
-//
-// Deliberate fail-open, but observable: an empty hash means the admitted flow
-// is invisible to P4b's targeted revocation (it degrades to scheduled
-// timer-wheel expiry only), which is a security-relevant degradation. Failing
-// the admission closed here would be worse — it would tear down an
-// already-committed, one-time-use admission over revocation-INDEX metadata — so
-// we keep the flow but bump MetricQurlV2RevocationHashError so the regression is
-// alertable in aggregate rather than buried in one log line. incrCounter is the
-// plugin's nil-guarded helper.IncrCounter (no-op when unset, e.g. in unit
-// tests); the knock-path helper (NewNhpServerHelper) binds it, so this is live
-// on the real v2 admission path.
+// down to the AOP builder and on to the AC, via the shared
+// revocationHashesFromClaims helper (recompute from the VERIFIED claim bytes;
+// fail-open-but-observable on a nil-claims / hash anomaly — see that helper).
 //
 // session_id and revocation_epoch are intentionally left unset: the prepare
-// contract (AdmissionPrepareResponse) does not return them yet. They await a
-// contract field and a later slice; the AOP fields exist already and stay
-// omitted until then.
+// contract (AdmissionPrepareResponse) does not return them. The re-knock refresh
+// path (buildV2RefreshResourceData) carries session_id; revocation_epoch awaits a
+// contract field and a later slice. The AOP fields exist already and stay omitted
+// until then.
 func buildV2ResourceData(resp *AdmissionPrepareResponse, claims *qurlv2.Claims, incrCounter func(string)) *common.ResourceData {
-	var qurlUserKeyHash, resourceKeyHash string
-	var deadline int64
-	if claims == nil {
-		// Documented invariant violation (the sole production caller passes the
-		// post-VerifyClaims value). Treat it like a hash failure rather than
-		// panicking at a now-test-reachable seam: build the pinhole-only
-		// ResourceData (the AC still opens) with empty hashes, and make the
-		// anomaly observable on the same counter — an empty-hash flow is
-		// un-revocable-by-key either way.
-		log.Error("[QURL] buildV2ResourceData: nil claims (invariant violation) admission=%s; proceeding with empty revocation hashes", resp.AdmissionID)
-		incrCounter(nhpserver.MetricQurlV2RevocationHashError)
-	} else {
-		var err error
-		qurlUserKeyHash, err = qurlv2.PublicKeyHashFromB64(claims.QurlUserPublicKeyB64)
-		if err != nil {
-			log.Error("[QURL] buildV2ResourceData: hashing qurl-user public key failed admission=%s: %v", resp.AdmissionID, err)
-			incrCounter(nhpserver.MetricQurlV2RevocationHashError)
-		}
-		resourceKeyHash, err = qurlv2.PublicKeyHashFromB64(claims.ResourcePublicKeyB64)
-		if err != nil {
-			log.Error("[QURL] buildV2ResourceData: hashing resource public key failed admission=%s: %v", resp.AdmissionID, err)
-			incrCounter(nhpserver.MetricQurlV2RevocationHashError)
-		}
-		deadline = claims.Exp
-	}
+	qurlUserKeyHash, resourceKeyHash, deadline := revocationHashesFromClaims(
+		claims, "admission="+resp.AdmissionID, incrCounter)
 
 	return &common.ResourceData{
 		ResourceGroup: common.ResourceGroup{

@@ -35,6 +35,11 @@ import (
 const (
 	admissionPreparePath = "/internal/v2/qurl/admissions/prepare"
 
+	// admissionAuthorizePath is the steady-state re-knock endpoint. Unlike
+	// prepare/commit it has no admission id (it keys on the authenticated qURL
+	// user public key + session match facts), so it is a bare path, not a fmt.
+	admissionAuthorizePath = "/internal/v2/qurl/admissions/authorize"
+
 	// admissionCommitPathFmt / admissionCancelPathFmt take the admission id.
 	admissionCommitPathFmt = "/internal/v2/qurl/admissions/%s/commit"
 	admissionCancelPathFmt = "/internal/v2/qurl/admissions/%s/cancel"
@@ -54,6 +59,22 @@ var (
 	// ErrAdmissionInvalidResponse is a structurally invalid prepare 200 body
 	// (missing admission_id / ac_routing). Distinct from a clean denial.
 	ErrAdmissionInvalidResponse = errors.New("qurl v2 admission invalid response")
+	// ErrNoLiveSession is the authorize-specific "this is not a steady-state
+	// re-knock" signal: qurl-service authorize found no live session matching the
+	// authenticated qURL identity + client IP / visitor session (its
+	// domain.ErrAccessDenied → 403 access_denied). It is NOT a terminal denial:
+	// the qURL itself may still be admissible for a FIRST knock, so the caller
+	// falls through to prepare → commit. authorize folds state-not-found into the
+	// same 403, so a never-admitted identity also lands here and is correctly
+	// (re)tried via prepare, which re-runs the full admissibility gate.
+	//
+	// Distinct from ErrAdmissionDenied (the qURL is provably not admissible —
+	// consumed/expired/revoked/over-policy — so prepare would also deny and a
+	// re-resolve is required) and from ErrAdmissionService (transient transport /
+	// 5xx — retryable as-is). The flow MUST branch on this sentinel and NOT treat
+	// a 403 from authorize as a hard deny, or genuine first knocks would be
+	// rejected.
+	ErrNoLiveSession = errors.New("qurl v2 no live session for re-knock")
 )
 
 // AdmissionPrepareRequest is the NHP Server Contract prepare request body.
@@ -107,6 +128,112 @@ type internalAdmissionPrepareResponse struct {
 	Success bool                      `json:"success"`
 	Data    *AdmissionPrepareResponse `json:"data,omitempty"`
 	Error   *resolveError             `json:"error,omitempty"`
+}
+
+// AdmissionAuthorizeRequest is the NHP Server Contract authorize (steady-state
+// re-knock) request body. Per the gospel (QURL_V2_KEYED_IDENTITY.md → "Steady-
+// state re-knocks should call an idempotent authorize endpoint"), authorize keys
+// on resource + SESSION facts, NOT on qURL status — so a consumed one-time-use
+// qURL whose session is still live keeps re-knocking until its own lifetime ends.
+//
+// authorize does NOT re-verify the issuer signature or proof-of-possession: the
+// inner identity was bound once at admission. The integrity boundary therefore
+// lives in the CALLER (authWithNHPClaims runs sig + liveness + cell + PoP +
+// resource-binding BEFORE calling AuthorizeAdmission); the authenticated key
+// here is the already-verified Noise IK key, used only to resolve the session.
+type AdmissionAuthorizeRequest struct {
+	// AuthenticatedQurlPublicKeyB64 is the per-qURL user public key NHP
+	// authenticated from the Noise IK handshake (req.PublicKey). It resolves the
+	// state row + sessions; it is NOT re-verified here (admission bound it).
+	AuthenticatedQurlPublicKeyB64 string `json:"authenticated_qurl_public_key_b64"`
+	// ClientIP is the re-knock source IP. REQUIRED — an empty/unparseable IP is a
+	// fail-closed deny on the qurl-service side (the legacy/IP-bound match fact).
+	ClientIP string `json:"client_ip"`
+	// VisitorSessionID is the resolved visitor-session id when the consumer
+	// presents one (preferred match fact; lets a visitor roam IPs). Empty falls
+	// back to ClientIP matching.
+	VisitorSessionID string `json:"visitor_session_id,omitempty"`
+	// ACID is the AC this re-knock is landing on, when NHP selects a (possibly
+	// different) AC for the refresh. When set, authorize records it into the
+	// winning session's admitted set BEFORE returning, keeping the targeted-revoke
+	// set complete by construction. Empty means "re-open the AC already recorded".
+	ACID string `json:"ac_id,omitempty"`
+	// RequestID rides in the request-id HTTP header, not the JSON body.
+	RequestID string `json:"-"`
+}
+
+// AdmissionAuthorizeResponse is the NHP Server Contract authorize response. NHP
+// clamps the AC pinhole OpenTime to RemainingSeconds (the live session's
+// remaining L7 lifetime) before re-opening/refreshing the AC named in ACRouting.
+// SessionID is the matched live session — unlike prepare, authorize returns it,
+// so the refresh path can stamp it into the P4a revocation metadata.
+type AdmissionAuthorizeResponse struct {
+	SessionID        string     `json:"session_id"`
+	RemainingSeconds uint32     `json:"remaining_seconds"`
+	ACRouting        *ACRouting `json:"ac_routing"`
+}
+
+// internalAdmissionAuthorizeResponse is the success/error envelope qurl-service
+// wraps authorize in (same {success,data,error} shape as prepare).
+type internalAdmissionAuthorizeResponse struct {
+	Success bool                        `json:"success"`
+	Data    *AdmissionAuthorizeResponse `json:"data,omitempty"`
+	Error   *resolveError               `json:"error,omitempty"`
+}
+
+// AuthorizeAdmission calls the NHP Server Contract authorize endpoint for a
+// steady-state re-knock. It is status-INDEPENDENT (session-keyed) so a consumed
+// one-time-use qURL's still-live session refreshes instead of being denied at
+// prepare. The caller MUST have already run the full integrity boundary (sig +
+// PoP + cell + resource), because authorize trusts the authenticated key.
+//
+// Error contract:
+//   - nil + response: a live session matched; refresh the AC for RemainingSeconds.
+//   - ErrNoLiveSession: no live matching session (403 access_denied, incl. no
+//     state row). NOT terminal — the caller falls through to prepare → commit
+//     (this is how a genuine FIRST knock is admitted).
+//   - ErrAdmissionDenied: the qURL is provably not admissible by some other
+//     terminal code (defensive — authorize's only denial is access_denied today).
+//   - ErrAdmissionService / ErrAdmissionInvalidResponse: transient / malformed.
+func (r *QurlResolver) AuthorizeAdmission(ctx context.Context, req *AdmissionAuthorizeRequest) (*AdmissionAuthorizeResponse, error) {
+	if r.serviceToken == "" {
+		return nil, fmt.Errorf("%w: service token is empty", ErrAdmissionService)
+	}
+	if req == nil {
+		return nil, fmt.Errorf("%w: nil authorize request", ErrAdmissionService)
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: marshal authorize request: %w", ErrAdmissionService, err)
+	}
+
+	respBody, status, err := r.doAdmissionRequest(ctx, http.MethodPost, admissionAuthorizePath, body, req.RequestID)
+	if err != nil {
+		return nil, err
+	}
+
+	if status != http.StatusOK {
+		return nil, classifyAuthorizeStatus(status, respBody)
+	}
+
+	var env internalAdmissionAuthorizeResponse
+	if err := json.Unmarshal(respBody, &env); err != nil {
+		return nil, fmt.Errorf("%w: parse authorize response: %w", ErrAdmissionInvalidResponse, err)
+	}
+	if !env.Success || env.Error != nil {
+		if env.Error != nil {
+			return nil, classifyAuthorizeErrorCode(env.Error.Code)
+		}
+		return nil, ErrAdmissionService
+	}
+	if env.Data == nil {
+		return nil, fmt.Errorf("%w: authorize success with no data", ErrAdmissionInvalidResponse)
+	}
+	if err := validateAdmissionAuthorizeResponse(env.Data); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrAdmissionInvalidResponse, err.Error())
+	}
+	return env.Data, nil
 }
 
 // PrepareAdmission calls the NHP Server Contract prepare endpoint. It reserves
@@ -264,6 +391,82 @@ func classifyAdmissionErrorCode(code string) error {
 	default:
 		return ErrAdmissionService
 	}
+}
+
+// classifyAuthorizeStatus maps a non-200 authorize status to the re-knock flow's
+// three outcomes. It prefers the structured error body, falling back to status
+// codes for a bodiless response.
+//
+// The CRITICAL difference from classifyAdmissionStatus: a 403 (authorize's
+// access_denied — "no live matching session", which folds in no-state-row) is
+// NOT a terminal deny here. It is ErrNoLiveSession, the "this is a first knock,
+// fall through to prepare" signal. Treating it as ErrAdmissionDenied would
+// wrongly reject every genuine first knock. Other terminal 4xx (404/409/410)
+// remain terminal — though authorize's only real denial today is the 403.
+func classifyAuthorizeStatus(status int, body []byte) error {
+	var env internalAdmissionAuthorizeResponse
+	if err := json.Unmarshal(body, &env); err == nil && env.Error != nil {
+		return classifyAuthorizeErrorCode(env.Error.Code)
+	}
+	switch status {
+	case http.StatusForbidden:
+		// access_denied: no live session for this client. Fall through to prepare.
+		return ErrNoLiveSession
+	case http.StatusNotFound, http.StatusGone, http.StatusConflict:
+		// Defensive: authorize does not emit these today (no-state-row is folded
+		// into the 403), but if a future revision does, they are terminal denials.
+		return ErrAdmissionDenied
+	default:
+		return ErrAdmissionService
+	}
+}
+
+// classifyAuthorizeErrorCode maps a qurl-service authorize error code to the
+// re-knock flow's outcomes. access_denied → ErrNoLiveSession (fall through to
+// prepare); other terminal codes → ErrAdmissionDenied; everything else →
+// ErrAdmissionService.
+func classifyAuthorizeErrorCode(code string) error {
+	switch code {
+	case "access_denied":
+		// Authorize's sole denial: no live matching session (also covers
+		// no-state-row, which it folds into access_denied). NOT terminal — the
+		// qURL may still admit a first knock via prepare.
+		return ErrNoLiveSession
+	case "qurl_not_found", "resource_not_found", "qurl_revoked", "resource_revoked",
+		"qurl_consumed", "qurl_expired", "resource_expired",
+		"policy_violation", "max_sessions_reached":
+		// Defensive parity with the prepare vocabulary; authorize is not expected
+		// to return these, but if it does they are terminal.
+		return ErrAdmissionDenied
+	default:
+		return ErrAdmissionService
+	}
+}
+
+// validateAdmissionAuthorizeResponse checks the authorize 200 body carries the
+// fields NHP needs to refresh the AC pinhole: a positive remaining_seconds (the
+// session is live and bounds the OpenTime clamp) and AC routing with an ac_id
+// and destination. A zero remaining_seconds on a 200 is treated as malformed
+// (qurl-service returns access_denied, not a 200, for an expired session), so
+// this is a defensive structural guard, symmetric with the prepare validator's
+// open_time=0 reject.
+func validateAdmissionAuthorizeResponse(resp *AdmissionAuthorizeResponse) error {
+	if resp.RemainingSeconds == 0 {
+		return errors.New("authorize returned remaining_seconds=0 (would reset the agent open-timer)")
+	}
+	if resp.ACRouting == nil {
+		return errors.New("authorize returned no ac_routing")
+	}
+	if resp.ACRouting.ACId == "" {
+		return errors.New("authorize ac_routing has empty ac_id")
+	}
+	if resp.ACRouting.DestHost == "" {
+		return errors.New("authorize ac_routing has empty dest_host")
+	}
+	if resp.ACRouting.DestPort <= 0 || resp.ACRouting.DestPort > 65535 {
+		return fmt.Errorf("authorize ac_routing has invalid dest_port %d", resp.ACRouting.DestPort)
+	}
+	return nil
 }
 
 // validateAdmissionPrepareResponse checks the prepare 200 body carries the fields
