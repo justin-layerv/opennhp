@@ -520,6 +520,22 @@ const (
 	MetricRevocationRejected        = "RevocationRejected"
 	MetricRevocationSurgicalFlushed = "RevocationSurgicalFlushed"
 	MetricRevocationIPv6HardFail    = "RevocationIPv6HardFail"
+	// MetricRevocationAckSent counts NHP_RACK acks the AC enqueued to the server
+	// after processing a validated NHP_REV (proof-of-delivery, P4e Slice 3
+	// #2793). One per validated NHP_REV regardless of flush count (the ack is a
+	// convergence claim, not a work-done claim — see common.ACRevocationAckMsg).
+	// A reject path does NOT send an ack, so this counter trails
+	// MetricRevocationRejected: (received - rejected) ≈ acks sent. A sustained
+	// gap below that line means acks are failing to enqueue (a degraded
+	// AC→server path), which the server side surfaces as un-acked → aged-out.
+	MetricRevocationAckSent = "RevocationAckSent"
+	// MetricRevocationAckSendFailed counts NHP_RACK acks that could not be
+	// enqueued to the server (no usable connection on the inbound NHP_REV, or
+	// the AC is shutting down). A nonzero value means the AC applied/converged
+	// the revoke but could not prove it to the server, so the server will retry
+	// the NHP_REV until it acks or ages out — not a silent loss, but a signal
+	// the AC→server return path is impaired.
+	MetricRevocationAckSendFailed = "RevocationAckSendFailed"
 )
 
 // Re-registration reason constants. These are the only values that

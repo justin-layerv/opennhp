@@ -351,6 +351,26 @@ const (
 	MetricRevocationReceived           = "RevocationReceived"
 	MetricRevocationFanoutSent         = "RevocationFanoutSent"
 	MetricRevocationFanoutBackpressure = "RevocationFanoutBackpressure"
+	// MetricRevocationAckReceived counts NHP_RACK acks the server received from
+	// ACs (proof-of-delivery, P4e Slice 3 #2793), one per validated ack whose
+	// AC identity resolved from the authenticated connection pubkey. Pairs with
+	// the AC's MetricRevocationAckSent across the fleet.
+	MetricRevocationAckReceived = "RevocationAckReceived"
+	// MetricRevocationAckUnresolved counts NHP_RACK acks the server could not
+	// attribute to a known AC connection (the authenticated pubkey matched no
+	// live ACConn). A spike means acks are arriving from connections the server
+	// no longer tracks (a drop/reconnect race) — the ack is ignored (the pending
+	// tracker, once added, is keyed by the resolved acId), and the revoke either
+	// already cleared or will age out.
+	MetricRevocationAckUnresolved = "RevocationAckUnresolved"
+	// MetricRevocationAgedOut counts pending per-AC revokes the server gave up
+	// retrying because they were never acked before the age-out deadline — a
+	// revoke that could NOT be proven delivered. THIS IS THE DE-RISK #5
+	// DEGRADED SIGNAL: any nonzero value is an immediate-revocation that the
+	// control plane could not confirm reached the AC. It is emitted (never a
+	// silent drop) so it can be alarmed. Wired by the retry/age-out engine
+	// (deferred — see #2793 design).
+	MetricRevocationAgedOut = "RevocationAgedOut"
 	// QURL plugin resolve telemetry. The qurl plugin orchestrates the
 	// browser-side qurl.link → qurl.site redirect — token validate via
 	// qurl-service, NHP knock to AC, JWT cookie set, 302 redirect — and

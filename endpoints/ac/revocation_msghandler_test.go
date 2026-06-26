@@ -517,6 +517,211 @@ func TestHandleUdpACRevocation_AppliedEventDoesNotIncrementRejectMetric(t *testi
 	}
 }
 
+// ============================================================================
+// P4e Slice 3 (#2793): AC → server proof-of-delivery ack (NHP_RACK).
+// ============================================================================
+
+// serverPubKey32 is a fixed 32-byte non-zero pubkey standing in for the server's
+// authenticated pubkey on an inbound NHP_REV (ppd.RemotePubKey). The ack send
+// addresses this verbatim; the bytes only need to be the right length.
+func serverPubKey32() []byte {
+	pk := make([]byte, core.PublicKeySize)
+	for i := range pk {
+		pk[i] = byte(i + 1)
+	}
+	return pk
+}
+
+// revPPDWithConn builds an inbound-NHP_REV PacketParserData that the ack path can
+// reply on: a non-nil ConnData and an authenticated server pubkey. The ConnData
+// fields are otherwise empty — sendRevocationAck only enqueues onto a.sendMsgCh
+// (it does not drive the send machinery), so a zero-value ConnData suffices to
+// carry the reply envelope through the channel in a unit test.
+func revPPDWithConn(t *testing.T, msg common.ACRevocationMsg) *core.PacketParserData {
+	t.Helper()
+	ppd := revPPD(t, msg)
+	ppd.ConnData = &core.ConnectionData{}
+	ppd.RemotePubKey = serverPubKey32()
+	return ppd
+}
+
+// acWithSendCapture builds a UdpAC wired to actually send a revocation ack: a
+// real core.Device (for NextCounterIndex), a buffered sendMsgCh the test drains,
+// a metrics publisher, the revocation index, a scheduler, and running=true. It
+// returns the AC and the send channel.
+func acWithSendCapture(t *testing.T) (*UdpAC, chan *core.MsgData) {
+	t.Helper()
+	f := newRecordingFlusher()
+	sched := NewScheduler(f, WithTickInterval(2*time.Millisecond), WithWheelSize(256))
+	sched.Start()
+	t.Cleanup(func() { shutdownOrFail(t, sched) })
+
+	sendCh := make(chan *core.MsgData, 8)
+	a := &UdpAC{
+		config:       &Config{ACId: "test-ac", DefaultCipherScheme: 0},
+		device:       core.NewDevice(core.NHP_AC, testPrivateKey(), nil),
+		tokenStore:   common.NewTokenStore[*AccessEntry](),
+		revIndex:     newRevocationIndex(),
+		expirySched:  sched,
+		registration: &ACRegistration{metrics: metrics.NewPublisherForTest(t)},
+		sendMsgCh:    sendCh,
+	}
+	a.installExpiryHook()
+	a.running.Store(true)
+	return a, sendCh
+}
+
+// drainOneAck returns the single MsgData enqueued on sendCh, or fails if none /
+// more than one is present. Used to assert exactly one NHP_RACK was sent.
+func drainOneAck(t *testing.T, sendCh chan *core.MsgData) *core.MsgData {
+	t.Helper()
+	select {
+	case md := <-sendCh:
+		select {
+		case extra := <-sendCh:
+			t.Fatalf("expected exactly one enqueued message, got a second: type=%d", extra.HeaderType)
+		default:
+		}
+		return md
+	default:
+		t.Fatal("expected one enqueued NHP_RACK, got none")
+		return nil
+	}
+}
+
+// TestHandleUdpACRevocation_SendsAckOnAppliedEvent: a validated event that
+// flushes a live entry must enqueue exactly one NHP_RACK addressed to the
+// server's authenticated pubkey, echoing scope + scope_key VERBATIM (still
+// prefixed) + epoch + event_id, and tick MetricRevocationAckSent. This is the
+// headline proof-of-delivery property (#2793).
+func TestHandleUdpACRevocation_SendsAckOnAppliedEvent(t *testing.T) {
+	a, sendCh := acWithSendCapture(t)
+	a.GenerateAccessToken(qurlV2Entry("qAck", "rAck", "", "aAck"))
+
+	if err := a.HandleUdpACRevocation(revPPDWithConn(t, common.ACRevocationMsg{
+		Scope: "qurl", ScopeKey: "qurl:qAck", RevocationEpoch: 7, EventId: "evt-ack-1",
+	})); err != nil {
+		t.Fatalf("applied event err=%v", err)
+	}
+
+	md := drainOneAck(t, sendCh)
+	if md.HeaderType != core.NHP_RACK {
+		t.Fatalf("enqueued header type=%d, want NHP_RACK(%d)", md.HeaderType, core.NHP_RACK)
+	}
+	// Addressed to the server's authenticated pubkey from the inbound REV.
+	if string(md.PeerPk) != string(serverPubKey32()) {
+		t.Fatalf("ack PeerPk does not match the inbound server pubkey")
+	}
+	var got common.ACRevocationAckMsg
+	if err := json.Unmarshal(md.Message, &got); err != nil {
+		t.Fatalf("ack body not ACRevocationAckMsg JSON: %v", err)
+	}
+	// scope_key echoed VERBATIM (still prefixed) — NOT the bare "qAck".
+	want := common.ACRevocationAckMsg{Scope: "qurl", ScopeKey: "qurl:qAck", RevocationEpoch: 7, EventId: "evt-ack-1"}
+	if got != want {
+		t.Fatalf("ack body = %+v, want %+v", got, want)
+	}
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if c := counters[MetricRevocationAckSent]; c != 1 {
+		t.Fatalf("%s = %v, want 1", MetricRevocationAckSent, c)
+	}
+	if c := counters[MetricRevocationAckSendFailed]; c != 0 {
+		t.Fatalf("%s = %v, want 0", MetricRevocationAckSendFailed, c)
+	}
+}
+
+// TestHandleUdpACRevocation_SendsAckEvenWhenNothingFlushed is the CONVERGENCE
+// property (the load-bearing correctness point of #2793): an NHP_REV that flushes
+// nothing — the common cell-wide-fanout case where this AC never admitted the key
+// — must STILL ack. Without this, the server would retry to age-out and falsely
+// mark the revoke degraded. Proven non-vacuously: no live entry matches, nothing
+// is flushed, yet exactly one NHP_RACK is enqueued.
+func TestHandleUdpACRevocation_SendsAckEvenWhenNothingFlushed(t *testing.T) {
+	a, sendCh := acWithSendCapture(t)
+	// A live entry under a DIFFERENT key, so the revoke matches nothing.
+	a.GenerateAccessToken(qurlV2Entry("qOther", "rOther", "", "aOther"))
+
+	if err := a.HandleUdpACRevocation(revPPDWithConn(t, common.ACRevocationMsg{
+		Scope: "qurl", ScopeKey: "qurl:qNeverAdmitted", RevocationEpoch: 1, EventId: "evt-noflush",
+	})); err != nil {
+		t.Fatalf("no-match event err=%v", err)
+	}
+
+	md := drainOneAck(t, sendCh)
+	if md.HeaderType != core.NHP_RACK {
+		t.Fatalf("enqueued header type=%d, want NHP_RACK", md.HeaderType)
+	}
+	var got common.ACRevocationAckMsg
+	if err := json.Unmarshal(md.Message, &got); err != nil {
+		t.Fatalf("ack body not ACRevocationAckMsg JSON: %v", err)
+	}
+	if got.ScopeKey != "qurl:qNeverAdmitted" || got.RevocationEpoch != 1 {
+		t.Fatalf("ack body = %+v, want scope_key=qurl:qNeverAdmitted epoch=1", got)
+	}
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if c := counters[MetricRevocationAckSent]; c != 1 {
+		t.Fatalf("%s = %v, want 1 (convergence ack on a no-flush event)", MetricRevocationAckSent, c)
+	}
+}
+
+// TestHandleUdpACRevocation_NoAckOnRejectPath: a rejected event (here an
+// unsupported scope) must NOT enqueue an NHP_RACK — reject paths age out to the
+// server's degraded metric by design, surfacing server↔AC validation drift rather
+// than masking it. Proven non-vacuously: the send channel stays empty and
+// MetricRevocationAckSent is 0 while MetricRevocationRejected ticks.
+func TestHandleUdpACRevocation_NoAckOnRejectPath(t *testing.T) {
+	a, sendCh := acWithSendCapture(t)
+
+	if err := a.HandleUdpACRevocation(revPPDWithConn(t, common.ACRevocationMsg{
+		Scope: "admission", ScopeKey: "admission:x", RevocationEpoch: 1, EventId: "evt-reject",
+	})); err == nil {
+		t.Fatal("expected a reject error for scope=admission, got nil")
+	}
+
+	select {
+	case md := <-sendCh:
+		t.Fatalf("a rejected event enqueued an ack (type=%d) — reject paths must not ack", md.HeaderType)
+	default:
+	}
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if c := counters[MetricRevocationAckSent]; c != 0 {
+		t.Fatalf("%s = %v after a rejected event, want 0", MetricRevocationAckSent, c)
+	}
+	if c := counters[MetricRevocationRejected]; c != 1 {
+		t.Fatalf("%s = %v, want 1", MetricRevocationRejected, c)
+	}
+}
+
+// TestSendRevocationAck_NoConnIsCountedFailure: an applied event whose inbound
+// ppd has no usable connection/pubkey (a malformed-but-validated edge) must not
+// panic and must tick MetricRevocationAckSendFailed rather than silently
+// swallowing the missed ack. This is the branch the existing no-ConnData handler
+// tests exercise implicitly; here it is asserted directly.
+func TestSendRevocationAck_NoConnIsCountedFailure(t *testing.T) {
+	a, sendCh := acWithSendCapture(t)
+	a.GenerateAccessToken(qurlV2Entry("qNC", "rNC", "", "aNC"))
+
+	// revPPD (no ConnData / no RemotePubKey) — the apply still succeeds, but the
+	// ack cannot be sent.
+	if err := a.HandleUdpACRevocation(revPPD(t, common.ACRevocationMsg{
+		Scope: "qurl", ScopeKey: "qurl:qNC", RevocationEpoch: 1, EventId: "evt-nc",
+	})); err != nil {
+		t.Fatalf("applied event err=%v", err)
+	}
+	select {
+	case md := <-sendCh:
+		t.Fatalf("expected no enqueued ack without a connection, got type=%d", md.HeaderType)
+	default:
+	}
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if c := counters[MetricRevocationAckSendFailed]; c != 1 {
+		t.Fatalf("%s = %v, want 1", MetricRevocationAckSendFailed, c)
+	}
+	if c := counters[MetricRevocationAckSent]; c != 0 {
+		t.Fatalf("%s = %v, want 0", MetricRevocationAckSent, c)
+	}
+}
+
 // TestWireRevocationScope_AllowlistGate is the unit-level guard on the scope
 // gate itself: exactly the three wire scopes are accepted (and round-trip to the
 // matching typed constant), everything else — crucially "admission" — is

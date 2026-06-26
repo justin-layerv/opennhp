@@ -471,7 +471,103 @@ func (a *UdpAC) HandleUdpACRevocation(ppd *core.PacketParserData) error {
 			acId, scope, scopeKey, revMsg.RevocationEpoch, revMsg.EventId)
 	}
 
+	// Proof-of-delivery ack (P4e Slice 3, #2793). Sent AFTER ApplyRevocation on
+	// EVERY validated event regardless of flush count — the ack is a convergence
+	// claim ("no live flow for this identity at/below this epoch on this AC"),
+	// not a work-done claim (see common.ACRevocationAckMsg). The two flushed==0
+	// cases (retry after a lost ack; cell-wide reaching a never-admitted AC) MUST
+	// still ack or the server would retry to age-out and falsely mark the revoke
+	// degraded. Reject paths above return early WITHOUT acking by design: they
+	// age out to the server's degraded metric, surfacing server↔AC validation
+	// drift instead of masking it. ScopeKey is echoed VERBATIM (the original
+	// scope-prefixed wire form, revMsg.ScopeKey — NOT the prefix-stripped
+	// scopeKey) so the server can match the ack to its pending tracker by string
+	// equality; the bare scopeKey is the AC-internal index form only.
+	a.sendRevocationAck(ppd, revMsg)
+
 	return nil
+}
+
+// sendRevocationAck enqueues an NHP_RACK acknowledgement of revMsg back to the
+// server that sent the NHP_REV, on the SAME server-initiated connection the
+// NHP_REV arrived on (ppd.ConnData) and addressed to that server's
+// authenticated pubkey (ppd.RemotePubKey). It is the AC-to-server mirror of the
+// server's fanoutRevocation send: an unsolicited push (no ResponseMsgCh, not a
+// transaction) — the AC does not block for a reply, since the server's retry
+// loop is what provides delivery assurance, not an AC-side wait.
+//
+// Fire-and-forget with a non-blocking enqueue: if the AC is shutting down or the
+// inbound NHP_REV lacked a usable ConnData/pubkey (a malformed-but-validated
+// edge that should not occur in production), the ack is dropped with a metric
+// (MetricRevocationAckSendFailed) rather than blocking the receive path. A
+// dropped ack is not a correctness loss — the server retries the NHP_REV until
+// it is acked or ages out — but it IS an observable AC→server-return-path
+// impairment, hence the dedicated counter.
+//
+// The caller MUST gate this on the validated/applied path: reject paths do not
+// ack (see HandleUdpACRevocation). revMsg is echoed (scope, scope_key VERBATIM,
+// epoch, event_id) per the common.ACRevocationAckMsg wire contract.
+func (a *UdpAC) sendRevocationAck(ppd *core.PacketParserData, revMsg *common.ACRevocationMsg) {
+	acId := a.config.ACId
+
+	// The connection and the server's authenticated pubkey both come from the
+	// inbound NHP_REV's PacketParserData. ppd.RemotePubKey is set by the
+	// responder only after validatePeer authenticates it, so it is the trusted
+	// server identity to address the ack to. A missing ConnData/pubkey means the
+	// receive path handed us an envelope we cannot reply on — drop with a metric.
+	if ppd == nil || ppd.ConnData == nil || len(ppd.RemotePubKey) != core.PublicKeySize {
+		a.incrMetric(MetricRevocationAckSendFailed)
+		log.Error("ac(%s)[sendRevocationAck] cannot ack NHP_REV: missing connection or server pubkey (scope=%q key=%q epoch=%d eventId=%q)",
+			acId, revMsg.Scope, revMsg.ScopeKey, revMsg.RevocationEpoch, revMsg.EventId)
+		return
+	}
+
+	ackMsg := &common.ACRevocationAckMsg{
+		Scope:           revMsg.Scope,
+		ScopeKey:        revMsg.ScopeKey, // VERBATIM (still scope-prefixed)
+		RevocationEpoch: revMsg.RevocationEpoch,
+		EventId:         revMsg.EventId,
+	}
+	ackBytes, marshalErr := json.Marshal(ackMsg)
+	if marshalErr != nil {
+		// A fixed-shape struct of plain fields cannot realistically fail to
+		// marshal; treat it as a send failure for observability rather than a
+		// panic, and let the server's retry cover the missed ack.
+		a.incrMetric(MetricRevocationAckSendFailed)
+		log.Error("ac(%s)[sendRevocationAck] failed to marshal NHP_RACK (eventId=%q): %v", acId, revMsg.EventId, marshalErr)
+		return
+	}
+
+	md := &core.MsgData{
+		ConnData:      ppd.ConnData,
+		HeaderType:    core.NHP_RACK,
+		CipherScheme:  ppd.CipherScheme,
+		TransactionId: a.device.NextCounterIndex(),
+		Compress:      true,
+		PeerPk:        ppd.RemotePubKey,
+		Message:       ackBytes,
+		// No ResponseMsgCh — unsolicited AC→server push (mirror of NHP_REV).
+	}
+
+	if !a.IsRunning() {
+		a.incrMetric(MetricRevocationAckSendFailed)
+		log.Error("ac(%s#%d)[sendRevocationAck] AC shutting down, skip ack (eventId=%q)", acId, md.TransactionId, revMsg.EventId)
+		return
+	}
+
+	// Non-blocking enqueue: a full send queue must not stall the revoke receive
+	// path. A dropped ack is recovered by the server's retry, so prefer dropping
+	// (with a metric) over blocking.
+	select {
+	case a.sendMsgCh <- md:
+		a.incrMetric(MetricRevocationAckSent)
+		log.Debug("ac(%s#%d)[sendRevocationAck] enqueued NHP_RACK scope=%q key=%q epoch=%d eventId=%q",
+			acId, md.TransactionId, revMsg.Scope, revMsg.ScopeKey, revMsg.RevocationEpoch, revMsg.EventId)
+	default:
+		a.incrMetric(MetricRevocationAckSendFailed)
+		log.Warning("ac(%s#%d)[sendRevocationAck] sendMsgCh full, dropping NHP_RACK (server will retry NHP_REV) eventId=%q",
+			acId, md.TransactionId, revMsg.EventId)
+	}
 }
 
 // HandleAccessControl writes kernel pinhole state for entry's

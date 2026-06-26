@@ -188,6 +188,18 @@ func (hs *HttpServer) handleInternalRevocation(ctx *gin.Context) {
 	// no-op). AddCounterWithDims is nil-safe.
 	hs.udpServer.metrics.AddCounterWithDims(MetricRevocationFanoutSent, float64(sent), nil)
 
+	// Proof-of-delivery tracking (#2793): record a pending entry per targeted AC
+	// so the retry engine retransmits the NHP_REV until the AC acks (NHP_RACK)
+	// or it ages out to the degraded metric. No-op when the engine is disabled
+	// (default). scope_key is the WIRE (scope-prefixed) form — the same bytes the
+	// AC echoes verbatim in its ack, matched by string equality. Tracked here
+	// (not inside fanoutRevocation) because fanoutRevocation is the lock-free
+	// send primitive that redelivery reuses; tracking there would reset the
+	// age-out clock on every retransmit. The !ok backpressure path returned 503
+	// above without reaching here, so on this path every conn in the set was
+	// enqueued.
+	hs.udpServer.trackFanout(conns, evt.Scope, evt.ScopeKey, evt.RevocationEpoch, evt.EventID)
+
 	// At-least-once: ack 200 only AFTER the fanout has been enqueued for every
 	// matched AC. An empty match set (cell-wide with no connected ACs / targeted
 	// with no matching ACId here) is a legitimate success — nothing to flush on

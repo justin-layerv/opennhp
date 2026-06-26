@@ -173,6 +173,16 @@ type UdpServer struct {
 	// revoke gate is strict and the server is in DynamoDB cloud mode.
 	acPubkeyRevokeSweepInterval time.Duration
 
+	// revocationRetry is the qURL v2 NHP_REV retry-until-ack-or-age-out
+	// engine (P4e Slice 3, #2793). nil = engine disabled (default; armed
+	// only when NHP_REVOCATION_RETRY_ENABLED=true). When non-nil, the
+	// fanout handler records a pending entry per targeted AC, the
+	// revocationRetryRoutine retransmits un-acked NHP_REV on a cadence
+	// until acked (NHP_RACK clears it) or aged out (RevocationAgedOut),
+	// and HandleRevocationAck clears the matching entry. See
+	// revocation_retry.go.
+	revocationRetry *revocationRetryTracker
+
 	// connection and remote transaction management
 
 	remoteConnectionMapMutex sync.Mutex
@@ -609,6 +619,21 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	} else {
 		log.Info("AC pubkey revoke mid-session sweep interval: %s (starts only in strict DynamoDB cloud mode)",
 			s.acPubkeyRevokeSweepInterval)
+	}
+
+	// qURL v2 revocation retry-until-ack-or-age-out engine (#2793). Default
+	// OFF: armed only when NHP_REVOCATION_RETRY_ENABLED=true, because a fleet of
+	// pre-ack ACs never sends NHP_RACK and would otherwise storm the aged-out
+	// degraded metric. Parse fails Start on a typo (see parseRevocationRetryConfig).
+	revRetryEnabled, revRetryInterval, revRetryAgeOut, err := parseRevocationRetryConfig()
+	if err != nil {
+		return err
+	}
+	if revRetryEnabled {
+		s.revocationRetry = newRevocationRetryTracker(revRetryInterval, revRetryAgeOut)
+		log.Info("qURL v2 revocation retry engine ENABLED (interval=%s ageOut=%s)", revRetryInterval, revRetryAgeOut)
+	} else {
+		log.Info("qURL v2 revocation retry engine disabled (%s not true); NHP_REV fanout stays fire-and-forget", RevocationRetryEnabledEnvVar)
 	}
 
 	// Initialize pluggable storage backend (DynamoDB or etcd)
@@ -1097,6 +1122,14 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	} else if s.acPubkeyRevokeSweepInterval > 0 && !s.acPubkeyRevokeVerifyRequire {
 		log.Info("AC pubkey revoke mid-session sweeper not started because %s is permit mode",
 			ACPubkeyRevokeVerifyEnvVar)
+	}
+	// qURL v2 revocation retry/age-out routine (#2793). Started only when the
+	// engine is armed (tracker non-nil). Joins s.wg + exits on s.signals.stop so
+	// it stops sending before Stop() closes s.sendMsgCh (wg.Wait precedes the
+	// close).
+	if s.revocationRetry != nil {
+		s.wg.Add(1)
+		go s.revocationRetryRoutine()
 	}
 
 	s.running.Store(true)
@@ -2843,6 +2876,17 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 	// NHP-Relay forwarded agent knock (#2208)
 	case core.NHP_RLY:
 		go s.HandleRelayForward(ppd)
+
+	// qURL v2 revocation ack from an AC (P4e Slice 3, #2793). Unsolicited
+	// AC→server push acknowledging an NHP_REV; clears the per-AC pending-revoke
+	// tracker so the retry-until-ack loop stops. Dispatched async like every
+	// other arm so a slow handler cannot head-of-line-block the receive queue.
+	case core.NHP_RACK:
+		go func() {
+			if ackErr := s.HandleRevocationAck(ppd); ackErr != nil {
+				log.Error("[Server] HandleRevocationAck failed: %v", ackErr)
+			}
+		}()
 
 	default:
 		// An unknown HeaderType reaching here means the upstream

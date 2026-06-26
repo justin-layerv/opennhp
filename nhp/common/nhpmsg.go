@@ -546,3 +546,52 @@ type ACRevocationMsg struct {
 	RevocationEpoch int64  `json:"revocation_epoch"` // monotonic epoch (must be >= 0)
 	EventId         string `json:"event_id,omitempty"`
 }
+
+// ACRevocationAckMsg is the AC→server acknowledgement of an NHP_REV, carried on
+// NHP_RACK (AC-to-server, LayerV extension). It is the proof-of-delivery signal
+// for DE-Risk #5: the AC sends one after it has PROCESSED a validated NHP_REV,
+// and the server uses it to clear that AC's pending-revoke tracker so the
+// retry-until-ack-or-age-out loop stops retransmitting (see
+// docs/design/QURL_V2_KEYED_IDENTITY.md revocation section, P4e Slice 3, #2793).
+//
+// Acknowledgement semantics — CONVERGENCE, not work-done (load-bearing): the AC
+// acks EVERY validated NHP_REV regardless of how many live entries it flushed.
+// ApplyRevocation returns 0 in two legitimate cases that MUST still ack, or the
+// server would retry to age-out and falsely mark the revoke degraded:
+//   - the retry after a lost ack (the entry was already torn down + deleted by
+//     the first apply, so the re-delivered event flushes nothing); and
+//   - cell-wide fanout reaching an AC that never admitted the key (the common
+//     case — every AC receives every cell-wide revoke).
+//
+// So the ack means "this AC has reached the post-revocation state for
+// (scope, scope_key, epoch)", i.e. there is no live flow for that identity at or
+// below this epoch on this AC. It is NOT a claim about how many flows were torn
+// down. A reject path (malformed/forged event, unsupported scope, etc.) does NOT
+// ack — those age out to the degraded metric, which correctly surfaces
+// server↔AC validation drift rather than masking it.
+//
+// Wire contract (CROSS-REPO-shaped but server↔AC only — qurl-service is not a
+// party). The fields echo the NHP_REV the AC received so the server can
+// correlate the ack to its pending tracker:
+//   - Scope / ScopeKey are echoed VERBATIM as received on the NHP_REV
+//     (ScopeKey is still the scope-PREFIXED "<scope>:<id>" form — the AC does
+//     NOT strip the prefix on the ack path). The server forwarded scope_key
+//     verbatim into the NHP_REV and tracks pending revokes under that exact
+//     byte string, so echoing it unmodified lets the server match by string
+//     equality. Normalizing/stripping here would reintroduce the
+//     fail-open-on-key-mismatch trap the gospel warns about repeatedly.
+//   - RevocationEpoch echoes the acked epoch; the server clears a pending
+//     tracker only when the ack's epoch matches (or supersedes) the epoch it
+//     last sent for that (acId, scope, scope_key).
+//   - EventId echoes the NHP_REV's event id for cross-hop log correlation; it
+//     does not affect ack matching (the (scope, scope_key, epoch) tuple does).
+//
+// The acking AC's identity is NOT carried in this message: the server resolves
+// it from the cryptographically-authenticated connection pubkey (ppd.RemotePubKey
+// → acConnectionMap), never from a spoofable body field.
+type ACRevocationAckMsg struct {
+	Scope           string `json:"scope"`
+	ScopeKey        string `json:"scope_key"`        // echoed VERBATIM (still scope-prefixed)
+	RevocationEpoch int64  `json:"revocation_epoch"` // echoed acked epoch
+	EventId         string `json:"event_id,omitempty"`
+}
