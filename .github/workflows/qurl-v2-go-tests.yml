@@ -1,0 +1,70 @@
+# Runs the repo's curated Go unit-test suite (`make test`) on PRs targeting
+# the qurl-v2 integration branch.
+#
+# Why this exists: ubuntu-build.yml / build-and-push.yml / codeql.yml all
+# trigger only on `pull_request: branches: [ "main" ]`, so NO Go tests run on
+# qurl-v2-targeted PRs. "gh pr checks green" on a qurl-v2 PR therefore proves
+# nothing about test coverage while that branch is actively churning. This
+# workflow reinstates, on qurl-v2 PRs, the exact unit-test coverage that runs
+# today only at the eventual qurl-v2 -> main merge (the `Run Unit Tests` step
+# in ubuntu-build.yml's `build` job, which also runs `make test`).
+#
+# Faithful, not approximate: it runs `make test` literally — the same target
+# the merge runs. That auto-tracks the Makefile's curated `-run` allowlist
+# (so an edit to the suite is picked up here with no workflow change) and
+# inherits the `KBS_SKIP_INIT=1` baked into the endpoints recipe, so the run
+# is hermetic (no etcd / network / key-init). The `test` target has no build
+# prerequisite and nhp has no private cross-repo deps, so it runs standalone.
+#
+# Complement, not duplicate, the qURL-plugin workflow (PR #2819 ->
+# qurl-v2-qurl-plugin-tests.yml): `make test`'s endpoints `-run` allowlist
+# (`Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry`)
+# deliberately EXCLUDES the qURL plugin package's tests (incl. TestWS1_*).
+# `make test` *compiles* ./server/staticplugins/qurl/... but runs none of its
+# tests; the plugin workflow runs exactly those. Zero execution overlap by
+# construction. This file owns the make-test-equivalent coverage; the plugin
+# workflow stays the TestWS1 carve-out. See that PR's #2826 follow-up for the
+# qurl-v2 -> main continuity plan (fold TestWS1 into the make-test allowlist
+# or run the package hermetically in main CI when the plugin workflow is
+# deleted at the merge).
+name: qurl-v2 Go tests
+
+on:
+  pull_request:
+    branches: [ "qurl-v2" ]
+
+concurrency:
+  group: "qurl-v2-go-tests-${{ github.ref }}"
+  cancel-in-progress: true
+
+# Restrict default permissions for security.
+permissions:
+  contents: read
+
+jobs:
+  go-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+    # go-version-file pins the toolchain to the endpoints module's own go.mod,
+    # so this workflow needs no GO_VERSION env and stays out of the Go-version
+    # lockstep table in scripts/check-go-version-drift.sh. The `make test`
+    # target also exercises the internalauth module, but its go.mod pins the
+    # same Go version (enforced by that same drift lint), so a single
+    # go-version-file is sufficient. SHA matches the setup-go pin used across
+    # ubuntu-build.yml / codeql.yml.
+    - name: Set up Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+      with:
+        go-version-file: endpoints/go.mod
+        cache-dependency-path: endpoints/go.sum
+
+    # `make test` is the SAME unit-test target ubuntu-build.yml's `build` job
+    # runs at the qurl-v2 -> main merge: `internalauth` in full, plus the
+    # curated `endpoints/server/...` `-run` allowlist under KBS_SKIP_INIT=1.
+    # Running the target verbatim keeps CI coverage identical to the merge and
+    # avoids an inlined copy drifting from the Makefile.
+    - name: Run Unit Tests
+      run: make test
