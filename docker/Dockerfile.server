@@ -53,6 +53,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 # general archive.ubuntu.com. See Dockerfile.ac.aws for the CI-failure
 # history (2026-04-17 outage affecting runs 24548987311 / 24549340621 /
 # 24550346283) that motivated this swap.
+#
+# The trailing `rm -f /usr/bin/pebble` strips an unused, CVE-flagged Go binary
+# the ubuntu base bakes into /usr/bin (see Dockerfile.ac.aws and #2800).
 RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ubuntu.com|//azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
     grep -q azure.archive.ubuntu.com /etc/apt/sources.list.d/ubuntu.sources || \
         { echo "ERROR: ubuntu.sources mirror substitution failed — file format may have changed"; exit 1; } && \
@@ -62,7 +65,8 @@ RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ub
     iptables \
     ipset \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/bin/pebble
 
 # Copy built binary
 COPY --from=builder /nhp-server/release/nhp-server /nhp-server

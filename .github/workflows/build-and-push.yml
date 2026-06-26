@@ -997,6 +997,17 @@ jobs:
       - name: Build image
         if: needs.changes.outputs.app == 'true'
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        # Cache hygiene: CACHE_SCOPE is the single source of truth that both
+        # cache-from and cache-to consume below, so the read scope can never
+        # drift from the write scope. The scope is keyed on a hash of every
+        # go.mod/go.sum, so it rotates when a dependency (or the `go` directive)
+        # changes and a bump lands on a fresh, empty scope that recompiles from
+        # source. Do NOT re-add a bare `scope=<image>` cache-from fallback:
+        # cache-to never writes it, so it could only ever serve some other,
+        # unrelated scope's layers. Tradeoff: the first build after a dep bump is
+        # fully cold (no base-layer reuse) — acceptable for reproducibility.
+        env:
+          CACHE_SCOPE: ${{ matrix.image }}-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'internalauth/go.mod', 'endpoints/go.mod', 'endpoints/go.sum', 'examples/server_plugin/go.mod', 'examples/server_plugin/go.sum') }}
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -1011,14 +1022,8 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           secrets: |
             github_token=${{ secrets.PLUGIN_REPO_TOKEN }}
-          # Cache strategy:
-          # 1. Primary: scope includes dependency hash - ensures fresh build when deps change
-          # 2. Fallback: scope without hash - faster builds for code-only changes
-          # Only write to the dependency-specific cache to prevent stale layer pollution
-          cache-from: |
-            type=gha,scope=${{ matrix.image }}-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'internalauth/go.mod', 'endpoints/go.mod', 'endpoints/go.sum', 'examples/server_plugin/go.mod', 'examples/server_plugin/go.sum') }}
-            type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'internalauth/go.mod', 'endpoints/go.mod', 'endpoints/go.sum', 'examples/server_plugin/go.mod', 'examples/server_plugin/go.sum') }}
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_SCOPE }}
 
       - name: Set image name for scanning
         if: needs.changes.outputs.app == 'true'

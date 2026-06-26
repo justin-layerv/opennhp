@@ -77,6 +77,14 @@ ENV AWS_REGION=""
 # All runtime apt packages in one layer:
 #   ca-certificates, iptables, ipset, curl, file, supervisor — base
 #   gettext-base — provides envsubst used by the entrypoint script below
+#
+# The trailing `rm -f /usr/bin/pebble` strips Canonical's pebble service
+# manager — an unused Go binary the ubuntu base bakes into /usr/bin that ships
+# HIGH CVEs (stale golang.org/x/net + Go stdlib) and fails the trivy image scan.
+# The container execs its own binary via ENTRYPOINT, never pebble. The `rm -f` is
+# deliberately idempotent — it no-ops if a future base digest drops or relocates
+# pebble; trivy is the backstop, so do NOT replace it with a `test -f` guard
+# (that would break the build the day the base image is fixed upstream). #2800.
 RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ubuntu.com|//azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
     grep -q azure.archive.ubuntu.com /etc/apt/sources.list.d/ubuntu.sources || \
         { echo "ERROR: ubuntu.sources mirror substitution failed — file format may have changed"; exit 1; } && \
@@ -89,7 +97,8 @@ RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ub
     file \
     supervisor \
     gettext-base \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/bin/pebble
 
 # Install Traefik v3 with retry logic for GitHub rate limits
 # 3.6.19 fixes CVE-2026-48020 (StripPrefix route-level auth bypass),

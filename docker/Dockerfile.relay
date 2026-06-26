@@ -44,6 +44,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Swap to Canonical's Azure mirror — GitHub Actions runners are in Azure, so
 # azure.archive.ubuntu.com is geo-local and more reliable (see Dockerfile.ac.aws
 # for the outage history that motivated this).
+#
+# The trailing `rm -f /usr/bin/pebble` strips an unused, CVE-flagged Go binary
+# the ubuntu base bakes into /usr/bin (see Dockerfile.ac.aws and #2800).
 RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ubuntu.com|//azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
     grep -q azure.archive.ubuntu.com /etc/apt/sources.list.d/ubuntu.sources || \
         { echo "ERROR: ubuntu.sources mirror substitution failed — file format may have changed"; exit 1; } && \
@@ -51,7 +54,8 @@ RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ub
     apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
     ca-certificates \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/bin/pebble
 
 ENV NHP_RELAY_HEALTHCHECK_URL=https://localhost:8080/health/live
 
