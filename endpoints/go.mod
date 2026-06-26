@@ -23,7 +23,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/layervai/nhp/internalauth v0.2.0
-	github.com/mark3labs/mcp-go v0.54.1
+	github.com/mark3labs/mcp-go v0.55.0
 	github.com/pelletier/go-toml/v2 v2.3.1
 	github.com/pion/webrtc/v4 v4.2.15
 	github.com/sigstore/cosign/v2 v2.6.3
