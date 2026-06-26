@@ -1,0 +1,58 @@
+# Runs the qURL static-plugin package tests on PRs targeting the qurl-v2
+# integration branch.
+#
+# Why this exists: ubuntu-build.yml / build-and-push.yml / codeql.yml all
+# trigger only on `pull_request: branches: [ "main" ]`, so NO Go tests run on
+# qurl-v2-targeted PRs. The WS1 completion gate
+# (server/staticplugins/qurl/ws1_no_internal_v1_gate_test.go) lives on qurl-v2
+# and asserts that no qURL v2 knock path calls a qURL v1 internal endpoint. A
+# gate that only runs at the eventual qurl-v2 -> main merge does not guard the
+# branch it is meant to guard, exactly when that branch is churning. This
+# workflow runs the qURL plugin package on qurl-v2 PRs so the gate gates.
+#
+# Scope is deliberately just the qURL plugin package, not the whole endpoints
+# module: that package is hermetic under KBS_SKIP_INIT=1 (no etcd / network /
+# key-init), which is why `make test` curates the broader server/... suite
+# behind a narrow -run allowlist. Keeping this run package-scoped keeps it fast
+# and self-contained on the integration branch.
+name: qurl-v2 qURL plugin tests
+
+on:
+  pull_request:
+    branches: [ "qurl-v2" ]
+
+concurrency:
+  group: "qurl-v2-qurl-plugin-tests-${{ github.ref }}"
+  cancel-in-progress: true
+
+# Restrict default permissions for security.
+permissions:
+  contents: read
+
+jobs:
+  qurl-plugin-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Avoid the private-key-dir creation path so the package runs hermetically
+      # in CI; see CLAUDE.md ("Test panic 'private key'") and the same env on the
+      # fuzz-quick job in ubuntu-build.yml.
+      KBS_SKIP_INIT: '1'
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+    # go-version-file pins the toolchain to the endpoints module's own go.mod, so
+    # this workflow needs no GO_VERSION env and stays out of the Go-version
+    # lockstep table in scripts/check-go-version-drift.sh.
+    - name: Set up Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+      with:
+        go-version-file: endpoints/go.mod
+        cache-dependency-path: endpoints/go.sum
+
+    # The Go module rooted at endpoints/ (module
+    # github.com/OpenNHP/opennhp/endpoints) owns the qURL plugin package, so the
+    # test runs from there with -race, mirroring the command run locally to
+    # validate the WS1 gate.
+    - name: Run qURL plugin package tests
+      run: cd endpoints && go test -race ./server/staticplugins/qurl/...
