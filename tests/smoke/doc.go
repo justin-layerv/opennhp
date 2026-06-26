@@ -28,22 +28,40 @@
 // PR1 ships Tier 1 only. Tier 2 and Tier 3 land in follow-up PRs after the
 // harness has proven stable in CI.
 //
-// # Running locally
+// # Running
 //
-//	export AWS_PROFILE=layerv
-//	export NHP_ENVIRONMENT=sandbox
-//	export NHP_SMOKE_ALLOW_SSM_PROBES=true
-//	# Auth0 credentials fetched from Secrets Manager; see Makefile test-smoke-sandbox
-//	cd tests/smoke && go test -tags=smoke -v -count=1 ./...
+// All contexts go through scripts/run-smoke.sh (TARGET=local|sandbox|prod) —
+// the single entrypoint shared by local pre-PR runs, PR CI, and post-deploy
+// CI. It owns the tier -> RUN_FILTER mapping and the env-derived flags.
+//
+// Local self-contained stack — no AWS, no Auth0. Brings up nhp-server +
+// nhp-ac + dynamodb-local via docker compose (tests/smoke/local-stack; the AC
+// registers with a seeded license so knock-ready reflects a live peer) and
+// runs the wire-contract `local` tier against the freshly-built binaries:
+//
+//	make test-smoke-local              # or: TARGET=local ./scripts/run-smoke.sh
+//
+// Against the deployed sandbox/prod — reads the AWS profile (no Auth0: the
+// qURL-minting tests that needed it were moved out of nhp — qURL smoke
+// belongs in qurl-service, see tests/smoke/CLAUDE.md):
+//
+//	make test-smoke-sandbox            # AWS_PROFILE=layerv,      all tiers
+//	make test-smoke-prod               # AWS_PROFILE=layerv-prod, all tiers
+//
+// Compile + vet only (the credential-free PR gate, also a CI job):
+//
+//	make smoke-build
 //
 // # Environment variables
 //
 // Required:
 //
-//	NHP_ENVIRONMENT            sandbox | prod
-//	AUTH0_CLIENT_ID            M2M client ID for smoke tests
-//	AUTH0_CLIENT_SECRET        M2M client secret
-//	AWS_REGION                 us-east-2
+//	NHP_ENVIRONMENT            local | sandbox | prod
+//	AWS_REGION                 us-east-2 (sandbox/prod; ignored by local)
+//
+// The local target derives localhost endpoints (NHPServerBaseURL =
+// http://localhost:8888 by default; override with NHP_SERVER_BASE_URL) and
+// skips AWS deploy-mode discovery entirely.
 //
 // Optional (defaults derived from NHP_ENVIRONMENT — see dns.go):
 //
@@ -51,10 +69,8 @@
 //	                           https://resolve.qurl.link.layerv.xyz (sandbox)
 //	                           https://resolve.qurl.link             (prod)
 //	                           NOT api.layerv.* — that's the QURL API.
-//	QURL_API_BASE_URL          qurl-service API, e.g. https://api.layerv.xyz
-//	AUTH0_DOMAIN               defaults to auth.layerv.ai
-//	AUTH0_AUDIENCE             defaults to QURL_API_BASE_URL (matches the
-//	                           audience the smoke M2M client is scoped to)
+//	QURL_API_BASE_URL          qurl-service API host the public-ALB lockdown
+//	                           fence targets, e.g. https://api.layerv.xyz
 //	NHP_SMOKE_ALLOW_SSM_PROBES true in sandbox, false in prod during burn-in
 //
 // Blue/green context (active color, per-color ASG names, TG ARNs,

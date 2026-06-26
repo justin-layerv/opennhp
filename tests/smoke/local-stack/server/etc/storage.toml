@@ -1,0 +1,21 @@
+# Local smoke stack storage: the DynamoDB backend (the cloud production
+# path — etcd is being retired) pointed at the dynamodb-local container.
+# Tables are created by scripts/smoke-local-stack.sh before the server
+# starts (the startup Ping does a GetItem against ACAssignmentsTable, so
+# that table must exist or the server falls back to degraded/no-storage).
+# Dummy AWS credentials are supplied via the container environment
+# (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) — dynamodb-local ignores
+# them but the SDK requires a credential to sign requests.
+#
+# AgentKeysTable / RelayKeysTable / AckTokensTable are intentionally left
+# empty: the local stack exercises the wire-contract subset, not the
+# dynamic agent/relay registries, and a set AckTokensTable would make a
+# failed ACK-store init fatal at boot.
+Backend = "dynamodb"
+
+[DynamoDB]
+Region = "us-east-2"
+Endpoint = "http://dynamodb-local:8000"
+LicensesTable = "nhp-licenses"
+ACAssignmentsTable = "nhp-ac-assignments"
+ResourcesTable = "nhp-resources"

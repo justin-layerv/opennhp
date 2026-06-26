@@ -17,7 +17,7 @@
 # a reproducer file, deadline-race signature, build failure, etc.),
 # invokes the wrapper, and asserts the expected exit code.
 #
-# Mirrors the pattern of tests/lints/redirect-url-drift/run-fixtures.sh.
+# Mirrors the pattern of the other tests/lints/*/run-fixtures.sh suites.
 #
 # Usage:
 #   ./tests/lints/run-fuzz/run-fixtures.sh

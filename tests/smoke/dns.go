@@ -71,6 +71,25 @@ type derivedEndpoints struct {
 // truth.
 func deriveEndpoints(env string) (derivedEndpoints, error) {
 	switch env {
+	case "local":
+		// Self-contained local stack (scripts/run-smoke.sh brings up
+		// nhp-server + dynamodb-local via docker compose). Only the NHP
+		// server's HTTP plugin/health endpoint exists locally — there is
+		// no CloudFront origin, no qurl-service, and no Auth0, so the
+		// qURL-minting and internal-ALB fences are excluded from the
+		// curated `local` tier (and skip via requireRemote if invoked
+		// directly). The four-place internal-ALB lockstep noted above
+		// does NOT apply to local: QURLInternalAPIHostname is empty.
+		// Override the base URL with NHP_SERVER_BASE_URL when the compose
+		// stack maps the HTTP port somewhere other than the default.
+		return derivedEndpoints{
+			NHPServerBaseURL:        "http://localhost:8888",
+			NHPServerOriginURL:      "",
+			QURLAPIBaseURL:          "",
+			QURLInternalAPIHostname: "",
+			QURLSiteDomain:          "qurl.site.local", // apex-format guard (#1329) only; unused on local (no qURL path runs)
+			QURLLinkOrigin:          "http://localhost:8888",
+		}, nil
 	case "sandbox":
 		return derivedEndpoints{
 			NHPServerBaseURL:        "https://resolve.qurl.link.layerv.xyz",
@@ -94,6 +113,6 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 			QURLLinkOrigin: "https://qurl.link",
 		}, nil
 	default:
-		return derivedEndpoints{}, fmt.Errorf("unknown environment %q (want sandbox or prod)", env)
+		return derivedEndpoints{}, fmt.Errorf("unknown environment %q (want local, sandbox, or prod)", env)
 	}
 }

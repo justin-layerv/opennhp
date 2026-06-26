@@ -1,0 +1,14 @@
+# NHP server base config for the self-contained local smoke stack
+# (tests/smoke/local-stack). Brought up by scripts/run-smoke.sh
+# (TARGET=local). DEMO keypair generated with `nhp-serverd keygen`
+# (curve25519) — not a production secret. The matching PUBLIC key is in
+# ../ac/etc/config.toml as ServerPubKeyBase64 so the AC can register.
+PrivateKeyBase64 = "4Di8JGAVaU5pOb8n6fiBjPsV6rwBTkkYE7chCn8Lg1Q="
+DefaultCipherScheme = 0
+ListenIp = "0.0.0.0"
+ListenPort = 62206
+Hostname = "localhost:62206"
+LogLevel = 2
+DisableAgentValidation = false
+CookieSigningKeyBase64 = ""
+CookieTimeWindowSeconds = 60

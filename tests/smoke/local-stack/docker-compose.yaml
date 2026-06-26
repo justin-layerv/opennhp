@@ -1,0 +1,76 @@
+# Self-contained local NHP stack for the smoke suite (NHP_ENVIRONMENT=local).
+# Brought up / torn down by scripts/smoke-local-stack.sh, which is driven by
+# scripts/run-smoke.sh (TARGET=local). No AWS, no Auth0, no qurl-service: this
+# exercises the freshly-built nhp-server + nhp-ac binaries against a local
+# DynamoDB (amazon/dynamodb-local), so the smoke suite can run a PR's own code
+# locally and in PR CI — not just against a deployed sandbox/prod.
+#
+# Bring this up via scripts/smoke-local-stack.sh, NOT a bare `docker compose
+# up`: ordering + readiness (tables seeded before the server starts, AC
+# registered before knock-ready) is enforced by the script's wait_for gates,
+# not by compose — depends_on here has no `condition: service_healthy` and the
+# AC has no healthcheck.
+#
+# Both images build from one multi-target Dockerfile
+# (tests/smoke/local-stack/Dockerfile) whose shared builder stage compiles both
+# binaries once; only the bind-mounted etc/ differs (plain HTTP on 8888,
+# DynamoDB endpoint pointed at the dynamodb-local container).
+name: nhp-smoke-local
+
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.5.2
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      # Bound to loopback so the host (run-smoke.sh) can create tables via the
+      # AWS CLI; never exposed beyond localhost.
+      - "127.0.0.1:8000:8000"
+
+  nhp-server:
+    image: nhp-smoke-local-server
+    build:
+      # Build context is the repo root (the build COPYs nhp/, endpoints/,
+      # internalauth/). This compose file lives three levels down. The
+      # dedicated multi-target Dockerfile (not docker/Dockerfile.server) builds
+      # from a git worktree — see its header.
+      context: ../../..
+      dockerfile: tests/smoke/local-stack/Dockerfile
+      target: server-runtime
+    depends_on:
+      - dynamodb-local
+    environment:
+      # dynamodb-local ignores credential values but the AWS SDK still requires
+      # a credential to sign requests; AWS_REGION matches storage.toml.
+      AWS_ACCESS_KEY_ID: "dummy"
+      AWS_SECRET_ACCESS_KEY: "dummy"
+      AWS_REGION: "us-east-2"
+      # The HTTP server requires session cookie keys or it refuses to start
+      # (httpserver.go::parseCookieKeys). base64 of
+      #   {"current":{"auth_key":"<32B>","encrypt_key":"<32B>"}}
+      # — non-secret DUMMY keys for the local stack only.
+      NHP_COOKIE_KEYS: "eyJjdXJyZW50Ijp7ImF1dGhfa2V5IjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJlbmNyeXB0X2tleSI6ImFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5In19"
+    volumes:
+      - ./server/etc:/nhp-server/etc:ro
+    ports:
+      - "127.0.0.1:8888:8888"
+
+  # The AC registers with nhp-server over UDP (NHP_AOL) using a license seeded
+  # into dynamodb-local. Once registered it is a live AC peer, so
+  # /health/knock-ready returns 200. NET_ADMIN is required because the AC
+  # manages iptables/ipset pinholes.
+  nhp-ac:
+    image: nhp-smoke-local-ac
+    build:
+      context: ../../..
+      dockerfile: tests/smoke/local-stack/Dockerfile
+      target: ac-runtime
+    depends_on:
+      - nhp-server
+    cap_add:
+      - NET_ADMIN
+    environment:
+      AWS_ACCESS_KEY_ID: "dummy"
+      AWS_SECRET_ACCESS_KEY: "dummy"
+      AWS_REGION: "us-east-2"
+    volumes:
+      - ./ac/etc:/nhp-ac/etc:ro

@@ -1,0 +1,24 @@
+# NHP-AC config for the self-contained local smoke stack
+# (tests/smoke/local-stack). DEMO keypair generated with `nhp-acd keygen`
+# (curve25519) — not a production secret. The AC registers with nhp-server
+# over UDP (NHP_AOL) using ServerEndpoint + ServerPubKeyBase64 and a license
+# key that scripts/smoke-local-stack.sh seeds into the dynamodb-local
+# nhp-licenses table; once registered it shows up as a live AC peer so
+# /health/knock-ready returns 200.
+PrivateKeyBase64 = "2JC4tRQbaMeWEdSt3KYXZtASLFtxXl4lRYEIWuQ9FHE="
+ACId = "testAC-local"
+DefaultIp = "127.0.0.1"
+DefaultCipherScheme = 0
+FilterMode = 0
+IpPassMode = 0
+LogLevel = 4
+
+# Per-AC server-assignment registration (cloud mode). ServerPubKeyBase64 is
+# the local nhp-server's public key (its private key is in
+# ../server/etc/config.toml). nhp-server is the compose service name.
+LicenseKey = "LOCAL-SMOKE-LICENSE"
+ServerEndpoint = "nhp-server"
+ServerPort = 62206
+ServerPubKeyBase64 = "0uRCbCIfyxwDYnt5xwwNL2KIseh2lxEPQGjJuDiz+mE="
+Environment = "local"
+ACVersion = "local-smoke"

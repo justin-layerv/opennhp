@@ -25,13 +25,86 @@ the actual binary that is running in production.
 
 ### When to run
 
-- CI: `.github/workflows/build-and-push.yml` runs it against sandbox
-  after `deploy-sandbox-validate`. `.github/workflows/promote-to-prod.yml`
-  runs it against prod alongside `qurl-smoke-tests`. Both paths
-  currently run in report-only mode (burn-in).
-- Manual: `gh workflow run nhp-smoke-tests.yml --ref <branch> -f environment=sandbox -f tier=tier1 -f allow_ssm_probes=true`
-- Local: `make test-smoke-sandbox` (reads AWS credentials from the
-  `layerv` profile and fetches Auth0 from Secrets Manager).
+The suite has ONE entrypoint, `scripts/run-smoke.sh`
+(`TARGET=local|sandbox|prod`), shared by all three contexts. It owns the
+tier → `RUN_FILTER` mapping (fenced by
+`scripts/check-smoke-tier-filter-coverage.sh`, which parses the script) and
+the env-derived flags (e.g. `NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED`). It does
+**not** fetch Auth0 — the `::add-mask::` masking is GitHub-Actions-only, so
+each caller fetches and passes the creds in.
+
+- **Local pre-PR (self-contained, no AWS/Auth0):** `make test-smoke-local`
+  brings up nhp-server + dynamodb-local (`tests/smoke/local-stack/`) via
+  docker compose and runs the wire-contract `local` tier against the
+  freshly-built server binary. `make smoke-build` is the credential-free
+  compile + vet + tier-fence gate.
+- **PR CI:** `.github/workflows/nhp-smoke-pr.yml` runs `smoke-build` and the
+  `smoke-local` stack on PRs touching the server or the smoke suite. No
+  secrets — safe for forks. This is the only smoke path that exercises a
+  PR's OWN code (the deployed-env paths below test already-deployed binaries).
+- **Post-deploy CI:** `.github/workflows/build-and-push.yml` runs it against
+  sandbox after `deploy-sandbox-validate`;
+  `.github/workflows/promote-to-prod.yml` runs it against prod alongside
+  `qurl-smoke-tests`. Both call the reusable `nhp-smoke-tests.yml`, which now
+  invokes `run-smoke.sh`. Both run in report-only mode (burn-in).
+- **Manual:** `gh workflow run nhp-smoke-tests.yml --ref <branch> -f environment=sandbox -f tier=tier1 -f allow_ssm_probes=true`
+- **Deployed sandbox/prod from a laptop:** `make test-smoke-sandbox` /
+  `make test-smoke-prod` (read the AWS profile; no Auth0 — the qURL-minting
+  tests that needed it were moved out of nhp).
+
+### Local target (`TARGET=local` / `NHP_ENVIRONMENT=local`)
+
+The local stack (`tests/smoke/local-stack/`, brought up by
+`scripts/smoke-local-stack.sh`) runs the real **nhp-server + nhp-ac** binaries
+in their cloud-mode DynamoDB path against `amazon/dynamodb-local` (etcd is
+being retired; do not add an etcd path). The AC registers with the server over
+NHP_AOL using a license the stack script seeds into the `nhp-licenses` table —
+cloud mode validates the AC via a bcrypt license check, NOT static `ac.toml`
+(permit mode accepts the unbound license), so `/health/knock-ready` reflects a
+live AC peer.
+
+If `Smoke (local stack)` goes red on an unrelated PR, suspect the AC's
+iptables/ipset firewall init first: the AC container runs `ipset` under
+`NET_ADMIN` and needs the runner's `ip_set` kernel module; if registration
+fails, knock-ready only times out at the 90s `wait_for` ceiling. The bring-up
+script dumps `compose logs nhp-server nhp-ac` on that timeout — read those
+(ipset errors) before re-diagnosing.
+
+The curated `local` tier runs the non-qURL wire contract
+(`HealthLive|HealthReady|HealthStartup|HealthKnockReady|Plugins|Timing`).
+It exercises **no qURL resolve/handler path** — under `Plugins` only the
+dispatcher 404 (`TestPlugins_UnknownASPIDReturns404`) runs locally; the
+branded-403 qURL path is `requireRemote`. So the local signal is: server+AC
+boot, AC registers via the seeded license, knock-ready reflects a live peer,
+and health/timing respond.
+Everything else is remote-only and **skips cleanly** under
+`NHP_ENVIRONMENT=local` — so `go test -tags=smoke ./...` against the local
+stack has zero failures (only the local-runnable subset executes; the rest
+skip):
+- qURL/TLS-dependent contract tests that REMAIN in nhp — the qurl-plugin
+  rejection path (10_resolve bad-token→403), qurl-browser-timings,
+  qurl-link-frontend, protocol-surface (real TLS cert), internal-api
+  source-IP — skip via `requireRemote(t)` at the top of the test. (The
+  qURL-MINTING tests — happy-path resolve, accept-negotiation,
+  qurl-router-authz-gate — were removed entirely; see the qURL-ownership
+  note below.)
+- AWS-infra fences (blue/green, canary, EIP, alarms, CW logs, SSM runbook,
+  custom-domain, Docker image) skip via `requireRemote` (in the central
+  `getSSMParameter` / `requireCWLogs` / `requireActiveColor` /
+  `requireServingASG` helpers, or per-test) / `skipIfNot{BlueGreen,Canary}`
+  (DeployMode is empty under local) / `skipIfNoSSMProbes` (probes off).
+
+Keys + license live in `tests/smoke/local-stack/`: the server keypair
+(`server/etc/config.toml` private ↔ the AC's `ServerPubKeyBase64`) was
+generated with `nhp-serverd keygen` (curve25519); the license key and its
+sha256/bcrypt hashes are constants in `scripts/smoke-local-stack.sh` with
+inline regen instructions. None are production secrets.
+
+To add a test to the local tier: make it pass against the localhost stack
+(gate any AWS/qURL dependency with `requireRemote`), then add its
+`Test<Prefix>_` token to the `local` case in `scripts/run-smoke.sh`. The
+coverage checker treats `local` as a curated allow-list (like `all`): it
+validates the tokens are real but does not require every test to appear.
 
 ### Tiers
 
@@ -46,29 +119,33 @@ deterministic order:
 
 PR1 ships Tier 1 only. PR2 adds Tier 2. PR3 adds Tier 3 + flips
 `continue-on-error` to false in the CI wiring so smoke becomes a
-required check.
+required check. When promoting `nhp-smoke-pr.yml` to a required check,
+account for its `paths:` filter: a required check that never triggers on a
+PR outside those paths leaves the PR pending forever — gate the requirement
+on the same paths (or drop the filter) so it always reports.
 
 **Env-keyed feature gating in the smoke suite is currently a
-multi-place coordination** — see #1640. Today five sites must update
+multi-place coordination** — see #1640. Today four sites must update
 in lockstep when adding a new env that participates in the qurl-
 service internal-ALB rollout:
 
-1. `.github/workflows/nhp-smoke-tests.yml` — `||` chain on
-   `NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED`.
+1. `scripts/run-smoke.sh` — the per-target
+   `NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED` derivation (moved here from
+   nhp-smoke-tests.yml's `||` chain when the entrypoint was unified).
 2. `tests/smoke/dns.go::deriveEndpoints` — internal hostname mapping.
 3. The env's tfvars — `qurl_internal_service_domain`.
 4. `tests/smoke/09_public_alb_internal_lockdown_test.go` —
    `httpListenerOptOutEnvs` map (env that disables the public HTTP
    listener opts out of the HTTP-redirect fence).
-5. `tests/smoke/17_qurl_router_authz_gate_test.go` —
-   `qurlSiteAuthzOptOutEnvs` map (env that disables the L7 authz
-   gate on `*.qurl.site` opts out of the silentDrop fence). Added
-   in #1984.
 
-#1640 tracks moving all five onto SSM-sourced reads at `TestMain`,
+(The former fifth site — `17_qurl_router_authz_gate_test.go`'s
+`qurlSiteAuthzOptOutEnvs` map — is gone: that qURL-minting test was
+removed when qURL smoke moved to qurl-service.)
+
+#1640 tracks moving all four onto SSM-sourced reads at `TestMain`,
 collapsing the coordination to a single Terraform-owned parameter
 per gate. Until that lands, adding a new env to the suite is a
-five-place edit.
+four-place edit.
 
 `TestMain` also resolves the #1645 lockdown-body fence's expected
 value from the Terraform-owned SSM parameter
@@ -86,26 +163,20 @@ which Test prefixes are SSM-required and so legitimately omitted
 from the tier3-no-ssm RUN_FILTER. Update it when a test gains or
 loses a hard SSM dependency.
 
-`10_`, `15_`, and `17_` intentionally exercise the qURL resolve path,
-which opens the AC `defaultset` pinhole for the smoke runner's source
-IP for the env's OpenTime window. `17_qurl_router_authz_gate_test.go`
-is the source of truth for the detailed L3 precondition assumptions.
-Do not add a later `18_+` smoke test that expects public
-`*.qurl.site:443` to be L3-closed from the same runner IP unless the
-test runs before those resolve-path files or isolates its egress/source
-IP; otherwise it will inherit the still-open pinhole and false-pass.
-When PR3 makes smoke required, explicitly revisit whether `17_` should
-remain one fail-loud required status or split qURL resolve precondition
-and no-cookie gate assertion into separate statuses. The current default
-is fail-loud with the `L3 precondition for qurl-router authz smoke`
-context so an Auth0 M2M/qurl-service outage cannot skip a security fence.
-Include the Auth0/qurl-service capacity footprint and worst-case runtime
-(45s resolve retry budget plus 15s post-resolve probe budget) in that
-PR3 decision instead of inheriting today's report-only trade-off silently.
-During burn-in, track `17_` failures that mention pre-TLS EOF/timeout retries
-exhausting or timeouts after TLS completion; those are the likely AC
-drain/slow-path noise shapes to understand before promoting the smoke to
-required.
+The qURL resolve/minting smoke tests (formerly the `10_` happy-path,
+`15_`, and `17_`) used to exercise the qURL resolve path, which opens the
+AC `defaultset` pinhole for the smoke runner's source IP for the env's
+OpenTime window. Those tests were removed (qURL minting is a qurl-service
+concern), so **no smoke test opens that pinhole today** — the old caveat
+about a later `18_+` test inheriting a still-open `*.qurl.site:443`
+pinhole and false-passing no longer applies. `10_resolve_test.go` now
+exercises only the bad-token→403 rejection path, which mints nothing.
+
+The deployed-nhp `/plugins/qurl` resolve contract these covered (302 +
+cookie domain + `Accept`-negotiation, the qurl-router silent-drop gate, and
+the knock-ready "lie detector") has no qurl-service equivalent yet; backfill
+is tracked in
+[qurl-service#1020](https://github.com/layervai/qurl-service/issues/1020).
 
 ### Deploy-mode tier mapping
 

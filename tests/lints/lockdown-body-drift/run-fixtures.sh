@@ -17,7 +17,7 @@
 # These fixtures pre-flush every failure mode the lint claims to catch, on every
 # CI run, and exercise the otherwise-unused 3-arg override interface.
 #
-# Mirrors the pattern of tests/lints/redirect-url-drift/run-fixtures.sh:
+# Mirrors the pattern of the other tests/lints/*/run-fixtures.sh suites:
 # array-of-specs, lockstep consistency check between the array and the on-disk
 # fixture dirs, single trapped tempdir.
 #

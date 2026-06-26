@@ -70,6 +70,11 @@ func TestPlugins_UnknownASPIDReturns404(t *testing.T) {
 // plugin dispatcher's perspective (what happens when the handler
 // returns an error). A regression in either path fails a test.
 func TestPlugins_NoTokenReturnsBranded403(t *testing.T) {
+	// The branded 403 page is served only when a qURL resource/plugin is
+	// provisioned for the host. The self-contained local stack has no qURL
+	// resource (qURL provisioning is a qurl-service concern), so /plugins/qurl
+	// returns a plain 404 there — skip on local; this fence runs on remote.
+	requireRemote(t)
 	resp, body := doGetNoRedirect(t, testConfig.NHPServerBaseURL, "/plugins/qurl", nil)
 	assertStatusCode(t, resp, http.StatusForbidden)
 

@@ -70,6 +70,7 @@ import (
 // browser execution is out of scope for smoke per CLAUDE.md; this is a deployed
 // byte tripwire.
 func TestQurlLinkFrontend_VerifierWireContract(t *testing.T) {
+	requireRemote(t) // remote-only: serves the qurl.link SPA, which is not part of the NHP stack.
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
 	htmlStr := string(body)
@@ -139,6 +140,7 @@ func TestQurlLinkFrontend_VerifierWireContract(t *testing.T) {
 // deployed root must keep serving the landing copy rather than reverting to a
 // spinner-only verifier.
 func TestQurlLinkFrontend_RootServesConsumerLandingPage(t *testing.T) {
+	requireRemote(t) // remote-only: serves the qurl.link SPA, which is not part of the NHP stack.
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
 	bodyStr := string(body)
@@ -195,6 +197,7 @@ func TestQurlLinkFrontend_RootServesConsumerLandingPage(t *testing.T) {
 }
 
 func TestQurlLinkFrontend_ServesCrawlerAssets(t *testing.T) {
+	requireRemote(t) // remote-only: serves the qurl.link SPA, which is not part of the NHP stack.
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/robots.txt", nil)
 	assertStatusCode(t, resp, http.StatusOK)
 
@@ -295,6 +298,7 @@ func qurlOGImageHasLayerVWordmarkPixels(img image.Image) bool {
 // ingress: JS-agent environments must use relay only; legacy environments keep
 // the hostname-derived resolve endpoint until their cutover flag flips.
 func TestQurlLinkFrontend_UsesExpectedIngress(t *testing.T) {
+	requireRemote(t) // remote-only: serves the qurl.link SPA, which is not part of the NHP stack.
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
 	script := inlineVerifierScript(t, string(body))
@@ -326,6 +330,7 @@ func TestQurlLinkFrontend_UsesExpectedIngress(t *testing.T) {
 // terraform didn't roll forward). Failure here means real users hit
 // the SPA's branded error page on every visit.
 func TestQurlLinkFrontend_AllowlistContainsServingHost(t *testing.T) {
+	requireRemote(t) // remote-only: serves the qurl.link SPA, which is not part of the NHP stack.
 	u, err := url.Parse(testConfig.QURLLinkOrigin)
 	if err != nil || u.Hostname() == "" {
 		t.Fatalf("testConfig.QURLLinkOrigin = %q does not parse to a usable host: %v", testConfig.QURLLinkOrigin, err)
@@ -525,6 +530,7 @@ func sha384SRI(body []byte) string {
 }
 
 func TestQurlLinkFrontend_JSAgentBundleIntegrity(t *testing.T) {
+	requireRemote(t) // remote-only: serves the qurl.link SPA, which is not part of the NHP stack.
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
 
@@ -599,6 +605,7 @@ func TestQurlLinkFrontend_JSAgentBundleIntegrity(t *testing.T) {
 }
 
 func TestQurlLinkFrontend_CSPOmitsUnsafeInlineScript(t *testing.T) {
+	requireRemote(t) // remote-only: serves the qurl.link SPA, which is not part of the NHP stack.
 	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
 	assertStatusCode(t, resp, http.StatusOK)
 

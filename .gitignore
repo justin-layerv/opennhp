@@ -156,6 +156,10 @@ dist/
 release/
 bin/
 
+# Smoke suite run artifact (written by scripts/run-smoke.sh's tee; consumed by
+# CI steps in-job, never committed).
+tests/smoke/test-output.txt
+
 # Debug
 debug
 *.dSYM/

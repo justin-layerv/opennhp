@@ -1,0 +1,106 @@
+name: NHP Smoke (PR)
+
+# Runs the smoke harness at PR time, with NO AWS credentials and NO secrets:
+#
+#   1. smoke-build — compile + vet the smoke suite under -tags=smoke and run
+#      the tier-filter coverage fence. The smoke module is otherwise never
+#      built at PR time (codeql builds nhp/internalauth/endpoints only), so a
+#      smoke test that doesn't compile currently only fails post-deploy on
+#      main, where it blocks the deploy pipeline. This closes that gap.
+#
+#   2. smoke-local — bring up the self-contained local stack (nhp-server +
+#      nhp-ac + dynamodb-local) via scripts/run-smoke.sh (TARGET=local) and run
+#      the wire-contract `local` tier against the PR's freshly-built binaries.
+#      This is the only smoke path that exercises a PR's OWN code:
+#      the deployed sandbox/prod smoke (nhp-smoke-tests.yml) runs against
+#      already-deployed binaries.
+#
+# Both jobs are safe for fork PRs — no OIDC role, no Secrets Manager, no
+# deployed environment is touched.
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "tests/smoke/**"
+      - "scripts/run-smoke.sh"
+      - "scripts/smoke-local-stack.sh"
+      - "scripts/check-smoke-tier-filter-coverage.sh"
+      - "endpoints/server/**"
+      - "endpoints/ac/**"
+      - "endpoints/go.mod"
+      - "endpoints/go.sum"
+      - "nhp/**"
+      - "internalauth/**"
+      - "docker/nhp-server/templates/**"
+      - ".github/workflows/nhp-smoke-pr.yml"
+
+permissions: {}
+
+concurrency:
+  group: nhp-smoke-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-build:
+    name: Smoke build + vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: tests/smoke/go.mod
+          cache-dependency-path: tests/smoke/go.sum
+
+      # go build + go vet under -tags=smoke, plus the tier-filter coverage
+      # fence. Mirrors `make smoke-build` (kept as a shell step so the failure
+      # output is inline rather than behind a make recipe).
+      - name: Build + vet smoke suite
+        working-directory: tests/smoke
+        run: |
+          set -euo pipefail
+          go build -tags=smoke ./...
+          go vet -tags=smoke ./...
+
+      - name: Check smoke tier filter coverage
+        run: bash scripts/check-smoke-tier-filter-coverage.sh
+
+  smoke-local:
+    name: Smoke (local stack)
+    needs: smoke-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: tests/smoke/go.mod
+          cache-dependency-path: tests/smoke/go.sum
+
+      # Docker and the AWS CLI are preinstalled on ubuntu-latest; run-smoke.sh
+      # uses them to bring up dynamodb-local + nhp-server and create the local
+      # tables. No AWS credentials are needed (dynamodb-local ignores them).
+      - name: Run local-stack smoke
+        env:
+          TARGET: local
+        run: ./scripts/run-smoke.sh
+
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nhp-smoke-pr-local-output
+          path: tests/smoke/test-output.txt
+          retention-days: 7

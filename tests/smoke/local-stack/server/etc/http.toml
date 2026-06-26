@@ -1,0 +1,9 @@
+# Local smoke stack HTTP listener: plain HTTP on 8888. This matches the
+# image HEALTHCHECK (curl http://localhost:8888/health/live) and the
+# deployed posture where TLS terminates at the NLB and the server speaks
+# plain HTTP on 8888. The smoke harness points NHPServerBaseURL at
+# http://localhost:8888 for the local target.
+EnableHttp = true
+EnableTLS = false
+HttpListenIp = "0.0.0.0"
+HttpListenPort = 8888

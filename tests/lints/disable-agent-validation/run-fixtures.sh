@@ -16,7 +16,7 @@
 # violation. Fixtures pre-flush every failure mode the lint claims
 # to catch on every CI run.
 #
-# Mirrors the pattern of tests/lints/redirect-url-drift/run-fixtures.sh.
+# Mirrors the pattern of the other tests/lints/*/run-fixtures.sh suites.
 #
 # Usage:
 #   ./tests/lints/disable-agent-validation/run-fixtures.sh

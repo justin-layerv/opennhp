@@ -333,6 +333,7 @@ func resolvePublicALBLockdownExpectedBody(ctx context.Context, env string) (map[
 // error other than ParameterNotFound is a smoke-suite setup bug.
 func getSSMParameter(t *testing.T, name string) (string, bool) {
 	t.Helper()
+	requireRemote(t)
 
 	value, ok, err := readSSMParameterWithContext(context.Background(), name)
 	if err != nil {

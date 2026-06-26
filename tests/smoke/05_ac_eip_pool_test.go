@@ -35,6 +35,7 @@ import (
 // can't be reached by the NHP server for AOP messages, or it can't
 // egress to AWS APIs, depending on how the missing EIP manifests.
 func TestACEIPPool_AllActiveACsHaveEIP(t *testing.T) {
+	requireRemote(t) // AC Elastic IP pool is AWS-only; no equivalent in the local stack.
 	asgName := requireActiveACASG(t)
 
 	instances := describeInServiceInstances(t, asgName)
@@ -76,6 +77,7 @@ func TestACEIPPool_AllActiveACsHaveEIP(t *testing.T) {
 //
 // Regression fence for PR #1006.
 func TestACEIPPool_PoolSizeMeetsMinimum(t *testing.T) {
+	requireRemote(t) // AC Elastic IP pool is AWS-only; no equivalent in the local stack.
 	asgName := requireActiveACASG(t)
 
 	// The EIP pool is tagged EIPPool=layerv-nhp-{env}-ac. Tag key and
@@ -151,6 +153,7 @@ func TestACEIPPool_PoolSizeMeetsMinimum(t *testing.T) {
 //
 // Regression fence for PR #1006.
 func TestACEIPPool_AlarmEvaluationPeriodsAtLeast3(t *testing.T) {
+	requireRemote(t) // CloudWatch alarm config is AWS-only; no equivalent in the local stack.
 	alarmName := fmt.Sprintf("layerv-nhp-%s-ac-eip-pool-utilization-high", testConfig.Environment)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

@@ -31,6 +31,7 @@ var letsEncryptIntermediateCN = regexp.MustCompile(`^[RE]\d+$`)
 // A cert approaching expiry would trigger this test 30 days before
 // the actual outage, giving the team a month to act.
 func TestProtocol_NLBTLSCertValid(t *testing.T) {
+	requireRemote(t) // remote-only: asserts the real NLB TLS cert (local stack is plain HTTP).
 	parsed, err := url.Parse(testConfig.NHPServerBaseURL)
 	if err != nil {
 		t.Fatalf("parse NHPServerBaseURL %q: %v", testConfig.NHPServerBaseURL, err)

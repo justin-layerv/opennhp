@@ -39,11 +39,11 @@ const (
 	knockRetryDelay = 2 * time.Second
 
 	// redirectURLField names the JSON field on the JSON branch of
-	// /plugins/qurl. MIRROR: redirectURLField in
-	// tests/smoke/15_resolve_accept_negotiation_test.go must rename
-	// in lockstep — they live in separate Go modules so an import
-	// would create a worse coupling. Same name on both sides reduces
-	// #1325's CI grep guard to a literal grep. Tracked in #1325.
+	// /plugins/qurl. Its value is verified in-process by main_test.go.
+	// The wire-level (deployed-server) verification — and the #1325
+	// cross-module drift guard against
+	// tests/smoke/15_resolve_accept_negotiation_test.go — were retired
+	// when the qURL-minting smoke tests moved to the qurl-service repo.
 	redirectURLField = "redirect_url"
 )
 

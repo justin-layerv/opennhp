@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Validate that every Test<Prefix>_ declared in tests/smoke/0X_*_test.go
-# is reachable by the corresponding tier in
-# .github/workflows/nhp-smoke-tests.yml's RUN_FILTER, and conversely
-# that every alternation token in each RUN_FILTER corresponds to at
-# least one real Test<Token>_ declaration.
+# is reachable by the corresponding tier in scripts/run-smoke.sh's
+# RUN_FILTER, and conversely that every alternation token in each
+# RUN_FILTER corresponds to at least one real Test<Token>_ declaration.
+#
+# RUN_FILTER is the SINGLE SOURCE OF TRUTH in scripts/run-smoke.sh (the
+# shared entrypoint that local pre-PR, PR CI, and post-deploy CI all call).
+# It used to live inline in .github/workflows/nhp-smoke-tests.yml; this
+# checker moved with it.
 #
 # Catches both directions of the silent-skip class:
 # - token-without-test (a filter token without a matching
@@ -22,14 +26,14 @@ set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 SMOKE_DIR="${REPO_ROOT}/tests/smoke"
-WORKFLOW="${REPO_ROOT}/.github/workflows/nhp-smoke-tests.yml"
+FILTER_SRC="${REPO_ROOT}/scripts/run-smoke.sh"
 
 if [ ! -d "$SMOKE_DIR" ]; then
   echo "ERROR: $SMOKE_DIR not found" >&2
   exit 1
 fi
-if [ ! -f "$WORKFLOW" ]; then
-  echo "ERROR: $WORKFLOW not found" >&2
+if [ ! -f "$FILTER_SRC" ]; then
+  echo "ERROR: $FILTER_SRC not found" >&2
   exit 1
 fi
 
@@ -113,7 +117,7 @@ extract_filter_tokens() {
       exit
     }
     in_block && stripped == ";;" { in_block=0 }
-  ' "$WORKFLOW" | sed '/^$/d' | sort -u
+  ' "$FILTER_SRC" | sed '/^$/d' | sort -u
 }
 
 # Run two-way consistency check for a single tier label against its
@@ -130,14 +134,14 @@ check_tier() {
   done < <(extract_filter_tokens "$label")
 
   # Structural-drift fence: if the awk extractor returned zero
-  # tokens, the script's RUN_FILTER assumption (single-line single-
+  # tokens, run-smoke.sh's RUN_FILTER assumption (single-line single-
   # quoted `^Test(...)_` after the case label) has broken — likely
-  # because someone reformatted the YAML to a multi-line block
-  # scalar or switched quote style. Without this guard the script
-  # silently reports OK when in fact it parsed nothing, defeating
-  # the regression class it exists to prevent.
+  # because someone reformatted the case block to a multi-line string
+  # or switched quote style. Without this guard the script silently
+  # reports OK when in fact it parsed nothing, defeating the
+  # regression class it exists to prevent.
   if [ "${#tokens[@]}" -eq 0 ]; then
-    echo "ERROR [$label]: extracted zero tokens from RUN_FILTER — likely YAML reformat (multi-line scalar, quote-style change, or case-label rename) broke the awk parser. Re-check $WORKFLOW or update extract_filter_tokens()." >&2
+    echo "ERROR [$label]: extracted zero tokens from RUN_FILTER — likely a run-smoke.sh reformat (multi-line string, quote-style change, or case-label rename) broke the awk parser. Re-check $FILTER_SRC or update extract_filter_tokens()." >&2
     return 1
   fi
 
@@ -152,7 +156,10 @@ check_tier() {
   done
 
   # test-without-token: real prefix not in filter alternation
-  # (skip for label=all which has empty filter)
+  # (skip for label=all, which has an empty filter, and label=local,
+  # which is a curated allow-list of the wire-contract subset that runs
+  # against the self-contained local stack — most tests are AWS-infra or
+  # qURL and legitimately absent from it)
   #
   # `tier3_no_ssm_expected_omissions` is the single source of truth
   # for prefixes that are intentionally omitted from tier3-no-ssm
@@ -174,7 +181,7 @@ check_tier() {
     done
     return 1
   }
-  if [ "$label" != "all" ]; then
+  if [ "$label" != "all" ] && [ "$label" != "local" ]; then
     for r in "${real[@]:-}"; do
       [ -z "$r" ] && continue
       if ! printf '%s\n' "${tokens[@]:-}" | grep -qx "$r"; then
@@ -261,7 +268,7 @@ for prefix in "${tier3_no_ssm_expected_omissions[@]}"; do
     continue
   fi
   if ! grep -qE "$ssm_helper_regex" "${matching_files[@]}"; then
-    echo "ERROR [tier3-no-ssm-exemption]: prefix '${prefix}' is in tier3_no_ssm_expected_omissions but its test file(s) (${matching_files[*]}) contain NO calls to helpers defined in $SSM_PROBE_FILE (sendShellScript / probe* family). Either (a) the test no longer needs SSM RunShellScript — remove from the exemption list AND add '${prefix}' to tier3-no-ssm RUN_FILTER in nhp-smoke-tests.yml, OR (b) the test uses a different SSM mechanism (e.g., CloudWatch Logs Insights via the AWS SDK, SSM Parameter Store via getSSMParameter) — those are not gated by the 30-day allow_ssm_probes burn-in, so they belong in tier3-no-ssm and the entry should be removed from this exemption list."
+    echo "ERROR [tier3-no-ssm-exemption]: prefix '${prefix}' is in tier3_no_ssm_expected_omissions but its test file(s) (${matching_files[*]}) contain NO calls to helpers defined in $SSM_PROBE_FILE (sendShellScript / probe* family). Either (a) the test no longer needs SSM RunShellScript — remove from the exemption list AND add '${prefix}' to tier3-no-ssm RUN_FILTER in scripts/run-smoke.sh, OR (b) the test uses a different SSM mechanism (e.g., CloudWatch Logs Insights via the AWS SDK, SSM Parameter Store via getSSMParameter) — those are not gated by the 30-day allow_ssm_probes burn-in, so they belong in tier3-no-ssm and the entry should be removed from this exemption list."
     ssm_dep_errs=$((ssm_dep_errs+1))
   fi
 done
@@ -277,12 +284,15 @@ check_tier "tier1+tier2" "${combined[@]:-}" || errs=$((errs+$?))
 all_real=()
 dedupe_array all_real "${tier1_prefixes[@]:-}" "${tier2_prefixes[@]:-}" "${tier3_prefixes[@]:-}"
 check_tier "tier3-no-ssm" "${all_real[@]:-}" || errs=$((errs+$?))
+# local is a curated allow-list (like `all`): validate its tokens are real
+# (token-without-test) but do not require every test to appear in it.
+check_tier "local" "${all_real[@]:-}" || errs=$((errs+$?))
 
 total_errs=$((errs + ssm_dep_errs))
 if [ "$total_errs" -gt 0 ]; then
   echo ""
   if [ "$errs" -gt 0 ]; then
-    echo "FAIL: $errs RUN_FILTER coverage error(s) in $WORKFLOW"
+    echo "FAIL: $errs RUN_FILTER coverage error(s) in $FILTER_SRC"
     echo "      Each token in a RUN_FILTER must have a matching ^func Test<Token>_ declaration"
     echo "      in some 0X_*_test.go file routing to that tier, and conversely."
   fi

@@ -23,8 +23,8 @@ import (
 )
 
 // TestMain runs once per go test process. It loads configuration from
-// environment variables, constructs AWS SDK clients, derives URLs from
-// NHP_ENVIRONMENT, and pre-fetches (or reuses) an Auth0 M2M bearer.
+// environment variables, constructs AWS SDK clients, and derives URLs from
+// NHP_ENVIRONMENT.
 //
 // The heavy lifting (struct definition, require* helpers, derivation)
 // lives in config.go so non-test files can use it too. This file owns
@@ -34,11 +34,11 @@ func TestMain(m *testing.M) {
 
 	env := strings.TrimSpace(os.Getenv("NHP_ENVIRONMENT"))
 	if env == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: NHP_ENVIRONMENT must be set to 'sandbox' or 'prod'")
+		fmt.Fprintln(os.Stderr, "ERROR: NHP_ENVIRONMENT must be set to 'local', 'sandbox', or 'prod'")
 		os.Exit(2)
 	}
-	if env != "sandbox" && env != "prod" {
-		fmt.Fprintf(os.Stderr, "ERROR: NHP_ENVIRONMENT must be 'sandbox' or 'prod', got %q\n", env)
+	if env != EnvLocal && env != "sandbox" && env != "prod" {
+		fmt.Fprintf(os.Stderr, "ERROR: NHP_ENVIRONMENT must be 'local', 'sandbox', or 'prod', got %q\n", env)
 		os.Exit(2)
 	}
 
@@ -58,10 +58,6 @@ func TestMain(m *testing.M) {
 		QURLInternalAPIHostname: getEnvOrDefault("QURL_INTERNAL_API_HOSTNAME", derived.QURLInternalAPIHostname),
 		QURLSiteDomain:          getEnvOrDefault("QURL_SITE_DOMAIN", derived.QURLSiteDomain),
 		QURLLinkOrigin:          getEnvOrDefault("QURL_LINK_ORIGIN", derived.QURLLinkOrigin),
-		Auth0Domain:             getEnvOrDefault("AUTH0_DOMAIN", "auth.layerv.ai"),
-		Auth0Audience:           getEnvOrDefault("AUTH0_AUDIENCE", derived.QURLAPIBaseURL),
-		Auth0ClientID:           os.Getenv("AUTH0_CLIENT_ID"),
-		Auth0ClientSecret:       os.Getenv("AUTH0_CLIENT_SECRET"),
 		AllowSSMProbes:          strings.EqualFold(os.Getenv("NHP_SMOKE_ALLOW_SSM_PROBES"), "true"),
 		QURLInternalALBEnabled:  strings.EqualFold(os.Getenv("NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED"), "true"),
 		AWSRegion:               region,
@@ -86,6 +82,22 @@ func TestMain(m *testing.M) {
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+	}
+
+	// Local self-contained stack: no AWS control-plane and no Auth0 /
+	// qurl-service. scripts/run-smoke.sh brings up nhp-server +
+	// dynamodb-local via docker compose; the suite only needs
+	// NHPServerBaseURL (default http://localhost:8888, override with
+	// NHP_SERVER_BASE_URL when the compose stack maps the port elsewhere).
+	// Skip the AWS SDK clients, deploy-mode discovery, and the lockdown-body
+	// resolve — the curated `local` tier runs only
+	// the wire-contract subset, and any remote-only test reached here skips
+	// via requireRemote, skipIfNot{BlueGreen,Canary} (DeployMode stays
+	// empty), or skipIfNoSSMProbes (AllowSSMProbes is false).
+	if env == EnvLocal {
+		fmt.Fprintf(os.Stderr, "smoke: env=local server=%s (self-contained stack; AWS control-plane skipped)\n",
+			testConfig.NHPServerBaseURL)
+		os.Exit(m.Run())
 	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
@@ -143,18 +155,6 @@ func TestMain(m *testing.M) {
 		} else {
 			publicALBLockdownExpectedBody = body
 			fmt.Fprintf(os.Stderr, "smoke: public-ALB lockdown expected body resolved from SSM: %v\n", body)
-		}
-	}
-
-	// Pre-fetch (or cache-hit) the Auth0 bearer. Failure is non-fatal
-	// for Tier 1 — Auth0-dependent tests will call requireAuth0 and
-	// fail explicitly if the token is missing.
-	if testConfig.Auth0ClientID != "" && testConfig.Auth0ClientSecret != "" {
-		tok, err := getOrMintCachedAuth0Token(ctx, testConfig)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "WARNING: Auth0 token prefetch failed: %v\n", err)
-		} else {
-			testConfig.CachedAuth0Token = tok
 		}
 	}
 

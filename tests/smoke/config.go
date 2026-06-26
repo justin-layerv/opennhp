@@ -32,11 +32,11 @@ const (
 // every test.
 //
 // This struct lives in a non-test file so that other non-test helpers
-// (qurl_client.go, ssm_probe.go, auth0.go) can take a *TestConfig or
-// read testConfig without running into the "can't use _test.go
-// identifiers from regular .go" compile rule.
+// (ssm_probe.go) can take a *TestConfig or read testConfig without
+// running into the "can't use _test.go identifiers from regular .go"
+// compile rule.
 type TestConfig struct {
-	Environment string // "sandbox" or "prod"
+	Environment string // "local", "sandbox", or "prod"
 
 	// DeployMode is the deployment model in effect for this
 	// environment: DeployModeBlueGreen or DeployModeCanary. Sourced
@@ -75,11 +75,13 @@ type TestConfig struct {
 	// `derivedEndpoints.NHPServerOriginURL`.
 	NHPServerOriginURL string
 
-	// QURLAPIBaseURL is the QURL service API (api.layerv.xyz in
-	// sandbox, api.layerv.ai in prod). Distinct from
-	// NHPServerBaseURL — this is what the NHP /plugins/qurl handler
-	// calls outbound to POST /internal/v1/resolve, and what Tier 2
-	// resolve tests call to mint QURLs.
+	// QURLAPIBaseURL is the QURL service API host (api.layerv.xyz in
+	// sandbox, api.layerv.ai in prod). Distinct from NHPServerBaseURL —
+	// this is what the NHP /plugins/qurl handler calls outbound to POST
+	// /internal/v1/resolve. The remaining smoke consumer is the
+	// public-ALB /internal/* lockdown fence (09_public_alb_internal_lockdown),
+	// which targets this host. (qURL-minting resolve tests were moved out
+	// of nhp — see tests/smoke/CLAUDE.md.)
 	QURLAPIBaseURL string
 
 	// QURLInternalAPIHostname is the bare hostname for the qurl-service
@@ -102,9 +104,10 @@ type TestConfig struct {
 	QURLInternalALBEnabled bool
 
 	// QURLSiteDomain is the parent domain of per-resource qurl.site
-	// hostnames. Tier 2 resolve tests assert:
-	//   - cookie Domain attribute equals this
-	//   - 302 Location host has this as its suffix
+	// hostnames. Retained for the deriveEndpoints regression fence
+	// (dns_test.go, the #1329 registered-apex guard); the qURL resolve
+	// tests that asserted cookie Domain / 302 Location against it were
+	// moved out of nhp (see tests/smoke/CLAUDE.md).
 	QURLSiteDomain string
 
 	// QURLLinkOrigin is the origin (scheme + host) of the qurl.link
@@ -112,16 +115,6 @@ type TestConfig struct {
 	// as the Origin header on cross-origin fetch() simulations and
 	// assert the server echoes it back in Access-Control-Allow-Origin.
 	QURLLinkOrigin string
-
-	Auth0Domain       string
-	Auth0Audience     string
-	Auth0ClientID     string
-	Auth0ClientSecret string
-
-	// CachedAuth0Token is the SSM-backed cached bearer populated in
-	// TestMain. Empty string means either credentials were unset or
-	// the fetch failed; tests gate on this via requireAuth0.
-	CachedAuth0Token string
 
 	// AllowSSMProbes gates every SSM RunShellScript call. Sandbox runs
 	// with true; prod defaults to false during the 30-day burn-in.
@@ -149,9 +142,9 @@ type TestConfig struct {
 }
 
 // testConfig is the package-global config populated in TestMain.
-// Tests read it directly; non-test helpers (auth0.go, qurl_client.go)
-// take a *TestConfig parameter so they're callable from unit tests
-// without the package-global being set.
+// Tests read it directly; non-test helpers (ssm_probe.go) take a
+// *TestConfig parameter so they're callable from unit tests without
+// the package-global being set.
 var testConfig *TestConfig
 
 // getEnvOrDefault returns the value of key, or def if key is unset or
@@ -163,23 +156,41 @@ func getEnvOrDefault(key, def string) string {
 	return def
 }
 
-// requireAuth0 fails the test if no Auth0 bearer was pre-fetched.
-// Auth0 credentials are mandatory for Tier 2 tests that mint QURLs;
-// this helper is a hard fail (not skip) because a missing token is
-// usually a CI misconfiguration we want to see, not a silent pass.
-func requireAuth0(t *testing.T) string {
+// EnvLocal is the NHP_ENVIRONMENT value for the self-contained local stack
+// (nhp-server + AC + dynamodb-local) brought up by scripts/run-smoke.sh,
+// as opposed to a deployed sandbox/prod environment. Local runs have no AWS
+// control-plane (SSM/CloudWatch/ASG/...) and no Auth0/qurl-service, so the
+// AWS-infra and qURL fences skip via requireRemote and the curated `local`
+// tier in scripts/run-smoke.sh selects only the wire-contract subset.
+const EnvLocal = "local"
+
+// IsLocal reports whether the suite is running against the local stack.
+func (c *TestConfig) IsLocal() bool { return c.Environment == EnvLocal }
+
+// requireRemote skips the test cleanly when running against the local stack.
+// Use at the top of any test (or shared helper) that asserts AWS-deployed
+// infrastructure — SSM params, ASG/blue-green/canary state, CloudWatch
+// alarms/logs, EIP pools, the instance Docker image — or that mints qURLs
+// via Auth0 + qurl-service. None of that exists in the local target.
+//
+// The curated `local` tier in scripts/run-smoke.sh is the primary selector
+// (it runs only the wire-contract subset); this is defense in depth so a
+// remote-only test invoked under NHP_ENVIRONMENT=local skips cleanly instead
+// of dereferencing a nil AWS client. It mirrors the skipIfNot* naming: a
+// local target is a deliberate POLICY state, not a broken-setup state.
+func requireRemote(t *testing.T) {
 	t.Helper()
-	if testConfig.CachedAuth0Token == "" {
-		t.Fatal("Auth0 token not available — AUTH0_CLIENT_ID/AUTH0_CLIENT_SECRET missing or token fetch failed")
+	if testConfig.IsLocal() {
+		t.Skip("skipped: NHP_ENVIRONMENT=local (self-contained stack) — this fence needs a deployed AWS environment")
 	}
-	return testConfig.CachedAuth0Token
 }
 
 // requireCWLogs fails the test if the CloudWatch Logs client is not
 // initialized. Setup unconditionally sets this, so nil indicates a
-// broken harness — fail hard, not skip (matches requireAuth0).
+// broken harness — fail hard, not skip (like the other require* helpers).
 func requireCWLogs(t *testing.T) {
 	t.Helper()
+	requireRemote(t)
 	if testConfig.CWLogsClient == nil {
 		t.Fatal("CWLogsClient not initialized — setup did not run or AWS config failed")
 	}
@@ -188,8 +199,8 @@ func requireCWLogs(t *testing.T) {
 // skipIfNoSSMProbes is named "skip..." (not "require...") because
 // SSM probes being disabled is a deliberate POLICY state — prod
 // runs with AllowSSMProbes=false during the 30-day burn-in — not a
-// broken-setup state. Compare requireAuth0, which t.Fatalfs on
-// missing credentials because that IS a broken-setup state. The
+// broken-setup state. Compare the require* helpers (e.g. requireCWLogs),
+// which t.Fatal on missing setup because that IS a broken-setup state. The
 // require/skipIf name prefixes make the intended severity legible
 // at the call site.
 func skipIfNoSSMProbes(t *testing.T) {
@@ -251,6 +262,7 @@ func skipIfNotCanary(t *testing.T) {
 // missing gate instead.
 func requireActiveColor(t *testing.T) string {
 	t.Helper()
+	requireRemote(t)
 	if testConfig.DeployMode != DeployModeBlueGreen {
 		t.Fatalf("requireActiveColor called in deploy mode %q — gate the caller with skipIfNotBlueGreen(t) first",
 			testConfig.DeployMode)
@@ -306,6 +318,7 @@ func requireActiveACASG(t *testing.T) string {
 // the env is blue/green or canary.
 func requireServingASG(t *testing.T, component string) string {
 	t.Helper()
+	requireRemote(t)
 	switch testConfig.DeployMode {
 	case DeployModeBlueGreen:
 		return requireColoredASG(t, component, requireActiveColor(t))

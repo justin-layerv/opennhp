@@ -25,9 +25,7 @@ package smoke
 // for the same client IP.
 
 import (
-	"context"
 	"math"
-	"net/url"
 	"testing"
 	"time"
 )
@@ -58,47 +56,6 @@ func TestTiming_HealthResponseP95(t *testing.T) {
 	median := percentile(durations, 50)
 	t.Logf("/health/live timing: median=%s p95=%s (n=%d) — informational only, no SLO threshold",
 		median.Round(time.Millisecond), p95.Round(time.Millisecond), len(durations))
-}
-
-// TestTiming_ResolveMax measures 3 samples of the full mint→resolve
-// chain and logs the slowest observed. Does NOT fail.
-//
-// The 10s bound reflects knockMaxAttempts=3 × knockRetryDelay=2s
-// from staticplugins/qurl/main.go:30-35. Worst-case happy path:
-// two failed knock attempts + retry waits + a success.
-//
-// Named "Max" rather than "P95" because at n=3, p95 collapses to the
-// single slowest sample — a real p95 needs ≥ ~20 samples, and each
-// resolve here is expensive (mint + knock + AC ipset open) so we keep
-// the sample count low. The other timing tests (n=20) are real p95s.
-func TestTiming_ResolveMax(t *testing.T) {
-	const samples = 3
-	// Test-scoped ctx so a stuck mint can't outlive the test itself.
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	durations := make([]time.Duration, 0, samples)
-
-	for i := 0; i < samples; i++ {
-		start := time.Now()
-		minted := mintSmokeQURL(ctx, t, "https://example.com")
-		resp, _ := doPostFormNoRedirect(t, testConfig.NHPServerBaseURL,
-			"/plugins/qurl", "token="+url.QueryEscape(minted.AccessToken()), nil)
-		elapsed := time.Since(start)
-		if resp.StatusCode == 302 {
-			durations = append(durations, elapsed)
-		} else {
-			t.Logf("resolve sample %d: status %d (expected 302), dropping from distribution", i, resp.StatusCode)
-		}
-	}
-
-	if len(durations) == 0 {
-		t.Log("no successful resolve samples to measure")
-		return
-	}
-
-	slowest := percentile(durations, 100)
-	t.Logf("resolve timing: max=%s (n=%d) — informational only, no SLO threshold",
-		slowest.Round(time.Millisecond), len(durations))
 }
 
 // TestTiming_KnockReadyMedian measures 20 samples of

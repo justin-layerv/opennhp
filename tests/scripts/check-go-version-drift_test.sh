@@ -37,7 +37,8 @@ write_good_fixture() {
     "$dir/endpoints" \
     "$dir/examples/server_plugin" \
     "$dir/tests/local" \
-    "$dir/tests/smoke"
+    "$dir/tests/smoke" \
+    "$dir/tests/smoke/local-stack"
   ln -sf "$SCRIPT" "$dir/scripts/check-go-version-drift.sh"
 
   for mod in nhp internalauth endpoints examples/server_plugin tests/local tests/smoke; do
@@ -65,6 +66,13 @@ EOF
 FROM golang:${version}-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
 EOF
   done
+
+  # The smoke local-stack builder is the one golang FROM outside docker/ that
+  # check-go-version-drift.sh fences (added to golang_from_files + the widened
+  # discovery root). Keep it in the in-sync fixture so that fence stays tested.
+  cat > "$dir/tests/smoke/local-stack/Dockerfile" <<EOF
+FROM golang:${version}-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
+EOF
 
   for dockerfile in Dockerfile.app Dockerfile.base; do
     cat > "$dir/docker/$dockerfile" <<EOF
@@ -426,6 +434,22 @@ EOF
   assert_failure "$name" "$tmp" "docker/Dockerfile.extra: contains a golang FROM but is not listed in golang_from_files"
 }
 
+# Fences the discovery widening: a golang FROM Dockerfile under
+# tests/smoke/local-stack that isn't in golang_from_files must be caught the
+# same way as an unlisted docker/ one, so a future local-stack Dockerfile can't
+# silently escape the GO_VERSION lockstep.
+test_unlisted_smoke_dockerfile_golang_from_fails() {
+  local name="unlisted smoke local-stack Dockerfile golang FROM fails"
+  local tmp
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+  write_good_fixture "$tmp"
+  cat > "$tmp/tests/smoke/local-stack/Dockerfile.extra" <<EOF
+FROM golang:1.26.4-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
+EOF
+  assert_failure "$name" "$tmp" "tests/smoke/local-stack/Dockerfile.extra: contains a golang FROM but is not listed in golang_from_files"
+}
+
 test_dev_dockerfile_checksum_fails() {
   local name="dev Dockerfile missing checksum fails"
   local tmp
@@ -504,6 +528,7 @@ test_second_dockerfile_golang_from_digest_drift_fails
 test_dockerfile_backup_is_ignored
 test_nested_dockerfile_golang_from_fails
 test_unlisted_dockerfile_golang_from_fails
+test_unlisted_smoke_dockerfile_golang_from_fails
 test_dev_dockerfile_checksum_fails
 test_dev_dockerfile_quoted_args_pass
 test_dev_dockerfile_checksum_drift_fails

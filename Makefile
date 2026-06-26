@@ -208,7 +208,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-redirect-url-drift lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns
+lint: lint-qurl-csp-gate-drift lint-qurl-link-og-image lint-disable-agent-validation lint-run-fuzz lint-ac-apt-guard lint-cis-metric-filter-patterns
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd internalauth && golangci-lint run ./...
@@ -248,25 +248,6 @@ lint-disable-agent-validation:
 	@./tests/lints/disable-agent-validation/run-fixtures.sh
 	@./scripts/check-disable-agent-validation.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] DisableAgentValidation check passed!$(END_COLOUR)"
-
-# Fence drift between the `redirectURLField` constant in the plugin
-# handler and the smoke test that verifies the wire contract (#1325).
-# Wired into `make lint` so a one-sided rename trips locally before CI.
-# CI runs the same script + fixtures in `redirect-url-drift-lint` in
-# build-and-push.yml. The fixture suite runs first so a script regression
-# (e.g., a regex tightening that drops a covered case) surfaces before
-# the production paths are checked.
-.PHONY: lint-redirect-url-drift
-lint-redirect-url-drift:
-	@echo "$(COLOUR_BLUE)[OpenNHP] Checking redirect_url drift (#1325)...$(END_COLOUR)"
-	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/check-redirect-url-drift.sh tests/lints/redirect-url-drift/run-fixtures.sh; \
-	else \
-		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
-	fi
-	@./tests/lints/redirect-url-drift/run-fixtures.sh
-	@./scripts/check-redirect-url-drift.sh
-	@echo "$(COLOUR_GREEN)[OpenNHP] redirect_url drift check passed!$(END_COLOUR)"
 
 # Fence qurl.link CSP propagation wait drift from the smoke assertion it is
 # trying to de-flake. Wired into `make lint` so local runs catch a one-sided
@@ -474,28 +455,45 @@ test-local: ## Run local e2e tests (requires: docker compose -f tests/local/dock
 	cd tests/local && go test -v -tags=local ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Local E2E Tests Done!$(END_COLOUR)"
 
-# Smoke tests run against a LIVE environment. See tests/smoke/doc.go
-# for the full environment variable matrix and tests/smoke/README (if
-# added) for the capability map.
-#
-# test-smoke-sandbox uses AWS_PROFILE=layerv and fetches Auth0
-# credentials from Secrets Manager. Requires AWS CLI + jq installed.
+# Smoke tests run via scripts/run-smoke.sh — the single entrypoint shared by
+# local runs, PR CI, and post-deploy CI (see tests/smoke/doc.go for the env
+# matrix and capability map; tests/smoke/CLAUDE.md for the suite rules). The
+# tier -> RUN_FILTER mapping and env-derived flags live in that script, so
+# these targets only supply credentials and the target name.
+
+# test-smoke-local needs no AWS or Auth0: scripts/run-smoke.sh brings up a
+# self-contained stack (nhp-server + nhp-ac + dynamodb-local) via docker
+# compose and runs the wire-contract `local` tier against the freshly-built
+# binaries.
+# Requires Docker + the AWS CLI (for dynamodb-local table creation).
+test-smoke-local: ## Run smoke tests against a self-contained local stack (Docker)
+	@echo "[OpenNHP] Running smoke tests against the local stack..."
+	TARGET=local ./scripts/run-smoke.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] Local smoke tests done!$(END_COLOUR)"
+
+# smoke-build is the credential-free PR-time gate: it compiles and vets the
+# smoke suite under -tags=smoke (the module is otherwise never built at PR
+# time — codeql builds nhp/internalauth/endpoints only) and runs the tier
+# filter coverage fence. Catches a smoke test that doesn't compile before it
+# reaches post-deploy CI on main.
+smoke-build: ## Compile + vet the smoke suite and check tier filter coverage (no creds)
+	@echo "[OpenNHP] Building + vetting smoke suite (-tags=smoke)..."
+	cd tests/smoke && go build -tags=smoke ./... && go vet -tags=smoke ./...
+	@bash scripts/check-smoke-tier-filter-coverage.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] Smoke build/vet done!$(END_COLOUR)"
+
+# test-smoke-sandbox uses AWS_PROFILE=layerv. Override the tier with e.g.
+# `TIER=tier1 make test-smoke-sandbox`. No Auth0/Secrets-Manager fetch — the
+# qURL-minting smoke tests were moved out of nhp (qURL smoke belongs in
+# qurl-service; see tests/smoke/CLAUDE.md).
 test-smoke-sandbox: ## Run smoke tests against sandbox (uses AWS_PROFILE=layerv)
 	@echo "[OpenNHP] Running smoke tests against sandbox..."
-	@command -v jq >/dev/null 2>&1 || { echo "$(COLOUR_RED)[OpenNHP] jq not found — install with: brew install jq$(END_COLOUR)"; exit 1; }
-	@SECRET=$$(AWS_PROFILE=layerv aws secretsmanager get-secret-value \
-		--secret-id "layerv-nhp-sandbox-auth0-smoke-test-credentials" \
-		--query SecretString --output text) && \
-	cd tests/smoke && \
-	NHP_ENVIRONMENT=sandbox \
-	NHP_SMOKE_ALLOW_SSM_PROBES=true \
 	AWS_PROFILE=layerv \
 	AWS_REGION=us-east-2 \
-	AUTH0_CLIENT_ID=$$(echo "$$SECRET" | jq -r '.client_id') \
-	AUTH0_CLIENT_SECRET=$$(echo "$$SECRET" | jq -r '.client_secret') \
-	AUTH0_DOMAIN=auth.layerv.ai \
-	AUTH0_AUDIENCE=https://api.layerv.xyz \
-	go test -tags=smoke -v -count=1 -timeout 15m ./...
+	TARGET=sandbox \
+	TIER=$${TIER:-all} \
+	NHP_SMOKE_ALLOW_SSM_PROBES=true \
+	./scripts/run-smoke.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] Sandbox smoke tests done!$(END_COLOUR)"
 
 # test-smoke-prod uses AWS_PROFILE=layerv-prod. SSM probes are OFF by
@@ -503,21 +501,12 @@ test-smoke-sandbox: ## Run smoke tests against sandbox (uses AWS_PROFILE=layerv)
 # on the command line to override.
 test-smoke-prod: ## Run smoke tests against prod (uses AWS_PROFILE=layerv-prod)
 	@echo "[OpenNHP] Running smoke tests against PROD..."
-	@command -v jq >/dev/null 2>&1 || { echo "$(COLOUR_RED)[OpenNHP] jq not found — install with: brew install jq$(END_COLOUR)"; exit 1; }
-	@SECRET=$$(AWS_PROFILE=layerv-prod aws secretsmanager get-secret-value \
-		--secret-id "layerv-nhp-prod-auth0-smoke-test-credentials" \
-		--region us-east-2 \
-		--query SecretString --output text) && \
-	cd tests/smoke && \
-	NHP_ENVIRONMENT=prod \
-	NHP_SMOKE_ALLOW_SSM_PROBES=$${NHP_SMOKE_ALLOW_SSM_PROBES:-false} \
 	AWS_PROFILE=layerv-prod \
 	AWS_REGION=us-east-2 \
-	AUTH0_CLIENT_ID=$$(echo "$$SECRET" | jq -r '.client_id') \
-	AUTH0_CLIENT_SECRET=$$(echo "$$SECRET" | jq -r '.client_secret') \
-	AUTH0_DOMAIN=auth.layerv.ai \
-	AUTH0_AUDIENCE=https://api.layerv.ai \
-	go test -tags=smoke -v -count=1 -timeout 15m ./...
+	TARGET=prod \
+	TIER=$${TIER:-all} \
+	NHP_SMOKE_ALLOW_SSM_PROBES=$${NHP_SMOKE_ALLOW_SSM_PROBES:-false} \
+	./scripts/run-smoke.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] Prod smoke tests done!$(END_COLOUR)"
 
 test-debug: ## Run the #2214 pointer-uniqueness fence under -tags=nhp_debug (the CI fence; opts in to the panic-on-reuse variant of common.TokenStore.Store)
@@ -602,4 +591,4 @@ archive:
 	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server nhp-relay
 	@echo "$(COLOUR_GREEN)[OpenNHP] Package ${PACKAGE_FILE} archived!$(END_COLOUR)"
 
-.PHONY: all generate-version-and-build init agentd acd serverd relayd db licenseadmin linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-smoke-sandbox test-smoke-prod test-all fuzz fuzz-quick archive ebpf clean_ebpf
+.PHONY: all generate-version-and-build init agentd acd serverd relayd db licenseadmin linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-smoke-local smoke-build test-smoke-sandbox test-smoke-prod test-all fuzz fuzz-quick archive ebpf clean_ebpf

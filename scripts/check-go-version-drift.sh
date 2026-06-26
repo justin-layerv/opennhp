@@ -192,6 +192,10 @@ golang_from_files=(
   "docker/Dockerfile.ac"
   "docker/Dockerfile.ac.aws"
   "docker/Dockerfile.relay"
+  # Local smoke-stack builder — lives under tests/, not docker/, so the
+  # discovery below is widened to that root too (otherwise its golang FROM
+  # would silently escape the GO_VERSION lockstep on the next bump).
+  "tests/smoke/local-stack/Dockerfile"
 )
 
 dev_go_dockerfiles=(
@@ -200,7 +204,8 @@ dev_go_dockerfiles=(
 )
 
 # Discovery intentionally covers the CI/toolchain roots in this repo:
-# workflow YAML, composite action YAML, and docker/** Dockerfiles.
+# workflow YAML, composite action YAML, and docker/** + tests/smoke/local-stack
+# Dockerfiles.
 while IFS= read -r workflow_file; do
   path=${workflow_file#"$REPO_ROOT"/}
   # Workflow indentation is part of the convention: top-level env.GO_VERSION is
@@ -233,7 +238,7 @@ while IFS= read -r dockerfile; do
   if grep -Eq '^FROM[[:space:]].*golang:' "$dockerfile" && ! is_listed "$path" "${golang_from_files[@]}"; then
     fail "$path: contains a golang FROM but is not listed in golang_from_files"
   fi
-done < <(find "$REPO_ROOT/docker" -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) ! -name '*.bak' -print)
+done < <(find "$REPO_ROOT/docker" "$REPO_ROOT/tests/smoke/local-stack" -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) ! -name '*.bak' -print)
 
 # `make lint-workflows` runs on macOS too, where /usr/bin/env bash may still be
 # 3.2. Use indexed arrays instead of Bash 4 associative arrays.

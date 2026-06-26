@@ -1551,49 +1551,6 @@ jobs:
         run: python3 ./scripts/check-observability-parity.py
 
   # ============================================================================
-  # REDIRECT_URL DRIFT LINT (PR) - #1325
-  # Static fence between the plugin handler's `redirectURLField` const
-  # and the smoke test that verifies it on the wire. Rationale and full
-  # extractor logic live in scripts/check-redirect-url-drift.sh.
-  # ============================================================================
-  redirect-url-drift-lint:
-    name: redirect_url Drift Lint (PR)
-    # PR-only by design — same posture as terraform-prod-drift-lint above.
-    # Main is branch-protected (CLAUDE.md "never push directly to main") so
-    # every code path lands on a PR first and the lint runs there. Admin
-    # force-merges that bypass PR are NOT covered — if that posture
-    # changes, drop the `if:` so the lint also runs on push to catch
-    # admin-bypass drift.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          fetch-depth: 1
-
-      - name: Shellcheck the drift script and fixture runner
-        # Cover the scripts explicitly here — validate-workflows.yml's
-        # actionlint -shellcheck only runs on .github/workflows/*.yml.
-        run: |
-          shellcheck ./scripts/check-redirect-url-drift.sh
-          shellcheck ./tests/lints/redirect-url-drift/run-fixtures.sh
-
-      - name: Run redirect-url-drift fixture suite
-        # Run fixtures BEFORE the production check so a regex regression
-        # (e.g., a tightening that drops backtick-raw or comment-line
-        # support) surfaces before it can mask real drift on the
-        # production paths. Mirrors the terraform-prod-drift-lint
-        # ordering above (fixtures → real check).
-        run: ./tests/lints/redirect-url-drift/run-fixtures.sh
-
-      - name: Check redirect_url drift between plugin and smoke (#1325)
-        run: ./scripts/check-redirect-url-drift.sh
-
-  # ============================================================================
   # QURL CSP GATE DRIFT LINT (PR)
   # Static fence between the sandbox deploy gate's qurl.link CSP regex and the
   # smoke suite's post-deploy CSP regex. The deploy gate absorbs CloudFront

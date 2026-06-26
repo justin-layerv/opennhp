@@ -18,6 +18,10 @@ on:
       - "scripts/check-go-version-drift.sh"
       - "scripts/check-disable-agent-validation.sh"
       - "scripts/check-smoke-tier-filter-coverage.sh"
+      # run-smoke.sh now owns the tier -> RUN_FILTER mapping that
+      # check-smoke-tier-filter-coverage.sh parses, so an edit to it must
+      # re-run that fence.
+      - "scripts/run-smoke.sh"
       - "scripts/check-cert-cleanup-log-gate-unique.sh"
       - "scripts/check-cleanup-event-type-lockstep.sh"
       - "scripts/check-lockdown-body-drift.sh"
@@ -276,7 +280,7 @@ jobs:
         run: bash scripts/check-disable-agent-validation.sh
 
       # Two-way coverage check: every alternation token in
-      # nhp-smoke-tests.yml's RUN_FILTER must correspond to a real
+      # scripts/run-smoke.sh's RUN_FILTER must correspond to a real
       # `^func Test<Token>_` in tests/smoke/0X_*_test.go, and every
       # such Test<Prefix>_ must be in the alternation for the tier
       # the file's prefix routes to. Without this, a token without a
