@@ -68,6 +68,47 @@ const (
 	// minRevocationRetryInterval floors the cadence so a typo cannot turn the
 	// retry routine into a busy-loop on sendMsgCh.
 	minRevocationRetryInterval = 1 * time.Second
+
+	// RevocationDeliveryLatencyP99SLO is the qURL v2 revocation-latency SLO
+	// (#2792): the p99 wall-clock time from the server enqueuing an NHP_REV for
+	// an AC (firstSentAt, recorded in track at fanout time) to that AC's
+	// proof-of-delivery ack (NHP_RACK) landing and being attributed (clearAck).
+	// This is the measurable emit→ack span; the full revoke-API→AC-flush span is
+	// NOT observable server-side (qurl-service is the upstream API and the AC
+	// flush/apply path is gated off — see #2792), so emit→ack is the proxy the
+	// gospel's "'immediate' must be a number" requirement is measured against
+	// (docs/design/QURL_V2_KEYED_IDENTITY.md, the revocation-latency SLO bullet).
+	//
+	// Why 15s, tied to the retry cadence and age-out:
+	//   - A delivered-on-first-try ack lands in ~1 control-plane RTT (sub-second).
+	//   - Each lost NHP_REV adds one retransmit interval (defaultRevocationRetryInterval,
+	//     ~5s) before the next attempt can be acked.
+	//   - 15s ≈ tolerate up to ~2 lost NHP_REVs (0 retransmits ≈ RTT; 1 ≈ 5s;
+	//     2 ≈ 10s, plus RTT slack) before the p99 is considered breached.
+	//
+	// Load-bearing invariant — this SLO MUST stay strictly below the age-out
+	// (defaultRevocationRetryAgeOut, ~60s): a revoke un-acked past the age-out
+	// becomes RevocationAgedOut and is dropped WITHOUT recording a latency sample,
+	// so the recorded MetricRevocationDeliveryLatency distribution is bounded
+	// [~0, ageOut) by construction. With 15s < 60s a genuine p99 breach is
+	// observable in the histogram (rather than silently censored into the
+	// age-out counter). The two signals are complementary: this SLO alarms on
+	// SLOW-but-delivered revokes; MetricRevocationAgedOut alarms on
+	// NEVER-delivered ones. Neither alone proves delivery — see the alarm wiring
+	// in terraform/modules/monitoring/main.tf, kept in lockstep with this value.
+	//
+	// p99 viability rests on the EMF emission, not the CloudWatch statistic set:
+	// RecordLatency dual-emits an EMF event per observation (see
+	// endpoints/metrics/publisher.go::emitEMF), and only the EMF stream supports
+	// the extended_statistic="p99" the alarm uses (a min/max/sum/count statistic
+	// set cannot compute percentiles — the #871 convention). Do NOT remove the
+	// EMF latency path without re-homing this alarm.
+	//
+	// Keep this in lockstep with the Terraform alarm threshold
+	// (terraform/modules/monitoring/main.tf, revocation_delivery_latency_high):
+	// the alarm threshold is expressed in MILLISECONDS (15000) because
+	// RecordLatency records milliseconds.
+	RevocationDeliveryLatencyP99SLO = 15 * time.Second
 )
 
 // parseRevocationRetryEnabled parses NHP_REVOCATION_RETRY_ENABLED. Empty/unset
@@ -221,20 +262,36 @@ func (rt *revocationRetryTracker) markResent(acId, scope, scopeKey string, epoch
 // epoch is at least the tracked epoch (a convergence ack proves the AC reached
 // the post-revocation state at/above that epoch). An ack for a lower epoch than
 // what is pending does NOT clear it — a newer revoke is outstanding and must
-// still be proven delivered. Returns true if an entry was cleared.
-func (rt *revocationRetryTracker) clearAck(acId, scope, scopeKey string, ackEpoch int64) bool {
+// still be proven delivered.
+//
+// Returns (elapsed, cleared): cleared is true iff an entry was removed, and on a
+// clear elapsed is the revocation-delivery latency for the SLO histogram (#2792)
+// — the wall-clock from the entry's firstSentAt (the original NHP_REV enqueue,
+// preserved verbatim across redeliveries by markResent) to now. Measured under
+// the same lock that reads firstSentAt and against the tracker's injectable
+// clock, so a test can drive a known gap deterministically. elapsed is the
+// zero Duration when nothing was cleared (caller must gate the recording on
+// cleared, not on elapsed != 0 — a same-instant ack legitimately yields 0).
+func (rt *revocationRetryTracker) clearAck(acId, scope, scopeKey string, ackEpoch int64) (elapsed time.Duration, cleared bool) {
 	k := pendingRevocationKey{acId: acId, scope: scope, scopeKey: scopeKey}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	cur, ok := rt.pending[k]
 	if !ok {
-		return false
+		return 0, false
 	}
 	if ackEpoch < cur.epoch {
-		return false
+		return 0, false
+	}
+	// Latency from the original send (firstSentAt, preserved across retries by
+	// markResent), so it spans every lost-NHP_REV retransmit. Clamp negative
+	// (only reachable if the injected clock runs backwards) to 0.
+	elapsed = rt.now().Sub(cur.firstSentAt)
+	if elapsed < 0 {
+		elapsed = 0
 	}
 	delete(rt.pending, k)
-	return true
+	return elapsed, true
 }
 
 // dueItem is a snapshot of a pending entry the retry routine should act on this
@@ -297,17 +354,27 @@ func (s *UdpServer) trackFanout(conns []*ACConn, scope, scopeKey string, epoch i
 }
 
 // clearPendingRevocationAck clears the pending entry an AC's NHP_RACK
-// acknowledges. Called by HandleRevocationAck after it has attributed the ack to
-// acId via the authenticated pubkey. No-op when the engine is disabled. scope /
-// scopeKey are the verbatim (scope-prefixed) values the AC echoed.
+// acknowledges and, on a clear, records the emit→ack revocation-delivery latency
+// into the SLO histogram (MetricRevocationDeliveryLatency, #2792). Called by
+// HandleRevocationAck after it has attributed the ack to acId via the
+// authenticated pubkey. No-op when the engine is disabled (tracker nil — the
+// default; no firstSentAt exists to measure against). scope / scopeKey are the
+// verbatim (scope-prefixed) values the AC echoed.
 func (s *UdpServer) clearPendingRevocationAck(acId, scope, scopeKey string, ackEpoch int64) {
 	if s.revocationRetry == nil {
 		return
 	}
-	if s.revocationRetry.clearAck(acId, scope, scopeKey, ackEpoch) {
-		log.Debug("server-ac(%s)[RevocationRetry] cleared pending revoke on ack (scope=%q key=%q epoch=%d)",
-			acId, scope, scopeKey, ackEpoch)
+	elapsed, cleared := s.revocationRetry.clearAck(acId, scope, scopeKey, ackEpoch)
+	if !cleared {
+		return
 	}
+	// Record the delivery latency (ms) for this acked revoke. RecordLatency is
+	// nil-safe and dual-emits a statistic set + an EMF event; the EMF stream is
+	// what backs the p99 alarm. Gated on cleared (not elapsed): a same-instant
+	// ack is a legitimate ~0ms sample, not a missing one.
+	s.metrics.RecordLatency(MetricRevocationDeliveryLatency, float64(elapsed.Milliseconds()))
+	log.Debug("server-ac(%s)[RevocationRetry] cleared pending revoke on ack (scope=%q key=%q epoch=%d latency=%s)",
+		acId, scope, scopeKey, ackEpoch, elapsed)
 }
 
 // revocationRetryRoutine is the background retry/age-out loop. Modeled on
@@ -422,10 +489,20 @@ func (s *UdpServer) liveACConnsForId(acId string) []*ACConn {
 }
 
 // parseRevocationRetryConfig reads + validates the three engine env vars and
-// returns (enabled, interval, ageOut). It enforces interval >= floor and
-// ageOut > interval (an age-out at or below one retry interval would declare a
-// revoke degraded before its first retransmit could be acked). Returns an error
-// so an operator typo fails Start rather than silently mis-arming the engine.
+// returns (enabled, interval, ageOut). It enforces, in order:
+//   - interval >= floor (a sub-floor cadence risks a busy-loop on sendMsgCh);
+//   - ageOut > interval (an age-out at or below one retry interval would declare
+//     a revoke degraded before its first retransmit could be acked);
+//   - ageOut > RevocationDeliveryLatencyP99SLO (the censoring invariant): a
+//     revoke acked after the age-out is dropped as RevocationAgedOut WITHOUT a
+//     latency sample, so an age-out at/below the SLO would silently censor every
+//     genuine p99 breach into the aged-out counter and leave the latency alarm
+//     structurally inert. The compile-time default (60s > 15s) satisfies this,
+//     but an operator override (NHP_REVOCATION_RETRY_AGE_OUT_SECONDS) could not —
+//     so it is enforced here at Start, not only by the default-pinning unit test.
+//
+// Returns an error so an operator typo / misconfig fails Start rather than
+// silently mis-arming the engine or blinding the SLO alarm.
 func parseRevocationRetryConfig() (enabled bool, interval, ageOut time.Duration, err error) {
 	enabled, err = parseRevocationRetryEnabled(os.Getenv(RevocationRetryEnabledEnvVar))
 	if err != nil {
@@ -442,6 +519,13 @@ func parseRevocationRetryConfig() (enabled bool, interval, ageOut time.Duration,
 	if ageOut <= interval {
 		return false, 0, 0, fmt.Errorf("%s (%s) must be greater than %s (%s)",
 			RevocationRetryAgeOutEnvVar, ageOut, RevocationRetryIntervalEnvVar, interval)
+	}
+	// Censoring-invariant guard (#2792): the age-out must strictly exceed the
+	// revocation-delivery SLO, else a p99 breach is censored into
+	// RevocationAgedOut and the latency alarm goes silent. See the doc above.
+	if ageOut <= RevocationDeliveryLatencyP99SLO {
+		return false, 0, 0, fmt.Errorf("%s (%s) must exceed the revocation-delivery SLO (%s), else a p99 breach is censored into %s and the latency alarm goes silent",
+			RevocationRetryAgeOutEnvVar, ageOut, RevocationDeliveryLatencyP99SLO, MetricRevocationAgedOut)
 	}
 	return enabled, interval, ageOut, nil
 }

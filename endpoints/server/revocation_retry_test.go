@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,15 +49,15 @@ func TestRetryTracker_TrackThenAckClears(t *testing.T) {
 		t.Fatalf("pendingCount after track = %d, want 1", n)
 	}
 	// An ack for a DIFFERENT AC must not clear it.
-	if rt.clearAck("ac-2", "qurl", "qurl:qX", 5) {
+	if _, cleared := rt.clearAck("ac-2", "qurl", "qurl:qX", 5); cleared {
 		t.Fatal("ack for a different acId wrongly cleared the entry")
 	}
 	// An ack with a mismatched scope_key must not clear it.
-	if rt.clearAck("ac-1", "qurl", "qurl:qOTHER", 5) {
+	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qOTHER", 5); cleared {
 		t.Fatal("ack with mismatched scope_key wrongly cleared the entry")
 	}
 	// The matching ack clears it.
-	if !rt.clearAck("ac-1", "qurl", "qurl:qX", 5) {
+	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 5); !cleared {
 		t.Fatal("matching ack did not clear the entry")
 	}
 	if n := rt.pendingCount(); n != 0 {
@@ -72,14 +74,14 @@ func TestRetryTracker_AckEpochBoundary(t *testing.T) {
 
 	rt.track("ac-1", "qurl", "qurl:qX", 5, "evt-5")
 	// Ack for an older epoch (4) must NOT clear the pending epoch-5 revoke.
-	if rt.clearAck("ac-1", "qurl", "qurl:qX", 4) {
+	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 4); cleared {
 		t.Fatal("stale ack (epoch 4 < pending 5) wrongly cleared the entry")
 	}
 	if n := rt.pendingCount(); n != 1 {
 		t.Fatalf("pendingCount = %d, want 1 after stale ack", n)
 	}
 	// Ack at a higher epoch (6) DOES clear (convergence at/above).
-	if !rt.clearAck("ac-1", "qurl", "qurl:qX", 6) {
+	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 6); !cleared {
 		t.Fatal("ack at higher epoch did not clear")
 	}
 }
@@ -101,10 +103,10 @@ func TestRetryTracker_HigherEpochSupersedes(t *testing.T) {
 	rt.track("ac-1", "qurl", "qurl:qX", 6, "evt-6")
 	// An ack at epoch 7 clears; an ack at epoch 6 would not (it's below the
 	// superseding epoch 7), proving the superseding epoch took.
-	if rt.clearAck("ac-1", "qurl", "qurl:qX", 6) {
+	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 6); cleared {
 		t.Fatal("ack at epoch 6 cleared, but pending should be the superseding epoch 7")
 	}
-	if !rt.clearAck("ac-1", "qurl", "qurl:qX", 7) {
+	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 7); !cleared {
 		t.Fatal("ack at the superseding epoch 7 did not clear")
 	}
 }
@@ -212,6 +214,9 @@ func TestParseRevocationRetryConfig_Rejects(t *testing.T) {
 		{"sub_floor_interval", "true", "0", ""},
 		{"ageout_not_greater_than_interval", "true", "10", "10"},
 		{"ageout_below_interval", "true", "30", "20"},
+		// Passes the interval check (8 > 5) but the age-out (8s) is below the 15s
+		// SLO — must be rejected by the censoring-invariant guard (#2792).
+		{"ageout_below_slo", "true", "5", "8"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(RevocationRetryEnabledEnvVar, tc.enabled)
@@ -221,6 +226,49 @@ func TestParseRevocationRetryConfig_Rejects(t *testing.T) {
 				t.Fatalf("%s: expected an error, got nil", tc.name)
 			}
 		})
+	}
+}
+
+// TestParseRevocationRetryConfig_RejectsAgeOutBelowSLO is the non-vacuous guard
+// for the censoring invariant (#2792): an age-out override that is above the
+// retry interval (so it clears the interval check) but at/below the SLO must be
+// rejected at Start — otherwise every genuine p99 breach would be silently
+// censored into RevocationAgedOut and the latency alarm would go inert. Asserts
+// the error specifically names the SLO so a regression that lets the interval
+// check shadow this one (or removes it) is caught, not just "some error fired".
+func TestParseRevocationRetryConfig_RejectsAgeOutBelowSLO(t *testing.T) {
+	// interval below the SLO so the interval check passes; age-out between the
+	// interval and the SLO so ONLY the SLO guard can reject it.
+	intervalSec := 5
+	ageOutSec := int(RevocationDeliveryLatencyP99SLO.Seconds()) - 1 // 14s: > interval, < SLO
+	if time.Duration(intervalSec)*time.Second >= RevocationDeliveryLatencyP99SLO {
+		t.Fatalf("test setup invalid: interval %ds must be below the SLO %s", intervalSec, RevocationDeliveryLatencyP99SLO)
+	}
+	t.Setenv(RevocationRetryEnabledEnvVar, "true")
+	t.Setenv(RevocationRetryIntervalEnvVar, strconv.Itoa(intervalSec))
+	t.Setenv(RevocationRetryAgeOutEnvVar, strconv.Itoa(ageOutSec))
+
+	_, _, _, err := parseRevocationRetryConfig()
+	if err == nil {
+		t.Fatal("expected an error for age-out below the SLO, got nil")
+	}
+	// The error must be the SLO guard, not the interval check shadowing it.
+	if !strings.Contains(err.Error(), "SLO") {
+		t.Fatalf("error %q does not mention the SLO — the censoring-invariant guard is not the one that fired", err.Error())
+	}
+
+	// Boundary: age-out exactly AT the SLO is also degenerate and must be rejected
+	// (strictly-greater requirement).
+	t.Setenv(RevocationRetryAgeOutEnvVar, strconv.Itoa(int(RevocationDeliveryLatencyP99SLO.Seconds())))
+	if _, _, _, err := parseRevocationRetryConfig(); err == nil {
+		t.Fatal("expected an error for age-out exactly at the SLO, got nil")
+	}
+
+	// And just ABOVE the SLO with a valid interval passes (proves the guard is a
+	// boundary, not a blanket reject).
+	t.Setenv(RevocationRetryAgeOutEnvVar, strconv.Itoa(int(RevocationDeliveryLatencyP99SLO.Seconds())+1))
+	if _, _, _, err := parseRevocationRetryConfig(); err != nil {
+		t.Fatalf("age-out just above the SLO should pass, got err=%v", err)
 	}
 }
 
@@ -408,7 +456,7 @@ func TestRetryEngine_AckMidTickDoesNotResurrect(t *testing.T) {
 	}
 
 	// The AC's ack lands NOW (mid-tick, after the snapshot, before redelivery).
-	if !s.revocationRetry.clearAck("ac-1", "qurl", "qurl:qX", 3) {
+	if _, cleared := s.revocationRetry.clearAck("ac-1", "qurl", "qurl:qX", 3); !cleared {
 		t.Fatal("precondition: ack did not clear the pending entry")
 	}
 	if n := s.revocationRetry.pendingCount(); n != 0 {
@@ -455,5 +503,120 @@ func TestRetryEngine_DisabledIsInert(t *testing.T) {
 	}
 	if c := serverCounters(t, s)[MetricRevocationAckReceived]; c != 1 {
 		t.Fatalf("%s = %v, want 1 even with engine off", MetricRevocationAckReceived, c)
+	}
+	// Engine off: NO latency sample is recorded (no firstSentAt to measure).
+	if got := serverLatencies(t, s)[MetricRevocationDeliveryLatency]; len(got) != 0 {
+		t.Fatalf("%s recorded %d samples with engine off, want 0", MetricRevocationDeliveryLatency, len(got))
+	}
+}
+
+// serverLatencies snapshots the server metrics publisher's recorded latency
+// samples (metric name → ms observations) for assertion.
+func serverLatencies(t *testing.T, s *UdpServer) map[string][]float64 {
+	t.Helper()
+	return s.metrics.LatenciesForTest(t)
+}
+
+// ── Revocation-delivery-latency SLO (#2792) ──────────────────────────────────
+
+// TestRevocationDeliveryLatency_MeasuresEmitToAckSpan is the non-vacuous proof
+// that the SLO histogram measures the REAL emit→ack span, not a ~0ms self-fulfilling
+// gap. It drives the injectable clock: track at T0, advance by a KNOWN 7s, then
+// run the production ack path (clearPendingRevocationAck). It asserts the single
+// recorded sample EQUALS 7000ms (the injected gap, computed from firstSentAt) and
+// landed under MetricRevocationDeliveryLatency — proving both the span endpoints
+// and the millisecond computation. A test that acked at T0 and only asserted
+// "< SLO" on a ~0ms gap is exactly the vacuous trap the gospel's "measured AND
+// tested" guards against; this advances the clock so the measurement is load-bearing.
+func TestRevocationDeliveryLatency_MeasuresEmitToAckSpan(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s, _ := newRetryEngineServer(t, clk)
+	putRetryConn(s, "ac-1", 7)
+
+	// Emit (T0): record firstSentAt at the current fake-clock instant.
+	s.trackFanout(s.acConnectionMap["ac-1"], "qurl", "qurl:qX", 3, "evt-3")
+
+	// A KNOWN gap elapses before the AC's ack lands.
+	const gap = 7 * time.Second
+	clk.advance(gap)
+
+	// Ack (T1): the production wiring path measures now-firstSentAt and records it.
+	s.clearPendingRevocationAck("ac-1", "qurl", "qurl:qX", 3)
+
+	samples := serverLatencies(t, s)[MetricRevocationDeliveryLatency]
+	if len(samples) != 1 {
+		t.Fatalf("%s recorded %d samples, want exactly 1", MetricRevocationDeliveryLatency, len(samples))
+	}
+	if got, want := samples[0], float64(gap.Milliseconds()); got != want {
+		t.Fatalf("recorded latency = %v ms, want %v ms (the injected emit→ack gap) — the histogram is not measuring firstSentAt→ack", got, want)
+	}
+	// The 7s sample is within the SLO bound (the gospel's "tested" assertion).
+	if samples[0] >= float64(RevocationDeliveryLatencyP99SLO.Milliseconds()) {
+		t.Fatalf("recorded latency %v ms is not below the SLO bound %v ms", samples[0], RevocationDeliveryLatencyP99SLO.Milliseconds())
+	}
+}
+
+// TestRevocationDeliveryLatency_BoundIsNonVacuous proves the SLO check can FAIL:
+// a delivery slower than RevocationDeliveryLatencyP99SLO (but still under the
+// age-out, so it is acked rather than censored) records a value that EXCEEDS the
+// bound. Without this, an "always < SLO" assertion could pass on a broken
+// measurement that records 0; here we show the bound actually discriminates.
+func TestRevocationDeliveryLatency_BoundIsNonVacuous(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s, _ := newRetryEngineServer(t, clk)
+	putRetryConn(s, "ac-1", 7)
+
+	s.trackFanout(s.acConnectionMap["ac-1"], "qurl", "qurl:qX", 3, "evt-3")
+
+	// A slow-but-delivered revoke: past the SLO, still inside the age-out window
+	// (so it is acked, not aged out — only acked revokes enter the histogram).
+	overSLO := RevocationDeliveryLatencyP99SLO + 5*time.Second
+	if overSLO >= testRetryAgeOut {
+		t.Fatalf("test setup invalid: over-SLO gap %s must stay below age-out %s", overSLO, testRetryAgeOut)
+	}
+	clk.advance(overSLO)
+	s.clearPendingRevocationAck("ac-1", "qurl", "qurl:qX", 3)
+
+	samples := serverLatencies(t, s)[MetricRevocationDeliveryLatency]
+	if len(samples) != 1 {
+		t.Fatalf("%s recorded %d samples, want exactly 1", MetricRevocationDeliveryLatency, len(samples))
+	}
+	if samples[0] < float64(RevocationDeliveryLatencyP99SLO.Milliseconds()) {
+		t.Fatalf("recorded latency %v ms did NOT exceed the SLO bound %v ms — the bound would never catch a real breach", samples[0], RevocationDeliveryLatencyP99SLO.Milliseconds())
+	}
+}
+
+// TestRevocationDeliveryLatency_SLOBelowAgeOut pins the load-bearing invariant
+// that makes the histogram observable: the SLO bound MUST be strictly below the
+// age-out deadline. A revoke un-acked past the age-out is dropped WITHOUT a
+// latency sample (RevocationAgedOut instead), so if the SLO were >= the age-out
+// the histogram could never contain a value that breaches it — the alarm would
+// be structurally silent. Asserting the relationship in code keeps a future
+// cadence/age-out retune from silently censoring the SLO signal.
+func TestRevocationDeliveryLatency_SLOBelowAgeOut(t *testing.T) {
+	if RevocationDeliveryLatencyP99SLO >= defaultRevocationRetryAgeOut {
+		t.Fatalf("SLO %s must be strictly below the age-out %s, else a breaching latency is censored into RevocationAgedOut and never enters the histogram",
+			RevocationDeliveryLatencyP99SLO, defaultRevocationRetryAgeOut)
+	}
+}
+
+// TestRevocationDeliveryLatency_StaleAckRecordsNoSample: an ack that does NOT
+// clear an entry (wrong epoch / wrong AC) records no latency sample — the
+// histogram counts proven deliveries only, never a no-op ack.
+func TestRevocationDeliveryLatency_StaleAckRecordsNoSample(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s, _ := newRetryEngineServer(t, clk)
+	putRetryConn(s, "ac-1", 7)
+	s.trackFanout(s.acConnectionMap["ac-1"], "qurl", "qurl:qX", 5, "evt-5")
+
+	clk.advance(3 * time.Second)
+	// Stale ack (epoch 4 < pending 5): does not clear, must not record.
+	s.clearPendingRevocationAck("ac-1", "qurl", "qurl:qX", 4)
+	if got := serverLatencies(t, s)[MetricRevocationDeliveryLatency]; len(got) != 0 {
+		t.Fatalf("stale ack recorded %d latency samples, want 0", len(got))
+	}
+	// pending entry survives the stale ack.
+	if n := s.revocationRetry.pendingCount(); n != 1 {
+		t.Fatalf("pendingCount after stale ack = %d, want 1", n)
 	}
 }

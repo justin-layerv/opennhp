@@ -878,6 +878,34 @@ Delivery requirements:
   flush-complete < N seconds), measured and tested. "Immediate" must be a number,
   since fan-out + index lookup + flush is not instantaneous.
 
+  PARTIALLY LANDED (nhp #2808): the number is defined and tested — `p99 < 15s`
+  (`RevocationDeliveryLatencyP99SLO`) over the server-measurable proxy span,
+  `NHP_REV` emit (`firstSentAt`) → `NHP_RACK` ack-attributed (`clearAck`), with a
+  p99 CloudWatch alarm and a companion `RevocationAgedOut` non-delivery alarm. The
+  histogram samples ACKED revokes only; never-delivered revokes surface as
+  `RevocationAgedOut` (the two alarms are read together). This is the
+  measure+test half of the gate.
+
+  NOT yet final operational proof — the gospel boundary (do not let the metric
+  become a false "delivery proven" signal):
+  - The latency is only as strong as the ack attribution beneath it. The pending
+    tracker keys on `(acId, scope, scope_key)`, but `acConnectionMap` is
+    `acId → []*ACConn`: when multiple live AC slots (blue/green, reconnect
+    overlap) share one `acId`, ONE slot's `NHP_RACK` clears the shared pending
+    key and records a latency sample even if a sibling slot never received the
+    revoke — so the histogram can read green without proving every targeted live
+    connection flushed (the same-`acId` caveat from nhp #2806). Final closure
+    needs the timed ack key to distinguish every targeted live slot (or wait for
+    all targeted slots to ack/age out).
+  - `NHP_RACK` must mean post-flush completion on the AC side for the span to be
+    a true revoke-to-flush latency; the convergence-ack semantics must be
+    audited against that meaning.
+  - The retry engine ships default-OFF; arming it fleet-wide (so the histogram
+    collects data) is the rollout step. Tracked with the ack/proof-of-delivery
+    work in nhp #2793 (with #2790 for targeted-fanout correspondence). Treat the
+    SLO acceptance-bar line + the "metrics prove revocation delivery and AC flush
+    completion" line as CLOSED only once these gates land.
+
 Transport can be selected during implementation. The design requirement is
 push-based delivery into the NHP/AC control plane, not polling from qurl-router.
 

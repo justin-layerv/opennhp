@@ -384,6 +384,8 @@ lint-workflows:
 	@bash scripts/check-smoke-tier-filter-coverage.sh
 	@bash scripts/check-cert-cleanup-log-gate-unique.sh
 	@bash scripts/check-cleanup-event-type-lockstep.sh
+	@shellcheck scripts/check-revocation-slo-lockstep.sh
+	@bash scripts/check-revocation-slo-lockstep.sh
 	@shellcheck scripts/check-golden-vectors.sh tests/scripts/check-golden-vectors_test.sh
 	@bash tests/scripts/check-golden-vectors_test.sh
 	@bash scripts/check-golden-vectors.sh

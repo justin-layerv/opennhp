@@ -371,6 +371,20 @@ const (
 	// silent drop) so it can be alarmed. Wired by the retry/age-out engine
 	// (deferred — see #2793 design).
 	MetricRevocationAgedOut = "RevocationAgedOut"
+	// MetricRevocationDeliveryLatency is the revocation-latency SLO histogram
+	// (#2792): one observation, in milliseconds, per revoke that an AC acked —
+	// the wall-clock from the server enqueuing the NHP_REV (firstSentAt) to that
+	// AC's NHP_RACK being attributed (clearAck), recorded via metrics.RecordLatency.
+	// The SLO target, the "why 15s", the EMF-backs-p99 note, the complementary-
+	// signal relationship with MetricRevocationAgedOut, and the engine-armed
+	// emission coupling all live on RevocationDeliveryLatencyP99SLO
+	// (revocation_retry.go) — the one canonical home; the p99 alarm is
+	// revocation_delivery_latency_high in terraform/modules/monitoring/main.tf.
+	//
+	// Coverage boundary (load-bearing for any consumer): samples ACKED revokes
+	// ONLY. A never-delivered revoke is counted by MetricRevocationAgedOut, never
+	// added here, so the distribution is bounded below the age-out by construction.
+	MetricRevocationDeliveryLatency = "RevocationDeliveryLatency"
 	// QURL plugin resolve telemetry. The qurl plugin orchestrates the
 	// browser-side qurl.link → qurl.site redirect — token validate via
 	// qurl-service, NHP knock to AC, JWT cookie set, 302 redirect — and
