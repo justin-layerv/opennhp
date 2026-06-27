@@ -110,6 +110,182 @@ After the L3 flush-on-expiry work in `endpoints/ac/expiry_scheduler.go` (nhp#216
 
 For the rollout phase, the L3 flush runs *alongside* the L7 `/authorize` enforcement (defense-in-depth). After 4+4 weeks of side-by-side validation, the L7 layer can be removed and L3 flush becomes the sole enforcement boundary. The scheduler's fail-closed admission semantic (UdpAC refuses new NHP-AOPs when the scheduler's circuit breaker is open) is sized for that end-state — see `SCHEDULER_SCALING.md` for the SLO contract.
 
+## eBPF/XDP map types and capacity (AC-side L3 enforcement)
+
+This section is the source of truth for the BPF map declarations in
+`nhp/ebpf/xdp/nhp_ebpf_xdp.c`, per the action item in
+[nhp#2163](https://github.com/layervai/nhp/issues/2163) (BPF-map item).
+
+> **Scope note.** These maps are the *eBPF/XDP* `FilterMode` of the AC. Under
+> `FilterMode=0` (iptables/ipset — the production default at time of writing)
+> they are never loaded, so the contents of this section are **inert in prod**
+> until the eBPF FilterMode flip. The L7 `/authorize` layer (above) is
+> orthogonal and unaffected.
+
+### Map-type invariant: authoritative allow-rules MUST be `HASH`, never `LRU_HASH`
+
+The XDP program (`xdp_white_prog`) decides admission by looking up
+**allow-rule maps** — five on the non-ICMP fall-through path, plus
+`icmpwhitelist` on the separate ICMP branch (six in total). A packet that
+matches no conntrack entry falls through to these maps; an entry's presence
+(with `allowed==1` and unexpired `expire_time`) **is** the kernel's
+authorization decision. They are therefore *authoritative*, not a cache:
+
+| Map | Key | Role |
+|---|---|---|
+| `spp` (whitelist) | src+dst+dport+proto | full 4-tuple allow-rule |
+| `src_port` | src+dport | source + destination-port allow-rule |
+| `sdwhitelist` | src+dst | source + destination allow-rule |
+| `port_list` | src+port-range | source + port-range allow-rule |
+| `protocol_port` | proto+dport | protocol + destination-port allow-rule |
+| `icmpwhitelist` | src+dst | ICMP allow-rule |
+
+All six are `BPF_MAP_TYPE_HASH`.
+
+**Why not `LRU_HASH`:** an LRU map silently evicts the least-recently-used
+entry when it reaches `max_entries`. For an authoritative allow-rule map that
+means inserting the *N+1*-th admission silently **evicts an already-admitted
+session's allow-rule** — its next packet finds no allow-rule and is dropped.
+The symptom is "a random session was killed" (#2163), and the admitted set
+becomes non-deterministic, so you can no longer reason about what is
+authorized. That breaks the security model.
+
+`HASH` instead returns `-E2BIG` from the kernel on an insert into a full map.
+The AC's user-space insertion path (`nhp/utils/ebpf/ebpf.go`,
+`EbpfRuleAdd` → `Add*Rule`) surfaces that as an explicit error, which the AC
+admission path (`endpoints/ac/msghandler.go`) treats as a **fail-CLOSED**
+event: it refuses to insert the *new* allow-rule (and emits a loud map-full
+metric/log naming the full map, see below) rather than silently revoking an
+*existing* one. Refreshing an *existing* allow-rule still succeeds on a full map
+(an update needs no new slot), so session re-authorization is unaffected — only
+genuinely-new rule insertions past capacity fail.
+
+**What "fail-closed" guarantees here (precisely).** The load-bearing property is
+*no silent eviction of an admitted session, and any allow-rule tuple that fails
+to insert is fail-closed at the datapath* (an absent rule never admits → next
+packet on that tuple `XDP_DROP`s). It is **not** "an admission is rejected as one
+atomic unit," because the call sites have two shapes:
+
+- **Single-rule sites** (e.g. `spp`/`sdwhitelist`/`protocol_port`) log the
+  `-E2BIG` and **return**, so the whole admission is refused.
+- **CIDR / port-range expansion sites** (the `src_port`/`port_list` temp-access
+  handlers, and the later `icmpwhitelist` path in
+  `endpoints/ac/msghandler.go`) log the per-tuple `-E2BIG` and **continue** the
+  per-IP loop — deliberately, so the rest of the range still gets its rules. If
+  the map fills mid-range the result is a **partial** allow-rule set: inserted
+  tuples pass, un-inserted tuples drop. Still fail-closed (no tuple is silently
+  admitted), just not all-or-nothing. Each per-tuple failure is individually
+  metered (`MetricEbpfMapFull`) and logged.
+
+Either way no *existing* admitted session is evicted — which is the whole point
+of the `LRU_HASH`→`HASH` change.
+
+**`conn_track` stays `LRU_HASH` — but it is NOT a pure cache.** It is a
+per-flow established-connection cache that the datapath populates (with
+`BPF_ANY`) only *after* an allow-rule match; a conntrack hit short-circuits to
+`XDP_PASS`. During **normal operation** it is derived from a still-present
+allow-rule, so eviction is benign: the flow's next packet misses conntrack,
+re-checks the (authoritative, fail-closed `HASH`) allow-rule, and re-passes +
+re-caches if still admitted. LRU is also operationally convenient because the
+XDP datapath has no error channel to user space — a full `HASH` conntrack would
+silently fail to cache and force every packet of every *new/uncached* flow
+through the full five-map allow-rule scan (already-cached flows still hit), a
+performance cliff; LRU instead sheds the coldest flows. Determinism is
+irrelevant for a cache.
+
+> **KNOWN LIMITATION (pending [nhp#2814](https://github.com/layervai/nhp/issues/2814)
+> — an E5-flip blocker).** The "derived cache, eviction always benign" property
+> **fails after a surgical revoke**, so `conn_track` LRU is *not* unconditionally
+> safe. `endpoints/ac/revocation_index.go` `flushEntryNow` does a **coarse**
+> `Scheduler.RescheduleEarlier` on the **shared** allow-rule for the `FlowKey`
+> ("COARSE first: bar re-open in every mode... additive, never gated by the
+> surgical outcome"), with **no `tokenStore` ref-count** against other live
+> admissions sharing that `FlowKey`. So the shared allow-rule is torn down even
+> when `surgicalFlushFlowKey` deliberately *"leaves same-allow-tuple siblings
+> (different source port) **alive**"* (the over-flush fix of
+> [#2784](https://github.com/layervai/nhp/issues/2784)). A spared sibling's
+> established flow then survives **solely via its `conn_track` entry** — there is
+> no allow-rule left to "re-admit + re-populate" it. If `conn_track` is
+> `LRU_HASH` and evicts that (typically *idle/cold*, hence first-out of the LRU
+> list — see `QUIET_STREAM_RESIDUAL.md`) sibling under `conn_track`-full memory
+> pressure, the sibling's next packet falls through to the **now-removed**
+> allow-rule path → `XDP_DROP`. That is exactly the collateral over-flush that
+> `surgicalFlushFlowKey` (and #2784) promise to prevent, re-opened via
+> LRU-under-pressure instead of via a coarse flush. So under load `conn_track`
+> LRU eviction can defeat the surgical-precision guarantee.
+>
+> This is **not fixed in this slice**: changing `conn_track` to `HASH` has its
+> own tradeoff — at capacity it returns `-E2BIG`, so a *new* flow cannot be
+> cached and takes the XDP **slow path** (full five-map scan) until a slot frees,
+> and that miss is silent (no error channel). Whether the datapath degrades
+> gracefully on a `conn_track`-full miss, plus the alternatives (pin spared
+> siblings; or size `conn_track` so eviction can't happen in practice), is a
+> perf/capacity + surgical-design decision coupled to the `max_entries` /
+> instance-type review (#2163 item 3, #2813). It is therefore **E5
+> flip-readiness work**, tracked in #2814 — the `LRU_HASH`→`HASH` allow-rule
+> security fix in this PR is correct, shippable, and inert under iptables
+> `FilterMode` regardless. The gap is load-bearing only once eBPF/XDP enforcement
+> is live (the flip), which is why it blocks E5 and not this PR. (Scope: IPv4 +
+> TCP/UDP only — `conn_track` is v4-only and the sibling-sparing surgical path
+> runs only for v4 TCP/UDP; v6/ICMP have a separate hard-fail story, #2778.)
+
+### Capacity / `max_entries` sizing and kernel-memory cost
+
+`MAX_ENTRIES` is **1,000,000** (uniform across all maps) at time of writing.
+#2163 targets 1M+ concurrent sessions and floats sizing each map at 2× the
+8M ipset ceiling (i.e. 16M). **We deliberately do *not* adopt 16M**, and the
+type fix above is independent of the eventual ceiling. The kernel-memory math
+is why.
+
+BPF `HASH` maps **preallocate** all element + bucket memory at map-creation
+(load) time by default (no `BPF_F_NO_PREALLOC`), and that memory is
+**unswappable kernel memory**. The model (per `kernel/bpf/hashtab.c`):
+`bytes ≈ max_entries × (≈48 B htab_elem + round_up(key,8) + round_up(value,8) + ≈16 B bucket)`;
+`LRU_HASH` adds ≈16 B/entry for the LRU list node.
+
+| `MAX_ENTRIES` | Total across all 7 maps | Feasible on prod AC (`c6i.xlarge`, 8 GB)? |
+|---|---|---|
+| 1,000,000 (current) | **≈ 0.63 GB** | yes |
+| 2,000,000 (2× headroom) | **≈ 1.28 GB** | yes, but tight alongside ipset + tokenStore |
+| 16,000,000 (#2163's floated 2×-of-8M) | **≈ 10 GB** | **no — exceeds total instance RAM** |
+
+(Per-map breakdown is reproducible from the struct sizes in
+`nhp_ebpf_xdp.c`; the dominant maps are `conn_track` at ≈130 MB/1M entries and
+`spp` at ≈92 MB/1M entries.)
+
+**AC-instance-RAM implication.** Prod ACs are `c6i.xlarge` (8 GB);
+sandbox ACs are `t3.medium` (4 GB) — see `terraform/modules/ac/main.tf`.
+A 16M sizing (~10 GB) is physically impossible on either: the AC would fail
+to load the `.o` at boot. Even 2M (~1.28 GB) is a meaningful fraction of an
+8 GB box that *also* carries the 8M ipset (~640 MB, #2163 item 1) and the
+in-memory `tokenStore` (~500 MB at 1M sessions, #2163 item 3) and the Go
+heap. The correct `max_entries` is therefore **coupled to the AC
+instance-type decision (#2163 item 3)** — it cannot be chosen in isolation.
+
+**Decision for this slice:** keep `MAX_ENTRIES = 1,000,000`. The LRU→HASH
+*security* fix is correct and shippable at any size, and is inert in prod
+(iptables FilterMode) until the eBPF flip. The `max_entries` bump is a
+separate, flip-time concern that must be co-decided with the instance-type
+review; the recommended target is **2M (not 16M)** unless instance RAM grows,
+and any bump must re-run the memory math above against the chosen instance
+type. Tracked as a concrete flip-time task in
+[nhp#2813](https://github.com/layervai/nhp/issues/2813) (under #2163 item 2).
+
+### Fail-closed observability (`MetricEbpfMapFull`)
+
+When an allow-rule map insert returns `-E2BIG`, the AC increments the
+`EbpfMapFull` metric (`endpoints/ac/registration.go`) and logs a loud
+fail-closed security event (`endpoints/ac/msghandler.go`,
+`(*UdpAC).ebpfRuleAddFailClosed`). A non-zero rate means the AC is rejecting
+*new* admissions because an allow-rule map is at capacity — i.e. the eBPF
+capacity ceiling has been reached and admissions are being denied (fail-closed,
+not silently evicting). **At the eBPF FilterMode flip (E5) this metric needs a
+CloudWatch alarm** (`terraform/modules/ac/monitoring.tf`, mirroring the
+`MetricUDPHandlerPanic` alarm) — until then "loud" is log + emitted-metric
+only, with no paging. Tracked in
+[nhp#2813](https://github.com/layervai/nhp/issues/2813). This is inert in prod
+under iptables FilterMode (the map is never loaded, so the metric never fires).
+
 ## Alternative considered: stateless signed cookie
 
 **Shape:** NHP server mints a signed cookie `{resource_id, client_ip, session_id, expires_at}` with HMAC at resolve time. `qurl-router` verifies signature + expiry + client_ip locally on every request. No qurl-service call on the data path.

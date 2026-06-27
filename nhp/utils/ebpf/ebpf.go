@@ -171,6 +171,29 @@ const (
 	MapTypeProtocolPort  = 6
 )
 
+// MapTypeName maps a MapType* constant to the BPF map's name as declared in
+// nhp/ebpf/xdp/nhp_ebpf_xdp.c, so operator-facing logs can name the map that
+// hit capacity instead of printing the bare 1..6 ordinal. Unknown values render
+// as "unknown(<n>)" rather than panicking.
+func MapTypeName(mapType int) string {
+	switch mapType {
+	case MapTypeWhitelist:
+		return "spp"
+	case MapTypeSdWhitelist:
+		return "sdwhitelist"
+	case MapTypeIcmpWhitelist:
+		return "icmpwhitelist"
+	case MapTypeSrcAndPort:
+		return "src_port"
+	case MapTypeSrcPortList:
+		return "port_list"
+	case MapTypeProtocolPort:
+		return "protocol_port"
+	default:
+		return fmt.Sprintf("unknown(%d)", mapType)
+	}
+}
+
 // Pinned-map filesystem paths. Single source of truth for both the
 // producer side (Add* functions in this file) and the consumer side
 // (boot enumeration in endpoints/ac/expiry_enumerate_ebpf_linux.go).
@@ -711,6 +734,28 @@ func isEbpfNoEntry(err error) bool {
 		return false
 	}
 	return errors.Is(err, ebpf.ErrKeyNotExist) || errors.Is(err, syscall.ENOENT)
+}
+
+// IsMapFull reports whether err is the kernel "map is full" signal from a BPF
+// map insert — i.e. the map is at max_entries and cannot admit a NEW key.
+//
+// The kernel returns E2BIG from BPF_MAP_UPDATE_ELEM when a non-LRU map (our
+// authoritative allow-rule maps are BPF_MAP_TYPE_HASH, #2163) is full. The
+// cilium/ebpf library wraps it as `fmt.Errorf("key too big for map: %w", err)`
+// over unix.E2BIG (see wrapMapError in syscalls.go); the "key too big" text is
+// misleading — for our fixed-size keys the only update-time cause is a full
+// map. errors.Is reaches through the wrapper, so we match the errno, never the
+// text (memory: feedback_silent_failure_patterns.md — no error-text scraping).
+//
+// This is the fail-CLOSED signal: callers must REJECT the new admission (and
+// raise a loud metric/log) rather than swallow it — an admitted-but-not-enforced
+// session is a security hole. Updating an EXISTING key on a full map still
+// succeeds (no new slot needed), so session re-authorization is unaffected.
+func IsMapFull(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.E2BIG)
 }
 
 // A generic entry function that calls the corresponding function to add whitelist entries based on mapTypeandparams.

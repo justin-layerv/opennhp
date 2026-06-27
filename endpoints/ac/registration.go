@@ -536,6 +536,18 @@ const (
 	// the NHP_REV until it acks or ages out — not a silent loss, but a signal
 	// the AC→server return path is impaired.
 	MetricRevocationAckSendFailed = "RevocationAckSendFailed"
+
+	// MetricEbpfMapFull counts allow-rule eBPF map inserts that failed because
+	// the map is at max_entries (kernel -E2BIG). This is the FAIL-CLOSED signal
+	// for the eBPF FilterMode: rather than silently evicting an already-admitted
+	// session (the LRU_HASH bug fixed in #2163), the AC rejects the NEW
+	// admission and bumps this counter. A non-zero rate means the eBPF capacity
+	// ceiling has been hit and admissions are being denied — needs a CloudWatch
+	// alarm at the eBPF FilterMode flip (E5); see
+	// docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md. Inert under
+	// FilterMode_IPTABLES (the maps are never loaded), so it cannot fire in prod
+	// until the flip.
+	MetricEbpfMapFull = "EbpfMapFull"
 )
 
 // Re-registration reason constants. These are the only values that

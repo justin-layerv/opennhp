@@ -67,6 +67,54 @@ const (
 // latency under load.
 const flushSafetyMargin = 50 * time.Millisecond
 
+// ebpfRuleAddFailClosed wraps ebpf.EbpfRuleAdd to give the eBPF allow-rule
+// insert path an explicit, LOUD fail-closed signal when a map is at capacity.
+//
+// The allow-rule maps are BPF_MAP_TYPE_HASH (#2163): a full map returns kernel
+// -E2BIG on insert of a NEW key rather than silently evicting an existing one
+// (the LRU_HASH bug). That error already propagates and every caller below acts
+// on it (never swallows it). This wrapper adds the security-relevant
+// observability the raw helper can't: a dedicated metric (MetricEbpfMapFull) and
+// a distinct, unambiguous log line naming the full map, so "an allow-rule map
+// hit its ceiling" is visible to operators and not buried under generic
+// insert-error noise. The error is returned unchanged so each caller's existing
+// control flow is preserved (never swallowed — admitted-but-not-enforced is a
+// security hole; never panicked).
+//
+// What the guarantee IS (and is NOT): the load-bearing property is "no silent
+// eviction of an admitted session, and any allow-rule tuple we fail to insert is
+// fail-closed at the datapath (no rule => XDP_DROP)." It is NOT "an admission is
+// rejected as one atomic unit." Two caller shapes differ:
+//   - Single-rule sites (e.g. mapType 1/2/6) log and RETURN on -E2BIG, so the
+//     whole admission is refused.
+//   - CIDR/range-expansion sites (mapType 4/5 temp-port handlers, and the later
+//     mapType 3 path) log and CONTINUE the per-IP loop — intentionally, so the
+//     rest of the range still gets rules. If the map fills mid-range the result
+//     is a PARTIAL allow-rule set: the inserted tuples pass, the un-inserted ones
+//     drop. That is still fail-closed (an absent rule never admits), just not
+//     all-or-nothing. The per-tuple failures are each logged + metered here.
+//
+// Inert under FilterMode_IPTABLES (the maps are never loaded), so this path
+// cannot fire in prod until the eBPF FilterMode flip (E5).
+func (a *UdpAC) ebpfRuleAddFailClosed(mapType int, params ebpf.EbpfRuleParams, ttlSec int) error {
+	return a.recordEbpfInsertResult(ebpf.EbpfRuleAdd(mapType, params, ttlSec), params, mapType)
+}
+
+// recordEbpfInsertResult is the detect-and-record half of
+// ebpfRuleAddFailClosed, split out so the map-full observability path is unit
+// testable without a kernel or pinned maps: a synthetic error wrapping
+// syscall.E2BIG drives the same branch the real kernel insert would. It bumps
+// MetricEbpfMapFull and emits the distinct fail-closed log on map-full, then
+// returns err UNCHANGED (never swallowed, never panicked) so the caller's
+// existing fail-closed control flow is preserved.
+func (a *UdpAC) recordEbpfInsertResult(err error, params ebpf.EbpfRuleParams, mapType int) error {
+	if ebpf.IsMapFull(err) {
+		a.incrMetric(MetricEbpfMapFull)
+		log.Error("[EbpfRuleAdd] ADMISSION FAIL-CLOSED: allow-rule eBPF map %q (mapType %d) full (-E2BIG) — refusing to insert this NEW allow-rule src: %s dst: %s; EXISTING admitted sessions are NOT evicted (#2163). Map at capacity (max_entries); see SESSION_ENFORCEMENT_ARCHITECTURE.md.", ebpf.MapTypeName(mapType), mapType, params.SrcIP, params.DstIP)
+	}
+	return err
+}
+
 // computeFlushDeadline returns `now + openTimeSec + flushSafetyMargin`
 // — the single source of truth for the L3 flush deadline anchoring.
 // Centralizing this here keeps the four call sites in lockstep so a
@@ -779,7 +827,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								DstIP: dstAddr.Ip,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
-							err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
@@ -793,7 +841,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								Protocol: dstAddr.Protocol,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
-							err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(1, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf tcp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 								return
@@ -828,7 +876,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								DstIP: dstAddr.Ip,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
-							err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
@@ -842,7 +890,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								Protocol: dstAddr.Protocol,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
-							err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(1, ebpfHashStr, openTimeSec)
 
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf udp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
@@ -874,7 +922,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								DstIP: dstAddr.Ip,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
-							err = ebpf.EbpfRuleAdd(3, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(3, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
@@ -931,7 +979,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 										SrcIP:   srcIpStr,
 										DstPort: dstAddr.Port,
 									}
-									err = ebpf.EbpfRuleAdd(4, ebpfHashStr, tempOpenTimeSec)
+									err = a.ebpfRuleAddFailClosed(4, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf for tcp dst port src: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPort, err)
 									}
@@ -942,7 +990,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 										DstPortStart: 1,
 										DstPortEnd:   65535,
 									}
-									err = ebpf.EbpfRuleAdd(5, ebpfHashStr, tempOpenTimeSec)
+									err = a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, err)
 									}
@@ -958,7 +1006,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 										SrcIP:   srcIpStr,
 										DstPort: dstAddr.Port,
 									}
-									err = ebpf.EbpfRuleAdd(4, ebpfHashStr, tempOpenTimeSec)
+									err = a.ebpfRuleAddFailClosed(4, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf for udp dst port src: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPort, err)
 									}
@@ -968,7 +1016,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 										DstPortStart: 1,
 										DstPortEnd:   65535,
 									}
-									err = ebpf.EbpfRuleAdd(5, ebpfHashStr, tempOpenTimeSec)
+									err = a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, err)
 									}
@@ -982,7 +1030,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 									SrcIP: srcIpStr,
 									DstIP: dstAddr.Ip,
 								}
-								err = ebpf.EbpfRuleAdd(3, ebpfHashStr, openTimeSec)
+								err = a.ebpfRuleAddFailClosed(3, ebpfHashStr, openTimeSec)
 								if err != nil {
 									log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								}
@@ -1076,7 +1124,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 				Protocol: "tcp",
 				DstPort:  tlocalAddr.Port,
 			}
-			err = ebpf.EbpfRuleAdd(6, ebpfHashStr, tempOpenTimeSec)
+			err = a.ebpfRuleAddFailClosed(6, ebpfHashStr, tempOpenTimeSec)
 			if err != nil {
 				log.Error("[EbpfRuleAdd] add ebpf type 6 protocol: %s, dstport :%d, %v", ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 				return
@@ -1137,7 +1185,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 				Protocol: "udp",
 				DstPort:  tlocalAddr.Port,
 			}
-			err = ebpf.EbpfRuleAdd(6, ebpfHashStr, tempOpenTimeSec)
+			err = a.ebpfRuleAddFailClosed(6, ebpfHashStr, tempOpenTimeSec)
 			if err != nil {
 				log.Error("[EbpfRuleAdd] add ebpf type 6 protocol: %s, dstport :%d, %v", ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 				return
@@ -1356,7 +1404,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 				// eBPF mapType here MUST also update the FlowKey
 				// shape to match.
 				a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
-				err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
+				err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, openTimeSec)
 				if err != nil {
 					log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 					return
@@ -1499,7 +1547,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 							DstIP: dstAddr.Ip,
 						}
 						a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
-						err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
+						err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, openTimeSec)
 						if err != nil {
 							log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 							return
@@ -1513,7 +1561,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 							Protocol: dstAddr.Protocol,
 						}
 						a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
-						err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
+						err = a.ebpfRuleAddFailClosed(1, ebpfHashStr, openTimeSec)
 
 						if err != nil {
 							log.Error("[EbpfRuleAdd] add ebpf udp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
@@ -1555,7 +1603,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 						DstIP: dstAddr.Ip,
 					}
 					a.scheduleFlushIfEnabled(flushEntry, remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
-					err = ebpf.EbpfRuleAdd(3, ebpfHashStr, openTimeSec)
+					err = a.ebpfRuleAddFailClosed(3, ebpfHashStr, openTimeSec)
 					if err != nil {
 						log.Error("[EbpfRuleAdd] add ebpf icmp src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 						return

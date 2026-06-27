@@ -99,16 +99,27 @@ struct protocol_port_value {
     __u64 expire_time;
 } __attribute__((packed));
 
+// Allow-rule map (src+dst+port+proto). AUTHORITATIVE admission decision:
+// presence of an entry here IS the kernel's "this flow is admitted" answer
+// on the XDP fast path. Must be BPF_MAP_TYPE_HASH, NOT LRU_HASH: an LRU map
+// silently evicts the least-recently-used entry when full, which would drop
+// an already-admitted session's allow-rule and "kill a random session"
+// (issue #2163). HASH instead returns -E2BIG to user space on insert into a
+// full map, so the AC fails the NEW admission closed rather than silently
+// revoking an EXISTING one. Rationale: docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md.
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct whitelist_key);
     __type(value, struct whitelist_value);
     __uint(max_entries, MAX_ENTRIES);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } spp SEC(".maps");
 
+// Allow-rule map (src+dst-port). Authoritative — HASH, not LRU_HASH. See
+// the spp map above and SESSION_ENFORCEMENT_ARCHITECTURE.md for why an LRU
+// allow-rule map silently evicts admitted sessions (#2163).
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct src_port_list_key);
     __type(value, struct src_port_list_value);
     __uint(max_entries, MAX_ENTRIES);
@@ -123,24 +134,30 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } icmpwhitelist SEC(".maps");
 
+// Allow-rule map (src+dst). Authoritative — HASH, not LRU_HASH. See the spp
+// map above and SESSION_ENFORCEMENT_ARCHITECTURE.md (#2163).
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct sdwhitelist_key);
     __type(value, struct sdwhitelist_value);
     __uint(max_entries, MAX_ENTRIES);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } sdwhitelist SEC(".maps");
 
+// Allow-rule map (src+port-range). Authoritative — HASH, not LRU_HASH. See
+// the spp map above and SESSION_ENFORCEMENT_ARCHITECTURE.md (#2163).
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct port_list_key);
     __type(value,struct port_list_value);
     __uint(max_entries, MAX_ENTRIES);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } port_list SEC(".maps");
 
+// Allow-rule map (proto+dst-port). Authoritative — HASH, not LRU_HASH. See
+// the spp map above and SESSION_ENFORCEMENT_ARCHITECTURE.md (#2163).
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct protocol_port_key);
     __type(value,struct protocol_port_value);
     __uint(max_entries, MAX_ENTRIES);
@@ -159,13 +176,47 @@ struct ipv4_ct_tuple {
 struct conn_value {
     __u64 timestamp;
     __u64 last_timestamp;
-    __u64 ttl_ns;   
+    __u64 ttl_ns;
     __u8 state;
     __u8 flags;
     __u32 rx_packets;
     __u32 tx_packets;
 };
 
+// conn_track: per-flow established-connection cache, kept LRU_HASH (unlike the
+// authoritative allow-rule maps above). It is NOT a pure cache, though — see the
+// KNOWN LIMITATION below.
+//
+// Datapath (xdp_white_prog): a packet that hits conn_track XDP_PASSes
+// immediately; a MISS falls through to the allow-rule maps, and only an
+// allow-rule match re-populates conn_track (BPF_ANY) before passing.
+//
+// During NORMAL operation conn_track is derived from a still-present allow-rule:
+// evicting an entry does NOT drop an admitted session — the flow's next packet
+// misses, re-checks the (authoritative, fail-closed HASH) allow-rule, and — if
+// still admitted — re-passes and re-caches. There eviction is benign
+// re-validation. The XDP datapath also cannot act on an insert failure (the
+// BPF_ANY update return is unused; kernel XDP has no error channel to user
+// space), so a HASH conn_track at capacity would return -E2BIG and silently
+// fail to cache, forcing every packet of every new flow through the full 5-map
+// allow-rule scan — a performance cliff. LRU instead sheds the coldest flows.
+//
+// KNOWN LIMITATION (pending #2814, an E5-flip blocker): the "derived cache"
+// property does NOT hold after a SURGICAL revoke. revocation_index.go
+// flushEntryNow does a COARSE RescheduleEarlier on the shared allow-rule for the
+// FlowKey ("bar re-open in every mode... never gated by the surgical outcome"),
+// with NO tokenStore ref-count against other live admissions on that FlowKey. So
+// the shared allow-rule is torn down even when surgicalFlushFlowKey deliberately
+// "leaves same-allow-tuple siblings (different source port) ALIVE" (#2784). A
+// spared sibling's established flow then survives SOLELY via its conn_track
+// entry — there is no allow-rule left to re-admit it. If LRU evicts that
+// (typically idle/cold) sibling under conn_track-full pressure, its next packet
+// falls through to the now-removed allow-rule -> XDP_DROP, collaterally killing a
+// flow surgicalFlushFlowKey promised to spare. Changing conn_track to HASH has
+// its own tradeoff (at capacity, -E2BIG => new flows uncached => XDP slow path;
+// needs verification the datapath degrades gracefully), so it is deferred to E5
+// flip-readiness rather than fixed here. See
+// docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md (#2163, #2784, #2814).
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, MAX_ENTRIES);
@@ -175,13 +226,13 @@ struct {
 } conn_track SEC(".maps");
 
 struct event_t {
-    __u64 timestamp;    
-    __u8 action;        
+    __u64 timestamp;
+    __u8 action;
     __be32 src_ip;
     __be32 dst_ip;
-    __be16 src_port;    
-    __be16 dst_port;    
-    __u8 protocol;      
+    __be16 src_port;
+    __be16 dst_port;
+    __u8 protocol;
     __be16 len;
 } __attribute__((packed));
 
@@ -232,11 +283,11 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
     struct tcphdr *tcp;
     struct ipv4_ct_tuple ct_key = {};
     struct ethhdr *eth = data;
-    
+
     if (data + sizeof(*eth) > data_end) {
         return XDP_DROP;
-    }   
-    
+    }
+
     if ((void *)(eth + 1) > data_end)
         return XDP_DROP;
 
@@ -271,9 +322,9 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
         ct_key.sport = udp->source;
         ct_key.dport = udp->dest;
         // ct_key.dport = bpf_htons(udp->dest);
-    } 
+    }
 
-    
+
     if (iph->protocol == IPPROTO_TCP) {
         void *tcp_start = (void *)iph + (iph->ihl * 4);
         if ((void *)(tcp_start + sizeof(struct tcphdr)) > data_end)
@@ -284,8 +335,8 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
             return XDP_PASS;
         }
     }
-    
-    if (iph->protocol == IPPROTO_UDP && 
+
+    if (iph->protocol == IPPROTO_UDP &&
         (ct_key.dport == bpf_htons(DHCP_PORT_R) || ct_key.dport == bpf_htons(DHCP_PORT_O) || ct_key.sport == bpf_htons(DNS_PORT))) {
         return XDP_PASS;
     }
@@ -301,15 +352,15 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
             .dst_ip = iph->daddr,
         };
         //only processes ICMP Echo Requests (type 8, code 0) and ICMP Echo Replies (type 0, code 0)
-        if ((icmp->type == ICMP_ECHO && icmp->code == 0) || 
+        if ((icmp->type == ICMP_ECHO && icmp->code == 0) ||
             (icmp->type == ICMP_ECHOREPLY && icmp->code == 0)) {
-            
+
             if (icmp->type == ICMP_ECHO) {
                 //Lookup icmpwhitelist entry
                 struct icmpwhitelist_value *iw_val = bpf_map_lookup_elem(&icmpwhitelist, &icmpkey);
                 if (!iw_val) {
                     return XDP_DROP;
-                }   
+                }
                 __u64 now = bpf_ktime_get_ns();
                 // Check if whitelist entry has expired
                 if (iw_val->expire_time < now) {
@@ -440,7 +491,7 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
             };
             bpf_map_update_elem(&conn_track, &ct_key, &new_val, BPF_ANY);
             return XDP_PASS;
-        }       
+        }
     }
 
     if (sp_val) {
@@ -453,7 +504,7 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
             submit_event(ctx, 1, iph->saddr, iph->daddr, ct_key.sport, ct_key.dport, iph->protocol, iph->tot_len);
             struct conn_value new_val = {
                 .timestamp = bpf_ktime_get_ns(),
-                .last_timestamp = bpf_ktime_get_ns(), 
+                .last_timestamp = bpf_ktime_get_ns(),
                 .ttl_ns = sp_val->expire_time - now,
                 .state = CT_ESTABLISHED,
                 .flags = CT_FLAG_NONE,
@@ -475,7 +526,7 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
             submit_event(ctx, 1, iph->saddr, iph->daddr, ct_key.sport, ct_key.dport, iph->protocol, iph->tot_len);
             struct conn_value new_val = {
                 .timestamp = bpf_ktime_get_ns(),
-                .last_timestamp = bpf_ktime_get_ns(), 
+                .last_timestamp = bpf_ktime_get_ns(),
                 .ttl_ns = pl_val->expire_time - now,
                 .state = CT_ESTABLISHED,
                 .flags = CT_FLAG_NONE,
@@ -496,7 +547,7 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
             submit_event(ctx, 1, iph->saddr, iph->daddr, ct_key.sport, ct_key.dport, iph->protocol, iph->tot_len);
             struct conn_value new_val = {
                 .timestamp = bpf_ktime_get_ns(),
-                .last_timestamp = bpf_ktime_get_ns(), 
+                .last_timestamp = bpf_ktime_get_ns(),
                 .ttl_ns = pp_val->expire_time - now,
                 .state = CT_ESTABLISHED,
                 .flags = CT_FLAG_NONE,
