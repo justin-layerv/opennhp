@@ -463,7 +463,7 @@ lint-terraform-drift:
 test:
 	@echo "[OpenNHP] Running Unit Tests..."
 	cd internalauth && go test -v ./... -race
-	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry"
+	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry|TestConformanceVectors"
 	@echo "$(COLOUR_GREEN)[OpenNHP] Unit Tests Done!$(END_COLOUR)"
 
 test-lambdas: ## Run Lambda unit tests (Python)
