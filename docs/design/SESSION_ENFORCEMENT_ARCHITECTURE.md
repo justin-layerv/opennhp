@@ -271,6 +271,58 @@ and any bump must re-run the memory math above against the chosen instance
 type. Tracked as a concrete flip-time task in
 [nhp#2813](https://github.com/layervai/nhp/issues/2813) (under #2163 item 2).
 
+#### IPv6 maps: `MAX_ENTRIES_V6` (separate, right-sized ceiling)
+
+The IPv6 allow-rule + conntrack maps (added declaration-only in the E2 IPv6
+slice — `spp_v6`, `src_port_v6`, `icmp_wl_v6`, `sdwhitelist_v6`,
+`port_list_v6` as `HASH`, and `conn_track_v6` as `LRU_HASH`) are sized by a
+**separate** `MAX_ENTRIES_V6`, deliberately **not** reused from `MAX_ENTRIES`.
+The production knock NLB is **IPv4-only**, so v6 enforcement scale is far smaller
+than v4 today; sizing the v6 maps at the v4 1M ceiling would preallocate ~0.5 GB
+of unswappable kernel memory for a near-empty workload. `MAX_ENTRIES_V6` is
+**131072 (128K, a power of two)** — a comfortable near-term v6 ceiling.
+
+Kernel-memory cost, using the same preallocation model as above (the
+`htab_elem + round_up(key,8) + round_up(value,8) + bucket` formula, `LRU_HASH`
++≈16 B/entry). The v6 keys (asserted packed sizes in `nhp_ebpf_xdp.c`) all reuse
+the IP-agnostic 16 B `*_value` types (`round_up(16,8)=16`); `conn_track_v6`
+reuses the 40 B `conn_value`. (`MB` below is decimal, 10⁶ B; ≈89 MiB binary.)
+
+| Map | Type | Key (packed → `round_up/8`) | B/entry | At 131072 |
+|---|---|---|---|---|
+| `spp_v6` | HASH | 35 → 40 | 120 | ≈ 15.7 MB |
+| `src_port_v6` | HASH | 18 → 24 | 104 | ≈ 13.6 MB |
+| `icmp_wl_v6` | HASH | 32 → 32 | 112 | ≈ 14.7 MB |
+| `sdwhitelist_v6` | HASH | 32 → 32 | 112 | ≈ 14.7 MB |
+| `port_list_v6` | HASH | 20 → 24 | 104 | ≈ 13.6 MB |
+| **5 HASH allow-rule maps** | | | **552** | **≈ 72.3 MB** |
+| `conn_track_v6` | LRU_HASH | 38 → 40 | 160 | ≈ 21.0 MB |
+| **Total (6 v6 maps)** | | | | **≈ 93 MB** |
+
+≈93 MB is trivial on an 8 GB `c6i.xlarge` (or even the 4 GB `t3.medium`
+sandbox) AC. There is deliberately **no `protocol_port_v6` map**: the
+`protocol_port` key (`{dst_port, protocol}`) carries no IP address, so a
+proto+dst-port allow-rule is IP-family-agnostic — the existing v4
+`protocol_port` map is reused for v6 (one entry admits the proto+port for both
+families), saving a map and a duplicate write path. Like the v4 `MAX_ENTRIES`
+bump, any `MAX_ENTRIES_V6` change is flip-time work that must re-run this math
+against the chosen instance type, co-decided under
+[nhp#2813](https://github.com/layervai/nhp/issues/2813).
+
+> **Guarantee gap — the C↔Go struct-size contract is not yet enforced in CI.**
+> The v6 key/tuple sizes are pinned with inline `_Static_assert`s in
+> `nhp_ebpf_xdp.c`, but **no CI job compiles that translation unit** (the `.o` is
+> committed; `ubuntu-build.yml` is `branches:[main]`-gated and does not run
+> `make ebpf`, and the BPF target is unavailable on the macOS dev host). So the
+> asserts only fire on a manual `make ebpf` regen, and the size contract that
+> slice 2's Go serializers + golden-byte tests and slice 6's
+> `map.KeySize() == GoSize` test depend on is, for now, locally-verified rather
+> than CI-gated. Wiring a lightweight compile/size-harness gate (and, for
+> symmetry, `_Static_assert`s on the v4 structs — including pinning
+> `ipv4_ct_tuple` at its actual 16 B with a note that the no-op `__packed` is
+> deliberately left, #2818) is tracked in
+> [nhp#2823](https://github.com/layervai/nhp/issues/2823).
+
 ### Fail-closed observability (`MetricEbpfMapFull`)
 
 When an allow-rule map insert returns `-E2BIG`, the AC increments the
