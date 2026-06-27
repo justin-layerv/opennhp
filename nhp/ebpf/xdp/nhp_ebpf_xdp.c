@@ -11,6 +11,29 @@
 #define ICMP_ECHOREPLY 0
 #define ETH_P_IPV6   0x86DD
 #define IPPROTO_UDP 17
+#define IPPROTO_ICMPV6 58
+// ICMPv6 Echo Request / Echo Reply (RFC 4443 §4) — the v6 equivalents of v4's
+// ICMP_ECHO(8)/ICMP_ECHOREPLY(0). Different numbering: 128/129, not 8/0.
+#define ICMPV6_ECHO_REQUEST 128
+#define ICMPV6_ECHO_REPLY   129
+// ICMPv6 Packet Too Big (RFC 4443 §3.2). IPv6 routers never fragment, so PMTUD
+// relies ENTIRELY on this message reaching the sender; dropping it blackholes
+// any flow whose path MTU is below the sender's assumption. RFC 4890 §4.3.1
+// classifies it as a message that MUST NOT be dropped — we PASS it (below).
+#define ICMPV6_PKT_TOO_BIG 2
+// IPv6 Neighbor Discovery (RFC 4861 §4) — the link-local control plane that is
+// to IPv6 what ARP is to IPv4: RS/RA learn the prefix + default route (SLAAC),
+// NS/NA resolve a neighbor's link-layer address, Redirect updates next-hop.
+// These ride inside ICMPv6 (so, unlike v4 ARP, they share the ETH_P_IPV6
+// ethertype and cannot be waved through by the ETH_P_ARP switch arm). We PASS
+// the whole 133–137 range unconditionally (the v6 analog of `case ETH_P_ARP:
+// return XDP_PASS`); see the ICMPv6 branch below for the rationale. RFC 4890
+// §4.4.1 likewise classifies NDP as MUST NOT be dropped on a link.
+#define ICMPV6_ND_ROUTER_SOLICIT   133
+#define ICMPV6_ND_ROUTER_ADVERT    134
+#define ICMPV6_ND_NEIGHBOR_SOLICIT 135
+#define ICMPV6_ND_NEIGHBOR_ADVERT  136
+#define ICMPV6_ND_REDIRECT         137
 #define MAX_ENTRIES 1000000
 // MAX_ENTRIES_V6: separate, right-sized ceiling for the IPv6 maps (E2 slice 1).
 // Deliberately NOT reused from MAX_ENTRIES (1,000,000): the prod knock NLB is
@@ -464,6 +487,21 @@ static __always_inline void reverseTuple(struct ipv4_ct_tuple *key) {
     key->sport = tmp_port;
 }
 
+// v6 counterpart of reverseTuple: swaps {daddr,saddr} and {dport,sport} and
+// flips the direction flag on an ipv6_ct_tuple, so one map can be probed for both
+// the ingress tuple and its reverse (the v4 conntrack two-lookup pattern).
+// Addresses are struct in6_addr (16 B), so they swap through a temporary struct
+// rather than a scalar.
+static __always_inline void reverseTuple_v6(struct ipv6_ct_tuple *key) {
+    struct in6_addr tmp_ip = key->daddr;
+    __u16 tmp_port = key->dport;
+    key->flags = !key->flags;
+    key->daddr = key->saddr;
+    key->saddr = tmp_ip;
+    key->dport = key->sport;
+    key->sport = tmp_port;
+}
+
 #ifndef __constant_htons
 #define __constant_htons(x) ((__u16)((((x) & 0xFF00) >> 8) | (((x) & 0x00FF) << 8)))
 #endif
@@ -471,6 +509,371 @@ static __always_inline void reverseTuple(struct ipv4_ct_tuple *key) {
 static __always_inline bool check_conn_expiry(struct conn_value *val) {
     __u64 now = bpf_ktime_get_ns();
     return (now > val->timestamp + val->ttl_ns);
+}
+
+// ----------------------------------------------------------------------------
+// IPv6 admission datapath (E2 slice 3).
+//
+// The v6 counterpart of the IPv4 flow in xdp_white_prog below: it mirrors the
+// same conntrack-fast-path → allow-rule-cascade → fail-CLOSED structure, against
+// the v6 maps slice 1 declared (spp_v6, sdwhitelist_v6, src_port_v6,
+// port_list_v6, the family-agnostic protocol_port, and icmp_wl_v6). It is
+// reached only from the ETH_P_IPV6 switch arm, which previously fail-OPENed
+// (`return XDP_PASS`); this slice changes that arm to filtered admission that
+// DROPs on no-match. Still INERT in prod: FilterMode defaults to iptables, so the
+// XDP program is not loaded until the E5 flip — no runtime change lands here.
+//
+// LIMITATION — no IPv6 extension-header chaining. We accept ONLY a packet whose
+// fixed-header `nexthdr` is directly TCP/UDP/ICMPv6 and DROP every other value
+// (including legitimate ext-header chains: Hop-by-Hop, Routing, Fragment, etc.).
+// Walking the ext-header chain is the classic XDP verifier/complexity trap
+// (unbounded loop, per-hop bounds checks) and is deliberately out of scope for
+// this slice. Consequence: fragmented v6 traffic and ext-header-carrying flows
+// fail CLOSED. If those must be admitted, add a bounded ext-header walk in a
+// follow-up. L4 therefore always starts at exactly (void *)(ip6h + 1) — the
+// 40-byte fixed header — so there is no v4-style ihl*4 arithmetic or re-parse.
+//
+// LIMITATION — DENY/ACCEPT events carry zeroed IPv4 address fields. struct
+// event_t is IPv4-shaped (__be32 src_ip/dst_ip); it cannot hold a 128-bit v6
+// address. Expanding it ripples into the Go event decoder (slices 2/4) and is
+// out of scope here, so v6 events pass 0 for the address fields (ports/protocol
+// are still meaningful). The verdict itself is unaffected — only event
+// telemetry addresses are truncated for v6.
+//
+// EVENT len — kept in PARITY with v4. v4 passes iph->tot_len, the entire L3
+// datagram length INCLUDING the 20-byte IPv4 header. The v6 fixed header's
+// payload_len excludes the 40-byte fixed header, so to report the same basis
+// (whole-datagram length) we add sizeof(struct ipv6hdr) back, in network byte
+// order, into `total_len` below and pass THAT to submit_event — not the raw
+// payload_len. Without this the v6 event would under-report by 40 bytes and the
+// slice-2/4 decoder would see two different length semantics across families.
+//
+// Reached as a helper (not inlined manually) so the v6 locals live in their own
+// function scope; combined with the per-rule { } blocks below, this lets clang
+// reuse one stack slot for the large v6 key structs instead of summing them
+// (the 512-byte BPF stack limit is the real constraint here, not insn count).
+static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
+                                             struct ethhdr *eth,
+                                             void *data_end) {
+    struct ipv6hdr *ip6h = (void *)(eth + 1);
+    if ((void *)(ip6h + 1) > data_end)
+        return XDP_DROP;
+
+    __u8 nexthdr = ip6h->nexthdr;
+
+    // Event length kept in parity with v4's iph->tot_len (whole L3 datagram):
+    // payload_len excludes the 40-byte fixed header, so add it back, staying in
+    // network byte order. See the EVENT len note in the header comment above.
+    __be16 total_len = bpf_htons(bpf_ntohs(ip6h->payload_len) + sizeof(struct ipv6hdr));
+
+    // No extension-header chaining (see LIMITATION above): accept ONLY a fixed
+    // header that points directly at TCP/UDP/ICMPv6; DROP everything else.
+    if (nexthdr != IPPROTO_TCP &&
+        nexthdr != IPPROTO_UDP &&
+        nexthdr != IPPROTO_ICMPV6)
+        return XDP_DROP;
+
+    // L4 ports. ICMPv6 is portless, so ports stay 0 for it (and the port-based
+    // maps below cannot match it — it is admitted only via icmp_wl_v6).
+    __be16 sport = 0;
+    __be16 dport = 0;
+    void *l4 = (void *)(ip6h + 1);   // 40-byte fixed header → L4 starts here
+    if (nexthdr == IPPROTO_TCP) {
+        struct tcphdr *tcp = l4;
+        if ((void *)(tcp + 1) > data_end)
+            return XDP_DROP;
+        sport = tcp->source;
+        dport = tcp->dest;
+    } else if (nexthdr == IPPROTO_UDP) {
+        struct udphdr *udp = l4;
+        if ((void *)(udp + 1) > data_end)
+            return XDP_DROP;
+        sport = udp->source;
+        dport = udp->dest;
+    }
+
+    __u64 now = bpf_ktime_get_ns();
+
+    // ICMPv6 admission. Unlike v4 (where a non-echo ICMP packet falls THROUGH
+    // to the conntrack + src+dst sdwhitelist cascade), this branch is scoped so
+    // a DROP here does NOT fall through to the port cascade, and a non-DROP
+    // verdict is decided entirely HERE. That makes ICMPv6 type-driven, which is
+    // what the v6 control plane needs:
+    //
+    //   - NDP (133–137 RS/RA/NS/NA/Redirect) and Packet-Too-Big (2) PASS
+    //     unconditionally — see below.
+    //   - Echo Request (128) is gated by a non-expired, allowed icmp_wl_v6
+    //     (src+dst) entry; Echo Reply (129) passes (mirrors v4 type 0).
+    //   - every OTHER ICMPv6 type (Dest-Unreach 1, Time-Exceeded 3,
+    //     Param-Problem 4, MLD 130–132/143, etc.) fails CLOSED.
+    //
+    // v4/v6 DIVERGENCE (deliberate, documented): in v4 a non-echo ICMP packet
+    // can be admitted by a portless src+dst `sdwhitelist` match (it falls
+    // through the ICMP block into the cascade). In v6 it cannot — ICMPv6 is
+    // gated SOLELY by this branch (icmp_wl_v6 for echo; the explicit
+    // PASS/DROP type filter for everything else), never by sdwhitelist_v6.
+    // An operator who relies on a src+dst allow to cover ping in v4 must add an
+    // icmp_wl_v6 entry for v6. This is stricter (fail-closed) than v4 and is the
+    // intended posture: the error types we do NOT pass (1/3/4) stay dropped
+    // rather than being rescuable via a broad src+dst rule.
+    if (nexthdr == IPPROTO_ICMPV6) {
+        struct icmp6hdr *icmp6 = l4;
+        if ((void *)(icmp6 + 1) > data_end)
+            return XDP_DROP;
+        __u8 icmp6_type = icmp6->icmp6_type;
+
+        // Neighbor Discovery (133–137) is the IPv6 analog of ARP: it is how the
+        // link resolves L2 addresses (NS/NA) and learns the prefix + default
+        // route (RS/RA), plus Redirect. The v4 path passes ARP unconditionally
+        // (`case ETH_P_ARP: return XDP_PASS`); NDP rides inside ICMPv6 on the
+        // ETH_P_IPV6 ethertype, so the equivalent passthrough has to live here.
+        // Without it, loading XDP on a v6-bearing interface (AWS/ENA) blackholes
+        // neighbor resolution: inbound NS for the AC's own address is dropped →
+        // no NA → neighbors can't resolve the AC's MAC → traffic to the AC
+        // black-holes. PASS the whole range unconditionally, matching ARP. This
+        // is link-local control traffic, not a data path admitted via the maps.
+        if (icmp6_type >= ICMPV6_ND_ROUTER_SOLICIT &&
+            icmp6_type <= ICMPV6_ND_REDIRECT)
+            return XDP_PASS;
+
+        // Packet Too Big (2): IPv6 routers never fragment, so PMTUD depends
+        // ENTIRELY on this message getting back to the sender. Its source is a
+        // path router whose address we cannot whitelist ahead of time, so —
+        // unlike v4, where ICMP errors can fall through to sdwhitelist — there
+        // is no map that could admit it; dropping it blackholes every large v6
+        // flow. RFC 4890 §4.3.1 classifies PTB as MUST NOT be dropped. PASS it.
+        // (Dest-Unreach 1 / Time-Exceeded 3 / Param-Problem 4 are deliberately
+        // NOT passed here — they fail closed below, the stricter v4/v6
+        // divergence documented above.)
+        if (icmp6_type == ICMPV6_PKT_TOO_BIG)
+            return XDP_PASS;
+
+        if (icmp6_type == ICMPV6_ECHO_REQUEST && icmp6->icmp6_code == 0) {
+            struct icmpwhitelist_key_v6 ikey = {
+                .src_ip = ip6h->saddr,
+                .dst_ip = ip6h->daddr,
+            };
+            struct icmpwhitelist_value *iw_val =
+                bpf_map_lookup_elem(&icmp_wl_v6, &ikey);
+            if (!iw_val)
+                return XDP_DROP;
+            if (iw_val->expire_time < now) {
+                bpf_map_delete_elem(&icmp_wl_v6, &ikey);
+                return XDP_DROP;
+            }
+            if (iw_val->allowed == 1)
+                return XDP_PASS;
+            return XDP_DROP;
+        } else if (icmp6_type == ICMPV6_ECHO_REPLY && icmp6->icmp6_code == 0) {
+            // Unconditional PASS — the one fail-OPEN arm in this fail-closed
+            // branch. Deliberate v4 parity: v4 PASSes ICMP type 0 (Echo Reply)
+            // the same way. An Echo Reply only arrives for a request we sent,
+            // so it carries no admission decision of its own.
+            return XDP_PASS;
+        }
+        // Any other ICMPv6 type (errors 1/3/4, MLD, etc.) fails closed.
+        return XDP_DROP;
+    }
+
+    // conntrack fast path (TCP/UDP only): a hit on a non-expired entry PASSes
+    // immediately, mirroring v4. Forward tuple, then reverse tuple.
+    struct ipv6_ct_tuple ct_key = {};
+    ct_key.daddr = ip6h->daddr;
+    ct_key.saddr = ip6h->saddr;
+    ct_key.dport = dport;
+    ct_key.sport = sport;
+    ct_key.nexthdr = nexthdr;
+    ct_key.flags = CT_DIR_INGRESS;
+
+    struct conn_value *existing_val = bpf_map_lookup_elem(&conn_track_v6, &ct_key);
+    if (existing_val) {
+        if (check_conn_expiry(existing_val)) {
+            bpf_map_delete_elem(&conn_track_v6, &ct_key);
+            return XDP_DROP;
+        }
+        struct conn_value new_val = *existing_val;
+        new_val.tx_packets++;
+        new_val.last_timestamp = bpf_ktime_get_ns();
+        bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_EXIST);
+        return XDP_PASS;
+    }
+    reverseTuple_v6(&ct_key);
+    existing_val = bpf_map_lookup_elem(&conn_track_v6, &ct_key);
+    if (existing_val) {
+        if (check_conn_expiry(existing_val)) {
+            bpf_map_delete_elem(&conn_track_v6, &ct_key);
+            reverseTuple_v6(&ct_key);
+            return XDP_DROP;
+        }
+        struct conn_value new_val = *existing_val;
+        new_val.rx_packets++;
+        new_val.last_timestamp = bpf_ktime_get_ns();
+        bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_EXIST);
+        reverseTuple_v6(&ct_key);
+        return XDP_PASS;
+    }
+    reverseTuple_v6(&ct_key);   // restore forward tuple for conntrack population
+
+    // Allow-rule cascade (mirrors the v4 order: spp → sdwhitelist → src_port →
+    // port_list → protocol_port). On a non-expired allowed hit: populate
+    // conn_track_v6 (so the flow's subsequent packets take the fast path above)
+    // and PASS. Each rule's key + lookup is scoped in its own { } block so clang
+    // reuses one stack slot for the large v6 key structs (512-byte stack limit).
+
+    // spp_v6 (src + dst + dport + proto)
+    {
+        struct whitelist_key_v6 key = {
+            .src_ip = ip6h->saddr,
+            .dst_ip = ip6h->daddr,
+            .dst_port = dport,
+            .protocol = nexthdr,
+        };
+        struct whitelist_value *w_val = bpf_map_lookup_elem(&spp_v6, &key);
+        if (w_val) {
+            if (w_val->expire_time < now) {
+                bpf_map_delete_elem(&spp_v6, &key);
+                return XDP_DROP;
+            }
+            if (w_val->allowed == 1) {
+                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                struct conn_value new_val = {
+                    .timestamp = bpf_ktime_get_ns(),
+                    .last_timestamp = bpf_ktime_get_ns(),
+                    .ttl_ns = w_val->expire_time - now,
+                    .state = CT_ESTABLISHED,
+                    .flags = CT_FLAG_NONE,
+                    .rx_packets = 1,
+                    .tx_packets = 0,
+                };
+                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                return XDP_PASS;
+            }
+        }
+    }
+
+    // sdwhitelist_v6 (src + dst)
+    {
+        struct sdwhitelist_key_v6 sdkey = {
+            .src_ip = ip6h->saddr,
+            .dst_ip = ip6h->daddr,
+        };
+        struct sdwhitelist_value *sd_val = bpf_map_lookup_elem(&sdwhitelist_v6, &sdkey);
+        if (sd_val) {
+            if (sd_val->expire_time < now) {
+                bpf_map_delete_elem(&sdwhitelist_v6, &sdkey);
+                return XDP_DROP;
+            }
+            if (sd_val->allowed == 1) {
+                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                struct conn_value new_val = {
+                    .timestamp = bpf_ktime_get_ns(),
+                    .last_timestamp = bpf_ktime_get_ns(),
+                    .ttl_ns = sd_val->expire_time - now,
+                    .state = CT_ESTABLISHED,
+                    .flags = CT_FLAG_NONE,
+                    .rx_packets = 1,
+                    .tx_packets = 0,
+                };
+                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                return XDP_PASS;
+            }
+        }
+    }
+
+    // src_port_v6 (src + dport)
+    {
+        struct src_port_list_key_v6 spkey = {
+            .src_ip = ip6h->saddr,
+            .dst_port = dport,
+        };
+        struct src_port_list_value *sp_val = bpf_map_lookup_elem(&src_port_v6, &spkey);
+        if (sp_val) {
+            if (sp_val->expire_time < now) {
+                bpf_map_delete_elem(&src_port_v6, &spkey);
+                return XDP_DROP;
+            }
+            if (sp_val->allowed == 1) {
+                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                struct conn_value new_val = {
+                    .timestamp = bpf_ktime_get_ns(),
+                    .last_timestamp = bpf_ktime_get_ns(),
+                    .ttl_ns = sp_val->expire_time - now,
+                    .state = CT_ESTABLISHED,
+                    .flags = CT_FLAG_NONE,
+                    .rx_packets = 1,
+                    .tx_packets = 0,
+                };
+                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                return XDP_PASS;
+            }
+        }
+    }
+
+    // port_list_v6 (src + port range)
+    {
+        struct port_list_key_v6 pl_key = {
+            .src_ip = ip6h->saddr,
+            .min_port = MIN_PORT,
+            .max_port = MAX_PORT,
+        };
+        struct port_list_value *pl_val = bpf_map_lookup_elem(&port_list_v6, &pl_key);
+        if (pl_val) {
+            if (pl_val->expire_time < now) {
+                bpf_map_delete_elem(&port_list_v6, &pl_key);
+                return XDP_DROP;
+            }
+            if (pl_val->allowed == 1) {
+                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                struct conn_value new_val = {
+                    .timestamp = bpf_ktime_get_ns(),
+                    .last_timestamp = bpf_ktime_get_ns(),
+                    .ttl_ns = pl_val->expire_time - now,
+                    .state = CT_ESTABLISHED,
+                    .flags = CT_FLAG_NONE,
+                    .rx_packets = 1,
+                    .tx_packets = 0,
+                };
+                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                return XDP_PASS;
+            }
+        }
+    }
+
+    // protocol_port (proto + dport) — REUSED v4 map. By design there is no
+    // protocol_port_v6: the key carries no IP address, so a proto+dport rule is
+    // IP-family-agnostic and one entry admits both families (slice 1 note).
+    {
+        struct protocol_port_key pp_key = {
+            .dst_port = dport,
+            .protocol = nexthdr,
+        };
+        struct protocol_port_value *pp_val = bpf_map_lookup_elem(&protocol_port, &pp_key);
+        if (pp_val) {
+            if (pp_val->expire_time < now) {
+                bpf_map_delete_elem(&protocol_port, &pp_key);
+                return XDP_DROP;
+            }
+            if (pp_val->allowed == 1) {
+                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                struct conn_value new_val = {
+                    .timestamp = bpf_ktime_get_ns(),
+                    .last_timestamp = bpf_ktime_get_ns(),
+                    .ttl_ns = pp_val->expire_time - now,
+                    .state = CT_ESTABLISHED,
+                    .flags = CT_FLAG_NONE,
+                    .rx_packets = 1,
+                    .tx_packets = 0,
+                };
+                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                return XDP_PASS;
+            }
+        }
+    }
+
+    // No allow-rule matched → fail CLOSED (the whole point of this slice: the
+    // ETH_P_IPV6 arm no longer fail-OPENs). Emit a DENY event like v4, then DROP.
+    submit_event(ctx, 0, 0, 0, sport, dport, nexthdr, total_len);
+    return XDP_DROP;
 }
 
 SEC("xdp")
@@ -491,7 +894,7 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
     switch (bpf_ntohs(eth->h_proto)) {
         case ETH_P_ARP:  return XDP_PASS;
         case ETH_P_IP:   break;
-        case ETH_P_IPV6: return XDP_PASS;
+        case ETH_P_IPV6: return xdp_white_prog_v6(ctx, eth, data_end);
         default:         return XDP_DROP;
     }
 

@@ -323,6 +323,19 @@ against the chosen instance type, co-decided under
 > deliberately left, #2818) is tracked in
 > [nhp#2823](https://github.com/layervai/nhp/issues/2823).
 
+> **Scope limitation — the v6 datapath does not chain IPv6 extension headers.**
+> `xdp_white_prog_v6` (added in the E2 slice-3 datapath, #2825) admits only
+> packets whose IPv6 fixed-header `nexthdr` is *directly* `TCP`/`UDP`/`ICMPv6`;
+> **any extension header (Hop-by-Hop, Routing, Fragment, Destination Options,
+> AH/ESP, …) DROPs fail-closed**, so **fragmented v6** and ext-header-carrying
+> flows are denied once v6 XDP enforcement is live (E5). The drop direction is
+> safe (an ext-header/fragment cannot be used to *bypass* admission), but a
+> subset of legitimate v6 traffic — notably NDP options-bearing messages and
+> fragments — is silently denied. Walking the chain in XDP is the verifier
+> complexity trap (unbounded loop + per-hop bounds checks) and is deliberately
+> out of scope here; a **bounded** ext-header walk is tracked in
+> [nhp#2833](https://github.com/layervai/nhp/issues/2833).
+
 ### Fail-closed observability (`MetricEbpfMapFull`)
 
 When an allow-rule map insert returns `-E2BIG`, the AC increments the
