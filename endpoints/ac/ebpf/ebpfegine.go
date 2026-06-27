@@ -80,9 +80,25 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 		log.Error("Failed to remove memlock limit")
 	}
 
+	// These three literals are the single source of truth for the eBPF
+	// object load path. The build side must ship the objects to match:
+	// Makefile EBPF_OBJ_* compile them into release/nhp-ac/etc/, and the
+	// docker/Dockerfile.ac.aws runtime guard asserts /nhp-ac/etc/<name>.o
+	// exists. If you rename an object or change bpfDir here, update both
+	// or the AC boot-fails under FilterMode=EBPFXDP. The drift is caught at
+	// PR time by scripts/check-ebpf-load-path-lockstep.sh (wired into
+	// `make lint-workflows`), which compares these consts against the
+	// Makefile paths and the Dockerfile guard — keep that lint's extractor
+	// in step if you change the shape of these declarations.
 	const ebpfenginename string = "nhp_ebpf_xdp.o"
 	const tcObjName string = "tc_egress.o"
-	//ebpf nhp_ebpf_xdp.o save to etc/ after clang compile
+	// bpfDir is relative to the AC's working directory at runtime
+	// (prod: nhp-acd systemd WorkingDirectory=/opt/layerv/nhp-ac), NOT
+	// joined onto the dirPath arg this func uses for logs below — that is
+	// deliberate: the build side ships the objects to a cwd-relative
+	// etc/ (Makefile EBPF_OBJ_* / the Dockerfile guard), so resolving
+	// them against dirPath instead would look in the wrong place and
+	// boot-fail the load. Keep this cwd-relative.
 	bpfDir := "etc"
 	specPath := filepath.Join(bpfDir, ebpfenginename)
 	tcSpecPath := filepath.Join(bpfDir, tcObjName)

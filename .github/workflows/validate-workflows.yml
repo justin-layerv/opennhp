@@ -26,6 +26,15 @@ on:
       - "scripts/check-image-tag-writer-allowlist.sh"
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
+      # eBPF load-path lockstep (#2810): trigger on the script itself and on all
+      # three source-of-truth sites it compares so a drift in ANY of them
+      # re-runs the check at PR time. Dockerfile.ac.aws is already listed below;
+      # the Go source of truth + the Makefile are not watched elsewhere, so they
+      # must be here or a Go-only/Makefile-only rename would skip the lint.
+      - "scripts/check-ebpf-load-path-lockstep.sh"
+      - "tests/scripts/check-ebpf-load-path-lockstep_test.sh"
+      - "endpoints/ac/ebpf/ebpfegine.go"
+      - "Makefile"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
       - "scripts/check-packer-failure-surfaced.sh"
       - "scripts/check-app-image-line-rendered.sh"
@@ -410,6 +419,22 @@ jobs:
 
       - name: Check asp+ac_id lockstep (TF ↔ Go)
         run: bash scripts/check-asp-and-ac-id-lockstep.sh
+
+      # eBPF object load-path lockstep (#2810): the AC loads its eBPF objects
+      # from a dir+filenames that are the runtime source of truth in
+      # endpoints/ac/ebpf/ebpfegine.go (bpfDir / ebpfenginename / tcObjName).
+      # The Makefile EBPF_OBJ_* output paths and the docker/Dockerfile.ac.aws
+      # build guard independently hardcode the same path; a Go-only rename
+      # would pass the in-image build guard (which only compares
+      # Makefile↔Dockerfile) yet boot-fail the AC under FilterMode=EBPFXDP.
+      # The fixture suite runs first so an extractor regression surfaces
+      # against synthetic inputs before the real tree runs. shellcheck both —
+      # actionlint's -shellcheck only covers workflow-embedded scripts.
+      - name: Test + check eBPF load-path lockstep (Go ↔ Makefile ↔ Dockerfile, #2810)
+        run: |
+          shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
+          bash tests/scripts/check-ebpf-load-path-lockstep_test.sh
+          bash scripts/check-ebpf-load-path-lockstep.sh
 
       - name: Check frps_az_suffixes validation drift (root ↔ module ↔ env-roots)
         run: bash scripts/check-frps-az-suffixes-validation-drift.sh

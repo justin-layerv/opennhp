@@ -40,6 +40,12 @@ ANDROID_CC='${TOOLCHAIN}/bin/aarch64-linux-android21-clang'
 ANDROID_CXX='${TOOLCHAIN}/bin/aarch64-linux-android21-clang++'
 
 # eBPF compile
+# The clang guard fires for any goal whose name contains "ebpf"
+# (both `ebpf` and `ebpf-objects`), so clang/llvm is required only
+# when an eBPF compile is actually requested — never for the plain
+# server/relay/agent builds (`make`, `make acd`, etc.). Keep "ebpf"
+# in any new eBPF target name, or extend this findstring, or the
+# guard silently stops protecting it.
 ifneq (,$(findstring ebpf,$(MAKECMDGOALS)))
     CLANG := $(shell command -v clang 2>/dev/null)
     ifeq ($(CLANG),)
@@ -51,17 +57,36 @@ EBPF_SRC_XDP = ./nhp/ebpf/xdp/nhp_ebpf_xdp.c
 EBPF_SRC_TC_EGRESS = ./nhp/ebpf/xdp/tc_egress.c
 EBPF_OBJ_XDP = ./release/nhp-ac/etc/nhp_ebpf_xdp.o
 EBPF_OBJ_TC_EGRESS = ./release/nhp-ac/etc/tc_egress.o
+# Both sources #include "vmlinux.h" (the in-tree, BTF-generated kernel
+# type header). It's a prerequisite so a local incremental `make
+# ebpf-objects` after a vmlinux.h regen recompiles instead of shipping a
+# stale object. The other includes (<bpf/bpf_helpers.h> etc.) are libbpf
+# system headers, not in-tree, so they can't be Make prerequisites — the
+# Docker build always does a clean compile, so they're not a staleness
+# risk there.
+EBPF_VMLINUX_H = ./nhp/ebpf/xdp/vmlinux.h
 CLANG_OPTS = -O2 -target bpf -g -Wall -I.
 
+# ebpf-objects compiles ONLY the two eBPF object files into
+# ./release/nhp-ac/etc/ (the path the AC loads from — source of truth is
+# endpoints/ac/ebpf/ebpfegine.go). This is the target the AC Docker image
+# build uses (docker/Dockerfile.ac.aws). Deliberately decoupled from
+# `generate-version-and-build`: the AC image only needs the objects, not
+# the full multi-binary build/SDK/archive pipeline the legacy `ebpf`
+# target pulls in.
+.PHONY: ebpf-objects
+ebpf-objects: $(EBPF_OBJ_XDP) $(EBPF_OBJ_TC_EGRESS)
+	@echo "$(COLOUR_GREEN)[eBPF] Object files compiled$(END_COLOUR)"
+
 .PHONY: ebpf
-ebpf: $(EBPF_OBJ_XDP) $(EBPF_OBJ_TC_EGRESS) generate-version-and-build
+ebpf: ebpf-objects generate-version-and-build
 	@echo "$(COLOUR_GREEN)[eBPF] Full build completed$(END_COLOUR)"
 
-$(EBPF_OBJ_XDP): $(EBPF_SRC_XDP)
+$(EBPF_OBJ_XDP): $(EBPF_SRC_XDP) $(EBPF_VMLINUX_H)
 	@mkdir -p $(@D)
 	@echo "$(COLOUR_BLUE)[eBPF] Compiling: $< -> $@ $(END_COLOUR)"
 	$(CLANG) $(CLANG_OPTS) -c $(EBPF_SRC_XDP) -o $(EBPF_OBJ_XDP)
-$(EBPF_OBJ_TC_EGRESS): $(EBPF_SRC_TC_EGRESS)
+$(EBPF_OBJ_TC_EGRESS): $(EBPF_SRC_TC_EGRESS) $(EBPF_VMLINUX_H)
 	@mkdir -p $(@D)
 	@echo "$(COLOUR_BLUE)[eBPF] Compiling: $< -> $@ $(END_COLOUR)"
 	$(CLANG) $(CLANG_OPTS) -c $(EBPF_SRC_TC_EGRESS) -o $(EBPF_OBJ_TC_EGRESS)
@@ -112,6 +137,7 @@ acd:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-ac... $(END_COLOUR)"
 	cd endpoints && \
 	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-ac/nhp-acd ./ac/main/main.go && \
+	mkdir -p ../release/nhp-ac/etc && \
 	cp ./ac/main/etc/*.toml ../release/nhp-ac/etc/
 
 serverd:
@@ -386,6 +412,9 @@ lint-workflows:
 	@bash scripts/check-cleanup-event-type-lockstep.sh
 	@shellcheck scripts/check-revocation-slo-lockstep.sh
 	@bash scripts/check-revocation-slo-lockstep.sh
+	@shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
+	@bash tests/scripts/check-ebpf-load-path-lockstep_test.sh
+	@bash scripts/check-ebpf-load-path-lockstep.sh
 	@shellcheck scripts/check-golden-vectors.sh tests/scripts/check-golden-vectors_test.sh
 	@bash tests/scripts/check-golden-vectors_test.sh
 	@bash scripts/check-golden-vectors.sh
