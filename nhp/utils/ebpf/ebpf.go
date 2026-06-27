@@ -194,6 +194,193 @@ func connTrackKeyFromBytes(buf []byte) (connTrackKey, error) {
 	}, nil
 }
 
+// ---------------------------------------------------------------------------
+// IPv6 key structs + serializers (E2 slice 2 — DECLARED ONLY, currently inert).
+//
+// These mirror the IPv4 key structs above, substituting a 16-byte [16]byte
+// address (the wire form of `struct in6_addr`) for each uint32 `__be32`
+// address. They are the Go counterparts of the `*_v6` packed C structs in
+// nhp/ebpf/xdp/nhp_ebpf_xdp.c, whose exact sizes are pinned there with
+// `_Static_assert`. Each `To*KeyV6` serializer emits exactly that many bytes;
+// the golden-byte tests (keys_v6_test.go) assert len(out) == the C size so a
+// Go/C size drift (the #2818 14-vs-16 class) fails Go CI rather than silently
+// mis-keying the kernel map. NOTHING calls these yet — slice 4 wires routing.
+//
+// IP byte order: unlike the v4 structs (which store the network-order address
+// packed into a uint32 and write it LittleEndian to undo Go's host order), the
+// v6 address is already the on-wire 16 bytes (from net.IP.To16(), network
+// order). It is copied verbatim — no byte-order transform — so the serialized
+// bytes match `struct in6_addr` directly. The non-address fields keep their
+// v4 twin's exact endianness (see each serializer).
+
+type whitelistKeyV6 struct {
+	SrcIP    [16]byte `ebpf:"src_ip"`
+	DstIP    [16]byte `ebpf:"dst_ip"`
+	DstPort  uint16   `ebpf:"dst_port"`
+	Protocol uint8    `ebpf:"protocol"`
+}
+
+type srcDestKeyV6 struct {
+	SrcIP [16]byte `ebpf:"src_ip"`
+	DstIP [16]byte `ebpf:"dst_ip"`
+}
+
+// portListKeyV6 and srcIPdstPortKeyV6 write their PORT fields BIG-endian
+// (network order) on the wire (see ToPlKeyV6/ToSpKeyV6), matching the sibling
+// whitelistKeyV6/connTrackKeyV6 ports and the C `__be16` fields. The whole
+// *_v6 key family is now uniformly network/big-endian — do NOT reintroduce the
+// v4-mirrored little-endian write here (it was the lone outlier that silently
+// mis-keyed the datapath; see below).
+//
+// DATAPATH AGREEMENT (now wired): the v6 XDP datapath's `xdp_white_prog_v6`
+// (nhp/ebpf/xdp/nhp_ebpf_xdp.c, slices 3+) builds the two lookup keys thus:
+//   - src_port_v6: `spkey.dst_port = dport` where `dport = tcp->dest`/`udp->dest`
+//     — the RAW network-order (__be16) packet port, NOT bpf_ntohs'd. So
+//     ToSpKeyV6 MUST write dst_port BIG-endian, or an asymmetric-port src_port
+//     rule (e.g. 443 = 0x01BB) inserts `BB 01` while the kernel looks up
+//     `01 BB` and the rule silently never matches. This was a real, latent
+//     value-dependent bug (the v4 analog is still LE — tracked in #2842) and is
+//     the load-bearing reason for the byte order here.
+//   - port_list_v6: `pl_key.min_port = MIN_PORT(0)`, `.max_port = MAX_PORT(65535)`
+//     — fixed host-order sentinel CONSTANTS, never the packet port. 0x0000 and
+//     0xFFFF are byte-order palindromes, so ToPlKeyV6's min/max byte order is
+//     UNOBSERVABLE for the only key the datapath ever queries. We still write
+//     BIG-endian here for family uniformity (so a future real-range lookup, if
+//     ever added, starts from a consistent serializer), NOT because a network
+//     order matches the datapath's host-order constants. NOTE: because the
+//     datapath only ever queries the (0,65535) sentinel, a real-RANGE
+//     port_list_v6 allow-rule does not match regardless of byte order — that is
+//     a separate range-vs-sentinel matter (shared with v4), not a byte-order
+//     bug, and is untouched here.
+//
+// Byte-for-byte agreement is validated end-to-end by the slice-6 real-map
+// BPF_PROG_TEST_RUN harness (the src_port_v6 case is the genuine byte-order
+// guard; the port_list_v6 case proves the admit path, not the byte order).
+// Tracked in #2841.
+type portListKeyV6 struct {
+	SrcIP        [16]byte `ebpf:"src_ip"`
+	DstPortStart uint16   `ebpf:"min_port"`
+	DstPortEnd   uint16   `ebpf:"max_port"`
+}
+
+type srcIPdstPortKeyV6 struct {
+	SrcIP   [16]byte `ebpf:"src_ip"`
+	DstPort uint16   `ebpf:"dst_port"` // BIG-endian (network order) on the wire — see the family note above ToSpKeyV6 / portListKeyV6.
+}
+
+// connTrackKeyV6 mirrors `struct ipv6_ct_tuple` in
+// nhp/ebpf/xdp/nhp_ebpf_xdp.c byte-for-byte — the IPv6 twin of connTrackKey.
+// Field ORDER is daddr, saddr, dport, sport, nexthdr, flags (destination-
+// before-source, the opposite of the allow-rule keys), matching the C struct
+// exactly. Addresses are the on-wire 16 bytes; ports are network/big-endian
+// __be16 (see ToCtKeyV6). DECLARED ONLY in this slice.
+type connTrackKeyV6 struct {
+	DstIP   [16]byte `ebpf:"daddr"`   // in6_addr daddr (network order)
+	SrcIP   [16]byte `ebpf:"saddr"`   // in6_addr saddr (network order)
+	DstPort uint16   `ebpf:"dport"`   // __be16 dport (network order)
+	SrcPort uint16   `ebpf:"sport"`   // __be16 sport (network order)
+	NextHdr uint8    `ebpf:"nexthdr"` // __u8 nexthdr (IPPROTO_TCP=6 / IPPROTO_UDP=17)
+	Flags   uint8    `ebpf:"flags"`   // __u8 flags (CT_DIR_INGRESS=0)
+}
+
+// On-wire sizes of the packed `*_v6` C structs. Each MUST equal the matching
+// `_Static_assert(sizeof(struct ...) == N)` in nhp/ebpf/xdp/nhp_ebpf_xdp.c —
+// that equality is the load-bearing C↔Go contract this slice exists to fence
+// (a mismatch silently mis-keys the kernel map). NOTE: these are SUMS of field
+// sizes, not unsafe.Sizeof(<struct>{}) — the Go structs are NOT packed (they
+// carry Go alignment padding), whereas the kernel structs are packed; the
+// To*KeyV6 serializers emit the packed form, and these consts fence it.
+const (
+	whitelistKeyV6Size   = 16 + 16 + 2 + 1         // 35: struct whitelist_key_v6
+	srcDestKeyV6Size     = 16 + 16                 // 32: struct sdwhitelist_key_v6 / icmpwhitelist_key_v6
+	srcPortListKeyV6Size = 16 + 2                  // 18: struct src_port_list_key_v6
+	portListKeyV6Size    = 16 + 2 + 2              // 20: struct port_list_key_v6
+	connTrackKeyV6Size   = 16 + 16 + 2 + 2 + 1 + 1 // 38: struct ipv6_ct_tuple
+)
+
+// ToWlKeyV6 serializes whitelistKeyV6 into the 35 packed bytes of
+// `struct whitelist_key_v6`: src_ip[16] + dst_ip[16] + BigEndian dst_port[2]
+// + protocol[1]. dst_port is big-endian to match ToWlKey's __be16 handling.
+func (r *whitelistKeyV6) ToWlKeyV6() []byte {
+	keyBytes := make([]byte, whitelistKeyV6Size)
+	copy(keyBytes[0:16], r.SrcIP[:])
+	copy(keyBytes[16:32], r.DstIP[:])
+	binary.BigEndian.PutUint16(keyBytes[32:34], r.DstPort)
+	keyBytes[34] = r.Protocol
+	return keyBytes
+}
+
+// ToSdKeyV6 serializes srcDestKeyV6 into the 32 packed bytes of
+// `struct sdwhitelist_key_v6` (and the identically-shaped
+// `struct icmpwhitelist_key_v6`): src_ip[16] + dst_ip[16].
+func (r *srcDestKeyV6) ToSdKeyV6() []byte {
+	keyBytes := make([]byte, srcDestKeyV6Size)
+	copy(keyBytes[0:16], r.SrcIP[:])
+	copy(keyBytes[16:32], r.DstIP[:])
+	return keyBytes
+}
+
+// ToPlKeyV6 serializes portListKeyV6 into the 20 packed bytes of
+// `struct port_list_key_v6`: src_ip[16] + BigEndian min_port[2] +
+// BigEndian max_port[2]. The ports are BIG-endian for family uniformity with
+// the rest of the *_v6 keys (ToWlKeyV6/ToSpKeyV6/ToCtKeyV6 all network-order),
+// NOT because a network order matches the datapath: the v6 XDP `port_list_v6`
+// lookup builds its key from the fixed host-order sentinel CONSTANTS
+// `min_port = MIN_PORT(0)` / `max_port = MAX_PORT(65535)` (see
+// nhp/ebpf/xdp/nhp_ebpf_xdp.c), never the packet port. 0x0000/0xFFFF are
+// byte-order palindromes, so this serializer's min/max byte order is
+// UNOBSERVABLE for the only key the datapath ever queries — flipping it from
+// the former little-endian to big-endian changes no datapath match today. (A
+// real-RANGE port_list_v6 rule does not match regardless, because the datapath
+// only queries the full-range sentinel — a separate range-vs-sentinel matter,
+// not byte order.) INPUT CONTRACT: the live v4 twin AddEbpfRuleForSrcDestPortList
+// passes safeIntToUint16(...) (a raw uint16), NOT parsePort(...) — so
+// DstPortStart/DstPortEnd here are raw host-order values; slice 4 must feed
+// these fields the same raw uint16, not a pre-swapped parsePort value.
+// (parsePort's pre-swap dance is only on the procoPortKey/ToPpKey path.)
+func (r *portListKeyV6) ToPlKeyV6() []byte {
+	keyBytes := make([]byte, portListKeyV6Size)
+	copy(keyBytes[0:16], r.SrcIP[:])
+	binary.BigEndian.PutUint16(keyBytes[16:18], r.DstPortStart)
+	binary.BigEndian.PutUint16(keyBytes[18:20], r.DstPortEnd)
+	return keyBytes
+}
+
+// ToSpKeyV6 serializes srcIPdstPortKeyV6 into the 18 packed bytes of
+// `struct src_port_list_key_v6`: src_ip[16] + BigEndian dst_port[2]. dst_port
+// is BIG-endian (network order) to match the v6 XDP `src_port_v6` lookup, which
+// builds its key as `spkey.dst_port = dport` where `dport = tcp->dest`/`udp->dest`
+// — the RAW network-order packet port, NOT bpf_ntohs'd (nhp/ebpf/xdp/nhp_ebpf_xdp.c).
+// This is the load-bearing byte order: a little-endian write inserts an
+// asymmetric port (443 = 0x01BB) as `BB 01` while the kernel looks up `01 BB`,
+// so the src_port rule silently never matches. (The v4 twin ToSpKey is still
+// little-endian and carries this exact latent bug — tracked in #2842.) INPUT
+// CONTRACT, same as ToPlKeyV6: the live v4 caller AddEbpfRuleForSrcDestPort
+// passes safeIntToUint16(...) (a raw uint16), so DstPort here is a raw
+// host-order value — slice 4 must do the same.
+func (r *srcIPdstPortKeyV6) ToSpKeyV6() []byte {
+	keyBytes := make([]byte, srcPortListKeyV6Size)
+	copy(keyBytes[0:16], r.SrcIP[:])
+	binary.BigEndian.PutUint16(keyBytes[16:18], r.DstPort)
+	return keyBytes
+}
+
+// ToCtKeyV6 serializes the IPv6 conntrack tuple into the exact 38 packed bytes
+// the kernel `struct ipv6_ct_tuple` map key expects: daddr[16] + saddr[16] +
+// BigEndian dport[2] + BigEndian sport[2] + nexthdr[1] + flags[1]. Mirrors
+// ToCtKey's field ORDER (destination-before-source) and big-endian ports. The
+// addresses are the on-wire 16 bytes, copied verbatim (no byte-order swap).
+func (r *connTrackKeyV6) ToCtKeyV6() []byte {
+	keyBytes := make([]byte, connTrackKeyV6Size)
+	copy(keyBytes[0:16], r.DstIP[:])
+	copy(keyBytes[16:32], r.SrcIP[:])
+	binary.BigEndian.PutUint16(keyBytes[32:34], r.DstPort)
+	binary.BigEndian.PutUint16(keyBytes[34:36], r.SrcPort)
+	keyBytes[36] = r.NextHdr
+	keyBytes[37] = r.Flags
+	return keyBytes
+}
+
 type whitelistValue struct {
 	Allowed    uint8
 	_          [7]byte
@@ -889,6 +1076,37 @@ func parseIP(ipStr string) (uint32, error) {
 		return 0, fmt.Errorf("only IPv4 addresses are supported: %s", ipStr)
 	}
 	return binary.LittleEndian.Uint32(ip), nil
+}
+
+// parseIP6 is the IPv6 counterpart of parseIP: it parses an IPv6 address
+// string into its 16 on-wire (network-order) bytes. It is the family-rejecting
+// mirror of parseIP — where parseIP rejects IPv6 (To4()==nil), parseIP6
+// rejects IPv4.
+//
+// The IPv4 rejection is EXPLICIT (To4()!=nil) and deliberately precedes
+// To16(): net.IP.To16() returns a non-nil 16-byte slice for an IPv4 input too
+// (the IPv4-mapped ::ffff:a.b.c.d form), so a To16()==nil check alone would
+// NOT reject IPv4 — it would silently encode v4 as an IPv4-mapped v6 address
+// and the "only IPv6 supported" error would be unreachable. Rejecting on
+// To4() first keeps the v4 and v6 paths strictly disjoint, so a caller can't
+// accidentally route a v4 address through a v6 map key (or vice versa).
+func parseIP6(ipStr string) ([16]byte, error) {
+	var out [16]byte
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		log.Error("invalid IP address: %s", ipStr)
+		return out, fmt.Errorf("invalid IP address: %s", ipStr)
+	}
+	if ip.To4() != nil {
+		log.Error("only IPv6 addresses are supported: %s", ipStr)
+		return out, fmt.Errorf("only IPv6 addresses are supported: %s", ipStr)
+	}
+	// To16() is guaranteed non-nil here: net.ParseIP already succeeded, and a
+	// parsed IP that is not IPv4 (To4()==nil, rejected above) always has a
+	// 16-byte To16() form. So no nil check is needed — a To16()==nil branch
+	// would be dead code. copy from a 16-byte source fully fills out[16]byte.
+	copy(out[:], ip.To16())
+	return out, nil
 }
 
 // Parse the port
