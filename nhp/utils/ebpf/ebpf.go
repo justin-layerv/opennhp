@@ -447,6 +447,30 @@ const (
 	PinPathConnTrack = "/sys/fs/bpf/conn_track"
 )
 
+// IPv6 pinned-map filesystem paths (E2 slice 4). One-for-one mirror of the v4
+// pin paths above, for the `*_v6` maps the XDP program declares with
+// LIBBPF_PIN_BY_NAME in nhp/ebpf/xdp/nhp_ebpf_xdp.c — so each path is
+// "/sys/fs/bpf/<map-name>" using the C map's exact name. These must stay
+// byte-identical to those SEC(".maps") names; a typo here pins/opens the wrong
+// path and the v6 allow-rule write silently lands nowhere (or fails open).
+//
+// NOTE the two deliberate asymmetries with v4:
+//   - icmp_wl_v6: the v6 ICMP map is named `icmp_wl_v6`, NOT `icmpwhitelist_v6`
+//     — a BPF map name is capped at BPF_OBJ_NAME_LEN (16, incl. NUL), and
+//     `icmpwhitelist_v6` is 17 chars (renamed in #2825/b696d248). So this path
+//     does NOT mirror the v4 PinPathIcmpWhitelist suffix verbatim.
+//   - protocol_port has NO v6 variant: its key is {dst_port, protocol} with no
+//     address field, so the same map serves both families. EbpfRuleAddV6
+//     therefore never handles MapTypeProtocolPort; that path stays on the
+//     shared v4 helper (AddEbpfRuleForProtocolPort).
+const (
+	PinPathWhitelistV6     = "/sys/fs/bpf/spp_v6"         // TCP/UDP per-port allow-rules (whitelistKeyV6) — map `spp_v6`
+	PinPathSdWhitelistV6   = "/sys/fs/bpf/sdwhitelist_v6" // any-proto src+dst allow-rules (srcDestKeyV6) — map `sdwhitelist_v6`
+	PinPathIcmpWhitelistV6 = "/sys/fs/bpf/icmp_wl_v6"     // ICMPv6 allow-rules (srcDestKeyV6) — map `icmp_wl_v6` (15-char cap; see note)
+	PinPathSrcPortV6       = "/sys/fs/bpf/src_port_v6"    // src+single-dst-port allow-rules (srcIPdstPortKeyV6) — map `src_port_v6`
+	PinPathPortListV6      = "/sys/fs/bpf/port_list_v6"   // src+dst-port-range allow-rules (portListKeyV6) — map `port_list_v6`
+)
+
 // WhitelistValueSize is the on-wire size of whitelistValue
 // (Allowed:1 + 7-pad + ExpireTime:8 = 16 bytes). Derived from
 // unsafe.Sizeof so a future struct-layout change becomes a compile
@@ -606,6 +630,71 @@ func AddSrcipDestPortRule(whitelistMap *ebpf.Map, rule *srcIPdstPortKey, ttlSec 
 
 	if err := whitelistMap.Update(keyBytes, &value, ebpf.UpdateAny); err != nil {
 		log.Error("failed to update src_port_list map: %v", err)
+		return err
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// IPv6 allow-rule writers (E2 slice 4 — wiring v6 admissions to the v6 maps).
+//
+// One-for-one mirror of the v4 Add* writers above. Each builds the packed v6
+// key via the s2 To*KeyV6 serializer and writes it to the supplied v6 map. The
+// value bytes are family-agnostic: whitelistValue / procoPortValue carry only
+// {allowed, expire_time} and no address, so the v4 To*Value constructors apply
+// unchanged here (their receiver fields are unused — see ToWlValue).
+//
+// FAIL-CLOSED CONTRACT: like the v4 writers, these return the RAW *ebpf.Map
+// Update error unwrapped. That is load-bearing — the admission path wraps
+// EbpfRuleAdd in (*UdpAC).recordEbpfInsertResult, which calls IsMapFull
+// (errors.Is over syscall.E2BIG) to detect a full HASH map and emit the LOUD
+// fail-closed metric+log (#2163). A %v-wrap here would defeat errors.Is and
+// silently degrade a full-map -E2BIG into a swallowed admit. Never wrap with %v.
+
+// AddWhitelistRuleV6 writes a whitelistKeyV6 (spp_v6) entry.
+func AddWhitelistRuleV6(whitelistMap *ebpf.Map, rule *whitelistKeyV6, ttlSec uint64) error {
+	keyBytes := rule.ToWlKeyV6()
+	value := (&whitelistKey{}).ToWlValue(ttlSec)
+
+	if err := whitelistMap.Update(keyBytes, &value, ebpf.UpdateAny); err != nil {
+		log.Error("failed to update spp_v6 map: %v", err)
+		return err
+	}
+	return nil
+}
+
+// AddSdWhitelistRuleV6 writes a srcDestKeyV6 entry to a v6 src+dst map
+// (sdwhitelist_v6 or the identically-shaped icmp_wl_v6).
+func AddSdWhitelistRuleV6(whitelistMap *ebpf.Map, rule *srcDestKeyV6, ttlSec uint64) error {
+	keyBytes := rule.ToSdKeyV6()
+	value := (&srcDestKey{}).ToSdValue(ttlSec)
+
+	if err := whitelistMap.Update(keyBytes, &value, ebpf.UpdateAny); err != nil {
+		log.Error("failed to update sdwhitelist_v6/icmp_wl_v6 map: %v", err)
+		return err
+	}
+	return nil
+}
+
+// AddSdPortlistRuleV6 writes a portListKeyV6 (port_list_v6) entry.
+func AddSdPortlistRuleV6(whitelistMap *ebpf.Map, rule *portListKeyV6, ttlSec uint64) error {
+	keyBytes := rule.ToPlKeyV6()
+	value := (&portListKey{}).ToPlValue(ttlSec)
+
+	if err := whitelistMap.Update(keyBytes, &value, ebpf.UpdateAny); err != nil {
+		log.Error("failed to update port_list_v6 map: %v", err)
+		return err
+	}
+	return nil
+}
+
+// AddSrcipDestPortRuleV6 writes a srcIPdstPortKeyV6 (src_port_v6) entry.
+func AddSrcipDestPortRuleV6(whitelistMap *ebpf.Map, rule *srcIPdstPortKeyV6, ttlSec uint64) error {
+	keyBytes := rule.ToSpKeyV6()
+	value := (&srcIPdstPortKey{}).ToSpValue(ttlSec)
+
+	if err := whitelistMap.Update(keyBytes, &value, ebpf.UpdateAny); err != nil {
+		log.Error("failed to update src_port_v6 map: %v", err)
 		return err
 	}
 	return nil
@@ -790,6 +879,237 @@ func safeIntToUint16(i int) (uint16, error) {
 		return 0, fmt.Errorf("value %d is out of range for uint16", i)
 	}
 	return uint16(i), nil
+}
+
+// ---------------------------------------------------------------------------
+// IPv6 load-pinned-map-and-write helpers (E2 slice 4). Each is the v6 twin of
+// the matching v4 AddEbpfRuleFor* function: it loads the pinned `*_v6` map,
+// parseIP6's the address(es) (which REJECTS IPv4 — keeping the families
+// disjoint), builds the v6 key, and writes via the Add*RuleV6 injectable writer
+// above. The raw map-Update error propagates unwrapped so the fail-closed
+// wrapper (recordEbpfInsertResult → IsMapFull) still matches -E2BIG.
+
+func AddEbpfRuleForSrcDstPortProtoV6(srcIPStr, dstIPStr string, protocol uint8, dstPort uint16, ttlSec uint64) error {
+	whitelistMap, err := ebpf.LoadPinnedMap(PinPathWhitelistV6, nil)
+	if err != nil {
+		log.Error("failed to load pinned spp_v6 map: %v", err)
+		return err
+	}
+	defer func() { _ = whitelistMap.Close() }()
+
+	srcIP, err := parseIP6(srcIPStr)
+	if err != nil {
+		log.Error("invalid source IPv6: %v", err)
+		return err
+	}
+	dstIP, err := parseIP6(dstIPStr)
+	if err != nil {
+		log.Error("invalid destination IPv6: %v", err)
+		return err
+	}
+
+	rule := &whitelistKeyV6{
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		DstPort:  dstPort,
+		Protocol: protocol,
+	}
+	return AddWhitelistRuleV6(whitelistMap, rule, ttlSec)
+}
+
+func AddEbpfRuleForSrcDstV6(srcIPStr, dstIPStr string, ttlSec uint64) error {
+	whitelistMap, err := ebpf.LoadPinnedMap(PinPathSdWhitelistV6, nil)
+	if err != nil {
+		log.Error("failed to load pinned sdwhitelist_v6 map: %v", err)
+		return err
+	}
+	defer func() { _ = whitelistMap.Close() }()
+
+	srcIP, err := parseIP6(srcIPStr)
+	if err != nil {
+		log.Error("invalid source IPv6: %v", err)
+		return err
+	}
+	dstIP, err := parseIP6(dstIPStr)
+	if err != nil {
+		log.Error("invalid destination IPv6: %v", err)
+		return err
+	}
+
+	rule := &srcDestKeyV6{
+		SrcIP: srcIP,
+		DstIP: dstIP,
+	}
+	return AddSdWhitelistRuleV6(whitelistMap, rule, ttlSec)
+}
+
+func AddEbpfIcmpRuleForSrcDstV6(srcIPStr, dstIPStr string, ttlSec uint64) error {
+	whitelistMap, err := ebpf.LoadPinnedMap(PinPathIcmpWhitelistV6, nil)
+	if err != nil {
+		log.Error("failed to load pinned icmp_wl_v6 map: %v", err)
+		return err
+	}
+	defer func() { _ = whitelistMap.Close() }()
+
+	srcIP, err := parseIP6(srcIPStr)
+	if err != nil {
+		log.Error("invalid source IPv6: %v", err)
+		return err
+	}
+	dstIP, err := parseIP6(dstIPStr)
+	if err != nil {
+		log.Error("invalid destination IPv6: %v", err)
+		return err
+	}
+
+	rule := &srcDestKeyV6{
+		SrcIP: srcIP,
+		DstIP: dstIP,
+	}
+	return AddSdWhitelistRuleV6(whitelistMap, rule, ttlSec)
+}
+
+func AddEbpfRuleForSrcDestPortV6(srcIPStr string, dstPort int, ttlSec uint64) error {
+	whitelistMap, err := ebpf.LoadPinnedMap(PinPathSrcPortV6, nil)
+	if err != nil {
+		log.Error("failed to load pinned src_port_v6 map: %v", err)
+		return err
+	}
+	defer func() { _ = whitelistMap.Close() }()
+
+	srcIP, err := parseIP6(srcIPStr)
+	if err != nil {
+		log.Error("invalid source IPv6: %v", err)
+		return err
+	}
+	dstPortu, err := safeIntToUint16(dstPort)
+	if err != nil {
+		log.Error("failed to safeIntToUint16 in src_port_v6 map: %v", err)
+		return err
+	}
+
+	rule := &srcIPdstPortKeyV6{
+		SrcIP:   srcIP,
+		DstPort: dstPortu,
+	}
+	return AddSrcipDestPortRuleV6(whitelistMap, rule, ttlSec)
+}
+
+func AddEbpfRuleForSrcDestPortListV6(srcIPStr string, dstPortStart, dstPortEnd int, ttlSec uint64) error {
+	portListMap, err := ebpf.LoadPinnedMap(PinPathPortListV6, nil)
+	if err != nil {
+		log.Error("failed to load pinned port_list_v6 map: %v", err)
+		return err
+	}
+	defer func() { _ = portListMap.Close() }()
+
+	srcIP, err := parseIP6(srcIPStr)
+	if err != nil {
+		log.Error("invalid source IPv6: %v", err)
+		return err
+	}
+	portStart, err := safeIntToUint16(dstPortStart)
+	if err != nil {
+		log.Error("failed to safeIntToUint16 for dstPortStart: %d", dstPortStart)
+		return err
+	}
+	portEnd, err := safeIntToUint16(dstPortEnd)
+	if err != nil {
+		log.Error("failed to safeIntToUint16 for dstPortEnd: %d", dstPortEnd)
+		return err
+	}
+
+	rule := &portListKeyV6{
+		SrcIP:        srcIP,
+		DstPortStart: portStart,
+		DstPortEnd:   portEnd,
+	}
+	return AddSdPortlistRuleV6(portListMap, rule, ttlSec)
+}
+
+// EbpfRuleAddV6 is the IPv6 dispatcher: the v6 twin of EbpfRuleAdd's per-mapType
+// switch. EbpfRuleAdd routes here once it has detected an IPv6 source address,
+// so v6 admissions land in the `*_v6` maps. It deliberately does NOT change any
+// caller — detection lives in EbpfRuleAdd so every msghandler call site stays
+// family-agnostic (it just passes the address string through).
+//
+// MapTypeProtocolPort (6) is intentionally NOT handled here: the protocol_port
+// map keys on {dst_port, protocol} with no address, so it is shared by both
+// families and stays on the v4 AddEbpfRuleForProtocolPort path. EbpfRuleAdd
+// never routes mapType 6 here (the family predicate requires a non-empty,
+// non-IPv4 SrcIP; type-6 admissions carry no SrcIP), but this returns an
+// explicit error rather than silently no-op'ing if that invariant is ever
+// violated — a silent miss would be a fail-OPEN admission gap.
+func EbpfRuleAddV6(mapType int, params EbpfRuleParams, TtlSec int) error {
+	var err error
+	TtlSec64 := uint64(TtlSec)
+	var protocol uint8
+	if len(params.Protocol) > 0 {
+		switch params.Protocol {
+		case "tcp":
+			protocol = 6
+		case "udp":
+			protocol = 17
+		case "icmp":
+			// ICMPv6 is gated via icmp_wl_v6 (MapTypeIcmpWhitelist), not here:
+			// that key is address-only (no nexthdr), so this byte is unused for
+			// ICMP. Kept as 1 (IPPROTO_ICMP) to mirror the v4 switch; were a
+			// MapTypeWhitelist v6 admission ever to carry "icmp", spp_v6 would
+			// need 58 (IPPROTO_ICMPV6) to match the packet's nexthdr.
+			protocol = 1
+		default:
+			return fmt.Errorf("unsupported protocol: %s", params.Protocol)
+		}
+	}
+
+	switch mapType {
+	case MapTypeWhitelist:
+		err = AddEbpfRuleForSrcDstPortProtoV6(params.SrcIP, params.DstIP, protocol, uint16(params.DstPort), TtlSec64)
+		if err != nil {
+			log.Error("failed add ebpf v6 src: %s dst: %s, error: %v, protocol: %d, dstport: %d", params.SrcIP, params.DstIP, err, protocol, uint16(params.DstPort))
+			return err
+		}
+
+	case MapTypeSdWhitelist:
+		err = AddEbpfRuleForSrcDstV6(params.SrcIP, params.DstIP, TtlSec64)
+		if err != nil {
+			log.Error("failed add ebpf v6 src: %s dst: %s", params.SrcIP, params.DstIP)
+			return err
+		}
+
+	case MapTypeIcmpWhitelist:
+		err = AddEbpfIcmpRuleForSrcDstV6(params.SrcIP, params.DstIP, TtlSec64)
+		if err != nil {
+			log.Error("failed add ebpf v6 icmp src: %s dst: %s", params.SrcIP, params.DstIP)
+			return err
+		}
+
+	case MapTypeSrcAndPort:
+		err = AddEbpfRuleForSrcDestPortV6(params.SrcIP, params.DstPort, TtlSec64)
+		if err != nil {
+			log.Error("failed add ebpf v6 src: %s dst port: %d", params.SrcIP, params.DstPort)
+			return err
+		}
+
+	case MapTypeSrcPortList:
+		err = AddEbpfRuleForSrcDestPortListV6(params.SrcIP, params.DstPortStart, params.DstPortEnd, TtlSec64)
+		if err != nil {
+			log.Error("failed add ebpf v6 src: %s dst port start: %d dst port end: %d", params.SrcIP, params.DstPortStart, params.DstPortEnd)
+			return err
+		}
+
+	case MapTypeProtocolPort:
+		// protocol_port is address-less and shared v4/v6 — must never be
+		// routed through the v6 dispatcher. EbpfRuleAdd's family predicate
+		// keeps type 6 on the v4 path; reaching here means that invariant
+		// broke. Fail loud rather than silently drop the admission.
+		return fmt.Errorf("MapTypeProtocolPort (6) has no IPv6 map — it is address-less and shared; must route through the v4 path, not EbpfRuleAddV6")
+
+	default:
+		return fmt.Errorf("unsupported map type: %d", mapType)
+	}
+
+	return nil
 }
 
 // DelEbpfRuleForSrcDstPortProto removes the allow-rule entry from
@@ -988,8 +1308,46 @@ func IsMapFull(err error) bool {
 	return errors.Is(err, syscall.E2BIG)
 }
 
+// isIPv6Src reports whether an admission's source-address string is an IPv6
+// address that must route to the `*_v6` maps. It is the family-detection
+// predicate EbpfRuleAdd uses to dispatch v4 vs v6; extracted as a pure function
+// so the routing decision is unit-testable without a kernel or pinned maps.
+//
+// The predicate is `ip != nil && ip.To4() == nil` — identical to utils.IsIPv6
+// (kept inline to avoid a new package dependency from this self-contained pkg;
+// parseIP/parseIP6 likewise carry their own family logic).
+//
+//   - The `ip != nil` nil-guard is load-bearing: net.ParseIP("") is nil and
+//     nil.To4() is also nil, so a bare `To4()==nil` check would misclassify an
+//     EMPTY SrcIP as IPv6. MapTypeProtocolPort (6) admissions carry no SrcIP
+//     (the map is address-less and shared v4/v6), so without the guard they
+//     would wrongly route to a non-existent v6 protocol_port map. The guard
+//     keeps empty-SrcIP (and any unparseable string) on the v4 path.
+//   - IPv4-mapped IPv6 (::ffff:a.b.c.d) has a non-nil To4(), so it routes v4 —
+//     consistent with parseIP6, which rejects it (keeping the families disjoint).
+//   - SINGLE-FAMILY-PER-RULE invariant: dispatch keys ONLY on SrcIP, so a
+//     mixed-family rule (v6 src + v4 dst) routes to v6, where parseIP6(dstIP)
+//     rejects the v4 dst and the admission fail-closes — correct, never
+//     mis-keyed, but it assumes one rule is one family end-to-end.
+func isIPv6Src(srcIP string) bool {
+	ip := net.ParseIP(srcIP)
+	return ip != nil && ip.To4() == nil
+}
+
 // A generic entry function that calls the corresponding function to add whitelist entries based on mapTypeandparams.
+//
+// FAMILY DETECTION (E2 slice 4): centralized HERE (via isIPv6Src) so every
+// msghandler call site stays family-agnostic — it just passes the admission's
+// source-address string through and this function routes IPv6 admissions to the
+// `*_v6` maps via EbpfRuleAddV6. Both the v4 and v6 paths return their raw insert
+// error, so the admission-side fail-closed wrapper
+// ((*UdpAC).recordEbpfInsertResult, which runs IsMapFull over -E2BIG) covers v6
+// exactly as it covers v4 — v6 inserts are NOT bypassing it.
 func EbpfRuleAdd(mapType int, params EbpfRuleParams, TtlSec int) error {
+	if isIPv6Src(params.SrcIP) {
+		return EbpfRuleAddV6(mapType, params, TtlSec)
+	}
+
 	var err error
 	TtlSec64 := uint64(TtlSec)
 	var protocol uint8
