@@ -1,6 +1,7 @@
 package qurlv2
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -58,5 +59,38 @@ func FuzzParseFragment(f *testing.F) {
 	f.Fuzz(func(_ *testing.T, fragment string) {
 		// Must not panic. ParseFragment is the unauthenticated entrypoint.
 		_, _ = ParseFragment(fragment)
+	})
+}
+
+// FuzzDecodeB64Canonical asserts the security-critical canonicality property of
+// decodeB64: it accepts a string ONLY if that string is the unique canonical
+// encoding of the bytes it decodes to. If decode succeeds, re-encoding the bytes
+// (through the same encodeB64 the decoder checks against) must reproduce the exact
+// input — otherwise a non-canonical variant of a signed part (notably one with
+// embedded '\r'/'\n', which Go's base64 decoder silently skips) would be accepted,
+// making fragments malleable.
+func FuzzDecodeB64Canonical(f *testing.F) {
+	f.Add("")
+	f.Add("AAAA")
+	f.Add("AQID")
+	f.Add("_-_-")
+	f.Add("A")    // length 1 mod 4
+	f.Add("AAA=") // padding
+	f.Add("AAB")  // non-canonical trailing bits
+	f.Add("\r")   // bare CR: Go's decoder skips it; must be rejected as non-canonical
+	f.Add("\n")   // bare LF: same
+	f.Add("A\nA") // embedded LF inside otherwise-valid base64
+
+	f.Fuzz(func(t *testing.T, s string) {
+		raw, err := decodeB64(s)
+		if err != nil {
+			if !errors.Is(err, ErrEncoding) {
+				t.Fatalf("decodeB64 rejected %q with non-ErrEncoding error: %v", s, err)
+			}
+			return
+		}
+		if got := encodeB64(raw); got != s {
+			t.Fatalf("decodeB64 accepted non-canonical %q (canonical form is %q)", s, got)
+		}
 	})
 }

@@ -72,6 +72,27 @@ describe("base64UrlDecode strict rejections", () => {
     expect(() => base64UrlDecode("AAAAA")).toThrow(Base64UrlError);
   });
 
+  it("rejects embedded CR/LF/CRLF anywhere in the string", () => {
+    // The Go↔JS malleability case: Go's base64 decoder (and the browser's atob)
+    // silently SKIP '\r'/'\n', so a newline injected into an otherwise-canonical
+    // string decodes to the SAME bytes. This hand-rolled decoder treats them as
+    // non-alphabet characters and must reject every position, matching the Go
+    // verifier's re-encode canonicality check and the `strict_base64`
+    // reject_embedded_* conformance vectors.
+    const canon = base64UrlEncode(new Uint8Array(32).fill(0)); // 43 chars
+    for (const ws of ["\n", "\r", "\r\n"]) {
+      for (const variant of [
+        ws + canon, // front
+        canon.slice(0, 21) + ws + canon.slice(21), // middle
+        canon + ws, // end
+      ]) {
+        expect(() => base64UrlDecode(variant)).toThrow(Base64UrlError);
+      }
+    }
+    // Sanity: the clean canonical string still decodes (no over-rejection).
+    expect(base64UrlDecode(canon)).toEqual(new Uint8Array(32).fill(0));
+  });
+
   it("rejects NON-CANONICAL trailing bits even though they decode to the same bytes", () => {
     // This is the load-bearing Go↔JS agreement case: `atob` would accept the
     // variant and recover the same bytes; the strict decoder must reject it.

@@ -168,7 +168,7 @@
     "strict_base64": {
       "entry_point": "decodeB64(string)",
       "input": "value_b64",
-      "comment": "These are the encoding-layer rejections a browser's lenient atob would silently accept. The non-canonical case is the load-bearing one: it decodes (leniently) to the SAME bytes as a canonical string, so the strict decoder must reject it to keep exactly one string per byte slice (a signature-bypass guard and the Go<->JS agreement point on which STRINGS are well-formed).",
+      "comment": "Encoding-layer rejections a browser's lenient atob would silently accept. Two cases are load-bearing because they decode leniently to the SAME bytes as a canonical string, so the strict decoder must reject them to keep one string per byte slice (a signature-bypass guard and the cross-language agreement point on which STRINGS are well-formed): non-canonical trailing bits, and embedded CR/LF, which Go's base64 decoder skips in every mode (including Strict). A verifier that only strict-decodes, without a re-encode/round-trip canonicality check, will WRONGLY accept the embedded-whitespace vectors.",
       "vectors": [
         {
           "name": "accept_canonical_32_byte_key",
@@ -203,6 +203,27 @@
           "reject_class": "encoding",
           "reason": "a single base64url char cannot encode a byte (length 1 mod 4)",
           "value_b64": "A"
+        },
+        {
+          "name": "reject_embedded_lf",
+          "expect": "reject",
+          "reject_class": "encoding",
+          "reason": "an embedded LF inside an otherwise-canonical 43-char key; a browser's lenient atob silently skips '\\n' and recovers the same 32 bytes, so the strict decoder must reject it to keep one string per byte slice",
+          "value_b64": "AAAAAAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAA"
+        },
+        {
+          "name": "reject_embedded_cr",
+          "expect": "reject",
+          "reject_class": "encoding",
+          "reason": "an embedded CR inside an otherwise-canonical 43-char key; lenient atob silently skips '\\r' and recovers the same 32 bytes, so strict must reject it",
+          "value_b64": "AAAAAAAAAAAAAAAAAAAAA\rAAAAAAAAAAAAAAAAAAAAAA"
+        },
+        {
+          "name": "reject_embedded_crlf",
+          "expect": "reject",
+          "reject_class": "encoding",
+          "reason": "an embedded CRLF pair inside an otherwise-canonical 43-char key; lenient atob silently skips '\\r\\n' and recovers the same 32 bytes, so strict must reject it",
+          "value_b64": "AAAAAAAAAAAAAAAAAAAAA\r\nAAAAAAAAAAAAAAAAAAAAAA"
         }
       ]
     },

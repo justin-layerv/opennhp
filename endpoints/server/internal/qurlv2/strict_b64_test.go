@@ -145,6 +145,60 @@ func TestParseFragment_RejectsNonCanonicalParts(t *testing.T) {
 	}
 }
 
+// TestDecodeB64_RejectsEmbeddedWhitespace pins the embedded-whitespace half of the
+// canonicality contract. Go's base64 decoder silently SKIPS '\r'/'\n' in every mode
+// (including Strict), so a newline injected into an otherwise-canonical string
+// decodes to the same bytes; decodeB64's re-encode-and-compare must reject every
+// such variant. Accepting them would make signed fragments malleable — distinct
+// strings decoding to the same sig/secret bytes (see TestParseFragment below).
+func TestDecodeB64_RejectsEmbeddedWhitespace(t *testing.T) {
+	canon := testX25519B64(t, 0) // 32 bytes -> 43 canonical chars
+	for name, ws := range map[string]string{"LF": "\n", "CR": "\r", "CRLF": "\r\n"} {
+		for _, pos := range []string{"front", "middle", "end"} {
+			var v string
+			switch pos {
+			case "front":
+				v = ws + canon
+			case "middle":
+				v = canon[:len(canon)/2] + ws + canon[len(canon)/2:]
+			case "end":
+				v = canon + ws
+			}
+			if _, err := decodeB64(v); !errors.Is(err, ErrEncoding) {
+				t.Errorf("%s/%s: decodeB64 must reject embedded whitespace with ErrEncoding, got: %v", name, pos, err)
+			}
+		}
+	}
+	// Sanity: the clean canonical string still decodes (no over-rejection).
+	if _, err := decodeB64(canon); err != nil {
+		t.Fatalf("canonical input must still decode: %v", err)
+	}
+}
+
+// TestParseFragment_RejectsEmbeddedWhitespaceParts is the end-to-end malleability
+// regression. A '\r'/'\n' injected into any base64url fragment part must make
+// ParseFragment reject the whole fragment. Before the decodeB64 round-trip check,
+// a newline in the unsigned secret part or the sig part decoded to the same bytes,
+// producing a DISTINCT fragment string that still verified.
+func TestParseFragment_RejectsEmbeddedWhitespaceParts(t *testing.T) {
+	sf := signedFragment(t)
+	parts := strings.Split(sf.body, ".")
+	// parts[0] is the literal "qv2" prefix; tamper each base64url part in turn.
+	for i := 1; i < len(parts); i++ {
+		for name, ws := range map[string]string{"LF": "\n", "CR": "\r", "CRLF": "\r\n"} {
+			tampered := append([]string(nil), parts...)
+			tampered[i] = parts[i][:1] + ws + parts[i][1:]
+			if _, err := ParseFragment(strings.Join(tampered, ".")); !errors.Is(err, ErrEncoding) {
+				t.Errorf("part %d %s-injected: ParseFragment must reject with ErrEncoding, got: %v", i, name, err)
+			}
+		}
+	}
+	// Sanity: the unmodified fragment still parses (no over-rejection).
+	if _, err := ParseFragment(sf.body); err != nil {
+		t.Fatalf("canonical fragment must still parse: %v", err)
+	}
+}
+
 // TestSignedClaims_ProduceCanonicalParts is a belt-and-suspenders parity check:
 // a conformant signer emits canonical base64url for the claims part (so freshly
 // minted artifacts are never self-rejected by the strict parser). nhp carries the
