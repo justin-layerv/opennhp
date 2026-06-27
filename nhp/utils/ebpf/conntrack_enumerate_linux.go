@@ -116,7 +116,7 @@ func enumerateConnTrackSrcPortsOnMap(m *ebpf.Map, srcIPStr, dstIPStr string, pro
 		return nil, fmt.Errorf("conn_track map info: %w", err)
 	}
 	if int(info.KeySize) != connTrackKeySize {
-		return nil, fmt.Errorf("conn_track map key size %d, want %d (packed ipv4_ct_tuple) — wrong map pinned at %s?", info.KeySize, connTrackKeySize, PinPathConnTrack)
+		return nil, fmt.Errorf("conn_track map key size %d, want %d (ipv4_ct_tuple: %d field bytes + %d trailing pad) — wrong map pinned at %s?", info.KeySize, connTrackKeySize, connTrackKeyDataLen, connTrackKeySize-connTrackKeyDataLen, PinPathConnTrack)
 	}
 	if info.ValueSize == 0 || int(info.ValueSize) > connTrackValueSizeMax {
 		return nil, fmt.Errorf("conn_track map value size %d out of range (1..%d) — wrong map pinned at %s?", info.ValueSize, connTrackValueSizeMax, PinPathConnTrack)

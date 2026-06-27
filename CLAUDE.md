@@ -94,6 +94,7 @@ make lint             # Run golangci-lint on nhp/ and endpoints/
 make lint-workflows   # Run actionlint + shellcheck on .github/workflows/ (mirrors CI)
 make test             # Run unit tests
 make test-local       # Run local e2e tests (requires etcd container)
+make test-ebpf        # Run eBPF datapath tests in-kernel (Linux + clang + CAP_BPF; run under sudo). See docs/TESTING.md
 make fuzz-quick       # Run fuzz tests briefly (FUZZTIME_QUICK, default 15s)
 make fuzz             # Run fuzz tests at full budget (FUZZTIME_LONG, default 60s)
 

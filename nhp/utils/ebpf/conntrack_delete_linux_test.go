@@ -95,7 +95,12 @@ func newTestConnTrackMap(t *testing.T) (*ebpf.Map, bool) {
 //	    __be16 sport;   // bytes 10..11 (network order)
 //	    __u8   nexthdr; // byte 12
 //	    __u8   flags;   // byte 13      (CT_DIR_INGRESS = 0)
-//	} __packed;         // 14 bytes, no padding
+//	};                  // 14 field bytes + 2 trailing pad = 16-byte map key
+//
+// NOTE: the COMPILED conn_track map key is 16 bytes (14 field bytes + 2
+// trailing pad), not 14. ToCtKey emits all 16 with the pad zeroed. Why the
+// compiled key is 16 despite the C `} __packed;` is documented in full in
+// connTrackKeySize's godoc (ebpf.go).
 func TestConnTrackKey_ToCtKey_GoldenBytes(t *testing.T) {
 	// Client 198.51.100.7:43210 -> resource 203.0.113.10:443 over TCP,
 	// ingress direction. (Chosen so every IP/port octet is distinct and a
@@ -119,7 +124,7 @@ func TestConnTrackKey_ToCtKey_GoldenBytes(t *testing.T) {
 	got := key.ToCtKey()
 
 	if len(got) != connTrackKeySize {
-		t.Fatalf("ToCtKey length = %d, want connTrackKeySize=%d (packed ipv4_ct_tuple)", len(got), connTrackKeySize)
+		t.Fatalf("ToCtKey length = %d, want connTrackKeySize=%d (ipv4_ct_tuple map key: 14 field bytes + 2 trailing pad)", len(got), connTrackKeySize)
 	}
 
 	// daddr first (bytes 0..3), network order. 203.0.113.10 = CB 00 71 0A.
@@ -148,12 +153,24 @@ func TestConnTrackKey_ToCtKey_GoldenBytes(t *testing.T) {
 	if got[13] != 0 {
 		t.Errorf("byte[13] flags = %d, want 0 (CT_DIR_INGRESS) — a wrong direction silently ENOENTs", got[13])
 	}
+	// Trailing alignment pad (bytes 14..15) must be zero. The XDP program
+	// hashes a zero-initialized ct_key (`ct_key = {}`), so a non-zero pad
+	// here would hash to a different bucket and silently ENOENT the
+	// delete/lookup against the real 16-byte-key map.
+	if got[14] != 0 || got[15] != 0 {
+		t.Errorf("bytes[14:16] trailing pad = % x, want 00 00 — must match the kernel's zero-initialized ct_key", got[14:16])
+	}
 
-	// Fence the C-struct contract directly: the const must equal the
-	// summed field sizes AND the emitted length, so a future field add to
-	// connTrackKey that forgets ToCtKey is caught.
-	if connTrackKeySize != 14 {
-		t.Errorf("connTrackKeySize = %d, want 14 — must match the packed kernel ipv4_ct_tuple", connTrackKeySize)
+	// Fence the C-struct contract directly: the const must equal the kernel
+	// map's KeySize (14 meaningful field bytes + 2 trailing alignment pad).
+	// Verified against the compiled object (conn_track KeySize=16). A future
+	// field add to connTrackKey that forgets ToCtKey or the pad math is
+	// caught here and by the length assertion above.
+	if connTrackKeySize != 16 {
+		t.Errorf("connTrackKeySize = %d, want 16 — must match the kernel conn_track map KeySize (14 field bytes + 2 trailing pad)", connTrackKeySize)
+	}
+	if connTrackKeyDataLen != 14 {
+		t.Errorf("connTrackKeyDataLen = %d, want 14 — the summed ipv4_ct_tuple field sizes", connTrackKeyDataLen)
 	}
 }
 

@@ -65,6 +65,26 @@ The tests automatically:
 
 Prerequisites: Docker must be running.
 
+### eBPF Datapath Tests (real kernel)
+
+The `nhp/utils/ebpf/...` package has Linux-only tests that load the compiled
+XDP object and drive packets through it in-kernel via `BPF_PROG_TEST_RUN`
+(the #2779 surgical-kill datapath proof) plus the conntrack map-op tests:
+
+```bash
+# Compiles nhp_ebpf_xdp.o (clang) and runs the whole utils/ebpf linux suite.
+# Requires Linux + clang + libbpf headers + CAP_BPF (run under sudo).
+sudo env "PATH=$PATH" make test-ebpf
+```
+
+`make test-ebpf` exports `NHP_REQUIRE_BPF_TESTS=1`, so a missing toolchain /
+capability / kernel-support is a HARD FAILURE rather than a silent skip. To
+get the graceful skip on a machine without BPF support, invoke the package
+directly with the var unset: `go test ./utils/ebpf/...`. CI runs this via
+`.github/workflows/ebpf-datapath-test.yml` on `ubuntu-latest` (PRs to `main`
+or the `qurl-v2` integration branch — feature PRs base on `qurl-v2`, so the
+gate must trigger there too).
+
 ### Integration Tests
 
 Integration tests run against deployed AWS infrastructure:

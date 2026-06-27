@@ -466,6 +466,25 @@ test:
 	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry|TestConformanceVectors"
 	@echo "$(COLOUR_GREEN)[OpenNHP] Unit Tests Done!$(END_COLOUR)"
 
+# test-ebpf compiles the real XDP object and runs the eBPF datapath tests
+# against a LIVE kernel via BPF_PROG_TEST_RUN. This is the #2779
+# surgical-kill datapath proof: it loads the compiled nhp_ebpf_xdp.o,
+# drives synthetic packets through it, and asserts the verdict flips
+# PASS -> DROP after a conntrack entry is surgically flushed (sibling
+# survives). REQUIRES a Linux host with CAP_BPF (or CAP_SYS_ADMIN) and a
+# kernel that supports XDP program load. NHP_REQUIRE_BPF_TESTS=1 turns any
+# missing capability / kernel support / missing object into a hard
+# failure instead of a silent skip — set it in CI. The clang findstring
+# guard above ensures `clang` is present because `ebpf` is in the goals.
+.PHONY: test-ebpf
+test-ebpf: $(EBPF_OBJ_XDP)
+	@echo "[OpenNHP] Running eBPF datapath tests (BPF_PROG_TEST_RUN)..."
+	@echo "$(COLOUR_BLUE)[eBPF] XDP object: $(EBPF_OBJ_XDP)$(END_COLOUR)"
+	cd nhp && NHP_EBPF_XDP_OBJECT="$(abspath $(EBPF_OBJ_XDP))" \
+		NHP_REQUIRE_BPF_TESTS=$${NHP_REQUIRE_BPF_TESTS:-1} \
+		go test -v -count=1 ./utils/ebpf/...
+	@echo "$(COLOUR_GREEN)[OpenNHP] eBPF datapath tests Done!$(END_COLOUR)"
+
 test-lambdas: ## Run Lambda unit tests (Python)
 	@echo "[OpenNHP] Running Lambda Unit Tests..."
 	python3 -m pytest terraform/modules/billing/lambda/test_*.py terraform/modules/developer-portal/lambda/test_*.py -v

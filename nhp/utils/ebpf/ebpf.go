@@ -65,8 +65,11 @@ type procoPortKey struct {
 //     network-order-preserving uint32 the allow-rule keys use); the ports
 //     are written big-endian to reproduce the on-wire __be16 the XDP
 //     program copies straight from the TCP/UDP header.
-//   - The struct is __packed in C (no trailing/interior padding): 4+4+2+2+
-//     1+1 = 14 bytes. ToCtKey emits exactly those 14 bytes.
+//   - The six fields sum to 14 bytes (4+4+2+2+1+1) with no INTERIOR padding
+//     (every field is naturally aligned), but the COMPILED conn_track map
+//     key is 16 bytes: 14 field bytes + 2 trailing pad. ToCtKey emits all 16
+//     (the pad is zero, matching the XDP's `ct_key = {}`). See
+//     connTrackKeySize for WHY the compiled key is 16, not 14.
 //   - flags selects the conntrack DIRECTION. The XDP program inserts the
 //     ESTABLISHED entry with flags = CT_DIR_INGRESS (0) keyed on the
 //     ingress orientation (saddr=client, daddr=resource). P4c deletes that
@@ -92,21 +95,58 @@ type connTrackKey struct {
 // deletes.
 const ctDirIngress uint8 = 0
 
-// connTrackKeySize is the on-wire size of the packed ipv4_ct_tuple
-// (14 bytes). Derived so ToCtKey's hand-packed buffer length and the
-// kernel key size cannot silently diverge. NOTE: this is the SUM of field
-// sizes, not unsafe.Sizeof(connTrackKey{}) — the Go struct is NOT packed
-// (it carries Go alignment padding), whereas the kernel struct is
-// __packed. ToCtKey emits the packed form; this const fences that form.
-const connTrackKeySize = 4 + 4 + 2 + 2 + 1 + 1
+// connTrackKeySize is the size of the kernel `conn_track` map key — 16
+// bytes. This is the authoritative length cilium/ebpf reports for the
+// compiled object's `ipv4_ct_tuple` BTF type, and the length Map.Put/Delete
+// require the marshalled key to be (a wrong length fails loudly with
+// "doesn't marshal to N bytes"). The struct's six fields sum to 14
+// (4+4+2+2+1+1); the trailing 2 bytes are alignment padding.
+//
+// WHY 16 and not 14 (the surprise this const exists to pin): `struct
+// ipv4_ct_tuple` is NOT effectively packed, even though the C source ends it
+// with `} __packed;`. `__packed` is the Linux `compiler.h` shorthand for
+// `__attribute__((packed))`, but that header is not included in the XDP
+// translation unit — so the bare token is UNDEFINED and applies no
+// attribute (it parses as an unused global variable of that struct type;
+// `nm nhp_ebpf_xdp.o` shows a BSS symbol literally named `__packed`). The
+// struct therefore keeps natural 4-byte alignment and its 14 field bytes
+// round up to a 16-byte size. The sibling allow-rule key structs (spp,
+// src_port, …) use the fully-spelled `__attribute__((packed))` and keep
+// their exact sizes (e.g. spp KeySize=11, NOT rounded to 12) — which is how
+// we know the cause is the undefined token here, not clang rounding map
+// keys in general. (Verified against release/nhp-ac/etc/nhp_ebpf_xdp.o:
+// conn_track KeySize=16, spp=11.)
+//
+// The XDP program builds its lookup key from a zero-initialized
+// `ct_key = {}` (nhp_ebpf_xdp.c), so the 2 trailing pad bytes it hashes are
+// zero — ToCtKey's zero pad matches byte-for-byte. Treat the compiled
+// KeySize as authoritative: the #2779 datapath gate seeds/deletes against
+// the real object, so any future KeySize drift fails that gate loudly.
+//
+// The C-side decision (truly pack the struct to 14 vs. keep 16 as the
+// intentional ABI) is tracked in #2818 — repacking is a breaking change for
+// the LIBBPF_PIN_BY_NAME conn_track map and must be coordinated with eBPF-XDP
+// mode adoption (prod runs FilterMode_IPTABLES today, so this path is
+// dormant). Until then, 16 is the live ABI and this serialization matches it.
+//
+// connTrackKeyDataLen is the 14 meaningful bytes; the gap to
+// connTrackKeySize is the trailing pad ToCtKey zero-fills and
+// connTrackKeyFromBytes ignores.
+const (
+	connTrackKeyDataLen = 4 + 4 + 2 + 2 + 1 + 1 // 14 meaningful bytes
+	connTrackKeySize    = 16                    // kernel map KeySize (14 + 2 trailing pad; see godoc)
+)
 
-// ToCtKey serializes the conntrack tuple into the exact 14 packed bytes
-// the kernel `ipv4_ct_tuple` map key expects. IP fields are written
-// little-endian because parseIP already returns the network-order bytes
-// packed into a uint32 via LittleEndian (matching ToWlKey's __be32
-// handling); ports are written big-endian to reproduce the on-wire
-// __be16. See connTrackKey's godoc for why every byte here is
-// load-bearing.
+// ToCtKey serializes the conntrack tuple into the 16 bytes the kernel
+// `conn_track` map key expects: the 14 meaningful field bytes followed by 2
+// zero pad bytes (see connTrackKeySize for why the map key is 16, not 14).
+// IP fields are written little-endian because parseIP already returns the
+// network-order bytes packed into a uint32 via LittleEndian (matching
+// ToWlKey's __be32 handling); ports are written big-endian to reproduce the
+// on-wire __be16. The trailing pad stays zero (make zero-fills it),
+// matching the kernel's `ct_key = {}` zero-init, so the seeded/deleted key
+// hashes identically to the one the XDP program builds. See connTrackKey's
+// godoc for why every byte here is load-bearing.
 func (r *connTrackKey) ToCtKey() []byte {
 	keyBytes := make([]byte, connTrackKeySize)
 	binary.LittleEndian.PutUint32(keyBytes[0:4], r.DstIP)
@@ -115,11 +155,14 @@ func (r *connTrackKey) ToCtKey() []byte {
 	binary.BigEndian.PutUint16(keyBytes[10:12], r.SrcPort)
 	keyBytes[12] = r.NextHdr
 	keyBytes[13] = r.Flags
+	// keyBytes[14:16] left zero — trailing alignment pad, matching the
+	// kernel's zero-initialized ct_key.
 	return keyBytes
 }
 
-// connTrackKeyFromBytes is the EXACT inverse of ToCtKey: it decodes the 14
-// packed bytes of a kernel `ipv4_ct_tuple` map key back into a connTrackKey.
+// connTrackKeyFromBytes is the EXACT inverse of ToCtKey: it decodes a kernel
+// `ipv4_ct_tuple` map key (connTrackKeySize=16 bytes — 14 meaningful + 2
+// trailing pad, which it ignores) back into a connTrackKey.
 // The conntrack-enumeration path (P4e slice 5,
 // conntrack_enumerate_linux.go) walks the pinned conn_track map and must
 // recover each entry's per-flow SOURCE PORT — the surgical discriminator —
@@ -139,7 +182,7 @@ func (r *connTrackKey) ToCtKey() []byte {
 // garbage from an out-of-bounds or truncated slice.
 func connTrackKeyFromBytes(buf []byte) (connTrackKey, error) {
 	if len(buf) != connTrackKeySize {
-		return connTrackKey{}, fmt.Errorf("conntrack key length %d, want %d (packed ipv4_ct_tuple)", len(buf), connTrackKeySize)
+		return connTrackKey{}, fmt.Errorf("conntrack key length %d, want %d (ipv4_ct_tuple: %d field bytes + %d trailing pad)", len(buf), connTrackKeySize, connTrackKeyDataLen, connTrackKeySize-connTrackKeyDataLen)
 	}
 	return connTrackKey{
 		DstIP:   binary.LittleEndian.Uint32(buf[0:4]),
