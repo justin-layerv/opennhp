@@ -524,9 +524,19 @@ const WhitelistValueSize = int(unsafe.Sizeof(whitelistValue{}))
 const ExpireTimeOffset = int(unsafe.Offsetof(whitelistValue{}.ExpireTime))
 
 type EbpfRuleParams struct {
-	SrcIP        string
-	DstIP        string
-	DstPort      int
+	SrcIP   string
+	DstIP   string
+	DstPort int
+	// DstPortStart / DstPortEnd feed the MapTypeSrcPortList (port_list) rule.
+	// IMPORTANT: the XDP port_list lookup key is built from the COMPILE-TIME
+	// constants {MIN_PORT(0), MAX_PORT(65535)} (nhp/ebpf/xdp/nhp_ebpf_xdp.c),
+	// never from the packet — so the map can ONLY express "all ports for a
+	// source". A rule seeded with any sub-range (anything other than {0, 65535})
+	// serializes to a key the datapath never looks up and silently never matches
+	// (the #2843 class of bug, where DstPortStart=1 fail-closed every all-ports
+	// admission). Use {0, 65535} for an all-ports rule (see
+	// allPortsEbpfRuleParams in endpoints/ac/msghandler.go); for a single port
+	// use DstPort + MapTypeSrcAndPort instead.
 	DstPortStart int
 	DstPortEnd   int
 	Protocol     string
@@ -603,12 +613,15 @@ func (r *procoPortKey) ToPpValue(ttlSec uint64) procoPortValue {
 // never observed to fail. The change is a forward-looking consistency fix,
 // pinned by TestPortListKey_ToPlKey_GoldenBytes with asymmetric values.
 //
-// ORTHOGONAL latent mismatch (NOT fixed here, tracked separately): the
-// inserter in endpoints/ac/msghandler.go builds the all-ports rule with
-// DstPortStart=1 while the XDP side looks up min_port=MIN_PORT=0, so the
-// port_list key never matches regardless of byte order. That is a value
-// mismatch in a different layer; this endianness fix neither causes nor
-// resolves it.
+// ORTHOGONAL value mismatch (was tracked separately; now RESOLVED in #2843):
+// the inserter in endpoints/ac/msghandler.go used to build the all-ports rule
+// with DstPortStart=1 while the XDP side looks up min_port=MIN_PORT=0, so the
+// port_list key never matched regardless of byte order. That was a value
+// mismatch in a different layer — this endianness convention neither caused nor
+// resolved it. #2843 fixed the inserter to DstPortStart=0 (via the shared
+// allPortsEbpfRuleParams helper, guarded by TestAllPortsEbpfRuleParams_Sentinel
+// in endpoints/ac and proven in-kernel by TestIPv4AdmissionDatapathPortListAllPorts);
+// the all-ports seed now matches the XDP lookup key.
 func (r *portListKey) ToPlKey() []byte {
 	keyBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint32(keyBytes[0:4], r.SrcIP)

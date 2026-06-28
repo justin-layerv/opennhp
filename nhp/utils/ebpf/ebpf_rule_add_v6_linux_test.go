@@ -160,7 +160,13 @@ func TestAddSdPortlistRuleV6_KeyLandsInMap(t *testing.T) {
 	}
 	defer func() { _ = m.Close() }()
 
-	rule := &portListKeyV6{SrcIP: mustParseIP6(t, "2001:db8::7"), DstPortStart: 1, DstPortEnd: 65535}
+	// All-ports-shaped rule: DstPortStart=0 is the canonical all-ports sentinel
+	// (matches the XDP MIN_PORT=0 lookup, #2843). This is a self-consistent
+	// round-trip (write via AddSdPortlistRuleV6, read back via ToPlKeyV6), so the
+	// exact bounds don't affect the assertion — using 0 keeps the fixture from
+	// implying min=1 is a valid all-ports start. (Byte-order coverage lives in
+	// the keys_v6_test.go golden vectors, which use non-palindromic bounds.)
+	rule := &portListKeyV6{SrcIP: mustParseIP6(t, "2001:db8::7"), DstPortStart: 0, DstPortEnd: 65535}
 	if err := AddSdPortlistRuleV6(m, rule, 30); err != nil {
 		t.Fatalf("AddSdPortlistRuleV6: %v", err)
 	}

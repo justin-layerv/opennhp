@@ -605,3 +605,38 @@ func TestNewFlusherForFilterMode_UnsupportedMode(t *testing.T) {
 		})
 	}
 }
+
+// TestAllPortsEbpfRuleParams_Sentinel is the pure-Go regression guard for the
+// #2843 all-ports sentinel. The two FilterMode_EBPFXDP all-ports branches in
+// HandleAccessControl build their port_list EbpfRuleParams via
+// allPortsEbpfRuleParams, so pinning the helper's bounds here makes a revert of
+// the sentinel back to the pre-#2843 DstPortStart=1 fail this test — without a
+// kernel.
+//
+// WHY DstPortStart MUST be 0: the XDP port_list lookup key is built from the
+// compile-time constants `.min_port = MIN_PORT(0), .max_port = MAX_PORT(65535)`
+// (nhp/ebpf/xdp/nhp_ebpf_xdp.c), never from the packet. A seed with
+// DstPortStart=1 produces the key {src,1,65535}, which never equals the lookup
+// {src,0,65535}, so every all-ports admission fail-closes under EBPFXDP. This
+// test owns the production-constant half of the proof; the in-kernel
+// TestIPv4AdmissionDatapathPortListAllPorts owns the key→verdict half (and
+// additionally proves the OLD min=1 value DROPs).
+//
+// SCOPE: this pins the constant the shared constructor returns, not that every
+// call site calls the constructor. The two HandleAccessControl all-ports
+// branches were collapsed onto this helper in the same change, so today a revert
+// to 1 at the sentinel goes red here.
+func TestAllPortsEbpfRuleParams_Sentinel(t *testing.T) {
+	const srcIP = "10.1.2.3"
+	got := allPortsEbpfRuleParams(srcIP)
+
+	if got.DstPortStart != 0 {
+		t.Errorf("all-ports DstPortStart = %d, want 0 — the XDP port_list lookup keys on MIN_PORT=0; a non-zero start (the pre-#2843 bug was 1) makes the seeded key never match and every all-ports admission fail-closes under FilterMode=EBPFXDP (#2843)", got.DstPortStart)
+	}
+	if got.DstPortEnd != 65535 {
+		t.Errorf("all-ports DstPortEnd = %d, want 65535 — the XDP port_list lookup keys on MAX_PORT=65535; any other end makes the seeded key never match the lookup", got.DstPortEnd)
+	}
+	if got.SrcIP != srcIP {
+		t.Errorf("all-ports SrcIP = %q, want %q — the source IP must be threaded through unchanged so the rule is keyed on the admitted source", got.SrcIP, srcIP)
+	}
+}

@@ -115,6 +115,34 @@ func (a *UdpAC) recordEbpfInsertResult(err error, params ebpf.EbpfRuleParams, ma
 	return err
 }
 
+// allPortsEbpfRuleParams builds the EbpfRuleParams for an "all ports"
+// (dstAddr.Port == 0) eBPF port_list admission for one source IP. It is the
+// SINGLE source of truth for the all-ports min/max sentinel, shared by the TCP
+// and UDP FilterMode_EBPFXDP branches in HandleAccessControl (which build
+// byte-identical params).
+//
+// DstPortStart MUST be 0 to match the XDP port_list lookup key, which is built
+// from the compile-time constants `.min_port = MIN_PORT(0), .max_port =
+// MAX_PORT(65535)` (nhp/ebpf/xdp/nhp_ebpf_xdp.c), NOT from the packet. The
+// inserter previously used DstPortStart=1, so the seeded key {src,1,65535} never
+// matched the lookup {src,0,65535} and every all-ports admission fail-closed
+// under FilterMode=EBPFXDP (#2843, v4 + v6). Centralizing the sentinel here lets
+// TestAllPortsEbpfRuleParams_Sentinel pin it so a regression back to 1 fails a
+// pure-Go test (the in-kernel TestIPv4AdmissionDatapathPortListAllPorts proves
+// the key→verdict half).
+//
+// ANY new all-ports port_list insert site MUST build its params through this
+// helper (not an inline EbpfRuleParams literal): the sentinel guard pins the
+// value this constructor returns, so a future site that inlines DstPortStart
+// would not be covered. Route it here to keep the guard load-bearing.
+func allPortsEbpfRuleParams(srcIPStr string) ebpf.EbpfRuleParams {
+	return ebpf.EbpfRuleParams{
+		SrcIP:        srcIPStr,
+		DstPortStart: 0,
+		DstPortEnd:   65535,
+	}
+}
+
 // computeFlushDeadline returns `now + openTimeSec + flushSafetyMargin`
 // — the single source of truth for the L3 flush deadline anchoring.
 // Centralizing this here keeps the four call sites in lockstep so a
@@ -985,11 +1013,10 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 									}
 
 								} else {
-									ebpfHashStr := ebpf.EbpfRuleParams{
-										SrcIP:        srcIpStr,
-										DstPortStart: 1,
-										DstPortEnd:   65535,
-									}
+									// All-ports sentinel built via the shared helper so the
+									// min/max bounds stay in lockstep with the XDP port_list
+									// lookup key (#2843); see allPortsEbpfRuleParams.
+									ebpfHashStr := allPortsEbpfRuleParams(srcIpStr)
 									err = a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, err)
@@ -1011,11 +1038,10 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 										log.Error("[EbpfRuleAdd] add ebpf for udp dst port src: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPort, err)
 									}
 								} else {
-									ebpfHashStr := ebpf.EbpfRuleParams{
-										SrcIP:        srcIpStr,
-										DstPortStart: 1,
-										DstPortEnd:   65535,
-									}
+									// All-ports sentinel built via the shared helper so the
+									// min/max bounds stay in lockstep with the XDP port_list
+									// lookup key (#2843); see allPortsEbpfRuleParams.
+									ebpfHashStr := allPortsEbpfRuleParams(srcIpStr)
 									err = a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, err)
