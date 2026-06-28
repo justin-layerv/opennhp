@@ -291,3 +291,43 @@ func TestLostPerfSamplesCounter(t *testing.T) {
 		t.Fatalf("LostPerfSamples delta = %d, want %d", got, want)
 	}
 }
+
+// TestSuppressedDenyEventsCounter verifies recordSuppressedDeny STORES the latest
+// cumulative snapshot rather than accumulating (contrast recordLostSamples, which
+// Adds per-read deltas). The in-kernel deny_suppressed counter is itself
+// cumulative, so the monitor sums it and stores the total each poll;
+// SuppressedDenyEvents must reflect the most recent store exactly.
+func TestSuppressedDenyEventsCounter(t *testing.T) {
+	recordSuppressedDeny(42)
+	if got := SuppressedDenyEvents(); got != 42 {
+		t.Fatalf("after store 42: SuppressedDenyEvents() = %d, want 42", got)
+	}
+	// A later poll reads a higher cumulative total; the store reflects it exactly
+	// (NOT 142) — proving Store, not Add.
+	recordSuppressedDeny(100)
+	if got := SuppressedDenyEvents(); got != 100 {
+		t.Fatalf("after store 100: SuppressedDenyEvents() = %d, want 100 (Store, not Add)", got)
+	}
+}
+
+// TestSumPerCPUCounter verifies the summing the monitor applies to the []uint64 a
+// PERCPU_ARRAY Lookup returns (one entry per possible CPU). The deny_suppressed
+// total the AC surfaces is the sum across all CPUs.
+func TestSumPerCPUCounter(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []uint64
+		want uint64
+	}{
+		{"nil", nil, 0},
+		{"empty", []uint64{}, 0},
+		{"single", []uint64{7}, 7},
+		{"multi-cpu", []uint64{1, 2, 3, 4}, 10},
+		{"some-idle-cpus", []uint64{0, 5, 0, 9}, 14},
+	}
+	for _, c := range cases {
+		if got := sumPerCPUCounter(c.in); got != c.want {
+			t.Errorf("%s: sumPerCPUCounter(%v) = %d, want %d", c.name, c.in, got, c.want)
+		}
+	}
+}

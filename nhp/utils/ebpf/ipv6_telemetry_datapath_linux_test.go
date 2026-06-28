@@ -41,6 +41,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -56,6 +57,13 @@ const (
 	// fail-loud rather than a silent pass.
 	eventsV6MapName = "events_v6"
 	eventsMapName   = "events"
+
+	// #2849 rate-limiter maps (mirror the SEC(".maps") symbols added in
+	// nhp_ebpf_xdp.c): deny_rl_config (regular ARRAY holding {capacity,
+	// refill_per_sec} the test seeds) and deny_suppressed (PERCPU_ARRAY counter
+	// the test sums across CPUs).
+	denyRlConfigMapName   = "deny_rl_config"
+	denySuppressedMapName = "deny_suppressed"
 
 	// Wire sizes of the perf event records, mirrored from the C structs (and the
 	// Go EventV6/Event structs). event_t_v6 is __packed at 48 bytes
@@ -338,4 +346,201 @@ func isAllZero(b []byte) bool {
 		}
 	}
 	return true
+}
+
+// --- #2849 DENY-telemetry rate-limiter proof ---
+//
+// These assert the per-CPU token bucket gating the malformed/early-drop DENY
+// sites: under a flood of gated DENYs it emits at most `capacity` events and
+// COUNTS the rest in deny_suppressed (never silently drops). The proof is
+// DETERMINISTIC by construction — the config is seeded with refill_per_sec=0, so
+// the bucket starts full and NEVER refills, making the emit/suppress split a pure
+// function of (capacity, packet-count) with ZERO dependence on wall-clock /
+// bpf_ktime (a refill-rate-based test would be flaky: ktime advances by real time
+// between TEST_RUN calls). The test pins to one CPU so the per-CPU bucket is the
+// same across every BPF_PROG_TEST_RUN — otherwise runs spread across CPUs, each
+// CPU's bucket independently allows `capacity`, and the count is nondeterministic.
+
+// denyRlConfigValue mirrors `struct deny_rl_config_t` (two __u64, native order)
+// in nhp_ebpf_xdp.c — the value the test writes into deny_rl_config[0] to drive
+// the bucket. (The production AC has its own copy in endpoints/ac/ebpf; this is
+// the nhp-module test's local mirror.)
+type denyRlConfigValue struct {
+	Capacity     uint64
+	RefillPerSec uint64
+}
+
+// pinToCPU0 pins the calling goroutine to a single CPU for the rest of the test,
+// so the per-CPU deny_rl_state bucket is consistent across every BPF_PROG_TEST_RUN
+// (bpf_ktime + per-CPU state mean a migrating run would hit a different, full
+// bucket). A SchedSetaffinity failure is an environment problem → LOUD-SKIP guard
+// (hard-fails under NHP_REQUIRE_BPF_TESTS=1).
+func pinToCPU0(t *testing.T) {
+	t.Helper()
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+	var set unix.CPUSet
+	set.Set(0)
+	if err := unix.SchedSetaffinity(0, &set); err != nil {
+		skipOrFatal(t, "SchedSetaffinity to CPU 0 (pin the per-CPU token bucket so the count is deterministic): %v", err)
+	}
+}
+
+// drainCountEvents reads every buffered perf sample (>= wantSize bytes) until the
+// reader times out, returning the count. Used to count how many DENY events the
+// rate limiter let through. A LostSamples on this small run means the buffer was
+// too small or a CPU problem — fatal, not a silent undercount.
+func drainCountEvents(t *testing.T, rd *perf.Reader, wantSize int) int {
+	t.Helper()
+	count := 0
+	for {
+		rd.SetDeadline(time.Now().Add(perfReadTimeout))
+		rec, err := rd.Read()
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, unix.EAGAIN) {
+				return count // no more buffered events
+			}
+			t.Fatalf("drain perf buffer: %v", err)
+		}
+		if rec.LostSamples > 0 {
+			t.Fatalf("drain: perf buffer reported %d lost samples (buffer too small / CPU problem) — count would be unreliable", rec.LostSamples)
+		}
+		if len(rec.RawSample) >= wantSize {
+			count++
+		}
+	}
+}
+
+// setupRateLimiterTest loads a fresh collection (fresh, zero-valued maps), pins to
+// one CPU (so the per-CPU token bucket is consistent across BPF_PROG_TEST_RUN
+// calls), resolves the rate-limiter maps, and opens a perf reader on `events`
+// BEFORE any run. Cleanups are test-scoped. Shared by the rate-limiter scenarios.
+func setupRateLimiterTest(t *testing.T) (prog *ebpf.Program, cfgMap, suppressedMap *ebpf.Map, rd *perf.Reader) {
+	t.Helper()
+	pinToCPU0(t)
+	prog, coll, cleanup := loadXDPCollectionV6(t)
+	if cleanup != nil {
+		t.Cleanup(cleanup)
+	}
+	eventsV4 := requireMapV6(t, coll, eventsMapName)
+	cfgMap = requireMapV6(t, coll, denyRlConfigMapName)
+	suppressedMap = requireMapV6(t, coll, denySuppressedMapName)
+	rd, closeRd := openPerfReader(t, eventsV4)
+	t.Cleanup(closeRd)
+	return prog, cfgMap, suppressedMap, rd
+}
+
+// fireGatedDENYPackets runs n truncated-TCP v4 packets through the program; each
+// must DROP at a #2849-gated early-DENY site (craftTruncatedTCPv4Packet). Shared
+// by the rate-limiter tests.
+func fireGatedDENYPackets(t *testing.T, prog *ebpf.Program, pkt []byte, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if got := runVerdict(t, prog, pkt); got != xdpDrop {
+			t.Fatalf("run %d: verdict = %d (%s), want XDP_DROP at the gated early-DENY site", i, got, xdpName(got))
+		}
+	}
+}
+
+// sumSuppressed reads the per-CPU deny_suppressed counter (key 0) and sums it
+// across CPUs — the cumulative count of DENY events the limiter has shed.
+func sumSuppressed(t *testing.T, suppressedMap *ebpf.Map) uint64 {
+	t.Helper()
+	var perCPU []uint64
+	if err := suppressedMap.Lookup(uint32(0), &perCPU); err != nil {
+		t.Fatalf("read deny_suppressed (per-CPU): %v", err)
+	}
+	var total uint64
+	for _, v := range perCPU {
+		total += v
+	}
+	return total
+}
+
+// runRateLimitScenario seeds deny_rl_config={capacity, refill_per_sec:0} (full
+// bucket, never refills ⇒ deterministic), fires `total` gated DENY packets, and
+// returns how many DENY events reached `events` and the summed deny_suppressed
+// counter.
+func runRateLimitScenario(t *testing.T, capacity uint64, total int) (emitted int, suppressed uint64) {
+	t.Helper()
+	prog, cfgMap, suppressedMap, rd := setupRateLimiterTest(t)
+
+	if err := cfgMap.Put(uint32(0), &denyRlConfigValue{Capacity: capacity, RefillPerSec: 0}); err != nil {
+		t.Fatalf("seed deny_rl_config{capacity:%d, refill:0}: %v", capacity, err)
+	}
+	pkt := craftTruncatedTCPv4Packet(t, net.ParseIP("10.1.2.3"), net.ParseIP("10.9.8.7"))
+	fireGatedDENYPackets(t, prog, pkt, total)
+
+	return drainCountEvents(t, rd, eventV4WireSize), sumSuppressed(t, suppressedMap)
+}
+
+// TestDenyTelemetryRateLimiterShedsAndCounts is the load-bearing #2849 proof:
+// with capacity=N and N+M gated DENY packets, EXACTLY N events are emitted and the
+// other M are counted in deny_suppressed — the limiter caps the flood without
+// silently losing telemetry.
+func TestDenyTelemetryRateLimiterShedsAndCounts(t *testing.T) {
+	const capacity uint64 = 3
+	const total = 5 // capacity (3) emitted + 2 suppressed
+	emitted, suppressed := runRateLimitScenario(t, capacity, total)
+
+	if emitted != int(capacity) {
+		t.Fatalf("emitted %d DENY events for %d gated packets, want EXACTLY %d (capacity) — the token bucket must emit N then shed the rest", emitted, total, capacity)
+	}
+	if want := uint64(total) - capacity; suppressed != want {
+		t.Fatalf("deny_suppressed = %d, want %d (the packets beyond capacity) — the limiter must COUNT what it sheds, never silently drop", suppressed, want)
+	}
+	t.Logf("rate-limiter OK: %d gated packets -> %d emitted + %d suppressed (capacity=%d, refill=0, deterministic)", total, emitted, suppressed, capacity)
+}
+
+// TestDenyTelemetryRateLimiterGenerousCapacityEmitsAll proves the limiter does NOT
+// over-suppress: with capacity far above the packet count, every gated DENY has a
+// token, so all emit and deny_suppressed stays 0. A limiter that just dropped
+// everything (or mis-computed the bucket) would fail here.
+func TestDenyTelemetryRateLimiterGenerousCapacityEmitsAll(t *testing.T) {
+	const total = 5
+	const capacity uint64 = 100
+	emitted, suppressed := runRateLimitScenario(t, capacity, total)
+
+	if emitted != total {
+		t.Fatalf("emitted %d of %d gated DENYs under generous capacity %d, want all %d — the limiter must not shed below capacity", emitted, total, capacity, total)
+	}
+	if suppressed != 0 {
+		t.Fatalf("deny_suppressed = %d under generous capacity, want 0 — nothing should be shed when under the cap", suppressed)
+	}
+}
+
+// TestDenyTelemetryRateLimiterRetuneDownClampsImmediately proves the runtime
+// downward-retune path (cr #1): lowering deny_rl_config.capacity while the bucket
+// holds MORE tokens than the new cap takes effect on the NEXT decision (the
+// unconditional clamp in should_emit_deny_event), not after a refill tick.
+// refill_per_sec=0 throughout, so the ONLY thing that can lower the live token
+// count is the clamp — a clean proof of the clamp itself, not of refill timing.
+// Without the clamp, phase 2 would drain from the old (higher) level and emit 5;
+// with it, exactly 2 emit then the rest are shed.
+func TestDenyTelemetryRateLimiterRetuneDownClampsImmediately(t *testing.T) {
+	prog, cfgMap, suppressedMap, rd := setupRateLimiterTest(t)
+	pkt := craftTruncatedTCPv4Packet(t, net.ParseIP("10.1.2.3"), net.ParseIP("10.9.8.7"))
+
+	// Phase 1: high cap, fire 3 → all emit (bucket 10 -> 7, refill=0 so no refill).
+	if err := cfgMap.Put(uint32(0), &denyRlConfigValue{Capacity: 10, RefillPerSec: 0}); err != nil {
+		t.Fatalf("seed cap=10: %v", err)
+	}
+	fireGatedDENYPackets(t, prog, pkt, 3)
+	if got := drainCountEvents(t, rd, eventV4WireSize); got != 3 {
+		t.Fatalf("phase 1: emitted %d of 3 under cap=10, want 3", got)
+	}
+
+	// Phase 2: retune DOWN to 2 with ~7 tokens still live. The clamp lowers the
+	// bucket to 2 on the next decision → exactly 2 more emit, then shed.
+	if err := cfgMap.Put(uint32(0), &denyRlConfigValue{Capacity: 2, RefillPerSec: 0}); err != nil {
+		t.Fatalf("retune cap=2: %v", err)
+	}
+	fireGatedDENYPackets(t, prog, pkt, 5) // expect 2 emit (clamped) + 3 suppressed
+	if got := drainCountEvents(t, rd, eventV4WireSize); got != 2 {
+		t.Fatalf("phase 2: emitted %d after retune-down to cap=2, want EXACTLY 2 — the downward retune must clamp the live bucket immediately (cr #1); without the clamp the bucket would drain from the old level", got)
+	}
+	if got := sumSuppressed(t, suppressedMap); got != 3 {
+		t.Fatalf("deny_suppressed = %d after retune-down, want 3 (the packets beyond the new cap)", got)
+	}
+	t.Logf("retune-down OK: cap 10->2 mid-flight -> 2 emitted + 3 suppressed (clamp took effect immediately)")
 }

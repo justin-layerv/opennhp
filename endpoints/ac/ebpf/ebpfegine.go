@@ -35,6 +35,12 @@ type bpfObjects struct {
 	Conntrack     *ebpf.Map     `ebpf:"conn_track"`
 	Events        *ebpf.Map     `ebpf:"events"`
 	EventsV6      *ebpf.Map     `ebpf:"events_v6"`
+	// DENY-telemetry rate-limiter maps (#2849). Only the two userspace touches —
+	// the config the AC writes and the suppressed counter it reads — need a Go
+	// handle; the per-CPU token-bucket state (deny_rl_state) is datapath-only and
+	// is kept alive by the loaded program, like the v6 allow-rule maps.
+	DenyRlConfig   *ebpf.Map `ebpf:"deny_rl_config"`
+	DenySuppressed *ebpf.Map `ebpf:"deny_suppressed"`
 }
 
 type tcBpfObjects struct {
@@ -192,6 +198,31 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 		return errors.New("'events_v6' map not found")
 	}
 
+	// DENY-telemetry rate-limiter (#2849). A nil here means the maps are missing
+	// from the loaded object (stale .o predating #2849) — fail closed at load
+	// rather than silently shipping an unconfigured (fail-open) limiter once
+	// FilterMode flips.
+	denyRlConfigMap := objs.DenyRlConfig
+	if denyRlConfigMap == nil {
+		log.Error("failed to load 'deny_rl_config' map from eBPF object (nil)")
+		return errors.New("'deny_rl_config' map not found")
+	}
+	denySuppressedMap := objs.DenySuppressed
+	if denySuppressedMap == nil {
+		log.Error("failed to load 'deny_suppressed' map from eBPF object (nil)")
+		return errors.New("'deny_suppressed' map not found")
+	}
+	// Activate the limiter by writing the default cap (key 0). Until this write
+	// the regular ARRAY is zero-valued (capacity 0 = fail-open / always-emit), so
+	// the limiter only ever starts shedding once this succeeds. Retunable at the
+	// E5 flip via a single map update, no object regen (#2823).
+	denyRlCfg := DenyRlConfig{Capacity: DefaultDenyRlCapacity, RefillPerSec: DefaultDenyRlRefillPerSec}
+	if err := denyRlConfigMap.Update(uint32(0), &denyRlCfg, ebpf.UpdateAny); err != nil {
+		log.Error("failed to write default deny_rl_config: %v", err)
+		return err
+	}
+	log.Info("eBPF DENY telemetry rate-limiter configured: capacity=%d refill=%d/s per CPU (#2849)", denyRlCfg.Capacity, denyRlCfg.RefillPerSec)
+
 	ExeDirPath := dirPath
 	//Set up the DENY logger
 	DenyLogger = log.NewLoggerDefine(
@@ -335,6 +366,36 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 				DenyLogger.Info("%s", logMsg)
 			} else { // ACCEPT
 				AcLogger.Info("%s", logMsg)
+			}
+		}
+	}()
+
+	// DENY rate-limiter suppressed-counter monitor (#2849). The in-kernel token
+	// bucket sheds malformed/early-drop DENY events under a flood and counts them
+	// per-CPU in deny_suppressed; poll + sum + surface so the shedding is never
+	// silent (mirrors the perf-overflow LostSamples WARN). Diagnostic only — it
+	// never touches the datapath. INERT until the flip, like the readers above.
+	//
+	// SuppressedDenyEvents() therefore lags by up to one poll interval (and is
+	// unset for the first interval). Fine for this WARN path; the follow-up that
+	// wires it into a CloudWatch metric should choose the alarm period/threshold
+	// with that staleness in mind.
+	const denySuppressedPollInterval = 60 * time.Second
+	go func() {
+		ticker := time.NewTicker(denySuppressedPollInterval)
+		defer ticker.Stop()
+		var last uint64
+		for range ticker.C {
+			var perCPU []uint64
+			if err := denySuppressedMap.Lookup(uint32(0), &perCPU); err != nil {
+				log.Error("failed to read deny_suppressed map: %v", err)
+				continue
+			}
+			total := sumPerCPUCounter(perCPU)
+			recordSuppressedDeny(total)
+			if total > last {
+				log.Warning("eBPF DENY telemetry rate-limiter shed %d malformed/early-drop event(s) since last poll (cumulative %d) — the malformed-packet flood is being capped as designed (#2849)", total-last, total)
+				last = total
 			}
 		}
 	}()

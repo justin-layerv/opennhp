@@ -563,6 +563,161 @@ static __always_inline int submit_event_v6(void *ctx, __u8 action, struct in6_ad
     return bpf_perf_event_output(ctx, &events_v6, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
 }
 
+// ----------------------------------------------------------------------------
+// DENY-telemetry rate limiter (#2849).
+//
+// E3 (above) gave the malformed/early-drop paths a voice: a truncated header,
+// an unsupported nexthdr, a bad IHL, or a truncated L4 header now emits a DENY
+// event before XDP_DROP instead of dropping silently. These are packets the
+// kernel would discard pre-iptables — XDP sees them at the NIC — so they are an
+// attacker-controllable, unbounded emission surface that goes hot the moment
+// FilterMode flips to eBPF at the E5 cutover. A single malformed-packet flood
+// could swamp the perf buffer (and the userspace reader) with DENY events.
+//
+// A per-CPU token bucket bounds that surface. The cap is held in a REGULAR
+// (non-per-CPU) ARRAY map so userspace can tune it at runtime without
+// recompiling/redeploying the object — that runtime-tunability is what lets E5
+// adjust the cap without a .o regen, partially easing #2823. The token state is
+// per-CPU (the hot path, written every packet — a shared map would need atomics
+// and contend across CPUs); a per-CPU bucket trades exactness for lock-free
+// speed (the effective aggregate cap is capacity * nr_cpus, which is fine for a
+// telemetry guard whose job is bounding, not precise accounting).
+//
+// Scope: ONLY the malformed/early-drop DENY sites are gated by this. The
+// no-match (unauthorized-access) DENY and every ACCEPT emission are left
+// unrate-limited on purpose — see should_emit_deny_event() and the call sites.
+struct deny_rl_state_t {
+    __u64 tokens;          // tokens currently available (<= capacity)
+    __u64 last_refill_ns;  // bpf_ktime_get_ns() at the last refill; 0 = uninit
+};
+
+// Per-CPU token-bucket state. PERCPU_ARRAY, single entry (key 0): the hot path
+// updates this every malformed-DENY decision, so per-CPU avoids cross-CPU
+// contention and lets us use a plain (non-atomic) read-modify-write.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, struct deny_rl_state_t);
+    __uint(max_entries, 1);
+} deny_rl_state SEC(".maps");
+
+struct deny_rl_config_t {
+    __u64 capacity;        // bucket size (max tokens); 0 = limiter disabled
+    __u64 refill_per_sec;  // tokens added per second
+};
+
+// Runtime config. REGULAR ARRAY (NOT per-CPU): userspace writes one shared copy
+// (key 0) that every CPU reads, so the cap can be retuned at the E5 flip with a
+// single map update and no object regen (#2823). capacity == 0 (the zero value
+// of a freshly created, never-written map) means "unconfigured" → fail OPEN to
+// today's always-emit behavior (see should_emit_deny_event()).
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, struct deny_rl_config_t);
+    __uint(max_entries, 1);
+} deny_rl_config SEC(".maps");
+
+// Suppression counter. PERCPU_ARRAY, single entry (key 0): incremented (plain
+// +=, no atomic — per-CPU) each time a malformed-DENY event is dropped by the
+// limiter, so userspace can sum across CPUs to observe how much telemetry the
+// rate limiter is shedding. Diagnostics only; does not affect the datapath.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 1);
+} deny_suppressed SEC(".maps");
+
+// One second in nanoseconds — bpf_ktime_get_ns() is a ns monotonic clock.
+#define NS_PER_SEC 1000000000ULL
+
+// should_emit_deny_event decides whether a malformed/early-drop DENY event may
+// be emitted, applying the per-CPU token bucket above. Returns 1 = EMIT,
+// 0 = SUPPRESS.
+//
+// Fail-open contract: if the limiter is unconfigured (no config map, or
+// capacity == 0) or its state can't be read, we return 1 (emit) so behavior is
+// IDENTICAL to today's always-emit datapath until userspace opts in by writing
+// a non-zero capacity. The rate limiter can only ever *reduce* emissions, never
+// add or block legitimate telemetry on a misconfiguration.
+//
+// Verifier/overflow notes:
+//   - All three map lookups are null-checked before any deref.
+//   - State is mutated in place through the per-CPU pointer (no
+//     bpf_map_update_elem); per-CPU means no atomics are needed.
+//   - Refill is computed overflow-safely by splitting elapsed into
+//     whole-seconds and sub-second remainder so neither term can wrap a u64 for
+//     any realistic refill_per_sec (whole = (elapsed/1e9)*rate, which only
+//     overflows after ~584 years of elapsed time at rate==1; sub = (elapsed%1e9)
+//     * rate / 1e9, where elapsed%1e9 < 1e9 keeps the product bounded for any
+//     sane rate). The tokens+refill sum is then guarded against wrap before the
+//     min(capacity, ...) clamp.
+static __always_inline int should_emit_deny_event(void) {
+    __u32 key = 0;
+
+    struct deny_rl_config_t *cfg = bpf_map_lookup_elem(&deny_rl_config, &key);
+    // Unconfigured (no map entry) or explicitly disabled (capacity 0) →
+    // fail open to today's always-emit behavior.
+    if (!cfg || cfg->capacity == 0)
+        return 1;
+
+    struct deny_rl_state_t *st = bpf_map_lookup_elem(&deny_rl_state, &key);
+    if (!st)
+        return 1;
+
+    __u64 capacity = cfg->capacity;
+    __u64 refill_per_sec = cfg->refill_per_sec;
+    __u64 now = bpf_ktime_get_ns();
+
+    if (st->last_refill_ns == 0) {
+        // First use on this CPU: start with a full bucket.
+        st->tokens = capacity;
+        st->last_refill_ns = now;
+    } else if (now > st->last_refill_ns) {
+        // Refill since the last decision. (now <= last_refill_ns is skipped:
+        // ktime is monotonic, so this only guards a same-ns re-entry — no
+        // refill is due in that case anyway.)
+        __u64 elapsed = now - st->last_refill_ns;
+
+        // Overflow-safe elapsed * refill_per_sec / NS_PER_SEC, split into
+        // whole-second and sub-second parts.
+        __u64 whole = (elapsed / NS_PER_SEC) * refill_per_sec;
+        __u64 sub = (elapsed % NS_PER_SEC) * refill_per_sec / NS_PER_SEC;
+        __u64 refill = whole + sub;
+
+        if (refill > 0) {
+            __u64 sum = st->tokens + refill;
+            // Clamp to capacity, also catching a u64 wrap (sum < tokens).
+            if (sum > capacity || sum < st->tokens)
+                sum = capacity;
+            st->tokens = sum;
+            st->last_refill_ns = now;
+        }
+    }
+
+    // A runtime capacity DECREASE (operator retunes deny_rl_config down at the E5
+    // flip) can leave the live token count above the new cap; the refill branch
+    // only clamps on the way up, so clamp unconditionally here too — the lower cap
+    // then takes effect on THIS decision instead of lagging until the next refill
+    // tick. Runtime-tunability without an .o regen is the point of the config map,
+    // so a retune-down must not silently keep draining from the old, higher level.
+    if (st->tokens > capacity)
+        st->tokens = capacity;
+
+    if (st->tokens > 0) {
+        st->tokens -= 1;
+        return 1; // EMIT
+    }
+
+    // Bucket empty: shed this event and bump the per-CPU suppressed counter
+    // (plain += is safe — per-CPU map, no cross-CPU contention).
+    __u64 *suppressed = bpf_map_lookup_elem(&deny_suppressed, &key);
+    if (suppressed)
+        *suppressed += 1;
+    return 0; // SUPPRESS
+}
+
 static __always_inline void reverseTuple(struct ipv4_ct_tuple *key) {
     __u32 tmp_ip = key->daddr;
     __u16 tmp_port = key->dport;
@@ -648,7 +803,8 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
         // cannot log what it cannot parse). E3 surfaces the DROP so it is not
         // silent; the addresses are simply unrecoverable at this point.
         struct in6_addr zero6 = {};
-        submit_event_v6(ctx, 0, zero6, zero6, 0, 0, 0, 0);
+        if (should_emit_deny_event())
+            submit_event_v6(ctx, 0, zero6, zero6, 0, 0, 0, 0);
         return XDP_DROP;
     }
 
@@ -668,7 +824,8 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
     if (nexthdr != IPPROTO_TCP &&
         nexthdr != IPPROTO_UDP &&
         nexthdr != IPPROTO_ICMPV6) {
-        submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
+        if (should_emit_deny_event())
+            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
         return XDP_DROP;
     }
 
@@ -684,7 +841,8 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
             // addresses are recoverable — emit a DENY with real addrs (E3). The
             // ports are NOT yet parsed at this point, so they are 0 (honest:
             // can't log what wasn't parsed).
-            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
+            if (should_emit_deny_event())
+                submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
             return XDP_DROP;
         }
         sport = tcp->source;
@@ -693,7 +851,8 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
         struct udphdr *udp = l4;
         if ((void *)(udp + 1) > data_end) {
             // L4 (UDP) header truncated — same treatment as the TCP case above.
-            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
+            if (should_emit_deny_event())
+                submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
             return XDP_DROP;
         }
         sport = udp->source;
@@ -733,7 +892,8 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
             // above. NOTE: the ICMPv6 *type* denials below (echo-not-allowed,
             // unsupported type) are deliberately left SILENT to mirror the v4
             // ICMP path, which does not emit a DENY on those — see E3 design.
-            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
+            if (should_emit_deny_event())
+                submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
             return XDP_DROP;
         }
         __u8 icmp6_type = icmp6->icmp6_type;
@@ -990,6 +1150,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
     // ETH_P_IPV6 arm no longer fail-OPENs). Emit a DENY event like v4 — now with
     // the full v6 src/dst addresses (E3) so the eBPF path matches the iptables
     // [NHP-DENY6] LOG rule — then DROP.
+    // NOT rate-limited (#2849): a no-match DROP is an unauthorized-access audit
+    // signal, not a malformed-packet flood, and dropping it would lose security
+    // visibility + break parity with the unconditional iptables [NHP-DENY6] LOG.
     submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
     return XDP_DROP;
 }
@@ -1030,7 +1193,8 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
         // addresses (E3 residual v4 parity), matching iptables' inability to
         // log a 4-tuple it can't validate. Surfacing the DROP (not silent) is
         // the point; the addresses are reported as 0.
-        submit_event(ctx, 0, 0, 0, 0, 0, iph->protocol, iph->tot_len);
+        if (should_emit_deny_event())
+            submit_event(ctx, 0, 0, 0, 0, 0, iph->protocol, iph->tot_len);
         return XDP_DROP;
     }
 
@@ -1041,7 +1205,8 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
             // checked above), so the addresses ARE recoverable — emit a DENY
             // with real addrs (E3). Ports are NOT yet parsed here, so they are
             // 0 (honest: can't log what wasn't parsed).
-            submit_event(ctx, 0, iph->saddr, iph->daddr, 0, 0, iph->protocol, iph->tot_len);
+            if (should_emit_deny_event())
+                submit_event(ctx, 0, iph->saddr, iph->daddr, 0, 0, iph->protocol, iph->tot_len);
             return XDP_DROP;
         }
         ct_key.nexthdr = IPPROTO_TCP;
@@ -1053,7 +1218,8 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
         if ((void *)(udp + 1) > data_end) {
             // UDP header truncated — same treatment as the TCP case above:
             // real addrs (recoverable), ports 0 (not yet parsed).
-            submit_event(ctx, 0, iph->saddr, iph->daddr, 0, 0, iph->protocol, iph->tot_len);
+            if (should_emit_deny_event())
+                submit_event(ctx, 0, iph->saddr, iph->daddr, 0, 0, iph->protocol, iph->tot_len);
             return XDP_DROP;
         }
         ct_key.nexthdr = IPPROTO_UDP;
@@ -1070,7 +1236,8 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
             // end. The IPv4 header + ports were already parsed (ct_key.sport/
             // dport set above), so the full 4-tuple is recoverable — emit a DENY
             // with real addrs + the parsed ports (E3 residual v4 parity).
-            submit_event(ctx, 0, iph->saddr, iph->daddr, ct_key.sport, ct_key.dport, iph->protocol, iph->tot_len);
+            if (should_emit_deny_event())
+                submit_event(ctx, 0, iph->saddr, iph->daddr, ct_key.sport, ct_key.dport, iph->protocol, iph->tot_len);
             return XDP_DROP;
         }
 
@@ -1302,6 +1469,10 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
             return XDP_PASS;
         }
     }
+    // No rule matched → fail CLOSED. NOT rate-limited (#2849): a no-match DROP is
+    // an unauthorized-access audit signal, not a malformed-packet flood, and
+    // dropping it would lose security visibility + break parity with the
+    // unconditional iptables [NHP-DENY] LOG rule (mirrors the v6 no-match site).
     submit_event(ctx, 0, iph->saddr, iph->daddr, ct_key.sport, ct_key.dport, iph->protocol, iph->tot_len);
     return XDP_DROP;
 }

@@ -44,6 +44,72 @@ func LostPerfSamples() uint64 {
 	return lostPerfSamples.Load()
 }
 
+// --- DENY telemetry rate-limiter (#2849) userspace support ---
+//
+// The in-kernel side (nhp/ebpf/xdp/nhp_ebpf_xdp.c) gates ONLY the malformed/
+// early-drop DENY submit_event sites behind a per-CPU token bucket; the no-match
+// (unauthorized-access) DENY and all ACCEPT emissions stay unrate-limited. These
+// helpers are the userspace half: the config the AC writes at load, and the
+// suppressed-count it surfaces. Build-tag-free so the config layout + the
+// per-CPU summing are unit-tested on any platform (the macOS-excludes-linux-files
+// gotcha would otherwise skip a test placed in ebpfegine.go).
+
+// DenyRlConfig mirrors `struct deny_rl_config_t` in nhp_ebpf_xdp.c (two __u64
+// fields). The AC writes one shared copy (key 0) into the regular ARRAY
+// `deny_rl_config`; the per-CPU datapath reads it on every malformed-DENY
+// decision. Capacity == 0 disables the limiter (fail-open to always-emit) — the
+// zero value before the AC writes, so a load that skips the write keeps today's
+// behavior. cilium/ebpf marshals this native-endian, matching the kernel struct
+// on the same host.
+type DenyRlConfig struct {
+	Capacity     uint64
+	RefillPerSec uint64
+}
+
+// Default per-CPU DENY-telemetry rate-limit applied at eBPF load (#2849): up to
+// DefaultDenyRlCapacity tokens of burst, refilled at DefaultDenyRlRefillPerSec
+// tokens/sec, so a sustained malformed-packet flood is capped at ~refill
+// events/sec/CPU while an incident's first packets still log. Conservative
+// starting point; tunable at the E5 FilterMode flip with a single deny_rl_config
+// map write and NO object regen (the cap lives in a map, not a #define — eases
+// #2823). INERT until the flip (EbpfEngineLoad runs only under FilterMode=EBPFXDP).
+const (
+	DefaultDenyRlCapacity     uint64 = 1000
+	DefaultDenyRlRefillPerSec uint64 = 1000
+)
+
+// suppressedDenyEvents holds the latest cumulative count of malformed/early-drop
+// DENY events the in-kernel token bucket SHED, summed across CPUs by the monitor
+// goroutine. Distinct from lostPerfSamples (unintended perf-ring overflow): a
+// growing value here is the limiter working as designed under a flood. Exported
+// via SuppressedDenyEvents for metric wiring + tests.
+var suppressedDenyEvents atomic.Uint64
+
+// recordSuppressedDeny stores the latest cumulative suppressed-DENY total. The
+// in-kernel counter is itself cumulative (a per-CPU += that is never reset), so
+// the monitor reads + sums it and stores the snapshot here — a Store, not an Add
+// (contrast recordLostSamples, which accumulates per-read deltas).
+func recordSuppressedDeny(total uint64) {
+	suppressedDenyEvents.Store(total)
+}
+
+// SuppressedDenyEvents returns the latest cumulative count of DENY telemetry
+// events shed by the rate limiter across all CPUs since process start.
+func SuppressedDenyEvents() uint64 {
+	return suppressedDenyEvents.Load()
+}
+
+// sumPerCPUCounter sums the per-CPU values a PERCPU_ARRAY Lookup returns (one
+// entry per possible CPU). Build-tag-free so the summing is unit-tested without a
+// kernel.
+func sumPerCPUCounter(perCPU []uint64) uint64 {
+	var total uint64
+	for _, v := range perCPU {
+		total += v
+	}
+	return total
+}
+
 // EventV4 mirrors `struct event_t` in nhp/ebpf/xdp/nhp_ebpf_xdp.c EXACTLY (same
 // field order, packed, 24 bytes). It is the decode target of the IPv4 perf-event
 // reader: addresses are host-order uint32 (the wire __be32 decoded BigEndian →
