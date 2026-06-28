@@ -39,6 +39,11 @@ on:
       - "scripts/check-packer-failure-surfaced.sh"
       - "scripts/check-app-image-line-rendered.sh"
       - "scripts/check-golden-vectors.sh"
+      # The conformance-parity check's fixture test runs in this workflow (the
+      # script itself runs in qurl-v2-conformance-parity.yml, which needs a
+      # Go/Node toolchain). Watch the script so an edit re-fires its shellcheck +
+      # the fixture test here; the test file rides tests/scripts/** below.
+      - "scripts/check-conformance-parity.sh"
       # All cross-language golden-vector files are listed so a one-sided edit to
       # ANY of them fires the Go↔TS cross-check (scripts/check-golden-vectors.sh)
       # — including the Go-side files, which the path-scoped js-agent.yml never
@@ -327,6 +332,21 @@ jobs:
           shellcheck scripts/check-golden-vectors.sh tests/scripts/check-golden-vectors_test.sh
           bash tests/scripts/check-golden-vectors_test.sh
           bash scripts/check-golden-vectors.sh
+
+      # Fixture-test for the Go↔npm conformance-parity check's DECISION logic
+      # (#2855): identical→0, differing→1+DRIFT, missing-file→1. The real
+      # scripts/check-conformance-parity.sh resolves its two
+      # issuer_signature_vectors.json copies via `go mod download` + `npm ci`,
+      # so it needs a Go/Node toolchain and runs in its own workflow
+      # (qurl-v2-conformance-parity.yml). This pure-shell job only shellchecks
+      # both files and runs the network-free fixture test (which injects
+      # GO_VECTOR/NPM_VECTOR to bypass resolution), guarding the compare/exit
+      # logic against regressions here without a toolchain. Mirrors the
+      # golden-vectors test wiring above.
+      - name: Test conformance-parity decision logic (Go ↔ npm, #2855)
+        run: |
+          shellcheck scripts/check-conformance-parity.sh tests/scripts/check-conformance-parity_test.sh
+          bash tests/scripts/check-conformance-parity_test.sh
 
       # Structural fence for the qurl-service /internal/* public-ALB
       # lockdown body contract (PR #1635; rearchitected by #1645). The

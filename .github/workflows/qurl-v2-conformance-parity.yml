@@ -1,0 +1,75 @@
+# Enforces that the two NHP legs which BOTH consume the qURL issuer-signature
+# golden vectors pin a byte-IDENTICAL copy of that file:
+#   - the Go server reads github.com/layervai/qurl-conformance, pinned in
+#     endpoints/go.mod (go:embed of its vectors/);
+#   - the browser js-agent reads npm @layervai/qurl-conformance, pinned in
+#     endpoints/js-agent/package.json.
+# These are two independent pins in two ecosystems. They resolve to the same
+# issuer_signature_vectors.json today, but nothing else stops a future one-sided
+# bump from shipping two DIFFERENT signature contracts to the two halves of one
+# wire protocol. scripts/check-conformance-parity.sh sha256-compares the ACTUAL
+# bytes each side resolves and fails on drift. (This complements
+# scripts/check-golden-vectors.sh, which fences the hand-copied fingerprint/KDF
+# vectors but NOT the package-sourced issuer-signature file.)
+#
+# Why a dedicated workflow (vs. an existing job):
+#   - validate-workflows.yml fires only on PRs to main, so it would not gate a
+#     pin bump landing on qurl-v2; its golden-vector step is a fast pure-shell
+#     lint with no Go/Node toolchain.
+#   - js-agent.yml is path-scoped to endpoints/js-agent/**, so a Go-only
+#     (go.mod) bump would never trigger it.
+#   - qurl-v2-go-tests.yml is the `make test` job with no Node toolchain.
+# So this runs on PRs to BOTH qurl-v2 (gate the integration branch while the
+# pins can diverge) AND main (survive the qurl-v2 -> main merge), path-filtered
+# to just the pin/script/workflow files. Path-filtered => keep it NON-required
+# in branch protection (a required path-filtered check hangs "pending" forever
+# on PRs that don't touch these paths — see the note in js-agent.yml).
+name: qurl-v2 conformance parity
+
+on:
+  pull_request:
+    branches: [ "qurl-v2", "main" ]
+    paths:
+      - 'endpoints/go.mod'
+      - 'endpoints/js-agent/package.json'
+      - 'endpoints/js-agent/package-lock.json'
+      - 'scripts/check-conformance-parity.sh'
+      - '.github/workflows/qurl-v2-conformance-parity.yml'
+
+concurrency:
+  group: "qurl-v2-conformance-parity-${{ github.ref }}"
+  cancel-in-progress: true
+
+# Restrict default permissions for security.
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+    # go-version-file pins the toolchain to the endpoints module's own go.mod
+    # (matches qurl-v2-go-tests.yml). setup-go still warms the module cache by
+    # go.sum even though the parity script runs `go mod download` itself.
+    - name: Set up Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+      with:
+        go-version-file: endpoints/go.mod
+        cache-dependency-path: endpoints/go.sum
+
+    # Node 22 matches the js-agent toolchain pin (js-agent.yml). setup-node warms
+    # the npm cache even though the parity script runs `npm ci` itself.
+    - name: Set up Node
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: '22'
+        cache: npm
+        cache-dependency-path: endpoints/js-agent/package-lock.json
+
+    # Self-contained: the script does its own `go mod download` + `npm ci`, then
+    # sha256-compares the resolved bytes. Same command run locally and in CI.
+    - name: Check Go/npm conformance vector parity
+      run: bash scripts/check-conformance-parity.sh

@@ -418,6 +418,8 @@ lint-workflows:
 	@shellcheck scripts/check-golden-vectors.sh tests/scripts/check-golden-vectors_test.sh
 	@bash tests/scripts/check-golden-vectors_test.sh
 	@bash scripts/check-golden-vectors.sh
+	@shellcheck scripts/check-conformance-parity.sh tests/scripts/check-conformance-parity_test.sh
+	@bash tests/scripts/check-conformance-parity_test.sh
 	@bash scripts/check-lockdown-body-drift.sh
 	@bash scripts/check-frps-az-suffixes-validation-drift.sh
 	@bash tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh
