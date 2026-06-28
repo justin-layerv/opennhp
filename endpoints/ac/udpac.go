@@ -147,6 +147,19 @@ type UdpAC struct {
 	// surgical FlushConn-per-source-port drive could not be proven off a kernel
 	// rig. Only read when surgicalConnFlush != nil.
 	enumerateConnSrcPorts func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
+
+	// surgicalConnFlushV6 / enumerateConnSrcPortsV6 are the IPv6 twins of the
+	// two fields above (E2 slice 5). Bound to BpfFlusher.FlushConnV6 and
+	// utilebpf.EnumerateConnTrackSrcPortsV6 in the same EBPFXDP-on-Linux Start()
+	// block; nil otherwise. When both are non-nil, surgicalFlushFlowKey performs
+	// surgical conntrack teardown for v6 flows (closing the #2778 IPv6
+	// immediate-revocation gap on the eBPF/XDP path) instead of the v6 hard-fail;
+	// when either is nil (iptables mode, non-Linux, L3 disabled) it keeps the
+	// hard-fail fallback. Same func-field indirection rationale as the v4 fields:
+	// keeps revocation_index.go build-tag-free and lets a test inject fakes (the
+	// pinned conn_track_v6 map is absent off a kernel rig).
+	surgicalConnFlushV6     func(context.Context, ConnFlowKey) error
+	enumerateConnSrcPortsV6 func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
 }
 
 // BpfFlusherSkippedCount returns the BpfFlusher's non-IPv4 skip
@@ -316,6 +329,12 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			// needs. Bound here (not called directly) so a unit test can swap
 			// in a fake — the pinned conn_track map is absent off a kernel rig.
 			a.enumerateConnSrcPorts = ebpf.EnumerateConnTrackSrcPorts
+			// IPv6 twins (E2 slice 5): bind the v6 surgical seam to the same
+			// EBPFXDP-on-Linux BpfFlusher so a v6 revoke gets immediate
+			// conntrack teardown instead of the #2778 hard-fail. FlushConnV6
+			// mirrors FlushConn but targets the conn_track_v6 map.
+			a.surgicalConnFlushV6 = bf.FlushConnV6
+			a.enumerateConnSrcPortsV6 = ebpf.EnumerateConnTrackSrcPortsV6
 		}
 		a.expirySched = NewScheduler(flusher,
 			WithDryRun(a.config.L3FlushDryRun),
@@ -355,6 +374,8 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			a.bpfFlusherSkippedCount = nil
 			a.surgicalConnFlush = nil
 			a.enumerateConnSrcPorts = nil
+			a.surgicalConnFlushV6 = nil
+			a.enumerateConnSrcPortsV6 = nil
 			return fmt.Errorf("L3 flush boot enumeration: %w", err)
 		}
 	}

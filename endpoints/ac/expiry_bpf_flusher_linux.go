@@ -73,21 +73,37 @@ import (
 // lifetime; deferred to a follow-up (the same one that swaps
 // ConntrackFlusher to netlink batching).
 type BpfFlusher struct {
-	// metricSkipped counts non-IPv4 keys that reached this
-	// (IPv4-only) flusher and were silently no-op'd. Read via
-	// SkippedCount for observability — see the Flush godoc; this
-	// branch should be unreachable in production, so any non-zero
-	// reading indicates an upstream regression.
+	// metricSkipped counts wrong-address-family keys that reached the
+	// wrong flusher and were silently no-op'd. Read via SkippedCount
+	// for observability — see the Flush godoc; every increment is a
+	// should-never-happen defensive path, so any non-zero reading
+	// indicates an upstream regression.
 	//
-	// CONFLATION NOTE: this single counter is incremented by BOTH
-	// Flush (scheduled-expiry path — a v6 skip is a benign leak the
-	// kernel TTL closes) AND FlushConn (revocation path — a v6 skip is
-	// a FAILED REVOKE, the worse signal). An operator can't tell which
-	// fired from this counter alone. Splitting it into expiry-skip vs
-	// revoke-skip is folded into the P4e follow-up issue (#2778; P4e owns the
-	// revoke breaker/accounting that needs the distinct signal, and the
-	// metrics publisher that consumes this lives in registration.go,
-	// outside this slice's scope).
+	// CONFLATION NOTE — two orthogonal axes share this one counter:
+	//
+	//   1. expiry vs revocation: Flush (scheduled-expiry path — a skip
+	//      is a benign leak the kernel TTL closes) vs FlushConn /
+	//      FlushConnV6 (revocation path — a skip is a FAILED REVOKE, the
+	//      worse signal).
+	//   2. flush DIRECTION / address family: FlushConn skips a v6 key
+	//      that reached the IPv4-only flusher, while FlushConnV6 skips an
+	//      IPv4-mapped key that reached the IPv6-only flusher. Both are
+	//      "wrong-family key → wrong flusher" regressions; the cr for E2
+	//      s5 flagged that a future E5 watch might want per-direction
+	//      visibility.
+	//
+	// The counter alone cannot tell which axis/direction tripped, but
+	// each increment is paired with a distinct, direction-specific
+	// Warning log (the four call sites below each name their own flusher
+	// and key), so an operator can always recover the direction from the
+	// logs around a non-zero reading. Splitting the counter itself (per
+	// expiry/revoke and per family) is deferred to the P4e follow-up
+	// issue (#2778; P4e owns the revoke breaker/accounting that needs the
+	// distinct signal, and the metrics publisher that consumes this lives
+	// in registration.go, outside this slice's scope). Keeping it folded
+	// here is acceptable because the path is should-never-happen
+	// defensive in production — the upstream code routes v4 keys to the
+	// IPv4 flushers and v6 keys to the IPv6 flusher.
 	metricSkipped atomic.Uint64
 }
 
@@ -236,6 +252,38 @@ func (f *BpfFlusher) FlushConn(ctx context.Context, conn ConnFlowKey) error {
 	}
 
 	return utilebpf.DelEbpfConnTrackEntry(key.SrcIPString(), key.DstIPString(), proto, conn.SrcPort, key.DstPort)
+}
+
+// FlushConnV6 is the IPv6 twin of FlushConn (E2 slice 5): it surgically deletes
+// a single established v6 flow from the pinned conn_track_v6 map by its full
+// 5-tuple. Bound to a.surgicalConnFlushV6 in the same EBPFXDP-on-Linux Start()
+// block as FlushConn, it is what makes a v6 qURL revocation immediate instead of
+// the documented IPv6 immediate-revocation gap (#2778). The gate is INVERTED vs
+// FlushConn: this requires a real (non-IPv4-mapped) v6 key — a v4 key reaching
+// here is the upstream-regression case, surfaced the same observable way.
+func (f *BpfFlusher) FlushConnV6(ctx context.Context, conn ConnFlowKey) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key := conn.Flow
+
+	// Inverse of FlushConn's gate: the conn_track_v6 map keys on struct
+	// ipv6_ct_tuple (in6_addr addrs), so this targets v6 flows only. An
+	// IPv4-mapped key reaching here is an upstream regression (the caller routes
+	// v4 to FlushConn); surface it the same observable way FlushConn surfaces a
+	// leaked v6 key — count it and no-op rather than mis-key the v6 map.
+	if isIPv4Mapped(key.SrcIP) || isIPv4Mapped(key.DstIP) {
+		f.metricSkipped.Add(1)
+		log.Warning("[BpfFlusher] IPv4-mapped conn key %s reached the IPv6-only eBPF conntrack flusher — upstream regression? (silently no-op'd; tracked in metricSkipped)", conn)
+		return nil
+	}
+
+	proto, ok := key.Protocol.ianaL4Proto()
+	if !ok {
+		return fmt.Errorf("BpfFlusher.FlushConnV6: protocol %s for %s has no conntrack entry (only TCP/UDP do)", key.Protocol, conn)
+	}
+
+	return utilebpf.DelEbpfConnTrackEntryV6(key.SrcIPString(), key.DstIPString(), proto, conn.SrcPort, key.DstPort)
 }
 
 // isIPv4Mapped returns true if the [16]byte holds an IPv4-mapped

@@ -67,18 +67,30 @@ const ctValueSize = 40
 // graceful skip.
 func newTestConnTrackMap(t *testing.T) (*ebpf.Map, bool) {
 	t.Helper()
+	return newTestConnTrackMapSized(t, "p4c_ct_test", connTrackKeySize)
+}
+
+// newTestConnTrackMapSized is the shared core of newTestConnTrackMap and (in the
+// v6 test file) newTestConnTrackMapV6: it creates a real in-kernel LRU_HASH map
+// of the given conntrack key size and the address-family-independent
+// ctValueSize, carrying the single copy of the NHP_REQUIRE_BPF_TESTS loud-skip
+// guard so the v4 and v6 acceptance gates cannot drift (one regressing to a
+// silent t.Skip while the other stays a hard t.Fatal). Returns (nil, false) to
+// signal skip on hosts that can't create BPF maps.
+func newTestConnTrackMapSized(t *testing.T, name string, keySize uint32) (*ebpf.Map, bool) {
+	t.Helper()
 	m, err := ebpf.NewMap(&ebpf.MapSpec{
-		Name:       "p4c_ct_test",
+		Name:       name,
 		Type:       ebpf.LRUHash,
-		KeySize:    connTrackKeySize,
+		KeySize:    keySize,
 		ValueSize:  ctValueSize,
 		MaxEntries: 16,
 	})
 	if err != nil {
 		if os.Getenv("NHP_REQUIRE_BPF_TESTS") == "1" {
-			t.Fatalf("NHP_REQUIRE_BPF_TESTS=1 but BPF map creation failed — the P4c surgical-kill semantic proof cannot run on this runner, and a silent skip would pass the acceptance gate green. Fix runner BPF capability or unset the flag. err=%v", err)
+			t.Fatalf("NHP_REQUIRE_BPF_TESTS=1 but BPF map creation failed — the conntrack surgical-kill semantic proof cannot run on this runner, and a silent skip would pass the acceptance gate green. Fix runner BPF capability or unset the flag. err=%v", err)
 		}
-		t.Skipf("cannot create BPF map on this host (need CAP_BPF / privileged kernel); skipping real-map surgical test — the golden-bytes test covers key correctness, and NHP_REQUIRE_BPF_TESTS is unset. err=%v", err)
+		t.Skipf("cannot create BPF map on this host (need CAP_BPF / privileged kernel); skipping real-map surgical test — the golden-bytes/round-trip tests cover key correctness, and NHP_REQUIRE_BPF_TESTS is unset. err=%v", err)
 		return nil, false
 	}
 	return m, true

@@ -73,6 +73,9 @@ func TestApplyRevocation_IPTablesV6_HardFail(t *testing.T) {
 	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0 (no surgical path in iptables mode)", MetricRevocationSurgicalFlushed, got)
 	}
+	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+		t.Errorf("%s = %v, want 0 (no v6 surgical path in iptables mode)", MetricRevocationSurgicalFlushedV6, got)
+	}
 	// The coarse reschedule still ran (drain-once-feed-both), and the entry was
 	// torn out of tokenStore so a re-knock cannot extend it.
 	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
@@ -101,6 +104,9 @@ func TestFlushEntryNow_IPTablesV6_HardFail(t *testing.T) {
 	}
 	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0 (surgical seam unwired in iptables mode)", MetricRevocationSurgicalFlushed, got)
+	}
+	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+		t.Errorf("%s = %v, want 0 (v6 surgical seam unwired in iptables mode)", MetricRevocationSurgicalFlushedV6, got)
 	}
 	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (coarse path runs)", MetricRevocationFlushScheduled, got)

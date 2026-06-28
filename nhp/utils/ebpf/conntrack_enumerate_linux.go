@@ -147,3 +147,86 @@ func enumerateConnTrackSrcPortsOnMap(m *ebpf.Map, srcIPStr, dstIPStr string, pro
 	}
 	return sports, nil
 }
+
+// EnumerateConnTrackSrcPortsV6 is the IPv6 twin of EnumerateConnTrackSrcPorts
+// (E2 slice 5): it walks the pinned v6 conntrack map (PinPathConnTrackV6) and
+// returns the per-flow SOURCE PORTS of every entry matching the given allow-rule
+// tuple {srcIP, dstIP, protocol, dstPort} in the CT_DIR_INGRESS direction. The
+// v6 surgical-revocation path uses it to recover the source ports
+// DelEbpfConnTrackEntryV6 needs (the allow-rule FlowKey carries only
+// {src,dst,dport,proto}). Returns ErrConnTrackMapNotPinned (wrapped) when the
+// pin path is absent so the caller can fall back to the coarse path. Mirrors
+// EnumerateConnTrackSrcPorts's contract exactly.
+func EnumerateConnTrackSrcPortsV6(srcIPStr, dstIPStr string, protocol uint8, dstPort uint16) ([]uint16, error) {
+	m, err := ebpf.LoadPinnedMap(PinPathConnTrackV6, nil)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// %w wraps the sentinel so callers can errors.Is; underlying text
+			// folded in via %s (errorlint flags %v on an error). Mirrors the v4
+			// EnumerateConnTrackSrcPorts not-pinned handling.
+			return nil, fmt.Errorf("%w: %s: %s", ErrConnTrackMapNotPinned, PinPathConnTrackV6, err.Error())
+		}
+		return nil, fmt.Errorf("load pinned conn_track_v6: %w", err)
+	}
+	defer func() { _ = m.Close() }()
+	return enumerateConnTrackSrcPortsOnMapV6(m, srcIPStr, dstIPStr, protocol, dstPort)
+}
+
+// enumerateConnTrackSrcPortsOnMapV6 is the map-handle-injectable core of
+// EnumerateConnTrackSrcPortsV6: it iterates the supplied v6 conntrack-shaped
+// map, decodes each key via connTrackKeyV6FromBytes (the exact inverse of
+// ToCtKeyV6), and collects the SOURCE PORTS of entries whose
+// {daddr,saddr,dport,nexthdr} match the target allow-rule tuple in the
+// CT_DIR_INGRESS direction. Mirrors enumerateConnTrackSrcPortsOnMap.
+func enumerateConnTrackSrcPortsOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, protocol uint8, dstPort uint16) ([]uint16, error) {
+	srcIP, err := parseIP6(srcIPStr)
+	if err != nil {
+		return nil, err
+	}
+	dstIP, err := parseIP6(dstIPStr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate the loaded map's key dimension against the packed v6 conntrack key
+	// size (the #2818 size-drift class): a kernel struct-layout change or the
+	// wrong map pinned here would let the iterator yield bytes that
+	// connTrackKeyV6FromBytes mis-decodes into bogus source ports. The value size
+	// is read (not asserted to a fixed const — the kernel conn_value layout is
+	// owned by the XDP program) but bounded so a wrong map can't force a
+	// pathological per-iteration allocation.
+	info, err := m.Info()
+	if err != nil {
+		return nil, fmt.Errorf("conn_track_v6 map info: %w", err)
+	}
+	if int(info.KeySize) != connTrackKeyV6Size {
+		return nil, fmt.Errorf("conn_track_v6 map key size %d, want %d (packed ipv6_ct_tuple) — wrong map pinned at %s?", info.KeySize, connTrackKeyV6Size, PinPathConnTrackV6)
+	}
+	if info.ValueSize == 0 || int(info.ValueSize) > connTrackValueSizeMax {
+		return nil, fmt.Errorf("conn_track_v6 map value size %d out of range (1..%d) — wrong map pinned at %s?", info.ValueSize, connTrackValueSizeMax, PinPathConnTrackV6)
+	}
+
+	keyBytes := make([]byte, connTrackKeyV6Size)
+	valBytes := make([]byte, info.ValueSize) // value discarded; only the key carries the 5-tuple
+	var sports []uint16
+
+	iter := m.Iterate()
+	for iter.Next(&keyBytes, &valBytes) {
+		key, derr := connTrackKeyV6FromBytes(keyBytes)
+		if derr != nil {
+			// A decode error from a map we already size-validated means a
+			// kernel/layout regression — fail loud rather than skip.
+			return nil, fmt.Errorf("decode conn_track_v6 key: %w", derr)
+		}
+		if key.Flags != ctDirIngress {
+			continue
+		}
+		if key.SrcIP == srcIP && key.DstIP == dstIP && key.DstPort == dstPort && key.NextHdr == protocol {
+			sports = append(sports, key.SrcPort)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("iterate conn_track_v6: %w", err)
+	}
+	return sports, nil
+}

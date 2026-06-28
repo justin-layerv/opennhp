@@ -18,3 +18,10 @@ var ErrConnTrackMapNotPinned = errors.New("conn_track bpf map not pinned")
 func EnumerateConnTrackSrcPorts(_, _ string, _ uint8, _ uint16) ([]uint16, error) {
 	return nil, errors.New("EnumerateConnTrackSrcPorts: conntrack enumeration requires Linux")
 }
+
+// EnumerateConnTrackSrcPortsV6 is the non-Linux build stub for the IPv6
+// conntrack source-port enumeration primitive (E2 slice 5). Hard error,
+// symmetric to EnumerateConnTrackSrcPorts's stub.
+func EnumerateConnTrackSrcPortsV6(_, _ string, _ uint8, _ uint16) ([]uint16, error) {
+	return nil, errors.New("EnumerateConnTrackSrcPortsV6: conntrack enumeration requires Linux")
+}

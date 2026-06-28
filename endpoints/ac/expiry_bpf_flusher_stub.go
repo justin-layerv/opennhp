@@ -37,6 +37,12 @@ func (f *BpfFlusher) FlushConn(_ context.Context, _ ConnFlowKey) error {
 	return errors.New("BpfFlusher.FlushConn: not supported on this platform")
 }
 
+// FlushConnV6 is the non-Linux stub for the IPv6 surgical conntrack-teardown
+// primitive (E2 slice 5). Hard error, symmetric to FlushConn's stub.
+func (f *BpfFlusher) FlushConnV6(_ context.Context, _ ConnFlowKey) error {
+	return errors.New("BpfFlusher.FlushConnV6: not supported on this platform")
+}
+
 // SkippedCount is the cross-platform symmetry stub for the Linux
 // implementation's non-IPv4 skip counter. Returns 0 on non-Linux —
 // the production AC never executes this path; the stub exists so

@@ -382,6 +382,31 @@ func (r *connTrackKeyV6) ToCtKeyV6() []byte {
 	return keyBytes
 }
 
+// connTrackKeyV6FromBytes is the EXACT inverse of ToCtKeyV6 (E2 slice 5): it
+// decodes the 38 packed bytes of a kernel `struct ipv6_ct_tuple` map key back
+// into a connTrackKeyV6. The v6 conntrack-enumeration path walks the pinned
+// conn_track_v6 map and recovers each entry's per-flow SOURCE PORT — the
+// surgical discriminator — from the raw key bytes the BPF iterator yields. A
+// wrong offset here silently decodes the wrong source port, enumeration filters
+// the target out, and the "surgical" v6 revoke degrades to coarse over-flush.
+// Matched pair with ToCtKeyV6 (fenced by the round-trip test); change one,
+// change the other. Errors on a wrong-length buffer rather than decoding
+// out-of-bounds garbage (a short/long key means the wrong map was pinned or the
+// kernel struct changed — fail loud).
+func connTrackKeyV6FromBytes(buf []byte) (connTrackKeyV6, error) {
+	if len(buf) != connTrackKeyV6Size {
+		return connTrackKeyV6{}, fmt.Errorf("conntrack v6 key length %d, want %d (packed ipv6_ct_tuple)", len(buf), connTrackKeyV6Size)
+	}
+	var k connTrackKeyV6
+	copy(k.DstIP[:], buf[0:16])
+	copy(k.SrcIP[:], buf[16:32])
+	k.DstPort = binary.BigEndian.Uint16(buf[32:34])
+	k.SrcPort = binary.BigEndian.Uint16(buf[34:36])
+	k.NextHdr = buf[36]
+	k.Flags = buf[37]
+	return k, nil
+}
+
 type whitelistValue struct {
 	Allowed    uint8
 	_          [7]byte
@@ -446,6 +471,15 @@ const (
 	// conn_track 5-tuple entry directly — see DelEbpfConnTrackEntry and
 	// docs/design/QURL_V2_KEYED_IDENTITY.md -> "Flow granularity caveat".
 	PinPathConnTrack = "/sys/fs/bpf/conn_track"
+
+	// PinPathConnTrackV6 is the IPv6 twin of PinPathConnTrack, for the
+	// `conn_track_v6` map the XDP program declares with LIBBPF_PIN_BY_NAME
+	// (nhp/ebpf/xdp/nhp_ebpf_xdp.c). It is the surgical-revocation primitive's
+	// pin path for v6 established flows (E2 slice 5): EnumerateConnTrackSrcPortsV6
+	// + DelEbpfConnTrackEntryV6 open it. Like the v4 path it must stay
+	// byte-identical to the C map's SEC(".maps") name — a typo here opens the
+	// wrong path and a v6 surgical delete silently lands nowhere (ENOENT → no-op).
+	PinPathConnTrackV6 = "/sys/fs/bpf/conn_track_v6"
 )
 
 // IPv6 pinned-map filesystem paths (E2 slice 4). One-for-one mirror of the v4
@@ -1333,6 +1367,63 @@ func delEbpfConnTrackOnMap(m *ebpf.Map, srcIPStr, dstIPStr string, protocol uint
 	}
 	if err := m.Delete(key.ToCtKey()); err != nil && !isEbpfNoEntry(err) {
 		return fmt.Errorf("delete from conn_track: %w", err)
+	}
+	return nil
+}
+
+// DelEbpfConnTrackEntryV6 is the IPv6 twin of DelEbpfConnTrackEntry (E2 slice
+// 5): it deletes a single established v6 flow from the pinned conn_track_v6 map
+// (PinPathConnTrackV6) by its full 5-tuple, including the per-flow source port.
+// This is the v6 surgical-revocation primitive — deleting the conntrack entry by
+// 5-tuple tears down EXACTLY the target flow and leaves a sibling flow on the
+// same allow-rule tuple (different source port) untouched, and forces the next
+// packet back through the (also-removed) allow-rule path → XDP_DROP. Idempotent
+// on no-match (ENOENT → nil): kernel GC or a concurrent flush may have removed
+// the entry first. Mirrors DelEbpfConnTrackEntry's contract exactly.
+//
+// TEARDOWN-COMPLETENESS ASSUMPTION (code-verified against nhp/ebpf/xdp/
+// nhp_ebpf_xdp.c, must be re-checked if the v6 datapath changes — same as the v4
+// assumption in DelEbpfConnTrackEntry's godoc): there is exactly ONE
+// conn_track_v6 entry per flow, inserted by xdp_white_prog_v6 in the
+// CT_DIR_INGRESS orientation (it reverseTuple_v6's its working tuple back to the
+// forward/ingress form before conntrack population — see the "restore forward
+// tuple" comment there). tc_egress.c does NOT touch conn_track_v6. So deleting
+// the single ingress-oriented entry (Flags=ctDirIngress) is sufficient; there is
+// no reversed/egress v6 conntrack entry left behind.
+func DelEbpfConnTrackEntryV6(srcIPStr, dstIPStr string, protocol uint8, srcPort, dstPort uint16) error {
+	m, err := ebpf.LoadPinnedMap(PinPathConnTrackV6, nil)
+	if err != nil {
+		return fmt.Errorf("load pinned conn_track_v6: %w", err)
+	}
+	defer func() { _ = m.Close() }()
+	return delEbpfConnTrackOnMapV6(m, srcIPStr, dstIPStr, protocol, srcPort, dstPort)
+}
+
+// delEbpfConnTrackOnMapV6 is the map-handle-injectable core of
+// DelEbpfConnTrackEntryV6: it builds the v6 conntrack 5-tuple key and issues the
+// idempotent Delete against the supplied map. Splitting the pinned-map open out
+// lets the surgical-revocation behavior be tested against a real in-test
+// ebpf.Map of the v6 conntrack shape (no /sys/fs/bpf pin required). Mirrors
+// delEbpfConnTrackOnMap.
+func delEbpfConnTrackOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, protocol uint8, srcPort, dstPort uint16) error {
+	srcIP, err := parseIP6(srcIPStr)
+	if err != nil {
+		return err
+	}
+	dstIP, err := parseIP6(dstIPStr)
+	if err != nil {
+		return err
+	}
+	key := &connTrackKeyV6{
+		DstIP:   dstIP,
+		SrcIP:   srcIP,
+		DstPort: dstPort,
+		SrcPort: srcPort,
+		NextHdr: protocol,
+		Flags:   ctDirIngress,
+	}
+	if err := m.Delete(key.ToCtKeyV6()); err != nil && !isEbpfNoEntry(err) {
+		return fmt.Errorf("delete from conn_track_v6: %w", err)
 	}
 	return nil
 }

@@ -24,16 +24,23 @@ import (
 // FlushConn-per-source-port drive could never be observed off a kernel rig.
 
 // fakeSurgicalFlusher records the ConnFlowKeys passed to FlushConn so a test can
-// assert which exact 5-tuples were surgically torn down.
+// assert which exact 5-tuples were surgically torn down. errFor, if set, lets a
+// test make a specific 5-tuple's flush fail (modeling a real non-ENOENT Delete
+// error) while the others succeed — the call is still recorded so the test can
+// prove every sibling was attempted.
 type fakeSurgicalFlusher struct {
 	mu      sync.Mutex
 	flushed []ConnFlowKey
+	errFor  func(ConnFlowKey) error
 }
 
 func (f *fakeSurgicalFlusher) flushConn(_ context.Context, conn ConnFlowKey) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.flushed = append(f.flushed, conn)
+	if f.errFor != nil {
+		return f.errFor(conn)
+	}
 	return nil
 }
 
@@ -142,15 +149,18 @@ func TestFlushEntryNow_Surgical_KillsEachSibling(t *testing.T) {
 	}
 }
 
-// TestFlushEntryNow_IPv6_HardFailNoSurgical proves the #2778 contract: a v6
-// FlowKey under the EBPFXDP surgical path is NOT enumerated or FlushConn'd
-// (conn_track is v4-only), increments MetricRevocationIPv6HardFail, and is NOT
-// silently treated as killed. The coarse path still runs (the only — futile, on
-// v6 — thing available), observable via MetricRevocationFlushScheduled.
+// TestFlushEntryNow_IPv6_HardFailNoSurgical proves the #2778 contract when only
+// the v4 surgical seam is wired (newSurgicalTestAC leaves the v6 seam nil, as on
+// a v4-only EBPFXDP build / non-Linux): a v6 FlowKey is NOT routed through the
+// v4 enumerator, increments MetricRevocationIPv6HardFail, and is NOT silently
+// treated as killed. The coarse path still runs (the only — futile, on v6 —
+// thing available), observable via MetricRevocationFlushScheduled. (When the v6
+// seam IS wired, surgicalFlushFlowKeyV6 instead surgically tears the v6 flow
+// down — see revocation_surgical_v6_test.go.)
 func TestFlushEntryNow_IPv6_HardFailNoSurgical(t *testing.T) {
 	enumerateCalled := false
 	enumerate := func(s, d string, proto uint8, dp uint16) ([]uint16, error) {
-		enumerateCalled = true // must NOT happen for v6
+		enumerateCalled = true // the v4 enumerator must NOT be called for a v6 key
 		return nil, nil
 	}
 	a, fsf := newSurgicalTestAC(t, enumerate)
@@ -165,7 +175,7 @@ func TestFlushEntryNow_IPv6_HardFailNoSurgical(t *testing.T) {
 	a.flushEntryNow(entry)
 
 	if enumerateCalled {
-		t.Error("enumerator was called for an IPv6 flow — v6 must hard-fail BEFORE enumeration (conn_track is v4-only)")
+		t.Error("v4 enumerator was called for an IPv6 flow — with the v6 seam unwired, a v6 key must hard-fail without touching the v4 conntrack path")
 	}
 	if n := len(fsf.snapshot()); n != 0 {
 		t.Errorf("FlushConn called %d times for an IPv6 flow, want 0", n)
@@ -175,6 +185,9 @@ func TestFlushEntryNow_IPv6_HardFailNoSurgical(t *testing.T) {
 	}
 	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0 (no surgical teardown is possible for v6)", MetricRevocationSurgicalFlushed, got)
+	}
+	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+		t.Errorf("%s = %v, want 0 (v6 seam unwired → hard-fail, nothing flushed)", MetricRevocationSurgicalFlushedV6, got)
 	}
 	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (coarse path still runs)", MetricRevocationFlushScheduled, got)

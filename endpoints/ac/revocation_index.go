@@ -470,8 +470,9 @@ func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 		switch {
 		case surgicalAvailable:
 			// SURGICAL: kill established flows on this tuple without over-flushing
-			// siblings. Only when the eBPF/XDP+IPv4 path is wired. v6 keys hard-fail
-			// inside surgicalFlushFlowKey.
+			// siblings. Only when the eBPF/XDP path is wired. surgicalFlushFlowKey
+			// dispatches v4 inline and v6 to surgicalFlushFlowKeyV6 (which is itself
+			// surgical when the v6 seam is wired, else hard-fails — #2778).
 			a.surgicalFlushFlowKey(ctx, key)
 		case iptablesMode && !isFlowKeyIPv4(key):
 			// v6 under iptables: the coarse RescheduleEarlier above just handed this
@@ -496,10 +497,8 @@ func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 // Per-key decision tree (the order matters for getting the v6 metric right —
 // see the IPv6 note on flushEntryNow):
 //
-//   - IPv6 key → MetricRevocationIPv6HardFail and RETURN. conn_track is v4-only;
-//     there is no entry to enumerate or delete, and the coarse allow-rule flush
-//     (also v4-only) won't drop it either — the flow dies at kernel TTL. This is
-//     an explicit hard-fail, NOT a silent success.
+//   - IPv6 key → surgicalFlushFlowKeyV6 (see its godoc for the wired-surgical /
+//     unwired-hard-fail decision tree). #2778.
 //   - IPv4 + ICMP / "any" → no conntrack entry exists by design (the XDP
 //     established-flow short-circuit is port-keyed), so there is nothing to
 //     surgically tear down; the coarse allow-rule teardown already done in
@@ -513,10 +512,19 @@ func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 // logged (best-effort: the coarse path already fired; revoke must not be taken
 // down by an enumeration hiccup) but does not panic.
 func (a *UdpAC) surgicalFlushFlowKey(ctx context.Context, key FlowKey) {
+	// isFlowKeyIPv4 is the AND of both endpoints, so a (malformed) MIXED-family
+	// key — one IPv4-mapped endpoint and one real v6 endpoint — is NOT v4 and
+	// routes to the v6 path below. MakeFlowKey only ever produces all-v4 or
+	// all-v6 keys, so a mixed key is unreachable in practice; but if one arose it
+	// is NOT silently treated as torn down: surgicalFlushFlowKeyV6 calls the v6
+	// enumerator, whose parseIP6 rejects the v4-mapped endpoint (rendered as a
+	// dotted quad), yielding a non-not-pinned error → the enumeration-error
+	// hard-fail branch (MetricRevocationIPv6HardFail) when conn_track_v6 is
+	// pinned, or the benign soft fallback when it is not. Either way it surfaces,
+	// never a silent success. (Defensive note for a corner the type system does
+	// not forbid; no dedicated metric since it cannot occur via MakeFlowKey.)
 	if !isFlowKeyIPv4(key) {
-		// v6 under EBPFXDP: no surgical path, coarse path is v4-only too.
-		a.incrMetric(MetricRevocationIPv6HardFail)
-		log.Warning("[Revocation] IPv6 flow %s under eBPF/XDP has no surgical conntrack teardown (conn_track is IPv4-only); flow will persist until kernel TTL (#2778)", key)
+		a.surgicalFlushFlowKeyV6(ctx, key)
 		return
 	}
 	proto, ok := key.Protocol.ianaL4Proto()
@@ -554,6 +562,99 @@ func (a *UdpAC) surgicalFlushFlowKey(ctx context.Context, key FlowKey) {
 			continue
 		}
 		a.incrMetric(MetricRevocationSurgicalFlushed)
+	}
+}
+
+// surgicalFlushFlowKeyV6 is the IPv6 twin of surgicalFlushFlowKey's v4 body: it
+// enumerates the live conn_track_v6 5-tuples sharing the given v6 allow-rule
+// FlowKey and surgically FlushConnV6's each, closing the #2778 IPv6
+// immediate-revocation gap on the eBPF/XDP path. Only the v6 seam is read here;
+// the caller has already established key is v6.
+//
+// The decision tree mirrors the v4 path exactly, with one deliberate asymmetry
+// on the enumeration-error branch (see below). The PROTO check precedes the
+// seam-nil check (the inverse of an earlier ordering) so that an ICMP/"any" key
+// — which never has a conn_track_v6 entry — short-circuits to a no-op before the
+// seam-nil hard-fail, regardless of whether the seam is wired. Ordering them the
+// other way over-counted MetricRevocationIPv6HardFail for unwired-seam ICMP keys
+// (a "gap" for a protocol that never had a conntrack entry to leak):
+//
+//   - ICMP / "any" → no conn_track_v6 entry exists by design (the XDP
+//     established-flow short-circuit is port-keyed); coarse allow-rule teardown
+//     suffices. No hard-fail, wired seam or not.
+//   - TCP/UDP + v6 seam NOT wired (enumerateConnSrcPortsV6 == nil ||
+//     surgicalConnFlushV6 == nil) → MetricRevocationIPv6HardFail and RETURN.
+//     This is the iptables / non-Linux / L3-disabled fallback: there is no
+//     conn_track_v6 to enumerate and the coarse allow-rule flush is v4-only, so
+//     the flow dies at kernel TTL — an explicit hard-fail, NOT a silent success.
+//     (#2778 eBPF path; #2794 covers the iptables-mode v6 path separately.)
+//   - TCP/UDP + seam wired → enumerate conn_track_v6 source ports and
+//     FlushConnV6 each 5-tuple, ticking MetricRevocationSurgicalFlushedV6 per
+//     flow (the v6-specific counter, NOT the shared v4 one).
+//
+// Enumeration "map not pinned" (XDP not attached at the v6 pin) is a soft
+// fallback: the coarse allow-rule reschedule already ran — log at debug and
+// return. ASYMMETRY vs the v4 path: any OTHER enumeration error ticks
+// MetricRevocationIPv6HardFail (in addition to a best-effort log), because for
+// v6 there is no working coarse fallback — an enumeration failure means the v6
+// flow genuinely has no immediate teardown, which is exactly what the hard-fail
+// metric exists to surface. The v4 path only logs because its coarse allow-rule
+// reschedule still tears the v4 flow down.
+//
+// The same asymmetry applies PER FLOW inside the loop: a FlushConnV6 that
+// returns a real (non-ENOENT) error left that specific 5-tuple alive with no
+// coarse fallback, so it ALSO ticks MetricRevocationIPv6HardFail (then continues
+// so one failed delete does not abort the surviving siblings). The v4 loop only
+// logs there, since its coarse allow-rule flush still bars re-open.
+func (a *UdpAC) surgicalFlushFlowKeyV6(ctx context.Context, key FlowKey) {
+	proto, ok := key.Protocol.ianaL4Proto()
+	if !ok {
+		// ICMP / "any": no conn_track_v6 entry exists by design (the XDP
+		// established-flow short-circuit is port-keyed), so there is nothing to
+		// surgically tear down REGARDLESS of whether the v6 seam is wired — a
+		// wired seam would no-op here too. Return before the seam-nil hard-fail
+		// so an unwired-seam v6 ICMP key is NOT counted as an
+		// immediate-revocation gap (it never had a conntrack entry to leak). The
+		// coarse allow-rule teardown already ran in flushEntryNow.
+		return
+	}
+	if a.enumerateConnSrcPortsV6 == nil || a.surgicalConnFlushV6 == nil {
+		// v6 seam not wired AND this is a TCP/UDP key that DOES have a
+		// conn_track_v6 entry: no surgical path, coarse path is v4-only too, so
+		// the flow genuinely leaks. This is the iptables / non-Linux / L3-disabled
+		// fallback — an explicit hard-fail, NOT a silent success.
+		a.incrMetric(MetricRevocationIPv6HardFail)
+		log.Warning("[Revocation] IPv6 flow %s has no surgical conntrack teardown (eBPF/XDP v6 seam not wired — iptables mode or non-Linux); flow will persist until kernel TTL (#2778/#2794)", key)
+		return
+	}
+	sports, err := a.enumerateConnSrcPortsV6(key.SrcIPString(), key.DstIPString(), proto, key.DstPort)
+	if err != nil {
+		if errors.Is(err, utilebpf.ErrConnTrackMapNotPinned) {
+			// conn_track_v6 not pinned at its path — feature inert. The coarse
+			// reschedule already ran; nothing else to do.
+			log.Debug("[Revocation] conn_track_v6 not pinned, surgical flush skipped for %s: %v", key, err)
+			return
+		}
+		// No working coarse fallback for v6 → this IS an immediate-revocation
+		// gap; surface it on the hard-fail metric (asymmetry vs v4, see godoc).
+		a.incrMetric(MetricRevocationIPv6HardFail)
+		log.Error("[Revocation] conn_track_v6 enumeration failed for %s; v6 flow has no immediate teardown (#2778): %v", key, err)
+		return
+	}
+	for _, sport := range sports {
+		conn := ConnFlowKey{Flow: key, SrcPort: sport}
+		if ferr := a.surgicalConnFlushV6(ctx, conn); ferr != nil {
+			// FlushConnV6 is idempotent on ENOENT (returns nil), so a non-nil
+			// error is a REAL teardown failure on THIS 5-tuple — a per-flow
+			// immediate-revocation gap (no coarse fallback for v6; see godoc), so
+			// tick the hard-fail metric per failed flow. Then continue: one port's
+			// delete failing must not abort the remaining siblings' flushes.
+			a.incrMetric(MetricRevocationIPv6HardFail)
+			log.Error("[Revocation] surgical FlushConnV6 failed for %s; v6 flow has no immediate teardown (#2778): %v", conn, ferr)
+			continue
+		}
+		// v6-specific counter, NOT the shared v4 one (see metric godoc).
+		a.incrMetric(MetricRevocationSurgicalFlushedV6)
 	}
 }
 

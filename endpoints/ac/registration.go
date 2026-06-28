@@ -491,35 +491,60 @@ const (
 	//     producer bug or a malformed/forged event worth alarming on rather than
 	//     leaving only in logs — distinct from the benign StaleDropped rate.
 	//   - MetricRevocationSurgicalFlushed — incremented once per established
-	//     conntrack flow surgically torn down by FlushConn on the eBPF/XDP+IPv4
-	//     revocation path (P4e slice 5). This is the per-FLOW analog of the
-	//     per-ENTRY EntriesFlushed: one revoked AccessEntry can have multiple
-	//     live 5-tuples (one per source port / client behind a NAT), each killed
-	//     individually so same-allow-tuple siblings survive. A zero count while
-	//     EntriesFlushed is nonzero means the revoked entries had no live
+	//     IPv4 conntrack flow surgically torn down by FlushConn on the
+	//     eBPF/XDP+IPv4 revocation path (P4e slice 5). This is the per-FLOW analog
+	//     of the per-ENTRY EntriesFlushed: one revoked AccessEntry can have
+	//     multiple live 5-tuples (one per source port / client behind a NAT), each
+	//     killed individually so same-allow-tuple siblings survive. A zero count
+	//     while EntriesFlushed is nonzero means the revoked entries had no live
 	//     established flows (only quiet/new pinholes) — expected, not an error.
-	//   - MetricRevocationIPv6HardFail — incremented once per IPv6 FlowKey a
-	//     revoke could NOT immediately tear down, in BOTH filter modes (#2794):
-	//     under EBPFXDP the surgical path can't address it (conn_track is
-	//     IPv4-only, struct ipv4_ct_tuple) and the eBPF allow-rule maps are
-	//     v4-only too; under FilterMode_IPTABLES the coarse reschedule hands the
-	//     v6 key to the `conntrack -D` flusher, which is IPv4-only (no
-	//     `-f ipv6`) and rejects it at its boundary (the netlink CTA_FILTER
-	//     replacement that would be v6-capable is #2165, UNbuilt). Either way the
-	//     v6 flow survives the revoke until kernel TTL — v6 immediate revoke is
-	//     a DECLARED out-of-scope gap (see the gospel Filter-mode/IPv6 caveat).
+	//     IPv6 surgical teardown is counted separately on
+	//     MetricRevocationSurgicalFlushedV6 (this counter is IPv4-only).
+	//   - MetricRevocationSurgicalFlushedV6 — the IPv6 twin of
+	//     MetricRevocationSurgicalFlushed (same per-flow semantics, same
+	//     zero-while-EntriesFlushed-nonzero reading): incremented once per
+	//     established conn_track_v6 flow surgically torn down by FlushConnV6 on
+	//     the eBPF/XDP+IPv6 revocation path (E2 slice 5). Split by address family
+	//     rather than folded into the v4 counter because the v6 datapath is the
+	//     newly-activated path operators most need to watch during the E5
+	//     FilterMode flip, and a shared counter would mask whether v6 surgical
+	//     teardown is firing at all. Mirrors the per-family split already used by
+	//     MetricRevocationIPv6HardFail.
+	//   - MetricRevocationIPv6HardFail — incremented for an IPv6 flow a revoke
+	//     could NOT immediately tear down, in BOTH filter modes (#2794): under
+	//     EBPFXDP the surgical path can't address it (conn_track is IPv4-only,
+	//     struct ipv4_ct_tuple) and the eBPF allow-rule maps are v4-only too;
+	//     under FilterMode_IPTABLES the coarse reschedule hands the v6 key to the
+	//     `conntrack -D` flusher, which is IPv4-only (no `-f ipv6`) and rejects it
+	//     at its boundary (the netlink CTA_FILTER replacement that would be
+	//     v6-capable is #2165, UNbuilt). Either way the v6 flow survives the
+	//     revoke until kernel TTL — v6 immediate revoke is a DECLARED out-of-scope
+	//     gap (see the gospel Filter-mode/IPv6 caveat).
+	//
+	//     GRANULARITY: ticked once per IPv6 FlowKey when the WHOLE key has no
+	//     teardown path (the iptables branch, the eBPF v6-seam-unwired branch, or
+	//     a v6 conntrack ENUMERATION error — none of which addresses any flow on
+	//     the tuple), AND once per FLOW for a per-port FlushConnV6 that fails on a
+	//     wired-but-pinned v6 map (enumeration succeeded but THAT 5-tuple's delete
+	//     genuinely failed — symmetric to the per-flow MetricRevocationSurgicalFlushedV6
+	//     success counter, since each failed delete is one real leaked flow). A
+	//     single revoked entry with N live flows can therefore contribute up to N
+	//     here if every per-flow delete fails. Both cases are real
+	//     immediate-revocation gaps on the SAME metric by design.
+	//
 	//     flushEntryNow ticks this directly (eBPF via surgicalFlushFlowKey,
 	//     iptables via its explicit FilterMode_IPTABLES branch) so the signal is
 	//     revocation-specific and NOT conflated with the benign per-flusher skip
 	//     counters (BpfFlusherSkippedCount / ConntrackFlusher metricSkipped) that
 	//     track scheduled-expiry v6 leaks. ANY nonzero reading is a real
 	//     immediate-revocation gap worth alarming on (#2778).
-	MetricRevocationStaleDropped    = "RevocationStaleDropped"
-	MetricRevocationEntriesFlushed  = "RevocationEntriesFlushed"
-	MetricRevocationFlushScheduled  = "RevocationFlushScheduled"
-	MetricRevocationRejected        = "RevocationRejected"
-	MetricRevocationSurgicalFlushed = "RevocationSurgicalFlushed"
-	MetricRevocationIPv6HardFail    = "RevocationIPv6HardFail"
+	MetricRevocationStaleDropped      = "RevocationStaleDropped"
+	MetricRevocationEntriesFlushed    = "RevocationEntriesFlushed"
+	MetricRevocationFlushScheduled    = "RevocationFlushScheduled"
+	MetricRevocationRejected          = "RevocationRejected"
+	MetricRevocationSurgicalFlushed   = "RevocationSurgicalFlushed"
+	MetricRevocationSurgicalFlushedV6 = "RevocationSurgicalFlushedV6"
+	MetricRevocationIPv6HardFail      = "RevocationIPv6HardFail"
 	// MetricRevocationAckSent counts NHP_RACK acks the AC enqueued to the server
 	// after processing a validated NHP_REV (proof-of-delivery, P4e Slice 3
 	// #2793). One per validated NHP_REV regardless of flush count (the ack is a

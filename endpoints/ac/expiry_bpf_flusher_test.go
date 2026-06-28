@@ -128,6 +128,93 @@ func TestBpfFlusher_FlushConn_CanceledCtx(t *testing.T) {
 	}
 }
 
+// TestBpfFlusher_FlushConnV6_V4Mapped_NoOp is the v6 twin of
+// TestBpfFlusher_FlushConn_NonIPv4_NoOp, fencing FlushConnV6's INVERTED family
+// gate — the load-bearing new logic of E2 s5. FlushConn skips a v6 key; FlushConnV6
+// skips an IPv4-MAPPED key (the caller routes v4 to FlushConn). If this gate were
+// ever written non-inverted (a copy-paste of FlushConn's `!isIPv4Mapped`), a real
+// v6 key would be silently skipped and never torn down — a silent revocation
+// failure that every AC-level wiring test would still pass, since they all inject a
+// fake surgicalConnFlushV6 and never run this real gate. So a v4-mapped key must
+// return nil and bump the skip counter WITHOUT attempting LoadPinnedMap. Runs on
+// any Linux host because the guard returns before any kernel call.
+func TestBpfFlusher_FlushConnV6_V4Mapped_NoOp(t *testing.T) {
+	f := &BpfFlusher{}
+	// An all-IPv4 key (rendered IPv4-mapped in [16]byte) reaching the v6-only
+	// flusher is the inverted-gate skip case.
+	k, err := MakeFlowKey("192.0.2.1", "192.0.2.2", 443, FlowProtoTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := ConnFlowKey{Flow: k, SrcPort: 43210}
+	if err := f.FlushConnV6(context.Background(), conn); err != nil {
+		t.Errorf("FlushConnV6 on v4-mapped key: got err %v, want nil (should short-circuit before LoadPinnedMap)", err)
+	}
+	if got := f.SkippedCount(); got != 1 {
+		t.Errorf("SkippedCount after 1 v4-mapped FlushConnV6: got %d want 1", got)
+	}
+	// Regression catch for a non-inverted gate: a genuine v6 key must NOT be
+	// skipped — it must fall through the gate to the proto switch. Use a FRESH
+	// flusher and assert the skip counter stays 0, so a non-inverted gate (which
+	// would skip the v6 key) moves it 0→1 and trips this assertion. (Reusing the
+	// flusher above would make the post-call count 1 under BOTH the correct gate
+	// and the inverted gate — a dud assertion.) We assert only on the skip
+	// counter, never the call's error, so this holds with or without a loaded
+	// kernel map (the real v6 delete fails here, but that is not what we test).
+	v6, err := MakeFlowKey("2001:db8::1", "2001:db8::2", 443, FlowProtoTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := &BpfFlusher{}
+	_ = fresh.FlushConnV6(context.Background(), ConnFlowKey{Flow: v6, SrcPort: 43210})
+	if got := fresh.SkippedCount(); got != 0 {
+		t.Errorf("SkippedCount after a genuine v6 FlushConnV6: got %d want 0 (a v6 key must pass the gate, not be skipped — a non-inverted gate would skip it and read 1)", got)
+	}
+}
+
+// TestBpfFlusher_FlushConnV6_NonConnProto_Errors is the v6 twin of
+// TestBpfFlusher_FlushConn_NonConnProto_Errors: ICMP / "any" create no
+// conn_track_v6 entry (the established-flow short-circuit is port-keyed), so
+// FlushConnV6 for them is a caller bug and must surface an error, not silently
+// no-op. The proto guard runs before LoadPinnedMap, so this is host-independent.
+// Uses genuine v6 keys so the inverted family gate lets them through to the proto
+// switch (a v4-mapped key would skip out before the proto check).
+func TestBpfFlusher_FlushConnV6_NonConnProto_Errors(t *testing.T) {
+	f := &BpfFlusher{}
+	for _, proto := range []FlowProto{FlowProtoICMP, FlowProtoAny} {
+		k, err := MakeFlowKey("2001:db8::1", "2001:db8::2", 0, proto)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn := ConnFlowKey{Flow: k, SrcPort: 43210}
+		if err := f.FlushConnV6(context.Background(), conn); err == nil {
+			t.Errorf("FlushConnV6 with protocol %s: got nil, want error (no conn_track_v6 entry exists for it)", proto)
+		}
+	}
+	// These are genuine v6 keys taking the proto-error path, NOT the v4-mapped
+	// skip branch, so the skip counter must stay 0.
+	if got := f.SkippedCount(); got != 0 {
+		t.Errorf("SkippedCount after v6 protocol-guard cases: got %d want 0 (these are v6 keys; the proto error path must not touch the skip counter)", got)
+	}
+}
+
+// TestBpfFlusher_FlushConnV6_CanceledCtx is the v6 twin of
+// TestBpfFlusher_FlushConn_CanceledCtx: a canceled context short-circuits before
+// any kernel call, symmetric to FlushConn. Without this a Shutdown-mid-revoke
+// could still issue a v6 map op.
+func TestBpfFlusher_FlushConnV6_CanceledCtx(t *testing.T) {
+	f := &BpfFlusher{}
+	k, err := MakeFlowKey("2001:db8::1", "2001:db8::2", 443, FlowProtoTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := f.FlushConnV6(ctx, ConnFlowKey{Flow: k, SrcPort: 43210}); err == nil {
+		t.Error("FlushConnV6 with canceled ctx: got nil, want ctx error (must short-circuit before LoadPinnedMap)")
+	}
+}
+
 // TestConnFlowKey_String fences the log rendering — a ConnFlowKey in logs
 // must show the source-port discriminator (the thing that distinguishes
 // it from the coarse allow-rule FlowKey), so a revoke-path log line is
