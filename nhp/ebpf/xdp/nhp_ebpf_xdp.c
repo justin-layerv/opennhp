@@ -69,38 +69,57 @@ enum {
     CT_DIR_EGRESS = 1,
 };
 
+// Size pins for the v4 allow-rule key structs — the C<->Go size contract their
+// Go serializers in nhp/utils/ebpf/ebpf.go marshal against (ToWlKey/ToSpKey/
+// ToPlKey/ToPpKey, plus ToSdKey shared by the two address-only keys
+// icmpwhitelist/sdwhitelist). Mirrors the _Static_asserts on the v6 twins below
+// (so v4 and v6 have parity): a wrong attribute or accidental field change
+// fails the compile of this object (make test-ebpf, run in the eBPF-datapath CI
+// job and at local regen) instead of silently diverging into a wrong KeySize.
 struct whitelist_key {
-    __be32 src_ip;
-    __be32 dst_ip;
-    __be16 dst_port;
-    __u8 protocol;
-} __attribute__((packed));
+    __be32 src_ip;            // 4
+    __be32 dst_ip;            // 4
+    __be16 dst_port;          // 2
+    __u8 protocol;            // 1
+} __attribute__((packed));    // = 11 bytes (KeySize for spp)
+_Static_assert(sizeof(struct whitelist_key) == 11,
+               "whitelist_key must be exactly 11 bytes (packed)");
 
 struct src_port_list_key {
-    __be32 src_ip;
-    __be16 dst_port;
-} __attribute__((packed));
+    __be32 src_ip;            // 4
+    __be16 dst_port;          // 2
+} __attribute__((packed));    // = 6 bytes (KeySize for src_port)
+_Static_assert(sizeof(struct src_port_list_key) == 6,
+               "src_port_list_key must be exactly 6 bytes (packed)");
 
 struct port_list_key {
-    __be32 src_ip;
-    __be16 min_port;
-    __be16 max_port;
-} __attribute__((packed));
+    __be32 src_ip;            // 4
+    __be16 min_port;          // 2
+    __be16 max_port;          // 2
+} __attribute__((packed));    // = 8 bytes (KeySize for port_list)
+_Static_assert(sizeof(struct port_list_key) == 8,
+               "port_list_key must be exactly 8 bytes (packed)");
 
 struct protocol_port_key {
-    __be16 dst_port;
-    __u8 protocol;
-} __attribute__((packed));
+    __be16 dst_port;          // 2
+    __u8 protocol;            // 1
+} __attribute__((packed));    // = 3 bytes (KeySize for protocol_port)
+_Static_assert(sizeof(struct protocol_port_key) == 3,
+               "protocol_port_key must be exactly 3 bytes (packed)");
 
 struct icmpwhitelist_key {
-    __be32 src_ip;
-    __be32 dst_ip;
-} __attribute__((packed));
+    __be32 src_ip;            // 4
+    __be32 dst_ip;            // 4
+} __attribute__((packed));    // = 8 bytes (KeySize for icmpwhitelist)
+_Static_assert(sizeof(struct icmpwhitelist_key) == 8,
+               "icmpwhitelist_key must be exactly 8 bytes (packed)");
 
 struct sdwhitelist_key {
-    __be32 src_ip;
-    __be32 dst_ip;
-} __attribute__((packed));
+    __be32 src_ip;            // 4
+    __be32 dst_ip;            // 4
+} __attribute__((packed));    // = 8 bytes (KeySize for sdwhitelist)
+_Static_assert(sizeof(struct sdwhitelist_key) == 8,
+               "sdwhitelist_key must be exactly 8 bytes (packed)");
 
 // ----------------------------------------------------------------------------
 // IPv6 allow-rule key structs (E2 slice 1 — DECLARED ONLY, currently inert).
@@ -118,9 +137,10 @@ struct sdwhitelist_key {
 // conntrack-key serialization (#2818). To make the C↔Go size contract
 // unambiguous and self-checking, each struct's EXACT packed size is pinned with
 // a `_Static_assert`: a wrong attribute or accidental field-type change fails
-// the compile of this .o (`make ebpf`). Note this TU is compiled only by
-// `make ebpf` at build/regen time — no CI job compiles it (the .o is committed),
-// so the inline assert is the tripwire at the next local regen. The end-to-end
+// the compile of this .o (`make ebpf`). This TU is compiled from source by
+// `make test-ebpf` — both at local regen AND in the eBPF-datapath CI job
+// (ebpf-datapath-test.yml, triggered by nhp/ebpf/** changes) — so a wrong size
+// fails that compile in CI, not just at the next local regen. The end-to-end
 // guard is closed by slice 2's Go serializers + golden-byte tests (run in Go CI)
 // and slice 6's `map.KeySize() == GoSize` kernel test; all three share these
 // exact byte sizes as the single source of truth.

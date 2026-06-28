@@ -229,8 +229,8 @@ func TestSrcDestKeyV6_ToSdKeyV6_GoldenBytes(t *testing.T) {
 // __be16 packet port, so an LE serializer inserts 443 as `BB 01` while the
 // kernel looks up `01 BB` → the rule silently never matches. This vector pins
 // the byte order the slice-6 real-map BPF_PROG_TEST_RUN harness proves
-// end-to-end. (The v4 twin ToSpKey is still LE with the same latent bug —
-// #2842.) See the family note above ToSpKeyV6 in ebpf.go (#2841).
+// end-to-end. (The v4 twin ToSpKey had the same latent bug; it is now fixed to
+// big-endian to match — #2842.) See the family note above ToSpKeyV6 in ebpf.go.
 func TestSrcIPdstPortKeyV6_ToSpKeyV6_GoldenBytes(t *testing.T) {
 	srcIP, err := parseIP6("2001:db8::7")
 	if err != nil {

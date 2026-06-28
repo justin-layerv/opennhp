@@ -239,8 +239,9 @@ type srcDestKeyV6 struct {
 //     ToSpKeyV6 MUST write dst_port BIG-endian, or an asymmetric-port src_port
 //     rule (e.g. 443 = 0x01BB) inserts `BB 01` while the kernel looks up
 //     `01 BB` and the rule silently never matches. This was a real, latent
-//     value-dependent bug (the v4 analog is still LE — tracked in #2842) and is
-//     the load-bearing reason for the byte order here.
+//     value-dependent bug (the v4 analog ToSpKey had the same bug, now fixed to
+//     big-endian to match — #2842) and is the load-bearing reason for the byte
+//     order here.
 //   - port_list_v6: `pl_key.min_port = MIN_PORT(0)`, `.max_port = MAX_PORT(65535)`
 //     — fixed host-order sentinel CONSTANTS, never the packet port. 0x0000 and
 //     0xFFFF are byte-order palindromes, so ToPlKeyV6's min/max byte order is
@@ -353,8 +354,8 @@ func (r *portListKeyV6) ToPlKeyV6() []byte {
 // — the RAW network-order packet port, NOT bpf_ntohs'd (nhp/ebpf/xdp/nhp_ebpf_xdp.c).
 // This is the load-bearing byte order: a little-endian write inserts an
 // asymmetric port (443 = 0x01BB) as `BB 01` while the kernel looks up `01 BB`,
-// so the src_port rule silently never matches. (The v4 twin ToSpKey is still
-// little-endian and carries this exact latent bug — tracked in #2842.) INPUT
+// so the src_port rule silently never matches. (The v4 twin ToSpKey had this
+// exact latent bug; it is now fixed to big-endian to match — #2842.) INPUT
 // CONTRACT, same as ToPlKeyV6: the live v4 caller AddEbpfRuleForSrcDestPort
 // passes safeIntToUint16(...) (a raw uint16), so DstPort here is a raw
 // host-order value — slice 4 must do the same.
@@ -529,6 +530,16 @@ func (r *srcDestKey) ToSdValue(ttlSec uint64) whitelistValue {
 	}
 }
 
+// ToPpKey serializes the `protocol_port` key (struct protocol_port_key
+// {__be16 dst_port; __u8 protocol;}). NOTE the divergent convention: unlike
+// the host-order-port-in + BigEndian-out family (ToSpKey/ToPlKey/ToCtKey/
+// ToWlKey), this path reaches the same network-order __be16 by the OPPOSITE
+// route — its caller AddEbpfRuleForProtocolPort feeds a value from parsePort,
+// which already byte-swaps to network order, and this then writes it
+// LittleEndian. The two swaps cancel, so the bytes are correct today, but it
+// is a footgun: "fixing" parsePort to return host order would silently break
+// this write. Converging this path onto host-order + BigEndian (like the
+// rest of the family) is tracked at #2845; do not change one half alone.
 func (r *procoPortKey) ToPpKey() []byte {
 	keyBytes := make([]byte, 3)
 	binary.LittleEndian.PutUint16(keyBytes[0:2], r.DstPort)
@@ -544,11 +555,31 @@ func (r *procoPortKey) ToPpValue(ttlSec uint64) procoPortValue {
 	}
 }
 
+// ToPlKey serializes the `port_list` allow-rule key into the 8 packed bytes
+// the kernel `port_list` HASH map expects, mirroring `struct port_list_key`
+// {__be32 src_ip; __be16 min_port; __be16 max_port;} in nhp_ebpf_xdp.c. The
+// port fields are big-endian for the same __be16 reason as ToSpKey (see its
+// godoc) — keeping the whole allow-rule key family on one network-order
+// convention.
+//
+// Unlike ToSpKey, this byte order is behaviorally INVISIBLE today: the XDP
+// program builds its port_list lookup key with the palindromic constants
+// MIN_PORT=0 (00 00) and MAX_PORT=65535 (FF FF), which read identically
+// big- or little-endian — which is exactly why the previous LE write was
+// never observed to fail. The change is a forward-looking consistency fix,
+// pinned by TestPortListKey_ToPlKey_GoldenBytes with asymmetric values.
+//
+// ORTHOGONAL latent mismatch (NOT fixed here, tracked separately): the
+// inserter in endpoints/ac/msghandler.go builds the all-ports rule with
+// DstPortStart=1 while the XDP side looks up min_port=MIN_PORT=0, so the
+// port_list key never matches regardless of byte order. That is a value
+// mismatch in a different layer; this endianness fix neither causes nor
+// resolves it.
 func (r *portListKey) ToPlKey() []byte {
 	keyBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint32(keyBytes[0:4], r.SrcIP)
-	binary.LittleEndian.PutUint16(keyBytes[4:6], r.DstPortStart)
-	binary.LittleEndian.PutUint16(keyBytes[6:8], r.DstPortEnd)
+	binary.BigEndian.PutUint16(keyBytes[4:6], r.DstPortStart)
+	binary.BigEndian.PutUint16(keyBytes[6:8], r.DstPortEnd)
 	return keyBytes
 }
 
@@ -560,10 +591,42 @@ func (r *portListKey) ToPlValue(ttlSec uint64) whitelistValue {
 	}
 }
 
+// ToSpKey serializes the `src_port` allow-rule key into the 6 packed bytes
+// the kernel `src_port` HASH map expects, mirroring `struct src_port_list_key`
+// {__be32 src_ip; __be16 dst_port;} in nhp/ebpf/xdp/nhp_ebpf_xdp.c.
+//
+// Byte order (the load-bearing detail — see TestSrcIPDstPortKey_ToSpKey_GoldenBytes):
+//   - src_ip is little-endian because parseIP already returns the
+//     network-order octets packed into a uint32 via LittleEndian, so the LE
+//     write reproduces network order — identical to ToCtKey/ToWlKey IP handling
+//     and to the XDP `iph->saddr` (__be32).
+//   - dst_port is BIG-endian to reproduce the on-wire __be16. The XDP program
+//     builds its lookup key as `spkey.dst_port = ct_key.dport`, where
+//     ct_key.dport is copied verbatim from the TCP/UDP header (tcp->dest /
+//     udp->dest) — i.e. network byte order. A HASH lookup matches only on
+//     exact key bytes, so the Go insert must use the SAME order.
+//
+// Why this was wrong before, and why it stayed hidden: this previously wrote
+// dst_port little-endian. That makes the inserted key for port P carry the
+// bytes of byteswap(P), so the kernel matches the rule against packets to
+// byteswap(P), not P — a rule meant to admit "<src> -> tcp/443" (0x01BB) is
+// stored as 0xBB 0x01 and actually admits tcp/47873 (0xBB01): the intended
+// port is denied (allow lookup misses -> XDP_DROP) AND the wrong port is
+// opened for that (already knock-authenticated) source — a least-privilege /
+// policy-fidelity break, not an outsider hole. It was masked because (a) prod
+// runs FilterMode_IPTABLES, so the XDP datapath is dormant; (b) the sibling
+// protocol_port path compensates for the same LE write via parsePort's
+// pre-swap, so the convention looked fine; and (c) no test pinned these bytes.
+//
+// IPv6 twin: the v6 serializers ToSpKeyV6/ToPlKeyV6 (merged in #2824) ALREADY
+// use this big-endian convention, and the v6 XDP src_port_v6 lookup (#2825) is
+// wired to match — they were the canary that surfaced this v4 bug, tracked as
+// #2842 (which this fix closes). This change brings v4 into alignment with the
+// already-correct v6; keep the two in lockstep.
 func (r *srcIPdstPortKey) ToSpKey() []byte {
 	keyBytes := make([]byte, 6)
 	binary.LittleEndian.PutUint32(keyBytes[0:4], r.SrcIP)
-	binary.LittleEndian.PutUint16(keyBytes[4:6], r.DstPort)
+	binary.BigEndian.PutUint16(keyBytes[4:6], r.DstPort)
 	return keyBytes
 }
 
@@ -1467,7 +1530,12 @@ func parseIP6(ipStr string) ([16]byte, error) {
 	return out, nil
 }
 
-// Parse the port
+// parsePort parses a decimal port and returns it BYTE-SWAPPED (network order
+// packed into a host uint16): for 443 it returns 0xBB01, not 0x01BB. This swap
+// is load-bearing — its only caller (AddEbpfRuleForProtocolPort) hands the
+// result to ToPpKey, whose LittleEndian write cancels it back to network order.
+// See ToPpKey's godoc for the full cancellation rationale and why changing one
+// half without the other silently breaks the key (convergence tracked: #2845).
 func parsePort(portStr string) (uint16, error) {
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
