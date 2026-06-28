@@ -12,19 +12,20 @@ import (
 // HandleRevocationAck processes a single NHP_RACK packet: an AC's
 // proof-of-delivery acknowledgement of an NHP_REV the server fanned out (P4e
 // Slice 3, #2793). It unmarshals the ACRevocationAckMsg, resolves the acking
-// AC's identity from the cryptographically-authenticated connection pubkey (NOT
-// a body field), and clears that AC's pending-revoke tracker for the acked
-// (scope, scope_key) at or below the acked epoch — which stops the
-// retry-until-ack-or-age-out loop for that AC.
+// AC slot identity from the cryptographically-authenticated connection pubkey
+// (NOT a body field), and clears that slot's pending-revoke tracker for the
+// acked (scope, scope_key) at or below the acked epoch — which stops the
+// retry-until-ack-or-age-out loop for that exact live slot.
 //
-// Identity attribution (load-bearing security property): the acId is resolved
-// from ppd.RemotePubKey (set by the responder only after validatePeer
+// Identity attribution (load-bearing security property): acId + AC pubkey are
+// resolved from ppd.RemotePubKey (set by the responder only after validatePeer
 // authenticates it) against the live AC connection registry. The ack message
-// deliberately carries NO acId field; trusting a body-supplied id would let any
-// authenticated AC clear another AC's pending revoke (a fail-open: the server
-// would stop retrying a revoke that never reached its true target). See the
-// ServerACAckMsg/HandleACOnline precedent (msghandler.go) for the same
-// pubkey→acId resolution from ppd.RemotePubKey.
+// deliberately carries NO acId/pubkey field; trusting a body-supplied id would
+// let any authenticated AC clear another AC's pending revoke (a fail-open: the
+// server would stop retrying a revoke that never reached its true target). The
+// pubkey is part of the pending key because acConnectionMap supports multiple
+// blue/green slots under one acId, and one sibling's ack must not prove another
+// sibling's delivery.
 //
 // Acknowledgement semantics mirror the AC side (common.ACRevocationAckMsg): the
 // ack is a CONVERGENCE claim, so a matched ack clears the pending tracker
@@ -48,7 +49,7 @@ func (s *UdpServer) HandleRevocationAck(ppd *core.PacketParserData) error {
 		return err
 	}
 
-	acId, ok := s.resolveACIdFromPubkey(ppd.RemotePubKey)
+	acId, acPubkey, ok := s.resolveACIdentityFromPubkey(ppd.RemotePubKey)
 	if !ok {
 		// The authenticated pubkey matched no live AC connection. The conn may
 		// have dropped/reconnected between the NHP_REV and this ack; ignore the
@@ -69,41 +70,47 @@ func (s *UdpServer) HandleRevocationAck(ppd *core.PacketParserData) error {
 	log.Info("server-ac(%s)[HandleRevocationAck] received NHP_RACK scope=%q key=%q epoch=%d eventId=%q",
 		acId, ackMsg.Scope, ackMsg.ScopeKey, ackMsg.RevocationEpoch, ackMsg.EventId)
 
-	// Clear the per-AC pending-revoke tracker for (acId, scope, scope_key) at or
-	// below the acked epoch — this stops the retry loop for that AC (#2793).
-	// scope_key is matched VERBATIM against the wire form the server sent (no
-	// strip/normalize). No-op when the engine is disabled (tracker nil).
-	s.clearPendingRevocationAck(acId, ackMsg.Scope, ackMsg.ScopeKey, ackMsg.RevocationEpoch)
+	// Clear the per-slot pending-revoke tracker for
+	// (acId, acPubkey, scope, scope_key) at or below the acked epoch — this stops
+	// the retry loop for that exact AC slot (#2793). scope_key is matched
+	// VERBATIM against the wire form the server sent (no strip/normalize). No-op
+	// when the engine is disabled (tracker nil).
+	s.clearPendingRevocationAck(acId, acPubkey, ackMsg.Scope, ackMsg.ScopeKey, ackMsg.RevocationEpoch)
 
 	return nil
 }
 
-// resolveACIdFromPubkey maps an authenticated connection pubkey (raw bytes from
-// ppd.RemotePubKey) to the configured acId of the AC that owns a live connection
-// with that pubkey, or ("", false) if no live ACConn matches. It is the ack
-// path's identity attribution: the acId comes from the crypto-authenticated
-// pubkey, never a spoofable message field.
+// resolveACIdentityFromPubkey maps an authenticated connection pubkey (raw bytes
+// from ppd.RemotePubKey) to the configured acId and stable AC slot pubkey
+// (ACPeer.PubKeyBase64) of the AC that owns a live connection with that pubkey,
+// or ("", "", false) if no live ACConn matches. It is the ack path's identity
+// attribution: both values come from the crypto-authenticated pubkey and the
+// live connection registry, never a spoofable message field.
 //
 // The scan is O(total live AC conns), acceptable because NHP_RACK volume is
 // bounded by revoke volume (a security-event rate, not a steady-state rate) and
 // the live-conn set is small (a cell's ACs × blue/green slots). If revoke
-// volume ever rises to where this matters, add a pubkey→acId index alongside
+// volume ever rises to where this matters, add a pubkey→identity index alongside
 // acConnectionMap — but that is premature today. Mirrors the existing
 // acConnPubkey-based scan in ac_pubkey_revoke_drop.go.
-func (s *UdpServer) resolveACIdFromPubkey(pubkey []byte) (string, bool) {
+func (s *UdpServer) resolveACIdentityFromPubkey(pubkey []byte) (string, string, bool) {
 	if len(pubkey) != core.PublicKeySize {
-		return "", false
+		return "", "", false
 	}
 	want := base64.StdEncoding.EncodeToString(pubkey)
 
 	s.acConnectionMapMutex.RLock()
 	defer s.acConnectionMapMutex.RUnlock()
-	for acId, conns := range s.acConnectionMap {
+	for mapACId, conns := range s.acConnectionMap {
 		for _, conn := range conns {
 			if got, ok := acConnPubkey(conn); ok && got == want {
-				return acId, true
+				acId := conn.ACId
+				if acId == "" {
+					acId = mapACId
+				}
+				return acId, got, true
 			}
 		}
 	}
-	return "", false
+	return "", "", false
 }

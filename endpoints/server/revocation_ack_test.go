@@ -12,12 +12,11 @@ import (
 // P4e Slice 3 (#2793): tests for the server NHP_RACK revocation-ack handler.
 //
 // These exercise HandleRevocationAck against the real acConnectionMap-based
-// identity attribution (resolveACIdFromPubkey) — not a mock — so "the ack was
-// attributed to the right AC" is proven by the observable metric outcome
-// (RevocationAckReceived on a match, RevocationAckUnresolved on no match). The
-// per-AC pending-revoke tracker that this handler will CLEAR is deferred (the
-// design surface held for confirmation, #2793), so these fence the receive +
-// attribution wiring the tracker will build on.
+// identity attribution (resolveACIdentityFromPubkey) — not a mock — so "the ack
+// was attributed to the right AC slot" is proven by the observable metric
+// outcome (RevocationAckReceived on a match, RevocationAckUnresolved on no
+// match). The retry-engine tests cover the pending-tracker clear path; these
+// fence the receive + attribution wiring it builds on.
 
 func newAckTestServer(t *testing.T) *UdpServer {
 	t.Helper()
@@ -131,27 +130,27 @@ func TestHandleRevocationAck_MalformedBodyReturnsError(t *testing.T) {
 	}
 }
 
-// TestResolveACIdFromPubkey is the unit-level guard on the attribution helper:
-// a matching pubkey resolves to its acId; a wrong-length pubkey and an unknown
-// pubkey both miss.
-func TestResolveACIdFromPubkey(t *testing.T) {
+// TestResolveACIdentityFromPubkey is the unit-level guard on the attribution
+// helper: a matching pubkey resolves to its acId and slot pubkey; a wrong-length
+// pubkey and an unknown pubkey both miss.
+func TestResolveACIdentityFromPubkey(t *testing.T) {
 	s := newAckTestServer(t)
 	putAckTestConn(s, "ac-alpha", 3)
 	putAckTestConn(s, "ac-beta", 4)
 
-	if got, ok := s.resolveACIdFromPubkey(testPubkey(3)); !ok || got != "ac-alpha" {
-		t.Fatalf("resolveACIdFromPubkey(seed3) = (%q,%v), want (ac-alpha,true)", got, ok)
+	if gotID, gotPubkey, ok := s.resolveACIdentityFromPubkey(testPubkey(3)); !ok || gotID != "ac-alpha" || gotPubkey != testPubkeyB64(3) {
+		t.Fatalf("resolveACIdentityFromPubkey(seed3) = (%q,%q,%v), want (ac-alpha,%q,true)", gotID, gotPubkey, ok, testPubkeyB64(3))
 	}
-	if got, ok := s.resolveACIdFromPubkey(testPubkey(4)); !ok || got != "ac-beta" {
-		t.Fatalf("resolveACIdFromPubkey(seed4) = (%q,%v), want (ac-beta,true)", got, ok)
+	if gotID, gotPubkey, ok := s.resolveACIdentityFromPubkey(testPubkey(4)); !ok || gotID != "ac-beta" || gotPubkey != testPubkeyB64(4) {
+		t.Fatalf("resolveACIdentityFromPubkey(seed4) = (%q,%q,%v), want (ac-beta,%q,true)", gotID, gotPubkey, ok, testPubkeyB64(4))
 	}
 	// Unknown pubkey.
-	if got, ok := s.resolveACIdFromPubkey(testPubkey(99)); ok {
-		t.Fatalf("resolveACIdFromPubkey(seed99) = (%q,true), want miss", got)
+	if gotID, gotPubkey, ok := s.resolveACIdentityFromPubkey(testPubkey(99)); ok {
+		t.Fatalf("resolveACIdentityFromPubkey(seed99) = (%q,%q,true), want miss", gotID, gotPubkey)
 	}
 	// Wrong-length input is rejected before any scan.
-	if got, ok := s.resolveACIdFromPubkey([]byte{1, 2, 3}); ok {
-		t.Fatalf("resolveACIdFromPubkey(short) = (%q,true), want miss", got)
+	if gotID, gotPubkey, ok := s.resolveACIdentityFromPubkey([]byte{1, 2, 3}); ok {
+		t.Fatalf("resolveACIdentityFromPubkey(short) = (%q,%q,true), want miss", gotID, gotPubkey)
 	}
 }
 

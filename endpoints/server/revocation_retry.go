@@ -17,10 +17,11 @@ import (
 //
 // Closes the DE-Risk #5 proof-of-delivery gap: the server→AC NHP_REV fanout is
 // fire-and-forget UDP, so a lost NHP_REV leaves the AC's flow alive to natural
-// expiry. This engine records a pending entry per targeted AC at fanout time,
-// retransmits the NHP_REV on a fixed cadence until the AC acks (NHP_RACK clears
-// the pending entry) or an age-out deadline elapses, at which point it ticks the
-// RevocationAgedOut degraded metric (NEVER a silent drop) and drops the entry.
+// expiry. This engine records a pending entry per targeted live AC slot
+// (acId + authenticated AC pubkey) at fanout time, retransmits the NHP_REV on a
+// fixed cadence until that slot acks (NHP_RACK clears the pending entry) or an
+// age-out deadline elapses, at which point it ticks the RevocationAgedOut
+// degraded metric (NEVER a silent drop) and drops the entry.
 //
 // Convergence-ack semantics make redelivery safe (see common.ACRevocationAckMsg
 // + the AC's HandleUdpACRevocation): the AC validates and acks EVERY redelivered
@@ -150,13 +151,20 @@ func parseRevocationRetryDuration(raw string, def, floor time.Duration) (time.Du
 	return d, nil
 }
 
-// pendingRevocationKey identifies one un-acked revoke targeted at one AC. Keyed
-// by (acId, scope, scopeKey) so a higher epoch for the same identity supersedes
-// the lower in place (one pending entry per AC per identity, bounding the map).
+// pendingRevocationKey identifies one un-acked revoke targeted at one live AC
+// slot. ACId is the configured AC group identifier, while acPubkey is the
+// authenticated AC slot identity (ACPeer.PubKeyBase64). Both are load-bearing:
+// acConnectionMap can hold multiple blue/green slots under one acId, and one
+// slot's NHP_RACK must not clear a sibling slot that may have missed the
+// NHP_REV. Keying by (acId, acPubkey, scope, scopeKey) lets a higher epoch for
+// the same live slot + identity supersede the lower in place while preserving
+// one pending entry per slot per identity.
+//
 // scopeKey here is the WIRE form (scope-prefixed) the server sent into the
 // NHP_REV and the AC echoes verbatim in its ack — matched by string equality.
 type pendingRevocationKey struct {
 	acId     string
+	acPubkey string
 	scope    string
 	scopeKey string // wire (scope-prefixed) form
 }
@@ -200,8 +208,8 @@ func newRevocationRetryTracker(interval, ageOut time.Duration) *revocationRetryT
 // lastSentAt/attempts but preserves firstSentAt so the age-out clock keeps
 // running from the original send. An equal-or-lower epoch than an existing entry
 // at a HIGHER epoch is ignored (the higher-epoch revoke already supersedes it).
-func (rt *revocationRetryTracker) track(acId, scope, scopeKey string, epoch int64, eventId string) {
-	k := pendingRevocationKey{acId: acId, scope: scope, scopeKey: scopeKey}
+func (rt *revocationRetryTracker) track(acId, acPubkey, scope, scopeKey string, epoch int64, eventId string) {
+	k := pendingRevocationKey{acId: acId, acPubkey: acPubkey, scope: scope, scopeKey: scopeKey}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	now := rt.now()
@@ -244,8 +252,8 @@ func (rt *revocationRetryTracker) track(acId, scope, scopeKey string, epoch int6
 // one outcome a delivery-proof feature cannot tolerate. The presence + exact-
 // epoch guard here no-ops both the acked-mid-tick (absent) and superseded-mid-
 // tick (epoch differs) cases, so a redelivery never recreates state.
-func (rt *revocationRetryTracker) markResent(acId, scope, scopeKey string, epoch int64) {
-	k := pendingRevocationKey{acId: acId, scope: scope, scopeKey: scopeKey}
+func (rt *revocationRetryTracker) markResent(acId, acPubkey, scope, scopeKey string, epoch int64) {
+	k := pendingRevocationKey{acId: acId, acPubkey: acPubkey, scope: scope, scopeKey: scopeKey}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	cur, ok := rt.pending[k]
@@ -258,11 +266,11 @@ func (rt *revocationRetryTracker) markResent(acId, scope, scopeKey string, epoch
 	cur.attempts++
 }
 
-// clearAck removes the pending entry for (acId, scope, scopeKey) when the acked
-// epoch is at least the tracked epoch (a convergence ack proves the AC reached
-// the post-revocation state at/above that epoch). An ack for a lower epoch than
-// what is pending does NOT clear it — a newer revoke is outstanding and must
-// still be proven delivered.
+// clearAck removes the pending entry for (acId, acPubkey, scope, scopeKey) when
+// the acked epoch is at least the tracked epoch (a convergence ack proves that
+// authenticated AC slot reached the post-revocation state at/above that epoch).
+// An ack for a lower epoch than what is pending does NOT clear it — a newer
+// revoke is outstanding and must still be proven delivered.
 //
 // Returns (elapsed, cleared): cleared is true iff an entry was removed, and on a
 // clear elapsed is the revocation-delivery latency for the SLO histogram (#2792)
@@ -272,8 +280,8 @@ func (rt *revocationRetryTracker) markResent(acId, scope, scopeKey string, epoch
 // clock, so a test can drive a known gap deterministically. elapsed is the
 // zero Duration when nothing was cleared (caller must gate the recording on
 // cleared, not on elapsed != 0 — a same-instant ack legitimately yields 0).
-func (rt *revocationRetryTracker) clearAck(acId, scope, scopeKey string, ackEpoch int64) (elapsed time.Duration, cleared bool) {
-	k := pendingRevocationKey{acId: acId, scope: scope, scopeKey: scopeKey}
+func (rt *revocationRetryTracker) clearAck(acId, acPubkey, scope, scopeKey string, ackEpoch int64) (elapsed time.Duration, cleared bool) {
+	k := pendingRevocationKey{acId: acId, acPubkey: acPubkey, scope: scope, scopeKey: scopeKey}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	cur, ok := rt.pending[k]
@@ -337,10 +345,11 @@ func (rt *revocationRetryTracker) pendingCount() int {
 	return len(rt.pending)
 }
 
-// trackFanout records the just-sent NHP_REV for each AC it was enqueued to, so
-// the retry engine can prove delivery. Called by the fanout handler AFTER a
-// successful enqueue. No-op when the engine is disabled (tracker nil). scopeKey
-// is the WIRE (scope-prefixed) form — the same bytes the AC echoes in its ack.
+// trackFanout records the just-sent NHP_REV for each live AC slot it was
+// enqueued to, so the retry engine can prove delivery for every targeted slot.
+// Called by the fanout handler AFTER a successful enqueue. No-op when the engine
+// is disabled (tracker nil). scopeKey is the WIRE (scope-prefixed) form — the
+// same bytes the AC echoes in its ack.
 func (s *UdpServer) trackFanout(conns []*ACConn, scope, scopeKey string, epoch int64, eventId string) {
 	if s.revocationRetry == nil {
 		return
@@ -349,22 +358,28 @@ func (s *UdpServer) trackFanout(conns []*ACConn, scope, scopeKey string, epoch i
 		if conn == nil || conn.ACId == "" {
 			continue
 		}
-		s.revocationRetry.track(conn.ACId, scope, scopeKey, epoch, eventId)
+		acPubkey, ok := acConnPubkey(conn)
+		if !ok {
+			log.Error("server-ac(%s)[RevocationRetry] cannot track fanout: ACConn missing pubkey (scope=%q key=%q epoch=%d eventId=%q)",
+				conn.ACId, scope, scopeKey, epoch, eventId)
+			continue
+		}
+		s.revocationRetry.track(conn.ACId, acPubkey, scope, scopeKey, epoch, eventId)
 	}
 }
 
-// clearPendingRevocationAck clears the pending entry an AC's NHP_RACK
+// clearPendingRevocationAck clears the pending entry an AC slot's NHP_RACK
 // acknowledges and, on a clear, records the emit→ack revocation-delivery latency
 // into the SLO histogram (MetricRevocationDeliveryLatency, #2792). Called by
-// HandleRevocationAck after it has attributed the ack to acId via the
-// authenticated pubkey. No-op when the engine is disabled (tracker nil — the
-// default; no firstSentAt exists to measure against). scope / scopeKey are the
-// verbatim (scope-prefixed) values the AC echoed.
-func (s *UdpServer) clearPendingRevocationAck(acId, scope, scopeKey string, ackEpoch int64) {
+// HandleRevocationAck after it has attributed the ack to acId + authenticated
+// AC pubkey. No-op when the engine is disabled (tracker nil — the default; no
+// firstSentAt exists to measure against). scope / scopeKey are the verbatim
+// (scope-prefixed) values the AC echoed.
+func (s *UdpServer) clearPendingRevocationAck(acId, acPubkey, scope, scopeKey string, ackEpoch int64) {
 	if s.revocationRetry == nil {
 		return
 	}
-	elapsed, cleared := s.revocationRetry.clearAck(acId, scope, scopeKey, ackEpoch)
+	elapsed, cleared := s.revocationRetry.clearAck(acId, acPubkey, scope, scopeKey, ackEpoch)
 	if !cleared {
 		return
 	}
@@ -420,18 +435,20 @@ func (s *UdpServer) runRevocationRetryTick() {
 }
 
 // redeliverPendingRevocation resends the NHP_REV for one due pending entry to
-// its AC's currently-live connection(s), then re-tracks the send (advancing the
-// attempt clock without resetting the age-out clock). If the AC has no live
-// connection right now (a control-connection blip / reconnect in progress) the
-// resend is skipped this tick — the pending entry is KEPT (decision #3: do NOT
-// clear on disconnect, or the flow survives un-revoked) and redelivered on a
-// later tick once the AC reconnects, or aged out to degraded if it never does.
+// the exact currently-live AC slot (same acId + pubkey), then re-tracks the
+// send (advancing the attempt clock without resetting the age-out clock). If
+// that slot has no live connection right now (a control-connection blip /
+// reconnect in progress) the resend is skipped this tick — the pending entry is
+// KEPT (decision #3: do NOT clear on disconnect, or the flow survives
+// un-revoked) and redelivered on a later tick once the same slot reconnects, or
+// aged out to degraded if it never does. A different blue/green sibling under
+// the same acId is not a substitute proof target.
 //
 // Lock discipline: resolves the live conn under acConnectionMapMutex (released)
 // then sends lock-free on sendMsgCh; the tracker mu is taken only inside
 // re-track. No nesting.
 func (s *UdpServer) redeliverPendingRevocation(item dueItem) {
-	conns := s.liveACConnsForId(item.key.acId)
+	conns := s.liveACConnsForPending(item.key)
 	if len(conns) == 0 {
 		// AC not currently connected. Keep the pending entry (it will age out to
 		// degraded if the AC never returns) and try again next tick.
@@ -467,24 +484,30 @@ func (s *UdpServer) redeliverPendingRevocation(item dueItem) {
 	// but does NOT recreate the entry if a concurrent ack cleared it (or a higher
 	// epoch superseded it) between collectDue's snapshot and now — preventing a
 	// resurrected-acked-revoke false age-out. See markResent.
-	s.revocationRetry.markResent(item.key.acId, item.key.scope, item.key.scopeKey, item.epoch)
+	s.revocationRetry.markResent(item.key.acId, item.key.acPubkey, item.key.scope, item.key.scopeKey, item.epoch)
 	log.Debug("server-ac(%s)[RevocationRetry] redelivered NHP_REV (scope=%q key=%q epoch=%d)",
 		item.key.acId, item.key.scope, item.key.scopeKey, item.epoch)
 }
 
-// liveACConnsForId snapshots the live AC connections for acId under
-// acConnectionMapMutex.RLock and returns a fresh slice the caller reads
-// lock-free. Mirrors findACConnectionsForRevocation's targeted branch for a
-// single id.
-func (s *UdpServer) liveACConnsForId(acId string) []*ACConn {
+// liveACConnsForPending snapshots the live AC connection(s) that match a
+// pending entry's exact AC slot identity under acConnectionMapMutex.RLock and
+// returns a fresh slice the caller reads lock-free. Under the normal
+// same-pubkey replacement invariant this is at most one connection; returning a
+// slice keeps redelivery tolerant of any transient duplicate same-pubkey entries
+// without broadening to sibling pubkeys under the same acId.
+func (s *UdpServer) liveACConnsForPending(key pendingRevocationKey) []*ACConn {
 	s.acConnectionMapMutex.RLock()
 	defer s.acConnectionMapMutex.RUnlock()
-	conns := s.acConnectionMap[acId]
+	conns := s.acConnectionMap[key.acId]
 	if len(conns) == 0 {
 		return nil
 	}
-	out := make([]*ACConn, len(conns))
-	copy(out, conns)
+	out := make([]*ACConn, 0, 1)
+	for _, conn := range conns {
+		if got, ok := acConnPubkey(conn); ok && got == key.acPubkey {
+			out = append(out, conn)
+		}
+	}
 	return out
 }
 

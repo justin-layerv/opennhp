@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -22,6 +23,8 @@ import (
 const (
 	testRetryInterval = 5 * time.Second
 	testRetryAgeOut   = 60 * time.Second
+	testSlotPubkeyA   = "test-slot-pubkey-a"
+	testSlotPubkeyB   = "test-slot-pubkey-b"
 )
 
 // fakeClock is a manually-advanced time source for deterministic tracker tests.
@@ -39,25 +42,29 @@ func newTestTracker(clk *fakeClock) *revocationRetryTracker {
 // ── Pure tracker tests ──────────────────────────────────────────────────────
 
 // TestRetryTracker_TrackThenAckClears: a tracked revoke is cleared by an ack at
-// the same epoch, and the matching is exact on (acId, scope, scopeKey).
+// the same epoch, and the matching is exact on (acId, acPubkey, scope, scopeKey).
 func TestRetryTracker_TrackThenAckClears(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	rt := newTestTracker(clk)
 
-	rt.track("ac-1", "qurl", "qurl:qX", 5, "evt-1")
+	rt.track("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 5, "evt-1")
 	if n := rt.pendingCount(); n != 1 {
 		t.Fatalf("pendingCount after track = %d, want 1", n)
 	}
 	// An ack for a DIFFERENT AC must not clear it.
-	if _, cleared := rt.clearAck("ac-2", "qurl", "qurl:qX", 5); cleared {
+	if _, cleared := rt.clearAck("ac-2", testSlotPubkeyA, "qurl", "qurl:qX", 5); cleared {
 		t.Fatal("ack for a different acId wrongly cleared the entry")
 	}
+	// An ack for a DIFFERENT blue/green slot under the same AC ID must not clear it.
+	if _, cleared := rt.clearAck("ac-1", testSlotPubkeyB, "qurl", "qurl:qX", 5); cleared {
+		t.Fatal("ack for a sibling acPubkey wrongly cleared the entry")
+	}
 	// An ack with a mismatched scope_key must not clear it.
-	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qOTHER", 5); cleared {
+	if _, cleared := rt.clearAck("ac-1", testSlotPubkeyA, "qurl", "qurl:qOTHER", 5); cleared {
 		t.Fatal("ack with mismatched scope_key wrongly cleared the entry")
 	}
 	// The matching ack clears it.
-	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 5); !cleared {
+	if _, cleared := rt.clearAck("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 5); !cleared {
 		t.Fatal("matching ack did not clear the entry")
 	}
 	if n := rt.pendingCount(); n != 0 {
@@ -72,16 +79,16 @@ func TestRetryTracker_AckEpochBoundary(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	rt := newTestTracker(clk)
 
-	rt.track("ac-1", "qurl", "qurl:qX", 5, "evt-5")
+	rt.track("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 5, "evt-5")
 	// Ack for an older epoch (4) must NOT clear the pending epoch-5 revoke.
-	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 4); cleared {
+	if _, cleared := rt.clearAck("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 4); cleared {
 		t.Fatal("stale ack (epoch 4 < pending 5) wrongly cleared the entry")
 	}
 	if n := rt.pendingCount(); n != 1 {
 		t.Fatalf("pendingCount = %d, want 1 after stale ack", n)
 	}
 	// Ack at a higher epoch (6) DOES clear (convergence at/above).
-	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 6); !cleared {
+	if _, cleared := rt.clearAck("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 6); !cleared {
 		t.Fatal("ack at higher epoch did not clear")
 	}
 }
@@ -93,20 +100,20 @@ func TestRetryTracker_HigherEpochSupersedes(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	rt := newTestTracker(clk)
 
-	rt.track("ac-1", "qurl", "qurl:qX", 5, "evt-5")
+	rt.track("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 5, "evt-5")
 	clk.advance(10 * time.Second)
-	rt.track("ac-1", "qurl", "qurl:qX", 7, "evt-7") // supersede
+	rt.track("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 7, "evt-7") // supersede
 	if n := rt.pendingCount(); n != 1 {
 		t.Fatalf("pendingCount = %d, want 1 (supersede replaces in place)", n)
 	}
 	// A lower epoch (6) is ignored — the pending epoch-7 still stands.
-	rt.track("ac-1", "qurl", "qurl:qX", 6, "evt-6")
+	rt.track("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 6, "evt-6")
 	// An ack at epoch 7 clears; an ack at epoch 6 would not (it's below the
 	// superseding epoch 7), proving the superseding epoch took.
-	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 6); cleared {
+	if _, cleared := rt.clearAck("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 6); cleared {
 		t.Fatal("ack at epoch 6 cleared, but pending should be the superseding epoch 7")
 	}
-	if _, cleared := rt.clearAck("ac-1", "qurl", "qurl:qX", 7); !cleared {
+	if _, cleared := rt.clearAck("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 7); !cleared {
 		t.Fatal("ack at the superseding epoch 7 did not clear")
 	}
 }
@@ -117,7 +124,7 @@ func TestRetryTracker_HigherEpochSupersedes(t *testing.T) {
 func TestRetryTracker_CollectDue_RetryThenAgeOut(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	rt := newTestTracker(clk)
-	rt.track("ac-1", "qurl", "qurl:qX", 1, "evt-1")
+	rt.track("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 1, "evt-1")
 
 	// Before the interval: nothing due.
 	clk.advance(testRetryInterval - time.Second)
@@ -153,7 +160,7 @@ func TestRetryTracker_CollectDue_RetryThenAgeOut(t *testing.T) {
 func TestRetryTracker_ReTrackPreservesFirstSent(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	rt := newTestTracker(clk)
-	rt.track("ac-1", "qurl", "qurl:qX", 1, "evt-1")
+	rt.track("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 1, "evt-1")
 
 	// Drive several redeliveries, each after one interval.
 	for i := 0; i < 5; i++ {
@@ -163,7 +170,7 @@ func TestRetryTracker_ReTrackPreservesFirstSent(t *testing.T) {
 			// Once we cross firstSentAt+ageOut, it ages out regardless of retracks.
 			return
 		}
-		rt.track("ac-1", "qurl", "qurl:qX", 1, "evt-1") // redelivery re-track
+		rt.track("ac-1", testSlotPubkeyA, "qurl", "qurl:qX", 1, "evt-1") // redelivery re-track
 	}
 	// By now > ageOut has elapsed since firstSentAt; the next collect must age out.
 	clk.advance(testRetryAgeOut)
@@ -372,6 +379,51 @@ func TestRetryEngine_AckStopsRetry(t *testing.T) {
 	}
 }
 
+// TestRetryEngine_SameACIDBlueGreenAckClearsOnlyAckingSlot is the regression
+// for #2793's proof gap: acConnectionMap can hold multiple live blue/green slots
+// under one acId. A NHP_RACK from one authenticated pubkey must clear only that
+// slot's pending entry; the sibling slot must stay pending and be redelivered to
+// its exact pubkey.
+func TestRetryEngine_SameACIDBlueGreenAckClearsOnlyAckingSlot(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s, sendCh := newRetryEngineServer(t, clk)
+	putRetryConn(s, "ac-1", 7)
+	putRetryConn(s, "ac-1", 8)
+
+	s.trackFanout(s.acConnectionMap["ac-1"], "qurl", "qurl:qX", 3, "evt-3")
+	if n := s.revocationRetry.pendingCount(); n != 2 {
+		t.Fatalf("pendingCount after two-slot fanout = %d, want 2", n)
+	}
+
+	ppd := ackPPD(t, common.ACRevocationAckMsg{
+		Scope: "qurl", ScopeKey: "qurl:qX", RevocationEpoch: 3, EventId: "evt-3",
+	}, testPubkey(7))
+	if err := s.HandleRevocationAck(ppd); err != nil {
+		t.Fatalf("HandleRevocationAck err=%v", err)
+	}
+	if n := s.revocationRetry.pendingCount(); n != 1 {
+		t.Fatalf("pendingCount after first slot ack = %d, want 1 (sibling must remain pending)", n)
+	}
+
+	clk.advance(testRetryInterval + time.Second)
+	s.runRevocationRetryTick()
+
+	sends := drainAllSends(sendCh)
+	if len(sends) != 1 {
+		t.Fatalf("redelivery enqueued %d NHP_REV, want 1 for the unacked sibling", len(sends))
+	}
+	if !bytes.Equal(sends[0].PeerPk, testPubkey(8)) {
+		t.Fatalf("redelivery PeerPk = %x, want unacked sibling pubkey %x", sends[0].PeerPk, testPubkey(8))
+	}
+	var revMsg common.ACRevocationMsg
+	if err := json.Unmarshal(sends[0].Message, &revMsg); err != nil {
+		t.Fatalf("redelivery body not ACRevocationMsg: %v", err)
+	}
+	if revMsg.ScopeKey != "qurl:qX" || revMsg.RevocationEpoch != 3 || revMsg.EventId != "evt-3" {
+		t.Fatalf("redelivery body = %+v, want original revoke for unacked sibling", revMsg)
+	}
+}
+
 // TestRetryEngine_AgeOutEmitsDegradedNotSilentDrop: an un-acked revoke past the
 // age-out deadline ticks MetricRevocationAgedOut (the DE-Risk #5 degraded signal)
 // and is dropped — NOT silently and NOT redelivered. This is the core
@@ -435,6 +487,44 @@ func TestRetryEngine_DisconnectKeepsPendingThenRedeliversOnReconnect(t *testing.
 	}
 }
 
+// TestRetryEngine_DisconnectedSlotDoesNotRedeliverToSameACIDSibling proves
+// redelivery does not broaden from the originally-targeted AC slot to a sibling
+// pubkey that happens to share the same acId. That sibling may never have hosted
+// the revoked flow, and sending to it cannot prove delivery to the disconnected
+// slot that did.
+func TestRetryEngine_DisconnectedSlotDoesNotRedeliverToSameACIDSibling(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s, sendCh := newRetryEngineServer(t, clk)
+	putRetryConn(s, "ac-1", 7)
+	s.trackFanout(s.acConnectionMap["ac-1"], "qurl", "qurl:qX", 3, "evt-3")
+
+	// Original slot disappears; a different blue/green sibling under the same
+	// acId is live. This must NOT be treated as a valid redelivery target.
+	s.acConnectionMap["ac-1"] = nil
+	putRetryConn(s, "ac-1", 8)
+
+	clk.advance(testRetryInterval + time.Second)
+	s.runRevocationRetryTick()
+	if sends := drainAllSends(sendCh); len(sends) != 0 {
+		t.Fatalf("redelivered to same-acId sibling (%d sends), want 0", len(sends))
+	}
+	if n := s.revocationRetry.pendingCount(); n != 1 {
+		t.Fatalf("pendingCount with only sibling live = %d, want 1", n)
+	}
+
+	// When the original pubkey reconnects, redelivery resumes to that exact slot.
+	putRetryConn(s, "ac-1", 7)
+	clk.advance(testRetryInterval + time.Second)
+	s.runRevocationRetryTick()
+	sends := drainAllSends(sendCh)
+	if len(sends) != 1 {
+		t.Fatalf("post-original-reconnect redelivery = %d sends, want 1", len(sends))
+	}
+	if !bytes.Equal(sends[0].PeerPk, testPubkey(7)) {
+		t.Fatalf("redelivery PeerPk = %x, want original slot pubkey %x", sends[0].PeerPk, testPubkey(7))
+	}
+}
+
 // TestRetryEngine_AckMidTickDoesNotResurrect is the deterministic guard for the
 // resurrect-acked-revoke hole: if the AC's ack clears the pending entry AFTER the
 // retry tick snapshotted it (collectDue) but BEFORE the redelivery re-records the
@@ -456,7 +546,7 @@ func TestRetryEngine_AckMidTickDoesNotResurrect(t *testing.T) {
 	}
 
 	// The AC's ack lands NOW (mid-tick, after the snapshot, before redelivery).
-	if _, cleared := s.revocationRetry.clearAck("ac-1", "qurl", "qurl:qX", 3); !cleared {
+	if _, cleared := s.revocationRetry.clearAck("ac-1", testPubkeyB64(7), "qurl", "qurl:qX", 3); !cleared {
 		t.Fatal("precondition: ack did not clear the pending entry")
 	}
 	if n := s.revocationRetry.pendingCount(); n != 0 {
@@ -494,7 +584,7 @@ func TestRetryEngine_DisabledIsInert(t *testing.T) {
 	putRetryConn(s, "ac-1", 7)
 	// These must not panic and must do nothing.
 	s.trackFanout(s.acConnectionMap["ac-1"], "qurl", "qurl:qX", 3, "evt-3")
-	s.clearPendingRevocationAck("ac-1", "qurl", "qurl:qX", 3)
+	s.clearPendingRevocationAck("ac-1", testPubkeyB64(7), "qurl", "qurl:qX", 3)
 	// No tracker, nothing to assert beyond not panicking; HandleRevocationAck
 	// still records the proof metric without a tracker.
 	ppd := ackPPD(t, common.ACRevocationAckMsg{Scope: "qurl", ScopeKey: "qurl:qX", RevocationEpoch: 3}, testPubkey(7))
@@ -541,7 +631,7 @@ func TestRevocationDeliveryLatency_MeasuresEmitToAckSpan(t *testing.T) {
 	clk.advance(gap)
 
 	// Ack (T1): the production wiring path measures now-firstSentAt and records it.
-	s.clearPendingRevocationAck("ac-1", "qurl", "qurl:qX", 3)
+	s.clearPendingRevocationAck("ac-1", testPubkeyB64(7), "qurl", "qurl:qX", 3)
 
 	samples := serverLatencies(t, s)[MetricRevocationDeliveryLatency]
 	if len(samples) != 1 {
@@ -575,7 +665,7 @@ func TestRevocationDeliveryLatency_BoundIsNonVacuous(t *testing.T) {
 		t.Fatalf("test setup invalid: over-SLO gap %s must stay below age-out %s", overSLO, testRetryAgeOut)
 	}
 	clk.advance(overSLO)
-	s.clearPendingRevocationAck("ac-1", "qurl", "qurl:qX", 3)
+	s.clearPendingRevocationAck("ac-1", testPubkeyB64(7), "qurl", "qurl:qX", 3)
 
 	samples := serverLatencies(t, s)[MetricRevocationDeliveryLatency]
 	if len(samples) != 1 {
@@ -611,7 +701,7 @@ func TestRevocationDeliveryLatency_StaleAckRecordsNoSample(t *testing.T) {
 
 	clk.advance(3 * time.Second)
 	// Stale ack (epoch 4 < pending 5): does not clear, must not record.
-	s.clearPendingRevocationAck("ac-1", "qurl", "qurl:qX", 4)
+	s.clearPendingRevocationAck("ac-1", testPubkeyB64(7), "qurl", "qurl:qX", 4)
 	if got := serverLatencies(t, s)[MetricRevocationDeliveryLatency]; len(got) != 0 {
 		t.Fatalf("stale ack recorded %d latency samples, want 0", len(got))
 	}

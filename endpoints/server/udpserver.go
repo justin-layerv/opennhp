@@ -176,7 +176,8 @@ type UdpServer struct {
 	// revocationRetry is the qURL v2 NHP_REV retry-until-ack-or-age-out
 	// engine (P4e Slice 3, #2793). nil = engine disabled (default; armed
 	// only when NHP_REVOCATION_RETRY_ENABLED=true). When non-nil, the
-	// fanout handler records a pending entry per targeted AC, the
+	// fanout handler records a pending entry per targeted AC slot
+	// (acId + authenticated pubkey), the
 	// revocationRetryRoutine retransmits un-acked NHP_REV on a cadence
 	// until acked (NHP_RACK clears it) or aged out (RevocationAgedOut),
 	// and HandleRevocationAck clears the matching entry. See
@@ -2878,9 +2879,10 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 		go s.HandleRelayForward(ppd)
 
 	// qURL v2 revocation ack from an AC (P4e Slice 3, #2793). Unsolicited
-	// AC→server push acknowledging an NHP_REV; clears the per-AC pending-revoke
-	// tracker so the retry-until-ack loop stops. Dispatched async like every
-	// other arm so a slow handler cannot head-of-line-block the receive queue.
+	// AC→server push acknowledging an NHP_REV; clears the per-AC-slot
+	// pending-revoke tracker so the retry-until-ack loop stops. Dispatched async
+	// like every other arm so a slow handler cannot head-of-line-block the
+	// receive queue.
 	case core.NHP_RACK:
 		go func() {
 			if ackErr := s.HandleRevocationAck(ppd); ackErr != nil {

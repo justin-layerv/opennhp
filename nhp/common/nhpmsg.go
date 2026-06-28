@@ -582,13 +582,16 @@ type ACRevocationMsg struct {
 //     fail-open-on-key-mismatch trap the gospel warns about repeatedly.
 //   - RevocationEpoch echoes the acked epoch; the server clears a pending
 //     tracker only when the ack's epoch matches (or supersedes) the epoch it
-//     last sent for that (acId, scope, scope_key).
+//     last sent for that authenticated AC slot (acId + pubkey, resolved from
+//     the connection) and (scope, scope_key).
 //   - EventId echoes the NHP_REV's event id for cross-hop log correlation; it
 //     does not affect ack matching (the (scope, scope_key, epoch) tuple does).
 //
 // The acking AC's identity is NOT carried in this message: the server resolves
-// it from the cryptographically-authenticated connection pubkey (ppd.RemotePubKey
-// → acConnectionMap), never from a spoofable body field.
+// both acId and the live slot pubkey from the cryptographically-authenticated
+// connection pubkey (ppd.RemotePubKey → acConnectionMap), never from a spoofable
+// body field. Multiple blue/green AC slots can share one acId, so the pubkey is
+// part of the server-side pending key.
 type ACRevocationAckMsg struct {
 	Scope           string `json:"scope"`
 	ScopeKey        string `json:"scope_key"`        // echoed VERBATIM (still scope-prefixed)
