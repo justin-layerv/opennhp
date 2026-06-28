@@ -180,19 +180,25 @@ func craftTCPv4Packet(t *testing.T, srcIP, dstIP net.IP, srcPort, dstPort uint16
 	return pkt
 }
 
-// loadXDPCollection loads the compiled XDP object and returns the program +
-// conn_track map. It folds every failure into the LOUD-SKIP guard: with
-// NHP_REQUIRE_BPF_TESTS set, any missing object / unsupported kernel /
-// missing capability is a hard t.Fatal; unset, it is a LOUD t.Skip. The
-// returned cleanup closes the collection.
+// loadXDPCollectionInner loads the compiled XDP object into the kernel and
+// returns the program + the whole collection + a cleanup that closes it. It is
+// the single home for the environment-failure folding that loadXDPCollection
+// (returns the conn_track map) and loadXDPCollectionV6 (returns the whole
+// collection) share: every missing prerequisite — no object / unreadable
+// object / memlock / unsupported kernel / missing CAP_BPF — is folded into the
+// LOUD-SKIP guard (a hard t.Fatal when NHP_REQUIRE_BPF_TESTS is set, a LOUD
+// t.Skip otherwise). A nil program is NOT an environment problem (a renamed C
+// symbol), so it is a hard t.Fatal regardless of the guard. On any skip/fatal
+// the returned triple is nil — skipOrFatal stops the goroutine before the
+// caller resumes, so the nil return only keeps the static control flow honest.
 //
-// PINNING: conn_track is declared LIBBPF_PIN_BY_NAME in the C source. With
-// the default NewCollection options and no bpffs PinPath, the loader errors
+// PINNING: conn_track is declared LIBBPF_PIN_BY_NAME in the C source. With the
+// default NewCollection options and no bpffs PinPath, the loader errors
 // ("pinning requested but no path given") before our test runs. This is a
-// BPF_PROG_TEST_RUN harness — we never want the maps pinned to /sys/fs/bpf
-// — so we strip the Pinning flag from EVERY map spec before NewCollection
-// (the object carries several PIN_BY_NAME maps; loading is whole-object).
-func loadXDPCollection(t *testing.T) (*ebpf.Program, *ebpf.Map, func()) {
+// BPF_PROG_TEST_RUN harness — we never want the maps pinned to /sys/fs/bpf — so
+// we strip the Pinning flag from EVERY map spec before NewCollection (the
+// object carries several PIN_BY_NAME maps; loading is whole-object).
+func loadXDPCollectionInner(t *testing.T) (*ebpf.Program, *ebpf.Collection, func()) {
 	t.Helper()
 
 	objPath := os.Getenv(objectPathEnv)
@@ -201,7 +207,7 @@ func loadXDPCollection(t *testing.T) (*ebpf.Program, *ebpf.Map, func()) {
 		return nil, nil, nil
 	}
 	if _, err := os.Stat(objPath); err != nil {
-		skipOrFatal(t, "XDP object %q not readable: %v (build it: `make %s`-style target compiles nhp_ebpf_xdp.o)", objPath, err, "test-ebpf")
+		skipOrFatal(t, "XDP object %q not readable: %v (build it: `make test-ebpf`-style target compiles nhp_ebpf_xdp.o)", objPath, err)
 		return nil, nil, nil
 	}
 
@@ -244,14 +250,33 @@ func loadXDPCollection(t *testing.T) (*ebpf.Program, *ebpf.Map, func()) {
 		t.Fatalf("program %q not found in %s (symbol renamed in nhp_ebpf_xdp.c?)", xdpProgName, objPath)
 		return nil, nil, nil
 	}
+
+	return prog, coll, coll.Close
+}
+
+// loadXDPCollection loads the compiled XDP object and returns the program +
+// conn_track map. It wraps loadXDPCollectionInner — which folds every
+// environment failure into the LOUD-SKIP guard (Fatal when NHP_REQUIRE_BPF_TESTS
+// is set, LOUD Skip otherwise) and whose returned cleanup closes the collection
+// — and adds the conn_track lookup the surgical-kill datapath proof needs. A
+// missing conn_track map is a renamed-C-symbol bug, not an environment problem,
+// so it is a hard t.Fatal regardless of the guard.
+func loadXDPCollection(t *testing.T) (*ebpf.Program, *ebpf.Map, func()) {
+	t.Helper()
+
+	prog, coll, cleanup := loadXDPCollectionInner(t)
+
 	ctMap := coll.Maps[connTrackMapName]
 	if ctMap == nil {
 		coll.Close()
-		t.Fatalf("map %q not found in %s (symbol renamed in nhp_ebpf_xdp.c?)", connTrackMapName, objPath)
+		// Re-read the object path (unchanged for the lifetime of a test run)
+		// so this renamed-symbol message names the object, symmetric with the
+		// program-not-found Fatal in loadXDPCollectionInner.
+		t.Fatalf("map %q not found in %s (symbol renamed in nhp_ebpf_xdp.c?)", connTrackMapName, os.Getenv(objectPathEnv))
 		return nil, nil, nil
 	}
 
-	return prog, ctMap, coll.Close
+	return prog, ctMap, cleanup
 }
 
 // skipOrFatal is the loud-skip guard. NHP_REQUIRE_BPF_TESTS set (CI) ->

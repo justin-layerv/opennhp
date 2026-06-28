@@ -52,11 +52,9 @@ package ebpf
 import (
 	"bytes"
 	"encoding/binary"
-	"os"
 	"testing"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/rlimit"
 )
 
 const (
@@ -326,71 +324,27 @@ func v6TestAddrs(t *testing.T) (allowedSrc, dst, deniedSrc [16]byte) {
 }
 
 // loadXDPCollectionV6 loads the compiled XDP object and returns the program +
-// the whole collection. It mirrors loadXDPCollection's failure folding exactly
-// (every environment failure -> skipOrFatal: Fatal when NHP_REQUIRE_BPF_TESTS=1,
-// LOUD Skip otherwise) and strips PIN_BY_NAME from every map spec
-// (BPF_PROG_TEST_RUN needs no bpffs; the object carries several PIN_BY_NAME maps
-// and loading is whole-object). It returns the COLLECTION rather than a single
-// map handle because the three v6 admission cases (TCP/UDP via spp_v6 &
-// sdwhitelist_v6, ICMPv6 via icmp_wl_v6) all live in one object — one load
-// yields every map. Callers pick the map they need via requireMapV6. The
-// returned cleanup closes the collection.
+// the whole collection. It is a thin wrapper over loadXDPCollectionInner — the
+// shared loader that folds every environment failure into the LOUD-SKIP guard
+// (Fatal when NHP_REQUIRE_BPF_TESTS=1, LOUD Skip otherwise) and whose cleanup
+// closes the collection. It exists as a stable, intention-revealing v6 entry
+// point (parallel to loadXDPCollection) so the v6 admission tests don't reach
+// into the unexported loader directly and so a seam already exists if v6 loading
+// ever needs to diverge. The v6 cases need the whole COLLECTION, not a single
+// map handle: the three (TCP/UDP via spp_v6 & sdwhitelist_v6, ICMPv6 via
+// icmp_wl_v6) all live in one object, so one load yields every map and callers
+// pick the one they need via requireMapV6.
 func loadXDPCollectionV6(t *testing.T) (*ebpf.Program, *ebpf.Collection, func()) {
 	t.Helper()
-
-	objPath := os.Getenv(objectPathEnv)
-	if objPath == "" {
-		skipOrFatal(t, "no XDP object: %s is empty (run via `make test-ebpf`)", objectPathEnv)
-		return nil, nil, nil
-	}
-	if _, err := os.Stat(objPath); err != nil {
-		skipOrFatal(t, "XDP object %q not readable: %v (build it: `make test-ebpf`-style target compiles nhp_ebpf_xdp.o)", objPath, err)
-		return nil, nil, nil
-	}
-
-	if err := rlimit.RemoveMemlock(); err != nil {
-		skipOrFatal(t, "rlimit.RemoveMemlock (needed to load the BPF maps; CAP_SYS_RESOURCE / CAP_BPF): %v", err)
-		return nil, nil, nil
-	}
-
-	spec, err := ebpf.LoadCollectionSpec(objPath)
-	if err != nil {
-		skipOrFatal(t, "LoadCollectionSpec(%q): %v", objPath, err)
-		return nil, nil, nil
-	}
-
-	// Strip PIN_BY_NAME from all maps — BPF_PROG_TEST_RUN needs no bpffs.
-	for _, m := range spec.Maps {
-		m.Pinning = ebpf.PinNone
-	}
-
-	coll, err := ebpf.NewCollection(spec)
-	if err != nil {
-		// EPERM/ENOSYS here = no CAP_BPF / kernel can't load XDP: precisely
-		// the "missing capability / kernel support" the guard turns into
-		// Fatal-when-required, Skip-otherwise.
-		skipOrFatal(t, "NewCollection (load XDP object into kernel): %v", err)
-		return nil, nil, nil
-	}
-
-	prog := coll.Programs[xdpProgName]
-	if prog == nil {
-		coll.Close()
-		// A nil program is NOT an environment problem — it means the C symbol
-		// was renamed. Always fail loud regardless of the guard.
-		t.Fatalf("program %q not found in %s (symbol renamed in nhp_ebpf_xdp.c?)", xdpProgName, objPath)
-		return nil, nil, nil
-	}
-
-	return prog, coll, coll.Close
+	return loadXDPCollectionInner(t)
 }
 
 // requireMapV6 fetches a named map handle from the loaded collection, failing
 // LOUD (never a silent skip-pass) if it is absent. A nil map is not an
 // environment problem — it means the C SEC(".maps") symbol was renamed or the
 // v6 maps were never integrated into the object — so this Fatals regardless of
-// the NHP_REQUIRE_BPF_TESTS guard, mirroring loadXDPCollection's program/map
-// nil-checks.
+// the NHP_REQUIRE_BPF_TESTS guard, mirroring the program/map nil-checks in
+// loadXDPCollectionInner and loadXDPCollection.
 func requireMapV6(t *testing.T, coll *ebpf.Collection, name string) *ebpf.Map {
 	t.Helper()
 	m := coll.Maps[name]
