@@ -950,9 +950,15 @@ jobs:
           - image: server
             dockerfile: docker/Dockerfile.server
             repo: layerv/nhp-server
+            platform: linux/amd64
           - image: ac
             dockerfile: docker/Dockerfile.ac.aws
             repo: layerv/nhp-ac
+            # Issue #2816: the AC eBPF objects are compiled inside this image
+            # build, and prod AC launch templates are x86_64 today. Keep this
+            # platform in lockstep with terraform/modules/ac/main.tf until a
+            # real non-amd64 BPF load test exists for the flip slice.
+            platform: linux/amd64
           # The NHP-Relay (#2208). Build + scan + push, mirroring the server/ac
           # legs. The CD deploy leg (#2624) is the `deploy-sandbox-relay` job
           # below: it puts this freshly-built tag into /sandbox/nhp/relay/image-tag
@@ -962,6 +968,7 @@ jobs:
           - image: relay
             dockerfile: docker/Dockerfile.relay
             repo: layerv/nhp-relay
+            platform: linux/amd64
     steps:
       # Skip at step level (not job level) so matrix expands and check names are created
       # Build only when app code changes (nhp/**, endpoints/**, docker/**)
@@ -1000,6 +1007,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
           push: false
           load: true
           tags: |

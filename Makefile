@@ -415,6 +415,9 @@ lint-workflows:
 	@shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
 	@bash tests/scripts/check-ebpf-load-path-lockstep_test.sh
 	@bash scripts/check-ebpf-load-path-lockstep.sh
+	@shellcheck scripts/check-ac-ebpf-arch-lockstep.sh tests/scripts/check-ac-ebpf-arch-lockstep_test.sh
+	@bash tests/scripts/check-ac-ebpf-arch-lockstep_test.sh
+	@bash scripts/check-ac-ebpf-arch-lockstep.sh
 	@shellcheck scripts/check-golden-vectors.sh tests/scripts/check-golden-vectors_test.sh
 	@bash tests/scripts/check-golden-vectors_test.sh
 	@bash scripts/check-golden-vectors.sh

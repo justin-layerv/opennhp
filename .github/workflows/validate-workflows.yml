@@ -33,7 +33,14 @@ on:
       # must be here or a Go-only/Makefile-only rename would skip the lint.
       - "scripts/check-ebpf-load-path-lockstep.sh"
       - "tests/scripts/check-ebpf-load-path-lockstep_test.sh"
+      # eBPF arch lockstep (#2816): the AC image build platform must stay
+      # in lockstep with terraform/modules/ac/main.tf's launch-template
+      # instance families. The fixture test mutates both sides so extractor
+      # regressions do not silently green.
+      - "scripts/check-ac-ebpf-arch-lockstep.sh"
+      - "tests/scripts/check-ac-ebpf-arch-lockstep_test.sh"
       - "endpoints/ac/ebpf/ebpfegine.go"
+      - "terraform/modules/ac/main.tf"
       - "Makefile"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
       - "scripts/check-packer-failure-surfaced.sh"
@@ -87,7 +94,9 @@ on:
       - "docker/nhp-server/etc/config.toml"
       - "endpoints/server/main/etc/config.toml"
   pull_request:
-    branches: [ "main" ]
+    # qurl-v2 carries the pre-E5 eBPF gates (#2810/#2816), so PRs against it
+    # must run these workflow/Terraform lockstep checks before merge too.
+    branches: [ "main", "qurl-v2" ]
     paths: *validate_paths
 
 # Restrict default permissions for security
@@ -455,6 +464,18 @@ jobs:
           shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
           bash tests/scripts/check-ebpf-load-path-lockstep_test.sh
           bash scripts/check-ebpf-load-path-lockstep.sh
+
+      # AC eBPF architecture lockstep (#2816): Dockerfile.ac.aws compiles the
+      # eBPF objects inside the AC image build, so build-and-push.yml must build
+      # that image for the same platform the AC launch template runs. Today this
+      # is intentionally linux/amd64-only (prod c6i.xlarge, non-prod t3.medium).
+      # A future arm64 or multi-arch AC path must add a real BPF load test before
+      # relaxing this gate.
+      - name: Test + check AC eBPF arch lockstep (workflow ↔ Terraform, #2816)
+        run: |
+          shellcheck scripts/check-ac-ebpf-arch-lockstep.sh tests/scripts/check-ac-ebpf-arch-lockstep_test.sh
+          bash tests/scripts/check-ac-ebpf-arch-lockstep_test.sh
+          bash scripts/check-ac-ebpf-arch-lockstep.sh
 
       - name: Check frps_az_suffixes validation drift (root ↔ module ↔ env-roots)
         run: bash scripts/check-frps-az-suffixes-validation-drift.sh
