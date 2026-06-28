@@ -497,6 +497,72 @@ static __always_inline int submit_event(void *ctx, __u8 action, __be32 src_ip, _
     return bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
 }
 
+// ----------------------------------------------------------------------------
+// IPv6 filter-decision telemetry (E3).
+//
+// struct event_t above is IPv4-shaped (__be32 src_ip/dst_ip) and cannot hold a
+// 128-bit v6 address, so before E3 the v6 datapath emitted ACCEPT events with
+// src/dst = 0 (addresses lost) and emitted NOTHING on a v6 DROP (silent). That
+// is the observability regression E3 closes: iptables mode (prod today) logs v6
+// fully via [NHP-ACCEPT6]/[NHP-DENY6] LOG rules with full v6 addresses, so
+// flipping FilterMode to eBPF (E5) would otherwise blind v6 filter logging.
+//
+// Rather than widen event_t (which would ripple into the proven v4 event
+// binary offsets, the v4 Go decoder, and the v4 log format), we add a PARALLEL
+// v6 event variant — same precedent as the E2 parallel v6 maps. The v4 path,
+// the v4 perf map, and its on-wire layout are left byte-for-byte untouched.
+//
+// FIELD ORDER mirrors event_t (timestamp, action, src, dst, sport, dport,
+// protocol, len) so the Go decoder can parse v4 and v6 events with the same
+// field sequence (only the address width differs: 16 bytes vs 4). __packed +
+// the _Static_assert below pin the 48-byte size so any C/Go layout drift is a
+// compile-time failure, mirroring the *_v6 key structs (the conntrack-16
+// lesson: a bare __packed token can no-op and natural-align the struct).
+struct event_t_v6 {
+    __u64 timestamp;
+    __u8 action;
+    struct in6_addr src_ip;
+    struct in6_addr dst_ip;
+    __be16 src_port;
+    __be16 dst_port;
+    __u8 protocol;
+    __be16 len;
+} __attribute__((packed));
+
+// 8 (timestamp) + 1 (action) + 16 (src_ip) + 16 (dst_ip) + 2 (src_port)
+//   + 2 (dst_port) + 1 (protocol) + 2 (len) = 48. Mirrored exactly by the Go
+// EventV6 struct (binary.Size(EventV6{}) == 48) — the C↔Go contract guard.
+_Static_assert(sizeof(struct event_t_v6) == 48,
+               "event_t_v6 must be exactly 48 bytes (packed) — keep in lockstep with the Go EventV6 struct");
+
+// Parallel v6 perf map (mirrors `events`). v6 filter-decision events land here
+// so the Go reader can decode them with the v6 (16-byte-address) layout without
+// disturbing the v4 `events` stream. Same depth as `events` (1024).
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(max_entries, 1024);
+} events_v6 SEC(".maps");
+
+// submit_event_v6 mirrors submit_event but emits a struct event_t_v6 to the
+// events_v6 perf map, carrying the full 128-bit src/dst addresses. Addresses
+// are passed as struct in6_addr (already network byte order, exactly as read
+// from ip6h->saddr/daddr); ports/len are __be16 (network order) just like the
+// v4 path. action: 0 = DENY, 1 = ACCEPT.
+static __always_inline int submit_event_v6(void *ctx, __u8 action, struct in6_addr src_ip, struct in6_addr dst_ip, __be16 src_port, __be16 dst_port, __u8 protocol, __be16 len) {
+    struct event_t_v6 ev = {};
+    ev.timestamp = bpf_ktime_get_ns();
+    ev.action = action; // 0 = DENY, 1 = ACCEPT
+    ev.src_ip = src_ip;
+    ev.dst_ip = dst_ip;
+    ev.src_port = src_port;
+    ev.dst_port = dst_port;
+    ev.protocol = protocol;
+    ev.len = len;
+
+    // Submit the v6 event details to the user space Perf Buffer (events_v6).
+    return bpf_perf_event_output(ctx, &events_v6, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
+}
+
 static __always_inline void reverseTuple(struct ipv4_ct_tuple *key) {
     __u32 tmp_ip = key->daddr;
     __u16 tmp_port = key->dport;
@@ -576,8 +642,15 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                                              struct ethhdr *eth,
                                              void *data_end) {
     struct ipv6hdr *ip6h = (void *)(eth + 1);
-    if ((void *)(ip6h + 1) > data_end)
+    if ((void *)(ip6h + 1) > data_end) {
+        // IPv6 fixed header is truncated — saddr/daddr are NOT readable here, so
+        // we emit a DENY with ZEROED addresses (matching iptables, which also
+        // cannot log what it cannot parse). E3 surfaces the DROP so it is not
+        // silent; the addresses are simply unrecoverable at this point.
+        struct in6_addr zero6 = {};
+        submit_event_v6(ctx, 0, zero6, zero6, 0, 0, 0, 0);
         return XDP_DROP;
+    }
 
     __u8 nexthdr = ip6h->nexthdr;
 
@@ -587,11 +660,17 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
     __be16 total_len = bpf_htons(bpf_ntohs(ip6h->payload_len) + sizeof(struct ipv6hdr));
 
     // No extension-header chaining (see LIMITATION above): accept ONLY a fixed
-    // header that points directly at TCP/UDP/ICMPv6; DROP everything else.
+    // header that points directly at TCP/UDP/ICMPv6; DROP everything else. The
+    // 40-byte fixed header is already bounds-validated above, so saddr/daddr ARE
+    // readable — emit a DENY with the real addresses (E3) before the DROP so an
+    // ext-header / unsupported-nexthdr drop is logged, matching iptables. ports
+    // are 0 (no parsed L4); nexthdr is carried for diagnostics.
     if (nexthdr != IPPROTO_TCP &&
         nexthdr != IPPROTO_UDP &&
-        nexthdr != IPPROTO_ICMPV6)
+        nexthdr != IPPROTO_ICMPV6) {
+        submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
         return XDP_DROP;
+    }
 
     // L4 ports. ICMPv6 is portless, so ports stay 0 for it (and the port-based
     // maps below cannot match it — it is admitted only via icmp_wl_v6).
@@ -600,14 +679,23 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
     void *l4 = (void *)(ip6h + 1);   // 40-byte fixed header → L4 starts here
     if (nexthdr == IPPROTO_TCP) {
         struct tcphdr *tcp = l4;
-        if ((void *)(tcp + 1) > data_end)
+        if ((void *)(tcp + 1) > data_end) {
+            // L4 (TCP) header truncated. The IPv6 fixed header is valid, so the
+            // addresses are recoverable — emit a DENY with real addrs (E3). The
+            // ports are NOT yet parsed at this point, so they are 0 (honest:
+            // can't log what wasn't parsed).
+            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
             return XDP_DROP;
+        }
         sport = tcp->source;
         dport = tcp->dest;
     } else if (nexthdr == IPPROTO_UDP) {
         struct udphdr *udp = l4;
-        if ((void *)(udp + 1) > data_end)
+        if ((void *)(udp + 1) > data_end) {
+            // L4 (UDP) header truncated — same treatment as the TCP case above.
+            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
             return XDP_DROP;
+        }
         sport = udp->source;
         dport = udp->dest;
     }
@@ -638,8 +726,16 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
     // rather than being rescuable via a broad src+dst rule.
     if (nexthdr == IPPROTO_ICMPV6) {
         struct icmp6hdr *icmp6 = l4;
-        if ((void *)(icmp6 + 1) > data_end)
+        if ((void *)(icmp6 + 1) > data_end) {
+            // ICMPv6 L4 header truncated. Fixed header is valid → addresses
+            // recoverable; emit a DENY with real addrs (E3), ports 0 (ICMPv6 is
+            // portless). This is the L4-header-truncation parity with TCP/UDP
+            // above. NOTE: the ICMPv6 *type* denials below (echo-not-allowed,
+            // unsupported type) are deliberately left SILENT to mirror the v4
+            // ICMP path, which does not emit a DENY on those — see E3 design.
+            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
             return XDP_DROP;
+        }
         __u8 icmp6_type = icmp6->icmp6_type;
 
         // Neighbor Discovery (133–137) is the IPv6 analog of ARP: it is how the
@@ -755,7 +851,7 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (w_val->allowed == 1) {
-                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -784,7 +880,7 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (sd_val->allowed == 1) {
-                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -813,7 +909,7 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (sp_val->allowed == 1) {
-                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -843,7 +939,7 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (pl_val->allowed == 1) {
-                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -874,7 +970,7 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (pp_val->allowed == 1) {
-                submit_event(ctx, 1, 0, 0, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -891,8 +987,10 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
     }
 
     // No allow-rule matched → fail CLOSED (the whole point of this slice: the
-    // ETH_P_IPV6 arm no longer fail-OPENs). Emit a DENY event like v4, then DROP.
-    submit_event(ctx, 0, 0, 0, sport, dport, nexthdr, total_len);
+    // ETH_P_IPV6 arm no longer fail-OPENs). Emit a DENY event like v4 — now with
+    // the full v6 src/dst addresses (E3) so the eBPF path matches the iptables
+    // [NHP-DENY6] LOG rule — then DROP.
+    submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
     return XDP_DROP;
 }
 
@@ -920,14 +1018,30 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
 
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
+        // IPv4 header truncated — no addresses to log. KEEP SILENT (E3: an
+        // IP-header-truncation drop has no recoverable 4-tuple, matching the
+        // eth-truncation drops above). The Go reader never sees an event here.
         return XDP_DROP;
 
-    if (iph->ihl < 5)
+    if (iph->ihl < 5) {
+        // Malformed IHL (< 5 = header shorter than the 20-byte minimum). The
+        // src/dst words are physically present but the header is structurally
+        // invalid, so we cannot trust the parse — emit a DENY with ZEROED
+        // addresses (E3 residual v4 parity), matching iptables' inability to
+        // log a 4-tuple it can't validate. Surfacing the DROP (not silent) is
+        // the point; the addresses are reported as 0.
+        submit_event(ctx, 0, 0, 0, 0, 0, iph->protocol, iph->tot_len);
         return XDP_DROP;
+    }
 
     if (iph->protocol == IPPROTO_TCP) {
         tcp = (void *)(iph + 1);
         if ((void *)(tcp + 1) > data_end) {
+            // TCP header truncated. The IPv4 header is valid (bounds + IHL
+            // checked above), so the addresses ARE recoverable — emit a DENY
+            // with real addrs (E3). Ports are NOT yet parsed here, so they are
+            // 0 (honest: can't log what wasn't parsed).
+            submit_event(ctx, 0, iph->saddr, iph->daddr, 0, 0, iph->protocol, iph->tot_len);
             return XDP_DROP;
         }
         ct_key.nexthdr = IPPROTO_TCP;
@@ -936,8 +1050,12 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
         // ct_key.dport = bpf_htons(tcp->dest);
     } else if (iph->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (void *)(iph + 1);
-        if ((void *)(udp + 1) > data_end)
+        if ((void *)(udp + 1) > data_end) {
+            // UDP header truncated — same treatment as the TCP case above:
+            // real addrs (recoverable), ports 0 (not yet parsed).
+            submit_event(ctx, 0, iph->saddr, iph->daddr, 0, 0, iph->protocol, iph->tot_len);
             return XDP_DROP;
+        }
         ct_key.nexthdr = IPPROTO_UDP;
         ct_key.sport = udp->source;
         ct_key.dport = udp->dest;
@@ -947,8 +1065,14 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
 
     if (iph->protocol == IPPROTO_TCP) {
         void *tcp_start = (void *)iph + (iph->ihl * 4);
-        if ((void *)(tcp_start + sizeof(struct tcphdr)) > data_end)
+        if ((void *)(tcp_start + sizeof(struct tcphdr)) > data_end) {
+            // TCP options-aware re-parse (offset by ihl*4) ran off the packet
+            // end. The IPv4 header + ports were already parsed (ct_key.sport/
+            // dport set above), so the full 4-tuple is recoverable — emit a DENY
+            // with real addrs + the parsed ports (E3 residual v4 parity).
+            submit_event(ctx, 0, iph->saddr, iph->daddr, ct_key.sport, ct_key.dport, iph->protocol, iph->tot_len);
             return XDP_DROP;
+        }
 
         struct tcphdr *tcp = tcp_start;
         if (__constant_htons(tcp->dest) == 22) {
