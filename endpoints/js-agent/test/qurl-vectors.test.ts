@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { readFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { issuerSignatureVectors } from "@layervai/qurl-conformance";
 import {
   verifyIssuerSignature,
   SignatureHighSError,
@@ -18,10 +17,10 @@ import { parseAndVerifyFragment } from "../src/qurl/fragment";
 
 // THE WEBCRYPTO LEG OF THE Go<->JS GOLDEN-VECTOR CONTRACT.
 //
-// This consumes the EXACT same fixture as the Go verifier — a byte-for-byte copy
-// of qurl-service internal/qurlv2/testdata/issuer_signature_vectors.json — and
-// proves WebCrypto verification agrees with Go on the pinned P-256 raw r||s low-S
-// wire encoding. The two divergence points it pins:
+// This consumes the EXACT same fixture as the Go verifier — the issuer-signature
+// vectors from the pinned @layervai/qurl-conformance package — and proves
+// WebCrypto verification agrees with Go on the pinned P-256 raw r||s low-S wire
+// encoding. The two divergence points it pins:
 //   - the 0x00 domain separator (signing_input_b64 cross-check), and
 //   - high-S rejection (WebCrypto's raw ECDSA accepts high-S; the JS gate must
 //     reject it) plus wrong-length DER rejection.
@@ -29,10 +28,6 @@ import { parseAndVerifyFragment } from "../src/qurl/fragment";
 // It FAILS (never skips) if the fixture is missing/unparseable, so the contract
 // can never silently drop out of CI — mirrors Go's LoadVectorFile + the always-run
 // TestGoldenVectors_Consume.
-
-const VECTOR_PATH = fileURLToPath(
-  new URL("./testdata/issuer_signature_vectors.json", import.meta.url),
-);
 
 const EXPECT_ACCEPT = "accept";
 const EXPECT_REJECT = "reject";
@@ -63,17 +58,15 @@ interface VectorFile {
 }
 
 function loadVectorFile(): VectorFile {
-  // Fail loudly if the shared fixture is absent — this is the contract, not an
-  // optional fixture. (Go's LoadVectorFile errors rather than returning empty.)
-  if (!existsSync(VECTOR_PATH)) {
-    throw new Error(
-      `golden-vector fixture missing at ${VECTOR_PATH}: copy it from ` +
-        `qurl-service internal/qurlv2/testdata/issuer_signature_vectors.json`,
-    );
-  }
-  const vf = JSON.parse(readFileSync(VECTOR_PATH, "utf8")) as VectorFile;
+  // The bytes come from the pinned @layervai/qurl-conformance package (the same
+  // bytes the Go verifier embeds). A missing import fails loudly on its own —
+  // this is the contract, not an optional fixture. (Go's LoadVectorFile errors
+  // rather than returning empty.)
+  const vf = issuerSignatureVectors() as VectorFile;
   if (!vf.vectors || vf.vectors.length === 0) {
-    throw new Error(`golden-vector fixture ${VECTOR_PATH} has no vectors`);
+    throw new Error(
+      "golden-vector fixture from @layervai/qurl-conformance has no vectors",
+    );
   }
   return vf;
 }
