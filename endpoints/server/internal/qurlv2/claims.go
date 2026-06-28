@@ -191,9 +191,10 @@ func encodeB64(b []byte) string {
 
 // decodeB64 decodes an unpadded-base64url string and accepts it ONLY if the input
 // is the unique canonical encoding of the bytes it decodes to. This is the contract
-// the nhp-owned conformance artifact (testdata/qv2_conformance_vectors.json,
-// strict_base64 class) pins for every qv2 verifier — the TS js-agent verifier and
-// the qurl-go SDK both vendor and re-run it. All implementations must agree on
+// the LayerV-owned conformance artifact (qv2_conformance_vectors.json, strict_base64
+// class, now pinned via the public github.com/layervai/qurl-conformance module)
+// pins for every qv2 verifier — the TS js-agent verifier and the qurl-go SDK both
+// re-run it. All implementations must agree on
 // which STRINGS are well-formed, not merely on which bytes a lenient decoder
 // recovers, so a non-canonical variant of a signed part is rejected here rather
 // than silently normalized.

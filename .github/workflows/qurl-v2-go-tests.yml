@@ -13,15 +13,19 @@
 # the merge runs. That auto-tracks the Makefile's curated `-run` allowlist
 # (so an edit to the suite is picked up here with no workflow change) and
 # inherits the `KBS_SKIP_INIT=1` baked into the endpoints recipe, so the run
-# is hermetic (no etcd / network / key-init). The `test` target has no build
-# prerequisite and nhp has no private cross-repo deps, so it runs standalone.
+# is hermetic (no etcd / key-init / no private cross-repo deps). The `test`
+# target has no build prerequisite. The one external dep is the public
+# `github.com/layervai/qurl-conformance` module, so a COLD module cache does a
+# one-time `proxy.golang.org` fetch (setup-go caches by go.sum afterward) — i.e.
+# not strictly "no network" on a cold cache, but no etcd/key-init/private deps.
 #
 # Complement, not duplicate, the qURL-plugin workflow (PR #2819 ->
 # qurl-v2-qurl-plugin-tests.yml): `make test`'s endpoints `-run` allowlist
-# (`Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry`)
-# deliberately EXCLUDES the qURL plugin package's tests (incl. TestWS1_*).
-# `make test` *compiles* ./server/staticplugins/qurl/... but runs none of its
-# tests; the plugin workflow runs exactly those. Zero execution overlap by
+# (`Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry|TestConformanceVectors`)
+# runs the qurlv2 conformance contract (PR #2834 added the TestConformanceVectors
+# token) but deliberately EXCLUDES the qURL plugin package's tests (incl.
+# TestWS1_*). `make test` *compiles* ./server/staticplugins/qurl/... but runs none
+# of its tests; the plugin workflow runs exactly those. Zero execution overlap by
 # construction. This file owns the make-test-equivalent coverage; the plugin
 # workflow stays the TestWS1 carve-out. See that PR's #2826 follow-up for the
 # qurl-v2 -> main continuity plan (fold TestWS1 into the make-test allowlist

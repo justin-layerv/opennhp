@@ -10,13 +10,8 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/utils"
 )
 
-// conformanceFilePath is the committed nhp-owned conformance artifact. It is a
-// standalone JSON document so the js-agent and the future qurl-go can vendor the
-// EXACT same bytes and run the same classes against their own implementations.
-const conformanceFilePath = "testdata/qv2_conformance_vectors.json"
-
 // TestConformanceVectors is the always-run, every-class contract test. It loads
-// the committed artifact and drives EVERY class -- including every negative --
+// the pinned conformance artifact and drives EVERY class -- including every negative --
 // through the package's REAL entry points, asserting the declared accept/reject
 // outcome and (where the class pins it) the reject_class. It FAILS (never skips)
 // if the artifact is missing/unparseable, so the contract can never silently drop
@@ -30,23 +25,20 @@ const conformanceFilePath = "testdata/qv2_conformance_vectors.json"
 // recompute-equality derivation with no reject branch, so its runner fails loudly
 // on any non-accept expect rather than honoring a flip -- see runServerIDClass.
 //
-// CI-COVERAGE GAP (read before relying on this as a CI gate): on the qurl-v2
-// integration branch this test is COMPILED but not yet EXECUTED by CI -- `make
-// test`'s endpoints -run allowlist
-// (Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry)
-// excludes TestConformanceVectors, and the qURL-plugin CI workflow runs only the
-// plugin package. So until the allowlist is widened (proposed to the make-test
-// allowlist owner under the #2826 qurl-v2 -> main continuity plan; one token,
-// "...|TestConformanceVectors"), a drifted vector or verifier regression fails this
-// test only when run locally (`go test -race ./server/internal/qurlv2/...`), not in
-// CI. The "a drifting verifier fails its own run" guarantee is therefore local-only
-// on qurl-v2 today; the local -race run is the behavioral proof until then.
+// CI coverage: this test RUNS in CI. PR #2834 widened `make test`'s endpoints
+// -run allowlist
+// (Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry|TestConformanceVectors)
+// to include TestConformanceVectors, and the qurl-v2-go-tests.yml workflow runs
+// `make test` on every qurl-v2-targeted PR. So a drifted vector or a verifier
+// regression fails this test in CI, not just locally -- the "a drifting verifier
+// fails its own run" guarantee holds on the qurl-v2 branch. The local -race run
+// (`go test -race ./server/internal/qurlv2/...`) remains the fullest behavioral proof.
 func TestConformanceVectors(t *testing.T) {
-	cf, err := LoadConformanceFile(conformanceFilePath)
+	cf, err := loadConformanceFile()
 	if err != nil {
 		t.Fatalf("conformance artifact must load: %v", err)
 	}
-	// The artifact-id identity check now lives in LoadConformanceFile (so every
+	// The artifact-id identity check now lives in parseConformanceFile (so every
 	// consumer, not just this test, fails closed on a wrong-artifact document);
 	// re-assert it here against the exported constant as a belt-and-suspenders pin.
 	if cf.Artifact != ConformanceArtifactID {
@@ -98,7 +90,10 @@ func runSignatureClass(t *testing.T, cf *ConformanceFile) {
 	if cf.SignatureClass.Composes != "issuer_signature_vectors.json" {
 		t.Fatalf("signature class must compose issuer_signature_vectors.json, got %q", cf.SignatureClass.Composes)
 	}
-	vf, err := LoadVectorFile("testdata/" + cf.SignatureClass.Composes)
+	// The composed file is the same pinned-module artifact: the conformance bytes
+	// name it (assertion above) and the module embeds it under that name, so loading
+	// it via loadVectorFile() honors the composition pointer.
+	vf, err := loadVectorFile()
 	if err != nil {
 		t.Fatalf("composed signature fixture must load: %v", err)
 	}

@@ -15,9 +15,10 @@ import (
 // Local (KMS-free) test signer for the verify-side port.
 //
 // qurl-service's qurlv2 package signs through a KMS client (issuer.go), but the
-// nhp port carries only the VERIFY side — nhp never mints qURLs. The committed
-// golden vectors (testdata/issuer_signature_vectors.json) are the cross-language
-// CONTRACT proving nhp verification agrees byte-for-byte with the KMS sign output;
+// nhp port carries only the VERIFY side — nhp never mints qURLs. The pinned
+// golden vectors (issuer_signature_vectors.json, from the public
+// github.com/layervai/qurl-conformance module) are the cross-language CONTRACT
+// proving nhp verification agrees byte-for-byte with the KMS sign output;
 // see vectors_test.go (TestGoldenVectors_Consume) for that always-run proof.
 //
 // These helpers exist only so the ported fragment/parse/strict-b64 tests can mint

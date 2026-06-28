@@ -3,8 +3,8 @@ package qurlv2
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
 )
 
 // Golden-vector fixture schema for qURL v2 issuer signatures.
@@ -99,14 +99,13 @@ const (
 	RejectClassWrongLength = "wrong_length"
 )
 
-// LoadVectorFile reads and parses a committed vector file. It returns an error
-// (never an empty/zero document) if the file is missing or malformed, so a
-// consumer test FAILS rather than silently skipping the contract.
-func LoadVectorFile(path string) (*VectorFile, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // fixed test fixture path, not user input
-	if err != nil {
-		return nil, fmt.Errorf("qurlv2: read vector file: %w", err)
-	}
+// parseVectorFile strictly parses issuer-signature vector bytes into a VectorFile.
+// It returns an error (never an empty/zero document) if the bytes are malformed, so
+// a consumer test FAILS rather than silently skipping the contract. The pinned
+// module's embedded bytes (conformance.IssuerSignatureVectors) are fed in by the
+// test-only loader in conformance_loaders_test.go, keeping qurl-conformance out of
+// the production import graph.
+func parseVectorFile(data []byte) (*VectorFile, error) {
 	var vf VectorFile
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -114,7 +113,7 @@ func LoadVectorFile(path string) (*VectorFile, error) {
 		return nil, fmt.Errorf("qurlv2: parse vector file: %w", err)
 	}
 	if len(vf.Vectors) == 0 {
-		return nil, fmt.Errorf("qurlv2: vector file %s has no vectors", path)
+		return nil, errors.New("qurlv2: vector file has no vectors")
 	}
 	return &vf, nil
 }

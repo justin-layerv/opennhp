@@ -3,13 +3,13 @@ package qurlv2
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
 )
 
 // qURL v2 conformance-vector artifact loader.
 //
-// qv2_conformance_vectors.json is the nhp-OWNED, language-agnostic wire-truth for
+// qv2_conformance_vectors.json is the LayerV-owned, language-agnostic wire-truth for
 // the qURL v2 verify path. Every qURL v2 verifier (the Go package here, the
 // TypeScript js-agent, and the future qurl-go) re-runs the SAME bytes against its
 // OWN implementation: a consumer feeds each class's input through its real
@@ -18,10 +18,16 @@ import (
 // a consumer recomputes/re-verifies rather than trusting a stored boolean -- so a
 // verifier that drifts from the contract fails its own run.
 //
+// The bytes are no longer vendored under testdata/: they come from the
+// version-pinned public module github.com/layervai/qurl-conformance (go:embed
+// accessors conformance.QV2Vectors / conformance.IssuerSignatureVectors), so every
+// language binding consumes one source of truth. See that module's
+// vectors/README_qv2_conformance_vectors.md for the schema, the reject_class
+// vocabulary, the class-to-entry-point map, and the ownership story.
+//
 // This file is the schema + loader. conformance_test.go is the always-run test
 // that drives every class (including negatives) through the package's real entry
-// points. See README_qv2_conformance_vectors.md for the schema, the reject_class
-// vocabulary, the class-to-entry-point map, and the vendoring/ownership story.
+// points.
 //
 // Input-shape-per-class (NOT one uniform shape): each class carries the exact
 // input form its target entry point consumes, so a stored fault survives to the
@@ -183,16 +189,17 @@ type ConformanceVector struct {
 // tells vendors to assert artifact + version).
 const ConformanceArtifactID = "qurl-v2-conformance-vectors"
 
-// LoadConformanceFile reads and strictly parses the conformance artifact. It
-// returns an error (never an empty/zero document) when the file is missing,
-// malformed, or is not the qURL v2 conformance artifact, so a consumer test FAILS
-// rather than silently skipping or misreading the contract. DisallowUnknownFields
-// keeps a typo'd or stale schema field from being ignored.
-func LoadConformanceFile(path string) (*ConformanceFile, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // fixed test fixture path, not user input
-	if err != nil {
-		return nil, fmt.Errorf("qurlv2: read conformance file: %w", err)
-	}
+// parseConformanceFile strictly parses conformance-artifact bytes into a
+// ConformanceFile. It returns an error (never an empty/zero document) when the
+// bytes are malformed or are not the qURL v2 conformance artifact, so a consumer
+// test FAILS rather than silently skipping or misreading the contract.
+// DisallowUnknownFields keeps a typo'd or stale schema field from being ignored.
+//
+// The pinned module's embedded bytes (conformance.QV2Vectors) are fed in by the
+// test-only loader in conformance_loaders_test.go; keeping the byte-parser here
+// (and the module import out) leaves qurl-conformance out of the production import
+// graph.
+func parseConformanceFile(data []byte) (*ConformanceFile, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var cf ConformanceFile
@@ -200,13 +207,13 @@ func LoadConformanceFile(path string) (*ConformanceFile, error) {
 		return nil, fmt.Errorf("qurlv2: parse conformance file: %w", err)
 	}
 	if cf.Artifact != ConformanceArtifactID {
-		return nil, fmt.Errorf("qurlv2: conformance file %s has artifact %q, want %q", path, cf.Artifact, ConformanceArtifactID)
+		return nil, fmt.Errorf("qurlv2: conformance file has artifact %q, want %q", cf.Artifact, ConformanceArtifactID)
 	}
 	if cf.SchemaVersion == 0 {
-		return nil, fmt.Errorf("qurlv2: conformance file %s missing schema_version", path)
+		return nil, errors.New("qurlv2: conformance file missing schema_version")
 	}
 	if len(cf.Classes) == 0 {
-		return nil, fmt.Errorf("qurlv2: conformance file %s has no classes", path)
+		return nil, errors.New("qurlv2: conformance file has no classes")
 	}
 	return &cf, nil
 }
