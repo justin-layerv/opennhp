@@ -42,32 +42,44 @@ struct whitelist_key {
     __be16 dst_port;
     __u8 protocol;
 } __attribute__((packed));
+_Static_assert(sizeof(struct whitelist_key) == 11,
+               "whitelist_key must be exactly 11 bytes");
 
 struct src_port_list_key {
     __be32 src_ip;
     __be16 dst_port;
 } __attribute__((packed));
+_Static_assert(sizeof(struct src_port_list_key) == 6,
+               "src_port_list_key must be exactly 6 bytes");
 
 struct port_list_key {
     __be32 src_ip;
     __be16 min_port;
     __be16 max_port;
 } __attribute__((packed));
+_Static_assert(sizeof(struct port_list_key) == 8,
+               "port_list_key must be exactly 8 bytes");
 
 struct protocol_port_key {
     __be16 dst_port;
     __u8 protocol;
 } __attribute__((packed));
+_Static_assert(sizeof(struct protocol_port_key) == 3,
+               "protocol_port_key must be exactly 3 bytes");
 
 struct icmpwhitelist_key {
     __be32 src_ip;
     __be32 dst_ip;
 } __attribute__((packed));
+_Static_assert(sizeof(struct icmpwhitelist_key) == 8,
+               "icmpwhitelist_key must be exactly 8 bytes");
 
 struct sdwhitelist_key {
     __be32 src_ip;
     __be32 dst_ip;
 } __attribute__((packed));
+_Static_assert(sizeof(struct sdwhitelist_key) == 8,
+               "sdwhitelist_key must be exactly 8 bytes");
 
 struct whitelist_value {
     __u8 allowed;
@@ -97,7 +109,22 @@ struct port_list_value {
 struct protocol_port_value {
     __u8 allowed;
     __u64 expire_time;
-} __attribute__((packed));
+};
+
+#define ASSERT_ALLOW_VALUE_LAYOUT(name)                               \
+    _Static_assert(sizeof(struct name) == 16,                         \
+                   #name " must be exactly 16 bytes");                \
+    _Static_assert(__builtin_offsetof(struct name, expire_time) == 8, \
+                   #name ".expire_time must start at byte 8")
+
+ASSERT_ALLOW_VALUE_LAYOUT(whitelist_value);
+ASSERT_ALLOW_VALUE_LAYOUT(icmpwhitelist_value);
+ASSERT_ALLOW_VALUE_LAYOUT(sdwhitelist_value);
+ASSERT_ALLOW_VALUE_LAYOUT(src_port_list_value);
+ASSERT_ALLOW_VALUE_LAYOUT(port_list_value);
+ASSERT_ALLOW_VALUE_LAYOUT(protocol_port_value);
+
+#undef ASSERT_ALLOW_VALUE_LAYOUT
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -382,7 +409,6 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
         .min_port = MIN_PORT,
         .max_port = MAX_PORT
     };
-    __u16 dst_port = bpf_ntohs(ct_key.dport);
 
     struct protocol_port_key pp_key = {
         .dst_port = ct_key.dport,

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strconv"
 	"syscall"
 	"unsafe"
 
@@ -14,6 +13,10 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
+// Key serializers preserve the byte order used by XDP lookups. IPv4 octets
+// stay in network order because parseIP decodes them into uint32 values with
+// LittleEndian and the serializers re-encode them the same way. Ports are
+// written big-endian to match raw packet __be16 fields.
 type whitelistKey struct {
 	SrcIP    uint32 `ebpf:"src_ip"`
 	DstIP    uint32 `ebpf:"dst_ip"`
@@ -27,9 +30,9 @@ type srcDestKey struct {
 }
 
 type portListKey struct {
-	SrcIP        uint32 `ebpf:"src_ip"`
-	DstPortStart uint16 `ebpf:"dst_port_start"`
-	DstPortEnd   uint16 `ebpf:"dst_port_end"`
+	SrcIP   uint32 `ebpf:"src_ip"`
+	MinPort uint16 `ebpf:"min_port"`
+	MaxPort uint16 `ebpf:"max_port"`
 }
 
 type srcIPdstPortKey struct {
@@ -37,7 +40,7 @@ type srcIPdstPortKey struct {
 	DstPort uint16 `ebpf:"dst_port"`
 }
 
-type procoPortKey struct {
+type protocolPortKey struct {
 	DstPort  uint16 `ebpf:"dst_port"`
 	Protocol uint8  `ebpf:"protocol"`
 }
@@ -48,8 +51,9 @@ type whitelistValue struct {
 	ExpireTime uint64
 }
 
-type procoPortValue struct {
+type protocolPortValue struct {
 	Allowed    uint8
+	_          [7]byte
 	ExpireTime uint64
 }
 
@@ -99,6 +103,7 @@ type EbpfRuleParams struct {
 	Protocol     string
 }
 
+// Mirrors struct whitelist_key in ebpf/xdp/nhp_ebpf_xdp.c.
 func (r *whitelistKey) ToWlKey() []byte {
 	keyBytes := make([]byte, 11)
 	binary.LittleEndian.PutUint32(keyBytes[0:4], r.SrcIP)
@@ -116,6 +121,8 @@ func (r *whitelistKey) ToWlValue(ttlSec uint64) whitelistValue {
 	}
 }
 
+// Mirrors struct sdwhitelist_key and struct icmpwhitelist_key in
+// ebpf/xdp/nhp_ebpf_xdp.c.
 func (r *srcDestKey) ToSdKey() []byte {
 	keyBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint32(keyBytes[0:4], r.SrcIP)
@@ -131,26 +138,28 @@ func (r *srcDestKey) ToSdValue(ttlSec uint64) whitelistValue {
 	}
 }
 
-func (r *procoPortKey) ToPpKey() []byte {
+// Mirrors struct protocol_port_key in ebpf/xdp/nhp_ebpf_xdp.c.
+func (r *protocolPortKey) ToPpKey() []byte {
 	keyBytes := make([]byte, 3)
-	binary.LittleEndian.PutUint16(keyBytes[0:2], r.DstPort)
+	binary.BigEndian.PutUint16(keyBytes[0:2], r.DstPort)
 	keyBytes[2] = r.Protocol
 	return keyBytes
 }
 
-func (r *procoPortKey) ToPpValue(ttlSec uint64) procoPortValue {
+func (r *protocolPortKey) ToPpValue(ttlSec uint64) protocolPortValue {
 	now, _ := getBootTimeNanos()
-	return procoPortValue{
+	return protocolPortValue{
 		Allowed:    1,
 		ExpireTime: now + ttlSec*1_000_000_000,
 	}
 }
 
+// Mirrors struct port_list_key in ebpf/xdp/nhp_ebpf_xdp.c.
 func (r *portListKey) ToPlKey() []byte {
 	keyBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint32(keyBytes[0:4], r.SrcIP)
-	binary.LittleEndian.PutUint16(keyBytes[4:6], r.DstPortStart)
-	binary.LittleEndian.PutUint16(keyBytes[6:8], r.DstPortEnd)
+	binary.BigEndian.PutUint16(keyBytes[4:6], r.MinPort)
+	binary.BigEndian.PutUint16(keyBytes[6:8], r.MaxPort)
 	return keyBytes
 }
 
@@ -162,10 +171,11 @@ func (r *portListKey) ToPlValue(ttlSec uint64) whitelistValue {
 	}
 }
 
+// Mirrors struct src_port_list_key in ebpf/xdp/nhp_ebpf_xdp.c.
 func (r *srcIPdstPortKey) ToSpKey() []byte {
 	keyBytes := make([]byte, 6)
 	binary.LittleEndian.PutUint32(keyBytes[0:4], r.SrcIP)
-	binary.LittleEndian.PutUint16(keyBytes[4:6], r.DstPort)
+	binary.BigEndian.PutUint16(keyBytes[4:6], r.DstPort)
 	return keyBytes
 }
 
@@ -214,12 +224,12 @@ func AddSdPortlistRule(whitelistMap *ebpf.Map, rule *portListKey, ttlSec uint64)
 }
 
 // function for update protocol_port map
-func AddPpWhitelistRule(whitelistMap *ebpf.Map, rule *procoPortKey, ttlSec uint64) error {
+func AddProtocolPortWhitelistRule(whitelistMap *ebpf.Map, rule *protocolPortKey, ttlSec uint64) error {
 	keyBytes := rule.ToPpKey()
 	value := rule.ToPpValue(ttlSec)
 
 	if err := whitelistMap.Update(keyBytes, &value, ebpf.UpdateAny); err != nil {
-		log.Error("failed to update sdwhitelist map: %v", err)
+		log.Error("failed to update protocol_port map: %v", err)
 		return err
 	}
 	return nil
@@ -380,9 +390,11 @@ func AddEbpfRuleForSrcDestPortList(srcIPStr string, dstPortStart, dstPortEnd int
 	}
 
 	rule := &portListKey{
-		SrcIP:        srcIP,
-		DstPortStart: portStart,
-		DstPortEnd:   portEnd,
+		SrcIP: srcIP,
+		// portListKey mirrors XDP's min_port/max_port field names; the
+		// rule API keeps the start/end wording callers already use.
+		MinPort: portStart,
+		MaxPort: portEnd,
 	}
 
 	return AddSdPortlistRule(portListMap, rule, ttlSec)
@@ -390,25 +402,19 @@ func AddEbpfRuleForSrcDestPortList(srcIPStr string, dstPortStart, dstPortEnd int
 
 // function for update protocol dstport map
 func AddEbpfRuleForProtocolPort(protocol uint8, dstPort uint16, ttlSec uint64) error {
-	portStr := fmt.Sprintf("%d", dstPort)
-	dstPortt, err := parsePort(portStr)
-	if err != nil {
-		log.Error("failed to parsePort: %v", portStr)
-		return err
-	}
-	portListMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/protocol_port", nil)
+	protocolPortMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/protocol_port", nil)
 	if err != nil {
 		log.Error("failed to load pinned protocol_port map: %v", err)
 		return err
 	}
-	defer func() { _ = portListMap.Close() }()
+	defer func() { _ = protocolPortMap.Close() }()
 
-	rule := &procoPortKey{
-		DstPort:  dstPortt,
+	rule := &protocolPortKey{
+		DstPort:  dstPort,
 		Protocol: protocol,
 	}
 
-	return AddPpWhitelistRule(portListMap, rule, ttlSec)
+	return AddProtocolPortWhitelistRule(protocolPortMap, rule, ttlSec)
 }
 
 func safeIntToUint16(i int) (uint16, error) {
@@ -593,13 +599,4 @@ func parseIP(ipStr string) (uint32, error) {
 		return 0, fmt.Errorf("only IPv4 addresses are supported: %s", ipStr)
 	}
 	return binary.LittleEndian.Uint32(ip), nil
-}
-
-// Parse the port
-func parsePort(portStr string) (uint16, error) {
-	port, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
-		return 0, err
-	}
-	return binary.LittleEndian.Uint16([]byte{byte(port >> 8), byte(port & 0xFF)}), nil
 }
