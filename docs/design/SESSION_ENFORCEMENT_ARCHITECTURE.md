@@ -363,18 +363,17 @@ bump, any `MAX_ENTRIES_V6` change is flip-time work that must re-run this math
 against the chosen instance type, co-decided under
 [nhp#2813](https://github.com/layervai/nhp/issues/2813).
 
-> **Guarantee gap — the C↔Go struct-size contract is not yet enforced in CI.**
-> The v6 key/tuple sizes are pinned with inline `_Static_assert`s in
-> `nhp_ebpf_xdp.c`, but **no CI job compiles that translation unit** (the `.o` is
-> committed; `ubuntu-build.yml` is `branches:[main]`-gated and does not run
-> `make ebpf`, and the BPF target is unavailable on the macOS dev host). So the
-> asserts only fire on a manual `make ebpf` regen, and the size contract that
-> slice 2's Go serializers + golden-byte tests and slice 6's
-> `map.KeySize() == GoSize` test depend on is, for now, locally-verified rather
-> than CI-gated. Wiring a lightweight compile/size-harness gate (and, for
-> symmetry, committed-object freshness coverage beyond the `ipv4_ct_tuple`
-> KeySize/ELF-symbol check added for #2818) is tracked in
-> [nhp#2823](https://github.com/layervai/nhp/issues/2823).
+> **C↔Go struct-size contract — enforced in CI.** The v4 and v6 key/tuple sizes
+> are pinned with `_Static_assert`s in `nhp_ebpf_xdp.c`, which documents the
+> packing rules and the shared size contract.
+> `.github/workflows/ebpf-datapath-test.yml` compiles it via `make test-ebpf`
+> whenever the eBPF source changes, so a wrong size (the `__packed`-no-op
+> regression class behind #2818) fails CI rather than only a local `make ebpf`
+> regen. The same job runs `scripts/check-ebpf-committed-object-drift.sh`, which
+> recompiles the object and diffs load-relevant bytes against the committed
+> `endpoints/ac/main/etc/nhp_ebpf_xdp.o`, so the native-AC load path cannot
+> silently lag the source. (Wiring this enforcement was tracked by
+> [nhp#2823](https://github.com/layervai/nhp/issues/2823).)
 
 > **IPv6 extension-header policy.** `xdp_white_prog_v6` walks a bounded IPv6
 > extension-header chain before admission: Hop-by-Hop Options, Routing,

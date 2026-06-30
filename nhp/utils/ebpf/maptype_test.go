@@ -91,7 +91,9 @@ func TestMapTypeName(t *testing.T) {
 // edit that flips an allow-rule or conntrack map back to LRU before any object
 // regeneration happens. The committed object's conn_track ABI is guarded
 // separately in xdp_object_contract_test.go; broader source/object byte
-// freshness is tracked in #2823.
+// freshness is now gated in CI by scripts/check-ebpf-committed-object-drift.sh,
+// which recompiles the object and diffs load-relevant bytes against the
+// committed native AC object; wiring this gate was tracked by #2823.
 func TestXdpSource_AdmissionMapsAndConnTrackAreHash(t *testing.T) {
 	src := readXdpSource(t)
 
