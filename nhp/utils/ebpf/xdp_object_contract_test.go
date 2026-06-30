@@ -107,10 +107,193 @@ func TestXDPSources_DoNotUseBarePacked(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read %s: %v", path, err)
 			}
-			code := stripCCommentsAndLiterals(string(b))
-			if loc := barePackedRE.FindStringIndex(code); loc != nil {
+			code, loc := findBarePackedToken(string(b))
+			if loc != nil {
 				t.Fatalf("%s contains bare __packed token near %q; use __attribute__((packed)) or an explicit natural-alignment _Static_assert",
 					relPath(testPaths.repoRoot, path), snippet(code, loc[0], loc[1]))
+			}
+		})
+	}
+}
+
+const (
+	scannerContinuedStringLiteralSrc     = "const char *msg = \"split \\\n__packed prose\";\nstruct key { int x; } __packed;"
+	scannerCRLFContinuedStringLiteralSrc = "const char *msg = \"split \\\r\n__packed prose\";\r\nstruct key { int x; } __packed;"
+	scannerMultilineBlockCommentSrc      = "/* historical\n__packed\nfootgun */\nstruct key { int x; };"
+	scannerContinuedLineCommentSrc       = "// historical __packed footgun \\\n__packed is still part of the comment\nstruct key { int x; } __packed;"
+)
+
+func TestBarePackedAuditScanner(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want bool
+	}{
+		{
+			name: "bare token in code",
+			src:  "struct key { int x; } __packed;",
+			want: true,
+		},
+		{
+			name: "bare token at beginning of input",
+			src:  "__packed struct key { int x; };",
+			want: true,
+		},
+		{
+			name: "macro alias definition is rejected by policy",
+			src:  "#define __packed __attribute__((packed))\nstruct key { int x; };",
+			want: true,
+		},
+		{
+			name: "fully spelled packed attribute",
+			src:  "struct key { int x; } __attribute__((packed));",
+			want: false,
+		},
+		{
+			name: "line comment",
+			src:  "// historical __packed footgun\nstruct key { int x; };",
+			want: false,
+		},
+		{
+			name: "backslash continued line comment",
+			src:  "// historical __packed footgun \\\n__packed is still part of the comment\nstruct key { int x; };",
+			want: false,
+		},
+		{
+			name: "crlf backslash continued line comment",
+			src:  "// historical __packed footgun \\\r\n__packed is still part of the comment\r\nstruct key { int x; };",
+			want: false,
+		},
+		{
+			name: "block comment",
+			src:  "/* historical __packed footgun */\nstruct key { int x; };",
+			want: false,
+		},
+		{
+			name: "multiline block comment",
+			src:  scannerMultilineBlockCommentSrc,
+			want: false,
+		},
+		{
+			name: "bare token after block comment is not swallowed",
+			src:  "/* historical __packed footgun */\nstruct key { int x; } __packed;",
+			want: true,
+		},
+		{
+			name: "block comment preserves boundary before bare token",
+			src:  "foo/* gap */__packed;",
+			want: true,
+		},
+		{
+			name: "block comment preserves boundary inside non-token",
+			src:  "__pa/* gap */cked;",
+			want: false,
+		},
+		{
+			name: "string literal",
+			src:  "const char *msg = \"do not write __packed\";\nstruct key { int x; };",
+			want: false,
+		},
+		{
+			name: "bare token after string literal is not swallowed",
+			src:  "const char *msg = \"do not write __packed\";\nstruct key { int x; } __packed;",
+			want: true,
+		},
+		{
+			name: "bare token after escaped quote in string literal is not swallowed",
+			src: `const char *msg = "quote: \" and __packed prose";
+struct key { int x; } __packed;`,
+			want: true,
+		},
+		{
+			name: "bare token after continued string literal is not swallowed",
+			src:  scannerContinuedStringLiteralSrc,
+			want: true,
+		},
+		{
+			name: "bare token after crlf continued string literal is not swallowed",
+			src:  scannerCRLFContinuedStringLiteralSrc,
+			want: true,
+		},
+		{
+			name: "ordinary code line splice creates bare token",
+			src:  "__pa\\\ncked struct key { int x; };",
+			want: true,
+		},
+		{
+			name: "ordinary code crlf line splice creates bare token",
+			src:  "__pa\\\r\ncked struct key { int x; };",
+			want: true,
+		},
+		{
+			name: "char literal",
+			src:  "const char marker = '_'; /* __packed */\nstruct key { int x; };",
+			want: false,
+		},
+		{
+			name: "bare token after escaped quote in char literal is not swallowed",
+			src: `const char quote = '\'';
+struct key { int x; } __packed;`,
+			want: true,
+		},
+		{
+			name: "longer identifier",
+			src:  "int foo__packed = 1;\nstruct key { int x; };",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, loc := findBarePackedToken(tt.src)
+			got := loc != nil
+			if got != tt.want {
+				t.Errorf("bare __packed detection = %t, want %t; stripped source:\n%s", got, tt.want, code)
+			}
+		})
+	}
+}
+
+// This overlaps a few detection fixtures so newline preservation is asserted
+// separately from whether a stripped source still contains a bare token. Ordinary
+// code splices are excluded because C removes those newlines before tokenizing.
+func TestBarePackedAuditScanner_PreservesSkippedNewlines(t *testing.T) {
+	tests := []struct {
+		name      string
+		src       string
+		wantToken bool
+	}{
+		{
+			name:      "continued string literal",
+			src:       scannerContinuedStringLiteralSrc,
+			wantToken: true,
+		},
+		{
+			name:      "crlf continued string literal",
+			src:       scannerCRLFContinuedStringLiteralSrc,
+			wantToken: true,
+		},
+		{
+			name:      "multiline block comment",
+			src:       scannerMultilineBlockCommentSrc,
+			wantToken: false,
+		},
+		{
+			name:      "backslash continued line comment",
+			src:       scannerContinuedLineCommentSrc,
+			wantToken: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, loc := findBarePackedToken(tt.src)
+			if strings.Count(code, "\n") != strings.Count(tt.src, "\n") {
+				t.Fatalf("stripped source preserved %d newlines, want %d; stripped source:\n%s",
+					strings.Count(code, "\n"), strings.Count(tt.src, "\n"), code)
+			}
+			if got := loc != nil; got != tt.wantToken {
+				t.Fatalf("bare __packed detection = %t, want %t; stripped source:\n%s", got, tt.wantToken, code)
 			}
 		})
 	}
@@ -179,9 +362,13 @@ func assertCommittedXDPObjectStrippedBTF(t *testing.T, path string) {
 // stripCCommentsAndLiterals is a narrow scanner for the ASCII C used here, not a
 // full C preprocessor lexer. It preserves code bytes while skipping ordinary
 // comments, backslash-continued line comments, and string/char literals so prose
-// mentions of __packed do not trip the bare-token audit. It assumes well-formed,
-// compilable input; the compiler catches unterminated literals before this
-// guard matters.
+// mentions of __packed do not trip the bare-token audit. Block comments and
+// literals are replaced with a leading space while preserving embedded newlines,
+// matching C's token-boundary behavior closely enough for this guard.
+// Backslash-newline splices in ordinary code are collapsed before token
+// matching; delimiters formed by such splices are not re-lexed as comments or
+// literals. It assumes well-formed, compilable input; the compiler catches
+// unterminated literals before this guard matters.
 func stripCCommentsAndLiterals(src string) string {
 	var out strings.Builder
 	out.Grow(len(src))
@@ -192,7 +379,7 @@ func stripCCommentsAndLiterals(src string) string {
 			for i < len(src) {
 				if src[i] == '\n' {
 					out.WriteByte('\n')
-					if i > 0 && src[i-1] == '\\' {
+					if hasLineContinuationBeforeNewline(src, i) {
 						i++
 						continue
 					}
@@ -203,6 +390,7 @@ func stripCCommentsAndLiterals(src string) string {
 			continue
 		}
 		if i+1 < len(src) && src[i] == '/' && src[i+1] == '*' {
+			out.WriteByte(' ')
 			i += 2
 			for i+1 < len(src) && !(src[i] == '*' && src[i+1] == '/') {
 				if src[i] == '\n' {
@@ -223,7 +411,12 @@ func stripCCommentsAndLiterals(src string) string {
 					out.WriteByte('\n')
 				}
 				if src[i] == '\\' {
-					i++
+					if end, ok := escapedNewlineEnd(src, i); ok {
+						out.WriteByte('\n')
+						i = end
+					} else {
+						i++
+					}
 					continue
 				}
 				if src[i] == quote {
@@ -232,9 +425,41 @@ func stripCCommentsAndLiterals(src string) string {
 			}
 			continue
 		}
+		if end, ok := escapedNewlineEnd(src, i); ok {
+			i = end
+			continue
+		}
 		out.WriteByte(src[i])
 	}
 	return out.String()
+}
+
+func escapedNewlineEnd(src string, slash int) (int, bool) {
+	if slash+1 >= len(src) || src[slash] != '\\' {
+		return 0, false
+	}
+	if src[slash+1] == '\n' {
+		return slash + 1, true
+	}
+	if slash+2 < len(src) && src[slash+1] == '\r' && src[slash+2] == '\n' {
+		return slash + 2, true
+	}
+	return 0, false
+}
+
+func hasLineContinuationBeforeNewline(src string, newline int) bool {
+	i := newline - 1
+	if i >= 0 && src[i] == '\r' {
+		i--
+	}
+	return i >= 0 && src[i] == '\\'
+}
+
+// findBarePackedToken returns loc indexes into the stripped code, not the
+// original source. Callers use loc only to print a nearby diagnostic snippet.
+func findBarePackedToken(src string) (string, []int) {
+	code := stripCCommentsAndLiterals(src)
+	return code, barePackedRE.FindStringIndex(code)
 }
 
 func hasELFSymbol(t *testing.T, path, name string) bool {
