@@ -480,9 +480,16 @@ const (
 	//     count). Drives the revocation-delivery / flush-completion proof the
 	//     design requires.
 	//   - MetricRevocationFlushScheduled — incremented once per entry whose
-	//     tracked FlowKeys were rescheduled to fire now. Distinguishes "entry
-	//     had live L3 flows we forced down" from "entry had no scheduled flows"
-	//     (e.g. scheduler disabled), which Flushed alone cannot.
+	//     tracked FlowKeys were processed by the immediate-revoke path (v4 keys
+	//     rescheduled to fire now; v6 keys torn down via the surgical-v6 seam or
+	//     surfaced as MetricRevocationIPv6HardFail — the coarse reschedule is
+	//     v4-only, #2778 part 2). Distinguishes "entry had scheduled L3 flows we
+	//     acted on" from "entry had no scheduled flows" (e.g. scheduler disabled),
+	//     which Flushed alone cannot. NOTE since #2778 part 2 this is a per-entry
+	//     "processed by revoke" tick, NOT a "a flush fired now" count: a v6-only
+	//     entry increments it even though nothing was rescheduled to fire now (its
+	//     teardown is surgical-v6 or the hard-fail). So a dashboard must not read it
+	//     as "live flows we forced down now" for v6 — that reading holds only for v4.
 	//   - MetricRevocationRejected — incremented once per NHP_REV the AC handler
 	//     (HandleUdpACRevocation, P4e) drops at validation BEFORE reaching
 	//     ApplyRevocation: malformed body, an unsupported/AC-internal scope, an
@@ -511,15 +518,16 @@ const (
 	//     teardown is firing at all. Mirrors the per-family split already used by
 	//     MetricRevocationIPv6HardFail.
 	//   - MetricRevocationIPv6HardFail — incremented for an IPv6 flow a revoke
-	//     could NOT immediately tear down, in BOTH filter modes (#2794): under
-	//     EBPFXDP the surgical path can't address it (conn_track is IPv4-only,
-	//     struct ipv4_ct_tuple) and the eBPF allow-rule maps are v4-only too;
-	//     under FilterMode_IPTABLES the coarse reschedule hands the v6 key to the
-	//     `conntrack -D` flusher, which is IPv4-only (no `-f ipv6`) and rejects it
-	//     at its boundary (the netlink CTA_FILTER replacement that would be
-	//     v6-capable is #2165, UNbuilt). Either way the v6 flow survives the
-	//     revoke until kernel TTL — v6 immediate revoke is a DECLARED out-of-scope
-	//     gap (see the gospel Filter-mode/IPv6 caveat).
+	//     could NOT immediately tear down. Under EBPFXDP, when the v6 conntrack
+	//     seam is UNWIRED (a v4-only build / non-Linux) the surgical path can't
+	//     address the flow (conn_track is IPv4-only, struct ipv4_ct_tuple; #2778);
+	//     when the seam IS wired (#2837) v6 is torn down surgically and this does
+	//     NOT tick. Under FilterMode_IPTABLES there is no v6 teardown at all
+	//     (#2794): `conntrack -D` is IPv4-only (no `-f ipv6`) and the surgical seam
+	//     is EBPFXDP-only; the v6-capable netlink CTA_FILTER replacement is #2165
+	//     (UNbuilt). In the unaddressable cases the v6 flow survives the revoke
+	//     until kernel TTL — a DECLARED out-of-scope gap (see the gospel
+	//     Filter-mode/IPv6 caveat + DE Risk #6).
 	//
 	//     GRANULARITY: ticked once per IPv6 FlowKey when the WHOLE key has no
 	//     teardown path (the iptables branch, the eBPF v6-seam-unwired branch, or
@@ -534,10 +542,12 @@ const (
 	//
 	//     flushEntryNow ticks this directly (eBPF via surgicalFlushFlowKey,
 	//     iptables via its explicit FilterMode_IPTABLES branch) so the signal is
-	//     revocation-specific and NOT conflated with the benign per-flusher skip
-	//     counters (BpfFlusherSkippedCount / ConntrackFlusher metricSkipped) that
-	//     track scheduled-expiry v6 leaks. ANY nonzero reading is a real
-	//     immediate-revocation gap worth alarming on (#2778).
+	//     revocation-specific and (since #2778 part 2) cleanly SPLIT from the benign
+	//     per-flusher expiry-skip counters (BpfFlusherSkippedCount / ConntrackFlusher
+	//     metricSkipped, which track scheduled-expiry v6 leaks only). ANY nonzero
+	//     reading is a real immediate-revocation gap worth alarming on. The split's
+	//     full rationale — incl. the deferred-tick residual (#2901) — is in the
+	//     flushEntryNow godoc / the QURL_V2_KEYED_IDENTITY.md Filter-mode/IPv6 caveat.
 	MetricRevocationStaleDropped      = "RevocationStaleDropped"
 	MetricRevocationEntriesFlushed    = "RevocationEntriesFlushed"
 	MetricRevocationFlushScheduled    = "RevocationFlushScheduled"
@@ -1396,8 +1406,11 @@ func (r *ACRegistration) l3FlushBreakerOpenGauge() float64 {
 // l3FlushBpfSkippedGauge reads the BpfFlusher's non-IPv4 skip
 // counter (when in EBPFXDP mode with BpfFlusher attached). A
 // non-zero reading signals an upstream regression scheduling v6
-// keys under EBPFXDP — see BpfFlusher.Flush godoc. Returns 0 when
-// the feature is off or the flusher isn't a BpfFlusher.
+// keys under EBPFXDP — see BpfFlusher.Flush godoc. This is the
+// EXPIRY-skip signal only: since #2778 part 2 the revoke path's
+// coarse reschedule is IPv4-only, so failed v6 revokes are surfaced
+// on MetricRevocationIPv6HardFail, not here. Returns 0 when the
+// feature is off or the flusher isn't a BpfFlusher.
 func (r *ACRegistration) l3FlushBpfSkippedGauge() float64 {
 	if r.ac == nil {
 		return 0

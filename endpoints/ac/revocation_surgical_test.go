@@ -153,10 +153,10 @@ func TestFlushEntryNow_Surgical_KillsEachSibling(t *testing.T) {
 // the v4 surgical seam is wired (newSurgicalTestAC leaves the v6 seam nil, as on
 // a v4-only EBPFXDP build / non-Linux): a v6 FlowKey is NOT routed through the
 // v4 enumerator, increments MetricRevocationIPv6HardFail, and is NOT silently
-// treated as killed. The coarse path still runs (the only — futile, on v6 —
-// thing available), observable via MetricRevocationFlushScheduled. (When the v6
-// seam IS wired, surgicalFlushFlowKeyV6 instead surgically tears the v6 flow
-// down — see revocation_surgical_v6_test.go.)
+// treated as killed. MetricRevocationFlushScheduled still ticks once per
+// processed entry (the v6 coarse reschedule is skipped — #2778 part 2 — since it
+// would be a v4-only no-op). (When the v6 seam IS wired, surgicalFlushFlowKeyV6
+// instead surgically tears the v6 flow down — see revocation_surgical_v6_test.go.)
 func TestFlushEntryNow_IPv6_HardFailNoSurgical(t *testing.T) {
 	enumerateCalled := false
 	enumerate := func(s, d string, proto uint8, dp uint16) ([]uint16, error) {
@@ -190,7 +190,7 @@ func TestFlushEntryNow_IPv6_HardFailNoSurgical(t *testing.T) {
 		t.Errorf("%s = %v, want 0 (v6 seam unwired → hard-fail, nothing flushed)", MetricRevocationSurgicalFlushedV6, got)
 	}
 	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
-		t.Errorf("%s = %v, want 1 (coarse path still runs)", MetricRevocationFlushScheduled, got)
+		t.Errorf("%s = %v, want 1 (per-entry tick; v6 coarse reschedule skipped)", MetricRevocationFlushScheduled, got)
 	}
 }
 

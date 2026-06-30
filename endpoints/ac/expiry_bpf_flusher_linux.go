@@ -73,37 +73,34 @@ import (
 // lifetime; deferred to a follow-up (the same one that swaps
 // ConntrackFlusher to netlink batching).
 type BpfFlusher struct {
-	// metricSkipped counts wrong-address-family keys that reached the
-	// wrong flusher and were silently no-op'd. Read via SkippedCount
-	// for observability — see the Flush godoc; every increment is a
-	// should-never-happen defensive path, so any non-zero reading
-	// indicates an upstream regression.
+	// metricSkipped counts non-IPv4-mapped keys that reached this IPv4-only flusher
+	// and were silently no-op'd. Read via SkippedCount for observability — see the
+	// Flush godoc. What a non-zero reading means depends on the increment site:
 	//
-	// CONFLATION NOTE — two orthogonal axes share this one counter:
+	//   - Flush (allow-rule): a v6 key here is a scheduled-EXPIRY skip — a benign
+	//     leak the kernel TTL closes. The eBPF datapath is IPv4-only, so a v6 key
+	//     is not expected under EBPFXDP in a correct (v4-only) deployment; if one
+	//     appears, the no-op here is the right outcome and the flow self-closes at
+	//     TTL. This is NOT a failed-revoke signal (see below).
+	//   - FlushConn: a v6 conn key here is a wrong-family ROUTING regression — the
+	//     revoke path routes v6 conn keys to FlushConnV6, not here.
+	//   - FlushConnV6: an IPv4-mapped conn key here is the inverse wrong-family
+	//     routing regression — the revoke path routes v4 conn keys to FlushConn.
 	//
-	//   1. expiry vs revocation: Flush (scheduled-expiry path — a skip
-	//      is a benign leak the kernel TTL closes) vs FlushConn /
-	//      FlushConnV6 (revocation path — a skip is a FAILED REVOKE, the
-	//      worse signal).
-	//   2. flush DIRECTION / address family: FlushConn skips a v6 key
-	//      that reached the IPv4-only flusher, while FlushConnV6 skips an
-	//      IPv4-mapped key that reached the IPv6-only flusher. Both are
-	//      "wrong-family key → wrong flusher" regressions; the cr for E2
-	//      s5 flagged that a future E5 watch might want per-direction
-	//      visibility.
+	// The Flush-path tick is NOT a failed-revoke signal: the revoke path's coarse
+	// reschedule is IPv4-only, so a v6 revoke never drives a key into Flush (a real
+	// failed v6 revoke is MetricRevocationIPv6HardFail; a normal one on a wired
+	// EBPFXDP build is torn down by FlushConnV6). The full expiry-vs-revoke split —
+	// incl. the deferred-tick residual (#2901) — lives in the flushEntryNow godoc
+	// (revocation_index.go) and the QURL_V2_KEYED_IDENTITY.md Filter-mode/IPv6
+	// caveat; this comment is intentionally local to avoid re-deriving it. (#2778)
 	//
-	// The counter alone cannot tell which axis/direction tripped, but
-	// each increment is paired with a distinct, direction-specific
-	// Warning log (the four call sites below each name their own flusher
-	// and key), so an operator can always recover the direction from the
-	// logs around a non-zero reading. Splitting the counter itself (per
-	// expiry/revoke and per family) is deferred to the P4e follow-up
-	// issue (#2778; P4e owns the revoke breaker/accounting that needs the
-	// distinct signal, and the metrics publisher that consumes this lives
-	// in registration.go, outside this slice's scope). Keeping it folded
-	// here is acceptable because the path is should-never-happen
-	// defensive in production — the upstream code routes v4 keys to the
-	// IPv4 flushers and v6 keys to the IPv6 flusher.
+	// The folded axis that remains is flush DIRECTION / address family (FlushConn-v6
+	// vs FlushConnV6-v4): each increment is paired with a distinct,
+	// direction-specific Warning log (the call sites below each name their own
+	// flusher and key), so an operator can recover the direction from the logs. A
+	// dedicated per-direction counter is the lower-priority E5 follow-up the cr for
+	// E2 s5 flagged (#2778).
 	metricSkipped atomic.Uint64
 }
 
@@ -115,11 +112,10 @@ func NewBpfFlusher() (*BpfFlusher, error) {
 }
 
 // SkippedCount returns the number of non-IPv4 keys this flusher has
-// silently no-op'd. A non-zero reading indicates an upstream
-// regression scheduling v6 keys under EBPFXDP — the eBPF maps are
-// IPv4-only by design. Exposed for the UdpAC metrics publisher
-// rather than the Scheduler's FlushMetrics (this is a flusher-
-// implementation concern, not a scheduler concern).
+// silently no-op'd — the expiry-skip / wrong-family count described on the
+// metricSkipped godoc (NOT a failed-revoke signal; that is
+// MetricRevocationIPv6HardFail). Exposed for the UdpAC metrics publisher
+// rather than the Scheduler's FlushMetrics (a flusher-implementation concern).
 func (f *BpfFlusher) SkippedCount() uint64 {
 	return f.metricSkipped.Load()
 }
@@ -214,18 +210,19 @@ func (f *BpfFlusher) Flush(ctx context.Context, key FlowKey) error {
 // caller bug, surfaced as an error rather than a silent no-op.
 //
 // REVOCATION-SEMANTICS CAVEAT — a nil return does NOT prove the flow was
-// torn down on the IPv6 branch. The conntrack map is IPv4-only (struct
+// torn down on the IPv6 branch. The conn_track map is IPv4-only (struct
 // ipv4_ct_tuple uses __be32), so a v6 ConnFlowKey has no entry to delete:
 // the no-op is the CORRECT outcome, but the nil return is indistinguishable
-// from a real delete. For scheduled expiry a missed flush is a leak the
-// kernel TTL eventually closes; for a REVOCATION primitive, a v6 qURL
-// admission therefore has no immediate-teardown path here at all. The v6
-// case is counted on metricSkipped (see SkippedCount), but the caller
-// (P4e's revoke wiring) MUST NOT read this nil as "flow killed" — it must
-// treat a v6 flow as an explicit hard-fail or coarse allow-rule fallback.
-// Tracked for the revoke path in the P4e follow-up issue (#2778); until then this
-// is a documented IPv6 immediate-revocation gap (see the gospel's
-// "Filter-mode/IPv6 caveat" + DE Risk #6).
+// from a real delete. This is precisely why the revoke caller
+// (surgicalFlushFlowKey) routes v6 conn keys to FlushConnV6 — the conn_track_v6
+// twin, #2837 — and NEVER here: a v6 key reaching FlushConn is a wrong-family
+// regression (counted on metricSkipped), not the normal v6 revoke path. The
+// matching coarse allow-rule reschedule in flushEntryNow is likewise IPv4-only,
+// so it never drives a v6 key into this flusher either (#2778 part 2). A v6 flow
+// whose surgical teardown is unavailable (iptables mode, or a v4-only EBPFXDP
+// build) is surfaced as the dedicated MetricRevocationIPv6HardFail — the
+// documented IPv6 immediate-revocation gap (see the gospel's
+// "Filter-mode/IPv6 caveat" + DE Risk #6), never a silent nil "killed".
 //
 // ctx-honoring: symmetric to Flush — honored at entry only, since the
 // cilium/ebpf LoadPinnedMap/Delete path takes no context. Per-call

@@ -99,7 +99,7 @@ func TestFlushEntryNow_V6Surgical_KillsEachSibling(t *testing.T) {
 		t.Errorf("%s = %v, want 0 (v6 was surgically flushed, not a gap)", MetricRevocationIPv6HardFail, got)
 	}
 	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
-		t.Errorf("%s = %v, want 1 (coarse reschedule runs alongside surgical)", MetricRevocationFlushScheduled, got)
+		t.Errorf("%s = %v, want 1 (per-entry tick; surgical-v6 teardown, v6 coarse reschedule skipped)", MetricRevocationFlushScheduled, got)
 	}
 }
 
@@ -264,9 +264,10 @@ func TestFlushEntryNow_V6_ICMP_SeamUnwired_NoHardFail(t *testing.T) {
 	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0 (nothing to surgically flush for v6 ICMP)", MetricRevocationSurgicalFlushedV6, got)
 	}
-	// The coarse allow-rule reschedule still runs (drain-once-feed-both).
+	// FlushScheduled ticks per processed entry; the v6 coarse reschedule is
+	// skipped (#2778 part 2), and v6 ICMP has no conn_track_v6 entry to flush.
 	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
-		t.Errorf("%s = %v, want 1 (coarse path runs even when surgical no-ops)", MetricRevocationFlushScheduled, got)
+		t.Errorf("%s = %v, want 1 (per-entry tick even when nothing is torn down for v6 ICMP)", MetricRevocationFlushScheduled, got)
 	}
 }
 
