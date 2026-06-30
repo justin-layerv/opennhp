@@ -497,11 +497,21 @@ lint-terraform-drift:
 test:
 	@echo "[OpenNHP] Running Unit Tests..."
 	cd internalauth && go test -v ./... -race
-	# TestWS1 = qURL v2 "no qv2 path calls /internal/v1" gate. make test compiles
-	# ./server/staticplugins/qurl/... but the allowlist otherwise skips it; folding
-	# it in keeps the gate running per-PR (re-homed from the now-deleted
-	# qurl-v2-qurl-plugin-tests.yml transitional workflow at the epic merge, #2826).
-	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry|TestConformanceVectors|TestWS1"
+	# endpoints/server/... is not all hermetic, so the broad suite runs behind a
+	# narrow -run allowlist of env-free tests. TestConformanceVectors (the qURL v2
+	# wire-format conformance vectors, server/internal/qurlv2) is one of them.
+	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry|TestConformanceVectors"
+	# qURL static-plugin package runs by PATH, not via a -run name token above:
+	# it is hermetic under KBS_SKIP_INIT=1 (no etcd/network/key-init), so the whole
+	# package runs here — the WS1 security gate (TestWS1_NoQv2PathCallsInternalV1:
+	# no qURL v2 knock path may call a qURL v1 internal endpoint) and every sibling
+	# qURL v2 test — robust to renames in a way a name match is not (the "gate that
+	# does not gate" regression #2826 guards against). build-and-push.yml also runs
+	# this package under -race on code PRs; this line covers the plain-runner
+	# `make test` (ubuntu-build.yml) and local runs, where the broad allowlist above
+	# would otherwise skip the package. -race mirrors the deleted
+	# qurl-v2-qurl-plugin-tests.yml this re-homes (knock driven on concurrent goroutines).
+	cd endpoints && KBS_SKIP_INIT=1 go test -race ./server/staticplugins/qurl/...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Unit Tests Done!$(END_COLOUR)"
 
 # test-ebpf compiles the real XDP object and runs the eBPF datapath tests
