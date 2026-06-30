@@ -25,6 +25,16 @@ var (
 	errLoadConfig = errors.New("config load error")
 )
 
+// FilterMode selects the AC datapath enforcement mechanism. user_data renders
+// the chosen value into config.toml as `FilterMode = <n>`, and the deploy-time
+// eBPF object smoke reads it back to gate the EBPFXDP object-layout check.
+// These iota values are a lockstep source of truth: the smoke module cannot
+// import endpoints/ac (that would make a test package an application
+// dependency), so it duplicates the numbers as acFilterModeIPTables /
+// acFilterModeEBPFXDP in tests/smoke/ssm_probe.go. Reordering this block or
+// inserting a mode shifts EBPFXDP's value and must update those smoke constants
+// in the same change — the drift is caught at PR time by
+// scripts/check-ebpf-load-path-lockstep.sh (wired into `make lint-workflows`).
 const (
 	FilterMode_IPTABLES = iota // 0
 	FilterMode_EBPFXDP         // 1

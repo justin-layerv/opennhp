@@ -39,11 +39,14 @@ on:
       - "scripts/check-revocation-slo-lockstep.sh"
       - "endpoints/server/revocation_retry.go"
       - "terraform/modules/monitoring/main.tf"
-      # eBPF load-path lockstep (#2810): trigger on the script itself and on all
-      # three source-of-truth sites it compares so a drift in ANY of them
-      # re-runs the check at PR time. Dockerfile.ac.aws is already listed below;
-      # the Go source of truth + the Makefile are not watched elsewhere, so they
-      # must be here or a Go-only/Makefile-only rename would skip the lint.
+      # eBPF load-path + FilterMode lockstep (#2810, #2812): trigger on the
+      # script + its fixture test and on the three source-of-truth sites it
+      # compares that aren't watched elsewhere — the Go object-path consts
+      # (ebpfegine.go), the Go FilterMode enum (config.go), and the Makefile
+      # EBPF_OBJ_* paths — so a rename or a FilterMode enum reorder re-runs the
+      # lint at PR time. Its other two sites (Dockerfile.ac.aws and
+      # tests/smoke/ssm_probe.go, the latter via "tests/smoke/**") are watched
+      # below; the script header inventories all five.
       - "scripts/check-ebpf-load-path-lockstep.sh"
       - "tests/scripts/check-ebpf-load-path-lockstep_test.sh"
       # eBPF arch lockstep (#2816): the AC image build platform must stay
@@ -59,6 +62,7 @@ on:
       - "scripts/check-ebpf-committed-object-drift.sh"
       - "tests/scripts/check-ebpf-committed-object-drift_test.sh"
       - "endpoints/ac/ebpf/ebpfegine.go"
+      - "endpoints/ac/config.go"
       - "terraform/modules/ac/main.tf"
       - "Makefile"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
@@ -526,7 +530,7 @@ jobs:
       # The fixture suite runs first so an extractor regression surfaces
       # against synthetic inputs before the real tree runs. shellcheck both —
       # actionlint's -shellcheck only covers workflow-embedded scripts.
-      - name: Test + check eBPF load-path lockstep (Go ↔ Makefile ↔ Dockerfile, #2810)
+      - name: Test + check eBPF load-path + FilterMode lockstep (Go ↔ Makefile ↔ Dockerfile ↔ smoke, #2810, #2812)
         run: |
           shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
           bash tests/scripts/check-ebpf-load-path-lockstep_test.sh

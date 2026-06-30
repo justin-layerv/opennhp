@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Asserts the eBPF object load path is in lockstep across the four sites that
-# independently hardcode the object directory + filenames (eBPF-mode-adoption
-# E1, PR #2810, PR #2859), and that the smoke-only FilterMode numeric constants
-# stay in lockstep with the AC source-of-truth enum.
+# Asserts the eBPF object load path and the AC FilterMode stay in lockstep
+# across five files. Four of them (sites 1-4 below) independently hardcode the
+# object directory + filenames (eBPF-mode-adoption E1, PR #2810, PR #2859); the
+# smoke probe (site 4) also carries the FilterMode numeric constants, which must
+# match the AC source-of-truth enum in endpoints/ac/config.go (site 5).
 #
 # Sites compared:
 #   1. endpoints/ac/ebpf/ebpfegine.go  (the runtime SOURCE OF TRUTH — the AC
