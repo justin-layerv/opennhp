@@ -128,8 +128,8 @@ func TestScopeKeysForEntry_LegacyAndSessionSeam(t *testing.T) {
 	if got := scopeKeysForEntry(&AccessEntry{OpenTime: 5}); len(got) != 0 {
 		t.Fatalf("legacy entry should yield no index keys, got %v", got)
 	}
-	// session_id seam: empty SessionId (pre-#1010) must NOT produce a session
-	// key, but the other dimensions still index.
+	// session_id seam: empty SessionId (pre qurl-service #1010) must NOT produce a
+	// session key, but the other dimensions still index.
 	got := scopeKeysForEntry(qurlV2Entry("q", "r", "", "a"))
 	for _, k := range got {
 		if k.scope == scopeSession {
@@ -139,7 +139,7 @@ func TestScopeKeysForEntry_LegacyAndSessionSeam(t *testing.T) {
 	if len(got) != 3 { // qurl, resource, admission
 		t.Fatalf("expected 3 keys (qurl,resource,admission) with empty session, got %v", got)
 	}
-	// Populated SessionId (post-#1010) indexes the session dimension.
+	// Populated SessionId (post qurl-service #1010) indexes the session dimension.
 	got = scopeKeysForEntry(qurlV2Entry("q", "r", "sess", "a"))
 	if len(got) != 4 {
 		t.Fatalf("expected 4 keys with populated session, got %v", got)

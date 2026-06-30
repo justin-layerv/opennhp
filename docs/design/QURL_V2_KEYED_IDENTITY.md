@@ -723,6 +723,29 @@ forward path carries the per-admission fields, **forwarded flows are revocable b
 resource key only** — a `qurl`/`session`/`admission`-scoped revoke will not match
 them. Tracked in #2774; may be mooted by #2208 (which removes the forward path).
 
+Implementation caveat (pre-epoch re-revoke window): until qurl-service #1010
+emits real per-`(scope, scope_key)` monotonic epochs end-to-end, every revoke
+carries `revocation_epoch = 0`, so the AC epoch gate (`admitEpoch` in
+`endpoints/ac/revocation_index.go`) — a faithful mirror of the `revocation_epoch`
+contract, with NO epoch-0 carve-out, since a carve-out would trade this
+under-revoke for an over-revoke (a stale epoch-0 straggler re-firing on a newer
+session) — can revoke-APPLY a given `(scope, scope_key)` only once. A revoke, a
+re-admission under the same hash, then a second epoch-0 revoke is dropped
+(`0 <= 0`), leaving the re-admitted session to natural expiry; **resource scope
+is the sharp case** (its hash is a durable resource key, not a per-session
+value). This is safe pre-epoch ONLY because of the no-positive-cache contract
+above: a revoked key is denied on its very next admission, so it cannot recur to
+hit the once-only-apply limit. **Verified on qurl-service main (2026-06-30):**
+admission gates fresh on `!resource.IsActive()` → `ErrResourceRevoked` and
+`QurlStatusRevoked` → `ErrQurlRevoked` (`internal/service/resolve_service.go`),
+and v2 disables the qurl-router L7 positive-auth cache (the `IsV2()` signal) so a
+revoke takes effect on the next re-check — there is no positive admission cache
+on the v2 path. The window dissolves once qurl-service #1010 lands (a re-revoke
+then carries a strictly greater epoch); the symmetric qurl-service #1028 TOCTOU
+relies on this same AC high-water mark as its backstop. This precondition must
+stay verified before v2 admission and the revoke Sink are enabled in any live
+environment. Tracked in #2781.
+
 Use the existing "Kafka / Netty pattern" hashed wheel algorithm; do not add
 Kafka infrastructure. The new work is the revocation fanout and the immediate
 fire path, not a new timer architecture.

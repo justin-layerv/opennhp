@@ -38,8 +38,8 @@ import (
 // FlowKey, the conntrack/bpf flushers, or endpoints/ac/ebpf/.
 
 // revocationScope names the dimension a revocation event targets. The string
-// values mirror qurl-service's revocation-event `scope` field (P4d, #1009) so
-// the two ends agree without a translation table.
+// values mirror qurl-service's revocation-event `scope` field (P4d,
+// qurl-service #1009) so the two ends agree without a translation table.
 type revocationScope string
 
 const (
@@ -223,30 +223,51 @@ func (ri *revocationIndex) tokensFor(scope revocationScope, scopeKey string) []s
 // diverge from that contract and could let a stale epoch-0 straggler re-fire and
 // over-flush a newer legitimate session. The first observation of a key has no
 // prior watermark and is always applied; thereafter only a strictly greater
-// epoch is applied. This also gives correct dedup in the pre-#1010 world where
-// every revoke shares epoch 0: the first epoch-0 event applies (unseen), a
+// epoch is applied. This also gives correct dedup in the pre-epoch world —
+// before qurl-service #1010 emits real per-(scope,scope_key) epochs end-to-end —
+// where every revoke shares epoch 0: the first epoch-0 event applies (unseen), a
 // second epoch-0 event for the same key is dropped (seen && 0 <= 0).
 //
 // Cross-service precondition (the local primitive cannot enforce it). The cost
-// of the above is that pre-#1010 a (scope, scopeKey) can be revoke-APPLIED only
-// once. This is safe ONLY while two contracts hold, and this primitive cannot
-// defend either locally — they are P4e / #1010 / qurl-service preconditions:
+// of the above is that, until real epochs land, a (scope, scopeKey) can be
+// revoke-APPLIED only once. This is safe ONLY while one of two cross-repo
+// contracts holds, and this AC primitive can defend neither locally:
 //
-//  1. qurl-service denies re-admission of a revoked key with no stale-cache
-//     window (QURL_V2_KEYED_IDENTITY.md "v2 admission uses no positive cache:
-//     a revoked qURL is denied on the very next admission"). Without this, a
-//     long-lived key (resource scope is the sharp case — its hash is a
-//     durable resource public key, not a per-session value) could be revoked,
-//     re-admitted, and a second epoch-0 revoke would be dropped (0 <= 0),
-//     leaving the new session alive to natural expiry.
-//  2. #1010 lands real per-(scope,scope_key) monotonic epochs, after which a
-//     re-revoke carries a strictly greater epoch and applies normally,
-//     dissolving the limitation entirely.
+//  1. qurl-service denies re-admission of a revoked key with no positive-cache
+//     window (QURL_V2_KEYED_IDENTITY.md "v2 admission uses no positive cache: a
+//     revoked qURL is denied on the very next admission", and the "Proposed
+//     Acceptance Bar": "no positive admission cache on the v2 admission path").
+//     Without it a long-lived key (resource scope is the sharp case — its hash
+//     is a durable resource public key, not a per-session value) could be
+//     revoked, re-admitted, and a second epoch-0 revoke would be dropped
+//     (0 <= 0), leaving the new session alive to natural expiry. This is the
+//     active guard pre-epoch and is VERIFIED to hold on qurl-service main
+//     (2026-06-30, #2781): every admission reads authoritative state fresh —
+//     resource scope gates on !resource.IsActive() -> ErrResourceRevoked and
+//     qURL scope on QurlStatusRevoked -> ErrQurlRevoked
+//     (internal/service/resolve_service.go) — and v2 resources disable the
+//     qurl-router L7 positive-auth cache (the IsV2() signal) so a revoke takes
+//     effect on the next re-check. No positive admission cache exists on the v2
+//     path.
+//  2. qurl-service #1010 lands real per-(scope,scope_key) monotonic epochs
+//     end-to-end (AOP metadata + revocation event), after which a re-revoke
+//     carries a strictly greater epoch and applies normally, dissolving the
+//     limitation entirely. (The symmetric qurl-service #1028 TOCTOU — a state row
+//     whose resource_revocation_epoch can freeze stale — names this same AC
+//     high-water mark as its authoritative backstop, so both ends want real
+//     epochs.)
 //
-// Tracked by #2781. There is NO production caller of ApplyRevocation before P4e
-// wires the receive path, so there is no live exposure to this window today;
-// the limitation must be closed (by #1010) before P4e enables it in an
-// environment where a revoked key can recur.
+// Tracked by #2781. The P4e receive path is now wired in the AC (NHP_REV ->
+// HandleUdpACRevocation -> ApplyRevocation), landed in the qURL v2 epic #2753
+// with the server-side fanout in #2789 — so safety no longer rests on "no
+// caller" (the original claim here, now stale). It rests on contract 1 above,
+// which is verified. There is still no LIVE exposure: the qURL v2 stack ships
+// dormant on main — v2 admission is gated off (QURL_V2_ADMISSION_ENABLED,
+// #2769) and the revoke endpoint is inert until the qurl-service NHP Sink goes
+// live (#2789 prod-rollout-ledger) — so no production revoke reaches here and no
+// v2 key is admitted to recur. Contract 1 must stay verified before v2 admission
+// and the revoke Sink are enabled in any live environment (gated rollouts; the
+// #2789 ledger entry carries the pre-enablement gate).
 func (ri *revocationIndex) admitEpoch(scope revocationScope, scopeKey string, epoch uint64) bool {
 	if ri == nil {
 		return true
@@ -312,7 +333,7 @@ func (ri *revocationIndex) peekStale(scope revocationScope, scopeKey string, epo
 // cache "deny re-admission of a revoked key" precondition (#2781), but an
 // in-flight admission already past that check is not defendable at this layer —
 // it is the same class as #2781/#2784 and dissolves once real monotonic epochs
-// (#1010) make the redelivered revoke carry a strictly greater epoch.
+// (qurl-service #1010) make the redelivered revoke carry a strictly greater epoch.
 //
 // scopeKey is the bare per-scope hash/id (NOT the qurl-service "qurl:<hash>"
 // prefixed scope_key form); P4e strips any transport-level prefix before
