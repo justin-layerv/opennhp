@@ -1,13 +1,13 @@
 import { buildKnock } from "../crypto/handshake.js";
 import { NHP_KNK } from "../crypto/packet.js";
+import type { RandomBytes } from "./entropy.js";
 
 /**
  * Sources of per-knock randomness and time, injectable so tests can pin them.
  * Production uses the browser CSPRNG (`crypto.getRandomValues`) and wall clock.
  */
 export interface KnockEntropy {
-  /** Fill `out` with cryptographically-strong random bytes, in place. */
-  randomBytes(out: Uint8Array): void;
+  randomBytes: RandomBytes;
   /** Now, in nanoseconds since the Unix epoch — Go's `time.Now().UnixNano()`. */
   nowNanos(): bigint;
 }

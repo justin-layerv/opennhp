@@ -1,9 +1,9 @@
 import { X25519_KEY_SIZE, x25519PublicKey } from "../crypto/dh.js";
+import type { RandomBytes } from "./entropy.js";
 
 /** Entropy seam for generating a browser device static keypair. */
 export interface KeyPairEntropy {
-  /** Fill `out` with cryptographically-strong random bytes, in place. */
-  randomBytes(out: Uint8Array): void;
+  randomBytes: RandomBytes;
 }
 
 /** Production entropy: the browser CSPRNG. */
