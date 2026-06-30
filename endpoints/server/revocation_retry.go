@@ -31,13 +31,13 @@ import (
 // retransmit to an AC whose flow persisted across a control-connection blip is
 // exactly what is required.
 //
-// ── Rollout gating (default OFF) ────────────────────────────────────────────
+// ── Rollout gating (binary default OFF; managed fleets set ON) ──────────────
 // A fleet of pre-ack ACs never sends NHP_RACK, so with the engine ON every
 // revoke would retry to age-out and storm RevocationAgedOut + retransmit load.
-// The engine therefore arms only when NHP_REVOCATION_RETRY_ENABLED=true. Until
-// then, fanout still records nothing and the AC ack-send / server ack-receive
-// (shipped inert in the prior unit) are no-ops. Flip to true only once the
-// fleet ships ack support.
+// The engine therefore arms only when NHP_REVOCATION_RETRY_ENABLED=true.
+// Terraform-managed sandbox/prod render that env var now that AC ack support
+// has shipped; the absent-env binary default remains OFF for unmanaged/pre-ACK
+// fleets so they can upgrade without surprise age-out noise.
 //
 // ── Lock discipline (see endpoints/server/CLAUDE.md) ────────────────────────
 // revocationRetryTracker.mu is LEAF-MOST: it is never held while acquiring

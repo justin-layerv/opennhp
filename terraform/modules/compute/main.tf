@@ -37,6 +37,22 @@ resource "terraform_data" "sns_alerts_contract" {
   }
 }
 
+resource "terraform_data" "revocation_retry_config_contract" {
+  lifecycle {
+    precondition {
+      # Mirrors parseRevocationRetryConfig, which validates interval/age-out
+      # relationships even when NHP_REVOCATION_RETRY_ENABLED=false.
+      condition = (
+        var.revocation_retry_age_out_seconds > var.revocation_retry_interval_seconds &&
+        # Keep this 15s SLO mirror in scripts/check-revocation-slo-lockstep.sh
+        # with RevocationDeliveryLatencyP99SLO and the CloudWatch alarm threshold.
+        var.revocation_retry_age_out_seconds > 15
+      )
+      error_message = "revocation_retry_age_out_seconds must be greater than revocation_retry_interval_seconds and greater than the 15s RevocationDeliveryLatency p99 SLO."
+    }
+  }
+}
+
 check "sns_alerts_gate_matches_destination" {
   assert {
     condition     = var.enable_sns_alerts || !local.sns_destination_present
@@ -847,6 +863,11 @@ locals {
     cloudfront_cidrs_ssm_parameter  = var.cloudfront_cidrs_ssm_parameter
     knock_headertype_verify_require = var.knock_headertype_verify_require
     internal_auth_require           = var.internal_auth_require
+    # qURL v2 immediate-revocation proof engine (#2793): managed fleets arm it
+    # explicitly while the Go binary remains default-off for unmanaged/pre-ACK ACs.
+    revocation_retry_enabled          = var.revocation_retry_enabled
+    revocation_retry_interval_seconds = var.revocation_retry_interval_seconds
+    revocation_retry_age_out_seconds  = var.revocation_retry_age_out_seconds
     # Knock-port DoS hardening (#1159): global rate cap + receive-buffer tuning.
     knock_global_rate_limit_pps   = var.knock_global_rate_limit_pps
     knock_global_rate_limit_burst = var.knock_global_rate_limit_burst

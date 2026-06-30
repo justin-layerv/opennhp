@@ -174,8 +174,9 @@ type UdpServer struct {
 	acPubkeyRevokeSweepInterval time.Duration
 
 	// revocationRetry is the qURL v2 NHP_REV retry-until-ack-or-age-out
-	// engine (P4e Slice 3, #2793). nil = engine disabled (default; armed
-	// only when NHP_REVOCATION_RETRY_ENABLED=true). When non-nil, the
+	// engine (P4e Slice 3, #2793). nil = engine disabled (absent-env binary
+	// default for unmanaged/pre-ACK fleets; Terraform-managed fleets set
+	// NHP_REVOCATION_RETRY_ENABLED=true). When non-nil, the
 	// fanout handler records a pending entry per targeted AC slot
 	// (acId + authenticated pubkey), the
 	// revocationRetryRoutine retransmits un-acked NHP_REV on a cadence
@@ -622,10 +623,11 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 			s.acPubkeyRevokeSweepInterval)
 	}
 
-	// qURL v2 revocation retry-until-ack-or-age-out engine (#2793). Default
-	// OFF: armed only when NHP_REVOCATION_RETRY_ENABLED=true, because a fleet of
-	// pre-ack ACs never sends NHP_RACK and would otherwise storm the aged-out
-	// degraded metric. Parse fails Start on a typo (see parseRevocationRetryConfig).
+	// qURL v2 revocation retry-until-ack-or-age-out engine (#2793). The binary
+	// arms only when NHP_REVOCATION_RETRY_ENABLED=true because a pre-ACK AC fleet
+	// would otherwise storm the aged-out degraded metric. Terraform-managed fleets
+	// now render that env var explicitly; absent env remains the unmanaged
+	// compatibility default. Parse fails Start on a typo (see parseRevocationRetryConfig).
 	revRetryEnabled, revRetryInterval, revRetryAgeOut, err := parseRevocationRetryConfig()
 	if err != nil {
 		return err

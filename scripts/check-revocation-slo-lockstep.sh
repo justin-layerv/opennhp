@@ -8,13 +8,18 @@
 #   - terraform/modules/monitoring/main.tf
 #       aws_cloudwatch_metric_alarm.revocation_delivery_latency_high.threshold
 #       (a plain number in MILLISECONDS, e.g. 15000)
+#   - terraform/modules/compute/main.tf
+#       terraform_data.revocation_retry_config_contract age-out precondition
+#       (a plain number in SECONDS, e.g. 15)
 #
 # The alarm threshold is the millisecond projection of the Go SLO: the metric
 # (MetricRevocationDeliveryLatency) is recorded via metrics.RecordLatency, which
 # records milliseconds. If the two drift, the p99 alarm fires at a bound that no
 # longer matches the documented SLO — a silent observability gap, exactly the
 # failure mode the inline lockstep comments warn about. This lint surfaces the
-# drift at PR time.
+# drift at PR time. The compute precondition is the second projection: it rejects
+# retry age-out settings that are not greater than the same SLO, so it must move
+# with the Go constant too.
 #
 # Supported Go SLO shapes (single-line const, value in seconds or milliseconds):
 #   RevocationDeliveryLatencyP99SLO = 15 * time.Second
@@ -38,6 +43,7 @@ set -euo pipefail
 REPO_ROOT="${REVOCATION_SLO_LOCKSTEP_ROOT:-$(git rev-parse --show-toplevel)}"
 GO_SRC="${REPO_ROOT}/endpoints/server/revocation_retry.go"
 TF_SRC="${REPO_ROOT}/terraform/modules/monitoring/main.tf"
+TF_COMPUTE_SRC="${REPO_ROOT}/terraform/modules/compute/main.tf"
 
 if [ ! -f "$GO_SRC" ]; then
   echo "ERROR: $GO_SRC not found" >&2
@@ -45,6 +51,10 @@ if [ ! -f "$GO_SRC" ]; then
 fi
 if [ ! -f "$TF_SRC" ]; then
   echo "ERROR: $TF_SRC not found" >&2
+  exit 1
+fi
+if [ ! -f "$TF_COMPUTE_SRC" ]; then
+  echo "ERROR: $TF_COMPUTE_SRC not found" >&2
   exit 1
 fi
 
@@ -115,4 +125,51 @@ EOF
   exit 1
 fi
 
-echo "OK: revocation-latency SLO is lockstep across the Go const + CloudWatch alarm (${go_ms} ms)"
+if [ $(( go_ms % 1000 )) -ne 0 ]; then
+  echo "ERROR: RevocationDeliveryLatencyP99SLO (${go_ms} ms) is not whole seconds; update the Terraform age-out precondition and this lint together." >&2
+  exit 1
+fi
+go_seconds=$(( go_ms / 1000 ))
+
+# Extract the compute-module age-out precondition SLO mirror (seconds). Scope the
+# scan to the revocation retry contract so a future unrelated age-out comparison
+# cannot satisfy the check accidentally.
+tf_compute_slo_seconds=$(awk '
+  /resource "terraform_data" "revocation_retry_config_contract"/ { inblock = 1 }
+  inblock && /var\.revocation_retry_age_out_seconds[[:space:]]*>[[:space:]]*[0-9]+/ {
+    line = $0
+    sub(/^.*var\.revocation_retry_age_out_seconds[[:space:]]*>[[:space:]]*/, "", line)
+    sub(/[[:space:])].*$/, "", line)
+    print line
+    exit
+  }
+  inblock && /^}/ { exit }
+' "$TF_COMPUTE_SRC")
+
+if [ -z "$tf_compute_slo_seconds" ]; then
+  echo "ERROR: could not extract the revocation_retry_age_out_seconds SLO precondition from terraform_data.revocation_retry_config_contract in $TF_COMPUTE_SRC" >&2
+  exit 1
+fi
+if ! printf '%s' "$tf_compute_slo_seconds" | grep -Eq '^[0-9]+$'; then
+  echo "ERROR: extracted retry age-out SLO precondition '$tf_compute_slo_seconds' is not a plain integer (seconds) in $TF_COMPUTE_SRC" >&2
+  exit 1
+fi
+
+if [ "$go_seconds" != "$tf_compute_slo_seconds" ]; then
+  cat <<EOF >&2
+ERROR: revocation-latency SLO drift between the Go constant and the Terraform retry age-out precondition.
+
+       $GO_SRC::RevocationDeliveryLatencyP99SLO
+         = ${go_scalar} * time.${go_unit}  (= ${go_seconds} seconds)
+
+       $TF_COMPUTE_SRC
+         terraform_data.revocation_retry_config_contract
+         revocation_retry_age_out_seconds > ${tf_compute_slo_seconds}
+
+       The retry age-out precondition must compare against the same SLO in
+       seconds. Update both sites in lockstep (#2793).
+EOF
+  exit 1
+fi
+
+echo "OK: revocation-latency SLO is lockstep across the Go const, CloudWatch alarm, and retry age-out precondition (${go_ms} ms)"

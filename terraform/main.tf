@@ -636,6 +636,9 @@ module "compute" {
 
   knock_headertype_verify_require     = var.nhp_knock_headertype_verify_require
   internal_auth_require               = var.nhp_internal_auth_require
+  revocation_retry_enabled            = var.nhp_revocation_retry_enabled
+  revocation_retry_interval_seconds   = var.nhp_revocation_retry_interval_seconds
+  revocation_retry_age_out_seconds    = var.nhp_revocation_retry_age_out_seconds
   overload_cookie_time_window_seconds = var.nhp_overload_cookie_time_window_seconds
 
   # Knock-port DoS hardening (#1159)

@@ -939,14 +939,17 @@ Delivery requirements:
   flush-complete < N seconds), measured and tested. "Immediate" must be a number,
   since fan-out + index lookup + flush is not instantaneous.
 
-  CODE LANDED, PRODUCTION-DARK UNTIL FLAG (nhp #2808 + #2793): the number is
-  defined and tested — `p99 < 15s` (`RevocationDeliveryLatencyP99SLO`) over the
-  server-measurable proxy span, `NHP_REV` emit (`firstSentAt`) → `NHP_RACK`
-  ack-attributed (`clearAck`), with a p99 CloudWatch alarm and a companion
+  ACTIVE IN TERRAFORM-MANAGED FLEETS (nhp #2808 + #2793): the number is
+  defined, tested, and explicitly armed by server user data —
+  `p99 < 15s` (`RevocationDeliveryLatencyP99SLO`) over the server-measurable
+  proxy span, `NHP_REV` emit (`firstSentAt`) → `NHP_RACK` ack-attributed
+  (`clearAck`), with a p99 CloudWatch alarm and a companion
   `RevocationAgedOut` non-delivery alarm, plus `RevocationUntrackable` for
   impossible live-connection identity invariant breaks. The histogram samples
   ACKED revokes only; never-delivered revokes surface as `RevocationAgedOut`
-  (the two delivery alarms are read together).
+  (the two delivery alarms are read together). The Go binary's absent-env
+  default remains off only for unmanaged/pre-ACK deployments; sandbox/prod set
+  `NHP_REVOCATION_RETRY_ENABLED=true` with a 5s resend cadence and 60s age-out.
 
   Operational-proof boundaries:
   - The pending tracker keys proof by targeted live AC slot:
@@ -974,11 +977,11 @@ Delivery requirements:
     rollout windows, not a false-green delivery proof; alarm tuning/runbooks must
     account for revoke × drain overlap until graceful-drain pruning is added
     (tracked in nhp #2868).
-  - The retry engine ships default-OFF; arming it fleet-wide (so the histogram
-    collects data) is the rollout step after the AC fleet has the ack code. Treat
-    the SLO acceptance-bar line as production-active only once
-    `NHP_REVOCATION_RETRY_ENABLED=true` is rolled out (with #2790 for targeted
-    fanout correspondence).
+  - The retry engine is explicitly armed by Terraform-managed server fleets via
+    `NHP_REVOCATION_RETRY_ENABLED=true`; changing or disabling it should be
+    treated as a security-relevant rollback because it returns server→AC
+    delivery to fire-and-forget semantics. The binary still treats an absent env
+    var as disabled so unmanaged/pre-ACK fleets can upgrade safely.
 
 Transport can be selected during implementation. The design requirement is
 push-based delivery into the NHP/AC control plane, not polling from qurl-router.

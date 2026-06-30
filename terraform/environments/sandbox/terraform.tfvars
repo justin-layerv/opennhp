@@ -69,6 +69,13 @@ resource_mode = "api"
 # Needed because AC Traefik serves pages on dynamic {resId}.nhp.layerv.xyz subdomains.
 nhp_cors_allowed_origins = "https://*.nhp.layerv.xyz,https://*.apps.layerv.xyz,https://*.qurl.site.layerv.xyz,https://qurl.link.layerv.xyz,https://staging.layerv.ai"
 
+# qURL v2 immediate-revocation proof engine (#2793). ACK support is now in the
+# AC/server protocol; keep this enabled so NHP_REV retries until every targeted
+# AC slot ACKs or ages out to RevocationAgedOut.
+nhp_revocation_retry_enabled          = true
+nhp_revocation_retry_interval_seconds = 5
+nhp_revocation_retry_age_out_seconds  = 60
+
 # Termination cleanup: Lambda cleans stale DynamoDB assignments on server termination
 enable_termination_cleanup = true
 

@@ -148,6 +148,13 @@ cloudmap_enabled          = true
 # zero/no datapoints across the 14-day burn-in and fresh-smoke windows.
 nhp_internal_auth_require = true
 
+# qURL v2 immediate-revocation proof engine (#2793). ACK support is now in the
+# AC/server protocol; keep this enabled so NHP_REV retries until every targeted
+# AC slot ACKs or ages out to RevocationAgedOut.
+nhp_revocation_retry_enabled          = true
+nhp_revocation_retry_interval_seconds = 5
+nhp_revocation_retry_age_out_seconds  = 60
+
 # Production domains
 production_domains = ["qurl.site", "qurl.link"]
 

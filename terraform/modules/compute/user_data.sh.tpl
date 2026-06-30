@@ -1068,6 +1068,13 @@ NHP_INTERNAL_AUTH_REQUIRE=true
 %{ if knock_headertype_verify_require ~}
 NHP_KNOCK_HEADERTYPE_VERIFY=true
 %{ endif ~}
+# qURL v2 immediate-revocation proof engine (#2793). Terraform-managed fleets
+# set this explicitly so NHP_REV fanout is retried until each targeted AC slot
+# ACKs (NHP_RACK) or ages out to RevocationAgedOut; the Go binary's absent-env
+# default remains off for unmanaged/pre-ACK deployments.
+NHP_REVOCATION_RETRY_ENABLED=${revocation_retry_enabled}
+NHP_REVOCATION_RETRY_INTERVAL_SECONDS=${revocation_retry_interval_seconds}
+NHP_REVOCATION_RETRY_AGE_OUT_SECONDS=${revocation_retry_age_out_seconds}
 # Knock-port DoS hardening (#1159): UDP receive buffer target (bytes).
 # Paired with the net.core.rmem_max sysctl below; bumping just one side
 # lets the kernel silently clamp the socket back to the default. Boot

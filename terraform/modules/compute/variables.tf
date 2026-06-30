@@ -547,6 +547,47 @@ variable "internal_auth_require" {
   default     = false
 }
 
+variable "revocation_retry_enabled" {
+  description = <<-EOT
+    Set NHP_REVOCATION_RETRY_ENABLED for the server's qURL v2 NHP_REV
+    proof-of-delivery engine (#2793): each targeted live AC slot must ACK
+    (NHP_RACK) or the server retries until the age-out deadline and emits
+    RevocationAgedOut.
+
+    Default false matches the Go binary's absent-env OFF behavior and the
+    sibling security-gate convention: module consumers must opt in explicitly
+    after confirming the target AC fleet is NHP_RACK-capable. Sandbox/prod
+    opt in via environment tfvars. Set this false as an emergency rollback or
+    when intentionally deploying a mixed/pre-ACK fleet; doing so returns
+    NHP_REV fanout to fire-and-forget semantics and should block relying on
+    immediate qURL revocation for production authorization.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "revocation_retry_interval_seconds" {
+  description = "NHP_REVOCATION_RETRY_INTERVAL_SECONDS: whole-second resend cadence for un-acked NHP_REV messages. Must stay >= 1 to avoid a busy retry loop."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.revocation_retry_interval_seconds >= 1 && floor(var.revocation_retry_interval_seconds) == var.revocation_retry_interval_seconds
+    error_message = "revocation_retry_interval_seconds must be a whole number of seconds >= 1."
+  }
+}
+
+variable "revocation_retry_age_out_seconds" {
+  description = "NHP_REVOCATION_RETRY_AGE_OUT_SECONDS: whole-second deadline before an un-acked revoke is marked degraded via RevocationAgedOut. Keep above the retry interval and the 15s delivery-latency SLO."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.revocation_retry_age_out_seconds >= 1 && floor(var.revocation_retry_age_out_seconds) == var.revocation_retry_age_out_seconds
+    error_message = "revocation_retry_age_out_seconds must be a positive whole number of seconds."
+  }
+}
+
 # =============================================================================
 # Knock-port DoS hardening (#1159)
 # =============================================================================

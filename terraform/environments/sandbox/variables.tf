@@ -215,6 +215,34 @@ variable "nhp_internal_auth_require" {
   default     = false
 }
 
+variable "nhp_revocation_retry_enabled" {
+  description = "Wrapper passthrough for the root nhp_revocation_retry_enabled (#2793). Default false keeps new/unset environments conservative; sandbox opts in explicitly in terraform.tfvars after ACK support."
+  type        = bool
+  default     = false
+}
+
+variable "nhp_revocation_retry_interval_seconds" {
+  description = "Wrapper passthrough for the root nhp_revocation_retry_interval_seconds (#2793)."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.nhp_revocation_retry_interval_seconds >= 1 && floor(var.nhp_revocation_retry_interval_seconds) == var.nhp_revocation_retry_interval_seconds
+    error_message = "nhp_revocation_retry_interval_seconds must be a whole number of seconds >= 1."
+  }
+}
+
+variable "nhp_revocation_retry_age_out_seconds" {
+  description = "Wrapper passthrough for the root nhp_revocation_retry_age_out_seconds (#2793)."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.nhp_revocation_retry_age_out_seconds >= 1 && floor(var.nhp_revocation_retry_age_out_seconds) == var.nhp_revocation_retry_age_out_seconds
+    error_message = "nhp_revocation_retry_age_out_seconds must be a positive whole number of seconds."
+  }
+}
+
 variable "nhp_overload_cookie_time_window_seconds" {
   description = "Wrapper passthrough for the root nhp_overload_cookie_time_window_seconds. Default 60s; tune only with NTP/clock-skew evidence."
   type        = number

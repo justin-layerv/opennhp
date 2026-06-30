@@ -71,7 +71,10 @@ var revocationWireScopes = map[string]struct{}{
 
 // handleInternalRevocation receives a qURL v2 revocation Event from
 // qurl-service over POST /nhp/internal/revocation and fans it out to the
-// matching connected ACs as NHP_REV (server→AC, fire-and-forget).
+// matching connected ACs as NHP_REV (server→AC). With the revocation retry
+// engine armed, each successfully enqueued target is tracked until that AC slot
+// acks (NHP_RACK) or ages out to the degraded metric; when the engine is
+// disabled for unmanaged/pre-ACK fleets, this reverts to best-effort send.
 //
 // Auth mirrors handleInternalKnock (NOT the no-body sweep helper, since this
 // endpoint has a body): RFC-1918 source-IP gate, then the rollout-gated HMAC
@@ -83,11 +86,11 @@ var revocationWireScopes = map[string]struct{}{
 //
 // Delivery semantics: qurl-service's Publisher provides at-least-once to nhp
 // via retry (it maps this endpoint's 5xx → transient → retry, 4xx → permanent).
-// The nhp→AC hop is best-effort: a lost NHP_REV is not retried at this layer, so
-// the corresponding AC entry simply lives to its natural expiry (documented
-// fail-open). Backpressure is the one exception that is fail-closed — see
-// fanoutRevocation: a full send queue returns 503 so the event is retried rather
-// than dropped.
+// The nhp→AC hop is fail-closed on enqueue backpressure — see fanoutRevocation:
+// a full send queue returns 503 so the event is retried rather than dropped.
+// After a successful enqueue, trackFanout records per-AC-slot proof state when
+// the retry engine is armed; NHP_RACK clears it and no-ack age-out emits
+// RevocationAgedOut instead of silently pretending delivery succeeded.
 func (hs *HttpServer) handleInternalRevocation(ctx *gin.Context) {
 	body, ok := hs.authorizeInternalSignedBodyRequest(ctx, "internal revocation", maxInternalRevocationRequestSize)
 	if !ok {

@@ -3,7 +3,7 @@
 # ----------------------------------------------------------------------------
 # Fixture tests for scripts/check-revocation-slo-lockstep.sh (#2817).
 #
-# Copies the two real source-of-truth files into a tempdir that mimics the repo
+# Copies the three real source-of-truth files into a tempdir that mimics the repo
 # layout, points the script at it via $REVOCATION_SLO_LOCKSTEP_ROOT, and asserts:
 #   - the unmutated copy passes (exit 0),
 #   - a drift on EITHER side is DETECTED (exit non-zero) — this proves the lint
@@ -11,6 +11,7 @@
 #     changed:
 #       * the Go scalar (seconds form) changes, the alarm threshold does not,
 #       * the alarm threshold changes, the Go scalar does not,
+#       * the retry age-out precondition changes, the Go scalar does not,
 #       * the Go const, re-expressed in the millisecond form, drifts,
 #   - the millisecond form of the Go const that NORMALIZES to the same value
 #     still passes (exit 0) — so the unit conversion is exercised, not assumed,
@@ -20,6 +21,8 @@
 #       * the alarm `threshold` key renamed out from under the block scan — the
 #         awk extractor returns empty and the script fails loud,
 #       * a non-integer alarm threshold — the integer guard fails loud.
+#       * the retry age-out precondition key renamed out from under the block
+#         scan — the awk extractor returns empty and the script fails loud.
 #
 # Every drift / shape-break case also asserts on the script's specific stderr
 # reason (not merely a non-zero exit), so a case cannot pass on an unrelated
@@ -37,6 +40,7 @@ SCRIPT="$REPO_ROOT/scripts/check-revocation-slo-lockstep.sh"
 
 REAL_GO="$REPO_ROOT/endpoints/server/revocation_retry.go"
 REAL_TF="$REPO_ROOT/terraform/modules/monitoring/main.tf"
+REAL_TF_COMPUTE="$REPO_ROOT/terraform/modules/compute/main.tf"
 
 pass=0
 fail=0
@@ -53,12 +57,13 @@ report_pass() { pass=$((pass + 1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 report_fail() { fail=$((fail + 1)); printf '  \033[31m✗\033[0m %s\n      %s\n' "$1" "$2"; }
 
 # Build a fixture repo: copy the real files into the same relative paths under a
-# tempdir. The script reads only these two files, so nothing else is needed.
+# tempdir. The script reads only these three files, so nothing else is needed.
 _make_fixture() {
   local dir="$1"
-  mkdir -p "$dir/endpoints/server" "$dir/terraform/modules/monitoring"
+  mkdir -p "$dir/endpoints/server" "$dir/terraform/modules/monitoring" "$dir/terraform/modules/compute"
   cp "$REAL_GO" "$dir/endpoints/server/revocation_retry.go"
   cp "$REAL_TF" "$dir/terraform/modules/monitoring/main.tf"
+  cp "$REAL_TF_COMPUTE" "$dir/terraform/modules/compute/main.tf"
 }
 
 # Run the script against a fixture root; echo its exit code.
@@ -120,6 +125,12 @@ test_tf_threshold_drift() {
     '/revocation_delivery_latency_high/,/^}/ s/^([[:space:]]*threshold[[:space:]]*=[[:space:]]*)15000/\120000/' \
     "SLO drift between the Go constant and the CloudWatch alarm"
 }
+test_tf_compute_precondition_drift() {
+  _expect_drift_detected "retry age-out precondition SLO drift is detected" \
+    "terraform/modules/compute/main.tf" \
+    '/revocation_retry_config_contract/,/^}/ s/(var\.revocation_retry_age_out_seconds[[:space:]]*>[[:space:]]*)15/\120/' \
+    "SLO drift between the Go constant and the Terraform retry age-out precondition"
+}
 test_go_ms_form_drift() {
   _expect_drift_detected "Go SLO drift in millisecond form is detected" \
     "endpoints/server/revocation_retry.go" \
@@ -175,16 +186,26 @@ test_shape_break_tf_non_integer_fails_loud() {
     '/revocation_delivery_latency_high/,/^}/ s/^([[:space:]]*threshold[[:space:]]*=[[:space:]]*[0-9]+)$/\1.5/' \
     "is not a plain integer"
 }
+test_shape_break_tf_compute_key_fails_loud() {
+  # Rename the age-out variable inside the compute contract so the awk block-scan
+  # finds no SLO comparison -> empty extract -> fail loud.
+  _expect_drift_detected "renamed retry age-out precondition key fails loud" \
+    "terraform/modules/compute/main.tf" \
+    '/revocation_retry_config_contract/,/^}/ s/var\.revocation_retry_age_out_seconds/var.revocation_retry_age_out_seconds_RENAMED/' \
+    "could not extract the revocation_retry_age_out_seconds SLO precondition"
+}
 
 echo "check-revocation-slo-lockstep.sh fixture tests"
 test_in_sync
 test_go_scalar_drift
 test_tf_threshold_drift
+test_tf_compute_precondition_drift
 test_go_ms_form_drift
 test_go_ms_form_equivalent_passes
 test_shape_break_go_unit_fails_loud
 test_shape_break_tf_key_fails_loud
 test_shape_break_tf_non_integer_fails_loud
+test_shape_break_tf_compute_key_fails_loud
 
 echo ""
 if [ "$fail" -gt 0 ]; then

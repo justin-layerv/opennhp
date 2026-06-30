@@ -1314,10 +1314,12 @@ resource "aws_cloudwatch_metric_alarm" "ac_registration_latency" {
 # (terraform/CLAUDE.md "Metric / Alarm Dim-Set Rules" — a partial dim set
 # selects a non-existent stream and the alarm sits in INSUFFICIENT_DATA forever).
 #
-# All three use treat_missing_data = "notBreaching": the revocation retry engine
-# is default-OFF (NHP_REVOCATION_RETRY_ENABLED), so until it is armed fleet-wide
-# there are no samples and no aged-out/untrackable events. Absence is "no revokes
-# / engine not yet armed," not a fault — matches the KnockLatency precedent.
+# All three use treat_missing_data = "notBreaching": even with the Terraform-
+# managed server fleet arming NHP_REVOCATION_RETRY_ENABLED, there may be long
+# quiet periods with no qURL v2 revokes, hence no latency samples or aged-out /
+# untrackable events. Absence is "no observed revokes," not a fault — matches
+# the KnockLatency precedent. Unmanaged/pre-ACK fleets that omit the env var also
+# produce no samples by design.
 
 # Revocation delivery latency p99 (the SLO). The threshold (15000 ms) MUST stay
 # in lockstep with RevocationDeliveryLatencyP99SLO (15s) in
