@@ -3847,15 +3847,37 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 	return artMsg, nil
 }
 
-// processACOperationBroadcast sends NHP-AOP to ALL AC connections in parallel.
-// Each AC in a different AZ must receive the knock so its ipset pinhole is
-// opened for the client IP — the AC NLB round-robins the client's subsequent
-// HTTPS request, so every AC needs the entry.
+// knockACFanoutEnabled reports whether cell-wide knock AC fan-out
+// (qurl-service#948, Config.EnableKnockACFanout) is on. Nil-safe so tests that
+// construct a bare UdpServer default to the legacy first-success, local-only
+// path.
+func (s *UdpServer) knockACFanoutEnabled() bool {
+	return s.config != nil && s.config.EnableKnockACFanout
+}
+
+// processACOperationBroadcast sends NHP-AOP to ALL local AC connections in
+// parallel. Each AC in a different AZ must receive the knock so its ipset/eBPF
+// pinhole is opened for the client IP — the AC NLB round-robins the client's
+// subsequent HTTPS request, so every AC needs the entry.
 //
-// Returns the first successful result immediately to minimize client-facing
-// latency. Unlike the pre-fix version, remaining goroutines are NOT canceled
-// — they continue in the background so all ACs still get the pinhole.
-// A background goroutine drains and logs the remaining results.
+// Return timing depends on Config.EnableKnockACFanout (knockACFanoutEnabled):
+//
+//   - OFF (legacy): returns the first successful result immediately to minimize
+//     client-facing latency; remaining goroutines are NOT canceled — they
+//     continue in the background so all ACs still get the pinhole, drained and
+//     logged by a background goroutine. The risk this leaves is qurl-service#948:
+//     the ack (which unblocks the synchronous knock → 302) can fire before a
+//     sibling AC's pinhole write completes, and a viewer GET the NLB hashes to
+//     that AC is dropped.
+//   - ON: waits for EVERY local AC to complete before returning, so the ack
+//     means "all live local ACs have the pinhole." Success/failure semantics are
+//     unchanged (success with the first successful ART if ≥1 AC succeeded — a
+//     partial failure does not fail an otherwise-good knock; the last error if
+//     every AC failed); only the TIMING moves from fastest-AC to slowest-AC. The
+//     wait is bounded per-AC by the broadcast context + the AC transaction
+//     timeout, so a wedged AC delays this knock by at most that budget. This is
+//     the local half of the #948 fix; the handler pairs it with a cross-server
+//     fan-out so peer ACs are covered too.
 func (s *UdpServer) processACOperationBroadcast(
 	parentCtx context.Context,
 	knkMsg *common.AgentKnockMsg,
@@ -3916,59 +3938,89 @@ func (s *UdpServer) processACOperationBroadcast(
 		}(conn)
 	}
 
-	// Wait for results. Return on first success to unblock the client, but
-	// let remaining goroutines finish in the background (fire-and-forget AOP).
-	// If all fail, return the last error.
+	// Wait for results. With fan-out OFF (legacy) return on first success to
+	// unblock the client, letting remaining goroutines finish in the background
+	// (fire-and-forget AOP). With fan-out ON wait for EVERY AC so the ack means
+	// "all live local ACs have the pinhole" (qurl-service#948). Either way, if
+	// all fail, return the last error.
+	waitAll := s.knockACFanoutEnabled()
 	var lastErr error
 	var lastArtMsg *common.ACOpsResultMsg
-	var failCount int
+	var firstSuccessArt *common.ACOpsResultMsg
+	var successCount, failCount int
+	var failedAddrs []string
 	for i := 0; i < total; i++ {
 		r := <-results
 		if r.err == nil {
-			log.Info("server-agent(%s@%s)[processACOperationBroadcast] AC at %s succeeded (1/%d), returning to caller",
-				userId, addrStr, r.acAddr, total)
-			// Drain remaining results in background — single summary log, emit metrics
-			remaining := total - i - 1
-			if remaining > 0 {
-				go func() {
-					var bgSuccess, bgFail int
-					var failedAddrs []string
-					for j := 0; j < remaining; j++ {
-						bgr := <-results
-						if bgr.err == nil {
-							bgSuccess++
-						} else {
-							bgFail++
-							failedAddrs = append(failedAddrs, bgr.acAddr)
+			successCount++
+			if firstSuccessArt == nil {
+				firstSuccessArt = r.artMsg
+			}
+			if !waitAll {
+				log.Info("server-agent(%s@%s)[processACOperationBroadcast] AC at %s succeeded (1/%d), returning to caller",
+					userId, addrStr, r.acAddr, total)
+				// Drain remaining results in background — single summary log, emit metrics
+				remaining := total - i - 1
+				if remaining > 0 {
+					go func() {
+						var bgSuccess, bgFail int
+						var bgFailedAddrs []string
+						for j := 0; j < remaining; j++ {
+							bgr := <-results
+							if bgr.err == nil {
+								bgSuccess++
+							} else {
+								bgFail++
+								bgFailedAddrs = append(bgFailedAddrs, bgr.acAddr)
+							}
 						}
-					}
+						elapsed := time.Since(broadcastStart)
+						s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(elapsed.Milliseconds()))
+						if bgFail > 0 {
+							s.metrics.IncrCounter(MetricBroadcastPartialFail)
+							log.Warning("server-agent(%s@%s)[processACOperationBroadcast] broadcast done in %v: %d/%d ACs succeeded, failed: %v",
+								userId, addrStr, elapsed, bgSuccess+1, total, bgFailedAddrs)
+						} else {
+							log.Info("server-agent(%s@%s)[processACOperationBroadcast] broadcast done in %v: %d/%d ACs succeeded",
+								userId, addrStr, elapsed, bgSuccess+1, total)
+						}
+					}()
+				} else {
 					elapsed := time.Since(broadcastStart)
 					s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(elapsed.Milliseconds()))
-					if bgFail > 0 {
-						s.metrics.IncrCounter(MetricBroadcastPartialFail)
-						log.Warning("server-agent(%s@%s)[processACOperationBroadcast] broadcast done in %v: %d/%d ACs succeeded, failed: %v",
-							userId, addrStr, elapsed, bgSuccess+1, total, failedAddrs)
-					} else {
-						log.Info("server-agent(%s@%s)[processACOperationBroadcast] broadcast done in %v: %d/%d ACs succeeded",
-							userId, addrStr, elapsed, bgSuccess+1, total)
-					}
-				}()
-			} else {
-				elapsed := time.Since(broadcastStart)
-				s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(elapsed.Milliseconds()))
+				}
+				s.metrics.IncrCounter(MetricBroadcastSuccess)
+				return r.artMsg, nil
 			}
-			s.metrics.IncrCounter(MetricBroadcastSuccess)
-			return r.artMsg, nil
+			// waitAll: keep collecting until every AC goroutine has reported.
+			continue
 		}
 		failCount++
+		failedAddrs = append(failedAddrs, r.acAddr)
 		log.Warning("server-agent(%s@%s)[processACOperationBroadcast] AC at %s failed: %v (%d/%d)",
 			userId, addrStr, r.acAddr, r.err, failCount, total)
 		lastErr = r.err
 		lastArtMsg = r.artMsg
 	}
 
+	// Reached when waitAll collected every result, or (in either mode) when
+	// every AC failed.
 	elapsed := time.Since(broadcastStart)
 	s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(elapsed.Milliseconds()))
+	if successCount > 0 {
+		// waitAll: every AC has now completed and at least one opened its
+		// pinhole. Mirror the legacy success/partial-fail metrics + logs.
+		if failCount > 0 {
+			s.metrics.IncrCounter(MetricBroadcastPartialFail)
+			log.Warning("server-agent(%s@%s)[processACOperationBroadcast] broadcast done in %v: %d/%d ACs succeeded, failed: %v",
+				userId, addrStr, elapsed, successCount, total, failedAddrs)
+		} else {
+			log.Info("server-agent(%s@%s)[processACOperationBroadcast] broadcast done in %v: %d/%d ACs succeeded",
+				userId, addrStr, elapsed, successCount, total)
+		}
+		s.metrics.IncrCounter(MetricBroadcastSuccess)
+		return firstSuccessArt, nil
+	}
 	s.metrics.IncrCounter(MetricBroadcastAllFail)
 	log.Warning("server-agent(%s@%s)[processACOperationBroadcast] all %d ACs failed in %v", userId, addrStr, total, elapsed)
 	return lastArtMsg, lastErr
@@ -3988,6 +4040,49 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			acDstIpMap[resName] = addrs
 		} else {
 			acDstIpMap[resName] = []*common.NetAddress{info.Addr}
+		}
+	}
+
+	// qurl-service#948: cell-wide knock AC fan-out (native/relay knock path).
+	// handleNhpOpenResource only ever runs for ORIGIN knocks — a forwarded knock
+	// is processed by ServerForwarder.handleDecryptedForwardedKnock, which never
+	// re-forwards — so no Forwarded guard is needed. The per-resource loop below
+	// opens pinholes only on THIS server's local ACs, but the qurl.site NLB hashes
+	// the viewer's GET across the whole fleet; fan the knock out (NHP_FWD) to every
+	// assigned PEER server so each opens its local ACs too. The defer makes EVERY
+	// return path — including the no-local-AC forward early-return below — block
+	// until peer pinholes are open before we ack. Coverage-only; the ack still
+	// comes from the local broadcast / forward.
+	if s.knockACFanoutEnabled() && s.storage != nil && s.forwarder != nil && len(req.OriginalPacket) > 0 {
+		if userAddr, parseErr := net.ResolveUDPAddr("udp", addrStr); parseErr == nil {
+			fanoutBase := context.WithoutCancel(context.Background())
+			var fanoutWg sync.WaitGroup
+			fannedAcIds := make(map[string]bool, len(res.Resources))
+			for _, info := range res.Resources {
+				if info == nil || info.ACId == "" || fannedAcIds[info.ACId] {
+					continue
+				}
+				fannedAcIds[info.ACId] = true
+				fanoutWg.Add(1)
+				go func(acId string) {
+					defer fanoutWg.Done()
+					lctx, lcancel := context.WithTimeout(fanoutBase, DefaultStorageTimeout)
+					assignment, lookupErr := s.storage.GetACAssignment(lctx, acId)
+					lcancel()
+					if lookupErr != nil || assignment == nil || len(assignment.AssignedServers) == 0 {
+						if lookupErr != nil && !IsNotFoundError(lookupErr) {
+							log.Warning("server-agent(%s@%s)-ac(%s)[handleNhpOpenResource] knock fan-out assignment lookup failed: %v", knkMsg.UserId, addrStr, acId, lookupErr)
+						}
+						return
+					}
+					fctx, fcancel := context.WithTimeout(fanoutBase, ForwardTimeout)
+					defer fcancel()
+					accepted := s.forwarder.FanoutKnock(fctx, assignment, s.localIp, req.OriginalPacket, userAddr)
+					s.metrics.IncrCounter(MetricKnockFanout)
+					log.Info("server-agent(%s@%s)-ac(%s)[handleNhpOpenResource] knock fan-out opened pinholes on %d peer server(s)", knkMsg.UserId, addrStr, acId, accepted)
+				}(info.ACId)
+			}
+			defer fanoutWg.Wait()
 		}
 	}
 

@@ -641,6 +641,11 @@ module "compute" {
   revocation_retry_age_out_seconds    = var.nhp_revocation_retry_age_out_seconds
   overload_cookie_time_window_seconds = var.nhp_overload_cookie_time_window_seconds
 
+  # Cell-wide knock AC fan-out (qurl-service#948). Sandbox-first rollout: enabled
+  # in sandbox to validate against the session-anchoring smoke; prod stays on the
+  # legacy local-only path until the ledgered flip widens this gate.
+  enable_knock_ac_fanout = var.environment == "sandbox"
+
   # Knock-port DoS hardening (#1159)
   knock_global_rate_limit_pps   = var.nhp_knock_global_rate_limit_pps
   knock_global_rate_limit_burst = var.nhp_knock_global_rate_limit_burst

@@ -855,6 +855,8 @@ locals {
     cookie_secret_arn                   = aws_secretsmanager_secret.cookie_secret.arn
     overload_cookie_secret_arn          = aws_secretsmanager_secret.overload_cookie_secret.arn
     overload_cookie_time_window_seconds = var.overload_cookie_time_window_seconds
+    # Cell-wide knock AC fan-out toggle (qurl-service#948) -> Config.EnableKnockACFanout
+    enable_knock_ac_fanout = var.enable_knock_ac_fanout
     # Shared HMAC secret for /nhp/internal/knock verification (matches qurl-service signer)
     nhp_internal_auth_secret_arn = var.nhp_internal_auth_secret_arn
     # CORS allowed origins for NHP HTTP server

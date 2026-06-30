@@ -107,6 +107,13 @@ const (
 	MetricKnockForwardFailure        = "KnockForwardFailure"
 	MetricKnockForwardSkippedDead    = "KnockForwardSkippedDead"
 	MetricKnockForwardFallback       = "KnockForwardFallback"
+	// Cell-wide knock AC fan-out (qurl-service#948, Config.EnableKnockACFanout).
+	// Unlike the forward counters above (a no-local-AC FAILOVER to one peer),
+	// these track the coverage FAN-OUT an origin knock sends to ALL assigned peer
+	// servers so every AC the qurl.site NLB can route to opens the pinhole.
+	MetricKnockFanout            = "KnockFanout"            // origin knocks that fanned out (per acId)
+	MetricKnockFanoutPeerSuccess = "KnockFanoutPeerSuccess" // peer servers that accepted a fan-out knock
+	MetricKnockFanoutPeerFail    = "KnockFanoutPeerFail"    // peer servers a fan-out knock could not reach
 	// MetricRelayForward counts every NHP_RLY packet (relay-forwarded agent
 	// knock, #2208) RECEIVED past the outer Noise auth. It is incremented at
 	// handler entry, BEFORE the relay-peer / source / inner-packet validation,

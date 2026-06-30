@@ -287,6 +287,87 @@ func (f *HttpKnockForwarder) ForwardHttpKnock(
 	return nil, fmt.Errorf("all %d servers failed for AC %s: %w", len(servers), acID, lastErr)
 }
 
+// FanoutHttpKnock forwards the knock to ALL healthy assigned peer servers in
+// parallel — not first-success — purely so each peer opens ITS local AC
+// pinholes. This is the cross-server half of the qurl-service#948 fix: the
+// origin server already opened its own local ACs, but the qurl.site NLB hashes
+// the viewer's GET across the whole fleet, so every assigned peer must open its
+// ACs too before the knock is acked.
+//
+// It does NOT produce the knock ack (the caller owns that from its local
+// broadcast / failover); the return is coverage observability only —
+// peersAccepted is how many peers reported a successful open. The req MUST carry
+// Forwarded=true (use buildForwardedKnock) so a peer does not re-fan-out;
+// forwardToServer's /nhp/internal/knock receiver re-enters handleHttpOpenResource
+// with that flag, whose fan-out gate is !Forwarded, bounding depth to one hop.
+//
+// A non-nil error means the assignment itself could not be resolved; the caller
+// logs and proceeds on its local coverage. Individual peer failures are logged +
+// metered, never surfaced — a single down peer must not fail an otherwise-good
+// knock.
+func (f *HttpKnockForwarder) FanoutHttpKnock(
+	ctx context.Context,
+	acID string,
+	req *common.HttpKnockRequest,
+	res *common.ResourceData,
+) (peersAccepted int, err error) {
+	if f.stopped.Load() {
+		return 0, errForwarderStopped
+	}
+	f.wg.Add(1)
+	defer f.wg.Done()
+
+	if f.storage == nil {
+		return 0, fmt.Errorf("no storage backend configured")
+	}
+
+	assignment, err := f.storage.GetACAssignment(ctx, acID)
+	if err != nil {
+		if IsNotFoundError(err) {
+			return 0, fmt.Errorf("no AC assignment found for %s", acID)
+		}
+		return 0, fmt.Errorf("storage error for AC %s: %w", acID, err)
+	}
+	if assignment.TTL != nil && *assignment.TTL < time.Now().Unix() {
+		return 0, fmt.Errorf("AC assignment expired for %s", acID)
+	}
+
+	// Healthy assigned peers, self and recently-failed excluded. Zero peers is
+	// not an error: a single-server cell's local broadcast already covers the
+	// whole fleet.
+	servers := f.filterForwardTargets(ctx, assignment.AssignedServers)
+	if len(servers) == 0 {
+		return 0, nil
+	}
+
+	f.metric(MetricKnockFanout)
+
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	for _, srv := range servers {
+		wg.Add(1)
+		go func(srv ServerInfo) {
+			defer wg.Done()
+			ackMsg, ferr := f.forwardToServer(ctx, srv, req, res)
+			if ferr != nil {
+				f.markFailed(srv.InternalIP)
+				f.metric(MetricKnockFanoutPeerFail)
+				log.Warning("knock fan-out to %s (%s) failed for AC %s: %v", srv.ID, srv.InternalIP, acID, ferr)
+				return
+			}
+			// A structured non-success ack (e.g. the peer holds none of the
+			// fleet's ACs) is not a fan-out failure — that peer simply opened
+			// nothing. Only a real success counts toward coverage.
+			if ackMsg != nil && ackMsg.ErrCode == common.ErrSuccess.ErrorCode() {
+				accepted.Add(1)
+				f.metric(MetricKnockFanoutPeerSuccess)
+			}
+		}(srv)
+	}
+	wg.Wait()
+	return int(accepted.Load()), nil
+}
+
 // filterForwardTargets returns assigned servers that are healthy and not this server.
 func (f *HttpKnockForwarder) filterForwardTargets(ctx context.Context, servers []ServerInfo) []ServerInfo {
 	// Filter to healthy servers first (CloudMap, if available)

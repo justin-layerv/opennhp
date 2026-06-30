@@ -341,6 +341,7 @@ DisableAgentValidation = false
 DisableRelayValidation = ${relay_enabled}
 CookieSigningKeyBase64 = "$COOKIE_SIGNING_KEY_B64"
 CookieTimeWindowSeconds = ${overload_cookie_time_window_seconds}
+EnableKnockACFanout = ${enable_knock_ac_fanout}
 %{ if dev_mode }
 Dev = true
 %{ endif }

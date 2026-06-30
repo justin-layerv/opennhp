@@ -200,6 +200,12 @@ variable "overload_cookie_time_window_seconds" {
   }
 }
 
+variable "enable_knock_ac_fanout" {
+  description = "Cell-wide knock AC fan-out (qurl-service#948). When true an origin knock waits for all its local ACs AND fans the knock out to all assigned peer servers, so every AC the qurl.site NLB can route to opens the L3 pinhole before the knock acks — closing the firewall-coverage race. Default false = legacy first-success, local-only behavior. Rendered as Config.EnableKnockACFanout in config.toml. Rolled out sandbox-first; flip per environment via the root-module gate."
+  type        = bool
+  default     = false
+}
+
 variable "resource_mode" {
   description = "Resource management mode: 'local' (config file) or 'api' (external auth service)"
   type        = string

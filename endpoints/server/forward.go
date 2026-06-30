@@ -10,6 +10,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
@@ -185,6 +186,64 @@ func (f *ServerForwarder) ForwardKnock(
 		return nil, lastErr
 	}
 	return nil, errors.New("all assigned servers unreachable or unhealthy")
+}
+
+// FanoutKnock sends the knock to ALL healthy assigned peer servers in parallel —
+// not first-success — purely so each peer opens ITS local AC pinholes. This is
+// the NHP_FWD (native/relay knock path) half of the qurl-service#948 fix: the
+// origin server already opened its own local ACs, but the qurl.site NLB hashes
+// the viewer's GET across the whole fleet, so every assigned peer must open its
+// ACs too before the knock is acked.
+//
+// selfInternalIP is this server's VPC IP; a target matching it is skipped (the
+// origin already opened its local ACs). The receiver runs HandleForwardRequest →
+// handleDecryptedForwardedKnock, which opens local ACs and never re-forwards, so
+// depth is bounded to one hop without needing a Forwarded flag.
+//
+// The return is coverage observability only — peersAccepted is how many peers
+// reported a successful open; the caller owns the knock ack from its local
+// broadcast. Individual peer failures are logged, never surfaced: a single down
+// peer must not fail an otherwise-good knock.
+func (f *ServerForwarder) FanoutKnock(
+	ctx context.Context,
+	assignment *ACAssignment,
+	selfInternalIP string,
+	knockData []byte,
+	userAddr *net.UDPAddr,
+) (peersAccepted int) {
+	if assignment == nil || len(assignment.AssignedServers) == 0 {
+		return 0
+	}
+
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	for _, target := range assignment.AssignedServers {
+		// Skip self (already opened local ACs) and recently-failed peers.
+		if selfInternalIP != "" && target.InternalIP == selfInternalIP {
+			continue
+		}
+		if f.health.IsUnhealthy(target.ID) {
+			continue
+		}
+		wg.Add(1)
+		go func(target ServerInfo) {
+			defer wg.Done()
+			result, ferr := f.forwardToServer(ctx, target, assignment.ACID, knockData, userAddr)
+			if ferr != nil {
+				if !isLocalForwardSendError(ferr) {
+					f.health.RecordFailure(target.ID)
+				}
+				log.Warning("Knock fan-out to server %s failed for AC %s: %v", target.ID, assignment.ACID, ferr)
+				return
+			}
+			f.health.RecordSuccess(target.ID)
+			if result != nil && result.Success {
+				accepted.Add(1)
+			}
+		}(target)
+	}
+	wg.Wait()
+	return int(accepted.Load())
 }
 
 // forwardToServer sends an NHP_FWD message to a specific server.
