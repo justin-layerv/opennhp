@@ -43,7 +43,11 @@ const (
 	// The wire-level (deployed-server) verification — and the #1325
 	// cross-module drift guard against
 	// tests/smoke/15_resolve_accept_negotiation_test.go — were retired
-	// when the qURL-minting smoke tests moved to the qurl-service repo.
+	// when the qURL-minting smoke tests moved to the qurl-service repo,
+	// where the value is now asserted verbatim by
+	// tests/smoke/nhp_resolve_accept_test.go. Neither side has a compile-time
+	// guard — if you rename it, change both repos in lockstep. See
+	// qurl-service#1018.
 	redirectURLField = "redirect_url"
 )
 
@@ -657,6 +661,11 @@ func nhpDrop(ctx *gin.Context) {
 // accessDeniedHTML is the branded error page shown when a QURL access link is
 // invalid, expired, consumed, or denied by policy. Matches the SPA error page
 // design from qurl/frontend/index.html. Generic message — no token state leaked.
+//
+// The "Access Link Invalid" marker in the <title>/<h2> below is asserted
+// verbatim by qurl-service tests/smoke/nhp_resolve_accept_test.go with no
+// compile-time guard — if you rename it, change both repos in lockstep. See
+// qurl-service#1018.
 const accessDeniedHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>

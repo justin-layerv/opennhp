@@ -21,6 +21,10 @@ const (
 )
 
 // Cookie names for NHP authentication tokens.
+//
+// Asserted verbatim by qurl-service tests/smoke/nhp_resolve_test.go (cookie
+// names + attributes), with no shared module or compile-time guard — if you
+// rename either, change both repos in lockstep. See qurl-service#1018.
 const (
 	CookieNHPToken        = "nhp_token"
 	CookieNHPRefreshToken = "nhp_refresh_token"
