@@ -2,7 +2,7 @@
 # Install with: pip install -r requirements-dev.txt
 
 # Pin test tooling so promote-to-prod Lambda tests are reproducible across re-runs.
-pytest==9.1.0
+pytest==9.1.1
 
 # AWS SDK (provided by Lambda runtime, needed for testing)
 boto3==1.43.29
