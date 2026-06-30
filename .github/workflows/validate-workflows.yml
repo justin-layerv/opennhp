@@ -280,6 +280,15 @@ jobs:
           shellcheck .github/scripts/plan-blue-green-dispatch.sh tests/scripts/plan-blue-green-dispatch_test.sh
           bash tests/scripts/plan-blue-green-dispatch_test.sh
 
+      # Fence the blue/green listener switch's #2628 private-server contract: when
+      # nhp-server is private the public udp-listener-arn SSM param is gone, so the
+      # switch must SKIP the public UDP flip (and still record active-color) for the
+      # server component while a missing primary listener stays a hard error for AC.
+      - name: Test blue/green listener switch
+        run: |
+          shellcheck .github/scripts/blue-green-switch.sh tests/scripts/blue-green-switch_test.sh
+          bash tests/scripts/blue-green-switch_test.sh
+
       # Shared by the Server and AC Packer post-processors. This keeps
       # Packer's region:ami-* artifact_id parsing from drifting across both
       # callers.

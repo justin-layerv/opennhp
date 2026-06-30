@@ -491,6 +491,22 @@ variable "qurl_resolve_certificate_arn" {
   default     = null
 }
 
+# #2628 / #2208 #8: the PUBLIC knock surface switch. When false, the public NLB
+# (aws_lb.server), its UDP 62206 listener/target-group/attachment, the blue/green
+# public-UDP target group + SSM switch params, and the 0.0.0.0/0 UDP ingress rule
+# are all NOT created — taking nhp-server's knock plane off the internet. The
+# internal relay NLB (aws_lb.server_internal, gated on relay_enabled) and the
+# already-private CloudMap HTTP path are unaffected; the resolve HTTPS surface is
+# gated separately on enable_qurl_resolve_endpoint. Root threads
+# `!var.take_server_private` here, so the default (true) preserves today's public
+# topology with zero diff. The resources gaining this count carry `moved {}` blocks
+# (moved.tf) so flipping the flag is a clean add/destroy, never a destroy+recreate.
+variable "public_server_surface_enabled" {
+  description = "Create the PUBLIC server NLB knock surface (aws_lb.server + UDP 62206 listener/TG + 0.0.0.0/0 ingress + blue/green public-UDP switch params). Set false (root: take_server_private=true) to take nhp-server private; the relay reaches it via the internal NLB. Default true = current public behaviour."
+  type        = bool
+  default     = true
+}
+
 # =============================================================================
 # NHP Server Env-Var Passthroughs
 # Variables that flow into /opt/layerv/nhp-server/etc/env via user_data.sh.tpl

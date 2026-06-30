@@ -93,6 +93,20 @@ variable "disable_nlb_health_checks" {
   default     = false
 }
 
+# #2628: escape hatch for the `server`/`ac` + disable_nlb_health_checks=true
+# combination, which the component_invariants precondition otherwise rejects
+# (those components normally HAVE an NLB). When a server/ac component's NLB is
+# INTENTIONALLY absent — e.g. nhp-server taken private (the public knock NLB is
+# removed) — disabling NLB health checks is correct, and the canary advances on
+# CPU + ASG-instance health like the NLB-less qurl-reverse-tunnel-server path.
+# Does NOT relax the suffix-consistency precondition (empty suffixes are still
+# required under disable=true) or the runtime _check_nlb_mode_consistency.
+variable "nlb_intentionally_absent" {
+  description = "Permit disable_nlb_health_checks=true for a server/ac component whose NLB is deliberately removed (e.g. nhp-server taken private, #2628). The canary then advances on CPU + ASG-instance health, not NLB target health. Default false."
+  type        = bool
+  default     = false
+}
+
 variable "alerts_sns_topic_arn" {
   description = "SNS topic ARN for deployment notifications and alarm actions"
   type        = string

@@ -1927,6 +1927,16 @@ variable "deploy_relay" {
   default     = false
 }
 
+# #2208 phase #8 / #2628: prod stays PUBLIC (false) until a dedicated prod-cutover
+# PR after the relay carries real browser traffic in prod (#6/#2680) + the resolve
+# plugin is retired (#7). Forwarded to module.nhp; flipping it requires deploy_relay
+# (precondition), so it cannot be set while the relay is dark.
+variable "take_server_private" {
+  description = "Take nhp-server off the public internet — remove the public UDP 62206 NLB and repoint the AC + qurl-service to the internal relay NLB. Requires deploy_relay=true and qurl_link_js_agent_enabled=true. Default false (prod stays public until the cutover PR)."
+  type        = bool
+  default     = false
+}
+
 variable "relay_dns_name" {
   description = "Public DNS name for the relay ALB. Prod: `relay.qurl.link` (set when prod enables). Only read when `deploy_relay = true`."
   type        = string

@@ -113,6 +113,23 @@ accepts any `*.internal` host with a valid port rather than only
 `server.nhp.<env>.internal`; that preserves nonstandard module uses, but a typo
 can still pass validation and fail later at DNS/runtime.
 
+**`take_server_private` repoints the UDP knock endpoint, NOT this HTTP path
+(#2628).** Two distinct server reach-paths must not be conflated. (1) The HTTP
+token-validation path above (`local.nhp_server_internal_url`,
+`server.<namespace>:8888`) stays on Cloud Map regardless of
+`take_server_private` — do not move it. (2) The UDP *knock/registration*
+endpoint — the in-VPC AC's `ServerEndpoint` and qurl-service's
+`nhp_server_host` (both `module.compute.nlb_dns_name`, the PUBLIC NLB) — is what
+`take_server_private` swaps to `module.compute.internal_nlb_dns_name` (the
+internal relay NLB) when the public NLB is removed. That output is null unless
+`deploy_relay=true`, so the flag's precondition
+(`terraform_data.take_server_private_preconditions`) requires
+`deploy_relay && qurl_link_js_agent_enabled`. The internal NLB runs
+`preserve_client_ip=true`, so the server replies to the AC from its instance IP,
+not the NLB IP — the AC-registration smoke in the #2628 rollout-ledger entry
+gates the cutover on that reply being accepted (CloudMap
+`server.<namespace>:62206` is the documented fallback).
+
 **Static name + `create_before_destroy` invariant.** Every ASG in
 this repo (the three listed above plus their `blue_green.tf` green
 counterparts) uses a static `name = "${var.name_prefix}-..."` AND

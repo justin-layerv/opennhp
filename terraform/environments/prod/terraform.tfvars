@@ -419,6 +419,15 @@ bootstrap_alb_elb_5xx_threshold_per_minute = 1
 # prod-enable PR flips it. Explicit here so the dark posture reads as deliberate.
 deploy_relay = false
 
+# #2208 #8 / #2628: keep nhp-server PUBLIC in prod. The cutover (remove the public
+# knock NLB; repoint the AC + qurl-service to the internal relay NLB) only happens
+# in a dedicated prod-cutover PR AFTER the relay carries real browser traffic in
+# prod (#6/#2680) and the resolve plugin is retired (#7) — and the prod public NLB
+# has enable_deletion_protection=true, so that PR must also flip protection off.
+# take_server_private=true requires deploy_relay=true (precondition), so it cannot
+# be flipped here while the relay is dark. Explicit so the public posture is deliberate.
+take_server_private = false
+
 # WAF go-live watch period (count-only). Unlike sandbox's dark launch, this PR
 # flips enable_qurl_agent_bootstrap=true simultaneously, so real customer agents
 # can hit bootstrap.layerv.ai on day 1. Per var.bootstrap_alb_waf_count_only_rule_groups's

@@ -102,48 +102,78 @@ else
     SECONDARY_LISTENER_TYPE=""
 fi
 
-# Get primary listener ARN
+# Get primary listener ARN.
+#
+# #2628: when nhp-server is private (take_server_private=true), Terraform removes the
+# public UDP NLB and its "${SSM_BASE}/udp-listener-arn" parameter. There is then no
+# public listener to flip — the relay->server hop uses the INTERNAL NLB, which fronts
+# both colors via a static target-group attach and needs no per-deploy listener flip
+# (#2645 tracks active-color-only internal routing).
+#
+# A missing listener alone is NOT enough to skip: a botched public apply, SSM drift,
+# or an accidental param deletion on a PUBLIC server would otherwise silently skip the
+# traffic switch and report the deploy green. So skip ONLY when the Terraform-written
+# "${SSM_BASE}/take-server-private" marker positively confirms "true"; if the listener
+# is missing and the marker is anything else (absent / "false"), fail loudly — that is
+# a broken public deploy, not a private server. A missing primary listener for the AC
+# component is still a real fault regardless.
+SKIP_PRIMARY_SWITCH=false
 PRIMARY_LISTENER_ARN=$(get_ssm_param "${SSM_BASE}/${PRIMARY_LISTENER_TYPE}-listener-arn")
 if [[ -z "$PRIMARY_LISTENER_ARN" ]]; then
-    log_error "Failed to get ${PRIMARY_LISTENER_TYPE} listener ARN from SSM"
-    exit 1
-fi
-log_info "Primary (${PRIMARY_LISTENER_TYPE}) Listener ARN: $PRIMARY_LISTENER_ARN"
-
-# Get target group ARNs based on target color
-if [[ "$TARGET_COLOR" == "blue" ]]; then
-    PRIMARY_TARGET_GROUP_ARN=$(get_ssm_param "${SSM_BASE}/blue-${PRIMARY_LISTENER_TYPE}-tg-arn")
+    if [[ "$COMPONENT" == "server" ]]; then
+        SERVER_PRIVATE=$(get_ssm_param "${SSM_BASE}/take-server-private")
+        if [[ "$SERVER_PRIVATE" == "true" ]]; then
+            log_warn "No public ${PRIMARY_LISTENER_TYPE} listener ARN in SSM and take-server-private=true — nhp-server is private (#2628). Skipping public listener switch; the internal relay NLB needs none."
+            SKIP_PRIMARY_SWITCH=true
+        else
+            log_error "No public ${PRIMARY_LISTENER_TYPE} listener ARN in SSM, but take-server-private is not 'true' (got '${SERVER_PRIVATE:-<absent>}'). A public server must have its listener — failing loudly (likely a partial apply or SSM drift) rather than silently skipping the traffic switch."
+            exit 1
+        fi
+    else
+        log_error "Failed to get ${PRIMARY_LISTENER_TYPE} listener ARN from SSM"
+        exit 1
+    fi
 else
-    PRIMARY_TARGET_GROUP_ARN=$(get_ssm_param "${SSM_BASE}/green-${PRIMARY_LISTENER_TYPE}-tg-arn")
+    log_info "Primary (${PRIMARY_LISTENER_TYPE}) Listener ARN: $PRIMARY_LISTENER_ARN"
 fi
 
-if [[ -z "$PRIMARY_TARGET_GROUP_ARN" ]]; then
-    log_error "Failed to get $TARGET_COLOR ${PRIMARY_LISTENER_TYPE} target group ARN from SSM"
-    exit 1
-fi
-log_info "Target ${PRIMARY_LISTENER_TYPE} TG ARN: $PRIMARY_TARGET_GROUP_ARN"
+PRIMARY_SWITCHED=false
+if [[ "$SKIP_PRIMARY_SWITCH" != "true" ]]; then
+    # Get target group ARNs based on target color
+    if [[ "$TARGET_COLOR" == "blue" ]]; then
+        PRIMARY_TARGET_GROUP_ARN=$(get_ssm_param "${SSM_BASE}/blue-${PRIMARY_LISTENER_TYPE}-tg-arn")
+    else
+        PRIMARY_TARGET_GROUP_ARN=$(get_ssm_param "${SSM_BASE}/green-${PRIMARY_LISTENER_TYPE}-tg-arn")
+    fi
 
-# Get rollback target group ARN (current color) in case we need to revert
-if [[ "$CURRENT_COLOR" == "blue" ]]; then
-    ROLLBACK_PRIMARY_TG_ARN=$(get_ssm_param "${SSM_BASE}/blue-${PRIMARY_LISTENER_TYPE}-tg-arn")
-else
-    ROLLBACK_PRIMARY_TG_ARN=$(get_ssm_param "${SSM_BASE}/green-${PRIMARY_LISTENER_TYPE}-tg-arn")
-fi
+    if [[ -z "$PRIMARY_TARGET_GROUP_ARN" ]]; then
+        log_error "Failed to get $TARGET_COLOR ${PRIMARY_LISTENER_TYPE} target group ARN from SSM"
+        exit 1
+    fi
+    log_info "Target ${PRIMARY_LISTENER_TYPE} TG ARN: $PRIMARY_TARGET_GROUP_ARN"
 
-# Switch primary listener
-log_info "Switching ${PRIMARY_LISTENER_TYPE} listener to $TARGET_COLOR target group..."
-if [[ "$DRY_RUN" != "true" ]]; then
-    aws elbv2 modify-listener \
-        --listener-arn "$PRIMARY_LISTENER_ARN" \
-        --default-actions "Type=forward,TargetGroupArn=$PRIMARY_TARGET_GROUP_ARN" \
-        --region "$AWS_REGION" \
-        --output text > /dev/null
-    log_info "${PRIMARY_LISTENER_TYPE} listener switched successfully"
-else
-    log_info "[DRY RUN] Would execute: aws elbv2 modify-listener --listener-arn $PRIMARY_LISTENER_ARN --default-actions Type=forward,TargetGroupArn=$PRIMARY_TARGET_GROUP_ARN"
-fi
+    # Get rollback target group ARN (current color) in case we need to revert
+    if [[ "$CURRENT_COLOR" == "blue" ]]; then
+        ROLLBACK_PRIMARY_TG_ARN=$(get_ssm_param "${SSM_BASE}/blue-${PRIMARY_LISTENER_TYPE}-tg-arn")
+    else
+        ROLLBACK_PRIMARY_TG_ARN=$(get_ssm_param "${SSM_BASE}/green-${PRIMARY_LISTENER_TYPE}-tg-arn")
+    fi
 
-PRIMARY_SWITCHED=true
+    # Switch primary listener
+    log_info "Switching ${PRIMARY_LISTENER_TYPE} listener to $TARGET_COLOR target group..."
+    if [[ "$DRY_RUN" != "true" ]]; then
+        aws elbv2 modify-listener \
+            --listener-arn "$PRIMARY_LISTENER_ARN" \
+            --default-actions "Type=forward,TargetGroupArn=$PRIMARY_TARGET_GROUP_ARN" \
+            --region "$AWS_REGION" \
+            --output text > /dev/null
+        log_info "${PRIMARY_LISTENER_TYPE} listener switched successfully"
+    else
+        log_info "[DRY RUN] Would execute: aws elbv2 modify-listener --listener-arn $PRIMARY_LISTENER_ARN --default-actions Type=forward,TargetGroupArn=$PRIMARY_TARGET_GROUP_ARN"
+    fi
+
+    PRIMARY_SWITCHED=true
+fi
 
 # Check if secondary listener exists (server only - HTTPS for QURL)
 if [[ -n "$SECONDARY_LISTENER_TYPE" ]]; then
@@ -183,14 +213,21 @@ if [[ -n "$SECONDARY_LISTENER_TYPE" ]]; then
                 --region "$AWS_REGION" \
                 --output text > /dev/null; then
                 log_error "${SECONDARY_LISTENER_TYPE} listener switch failed!"
-                # Rollback primary listener to maintain consistency
-                log_warn "Rolling back ${PRIMARY_LISTENER_TYPE} listener to $CURRENT_COLOR..."
-                aws elbv2 modify-listener \
-                    --listener-arn "$PRIMARY_LISTENER_ARN" \
-                    --default-actions "Type=forward,TargetGroupArn=$ROLLBACK_PRIMARY_TG_ARN" \
-                    --region "$AWS_REGION" \
-                    --output text > /dev/null
-                log_warn "${PRIMARY_LISTENER_TYPE} listener rolled back. Traffic remains on $CURRENT_COLOR."
+                # Roll the primary listener back to maintain consistency — but ONLY if it
+                # was actually switched. In the #2628 private-skip path PRIMARY_SWITCHED=false
+                # and PRIMARY_LISTENER_ARN/ROLLBACK_PRIMARY_TG_ARN are unset, so there's
+                # nothing to roll back; this guard (matching the TG-missing rollback above)
+                # also avoids a `set -u` error if a future resolve-on-private change ever
+                # makes this path reachable (today: private ⟹ resolve off ⟹ no secondary).
+                if [[ "$PRIMARY_SWITCHED" == "true" ]]; then
+                    log_warn "Rolling back ${PRIMARY_LISTENER_TYPE} listener to $CURRENT_COLOR..."
+                    aws elbv2 modify-listener \
+                        --listener-arn "$PRIMARY_LISTENER_ARN" \
+                        --default-actions "Type=forward,TargetGroupArn=$ROLLBACK_PRIMARY_TG_ARN" \
+                        --region "$AWS_REGION" \
+                        --output text > /dev/null
+                    log_warn "${PRIMARY_LISTENER_TYPE} listener rolled back. Traffic remains on $CURRENT_COLOR."
+                fi
                 exit 1
             fi
             log_info "${SECONDARY_LISTENER_TYPE} listener switched successfully"

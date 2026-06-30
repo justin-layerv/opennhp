@@ -722,14 +722,23 @@ resource "aws_security_group" "server" {
 
 # --- Server SG Rules (separate resources to avoid inline/standalone conflicts) ---
 
-# NHP Protocol (UDP 62206) - from NLB
+# NHP Protocol (UDP 62206) - knock packets.
+#
+# Source CIDR tracks the knock surface. NLBs run preserve_client_ip=true, so the
+# rule must admit the ORIGINAL client IP, not the NLB node IP:
+#   - public (default): 0.0.0.0/0 — the public NLB forwards internet client IPs.
+#   - private (#2628, public_server_surface_enabled=false): var.vpc_cidr — the public
+#     NLB is gone and the ONLY remaining UDP 62206 ingress is the in-VPC internal
+#     relay NLB (relay/AC forwards carry an in-VPC source). This same rule already
+#     admits the relay->server hop today (see the aws_lb.server_internal block), so it
+#     is NARROWED here rather than removed — deleting it would break the relay path too.
 resource "aws_vpc_security_group_ingress_rule" "server_nhp_udp" {
   security_group_id = aws_security_group.server.id
-  description       = "NHP Protocol from NLB"
+  description       = var.public_server_surface_enabled ? "NHP Protocol from NLB" : "NHP Protocol from in-VPC relay/AC (server private, #2628)"
   from_port         = 62206
   to_port           = 62206
   ip_protocol       = "udp"
-  cidr_ipv4         = "0.0.0.0/0"
+  cidr_ipv4         = var.public_server_surface_enabled ? "0.0.0.0/0" : var.vpc_cidr
 
   tags = {
     Name = "${var.name_prefix}-server-nhp-udp"
@@ -1289,8 +1298,15 @@ resource "aws_autoscaling_policy" "cpu" {
 # copies DesiredCapacity to the standby ASG, so the spurious 4 propagated
 # permanently. CPU target-tracking (70%) is sufficient for real load scaling.
 
-# Network Load Balancer
+# Network Load Balancer (PUBLIC knock surface).
+# #2628: count-gated on public_server_surface_enabled so take_server_private removes
+# the entire public NLB. A moved {} block (moved.tf) migrates the pre-existing
+# un-indexed state address to [0], so the default (enabled) path shows NO diff and
+# the disabled path is a clean destroy — never a destroy+recreate. In prod,
+# enable_deletion_protection=true means a future prod cutover must disable protection
+# before this can be destroyed (rollout-ledger checklist).
 resource "aws_lb" "server" {
+  count              = var.public_server_surface_enabled ? 1 : 0
   name               = replace("${var.name_prefix}-nlb", "_", "-")
   internal           = false
   load_balancer_type = "network"
@@ -1306,8 +1322,9 @@ resource "aws_lb" "server" {
   })
 }
 
-# UDP Target Group
+# UDP Target Group (PUBLIC knock surface) — #2628 count-gated, see aws_lb.server.
 resource "aws_lb_target_group" "udp" {
+  count       = var.public_server_surface_enabled ? 1 : 0
   name        = replace("${var.name_prefix}-udp", "_", "-")
   port        = 62206
   protocol    = "UDP"
@@ -1337,21 +1354,23 @@ resource "aws_lb_target_group" "udp" {
   })
 }
 
-# Attach ASG to Target Group
+# Attach ASG to Target Group (PUBLIC knock surface) — #2628 count-gated.
 resource "aws_autoscaling_attachment" "server" {
+  count                  = var.public_server_surface_enabled ? 1 : 0
   autoscaling_group_name = aws_autoscaling_group.server.name
-  lb_target_group_arn    = aws_lb_target_group.udp.arn
+  lb_target_group_arn    = aws_lb_target_group.udp[0].arn
 }
 
-# UDP Listener
+# UDP Listener (PUBLIC knock surface) — #2628 count-gated, see aws_lb.server.
 resource "aws_lb_listener" "udp" {
-  load_balancer_arn = aws_lb.server.arn
+  count             = var.public_server_surface_enabled ? 1 : 0
+  load_balancer_arn = aws_lb.server[0].arn
   port              = 62206
   protocol          = "UDP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.udp.arn
+    target_group_arn = aws_lb_target_group.udp[0].arn
   }
 
   tags = merge(var.tags, {
@@ -1365,7 +1384,7 @@ resource "aws_lb_listener" "udp" {
     # `default_action.target_group_arn` at the blue or green TG to
     # flip which ASG serves production knocks. Without this ignore,
     # every `terraform apply` resets the listener back to
-    # `aws_lb_target_group.udp.arn` (the blue TG), silently undoing
+    # `aws_lb_target_group.udp[0].arn` (the blue TG), silently undoing
     # the blue/green traffic switch within seconds of CI making it.
     # The sandbox state-drift incident on 2026-04-08 was caused
     # exactly by this: a green-active deploy landed, the next CI
@@ -1671,7 +1690,11 @@ resource "aws_autoscaling_attachment" "https" {
 resource "aws_lb_listener" "https" {
   count = var.enable_qurl_resolve_endpoint ? 1 : 0
 
-  load_balancer_arn = aws_lb.server.arn
+  # aws_lb.server is now count-gated (#2628). enable_qurl_resolve_endpoint is always
+  # false whenever public_server_surface_enabled is false (the take_server_private
+  # precondition forces qurl_link_js_agent_enabled=true, which disables resolve), so
+  # aws_lb.server[0] is guaranteed present whenever this listener exists.
+  load_balancer_arn = aws_lb.server[0].arn
   port              = 443
   protocol          = "TLS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
@@ -1692,6 +1715,15 @@ resource "aws_lb_listener" "https" {
     precondition {
       condition     = var.qurl_resolve_certificate_arn != null
       error_message = "qurl_resolve_certificate_arn is required when enable_qurl_resolve_endpoint is true."
+    }
+    # #2628: this listener attaches to the public NLB (aws_lb.server[0]), which is
+    # not created when public_server_surface_enabled is false. The root forbids this
+    # combo (take_server_private forces qurl_link_js_agent_enabled, which disables
+    # enable_qurl_resolve_endpoint), but assert it module-locally so a standalone
+    # module use fails with a clear message instead of an index-out-of-range error.
+    precondition {
+      condition     = var.public_server_surface_enabled
+      error_message = "enable_qurl_resolve_endpoint = true requires public_server_surface_enabled = true: the resolve HTTPS listener attaches to the public NLB (aws_lb.server), which is not created when the public knock surface is removed (#2628)."
     }
     # Same blue/green traffic-switch concern as the UDP listener above —
     # blue-green-switch.sh flips `default_action.target_group_arn` on

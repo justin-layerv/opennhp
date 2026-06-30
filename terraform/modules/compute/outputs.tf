@@ -1,21 +1,25 @@
+# #2628: aws_lb.server is count-gated on public_server_surface_enabled, so these are
+# `one(...)` (null when take_server_private). Root consumers handle the null: the AC +
+# qurl-service host repoint to internal_nlb_dns_name, and the public-NLB alarms /
+# resolve Route53 are gated off in the same private state.
 output "nlb_dns_name" {
-  description = "NLB DNS name"
-  value       = aws_lb.server.dns_name
+  description = "Public NLB DNS name (null when take_server_private)"
+  value       = one(aws_lb.server[*].dns_name)
 }
 
 output "nlb_arn" {
-  description = "NLB ARN"
-  value       = aws_lb.server.arn
+  description = "Public NLB ARN (null when take_server_private)"
+  value       = one(aws_lb.server[*].arn)
 }
 
 output "nlb_arn_suffix" {
-  description = "NLB ARN suffix for CloudWatch"
-  value       = aws_lb.server.arn_suffix
+  description = "Public NLB ARN suffix for CloudWatch (null when take_server_private)"
+  value       = one(aws_lb.server[*].arn_suffix)
 }
 
 output "nlb_zone_id" {
-  description = "NLB zone ID for Route 53"
-  value       = aws_lb.server.zone_id
+  description = "Public NLB zone ID for Route 53 (null when take_server_private)"
+  value       = one(aws_lb.server[*].zone_id)
 }
 
 # Internal NLB DNS name for the relay -> cell-server UDP hop (#2208 #8 / #2628;
@@ -29,6 +33,29 @@ output "nlb_zone_id" {
 output "internal_nlb_dns_name" {
   description = "Internal (private) NLB DNS name for the relay -> cell-server UDP knock hop. Points the relay at a stable, load-balanced target that survives server-fleet churn (#2626). Distinct from nlb_dns_name (the public NLB). null when relay_enabled=false (the NLB is gated on it); the consumer (root cell_servers[].host) is likewise gated on deploy_relay, so the null is never dialed."
   value       = one(aws_lb.server_internal[*].dns_name)
+}
+
+# CloudWatch dimensions for the internal relay NLB. #2628: when the server is
+# private the public NLB is gone, so the monitoring dashboard's NLB widgets
+# repoint here (the relay->server knock path is the meaningful traffic then).
+# null when relay_enabled=false; consumers gate on take_server_private (which
+# requires deploy_relay), so the null is never read.
+output "internal_nlb_arn_suffix" {
+  description = "Internal relay NLB ARN suffix for CloudWatch (null when relay not deployed)."
+  value       = one(aws_lb.server_internal[*].arn_suffix)
+}
+
+output "internal_udp_target_group_arn_suffix" {
+  description = "Internal relay UDP target group ARN suffix for CloudWatch (null when relay not deployed)."
+  value       = one(aws_lb_target_group.udp_internal[*].arn_suffix)
+}
+
+# Full ARN of the internal relay UDP target group. #2628: the status page repoints
+# its server target-health check here when the server is private (the public TGs are
+# gone). null when relay_enabled=false; the consumer gates on take_server_private.
+output "internal_udp_target_group_arn" {
+  description = "Internal relay UDP target group ARN (null when relay not deployed)."
+  value       = one(aws_lb_target_group.udp_internal[*].arn)
 }
 
 output "asg_name" {
@@ -122,8 +149,8 @@ output "log_group_stderr_name" {
 }
 
 output "target_group_arn_suffix" {
-  description = "Target group ARN suffix for CloudWatch"
-  value       = aws_lb_target_group.udp.arn_suffix
+  description = "Public UDP target group ARN suffix for CloudWatch (null when take_server_private)"
+  value       = one(aws_lb_target_group.udp[*].arn_suffix)
 }
 
 output "https_target_group_arn_suffix" {
@@ -165,13 +192,13 @@ output "ssm_deployed_at_parameter" {
 # =============================================================================
 
 output "nlb_udp_listener_arn" {
-  description = "NLB UDP listener ARN - used for blue/green traffic switching"
-  value       = aws_lb_listener.udp.arn
+  description = "Public NLB UDP listener ARN - used for blue/green traffic switching (null when take_server_private; blue-green-switch.sh skips the public UDP flip)"
+  value       = one(aws_lb_listener.udp[*].arn)
 }
 
 output "target_group_arn" {
-  description = "UDP target group ARN"
-  value       = aws_lb_target_group.udp.arn
+  description = "Public UDP target group ARN (null when take_server_private)"
+  value       = one(aws_lb_target_group.udp[*].arn)
 }
 
 # =============================================================================
@@ -194,13 +221,13 @@ output "green_asg_arn" {
 }
 
 output "udp_target_group_blue_arn" {
-  description = "Blue UDP target group ARN (same as target_group_arn)"
-  value       = aws_lb_target_group.udp.arn
+  description = "Blue UDP target group ARN (same as target_group_arn; null when take_server_private)"
+  value       = one(aws_lb_target_group.udp[*].arn)
 }
 
 output "udp_target_group_green_arn" {
-  description = "Green UDP target group ARN (null if blue/green not enabled)"
-  value       = var.enable_blue_green ? aws_lb_target_group.udp_green[0].arn : null
+  description = "Green UDP target group ARN (null if blue/green not enabled OR take_server_private)"
+  value       = one(aws_lb_target_group.udp_green[*].arn)
 }
 
 output "https_target_group_blue_arn" {

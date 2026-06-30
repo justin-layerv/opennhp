@@ -2696,7 +2696,14 @@ jobs:
             echo "::warning::Some validation checks failed - see output above"
           fi
 
+      # #2628: the integration tests knock the server over its PUBLIC NLB
+      # (NHP_SERVER_ENDPOINT). When take_server_private is set the public NLB is
+      # gone (nlb_dns is empty) and a GitHub-hosted runner outside the VPC cannot
+      # reach the internal relay NLB, so skip cleanly rather than run against an
+      # empty ":62206" host and silently no-op while looking green. Post-cutover
+      # end-to-end coverage moves to the relay path (#6/#2680) + the activation smokes.
       - name: Setup Go for Integration Tests
+        if: needs.deploy-sandbox-infra.outputs.nlb_dns != ''
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -2705,6 +2712,7 @@ jobs:
             endpoints/go.sum
 
       - name: Run Integration Tests
+        if: needs.deploy-sandbox-infra.outputs.nlb_dns != ''
         timeout-minutes: 7
         env:
           NHP_SERVER_ENDPOINT: "${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}:62206"
@@ -2836,7 +2844,12 @@ jobs:
           echo "Continuing so the full smoke suite still runs; TestQurlLinkFrontend_CSPOmitsUnsafeInlineScript remains the hard CSP gate."
 
       - name: Deployment Summary
+        env:
+          NLB_DNS: ${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}
         run: |
+          # #2628: nlb_dns is empty when take_server_private (no public NLB) — label it
+          # rather than render an empty backtick pair.
+          NLB_DISPLAY="${NLB_DNS:-none — server private (#2628), relay-only ingress}"
           {
             echo "## Sandbox Deployment Complete"
             echo ""
@@ -2846,7 +2859,7 @@ jobs:
             echo "| Server + AC | Blue/Green | Deployed ✓ |"
             echo ""
             echo "### Endpoints"
-            echo "- **NHP NLB:** \`${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}\`"
+            echo "- **NHP NLB:** \`${NLB_DISPLAY}\`"
             echo "- **etcd:** \`${{ needs.deploy-sandbox-infra.outputs.etcd_endpoint }}\`"
             echo ""
             echo "**Image Tag:** \`${{ needs.setup.outputs.image_tag }}\`"

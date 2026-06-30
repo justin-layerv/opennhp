@@ -574,7 +574,19 @@ thread worked out across several PRs.
    renewal, session expiry, multi-tab.
 7. Retire the qurl-service internal resolve plugin on `nhp-server` (the
    synthesized-knock path) once the relay path is proven.
-8. Move `nhp-server` to private subnets; tear down the public UDP `62206` NLB.
+8. Move `nhp-server` private; tear down the public UDP `62206` NLB. **Implemented
+   (#2628) behind `take_server_private` (default false).** When set, the public NLB
+   + UDP listener + `0.0.0.0/0` ingress are removed (QURL-only end-state — see Out of
+   scope), the in-VPC AC `ServerEndpoint` and qurl-service `nhp_server_host` repoint
+   from the public NLB to the **internal** relay NLB (`internal_nlb_dns_name`), and
+   the public-NLB CloudWatch alarms gate off (the internal NLB keeps
+   `internal_tg_no_healthy_targets`). Requires `deploy_relay` +
+   `qurl_link_js_agent_enabled` (hard precondition). Sandbox flips it first as the
+   soak; prod stays public until a dedicated cutover PR. The blue/green deploy
+   workflow skips the public UDP listener flip when it is absent (the internal NLB
+   uses a static both-color attach). Activation checklist (incl. the
+   AC-registration-via-internal-NLB smoke under `preserve_client_ip`) lives in the
+   #2628 prod-rollout-ledger entry.
 
 ### Phase 3 — Footprint cleanup (parallel after Phase 2)
 
@@ -615,10 +627,13 @@ thread worked out across several PRs.
 
 ## Out of scope
 
-- **Raw OpenNHP agents on UDP `62206`.** If any customer still needs the raw
-  NHP-agent path, a minimal public listener stays. If LayerV's surface is
-  QURL-only, the entire public NLB goes away with step 8. This doc does not
-  decide that; it is gated on a customer-surface audit.
+- **Raw OpenNHP agents on UDP `62206`.** #2628 adopts the **QURL-only** end-state:
+  when `take_server_private` is set, the entire public NLB goes away — no minimal
+  public listener is retained. Any external/standalone AC or raw NHP-agent that
+  still knocks the public NLB must migrate to the relay first; confirming none
+  remain is a pre-cutover task in the #2628 rollout-ledger entry (the
+  customer-surface audit). In-VPC ACs are handled automatically (repointed to the
+  internal relay NLB).
 - **NHP-AOP wire format.** Reused unchanged.
 - **Application-layer changes to the fileviewer / qurl.link page** beyond
   mounting the JS NHP-Agent.

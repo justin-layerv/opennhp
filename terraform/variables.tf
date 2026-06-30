@@ -2827,6 +2827,27 @@ variable "deploy_relay" {
   default     = false
 }
 
+# #2208 phase #8 / #2628: the final cutover that takes nhp-server OFF the internet.
+# When true, the PUBLIC knock NLB (aws_lb.server: UDP 62206 listener + 0.0.0.0/0
+# ingress) is removed and the in-VPC AC + qurl-service server host repoint to the
+# INTERNAL relay NLB (module.compute.internal_nlb_dns_name). The already-private
+# CloudMap HTTP token-validation path (local.nhp_server_internal_url, :8888) is
+# untouched. The public RESOLVE HTTPS surface is gated separately via
+# enable_qurl_resolve_endpoint (= deploy_qurl_link && !qurl_link_js_agent_enabled).
+#
+# Default false = current public behaviour (no diff on merge). Requires
+# deploy_relay=true (the internal NLB repoint target only exists then) AND
+# qurl_link_js_agent_enabled=true (browser knocks already on the relay, resolve
+# already off) — enforced by terraform_data.take_server_private_preconditions in
+# main.tf. Sandbox flips it true now as the soak; PROD stays false until a
+# dedicated prod-cutover PR after the relay carries real browser traffic in prod
+# (#6/#2680, #7). See docs/runbooks/prod-rollout-ledger and #2628 acceptance.
+variable "take_server_private" {
+  description = "Remove nhp-server's public knock NLB (UDP 62206) and repoint the in-VPC AC + qurl-service to the internal relay NLB. Requires deploy_relay=true and qurl_link_js_agent_enabled=true. Default false (public). Sandbox: true; prod: false until a dedicated prod-cutover PR (#2628 / #2208 #8)."
+  type        = bool
+  default     = false
+}
+
 variable "relay_dns_name" {
   description = "Public DNS name for the relay ALB. Sandbox: `relay.qurl.link.layerv.xyz`. Only read when `deploy_relay = true`."
   type        = string

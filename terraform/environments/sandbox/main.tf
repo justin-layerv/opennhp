@@ -179,6 +179,7 @@ module "nhp" {
 
   # NHP-Relay (#2208)
   deploy_relay                   = var.deploy_relay
+  take_server_private            = var.take_server_private # #2628 phase #8 cutover
   relay_dns_name                 = var.relay_dns_name
   relay_route53_zone_id          = var.relay_route53_zone_id
   relay_provision_certificate    = var.relay_provision_certificate

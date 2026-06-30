@@ -2146,6 +2146,16 @@ variable "deploy_relay" {
   default     = false
 }
 
+# #2208 phase #8 / #2628: take nhp-server private (remove the public knock NLB;
+# repoint the in-VPC AC + qurl-service to the internal relay NLB). Forwarded to
+# module.nhp; the module enforces deploy_relay + qurl_link_js_agent_enabled.
+# Sandbox sets this true in terraform.tfvars as the soak.
+variable "take_server_private" {
+  description = "Take nhp-server off the public internet — remove the public UDP 62206 NLB and repoint the AC + qurl-service to the internal relay NLB. Requires deploy_relay=true and qurl_link_js_agent_enabled=true. Default false."
+  type        = bool
+  default     = false
+}
+
 variable "relay_dns_name" {
   description = "Public DNS name for the relay ALB. Sandbox: `relay.qurl.link.layerv.xyz`. Only read when `deploy_relay = true`."
   type        = string

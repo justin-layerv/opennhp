@@ -867,6 +867,16 @@ relay_route53_zone_id       = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (
 relay_provision_certificate = true
 relay_manage_dns_alias      = true
 
+# #2208 #8 / #2628: take nhp-server private — remove the public knock NLB (UDP
+# 62206 + 0.0.0.0/0 ingress); the relay reaches the cell via the internal NLB and
+# the in-VPC AC + qurl-service repoint there too. Sandbox is the soak: the public
+# resolve surface is already off here (qurl_link_js_agent_enabled=true), so this
+# brings down the last public surface. Requires deploy_relay=true +
+# qurl_link_js_agent_enabled=true (enforced in main.tf). After apply, run the
+# rollout-ledger activation checklist (esp. the AC-registration-via-internal-NLB
+# smoke). Prod stays false until a dedicated prod-cutover PR (#6/#2680, #7 first).
+take_server_private = true
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

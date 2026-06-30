@@ -90,7 +90,22 @@ if [ -n "$NHP_NLB" ] && [ "$NHP_NLB" != "None" ]; then
         warn "UDP port 62206 test inconclusive (may be normal for NHP)"
     fi
 else
-    fail "NHP NLB not found"
+    # #2628: when nhp-server is private (take_server_private), the public NLB is
+    # removed and the relay's INTERNAL NLB is the only knock ingress — which a CI
+    # runner outside the VPC cannot reach. Treat "public NLB absent + internal NLB
+    # present" as an intentional skip (note), not a deployment failure. Only fail if
+    # neither exists (a genuinely broken server deploy).
+    # Env-scoped match (mirrors the public NLB lookup's nhp-${ENV}-nlb style) so an
+    # unrelated load balancer with "srv-int" in its name can't false-positive. The
+    # internal relay NLB is replace("${name_prefix}-srv-int",...) = layerv-nhp-${ENV}-srv-int.
+    INTERNAL_NLB=$(run_aws elbv2 describe-load-balancers \
+        --query "LoadBalancers[?contains(LoadBalancerName, 'nhp-${ENV}-srv-int')].DNSName | [0]" \
+        --output text 2>/dev/null || true)
+    if [ -n "$INTERNAL_NLB" ] && [ "$INTERNAL_NLB" != "None" ]; then
+        warn "Public NHP NLB absent — server is private (#2628); internal relay NLB present ($INTERNAL_NLB). Skipping public-NLB reachability checks (not reachable from CI)."
+    else
+        fail "NHP NLB not found"
+    fi
 fi
 echo ""
 

@@ -257,18 +257,25 @@ jobs:
             echo "standby_image_tag=$BLUE_TAG" >> "$GITHUB_OUTPUT"
           fi
 
-          # Server listeners: primary=UDP, secondary=HTTPS (optional)
-          {
-            echo "primary_listener_arn=$(aws ssm get-parameter \
-              --name "${SSM_BASE}/udp-listener-arn" \
-              --query "Parameter.Value" --output text)"
+          # Server listeners: primary=UDP, secondary=HTTPS — both OPTIONAL.
+          # #2628: the UDP (primary) switch params are ABSENT when nhp-server is private
+          # (take_server_private removes the public NLB + its blue/green switch params).
+          # Tolerate their absence exactly like the HTTPS reads below; the switch step
+          # (blue-green-switch.sh) skips the public UDP flip in that state — the internal
+          # relay NLB fronts both colors via a static attach and needs no listener flip.
+          PRIMARY_LISTENER=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/udp-listener-arn" \
+            --query "Parameter.Value" --output text 2>/dev/null) || PRIMARY_LISTENER=""
+          echo "primary_listener_arn=$PRIMARY_LISTENER" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$PRIMARY_LISTENER" ]]; then
             echo "blue_primary_tg_arn=$(aws ssm get-parameter \
               --name "${SSM_BASE}/blue-udp-tg-arn" \
-              --query "Parameter.Value" --output text)"
+              --query "Parameter.Value" --output text)" >> "$GITHUB_OUTPUT"
             echo "green_primary_tg_arn=$(aws ssm get-parameter \
               --name "${SSM_BASE}/green-udp-tg-arn" \
-              --query "Parameter.Value" --output text)"
-          } >> "$GITHUB_OUTPUT"
+              --query "Parameter.Value" --output text)" >> "$GITHUB_OUTPUT"
+          fi
 
           # HTTPS listener/TGs are optional (only exist if QURL resolve endpoint is enabled)
           HTTPS_LISTENER=$(aws ssm get-parameter \
@@ -1126,8 +1133,11 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # #2628: skipped when the server is private (no public UDP listener ARN — the
+      # internal relay NLB needs no per-deploy flip, so there is nothing to verify here;
+      # the activation-checklist smokes cover the internal knock path).
       - name: "[Server] Verify Traffic Switch"
-        if: needs.prepare.outputs.deploy_server == 'true'
+        if: needs.prepare.outputs.deploy_server == 'true' && needs.prepare.outputs.server_primary_listener_arn != ''
         env:
           STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
           PRIMARY_LISTENER: ${{ needs.prepare.outputs.server_primary_listener_arn }}
@@ -1146,8 +1156,10 @@ jobs:
             exit 1
           fi
 
+      # #2628: skipped when the server is private (no public UDP listener to reconcile;
+      # the internal relay NLB uses a static both-color attach with no SSM-tracked flip).
       - name: "[Server] Reconcile Listener and SSM State"
-        if: needs.prepare.outputs.deploy_server == 'true'
+        if: needs.prepare.outputs.deploy_server == 'true' && needs.prepare.outputs.server_primary_listener_arn != ''
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           PRIMARY_LISTENER: ${{ needs.prepare.outputs.server_primary_listener_arn }}
