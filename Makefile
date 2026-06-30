@@ -404,7 +404,8 @@ lint-workflows:
 	@bash scripts/check-smoke-tier-filter-coverage.sh
 	@bash scripts/check-cert-cleanup-log-gate-unique.sh
 	@bash scripts/check-cleanup-event-type-lockstep.sh
-	@shellcheck scripts/check-revocation-slo-lockstep.sh
+	@shellcheck scripts/check-revocation-slo-lockstep.sh tests/scripts/check-revocation-slo-lockstep_test.sh
+	@bash tests/scripts/check-revocation-slo-lockstep_test.sh
 	@bash scripts/check-revocation-slo-lockstep.sh
 	@shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
 	@bash tests/scripts/check-ebpf-load-path-lockstep_test.sh

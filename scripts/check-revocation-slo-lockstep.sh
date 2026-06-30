@@ -23,11 +23,19 @@
 # the script exits with a clear error) rather than silently accepting a stale
 # value — update this extractor in the same change.
 #
-# Wired into `make lint-workflows`.
+# Wired into `make lint-workflows` and `.github/workflows/validate-workflows.yml`
+# (the CI step + the &validate_paths trigger on this script and BOTH
+# source-of-truth files) — #2817 closed the gap where this ran only locally, so
+# a one-sided edit to either site would have passed CI silently.
+#
+# Testability: REPO_ROOT may be overridden via $REVOCATION_SLO_LOCKSTEP_ROOT so
+# the paired fixture test (tests/scripts/check-revocation-slo-lockstep_test.sh)
+# can point the extractors at mutated copies in a tempdir. Defaults to the git
+# toplevel.
 
 set -euo pipefail
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
+REPO_ROOT="${REVOCATION_SLO_LOCKSTEP_ROOT:-$(git rev-parse --show-toplevel)}"
 GO_SRC="${REPO_ROOT}/endpoints/server/revocation_retry.go"
 TF_SRC="${REPO_ROOT}/terraform/modules/monitoring/main.tf"
 
@@ -43,7 +51,12 @@ fi
 # Extract the Go SLO constant's numeric scalar and its time unit. Matches a
 # single-line `RevocationDeliveryLatencyP99SLO = <int> * time.<Unit>` const,
 # tolerating surrounding whitespace and an optional trailing comment.
-go_line=$(grep -E 'RevocationDeliveryLatencyP99SLO[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*\*[[:space:]]*time\.(Second|Millisecond)' "$GO_SRC" | head -n1)
+# `-m1` stops at the first hit; `|| true` is load-bearing — a no-match grep exits
+# 1, which under `set -e` would abort the script HERE with no diagnostic and
+# defeat the `if [ -z ... ]` clear-error handler just below. Tolerate the
+# non-match so that handler runs and emits the actionable "could not extract"
+# message (a refactor to an unsupported shape must fail loud, not silently).
+go_line=$(grep -m1 -E 'RevocationDeliveryLatencyP99SLO[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*\*[[:space:]]*time\.(Second|Millisecond)' "$GO_SRC") || true
 if [ -z "$go_line" ]; then
   echo "ERROR: could not extract RevocationDeliveryLatencyP99SLO from $GO_SRC" >&2
   echo "       (expected: RevocationDeliveryLatencyP99SLO = <int> * time.Second|Millisecond)" >&2

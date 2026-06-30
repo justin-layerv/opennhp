@@ -30,6 +30,15 @@ on:
       - "scripts/check-image-tag-writer-allowlist.sh"
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
+      # qURL v2 revocation-latency SLO lockstep (#2817): trigger on the script
+      # and on BOTH source-of-truth sites it compares so a one-sided edit to the
+      # Go SLO const or the TF alarm threshold re-runs the check at PR time.
+      # Neither source file is watched elsewhere in this anchor, so they must be
+      # here or a Go-only / TF-only edit would skip the lint. The paired fixture
+      # test rides tests/scripts/** below.
+      - "scripts/check-revocation-slo-lockstep.sh"
+      - "endpoints/server/revocation_retry.go"
+      - "terraform/modules/monitoring/main.tf"
       # eBPF load-path lockstep (#2810): trigger on the script itself and on all
       # three source-of-truth sites it compares so a drift in ANY of them
       # re-runs the check at PR time. Dockerfile.ac.aws is already listed below;
@@ -458,6 +467,24 @@ jobs:
 
       - name: Check asp+ac_id lockstep (TF ↔ Go)
         run: bash scripts/check-asp-and-ac-id-lockstep.sh
+
+      # qURL v2 revocation-latency SLO lockstep (#2817): the Go source-of-truth
+      # const RevocationDeliveryLatencyP99SLO (endpoints/server/revocation_retry.go)
+      # and the CloudWatch alarm threshold
+      # (terraform/modules/monitoring/main.tf::revocation_delivery_latency_high)
+      # must agree — the alarm threshold is the millisecond projection of the Go
+      # SLO (MetricRevocationDeliveryLatency is recorded in ms). A one-sided edit
+      # would leave the p99 alarm firing at a bound that no longer matches the
+      # documented SLO — a silent observability gap. This lint was wired only into
+      # `make lint-workflows`, which no CI workflow runs, so it never ran in CI
+      # (#2817). The fixture suite runs first so an extractor regression surfaces
+      # against synthetic inputs before the real tree runs. shellcheck both —
+      # actionlint's -shellcheck only covers workflow-embedded scripts.
+      - name: Test + check revocation-latency SLO lockstep (Go ↔ Terraform, #2817)
+        run: |
+          shellcheck scripts/check-revocation-slo-lockstep.sh tests/scripts/check-revocation-slo-lockstep_test.sh
+          bash tests/scripts/check-revocation-slo-lockstep_test.sh
+          bash scripts/check-revocation-slo-lockstep.sh
 
       # eBPF object load-path lockstep (#2810): the AC loads its eBPF objects
       # from a dir+filenames that are the runtime source of truth in
