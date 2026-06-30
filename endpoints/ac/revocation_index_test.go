@@ -376,6 +376,131 @@ func TestApplyRevocation_RevokeBeforeAdmitDoesNotPoisonWatermark(t *testing.T) {
 	}
 }
 
+// TestFlushEntryNow_StillFiresAfterTokenDeleted fences the load-bearing
+// assumption behind the #2784 under-flush interim: deleteThenFlushEntry calls
+// deleteToken BEFORE flushEntryNow (delete-first removes the entry from the
+// tokenStore snapshot a concurrent sibling expiry reads, closing the dominant
+// longest-wins push-back). That order is only safe because flushEntryNow drains
+// the tracked FlowKeys off the entry POINTER, not via a tokenStore re-Load — so
+// the flush must still fire after the entry is gone from tokenStore and the
+// revocation index.
+//
+// This test puts the AC in the exact post-delete state (entry removed from both
+// tokenStore and the index) and then calls flushEntryNow directly, asserting the
+// scheduled flow is still pulled to now and flushed. A regression that makes
+// flushEntryNow look the entry up in tokenStore (it would find nothing
+// post-delete) — or that drops the off-pointer drain — turns the immediate
+// revoke into a silent no-op and turns this test red.
+//
+// Note on scope: the deleteToken/flushEntryNow ORDER itself is not observable
+// from a single goroutine — both run synchronously and leave identical end
+// state, so only a concurrent sibling expiry can tell the two orders apart (see
+// the deleteThenFlushEntry godoc). This test fences the invariant the order
+// depends on, which IS deterministically observable.
+func TestFlushEntryNow_StillFiresAfterTokenDeleted(t *testing.T) {
+	a, flusher := newTestACWithScheduler(t)
+
+	// Admit a qURL v2 entry and schedule its flow key. The deadline is an
+	// arbitrary far-future value (well beyond the 2s wait below); its exact
+	// value — and the entry's OpenTime — are irrelevant here because
+	// flushEntryNow's RescheduleEarlier pulls the key to now regardless of the
+	// original deadline. recordScheduledKey + Schedule mirror what the admission
+	// path does via scheduleFlushIfEnabled.
+	entry := qurlV2Entry("qDel", "rDel", "", "aDel")
+	token := a.GenerateAccessToken(entry) // storeToken → tokenStore + index
+	key := mustKey(t, "203.0.113.7", "198.51.100.7", 443, FlowProtoTCP)
+	entry.recordScheduledKey(key)
+	a.expirySched.Schedule(key, time.Now().Add(30*time.Second))
+
+	// Put the AC in ApplyRevocation's post-delete state: entry gone from
+	// tokenStore AND deindexed, BEFORE the flush runs.
+	a.deleteToken(token, entry)
+	if _, found := a.tokenStore.Load(token); found {
+		t.Fatalf("precondition: entry must be removed from tokenStore before flushEntryNow")
+	}
+	if toks := a.revIndex.tokensFor(scopeQurl, "qDel"); len(toks) != 0 {
+		t.Fatalf("precondition: entry must be deindexed before flushEntryNow, got %v", toks)
+	}
+	// The entry pointer must still carry its tracked key — deleteToken does not
+	// touch scheduledKeys; that is exactly what lets the off-pointer drain work.
+	if !entry.holdsScheduledKey(key) {
+		t.Fatalf("precondition: deleteToken must not drain the entry's scheduledKeys")
+	}
+
+	// flushEntryNow must still drain the key off the entry pointer and pull it to
+	// now — NOT depend on a tokenStore lookup that would now miss.
+	a.flushEntryNow(entry)
+
+	if !flusher.waitFor(1, 2*time.Second) {
+		t.Fatalf("flushEntryNow did not fire after the entry was deleted; flusher saw %d (off-pointer drain regressed?)", flusher.count())
+	}
+	if got := flusher.snapshotKeys(); len(got) != 1 || got[0] != key {
+		t.Fatalf("flushed wrong key after delete: got %v want [%v]", got, key)
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_DeletedHolderNotCountedKeyCanceled fences the
+// behavioral claim of the #2784 under-flush fix (not just its enabling
+// off-pointer-drain invariant): once the revoked entry is removed from tokenStore
+// (deleteThenFlushEntry's deleteToken step), a concurrent sibling's
+// cancelAllScheduledFlows must CANCEL the shared FlowKey rather than re-Schedule
+// (push back) the just-revoked deadline — because the revoked entry is gone from
+// the Snapshot the cancel walks, even though its pointer still holds the key.
+//
+// It is the deterministic counterpart to
+// TestUdpAC_CancelAllScheduledFlows_MultiSessionRaceKeepsKeyAlive: there the peer
+// is STILL in tokenStore (a live holder) and the shared key is KEPT ALIVE; here
+// the peer has been deleted (the revoke's delete-first step) and the key is
+// CANCELED. The delete is exactly the lever that flips push-back → cancel: with
+// the entry still present that mirror test asserts EntryCount 1, with it deleted
+// this one asserts EntryCount 0.
+//
+// Scope: this drives the building blocks (deleteToken + cancelAllScheduledFlows)
+// directly to reconstruct the exact post-delete snapshot state — it does NOT call
+// ApplyRevocation / deleteThenFlushEntry end-to-end, and it does not fence the
+// deleteToken-vs-flushEntryNow ORDER itself (unobservable single-goroutine; see
+// the deleteThenFlushEntry godoc and #2896). What it fences is the
+// snapshot-membership property that flip depends on.
+func TestUdpAC_CancelAllScheduledFlows_DeletedHolderNotCountedKeyCanceled(t *testing.T) {
+	a, _ := newTestACWithScheduler(t)
+	const srcIP, dstIP, dstPort = "198.51.100.20", "203.0.113.20", 443
+	key := mustKey(t, srcIP, dstIP, dstPort, FlowProtoTCP)
+
+	// A (revoked) and B (sibling) share one network-shaped FlowKey. A long
+	// OpenTime keeps both firewall deadlines far in the future for the whole test
+	// (so the shared scheduler entry is never close to firing on its own).
+	entryA := qurlV2Entry("qA", "rShared", "", "aA")
+	entryB := qurlV2Entry("qB", "rShared", "", "aB")
+	entryA.OpenTime, entryB.OpenTime = 600, 600
+	tokA := a.GenerateAccessToken(entryA) // storeToken → tokenStore + index; stamps FirstKnockTime=now
+	_ = a.GenerateAccessToken(entryB)
+
+	// Both schedule the shared key; longest-wins absorbs to a single scheduler entry.
+	deadline := time.Now().Add(600 * time.Second)
+	a.scheduleFlushIfEnabled(entryA, srcIP, dstIP, dstPort, FlowProtoTCP, deadline)
+	a.scheduleFlushIfEnabled(entryB, srcIP, dstIP, dstPort, FlowProtoTCP, deadline)
+	if got := a.expirySched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1 (shared key absorbed by longest-wins)", got)
+	}
+
+	// The revoke's delete-first step (deleteThenFlushEntry's deleteToken): A leaves
+	// tokenStore. Its pointer still holds the key — flushEntryNow drains off the
+	// pointer, not tokenStore — but it is now absent from the Snapshot a sibling's
+	// cancelAllScheduledFlows walks.
+	a.deleteToken(tokA, entryA)
+	if !entryA.holdsScheduledKey(key) {
+		t.Fatalf("precondition: deleteToken must not drain entryA's scheduledKeys")
+	}
+
+	// B expires naturally. With A gone from the snapshot, B finds no other live
+	// holder and CANCELS the shared key — it must NOT re-Schedule it back to a
+	// future firewall deadline (the under-flush push-back the fix prevents).
+	a.cancelAllScheduledFlows(entryB)
+	if got := a.expirySched.EntryCount(); got != 0 {
+		t.Fatalf("EntryCount after sibling expiry = %d, want 0 — a deleted (revoked) entry was wrongly counted as a live holder and the shared key was pushed back (#2784 under-flush)", got)
+	}
+}
+
 // TestScheduler_RescheduleEarlier_PullsEarlierVsScheduleNoOp pins the scheduler
 // primitive the revocation flush depends on, directly against the
 // recording flusher (no UdpAC). It is the unit-level proof of the headline

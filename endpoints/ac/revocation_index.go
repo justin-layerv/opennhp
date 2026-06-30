@@ -311,21 +311,20 @@ func (ri *revocationIndex) peekStale(scope revocationScope, scopeKey string, epo
 //  2. epoch-gates the matched event (idempotency / ordering; mirrors P4d) via
 //     the atomic check-and-set admitEpoch. A stale or duplicate epoch is
 //     dropped and 0 entries are reported flushed;
-//  3. flushes each matching entry's active L3 flow state IMMEDIATELY by
-//     rescheduling its tracked FlowKeys to fire now, reusing the existing
+//  3. for each matching entry, via deleteThenFlushEntry, removes it from
+//     tokenStore (deindexing it, so a refresh / re-knock cannot re-extend it)
+//     and THEN flushes its active L3 flow state immediately — rescheduling the
+//     entry's tracked FlowKeys to fire now, reusing the existing
 //     scheduler/flusher (conntrack delete on iptables mode, XDP map delete on
-//     eBPF mode) and the circuit breaker;
-//  4. removes the entry from tokenStore so a refresh / re-knock cannot extend it.
+//     eBPF mode) and the circuit breaker.
 //
 // Returns the number of tokenStore entries acted on (0 when dropped as stale or
 // when nothing matched). Coarse OVER-flush of a shared FlowKey is accepted here
 // per the design's interim caveat; surgical precision is P4c. The symmetric
-// UNDER-flush direction is also a P4c-deferred consequence of the network-shaped
-// FlowKey: this orders flushEntryNow before deleteToken, so within that window a
-// concurrent natural expiry of a sibling sharing the FlowKey can re-Schedule (or
-// Cancel) the key off a tokenStore snapshot that still lists this entry and push
-// the revoke deadline back. There is no production caller until P4e, and P4c's
-// per-session discriminator closes both directions; tracked in #2784.
+// UNDER-flush direction is narrowed by deleteThenFlushEntry's delete-before-flush
+// order (the #2784 interim — see its godoc for the mechanism and the two
+// residual windows that remain, which are live-but-bounded, not dead code). P4c's
+// per-session discriminator closes both directions entirely; tracked in #2784.
 //
 // Relatedly, the tokensFor snapshot is taken once and iterated: an admission for
 // the same key that lands AFTER the snapshot is not in the set and survives this
@@ -379,16 +378,55 @@ func (a *UdpAC) ApplyRevocation(scope revocationScope, scopeKey string, epoch ui
 			// dropped it from the index. Nothing to flush.
 			continue
 		}
-		a.flushEntryNow(entry)
-		// deleteToken removes the entry from tokenStore (so a late re-knock
-		// cannot re-extend its pinhole) AND deindexes it. tokenStore.Delete
-		// fires NO OnExpire hook, so index maintenance must be explicit.
-		a.deleteToken(token, entry)
+		a.deleteThenFlushEntry(token, entry)
 		flushed++
 	}
 	log.Info("[Revocation] applied scope=%s key=%s epoch=%d flushed=%d entries", scope, scopeKey, epoch, flushed)
 	a.addMetric(MetricRevocationEntriesFlushed, uint64(flushed))
 	return flushed
+}
+
+// deleteThenFlushEntry tears one revoked entry down in the #2784-mandated order:
+// deleteToken BEFORE flushEntryNow. That order is load-bearing — it must not be
+// reversed, nor may any tokenStore / revocation-index work be inserted between
+// the two calls — so the pair is encapsulated here, where a refactor of
+// ApplyRevocation's loop cannot accidentally split or reorder it. This is the
+// single home for the delete-before-flush rationale (the call site and the
+// ApplyRevocation godoc only point here).
+//
+// deleteToken removes the entry from tokenStore (so a late re-knock cannot
+// re-extend its pinhole) AND deindexes it; tokenStore.Delete fires NO OnExpire
+// hook, so the index maintenance is explicit. Doing it FIRST takes the entry out
+// of the tokenStore snapshot a concurrent sibling expiry's
+// cancelAllScheduledFlows reads: a sibling that snapshots after this delete sees
+// no live holder of a shared FlowKey and Cancels it (or no-ops) instead of
+// re-Scheduling the just-revoked deadline back to this entry's future firewall
+// deadline via longest-wins Schedule — closing the dominant under-flush
+// push-back that defeated the revoke.
+//
+// flushEntryNow still fires post-delete because it drains the tracked keys off
+// the entry POINTER, not tokenStore. That off-pointer drain is the implicit
+// contract this order depends on; a future edit that makes flushEntryNow re-Load
+// the entry from tokenStore would silently break the flush, so it is fenced by
+// TestFlushEntryNow_StillFiresAfterTokenDeleted.
+//
+// Two residuals remain and are P4c concerns: a sibling that snapshotted just
+// BEFORE the delete can still push the deadline back, and a sibling Cancel
+// landing after flushEntryNow's RescheduleEarlier drops the coarse reschedule.
+// Both degrade only the COARSE allow-rule re-open barrier, not the
+// established-flow teardown: flushEntryNow runs its surgical conntrack flush
+// synchronously per key (see its godoc for the per-mode eBPF/iptables/v6 detail),
+// so where that path applies the revoked established flows are already gone and
+// only the allow-rule lingers to its kernel TTL. These are live-but-bounded, NOT
+// dead code: the apply path is wired in prod (NHP_REV → HandleUdpACRevocation →
+// ApplyRevocation → here, #2753), but each residual needs a real revoke applying
+// in the microsecond window of a sibling's natural expiry on the same FlowKey,
+// bounded by the kernel TTL — the same coarse shared-FlowKey limitation that is
+// the accepted P4b interim. P4c's per-session FlowKey discriminator closes both
+// directions (and both residuals) entirely.
+func (a *UdpAC) deleteThenFlushEntry(token string, entry *AccessEntry) {
+	a.deleteToken(token, entry)
+	a.flushEntryNow(entry)
 }
 
 // flushEntryNow forces every FlowKey the entry has scheduled to fire its flush

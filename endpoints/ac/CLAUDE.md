@@ -72,4 +72,8 @@ must update this list and audit all existing call sites.
   Mutex correctness fenced by
   `TestAccessEntry_ScheduledKeys_NoRaceDetectorTrip` under `-race`;
   cross-entry shared-FlowKey race (sequential) fenced by
-  `TestUdpAC_CancelAllScheduledFlows_MultiSessionRaceKeepsKeyAlive`.
+  `TestUdpAC_CancelAllScheduledFlows_MultiSessionRaceKeepsKeyAlive`
+  (live peer → key kept alive) and its deleted-peer counterpart
+  `TestUdpAC_CancelAllScheduledFlows_DeletedHolderNotCountedKeyCanceled`
+  (revoked/deleted peer → key Cancelled, the #2784 under-flush
+  behavioral fence).

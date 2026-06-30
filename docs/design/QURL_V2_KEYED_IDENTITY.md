@@ -763,15 +763,29 @@ the same destination. qurl-service/NHP/L7 then prevent the revoked qURL from
 re-opening. This preserves confidentiality but may have availability collateral.
 
 The same network-shaped `FlowKey` produces a symmetric **under-flush** race in
-the P4b apply primitive (`ApplyRevocation`). It pulls the shared key's deadline
-to now and then removes the revoked entry from the token store; in that window a
-concurrent natural expiry of a sibling holding the same `FlowKey` can re-derive
-the key's deadline from a token-store snapshot that still lists the revoked
-entry and push the deadline back (longest-wins `Schedule`), leaving the revoked
-flow alive to natural expiry. This is non-urgent (no production caller until the
-P4e receive path; microsecond window) and is closed by the same per-session
-kernel discriminator below — both the over-flush and under-flush directions
-dissolve once revoke is surgical. Tracked in #2784.
+the P4b apply primitive (`ApplyRevocation`). The original ordering pulled the
+shared key's deadline to now and *then* removed the revoked entry from the token
+store; in that window a concurrent natural expiry of a sibling holding the same
+`FlowKey` could re-derive the key's deadline from a token-store snapshot that
+still listed the revoked entry and push the deadline back (longest-wins
+`Schedule`), leaving the revoked flow alive to natural expiry. The #2784 interim
+narrows this by **removing the revoked entry from the token store BEFORE the
+flush** (`flushEntryNow` drains the entry's tracked keys off the entry pointer,
+not the token store, so it still fires after the delete). A sibling that
+snapshots after the delete then sees no live holder and `Cancel`s the shared key
+instead of pushing its deadline back — closing the dominant push-back. Two
+residuals remain (a sibling that snapshotted just before the delete can still
+push the deadline back; a sibling `Cancel` landing after the reschedule drops the
+coarse reschedule). Both touch only the coarse allow-rule re-open barrier —
+`flushEntryNow`'s surgical conntrack teardown runs synchronously per key, so on
+eBPF/XDP v4 ACs the revoked established flows are already gone and only the
+allow-rule lingers to its kernel TTL; iptables-mode and v6 flows fall back to
+kernel TTL entirely. The apply path is wired (`NHP_REV` → `HandleUdpACRevocation`
+→ `ApplyRevocation`, #2753), so these are live-but-bounded windows: each needs a
+real revoke applying in the microsecond window of a sibling's natural expiry on
+the same `FlowKey`, bounded by the kernel TTL. Both are fully closed by the same
+per-session kernel discriminator below — the over-flush and under-flush
+directions dissolve once revoke is surgical. Tracked in #2784.
 
 Because the product requires "kill exactly this qURL and preserve every other
 holder of the same src/dst tuple," AC needs a new kernel-visible discriminator
