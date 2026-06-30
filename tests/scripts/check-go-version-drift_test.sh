@@ -36,12 +36,13 @@ write_good_fixture() {
     "$dir/internalauth" \
     "$dir/endpoints" \
     "$dir/examples/server_plugin" \
+    "$dir/tests/e2e" \
     "$dir/tests/local" \
     "$dir/tests/smoke" \
     "$dir/tests/smoke/local-stack"
   ln -sf "$SCRIPT" "$dir/scripts/check-go-version-drift.sh"
 
-  for mod in nhp internalauth endpoints examples/server_plugin tests/local tests/smoke; do
+  for mod in nhp internalauth endpoints examples/server_plugin tests/e2e tests/local tests/smoke; do
     cat > "$dir/$mod/go.mod" <<EOF
 module example.com/$mod
 

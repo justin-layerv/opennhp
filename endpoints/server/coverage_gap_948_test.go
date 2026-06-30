@@ -39,8 +39,8 @@ import (
 // AC on another server, so the local broadcast alone writes a pinhole on every
 // locally-connected AC EXCEPT that one. That local-only scope is exactly why the
 // handlers add a cross-server fan-out under Config.EnableKnockACFanout (proven by
-// TestFanoutHttpKnock_* / TestFanoutKnock_*); this characterization stays true of
-// the local-broadcast primitive whether or not the fan-out flag is on.
+// TestFanoutHttpKnock_* / TestFanoutKnock_*). The target-set characterization is
+// independent of that flag.
 func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 	s, sendCh := newTestServerForBroadcast(t)
 	// Enable only the local wait-for-all timing so PROOF 2 can assert after
@@ -71,11 +71,16 @@ func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 
 	// Record which AC each NHP_AOP is addressed to, keyed by the AC's recv addr.
 	var mu sync.Mutex
+	var bothObserved sync.Once
+	bothLocalAOPs := make(chan struct{})
 	gotAOP := make(map[string]bool)
 	go func() {
 		for md := range sendCh {
 			mu.Lock()
 			gotAOP[md.ConnData.RemoteAddr.String()] = true
+			if gotAOP[alphaAddr] && gotAOP[betaAddr] {
+				bothObserved.Do(func() { close(bothLocalAOPs) })
+			}
 			mu.Unlock()
 			art := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
 			body, _ := json.Marshal(art)
@@ -100,6 +105,16 @@ func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 	dstAddrs := []*common.NetAddress{{Ip: "0.0.0.0", Port: 443}}
 	if _, err := s.processACOperationBroadcast(context.Background(), knk, conns, srcAddr, dstAddrs, 60, nil); err != nil {
 		t.Fatalf("broadcast returned error: %v", err)
+	}
+	// processACOperationBroadcast has returned, so its target loop has enqueued
+	// any AOPs it will send; wait for the collector goroutine to catch up before
+	// asserting the negative gamma case.
+	select {
+	case <-bothLocalAOPs:
+	case <-time.After(2 * time.Second):
+		mu.Lock()
+		t.Logf("timed out waiting for both local AOP collector observations; continuing to existing assertions with gotAOP=%v", gotAOP)
+		mu.Unlock()
 	}
 
 	waitForAOPs := func(addrs ...string) map[string]bool {

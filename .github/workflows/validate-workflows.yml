@@ -91,6 +91,7 @@ on:
       - "internalauth/go.mod"
       - "endpoints/go.mod"
       - "examples/server_plugin/go.mod"
+      - "tests/e2e/go.mod"
       - "tests/local/go.mod"
       - "tests/smoke/**"
       - "tests/lints/disable-agent-validation/**"

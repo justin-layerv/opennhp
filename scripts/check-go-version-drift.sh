@@ -168,14 +168,15 @@ case "$canonical" in
 esac
 
 # CI-touched modules only. Excluded modules intentionally follow their own
-# lifecycle today: tests/e2e (#1290), tests/integration, and docker/web-app.
-# tests/smoke is included here because CI runs it in the shared Go image even
-# though its dependency tidy lifecycle is separate.
+# lifecycle today: tests/integration and docker/web-app. tests/smoke and
+# tests/e2e are included here because CI runs them with the shared Go version,
+# even though their dependency tidy lifecycles are separate.
 go_mod_files=(
   "nhp/go.mod"
   "internalauth/go.mod"
   "endpoints/go.mod"
   "examples/server_plugin/go.mod"
+  "tests/e2e/go.mod"
   "tests/local/go.mod"
   "tests/smoke/go.mod"
 )

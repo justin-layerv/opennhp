@@ -73,7 +73,7 @@ tests/               # local/, integration/, e2e/, smoke/
 release/             # Build output (gitignored)
 ```
 
-**Multi-Module Workspace:** Five Go modules — `nhp/`, `internalauth/`, `endpoints/`, `examples/server_plugin/`, `tests/local/`. The first four are wired with `replace` directives pointing to local paths (`internalauth` is also published externally so qurl-service and qurl-reverse-tunnel-server can import the same HMAC canonicalization). Always run `go mod tidy` in all five when updating dependencies; `make init` does this. Other Go modules (`tests/e2e/`, `tests/integration/`, `tests/smoke/`, `docker/web-app/`) have their own lifecycle and aren't auto-tidied — tracked in #1290.
+**Multi-Module Workspace:** Five Go modules — `nhp/`, `internalauth/`, `endpoints/`, `examples/server_plugin/`, `tests/local/`. The first four are wired with `replace` directives pointing to local paths (`internalauth` is also published externally so qurl-service and qurl-reverse-tunnel-server can import the same HMAC canonicalization). Always run `go mod tidy` in all five when updating dependencies; `make init` does this. Other Go modules (`tests/e2e/`, `tests/integration/`, `tests/smoke/`, `docker/web-app/`) have their own lifecycle and aren't auto-tidied — tracked in #1290. `tests/e2e/` is still included in Go-version drift checks and e2e-tag lint coverage.
 
 **Related Repos:** `console` (UI/API), `website` (layerv.ai), `traefik-plugins` (middleware)
 
