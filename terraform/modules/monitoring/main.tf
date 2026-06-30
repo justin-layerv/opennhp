@@ -32,6 +32,11 @@ locals {
   # rather than smearing across two.
   server_restart_period_seconds = 300
 
+  # Keep sandbox/non-prod as the early canary at the old threshold while
+  # giving prod cloud-mode flips headroom for newly visible agent reject paths.
+  # See the auth_failures alarm comment and #1944 rollout ledger.
+  auth_failures_threshold = var.environment == "prod" ? 250 : 50
+
   ack_token_shared_store_failure_alarms = {
     init = {
       metric_name = "ACKTokenSharedStoreInitFailure"
@@ -741,16 +746,27 @@ resource "aws_cloudwatch_metric_alarm" "storage_health" {
 }
 
 # NHP Authentication Failures
+#
+# Cloud-mode agent peer lookup changes the AuthFailure population: unknown
+# agent pubkeys and empty-RemotePubKey responder regressions now reach the
+# handler and increment this counter instead of being rejected at the Noise
+# responder layer. Pre-rollout audit for #1944 (2026-06-30): prod had no
+# AuthFailure datapoints in the prior 30 days while KnockRequest was non-zero;
+# sandbox peaked at 3 per 5-minute bucket over the prior 5 days and 7 per hour
+# over the prior 30 days. Prod gets rollout headroom for that new cloud-mode
+# rate; non-prod keeps the old threshold so sandbox remains an early canary.
+# Agent-path specific alarms remain tracked in #1955.
 resource "aws_cloudwatch_metric_alarm" "auth_failures" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-auth-failures"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
+  datapoints_to_alarm = 3
   metric_name         = "AuthFailure"
   namespace           = "LayerV/NHP"
   period              = 300
   statistic           = "Sum"
-  threshold           = 50
-  alarm_description   = "High rate of authentication failures"
+  threshold           = local.auth_failures_threshold
+  alarm_description   = "NHP AuthFailure exceeded the environment-specific threshold in each of 3 consecutive 5-minute periods. Prod threshold includes cloud-mode agent-lookup headroom; non-prod keeps canary sensitivity. Agent-specific lookup alarms are tracked separately."
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"
