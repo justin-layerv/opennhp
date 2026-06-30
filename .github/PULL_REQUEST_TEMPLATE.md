@@ -25,7 +25,7 @@ Fixes #
 
 Choose exactly one:
 
-<!-- Keep these checkbox labels in sync with .github/workflows/prod-rollout-tasks.yml and docs/runbooks/prod-rollout-ledger/README.md. If this PR creates a pre-rollout, rollout, or post-rollout task, add a succinct entry file under docs/runbooks/prod-rollout-ledger/ (see its README for the naming convention and template). Do not edit checkbox labels. -->
+<!-- Keep these checkbox labels in sync with .github/scripts/check-prod-rollout-tasks-body.sh and docs/runbooks/prod-rollout-ledger/README.md. If this PR creates a pre-rollout, rollout, or post-rollout task, add a succinct entry file under docs/runbooks/prod-rollout-ledger/ (see its README for the naming convention and template). Do not edit checkbox labels. -->
 
 - [ ] Added a prod rollout ledger entry
 - [ ] Confirmed this PR has no prod rollout tasks

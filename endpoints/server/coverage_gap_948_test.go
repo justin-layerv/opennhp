@@ -43,6 +43,11 @@ import (
 // the local-broadcast primitive whether or not the fan-out flag is on.
 func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 	s, sendCh := newTestServerForBroadcast(t)
+	// Enable only the local wait-for-all timing so PROOF 2 can assert after
+	// every local AC reports. This direct broadcast call does not exercise the
+	// cross-server fan-out half of the flag; gamma remains absent from this
+	// server's map either way.
+	s.config = &Config{EnableKnockACFanout: true}
 
 	const acId = "sandbox-ac" // all qurl.site AC instances share one acId
 

@@ -9,7 +9,8 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  pull-requests: read
+  contents: read # checkout of the gate scripts
+  pull-requests: read # gh api pulls/<n>/files for the ledger-entry check
 
 jobs:
   check-pr-body:
@@ -17,74 +18,78 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Run the gate SCRIPTS from the BASE ref, not the PR head. Every input
+      # comes from the trusted event payload / gh api (PR_BODY, PR_DRAFT,
+      # PR_AUTHOR, PR_NUMBER) and never from the checked-out tree, so pinning to
+      # base.sha is behaviour-identical for legitimate PRs while a PR can no
+      # longer rewrite the check-prod-rollout-*.sh logic that judges it.
+      #
+      # This NARROWS, not closes, the fork-trust gap: on a `pull_request` event
+      # GitHub runs the workflow YAML from the PR's merge ref, so this file's
+      # invoking step is still PR-editable. Acceptable for an advisory check
+      # (read-only token, no secrets, reviewer-visible diff); fully protecting
+      # the gate (the workflow file too, e.g. via CODEOWNERS or a reusable
+      # workflow) is tracked for any promotion to a required check in #2907.
+      # Sparse + shallow + no credentials keeps the checkout minimal.
+      - name: Check out the gate scripts (base ref — trusted)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Require exactly one Prod Rollout Tasks choice
         env:
           GH_TOKEN: ${{ github.token }}
           PR_BODY: ${{ github.event.pull_request.body || '' }}
           PR_DRAFT: ${{ github.event.pull_request.draft }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
 
-          # Draft PRs report success so required-check branch protection does
-          # not block work-in-progress changes before they are ready for review.
-          if [ "$PR_DRAFT" = "true" ]; then
-            echo "Draft PR; the prod rollout tasks body check will run when the PR is ready for review."
+          body_check=.github/scripts/check-prod-rollout-tasks-body.sh
+          ledger_check=.github/scripts/check-prod-rollout-ledger-entry.sh
+
+          # The base ref lacks the gate scripts only while bootstrapping — the PR
+          # that first adds them — when there is no trusted copy to enforce yet
+          # (the PR-head copies are still unit-tested by the validate-workflows
+          # fence). Pass so the introducing PR is not blocked by its own absence.
+          # Check both scripts so the `select:added` path below can't later hit a
+          # raw "No such file" if one were removed from base independently.
+          # Emit a ::warning:: rather than a silent pass: once the scripts live on
+          # the base branch this path never runs, so if it ever does (scripts
+          # renamed/removed on base) it surfaces loudly instead of the gate
+          # quietly going green — "missing" must not look like "compliant".
+          if [ ! -f "$body_check" ] || [ ! -f "$ledger_check" ]; then
+            echo "::warning::prod-rollout-tasks gate scripts are absent on the base ref; skipping the body check (expected only on the PR that first introduces them)."
             exit 0
           fi
 
-          if ! printf '%s\n' "$PR_BODY" | grep -Eq '^##[[:space:]]+Prod Rollout Tasks[[:space:]]*$'; then
-            echo "::error::Missing exact '## Prod Rollout Tasks' section in the PR body. Check spelling and capitalization. See docs/runbooks/prod-rollout-ledger/README.md."
-            exit 1
+          # The body-structure decision — Dependabot/draft exemptions and the
+          # exactly-one-box parsing — lives in this script so it is unit-tested
+          # by tests/scripts/check-prod-rollout-tasks-body_test.sh (fenced in
+          # validate-workflows.yml). It prints a decision token and emits its own
+          # ::error:: on failure; set -e propagates a non-zero exit.
+          decision=$("$body_check")
+          echo "Prod rollout tasks decision: $decision"
+
+          # Only the "Added a ledger entry" choice needs the PR diff; every other
+          # decision (exempt, draft, or the "no prod rollout tasks" box) is final.
+          if [ "$decision" != "select:added" ]; then
+            exit 0
           fi
 
-          tasks_section=$(printf '%s\n' "$PR_BODY" | awk '
-            /^##[[:space:]]+Prod Rollout Tasks[[:space:]]*$/ { in_section=1; next }
-            /^##[[:space:]]+/ && in_section { exit }
-            in_section { print }
-          ')
-
-          # Keep these checkbox labels in sync with .github/PULL_REQUEST_TEMPLATE.md
-          # and docs/runbooks/prod-rollout-ledger/README.md.
-          # The [[:space:]]*$ anchors intentionally absorb GitHub's CRLF body lines.
-          # Labels must stay regex-safe; metacharacters silently change matching semantics.
-          count_checked() {
-            local label="$1"
-            printf '%s\n' "$tasks_section" | grep -Ec "^[[:space:]]*[-*+][[:space:]]+\[[xX]\][[:space:]]+${label}[[:space:]]*$" || true
-          }
-
-          added_count=$(count_checked 'Added a prod rollout ledger entry')
-          notasks_count=$(count_checked 'Confirmed this PR has no prod rollout tasks')
-          total=$((added_count + notasks_count))
-
-          if [ "$total" -ne 1 ]; then
-            echo "::error::Choose exactly one Prod Rollout Tasks checkbox in the PR body."
-            echo "Found added=$added_count no-tasks=$notasks_count."
-            echo "Expected exactly one of these checked lines, with the exact label text; put context elsewhere in the PR body or the ledger entry:"
-            echo "- [x] Added a prod rollout ledger entry"
-            echo "- [x] Confirmed this PR has no prod rollout tasks"
-            exit 1
-          fi
-
-          if [ "$added_count" -eq 1 ]; then
-            # Fail closed if the PR files API is unavailable: keep this as its
-            # own assignment so a non-zero `gh` exit aborts the job under set -e
-            # (do not fold it into the `|| true` pipeline below, which would mask
-            # an API failure). `status != "removed"` excludes pure deletions, so
-            # a PR that only completes (deletes) an entry does not satisfy the
-            # "Added" choice — it should select "no prod rollout tasks" instead.
-            changed_files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate \
-              --jq '.[] | select(.status != "removed") | .filename')
-            # Pass when the PR adds, modifies, or renames any ledger entry file:
-            # any path under the ledger dir other than its README. `|| true`
-            # keeps a no-match grep from tripping `set -o pipefail`, and avoiding
-            # `grep -q` keeps the pipe open so the upstream grep never takes
-            # SIGPIPE regardless of the changed-file count.
-            entry_files=$(printf '%s\n' "$changed_files" \
-              | grep -E '^docs/runbooks/prod-rollout-ledger/.+' \
-              | grep -vE '^docs/runbooks/prod-rollout-ledger/README\.md$' || true)
-            if [ -z "$entry_files" ]; then
-              echo "::error::The PR body says a prod rollout ledger entry was added, but no added/modified file under docs/runbooks/prod-rollout-ledger/ (other than README.md) is in the PR diff."
-              exit 1
-            fi
-          fi
+          # The PR body claims a ledger entry was added; confirm the diff backs
+          # that up. Fail closed if the PR files API is unavailable: keep this as
+          # its own assignment so a non-zero `gh` exit aborts the job under set -e
+          # (do not fold it into the helper pipeline below, which would mask an
+          # API failure). `status != "removed"` excludes pure deletions, so a PR
+          # that only completes (deletes) an entry does not satisfy the "Added"
+          # choice — it should select "no prod rollout tasks" instead.
+          changed_files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate \
+            --jq '.[] | select(.status != "removed") | .filename')
+          # The ledger-entry match is pure, so it lives in its own script that is
+          # unit-tested by tests/scripts/check-prod-rollout-ledger-entry_test.sh.
+          printf '%s\n' "$changed_files" | "$ledger_check"

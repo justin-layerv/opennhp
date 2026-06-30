@@ -318,6 +318,18 @@ jobs:
       - name: Test dependabot-go-tidy preflight (PR #1777)
         run: bash tests/scripts/dependabot-go-tidy_test.sh
 
+      # Fence the prod-rollout-tasks gate's two pure helpers: the body parser
+      # (Dependabot/draft exemptions + exactly-one-box logic, with an exact
+      # bot-identity match a refactor could loosen) and the ledger-entry match.
+      # Both are regex-heavy; actionlint shellchecks them but cannot exercise
+      # their branches.
+      - name: Test prod-rollout-tasks gate scripts
+        run: |
+          shellcheck .github/scripts/check-prod-rollout-tasks-body.sh tests/scripts/check-prod-rollout-tasks-body_test.sh
+          shellcheck .github/scripts/check-prod-rollout-ledger-entry.sh tests/scripts/check-prod-rollout-ledger-entry_test.sh
+          bash tests/scripts/check-prod-rollout-tasks-body_test.sh
+          bash tests/scripts/check-prod-rollout-ledger-entry_test.sh
+
       # Structural fence against DisableAgentValidation=true creeping
       # into a deployable config (#1157 F9). The flag turns off agent
       # static-pubkey validation entirely; setting it true in any
