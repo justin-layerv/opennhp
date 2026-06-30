@@ -49,3 +49,11 @@ func (f *BpfFlusher) FlushConnV6(_ context.Context, _ ConnFlowKey) error {
 // the metrics-publishing code (registration.go) can compile across
 // platforms without build-tagging the gauge.
 func (f *BpfFlusher) SkippedCount() uint64 { return 0 }
+
+// ConntrackStats is the cross-platform symmetry stub for the Linux
+// implementation's conntrack sampler/reaper. The production AC never executes
+// this path; the stub keeps registration metrics build-tag-free on developer
+// machines.
+func (f *BpfFlusher) ConntrackStats() BpfConntrackStats {
+	return BpfConntrackStats{}
+}

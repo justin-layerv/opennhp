@@ -67,6 +67,11 @@ AC_CORE_ALARM_NAMES = (
     "registration_stale",
     "l3_flush_schedule_wait_timeout",
     "publisher_failures",
+    "ebpf_map_full",
+    "ebpf_conntrack_v4_usage_high",
+    "ebpf_conntrack_v6_usage_high",
+    "ebpf_conntrack_sample_errors",
+    "ebpf_conntrack_partial_samples",
 )
 # Keep exemptions explicit and rare. An exemption means the alarm intentionally
 # does not use the shared AC SNS action contract; otherwise a new AC alarm

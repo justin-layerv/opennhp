@@ -214,6 +214,169 @@ resource "aws_cloudwatch_metric_alarm" "udp_handler_panic" {
   })
 }
 
+# ==================== eBPF Map Capacity Alarms ====================
+#
+# All metrics in this section are Go-published by the AC metrics publisher, so
+# dimensions MUST exactly match {Component, Environment, Region}. See
+# terraform/CLAUDE.md "Metric / Alarm Dim-Set Rules".
+resource "aws_cloudwatch_metric_alarm" "ebpf_map_full" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-ebpf-map-full"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "EbpfMapFull"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "AC eBPF allow-rule map reached max_entries and rejected new admissions fail-closed. This is allow-rule capacity, not conntrack cache saturation. See docs/runbooks/ebpf-map-capacity.md."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  # Keep OK routing aligned with AC core alarm parity even though this is a
+  # reset-per-flush event detector.
+  ok_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name  = "${var.name_prefix}-ac-ebpf-map-full"
+    Issue = "2813"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "ebpf_conntrack_v4_usage_high" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-ebpf-conntrack-v4-usage-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "EbpfConntrackV4UsagePercent"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 85
+  alarm_description   = "AC eBPF IPv4 conntrack HASH cache occupancy exceeded 85% after quiet-entry reaping. Correctness remains fail-closed, but new/uncached flows can fall back to the allow-rule slow path. If EbpfConntrackSampleErrors fires, usage gauges may be stale or unavailable; sustained EbpfConntrackPartialSamples below alarm threshold can also undercount occupancy. See docs/runbooks/ebpf-map-capacity.md."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name  = "${var.name_prefix}-ac-ebpf-conntrack-v4-usage-high"
+    Issue = "2813"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "ebpf_conntrack_v6_usage_high" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-ebpf-conntrack-v6-usage-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "EbpfConntrackV6UsagePercent"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 85
+  alarm_description   = "AC eBPF IPv6 conntrack HASH cache occupancy exceeded 85% after quiet-entry reaping. Correctness remains fail-closed, but new/uncached flows can fall back to the allow-rule slow path. If EbpfConntrackSampleErrors fires, usage gauges may be stale or unavailable; sustained EbpfConntrackPartialSamples below alarm threshold can also undercount occupancy. See docs/runbooks/ebpf-map-capacity.md."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name  = "${var.name_prefix}-ac-ebpf-conntrack-v6-usage-high"
+    Issue = "2813"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "ebpf_conntrack_sample_errors" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-ebpf-conntrack-sample-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "EbpfConntrackSampleErrors"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "AC eBPF conntrack stats/reaper failed to sample pinned maps. Capacity alarms may be blind and quiet-entry reclamation may be stalled. See docs/runbooks/ebpf-map-capacity.md."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  # Keep OK routing aligned with AC core alarm parity even though this is a
+  # reset-per-flush event detector.
+  ok_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name  = "${var.name_prefix}-ac-ebpf-conntrack-sample-errors"
+    Issue = "2813"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "ebpf_conntrack_partial_samples" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  # Partial samples are a telemetry-quality signal, not direct capacity
+  # failure: a busy but healthy AC can churn enough HASH keys for a single
+  # walk to abort. With the current 60s metrics cadence and two conntrack
+  # families, a 5-minute period has up to about 10 family-walk opportunities.
+  # Sum>4 over 3 consecutive periods pages only when partial walks are
+  # sustained across most flushes, while one-off churn remains a runbook note.
+  # CALIBRATION: confirm this threshold against sandbox/prod EBPFXDP flip
+  # baselines before treating isolated ALARM transitions as a capacity defect.
+  alarm_name          = "${var.name_prefix}-ac-ebpf-conntrack-partial-samples"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  metric_name         = "EbpfConntrackPartialSamples"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 4
+  alarm_description   = "AC eBPF conntrack HASH iteration was aborted more than 4 times in each of 3 consecutive five-minute windows. Occupancy gauges may undercount and quiet-entry reaping skipped deletes for partial samples. See docs/runbooks/ebpf-map-capacity.md."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name  = "${var.name_prefix}-ac-ebpf-conntrack-partial-samples"
+    Issue = "2813"
+  })
+}
+
 # ==================== Custom Domain Cert Sync Alarms ====================
 
 resource "aws_cloudwatch_metric_alarm" "cert_sync_failures" {

@@ -121,6 +121,34 @@ type UdpAC struct {
 	// without taking a build-tag dependency
 	bpfFlusherSkippedCount func() uint64
 
+	// bpfConntrackStats is the BpfFlusher's conntrack occupancy + quiet-reaper
+	// stats reader, set alongside bpfFlusherSkippedCount when the scheduler is
+	// constructed in EBPFXDP mode on Linux. nil otherwise. The indirection keeps
+	// registration.go build-tag-free while still publishing eBPF conntrack cache
+	// saturation signals during the FilterMode flip.
+	bpfConntrackStats func() BpfConntrackStats
+
+	// bpfConntrackSampleErrorsReported is the cumulative sampler-error
+	// watermark already emitted as reset-per-flush publisher counter events.
+	// BpfFlusher owns the raw cumulative count because sampling is cached across
+	// all conntrack gauge reads; UdpAC converts only the unseen delta into
+	// MetricEbpfConntrackSampleErrors so the CloudWatch alarm can recover after
+	// transient failures.
+	bpfConntrackSampleErrorsReported atomic.Uint64
+
+	// bpfConntrackPartialSamplesReported is the cumulative partial-sample
+	// watermark already emitted as reset-per-flush publisher counter events.
+	// Partial samples are not hard sampler errors, but HASH iteration churn can
+	// undercount occupancy, so the condition needs its own recoverable signal.
+	bpfConntrackPartialSamplesReported atomic.Uint64
+
+	// bpfConntrackExpiredReaped*Reported are the cumulative quiet-reap
+	// watermarks already emitted as reset-per-flush publisher counter events.
+	// Keeping these as counters avoids publishing per-instance monotonic gauges
+	// into fleet-shared CloudWatch streams.
+	bpfConntrackExpiredReapedV4Reported atomic.Uint64
+	bpfConntrackExpiredReapedV6Reported atomic.Uint64
+
 	// surgicalConnFlush is the per-flow surgical conntrack-teardown seam
 	// used by the revocation apply path (flushEntryNow). Set to
 	// BpfFlusher.FlushConn ONLY when the scheduler is constructed in EBPFXDP
@@ -171,6 +199,57 @@ func (a *UdpAC) BpfFlusherSkippedCount() (uint64, bool) {
 		return 0, false
 	}
 	return a.bpfFlusherSkippedCount(), true
+}
+
+// BpfConntrackStats returns the eBPF conntrack stats snapshot and ok=true when
+// the EBPFXDP BpfFlusher is wired; zero, false otherwise.
+func (a *UdpAC) BpfConntrackStats() (BpfConntrackStats, bool) {
+	if a.bpfConntrackStats == nil {
+		return BpfConntrackStats{}, false
+	}
+	stats := a.bpfConntrackStats()
+	a.recordBpfConntrackSampleErrors(stats.SampleErrors)
+	a.recordBpfConntrackPartialSamples(stats.PartialSamples)
+	a.recordBpfConntrackExpiredReapedV4(stats.V4ExpiredReaped)
+	a.recordBpfConntrackExpiredReapedV6(stats.V6ExpiredReaped)
+	return stats, true
+}
+
+func (a *UdpAC) recordBpfConntrackSampleErrors(sampleErrors uint64) {
+	a.recordBpfConntrackCounterDeltas(&a.bpfConntrackSampleErrorsReported, sampleErrors, MetricEbpfConntrackSampleErrors)
+}
+
+func (a *UdpAC) recordBpfConntrackPartialSamples(partialSamples uint64) {
+	a.recordBpfConntrackCounterDeltas(&a.bpfConntrackPartialSamplesReported, partialSamples, MetricEbpfConntrackPartialSamples)
+}
+
+func (a *UdpAC) recordBpfConntrackExpiredReapedV4(expiredReaped uint64) {
+	a.recordBpfConntrackCounterDeltas(&a.bpfConntrackExpiredReapedV4Reported, expiredReaped, MetricEbpfConntrackV4ExpiredReaped)
+}
+
+func (a *UdpAC) recordBpfConntrackExpiredReapedV6(expiredReaped uint64) {
+	a.recordBpfConntrackCounterDeltas(&a.bpfConntrackExpiredReapedV6Reported, expiredReaped, MetricEbpfConntrackV6ExpiredReaped)
+}
+
+func (a *UdpAC) recordBpfConntrackCounterDeltas(reported *atomic.Uint64, watermark uint64, metricName string) {
+	if a == nil || a.registration == nil || a.registration.metrics == nil {
+		return
+	}
+	for {
+		prev := reported.Load()
+		if watermark <= prev {
+			return
+		}
+		if reported.CompareAndSwap(prev, watermark) {
+			if !a.addMetric(metricName, watermark-prev) {
+				// collectGauges invokes gauge funcs serially today; if this stats
+				// path gets concurrent callers, replace rollback with a stronger
+				// publish/commit protocol rather than clobbering a racing advance.
+				reported.CompareAndSwap(watermark, prev)
+			}
+			return
+		}
+	}
 }
 
 type UdpConn struct {
@@ -319,6 +398,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 		// non-Linux stub returns 0 from SkippedCount.
 		if bf, ok := flusher.(*BpfFlusher); ok && bf != nil {
 			a.bpfFlusherSkippedCount = bf.SkippedCount
+			a.bpfConntrackStats = bf.ConntrackStats
 			// Bind the surgical conntrack-teardown seam to the same
 			// EBPFXDP-on-Linux BpfFlusher. This is what flips
 			// flushEntryNow from coarse-only allow-rule reschedule to the
@@ -372,6 +452,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			// fence: round 11 minor — nil-write safety pinned).
 			a.expirySched = nil
 			a.bpfFlusherSkippedCount = nil
+			a.bpfConntrackStats = nil
 			a.surgicalConnFlush = nil
 			a.enumerateConnSrcPorts = nil
 			a.surgicalConnFlushV6 = nil
@@ -974,19 +1055,22 @@ func (a *UdpAC) latestOtherFirewallDeadline(candidates []*AccessEntry, self *Acc
 // metric-publishing call site in this file should route through
 // here so the nil-discipline lives in one place.
 func (a *UdpAC) incrMetric(name string) {
-	if reg := a.registration; reg != nil {
+	if reg := a.registration; reg != nil && reg.metrics != nil {
 		reg.metrics.IncrCounter(name)
 	}
 }
 
-// addMetric adds value to an AC counter in one publish, the batched analog
-// of incrMetric. Same nil-discipline (nil registration / nil publisher are
-// no-ops). Used by the revocation apply path to report N entries flushed
-// without N separate IncrCounter calls.
-func (a *UdpAC) addMetric(name string, value uint64) {
-	if reg := a.registration; reg != nil {
+// addMetric adds value to an AC counter in one publish, the batched analog of
+// incrMetric. It returns false when the registration/publisher path is not
+// wired. Used by the revocation apply path to report N entries flushed without N
+// separate IncrCounter calls; callers that track watermarks can use the return
+// value to avoid consuming unpublished deltas.
+func (a *UdpAC) addMetric(name string, value uint64) bool {
+	if reg := a.registration; reg != nil && reg.metrics != nil {
 		reg.metrics.AddCounterWithDims(name, float64(value), nil)
+		return true
 	}
+	return false
 }
 
 // recordTransactionClosed increments MetricTransactionClosed iff err

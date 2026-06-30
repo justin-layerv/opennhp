@@ -208,21 +208,40 @@ channel, and the `BPF_ANY` update result is intentionally not verdict-bearing.
 Correctness still holds: if an allow-rule matches, the packet returns
 `XDP_PASS`; it simply remains uncached and pays the full allow-rule scan on each
 packet until a cache slot is made available. If no allow-rule matches, it still
-`XDP_DROP`s. Expired quiet conntrack entries are not proactively scavenged
-today, so a full HASH cache can stay saturated if dead/quiet entries accumulate;
-that makes #2813's sizing, conntrack-specific saturation signal, and explicit
-quiet-entry reclamation strategy a hard E5 flip prerequisite. The real-kernel
-regression proof is
+`XDP_DROP`s. Dead quiet entries are reclaimed by the userspace conntrack
+stats/reaper (`nhp/utils/ebpf/conntrack_stats_linux.go`), wired through
+`BpfFlusher.ConntrackStats`: once per metrics flush sample it applies the same
+`timestamp + ttl_ns < now` predicate as `check_conn_expiry` and deletes expired
+entries from `conn_track` / `conn_track_v6`, even when the flow will never send
+the next packet that would trigger datapath GC. Reclamation cadence is therefore
+the AC metrics flush cadence (60s today). The 30s conntrack stats cache dedupes
+the multiple conntrack gauges inside one flush; it does not create a faster
+independent reaper cadence. Each sample deletes at most 100,000 expired quiet
+entries per conntrack family, up to ~200,000 across V4+V6; at today's cadence
+that is roughly 100,000 entries/minute per family, so a mass-expiry event cannot
+issue unbounded delete syscalls on the metrics goroutine and may drain gradually.
+The reaper uses the package's existing kernel-time helper; on
+non-suspending EC2 hosts it is equivalent to XDP's `bpf_ktime_get_ns`, and even
+under clock-domain skew the worst case is premature cache reaping followed by
+allow-rule slow-path repopulation, not fail-open or silent eviction. If sampler
+errors occur, `EbpfConntrackSampleErrors` pages on-call because both occupancy
+visibility and quiet-entry reclamation may be impaired. If concurrent HASH churn
+aborts an iteration, `EbpfConntrackPartialSamples` pages separately because the
+AC preserves conservative occupancy but deletes are skipped for that sample. The
+real-kernel regression proof is
 `TestConnTrackFullHashCacheMissFallsBackToAllowRule`, which shrinks
 `conn_track`, fills it, and verifies exactly that full-cache slow-path behavior
 without evicting an existing established entry.
 
 This removes the E5 flip blocker in #2814. The remaining capacity concern is
-operational sizing, reclamation, and alarm coverage: a full conntrack HASH map
-is a performance cliff for new/uncached flows, not a fail-open or
-collateral-kill condition. Sizing stays coupled to `max_entries`, instance type,
-and the E5 flip-readiness work tracked in
-[nhp#2813](https://github.com/layervai/nhp/issues/2813).
+operational sizing: a full conntrack HASH map is a performance cliff for
+new/uncached flows, not a fail-open or collateral-kill condition. Sizing stays
+coupled to `max_entries`, instance type, and the E5 flip readiness checks; a
+near-`max_entries` conntrack walk measurement on the target AC instance type is
+a hard E5 flip gate until #2928 removes the full-walk publisher dependency.
+Do not treat the metrics-path reaper as capacity-safety evidence for E5 without
+either landing #2928's decoupled/batched path or recording why sizing plus
+datapath GC are sufficient without it.
 
 ### Capacity / `max_entries` sizing and kernel-memory cost
 
@@ -268,8 +287,8 @@ security fix is correct and shippable at any size, and is inert in prod
 separate, flip-time concern that must be co-decided with the instance-type
 review; the recommended target is **2M (not 16M)** unless instance RAM grows,
 and any bump must re-run the memory math above against the chosen instance
-type. Tracked as a concrete flip-time task in
-[nhp#2813](https://github.com/layervai/nhp/issues/2813) (under #2163 item 2).
+type. This slice keeps the current value and makes the current ceiling
+observable rather than changing the RAM envelope.
 
 #### ipset `maxelem` (#2163 item 1): a capped security backstop, not a scale lever
 
@@ -389,12 +408,32 @@ fail-closed security event (`endpoints/ac/msghandler.go`,
 `(*UdpAC).ebpfRuleAddFailClosed`). A non-zero rate means the AC is rejecting
 *new* admissions because an allow-rule map is at capacity — i.e. the eBPF
 capacity ceiling has been reached and admissions are being denied (fail-closed,
-not silently evicting). **At the eBPF FilterMode flip (E5) this metric needs a
-CloudWatch alarm** (`terraform/modules/ac/monitoring.tf`, mirroring the
-`MetricUDPHandlerPanic` alarm) — until then "loud" is log + emitted-metric
-only, with no paging. Tracked in
-[nhp#2813](https://github.com/layervai/nhp/issues/2813). This is inert in prod
-under iptables FilterMode (the map is never loaded, so the metric never fires).
+not silently evicting). The CloudWatch alarm in
+`terraform/modules/ac/monitoring.tf` watches the AC publisher base dimensions
+`{Component=AC, Environment, Region}` and points operators at
+`docs/runbooks/ebpf-map-capacity.md`. This is inert in prod under iptables
+FilterMode (the map is never loaded, so the metric never fires).
+
+### Conntrack saturation observability and quiet-entry reclamation
+
+Conntrack cache pressure is intentionally separate from `EbpfMapFull`:
+
+| Metric | Meaning |
+|---|---|
+| `EbpfConntrackV4Entries` / `EbpfConntrackV6Entries` | Current established-flow cache entries after quiet-entry reaping in this sample |
+| `EbpfConntrackV4MaxEntries` / `EbpfConntrackV6MaxEntries` | Loaded map ceiling reported by the pinned map metadata |
+| `EbpfConntrackV4UsagePercent` / `EbpfConntrackV6UsagePercent` | Post-reap occupancy vs the map's `max_entries` |
+| `EbpfConntrackV4OldestAgeSeconds` / `EbpfConntrackV6OldestAgeSeconds` | Oldest surviving entry idle age observed in the sample; during an expiry backlog above the delete budget, this can under-report while expired survivors wait for a later pass |
+| `EbpfConntrackV4ExpiredReaped` / `EbpfConntrackV6ExpiredReaped` | Per-period quiet expired entries deleted by the sampler/reaper |
+| `EbpfConntrackSampleSeconds` | Wall-clock duration of the most recent sample/reap attempt; use `Maximum` during flip validation to catch full-map walk latency |
+| `EbpfConntrackSampleErrors` | Per-period failures to sample/reap the pinned conntrack maps |
+| `EbpfConntrackPartialSamples` | Per-period incomplete HASH walks caused by concurrent churn; usage gauges may undercount for those samples. The alarm pages only on sustained partials, not isolated churny walks |
+
+Terraform alarms page separately on high v4/v6 conntrack usage and sampler
+errors or partial samples. A conntrack usage alarm means new/uncached flows may
+lose the fast-path cache and fall back to the allow-rule cascade; it does
+**not** mean admissions are being rejected. `EbpfMapFull` is the
+admission-fail-closed signal.
 
 ## Alternative considered: stateless signed cookie
 

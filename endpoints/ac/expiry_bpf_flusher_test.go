@@ -4,8 +4,15 @@ package ac
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
+
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
+	utilebpf "github.com/OpenNHP/opennhp/nhp/utils/ebpf"
 )
+
+var errTestConntrackSample = errors.New("conntrack sample failed")
 
 // TestIsIPv4Mapped fences the IPv4 detection used to short-circuit
 // BpfFlusher on non-IPv4 keys (the eBPF maps are IPv4-only).
@@ -212,6 +219,159 @@ func TestBpfFlusher_FlushConnV6_CanceledCtx(t *testing.T) {
 	cancel()
 	if err := f.FlushConnV6(ctx, ConnFlowKey{Flow: k, SrcPort: 43210}); err == nil {
 		t.Error("FlushConnV6 with canceled ctx: got nil, want ctx error (must short-circuit before LoadPinnedMap)")
+	}
+}
+
+func TestBpfConntrackStatsCacheTTLBelowPublisherFlushInterval(t *testing.T) {
+	flushInterval := metrics.FlushIntervalForTest(t)
+	if bpfConntrackStatsCacheTTL >= flushInterval {
+		t.Fatalf("bpfConntrackStatsCacheTTL = %s, want < metrics flush interval %s so each flush can drive at most one fresh conntrack walk/reap",
+			bpfConntrackStatsCacheTTL, flushInterval)
+	}
+}
+
+func TestBpfConntrackStatsFromRaw_PostReapOccupancyAndCumulativeCounters(t *testing.T) {
+	raw := utilebpf.ConnTrackStats{
+		V4: utilebpf.ConnTrackMapStats{
+			Entries:        10,
+			MaxEntries:     20,
+			OldestAgeNanos: uint64(2 * time.Second),
+			ExpiredDeleted: 3,
+		},
+		V6: utilebpf.ConnTrackMapStats{
+			Entries:        5,
+			MaxEntries:     10,
+			OldestAgeNanos: uint64(1500 * time.Millisecond),
+			ExpiredDeleted: 5,
+			PartialSample:  true,
+		},
+	}
+
+	got := bpfConntrackStatsFromRaw(raw, 2, 1, 11, 7)
+	if got.V4Entries != 7 {
+		t.Fatalf("V4Entries = %d, want post-reap 7", got.V4Entries)
+	}
+	if got.V4UsagePercent != 35 {
+		t.Fatalf("V4UsagePercent = %v, want 35", got.V4UsagePercent)
+	}
+	if got.V4OldestAgeSeconds != 2 {
+		t.Fatalf("V4OldestAgeSeconds = %v, want 2", got.V4OldestAgeSeconds)
+	}
+	if got.V4ExpiredReaped != 11 {
+		t.Fatalf("V4ExpiredReaped = %d, want cumulative 11", got.V4ExpiredReaped)
+	}
+	if got.V6Entries != 0 {
+		t.Fatalf("V6Entries = %d, want 0 after reaping every observed entry", got.V6Entries)
+	}
+	if got.V6UsagePercent != 0 {
+		t.Fatalf("V6UsagePercent = %v, want 0", got.V6UsagePercent)
+	}
+	if got.V6OldestAgeSeconds != 1.5 {
+		t.Fatalf("V6OldestAgeSeconds = %v, want 1.5", got.V6OldestAgeSeconds)
+	}
+	if got.V6ExpiredReaped != 7 {
+		t.Fatalf("V6ExpiredReaped = %d, want cumulative 7", got.V6ExpiredReaped)
+	}
+	if got.SampleErrors != 2 {
+		t.Fatalf("SampleErrors = %d, want 2", got.SampleErrors)
+	}
+	if got.PartialSamples != 1 {
+		t.Fatalf("PartialSamples = %d, want 1", got.PartialSamples)
+	}
+}
+
+func TestBpfConntrackStatsPreserveLastGoodOnHardSampleError(t *testing.T) {
+	previous := BpfConntrackStats{
+		V4Entries:          17,
+		V4MaxEntries:       100,
+		V4UsagePercent:     17,
+		V4OldestAgeSeconds: 4,
+		V4ExpiredReaped:    9,
+		V6Entries:          33,
+		V6MaxEntries:       100,
+		V6UsagePercent:     33,
+		V6OldestAgeSeconds: 8,
+		V6ExpiredReaped:    3,
+	}
+	raw := utilebpf.ConnTrackStats{
+		V4: utilebpf.ConnTrackMapStats{
+			SampleError:  true,
+			MapNotPinned: true,
+		},
+		V6: utilebpf.ConnTrackMapStats{
+			Entries:        10,
+			MaxEntries:     20,
+			ExpiredDeleted: 2,
+			OldestAgeNanos: uint64(3 * time.Second),
+		},
+	}
+
+	next := bpfConntrackStatsFromRaw(raw, 1, 0, 9, 5)
+	got := bpfConntrackStatsPreserveConservativeOccupancy(next, previous, raw, errTestConntrackSample)
+
+	if got.V4Entries != previous.V4Entries || got.V4MaxEntries != previous.V4MaxEntries ||
+		got.V4UsagePercent != previous.V4UsagePercent || got.V4OldestAgeSeconds != previous.V4OldestAgeSeconds {
+		t.Fatalf("V4 occupancy = entries %d max %d usage %v age %v, want previous entries %d max %d usage %v age %v",
+			got.V4Entries, got.V4MaxEntries, got.V4UsagePercent, got.V4OldestAgeSeconds,
+			previous.V4Entries, previous.V4MaxEntries, previous.V4UsagePercent, previous.V4OldestAgeSeconds)
+	}
+	if got.V4ExpiredReaped != 9 {
+		t.Fatalf("V4ExpiredReaped = %d, want current watermark 9", got.V4ExpiredReaped)
+	}
+	if got.V6Entries != 8 || got.V6MaxEntries != 20 || got.V6UsagePercent != 40 || got.V6OldestAgeSeconds != 3 {
+		t.Fatalf("V6 occupancy = entries %d max %d usage %v age %v, want new sample entries 8 max 20 usage 40 age 3",
+			got.V6Entries, got.V6MaxEntries, got.V6UsagePercent, got.V6OldestAgeSeconds)
+	}
+	if got.V6ExpiredReaped != 5 {
+		t.Fatalf("V6ExpiredReaped = %d, want current watermark 5", got.V6ExpiredReaped)
+	}
+	if got.SampleErrors != 1 {
+		t.Fatalf("SampleErrors = %d, want 1", got.SampleErrors)
+	}
+}
+
+func TestBpfConntrackStatsPreserveConservativeOccupancyOnPartialSample(t *testing.T) {
+	previous := BpfConntrackStats{
+		V4Entries:          80,
+		V4MaxEntries:       100,
+		V4UsagePercent:     80,
+		V4OldestAgeSeconds: 20,
+		V6Entries:          10,
+		V6MaxEntries:       100,
+		V6UsagePercent:     10,
+		V6OldestAgeSeconds: 4,
+	}
+	raw := utilebpf.ConnTrackStats{
+		V4: utilebpf.ConnTrackMapStats{
+			Entries:        20,
+			MaxEntries:     100,
+			OldestAgeNanos: uint64(3 * time.Second),
+			PartialSample:  true,
+		},
+		V6: utilebpf.ConnTrackMapStats{
+			Entries:        70,
+			MaxEntries:     100,
+			OldestAgeNanos: uint64(9 * time.Second),
+			PartialSample:  true,
+		},
+	}
+
+	next := bpfConntrackStatsFromRaw(raw, 0, 2, 7, 11)
+	got := bpfConntrackStatsPreserveConservativeOccupancy(next, previous, raw, nil)
+
+	if got.V4Entries != previous.V4Entries || got.V4MaxEntries != previous.V4MaxEntries ||
+		got.V4UsagePercent != previous.V4UsagePercent || got.V4OldestAgeSeconds != previous.V4OldestAgeSeconds {
+		t.Fatalf("V4 partial occupancy = entries %d max %d usage %v age %v, want previous entries %d max %d usage %v age %v",
+			got.V4Entries, got.V4MaxEntries, got.V4UsagePercent, got.V4OldestAgeSeconds,
+			previous.V4Entries, previous.V4MaxEntries, previous.V4UsagePercent, previous.V4OldestAgeSeconds)
+	}
+	if got.V6Entries != 70 || got.V6MaxEntries != 100 || got.V6UsagePercent != 70 || got.V6OldestAgeSeconds != 9 {
+		t.Fatalf("V6 partial occupancy = entries %d max %d usage %v age %v, want higher partial sample entries 70 max 100 usage 70 age 9",
+			got.V6Entries, got.V6MaxEntries, got.V6UsagePercent, got.V6OldestAgeSeconds)
+	}
+	if got.PartialSamples != 2 || got.V4ExpiredReaped != 7 || got.V6ExpiredReaped != 11 {
+		t.Fatalf("watermarks = partial %d v4Reaped %d v6Reaped %d, want current 2/7/11",
+			got.PartialSamples, got.V4ExpiredReaped, got.V6ExpiredReaped)
 	}
 }
 

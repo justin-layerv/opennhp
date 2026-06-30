@@ -808,6 +808,47 @@ func TestPublisher_Flush_PutMetricDataPayload(t *testing.T) {
 	}
 }
 
+func TestPublisher_Flush_IncludesGaugeEmittedCountersInSameWindow(t *testing.T) {
+	mockCW := &mockCloudWatchClient{}
+	mp := newTestPublisher(t, mockCW)
+	mp.dims = []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String("sandbox")},
+	}
+	mp.RegisterGaugeFunc("ConntrackUsage", func() float64 {
+		mp.AddCounterWithDims("ConntrackPartialSamples", 2, nil)
+		return 87
+	})
+
+	mp.collectGauges()
+	mp.flush()
+
+	if len(mockCW.calls) != 1 {
+		t.Fatalf("expected 1 PutMetricData call, got %d", len(mockCW.calls))
+	}
+	byName := indexByName(mockCW.calls[0].MetricData)
+	partialSamples, ok := byName["ConntrackPartialSamples"]
+	if !ok {
+		t.Fatalf("ConntrackPartialSamples counter emitted from gauge func missing from same flush: %+v", mockCW.calls[0].MetricData)
+	}
+	if got := aws.ToFloat64(partialSamples.Value); got != 2 {
+		t.Errorf("ConntrackPartialSamples value = %v, want 2", got)
+	}
+	if partialSamples.Unit != types.StandardUnitCount {
+		t.Errorf("ConntrackPartialSamples unit = %v, want Count", partialSamples.Unit)
+	}
+
+	usage, ok := byName["ConntrackUsage"]
+	if !ok {
+		t.Fatalf("ConntrackUsage gauge missing from flush: %+v", mockCW.calls[0].MetricData)
+	}
+	if got := aws.ToFloat64(usage.Value); got != 87 {
+		t.Errorf("ConntrackUsage value = %v, want 87", got)
+	}
+	if usage.Unit != types.StandardUnitNone {
+		t.Errorf("ConntrackUsage unit = %v, want None", usage.Unit)
+	}
+}
+
 func TestPublisher_Flush_BatchingByBatchSize(t *testing.T) {
 	mockCW := &mockCloudWatchClient{}
 	mp := newTestPublisher(t, mockCW)

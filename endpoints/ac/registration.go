@@ -577,12 +577,45 @@ const (
 	// for the eBPF FilterMode: rather than silently evicting an already-admitted
 	// session (the LRU_HASH bug fixed in #2163), the AC rejects the NEW
 	// admission and bumps this counter. A non-zero rate means the eBPF capacity
-	// ceiling has been hit and admissions are being denied — needs a CloudWatch
-	// alarm at the eBPF FilterMode flip (E5); see
-	// docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md. Inert under
-	// FilterMode_IPTABLES (the maps are never loaded), so it cannot fire in prod
-	// until the flip.
+	// ceiling has been hit and admissions are being denied. The Terraform alarm
+	// is deliberately allow-rule-specific; established-flow conntrack cache
+	// saturation uses the EbpfConntrack* gauges below. Inert under
+	// FilterMode_IPTABLES (the maps are never loaded), so it cannot fire until
+	// the eBPF FilterMode flip.
 	MetricEbpfMapFull = "EbpfMapFull"
+
+	// eBPF established-flow conntrack cache telemetry. Entries/max/usage/age
+	// values are gauges produced by BpfFlusher.ConntrackStats when EBPFXDP is
+	// wired; the gauge funcs are not registered in iptables mode, avoiding inert
+	// pre-flip custom metrics. ExpiredReaped values are emitted as
+	// reset-per-flush counters from the same stats snapshot. The split is
+	// intentional because conn_track and conn_track_v6 have independent
+	// max_entries ceilings and E5 needs to distinguish allow-rule admission
+	// saturation (MetricEbpfMapFull) from conntrack cache saturation (slow-path
+	// pressure for new/uncached flows).
+	MetricEbpfConntrackV4Entries          = "EbpfConntrackV4Entries"
+	MetricEbpfConntrackV4MaxEntries       = "EbpfConntrackV4MaxEntries"
+	MetricEbpfConntrackV4UsagePercent     = "EbpfConntrackV4UsagePercent"
+	MetricEbpfConntrackV4OldestAgeSeconds = "EbpfConntrackV4OldestAgeSeconds"
+	MetricEbpfConntrackV4ExpiredReaped    = "EbpfConntrackV4ExpiredReaped"
+	MetricEbpfConntrackV6Entries          = "EbpfConntrackV6Entries"
+	MetricEbpfConntrackV6MaxEntries       = "EbpfConntrackV6MaxEntries"
+	MetricEbpfConntrackV6UsagePercent     = "EbpfConntrackV6UsagePercent"
+	MetricEbpfConntrackV6OldestAgeSeconds = "EbpfConntrackV6OldestAgeSeconds"
+	MetricEbpfConntrackV6ExpiredReaped    = "EbpfConntrackV6ExpiredReaped"
+	MetricEbpfConntrackSampleSeconds      = "EbpfConntrackSampleSeconds"
+
+	// MetricEbpfConntrackSampleErrors counts stats/reaper sample failures per
+	// publisher interval. It intentionally uses reset-per-flush counter
+	// semantics, not a cumulative gauge, so the alarm self-recovers after the
+	// pinned-map problem clears.
+	MetricEbpfConntrackSampleErrors = "EbpfConntrackSampleErrors"
+
+	// MetricEbpfConntrackPartialSamples counts conntrack HASH map iterations
+	// that were aborted by concurrent map churn before a complete pass. It is a
+	// reset-per-flush counter because the occupancy gauges from that sample may
+	// undercount and the quiet reaper skips deletes from incomplete walks.
+	MetricEbpfConntrackPartialSamples = "EbpfConntrackPartialSamples"
 )
 
 // Re-registration reason constants. These are the only values that
@@ -1229,11 +1262,33 @@ func (r *ACRegistration) Start() error {
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleAfterShutdown, r.l3FlushScheduleAfterShutdownGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleWaitTimeout, r.l3FlushScheduleWaitTimeoutGauge)
 
+	r.registerConntrackGaugeFuncs()
+
 	// Add to wait group BEFORE starting goroutines to prevent race with Stop()
 	r.wg.Add(1)
 	go r.registrationLoop()
 
 	return nil
+}
+
+func (r *ACRegistration) registerConntrackGaugeFuncs() {
+	// These conntrack gauges intentionally have a side effect under EBPFXDP:
+	// BpfFlusher.ConntrackStats also reaps expired quiet entries and emits
+	// reset-per-flush sample/partial/expired-reaped counters. Keep them in the
+	// collected gauge path when the BpfFlusher stats reader is wired, unless
+	// reaping gets its own scheduler (tracked in nhp#2928).
+	if r == nil || r.metrics == nil || r.ac == nil || r.ac.bpfConntrackStats == nil {
+		return
+	}
+	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV4Entries, r.ebpfConntrackV4EntriesGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV4MaxEntries, r.ebpfConntrackV4MaxEntriesGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV4UsagePercent, r.ebpfConntrackV4UsagePercentGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV4OldestAgeSeconds, r.ebpfConntrackV4OldestAgeSecondsGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV6Entries, r.ebpfConntrackV6EntriesGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV6MaxEntries, r.ebpfConntrackV6MaxEntriesGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV6UsagePercent, r.ebpfConntrackV6UsagePercentGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV6OldestAgeSeconds, r.ebpfConntrackV6OldestAgeSecondsGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackSampleSeconds, r.ebpfConntrackSampleSecondsGauge)
 }
 
 // Stop stops the registration manager. Safe to call multiple times,
@@ -1420,6 +1475,45 @@ func (r *ACRegistration) l3FlushBpfSkippedGauge() float64 {
 		return 0
 	}
 	return float64(count)
+}
+
+func (r *ACRegistration) ebpfConntrackStatsSnapshot() BpfConntrackStats {
+	if r.ac == nil {
+		return BpfConntrackStats{}
+	}
+	stats, ok := r.ac.BpfConntrackStats()
+	if !ok {
+		return BpfConntrackStats{}
+	}
+	return stats
+}
+
+func (r *ACRegistration) ebpfConntrackV4EntriesGauge() float64 {
+	return float64(r.ebpfConntrackStatsSnapshot().V4Entries)
+}
+func (r *ACRegistration) ebpfConntrackV4MaxEntriesGauge() float64 {
+	return float64(r.ebpfConntrackStatsSnapshot().V4MaxEntries)
+}
+func (r *ACRegistration) ebpfConntrackV4UsagePercentGauge() float64 {
+	return r.ebpfConntrackStatsSnapshot().V4UsagePercent
+}
+func (r *ACRegistration) ebpfConntrackV4OldestAgeSecondsGauge() float64 {
+	return r.ebpfConntrackStatsSnapshot().V4OldestAgeSeconds
+}
+func (r *ACRegistration) ebpfConntrackV6EntriesGauge() float64 {
+	return float64(r.ebpfConntrackStatsSnapshot().V6Entries)
+}
+func (r *ACRegistration) ebpfConntrackV6MaxEntriesGauge() float64 {
+	return float64(r.ebpfConntrackStatsSnapshot().V6MaxEntries)
+}
+func (r *ACRegistration) ebpfConntrackV6UsagePercentGauge() float64 {
+	return r.ebpfConntrackStatsSnapshot().V6UsagePercent
+}
+func (r *ACRegistration) ebpfConntrackV6OldestAgeSecondsGauge() float64 {
+	return r.ebpfConntrackStatsSnapshot().V6OldestAgeSeconds
+}
+func (r *ACRegistration) ebpfConntrackSampleSecondsGauge() float64 {
+	return r.ebpfConntrackStatsSnapshot().SampleDurationSeconds
 }
 
 // registrationLoop attempts registration and maintains connections.

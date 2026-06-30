@@ -46,6 +46,11 @@ must update this list and audit all existing call sites.
   these locks (so no inversion is possible from outside-in callers).
   When extending the scheduler, keep the lock discipline documented
   in the scheduler godoc rather than duplicating it here.
+- **`BpfFlusher.statsMu` is leaf-most and internal.** `ConntrackStats`
+  holds it across the eBPF conntrack walk/reap cache refresh, but that path
+  does not call back into `UdpAC`, `ACRegistration`, metrics publisher locks,
+  or scheduler/tokenstore locks. Keep it leaf-most; future changes that invoke
+  AC callbacks while holding `statsMu` must audit this table first.
 - **`tokenStore.mu` is never held while scheduler `shard.mu` /
   `wheelMu` are acquired** (#2172). The
   `TokenStore.OnExpire` hook wired by `(*UdpAC).Start` calls

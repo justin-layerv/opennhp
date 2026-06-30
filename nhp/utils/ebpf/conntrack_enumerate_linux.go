@@ -109,8 +109,9 @@ func enumerateConnTrackSrcPortsOnMap(m *ebpf.Map, srcIPStr, dstIPStr string, pro
 	// connTrackKeyFromBytes mis-decodes into bogus source ports — fail loud
 	// rather than enumerate garbage. The value size is read (not asserted to a
 	// fixed const, since the kernel conn_value layout is owned by the XDP
-	// program and not mirrored in this package) but bounded so a wrong map
-	// can't force a pathological per-iteration allocation.
+	// program and not mirrored in this package) but bounded against the same
+	// minimum the stats/reaper parser requires, so a wrong tiny-value map fails
+	// loud instead of looking merely empty.
 	info, err := m.Info()
 	if err != nil {
 		return nil, fmt.Errorf("conn_track map info: %w", err)
@@ -118,8 +119,8 @@ func enumerateConnTrackSrcPortsOnMap(m *ebpf.Map, srcIPStr, dstIPStr string, pro
 	if int(info.KeySize) != connTrackKeySize {
 		return nil, fmt.Errorf("conn_track map key size %d, want %d (ipv4_ct_tuple: %d field bytes + %d trailing pad) — wrong map pinned at %s?", info.KeySize, connTrackKeySize, connTrackKeyDataLen, connTrackKeySize-connTrackKeyDataLen, PinPathConnTrack)
 	}
-	if info.ValueSize == 0 || int(info.ValueSize) > connTrackValueSizeMax {
-		return nil, fmt.Errorf("conn_track map value size %d out of range (1..%d) — wrong map pinned at %s?", info.ValueSize, connTrackValueSizeMax, PinPathConnTrack)
+	if info.ValueSize < connTrackValueMinSize || int(info.ValueSize) > connTrackValueSizeMax {
+		return nil, fmt.Errorf("conn_track map value size %d out of range (%d..%d) — wrong map pinned at %s?", info.ValueSize, connTrackValueMinSize, connTrackValueSizeMax, PinPathConnTrack)
 	}
 
 	keyBytes := make([]byte, connTrackKeySize)
@@ -193,8 +194,9 @@ func enumerateConnTrackSrcPortsOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, p
 	// wrong map pinned here would let the iterator yield bytes that
 	// connTrackKeyV6FromBytes mis-decodes into bogus source ports. The value size
 	// is read (not asserted to a fixed const — the kernel conn_value layout is
-	// owned by the XDP program) but bounded so a wrong map can't force a
-	// pathological per-iteration allocation.
+	// owned by the XDP program) but bounded against the same minimum the
+	// stats/reaper parser requires, so a wrong tiny-value map fails loud instead
+	// of looking merely empty.
 	info, err := m.Info()
 	if err != nil {
 		return nil, fmt.Errorf("conn_track_v6 map info: %w", err)
@@ -202,8 +204,8 @@ func enumerateConnTrackSrcPortsOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, p
 	if int(info.KeySize) != connTrackKeyV6Size {
 		return nil, fmt.Errorf("conn_track_v6 map key size %d, want %d (packed ipv6_ct_tuple) — wrong map pinned at %s?", info.KeySize, connTrackKeyV6Size, PinPathConnTrackV6)
 	}
-	if info.ValueSize == 0 || int(info.ValueSize) > connTrackValueSizeMax {
-		return nil, fmt.Errorf("conn_track_v6 map value size %d out of range (1..%d) — wrong map pinned at %s?", info.ValueSize, connTrackValueSizeMax, PinPathConnTrackV6)
+	if info.ValueSize < connTrackValueMinSize || int(info.ValueSize) > connTrackValueSizeMax {
+		return nil, fmt.Errorf("conn_track_v6 map value size %d out of range (%d..%d) — wrong map pinned at %s?", info.ValueSize, connTrackValueMinSize, connTrackValueSizeMax, PinPathConnTrackV6)
 	}
 
 	keyBytes := make([]byte, connTrackKeyV6Size)

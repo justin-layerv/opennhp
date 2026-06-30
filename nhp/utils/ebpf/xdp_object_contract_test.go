@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 )
 
 // committedXDPObjectRel deliberately reaches outside the nhp Go module: the
@@ -319,18 +320,60 @@ func TestCommittedXDPObject_ConnTrackABI(t *testing.T) {
 		t.Fatalf("LoadCollectionSpec(%s): %v", committedXDPObjectRel, err)
 	}
 	assertCommittedXDPObjectStrippedBTF(t, objPath)
-	ctMap := spec.Maps["conn_track"]
-	if ctMap == nil {
-		t.Fatalf("%s has no conn_track map", committedXDPObjectRel)
-	}
-	if got, want := ctMap.KeySize, uint32(connTrackKeySize); got != want {
-		t.Fatalf("committed conn_track KeySize = %d, want %d (ipv4_ct_tuple ABI: %d field bytes + %d trailing pad)",
-			got, want, connTrackKeyDataLen, connTrackKeySize-connTrackKeyDataLen)
-	}
+	assertConnTrackMapContract(t, spec, "conn_track", connTrackKeySize)
+	assertConnTrackMapContract(t, spec, "conn_track_v6", connTrackKeyV6Size)
 
 	if hasELFSymbol(t, objPath, "__packed") {
 		t.Fatalf("%s still contains an ELF symbol named __packed; regenerate it after removing the no-op C token", committedXDPObjectRel)
 	}
+}
+
+func assertConnTrackMapContract(t *testing.T, spec *ebpf.CollectionSpec, mapName string, wantKeySize int) {
+	t.Helper()
+	m := spec.Maps[mapName]
+	if m == nil {
+		t.Fatalf("%s has no %s map", committedXDPObjectRel, mapName)
+	}
+	if got, want := m.Pinning, ebpf.PinByName; got != want {
+		t.Fatalf("committed %s Pinning = %s, want %s so the AC loader pins it under /sys/fs/bpf/%s",
+			mapName, got, want, mapName)
+	}
+	if got, want := m.KeySize, uint32(wantKeySize); got != want {
+		t.Fatalf("committed %s KeySize = %d, want %d", mapName, got, want)
+	}
+	assertConnTrackValueLayout(t, spec, mapName)
+}
+
+func assertConnTrackValueLayout(t *testing.T, spec *ebpf.CollectionSpec, mapName string) {
+	t.Helper()
+	m := spec.Maps[mapName]
+	if m == nil {
+		t.Fatalf("%s has no %s map", committedXDPObjectRel, mapName)
+	}
+	valueStruct, ok := btf.UnderlyingType(m.Value).(*btf.Struct)
+	if !ok {
+		t.Fatalf("committed %s value BTF = %T, want struct conn_value", mapName, m.Value)
+	}
+	assertBTFMemberOffset(t, mapName, valueStruct, "timestamp", connTrackValueTimestampOff)
+	assertBTFMemberOffset(t, mapName, valueStruct, "last_timestamp", connTrackValueLastTimestampOff)
+	assertBTFMemberOffset(t, mapName, valueStruct, "ttl_ns", connTrackValueTTLOff)
+}
+
+func assertBTFMemberOffset(t *testing.T, mapName string, st *btf.Struct, name string, wantBytes int) {
+	t.Helper()
+	for _, member := range st.Members {
+		if member.Name != name {
+			continue
+		}
+		if member.Offset%8 != 0 {
+			t.Fatalf("committed %s value member %s offset = %d bits, want byte-aligned offset %d", mapName, name, member.Offset, wantBytes)
+		}
+		if got := int(member.Offset.Bytes()); got != wantBytes {
+			t.Fatalf("committed %s value member %s offset = %d, want %d", mapName, name, got, wantBytes)
+		}
+		return
+	}
+	t.Fatalf("committed %s value BTF has no member %s", mapName, name)
 }
 
 func assertCommittedXDPObjectStrippedBTF(t *testing.T, path string) {

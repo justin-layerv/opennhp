@@ -5,7 +5,9 @@ package ac
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/log"
 	utilebpf "github.com/OpenNHP/opennhp/nhp/utils/ebpf"
@@ -16,15 +18,15 @@ import (
 // short-circuit otherwise lets established flows survive
 // allow-rule expiry.
 //
-// # Why we don't iterate conn_track here
+// # Why Flush doesn't iterate conn_track
 //
 // The XDP program (nhp/ebpf/xdp/nhp_ebpf_xdp.c) sets each
 // conn_track entry's `ttl_ns = expire_time - now_at_create`, so a
 // conn_track entry inherits the REMAINING lifetime of the
 // allow-rule at flow start. When `check_conn_expiry` fires at the
 // next packet, the entry is deleted by the XDP program itself and
-// the packet drops. We therefore do NOT need to iterate conn_track
-// on flush — deleting the allow-rule alone is sufficient for:
+// the packet drops. We therefore do NOT synchronously iterate
+// conn_track from Flush — deleting the allow-rule alone is sufficient for:
 //
 //   - blocking new flows: allow-rule lookup fails → XDP_DROP
 //   - terminating active flows: conn_track ttl_ns has expired at
@@ -32,11 +34,12 @@ import (
 //     were anchored to the same expire_time), so the next packet
 //     triggers check_conn_expiry → bpf_map_delete_elem → XDP_DROP
 //
-// **Quiet-flow residual** (acknowledged in
-// QUIET_STREAM_RESIDUAL.md): a connection with no traffic at the
-// moment of allow-rule deletion will linger in conn_track until
-// the next packet attempt — the user has signed up for the
-// ~25-second backend-side TCP keepalive recipe as the mitigation.
+// **Quiet-flow residual** (acknowledged in QUIET_STREAM_RESIDUAL.md): a
+// connection with no traffic at the moment of allow-rule deletion will not
+// trigger datapath GC on its own. ConntrackStats runs a metrics-path sampler
+// and quiet-entry reaper over conn_track / conn_track_v6 once per cache window
+// so dead quiet entries do not keep HASH maps saturated before the next packet
+// attempt; Flush stays latency-bounded and per-key.
 //
 // # Multi-map delete
 //
@@ -102,7 +105,25 @@ type BpfFlusher struct {
 	// dedicated per-direction counter is the lower-priority E5 follow-up the cr for
 	// E2 s5 flagged (#2778).
 	metricSkipped atomic.Uint64
+
+	statsMu sync.Mutex
+	statsAt time.Time
+	stats   BpfConntrackStats
+
+	conntrackSampleErrors    atomic.Uint64
+	conntrackPartialSamples  atomic.Uint64
+	conntrackExpiredReapedV4 atomic.Uint64
+	conntrackExpiredReapedV6 atomic.Uint64
 }
+
+const (
+	// Shorter than endpoints/metrics.flushInterval (60s today) by design:
+	// this dedupes the many conntrack GaugeFuncs inside one metrics flush,
+	// not across independent flush windows. Revisit if the publisher cadence
+	// drops below this value.
+	bpfConntrackStatsCacheTTL       = 30 * time.Second
+	bpfConntrackSampleSlowThreshold = 2 * time.Second
+)
 
 // NewBpfFlusher constructs a BpfFlusher. Returns nil error
 // unconditionally on Linux — the per-Flush LoadPinnedMap is the
@@ -118,6 +139,165 @@ func NewBpfFlusher() (*BpfFlusher, error) {
 // rather than the Scheduler's FlushMetrics (a flusher-implementation concern).
 func (f *BpfFlusher) SkippedCount() uint64 {
 	return f.metricSkipped.Load()
+}
+
+// ConntrackStats samples the pinned eBPF conntrack maps, reaps entries whose
+// XDP ttl has expired but whose flows went quiet, and returns a cached
+// cross-platform stats view for CloudWatch gauges. This is intentionally not a
+// pure getter: quiet-entry reclamation runs at metrics-flush cadence, and the
+// cache ensures the many GaugeFuncs in one flush share one map walk. statsMu is
+// held across that walk/delete pass; the work is bounded to once per cache
+// window, not once per gauge.
+func (f *BpfFlusher) ConntrackStats() BpfConntrackStats {
+	if f == nil {
+		return BpfConntrackStats{}
+	}
+
+	now := time.Now()
+	f.statsMu.Lock()
+	defer f.statsMu.Unlock()
+	if !f.statsAt.IsZero() && now.Sub(f.statsAt) < bpfConntrackStatsCacheTTL {
+		return f.stats
+	}
+
+	sampleStart := time.Now()
+	raw, err := utilebpf.SampleAndReapConnTrack()
+	sampleElapsed := time.Since(sampleStart)
+	slowSample := sampleElapsed > bpfConntrackSampleSlowThreshold
+	if slowSample {
+		if err != nil {
+			log.Warning("[BpfFlusher] conntrack stats/reaper sample took %s (> %s) and failed: %v; full HASH map walks may delay metrics publishing (see nhp#2928)",
+				sampleElapsed, bpfConntrackSampleSlowThreshold, err)
+		} else {
+			log.Warning("[BpfFlusher] conntrack stats/reaper sample took %s (> %s); full HASH map walks may delay metrics publishing (v4=%d/%d v6=%d/%d, see nhp#2928)",
+				sampleElapsed, bpfConntrackSampleSlowThreshold, raw.V4.Entries, raw.V4.MaxEntries, raw.V6.Entries, raw.V6.MaxEntries)
+		}
+	}
+	if err != nil {
+		// SampleErrors is per refresh attempt (a joined v4/v6 sample/reap
+		// pass); PartialSamples below is per family because HASH iteration can
+		// abort in one map while the other family returns a complete sample.
+		f.conntrackSampleErrors.Add(1)
+		if !slowSample {
+			log.Warning("[BpfFlusher] conntrack stats/reaper sample failed: %v", err)
+		}
+	}
+	if raw.V4.PartialSample {
+		f.conntrackPartialSamples.Add(1)
+		log.Warning("[BpfFlusher] conntrack v4 stats/reaper sample was partial; occupancy may undercount during high churn")
+	}
+	if raw.V6.PartialSample {
+		f.conntrackPartialSamples.Add(1)
+		log.Warning("[BpfFlusher] conntrack v6 stats/reaper sample was partial; occupancy may undercount during high churn")
+	}
+	f.conntrackExpiredReapedV4.Add(raw.V4.ExpiredDeleted)
+	f.conntrackExpiredReapedV6.Add(raw.V6.ExpiredDeleted)
+
+	nextStats := bpfConntrackStatsFromRaw(
+		raw,
+		f.conntrackSampleErrors.Load(),
+		f.conntrackPartialSamples.Load(),
+		f.conntrackExpiredReapedV4.Load(),
+		f.conntrackExpiredReapedV6.Load(),
+	)
+	nextStats.SampleDurationSeconds = sampleElapsed.Seconds()
+	f.stats = bpfConntrackStatsPreserveConservativeOccupancy(nextStats, f.stats, raw, err)
+	f.statsAt = time.Now()
+	return f.stats
+}
+
+func bpfConntrackStatsFromRaw(raw utilebpf.ConnTrackStats, sampleErrors, partialSamples, expiredReapedV4, expiredReapedV6 uint64) BpfConntrackStats {
+	v4Entries := bpfConntrackPostReapEntries(raw.V4)
+	v6Entries := bpfConntrackPostReapEntries(raw.V6)
+	return BpfConntrackStats{
+		V4Entries:          v4Entries,
+		V4MaxEntries:       raw.V4.MaxEntries,
+		V4UsagePercent:     bpfConntrackUsagePercent(v4Entries, raw.V4.MaxEntries),
+		V4OldestAgeSeconds: bpfConntrackAgeSeconds(raw.V4.OldestAgeNanos),
+		V4ExpiredReaped:    expiredReapedV4,
+		V6Entries:          v6Entries,
+		V6MaxEntries:       raw.V6.MaxEntries,
+		V6UsagePercent:     bpfConntrackUsagePercent(v6Entries, raw.V6.MaxEntries),
+		V6OldestAgeSeconds: bpfConntrackAgeSeconds(raw.V6.OldestAgeNanos),
+		V6ExpiredReaped:    expiredReapedV6,
+		SampleErrors:       sampleErrors,
+		PartialSamples:     partialSamples,
+	}
+}
+
+func bpfConntrackStatsPreserveConservativeOccupancy(next, previous BpfConntrackStats, raw utilebpf.ConnTrackStats, sampleErr error) BpfConntrackStats {
+	if sampleErr != nil && bpfConntrackMapStatsLacksUsableOccupancy(raw.V4) {
+		next.V4Entries = previous.V4Entries
+		next.V4MaxEntries = previous.V4MaxEntries
+		next.V4UsagePercent = previous.V4UsagePercent
+		next.V4OldestAgeSeconds = previous.V4OldestAgeSeconds
+	}
+	if sampleErr != nil && bpfConntrackMapStatsLacksUsableOccupancy(raw.V6) {
+		next.V6Entries = previous.V6Entries
+		next.V6MaxEntries = previous.V6MaxEntries
+		next.V6UsagePercent = previous.V6UsagePercent
+		next.V6OldestAgeSeconds = previous.V6OldestAgeSeconds
+	}
+	if raw.V4.PartialSample {
+		next = bpfConntrackStatsPreservePartialV4(next, previous)
+	}
+	if raw.V6.PartialSample {
+		next = bpfConntrackStatsPreservePartialV6(next, previous)
+	}
+	return next
+}
+
+func bpfConntrackStatsPreservePartialV4(next, previous BpfConntrackStats) BpfConntrackStats {
+	if next.V4UsagePercent < previous.V4UsagePercent {
+		next.V4Entries = previous.V4Entries
+		next.V4MaxEntries = previous.V4MaxEntries
+		next.V4UsagePercent = previous.V4UsagePercent
+	}
+	if next.V4OldestAgeSeconds < previous.V4OldestAgeSeconds {
+		next.V4OldestAgeSeconds = previous.V4OldestAgeSeconds
+	}
+	return next
+}
+
+func bpfConntrackStatsPreservePartialV6(next, previous BpfConntrackStats) BpfConntrackStats {
+	if next.V6UsagePercent < previous.V6UsagePercent {
+		next.V6Entries = previous.V6Entries
+		next.V6MaxEntries = previous.V6MaxEntries
+		next.V6UsagePercent = previous.V6UsagePercent
+	}
+	if next.V6OldestAgeSeconds < previous.V6OldestAgeSeconds {
+		next.V6OldestAgeSeconds = previous.V6OldestAgeSeconds
+	}
+	return next
+}
+
+func bpfConntrackMapStatsLacksUsableOccupancy(stats utilebpf.ConnTrackMapStats) bool {
+	if stats.SampleError {
+		// A wrong or mismatched pinned map can still report MaxEntries; do not
+		// treat that alone as usable occupancy after a sample error.
+		return stats.Entries == 0 && stats.OldestAgeNanos == 0 && stats.ExpiredDeleted == 0
+	}
+	return stats.Entries == 0 && stats.MaxEntries == 0 && stats.OldestAgeNanos == 0 && stats.ExpiredDeleted == 0
+}
+
+func bpfConntrackPostReapEntries(stats utilebpf.ConnTrackMapStats) uint64 {
+	if stats.ExpiredDeleted >= stats.Entries {
+		return 0
+	}
+	// ExpiredDeleted only includes successful map deletes; failed deletes stay
+	// in this occupancy count so usage alarms remain conservative.
+	return stats.Entries - stats.ExpiredDeleted
+}
+
+func bpfConntrackUsagePercent(entries, maxEntries uint64) float64 {
+	if maxEntries == 0 {
+		return 0
+	}
+	return 100 * float64(entries) / float64(maxEntries)
+}
+
+func bpfConntrackAgeSeconds(ageNanos uint64) float64 {
+	return float64(ageNanos) / float64(time.Second)
 }
 
 // Flush implements FlowFlusher. Deletes the allow-rule entry for

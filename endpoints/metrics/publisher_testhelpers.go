@@ -13,6 +13,7 @@ import (
 	"io"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
@@ -37,6 +38,13 @@ func NewPublisherForTest(t testing.TB) *Publisher {
 		stop:        make(chan struct{}),
 		emfWriter:   io.Discard,
 	}
+}
+
+// FlushIntervalForTest exposes the publisher flush cadence to external-package
+// tests that need to fence cross-package timing invariants.
+func FlushIntervalForTest(t testing.TB) time.Duration {
+	t.Helper()
+	return flushInterval
 }
 
 // NewPublisherForTestWithEMFBuffer is like NewPublisherForTest but routes

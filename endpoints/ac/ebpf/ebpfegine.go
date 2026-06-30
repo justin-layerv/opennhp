@@ -124,6 +124,12 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 	}
 
 	var objs bpfObjects
+	// Loading xdp_white_prog loads every map it references, including maps we do
+	// not keep Go handles for (conn_track_v6 and the v6 allow-rule maps).
+	// Those maps declare LIBBPF_PIN_BY_NAME in the XDP object; with this PinPath,
+	// conn_track and conn_track_v6 are pinned together whenever EBPFXDP starts.
+	// If a future loader supports a v4-only object, update the joined conntrack
+	// sampler/reaper before flipping it so a legitimate absent v6 map does not page.
 	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{
 			PinPath: "/sys/fs/bpf/", // automatically mounted to

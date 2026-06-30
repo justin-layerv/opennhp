@@ -1077,12 +1077,11 @@ func removeCheckpoint(dir string) {
 // checkpoint. The caller must be holding mp.mu so the maps cannot mutate
 // underneath us.
 //
-// gaugeFuncs is intentionally NOT included: gauge functions are pure
-// closures that re-derive their value from live process state on every
-// flush, so they cannot meaningfully survive a process crash. Whatever
-// gauge functions exist after restart are re-registered by the same setup
-// code that registered them the first time, and the next flush will pick
-// up their current values.
+// gaugeFuncs is intentionally NOT included: they are process-local closures
+// that may read or maintain live process/kernel state on every flush, so they
+// cannot meaningfully survive a process crash. Whatever gauge functions exist
+// after restart are re-registered by the same setup code that registered them
+// the first time, and the next flush will pick up their current values.
 func (mp *Publisher) snapshotToCheckpoint() *checkpoint {
 	cp := &checkpoint{
 		Version:   checkpointSchemaVersion,
