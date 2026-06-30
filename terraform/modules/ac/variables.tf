@@ -216,7 +216,7 @@ variable "ipset_temp_timeout" {
 }
 
 variable "ipset_max_elements" {
-  description = "Maximum number of entries per ipset (defaultset, tempset, etc.). Applied per-ipset; AC creates 6 sets (3 IPv4 + 3 IPv6), so worst-case kernel residency per instance is 6 × ipset_max_elements. Caps kernel memory consumption from ipset population attacks; was 1,000,000 before #1160 T3-08. Default of 10,000 sized to the worst-case legitimate ceiling: 80 pps sustained × 120s defaultset timeout ≈ 9,600 concurrent entries, rounded up. Sandbox and prod both observe 0 entries at steady state; the cap bounds the attack ceiling, not typical load."
+  description = "Maximum number of entries per ipset (defaultset, tempset, etc.). Applied per-ipset; AC creates 6 sets (3 IPv4 + 3 IPv6), so worst-case kernel residency per instance is 6 × ipset_max_elements. Caps kernel memory consumption from ipset population attacks; was 1,000,000 before #1160 T3-08. Default of 10,000 sized to the worst-case legitimate ceiling: 80 pps sustained × 120s defaultset timeout ≈ 9,600 concurrent entries, rounded up. Sandbox and prod both observe 0 entries at steady state; the cap bounds the attack ceiling, not typical load. #2163 confirmed this cap stays and rejected an 8M bump; see docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md 'ipset maxelem'."
   type        = number
   default     = 10000
 

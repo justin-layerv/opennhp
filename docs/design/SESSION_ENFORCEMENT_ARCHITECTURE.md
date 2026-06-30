@@ -228,7 +228,8 @@ and the E5 flip-readiness work tracked in
 
 `MAX_ENTRIES` is **1,000,000** (uniform across all maps) at time of writing.
 #2163 targets 1M+ concurrent sessions and floats sizing each map at 2× the
-8M ipset ceiling (i.e. 16M). **We deliberately do *not* adopt 16M**, and the
+8M ipset bump it proposed (i.e. 16M; that 8M premise is itself rejected — see
+"ipset `maxelem`" below). **We deliberately do *not* adopt 16M**, and the
 type fix above is independent of the eventual ceiling. The kernel-memory math
 is why.
 
@@ -252,10 +253,14 @@ BPF `HASH` maps **preallocate** all element + bucket memory at map-creation
 sandbox ACs are `t3.medium` (4 GB) — see `terraform/modules/ac/main.tf`.
 A 16M sizing (~10.5 GB) is physically impossible on either: the AC would fail
 to load the `.o` at boot. Even 2M (~1.31 GB) is a meaningful fraction of an
-8 GB box that *also* carries the 8M ipset (~640 MB, #2163 item 1) and the
-in-memory `tokenStore` (~500 MB at 1M sessions, #2163 item 3) and the Go
-heap. The correct `max_entries` is therefore **coupled to the AC
-instance-type decision (#2163 item 3)** — it cannot be chosen in isolation.
+8 GB box that *also* carries the ipset (a capped security backstop — ≤1M
+entries by validation, default 10k; **not** the 8M item 1 originally floated —
+see "ipset `maxelem`" below) and the in-memory `tokenStore` (~500 MB at 1M
+sessions — a floor, since qURL v2 keyed-identity metadata and the L3-flush
+`scheduledKeys` map were added to `AccessEntry` after that estimate; #2163
+item 3) and the Go heap. The correct `max_entries` is therefore **coupled to
+the AC instance-type decision (#2163 item 3)** — it cannot be chosen in
+isolation.
 
 **Decision for this slice:** keep `MAX_ENTRIES = 1,000,000`. The HASH map-type
 security fix is correct and shippable at any size, and is inert in prod
@@ -265,6 +270,41 @@ review; the recommended target is **2M (not 16M)** unless instance RAM grows,
 and any bump must re-run the memory math above against the chosen instance
 type. Tracked as a concrete flip-time task in
 [nhp#2813](https://github.com/layervai/nhp/issues/2813) (under #2163 item 2).
+
+#### ipset `maxelem` (#2163 item 1): a capped security backstop, not a scale lever
+
+[#2163](https://github.com/layervai/nhp/issues/2163) item 1 proposed bumping the
+ipset `maxelem` to **8M** so the **iptables/ipset** datapath could admit 1M+
+concurrent sessions. **We deliberately do not do this.** `ipset_max_elements`
+(`terraform/modules/ac/variables.tf`) stays a **security backstop** — default
+**10,000**, hard-validated ceiling **1,000,000** — set by #1160 T3-08 (landed in
+#1506) to bound a population-flood DoS. Three reasons the 8M bump is the wrong
+lever:
+
+1. **It reintroduces the DoS surface #1506 closed.** The cap bounds
+   kernel-memory growth from an attacker flooding the knock path; 8M removes that
+   bound. The AC creates **6 sets** per instance (3 IPv4 + 3 IPv6), so the
+   worst-case is `6 × maxelem`, not one set.
+2. **The worst-case kernel-memory cost is infeasible.** ipset hash types grow
+   *dynamically* (memory ∝ *actual* entries, capped at `maxelem` — unlike the BPF
+   maps above, which preallocate at load), so at typical load the cap costs
+   ~nothing. But the worst case 8M would unlock is ~640 MB/set × 6 ≈ **3.8 GB** of
+   unswappable kernel memory, on top of the BPF maps and `tokenStore` on the same
+   8 GB box. Even the 1M ceiling is ~80 MB/set worst-case. (That ~80 B/entry is a
+   per-set-type blend — the `hash:ip,port,ip` sets (`defaultset`, `defaultset_down`)
+   run larger than the `hash:net,port` `tempset` — so treat these as
+   order-of-magnitude, not exact.)
+3. **The 1M-session scale step rides the eBPF/XDP datapath, not ipset growth.**
+   At scale, allow-rules live in the BPF `HASH` maps (sized under
+   [nhp#2813](https://github.com/layervai/nhp/issues/2813); recommended 2M, *not*
+   16M), reached only after the FilterMode flip. The ipset path is the pre-flip
+   datapath, so its `maxelem` is sized to the **legitimate-traffic ceiling**
+   (80 pps × 120 s ≈ 9.6k, rounded to 10k), not the 1M-session target.
+
+If the ipset datapath ever had to carry production scale *before* the flip, that
+is a paired **instance-type + security sign-off** decision (the same gate #2813
+puts on the BPF bump) — never a unilateral `maxelem` bump. The `max_entries` and
+`maxelem` levers are co-decided.
 
 #### IPv6 maps: `MAX_ENTRIES_V6` (separate, right-sized ceiling)
 
