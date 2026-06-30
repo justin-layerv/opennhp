@@ -76,8 +76,9 @@ func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 	gotAOP := make(map[string]bool)
 	go func() {
 		for md := range sendCh {
+			addr := md.ConnData.RemoteAddr.String()
 			mu.Lock()
-			gotAOP[md.ConnData.RemoteAddr.String()] = true
+			gotAOP[addr] = true
 			if gotAOP[alphaAddr] && gotAOP[betaAddr] {
 				bothObserved.Do(func() { close(bothLocalAOPs) })
 			}

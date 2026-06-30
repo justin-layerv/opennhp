@@ -56,6 +56,17 @@ def find_policy_statement(terraform_root: Path, policy_name: str, sid: str) -> d
     raise AssertionError(f"aws_iam_policy.{policy_name} not found")
 
 
+def find_policy_expression(terraform_root: Path, policy_name: str) -> str:
+    for _file, rtype, name, body in iter_resources(parse_tf_files(terraform_root)):
+        if rtype != "aws_iam_policy" or name != policy_name:
+            continue
+        policy = body.get("policy")
+        if not isinstance(policy, str):
+            raise AssertionError(f"aws_iam_policy.{policy_name} policy is not a string expression")
+        return " ".join(policy.split())
+    raise AssertionError(f"aws_iam_policy.{policy_name} not found")
+
+
 def policy_fixture(
     *extra_statements: str,
     ssm_resources: tuple[str, ...] = DEFAULT_SSM_RESOURCES,
@@ -631,6 +642,44 @@ class TerraformPlanPrBootstrapTests(unittest.TestCase):
         )
         self.assertNotIn("arn:aws:iam::${local.account_id}:role/nhp-*-github-actions*", resources)
         self.assertNotIn("arn:aws:iam::${local.account_id}:role/nhp-*", resources)
+
+
+class DynamoDBReadPolicyTests(unittest.TestCase):
+    def test_qurl_agent_keys_read_is_narrowly_scoped(self) -> None:
+        policy = find_policy_expression(REPO_ROOT / "terraform", "dynamodb_read")
+        broad_start = policy.index('Sid = "DynamoDBReadAccess"')
+        get_start = policy.index('Sid = "DynamoDBQurlAgentKeysGetItem"')
+        query_start = policy.index('Sid = "DynamoDBQurlAgentKeysPubkeyIndexQuery"')
+        next_start = policy.index("var.kms_key_arn", query_start)
+
+        broad_stmt = policy[broad_start:get_start]
+        self.assertNotIn("qurl_agent_keys", broad_stmt)
+
+        agent_conditional = policy[policy.rindex("var.deploy_qurl_tables ? [", 0, get_start):next_start]
+        self.assertIn('Action = ["dynamodb:GetItem"]', agent_conditional)
+        self.assertIn('Action = ["dynamodb:Query"]', agent_conditional)
+        self.assertNotIn("Resource = []", agent_conditional)
+
+        get_stmt = policy[get_start:query_start]
+        self.assertIn('Action = ["dynamodb:GetItem"]', get_stmt)
+        self.assertIn("Resource = aws_dynamodb_table.qurl_agent_keys[0].arn", get_stmt)
+        self.assertNotIn("dynamodb:Query", get_stmt)
+        self.assertNotIn("pubkey-index", get_stmt)
+
+        query_stmt = policy[query_start:next_start]
+        self.assertIn('Action = ["dynamodb:Query"]', query_stmt)
+        self.assertIn(
+            'Resource = "${aws_dynamodb_table.qurl_agent_keys[0].arn}/index/pubkey-index"',
+            query_stmt,
+        )
+        self.assertNotIn("dynamodb:GetItem", query_stmt)
+        self.assertNotIn("Resource = aws_dynamodb_table.qurl_agent_keys[0].arn", query_stmt)
+
+        for stmt in (get_stmt, query_stmt):
+            self.assertNotIn("dynamodb:Scan", stmt)
+            self.assertNotIn("dynamodb:PutItem", stmt)
+            self.assertNotIn("dynamodb:UpdateItem", stmt)
+            self.assertNotIn("${aws_dynamodb_table.qurl_agent_keys[0].arn}/index/*", stmt)
 
 
 if __name__ == "__main__":

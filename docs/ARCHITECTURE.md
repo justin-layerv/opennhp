@@ -222,7 +222,9 @@ not pre-registration (parallel to the AC `license validation` path above):
                                                      agentPeerMap
 ```
 
-See `endpoints/server/agent_peer_lookup.go` for the implementation contract.
+See `endpoints/server/agent_peer_lookup.go` for the implementation contract and
+`docs/design/QURL_AGENT_KEYS_SCHEMA.md` for the cross-repo DynamoDB schema
+contract shared with qurl-service.
 
 ##### Revocation horizon
 
@@ -245,57 +247,32 @@ trigger an ASG instance refresh in the same operation if the agent is currently
 trusted by any running server — without the refresh, the agent stays trusted on
 existing instances until they cycle.
 
-##### Cross-tenant pubkey uniqueness (deferred-mitigation)
+##### Cross-tenant pubkey uniqueness
 
-Pubkey uniqueness in `qurl-agent-keys` is enforced **only by a writer-side soft
-check** in qurl-service (`internal/repository/dynamodb/agent_keys_repo.go::Upsert`):
-on every write, the writer reads the `pubkey-index` GSI; if the pubkey is already
-registered to a different `owner_id`, it emits a WARN log and **proceeds with the
-write**. The check is eventually consistent (GSI is eventually consistent), so
-there is a false-negative window during a tight squat race.
+The schema and rollout contract for this table lives in
+`docs/design/QURL_AGENT_KEYS_SCHEMA.md`.
 
-**Auth implication:** an attacker who wins the writer-side soft-uniqueness race
-against a victim tenant can register the victim's pubkey under their own
-`owner_id`. The reader (`AgentPeerLookup`) admits whichever row DDB returns
-first (`Items[0]`), so subsequent agent requests with that pubkey **can be
-attributed to the wrong `owner_id`** until the squatter's row is removed.
-Multi-tenant separation at the qurl-service auth layer cannot reverse this from
-the cached peer alone — the reader-side observation is "pubkey X → admit," not
-"pubkey X belongs to owner Y."
+qurl-service enforces pubkey uniqueness at write time with the #488 claim-row
+transaction (`qurl-service` PR #1037). `AgentPeerLookup.queryAndCache` still
+issues the KEYS_ONLY GSI Query with `Limit=2` (not `Limit=1`) as defense in
+depth, then uses the projected `(owner_id, agent_id)` to `GetItem` the base row
+for `schema_version`. If `Items > 1`, nhp-server emits
+`MetricAgentLookupPubkeyCollision`, logs `event="agent_lookup_pubkey_collision"`,
+and rejects the knock fail-closed instead of admitting an arbitrary row.
 
-**Defense-in-depth signals today:**
+A non-zero collision metric now means legacy duplicate data, manual table
+mutation, or a writer invariant regression. Reconcile the duplicate rows before
+allowing the agent path to proceed.
 
-- `AgentPeerLookup.queryAndCache` issues the GSI Query with `Limit=2` (not
-  `Limit=1`) and emits `MetricAgentLookupPubkeyCollision` + a WARN log whenever
-  `Items > 1`. This is a forensic signal, not a fix — the resolver still admits
-  `Items[0]`.
-- The hard fix is tracked in qurl-service issue #488 (TransactWriteItems against
-  a claims sidecar table to enforce true uniqueness at write time).
+**Detection still has a temporal blind spot.** The collision check runs only
+inside `queryAndCache`, which is the first-resolve/LRU-miss path. Once a pubkey
+is pinned in `UdpServer.agentPeerMap` (no TTL, no eviction), later knocks from
+that agent short-circuit at the `alreadyKnown` check in
+`resolveAgentPeerForKnock` and do not re-query DDB. Active-knock revocation and
+bounded revalidation are tracked in #1943.
 
-**Detection has a temporal blind spot.** The collision metric / WARN only fires
-inside `queryAndCache`, which runs ONLY on the LRU-miss path. Once a pubkey is
-pinned in `UdpServer.agentPeerMap` (no TTL, no eviction), every subsequent knock
-from that agent short-circuits at the `alreadyKnown` check in
-`resolveAgentPeerForKnock` and the DDB lookup never reruns. Consequence:
-
-- A cross-tenant squat that lands *before* the victim's first knock is observable
-  (both rows are visible at first-resolve time, the WARN fires).
-- A cross-tenant squat that lands *after* the victim's first knock — the more
-  realistic attack window — is NOT observable by the reader. The victim's
-  resolution is already pinned; subsequent knocks short-circuit before the GSI
-  Query. The squatter only becomes visible on the *next* process restart (or if
-  active-knock revocation #1943 ever lands and evicts the pin).
-
-For the post-first-knock attack window, the only signal today is the writer-side
-WARN log in qurl-service (`Upsert`'s soft-uniqueness check) — same forensic
-limitation as the reader's, scoped to the qurl-service log stream.
-
-Until #488 lands, operators monitoring the cross-tenant attack class should watch
-the `MetricAgentLookupPubkeyCollision` counter (covers the pre-first-knock window
-only) AND the qurl-service writer-side WARN log (covers the post-first-knock
-window). An alarm on this metric — and on the four sibling agent-lookup
-metrics — is tracked in nhp issue #1955; the counters themselves ship in PR
-#1833.
+An alarm on this metric — and on the four sibling agent-lookup metrics — is
+tracked in nhp issue #1955; the counters themselves ship in PR #1833.
 
 ---
 

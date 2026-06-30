@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
+	"github.com/layervai/nhp/internalauth"
 )
 
 // TestResolveAgentPeerForKnock_HappyPath asserts that on a fresh
@@ -303,6 +305,157 @@ func TestResolveAgentPeerForKnock_DDBErrorRejects(t *testing.T) {
 	}
 	if c := counters[MetricAuthFailure]; c != 0 {
 		t.Errorf("MetricAuthFailure counter=%v want 0 on ddb error (split to MetricAgentLookupDDBError)", c)
+	}
+}
+
+// TestResolveAgentPeerForKnock_SchemaMismatchRejectsSeparately asserts an
+// explicit unsupported qurl-agent-keys schema version rejects with the same wire
+// error as unknown/DDB errors, but increments its own contract metric instead of
+// AuthFailure or DDBError.
+func TestResolveAgentPeerForKnock_SchemaMismatchRejectsSeparately(t *testing.T) {
+	pk := pubkeyB64(0x2A)
+	q := newFakeAgentKeysQuerier()
+	q.putWithSchemaVersion(pk, "owner-schema", "agent-schema", internalauth.QURLAgentKeysSchemaVersion+1)
+
+	lookup := newTestLookup(t, q)
+	publisher := metrics.NewPublisherForTest(t)
+	lookup.SetMetrics(publisher)
+	s := &UdpServer{
+		metrics:         publisher,
+		agentPeerMap:    map[string]*core.UdpPeer{},
+		agentPeerLookup: lookup,
+	}
+
+	rawPubkey := decodeB64(t, pk)
+	ppd := &core.PacketParserData{
+		HeaderType:   core.NHP_KNK,
+		RemotePubKey: rawPubkey,
+		ConnData: &core.ConnectionData{
+			RemoteAddr: &net.UDPAddr{IP: net.ParseIP("203.0.113.42"), Port: 5555},
+		},
+	}
+	knkMsg := &common.AgentKnockMsg{UserId: "user-schema"}
+	ackMsg := &common.ServerKnockAckMsg{}
+
+	err := s.resolveAgentPeerForKnock(ppd, knkMsg, ackMsg, 42, "203.0.113.42:5555")
+	if !errors.Is(err, common.ErrKnockServerNotFound) {
+		t.Fatalf("err=%v want ErrKnockServerNotFound", err)
+	}
+	if ackMsg.ErrCode != common.ErrKnockServerNotFound.ErrorCode() {
+		t.Errorf("ackMsg.ErrCode=%q want %q", ackMsg.ErrCode, common.ErrKnockServerNotFound.ErrorCode())
+	}
+
+	counters, _ := s.metrics.CountersForTest(t)
+	if c := counters[MetricAgentLookupSchemaMismatch]; c != 1 {
+		t.Errorf("MetricAgentLookupSchemaMismatch counter=%v want 1", c)
+	}
+	if c := counters[MetricAgentLookupDDBError]; c != 0 {
+		t.Errorf("MetricAgentLookupDDBError counter=%v want 0 on schema mismatch", c)
+	}
+	if c := counters[MetricAuthFailure]; c != 0 {
+		t.Errorf("MetricAuthFailure counter=%v want 0 on schema mismatch", c)
+	}
+}
+
+// TestResolveAgentPeerForKnock_PubkeyCollisionRejectsSeparately asserts a
+// qurl-agent-keys pubkey-index collision rejects with the same wire error as
+// unknown/DDB errors, but stays out of the DDBError/AuthFailure buckets. The
+// collision metric is emitted by AgentPeerLookup itself because direct lookup
+// callers also need the forensic signal.
+func TestResolveAgentPeerForKnock_PubkeyCollisionRejectsSeparately(t *testing.T) {
+	pk := pubkeyB64(0x2B)
+	lookup := newTestLookup(t, &collidingAgentKeysQuerier{pk: pk})
+	publisher := metrics.NewPublisherForTest(t)
+	lookup.SetMetrics(publisher)
+
+	s := &UdpServer{
+		metrics:         publisher,
+		agentPeerMap:    map[string]*core.UdpPeer{},
+		agentPeerLookup: lookup,
+	}
+
+	rawPubkey := decodeB64(t, pk)
+	ppd := &core.PacketParserData{
+		HeaderType:   core.NHP_KNK,
+		RemotePubKey: rawPubkey,
+		ConnData: &core.ConnectionData{
+			RemoteAddr: &net.UDPAddr{IP: net.ParseIP("203.0.113.43"), Port: 5556},
+		},
+	}
+	knkMsg := &common.AgentKnockMsg{UserId: "user-collision"}
+	ackMsg := &common.ServerKnockAckMsg{}
+
+	err := s.resolveAgentPeerForKnock(ppd, knkMsg, ackMsg, 43, "203.0.113.43:5556")
+	if !errors.Is(err, common.ErrKnockServerNotFound) {
+		t.Fatalf("err=%v want ErrKnockServerNotFound", err)
+	}
+	if ackMsg.ErrCode != common.ErrKnockServerNotFound.ErrorCode() {
+		t.Errorf("ackMsg.ErrCode=%q want %q", ackMsg.ErrCode, common.ErrKnockServerNotFound.ErrorCode())
+	}
+
+	counters, _ := s.metrics.CountersForTest(t)
+	if c := counters[MetricAgentLookupPubkeyCollision]; c != 1 {
+		t.Errorf("MetricAgentLookupPubkeyCollision counter=%v want 1", c)
+	}
+	if c := counters[MetricAgentLookupDDBError]; c != 0 {
+		t.Errorf("MetricAgentLookupDDBError counter=%v want 0 on pubkey collision", c)
+	}
+	if c := counters[MetricAuthFailure]; c != 0 {
+		t.Errorf("MetricAuthFailure counter=%v want 0 on pubkey collision", c)
+	}
+}
+
+// TestResolveAgentPeerForKnock_PubkeyCandidateOverflowRejectsSeparately asserts
+// an over-cap pubkey-index candidate set rejects with the same wire error as a
+// collision, but increments its own metric so alarms can distinguish one-owner
+// row sprawl from a true cross-owner key collision.
+func TestResolveAgentPeerForKnock_PubkeyCandidateOverflowRejectsSeparately(t *testing.T) {
+	pk := pubkeyB64(0x2C)
+	rows := make([]map[string]types.AttributeValue, 0, agentPeerLookupMaxProjectedRows+1)
+	for i := 0; i < agentPeerLookupMaxProjectedRows+1; i++ {
+		rows = append(rows, agentKeyTestRow(pk, "owner-overflow", fmt.Sprintf("agent-overflow-%02d", i)))
+	}
+	lookup := newTestLookup(t, &orderedAgentKeysQuerier{rows: rows})
+	publisher := metrics.NewPublisherForTest(t)
+	lookup.SetMetrics(publisher)
+
+	s := &UdpServer{
+		metrics:         publisher,
+		agentPeerMap:    map[string]*core.UdpPeer{},
+		agentPeerLookup: lookup,
+	}
+
+	rawPubkey := decodeB64(t, pk)
+	ppd := &core.PacketParserData{
+		HeaderType:   core.NHP_KNK,
+		RemotePubKey: rawPubkey,
+		ConnData: &core.ConnectionData{
+			RemoteAddr: &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 5557},
+		},
+	}
+	knkMsg := &common.AgentKnockMsg{UserId: "user-overflow"}
+	ackMsg := &common.ServerKnockAckMsg{}
+
+	err := s.resolveAgentPeerForKnock(ppd, knkMsg, ackMsg, 44, "203.0.113.44:5557")
+	if !errors.Is(err, common.ErrKnockServerNotFound) {
+		t.Fatalf("err=%v want ErrKnockServerNotFound", err)
+	}
+	if ackMsg.ErrCode != common.ErrKnockServerNotFound.ErrorCode() {
+		t.Errorf("ackMsg.ErrCode=%q want %q", ackMsg.ErrCode, common.ErrKnockServerNotFound.ErrorCode())
+	}
+
+	counters, _ := s.metrics.CountersForTest(t)
+	if c := counters[MetricAgentLookupPubkeyCandidateOverflow]; c != 1 {
+		t.Errorf("MetricAgentLookupPubkeyCandidateOverflow counter=%v want 1", c)
+	}
+	if c := counters[MetricAgentLookupPubkeyCollision]; c != 0 {
+		t.Errorf("MetricAgentLookupPubkeyCollision counter=%v want 0 on candidate overflow", c)
+	}
+	if c := counters[MetricAgentLookupDDBError]; c != 0 {
+		t.Errorf("MetricAgentLookupDDBError counter=%v want 0 on candidate overflow", c)
+	}
+	if c := counters[MetricAuthFailure]; c != 0 {
+		t.Errorf("MetricAuthFailure counter=%v want 0 on candidate overflow", c)
 	}
 }
 

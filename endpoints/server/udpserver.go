@@ -777,8 +777,10 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		s.metrics.IncrCounter(MetricAgentLookupInitFailure)
 	}
 	// Thread the publisher into the agent peer lookup so its forensic
-	// counters (MetricAgentLookupPubkeyCollision today; future
-	// additions here) emit. Same init-order reason as the deferred
+	// counters (MetricAgentLookupSchemaMismatch,
+	// MetricAgentLookupPubkeyCollision, and
+	// MetricAgentLookupPubkeyCandidateOverflow today; future additions
+	// here) emit. Same init-order reason as the deferred
 	// agentLookupInitFailed emit above: the lookup is constructed
 	// ~40 lines before s.metrics exists.
 	//

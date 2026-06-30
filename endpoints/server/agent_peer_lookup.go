@@ -38,6 +38,7 @@ import (
 
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/layervai/nhp/internalauth"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
@@ -81,10 +82,25 @@ const (
 	// wouldn't catch.
 	unwrapMaxHops = 16
 
-	// agentPeerLookupIndexName is the GSI hashed on public_key.
-	// Owned by terraform/modules/dynamodb (qurl_agent_keys table);
-	// any rename there must mirror here.
-	agentPeerLookupIndexName = "pubkey-index"
+	// agentPeerLookupIndexName is the GSI hashed on public_key. Defined in
+	// internalauth so nhp-server and qurl-service compile against the same
+	// contract instead of duplicating a string literal.
+	agentPeerLookupIndexName = internalauth.QURLAgentKeysPubkeyIndexName
+
+	// agentPeerLookupMaxProjectedRows bounds how many pubkey-index rows the
+	// reader will inspect for one public_key. Normal state is exactly one row;
+	// same-owner re-bootstrap duplicates are expected to be rare and small. If
+	// a GSI partition exceeds this cap, the reader rejects fail-closed instead
+	// of admitting before it can prove there is no hidden distinct-owner row.
+	// Raising this cap must revisit DynamoDBOperationTimeout because the Query
+	// and all candidate GetItems intentionally share one total resolve budget.
+	agentPeerLookupMaxProjectedRows = 16
+
+	// agentPeerLookupQueryLimit asks DynamoDB for one sentinel row beyond the
+	// inspected-row cap. That keeps exactly agentPeerLookupMaxProjectedRows
+	// same-owner candidates unambiguous while still rejecting 17+ candidates
+	// before issuing base-table GetItems.
+	agentPeerLookupQueryLimit = agentPeerLookupMaxProjectedRows + 1
 )
 
 // Lookup-error sentinels. HandleKnockRequest distinguishes these
@@ -128,6 +144,31 @@ var (
 	// so the more specific log line wins.
 	ErrAgentLookupMalformedRow = errors.New("agent peer lookup: malformed row from ddb")
 
+	// ErrAgentLookupSchemaMismatch signals that a qurl-agent-keys row
+	// declared a schema_version this reader does not understand. This is
+	// a writer/reader rollout contract failure, not a DDB outage and not
+	// an auth-policy reject. The knock still receives the generic reject;
+	// the distinct sentinel drives event="agent_lookup_schema_mismatch"
+	// and MetricAgentLookupSchemaMismatch for operator triage.
+	ErrAgentLookupSchemaMismatch = errors.New("agent peer lookup: unsupported qurl-agent-keys schema version")
+
+	// ErrAgentLookupPubkeyCollision signals that the pubkey-index GSI
+	// returned registration rows for more than one owner_id for a single
+	// public_key. qurl-service #488 now enforces one-owner-per-pubkey on
+	// writes; a distinct-owner collision here means legacy duplicate data,
+	// manual table mutation, or a writer invariant regression. The reader
+	// rejects fail-closed instead of admitting an arbitrary owner. Same-owner
+	// duplicate agent_id rows are unambiguous for auth and tolerated.
+	ErrAgentLookupPubkeyCollision = errors.New("agent peer lookup: qurl-agent-keys pubkey collision")
+
+	// ErrAgentLookupPubkeyCandidateOverflow signals that the pubkey-index GSI
+	// returned more same-owner candidates than the reader will inspect, or
+	// indicated another page after the sentinel query. This is fail-closed for
+	// the same reason as a true collision (an uninspected row could hide a
+	// distinct owner), but it has its own event/metric so alarms can distinguish
+	// "two owners share one key" from "one owner has too many sibling rows."
+	ErrAgentLookupPubkeyCandidateOverflow = errors.New("agent peer lookup: qurl-agent-keys pubkey candidate overflow")
+
 	// ErrAgentLookupInternal signals a programmer-error reachable
 	// only via a future regression in this package — e.g., a
 	// singleflight closure returning a non-*core.UdpPeer value
@@ -151,6 +192,7 @@ var (
 // the AC-assignment cache TTL (config-driven, adaptive).
 type AgentKeysQuerier interface {
 	Query(ctx context.Context, params *dynamodb.QueryInput, optFns ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
+	GetItem(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 }
 
 // counterIncrementer is the narrow metrics surface AgentPeerLookup
@@ -166,36 +208,34 @@ type counterIncrementer interface {
 
 // agentCacheEntry tags a cached peer with the time it was fetched
 // (so getCached can enforce the per-entry TTL on top of the LRU)
-// and the owner_id / agent_id projected for free by the pubkey-
-// index GSI's KEYS_ONLY projection. The metadata is surfaced in
-// the agent_resolved log line via CachedOwnerID and is otherwise
-// unused — the wire path operates on the *core.UdpPeer alone.
-// Empty strings are tolerated: an older writer row missing
-// owner_id should not break resolution; it just means the log
-// lacks the owner_id field for that pubkey.
+// and the owner_id read from the strongly-consistent qurl-agent-keys
+// base row. The metadata is surfaced in the agent_resolved log line
+// via CachedOwnerID and is otherwise unused — the wire path operates
+// on the *core.UdpPeer alone.
+// ownerID should be non-empty on cached entries because decodeProjectedAgentKeyRows
+// rejects missing base-table key attrs before the GetItem; empty CachedOwnerID
+// returns therefore indicate cache miss/expiry, not a tolerated partial row.
 type agentCacheEntry struct {
 	peer      *core.UdpPeer
 	fetchedAt time.Time
 	ownerID   string
-	agentID   string
 }
 
-// agentKeyRow mirrors the qurl-agent-keys row shape. Only fields
-// that the resolver actually consumes are unmarshaled — keeps the
-// cache footprint small. Today that's:
+// agentKeyRow is the shared qurl-agent-keys row contract. The alias is only a
+// transient DDB decode target; successful resolves cache the *core.UdpPeer plus
+// owner_id/agent_id metadata, not the full registration row. The resolver consumes:
 //
 //   - PublicKey: the GSI hash key; load-bearing for the cache
 //     pubkey identity.
 //   - OwnerID, AgentID: free attributes the pubkey-index GSI's
 //     KEYS_ONLY projection ships alongside public_key (the base
 //     table's hash and range keys; see
-//     terraform/modules/dynamodb/main.tf). Plumbed into the
-//     agent_resolved log + the pubkey-collision WARN log so
-//     triage can see which owner_id was admitted (or which two
-//     are colliding) without a follow-up scan-query against DDB.
-//
-// Other bootstrap-only fields (registered_at, last_seen_at, etc.)
-// are intentionally not unmarshaled.
+//     terraform/modules/dynamodb/main.tf). Used to fetch the
+//     strongly-consistent base row and to populate the
+//     pubkey-collision ERROR log so triage can see which owner_ids
+//     are colliding without a follow-up scan-query against DDB.
+//   - SchemaVersion: the reader/writer rollout gate for structural
+//     schema changes.
 //
 // Encoding contract: PublicKey is the same base64.StdEncoding
 // form (padded, standard alphabet) that the noise responder
@@ -207,11 +247,7 @@ type agentCacheEntry struct {
 // cache lookup at nhpauth.go uses StdEncoding; AddAgentPeer
 // would key on the un-normalized DDB form, so every knock
 // re-queries DDB and the warm path never fires).
-type agentKeyRow struct {
-	PublicKey string `dynamodbav:"public_key"`
-	OwnerID   string `dynamodbav:"owner_id"`
-	AgentID   string `dynamodbav:"agent_id"`
-}
+type agentKeyRow = internalauth.QURLAgentKeyRow
 
 // AgentPeerLookup is the per-process resolver for agent pubkey →
 // *UdpPeer. hashicorp/golang-lru/v2 is internally thread-safe;
@@ -257,11 +293,18 @@ type agentKeyRow struct {
 // (so a real bootstrap completes within RTT, not on TTL boundary).
 // Combined with DisableAgentPeerValidation=true at the responder,
 // an attacker reaching HandleKnockRequest with N unique random
-// pubkeys forces N DDB Queries against the pubkey-index GSI. The
-// UDP rate limiter (knock-pre-RL) caps incoming packets per single
-// source IP, so the per-IP bound on amplification is:
+// pubkeys forces N DDB Queries against the pubkey-index GSI. Random
+// unknown pubkeys stop there; strongly-consistent base-table GetItem
+// calls are only reached after the GSI has returned at least one
+// projected row. A valid pre-cache pubkey in normal one-row state pays
+// one extra read at most once per cache/agentPeerMap warmup window. An
+// anomalous same-owner duplicate set can pay up to
+// agentPeerLookupMaxProjectedRows GetItems before cache or fail-closed
+// rejection. The UDP rate limiter (knock-pre-RL) caps incoming packets
+// per single source IP, so the per-IP amplification bound is:
 //
 //	N(unique-pubkeys-per-window) × cost(GSI Query) ≤ per_ip_rate_limit × 1 Query
+//	N(valid-pre-cache-pubkeys-per-window) × cost(GSI Query + GetItems) ≤ per_ip_rate_limit × (1 Query + agentPeerLookupMaxProjectedRows GetItems)
 //
 // IMPORTANT: this is a SINGLE-SOURCE-IP bound. A distributed
 // attacker (botnet, or even a modestly large set of unique source
@@ -302,9 +345,9 @@ type AgentPeerLookup struct {
 	// production.
 	onSingleflightEnter func(pubKeyB64 string)
 	// metrics is an optional counterIncrementer for forensic
-	// counters (e.g. MetricAgentLookupPubkeyCollision when the
-	// pubkey-index GSI returns >1 row for the same key). nil-safe:
-	// nil disables emission, behavior is otherwise unchanged.
+	// counters (e.g. pubkey collision and candidate-overflow
+	// guardrails). nil-safe: nil disables emission, behavior is
+	// otherwise unchanged.
 	metrics counterIncrementer
 }
 
@@ -465,47 +508,30 @@ func (l *AgentPeerLookup) queryAndCache(ctx context.Context, pubKeyB64 string) (
 	queryCtx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
 	defer cancel()
 
-	// Limit=2 honors whichever row DDB returns first on a pubkey
-	// collision but ALSO lets us detect that a collision occurred.
-	// DDB GSIs do NOT enforce uniqueness — pubkey uniqueness is
-	// purely a writer-side contract.
+	// Query a bounded candidate set from the KEYS_ONLY pubkey-index GSI while
+	// keeping random-unknown pubkey misses at one Query and no base-table
+	// GetItem. The query returns public_key plus the base-table owner_id/agent_id
+	// key pair; the schema_version gate below uses a follow-up GetItem on the
+	// base row. DDB GSIs do NOT enforce uniqueness, so qurl-service owns the
+	// writer-side one-owner-per-pubkey claim invariant (#488, implemented by
+	// qurl-service PR #1037). If two owners ever share a pubkey, the reader
+	// rejects fail-closed instead of admitting whichever owner DDB returns first.
 	//
-	// Writer-side contract (qurl-service PR-1a, repo qurl-service
-	// #485, internal/repository/dynamodb/agent_keys_repo.go's
-	// `Upsert`): on every write, the writer reads the pubkey-index
-	// GSI; if the pubkey is already registered to a different
-	// owner, it emits a WARN log (`agent bootstrap: cross-tenant
-	// pubkey squatting detected`) and proceeds with the write. The
-	// posture is WARN-only — the writer does NOT reject the
-	// conflicting write — and the GSI read is eventually consistent,
-	// so there is a false-negative window during a tight squat race.
-	//
-	// qurl-service #488 tracks the true uniqueness invariant
-	// (TransactWriteItems against a claims sidecar table) that
-	// closes this gap.
-	//
-	// If two rows ever share a pubkey, the resolver returns whichever
-	// row DDB hands back first and admits the holder of the matching
-	// private key; multi-tenant identity confusion would surface at
-	// the qurl-service auth layer (where owner_id is the principal),
-	// not here.
-	//
-	// Limit=2 (not Limit=1) is defense-in-depth: when the writer-side
-	// soft check fails open, the reader still detects the collision
-	// (Items > 1) and emits MetricAgentLookupPubkeyCollision + a WARN
-	// log. The forensic signal lets operators see writer-side
-	// invariant violations in real time without coupling the
-	// detection to the qurl-service deploy. One extra projected
-	// attribute set on the no-collision (Items == 1) path is
-	// negligible.
+	// qurl-service #1037 intentionally permits the SAME owner to hold one key
+	// under multiple agent_id rows (sidecar re-bootstrap / sibling rows). Those
+	// rows are one principal for auth, so the reader tries the bounded candidates
+	// below and accepts the first current, schema-compatible base row. If the GSI
+	// partition exceeds agentPeerLookupMaxProjectedRows, the reader rejects
+	// fail-closed because the sentinel row or an uninspected page could hide a
+	// distinct owner.
 	out, err := l.querier.Query(queryCtx, &dynamodb.QueryInput{
 		TableName:              aws.String(l.table),
 		IndexName:              aws.String(agentPeerLookupIndexName),
-		KeyConditionExpression: aws.String("public_key = :pk"),
+		KeyConditionExpression: aws.String(internalauth.QURLAgentKeysPublicKeyAttr + " = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":pk": &types.AttributeValueMemberS{Value: pubKeyB64},
 		},
-		Limit: aws.Int32(2),
+		Limit: aws.Int32(agentPeerLookupQueryLimit),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrAgentLookupRetryAfter, err)
@@ -515,55 +541,95 @@ func (l *AgentPeerLookup) queryAndCache(ctx context.Context, pubKeyB64 string) (
 		return nil, ErrAgentUnknownPubkey
 	}
 
-	if len(out.Items) > 1 {
-		// Defense-in-depth: the writer-side soft uniqueness check
-		// (qurl-service #485, WARN-only) failed open. We still admit
-		// Items[0] (the qurl-service auth layer enforces multi-tenant
-		// separation by owner_id), but emit a forensic signal so
-		// operators can see the invariant violation in real time. See
-		// the MetricAgentLookupPubkeyCollision godoc.
-		//
-		// Surface the conflicting owner_ids in the WARN line — the
+	// Decode the bounded sentinel page before the overflow check so a
+	// distinct-owner collision remains the sharper signal when a partition is
+	// both cross-owner and over the same-owner candidate cap. The Query limit is
+	// cap+1, so this never unmarshals more than the one sentinel row beyond the
+	// inspected set.
+	projectedRows, err := decodeProjectedAgentKeyRows(out.Items)
+	if err != nil {
+		return nil, err
+	}
+
+	if firstMeta, secondMeta, ok := distinctOwnerPubkeyCollision(projectedRows); ok {
+		// Surface the conflicting owner_ids in the ERROR line — the
 		// pubkey-index GSI's KEYS_ONLY projection ships owner_id and
 		// agent_id at zero extra cost, and operators chasing a
 		// cross-tenant squat need to know *which* owners are
-		// colliding without a follow-up scan-query. Best-effort: if
-		// unmarshal fails on either row, the corresponding
-		// owner_id_* field is left "". The admit path that follows
-		// still hard-fails on a real unmarshal error of Items[0].
-		var firstMeta, secondMeta agentKeyRow
-		_ = attributevalue.UnmarshalMap(out.Items[0], &firstMeta)
-		_ = attributevalue.UnmarshalMap(out.Items[1], &secondMeta)
-		log.Warning("agent peer lookup: pubkey-collision detected on pubkey-index GSI: pubkey_b64_prefix=%q row_count=%d owner_id_admitted=%q agent_id_admitted=%q owner_id_collision=%q agent_id_collision=%q (writer-side uniqueness invariant violated; qurl-service #488 tracks the hard fix)",
+		// colliding without a follow-up scan-query. This intentionally
+		// fail-closes on the projected GSI rows before base-row GetItem:
+		// cross-owner same-key registration is never a legitimate
+		// steady state after qurl-service #1037, and any stale projection
+		// self-heals once the GSI converges.
+		log.Error("agent peer lookup: distinct-owner pubkey-collision detected on pubkey-index GSI: pubkey_b64_prefix=%q row_count=%d owner_id_first=%q agent_id_first=%q owner_id_second=%q agent_id_second=%q (qurl-agent-keys one-owner-per-pubkey invariant violated; rejecting fail-closed)",
 			pubkeyLogPrefix(pubKeyB64), len(out.Items),
 			firstMeta.OwnerID, firstMeta.AgentID,
 			secondMeta.OwnerID, secondMeta.AgentID)
 		if l.metrics != nil {
 			l.metrics.IncrCounter(MetricAgentLookupPubkeyCollision)
 		}
+		// Do not cache fail-closed rows. Repeated bad knocks may re-read DDB,
+		// but they stay bounded by the existing knock/source rate limits and
+		// singleflight dedupes concurrent attempts for the same pubkey.
+		return nil, fmt.Errorf("%w: pubkey_b64_prefix=%q row_count=%d", ErrAgentLookupPubkeyCollision, pubkeyLogPrefix(pubKeyB64), len(out.Items))
 	}
 
-	var row agentKeyRow
-	if err := attributevalue.UnmarshalMap(out.Items[0], &row); err != nil {
-		// Structurally a writer-side bug (qurl-service wrote a row
-		// shape this reader can't parse), NOT a transient infra
-		// event. Wrap both sentinels: ErrAgentLookupMalformedRow
-		// drives a distinct event= tag in the resolve-handler log
-		// (event="agent_lookup_row_unmarshal_error") so triage
-		// doesn't have to grep the err string to disambiguate from
-		// a real DDB outage; ErrAgentLookupRetryAfter keeps the
-		// existing MetricAgentLookupDDBError alarm firing so a
-		// third metric isn't needed for an exceedingly rare case
-		// (the writer side MarshalMap's a fixed schema). The raw
-		// err is preserved in the structured log line at the
-		// caller so the underlying cause is recoverable.
-		return nil, fmt.Errorf("%w: %w: %w", ErrAgentLookupMalformedRow, ErrAgentLookupRetryAfter, err)
+	if len(projectedRows) > agentPeerLookupMaxProjectedRows || len(out.LastEvaluatedKey) != 0 {
+		first := projectedRows[0]
+		log.Error("agent peer lookup: pubkey-index GSI candidate set exceeds inspection cap: pubkey_b64_prefix=%q projected_row_count=%d candidate_limit=%d query_limit=%d has_more_candidates=%t first_owner_id=%q first_agent_id=%q (cannot prove one-owner-per-pubkey invariant across sentinel/uninspected rows; rejecting fail-closed)",
+			pubkeyLogPrefix(pubKeyB64), len(projectedRows), agentPeerLookupMaxProjectedRows, agentPeerLookupQueryLimit, len(out.LastEvaluatedKey) != 0, first.OwnerID, first.AgentID)
+		if l.metrics != nil {
+			l.metrics.IncrCounter(MetricAgentLookupPubkeyCandidateOverflow)
+		}
+		// Treat an over-cap candidate set like an ambiguity: the reader cannot
+		// safely cache a row until operators reconcile the data shape.
+		return nil, fmt.Errorf("%w: pubkey_b64_prefix=%q candidate_limit=%d observed_candidates=%d has_more_candidates=%t", ErrAgentLookupPubkeyCandidateOverflow, pubkeyLogPrefix(pubKeyB64), agentPeerLookupMaxProjectedRows, len(projectedRows), len(out.LastEvaluatedKey) != 0)
 	}
 
-	if row.PublicKey == "" {
-		// A pubkey-index hit without a public_key attribute should
-		// be impossible (it's the GSI's hash key), but treat as
-		// unknown rather than cache an empty peer.
+	var selectedRow *agentKeyRow
+	// Examine every bounded same-owner candidate before caching. An explicit
+	// unsupported schema_version on any current sibling means writer-first
+	// contract drift for this pubkey, so the whole pubkey fails closed even if
+	// another sibling row is still schema-compatible.
+	for _, projected := range projectedRows {
+		row, err := l.getAgentKeyBaseRow(queryCtx, projected)
+		if err != nil {
+			// Even after selecting a valid sibling, fail the resolve on
+			// transient read uncertainty. Accepting early would skip the
+			// unsupported-schema check on later same-owner siblings and
+			// weaken the reader-first contract.
+			return nil, err
+		}
+		if row == nil {
+			// A same-owner duplicate can include a stale GSI projection for a
+			// row that was already deleted/reconciled. Try the next projected
+			// candidate before treating the pubkey as unknown.
+			continue
+		}
+		if row.PublicKey != pubKeyB64 {
+			// The GSI can be eventually consistent across a writer-side pubkey
+			// rotation. Do not cache a base row that no longer owns the queried
+			// key; a same-owner duplicate may still include a current sibling.
+			continue
+		}
+
+		if !internalauth.IsSupportedQURLAgentKeysSchemaVersion(row.SchemaVersion) {
+			if l.metrics != nil {
+				l.metrics.IncrCounter(MetricAgentLookupSchemaMismatch)
+			}
+			// Do not cache fail-closed rows. Repeated bad knocks may re-read DDB,
+			// but they stay bounded by the existing knock/source rate limits and
+			// singleflight dedupes concurrent attempts for the same pubkey.
+			return nil, fmt.Errorf("%w: owner_id=%q agent_id=%q got schema_version=%d want %d",
+				ErrAgentLookupSchemaMismatch, row.OwnerID, row.AgentID, row.SchemaVersion, internalauth.QURLAgentKeysSchemaVersion)
+		}
+
+		if selectedRow == nil {
+			selectedRow = row
+		}
+	}
+
+	if selectedRow == nil {
 		return nil, ErrAgentUnknownPubkey
 	}
 
@@ -576,7 +642,7 @@ func (l *AgentPeerLookup) queryAndCache(ctx context.Context, pubKeyB64 string) (
 	// load-bearing for PeerGroup avoidance too — see the godoc on
 	// AgentPeerLookup before doing so.
 	peer := &core.UdpPeer{
-		PubKeyBase64: row.PublicKey,
+		PubKeyBase64: selectedRow.PublicKey,
 		Type:         core.NHP_AGENT,
 		// ExpireTime=0: this lookup's LRU is a cache, not a
 		// revocation mechanism. See the package godoc + the
@@ -588,21 +654,96 @@ func (l *AgentPeerLookup) queryAndCache(ctx context.Context, pubKeyB64 string) (
 	l.cache.Add(pubKeyB64, &agentCacheEntry{
 		peer:      peer,
 		fetchedAt: l.now(),
-		ownerID:   row.OwnerID,
-		agentID:   row.AgentID,
+		ownerID:   selectedRow.OwnerID,
 	})
 	return peer, nil
 }
 
-// CachedOwnerID returns the owner_id projected by the pubkey-index
-// GSI for a previously-resolved pubkey, or "" if not present in the
-// cache or expired. Used by the resolveAgentPeerForKnock caller to
-// enrich the agent_resolved log line with the tenant owner — the
-// GSI's KEYS_ONLY projection ships owner_id at zero extra cost, and
-// surfacing it on the resolved log avoids a follow-up scan-query
-// during triage. Empty return is non-fatal: an older row missing
-// owner_id (or an evicted entry) just produces a log line without
-// the owner_id field.
+func decodeProjectedAgentKeyRows(items []map[string]types.AttributeValue) ([]agentKeyRow, error) {
+	projectedRows := make([]agentKeyRow, 0, len(items))
+	for _, item := range items {
+		var projected agentKeyRow
+		if err := attributevalue.UnmarshalMap(item, &projected); err != nil {
+			// Structurally a writer-side bug (qurl-service wrote a row
+			// shape this reader can't parse), NOT a transient infra
+			// event. Wrap both sentinels: ErrAgentLookupMalformedRow
+			// drives a distinct event= tag in the resolve-handler log
+			// (event="agent_lookup_row_unmarshal_error") so triage
+			// doesn't have to grep the err string to disambiguate from
+			// a real DDB outage; ErrAgentLookupRetryAfter keeps the
+			// existing MetricAgentLookupDDBError alarm firing so a
+			// third metric isn't needed for an exceedingly rare case
+			// (the writer side MarshalMap's a fixed schema). The raw
+			// err is preserved in the structured log line at the
+			// caller so the underlying cause is recoverable.
+			return nil, fmt.Errorf("%w: %w: %w", ErrAgentLookupMalformedRow, ErrAgentLookupRetryAfter, err)
+		}
+
+		if projected.PublicKey == "" {
+			// A pubkey-index hit without a public_key attribute should
+			// be impossible because public_key is the GSI hash key. Reject the
+			// whole candidate set rather than skip this row: once the index key
+			// contract is corrupt, admitting a sibling would trust a partial
+			// projection we cannot prove is complete.
+			return nil, fmt.Errorf("%w: %w: missing projected qurl-agent-keys public_key", ErrAgentLookupMalformedRow, ErrAgentLookupRetryAfter)
+		}
+		if projected.OwnerID == "" || projected.AgentID == "" {
+			return nil, fmt.Errorf("%w: %w: missing projected qurl-agent-keys key attrs owner_id=%q agent_id=%q", ErrAgentLookupMalformedRow, ErrAgentLookupRetryAfter, projected.OwnerID, projected.AgentID)
+		}
+		projectedRows = append(projectedRows, projected)
+	}
+	return projectedRows, nil
+}
+
+func distinctOwnerPubkeyCollision(projectedRows []agentKeyRow) (agentKeyRow, agentKeyRow, bool) {
+	if len(projectedRows) < 2 {
+		return agentKeyRow{}, agentKeyRow{}, false
+	}
+	first := projectedRows[0]
+	for _, candidate := range projectedRows[1:] {
+		if candidate.OwnerID != first.OwnerID {
+			return first, candidate, true
+		}
+	}
+	return agentKeyRow{}, agentKeyRow{}, false
+}
+
+// getAgentKeyBaseRow fetches the authoritative base-table row for the
+// projected (owner_id, agent_id) GSI hit. The caller uses it to gate
+// schema_version, verify the row still owns the queried public_key after any
+// GSI propagation lag, and populate cache metadata from the strongly-consistent
+// source of truth. It uses the same timeout context as the preceding GSI Query:
+// DynamoDBOperationTimeout is a total resolve budget, not a per-call budget.
+func (l *AgentPeerLookup) getAgentKeyBaseRow(ctx context.Context, projected agentKeyRow) (*agentKeyRow, error) {
+	out, err := l.querier.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(l.table),
+		Key: map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysOwnerIDAttr: &types.AttributeValueMemberS{Value: projected.OwnerID},
+			internalauth.QURLAgentKeysAgentIDAttr: &types.AttributeValueMemberS{Value: projected.AgentID},
+		},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: get qurl-agent-keys base row: %w", ErrAgentLookupRetryAfter, err)
+	}
+	if len(out.Item) == 0 {
+		return nil, nil
+	}
+
+	var row agentKeyRow
+	if err := attributevalue.UnmarshalMap(out.Item, &row); err != nil {
+		return nil, fmt.Errorf("%w: %w: %w", ErrAgentLookupMalformedRow, ErrAgentLookupRetryAfter, err)
+	}
+	return &row, nil
+}
+
+// CachedOwnerID returns the owner_id cached from the strongly-consistent
+// qurl-agent-keys base row for a previously-resolved pubkey, or "" if not
+// present in the cache or expired. Used by the resolveAgentPeerForKnock caller
+// to enrich the agent_resolved log line with the tenant owner; carrying the
+// owner alongside the peer avoids a follow-up scan-query during triage. Empty
+// return is non-fatal: an older row missing owner_id (or an evicted entry) just
+// produces a log line without the owner_id field.
 //
 // Evicts expired entries on hit, matching getCached's semantics —
 // without symmetry, a stale entry would linger in the LRU until

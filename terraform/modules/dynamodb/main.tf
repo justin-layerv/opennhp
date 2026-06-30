@@ -434,10 +434,6 @@ resource "aws_iam_policy" "dynamodb_read" {
           "${aws_dynamodb_table.qurl_domains[0].arn}/index/*",
           aws_dynamodb_table.qurl_access_codes[0].arn,
           "${aws_dynamodb_table.qurl_access_codes[0].arn}/index/*",
-          # Read-only for nhp-server's knock path; writes flow via
-          # `qurl_table_arns` to the qurl-service task role.
-          aws_dynamodb_table.qurl_agent_keys[0].arn,
-          "${aws_dynamodb_table.qurl_agent_keys[0].arn}/index/*",
         ] : [])
       },
       {
@@ -461,7 +457,20 @@ resource "aws_iam_policy" "dynamodb_read" {
           aws_dynamodb_table.ack_tokens.arn
         ]
       }
-      ], var.kms_key_arn != null ? [{
+      ], var.deploy_qurl_tables ? [
+      {
+        Sid      = "DynamoDBQurlAgentKeysGetItem"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.qurl_agent_keys[0].arn
+      },
+      {
+        Sid      = "DynamoDBQurlAgentKeysPubkeyIndexQuery"
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = "${aws_dynamodb_table.qurl_agent_keys[0].arn}/index/pubkey-index"
+      }
+      ] : [], var.kms_key_arn != null ? [{
         # Encrypt/GenerateDataKey are required for nhp-server PutItem calls
         # into KMS-encrypted DynamoDB tables (ack_tokens and ac_assignments).
         # ViaService + CallerAccount keep the broadened verbs scoped to this
@@ -1285,6 +1294,8 @@ resource "aws_dynamodb_table" "qurl_api_keys" {
 }
 
 # qurl-agent-keys: sidecar agent registrations from the bootstrap path.
+# Cross-repo row contract: docs/design/QURL_AGENT_KEYS_SCHEMA.md and
+# internalauth.QURLAgentKeyRow.
 # PK=owner_id, SK=agent_id (regex ^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$ or
 # server-generated UUIDv7). Bootstrap (qurl-service) writes the agent's
 # X25519 public key; nhp-server Query's `pubkey-index` on knock receipt
@@ -1295,30 +1306,20 @@ resource "aws_dynamodb_table" "qurl_api_keys" {
 # don't do epoch math; numeric `ttl` (last_seen + 90d) drives DDB
 # eviction.
 #
-# Pubkey uniqueness is a SOFT invariant — DynamoDB GSIs don't enforce
-# it. A re-bootstrap under a FRESH `agent_id` orphans the prior row's
-# pubkey until TTL eviction, so the reader's Query could return >1 item.
-#
-# Defense posture today (writer-side soft + reader-side forensic):
-#   - qurl-service AgentKeysRepository.Upsert reads the pubkey-index GSI
-#     before every write and emits a WARN log on cross-tenant squat
-#     detection (`agent bootstrap: cross-tenant pubkey squatting
-#     detected`). It does NOT reject the write.
-#   - nhp-server reader (endpoints/server/agent_peer_lookup.go::
-#     queryAndCache) queries with Limit=2 and admits Items[0]
-#     (multi-tenant separation is enforced at the qurl-service auth
-#     layer where owner_id is the principal). When the GSI returns
-#     >1 row for the same pubkey, the reader emits the
-#     `MetricAgentLookupPubkeyCollision` counter + a WARN log so
-#     operators see writer-side invariant violations in real time
-#     without coupling to the qurl-service deploy. One extra
-#     projected attribute set on the no-collision path is negligible.
-#
-# Hard uniqueness (TransactWriteItems against a claims sidecar table)
-# is tracked in qurl-service #488; until it lands, an attacker that
-# achieves the rare write-time race window can squat a pubkey and the
-# reader will admit them — the collision counter is the only
-# in-process signal of that until #488 ships.
+# DynamoDB GSIs don't enforce pubkey uniqueness, so qurl-service owns
+# the writer-side one-owner-per-pubkey claim invariant (#488,
+# implemented by qurl-service PR #1037). nhp-server queries the
+# KEYS_ONLY pubkey-index with Limit=17 (16-row inspection cap plus a
+# sentinel), then uses GetItem on the base row by projected
+# (owner_id, agent_id) to read schema_version. If the reader sees >1
+# owner_id for the same pubkey, it emits MetricAgentLookupPubkeyCollision;
+# if the candidate set exceeds its inspection cap, it emits
+# MetricAgentLookupPubkeyCandidateOverflow. Both reject the knock
+# fail-closed; non-zero metrics mean legacy duplicate data, manual table
+# mutation, writer invariant drift, or same-owner row sprawl requiring
+# reconciliation. Same-owner duplicate agent_id rows under the cap are an
+# unambiguous principal and are tolerated while stale/orphan rows are
+# reconciled.
 # TODO: revisit DoS-amplification cost ceiling if billing_mode
 # below moves off PAY_PER_REQUEST (unknown-pubkey lookups intentionally
 # bypass the in-process LRU; the bound is rate_limit × 1 Query per
@@ -1349,9 +1350,12 @@ resource "aws_dynamodb_table" "qurl_agent_keys" {
 
   # KEYS_ONLY so the hot `last_seen_at` keepalive write doesn't rewrite the
   # GSI on every knock (PAY_PER_REQUEST charges WCU per GSI item write).
-  # Query on `public_key` returns the projected (owner_id, agent_id) in 1
-  # RTT — the auth path doesn't need the base row. A follow-up GetItem
-  # fetches aux metadata only when needed (hostname/version/last_seen_at).
+  # Query on `public_key` returns the projected (owner_id, agent_id) candidate;
+  # nhp-server then performs a strongly consistent base-table GetItem on every
+  # cold GSI hit to fetch schema_version, re-check public_key, and cache
+  # owner/agent metadata. Keeping schema_version off the GSI is deliberate:
+  # GSI reads cannot be strongly consistent, so projection would not satisfy
+  # the auth-path guardrail.
   global_secondary_index {
     name            = "pubkey-index"
     hash_key        = "public_key"

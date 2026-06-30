@@ -711,17 +711,42 @@ const (
 	MetricAgentFirstResolve = "AgentFirstResolve"
 
 	// MetricAgentLookupPubkeyCollision fires once per agent-peer
-	// lookup that finds MORE than one row on the pubkey-index GSI
-	// for the same public_key (cross-tenant pubkey squat or a
-	// rotation-race orphan row that hasn't TTL-expired). The
-	// resolver still admits whichever row DDB hands back first
-	// (multi-tenant separation is enforced at the qurl-service
-	// auth layer); this counter is purely defense-in-depth
-	// forensics. A sustained non-zero value is evidence that the
-	// qurl-service writer-side soft uniqueness check (WARN-only
-	// today, see qurl-service #488) is being defeated and the
-	// hard uniqueness invariant has drifted.
+	// lookup that finds more than one owner on the pubkey-index GSI
+	// for the same public_key. qurl-service #488/PR #1037 enforces
+	// one-owner-per-pubkey at write time, so a non-zero value means
+	// legacy duplicate data, manual table mutation, or writer
+	// invariant regression.
+	// The resolver rejects fail-closed with
+	// event="agent_lookup_pubkey_collision" rather than admitting an
+	// arbitrary row.
 	MetricAgentLookupPubkeyCollision = "AgentLookupPubkeyCollision"
+
+	// MetricAgentLookupPubkeyCandidateOverflow fires once per
+	// agent-peer lookup whose pubkey-index candidate set exceeds the
+	// resolver's bounded inspection cap. This is separate from
+	// MetricAgentLookupPubkeyCollision so alarms can distinguish a
+	// true cross-owner key collision from a same-owner duplicate or
+	// orphan-row set that grew too large to prove safe in one bounded
+	// read. The resolver rejects fail-closed with
+	// event="agent_lookup_pubkey_candidate_overflow".
+	MetricAgentLookupPubkeyCandidateOverflow = "AgentLookupPubkeyCandidateOverflow"
+
+	// MetricAgentLookupSchemaMismatch fires when the qurl-agent-keys
+	// row declares a schema_version this nhp-server build does not
+	// understand. This is the structural
+	// writer/reader contract guard for the cross-repo DynamoDB boundary:
+	// additive columns require no bump; renames/removals or semantic
+	// changes require a version bump and a reader deploy that explicitly
+	// accepts it. Legacy rows with no schema_version are version 0 and
+	// remain accepted during rollout; explicit unknown versions reject
+	// fail-closed and page this metric.
+	//
+	// Counter semantics under singleflight piggyback: the counter is
+	// incremented inside AgentPeerLookup by the singleflight winner, so
+	// N concurrent first-knocks for the same mismatched pubkey reject
+	// N callers but produce one schema-mismatch increment for that
+	// resolve window.
+	MetricAgentLookupSchemaMismatch = "AgentLookupSchemaMismatch"
 
 	// MetricAgentLookupInitFailure fires once at server startup
 	// when NewAgentPeerLookupFromStorage returns an error.

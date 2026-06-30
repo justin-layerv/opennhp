@@ -517,9 +517,9 @@ func (s *UdpServer) resolveAgentPeerForKnock(
 		//     behavior documented at the alreadyKnown branch above.
 		//     This is deterministic — no last-writer-wins race on
 		//     the shared cache pointer — and the only case where
-		//     multiple piggybackers present DISTINCT source addresses
-		//     is the cross-tenant pubkey-squat posture
-		//     (qurl-service #488 tracks the hard uniqueness fix).
+		//     multiple piggybackers present DISTINCT source addresses,
+		//     where first-writer-wins is the same posture the cache-warm
+		//     branch uses for the pubkey identity.
 		//
 		// Mirrors the cloud-mode AC pattern in HandleACOnline
 		// (UpdateRecv runs only on the first registration in a
@@ -617,6 +617,17 @@ func (s *UdpServer) resolveAgentPeerForKnock(
 		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_lookup_row_unmarshal_error\" pubkey_b64_prefix=%q err=%v",
 			knkMsg.UserId, transactionId, addrStr, pubKeyPrefix, lookupErr)
 		s.metrics.IncrCounter(MetricAgentLookupDDBError)
+	case errors.Is(lookupErr, ErrAgentLookupSchemaMismatch):
+		// Schema/collision/overflow counters are owned by queryAndCache at
+		// the exact fail-closed decision point; these arms add log events only.
+		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_lookup_schema_mismatch\" pubkey_b64_prefix=%q err=%v",
+			knkMsg.UserId, transactionId, addrStr, pubKeyPrefix, lookupErr)
+	case errors.Is(lookupErr, ErrAgentLookupPubkeyCollision):
+		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_lookup_pubkey_collision\" pubkey_b64_prefix=%q err=%v",
+			knkMsg.UserId, transactionId, addrStr, pubKeyPrefix, lookupErr)
+	case errors.Is(lookupErr, ErrAgentLookupPubkeyCandidateOverflow):
+		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_lookup_pubkey_candidate_overflow\" pubkey_b64_prefix=%q err=%v",
+			knkMsg.UserId, transactionId, addrStr, pubKeyPrefix, lookupErr)
 	case errors.Is(lookupErr, ErrAgentLookupInternal):
 		// Code-regression branch (e.g., singleflight closure
 		// returning a non-*core.UdpPeer despite the contract).

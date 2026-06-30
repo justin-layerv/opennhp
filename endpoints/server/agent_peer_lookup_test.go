@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/layervai/nhp/internalauth"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -16,14 +18,16 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
-// fakeAgentKeysQuerier mocks the DDB Query path for AgentPeerLookup.
+// fakeAgentKeysQuerier mocks the DDB Query/GetItem path for AgentPeerLookup.
 // Tests that need to assert call count / inject errors operate on
 // this struct directly.
 type fakeAgentKeysQuerier struct {
-	mu    sync.Mutex
-	calls int
-	rows  map[string]map[string]types.AttributeValue // keyed by pubkey b64
-	err   error                                      // returned for every Query call
+	mu       sync.Mutex
+	calls    int
+	getCalls int
+	rows     map[string]map[string]types.AttributeValue // keyed by pubkey b64
+	err      error                                      // returned for every Query call
+	getErr   error                                      // returned for every GetItem call
 }
 
 func newFakeAgentKeysQuerier() *fakeAgentKeysQuerier {
@@ -36,10 +40,18 @@ func (f *fakeAgentKeysQuerier) put(pubKeyB64, ownerID, agentID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rows[pubKeyB64] = map[string]types.AttributeValue{
-		"public_key": &types.AttributeValueMemberS{Value: pubKeyB64},
-		"owner_id":   &types.AttributeValueMemberS{Value: ownerID},
-		"agent_id":   &types.AttributeValueMemberS{Value: agentID},
+		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pubKeyB64},
+		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: ownerID},
+		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: agentID},
+		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
 	}
+}
+
+func (f *fakeAgentKeysQuerier) putWithSchemaVersion(pubKeyB64, ownerID, agentID string, schemaVersion int) {
+	f.put(pubKeyB64, ownerID, agentID)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rows[pubKeyB64][internalauth.QURLAgentKeysSchemaVersionAttr] = &types.AttributeValueMemberN{Value: fmt.Sprint(schemaVersion)}
 }
 
 func (f *fakeAgentKeysQuerier) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
@@ -67,13 +79,77 @@ func (f *fakeAgentKeysQuerier) Query(_ context.Context, in *dynamodb.QueryInput,
 	if !ok {
 		return &dynamodb.QueryOutput{Items: nil}, nil
 	}
-	return &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{row}}, nil
+	return &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{projectedAgentKeyRow(row)}}, nil
+}
+
+func (f *fakeAgentKeysQuerier) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getCalls++
+
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+
+	ownerID := stringAttr(in.Key, internalauth.QURLAgentKeysOwnerIDAttr)
+	agentID := stringAttr(in.Key, internalauth.QURLAgentKeysAgentIDAttr)
+	for _, row := range f.rows {
+		if stringAttr(row, internalauth.QURLAgentKeysOwnerIDAttr) == ownerID &&
+			stringAttr(row, internalauth.QURLAgentKeysAgentIDAttr) == agentID {
+			return &dynamodb.GetItemOutput{Item: cloneAgentKeyRow(row)}, nil
+		}
+	}
+	return &dynamodb.GetItemOutput{}, nil
 }
 
 func (f *fakeAgentKeysQuerier) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+func (f *fakeAgentKeysQuerier) getCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCalls
+}
+
+func projectedAgentKeyRow(row map[string]types.AttributeValue) map[string]types.AttributeValue {
+	projected := map[string]types.AttributeValue{}
+	for _, attr := range []string{
+		internalauth.QURLAgentKeysPublicKeyAttr,
+		internalauth.QURLAgentKeysOwnerIDAttr,
+		internalauth.QURLAgentKeysAgentIDAttr,
+	} {
+		if v, ok := row[attr]; ok {
+			projected[attr] = v
+		}
+	}
+	return projected
+}
+
+func cloneAgentKeyRow(row map[string]types.AttributeValue) map[string]types.AttributeValue {
+	cloned := make(map[string]types.AttributeValue, len(row))
+	for k, v := range row {
+		cloned[k] = v
+	}
+	return cloned
+}
+
+func agentKeyTestRow(pubKeyB64, ownerID, agentID string) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pubKeyB64},
+		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: ownerID},
+		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: agentID},
+		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+	}
+}
+
+func stringAttr(row map[string]types.AttributeValue, attr string) string {
+	if v, ok := row[attr].(*types.AttributeValueMemberS); ok {
+		return v.Value
+	}
+	return ""
 }
 
 // pubkeyB64 returns a deterministic 32-byte b64-encoded pubkey for
@@ -231,6 +307,25 @@ func TestAgentPeerLookup_DDBErrorRetryAfter(t *testing.T) {
 	}
 }
 
+func TestAgentPeerLookup_GetItemErrorRetryAfter(t *testing.T) {
+	q := newFakeAgentKeysQuerier()
+	pk := pubkeyB64(0x4A)
+	q.put(pk, "owner-get-error", "agent-get-error")
+	q.getErr = &types.ProvisionedThroughputExceededException{Message: aws.String("get throttled")}
+
+	l := newTestLookup(t, q)
+	_, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentLookupRetryAfter) {
+		t.Fatalf("err=%v want ErrAgentLookupRetryAfter", err)
+	}
+	if q.callCount() != 1 {
+		t.Errorf("Query calls=%d want 1", q.callCount())
+	}
+	if q.getCallCount() != 1 {
+		t.Errorf("GetItem calls=%d want 1", q.getCallCount())
+	}
+}
+
 // TestAgentPeerLookup_GenericDDBError asserts a non-throttle DDB
 // failure also wraps as retry-after (we don't classify error
 // subtypes — anything from the SDK is transient from our POV).
@@ -272,16 +367,21 @@ func TestAgentPeerLookup_DDBErrorPreservesSDKType(t *testing.T) {
 	}
 }
 
-// TestAgentPeerLookup_HappyPathQueryShape asserts the Query input
-// targets the correct table + GSI + KeyConditionExpression. The
-// pubkey-index GSI is the load-bearing piece — a regression that
-// silently drops the IndexName would full-scan the base table.
+// TestAgentPeerLookup_HappyPathQueryShape asserts the Query targets the
+// pubkey-index GSI and the follow-up GetItem fetches the strongly-consistent
+// base row for schema_version.
 func TestAgentPeerLookup_HappyPathQueryShape(t *testing.T) {
-	var captured *dynamodb.QueryInput
+	var capturedQuery *dynamodb.QueryInput
+	var capturedGet *dynamodb.GetItemInput
 	q := &captureAgentKeysQuerier{
 		inner: newFakeAgentKeysQuerier(),
 		captureFn: func(in *dynamodb.QueryInput) {
-			captured = in
+			cp := *in
+			capturedQuery = &cp
+		},
+		captureGetFn: func(in *dynamodb.GetItemInput) {
+			cp := *in
+			capturedGet = &cp
 		},
 	}
 	pk := pubkeyB64(0x06)
@@ -292,29 +392,45 @@ func TestAgentPeerLookup_HappyPathQueryShape(t *testing.T) {
 		t.Fatalf("lookup: %v", err)
 	}
 
-	if captured == nil {
+	if capturedQuery == nil {
 		t.Fatal("Query was not called")
 	}
-	if got := aws.ToString(captured.TableName); got != "qurl-agent-keys-test" {
+	if got := aws.ToString(capturedQuery.TableName); got != "qurl-agent-keys-test" {
 		t.Errorf("TableName=%q want %q", got, "qurl-agent-keys-test")
 	}
-	if got := aws.ToString(captured.IndexName); got != "pubkey-index" {
+	if got := aws.ToString(capturedQuery.IndexName); got != "pubkey-index" {
 		t.Errorf("IndexName=%q want %q", got, "pubkey-index")
 	}
-	if got := aws.ToString(captured.KeyConditionExpression); got != "public_key = :pk" {
+	if got := aws.ToString(capturedQuery.KeyConditionExpression); got != "public_key = :pk" {
 		t.Errorf("KeyConditionExpression=%q want %q", got, "public_key = :pk")
 	}
-	if v, ok := captured.ExpressionAttributeValues[":pk"]; !ok {
+	if v, ok := capturedQuery.ExpressionAttributeValues[":pk"]; !ok {
 		t.Error(":pk attribute missing")
 	} else if s, ok := v.(*types.AttributeValueMemberS); !ok || s.Value != pk {
 		t.Errorf(":pk value=%v want %q", v, pk)
 	}
-	// Limit=2 (not 1) is load-bearing for the pubkey-collision
-	// detection in queryAndCache — see the godoc there. The reader
-	// still admits Items[0] when there's no collision; the extra
-	// projected attribute set on the happy path is negligible.
-	if captured.Limit == nil || *captured.Limit != 2 {
-		t.Errorf("Limit=%v want 2 (Limit>=2 is required for collision detection)", captured.Limit)
+	// A bounded multi-row limit is load-bearing for pubkey-collision detection
+	// in queryAndCache — see the godoc there. The reader still decodes the
+	// single returned row when there's no collision; the extra projected
+	// candidate budget is negligible on the happy path.
+	if capturedQuery.Limit == nil || *capturedQuery.Limit != agentPeerLookupQueryLimit {
+		t.Errorf("Limit=%v want %d", capturedQuery.Limit, agentPeerLookupQueryLimit)
+	}
+
+	if capturedGet == nil {
+		t.Fatal("GetItem was not called")
+	}
+	if got := aws.ToString(capturedGet.TableName); got != "qurl-agent-keys-test" {
+		t.Errorf("GetItem TableName=%q want %q", got, "qurl-agent-keys-test")
+	}
+	if !aws.ToBool(capturedGet.ConsistentRead) {
+		t.Error("GetItem ConsistentRead=false want true for schema gate")
+	}
+	if got := stringAttr(capturedGet.Key, internalauth.QURLAgentKeysOwnerIDAttr); got != "owner-6" {
+		t.Errorf("GetItem owner_id=%q want owner-6", got)
+	}
+	if got := stringAttr(capturedGet.Key, internalauth.QURLAgentKeysAgentIDAttr); got != "agent-6" {
+		t.Errorf("GetItem agent_id=%q want agent-6", got)
 	}
 }
 
@@ -382,6 +498,256 @@ func TestAgentPeerLookup_NilQuerier(t *testing.T) {
 	}
 }
 
+// TestAgentPeerLookup_SchemaVersionMismatchRejects fences the reader-side
+// schema gate: an explicit future/unknown schema_version must fail closed
+// instead of silently interpreting the row as v1.
+func TestAgentPeerLookup_SchemaVersionMismatchRejects(t *testing.T) {
+	q := newFakeAgentKeysQuerier()
+	pk := pubkeyB64(0x0A)
+	q.putWithSchemaVersion(pk, "owner-schema", "agent-schema", internalauth.QURLAgentKeysSchemaVersion+1)
+
+	l := newTestLookup(t, q)
+	m := &fakeCounterIncrementer{}
+	l.SetMetrics(m)
+
+	if _, ok := projectedAgentKeyRow(q.rows[pk])[internalauth.QURLAgentKeysSchemaVersionAttr]; ok {
+		t.Fatal("fake Query projected schema_version; production pubkey-index is KEYS_ONLY, so schema gate must rely on GetItem")
+	}
+
+	_, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentLookupSchemaMismatch) {
+		t.Fatalf("err=%v want ErrAgentLookupSchemaMismatch", err)
+	}
+	if got := m.count(MetricAgentLookupSchemaMismatch); got != 1 {
+		t.Errorf("%s counter=%d want 1", MetricAgentLookupSchemaMismatch, got)
+	}
+
+	// The failed row must not cache. Replacing it with a supported row should
+	// re-query and succeed immediately.
+	q.put(pk, "owner-schema", "agent-schema")
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if err != nil {
+		t.Fatalf("post-fix lookup: %v", err)
+	}
+	if peer == nil || peer.PublicKeyBase64() != pk {
+		t.Fatalf("post-fix peer=%v want pubkey=%q", peer, pk)
+	}
+	if got := q.callCount(); got != 2 {
+		t.Errorf("DDB calls=%d want 2 (schema mismatch must not cache)", got)
+	}
+	if got := q.getCallCount(); got != 2 {
+		t.Errorf("GetItem calls=%d want 2 (schema mismatch must not cache)", got)
+	}
+}
+
+// TestAgentPeerLookup_LegacyMissingSchemaVersionAccepted preserves rollout
+// safety for rows written before schema_version existed. The strict rejection
+// path applies to explicit unknown versions, not to legacy version 0.
+func TestAgentPeerLookup_LegacyMissingSchemaVersionAccepted(t *testing.T) {
+	q := newFakeAgentKeysQuerier()
+	pk := pubkeyB64(0x0B)
+	q.put(pk, "owner-legacy", "agent-legacy")
+	q.mu.Lock()
+	delete(q.rows[pk], internalauth.QURLAgentKeysSchemaVersionAttr)
+	q.mu.Unlock()
+
+	l := newTestLookup(t, q)
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if err != nil {
+		t.Fatalf("legacy lookup: %v", err)
+	}
+	if peer == nil || peer.PublicKeyBase64() != pk {
+		t.Fatalf("legacy peer=%v want pubkey=%q", peer, pk)
+	}
+}
+
+// TestAgentPeerLookup_GSIHitBaseRowMissingUnknown covers the
+// eventually-consistent edge where pubkey-index still points at a
+// base-table key that no longer exists. That is not a DDB outage:
+// reject as an unknown pubkey and do not cache so the next resolve can
+// self-heal after the writer/table state converges.
+func TestAgentPeerLookup_GSIHitBaseRowMissingUnknown(t *testing.T) {
+	pk := pubkeyB64(0x0C)
+	row := map[string]types.AttributeValue{
+		internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: "owner-missing-base"},
+		internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: "agent-missing-base"},
+	}
+	q := &splitAgentKeysQuerier{queryItem: row}
+	l := newTestLookup(t, q)
+
+	_, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentUnknownPubkey) {
+		t.Fatalf("err=%v want ErrAgentUnknownPubkey", err)
+	}
+	if got := q.getCallCount(); got != 1 {
+		t.Fatalf("GetItem calls=%d want 1", got)
+	}
+
+	q.setGetItem(map[string]types.AttributeValue{
+		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-missing-base"},
+		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-missing-base"},
+		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+	})
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if err != nil {
+		t.Fatalf("post-convergence lookup: %v", err)
+	}
+	if peer == nil || peer.PublicKeyBase64() != pk {
+		t.Fatalf("post-convergence peer=%v want pubkey=%q", peer, pk)
+	}
+	if got := q.queryCallCount(); got != 2 {
+		t.Errorf("Query calls=%d want 2 (missing base row must not cache)", got)
+	}
+}
+
+// TestAgentPeerLookup_GSIHitBaseRowPublicKeyMismatchUnknown covers a
+// stale pubkey-index hit during public_key rotation: the GSI projection
+// matched the queried key, but the strongly-consistent base row no
+// longer owns it. The reader rejects as unknown, lets the caller count
+// the knock as MetricAuthFailure, and retries cold on the next knock.
+func TestAgentPeerLookup_GSIHitBaseRowPublicKeyMismatchUnknown(t *testing.T) {
+	pk := pubkeyB64(0x0D)
+	rotatedPK := pubkeyB64(0x0E)
+	row := map[string]types.AttributeValue{
+		internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: "owner-rotated"},
+		internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: "agent-rotated"},
+	}
+	q := &splitAgentKeysQuerier{
+		queryItem: row,
+		getItem: map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: rotatedPK},
+			internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-rotated"},
+			internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-rotated"},
+			internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		},
+	}
+	l := newTestLookup(t, q)
+
+	_, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentUnknownPubkey) {
+		t.Fatalf("err=%v want ErrAgentUnknownPubkey", err)
+	}
+
+	q.setGetItem(map[string]types.AttributeValue{
+		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-rotated"},
+		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-rotated"},
+		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+	})
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if err != nil {
+		t.Fatalf("post-gsi-convergence lookup: %v", err)
+	}
+	if peer == nil || peer.PublicKeyBase64() != pk {
+		t.Fatalf("post-gsi-convergence peer=%v want pubkey=%q", peer, pk)
+	}
+	if got := q.queryCallCount(); got != 2 {
+		t.Errorf("Query calls=%d want 2 (public_key mismatch must not cache)", got)
+	}
+}
+
+// TestAgentPeerLookup_MalformedBaseRow wraps base-table UnmarshalMap failures
+// separately from malformed KEYS_ONLY projections. The projected key attrs are
+// usable, so the reader reaches GetItem, then rejects the unparseable
+// strongly-consistent row as a data/schema regression and leaves the pubkey
+// uncached.
+func TestAgentPeerLookup_MalformedBaseRow(t *testing.T) {
+	pk := pubkeyB64(0x8A)
+	q := &splitAgentKeysQuerier{
+		queryItem: map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: pk},
+			internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: "owner-malformed-base"},
+			internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: "agent-malformed-base"},
+		},
+		getItem: map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
+			internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-malformed-base"},
+			internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-malformed-base"},
+			internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberS{Value: "not-an-int"},
+		},
+	}
+	l := newTestLookup(t, q)
+
+	_, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentLookupMalformedRow) {
+		t.Fatalf("err=%v want ErrAgentLookupMalformedRow", err)
+	}
+	if !errors.Is(err, ErrAgentLookupRetryAfter) {
+		t.Fatalf("err=%v want ErrAgentLookupRetryAfter wrapper", err)
+	}
+	if got := q.getCallCount(); got != 1 {
+		t.Fatalf("GetItem calls=%d want 1", got)
+	}
+
+	q.setGetItem(map[string]types.AttributeValue{
+		internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-malformed-base"},
+		internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-malformed-base"},
+		internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+	})
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if err != nil {
+		t.Fatalf("post-fix lookup: %v", err)
+	}
+	if peer == nil || peer.PublicKeyBase64() != pk {
+		t.Fatalf("post-fix peer=%v want pubkey=%q", peer, pk)
+	}
+	if got := q.queryCallCount(); got != 2 {
+		t.Errorf("Query calls=%d want 2 (malformed base row must not cache)", got)
+	}
+}
+
+// TestAgentPeerLookup_MissingProjectedKeyAttrsMalformed covers a malformed
+// KEYS_ONLY projection that lacks the base-table key attrs needed for the
+// strong GetItem. This is a data/schema shape problem, not an unknown pubkey.
+func TestAgentPeerLookup_MissingProjectedKeyAttrsMalformed(t *testing.T) {
+	pk := pubkeyB64(0x0F)
+	q := &splitAgentKeysQuerier{
+		queryItem: map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: pk},
+		},
+	}
+	l := newTestLookup(t, q)
+
+	_, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentLookupMalformedRow) {
+		t.Fatalf("err=%v want ErrAgentLookupMalformedRow", err)
+	}
+	if !errors.Is(err, ErrAgentLookupRetryAfter) {
+		t.Fatalf("err=%v want ErrAgentLookupRetryAfter wrapper", err)
+	}
+	if got := q.getCallCount(); got != 0 {
+		t.Fatalf("GetItem calls=%d want 0 (missing key attrs cannot build base-table key)", got)
+	}
+}
+
+// TestAgentPeerLookup_MissingProjectedPubkeyMalformed covers an impossible GSI
+// shape where a pubkey-index hit is missing the GSI hash key itself. Treat this
+// like a schema/data regression, not a normal unknown-pubkey auth miss.
+func TestAgentPeerLookup_MissingProjectedPubkeyMalformed(t *testing.T) {
+	q := &splitAgentKeysQuerier{
+		queryItem: map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysOwnerIDAttr: &types.AttributeValueMemberS{Value: "owner-missing-pubkey"},
+			internalauth.QURLAgentKeysAgentIDAttr: &types.AttributeValueMemberS{Value: "agent-missing-pubkey"},
+		},
+	}
+	l := newTestLookup(t, q)
+
+	_, err := l.LookupAgentByPubKey(context.Background(), pubkeyB64(0x10))
+	if !errors.Is(err, ErrAgentLookupMalformedRow) {
+		t.Fatalf("err=%v want ErrAgentLookupMalformedRow", err)
+	}
+	if !errors.Is(err, ErrAgentLookupRetryAfter) {
+		t.Fatalf("err=%v want ErrAgentLookupRetryAfter wrapper", err)
+	}
+	if got := q.getCallCount(); got != 0 {
+		t.Fatalf("GetItem calls=%d want 0 (missing pubkey cannot be trusted)", got)
+	}
+}
+
 // TestAgentPeerLookup_Concurrent asserts concurrent cache hits/misses
 // don't race on the cache or clock. The race detector catches
 // memory-model regressions; the explicit assertions below catch a
@@ -395,7 +761,7 @@ func TestAgentPeerLookup_Concurrent(t *testing.T) {
 
 	q := newFakeAgentKeysQuerier()
 	for i := 0; i < numPubkeys; i++ {
-		q.put(pubkeyB64(byte(0x10+i)), "owner", "agent")
+		q.put(pubkeyB64(byte(0x10+i)), "owner", fmt.Sprintf("agent-%02d", i))
 	}
 
 	l := newTestLookup(t, q)
@@ -481,6 +847,10 @@ func (b *blockingAgentKeysQuerier) Query(ctx context.Context, in *dynamodb.Query
 	}
 	<-b.release
 	return b.inner.Query(ctx, in, opts...)
+}
+
+func (b *blockingAgentKeysQuerier) GetItem(ctx context.Context, in *dynamodb.GetItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	return b.inner.GetItem(ctx, in, opts...)
 }
 
 // TestAgentPeerLookup_Singleflight_DedupsConcurrentMissOnSamePubkey
@@ -690,20 +1060,92 @@ func TestAgentPeerLookup_Singleflight_DoesNotDedupeDifferentPubkeys(t *testing.T
 	}
 }
 
-// TestAgentPeerLookup_PubkeyCollisionEmitsMetricAndWarn fences the
-// defense-in-depth detection: when the qurl-service writer-side
-// soft uniqueness check fails open and the pubkey-index GSI hosts
-// >1 rows for the same pubkey, the reader still admits the agent
-// (multi-tenant separation enforced at the auth layer) but emits
-// MetricAgentLookupPubkeyCollision so operators see the invariant
-// violation in real time.
+// TestAgentPeerLookup_PubkeyCollisionRejectsMetricAndErrorLog fences the
+// fail-closed detection: when the pubkey-index GSI hosts rows for more than one
+// owner on the same pubkey, the reader emits MetricAgentLookupPubkeyCollision
+// and rejects instead of admitting whichever row DDB returns first.
 //
 // Regression fence for two things at once:
 //   - Limit must stay >1 so the second row is even visible.
-//   - The metric must fire when Items > 1.
-func TestAgentPeerLookup_PubkeyCollisionEmitsMetricAndWarn(t *testing.T) {
+//   - The metric must fire when the projected owners differ.
+func TestAgentPeerLookup_PubkeyCollisionRejectsMetricAndErrorLog(t *testing.T) {
 	pk := pubkeyB64(0x77)
 	q := &collidingAgentKeysQuerier{pk: pk}
+
+	l := newTestLookup(t, q)
+	m := &fakeCounterIncrementer{}
+	l.SetMetrics(m)
+
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentLookupPubkeyCollision) {
+		t.Fatalf("err=%v want ErrAgentLookupPubkeyCollision", err)
+	}
+	if peer != nil {
+		t.Fatalf("peer=%v want nil on collision reject", peer)
+	}
+
+	got := m.count(MetricAgentLookupPubkeyCollision)
+	if got != 1 {
+		t.Errorf("%s counter=%d want 1 (collision detection should emit)",
+			MetricAgentLookupPubkeyCollision, got)
+	}
+
+	// Sanity: the named candidate cap must reach the querier so the second row
+	// is actually visible. If the production code regresses Limit back to 1, the
+	// collidingQuerier assertion fails loudly.
+	if got := q.lastLimit; got != agentPeerLookupQueryLimit {
+		t.Errorf("Query Limit=%d want %d", got, agentPeerLookupQueryLimit)
+	}
+}
+
+// TestAgentPeerLookup_PubkeyCollisionDetectsDistinctOwnerAfterSameOwnerRows
+// fences a subtle GSI-ordering edge: with PK=public_key and no GSI sort key,
+// DynamoDB can return same-owner rows before a later distinct owner. The reader
+// must inspect more than the first two rows, or it can admit a row while a hidden
+// cross-owner collision exists.
+func TestAgentPeerLookup_PubkeyCollisionDetectsDistinctOwnerAfterSameOwnerRows(t *testing.T) {
+	pk := pubkeyB64(0x7A)
+	q := &orderedAgentKeysQuerier{
+		rows: []map[string]types.AttributeValue{
+			agentKeyTestRow(pk, "owner-a", "agent-a-1"),
+			agentKeyTestRow(pk, "owner-a", "agent-a-2"),
+			agentKeyTestRow(pk, "owner-b", "agent-b-1"),
+		},
+	}
+
+	l := newTestLookup(t, q)
+	m := &fakeCounterIncrementer{}
+	l.SetMetrics(m)
+
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentLookupPubkeyCollision) {
+		t.Fatalf("err=%v want ErrAgentLookupPubkeyCollision", err)
+	}
+	if peer != nil {
+		t.Fatalf("peer=%v want nil when a third projected row has a distinct owner", peer)
+	}
+	if got := q.lastLimit; got != agentPeerLookupQueryLimit {
+		t.Errorf("Query Limit=%d want %d (must inspect beyond first two rows)", got, agentPeerLookupQueryLimit)
+	}
+	if got := q.getCallCount(); got != 0 {
+		t.Errorf("GetItem calls=%d want 0 (projected distinct-owner collision should reject before base reads)", got)
+	}
+	if got := m.count(MetricAgentLookupPubkeyCollision); got != 1 {
+		t.Errorf("%s counter=%d want 1", MetricAgentLookupPubkeyCollision, got)
+	}
+}
+
+// TestAgentPeerLookup_ExactCandidateCapSameOwnerAccepted fences the sentinel
+// query boundary: exactly agentPeerLookupMaxProjectedRows same-owner candidates
+// are fully inspected and can be accepted. The 17th projected row, or a further
+// page marker, is what turns the partition into an over-cap fail-closed state.
+func TestAgentPeerLookup_ExactCandidateCapSameOwnerAccepted(t *testing.T) {
+	pk := pubkeyB64(0x7C)
+	rows := make([]map[string]types.AttributeValue, 0, agentPeerLookupMaxProjectedRows)
+	for i := 0; i < agentPeerLookupMaxProjectedRows; i++ {
+		rows = append(rows, agentKeyTestRow(pk, "owner-cap", fmt.Sprintf("agent-cap-%02d", i)))
+	}
+	q := &orderedAgentKeysQuerier{rows: rows}
 
 	l := newTestLookup(t, q)
 	m := &fakeCounterIncrementer{}
@@ -713,44 +1155,107 @@ func TestAgentPeerLookup_PubkeyCollisionEmitsMetricAndWarn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupAgentByPubKey: %v", err)
 	}
-	if peer == nil {
-		t.Fatal("peer is nil (collision should still admit Items[0])")
+	if peer == nil || peer.PubKeyBase64 != pk {
+		t.Fatalf("peer=%v want pubkey %q", peer, pk)
 	}
-	if peer.PublicKeyBase64() != pk {
-		t.Errorf("peer pubkey=%q want %q", peer.PublicKeyBase64(), pk)
+	if got := q.lastLimit; got != agentPeerLookupQueryLimit {
+		t.Errorf("Query Limit=%d want %d", got, agentPeerLookupQueryLimit)
 	}
-
-	got := m.count(MetricAgentLookupPubkeyCollision)
-	if got != 1 {
-		t.Errorf("%s counter=%d want 1 (collision detection should emit)",
-			MetricAgentLookupPubkeyCollision, got)
+	if got := q.getCallCount(); got != agentPeerLookupMaxProjectedRows {
+		t.Errorf("GetItem calls=%d want %d (every same-owner sibling is checked)", got, agentPeerLookupMaxProjectedRows)
 	}
-
-	// Sanity: Limit=2 must reach the querier so the second row is
-	// actually visible. If the production code regresses Limit back
-	// to 1, the collidingQuerier asserts and the test fails loudly.
-	if got := q.lastLimit; got != 2 {
-		t.Errorf("Query Limit=%d want 2 (Limit=1 would hide collisions; see queryAndCache comment)",
-			got)
+	if got := m.count(MetricAgentLookupPubkeyCollision); got != 0 {
+		t.Errorf("%s counter=%d want 0 for exact-cap same-owner set", MetricAgentLookupPubkeyCollision, got)
+	}
+	if got := m.count(MetricAgentLookupPubkeyCandidateOverflow); got != 0 {
+		t.Errorf("%s counter=%d want 0 for exact-cap same-owner set", MetricAgentLookupPubkeyCandidateOverflow, got)
+	}
+	if got := l.CachedOwnerID(pk); got != "owner-cap" {
+		t.Errorf("CachedOwnerID(%q)=%q want owner-cap", pk, got)
 	}
 }
 
-// TestAgentPeerLookup_PubkeyCollisionAdmitsItemsZero fences the
-// admit-Items[0] half of the collision contract that the existing
-// metric+WARN test only covers indirectly. The package godoc
-// documents "the resolver returns whichever row DDB hands back
-// first" and the queryAndCache implementation reads `out.Items[0]`
-// explicitly. A future regression to `out.Items[1]`,
-// `out.Items[len-1]`, or any shuffle of the slice would slip past
-// the existing collision test (which sets both rows to the same
-// pubkey and so can't distinguish which row was admitted).
-//
-// This test stubs the GSI to return TWO rows with DISTINCT
-// public_key strings — impossible against the real
-// `KeyConditionExpression="public_key = :pk"` query but a valid
-// adversarial fake — and asserts the returned peer's pubkey
-// matches Items[0]. Round-16 review test-coverage gap.
-func TestAgentPeerLookup_PubkeyCollisionAdmitsItemsZero(t *testing.T) {
+// TestAgentPeerLookup_PubkeyCandidateOverflowRejects fences the fail-closed
+// behavior when the pubkey-index partition has more rows than the bounded reader
+// will inspect. Even if the sentinel row is same-owner, another uninspected row
+// could hide a distinct owner, so the reader must reject without caching.
+func TestAgentPeerLookup_PubkeyCandidateOverflowRejects(t *testing.T) {
+	pk := pubkeyB64(0x7B)
+	rows := make([]map[string]types.AttributeValue, 0, agentPeerLookupMaxProjectedRows+1)
+	for i := 0; i < agentPeerLookupMaxProjectedRows+1; i++ {
+		rows = append(rows, agentKeyTestRow(pk, "owner-overflow", fmt.Sprintf("agent-overflow-%02d", i)))
+	}
+	q := &orderedAgentKeysQuerier{rows: rows}
+
+	l := newTestLookup(t, q)
+	m := &fakeCounterIncrementer{}
+	l.SetMetrics(m)
+
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentLookupPubkeyCandidateOverflow) {
+		t.Fatalf("err=%v want ErrAgentLookupPubkeyCandidateOverflow for over-cap candidate set", err)
+	}
+	if peer != nil {
+		t.Fatalf("peer=%v want nil on over-cap candidate set", peer)
+	}
+	if got := q.getCallCount(); got != 0 {
+		t.Errorf("GetItem calls=%d want 0 (overflow should reject before base reads)", got)
+	}
+	if got := q.lastLimit; got != agentPeerLookupQueryLimit {
+		t.Errorf("Query Limit=%d want %d", got, agentPeerLookupQueryLimit)
+	}
+	if got := m.count(MetricAgentLookupPubkeyCandidateOverflow); got != 1 {
+		t.Errorf("%s counter=%d want 1", MetricAgentLookupPubkeyCandidateOverflow, got)
+	}
+	if got := m.count(MetricAgentLookupPubkeyCollision); got != 0 {
+		t.Errorf("%s counter=%d want 0 on over-cap candidate set", MetricAgentLookupPubkeyCollision, got)
+	}
+}
+
+// TestAgentPeerLookup_PubkeyCandidateOverflowRejectsPaginationMarker fences the
+// LastEvaluatedKey half of the overflow guard. DynamoDB can return a short page
+// with a page marker under its response-size limits; even <=cap same-owner rows
+// must reject because an uninspected next page could hide a distinct owner.
+func TestAgentPeerLookup_PubkeyCandidateOverflowRejectsPaginationMarker(t *testing.T) {
+	pk := pubkeyB64(0x7D)
+	q := &orderedAgentKeysQuerier{
+		rows: []map[string]types.AttributeValue{
+			agentKeyTestRow(pk, "owner-paged", "agent-paged-01"),
+			agentKeyTestRow(pk, "owner-paged", "agent-paged-02"),
+		},
+		forceLastEvaluatedKey: true,
+	}
+
+	l := newTestLookup(t, q)
+	m := &fakeCounterIncrementer{}
+	l.SetMetrics(m)
+
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentLookupPubkeyCandidateOverflow) {
+		t.Fatalf("err=%v want ErrAgentLookupPubkeyCandidateOverflow for paginated candidate set", err)
+	}
+	if peer != nil {
+		t.Fatalf("peer=%v want nil when DDB reports another candidate page", peer)
+	}
+	if got := q.getCallCount(); got != 0 {
+		t.Errorf("GetItem calls=%d want 0 (pagination marker should reject before base reads)", got)
+	}
+	if got := q.lastLimit; got != agentPeerLookupQueryLimit {
+		t.Errorf("Query Limit=%d want %d", got, agentPeerLookupQueryLimit)
+	}
+	if got := m.count(MetricAgentLookupPubkeyCandidateOverflow); got != 1 {
+		t.Errorf("%s counter=%d want 1", MetricAgentLookupPubkeyCandidateOverflow, got)
+	}
+	if got := m.count(MetricAgentLookupPubkeyCollision); got != 0 {
+		t.Errorf("%s counter=%d want 0 on paginated candidate set", MetricAgentLookupPubkeyCollision, got)
+	}
+}
+
+// TestAgentPeerLookup_PubkeyCollisionRejectsBeforeRowSelection fences the
+// security property that a collision never admits Items[0] or any other
+// arbitrary row. The fake returns two distinct public_key values so any
+// accidental row-selection regression would be visible as a non-nil peer.
+func TestAgentPeerLookup_PubkeyCollisionRejectsBeforeRowSelection(t *testing.T) {
 	first := pubkeyB64(0x11)
 	second := pubkeyB64(0x22)
 	q := &distinctRowCollisionQuerier{first: first, second: second}
@@ -760,20 +1265,111 @@ func TestAgentPeerLookup_PubkeyCollisionAdmitsItemsZero(t *testing.T) {
 	l.SetMetrics(m)
 
 	peer, err := l.LookupAgentByPubKey(context.Background(), first)
+	if !errors.Is(err, ErrAgentLookupPubkeyCollision) {
+		t.Fatalf("err=%v want ErrAgentLookupPubkeyCollision", err)
+	}
+	if peer != nil {
+		t.Fatalf("peer=%v want nil on collision reject; fake rows were %q and %q", peer, first, second)
+	}
+	if got := m.count(MetricAgentLookupPubkeyCollision); got != 1 {
+		t.Errorf("%s counter=%d want 1 (collision reject must stay observable)",
+			MetricAgentLookupPubkeyCollision, got)
+	}
+}
+
+// TestAgentPeerLookup_SameOwnerDuplicatePubkeyUsesCurrentBaseRow fences the
+// qurl-service #1037 contract that the same owner may hold one pubkey under
+// multiple agent_id rows. That shape is not a cross-tenant auth ambiguity:
+// nhp-server should tolerate it, skip stale base rows, and cache the first
+// current strongly-consistent row without firing the pubkey-collision metric.
+func TestAgentPeerLookup_SameOwnerDuplicatePubkeyUsesCurrentBaseRow(t *testing.T) {
+	pk := pubkeyB64(0x78)
+	q := &sameOwnerDuplicateAgentKeysQuerier{
+		pk:           pk,
+		ownerID:      "owner-dup",
+		staleAgentID: "agent-old",
+		currentRow: map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
+			internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: "owner-dup"},
+			internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-new"},
+			internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		},
+	}
+
+	l := newTestLookup(t, q)
+	m := &fakeCounterIncrementer{}
+	l.SetMetrics(m)
+
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
 	if err != nil {
 		t.Fatalf("LookupAgentByPubKey: %v", err)
 	}
-	if peer == nil {
-		t.Fatal("peer is nil (collision should still admit Items[0])")
+	if peer == nil || peer.PubKeyBase64 != pk {
+		t.Fatalf("peer=%v want pubkey %q", peer, pk)
 	}
-	if got := peer.PublicKeyBase64(); got != first {
-		t.Errorf("admitted peer pubkey=%q want %q (Items[0]); regression "+
-			"to Items[1] or non-first row would surface here as the second pubkey %q",
-			got, first, second)
+	if got := m.count(MetricAgentLookupPubkeyCollision); got != 0 {
+		t.Errorf("%s counter=%d want 0 for same-owner duplicate", MetricAgentLookupPubkeyCollision, got)
 	}
-	if got := m.count(MetricAgentLookupPubkeyCollision); got != 1 {
-		t.Errorf("%s counter=%d want 1 (defense-in-depth fence still required)",
-			MetricAgentLookupPubkeyCollision, got)
+	if got := q.getCallCount(); got != 2 {
+		t.Errorf("GetItem calls=%d want 2 (stale same-owner row should be skipped before current row)", got)
+	}
+	if got := l.CachedOwnerID(pk); got != "owner-dup" {
+		t.Errorf("CachedOwnerID(%q)=%q want owner-dup", pk, got)
+	}
+}
+
+// TestAgentPeerLookup_SameOwnerDuplicateLaterGetItemErrorRetryAfter fences the
+// stricter side of same-owner duplicate tolerance: after one sibling is selected,
+// a transient read error on a later sibling still fails the resolve. Otherwise the
+// reader could cache a valid-looking row without checking every current sibling
+// for unsupported schema_version drift.
+func TestAgentPeerLookup_SameOwnerDuplicateLaterGetItemErrorRetryAfter(t *testing.T) {
+	pk := pubkeyB64(0x79)
+	ownerID := "owner-dup"
+	q := &sameOwnerDuplicateSecondGetErrorQuerier{
+		firstRow: map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
+			internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: ownerID},
+			internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-first"},
+			internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		},
+		secondRow: map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysPublicKeyAttr:     &types.AttributeValueMemberS{Value: pk},
+			internalauth.QURLAgentKeysOwnerIDAttr:       &types.AttributeValueMemberS{Value: ownerID},
+			internalauth.QURLAgentKeysAgentIDAttr:       &types.AttributeValueMemberS{Value: "agent-second"},
+			internalauth.QURLAgentKeysSchemaVersionAttr: &types.AttributeValueMemberN{Value: fmt.Sprint(internalauth.QURLAgentKeysSchemaVersion)},
+		},
+		secondErr: &types.ProvisionedThroughputExceededException{Message: aws.String("second sibling throttled")},
+	}
+
+	l := newTestLookup(t, q)
+	peer, err := l.LookupAgentByPubKey(context.Background(), pk)
+	if !errors.Is(err, ErrAgentLookupRetryAfter) {
+		t.Fatalf("err=%v want ErrAgentLookupRetryAfter", err)
+	}
+	if peer != nil {
+		t.Fatalf("peer=%v want nil while later same-owner sibling is unreadable", peer)
+	}
+	if got := q.getCallCount(); got != 2 {
+		t.Errorf("GetItem calls=%d want 2 (must attempt later sibling before failing closed)", got)
+	}
+	if got := l.CachedOwnerID(pk); got != "" {
+		t.Errorf("CachedOwnerID(%q)=%q want empty after retry-after; selected first sibling must not be cached", pk, got)
+	}
+
+	q.clearSecondErr()
+	peer, err = l.LookupAgentByPubKey(context.Background(), pk)
+	if err != nil {
+		t.Fatalf("recovered lookup: %v", err)
+	}
+	if peer == nil || peer.PubKeyBase64 != pk {
+		t.Fatalf("recovered peer=%v want pubkey %q", peer, pk)
+	}
+	if got := q.getCallCount(); got != 4 {
+		t.Errorf("GetItem calls=%d want 4 (retry should re-read both siblings after uncached failure)", got)
+	}
+	if got := l.CachedOwnerID(pk); got != ownerID {
+		t.Errorf("CachedOwnerID(%q)=%q want %q after recovered lookup", pk, got, ownerID)
 	}
 }
 
@@ -792,9 +1388,10 @@ func TestAgentPeerLookup_PubkeyCollisionAdmitsItemsZero(t *testing.T) {
 //     UdpServer.Start: lookup built before publisher).
 func TestAgentPeerLookup_SetMetricsSetOnceContract(t *testing.T) {
 	pk := pubkeyB64(0xAA)
-	// Use the collision-emitting querier so the metric path fires
-	// on every LookupAgentByPubKey call — that's how we observe
-	// whether SetMetrics(nil) accepted or rejected the clear.
+	// Use the collision-emitting querier so the metric path fires on every
+	// LookupAgentByPubKey call — that's how we observe whether SetMetrics(nil)
+	// accepted or rejected the clear. ErrAgentLookupPubkeyCollision is the
+	// expected result of this fixture.
 	collider := &collidingAgentKeysQuerier{pk: pk}
 	l := newTestLookup(t, collider)
 
@@ -812,8 +1409,8 @@ func TestAgentPeerLookup_SetMetricsSetOnceContract(t *testing.T) {
 	}
 
 	// Trigger one collision to baseline the counter.
-	if _, err := l.LookupAgentByPubKey(context.Background(), pk); err != nil {
-		t.Fatalf("LookupAgentByPubKey: %v", err)
+	if _, err := l.LookupAgentByPubKey(context.Background(), pk); !errors.Is(err, ErrAgentLookupPubkeyCollision) {
+		t.Fatalf("LookupAgentByPubKey err=%v want ErrAgentLookupPubkeyCollision", err)
 	}
 	if got := first.count(MetricAgentLookupPubkeyCollision); got != 1 {
 		t.Fatalf("baseline collision counter=%d want 1", got)
@@ -830,8 +1427,8 @@ func TestAgentPeerLookup_SetMetricsSetOnceContract(t *testing.T) {
 	// counter. If the set-once contract regressed, the counter would
 	// stay at 1.
 	l.invalidate(pk)
-	if _, err := l.LookupAgentByPubKey(context.Background(), pk); err != nil {
-		t.Fatalf("post-clear-attempt LookupAgentByPubKey: %v", err)
+	if _, err := l.LookupAgentByPubKey(context.Background(), pk); !errors.Is(err, ErrAgentLookupPubkeyCollision) {
+		t.Fatalf("post-clear-attempt LookupAgentByPubKey err=%v want ErrAgentLookupPubkeyCollision", err)
 	}
 	if got := first.count(MetricAgentLookupPubkeyCollision); got != 2 {
 		t.Errorf("post-clear-attempt collision counter=%d want 2 (set-once should have preserved the publisher wiring; a nil-clear-accepted regression would leave the counter at 1)", got)
@@ -848,13 +1445,12 @@ func TestAgentPeerLookup_SetMetricsSetOnceContract(t *testing.T) {
 	}
 }
 
-// TestAgentPeerLookup_CachedOwnerIDPopulated fences the KEYS_ONLY
-// metadata plumbing: after a successful LookupAgentByPubKey, the
-// resolver's CachedOwnerID returns the owner_id projected by the
-// pubkey-index GSI. The resolveAgentPeerForKnock caller reads this
-// to enrich the agent_resolved log with the tenant owner; a
-// regression that drops owner_id from agentCacheEntry would surface
-// here as an empty string.
+// TestAgentPeerLookup_CachedOwnerIDPopulated fences the cached metadata
+// plumbing: after a successful LookupAgentByPubKey, the resolver's
+// CachedOwnerID returns the owner_id read from the strongly-consistent base
+// row. The resolveAgentPeerForKnock caller reads this to enrich the
+// agent_resolved log with the tenant owner; a regression that drops owner_id
+// from agentCacheEntry would surface here as an empty string.
 //
 // Empty-pubkey lookup, expired entry, and "lookup never called for
 // this pubkey" all return "" — non-fatal cases the caller treats as
@@ -871,7 +1467,7 @@ func TestAgentPeerLookup_CachedOwnerIDPopulated(t *testing.T) {
 	}
 
 	if got := l.CachedOwnerID(pk); got != "owner-keysonly-1" {
-		t.Errorf("CachedOwnerID(%q)=%q want %q (KEYS_ONLY projection plumbing broken)",
+		t.Errorf("CachedOwnerID(%q)=%q want %q (base-row metadata plumbing broken)",
 			pk, got, "owner-keysonly-1")
 	}
 
@@ -1016,10 +1612,10 @@ func TestUdpServer_ResolveOwnerIDByPubKey(t *testing.T) {
 // hypothetical-regression fence — it exercises a code path that
 // can only arise from a future bug (e.g., the resolver query stops
 // keying on public_key, or the GSI is rebuilt with a different
-// hash key) and asserts the admit-Items[0] invariant holds in that
-// adversarial scenario. Distinct from collidingAgentKeysQuerier
+// hash key) and asserts the reader rejects before selecting either
+// arbitrary row. Distinct from collidingAgentKeysQuerier
 // (same-pubkey-twice), which exercises the production-reachable
-// writer-side soft-uniqueness-failed-open case.
+// invariant-drift case.
 type distinctRowCollisionQuerier struct {
 	first  string
 	second string
@@ -1027,16 +1623,74 @@ type distinctRowCollisionQuerier struct {
 
 func (d *distinctRowCollisionQuerier) Query(_ context.Context, _ *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
 	row0 := map[string]types.AttributeValue{
-		"public_key": &types.AttributeValueMemberS{Value: d.first},
+		internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: d.first},
+		internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: "owner-distinct-a"},
+		internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: "agent-distinct-a"},
 	}
 	row1 := map[string]types.AttributeValue{
-		"public_key": &types.AttributeValueMemberS{Value: d.second},
+		internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: d.second},
+		internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: "owner-distinct-b"},
+		internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: "agent-distinct-b"},
 	}
 	return &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{row0, row1}}, nil
 }
 
-// fakeCounterIncrementer captures IncrCounter calls so collision
-// tests can assert MetricAgentLookupPubkeyCollision fired.
+func (d *distinctRowCollisionQuerier) GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	return nil, errors.New("distinctRowCollisionQuerier.GetItem should not be called after collision Query")
+}
+
+// splitAgentKeysQuerier lets tests independently control the eventually
+// consistent GSI projection and the strongly-consistent base-table read.
+// The main fake keeps those surfaces coupled, which is the common happy
+// path but cannot express stale-GSI convergence edges.
+type splitAgentKeysQuerier struct {
+	mu         sync.Mutex
+	queryItem  map[string]types.AttributeValue
+	getItem    map[string]types.AttributeValue
+	queryCalls int
+	getCalls   int
+}
+
+func (s *splitAgentKeysQuerier) Query(context.Context, *dynamodb.QueryInput, ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queryCalls++
+	if s.queryItem == nil {
+		return &dynamodb.QueryOutput{}, nil
+	}
+	return &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{cloneAgentKeyRow(s.queryItem)}}, nil
+}
+
+func (s *splitAgentKeysQuerier) GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getCalls++
+	if s.getItem == nil {
+		return &dynamodb.GetItemOutput{}, nil
+	}
+	return &dynamodb.GetItemOutput{Item: cloneAgentKeyRow(s.getItem)}, nil
+}
+
+func (s *splitAgentKeysQuerier) setGetItem(row map[string]types.AttributeValue) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getItem = cloneAgentKeyRow(row)
+}
+
+func (s *splitAgentKeysQuerier) queryCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queryCalls
+}
+
+func (s *splitAgentKeysQuerier) getCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
+}
+
+// fakeCounterIncrementer captures IncrCounter calls so guardrail tests can
+// assert the right forensic counter fired.
 type fakeCounterIncrementer struct {
 	mu     sync.Mutex
 	counts map[string]int
@@ -1057,10 +1711,173 @@ func (f *fakeCounterIncrementer) count(name string) int {
 	return f.counts[name]
 }
 
-// collidingAgentKeysQuerier returns TWO rows for the configured
-// pubkey on every Query — simulating the writer-side uniqueness
-// invariant failing open (two owners' bootstrap registrations
-// racing or a rotation-orphan row that hasn't TTL-expired).
+// sameOwnerDuplicateAgentKeysQuerier returns two projected rows for the same
+// owner/public_key but makes the first base row look stale/deleted. It models
+// the qurl-service #1037 same-owner multi-agent_id allowance plus a
+// reconciliation window where one GSI projection outlives its base row.
+type sameOwnerDuplicateAgentKeysQuerier struct {
+	pk           string
+	ownerID      string
+	staleAgentID string
+	currentRow   map[string]types.AttributeValue
+
+	mu       sync.Mutex
+	getCalls int
+}
+
+func (s *sameOwnerDuplicateAgentKeysQuerier) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
+	if in.Limit == nil || *in.Limit != agentPeerLookupQueryLimit {
+		return nil, fmt.Errorf("sameOwnerDuplicateAgentKeysQuerier Query Limit=%v want %d", in.Limit, agentPeerLookupQueryLimit)
+	}
+	currentAgentID := stringAttr(s.currentRow, internalauth.QURLAgentKeysAgentIDAttr)
+	stale := map[string]types.AttributeValue{
+		internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: s.pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: s.ownerID},
+		internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: s.staleAgentID},
+	}
+	current := map[string]types.AttributeValue{
+		internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: s.pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: s.ownerID},
+		internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: currentAgentID},
+	}
+	return &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{stale, current}}, nil
+}
+
+func (s *sameOwnerDuplicateAgentKeysQuerier) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getCalls++
+
+	if stringAttr(in.Key, internalauth.QURLAgentKeysAgentIDAttr) == s.staleAgentID {
+		return &dynamodb.GetItemOutput{}, nil
+	}
+	return &dynamodb.GetItemOutput{Item: cloneAgentKeyRow(s.currentRow)}, nil
+}
+
+func (s *sameOwnerDuplicateAgentKeysQuerier) getCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
+}
+
+// sameOwnerDuplicateSecondGetErrorQuerier returns two current same-owner
+// siblings and injects a transient GetItem error for the second. It fences the
+// fail-closed choice that every bounded sibling must be readable before caching.
+type sameOwnerDuplicateSecondGetErrorQuerier struct {
+	firstRow  map[string]types.AttributeValue
+	secondRow map[string]types.AttributeValue
+
+	mu        sync.Mutex
+	getCalls  int
+	secondErr error
+}
+
+func (s *sameOwnerDuplicateSecondGetErrorQuerier) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
+	if in.Limit == nil || *in.Limit != agentPeerLookupQueryLimit {
+		return nil, fmt.Errorf("sameOwnerDuplicateSecondGetErrorQuerier Query Limit=%v want %d", in.Limit, agentPeerLookupQueryLimit)
+	}
+	return &dynamodb.QueryOutput{
+		Items: []map[string]types.AttributeValue{
+			projectedAgentKeyRow(s.firstRow),
+			projectedAgentKeyRow(s.secondRow),
+		},
+	}, nil
+}
+
+func (s *sameOwnerDuplicateSecondGetErrorQuerier) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getCalls++
+
+	agentID := stringAttr(in.Key, internalauth.QURLAgentKeysAgentIDAttr)
+	if agentID == stringAttr(s.secondRow, internalauth.QURLAgentKeysAgentIDAttr) && s.secondErr != nil {
+		return nil, s.secondErr
+	}
+	for _, row := range []map[string]types.AttributeValue{s.firstRow, s.secondRow} {
+		if stringAttr(row, internalauth.QURLAgentKeysAgentIDAttr) == agentID {
+			return &dynamodb.GetItemOutput{Item: cloneAgentKeyRow(row)}, nil
+		}
+	}
+	return &dynamodb.GetItemOutput{}, nil
+}
+
+func (s *sameOwnerDuplicateSecondGetErrorQuerier) clearSecondErr() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.secondErr = nil
+}
+
+func (s *sameOwnerDuplicateSecondGetErrorQuerier) getCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
+}
+
+// orderedAgentKeysQuerier returns rows in the supplied order and respects the
+// Query Limit, so tests can model GSI partition ordering and hidden follow-on
+// pages. GetItem returns the matching base row when the resolver gets that far.
+type orderedAgentKeysQuerier struct {
+	rows []map[string]types.AttributeValue
+
+	forceLastEvaluatedKey bool
+
+	mu        sync.Mutex
+	getCalls  int
+	lastLimit int32
+}
+
+func (o *orderedAgentKeysQuerier) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
+	o.mu.Lock()
+	if in.Limit != nil {
+		o.lastLimit = *in.Limit
+	}
+	o.mu.Unlock()
+
+	limit := len(o.rows)
+	if in.Limit != nil && int(*in.Limit) < limit {
+		limit = int(*in.Limit)
+	}
+	items := make([]map[string]types.AttributeValue, 0, limit)
+	for _, row := range o.rows[:limit] {
+		items = append(items, projectedAgentKeyRow(row))
+	}
+	out := &dynamodb.QueryOutput{Items: items}
+	if limit > 0 && (limit < len(o.rows) || o.forceLastEvaluatedKey) {
+		last := o.rows[limit-1]
+		out.LastEvaluatedKey = map[string]types.AttributeValue{
+			internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: stringAttr(last, internalauth.QURLAgentKeysPublicKeyAttr)},
+			internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: stringAttr(last, internalauth.QURLAgentKeysOwnerIDAttr)},
+			internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: stringAttr(last, internalauth.QURLAgentKeysAgentIDAttr)},
+		}
+	}
+	return out, nil
+}
+
+func (o *orderedAgentKeysQuerier) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.getCalls++
+
+	ownerID := stringAttr(in.Key, internalauth.QURLAgentKeysOwnerIDAttr)
+	agentID := stringAttr(in.Key, internalauth.QURLAgentKeysAgentIDAttr)
+	for _, row := range o.rows {
+		if stringAttr(row, internalauth.QURLAgentKeysOwnerIDAttr) == ownerID &&
+			stringAttr(row, internalauth.QURLAgentKeysAgentIDAttr) == agentID {
+			return &dynamodb.GetItemOutput{Item: cloneAgentKeyRow(row)}, nil
+		}
+	}
+	return &dynamodb.GetItemOutput{}, nil
+}
+
+func (o *orderedAgentKeysQuerier) getCallCount() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.getCalls
+}
+
+// collidingAgentKeysQuerier returns TWO rows for the configured pubkey on every
+// Query — simulating legacy duplicate data, manual mutation, or writer-side
+// uniqueness invariant drift.
 type collidingAgentKeysQuerier struct {
 	pk        string
 	mu        sync.Mutex
@@ -1076,9 +1893,20 @@ func (c *collidingAgentKeysQuerier) Query(_ context.Context, in *dynamodb.QueryI
 	}
 	c.mu.Unlock()
 	row := map[string]types.AttributeValue{
-		"public_key": &types.AttributeValueMemberS{Value: c.pk},
+		internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: c.pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: "owner-collision-a"},
+		internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: "agent-collision-a"},
 	}
-	return &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{row, row}}, nil
+	other := map[string]types.AttributeValue{
+		internalauth.QURLAgentKeysPublicKeyAttr: &types.AttributeValueMemberS{Value: c.pk},
+		internalauth.QURLAgentKeysOwnerIDAttr:   &types.AttributeValueMemberS{Value: "owner-collision-b"},
+		internalauth.QURLAgentKeysAgentIDAttr:   &types.AttributeValueMemberS{Value: "agent-collision-b"},
+	}
+	return &dynamodb.QueryOutput{Items: []map[string]types.AttributeValue{row, other}}, nil
+}
+
+func (c *collidingAgentKeysQuerier) GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	return nil, errors.New("collidingAgentKeysQuerier.GetItem should not be called after collision Query")
 }
 
 // TestUnwrapDynamoDBStorage_NilInputReturnsNilNoError asserts the
@@ -1343,8 +2171,9 @@ func (c *selfLoopBackendShim) Backend() StorageBackend {
 // shape assertions. Forwards the actual response to the inner fake
 // so assertion-only tests still get meaningful data back.
 type captureAgentKeysQuerier struct {
-	inner     *fakeAgentKeysQuerier
-	captureFn func(in *dynamodb.QueryInput)
+	inner        *fakeAgentKeysQuerier
+	captureFn    func(in *dynamodb.QueryInput)
+	captureGetFn func(in *dynamodb.GetItemInput)
 }
 
 func (c *captureAgentKeysQuerier) Query(ctx context.Context, in *dynamodb.QueryInput, opts ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
@@ -1352,4 +2181,11 @@ func (c *captureAgentKeysQuerier) Query(ctx context.Context, in *dynamodb.QueryI
 		c.captureFn(in)
 	}
 	return c.inner.Query(ctx, in, opts...)
+}
+
+func (c *captureAgentKeysQuerier) GetItem(ctx context.Context, in *dynamodb.GetItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	if c.captureGetFn != nil {
+		c.captureGetFn(in)
+	}
+	return c.inner.GetItem(ctx, in, opts...)
 }
