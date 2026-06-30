@@ -97,19 +97,43 @@ func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 		t.Fatalf("broadcast returned error: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	waitForAOPs := func(addrs ...string) map[string]bool {
+		t.Helper()
+
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for {
+			mu.Lock()
+			snapshot := make(map[string]bool, len(gotAOP))
+			for addr, seen := range gotAOP {
+				snapshot[addr] = seen
+			}
+			mu.Unlock()
+
+			allSeen := true
+			for _, addr := range addrs {
+				if !snapshot[addr] {
+					allSeen = false
+					break
+				}
+			}
+			if allSeen || time.Now().After(deadline) {
+				return snapshot
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	got := waitForAOPs(alphaAddr, betaAddr)
 
 	// PROOF 2 — the two locally-connected ACs got the pinhole AOP (GET1's AC).
-	if !gotAOP[alphaAddr] || !gotAOP[betaAddr] {
-		t.Fatalf("expected pinhole AOP on both locally-connected ACs; got %v", gotAOP)
+	if !got[alphaAddr] || !got[betaAddr] {
+		t.Fatalf("expected pinhole AOP on both locally-connected ACs; got %v", got)
 	}
 
 	// PROOF 3 — gamma, a healthy AC NLB target the viewer GET can be hashed to,
 	// received NO admission AOP and therefore has no pinhole. The GET the NLB
 	// routes to gamma is dropped for the full client timeout. This is the #948
 	// coverage gap, reproduced against real server code.
-	if gotAOP[gammaAddr] {
+	if got[gammaAddr] {
 		t.Fatalf("gamma unexpectedly received an AOP — the coverage gap did not reproduce")
 	}
 	t.Logf("COVERAGE GAP REPRODUCED: knock opened pinholes on %d/3 fleet ACs (alpha,beta); "+

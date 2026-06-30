@@ -481,6 +481,14 @@ const (
 	//                        already succeeded (post-knock failure). Only
 	//                        Success + FailKnock count call attempts that
 	//                        exercised the retry policy.
+	// Keep the terminal outcome set below in sync with
+	// terraform/modules/monitoring/main.tf
+	// (aws_cloudwatch_metric_alarm.qurl_browser_rejected_ratio). That alarm's
+	// denominator intentionally includes Success plus every Fail* outcome;
+	// adding another terminal outcome without updating Terraform inflates the
+	// rejected-field ratio. The alarm currently uses 8 of CloudWatch
+	// PutMetricAlarm's 10 MetricStat slots plus 2 of its 10 Expression slots,
+	// so any new terminal outcome also has to re-check metric-math headroom.
 	MetricQurlResolveDurationMs         = "QurlResolveDurationMs"
 	MetricQurlResolveTokenValidateMs    = "QurlResolveTokenValidateMs"
 	MetricQurlResolveCatalogResolveMs   = "QurlResolveCatalogResolveMs"
@@ -520,6 +528,13 @@ const (
 	//     histogram contamination.
 	//   - Two counters rather than one with a dimension because the
 	//     helper.IncrCounter callback only accepts a name.
+	//     CloudWatch alarms live in terraform/modules/monitoring/main.tf
+	//     as aws_cloudwatch_metric_alarm.qurl_browser_rejected_ratio:
+	//     `${name_prefix}-${cell_id}-qurl-browser-rejected-malformed-ratio`
+	//     and `${name_prefix}-${cell_id}-qurl-browser-rejected-out-of-range-ratio`.
+	//     They alarm on rejected-count / QurlResolve{Success,Fail*} ratio, not
+	//     raw rejected count, because one request can carry up to six forged
+	//     timing fields.
 	//   - No cross-field coherence check. The natural candidate
 	//     (submitReadyMs >= domInteractive) is inverted under W3C HTML
 	//     parsing semantics: the parser executes <script> synchronously

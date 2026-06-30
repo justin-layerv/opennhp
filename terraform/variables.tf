@@ -614,6 +614,12 @@ variable "chatbot_owned_externally" {
   default     = false
 }
 
+variable "qurl_browser_rejected_alarm_actions_enabled" {
+  description = "Enable SNS actions for the qURL browser timing rejected-ratio alarms. Leave false for the initial #1840 report-only bake; flip true after the 7-day bake confirms the calibrated thresholds stay quiet outside intentional rejection tests."
+  type        = bool
+  default     = false
+}
+
 # ==================== ASG Lifecycle Hook ====================
 
 variable "enable_termination_cleanup" {

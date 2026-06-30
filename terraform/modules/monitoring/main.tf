@@ -64,6 +64,33 @@ locals {
     }
   }
 
+  # qURL browser timing rejection-ratio alarms (#1840). The alarm thresholds are
+  # rejected browser timing fields per qURL resolve attempt, not percentages of
+  # requests. Baseline query captured 2026-06-30 over the prior 14d at 5m
+  # resolution:
+  #   sandbox/cell0: malformed max=0.154, out_of_range max=0.231
+  #   prod/cell0:    both 0
+  # These start above the sandbox noise floor and require three consecutive
+  # breaching 5m periods before the alarm enters ALARM.
+  qurl_browser_rejected_alarms = {
+    malformed = {
+      metric_name     = "QurlResolveBrowserRejectedMalformed"
+      suffix          = "qurl-browser-rejected-malformed-ratio"
+      threshold       = 0.20
+      label           = "Malformed rejected browser timing fields per resolve attempt"
+      numerator_label = "Malformed browser timing rejected fields"
+      description     = "qURL malformed browser timing rejected-fields-per-resolve-attempt ratio"
+    }
+    out_of_range = {
+      metric_name     = "QurlResolveBrowserRejectedOutOfRange"
+      suffix          = "qurl-browser-rejected-out-of-range-ratio"
+      threshold       = 0.30
+      label           = "Out-of-range rejected browser timing fields per resolve attempt"
+      numerator_label = "Out-of-range browser timing rejected fields"
+      description     = "qURL out-of-range browser timing rejected-fields-per-resolve-attempt ratio"
+    }
+  }
+
   # Knock forward-path health alarms (issue #2449). Both share the
   # single-event-detector shape below (see the resource for the calibration
   # rationale); they differ only in which counter they watch. A map + for_each
@@ -938,6 +965,125 @@ resource "aws_cloudwatch_metric_alarm" "internal_security_failure" {
     Component = "monitoring"
     Cell      = var.cell_id
     Issue     = "1140"
+  })
+}
+
+# qURL browser timing rejection-ratio alarms (#1840). The rejected counters are
+# emitted from endpoints/server/staticplugins/qurl/main.go through the
+# HttpServerPluginHelper bound in httpserver.go to the nhp-server CloudWatch
+# publisher. That publisher's base dim set is {Environment, Cell}
+# (buildServerMetricDimensions in endpoints/server/udpserver.go), so every
+# metric query below must use exactly those dimensions.
+#
+# Why metric math instead of raw counter alarms: recordBrowserTimings parses up
+# to six fields per request, so one forged request can increment a rejected
+# counter multiple times. Alert on rejected fields / resolve outcomes, not
+# percentage of requests, to avoid paging purely because resolve traffic
+# increased.
+#
+# Denominator: all qURL resolve outcome counters. QurlResolveFailValidate
+# includes pre-timing token-format rejects, which dilutes scanner noise, but it
+# matches the issue's requested "resolve attempt" model and keeps the ratio
+# stable against total endpoint traffic rather than only successful knocks.
+# The #2924 activation follow-up must verify the ratio still moves under an
+# intentional forged-timing burst before enabling actions.
+# This alarm uses 8 of CloudWatch PutMetricAlarm's 10 MetricStat slots
+# (1 rejected counter + 7 outcome counters) plus 2 of its 10 Expression slots
+# (10 of 20 total MetricDataQuery entries). If another terminal QurlResolve
+# outcome is added, update this denominator and re-check the remaining
+# metric-math budget plus the per-referenced-metric alarm cost before adding it
+# here.
+#
+# Publisher liveness backstop: server_publisher_failures covers intermittent
+# PutMetricData drops, and server-cloudmap-register-refresh-heartbeat covers
+# total publisher death. This sparse ratio intentionally stays notBreaching when
+# no qURL resolve metrics are emitted.
+#
+# Rollout posture: alarm and OK actions are wired but paused by default while
+# the alarms bake against live sandbox/prod data. Before flipping
+# var.qurl_browser_rejected_alarm_actions_enabled, the #2924 activation review
+# must explicitly keep or remove OK recovery notifications for this sensitive
+# sparse-ratio alarm.
+resource "aws_cloudwatch_metric_alarm" "qurl_browser_rejected_ratio" {
+  for_each = local.qurl_browser_rejected_alarms
+
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-${each.value.suffix}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  threshold           = each.value.threshold
+  alarm_description   = "${each.value.description} exceeded ${format("%.2f rejected fields per resolve attempt", each.value.threshold)} for 15 minutes. Numerator is ${each.value.metric_name}; denominator is QurlResolveSuccess + QurlResolveFail*. Trust model: endpoints/server/msghandler.go::QurlResolveBrowser*. Terraform alarm: aws_cloudwatch_metric_alarm.qurl_browser_rejected_ratio[\"${each.key}\"]. #1840."
+  actions_enabled     = var.qurl_browser_rejected_alarm_actions_enabled
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "ratio"
+    expression  = "IF(resolve_attempts > 0, FILL(rejected, 0) / resolve_attempts, 0)"
+    label       = each.value.label
+    return_data = true
+  }
+
+  metric_query {
+    id          = "resolve_attempts"
+    expression  = "FILL(success, 0) + FILL(fail_validate, 0) + FILL(fail_resolve_catalog, 0) + FILL(fail_knock, 0) + FILL(fail_post_knock, 0) + FILL(fail_canceled, 0) + FILL(fail_unknown, 0)"
+    label       = "qURL resolve outcomes"
+    return_data = false
+  }
+
+  metric_query {
+    id          = "rejected"
+    label       = each.value.numerator_label
+    return_data = false
+
+    metric {
+      metric_name = each.value.metric_name
+      namespace   = "LayerV/NHP"
+      period      = 300
+      stat        = "Sum"
+
+      dimensions = {
+        Environment = var.environment
+        Cell        = var.cell_id
+      }
+    }
+  }
+
+  dynamic "metric_query" {
+    for_each = {
+      success              = "QurlResolveSuccess"
+      fail_validate        = "QurlResolveFailValidate"
+      fail_resolve_catalog = "QurlResolveFailResolveCatalog"
+      fail_knock           = "QurlResolveFailKnock"
+      fail_post_knock      = "QurlResolveFailPostKnock"
+      fail_canceled        = "QurlResolveFailCanceled"
+      fail_unknown         = "QurlResolveFailUnknown"
+    }
+    iterator = outcome
+
+    content {
+      id          = outcome.key
+      return_data = false
+
+      metric {
+        metric_name = outcome.value
+        namespace   = "LayerV/NHP"
+        period      = 300
+        stat        = "Sum"
+
+        dimensions = {
+          Environment = var.environment
+          Cell        = var.cell_id
+        }
+      }
+    }
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+    Issue     = "1840"
   })
 }
 

@@ -134,6 +134,94 @@ RELAY_FORWARD_REJECT_BLOCK = textwrap.dedent(
     """
 ).strip()
 
+QURL_BROWSER_REJECTED_RATIO_BLOCK = textwrap.dedent(
+    """
+    locals {
+      qurl_browser_rejected_alarms = {
+        malformed = {
+          metric_name = "QurlResolveBrowserRejectedMalformed"
+        }
+        out_of_range = {
+          metric_name = "QurlResolveBrowserRejectedOutOfRange"
+        }
+      }
+    }
+
+    resource "aws_cloudwatch_metric_alarm" "qurl_browser_rejected_ratio" {
+      for_each = local.qurl_browser_rejected_alarms
+
+      alarm_name          = "${var.name_prefix}-${var.cell_id}-${each.value.suffix}"
+      comparison_operator = "GreaterThanThreshold"
+      evaluation_periods  = 3
+      datapoints_to_alarm = 3
+      threshold           = each.value.threshold
+      actions_enabled     = var.qurl_browser_rejected_alarm_actions_enabled
+      alarm_actions       = [aws_sns_topic.alerts.arn]
+      ok_actions          = [aws_sns_topic.alerts.arn]
+      treat_missing_data  = "notBreaching"
+
+      metric_query {
+        id          = "ratio"
+        expression  = "IF(resolve_attempts > 0, FILL(rejected, 0) / resolve_attempts, 0)"
+        return_data = true
+      }
+
+      metric_query {
+        id          = "resolve_attempts"
+        expression  = "FILL(success, 0) + FILL(fail_validate, 0) + FILL(fail_resolve_catalog, 0) + FILL(fail_knock, 0) + FILL(fail_post_knock, 0) + FILL(fail_canceled, 0) + FILL(fail_unknown, 0)"
+        return_data = false
+      }
+
+      metric_query {
+        id          = "rejected"
+        return_data = false
+
+        metric {
+          metric_name = each.value.metric_name
+          namespace   = "LayerV/NHP"
+          period      = 300
+          stat        = "Sum"
+
+          dimensions = {
+            Environment = var.environment
+            Cell        = var.cell_id
+          }
+        }
+      }
+
+      dynamic "metric_query" {
+        for_each = {
+          success              = "QurlResolveSuccess"
+          fail_validate        = "QurlResolveFailValidate"
+          fail_resolve_catalog = "QurlResolveFailResolveCatalog"
+          fail_knock           = "QurlResolveFailKnock"
+          fail_post_knock      = "QurlResolveFailPostKnock"
+          fail_canceled        = "QurlResolveFailCanceled"
+          fail_unknown         = "QurlResolveFailUnknown"
+        }
+        iterator = outcome
+
+        content {
+          id          = outcome.key
+          return_data = false
+
+          metric {
+            metric_name = outcome.value
+            namespace   = "LayerV/NHP"
+            period      = 300
+            stat        = "Sum"
+
+            dimensions = {
+              Environment = var.environment
+              Cell        = var.cell_id
+            }
+          }
+        }
+      }
+    }
+    """
+).strip()
+
 
 def build_fixture(root: Path) -> None:
     write(
@@ -148,6 +236,7 @@ def build_fixture(root: Path) -> None:
           server_stderr_log_group_name = module.compute.log_group_stderr_name
           name_prefix                  = local.name_prefix
           chatbot_owned_externally     = var.chatbot_owned_externally
+          qurl_browser_rejected_alarm_actions_enabled = var.qurl_browser_rejected_alarm_actions_enabled
           deploy_relay                 = var.deploy_relay
         }
 
@@ -204,6 +293,8 @@ def build_fixture(root: Path) -> None:
         # replacement anchor could drift and silently no-op those tests.
         + "\n\n"
         + RELAY_FORWARD_REJECT_BLOCK
+        + "\n\n"
+        + QURL_BROWSER_REJECTED_RATIO_BLOCK
         + "\n",
     )
     write(
@@ -317,6 +408,7 @@ def build_fixture(root: Path) -> None:
               slack_workspace_id         = var.slack_workspace_id
               slack_channel_id           = var.slack_channel_id
               chatbot_owned_externally   = var.chatbot_owned_externally
+              qurl_browser_rejected_alarm_actions_enabled = var.qurl_browser_rejected_alarm_actions_enabled
             }
             """,
         )
@@ -351,6 +443,11 @@ def build_fixture(root: Path) -> None:
             variable "chatbot_owned_externally" {
               type    = bool
               default = true
+            }
+
+            variable "qurl_browser_rejected_alarm_actions_enabled" {
+              type    = bool
+              default = false
             }
             """,
         )
@@ -827,6 +924,111 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("server_forward_target_drop", result.stderr)
         self.assertIn("alarm_actions", result.stderr)
+
+    def test_qurl_browser_rejected_ratio_dimension_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_text = monitoring_main.read_text(encoding="utf-8")
+            qurl_alarm_start = monitoring_text.index(
+                'resource "aws_cloudwatch_metric_alarm" "qurl_browser_rejected_ratio"'
+            )
+            monitoring_main.write_text(
+                monitoring_text[:qurl_alarm_start]
+                + monitoring_text[qurl_alarm_start:].replace(
+                    "        Cell        = var.cell_id\n",
+                    "        Region      = var.aws_region\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_browser_rejected_ratio", result.stderr)
+        self.assertIn("dimensions", result.stderr)
+
+    def test_qurl_browser_rejected_ratio_actions_enabled_wiring_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    "  actions_enabled     = var.qurl_browser_rejected_alarm_actions_enabled\n",
+                    "  actions_enabled     = true\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_browser_rejected_ratio", result.stderr)
+        self.assertIn("actions_enabled", result.stderr)
+
+    def test_qurl_browser_rejected_ratio_math_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    "IF(resolve_attempts > 0, FILL(rejected, 0) / resolve_attempts, 0)",
+                    "FILL(rejected, 0)",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_browser_rejected_ratio", result.stderr)
+        self.assertIn("normalized by resolve attempts", result.stderr)
+
+    def test_qurl_browser_rejected_ratio_numerator_wiring_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    "      metric_name = each.value.metric_name\n",
+                    '      metric_name = "QurlResolveBrowserRejectedMalformed"\n',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_browser_rejected_ratio", result.stderr)
+        self.assertIn("selected alarm metric", result.stderr)
+
+    def test_qurl_browser_rejected_ratio_denominator_wiring_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_text = monitoring_main.read_text(encoding="utf-8")
+            mutated = monitoring_text.replace(
+                'fail_unknown         = "QurlResolveFailUnknown"',
+                'fail_unknown         = "QurlResolveFailOther"',
+                1,
+            )
+            self.assertNotEqual(mutated, monitoring_text)
+            monitoring_main.write_text(mutated, encoding="utf-8")
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_browser_rejected_ratio", result.stderr)
+        self.assertIn("denominator/numerator set", result.stderr)
 
     def test_ac_registration_stale_action_wiring_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -697,10 +697,11 @@ module "monitoring" {
   asg_name                            = module.compute.asg_name
   # Observability parity expressions are fenced by
   # scripts/check-observability-parity.py.
-  server_log_group_name        = module.compute.log_group_name
-  server_stderr_log_group_name = module.compute.log_group_stderr_name
-  name_prefix                  = local.name_prefix
-  tags                         = local.common_tags
+  server_log_group_name                       = module.compute.log_group_name
+  server_stderr_log_group_name                = module.compute.log_group_stderr_name
+  name_prefix                                 = local.name_prefix
+  tags                                        = local.common_tags
+  qurl_browser_rejected_alarm_actions_enabled = var.qurl_browser_rejected_alarm_actions_enabled
 
   # Slack integration
   enable_slack_notifications = var.enable_slack_notifications

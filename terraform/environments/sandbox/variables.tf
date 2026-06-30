@@ -318,6 +318,12 @@ variable "chatbot_owned_externally" {
   default     = true
 }
 
+variable "qurl_browser_rejected_alarm_actions_enabled" {
+  description = "Enable SNS actions for the qURL browser timing rejected-ratio alarms. Default false keeps the initial #1840 rollout report-only while thresholds bake."
+  type        = bool
+  default     = false
+}
+
 # Production domains
 variable "production_domains" {
   type    = list(string)

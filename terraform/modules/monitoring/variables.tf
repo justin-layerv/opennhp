@@ -151,6 +151,12 @@ variable "alert_emails" {
   default     = []
 }
 
+variable "qurl_browser_rejected_alarm_actions_enabled" {
+  description = "Whether qURL browser timing rejection-ratio alarms should execute alarm/OK actions. Defaults false so the #1840 alarms can bake report-only for 7 days before paging is enabled."
+  type        = bool
+  default     = false
+}
+
 # Mirrors the root var.deploy_relay (= compute's relay_enabled). Static input
 # boolean, so it is safe to use directly in an alarm `count` (no
 # count-depends-on-computed problem — contrast compute's enable_sns_alerts,

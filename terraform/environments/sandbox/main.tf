@@ -71,10 +71,11 @@ module "nhp" {
   nhp_udp_recv_buffer_bytes         = var.nhp_udp_recv_buffer_bytes
 
   # Monitoring
-  enable_slack_notifications = var.enable_slack_notifications
-  slack_workspace_id         = var.slack_workspace_id
-  slack_channel_id           = var.slack_channel_id
-  chatbot_owned_externally   = var.chatbot_owned_externally
+  enable_slack_notifications                  = var.enable_slack_notifications
+  slack_workspace_id                          = var.slack_workspace_id
+  slack_channel_id                            = var.slack_channel_id
+  chatbot_owned_externally                    = var.chatbot_owned_externally
+  qurl_browser_rejected_alarm_actions_enabled = var.qurl_browser_rejected_alarm_actions_enabled
 
   # QURL domains (sandbox uses layerv.xyz subdomains)
   production_domains     = var.production_domains

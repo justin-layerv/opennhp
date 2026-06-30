@@ -115,7 +115,7 @@ fail=0
 # option flag — defensive, since need()/need_window() take arbitrary
 # caller-supplied patterns.
 need() { # need <egrep-pattern> <human message>
-  if ! printf '%s\n' "$notify_block" | grep -qE -e "$1"; then
+  if ! grep -qE -e "$1" <<<"$notify_block"; then
     printf '  \033[31m✗\033[0m %s\n' "$2" >&2
     fail=1
   fi
@@ -126,17 +126,19 @@ need() { # need <egrep-pattern> <human message>
 # the thing it guards: a bare "both strings exist somewhere in the block" can't
 # tell that the gate was detached from (or the guarded block deleted out from
 # under) it. `head -1` takes the first anchor; `|| true` tolerates grep's
-# no-match exit under `set -euo pipefail`.
+# `grep -m 1` takes the first anchor without piping into `head`; that avoids a
+# GNU grep/pipefail false negative when the real notify block is large.
 need_window() { # need_window <anchor-egrep> <gap> <target-egrep> <human message>
-  local anchor="$1" gap="$2" target="$3" msg="$4" aline slice
-  aline=$(printf '%s\n' "$notify_block" | grep -nE -e "$anchor" | head -1 | cut -d: -f1) || true
+  local anchor="$1" gap="$2" target="$3" msg="$4" aline anchor_match slice
+  anchor_match=$(grep -nE -m 1 -e "$anchor" <<<"$notify_block" || true)
+  aline="${anchor_match%%:*}"
   if [ -z "$aline" ]; then
     printf '  \033[31m✗\033[0m %s (anchor not found)\n' "$msg" >&2
     fail=1
     return
   fi
-  slice=$(printf '%s\n' "$notify_block" | awk -v s="$aline" -v g="$gap" 'NR>=s && NR<=s+g')
-  if ! printf '%s\n' "$slice" | grep -qE -e "$target"; then
+  slice=$(awk -v s="$aline" -v g="$gap" 'NR>=s && NR<=s+g' <<<"$notify_block")
+  if ! grep -qE -e "$target" <<<"$slice"; then
     printf '  \033[31m✗\033[0m %s (not found within %s lines of its anchor)\n' "$msg" "$gap" >&2
     fail=1
   fi

@@ -302,6 +302,30 @@ def require_assignment(block: HclBlock, key: str, expected: str) -> None:
         )
 
 
+def require_block_text(block: HclBlock, needle: str, reason: str) -> None:
+    if needle not in block.body:
+        raise LintError(f"{_block_location(block)} missing `{needle}` ({reason})")
+
+
+def has_metric_name(text: str, metric_name: str) -> bool:
+    return (
+        re.search(rf'\bmetric_name\s*=\s*"{re.escape(metric_name)}"', text)
+        is not None
+    )
+
+
+def require_hcl_map_entry(
+    block: HclBlock, key: str, value: str, reason: str
+) -> None:
+    if not re.search(
+        rf'(?m)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*"{re.escape(value)}"[ \t]*$',
+        block.body,
+    ):
+        raise LintError(
+            f'{_block_location(block)} missing `{key} = "{value}"` ({reason})'
+        )
+
+
 def map_assignment(block: HclBlock, key: str) -> dict[str, str] | None:
     # Deliberately narrow like assignment(): relay/monitoring dimensions are
     # simple string expressions today. If a pinned map grows multi-line values,
@@ -563,6 +587,7 @@ def check_env_root(repo: Path, env: str) -> None:
         "slack_workspace_id",
         "slack_channel_id",
         "chatbot_owned_externally",
+        "qurl_browser_rejected_alarm_actions_enabled",
     ]
     for name in passthroughs:
         require_variable(variables, name)
@@ -598,6 +623,11 @@ def check_root_module(repo: Path) -> None:
     require_assignment(monitoring, "name_prefix", "local.name_prefix")
     require_assignment(
         monitoring, "chatbot_owned_externally", "var.chatbot_owned_externally"
+    )
+    require_assignment(
+        monitoring,
+        "qurl_browser_rejected_alarm_actions_enabled",
+        "var.qurl_browser_rejected_alarm_actions_enabled",
     )
     require_assignment(monitoring, "deploy_relay", "var.deploy_relay")
 
@@ -716,6 +746,81 @@ def check_shared_resources(repo: Path) -> None:
         "dimensions",
         {"Environment": "var.environment", "Cell": "var.cell_id"},
     )
+    qurl_browser_rejected_ratio = find_block(
+        monitoring_main,
+        'resource "aws_cloudwatch_metric_alarm"',
+        "qurl_browser_rejected_ratio",
+    )
+    require_assignment(
+        qurl_browser_rejected_ratio,
+        "for_each",
+        "local.qurl_browser_rejected_alarms",
+    )
+    require_assignment(qurl_browser_rejected_ratio, "threshold", "each.value.threshold")
+    require_assignment(qurl_browser_rejected_ratio, "evaluation_periods", "3")
+    require_assignment(qurl_browser_rejected_ratio, "datapoints_to_alarm", "3")
+    require_assignment(
+        qurl_browser_rejected_ratio,
+        "actions_enabled",
+        "var.qurl_browser_rejected_alarm_actions_enabled",
+    )
+    require_assignment(
+        qurl_browser_rejected_ratio,
+        "comparison_operator",
+        '"GreaterThanThreshold"',
+    )
+    require_assignment(qurl_browser_rejected_ratio, "alarm_actions", "[aws_sns_topic.alerts.arn]")
+    require_assignment(qurl_browser_rejected_ratio, "ok_actions", "[aws_sns_topic.alerts.arn]")
+    require_assignment(qurl_browser_rejected_ratio, "treat_missing_data", '"notBreaching"')
+    require_map_assignment(
+        qurl_browser_rejected_ratio,
+        "dimensions",
+        {"Environment": "var.environment", "Cell": "var.cell_id"},
+    )
+    require_block_text(
+        qurl_browser_rejected_ratio,
+        "IF(resolve_attempts > 0, FILL(rejected, 0) / resolve_attempts, 0)",
+        "qURL browser rejected alarms must remain normalized by resolve attempts",
+    )
+    require_block_text(
+        qurl_browser_rejected_ratio,
+        "metric_name = each.value.metric_name",
+        "qURL browser rejected numerator must use the selected alarm metric",
+    )
+    require_block_text(
+        qurl_browser_rejected_ratio,
+        "iterator = outcome",
+        "qURL browser rejected denominator metric query iterator must stay explicit",
+    )
+    require_block_text(
+        qurl_browser_rejected_ratio,
+        "metric_name = outcome.value",
+        "qURL browser rejected denominator metric queries must use the selected outcome metric",
+    )
+    monitoring_text = _read(monitoring_main)
+    for metric_name in (
+        "QurlResolveBrowserRejectedMalformed",
+        "QurlResolveBrowserRejectedOutOfRange",
+    ):
+        if not has_metric_name(monitoring_text, metric_name):
+            raise LintError(
+                f"{monitoring_main}: missing qURL browser rejected metric `{metric_name}`"
+            )
+    for metric_id, metric_name in (
+        ("success", "QurlResolveSuccess"),
+        ("fail_validate", "QurlResolveFailValidate"),
+        ("fail_resolve_catalog", "QurlResolveFailResolveCatalog"),
+        ("fail_knock", "QurlResolveFailKnock"),
+        ("fail_post_knock", "QurlResolveFailPostKnock"),
+        ("fail_canceled", "QurlResolveFailCanceled"),
+        ("fail_unknown", "QurlResolveFailUnknown"),
+    ):
+        require_hcl_map_entry(
+            qurl_browser_rejected_ratio,
+            metric_id,
+            metric_name,
+            "qURL browser rejected ratio denominator/numerator set must not drift",
+        )
     # Go-side checks scope to the metric-dimension builders the Terraform
     # selectors depend on. They catch simple emitter renames without pulling a Go
     # parser into this small static lint.
