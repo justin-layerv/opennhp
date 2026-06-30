@@ -469,12 +469,11 @@ func (a *UdpAC) deleteThenFlushEntry(token string, entry *AccessEntry) {
 // barrier so a flow already being torn down isn't double-flushed) — the inverse
 // of /refresh-shorten, which wants the flow to survive to a peer's deadline.
 //
-// IPv6 (#2778/#2794/#2837): the coarse RescheduleEarlier above is IPv4-ONLY — it
-// is never issued for a v6 key, because the established-flow teardown a reschedule
-// triggers is v4-only in BOTH modes (see the loop comment), making a v6 reschedule
-// a pure no-op that would only pollute the v4-only flusher's expiry-skip counter.
-// v6 keys are handled entirely by the switch below, and the expiry-skip vs
-// revoke-skip split (#2778 part 2) falls out of that:
+// IPv6 (#2778/#2794/#2837/#2165): the coarse RescheduleEarlier path is IPv4 by
+// default, and is enabled for v6 only when FilterMode_IPTABLES is using the
+// netlink ConntrackFlusher backend. That keeps the expiry-skip vs revoke-skip
+// split intact for v4-only teardown paths while letting iptables+netlink tear v6
+// down on the same coarse path iptables already uses for v4:
 //
 //   - EBPFXDP: surgicalFlushFlowKey routes the v6 key to surgicalFlushFlowKeyV6.
 //     When the v6 conntrack seam is wired (FlushConnV6 + EnumerateConnTrackSrcPortsV6,
@@ -482,24 +481,24 @@ func (a *UdpAC) deleteThenFlushEntry(token string, entry *AccessEntry) {
 //     a real immediate revoke. When the seam is unwired (v4-only build / non-Linux)
 //     it ticks MetricRevocationIPv6HardFail and does NOT treat the absence of a v6
 //     conntrack entry as "killed".
-//   - FilterMode_IPTABLES: there is no v6 teardown at all — `conntrack -D` is
-//     IPv4-only (no `-f ipv6`) and the surgical seam is EBPFXDP-only — so the
-//     explicit FilterMode_IPTABLES branch below ticks MetricRevocationIPv6HardFail.
-//     The v6-capable netlink replacement is #2165 (UNbuilt); until it lands, v6
-//     immediate revoke under iptables is DECLARED OUT OF SCOPE (see the gospel
-//     "Filter-mode/IPv6 caveat" + DE Risk #6 in docs/design/QURL_V2_KEYED_IDENTITY.md).
+//   - FilterMode_IPTABLES, EXEC backend: the coarse RescheduleEarlier path stays
+//     IPv4-only because `conntrack -D` is IPv4-only (no `-f ipv6`) and the
+//     surgical seam is EBPFXDP-only. A v6 revoke therefore ticks
+//     MetricRevocationIPv6HardFail directly here and is NOT folded into the
+//     exec flusher's benign expiry-skip counter.
+//   - FilterMode_IPTABLES, NETLINK backend (#2165, opt-in via
+//     l3FlushConntrackBackend=netlink): the coarse Flush dumps + deletes both
+//     families, so the v6 revoke is torn down on the next scheduler tick. No
+//     hard-fail fires. This keeps iptables' existing coarse mass-delete semantics;
+//     a sibling-preserving netlink surgical path is a separate follow-up.
 //
-// MetricRevocationIPv6HardFail is the dedicated REVOKE-skip signal: ANY nonzero
-// reading is a real immediate-revocation gap to alarm on. Because the coarse
-// reschedule no longer IMMEDIATELY drives v6 keys into the v4-only flusher, that
-// flusher's metricSkipped (BpfFlusherSkippedCount / ConntrackFlusher SkippedCount,
-// published as MetricL3FlushBpfSkipped) is the EXPIRY-skip signal ALONE — the
-// benign scheduled-expiry leak and the failed v6 revoke are no longer conflated.
-// A revoked v6 flow's lingering scheduled flush still fires one benign no-op tick
-// at its NATURAL firewall deadline (deleteToken does not cancel it — #2901 tracks
-// routing the revoke path through cancelAllScheduledFlows to drop that orphan), so
-// what the gate removes is the revoke-correlated SPIKE, not the per-flow tick
-// (#2778 part 2).
+// The hard-fail is raised whenever a v6 revoke has no teardown path: EBPFXDP via
+// the surgical path (surgicalConnFlush != nil), and iptables via the explicit
+// FilterMode_IPTABLES branch below ONLY when the coarse path is IPv4-only (the
+// exec backend). With the netlink backend (coarseConntrackHandlesV6, #2165) the
+// iptables v6 revoke IS torn down by the coarse Flush, so no hard-fail fires
+// there. Either way ANY nonzero reading is a real immediate-revocation gap to
+// alarm on, distinct from the benign expiry skip counters.
 func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 	if a.expirySched == nil || entry == nil {
 		return
@@ -533,18 +532,16 @@ func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 	// surgicalConnFlush set, so they never reach here) and the coarse-only v4
 	// fallback test nil-safe.
 	iptablesMode := a.config != nil && a.config.FilterMode == FilterMode_IPTABLES
+	iptablesV6CoarseAvailable := iptablesMode && a.coarseConntrackHandlesV6.Load()
 	for _, key := range keys {
-		// Classify the key's family once — both the coarse reschedule (v4-only)
-		// and the iptables v6 hard-fail branch below key off it.
+		// Classify the key's family once — both the coarse reschedule and the
+		// iptables v6 hard-fail branch below key off it.
 		isV4 := isFlowKeyIPv4(key)
-		// COARSE allow-rule teardown — IPv4 ONLY. Rescheduling a v6 key would fire
-		// the v4-only flusher as a guaranteed no-op that only spikes the expiry-skip
-		// counter (metricSkipped), conflating a benign expiry leak with a failed v6
-		// revoke (#2778 part 2); v6 teardown is the surgical seam below (FlushConnV6,
-		// #2837) or the dedicated MetricRevocationIPv6HardFail, and re-open is barred
-		// by deleteToken + the ipset/allow-rule timeout regardless. See the
-		// flushEntryNow godoc above for the full rationale (incl. the deferred tick).
-		if isV4 {
+		// COARSE teardown. IPv4 is always supported. IPv6 is supported only when
+		// iptables mode is backed by the #2165 netlink ConntrackFlusher; under
+		// exec it would be a guaranteed no-op that only pollutes the expiry-skip
+		// counter.
+		if isV4 || iptablesV6CoarseAvailable {
 			a.expirySched.RescheduleEarlier(key, now)
 		}
 		switch {
@@ -556,14 +553,23 @@ func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 			// wired, else hard-fails — #2778/#2837).
 			a.surgicalFlushFlowKey(ctx, key)
 		case iptablesMode && !isV4:
-			// v6 under iptables: NO immediate teardown exists — the coarse path is
-			// v4-only (so it was skipped above) and the surgical seam is EBPFXDP-only.
-			// Raise the revocation-specific hard-fail so the breaker/observability
-			// sees "v6 revoke not torn down" as its OWN signal, never folded into the
-			// benign expiry-skip counter. Out of scope until #2165 netlink — see
-			// godoc + design doc. (#2778/#2794)
+			if iptablesV6CoarseAvailable {
+				// Netlink backend (#2165): the coarse RescheduleEarlier above
+				// reschedules ConntrackFlusher.Flush, which under netlink tears
+				// down v6 conntrack entries too — so this v6 revoke IS torn down
+				// (near-immediately, on the next scheduler tick). No #2794 gap,
+				// hence no hard-fail. Same coarse-mass-delete semantics as v4;
+				// the surgical sibling-preserving path stays the #2784 follow-up.
+				break
+			}
+			// Exec backend: `conntrack -D` is IPv4-only (no -f ipv6), so the
+			// coarse reschedule was intentionally skipped rather than handing a
+			// guaranteed no-op to the flusher and polluting metricSkipped. Raise the
+			// revocation-specific hard-fail so observability can tell "v6 revoke not
+			// torn down" apart from a benign expiry skip. Closed by setting
+			// l3FlushConntrackBackend=netlink (#2165). (#2778/#2794)
 			a.incrMetric(MetricRevocationIPv6HardFail)
-			log.Warning("[Revocation] IPv6 flow %s under iptables has no immediate conntrack teardown (conntrack -D is IPv4-only; netlink is #2165); flow will persist until kernel TTL (#2778/#2794)", key)
+			log.Warning("[Revocation] IPv6 flow %s under iptables (exec backend) has no immediate conntrack teardown (conntrack -D is IPv4-only; set l3FlushConntrackBackend=netlink, #2165); flow will persist until kernel TTL (#2778/#2794)", key)
 		}
 	}
 	a.incrMetric(MetricRevocationFlushScheduled)
@@ -572,8 +578,8 @@ func (a *UdpAC) flushEntryNow(entry *AccessEntry) {
 // surgicalFlushFlowKey enumerates the live conntrack 5-tuples sharing the given
 // allow-rule FlowKey and surgically FlushConn's each, so a revoke kills EXACTLY
 // the revoked admission's established flows and leaves same-allow-tuple siblings
-// (different source port) alive. Called only when the eBPF/XDP+IPv4 surgical
-// path is wired (a.surgicalConnFlush != nil, i.e. EBPFXDP-on-Linux).
+// (different source port) alive. Called only when the eBPF/XDP surgical path is
+// wired (a.surgicalConnFlush != nil, i.e. EBPFXDP-on-Linux).
 //
 // Per-key decision tree (the order matters for getting the v6 metric right —
 // see the IPv6 note on flushEntryNow):

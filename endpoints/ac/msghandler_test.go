@@ -595,7 +595,7 @@ func TestScheduleFlushIfEnabled_RejectsMalformedFlowKey(t *testing.T) {
 func TestNewFlusherForFilterMode_UnsupportedMode(t *testing.T) {
 	for _, mode := range []int{2, 3, 99, -1} {
 		t.Run(strconv.Itoa(mode), func(t *testing.T) {
-			f, err := newFlusherForFilterMode(mode)
+			f, err := newFlusherForFilterMode(mode, BackendExec, defaultConntrackNetlinkPoolSize)
 			if err == nil {
 				t.Errorf("FilterMode=%d: expected error, got nil (flusher=%T)", mode, f)
 			}

@@ -449,6 +449,97 @@ func TestL3FlushConfigReload_PropagatesToLiveScheduler(t *testing.T) {
 	}
 }
 
+func TestL3FlushConntrackReloadRecordsConfigButKeepsConstructedFlusher(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry:    true,
+		L3FlushDryRun:            true,
+		L3FlushConntrackBackend:  "exec",
+		L3FlushConntrackPoolSize: defaultConntrackNetlinkPoolSize,
+		L3FlushErrorThreshold:    10,
+		L3FlushErrorWindowSec:    60,
+	}); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	constructed := &ConntrackFlusher{}
+	ac.conntrackFlusher.Store(constructed)
+
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry:    true,
+		L3FlushDryRun:            true,
+		L3FlushConntrackBackend:  "netlink",
+		L3FlushConntrackPoolSize: 32,
+		L3FlushErrorThreshold:    10,
+		L3FlushErrorWindowSec:    60,
+	}); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := ac.config.L3FlushConntrackBackend; got != "netlink" {
+		t.Errorf("L3FlushConntrackBackend after reload = %q, want netlink", got)
+	}
+	if got := ac.config.L3FlushConntrackPoolSize; got != 32 {
+		t.Errorf("L3FlushConntrackPoolSize after reload = %d, want 32", got)
+	}
+	if got := ac.conntrackFlusher.Load(); got != constructed {
+		t.Errorf("conntrack flusher pointer changed on reload: got %p want %p", got, constructed)
+	}
+}
+
+func TestL3FlushConntrackReloadDedupesRepeatedUnknownBackend(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry:    true,
+		L3FlushDryRun:            true,
+		L3FlushConntrackBackend:  "bogus",
+		L3FlushConntrackPoolSize: defaultConntrackNetlinkPoolSize,
+		L3FlushErrorThreshold:    10,
+		L3FlushErrorWindowSec:    60,
+	}); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	if got := ac.config.L3FlushConntrackBackend; got != "exec" {
+		t.Fatalf("first-load backend = %q, want normalized exec", got)
+	}
+	if got := ac.lastInvalidL3FlushConntrackBackend; got != "bogus" {
+		t.Fatalf("remembered invalid backend = %q, want bogus", got)
+	}
+
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry:    true,
+		L3FlushDryRun:            true,
+		L3FlushConntrackBackend:  "bogus",
+		L3FlushConntrackPoolSize: defaultConntrackNetlinkPoolSize,
+		L3FlushErrorThreshold:    10,
+		L3FlushErrorWindowSec:    60,
+	}); err != nil {
+		t.Fatalf("same invalid reload: %v", err)
+	}
+	if got := ac.config.L3FlushConntrackBackend; got != "exec" {
+		t.Fatalf("same-invalid reload backend = %q, want normalized exec", got)
+	}
+	if got := ac.lastInvalidL3FlushConntrackBackend; got != "bogus" {
+		t.Fatalf("same-invalid remembered backend = %q, want bogus", got)
+	}
+
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry:    true,
+		L3FlushDryRun:            true,
+		L3FlushConntrackBackend:  "netlink",
+		L3FlushConntrackPoolSize: defaultConntrackNetlinkPoolSize,
+		L3FlushErrorThreshold:    10,
+		L3FlushErrorWindowSec:    60,
+	}); err != nil {
+		t.Fatalf("valid reload: %v", err)
+	}
+	if got := ac.lastInvalidL3FlushConntrackBackend; got != "" {
+		t.Fatalf("remembered invalid backend after valid reload = %q, want cleared", got)
+	}
+}
+
 // TestL3FlushConfigReload_ClampsThresholdToRing fences the
 // clamp behavior when an operator's new threshold outgrows the
 // breaker ring sized at scheduler construction. The ring at

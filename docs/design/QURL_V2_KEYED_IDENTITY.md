@@ -805,9 +805,10 @@ surface remains to be built, and it must match these entries by their
 kernel-keyed (NAT'd) `FlowKey`, not by `SrcAddrs` (the AOL-declared IP), since
 the two deliberately diverge for NAT'd temp access.
 
-Filter-mode/IPv6 caveat — DECLARED DISPOSITION (#2778/#2794/#2837, DE Risk #6).
+Filter-mode/IPv6 caveat — DECLARED DISPOSITION (#2778/#2794/#2837/#2165, DE Risk #6).
 Immediate revocation of IPv6 established flows is now **resolved on the eBPF/XDP
-datapath** and remains **out of scope under iptables**. Status by mode:
+datapath** and resolved under iptables when the #2165 netlink backend is selected.
+Status by mode:
 
 - **eBPF/XDP (`FilterMode_EBPFXDP`) — RESOLVED (#2837)**: v6 established flows are
   torn down surgically by `FlushConnV6` + `EnumerateConnTrackSrcPortsV6` against a
@@ -817,46 +818,58 @@ datapath** and remains **out of scope under iptables**. Status by mode:
   proof is the #2779 kernel-rig gate). When the v6 seam is **unwired** (a v4-only
   build / non-Linux) the path hard-fails loudly (below) rather than silently
   treating the v6 flow as killed.
-- **iptables (`FilterMode_IPTABLES`) — STILL OUT OF SCOPE (#2794/#2165)**: the
-  `ConntrackFlusher` shells `conntrack -D` with no `-f ipv6`, so it rejects a v6
-  key at its boundary and tears nothing down, and the surgical seam is
-  EBPFXDP-only. The v6-capable netlink (CTA_FILTER) replacement is **#2165
-  (unbuilt)** — there is no netlink flusher today, despite earlier comments that
-  claimed otherwise. A revoked v6 flow under iptables dies only at its kernel TTL.
+- **iptables + exec (`FilterMode_IPTABLES`, `l3FlushConntrackBackend="exec"`) —
+  DECLARED GAP (#2794)**: the `ConntrackFlusher` shells `conntrack -D` with no
+  `-f ipv6`, so it rejects a v6 key at its boundary and tears nothing down, and
+  the surgical seam is EBPFXDP-only. A revoked v6 flow under this backend dies
+  only at its kernel TTL.
+- **iptables + netlink (`FilterMode_IPTABLES`, `l3FlushConntrackBackend="netlink"`)
+  — RESOLVED (#2165)**: the `ConntrackFlusher` uses direct ctnetlink operations
+  and handles both IPv4 and IPv6. `flushEntryNow` therefore reschedules v6 keys
+  through the same coarse immediate-flush path iptables already uses for v4, and
+  `MetricRevocationIPv6HardFail` stays quiet. The sibling-preserving netlink
+  surgical path is tracked separately; this keeps iptables' existing coarse
+  mass-delete semantics while making them v6-capable.
 
 This gap is **surfaced, not silently swallowed**: `(*UdpAC).flushEntryNow` ticks
-the dedicated `MetricRevocationIPv6HardFail` for every v6 key it cannot tear down
-(eBPF v6-seam-unwired via `surgicalFlushFlowKey`, iptables via its explicit
-`FilterMode_IPTABLES` branch), plus once per failed per-flow `FlushConnV6` on a
-wired seam. ANY nonzero reading is a real immediate-revocation gap to alarm on.
-Closing the residual iptables gap requires #2165 (netlink partial-tuple v6
-delete).
+the dedicated `MetricRevocationIPv6HardFail` for every v6 key it cannot tear
+down — eBPF v6-seam-unwired via `surgicalFlushFlowKey`, iptables+exec via its
+explicit `FilterMode_IPTABLES` branch, plus once per failed per-flow
+`FlushConnV6` on a wired seam. With the netlink backend
+(`coarseConntrackHandlesV6`) the iptables v6 revoke is torn down and no hard-fail
+fires. The metric is distinct from the benign per-flusher skip counters
+(`BpfFlusherSkippedCount` / `ConntrackFlusher` `metricSkipped`) that track
+scheduled-expiry v6 leaks. ANY nonzero reading is a real immediate-revocation gap
+to alarm on.
 
 **Expiry-skip vs revoke-skip — SPLIT (#2778 part 2).** The coarse allow-rule
-reschedule in `flushEntryNow` (`Scheduler.RescheduleEarlier`) is **IPv4-only**: it
-is never issued for a v6 key, because the established-flow teardown it triggers is
-IPv4-only in both modes (eBPF allow-rule maps; `conntrack -D`), making a v6
-reschedule a pure no-op. Issuing it would IMMEDIATELY tick the v4-only flushers'
-expiry-skip counters (`BpfFlusherSkippedCount` / `ConntrackFlusher`
-`metricSkipped`, published as `MetricL3FlushBpfSkipped`) on every revoke,
-conflating a benign scheduled-expiry v6 leak with a failed v6 revoke. With the
-reschedule gated to v4, those counters are the **expiry-skip** signal alone and
-`MetricRevocationIPv6HardFail` is the **revoke-skip** signal — the two are cleanly
-distinguishable, which is what DE Risk #6 requires (a silent failed revoke must
-not hide inside a benign counter). Note this *defers* rather than *eliminates* a
-revoked v6 flow's expiry-skip tick: `deleteToken` uses `tokenStore.Delete` (no
-`OnExpire` hook → no `cancelAllScheduledFlows`), so the revoked flow's lingering
-scheduled flush still fires one benign no-op tick at its natural firewall deadline
-— what the gate removes is the revoke-correlated *spike*, not the per-flow tick.
+reschedule in `flushEntryNow` (`Scheduler.RescheduleEarlier`) is **IPv4-only
+except for iptables+netlink**. It is never issued for a v6 key under eBPF/XDP or
+iptables+exec, because the established-flow teardown it would trigger there is
+IPv4-only (eBPF allow-rule maps; `conntrack -D`), making a v6 reschedule a pure
+no-op. Issuing it would IMMEDIATELY tick the v4-only flushers' expiry-skip
+counters (`BpfFlusherSkippedCount` / `ConntrackFlusher` `metricSkipped`,
+published as `MetricL3FlushBpfSkipped`) on every revoke, conflating a benign
+scheduled-expiry v6 leak with a failed v6 revoke. With the reschedule gated to v4
+or netlink-capable iptables, those counters are the **expiry-skip** signal alone
+and `MetricRevocationIPv6HardFail` is the **revoke-skip** signal — the two are
+cleanly distinguishable, which is what DE Risk #6 requires (a silent failed
+revoke must not hide inside a benign counter). Note this *defers* rather than
+*eliminates* a revoked v6 flow's expiry-skip tick under the v4-only paths:
+`deleteToken` uses `tokenStore.Delete` (no `OnExpire` hook →
+no `cancelAllScheduledFlows`), so the revoked flow's lingering scheduled flush
+still fires one benign no-op tick at its natural firewall deadline — what the gate
+removes is the revoke-correlated *spike*, not the per-flow tick.
 Dropping that orphan tick entirely (routing the revoke path through
 `cancelAllScheduledFlows`) is tracked separately in #2901 — it touches the #2201
 multi-session reschedule consult, so it is out of scope here.
 
-Note this is a teardown-of-*established*-flows gap only (and only under iptables /
-an unwired eBPF v6 seam now): re-open is barred regardless — the entry is removed
-from the token store so a refresh / re-knock cannot extend it, and the ipset /
-allow-rule entry self-expires on its own timeout. The residual v6 established
-flow's lifetime (to kernel TTL) is the only exposure, never a re-openable hole.
+Note this is a teardown-of-*established*-flows gap only (and only under
+iptables+exec / an unwired eBPF v6 seam now): re-open is barred regardless — the
+entry is removed from the token store so a refresh / re-knock cannot extend it,
+and the ipset / allow-rule entry self-expires on its own timeout. The residual v6
+established flow's lifetime (to kernel TTL) is the only exposure, never a
+re-openable hole.
 
 Backpressure rule:
 

@@ -7,23 +7,25 @@ import (
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
 )
 
-// These tests pin the #2794 fix: in FilterMode_IPTABLES an IPv6 immediate revoke
-// has NO real teardown (the ConntrackFlusher shells `conntrack -D`, which is
-// IPv4-only — no `-f ipv6`; the v6-capable netlink flusher is the UNbuilt #2165),
-// so the revoke must raise the revocation-specific MetricRevocationIPv6HardFail
-// rather than only ticking the flusher's CONFLATED metricSkipped ("benign expiry
-// leak"). Before the fix, flushEntryNow ticked NO revocation-specific failure
-// metric in iptables mode — the gap was a silent no-op behind a false comment
-// claiming the iptables flusher "uses netlink, which IS v6-capable."
+// These tests pin the #2794 fix and its #2165 gap-closing follow-up. In
+// FilterMode_IPTABLES with the EXEC backend an IPv6 immediate revoke has NO real
+// teardown (the ConntrackFlusher shells `conntrack -D`, which is IPv4-only — no
+// `-f ipv6`), so the revoke must raise the revocation-specific
+// MetricRevocationIPv6HardFail rather than only ticking the flusher's CONFLATED
+// metricSkipped ("benign expiry leak"). With the NETLINK backend (#2165,
+// coarseConntrackHandlesV6) the coarse Flush is v6-capable and tears the flow
+// down, so the hard-fail must NOT fire — fenced by the
+// NetlinkBackend_NoHardFail test below. Before #2794, flushEntryNow ticked NO
+// revocation-specific failure metric in iptables mode — the gap was a silent
+// no-op behind a false comment claiming the iptables flusher "uses netlink."
 //
-// The load-bearing, platform-independent assertion is the hard-fail counter.
-// As of #2778 part 2 the coarse RescheduleEarlier is IPv4-only, so a revoked v6
-// key is NOT rescheduled into the flusher at all — its expiry-skip counter
-// (metricSkipped, a //go:build linux type) stays clean, and the v6 revoke is
-// surfaced ONLY on the dedicated MetricRevocationIPv6HardFail, which these tests
-// assert directly. TestFlushEntryNow_IPTablesV6_NotRescheduledIntoFlusher pins
-// that the v6 key is not rescheduled while a v4 sibling is — the concrete proof
-// the expiry-skip vs revoke-skip split holds.
+// The load-bearing, platform-independent assertion for the exec backend is the
+// hard-fail counter. In that mode the coarse RescheduleEarlier is IPv4-only, so a
+// revoked v6 key is NOT rescheduled into the flusher at all — its expiry-skip
+// counter (metricSkipped, a //go:build linux type) stays clean, and the v6 revoke
+// is surfaced ONLY on the dedicated MetricRevocationIPv6HardFail. The netlink
+// backend test flips only the coarseConntrackHandlesV6 gate and proves the v6 key
+// does reach the flusher without raising the hard-fail.
 
 // newIPTablesTestAC builds a UdpAC in FilterMode_IPTABLES with a real metrics
 // publisher and a started scheduler, leaving the eBPF surgical seam unwired
@@ -115,6 +117,39 @@ func TestFlushEntryNow_IPTablesV6_HardFail(t *testing.T) {
 	}
 	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (per-entry tick; v6 coarse reschedule skipped)", MetricRevocationFlushScheduled, got)
+	}
+}
+
+// TestFlushEntryNow_IPTablesV6_NetlinkBackend_NoHardFail proves the #2165
+// gap-closing path: when the netlink backend is active
+// (coarseConntrackHandlesV6 == true) the coarse RescheduleEarlier→Flush tears
+// down v6 conntrack entries too, so a v6 revoke under iptables does NOT raise the
+// hard-fail. This is the inverse of TestFlushEntryNow_IPTablesV6_HardFail (exec
+// backend), and the only difference between the two ACs is the backend-capability
+// flag — proving the gate is exactly coarseConntrackHandlesV6.
+func TestFlushEntryNow_IPTablesV6_NetlinkBackend_NoHardFail(t *testing.T) {
+	a, flusher := newIPTablesTestAC(t)
+	a.coarseConntrackHandlesV6.Store(true) // netlink backend: coarse Flush is v6-capable
+
+	key := mustKey(t, "2001:db8::a", "2001:db8::b", 443, FlowProtoTCP)
+	entry := &AccessEntry{OpenTime: 10}
+	entry.recordScheduledKey(key)
+	a.expirySched.Schedule(key, time.Now().Add(time.Hour))
+
+	a.flushEntryNow(entry)
+
+	if !flusher.waitFor(1, 2*time.Second) {
+		t.Fatal("v6 key never reached the flusher; netlink-capable iptables revoke did not reschedule")
+	}
+	keys := flusher.snapshotKeys()
+	if len(keys) != 1 || keys[0] != key {
+		t.Errorf("flusher saw %v; want exactly [%v] (netlink-capable iptables v6 revoke should flush the v6 key)", keys, key)
+	}
+	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+		t.Errorf("%s = %v, want 0 (netlink backend coarse Flush is v6-capable; gap closed, #2165)", MetricRevocationIPv6HardFail, got)
+	}
+	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+		t.Errorf("%s = %v, want 1 (coarse path still runs)", MetricRevocationFlushScheduled, got)
 	}
 }
 

@@ -32,6 +32,11 @@ type UdpAC struct {
 	iptables   *utils.IPTables
 	ipset      *utils.IPSet
 
+	// lastInvalidL3FlushConntrackBackend suppresses repeat reload warnings for
+	// the same unknown backend token. The effective config stays normalized to
+	// exec; this only remembers the bad raw value already reported.
+	lastInvalidL3FlushConntrackBackend string
+
 	stats struct {
 		totalRecvBytes uint64
 		totalSendBytes uint64
@@ -149,6 +154,29 @@ type UdpAC struct {
 	bpfConntrackExpiredReapedV4Reported atomic.Uint64
 	bpfConntrackExpiredReapedV6Reported atomic.Uint64
 
+	// conntrackFlusher holds the FilterMode_IPTABLES flusher so Stop can
+	// Close it (the netlink backend owns a pool of netlink sockets). nil
+	// in EBPFXDP / non-Linux / L3-disabled. Atomic because metrics readers
+	// run outside the Start/Stop path. The exec backend's Close is a no-op,
+	// so closing unconditionally when non-nil is safe.
+	conntrackFlusher atomic.Pointer[ConntrackFlusher]
+
+	// coarseConntrackHandlesV6 is true when the iptables-mode coarse flush
+	// path (RescheduleEarlier → ConntrackFlusher.Flush) tears down IPv6
+	// conntrack entries — i.e. the netlink backend is active. It gates the
+	// revocation IPv6 hard-fail in flushEntryNow: with a v6-capable coarse
+	// path, a v6 immediate revoke IS torn down (no #2794 gap), so no
+	// hard-fail is warranted. With the exec backend (IPv4-only `conntrack
+	// -D`) it stays false and the hard-fail still fires.
+	//
+	// Derived from cf.HandlesIPv6() at Start, but kept as an atomic bool (vs
+	// re-deriving from conntrackFlusher at the read site) ON PURPOSE: it is
+	// the cross-platform test seam for the v6-gate. The netlink flusher can't
+	// be constructed off Linux+CAP_NET_ADMIN, so
+	// TestFlushEntryNow_IPTablesV6_NetlinkBackend_NoHardFail sets this field
+	// directly to exercise the gap-closed path without a real netlink socket.
+	coarseConntrackHandlesV6 atomic.Bool
+
 	// surgicalConnFlush is the per-flow surgical conntrack-teardown seam
 	// used by the revocation apply path (flushEntryNow). Set to
 	// BpfFlusher.FlushConn ONLY when the scheduler is constructed in EBPFXDP
@@ -199,6 +227,45 @@ func (a *UdpAC) BpfFlusherSkippedCount() (uint64, bool) {
 		return 0, false
 	}
 	return a.bpfFlusherSkippedCount(), true
+}
+
+// ConntrackFlusherSkippedCount returns the ConntrackFlusher's skip counter
+// and ok=true when the iptables-mode flusher is attached. Exec uses this for
+// non-IPv4 expiry skips; netlink uses it for impossible mixed-family keys.
+func (a *UdpAC) ConntrackFlusherSkippedCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil {
+		return 0, false
+	}
+	return cf.SkippedCount(), true
+}
+
+// ConntrackNetlinkDeletedCount returns the netlink ConntrackFlusher's
+// cumulative deleted-entries counter and ok=true when the iptables-mode
+// netlink backend is attached; 0, false otherwise (exec backend, EBPFXDP,
+// or feature off). Cross-platform via the *ConntrackFlusher type (the
+// non-Linux stub returns 0/false here). The conntrackFlusher pointer is atomic:
+// Start stores it before registration metric readers spawn, failed-Start cleanup
+// clears it before Start returns, Stop keeps it non-nil after Close for final
+// gauge reads, and the backend choice plus counters read here are immutable or
+// atomic.
+func (a *UdpAC) ConntrackNetlinkDeletedCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkDeletedCount(), true
+}
+
+// ConntrackNetlinkSlowDumpCount mirrors ConntrackNetlinkDeletedCount for
+// the slow-dump counter (Flush calls whose conntrack dump exceeded the
+// slow-dump threshold). ok=true only with the netlink backend attached.
+func (a *UdpAC) ConntrackNetlinkSlowDumpCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkSlowDumpCount(), true
 }
 
 // BpfConntrackStats returns the eBPF conntrack stats snapshot and ok=true when
@@ -386,7 +453,10 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	// late-fire forever (worst-of-both-worlds for an L3-only
 	// enforcement contract).
 	if a.config.EnableL3FlushOnExpiry {
-		flusher, ferr := newFlusherForFilterMode(a.config.FilterMode)
+		// Backend was normalized to a known value at config load (unknown
+		// → exec with a Warning), so ok is guaranteed here; ignore it.
+		conntrackBackend, _ := ParseConntrackBackend(a.config.L3FlushConntrackBackend)
+		flusher, ferr := newFlusherForFilterMode(a.config.FilterMode, conntrackBackend, a.config.L3FlushConntrackPoolSize)
 		if ferr != nil {
 			return ferr
 		}
@@ -415,6 +485,18 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			// mirrors FlushConn but targets the conn_track_v6 map.
 			a.surgicalConnFlushV6 = bf.FlushConnV6
 			a.enumerateConnSrcPortsV6 = ebpf.EnumerateConnTrackSrcPortsV6
+		}
+		if cf, ok := flusher.(*ConntrackFlusher); ok && cf != nil {
+			// FilterMode_IPTABLES on Linux. Hold the flusher so Stop can
+			// Close its netlink socket pool (the exec backend's Close is a
+			// no-op). Record whether the coarse flush path tears down IPv6:
+			// with the netlink backend it does, so the revocation IPv6
+			// hard-fail in flushEntryNow should NOT fire for iptables v6
+			// revokes (the coarse RescheduleEarlier→Flush handles them); with
+			// the exec backend (`conntrack -D`, IPv4-only) it stays false and
+			// the hard-fail still surfaces the gap. See #2165 / #2794.
+			a.conntrackFlusher.Store(cf)
+			a.coarseConntrackHandlesV6.Store(cf.HandlesIPv6())
 		}
 		a.expirySched = NewScheduler(flusher,
 			WithDryRun(a.config.L3FlushDryRun),
@@ -457,6 +539,14 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			a.enumerateConnSrcPorts = nil
 			a.surgicalConnFlushV6 = nil
 			a.enumerateConnSrcPortsV6 = nil
+			// Close the netlink socket pool we opened above (same
+			// leak-avoidance rationale as the scheduler Shutdown) and nil
+			// the iptables flusher fields so the caller's post-Start
+			// cleanup is a no-op.
+			if cf := a.conntrackFlusher.Swap(nil); cf != nil {
+				_ = cf.Close()
+			}
+			a.coarseConntrackHandlesV6.Store(false)
 			return fmt.Errorf("L3 flush boot enumeration: %w", err)
 		}
 	}
@@ -539,6 +629,18 @@ func (ac *UdpAC) Stop() {
 			log.Error("[L3FlushSched] shutdown drain timed out: %v", err)
 		}
 	}
+	// Close the iptables conntrack flusher's netlink socket pool, if any.
+	// AFTER the scheduler drained above, so no Flush is mid-dump on a
+	// socket we're closing. No-op for the exec backend / EBPFXDP /
+	// non-Linux (nil flusher or nil pool). Keep the pointer non-nil after
+	// Close so registration gauges can still read final atomic counters from
+	// the flusher during shutdown; this is the Stop half of
+	// ConntrackNetlinkDeletedCount's atomic read invariant.
+	if cf := ac.conntrackFlusher.Load(); cf != nil {
+		if err := cf.Close(); err != nil {
+			log.Warning("[L3FlushSched] conntrack flusher close: %v", err)
+		}
+	}
 	ac.wg.Wait()
 	close(ac.sendMsgCh)
 	close(ac.signals.serverMapUpdated)
@@ -564,15 +666,18 @@ func (a *UdpAC) IsRunning() bool {
 // directly unit-testable — a future FilterMode addition that forgets
 // to wire a flusher here is caught by TestNewFlusherForFilterMode
 // rather than discovered at AC startup time
-func newFlusherForFilterMode(filterMode int) (FlowFlusher, error) {
+func newFlusherForFilterMode(filterMode int, conntrackBackend ConntrackBackend, conntrackPoolSize int) (FlowFlusher, error) {
 	switch filterMode {
 	case FilterMode_IPTABLES:
-		f, err := NewConntrackFlusher()
+		f, err := NewConntrackFlusher(WithBackend(conntrackBackend), WithNetlinkPoolSize(conntrackPoolSize))
 		if err != nil {
 			return nil, fmt.Errorf("L3 flush enabled but ConntrackFlusher failed: %w", err)
 		}
 		return f, nil
 	case FilterMode_EBPFXDP:
+		if conntrackBackend == BackendNetlink {
+			log.Warning("[L3FlushSched] l3FlushConntrackBackend=netlink ignored under FilterMode_EBPFXDP; using BpfFlusher surgical conntrack teardown")
+		}
 		f, err := NewBpfFlusher()
 		if err != nil {
 			return nil, fmt.Errorf("L3 flush enabled but BpfFlusher failed: %w", err)

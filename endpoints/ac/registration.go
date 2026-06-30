@@ -445,15 +445,34 @@ const (
 	//   - BreakerOpen    — 0/1 — fail-closed gauge for admission
 	//   - BpfSkipped     — non-IPv4 keys hitting the IPv4-only BPF
 	//                      flusher (upstream-regression signal)
-	MetricL3FlushEntries               = "L3FlushEntries"
-	MetricL3FlushFlushTotal            = "L3FlushTotal"
-	MetricL3FlushFlushErr              = "L3FlushErr"
-	MetricL3FlushFlushDryRun           = "L3FlushDryRun"
-	MetricL3FlushDeferred              = "L3FlushDeferred"
-	MetricL3FlushDropped               = "L3FlushDropped"
-	MetricL3FlushBucketMaxDepth        = "L3FlushBucketMaxDepth"
-	MetricL3FlushBreakerOpen           = "L3FlushBreakerOpen"
-	MetricL3FlushBpfSkipped            = "L3FlushBpfSkipped"
+	//   - ConntrackSkipped — keys no-op'd by the iptables-mode
+	//                        ConntrackFlusher before backend work
+	MetricL3FlushEntries        = "L3FlushEntries"
+	MetricL3FlushFlushTotal     = "L3FlushTotal"
+	MetricL3FlushFlushErr       = "L3FlushErr"
+	MetricL3FlushFlushDryRun    = "L3FlushDryRun"
+	MetricL3FlushDeferred       = "L3FlushDeferred"
+	MetricL3FlushDropped        = "L3FlushDropped"
+	MetricL3FlushBucketMaxDepth = "L3FlushBucketMaxDepth"
+	MetricL3FlushBreakerOpen    = "L3FlushBreakerOpen"
+	MetricL3FlushBpfSkipped     = "L3FlushBpfSkipped"
+	// MetricL3FlushConntrackSkipped is the ConntrackFlusher's skip counter:
+	// exec backend non-IPv4 expiry skips, plus netlink backend mixed-family
+	// FlowKey regressions. 0/absent outside iptables-mode L3 flush.
+	MetricL3FlushConntrackSkipped = "L3FlushConntrackSkipped"
+	// MetricL3FlushConntrackDeleted is the cumulative count of conntrack
+	// entries the netlink ConntrackFlusher backend (#2165) has deleted.
+	// Published only when that backend is active (iptables mode + netlink);
+	// its rate over the soak confirms the netlink path is tearing flows
+	// down and is readable against the throughput target. 0/absent on the
+	// exec backend and EBPFXDP.
+	MetricL3FlushConntrackDeleted = "L3FlushConntrackDeleted"
+	// MetricL3FlushConntrackSlowDumps is the cumulative count of netlink
+	// Flush calls whose successful conntrack dump attempt exceeded the
+	// slow-dump threshold — a latency-regression signal for the soak (a
+	// rising rate is the O(table) per-key dump hitting the table-size knee).
+	// Same backend gating as MetricL3FlushConntrackDeleted.
+	MetricL3FlushConntrackSlowDumps    = "L3FlushConntrackSlowDumps"
 	MetricL3FlushScheduleRejected      = "L3FlushScheduleRejected"
 	MetricL3FlushScheduleAfterShutdown = "L3FlushScheduleAfterShutdown"
 	// MetricL3FlushScheduleWaitTimeout counts Schedule() calls where
@@ -522,12 +541,13 @@ const (
 	//     seam is UNWIRED (a v4-only build / non-Linux) the surgical path can't
 	//     address the flow (conn_track is IPv4-only, struct ipv4_ct_tuple; #2778);
 	//     when the seam IS wired (#2837) v6 is torn down surgically and this does
-	//     NOT tick. Under FilterMode_IPTABLES there is no v6 teardown at all
-	//     (#2794): `conntrack -D` is IPv4-only (no `-f ipv6`) and the surgical seam
-	//     is EBPFXDP-only; the v6-capable netlink CTA_FILTER replacement is #2165
-	//     (UNbuilt). In the unaddressable cases the v6 flow survives the revoke
-	//     until kernel TTL — a DECLARED out-of-scope gap (see the gospel
-	//     Filter-mode/IPv6 caveat + DE Risk #6).
+	//     NOT tick. Under FilterMode_IPTABLES + BackendExec, `conntrack -D` is
+	//     IPv4-only (no `-f ipv6`) and the surgical seam is EBPFXDP-only, so this
+	//     ticks. Under FilterMode_IPTABLES + BackendNetlink (#2165), v6 is torn
+	//     down by the coarse netlink path and this does NOT tick. In the
+	//     unaddressable cases the v6 flow survives the revoke until kernel TTL —
+	//     a DECLARED out-of-scope gap (see the gospel Filter-mode/IPv6 caveat +
+	//     DE Risk #6).
 	//
 	//     GRANULARITY: ticked once per IPv6 FlowKey when the WHOLE key has no
 	//     teardown path (the iptables branch, the eBPF v6-seam-unwired branch, or
@@ -543,9 +563,10 @@ const (
 	//     flushEntryNow ticks this directly (eBPF via surgicalFlushFlowKey,
 	//     iptables via its explicit FilterMode_IPTABLES branch) so the signal is
 	//     revocation-specific and (since #2778 part 2) cleanly SPLIT from the benign
-	//     per-flusher expiry-skip counters (BpfFlusherSkippedCount / ConntrackFlusher
-	//     metricSkipped, which track scheduled-expiry v6 leaks only). ANY nonzero
-	//     reading is a real immediate-revocation gap worth alarming on. The split's
+	//     per-flusher skip counters (BpfFlusherSkippedCount / ConntrackFlusher
+	//     metricSkipped, which track scheduled-expiry v6 leaks and impossible
+	//     mixed-family FlowKey regressions only). For this revocation metric,
+	//     ANY nonzero reading is a real immediate-revocation gap worth alarming on. The split's
 	//     full rationale — incl. the deferred-tick residual (#2901) — is in the
 	//     flushEntryNow godoc / the QURL_V2_KEYED_IDENTITY.md Filter-mode/IPv6 caveat.
 	MetricRevocationStaleDropped      = "RevocationStaleDropped"
@@ -1258,6 +1279,9 @@ func (r *ACRegistration) Start() error {
 	r.metrics.RegisterGaugeFunc(MetricL3FlushBucketMaxDepth, r.l3FlushBucketMaxDepthGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushBreakerOpen, r.l3FlushBreakerOpenGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushBpfSkipped, r.l3FlushBpfSkippedGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackSkipped, r.l3FlushConntrackSkippedGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackDeleted, r.l3FlushConntrackDeletedGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackSlowDumps, r.l3FlushConntrackSlowDumpsGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleRejected, r.l3FlushScheduleRejectedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleAfterShutdown, r.l3FlushScheduleAfterShutdownGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleWaitTimeout, r.l3FlushScheduleWaitTimeoutGauge)
@@ -1474,6 +1498,56 @@ func (r *ACRegistration) l3FlushBpfSkippedGauge() float64 {
 	if !ok {
 		return 0
 	}
+	return float64(count)
+}
+
+// l3FlushConntrackSkippedGauge reads the iptables-mode ConntrackFlusher's
+// skip counter. On exec this is the existing non-IPv4 expiry-skip signal; on
+// netlink it also catches impossible mixed-family FlowKey regressions before
+// the backend can pick an address family.
+func (r *ACRegistration) l3FlushConntrackSkippedGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackFlusherSkippedCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+// l3FlushConntrackDeletedGauge reads the netlink ConntrackFlusher's
+// cumulative deleted-entries counter (#2165), when in iptables mode with
+// the netlink backend attached. Returns 0 when the feature is off, the
+// backend is exec, or the mode is EBPFXDP — so the published series is
+// flat/0 except on an AC actually running the netlink datapath.
+func (r *ACRegistration) l3FlushConntrackDeletedGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkDeletedCount()
+	if !ok {
+		return 0
+	}
+	// GaugeFuncs publish float64; this cumulative uint64 stays exactly
+	// represented until 2^53, far beyond a single AC process's expected
+	// lifetime conntrack-delete count.
+	return float64(count)
+}
+
+// l3FlushConntrackSlowDumpsGauge reads the netlink ConntrackFlusher's
+// slow-dump counter (#2165). Returns 0 unless the netlink datapath is the
+// active backend (mirrors l3FlushConntrackDeletedGauge).
+func (r *ACRegistration) l3FlushConntrackSlowDumpsGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkSlowDumpCount()
+	if !ok {
+		return 0
+	}
+	// Same float64 gauge boundary as l3FlushConntrackDeletedGauge; the
+	// counter remains exact for any realistic AC-process lifetime.
 	return float64(count)
 }
 

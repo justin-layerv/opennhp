@@ -81,6 +81,28 @@ type Config struct {
 	L3FlushErrorThreshold int `json:"l3FlushErrorThreshold"`
 	L3FlushErrorWindowSec int `json:"l3FlushErrorWindowSec"`
 
+	// L3FlushConntrackBackend selects how FilterMode_IPTABLES tears down
+	// kernel conntrack entries on flush: "exec" (default — fork+exec the
+	// `conntrack -D` tool, IPv4-only) or "netlink" (direct
+	// NFNL_SUBSYS_CTNETLINK, no fork, IPv4+IPv6; the #2165 throughput path
+	// and the iptables IPv6 immediate-teardown fix). Empty/unset = "exec",
+	// preserving v1 behavior until the netlink path is soak-validated per
+	// the #2165 rollout plan. Ignored in FilterMode_EBPFXDP (that mode uses
+	// BpfFlusher). Live-reload note: like FilterMode itself, a change here
+	// requires an AC restart — the flusher is built once at Start.
+	L3FlushConntrackBackend string `json:"l3FlushConntrackBackend"`
+
+	// L3FlushConntrackPoolSize is the number of pre-warmed netlink sockets
+	// the "netlink" backend makes available through its free-list pool
+	// (concurrency = pool size, since a netlink socket is single-flight). Default
+	// defaultConntrackNetlinkPoolSize — the ~4:1 ratio against the worker pool
+	// from the #2165 sketch. Each holder keeps its socket through the whole
+	// O(table) dump + matching deletes, so this ratio is deliberately
+	// operator-tunable during the soak without a code change + AMI rebuild.
+	// Normalized at load: ≤0 → default, and clamped to maxConntrackNetlinkPoolSize
+	// so a typo can't exhaust file descriptors. Ignored by the exec backend.
+	L3FlushConntrackPoolSize int `json:"l3FlushConntrackPoolSize"`
+
 	// ============================================================================
 	// Per-AC Server Assignment Configuration (Required)
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2 for details.
@@ -323,6 +345,20 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 		//
 		conf.L3FlushErrorThreshold = intOrDefault(conf.L3FlushErrorThreshold, DefaultL3FlushErrorThreshold)
 		conf.L3FlushErrorWindowSec = intOrDefault(conf.L3FlushErrorWindowSec, DefaultL3FlushErrorWindowSec)
+		// Normalize the conntrack backend selector so an unknown value (a
+		// typo in ac.toml) surfaces at boot as a Warning + safe fallback to
+		// exec, rather than a silent mis-select at flusher construction.
+		// Empty is valid ("" → exec); only a non-empty unknown warns.
+		if normalized, ok := ParseConntrackBackend(conf.L3FlushConntrackBackend); !ok {
+			log.Warning("unknown l3FlushConntrackBackend %q; falling back to %q (valid: exec, netlink)", conf.L3FlushConntrackBackend, normalized)
+			a.lastInvalidL3FlushConntrackBackend = conf.L3FlushConntrackBackend
+			conf.L3FlushConntrackBackend = normalized.String()
+		} else {
+			a.lastInvalidL3FlushConntrackBackend = ""
+		}
+		// Normalize the netlink pool size: ≤0 → default 16, and clamp a
+		// too-large value (typo) so it can't exhaust file descriptors.
+		conf.L3FlushConntrackPoolSize = normalizeConntrackPoolSize(conf.L3FlushConntrackPoolSize)
 		a.serverPeerMutex.Lock()
 		a.config = &conf
 		a.serverPubKeyAllowlist = set
@@ -367,6 +403,29 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 	if a.config.DefaultCipherScheme != conf.DefaultCipherScheme {
 		log.Info("set default cipher scheme to %d", conf.DefaultCipherScheme)
 		a.config.DefaultCipherScheme = conf.DefaultCipherScheme
+	}
+
+	newConntrackBackendRaw := conf.L3FlushConntrackBackend
+	newConntrackBackend, ok := ParseConntrackBackend(newConntrackBackendRaw)
+	if !ok {
+		if newConntrackBackendRaw != a.lastInvalidL3FlushConntrackBackend {
+			log.Warning("unknown l3FlushConntrackBackend %q; falling back to %q (valid: exec, netlink)", newConntrackBackendRaw, newConntrackBackend)
+			a.lastInvalidL3FlushConntrackBackend = newConntrackBackendRaw
+		}
+	} else {
+		a.lastInvalidL3FlushConntrackBackend = ""
+	}
+	oldConntrackBackend, _ := ParseConntrackBackend(a.config.L3FlushConntrackBackend)
+	if oldConntrackBackend != newConntrackBackend {
+		log.Warning("[L3FlushSched] l3FlushConntrackBackend reload from %q to %q requires AC restart to affect the constructed ConntrackFlusher (the flusher is built once at Start).",
+			oldConntrackBackend, newConntrackBackend)
+		a.config.L3FlushConntrackBackend = newConntrackBackend.String()
+	}
+	newConntrackPoolSize := normalizeConntrackPoolSize(conf.L3FlushConntrackPoolSize)
+	if a.config.L3FlushConntrackPoolSize != newConntrackPoolSize {
+		log.Warning("[L3FlushSched] l3FlushConntrackPoolSize reload from %d to %d requires AC restart to affect the constructed ConntrackFlusher socket pool (the pool is built once at Start).",
+			a.config.L3FlushConntrackPoolSize, newConntrackPoolSize)
+		a.config.L3FlushConntrackPoolSize = newConntrackPoolSize
 	}
 
 	// L3 flush-on-expiry config. Logging on change matches the

@@ -30,32 +30,76 @@ import (
 // defense-in-depth, NOT enough for the L3-only million-session
 // target's 100k flushes/sec headroom.
 //
-// **Follow-up** (filed as #2165 — to be created): replace with
-// direct netlink (CTA_FILTER-based partial-tuple delete) for the
-// throughput target. The FlowFlusher interface boundary keeps the
-// swap mechanical; no caller-visible change.
+// # Backends (#2165)
 //
-// Until then, the bounded backpressure path in expiry_scheduler.go
-// limits damage: if conntrack-delete sustained throughput is
-// exceeded, the breaker opens and UdpAC fails closed at NHP-AOP
-// admission. Better to fail loud than to silently late-flush.
+// Flush dispatches on the configured ConntrackBackend:
+//
+//   - BackendExec (default): the v1 fork+exec `conntrack -D` path
+//     documented below. IPv4-only.
+//   - BackendNetlink: direct NFNL_SUBSYS_CTNETLINK via a pool of
+//     pre-warmed netlink sockets (expiry_conntrack_flusher_netlink_linux.go).
+//     No fork, no userspace-tool dependency, no locale-fragile stderr
+//     scrape, and IPv4 + IPv6. This is the throughput path — each delete
+//     is a netlink syscall (~100µs) rather than a ~5-10 ms fork+exec —
+//     and the IPv6 capability closes the iptables-mode immediate-teardown
+//     gap (#2794/#2797). Opt-in until soak-validated per the rollout plan.
+//
+// The backend is internal to the Linux build; FlowFlusher and every
+// caller, scheduler, and test are unchanged across the toggle.
+//
+// Until netlink is the default, the bounded backpressure path in
+// expiry_scheduler.go limits damage: if conntrack-delete sustained
+// throughput is exceeded, the breaker opens and UdpAC fails closed at
+// NHP-AOP admission. Better to fail loud than to silently late-flush.
 //
 // # Idempotency
 //
-// `conntrack -D` returns exit status 1 when no matching entries
+// Exec: `conntrack -D` returns exit status 1 when no matching entries
 // exist. The wrapper distinguishes ENOENT from real errors via
 // stderr-text inspection — the kernel reports "0 flow entries have
-// been deleted" on no-match, which we treat as success.
+// been deleted" on no-match, which we treat as success. Netlink: a
+// delete of an already-gone entry surfaces ENOENT, mapped to success
+// (see isConntrackENOENT). Both honor the FlowFlusher idempotency
+// contract the scheduler's breaker relies on.
 type ConntrackFlusher struct {
+	// backend selects exec vs netlink; see ConntrackBackend.
+	backend ConntrackBackend
+
+	// pool is the pre-warmed netlink socket pool; non-nil iff
+	// backend == BackendNetlink. Owned by this flusher — closed by Close.
+	pool *ctNetlinkPool
+
+	// ctOps owns raw netlink dump/delete calls. The real implementation wraps
+	// ctConn; tests replace it so retry/deadline policy is covered in ordinary
+	// CI without CAP_NET_ADMIN.
+	ctOps ctNetlinkOps
+
+	// netlinkDeleted counts conntrack entries the netlink backend has
+	// actually deleted (cumulative, across all Flush calls). Published as
+	// the L3FlushConntrackDeleted gauge so the soak can confirm the netlink
+	// path is tearing flows down (vs no-op'ing) and read its rate against
+	// the throughput target. Zero on the exec backend.
+	netlinkDeleted atomic.Uint64
+
+	// netlinkSlowDumps counts Flush calls whose successful conntrack dump
+	// attempt exceeded netlinkSlowDumpThreshold (cumulative). Retry/reopen
+	// overhead is excluded so the L3FlushConntrackSlowDumps gauge remains a
+	// table-size latency signal for the soak: a rising rate is the O(table)
+	// per-key dump hitting the table-size knee the throughput follow-up
+	// tracks, exactly the large-table regime the single-threaded ≤200µs
+	// benchmark can't surface. Zero on the exec backend.
+	netlinkSlowDumps atomic.Uint64
+
 	// Per-call timeout comes from the scheduler-supplied context
 	// (defaultFlushCallTimeout in expiry_scheduler.go); we don't
 	// add a second wrapper here. A previous `timeout uint8` field
 	// claimed "caps fork+exec stalls" but was never wired into the
 	// exec.CommandContext call. Removed as dead code.
-	binary string // resolved path to the `conntrack` binary
-	// metricSkipped counts non-IPv4 keys no-op'd at Flush entry
-	// (conntrack -D is IPv4-only — see Flush). Symmetric with
-	// BpfFlusher.metricSkipped so the two flushers stay operationally
+	binary string // resolved path to the `conntrack` binary (exec backend)
+	// metricSkipped counts keys no-op'd at Flush entry before backend work:
+	// exec backend non-IPv4 expiry skips (`conntrack -D` is IPv4-only — see
+	// Flush), and netlink backend mixed-family FlowKey regressions. Symmetric
+	// with BpfFlusher.metricSkipped so the flushers stay operationally
 	// observable.
 	//
 	// This is the EXPIRY-skip counter: a v6 key reaching this IPv4-only flusher is
@@ -70,37 +114,99 @@ type ConntrackFlusher struct {
 	metricSkipped atomic.Uint64
 }
 
-// NewConntrackFlusher constructs a flusher backed by the
-// `conntrack` userspace tool. Returns an error if the binary is
-// not installed (the AC's user_data.sh.tpl installs conntrack-tools
-// in the iptables-mode setup; failure here means a malformed AMI).
+// NewConntrackFlusher constructs a flusher. With no options (or
+// WithBackend(BackendExec)) it backs onto the `conntrack` userspace
+// tool — the v1 default. WithBackend(BackendNetlink) opens a pool of
+// NFNL_SUBSYS_CTNETLINK sockets instead.
 //
-// Logs the resolved conntrack-tools version at construction so
-// AC-log diffing across AMI rebuilds reveals an unexpected version
-// change before it bites the no-match stderr-substring classifier
-// (see isConntrackNoEntries). Operationally-paired with the runbook
-// note in docs/runbooks/l3-flush-breaker-recovery.md and tracked
-// as a hard AMI-startup assertion in #2179
-func NewConntrackFlusher() (*ConntrackFlusher, error) {
-	bin, err := exec.LookPath("conntrack")
-	if err != nil {
-		return nil, fmt.Errorf("conntrack binary not found in PATH: %w", err)
+// Construction is fail-closed in both backends (the L3-only enforcement
+// contract: an AC that enabled L3 flush but can't flush must NOT come
+// up silently late-flushing):
+//
+//   - exec: errors if the `conntrack` binary is not installed (the AC's
+//     user_data.sh.tpl installs conntrack-tools in the iptables-mode
+//     setup; failure here means a malformed AMI). The resolved version
+//     is logged so AC-log diffing across AMI rebuilds reveals an
+//     unexpected version change before it bites the no-match stderr
+//     classifier (see isConntrackNoEntries). Paired with the runbook
+//     note in docs/runbooks/l3-flush-breaker-recovery.md and tracked as
+//     a hard AMI-startup assertion in #2179.
+//   - netlink: errors if any pooled socket fails to open (no CAP_NET_ADMIN,
+//     a netns issue, an unsupported kernel). The caller (Start via
+//     newFlusherForFilterMode) treats this as fatal.
+func NewConntrackFlusher(opts ...ConntrackFlusherOption) (*ConntrackFlusher, error) {
+	cfg := resolveConntrackFlusherConfig(opts...)
+	f := &ConntrackFlusher{backend: cfg.backend, ctOps: realCtNetlinkOps{}}
+
+	switch cfg.backend {
+	case BackendNetlink:
+		pool, err := newCtNetlinkPool(cfg.poolSize)
+		if err != nil {
+			return nil, fmt.Errorf("conntrack netlink backend init: %w", err)
+		}
+		f.pool = pool
+		log.Info("[ConntrackFlusher] using direct netlink (NFNL_SUBSYS_CTNETLINK) backend — pool=%d, IPv4+IPv6", cfg.poolSize)
+	default: // BackendExec
+		bin, err := exec.LookPath("conntrack")
+		if err != nil {
+			return nil, fmt.Errorf("conntrack binary not found in PATH: %w", err)
+		}
+		if ver, vErr := readConntrackVersion(bin); vErr == nil {
+			log.Info("[ConntrackFlusher] using conntrack at %s — %s (exec backend, IPv4-only)", bin, ver)
+		} else {
+			// Soft-fail: a `--version` flake shouldn't block AC start.
+			// The flusher itself works regardless; this is observability.
+			log.Warning("[ConntrackFlusher] conntrack at %s — version probe failed: %v", bin, vErr)
+		}
+		f.binary = bin
 	}
-	if ver, vErr := readConntrackVersion(bin); vErr == nil {
-		log.Info("[ConntrackFlusher] using conntrack at %s — %s", bin, ver)
-	} else {
-		// Soft-fail: a `--version` flake shouldn't block AC start.
-		// The flusher itself works regardless; this is observability.
-		log.Warning("[ConntrackFlusher] conntrack at %s — version probe failed: %v", bin, vErr)
-	}
-	return &ConntrackFlusher{binary: bin}, nil
+	return f, nil
 }
 
-// SkippedCount returns the number of non-IPv4 keys this flusher
-// has no-op'd (the conntrack invocation is IPv4-only by design) — the
-// benign scheduled-expiry v6-leak count described on the metricSkipped
-// godoc (NOT a failed-revoke signal; that is MetricRevocationIPv6HardFail).
-// Symmetric with BpfFlusher.SkippedCount for the metric publisher.
+// IsNetlinkBackend reports whether this flusher uses the direct netlink
+// backend. Used only for netlink-specific metric gating; capability decisions
+// should use HandlesIPv6.
+func (f *ConntrackFlusher) IsNetlinkBackend() bool { return f.backend == BackendNetlink }
+
+// HandlesIPv6 reports whether this flusher's coarse Flush tears down
+// IPv6 conntrack entries. True only for the netlink backend — exec's
+// `conntrack -D` is invoked without `-f ipv6` and is IPv4-only. The AC
+// reads this at Start to decide whether the iptables-mode immediate-
+// revocation path still has to raise the IPv6 hard-fail (#2794): when
+// the coarse path is v6-capable, a v6 revoke's RescheduleEarlier→Flush
+// actually tears the flow down, so no hard-fail is warranted.
+func (f *ConntrackFlusher) HandlesIPv6() bool { return f.IsNetlinkBackend() }
+
+// Close releases backend resources. Exec backend: no-op. Netlink
+// backend: closes every pooled socket. Safe to call once after the
+// scheduler has drained (no Flush in flight); idempotent on a nil pool.
+func (f *ConntrackFlusher) Close() error {
+	if f.pool != nil {
+		return f.pool.Close()
+	}
+	return nil
+}
+
+// NetlinkDeletedCount returns the cumulative number of conntrack entries
+// the netlink backend has deleted. Always 0 on the exec backend (which
+// has no per-entry visibility). Read by the L3FlushConntrackDeleted gauge.
+func (f *ConntrackFlusher) NetlinkDeletedCount() uint64 {
+	return f.netlinkDeleted.Load()
+}
+
+// NetlinkSlowDumpCount returns the cumulative number of Flush calls whose
+// conntrack dump exceeded netlinkSlowDumpThreshold. Always 0 on the exec
+// backend. Read by the L3FlushConntrackSlowDumps gauge.
+func (f *ConntrackFlusher) NetlinkSlowDumpCount() uint64 {
+	return f.netlinkSlowDumps.Load()
+}
+
+// SkippedCount returns the number of keys this flusher no-op'd before backend
+// work — exec backend non-IPv4 expiry skips plus netlink backend mixed-family
+// FlowKey regressions. The exec count is the benign scheduled-expiry v6-leak
+// count described on the metricSkipped godoc (NOT a failed-revoke signal; that
+// is MetricRevocationIPv6HardFail). Symmetric with BpfFlusher.SkippedCount for
+// the metric publisher.
 func (f *ConntrackFlusher) SkippedCount() uint64 {
 	return f.metricSkipped.Load()
 }
@@ -124,38 +230,46 @@ func readConntrackVersion(bin string) (string, error) {
 	return first, nil
 }
 
-// Flush implements FlowFlusher. Issues `conntrack -D -s SRC -d DST
-// --dport PORT -p PROTO` to remove all kernel conntrack entries
+// Flush implements FlowFlusher, dispatching to the configured backend.
+//
+// CONTRACT (both backends): Returns nil on success OR on no-matching-flows
+// (idempotent ENOENT no-op). msghandler.go's schedule-then-write reorder
+// for #2168 relies on this — a scheduled flush against a never-written
+// kernel entry (e.g., when the ipset.Add subsequently failed) MUST NOT
+// bump FlushErr or trip the breaker. Returns a wrapped error on any
+// other failure; the scheduler records this into the breaker.
+func (f *ConntrackFlusher) Flush(ctx context.Context, key FlowKey) error {
+	if f.backend == BackendNetlink {
+		return f.flushNetlink(ctx, key)
+	}
+	return f.flushExec(ctx, key)
+}
+
+// flushExec is the v1 BackendExec path. Issues `conntrack -D -s SRC -d
+// DST --dport PORT -p PROTO` to remove all kernel conntrack entries
 // matching the FlowKey's (src_ip, dst_ip, dst_port, proto) tuple.
 // Source port is intentionally unconstrained — the kernel deletes
 // every flow matching the partial tuple.
 //
-// CONTRACT: Returns nil on success OR on no-matching-flows
-// (idempotent ENOENT no-op). msghandler.go's schedule-then-write
-// reorder for #2168 relies on this — a scheduled flush against a
-// never-written kernel entry (e.g., when the ipset.Add subsequently
-// failed) MUST NOT bump FlushErr or trip the breaker. Logged at
-// Debug only; see isConntrackNoEntries for the "0 flow entries
-// have been deleted" detection. Returns a wrapped error on any
-// other failure; the scheduler records this into the breaker.
-func (f *ConntrackFlusher) Flush(ctx context.Context, key FlowKey) error {
+// See Flush for the idempotency contract; here no-match is detected via
+// isConntrackNoEntries ("0 flow entries have been deleted") and logged
+// at Debug.
+func (f *ConntrackFlusher) flushExec(ctx context.Context, key FlowKey) error {
 	// IPv4-only. The conntrack invocation below doesn't pass
 	// `-f ipv6`, so a non-IPv4-mapped key would produce a kernel-
 	// call failure and trip the breaker on every fire. FlowKey
 	// admits v6 by design (parseIPTo16 stores both families); the
 	// constraint lives at the flusher boundary, matching the
 	// BpfFlusher symmetric guard in expiry_bpf_flusher_linux.go.
-	// As of #2778 part 2 the revoke path no longer reaches here immediately for
-	// v6: flushEntryNow's coarse RescheduleEarlier is IPv4-only, so a revoked v6
-	// key is not rescheduled into this flusher (its teardown is surfaced on
-	// MetricRevocationIPv6HardFail, the declared out-of-scope gap pending the
-	// #2165 netlink flusher). A v6 key reaching here is therefore a benign
-	// scheduled-expiry leak — an admitted v6 flow's allow-rule flush firing at its
-	// firewall deadline — no-op'd (Warning, no breaker trip) and counted on the
-	// expiry-only metricSkipped; the kernel TTL closes the established flow.
+	// This is the exec backend; the #2165 netlink backend handles v6 instead of
+	// skipping. flushEntryNow does not reschedule v6 immediate revokes into the
+	// exec backend, so a v6 key reaching here is a scheduled-expiry leak (or an
+	// upstream scheduling regression), not the revoke-skip signal. Immediate
+	// v6 revokes under iptables+exec are surfaced on MetricRevocationIPv6HardFail
+	// at the revoke site.
 	if !isIPv4Mapped(key.SrcIP) || !isIPv4Mapped(key.DstIP) {
 		f.metricSkipped.Add(1)
-		log.Warning("[ConntrackFlusher] non-IPv4 key %s reached IPv4-only conntrack flusher — benign v6 scheduled-expiry leak (the revoke path does not reschedule v6 here; v6 revokes are surfaced on MetricRevocationIPv6HardFail). No-op'd; flow self-closes at kernel TTL; tracked in metricSkipped", key)
+		log.Warning("[ConntrackFlusher] non-IPv4 key %s reached the IPv4-only exec conntrack flusher — benign v6 scheduled-expiry leak or upstream scheduling regression. No-op'd; flow self-closes at kernel TTL; tracked in metricSkipped", key)
 		return nil
 	}
 	srcIP := key.SrcIPString()
@@ -192,8 +306,8 @@ func (f *ConntrackFlusher) Flush(ctx context.Context, key FlowKey) error {
 	// string the no-match-success detection greps for stays in the C
 	// locale. Without this, an AMI build with a localized LC_ALL
 	// would silently reclassify every no-match flush as a real error
-	// and trip the L3 flush breaker
-	// Eliminated entirely once #2165 swaps to netlink.
+	// and trip the L3 flush breaker. Moot on the netlink backend (#2165),
+	// which has no stderr to scrape — set l3FlushConntrackBackend=netlink.
 	cmd.Env = append(cmd.Environ(), "LC_ALL=C")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
