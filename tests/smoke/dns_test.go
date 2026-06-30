@@ -9,7 +9,10 @@
 
 package smoke
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // TestDeriveEndpoints_ProdQurlHostsAreRegisteredApexes fences the
 // regression class that produced #1329: a prod entry in
@@ -77,6 +80,81 @@ func TestDeriveEndpoints_SandboxValuesArePinned(t *testing.T) {
 	for _, c := range cases {
 		if c.got != c.want {
 			t.Errorf("sandbox %s = %q, want %q", c.field, c.got, c.want)
+		}
+	}
+}
+
+// TestDeriveEndpoints_ResolveEndpointTracksJSAgent fences the
+// topology gate that 01/09/10/12/13/14/21/24 key on: an env's
+// derivedEndpoints.ResolveEndpointEnabled MUST be the inverse of the
+// browser-JS-agent switch (qurlLinkJSAgentEnabledEnvs, the smoke
+// mirror of qurl_link_js_agent_enabled), because turning on the
+// JS-agent + relay topology is exactly what tears down the legacy
+// server-side resolve.qurl.link surface (terraform local
+// `qurl_resolve_endpoint_enabled = deploy_qurl_link &&
+// !qurl_link_js_agent_enabled`). Without this fence the two per-env
+// mirrors could drift — e.g. someone flips qurlLinkJSAgentEnabledEnvs
+// for a new env but forgets ResolveEndpointEnabled — and the gated
+// tests would either hammer a dead endpoint or skip a live one.
+//
+// RelayBaseURL is pinned alongside so the protocol-surface re-home
+// target can't silently go empty in a JS-agent env (which would make
+// nhpIngressTLSURL skip the TLS fence instead of asserting it), and is
+// additionally cross-checked against qurlLinkJSAgentNetworkOrigins (the
+// CSP connect-src mirror of the same relay_dns_name tfvar) so the relay
+// host has a single drift fence rather than two independent literals.
+func TestDeriveEndpoints_ResolveEndpointTracksJSAgent(t *testing.T) {
+	cases := []struct {
+		env                string
+		wantResolveEnabled bool
+		wantRelayBaseURL   string
+	}{
+		{"local", true, ""},
+		{"sandbox", false, "https://relay.qurl.link.layerv.xyz"},
+		{"prod", true, ""},
+	}
+	for _, c := range cases {
+		d, err := deriveEndpoints(c.env)
+		if err != nil {
+			t.Fatalf("deriveEndpoints(%q): %v", c.env, err)
+		}
+		if d.ResolveEndpointEnabled != c.wantResolveEnabled {
+			t.Errorf("%s ResolveEndpointEnabled = %v, want %v", c.env, d.ResolveEndpointEnabled, c.wantResolveEnabled)
+		}
+		if d.RelayBaseURL != c.wantRelayBaseURL {
+			t.Errorf("%s RelayBaseURL = %q, want %q", c.env, d.RelayBaseURL, c.wantRelayBaseURL)
+		}
+		// The load-bearing invariant: resolve surface present iff the
+		// JS-agent is NOT enabled for this env.
+		if want := !qurlLinkJSAgentEnabledEnvs[c.env]; d.ResolveEndpointEnabled != want {
+			t.Errorf("%s: ResolveEndpointEnabled (%v) must equal !qurlLinkJSAgentEnabledEnvs[%q] (%v) — the two per-env mirrors drifted",
+				c.env, d.ResolveEndpointEnabled, c.env, want)
+		}
+		// Single source of truth for the relay host: in a JS-agent env the
+		// re-home target (RelayBaseURL) must be one of the browser connect-src
+		// origins the CSP mirror already pins (qurlLinkJSAgentNetworkOrigins),
+		// so the two relay-DNS mirrors of relay_dns_name can't drift apart.
+		if qurlLinkJSAgentEnabledEnvs[c.env] {
+			if origins := qurlLinkJSAgentNetworkOrigins[c.env]; !slices.Contains(origins, d.RelayBaseURL) {
+				t.Errorf("%s: RelayBaseURL %q not in qurlLinkJSAgentNetworkOrigins[%q] %v — the two relay-DNS mirrors drifted",
+					c.env, d.RelayBaseURL, c.env, origins)
+			}
+		}
+	}
+
+	// Anti-drift: the loop only fences envs present in `cases`. Assert every
+	// JS-agent env is covered, so a new entry in qurlLinkJSAgentEnabledEnvs
+	// (the CLAUDE.md "both-places edit") can't silently escape the
+	// ResolveEndpointEnabled-inverse and RelayBaseURL cross-checks above.
+	// (Widening this to assert `cases` covers every env deriveEndpoints accepts
+	// needs a canonical env enum that doesn't exist yet — tracked in #2915.)
+	covered := make(map[string]bool, len(cases))
+	for _, c := range cases {
+		covered[c.env] = true
+	}
+	for env := range qurlLinkJSAgentEnabledEnvs {
+		if !covered[env] {
+			t.Errorf("qurlLinkJSAgentEnabledEnvs has env %q with no case in TestDeriveEndpoints_ResolveEndpointTracksJSAgent — add it so its resolve/relay invariants are fenced", env)
 		}
 	}
 }

@@ -15,6 +15,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.68.4
 	github.com/aws/smithy-go v1.27.1
 	github.com/google/uuid v1.6.0
+	github.com/layervai/qurl-go v0.0.0-20260629023600-359227e7b6e8
 )
 
 require (
@@ -31,4 +32,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.31.3 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.36.6 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3 // indirect
+	golang.org/x/crypto v0.53.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
 )

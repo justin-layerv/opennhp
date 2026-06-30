@@ -46,6 +46,38 @@ type derivedEndpoints struct {
 	// as the Origin header on cross-origin fetch() simulations and
 	// assert the server echoes it back in Access-Control-Allow-Origin.
 	QURLLinkOrigin string
+
+	// ResolveEndpointEnabled reports whether the nhp-server's HTTP
+	// surface (the /health/*, /plugins/*, and qURL token-resolution
+	// path) is reachable at NHPServerBaseURL in this env. It mirrors the
+	// Terraform local `qurl_resolve_endpoint_enabled = deploy_qurl_link &&
+	// !qurl_link_js_agent_enabled` (terraform/main.tf): an env that turns
+	// on the browser JS-agent + relay topology (qurl_link_js_agent_enabled
+	// = true) tears that public surface down entirely — the resolve /
+	// resolve-origin Route53 records and the server NLB HTTPS listener (and
+	// its blue/green SSM params) are not created. Tests that hit
+	// resolve.qurl.link gate on this via skipIfResolveEndpointDisabled so
+	// they keep running where the surface is live (prod, and the localhost
+	// stack) and skip cleanly where the JS-agent replaced it (sandbox).
+	//
+	// local is true: the self-contained stack serves /health and the
+	// /plugins dispatcher on localhost:8888, and the JS-agent teardown is a
+	// deployed-env concern. The invariant
+	// `ResolveEndpointEnabled == !qurlLinkJSAgentEnabledEnvs[env]` holds for
+	// every env and is fenced against drift in dns_test.go.
+	ResolveEndpointEnabled bool
+
+	// RelayBaseURL is the public HTTPS ingress for the NHP-Relay
+	// (relay.qurl.link.layerv.xyz in sandbox), the browser-knock front door
+	// that replaces the resolve NLB under the JS-agent topology. Empty in
+	// envs without a deployed relay (local, and prod until deploy_relay
+	// flips). The relay ALB terminates TLS and forwards only POST/OPTIONS
+	// /relay/*; every other path (including /health/live, which is the
+	// ALB-internal target health-check path) returns a 404 default action,
+	// so the only externally-assertable relay surface is its TLS
+	// certificate — TestProtocol_NLBTLSCertValid re-homes here when the
+	// resolve endpoint is disabled. Mirrors the env's relay_dns_name tfvar.
+	RelayBaseURL string
 }
 
 // deriveEndpoints returns the default URL set for the named environment.
@@ -89,6 +121,8 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 			QURLInternalAPIHostname: "",
 			QURLSiteDomain:          "qurl.site.local", // apex-format guard (#1329) only; unused on local (no qURL path runs)
 			QURLLinkOrigin:          "http://localhost:8888",
+			ResolveEndpointEnabled:  true, // localhost:8888 serves /health + /plugins for the curated local tier
+			RelayBaseURL:            "",   // no relay in the self-contained stack
 		}, nil
 	case "sandbox":
 		return derivedEndpoints{
@@ -98,6 +132,12 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 			QURLInternalAPIHostname: "internal-api.qurl.layerv.xyz",
 			QURLSiteDomain:          "qurl.site.layerv.xyz",
 			QURLLinkOrigin:          "https://qurl.link.layerv.xyz",
+			// sandbox runs the browser JS-agent + relay topology
+			// (qurl_link_js_agent_enabled = true), so the legacy server-side
+			// resolve.qurl.link surface is torn down; the relay is the live
+			// HTTPS ingress (deploy_relay = true, relay_dns_name below).
+			ResolveEndpointEnabled: false,
+			RelayBaseURL:           "https://relay.qurl.link.layerv.xyz",
 		}, nil
 	case "prod":
 		return derivedEndpoints{
@@ -111,6 +151,12 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 			// terraform/environments/prod qurl_site_domain value.
 			QURLSiteDomain: "qurl.site",
 			QURLLinkOrigin: "https://qurl.link",
+			// prod still serves the legacy resolve endpoint
+			// (qurl_link_js_agent_enabled = false). The relay is not yet
+			// deployed in prod (deploy_relay = false), so RelayBaseURL stays
+			// empty until prod adopts the JS-agent topology.
+			ResolveEndpointEnabled: true,
+			RelayBaseURL:           "",
 		}, nil
 	default:
 		return derivedEndpoints{}, fmt.Errorf("unknown environment %q (want local, sandbox, or prod)", env)

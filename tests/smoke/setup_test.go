@@ -58,14 +58,22 @@ func TestMain(m *testing.M) {
 		QURLInternalAPIHostname: getEnvOrDefault("QURL_INTERNAL_API_HOSTNAME", derived.QURLInternalAPIHostname),
 		QURLSiteDomain:          getEnvOrDefault("QURL_SITE_DOMAIN", derived.QURLSiteDomain),
 		QURLLinkOrigin:          getEnvOrDefault("QURL_LINK_ORIGIN", derived.QURLLinkOrigin),
-		AllowSSMProbes:          strings.EqualFold(os.Getenv("NHP_SMOKE_ALLOW_SSM_PROBES"), "true"),
-		QURLInternalALBEnabled:  strings.EqualFold(os.Getenv("NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED"), "true"),
-		AWSRegion:               region,
+		// ResolveEndpointEnabled intentionally has NO env override: it is a hard
+		// topology invariant fenced against qurlLinkJSAgentEnabledEnvs in
+		// dns_test.go. RelayBaseURL does take one (a reachable URL worth
+		// overriding ad-hoc). Do not add an override for ResolveEndpointEnabled
+		// — it would let the drift fence and the runtime value diverge.
+		ResolveEndpointEnabled: derived.ResolveEndpointEnabled,
+		RelayBaseURL:           getEnvOrDefault("NHP_RELAY_BASE_URL", derived.RelayBaseURL),
+		AllowSSMProbes:         strings.EqualFold(os.Getenv("NHP_SMOKE_ALLOW_SSM_PROBES"), "true"),
+		QURLInternalALBEnabled: strings.EqualFold(os.Getenv("NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED"), "true"),
+		AWSRegion:              region,
 	}
 
 	testConfig.NHPServerBaseURL = strings.TrimSuffix(testConfig.NHPServerBaseURL, "/")
 	testConfig.NHPServerOriginURL = strings.TrimSuffix(testConfig.NHPServerOriginURL, "/")
 	testConfig.QURLAPIBaseURL = strings.TrimSuffix(testConfig.QURLAPIBaseURL, "/")
+	testConfig.RelayBaseURL = strings.TrimSuffix(testConfig.RelayBaseURL, "/")
 
 	// Catch the misconfigured combo "ALB enabled but no hostname" before
 	// any test runs. Without this, smoke probes interpolate the empty

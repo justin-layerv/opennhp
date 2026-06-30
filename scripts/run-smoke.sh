@@ -115,10 +115,10 @@ case "$TIER" in
     RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|ACEBPFObjects|SSMRunbook|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|PublicALB|ResolveOrigin)_'
     ;;
   tier1+tier2)
-    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|ACEBPFObjects|SSMRunbook|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
+    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|ACEBPFObjects|SSMRunbook|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveV2|ResolveOrigin|Knock|Plugins|InternalAPI|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
     ;;
   tier3-no-ssm)
-    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
+    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveV2|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
     ;;
   local)
     # Curated local-safe subset: pure NHP wire/HTTP contract that runs against
@@ -129,7 +129,14 @@ case "$TIER" in
     # under these prefixes skip via requireRemote. Like `all`, this is an
     # allow-list: the coverage checker validates these tokens are real but does
     # NOT require every test to appear here.
-    RUN_FILTER='^Test(HealthLive|HealthReady|HealthStartup|HealthKnockReady|Plugins|Timing)_'
+    #
+    # ResolveV2 (TestResolveV2_SDKRejectsBadLinks) is the exception that does
+    # NOT touch the local stack: it is a fully offline qurl-go SDK tripwire
+    # (no AWS, no network, no minting). It rides the local tier so the
+    # PR-pre-flight lane (nhp-smoke-pr.yml) actually EXECUTES it — a bad qurl-go
+    # bump that loosens the v2 parser/signature check then reds on the PR that
+    # bumps it, not only post-merge against deployed binaries.
+    RUN_FILTER='^Test(HealthLive|HealthReady|HealthStartup|HealthKnockReady|Plugins|Timing|ResolveV2)_'
     ;;
   all)
     RUN_FILTER=''

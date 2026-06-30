@@ -139,6 +139,11 @@ type keepAliveProbe struct {
 // origin_keepalive_timeout, fencing the resolve.qurl.link 502 class
 // (PR #1795). See file-level comment for rationale.
 func TestResolveOrigin_HTTPIdleTimeoutClearsCloudFrontKeepAlive(t *testing.T) {
+	// This fences the CloudFront-origin-keepalive vs server-IdleTimeout race
+	// (#1795), which only exists on the CloudFront → resolve-origin NLB path.
+	// The JS-agent + relay topology removes that path (no CF resolve edge, no
+	// resolve-origin record), so skip there; prod still runs it.
+	skipIfResolveEndpointDisabled(t)
 	if testConfig.NHPServerOriginURL == "" {
 		// Sandbox and prod are KNOWN to have a separate
 		// resolve-origin.<env> Route53 record (see
@@ -149,7 +154,10 @@ func TestResolveOrigin_HTTPIdleTimeoutClearsCloudFrontKeepAlive(t *testing.T) {
 		// only in unknown/future envs where we explicitly don't expect
 		// the record to exist.
 		switch testConfig.Environment {
-		case "sandbox", "prod":
+		case "prod":
+			// sandbox is handled by skipIfResolveEndpointDisabled above —
+			// under the JS-agent topology it legitimately has no
+			// resolve-origin record. prod still must, so fail loudly there.
 			t.Fatalf("NHPServerOriginURL is empty for env %q, which is expected to have a separate resolve-origin record (see tests/smoke/dns.go::deriveEndpoints + terraform/main.tf::aws_route53_record.qurl_link_resolve_origin). Either the record is missing or the smoke wiring regressed; this fence cannot be silently skipped in a known env.", testConfig.Environment)
 		default:
 			t.Skipf("skipped: NHPServerOriginURL not set for env %q (no separate origin record)", testConfig.Environment)

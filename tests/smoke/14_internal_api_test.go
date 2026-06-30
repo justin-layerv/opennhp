@@ -45,7 +45,8 @@ import (
 // endpoint's internals by sending malformed JSON). The assertion
 // is specifically 403, not "4xx-class".
 func TestInternalAPI_PublicIPRejected(t *testing.T) {
-	requireRemote(t) // remote-only: internal-API source-IP gate behaves differently against a localhost stack.
+	requireRemote(t)                 // remote-only: internal-API source-IP gate behaves differently against a localhost stack.
+	skipIfResolveEndpointDisabled(t) // /nhp/internal/* lives on the resolve surface; gone under the JS-agent topology
 	emptyBody := strings.NewReader("{}")
 
 	resp, body := doRequest(t, testConfig.HTTPClient, http.MethodPost,

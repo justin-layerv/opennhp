@@ -40,6 +40,10 @@ import (
 // no-handler branch is method-agnostic, so a method-split would
 // be a separate regression class with its own fence.
 func TestPlugins_UnknownASPIDReturns404(t *testing.T) {
+	// The /plugins dispatcher lives on the nhp-server HTTP surface at
+	// NHPServerBaseURL, which the JS-agent + relay topology takes private.
+	// Runs where that surface is live (prod + localhost), skips in JS-agent envs.
+	skipIfResolveEndpointDisabled(t)
 	resp, body := doGetNoRedirect(t, testConfig.NHPServerBaseURL, "/plugins/nonexistent", nil)
 	assertStatusCode(t, resp, http.StatusNotFound)
 
@@ -75,6 +79,7 @@ func TestPlugins_NoTokenReturnsBranded403(t *testing.T) {
 	// resource (qURL provisioning is a qurl-service concern), so /plugins/qurl
 	// returns a plain 404 there — skip on local; this fence runs on remote.
 	requireRemote(t)
+	skipIfResolveEndpointDisabled(t) // branded-403 page is served by the legacy resolve plugin; gone under the JS-agent topology
 	resp, body := doGetNoRedirect(t, testConfig.NHPServerBaseURL, "/plugins/qurl", nil)
 	assertStatusCode(t, resp, http.StatusForbidden)
 
@@ -119,6 +124,10 @@ func TestPlugins_NoTokenReturnsBranded403(t *testing.T) {
 // 64 KiB is comfortably over the 16 KiB cap and small enough not to
 // stress the test transport.
 func TestPlugins_OversizedPOSTReturns413(t *testing.T) {
+	// The /plugins body cap lives on the resolve-origin NLB surface, which
+	// the JS-agent + relay topology tears down (along with the resolve-origin
+	// Route53 record). Skip there; runs where the surface is live (prod).
+	skipIfResolveEndpointDisabled(t)
 	if testConfig.NHPServerOriginURL == "" {
 		// Sandbox and prod are KNOWN to have a separate
 		// resolve-origin.<env> Route53 record (see
@@ -127,7 +136,10 @@ func TestPlugins_OversizedPOSTReturns413(t *testing.T) {
 		// in either of those envs means the wiring regressed — fail
 		// loudly, don't silently turn off the cap fence.
 		switch testConfig.Environment {
-		case "sandbox", "prod":
+		case "prod":
+			// sandbox is handled by skipIfResolveEndpointDisabled above —
+			// under the JS-agent topology it legitimately has no
+			// resolve-origin record. prod still must, so fail loudly there.
 			t.Fatalf("NHPServerOriginURL is empty for env %q, which is expected to have a separate resolve-origin record (see tests/smoke/dns.go::deriveEndpoints + terraform/main.tf::aws_route53_record.qurl_link_resolve_origin). Either the record is missing or the smoke wiring regressed; this fence cannot be silently skipped in a known env.", testConfig.Environment)
 		default:
 			t.Skipf("skipped: NHPServerOriginURL not set for env %q (no separate origin record)", testConfig.Environment)

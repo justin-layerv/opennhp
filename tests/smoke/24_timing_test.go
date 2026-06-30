@@ -33,6 +33,7 @@ import (
 // TestTiming_HealthResponseP95 measures 20 samples of
 // /health/live and logs the p95 response time. Does NOT fail.
 func TestTiming_HealthResponseP95(t *testing.T) {
+	skipIfResolveEndpointDisabled(t) // /health/* lives on the resolve surface; gone under the JS-agent topology
 	const samples = 20
 	durations := make([]time.Duration, 0, samples)
 
@@ -61,6 +62,7 @@ func TestTiming_HealthResponseP95(t *testing.T) {
 // TestTiming_KnockReadyMedian measures 20 samples of
 // /health/knock-ready and logs the median. Does NOT fail.
 func TestTiming_KnockReadyMedian(t *testing.T) {
+	skipIfResolveEndpointDisabled(t) // /health/* lives on the resolve surface; gone under the JS-agent topology
 	const samples = 20
 	durations := make([]time.Duration, 0, samples)
 

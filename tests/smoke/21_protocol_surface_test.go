@@ -21,20 +21,30 @@ import (
 // CN starting with those letters doesn't accidentally pass.
 var letsEncryptIntermediateCN = regexp.MustCompile(`^[RE]\d+$`)
 
-// TestProtocol_NLBTLSCertValid connects to the NHP server's HTTPS
-// endpoint, captures the TLS certificate, and asserts:
+// TestProtocol_NLBTLSCertValid connects to the env's externally-reachable
+// NHP HTTPS ingress, captures the TLS certificate, and asserts:
 //
 //  1. Issuer is a trusted CA (Amazon or Let's Encrypt)
-//  2. SAN includes the server hostname
+//  2. SAN includes the ingress hostname
 //  3. NotAfter is at least 30 days in the future
+//
+// The ingress is the resolve endpoint NLB where it is live (prod), or the
+// NHP-Relay ALB under the JS-agent topology (sandbox) — see nhpIngressTLSURL.
+// The relay ships dark and 404s every route by default, so its TLS
+// termination is the only externally-assertable relay surface; this fence
+// keeps that public cert covered after the resolve NLB is retired.
 //
 // A cert approaching expiry would trigger this test 30 days before
 // the actual outage, giving the team a month to act.
 func TestProtocol_NLBTLSCertValid(t *testing.T) {
-	requireRemote(t) // remote-only: asserts the real NLB TLS cert (local stack is plain HTTP).
-	parsed, err := url.Parse(testConfig.NHPServerBaseURL)
+	requireRemote(t) // remote-only: asserts the real NLB/ALB TLS cert (local stack is plain HTTP).
+	target, ok := testConfig.nhpIngressTLSURL()
+	if !ok {
+		t.Skipf("skipped: env %q exposes no externally-reachable NHP HTTPS ingress (resolve endpoint disabled and no relay deployed)", testConfig.Environment)
+	}
+	parsed, err := url.Parse(target)
 	if err != nil {
-		t.Fatalf("parse NHPServerBaseURL %q: %v", testConfig.NHPServerBaseURL, err)
+		t.Fatalf("parse NHP ingress URL %q: %v", target, err)
 	}
 	host := parsed.Hostname()
 	port := parsed.Port()

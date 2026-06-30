@@ -157,6 +157,54 @@ reds just those fences (scoped via `requirePublicALBLockdownExpectedBody`,
 not a suite abort). It already follows the #1640 shape (SSM-sourced read at
 `TestMain`), so #1640's consolidation needn't touch it.
 
+### Resolve-endpoint topology gate (JS-agent + relay)
+
+Envs that enable the browser JS-agent + NHP-Relay topology
+(`qurl_link_js_agent_enabled = true`, sandbox today) take `nhp-server`
+private: Terraform's `qurl_resolve_endpoint_enabled = deploy_qurl_link &&
+!qurl_link_js_agent_enabled` tears down the public `resolve.qurl.link`
+NLB/HTTPS surface that hosted `/health/*`, `/plugins/*`, the qURL
+token-resolution path, the `resolve-origin` record, and the server's
+blue/green HTTPS listener (and its `https-listener-arn` SSM param). The
+smoke mirror is `derivedEndpoints.ResolveEndpointEnabled`
+(`dns.go::deriveEndpoints`), and tests fencing that surface gate on
+`skipIfResolveEndpointDisabled(t)` — they skip in JS-agent envs and run
+where the surface is live (prod, and the localhost stack). `01_health`,
+`09_resolve_origin_idle_timeout`, `10_resolve` (the v1 server-403 tests),
+`12_qurl_browser_timings`, `13_plugins`, `14_internal_api`, `24_timing`
+all carry the gate; `04_blue_green` drops just its `server/https` listener
+check.
+
+`ResolveEndpointEnabled` MUST stay the inverse of
+`qurlLinkJSAgentEnabledEnvs` (the `16_qurl_link_frontend_test.go` mirror of
+the same tfvar). `dns_test.go::TestDeriveEndpoints_ResolveEndpointTracksJSAgent`
+fences the two against drift, so adding a new JS-agent env is a both-places
+edit. The TLS-surface fence (`21_protocol_surface`) does NOT skip — it
+**re-homes** to the relay ALB via `nhpIngressTLSURL()` / `RelayBaseURL`
+(`relay.qurl.link.<env>`); the relay ships dark and 404s every route, so its
+TLS termination is the only externally-assertable relay surface. The v2
+keyed-identity resolve-REJECTION contract moved client-side into the
+`github.com/layervai/qurl-go` SDK — `10_resolve`'s
+`TestResolveV2_SDKRejectsBadLinks` fences it offline (no deployed infra, no
+minting) and runs in every env. New resolve work uses the SDK, not the dead
+HTTP endpoint.
+
+**Server and AC flip blue/green independently.** Each component has its own
+`/{env}/nhp/{server,ac}/active-color` SSM param and its own ASG/TG set; a
+per-component deploy can leave them on different colors (observed:
+server=blue while the AC rolled to green). Every blue/green resolution is
+therefore **per-component** — never reuse one component's color for the
+other's resources:
+
+- `requireActiveColorForComponent(t, component)` / `inactiveColorForComponent(t, component)`
+  read the named component's own active/standby color.
+- `requireActiveColor(t)` / `requireActiveACColor(t)` are the server / AC
+  convenience wrappers over the former.
+- `requireServingASG(t, component)` (behind `requireActiveServerASG` /
+  `requireActiveACASG`) and the `04_blue_green` listener + inactive-ASG fences
+  all route the component through these, so `02_ac_ebpf_objects` /
+  `05_ac_eip_pool` resolve the AC's serving fleet even when the colors diverge.
+
 The `scripts/check-smoke-tier-filter-coverage.sh::tier3_no_ssm_expected_omissions`
 list is a sixth env-independent maintenance list — it documents
 which Test prefixes are SSM-required and so legitimately omitted

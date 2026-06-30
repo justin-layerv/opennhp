@@ -5,6 +5,7 @@ package smoke
 import (
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
@@ -116,6 +117,20 @@ type TestConfig struct {
 	// assert the server echoes it back in Access-Control-Allow-Origin.
 	QURLLinkOrigin string
 
+	// ResolveEndpointEnabled reports whether the nhp-server's HTTP surface
+	// (/health/*, /plugins/*, and the qURL token-resolution path) is served
+	// at NHPServerBaseURL in this env. False in envs that run the browser
+	// JS-agent + relay topology (qurl_link_js_agent_enabled = true), which
+	// tears down the legacy resolve.qurl.link NLB/HTTPS surface. Gated tests
+	// use skipIfResolveEndpointDisabled. See derivedEndpoints.ResolveEndpointEnabled.
+	ResolveEndpointEnabled bool
+
+	// RelayBaseURL is the public HTTPS NHP-Relay ingress for this env
+	// (relay.qurl.link.layerv.xyz in sandbox), or empty where no relay is
+	// deployed. The protocol-surface TLS test re-homes here when the resolve
+	// endpoint is disabled. See derivedEndpoints.RelayBaseURL.
+	RelayBaseURL string
+
 	// AllowSSMProbes gates every SSM RunShellScript call. Sandbox runs
 	// with true; prod defaults to false during the 30-day burn-in.
 	AllowSSMProbes bool
@@ -223,6 +238,51 @@ func skipIfQurlInternalALBDisabled(t *testing.T) {
 	}
 }
 
+// skipIfResolveEndpointDisabled skips the test cleanly when this env does
+// not serve the nhp-server HTTP surface at NHPServerBaseURL — i.e. when the
+// browser JS-agent + relay topology (qurl_link_js_agent_enabled = true) has
+// torn down the legacy resolve.qurl.link NLB/HTTPS surface that hosts
+// /health/*, /plugins/*, the qURL token-resolution path, and the server's
+// blue/green HTTPS listener. Like skipIfNoSSMProbes / skipIfQurlInternalALBDisabled,
+// the disabled state is a deliberate deployment TOPOLOGY, not a broken setup,
+// so this skips rather than fails. Tests that fence that surface keep running
+// where it is live (prod, and the localhost stack) and skip in JS-agent envs
+// (sandbox today). The TLS-cert fence re-homes to the relay instead — see
+// nhpIngressTLSURL.
+func skipIfResolveEndpointDisabled(t *testing.T) {
+	t.Helper()
+	if !testConfig.ResolveEndpointEnabled {
+		t.Skipf("skipped: env %q runs the JS-agent + relay topology — the legacy server-side resolve.qurl.link surface (/health, /plugins, resolve) is not deployed", testConfig.Environment)
+	}
+}
+
+// nhpIngressTLSURL returns the env's externally-reachable NHP HTTPS ingress
+// for TLS-surface assertions: the resolve endpoint (NHPServerBaseURL) where it
+// is live, else the NHP-Relay (RelayBaseURL) under the JS-agent topology. The
+// second return is false when neither is reachable from the runner, so the
+// caller can skip. Only the relay ALB's TLS termination is externally
+// assertable in JS-agent envs; its routes 404 by default (see
+// derivedEndpoints.RelayBaseURL).
+//
+// The resolve-on branch returns ("", false) for the localhost stack (plain
+// HTTP, no TLS). That path is unreachable on the deployed path — the only
+// runtime caller, TestProtocol_NLBTLSCertValid, gates on requireRemote(t)
+// first — so the https:// guard is defense-in-depth that keeps the helper
+// correct in isolation, not live local logic (config_test.go locks all four
+// branches directly).
+func (c *TestConfig) nhpIngressTLSURL() (string, bool) {
+	if c.ResolveEndpointEnabled {
+		if strings.HasPrefix(c.NHPServerBaseURL, "https://") {
+			return c.NHPServerBaseURL, true
+		}
+		return "", false // localhost stack is plain HTTP — no TLS surface
+	}
+	if c.RelayBaseURL != "" {
+		return c.RelayBaseURL, true
+	}
+	return "", false
+}
+
 // skipIfNotBlueGreen skips the test cleanly when DeployMode is not
 // blue/green. Use at the top of tests that fence blue/green-specific
 // invariants (active/inactive ASGs, color-coded TGs, listener
@@ -245,8 +305,28 @@ func skipIfNotCanary(t *testing.T) {
 	}
 }
 
-// requireActiveColor reads /{env}/nhp/server/active-color from SSM
-// and fails the test (not skip) if it is missing or not one of
+// requireActiveColor reads the NHP server's active blue/green color from
+// /{env}/nhp/server/active-color. See requireActiveColorForComponent for the
+// fail-loud and mode-gate policy.
+func requireActiveColor(t *testing.T) string {
+	t.Helper()
+	return requireActiveColorForComponent(t, "server")
+}
+
+// requireActiveACColor reads the AC's active blue/green color from
+// /{env}/nhp/ac/active-color. The AC and the server flip INDEPENDENTLY — each
+// has its own active-color SSM param and its own blue/green ASG + TG set, and a
+// per-component deploy can leave them on different colors (e.g. server=blue
+// while the AC has rolled to green). AC-side assertions must therefore resolve
+// the AC's own color, not reuse the server's; see
+// TestBlueGreen_ActiveListenersPointToActiveColorTGs.
+func requireActiveACColor(t *testing.T) string {
+	t.Helper()
+	return requireActiveColorForComponent(t, "ac")
+}
+
+// requireActiveColorForComponent reads /{env}/nhp/{component}/active-color from
+// SSM and fails the test (not skip) if it is missing or not one of
 // {blue, green}.
 //
 // Fail-loud policy: a missing SSM parameter here means either the
@@ -260,14 +340,14 @@ func skipIfNotCanary(t *testing.T) {
 // surface as a confusing "active-color SSM is missing" error in
 // canary mode; the explicit fatal points the operator at the
 // missing gate instead.
-func requireActiveColor(t *testing.T) string {
+func requireActiveColorForComponent(t *testing.T, component string) string {
 	t.Helper()
 	requireRemote(t)
 	if testConfig.DeployMode != DeployModeBlueGreen {
-		t.Fatalf("requireActiveColor called in deploy mode %q — gate the caller with skipIfNotBlueGreen(t) first",
-			testConfig.DeployMode)
+		t.Fatalf("requireActiveColorForComponent[%s] called in deploy mode %q — gate the caller with skipIfNotBlueGreen(t) first",
+			component, testConfig.DeployMode)
 	}
-	name := "/" + testConfig.Environment + "/nhp/server/active-color"
+	name := "/" + testConfig.Environment + "/nhp/" + component + "/active-color"
 	val, ok := getSSMParameter(t, name)
 	if !ok {
 		t.Fatalf("SSM parameter %s is missing — cannot determine active color", name)
@@ -278,20 +358,20 @@ func requireActiveColor(t *testing.T) string {
 	return val
 }
 
-// inactiveColor returns the color opposite to the active color.
-// Fails loudly if ActiveColor is not {blue, green}. Blue/green only.
-func inactiveColor(t *testing.T) string {
+// inactiveColorForComponent returns the standby color for a component — the
+// opposite of its OWN active color. Server and AC flip independently, so a
+// caller touching an AC resource must pass "ac" (not reuse the server's
+// inactive color, which can differ when the colors diverge). Fails loudly if
+// the active color is not {blue, green}. Blue/green only.
+func inactiveColorForComponent(t *testing.T, component string) string {
 	t.Helper()
-	active := requireActiveColor(t)
-	switch active {
-	case "blue":
+	// requireActiveColorForComponent already validates the SSM value is exactly
+	// {blue, green} (it fatals otherwise), so the standby color is just the other
+	// one — no second validation/default arm needed here.
+	if requireActiveColorForComponent(t, component) == "blue" {
 		return "green"
-	case "green":
-		return "blue"
-	default:
-		t.Fatalf("unexpected active color %q (want blue or green)", active)
-		return ""
 	}
+	return "blue"
 }
 
 // requireActiveServerASG returns the ASG name for the currently-serving
@@ -321,7 +401,11 @@ func requireServingASG(t *testing.T, component string) string {
 	requireRemote(t)
 	switch testConfig.DeployMode {
 	case DeployModeBlueGreen:
-		return requireColoredASG(t, component, requireActiveColor(t))
+		// Resolve the COMPONENT's own active color — the server and AC flip
+		// independently (observed sandbox: server=blue, AC=green), so using the
+		// server color for an AC ASG would return the AC's standby ASG and make
+		// 02_ac_ebpf_objects / 05_ac_eip_pool assert against the wrong fleet.
+		return requireColoredASG(t, component, requireActiveColorForComponent(t, component))
 	case DeployModeCanary:
 		// /{env}/nhp/{component}/asg-name is created in BOTH modes
 		// (terraform/modules/compute/main.tf::aws_ssm_parameter.asg_name

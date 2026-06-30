@@ -60,6 +60,7 @@ import (
 // already fences this; we rely on it transitively.
 func TestQurlBrowserTimings_ExtraFieldsDoNotChangeResponseShape(t *testing.T) {
 	requireRemote(t)                     // remote-only: qURL bad-token 403 needs a provisioned qURL resource (qurl-service).
+	skipIfResolveEndpointDisabled(t)     // /plugins/qurl is the legacy resolve surface; gone under the JS-agent topology
 	bogus := "at_nonexistentyyyyyyyyyyy" // at_ + 22 chars; same shape as the bogus token in 10_resolve_test.go
 
 	// Control arm: POST without timing fields.
@@ -124,7 +125,8 @@ func TestQurlBrowserTimings_ExtraFieldsDoNotChangeResponseShape(t *testing.T) {
 // out of scope for smoke — it requires CloudWatch — and is the right
 // place for #1840's alarm-wiring tests.
 func TestQurlBrowserTimings_AdversarialFieldsAreRejectedSilently(t *testing.T) {
-	requireRemote(t) // remote-only: qURL bad-token 403 needs a provisioned qURL resource (qurl-service).
+	requireRemote(t)                 // remote-only: qURL bad-token 403 needs a provisioned qURL resource (qurl-service).
+	skipIfResolveEndpointDisabled(t) // /plugins/qurl is the legacy resolve surface; gone under the JS-agent topology
 	bogus := "at_nonexistentyyyyyyyyyyy"
 
 	// Adversarial mix: NaN (case-insensitive), +Inf, negative,

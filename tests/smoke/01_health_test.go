@@ -54,6 +54,12 @@ type healthCheckItem struct {
 // Regression fence for PR #991 (middleware ordering bugs could move
 // health behind auth; this is the canary that surfaces it immediately).
 func TestHealthLive_Returns200(t *testing.T) {
+	// /health/* lives on the nhp-server HTTP surface at NHPServerBaseURL.
+	// Envs running the JS-agent + relay topology take nhp-server private
+	// (no public resolve.qurl.link), so this fence skips there and runs
+	// where the surface is live (prod + the localhost stack). The relay's
+	// own /health/live is ALB-internal-only and not a substitute.
+	skipIfResolveEndpointDisabled(t)
 	resp, body := doGet(t, testConfig.NHPServerBaseURL, "/health/live", nil)
 	assertStatusCode(t, resp, 200)
 
@@ -77,6 +83,7 @@ func TestHealthLive_Returns200(t *testing.T) {
 // invariant is "zero critical failures", not "this specific check
 // exists."
 func TestHealthReady_NoCriticalFailures(t *testing.T) {
+	skipIfResolveEndpointDisabled(t)
 	resp, body := doGet(t, testConfig.NHPServerBaseURL, "/health/ready", nil)
 	assertStatusCode(t, resp, 200)
 
@@ -117,6 +124,7 @@ func TestHealthReady_NoCriticalFailures(t *testing.T) {
 // retry budget aligns this test with TestHealthKnockReady_ReflectsACPeerCount
 // below, which absorbs the same convergence window.
 func TestHealthStartup_Returns200(t *testing.T) {
+	skipIfResolveEndpointDisabled(t)
 	assertEventually(t, postFlipMaxWait, postFlipPollInterval, func() error {
 		resp, body := doGet(t, testConfig.NHPServerBaseURL, "/health/startup", nil)
 		if resp.StatusCode != http.StatusOK {
@@ -187,6 +195,7 @@ const (
 //
 // Regression fence for PRs #991, #1005, #1006.
 func TestHealthKnockReady_ReflectsACPeerCount(t *testing.T) {
+	skipIfResolveEndpointDisabled(t)
 	assertEventually(t, postFlipMaxWait, postFlipPollInterval, func() error {
 		resp, body := doGet(t, testConfig.NHPServerBaseURL, "/health/knock-ready", nil)
 		if resp.StatusCode != 200 {
@@ -223,6 +232,7 @@ func TestHealthKnockReady_ReflectsACPeerCount(t *testing.T) {
 // ac_peers=fail child when zero ACs are connected, which is exactly
 // the false-healthy state we can't afford.
 func TestHealthKnockReady_ACPeerCheckerIsCritical(t *testing.T) {
+	skipIfResolveEndpointDisabled(t)
 	_, body := doGet(t, testConfig.NHPServerBaseURL, "/health/knock-ready", nil)
 
 	var parsed healthReadyResponse
@@ -244,6 +254,7 @@ func TestHealthKnockReady_ACPeerCheckerIsCritical(t *testing.T) {
 // strategy. Both endpoints returning 200 is fine; their bodies
 // differing is the test.
 func TestHealthKnockReady_DistinctFromReady(t *testing.T) {
+	skipIfResolveEndpointDisabled(t)
 	_, readyBody := doGet(t, testConfig.NHPServerBaseURL, "/health/ready", nil)
 	_, knockBody := doGet(t, testConfig.NHPServerBaseURL, "/health/knock-ready", nil)
 

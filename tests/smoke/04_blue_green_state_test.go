@@ -78,7 +78,7 @@ func TestBlueGreen_DeployedCommitPreviousExists(t *testing.T) {
 type listenerToTGCheck struct {
 	label          string // human-readable: "server/udp", "ac/tcp"
 	listenerSSM    string // SSM param holding the listener ARN
-	activeTGSSMKey string // SSM key pattern, with %s replaced by active color
+	activeTGSSMKey string // SSM key for the active-color TG ARN this listener must point to
 }
 
 // TestBlueGreen_ActiveListenersPointToActiveColorTGs fences PR #997's
@@ -95,29 +95,44 @@ type listenerToTGCheck struct {
 // Regression fence for PR #997.
 func TestBlueGreen_ActiveListenersPointToActiveColorTGs(t *testing.T) {
 	skipIfNotBlueGreen(t)
-	active := requireActiveColor(t)
+	// The server and the AC flip blue/green INDEPENDENTLY — each has its own
+	// active-color SSM param and its own ASG/TG set, and a per-component deploy
+	// can leave them on different colors (observed in sandbox: server=blue
+	// while the AC had rolled to green). Resolve each component's expected TG
+	// against THAT component's active color; cross-checking the AC listener
+	// against the server's color is the bug that surfaced once the server/https
+	// short-circuit below was removed for JS-agent envs.
+	serverActive := requireActiveColor(t)
+	acActive := requireActiveACColor(t)
 	env := testConfig.Environment
 
-	// Three listeners to verify: server UDP (NHP wire protocol),
-	// server HTTPS (QURL resolve), AC TCP (customer proxied traffic).
-	// If any listener SSM param is missing the test fails rather than
-	// skips — all three exist in sandbox and prod today.
+	// Listeners to verify: server UDP (NHP wire protocol), AC TCP (customer
+	// proxied traffic), and — only where the resolve endpoint is deployed —
+	// server HTTPS (QURL resolve). The JS-agent + relay topology removes the
+	// server HTTPS listener entirely: terraform gates both the listener and
+	// its /{env}/nhp/server/https-listener-arn SSM param on
+	// enable_qurl_resolve_endpoint (modules/compute/blue_green.tf), so the
+	// param is absent in JS-agent envs and a static three-listener check
+	// would fail on a missing SSM param. UDP + AC TCP blue/green is
+	// unaffected. If any listed param is missing the test fails (not skips).
 	checks := []listenerToTGCheck{
 		{
 			label:          "server/udp",
 			listenerSSM:    "/" + env + "/nhp/server/udp-listener-arn",
-			activeTGSSMKey: "/" + env + "/nhp/server/" + active + "-udp-tg-arn",
-		},
-		{
-			label:          "server/https",
-			listenerSSM:    "/" + env + "/nhp/server/https-listener-arn",
-			activeTGSSMKey: "/" + env + "/nhp/server/" + active + "-https-tg-arn",
+			activeTGSSMKey: "/" + env + "/nhp/server/" + serverActive + "-udp-tg-arn",
 		},
 		{
 			label:          "ac/tcp",
 			listenerSSM:    "/" + env + "/nhp/ac/tcp-listener-arn",
-			activeTGSSMKey: "/" + env + "/nhp/ac/" + active + "-tcp-tg-arn",
+			activeTGSSMKey: "/" + env + "/nhp/ac/" + acActive + "-tcp-tg-arn",
 		},
+	}
+	if testConfig.ResolveEndpointEnabled {
+		checks = append(checks, listenerToTGCheck{
+			label:          "server/https",
+			listenerSSM:    "/" + env + "/nhp/server/https-listener-arn",
+			activeTGSSMKey: "/" + env + "/nhp/server/" + serverActive + "-https-tg-arn",
+		})
 	}
 
 	assertEventually(t, 30*time.Second, 5*time.Second, func() error {
@@ -155,8 +170,8 @@ func TestBlueGreen_ActiveListenersPointToActiveColorTGs(t *testing.T) {
 				return fmt.Errorf("%s: listener %s has no target group in default action", c.label, listenerARN)
 			}
 			if actualTG != expectedTG {
-				return fmt.Errorf("%s: listener default TG = %s, want %s (active color = %s) — PR #997 class drift",
-					c.label, actualTG, expectedTG, active)
+				return fmt.Errorf("%s: listener default TG = %s, want %s (per %s) — PR #997 class drift",
+					c.label, actualTG, expectedTG, c.activeTGSSMKey)
 			}
 		}
 		return nil
@@ -164,25 +179,28 @@ func TestBlueGreen_ActiveListenersPointToActiveColorTGs(t *testing.T) {
 }
 
 // TestBlueGreen_InactiveASGScaledToZeroOrMin fences MEMORY gotcha #11.
-// The inactive-color ASGs (derived from the active color via
-// inactiveColor()) must have desired_capacity == 0 OR
+// The inactive-color ASGs (derived from each component's active color
+// via inactiveColorForComponent()) must have desired_capacity == 0 OR
 // desired_capacity == min_size (warm-standby mode). Anything else
 // means the inactive color is still consuming capacity and can race
 // the active color for traffic.
+//
+// The server and AC flip independently, so the inactive color is resolved
+// per component — using the server's inactive color for the AC ASG would
+// check the AC's ACTIVE fleet when the colors diverge (server=blue, AC=green).
 //
 // ASG names come from /{env}/nhp/{server,ac}/{blue,green}-asg-name.
 // No env vars needed.
 func TestBlueGreen_InactiveASGScaledToZeroOrMin(t *testing.T) {
 	skipIfNotBlueGreen(t)
-	inactive := inactiveColor(t)
 	env := testConfig.Environment
 
 	components := []struct {
 		label    string
 		ssmParam string
 	}{
-		{"server", "/" + env + "/nhp/server/" + inactive + "-asg-name"},
-		{"ac", "/" + env + "/nhp/ac/" + inactive + "-asg-name"},
+		{"server", "/" + env + "/nhp/server/" + inactiveColorForComponent(t, "server") + "-asg-name"},
+		{"ac", "/" + env + "/nhp/ac/" + inactiveColorForComponent(t, "ac") + "-asg-name"},
 	}
 
 	for _, c := range components {
