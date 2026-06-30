@@ -64,8 +64,10 @@ var (
 // name for the process lifetime.
 //
 // Empty slice on success is possible (ASG has zero desired) and
-// callers must handle it. A cache hit never fails; a cache miss
-// calls DescribeAutoScalingGroups and t.Fatalf's on error.
+// callers must handle it. Empty results are intentionally not cached
+// because they can also be a transient refresh race. A non-empty cache
+// hit never fails; a cache miss calls DescribeAutoScalingGroups and
+// t.Fatalf's on error.
 func describeInServiceInstances(t *testing.T, asgName string) []string {
 	t.Helper()
 
@@ -96,9 +98,13 @@ func describeInServiceInstances(t *testing.T, asgName string) []string {
 		}
 	}
 
-	inServiceCacheMu.Lock()
-	inServiceCache[asgName] = ids
-	inServiceCacheMu.Unlock()
+	// Empty InService lists can be a refresh race; do not cache them
+	// or callers with a local retry loop will keep seeing the transient.
+	if len(ids) > 0 {
+		inServiceCacheMu.Lock()
+		inServiceCache[asgName] = ids
+		inServiceCacheMu.Unlock()
+	}
 	return ids
 }
 

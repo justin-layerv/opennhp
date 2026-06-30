@@ -91,6 +91,30 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 		return authWithNHPBootstrap(req, helper, accessToken, clientIP)
 	}
 
+	// qURL v2 signed-claims admission. A knock carrying the signed claims +
+	// issuer signature blobs is CLAIMED by the qv2 path here, regardless of the
+	// feature flag, so a qv2-shaped knock can never slip past the math-first
+	// integrity boundary into the legacy steady-state path:
+	//
+	//   - flag ON  -> authWithNHPClaims runs the full independent verify (issuer
+	//     sig + liveness + cell + proof-of-possession + resource binding) before
+	//     prepare/commit/open.
+	//   - flag OFF -> FAIL CLOSED here. We must NOT fall through to the
+	//     steady-state /authorize path: that path would admit on a pre-existing
+	//     legacy session WITHOUT any qv2 binding check, which crosses the
+	//     math-first boundary (a qv2-shaped knock must verify or be denied).
+	//
+	// This is why HandleKnockRequest's DDB-skip predicate (isQurlV2ClaimsKnock)
+	// can stay flag-independent: a qv2-shaped knock is decided here either way, so
+	// the skipped DDB lookup can never gate anything.
+	if claimsB64, sigB64, ok := qurlV2ClaimsBlobs(req.Msg); ok {
+		if !v2AdmissionEnabled {
+			log.Info("[QURL] AuthWithNHP: qv2 claims knock rejected (v2 admission disabled) client=%s", clientIP)
+			return failAck(ackMsg, common.ErrQurlSessionExpired, "qurl v2 admission disabled")
+		}
+		return authWithNHPClaims(req, helper, claimsB64, sigB64, clientIP)
+	}
+
 	// Resolve the resource -> AC mapping from the catalog. The same resourceID
 	// keys this lookup and the /authorize call below. identity only influences
 	// ResolveResource's tunnel-placement branch (resourceID == TunnelServerResourceID);
@@ -261,7 +285,8 @@ func isTerminalResolveDeny(err error) bool {
 	return errors.Is(err, ErrTokenNotFound) ||
 		errors.Is(err, ErrTokenConsumed) ||
 		errors.Is(err, ErrTokenExpired) ||
-		errors.Is(err, ErrPolicyViolation)
+		errors.Is(err, ErrPolicyViolation) ||
+		errors.Is(err, ErrAgentIdentityConflict)
 }
 
 func qurlBootstrapAccessToken(msg *common.AgentKnockMsg) (string, bool) {

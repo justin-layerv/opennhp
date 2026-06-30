@@ -44,6 +44,7 @@ func TestHandleHttpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 			srcAddr *common.NetAddress,
 			_ []*common.NetAddress,
 			openTime uint32,
+			_ *common.ResourceData,
 		) (*common.ACOpsResultMsg, error) {
 			gotSrcIp = srcAddr.Ip
 			gotOpenTime = openTime
@@ -147,6 +148,7 @@ func TestHandleHttpOpenResource_PublishACKTokens_ExitCommand(t *testing.T) {
 			_ *common.NetAddress,
 			_ []*common.NetAddress,
 			openTime uint32,
+			_ *common.ResourceData,
 		) (*common.ACOpsResultMsg, error) {
 			return &common.ACOpsResultMsg{
 				ErrCode:  common.ErrSuccess.ErrorCode(),

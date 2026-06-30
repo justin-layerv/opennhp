@@ -40,10 +40,22 @@ ANDROID_CC='${TOOLCHAIN}/bin/aarch64-linux-android21-clang'
 ANDROID_CXX='${TOOLCHAIN}/bin/aarch64-linux-android21-clang++'
 
 # eBPF compile
+# The clang guard fires for any goal whose name contains "ebpf"
+# (both `ebpf` and `ebpf-objects`), so clang/llvm is required only
+# when an eBPF compile is actually requested — never for the plain
+# server/relay/agent builds (`make`, `make acd`, etc.). Keep "ebpf"
+# in any new eBPF target name, or extend this findstring, or the
+# guard silently stops protecting it.
 ifneq (,$(findstring ebpf,$(MAKECMDGOALS)))
-    CLANG := $(shell command -v clang 2>/dev/null)
+    CLANG ?= $(shell command -v clang 2>/dev/null)
+    # Keep env/CLI CLANG=<binary> overrides, then flatten the fallback so
+    # `command -v clang` is not re-run on every $(CLANG) reference below.
+    CLANG := $(CLANG)
     ifeq ($(CLANG),)
-        $(error "clang is not installed. Please install clang to compile eBPF programs.")
+        $(error "clang is not installed. Please install clang or run with CLANG=<clang binary> to compile eBPF programs.")
+    endif
+    ifeq ($(shell command -v $(CLANG) 2>/dev/null),)
+        $(error "CLANG=$(CLANG) was not found. Pass CLANG=<clang binary> or install clang to compile eBPF programs.")
     endif
 endif
 
@@ -51,17 +63,43 @@ EBPF_SRC_XDP = ./nhp/ebpf/xdp/nhp_ebpf_xdp.c
 EBPF_SRC_TC_EGRESS = ./nhp/ebpf/xdp/tc_egress.c
 EBPF_OBJ_XDP = ./release/nhp-ac/etc/nhp_ebpf_xdp.o
 EBPF_OBJ_TC_EGRESS = ./release/nhp-ac/etc/tc_egress.o
-CLANG_OPTS = -O2 -target bpf -g -Wall -I.
+# Both sources #include "vmlinux.h" (the in-tree, BTF-generated kernel
+# type header). It's a prerequisite so a local incremental `make
+# ebpf-objects` after a vmlinux.h regen recompiles instead of shipping a
+# stale object. The other includes (<bpf/bpf_helpers.h> etc.) are libbpf
+# system headers, not in-tree, so they can't be Make prerequisites — the
+# Docker build always does a clean compile, so they're not a staleness
+# risk there.
+EBPF_VMLINUX_H = ./nhp/ebpf/xdp/vmlinux.h
+# Keep BTF paths reproducible so the committed-object freshness gate can compare
+# byte-for-byte across local containers and GitHub runner workspaces.
+# Do not switch eBPF source paths or include paths to absolute forms without
+# extending this prefix map; the committed native AC object is DWARF-stripped,
+# but .BTF/.BTF.ext survives debug stripping and can otherwise make the
+# required load-relevant comparison workspace-dependent.
+CLANG_PREFIX_MAP = -ffile-prefix-map=$(CURDIR)=.
+CLANG_OPTS = -O2 -target bpf -g -Wall -I. $(CLANG_PREFIX_MAP)
+
+# ebpf-objects compiles ONLY the two eBPF object files into
+# ./release/nhp-ac/etc/ (the path the AC loads from — source of truth is
+# endpoints/ac/ebpf/ebpfegine.go). This is the target the AC Docker image
+# build uses (docker/Dockerfile.ac.aws). Deliberately decoupled from
+# `generate-version-and-build`: the AC image only needs the objects, not
+# the full multi-binary build/SDK/archive pipeline the legacy `ebpf`
+# target pulls in.
+.PHONY: ebpf-objects
+ebpf-objects: $(EBPF_OBJ_XDP) $(EBPF_OBJ_TC_EGRESS)
+	@echo "$(COLOUR_GREEN)[eBPF] Object files compiled$(END_COLOUR)"
 
 .PHONY: ebpf
-ebpf: $(EBPF_OBJ_XDP) $(EBPF_OBJ_TC_EGRESS) generate-version-and-build
+ebpf: ebpf-objects generate-version-and-build
 	@echo "$(COLOUR_GREEN)[eBPF] Full build completed$(END_COLOUR)"
 
-$(EBPF_OBJ_XDP): $(EBPF_SRC_XDP)
+$(EBPF_OBJ_XDP): $(EBPF_SRC_XDP) $(EBPF_VMLINUX_H)
 	@mkdir -p $(@D)
 	@echo "$(COLOUR_BLUE)[eBPF] Compiling: $< -> $@ $(END_COLOUR)"
 	$(CLANG) $(CLANG_OPTS) -c $(EBPF_SRC_XDP) -o $(EBPF_OBJ_XDP)
-$(EBPF_OBJ_TC_EGRESS): $(EBPF_SRC_TC_EGRESS)
+$(EBPF_OBJ_TC_EGRESS): $(EBPF_SRC_TC_EGRESS) $(EBPF_VMLINUX_H)
 	@mkdir -p $(@D)
 	@echo "$(COLOUR_BLUE)[eBPF] Compiling: $< -> $@ $(END_COLOUR)"
 	$(CLANG) $(CLANG_OPTS) -c $(EBPF_SRC_TC_EGRESS) -o $(EBPF_OBJ_TC_EGRESS)
@@ -112,6 +150,7 @@ acd:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-ac... $(END_COLOUR)"
 	cd endpoints && \
 	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-ac/nhp-acd ./ac/main/main.go && \
+	mkdir -p ../release/nhp-ac/etc && \
 	cp ./ac/main/etc/*.toml ../release/nhp-ac/etc/
 
 serverd:
@@ -365,9 +404,24 @@ lint-workflows:
 	@bash scripts/check-smoke-tier-filter-coverage.sh
 	@bash scripts/check-cert-cleanup-log-gate-unique.sh
 	@bash scripts/check-cleanup-event-type-lockstep.sh
+	@shellcheck scripts/check-revocation-slo-lockstep.sh
+	@bash scripts/check-revocation-slo-lockstep.sh
+	@shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
+	@bash tests/scripts/check-ebpf-load-path-lockstep_test.sh
+	@bash scripts/check-ebpf-load-path-lockstep.sh
+	@shellcheck scripts/check-ac-ebpf-arch-lockstep.sh tests/scripts/check-ac-ebpf-arch-lockstep_test.sh
+	@bash tests/scripts/check-ac-ebpf-arch-lockstep_test.sh
+	@bash scripts/check-ac-ebpf-arch-lockstep.sh
+	@shellcheck scripts/check-ebpf-toolchain-pin-lockstep.sh tests/scripts/check-ebpf-toolchain-pin-lockstep_test.sh scripts/install-ebpf-toolchain.sh tests/scripts/install-ebpf-toolchain_test.sh scripts/check-ebpf-committed-object-drift.sh tests/scripts/check-ebpf-committed-object-drift_test.sh
+	@bash tests/scripts/check-ebpf-toolchain-pin-lockstep_test.sh
+	@bash scripts/check-ebpf-toolchain-pin-lockstep.sh
+	@bash tests/scripts/install-ebpf-toolchain_test.sh
+	@bash tests/scripts/check-ebpf-committed-object-drift_test.sh
 	@shellcheck scripts/check-golden-vectors.sh tests/scripts/check-golden-vectors_test.sh
 	@bash tests/scripts/check-golden-vectors_test.sh
 	@bash scripts/check-golden-vectors.sh
+	@shellcheck scripts/check-conformance-parity.sh tests/scripts/check-conformance-parity_test.sh
+	@bash tests/scripts/check-conformance-parity_test.sh
 	@bash scripts/check-lockdown-body-drift.sh
 	@bash scripts/check-frps-az-suffixes-validation-drift.sh
 	@bash tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh
@@ -442,8 +496,31 @@ lint-terraform-drift:
 test:
 	@echo "[OpenNHP] Running Unit Tests..."
 	cd internalauth && go test -v ./... -race
-	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry"
+	# TestWS1 = qURL v2 "no qv2 path calls /internal/v1" gate. make test compiles
+	# ./server/staticplugins/qurl/... but the allowlist otherwise skips it; folding
+	# it in keeps the gate running per-PR (re-homed from the now-deleted
+	# qurl-v2-qurl-plugin-tests.yml transitional workflow at the epic merge, #2826).
+	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry|TestConformanceVectors|TestWS1"
 	@echo "$(COLOUR_GREEN)[OpenNHP] Unit Tests Done!$(END_COLOUR)"
+
+# test-ebpf compiles the real XDP object and runs the eBPF datapath tests
+# against a LIVE kernel via BPF_PROG_TEST_RUN. This is the #2779
+# surgical-kill datapath proof: it loads the compiled nhp_ebpf_xdp.o,
+# drives synthetic packets through it, and asserts the verdict flips
+# PASS -> DROP after a conntrack entry is surgically flushed (sibling
+# survives). REQUIRES a Linux host with CAP_BPF (or CAP_SYS_ADMIN) and a
+# kernel that supports XDP program load. NHP_REQUIRE_BPF_TESTS=1 turns any
+# missing capability / kernel support / missing object into a hard
+# failure instead of a silent skip — set it in CI. The clang findstring
+# guard above ensures `clang` is present because `ebpf` is in the goals.
+.PHONY: test-ebpf
+test-ebpf: $(EBPF_OBJ_XDP)
+	@echo "[OpenNHP] Running eBPF datapath tests (BPF_PROG_TEST_RUN)..."
+	@echo "$(COLOUR_BLUE)[eBPF] XDP object: $(EBPF_OBJ_XDP)$(END_COLOUR)"
+	cd nhp && NHP_EBPF_XDP_OBJECT="$(abspath $(EBPF_OBJ_XDP))" \
+		NHP_REQUIRE_BPF_TESTS=$${NHP_REQUIRE_BPF_TESTS:-1} \
+		go test -v -count=1 ./utils/ebpf/...
+	@echo "$(COLOUR_GREEN)[OpenNHP] eBPF datapath tests Done!$(END_COLOUR)"
 
 test-lambdas: ## Run Lambda unit tests (Python)
 	@echo "[OpenNHP] Running Lambda Unit Tests..."

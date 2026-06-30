@@ -87,6 +87,22 @@ type Config struct {
 	// Environment variable: QURL_IDLE_CONN_TIMEOUT
 	// Required. Recommended: 30
 	IdleConnTimeout int
+
+	// V2AdmissionEnabled gates the qURL v2 signed-claims admission path
+	// (authWithNHPClaims). Default OFF: when false, a qv2 claims knock is failed
+	// closed (denied) at dispatch — the plugin does not verify claims, call
+	// qurl-service v2 admission, or open any AC for it, and it never falls through
+	// to the legacy steady-state path. Environment variable:
+	// QURL_V2_ADMISSION_ENABLED (truthy: "1"/"true"/"yes"/"on", case-insensitive).
+	// Optional; defaults false.
+	V2AdmissionEnabled bool
+
+	// V2IssuerTrustStoreJSON is the qURL v2 issuer trust store: a JSON object
+	// mapping issuer kid -> base64(DER SPKI P-256 public key). It is REQUIRED
+	// when V2AdmissionEnabled is true (the admission path fails closed without
+	// it) and ignored when the flag is off. Environment variable:
+	// QURL_V2_ISSUER_TRUST_STORE.
+	V2IssuerTrustStoreJSON string
 }
 
 // LoadConfig loads and validates configuration from environment variables.
@@ -94,13 +110,15 @@ type Config struct {
 // This enables fail-fast behavior where Terraform deployments fail early on misconfiguration.
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
-		QurlAPIURL:            os.Getenv("QURL_API_URL"),
-		ServiceToken:          os.Getenv("QURL_SERVICE_TOKEN"),
-		AllowedRedirectDomain: os.Getenv("QURL_ALLOWED_REDIRECT_DOMAIN"),
-		APITimeout:            getEnvInt("QURL_API_TIMEOUT"),
-		MaxIdleConns:          getEnvInt("QURL_MAX_IDLE_CONNS"),
-		MaxIdleConnsPerHost:   getEnvInt("QURL_MAX_IDLE_CONNS_PER_HOST"),
-		IdleConnTimeout:       getEnvInt("QURL_IDLE_CONN_TIMEOUT"),
+		QurlAPIURL:             os.Getenv("QURL_API_URL"),
+		ServiceToken:           os.Getenv("QURL_SERVICE_TOKEN"),
+		AllowedRedirectDomain:  os.Getenv("QURL_ALLOWED_REDIRECT_DOMAIN"),
+		APITimeout:             getEnvInt("QURL_API_TIMEOUT"),
+		MaxIdleConns:           getEnvInt("QURL_MAX_IDLE_CONNS"),
+		MaxIdleConnsPerHost:    getEnvInt("QURL_MAX_IDLE_CONNS_PER_HOST"),
+		IdleConnTimeout:        getEnvInt("QURL_IDLE_CONN_TIMEOUT"),
+		V2AdmissionEnabled:     getEnvBool("QURL_V2_ADMISSION_ENABLED"),
+		V2IssuerTrustStoreJSON: os.Getenv("QURL_V2_ISSUER_TRUST_STORE"),
 	}
 
 	if err := validateConfig(cfg); err != nil {
@@ -122,6 +140,19 @@ func getEnvInt(key string) int {
 		return 0
 	}
 	return i
+}
+
+// getEnvBool returns true iff the environment variable is set to a truthy value
+// ("1", "true", "yes", "on", case-insensitive). Any other value — including
+// unset, "0", "false", or an unrecognized string — is false, so the qURL v2
+// admission feature stays OFF unless explicitly enabled (fail-safe default).
+func getEnvBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // validateConfig validates all required configuration fields.
@@ -154,6 +185,15 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.IdleConnTimeout <= 0 {
 		return errors.New("missing or invalid QURL_IDLE_CONN_TIMEOUT: must be positive (recommended: 30)")
+	}
+
+	// When the qURL v2 admission path is enabled it MUST have an issuer trust
+	// store, or it cannot verify any claim and would fail every qv2 knock.
+	// Fail fast at startup rather than at the first knock. (The store is parsed
+	// — and structurally validated — by LoadV2TrustStore at Init; here we only
+	// assert presence so the misconfiguration surfaces as a clear startup error.)
+	if cfg.V2AdmissionEnabled && strings.TrimSpace(cfg.V2IssuerTrustStoreJSON) == "" {
+		return errors.New("QURL_V2_ADMISSION_ENABLED is set but QURL_V2_ISSUER_TRUST_STORE is empty")
 	}
 
 	return nil

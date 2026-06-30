@@ -1,0 +1,210 @@
+name: eBPF Datapath and Object Freshness Test
+
+# Real-kernel proof for the #2779 surgical-kill datapath. ubuntu-24.04
+# GitHub runners boot a recent kernel with BPF_PROG_TEST_RUN support; the test
+# step runs under sudo (XDP load needs CAP_BPF + CAP_NET_ADMIN, see that
+# step's note), so this is the gate that actually EXECUTES
+# nhp/utils/ebpf/surgical_kill_datapath_linux_test.go in-kernel:
+#
+#   make test-ebpf  -> compiles nhp_ebpf_xdp.o with clang (-target bpf) and
+#   runs `go test ./utils/ebpf/...` with NHP_EBPF_XDP_OBJECT pointing at the
+#   compiled object. The test loads it via BPF_PROG_TEST_RUN, seeds two
+#   conntrack flows, deletes one, and asserts the verdict flips PASS -> DROP
+#   for the target while the sibling survives.
+#
+# NHP_REQUIRE_BPF_TESTS=1 turns the test's loud-skip guard into a HARD
+# FAILURE: a runner missing clang, libbpf headers, CAP_BPF, or kernel
+# TEST_RUN support fails this job instead of skip-passing it (memory:
+# feedback_silent_failure_patterns.md). This is test-only — no AWS creds, no
+# deploy, no mutation.
+#
+# Triggers: PRs to main (so the proof gates merges to the default branch),
+# qurl-v2 (the keyed-identity integration branch), and the ebpf/* integration
+# stack. For a same-repo `pull_request` event GitHub evaluates the workflow from
+# the PR HEAD while the `branches:` filter matches the BASE ref, so listing each
+# integration base here makes the job run directly on stacked eBPF PRs whose
+# heads already carry this file — no temp PR-to-main needed. Plus manual
+# dispatch for ad-hoc runs.
+on:
+  pull_request:
+    branches: [main, qurl-v2, 'ebpf/**']
+    # Keep the workflow unfiltered by paths so the check can be made required
+    # without path-skipped required checks hanging PRs. The `changes` job below
+    # skips the expensive clang/BPF proof unless proof inputs changed, but the
+    # proof job fails closed by running when detection itself does not succeed.
+    # The tradeoff is one cheap detection job on every PR to these bases.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ebpf-datapath-test-${{ github.ref }}
+  # Mergeability is computed on the latest head SHA, so cancelling a
+  # superseded run is safe for the required context. A manually cancelled
+  # latest-head run must be rerun.
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect eBPF proof inputs
+    # Keep the whole required-check workflow on the same pinned runner family,
+    # even though this job only calls the GitHub API and does not compile BPF.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    timeout-minutes: 2
+    outputs:
+      # Default unknown future trigger shapes to proof-required. For current
+      # pull_request runs, paths-filter emits the literal string "false" for
+      # unrelated changes, so this fallback is only reached if no detector step
+      # ran at all. Do not collapse this to boolean coercion: the required-check
+      # skip path relies on the string value propagating to the job-level
+      # `== 'true'` comparison below.
+      ebpf: ${{ steps.manual.outputs.ebpf || steps.filter.outputs.ebpf || 'true' }}
+    steps:
+      - name: Force proof for manual dispatch
+        id: manual
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "ebpf=true" >> "$GITHUB_OUTPUT"
+
+      - name: Detect eBPF proof inputs
+        id: filter
+        if: github.event_name == 'pull_request'
+        # No checkout: for pull_request events, paths-filter reads the compare
+        # API using the permissions above.
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        with:
+          filters: |
+            ebpf:
+              - 'nhp/ebpf/**'
+              - 'nhp/utils/ebpf/**'
+              - 'endpoints/ac/main/etc/nhp_ebpf_xdp.o'
+              # cilium/ebpf and x/sys live here; a bump changes Program.Run /
+              # object load behavior, so re-run the proof when the module pins
+              # move.
+              - 'nhp/go.mod'
+              - 'nhp/go.sum'
+              - 'Makefile'
+              - 'scripts/install-ebpf-toolchain.sh'
+              - 'scripts/check-ebpf-committed-object-drift.sh'
+              # scripts/check-ebpf-toolchain-pin-lockstep.sh is lint-only and
+              # covered by validate-workflows; it cannot change object bytes.
+              - '.github/workflows/ebpf-datapath-test.yml'
+
+  ebpf-datapath:
+    name: eBPF datapath and object freshness proof
+    needs: changes
+    # Required-check integrity: if `changes` fails, run the proof instead of
+    # letting a dependency-failure skip satisfy branch protection. Still honor
+    # real run cancellation so superseded PR heads do not compile stale proofs.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.ebpf == 'true') }}
+    runs-on: ubuntu-24.04
+    # Bound the job so a hung BPF_PROG_TEST_RUN or stuck apt-get cannot ride
+    # the default 6h timeout.
+    timeout-minutes: 15
+    env:
+      EBPF_APT_SNAPSHOT: 20260628T000000Z
+      EBPF_CLANG_PACKAGE: clang-18=1:18.1.3-1ubuntu1
+      EBPF_LLVM_PACKAGE: llvm-18=1:18.1.3-1ubuntu1
+      EBPF_LIBBPF_DEV_PACKAGE: libbpf-dev=1:1.3.0-2build2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: nhp/go.mod
+          # Point the cache key at this module's go.sum — the repo root has no
+          # go.mod, so without this setup-go logs "Restore cache failed:
+          # Dependencies file is not found" and skips caching entirely. NOTE:
+          # the test step runs `sudo … make test-ebpf`, and sudo resets HOME to
+          # /root, so the compile under root does NOT read this runner-HOME
+          # cache; this line silences the warning and primes the cache for any
+          # future non-sudo Go step, but is not what makes the current job
+          # fast (the job is paths-gated + 15-min-bounded, so a cold compile is
+          # acceptable).
+          cache-dependency-path: nhp/go.sum
+
+      - name: Resolve eBPF tool names
+        run: |
+          CLANG="${EBPF_CLANG_PACKAGE%%=*}"
+          EBPF_LLVM_PACKAGE_NAME="${EBPF_LLVM_PACKAGE%%=*}"
+          # Intentional mirror of llvm_strip_bin_from_package() in
+          # scripts/check-ebpf-committed-object-drift.sh.
+          case "$EBPF_LLVM_PACKAGE_NAME" in
+            llvm-*) LLVM_STRIP="llvm-strip${EBPF_LLVM_PACKAGE_NAME#llvm}" ;;
+            # Bare `llvm` (and any other spelling) maps to the unsuffixed binary.
+            *) LLVM_STRIP="llvm-strip" ;;
+          esac
+          EBPF_LIBBPF_DEV_PACKAGE_NAME="${EBPF_LIBBPF_DEV_PACKAGE%%=*}"
+          {
+            echo "CLANG=$CLANG"
+            echo "LLVM_STRIP=$LLVM_STRIP"
+            echo "EBPF_LLVM_PACKAGE_NAME=$EBPF_LLVM_PACKAGE_NAME"
+            echo "EBPF_LIBBPF_DEV_PACKAGE_NAME=$EBPF_LIBBPF_DEV_PACKAGE_NAME"
+          } >> "$GITHUB_ENV"
+
+      # clang compiles the XDP object (-target bpf); llvm provides
+      # llvm-strip-18 for the committed-object load-relevant comparison; libbpf-dev provides
+      # the <bpf/bpf_helpers.h> family the source includes (vmlinux.h is
+      # vendored in-repo at nhp/ebpf/xdp/). Pin the runner, snapshot, and
+      # package versions because the committed-object gate compares BPF object
+      # bytes and compiler output, clang builtin headers, libbpf headers, and
+      # transitive system headers are byte-sensitive. The repo stores the
+      # DWARF-stripped, BTF-retaining native AC object; the gate strips the
+      # fresh compile the same way before comparison.
+      # The snapshot keeps those package inputs installable after rolling Ubuntu
+      # pockets evict them. When these pins move, update EBPF_APT_SNAPSHOT and regenerate
+      # endpoints/ac/main/etc/nhp_ebpf_xdp.o with
+      # scripts/check-ebpf-committed-object-drift.sh.
+      # Transient snapshot service failures are retried here; persistent
+      # failures mean either the snapshot service is degraded or the pins need
+      # an intentional snapshot/object rebaseline. Both update and install carry
+      # --snapshot so apt fetches and resolves against the same immutable index.
+      - name: Install eBPF toolchain
+        run: bash scripts/install-ebpf-toolchain.sh
+
+      # Self-diagnosing: if a run ever goes red, these lines show the kernel,
+      # the effective user (root vs runner), and the unprivileged-BPF sysctl in
+      # one shot instead of guessing at the cause.
+      - name: Show toolchain + kernel + BPF capability
+        run: |
+          "$CLANG" --version
+          "$LLVM_STRIP" --version | sed -n '1p'
+          dpkg-query -W "$EBPF_LLVM_PACKAGE_NAME"
+          dpkg-query -W "$EBPF_LIBBPF_DEV_PACKAGE_NAME"
+          uname -a
+          id
+          sysctl kernel.unprivileged_bpf_disabled || true
+
+      # The datapath proof below compiles and loads release/nhp-ac/etc/
+      # nhp_ebpf_xdp.o. The native AC path can load the committed
+      # endpoints/ac/main/etc/nhp_ebpf_xdp.o instead, so verify the committed
+      # artifact is load-relevant fresh before trusting the source proof.
+      # Keep this immediately before the datapath proof: the drift script
+      # removes and rebuilds the release objects, so the sudo proof starts from
+      # a freshly verified tree before `make test-ebpf` recompiles and loads.
+      # CLANG and LLVM_STRIP are derived once from package pins above and reach
+      # make through the Makefile's `CLANG ?=`.
+      - name: Verify committed XDP object freshness
+        run: bash scripts/check-ebpf-committed-object-drift.sh
+
+      # NHP_REQUIRE_BPF_TESTS=1 => any missing prerequisite is a hard failure,
+      # never a silent skip. make test-ebpf compiles the object (clang, no root
+      # needed) and runs the datapath test against the live kernel via
+      # BPF_PROG_TEST_RUN.
+      #
+      # ROOT REQUIRED: loading an XDP program (BPF_PROG_LOAD) and creating BPF
+      # maps need CAP_BPF + CAP_NET_ADMIN, which the default GitHub-hosted
+      # ubuntu-latest user does NOT hold — a non-root run gets EPERM at
+      # ebpf.NewCollection before the test logic runs, which the loud-skip
+      # guard (correctly) escalates to a hard failure. Run under sudo, carrying
+      # setup-go's PATH and the require flag inline (more robust than relying
+      # on sudo env_keep).
+      - name: Run eBPF datapath proof (real kernel)
+        run: sudo env "PATH=$PATH" "CLANG=$CLANG" NHP_REQUIRE_BPF_TESTS=1 make test-ebpf

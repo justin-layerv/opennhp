@@ -54,6 +54,16 @@ type UdpAC struct {
 
 	tokenStore *common.TokenStore[*AccessEntry]
 
+	// revIndex is the qURL v2 secondary revocation index (P4b): reverse
+	// lookups from a revocation key (qurl_user_public_key_hash /
+	// resource_public_key_hash / session_id / admission_id) to the tokenStore
+	// tokens whose AccessEntry carries it, plus the per-(scope,key) applied-
+	// epoch watermark for idempotency. Maintained by storeToken/deleteToken and
+	// the OnExpire hook so it tracks tokenStore membership; driven by
+	// ApplyRevocation. Constructed in Start alongside tokenStore. See
+	// revocation_index.go and docs/design/QURL_V2_KEYED_IDENTITY.md.
+	revIndex *revocationIndex
+
 	// aopReplay dedupes recently observed NHP_AOP packets by
 	// (sender_pubkey, txid, send_time) so a captured-and-replayed
 	// packet cannot re-open ipset entries on a fresh connection.
@@ -110,6 +120,46 @@ type UdpAC struct {
 	// metrics publisher read the counter from registration.go
 	// without taking a build-tag dependency
 	bpfFlusherSkippedCount func() uint64
+
+	// surgicalConnFlush is the per-flow surgical conntrack-teardown seam
+	// used by the revocation apply path (flushEntryNow). Set to
+	// BpfFlusher.FlushConn ONLY when the scheduler is constructed in EBPFXDP
+	// mode on Linux (same gate as bpfFlusherSkippedCount); nil otherwise —
+	// in iptables mode, on non-Linux, or when L3 flush is disabled, where
+	// flushEntryNow falls back to the coarse allow-rule reschedule alone.
+	// A non-nil value is the signal that the eBPF/XDP+IPv4 surgical path is
+	// available: flushEntryNow enumerates each revoked flow's conntrack
+	// 5-tuples and calls this to kill EXACTLY the revoked admission's flow,
+	// leaving same-allow-tuple siblings (different source port) alive — the
+	// surgical precision P4c's primitives enable and #2784 needs. The
+	// func-field indirection (rather than a typed *BpfFlusher) keeps
+	// revocation_index.go build-tag-free and lets an AC-level test inject a
+	// fake to prove the wiring drives surgical-per-v4-key + v6-hard-fail.
+	surgicalConnFlush func(context.Context, ConnFlowKey) error
+
+	// enumerateConnSrcPorts recovers the live conn_track source ports on an
+	// allow-rule tuple {srcIP,dstIP,proto,dstPort}, feeding the surgical flush
+	// above. Bound to utilebpf.EnumerateConnTrackSrcPorts in the same
+	// EBPFXDP-on-Linux Start() block as surgicalConnFlush. The func-field seam
+	// (rather than calling the package function directly from
+	// surgicalFlushFlowKey) lets an AC-level test inject a fake enumerator: the
+	// pinned conn_track map is absent in unit tests, so without this seam the
+	// surgical FlushConn-per-source-port drive could not be proven off a kernel
+	// rig. Only read when surgicalConnFlush != nil.
+	enumerateConnSrcPorts func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
+
+	// surgicalConnFlushV6 / enumerateConnSrcPortsV6 are the IPv6 twins of the
+	// two fields above (E2 slice 5). Bound to BpfFlusher.FlushConnV6 and
+	// utilebpf.EnumerateConnTrackSrcPortsV6 in the same EBPFXDP-on-Linux Start()
+	// block; nil otherwise. When both are non-nil, surgicalFlushFlowKey performs
+	// surgical conntrack teardown for v6 flows (closing the #2778 IPv6
+	// immediate-revocation gap on the eBPF/XDP path) instead of the v6 hard-fail;
+	// when either is nil (iptables mode, non-Linux, L3 disabled) it keeps the
+	// hard-fail fallback. Same func-field indirection rationale as the v4 fields:
+	// keeps revocation_index.go build-tag-free and lets a test inject fakes (the
+	// pinned conn_track_v6 map is absent off a kernel rig).
+	surgicalConnFlushV6     func(context.Context, ConnFlowKey) error
+	enumerateConnSrcPortsV6 func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
 }
 
 // BpfFlusherSkippedCount returns the BpfFlusher's non-IPv4 skip
@@ -203,6 +253,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	// ServerPubKeyAllowlist entries and leave source 3 of the
 	// allowlist dead until the next config.toml touch (see #1239).
 	a.tokenStore = common.NewTokenStore[*AccessEntry]()
+	a.revIndex = newRevocationIndex()
 	// Registered BEFORE a.expirySched is constructed below. Safe
 	// for two reasons: (1) the hook closure captures `a` rather
 	// than the scheduler pointer, so it reads a.expirySched at
@@ -241,7 +292,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 				DstIP: a.config.DefaultIp,
 			}
 			log.Info("server ip is %s", server.Ip)
-			err = ebpf.EbpfRuleAdd(2, ebpfHashStr, 31536000)
+			err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, 31536000)
 			if err != nil {
 				log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 				continue
@@ -268,6 +319,22 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 		// non-Linux stub returns 0 from SkippedCount.
 		if bf, ok := flusher.(*BpfFlusher); ok && bf != nil {
 			a.bpfFlusherSkippedCount = bf.SkippedCount
+			// Bind the surgical conntrack-teardown seam to the same
+			// EBPFXDP-on-Linux BpfFlusher. This is what flips
+			// flushEntryNow from coarse-only allow-rule reschedule to the
+			// surgical FlushConn-per-5-tuple path. iptables mode
+			// (ConntrackFlusher) and non-Linux leave it nil → coarse path.
+			a.surgicalConnFlush = bf.FlushConn
+			// Pair the enumerator that recovers the source ports FlushConn
+			// needs. Bound here (not called directly) so a unit test can swap
+			// in a fake — the pinned conn_track map is absent off a kernel rig.
+			a.enumerateConnSrcPorts = ebpf.EnumerateConnTrackSrcPorts
+			// IPv6 twins (E2 slice 5): bind the v6 surgical seam to the same
+			// EBPFXDP-on-Linux BpfFlusher so a v6 revoke gets immediate
+			// conntrack teardown instead of the #2778 hard-fail. FlushConnV6
+			// mirrors FlushConn but targets the conn_track_v6 map.
+			a.surgicalConnFlushV6 = bf.FlushConnV6
+			a.enumerateConnSrcPortsV6 = ebpf.EnumerateConnTrackSrcPortsV6
 		}
 		a.expirySched = NewScheduler(flusher,
 			WithDryRun(a.config.L3FlushDryRun),
@@ -305,6 +372,10 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			// fence: round 11 minor — nil-write safety pinned).
 			a.expirySched = nil
 			a.bpfFlusherSkippedCount = nil
+			a.surgicalConnFlush = nil
+			a.enumerateConnSrcPorts = nil
+			a.surgicalConnFlushV6 = nil
+			a.enumerateConnSrcPortsV6 = nil
 			return fmt.Errorf("L3 flush boot enumeration: %w", err)
 		}
 	}
@@ -444,19 +515,31 @@ func newFlusherForFilterMode(filterMode int) (FlowFlusher, error) {
 // based on FlowKey.Protocol (BpfFlusher uses sdwhitelist for
 // FlowProtoAny, spp for tcp/udp, icmpwhitelist for icmp).
 //
-// entry is the AccessEntry the schedule belongs to and MUST be
-// non-nil. The key is recorded on entry.scheduledKeys BEFORE
-// Scheduler.Schedule (record-then-Schedule order — see the inline
-// rationale below) so the matching cancelAllScheduledFlows walks
-// exactly what was scheduled (#2201, #2205). A nil entry would
-// schedule without tracking; cancelAllScheduledFlows would later
-// miss the key and leave a phantom scheduler entry that fires Flush
-// against already-gone kernel state. The non-nil contract is
-// enforced by a Critical log + early return rather than panic —
-// the kernel-state side may already be settled by the caller, so
-// taking the AC down for a single mis-shaped admission is a worse
-// outcome than dropping the schedule.
+// When the feature is enabled, entry MUST be non-nil. The key is
+// recorded on entry.scheduledKeys BEFORE Scheduler.Schedule
+// (record-then-Schedule order — see the inline rationale below) so the
+// matching cancelAllScheduledFlows walks exactly what was scheduled
+// (#2201, #2205). A nil entry while the scheduler is live would
+// schedule without tracking; cancelAllScheduledFlows would later miss
+// the key and leave a phantom scheduler entry that fires Flush against
+// already-gone kernel state. The non-nil contract is enforced by a
+// Critical log + early return rather than panic — the kernel-state side
+// may already be settled by the caller, so taking the AC down for a
+// single mis-shaped admission is a worse outcome than dropping the
+// schedule.
+//
+// The disabled-scheduler short-circuit comes FIRST, before the nil-entry
+// check: with no scheduler there is nothing to Schedule and no phantom
+// to create, so a nil entry is harmless. Ordering it first lets callers
+// that legitimately have no entry to mint when the feature is off (the
+// temp-access path's registerTempAccessFlushEntry returns nil in that
+// config to avoid parking a useless tokenStore entry — #2213) pass nil
+// without tripping the Critical/metric meant for a genuine
+// enabled-scheduler contract violation.
 func (a *UdpAC) scheduleFlushIfEnabled(entry *AccessEntry, srcIP, dstIP string, dstPort int, proto FlowProto, deadline time.Time) {
+	if a.expirySched == nil {
+		return
+	}
 	if entry == nil {
 		log.Critical("[L3FlushSched] scheduleFlushIfEnabled called with nil entry — schedule dropped to avoid phantom scheduler entry (src=%s dst=%s port=%d)",
 			srcIP, dstIP, dstPort)
@@ -489,82 +572,152 @@ func (a *UdpAC) scheduleFlushIfEnabled(entry *AccessEntry, srcIP, dstIP string, 
 	a.expirySched.Schedule(key, deadline)
 }
 
-// scheduleFlushOrphan schedules an L3 flush without recording the
-// FlowKey on any AccessEntry. The scheduler entry has no tracked
-// owner, so cancelAllScheduledFlows (which walks per-entry tracked
-// keys) never cancels it — the scheduler fires Flush at the
-// scheduled deadline regardless of any tokenStore expiry.
+// registerTempAccessFlushEntry constructs and stores a long-lived
+// AccessEntry that OWNS the L3 flushes scheduled by the NAT'd /
+// temp-access path (msghandler.go's tcpTempAccessHandler /
+// udpTempAccessHandler). It is the #2213 fix that retires the prior
+// orphan-flush path (the removed scheduleFlushOrphan), and it is a
+// prerequisite for explicit admin Cancel (#2172) to terminate
+// temp-access flows early.
 //
-// Used only by the NAT'd / temp-access path in msghandler.go
-// (tcpTempAccessHandler / udpTempAccessHandler). The temp handler
-// writes a kernel rule whose lifetime is the long outer openTimeSec
-// (often hours), but the tempEntry that gates the temp-handler's
-// auth check has OpenTime = TempPortOpenTime (30s). Recording the
-// FlowKey on tempEntry would Cancel the scheduled flush at
-// tempEntry's ~35s tokenStore expiry, leaving the kernel rule live
-// for the rest of openTimeSec with no queued conntrack flush — an
-// ESTABLISHED-bypass under L3-only enforcement. Recording on the
-// long-window outer admission entry doesn't fit either: its
-// firewallDeadline + accessTokenLatePacketBufferSeconds (5s)
-// expires before the temp-handler's kernel rule (which can be
-// written up to tempOpenTimeSec=30s after admission). The lifetime
-// mismatch is structural; no existing AccessEntry covers it.
+// # Why a dedicated entry
 //
-// Tracked in #2213 — the proper fix introduces a long-lived
-// AccessEntry whose OpenTime matches the kernel rule's actual
-// lifetime, then routes the temp handler back through
-// scheduleFlushIfEnabled against THAT entry. Required before L7
-// removal because the orphan loses revocation precision: an
-// explicit admin Cancel path (added by #2172) cannot find the
-// scheduler entry to terminate it early. Acceptable today since
-// no production caller invokes explicit Cancel on temp-handler
-// kernel rules — the orphan still fires Flush at its scheduled
-// deadline, matching the kernel rule's natural TTL.
+// The temp handler writes a kernel rule whose lifetime is the long
+// outer openTimeSec (often hours). The two AccessEntry pointers that
+// already exist at that point don't fit, which is why the orphan path
+// recorded the FlowKey on no entry at all:
 //
-// Multi-session interaction: if a tracked entry later schedules
-// the SAME FlowKey with a later deadline, scheduler longest-wins
-// absorb keeps the entry at the later deadline. The orphan's
-// earlier deadline is supplanted.
+//   - tempEntry (the auth-gate entry minted in HandleAccessControl's
+//     PASS_PRE_ACCESS_IP branch) has OpenTime = TempPortOpenTime
+//     (30s). Recording the FlowKey on it would let its ~35s tokenStore
+//     expiry fire cancelAllScheduledFlows and Cancel the scheduled
+//     flush while the kernel rule is still live for the rest of
+//     openTimeSec — an ESTABLISHED-bypass under L3-only enforcement.
+//   - the outer AOL admission entry's firewallDeadline +
+//     accessTokenLatePacketBufferSeconds expires before the temp
+//     handler's kernel rule (which can be written up to
+//     tempOpenTimeSec=30s after admission), so it Cancels early too.
 //
-// Cross-cancel asymmetry: if a tracked entry T_A holds the SAME
-// FlowKey K as an orphan O_orphan, and T_A expires first,
-// cancelAllScheduledFlows(T_A) → drains {K} → walks
-// latestOtherFirewallDeadline → finds NO peer (orphan registers
-// on no entry) → Cancel(K). The scheduler entry vanishes even
-// though O_orphan's deadline is in the future. The kernel rule
-// O_orphan was written for lives until its TTL but no flush
-// fires — an ESTABLISHED-bypass.
+// The lifetime mismatch is structural; no pre-existing AccessEntry
+// covers it. This entry closes the gap: its OpenTime is set to
+// openTimeSec, so firewallDeadline() == FirstKnockTime + openTimeSec
+// ≈ the kernel rule's natural TTL.
 //
-// Reachability of cross-cancel asymmetry: REQUIRES the same K =
-// (srcIP, dstIP, port, proto) to be scheduled by BOTH the tracked
-// AOL admission path AND the orphan temp-handler path on the SAME
-// AC. The discriminator is IpPassMode (endpoints/ac/config.go:49,
-// `a.IpPassMode()` consulted at msghandler.go's HandleAccessControl
-// branch switch): it is AC-GLOBAL config, not per-resource. Every
-// admission on a given AC routes through ONE of:
-//   - PASS_KNOCK_IP (tracked AOL admission)
-//   - PASS_KNOCKIP_WITH_RANGE (tracked AOL admission with range)
-//   - PASS_PRE_ACCESS_IP (temp handler / orphan path)
+// # Ownership & cancelability (the point of #2213)
 //
-// Per AC, all admissions share one IpPassMode value. The same K
-// therefore cannot be scheduled by both paths on the same AC.
-// Cross-AC FlowKey collisions are isolated by per-AC kernel state.
-// **Unreachable in production with current PassMode architecture.**
+// The returned entry is stored in tokenStore via GenerateAccessToken,
+// so it appears in tokenStore.Snapshot() and self-cleans via the
+// OnExpire hook. The caller records every temp-rule FlowKey on it
+// through scheduleFlushIfEnabled. Consequences:
 //
-// If a future change makes IpPassMode per-resource or per-tuple
-// (deviating from the current AC-global config), this asymmetry
-// becomes reachable. The cleanest mitigation at that point is the
-// long-lived AccessEntry from #2213 (replaces scheduleFlushOrphan
-// entirely); a shorter-term mitigation is an orphan deadline
-// registry that latestOtherFirewallDeadline consults as a fallback
-// (heavier; only worth implementing if #2213 slips and per-resource
-// PassMode ships first).
-func (a *UdpAC) scheduleFlushOrphan(srcIP, dstIP string, dstPort int, proto FlowProto, deadline time.Time) {
-	key, ok := a.flowKeyForScheduler(srcIP, dstIP, dstPort, proto)
-	if !ok {
-		return
+//   - Natural expiry: OnExpire fires cancelAllScheduledFlows at
+//     FirstKnockTime + openTimeSec + accessTokenLatePacketBufferSeconds,
+//     which is AFTER the flush already fired at
+//     computeFlushDeadline(openTimeSec) (openTimeSec +
+//     flushSafetyMargin). The drain hits an already-fired scheduler
+//     entry and Scheduler.Cancel no-ops idempotently — timing is
+//     preserved exactly vs the orphan path (the flush still fires at
+//     its deadline; only OWNERSHIP changed).
+//   - Explicit admin Cancel (#2172): because the FlowKeys are now
+//     OWNED, an admin Cancel walking tokenStore entries can call
+//     cancelAllScheduledFlows on this entry and terminate the flow's
+//     scheduled flush early. The orphan path had no owner to walk to,
+//     so its scheduler entry could never be terminated before its
+//     deadline.
+//
+// Failure-cleanup divergence from the admission path: if a per-tuple
+// kernel write in the caller's loop fails mid-way, the caller returns
+// and the keys already recorded on this entry are drained only at the
+// natural OnExpire (openTimeSec later), NOT immediately — the temp
+// handler has no equivalent of admission's emitOrCleanupPreMintedToken
+// immediate drain. Acceptable and bounded: the entry is in tokenStore
+// so OnExpire reaps it, and each orphaned key's own flushDeadline
+// (now + openTimeSec + flushSafetyMargin) fires a self-idempotent
+// no-op flush around the same moment. This matches the retired orphan
+// path's behavior; converging on admission's immediate drain isn't
+// worth the temp loop's added complexity for this slice.
+//
+// The phantom token minted here is never returned to the agent; it
+// exists only to anchor the entry in tokenStore for the OnExpire /
+// admin-Cancel reachability above. The agent already holds its own
+// auth-gate token (tempEntry's), which it used to reach this handler,
+// so no second token is exposed. The fresh &AccessEntry{} is stored
+// under exactly one token, satisfying the pointer-identity invariant
+// documented on the AccessEntry struct (and the nhp_debug Store
+// fence): it is never re-keyed.
+//
+// # Cross-session safety (now that the key is owned)
+//
+// Recording on a real entry restores the #2201 multi-session
+// reschedule path for temp-access keys: if a peer entry holds the same
+// FlowKey with a later firewall deadline, cancelAllScheduledFlows
+// re-Schedules rather than Cancels. With the prior orphan path this
+// peer-aware behavior was impossible (the orphan registered on no
+// entry, so latestOtherFirewallDeadline could neither find it as a
+// peer nor protect it — the cross-cancel asymmetry the orphan godoc
+// documented). Under the current AC-global IpPassMode the same K is
+// never scheduled by both the AOL admission path and the temp-handler
+// path on one AC, so that asymmetry was unreachable in production;
+// this fix removes it structurally regardless of a future
+// per-resource PassMode.
+//
+// SrcAddrs carries the AOL-declared agent address(es) for parity with
+// tempEntry and for log/refresh shape; the scheduled FlowKeys use the
+// kernel-observed (NAT'd) source IP the caller derives from the live
+// connection, exactly as the orphan path did (#2205). The cancel walk
+// reads only firewallDeadline + scheduledKeys, never SrcAddrs, so the
+// two source views never need to agree. A corollary for the #2172
+// admin-Cancel SELECTION surface: it must match these entries by their
+// kernel-keyed (NAT'd) FlowKey, not by SrcAddrs — matching the
+// AOL-declared IP would miss the NAT'd kernel rule this entry owns.
+//
+// Occupancy note (scheduler ENABLED only — the disabled config stores
+// nothing, see the feature-off short-circuit below): where the orphan
+// path stored nothing, every successful PASS_PRE_ACCESS_IP admission now
+// parks UP TO TWO long-lived entries (lifetime openTimeSec, often hours)
+// in tokenStore until natural expiry — HandleAccessControl opens both a
+// TCP and a UDP temp listener on the picked port and spawns both
+// tcpTempAccessHandler and udpTempAccessHandler, each of which calls
+// this helper once (a TCP-keyed entry and a UDP/ANY/ICMP-keyed entry).
+// This raises N for cancelAllScheduledFlows's O(K×N) walk and for each
+// CleanExpired scan on a busy temp-access AC, and the #2172 admin-Cancel
+// selection surface will see both owning entries per flow. There is no
+// dedicated tokenStore-size alarm today; the occupancy is bounded and
+// self-cleaning, folded into the same capacity model the
+// cancelAllScheduledFlows godoc tracks under #2163 — the right place to
+// add a size gauge/alarm if PASS_PRE_ACCESS_IP occupancy becomes
+// alarm-relevant under sustained authenticated knock load.
+//
+// Zero-key parking edge: this entry is registered before the caller's
+// FilterMode dispatch + per-tuple loop, so if FilterMode hits the
+// validated-unreachable default branch (or the first kernel write
+// fails) the entry is parked owning no keys until its OnExpire. Benign
+// (FilterMode is validated config; the entry self-cleans), and the same
+// shape as the partial-schedule failure-cleanup divergence noted above
+// — not worth lazy-registration complexity that would split the
+// load-bearing Schedule-then-write (#2168) interleaving.
+func (a *UdpAC) registerTempAccessFlushEntry(au *common.AgentUser, srcAddrs, dstAddrs []*common.NetAddress, openTimeSec int) *AccessEntry {
+	// Feature-off short-circuit: with no scheduler there is no flush to
+	// own and no admin-Cancel target, so minting + storing an entry would
+	// be pure tokenStore occupancy with zero benefit — and a divergence
+	// from the retired orphan path, which stored nothing in EITHER config.
+	// Returning nil is safe: scheduleFlushIfEnabled short-circuits on the
+	// nil scheduler before its nil-entry guard, so the caller's schedule
+	// calls no-op without tripping the Critical/metric.
+	if a.expirySched == nil {
+		return nil
 	}
-	a.expirySched.Schedule(key, deadline)
+	entry := &AccessEntry{
+		User:     au,
+		SrcAddrs: srcAddrs,
+		DstAddrs: dstAddrs,
+		OpenTime: openTimeSec,
+	}
+	// GenerateAccessToken stamps FirstKnockTime/ExpireTime and Stores
+	// the entry under a fresh opaque token. The token is intentionally
+	// discarded — see godoc (phantom token, never sent to the agent).
+	a.GenerateAccessToken(entry)
+	return entry
 }
 
 // installExpiryHook wires cancelAllScheduledFlows into TokenStore's
@@ -575,7 +728,12 @@ func (a *UdpAC) scheduleFlushOrphan(srcIP, dstIP string, dstPort int, proto Flow
 // outside tokenStore.mu (see SetOnExpire godoc), so scheduler
 // shard locks taken inside are never held with tokenStore.mu.
 func (a *UdpAC) installExpiryHook() {
-	a.tokenStore.SetOnExpire(func(_ string, entry *AccessEntry) {
+	a.tokenStore.SetOnExpire(func(token string, entry *AccessEntry) {
+		// Deindex BEFORE the scheduler cancel so a concurrent
+		// ApplyRevocation snapshot taken after this point cannot include a
+		// token whose entry is already expiring. revIndex.remove is a no-op
+		// for legacy entries (no qURL v2 metadata) and nil-safe pre-Start.
+		a.revIndex.remove(token, entry)
 		a.cancelAllScheduledFlows(entry)
 	})
 }
@@ -821,6 +979,16 @@ func (a *UdpAC) incrMetric(name string) {
 	}
 }
 
+// addMetric adds value to an AC counter in one publish, the batched analog
+// of incrMetric. Same nil-discipline (nil registration / nil publisher are
+// no-ops). Used by the revocation apply path to report N entries flushed
+// without N separate IncrCounter calls.
+func (a *UdpAC) addMetric(name string, value uint64) {
+	if reg := a.registration; reg != nil {
+		reg.metrics.AddCounterWithDims(name, float64(value), nil)
+	}
+}
+
 // recordTransactionClosed increments MetricTransactionClosed iff err
 // is common.ErrTransactionClosed. Nil-safety is delegated to
 // incrMetric.
@@ -835,7 +1003,7 @@ func (a *UdpAC) recordTransactionClosed(err error) {
 
 // recoverUDPHandler catches panics on every per-packet goroutine on
 // the AC's UDP message-handler path: the recvMessageRoutine entries
-// (NHP_AOP, NHP_ARD) and every goroutine they transitively spawn
+// (NHP_AOP, NHP_ARD, NHP_REV) and every goroutine they transitively spawn
 // (HandleAccessControl's tcpTempAccessHandler / udpTempAccessHandler
 // and the tempConnTerminator nested inside each of those). It logs
 // the panic value + stack at Error and increments
@@ -1270,6 +1438,26 @@ func (a *UdpAC) recvMessageRoutine() {
 					defer a.wg.Done()
 					defer a.recoverUDPHandler(core.NHP_ARD)
 					a.HandleACRedispatch(ppd)
+				}()
+
+			case core.NHP_REV:
+				// Handle a qURL v2 immediate-revocation push from the
+				// server (P4e). wg-tracked like NHP_ARD so Stop()'s
+				// wg.Wait() blocks until an in-flight revoke apply
+				// returns. HandleUdpACRevocation validates the event and
+				// calls the P4b ApplyRevocation primitive; it logs every
+				// outcome (parse/validation reject AND apply result) with
+				// full context itself, so — like the NHP_ARD seam — this
+				// dispatch arm does not re-log the returned error (the
+				// NHP_AOP seam comment above: re-logging here adds noise
+				// without information). The error return exists for the
+				// direct test callers. There is no NHP_ART response path,
+				// so nothing to forward.
+				a.wg.Add(1)
+				go func() {
+					defer a.wg.Done()
+					defer a.recoverUDPHandler(core.NHP_REV)
+					_ = a.HandleUdpACRevocation(ppd)
 				}()
 			}
 		}

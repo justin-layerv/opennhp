@@ -147,6 +147,23 @@ func (p FlowProto) String() string {
 	}
 }
 
+// ianaL4Proto maps the AC's FlowProto enum to the IANA L4 protocol number
+// the eBPF map keys use (TCP=6, UDP=17), returning ok=false for protocols
+// that have no L4 number in that sense (ICMP, "any"). Single source of the
+// TCP/UDP→IANA mapping: both the allow-rule flusher (BpfFlusher.Flush) and
+// the surgical conntrack flusher (BpfFlusher.FlushConn) need it, and a
+// divergent second copy could silently encode the wrong protocol byte.
+func (p FlowProto) ianaL4Proto() (uint8, bool) {
+	switch p {
+	case FlowProtoTCP:
+		return 6, true
+	case FlowProtoUDP:
+		return 17, true
+	default:
+		return 0, false
+	}
+}
+
 // FlowKey identifies a single allow-rule flow at the AC. Both IPv4
 // and IPv6 are stored in 16-byte form: IPv4 addresses are stored in
 // IPv4-mapped IPv6 form (::ffff:a.b.c.d), matching the kernel
@@ -228,6 +245,40 @@ func netIPFrom16(b [16]byte) net.IP {
 // String renders a FlowKey in `src→dst:port/proto` form for logging.
 func (k FlowKey) String() string {
 	return fmt.Sprintf("%s→%s:%d/%s", k.SrcIPString(), k.DstIPString(), k.DstPort, k.Protocol)
+}
+
+// ConnFlowKey identifies a single ESTABLISHED flow — the allow-rule
+// FlowKey plus the per-flow source port. The source port is the
+// kernel-visible "per-admission discriminator" (P4c): the allow-rule
+// FlowKey alone cannot distinguish two admissions that share one
+// {src,dst,dport,proto} network tuple (NAT'd clients behind one IP),
+// because they collapse to a single allow-rule map entry — but the
+// kernel's conntrack map keys on the full 5-tuple incl. source port, and
+// two concurrent flows behind one NAT to the same destination always have
+// distinct source ports. So this is the granularity at which a revoke can
+// surgically kill EXACTLY one admission's established flow while leaving a
+// same-tuple sibling (different source port) alive.
+//
+// SrcPort is host byte order (0..65535); the eBPF helper converts it to
+// the on-wire network order the kernel conntrack key uses.
+//
+// Why this is a parallel key and NOT a widening of FlowKey: FlowKey has a
+// documented per-entry memory budget (SCHEDULER_SCALING.md) and is used as
+// the timer-wheel map key across the whole scheduler; adding a source-port
+// dimension there would inflate every scheduled allow-rule entry and is
+// pointless for scheduled expiry (the allow-rule maps have no source-port
+// slot). ConnFlowKey is confined to the surgical-teardown path, which P4e
+// wires to the revocation index. The normal scheduled-expiry FlowFlusher
+// contract (Flush(ctx, FlowKey)) is untouched.
+type ConnFlowKey struct {
+	Flow    FlowKey
+	SrcPort uint16
+}
+
+// String renders a ConnFlowKey in `src:sport→dst:dport/proto` form.
+func (c ConnFlowKey) String() string {
+	return fmt.Sprintf("%s:%d→%s:%d/%s",
+		c.Flow.SrcIPString(), c.SrcPort, c.Flow.DstIPString(), c.Flow.DstPort, c.Flow.Protocol)
 }
 
 // shard returns the shard index for this key. Inlines FNV-1a over
@@ -806,6 +857,45 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 // the scheduler. This soft-fail surfaces a missed schedule + a log
 // line, not a crash that takes down the AC.
 func (s *Scheduler) Schedule(key FlowKey, deadline time.Time) {
+	s.scheduleEntry(key, deadline, false)
+}
+
+// RescheduleEarlier is the deliberate INVERSE of Schedule's longest-wins
+// absorb: it moves an existing entry's deadline EARLIER (or inserts it if
+// absent), and is a no-op only when the existing deadline is already at or
+// before the requested one. It exists so qURL v2 immediate revocation
+// (flushEntryNow in revocation_index.go) can force a flow that is already
+// scheduled at its normal future firewall deadline to fire NOW — Schedule
+// alone cannot, because longest-wins makes Schedule(key, now) a no-op against
+// any later-scheduled key (which is every live admitted flow).
+//
+// It is NOT a substitute for Cancel-then-Schedule: it preserves Schedule's
+// Phase 1 in-flight barrier. A worker already tearing the kernel rule down is
+// waited out (the in-flight Flush already IS the immediate teardown); the body
+// then inserts a fresh entry at the new deadline once the cleanup defer has
+// removed the drained one, scheduling a second flush that is an idempotent
+// ENOENT no-op against the already-torn-down rule. A not-yet-fired entry is
+// simply pulled earlier. Reusing Schedule's body keeps the subtle inFlight-wait
+// / wheel-relink / metric accounting in one place — the only behavioral delta
+// is the comparison direction.
+//
+// Shared-FlowKey caveat: pulling a shared tuple's entry earlier fires the
+// flush for every session on that FlowKey, including non-revoked siblings.
+// That coarse over-flush is the accepted interim for the revocation slice
+// (P4b); the kernel-visible per-session discriminator that makes revoke
+// surgical is P4c. Non-revocation callers must keep using Schedule.
+func (s *Scheduler) RescheduleEarlier(key FlowKey, deadline time.Time) {
+	s.scheduleEntry(key, deadline, true)
+}
+
+// scheduleEntry is the shared body of Schedule and RescheduleEarlier. When
+// pullEarlier is false (Schedule) it skips on existing.deadlineNs >=
+// deadlineNs (longest-wins). When true (RescheduleEarlier) it skips only on
+// existing.deadlineNs <= deadlineNs, i.e. it inserts whenever the requested
+// deadline is strictly earlier than what is scheduled. The wait-timeout
+// force-insert path is identical for both — a stuck in-flight entry's stored
+// deadline is never honored.
+func (s *Scheduler) scheduleEntry(key FlowKey, deadline time.Time, pullEarlier bool) {
 	if !s.started.Load() {
 		// Schedule lost the race against Shutdown — boot enumeration
 		// on the next AC process recovers any state we couldn't
@@ -908,10 +998,17 @@ func (s *Scheduler) Schedule(key FlowKey, deadline time.Time) {
 	// new kernel rule with no flush hook once the cleanup defer
 	// finally removes the index entry. Force-insert to keep the
 	// new write under a fresh schedule.
-	if ok && !timedOutOnInFlight && existing.deadlineNs >= deadlineNs {
-		// Longest-wins: the existing entry has at-least-as-late a
-		// deadline already, leave it alone.
-		return
+	if ok && !timedOutOnInFlight {
+		// Longest-wins (Schedule) leaves an at-least-as-late existing
+		// entry alone; shortest-wins (RescheduleEarlier) leaves an
+		// at-least-as-early one alone. In both directions the existing
+		// schedule already satisfies the caller's intent, so skip the
+		// re-insert. The in-flight case is handled in Phase 1 above and
+		// the wait-timeout force-insert below bypasses this entirely.
+		if (!pullEarlier && existing.deadlineNs >= deadlineNs) ||
+			(pullEarlier && existing.deadlineNs <= deadlineNs) {
+			return
+		}
 	}
 
 	// TODO(scaling): per-call alloc on every Schedule. At the 15M

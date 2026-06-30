@@ -133,6 +133,12 @@ variable "nhp_resources_customer_id_prefix" {
   }
 }
 
+variable "qurl_browser_relay_base_url" {
+  description = "Browser relay origin embedded by qurl-service into qv1 qURL bootstrap fragments. Empty keeps qurl_link fragments on legacy #at_ form."
+  type        = string
+  default     = ""
+}
+
 # ==================== Auth0 ====================
 
 variable "auth0_domain" {

@@ -250,6 +250,7 @@ fi
 ssm_helper_alt=$(printf '%s\n' "$ssm_helper_names" | tr '\n' '|' | sed 's/|$//')
 ssm_helper_regex="(^|[^A-Za-z0-9_])(${ssm_helper_alt})\\("
 tier3_no_ssm_expected_omissions=(
+  ACEBPFObjects
   DockerImage
   SSMRunbook
   ServerDeployStability

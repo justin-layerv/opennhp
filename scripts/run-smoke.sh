@@ -112,10 +112,10 @@ esac
 # ----------------------------------------------------------------------------
 case "$TIER" in
   tier1)
-    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|PublicALB|ResolveOrigin)_'
+    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|ACEBPFObjects|SSMRunbook|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|PublicALB|ResolveOrigin)_'
     ;;
   tier1+tier2)
-    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
+    RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|ACEBPFObjects|SSMRunbook|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'
     ;;
   tier3-no-ssm)
     RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACAlarms|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing|CustomDomainCleanup|CustomDomainCertDNSOwnership)_'

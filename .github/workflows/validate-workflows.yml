@@ -30,10 +30,37 @@ on:
       - "scripts/check-image-tag-writer-allowlist.sh"
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
+      # eBPF load-path lockstep (#2810): trigger on the script itself and on all
+      # three source-of-truth sites it compares so a drift in ANY of them
+      # re-runs the check at PR time. Dockerfile.ac.aws is already listed below;
+      # the Go source of truth + the Makefile are not watched elsewhere, so they
+      # must be here or a Go-only/Makefile-only rename would skip the lint.
+      - "scripts/check-ebpf-load-path-lockstep.sh"
+      - "tests/scripts/check-ebpf-load-path-lockstep_test.sh"
+      # eBPF arch lockstep (#2816): the AC image build platform must stay
+      # in lockstep with terraform/modules/ac/main.tf's launch-template
+      # instance families. The fixture test mutates both sides so extractor
+      # regressions do not silently green.
+      - "scripts/check-ac-ebpf-arch-lockstep.sh"
+      - "tests/scripts/check-ac-ebpf-arch-lockstep_test.sh"
+      - "scripts/check-ebpf-toolchain-pin-lockstep.sh"
+      - "tests/scripts/check-ebpf-toolchain-pin-lockstep_test.sh"
+      - "scripts/install-ebpf-toolchain.sh"
+      - "tests/scripts/install-ebpf-toolchain_test.sh"
+      - "scripts/check-ebpf-committed-object-drift.sh"
+      - "tests/scripts/check-ebpf-committed-object-drift_test.sh"
+      - "endpoints/ac/ebpf/ebpfegine.go"
+      - "terraform/modules/ac/main.tf"
+      - "Makefile"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
       - "scripts/check-packer-failure-surfaced.sh"
       - "scripts/check-app-image-line-rendered.sh"
       - "scripts/check-golden-vectors.sh"
+      # The conformance-parity check's fixture test runs in this workflow (the
+      # script itself runs in qurl-v2-conformance-parity.yml, which needs a
+      # Go/Node toolchain). Watch the script so an edit re-fires its shellcheck +
+      # the fixture test here; the test file rides tests/scripts/** below.
+      - "scripts/check-conformance-parity.sh"
       # All cross-language golden-vector files are listed so a one-sided edit to
       # ANY of them fires the Go↔TS cross-check (scripts/check-golden-vectors.sh)
       # — including the Go-side files, which the path-scoped js-agent.yml never
@@ -77,7 +104,9 @@ on:
       - "docker/nhp-server/etc/config.toml"
       - "endpoints/server/main/etc/config.toml"
   pull_request:
-    branches: [ "main" ]
+    # qurl-v2 carries the pre-E5 eBPF gates (#2810/#2816), so PRs against it
+    # must run these workflow/Terraform lockstep checks before merge too.
+    branches: [ "main", "qurl-v2" ]
     paths: *validate_paths
 
 # Restrict default permissions for security
@@ -323,6 +352,21 @@ jobs:
           bash tests/scripts/check-golden-vectors_test.sh
           bash scripts/check-golden-vectors.sh
 
+      # Fixture-test for the Go↔npm conformance-parity check's DECISION logic
+      # (#2855): identical→0, differing→1+DRIFT, missing-file→1. The real
+      # scripts/check-conformance-parity.sh resolves its two
+      # issuer_signature_vectors.json copies via `go mod download` + `npm ci`,
+      # so it needs a Go/Node toolchain and runs in its own workflow
+      # (qurl-v2-conformance-parity.yml). This pure-shell job only shellchecks
+      # both files and runs the network-free fixture test (which injects
+      # GO_VECTOR/NPM_VECTOR to bypass resolution), guarding the compare/exit
+      # logic against regressions here without a toolchain. Mirrors the
+      # golden-vectors test wiring above.
+      - name: Test conformance-parity decision logic (Go ↔ npm, #2855)
+        run: |
+          shellcheck scripts/check-conformance-parity.sh tests/scripts/check-conformance-parity_test.sh
+          bash tests/scripts/check-conformance-parity_test.sh
+
       # Structural fence for the qurl-service /internal/* public-ALB
       # lockdown body contract (PR #1635; rearchitected by #1645). The
       # smoke fence no longer carries a Go body literal — it resolves its
@@ -414,6 +458,45 @@ jobs:
 
       - name: Check asp+ac_id lockstep (TF ↔ Go)
         run: bash scripts/check-asp-and-ac-id-lockstep.sh
+
+      # eBPF object load-path lockstep (#2810): the AC loads its eBPF objects
+      # from a dir+filenames that are the runtime source of truth in
+      # endpoints/ac/ebpf/ebpfegine.go (bpfDir / ebpfenginename / tcObjName).
+      # The Makefile EBPF_OBJ_* output paths and the docker/Dockerfile.ac.aws
+      # build guard independently hardcode the same path; a Go-only rename
+      # would pass the in-image build guard (which only compares
+      # Makefile↔Dockerfile) yet boot-fail the AC under FilterMode=EBPFXDP.
+      # The fixture suite runs first so an extractor regression surfaces
+      # against synthetic inputs before the real tree runs. shellcheck both —
+      # actionlint's -shellcheck only covers workflow-embedded scripts.
+      - name: Test + check eBPF load-path lockstep (Go ↔ Makefile ↔ Dockerfile, #2810)
+        run: |
+          shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
+          bash tests/scripts/check-ebpf-load-path-lockstep_test.sh
+          bash scripts/check-ebpf-load-path-lockstep.sh
+
+      # AC eBPF architecture lockstep (#2816): Dockerfile.ac.aws compiles the
+      # eBPF objects inside the AC image build, so build-and-push.yml must build
+      # that image for the same platform the AC launch template runs. Today this
+      # is intentionally linux/amd64-only (prod c6i.xlarge, non-prod t3.medium).
+      # A future arm64 or multi-arch AC path must add a real BPF load test before
+      # relaxing this gate.
+      - name: Test + check AC eBPF arch lockstep (workflow ↔ Terraform, #2816)
+        run: |
+          shellcheck scripts/check-ac-ebpf-arch-lockstep.sh tests/scripts/check-ac-ebpf-arch-lockstep_test.sh
+          bash tests/scripts/check-ac-ebpf-arch-lockstep_test.sh
+          bash scripts/check-ac-ebpf-arch-lockstep.sh
+
+      # Fixture-test the committed-object freshness guard without requiring the
+      # workflow-lint job to install clang/libbpf. The real eBPF workflow runs
+      # the script against the actual object after installing the toolchain.
+      - name: Test eBPF committed-object drift guard (#2823)
+        run: |
+          shellcheck scripts/check-ebpf-toolchain-pin-lockstep.sh tests/scripts/check-ebpf-toolchain-pin-lockstep_test.sh scripts/install-ebpf-toolchain.sh tests/scripts/install-ebpf-toolchain_test.sh scripts/check-ebpf-committed-object-drift.sh tests/scripts/check-ebpf-committed-object-drift_test.sh
+          bash tests/scripts/check-ebpf-toolchain-pin-lockstep_test.sh
+          bash scripts/check-ebpf-toolchain-pin-lockstep.sh
+          bash tests/scripts/install-ebpf-toolchain_test.sh
+          bash tests/scripts/check-ebpf-committed-object-drift_test.sh
 
       - name: Check frps_az_suffixes validation drift (root ↔ module ↔ env-roots)
         run: bash scripts/check-frps-az-suffixes-validation-drift.sh

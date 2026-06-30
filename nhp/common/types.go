@@ -58,6 +58,58 @@ type ResourceData struct {
 	RedirectWithParams bool           `json:"redirectWithParams,omitempty"`
 	SkipAuth           bool           `json:"skipAuth,omitempty"`
 	CookieDomain       string         `json:"cookieDomain,omitempty"`
+
+	// qURL v2 protected-resource public key (P1b), surfaced from the NHP
+	// catalog row (endpoints/server.Resource) so later admission phases
+	// (P3/P4) can key routing/admission on the resource public key. Carried
+	// here — alongside the other layerv-local catalog extensions above —
+	// rather than on the upstream-synced ResourceGroup/ResourceInfo in
+	// nhpmsg.go. Empty for v1 / feature-off resources.
+	//
+	// UNVALIDATED — consumers MUST verify before trusting. P1b is a dumb
+	// carrier: it passes these through without decoding or hashing, so the
+	// value can be empty, malformed, or (once it gates admission) attacker-
+	// influenced. The admission-gate phase MUST base64url-decode
+	// ResourcePublicKeyB64, length-check the DER, and recompute the hash from
+	// the decoded bytes — i.e. verify ResourcePublicKeyHash ==
+	// SHA-256(decode(ResourcePublicKeyB64)) — rather than trusting the stored
+	// hash. Do not use either field as an identity/routing key without that
+	// verification.
+	//
+	//   ResourcePublicKeyB64:  unpadded base64url DER SPKI of the resource pubkey
+	//   ResourcePublicKeyHash: lowercase hex SHA-256 of the DECODED DER bytes
+	ResourcePublicKeyB64  string `json:"resourcePublicKeyB64,omitempty"`
+	ResourcePublicKeyHash string `json:"resourcePublicKeyHash,omitempty"`
+
+	// qURL v2 keyed-identity revocation metadata (P4a). Populated only by the v2
+	// signed-claims admission path (qurl plugin authWithNHPClaims), carried here
+	// from the admission decision down to the AOP builder, which stamps the
+	// matching ServerACOpsMsg fields so the AC can store them on the access/flow
+	// entry for immediate, targeted revocation. These are empty for v1 /
+	// feature-off admissions (they are not on the catalog row), so the AOP omits
+	// them (omitempty) and stays additive/wire-compatible for pre-v2 ACs.
+	// (ResourcePublicKeyHash above doubles as the resource revocation key and,
+	// unlike the per-admission fields, can ride a catalog ResourceData for a
+	// v2-provisioned resource even on a non-v2 knock — see processACOperation.)
+	//
+	// SessionId is carried ONLY by the steady-state re-knock (authorize) path:
+	// the authorize response returns the matched live session, so the refresh
+	// stamps it here for the AC's session_id secondary index. The first-knock
+	// (prepare) path leaves it empty — prepare does not return a session id — so a
+	// freshly-admitted flow is indexed by qurl-user / resource hash only until its
+	// first re-knock refreshes it under the session key. revocation_epoch is still
+	// NOT carried: neither prepare nor authorize returns it, so it awaits a
+	// contract field and a later slice. See
+	// docs/design/QURL_V2_KEYED_IDENTITY.md → "AC Admission and Immediate Revocation".
+	//
+	//   QurlUserPublicKeyHash: lowercase hex SHA-256 of the DECODED qURL-user pubkey
+	//   SessionId:             qURL v2 session id (authorize/re-knock path only)
+	//   AdmissionId:           id of the admission decision that opened this access
+	//   Deadline:              unix seconds; admission validity deadline (claim exp)
+	QurlUserPublicKeyHash string `json:"qurlUserPublicKeyHash,omitempty"`
+	SessionId             string `json:"sessionId,omitempty"`
+	AdmissionId           string `json:"admissionId,omitempty"`
+	Deadline              int64  `json:"deadline,omitempty"`
 }
 
 type ResourceGroupMap map[string]*ResourceData

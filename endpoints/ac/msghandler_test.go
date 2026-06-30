@@ -176,6 +176,86 @@ func TestHandleUdpACOperations_FirstSeenProceedsToUnmarshal(t *testing.T) {
 	}
 }
 
+// TestAccessEntryFromAOP_StoresQurlV2Metadata proves the AC stores the qURL v2
+// revocation metadata (P4a) verbatim from the NHP-AOP onto the AccessEntry it
+// admits. P4b's targeted-revocation index match depends on the stored value
+// being byte-identical to what the server stamped, so the AC must store the
+// hashes as received and MUST NOT recompute them — this asserts pass-through.
+func TestAccessEntryFromAOP_StoresQurlV2Metadata(t *testing.T) {
+	dop := &common.ServerACOpsMsg{
+		UserId:           "u",
+		DeviceId:         "d",
+		OrganizationId:   "org",
+		AuthServiceId:    "asp",
+		SourceAddrs:      []*common.NetAddress{{Ip: "203.0.113.9", Port: 5555}},
+		DestinationAddrs: []*common.NetAddress{{Ip: "10.0.0.5", Port: 8443}},
+		OpenTime:         60,
+
+		QurlUserPublicKeyHash: "a1b2c3",
+		ResourcePublicKeyHash: "d4e5f6",
+		SessionId:             "sess_123",
+		AdmissionId:           "adm_test123",
+		RevocationEpoch:       42,
+		Deadline:              1781910300,
+	}
+
+	entry := accessEntryFromAOP(dop)
+
+	if entry.QurlUserPublicKeyHash != "a1b2c3" {
+		t.Errorf("QurlUserPublicKeyHash = %q, want %q (verbatim from AOP)", entry.QurlUserPublicKeyHash, "a1b2c3")
+	}
+	if entry.ResourcePublicKeyHash != "d4e5f6" {
+		t.Errorf("ResourcePublicKeyHash = %q, want %q (verbatim from AOP)", entry.ResourcePublicKeyHash, "d4e5f6")
+	}
+	if entry.SessionId != "sess_123" {
+		t.Errorf("SessionId = %q, want %q", entry.SessionId, "sess_123")
+	}
+	if entry.AdmissionId != "adm_test123" {
+		t.Errorf("AdmissionId = %q, want %q", entry.AdmissionId, "adm_test123")
+	}
+	if entry.RevocationEpoch != 42 {
+		t.Errorf("RevocationEpoch = %d, want %d", entry.RevocationEpoch, 42)
+	}
+	if entry.Deadline != 1781910300 {
+		t.Errorf("Deadline = %d, want %d", entry.Deadline, 1781910300)
+	}
+
+	// Existing (non-metadata) mapping still holds.
+	if entry.User == nil || entry.User.UserId != "u" || entry.User.AuthServiceId != "asp" {
+		t.Errorf("User mapping wrong: %#v", entry.User)
+	}
+	if entry.OpenTime != 60 {
+		t.Errorf("OpenTime = %d, want 60", entry.OpenTime)
+	}
+	// OwnerId stays empty on the AC side by invariant (server-resolved only).
+	if entry.User != nil && entry.User.OwnerId != "" {
+		t.Errorf("OwnerId = %q, want empty (server-resolved-only invariant)", entry.User.OwnerId)
+	}
+}
+
+// TestAccessEntryFromAOP_LegacyAOP_NoMetadata proves a legacy / non-qURL-v2 AOP
+// (the six fields absent on the wire, so zero after unmarshal) produces an
+// AccessEntry with zero-valued revocation metadata — the AC store is unchanged
+// for existing knocks.
+func TestAccessEntryFromAOP_LegacyAOP_NoMetadata(t *testing.T) {
+	dop := &common.ServerACOpsMsg{
+		UserId:           "u",
+		AuthServiceId:    "asp",
+		SourceAddrs:      []*common.NetAddress{{Ip: "203.0.113.9", Port: 5555}},
+		DestinationAddrs: []*common.NetAddress{{Ip: "10.0.0.5", Port: 8443}},
+		OpenTime:         60,
+		// qURL v2 fields intentionally absent — legacy shape.
+	}
+
+	entry := accessEntryFromAOP(dop)
+
+	if entry.QurlUserPublicKeyHash != "" || entry.ResourcePublicKeyHash != "" ||
+		entry.SessionId != "" || entry.AdmissionId != "" ||
+		entry.RevocationEpoch != 0 || entry.Deadline != 0 {
+		t.Errorf("legacy AOP must yield zero revocation metadata, got %#v", entry)
+	}
+}
+
 // TestApplyDefaultIpSubstitution fences the load-bearing IP-substitution
 // invariant on the AC ipset-write path. Two production callers depend
 // on this behavior:
@@ -523,5 +603,40 @@ func TestNewFlusherForFilterMode_UnsupportedMode(t *testing.T) {
 				t.Errorf("FilterMode=%d: expected nil flusher, got %T", mode, f)
 			}
 		})
+	}
+}
+
+// TestAllPortsEbpfRuleParams_Sentinel is the pure-Go regression guard for the
+// #2843 all-ports sentinel. The two FilterMode_EBPFXDP all-ports branches in
+// HandleAccessControl build their port_list EbpfRuleParams via
+// allPortsEbpfRuleParams, so pinning the helper's bounds here makes a revert of
+// the sentinel back to the pre-#2843 DstPortStart=1 fail this test — without a
+// kernel.
+//
+// WHY DstPortStart MUST be 0: the XDP port_list lookup key is built from the
+// compile-time constants `.min_port = MIN_PORT(0), .max_port = MAX_PORT(65535)`
+// (nhp/ebpf/xdp/nhp_ebpf_xdp.c), never from the packet. A seed with
+// DstPortStart=1 produces the key {src,1,65535}, which never equals the lookup
+// {src,0,65535}, so every all-ports admission fail-closes under EBPFXDP. This
+// test owns the production-constant half of the proof; the in-kernel
+// TestIPv4AdmissionDatapathPortListAllPorts owns the key→verdict half (and
+// additionally proves the OLD min=1 value DROPs).
+//
+// SCOPE: this pins the constant the shared constructor returns, not that every
+// call site calls the constructor. The two HandleAccessControl all-ports
+// branches were collapsed onto this helper in the same change, so today a revert
+// to 1 at the sentinel goes red here.
+func TestAllPortsEbpfRuleParams_Sentinel(t *testing.T) {
+	const srcIP = "10.1.2.3"
+	got := allPortsEbpfRuleParams(srcIP)
+
+	if got.DstPortStart != 0 {
+		t.Errorf("all-ports DstPortStart = %d, want 0 — the XDP port_list lookup keys on MIN_PORT=0; a non-zero start (the pre-#2843 bug was 1) makes the seeded key never match and every all-ports admission fail-closes under FilterMode=EBPFXDP (#2843)", got.DstPortStart)
+	}
+	if got.DstPortEnd != 65535 {
+		t.Errorf("all-ports DstPortEnd = %d, want 65535 — the XDP port_list lookup keys on MAX_PORT=65535; any other end makes the seeded key never match the lookup", got.DstPortEnd)
+	}
+	if got.SrcIP != srcIP {
+		t.Errorf("all-ports SrcIP = %q, want %q — the source IP must be threaded through unchanged so the rule is keyed on the admitted source", got.SrcIP, srcIP)
 	}
 }

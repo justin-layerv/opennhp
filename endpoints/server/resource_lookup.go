@@ -729,6 +729,13 @@ func (l *ResourceLookup) resourceDataFromRow(aspId string, row Resource, direct 
 			},
 		},
 		SkipAuth: true,
+		// qURL v2 (P1b): surface the protected-resource public key + hash so
+		// later admission phases (P3/P4) can key on them. Pass-through only —
+		// no validation/decode/gate here, and empty for legacy / feature-off
+		// rows (which omit the attributes entirely), so this is purely
+		// additive and never adds a reject path.
+		ResourcePublicKeyB64:  row.ResourcePublicKeyB64,
+		ResourcePublicKeyHash: row.ResourcePublicKeyHash,
 	}, true
 }
 

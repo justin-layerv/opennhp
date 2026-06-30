@@ -1765,7 +1765,7 @@ func TestBroadcast_ReturnsOnFirstSuccess(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err != nil {
 		t.Fatalf("Expected success, got error: %v", err)
@@ -1828,7 +1828,7 @@ func TestBroadcast_PartialFailureStillSucceeds(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err != nil {
 		t.Fatalf("Expected success (partial), got error: %v", err)
@@ -1870,7 +1870,7 @@ func TestBroadcastCancellation_AllFail(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	_, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	_, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err == nil {
 		t.Fatal("Expected error when all ACs fail")
@@ -1891,7 +1891,7 @@ func TestBroadcastCancellation_SingleConn(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err != nil {
 		t.Fatalf("Expected success for single conn, got: %v", err)
@@ -1953,7 +1953,7 @@ func TestBroadcast_TimeoutReturnsFirstSuccess(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 
 	if err != nil {
 		t.Fatalf("Expected success (first AC responded), got error: %v", err)
@@ -2014,7 +2014,7 @@ func TestBroadcast_ParentContextCancellationDoesNotAbort(t *testing.T) {
 	parentCtx, cancel := context.WithCancel(ContextWithRequestID(context.Background(), "req-broadcast-777"))
 	cancel()
 
-	artMsg, err := s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, 60, nil)
 	if err != nil {
 		t.Fatalf("broadcast must succeed even with canceled parent ctx, got err=%v", err)
 	}
@@ -2054,7 +2054,7 @@ func TestProcessACOperation_ContextAlreadyCanceled(t *testing.T) {
 	cancel() // cancel immediately
 
 	start := time.Now()
-	_, err := s.processACOperation(ctx, knkMsg, conn, srcAddr, dstAddrs, 60)
+	_, err := s.processACOperation(ctx, knkMsg, conn, srcAddr, dstAddrs, 60, nil)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.Canceled) {
@@ -2318,6 +2318,51 @@ func TestHandleACOnline_MalformedBodyEmitsFailureMetric(t *testing.T) {
 	}
 	if got := counters[MetricACRegistrationSuccess]; got != 0 {
 		t.Errorf("MetricACRegistrationSuccess = %v, want 0 on failure path", got)
+	}
+}
+
+// TestHandleACOnline_EmptyACIDRejectsBeforeRegistration keeps malformed AC
+// online messages out of acConnectionMap. The revocation proof engine treats an
+// already-enqueued live conn without ACId as RevocationUntrackable, so the
+// registration path must reject empty ACId before such a conn can become live.
+func TestHandleACOnline_EmptyACIDRejectsBeforeRegistration(t *testing.T) {
+	publisher := metrics.NewPublisherForTest(t)
+	s := &UdpServer{
+		metrics:         publisher,
+		acPeerMap:       map[string]*core.UdpPeer{},
+		acConnectionMap: map[string][]*ACConn{},
+	}
+	body, err := json.Marshal(common.ACOnlineMsg{ACId: "   "})
+	if err != nil {
+		t.Fatalf("marshal ACOnlineMsg: %v", err)
+	}
+	ppd := &core.PacketParserData{
+		SenderTrxId:  43,
+		HeaderType:   core.NHP_AOL,
+		BodyMessage:  body,
+		RemotePubKey: testPubkey(7),
+		ConnData: &core.ConnectionData{
+			RemoteAddr:           &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 4567},
+			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+		},
+	}
+
+	err = s.HandleACOnline(ppd)
+	if !errors.Is(err, common.ErrServerACOpsFailed) {
+		t.Fatalf("HandleACOnline empty ACId err=%v, want ErrServerACOpsFailed", err)
+	}
+	counters, _ := publisher.CountersForTest(t)
+	if got := counters[MetricACRegistrationFailure]; got != 1 {
+		t.Fatalf("%s = %v, want 1", MetricACRegistrationFailure, got)
+	}
+	if got := counters[MetricACRegistrationSuccess]; got != 0 {
+		t.Fatalf("%s = %v, want 0", MetricACRegistrationSuccess, got)
+	}
+	if got := len(s.acConnectionMap); got != 0 {
+		t.Fatalf("acConnectionMap len = %d, want 0", got)
+	}
+	if got := len(s.acPeerMap); got != 0 {
+		t.Fatalf("acPeerMap len = %d, want 0", got)
 	}
 }
 

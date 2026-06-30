@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"slices"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -150,6 +151,26 @@ func (mp *Publisher) CountersForTest(t testing.TB) (counters map[string]float64,
 		dimCounters[k] = v.value
 	}
 	return counters, dimCounters
+}
+
+// LatenciesForTest returns a deep copy of the in-memory latency observations
+// (metric name → recorded millisecond samples), as accumulated by RecordLatency
+// between flushes. Intended only for external-package tests that need to assert
+// a specific latency value was recorded by code under test (e.g. the
+// revocation-delivery-latency SLO histogram, #2792) without going through the
+// EMF/statistic-set serialization. Mirrors CountersForTest / GaugesForTest.
+func (mp *Publisher) LatenciesForTest(t testing.TB) map[string][]float64 {
+	t.Helper()
+	if mp == nil {
+		return map[string][]float64{}
+	}
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	out := make(map[string][]float64, len(mp.latencies))
+	for k, v := range mp.latencies {
+		out[k] = slices.Clone(v)
+	}
+	return out
 }
 
 // GaugesForTest collects registered gauge functions and returns a snapshot of

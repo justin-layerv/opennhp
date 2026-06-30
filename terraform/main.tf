@@ -2568,6 +2568,11 @@ module "qurl_service" {
   enable_qurl_agent_bootstrap = var.enable_qurl_agent_bootstrap
   nhp_server_public_key_b64   = module.compute.server_public_key_b64
   nhp_server_host             = module.compute.nlb_dns_name
+  qurl_browser_relay_base_url = (
+    var.qurl_link_js_agent_enabled && var.deploy_relay && var.relay_dns_name != ""
+    ? "https://${var.relay_dns_name}"
+    : ""
+  )
   # nhp_server_port is intentionally NOT threaded from a root variable.
   # The port is a code-level constant (62206) hardcoded in three places —
   # `modules/compute/main.tf` (UDP TG), `modules/ac/main.tf` (AC
@@ -5090,7 +5095,8 @@ module "relay" {
   secrets_kms_key_arn = module.kms.secrets_key_arn
 
   # #2631 CORS: the relay's only cross-origin caller is the qURL KNOCK PORTAL
-  # (qurl.link/#at_xxx) — the page that POSTs the browser knock. Derived from the
+  # (qurl.link/#qv1... in JS-agent mode; legacy #at_ during rollout) — the page
+  # that POSTs the browser knock. Derived from the
   # portal domain var (not hardcoded). The resource domains (*.qurl.site, custom
   # whitelabel) are the data plane — direct connect through the AC, never the relay
   # — so they are deliberately NOT here. The relay echoes the matched origin, never

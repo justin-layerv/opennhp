@@ -128,6 +128,17 @@ resource "terraform_data" "qurl_bootstrap_chain_inputs" {
   }
 }
 
+resource "terraform_data" "qurl_browser_relay_inputs" {
+  count = var.qurl_browser_relay_base_url != "" ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.nhp_server_public_key_b64 != ""
+      error_message = "qurl_browser_relay_base_url requires nhp_server_public_key_b64 so qurl-service can embed the NHP server identity into qv1 qURL bootstrap fragments."
+    }
+  }
+}
+
 # SSM parameter for image tag - created with default, updated by CI
 # The CI pipeline updates this parameter after pushing a new image to ECR.
 # Using lifecycle ignore_changes so CI updates don't cause drift.
@@ -433,8 +444,13 @@ locals {
     # var.enable_qurl_agent_bootstrap tfvars flip per environment —
     # matches the established dark-launch pattern in this tree
     # (deploy_frps, deploy_qurl_service, deploy_bootstrap_alb).
-    var.deploy_qurl_bootstrap_chain ? [
+    var.deploy_qurl_bootstrap_chain || var.qurl_browser_relay_base_url != "" ? [
       { name = "NHP_SERVER_PUBLIC_KEY_B64", value = var.nhp_server_public_key_b64 },
+    ] : [],
+    var.qurl_browser_relay_base_url != "" ? [
+      { name = "QURL_BROWSER_RELAY_BASE_URL", value = var.qurl_browser_relay_base_url },
+    ] : [],
+    var.deploy_qurl_bootstrap_chain ? [
       { name = "NHP_SERVER_HOST", value = var.nhp_server_host },
       { name = "NHP_SERVER_PORT", value = var.nhp_server_port },
       { name = "QURL_AGENT_BOOTSTRAP_ENABLED", value = var.enable_qurl_agent_bootstrap ? "true" : "false" },

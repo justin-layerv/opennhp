@@ -76,6 +76,43 @@ func (f *fakeResourcesQuerier) putDynamicQURLWithTTL(resourceID, aspID, acID, re
 	f.putWithTTL(qurlDynamicCustomerIDForResourceID(resourceID), resourceID, aspID, acID, resourceFQDN, destHost, destPort, openTime, ttl)
 }
 
+// testResourceKey* is one real, round-trippable qURL v2 resource-key vector
+// shared by the resource-key tests: an ECC_NIST_P256 public key as unpadded
+// base64url DER SPKI (91-byte DER, the canonical KMS shape), and the true
+// lowercase-hex SHA-256 of those decoded DER bytes. P1b never decodes these
+// (it is a dumb carrier, so any string would exercise the pass-through), but
+// using a genuine vector lets the P3/P4 verification tests — which WILL decode
+// and re-hash — reuse it verbatim instead of regenerating one.
+const (
+	testResourceKeyB64  = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAErTmtDfRQQU6zbjsG04rIJtHFISPccQqjN2KJblO20ckMWro05BbgXXRTmgSDiQyaT_nrogq3wKT3fp5VtFgopQ"
+	testResourceKeyHash = "137ea1a638b0bf4c9fd0fde230a75f6dee9a667bb20643499205ae729d21bfa1"
+)
+
+// stampResourceKeyOnLastRow adds the qURL v2 protected-resource public-key
+// attributes (resource_public_key_b64 / resource_public_key_hash) to the most
+// recently written row in customerID's partition, mirroring how qurl-service
+// (P1a) writes them onto an otherwise-normal catalog row at mint. Shared by the
+// dynamic (direct GetItem) and static (Query) put helpers below. Follows the
+// same create-then-stamp-under-lock pattern as putWithTTL.
+func (f *fakeResourcesQuerier) stampResourceKeyOnLastRow(customerID, pubKeyB64, pubKeyHash string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rows := f.rowsByCust[customerID]
+	if len(rows) == 0 {
+		return
+	}
+	row := rows[len(rows)-1]
+	row["resource_public_key_b64"] = &types.AttributeValueMemberS{Value: pubKeyB64}
+	row["resource_public_key_hash"] = &types.AttributeValueMemberS{Value: pubKeyHash}
+}
+
+// putDynamicQURLWithResourceKey emits a dynamic q_ direct row (read via the
+// GetItem path) that also carries the resource-key attributes.
+func (f *fakeResourcesQuerier) putDynamicQURLWithResourceKey(resourceID, aspID, acID, resourceFQDN, destHost string, destPort, openTime int, ttl int64, pubKeyB64, pubKeyHash string) {
+	f.putDynamicQURLWithTTL(resourceID, aspID, acID, resourceFQDN, destHost, destPort, openTime, ttl)
+	f.stampResourceKeyOnLastRow(qurlDynamicCustomerIDForResourceID(resourceID), pubKeyB64, pubKeyHash)
+}
+
 // putWithPortSuffix emits the port_suffix attribute explicitly. Use it
 // for per-AZ rows where tests need to distinguish false from legacy
 // rows that omit the attribute entirely.
@@ -465,6 +502,14 @@ func putTunnelServerRow(q *fakeResourcesQuerier, resourceID string) {
 	q.put(nhpSystemCustomerID, resourceID, "agent", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
 }
 
+// putTunnelServerRowWithResourceKey is putTunnelServerRow plus the qURL v2
+// resource-key attributes, so a static (Query-path) row can be proven to
+// surface them too.
+func putTunnelServerRowWithResourceKey(q *fakeResourcesQuerier, resourceID, pubKeyB64, pubKeyHash string) {
+	putTunnelServerRow(q, resourceID)
+	q.stampResourceKeyOnLastRow(nhpSystemCustomerID, pubKeyB64, pubKeyHash)
+}
+
 // TestResourceLookup_CacheMissThenHit asserts the standard flow:
 // first lookup queries DDB; second lookup is a cache hit (no extra
 // Query) and the applier is invoked exactly once.
@@ -661,6 +706,99 @@ func TestResourceLookup_LookupResourceDirectCacheExpiresAtRowTTL(t *testing.T) {
 	}
 	if got := q.callCount(); got != 2 {
 		t.Fatalf("DDB calls after row ttl expiry = %d, want 2", got)
+	}
+}
+
+// TestResourceLookup_LookupResourceSurfacesResourceKey proves the qURL v2
+// (P1b) read side: when a dynamic q_ catalog row carries the protected-
+// resource public-key attributes qurl-service (P1a) writes, the direct
+// GetItem path surfaces them verbatim on common.ResourceData for later
+// admission phases. This is a pass-through: the test asserts only that the
+// exact stored strings survive the read — it does NOT decode the key or
+// recompute the hash (validation is a later phase, and the hash derivation
+// is owned by the qurl-service writer).
+func TestResourceLookup_LookupResourceSurfacesResourceKey(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+
+	// Opaque to P1b (used only to prove byte-exact pass-through), but a real
+	// vector — see testResourceKeyB64/Hash.
+	pubKeyB64, pubKeyHash := testResourceKeyB64, testResourceKeyHash
+	q.putDynamicQURLWithResourceKey("q_123456789ab", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, now.Add(time.Hour).Unix(), pubKeyB64, pubKeyHash)
+
+	res, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+	if err != nil {
+		t.Fatalf("LookupResource err: %v", err)
+	}
+	if got := res.ResourcePublicKeyB64; got != pubKeyB64 {
+		t.Errorf("ResourcePublicKeyB64 = %q, want %q", got, pubKeyB64)
+	}
+	if got := res.ResourcePublicKeyHash; got != pubKeyHash {
+		t.Errorf("ResourcePublicKeyHash = %q, want %q", got, pubKeyHash)
+	}
+	// The key must not perturb the rest of the row shape.
+	if !res.SkipAuth {
+		t.Error("res.SkipAuth = false, want true")
+	}
+	if got := res.Resources["q_123456789ab"].ACId; got != "dynamic-ac" {
+		t.Errorf("ACId = %q, want %q", got, "dynamic-ac")
+	}
+}
+
+// TestResourceLookup_LookupResourceTolerantOfMissingResourceKey proves the
+// read stays backward-compatible: a legacy / feature-off row (written before
+// P1a, so carrying neither resource-key attribute) still decodes and
+// resolves, surfacing empty key fields rather than failing the tolerant
+// UnmarshalMap. putDynamicQURLWithTTL omits both attributes, mirroring those
+// rows exactly.
+func TestResourceLookup_LookupResourceTolerantOfMissingResourceKey(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+	q.putDynamicQURLWithTTL("q_123456789ab", "qurl", "dynamic-ac", "dynamic.example", "dynamic.example", 8443, 300, now.Add(time.Hour).Unix())
+
+	res, err := l.LookupResource(context.Background(), "qurl", "q_123456789ab")
+	if err != nil {
+		t.Fatalf("LookupResource err: %v", err)
+	}
+	if got := res.ResourcePublicKeyB64; got != "" {
+		t.Errorf("ResourcePublicKeyB64 = %q, want empty for a keyless row", got)
+	}
+	if got := res.ResourcePublicKeyHash; got != "" {
+		t.Errorf("ResourcePublicKeyHash = %q, want empty for a keyless row", got)
+	}
+	if got := res.Resources["q_123456789ab"].ACId; got != "dynamic-ac" {
+		t.Errorf("ACId = %q, want %q (keyless row must still resolve)", got, "dynamic-ac")
+	}
+}
+
+// TestResourceLookup_QueryPathSurfacesResourceKey proves the static (Query)
+// lookup path surfaces the resource key too. The surfacing logic is shared
+// (resourceDataFromRow feeds both paths), so this complements the direct-path
+// SurfacesResourceKey test by exercising the second caller of that function
+// end-to-end via LookupAuthServiceProvider.
+func TestResourceLookup_QueryPathSurfacesResourceKey(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	pubKeyB64, pubKeyHash := testResourceKeyB64, testResourceKeyHash
+	putTunnelServerRowWithResourceKey(q, "qurl-tunnel-server", pubKeyB64, pubKeyHash)
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
+	if err != nil {
+		t.Fatalf("LookupAuthServiceProvider err: %v", err)
+	}
+	group, ok := asp.ResourceGroups["qurl-tunnel-server"]
+	if !ok {
+		t.Fatalf("ResourceGroups missing qurl-tunnel-server; got %v", aspKeys(asp))
+	}
+	if got := group.ResourcePublicKeyB64; got != pubKeyB64 {
+		t.Errorf("ResourcePublicKeyB64 = %q, want %q", got, pubKeyB64)
+	}
+	if got := group.ResourcePublicKeyHash; got != pubKeyHash {
+		t.Errorf("ResourcePublicKeyHash = %q, want %q", got, pubKeyHash)
 	}
 }
 

@@ -110,6 +110,252 @@ After the L3 flush-on-expiry work in `endpoints/ac/expiry_scheduler.go` (nhp#216
 
 For the rollout phase, the L3 flush runs *alongside* the L7 `/authorize` enforcement (defense-in-depth). After 4+4 weeks of side-by-side validation, the L7 layer can be removed and L3 flush becomes the sole enforcement boundary. The scheduler's fail-closed admission semantic (UdpAC refuses new NHP-AOPs when the scheduler's circuit breaker is open) is sized for that end-state — see `SCHEDULER_SCALING.md` for the SLO contract.
 
+## eBPF/XDP map types and capacity (AC-side L3 enforcement)
+
+This section is the source of truth for the BPF map declarations in
+`nhp/ebpf/xdp/nhp_ebpf_xdp.c`, per the action item in
+[nhp#2163](https://github.com/layervai/nhp/issues/2163) (BPF-map item).
+
+> **Scope note.** These maps are the *eBPF/XDP* `FilterMode` of the AC. Under
+> `FilterMode=0` (iptables/ipset — the production default at time of writing)
+> they are never loaded, so the contents of this section are **inert in prod**
+> until the eBPF FilterMode flip. The L7 `/authorize` layer (above) is
+> orthogonal and unaffected.
+
+### Map-type invariant: authoritative allow-rules MUST be `HASH`, never `LRU_HASH`
+
+The XDP program (`xdp_white_prog`) decides admission by looking up
+**allow-rule maps** — five on the non-ICMP fall-through path, plus
+`icmpwhitelist` on the separate ICMP branch (six in total). A packet that
+matches no conntrack entry falls through to these maps; an entry's presence
+(with `allowed==1` and unexpired `expire_time`) **is** the kernel's
+authorization decision. They are therefore *authoritative*, not a cache:
+
+| Map | Key | Role |
+|---|---|---|
+| `spp` (whitelist) | src+dst+dport+proto | full 4-tuple allow-rule |
+| `src_port` | src+dport | source + destination-port allow-rule |
+| `sdwhitelist` | src+dst | source + destination allow-rule |
+| `port_list` | src+port-range | source + port-range allow-rule |
+| `protocol_port` | proto+dport | protocol + destination-port allow-rule |
+| `icmpwhitelist` | src+dst | ICMP allow-rule |
+
+All six are `BPF_MAP_TYPE_HASH`.
+
+**Why not `LRU_HASH`:** an LRU map silently evicts the least-recently-used
+entry when it reaches `max_entries`. For an authoritative allow-rule map that
+means inserting the *N+1*-th admission silently **evicts an already-admitted
+session's allow-rule** — its next packet finds no allow-rule and is dropped.
+The symptom is "a random session was killed" (#2163), and the admitted set
+becomes non-deterministic, so you can no longer reason about what is
+authorized. That breaks the security model.
+
+`HASH` instead returns `-E2BIG` from the kernel on an insert into a full map.
+The AC's user-space insertion path (`nhp/utils/ebpf/ebpf.go`,
+`EbpfRuleAdd` → `Add*Rule`) surfaces that as an explicit error, which the AC
+admission path (`endpoints/ac/msghandler.go`) treats as a **fail-CLOSED**
+event: it refuses to insert the *new* allow-rule (and emits a loud map-full
+metric/log naming the full map, see below) rather than silently revoking an
+*existing* one. Refreshing an *existing* allow-rule still succeeds on a full map
+(an update needs no new slot), so session re-authorization is unaffected — only
+genuinely-new rule insertions past capacity fail.
+
+**What "fail-closed" guarantees here (precisely).** The load-bearing property is
+*no silent eviction of an admitted session, and any allow-rule tuple that fails
+to insert is fail-closed at the datapath* (an absent rule never admits → next
+packet on that tuple `XDP_DROP`s). It is **not** "an admission is rejected as one
+atomic unit," because the call sites have two shapes:
+
+- **Single-rule sites** (e.g. `spp`/`sdwhitelist`/`protocol_port`) log the
+  `-E2BIG` and **return**, so the whole admission is refused.
+- **CIDR / port-range expansion sites** (the `src_port`/`port_list` temp-access
+  handlers, and the later `icmpwhitelist` path in
+  `endpoints/ac/msghandler.go`) log the per-tuple `-E2BIG` and **continue** the
+  per-IP loop — deliberately, so the rest of the range still gets its rules. If
+  the map fills mid-range the result is a **partial** allow-rule set: inserted
+  tuples pass, un-inserted tuples drop. Still fail-closed (no tuple is silently
+  admitted), just not all-or-nothing. Each per-tuple failure is individually
+  metered (`MetricEbpfMapFull`) and logged.
+
+Either way no *existing* admitted session is evicted — which is the whole point
+of the `LRU_HASH`→`HASH` change.
+
+**`conn_track` and `conn_track_v6` are also `HASH` (#2814).** They are
+per-flow established-connection caches that the datapath populates (with
+`BPF_ANY`) only *after* an allow-rule match; a conntrack hit short-circuits to
+`XDP_PASS`. The old "they are only caches, so LRU eviction is benign" argument
+is true only while the shared allow-rule still exists. It fails after a
+surgical revoke:
+
+- `endpoints/ac/revocation_index.go` `flushEntryNow` first does a **coarse**
+  `Scheduler.RescheduleEarlier` on the shared allow-rule for the `FlowKey`
+  ("COARSE first: bar re-open in every mode... additive, never gated by the
+  surgical outcome"), with no `tokenStore` ref-count against other live
+  admissions sharing that `FlowKey`.
+- `surgicalFlushFlowKey` / `surgicalFlushFlowKeyV6` then delete only the revoked
+  5-tuples and deliberately leave same-allow-tuple siblings alive (#2784).
+- A spared sibling's established flow then survives solely via its conntrack
+  entry. If the conntrack map were `LRU_HASH`, memory pressure could evict that
+  typically idle/cold sibling entry; the next packet would miss conntrack, find
+  the now-removed allow-rule absent, and `XDP_DROP`. That reopens the collateral
+  over-flush #2784 fixed.
+
+The decision is therefore **option 1 from
+[nhp#2814](https://github.com/layervai/nhp/issues/2814)**: use
+`BPF_MAP_TYPE_HASH` for both established-flow caches. At capacity a new/uncached
+flow's cache insert returns `-E2BIG`; the XDP datapath has no user-space error
+channel, and the `BPF_ANY` update result is intentionally not verdict-bearing.
+Correctness still holds: if an allow-rule matches, the packet returns
+`XDP_PASS`; it simply remains uncached and pays the full allow-rule scan on each
+packet until a cache slot is made available. If no allow-rule matches, it still
+`XDP_DROP`s. Expired quiet conntrack entries are not proactively scavenged
+today, so a full HASH cache can stay saturated if dead/quiet entries accumulate;
+that makes #2813's sizing, conntrack-specific saturation signal, and explicit
+quiet-entry reclamation strategy a hard E5 flip prerequisite. The real-kernel
+regression proof is
+`TestConnTrackFullHashCacheMissFallsBackToAllowRule`, which shrinks
+`conn_track`, fills it, and verifies exactly that full-cache slow-path behavior
+without evicting an existing established entry.
+
+This removes the E5 flip blocker in #2814. The remaining capacity concern is
+operational sizing, reclamation, and alarm coverage: a full conntrack HASH map
+is a performance cliff for new/uncached flows, not a fail-open or
+collateral-kill condition. Sizing stays coupled to `max_entries`, instance type,
+and the E5 flip-readiness work tracked in
+[nhp#2813](https://github.com/layervai/nhp/issues/2813).
+
+### Capacity / `max_entries` sizing and kernel-memory cost
+
+`MAX_ENTRIES` is **1,000,000** (uniform across all maps) at time of writing.
+#2163 targets 1M+ concurrent sessions and floats sizing each map at 2× the
+8M ipset ceiling (i.e. 16M). **We deliberately do *not* adopt 16M**, and the
+type fix above is independent of the eventual ceiling. The kernel-memory math
+is why.
+
+BPF `HASH` maps **preallocate** all element + bucket memory at map-creation
+(load) time by default (no `BPF_F_NO_PREALLOC`), and that memory is
+**unswappable kernel memory**. The model (per `kernel/bpf/hashtab.c`):
+`bytes ≈ max_entries × (≈48 B htab_elem + round_up(key,8) + round_up(value,8) + ≈16 B bucket)`;
+`LRU_HASH` adds ≈16 B/entry for the LRU list node.
+
+| `MAX_ENTRIES` | Total across all 7 maps | Feasible on prod AC (`c6i.xlarge`, 8 GB)? |
+|---|---|---|
+| 1,000,000 (current) | **≈ 0.66 GB** | yes |
+| 2,000,000 (2× headroom) | **≈ 1.31 GB** | yes, but tight alongside ipset + tokenStore |
+| 16,000,000 (#2163's floated 2×-of-8M) | **≈ 10.5 GB** | **no — exceeds total instance RAM** |
+
+(Per-map breakdown is reproducible from the struct sizes in
+`nhp_ebpf_xdp.c`; the dominant maps are `conn_track` at ≈120 MB/1M entries and
+`spp` at ≈96 MB/1M entries.)
+
+**AC-instance-RAM implication.** Prod ACs are `c6i.xlarge` (8 GB);
+sandbox ACs are `t3.medium` (4 GB) — see `terraform/modules/ac/main.tf`.
+A 16M sizing (~10.5 GB) is physically impossible on either: the AC would fail
+to load the `.o` at boot. Even 2M (~1.31 GB) is a meaningful fraction of an
+8 GB box that *also* carries the 8M ipset (~640 MB, #2163 item 1) and the
+in-memory `tokenStore` (~500 MB at 1M sessions, #2163 item 3) and the Go
+heap. The correct `max_entries` is therefore **coupled to the AC
+instance-type decision (#2163 item 3)** — it cannot be chosen in isolation.
+
+**Decision for this slice:** keep `MAX_ENTRIES = 1,000,000`. The HASH map-type
+security fix is correct and shippable at any size, and is inert in prod
+(iptables FilterMode) until the eBPF flip. The `max_entries` bump is a
+separate, flip-time concern that must be co-decided with the instance-type
+review; the recommended target is **2M (not 16M)** unless instance RAM grows,
+and any bump must re-run the memory math above against the chosen instance
+type. Tracked as a concrete flip-time task in
+[nhp#2813](https://github.com/layervai/nhp/issues/2813) (under #2163 item 2).
+
+#### IPv6 maps: `MAX_ENTRIES_V6` (separate, right-sized ceiling)
+
+The IPv6 allow-rule + conntrack maps (added in the E2 IPv6
+slice — `spp_v6`, `src_port_v6`, `icmp_wl_v6`, `sdwhitelist_v6`,
+`port_list_v6` as `HASH`, and `conn_track_v6` as `HASH`) are sized by a
+**separate** `MAX_ENTRIES_V6`, deliberately **not** reused from `MAX_ENTRIES`.
+The production knock NLB is **IPv4-only**, so v6 enforcement scale is far smaller
+than v4 today; sizing the v6 maps at the v4 1M ceiling would preallocate ~0.5 GB
+of unswappable kernel memory for a near-empty workload. `MAX_ENTRIES_V6` is
+**131072 (128K, a power of two)** — a comfortable near-term v6 ceiling.
+
+Kernel-memory cost, using the same preallocation model as above (the
+`htab_elem + round_up(key,8) + round_up(value,8) + bucket` formula, `LRU_HASH`
++≈16 B/entry). The v6 keys (asserted packed sizes in `nhp_ebpf_xdp.c`) all reuse
+the IP-agnostic 16 B `*_value` types (`round_up(16,8)=16`); `conn_track_v6`
+reuses the 40 B `conn_value`. (`MB` below is decimal, 10⁶ B; ≈89 MiB binary.)
+
+| Map | Type | Key (packed → `round_up/8`) | B/entry | At 131072 |
+|---|---|---|---|---|
+| `spp_v6` | HASH | 35 → 40 | 120 | ≈ 15.7 MB |
+| `src_port_v6` | HASH | 18 → 24 | 104 | ≈ 13.6 MB |
+| `icmp_wl_v6` | HASH | 32 → 32 | 112 | ≈ 14.7 MB |
+| `sdwhitelist_v6` | HASH | 32 → 32 | 112 | ≈ 14.7 MB |
+| `port_list_v6` | HASH | 20 → 24 | 104 | ≈ 13.6 MB |
+| **5 HASH allow-rule maps** | | | **552** | **≈ 72.3 MB** |
+| `conn_track_v6` | HASH | 38 → 40 | 144 | ≈ 18.9 MB |
+| **Total (6 v6 maps)** | | | | **≈ 91 MB** |
+
+≈91 MB is trivial on an 8 GB `c6i.xlarge` (or even the 4 GB `t3.medium`
+sandbox) AC. There is deliberately **no `protocol_port_v6` map**: the
+`protocol_port` key (`{dst_port, protocol}`) carries no IP address, so a
+proto+dst-port allow-rule is IP-family-agnostic — the existing v4
+`protocol_port` map is reused for v6 (one entry admits the proto+port for both
+families), saving a map and a duplicate write path. Like the v4 `MAX_ENTRIES`
+bump, any `MAX_ENTRIES_V6` change is flip-time work that must re-run this math
+against the chosen instance type, co-decided under
+[nhp#2813](https://github.com/layervai/nhp/issues/2813).
+
+> **Guarantee gap — the C↔Go struct-size contract is not yet enforced in CI.**
+> The v6 key/tuple sizes are pinned with inline `_Static_assert`s in
+> `nhp_ebpf_xdp.c`, but **no CI job compiles that translation unit** (the `.o` is
+> committed; `ubuntu-build.yml` is `branches:[main]`-gated and does not run
+> `make ebpf`, and the BPF target is unavailable on the macOS dev host). So the
+> asserts only fire on a manual `make ebpf` regen, and the size contract that
+> slice 2's Go serializers + golden-byte tests and slice 6's
+> `map.KeySize() == GoSize` test depend on is, for now, locally-verified rather
+> than CI-gated. Wiring a lightweight compile/size-harness gate (and, for
+> symmetry, committed-object freshness coverage beyond the `ipv4_ct_tuple`
+> KeySize/ELF-symbol check added for #2818) is tracked in
+> [nhp#2823](https://github.com/layervai/nhp/issues/2823).
+
+> **IPv6 extension-header policy.** `xdp_white_prog_v6` walks a bounded IPv6
+> extension-header chain before admission: Hop-by-Hop Options, Routing,
+> Destination Options, Mobility, and AH advance with per-header `data_end`
+> checks, up to the fixed verifier-friendly cap in `nhp_ebpf_xdp.c`. If the
+> resolved upper layer is `TCP`/`UDP`/`ICMPv6`, the packet enters the normal
+> allow-rule cascade with the resolved protocol and L4 offset. Routing-header
+> security policy (for example RH0 / `segments-left`) is deliberately delegated
+> to the kernel stack after `XDP_PASS`; XDP only classifies through the header to
+> preserve the admission decision.
+>
+> The parser still fails closed for anything it cannot safely classify:
+> Fragment headers, ESP, No Next Header, unknown protocols, truncated headers,
+> and chains longer than the cap all drop and emit a v6 DENY event with ports
+> set to zero. Fragment remains a deliberate deny policy, not an accidental
+> parser gap: non-first fragments do not carry the L4 ports that the XDP
+> allow-rule and conntrack keys need, so admitting fragmented flows safely needs
+> fragment-aware state rather than treating the first fragment as sufficient.
+> That follow-up is tracked in
+> [nhp#2865](https://github.com/layervai/nhp/issues/2865).
+>
+> Before the E5 v6 XDP flip, verifier acceptance of the accumulated-offset
+> parser must also be re-run on the minimum supported AC kernel; that rollout
+> check is tracked in [nhp#2869](https://github.com/layervai/nhp/issues/2869).
+
+### Fail-closed observability (`MetricEbpfMapFull`)
+
+When an allow-rule map insert returns `-E2BIG`, the AC increments the
+`EbpfMapFull` metric (`endpoints/ac/registration.go`) and logs a loud
+fail-closed security event (`endpoints/ac/msghandler.go`,
+`(*UdpAC).ebpfRuleAddFailClosed`). A non-zero rate means the AC is rejecting
+*new* admissions because an allow-rule map is at capacity — i.e. the eBPF
+capacity ceiling has been reached and admissions are being denied (fail-closed,
+not silently evicting). **At the eBPF FilterMode flip (E5) this metric needs a
+CloudWatch alarm** (`terraform/modules/ac/monitoring.tf`, mirroring the
+`MetricUDPHandlerPanic` alarm) — until then "loud" is log + emitted-metric
+only, with no paging. Tracked in
+[nhp#2813](https://github.com/layervai/nhp/issues/2813). This is inert in prod
+under iptables FilterMode (the map is never loaded, so the metric never fires).
+
 ## Alternative considered: stateless signed cookie
 
 **Shape:** NHP server mints a signed cookie `{resource_id, client_ip, session_id, expires_at}` with HMAC at resolve time. `qurl-router` verifies signature + expiry + client_ip locally on every request. No qurl-service call on the data path.

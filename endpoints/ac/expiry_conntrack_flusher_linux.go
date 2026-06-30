@@ -53,12 +53,20 @@ type ConntrackFlusher struct {
 	// claimed "caps fork+exec stalls" but was never wired into the
 	// exec.CommandContext call. Removed as dead code.
 	binary string // resolved path to the `conntrack` binary
-	// metricSkipped counts non-IPv4 keys silently no-op'd at
-	// Flush entry. Symmetric with BpfFlusher.metricSkipped so the
-	// two flushers stay operationally observable. Unreachable in
-	// production (iptables-mode call sites only produce v4 keys);
-	// non-zero reading means an upstream regression let a v6 key
-	// reach here.
+	// metricSkipped counts non-IPv4 keys no-op'd at Flush entry
+	// (conntrack -D is IPv4-only — see Flush). Symmetric with
+	// BpfFlusher.metricSkipped so the two flushers stay operationally
+	// observable. This counter is CONFLATED — it cannot tell apart:
+	//   - a benign scheduled-expiry v6 leak (the original intent), and
+	//   - a v6 IMMEDIATE revoke: flushEntryNow's coarse RescheduleEarlier
+	//     reschedules a revoked v6 key into this flusher, where it lands
+	//     here too (#2794). That case is a real (declared out-of-scope
+	//     until #2165 netlink) immediate-revocation gap, NOT a benign skip.
+	// Because of that conflation the revocation path does NOT rely on this
+	// counter: flushEntryNow ticks the dedicated MetricRevocationIPv6HardFail
+	// for v6 revokes directly. So a non-zero reading here means EITHER a v6
+	// revoke (cross-check MetricRevocationIPv6HardFail) OR — if that revoke
+	// metric is flat — an upstream regression scheduling a v6 expiry key.
 	metricSkipped atomic.Uint64
 }
 
@@ -89,10 +97,12 @@ func NewConntrackFlusher() (*ConntrackFlusher, error) {
 }
 
 // SkippedCount returns the number of non-IPv4 keys this flusher
-// has silently no-op'd. A non-zero reading indicates an upstream
-// regression scheduling v6 keys under FilterMode_IPTABLES — the
-// conntrack invocation is IPv4-only by design. Symmetric with
-// BpfFlusher.SkippedCount for the metric publisher.
+// has no-op'd (the conntrack invocation is IPv4-only by design).
+// This is the CONFLATED counter described on metricSkipped: a
+// non-zero reading is a v6 immediate revoke (cross-check
+// MetricRevocationIPv6HardFail, #2794) OR — if that revoke metric is
+// flat — an upstream regression scheduling a v6 expiry key. Symmetric
+// with BpfFlusher.SkippedCount for the metric publisher.
 func (f *ConntrackFlusher) SkippedCount() uint64 {
 	return f.metricSkipped.Load()
 }
@@ -137,13 +147,17 @@ func (f *ConntrackFlusher) Flush(ctx context.Context, key FlowKey) error {
 	// admits v6 by design (parseIPTo16 stores both families); the
 	// constraint lives at the flusher boundary, matching the
 	// BpfFlusher symmetric guard in expiry_bpf_flusher_linux.go.
-	// This branch should be unreachable today (production sites
-	// only schedule v4); if it ever fires, an upstream regression
-	// let a v6 key reach here — Warning + no-op rather than
-	// silent breaker trip.
+	// This branch IS reachable for a v6 IMMEDIATE revoke: flushEntryNow's
+	// coarse RescheduleEarlier pulls a revoked v6 key here (#2794). That
+	// is a declared out-of-scope gap (v6 teardown needs the #2165 netlink
+	// flusher), already surfaced loudly via MetricRevocationIPv6HardFail at
+	// the revoke site — so here we just no-op (Warning, no breaker trip).
+	// A v6 *expiry* key reaching here with the revoke metric flat instead
+	// signals an upstream regression scheduling v6 expiries. metricSkipped
+	// conflates the two; see its godoc.
 	if !isIPv4Mapped(key.SrcIP) || !isIPv4Mapped(key.DstIP) {
 		f.metricSkipped.Add(1)
-		log.Warning("[ConntrackFlusher] non-IPv4 key %s reached IPv4-only conntrack flusher — upstream regression? Schedule leaked (silently no-op'd; tracked in metricSkipped)", key)
+		log.Warning("[ConntrackFlusher] non-IPv4 key %s reached IPv4-only conntrack flusher — v6 immediate revoke (declared out of scope until #2165; see MetricRevocationIPv6HardFail) or an upstream v6-expiry schedule leak (no-op'd; tracked in metricSkipped)", key)
 		return nil
 	}
 	srcIP := key.SrcIPString()

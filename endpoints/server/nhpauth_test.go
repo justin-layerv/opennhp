@@ -538,6 +538,183 @@ func TestIsQurlRelayBootstrapKnock_NarrowBypass(t *testing.T) {
 	}
 }
 
+// TestIsQurlV2ClaimsKnock recognizes the qURL v2 signed-claims knock DISTINCTLY
+// from the qv1 access-token bootstrap. The qv2 knock carries the signed claims +
+// issuer signature blobs in encrypted UserData and — unlike qv1 — its ResourceId
+// is the protected-resource public key, NOT the "qurl-bootstrap" sentinel, so the
+// predicate must not depend on that sentinel.
+func TestIsQurlV2ClaimsKnock(t *testing.T) {
+	rawPubkey := decodeB64(t, pubkeyB64(0x42))
+	validPPD := &core.PacketParserData{
+		HeaderType:   core.NHP_KNK,
+		RemotePubKey: rawPubkey,
+	}
+	// A qv2 knock's ResourceId is the resource public key (base64url), not the
+	// sentinel. Use a representative non-sentinel value to prove the predicate
+	// does not key on "qurl-bootstrap".
+	const resourceKeyID = "cmVzb3VyY2Uta2V5LWlk"
+	v2UserData := map[string]any{
+		QurlV2ClaimsUserDataKey:    "eyJ2IjoyfQ",
+		QurlV2IssuerSigUserDataKey: "c2lnbmF0dXJlLWJsb2I",
+	}
+
+	tests := []struct {
+		name string
+		ppd  *core.PacketParserData
+		knk  *common.AgentKnockMsg
+		want bool
+	}{
+		{
+			name: "valid qv2 claims knock with resource-key resource id",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    resourceKeyID,
+				UserData:      v2UserData,
+			},
+			want: true,
+		},
+		{
+			name: "qv1 bootstrap token alone is not a qv2 claims knock",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    qurlRelayBootstrapResourceID,
+				UserData: map[string]any{
+					qurlAccessTokenUserDataKey: "at_1234567890123456789012",
+				},
+			},
+			want: false,
+		},
+		{
+			name: "renegotiation knock is not a qv2 claims knock",
+			ppd:  &core.PacketParserData{HeaderType: core.NHP_RKN, RemotePubKey: rawPubkey},
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    resourceKeyID,
+				UserData:      v2UserData,
+			},
+			want: false,
+		},
+		{
+			name: "non qurl asp is not a qv2 claims knock",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: "agent",
+				ResourceId:    resourceKeyID,
+				UserData:      v2UserData,
+			},
+			want: false,
+		},
+		{
+			name: "empty authenticated pubkey is not a qv2 claims knock",
+			ppd:  &core.PacketParserData{HeaderType: core.NHP_KNK},
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    resourceKeyID,
+				UserData:      v2UserData,
+			},
+			want: false,
+		},
+		{
+			name: "missing signature blob is not a qv2 claims knock",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    resourceKeyID,
+				UserData:      map[string]any{QurlV2ClaimsUserDataKey: "eyJ2IjoyfQ"},
+			},
+			want: false,
+		},
+		{
+			name: "missing claims blob is not a qv2 claims knock",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    resourceKeyID,
+				UserData:      map[string]any{QurlV2IssuerSigUserDataKey: "c2ln"},
+			},
+			want: false,
+		},
+		{
+			name: "empty-string claims blob is not a qv2 claims knock",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    resourceKeyID,
+				UserData: map[string]any{
+					QurlV2ClaimsUserDataKey:    "   ",
+					QurlV2IssuerSigUserDataKey: "c2ln",
+				},
+			},
+			want: false,
+		},
+		{
+			name: "non-string claims blob is not a qv2 claims knock",
+			ppd:  validPPD,
+			knk: &common.AgentKnockMsg{
+				AuthServiceId: qurlRelayBootstrapAuthServiceID,
+				ResourceId:    resourceKeyID,
+				UserData: map[string]any{
+					QurlV2ClaimsUserDataKey:    map[string]any{"nested": true},
+					QurlV2IssuerSigUserDataKey: "c2ln",
+				},
+			},
+			want: false,
+		},
+		{
+			name: "nil message is not a qv2 claims knock",
+			ppd:  validPPD,
+			knk:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isQurlV2ClaimsKnock(tt.ppd, tt.knk); got != tt.want {
+				t.Errorf("isQurlV2ClaimsKnock() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsQurlRelaySelfAuthKnock asserts the combined predicate that gates the
+// HandleKnockRequest DDB agent-key skip recognizes BOTH the qv1 bootstrap token
+// knock and the qv2 signed-claims knock, and rejects anything that is neither.
+func TestIsQurlRelaySelfAuthKnock(t *testing.T) {
+	rawPubkey := decodeB64(t, pubkeyB64(0x42))
+	validPPD := &core.PacketParserData{HeaderType: core.NHP_KNK, RemotePubKey: rawPubkey}
+
+	qv1 := &common.AgentKnockMsg{
+		AuthServiceId: qurlRelayBootstrapAuthServiceID,
+		ResourceId:    qurlRelayBootstrapResourceID,
+		UserData:      map[string]any{qurlAccessTokenUserDataKey: "at_1234567890123456789012"},
+	}
+	qv2 := &common.AgentKnockMsg{
+		AuthServiceId: qurlRelayBootstrapAuthServiceID,
+		ResourceId:    "cmVzb3VyY2Uta2V5LWlk",
+		UserData: map[string]any{
+			QurlV2ClaimsUserDataKey:    "eyJ2IjoyfQ",
+			QurlV2IssuerSigUserDataKey: "c2lnbmF0dXJlLWJsb2I",
+		},
+	}
+	neither := &common.AgentKnockMsg{
+		AuthServiceId: qurlRelayBootstrapAuthServiceID,
+		ResourceId:    "r_steady00000",
+	}
+
+	if !isQurlRelaySelfAuthKnock(validPPD, qv1) {
+		t.Error("qv1 bootstrap knock must be recognized as self-auth")
+	}
+	if !isQurlRelaySelfAuthKnock(validPPD, qv2) {
+		t.Error("qv2 claims knock must be recognized as self-auth")
+	}
+	if isQurlRelaySelfAuthKnock(validPPD, neither) {
+		t.Error("a plain steady-state knock must NOT be recognized as self-auth")
+	}
+}
+
 // TestResolveAgentPeerForKnock_AddsToCoreDevice asserts that the
 // resolved peer is registered with core.Device's peer map (via
 // AddAgentPeer), so subsequent packets that go through the noise

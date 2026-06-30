@@ -6,6 +6,7 @@ runbook file is added, renamed, or removed.
 - [Create a QURL via the API](create-qurl.md)
 - [Custom-domain cert DNS ownership alarms](custom-domain-cert-dns-ownership.md)
 - [Renew a LayerV-owned domain](domain-renewal.md)
+- [eBPF committed-object freshness](ebpf-committed-object-freshness.md)
 - [ECR cross-account replication failure](ecr-replication-failure.md)
 - [F5 revoked-pubkey alarm](f5-revoked-pubkey-paging.md)
 - [FRPS Cloud Map routing policy flip](frps-cloud-map-routing-policy.md)

@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -1297,4 +1298,239 @@ func TestDeriveSourceAddr(t *testing.T) {
 			t.Errorf("ip = %s, want global rightmost 203.0.113.7 across all XFF lines (attacker first line 9.9.9.9 must NOT win)", got.IP)
 		}
 	})
+}
+
+// ============================================================================
+// qURL v2 relay-routing invariant (regression guards)
+//
+// The qURL v2 design (docs/design/QURL_V2_KEYED_IDENTITY.md, "Current Code
+// Reality -> NHP" and Migration Plan Phase 0) depends on the relay staying
+// "boring": POST /relay/{serverId} routes ONLY by the cell NHP-server static
+// public-key fingerprint and forwards an OPAQUE inner NHP packet it cannot read.
+// These two tests lock the parts of that invariant not already fenced above:
+//
+//   - TestRelay_RoutesOnlyByPubKeyFingerprint: routing is keyed strictly by the
+//     per-cell fingerprint (scope: "routes ONLY by fingerprint" + unknown -> 404).
+//   - TestRelay_DispatchesByCounterNeverDecryptsInner: the relay reads only the
+//     cleartext counter and materially cannot decrypt the inner body (scope:
+//     "dispatches by fingerprint + counter only, never decrypts the inner").
+//
+// The complementary halves are already covered and intentionally NOT repeated
+// here: verbatim opaque forwarding (RelayForwardMsg.InnerPacket byte-equality)
+// is asserted by TestRelay_TrustedHeaderForwardStampsAttestedRightmostXFF, and
+// counter-keyed ACK dispatch by TestRelay_DispatchToConcurrentWaiters /
+// TestRelay_SameClientSameCounter_NoOverwrite.
+// ============================================================================
+
+// newTwoCellTestRelay builds a relay configured for two distinct cells, each
+// routed to its own UDP backend, and returns the relay plus both backend
+// sockets. Cells have distinct static keys, so utils.PubKeyFingerprint gives
+// each a distinct {serverId}. It mirrors newTestRelay's variadic-option shape;
+// callers pass extra testRelayOptions on top of the shortened ACK-wait below.
+func newTwoCellTestRelay(t *testing.T, pubA, pubB []byte, opts ...testRelayOption) (rs *RelayServer, backendA, backendB *net.UDPConn) {
+	t.Helper()
+	backendA = mustRelayUDPListener(t)
+	backendB = mustRelayUDPListener(t)
+	cfg := &Config{
+		PrivateKeyBase64: base64.StdEncoding.EncodeToString(keyBytes(0x80)),
+		UDPListenAddr:    "127.0.0.1:0",
+		SourceAddrMode:   SourceAddrModeRemoteAddr,
+		Servers: []ServerConfig{
+			{Name: "cell-a", PubKeyBase64: base64.StdEncoding.EncodeToString(pubA), Host: "127.0.0.1", Port: backendA.LocalAddr().(*net.UDPAddr).Port},
+			{Name: "cell-b", PubKeyBase64: base64.StdEncoding.EncodeToString(pubB), Host: "127.0.0.1", Port: backendB.LocalAddr().(*net.UDPAddr).Port},
+		},
+	}
+	rs, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Shorten the ACK-wait (these tests assert on the forwarded NHP_RLY datagram,
+	// not the ACK leg — no listener replies here — so the handler must not block
+	// on the 5s default), then apply caller options. All run before
+	// startBackground so the fields are settled before any reader.
+	for _, opt := range append([]testRelayOption{withTestRelayResponseTimeout(200 * time.Millisecond)}, opts...) {
+		opt(rs)
+	}
+	rs.startBackground()
+	t.Cleanup(func() { testStop(rs) })
+	return rs, backendA, backendB
+}
+
+// mustRelayUDPListener binds a localhost UDP socket and closes it at test end.
+// (relay_test.go has no shared UDP-listener helper; the server package's
+// mustUDPListener is in a different package.)
+func mustRelayUDPListener(t *testing.T) *net.UDPConn {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// gotDatagram reports whether a datagram lands on conn within timeout. A relay
+// forward is one NHP_RLY datagram, so its arrival (or absence) on a given
+// backend is the ground truth for where handleRelay routed the request.
+func gotDatagram(t *testing.T, conn *net.UDPConn, timeout time.Duration) bool {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 65536)
+	_, _, err := conn.ReadFromUDP(buf)
+	if err == nil {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	t.Fatalf("ReadFromUDP: %v", err)
+	return false
+}
+
+// TestRelay_RoutesOnlyByPubKeyFingerprint locks the qURL v2 routing invariant:
+// POST /relay/{serverId} selects the backend STRICTLY by the per-cell static
+// public-key fingerprint. Two cells (A, B) are addressable only by their own
+// fingerprints, and a structurally-valid fingerprint for an unconfigured key is
+// a 404 (no backend) — the same fail-closed behavior as a garbage serverId.
+//
+// Concretely this catches a future regression to first-server-wins or any
+// cross-cell leak (fp(A) reaching cell B, or vice versa) that the single-cell
+// TestRelay_RoundTrip and the garbage-string TestRelay_UnknownServer_404 would
+// both still pass. (The map is keyed on the exact fingerprint string, so a
+// prefix/substring match isn't a plausible regression to guard separately.)
+func TestRelay_RoutesOnlyByPubKeyFingerprint(t *testing.T) {
+	pubA := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	pubB := devicePubKey(t, core.NHP_SERVER, keyBytes(0x41))
+	fpA := utils.PubKeyFingerprint(pubA)
+	fpB := utils.PubKeyFingerprint(pubB)
+	if fpA == fpB {
+		t.Fatal("distinct cell keys produced the same fingerprint; test cannot discriminate")
+	}
+	// A structurally-valid fingerprint for a key that is NOT configured.
+	fpUnconfigured := utils.PubKeyFingerprint(devicePubKey(t, core.NHP_SERVER, keyBytes(0x42)))
+
+	rs, backendA, backendB := newTwoCellTestRelay(t, pubA, pubB)
+
+	// post drives handleRelay synchronously (it returns within responseTimeout —
+	// 200ms here — once it has forwarded and parked on the ACK wait that never
+	// arrives, or immediately for a 404) and returns the recorder, so each case
+	// can both observe where the datagram landed and assert the final status. The
+	// inner knock is built for pubA but its bytes are irrelevant to routing — the
+	// relay dispatches on the URL fingerprint, never the packet contents.
+	innerKnock := makeInnerKnock(t, pubA, 1234)
+	post := func(serverID string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerKnock))
+		req.RemoteAddr = "203.0.113.7:44444"
+		w := httptest.NewRecorder()
+		rs.handleRelay(w, req)
+		return w
+	}
+
+	// noDatagramWait bounds the "expected NO datagram" checks. handleRelay forwards
+	// to the backend synchronously BEFORE it parks on the ACK wait, so by the time
+	// post() returns any same-request datagram (including a cross-cell leak) is
+	// already queued on the backend socket — a short wait is sufficient and avoids
+	// burning responseTimeout on every negative assertion. Positive checks below
+	// keep a generous ceiling since they only ever wait when something is wrong.
+	const noDatagramWait = 50 * time.Millisecond
+
+	// NOTE: these subtests share backendA/backendB and MUST stay sequential —
+	// each positive check drains the one datagram its POST produced before the
+	// next subtest posts. Do NOT add t.Parallel() here: parallel subtests would
+	// race the drains and let one subtest's datagram satisfy another's check.
+	t.Run("fingerprint A routes to backend A only", func(t *testing.T) {
+		post(fpA)
+		if !gotDatagram(t, backendA, time.Second) {
+			t.Error("backend A received no datagram for fp(A); request was not routed to cell A")
+		}
+		if gotDatagram(t, backendB, noDatagramWait) {
+			t.Error("backend B received a datagram for fp(A); routing leaked across cells")
+		}
+	})
+
+	t.Run("fingerprint B routes to backend B only", func(t *testing.T) {
+		post(fpB)
+		if !gotDatagram(t, backendB, time.Second) {
+			t.Error("backend B received no datagram for fp(B); request was not routed to cell B")
+		}
+		if gotDatagram(t, backendA, noDatagramWait) {
+			t.Error("backend A received a datagram for fp(B); routing leaked across cells")
+		}
+	})
+
+	t.Run("valid but unconfigured fingerprint is 404 and forwards nothing", func(t *testing.T) {
+		w := post(fpUnconfigured)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404 for a valid fingerprint of an unconfigured key", w.Code)
+		}
+		// Drain BOTH backends unconditionally — evaluate each before asserting so a
+		// datagram on A doesn't short-circuit (||) the read on B and leave B's
+		// socket buffered for a later reader.
+		leakedA := gotDatagram(t, backendA, noDatagramWait)
+		leakedB := gotDatagram(t, backendB, noDatagramWait)
+		if leakedA || leakedB {
+			t.Errorf("an unconfigured fingerprint forwarded a datagram (A=%v, B=%v); it must select no backend", leakedA, leakedB)
+		}
+	})
+}
+
+// TestRelay_DispatchesByCounterNeverDecryptsInner locks the second half of the
+// qURL v2 opacity invariant: the relay dispatches by the inner packet's
+// CLEARTEXT counter and CANNOT read the encrypted inner body (the qURL/knock
+// semantics). It asserts both directions on the relay's own code paths:
+//
+//   - innerCounter(inner) returns the agent's counter, read from the cleartext
+//     header WITHOUT decryption (RecvPrecheck parses the header only); and
+//   - the relay's NHP_RELAY device cannot decrypt the inner packet — it is
+//     sealed to the cell SERVER's static key, not the relay's, so PacketToMsg
+//     fails. The relay literally lacks the key to read qURL claims.
+//
+// Verbatim opaque forwarding of those same bytes is fenced by
+// TestRelay_TrustedHeaderForwardStampsAttestedRightmostXFF; counter-keyed reply
+// dispatch by TestRelay_DispatchToConcurrentWaiters. Together they cover
+// "dispatches by fingerprint + counter only, never decrypts the inner packet".
+func TestRelay_DispatchesByCounterNeverDecryptsInner(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
+
+	const counter = uint64(0xC0FFEE)
+	inner := makeInnerKnock(t, serverPub, counter)
+
+	// 1. The relay reads the counter from the cleartext header — no decryption.
+	got, err := rs.innerCounter(inner)
+	if err != nil {
+		t.Fatalf("innerCounter returned error for a well-formed inner knock: %v", err)
+	}
+	if got != counter {
+		t.Errorf("innerCounter = %#x, want %#x (the counter is the only inner field the relay reads)", got, counter)
+	}
+
+	// 2. The relay's NHP_RELAY device cannot decrypt the inner packet: it is
+	// sealed agent->server (to serverPub), so the relay key cannot open it. A
+	// successful decrypt here would mean the relay could read qURL claims —
+	// exactly what the design forbids.
+	//
+	// Assert the SPECIFIC cryptographic failure (ErrHeaderDigestCheckFailed —
+	// "HMAC validation failed", a stable named error). The HMAC is keyed by the
+	// agent<->server ECDH secret the relay does not possess, so the integrity
+	// check fails before any body decryption. Pinning this error (rather than
+	// "any error") proves the relay is rejected at the crypto layer, not by an
+	// incidental confound like peer-not-configured.
+	pkt := &core.Packet{Content: append([]byte(nil), inner...)}
+	ppd, derr := rs.device.PacketToMsg(&core.PacketData{
+		BasePacket: pkt,
+		ConnData:   &core.ConnectionData{Device: rs.device, RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206}},
+		InitTime:   time.Now().UnixNano(),
+	})
+	if derr == nil {
+		t.Fatalf("relay device decrypted an inner packet sealed to the server key (header=%s); the relay must NOT be able to read inner qURL/knock semantics",
+			core.HeaderTypeToString(ppd.HeaderType))
+	}
+	if !errors.Is(derr, core.ErrHeaderDigestCheckFailed) {
+		t.Errorf("relay decrypt failed with %v, want crypto-layer rejection %v (a non-crypto failure would make the no-decrypt guard pass for the wrong reason)",
+			derr, core.ErrHeaderDigestCheckFailed)
+	}
 }

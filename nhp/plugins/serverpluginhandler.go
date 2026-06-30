@@ -277,6 +277,27 @@ type NhpServerPluginHelper struct {
 	// THAT PATH — the lock-free read sees a stable snapshot.
 	//
 	AspData *common.AuthServiceProviderData
+
+	// ServerCellPublicKeyB64 is this NHP server's own static public key
+	// (the "cell public key" in qURL v2 terms), standard-base64 encoded —
+	// the same encoding the device emits for peer keys and the same the
+	// authenticated agent key (NhpAuthRequest.PublicKey) uses. The qURL v2
+	// admission path binds the signed claims' cell_public_key_b64 against
+	// this value (decoding both sides to raw bytes) so a qURL minted for a
+	// DIFFERENT cell cannot be admitted here. Empty when the host did not
+	// plumb it (hand-built test helpers); the qv2 admission path fails
+	// closed on an empty cell key.
+	ServerCellPublicKeyB64 string
+
+	// IncrCounter routes a counter increment through the host server's CloudWatch
+	// publisher (mirrors HttpServerPluginHelper, which carries the same emitter).
+	// The knock path runs qURL v2 admission (authWithNHPClaims), so admission-path
+	// counters such as MetricQurlV2RevocationHashError must be emitted through
+	// THIS helper to be live. Nil-safe: the publisher is not always plumbed
+	// (notably hand-built unit-test helpers), so callers must branch on `!= nil`
+	// rather than relying on a no-op default. (HttpServerPluginHelper also exposes
+	// RecordLatency; add it here when the knock path first records a latency.)
+	IncrCounter func(name string)
 }
 
 type HttpServerPluginHelper struct {

@@ -225,6 +225,74 @@ func TestParseQurlAPIURLValue(t *testing.T) {
 	}
 }
 
+func TestParseACFilterModeValue(t *testing.T) {
+	tests := []struct {
+		name    string
+		line    string
+		want    int
+		wantErr bool
+	}{
+		{
+			name: "iptables_with_spaces",
+			line: "FilterMode = 0",
+			want: acFilterModeIPTables,
+		},
+		{
+			name: "ebpfxdp_without_spaces",
+			line: "FilterMode=1",
+			want: acFilterModeEBPFXDP,
+		},
+		{
+			name: "trim_surrounding_whitespace",
+			line: "  FilterMode = 1  ",
+			want: acFilterModeEBPFXDP,
+		},
+		{
+			name: "trailing_inline_toml_comment",
+			line: "FilterMode = 1 # EBPFXDP",
+			want: acFilterModeEBPFXDP,
+		},
+		{
+			name: "lowercase_key_matches_ac_parser",
+			line: "filtermode = 1",
+			want: acFilterModeEBPFXDP,
+		},
+		{
+			name:    "missing_equals",
+			line:    "FilterMode 1",
+			wantErr: true,
+		},
+		{
+			name:    "wrong_key",
+			line:    "OtherMode = 1",
+			wantErr: true,
+		},
+		{
+			name:    "non_integer",
+			line:    "FilterMode = EBPFXDP",
+			wantErr: true,
+		},
+		{
+			name:    "unsupported_mode",
+			line:    "FilterMode = 2",
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseACFilterModeValue(tc.line)
+			switch {
+			case tc.wantErr && err == nil:
+				t.Fatalf("expected error for line %q, got nil (got=%d)", tc.line, got)
+			case !tc.wantErr && err != nil:
+				t.Fatalf("unexpected error for line %q: %v", tc.line, err)
+			case !tc.wantErr && got != tc.want:
+				t.Fatalf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSSMProbeNamedCommandsPassRejectList verifies that every named
 // probe's command string clears the reject-list. This catches the
 // regression where someone tightens the reject-list and accidentally
@@ -238,6 +306,9 @@ func TestSSMProbeNamedCommandsPassRejectList(t *testing.T) {
 		cmdDockerImageTag,
 		cmdSystemdNRestartsNhpServer,
 		cmdGrepQurlAPIURL,
+		cmdGrepACFilterMode,
+		cmdACEBPFXDPObjectPresent,
+		cmdACTCEgressObjectPresent,
 		fmt.Sprintf(cmdDigInternalQurlAPIFmt, benignHostname),
 		fmt.Sprintf(cmdCurlInternalQurlAPIFmt, benignHostname),
 		fmt.Sprintf(cmdCurlInternalQurlResolveFmt, benignHostname),

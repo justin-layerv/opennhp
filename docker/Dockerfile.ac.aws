@@ -13,14 +13,24 @@ WORKDIR /nhp-server
 # -o Acquire::Retries=3 + short timeout so a transient APT mirror
 # outage retries instead of failing the whole Docker build. This
 # stage uses deb.debian.org (golang:bookworm base) but the flags
-# are mirror-agnostic — the runtime stage's ubuntu:24.04 apt calls
+# are mirror-agnostic — the runtime stage's ubuntu:26.04 apt calls
 # apply the same hardening. Real CI flake: see run 24548987311
 # (2026-04-17), archive.ubuntu.com outage in the runtime stage.
+# clang + llvm compile the eBPF objects (make ebpf-objects, below);
+# libbpf-dev supplies the <bpf/bpf_helpers.h>, <bpf/bpf_core_read.h>,
+# and <bpf/bpf_endian.h> headers the eBPF C sources #include (the
+# vendored vmlinux.h is in-tree, but those three are angle-bracket
+# system includes resolved from /usr/include/bpf/). Without libbpf-dev
+# the eBPF compile fails with "bpf/bpf_helpers.h: file not found". This
+# whole toolchain lives only in the AC builder stage — docker/Dockerfile.server
+# (server/relay) builds via `make serverd`, which never triggers the
+# clang-required eBPF path, so clang stays out of the non-AC build deps.
 RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
     apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
     make \
     clang \
     llvm \
+    libbpf-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files first (better layer caching)
@@ -42,8 +52,21 @@ RUN cd endpoints && go mod download
 # Copy source code
 COPY . .
 
-# Build the AC
-RUN make init acd
+# Build the AC binary plus the eBPF object files.
+#
+# `ebpf-objects` compiles the eBPF objects with clang/llvm (installed in
+# this builder stage above); they ride into the runtime image via the
+# `release/nhp-ac` COPY below so the AC's boot-time load path is satisfied
+# for a later FilterMode=EBPFXDP flip (eBPF-mode-adoption epic). Today
+# FilterMode defaults to 0 (iptables), so the objects ship but stay
+# unused — this image change is a runtime no-op until the flip slice.
+#
+# Goal order matters: `init` runs `git clean -df release` FIRST, so it
+# must stay ahead of `acd` and `ebpf-objects` — both populate
+# release/nhp-ac/etc/ and a reorder putting init last would wipe their
+# output. (The runtime guard below would catch a wiped .o, but only at
+# image-build time.)
+RUN make init acd ebpf-objects
 
 # Stage 2: Runtime image with Traefik
 FROM ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64 AS runtime
@@ -77,14 +100,6 @@ ENV AWS_REGION=""
 # All runtime apt packages in one layer:
 #   ca-certificates, iptables, ipset, curl, file, supervisor — base
 #   gettext-base — provides envsubst used by the entrypoint script below
-#
-# The trailing `rm -f /usr/bin/pebble` strips Canonical's pebble service
-# manager — an unused Go binary the ubuntu base bakes into /usr/bin that ships
-# HIGH CVEs (stale golang.org/x/net + Go stdlib) and fails the trivy image scan.
-# The container execs its own binary via ENTRYPOINT, never pebble. The `rm -f` is
-# deliberately idempotent — it no-ops if a future base digest drops or relocates
-# pebble; trivy is the backstop, so do NOT replace it with a `test -f` guard
-# (that would break the build the day the base image is fixed upstream). #2800.
 RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ubuntu.com|//azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
     grep -q azure.archive.ubuntu.com /etc/apt/sources.list.d/ubuntu.sources || \
         { echo "ERROR: ubuntu.sources mirror substitution failed — file format may have changed"; exit 1; } && \
@@ -97,8 +112,29 @@ RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ub
     file \
     supervisor \
     gettext-base \
+    # Pull libssl3t64 + openssl-provider-legacy explicitly so `install` upgrades
+    # them from the pinned base's 3.5.5-1ubuntu3 to >= 3.5.5-1ubuntu3.2, which
+    # fixes CVE-2026-45447 (openssl PKCS7_verify heap UAF, HIGH). We patch the
+    # package in this layer rather than bumping the base digest because the
+    # patched ubuntu:26.04 digest is still < the docker dep-age window
+    # (min_age_days=14); the apt layer is invisible to that check. Drop this once
+    # an age-compliant base digest ships the fix.
+    libssl3t64 \
+    openssl-provider-legacy \
+    # Fail the build loudly if the openssl upgrade didn't land (e.g. a stale
+    # mirror still serving 3.5.5-1ubuntu3) — otherwise the image would ship the
+    # CVE-2026-45447-vulnerable libssl while the build stays green.
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libssl3t64)" ge 3.5.5-1ubuntu3.2 \
+        || { echo "ERROR: libssl3t64 < 3.5.5-1ubuntu3.2 — CVE-2026-45447 not patched"; exit 1; } \
     && rm -rf /var/lib/apt/lists/* \
-    && rm -f /usr/bin/pebble
+    # Drop Canonical's Pebble service manager (a stray Go binary the ubuntu
+    # base ships in /usr/bin/pebble). We never invoke it — this image runs
+    # supervisord over nhp-acd + traefik — and it vendors an old
+    # golang.org/x/net + Go stdlib, so Trivy flags a cluster of HIGH CVEs
+    # against it (x/net CVE-2026-25680/25681/27136/39821/42502/42506 + stdlib
+    # CVE-2026-27145; newer base digests add more). Removing the binary clears
+    # the whole gobinary scan target. See .trivyignore.
+    && rm -f /usr/bin/pebble && rm -rf /var/lib/pebble
 
 # Install Traefik v3 with retry logic for GitHub rate limits
 # 3.6.19 fixes CVE-2026-48020 (StripPrefix route-level auth bypass),
@@ -125,8 +161,27 @@ RUN set -ex && \
     chmod +x /usr/local/bin/traefik && \
     rm /tmp/traefik.tar.gz
 
-# Copy built AC binary and scripts
+# Copy built AC binary and scripts.
+# The /nhp-ac tree is what the prod boot path extracts via `docker cp`
+# (terraform/modules/ac/user_data.sh.tpl) into /opt/layerv/nhp-ac, which
+# is the nhp-acd systemd WorkingDirectory. So everything the AC reads at
+# a path relative to its cwd must live under /nhp-ac/ in this image.
 COPY --from=builder /nhp-server/release/nhp-ac /nhp-ac
+
+# Regression guard: fail the image build loudly if the eBPF objects are
+# absent (or empty) from /nhp-ac/etc/ — the path the AC loads them from
+# (source of truth: endpoints/ac/ebpf/ebpfegine.go, resolved relative to the
+# cwd established by the COPY comment above). A future edit that drops the
+# builder's `ebpf-objects` step, or a Makefile change to the EBPF_OBJ_*
+# output paths, would otherwise silently ship an image that boot-fails
+# the AC the moment FilterMode is flipped to EBPFXDP. `test -s` (not `-f`)
+# so a zero-byte / truncated object also fails the guard — a clang failure
+# already aborts the earlier `make ... ebpf-objects` step, so this is
+# defense-in-depth against a future build that produces an empty file. No
+# `|| true` / `2>/dev/null` — the guard exits non-zero and aborts the build.
+RUN test -s /nhp-ac/etc/nhp_ebpf_xdp.o && test -s /nhp-ac/etc/tc_egress.o \
+    || { echo "ERROR: eBPF object(s) missing or empty in /nhp-ac/etc/ — the AC will boot-fail under FilterMode=EBPFXDP. Did the builder's 'make ... ebpf-objects' step get dropped, did the Makefile EBPF_OBJ_* output paths change, or did the compile emit an empty object? (load path: endpoints/ac/ebpf/ebpfegine.go bpfDir=\"etc\")"; exit 1; }
+
 COPY --from=builder /nhp-server/docker/iptables_defaults_ubuntu.sh /iptables_defaults_ubuntu.sh
 COPY --from=builder /nhp-server/docker/iptables_defaults_x86.sh /iptables_defaults_x86.sh
 

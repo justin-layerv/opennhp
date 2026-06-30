@@ -71,6 +71,7 @@ body:
         - admin
         - db
         - nhp
+        - ebpf
         - internalauth
         - terraform
         - docker

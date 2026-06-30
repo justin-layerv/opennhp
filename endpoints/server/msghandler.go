@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -336,6 +337,63 @@ const (
 	MetricACRegistrationLatency = "ACRegistrationLatency"
 	MetricBroadcastPartialFail  = "BroadcastPartialFail"
 	MetricBroadcastDurationMs   = "BroadcastDurationMs"
+	// qURL v2 revocation fanout telemetry (P4e). The server receives a
+	// revocation event from qurl-service on /nhp/internal/revocation and pushes
+	// NHP_REV to the matching connected ACs fire-and-forget.
+	//
+	// MetricRevocationReceived counts events that pass the request-auth gate and
+	// validation (one per accepted POST, before fanout). MetricRevocationFanoutSent
+	// is the per-event count of ACs an NHP_REV was enqueued for (0 on a
+	// no-matching-AC no-op). MetricRevocationFanoutBackpressure fires when the
+	// shared send queue is full mid-fanout and the handler fails closed with 503
+	// so qurl-service's at-least-once Publisher retries; a nonzero value means
+	// the send pipeline is saturated and revocations are being deferred (page if
+	// sustained — a revoke is security-relevant and the retry budget is finite).
+	MetricRevocationReceived           = "RevocationReceived"
+	MetricRevocationFanoutSent         = "RevocationFanoutSent"
+	MetricRevocationFanoutBackpressure = "RevocationFanoutBackpressure"
+	// MetricRevocationAckReceived counts NHP_RACK acks the server received from
+	// ACs (proof-of-delivery, P4e Slice 3 #2793), one per validated ack whose
+	// AC identity resolved from the authenticated connection pubkey. Pairs with
+	// the AC's MetricRevocationAckSent across the fleet.
+	MetricRevocationAckReceived = "RevocationAckReceived"
+	// MetricRevocationAckUnresolved counts NHP_RACK acks the server could not
+	// attribute to a known AC connection (the authenticated pubkey matched no
+	// live ACConn). A spike means acks are arriving from connections the server
+	// no longer tracks (a drop/reconnect race) — the ack is ignored (the pending
+	// tracker, once added, is keyed by the resolved acId), and the revoke either
+	// already cleared or will age out.
+	MetricRevocationAckUnresolved = "RevocationAckUnresolved"
+	// MetricRevocationAgedOut counts pending per-AC revokes the server gave up
+	// retrying because they were never acked before the age-out deadline — a
+	// revoke that could NOT be proven delivered. THIS IS THE DE-RISK #5
+	// DEGRADED SIGNAL: any nonzero value is an immediate-revocation that the
+	// control plane could not confirm reached the AC. It is emitted (never a
+	// silent drop) so it can be alarmed. Wired by the retry/age-out engine
+	// (deferred — see #2793 design).
+	MetricRevocationAgedOut = "RevocationAgedOut"
+	// MetricRevocationUntrackable counts invariant breaks where a server already
+	// enqueued NHP_REV fanout to an AC connection but could not key that
+	// connection to an ACId or authenticated AC pubkey for proof tracking. This
+	// is distinct from MetricRevocationAgedOut: no retry deadline elapsed; the
+	// server simply cannot prove or redrive that enqueued target. Any nonzero
+	// value means the live-connection registry violated the identity invariants
+	// the proof engine depends on.
+	MetricRevocationUntrackable = "RevocationUntrackable"
+	// MetricRevocationDeliveryLatency is the revocation-latency SLO histogram
+	// (#2792): one observation, in milliseconds, per revoke that an AC acked —
+	// the wall-clock from the server enqueuing the NHP_REV (firstSentAt) to that
+	// AC's NHP_RACK being attributed (clearAck), recorded via metrics.RecordLatency.
+	// The SLO target, the "why 15s", the EMF-backs-p99 note, the complementary-
+	// signal relationship with MetricRevocationAgedOut, and the engine-armed
+	// emission coupling all live on RevocationDeliveryLatencyP99SLO
+	// (revocation_retry.go) — the one canonical home; the p99 alarm is
+	// revocation_delivery_latency_high in terraform/modules/monitoring/main.tf.
+	//
+	// Coverage boundary (load-bearing for any consumer): samples ACKED revokes
+	// ONLY. A never-delivered revoke is counted by MetricRevocationAgedOut, never
+	// added here, so the distribution is bounded below the age-out by construction.
+	MetricRevocationDeliveryLatency = "RevocationDeliveryLatency"
 	// QURL plugin resolve telemetry. The qurl plugin orchestrates the
 	// browser-side qurl.link → qurl.site redirect — token validate via
 	// qurl-service, NHP knock to AC, JWT cookie set, 302 redirect — and
@@ -509,6 +567,19 @@ const (
 	MetricQurlResolveBrowserTimeToSubmitMs     = "QurlResolveBrowserTimeToSubmitMs"
 	MetricQurlResolveBrowserRejectedMalformed  = "QurlResolveBrowserRejectedMalformed"
 	MetricQurlResolveBrowserRejectedOutOfRange = "QurlResolveBrowserRejectedOutOfRange"
+	// MetricQurlV2RevocationHashError fires when the qURL v2 admission path
+	// (buildV2ResourceData) fails to hash a VERIFIED claim key into its
+	// revocation-index digest. The keys already decoded during VerifyClaims, so
+	// this should be unreachable; if it ever fires, the admission still completes
+	// (we do not fail an already-committed, one-time-use admission over
+	// revocation-INDEX metadata — see buildV2ResourceData), but the resulting
+	// flow lands with an empty hash and is therefore invisible to P4b's targeted
+	// revocation, downgrading it to scheduled timer-wheel expiry only. A single
+	// log line is easy to miss in aggregate, so this counter makes the
+	// decode/hash regression alertable: a non-zero rate means admitted v2 flows
+	// are silently becoming un-revocable-by-key. Emitted on the knock-path helper
+	// (NewNhpServerHelper binds IncrCounter), so it is live on the real v2 path.
+	MetricQurlV2RevocationHashError = "QurlV2RevocationHashError"
 	// MetricLicenseValidationRateLimited fires from BOTH call sites:
 	// the hoisted preflight check (closes the F5 amplification
 	// surface) AND the deeper in-validateACLicense check. It's the
@@ -1191,6 +1262,14 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	}
 
 	acId := aolMsg.ACId
+	if strings.TrimSpace(acId) == "" {
+		log.Warning("server-ac(#%d@%s)[HandleACOnline] rejecting AC online with empty ACId", transactionId, addrStr)
+		s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrServerACOpsFailed, acId, addrStr, "missing-ac-id")
+		return common.ErrServerACOpsFailed
+	}
+	// Preserve non-empty ACId verbatim. Storage, acConnectionMap, and target
+	// lookups all key on the configured string; trimming here would be a live
+	// ungated identity change rather than a malformed-empty reject.
 
 	// Check if AC should be redirected to its assigned servers (per-AC server assignment).
 	// This only applies when storage is configured and AC provides a license key.

@@ -190,6 +190,40 @@ const (
 	// silently asserts on the wrong value. (`tail -1` would match
 	// systemd's resolution rule, but `|` is in the reject-list.)
 	cmdGrepQurlAPIURL = "grep -m1 '^QURL_API_URL=' " + nhpServerEnvFilePath
+
+	// acConfigFilePath is the infrastructure-rendered config file read
+	// by nhp-acd from its systemd WorkingDirectory. The deployed host
+	// path is the thing #2812 needs to fence, not the in-image path.
+	acConfigFilePath = "/opt/layerv/nhp-ac/etc/config.toml"
+
+	acEBPFXDPObjectPath  = "/opt/layerv/nhp-ac/etc/nhp_ebpf_xdp.o"
+	acTCEgressObjectPath = "/opt/layerv/nhp-ac/etc/tc_egress.o"
+
+	// cmdGrepACFilterMode reads the AC FilterMode line from the deployed
+	// host config. The eBPF object-layout smoke skips while this remains
+	// iptables mode and turns into a hard gate as soon as a deployed AC
+	// is actually running FilterMode=EBPFXDP. `-i` matches go-toml/v2's
+	// case-insensitive key binding, while parseACFilterModeValue still
+	// rejects the wrong key and non-numeric values. user_data renders
+	// config.toml with 0600 permissions; this follows the existing
+	// smoke-suite SSM convention that AWS-RunShellScript runs as root.
+	cmdGrepACFilterMode = "grep -im1 '^FilterMode[[:space:]]*=' " + acConfigFilePath
+
+	// These object checks probe the host-extracted AC tree, closing the
+	// docker-cp gap from #2812. `-s` matches the Dockerfile image guard:
+	// zero-byte objects are as load-breaking as absent objects. Keeping
+	// one named probe per object makes a hard-gate failure identify the
+	// exact missing or truncated file without shell chaining.
+	cmdACEBPFXDPObjectPresent  = "test -s " + acEBPFXDPObjectPath
+	cmdACTCEgressObjectPresent = "test -s " + acTCEgressObjectPath
+)
+
+const (
+	// Mirrors endpoints/ac/config.go FilterMode_IPTABLES/FilterMode_EBPFXDP.
+	// The smoke module intentionally does not import endpoints/, so unknown
+	// future mode values fail loud until this gate is revisited.
+	acFilterModeIPTables = 0
+	acFilterModeEBPFXDP  = 1
 )
 
 // rejectPatterns are the command substrings that must never appear in
@@ -503,6 +537,57 @@ func probeQurlAPIURL(ctx context.Context, instanceID string) (string, error) {
 		return "", classifyQurlAPIURLError(err)
 	}
 	return parseQurlAPIURLValue(out)
+}
+
+// probeACFilterMode reads the deployed AC config's FilterMode from
+// /opt/layerv/nhp-ac/etc/config.toml. user_data always renders this
+// line; if it ever disappears, that is config drift and the probe fails
+// loud rather than silently treating the host as iptables mode. It is
+// intentionally separate from the object-existence probe so the smoke
+// test can skip before E5 without masking missing-object failures once
+// EBPFXDP is live.
+func probeACFilterMode(ctx context.Context, instanceID string) (int, error) {
+	out, err := sendShellScript(ctx, instanceID, cmdGrepACFilterMode)
+	if err != nil {
+		return 0, fmt.Errorf("read AC FilterMode from %s: %w", acConfigFilePath, err)
+	}
+	return parseACFilterModeValue(out)
+}
+
+// probeACEBPFObjectsPresent asserts that the eBPF object files the AC
+// loads relative to its WorkingDirectory survived docker-cp extraction
+// into the deployed host layout.
+func probeACEBPFObjectsPresent(ctx context.Context, instanceID string) error {
+	if _, err := sendShellScript(ctx, instanceID, cmdACEBPFXDPObjectPresent); err != nil {
+		return fmt.Errorf("AC eBPF object presence check failed for deployed layout %s (missing, empty, unreadable, or SSM probe failure): %w", acEBPFXDPObjectPath, err)
+	}
+	if _, err := sendShellScript(ctx, instanceID, cmdACTCEgressObjectPresent); err != nil {
+		return fmt.Errorf("AC eBPF object presence check failed for deployed layout %s (missing, empty, unreadable, or SSM probe failure): %w", acTCEgressObjectPath, err)
+	}
+	return nil
+}
+
+func parseACFilterModeValue(line string) (int, error) {
+	line = strings.TrimSpace(line)
+	const filterModeKey = "FilterMode"
+	key, value, ok := strings.Cut(line, "=")
+	if !ok || !strings.EqualFold(strings.TrimSpace(key), filterModeKey) {
+		return 0, fmt.Errorf("unexpected AC config FilterMode line shape: %q", line)
+	}
+	value = strings.TrimSpace(value)
+	if beforeComment, _, hasComment := strings.Cut(value, "#"); hasComment {
+		value = strings.TrimSpace(beforeComment)
+	}
+	mode, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse AC FilterMode from %q: %w", line, err)
+	}
+	switch mode {
+	case acFilterModeIPTables, acFilterModeEBPFXDP:
+		return mode, nil
+	default:
+		return 0, fmt.Errorf("AC FilterMode = %d, want %d (iptables) or %d (EBPFXDP)", mode, acFilterModeIPTables, acFilterModeEBPFXDP)
+	}
 }
 
 // parseQurlAPIURLValue extracts the RHS of a "QURL_API_URL=..." env

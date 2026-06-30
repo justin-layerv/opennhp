@@ -3,9 +3,11 @@ package ac
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -13,6 +15,34 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/utils"
 	"github.com/OpenNHP/opennhp/nhp/utils/ebpf"
+)
+
+// NHP_REV (qURL v2 immediate-revocation) handler rejection sentinels. Returned
+// by HandleUdpACRevocation so the dispatch seam and tests can distinguish a
+// validation reject from an apply. All are fail-closed: the event is dropped
+// without calling ApplyRevocation, and each reject increments
+// MetricRevocationRejected.
+var (
+	// ErrRevocationUnsupportedScope is returned when an NHP_REV carries a scope
+	// that is not one of the wire scopes qurl-service emits (qurl/resource/
+	// session) — including the AC-internal-only "admission" dimension.
+	ErrRevocationUnsupportedScope = errors.New("unsupported revocation scope")
+	// ErrRevocationNegativeEpoch is returned when an NHP_REV carries a negative
+	// epoch, which would convert to a near-max uint64 and poison the apply
+	// watermark.
+	ErrRevocationNegativeEpoch = errors.New("negative revocation epoch")
+	// ErrRevocationEmptyScopeKey is returned when an NHP_REV carries an empty or
+	// prefix-only scope_key (e.g. "qurl:"). ApplyRevocation already no-ops an
+	// empty key, but a well-formed scope with no identity is a malformed event
+	// from a correct producer's perspective; rejecting it explicitly (rather than
+	// silently no-opping) keeps it on the counted-reject path so a producer bug is
+	// visible in the metric, not just absent from the flush counts.
+	ErrRevocationEmptyScopeKey = errors.New("empty revocation scope key")
+	// ErrRevocationScopeKeyPrefixMismatch is returned when the scope_key's
+	// "<scope>:" prefix disagrees with the event's scope field (e.g.
+	// scope="qurl" with scope_key="resource:..."). qurl-service builds the prefix
+	// from the same scope, so a mismatch is a malformed or forged event.
+	ErrRevocationScopeKeyPrefixMismatch = errors.New("revocation scope_key prefix does not match scope")
 )
 
 // IP pass mode
@@ -36,6 +66,82 @@ const (
 // about. Tuning down would require benchmarking ipset eviction
 // latency under load.
 const flushSafetyMargin = 50 * time.Millisecond
+
+// ebpfRuleAddFailClosed wraps ebpf.EbpfRuleAdd to give the eBPF allow-rule
+// insert path an explicit, LOUD fail-closed signal when a map is at capacity.
+//
+// The allow-rule maps are BPF_MAP_TYPE_HASH (#2163): a full map returns kernel
+// -E2BIG on insert of a NEW key rather than silently evicting an existing one
+// (the LRU_HASH bug). That error already propagates and every caller below acts
+// on it (never swallows it). This wrapper adds the security-relevant
+// observability the raw helper can't: a dedicated metric (MetricEbpfMapFull) and
+// a distinct, unambiguous log line naming the full map, so "an allow-rule map
+// hit its ceiling" is visible to operators and not buried under generic
+// insert-error noise. The error is returned unchanged so each caller's existing
+// control flow is preserved (never swallowed — admitted-but-not-enforced is a
+// security hole; never panicked).
+//
+// What the guarantee IS (and is NOT): the load-bearing property is "no silent
+// eviction of an admitted session, and any allow-rule tuple we fail to insert is
+// fail-closed at the datapath (no rule => XDP_DROP)." It is NOT "an admission is
+// rejected as one atomic unit." Two caller shapes differ:
+//   - Single-rule sites (e.g. mapType 1/2/6) log and RETURN on -E2BIG, so the
+//     whole admission is refused.
+//   - CIDR/range-expansion sites (mapType 4/5 temp-port handlers, and the later
+//     mapType 3 path) log and CONTINUE the per-IP loop — intentionally, so the
+//     rest of the range still gets rules. If the map fills mid-range the result
+//     is a PARTIAL allow-rule set: the inserted tuples pass, the un-inserted ones
+//     drop. That is still fail-closed (an absent rule never admits), just not
+//     all-or-nothing. The per-tuple failures are each logged + metered here.
+//
+// Inert under FilterMode_IPTABLES (the maps are never loaded), so this path
+// cannot fire in prod until the eBPF FilterMode flip (E5).
+func (a *UdpAC) ebpfRuleAddFailClosed(mapType int, params ebpf.EbpfRuleParams, ttlSec int) error {
+	return a.recordEbpfInsertResult(ebpf.EbpfRuleAdd(mapType, params, ttlSec), params, mapType)
+}
+
+// recordEbpfInsertResult is the detect-and-record half of
+// ebpfRuleAddFailClosed, split out so the map-full observability path is unit
+// testable without a kernel or pinned maps: a synthetic error wrapping
+// syscall.E2BIG drives the same branch the real kernel insert would. It bumps
+// MetricEbpfMapFull and emits the distinct fail-closed log on map-full, then
+// returns err UNCHANGED (never swallowed, never panicked) so the caller's
+// existing fail-closed control flow is preserved.
+func (a *UdpAC) recordEbpfInsertResult(err error, params ebpf.EbpfRuleParams, mapType int) error {
+	if ebpf.IsMapFull(err) {
+		a.incrMetric(MetricEbpfMapFull)
+		log.Error("[EbpfRuleAdd] ADMISSION FAIL-CLOSED: allow-rule eBPF map %q (mapType %d) full (-E2BIG) — refusing to insert this NEW allow-rule src: %s dst: %s; EXISTING admitted sessions are NOT evicted (#2163). Map at capacity (max_entries); see SESSION_ENFORCEMENT_ARCHITECTURE.md.", ebpf.MapTypeName(mapType), mapType, params.SrcIP, params.DstIP)
+	}
+	return err
+}
+
+// allPortsEbpfRuleParams builds the EbpfRuleParams for an "all ports"
+// (dstAddr.Port == 0) eBPF port_list admission for one source IP. It is the
+// SINGLE source of truth for the all-ports min/max sentinel, shared by the TCP
+// and UDP FilterMode_EBPFXDP branches in HandleAccessControl (which build
+// byte-identical params).
+//
+// DstPortStart MUST be 0 to match the XDP port_list lookup key, which is built
+// from the compile-time constants `.min_port = MIN_PORT(0), .max_port =
+// MAX_PORT(65535)` (nhp/ebpf/xdp/nhp_ebpf_xdp.c), NOT from the packet. The
+// inserter previously used DstPortStart=1, so the seeded key {src,1,65535} never
+// matched the lookup {src,0,65535} and every all-ports admission fail-closed
+// under FilterMode=EBPFXDP (#2843, v4 + v6). Centralizing the sentinel here lets
+// TestAllPortsEbpfRuleParams_Sentinel pin it so a regression back to 1 fails a
+// pure-Go test (the in-kernel TestIPv4AdmissionDatapathPortListAllPorts proves
+// the key→verdict half).
+//
+// ANY new all-ports port_list insert site MUST build its params through this
+// helper (not an inline EbpfRuleParams literal): the sentinel guard pins the
+// value this constructor returns, so a future site that inlines DstPortStart
+// would not be covered. Route it here to keep the guard load-bearing.
+func allPortsEbpfRuleParams(srcIPStr string) ebpf.EbpfRuleParams {
+	return ebpf.EbpfRuleParams{
+		SrcIP:        srcIPStr,
+		DstPortStart: 0,
+		DstPortEnd:   65535,
+	}
+}
 
 // computeFlushDeadline returns `now + openTimeSec + flushSafetyMargin`
 // — the single source of truth for the L3 flush deadline anchoring.
@@ -127,13 +233,54 @@ func (a *UdpAC) admitAndIssueToken(entry *AccessEntry, openTimeSec int, artMsgIn
 	defer func() {
 		if !cleaned {
 			a.cancelAllScheduledFlows(entry)
-			a.tokenStore.Delete(preMintedToken)
+			// deleteToken (Delete + revIndex deindex) preserves the
+			// cancel-first order; GenerateAccessToken indexed the entry via
+			// storeToken, so this panic-cleanup path must deindex too. No-op
+			// on the index for legacy / non-qURL-v2 entries.
+			a.deleteToken(preMintedToken, entry)
 		}
 	}()
 	artMsg, err = a.HandleAccessControl(entry, openTimeSec, artMsgIn)
 	a.emitOrCleanupPreMintedToken(artMsg, preMintedToken, entry)
 	cleaned = true
 	return
+}
+
+// accessEntryFromAOP maps a decoded NHP-AOP message onto the AccessEntry the AC
+// admits. Pure (no receiver, no side effects) so the field mapping — including
+// the qURL v2 revocation metadata carried by P4a — is unit-testable without the
+// kernel-write admission machinery.
+//
+// OwnerId (the server-resolved tenant identity, see common.AgentUser godoc) is
+// INTENTIONALLY not populated on the AC side: the NHP-AOP wire (dopMsg) carries
+// only the client-supplied fields, and the AC is not a consumer of
+// /nhp/internal/token/validate (which is where server-resolved OwnerId surfaces
+// downstream). A future contributor "fixing" this by guessing an OwnerId from
+// dopMsg would inject a non-authoritative value into the AC-side AgentUser and
+// break the field's "server-resolved-only" invariant. If the AC ever needs
+// OwnerId, extend the NHP-AOP wire to carry it from the resolved server state.
+func accessEntryFromAOP(dopMsg *common.ServerACOpsMsg) *AccessEntry {
+	return &AccessEntry{
+		User: &common.AgentUser{
+			UserId:         dopMsg.UserId,
+			DeviceId:       dopMsg.DeviceId,
+			OrganizationId: dopMsg.OrganizationId,
+			AuthServiceId:  dopMsg.AuthServiceId,
+		},
+		SrcAddrs: dopMsg.SourceAddrs,
+		DstAddrs: dopMsg.DestinationAddrs,
+		OpenTime: int(dopMsg.OpenTime),
+		// qURL v2 keyed-identity revocation metadata (P4a): stored verbatim from
+		// the AOP onto the access entry so P4b can index live flows for immediate
+		// revocation. Stored as received — NOT recomputed AC-side (see AccessEntry
+		// godoc). Zero-valued for legacy admissions, where the AOP omits them.
+		QurlUserPublicKeyHash: dopMsg.QurlUserPublicKeyHash,
+		ResourcePublicKeyHash: dopMsg.ResourcePublicKeyHash,
+		SessionId:             dopMsg.SessionId,
+		AdmissionId:           dopMsg.AdmissionId,
+		RevocationEpoch:       dopMsg.RevocationEpoch,
+		Deadline:              dopMsg.Deadline,
+	}
 }
 
 // HandleUdpACOperations processes a single NHP_AOP packet. Synchronous —
@@ -205,31 +352,8 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 		return
 	}
 
-	srcAddrs := dopMsg.SourceAddrs
-	dstAddrs := dopMsg.DestinationAddrs
 	openTimeSec := int(dopMsg.OpenTime)
-	// OwnerId (the server-resolved tenant identity, see common.AgentUser
-	// godoc) is INTENTIONALLY not populated on the AC side: the
-	// NHP-AOP wire (dopMsg) carries only the client-supplied fields,
-	// and the AC is not a consumer of /nhp/internal/token/validate
-	// (which is where server-resolved OwnerId surfaces downstream).
-	// A future contributor "fixing" this by guessing an OwnerId from
-	// dopMsg would inject a non-authoritative value into the
-	// AC-side AgentUser and break the field's "server-resolved-only"
-	// invariant. If the AC ever needs OwnerId, extend NHP-AOP wire
-	// to carry it from the resolved server-side state.
-	agentUser := &common.AgentUser{
-		UserId:         dopMsg.UserId,
-		DeviceId:       dopMsg.DeviceId,
-		OrganizationId: dopMsg.OrganizationId,
-		AuthServiceId:  dopMsg.AuthServiceId,
-	}
-	entry := &AccessEntry{
-		User:     agentUser,
-		SrcAddrs: srcAddrs,
-		DstAddrs: dstAddrs,
-		OpenTime: openTimeSec,
-	}
+	entry := accessEntryFromAOP(dopMsg)
 	artMsg, err = a.admitAndIssueToken(entry, openTimeSec, artMsg)
 	if err != nil {
 		log.Error("ac(%s#%d)[HandleUdpACOperations] HandleAccessControl failed, err: %v", acId, transactionId, err)
@@ -263,6 +387,263 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 	}
 
 	return nil
+}
+
+// wireRevocationScope maps a qurl-service revocation-event wire scope string to
+// the AC's internal revocationScope, returning ok=false for any scope the AC
+// does not apply locally. qurl-service emits four scopes ("qurl", "resource",
+// "session", "cell"); the AC applies only the first three. "cell" is a
+// server-side fanout selector with no AC-local index, so the AC drops it here
+// (its job is done once the server fans the event out to the cell's ACs); Slice 3
+// folds the explicit cell-drop + epoch conversion into a shared scopeFromWire.
+// The string VALUES are identical to the revocationScope constants by
+// construction (P4b mirrored qurl-service byte-for-byte, see revocation_index.go),
+// so this is an allowlist GATE, not a translation table — equal bytes in,
+// validated typed value out.
+//
+// The allowlist is load-bearing, not defensive boilerplate: a raw
+// revocationScope(s) cast would also accept "admission", and scopeAdmission is a
+// populated index dimension (scopeKeysForEntry stamps every admission with an
+// AdmissionId under it). An inbound scope=="admission" would therefore flush by
+// admission-id — a capability qurl-service never grants over the wire and the
+// design reserves for a future AC-internal cancel seam. Rejecting it (and the
+// server-only "cell") here keeps the AC apply path to qurl/resource/session only.
+func wireRevocationScope(s string) (revocationScope, bool) {
+	switch revocationScope(s) {
+	case scopeQurl, scopeResource, scopeSession:
+		return revocationScope(s), true
+	default:
+		return "", false
+	}
+}
+
+// bareScopeKey strips the "<scope>:" transport prefix qurl-service puts on its
+// scope_key ("<scope>:<identity>", see qurl-service
+// internal/revocation/scopekey.go) and returns the bare identity hash/id that
+// ApplyRevocation indexes on. The identity itself may legitimately contain ':'
+// (a session id is opaque), so only the single leading "<scope>:" is removed via
+// TrimPrefix — not a split on the last colon.
+//
+// It is the single source of truth for the malformed-key classification, so the
+// handler does not re-derive the prefix check: a non-nil error is the exact
+// reject sentinel to return —
+//   - ErrRevocationScopeKeyPrefixMismatch: a non-empty prefix that disagrees with
+//     scope (qurl-service always builds the prefix from the same scope, so this is
+//     a producer bug / forgery). Checked first so "" classifies as empty, not
+//     mismatch.
+//   - ErrRevocationEmptyScopeKey: an empty scopeKey or a prefix-only key ("qurl:")
+//     — no identity to act on.
+func bareScopeKey(scope revocationScope, scopeKey string) (bare string, err error) {
+	prefix := string(scope) + ":"
+	if scopeKey != "" && !strings.HasPrefix(scopeKey, prefix) {
+		return "", ErrRevocationScopeKeyPrefixMismatch
+	}
+	bare = strings.TrimPrefix(scopeKey, prefix)
+	if bare == "" {
+		return "", ErrRevocationEmptyScopeKey
+	}
+	return bare, nil
+}
+
+// HandleUdpACRevocation processes a single NHP_REV packet: a qURL v2 immediate-
+// revocation event the NHP Server relayed from qurl-service. It unmarshals the
+// ACRevocationMsg, validates the scope, strips the "<scope>:" transport prefix
+// off scope_key to the bare identity, validates the epoch, and calls the P4b
+// apply primitive (*UdpAC).ApplyRevocation, which finds the matching live
+// AccessEntries via the secondary revocation index and tears their L3 flow state
+// down now (coarse RescheduleEarlier flush — surgical precision is the deferred
+// P4c/#2784 follow-up; this handler does NOT touch that path).
+//
+// Synchronous — the caller owns goroutine + wg accounting, mirroring
+// HandleUdpACOperations. The production caller is the NHP_REV arm of
+// recvMessageRoutine in udpac.go, which spawns this wrapped by
+// `defer a.wg.Done(); defer a.recoverUDPHandler(core.NHP_REV)`. Tests call it
+// directly without that ceremony.
+//
+// No replay/dedupe cache here (unlike the NHP_AOP handler): there is no NHP_ART
+// response to be used as a replay-success oracle, and ApplyRevocation is already
+// replay-safe — its admitEpoch watermark drops a duplicate/stale epoch and a
+// no-live-match event is a no-op without advancing state. A redelivered NHP_REV
+// is therefore harmless.
+//
+// Delivery-guarantee dependency (do not lose across the slice boundary): NHP_REV
+// is fire-and-forget UDP with no ack, so a lost packet leaves the entry alive to
+// natural expiry — a fail-open outcome. The replay-safety reasoning above assumes
+// the sender provides redelivery. depends on: Slice 2 at-least-once send (the
+// server→AC fanout must retry); tracked in the P4e plan.
+//
+// Every reject path is fail-closed (drops without calling ApplyRevocation) and
+// increments MetricRevocationRejected so a malformed/forged-event spike is
+// alarmable. Errors are logged + returned per the admission-handler convention;
+// the dispatch seam does not re-log (the handler's log is richer), matching the
+// NHP_ARD/NHP_AOP precedent.
+func (a *UdpAC) HandleUdpACRevocation(ppd *core.PacketParserData) error {
+	acId := a.config.ACId
+
+	revMsg := &common.ACRevocationMsg{}
+	if err := json.Unmarshal(ppd.BodyMessage, revMsg); err != nil {
+		log.Error("ac(%s)[HandleUdpACRevocation] failed to parse NHP_REV message: %v", acId, err)
+		a.incrMetric(MetricRevocationRejected)
+		return err
+	}
+
+	scope, ok := wireRevocationScope(revMsg.Scope)
+	if !ok {
+		// Unknown, server-only ("cell"), or AC-internal-only ("admission") scope.
+		// The AC applies only qurl/resource/session; anything else is dropped
+		// without applying (a producer bug or a malformed/forged event for
+		// unknown/admission, or a correctly-ignored cell selector).
+		log.Error("ac(%s)[HandleUdpACRevocation] rejecting NHP_REV with unsupported scope=%q (key=%q epoch=%d eventId=%q)",
+			acId, revMsg.Scope, revMsg.ScopeKey, revMsg.RevocationEpoch, revMsg.EventId)
+		a.incrMetric(MetricRevocationRejected)
+		return fmt.Errorf("%w: scope=%q", ErrRevocationUnsupportedScope, revMsg.Scope)
+	}
+
+	// Strip the "<scope>:" transport prefix to the bare identity ApplyRevocation
+	// indexes on. This is the load-bearing translation across the slice boundary:
+	// qurl-service emits the prefixed form, ApplyRevocation requires the bare hash
+	// (its index is keyed on the bare hash stamped onto each AccessEntry at
+	// admission), so forwarding the prefixed key verbatim would never match and
+	// silently fail revocation open. bareScopeKey is the single source of truth
+	// for the malformed-key classification — its returned sentinel
+	// (ErrRevocationEmptyScopeKey for empty / prefix-only, or
+	// ErrRevocationScopeKeyPrefixMismatch for a prefix that disagrees with scope)
+	// is returned verbatim, so the handler does not re-derive the prefix check.
+	scopeKey, keyErr := bareScopeKey(scope, revMsg.ScopeKey)
+	if keyErr != nil {
+		log.Error("ac(%s)[HandleUdpACRevocation] rejecting NHP_REV scope_key=%q: %v (scope=%q epoch=%d eventId=%q)",
+			acId, revMsg.ScopeKey, keyErr, revMsg.Scope, revMsg.RevocationEpoch, revMsg.EventId)
+		a.incrMetric(MetricRevocationRejected)
+		return keyErr
+	}
+
+	if revMsg.RevocationEpoch < 0 {
+		// A negative wire epoch would convert to a near-max uint64 and, on a
+		// matched key, pin lastEpoch so high that every subsequent legitimate
+		// revoke is dropped as stale (epoch <= last) — a fail-open
+		// watermark-poisoning vector. Reject before the uint64 conversion.
+		log.Error("ac(%s)[HandleUdpACRevocation] rejecting NHP_REV with negative epoch=%d (scope=%q key=%q eventId=%q)",
+			acId, revMsg.RevocationEpoch, revMsg.Scope, revMsg.ScopeKey, revMsg.EventId)
+		a.incrMetric(MetricRevocationRejected)
+		return fmt.Errorf("%w: epoch=%d", ErrRevocationNegativeEpoch, revMsg.RevocationEpoch)
+	}
+
+	// The receive breadcrumb carries eventId for cross-hop correlation (the
+	// qurl-service→server→AC trace), which ApplyRevocation's own outcome log does
+	// not. It is at Debug because under cell-wide fan-out every AC receives every
+	// revoke — including the keys it never admitted — so at Info this would be the
+	// dominant no-op log line (count × AC count). ApplyRevocation is the P4b seam:
+	// it epoch-gates, flushes matching live entries' L3 flow state immediately,
+	// removes them from tokenStore, and logs the applied / stale-drop / no-match
+	// outcome with counts + metrics itself — so this handler never re-logs the
+	// count. The single Info below fires only when something was actually torn
+	// down, attaching the eventId breadcrumb to the applied case (where an
+	// operator wants the correlation id) without inflating the common no-op path.
+	// scopeKey is the BARE identity here (prefix already stripped).
+	log.Debug("ac(%s)[HandleUdpACRevocation] received NHP_REV scope=%s key=%q epoch=%d eventId=%q",
+		acId, scope, scopeKey, revMsg.RevocationEpoch, revMsg.EventId)
+	if flushed := a.ApplyRevocation(scope, scopeKey, uint64(revMsg.RevocationEpoch)); flushed > 0 {
+		log.Info("ac(%s)[HandleUdpACRevocation] applied NHP_REV scope=%s key=%q epoch=%d eventId=%q",
+			acId, scope, scopeKey, revMsg.RevocationEpoch, revMsg.EventId)
+	}
+
+	// Proof-of-delivery ack (P4e Slice 3, #2793). Sent AFTER ApplyRevocation on
+	// EVERY validated event regardless of flush count — the ack is a convergence
+	// claim ("no live flow for this identity at/below this epoch on this AC"),
+	// not a work-done claim (see common.ACRevocationAckMsg). The two flushed==0
+	// cases (retry after a lost ack; cell-wide reaching a never-admitted AC) MUST
+	// still ack or the server would retry to age-out and falsely mark the revoke
+	// degraded. Reject paths above return early WITHOUT acking by design: they
+	// age out to the server's degraded metric, surfacing server↔AC validation
+	// drift instead of masking it. ScopeKey is echoed VERBATIM (the original
+	// scope-prefixed wire form, revMsg.ScopeKey — NOT the prefix-stripped
+	// scopeKey) so the server can match the ack to its pending tracker by string
+	// equality; the bare scopeKey is the AC-internal index form only.
+	a.sendRevocationAck(ppd, revMsg)
+
+	return nil
+}
+
+// sendRevocationAck enqueues an NHP_RACK acknowledgement of revMsg back to the
+// server that sent the NHP_REV, on the SAME server-initiated connection the
+// NHP_REV arrived on (ppd.ConnData) and addressed to that server's
+// authenticated pubkey (ppd.RemotePubKey). It is the AC-to-server mirror of the
+// server's fanoutRevocation send: an unsolicited push (no ResponseMsgCh, not a
+// transaction) — the AC does not block for a reply, since the server's retry
+// loop is what provides delivery assurance, not an AC-side wait.
+//
+// Fire-and-forget with a non-blocking enqueue: if the AC is shutting down or the
+// inbound NHP_REV lacked a usable ConnData/pubkey (a malformed-but-validated
+// edge that should not occur in production), the ack is dropped with a metric
+// (MetricRevocationAckSendFailed) rather than blocking the receive path. A
+// dropped ack is not a correctness loss — the server retries the NHP_REV until
+// it is acked or ages out — but it IS an observable AC→server-return-path
+// impairment, hence the dedicated counter.
+//
+// The caller MUST gate this on the validated/applied path: reject paths do not
+// ack (see HandleUdpACRevocation). revMsg is echoed (scope, scope_key VERBATIM,
+// epoch, event_id) per the common.ACRevocationAckMsg wire contract.
+func (a *UdpAC) sendRevocationAck(ppd *core.PacketParserData, revMsg *common.ACRevocationMsg) {
+	acId := a.config.ACId
+
+	// The connection and the server's authenticated pubkey both come from the
+	// inbound NHP_REV's PacketParserData. ppd.RemotePubKey is set by the
+	// responder only after validatePeer authenticates it, so it is the trusted
+	// server identity to address the ack to. A missing ConnData/pubkey means the
+	// receive path handed us an envelope we cannot reply on — drop with a metric.
+	if ppd == nil || ppd.ConnData == nil || len(ppd.RemotePubKey) != core.PublicKeySize {
+		a.incrMetric(MetricRevocationAckSendFailed)
+		log.Error("ac(%s)[sendRevocationAck] cannot ack NHP_REV: missing connection or server pubkey (scope=%q key=%q epoch=%d eventId=%q)",
+			acId, revMsg.Scope, revMsg.ScopeKey, revMsg.RevocationEpoch, revMsg.EventId)
+		return
+	}
+
+	ackMsg := &common.ACRevocationAckMsg{
+		Scope:           revMsg.Scope,
+		ScopeKey:        revMsg.ScopeKey, // VERBATIM (still scope-prefixed)
+		RevocationEpoch: revMsg.RevocationEpoch,
+		EventId:         revMsg.EventId,
+	}
+	ackBytes, marshalErr := json.Marshal(ackMsg)
+	if marshalErr != nil {
+		// A fixed-shape struct of plain fields cannot realistically fail to
+		// marshal; treat it as a send failure for observability rather than a
+		// panic, and let the server's retry cover the missed ack.
+		a.incrMetric(MetricRevocationAckSendFailed)
+		log.Error("ac(%s)[sendRevocationAck] failed to marshal NHP_RACK (eventId=%q): %v", acId, revMsg.EventId, marshalErr)
+		return
+	}
+
+	md := &core.MsgData{
+		ConnData:      ppd.ConnData,
+		HeaderType:    core.NHP_RACK,
+		CipherScheme:  ppd.CipherScheme,
+		TransactionId: a.device.NextCounterIndex(),
+		Compress:      true,
+		PeerPk:        ppd.RemotePubKey,
+		Message:       ackBytes,
+		// No ResponseMsgCh — unsolicited AC→server push (mirror of NHP_REV).
+	}
+
+	if !a.IsRunning() {
+		a.incrMetric(MetricRevocationAckSendFailed)
+		log.Error("ac(%s#%d)[sendRevocationAck] AC shutting down, skip ack (eventId=%q)", acId, md.TransactionId, revMsg.EventId)
+		return
+	}
+
+	// Non-blocking enqueue: a full send queue must not stall the revoke receive
+	// path. A dropped ack is recovered by the server's retry, so prefer dropping
+	// (with a metric) over blocking.
+	select {
+	case a.sendMsgCh <- md:
+		a.incrMetric(MetricRevocationAckSent)
+		log.Debug("ac(%s#%d)[sendRevocationAck] enqueued NHP_RACK scope=%q key=%q epoch=%d eventId=%q",
+			acId, md.TransactionId, revMsg.Scope, revMsg.ScopeKey, revMsg.RevocationEpoch, revMsg.EventId)
+	default:
+		a.incrMetric(MetricRevocationAckSendFailed)
+		log.Warning("ac(%s#%d)[sendRevocationAck] sendMsgCh full, dropping NHP_RACK (server will retry NHP_REV) eventId=%q",
+			acId, md.TransactionId, revMsg.EventId)
+	}
 }
 
 // HandleAccessControl writes kernel pinhole state for entry's
@@ -474,7 +855,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								DstIP: dstAddr.Ip,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
-							err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
@@ -488,7 +869,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								Protocol: dstAddr.Protocol,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
-							err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(1, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf tcp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 								return
@@ -523,7 +904,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								DstIP: dstAddr.Ip,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
-							err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
@@ -537,7 +918,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								Protocol: dstAddr.Protocol,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
-							err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(1, ebpfHashStr, openTimeSec)
 
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf udp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
@@ -569,7 +950,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								DstIP: dstAddr.Ip,
 							}
 							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
-							err = ebpf.EbpfRuleAdd(3, ebpfHashStr, openTimeSec)
+							err = a.ebpfRuleAddFailClosed(3, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
@@ -626,18 +1007,17 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 										SrcIP:   srcIpStr,
 										DstPort: dstAddr.Port,
 									}
-									err = ebpf.EbpfRuleAdd(4, ebpfHashStr, tempOpenTimeSec)
+									err = a.ebpfRuleAddFailClosed(4, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf for tcp dst port src: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPort, err)
 									}
 
 								} else {
-									ebpfHashStr := ebpf.EbpfRuleParams{
-										SrcIP:        srcIpStr,
-										DstPortStart: 1,
-										DstPortEnd:   65535,
-									}
-									err = ebpf.EbpfRuleAdd(5, ebpfHashStr, tempOpenTimeSec)
+									// All-ports sentinel built via the shared helper so the
+									// min/max bounds stay in lockstep with the XDP port_list
+									// lookup key (#2843); see allPortsEbpfRuleParams.
+									ebpfHashStr := allPortsEbpfRuleParams(srcIpStr)
+									err = a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, err)
 									}
@@ -653,17 +1033,16 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 										SrcIP:   srcIpStr,
 										DstPort: dstAddr.Port,
 									}
-									err = ebpf.EbpfRuleAdd(4, ebpfHashStr, tempOpenTimeSec)
+									err = a.ebpfRuleAddFailClosed(4, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf for udp dst port src: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPort, err)
 									}
 								} else {
-									ebpfHashStr := ebpf.EbpfRuleParams{
-										SrcIP:        srcIpStr,
-										DstPortStart: 1,
-										DstPortEnd:   65535,
-									}
-									err = ebpf.EbpfRuleAdd(5, ebpfHashStr, tempOpenTimeSec)
+									// All-ports sentinel built via the shared helper so the
+									// min/max bounds stay in lockstep with the XDP port_list
+									// lookup key (#2843); see allPortsEbpfRuleParams.
+									ebpfHashStr := allPortsEbpfRuleParams(srcIpStr)
+									err = a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec)
 									if err != nil {
 										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, err)
 									}
@@ -677,7 +1056,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 									SrcIP: srcIpStr,
 									DstIP: dstAddr.Ip,
 								}
-								err = ebpf.EbpfRuleAdd(3, ebpfHashStr, openTimeSec)
+								err = a.ebpfRuleAddFailClosed(3, ebpfHashStr, openTimeSec)
 								if err != nil {
 									log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								}
@@ -771,7 +1150,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 				Protocol: "tcp",
 				DstPort:  tlocalAddr.Port,
 			}
-			err = ebpf.EbpfRuleAdd(6, ebpfHashStr, tempOpenTimeSec)
+			err = a.ebpfRuleAddFailClosed(6, ebpfHashStr, tempOpenTimeSec)
 			if err != nil {
 				log.Error("[EbpfRuleAdd] add ebpf type 6 protocol: %s, dstport :%d, %v", ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 				return
@@ -832,7 +1211,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 				Protocol: "udp",
 				DstPort:  tlocalAddr.Port,
 			}
-			err = ebpf.EbpfRuleAdd(6, ebpfHashStr, tempOpenTimeSec)
+			err = a.ebpfRuleAddFailClosed(6, ebpfHashStr, tempOpenTimeSec)
 			if err != nil {
 				log.Error("[EbpfRuleAdd] add ebpf type 6 protocol: %s, dstport :%d, %v", ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 				return
@@ -870,12 +1249,12 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 
 		if tcpListener != nil {
 			a.wg.Add(1)
-			go a.tcpTempAccessHandler(tcpListener, tempOpenTimeSec, dstAddrs, openTimeSec)
+			go a.tcpTempAccessHandler(tcpListener, tempOpenTimeSec, au, srcAddrs, dstAddrs, openTimeSec)
 		}
 
 		if udpListener != nil {
 			a.wg.Add(1)
-			go a.udpTempAccessHandler(udpListener, tempOpenTimeSec, dstAddrs, openTimeSec)
+			go a.udpTempAccessHandler(udpListener, tempOpenTimeSec, au, srcAddrs, dstAddrs, openTimeSec)
 		}
 	}
 
@@ -887,7 +1266,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 	return
 }
 
-func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, dstAddrs []*common.NetAddress, openTimeSec int) {
+func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, au *common.AgentUser, srcAddrs, dstAddrs []*common.NetAddress, openTimeSec int) {
 	defer a.wg.Done()
 	// Spawned from HandleAccessControl on the NHP_AOP path; same
 	// blast radius as the per-packet recover seam in
@@ -985,17 +1364,16 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 		return
 	}
 
-	// Per-entry tracking on tempEntry (the #2205 proposal) introduces
-	// an ESTABLISHED-bypass: tempEntry's tokenStore expiry (~35s)
-	// fires Cancel on the scheduled flush long before the kernel rule
-	// (lifetime openTimeSec, often hours) GCs. Routed through
-	// scheduleFlushOrphan instead — the scheduler entry has no
-	// per-entry owner, fires Flush at the scheduled deadline, and
-	// matches the kernel rule's natural TTL. See scheduleFlushOrphan
-	// godoc + #2213 for the lifetime-mismatch analysis and the
-	// proper fix (long-lived AccessEntry whose OpenTime matches the
-	// kernel rule's actual lifetime, restoring revocation precision
-	// before L7 removal).
+	// The kernel rule this handler writes lives for the long outer
+	// openTimeSec (often hours), so its scheduled L3 flush must be
+	// OWNED by an AccessEntry with a matching lifetime — not recorded
+	// on tempEntry (OpenTime ~30s, would Cancel the flush at its ~35s
+	// expiry → ESTABLISHED-bypass). registerTempAccessFlushEntry mints
+	// that long-lived owner (#2213, retiring the prior orphan path) so
+	// the flush is cancelable by an explicit admin Cancel (#2172). The
+	// flush deadline is unchanged (computeFlushDeadline(openTimeSec)):
+	// only OWNERSHIP changed, not timing. See registerTempAccessFlushEntry
+	// godoc for the lifetime-mismatch analysis.
 	if a.VerifyAccessToken(accMsg.ACToken) != nil {
 		remoteAddr, _ := net.ResolveTCPAddr(conn.RemoteAddr().Network(), conn.RemoteAddr().String())
 		srcAddrIp := remoteAddr.IP.String()
@@ -1006,6 +1384,12 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 			log.Error("[tcpTempAccessHandler] invalid destination IP: %s", dstAddrs[0].Ip)
 			return
 		}
+
+		// All per-tuple keys below record on this one entry, mirroring
+		// HandleAccessControl's single-entry multi-tuple admission (hence
+		// hoisted out of the loop). Ownership/timing rationale: see the
+		// block comment above + registerTempAccessFlushEntry godoc.
+		flushEntry := a.registerTempAccessFlushEntry(au, srcAddrs, dstAddrs, openTimeSec)
 
 		// Anchor flushDeadline at the moment the temp handler is about
 		// to write kernel state — the kernel timer starts NOW, not at
@@ -1022,7 +1406,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 				// Wildcard port (Port==0) maps to the FlowKey port=0
 				// no-port-filter form; ConntrackFlusher skips --dport
 				// in that case, which is the right partial-tuple shape.
-				a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
+				a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
 				_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 				if err != nil {
 					log.Error("[tcpTempAccessHandler] add ipset %s error: %v", ipHashStr, err)
@@ -1045,8 +1429,8 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 				// past timeout. A future change that swaps the
 				// eBPF mapType here MUST also update the FlowKey
 				// shape to match.
-				a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
-				err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
+				a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
+				err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, openTimeSec)
 				if err != nil {
 					log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 					return
@@ -1059,7 +1443,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 	}
 }
 
-func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs []*common.NetAddress, openTimeSec int) {
+func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *common.AgentUser, srcAddrs, dstAddrs []*common.NetAddress, openTimeSec int) {
 	defer a.wg.Done()
 	// Same per-packet panic-recover discipline as tcpTempAccessHandler.
 	defer a.recoverUDPHandler(core.NHP_AOP)
@@ -1140,9 +1524,12 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 		return
 	}
 
-	// Routed through scheduleFlushOrphan (NOT per-entry tracking) —
-	// see tcpTempAccessHandler's matching note + scheduleFlushOrphan
-	// godoc + #2213 for the lifetime-mismatch analysis.
+	// Flushes scheduled below are OWNED by a long-lived AccessEntry
+	// (registerTempAccessFlushEntry, #2213) instead of the retired
+	// orphan path — making them cancelable by an explicit admin Cancel
+	// (#2172). See tcpTempAccessHandler's matching note +
+	// registerTempAccessFlushEntry godoc for the lifetime-mismatch
+	// analysis; timing is unchanged (only OWNERSHIP changed).
 	if a.VerifyAccessToken(accMsg.ACToken) != nil {
 		srcAddrIp := remoteAddr.IP.String()
 
@@ -1152,6 +1539,13 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 			log.Error("[udpTempAccessHandler] invalid destination IP: %s", dstAddrs[0].Ip)
 			return
 		}
+
+		// One entry owns every flush scheduled below (TCP/UDP/ANY + the
+		// ICMP ping branch), mirroring HandleAccessControl's single-entry
+		// admission (hence hoisted out of the loop). Ownership/timing
+		// rationale: see the comment above + registerTempAccessFlushEntry
+		// godoc.
+		flushEntry := a.registerTempAccessFlushEntry(au, srcAddrs, dstAddrs, openTimeSec)
 
 		// Anchor flushDeadline at the moment the temp handler is about
 		// to write kernel state — the kernel timer starts NOW, not at
@@ -1166,7 +1560,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 				}
 				switch a.config.FilterMode {
 				case FilterMode_IPTABLES:
-					a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
+					a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 					_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 					if err != nil {
 						log.Error("[udpTempAccessHandler] add ipset %s error: %v", ipHashStr, err)
@@ -1178,8 +1572,8 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 							SrcIP: srcAddrIp,
 							DstIP: dstAddr.Ip,
 						}
-						a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
-						err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
+						a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
+						err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, openTimeSec)
 						if err != nil {
 							log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 							return
@@ -1192,8 +1586,8 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 							DstPort:  dstAddr.Port,
 							Protocol: dstAddr.Protocol,
 						}
-						a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
-						err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
+						a.scheduleFlushIfEnabled(flushEntry, srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
+						err = a.ebpfRuleAddFailClosed(1, ebpfHashStr, openTimeSec)
 
 						if err != nil {
 							log.Error("[EbpfRuleAdd] add ebpf udp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
@@ -1224,7 +1618,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 					// in-flight Flush barrier holds; if the
 					// non-fatal write below fails the flush is a
 					// no-op against an absent entry.
-					a.scheduleFlushOrphan(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
+					a.scheduleFlushIfEnabled(flushEntry, remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 					_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 					if err != nil {
 						log.Warning("[udpTempAccessHandler] failed to add ICMP rule %s: %v", ipHashStr, err)
@@ -1234,8 +1628,8 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 						SrcIP: remoteAddr.IP.String(),
 						DstIP: dstAddr.Ip,
 					}
-					a.scheduleFlushOrphan(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
-					err = ebpf.EbpfRuleAdd(3, ebpfHashStr, openTimeSec)
+					a.scheduleFlushIfEnabled(flushEntry, remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
+					err = a.ebpfRuleAddFailClosed(3, ebpfHashStr, openTimeSec)
 					if err != nil {
 						log.Error("[EbpfRuleAdd] add ebpf icmp src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 						return

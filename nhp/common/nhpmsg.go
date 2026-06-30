@@ -138,6 +138,19 @@ type ServerACOpsMsg struct {
 	SourceAddrs      []*NetAddress `json:"srcAddrs"`
 	DestinationAddrs []*NetAddress `json:"dstAddrs"`
 	OpenTime         uint32        `json:"opnTime"`
+
+	// qURL v2 keyed-identity revocation metadata (additive; populated only by
+	// the v2 signed-claims admission path, omitted for every legacy admission).
+	// Carried from the server's admission decision down to the AC so the AC can
+	// store it on the access/flow entry for immediate, targeted revocation.
+	// Indexing these for O(1) revoke lookup is P4b; P4a only carries + stores.
+	// See docs/design/QURL_V2_KEYED_IDENTITY.md → "AC Admission and Immediate Revocation".
+	QurlUserPublicKeyHash string `json:"qurlUsrPubKeyHash,omitempty"` // hash of the qURL user's keyed-identity public key
+	ResourcePublicKeyHash string `json:"resPubKeyHash,omitempty"`     // hash of the protected resource's public key
+	SessionId             string `json:"sessId,omitempty"`            // qURL v2 session identifier
+	AdmissionId           string `json:"admId,omitempty"`             // unique id of the admission decision that opened this access
+	RevocationEpoch       uint64 `json:"revEpoch,omitempty"`          // monotonic epoch used to invalidate access on revoke
+	Deadline              int64  `json:"deadline,omitempty"`          // unix seconds; admission validity deadline
 }
 
 type ACOpsResultMsg struct {
@@ -486,4 +499,102 @@ type ACRedispatchMsg struct {
 	Targets []RedirectTarget `json:"targets"`           // Ordered list of assigned servers (typically 3)
 	ErrCode string           `json:"errCode,omitempty"` // Error code if assignment lookup failed
 	ErrMsg  string           `json:"errMsg,omitempty"`  // Error message if failed
+}
+
+// ACRevocationMsg carries a qURL v2 immediate-revocation event from the NHP
+// Server to an AC over NHP_REV (server-to-AC, LayerV extension). The server
+// relays it fire-and-forget after receiving the event from qurl-service; the AC
+// resolves Scope+ScopeKey to its secondary revocation index and tears down the
+// matching live access entries immediately (see (*UdpAC).HandleUdpACRevocation
+// → ApplyRevocation, P4b).
+//
+// Wire contract (CROSS-REPO). The json tags and field semantics mirror
+// qurl-service's revocation event (`internal/revocation/event.go`, P4d) so the
+// server send side (P4e Slice 2) can field-copy from the qurl-service Event into
+// this struct without a semantic transform — that is why the tags are snake_case
+// (matching qurl-service) rather than the camelCase used elsewhere in this file.
+// Keep the tags stable; they cannot change after Slice 2 ships.
+//
+//   - Scope is the revocation dimension. qurl-service emits one of "qurl",
+//     "resource", "session", or "cell"; this struct's string values mirror those
+//     byte-for-byte so the two ends agree without a translation table. The AC
+//     handler applies only "qurl"/"resource"/"session" — "cell" is a
+//     server-side fanout selector with no AC-local index (the AC drops it), and
+//     "admission" is an AC-internal index dimension that is never a wire scope
+//     (the handler rejects both as unsupported).
+//   - ScopeKey is the scope-PREFIXED key exactly as qurl-service emits it:
+//     "<scope>:<identity-hash-or-id>", e.g. "resource:<resource_public_key_hash>"
+//     or "qurl:<qurl_user_public_key_hash>" (qurl-service
+//     `internal/revocation/scopekey.go` `ScopeKey`). The AC handler strips the
+//     "<scope>:" transport prefix before calling ApplyRevocation, which requires
+//     the BARE identity (its index is keyed on the bare hash carried onto each
+//     AccessEntry at admission). The scope and the prefix MUST agree (qurl-service
+//     builds the prefix from the same scope); a mismatch is treated as malformed.
+//   - RevocationEpoch is the per-(scope, scope_key) monotonic counter used for
+//     idempotency/ordering; the AC applies an event only when its epoch is
+//     strictly greater than the last applied for that (Scope, ScopeKey). MUST be
+//     non-negative; a negative value is rejected (it would convert to a near-max
+//     uint64 and poison the epoch watermark). int64 (not uint64) to match
+//     qurl-service's wire type; the handler's negative guard covers the only
+//     unsafe input before the uint64 conversion.
+//   - EventId is an opaque producer-assigned id (qurl-service "evt_..."), carried
+//     for log correlation / tracing across the qurl-service→server→AC hops; it
+//     does not affect apply.
+type ACRevocationMsg struct {
+	Scope           string `json:"scope"`            // "qurl" | "resource" | "session" | "cell" (AC applies the first three)
+	ScopeKey        string `json:"scope_key"`        // scope-prefixed "<scope>:<hash>"; handler strips the prefix
+	RevocationEpoch int64  `json:"revocation_epoch"` // monotonic epoch (must be >= 0)
+	EventId         string `json:"event_id,omitempty"`
+}
+
+// ACRevocationAckMsg is the AC→server acknowledgement of an NHP_REV, carried on
+// NHP_RACK (AC-to-server, LayerV extension). It is the proof-of-delivery signal
+// for DE-Risk #5: the AC sends one after it has PROCESSED a validated NHP_REV,
+// and the server uses it to clear that AC's pending-revoke tracker so the
+// retry-until-ack-or-age-out loop stops retransmitting (see
+// docs/design/QURL_V2_KEYED_IDENTITY.md revocation section, P4e Slice 3, #2793).
+//
+// Acknowledgement semantics — CONVERGENCE, not work-done (load-bearing): the AC
+// acks EVERY validated NHP_REV regardless of how many live entries it flushed.
+// ApplyRevocation returns 0 in two legitimate cases that MUST still ack, or the
+// server would retry to age-out and falsely mark the revoke degraded:
+//   - the retry after a lost ack (the entry was already torn down + deleted by
+//     the first apply, so the re-delivered event flushes nothing); and
+//   - cell-wide fanout reaching an AC that never admitted the key (the common
+//     case — every AC receives every cell-wide revoke).
+//
+// So the ack means "this AC has reached the post-revocation state for
+// (scope, scope_key, epoch)", i.e. there is no live flow for that identity at or
+// below this epoch on this AC. It is NOT a claim about how many flows were torn
+// down. A reject path (malformed/forged event, unsupported scope, etc.) does NOT
+// ack — those age out to the degraded metric, which correctly surfaces
+// server↔AC validation drift rather than masking it.
+//
+// Wire contract (CROSS-REPO-shaped but server↔AC only — qurl-service is not a
+// party). The fields echo the NHP_REV the AC received so the server can
+// correlate the ack to its pending tracker:
+//   - Scope / ScopeKey are echoed VERBATIM as received on the NHP_REV
+//     (ScopeKey is still the scope-PREFIXED "<scope>:<id>" form — the AC does
+//     NOT strip the prefix on the ack path). The server forwarded scope_key
+//     verbatim into the NHP_REV and tracks pending revokes under that exact
+//     byte string, so echoing it unmodified lets the server match by string
+//     equality. Normalizing/stripping here would reintroduce the
+//     fail-open-on-key-mismatch trap the gospel warns about repeatedly.
+//   - RevocationEpoch echoes the acked epoch; the server clears a pending
+//     tracker only when the ack's epoch matches (or supersedes) the epoch it
+//     last sent for that authenticated AC slot (acId + pubkey, resolved from
+//     the connection) and (scope, scope_key).
+//   - EventId echoes the NHP_REV's event id for cross-hop log correlation; it
+//     does not affect ack matching (the (scope, scope_key, epoch) tuple does).
+//
+// The acking AC's identity is NOT carried in this message: the server resolves
+// both acId and the live slot pubkey from the cryptographically-authenticated
+// connection pubkey (ppd.RemotePubKey → acConnectionMap), never from a spoofable
+// body field. Multiple blue/green AC slots can share one acId, so the pubkey is
+// part of the server-side pending key.
+type ACRevocationAckMsg struct {
+	Scope           string `json:"scope"`
+	ScopeKey        string `json:"scope_key"`        // echoed VERBATIM (still scope-prefixed)
+	RevocationEpoch int64  `json:"revocation_epoch"` // echoed acked epoch
+	EventId         string `json:"event_id,omitempty"`
 }

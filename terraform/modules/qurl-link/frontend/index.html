@@ -1279,11 +1279,7 @@
         relayBaseUrl: "${relay_base_url}",
         serverStaticPubB64: "${server_static_pub_b64}"
       };
-      const token = window.location.hash.substring(1);
-
-      if (!token || !token.startsWith('at_')) {
-        return;
-      }
+      const fragment = window.location.hash.substring(1);
 
       // From here down we are in the verifier path. Anything that throws during
       // token initialization renders the branded access page instead of leaving
@@ -1298,6 +1294,13 @@
         }
       });
 
+      clearSensitiveFragment(fragment);
+      const bootstrap = parseQurlBootstrapFragment(fragment);
+
+      if (!bootstrap) {
+        return;
+      }
+
       document.body.classList.add('verifying');
 
       const hostname = window.location.hostname.toLowerCase();
@@ -1309,8 +1312,29 @@
       // Token format matches qurl-service token generation
       // (qurl-service/internal/domain/qurl.go): at_ + 22 base64url chars
       // (lowercase alphanumeric, underscore, hyphen).
-      if (!/^at_[a-z0-9_-]{22}$/.test(token)) {
+      if (!/^at_[a-z0-9_-]{22}$/.test(bootstrap.accessToken)) {
         showError('Invalid access token format');
+        return;
+      }
+      if (bootstrap.agentPrivateKeyB64 && !isX25519KeyB64(bootstrap.agentPrivateKeyB64)) {
+        showError('Invalid agent private key format');
+        return;
+      }
+      if (bootstrap.agentPublicKeyB64 && !isX25519KeyB64(bootstrap.agentPublicKeyB64)) {
+        showError('Invalid agent public key format');
+        return;
+      }
+      if (bootstrap.serverPublicKeyB64 && !isX25519KeyB64(bootstrap.serverPublicKeyB64)) {
+        showError('Invalid server public key format');
+        return;
+      }
+      if (bootstrap.serverPublicKeyB64 && !QURL_LINK_CONFIG.serverStaticPubB64) {
+        showError('Relay verifier is not configured');
+        return;
+      }
+      if (bootstrap.serverPublicKeyB64 &&
+          bootstrap.serverPublicKeyB64 !== QURL_LINK_CONFIG.serverStaticPubB64) {
+        showError('Relay verifier identity mismatch');
         return;
       }
 
@@ -1323,7 +1347,7 @@
       // The 500ms delay keeps the spinner visible long enough to register.
       setTimeout(function() {
 %{ if js_agent_enabled ~}
-        verifyWithRelay(token).catch(function(error) {
+        verifyWithRelay(bootstrap).catch(function(error) {
           showError('Relay verification failed');
           if (typeof console !== 'undefined' && console.error) {
             console.error('qURL relay verification failed:', error);
@@ -1333,7 +1357,7 @@
         var form = document.createElement('form');
         form.method = 'POST';
         form.action = 'https://resolve.' + hostname + '/plugins/qurl';
-        appendField(form, 'token', token);
+        appendField(form, 'token', bootstrap.accessToken);
         appendBrowserTimings(form, submitReadyMs);
         document.body.appendChild(form);
         form.submit();
@@ -1341,20 +1365,32 @@
       }, 500);
 
 %{ if js_agent_enabled ~}
-      async function verifyWithRelay(accessToken) {
-        if (!QURL_LINK_CONFIG.relayBaseUrl || !QURL_LINK_CONFIG.serverStaticPubB64) {
+      async function verifyWithRelay(bootstrap) {
+        var relayBaseUrl = bootstrap.relayBaseUrl || QURL_LINK_CONFIG.relayBaseUrl;
+        var serverStaticPubB64 = bootstrap.serverPublicKeyB64 || QURL_LINK_CONFIG.serverStaticPubB64;
+        if (!relayBaseUrl || !serverStaticPubB64) {
           showError('Relay verifier is not configured');
+          return;
+        }
+        if (!isAllowedRelayUrl(relayBaseUrl)) {
+          showError('Relay verifier origin not allowed');
           return;
         }
 
         var agent = await import('/nhp-agent.min.js');
-        var keyPair = agent.generateDeviceKeyPair();
+        var deviceStaticPriv;
+        if (bootstrap.agentPrivateKeyB64) {
+          deviceStaticPriv = agent.x25519KeyFromBase64(bootstrap.agentPrivateKeyB64);
+        } else {
+          var keyPair = agent.generateDeviceKeyPair();
+          deviceStaticPriv = keyPair.deviceStaticPriv;
+        }
         var result = await agent.knock({
-          deviceStaticPriv: keyPair.deviceStaticPriv,
-          serverStaticPub: agent.x25519KeyFromBase64(QURL_LINK_CONFIG.serverStaticPubB64),
-          relayBaseUrl: QURL_LINK_CONFIG.relayBaseUrl,
-          authServiceId: 'qurl',
-          qurlAccessToken: accessToken,
+          deviceStaticPriv: deviceStaticPriv,
+          serverStaticPub: agent.x25519KeyFromBase64(serverStaticPubB64),
+          relayBaseUrl: relayBaseUrl,
+          authServiceId: bootstrap.authServiceId || 'qurl',
+          qurlAccessToken: bootstrap.accessToken,
           qurlUserAgent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : ''
         });
 
@@ -1448,6 +1484,88 @@
         }
       }
 %{ endif ~}
+
+      function parseQurlBootstrapFragment(fragment) {
+        if (!fragment) {
+          return null;
+        }
+        if (fragment.startsWith('at_')) {
+          return { accessToken: fragment };
+        }
+        if (!fragment.startsWith('qv1.')) {
+          return null;
+        }
+        // Outer bundle: unpadded base64url JSON. Inner X25519 keys: strict
+        // std-base64 32-byte values so qurl-service and the JS agent share one
+        // wire contract.
+        var raw = JSON.parse(base64UrlDecode(fragment.substring(4)));
+        if (!raw || raw.v !== 1) {
+          throw new Error('Unsupported qURL bootstrap bundle');
+        }
+        // nhp_resource_id and agent_public_key_b64 are intentionally
+        // self-describing contract fields. The browser relay path uses the
+        // private key to knock; smoke derives and checks the public key.
+        return {
+          accessToken: requiredBundleString(raw.access_token, 'access_token'),
+          nhpResourceId: requiredBundleString(raw.nhp_resource_id, 'nhp_resource_id'),
+          agentPrivateKeyB64: requiredBundleString(raw.agent_private_key_b64, 'agent_private_key_b64'),
+          agentPublicKeyB64: requiredBundleString(raw.agent_public_key_b64, 'agent_public_key_b64'),
+          serverPublicKeyB64: requiredBundleString(raw.server_public_key_b64, 'server_public_key_b64'),
+          relayBaseUrl: requiredBundleString(raw.relay_url, 'relay_url'),
+          // Validate the RAW field — qurl-service always emits auth_service_id,
+          // so fail closed on a missing/empty value rather than masking it with
+          // a default before the required check (which made the check dead).
+          authServiceId: requiredBundleString(raw.auth_service_id, 'auth_service_id')
+        };
+      }
+
+      function requiredBundleString(value, fieldName) {
+        if (typeof value !== 'string' || value.length === 0) {
+          throw new Error('qURL bootstrap bundle missing ' + fieldName);
+        }
+        return value;
+      }
+
+      function base64UrlDecode(value) {
+        var normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+        var padding = normalized.length % 4;
+        if (padding) {
+          normalized += '='.repeat(4 - padding);
+        }
+        // Bundle fields are intentionally ASCII-only: tokens, resource IDs,
+        // origins, service IDs, and base64-encoded X25519 keys.
+        return atob(normalized);
+      }
+
+      function clearSensitiveFragment(fragment) {
+        if (!isSensitiveQurlFragment(fragment) || typeof history === 'undefined' || typeof history.replaceState !== 'function') {
+          return;
+        }
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+      }
+
+      function isSensitiveQurlFragment(fragment) {
+        return !!fragment && (fragment.startsWith('qv1.') || fragment.startsWith('at_'));
+      }
+
+      function isX25519KeyB64(value) {
+        return /^[A-Za-z0-9+/]{43}=$/.test(value);
+      }
+
+      function isAllowedRelayUrl(relayUrl) {
+        try {
+          var configured = new URL(QURL_LINK_CONFIG.relayBaseUrl);
+          var requested = new URL(relayUrl);
+          return requested.origin === configured.origin &&
+            requested.username === '' &&
+            requested.password === '' &&
+            requested.pathname === '/' &&
+            requested.search === '' &&
+            requested.hash === '';
+        } catch (error) {
+          return false;
+        }
+      }
 
       // showError(message): verifier-path only. message is meant for the
       // operator console, never the page DOM. Callers must NOT pass the access

@@ -173,6 +173,17 @@ type UdpServer struct {
 	// revoke gate is strict and the server is in DynamoDB cloud mode.
 	acPubkeyRevokeSweepInterval time.Duration
 
+	// revocationRetry is the qURL v2 NHP_REV retry-until-ack-or-age-out
+	// engine (P4e Slice 3, #2793). nil = engine disabled (default; armed
+	// only when NHP_REVOCATION_RETRY_ENABLED=true). When non-nil, the
+	// fanout handler records a pending entry per targeted AC slot
+	// (acId + authenticated pubkey), the
+	// revocationRetryRoutine retransmits un-acked NHP_REV on a cadence
+	// until acked (NHP_RACK clears it) or aged out (RevocationAgedOut),
+	// and HandleRevocationAck clears the matching entry. See
+	// revocation_retry.go.
+	revocationRetry *revocationRetryTracker
+
 	// connection and remote transaction management
 
 	remoteConnectionMapMutex sync.Mutex
@@ -338,6 +349,7 @@ type UdpServer struct {
 		srcAddr *common.NetAddress,
 		dstAddrs []*common.NetAddress,
 		openTime uint32,
+		res *common.ResourceData,
 	) (*common.ACOpsResultMsg, error)
 
 	// agentPeerLookup resolves a knock's RemotePubKey to a registered
@@ -410,6 +422,7 @@ func (s *UdpServer) resolveProcessACOperationBroadcast() func(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	if s.processACOperationBroadcastFn != nil {
 		return s.processACOperationBroadcastFn
@@ -607,6 +620,21 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	} else {
 		log.Info("AC pubkey revoke mid-session sweep interval: %s (starts only in strict DynamoDB cloud mode)",
 			s.acPubkeyRevokeSweepInterval)
+	}
+
+	// qURL v2 revocation retry-until-ack-or-age-out engine (#2793). Default
+	// OFF: armed only when NHP_REVOCATION_RETRY_ENABLED=true, because a fleet of
+	// pre-ack ACs never sends NHP_RACK and would otherwise storm the aged-out
+	// degraded metric. Parse fails Start on a typo (see parseRevocationRetryConfig).
+	revRetryEnabled, revRetryInterval, revRetryAgeOut, err := parseRevocationRetryConfig()
+	if err != nil {
+		return err
+	}
+	if revRetryEnabled {
+		s.revocationRetry = newRevocationRetryTracker(revRetryInterval, revRetryAgeOut)
+		log.Info("qURL v2 revocation retry engine ENABLED (interval=%s ageOut=%s)", revRetryInterval, revRetryAgeOut)
+	} else {
+		log.Info("qURL v2 revocation retry engine disabled (%s not true); NHP_REV fanout stays fire-and-forget", RevocationRetryEnabledEnvVar)
 	}
 
 	// Initialize pluggable storage backend (DynamoDB or etcd)
@@ -1096,6 +1124,14 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		log.Info("AC pubkey revoke mid-session sweeper not started because %s is permit mode",
 			ACPubkeyRevokeVerifyEnvVar)
 	}
+	// qURL v2 revocation retry/age-out routine (#2793). Started only when the
+	// engine is armed (tracker non-nil). Joins s.wg + exits on s.signals.stop so
+	// it stops sending before Stop() closes s.sendMsgCh (wg.Wait precedes the
+	// close).
+	if s.revocationRetry != nil {
+		s.wg.Add(1)
+		go s.revocationRetryRoutine()
+	}
 
 	s.running.Store(true)
 	return nil
@@ -1472,16 +1508,7 @@ func (s *UdpServer) drainACConnections() {
 	}
 
 	// Snapshot connections under read lock — check before doing any work
-	s.acConnectionMapMutex.RLock()
-	totalConns := 0
-	for _, acConns := range s.acConnectionMap {
-		totalConns += len(acConns)
-	}
-	conns := make([]*ACConn, 0, totalConns)
-	for _, acConns := range s.acConnectionMap {
-		conns = append(conns, acConns...)
-	}
-	s.acConnectionMapMutex.RUnlock()
+	conns := s.snapshotAllACConnections()
 
 	if len(conns) == 0 {
 		return
@@ -1534,6 +1561,137 @@ func (s *UdpServer) drainACConnections() {
 	time.Sleep(drainFlushDelay)
 
 	log.Info("Shutdown: drained %d/%d AC connections", sent, len(conns))
+}
+
+// Revocation fanout mode wire strings. These mirror qurl-service's
+// revocation.FanoutMode constants byte-for-byte (internal/revocation/event.go:
+// FanoutTargeted / FanoutCellWide) so the server selects the AC set without a
+// translation table. Keep them stable; they are part of the cross-repo wire
+// contract.
+const (
+	// revocationFanoutTargeted delivers only to the ACs whose ACId is in the
+	// event's target_ac_ids. Honored ONLY when target_set_complete=true (the
+	// handler rejects an incomplete targeted event before reaching fanout).
+	revocationFanoutTargeted = "targeted"
+	// revocationFanoutCellWide delivers to every connected AC. It is the safe
+	// fallback qurl-service emits whenever the admitted-AC set cannot be proven
+	// complete (and the only mode qurl-service emits until the P3c admitted-AC
+	// wiring lands).
+	revocationFanoutCellWide = "cell-wide"
+)
+
+// snapshotAllACConnections returns every live AC connection (all acIds, all
+// blue/green slots per acId) as a flat slice, taken under acConnectionMapMutex.
+// RLock. The returned *ACConn pointers are read lock-free by callers; the slice
+// itself is a fresh copy so iterating it never races a concurrent map mutation.
+// This is the shared snapshot primitive behind the graceful-drain (NHP_ARD) and
+// cell-wide revocation (NHP_REV) fanouts — keep the lock-hold to this pure map
+// walk (no I/O, no send) so it never serializes the receive path.
+func (s *UdpServer) snapshotAllACConnections() []*ACConn {
+	s.acConnectionMapMutex.RLock()
+	defer s.acConnectionMapMutex.RUnlock()
+	totalConns := 0
+	for _, acConns := range s.acConnectionMap {
+		totalConns += len(acConns)
+	}
+	conns := make([]*ACConn, 0, totalConns)
+	for _, acConns := range s.acConnectionMap {
+		conns = append(conns, acConns...)
+	}
+	return conns
+}
+
+// findACConnectionsForRevocation snapshots the AC connection map and returns
+// the ACConn entries an NHP_REV fanout should target, selected purely by
+// fanoutMode (orthogonal to the revocation scope — a resource-scoped revoke can
+// ship cell-wide):
+//
+//   - cell-wide: every connected AC connection (all colors / all blue-green
+//     slots), via snapshotAllACConnections (the same snapshot the NHP_ARD drain
+//     uses).
+//   - targeted: only connections whose ACId is in targetACIDs. ACConn.ACId is
+//     the AC's configured id string, the SAME identifier space qurl-service
+//     records in a session's admitted_ac_ids and copies into target_ac_ids
+//     (verified cross-repo); an empty targetACIDs therefore matches nothing.
+//
+// The returned slice holds *ACConn pointers the caller reads lock-free.
+// fanoutMode is assumed pre-validated by the handler (revocationFanoutTargeted /
+// revocationFanoutCellWide); any other value selects nothing (defensive — the
+// handler rejects unknown modes with 400 before calling this).
+//
+// An empty result is a legitimate success case (cell-wide with no connected
+// ACs, or targeted with no matching ACId on this server): there is simply
+// nothing to flush here. The caller treats it as "nothing to do," not an error.
+func (s *UdpServer) findACConnectionsForRevocation(fanoutMode string, targetACIDs []string) []*ACConn {
+	switch fanoutMode {
+	case revocationFanoutCellWide:
+		return s.snapshotAllACConnections()
+	case revocationFanoutTargeted:
+		// Build the targeted-id lookup outside the lock to keep the critical
+		// section to a pure map walk; index by ACId so we resolve each wanted
+		// id to its connection slice rather than scanning every connection.
+		wanted := make(map[string]struct{}, len(targetACIDs))
+		for _, id := range targetACIDs {
+			wanted[id] = struct{}{}
+		}
+		s.acConnectionMapMutex.RLock()
+		defer s.acConnectionMapMutex.RUnlock()
+		conns := make([]*ACConn, 0, len(wanted))
+		for id := range wanted {
+			conns = append(conns, s.acConnectionMap[id]...)
+		}
+		return conns
+	default:
+		return nil
+	}
+}
+
+// fanoutRevocation pushes an NHP_REV carrying revBytes (a marshaled
+// common.ACRevocationMsg) to each AC connection fire-and-forget, mirroring
+// drainACConnections' per-connection MsgData construction. revBytes is marshaled
+// once by the caller and reused for every AC (the message is identical
+// per-connection; only the transport envelope — ConnData, PeerPk, cipher,
+// counter — differs).
+//
+// Backpressure is fail-CLOSED: the send is a non-blocking enqueue onto the
+// shared sendMsgCh, and if any AC's enqueue would block (queue full) the method
+// stops and returns ok=false so the handler can answer 503 and let
+// qurl-service's at-least-once Publisher retry the whole event. This is safe
+// despite a possible partial fanout (some ACs already enqueued before the full
+// queue) because NHP_REV apply is epoch-idempotent on the AC (Slice 1 watermark:
+// a re-delivered event at the same revocation_epoch is a no-op), so the retry
+// re-sending to already-served ACs causes no double-teardown. The alternative —
+// silently dropping — would lose the revocation with no retry signal (fail-open).
+//
+// conns may be empty (cell-wide with no connected ACs / targeted with no match
+// here); that returns sent=0, ok=true (nothing to do is success, not 503).
+func (s *UdpServer) fanoutRevocation(conns []*ACConn, revBytes []byte) (sent int, ok bool) {
+	for _, conn := range conns {
+		md := &core.MsgData{
+			ConnData:      conn.ConnData,
+			HeaderType:    core.NHP_REV,
+			CipherScheme:  conn.ACCipherScheme,
+			TransactionId: s.device.NextCounterIndex(),
+			Compress:      true,
+			PeerPk:        conn.ACPeer.PublicKey(),
+			Message:       revBytes,
+			// No ResponseMsgCh — fire-and-forget (server→AC push, like NHP_ARD).
+		}
+		select {
+		case s.sendMsgCh <- md:
+			sent++
+		default:
+			// Fail closed: report backpressure so the caller returns 503 and
+			// the producer retries, rather than dropping this (and any
+			// remaining) AC's revocation.
+			if s.metrics != nil {
+				s.metrics.IncrCounter(MetricRevocationFanoutBackpressure)
+			}
+			log.Warning("revocation fanout: sendMsgCh full after %d/%d ACs; returning 503 for producer retry", sent, len(conns))
+			return sent, false
+		}
+	}
+	return sent, true
 }
 
 // Cloud Map registration self-healing tunables (issue #1681). Boot retry +
@@ -2720,6 +2878,18 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 	case core.NHP_RLY:
 		go s.HandleRelayForward(ppd)
 
+	// qURL v2 revocation ack from an AC (P4e Slice 3, #2793). Unsolicited
+	// AC→server push acknowledging an NHP_REV; clears the per-AC-slot
+	// pending-revoke tracker so the retry-until-ack loop stops. Dispatched async
+	// like every other arm so a slow handler cannot head-of-line-block the
+	// receive queue.
+	case core.NHP_RACK:
+		go func() {
+			if ackErr := s.HandleRevocationAck(ppd); ackErr != nil {
+				log.Error("[Server] HandleRevocationAck failed: %v", ackErr)
+			}
+		}()
+
 	default:
 		// An unknown HeaderType reaching here means the upstream
 		// parser accepted a type this dispatcher doesn't route —
@@ -3476,7 +3646,53 @@ func (s *UdpServer) dedupeRecvART(ppd *core.PacketParserData) error {
 	return nil
 }
 
-func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32) (artMsg *common.ACOpsResultMsg, err error) {
+// stampQurlV2RevocationMetadata copies the qURL v2 revocation metadata (P4a)
+// from res onto the AOP. Pure + nil-safe so the production stamp and the test
+// doubles share ONE mapping and cannot drift (mirrors the AC-side
+// accessEntryFromAOP extraction). res is nil on the local non-v2 path and a
+// catalog ResourceData on the forward/http paths. All four fields are omitempty,
+// so the AOP stays additive/wire-compatible (pre-v2 ACs ignore unknown keys).
+// Only the v2 admission path (authWithNHPClaims/buildV2ResourceData) sets
+// qurl_user hash / admission_id / deadline on a ResourceData;
+// resource_public_key_hash can ride a catalog ResourceData for a v2-provisioned
+// resource even on a non-v2 knock (it is the resource revocation key).
+// session_id is carried only by the steady-state authorize (re-knock) path,
+// which is the first place a session id exists (prepare returns none); the
+// first-knock path leaves it empty. revocation_epoch is still not carried (no
+// admission response returns it) and has no ResourceData field; it awaits a
+// later contract + slice.
+//
+// INVARIANT (forward-safety): the per-admission fields (admission_id / deadline /
+// qurl_user hash / session_id) must ONLY ever originate from v2 admission, never
+// from a catalog/storage producer. Today that holds — buildV2ResourceData and
+// buildV2RefreshResourceData (the prepare and authorize paths) are the sole
+// writers of those fields onto any ResourceData (no resource_lookup / storage
+// path sets them) — so stamping unconditionally from a non-nil res is safe on the
+// forward/http catalog paths (they leave the fields empty). If a future change
+// ever persists any of them onto a catalog row, a non-v2 forwarded knock would
+// emit stale per-admission metadata; at that point this stamp must gate them on
+// v2-admission provenance. See #2774 (the forward path is where a v2-fields-on-
+// forward change would land).
+func stampQurlV2RevocationMetadata(aopMsg *common.ServerACOpsMsg, res *common.ResourceData) {
+	if aopMsg == nil || res == nil {
+		return
+	}
+	aopMsg.QurlUserPublicKeyHash = res.QurlUserPublicKeyHash
+	aopMsg.ResourcePublicKeyHash = res.ResourcePublicKeyHash
+	aopMsg.SessionId = res.SessionId
+	aopMsg.AdmissionId = res.AdmissionId
+	aopMsg.Deadline = res.Deadline
+}
+
+// res carries the qURL v2 revocation metadata (P4a) to stamp onto the AOP. It is
+// nil on the local admission path for non-qURL-v2 knocks, and a catalog
+// ResourceData on the forward/http paths. The stamped fields are all omitempty,
+// so the AOP stays additive and wire-compatible: pre-v2 ACs simply ignore keys
+// they don't know. No flag check is needed here — only the v2 admission path
+// (authWithNHPClaims, gated by v2AdmissionEnabled) sets the per-admission fields
+// (qurl_user hash, admission_id, deadline); resource_public_key_hash rides the
+// catalog ResourceData for v2-provisioned resources (see stampQurlV2RevocationMetadata).
+func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32, res *common.ResourceData) (artMsg *common.ACOpsResultMsg, err error) {
 	// should not happen
 	if knkMsg == nil || conn == nil {
 		log.Critical("processACOperation with nil input argument")
@@ -3524,6 +3740,9 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 		DestinationAddrs: dstAddrs,
 		OpenTime:         openTime + ACOpenCompensationTime, // compensate ac open time
 	}
+	// qURL v2 revocation metadata (P4a): stamp from res via the shared pure
+	// helper so prod and the test doubles can't diverge (see its godoc).
+	stampQurlV2RevocationMetadata(aopMsg, res)
 	aopBytes, marshalErr := json.Marshal(aopMsg)
 	if marshalErr != nil {
 		log.Error("server-agent(%s@%s)[processACOperation] failed to marshal AOP message: %v", knkMsg.UserId, srcAddr.String(), marshalErr)
@@ -3642,6 +3861,7 @@ func (s *UdpServer) processACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	s.metrics.IncrCounter(MetricBroadcastTotal)
 
@@ -3655,7 +3875,7 @@ func (s *UdpServer) processACOperationBroadcast(
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(baseCtx, DefaultBroadcastTimeout)
 		defer cancel()
-		artMsg, err := s.processACOperation(ctx, knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		artMsg, err := s.processACOperation(ctx, knkMsg, conns[0], srcAddr, dstAddrs, openTime, res)
 		elapsed := float64(time.Since(start).Milliseconds())
 		s.metrics.RecordLatency(MetricBroadcastDurationMs, elapsed)
 		s.metrics.RecordLatency(MetricBroadcastACLatencyMs, elapsed)
@@ -3688,7 +3908,7 @@ func (s *UdpServer) processACOperationBroadcast(
 			acStart := time.Now()
 			ctx, cancel := context.WithTimeout(baseCtx, DefaultBroadcastTimeout)
 			defer cancel()
-			artMsg, err := s.processACOperation(ctx, knkMsg, c, srcAddr, dstAddrs, openTime)
+			artMsg, err := s.processACOperation(ctx, knkMsg, c, srcAddr, dstAddrs, openTime, res)
 			s.metrics.RecordLatency(MetricBroadcastACLatencyMs, float64(time.Since(acStart).Milliseconds()))
 			results <- broadcastResult{artMsg, err, c.ACPeer.RecvAddr().String()}
 		}(conn)
@@ -3882,7 +4102,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			// resolveProcessACOperationBroadcast lets handler-site integration
 			// tests inject a fake AC response — see
 			// udpserver_publish_acktokens_test.go.
-			artMsg, err := s.resolveProcessACOperationBroadcast()(context.Background(), knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
+			artMsg, err := s.resolveProcessACOperationBroadcast()(context.Background(), knkMsg, connsCopy, srcAddr, dstAddrs, openTime, res)
 			if artMsg == nil {
 				// Keep the artMsgs map nil-free — the successCount loop and the
 				// failure-log loop below deref entries unconditionally (mirrors the
@@ -3987,6 +4207,10 @@ func (us *UdpServer) NewNhpServerHelper(ppd *core.PacketParserData, aspData *com
 	h := &plugins.NhpServerPluginHelper{}
 	h.StopSignal = ppd.ConnData.StopSignal
 	h.AspData = aspData
+	// Expose this server's own static (cell) public key so qURL v2 admission can
+	// bind the signed claims' cell_public_key_b64 to THIS cell. Std-base64, the
+	// same encoding the authenticated agent key (req.PublicKey) carries.
+	h.ServerCellPublicKeyB64 = us.device.PublicKeyBase64()
 
 	h.AuthWithNhpCallbackFunc = func(req *common.NhpAuthRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 		return us.handleNhpOpenResource(req, res)
@@ -3994,6 +4218,16 @@ func (us *UdpServer) NewNhpServerHelper(ppd *core.PacketParserData, aspData *com
 	h.ResolveResourceFunc = func(aspId, resId, srcIP string) (*common.ResourceData, error) {
 		_ = srcIP // Dynamic qURL rows resolve by exact (aspId, resId).
 		return us.ResolveInternalKnockResource(us.LifecycleCtx(), aspId, resId, "HandleKnockRequest-resource")
+	}
+
+	// Bind the metric emitter for plugins (mirrors the HTTP helper in
+	// httpserver.go; gate on metrics != nil before binding). The knock path
+	// — where qURL v2 admission runs (authWithNHPClaims) — uses THIS helper, so
+	// without this binding any helper.IncrCounter from the plugin (e.g.
+	// MetricQurlV2RevocationHashError) would be a silent no-op on the real v2
+	// admission path. The bound method value is also nil-receiver-safe.
+	if us.metrics != nil {
+		h.IncrCounter = us.metrics.IncrCounter
 	}
 
 	return h
@@ -4395,18 +4629,23 @@ func (s *UdpServer) SendMessage(md *core.MsgData) error {
 	return nil
 }
 
-// ProcessACOperation wraps the internal processACOperation method.
+// ProcessACOperation wraps the internal processACOperation method. res carries
+// qURL v2 revocation metadata (P4a) to stamp onto the AOP, or nil for legacy
+// callers.
 func (s *UdpServer) ProcessACOperation(
 	knkMsg *common.AgentKnockMsg,
 	acConn *ACConn,
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
-	return s.processACOperation(context.Background(), knkMsg, acConn, srcAddr, dstAddrs, openTime)
+	return s.processACOperation(context.Background(), knkMsg, acConn, srcAddr, dstAddrs, openTime, res)
 }
 
-// ProcessACOperationBroadcast wraps the internal processACOperationBroadcast method.
+// ProcessACOperationBroadcast wraps the internal processACOperationBroadcast
+// method. res carries qURL v2 revocation metadata (P4a) to stamp onto the AOP,
+// or nil for legacy callers.
 func (s *UdpServer) ProcessACOperationBroadcast(
 	parentCtx context.Context,
 	knkMsg *common.AgentKnockMsg,
@@ -4414,6 +4653,7 @@ func (s *UdpServer) ProcessACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
-	return s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, openTime)
+	return s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, openTime, res)
 }

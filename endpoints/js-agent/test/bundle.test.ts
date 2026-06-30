@@ -42,15 +42,31 @@ describe("production bundle", () => {
     expect(output.imports).toEqual([]);
 
     // Export names come from the metafile (no execution). Type-only exports
-    // (KnockRequest/KnockResult/KnockSuccess, the Renewal* types) are erased, so
-    // this is the complete runtime public surface PR-6 ships. Adding a new public
-    // export is *expected* to fail this assertion — that's the surface-change
-    // tripwire; the fix is to add the name to the list below.
+    // (KnockRequest/KnockResult/KnockSuccess, the Renewal* types, the qURL v2
+    // Fragment/Claims/Secret/EcPublicJwk/QurlV2Knock* types) are erased, so this is
+    // the complete runtime public surface. Adding a new public export is *expected*
+    // to fail this assertion — that's the surface-change tripwire; the fix is to add
+    // the name to the list below. The qURL v2 entries are the construct/call/catch
+    // surface the qurl.link page needs: knockQurlV2 (call), TrustStore +
+    // RelayAllowlist (construct), and the error classes it branches on
+    // (FragmentError, SignatureError, RelayUrlError, UnknownKidError, plus the
+    // parse-level StrictParseError/KeyLengthError/Base64UrlError that knockQurlV2
+    // can surface from a malformed fragment).
     expect([...output.exports].sort()).toEqual([
+      "Base64UrlError",
+      "FragmentError",
+      "KeyLengthError",
       "PUBKEY_FINGERPRINT_LEN",
+      "RelayAllowlist",
       "RelayError",
+      "RelayUrlError",
+      "SignatureError",
+      "StrictParseError",
+      "TrustStore",
+      "UnknownKidError",
       "generateDeviceKeyPair",
       "knock",
+      "knockQurlV2",
       "pubKeyFingerprint",
       "startRenewal",
       "x25519KeyFromBase64",

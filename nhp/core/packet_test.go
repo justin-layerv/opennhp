@@ -56,3 +56,58 @@ func TestPacketMinimalLengthPanicsAfterRelease(t *testing.T) {
 	}()
 	_ = pkt.MinimalLength()
 }
+
+// TestNHPRevHeaderType_ACReachability is the wire-reachability proof for the
+// qURL v2 revocation push (P4e). The AC's handler unit tests
+// (revocation_msghandler_test.go) call HandleUdpACRevocation directly and so
+// bypass RecvPrecheck — meaning they would all stay GREEN even if NHP_REV were
+// rejected at the receive gate, leaving a handler that can never fire in
+// production. This test fences that gap directly:
+//
+//   - CheckRecvHeaderType(NHP_REV) must be true for an NHP_AC device. This is
+//     the gate RecvPrecheck consults (packet.go); without the NHP_AC arm
+//     entry, a server-sent NHP_REV is dropped as "header type does not match
+//     device" before reaching the AC message routine.
+//   - It must NOT be accepted by the other device roles — only the AC receives
+//     it.
+//   - HeaderTypeToDeviceType(NHP_REV) must be NHP_SERVER: the server is the
+//     sender, mirroring the NHP_ARD precedent.
+//   - HeaderTypeToString(NHP_REV) must round-trip to a real name (not
+//     "UNKNOWN"), which proves the positional nhpHeaderTypeStrings entry is
+//     present and iota-aligned with the const.
+func TestNHPRevHeaderType_ACReachability(t *testing.T) {
+	// AC accepts NHP_REV at the receive gate.
+	acDev := &Device{deviceType: NHP_AC}
+	if !acDev.CheckRecvHeaderType(NHP_REV) {
+		t.Fatal("CheckRecvHeaderType(NHP_REV) = false for NHP_AC; the server-sent " +
+			"revocation push would be rejected by RecvPrecheck before reaching " +
+			"the AC message routine (add NHP_REV to the NHP_AC arm in packet.go)")
+	}
+
+	// No other device role receives NHP_REV — it is a server→AC message only.
+	for _, dt := range []struct {
+		name string
+		typ  int
+	}{
+		{"NHP_SERVER", NHP_SERVER},
+		{"NHP_AGENT", NHP_AGENT},
+		{"NHP_RELAY", NHP_RELAY},
+		{"NHP_DB", NHP_DB},
+	} {
+		d := &Device{deviceType: dt.typ}
+		if d.CheckRecvHeaderType(NHP_REV) {
+			t.Fatalf("CheckRecvHeaderType(NHP_REV) = true for %s; only the AC may receive it", dt.name)
+		}
+	}
+
+	// The server is the sender.
+	if got := HeaderTypeToDeviceType(NHP_REV); got != NHP_SERVER {
+		t.Fatalf("HeaderTypeToDeviceType(NHP_REV) = %d, want NHP_SERVER (%d)", got, NHP_SERVER)
+	}
+
+	// The positional string table is aligned with the const.
+	if got := HeaderTypeToString(NHP_REV); got == "UNKNOWN" || got == "" {
+		t.Fatalf("HeaderTypeToString(NHP_REV) = %q; nhpHeaderTypeStrings is missing "+
+			"the NHP_REV entry or is misaligned with the const block", got)
+	}
+}

@@ -83,10 +83,25 @@ func TestQurlLinkFrontend_VerifierWireContract(t *testing.T) {
 	if qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
 		wantSnippets := []string{
 			"QURL_LINK_CONFIG",
+			"qv1.",
+			"parseQurlBootstrapFragment",
+			"agent_private_key_b64",
+			"agent_public_key_b64",
+			"server_public_key_b64",
+			"relay_url",
+			"clearSensitiveFragment",
+			"isSensitiveQurlFragment",
+			"isAllowedRelayUrl",
+			"requested.username === ''",
+			"requested.password === ''",
+			"bootstrap.serverPublicKeyB64 && !QURL_LINK_CONFIG.serverStaticPubB64",
+			"bootstrap.serverPublicKeyB64 !== QURL_LINK_CONFIG.serverStaticPubB64",
+			"Relay verifier identity mismatch",
+			"Relay verifier origin not allowed",
 			"import('/nhp-agent.min.js')",
-			"agent.generateDeviceKeyPair()",
+			"agent.x25519KeyFromBase64(bootstrap.agentPrivateKeyB64)",
 			"agent.knock({",
-			"qurlAccessToken: accessToken",
+			"qurlAccessToken: bootstrap.accessToken",
 			"qurlUserAgent:",
 			"serverStaticPubB64",
 			"relayBaseUrl",
@@ -103,6 +118,13 @@ func TestQurlLinkFrontend_VerifierWireContract(t *testing.T) {
 		if strings.Contains(bodyStr, "https://resolve.") || strings.Contains(bodyStr, "/plugins/qurl") || strings.Contains(bodyStr, "appendBrowserTimings") {
 			t.Fatalf("deployed JS-agent qurl.link verifier still contains legacy browser-to-resolve code; browser ingress must be relay-only in env %q.", testConfig.Environment)
 		}
+		// NOTE: this is a substring byte-contract — it proves the qv1 bundle
+		// security guards are PRESENT in the deployed page (so an SPA refactor
+		// can't silently drop the userinfo check, the server-pubkey fail-closed/
+		// mismatch branches, or isAllowedRelayUrl), but it does not EXECUTE the
+		// rejection path. Driving isAllowedRelayUrl's reject cases (origin
+		// mismatch, embedded userinfo, non-root path, query/fragment) needs a
+		// headless-browser/JS harness that Go smoke is not. Tracked in #2748.
 		return
 	}
 

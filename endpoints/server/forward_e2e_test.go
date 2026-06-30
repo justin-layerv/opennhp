@@ -794,6 +794,7 @@ func (d *e2eForwarderDeps) ProcessACOperation(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	return nil, nil
 }
@@ -805,9 +806,10 @@ func (d *e2eForwarderDeps) ProcessACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	if len(conns) > 0 {
-		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime, res)
 	}
 	return nil, nil
 }
@@ -1133,6 +1135,7 @@ func (d *capturingForwarderDeps) ProcessACOperation(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	return nil, nil
 }
@@ -1144,9 +1147,10 @@ func (d *capturingForwarderDeps) ProcessACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	if len(conns) > 0 {
-		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime, res)
 	}
 	return nil, nil
 }
@@ -1361,8 +1365,11 @@ func (d *mockACForwarderDeps) ProcessACOperation(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
-	// Build the ServerACOpsMsg (same as real server)
+	// Build the ServerACOpsMsg (same as real server), including the P4a qURL v2
+	// revocation metadata when res carries it. Calls the SAME production helper
+	// as processACOperation so the mock's stamp can't drift from prod.
 	aopMsg := &common.ServerACOpsMsg{
 		UserId:           knkMsg.UserId,
 		DeviceId:         knkMsg.DeviceId,
@@ -1373,6 +1380,7 @@ func (d *mockACForwarderDeps) ProcessACOperation(
 		DestinationAddrs: dstAddrs,
 		OpenTime:         openTime,
 	}
+	stampQurlV2RevocationMetadata(aopMsg, res)
 	aopBytes, _ := json.Marshal(aopMsg)
 
 	d.t.Logf("ProcessACOperation: Sending NHP_AOP to mock AC (Resource=%s, User=%s)",
@@ -1443,9 +1451,10 @@ func (d *mockACForwarderDeps) ProcessACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	if len(conns) > 0 {
-		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime, res)
 	}
 	return nil, nil
 }
@@ -1870,6 +1879,7 @@ func (d *errorACForwarderDeps) ProcessACOperation(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	// Return the configured error
 	return &common.ACOpsResultMsg{
@@ -1885,9 +1895,10 @@ func (d *errorACForwarderDeps) ProcessACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	if len(conns) > 0 {
-		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime, res)
 	}
 	return nil, nil
 }
@@ -2067,6 +2078,7 @@ func (d *timeoutACForwarderDeps) ProcessACOperation(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	d.t.Log("ProcessACOperation: Simulating timeout (sleeping 3s)...")
 	// Simulate timeout by waiting longer than the expected timeout
@@ -2084,9 +2096,10 @@ func (d *timeoutACForwarderDeps) ProcessACOperationBroadcast(
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
+	res *common.ResourceData,
 ) (*common.ACOpsResultMsg, error) {
 	if len(conns) > 0 {
-		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime, res)
 	}
 	return nil, nil
 }

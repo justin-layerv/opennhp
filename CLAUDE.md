@@ -30,6 +30,7 @@ Commit format and full details: see [`docs/COMMIT_CONVENTION.md`](docs/COMMIT_CO
 | `relay` | NHP-Relay forwarder (`endpoints/relay`) |
 | `db` | Database service |
 | `nhp` | Core protocol library |
+| `ebpf` | eBPF datapath and committed BPF objects |
 | `internalauth` | Shared HMAC canonicalization module (cross-repo) |
 | `terraform` | Infrastructure |
 | `docker` | Container configuration |
@@ -94,6 +95,7 @@ make lint             # Run golangci-lint on nhp/ and endpoints/
 make lint-workflows   # Run actionlint + shellcheck on .github/workflows/ (mirrors CI)
 make test             # Run unit tests
 make test-local       # Run local e2e tests (requires etcd container)
+make test-ebpf        # Run eBPF datapath tests in-kernel (Linux + clang + CAP_BPF; run under sudo). See docs/TESTING.md
 make fuzz-quick       # Run fuzz tests briefly (FUZZTIME_QUICK, default 15s)
 make fuzz             # Run fuzz tests at full budget (FUZZTIME_LONG, default 60s)
 
@@ -117,6 +119,13 @@ trivy image nhp-server --severity HIGH,CRITICAL
 ```
 
 Both fuzz targets route through `scripts/run-fuzz.sh`, which distinguishes a real crasher (writes `testdata/fuzz/<NAME>/<sha>`) from the upstream Go-fuzz coordinator deadline-race flake (no reproducer file). If `fuzz-quick` ever goes red on a PR that didn't touch Go code, check the wrapper first — and after a Go toolchain bump, re-validate the deadline-race signature it greps for. The wrapper's decision tree is fenced by `tests/lints/run-fuzz/run-fixtures.sh`.
+
+The eBPF datapath workflow commits the native AC XDP object after stripping
+DWARF/debug sections while retaining BTF, so the required freshness gate compares
+load-relevant bytes and non-loadable metadata drift cannot churn git history or
+block branch protection; detailed triage lives in
+`docs/runbooks/ebpf-committed-object-freshness.md`.
+Current canonical eBPF toolchain pins (guarded by `scripts/check-ebpf-toolchain-pin-lockstep.sh`): EBPF_APT_SNAPSHOT=20260628T000000Z, EBPF_CLANG_PACKAGE=clang-18=1:18.1.3-1ubuntu1, EBPF_LLVM_PACKAGE=llvm-18=1:18.1.3-1ubuntu1, EBPF_LIBBPF_DEV_PACKAGE=libbpf-dev=1:1.3.0-2build2.
 
 The blue/green stale-target-group preflight in `.github/scripts/prune-missing-asg-target-groups.sh` uses an AWS CLI JMESPath query with JSON string literals for tab/newline output and classifies retryable AWS CLI failures from stderr text. Its shell fixtures cover the parsed `count<TAB>ARNs` layout and representative error strings, but not the real AWS CLI evaluator/output formatter; after an AWS CLI or jmespath major bump, re-run the script in `DRY_RUN=true` against a real standby ASG before trusting that path.
 
@@ -242,6 +251,7 @@ This file stays light. Subtree-scoped rules live in nested `CLAUDE.md` files (au
 | Upstream sync process | `docs/UPSTREAM_SYNC.md` |
 | Session enforcement (server-side authz) | `docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md` |
 | NHP-Relay topology + re-knock authz (taking nhp-server private, #2208) | `docs/design/NHP_RELAY_TOPOLOGY.md` |
+| qURL v2 keyed identity + admission contract (signed claims, NHP Server Contract) | `docs/design/QURL_V2_KEYED_IDENTITY.md` |
 | Commit convention + scopes table | `docs/COMMIT_CONVENTION.md` |
 | Runbooks index | `docs/runbooks/README.md` |
 | Security monitoring + secrets / `NHP_INTERNAL_AUTH_SECRET` / KMS exception | `docs/SECURITY.md` |

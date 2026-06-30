@@ -58,6 +58,8 @@ When `js_agent_enabled` is true, Terraform also requires
 into `index.html`, and emits a `connect-src` directive for the relay origin
 only. Keep the relay value paired with `relay_dns_name`; without it, the browser
 blocks the agent's `POST /relay/{serverId}` before the backend sees the request.
+The qurl-service qv1 bootstrap bundle also carries its intended relay origin;
+the page accepts it only when it matches this Terraform-rendered static origin.
 
 Terraform reads `nhp-agent.min.js.sri` to render the browser agent script tag's
 `integrity="sha384-..."` metadata. Do not hand-edit the hash. Regenerate the

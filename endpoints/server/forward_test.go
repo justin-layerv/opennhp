@@ -1479,10 +1479,10 @@ func (d *testForwarderDepsWithDevice) ResolveAuthSvcProvider(context.Context, st
 func (d *testForwarderDepsWithDevice) LifecycleCtx() context.Context {
 	return context.Background()
 }
-func (d *testForwarderDepsWithDevice) ProcessACOperation(*common.AgentKnockMsg, *ACConn, *common.NetAddress, []*common.NetAddress, uint32) (*common.ACOpsResultMsg, error) {
+func (d *testForwarderDepsWithDevice) ProcessACOperation(*common.AgentKnockMsg, *ACConn, *common.NetAddress, []*common.NetAddress, uint32, *common.ResourceData) (*common.ACOpsResultMsg, error) {
 	return nil, nil
 }
-func (d *testForwarderDepsWithDevice) ProcessACOperationBroadcast(context.Context, *common.AgentKnockMsg, []*ACConn, *common.NetAddress, []*common.NetAddress, uint32) (*common.ACOpsResultMsg, error) {
+func (d *testForwarderDepsWithDevice) ProcessACOperationBroadcast(context.Context, *common.AgentKnockMsg, []*ACConn, *common.NetAddress, []*common.NetAddress, uint32, *common.ResourceData) (*common.ACOpsResultMsg, error) {
 	return nil, nil
 }
 func (d *testForwarderDepsWithDevice) PublishACKTokens(context.Context, *common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) error {

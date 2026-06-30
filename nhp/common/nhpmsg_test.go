@@ -1,6 +1,7 @@
 package common
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -186,5 +187,125 @@ func TestResourceInfo_DestHost_PortSuffixWithZeroPort(t *testing.T) {
 
 	if got := res.DestHost(); got != "" {
 		t.Fatalf("DestHost() = %q, want empty host rather than silently dropping required port suffix", got)
+	}
+}
+
+// TestServerACOpsMsg_QurlV2Metadata_RoundTrip proves the qURL v2 revocation
+// metadata (P4a) survives a marshal/unmarshal cycle of the ac<->server AOP wire
+// with the exact values intact, so the AC reads back what the server stamped.
+// If a JSON tag is ever renamed on one side only, this catches it.
+func TestServerACOpsMsg_QurlV2Metadata_RoundTrip(t *testing.T) {
+	orig := &ServerACOpsMsg{
+		UserId:           "u",
+		AuthServiceId:    "asp",
+		ResourceId:       "res",
+		SourceAddrs:      []*NetAddress{{Ip: "203.0.113.9", Port: 5555}},
+		DestinationAddrs: []*NetAddress{{Ip: "10.0.0.5", Port: 8443}},
+		OpenTime:         60,
+
+		QurlUserPublicKeyHash: "a1b2c3",
+		ResourcePublicKeyHash: "d4e5f6",
+		SessionId:             "sess_123",
+		AdmissionId:           "adm_test123",
+		RevocationEpoch:       42,
+		Deadline:              1781910300,
+	}
+
+	b, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got ServerACOpsMsg
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if got.QurlUserPublicKeyHash != orig.QurlUserPublicKeyHash {
+		t.Errorf("QurlUserPublicKeyHash = %q, want %q", got.QurlUserPublicKeyHash, orig.QurlUserPublicKeyHash)
+	}
+	if got.ResourcePublicKeyHash != orig.ResourcePublicKeyHash {
+		t.Errorf("ResourcePublicKeyHash = %q, want %q", got.ResourcePublicKeyHash, orig.ResourcePublicKeyHash)
+	}
+	if got.SessionId != orig.SessionId {
+		t.Errorf("SessionId = %q, want %q", got.SessionId, orig.SessionId)
+	}
+	if got.AdmissionId != orig.AdmissionId {
+		t.Errorf("AdmissionId = %q, want %q", got.AdmissionId, orig.AdmissionId)
+	}
+	if got.RevocationEpoch != orig.RevocationEpoch {
+		t.Errorf("RevocationEpoch = %d, want %d", got.RevocationEpoch, orig.RevocationEpoch)
+	}
+	if got.Deadline != orig.Deadline {
+		t.Errorf("Deadline = %d, want %d", got.Deadline, orig.Deadline)
+	}
+}
+
+// TestServerACOpsMsg_LegacyAOP_OmitsQurlV2Metadata is the load-bearing
+// legacy-safety test for P4a: a legacy / non-qURL-v2 AOP leaves the six new
+// fields zero-valued, and because they are all omitempty the marshaled wire
+// MUST NOT contain their JSON keys at all. This is what keeps the AOP
+// byte-identical for pre-v2 servers and ACs — a round-trip test alone does not
+// prove it. If anyone drops an omitempty (or adds a non-omitempty field), the
+// presence check here fails.
+func TestServerACOpsMsg_LegacyAOP_OmitsQurlV2Metadata(t *testing.T) {
+	legacy := &ServerACOpsMsg{
+		UserId:           "u",
+		AuthServiceId:    "asp",
+		ResourceId:       "res",
+		SourceAddrs:      []*NetAddress{{Ip: "203.0.113.9", Port: 5555}},
+		DestinationAddrs: []*NetAddress{{Ip: "10.0.0.5", Port: 8443}},
+		OpenTime:         60,
+		// qURL v2 fields intentionally left zero — this is the legacy shape.
+	}
+
+	b, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	wire := string(b)
+
+	for _, key := range []string{
+		"qurlUsrPubKeyHash",
+		"resPubKeyHash",
+		"sessId",
+		"admId",
+		"revEpoch",
+		"deadline",
+	} {
+		if strings.Contains(wire, key) {
+			t.Errorf("legacy AOP wire must omit qURL v2 key %q (omitempty regression), got: %s", key, wire)
+		}
+	}
+}
+
+// TestServerACOpsMsg_V2AOP_EmitsExpectedKeys pins the on-wire JSON tag names for
+// the populated path, so the server stamper and the AC reader cannot drift to
+// different keys without a test failing. (RevocationEpoch is omitempty, so 0 is
+// absent; a non-zero value is asserted present.)
+func TestServerACOpsMsg_V2AOP_EmitsExpectedKeys(t *testing.T) {
+	v2 := &ServerACOpsMsg{
+		QurlUserPublicKeyHash: "a1b2c3",
+		ResourcePublicKeyHash: "d4e5f6",
+		SessionId:             "sess_123",
+		AdmissionId:           "adm_test123",
+		RevocationEpoch:       42,
+		Deadline:              1781910300,
+	}
+	b, err := json.Marshal(v2)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	wire := string(b)
+	for _, key := range []string{
+		`"qurlUsrPubKeyHash":"a1b2c3"`,
+		`"resPubKeyHash":"d4e5f6"`,
+		`"sessId":"sess_123"`,
+		`"admId":"adm_test123"`,
+		`"revEpoch":42`,
+		`"deadline":1781910300`,
+	} {
+		if !strings.Contains(wire, key) {
+			t.Errorf("populated AOP wire missing %s, got: %s", key, wire)
+		}
 	}
 }

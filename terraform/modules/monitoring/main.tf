@@ -1284,6 +1284,116 @@ resource "aws_cloudwatch_metric_alarm" "ac_registration_latency" {
   })
 }
 
+# ==================== qURL v2 Revocation SLO (#2792) ====================
+#
+# Three complementary alarms cover the revocation-latency rollout gate: the
+# latency p99 alarm catches SLOW-but-delivered revokes; the aged-out alarm
+# catches NEVER-delivered ones; the untrackable alarm catches impossible
+# connection-identity invariant breaks after fanout enqueue. The full rationale
+# — the SLO number, the EMF-backs-p99 detail, the histogram coverage boundary —
+# is canonical on RevocationDeliveryLatencyP99SLO in endpoints/server/revocation_retry.go.
+#
+# All three key on the nhp-server publisher's base dim set {Environment, Cell};
+# keep in lockstep with buildServerMetricDimensions() in endpoints/server/udpserver.go
+# (terraform/CLAUDE.md "Metric / Alarm Dim-Set Rules" — a partial dim set
+# selects a non-existent stream and the alarm sits in INSUFFICIENT_DATA forever).
+#
+# All three use treat_missing_data = "notBreaching": the revocation retry engine
+# is default-OFF (NHP_REVOCATION_RETRY_ENABLED), so until it is armed fleet-wide
+# there are no samples and no aged-out/untrackable events. Absence is "no revokes
+# / engine not yet armed," not a fault — matches the KnockLatency precedent.
+
+# Revocation delivery latency p99 (the SLO). The threshold (15000 ms) MUST stay
+# in lockstep with RevocationDeliveryLatencyP99SLO (15s) in
+# endpoints/server/revocation_retry.go — MILLISECONDS because RecordLatency
+# records ms. Enforced at lint time by scripts/check-revocation-slo-lockstep.sh.
+resource "aws_cloudwatch_metric_alarm" "revocation_delivery_latency_high" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-revocation-delivery-latency"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "RevocationDeliveryLatency"
+  namespace           = "LayerV/NHP"
+  period              = 60
+  extended_statistic  = "p99"
+  threshold           = 15000
+  alarm_description   = "qURL v2 revocation delivery latency p99 (NHP_REV emit -> AC NHP_RACK ack) exceeded the 15s SLO (#2792). Keep the threshold in lockstep with RevocationDeliveryLatencyP99SLO in endpoints/server/revocation_retry.go."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Revocation aged out — the non-delivery signal. ANY nonzero value is an
+# immediate-revocation the control plane could NOT prove reached its AC before
+# the age-out deadline (the DE-Risk #5 degraded signal, emitted never silently
+# dropped — see MetricRevocationAgedOut in endpoints/server/msghandler.go). This
+# is the companion the latency-p99 alarm cannot replace: an un-acked revoke ages
+# out WITHOUT recording a latency sample, so it is invisible to the histogram.
+# Sum >= 1 over the period, mirroring the ack_token_shared_store_failure pattern.
+resource "aws_cloudwatch_metric_alarm" "revocation_aged_out" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-revocation-aged-out"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "RevocationAgedOut"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "qURL v2 revocation could NOT be proven delivered to an AC before the age-out deadline (RevocationAgedOut, #2792/#2793). Any nonzero value is an immediate-revocation the control plane could not confirm reached the AC — investigate AC connectivity / NHP_REV delivery before relying on immediate revoke."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Revocation untrackable — an invariant-break signal, distinct from retry
+# age-out. ANY nonzero value means an NHP_REV was enqueued to a live AC
+# connection, but the retry engine could not key that target to ACId +
+# authenticated pubkey and therefore cannot prove, retry, or clear delivery for
+# that target. This should be zero outside code/registry bugs.
+resource "aws_cloudwatch_metric_alarm" "revocation_untrackable" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-revocation-untrackable"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "RevocationUntrackable"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "qURL v2 revocation fanout was enqueued but could not be keyed to ACId/authenticated pubkey for retry proof (RevocationUntrackable, #2793). Any nonzero value is a live-connection registry invariant break; check server logs for 'cannot track fanout'."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
 # ==================== DynamoDB Monitoring ====================
 
 # DynamoDB throttling — per-table read+write throttle events.

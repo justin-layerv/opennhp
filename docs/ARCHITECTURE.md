@@ -975,7 +975,9 @@ Internet
 ## QURL Link Architecture
 
 The QURL Link system provides secure, tokenized access to protected resources. Users receive a link
-(e.g., `qurl.link/#at_xxx`) that initiates NHP authentication before granting access.
+that initiates NHP authentication before granting access. Legacy environments use a plaintext
+`#at_...` fragment; JS-agent environments use a `#qv1.<bundle>` fragment containing the qURL access
+token, qURL-scoped NHP agent private key, NHP server public key, relay origin, and auth service ID.
 
 ### Architecture Overview
 
@@ -1018,20 +1020,20 @@ The QURL Link system provides secure, tokenized access to protected resources. U
 ### Authentication Flow
 
 ```
-1. User clicks link: qurl.link/#at_xxx
+1. User clicks link: qurl.link/#qv1.<bundle>
         │
         ▼
 2. CloudFront serves S3 redirect page
         │
         ▼
-3. JavaScript extracts token, redirects to:
-   resolve.qurl.link/plugins/qurl?token=xxx
+3. JavaScript extracts the bootstrap bundle, clears the fragment, and knocks
+   the relay with the qURL-scoped NHP agent key
         │
         ▼
-4. NHP Server validates token with QURL Service API
+4. NHP Server validates the token and authenticated agent public key with QURL Service API
         │
         ▼
-5. NHP Server sends NHP_AOP to AC (adds user IP to ipset)
+5. NHP Server opens access on the AC
         │
         ▼
 6. NHP Server redirects user to: {appId}.qurl.site
