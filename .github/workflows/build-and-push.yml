@@ -2643,17 +2643,14 @@ jobs:
     # job only waits out the common CloudFront policy propagation window before
     # handing off to smoke.
     #
-    # deploy-sandbox-relay is deliberately NOT in needs here. As of #2646
-    # deploy-relay.sh polls its instance refresh to completion and FAILS LOUD on
-    # a bad roll, so a broken relay deploy already surfaces on its own red
-    # deploy-sandbox-relay job + notify's DEPLOY_FAILED loop — validate does not
-    # need to wait for it to make a bad roll observable. And the relay is dark
-    # (validate/smoke don't exercise it), so ordering validate after the relay
-    # roll would only add latency (up to the relay poll's 15-min ceiling) to
-    # every sandbox deploy for no coverage. The real relay post-deploy smoke
-    # (HTTP/forward reachability) and its validate-ordering land with #6, where
-    # they have teeth.
-    needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green, deploy-sandbox-qurl]
+    # #2680 (#6) gives the relay real teeth in this job. The qurl relay
+    # bootstrap smoke below imports the deployed qurl.link JS-agent bundle and
+    # sends a shaped bogus-token knock through the real relay, expecting an
+    # authenticated reResolve ACK back from nhp-server/qurl-service. Validation
+    # now ORDERS after deploy-sandbox-relay, but only the relay smoke and
+    # deployment tracking gate on relay success. That keeps unrelated
+    # integration/E2E/CSP validation visible when the relay leg is already red.
+    needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green, deploy-sandbox-qurl, deploy-sandbox-relay]
     if: |
       always() &&
       needs.deploy-sandbox-infra.result == 'success' &&
@@ -2661,12 +2658,13 @@ jobs:
       needs.deploy-sandbox-qurl.result != 'cancelled'
     runs-on: ubuntu-latest
     environment: sandbox
-    # Overall budget covers the existing validation/integration/E2E phases plus
-    # the bounded CSP propagation wait. Individual long-running run steps also
-    # carry step-level timeouts so a hang in pre-existing validation does not
-    # inherit the full CSP propagation budget. The remaining headroom is for
-    # checkout, AWS setup, SSM reads, and summary steps.
-    timeout-minutes: 60
+    # Overall budget covers the existing validation/integration/E2E phases, the
+    # bounded CSP propagation wait, and the relay bootstrap smoke. Individual
+    # long-running run steps also carry step-level timeouts so a hang in
+    # pre-existing validation does not inherit the full propagation/probe budget.
+    # The remaining headroom is for checkout, AWS setup, SSM reads, and summary
+    # steps.
+    timeout-minutes: 65
     outputs:
       qurl_link_url: ${{ steps.qurl-domain-sandbox.outputs.qurl_link_url }}
     steps:
@@ -2843,8 +2841,27 @@ jobs:
           fi
           echo "Continuing so the full smoke suite still runs; TestQurlLinkFrontend_CSPOmitsUnsafeInlineScript remains the hard CSP gate."
 
+      # Node setup is only needed when the relay smoke will run; relay failure is
+      # already loud on deploy-sandbox-relay and should not spend extra setup time.
+      - name: Setup Node for qURL relay smoke
+        if: needs.deploy-sandbox-relay.result == 'success'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+
+      - name: Smoke qURL JS-agent relay bootstrap
+        if: needs.deploy-sandbox-relay.result == 'success'
+        # The helper has three bounded legs (HTML fetch, bundle fetch, relay
+        # knock), each controlled by QURL_RELAY_SMOKE_TIMEOUT_MS plus short
+        # backoffs. Five minutes keeps headroom without hiding true hangs.
+        timeout-minutes: 5
+        env:
+          QURL_LINK_URL: ${{ steps.qurl-domain-sandbox.outputs.qurl_link_url }}
+        run: node scripts/qurl-relay-bootstrap-smoke.mjs "$QURL_LINK_URL"
+
       - name: Deployment Summary
         env:
+          RELAY_DEPLOY_RESULT: ${{ needs.deploy-sandbox-relay.result }}
           NLB_DNS: ${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}
         run: |
           # #2628: nlb_dns is empty when take_server_private (no public NLB) — label it
@@ -2868,12 +2885,24 @@ jobs:
             echo "- Post-deployment validation script executed"
             echo "- Integration tests completed (etcd tests skipped without mTLS certs)"
             echo "- E2E demo flow tests executed"
+            if [[ "$RELAY_DEPLOY_RESULT" == "success" ]]; then
+              echo "- qURL JS-agent relay bootstrap smoke passed"
+            else
+              echo "- qURL JS-agent relay bootstrap smoke skipped because deploy-sandbox-relay was $RELAY_DEPLOY_RESULT"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Record the deployed SHA only after the relay cutover smoke path could run;
+      # otherwise scheduled deploy should retry the unverified #2680 cutover.
       - name: Update Deployment Tracking
+        if: success() && needs.deploy-sandbox-relay.result == 'success'
         env:
           NEW_SHA: ${{ github.sha }}
         run: |
+          # #2680 treats the JS-agent -> relay cutover as part of a complete
+          # sandbox deploy. If the relay leg failed/skipped and the smoke could
+          # not run, leave deployed-commit on the previous SHA so the scheduled
+          # deploy path retries instead of recording an unverified cutover.
           # Save the current deployed-commit as -previous before overwriting,
           # so sandbox rollback tooling can target the actual previous version
           # (not the current — possibly broken — one). Mirrors the prod pattern

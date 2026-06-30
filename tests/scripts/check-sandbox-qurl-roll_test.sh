@@ -7,14 +7,17 @@
 # advances unless CI rolls it. Prod (promote-to-prod.yml deploy-qurl) did;
 # sandbox did not, so env-var changes silently no-op'd until a downstream
 # consumer 403'd (qurl-service #335). The deploy-sandbox-qurl job closes that
-# gap. This test fails if the load-bearing pieces of that job regress or are
-# removed, so the gap cannot silently reopen.
+# gap. The same validate job now also owns the qURL JS-agent → relay bootstrap
+# smoke (#2680), so this test fences that relay ordering/wiring too. It fails
+# if the load-bearing pieces regress or are removed, so those gaps cannot
+# silently reopen.
 #
 # Asserted against the REAL build-and-push.yml (not a fixture) — the invariants
-# are simple presence checks, not subtle ordering, so a real-tree assertion is
-# the proportionate guard. The job block is extracted by awk and each assertion
-# is scoped to it, so an unrelated match elsewhere in the file cannot satisfy a
-# check (and a future reorder that moves these lines OUT of the job fails loud).
+# are simple wiring checks plus the one load-bearing smoke-before-tracking order
+# check, so a real-tree assertion is the proportionate guard. The job block is
+# extracted by awk and each assertion is scoped to it, so an unrelated match
+# elsewhere in the file cannot satisfy a check (and a future reorder that moves
+# these lines OUT of the job fails loud).
 #
 # Usage: bash tests/scripts/check-sandbox-qurl-roll_test.sh
 # ============================================================================
@@ -57,6 +60,58 @@ assert_in() {
     report_pass "$label"
   else
     report_fail "$label" "pattern not found in $job job: $re"
+  fi
+}
+
+# Extract a named step block from an already-extracted job block, stopping at the
+# next step at the same indentation. Keeps step-specific gates from being
+# satisfied by the same expression elsewhere in the job.
+extract_step() {
+  local block="$1" step="$2"
+  awk -v step="$step" '
+    $0 ~ "^[[:space:]]*- name: " step "[[:space:]]*$" { capture=1; print; next }
+    capture && /^[[:space:]]*- name: / { exit }
+    capture { print }
+  ' <<< "$block"
+}
+
+assert_step_in() {
+  local block="$1" job="$2" step="$3" label="$4" re="$5"
+  local step_block
+  step_block=$(extract_step "$block" "$step")
+  if [[ -z "$step_block" ]]; then
+    report_fail "$label" "step not found in $job job: $step"
+    return
+  fi
+  assert_in "$step_block" "$job step '$step'" "$label" "$re"
+}
+
+assert_step_not_in() {
+  local block="$1" job="$2" step="$3" label="$4" re="$5"
+  local step_block
+  step_block=$(extract_step "$block" "$step")
+  if [[ -z "$step_block" ]]; then
+    report_fail "$label" "step not found in $job job: $step"
+    return
+  fi
+  if grep -Eq -- "$re" <<< "$step_block"; then
+    report_fail "$label" "unexpected pattern found in $job step '$step': $re"
+  else
+    report_pass "$label"
+  fi
+}
+
+assert_step_order() {
+  local block="$1" job="$2" before="$3" after="$4" label="$5"
+  local before_line after_line
+  before_line=$(grep -nF -- "- name: $before" <<< "$block" | head -n1 | cut -d: -f1)
+  after_line=$(grep -nF -- "- name: $after" <<< "$block" | head -n1 | cut -d: -f1)
+  if [[ -z "$before_line" || -z "$after_line" ]]; then
+    report_fail "$label" "missing step(s) in $job job: before='$before' after='$after'"
+  elif [[ "$before_line" -lt "$after_line" ]]; then
+    report_pass "$label"
+  else
+    report_fail "$label" "step '$before' must appear before '$after' in $job job"
   fi
 }
 
@@ -129,6 +184,34 @@ else
     'needs:.*deploy-sandbox-qurl'
   assert_in "$VALIDATE" deploy-sandbox-validate "validate skips only on cancelled qurl (not on roll failure)" \
     "needs\.deploy-sandbox-qurl\.result != 'cancelled'"
+
+  # Relay ordering/smoke guard (#2680): once qurl.link is in JS-agent mode, a
+  # green sandbox deploy must prove the shipped verifier + deployed agent bundle
+  # can traverse the real relay. The smoke has teeth only if validate waits for
+  # a successful relay deploy leg and passes the same qurl.link origin resolved
+  # from SSM to the helper.
+  assert_in "$VALIDATE" deploy-sandbox-validate "validate needs deploy-sandbox-relay (orders smoke after relay roll)" \
+    'needs:.*deploy-sandbox-relay'
+  assert_in "$VALIDATE" deploy-sandbox-validate "validate gates relay smoke on relay deploy success" \
+    "needs\.deploy-sandbox-relay\.result == 'success'"
+  assert_step_in "$VALIDATE" deploy-sandbox-validate "Setup Node for qURL relay smoke" "setup-node for relay smoke is gated on relay deploy success" \
+    "needs\.deploy-sandbox-relay\.result == 'success'"
+  assert_step_order "$VALIDATE" deploy-sandbox-validate "Smoke qURL JS-agent relay bootstrap" "Update Deployment Tracking" \
+    "relay smoke runs before deployment tracking"
+  assert_step_not_in "$VALIDATE" deploy-sandbox-validate "Smoke qURL JS-agent relay bootstrap" "relay smoke is not continue-on-error" \
+    'continue-on-error'
+  assert_step_in "$VALIDATE" deploy-sandbox-validate "Smoke qURL JS-agent relay bootstrap" "relay smoke has bounded headroom" \
+    'timeout-minutes:[[:space:]]*5'
+  assert_step_in "$VALIDATE" deploy-sandbox-validate "Update Deployment Tracking" "deployment tracking records only after relay success" \
+    "needs\.deploy-sandbox-relay\.result == 'success'"
+  assert_step_in "$VALIDATE" deploy-sandbox-validate "Update Deployment Tracking" "deployment tracking requires prior step success" \
+    'success\(\).*needs\.deploy-sandbox-relay\.result'
+  assert_in "$VALIDATE" deploy-sandbox-validate "relay smoke uses the SSM-resolved qurl link URL" \
+    'QURL_LINK_URL:.*qurl-domain-sandbox\.outputs\.qurl_link_url'
+  # SC2016: the $QURL_LINK_URL in the grep pattern is literal workflow text.
+  # shellcheck disable=SC2016
+  assert_in "$VALIDATE" deploy-sandbox-validate "relay smoke invokes qurl-relay-bootstrap-smoke helper" \
+    'node scripts/qurl-relay-bootstrap-smoke\.mjs "\$QURL_LINK_URL"'
 fi
 
 echo

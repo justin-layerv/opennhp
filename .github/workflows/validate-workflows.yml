@@ -220,6 +220,14 @@ jobs:
       - name: Test sandbox qurl ECS roll (issue #1634)
         run: bash tests/scripts/check-sandbox-qurl-roll_test.sh
 
+      # PR-time fence for the #2680 post-deploy relay smoke helper. The live
+      # network probe runs only after sandbox deploy, but parser/token/SRI guard
+      # regressions should fail before merge.
+      - name: Test qURL relay bootstrap smoke helper
+        run: |
+          node --check scripts/qurl-relay-bootstrap-smoke.mjs
+          node scripts/qurl-relay-bootstrap-smoke.mjs --self-test
+
       # Behavioral fence for the shared ECS deploy helper used by sandbox and
       # prod qurl rolls. It must reject real rollbacks, while accepting a newer
       # same-family task def only when a concurrent qurl-service deploy has

@@ -450,6 +450,13 @@ lint-workflows:
 	}
 	@python3 tests/scripts/test_promote_to_prod_gating.py
 	@bash tests/scripts/check-sandbox-qurl-roll_test.sh
+	@command -v node >/dev/null 2>&1 || { \
+		echo "$(COLOUR_RED)[OpenNHP] node not found. Install Node.js 18+ to run the qURL relay bootstrap smoke self-test$(END_COLOUR)"; \
+		exit 1; \
+	}
+	@node -e 'const major = Number(process.versions.node.split(".")[0]); if (major < 18) { console.error("Node.js 18+ is required for scripts/qurl-relay-bootstrap-smoke.mjs; found " + process.version); process.exit(1); }'
+	@node --check scripts/qurl-relay-bootstrap-smoke.mjs
+	@node scripts/qurl-relay-bootstrap-smoke.mjs --self-test
 	@shellcheck .github/scripts/deploy-ecs-service.sh tests/scripts/deploy-ecs-service_test.sh
 	@bash tests/scripts/deploy-ecs-service_test.sh
 	@bash tests/scripts/dependabot-go-tidy_test.sh
