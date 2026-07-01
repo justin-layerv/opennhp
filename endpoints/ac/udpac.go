@@ -348,6 +348,37 @@ func (a *UdpAC) ConntrackNetlinkIndexOriginCount() (uint64, bool) {
 	return cf.NetlinkIndexOriginCount(), true
 }
 
+// ConntrackNetlinkIndexResyncAttemptCount mirrors ConntrackNetlinkDeletedCount
+// for runtime event-index resync attempts after stream loss/skew.
+func (a *UdpAC) ConntrackNetlinkIndexResyncAttemptCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexResyncAttemptCount(), true
+}
+
+// ConntrackNetlinkIndexResyncSuccessCount mirrors ConntrackNetlinkDeletedCount
+// for runtime event-index resyncs that installed a rebuilt generation.
+func (a *UdpAC) ConntrackNetlinkIndexResyncSuccessCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexResyncSuccessCount(), true
+}
+
+// ConntrackNetlinkIndexResyncFailureCount mirrors ConntrackNetlinkDeletedCount
+// for runtime event-index resync attempts that failed. The flusher stays on the
+// safe dump/filter/delete fallback while this rises.
+func (a *UdpAC) ConntrackNetlinkIndexResyncFailureCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexResyncFailureCount(), true
+}
+
 // BpfConntrackStats returns the eBPF conntrack stats snapshot and ok=true when
 // the EBPFXDP BpfFlusher is wired; zero, false otherwise.
 func (a *UdpAC) BpfConntrackStats() (BpfConntrackStats, bool) {

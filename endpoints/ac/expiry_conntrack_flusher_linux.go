@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -96,8 +97,14 @@ type ConntrackFlusher struct {
 	// multicast events. When healthy, BackendNetlink Flush uses it to avoid the
 	// O(table) dump and delete only origins already known for the FlowKey. If
 	// the event stream errors, Flush falls back to dump-and-filter rather than
-	// silently missing flows.
-	eventIndex *ctEventIndex
+	// silently missing flows. The generation pointer is atomic so the healthy
+	// hot path does not take a flusher-level mutex; eventIndexMu protects the
+	// archive/swap boundary used by cumulative gauges.
+	eventIndexMu sync.RWMutex
+	eventIndex   atomic.Pointer[ctEventIndex]
+	// newEventIndex constructs a fresh subscription-backed index generation.
+	// Tests replace it so resync behavior can be fenced without CAP_NET_ADMIN.
+	newEventIndex func() (*ctEventIndex, error)
 
 	// netlinkIndexedFlushes counts Flush calls served from eventIndex (including
 	// indexed no-match). This is the runtime proof that the #2908 O(matches)
@@ -110,6 +117,30 @@ type ConntrackFlusher struct {
 	// serving all scheduled-expiry Flushes, but correctness is still preserved by
 	// the fallback dump.
 	netlinkIndexFallbackDumps atomic.Uint64
+	// netlinkIndexArchivedEvents/Error/PendingOverflow preserve cumulative
+	// generation-local event counters when resync swaps in a fresh event index.
+	// The current generation still owns its live counts; public accessors return
+	// archived + current so a successful resync does not erase the overrun signal.
+	netlinkIndexArchivedEvents           atomic.Uint64
+	netlinkIndexArchivedEventErrors      atomic.Uint64
+	netlinkIndexArchivedPendingOverflows atomic.Uint64
+	// Runtime resync attempts/successes/failures make the #2946 recovery path
+	// observable. resyncInFlight coalesces error bursts; resyncMu serializes
+	// explicit/test-driven calls with the asynchronous recovery worker.
+	netlinkIndexResyncAttempts  atomic.Uint64
+	netlinkIndexResyncSuccesses atomic.Uint64
+	netlinkIndexResyncFailures  atomic.Uint64
+	netlinkIndexResyncInFlight  atomic.Bool
+	netlinkIndexResyncMu        sync.Mutex
+	netlinkIndexResyncLaunchMu  sync.Mutex
+	netlinkIndexResyncCancelMu  sync.Mutex
+	netlinkIndexResyncCancel    context.CancelFunc
+	netlinkIndexResyncWG        sync.WaitGroup
+	netlinkIndexLastResyncNanos atomic.Int64
+	// Test hook: pauses a resync worker after the pre-lock closed check, before
+	// it waits on netlinkIndexResyncMu. Nil in production.
+	netlinkIndexBeforeResyncLock func()
+	closed                       atomic.Bool
 
 	// netlinkIndexAuthoritativeDumps counts intentional O(table) dumps requested
 	// by RescheduleEarlier/immediate revocation so that operators can separate
@@ -168,7 +199,7 @@ type ConntrackFlusher struct {
 //     silently start in the old O(table)-per-Flush regime.
 func NewConntrackFlusher(opts ...ConntrackFlusherOption) (*ConntrackFlusher, error) {
 	cfg := resolveConntrackFlusherConfig(opts...)
-	f := &ConntrackFlusher{backend: cfg.backend, ctOps: realCtNetlinkOps{}}
+	f := &ConntrackFlusher{backend: cfg.backend, ctOps: realCtNetlinkOps{}, newEventIndex: newCtEventIndex}
 
 	switch cfg.backend {
 	case BackendNetlink:
@@ -177,18 +208,22 @@ func NewConntrackFlusher(opts ...ConntrackFlusherOption) (*ConntrackFlusher, err
 			return nil, fmt.Errorf("conntrack netlink backend init: %w", err)
 		}
 		f.pool = pool
-		eventIndex, err := newCtEventIndex()
+		eventIndex, err := f.openEventIndex()
 		if err != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("conntrack event index init: %w", err)
 		}
-		f.eventIndex = eventIndex
-		indexed, err := f.rebuildEventIndex(context.Background(), time.Now().Add(defaultNetlinkIndexBackfillTimeout))
+		indexed, err := f.rebuildEventIndex(context.Background(), eventIndex, time.Now().Add(defaultNetlinkIndexBackfillTimeout))
 		if err != nil {
+			_ = eventIndex.Close()
 			_ = f.Close()
 			return nil, fmt.Errorf("conntrack event index backfill: %w", err)
 		}
-		log.Info("[ConntrackFlusher] using direct netlink (NFNL_SUBSYS_CTNETLINK) backend — pool=%d, IPv4+IPv6, event-indexed-origins=%d", cfg.poolSize, indexed)
+		if f.installStartupEventIndex(eventIndex) {
+			log.Info("[ConntrackFlusher] using direct netlink (NFNL_SUBSYS_CTNETLINK) backend — pool=%d, IPv4+IPv6, event-indexed-origins=%d", cfg.poolSize, eventIndex.OriginCount())
+		} else {
+			log.Warning("[ConntrackFlusher] using direct netlink (NFNL_SUBSYS_CTNETLINK) backend — pool=%d, IPv4+IPv6, event index started unhealthy; fallback dumps active until runtime resync restores the hot path, indexed-origins-discarded=%d", cfg.poolSize, indexed)
+		}
 	default: // BackendExec
 		bin, err := exec.LookPath("conntrack")
 		if err != nil {
@@ -220,14 +255,121 @@ func (f *ConntrackFlusher) IsNetlinkBackend() bool { return f.backend == Backend
 // actually tears the flow down, so no hard-fail is warranted.
 func (f *ConntrackFlusher) HandlesIPv6() bool { return f.IsNetlinkBackend() }
 
-// Close releases backend resources. Exec backend: no-op. Netlink
-// backend: closes every pooled socket. Safe to call once after the
-// scheduler has drained (no Flush in flight); idempotent on a nil pool.
-func (f *ConntrackFlusher) Close() error {
-	var firstErr error
-	if f.eventIndex != nil {
-		firstErr = f.eventIndex.Close()
+func (f *ConntrackFlusher) openEventIndex() (*ctEventIndex, error) {
+	if f.newEventIndex != nil {
+		return f.newEventIndex()
 	}
+	return newCtEventIndex()
+}
+
+func (f *ConntrackFlusher) storeEventIndex(idx *ctEventIndex) {
+	f.eventIndexMu.Lock()
+	f.eventIndex.Store(idx)
+	f.eventIndexMu.Unlock()
+}
+
+func (f *ConntrackFlusher) installStartupEventIndex(idx *ctEventIndex) bool {
+	// If startup backfill finished unhealthy, no onUnhealthy callback is armed;
+	// the first non-authoritative fallback Flush becomes the lazy resync trigger.
+	healthy := f.enableEventIndexResyncCallbackIfHealthy(idx)
+	f.storeEventIndex(idx)
+	return healthy
+}
+
+func (f *ConntrackFlusher) enableEventIndexResyncCallbackIfHealthy(idx *ctEventIndex) bool {
+	if idx == nil {
+		return false
+	}
+	return idx.enableUnhealthyCallbackIfHealthy(func(err error) {
+		f.scheduleEventIndexResync("event stream", err)
+	})
+}
+
+func (f *ConntrackFlusher) currentEventIndex() *ctEventIndex {
+	return f.eventIndex.Load()
+}
+
+func (f *ConntrackFlusher) swapEventIndexClosingAndArchivingOld(idx *ctEventIndex) error {
+	f.eventIndexMu.Lock()
+	var firstErr error
+	old := f.eventIndex.Swap(idx)
+	if old != nil {
+		// Close and archive while holding eventIndexMu so gauge readers never
+		// observe the generation pointer move without the old generation's final
+		// counters folded into the cumulative archive. The pointer swap happens
+		// first so hot-path Flushes start using the fresh generation immediately;
+		// gauge readers take eventIndexMu.RLock and therefore see either the old
+		// pointer plus pre-archive counters or the new pointer plus archived old
+		// counters. This intentionally keeps the monitor-close syscall inside the
+		// short write-side critical section; do not move it after unlock unless
+		// the archive boundary is replaced with an equivalent monotonic snapshot.
+		firstErr = old.Close()
+		f.archiveEventIndexCounters(old)
+	}
+	f.eventIndexMu.Unlock()
+	return firstErr
+}
+
+func (f *ConntrackFlusher) archiveEventIndexCounters(idx *ctEventIndex) {
+	if idx == nil {
+		return
+	}
+	// These gauges are generation health/liveness signals, not an exact audit
+	// log. Closing before this archive prevents completed generations from
+	// disappearing during a swap; a callback already racing at the close boundary
+	// may still land on either side by one event.
+	f.netlinkIndexArchivedEvents.Add(idx.EventCount())
+	f.netlinkIndexArchivedEventErrors.Add(idx.ErrorCount())
+	f.netlinkIndexArchivedPendingOverflows.Add(idx.PendingOverflowCount())
+}
+
+func (f *ConntrackFlusher) closeAndArchiveEventIndexCounters(idx *ctEventIndex) {
+	if idx == nil {
+		return
+	}
+	_ = idx.Close()
+	f.archiveEventIndexCounters(idx)
+}
+
+func (f *ConntrackFlusher) beginEventIndexResyncContext(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	f.netlinkIndexResyncCancelMu.Lock()
+	f.netlinkIndexResyncCancel = cancel
+	f.netlinkIndexResyncCancelMu.Unlock()
+	return ctx, func() {
+		cancel()
+		f.netlinkIndexResyncCancelMu.Lock()
+		f.netlinkIndexResyncCancel = nil
+		f.netlinkIndexResyncCancelMu.Unlock()
+	}
+}
+
+func (f *ConntrackFlusher) cancelEventIndexResync() {
+	f.netlinkIndexResyncCancelMu.Lock()
+	cancel := f.netlinkIndexResyncCancel
+	f.netlinkIndexResyncCancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// Close releases backend resources. Exec backend: no-op. Netlink backend:
+// blocks new resync launches, cancels the active resync, waits for scheduled
+// workers without holding netlinkIndexResyncMu, then serializes final
+// event-index/pool teardown behind any direct in-flight resync. Safe to call
+// once after the scheduler has drained (no Flush in flight); idempotent on a nil
+// pool.
+func (f *ConntrackFlusher) Close() error {
+	f.closed.Store(true)
+	f.netlinkIndexResyncLaunchMu.Lock()
+	f.netlinkIndexResyncLaunchMu.Unlock()
+	f.cancelEventIndexResync()
+	f.netlinkIndexResyncWG.Wait()
+
+	f.netlinkIndexResyncMu.Lock()
+	defer f.netlinkIndexResyncMu.Unlock()
+
+	firstErr := f.swapEventIndexClosingAndArchivingOld(nil)
 	if f.pool != nil {
 		if err := f.pool.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -272,32 +414,46 @@ func (f *ConntrackFlusher) NetlinkIndexAuthoritativeDumpCount() uint64 {
 
 // NetlinkIndexEventErrorCount returns the conntrack event stream error count.
 // A nonzero value means indexed Flush is disabled and safe dump fallback is in
-// use until the AC restarts/rebuilds the subscription.
+// use until resync rebuilds the subscription. Failed candidate generations are
+// included too; the metric is a cumulative stream/subscription health signal,
+// not only errors from generations that served the hot path.
 func (f *ConntrackFlusher) NetlinkIndexEventErrorCount() uint64 {
-	if f.eventIndex == nil {
-		return 0
+	f.eventIndexMu.RLock()
+	count := f.netlinkIndexArchivedEventErrors.Load()
+	idx := f.eventIndex.Load()
+	f.eventIndexMu.RUnlock()
+	if idx != nil {
+		count += idx.ErrorCount()
 	}
-	return f.eventIndex.ErrorCount()
+	return count
 }
 
 // NetlinkIndexPendingOverflowCount returns the number of startup backfill
 // pending-buffer overflows. Nonzero means startup churn outran the replay cap
 // and the event index disabled itself before serving the hot path.
 func (f *ConntrackFlusher) NetlinkIndexPendingOverflowCount() uint64 {
-	if f.eventIndex == nil {
-		return 0
+	f.eventIndexMu.RLock()
+	count := f.netlinkIndexArchivedPendingOverflows.Load()
+	idx := f.eventIndex.Load()
+	f.eventIndexMu.RUnlock()
+	if idx != nil {
+		count += idx.PendingOverflowCount()
 	}
-	return f.eventIndex.PendingOverflowCount()
+	return count
 }
 
 // NetlinkIndexEventCount returns the cumulative number of valid-group
 // conntrack multicast events observed by the event index. It is a liveness
 // signal for the #2908 hot-path subscription.
 func (f *ConntrackFlusher) NetlinkIndexEventCount() uint64 {
-	if f.eventIndex == nil {
-		return 0
+	f.eventIndexMu.RLock()
+	count := f.netlinkIndexArchivedEvents.Load()
+	idx := f.eventIndex.Load()
+	f.eventIndexMu.RUnlock()
+	if idx != nil {
+		count += idx.EventCount()
 	}
-	return f.eventIndex.EventCount()
+	return count
 }
 
 // NetlinkIndexOriginCount returns the current number of full-origin conntrack
@@ -306,10 +462,27 @@ func (f *ConntrackFlusher) NetlinkIndexEventCount() uint64 {
 // empty table or a disabled/reclaimed index, so dashboards must correlate it
 // with NetlinkIndexEventErrorCount and NetlinkIndexFallbackDumpCount.
 func (f *ConntrackFlusher) NetlinkIndexOriginCount() uint64 {
-	if f.eventIndex == nil {
+	idx := f.currentEventIndex()
+	if idx == nil {
 		return 0
 	}
-	return f.eventIndex.OriginCount()
+	return idx.OriginCount()
+}
+
+// NetlinkIndexResyncAttemptCount returns runtime event-index resync attempts.
+// Startup backfill is not counted here; this is the #2946 recovery path.
+func (f *ConntrackFlusher) NetlinkIndexResyncAttemptCount() uint64 {
+	return f.netlinkIndexResyncAttempts.Load()
+}
+
+// NetlinkIndexResyncSuccessCount returns successful runtime event-index resyncs.
+func (f *ConntrackFlusher) NetlinkIndexResyncSuccessCount() uint64 {
+	return f.netlinkIndexResyncSuccesses.Load()
+}
+
+// NetlinkIndexResyncFailureCount returns failed runtime event-index resyncs.
+func (f *ConntrackFlusher) NetlinkIndexResyncFailureCount() uint64 {
+	return f.netlinkIndexResyncFailures.Load()
 }
 
 // SkippedCount returns the number of keys this flusher no-op'd before backend

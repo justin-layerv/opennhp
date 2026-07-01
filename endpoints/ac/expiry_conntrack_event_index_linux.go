@@ -26,6 +26,11 @@ type ctEventIndex struct {
 	mu       sync.RWMutex
 	byQuery  map[ctIndexQueryKey]map[ctOriginKey]struct{}
 	byOrigin map[ctOriginKey]*conntrack.IPTuple
+	// onUnhealthy is installed only after a generation has completed backfill
+	// while healthy. Resync candidates are armed before the final pre-swap
+	// health/closed checks, so recursive recovery is coalesced by the flusher's
+	// netlinkIndexResyncInFlight gate rather than by this field staying nil.
+	onUnhealthy func(error)
 	// backfilling is true from subscription start until the initial table dump
 	// is installed. Events received in that window are buffered and replayed
 	// after the snapshot so a DESTROY that races the dump cannot be overwritten
@@ -154,27 +159,31 @@ func (idx *ctEventIndex) watchErrors(ctx context.Context, errCh <-chan error) {
 
 func (idx *ctEventIndex) markUnhealthy(err error) {
 	idx.mu.Lock()
-	shouldLog := idx.markUnhealthyLocked()
+	firstUnhealthy := idx.markUnhealthyLocked()
+	onUnhealthy := idx.onUnhealthy
 	idx.mu.Unlock()
-	if shouldLog {
+	if firstUnhealthy {
 		logConntrackEventIndexUnhealthy(err)
+		if onUnhealthy != nil {
+			onUnhealthy(err)
+		}
 	}
 }
 
 func (idx *ctEventIndex) markUnhealthyLocked() bool {
-	shouldLog := idx.errors.Add(1) == 1
+	firstUnhealthy := idx.errors.Add(1) == 1
 	idx.healthy.Store(false)
 	idx.reclaimMirrorLocked()
 	if idx.backfilling {
 		idx.pending = nil
 	}
-	return shouldLog
+	return firstUnhealthy
 }
 
 // reclaimMirrorLocked drops the userspace origin mirror. Once the index is
-// disabled it is never read again (Flush falls back to dump/filter until AC
-// restart, #2946), so releasing both maps returns the dead RSS at million-entry
-// scale and drives OriginCount/IndexOrigins to 0 as the disabled-state signal.
+// disabled it is not read again unless a later resync swaps in a fresh
+// generation, so releasing both maps returns dead RSS at million-entry scale and
+// drives OriginCount/IndexOrigins to 0 as the disabled-state signal.
 // Already-empty maps are left in place so repeated stream errors do not churn
 // fresh allocations after the first disable.
 func (idx *ctEventIndex) reclaimMirrorLocked() {
@@ -188,7 +197,7 @@ func (idx *ctEventIndex) reclaimMirrorLocked() {
 }
 
 func logConntrackEventIndexUnhealthy(err error) {
-	log.Warning("[ConntrackFlusher] conntrack event index disabled; falling back to per-Flush dumps until AC restart: %v", err)
+	log.Warning("[ConntrackFlusher] conntrack event index disabled; falling back to per-Flush dumps while resync is pending: %v", err)
 }
 
 func (idx *ctEventIndex) handleEvent(con conntrack.Con) int {
@@ -205,9 +214,11 @@ func (idx *ctEventIndex) handleEvent(con conntrack.Con) int {
 	switch con.Info.NetlinkGroup {
 	case conntrack.NetlinkCtDestroy, conntrack.NetlinkCtNew, conntrack.NetlinkCtUpdate:
 		if idx.errors.Load() > 0 {
-			// Once a stream error permanently disables the index, valid-group events
-			// are only useful as a liveness signal. Avoid taking idx.mu on the
-			// fallback-only path; #2946 owns any future runtime re-arm.
+			// Once this generation has seen a stream error, valid-group
+			// events are only useful as a liveness signal for the archived
+			// generation. Avoid taking idx.mu on the fallback-only path;
+			// runtime resync installs a fresh generation instead of
+			// re-arming this disabled mirror.
 			idx.events.Add(1)
 			return 0
 		}
@@ -288,6 +299,19 @@ func (idx *ctEventIndex) rebuild(cons []conntrack.Con) int {
 	}
 	idx.mu.Unlock()
 	return indexed
+}
+
+func (idx *ctEventIndex) enableUnhealthyCallbackIfHealthy(onUnhealthy func(error)) bool {
+	if idx == nil {
+		return false
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if !idx.healthy.Load() {
+		return false
+	}
+	idx.onUnhealthy = onUnhealthy
+	return true
 }
 
 func (idx *ctEventIndex) upsertOriginLocked(origin *conntrack.IPTuple, clone bool) {

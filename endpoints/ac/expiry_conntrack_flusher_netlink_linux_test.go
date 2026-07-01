@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -115,22 +117,22 @@ func TestConntrackDeleteResult(t *testing.T) {
 }
 
 type fakeCtNetlinkOps struct {
-	dumpFn   func(*ctConn, conntrack.Family, time.Time) ([]conntrack.Con, error)
-	deleteFn func(*ctConn, conntrack.Family, *conntrack.IPTuple, time.Time) error
+	dumpFn   func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error)
+	deleteFn func(context.Context, *ctConn, conntrack.Family, *conntrack.IPTuple, time.Time) error
 }
 
-func (f fakeCtNetlinkOps) dump(c *ctConn, family conntrack.Family, deadline time.Time) ([]conntrack.Con, error) {
+func (f fakeCtNetlinkOps) dump(ctx context.Context, c *ctConn, family conntrack.Family, deadline time.Time, interruptOnCancel bool) ([]conntrack.Con, error) {
 	if f.dumpFn == nil {
 		return nil, errors.New("unexpected dump")
 	}
-	return f.dumpFn(c, family, deadline)
+	return f.dumpFn(ctx, c, family, deadline, interruptOnCancel)
 }
 
-func (f fakeCtNetlinkOps) deleteOrigin(c *ctConn, family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error {
+func (f fakeCtNetlinkOps) deleteOrigin(ctx context.Context, c *ctConn, family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error {
 	if f.deleteFn == nil {
 		return errors.New("unexpected delete")
 	}
-	return f.deleteFn(c, family, origin, deadline)
+	return f.deleteFn(ctx, c, family, origin, deadline)
 }
 
 func testConntrackCon(t *testing.T, src, dst string, sport, dport uint16, proto uint8) conntrack.Con {
@@ -258,7 +260,7 @@ func TestFlushNetlinkFakeOpsDeletesMatchingAndCounts(t *testing.T) {
 		backend: BackendNetlink,
 		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, family conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, family conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				dumpCalls.Add(1)
 				if family != conntrack.IPv4 {
 					t.Fatalf("dump family = %v, want IPv4", family)
@@ -271,7 +273,7 @@ func TestFlushNetlinkFakeOpsDeletesMatchingAndCounts(t *testing.T) {
 					testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51002, 443, unix.IPPROTO_TCP),
 				}, nil
 			},
-			deleteFn: func(_ *ctConn, family conntrack.Family, origin *conntrack.IPTuple, _ time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, family conntrack.Family, origin *conntrack.IPTuple, _ time.Time) error {
 				if family != conntrack.IPv4 {
 					t.Fatalf("delete family = %v, want IPv4", family)
 				}
@@ -573,7 +575,8 @@ func TestConntrackEventIndexBackfillPendingOverflowDisablesIndex(t *testing.T) {
 	}
 }
 
-func TestRebuildEventIndexReportsZeroWhenBackfillOverflowDisabled(t *testing.T) {
+func TestRebuildEventIndexDoesNotServeSnapshotAfterBackfillOverflow(t *testing.T) {
+	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	idx := &ctEventIndex{
 		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
 		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
@@ -585,11 +588,10 @@ func TestRebuildEventIndexReportsZeroWhenBackfillOverflowDisabled(t *testing.T) 
 	idx.handleEvent(overflow)
 
 	f := &ConntrackFlusher{
-		backend:    BackendNetlink,
-		pool:       testCtNetlinkPool(&ctConn{}),
-		eventIndex: idx,
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, family conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, family conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				if family == conntrack.IPv6 {
 					return nil, nil
 				}
@@ -599,16 +601,20 @@ func TestRebuildEventIndexReportsZeroWhenBackfillOverflowDisabled(t *testing.T) 
 			},
 		},
 	}
+	f.storeEventIndex(idx)
 
-	indexed, err := f.rebuildEventIndex(context.Background(), time.Now().Add(time.Second))
+	indexed, err := f.rebuildEventIndex(context.Background(), idx, time.Now().Add(time.Second))
 	if err != nil {
 		t.Fatalf("rebuildEventIndex returned error: %v", err)
 	}
-	if indexed != 0 {
-		t.Fatalf("rebuildEventIndex indexed origins = %d, want 0 when index disabled", indexed)
+	if indexed != 1 {
+		t.Fatalf("rebuildEventIndex indexed origins = %d, want snapshot count 1", indexed)
 	}
 	if got := idx.OriginCount(); got != 0 {
 		t.Fatalf("OriginCount after disabled rebuild = %d, want 0", got)
+	}
+	if _, ok := idx.originsForKey(key); ok {
+		t.Fatal("originsForKey reported healthy index after backfill overflow")
 	}
 }
 
@@ -765,15 +771,14 @@ func TestFlushNetlinkIndexedUsesIndexWithoutDump(t *testing.T) {
 	var dumpCalls atomic.Int32
 	var deleteSrcPorts []uint16
 	f := &ConntrackFlusher{
-		backend:    BackendNetlink,
-		pool:       testCtNetlinkPool(&ctConn{}),
-		eventIndex: idx,
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, _ conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				dumpCalls.Add(1)
 				return nil, errors.New("indexed Flush must not dump")
 			},
-			deleteFn: func(_ *ctConn, family conntrack.Family, origin *conntrack.IPTuple, _ time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, family conntrack.Family, origin *conntrack.IPTuple, _ time.Time) error {
 				if family != conntrack.IPv4 {
 					t.Fatalf("delete family = %v, want IPv4", family)
 				}
@@ -785,6 +790,7 @@ func TestFlushNetlinkIndexedUsesIndexWithoutDump(t *testing.T) {
 			},
 		},
 	}
+	f.storeEventIndex(idx)
 
 	if err := f.Flush(context.Background(), key); err != nil {
 		t.Fatalf("Flush returned error: %v", err)
@@ -826,11 +832,10 @@ func TestFlushNetlinkAuthoritativeContextBypassesHealthyIndex(t *testing.T) {
 	var dumpCalls atomic.Int32
 	var deleteSrcPorts []uint16
 	f := &ConntrackFlusher{
-		backend:    BackendNetlink,
-		pool:       testCtNetlinkPool(&ctConn{}),
-		eventIndex: idx,
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, family conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, family conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				dumpCalls.Add(1)
 				if family != conntrack.IPv4 {
 					t.Fatalf("dump family = %v, want IPv4", family)
@@ -840,7 +845,7 @@ func TestFlushNetlinkAuthoritativeContextBypassesHealthyIndex(t *testing.T) {
 					testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51001, 443, unix.IPPROTO_TCP),
 				}, nil
 			},
-			deleteFn: func(_ *ctConn, family conntrack.Family, origin *conntrack.IPTuple, _ time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, family conntrack.Family, origin *conntrack.IPTuple, _ time.Time) error {
 				if family != conntrack.IPv4 {
 					t.Fatalf("delete family = %v, want IPv4", family)
 				}
@@ -852,6 +857,7 @@ func TestFlushNetlinkAuthoritativeContextBypassesHealthyIndex(t *testing.T) {
 			},
 		},
 	}
+	f.storeEventIndex(idx)
 
 	if err := f.Flush(withAuthoritativeFlush(context.Background()), key); err != nil {
 		t.Fatalf("Flush returned error: %v", err)
@@ -888,11 +894,10 @@ func TestFlushNetlinkFallsBackToDumpWhenIndexUnhealthy(t *testing.T) {
 	dumpCalls := 0
 	deleteCalls := 0
 	f := &ConntrackFlusher{
-		backend:    BackendNetlink,
-		pool:       testCtNetlinkPool(&ctConn{}),
-		eventIndex: idx,
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, family conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, family conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				dumpCalls++
 				if family != conntrack.IPv4 {
 					t.Fatalf("dump family = %v, want IPv4", family)
@@ -901,12 +906,13 @@ func TestFlushNetlinkFallsBackToDumpWhenIndexUnhealthy(t *testing.T) {
 					testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
 				}, nil
 			},
-			deleteFn: func(_ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
 				deleteCalls++
 				return nil
 			},
 		},
 	}
+	f.storeEventIndex(idx)
 
 	if err := f.Flush(context.Background(), key); err != nil {
 		t.Fatalf("Flush returned error: %v", err)
@@ -931,6 +937,654 @@ func TestFlushNetlinkFallsBackToDumpWhenIndexUnhealthy(t *testing.T) {
 	}
 }
 
+func TestConntrackEventIndexResyncRestoresIndexedFlush(t *testing.T) {
+	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
+	oldIdx := &ctEventIndex{
+		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+	}
+	oldIdx.rebuild([]conntrack.Con{
+		testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51999, 443, unix.IPPROTO_TCP),
+	})
+	oldIdx.markUnhealthy(unix.ENOBUFS)
+
+	var candidate *ctEventIndex
+	var dumpCalls atomic.Int32
+	var deleteSrcPorts []uint16
+	injectedPendingEvent := false
+	f := &ConntrackFlusher{
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
+		newEventIndex: func() (*ctEventIndex, error) {
+			candidate = &ctEventIndex{
+				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				backfilling: true,
+			}
+			return candidate, nil
+		},
+		ctOps: fakeCtNetlinkOps{
+			dumpFn: func(_ context.Context, _ *ctConn, family conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
+				dumpCalls.Add(1)
+				switch family {
+				case conntrack.IPv4:
+					if !injectedPendingEvent {
+						injectedPendingEvent = true
+						createdDuringResync := testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51001, 443, unix.IPPROTO_TCP)
+						createdDuringResync.Info = &conntrack.InfoSource{NetlinkGroup: conntrack.NetlinkCtNew}
+						candidate.handleEvent(createdDuringResync)
+					}
+					return []conntrack.Con{
+						testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
+					}, nil
+				case conntrack.IPv6:
+					return nil, nil
+				default:
+					t.Fatalf("unexpected dump family %v", family)
+					return nil, nil
+				}
+			},
+			deleteFn: func(_ context.Context, _ *ctConn, family conntrack.Family, origin *conntrack.IPTuple, _ time.Time) error {
+				if family != conntrack.IPv4 {
+					t.Fatalf("delete family = %v, want IPv4", family)
+				}
+				if origin == nil || origin.Proto == nil || origin.Proto.SrcPort == nil {
+					t.Fatalf("delete origin missing source port: %+v", origin)
+				}
+				deleteSrcPorts = append(deleteSrcPorts, *origin.Proto.SrcPort)
+				return nil
+			},
+		},
+	}
+	f.storeEventIndex(oldIdx)
+
+	indexed, err := f.resyncEventIndex(context.Background(), time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatalf("resyncEventIndex returned error: %v", err)
+	}
+	if indexed != 1 {
+		t.Fatalf("resync indexed snapshot origins = %d, want 1", indexed)
+	}
+	if got := f.NetlinkIndexOriginCount(); got != 2 {
+		t.Fatalf("NetlinkIndexOriginCount after resync = %d, want 2 (snapshot + buffered NEW)", got)
+	}
+	if got := f.NetlinkIndexEventErrorCount(); got != 1 {
+		t.Fatalf("NetlinkIndexEventErrorCount after resync = %d, want archived overrun 1", got)
+	}
+	if got := f.NetlinkIndexEventCount(); got != 1 {
+		t.Fatalf("NetlinkIndexEventCount after resync = %d, want buffered event 1", got)
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexResyncSuccessCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncSuccessCount = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexResyncFailureCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncFailureCount = %d, want 0", got)
+	}
+
+	if err := f.Flush(context.Background(), key); err != nil {
+		t.Fatalf("Flush after resync returned error: %v", err)
+	}
+	if got := dumpCalls.Load(); got != 2 {
+		t.Fatalf("dump calls after indexed Flush = %d, want only the two resync backfill dumps", got)
+	}
+	sort.Slice(deleteSrcPorts, func(i, j int) bool { return deleteSrcPorts[i] < deleteSrcPorts[j] })
+	if got, want := fmt.Sprint(deleteSrcPorts), "[51000 51001]"; got != want {
+		t.Fatalf("deleted source ports after resync = %s, want %s", got, want)
+	}
+	if got := f.NetlinkIndexedFlushCount(); got != 1 {
+		t.Fatalf("NetlinkIndexedFlushCount after resync Flush = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexFallbackDumpCount(); got != 0 {
+		t.Fatalf("NetlinkIndexFallbackDumpCount after resync Flush = %d, want 0", got)
+	}
+}
+
+func TestConntrackEventIndexResyncFailureLeavesFallbackVisible(t *testing.T) {
+	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
+	oldIdx := &ctEventIndex{
+		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+	}
+	oldIdx.rebuild(nil)
+	oldIdx.markUnhealthy(unix.ENOBUFS)
+	boom := errors.New("backfill failed")
+	f := &ConntrackFlusher{
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
+		newEventIndex: func() (*ctEventIndex, error) {
+			return &ctEventIndex{
+				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				backfilling: true,
+			}, nil
+		},
+		ctOps: fakeCtNetlinkOps{
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
+				return nil, boom
+			},
+		},
+	}
+	f.storeEventIndex(oldIdx)
+
+	if _, err := f.resyncEventIndex(context.Background(), time.Now().Add(time.Second)); !errors.Is(err, boom) {
+		t.Fatalf("resyncEventIndex error = %v, want errors.Is(..., boom)", err)
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexResyncSuccessCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncSuccessCount = %d, want 0", got)
+	}
+	if got := f.NetlinkIndexResyncFailureCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncFailureCount = %d, want 1", got)
+	}
+
+	dumpCalls := 0
+	deleteCalls := 0
+	f.newEventIndex = nil // keep this assertion synchronous; production resync is callback-driven.
+	f.ctOps = fakeCtNetlinkOps{
+		dumpFn: func(_ context.Context, _ *ctConn, family conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
+			dumpCalls++
+			if family != conntrack.IPv4 {
+				t.Fatalf("dump family = %v, want IPv4", family)
+			}
+			return []conntrack.Con{
+				testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
+			}, nil
+		},
+		deleteFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
+			deleteCalls++
+			return nil
+		},
+	}
+
+	if err := f.Flush(context.Background(), key); err != nil {
+		t.Fatalf("Flush after failed resync returned error: %v", err)
+	}
+	if dumpCalls != 1 {
+		t.Fatalf("dump calls after failed resync Flush = %d, want fallback dump 1", dumpCalls)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("delete calls after failed resync Flush = %d, want 1", deleteCalls)
+	}
+	if got := f.NetlinkIndexFallbackDumpCount(); got != 1 {
+		t.Fatalf("NetlinkIndexFallbackDumpCount after failed resync Flush = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexedFlushCount(); got != 0 {
+		t.Fatalf("NetlinkIndexedFlushCount after failed resync Flush = %d, want 0", got)
+	}
+}
+
+func TestConntrackEventIndexResyncUnhealthyDuringBackfillCountsFailure(t *testing.T) {
+	var candidate *ctEventIndex
+	f := &ConntrackFlusher{
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
+		newEventIndex: func() (*ctEventIndex, error) {
+			candidate = &ctEventIndex{
+				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				backfilling: true,
+			}
+			return candidate, nil
+		},
+		ctOps: fakeCtNetlinkOps{
+			dumpFn: func(_ context.Context, _ *ctConn, family conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
+				if family == conntrack.IPv4 {
+					candidate.markUnhealthy(unix.ENOBUFS)
+					return []conntrack.Con{
+						testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
+					}, nil
+				}
+				return nil, nil
+			},
+		},
+	}
+
+	_, err := f.resyncEventIndex(context.Background(), time.Now().Add(time.Second))
+	if err == nil || !strings.Contains(err.Error(), "became unhealthy during backfill") {
+		t.Fatalf("resyncEventIndex error = %v, want unhealthy-during-backfill failure", err)
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexResyncSuccessCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncSuccessCount = %d, want 0", got)
+	}
+	if got := f.NetlinkIndexResyncFailureCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncFailureCount = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexEventErrorCount(); got != 1 {
+		t.Fatalf("NetlinkIndexEventErrorCount = %d, want archived candidate error", got)
+	}
+	if got := f.NetlinkIndexOriginCount(); got != 0 {
+		t.Fatalf("NetlinkIndexOriginCount = %d, want discarded unhealthy candidate", got)
+	}
+}
+
+func TestConntrackEventIndexResyncBackoffRemaining(t *testing.T) {
+	now := time.Unix(123, 456)
+	f := &ConntrackFlusher{}
+	if got := f.eventIndexResyncBackoffRemaining(now); got != 0 {
+		t.Fatalf("backoff with no prior resync = %s, want 0", got)
+	}
+
+	f.netlinkIndexLastResyncNanos.Store(now.Add(-defaultNetlinkIndexResyncMinInterval / 2).UnixNano())
+	if got, want := f.eventIndexResyncBackoffRemaining(now), defaultNetlinkIndexResyncMinInterval/2; got != want {
+		t.Fatalf("backoff halfway through interval = %s, want %s", got, want)
+	}
+
+	f.netlinkIndexLastResyncNanos.Store(now.Add(-defaultNetlinkIndexResyncMinInterval).UnixNano())
+	if got := f.eventIndexResyncBackoffRemaining(now); got != 0 {
+		t.Fatalf("backoff after interval elapsed = %s, want 0", got)
+	}
+}
+
+func TestConntrackEventIndexScheduleResyncHonorsBackoff(t *testing.T) {
+	var opened atomic.Int32
+	f := &ConntrackFlusher{
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
+		newEventIndex: func() (*ctEventIndex, error) {
+			opened.Add(1)
+			return &ctEventIndex{
+				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				backfilling: true,
+			}, nil
+		},
+		ctOps: fakeCtNetlinkOps{
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
+				return nil, nil
+			},
+		},
+	}
+	f.netlinkIndexLastResyncNanos.Store(time.Now().UnixNano())
+
+	f.scheduleEventIndexResync("flush fallback", errCtEventIndexUnavailable)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := opened.Load(); got != 0 {
+		t.Fatalf("newEventIndex calls during backoff = %d, want 0", got)
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount during backoff = %d, want 0", got)
+	}
+	if f.netlinkIndexResyncInFlight.Load() {
+		t.Fatal("resyncInFlight set during backoff")
+	}
+}
+
+func TestConntrackEventIndexFallbackFlushSchedulesResync(t *testing.T) {
+	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
+	matchingCon := testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP)
+	idx := &ctEventIndex{
+		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+	}
+	idx.rebuild(nil)
+	idx.markUnhealthy(unix.ENOBUFS)
+
+	var dumpCalls atomic.Int32
+	var deleteCalls atomic.Int32
+	f := &ConntrackFlusher{
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}, &ctConn{}),
+		newEventIndex: func() (*ctEventIndex, error) {
+			return &ctEventIndex{
+				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				backfilling: true,
+			}, nil
+		},
+		ctOps: fakeCtNetlinkOps{
+			dumpFn: func(_ context.Context, _ *ctConn, family conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
+				dumpCalls.Add(1)
+				if family == conntrack.IPv4 {
+					return []conntrack.Con{matchingCon}, nil
+				}
+				return nil, nil
+			},
+			deleteFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
+				deleteCalls.Add(1)
+				return nil
+			},
+		},
+	}
+	f.storeEventIndex(idx)
+
+	if err := f.Flush(context.Background(), key); err != nil {
+		t.Fatalf("Flush returned error: %v", err)
+	}
+	if got := f.NetlinkIndexFallbackDumpCount(); got != 1 {
+		t.Fatalf("NetlinkIndexFallbackDumpCount = %d, want 1", got)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("delete calls = %d, want 1 fallback delete", got)
+	}
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.After(time.Second)
+	for f.NetlinkIndexResyncSuccessCount() == 0 {
+		select {
+		case <-ticker.C:
+		case <-timeout:
+			t.Fatalf("fallback Flush did not schedule a successful resync; attempts=%d failures=%d dumpCalls=%d", f.NetlinkIndexResyncAttemptCount(), f.NetlinkIndexResyncFailureCount(), dumpCalls.Load())
+		}
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexResyncFailureCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncFailureCount = %d, want 0", got)
+	}
+	if got := f.currentEventIndex(); got == nil || got == idx {
+		t.Fatalf("currentEventIndex after fallback-triggered resync = %p, want fresh generation", got)
+	}
+}
+
+func TestFlushNetlinkHealthyEmptyIndexDoesNotScheduleResync(t *testing.T) {
+	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
+	idx := &ctEventIndex{
+		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+	}
+	idx.rebuild(nil)
+
+	var dumpCalls atomic.Int32
+	resyncStarted := make(chan struct{})
+	resyncRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseResync := func() { releaseOnce.Do(func() { close(resyncRelease) }) }
+	defer releaseResync()
+
+	f := &ConntrackFlusher{
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
+		newEventIndex: func() (*ctEventIndex, error) {
+			close(resyncStarted)
+			<-resyncRelease
+			return &ctEventIndex{
+				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				backfilling: true,
+			}, nil
+		},
+		ctOps: fakeCtNetlinkOps{
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
+				dumpCalls.Add(1)
+				return nil, nil
+			},
+		},
+	}
+	f.storeEventIndex(idx)
+
+	if err := f.Flush(context.Background(), key); err != nil {
+		t.Fatalf("Flush returned error: %v", err)
+	}
+	if got := f.NetlinkIndexedFlushCount(); got != 1 {
+		t.Fatalf("NetlinkIndexedFlushCount = %d, want healthy empty indexed Flush", got)
+	}
+	if got := f.NetlinkIndexFallbackDumpCount(); got != 0 {
+		t.Fatalf("NetlinkIndexFallbackDumpCount = %d, want 0", got)
+	}
+	if got := dumpCalls.Load(); got != 0 {
+		t.Fatalf("dump calls = %d, want 0 for healthy empty index", got)
+	}
+
+	select {
+	case <-resyncStarted:
+		releaseResync()
+		t.Fatal("healthy empty index scheduled resync")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount = %d, want 0", got)
+	}
+	if f.netlinkIndexResyncInFlight.Load() {
+		t.Fatal("resyncInFlight set for healthy empty index")
+	}
+}
+
+func TestConntrackEventIndexResyncClosedFlusherRejected(t *testing.T) {
+	f := &ConntrackFlusher{backend: BackendNetlink}
+	f.closed.Store(true)
+	if _, err := f.resyncEventIndex(context.Background(), time.Now().Add(time.Second)); !errors.Is(err, errCtNetlinkPoolClosed) {
+		t.Fatalf("resyncEventIndex on closed flusher = %v, want %v", err, errCtNetlinkPoolClosed)
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount on closed flusher = %d, want 0", got)
+	}
+}
+
+func TestConntrackEventIndexUnhealthyCallbackSchedulesResync(t *testing.T) {
+	oldIdx := &ctEventIndex{
+		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+		backfilling: true,
+	}
+	oldIdx.rebuild(nil)
+	var dumpCalls atomic.Int32
+	f := &ConntrackFlusher{
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
+		newEventIndex: func() (*ctEventIndex, error) {
+			return &ctEventIndex{
+				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				backfilling: true,
+			}, nil
+		},
+		ctOps: fakeCtNetlinkOps{
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
+				dumpCalls.Add(1)
+				return nil, nil
+			},
+		},
+	}
+	if healthy := f.installStartupEventIndex(oldIdx); !healthy {
+		t.Fatal("installStartupEventIndex reported unhealthy for clean index")
+	}
+
+	oldIdx.markUnhealthy(unix.ENOBUFS)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.After(time.Second)
+	for f.NetlinkIndexResyncSuccessCount() == 0 {
+		select {
+		case <-ticker.C:
+		case <-timeout:
+			t.Fatal("unhealthy callback did not schedule a successful resync")
+		}
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexResyncFailureCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncFailureCount = %d, want 0", got)
+	}
+	if got := dumpCalls.Load(); got != 2 {
+		t.Fatalf("resync dump calls = %d, want IPv4+IPv6 backfill", got)
+	}
+	if got := f.currentEventIndex(); got == nil || got == oldIdx {
+		t.Fatalf("currentEventIndex after callback resync = %p, want fresh generation", got)
+	}
+	if got := f.NetlinkIndexEventErrorCount(); got != 1 {
+		t.Fatalf("NetlinkIndexEventErrorCount = %d, want archived callback trigger", got)
+	}
+}
+
+func TestConntrackStartupUnhealthyIndexFallsBackInsteadOfFailing(t *testing.T) {
+	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
+	idx := &ctEventIndex{
+		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+		backfilling: true,
+	}
+	idx.markUnhealthy(unix.ENOBUFS)
+	if indexed := idx.rebuild([]conntrack.Con{
+		testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
+	}); indexed != 1 {
+		t.Fatalf("startup rebuild indexed = %d, want 1 before unhealthy reclaim", indexed)
+	}
+
+	f := &ConntrackFlusher{backend: BackendNetlink}
+	if healthy := f.installStartupEventIndex(idx); healthy {
+		t.Fatal("installStartupEventIndex reported healthy, want fallback startup")
+	}
+	if got := f.currentEventIndex(); got != idx {
+		t.Fatalf("currentEventIndex = %p, want startup index %p", got, idx)
+	}
+	if got := f.NetlinkIndexEventErrorCount(); got != 1 {
+		t.Fatalf("NetlinkIndexEventErrorCount = %d, want startup event error visible", got)
+	}
+	if got := f.NetlinkIndexOriginCount(); got != 0 {
+		t.Fatalf("NetlinkIndexOriginCount = %d, want reclaimed unhealthy startup mirror", got)
+	}
+	if _, ok := idx.originsForKey(key); ok {
+		t.Fatal("unhealthy startup index served indexed origins; want fallback path")
+	}
+}
+
+func TestConntrackEventIndexCloseCancelsInFlightResync(t *testing.T) {
+	dumpStarted := make(chan struct{})
+	resyncDone := make(chan error, 1)
+	closeDone := make(chan error, 1)
+	var dumpCalls atomic.Int32
+
+	f := &ConntrackFlusher{
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
+		newEventIndex: func() (*ctEventIndex, error) {
+			return &ctEventIndex{
+				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				backfilling: true,
+			}, nil
+		},
+		ctOps: fakeCtNetlinkOps{
+			dumpFn: func(ctx context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
+				if dumpCalls.Add(1) == 1 {
+					close(dumpStarted)
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				return nil, nil
+			},
+		},
+	}
+
+	go func() {
+		_, err := f.resyncEventIndex(context.Background(), time.Now().Add(time.Second))
+		resyncDone <- err
+	}()
+	select {
+	case <-dumpStarted:
+	case <-time.After(time.Second):
+		t.Fatal("resync did not reach backfill dump")
+	}
+
+	go func() {
+		closeDone <- f.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel in-flight resync")
+	}
+	select {
+	case err := <-resyncDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("resyncEventIndex during Close = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resync did not finish after Close cancellation")
+	}
+	if got := f.currentEventIndex(); got != nil {
+		t.Fatalf("currentEventIndex after Close = %p, want nil", got)
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount = %d, want 1", got)
+	}
+	if got := f.NetlinkIndexResyncSuccessCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncSuccessCount = %d, want 0", got)
+	}
+	if got := f.NetlinkIndexResyncFailureCount(); got != 1 {
+		t.Fatalf("NetlinkIndexResyncFailureCount = %d, want 1", got)
+	}
+}
+
+func TestConntrackEventIndexCloseDoesNotDeadlockWithQueuedResync(t *testing.T) {
+	beforeLock := make(chan struct{})
+	releaseBeforeLock := make(chan struct{})
+	closeDone := make(chan error, 1)
+	var hookEntered atomic.Bool
+	var newEventIndexCalls atomic.Int32
+
+	f := &ConntrackFlusher{
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
+		newEventIndex: func() (*ctEventIndex, error) {
+			newEventIndexCalls.Add(1)
+			return &ctEventIndex{
+				byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+				byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+			}, nil
+		},
+		netlinkIndexBeforeResyncLock: func() {
+			if hookEntered.CompareAndSwap(false, true) {
+				close(beforeLock)
+			}
+			<-releaseBeforeLock
+		},
+	}
+
+	f.scheduleEventIndexResync("test", errors.New("stream loss"))
+	select {
+	case <-beforeLock:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled resync did not reach pre-lock hook")
+	}
+	f.netlinkIndexResyncMu.Lock()
+	go func() {
+		closeDone <- f.Close()
+	}()
+	deadline := time.Now().Add(time.Second)
+	for !f.closed.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not mark flusher closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseBeforeLock)
+	f.netlinkIndexResyncMu.Unlock()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close deadlocked behind queued resync")
+	}
+	if got := newEventIndexCalls.Load(); got != 0 {
+		t.Fatalf("new event index calls after queued resync observed Close = %d, want 0", got)
+	}
+	if got := f.NetlinkIndexResyncAttemptCount(); got != 0 {
+		t.Fatalf("NetlinkIndexResyncAttemptCount after queued Close = %d, want 0", got)
+	}
+	if f.netlinkIndexResyncInFlight.Load() {
+		t.Fatal("netlinkIndexResyncInFlight remained true after queued Close")
+	}
+}
+
 func TestFlushNetlinkFakeOpsDumpTimeoutReturnsErrorWithoutRetry(t *testing.T) {
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	dumpCalls := 0
@@ -939,11 +1593,11 @@ func TestFlushNetlinkFakeOpsDumpTimeoutReturnsErrorWithoutRetry(t *testing.T) {
 		backend: BackendNetlink,
 		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, _ conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				dumpCalls++
 				return nil, context.DeadlineExceeded
 			},
-			deleteFn: func(_ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
 				deleteCalls++
 				return nil
 			},
@@ -974,7 +1628,7 @@ func TestFlushNetlinkFakeOpsMixedFamilySkipsDump(t *testing.T) {
 		backend: BackendNetlink,
 		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, _ conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				dumpCalls++
 				return nil, nil
 			},
@@ -1005,28 +1659,32 @@ func TestL3FlushConntrackSkippedGauge(t *testing.T) {
 }
 
 func TestL3FlushConntrackIndexGauges(t *testing.T) {
-	cf := &ConntrackFlusher{
-		backend: BackendNetlink,
-		eventIndex: &ctEventIndex{
-			byQuery: make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-			byOrigin: map[ctOriginKey]*conntrack.IPTuple{
-				{srcPort: 101}: {},
-				{srcPort: 102}: {},
-				{srcPort: 103}: {},
-				{srcPort: 104}: {},
-				{srcPort: 105}: {},
-				{srcPort: 106}: {},
-				{srcPort: 107}: {},
-			},
+	idx := &ctEventIndex{
+		byQuery: make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+		byOrigin: map[ctOriginKey]*conntrack.IPTuple{
+			{srcPort: 101}: {},
+			{srcPort: 102}: {},
+			{srcPort: 103}: {},
+			{srcPort: 104}: {},
+			{srcPort: 105}: {},
+			{srcPort: 106}: {},
+			{srcPort: 107}: {},
 		},
 	}
+	cf := &ConntrackFlusher{
+		backend: BackendNetlink,
+	}
+	cf.storeEventIndex(idx)
 	cf.netlinkIndexedFlushes.Store(3)
 	cf.netlinkIndexFallbackDumps.Store(4)
 	cf.netlinkIndexAuthoritativeDumps.Store(9)
-	cf.eventIndex.errors.Store(5)
-	cf.eventIndex.events.Store(6)
-	cf.eventIndex.originCount.Store(7)
-	cf.eventIndex.pendingOverflows.Store(8)
+	cf.netlinkIndexResyncAttempts.Store(9)
+	cf.netlinkIndexResyncSuccesses.Store(8)
+	cf.netlinkIndexResyncFailures.Store(1)
+	idx.errors.Store(5)
+	idx.events.Store(6)
+	idx.originCount.Store(7)
+	idx.pendingOverflows.Store(8)
 	ac := &UdpAC{config: &Config{ACId: "test-ac"}}
 	ac.conntrackFlusher.Store(cf)
 	reg := &ACRegistration{ac: ac}
@@ -1052,6 +1710,15 @@ func TestL3FlushConntrackIndexGauges(t *testing.T) {
 	if got := reg.l3FlushConntrackIndexOriginsGauge(); got != 7 {
 		t.Fatalf("l3FlushConntrackIndexOriginsGauge = %v, want 7", got)
 	}
+	if got := reg.l3FlushConntrackIndexResyncAttemptsGauge(); got != 9 {
+		t.Fatalf("l3FlushConntrackIndexResyncAttemptsGauge = %v, want 9", got)
+	}
+	if got := reg.l3FlushConntrackIndexResyncSuccessesGauge(); got != 8 {
+		t.Fatalf("l3FlushConntrackIndexResyncSuccessesGauge = %v, want 8", got)
+	}
+	if got := reg.l3FlushConntrackIndexResyncFailuresGauge(); got != 1 {
+		t.Fatalf("l3FlushConntrackIndexResyncFailuresGauge = %v, want 1", got)
+	}
 }
 
 func TestFlushNetlinkFakeOpsIPv6ICMPFamily(t *testing.T) {
@@ -1061,7 +1728,7 @@ func TestFlushNetlinkFakeOpsIPv6ICMPFamily(t *testing.T) {
 		backend: BackendNetlink,
 		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, family conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, family conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				if family != conntrack.IPv6 {
 					t.Fatalf("dump family = %v, want IPv6", family)
 				}
@@ -1071,7 +1738,7 @@ func TestFlushNetlinkFakeOpsIPv6ICMPFamily(t *testing.T) {
 					testConntrackCon(t, "2001:db8::10", "2001:db8::20", 0, 0, unix.IPPROTO_TCP),
 				}, nil
 			},
-			deleteFn: func(_ *ctConn, family conntrack.Family, origin *conntrack.IPTuple, _ time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, family conntrack.Family, origin *conntrack.IPTuple, _ time.Time) error {
 				if family != conntrack.IPv6 {
 					t.Fatalf("delete family = %v, want IPv6", family)
 				}
@@ -1112,14 +1779,14 @@ func TestFlushNetlinkFakeOpsContinuesAfterSingleDeleteErrorBeforeDeadline(t *tes
 		backend: BackendNetlink,
 		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, _ conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				return []conntrack.Con{
 					testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
 					testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51001, 443, unix.IPPROTO_TCP),
 					testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51002, 443, unix.IPPROTO_TCP),
 				}, nil
 			},
-			deleteFn: func(_ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
 				deleteCalls++
 				if deleteCalls == 2 {
 					return boom
@@ -1159,10 +1826,10 @@ func TestFlushNetlinkFakeOpsStopsOnConsecutiveDeleteErrorsBeforeDeadline(t *test
 		backend: BackendNetlink,
 		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, _ conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				return origins, nil
 			},
-			deleteFn: func(_ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, _ time.Time) error {
 				deleteCalls++
 				return boom
 			},
@@ -1192,13 +1859,13 @@ func TestFlushNetlinkFakeOpsStopsOnPersistentDeleteErrorAfterDeadline(t *testing
 		backend: BackendNetlink,
 		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, _ conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				return []conntrack.Con{
 					testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
 					testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51001, 443, unix.IPPROTO_TCP),
 				}, nil
 			},
-			deleteFn: func(_ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, deadline time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, deadline time.Time) error {
 				deleteCalls++
 				if sleep := time.Until(deadline) + time.Millisecond; sleep > 0 {
 					time.Sleep(sleep)
@@ -1211,8 +1878,8 @@ func TestFlushNetlinkFakeOpsStopsOnPersistentDeleteErrorAfterDeadline(t *testing
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	err := f.Flush(ctx, key)
-	if !errors.Is(err, boom) {
-		t.Fatalf("Flush error = %v, want errors.Is(..., boom)", err)
+	if !errors.Is(err, boom) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Flush error = %v, want delete error or deadline exceeded", err)
 	}
 	if !strings.Contains(err.Error(), "deleted 0/2 matched") {
 		t.Fatalf("Flush error = %q, want deadline-break delete count", err)
@@ -1238,14 +1905,13 @@ func TestFlushNetlinkIndexedStopsAfterDeadlineBetweenSuccessfulDeletes(t *testin
 
 	deleteCalls := 0
 	f := &ConntrackFlusher{
-		backend:    BackendNetlink,
-		pool:       testCtNetlinkPool(&ctConn{}),
-		eventIndex: idx,
+		backend: BackendNetlink,
+		pool:    testCtNetlinkPool(&ctConn{}),
 		ctOps: fakeCtNetlinkOps{
-			dumpFn: func(_ *ctConn, _ conntrack.Family, _ time.Time) ([]conntrack.Con, error) {
+			dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 				return nil, errors.New("indexed Flush must not dump")
 			},
-			deleteFn: func(_ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, deadline time.Time) error {
+			deleteFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ *conntrack.IPTuple, deadline time.Time) error {
 				deleteCalls++
 				if sleep := time.Until(deadline) + time.Millisecond; sleep > 0 {
 					time.Sleep(sleep)
@@ -1254,6 +1920,7 @@ func TestFlushNetlinkIndexedStopsAfterDeadlineBetweenSuccessfulDeletes(t *testin
 			},
 		},
 	}
+	f.storeEventIndex(idx)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -1278,7 +1945,7 @@ func TestFlushNetlinkCtxCanceledWhileWaitingForFreeSocket(t *testing.T) {
 	f := &ConntrackFlusher{
 		backend: BackendNetlink,
 		pool:    &ctNetlinkPool{conns: []*ctConn{{}}, free: make(chan *ctConn, 1)},
-		ctOps: fakeCtNetlinkOps{dumpFn: func(*ctConn, conntrack.Family, time.Time) ([]conntrack.Con, error) {
+		ctOps: fakeCtNetlinkOps{dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 			dumpCalls.Add(1)
 			return nil, nil
 		}},
@@ -1303,7 +1970,7 @@ func TestFlushNetlinkCtxCanceledWhileWaitingForFreeSocket(t *testing.T) {
 func TestDumpWithRetry(t *testing.T) {
 	t.Run("transient-error-retries-on-fresh-socket", func(t *testing.T) {
 		calls := 0
-		f := &ConntrackFlusher{ctOps: fakeCtNetlinkOps{dumpFn: func(*ctConn, conntrack.Family, time.Time) ([]conntrack.Con, error) {
+		f := &ConntrackFlusher{ctOps: fakeCtNetlinkOps{dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 			calls++
 			if calls == 1 {
 				return nil, unix.ENOBUFS
@@ -1311,7 +1978,7 @@ func TestDumpWithRetry(t *testing.T) {
 			return []conntrack.Con{{}}, nil
 		}}}
 
-		cons, _, err := f.dumpWithRetry(&ctConn{}, conntrack.IPv4, time.Now().Add(time.Minute))
+		cons, _, err := f.dumpWithRetry(context.Background(), &ctConn{}, conntrack.IPv4, time.Now().Add(time.Minute), false)
 		if err != nil {
 			t.Fatalf("dumpWithRetry returned error: %v", err)
 		}
@@ -1325,12 +1992,12 @@ func TestDumpWithRetry(t *testing.T) {
 
 	t.Run("expired-deadline-does-not-retry-transient-error", func(t *testing.T) {
 		calls := 0
-		f := &ConntrackFlusher{ctOps: fakeCtNetlinkOps{dumpFn: func(*ctConn, conntrack.Family, time.Time) ([]conntrack.Con, error) {
+		f := &ConntrackFlusher{ctOps: fakeCtNetlinkOps{dumpFn: func(_ context.Context, _ *ctConn, _ conntrack.Family, _ time.Time, _ bool) ([]conntrack.Con, error) {
 			calls++
 			return nil, unix.EINTR
 		}}}
 
-		_, _, err := f.dumpWithRetry(&ctConn{}, conntrack.IPv4, time.Now().Add(-time.Millisecond))
+		_, _, err := f.dumpWithRetry(context.Background(), &ctConn{}, conntrack.IPv4, time.Now().Add(-time.Millisecond), false)
 		if !errors.Is(err, unix.EINTR) {
 			t.Fatalf("dumpWithRetry error = %v, want EINTR", err)
 		}
@@ -1345,7 +2012,7 @@ func TestDeleteOriginWithRetry(t *testing.T) {
 
 	t.Run("transient-error-retries-on-fresh-socket", func(t *testing.T) {
 		calls := 0
-		f := &ConntrackFlusher{ctOps: fakeCtNetlinkOps{deleteFn: func(*ctConn, conntrack.Family, *conntrack.IPTuple, time.Time) error {
+		f := &ConntrackFlusher{ctOps: fakeCtNetlinkOps{deleteFn: func(context.Context, *ctConn, conntrack.Family, *conntrack.IPTuple, time.Time) error {
 			calls++
 			if calls == 1 {
 				return unix.EINTR
@@ -1353,7 +2020,7 @@ func TestDeleteOriginWithRetry(t *testing.T) {
 			return nil
 		}}}
 
-		if err := f.deleteOriginWithRetry(&ctConn{}, conntrack.IPv4, origin, time.Now().Add(time.Minute)); err != nil {
+		if err := f.deleteOriginWithRetry(context.Background(), &ctConn{}, conntrack.IPv4, origin, time.Now().Add(time.Minute)); err != nil {
 			t.Fatalf("deleteOriginWithRetry returned error: %v", err)
 		}
 		if calls != 2 {
@@ -1363,12 +2030,12 @@ func TestDeleteOriginWithRetry(t *testing.T) {
 
 	t.Run("expired-deadline-does-not-retry-transient-error", func(t *testing.T) {
 		calls := 0
-		f := &ConntrackFlusher{ctOps: fakeCtNetlinkOps{deleteFn: func(*ctConn, conntrack.Family, *conntrack.IPTuple, time.Time) error {
+		f := &ConntrackFlusher{ctOps: fakeCtNetlinkOps{deleteFn: func(context.Context, *ctConn, conntrack.Family, *conntrack.IPTuple, time.Time) error {
 			calls++
 			return unix.ENOBUFS
 		}}}
 
-		err := f.deleteOriginWithRetry(&ctConn{}, conntrack.IPv4, origin, time.Now().Add(-time.Millisecond))
+		err := f.deleteOriginWithRetry(context.Background(), &ctConn{}, conntrack.IPv4, origin, time.Now().Add(-time.Millisecond))
 		if !errors.Is(err, unix.ENOBUFS) {
 			t.Fatalf("deleteOriginWithRetry error = %v, want ENOBUFS", err)
 		}

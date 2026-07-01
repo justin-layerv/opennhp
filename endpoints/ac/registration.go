@@ -490,7 +490,9 @@ const (
 	MetricL3FlushConntrackIndexAuthoritativeDumps = "L3FlushConntrackIndexAuthoritativeDumps"
 	// MetricL3FlushConntrackIndexEventErrors counts conntrack multicast stream
 	// errors. Nonzero means the event index has been disabled and Flush is using
-	// the safe dump fallback rather than risking a silent enforcement gap.
+	// the safe dump fallback rather than risking a silent enforcement gap. It
+	// also includes failed candidate generations so stream-loss during rebuild is
+	// visible even when that candidate never served Flush.
 	MetricL3FlushConntrackIndexEventErrors = "L3FlushConntrackIndexEventErrors"
 	// MetricL3FlushConntrackIndexPendingOverflows counts startup backfill
 	// pending-buffer overflows. Nonzero distinguishes startup replay pressure
@@ -507,8 +509,19 @@ const (
 	// alongside EventErrors/FallbackDumps: it may be a healthy empty table or a
 	// disabled/reclaimed index.
 	MetricL3FlushConntrackIndexOrigins = "L3FlushConntrackIndexOrigins"
-	MetricL3FlushScheduleRejected      = "L3FlushScheduleRejected"
-	MetricL3FlushScheduleAfterShutdown = "L3FlushScheduleAfterShutdown"
+	// MetricL3FlushConntrackIndexResyncAttempts is the cumulative number of
+	// runtime event-index resync attempts after stream loss/skew. Startup
+	// backfill is intentionally excluded.
+	MetricL3FlushConntrackIndexResyncAttempts = "L3FlushConntrackIndexResyncAttempts"
+	// MetricL3FlushConntrackIndexResyncSuccesses is the cumulative number of
+	// runtime resyncs that installed a rebuilt subscription generation.
+	MetricL3FlushConntrackIndexResyncSuccesses = "L3FlushConntrackIndexResyncSuccesses"
+	// MetricL3FlushConntrackIndexResyncFailures is the cumulative number of
+	// runtime resyncs that failed; while this rises, Flush remains on the safe
+	// dump/filter/delete fallback.
+	MetricL3FlushConntrackIndexResyncFailures = "L3FlushConntrackIndexResyncFailures"
+	MetricL3FlushScheduleRejected             = "L3FlushScheduleRejected"
+	MetricL3FlushScheduleAfterShutdown        = "L3FlushScheduleAfterShutdown"
 	// MetricL3FlushScheduleWaitTimeout counts Schedule() calls where
 	// the in-flight Flush exceeded flushCallTimeout + scheduleWaitSlop
 	// before closing its inFlight chan. Non-zero is a chronically-
@@ -1328,6 +1341,9 @@ func (r *ACRegistration) Start() error {
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexPendingOverflows, r.l3FlushConntrackIndexPendingOverflowsGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexEvents, r.l3FlushConntrackIndexEventsGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexOrigins, r.l3FlushConntrackIndexOriginsGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexResyncAttempts, r.l3FlushConntrackIndexResyncAttemptsGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexResyncSuccesses, r.l3FlushConntrackIndexResyncSuccessesGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexResyncFailures, r.l3FlushConntrackIndexResyncFailuresGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleRejected, r.l3FlushScheduleRejectedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleAfterShutdown, r.l3FlushScheduleAfterShutdownGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleWaitTimeout, r.l3FlushScheduleWaitTimeoutGauge)
@@ -1679,6 +1695,39 @@ func (r *ACRegistration) l3FlushConntrackIndexOriginsGauge() float64 {
 		return 0
 	}
 	count, ok := r.ac.ConntrackNetlinkIndexOriginCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexResyncAttemptsGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexResyncAttemptCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexResyncSuccessesGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexResyncSuccessCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexResyncFailuresGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexResyncFailureCount()
 	if !ok {
 		return 0
 	}

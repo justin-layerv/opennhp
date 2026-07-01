@@ -73,11 +73,13 @@ import (
 // proves the hot path is active; `L3FlushConntrackIndexFallbackDumps` and
 // `L3FlushConntrackIndexEventErrors` prove dump fallback/event-loss is visible.
 // `L3FlushConntrackIndexAuthoritativeDumps` separately counts intentional
-// fresh-ground-truth dumps for immediate revocation, `L3FlushConntrackIndexEvents`
-// proves the event stream is live, and `L3FlushConntrackIndexOrigins` records
-// the resident userspace mirror size. `L3FlushConntrackSlowDumps` remains the
-// latency signal for fallback, authoritative, and startup/soak characterization
-// dumps.
+// fresh-ground-truth dumps for immediate revocation.
+// `L3FlushConntrackIndexResync{Attempts,Successes,Failures}` proves whether
+// runtime stream-loss recovery is restoring the hot path (#2946).
+// `L3FlushConntrackIndexEvents` proves the event stream is live, and
+// `L3FlushConntrackIndexOrigins` records the resident userspace mirror size.
+// `L3FlushConntrackSlowDumps` remains the latency signal for fallback,
+// authoritative, startup backfill, and resync backfill dumps.
 
 // defaultNetlinkOpTimeout is the hard ceiling for one netlink Flush when the
 // caller supplies no sooner ctx deadline. It caps socket acquisition, the dump,
@@ -100,14 +102,25 @@ const minNetlinkOpTimeout = time.Millisecond
 const netlinkSlowDumpThreshold = 1 * time.Millisecond
 
 // defaultNetlinkIndexBackfillTimeout bounds the one-time startup dump that
-// seeds the #2908 event index with flows that existed before subscription.
-// Steady-state Flush calls must not pay this O(table) cost while the event
-// stream is healthy; a startup failure is loud so the AC does not silently run
-// with an empty index. Runtime event-stream failures degrade to safe fallback,
-// but startup is intentionally stricter for the opt-in netlink backend: if the
-// AC cannot prove the initial snapshot was built, operators should fix that
-// before accepting the #2908 throughput path.
+// seeds the #2908 event index with flows that existed before subscription and
+// the runtime resync rebuild after stream loss. Steady-state Flush calls must
+// not pay this O(table) cost while the event stream is healthy. Dump failures
+// are loud because the AC cannot prove the initial snapshot was built;
+// event-stream loss during backfill still starts on the safe fallback path so a
+// high-churn boot does not crash-loop the AC. Close cancels any in-flight
+// runtime resync and snaps its active socket deadline forward before tearing
+// down the shared netlink pool.
 const defaultNetlinkIndexBackfillTimeout = 30 * time.Second
+
+// defaultNetlinkIndexResyncMinInterval prevents sustained multicast loss from
+// turning recovery into an unbounded stream of IPv4+IPv6 full-table dumps. Flush
+// remains on the safe fallback path during the quiet period; the next fallback
+// after this interval can start another resync attempt. The interval is measured
+// from the end of the previous attempt, so a timed-out rebuild plus this floor is
+// the sustained-loss retry cadence. With the default 30s backfill timeout, the
+// worst-case hot-path restoration cadence under continuous loss is about 40s;
+// correctness is preserved throughout by fallback dumps.
+const defaultNetlinkIndexResyncMinInterval = 10 * time.Second
 
 // maxConsecutiveNetlinkDeleteErrors bounds the reopen-on-error path inside one
 // Flush. A post-retry delete error marks the socket bad; if a kernel-side hard
@@ -129,18 +142,18 @@ type ctConn struct {
 }
 
 type ctNetlinkOps interface {
-	dump(c *ctConn, family conntrack.Family, deadline time.Time) ([]conntrack.Con, error)
-	deleteOrigin(c *ctConn, family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error
+	dump(ctx context.Context, c *ctConn, family conntrack.Family, deadline time.Time, interruptOnCancel bool) ([]conntrack.Con, error)
+	deleteOrigin(ctx context.Context, c *ctConn, family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error
 }
 
 type realCtNetlinkOps struct{}
 
-func (realCtNetlinkOps) dump(c *ctConn, family conntrack.Family, deadline time.Time) ([]conntrack.Con, error) {
-	return c.dump(family, deadline)
+func (realCtNetlinkOps) dump(ctx context.Context, c *ctConn, family conntrack.Family, deadline time.Time, interruptOnCancel bool) ([]conntrack.Con, error) {
+	return c.dump(ctx, family, deadline, interruptOnCancel)
 }
 
-func (realCtNetlinkOps) deleteOrigin(c *ctConn, family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error {
-	return c.deleteOrigin(family, origin, deadline)
+func (realCtNetlinkOps) deleteOrigin(ctx context.Context, c *ctConn, family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error {
+	return c.deleteOrigin(ctx, family, origin, deadline)
 }
 
 func (f *ConntrackFlusher) ctNetlinkOps() ctNetlinkOps {
@@ -188,14 +201,52 @@ func (c *ctConn) setDeadline(deadline time.Time) error {
 	return c.nfct.Con.SetWriteDeadline(deadline)
 }
 
+func (c *ctConn) interruptDeadlineOnCancel(ctx context.Context) func() {
+	if ctx == nil || ctx.Done() == nil || c.nfct == nil {
+		return func() {}
+	}
+	nfct := c.nfct
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			// mdlayher/netlink exposes net.Conn-style deadline setters; moving
+			// the deadline from a watcher goroutine is the standard way to
+			// interrupt a blocked Dump during resync/backfill cancellation.
+			// Later users of this pooled socket call setDeadline before dump/delete,
+			// so the past deadline cannot poison a released socket.
+			now := time.Now()
+			_ = nfct.Con.SetReadDeadline(now)
+			_ = nfct.Con.SetWriteDeadline(now)
+		case <-stop:
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
 // dump returns the family's conntrack table with the whole-Flush socket
 // deadline applied to bound the syscall. Caller holds mu.
-func (c *ctConn) dump(family conntrack.Family, deadline time.Time) ([]conntrack.Con, error) {
+func (c *ctConn) dump(ctx context.Context, family conntrack.Family, deadline time.Time, interruptOnCancel bool) ([]conntrack.Con, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := c.ensureOpen(); err != nil {
 		return nil, err
 	}
 	if err := c.setDeadline(deadline); err != nil {
 		return nil, err
+	}
+	if interruptOnCancel {
+		stopInterrupt := c.interruptDeadlineOnCancel(ctx)
+		defer stopInterrupt()
 	}
 	return c.nfct.Dump(conntrack.Conntrack, family)
 }
@@ -205,9 +256,15 @@ func (c *ctConn) dump(family conntrack.Family, deadline time.Time) ([]conntrack.
 // kernel GC raced us, or it was never written per #2168) maps to success to
 // satisfy the FlowFlusher idempotency contract; any other error is returned
 // for the breaker. Caller holds mu.
-func (c *ctConn) deleteOrigin(family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error {
+func (c *ctConn) deleteOrigin(ctx context.Context, family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error {
 	if origin == nil {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := c.ensureOpen(); err != nil {
 		return err
@@ -229,7 +286,11 @@ type ctNetlinkPool struct {
 	closed atomic.Bool
 }
 
-var errCtNetlinkPoolClosed = errors.New("conntrack netlink pool closed")
+var (
+	errCtNetlinkPoolClosed          = errors.New("conntrack netlink pool closed")
+	errCtEventIndexUnavailable      = errors.New("conntrack event index unavailable")
+	errCtEventIndexPreSwapUnhealthy = errors.New("rebuilt conntrack event index became unhealthy before install")
+)
 
 // newCtNetlinkPool opens n conntrack netlink sockets. On any open failure it
 // closes the sockets already opened and returns the error, so construction is
@@ -345,16 +406,19 @@ func (f *ConntrackFlusher) flushNetlink(ctx context.Context, key FlowKey) error 
 	isV6 := family == conntrack.IPv6
 	deadline := netlinkOpDeadline(ctx)
 
+	eventIndex := f.currentEventIndex()
 	if wantsAuthoritativeFlush(ctx) {
 		f.netlinkIndexAuthoritativeDumps.Add(1)
 	} else {
-		if origins, ok := f.eventIndex.originsForKey(key); ok {
+		if origins, ok := eventIndex.originsForKey(key); ok {
 			f.netlinkIndexedFlushes.Add(1)
 			return f.flushNetlinkIndexed(ctx, key, family, origins, deadline)
 		}
+		if eventIndex != nil {
+			f.scheduleEventIndexResync("flush fallback", errCtEventIndexUnavailable)
+		}
 		f.netlinkIndexFallbackDumps.Add(1)
 	}
-
 	return f.flushNetlinkByDump(ctx, key, family, isV6, deadline)
 }
 
@@ -372,7 +436,7 @@ func (f *ConntrackFlusher) flushNetlinkByDump(ctx context.Context, key FlowKey, 
 		return err
 	}
 
-	cons, dumpDuration, err := f.dumpWithRetry(c, family, deadline)
+	cons, dumpDuration, err := f.dumpWithRetry(ctx, c, family, deadline, false)
 	if err != nil {
 		return fmt.Errorf("conntrack netlink dump for %s: %w", key, err)
 	}
@@ -427,7 +491,11 @@ func (f *ConntrackFlusher) flushNetlinkIndexed(ctx context.Context, key FlowKey,
 	c.mu.Unlock()
 	f.pool.release(c)
 
-	f.eventIndex.removeOrigins(deletedOrigins)
+	// A resync can swap generations after this Flush took its origin snapshot.
+	// Removing from the current generation is still correct: missing keys are
+	// ignored, and if the rebuilt generation captured one of the just-deleted
+	// origins, pruning it avoids a stale indexed hit.
+	f.currentEventIndex().removeOrigins(deletedOrigins)
 
 	if firstErr != nil {
 		return fmt.Errorf("conntrack indexed netlink delete for %s (deleted %d/%d indexed): %w", key, deleted, len(origins), firstErr)
@@ -450,7 +518,7 @@ func (f *ConntrackFlusher) deleteMatchedOrigins(ctx context.Context, c *ctConn, 
 		// Reuse the kernel's own reported origin tuple verbatim for the
 		// delete: it carries the full 5-tuple (incl. source port, and for
 		// ICMP the id/type/code) the kernel needs to find the exact entry.
-		if derr := f.deleteOriginWithRetry(c, family, origin, deadline); derr != nil {
+		if derr := f.deleteOriginWithRetry(ctx, c, family, origin, deadline); derr != nil {
 			consecutiveDeleteErrors++
 			if firstErr == nil {
 				firstErr = derr
@@ -492,8 +560,8 @@ func netlinkDeleteLoopDeadlineErr(ctx context.Context, deadline time.Time) error
 	return nil
 }
 
-func (f *ConntrackFlusher) rebuildEventIndex(ctx context.Context, deadline time.Time) (int, error) {
-	if f.eventIndex == nil {
+func (f *ConntrackFlusher) rebuildEventIndex(ctx context.Context, idx *ctEventIndex, deadline time.Time) (int, error) {
+	if idx == nil {
 		return 0, nil
 	}
 	var cons []conntrack.Con
@@ -506,7 +574,7 @@ func (f *ConntrackFlusher) rebuildEventIndex(ctx context.Context, deadline time.
 			return 0, err
 		}
 		c.mu.Lock()
-		familyCons, _, dumpErr := f.dumpWithRetry(c, family, deadline)
+		familyCons, _, dumpErr := f.dumpWithRetry(ctx, c, family, deadline, true)
 		c.mu.Unlock()
 		f.pool.release(c)
 		if dumpErr != nil {
@@ -514,30 +582,178 @@ func (f *ConntrackFlusher) rebuildEventIndex(ctx context.Context, deadline time.
 		}
 		cons = append(cons, familyCons...)
 	}
-	f.eventIndex.rebuild(cons)
-	if !f.eventIndex.healthy.Load() {
-		return 0, nil
+	return idx.rebuild(cons), nil
+}
+
+func (f *ConntrackFlusher) scheduleEventIndexResync(trigger string, reason error) {
+	if f == nil || f.backend != BackendNetlink || f.pool == nil || f.newEventIndex == nil {
+		return
 	}
-	return int(f.eventIndex.OriginCount()), nil
+	if f.netlinkIndexResyncInFlight.Load() || f.eventIndexResyncBackoffRemainingNow() > 0 {
+		return
+	}
+	f.netlinkIndexResyncLaunchMu.Lock()
+	defer f.netlinkIndexResyncLaunchMu.Unlock()
+	if f.closed.Load() {
+		return
+	}
+	// Recovery is trigger-driven, not a timer loop. If an attempt fails while
+	// the current generation is already unhealthy, the next non-authoritative
+	// fallback Flush is the backstop that schedules another attempt once backoff
+	// allows it. Immediate-revocation authoritative Flushes intentionally use
+	// fresh kernel ground truth and do not drive index recovery.
+	if f.netlinkIndexResyncInFlight.Load() || f.eventIndexResyncBackoffRemainingNow() > 0 {
+		return
+	}
+	if !f.netlinkIndexResyncInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	f.netlinkIndexResyncWG.Add(1)
+	go func() {
+		defer func() {
+			f.netlinkIndexLastResyncNanos.Store(time.Now().UnixNano())
+			f.netlinkIndexResyncInFlight.Store(false)
+			f.netlinkIndexResyncWG.Done()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), defaultNetlinkIndexBackfillTimeout)
+		defer cancel()
+		deadline := time.Now().Add(defaultNetlinkIndexBackfillTimeout)
+		if _, err := f.resyncEventIndex(ctx, deadline); err != nil {
+			log.Warning("[ConntrackFlusher] conntrack event index resync failed — trigger=%s, reason=%v, err=%v", trigger, reason, err)
+		}
+	}()
+}
+
+func (f *ConntrackFlusher) eventIndexResyncBackoffRemainingNow() time.Duration {
+	last := f.netlinkIndexLastResyncNanos.Load()
+	if last == 0 {
+		return 0
+	}
+	return netlinkIndexResyncBackoffRemainingSince(last, time.Now())
+}
+
+func (f *ConntrackFlusher) eventIndexResyncBackoffRemaining(now time.Time) time.Duration {
+	if f == nil {
+		return 0
+	}
+	last := f.netlinkIndexLastResyncNanos.Load()
+	if last == 0 {
+		return 0
+	}
+	return netlinkIndexResyncBackoffRemainingSince(last, now)
+}
+
+func netlinkIndexResyncBackoffRemainingSince(last int64, now time.Time) time.Duration {
+	elapsed := now.Sub(time.Unix(0, last))
+	if elapsed >= defaultNetlinkIndexResyncMinInterval {
+		return 0
+	}
+	return defaultNetlinkIndexResyncMinInterval - elapsed
+}
+
+// resyncEventIndex rebuilds and swaps the event index once. Production callers
+// should enter through scheduleEventIndexResync so the in-flight coalescing and
+// min-interval backoff are honored; direct calls are for tests/synchronous
+// construction paths and intentionally bypass backoff accounting.
+func (f *ConntrackFlusher) resyncEventIndex(ctx context.Context, deadline time.Time) (int, error) {
+	if f == nil || f.backend != BackendNetlink {
+		return 0, errors.New("conntrack event index resync requires netlink backend")
+	}
+	if f.closed.Load() {
+		return 0, errCtNetlinkPoolClosed
+	}
+	if f.netlinkIndexBeforeResyncLock != nil {
+		f.netlinkIndexBeforeResyncLock()
+	}
+	f.netlinkIndexResyncMu.Lock()
+	defer f.netlinkIndexResyncMu.Unlock()
+	ctx, finishResyncContext := f.beginEventIndexResyncContext(ctx)
+	defer finishResyncContext()
+
+	if f.closed.Load() {
+		return 0, errCtNetlinkPoolClosed
+	}
+	f.netlinkIndexResyncAttempts.Add(1)
+	candidate, err := f.openEventIndex()
+	if err != nil {
+		f.netlinkIndexResyncFailures.Add(1)
+		return 0, fmt.Errorf("open conntrack event subscription: %w", err)
+	}
+	closeCandidate := true
+	defer func() {
+		if closeCandidate {
+			_ = candidate.Close()
+		}
+	}()
+
+	indexed, err := f.rebuildEventIndex(ctx, candidate, deadline)
+	if err != nil {
+		f.closeAndArchiveEventIndexCounters(candidate)
+		closeCandidate = false
+		f.netlinkIndexResyncFailures.Add(1)
+		return 0, fmt.Errorf("backfill rebuilt conntrack event index: %w", err)
+	}
+	if !f.enableEventIndexResyncCallbackIfHealthy(candidate) {
+		f.closeAndArchiveEventIndexCounters(candidate)
+		closeCandidate = false
+		f.netlinkIndexResyncFailures.Add(1)
+		return 0, errors.New("rebuilt conntrack event index became unhealthy during backfill")
+	}
+	// A stream error can land after the callback is armed but before this
+	// candidate is installed. Reject that TOCTOU case instead of counting it as
+	// a successful resync that immediately serves fallback dumps.
+	if !candidate.healthy.Load() {
+		f.closeAndArchiveEventIndexCounters(candidate)
+		closeCandidate = false
+		f.netlinkIndexResyncFailures.Add(1)
+		return 0, errCtEventIndexPreSwapUnhealthy
+	}
+	if f.closed.Load() {
+		f.closeAndArchiveEventIndexCounters(candidate)
+		closeCandidate = false
+		f.netlinkIndexResyncFailures.Add(1)
+		return 0, errCtNetlinkPoolClosed
+	}
+
+	_ = f.swapEventIndexClosingAndArchivingOld(candidate)
+	closeCandidate = false
+	// Success records that a rebuilt generation was installed while healthy.
+	// If the stream fails immediately after the swap, EventErrors/FallbackDumps
+	// show that later state and the next fallback Flush schedules recovery.
+	f.netlinkIndexResyncSuccesses.Add(1)
+	log.Info("[ConntrackFlusher] conntrack event index resync installed rebuilt generation — indexed-origins=%d", indexed)
+	return indexed, nil
 }
 
 // deleteOriginWithRetry retries one transient delete failure on a freshly
 // opened socket. A failed delete can leave unread netlink messages behind; the
 // markBad before retry keeps the retry's request/response stream clean without
 // making scheduler-level retries part of the expiry contract.
-func (f *ConntrackFlusher) deleteOriginWithRetry(c *ctConn, family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error {
+func (f *ConntrackFlusher) deleteOriginWithRetry(ctx context.Context, c *ctConn, family conntrack.Family, origin *conntrack.IPTuple, deadline time.Time) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	ops := f.ctNetlinkOps()
-	err := ops.deleteOrigin(c, family, origin, deadline)
+	err := ops.deleteOrigin(ctx, c, family, origin, deadline)
 	if err == nil {
 		return nil
 	}
 	c.markBad()
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
 	if !isTransientNetlinkErr(err) || !time.Now().Before(deadline) {
 		return err
 	}
 	log.Debug("[ConntrackFlusher] transient netlink delete error, retrying once: %v", err)
-	if rerr := ops.deleteOrigin(c, family, origin, deadline); rerr != nil {
+	if rerr := ops.deleteOrigin(ctx, c, family, origin, deadline); rerr != nil {
 		c.markBad()
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		// Join so both the original transient error and the retry failure
 		// stay in the chain for errors.Is.
 		return fmt.Errorf("conntrack netlink delete failed after one retry: %w", errors.Join(err, rerr))
@@ -554,24 +770,36 @@ func (f *ConntrackFlusher) deleteOriginWithRetry(c *ctConn, family conntrack.Fam
 // timeout (the wedged-kernel case) is NOT transient — it is returned
 // immediately, and a transient error after the deadline has passed does not
 // spend the retry. A persistent error after the retry still fails loud.
-func (f *ConntrackFlusher) dumpWithRetry(c *ctConn, family conntrack.Family, deadline time.Time) ([]conntrack.Con, time.Duration, error) {
+func (f *ConntrackFlusher) dumpWithRetry(ctx context.Context, c *ctConn, family conntrack.Family, deadline time.Time, interruptOnCancel bool) ([]conntrack.Con, time.Duration, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	ops := f.ctNetlinkOps()
 	dumpStart := time.Now()
-	cons, err := ops.dump(c, family, deadline)
+	cons, err := ops.dump(ctx, c, family, deadline, interruptOnCancel)
 	duration := time.Since(dumpStart)
 	if err == nil {
 		return cons, duration, nil
 	}
 	c.markBad()
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, duration, cerr
+	}
 	if !isTransientNetlinkErr(err) || !time.Now().Before(deadline) {
 		return nil, duration, err
 	}
 	log.Debug("[ConntrackFlusher] transient netlink dump error, retrying once: %v", err)
 	dumpStart = time.Now()
-	cons, rerr := ops.dump(c, family, deadline)
+	cons, rerr := ops.dump(ctx, c, family, deadline, interruptOnCancel)
 	duration = time.Since(dumpStart)
 	if rerr != nil {
 		c.markBad()
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, duration, cerr
+		}
 		// Join so both the original transient error and the retry failure
 		// stay in the chain for errors.Is.
 		return nil, duration, fmt.Errorf("conntrack netlink dump failed after one retry: %w", errors.Join(err, rerr))

@@ -46,15 +46,19 @@ fallback used because the index was unavailable/unhealthy),
 `L3FlushConntrackIndexAuthoritativeDumps` (intentional fresh-ground-truth dumps
 for immediate revocation), `L3FlushConntrackIndexEventErrors` (event stream
 disabled the index), `L3FlushConntrackIndexPendingOverflows` (startup replay
-pressure tripped the pending cap), `L3FlushConntrackIndexEvents` (event-stream liveness),
+pressure tripped the pending cap), `L3FlushConntrackIndexResyncAttempts`,
+`L3FlushConntrackIndexResyncSuccesses`, and
+`L3FlushConntrackIndexResyncFailures` (runtime #2946 recovery),
+`L3FlushConntrackIndexEvents` (event-stream liveness),
 `L3FlushConntrackIndexOrigins` (resident userspace mirror cardinality),
 `L3FlushConntrackSlowDumps` (fallback/authoritative/backfill dumps over ~1ms),
 and the existing breaker/`FlushErr` series. During populated-table characterization,
 `IndexedFlushes` should rise with deletes, `IndexEvents` should advance when the
 conntrack table churns, `IndexOrigins` should match the expected table
-cardinality envelope while the index is healthy, and fallback/error/slow-dump
-counters should stay flat after startup except for intentional authoritative
-immediate-revocation dumps; any unexplained fallback rate means the million-table
+cardinality envelope while the index is healthy, and fallback/error/
+resync-failure/slow-dump counters should stay flat after startup except for
+intentional authoritative immediate-revocation dumps or an injected/real
+event-loss episode; any unexplained fallback rate means the million-table
 throughput claim is not established even though correctness is preserved. If the
 event index disables itself, the resident mirror is reclaimed
 and `IndexOrigins` is expected to drop to 0 while fallback/error counters explain
@@ -65,8 +69,14 @@ table, so dashboards/sign-off must read it alongside `IndexEventErrors` and
 The event monitor raises its netlink receive buffer but deliberately does **not**
 enable `NETLINK_NO_ENOBUFS`: ENOBUFS must stay visible because it means multicast
 events may have been dropped and the index is no longer complete. Today that
-condition disables the index until AC restart and uses safe dump fallback; runtime
-resync after an overrun is tracked in [#2946](https://github.com/layervai/nhp/issues/2946).
+condition disables the current index, uses safe dump fallback while resync
+rebuilds a fresh subscription generation, and surfaces recovery on the resync
+metrics added for [#2946](https://github.com/layervai/nhp/issues/2946). Runtime
+`EventErrors` are cumulative subscription-health evidence and remain non-zero
+after a recovered blip; use resync attempts/successes/failures plus fallback
+dumps for current recovery posture. Runtime resync attempts are rate-limited by
+a minimum interval, so sustained event loss should show bounded
+`ResyncAttempts`/`SlowDumps` rather than continuous rebuilds.
 
 - [ ] Pre-rollout: on a **sandbox** iptables-mode AC, confirm the netlink datapath
       is available — `nf_conntrack_netlink` loadable + AC has `CAP_NET_ADMIN`
@@ -74,13 +84,17 @@ resync after an overrun is tracked in [#2946](https://github.com/layervai/nhp/is
       flusher fails Start loud if `conntrack.Open` fails). The #2908 event index
       also makes netlink event subscription and the startup backfill dump fatal
       for the opt-in netlink backend: a subscription failure or a 30s backfill
-      timeout blocks AC start rather than silently running with an incomplete hot
-      path. Startup pending-replay overflow is intentionally softer: AC starts on
-      the safe dump fallback, `L3FlushConntrackIndexPendingOverflows` is nonzero,
-      `IndexOrigins` remains 0, and the #2908 throughput claim is not accepted
-      until restart/backfill arms the index at target cardinality. Confirm that
-      fail-closed subscription/timeout posture and degraded-on-overflow posture
-      are acceptable for the target instance before flipping the backend. Then run
+      timeout blocks AC start rather than silently running with an unproven
+      snapshot. Event-stream loss during backfill is different and intentionally
+      softer: the AC starts on safe fallback dumps, error/pending-overflow
+      counters stay visible, `IndexOrigins` remains 0, and runtime resync
+      restores the hot path once the stream is healthy. The #2908 throughput
+      claim is not accepted until restart/backfill or runtime resync arms the
+      index at target cardinality. Treat startup stream loss as an explicit
+      throughput-only sign-off item: enforcement still uses safe dump fallback,
+      but the hot path is absent until recovery. Confirm that fail-closed
+      subscription/timeout posture and degraded-on-stream-loss posture are
+      acceptable for the target instance before flipping the backend. Then run
       `NHP_CONNTRACK_NETLINK_BENCH_GATE=1 go test -bench=BenchmarkConntrackFlusher_Netlink -benchtime=2s ./endpoints/ac/`
       on that AC and confirm **≤200µs/op** (the #2165 acceptance gate). The env
       var intentionally turns the benchmark's warning into a hard failure for
@@ -105,6 +119,9 @@ resync after an overrun is tracked in [#2946](https://github.com/layervai/nhp/is
       `L3FlushConntrackIndexAuthoritativeDumps`,
       `L3FlushConntrackIndexEventErrors`,
       `L3FlushConntrackIndexPendingOverflows`,
+      `L3FlushConntrackIndexResyncAttempts`,
+      `L3FlushConntrackIndexResyncSuccesses`,
+      `L3FlushConntrackIndexResyncFailures`,
       `L3FlushConntrackIndexEvents`, `L3FlushConntrackIndexOrigins`,
       `L3FlushConntrackSlowDumps`, AC process RSS/Go heap, and GC pause. Record
       the steady-state resident index cost at the target cardinality, not just
@@ -178,14 +195,30 @@ resync after an overrun is tracked in [#2946](https://github.com/layervai/nhp/is
       accounts for intentional immediate-revocation dumps, and
       `L3FlushConntrackIndexFallbackDumps`,
       `L3FlushConntrackIndexEventErrors`,
-      `L3FlushConntrackIndexPendingOverflows`, and post-startup
+      `L3FlushConntrackIndexPendingOverflows`,
+      `L3FlushConntrackIndexResyncFailures`, and post-startup
       `L3FlushConntrackSlowDumps` stay flat except for recorded authoritative
-      dumps. Treat any event-index error as
-      "hot path lost until AC restart" unless #2946 has landed; correctness is
-      preserved by fallback, but the #2908 throughput claim is not accepted while
-      that condition is present. Treat any pending-overflow count above zero as
-      startup replay pressure evidence that must be resolved or explicitly
-      accepted before prod flip.
+      dumps. If an event-index error is
+      injected, expect `L3FlushConntrackIndexEventErrors` to move and verify
+      `L3FlushConntrackIndexResyncAttempts` and
+      `L3FlushConntrackIndexResyncSuccesses` advance, event-loss fallback dumps
+      stop after the rebuilt generation is installed, and no teardown miss
+      appears in the pre/post table snapshot. Under sustained injected event
+      loss, verify error/resync-failure counters move together, resync attempts
+      respect the minimum interval, and the AC does not create a continuous
+      full-table dump loop; also watch socket-pool wait and `SlowDumps` because
+      resync backfills share the pool with fallback dumps while the index is
+      unhealthy. Treat `EventErrors` as cumulative subscription-health evidence,
+      not a distinct incident count; use resync attempts/failures for recovery
+      episode cadence. Recovery is trigger-driven: a degraded but quiescent AC
+      may not advance `ResyncAttempts` until the next non-authoritative fallback
+      Flush.
+      During shutdown or restart, verify an in-flight resync is
+      cancelled by Close (the active socket deadline is snapped forward) before
+      the shared pool is torn down, rather than waiting for the full backfill
+      budget. Treat any pending-overflow count above zero as startup replay
+      pressure evidence that must be resolved or explicitly accepted before prod
+      flip.
       Note: a transient netlink `ENOBUFS`/`EINTR`
       dump is retried once and is self-healing (the socket is reopened); a
       *persistent* dump failure trips `FlushErr` → breaker (intended fail-loud).
@@ -223,7 +256,6 @@ resync after an overrun is tracked in [#2946](https://github.com/layervai/nhp/is
       across the swap).
 - [ ] Follow-up (not blocking, tracked — no action required for this rollout): a
       dump-latency histogram for finer fallback/backfill readability is **#2909**.
-      Runtime event-index resync after multicast overrun is **#2946**.
       Compact resident origin storage to reduce million-entry GC scan pressure is
       **#2973**.
       The surgical, sibling-preserving revoke teardown stays the **#2784**

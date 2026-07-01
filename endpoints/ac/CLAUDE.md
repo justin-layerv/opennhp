@@ -65,12 +65,30 @@ must update this list and audit all existing call sites.
   across dump/delete syscalls; `ctEventIndex.mu` guards the #2908 event-fed
   origin index and is held only while applying multicast events, startup
   backfill replay, taking a lookup snapshot, or pruning successfully-deleted
-  origins after the indexed delete path has released its pooled socket. The
-  netlink backend intentionally avoids nesting `ctConn.mu` and
-  `ctEventIndex.mu`; neither lock calls back into `UdpAC`, `ACRegistration`,
-  metrics publisher locks, tokenstore, or scheduler locks. Keep both leaf-most;
-  future changes that invoke AC callbacks while holding either lock must audit
-  this table first.
+  origins after the indexed delete path has released its pooled socket.
+  the current event-index generation pointer is an `atomic.Pointer` so the
+  #2908 hot Flush path does not take a flusher-level mutex; `eventIndexMu`
+  guards the archived-counter snapshot boundary used by cumulative gauges
+  (resync swaps in the candidate, then closes and archives the old event
+  subscription under this mutex so those gauges stay monotonic);
+  `netlinkIndexResyncMu` serializes resync and final teardown so shutdown cannot
+  leak a freshly rebuilt generation. `netlinkIndexResyncLaunchMu` gates worker
+  `WaitGroup` Add vs Close Wait; Close takes and releases it immediately after
+  setting `closed=true`, before cancellation and `WaitGroup` wait. Close waits
+  for scheduled resync workers before taking `netlinkIndexResyncMu`, so a worker
+  launched just before shutdown can acquire the mutex, observe `closed`, and exit
+  instead of blocking behind Close's wait.
+  `netlinkIndexResyncCancelMu` protects only the active resync cancel function;
+  resync may briefly take it while holding `netlinkIndexResyncMu`, while Close
+  takes and releases it before waiting for workers and final teardown. The netlink
+  backend intentionally avoids nesting `ctConn.mu` and `ctEventIndex.mu`; resync
+  may take `netlinkIndexResyncMu` before pooled-socket work and before swapping
+  `eventIndexMu`, and no path takes the reverse order. The event-index
+  `onUnhealthy` callback fires only after `ctEventIndex.mu` is released. None of
+  these locks call back into
+  `UdpAC`, `ACRegistration`, metrics publisher locks, tokenstore, or scheduler
+  locks. Keep them leaf-most; future changes that invoke AC callbacks while
+  holding any of them must audit this table first.
 - **`tokenStore.mu` is never held while scheduler `shard.mu` /
   `wheelMu` are acquired** (#2172). The
   `TokenStore.OnExpire` hook wired by `(*UdpAC).Start` calls
