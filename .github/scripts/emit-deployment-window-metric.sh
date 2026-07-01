@@ -20,7 +20,7 @@ emit_deployment_window_metric() {
     --cli-read-timeout 10 \
     --namespace "LayerV/NHP" \
     --metric-name "DeploymentWindow" \
-    --dimensions Name=Environment,Value="$environment" Name=Cell,Value="$cell_id" \
+    --dimensions "Environment=${environment},Cell=${cell_id}" \
     --value 1 \
     --unit Count; then
     echo "::warning::Failed to push DeploymentWindow metric (Environment=$environment Cell=$cell_id Component=$component Strategy=$strategy); continuing"

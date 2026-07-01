@@ -72,6 +72,24 @@ if [[ "$*" != cloudwatch\ put-metric-data* ]]; then
   echo "unexpected aws invocation: $*" >&2
   exit 2
 fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dimensions)
+      shift
+      if [[ "${1:-}" != Environment=*,Cell=* ]]; then
+        echo "unexpected --dimensions form: ${1:-<missing>}" >&2
+        exit 2
+      fi
+      ;;
+    Name=*)
+      echo "unexpected bare Name= dimension argument: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
 count_file="$STATE_DIR/aws-count"
 count=0
 [[ -f "$count_file" ]] && count=$(cat "$count_file")
@@ -174,10 +192,11 @@ assert_file_contains "metric namespace is LayerV/NHP" "$LAST_STATE_DIR/aws-args"
 assert_file_contains "metric name is DeploymentWindow" "$LAST_STATE_DIR/aws-args" "--metric-name DeploymentWindow"
 assert_file_contains "put metric has bounded connect timeout" "$LAST_STATE_DIR/aws-args" "--cli-connect-timeout 5"
 assert_file_contains "put metric has bounded read timeout" "$LAST_STATE_DIR/aws-args" "--cli-read-timeout 10"
-assert_file_contains "environment dimension is present" "$LAST_STATE_DIR/aws-args" "Name=Environment,Value=prod"
-assert_file_contains "cell dimension is present" "$LAST_STATE_DIR/aws-args" "Name=Cell,Value=cell0"
-assert_file_not_contains "component stays log-only, not a dimension" "$LAST_STATE_DIR/aws-args" "Name=Component"
-assert_file_not_contains "strategy stays log-only, not a dimension" "$LAST_STATE_DIR/aws-args" "Name=Strategy"
+assert_file_contains "dimensions use put-metric-data shorthand" "$LAST_STATE_DIR/aws-args" "--dimensions Environment=prod,Cell=cell0"
+assert_file_contains "environment dimension is present" "$LAST_STATE_DIR/aws-args" "Environment=prod"
+assert_file_contains "cell dimension is present" "$LAST_STATE_DIR/aws-args" "Cell=cell0"
+assert_file_not_contains "component stays log-only, not a dimension" "$LAST_STATE_DIR/aws-args" "Component="
+assert_file_not_contains "strategy stays log-only, not a dimension" "$LAST_STATE_DIR/aws-args" "Strategy="
 
 run_case put-failure env FAKE_PUT_MODE=fail bash "$SCRIPT" prod cell0 ac canary
 assert_rc "put-metric-data failure is non-blocking" 0

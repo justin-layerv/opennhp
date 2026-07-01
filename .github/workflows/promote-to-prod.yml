@@ -1321,16 +1321,16 @@ jobs:
             # Consistent with the existing LayerV/NHP::DeploymentEvent
             # push in finalize.send-notification.
             #
-            # Dimensions use the AWS-canonical Name=/Value= pair-of-args
-            # form (NOT the comma-joined shorthand). Comma-joined breaks
-            # the moment a future Reason value contains a comma or space
-            # (e.g., "Throttled (transient)"); the pair form survives any
-            # value the shell can quote.
+            # put-metric-data --dimensions uses the AWS CLI's command-specific
+            # Key=Value shorthand, not the Name=...,Value=... structure form
+            # accepted by other CloudWatch commands. Keep Reason values simple;
+            # if a future value can contain a comma, switch this call to
+            # --metric-data JSON instead of reverting to the broken pair form.
             aws cloudwatch put-metric-data \
               --region "$AWS_REGION" \
               --namespace "LayerV/NHP" \
               --metric-name "StaleTerraformCheckCouldNotVerify" \
-              --dimensions Name=Environment,Value=prod Name=Reason,Value="$reason" \
+              --dimensions "Environment=prod,Reason=${reason}" \
               --value 1 \
               --unit Count \
               || echo "::warning::Failed to push StaleTerraformCheckCouldNotVerify metric (reason=$reason)"
@@ -3895,15 +3895,14 @@ jobs:
           # the workflow's actual outcome.
           DEPLOY_STATUS: ${{ steps.final_status.outputs.value }}
         run: |
-          # Pair-of-args dimensions form (NOT comma-joined shorthand)
-          # to match push_could_not_verify_metric in the preflight job.
-          # Today $DEPLOY_STATUS is constrained to success/failed, but
-          # the form is forward-defensive against any future Status
-          # value containing a comma or space.
+          # put-metric-data --dimensions uses Key=Value shorthand. Today
+          # $DEPLOY_STATUS is constrained to success/failed; if a future
+          # Status value can contain a comma, use --metric-data JSON
+          # instead of the unsupported Name=...,Value=... pair form.
           aws cloudwatch put-metric-data \
             --namespace "LayerV/NHP" \
             --metric-name "DeploymentEvent" \
-            --dimensions Name=Environment,Value=prod Name=Strategy,Value=promote Name=Status,Value="$DEPLOY_STATUS" \
+            --dimensions "Environment=prod,Strategy=promote,Status=${DEPLOY_STATUS}" \
             --value 1 \
             --unit Count \
             || echo "::warning::Failed to push deployment metric"

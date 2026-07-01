@@ -316,20 +316,32 @@ jobs:
             .github/scripts/dispatch-and-poll-blue-green.sh \
             .github/scripts/dispatch-and-poll-canary.sh \
             .github/scripts/emit-deployment-window-metric.sh \
+            .github/scripts/verify-asg-instances-healthy.sh \
             .github/scripts/recover-relay-deposed-sg.sh \
             .github/scripts/check-relay-deposed-sg-clear.sh \
             tests/scripts/prune-missing-asg-target-groups_test.sh \
             tests/scripts/wait-for-instance-refresh_test.sh \
             tests/scripts/deploy-relay_test.sh \
             tests/scripts/emit-deployment-window-metric_test.sh \
+            tests/scripts/verify-asg-instances-healthy_test.sh \
             tests/scripts/recover-relay-deposed-sg_test.sh \
             tests/scripts/check-relay-deposed-sg-clear_test.sh
           bash tests/scripts/prune-missing-asg-target-groups_test.sh
           bash tests/scripts/wait-for-instance-refresh_test.sh
           bash tests/scripts/deploy-relay_test.sh
           bash tests/scripts/emit-deployment-window-metric_test.sh
+          bash tests/scripts/verify-asg-instances-healthy_test.sh
           bash tests/scripts/recover-relay-deposed-sg_test.sh
           bash tests/scripts/check-relay-deposed-sg-clear_test.sh
+
+      # Regression fence for aws cloudwatch put-metric-data: its --dimensions
+      # option uses command-specific Key=Value shorthand, not the
+      # Name=...,Value=... structure form accepted by other CloudWatch APIs.
+      - name: Check CloudWatch put-metric-data dimensions
+        run: |
+          python3 -m py_compile .github/scripts/check-cloudwatch-put-metric-data-dimensions.py
+          python3 .github/scripts/check-cloudwatch-put-metric-data-dimensions.py --self-test
+          python3 .github/scripts/check-cloudwatch-put-metric-data-dimensions.py
 
       # Fence the canonical active-color → slot resolver (shared by
       # build-and-push.yml, promote-to-prod.yml, blue-green-deploy.yml, and

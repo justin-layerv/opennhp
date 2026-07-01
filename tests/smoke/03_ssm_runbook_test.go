@@ -112,7 +112,7 @@ func TestSSMRunbook_VerifyASGInstancesShellCmdExits0(t *testing.T) {
 
 // TestSSMRunbook_ShellCmdHasNoDoubleQuotes is a belt-and-suspenders
 // Go-side static check on verify-asg-instances-healthy.sh. The shell
-// script has its own runtime guard at line 86; this test catches the
+// script has its own runtime guard; this test catches the
 // class at a different layer — if a future edit adds a double-quoted
 // command literal, the shell guard would reject it at deploy time.
 // This Go test rejects it at PR time instead, which is cheaper.
