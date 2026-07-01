@@ -94,16 +94,6 @@ dedupe_array tier1_prefixes "${tier1_prefixes[@]:-}"
 dedupe_array tier2_prefixes "${tier2_prefixes[@]:-}"
 dedupe_array tier3_prefixes "${tier3_prefixes[@]:-}"
 
-array_contains() {
-  local needle="$1"
-  shift
-  local item
-  for item in "$@"; do
-    [ "$item" = "$needle" ] && return 0
-  done
-  return 1
-}
-
 # Extract a tier's RUN_FILTER alternation tokens. Pulls the first
 # `^Test(...)_` regex on the line whose case label matches the tier.
 extract_filter_tokens() {
