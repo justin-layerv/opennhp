@@ -37,9 +37,12 @@ CVE-2026-39883
 # golang.org/x/net + older Go stdlib) used to flag a cluster of HIGH CVEs
 # (CVE-2026-25680/25681/27136/27145/39821/42502/42506, and on newer base
 # digests also -33814 / -42504). We do NOT ignore those — our containers never
-# invoke pebble, so each scanned runtime stage (Dockerfile.server,
-# Dockerfile.ac.aws, Dockerfile.relay) deletes /usr/bin/pebble. Trivy scans the
-# squashed filesystem, so removing the binary drops the whole gobinary target to
-# zero findings — fixable CVEs are fixed, not suppressed. If a future base ever
-# legitimately needs pebble, revisit (bump to a digest whose pebble vendors
-# x/net >= 0.55.0 and Go >= 1.26.4) rather than adding ignores here.
+# invoke pebble, so every ubuntu-based Dockerfile — the scanned trio
+# Dockerfile.{server,ac.aws,relay}, the un-gated Dockerfile.{ac,app,base}, and
+# the local/CI smoke image tests/smoke/local-stack/Dockerfile — deletes
+# /usr/bin/pebble. scripts/check-base-image-pebble-purge.sh enforces that at PR
+# time so a new/edited ubuntu Dockerfile can't silently skip it. Trivy
+# scans the squashed filesystem, so removing the binary drops the whole gobinary
+# target to zero findings — fixable CVEs are fixed, not suppressed. If a future
+# base ever legitimately needs pebble, revisit (bump to a digest whose pebble
+# vendors x/net >= 0.55.0 and Go >= 1.26.4) rather than adding ignores here.

@@ -27,7 +27,12 @@ RUN apt-get update && \
     ipset \
     git \
     vim \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Drop Canonical's Pebble (unused stray Go binary the ubuntu base ships in
+    # /usr/bin/pebble) — flags HIGH x/net + stdlib CVEs. opennhp-base is the
+    # FROM-base for Dockerfile.agent/db, so this clears the whole family.
+    # Required by scripts/check-base-image-pebble-purge.sh; see .trivyignore.
+    && rm -f /usr/bin/pebble && rm -rf /var/lib/pebble
 
 # Set Go version
 ENV GO_VERSION=${GO_VERSION}

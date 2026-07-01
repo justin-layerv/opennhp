@@ -49,7 +49,11 @@ RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Drop Canonical's Pebble (unused stray Go binary the ubuntu base ships in
+    # /usr/bin/pebble) — flags HIGH x/net + stdlib CVEs. Required by
+    # scripts/check-base-image-pebble-purge.sh; see .trivyignore.
+    && rm -f /usr/bin/pebble && rm -rf /var/lib/pebble
 
 COPY --from=builder /out/nhp-serverd /nhp-server/nhp-serverd
 # Plugin templates (passcode login pages, etc.), same as docker/Dockerfile.server.
@@ -75,7 +79,11 @@ RUN apt-get -o Acquire::Retries=3 update && \
     curl \
     iptables \
     ipset \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Drop Canonical's Pebble (unused stray Go binary the ubuntu base ships in
+    # /usr/bin/pebble) — flags HIGH x/net + stdlib CVEs. Required by
+    # scripts/check-base-image-pebble-purge.sh; see .trivyignore.
+    && rm -f /usr/bin/pebble && rm -rf /var/lib/pebble
 
 COPY --from=builder /out/nhp-acd /nhp-ac/nhp-acd
 RUN mkdir -p /nhp-ac/logs /nhp-ac/etc

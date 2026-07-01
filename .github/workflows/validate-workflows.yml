@@ -24,6 +24,12 @@ on:
       - "scripts/run-smoke.sh"
       - "scripts/check-cert-cleanup-log-gate-unique.sh"
       - "scripts/check-cleanup-event-type-lockstep.sh"
+      # Base-image pebble purge (#2800/#2804): watch the lint so an edit to it
+      # re-fires. Edits to ANY Dockerfile are caught by the docker/Dockerfile*
+      # glob below — the same discovery the lint runs over, so a brand-new
+      # ubuntu Dockerfile fires this on the PR that introduces it. The paired
+      # fixture test rides tests/scripts/** below.
+      - "scripts/check-base-image-pebble-purge.sh"
       - "scripts/check-lockdown-body-drift.sh"
       - "scripts/check-paths-filter-coverage.py"
       - "scripts/print-dispatch-ref-error.sh"
@@ -90,11 +96,15 @@ on:
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
-      - "docker/Dockerfile.server"
-      - "docker/Dockerfile.ac"
-      - "docker/Dockerfile.ac.aws"
-      - "docker/Dockerfile.app"
-      - "docker/Dockerfile.base"
+      # Globs, not an enumerated list, so a brand-new Dockerfile fires
+      # validate-workflows on the PR that introduces it — matching the recursive
+      # discovery model of check-base-image-pebble-purge.sh and
+      # check-go-version-drift.sh. The first entry covers top-level docker/
+      # Dockerfiles (`*` doesn't cross `/`); the second covers nested ones (e.g. a
+      # future docker/web-app/Dockerfile) so the lint's recursive find can't see a
+      # Dockerfile this trigger doesn't. (tests/smoke/** below already recurses.)
+      - "docker/Dockerfile*"
+      - "docker/**/Dockerfile*"
       - "nhp/go.mod"
       - "internalauth/go.mod"
       - "endpoints/go.mod"
@@ -211,6 +221,20 @@ jobs:
 
       - name: Check Go version drift
         run: bash scripts/check-go-version-drift.sh
+
+      # Deterministic guard (#2800/#2804) that every ubuntu-based Dockerfile
+      # strips Canonical's /usr/bin/pebble. trivy only covers the gated trio, and
+      # only once its DB lists the CVEs; this covers every ubuntu Dockerfile at PR
+      # time so a base-image binary can't silently ship CVEs again. The fixture
+      # suite runs before the real check so a regex regression surfaces against
+      # known inputs first, rather than the real tree passing false-green.
+      # shellcheck both — actionlint's -shellcheck only covers workflow-embedded
+      # scripts, not standalone scripts/*.sh.
+      - name: Test + check base-image pebble purge (#2800/#2804)
+        run: |
+          shellcheck scripts/check-base-image-pebble-purge.sh tests/scripts/check-base-image-pebble-purge_test.sh
+          bash tests/scripts/check-base-image-pebble-purge_test.sh
+          bash scripts/check-base-image-pebble-purge.sh
 
       # Structural fence for the promote-to-prod gate logic that closed
       # issue #1322 (deploy-* must require terraform-apply success when
