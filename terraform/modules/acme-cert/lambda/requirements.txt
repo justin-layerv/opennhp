@@ -14,7 +14,7 @@
 acme==2.11.0
 
 # JSON Object Signing and Encryption (ACME dependency)
-josepy==1.14.0
+josepy==1.15.0
 
 # Cryptography for key generation and certificate handling
 cryptography==48.0.1
