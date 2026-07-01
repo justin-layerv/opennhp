@@ -29,13 +29,38 @@ services:
       context: ..
       dockerfile: ./docker/Dockerfile.ac
     volumes:
-      - ./nhp-ac/etc/:/nhp-ac/etc/
+      # Bind config files individually so image-baked /nhp-ac/etc/*.o remains
+      # visible. For live reload tests, edit these files in place or restart
+      # the container; reintroducing a broad etc/ bind would shadow eBPF objects.
+      # These tracked source files must exist on the host, or Docker may create
+      # a directory at the target path and produce a confusing config parse error.
+      # The AC reads these configs at boot/reload; local runtime writes belong
+      # under logs/ or bpffs, not /nhp-ac/etc.
+      - ./nhp-ac/etc/config.toml:/nhp-ac/etc/config.toml:ro
+      - ./nhp-ac/etc/resource.toml:/nhp-ac/etc/resource.toml:ro
+      - ./nhp-ac/etc/server.toml:/nhp-ac/etc/server.toml:ro
       - ./nhp-ac/traefik/etc/traefik.toml:/opt/traefik/traefik.toml
       - ./nhp-ac/traefik/etc/provider.toml:/opt/traefik/provider.toml
       - ./nhp-ac/logs/:/nhp-ac/logs/
     restart: always
     cap_add:
+      # FilterMode=EBPFXDP is still opt-in via docker/nhp-ac/etc/config.toml.
+      # These local-dev privileges let the AC mount bpffs, load/pin eBPF maps
+      # and programs, and attach XDP/TC when a developer flips that mode.
+      # Do not copy this local-only privilege set into deployed/prod topology.
       - NET_ADMIN
+      - BPF
+      - PERFMON
+      - SYS_ADMIN
+      - SYS_RESOURCE
+    security_opt:
+      # Docker's default seccomp profile can block the XDP/TC attach path even
+      # when the caps above are present; keep this local-only with those caps.
+      - seccomp=unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     depends_on:
       - nhp-server
     networks:

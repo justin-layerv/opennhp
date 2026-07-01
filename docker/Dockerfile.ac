@@ -8,10 +8,16 @@ FROM golang:1.26.4-bookworm@sha256:5d2b868674b57c9e48cdd39e891acce4196b6926ca6d1
 WORKDIR /nhp-server
 
 # Install build dependencies
+# Local compose exercises the eBPF build/load path, but does not promise
+# byte-identical prod objects: prod object freshness remains with
+# docker/Dockerfile.ac.aws's pinned clang-18 toolchain and CI guards.
 RUN apt-get update && apt-get install -y \
     make \
     clang \
     llvm \
+    # libbpf-dev supplies the <bpf/*.h> headers for `make ebpf-objects`;
+    # see docker/Dockerfile.ac.aws for the prod-image rationale.
+    libbpf-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy source code
@@ -19,11 +25,22 @@ COPY . .
 
 RUN echo "Building for architecture: ${TARGETARCH}"
 
-# Build the AC
-RUN make init acd
+# Build the AC binary plus the eBPF object files.
+#
+# `init` runs `git clean -df release` first, so it must stay ahead of both
+# `acd` and `ebpf-objects`: the latter two populate release/nhp-ac/. The
+# runtime stage copies that whole tree to /nhp-ac, and docker-compose mounts
+# only individual config files so the image-baked /nhp-ac/etc/*.o files remain
+# visible when local FilterMode=EBPFXDP is exercised.
+RUN make init acd ebpf-objects
 
 # Stage 2: Runtime image
 FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba AS runtime
+
+# EbpfEngineLoad resolves bpfDir="etc" relative to process cwd, so local
+# runtime cwd must match the /nhp-ac tree that carries etc/*.o. This mirrors
+# docker/Dockerfile.ac.aws's supervisord `directory=/nhp-ac`.
+WORKDIR /nhp-ac
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
@@ -50,6 +67,22 @@ RUN apt-get update && \
 
 # Copy built binary and scripts
 COPY --from=builder /nhp-server/release/nhp-ac /nhp-ac
+
+# Regression guard: local docker-compose eBPF mode loads these objects from
+# /nhp-ac/etc/ at AC startup. Fail the image build if a future edit drops the
+# builder's `ebpf-objects` step, changes the Makefile output paths, or emits an
+# empty object. Keep this guard in lockstep with docker/Dockerfile.ac.aws via
+# scripts/check-ebpf-load-path-lockstep.sh.
+RUN test -s /nhp-ac/etc/nhp_ebpf_xdp.o && test -s /nhp-ac/etc/tc_egress.o \
+    || { \
+        echo "ERROR: eBPF object(s) missing or empty in /nhp-ac/etc/"; \
+        echo "local docker-compose AC will boot-fail under FilterMode=EBPFXDP."; \
+        echo "Did the builder's 'make ... ebpf-objects' step get dropped,"; \
+        echo "did the Makefile EBPF_OBJ_* output paths change, or did the compile emit an empty object?"; \
+        echo 'load path: endpoints/ac/ebpf/ebpfegine.go bpfDir="etc"'; \
+        exit 1; \
+    }
+
 COPY --from=builder /nhp-server/docker/iptables_defaults_ubuntu.sh /iptables_defaults_ubuntu.sh
 COPY --from=builder /nhp-server/docker/iptables_defaults_x86.sh /iptables_defaults_x86.sh
 
@@ -62,8 +95,7 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then \
     chmod +x /iptables_defaults.sh && \
     rm -f /iptables_defaults_*.sh
 
-# Create startup script
-RUN echo '#!/bin/bash\n/iptables_defaults.sh -f\nexec /nhp-ac/nhp-acd run' > /start.sh && \
-    chmod +x /start.sh
+COPY --from=builder /nhp-server/docker/start-ac.sh /start.sh
+RUN chmod +x /start.sh
 
 ENTRYPOINT ["/start.sh"]

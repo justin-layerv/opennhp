@@ -50,14 +50,14 @@ on:
       - "scripts/check-revocation-slo-lockstep.sh"
       - "endpoints/server/revocation_retry.go"
       - "terraform/modules/monitoring/main.tf"
-      # eBPF load-path + FilterMode lockstep (#2810, #2812): trigger on the
-      # script + its fixture test and on the three source-of-truth sites it
-      # compares that aren't watched elsewhere — the Go object-path consts
-      # (ebpfegine.go), the Go FilterMode enum (config.go), and the Makefile
-      # EBPF_OBJ_* paths — so a rename or a FilterMode enum reorder re-runs the
-      # lint at PR time. Its other two sites (Dockerfile.ac.aws and
-      # tests/smoke/ssm_probe.go, the latter via "tests/smoke/**") are watched
-      # below; the script header inventories all five.
+      # eBPF load-path + FilterMode lockstep (#2810, #2812, #2815): trigger on
+      # the script + its fixture test and on the source-of-truth sites it
+      # compares that aren't watched elsewhere: Go object-path consts
+      # (ebpfegine.go), Go FilterMode enum (config.go), Makefile EBPF_OBJ_*
+      # paths, the local compose mount/load shape, and the local AC bpffs startup
+      # helper. The Dockerfile guards ride the docker/Dockerfile* globs below,
+      # and tests/smoke/ssm_probe.go rides tests/smoke/** below; the script
+      # header inventories every site.
       - "scripts/check-ebpf-load-path-lockstep.sh"
       - "tests/scripts/check-ebpf-load-path-lockstep_test.sh"
       # eBPF arch lockstep (#2816): the AC image build platform must stay
@@ -78,6 +78,8 @@ on:
       - ".github/rulesets/**"
       - "endpoints/ac/ebpf/ebpfegine.go"
       - "endpoints/ac/config.go"
+      - "docker/docker-compose.yaml"
+      - "docker/start-ac.sh"
       - "terraform/modules/ac/main.tf"
       - "Makefile"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
@@ -566,19 +568,19 @@ jobs:
           bash tests/scripts/check-revocation-slo-lockstep_test.sh
           bash scripts/check-revocation-slo-lockstep.sh
 
-      # eBPF object load-path lockstep (#2810): the AC loads its eBPF objects
-      # from a dir+filenames that are the runtime source of truth in
+      # eBPF object load-path lockstep (#2810, #2812, #2815): the AC loads its
+      # eBPF objects from a dir+filenames that are the runtime source of truth in
       # endpoints/ac/ebpf/ebpfegine.go (bpfDir / ebpfenginename / tcObjName).
-      # The Makefile EBPF_OBJ_* output paths and the docker/Dockerfile.ac.aws
-      # build guard independently hardcode the same path; a Go-only rename
-      # would pass the in-image build guard (which only compares
-      # Makefile↔Dockerfile) yet boot-fail the AC under FilterMode=EBPFXDP.
-      # The fixture suite runs first so an extractor regression surfaces
-      # against synthetic inputs before the real tree runs. shellcheck both —
-      # actionlint's -shellcheck only covers workflow-embedded scripts.
-      - name: Test + check eBPF load-path + FilterMode lockstep (Go ↔ Makefile ↔ Dockerfile ↔ smoke, #2810, #2812)
+      # The Makefile EBPF_OBJ_* output paths, both AC Dockerfile build guards,
+      # local compose mount/load prerequisites, local bpffs startup helper, and
+      # the smoke deployed-layout probe must stay aligned or FilterMode=EBPFXDP
+      # can boot-fail. The fixture suite runs first so an extractor regression
+      # surfaces against synthetic inputs before the real tree runs. shellcheck
+      # the helper + both lint scripts — actionlint's -shellcheck only covers
+      # workflow-embedded scripts.
+      - name: Test + check eBPF load-path + FilterMode lockstep (Go ↔ Makefile ↔ Dockerfiles ↔ compose/startup ↔ smoke, #2810, #2812, #2815)
         run: |
-          shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
+          shellcheck docker/start-ac.sh scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
           bash tests/scripts/check-ebpf-load-path-lockstep_test.sh
           bash scripts/check-ebpf-load-path-lockstep.sh
 

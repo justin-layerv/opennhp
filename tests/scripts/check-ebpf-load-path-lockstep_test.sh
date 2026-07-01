@@ -3,12 +3,19 @@
 # ----------------------------------------------------------------------------
 # Fixture tests for scripts/check-ebpf-load-path-lockstep.sh.
 #
-# Copies the five real source/probe files into a tempdir that mimics the
+# Copies the real source/probe files into a tempdir that mimics the
 # repo layout, points the script at it via $EBPF_LOCKSTEP_ROOT, and asserts:
 #   - the unmutated copy passes (exit 0),
 #   - each independent single-site mutation (Go xdp name, Go tc name, Go dir,
-#     Makefile xdp path, Makefile tc path, Dockerfile guard path, smoke xdp
-#     path, smoke tc path, AC FilterMode enum value, smoke FilterMode value) is
+#     Makefile xdp path, Makefile tc path, prod Dockerfile guard path, local
+#     Dockerfile guard path, local Dockerfile WORKDIR, local compose broad-shadow
+#     mount, local compose missing config-file bind, local compose writable
+#     config-file bind, local Dockerfile start script copy, local compose missing
+#     BPF cap, local compose missing seccomp opt, local compose missing memlock,
+#     local compose memlock values only present under a sibling ulimit, local
+#     start script missing bpffs mount, validate-workflows missing start-ac
+#     trigger, future non-toml local config file, smoke xdp path, smoke tc path,
+#     AC FilterMode enum value, smoke FilterMode value) is
 #     DETECTED (exit non-zero) — this proves the lint is non-vacuous: it
 #     actually fails when a site drifts, not just when nothing changed,
 #   - an AC FilterMode const block with simple explicit numeric values still
@@ -29,8 +36,12 @@ SCRIPT="$REPO_ROOT/scripts/check-ebpf-load-path-lockstep.sh"
 REAL_GO="$REPO_ROOT/endpoints/ac/ebpf/ebpfegine.go"
 REAL_AC_CONFIG="$REPO_ROOT/endpoints/ac/config.go"
 REAL_MK="$REPO_ROOT/Makefile"
-REAL_DK="$REPO_ROOT/docker/Dockerfile.ac.aws"
+REAL_DK_AWS="$REPO_ROOT/docker/Dockerfile.ac.aws"
+REAL_DK_LOCAL="$REPO_ROOT/docker/Dockerfile.ac"
 REAL_SMOKE="$REPO_ROOT/tests/smoke/ssm_probe.go"
+REAL_COMPOSE="$REPO_ROOT/docker/docker-compose.yaml"
+REAL_AC_START="$REPO_ROOT/docker/start-ac.sh"
+REAL_VALIDATE_WORKFLOW="$REPO_ROOT/.github/workflows/validate-workflows.yml"
 
 pass=0
 fail=0
@@ -50,12 +61,17 @@ report_fail() { fail=$((fail + 1)); printf '  \033[31m✗\033[0m %s\n      %s\n'
 # a tempdir. The script reads only these files, so nothing else is needed.
 _make_fixture() {
   local dir="$1"
-  mkdir -p "$dir/endpoints/ac/ebpf" "$dir/docker" "$dir/tests/smoke"
+  mkdir -p "$dir/.github/workflows" "$dir/endpoints/ac/ebpf" "$dir/docker/nhp-ac/etc" "$dir/tests/smoke"
   cp "$REAL_GO" "$dir/endpoints/ac/ebpf/ebpfegine.go"
   cp "$REAL_AC_CONFIG" "$dir/endpoints/ac/config.go"
   cp "$REAL_MK" "$dir/Makefile"
-  cp "$REAL_DK" "$dir/docker/Dockerfile.ac.aws"
+  cp "$REAL_DK_AWS" "$dir/docker/Dockerfile.ac.aws"
+  cp "$REAL_DK_LOCAL" "$dir/docker/Dockerfile.ac"
   cp "$REAL_SMOKE" "$dir/tests/smoke/ssm_probe.go"
+  cp "$REAL_COMPOSE" "$dir/docker/docker-compose.yaml"
+  cp "$REAL_AC_START" "$dir/docker/start-ac.sh"
+  cp "$REAL_VALIDATE_WORKFLOW" "$dir/.github/workflows/validate-workflows.yml"
+  cp "$REPO_ROOT"/docker/nhp-ac/etc/*.toml "$dir/docker/nhp-ac/etc/"
 }
 
 # Run the script against a fixture root; echo its exit code.
@@ -117,10 +133,95 @@ test_mk_tc_drift() {
     "Makefile" \
     's#EBPF_OBJ_TC_EGRESS = \./release/nhp-ac/etc/tc_egress\.o#EBPF_OBJ_TC_EGRESS = ./release/nhp-ac/etc/tc_egress_DRIFT.o#'
 }
-test_dk_guard_drift() {
-  _expect_drift_detected "Dockerfile guard path drift is detected" \
+test_dk_aws_guard_drift() {
+  _expect_drift_detected "Dockerfile.ac.aws guard path drift is detected" \
     "docker/Dockerfile.ac.aws" \
     's#/nhp-ac/etc/nhp_ebpf_xdp\.o#/nhp-ac/etc/nhp_ebpf_xdp_DRIFT.o#g'
+}
+test_dk_local_guard_drift() {
+  _expect_drift_detected "Dockerfile.ac guard path drift is detected" \
+    "docker/Dockerfile.ac" \
+    's#/nhp-ac/etc/nhp_ebpf_xdp\.o#/nhp-ac/etc/nhp_ebpf_xdp_DRIFT.o#g'
+}
+test_dk_local_workdir_drift() {
+  _expect_drift_detected "Dockerfile.ac missing WORKDIR /nhp-ac is detected" \
+    "docker/Dockerfile.ac" \
+    's#WORKDIR /nhp-ac#WORKDIR /#'
+}
+test_compose_broad_mount_drift() {
+  _expect_drift_detected "docker-compose AC etc broad mount is detected" \
+    "docker/docker-compose.yaml" \
+    's#\./nhp-ac/etc/config\.toml:/nhp-ac/etc/config\.toml:ro#./nhp-ac/etc/:/nhp-ac/etc/#'
+}
+test_compose_missing_config_bind_drift() {
+  _expect_drift_detected "docker-compose missing AC config file bind is detected" \
+    "docker/docker-compose.yaml" \
+    '/resource\.toml:/d'
+}
+test_compose_writable_config_bind_drift() {
+  _expect_drift_detected "docker-compose writable AC config file bind is detected" \
+    "docker/docker-compose.yaml" \
+    's#\./nhp-ac/etc/config\.toml:/nhp-ac/etc/config\.toml:ro#./nhp-ac/etc/config.toml:/nhp-ac/etc/config.toml:rw#'
+}
+test_dk_local_start_script_copy_drift() {
+  _expect_drift_detected "Dockerfile.ac missing start-ac.sh copy is detected" \
+    "docker/Dockerfile.ac" \
+    '/start-ac\.sh/d'
+}
+test_compose_missing_bpf_cap_drift() {
+  _expect_drift_detected "docker-compose missing BPF cap is detected" \
+    "docker/docker-compose.yaml" \
+    '/^[[:space:]]*- BPF$/d'
+}
+test_compose_missing_seccomp_drift() {
+  _expect_drift_detected "docker-compose missing seccomp opt is detected" \
+    "docker/docker-compose.yaml" \
+    '/seccomp=unconfined/d'
+}
+test_compose_missing_memlock_drift() {
+  _expect_drift_detected "docker-compose missing memlock ulimit is detected" \
+    "docker/docker-compose.yaml" \
+    '/memlock:/,/hard: -1/d'
+}
+test_compose_memlock_values_scoped_drift() {
+  local name="docker-compose memlock values must be scoped to memlock block"
+  local tmp; tmp=$(_mktemp)
+  _make_fixture "$tmp"
+  local compose="$tmp/docker/docker-compose.yaml"
+  awk '
+    /^[[:space:]]*ulimits:[[:space:]]*$/ {
+      print
+      print "      nofile:"
+      print "        soft: -1"
+      print "        hard: -1"
+      next
+    }
+    /^[[:space:]]*memlock:[[:space:]]*$/ { in_memlock = 1; print; next }
+    in_memlock && /^[[:space:]]*soft:[[:space:]]*-1[[:space:]]*$/ { sub(/-1/, "65536") }
+    in_memlock && /^[[:space:]]*hard:[[:space:]]*-1[[:space:]]*$/ { sub(/-1/, "65536"); in_memlock = 0 }
+    { print }
+  ' "$compose" >"$compose.tmp"
+  mv "$compose.tmp" "$compose"
+  local rc; rc=$(_run "$tmp")
+  if [ "$rc" != "0" ]; then report_pass "$name"; else report_fail "$name" "memlock soft/hard drift passed because sibling ulimit values were -1"; fi
+}
+test_start_ac_bpffs_mount_drift() {
+  _expect_drift_detected "start-ac.sh missing bpffs mount is detected" \
+    "docker/start-ac.sh" \
+    's#mount -t bpf bpf /sys/fs/bpf#echo "skip bpffs mount"#'
+}
+test_validate_workflows_missing_start_ac_trigger_drift() {
+  _expect_drift_detected "validate-workflows missing start-ac trigger is detected" \
+    ".github/workflows/validate-workflows.yml" \
+    '/docker\/start-ac\.sh/d'
+}
+test_compose_future_non_toml_config_bind_drift() {
+  local name="docker-compose missing future non-toml AC config bind is detected"
+  local tmp; tmp=$(_mktemp)
+  _make_fixture "$tmp"
+  printf '%s\n' '{"example":true}' >"$tmp/docker/nhp-ac/etc/example.json"
+  local rc; rc=$(_run "$tmp")
+  if [ "$rc" != "0" ]; then report_pass "$name"; else report_fail "$name" "new non-object config file without a per-file bind did not fail the lint (exit 0)"; fi
 }
 test_smoke_xdp_drift() {
   _expect_drift_detected "smoke xdp object path drift is detected" \
@@ -194,7 +295,20 @@ test_go_tc_rename
 test_go_dir_rename
 test_mk_xdp_drift
 test_mk_tc_drift
-test_dk_guard_drift
+test_dk_aws_guard_drift
+test_dk_local_guard_drift
+test_dk_local_workdir_drift
+test_compose_broad_mount_drift
+test_compose_missing_config_bind_drift
+test_compose_writable_config_bind_drift
+test_dk_local_start_script_copy_drift
+test_compose_missing_bpf_cap_drift
+test_compose_missing_seccomp_drift
+test_compose_missing_memlock_drift
+test_compose_memlock_values_scoped_drift
+test_start_ac_bpffs_mount_drift
+test_validate_workflows_missing_start_ac_trigger_drift
+test_compose_future_non_toml_config_bind_drift
 test_smoke_xdp_drift
 test_smoke_tc_drift
 test_ac_filtermode_enum_drift

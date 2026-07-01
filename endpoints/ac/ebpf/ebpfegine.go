@@ -80,15 +80,16 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 	// These three literals are the single source of truth for the eBPF
 	// object load path. The build side must ship the objects to match:
 	// Makefile EBPF_OBJ_* compile them into release/nhp-ac/etc/, and the
-	// docker/Dockerfile.ac.aws runtime guard asserts /nhp-ac/etc/<name>.o
-	// exists, and tests/smoke/02_ac_ebpf_objects_test.go checks the
-	// deployed host extraction path. If you rename an object or change
-	// bpfDir here, update all of those sites or the AC boot-fails under
+	// docker/Dockerfile.ac.aws + docker/Dockerfile.ac runtime guards assert
+	// /nhp-ac/etc/<name>.o exists, and tests/smoke/02_ac_ebpf_objects_test.go
+	// checks the deployed host extraction path. If you rename an object or
+	// change bpfDir here, update all of those sites or the AC boot-fails under
 	// FilterMode=EBPFXDP. The drift is caught at PR time by
 	// scripts/check-ebpf-load-path-lockstep.sh (wired into `make
 	// lint-workflows`), which compares these consts against the Makefile
-	// paths, the Dockerfile guard, and the smoke probe — keep that lint's
-	// extractor in step if you change the shape of these declarations.
+	// paths, the Dockerfile guards, the local-compose mount shape, and the
+	// smoke probe — keep that lint's extractor in step if you change the
+	// shape of these declarations.
 	const ebpfenginename string = "nhp_ebpf_xdp.o"
 	const tcObjName string = "tc_egress.o"
 	// bpfDir is relative to the AC's working directory at runtime
