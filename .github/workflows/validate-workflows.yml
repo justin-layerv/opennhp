@@ -122,6 +122,7 @@ on:
       - "tests/lints/disable-agent-validation/**"
       - "tests/lints/paths-filter-coverage/**"
       - "tests/lints/dispatch-ref-error/**"
+      - "tests/lints/smoke-tier-filter-coverage/**"
       - "tests/lints/lockdown-body-drift/**"
       - "tests/lints/verify-image-attestation/**"
       - ".github/actions/verify-image-attestation/**"
@@ -398,6 +399,20 @@ jobs:
 
       - name: Check DisableAgentValidation flag (#1157 F9)
         run: bash scripts/check-disable-agent-validation.sh
+
+      # Regression fence for the membership test inside
+      # check-smoke-tier-filter-coverage.sh (the coverage gate run in the
+      # next step): its pure-bash array_contains must not regress to a
+      # `printf … | grep -q` pipe that races SIGPIPE under `set -o
+      # pipefail` and flips a match into a spurious coverage error (an
+      # intermittent flake). The fixture guards this structurally + with a
+      # unit test; see its header for the full mechanism. shellcheck the
+      # lint too — it wasn't covered before, and actionlint's -shellcheck
+      # only sees workflow-embedded scripts.
+      - name: Shellcheck + test smoke-tier-filter-coverage fixtures
+        run: |
+          shellcheck scripts/check-smoke-tier-filter-coverage.sh tests/lints/smoke-tier-filter-coverage/run-fixtures.sh
+          bash tests/lints/smoke-tier-filter-coverage/run-fixtures.sh
 
       # Two-way coverage check: every alternation token in
       # scripts/run-smoke.sh's RUN_FILTER must correspond to a real

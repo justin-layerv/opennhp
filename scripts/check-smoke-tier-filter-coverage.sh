@@ -130,6 +130,33 @@ extract_filter_tokens() {
   ' "$FILTER_SRC" | sed '/^$/d' | sort -u
 }
 
+# Exact-match membership test: return 0 iff $1 equals one of the
+# remaining args. Pure bash — no subprocess, no pipe.
+#
+# This replaced a `printf '%s\n' "${arr[@]}" | grep -qx "$needle"`
+# membership idiom that raced SIGPIPE under `set -o pipefail`: grep
+# closes the pipe on its first match, printf then hits EPIPE and exits
+# non-zero, and pipefail propagates that non-zero status even though
+# grep MATCHED — flipping a hit into a spurious "no matching
+# declaration" flake. Full mechanism + the regression fence live in
+# tests/lints/smoke-tier-filter-coverage/run-fixtures.sh.
+#
+# Tokens and prefixes are alphanumeric ([A-Z][A-Za-z0-9]*), so exact
+# string equality is identical to the old `grep -qx` whole-line match,
+# with no regex-metacharacter caveat.
+#
+# Keep this subprocess-free: do NOT reintroduce a `printf … | grep -q`
+# membership test (fenced by the fixture above).
+array_contains() {
+  local needle="$1"
+  shift
+  local candidate
+  for candidate in "$@"; do
+    [ "$candidate" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 # Run two-way consistency check for a single tier label against its
 # expected real-test prefixes.
 check_tier() {
@@ -184,12 +211,9 @@ check_tier() {
   # duplicate per-callsite copy is the same silent-drift class this
   # lint exists to prevent.
   is_expected_omission() {
-    local t="$1"
-    local x
-    for x in "${tier3_no_ssm_expected_omissions[@]}"; do
-      [ "$x" = "$t" ] && return 0
-    done
-    return 1
+    # `:-`: uniform with the callsites above, and safe if this list is
+    # ever emptied (bare "${arr[@]}" trips nounset on bash 3.2).
+    array_contains "$1" "${tier3_no_ssm_expected_omissions[@]:-}"
   }
   if [ "$label" != "all" ] && [ "$label" != "local" ]; then
     for r in "${real[@]:-}"; do

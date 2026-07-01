@@ -404,6 +404,8 @@ lint-workflows:
 	@bash scripts/check-scope-drift.sh
 	@bash tests/scripts/check-go-version-drift_test.sh
 	@bash scripts/check-go-version-drift.sh
+	@shellcheck scripts/check-smoke-tier-filter-coverage.sh tests/lints/smoke-tier-filter-coverage/run-fixtures.sh
+	@bash tests/lints/smoke-tier-filter-coverage/run-fixtures.sh
 	@bash scripts/check-smoke-tier-filter-coverage.sh
 	@bash scripts/check-cert-cleanup-log-gate-unique.sh
 	@bash scripts/check-cleanup-event-type-lockstep.sh
