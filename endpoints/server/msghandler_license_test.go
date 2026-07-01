@@ -281,13 +281,60 @@ func TestValidateACLicense_TimingAttackPrevention(t *testing.T) {
 	// We use relative tolerance to catch that while allowing CI variance.
 	// Note: CI environments have significant timing variance due to virtualization.
 	const (
-		warmupRuns      = 2 // Discard first N runs (CPU cache warming)
-		measuredRuns    = 8 // Runs to measure (after warmup)
-		totalRuns       = warmupRuns + measuredRuns
-		trimOutliers    = 1                     // Remove N highest/lowest samples
-		maxRelativeDev  = 0.47                  // Max 47% deviation from median (catches 10x attacks, allows CI noise)
-		minExpectedTime = 50 * time.Millisecond // bcrypt should take at least this long
+		warmupRuns     = 2 // Discard first N runs (CPU cache warming)
+		measuredRuns   = 8 // Runs to measure (after warmup)
+		totalRuns      = warmupRuns + measuredRuns
+		trimOutliers   = 1    // Remove N highest/lowest samples
+		maxRelativeDev = 0.47 // Max 47% deviation from median (catches 10x attacks, allows CI noise)
+
+		// Calibrated "did bcrypt run" floor (full rationale in the block
+		// comment below): floor = bcryptFloorFraction of the fastest of
+		// calibrationRuns bcrypt samples; minPlausibleBcrypt is the
+		// absolute backstop.
+		calibrationRuns     = 5
+		bcryptFloorFraction = 0.5
+		minPlausibleBcrypt  = 10 * time.Millisecond
 	)
+
+	// Calibrate the "did bcrypt run" floor against this machine's real
+	// bcrypt cost instead of hardcoding it: a fixed 50ms floor false-failed
+	// on fast CPUs where cost-10 bcrypt (DefaultCost, as in production's
+	// dummyBcryptHash "$2a$10$...") finishes in ~46ms, dropping every path's
+	// median just under 50ms while bcrypt ran fine. The relative-deviation
+	// check below stays the primary constant-time assertion and is
+	// untouched; this floor is only a belt-and-suspenders "did bcrypt run".
+	//
+	// Floor = bcryptFloorFraction of the fastest of calibrationRuns
+	// bare-bcrypt samples (against the same cost-10 dummy hash the not-found
+	// path uses). Calibration is decoupled from validateACLicense, so a path
+	// that skipped bcrypt returns in microseconds and still trips the floor.
+	// The fastest sample is the truest per-op lower bound (least
+	// interrupted), so no warmup is needed and a transient blip can't
+	// inflate the floor above the measured medians (bcrypt + storage lookup,
+	// always >= a bare op).
+	//
+	// The floor tracks measured cost, so it asserts bcrypt *ran*, not a
+	// specific cost value (pinned by DefaultCost / dummyBcryptHash, not this
+	// test). minPlausibleBcrypt backstops that: real cost-10 never finishes
+	// under it, so dropping below means a no-op or gross downgrade — fail
+	// loudly. It is itself hardware-era; if a future CPU runs cost-10 under
+	// it, bump it (loud, never silent).
+	calibrationSamples := make([]time.Duration, 0, calibrationRuns)
+	for i := 0; i < calibrationRuns; i++ {
+		calStart := time.Now()
+		// Key mismatch is fine: bcrypt cost is independent of the password
+		// matching, and mirrors the production not-found path.
+		_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte("calibration-key"))
+		calibrationSamples = append(calibrationSamples, time.Since(calStart))
+	}
+	calibratedBcrypt := slices.Min(calibrationSamples)
+	if calibratedBcrypt < minPlausibleBcrypt {
+		t.Fatalf("bcrypt calibration measured %v (< %v); bcrypt is a no-op or running at a grossly reduced cost",
+			calibratedBcrypt, minPlausibleBcrypt)
+	}
+	minExpectedTime := time.Duration(float64(calibratedBcrypt) * bcryptFloorFraction)
+	t.Logf("Calibrated bcrypt cost: %v (samples: %v) -> absolute floor: %v",
+		calibratedBcrypt, formatDurations(calibrationSamples), minExpectedTime)
 
 	storage := NewMemoryStorage()
 	s := testServer(t, storage)
