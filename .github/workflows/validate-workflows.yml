@@ -61,6 +61,10 @@ on:
       - "tests/scripts/install-ebpf-toolchain_test.sh"
       - "scripts/check-ebpf-committed-object-drift.sh"
       - "tests/scripts/check-ebpf-committed-object-drift_test.sh"
+      # eBPF required-check ruleset manager (#2861): re-run the fence when the
+      # ruleset config-as-code it applies changes. Its script and test already
+      # ride the .github/scripts/** and tests/scripts/** globs above.
+      - ".github/rulesets/**"
       - "endpoints/ac/ebpf/ebpfegine.go"
       - "endpoints/ac/config.go"
       - "terraform/modules/ac/main.tf"
@@ -558,6 +562,18 @@ jobs:
           bash scripts/check-ebpf-toolchain-pin-lockstep.sh
           bash tests/scripts/install-ebpf-toolchain_test.sh
           bash tests/scripts/check-ebpf-committed-object-drift_test.sh
+
+      # Fence the eBPF required-check ruleset manager (#2861): shellcheck the
+      # apply/check/remove script and run its fixture suite (mock gh) so a
+      # regression in its idempotency, drift detection (incl. bypass/strict
+      # posture), stale-#2779 scan, or fail-closed precondition surfaces at PR
+      # time. The script applies .github/rulesets/ebpf-datapath-proof-required.json
+      # to live branch protection. shellcheck both — actionlint's -shellcheck only
+      # covers workflow-embedded scripts.
+      - name: Test eBPF required-check ruleset manager (#2861)
+        run: |
+          shellcheck .github/scripts/require-ebpf-datapath-check.sh tests/scripts/require-ebpf-datapath-check_test.sh
+          bash tests/scripts/require-ebpf-datapath-check_test.sh
 
       - name: Check frps_az_suffixes validation drift (root ↔ module ↔ env-roots)
         run: bash scripts/check-frps-az-suffixes-validation-drift.sh

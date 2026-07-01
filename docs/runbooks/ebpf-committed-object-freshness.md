@@ -57,7 +57,47 @@ classifier; it intentionally matches `LC_ALL=C` apt/dpkg diagnostic text.
 
 ## Required-check rollout
 
-Do not flip the branch ruleset or branch-protection requirement until PR #2860
-lands on `qurl-v2` and the live proof workflow has passed there. Follow
+`eBPF datapath and object freshness proof` is a **required status check on
+`main`**, enforced by the additive branch ruleset `eBPF datapath proof required`
+(config-as-code: `.github/rulesets/ebpf-datapath-proof-required.json`). The
+context is bound to integration_id 15368 (GitHub Actions) so only the
+Actions-produced check satisfies it. PR #2860 made the proof require-safe (no
+`pull_request.paths` filter; conditional `changes` job); the qURL v2 epic (#2753)
+landed it on `main` and `qurl-v2` was deleted, so `main` is the target.
+
+Apply, verify, or roll back with:
+
+```bash
+.github/scripts/require-ebpf-datapath-check.sh --check    # read-only drift check
+.github/scripts/require-ebpf-datapath-check.sh --apply    # idempotent create/update
+.github/scripts/require-ebpf-datapath-check.sh --remove   # rollback (delete ruleset)
+```
+
+The check is satisfiable for every PR: the workflow runs on every PR to `main`
+(no path filter) and the proof job reports a terminal `skipped`/`success`/
+`failure` via the #2860 conditional-job pattern, so an unrelated PR reports
+`skipped`, never Expected/missing. `--apply` refuses to create the rule unless
+the workflow is present on the target branch, so the context cannot be required
+before it can report. A PR branch cut before #2753 lacks the workflow and must
+rebase onto current `main` to pick it up.
+
+Follow the rollout entry
 `docs/runbooks/prod-rollout-ledger/2026-06-28-issue-2861-ebpf-required-check.md`
 for the pre-rollout, rollout, post-rollout, and rollback checklist.
+
+### Operational notes
+
+- **Reconciliation is manual.** CI runs only the fixture suite + `shellcheck`,
+  not `--check` against the live repo, so an out-of-band weakening of the ruleset
+  (added bypass actor, an `exclude` of `refs/heads/main`, enforcement flipped to
+  `evaluate`) is not auto-detected. Run `--check` after any suspected change.
+  Scheduled drift detection is tracked in issue #2898.
+- **Skipped-required-check dependency.** Satisfiability relies on GitHub treating
+  a job skipped via job-level `if:` as a passing required check (verified live on
+  PR #2877). If GitHub ever changes that, unrelated PRs would hang as Expected —
+  roll back with `--remove` and keep the post-rollout-watch ledger item open
+  until the next unrelated and next real eBPF PR both confirm the behavior.
+- **No bypass actors (fail-closed).** The ruleset grants no bypass, so an
+  emergency eBPF hotfix blocked by an unresolvable pinned apt snapshot is
+  unblocked via `--remove` (needs repo-admin scope), not a per-actor bypass —
+  ensure the on-call has that scope.

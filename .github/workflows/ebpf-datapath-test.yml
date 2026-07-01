@@ -18,21 +18,31 @@ name: eBPF Datapath and Object Freshness Test
 # feedback_silent_failure_patterns.md). This is test-only — no AWS creds, no
 # deploy, no mutation.
 #
-# Triggers: PRs to main (so the proof gates merges to the default branch),
-# qurl-v2 (the keyed-identity integration branch), and the ebpf/* integration
-# stack. For a same-repo `pull_request` event GitHub evaluates the workflow from
-# the PR HEAD while the `branches:` filter matches the BASE ref, so listing each
-# integration base here makes the job run directly on stacked eBPF PRs whose
-# heads already carry this file — no temp PR-to-main needed. Plus manual
-# dispatch for ad-hoc runs.
+# Triggers: PRs to main (so the proof gates merges to the default branch) and the
+# ebpf/* integration stack. (qurl-v2 was merged into main via #2753 and deleted,
+# so it is no longer a base.) For a same-repo `pull_request` event GitHub
+# evaluates the workflow from the PR HEAD while the `branches:` filter matches the
+# BASE ref, so listing each integration base here makes the job run directly on
+# stacked eBPF PRs whose heads already carry this file — no temp PR-to-main
+# needed. Plus manual dispatch for ad-hoc runs.
 on:
   pull_request:
-    branches: [main, qurl-v2, 'ebpf/**']
-    # Keep the workflow unfiltered by paths so the check can be made required
-    # without path-skipped required checks hanging PRs. The `changes` job below
-    # skips the expensive clang/BPF proof unless proof inputs changed, but the
-    # proof job fails closed by running when detection itself does not succeed.
-    # The tradeoff is one cheap detection job on every PR to these bases.
+    branches: [main, 'ebpf/**']
+    # Keep the workflow unfiltered by paths: `eBPF datapath and object freshness
+    # proof` is a REQUIRED status check on `main` (branch ruleset
+    # `eBPF datapath proof required`; config-as-code in .github/rulesets/, see
+    # docs/runbooks/ebpf-committed-object-freshness.md). A path filter here would
+    # let unrelated PRs skip the whole workflow and hang on the missing required
+    # check. Instead the `changes` job below skips the expensive clang/BPF proof
+    # unless proof inputs changed, while the proof job fails closed by running
+    # when detection itself does not succeed — so every PR reports a terminal
+    # skipped/success/failure for the required context. The tradeoff is one cheap
+    # detection job on every PR to these bases.
+    #
+    # No `merge_group:` trigger today (the repo uses classic branch protection, not
+    # a merge queue). If a merge queue is ever adopted, add `merge_group:` here so
+    # the required `eBPF datapath and object freshness proof` context is produced
+    # inside the queue — otherwise queued PRs would block on a never-reported check.
   workflow_dispatch:
 
 permissions:
