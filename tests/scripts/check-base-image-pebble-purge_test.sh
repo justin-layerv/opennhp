@@ -230,5 +230,31 @@ RUN rm -f /tmp/scratch /usr/bin/pebble
 EOF
 assert_fail "multi-target rm fails closed (canonical form required)" "$d" "docker/Dockerfile.server"
 
+# 17-19. The other documented fail-closed forms — split-flag (`rm -r -f`),
+#        quoted-path (`rm -f "…"`), and `--`-terminated (`rm -f -- …`) — are all
+#        rejected the same way. Pin each so a future purge_re change can't quietly
+#        start accepting them (or mis-accepting a near-miss) without the header's
+#        documented contract being updated in lockstep.
+d="$ROOT/split-flag-rm"; new_fixture "$d"
+cat > "$d/docker/Dockerfile.server" <<'EOF'
+FROM ubuntu:26.04@sha256:deadbeef AS runtime
+RUN rm -r -f /usr/bin/pebble
+EOF
+assert_fail "split-flag rm -r -f fails closed" "$d" "docker/Dockerfile.server"
+
+d="$ROOT/quoted-path-rm"; new_fixture "$d"
+cat > "$d/docker/Dockerfile.server" <<'EOF'
+FROM ubuntu:26.04@sha256:deadbeef AS runtime
+RUN rm -f "/usr/bin/pebble"
+EOF
+assert_fail "quoted-path rm fails closed" "$d" "docker/Dockerfile.server"
+
+d="$ROOT/dashdash-rm"; new_fixture "$d"
+cat > "$d/docker/Dockerfile.server" <<'EOF'
+FROM ubuntu:26.04@sha256:deadbeef AS runtime
+RUN rm -f -- /usr/bin/pebble
+EOF
+assert_fail "-- terminated rm fails closed" "$d" "docker/Dockerfile.server"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

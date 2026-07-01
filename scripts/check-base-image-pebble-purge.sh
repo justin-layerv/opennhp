@@ -34,12 +34,13 @@
 # Requiring the `rm` (erring toward one harmless extra removal) is the safe bias;
 # these residuals are documented rather than papered over. The match also expects
 # the canonical single-target `rm -f /usr/bin/pebble`: a multi-target
-# (`rm -f /a /usr/bin/pebble`) or split-flag (`rm -r -f …`) form fails closed —
-# the error points at the canonical form — which is the safe direction. A purge
-# string buried in an *inline* trailing comment (`RUN x  # rm -f /usr/bin/pebble`)
-# can also satisfy the check: whole-line `#` comments are stripped, but telling an
-# inline comment from a real command needs shell parsing (a `#` can sit inside a
-# quoted string), so this lint matches text and leaves that to trivy on the trio.
+# (`rm -f /a /usr/bin/pebble`), split-flag (`rm -r -f …`), quoted-path, or
+# `--`-terminated form fails closed — the error points at the canonical form —
+# which is the safe direction. A purge string buried in an *inline* trailing
+# comment (`RUN x  # rm -f /usr/bin/pebble`) can also satisfy the check:
+# whole-line `#` comments are stripped, but telling an inline comment from a
+# real command needs shell parsing (a `#` can sit inside a quoted string), so
+# this lint matches text and leaves that to trivy on the trio.
 #
 # Wired into `make lint-workflows` and .github/workflows/validate-workflows.yml.
 
@@ -83,11 +84,12 @@ ubuntu_from_re='^[[:space:]]*FROM[[:space:]]+(--platform=[^[:space:]]+[[:space:]
 # `/usr/bin/pebble-old` can't satisfy the check.
 purge_re='rm[[:space:]]+(-[[:alpha:]]*f[[:alpha:]]*|--force)[[:space:]]+/usr/bin/pebble([[:space:]]|$)'
 
-# Discover Dockerfile* recursively under each root, mirroring check-go-version-drift.sh
-# — so a Dockerfile in a subdir (e.g. a future docker/web-app/Dockerfile) can't
-# escape. The CI triggers in validate-workflows.yml cover the same surface
-# (docker/Dockerfile* + docker/**/Dockerfile* + the recursive tests/smoke/**), so
-# what fires the job and what the lint scans line up.
+# Discover Dockerfile* recursively under each root — the same two roots (docker/
+# + tests/smoke/local-stack/) and recursive model as check-go-version-drift.sh, so
+# a Dockerfile in a subdir (e.g. a future docker/web-app/Dockerfile) can't escape.
+# The `Dockerfile*` name pattern matches the docker/Dockerfile* CI trigger glob
+# (slightly broader than that script's `Dockerfile`/`Dockerfile.*`), which keeps
+# what fires the job and what the lint scans aligned; tests/smoke/** recurses too.
 find_roots=("$DOCKER_DIR")
 [ -d "$SMOKE_DIR" ] && find_roots+=("$SMOKE_DIR")
 
