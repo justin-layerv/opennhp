@@ -13,7 +13,11 @@
 #
 # Base image digests are pinned to match docker/Dockerfile.server so layers are
 # shared from the local/CI cache and the golang tag stays in lockstep with the
-# canonical GO_VERSION in .github/workflows/build-and-push.yml. Bump together.
+# canonical GO_VERSION in .github/workflows/build-and-push.yml. Bump together —
+# scripts/check-ubuntu-base-digest-drift.sh enforces the ubuntu digest lockstep
+# (#2800) and check-go-version-drift.sh the golang one, so a one-sided bump
+# (e.g. a dependabot "bump ubuntu … in /docker" PR that can't reach this file)
+# fails CI until this digest is bumped too.
 FROM golang:1.26.4-bookworm@sha256:5d2b868674b57c9e48cdd39e891acce4196b6926ca6d11e9c270a8f85106203d AS builder
 
 WORKDIR /src
@@ -43,7 +47,7 @@ RUN cd endpoints && \
     go build -trimpath -o /out/nhp-acd ./ac/main/main.go
 
 # --- server runtime -------------------------------------------------------
-FROM ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64 AS server-runtime
+FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba AS server-runtime
 
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
@@ -69,7 +73,7 @@ ENTRYPOINT ["/nhp-server/nhp-serverd"]
 CMD ["run"]
 
 # --- AC runtime -----------------------------------------------------------
-FROM ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64 AS ac-runtime
+FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba AS ac-runtime
 
 # The AC opens firewall pinholes via iptables + ipset (needs NET_ADMIN at
 # runtime — granted by the compose service).

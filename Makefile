@@ -409,6 +409,9 @@ lint-workflows:
 	@shellcheck scripts/check-base-image-pebble-purge.sh tests/scripts/check-base-image-pebble-purge_test.sh
 	@bash tests/scripts/check-base-image-pebble-purge_test.sh
 	@bash scripts/check-base-image-pebble-purge.sh
+	@shellcheck scripts/check-ubuntu-base-digest-drift.sh tests/scripts/check-ubuntu-base-digest-drift_test.sh
+	@bash tests/scripts/check-ubuntu-base-digest-drift_test.sh
+	@bash scripts/check-ubuntu-base-digest-drift.sh
 	@shellcheck scripts/check-revocation-slo-lockstep.sh tests/scripts/check-revocation-slo-lockstep_test.sh
 	@bash tests/scripts/check-revocation-slo-lockstep_test.sh
 	@bash scripts/check-revocation-slo-lockstep.sh

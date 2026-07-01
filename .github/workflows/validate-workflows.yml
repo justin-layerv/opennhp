@@ -30,6 +30,11 @@ on:
       # ubuntu Dockerfile fires this on the PR that introduces it. The paired
       # fixture test rides tests/scripts/** below.
       - "scripts/check-base-image-pebble-purge.sh"
+      # Ubuntu base digest lockstep (#2800): the pebble lint's sibling. Same
+      # docker/Dockerfile* + tests/smoke/** discovery fires it on any Dockerfile
+      # edit; watch the lint itself so an edit to it re-fires. Paired fixture
+      # test rides tests/scripts/** below.
+      - "scripts/check-ubuntu-base-digest-drift.sh"
       - "scripts/check-lockdown-body-drift.sh"
       - "scripts/check-paths-filter-coverage.py"
       - "scripts/print-dispatch-ref-error.sh"
@@ -235,6 +240,19 @@ jobs:
           shellcheck scripts/check-base-image-pebble-purge.sh tests/scripts/check-base-image-pebble-purge_test.sh
           bash tests/scripts/check-base-image-pebble-purge_test.sh
           bash scripts/check-base-image-pebble-purge.sh
+
+      # Ubuntu base digest lockstep (#2800): every ubuntu FROM across docker/**
+      # and the smoke image must pin the SAME digest as docker/Dockerfile.server.
+      # A dependabot "bump ubuntu … in /docker" PR (#2755) moved docker/** but
+      # structurally can't reach tests/smoke/local-stack/Dockerfile, leaving it on
+      # the old, more-vulnerable base — this fence fails that PR until smoke is
+      # bumped too. Fixtures run before the real check so a regex/extractor
+      # regression surfaces against known inputs first.
+      - name: Test + check ubuntu base digest drift (#2800)
+        run: |
+          shellcheck scripts/check-ubuntu-base-digest-drift.sh tests/scripts/check-ubuntu-base-digest-drift_test.sh
+          bash tests/scripts/check-ubuntu-base-digest-drift_test.sh
+          bash scripts/check-ubuntu-base-digest-drift.sh
 
       # Structural fence for the promote-to-prod gate logic that closed
       # issue #1322 (deploy-* must require terraform-apply success when

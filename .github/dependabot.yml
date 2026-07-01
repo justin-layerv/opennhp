@@ -125,6 +125,12 @@ updates:
       - "ci"
 
   # Docker
+  # Scoped to /docker, so an ubuntu base-image digest bump here CANNOT touch
+  # tests/smoke/local-stack/Dockerfile, which pins the same ubuntu base.
+  # scripts/check-ubuntu-base-digest-drift.sh enforces that lockstep (#2800), so
+  # an ubuntu-bump PR goes red until the smoke Dockerfile's digest is hand-bumped
+  # to match in the same PR — commit that follow-up rather than merging the bump
+  # alone. (The golang builder tag has the same lockstep via check-go-version-drift.sh.)
   - package-ecosystem: "docker"
     directory: "/docker"
     schedule:
