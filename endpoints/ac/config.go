@@ -96,9 +96,10 @@ type Config struct {
 	// the "netlink" backend makes available through its free-list pool
 	// (concurrency = pool size, since a netlink socket is single-flight). Default
 	// defaultConntrackNetlinkPoolSize — the ~4:1 ratio against the worker pool
-	// from the #2165 sketch. Each holder keeps its socket through the whole
-	// O(table) dump + matching deletes, so this ratio is deliberately
-	// operator-tunable during the soak without a code change + AMI rebuild.
+	// from the #2165 sketch. Each holder keeps its socket through the indexed
+	// delete loop (or the O(table) dump fallback if the #2908 event index is
+	// unhealthy), so this ratio is deliberately operator-tunable during the soak
+	// without a code change + AMI rebuild.
 	// Normalized at load: ≤0 → default, and clamped to maxConntrackNetlinkPoolSize
 	// so a typo can't exhaust file descriptors. Ignored by the exec backend.
 	L3FlushConntrackPoolSize int `json:"l3FlushConntrackPoolSize"`

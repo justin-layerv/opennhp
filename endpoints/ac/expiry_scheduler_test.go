@@ -731,18 +731,20 @@ func randIPv4() string {
 // --- flushers --------------------------------------------------------
 
 type recordingFlusher struct {
-	mu       sync.Mutex
-	keys     []FlowKey
-	flushedC chan struct{}
+	mu            sync.Mutex
+	keys          []FlowKey
+	authoritative []bool
+	flushedC      chan struct{}
 }
 
 func newRecordingFlusher() *recordingFlusher {
 	return &recordingFlusher{flushedC: make(chan struct{}, 1024)}
 }
 
-func (r *recordingFlusher) Flush(_ context.Context, k FlowKey) error {
+func (r *recordingFlusher) Flush(ctx context.Context, k FlowKey) error {
 	r.mu.Lock()
 	r.keys = append(r.keys, k)
+	r.authoritative = append(r.authoritative, wantsAuthoritativeFlush(ctx))
 	r.mu.Unlock()
 	select {
 	case r.flushedC <- struct{}{}:

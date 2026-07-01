@@ -313,6 +313,17 @@ func (k FlowKey) shard() uint32 {
 	return h & (schedulerShardCount - 1)
 }
 
+type authoritativeFlushContextKey struct{}
+
+func withAuthoritativeFlush(ctx context.Context) context.Context {
+	return context.WithValue(ctx, authoritativeFlushContextKey{}, true)
+}
+
+func wantsAuthoritativeFlush(ctx context.Context) bool {
+	v, _ := ctx.Value(authoritativeFlushContextKey{}).(bool)
+	return v
+}
+
 // FlowFlusher tears down kernel flow state for a given FlowKey.
 //
 // CONTRACT: implementations MUST be safe for concurrent use from
@@ -433,13 +444,18 @@ const overflowBucketIdx uint32 = 0xFFFFFFFF
 // data loss for an explicit fail-closed signal.
 //
 // Memory: FlowKey (36) + deadlineNs (8) + gen (8 atomic) + bucket
-// (4) + deferCount (1) + 3B padding + next/prev (16) + inFlight
+// (4) + deferCount/authoritativeFlush (2) + 2B padding + next/prev (16) + inFlight
 // chan header (8, nil until processEntry) ≈ 88 B.
 type expiryEntry struct {
 	FlowKey
 	deadlineNs uint64
 	gen        atomic.Uint64
 	bucket     uint32
+	// authoritativeFlush is set by RescheduleEarlier's immediate-revocation
+	// path. Backends that maintain an async fast-path mirror can read the
+	// context flag processEntry derives from this and choose fresh kernel
+	// ground truth for revoke-triggered coarse flushes.
+	authoritativeFlush bool
 	// deferCount: single-writer (tick goroutine via dispatch ONLY).
 	// Today only one tick loop exists; the per-shard-ticker work in
 	// SCHEDULER_SCALING.md's roadmap (tracked in #2169) would change
@@ -448,7 +464,7 @@ type expiryEntry struct {
 	// hold a per-shard lock) if that roadmap lands, otherwise the
 	// backpressure-drop semantics race silently
 	deferCount uint8
-	_          [3]byte
+	_          [2]byte
 	next       *expiryEntry
 	prev       *expiryEntry
 	// inFlight is non-nil iff a worker has begun Flush for this entry.
@@ -1005,8 +1021,11 @@ func (s *Scheduler) scheduleEntry(key FlowKey, deadline time.Time, pullEarlier b
 		// schedule already satisfies the caller's intent, so skip the
 		// re-insert. The in-flight case is handled in Phase 1 above and
 		// the wait-timeout force-insert below bypasses this entirely.
-		if (!pullEarlier && existing.deadlineNs >= deadlineNs) ||
-			(pullEarlier && existing.deadlineNs <= deadlineNs) {
+		if !pullEarlier && existing.deadlineNs >= deadlineNs {
+			return
+		}
+		if pullEarlier && existing.deadlineNs <= deadlineNs {
+			existing.authoritativeFlush = true
 			return
 		}
 	}
@@ -1017,8 +1036,9 @@ func (s *Scheduler) scheduleEntry(key FlowKey, deadline time.Time, pullEarlier b
 	// SCHEDULER_SCALING.md's "allocation-free hot path" roadmap
 	//
 	entry := &expiryEntry{
-		FlowKey:    key,
-		deadlineNs: deadlineNs,
+		FlowKey:            key,
+		deadlineNs:         deadlineNs,
+		authoritativeFlush: pullEarlier,
 	}
 	entry.gen.Store(s.genCounter.Add(1))
 
@@ -1742,6 +1762,12 @@ func (s *Scheduler) processEntry(entry *expiryEntry) {
 	}
 
 	ctx, cancel := context.WithTimeout(s.ctx, s.flushCallTimeout)
+	// Safe without holding shard.mu: scheduleEntry can only set this bit while
+	// entry.inFlight is nil; setting inFlight under shard.mu above makes later
+	// RescheduleEarlier callers wait instead of writing this entry concurrently.
+	if entry.authoritativeFlush {
+		ctx = withAuthoritativeFlush(ctx)
+	}
 	err := s.flusher.Flush(ctx, entry.FlowKey)
 	cancel()
 	// context.Canceled means the scheduler's lifecycle ctx was

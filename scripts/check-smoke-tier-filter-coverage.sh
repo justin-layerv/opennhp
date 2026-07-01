@@ -94,6 +94,16 @@ dedupe_array tier1_prefixes "${tier1_prefixes[@]:-}"
 dedupe_array tier2_prefixes "${tier2_prefixes[@]:-}"
 dedupe_array tier3_prefixes "${tier3_prefixes[@]:-}"
 
+array_contains() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 # Extract a tier's RUN_FILTER alternation tokens. Pulls the first
 # `^Test(...)_` regex on the line whose case label matches the tier.
 extract_filter_tokens() {
@@ -149,7 +159,7 @@ check_tier() {
   # token-without-test: filter token has no matching Test<token>_
   for t in "${tokens[@]:-}"; do
     [ -z "$t" ] && continue
-    if ! printf '%s\n' "${real[@]:-}" | grep -qx "$t"; then
+    if ! array_contains "$t" "${real[@]:-}"; then
       echo "ERROR [$label]: filter token '$t' has no matching ^func Test${t}_ declaration in any file routing to this tier — silent no-op"
       errs=$((errs+1))
     fi
@@ -184,7 +194,7 @@ check_tier() {
   if [ "$label" != "all" ] && [ "$label" != "local" ]; then
     for r in "${real[@]:-}"; do
       [ -z "$r" ] && continue
-      if ! printf '%s\n' "${tokens[@]:-}" | grep -qx "$r"; then
+      if ! array_contains "$r" "${tokens[@]:-}"; then
         # tier1+tier2 should also include tier1 prefixes; tier3-no-ssm
         # is allowed to omit SSM-needing prefixes. We split the
         # tier3-no-ssm omission into two cases: expected (in the

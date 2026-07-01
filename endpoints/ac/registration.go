@@ -469,10 +469,44 @@ const (
 	MetricL3FlushConntrackDeleted = "L3FlushConntrackDeleted"
 	// MetricL3FlushConntrackSlowDumps is the cumulative count of netlink
 	// Flush calls whose successful conntrack dump attempt exceeded the
-	// slow-dump threshold — a latency-regression signal for the soak (a
-	// rising rate is the O(table) per-key dump hitting the table-size knee).
+	// slow-dump threshold — now a fallback/backfill signal for the soak (a
+	// rising steady-state rate means the event index is unhealthy, immediate
+	// revocations are forcing authoritative dumps, or both).
 	// Same backend gating as MetricL3FlushConntrackDeleted.
-	MetricL3FlushConntrackSlowDumps    = "L3FlushConntrackSlowDumps"
+	MetricL3FlushConntrackSlowDumps = "L3FlushConntrackSlowDumps"
+	// MetricL3FlushConntrackIndexedFlushes is the cumulative count of netlink
+	// Flush calls served from the conntrack event index (#2908), i.e. the
+	// O(matches) path that avoids the per-Flush O(table) dump.
+	MetricL3FlushConntrackIndexedFlushes = "L3FlushConntrackIndexedFlushes"
+	// MetricL3FlushConntrackIndexFallbackDumps is the cumulative count of
+	// netlink Flush calls that fell back to the O(table) dump path because the
+	// event index was unavailable/unhealthy. Correctness is preserved, but any
+	// nonzero rate means the #2908 hot path is not serving all scheduled-expiry
+	// Flushes.
+	MetricL3FlushConntrackIndexFallbackDumps = "L3FlushConntrackIndexFallbackDumps"
+	// MetricL3FlushConntrackIndexAuthoritativeDumps is the cumulative count of
+	// netlink Flush calls that intentionally bypassed the event index to use
+	// fresh kernel ground truth for immediate revocation.
+	MetricL3FlushConntrackIndexAuthoritativeDumps = "L3FlushConntrackIndexAuthoritativeDumps"
+	// MetricL3FlushConntrackIndexEventErrors counts conntrack multicast stream
+	// errors. Nonzero means the event index has been disabled and Flush is using
+	// the safe dump fallback rather than risking a silent enforcement gap.
+	MetricL3FlushConntrackIndexEventErrors = "L3FlushConntrackIndexEventErrors"
+	// MetricL3FlushConntrackIndexPendingOverflows counts startup backfill
+	// pending-buffer overflows. Nonzero distinguishes startup replay pressure
+	// from generic event stream errors during the #2908 soak.
+	MetricL3FlushConntrackIndexPendingOverflows = "L3FlushConntrackIndexPendingOverflows"
+	// MetricL3FlushConntrackIndexEvents is the cumulative count of valid-group
+	// conntrack multicast events observed by the event index. The soak uses its
+	// delta as a liveness signal: healthy and zero-error is not enough if no
+	// events arrive.
+	MetricL3FlushConntrackIndexEvents = "L3FlushConntrackIndexEvents"
+	// MetricL3FlushConntrackIndexOrigins is the current number of full-origin
+	// conntrack tuples mirrored in userspace by the event index. The soak uses it
+	// to bound resident memory at target table cardinality. Interpret 0 only
+	// alongside EventErrors/FallbackDumps: it may be a healthy empty table or a
+	// disabled/reclaimed index.
+	MetricL3FlushConntrackIndexOrigins = "L3FlushConntrackIndexOrigins"
 	MetricL3FlushScheduleRejected      = "L3FlushScheduleRejected"
 	MetricL3FlushScheduleAfterShutdown = "L3FlushScheduleAfterShutdown"
 	// MetricL3FlushScheduleWaitTimeout counts Schedule() calls where
@@ -1282,6 +1316,13 @@ func (r *ACRegistration) Start() error {
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackSkipped, r.l3FlushConntrackSkippedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackDeleted, r.l3FlushConntrackDeletedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackSlowDumps, r.l3FlushConntrackSlowDumpsGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexedFlushes, r.l3FlushConntrackIndexedFlushesGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexFallbackDumps, r.l3FlushConntrackIndexFallbackDumpsGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexAuthoritativeDumps, r.l3FlushConntrackIndexAuthoritativeDumpsGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexEventErrors, r.l3FlushConntrackIndexEventErrorsGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexPendingOverflows, r.l3FlushConntrackIndexPendingOverflowsGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexEvents, r.l3FlushConntrackIndexEventsGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexOrigins, r.l3FlushConntrackIndexOriginsGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleRejected, r.l3FlushScheduleRejectedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleAfterShutdown, r.l3FlushScheduleAfterShutdownGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleWaitTimeout, r.l3FlushScheduleWaitTimeoutGauge)
@@ -1556,6 +1597,83 @@ func (r *ACRegistration) l3FlushConntrackSlowDumpsGauge() float64 {
 	}
 	// Same float64 gauge boundary as l3FlushConntrackDeletedGauge; the
 	// counter remains exact for any realistic AC-process lifetime.
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexedFlushesGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexedFlushCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexFallbackDumpsGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexFallbackDumpCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexAuthoritativeDumpsGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexAuthoritativeDumpCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexEventErrorsGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexEventErrorCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexPendingOverflowsGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexPendingOverflowCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexEventsGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexEventCount()
+	if !ok {
+		return 0
+	}
+	return float64(count)
+}
+
+func (r *ACRegistration) l3FlushConntrackIndexOriginsGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkIndexOriginCount()
+	if !ok {
+		return 0
+	}
 	return float64(count)
 }
 

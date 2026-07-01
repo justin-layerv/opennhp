@@ -51,6 +51,34 @@ func (f *ConntrackFlusher) NetlinkDeletedCount() uint64 { return 0 }
 // cross-platform metrics-gauge reason as NetlinkDeletedCount.
 func (f *ConntrackFlusher) NetlinkSlowDumpCount() uint64 { return 0 }
 
+// NetlinkIndexedFlushCount is 0 on non-Linux. Present for the same
+// cross-platform metrics-gauge reason as NetlinkDeletedCount.
+func (f *ConntrackFlusher) NetlinkIndexedFlushCount() uint64 { return 0 }
+
+// NetlinkIndexFallbackDumpCount is 0 on non-Linux. Present for the same
+// cross-platform metrics-gauge reason as NetlinkDeletedCount.
+func (f *ConntrackFlusher) NetlinkIndexFallbackDumpCount() uint64 { return 0 }
+
+// NetlinkIndexAuthoritativeDumpCount is 0 on non-Linux. Present for the same
+// cross-platform metrics-gauge reason as NetlinkDeletedCount.
+func (f *ConntrackFlusher) NetlinkIndexAuthoritativeDumpCount() uint64 { return 0 }
+
+// NetlinkIndexEventErrorCount is 0 on non-Linux. Present for the same
+// cross-platform metrics-gauge reason as NetlinkDeletedCount.
+func (f *ConntrackFlusher) NetlinkIndexEventErrorCount() uint64 { return 0 }
+
+// NetlinkIndexPendingOverflowCount is 0 on non-Linux. Present for the same
+// cross-platform metrics-gauge reason as NetlinkDeletedCount.
+func (f *ConntrackFlusher) NetlinkIndexPendingOverflowCount() uint64 { return 0 }
+
+// NetlinkIndexEventCount is 0 on non-Linux. Present for the same
+// cross-platform metrics-gauge reason as NetlinkDeletedCount.
+func (f *ConntrackFlusher) NetlinkIndexEventCount() uint64 { return 0 }
+
+// NetlinkIndexOriginCount is 0 on non-Linux. Present for the same
+// cross-platform metrics-gauge reason as NetlinkDeletedCount.
+func (f *ConntrackFlusher) NetlinkIndexOriginCount() uint64 { return 0 }
+
 // SkippedCount is 0 on non-Linux. It is not currently read cross-platform for
 // ConntrackFlusher, but keeping the stub method symmetric with Linux prevents
 // future metric plumbing from needing another build-tag split.

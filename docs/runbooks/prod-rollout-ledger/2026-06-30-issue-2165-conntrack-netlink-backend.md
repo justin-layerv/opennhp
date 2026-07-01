@@ -1,7 +1,7 @@
 # 2026-06-30 · issue #2165 · AC ConntrackFlusher direct-netlink backend (opt-in)
 
 - **Owner:** prod rollout coordinator
-- **Source:** [#2165](https://github.com/layervai/nhp/issues/2165) · capacity audit [#2163](https://github.com/layervai/nhp/issues/2163) · v6 gap [#2794](https://github.com/layervai/nhp/issues/2794)/[#2797](https://github.com/layervai/nhp/pull/2797) · exec-backend PR [#2164](https://github.com/layervai/nhp/issues/2164)
+- **Source:** [#2165](https://github.com/layervai/nhp/issues/2165) · [#2908](https://github.com/layervai/nhp/issues/2908) · capacity audit [#2163](https://github.com/layervai/nhp/issues/2163) · v6 gap [#2794](https://github.com/layervai/nhp/issues/2794)/[#2797](https://github.com/layervai/nhp/pull/2797) · exec-backend PR [#2164](https://github.com/layervai/nhp/issues/2164)
 
 Adds `l3FlushConntrackBackend` to AC config. `"exec"` (default) keeps today's
 fork+exec `conntrack -D`. `"netlink"` switches `FilterMode_IPTABLES` L3 flush to a
@@ -26,29 +26,67 @@ Also adds `l3FlushConntrackPoolSize` (default 16; ≤0 → default, clamped to 1
 the socket-pool : worker ratio can be tuned during the soak without a code change.
 The default is the conservative #2165 sketch ratio (16 single-flight netlink
 sockets for the 64-worker scheduler), and the soak must explicitly accept or tune
-that ratio because each socket holder owns the O(table) dump and every matching
-delete for the whole `Flush`. The soak measures the channel-backed free-list pool
-routing model: acquired sockets are absent until release, so contention signals
-should be interpreted after availability-aware routing, not round-robin
-head-of-line blocking. Three soak-readability metrics are published only on the
-netlink backend:
-`L3FlushConntrackDeleted` (entries torn down), `L3FlushConntrackSlowDumps` (Flush
-dumps over ~1ms — the table-size-knee early warning, #2908), and the existing
-breaker/`FlushErr` series. Because each netlink `Dump` materializes the whole
-family table before filtering, also watch AC process RSS/Go heap/GC pause during
-the populated-table characterization; the O(table) knee can show up as allocation
-pressure before it is obvious in dump latency.
+that ratio because each socket holder owns its delete loop (or the safe O(table)
+dump fallback if the #2908 event index is unhealthy) for the whole `Flush`. The
+soak measures the channel-backed free-list pool routing model: acquired sockets
+are absent until release, so contention signals should be interpreted after
+availability-aware routing, not round-robin head-of-line blocking.
+
+#2908 adds a conntrack NEW/UPDATE/DESTROY event index seeded by a one-time startup
+dump. While that event stream is healthy, steady-state `Flush` is O(matches): look
+up the full origin tuples for `{src,dst,dport,proto}` and delete those entries
+without dumping the whole family table. If the event stream errors or is not
+usable, the flusher falls back to the old dump/filter/delete path rather than
+silently missing flows; if an immediate-revocation reschedule needs fresh kernel
+ground truth, it intentionally uses the same dump/delete path and counts that
+separately. Netlink-only soak-readability metrics:
+`L3FlushConntrackDeleted` (entries torn down), `L3FlushConntrackIndexedFlushes`
+(event-index hot path used), `L3FlushConntrackIndexFallbackDumps` (safe O(table)
+fallback used because the index was unavailable/unhealthy),
+`L3FlushConntrackIndexAuthoritativeDumps` (intentional fresh-ground-truth dumps
+for immediate revocation), `L3FlushConntrackIndexEventErrors` (event stream
+disabled the index), `L3FlushConntrackIndexPendingOverflows` (startup replay
+pressure tripped the pending cap), `L3FlushConntrackIndexEvents` (event-stream liveness),
+`L3FlushConntrackIndexOrigins` (resident userspace mirror cardinality),
+`L3FlushConntrackSlowDumps` (fallback/authoritative/backfill dumps over ~1ms),
+and the existing breaker/`FlushErr` series. During populated-table characterization,
+`IndexedFlushes` should rise with deletes, `IndexEvents` should advance when the
+conntrack table churns, `IndexOrigins` should match the expected table
+cardinality envelope while the index is healthy, and fallback/error/slow-dump
+counters should stay flat after startup except for intentional authoritative
+immediate-revocation dumps; any unexplained fallback rate means the million-table
+throughput claim is not established even though correctness is preserved. If the
+event index disables itself, the resident mirror is reclaimed
+and `IndexOrigins` is expected to drop to 0 while fallback/error counters explain
+why the hot path is no longer active. Treat `IndexOrigins = 0` as a correlated
+signal, not an alertable fact by itself: it also represents a healthy empty
+table, so dashboards/sign-off must read it alongside `IndexEventErrors` and
+`IndexFallbackDumps`.
+The event monitor raises its netlink receive buffer but deliberately does **not**
+enable `NETLINK_NO_ENOBUFS`: ENOBUFS must stay visible because it means multicast
+events may have been dropped and the index is no longer complete. Today that
+condition disables the index until AC restart and uses safe dump fallback; runtime
+resync after an overrun is tracked in [#2946](https://github.com/layervai/nhp/issues/2946).
 
 - [ ] Pre-rollout: on a **sandbox** iptables-mode AC, confirm the netlink datapath
       is available — `nf_conntrack_netlink` loadable + AC has `CAP_NET_ADMIN`
       (it already manages iptables/ipset/`conntrack -D`, so this should hold; the
-      flusher fails Start loud if `conntrack.Open` fails). Then run
+      flusher fails Start loud if `conntrack.Open` fails). The #2908 event index
+      also makes netlink event subscription and the startup backfill dump fatal
+      for the opt-in netlink backend: a subscription failure or a 30s backfill
+      timeout blocks AC start rather than silently running with an incomplete hot
+      path. Startup pending-replay overflow is intentionally softer: AC starts on
+      the safe dump fallback, `L3FlushConntrackIndexPendingOverflows` is nonzero,
+      `IndexOrigins` remains 0, and the #2908 throughput claim is not accepted
+      until restart/backfill arms the index at target cardinality. Confirm that
+      fail-closed subscription/timeout posture and degraded-on-overflow posture
+      are acceptable for the target instance before flipping the backend. Then run
       `NHP_CONNTRACK_NETLINK_BENCH_GATE=1 go test -bench=BenchmarkConntrackFlusher_Netlink -benchtime=2s ./endpoints/ac/`
       on that AC and confirm **≤200µs/op** (the #2165 acceptance gate). The env
       var intentionally turns the benchmark's warning into a hard failure for
-      this acceptance run; ordinary ad hoc/CI `-bench` invocations may only log a
-      populated-table miss. The bench skips where netlink is unavailable, so a
-      skip means the AC isn't ready.
+      this acceptance run; ordinary ad hoc/CI `-bench` invocations may only log an
+      unready-AC miss. The bench skips where netlink event subscription is
+      unavailable, so a skip means the AC isn't ready.
       On the same AC, run a real-kernel idempotency probe before the flip: confirm
       a no-match netlink `Flush` returns nil (the #2168 schedule-then-write
       contract) and confirm a targeted absent-origin delete surfaces as ENOENT
@@ -61,17 +99,52 @@ pressure before it is obvious in dump latency.
       rather than parking a worker past `flushCallTimeout`.
       Also run a non-gated characterization against a representative populated
       conntrack table (or an artificially populated table at the target
-      cardinality): compare exec vs netlink p50/p95/p99 flush latency at the
-      target table size, record table cardinality, `L3FlushConntrackSlowDumps`,
-      the temporary alert threshold chosen for that counter, AC process RSS/Go
-      heap, and GC pause.
+      cardinality): compare exec vs netlink-index p50/p95/p99 flush latency at
+      the target table size, record table cardinality,
+      `L3FlushConntrackIndexedFlushes`, `L3FlushConntrackIndexFallbackDumps`,
+      `L3FlushConntrackIndexAuthoritativeDumps`,
+      `L3FlushConntrackIndexEventErrors`,
+      `L3FlushConntrackIndexPendingOverflows`,
+      `L3FlushConntrackIndexEvents`, `L3FlushConntrackIndexOrigins`,
+      `L3FlushConntrackSlowDumps`, AC process RSS/Go heap, and GC pause. Record
+      the steady-state resident index cost at the target cardinality, not just
+      transient dump allocation, because the #2908 index intentionally trades
+      repeated O(table) dumps for a full userspace origin mirror.
+      Record index arm-success across repeated AC restarts/backfills at the
+      target cardinality; a startup that leaves `IndexOrigins = 0` with
+      `L3FlushConntrackIndexPendingOverflows`/event errors means the hot path
+      failed to arm and cannot support the #2908 throughput claim.
+      Record the startup backfill dump wall time against the 30s
+      `defaultNetlinkIndexBackfillTimeout` budget so the soak distinguishes a
+      steady-state throughput win from a startup-availability cliff. Startup
+      fail-closed is intentional for the opt-in netlink backend: if the event
+      subscription cannot arm or the seed backfill cannot complete inside that
+      budget, the AC should fail visibly instead of silently starting in the old
+      O(table)-per-Flush regime. Do not flip prod until the observed backfill
+      wall time has clear headroom under representative cardinality/churn, or
+      tune/escalate before enabling.
+      Also run a low-frequency completeness reconcile during the characterization:
+      compare a kernel dump snapshot against the event index's expected origin
+      count/match set for sampled FlowKeys. Counter flatness proves the hot path
+      is active and error-free; this reconcile is the gate that proves it is
+      complete enough to trust for indexed no-match Flushes. Sign-off must record
+      the observed NEW-event apply lag / reconcile skew bound, because an indexed
+      no-match is not a fresh kernel-ground-truth dump; it means the healthy event
+      mirror currently has no matching origin. Do not proceed unless that measured
+      lag window is explicitly accepted for scheduled-expiry teardown semantics;
+      immediate-revocation `RescheduleEarlier` flushes bypass the index and use a
+      fresh dump so the revocation path does not rely on that async no-match.
       This is a **hard rollout gate**: do not proceed to the prod flip if
-      netlink is worse in that regime without resolving/escalating the #2908
-      table-size follow-up, and do not treat this populated-table check as a
-      formality (the single-threaded small-table bench cannot surface O(table ×
-      concurrent flushes) behavior, and CI does not populate a representative
-      kernel conntrack table). Attach the characterization output to rollout
-      sign-off before flipping prod. Use the same pre/post table snapshot for the
+      `L3FlushConntrackIndexEventErrors` has a nonzero rate, if
+      `L3FlushConntrackIndexFallbackDumps` has a nonzero rate, or if indexed
+      netlink is worse in that regime. Record
+      `L3FlushConntrackIndexAuthoritativeDumps` separately so immediate
+      revocation dump cost is visible without masking event-index fallback
+      health, and do not treat this populated-table check as a formality (CI
+      does not populate a representative kernel
+      conntrack table or prove event stream health). Attach the characterization
+      output to rollout sign-off before flipping prod. Use
+      the same pre/post table snapshot for the
       parity readout and treat any exec-vs-netlink teardown gap from port-less
       TCP/UDP entries as a signal to investigate, not noise, even though
       confirmed TCP/UDP entries are expected to carry ports. The accepted
@@ -97,19 +170,36 @@ pressure before it is obvious in dump latency.
       iptables v6 gap is closed. Watch: L3 flush breaker stays closed (no
       `BreakerOpen`), `FlushErr` flat, zero scheduler drops, `RevocationIPv6HardFail`
       drops to 0 for any iptables v6 revoke (gap closed), `L3FlushConntrackDeleted`
-      climbs (path is actually tearing flows down), and `L3FlushConntrackSlowDumps`
-      stays below the pre-recorded temporary alert threshold (no table-size-knee);
-      AC process RSS/Go heap/GC pause should not rise with slow-dump spikes.
+      climbs (path is actually tearing flows down), `L3FlushConntrackIndexedFlushes`
+      climbs (event index is serving steady-state Flush),
+      `L3FlushConntrackIndexEvents` climbs when the table churns,
+      `L3FlushConntrackIndexOrigins` is recorded at target table cardinality
+      with RSS/Go heap/GC pause, `L3FlushConntrackIndexAuthoritativeDumps`
+      accounts for intentional immediate-revocation dumps, and
+      `L3FlushConntrackIndexFallbackDumps`,
+      `L3FlushConntrackIndexEventErrors`,
+      `L3FlushConntrackIndexPendingOverflows`, and post-startup
+      `L3FlushConntrackSlowDumps` stay flat except for recorded authoritative
+      dumps. Treat any event-index error as
+      "hot path lost until AC restart" unless #2946 has landed; correctness is
+      preserved by fallback, but the #2908 throughput claim is not accepted while
+      that condition is present. Treat any pending-overflow count above zero as
+      startup replay pressure evidence that must be resolved or explicitly
+      accepted before prod flip.
       Note: a transient netlink `ENOBUFS`/`EINTR`
       dump is retried once and is self-healing (the socket is reopened); a
       *persistent* dump failure trips `FlushErr` → breaker (intended fail-loud).
       The scheduler's `flushCallTimeout` is one whole-Flush budget shared by
-      socket-pool wait, dump, and all matching deletes; if `FlushErr` ticks after
-      a successful slow dump or during the large fan-out tuple, correlate it with
-      `L3FlushConntrackSlowDumps`, matched-flow count/fan-out size, breaker state,
-      and pool size before accepting the flip. A slow-dump rise without `FlushErr`
-      is a table-size warning; slow dumps plus `FlushErr` block the flip until the
-      budget/pool-size/#2908 path is resolved. For the large fan-out tuple,
+      socket-pool wait and all indexed deletes (or by fallback dump + deletes if
+      the index is unhealthy); if `FlushErr` ticks during the large fan-out tuple,
+      correlate it with indexed/fallback counters, matched-flow count/fan-out
+      size, breaker state, and pool size before accepting the flip. Any
+      fallback dump rise is an event-index health warning; fallback dumps plus
+      `FlushErr` block the flip until the event stream/pool/budget path is
+      resolved. Authoritative dumps are expected only for immediate revocation,
+      but authoritative dumps plus `FlushErr` still require pool/budget review
+      before accepting the flip. For the
+      large fan-out tuple,
       compare `L3FlushConntrackDeleted` deltas against the matched-flow count so a
       mid-list persistent delete error cannot silently strand the tail. Partial
       success still returns an error and spends breaker budget, so do not accept
@@ -131,12 +221,12 @@ pressure before it is obvious in dump latency.
       → reverts to the v1 fork+exec datapath. Default is exec, so reverting this
       PR entirely is also safe. No data/schema migration (the flusher is stateless
       across the swap).
-- [ ] Follow-up (not blocking, tracked — no action required for this rollout): the
-      per-`Flush` conntrack dump is O(table); true million-session 100k/sec headroom
-      needs a kernel-side CTA_FILTER mass-delete or an AC-side conntrack-event
-      source-port index — **#2908** (the `L3FlushConntrackSlowDumps` metric is its
-      early-warning signal). A dump-latency histogram for finer soak readability is
-      **#2909**. The surgical, sibling-preserving revoke teardown stays the **#2784**
+- [ ] Follow-up (not blocking, tracked — no action required for this rollout): a
+      dump-latency histogram for finer fallback/backfill readability is **#2909**.
+      Runtime event-index resync after multicast overrun is **#2946**.
+      Compact resident origin storage to reduce million-entry GC scan pressure is
+      **#2973**.
+      The surgical, sibling-preserving revoke teardown stays the **#2784**
       follow-up.
 
 > Cross-link: the [#2797 ledger entry](2026-06-25-pr-2797-revocation-ipv6-hardfail-iptables.md)

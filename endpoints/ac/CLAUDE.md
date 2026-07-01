@@ -60,6 +60,17 @@ must update this list and audit all existing call sites.
   goroutine clears the pointer during teardown and then closes `done`, so
   callers that wait for shutdown must snapshot the pointer, release the mutex,
   and only then wait.
+- **ConntrackFlusher netlink locks are leaf-most and internal.** `ctConn.mu`
+  serializes request/response use of one pooled ctnetlink socket and may be held
+  across dump/delete syscalls; `ctEventIndex.mu` guards the #2908 event-fed
+  origin index and is held only while applying multicast events, startup
+  backfill replay, taking a lookup snapshot, or pruning successfully-deleted
+  origins after the indexed delete path has released its pooled socket. The
+  netlink backend intentionally avoids nesting `ctConn.mu` and
+  `ctEventIndex.mu`; neither lock calls back into `UdpAC`, `ACRegistration`,
+  metrics publisher locks, tokenstore, or scheduler locks. Keep both leaf-most;
+  future changes that invoke AC callbacks while holding either lock must audit
+  this table first.
 - **`tokenStore.mu` is never held while scheduler `shard.mu` /
   `wheelMu` are acquired** (#2172). The
   `TokenStore.OnExpire` hook wired by `(*UdpAC).Start` calls

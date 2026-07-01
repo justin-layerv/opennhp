@@ -274,6 +274,79 @@ func (a *UdpAC) ConntrackNetlinkSlowDumpCount() (uint64, bool) {
 	return cf.NetlinkSlowDumpCount(), true
 }
 
+// ConntrackNetlinkIndexedFlushCount mirrors ConntrackNetlinkDeletedCount for
+// Flush calls served by the #2908 conntrack event index.
+func (a *UdpAC) ConntrackNetlinkIndexedFlushCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexedFlushCount(), true
+}
+
+// ConntrackNetlinkIndexFallbackDumpCount mirrors ConntrackNetlinkDeletedCount
+// for Flush calls that had to fall back to the O(table) dump path because the
+// event index was unavailable/unhealthy.
+func (a *UdpAC) ConntrackNetlinkIndexFallbackDumpCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexFallbackDumpCount(), true
+}
+
+// ConntrackNetlinkIndexAuthoritativeDumpCount mirrors
+// ConntrackNetlinkDeletedCount for Flush calls that intentionally bypassed the
+// event index to use fresh kernel ground truth for immediate revocation.
+func (a *UdpAC) ConntrackNetlinkIndexAuthoritativeDumpCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexAuthoritativeDumpCount(), true
+}
+
+// ConntrackNetlinkIndexEventErrorCount mirrors ConntrackNetlinkDeletedCount for
+// conntrack multicast stream errors. Nonzero means indexed Flush is disabled
+// and the safe dump fallback is in use.
+func (a *UdpAC) ConntrackNetlinkIndexEventErrorCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexEventErrorCount(), true
+}
+
+// ConntrackNetlinkIndexPendingOverflowCount mirrors ConntrackNetlinkDeletedCount
+// for startup backfill pending-buffer overflows.
+func (a *UdpAC) ConntrackNetlinkIndexPendingOverflowCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexPendingOverflowCount(), true
+}
+
+// ConntrackNetlinkIndexEventCount mirrors ConntrackNetlinkDeletedCount for the
+// conntrack multicast event liveness counter.
+func (a *UdpAC) ConntrackNetlinkIndexEventCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexEventCount(), true
+}
+
+// ConntrackNetlinkIndexOriginCount mirrors ConntrackNetlinkDeletedCount for the
+// resident origin count in the #2908 event index.
+func (a *UdpAC) ConntrackNetlinkIndexOriginCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkIndexOriginCount(), true
+}
+
 // BpfConntrackStats returns the eBPF conntrack stats snapshot and ok=true when
 // the EBPFXDP BpfFlusher is wired; zero, false otherwise.
 func (a *UdpAC) BpfConntrackStats() (BpfConntrackStats, bool) {

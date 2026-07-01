@@ -57,10 +57,11 @@ func ParseConntrackBackend(s string) (ConntrackBackend, bool) {
 // defaultConntrackNetlinkPoolSize is the netlink socket pool size. Sized per
 // the #2165 sketch — one socket per ~4 flush workers. A netlink socket
 // serializes request→response by sequence number and so is single-flight; the
-// pool is what provides concurrency. The default is deliberately conservative
-// for the first opt-in: each holder owns its socket across the O(table) dump
-// and matching deletes, and the rollout ledger must explicitly accept or tune
-// this ratio under representative burst + fan-out before the prod flip.
+// pool is what provides delete concurrency. The default is deliberately
+// conservative for the first opt-in: each holder owns its socket across the
+// indexed deletes (or the safe O(table) dump fallback if the event index is
+// unhealthy), and the rollout ledger must explicitly accept or tune this ratio
+// under representative burst + fan-out before the prod flip.
 const (
 	conntrackNetlinkWorkersPerSocket = 4
 	defaultConntrackNetlinkPoolSize  = defaultWorkerCount / conntrackNetlinkWorkersPerSocket

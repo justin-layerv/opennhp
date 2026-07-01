@@ -39,10 +39,12 @@ import (
 //   - BackendNetlink: direct NFNL_SUBSYS_CTNETLINK via a pool of
 //     pre-warmed netlink sockets (expiry_conntrack_flusher_netlink_linux.go).
 //     No fork, no userspace-tool dependency, no locale-fragile stderr
-//     scrape, and IPv4 + IPv6. This is the throughput path — each delete
-//     is a netlink syscall (~100µs) rather than a ~5-10 ms fork+exec —
-//     and the IPv6 capability closes the iptables-mode immediate-teardown
-//     gap (#2794/#2797). Opt-in until soak-validated per the rollout plan.
+//     scrape, and IPv4 + IPv6. It also keeps a conntrack-event source-port
+//     index (#2908) so steady-state Flush is O(matches) instead of a
+//     per-key O(table) dump; if the event stream is unhealthy it falls back
+//     to dump-and-filter rather than risking a silent miss. The IPv6 capability
+//     closes the iptables-mode immediate-teardown gap (#2794/#2797). Opt-in
+//     until soak-validated per the rollout plan.
 //
 // The backend is internal to the Linux build; FlowFlusher and every
 // caller, scheduler, and test are unchanged across the toggle.
@@ -84,11 +86,35 @@ type ConntrackFlusher struct {
 	// netlinkSlowDumps counts Flush calls whose successful conntrack dump
 	// attempt exceeded netlinkSlowDumpThreshold (cumulative). Retry/reopen
 	// overhead is excluded so the L3FlushConntrackSlowDumps gauge remains a
-	// table-size latency signal for the soak: a rising rate is the O(table)
-	// per-key dump hitting the table-size knee the throughput follow-up
-	// tracks, exactly the large-table regime the single-threaded ≤200µs
-	// benchmark can't surface. Zero on the exec backend.
+	// fallback/backfill/authoritative-revoke table-walk signal for the soak: a
+	// rising steady-state rate must be explained by either unhealthy/unavailable
+	// index fallback or intentional authoritative immediate-revocation dumps.
+	// Zero on the exec backend.
 	netlinkSlowDumps atomic.Uint64
+
+	// eventIndex is the #2908 source-port/full-origin index fed by conntrack
+	// multicast events. When healthy, BackendNetlink Flush uses it to avoid the
+	// O(table) dump and delete only origins already known for the FlowKey. If
+	// the event stream errors, Flush falls back to dump-and-filter rather than
+	// silently missing flows.
+	eventIndex *ctEventIndex
+
+	// netlinkIndexedFlushes counts Flush calls served from eventIndex (including
+	// indexed no-match). This is the runtime proof that the #2908 O(matches)
+	// path is active on a netlink AC.
+	netlinkIndexedFlushes atomic.Uint64
+
+	// netlinkIndexFallbackDumps counts Flush calls that had to use the old
+	// O(table) dump path because eventIndex was unavailable/unhealthy. Any
+	// nonzero rate during the million-table soak means the #2908 hot path is not
+	// serving all scheduled-expiry Flushes, but correctness is still preserved by
+	// the fallback dump.
+	netlinkIndexFallbackDumps atomic.Uint64
+
+	// netlinkIndexAuthoritativeDumps counts intentional O(table) dumps requested
+	// by RescheduleEarlier/immediate revocation so that operators can separate
+	// fresh-ground-truth revoke dumps from unhealthy-index fallback.
+	netlinkIndexAuthoritativeDumps atomic.Uint64
 
 	// Per-call timeout comes from the scheduler-supplied context
 	// (defaultFlushCallTimeout in expiry_scheduler.go); we don't
@@ -132,8 +158,14 @@ type ConntrackFlusher struct {
 //     note in docs/runbooks/l3-flush-breaker-recovery.md and tracked as
 //     a hard AMI-startup assertion in #2179.
 //   - netlink: errors if any pooled socket fails to open (no CAP_NET_ADMIN,
-//     a netns issue, an unsupported kernel). The caller (Start via
-//     newFlusherForFilterMode) treats this as fatal.
+//     a netns issue, an unsupported kernel), if the event subscription cannot
+//     be armed, or if the initial event-index backfill cannot finish inside
+//     defaultNetlinkIndexBackfillTimeout. The caller (Start via
+//     newFlusherForFilterMode) treats this as fatal. This startup posture is
+//     intentionally stricter than runtime event-index errors, which degrade to
+//     dump/filter fallback: the netlink backend is opt-in, and a boot that
+//     cannot prove the #2908 hot path can arm should fail visibly rather than
+//     silently start in the old O(table)-per-Flush regime.
 func NewConntrackFlusher(opts ...ConntrackFlusherOption) (*ConntrackFlusher, error) {
 	cfg := resolveConntrackFlusherConfig(opts...)
 	f := &ConntrackFlusher{backend: cfg.backend, ctOps: realCtNetlinkOps{}}
@@ -145,7 +177,18 @@ func NewConntrackFlusher(opts ...ConntrackFlusherOption) (*ConntrackFlusher, err
 			return nil, fmt.Errorf("conntrack netlink backend init: %w", err)
 		}
 		f.pool = pool
-		log.Info("[ConntrackFlusher] using direct netlink (NFNL_SUBSYS_CTNETLINK) backend — pool=%d, IPv4+IPv6", cfg.poolSize)
+		eventIndex, err := newCtEventIndex()
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("conntrack event index init: %w", err)
+		}
+		f.eventIndex = eventIndex
+		indexed, err := f.rebuildEventIndex(context.Background(), time.Now().Add(defaultNetlinkIndexBackfillTimeout))
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("conntrack event index backfill: %w", err)
+		}
+		log.Info("[ConntrackFlusher] using direct netlink (NFNL_SUBSYS_CTNETLINK) backend — pool=%d, IPv4+IPv6, event-indexed-origins=%d", cfg.poolSize, indexed)
 	default: // BackendExec
 		bin, err := exec.LookPath("conntrack")
 		if err != nil {
@@ -181,10 +224,16 @@ func (f *ConntrackFlusher) HandlesIPv6() bool { return f.IsNetlinkBackend() }
 // backend: closes every pooled socket. Safe to call once after the
 // scheduler has drained (no Flush in flight); idempotent on a nil pool.
 func (f *ConntrackFlusher) Close() error {
-	if f.pool != nil {
-		return f.pool.Close()
+	var firstErr error
+	if f.eventIndex != nil {
+		firstErr = f.eventIndex.Close()
 	}
-	return nil
+	if f.pool != nil {
+		if err := f.pool.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // NetlinkDeletedCount returns the cumulative number of conntrack entries
@@ -199,6 +248,68 @@ func (f *ConntrackFlusher) NetlinkDeletedCount() uint64 {
 // backend. Read by the L3FlushConntrackSlowDumps gauge.
 func (f *ConntrackFlusher) NetlinkSlowDumpCount() uint64 {
 	return f.netlinkSlowDumps.Load()
+}
+
+// NetlinkIndexedFlushCount returns the cumulative number of netlink Flush
+// calls served from the conntrack event index. Always 0 on the exec backend.
+func (f *ConntrackFlusher) NetlinkIndexedFlushCount() uint64 {
+	return f.netlinkIndexedFlushes.Load()
+}
+
+// NetlinkIndexFallbackDumpCount returns the cumulative number of netlink Flush
+// calls that had to use the O(table) dump fallback because the event index was
+// unavailable/unhealthy. Always 0 on the exec backend.
+func (f *ConntrackFlusher) NetlinkIndexFallbackDumpCount() uint64 {
+	return f.netlinkIndexFallbackDumps.Load()
+}
+
+// NetlinkIndexAuthoritativeDumpCount returns the cumulative number of netlink
+// Flush calls that intentionally bypassed the event index to use fresh kernel
+// ground truth for immediate revocation. Always 0 on the exec backend.
+func (f *ConntrackFlusher) NetlinkIndexAuthoritativeDumpCount() uint64 {
+	return f.netlinkIndexAuthoritativeDumps.Load()
+}
+
+// NetlinkIndexEventErrorCount returns the conntrack event stream error count.
+// A nonzero value means indexed Flush is disabled and safe dump fallback is in
+// use until the AC restarts/rebuilds the subscription.
+func (f *ConntrackFlusher) NetlinkIndexEventErrorCount() uint64 {
+	if f.eventIndex == nil {
+		return 0
+	}
+	return f.eventIndex.ErrorCount()
+}
+
+// NetlinkIndexPendingOverflowCount returns the number of startup backfill
+// pending-buffer overflows. Nonzero means startup churn outran the replay cap
+// and the event index disabled itself before serving the hot path.
+func (f *ConntrackFlusher) NetlinkIndexPendingOverflowCount() uint64 {
+	if f.eventIndex == nil {
+		return 0
+	}
+	return f.eventIndex.PendingOverflowCount()
+}
+
+// NetlinkIndexEventCount returns the cumulative number of valid-group
+// conntrack multicast events observed by the event index. It is a liveness
+// signal for the #2908 hot-path subscription.
+func (f *ConntrackFlusher) NetlinkIndexEventCount() uint64 {
+	if f.eventIndex == nil {
+		return 0
+	}
+	return f.eventIndex.EventCount()
+}
+
+// NetlinkIndexOriginCount returns the current number of full-origin conntrack
+// tuples mirrored by the event index. This is the resident-size signal for the
+// million-entry soak. A zero value is ambiguous by itself: it can mean a healthy
+// empty table or a disabled/reclaimed index, so dashboards must correlate it
+// with NetlinkIndexEventErrorCount and NetlinkIndexFallbackDumpCount.
+func (f *ConntrackFlusher) NetlinkIndexOriginCount() uint64 {
+	if f.eventIndex == nil {
+		return 0
+	}
+	return f.eventIndex.OriginCount()
 }
 
 // SkippedCount returns the number of keys this flusher no-op'd before backend

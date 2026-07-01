@@ -49,6 +49,14 @@ func (r *recordingFlusher) snapshotKeys() []FlowKey {
 	return out
 }
 
+func (r *recordingFlusher) snapshotAuthoritative() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]bool, len(r.authoritative))
+	copy(out, r.authoritative)
+	return out
+}
+
 func TestRevocationIndex_AddLookupRemove(t *testing.T) {
 	ri := newRevocationIndex()
 	entry := qurlV2Entry("qhash1", "rhash1", "sess1", "adm1")
@@ -532,6 +540,9 @@ func TestScheduler_RescheduleEarlier_PullsEarlierVsScheduleNoOp(t *testing.T) {
 	if len(got) != 1 || got[0] != keyB {
 		t.Fatalf("expected only keyB flushed, got %v", got)
 	}
+	if got := f.snapshotAuthoritative(); len(got) != 1 || !got[0] {
+		t.Fatalf("RescheduleEarlier flush authoritative flags = %v, want [true]", got)
+	}
 
 	// RescheduleEarlier must NOT push a deadline later: an entry already due
 	// sooner stays put (shortest-wins skip).
@@ -540,5 +551,8 @@ func TestScheduler_RescheduleEarlier_PullsEarlierVsScheduleNoOp(t *testing.T) {
 	sched.RescheduleEarlier(keyC, time.Now().Add(30*time.Second))
 	if !f.waitFor(2, 2*time.Second) {
 		t.Fatalf("RescheduleEarlier wrongly delayed a sooner deadline; flusher saw %d", f.count())
+	}
+	if got := f.snapshotAuthoritative(); len(got) != 2 || !got[1] {
+		t.Fatalf("RescheduleEarlier shortest-wins flush authoritative flags = %v, want second true", got)
 	}
 }

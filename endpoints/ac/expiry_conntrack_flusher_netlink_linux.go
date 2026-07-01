@@ -34,11 +34,12 @@ import (
 // port); there is no partial-tuple index. A single allow-rule FlowKey
 // {src,dst,dport,proto} fans out to every established flow on that tuple
 // regardless of the client's ephemeral source port. So a partial-tuple
-// flush is fundamentally: enumerate the matching flows (a dump), then
-// delete each by its full tuple. flushNetlink does exactly that — it is
-// the iptables/conntrack analog of the eBPF enumerate-then-FlushConn-each
-// surgical path (EnumerateConnTrackSrcPorts + BpfFlusher.FlushConn), with
-// each per-flow delete the conntrack single-flow-delete primitive.
+// flush needs a source-port/full-origin index somewhere. For #2908 the netlink
+// backend keeps that index in the AC, fed by conntrack NEW/UPDATE/DESTROY
+// events and seeded by a one-time startup dump. A healthy index makes Flush
+// O(matches): look up the origins for {src,dst,dport,proto}, then delete each
+// by its full tuple. If the event stream errors, Flush falls back to the prior
+// dump/filter/delete path instead of silently missing flows.
 //
 // For EXPIRY (this Flush) we delete ALL matching flows — the allow-rule
 // is gone, so every flow on its tuple must die; there is no sibling to
@@ -61,20 +62,22 @@ import (
 // unread kernel messages that would desync the next op), and a transient dump
 // error (ENOBUFS/EINTR) is retried once before giving up to the breaker.
 //
-// # Cost / the remaining throughput follow-up
+// # Cost / fallback behavior
 //
-// The per-Flush dump is O(conntrack-table-size). On a small/medium table
-// (the common case, and any sandbox AC) the dump is sub-millisecond and
-// the win is the eliminated fork+exec — this is what the
-// BenchmarkConntrackFlusher_Netlink ≤200µs/op gate measures. At a
-// pathological million-entry table a per-key dump does not by itself
-// reach the 100k/sec headroom; closing that asymptotic gap needs either
-// a kernel-side CTA_FILTER mass-delete (one message, no userspace
-// transfer) or an AC-side source-port index fed by conntrack NEW/DESTROY
-// events. Both require on-kernel validation and are tracked in #2908;
-// this backend is the correct, soak-ready datapath they build on, and
-// the L3FlushConntrackSlowDumps metric is the early-warning signal for
-// the knee.
+// The healthy-index hot path avoids the O(conntrack-table-size) per-Flush
+// dump that #2908 flagged and is bounded by the number of matching established
+// flows behind the allow-rule tuple. The O(table) dump path remains in bounded
+// cases only: the one-time startup backfill, authoritative immediate-revocation
+// flushes that require fresh kernel ground truth, and the safe fallback when the
+// event stream is unavailable/unhealthy. `L3FlushConntrackIndexedFlushes`
+// proves the hot path is active; `L3FlushConntrackIndexFallbackDumps` and
+// `L3FlushConntrackIndexEventErrors` prove dump fallback/event-loss is visible.
+// `L3FlushConntrackIndexAuthoritativeDumps` separately counts intentional
+// fresh-ground-truth dumps for immediate revocation, `L3FlushConntrackIndexEvents`
+// proves the event stream is live, and `L3FlushConntrackIndexOrigins` records
+// the resident userspace mirror size. `L3FlushConntrackSlowDumps` remains the
+// latency signal for fallback, authoritative, and startup/soak characterization
+// dumps.
 
 // defaultNetlinkOpTimeout is the hard ceiling for one netlink Flush when the
 // caller supplies no sooner ctx deadline. It caps socket acquisition, the dump,
@@ -95,6 +98,16 @@ const minNetlinkOpTimeout = time.Millisecond
 // enough that a table-size-knee regression shows up as a rising counter
 // during the soak.
 const netlinkSlowDumpThreshold = 1 * time.Millisecond
+
+// defaultNetlinkIndexBackfillTimeout bounds the one-time startup dump that
+// seeds the #2908 event index with flows that existed before subscription.
+// Steady-state Flush calls must not pay this O(table) cost while the event
+// stream is healthy; a startup failure is loud so the AC does not silently run
+// with an empty index. Runtime event-stream failures degrade to safe fallback,
+// but startup is intentionally stricter for the opt-in netlink backend: if the
+// AC cannot prove the initial snapshot was built, operators should fix that
+// before accepting the #2908 throughput path.
+const defaultNetlinkIndexBackfillTimeout = 30 * time.Second
 
 // maxConsecutiveNetlinkDeleteErrors bounds the reopen-on-error path inside one
 // Flush. A post-retry delete error marks the socket bad; if a kernel-side hard
@@ -332,6 +345,20 @@ func (f *ConntrackFlusher) flushNetlink(ctx context.Context, key FlowKey) error 
 	isV6 := family == conntrack.IPv6
 	deadline := netlinkOpDeadline(ctx)
 
+	if wantsAuthoritativeFlush(ctx) {
+		f.netlinkIndexAuthoritativeDumps.Add(1)
+	} else {
+		if origins, ok := f.eventIndex.originsForKey(key); ok {
+			f.netlinkIndexedFlushes.Add(1)
+			return f.flushNetlinkIndexed(ctx, key, family, origins, deadline)
+		}
+		f.netlinkIndexFallbackDumps.Add(1)
+	}
+
+	return f.flushNetlinkByDump(ctx, key, family, isV6, deadline)
+}
+
+func (f *ConntrackFlusher) flushNetlinkByDump(ctx context.Context, key FlowKey, family conntrack.Family, isV6 bool, deadline time.Time) error {
 	c, err := f.pool.acquire(ctx, deadline)
 	if err != nil {
 		return err
@@ -354,10 +381,9 @@ func (f *ConntrackFlusher) flushNetlink(ctx context.Context, key FlowKey) error 
 	}
 
 	// Resolve the match spec ONCE — it depends only on key + family, both
-	// fixed for this Flush, so recomputing it per dumped entry would be pure
-	// repeated work in the O(table) loop.
+	// fixed for this fallback Flush, so recomputing it per dumped entry would
+	// be pure repeated work in the O(table) loop.
 	wantProto, filterProto, filterPort := conntrackMatchSpec(key, isV6)
-	var firstErr error
 	var matchedOrigins []*conntrack.IPTuple
 	for i := range cons {
 		t, ok := conToTuple(&cons[i])
@@ -370,11 +396,59 @@ func (f *ConntrackFlusher) flushNetlink(ctx context.Context, key FlowKey) error 
 		matchedOrigins = append(matchedOrigins, cons[i].Origin)
 	}
 
+	deleted, _, firstErr := f.deleteMatchedOrigins(ctx, c, family, matchedOrigins, deadline, false)
+
+	if firstErr != nil {
+		return fmt.Errorf("conntrack netlink delete for %s (deleted %d/%d matched): %w", key, deleted, len(matchedOrigins), firstErr)
+	}
+	if len(matchedOrigins) == 0 {
+		log.Debug("[ConntrackFlusher] no matching netlink entries for %s (idempotent)", key)
+	}
+	return nil
+}
+
+func (f *ConntrackFlusher) flushNetlinkIndexed(ctx context.Context, key FlowKey, family conntrack.Family, origins []*conntrack.IPTuple, deadline time.Time) error {
+	if len(origins) == 0 {
+		log.Debug("[ConntrackFlusher] no indexed netlink entries for %s (idempotent)", key)
+		return nil
+	}
+	c, err := f.pool.acquire(ctx, deadline)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		c.mu.Unlock()
+		f.pool.release(c)
+		return err
+	}
+
+	deleted, deletedOrigins, firstErr := f.deleteMatchedOrigins(ctx, c, family, origins, deadline, true)
+	c.mu.Unlock()
+	f.pool.release(c)
+
+	f.eventIndex.removeOrigins(deletedOrigins)
+
+	if firstErr != nil {
+		return fmt.Errorf("conntrack indexed netlink delete for %s (deleted %d/%d indexed): %w", key, deleted, len(origins), firstErr)
+	}
+	return nil
+}
+
+func (f *ConntrackFlusher) deleteMatchedOrigins(ctx context.Context, c *ctConn, family conntrack.Family, origins []*conntrack.IPTuple, deadline time.Time, collectDeleted bool) (int, []*conntrack.IPTuple, error) {
+	var firstErr error
 	deleted := 0
 	consecutiveDeleteErrors := 0
-	for _, origin := range matchedOrigins {
+	var deletedOrigins []*conntrack.IPTuple
+	for _, origin := range origins {
+		if derr := netlinkDeleteLoopDeadlineErr(ctx, deadline); derr != nil {
+			if firstErr == nil {
+				firstErr = derr
+			}
+			break
+		}
 		// Reuse the kernel's own reported origin tuple verbatim for the
-		// delete — it carries the full 5-tuple (incl. source port, and for
+		// delete: it carries the full 5-tuple (incl. source port, and for
 		// ICMP the id/type/code) the kernel needs to find the exact entry.
 		if derr := f.deleteOriginWithRetry(c, family, origin, deadline); derr != nil {
 			consecutiveDeleteErrors++
@@ -398,18 +472,53 @@ func (f *ConntrackFlusher) flushNetlink(ctx context.Context, key FlowKey) error 
 		}
 		consecutiveDeleteErrors = 0
 		deleted++
+		if collectDeleted {
+			deletedOrigins = append(deletedOrigins, origin)
+		}
 	}
-
 	if deleted > 0 {
 		f.netlinkDeleted.Add(uint64(deleted))
 	}
-	if firstErr != nil {
-		return fmt.Errorf("conntrack netlink delete for %s (deleted %d/%d matched): %w", key, deleted, len(matchedOrigins), firstErr)
+	return deleted, deletedOrigins, firstErr
+}
+
+func netlinkDeleteLoopDeadlineErr(ctx context.Context, deadline time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if len(matchedOrigins) == 0 {
-		log.Debug("[ConntrackFlusher] no matching netlink entries for %s (idempotent)", key)
+	if !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
 	}
 	return nil
+}
+
+func (f *ConntrackFlusher) rebuildEventIndex(ctx context.Context, deadline time.Time) (int, error) {
+	if f.eventIndex == nil {
+		return 0, nil
+	}
+	var cons []conntrack.Con
+	for _, family := range []conntrack.Family{conntrack.IPv4, conntrack.IPv6} {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		c, err := f.pool.acquire(ctx, deadline)
+		if err != nil {
+			return 0, err
+		}
+		c.mu.Lock()
+		familyCons, _, dumpErr := f.dumpWithRetry(c, family, deadline)
+		c.mu.Unlock()
+		f.pool.release(c)
+		if dumpErr != nil {
+			return 0, fmt.Errorf("conntrack index backfill dump family %d: %w", family, dumpErr)
+		}
+		cons = append(cons, familyCons...)
+	}
+	f.eventIndex.rebuild(cons)
+	if !f.eventIndex.healthy.Load() {
+		return 0, nil
+	}
+	return int(f.eventIndex.OriginCount()), nil
 }
 
 // deleteOriginWithRetry retries one transient delete failure on a freshly
@@ -507,7 +616,11 @@ func isMixedFamilyKey(key FlowKey) bool {
 // distinguishes the families. Callers guard mixed-family keys first; MakeFlowKey
 // only ever produces all-v4 or all-v6 keys.
 func familyForKey(key FlowKey) conntrack.Family {
-	if isIPv4Mapped(key.SrcIP) && isIPv4Mapped(key.DstIP) {
+	return familyForIPs(key.SrcIP, key.DstIP)
+}
+
+func familyForIPs(src, dst [16]byte) conntrack.Family {
+	if isIPv4Mapped(src) && isIPv4Mapped(dst) {
 		return conntrack.IPv4
 	}
 	return conntrack.IPv6
