@@ -2149,6 +2149,13 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "logs:DeleteMetricFilter",
           "logs:DescribeMetricFilters",
           "cloudwatch:PutMetricAlarm",
+          # PutCompositeAlarm: the canary-deployment module's canary_health
+          # composite alarm (modules/canary-deployment/alarms.tf) needs this to
+          # create/update. Its omission (PutMetricAlarm was granted, the composite
+          # variant was not) silently broke EVERY sandbox apply with
+          # `PutCompositeAlarm AccessDenied` once a change forced the alarm to
+          # update. DeleteAlarms below already covers composite-alarm teardown.
+          "cloudwatch:PutCompositeAlarm",
           "cloudwatch:PutMetricData",
           "cloudwatch:DeleteAlarms",
           "cloudwatch:PutDashboard",
