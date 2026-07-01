@@ -123,6 +123,11 @@ on:
       - "tests/lints/paths-filter-coverage/**"
       - "tests/lints/dispatch-ref-error/**"
       - "tests/lints/smoke-tier-filter-coverage/**"
+      # SIGPIPE-under-pipefail membership fences for the packer + eBPF lints:
+      # watch each fixture dir so an edit re-fires its shellcheck + fixture
+      # run in the job below.
+      - "tests/lints/packer-failure-surfaced/**"
+      - "tests/lints/ebpf-load-path-lockstep/**"
       - "tests/lints/lockdown-body-drift/**"
       - "tests/lints/verify-image-attestation/**"
       - ".github/actions/verify-image-attestation/**"
@@ -599,6 +604,18 @@ jobs:
           bash tests/scripts/check-ebpf-load-path-lockstep_test.sh
           bash scripts/check-ebpf-load-path-lockstep.sh
 
+      # SIGPIPE-under-pipefail regression fence for the Dockerfile-path
+      # membership test in the lint above: a `printf … | grep -qxF` pipe could
+      # flip a MATCH into a spurious "guard is missing <path>" drift (full
+      # derivation in the fixture header). The race can't be reproduced
+      # reliably in a live run, so the fixture fences it structurally and
+      # unit-tests the pure-bash lines_contain replacement. shellcheck the
+      # fixture too (the lint itself is covered above).
+      - name: Shellcheck + test eBPF load-path membership fixtures (SIGPIPE fence)
+        run: |
+          shellcheck tests/lints/ebpf-load-path-lockstep/run-fixtures.sh
+          bash tests/lints/ebpf-load-path-lockstep/run-fixtures.sh
+
       # AC eBPF architecture lockstep (#2816): Dockerfile.ac.aws compiles the
       # eBPF objects inside the AC image build, so build-and-push.yml must build
       # that image for the same platform the AC launch template runs. Today this
@@ -636,6 +653,19 @@ jobs:
 
       - name: Check frps_az_suffixes validation drift (root ↔ module ↔ env-roots)
         run: bash scripts/check-frps-az-suffixes-validation-drift.sh
+
+      # SIGPIPE-under-pipefail regression fence for need()'s notify-block
+      # membership test in the packer lint below: a `printf … | grep -qE` pipe
+      # could flip a MATCH into a spurious "✗ <message>" failure (full
+      # derivation in the fixture header). The race can't be reproduced
+      # reliably in a live run, so the fixture fences it structurally and
+      # unit-tests the extracted need(). shellcheck the lint too — it was not
+      # covered before (actionlint's -shellcheck only sees workflow-embedded
+      # scripts).
+      - name: Shellcheck + test packer-failure-surfaced fixtures (SIGPIPE fence)
+        run: |
+          shellcheck scripts/check-packer-failure-surfaced.sh tests/lints/packer-failure-surfaced/run-fixtures.sh
+          bash tests/lints/packer-failure-surfaced/run-fixtures.sh
 
       # Structural fence for the notify-job wiring that surfaces Packer Build
       # AMI failures (issue #2252). packer-build is not a required check (it's

@@ -79,7 +79,20 @@ fi
 
 fail=0
 need() { # need <egrep-pattern> <human message>
-  if ! printf '%s\n' "$notify_block" | grep -qE "$1"; then
+  # Capture-then-test, not `printf '%s\n' "$notify_block" | grep -qE`: a
+  # drained `grep -E` (no -q) can't close the pipe early, so the printf
+  # builtin never hits EPIPE mid-write and gets flipped from a match into a
+  # spurious miss under pipefail (full derivation in
+  # tests/lints/packer-failure-surfaced/run-fixtures.sh; same convention as
+  # check-base-image-pebble-purge.sh). `|| true` absorbs grep's no-match
+  # exit under errexit. (need_order below is already safe: it captures into
+  # a var with a trailing `|| true`, so grep's status never gates a branch.)
+  # One semantic delta from grep -qE: a pattern whose only match is a blank
+  # line reads as a miss here (captured output is empty) — the A1-A5 wiring
+  # patterns all match non-empty content, so that edge never bites.
+  local hit
+  hit=$(printf '%s\n' "$notify_block" | grep -E "$1" || true)
+  if [ -z "$hit" ]; then
     printf '  \033[31m✗\033[0m %s\n' "$2" >&2
     fail=1
   fi

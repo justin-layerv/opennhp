@@ -101,6 +101,28 @@ fail() {
   exit 1
 }
 
+# Exact whole-line membership: return 0 iff $1 equals one of the
+# newline-separated lines of $2. Pure bash — no subprocess, no pipe.
+#
+# Replaces a `printf '%s\n' "$dk_paths" | grep -qxF "$want"` pipe whose
+# early pipe-close raced the still-writing printf and, under pipefail,
+# flipped a match into a spurious "Dockerfile.ac.aws guard is missing"
+# drift (full derivation in
+# tests/lints/ebpf-load-path-lockstep/run-fixtures.sh). The guard paths
+# are fixed strings, so exact per-line equality (`=`) is identical to the
+# old `grep -qxF` whole-line fixed-string match; the here-string keeps the
+# loop in the current shell so `return 0` exits the function directly.
+#
+# Keep this subprocess-free: do NOT reintroduce a `printf … | grep -q`
+# membership test (fenced by tests/lints/ebpf-load-path-lockstep/).
+lines_contain() {
+  local needle="$1" block="$2" line
+  while IFS= read -r line; do
+    [ "$line" = "$needle" ] && return 0
+  done <<< "$block"
+  return 1
+}
+
 # --- Site 1: Go consts (the source of truth) --------------------------------
 # const ebpfenginename string = "nhp_ebpf_xdp.o"
 go_xdp=$(grep -E 'ebpfenginename[[:space:]]+string[[:space:]]*=[[:space:]]*"[^"]+"' "$GO_SRC" \
@@ -301,13 +323,15 @@ mismatch=""
 [ "$mk_tc" = "$want_tc" ]   || mismatch+=$'\n'"  Makefile EBPF_OBJ_TC_EGRESS = ./release/nhp-ac/${mk_tc}   (want .../${want_tc})"
 
 # Dockerfiles: both wanted paths must appear in each guard's path set.
-printf '%s\n' "$dk_aws_paths" | grep -qxF "$want_xdp" \
+# lines_contain is a pure-bash exact membership test — see its definition
+# for why a `printf … | grep -qxF` pipe would race SIGPIPE under pipefail.
+lines_contain "$want_xdp" "$dk_aws_paths" \
   || mismatch+=$'\n'"  Dockerfile.ac.aws guard is missing  /nhp-ac/${want_xdp}  (xdp object)"
-printf '%s\n' "$dk_aws_paths" | grep -qxF "$want_tc" \
+lines_contain "$want_tc" "$dk_aws_paths" \
   || mismatch+=$'\n'"  Dockerfile.ac.aws guard is missing  /nhp-ac/${want_tc}  (tc object)"
-printf '%s\n' "$dk_local_paths" | grep -qxF "$want_xdp" \
+lines_contain "$want_xdp" "$dk_local_paths" \
   || mismatch+=$'\n'"  Dockerfile.ac guard is missing      /nhp-ac/${want_xdp}  (xdp object)"
-printf '%s\n' "$dk_local_paths" | grep -qxF "$want_tc" \
+lines_contain "$want_tc" "$dk_local_paths" \
   || mismatch+=$'\n'"  Dockerfile.ac guard is missing      /nhp-ac/${want_tc}  (tc object)"
 
 [ "$smoke_xdp" = "$want_xdp" ] || mismatch+=$'\n'"  smoke acEBPFXDPObjectPath  = /opt/layerv/nhp-ac/${smoke_xdp}   (want .../${want_xdp})"
