@@ -17,13 +17,14 @@ acme==2.11.0
 josepy==1.15.0
 
 # Cryptography for key generation and certificate handling
-cryptography==48.0.1
+# Pinned >=49 in lockstep with pyOpenSSL 26.3.0 (requires cryptography<50,>=49).
+cryptography==49.0.0
 
 # DNS resolver for propagation verification
 dnspython==2.8.0
 
 # Required transitive dependencies (with manylinux wheels)
-pyOpenSSL==26.2.0
+pyOpenSSL==26.3.0
 cffi>=2.0.0
 pycparser==2.22
 pyrfc3339==1.1
