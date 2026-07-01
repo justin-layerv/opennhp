@@ -948,11 +948,31 @@ Delivery requirements:
   blue/green-suffixed id, a re-normalized form), targeted fanout silently matches
   nothing and **fails open** (the missed `NHP_REV` leaves the AC entry to expire).
   The server side (P4e Slice 2, nhp #2789) builds and unit-tests the targeted
-  path, but qurl-service emits **cell-wide only** until the P3c `admitted_ac_ids`
-  wiring lands; targeted fanout MUST NOT be enabled cross-repo until the
-  id-correspondence is verified end-to-end and a "targeted matched zero ACs"
-  observability guard exists. Tracked: nhp #2790. The incomplete-targeted reject
-  is the interim backstop;
+  path, and the **"targeted matched zero ACs" observability guard now exists**
+  (`RevocationTargetedZeroMatch`, nhp #2790): a targeted event that named a
+  non-empty `target_ac_ids` set but matched no connected AC on a server increments
+  the counter, so an identifier-space drift is a countable signal instead of a
+  silent no-op. Read it FLEET-WIDE — a single server legitimately zero-matches when
+  the named ACs are connected to sibling servers, so the drift signature is every
+  server zero-matching at once (fleet `RevocationFanoutSent` for targeted events
+  collapsing to 0 while this counter spikes), not any one server's count. The
+  counter catches this all-or-nothing drift (a shared-convention change that
+  misses on every server); a PARTIAL intra-event drift — some `target_ac_ids`
+  still match a live `ACConn.ACId` while others don't — leaves the match set
+  non-empty and is NOT caught (the drifted id's `NHP_REV` still fails open). That
+  is an accepted blind spot given the single shared id encoding. Three things gate
+  enabling targeted fanout cross-repo, all tracked in nhp #2790: (1) qurl-service
+  emits **cell-wide only** until the P3c `admitted_ac_ids` builder wiring lands;
+  (2) the id-correspondence MUST be proven end-to-end (a `target_ac_ids` value
+  emitted by qurl-service string-equals a live `ACConn.ACId` a running nhp-server
+  holds); and (3) a fleet-wide CloudWatch alarm on `RevocationTargetedZeroMatch`
+  (spiking while targeted `RevocationFanoutSent` collapses to 0) MUST be wired at
+  enable time so the canary is actually watched — it is intentionally NOT wired
+  now, since the metric is inert and would only no-data/flap pre-enable. Alarm on
+  the two series' shapes, NOT a literal ratio: `RevocationTargetedZeroMatch` is +1
+  per event while `RevocationFanoutSent` is +N per event (N = ACs matched), so
+  dividing them mixes events with AC-deliveries. The incomplete-targeted reject is
+  the interim backstop;
 - bounded retry with dead-letter visibility;
 - AC ack recorded for operational proof;
 - a defined end-to-end revocation-latency SLO (e.g. p99 from revoke API to AC

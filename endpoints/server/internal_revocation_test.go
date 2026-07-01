@@ -336,6 +336,110 @@ func TestInternalRevocation_EmptyMatchIsNoOp200(t *testing.T) {
 	}
 }
 
+// TestInternalRevocation_TargetedZeroMatchCanary pins the #2790 observability
+// guard: a targeted event that NAMED a non-empty target_ac_ids set but matched
+// zero connected ACs on this server emits MetricRevocationTargetedZeroMatch — so
+// a cross-repo target_ac_ids↔ACConn.ACId identifier drift (which would fail open,
+// silently matching nothing) is observable instead of an indistinguishable no-op.
+// The legitimate no-drift shapes (cell-wide with no ACs, targeted WITH a live
+// match, targeted partial match, and targeted with an empty target set) MUST NOT
+// emit it. Every case is still a 200 no-error: a single server holding none of
+// the named ACs is expected, so the canary is a fleet-wide counter, never a
+// per-request failure.
+func TestInternalRevocation_TargetedZeroMatchCanary(t *testing.T) {
+	cases := []struct {
+		name       string
+		connectACs []string
+		mutate     func(*revocationEvent)
+		wantCanary float64
+		wantFanout int
+	}{
+		{
+			name:       "targeted names ACs but none connected here fires canary",
+			connectACs: nil,
+			mutate: func(e *revocationEvent) {
+				e.FanoutMode = revocationFanoutTargeted
+				e.TargetSetComplete = true
+				e.TargetACIDs = []string{"ac-elsewhere-1", "ac-elsewhere-2"}
+			},
+			wantCanary: 1,
+			wantFanout: 0,
+		},
+		{
+			name:       "targeted with a live match does not fire canary",
+			connectACs: []string{"ac-here"},
+			mutate: func(e *revocationEvent) {
+				e.FanoutMode = revocationFanoutTargeted
+				e.TargetSetComplete = true
+				e.TargetACIDs = []string{"ac-here", "ac-elsewhere"}
+			},
+			wantCanary: 0,
+			wantFanout: 1,
+		},
+		{
+			// Partial match: two ACs live here, the target set names one of them
+			// plus one that is not connected. A match exists, so the canary stays
+			// 0; only the named-and-live AC is sent to (the connected-but-unnamed
+			// ac-b is not a match, the named-but-absent ac-missing has nothing here).
+			name:       "targeted partial match (some named ACs live, some not) does not fire canary",
+			connectACs: []string{"ac-a", "ac-b"},
+			mutate: func(e *revocationEvent) {
+				e.FanoutMode = revocationFanoutTargeted
+				e.TargetSetComplete = true
+				e.TargetACIDs = []string{"ac-a", "ac-missing"}
+			},
+			wantCanary: 0,
+			wantFanout: 1,
+		},
+		{
+			name:       "targeted with an empty target set does not fire canary",
+			connectACs: []string{"ac-here"},
+			mutate: func(e *revocationEvent) {
+				e.FanoutMode = revocationFanoutTargeted
+				e.TargetSetComplete = true
+				e.TargetACIDs = nil
+			},
+			wantCanary: 0,
+			wantFanout: 0,
+		},
+		{
+			name:       "cell-wide with zero connected ACs does not fire canary",
+			connectACs: nil,
+			mutate:     nil, // default cell-wide
+			wantCanary: 0,
+			wantFanout: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			signer := newRevocationSigner(t)
+			s := newRevocationTestServer(t, 16)
+			seed := byte(0x40)
+			for _, ac := range tc.connectACs {
+				putRevokeDropConn(s, ac, seed, udpAddr("10.0.1.1", 48000+int(seed)))
+				seed++
+			}
+			hs := &HttpServer{udpServer: s, internalAuthSigner: signer, internalAuthRequire: true}
+			router := newRevocationRouter(hs)
+
+			req := signedRevocationRequest(t, signer, validCellWideEvent(tc.mutate))
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+			}
+			if got := drainSend(s); len(got) != tc.wantFanout {
+				t.Fatalf("fanout sent %d msgs, want %d", len(got), tc.wantFanout)
+			}
+			counters, _ := s.metrics.CountersForTest(t)
+			if c := counters[MetricRevocationTargetedZeroMatch]; c != tc.wantCanary {
+				t.Errorf("%s=%v, want %v", MetricRevocationTargetedZeroMatch, c, tc.wantCanary)
+			}
+		})
+	}
+}
+
 // --- backpressure ----------------------------------------------------------
 
 func TestInternalRevocation_BackpressureReturns503(t *testing.T) {

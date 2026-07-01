@@ -193,6 +193,24 @@ func (hs *HttpServer) handleInternalRevocation(ctx *gin.Context) {
 	// no-op). AddCounterWithDims is nil-safe.
 	hs.udpServer.metrics.AddCounterWithDims(MetricRevocationFanoutSent, float64(sent), nil)
 
+	// Targeted-zero-match canary (#2790). A targeted event reaching here is
+	// provably complete (the incomplete-targeted gate 400'd above), so it NAMED a
+	// specific AC set; a non-empty set matching zero connected ACs here is the
+	// exact shape a cross-repo target_ac_ids↔ACConn.ACId identifier drift would
+	// produce (a silent, fail-open no-op today). Count it so the drift is
+	// observable — the counter is the signal, alarmed on the fleet-wide aggregate
+	// (see MetricRevocationTargetedZeroMatch). The log is DEBUG, not Info: a
+	// single-server zero-match is expected when the named ACs are on sibling
+	// servers, so once targeted fanout is enabled ~N-1 servers would emit this per
+	// revoke — and the "applied" Info line below already records fanout=targeted
+	// acs_targeted=0. Debug keeps the drift breadcrumb for deep triage without
+	// amplifying Info volume at enable time.
+	if evt.FanoutMode == revocationFanoutTargeted && len(evt.TargetACIDs) > 0 && len(conns) == 0 {
+		hs.udpServer.metrics.IncrCounter(MetricRevocationTargetedZeroMatch)
+		log.Debug("internal revocation targeted fanout matched zero connected ACs on this server (identifier-space drift canary #2790): scope=%q eventId=%q targets=%d — expected when the named ACs are on sibling servers; alarm on the fleet-wide %s rate",
+			evt.Scope, evt.EventID, len(evt.TargetACIDs), MetricRevocationTargetedZeroMatch)
+	}
+
 	// Proof-of-delivery tracking (#2793): record a pending entry per targeted AC
 	// so the retry engine retransmits the NHP_REV until the AC acks (NHP_RVA)
 	// or it ages out to the degraded metric. No-op when the engine is disabled
@@ -210,7 +228,9 @@ func (hs *HttpServer) handleInternalRevocation(ctx *gin.Context) {
 	// At-least-once: ack 200 only AFTER the fanout has been enqueued for every
 	// matched AC. An empty match set (cell-wide with no connected ACs / targeted
 	// with no matching ACId here) is a legitimate success — nothing to flush on
-	// this server.
+	// this server. The targeted zero-match case is additionally counted above
+	// (MetricRevocationTargetedZeroMatch) so it is not silent, but it is still a
+	// 200 here: a single server holding none of the named ACs is expected.
 	log.Info("internal revocation applied: scope=%q fanout=%q acs_targeted=%d eventId=%q epoch=%d",
 		evt.Scope, evt.FanoutMode, sent, evt.EventID, evt.RevocationEpoch)
 	ctx.JSON(http.StatusOK, gin.H{"status": "accepted", "acs_targeted": sent})

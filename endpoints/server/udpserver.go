@@ -1614,9 +1614,11 @@ func (s *UdpServer) snapshotAllACConnections() []*ACConn {
 //     slots), via snapshotAllACConnections (the same snapshot the NHP_ARD drain
 //     uses).
 //   - targeted: only connections whose ACId is in targetACIDs. ACConn.ACId is
-//     the AC's configured id string, the SAME identifier space qurl-service
-//     records in a session's admitted_ac_ids and copies into target_ac_ids
-//     (verified cross-repo); an empty targetACIDs therefore matches nothing.
+//     the AC's configured id string, the identifier space qurl-service is
+//     EXPECTED to record in a session's admitted_ac_ids and copy into
+//     target_ac_ids — a cross-repo string-equality contract NOT yet proven
+//     end-to-end (#2790), which is why the caller emits a zero-match canary. An
+//     empty targetACIDs therefore matches nothing.
 //
 // The returned slice holds *ACConn pointers the caller reads lock-free.
 // fanoutMode is assumed pre-validated by the handler (revocationFanoutTargeted /
@@ -1625,7 +1627,11 @@ func (s *UdpServer) snapshotAllACConnections() []*ACConn {
 //
 // An empty result is a legitimate success case (cell-wide with no connected
 // ACs, or targeted with no matching ACId on this server): there is simply
-// nothing to flush here. The caller treats it as "nothing to do," not an error.
+// nothing to flush here. The caller treats it as "nothing to do," not an error —
+// but for a targeted event the caller (handleInternalRevocation) counts this case
+// via MetricRevocationTargetedZeroMatch (#2790) so a zero match is observable
+// instead of silent, since that is the shape a cross-repo target_ac_ids↔ACId
+// identifier drift would take.
 func (s *UdpServer) findACConnectionsForRevocation(fanoutMode string, targetACIDs []string) []*ACConn {
 	switch fanoutMode {
 	case revocationFanoutCellWide:

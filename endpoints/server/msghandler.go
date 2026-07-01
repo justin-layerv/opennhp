@@ -359,6 +359,44 @@ const (
 	MetricRevocationReceived           = "RevocationReceived"
 	MetricRevocationFanoutSent         = "RevocationFanoutSent"
 	MetricRevocationFanoutBackpressure = "RevocationFanoutBackpressure"
+	// MetricRevocationTargetedZeroMatch counts targeted revocation events that
+	// named a non-empty target_ac_ids set but matched ZERO connected ACs on this
+	// server (#2790). It turns a formerly-silent no-op into a countable signal so
+	// a cross-repo identifier-space drift is observable: target_ac_ids is matched
+	// by string equality against ACConn.ACId, and if qurl-service ever changes
+	// what it stores in a session's admitted_ac_ids (a pubkey hash, a DB row id, a
+	// blue/green-suffixed id, a re-normalized form) targeted fanout silently
+	// matches nothing and FAILS OPEN — the lost NHP_REV leaves the AC entry to
+	// natural expiry with no error surfaced.
+	//
+	// READ THIS AS A FLEET-WIDE CANARY, NOT A PER-SERVER ERROR. An AC holds one
+	// server connection per blue/green slot, so a targeted revoke naming ACs that
+	// live on sibling servers legitimately zero-matches here — a nonzero count on
+	// any single server is expected. The drift signal is the fleet-wide shape: if
+	// the identifier contract holds, every targeted revoke matches on at least one
+	// server so fleet RevocationFanoutSent stays > 0; on drift EVERY server
+	// zero-matches, fleet targeted RevocationFanoutSent collapses to 0, and this
+	// counter rises to ~100% of targeted events. Until qurl-service enables
+	// targeted fanout (cell-wide only today) this path is inert, so any nonzero
+	// value before that cross-repo enable is itself a signal.
+	//
+	// Coverage boundary: this fires only when ALL named ids miss (len(conns)==0),
+	// the realistic all-or-nothing shape of a shared-convention drift. A PARTIAL
+	// intra-event drift — some target_ac_ids still match a live ACConn.ACId while
+	// others don't — leaves the match set non-empty, so this stays 0 and the
+	// drifted id's NHP_REV still fails open silently. That is a blind spot by
+	// construction, accepted because the id encoding is one shared convention (a
+	// subset drifting independently is not a realistic failure mode).
+	//
+	// Counted per DELIVERY attempt, not per unique event: qurl-service is
+	// at-least-once, so a retried event re-increments this on each zero-match
+	// server (RevocationFanoutSent re-fires on retry the same way). But the
+	// per-increment MAGNITUDES differ: this is +1 per zero-match EVENT, while
+	// RevocationFanoutSent is +N per event (N = ACs matched, via AddCounterWithDims).
+	// So read the drift as the two series' SHAPE — targeted RevocationFanoutSent
+	// collapsing to ~0 while this rises — NOT a literal zeroMatch/(zeroMatch+fanoutSent)
+	// division, which would mix events with AC-deliveries.
+	MetricRevocationTargetedZeroMatch = "RevocationTargetedZeroMatch"
 	// MetricRevocationAckReceived counts NHP_RVA acks the server received from
 	// ACs (proof-of-delivery, P4e Slice 3 #2793), one per validated ack whose
 	// AC identity resolved from the authenticated connection pubkey. Pairs with
