@@ -395,9 +395,13 @@ against the chosen instance type, co-decided under
 > That follow-up is tracked in
 > [nhp#2865](https://github.com/layervai/nhp/issues/2865).
 >
-> Before the E5 v6 XDP flip, verifier acceptance of the accumulated-offset
-> parser must also be re-run on the minimum supported AC kernel; that rollout
-> check is tracked in [nhp#2869](https://github.com/layervai/nhp/issues/2869).
+> Minimum-kernel verifier proof for the current E5 target floor was recorded
+> while closing [nhp#2869](https://github.com/layervai/nhp/issues/2869) in
+> [nhp#2941](https://github.com/layervai/nhp/pull/2941). Before the flip, re-run
+> the proof if the target AC AMI, active running kernel, instance architecture,
+> eBPF source, or pinned eBPF toolchain changes; if verifier acceptance
+> regresses, keep v6 XDP gated. The flip-time revalidation/hold obligation is
+> tracked in [nhp#2945](https://github.com/layervai/nhp/issues/2945).
 
 ### Fail-closed observability (`MetricEbpfMapFull`)
 
