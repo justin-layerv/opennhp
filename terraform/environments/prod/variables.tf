@@ -2020,3 +2020,63 @@ variable "relay_scale_requests_per_target" {
     error_message = "relay_scale_requests_per_target must be >= 50."
   }
 }
+
+# ==================== qURL v2 (keyed identity) ====================
+# Gates for qURL v2. All default false / empty (dark launch). Not set in prod
+# tfvars — prod stays dark until sandbox validation completes.
+variable "qurl_v2_issuer_key_enabled" {
+  description = "Provision the qURL v2 issuer signing KMS key and wire qurl-api issuer config + kms:Sign. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_resource_keys_enabled" {
+  description = "Enable qURL v2 per-resource KMS keys on qurl-api (tag-scoped create/reap). Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_issuance_enabled" {
+  description = "Enable qURL v2 link minting on qurl-api (requires issuer-key + resource-keys). Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_admission_enabled" {
+  description = "Enable the NHP server's qURL v2 signed-claims admission path + issuer trust store. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_issuer_kid" {
+  description = "Issuer key id (kid) stamped into signed claims and used as the NHP-server trust-store key. Required when issuance/admission are enabled."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_v2_issuer_kid == "" || can(regex("^[A-Za-z0-9._-]+$", var.qurl_v2_issuer_kid))
+    error_message = "qurl_v2_issuer_kid must be empty or contain only [A-Za-z0-9._-]."
+  }
+}
+
+variable "qurl_v2_relay_url" {
+  description = "qURL v2 relay endpoint embedded in signed claims (HTTPS, on the allowlist). Required when qurl_v2_issuance_enabled = true."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_v2_relay_url == "" || can(regex("^https://", var.qurl_v2_relay_url))
+    error_message = "qurl_v2_relay_url must be empty or an https:// URL."
+  }
+}
+
+variable "qurl_v2_relay_allowlist" {
+  description = "Comma-separated host[:port] allowlist for qURL v2 relay_url. Required when qurl_v2_issuer_key_enabled = true."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_v2_relay_allowlist == "" || can(regex("^[A-Za-z0-9.:_-]+(,[A-Za-z0-9.:_-]+)*$", var.qurl_v2_relay_allowlist))
+    error_message = "qurl_v2_relay_allowlist must be empty or a comma-separated list of host[:port] entries (no spaces or scheme)."
+  }
+}

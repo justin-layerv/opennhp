@@ -455,6 +455,25 @@ variable "qurl_config" {
   }
 }
 
+# qURL v2 admission (NHP-server side of the NHP Server Contract). The qURL plugin
+# on the NHP server independently verifies qv2 signed claims against this trust
+# store before calling qurl-service's admission endpoints. Both default to the
+# "off" shape so the plugin's LoadConfig stays satisfied (the trust store is only
+# required when admission is enabled). The root module computes the trust store
+# from the issuer KMS key's public half; enabling is coordinated with
+# qurl-service's QURL_V2_ISSUANCE_ENABLED.
+variable "qurl_v2_admission_enabled" {
+  description = "Enable the NHP server's qURL v2 signed-claims admission path (QURL_V2_ADMISSION_ENABLED). Requires a non-empty qurl_v2_issuer_trust_store. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_issuer_trust_store" {
+  description = "JSON {kid: base64(DER SPKI P-256 issuer public key)} for QURL_V2_ISSUER_TRUST_STORE. Computed by the root module from the issuer KMS key's public key. Default \"{}\" (no issuers) when admission is off."
+  type        = string
+  default     = "{}"
+}
+
 variable "qurl_service_token_secret_arn" {
   description = "ARN of Secrets Manager secret containing the QURL service token for API authentication"
   type        = string

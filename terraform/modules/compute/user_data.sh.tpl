@@ -1056,6 +1056,16 @@ QURL_API_TIMEOUT=${qurl_api_timeout}
 QURL_MAX_IDLE_CONNS=${qurl_max_idle_conns}
 QURL_MAX_IDLE_CONNS_PER_HOST=${qurl_max_idle_conns_per_host}
 QURL_IDLE_CONN_TIMEOUT=${qurl_idle_conn_timeout}
+%{ if qurl_v2_admission_enabled ~}
+# qURL v2 admission (NHP-server independent verifier). Rendered only when admission
+# is enabled, so an off env's user_data is byte-unchanged (no fleet roll until the
+# coordinated enable). The trust store value is base64-encoded (base64encode() in the
+# compute module; the qURL plugin's LoadConfig decodes it), so the JSON survives both
+# the systemd EnvironmentFile= and docker --env-file reads of this file intact with no
+# quote-handling dependency. Same transport pattern as NHP_COOKIE_KEYS below.
+QURL_V2_ADMISSION_ENABLED=true
+QURL_V2_ISSUER_TRUST_STORE=${qurl_v2_issuer_trust_store}
+%{ endif ~}
 %{ endif ~}
 %{ if cloudfront_cidrs_ssm_parameter != null ~}
 NHP_TRUSTED_PROXY_CIDRS=$CF_CIDRS

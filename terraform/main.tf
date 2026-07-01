@@ -267,6 +267,98 @@ module "kms" {
   environment = var.environment
   name_prefix = local.name_prefix
   tags        = local.common_tags
+
+  qurl_v2_issuer_key_enabled = var.qurl_v2_issuer_key_enabled
+}
+
+# qURL v2 issuer public key (base64 DER SPKI) read from the provisioned issuer KMS
+# key, so the NHP server's trust store is computed in Terraform with no manual key
+# handling. Gated on admission_enabled too (not just the key): its only consumer is
+# the trust-store local below, which needs it only when admission is on — so the
+# kms:GetPublicKey read (and the apply role's permission to make it) is deferred to
+# the coordinated enable rather than this staging apply.
+data "aws_kms_public_key" "qurl_v2_issuer" {
+  count  = local.qurl_v2_admission_ready ? 1 : 0
+  key_id = module.kms.qurl_v2_issuer_key_arn
+}
+
+locals {
+  # True when the NHP server should actually load a v2 issuer trust store: admission
+  # on, the issuer key provisioned, and a kid to key it by. Single source for both
+  # the data-source read gate and the trust-store computation so the two can't drift.
+  qurl_v2_admission_ready = var.qurl_v2_admission_enabled && var.qurl_v2_issuer_key_enabled && var.qurl_v2_issuer_kid != ""
+
+  # QURL_V2_ISSUER_TRUST_STORE for the NHP server: {kid: base64(DER SPKI issuer
+  # public key)}. aws_kms_public_key.public_key is already base64 DER SPKI — the
+  # exact value shape LoadV2TrustStore expects. "{}" until ready so the qURL plugin's
+  # LoadConfig stays satisfied while the feature is dark. The flag-invariants
+  # precondition below turns "admission on but kid/key missing" into a plan error, so
+  # live admission never silently ships an empty "{}" store.
+  qurl_v2_issuer_trust_store = (
+    local.qurl_v2_admission_ready
+    ? jsonencode({ (var.qurl_v2_issuer_kid) = data.aws_kms_public_key.qurl_v2_issuer[0].public_key })
+    : "{}"
+  )
+
+  # KMS keys the per-resource-key policy must explicitly Deny destructive actions on:
+  # the account encryption CMKs (ebs/efs/secrets/logs/rds) + the issuer key. compact()
+  # drops the issuer ARN when its key isn't provisioned (null). Threaded to
+  # module.qurl_service.
+  #
+  # EXHAUSTIVENESS is load-bearing and NOT yet complete: the Deny is an enumerated
+  # list, so any OTHER root-delegating KMS key in this account (key policy grants kms:*
+  # to the account root, so identity IAM alone authorizes destructive actions) that is
+  # not listed stays reachable via the TagResource(*) -> ScheduleKeyDeletion path once
+  # resource-keys is enabled. Known gap: the out-of-band Terraform state CMK
+  # (alias/terraform-state, root-delegating, unmanaged here) is NOT listed. The
+  # exhaustive fix (an SCP that doesn't depend on app-maintained enumeration) is
+  # tracked in #2990; the #2984 ledger gates enabling qurl_v2_resource_keys_enabled on
+  # it. Adding a new root-delegating CMK elsewhere silently reopens the gap until then.
+  qurl_v2_resource_key_protected_kms_arns = compact([
+    module.kms.ebs_key_arn,
+    module.kms.efs_key_arn,
+    module.kms.secrets_key_arn,
+    module.kms.logs_key_arn,
+    module.kms.rds_key_arn,
+    module.kms.qurl_v2_issuer_key_arn,
+  ])
+}
+
+# Fail-closed plan-time guard on the qURL v2 flag invariants. Turns the highest-
+# consequence misconfigurations — admission on with no trust store (every qv2 knock
+# denies), or issuance on without its prerequisites (createQurl mints unadmittable
+# links) — into a hard plan error instead of a silent runtime failure one deploy
+# later. qurl-service's own Config.Validate is the runtime backstop; this fires
+# ~one deploy earlier, at plan.
+resource "terraform_data" "qurl_v2_flag_invariants" {
+  lifecycle {
+    precondition {
+      condition     = !var.qurl_v2_admission_enabled || (var.qurl_v2_issuer_key_enabled && var.qurl_v2_issuer_kid != "")
+      error_message = "qurl_v2_admission_enabled requires qurl_v2_issuer_key_enabled = true and a non-empty qurl_v2_issuer_kid (else the NHP-server trust store is \"{}\" and every qv2 admission denies)."
+    }
+    precondition {
+      condition     = !var.qurl_v2_issuance_enabled || (var.qurl_v2_issuer_key_enabled && var.qurl_v2_resource_keys_enabled)
+      error_message = "qurl_v2_issuance_enabled requires qurl_v2_issuer_key_enabled and qurl_v2_resource_keys_enabled."
+    }
+    precondition {
+      # issuance + admission must flip together: minting v2 links (issuance) while the
+      # NHP server has no issuer in its trust store (admission off => "{}") means every
+      # knock denies. The reverse (admission on, issuance off) is harmless, so only this
+      # direction is enforced.
+      condition     = !var.qurl_v2_issuance_enabled || var.qurl_v2_admission_enabled
+      error_message = "qurl_v2_issuance_enabled requires qurl_v2_admission_enabled (else minted qv2 links have no issuer in the NHP-server trust store and every knock denies)."
+    }
+    precondition {
+      # Relay values are required by qurl-service Config.Validate at boot; assert their
+      # presence here too so a missing value fails one deploy earlier, at plan.
+      condition     = !var.qurl_v2_issuance_enabled || var.qurl_v2_relay_url != ""
+      error_message = "qurl_v2_issuance_enabled requires a non-empty qurl_v2_relay_url (embedded as relay_url in signed claims)."
+    }
+    precondition {
+      condition     = !var.qurl_v2_issuer_key_enabled || var.qurl_v2_relay_allowlist != ""
+      error_message = "qurl_v2_issuer_key_enabled requires a non-empty qurl_v2_relay_allowlist (the issuer's relay_url allowlist)."
+    }
+  }
 }
 
 # Plugins Module - Unified S3 bucket for NHP Server and Traefik plugins
@@ -576,6 +668,11 @@ module "compute" {
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
+
+  # qURL v2 admission (NHP-server independent verifier). Trust store computed
+  # above from the issuer KMS key; both are the "off" shape until enabled.
+  qurl_v2_admission_enabled  = var.qurl_v2_admission_enabled
+  qurl_v2_issuer_trust_store = local.qurl_v2_issuer_trust_store
 
   # Shared HMAC secret; seed ordering enforced via depends_on below.
   nhp_internal_auth_secret_arn = aws_secretsmanager_secret.nhp_internal_auth.arn
@@ -2766,6 +2863,20 @@ module "qurl_service" {
   #    the intended path). Module-level dep is therefore the right trade-off
   #    here; future maintainers should not try to "tighten" without also
   #    revisiting that invariant.
+  # qURL v2 issuance: issuer signing key (from module.kms) + per-resource keys +
+  # minting. issuer_key_arn is empty unless the key is provisioned; kid / relay /
+  # allowlist drive the signed claims. Each capability is gated by its own flag in
+  # the module; enabling issuance is coordinated with the NHP-server admission flip.
+  qurl_v2_issuer_key_enabled    = var.qurl_v2_issuer_key_enabled
+  qurl_v2_resource_keys_enabled = var.qurl_v2_resource_keys_enabled
+  qurl_v2_issuance_enabled      = var.qurl_v2_issuance_enabled
+  qurl_v2_issuer_key_arn        = var.qurl_v2_issuer_key_enabled ? module.kms.qurl_v2_issuer_key_arn : ""
+  qurl_v2_issuer_kid            = var.qurl_v2_issuer_kid
+  qurl_v2_relay_url             = var.qurl_v2_relay_url
+  qurl_v2_relay_allowlist       = var.qurl_v2_relay_allowlist
+  # Explicit-Deny targets for the per-resource-key policy (encryption CMKs + issuer).
+  qurl_v2_resource_key_protected_kms_arns = local.qurl_v2_resource_key_protected_kms_arns
+
   depends_on = [
     terraform_data.nhp_internal_auth_seed,
     module.bootstrap_alb,

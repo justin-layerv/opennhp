@@ -160,6 +160,10 @@ DATA_SOURCE_ACTIONS: dict[str, DataSourceActions] = {
     "aws_secretsmanager_secret_version": ["secretsmanager:GetSecretValue"],
     # internal/service/ssm/parameter_data_source.go calls ssm:GetParameter.
     "aws_ssm_parameter": ["ssm:GetParameter"],
+    # internal/service/kms/public_key_data_source.go calls kms:GetPublicKey
+    # (GetPublicKey on the key id). The github_actions role already grants
+    # kms:Get* which covers this via IAM glob.
+    "aws_kms_public_key": ["kms:GetPublicKey"],
 }
 
 # The canonical `nhp-${env}-github-actions` role is declared in

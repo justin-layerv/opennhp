@@ -331,3 +331,54 @@ resource "aws_kms_alias" "rds" {
   name          = "alias/${var.name_prefix}-rds"
   target_key_id = aws_kms_key.rds.key_id
 }
+
+# ==================== qURL v2 Issuer Signing Key (#2769) ====================
+# Asymmetric ECDSA P-256 SIGN_VERIFY key. qurl-service signs qURL v2 bootstrap
+# claims with it (kms:Sign, EcdsaSha256), and its PUBLIC half seeds BOTH the
+# qurl-service admission verifier and the NHP server's QURL_V2_ISSUER_TRUST_STORE
+# (fetched via kms:GetPublicKey / data.aws_kms_public_key). SIGN_VERIFY +
+# ECC_NIST_P256 is the exact algorithm the qurlv2 signer and both independent
+# verifiers are pinned to (raw r||s, low-S, SHA-256).
+#
+# Gated on qurl_v2_issuer_key_enabled so envs that haven't begun the v2 rollout
+# create no key. Rotation is intentionally manual: KMS does not auto-rotate
+# asymmetric keys, and the `kid` embedded in the signed claims binds a specific
+# key — rotating means minting a new key + adding it to the verifiers' trust
+# stores, never an in-place swap. The task role gets kms:Sign/GetPublicKey via
+# an IAM policy in the qurl-service module (root-account delegation in the key
+# policy lets IAM grant it), matching how the encryption keys here are consumed.
+resource "aws_kms_key" "qurl_v2_issuer" {
+  count = var.qurl_v2_issuer_key_enabled ? 1 : 0
+
+  description              = "NHP ${var.environment} - qURL v2 issuer signing key (ECDSA P-256)"
+  key_usage                = "SIGN_VERIFY"
+  customer_master_key_spec = "ECC_NIST_P256"
+  deletion_window_in_days  = local.is_prod ? 30 : 7
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EnableRootAccount"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action   = "kms:*"
+        Resource = "*"
+      },
+    ]
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-kms-qurl-v2-issuer"
+    Component = "kms"
+    Purpose   = "qURL v2 issuer signing"
+  })
+}
+
+resource "aws_kms_alias" "qurl_v2_issuer" {
+  count         = var.qurl_v2_issuer_key_enabled ? 1 : 0
+  name          = "alias/${var.name_prefix}-qurl-v2-issuer"
+  target_key_id = aws_kms_key.qurl_v2_issuer[0].key_id
+}

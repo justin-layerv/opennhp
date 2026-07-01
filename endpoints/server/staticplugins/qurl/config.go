@@ -1,6 +1,7 @@
 package qurl
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -104,8 +105,16 @@ type Config struct {
 	// V2IssuerTrustStoreJSON is the qURL v2 issuer trust store: a JSON object
 	// mapping issuer kid -> base64(DER SPKI P-256 public key). It is REQUIRED
 	// when V2AdmissionEnabled is true (the admission path fails closed without
-	// it) and ignored when the flag is off. Environment variable:
-	// QURL_V2_ISSUER_TRUST_STORE.
+	// it) and ignored when the flag is off.
+	//
+	// WIRE ENCODING: the QURL_V2_ISSUER_TRUST_STORE environment variable is
+	// base64-encoded with standard, PADDED base64 — Terraform's base64encode() emits
+	// padded std base64, and LoadConfig decodes with base64.StdEncoding, so the two
+	// must stay on the same alphabet (do NOT switch either to RawStdEncoding). The
+	// JSON's quotes/braces don't survive the server env file cleanly, which is
+	// consumed as BOTH a systemd EnvironmentFile= and a docker --env-file. LoadConfig
+	// base64-decodes it, so this field always holds the raw JSON. Mirrors the
+	// NHP_COOKIE_KEYS transport pattern (terraform/modules/compute/user_data.sh.tpl).
 	V2IssuerTrustStoreJSON string
 }
 
@@ -123,6 +132,19 @@ func LoadConfig() (*Config, error) {
 		IdleConnTimeout:        getEnvInt("QURL_IDLE_CONN_TIMEOUT"),
 		V2AdmissionEnabled:     getEnvBool("QURL_V2_ADMISSION_ENABLED"),
 		V2IssuerTrustStoreJSON: os.Getenv("QURL_V2_ISSUER_TRUST_STORE"),
+	}
+
+	// QURL_V2_ISSUER_TRUST_STORE is transported base64-encoded (see the field's WIRE
+	// ENCODING note); decode it to the raw JSON the rest of the plugin expects. A
+	// non-base64 value is a hard error so a misencoded deploy fails fast at boot
+	// rather than denying every qv2 knock at runtime. Empty (unset) stays empty —
+	// validateConfig rejects that only when admission is enabled.
+	if cfg.V2IssuerTrustStoreJSON != "" {
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(cfg.V2IssuerTrustStoreJSON))
+		if err != nil {
+			return nil, fmt.Errorf("QURL_V2_ISSUER_TRUST_STORE must be base64-encoded JSON: %w", err)
+		}
+		cfg.V2IssuerTrustStoreJSON = string(decoded)
 	}
 
 	if err := validateConfig(cfg); err != nil {

@@ -91,7 +91,7 @@ func TestLoadConfig_V2Flag(t *testing.T) {
 	t.Run("enabled with trust store", func(t *testing.T) {
 		setBaseEnv(t)
 		t.Setenv("QURL_V2_ADMISSION_ENABLED", "true")
-		t.Setenv("QURL_V2_ISSUER_TRUST_STORE", p256TrustStoreJSON(t, "kid-1"))
+		t.Setenv("QURL_V2_ISSUER_TRUST_STORE", base64.StdEncoding.EncodeToString([]byte(p256TrustStoreJSON(t, "kid-1"))))
 		cfg, err := LoadConfig()
 		if err != nil {
 			t.Fatalf("LoadConfig: %v", err)
@@ -118,7 +118,7 @@ func TestLoadConfig_V2Flag(t *testing.T) {
 		for _, v := range []string{"1", "true", "TRUE", "yes", "on"} {
 			setBaseEnv(t)
 			t.Setenv("QURL_V2_ADMISSION_ENABLED", v)
-			t.Setenv("QURL_V2_ISSUER_TRUST_STORE", p256TrustStoreJSON(t, "kid-1"))
+			t.Setenv("QURL_V2_ISSUER_TRUST_STORE", base64.StdEncoding.EncodeToString([]byte(p256TrustStoreJSON(t, "kid-1"))))
 			cfg, err := LoadConfig()
 			if err != nil {
 				t.Fatalf("LoadConfig(%q): %v", v, err)

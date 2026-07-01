@@ -47,3 +47,18 @@ output "rds_key_id" {
   description = "ID of KMS key for RDS encryption"
   value       = aws_kms_key.rds.key_id
 }
+
+output "qurl_v2_issuer_key_arn" {
+  description = "ARN of the qURL v2 issuer signing key (ECDSA P-256); null when qurl_v2_issuer_key_enabled = false"
+  value       = one(aws_kms_key.qurl_v2_issuer[*].arn)
+}
+
+output "qurl_v2_issuer_key_id" {
+  description = "ID of the qURL v2 issuer signing key; null when not provisioned"
+  value       = one(aws_kms_key.qurl_v2_issuer[*].key_id)
+}
+
+output "qurl_v2_issuer_key_alias" {
+  description = "Alias name of the qURL v2 issuer signing key; null when not provisioned"
+  value       = one(aws_kms_alias.qurl_v2_issuer[*].name)
+}

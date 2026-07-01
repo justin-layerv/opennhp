@@ -858,6 +858,14 @@ locals {
     qurl_max_idle_conns_per_host  = var.qurl_config != null ? var.qurl_config.max_idle_conns_per_host : 5
     qurl_idle_conn_timeout        = var.qurl_config != null ? var.qurl_config.idle_conn_timeout : 30
     qurl_service_token_secret_arn = var.qurl_service_token_secret_arn != null ? var.qurl_service_token_secret_arn : ""
+    # qURL v2 admission (NHP-server independent verifier). admission_enabled is a
+    # bool gating whether the env block renders at all — an off env's user_data is
+    # byte-unchanged, so this PR triggers no fleet roll until the coordinated enable.
+    # The trust store JSON is base64-encoded for env-file transport (the JSON's quotes
+    # would otherwise depend on systemd-vs-docker env-file quote handling); the qURL
+    # plugin's LoadConfig base64-decodes it. Mirrors NHP_COOKIE_KEYS in this template.
+    qurl_v2_admission_enabled  = var.qurl_v2_admission_enabled
+    qurl_v2_issuer_trust_store = base64encode(var.qurl_v2_issuer_trust_store)
     # Blue/Green deployment configuration
     enable_blue_green = var.enable_blue_green
     # Cookie signing secret (shared across all instances)

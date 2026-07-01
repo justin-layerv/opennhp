@@ -502,6 +502,36 @@ locals {
       { name = "OTEL_TRACING_ENABLED", value = var.otel_tracing_enabled ? "true" : "false" },
       { name = "OTEL_LOG_CORRELATION", value = var.otel_log_correlation ? "true" : "false" },
     ] : [],
+
+    # ==================== qURL v2 (keyed identity) ====================
+    # Each block is emitted only when its flag is set, so the qurl-service v2
+    # config validators (which require the companion values only when a flag is
+    # on) stay satisfied and v1 behavior is byte-identical when off. The flags
+    # have a dependency order enforced by qurl-service's own boot-time
+    # Config.Validate (fail-closed): issuance requires issuer-key + resource-keys.
+    # Turning these on is a coordinated cross-service flip with the NHP server's
+    # QURL_V2_ADMISSION_ENABLED (compute module).
+    #
+    # SERVICE_ROLE_ARN / ACCOUNT_ROOT_ARN are this task's own role and the account
+    # root: qurl-service stamps them into the key policy of every per-resource KMS
+    # key it mints at runtime (GetPublicKey + admin; kms:Sign withheld from all).
+    var.qurl_v2_resource_keys_enabled ? [
+      { name = "QURL_V2_RESOURCE_KEYS_ENABLED", value = "true" },
+      { name = "QURL_V2_RESOURCE_KEY_SERVICE_ROLE_ARN", value = aws_iam_role.task.arn },
+      { name = "QURL_V2_RESOURCE_KEY_ACCOUNT_ROOT_ARN", value = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" },
+    ] : [],
+    var.qurl_v2_issuer_key_enabled ? [
+      { name = "QURL_V2_ISSUER_KEY_ENABLED", value = "true" },
+      { name = "QURL_V2_ISSUER_KEY_ARN", value = var.qurl_v2_issuer_key_arn },
+      { name = "QURL_V2_ISSUER_KEY_KID", value = var.qurl_v2_issuer_kid },
+      { name = "QURL_V2_ISSUER_KEY_SERVICE_ROLE_ARN", value = aws_iam_role.task.arn },
+      { name = "QURL_V2_ISSUER_KEY_ACCOUNT_ROOT_ARN", value = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" },
+      { name = "QURL_V2_RELAY_ALLOWLIST", value = var.qurl_v2_relay_allowlist },
+    ] : [],
+    var.qurl_v2_issuance_enabled ? [
+      { name = "QURL_V2_ISSUANCE_ENABLED", value = "true" },
+      { name = "QURL_V2_RELAY_URL", value = var.qurl_v2_relay_url },
+    ] : [],
   )
 
   # Secrets and SSM parameters resolved by ECS at task launch time.
@@ -707,6 +737,115 @@ resource "aws_iam_role_policy" "task_dynamodb" {
         Resource = [var.secrets_kms_key_arn]
       }] : [],
     )
+  })
+}
+
+# qURL v2 issuer signing — kms:Sign on the single terraform-provisioned issuer
+# key (module.kms.qurl_v2_issuer_key_arn). Scoped to exactly that ARN. Gated on
+# the issuer-key flag AND a non-empty ARN so a half-configured env grants nothing.
+resource "aws_iam_role_policy" "task_qurl_v2_issuer_signing" {
+  # count keys on the flag only: the ARN comes from module.kms (known after
+  # apply), so a `!= ""` test here would make count unresolvable at plan time
+  # ("Invalid count argument"). The root always passes the real ARN when the flag
+  # is on, and the variable validation pins its format.
+  count = var.qurl_v2_issuer_key_enabled ? 1 : 0
+  name  = "qurl-v2-issuer-signing"
+  role  = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "QurlV2IssuerSign"
+      Effect = "Allow"
+      Action = [
+        "kms:Sign",
+        "kms:GetPublicKey",
+        "kms:DescribeKey",
+      ]
+      Resource = [var.qurl_v2_issuer_key_arn]
+    }]
+  })
+}
+
+# qURL v2 per-resource keys — qurl-service mints a KMS key per protected resource
+# at runtime, tag-scoped to keys it stamps with purpose=qurl-v2-resource-key
+# (internal/resourcekey/kms_provider.go keyTags). Three statements:
+#   1. Create    — kms:CreateKey + kms:TagResource, gated on aws:RequestTag.
+#   2. Lifecycle — GetPublicKey/DescribeKey/ScheduleKeyDeletion on tagged keys.
+#   3. Deny      — explicit Deny on the encryption CMKs + issuer key.
+# Statement 1's kms:TagResource is necessarily Resource="*" (a not-yet-created key
+# has no ARN), so on its own it could tag an EXISTING key — e.g. an encryption CMK —
+# with the magic tag, and statement 2 (aws:ResourceTag-scoped) would then authorize
+# ScheduleKeyDeletion on it. Those CMK key policies delegate to the account root, so
+# identity IAM alone suffices; statement 3 closes that escalation (an explicit Deny
+# beats any Allow). No alias/PutKeyPolicy actions: the provider sets each key's
+# policy inline at CreateKey and creates no KMS alias (the rk_ id is a DB display
+# field). Note the "per-resource keys never get kms:Sign" guarantee is enforced by
+# the key policy kms_provider.go stamps at CreateKey, NOT by this IAM policy — an
+# IAM reader alone cannot prove it; keep the two in lockstep if the provider changes.
+resource "aws_iam_role_policy" "task_qurl_v2_resource_keys" {
+  count = var.qurl_v2_resource_keys_enabled ? 1 : 0
+  name  = "qurl-v2-resource-keys"
+  role  = aws_iam_role.task.id
+
+  # Statement 3 (the Deny) is a required safety guard, not optional hardening —
+  # refuse to create a Deny-less version of this policy if the protected-key ARNs
+  # weren't threaded in from the root.
+  lifecycle {
+    precondition {
+      condition     = length(var.qurl_v2_resource_key_protected_kms_arns) > 0
+      error_message = "qurl_v2_resource_key_protected_kms_arns must be non-empty when resource keys are enabled (the Deny on the encryption CMKs + issuer key is required)."
+    }
+  }
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # CreateKey has no pre-existing ARN to scope to; aws:RequestTag forces the
+        # identifying tag at creation so the lifecycle statement below binds to
+        # exactly these keys. kms:TagResource is required alongside kms:CreateKey
+        # to apply tags atomically in the CreateKey request.
+        Sid      = "QurlV2ResourceKeyCreate"
+        Effect   = "Allow"
+        Action   = ["kms:CreateKey", "kms:TagResource"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "aws:RequestTag/purpose" = "qurl-v2-resource-key" }
+        }
+      },
+      {
+        # Read/reap ONLY keys qurl-service tagged. GetPublicKey seeds the AC ECDH
+        # resource identity; ScheduleKeyDeletion reaps orphaned/rotated keys (KMS
+        # enforces a 7-30d pending window, so readers are never broken).
+        Sid    = "QurlV2ResourceKeyLifecycle"
+        Effect = "Allow"
+        Action = [
+          "kms:GetPublicKey",
+          "kms:DescribeKey",
+          "kms:ScheduleKeyDeletion",
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/purpose" = "qurl-v2-resource-key" }
+        }
+      },
+      {
+        # Explicit Deny on the encryption CMKs + issuer key (ARNs threaded from the
+        # root's module.kms outputs). Neutralises the TagResource -> ScheduleKeyDeletion
+        # escalation described in the resource-level comment; Deny overrides the
+        # root-delegated Allow those keys' policies grant.
+        Sid    = "QurlV2ResourceKeyDenyProtectedKeys"
+        Effect = "Deny"
+        Action = [
+          "kms:TagResource",
+          "kms:ScheduleKeyDeletion",
+          "kms:DisableKey",
+          "kms:PutKeyPolicy",
+        ]
+        Resource = var.qurl_v2_resource_key_protected_kms_arns
+      },
+    ]
   })
 }
 

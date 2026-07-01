@@ -1241,3 +1241,84 @@ variable "scanner_lambda_alarm_sns_topic_arn" {
     error_message = "scanner_lambda_alarm_sns_topic_arn must be empty or a standard SNS topic ARN (arn:aws:sns:<region>:<account>:<name>)."
   }
 }
+
+# ==================== qURL v2 (keyed identity) ====================
+# Feature gates for qURL v2 issuance. All default false (dark launch). Dependency
+# order is enforced fail-closed by qurl-service's own Config.Validate at boot:
+# issuance requires issuer-key + resource-keys, so flip them together in tfvars.
+
+variable "qurl_v2_issuer_key_enabled" {
+  description = "Emit QURL_V2_ISSUER_KEY_ENABLED + issuer key ARN/kid/role env on qurl-api and grant kms:Sign on the issuer key. Requires qurl_v2_issuer_key_arn. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_resource_keys_enabled" {
+  description = "Emit QURL_V2_RESOURCE_KEYS_ENABLED and grant the tag-scoped per-resource KMS create/reap policy so qurl-service mints a P-256 key per protected resource. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_issuance_enabled" {
+  description = "Emit QURL_V2_ISSUANCE_ENABLED + QURL_V2_RELAY_URL so createQurl mints v2 signed-claims links (and mounts the admission surface). Requires issuer-key + resource-keys enabled. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_issuer_key_arn" {
+  description = "ARN of the qURL v2 issuer signing KMS key (from module.kms.qurl_v2_issuer_key_arn). Required when qurl_v2_issuer_key_enabled = true."
+  type        = string
+  default     = ""
+
+  validation {
+    # arn:aws[a-z-]*: matches the aws / aws-us-gov / aws-cn partitions; key/[a-z0-9-]+
+    # accepts both UUID key ids and multi-Region key ids (mrk-...).
+    condition     = var.qurl_v2_issuer_key_arn == "" || can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-z0-9-]+$", var.qurl_v2_issuer_key_arn))
+    error_message = "qurl_v2_issuer_key_arn must be empty or a valid KMS key ARN."
+  }
+}
+
+variable "qurl_v2_issuer_kid" {
+  description = "Key id (kid) stamped into signed claims and used as the trust-store key on both verifiers. Must match the NHP server's QURL_V2_ISSUER_TRUST_STORE key. Required when qurl_v2_issuer_key_enabled = true."
+  type        = string
+  default     = ""
+
+  validation {
+    # The kid is both a JSON object key in the computed trust store and the
+    # QURL_V2_ISSUER_KEY_KID env value; a stray char (space, newline, =) would break
+    # signer/verifier kid matching -> ErrUnknownKID -> every admission denies. Pin it.
+    condition     = var.qurl_v2_issuer_kid == "" || can(regex("^[A-Za-z0-9._-]+$", var.qurl_v2_issuer_kid))
+    error_message = "qurl_v2_issuer_kid must be empty or contain only [A-Za-z0-9._-]."
+  }
+}
+
+variable "qurl_v2_relay_url" {
+  description = "Deployment relay endpoint embedded in signed claims as relay_url (HTTPS, must be on the relay allowlist). Required when qurl_v2_issuance_enabled = true."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_v2_relay_url == "" || can(regex("^https://", var.qurl_v2_relay_url))
+    error_message = "qurl_v2_relay_url must be empty or an https:// URL."
+  }
+}
+
+variable "qurl_v2_relay_allowlist" {
+  description = "Comma-separated host[:port] allowlist a qURL v2 relay_url may target (QURL_V2_RELAY_ALLOWLIST). Required when qurl_v2_issuer_key_enabled = true."
+  type        = string
+  default     = ""
+
+  validation {
+    # Comma-separated host[:port] tokens — no spaces and no scheme. Catches a
+    # fat-fingered "https://..." or space-separated value at plan time; qurl-service
+    # boot Config.Validate remains the authoritative parser.
+    condition     = var.qurl_v2_relay_allowlist == "" || can(regex("^[A-Za-z0-9.:_-]+(,[A-Za-z0-9.:_-]+)*$", var.qurl_v2_relay_allowlist))
+    error_message = "qurl_v2_relay_allowlist must be empty or a comma-separated list of host[:port] entries (no spaces or scheme)."
+  }
+}
+
+variable "qurl_v2_resource_key_protected_kms_arns" {
+  description = "KMS key ARNs the per-resource-key policy explicitly Denies destructive actions on (the account encryption CMKs + the issuer key), threaded from the root's module.kms outputs. Must be non-empty when qurl_v2_resource_keys_enabled = true — the Deny is a required safety guard, not optional hardening."
+  type        = list(string)
+  default     = []
+}

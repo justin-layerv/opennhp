@@ -1,6 +1,7 @@
 package qurl
 
 import (
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -652,4 +653,46 @@ func TestValidateCookieDomain(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoadConfig_V2IssuerTrustStoreBase64 covers the base64 wire transport of
+// QURL_V2_ISSUER_TRUST_STORE: LoadConfig base64-decodes the env value into the raw
+// JSON the rest of the plugin consumes, and fails closed on a non-base64 value.
+func TestLoadConfig_V2IssuerTrustStoreBase64(t *testing.T) {
+	const storeJSON = `{"qurl-issuer-sandbox-2026-07":"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE"}`
+
+	t.Run("valid base64 decodes to raw JSON", func(t *testing.T) {
+		setBaseEnvVars(t, baseEnvVars())
+		t.Setenv("QURL_V2_ADMISSION_ENABLED", "true")
+		t.Setenv("QURL_V2_ISSUER_TRUST_STORE", base64.StdEncoding.EncodeToString([]byte(storeJSON)))
+
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v, want nil", err)
+		}
+		if cfg.V2IssuerTrustStoreJSON != storeJSON {
+			t.Errorf("V2IssuerTrustStoreJSON = %q, want decoded JSON %q", cfg.V2IssuerTrustStoreJSON, storeJSON)
+		}
+	})
+
+	t.Run("non-base64 value is a hard error", func(t *testing.T) {
+		setBaseEnvVars(t, baseEnvVars())
+		t.Setenv("QURL_V2_ADMISSION_ENABLED", "true")
+		// Raw JSON contains {, ", :, } — none of which are in the base64 alphabet.
+		t.Setenv("QURL_V2_ISSUER_TRUST_STORE", storeJSON)
+
+		if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "must be base64-encoded JSON") {
+			t.Fatalf("LoadConfig() error = %v, want base64 decode error", err)
+		}
+	})
+
+	t.Run("admission enabled with empty store still fails closed", func(t *testing.T) {
+		setBaseEnvVars(t, baseEnvVars())
+		t.Setenv("QURL_V2_ADMISSION_ENABLED", "true")
+		t.Setenv("QURL_V2_ISSUER_TRUST_STORE", "")
+
+		if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "QURL_V2_ISSUER_TRUST_STORE is empty") {
+			t.Fatalf("LoadConfig() error = %v, want empty-store error", err)
+		}
+	})
 }
