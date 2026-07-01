@@ -1387,6 +1387,65 @@ resource "aws_dynamodb_table" "qurl_agent_keys" {
   })
 }
 
+# qurl-v2-admissions: qURL v2 admission hot-state (design Phase 3c). Holds two
+# row kinds under one (pk, sk) schema: qURL STATE rows (PK `QURL#<hash>`, SK
+# `STATE`) for liveness/lease/consume/use-ceiling, and SESSION rows
+# (PK `RESOURCE#<hash>`, SK `SESSION#<session_id>`) for steady-state re-knock
+# authorize. No GSIs — every access is primary-key (GetItem on a state row,
+# Query on a resource partition for sessions). DynamoDB TTL on `ttl`.
+#
+# Schema MUST mirror qurl-service#994's
+# `internal/repository/dynamodb/schema.go::TableQurlV2Admissions` exactly:
+# PK `pk` (S), SK `sk` (S), TTL attribute `ttl`, no GSIs. The qurl-service
+# schema reconciler runs DescribeTable against every registry entry every 60s;
+# this table being absent fails `/health/ready` and triggers an ECS deploy
+# rollback — so it is a hard prerequisite for any qurl-service deploy carrying
+# the v2 registry, even though v2 issuance/admission is gated off
+# (QURL_V2_ISSUANCE_ENABLED / QURL_V2_RESOURCE_KEYS_ENABLED default false).
+# Provisioning it empty is inert: v1/qv1 token+session rows live in
+# qurl-access-tokens / qurl-sessions and are byte-identical with the flag off.
+# See docs/design/QURL_V2_KEYED_IDENTITY.md (Persistent State).
+resource "aws_dynamodb_table" "qurl_v2_admissions" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-v2-admissions"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  range_key                   = "sk"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-v2-admissions"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "qURL v2 admission hot-state: qURL liveness + session rows"
+  })
+}
+
 # qurl-customers: Stores customer records for quota and billing
 # PK: auth0_subject (Auth0 user ID or "email:<sha256>" for bridge keys)
 resource "aws_dynamodb_table" "qurl_customers" {
