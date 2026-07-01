@@ -101,4 +101,7 @@ must update this list and audit all existing call sites.
   (live peer → key kept alive) and its deleted-peer counterpart
   `TestUdpAC_CancelAllScheduledFlows_DeletedHolderNotCountedKeyCanceled`
   (revoked/deleted peer → key Cancelled, the #2784 under-flush
-  behavioral fence).
+  behavioral fence). The end-to-end ApplyRevocation order fence is
+  `TestApplyRevocation_DeleteBeforeFlushOrderPreventsSiblingPushBack`,
+  which intentionally gates `flushEntryNow` on `e.mu` to observe the
+  post-delete/pre-flush window.

@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -447,6 +448,95 @@ func TestFlushEntryNow_StillFiresAfterTokenDeleted(t *testing.T) {
 	}
 }
 
+// TestApplyRevocation_DeleteBeforeFlushOrderPreventsSiblingPushBack fences the
+// #2784 order itself inside ApplyRevocation/deleteThenFlushEntry. The observable
+// bad interleaving is:
+//
+//  1. revoked entry A and sibling B share one FlowKey;
+//  2. ApplyRevocation for A reaches the delete/flush pair;
+//  3. B expires in the tiny window between A's deleteToken and flushEntryNow.
+//
+// With the required delete-before-flush order, B's cancelAllScheduledFlows
+// snapshot no longer sees A and must Cancel the shared key (EntryCount 0). If a
+// future edit reverses the order to flush-before-delete, this test blocks inside
+// flushEntryNow before A is deleted and times out waiting for the delete to
+// become visible, making the regression deterministic instead of timing-based.
+func TestApplyRevocation_DeleteBeforeFlushOrderPreventsSiblingPushBack(t *testing.T) {
+	a, flusher := newTestACWithScheduler(t)
+	const srcIP, dstIP, dstPort = "198.51.100.30", "203.0.113.30", 443
+	key := mustKey(t, srcIP, dstIP, dstPort, FlowProtoTCP)
+	const openSeconds = 600
+
+	entryA := qurlV2Entry("qOrderA", "rSharedOrder", "", "aOrderA")
+	entryB := qurlV2Entry("qOrderB", "rSharedOrder", "", "aOrderB")
+	entryA.OpenTime, entryB.OpenTime = openSeconds, openSeconds
+	tokA := a.GenerateAccessToken(entryA)
+	_ = a.GenerateAccessToken(entryB) // stored so B is live; never revoked
+
+	deadline := time.Now().Add(time.Duration(openSeconds) * time.Second)
+	a.scheduleFlushIfEnabled(entryA, srcIP, dstIP, dstPort, FlowProtoTCP, deadline)
+	a.scheduleFlushIfEnabled(entryB, srcIP, dstIP, dstPort, FlowProtoTCP, deadline)
+	if got := a.expirySched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1 (shared key absorbed by longest-wins)", got)
+	}
+
+	// Stress note: run this with -race/-count=N to re-check the deterministic
+	// interleave; the lock gate, not goroutine timing, is what makes it stable.
+	// Hold A's entry lock so delete-before-flush reaches deleteToken, then blocks
+	// when flushEntryNow tries to drain A's scheduled keys. A flush-before-delete
+	// regression blocks before the delete instead, and the wait below fails.
+	entryA.mu.Lock()
+	unlockA := sync.OnceFunc(entryA.mu.Unlock)
+	defer unlockA()
+
+	done := make(chan int, 1)
+	go func() {
+		done <- a.ApplyRevocation(scopeQurl, "qOrderA", 1)
+	}()
+
+	if !waitUntil(func() bool {
+		return len(a.revIndex.tokensFor(scopeQurl, "qOrderA")) == 0
+	}, 2*time.Second) {
+		unlockA()
+		select {
+		case <-done:
+			t.Fatal("ApplyRevocation finished without deindexing the revoked entry before entering flushEntryNow")
+		case <-time.After(2 * time.Second):
+			t.Fatal("ApplyRevocation stayed blocked before deindexing; delete-before-flush order likely regressed or deleteToken now waits on AccessEntry.mu")
+		}
+	}
+	if _, found := a.tokenStore.Load(tokA); found {
+		t.Fatal("revoked entry still in tokenStore after deindexing between deleteToken and flushEntryNow")
+	}
+
+	// Drive the sibling expiry while A's flush is still blocked in the
+	// post-delete/pre-flush window. A must be absent from B's tokenStore snapshot,
+	// so B cancels the shared scheduler entry rather than pushing it back to A's
+	// future deadline.
+	a.cancelAllScheduledFlows(entryB)
+	if got := a.expirySched.EntryCount(); got != 0 {
+		t.Fatalf("EntryCount after sibling expiry between delete and flush = %d, want 0; revoked entry was counted as a live holder and pushed the shared key back (#2784)", got)
+	}
+
+	unlockA()
+	select {
+	case n := <-done:
+		if n != 1 {
+			t.Fatalf("ApplyRevocation flushed %d, want 1", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ApplyRevocation did not finish after releasing the flushEntryNow gate")
+	}
+	// B canceled the shared scheduler entry above; A's flush must reinsert it
+	// via RescheduleEarlier before the flusher fires.
+	if !flusher.waitFor(1, 2*time.Second) {
+		t.Fatalf("revocation flush did not fire after releasing the gate; flusher saw %d", flusher.count())
+	}
+	if got := flusher.snapshotKeys(); len(got) != 1 || got[0] != key {
+		t.Fatalf("flushed wrong key after releasing gate: got %v want [%v]", got, key)
+	}
+}
+
 // TestUdpAC_CancelAllScheduledFlows_DeletedHolderNotCountedKeyCanceled fences the
 // behavioral claim of the #2784 under-flush fix (not just its enabling
 // off-pointer-drain invariant): once the revoked entry is removed from tokenStore
@@ -464,10 +554,9 @@ func TestFlushEntryNow_StillFiresAfterTokenDeleted(t *testing.T) {
 // this one asserts EntryCount 0.
 //
 // Scope: this drives the building blocks (deleteToken + cancelAllScheduledFlows)
-// directly to reconstruct the exact post-delete snapshot state — it does NOT call
-// ApplyRevocation / deleteThenFlushEntry end-to-end, and it does not fence the
-// deleteToken-vs-flushEntryNow ORDER itself (unobservable single-goroutine; see
-// the deleteThenFlushEntry godoc and #2896). What it fences is the
+// directly to reconstruct the exact post-delete snapshot state. The companion
+// TestApplyRevocation_DeleteBeforeFlushOrderPreventsSiblingPushBack fences the
+// ApplyRevocation/deleteThenFlushEntry order end-to-end; this test isolates the
 // snapshot-membership property that flip depends on.
 func TestUdpAC_CancelAllScheduledFlows_DeletedHolderNotCountedKeyCanceled(t *testing.T) {
 	a, _ := newTestACWithScheduler(t)
