@@ -129,11 +129,11 @@ func describeASGCapacity(t *testing.T, asgName string) (desired, minSize int32) 
 	return aws.ToInt32(g.DesiredCapacity), aws.ToInt32(g.MinSize)
 }
 
-// describeInstancePublicIPs returns a map from instance ID to the
-// public IP (EIP) currently associated with that instance. Instances
-// without an EIP are omitted from the map — the caller decides if
-// that's a failure.
-func describeInstancePublicIPs(t *testing.T, instanceIDs []string) map[string]string {
+// describeInstanceElasticIPs returns a map from instance ID to the
+// public EIP currently associated with that instance from the tagged
+// AC EIP pool. Instances with only an EC2 auto-assigned public IP are
+// omitted from the map because they are not safe stable egress IPs.
+func describeInstanceElasticIPs(t *testing.T, instanceIDs []string, tagKey, tagValue string) map[string]string {
 	t.Helper()
 	if len(instanceIDs) == 0 {
 		return map[string]string{}
@@ -142,21 +142,28 @@ func describeInstancePublicIPs(t *testing.T, instanceIDs []string) map[string]st
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	resp, err := testConfig.EC2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-		InstanceIds: instanceIDs,
+	resp, err := testConfig.EC2Client.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String("instance-id"),
+				Values: instanceIDs,
+			},
+			{
+				Name:   aws.String("tag:" + tagKey),
+				Values: []string{tagValue},
+			},
+		},
 	})
 	if err != nil {
-		t.Fatalf("describe instances %v: %v", instanceIDs, err)
+		t.Fatalf("describe addresses for instances %v tag:%s=%s: %v", instanceIDs, tagKey, tagValue, err)
 	}
 
 	out := make(map[string]string)
-	for _, r := range resp.Reservations {
-		for _, inst := range r.Instances {
-			if inst.InstanceId == nil || inst.PublicIpAddress == nil {
-				continue
-			}
-			out[*inst.InstanceId] = *inst.PublicIpAddress
+	for _, addr := range resp.Addresses {
+		if addr.InstanceId == nil || addr.PublicIp == nil {
+			continue
 		}
+		out[*addr.InstanceId] = *addr.PublicIp
 	}
 	return out
 }

@@ -219,29 +219,105 @@ AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest
 # Claim an unassociated EIP from the pool for stable egress IP.
 # Customers whitelist these IPs on their origin firewalls.
 # ============================================================================
+# Capped, jittered backoff between EIP claim attempts. The linear term is
+# capped so a deadline-bounded claim keeps polling roughly every 10-14s
+# instead of sleeping ever-longer and missing a freed EIP, and the jitter
+# decorrelates the near-simultaneous standby AC boots that poll the same
+# pool. Caps each sleep to the remaining budget so no single sleep runs past
+# EIP_CLAIM_DEADLINE (an AWS call already in flight can still push total
+# wall-clock slightly beyond it — the loop never *sleeps* past the deadline,
+# it just lets an in-progress attempt finish). All arithmetic stays in
+# $(( )) expansions (never a bare (( )) command) to remain safe under
+# `set -e`.
+eip_backoff_sleep() {
+  local n=$1
+  local backoff=$(( RANDOM % 5 + ( n < 5 ? n : 5 ) * 2 ))
+  local remaining=$(( EIP_CLAIM_DEADLINE - $(date +%s) ))
+  if [ "$remaining" -le 0 ]; then return 0; fi
+  if [ "$backoff" -gt "$remaining" ]; then backoff="$remaining"; fi
+  sleep "$backoff"
+}
+
 echo "Attempting to claim an Elastic IP from pool ${eip_pool_tag}..."
 EIP_CLAIMED=false
 EIP_CLAIM_START=$(date +%s)
-for attempt in 1 2 3 4 5; do
-  ALLOC_ID=$(aws ec2 describe-addresses \
+# Bound the claim by a deadline, not a fixed attempt count. During a
+# blue/green standby instance refresh the pool churns: AWS releases a
+# terminated instance's EIP asynchronously (eventual consistency), so a
+# freshly-launched replacement can briefly observe zero free EIPs even
+# though the pool has nominal headroom (2*max+1). The old 5-attempt (~45s)
+# budget lost that race intermittently — one standby AC would FATAL-exit
+# with "No available EIPs", never start nhp-acd/traefik, and fail the
+# blue/green Verify Standby Health gate (observed 2026-07-01: sandbox
+# deploy run 28492685955, 1 of 3 standby ACs; run 28486896507 hit the same).
+# Retry until the deadline so the release has time to propagate; a genuinely
+# exhausted pool still FATAL-exits, just after a bounded wait. This 300s
+# budget assumes the blue/green Verify Standby Health window is at or near
+# its 15-min default (blue-green-deploy.yml input
+# standby_health_timeout_minutes, range 2-60 min). A deploy invoked with a
+# very tight window (near the 2-min floor) will fail the standby gate on any
+# AC that has to wait out EIP propagation regardless of this budget — that's
+# a pool-provisioning problem (tracked in #2982), not something user_data can
+# tune around since it can't see that input. The two values live in separate
+# files with no lint linking them, so if the default is lowered, lower this
+# too.
+EIP_CLAIM_BUDGET_SECONDS=300
+EIP_CLAIM_DEADLINE=$(( EIP_CLAIM_START + EIP_CLAIM_BUDGET_SECONDS ))
+attempt=0
+while [ "$(date +%s)" -lt "$EIP_CLAIM_DEADLINE" ]; do
+  attempt=$(( attempt + 1 ))
+  if ! AVAILABLE_EIPS=$(aws ec2 describe-addresses \
     --filters "Name=tag:EIPPool,Values=${eip_pool_tag}" \
-    --query 'Addresses[?AssociationId==`null`].AllocationId | [0]' \
-    --output text --region "$REGION")
-
-  if [ "$ALLOC_ID" = "None" ] || [ -z "$ALLOC_ID" ]; then
-    echo "WARNING: No available EIPs in pool (attempt $attempt/5)"
-    sleep $(( RANDOM % 3 + attempt * 2 ))
+    --query 'Addresses[?AssociationId==`null`].AllocationId' \
+    --output text --region "$REGION"); then
+    echo "WARNING: failed to list available EIPs in pool (attempt $attempt), retrying..." >&2
+    eip_backoff_sleep "$attempt"
     continue
   fi
 
+  # describe-addresses separates ids with tabs/newlines; normalize to spaces
+  # and split. Empty or whitespace-only output yields a 0-length array — no
+  # free EIP right now (release lag during refresh churn, or true exhaustion).
+  # The `<<<` here-string appends a trailing newline, so `read` returns 0 (not
+  # EOF-nonzero) even on empty input — keep it a here-string, not a pipe, to
+  # stay safe under `set -e`.
+  AVAILABLE_EIPS="$${AVAILABLE_EIPS//$'\t'/ }"
+  AVAILABLE_EIPS="$${AVAILABLE_EIPS//$'\n'/ }"
+  read -r -a AVAILABLE_EIP_IDS <<< "$AVAILABLE_EIPS"
+  AVAILABLE_EIP_COUNT=$${#AVAILABLE_EIP_IDS[@]}
+  if [ "$AVAILABLE_EIP_COUNT" -eq 0 ]; then
+    echo "WARNING: No available EIPs in pool (attempt $attempt)"
+    eip_backoff_sleep "$attempt"
+    continue
+  fi
+  # Keep this as an assignment: under set -e, a bare (( ... )) command
+  # exits 1 when RANDOM % count evaluates to 0.
+  EIP_INDEX=$(( RANDOM % AVAILABLE_EIP_COUNT ))
+  ALLOC_ID="$${AVAILABLE_EIP_IDS[$EIP_INDEX]}"
+
+  # Do not let concurrent AC boots steal an EIP that another AC has just
+  # claimed. The AWS API defaults to allowing reassociation unless told
+  # otherwise, which can leave the displaced instance serving on its
+  # auto-assigned public IP.
   if aws ec2 associate-address \
     --allocation-id "$ALLOC_ID" \
     --instance-id "$INSTANCE_ID" \
+    --no-allow-reassociation \
     --region "$REGION"; then
     echo "Successfully claimed EIP allocation $ALLOC_ID"
-    sleep 2
-    PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-      http://169.254.169.254/latest/meta-data/public-ipv4)
+    EIP_PUBLIC_IP=$(aws ec2 describe-addresses \
+      --allocation-ids "$ALLOC_ID" \
+      --query 'Addresses[0].PublicIp' \
+      --output text --region "$REGION" 2>/dev/null || true)
+    if [ -n "$EIP_PUBLIC_IP" ] && [ "$EIP_PUBLIC_IP" != "None" ]; then
+      PUBLIC_IP="$EIP_PUBLIC_IP"
+      PUBLIC_IP_SOURCE="eip_describe"
+    else
+      # Log/metric fallback only; IMDS may briefly lag the EIP association.
+      PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+        http://169.254.169.254/latest/meta-data/public-ipv4)
+      PUBLIC_IP_SOURCE="imds_fallback"
+    fi
     echo "EIP associated. New public IP: $PUBLIC_IP"
     EIP_CLAIMED=true
     EIP_CLAIM_END=$(date +%s)
@@ -266,11 +342,12 @@ for attempt in 1 2 3 4 5; do
         --arg instance_id "$INSTANCE_ID" \
         --arg allocation_id "$ALLOC_ID" \
         --arg public_ip "$PUBLIC_IP" \
+        --arg public_ip_source "$PUBLIC_IP_SOURCE" \
         --argjson duration_seconds "$EIP_CLAIM_DURATION" \
         --argjson attempts "$attempt" \
         --arg az "$AZ" \
         --arg environment "${environment}" \
-        '{event: $event, instance_id: $instance_id, allocation_id: $allocation_id, public_ip: $public_ip, duration_seconds: $duration_seconds, attempts: $attempts, az: $az, environment: $environment}'; then
+        '{event: $event, instance_id: $instance_id, allocation_id: $allocation_id, public_ip: $public_ip, public_ip_source: $public_ip_source, duration_seconds: $duration_seconds, attempts: $attempts, az: $az, environment: $environment}'; then
       echo "WARNING: failed to emit eip_claimed structured log line (boot continues)" >&2
     fi
     # Emit EIP claim success metrics to CloudWatch. Log on failure (but
@@ -287,13 +364,13 @@ for attempt in 1 2 3 4 5; do
     fi
     break
   else
-    echo "EIP $ALLOC_ID was claimed by another instance (attempt $attempt/5), retrying..."
-    sleep $(( RANDOM % 3 + attempt * 2 ))
+    echo "Failed to claim EIP $ALLOC_ID (attempt $attempt), retrying..."
+    eip_backoff_sleep "$attempt"
   fi
 done
 
 if [ "$EIP_CLAIMED" = "false" ]; then
-  echo "FATAL: Could not claim an EIP after 5 attempts. Instance cannot serve traffic without a stable IP."
+  echo "FATAL: Could not claim an EIP after $attempt attempts over $(( $(date +%s) - EIP_CLAIM_START ))s. Instance cannot serve traffic without a stable IP."
   echo "Check that enough EIPs are allocated (ac_max_capacity) and AWS EIP quota is sufficient."
   # Emit EIP claim failure metric to CloudWatch. We deliberately log on
   # failure (without aborting the cooldown / exit path) so the operator can
@@ -309,6 +386,10 @@ if [ "$EIP_CLAIMED" = "false" ]; then
   fi
   # Cooldown before exit to prevent ASG from rapidly cycling replacement instances
   # when EIP pool is genuinely exhausted (e.g., all allocated EIPs are in use).
+  # NOTE: the deadline-bounded claim loop above already makes each instance
+  # linger ~5 min before reaching here, so it now provides most of this
+  # anti-cycle protection; the cooldown is retained as extra margin and can
+  # likely shrink if the claim budget grows.
   sleep 120
   exit 1
 fi

@@ -21,8 +21,11 @@ locals {
   # the new instance has already booted and is running user_data that tries
   # to claim an EIP from the pool. If the pool is sized exactly at
   # `max_capacity * 2`, that transient moment has zero free EIPs and the new
-  # instance's claim script races its ~33s retry budget against the
-  # disassociation. When the race is lost, user_data FATAL-exits and the
+  # instance's claim script races its retry budget (a 300s deadline — see
+  # eip_backoff_sleep in user_data.sh.tpl) against the disassociation. The
+  # deadline-bounded retry now wins that race in almost all cases; this `+ 1`
+  # is the terraform-side backstop for the transient window. When the race is
+  # nonetheless lost (a genuinely exhausted pool), user_data FATAL-exits and the
   # instance comes up with no EIP → traefik and nhp-acd never start → the
   # blue/green workflow's Verify Standby Health step correctly rejects the
   # ASG and the whole deploy halts. Observed 2026-04-08 on sandbox: every

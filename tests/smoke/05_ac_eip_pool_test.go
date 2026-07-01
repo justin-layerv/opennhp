@@ -29,11 +29,22 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 )
 
+// acEIPPoolTag mirrors terraform/modules/ac/main.tf's local.eip_pool_tag
+// ("${name_prefix}-ac") and terraform/modules/ac/eip.tf's EIPPool tag key.
+// The sandbox/prod modules set name_prefix to "layerv-nhp-{env}"; update
+// this helper if that module contract changes.
+func acEIPPoolTag() (key, value string) {
+	return "EIPPool", fmt.Sprintf("layerv-nhp-%s-ac", testConfig.Environment)
+}
+
 // TestACEIPPool_AllActiveACsHaveEIP enumerates the active AC ASG's
-// InService instances and confirms each has an associated public IP
-// (EIP). Any instance without an EIP is an acute bug: it either
-// can't be reached by the NHP server for AOP messages, or it can't
-// egress to AWS APIs, depending on how the missing EIP manifests.
+// InService instances and confirms each has an associated managed
+// EIP from the AC EIP pool. Any instance with only an auto-assigned
+// EC2 public IP is an acute bug: customer origins and internal WAFs
+// allowlist the managed pool, not arbitrary instance public IPs.
+//
+// Regression fence for PR #2911 (EIP reassociation during concurrent
+// AC boots displaced a healthy instance onto an auto-assigned public IP).
 func TestACEIPPool_AllActiveACsHaveEIP(t *testing.T) {
 	requireRemote(t) // AC Elastic IP pool is AWS-only; no equivalent in the local stack.
 	asgName := requireActiveACASG(t)
@@ -43,10 +54,11 @@ func TestACEIPPool_AllActiveACsHaveEIP(t *testing.T) {
 		t.Fatalf("no InService AC instances in ASG %s", asgName)
 	}
 
-	ips := describeInstancePublicIPs(t, instances)
+	poolTagKey, poolTagValue := acEIPPoolTag()
+	ips := describeInstanceElasticIPs(t, instances, poolTagKey, poolTagValue)
 	for _, id := range instances {
 		if ip, ok := ips[id]; !ok || ip == "" {
-			t.Errorf("AC instance %s has no public IP (EIP)", id)
+			t.Errorf("AC instance %s has no managed EIP tagged %s=%s", id, poolTagKey, poolTagValue)
 		}
 	}
 }
@@ -84,8 +96,7 @@ func TestACEIPPool_PoolSizeMeetsMinimum(t *testing.T) {
 	// value are asserted here against the TF source of truth. DO NOT
 	// relax this to a substring match or softer skip path without
 	// also updating the terraform comment + this test.
-	poolTagKey := "EIPPool"
-	poolTagValue := fmt.Sprintf("layerv-nhp-%s-ac", testConfig.Environment)
+	poolTagKey, poolTagValue := acEIPPoolTag()
 	poolSize := describeElasticIPPool(t, poolTagKey, poolTagValue)
 	if poolSize == 0 {
 		t.Fatalf("no EIPs tagged %s=%s — tag shape drifted from terraform/modules/ac/eip.tf; PR #1006 fence is broken, update the test",
