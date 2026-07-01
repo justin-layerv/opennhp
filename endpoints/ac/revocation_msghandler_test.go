@@ -3,9 +3,11 @@ package ac
 import (
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/internal/revocationscope"
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -518,7 +520,7 @@ func TestHandleUdpACRevocation_AppliedEventDoesNotIncrementRejectMetric(t *testi
 }
 
 // ============================================================================
-// P4e Slice 3 (#2793): AC → server proof-of-delivery ack (NHP_RACK).
+// P4e Slice 3 (#2793): AC → server proof-of-delivery ack (NHP_RVA).
 // ============================================================================
 
 // serverPubKey32 is a fixed 32-byte non-zero pubkey standing in for the server's
@@ -572,7 +574,7 @@ func acWithSendCapture(t *testing.T) (*UdpAC, chan *core.MsgData) {
 }
 
 // drainOneAck returns the single MsgData enqueued on sendCh, or fails if none /
-// more than one is present. Used to assert exactly one NHP_RACK was sent.
+// more than one is present. Used to assert exactly one NHP_RVA was sent.
 func drainOneAck(t *testing.T, sendCh chan *core.MsgData) *core.MsgData {
 	t.Helper()
 	select {
@@ -584,13 +586,13 @@ func drainOneAck(t *testing.T, sendCh chan *core.MsgData) *core.MsgData {
 		}
 		return md
 	default:
-		t.Fatal("expected one enqueued NHP_RACK, got none")
+		t.Fatal("expected one enqueued NHP_RVA, got none")
 		return nil
 	}
 }
 
 // TestHandleUdpACRevocation_SendsAckOnAppliedEvent: a validated event that
-// flushes a live entry must enqueue exactly one NHP_RACK addressed to the
+// flushes a live entry must enqueue exactly one NHP_RVA addressed to the
 // server's authenticated pubkey, echoing scope + scope_key VERBATIM (still
 // prefixed) + epoch + event_id, and tick MetricRevocationAckSent. This is the
 // headline proof-of-delivery property (#2793).
@@ -605,8 +607,8 @@ func TestHandleUdpACRevocation_SendsAckOnAppliedEvent(t *testing.T) {
 	}
 
 	md := drainOneAck(t, sendCh)
-	if md.HeaderType != core.NHP_RACK {
-		t.Fatalf("enqueued header type=%d, want NHP_RACK(%d)", md.HeaderType, core.NHP_RACK)
+	if md.HeaderType != core.NHP_RVA {
+		t.Fatalf("enqueued header type=%d, want NHP_RVA(%d)", md.HeaderType, core.NHP_RVA)
 	}
 	// Addressed to the server's authenticated pubkey from the inbound REV.
 	if string(md.PeerPk) != string(serverPubKey32()) {
@@ -635,7 +637,7 @@ func TestHandleUdpACRevocation_SendsAckOnAppliedEvent(t *testing.T) {
 // nothing — the common cell-wide-fanout case where this AC never admitted the key
 // — must STILL ack. Without this, the server would retry to age-out and falsely
 // mark the revoke degraded. Proven non-vacuously: no live entry matches, nothing
-// is flushed, yet exactly one NHP_RACK is enqueued.
+// is flushed, yet exactly one NHP_RVA is enqueued.
 func TestHandleUdpACRevocation_SendsAckEvenWhenNothingFlushed(t *testing.T) {
 	a, sendCh := acWithSendCapture(t)
 	// A live entry under a DIFFERENT key, so the revoke matches nothing.
@@ -648,8 +650,8 @@ func TestHandleUdpACRevocation_SendsAckEvenWhenNothingFlushed(t *testing.T) {
 	}
 
 	md := drainOneAck(t, sendCh)
-	if md.HeaderType != core.NHP_RACK {
-		t.Fatalf("enqueued header type=%d, want NHP_RACK", md.HeaderType)
+	if md.HeaderType != core.NHP_RVA {
+		t.Fatalf("enqueued header type=%d, want NHP_RVA", md.HeaderType)
 	}
 	var got common.ACRevocationAckMsg
 	if err := json.Unmarshal(md.Message, &got); err != nil {
@@ -665,7 +667,7 @@ func TestHandleUdpACRevocation_SendsAckEvenWhenNothingFlushed(t *testing.T) {
 }
 
 // TestHandleUdpACRevocation_NoAckOnRejectPath: a rejected event (here an
-// unsupported scope) must NOT enqueue an NHP_RACK — reject paths age out to the
+// unsupported scope) must NOT enqueue an NHP_RVA — reject paths age out to the
 // server's degraded metric by design, surfacing server↔AC validation drift rather
 // than masking it. Proven non-vacuously: the send channel stays empty and
 // MetricRevocationAckSent is 0 while MetricRevocationRejected ticks.
@@ -722,10 +724,47 @@ func TestSendRevocationAck_NoConnIsCountedFailure(t *testing.T) {
 	}
 }
 
+// TestSendRevocationAck_QueueFullIsCountedFailure: when the AC's sendMsgCh is
+// full, the non-blocking ack enqueue must DROP the NHP_RVA with
+// MetricRevocationAckSendFailed (the server retries the NHP_REV) rather than block
+// the revoke receive path — and it must NOT tick MetricRevocationAckSent. This is
+// the backpressure branch (msghandler.go select default), the one most likely to
+// fire under real load, and previously the only ack-send failure branch with no
+// direct test.
+func TestSendRevocationAck_QueueFullIsCountedFailure(t *testing.T) {
+	a, _ := acWithSendCapture(t)
+	// Replace the buffered capture channel with an unbuffered one that has no
+	// reader, so the non-blocking ack enqueue hits the select's default arm.
+	a.sendMsgCh = make(chan *core.MsgData)
+
+	// A valid event (no live match → convergence ack attempted). The apply path
+	// validates and converges, then tries to ack; the full queue drops it.
+	if err := a.HandleUdpACRevocation(revPPDWithConn(t, common.ACRevocationMsg{
+		Scope: "qurl", ScopeKey: "qurl:qFull", RevocationEpoch: 1, EventId: "evt-full",
+	})); err != nil {
+		t.Fatalf("validated event err=%v", err)
+	}
+
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if c := counters[MetricRevocationAckSendFailed]; c != 1 {
+		t.Fatalf("%s = %v, want 1 (a full sendMsgCh must drop the ack as a counted failure)", MetricRevocationAckSendFailed, c)
+	}
+	if c := counters[MetricRevocationAckSent]; c != 0 {
+		t.Fatalf("%s = %v, want 0 (the ack was dropped, not sent)", MetricRevocationAckSent, c)
+	}
+}
+
 // TestWireRevocationScope_AllowlistGate is the unit-level guard on the scope
 // gate itself: exactly the three wire scopes are accepted (and round-trip to the
-// matching typed constant), everything else — crucially "admission" — is
-// rejected.
+// matching typed constant), everything else — crucially "admission" and "cell" —
+// is rejected.
+//
+// The accepted set is sourced from the shared endpoints/internal/revocationscope
+// package, which the server's proof-tracking gate (trackFanout) also calls — so
+// the AC apply/ack allowlist and the server's "which scopes do I expect an
+// NHP_RVA for" set are the SAME set by construction and cannot drift (#2793).
+// This test pins the AC-visible behavior of that shared gate; the canonical set
+// itself is pinned in revocationscope's own TestAckable.
 func TestWireRevocationScope_AllowlistGate(t *testing.T) {
 	for _, tc := range []struct {
 		in   string
@@ -740,9 +779,31 @@ func TestWireRevocationScope_AllowlistGate(t *testing.T) {
 			t.Fatalf("wireRevocationScope(%q) = (%q,%v), want (%q,true)", tc.in, got, ok, tc.want)
 		}
 	}
-	for _, bad := range []string{"admission", "cell", "", "Qurl", " qurl", "qurl ", "unknown"} {
+	// Reject the AC-meaningful near-misses: "admission" (the reserved AC-internal
+	// dimension a raw cast would wrongly accept) and "cell" (server-only). The
+	// exhaustive near-miss coverage (case, whitespace, unknown) lives in
+	// revocationscope's TestAckable — wireRevocationScope is now just a typed
+	// wrapper over revocationscope.Contains, so re-listing them here is redundant.
+	for _, bad := range []string{"admission", "cell"} {
 		if got, ok := wireRevocationScope(bad); ok {
 			t.Fatalf("wireRevocationScope(%q) = (%q,true), want rejected", bad, got)
 		}
+	}
+}
+
+// TestACScopeConstants_MatchSharedAckable closes the last drift seam: wireRevocationScope
+// now ACCEPTS scopes via the shared revocationscope.Contains, but ApplyRevocation /
+// scopeKeysForEntry INDEX live entries using the AC's own typed constants
+// (scopeQurl/scopeResource/scopeSession, revocation_index.go). If a scope string were
+// renamed in the shared package but not in these constants (or vice-versa),
+// wireRevocationScope would accept a scope the AC index can never match — a silent
+// no-match that still converges and acks. Pin the two so that drift fails loudly here.
+func TestACScopeConstants_MatchSharedAckable(t *testing.T) {
+	got := []string{string(scopeQurl), string(scopeResource), string(scopeSession)}
+	want := revocationscope.All()
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("AC index scope constants %v != shared revocationscope.All() %v — wireRevocationScope would accept a scope the AC index cannot match", got, want)
 	}
 }

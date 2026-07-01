@@ -548,7 +548,7 @@ type ACRevocationMsg struct {
 }
 
 // ACRevocationAckMsg is the AC→server acknowledgement of an NHP_REV, carried on
-// NHP_RACK (AC-to-server, LayerV extension). It is the proof-of-delivery signal
+// NHP_RVA (AC-to-server, LayerV extension). It is the proof-of-delivery signal
 // for DE-Risk #5: the AC sends one after it has PROCESSED a validated NHP_REV,
 // and the server uses it to clear that AC's pending-revoke tracker so the
 // retry-until-ack-or-age-out loop stops retransmitting (see

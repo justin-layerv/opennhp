@@ -9,7 +9,7 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
-// P4e Slice 3 (#2793): tests for the server NHP_RACK revocation-ack handler.
+// P4e Slice 3 (#2793): tests for the server NHP_RVA revocation-ack handler.
 //
 // These exercise HandleRevocationAck against the real acConnectionMap-based
 // identity attribution (resolveACIdentityFromPubkey) — not a mock — so "the ack
@@ -51,7 +51,7 @@ func ackPPD(t *testing.T, msg common.ACRevocationAckMsg, serverPubKey []byte) *c
 		t.Fatalf("marshal ACRevocationAckMsg: %v", err)
 	}
 	return &core.PacketParserData{
-		HeaderType:   core.NHP_RACK,
+		HeaderType:   core.NHP_RVA,
 		BodyMessage:  body,
 		RemotePubKey: serverPubKey,
 	}
@@ -117,7 +117,7 @@ func TestHandleRevocationAck_MalformedBodyReturnsError(t *testing.T) {
 	putAckTestConn(s, "ac-1", 7)
 
 	ppd := &core.PacketParserData{
-		HeaderType:   core.NHP_RACK,
+		HeaderType:   core.NHP_RVA,
 		BodyMessage:  []byte("{not valid json"),
 		RemotePubKey: testPubkey(7),
 	}

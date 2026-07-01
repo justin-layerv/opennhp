@@ -955,7 +955,7 @@ Delivery requirements:
   ACTIVE IN TERRAFORM-MANAGED FLEETS (nhp #2808 + #2793): the number is
   defined, tested, and explicitly armed by server user data —
   `p99 < 15s` (`RevocationDeliveryLatencyP99SLO`) over the server-measurable
-  proxy span, `NHP_REV` emit (`firstSentAt`) → `NHP_RACK` ack-attributed
+  proxy span, `NHP_REV` emit (`firstSentAt`) → `NHP_RVA` ack-attributed
   (`clearAck`), with a p99 CloudWatch alarm and a companion
   `RevocationAgedOut` non-delivery alarm, plus `RevocationUntrackable` for
   impossible live-connection identity invariant breaks. The histogram samples
@@ -969,7 +969,7 @@ Delivery requirements:
     `(acId, authenticated AC pubkey, scope, scope_key)`. `acId` remains the
     qurl-service targeting identifier, but `acConnectionMap` can hold multiple
     blue/green slots under one `acId`; each targeted slot must ack or age out
-    independently. One sibling's `NHP_RACK` does not clear another sibling's
+    independently. One sibling's `NHP_RVA` does not clear another sibling's
     pending entry or record its latency sample.
   - The `RevocationDeliveryLatency` p99 is therefore per targeted AC slot, not
     per `acId` or per revoke event. A blue/green overlap can produce multiple
@@ -981,9 +981,19 @@ Delivery requirements:
   - If fanout was enqueued but the server cannot key the live connection to
     `ACId` + authenticated AC pubkey, the retry engine emits
     `RevocationUntrackable` instead of overloading retry age-out.
-  - `NHP_RACK` is sent only after the AC validates the `NHP_REV` and calls
+  - `NHP_RVA` is sent only after the AC validates the `NHP_REV` and calls
     `ApplyRevocation`; this is a convergence ack ("no live flow for this
     identity at/below this epoch on this AC slot"), not a count of flushed flows.
+  - Proof is tracked only for scopes the AC actually applies and acks
+    (`qurl`/`resource`/`session` — the AC's `wireRevocationScope` allowlist,
+    mirrored server-side by `revocationAckableScopes`). The `cell` scope is a
+    server-side fanout selector with no AC-local index: the server still accepts
+    and fans out `cell`, but the AC drops it without acking, so the server does
+    **not** create a pending proof entry for it. Tracking it would otherwise
+    guarantee a never-arriving ack and a false `RevocationAgedOut` on every
+    targeted AC once the engine is armed (nhp #2793). A `cell` revoke therefore
+    produces neither a latency sample nor an age-out — its "delivery" is the
+    fanout itself, not a per-flow AC ack.
   - Because proof is per live slot, a revoke that overlaps a blue/green drain can
     age out for a slot that was targeted and then decommissioned before its ack
     arrived. That is an expected fail-safe `RevocationAgedOut` source during

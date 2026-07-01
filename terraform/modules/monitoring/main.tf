@@ -1483,7 +1483,7 @@ resource "aws_cloudwatch_metric_alarm" "revocation_delivery_latency_high" {
   period              = 60
   extended_statistic  = "p99"
   threshold           = 15000
-  alarm_description   = "qURL v2 revocation delivery latency p99 (NHP_REV emit -> AC NHP_RACK ack) exceeded the 15s SLO (#2792). Keep the threshold in lockstep with RevocationDeliveryLatencyP99SLO in endpoints/server/revocation_retry.go."
+  alarm_description   = "qURL v2 revocation delivery latency p99 (NHP_REV emit -> AC NHP_RVA ack) exceeded the 15s SLO (#2792). Keep the threshold in lockstep with RevocationDeliveryLatencyP99SLO in endpoints/server/revocation_retry.go."
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"

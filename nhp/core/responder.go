@@ -1150,7 +1150,27 @@ func (ppd *PacketParserData) Destroy() {
 
 func (ppd *PacketParserData) IsAllowedAtOverload() bool {
 	switch ppd.HeaderType {
-	case NHP_KNK, DHP_KNK, NHP_RKN, NHP_EXT, NHP_AOL, NHP_ART:
+	case NHP_KNK, DHP_KNK, NHP_RKN, NHP_EXT, NHP_AOL, NHP_ART,
+		// NHP_RVA is the AC→server revocation proof-of-delivery ack (#2793).
+		// Dropping it under overload would strand the server's pending-revoke
+		// tracker: the AC has already applied the revoke, but its ack is discarded,
+		// so the retry engine keeps retransmitting and may age the (delivered)
+		// revoke out to a FALSE RevocationAgedOut degraded signal. Admit it so the
+		// degraded metric stays trustworthy.
+		//
+		// Threat model — explicitly accepted: this gate runs BEFORE the handshake
+		// AEAD (see the IsAllowedAtOverload call site in the digest path above),
+		// and unlike NHP_RKN an NHP_RVA carries no pre-validation overload cookie.
+		// So a forged NHP_RVA now forces a handshake attempt during overload where
+		// it would previously have been shed. This is the SAME class as the already-
+		// admitted no-cookie types (NHP_KNK / DHP_KNK / NHP_AOL): the forgery fails
+		// the AEAD (the attacker lacks the AC static key), so it adds no NEW DoS
+		// primitive beyond what forged NHP_KNK already permits, and NHP_RVA is a
+		// low-volume security-event-rate message with no separate rate-limit gap on
+		// this path. The marginal cost is accepted to keep the revocation degraded
+		// signal trustworthy under overload; if NHP_RVA volume ever rises, gate it
+		// behind a cookie like NHP_RKN rather than removing it here.
+		NHP_RVA:
 		return true
 	default:
 		return false

@@ -836,3 +836,27 @@ func TestValidatePeerKnockNotOverloadCompletesHandshake(t *testing.T) {
 		t.Fatal("non-overload KNK must not generate a cookie")
 	}
 }
+
+// TestIsAllowedAtOverload pins the server overload allowlist
+// (PacketParserData.IsAllowedAtOverload), the gate that decides which packet
+// types the server still processes while shedding load.
+// NHP_RVA — the qURL v2 revocation proof-of-delivery ack (#2793) — MUST be
+// admitted: dropping it under overload would strand the server's pending-revoke
+// tracker and age a successfully-delivered revoke out to a false
+// RevocationAgedOut. The denied cases fence the allowlist so a future widening
+// is deliberate, and assert the asymmetry that only the AC→server ack NHP_RVA
+// is admitted, NOT the server→AC revoke push NHP_REV.
+func TestIsAllowedAtOverload(t *testing.T) {
+	allowed := []int{NHP_KNK, DHP_KNK, NHP_RKN, NHP_EXT, NHP_AOL, NHP_ART, NHP_RVA}
+	for _, ht := range allowed {
+		if !(&PacketParserData{HeaderType: ht}).IsAllowedAtOverload() {
+			t.Errorf("IsAllowedAtOverload(%s) = false, want true (must survive overload)", HeaderTypeToString(ht))
+		}
+	}
+	denied := []int{NHP_REV, NHP_ACK, NHP_LST, NHP_AAK, NHP_COK, NHP_OTP, NHP_REG}
+	for _, ht := range denied {
+		if (&PacketParserData{HeaderType: ht}).IsAllowedAtOverload() {
+			t.Errorf("IsAllowedAtOverload(%s) = true, want false (must be shed at overload)", HeaderTypeToString(ht))
+		}
+	}
+}

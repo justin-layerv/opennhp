@@ -180,7 +180,7 @@ type UdpServer struct {
 	// fanout handler records a pending entry per targeted AC slot
 	// (acId + authenticated pubkey), the
 	// revocationRetryRoutine retransmits un-acked NHP_REV on a cadence
-	// until acked (NHP_RACK clears it) or aged out (RevocationAgedOut),
+	// until acked (NHP_RVA clears it) or aged out (RevocationAgedOut),
 	// and HandleRevocationAck clears the matching entry. See
 	// revocation_retry.go.
 	revocationRetry *revocationRetryTracker
@@ -1671,6 +1671,22 @@ func (s *UdpServer) findACConnectionsForRevocation(fanoutMode string, targetACID
 // here); that returns sent=0, ok=true (nothing to do is success, not 503).
 func (s *UdpServer) fanoutRevocation(conns []*ACConn, revBytes []byte) (sent int, ok bool) {
 	for _, conn := range conns {
+		if conn == nil || conn.ACPeer == nil {
+			// Defensive: a nil conn or a conn with a nil ACPeer must be skipped, not
+			// dereferenced (conn.ACPeer.PublicKey() would panic). This is the minimal
+			// "don't panic" guard and is intentionally LOOSER than the proof side:
+			// trackFanout keys on acConnPubkey, which rejects BOTH a nil ACPeer and a
+			// non-nil ACPeer with an empty PubKeyBase64 (ticking RevocationUntrackable).
+			// So for either malformed shape the track side is stricter than the send
+			// side, not symmetric: a nil-ACPeer conn is skipped here AND ticks
+			// RevocationUntrackable there (counted-but-not-sent), and a non-nil but
+			// keyless ACPeer would be SENT an NHP_REV here yet get no pending proof
+			// entry. Both surface a malformed-registry invariant break rather than a
+			// silent proof gap. Under current invariants findACConnectionsForRevocation
+			// never yields any such entry; this is defense-in-depth against a future
+			// regression.
+			continue
+		}
 		md := &core.MsgData{
 			ConnData:      conn.ConnData,
 			HeaderType:    core.NHP_REV,
@@ -2887,7 +2903,7 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 	// pending-revoke tracker so the retry-until-ack loop stops. Dispatched async
 	// like every other arm so a slow handler cannot head-of-line-block the
 	// receive queue.
-	case core.NHP_RACK:
+	case core.NHP_RVA:
 		go func() {
 			if ackErr := s.HandleRevocationAck(ppd); ackErr != nil {
 				log.Error("[Server] HandleRevocationAck failed: %v", ackErr)

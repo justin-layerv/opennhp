@@ -1071,7 +1071,7 @@ NHP_KNOCK_HEADERTYPE_VERIFY=true
 %{ endif ~}
 # qURL v2 immediate-revocation proof engine (#2793). Terraform-managed fleets
 # set this explicitly so NHP_REV fanout is retried until each targeted AC slot
-# ACKs (NHP_RACK) or ages out to RevocationAgedOut; the Go binary's absent-env
+# ACKs (NHP_RVA) or ages out to RevocationAgedOut; the Go binary's absent-env
 # default remains off for unmanaged/pre-ACK deployments.
 NHP_REVOCATION_RETRY_ENABLED=${revocation_retry_enabled}
 NHP_REVOCATION_RETRY_INTERVAL_SECONDS=${revocation_retry_interval_seconds}

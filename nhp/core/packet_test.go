@@ -111,3 +111,45 @@ func TestNHPRevHeaderType_ACReachability(t *testing.T) {
 			"the NHP_REV entry or is misaligned with the const block", got)
 	}
 }
+
+// TestNHPRVAHeaderType_ServerReachability is the symmetric receive-gate guard
+// for the AC's revocation acknowledgement. Handler tests call
+// HandleRevocationAck directly, so this pins the wire routing too:
+//
+//   - CheckRecvHeaderType(NHP_RVA) must be true for an NHP_SERVER device.
+//   - It must NOT be accepted by the other device roles — only the server
+//     receives the AC's revocation ack.
+//   - HeaderTypeToDeviceType(NHP_RVA) must be NHP_AC: the AC is the sender.
+//   - HeaderTypeToString(NHP_RVA) must be exactly "NHP-RVA", preserving the
+//     three-letter NHP message mnemonic convention.
+func TestNHPRVAHeaderType_ServerReachability(t *testing.T) {
+	serverDev := &Device{deviceType: NHP_SERVER}
+	if !serverDev.CheckRecvHeaderType(NHP_RVA) {
+		t.Fatal("CheckRecvHeaderType(NHP_RVA) = false for NHP_SERVER; the AC-sent " +
+			"revocation ack would be rejected by RecvPrecheck before reaching " +
+			"the server ack handler (add NHP_RVA to the NHP_SERVER arm in packet.go)")
+	}
+
+	for _, dt := range []struct {
+		name string
+		typ  int
+	}{
+		{"NHP_AC", NHP_AC},
+		{"NHP_AGENT", NHP_AGENT},
+		{"NHP_RELAY", NHP_RELAY},
+		{"NHP_DB", NHP_DB},
+	} {
+		d := &Device{deviceType: dt.typ}
+		if d.CheckRecvHeaderType(NHP_RVA) {
+			t.Fatalf("CheckRecvHeaderType(NHP_RVA) = true for %s; only the server may receive it", dt.name)
+		}
+	}
+
+	if got := HeaderTypeToDeviceType(NHP_RVA); got != NHP_AC {
+		t.Fatalf("HeaderTypeToDeviceType(NHP_RVA) = %d, want NHP_AC (%d)", got, NHP_AC)
+	}
+
+	if got := HeaderTypeToString(NHP_RVA); got != "NHP-RVA" {
+		t.Fatalf("HeaderTypeToString(NHP_RVA) = %q, want %q", got, "NHP-RVA")
+	}
+}

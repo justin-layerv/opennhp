@@ -53,15 +53,17 @@ type revocationEvent struct {
 	TargetACIDs       []string `json:"target_ac_ids"`
 }
 
-// revocationWireScopes is the set of scopes the server accepts on the wire. It
-// mirrors qurl-service's Scope constants (internal/revocation/event.go) and the
-// AC's wireRevocationScope allowlist (endpoints/ac/msghandler.go). "cell" is a
-// server-side fanout selector with no AC-local index — it is a valid wire scope
-// (the AC drops it), so the server accepts it here; the AC's own allowlist
-// no-ops it. "admission" is an AC-internal index dimension and is NOT a wire
-// scope (neither end accepts it). The server does not act on the scope itself
-// beyond this gate; it field-copies scope + scope_key into the NHP_REV message
-// for the AC to resolve.
+// revocationWireScopes is the set of scopes the server ACCEPTS on the wire — a
+// strict SUPERSET of the scopes the AC applies and acks (the shared
+// endpoints/internal/revocationscope set, qurl/resource/session). "cell" is a
+// server-side fanout selector with no AC-local index: the server accepts it and
+// fans it out, but the AC drops it without acking, so proof-tracking is gated on
+// revocationscope.Contains in trackFanout — NOT on this accept set — or a cell
+// revoke would age out to a false RevocationAgedOut (#2793; the mechanism is
+// documented on the revocationscope package). "admission" is an AC-internal index
+// dimension and is NOT a wire scope (neither end accepts it). The server does not
+// act on the scope itself beyond this gate; it field-copies scope + scope_key into
+// the NHP_REV message for the AC to resolve.
 var revocationWireScopes = map[string]struct{}{
 	"qurl":     {},
 	"resource": {},
@@ -73,7 +75,7 @@ var revocationWireScopes = map[string]struct{}{
 // qurl-service over POST /nhp/internal/revocation and fans it out to the
 // matching connected ACs as NHP_REV (server→AC). With the revocation retry
 // engine armed, each successfully enqueued target is tracked until that AC slot
-// acks (NHP_RACK) or ages out to the degraded metric; when the engine is
+// acks (NHP_RVA) or ages out to the degraded metric; when the engine is
 // disabled for unmanaged/pre-ACK fleets, this reverts to best-effort send.
 //
 // Auth mirrors handleInternalKnock (NOT the no-body sweep helper, since this
@@ -89,7 +91,7 @@ var revocationWireScopes = map[string]struct{}{
 // The nhp→AC hop is fail-closed on enqueue backpressure — see fanoutRevocation:
 // a full send queue returns 503 so the event is retried rather than dropped.
 // After a successful enqueue, trackFanout records per-AC-slot proof state when
-// the retry engine is armed; NHP_RACK clears it and no-ack age-out emits
+// the retry engine is armed; NHP_RVA clears it and no-ack age-out emits
 // RevocationAgedOut instead of silently pretending delivery succeeded.
 func (hs *HttpServer) handleInternalRevocation(ctx *gin.Context) {
 	body, ok := hs.authorizeInternalSignedBodyRequest(ctx, "internal revocation", maxInternalRevocationRequestSize)
@@ -192,15 +194,17 @@ func (hs *HttpServer) handleInternalRevocation(ctx *gin.Context) {
 	hs.udpServer.metrics.AddCounterWithDims(MetricRevocationFanoutSent, float64(sent), nil)
 
 	// Proof-of-delivery tracking (#2793): record a pending entry per targeted AC
-	// so the retry engine retransmits the NHP_REV until the AC acks (NHP_RACK)
+	// so the retry engine retransmits the NHP_REV until the AC acks (NHP_RVA)
 	// or it ages out to the degraded metric. No-op when the engine is disabled
 	// (default). scope_key is the WIRE (scope-prefixed) form — the same bytes the
 	// AC echoes verbatim in its ack, matched by string equality. Tracked here
 	// (not inside fanoutRevocation) because fanoutRevocation is the lock-free
 	// send primitive that redelivery reuses; tracking there would reset the
 	// age-out clock on every retransmit. The !ok backpressure path returned 503
-	// above without reaching here, so on this path every conn in the set was
-	// enqueued.
+	// above without reaching here, so on this path every well-formed conn in the
+	// set was enqueued (fanoutRevocation skips a nil / nil-ACPeer conn, which
+	// trackFanout independently treats as untrackable — unreachable today, see the
+	// guard comment in fanoutRevocation).
 	hs.udpServer.trackFanout(conns, evt.Scope, evt.ScopeKey, evt.RevocationEpoch, evt.EventID)
 
 	// At-least-once: ack 200 only AFTER the fanout has been enqueued for every

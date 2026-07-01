@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/OpenNHP/opennhp/endpoints/internal/revocationscope"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/layervai/nhp/internalauth"
@@ -484,5 +485,30 @@ func TestInternalRevocation_NilUdpServer503(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%s, want 503 (nil udpServer)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRevocationWireScopes_SupersetOfAckable pins the structural relationship
+// between the two server-side scope sets now that ackability is sourced from the
+// shared endpoints/internal/revocationscope package: every scope the AC acks
+// (revocationscope.All) MUST also be a scope the server accepts on the wire
+// (revocationWireScopes) — the server cannot proof-track a scope it would reject
+// at the door. It also pins that "cell" is accepted-on-wire but NOT ackable (the
+// exact #2793 split). The AC↔server ackability lockstep itself is now drift-proof
+// by construction (both sides call revocationscope.Contains), so it needs no
+// mirror test here; this only guards the accept ⊇ ackable superset invariant.
+func TestRevocationWireScopes_SupersetOfAckable(t *testing.T) {
+	for _, s := range revocationscope.All() {
+		if _, ok := revocationWireScopes[s]; !ok {
+			t.Errorf("ackable scope %q is not accepted in revocationWireScopes (accept set must be a superset of ackable)", s)
+		}
+	}
+	// "cell" is the load-bearing split: accepted on the wire and fanned out, but
+	// NOT ackable (the AC drops it), so the server must not proof-track it.
+	if _, ok := revocationWireScopes["cell"]; !ok {
+		t.Error(`revocationWireScopes must accept "cell" (the server fans it out cell-wide)`)
+	}
+	if revocationscope.Contains("cell") {
+		t.Error(`revocationscope must NOT mark "cell" ackable (the AC drops it without acking — #2793)`)
 	}
 }

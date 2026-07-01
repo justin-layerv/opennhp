@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/internal/revocationscope"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
@@ -401,6 +402,11 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 // so this is an allowlist GATE, not a translation table — equal bytes in,
 // validated typed value out.
 //
+// The ackable set is the SHARED single source of truth in
+// endpoints/internal/revocationscope, which the NHP server's proof-tracking gate
+// (trackFanout) also derives from — so the AC's apply/ack allowlist and the
+// server's "which scopes do I expect an NHP_RVA for" set cannot drift (#2793).
+//
 // The allowlist is load-bearing, not defensive boilerplate: a raw
 // revocationScope(s) cast would also accept "admission", and scopeAdmission is a
 // populated index dimension (scopeKeysForEntry stamps every admission with an
@@ -409,12 +415,10 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 // design reserves for a future AC-internal cancel seam. Rejecting it (and the
 // server-only "cell") here keeps the AC apply path to qurl/resource/session only.
 func wireRevocationScope(s string) (revocationScope, bool) {
-	switch revocationScope(s) {
-	case scopeQurl, scopeResource, scopeSession:
+	if revocationscope.Contains(s) {
 		return revocationScope(s), true
-	default:
-		return "", false
 	}
+	return "", false
 }
 
 // bareScopeKey strips the "<scope>:" transport prefix qurl-service puts on its
@@ -564,7 +568,7 @@ func (a *UdpAC) HandleUdpACRevocation(ppd *core.PacketParserData) error {
 	return nil
 }
 
-// sendRevocationAck enqueues an NHP_RACK acknowledgement of revMsg back to the
+// sendRevocationAck enqueues an NHP_RVA acknowledgement of revMsg back to the
 // server that sent the NHP_REV, on the SAME server-initiated connection the
 // NHP_REV arrived on (ppd.ConnData) and addressed to that server's
 // authenticated pubkey (ppd.RemotePubKey). It is the AC-to-server mirror of the
@@ -610,13 +614,13 @@ func (a *UdpAC) sendRevocationAck(ppd *core.PacketParserData, revMsg *common.ACR
 		// marshal; treat it as a send failure for observability rather than a
 		// panic, and let the server's retry cover the missed ack.
 		a.incrMetric(MetricRevocationAckSendFailed)
-		log.Error("ac(%s)[sendRevocationAck] failed to marshal NHP_RACK (eventId=%q): %v", acId, revMsg.EventId, marshalErr)
+		log.Error("ac(%s)[sendRevocationAck] failed to marshal NHP_RVA (eventId=%q): %v", acId, revMsg.EventId, marshalErr)
 		return
 	}
 
 	md := &core.MsgData{
 		ConnData:      ppd.ConnData,
-		HeaderType:    core.NHP_RACK,
+		HeaderType:    core.NHP_RVA,
 		CipherScheme:  ppd.CipherScheme,
 		TransactionId: a.device.NextCounterIndex(),
 		Compress:      true,
@@ -637,11 +641,11 @@ func (a *UdpAC) sendRevocationAck(ppd *core.PacketParserData, revMsg *common.ACR
 	select {
 	case a.sendMsgCh <- md:
 		a.incrMetric(MetricRevocationAckSent)
-		log.Debug("ac(%s#%d)[sendRevocationAck] enqueued NHP_RACK scope=%q key=%q epoch=%d eventId=%q",
+		log.Debug("ac(%s#%d)[sendRevocationAck] enqueued NHP_RVA scope=%q key=%q epoch=%d eventId=%q",
 			acId, md.TransactionId, revMsg.Scope, revMsg.ScopeKey, revMsg.RevocationEpoch, revMsg.EventId)
 	default:
 		a.incrMetric(MetricRevocationAckSendFailed)
-		log.Warning("ac(%s#%d)[sendRevocationAck] sendMsgCh full, dropping NHP_RACK (server will retry NHP_REV) eventId=%q",
+		log.Warning("ac(%s#%d)[sendRevocationAck] sendMsgCh full, dropping NHP_RVA (server will retry NHP_REV) eventId=%q",
 			acId, md.TransactionId, revMsg.EventId)
 	}
 }

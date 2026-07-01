@@ -360,7 +360,7 @@ func TestRetryEngine_AckStopsRetry(t *testing.T) {
 	putRetryConn(s, "ac-1", 7)
 	s.trackFanout(s.acConnectionMap["ac-1"], "qurl", "qurl:qX", 3, "evt-3")
 
-	// The AC's NHP_RACK arrives and is attributed + cleared.
+	// The AC's NHP_RVA arrives and is attributed + cleared.
 	ppd := ackPPD(t, common.ACRevocationAckMsg{
 		Scope: "qurl", ScopeKey: "qurl:qX", RevocationEpoch: 3, EventId: "evt-3",
 	}, testPubkey(7))
@@ -381,7 +381,7 @@ func TestRetryEngine_AckStopsRetry(t *testing.T) {
 
 // TestRetryEngine_SameACIDBlueGreenAckClearsOnlyAckingSlot is the regression
 // for #2793's proof gap: acConnectionMap can hold multiple live blue/green slots
-// under one acId. A NHP_RACK from one authenticated pubkey must clear only that
+// under one acId. A NHP_RVA from one authenticated pubkey must clear only that
 // slot's pending entry; the sibling slot must stay pending and be redelivered to
 // its exact pubkey.
 func TestRetryEngine_SameACIDBlueGreenAckClearsOnlyAckingSlot(t *testing.T) {
@@ -501,6 +501,90 @@ func TestRetryEngine_TrackFanoutMissingACIDEmitsUntrackable(t *testing.T) {
 	}
 	if c := counters[MetricRevocationAgedOut]; c != 0 {
 		t.Fatalf("%s = %v, want 0 (untrackable must not pollute retry age-out)", MetricRevocationAgedOut, c)
+	}
+}
+
+// TestRetryEngine_TrackFanoutUnackableScopeNotTracked is the #2793 false-age-out
+// guard for the "cell" scope. The server ACCEPTS and fans out "cell" (it is in
+// revocationWireScopes), but the AC DROPS it without acking (wireRevocationScope
+// applies only qurl/resource/session). So the retry engine must NOT record a
+// pending proof entry for a cell-scoped fanout — otherwise the never-arriving ack
+// would age out to a FALSE RevocationAgedOut on every targeted AC once the engine
+// is armed. The skip is clean: not an untrackable invariant break, not an age-out.
+// Proven non-vacuously: the SAME well-formed conn IS tracked for an ackable scope.
+func TestRetryEngine_TrackFanoutUnackableScopeNotTracked(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s, _ := newRetryEngineServer(t, clk)
+	putRetryConn(s, "ac-1", 7)
+	conns := s.acConnectionMap["ac-1"]
+
+	// "cell" is accepted+fanned-out but unackable: it must not be tracked.
+	s.trackFanout(conns, "cell", "cell:cX", 3, "evt-cell")
+	if n := s.revocationRetry.pendingCount(); n != 0 {
+		t.Fatalf("pendingCount after cell-scoped fanout = %d, want 0 (cell is unackable, must not be tracked)", n)
+	}
+	counters := serverCounters(t, s)
+	if c := counters[MetricRevocationUntrackable]; c != 0 {
+		t.Fatalf("%s = %v, want 0 (an unackable scope is a clean skip, not an invariant break)", MetricRevocationUntrackable, c)
+	}
+	if c := counters[MetricRevocationAgedOut]; c != 0 {
+		t.Fatalf("%s = %v, want 0 (an unackable scope must never age out)", MetricRevocationAgedOut, c)
+	}
+
+	// Non-vacuous: the SAME well-formed conn IS tracked for an ackable scope, so
+	// the zero above is the scope gate, not a broken conn.
+	s.trackFanout(conns, "qurl", "qurl:qX", 3, "evt-qurl")
+	if n := s.revocationRetry.pendingCount(); n != 1 {
+		t.Fatalf("pendingCount after qurl-scoped fanout = %d, want 1 (an ackable scope must be tracked)", n)
+	}
+}
+
+// TestFanoutRevocation_SkipsNilAndNilPeerButSendsKeylessPeer fences the
+// fanoutRevocation defensive guard: a nil conn, or a conn with a nil ACPeer,
+// must be skipped without panicking on conn.ACPeer.PublicKey(), while a keyless
+// but non-nil ACPeer is still sent. This pins the documented send/track
+// asymmetry for malformed-registry entries — unreachable under current
+// invariants, so it has no production caller and is fenced here directly.
+func TestFanoutRevocation_SkipsNilAndNilPeerButSendsKeylessPeer(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s, sendCh := newRetryEngineServer(t, clk)
+
+	conns := []*ACConn{
+		nil, // nil conn: skipped, no panic
+		{ConnData: &core.ConnectionData{}, ACId: "ac-nilpeer"}, // nil ACPeer: skipped, no panic
+		{
+			ConnData: &core.ConnectionData{},
+			ACPeer:   &core.UdpPeer{PubKeyBase64: "", Type: core.NHP_AC},
+			ACId:     "ac-keyless",
+		},
+		{
+			ConnData: &core.ConnectionData{},
+			ACPeer:   &core.UdpPeer{PubKeyBase64: testPubkeyB64(9), Type: core.NHP_AC},
+			ACId:     "ac-valid",
+		},
+	}
+
+	sent, ok := s.fanoutRevocation(conns, []byte(`{"scope":"qurl"}`))
+	if !ok {
+		t.Fatal("fanoutRevocation ok=false, want true (no backpressure)")
+	}
+	if sent != 2 {
+		t.Fatalf("fanoutRevocation sent=%d, want 2 (keyless and well-formed conns)", sent)
+	}
+	msgs := drainAllSends(sendCh)
+	if len(msgs) != 2 {
+		t.Fatalf("enqueued %d messages, want exactly 2 NHP_REV", len(msgs))
+	}
+	for i, msg := range msgs {
+		if msg.HeaderType != core.NHP_REV {
+			t.Fatalf("message %d header type=%d, want NHP_REV", i, msg.HeaderType)
+		}
+	}
+	if len(msgs[0].PeerPk) != 0 {
+		t.Fatalf("keyless peer PeerPk len=%d, want 0", len(msgs[0].PeerPk))
+	}
+	if len(msgs[1].PeerPk) == 0 {
+		t.Fatal("well-formed peer PeerPk len=0, want non-empty")
 	}
 }
 

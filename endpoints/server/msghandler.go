@@ -359,12 +359,12 @@ const (
 	MetricRevocationReceived           = "RevocationReceived"
 	MetricRevocationFanoutSent         = "RevocationFanoutSent"
 	MetricRevocationFanoutBackpressure = "RevocationFanoutBackpressure"
-	// MetricRevocationAckReceived counts NHP_RACK acks the server received from
+	// MetricRevocationAckReceived counts NHP_RVA acks the server received from
 	// ACs (proof-of-delivery, P4e Slice 3 #2793), one per validated ack whose
 	// AC identity resolved from the authenticated connection pubkey. Pairs with
 	// the AC's MetricRevocationAckSent across the fleet.
 	MetricRevocationAckReceived = "RevocationAckReceived"
-	// MetricRevocationAckUnresolved counts NHP_RACK acks the server could not
+	// MetricRevocationAckUnresolved counts NHP_RVA acks the server could not
 	// attribute to a known AC connection (the authenticated pubkey matched no
 	// live ACConn). A spike means acks are arriving from connections the server
 	// no longer tracks (a drop/reconnect race) — the ack is ignored (the pending
@@ -390,7 +390,7 @@ const (
 	// MetricRevocationDeliveryLatency is the revocation-latency SLO histogram
 	// (#2792): one observation, in milliseconds, per revoke that an AC acked —
 	// the wall-clock from the server enqueuing the NHP_REV (firstSentAt) to that
-	// AC's NHP_RACK being attributed (clearAck), recorded via metrics.RecordLatency.
+	// AC's NHP_RVA being attributed (clearAck), recorded via metrics.RecordLatency.
 	// The SLO target, the "why 15s", the EMF-backs-p99 note, the complementary-
 	// signal relationship with MetricRevocationAgedOut, and the engine-armed
 	// emission coupling all live on RevocationDeliveryLatencyP99SLO

@@ -57,16 +57,16 @@ const (
 	// "AC Admission and Immediate Revocation" (P4e receive side).
 	NHP_REV
 
-	// NHP_RACK: AC acknowledges an NHP_REV back to the server (AC-to-server,
+	// NHP_RVA: AC acknowledges an NHP_REV back to the server (AC-to-server,
 	// LayerV extension). The AC sends one after it has processed an NHP_REV —
 	// proof-of-delivery for DE-Risk #5: the server tracks per-AC un-acked
 	// revokes and retries the NHP_REV until acked or aged out. Unlike NHP_ART
-	// (a transaction RESPONSE on the AC's NHP_AOP), NHP_RACK is an UNSOLICITED
+	// (a transaction RESPONSE on the AC's NHP_AOP), NHP_RVA is an UNSOLICITED
 	// AC→server push on the existing server-initiated connection, the mirror of
 	// NHP_REV. See docs/design/QURL_V2_KEYED_IDENTITY.md -> revocation
 	// "AC ack recorded for operational proof" + "retry until all known ACs
 	// acknowledge or age out" (P4e Slice 3, #2793).
-	NHP_RACK
+	NHP_RVA
 )
 
 var nhpHeaderTypeStrings []string = []string{
@@ -99,11 +99,11 @@ var nhpHeaderTypeStrings []string = []string{
 	"NHP_DBA", //server send ack to db after receiving db's online status
 	"DHP-KNK", //agent sends dhp knock to server
 	// Per-AC Server Assignment Messages (Phase 2)
-	"NHP-FWD",  // server forwards knock to assigned server (server-to-server)
-	"NHP-FRT",  // server returns forward result (server-to-server)
-	"NHP-ARD",  // server sends AC redispatch with assigned servers
-	"NHP-REV",  // server pushes a qURL v2 immediate-revocation event to the AC
-	"NHP-RACK", // AC acknowledges an NHP_REV back to the server (proof-of-delivery)
+	"NHP-FWD", // server forwards knock to assigned server (server-to-server)
+	"NHP-FRT", // server returns forward result (server-to-server)
+	"NHP-ARD", // server sends AC redispatch with assigned servers
+	"NHP-REV", // server pushes a qURL v2 immediate-revocation event to the AC
+	"NHP-RVA", // AC acknowledges an NHP_REV back to the server (proof-of-delivery)
 }
 
 func HeaderTypeToString(t int) string {
@@ -123,7 +123,7 @@ func HeaderTypeToDeviceType(t int) int {
 		return NHP_SERVER
 
 	case NHP_AOL, NHP_ART,
-		NHP_RACK: // AC→server revocation ack (P4e Slice 3)
+		NHP_RVA: // AC→server revocation ack (P4e Slice 3)
 		return NHP_AC
 
 	case NHP_RLY:
@@ -233,11 +233,11 @@ func (d *Device) CheckRecvHeaderType(t int) bool {
 	case NHP_SERVER:
 		switch t {
 		// NHP_FWD, NHP_FRT: Server-to-server forwarding (Phase 2 - Per-AC Assignment)
-		// NHP_RACK: AC→server revocation ack (P4e Slice 3, #2793) — unsolicited
+		// NHP_RVA: AC→server revocation ack (P4e Slice 3, #2793) — unsolicited
 		// AC push on the server-initiated connection, accepted on the server's
 		// receive path like NHP_AOL.
 		case NHP_REG, NHP_KNK, DHP_KNK, NHP_LST, NHP_RKN, NHP_EXT, NHP_ART, NHP_RLY, NHP_AOL, NHP_OTP, NHP_DRG, NHP_DAR, NHP_DAV, NHP_DOL, NHP_DWA,
-			NHP_FWD, NHP_FRT, NHP_RACK:
+			NHP_FWD, NHP_FRT, NHP_RVA:
 			return true
 		}
 	case NHP_AC:

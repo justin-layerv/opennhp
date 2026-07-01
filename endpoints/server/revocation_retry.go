@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/internal/revocationscope"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
@@ -19,7 +20,7 @@ import (
 // fire-and-forget UDP, so a lost NHP_REV leaves the AC's flow alive to natural
 // expiry. This engine records a pending entry per targeted live AC slot
 // (acId + authenticated AC pubkey) at fanout time, retransmits the NHP_REV on a
-// fixed cadence until that slot acks (NHP_RACK clears the pending entry) or an
+// fixed cadence until that slot acks (NHP_RVA clears the pending entry) or an
 // age-out deadline elapses, at which point it ticks the RevocationAgedOut
 // degraded metric (NEVER a silent drop) and drops the entry.
 //
@@ -32,7 +33,7 @@ import (
 // exactly what is required.
 //
 // ── Rollout gating (binary default OFF; managed fleets set ON) ──────────────
-// A fleet of pre-ack ACs never sends NHP_RACK, so with the engine ON every
+// A fleet of pre-ack ACs never sends NHP_RVA, so with the engine ON every
 // revoke would retry to age-out and storm RevocationAgedOut + retransmit load.
 // The engine therefore arms only when NHP_REVOCATION_RETRY_ENABLED=true.
 // Terraform-managed sandbox/prod render that env var now that AC ack support
@@ -73,7 +74,7 @@ const (
 	// RevocationDeliveryLatencyP99SLO is the qURL v2 revocation-latency SLO
 	// (#2792): the p99 wall-clock time from the server enqueuing an NHP_REV for
 	// an AC (firstSentAt, recorded in track at fanout time) to that AC's
-	// proof-of-delivery ack (NHP_RACK) landing and being attributed (clearAck).
+	// proof-of-delivery ack (NHP_RVA) landing and being attributed (clearAck).
 	// This is the measurable emit→ack span; the full revoke-API→AC-flush span is
 	// NOT observable server-side (qurl-service is the upstream API and the AC
 	// flush/apply path is gated off — see #2792), so emit→ack is the proxy the
@@ -91,9 +92,14 @@ const (
 	// (defaultRevocationRetryAgeOut, ~60s): a revoke un-acked past the age-out
 	// becomes RevocationAgedOut and is dropped WITHOUT recording a latency sample,
 	// so the recorded MetricRevocationDeliveryLatency distribution is bounded
-	// [~0, ageOut) by construction. With 15s < 60s a genuine p99 breach is
-	// observable in the histogram (rather than silently censored into the
-	// age-out counter). The two signals are complementary: this SLO alarms on
+	// [~0, ageOut + interval) by construction. The "+ interval" is one-tick slop:
+	// age-out is detected on the retry ticker (collectDue), so an ack that lands
+	// between crossing firstSentAt+ageOut and the next tick is still recorded (as a
+	// sample slightly above ageOut) rather than censored — which is harmless, since
+	// censoring only threatens samples we DROP, not ones we keep. With 15s well
+	// below 60s a genuine p99 breach is observable in the histogram (rather than
+	// silently censored into the age-out counter). The two signals are
+	// complementary: this SLO alarms on
 	// SLOW-but-delivered revokes; MetricRevocationAgedOut alarms on
 	// NEVER-delivered ones. Neither alone proves delivery — see the alarm wiring
 	// in terraform/modules/monitoring/main.tf, kept in lockstep with this value.
@@ -155,7 +161,7 @@ func parseRevocationRetryDuration(raw string, def, floor time.Duration) (time.Du
 // slot. ACId is the configured AC group identifier, while acPubkey is the
 // authenticated AC slot identity (ACPeer.PubKeyBase64). The pubkey is the
 // uniqueness proof: acConnectionMap can hold multiple blue/green slots under
-// one acId, and one slot's NHP_RACK must not clear a sibling slot that may have
+// one acId, and one slot's NHP_RVA must not clear a sibling slot that may have
 // missed the NHP_REV. ACId stays in the key to preserve the server's targeting
 // and logging boundary, not because acId alone proves uniqueness. Keying by
 // (acId, acPubkey, scope, scopeKey) lets a higher epoch for the same live slot
@@ -356,6 +362,20 @@ func (s *UdpServer) trackFanout(conns []*ACConn, scope, scopeKey string, epoch i
 	if s.revocationRetry == nil {
 		return
 	}
+	// Only track scopes the AC will acknowledge (NHP_RVA). The AC applies+acks
+	// qurl/resource/session and DROPS "cell" without acking (a server-side fanout
+	// selector with no AC-local index). Recording a pending proof entry for an
+	// unackable scope would guarantee a never-arriving ack → a false
+	// RevocationAgedOut on every targeted AC once the engine is armed (#2793). The
+	// ackable set is the SHARED single source of truth in
+	// endpoints/internal/revocationscope that the AC's wireRevocationScope gate
+	// also derives from, so the two cannot drift. The scope is identical for the
+	// whole fanout, so this gate is per-call, not per-conn.
+	if !revocationscope.Contains(scope) {
+		log.Debug("server-ac[RevocationRetry] not tracking fanout for unackable scope=%q (AC drops it without ack); no proof-of-delivery entry (key=%q epoch=%d eventId=%q)",
+			scope, scopeKey, epoch, eventId)
+		return
+	}
 	for _, conn := range conns {
 		if conn == nil {
 			continue
@@ -386,7 +406,7 @@ func (s *UdpServer) trackFanout(conns []*ACConn, scope, scopeKey string, epoch i
 	}
 }
 
-// clearPendingRevocationAck clears the pending entry an AC slot's NHP_RACK
+// clearPendingRevocationAck clears the pending entry an AC slot's NHP_RVA
 // acknowledges and, on a clear, records the emit→ack revocation-delivery latency
 // into the SLO histogram (MetricRevocationDeliveryLatency, #2792). Called by
 // HandleRevocationAck after it has attributed the ack to acId + authenticated

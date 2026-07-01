@@ -573,12 +573,12 @@ variable "revocation_retry_enabled" {
   description = <<-EOT
     Set NHP_REVOCATION_RETRY_ENABLED for the server's qURL v2 NHP_REV
     proof-of-delivery engine (#2793): each targeted live AC slot must ACK
-    (NHP_RACK) or the server retries until the age-out deadline and emits
+    (NHP_RVA) or the server retries until the age-out deadline and emits
     RevocationAgedOut.
 
     Default false matches the Go binary's absent-env OFF behavior and the
     sibling security-gate convention: module consumers must opt in explicitly
-    after confirming the target AC fleet is NHP_RACK-capable. Sandbox/prod
+    after confirming the target AC fleet is NHP_RVA-capable. Sandbox/prod
     opt in via environment tfvars. Set this false as an emergency rollback or
     when intentionally deploying a mixed/pre-ACK fleet; doing so returns
     NHP_REV fanout to fire-and-forget semantics and should block relying on
