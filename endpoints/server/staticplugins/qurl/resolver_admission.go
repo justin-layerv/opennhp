@@ -136,11 +136,13 @@ type internalAdmissionPrepareResponse struct {
 // on resource + SESSION facts, NOT on qURL status — so a consumed one-time-use
 // qURL whose session is still live keeps re-knocking until its own lifetime ends.
 //
-// authorize does NOT re-verify the issuer signature or proof-of-possession: the
-// inner identity was bound once at admission. The integrity boundary therefore
-// lives in the CALLER (authWithNHPClaims runs sig + liveness + cell + PoP +
-// resource-binding BEFORE calling AuthorizeAdmission); the authenticated key
-// here is the already-verified Noise IK key, used only to resolve the session.
+// authorize does NOT receive unsigned duplicate resource/cell identities and
+// does NOT re-verify the issuer signature: the integrity boundary lives in the
+// CALLER (authWithNHPClaims runs sig + signed-claims liveness + cell + PoP +
+// resource-binding BEFORE calling AuthorizeAdmission). qurl-service's authority
+// on this path is the hot session/state read: it resolves the authenticated key
+// to a live session and returns remaining_seconds from authoritative state, not
+// from any positive admission cache.
 type AdmissionAuthorizeRequest struct {
 	// AuthenticatedQurlPublicKeyB64 is the per-qURL user public key NHP
 	// authenticated from the Noise IK handshake (req.PublicKey). It resolves the

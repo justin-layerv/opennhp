@@ -644,18 +644,25 @@ Steady-state re-knocks should call an idempotent authorize endpoint:
 
 ```http
 POST /internal/v2/qurl/admissions/authorize
+X-Request-ID: ...
 
 {
-  "qurl_user_public_key_b64": "...",
-  "resource_public_key_b64": "...",
-  "src_ip": "203.0.113.10",
+  "authenticated_qurl_public_key_b64": "...",
+  "client_ip": "203.0.113.10",
   "visitor_session_id": "...",
-  "request_id": "..."
+  "ac_id": "..."
 }
 ```
 
-The response returns `remaining_seconds` and AC routing metadata. NHP clamps
-`OpenTime` to `remaining_seconds` before opening/refreshing the AC pinhole.
+Unlike prepare, authorize does not accept unsigned duplicate resource or qURL
+identity fields. NHP must first run the local qv2 integrity boundary again on the
+re-knock (issuer signature, signed `nbf`/`exp` liveness with skew, cell binding,
+proof-of-possession, and resource binding). qurl-service then resolves the
+already-authenticated qURL public key plus session match facts against its
+authoritative hot state. A live session returns `remaining_seconds` and AC
+routing metadata; no positive admission cache may allow a revoked or expired
+session to refresh. NHP clamps `OpenTime` to `remaining_seconds` before
+opening/refreshing the AC pinhole.
 
 Re-knock semantics for one-time-use qURLs: a one-time-use qURL becomes `consumed`
 after first admission, but its session must remain valid for `session_duration`.

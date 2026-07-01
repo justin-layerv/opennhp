@@ -600,6 +600,63 @@ func TestAuthWithNHPClaims_ConsumedReKnock_AuthorizeRefreshes_SessionSurvives(t 
 	}
 }
 
+// TestAuthWithNHPClaims_LivenessPrecedesAuthorizeRefresh is the #2770 fence:
+// an expired or not-yet-valid signed qv2 claim must be rejected BEFORE NHP asks
+// qurl-service to refresh a live session. The fake authorize endpoint is hostile
+// and would return a valid live-session refresh if contacted; the correct path
+// never calls it, because signed exp/nbf liveness is part of NHP's local
+// integrity boundary and is checked before any qurl-service side effect.
+func TestAuthWithNHPClaims_LivenessPrecedesAuthorizeRefresh(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(claims map[string]any)
+	}{
+		{
+			name: "expired claims",
+			mutate: func(claims map[string]any) {
+				now := time.Now().Unix()
+				claims["iat"] = now - 1000
+				claims["nbf"] = now - 1000
+				claims["exp"] = now - 500 // well past skew
+			},
+		},
+		{
+			name: "not yet valid claims",
+			mutate: func(claims map[string]any) {
+				now := time.Now().Unix()
+				claims["iat"] = now - 10   // already issued; only nbf is in the future
+				claims["nbf"] = now + 1000 // future beyond skew
+				claims["exp"] = now + 2000
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newV2Fixture(t, tt.mutate)
+			enableV2(t, f.issuer.trustStore(t))
+
+			rec := newAdmissionRecorder(t, defaultACRouting())
+			rec.liveAuthorize("sess_stale_claim_should_not_refresh", 120, defaultACRouting())
+			setRecordingResolver(t, rec)
+
+			ack, err := AuthWithNHP(f.req, f.helper(nil))
+			if err == nil {
+				t.Fatal("stale signed claims must produce an error ack")
+			}
+			if ack.ErrCode != common.ErrQurlSessionExpired.ErrorCode() {
+				t.Errorf("ack.ErrCode = %q, want ErrQurlSessionExpired", ack.ErrCode)
+			}
+			if *f.openedCalled {
+				t.Error("AC must NOT open when signed claim liveness fails")
+			}
+			if got := rec.callOrder(); len(got) != 0 {
+				t.Fatalf("signed claim liveness must reject before any qurl-service authorize/prepare call; got %v", got)
+			}
+		})
+	}
+}
+
 // TestAuthWithNHPClaims_RevokedQurlReKnock_AuthorizeDenies_PrepareReDenies proves
 // the safe side of authorize's 403-conflation: when the qURL itself is revoked,
 // authorize finds no live session (403 -> fall through) AND prepare re-denies
@@ -769,6 +826,7 @@ func TestAuthWithNHPClaims_CryptoChecksFailClosed(t *testing.T) {
 			setup: func(t *testing.T) (*v2Fixture, *plugins.NhpServerPluginHelper) {
 				f := newV2Fixture(t, func(claims map[string]any) {
 					now := time.Now().Unix()
+					claims["iat"] = now - 10   // already issued; only nbf is in the future
 					claims["nbf"] = now + 1000 // future beyond skew
 					claims["exp"] = now + 2000
 				})
