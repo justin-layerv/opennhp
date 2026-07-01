@@ -784,8 +784,8 @@ def check_shared_resources(repo: Path) -> None:
     )
     require_block_text(
         qurl_browser_rejected_ratio,
-        "IF(resolve_attempts > 0, FILL(rejected, 0) / resolve_attempts, 0)",
-        "qURL browser rejected alarms must remain normalized by resolve attempts",
+        "IF(resolve_attempts >= ${local.qurl_browser_rejected_min_resolve_attempts}, FILL(rejected, 0) / resolve_attempts, 0)",
+        "qURL browser rejected alarms must remain normalized by resolve attempts and gated by the low-volume floor",
     )
     require_block_text(
         qurl_browser_rejected_ratio,

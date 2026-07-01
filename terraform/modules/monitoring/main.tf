@@ -91,6 +91,31 @@ locals {
     }
   }
 
+  # Minimum qURL resolve attempts (denominator) in a 5-minute period before the
+  # rejected-fields ratio is trusted enough to page (#2924 activation review).
+  # Below this floor the ratio expression returns 0 (notBreaching): a handful of
+  # resolve attempts — where a single forged request can contribute up to six
+  # rejected timing fields (recordBrowserTimings,
+  # endpoints/server/staticplugins/qurl/main.go) — must not breach on a tiny
+  # denominator. A real forged-timing burst still pages: recordBrowserTimings
+  # runs only after a request clears ValidateAccessToken (a token-format failure
+  # returns before browser timings are parsed), so every request that can
+  # increment the numerator lands in exactly one resolve outcome
+  # (QurlResolveSuccess or a QurlResolveFail*), all of which are in the
+  # denominator. The numerator cannot move without lifting resolve_attempts in
+  # lockstep, so a burst climbs past this floor. Worst case in a window that just
+  # clears the floor (~20 attempts, one of them forged with up-to-six fields):
+  # 6/20 = 0.30 — not greater than the 0.30 out-of-range threshold (so
+  # GreaterThanThreshold does not breach it), but above the 0.20 malformed one;
+  # that per-threshold boundary shifts if the floor is retuned. The real safety is
+  # datapoints_to_alarm=3: even that malformed case must stay breaching across
+  # three 5-minute windows to page — real forgery, not a single-window blip. The load-bearing
+  # calibration is the per-cell resolve_attempts distribution, tuned against live
+  # data during the #1840 bake before flipping
+  # var.qurl_browser_rejected_alarm_actions_enabled. The ratio only falls (never
+  # rises) versus the 2026-06-30 baseline, so the report-only bake stays valid.
+  qurl_browser_rejected_min_resolve_attempts = 20
+
   # Knock forward-path health alarms (issue #2449). Both share the
   # single-event-detector shape below (see the resource for the calibration
   # rationale); they differ only in which counter they watch. A map + for_each
@@ -987,6 +1012,18 @@ resource "aws_cloudwatch_metric_alarm" "internal_security_failure" {
 # stable against total endpoint traffic rather than only successful knocks.
 # The #2924 activation follow-up must verify the ratio still moves under an
 # intentional forged-timing burst before enabling actions.
+#
+# Low-volume floor (#2924): the ratio is gated on resolve_attempts >=
+# local.qurl_browser_rejected_min_resolve_attempts (see that local for the
+# rationale) so a tiny denominator cannot breach. This also settles the
+# datapoints_to_alarm=3 / evaluation_periods=3 false-negative raised in #2924:
+# a sub-15-minute forged-timing spike is intentionally NOT paged (report-only
+# shaping) — sparse cells below the floor evaluate to 0, and cells above it need
+# three consecutive breaching 5-minute datapoints. Sustained forgery, the actual
+# threat model, persists across those datapoints and pages; brief bursts stay
+# visible on the raw QurlResolveBrowserRejected* counters. Tightening M/N would
+# trade this for false positives against the floor's noise goal, so 3-of-3 and
+# the floor are the calibrated pair.
 # This alarm uses 8 of CloudWatch PutMetricAlarm's 10 MetricStat slots
 # (1 rejected counter + 7 outcome counters) plus 2 of its 10 Expression slots
 # (10 of 20 total MetricDataQuery entries). If another terminal QurlResolve
@@ -999,11 +1036,13 @@ resource "aws_cloudwatch_metric_alarm" "internal_security_failure" {
 # total publisher death. This sparse ratio intentionally stays notBreaching when
 # no qURL resolve metrics are emitted.
 #
-# Rollout posture: alarm and OK actions are wired but paused by default while
-# the alarms bake against live sandbox/prod data. Before flipping
-# var.qurl_browser_rejected_alarm_actions_enabled, the #2924 activation review
-# must explicitly keep or remove OK recovery notifications for this sensitive
-# sparse-ratio alarm.
+# Rollout posture: alarm and OK actions are wired but paused by default
+# (actions_enabled=false) while the alarms bake against live sandbox/prod data.
+# The flip to var.qurl_browser_rejected_alarm_actions_enabled=true stays gated on
+# the 7-day #1840 bake, tracked in #2924. #2924 decision: keep OK recovery
+# notifications — a forged-timing alarm's on-call needs the "forgery subsided"
+# signal, and the 3-of-3 datapoints damp flapping; revisit only if the bake
+# surfaces OK-side flap.
 resource "aws_cloudwatch_metric_alarm" "qurl_browser_rejected_ratio" {
   for_each = local.qurl_browser_rejected_alarms
 
@@ -1020,7 +1059,7 @@ resource "aws_cloudwatch_metric_alarm" "qurl_browser_rejected_ratio" {
 
   metric_query {
     id          = "ratio"
-    expression  = "IF(resolve_attempts > 0, FILL(rejected, 0) / resolve_attempts, 0)"
+    expression  = "IF(resolve_attempts >= ${local.qurl_browser_rejected_min_resolve_attempts}, FILL(rejected, 0) / resolve_attempts, 0)"
     label       = each.value.label
     return_data = true
   }

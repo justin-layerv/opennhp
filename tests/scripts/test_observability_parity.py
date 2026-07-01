@@ -145,6 +145,8 @@ QURL_BROWSER_REJECTED_RATIO_BLOCK = textwrap.dedent(
           metric_name = "QurlResolveBrowserRejectedOutOfRange"
         }
       }
+
+      qurl_browser_rejected_min_resolve_attempts = 20
     }
 
     resource "aws_cloudwatch_metric_alarm" "qurl_browser_rejected_ratio" {
@@ -162,7 +164,7 @@ QURL_BROWSER_REJECTED_RATIO_BLOCK = textwrap.dedent(
 
       metric_query {
         id          = "ratio"
-        expression  = "IF(resolve_attempts > 0, FILL(rejected, 0) / resolve_attempts, 0)"
+        expression  = "IF(resolve_attempts >= ${local.qurl_browser_rejected_min_resolve_attempts}, FILL(rejected, 0) / resolve_attempts, 0)"
         return_data = true
       }
 
@@ -977,7 +979,7 @@ class ObservabilityParityTests(unittest.TestCase):
             monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
             monitoring_main.write_text(
                 monitoring_main.read_text(encoding="utf-8").replace(
-                    "IF(resolve_attempts > 0, FILL(rejected, 0) / resolve_attempts, 0)",
+                    "IF(resolve_attempts >= ${local.qurl_browser_rejected_min_resolve_attempts}, FILL(rejected, 0) / resolve_attempts, 0)",
                     "FILL(rejected, 0)",
                     1,
                 ),
@@ -989,6 +991,31 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("qurl_browser_rejected_ratio", result.stderr)
         self.assertIn("normalized by resolve attempts", result.stderr)
+
+    def test_qurl_browser_rejected_ratio_missing_floor_fails(self) -> None:
+        # Dropping the low-volume floor back to `> 0` (the pre-#2924 guard) must
+        # trip the lint: the gating *structure* (`>=` the floor local) is the hard
+        # contract. The floor *value* stays tunable during the bake — the pinned
+        # needle references the local, not the literal 20 — so retuning 20 does
+        # not trip this.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            monitoring_main = root / "terraform" / "modules" / "monitoring" / "main.tf"
+            monitoring_main.write_text(
+                monitoring_main.read_text(encoding="utf-8").replace(
+                    ">= ${local.qurl_browser_rejected_min_resolve_attempts}",
+                    "> 0",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_browser_rejected_ratio", result.stderr)
+        self.assertIn("low-volume floor", result.stderr)
 
     def test_qurl_browser_rejected_ratio_numerator_wiring_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
