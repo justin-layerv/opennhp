@@ -56,3 +56,32 @@ func TestNHPIngressTLSURL(t *testing.T) {
 		})
 	}
 }
+
+// TestPublicKnockSurfaceFromMarker locks the fail-closed truth table behind
+// serverPublicKnockSurfaceEnabled, which gates the server/udp listener check in
+// TestBlueGreen_ActiveListenersPointToActiveColorTGs (#2628). The security-
+// relevant case is that ONLY an explicit "true" marker suppresses the check:
+// any other value — including a missing (ok=false) or empty marker — must keep
+// the udp-listener assertion live so a dropped public listener fails loud
+// instead of being mistaken for an intended take-server-private state.
+func TestPublicKnockSurfaceFromMarker(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     string
+		present bool
+		want    bool
+	}{
+		{"marker_true_means_private_skip_udp", "true", true, false},
+		{"marker_false_means_public_run_udp", "false", true, true},
+		{"marker_missing_fails_closed_public", "", false, true},
+		{"marker_present_but_empty_stays_public", "", true, true},
+		{"marker_unexpected_value_stays_public", "yes", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := publicKnockSurfaceFromMarker(tc.val, tc.present); got != tc.want {
+				t.Errorf("publicKnockSurfaceFromMarker(%q, %v) = %v, want %v", tc.val, tc.present, got, tc.want)
+			}
+		})
+	}
+}

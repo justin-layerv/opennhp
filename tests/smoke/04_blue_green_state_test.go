@@ -106,26 +106,32 @@ func TestBlueGreen_ActiveListenersPointToActiveColorTGs(t *testing.T) {
 	acActive := requireActiveACColor(t)
 	env := testConfig.Environment
 
-	// Listeners to verify: server UDP (NHP wire protocol), AC TCP (customer
-	// proxied traffic), and — only where the resolve endpoint is deployed —
-	// server HTTPS (QURL resolve). The JS-agent + relay topology removes the
-	// server HTTPS listener entirely: terraform gates both the listener and
-	// its /{env}/nhp/server/https-listener-arn SSM param on
-	// enable_qurl_resolve_endpoint (modules/compute/blue_green.tf), so the
-	// param is absent in JS-agent envs and a static three-listener check
-	// would fail on a missing SSM param. UDP + AC TCP blue/green is
-	// unaffected. If any listed param is missing the test fails (not skips).
+	// Listeners to verify: AC TCP (customer proxied traffic) always; server/udp
+	// (NHP knock) and server/https (QURL resolve) only where their respective
+	// public surface is still deployed. Two independent #2628/#2208 topology
+	// gates each remove a server-side public listener and its SSM param, so a
+	// static three-listener check would fail on the now-absent param — append
+	// each on its own signal:
+	//   - server/udp:   serverPublicKnockSurfaceEnabled(t)  (take_server_private)
+	//   - server/https: testConfig.ResolveEndpointEnabled   (qurl_link_js_agent)
+	// The two gates are independent and must NOT be collapsed — see the
+	// serverPublicKnockSurfaceEnabled doc and CLAUDE.md's resolve-endpoint gate
+	// section for why (distinct surfaces, one-way precondition, valid
+	// resolve-off+UDP-public intermediate state). Any param listed below that is
+	// missing fails the test (not skips); the gates decide inclusion.
 	checks := []listenerToTGCheck{
-		{
-			label:          "server/udp",
-			listenerSSM:    "/" + env + "/nhp/server/udp-listener-arn",
-			activeTGSSMKey: "/" + env + "/nhp/server/" + serverActive + "-udp-tg-arn",
-		},
 		{
 			label:          "ac/tcp",
 			listenerSSM:    "/" + env + "/nhp/ac/tcp-listener-arn",
 			activeTGSSMKey: "/" + env + "/nhp/ac/" + acActive + "-tcp-tg-arn",
 		},
+	}
+	if serverPublicKnockSurfaceEnabled(t) {
+		checks = append(checks, listenerToTGCheck{
+			label:          "server/udp",
+			listenerSSM:    "/" + env + "/nhp/server/udp-listener-arn",
+			activeTGSSMKey: "/" + env + "/nhp/server/" + serverActive + "-udp-tg-arn",
+		})
 	}
 	if testConfig.ResolveEndpointEnabled {
 		checks = append(checks, listenerToTGCheck{

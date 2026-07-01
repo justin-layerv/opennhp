@@ -172,8 +172,28 @@ smoke mirror is `derivedEndpoints.ResolveEndpointEnabled`
 where the surface is live (prod, and the localhost stack). `01_health`,
 `09_resolve_origin_idle_timeout`, `10_resolve` (the v1 server-403 tests),
 `12_qurl_browser_timings`, `13_plugins`, `14_internal_api`, `24_timing`
-all carry the gate; `04_blue_green` drops just its `server/https` listener
-check.
+all carry the gate; `04_blue_green` drops its `server/https` listener check
+on this gate.
+
+**A second, independent gate covers the UDP knock surface (#2628).**
+`take_server_private` (→ `public_server_surface_enabled = !take_server_private`)
+removes the *public* UDP 62206 NLB, its listener, and the
+`udp-listener-arn` / `{color}-udp-tg-arn` SSM params — the relay/AC then reach
+the cell over the internal NLB (a static single-TG forward, no active-color flip
+to assert). This is **distinct from** the resolve/JS-agent gate above:
+`take_server_private=true` *requires* the resolve endpoint already be off
+(`terraform/main.tf` precondition), but not vice-versa, so "resolve off + UDP
+still public" is a valid intermediate rollout state (sandbox pre-#2628; prod
+today has both public). Do **not** collapse the two gates — that would silently
+skip the UDP-listener assertion while the public knock surface is still live.
+`04_blue_green`'s `server/udp` check gates on `serverPublicKnockSurfaceEnabled(t)`,
+which reads the Terraform-owned `/{env}/nhp/server/take-server-private` marker
+directly from SSM (present in every blue/green env; value flips between states)
+rather than a hardcoded env-list mirror — so unlike `ResolveEndpointEnabled` it
+needs no drift-fence test, and it mirrors `blue-green-switch.sh`'s fail-closed
+policy: skip the check ONLY when the marker is explicitly `"true"`, else keep it
+live so a dropped public listener fails loud. Pure truth table locked in
+`config_test.go::TestPublicKnockSurfaceFromMarker`.
 
 `ResolveEndpointEnabled` MUST stay the inverse of
 `qurlLinkJSAgentEnabledEnvs` (the `16_qurl_link_frontend_test.go` mirror of
