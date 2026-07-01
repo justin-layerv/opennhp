@@ -176,6 +176,7 @@ gh workflow run blue-green-deploy.yml \
   -f component=both \
   -f action=deploy \
   -f image_tag="$HEAD_SHA" \
+  -f cell_id=cell0 \
   -f correlation_id="$BG_CORRELATION_ID"
 
 # 24 retries × 5s = 120s window. gh run list has a ~30s

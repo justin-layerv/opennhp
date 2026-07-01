@@ -33,6 +33,7 @@ COMPONENT="$1"
 IMAGE_TAG="$2"
 ENVIRONMENT="$3"
 CELL_ID="$4"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 POLL_INTERVAL=30
 POLL_TIMEOUT=2400  # 40 minutes (10-min buffer before 50-min job timeout)
@@ -41,6 +42,10 @@ POLL_TIMEOUT=2400  # 40 minutes (10-min buffer before 50-min job timeout)
 # freshly-dispatched runs appear, so anything under ~45s races the
 # API. Matches dispatch-and-poll-blue-green.sh.
 FIND_RETRIES=24
+# shellcheck source=.github/scripts/emit-deployment-window-metric.sh
+source "$SCRIPT_DIR/emit-deployment-window-metric.sh"
+# The promote-to-prod caller exports DEPLOYMENT_WINDOW_*; when unset, the
+# helper intentionally no-ops so standalone dispatches are unaffected.
 
 echo "::notice::Deploying $COMPONENT via canary (Step Functions)"
 
@@ -53,6 +58,8 @@ echo "::notice::Deploying $COMPONENT via canary (Step Functions)"
 # and matching on it in the run's display title is unambiguous.
 CORRELATION_ID="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-$(date +%s)-$$"
 echo "::notice::correlation_id: $CORRELATION_ID"
+
+emit_deployment_window_metric_throttled
 
 gh workflow run canary-deploy.yml \
   --ref main \
@@ -81,6 +88,8 @@ ELAPSED=0
 LAST_JOBS=""
 
 while [[ $ELAPSED -lt $POLL_TIMEOUT ]]; do
+  emit_deployment_window_metric_throttled
+
   STATUS=$(gh run view "$RUN_ID" --json status,conclusion --jq '.status' 2>/dev/null || echo "unknown")
 
   if [[ "$STATUS" == "completed" ]]; then

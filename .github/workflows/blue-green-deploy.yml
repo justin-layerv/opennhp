@@ -52,6 +52,11 @@ on:
         description: 'Image tag to deploy (required for deploy action)'
         required: false
         type: string
+      cell_id:
+        description: 'Cell identifier for deploy-window markers and AC assignment cleanup'
+        required: false
+        default: 'cell0'
+        type: string
       skip_validation:
         description: 'Skip post-switch validation'
         required: false
@@ -567,6 +572,15 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Mark Deployment Window
+        if: (needs.prepare.outputs.deploy_server == 'true' || needs.prepare.outputs.deploy_ac == 'true') && inputs.dry_run != true
+        uses: ./.github/actions/mark-deployment-window
+        with:
+          environment: ${{ inputs.environment }}
+          cell_id: ${{ inputs.cell_id }}
+          component: ${{ inputs.component }}
+          strategy: blue-green-standby
+
       # ---- Server Deploy Steps ----
       - name: "[Server] Validate Image Exists in ECR"
         id: server-image
@@ -753,6 +767,11 @@ jobs:
           DEPLOY_SERVER: ${{ needs.prepare.outputs.deploy_server }}
           DEPLOY_AC: ${{ needs.prepare.outputs.deploy_ac }}
           REFRESH_TIMEOUT_MINUTES: ${{ inputs.refresh_timeout_minutes }}
+          DEPLOYMENT_WINDOW_ENVIRONMENT: ${{ inputs.environment }}
+          DEPLOYMENT_WINDOW_CELL_ID: ${{ inputs.cell_id }}
+          DEPLOYMENT_WINDOW_COMPONENT: ${{ inputs.component }}
+          DEPLOYMENT_WINDOW_STRATEGY: blue-green-standby-refresh
+          DEPLOYMENT_WINDOW_EMIT_INTERVAL_SECONDS: '60'
         run: |
           set -euo pipefail
           # shellcheck source=.github/scripts/wait-for-instance-refresh.sh
@@ -938,6 +957,15 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Mark Deployment Window
+        if: (needs.prepare.outputs.deploy_server == 'true' || needs.prepare.outputs.deploy_ac == 'true') && inputs.dry_run != true
+        uses: ./.github/actions/mark-deployment-window
+        with:
+          environment: ${{ inputs.environment }}
+          cell_id: ${{ inputs.cell_id }}
+          component: ${{ inputs.component }}
+          strategy: blue-green-switch
+
       - name: "[Server] Switch NLB Listeners"
         if: needs.prepare.outputs.deploy_server == 'true'
         env:
@@ -991,9 +1019,9 @@ jobs:
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
           ENVIRONMENT: ${{ inputs.environment }}
+          CELL_ID: ${{ inputs.cell_id }}
         run: |
           set -euo pipefail
-          CELL_ID="cell0"  # Single cell today; parameterize when multi-cell ships
           chmod +x .github/scripts/clear-ac-assignments.sh
           .github/scripts/clear-ac-assignments.sh "$ENVIRONMENT" "$CELL_ID"
 

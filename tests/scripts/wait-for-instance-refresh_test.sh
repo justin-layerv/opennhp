@@ -57,6 +57,10 @@ if [[ -n "${FAKE_DATE_SEQUENCE:-}" ]]; then
   printf '%s\n' "${values[$index]}"
   exit 0
 fi
+if [[ -n "${FAKE_DATE_FAIL:-}" ]]; then
+  echo "simulated date failure" >&2
+  exit 1
+fi
 
 /bin/date "$@"
 DATE
@@ -96,6 +100,15 @@ if [[ -n "${FAKE_EXPECT_REGION:-}" ]]; then
 fi
 
 case "$1 $2" in
+  "cloudwatch put-metric-data")
+    count_file="$STATE_DIR/deployment-window-count"
+    count=0
+    [[ -f "$count_file" ]] && count=$(cat "$count_file")
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+    printf '%s\n' "$*" >> "$STATE_DIR/deployment-window-log"
+    ;;
+
   "autoscaling describe-instance-refreshes")
     if [[ "$ASG_NAME" != "$EXPECTED_ASG" ]]; then
       echo "unexpected ASG name: got '$ASG_NAME', expected '$EXPECTED_ASG'" >&2
@@ -352,6 +365,30 @@ run_source_case source-error-reset FAKE_DESCRIBE_MODE=nonconsecutive-errors
 assert_rc "sourceable helper resets error budget after successful describe" 0
 assert_contains "error-budget reset case eventually succeeds" "Blue instance refresh refresh-test completed successfully"
 assert_file_equals "error-budget reset case reaches fourth poll" "$LAST_STATE_DIR/describe-count" "4"
+
+run_source_case deployment-window-heartbeat \
+  FAKE_DATE_SEQUENCE="100 161" \
+  FAKE_DESCRIBE_MODE=successful \
+  DEPLOYMENT_WINDOW_ENVIRONMENT=prod \
+  DEPLOYMENT_WINDOW_CELL_ID=cell0 \
+  DEPLOYMENT_WINDOW_COMPONENT=server \
+  DEPLOYMENT_WINDOW_STRATEGY=promote \
+  DEPLOYMENT_WINDOW_EMIT_INTERVAL_SECONDS=60
+assert_rc "sourceable helper with deployment-window heartbeat succeeds" 0
+assert_contains "deployment-window heartbeat logs metric push" "DeploymentWindow metric pushed (Environment=prod Cell=cell0 Component=server Strategy=promote)"
+assert_file_equals "deployment-window heartbeat emits during each long poll interval" "$LAST_STATE_DIR/deployment-window-count" "2"
+
+run_source_case deployment-window-date-failure \
+  FAKE_DATE_FAIL=1 \
+  FAKE_DESCRIBE_MODE=successful \
+  DEPLOYMENT_WINDOW_ENVIRONMENT=prod \
+  DEPLOYMENT_WINDOW_CELL_ID=cell0 \
+  DEPLOYMENT_WINDOW_COMPONENT=ac \
+  DEPLOYMENT_WINDOW_STRATEGY=promote \
+  DEPLOYMENT_WINDOW_EMIT_INTERVAL_SECONDS=60
+assert_rc "deployment-window heartbeat date failure still succeeds" 0
+assert_contains "deployment-window heartbeat date failure warns" "::warning::date +%s failed while throttling DeploymentWindow heartbeat; using shell monotonic fallback"
+assert_file_equals "deployment-window heartbeat date failure throttles on shell fallback" "$LAST_STATE_DIR/deployment-window-count" "1"
 
 run_case persistent-error FAKE_DESCRIBE_MODE=persistent-error
 assert_rc "persistent describe errors fail loud" 1

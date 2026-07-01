@@ -1,0 +1,30 @@
+name: 'Mark Deployment Window'
+description: 'Emit a qURL v2 DeploymentWindow metric for revocation age-out paging suppression.'
+
+inputs:
+  environment:
+    description: 'Deployment environment dimension.'
+    required: true
+  cell_id:
+    description: 'Cell dimension.'
+    required: true
+  component:
+    description: 'Log-only component breadcrumb.'
+    required: true
+  strategy:
+    description: 'Log-only deployment strategy breadcrumb.'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Emit DeploymentWindow
+      shell: bash
+      env:
+        ENVIRONMENT: ${{ inputs.environment }}
+        CELL_ID: ${{ inputs.cell_id }}
+        COMPONENT: ${{ inputs.component }}
+        STRATEGY: ${{ inputs.strategy }}
+      run: |
+        # Component/strategy are log-only; metric dimensions stay {Environment, Cell}.
+        bash "$GITHUB_ACTION_PATH/../../scripts/emit-deployment-window-metric.sh" "$ENVIRONMENT" "$CELL_ID" "$COMPONENT" "$STRATEGY"

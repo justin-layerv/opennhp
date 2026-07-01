@@ -15,6 +15,11 @@
 #
 # Environment:
 #   AWS_REGION: Region to pass to AWS CLI calls when set.
+#   DEPLOYMENT_WINDOW_ENVIRONMENT, DEPLOYMENT_WINDOW_CELL_ID,
+#   DEPLOYMENT_WINDOW_COMPONENT, DEPLOYMENT_WINDOW_STRATEGY: when all are set,
+#     emit the revocation DeploymentWindow metric while polling long refreshes.
+#   DEPLOYMENT_WINDOW_EMIT_INTERVAL_SECONDS: minimum seconds between heartbeat
+#     emits from this shell (default: 60).
 #   INSTANCE_REFRESH_HEALTH_CHECK_SETTLE_SECONDS: Seconds to wait before reading
 #     a canary SSM command result (default: 10).
 #
@@ -29,6 +34,10 @@ wait_refresh_aws() {
     aws "$@"
   fi
 }
+
+WAIT_REFRESH_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.github/scripts/emit-deployment-window-metric.sh
+source "$WAIT_REFRESH_SCRIPT_DIR/emit-deployment-window-metric.sh"
 
 wait_refresh_timeout() {
   local label="$1"
@@ -110,6 +119,8 @@ wait_for_instance_refresh() {
   echo "Waiting for $subject..."
   describe_err=$(mktemp)
   for ((iteration = 1; iteration <= max_iterations; iteration++)); do
+    emit_deployment_window_metric_throttled
+
     if [[ -n "$deadline_epoch_seconds" ]]; then
       now_seconds=$(date +%s || printf '0')
     fi

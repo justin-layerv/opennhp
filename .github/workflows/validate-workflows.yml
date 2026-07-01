@@ -313,16 +313,21 @@ jobs:
             .github/scripts/prune-missing-asg-target-groups.sh \
             .github/scripts/wait-for-instance-refresh.sh \
             .github/scripts/deploy-relay.sh \
+            .github/scripts/dispatch-and-poll-blue-green.sh \
+            .github/scripts/dispatch-and-poll-canary.sh \
+            .github/scripts/emit-deployment-window-metric.sh \
             .github/scripts/recover-relay-deposed-sg.sh \
             .github/scripts/check-relay-deposed-sg-clear.sh \
             tests/scripts/prune-missing-asg-target-groups_test.sh \
             tests/scripts/wait-for-instance-refresh_test.sh \
             tests/scripts/deploy-relay_test.sh \
+            tests/scripts/emit-deployment-window-metric_test.sh \
             tests/scripts/recover-relay-deposed-sg_test.sh \
             tests/scripts/check-relay-deposed-sg-clear_test.sh
           bash tests/scripts/prune-missing-asg-target-groups_test.sh
           bash tests/scripts/wait-for-instance-refresh_test.sh
           bash tests/scripts/deploy-relay_test.sh
+          bash tests/scripts/emit-deployment-window-metric_test.sh
           bash tests/scripts/recover-relay-deposed-sg_test.sh
           bash tests/scripts/check-relay-deposed-sg-clear_test.sh
 

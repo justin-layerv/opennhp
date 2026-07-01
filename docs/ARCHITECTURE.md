@@ -1549,7 +1549,7 @@ The system publishes metrics to CloudWatch under the `LayerV/NHP` namespace from
 |--------|---------|-----|
 | NHP Server (Go) | `KnockRequest`, `AuthSuccess`, `AuthFailure`, `KnockLatency`, `ServerStartupEvent`, `TransactionClosed` | `Publisher` in `endpoints/metrics/publisher.go` — counters and gauges flush every 60 s via `PutMetricData`; latency distributions and one-shot signals (startup, panic detection) emit CloudWatch Embedded Metric Format (EMF) JSON to stdout, auto-extracted at log ingestion (#1107) |
 | CloudWatch Agent | `mem_used_percent`, `disk_used_percent` | Installed on Server and AC instances via user_data; config in `/opt/aws/amazon-cloudwatch-agent/etc/` |
-| CI Workflows | `DeploymentEvent` | `put-metric-data` in blue-green, canary, and build-and-push workflows with Environment/Component/Strategy dimensions |
+| CI Workflows | `DeploymentEvent`, `DeploymentWindow` | `put-metric-data` in blue-green, canary, promote, and build-and-push workflows. `DeploymentEvent` keeps Environment/Component/Strategy dimensions for deploy analytics; `DeploymentWindow` uses exactly `{Environment, Cell}` and is refreshed while long server/AC rollout polls are active so the qURL v2 `revocation-aged-out-page` composite alarm can suppress routine rollout overlap without weakening the raw `RevocationAgedOut` detector (#2868). A no-action `revocation-aged-out-suppressed` composite records the raw+window overlap as an audit breadcrumb. |
 
 Grafana dashboards consume these metrics via a CloudWatch datasource. See `docs/grafana-dashboard-improvements.md` for the phased dashboard improvement plan and `terraform/modules/grafana-dashboards/` for dashboard JSON definitions.
 

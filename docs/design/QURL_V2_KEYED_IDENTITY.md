@@ -1023,10 +1023,33 @@ Delivery requirements:
     fanout itself, not a per-flow AC ack.
   - Because proof is per live slot, a revoke that overlaps a blue/green drain can
     age out for a slot that was targeted and then decommissioned before its ack
-    arrived. That is an expected fail-safe `RevocationAgedOut` source during
-    rollout windows, not a false-green delivery proof; alarm tuning/runbooks must
-    account for revoke × drain overlap until graceful-drain pruning is added
-    (tracked in nhp #2868).
+    arrived. nhp #2868 intentionally keeps this as a raw
+    `RevocationAgedOut` signal rather than pruning on ordinary disconnect,
+    UDP loss, or unknown AC drop: the server does not yet receive an AC-side
+    decommission proof that the exact `(acId, authenticated AC pubkey, scope,
+    scope_key)` slot can no longer host the revoked flow. Until that proof
+    exists, retry keeps pending entries through disconnect and ages them out.
+    Production paging is tuned around the known deploy overlap instead: the raw
+    `revocation-aged-out` alarm remains `Sum >= 1`, deploy workflows emit and
+    refresh a short-lived `{Environment, Cell}` `DeploymentWindow` metric while
+    long ASG/canary polls are still active, and
+    `revocation-aged-out-page` pages only when the raw detector is ALARM outside
+    the roughly 10-minute window after the latest deploy heartbeat. During the
+    window the raw alarm remains visible for audit; outside it, a single
+    non-deploy age-out still pages.
+  - This is a bounded paging tradeoff, not a weakening of the raw detector:
+    a transient age-out that happens inside the deploy-heartbeat window is
+    suppressed from paging rather than queued for a later page. It pages only
+    if the raw detector remains or repeats after the suppressor clears. The raw
+    `RevocationAgedOut` metric and no-action alarm remain visible throughout
+    for dashboards, audits, and incident review; the no-action
+    `revocation-aged-out-suppressed` composite is an explicit breadcrumb for
+    the `raw ALARM && deploy-window ALARM` case. The suppressor is trust-on-emit
+    in the shared `LayerV/NHP` namespace: any principal with
+    `cloudwatch:PutMetricData` for that namespace, including server instances
+    that publish the raw signal, can emit `DeploymentWindow`; follow-up
+    hardening is tracked in
+    [#2974](https://github.com/layervai/nhp/issues/2974).
   - The retry engine is explicitly armed by Terraform-managed server fleets via
     `NHP_REVOCATION_RETRY_ENABLED=true`; changing or disabling it should be
     treated as a security-relevant rollback because it returns server→AC

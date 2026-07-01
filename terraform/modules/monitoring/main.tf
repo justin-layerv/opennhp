@@ -1538,13 +1538,58 @@ resource "aws_cloudwatch_metric_alarm" "revocation_delivery_latency_high" {
   })
 }
 
-# Revocation aged out — the non-delivery signal. ANY nonzero value is an
+# Deployment window suppressor for revocation age-out paging (#2868).
+#
+# The raw RevocationAgedOut detector below stays threshold=1 because a single
+# non-deploy age-out is still a real immediate-revocation proof failure. Routine
+# blue/green/canary deploy overlap is handled at the notification layer instead:
+# deploy workflows emit DeploymentWindow at rollout start and refresh it while
+# long ASG/canary polls are still active, this no-action alarm stays ALARM when
+# at least one datapoint appears in the recent roughly 10-minute deploy window,
+# and the composite pager below requires raw age-out AND NOT deployment-window.
+# The 60s period bounds alarm arming latency near the NLB switch/decommission
+# edge while the heartbeat keeps long refreshes covered. The 10-minute hold
+# after the latest heartbeat bounds the non-paging shadow for a genuine one-shot
+# in-window failure while still covering the retry age-out tail of normal deploy
+# decommissions.
+#
+# No SEARCH expression: deploy workflows publish this exact {Environment, Cell}
+# dim set to match buildServerMetricDimensions() and keep the alarm evaluable.
+resource "aws_cloudwatch_metric_alarm" "revocation_deploy_window" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-revocation-deploy-window"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 10
+  datapoints_to_alarm = 1
+  metric_name         = "DeploymentWindow"
+  namespace           = "LayerV/NHP"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "Recent deploy-window suppressor for qURL v2 RevocationAgedOut paging (#2868). No actions: used only by the revocation-aged-out-page composite so routine server/AC rollouts do not auto-page while the raw detector remains threshold=1."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Revocation aged out — the raw non-delivery detector. ANY nonzero value is an
 # immediate-revocation the control plane could NOT prove reached its AC before
 # the age-out deadline (the DE-Risk #5 degraded signal, emitted never silently
 # dropped — see MetricRevocationAgedOut in endpoints/server/msghandler.go). This
 # is the companion the latency-p99 alarm cannot replace: an un-acked revoke ages
 # out WITHOUT recording a latency sample, so it is invisible to the histogram.
 # Sum >= 1 over the period, mirroring the ack_token_shared_store_failure pattern.
+#
+# No direct actions by design (#2868): page via
+# aws_cloudwatch_composite_alarm.revocation_aged_out_page so deploy-window
+# overlap suppresses notifications without weakening this raw detector.
 resource "aws_cloudwatch_metric_alarm" "revocation_aged_out" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-revocation-aged-out"
   comparison_operator = "GreaterThanOrEqualToThreshold"
@@ -1554,15 +1599,52 @@ resource "aws_cloudwatch_metric_alarm" "revocation_aged_out" {
   period              = 300
   statistic           = "Sum"
   threshold           = 1
-  alarm_description   = "qURL v2 revocation could NOT be proven delivered to an AC before the age-out deadline (RevocationAgedOut, #2792/#2793). Any nonzero value is an immediate-revocation the control plane could not confirm reached the AC — investigate AC connectivity / NHP_REV delivery before relying on immediate revoke."
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-  ok_actions          = [aws_sns_topic.alerts.arn]
+  alarm_description   = "Raw qURL v2 revocation age-out detector (RevocationAgedOut, #2792/#2793/#2868). Threshold remains Sum>=1; direct paging is intentionally handled by revocation-aged-out-page so deploy-window overlap can be suppressed without hiding this raw proof-failure signal."
   treat_missing_data  = "notBreaching"
 
   dimensions = {
     Environment = var.environment
     Cell        = var.cell_id
   }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Paging alarm for revocation age-out. This preserves the strict raw detector
+# while suppressing routine deploy-overlap noise. Outside the recent deploy
+# window, a non-deploy age-out still pages on the first raw event; during the
+# deploy window the raw alarm remains visible in CloudWatch/Grafana but the
+# composite does not notify.
+resource "aws_cloudwatch_composite_alarm" "revocation_aged_out_page" {
+  alarm_name        = "${var.name_prefix}-${var.cell_id}-revocation-aged-out-page"
+  alarm_description = "Pages when qURL v2 RevocationAgedOut fires outside a recent server/AC deployment window (#2868). Raw age-outs during deploy still appear on ${aws_cloudwatch_metric_alarm.revocation_aged_out.alarm_name}; non-deploy age-outs page here on the first event."
+
+  alarm_rule = "ALARM(\"${aws_cloudwatch_metric_alarm.revocation_aged_out.alarm_name}\") AND NOT ALARM(\"${aws_cloudwatch_metric_alarm.revocation_deploy_window.alarm_name}\")"
+
+  # Do not send OK actions from this composite: a deployment window can clear
+  # ALARM(raw) AND NOT ALARM(window) without proving the raw age-out resolved.
+  # Recovery is verified from the raw detector and deploy-window breadcrumb.
+  alarm_actions = [aws_sns_topic.alerts.arn]
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# No-action breadcrumb for the suppression tradeoff above. This alarm is
+# operator-visible when a raw revocation age-out is suppressed by an active
+# deploy window, but it intentionally has no SNS actions so routine deploy
+# overlap still does not page.
+resource "aws_cloudwatch_composite_alarm" "revocation_aged_out_suppressed" {
+  alarm_name        = "${var.name_prefix}-${var.cell_id}-revocation-aged-out-suppressed"
+  alarm_description = "No-action breadcrumb when qURL v2 RevocationAgedOut is present during an active DeploymentWindow (#2868). Inspect with the raw alarm to audit suppressed deploy-overlap events; paging remains on revocation-aged-out-page."
+
+  alarm_rule      = "ALARM(\"${aws_cloudwatch_metric_alarm.revocation_aged_out.alarm_name}\") AND ALARM(\"${aws_cloudwatch_metric_alarm.revocation_deploy_window.alarm_name}\")"
+  actions_enabled = false
 
   tags = merge(var.tags, {
     Component = "monitoring"

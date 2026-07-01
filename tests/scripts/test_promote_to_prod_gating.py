@@ -150,6 +150,7 @@ QRTS_TERRAFORM_VARIABLES = (
     REPO_ROOT / "terraform" / "modules" / "qurl-reverse-tunnel-server" / "variables.tf"
 )
 QRTS_PROD_TFVARS = REPO_ROOT / "terraform" / "environments" / "prod" / "terraform.tfvars"
+MONITORING_TF = REPO_ROOT / "terraform" / "modules" / "monitoring" / "main.tf"
 _TERRAFORM_MODULE_SCAN_PATHS = (
     REPO_ROOT / "terraform" / "main.tf",
     REPO_ROOT / "terraform" / "environments" / "prod" / "main.tf",
@@ -217,6 +218,101 @@ def _missing_cert_lambda_suites(run_body: str) -> list[str]:
         suite for suite, markers in _CERT_LAMBDA_SUITES.items()
         if not all(marker in run_body for marker in markers)
     ]
+
+
+# Terraform references for the revocation age-out composite children, shared by
+# the alarm-rule guard and its self-test so both pin the same two child alarms.
+_REVOCATION_RAW_REF = "aws_cloudwatch_metric_alarm.revocation_aged_out.alarm_name"
+_REVOCATION_WINDOW_REF = "aws_cloudwatch_metric_alarm.revocation_deploy_window.alarm_name"
+
+
+def _tf_resource_block(tf_text: str, resource_type: str, name: str) -> str:
+    marker = f'resource "{resource_type}" "{name}"'
+    start = tf_text.find(marker)
+    if start == -1:
+        return ""
+    brace_start = tf_text.find("{", start)
+    if brace_start == -1:
+        return ""
+
+    depth = 0
+    for index in range(brace_start, len(tf_text)):
+        char = tf_text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return tf_text[start : index + 1]
+    return ""
+
+
+def _assert_revocation_ageout_alarm_rules(tf_text: str, failures: list[str]) -> None:
+    """Pin the raw/page/breadcrumb composite semantics for issue #2868."""
+    page_block = _tf_resource_block(
+        tf_text, "aws_cloudwatch_composite_alarm", "revocation_aged_out_page"
+    )
+    suppressed_block = _tf_resource_block(
+        tf_text, "aws_cloudwatch_composite_alarm", "revocation_aged_out_suppressed"
+    )
+    raw = _REVOCATION_RAW_REF
+    window = _REVOCATION_WINDOW_REF
+    page_rule = f'alarm_rule = "ALARM(\\"${{{raw}}}\\") AND NOT ALARM(\\"${{{window}}}\\")"'
+    suppressed_rule = f'alarm_rule      = "ALARM(\\"${{{raw}}}\\") AND ALARM(\\"${{{window}}}\\")"'
+
+    if not _check(
+        "monitoring page composite pages only outside deploy window",
+        page_rule in page_block,
+        "revocation-aged-out-page must stay `raw ALARM AND NOT deploy-window ALARM`",
+    ):
+        failures.append("revocation-aged-out-page alarm_rule drifted")
+    if not _check(
+        "monitoring page composite has no OK action",
+        "ok_actions" not in page_block,
+        "a deploy window can clear the page composite before the raw age-out is resolved",
+    ):
+        failures.append("revocation-aged-out-page must not send OK actions")
+    if not _check(
+        "monitoring suppressed breadcrumb fires only inside deploy window",
+        suppressed_rule in suppressed_block,
+        "revocation-aged-out-suppressed must stay `raw ALARM AND deploy-window ALARM`",
+    ):
+        failures.append("revocation-aged-out-suppressed alarm_rule drifted")
+
+
+def _assert_revocation_ageout_alarm_rules_self_test() -> bool:
+    raw = _REVOCATION_RAW_REF
+    window = _REVOCATION_WINDOW_REF
+    good = f'''
+resource "aws_cloudwatch_composite_alarm" "revocation_aged_out_page" {{
+  alarm_rule = "ALARM(\\"${{{raw}}}\\") AND NOT ALARM(\\"${{{window}}}\\")"
+  alarm_actions = ["arn:aws:sns:us-east-2:123456789012:alerts"]
+}}
+
+resource "aws_cloudwatch_composite_alarm" "revocation_aged_out_suppressed" {{
+  alarm_rule      = "ALARM(\\"${{{raw}}}\\") AND ALARM(\\"${{{window}}}\\")"
+}}
+'''
+    swapped = good.replace(" AND NOT ALARM(", " AND ALARM(", 1)
+
+    good_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_ageout_alarm_rules(good, good_failures)
+
+    swapped_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_ageout_alarm_rules(swapped, swapped_failures)
+
+    false_ok = good.replace(
+        '  alarm_actions = ["arn:aws:sns:us-east-2:123456789012:alerts"]',
+        '  alarm_actions = ["arn:aws:sns:us-east-2:123456789012:alerts"]\n'
+        '  ok_actions    = ["arn:aws:sns:us-east-2:123456789012:alerts"]',
+    )
+    false_ok_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_ageout_alarm_rules(false_ok, false_ok_failures)
+
+    return not good_failures and bool(swapped_failures) and bool(false_ok_failures)
 
 # Gate matchers — anchored regexes, NOT plain substrings. The naïve
 # `"inputs.run_terraform && success" in gate` test passes false-positively
@@ -889,6 +985,7 @@ def _assert_qrts_smoke_after_deploy_qrts(jobs: dict, failures: list[str]) -> Non
     if isinstance(monitor_needs, str):
         monitor_needs = [monitor_needs]
     monitor_gate = str(monitor.get("if", ""))
+    monitor_env = monitor.get("env", {}) or {}
     monitor_run = "\n".join(
         str(step.get("run", "")) for step in (monitor.get("steps", []) or [])
     )
@@ -896,6 +993,15 @@ def _assert_qrts_smoke_after_deploy_qrts(jobs: dict, failures: list[str]) -> Non
         r"--alarm-name-prefix\s+[\"']([^\"']+)[\"']",
         monitor_run,
     )
+    monitor_env_alarm_prefix = str(monitor_env.get("ALARM_PREFIX", ""))
+    monitor_alarm_prefixes = [
+        monitor_env_alarm_prefix if prefix == "$ALARM_PREFIX" else prefix
+        for prefix in monitor_alarm_prefixes
+    ]
+    if monitor_env_alarm_prefix:
+        monitor_alarm_prefixes = list(dict.fromkeys([*monitor_alarm_prefixes, monitor_env_alarm_prefix]))
+    monitor_ignored_alarm_suffix_re = str(monitor_env.get("IGNORED_ALARM_SUFFIX_RE", ""))
+    monitor_alarm_classifier_jq = str(monitor_env.get("ALARM_CLASSIFIER_JQ", ""))
     qrts_alarm_prefix = "layerv-nhp-prod-frps"
     workflow_text = WORKFLOW.read_text() if WORKFLOW.is_file() else ""
     if not _check(
@@ -936,6 +1042,51 @@ def _assert_qrts_smoke_after_deploy_qrts(jobs: dict, failures: list[str]) -> Non
         ),
     ):
         failures.append("monitor alarm prefix no longer covers QRtS alarms")
+    if not _check(
+        "monitor inspects composite alarms",
+        "CompositeAlarms" in monitor_alarm_classifier_jq,
+        "revocation-aged-out-page is a composite alarm; monitor must not look only at MetricAlarms",
+    ):
+        failures.append("monitor no longer inspects CompositeAlarms")
+    if not _check(
+        "monitor classifies actionable and ignored alarms once per payload",
+        "ALARM_CLASSIFIER_JQ" in monitor_run
+        and "actionable" in monitor_alarm_classifier_jq
+        and "ignored" in monitor_alarm_classifier_jq
+        and "[(.MetricAlarms // [])[], (.CompositeAlarms // [])[]]" not in monitor_run,
+        "monitor should classify MetricAlarms+CompositeAlarms through the shared jq filter, not duplicate the filter in shell",
+    ):
+        failures.append("monitor alarm classifier is no longer centralized")
+    if not _check(
+        "monitor warns when CloudWatch alarm discovery fails",
+        "::warning::CloudWatch describe-alarms failed" in monitor_run
+        and "ALARM_JSON='{}'" in monitor_run,
+        "CloudWatch API failures should be visible instead of silently classifying as no alarms",
+    ):
+        failures.append("monitor CloudWatch alarm discovery failure is silent")
+    if not _check(
+        "monitor ignores only raw/suppressor/breadcrumb revocation age-out inputs",
+        monitor_ignored_alarm_suffix_re
+        == r"-(revocation-aged-out|revocation-deploy-window|revocation-aged-out-suppressed)$"
+        and "revocation-aged-out-page" in monitor_run,
+        "monitor must ignore the raw detector/suppressor/breadcrumb but still watch the page composite",
+    ):
+        failures.append("monitor revocation age-out ignore/page contract drifted")
+    revocation_ignore_re = monitor_ignored_alarm_suffix_re
+    if not _check(
+        "monitor revocation ignore regex excludes page composite",
+        re.search(revocation_ignore_re, "layerv-nhp-prod-cell0-revocation-aged-out-page")
+        is None,
+        "the page composite must stay actionable; do not drop the end anchor",
+    ):
+        failures.append("monitor revocation ignore regex now matches the page composite")
+    if not _check(
+        "monitor revocation ignore regex includes suppressed breadcrumb",
+        re.search(revocation_ignore_re, "layerv-nhp-prod-cell0-revocation-aged-out-suppressed")
+        is not None,
+        "the no-action suppressed breadcrumb must not fail the post-deploy monitor",
+    ):
+        failures.append("monitor revocation ignore regex no longer matches suppressed breadcrumb")
 
     finalize = jobs.get("finalize", {})
     finalize_needs = finalize.get("needs", [])
@@ -4193,7 +4344,7 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
 
 
 def main() -> int:
-    for path in (WORKFLOW, BUILD_AND_PUSH_WORKFLOW, BUILD_LAMBDA_PACKAGES_ACTION):
+    for path in (WORKFLOW, BUILD_AND_PUSH_WORKFLOW, BUILD_LAMBDA_PACKAGES_ACTION, MONITORING_TF):
         if not path.is_file():
             print(f"FAIL: {path} not found")
             return 1
@@ -4206,6 +4357,10 @@ def main() -> int:
     print(
         f"Checking {BUILD_LAMBDA_PACKAGES_ACTION.relative_to(REPO_ROOT)} "
         "for Lambda test hermeticity…"
+    )
+    print(
+        f"Checking {MONITORING_TF.relative_to(REPO_ROOT)} "
+        "for revocation age-out alarm-rule semantics…"
     )
 
     # Run the harness's own canaries first: a parser regression that always
@@ -4230,10 +4385,17 @@ def main() -> int:
         f"scan roots: {sorted(scan_roots)}",
     ):
         return 1
+    if not _check(
+        "self-test: revocation age-out alarm-rule/OK-action guard rejects bad semantics",
+        _assert_revocation_ageout_alarm_rules_self_test(),
+        "the alarm-rule guard accepted a swapped page/suppressed fixture",
+    ):
+        return 1
 
     wf = yaml.safe_load(WORKFLOW.read_text())
     build_and_push_wf = yaml.safe_load(BUILD_AND_PUSH_WORKFLOW.read_text())
     build_lambda_action = yaml.safe_load(BUILD_LAMBDA_PACKAGES_ACTION.read_text())
+    monitoring_tf_text = MONITORING_TF.read_text()
     jobs = wf.get("jobs", {})
     build_and_push_jobs = build_and_push_wf.get("jobs", {})
     failures: list[str] = []
@@ -4275,6 +4437,8 @@ def main() -> int:
     )
     for fn in action_assertions:
         fn(build_lambda_action, failures)
+
+    _assert_revocation_ageout_alarm_rules(monitoring_tf_text, failures)
 
     if failures:
         print()

@@ -2389,10 +2389,25 @@ jobs:
           aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # The immediate mark intentionally overlaps with the parent canary poller
+      # and child canary workflow heartbeats so dispatch gaps stay covered.
+      - name: Mark Deployment Window
+        uses: ./.github/actions/mark-deployment-window
+        with:
+          environment: prod
+          cell_id: ${{ inputs.cell_id }}
+          component: server
+          strategy: promote
+
       - name: Deploy server
         id: deploy-server-step
         env:
           GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_WINDOW_ENVIRONMENT: prod
+          DEPLOYMENT_WINDOW_CELL_ID: ${{ inputs.cell_id }}
+          DEPLOYMENT_WINDOW_COMPONENT: server
+          DEPLOYMENT_WINDOW_STRATEGY: promote-server
+          DEPLOYMENT_WINDOW_EMIT_INTERVAL_SECONDS: '60'
         run: |
           echo "--- Deploying NHP Server ---"
           START_TIME=$(date +%s)
@@ -2972,10 +2987,25 @@ jobs:
           aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # The immediate mark intentionally overlaps with the parent canary poller
+      # and child canary workflow heartbeats so dispatch gaps stay covered.
+      - name: Mark Deployment Window
+        uses: ./.github/actions/mark-deployment-window
+        with:
+          environment: prod
+          cell_id: ${{ inputs.cell_id }}
+          component: ac
+          strategy: promote
+
       - name: Deploy AC
         id: deploy-ac-step
         env:
           GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_WINDOW_ENVIRONMENT: prod
+          DEPLOYMENT_WINDOW_CELL_ID: ${{ inputs.cell_id }}
+          DEPLOYMENT_WINDOW_COMPONENT: ac
+          DEPLOYMENT_WINDOW_STRATEGY: promote-ac
+          DEPLOYMENT_WINDOW_EMIT_INTERVAL_SECONDS: '60'
         run: |
           echo "--- Deploying Access Controller ---"
           START_TIME=$(date +%s)
@@ -3417,6 +3447,15 @@ jobs:
       (needs.smoke-test.result == 'success' || needs.qurl-smoke-tests.result == 'success' || needs.qrts-smoke-tests.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      ALARM_PREFIX: layerv-nhp-prod
+      IGNORED_ALARM_SUFFIX_RE: '-(revocation-aged-out|revocation-deploy-window|revocation-aged-out-suppressed)$'
+      ALARM_CLASSIFIER_JQ: |
+        [(.MetricAlarms // [])[], (.CompositeAlarms // [])[]] as $alarms
+        | {
+            actionable: ($alarms | map(select((.AlarmName | test($re)) | not))),
+            ignored: ($alarms | map(select(.AlarmName | test($re))))
+          }
     # QRtS alarms use the same prod name prefix (layerv-nhp-prod-frps-*),
     # so this shared post-deploy monitor includes tunnel-server alarms.
     steps:
@@ -3428,43 +3467,63 @@ jobs:
 
       - name: List monitored alarms
         run: |
-          echo "Discovering CloudWatch alarms with prefix 'layerv-nhp-prod'..."
-          ALL_ALARMS=$(aws cloudwatch describe-alarms \
-            --alarm-name-prefix "layerv-nhp-prod" \
-            --query "MetricAlarms[*].{Name: AlarmName, State: StateValue, Metric: MetricName}" \
-            --output table 2>/dev/null || echo "No alarms found")
-          echo "$ALL_ALARMS"
+          echo "Discovering actionable CloudWatch alarms with prefix '$ALARM_PREFIX'..."
+          if ! ALARM_JSON=$(aws cloudwatch describe-alarms \
+            --alarm-name-prefix "$ALARM_PREFIX" \
+            --output json); then
+            echo "::warning::CloudWatch describe-alarms failed while listing monitored alarms; treating alarm set as empty"
+            ALARM_JSON='{}'
+          fi
+          ALARM_GROUPS=$(printf '%s\n' "$ALARM_JSON" | jq -c --arg re "$IGNORED_ALARM_SUFFIX_RE" "$ALARM_CLASSIFIER_JQ")
 
-          ALARM_COUNT=$(aws cloudwatch describe-alarms \
-            --alarm-name-prefix "layerv-nhp-prod" \
-            --query "length(MetricAlarms)" --output text 2>/dev/null || echo "0")
-          echo "::notice::Monitoring $ALARM_COUNT alarm(s) for 5 minutes"
+          ACTIONABLE_ALARMS=$(printf '%s\n' "$ALARM_GROUPS" | jq -r '
+            .actionable[]
+            | [.AlarmName, .StateValue, (if .AlarmRule then "Composite" else "Metric" end), (.MetricName // "-")]
+            | @tsv
+          ')
+
+          if [[ -n "$ACTIONABLE_ALARMS" ]]; then
+            printf 'Name\tState\tType\tMetric\n%s\n' "$ACTIONABLE_ALARMS"
+          else
+            echo "No actionable alarms found"
+          fi
+
+          ALARM_COUNT=$(printf '%s\n' "$ALARM_GROUPS" | jq -r '.actionable | length')
+          IGNORED_COUNT=$(printf '%s\n' "$ALARM_GROUPS" | jq -r '.ignored | length')
+          echo "::notice::Monitoring $ALARM_COUNT actionable alarm(s) for 5 minutes ($IGNORED_COUNT raw/suppressor/breadcrumb alarm(s) ignored by this post-deploy gate)"
 
       - name: Monitor CloudWatch alarms (5 minutes)
         id: monitor-step
         run: |
-          echo "Monitoring CloudWatch alarms for 5 minutes..."
+          echo "Monitoring actionable CloudWatch alarms for 5 minutes..."
+          echo "Ignoring raw/suppressor/breadcrumb revocation alarms; the actionable page path is the revocation-aged-out-page composite."
           echo ""
 
           CHECKS=10
           INTERVAL=30
 
           for i in $(seq 1 $CHECKS); do
-            ALARMS=$(aws cloudwatch describe-alarms \
-              --alarm-name-prefix "layerv-nhp-prod" \
+            if ! ALARM_JSON=$(aws cloudwatch describe-alarms \
+              --alarm-name-prefix "$ALARM_PREFIX" \
               --state-value ALARM \
-              --query "MetricAlarms[*].AlarmName" --output text 2>/dev/null || echo "")
+              --output json); then
+              echo "::warning::CloudWatch describe-alarms failed on monitor check $i/$CHECKS; treating alarm set as empty for this check"
+              ALARM_JSON='{}'
+            fi
+            ALARM_GROUPS=$(printf '%s\n' "$ALARM_JSON" | jq -c --arg re "$IGNORED_ALARM_SUFFIX_RE" "$ALARM_CLASSIFIER_JQ")
+
+            ALARMS=$(printf '%s\n' "$ALARM_GROUPS" | jq -r '.actionable[].AlarmName' | xargs)
+            IGNORED_ALARMS=$(printf '%s\n' "$ALARM_GROUPS" | jq -r '.ignored[].AlarmName' | xargs)
 
             ELAPSED=$(( i * INTERVAL ))
 
-            if [[ -n "$ALARMS" && "$ALARMS" != "None" ]]; then
+            if [[ -n "$ALARMS" ]]; then
               echo "::error::CloudWatch alarm(s) in ALARM state after ${ELAPSED}s: $ALARMS"
               echo ""
-              ALARM_DETAILS=$(aws cloudwatch describe-alarms \
-                --alarm-name-prefix "layerv-nhp-prod" \
-                --state-value ALARM \
-                --query "MetricAlarms[*].{Name: AlarmName, Reason: StateReason}" \
-                --output json 2>/dev/null || echo "[]")
+              ALARM_DETAILS=$(printf '%s\n' "$ALARM_GROUPS" | jq -c '
+                .actionable
+                | map({Name: .AlarmName, Reason: (.StateReason // "")})
+              ')
               echo "$ALARM_DETAILS" | jq -r '.[] | "  \(.Name): \(.Reason)"' 2>/dev/null || true
 
               # Write failure details to step summary
@@ -3483,7 +3542,11 @@ jobs:
               exit 1
             fi
 
-            echo "  Check $i/$CHECKS (${ELAPSED}s): All alarms OK"
+            if [[ -n "$IGNORED_ALARMS" ]]; then
+              echo "  Check $i/$CHECKS (${ELAPSED}s): No actionable alarms in ALARM state (ignored: $IGNORED_ALARMS)"
+            else
+              echo "  Check $i/$CHECKS (${ELAPSED}s): No actionable alarms in ALARM state"
+            fi
             if [[ $i -lt $CHECKS ]]; then
               sleep "$INTERVAL"
             fi
@@ -3495,9 +3558,9 @@ jobs:
           {
             echo "## Post-Deploy Monitor"
             echo ""
-            echo "> :white_check_mark: **5-minute monitoring window passed** — no alarms triggered"
+            echo "> :white_check_mark: **5-minute monitoring window passed** — no actionable alarms triggered"
             echo ""
-            echo "10 checks at 30s intervals. All \`layerv-nhp-prod*\` alarms remained in OK state."
+            echo "10 checks at 30s intervals. All actionable \`layerv-nhp-prod*\` alarms remained out of ALARM state."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
