@@ -193,6 +193,17 @@ variable "log_level" {
   }
 }
 
+variable "ac_filter_mode" {
+  description = "NHP AC datapath filter mode rendered into config.toml as FilterMode: 0=iptables/ipset, 1=eBPF/XDP. Keep prod at 0 until the E5 eBPF flip gates have passed."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = contains([0, 1], var.ac_filter_mode)
+    error_message = "ac_filter_mode must be 0 (iptables/ipset) or 1 (eBPF/XDP)."
+  }
+}
+
 variable "ipset_default_timeout" {
   description = "Timeout in seconds for defaultset ipset entries (active sessions after NHP knock). Clients must re-knock after this period."
   type        = number

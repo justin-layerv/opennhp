@@ -933,7 +933,7 @@ IpPassMode = 0
 LogLevel = ${log_level}
 AuthServiceId = "${auth_service_id}"
 ResourceIds = ${resource_ids}
-FilterMode = 0
+FilterMode = ${ac_filter_mode}
 
 # L3 flush-on-expiry. Toml keys match the Go struct field names
 # (endpoints/ac/config.go) — not the json tags, which the toml unmarshaler

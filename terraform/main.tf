@@ -1146,6 +1146,7 @@ module "ac" {
 
   # AC configuration options
   log_level       = var.log_level
+  ac_filter_mode  = var.ac_filter_mode
   auth_service_id = var.ac_auth_service_id
   resource_ids    = var.ac_resource_ids
   # AC registration endpoint (config.toml ServerEndpoint → initial NHP_AOL knock).

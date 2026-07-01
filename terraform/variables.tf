@@ -401,6 +401,17 @@ variable "ac_max_capacity" {
   default     = null
 }
 
+variable "ac_filter_mode" {
+  description = "Root passthrough for the AC module's datapath FilterMode: 0=iptables/ipset, 1=eBPF/XDP. Default 0 preserves the production baseline; set per environment only after the eBPF flip gates for that environment are satisfied."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = contains([0, 1], var.ac_filter_mode)
+    error_message = "ac_filter_mode must be 0 (iptables/ipset) or 1 (eBPF/XDP)."
+  }
+}
+
 variable "enable_egress_eips" {
   description = "Allocate Elastic IPs for AC instances for stable egress IPs (2x when blue/green enabled). Customers whitelist these on their origin firewalls."
   type        = bool

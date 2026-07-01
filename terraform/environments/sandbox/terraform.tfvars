@@ -22,6 +22,7 @@ deploy_ac          = true
 acme_email         = "admin@layerv.xyz"
 ac_auth_service_id = "agent"
 ac_min_capacity    = 3
+ac_filter_mode     = 1
 # Two AC-protected resources, each a distinct identity per NHP spec
 # (CSA "Stealth Mode SDP" Appendix 2, NHP-KNK Message Fields):
 #   - "qurl"               — viewer-side qurl-link / SPA resolve flow

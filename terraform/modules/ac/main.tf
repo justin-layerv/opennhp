@@ -948,6 +948,7 @@ locals {
     secrets_kms_key_arn = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
     # AC configuration options
     log_level         = var.log_level
+    ac_filter_mode    = var.ac_filter_mode
     ac_id             = var.ac_id
     auth_service_id   = var.auth_service_id
     resource_ids      = jsonencode(var.resource_ids)
@@ -1032,6 +1033,21 @@ resource "terraform_data" "frps_control_listener_port_preconditions" {
     precondition {
       condition     = length(distinct(local.frp_control_listener_ports)) == length(local.frp_control_listener_ports)
       error_message = "FRPS control listener ports must be unique. The primary frp_control_port and every frp_control_additional_upstreams[*].listen_port are public AC NLB listeners and cannot share a port."
+    }
+  }
+}
+
+# Plan-time render lint for the AC datapath selector. The eBPF rollout
+# gates read the deployed config.toml `FilterMode` line through SSM, so
+# this must render as unquoted numeric TOML and must stay connected to
+# var.ac_filter_mode rather than drifting back to a literal.
+resource "terraform_data" "ac_user_data_filter_mode_render_check" {
+  input = sha256(local.user_data)
+
+  lifecycle {
+    precondition {
+      condition     = strcontains(local.user_data, "\nFilterMode = ${var.ac_filter_mode}\n")
+      error_message = "AC user_data must render config.toml with unquoted numeric `FilterMode = var.ac_filter_mode` so the eBPF rollout smoke can verify the active datapath."
     }
   }
 }

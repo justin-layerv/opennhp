@@ -54,6 +54,7 @@ module "nhp" {
   ac_resource_ids    = var.ac_resource_ids
   ac_min_capacity    = var.ac_min_capacity
   ac_max_capacity    = var.ac_max_capacity
+  ac_filter_mode     = var.ac_filter_mode
   enable_egress_eips = var.enable_egress_eips
 
   # Security services

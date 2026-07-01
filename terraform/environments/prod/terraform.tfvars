@@ -39,6 +39,7 @@ ac_auth_service_id = "agent"
 ac_resource_ids    = ["qurl", "qurl-tunnel-server"]
 ac_min_capacity    = 3
 ac_max_capacity    = 10
+ac_filter_mode     = 0
 enable_egress_eips = true
 
 # Terraform state bucket for GitHub Actions permissions

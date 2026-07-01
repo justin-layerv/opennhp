@@ -148,6 +148,17 @@ variable "ac_min_capacity" {
   default     = null
 }
 
+variable "ac_filter_mode" {
+  description = "AC datapath FilterMode for sandbox: 0=iptables/ipset, 1=eBPF/XDP."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = contains([0, 1], var.ac_filter_mode)
+    error_message = "ac_filter_mode must be 0 (iptables/ipset) or 1 (eBPF/XDP)."
+  }
+}
+
 variable "enable_egress_eips" {
   description = "Allocate Elastic IPs for AC instances for stable egress IPs (2x when blue/green enabled). Customers whitelist these on their origin firewalls."
   type        = bool
