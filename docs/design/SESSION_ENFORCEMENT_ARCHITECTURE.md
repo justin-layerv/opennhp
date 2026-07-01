@@ -439,15 +439,15 @@ against the chosen instance type, co-decided under
 >
 > Minimum-kernel verifier proof for the current E5 target floor was recorded
 > while closing [nhp#2869](https://github.com/layervai/nhp/issues/2869) in
-> [nhp#2941](https://github.com/layervai/nhp/pull/2941). Before the flip, re-run
-> the proof if the target AC AMI, active running kernel, instance architecture,
-> eBPF source, or pinned eBPF toolchain changes; if verifier acceptance
-> regresses, keep v6 XDP gated. The flip-time revalidation/hold obligation is
-> tracked in [nhp#2945](https://github.com/layervai/nhp/issues/2945), including
-> validation that the loaded XDP object pins `frag_state_v6` with the conntrack
-> maps before the new AC sampler runs and that the `EbpfFragStateV6*`
-> gauges/counter are present before relying on EBPFXDP for IPv6 fragmented-flow
-> admission.
+> [nhp#2941](https://github.com/layervai/nhp/pull/2941). The dated
+> [nhp#2945](https://github.com/layervai/nhp/issues/2945) revalidation evidence
+> and the remaining flip-time re-run, hold, and #2865 fragment-state
+> load/telemetry checks are carried as HARD pre-rollout items in the
+> prod-rollout ledger entry tracked by
+> [nhp#2816](https://github.com/layervai/nhp/issues/2816), with #2945 left open
+> as the flip-time min-kernel re-run anchor.
+> If those ledger inputs change again before v6 XDP is enabled, re-run the proof
+> per that entry; if verifier acceptance regresses, keep v6 XDP gated.
 
 ### Fail-closed observability (`MetricEbpfMapFull`)
 
