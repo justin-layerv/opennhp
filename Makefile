@@ -138,6 +138,7 @@ init:
 	cd endpoints && go mod tidy
 	cd examples/server_plugin && go mod tidy
 	cd tests/local && go mod tidy
+	cd tests/e2e && go mod tidy
 
 agentd:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-agent... $(END_COLOUR)"
@@ -527,6 +528,11 @@ test:
 	# would otherwise skip the package. -race mirrors the deleted
 	# qurl-v2-qurl-plugin-tests.yml this re-homes (knock driven on concurrent goroutines).
 	cd endpoints && KBS_SKIP_INIT=1 go test -race ./server/staticplugins/qurl/...
+	# qURL expiry's live e2e harness mirrors qurl-service internals; keep its
+	# manifest-backed contract guard in the normal unit lane without touching AWS.
+	# This intentionally enters tests/e2e's separate module so module drift cannot
+	# hide the always-on fence behind the tagged live-e2e lane.
+	cd tests/e2e && go test ./qurl-expiry -count=1
 	@echo "$(COLOUR_GREEN)[OpenNHP] Unit Tests Done!$(END_COLOUR)"
 
 # test-ebpf compiles the real XDP object and runs the eBPF datapath tests

@@ -1,0 +1,69 @@
+{
+  "artifact": "nhp-qurl-expiry-e2e-contract",
+  "schema_version": 1,
+  "issue": "https://github.com/layervai/nhp/issues/2932",
+  "description": "Mirrored qurl-service storage and link contracts consumed by the NHP qURL expiry e2e harness.",
+  "source_of_truth": {
+    "repository": "layervai/qurl-service",
+    "ref": "main",
+    "verified_commit": "b8db7aa94089f229fb744dfd17a142df2845a248",
+    "paths": [
+      "internal/repository/dynamodb/schema.go",
+      "internal/repository/dynamodb/webhook_event_dedupe_repo.go",
+      "internal/repository/dynamodb/resource_repo.go",
+      "internal/repository/dynamodb/qurl_repo.go",
+      "cmd/qurl-scanner/resource_close.go",
+      "internal/service/qurl_bootstrap_bundle.go",
+      "internal/domain/webhook.go"
+    ]
+  },
+  "events": {
+    "qurl_expired": "qurl.expired",
+    "resource_closed": "resource.closed"
+  },
+  "webhook_dedupe": {
+    "table": "qurl-webhook-event-dedupe",
+    "partition_key": "pk",
+    "event_type_attribute": "event_type",
+    "primary_id_attribute": "primary_id",
+    "pk_algorithm": "sha256_lenprefixed_event_type_primary_id_v1",
+    "vectors": [
+      {
+        "event_type": "qurl.expired",
+        "primary_id": "q_contract_123",
+        "pk": "b796bbf9008ed60293234b98a48c93e4b8465632ff7bd6e943dd706a49449bc2"
+      },
+      {
+        "event_type": "resource.closed",
+        "primary_id": "r_contract_456",
+        "pk": "c2d63c64adeeada351584fdadc6ba2a696edc4c4d1d9bf527cf2c92a402dc09e"
+      }
+    ]
+  },
+  "resources": {
+    "table": "qurl-resources",
+    "partition_key": "resource_id",
+    "sort_key": "sk",
+    "resource_sort_key_value": "RESOURCE",
+    "tombstoned_at_attribute": "resource_tombstoned_at",
+    "tombstone_ttl_attribute": "tombstone_ttl"
+  },
+  "access_tokens": {
+    "table": "qurl-access-tokens",
+    "resource_index": "resource-token-index",
+    "resource_index_partition_key": "resource_id",
+    "qurl_id_projection_attribute": "nhp_resource_id"
+  },
+  "sessions": {
+    "table": "qurl-sessions",
+    "partition_key": "resource_id",
+    "ttl_attribute": "ttl",
+    "ttl_placeholder": "#ttl",
+    "active_filter_expression": "#ttl > :now"
+  },
+  "qurl_link": {
+    "access_token_prefix": "at_",
+    "bootstrap_fragment_prefix": "qv1.",
+    "bootstrap_access_token_field": "access_token"
+  }
+}

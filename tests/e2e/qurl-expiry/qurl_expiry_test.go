@@ -5,9 +5,6 @@ package qurlexpiry
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,10 +29,10 @@ import (
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
-const (
-	eventQurlExpired   = "qurl.expired"
-	eventResourceClose = "resource.closed"
-	schemaDriftHint    = "possible qurl-service/qurl-api storage contract drift; see #2932"
+var (
+	eventQurlExpired   = expiryContract.Events.QurlExpired
+	eventResourceClose = expiryContract.Events.ResourceClosed
+	schemaMismatchHint = "possible qurl-service/qurl-api storage contract mismatch; see " + expiryContract.Issue
 )
 
 type expiryConfig struct {
@@ -252,30 +249,31 @@ func loadExpiryConfig(t *testing.T) *expiryConfig {
 		accessToken:        os.Getenv("QURL_EXPIRY_E2E_ACCESS_TOKEN"),
 		auth0SecretID:      envString("QURL_EXPIRY_E2E_AUTH0_SECRET_ID", "layerv-nhp-sandbox-auth0-backend-credentials"),
 		auth0TokenURL:      envString("QURL_EXPIRY_E2E_AUTH0_TOKEN_URL", "https://auth.layerv.ai/oauth/token"),
-		accessTokensTable:  envString("QURL_EXPIRY_E2E_ACCESS_TOKENS_TABLE", tablePrefix+"-qurl-access-tokens"),
-		resourcesTable:     envString("QURL_EXPIRY_E2E_RESOURCES_TABLE", tablePrefix+"-qurl-resources"),
-		sessionsTable:      envString("QURL_EXPIRY_E2E_SESSIONS_TABLE", tablePrefix+"-qurl-sessions"),
-		webhookDedupeTable: envString("QURL_EXPIRY_E2E_WEBHOOK_DEDUPE_TABLE", tablePrefix+"-qurl-webhook-event-dedupe"),
-		scannerFunction:    envString("QURL_EXPIRY_E2E_SCANNER_FUNCTION", tablePrefix+"-qurl-scanner"),
-		queueName:          queueName,
-		dlqName:            dlqName,
-		ttl:                envString("QURL_EXPIRY_E2E_TTL", "1m"),
-		massTTL:            envString("QURL_EXPIRY_E2E_MASS_TTL", "3m"),
-		sessionDuration:    envString("QURL_EXPIRY_E2E_SESSION_DURATION", "90s"),
-		targetURLBase:      strings.TrimRight(envString("QURL_EXPIRY_E2E_TARGET_URL_BASE", "https://example.com/qurl-expiry-e2e"), "/"),
-		runID:              envString("QURL_EXPIRY_E2E_RUN_ID", strconv.FormatInt(time.Now().UTC().UnixNano(), 36)),
-		massCount:          intEnv(t, "QURL_EXPIRY_E2E_MASS_COUNT", 50),
-		testTimeout:        durationEnv(t, "QURL_EXPIRY_E2E_TEST_TIMEOUT", 20*time.Minute),
-		waitTimeout:        durationEnv(t, "QURL_EXPIRY_E2E_WAIT_TIMEOUT", 8*time.Minute),
-		pollInterval:       durationEnv(t, "QURL_EXPIRY_E2E_POLL_INTERVAL", 3*time.Second),
-		requestSpacing:     durationEnv(t, "QURL_EXPIRY_E2E_REQUEST_SPACING", 1300*time.Millisecond),
-		apiRetryTimeout:    durationEnv(t, "QURL_EXPIRY_E2E_API_RETRY_TIMEOUT", 3*time.Minute),
-		deferHold:          durationEnv(t, "QURL_EXPIRY_E2E_DEFER_HOLD", 20*time.Second),
-		testStartedAt:      time.Now().UTC(),
-		invokeScanner:      envBool(t, "QURL_EXPIRY_E2E_INVOKE_SCANNER", true),
-		requireDLQEmpty:    !envBool(t, "QURL_EXPIRY_E2E_ALLOW_SHARED_DLQ_BACKLOG", false),
-		requireQueueEmpty:  !envBool(t, "QURL_EXPIRY_E2E_ALLOW_SHARED_QUEUE_BACKLOG", false),
-		skipScannerErrors:  envBool(t, "QURL_EXPIRY_E2E_SKIP_SCANNER_ERROR_CHECK", false),
+		accessTokensTable:  envString("QURL_EXPIRY_E2E_ACCESS_TOKENS_TABLE", tablePrefix+"-"+expiryContract.AccessTokens.Table),
+		resourcesTable:     envString("QURL_EXPIRY_E2E_RESOURCES_TABLE", tablePrefix+"-"+expiryContract.Resources.Table),
+		sessionsTable:      envString("QURL_EXPIRY_E2E_SESSIONS_TABLE", tablePrefix+"-"+expiryContract.Sessions.Table),
+		webhookDedupeTable: envString("QURL_EXPIRY_E2E_WEBHOOK_DEDUPE_TABLE", tablePrefix+"-"+expiryContract.WebhookDedupe.Table),
+		// The scanner Lambda name is a harness trigger, not a mirrored qurl-service storage/link contract.
+		scannerFunction:   envString("QURL_EXPIRY_E2E_SCANNER_FUNCTION", tablePrefix+"-qurl-scanner"),
+		queueName:         queueName,
+		dlqName:           dlqName,
+		ttl:               envString("QURL_EXPIRY_E2E_TTL", "1m"),
+		massTTL:           envString("QURL_EXPIRY_E2E_MASS_TTL", "3m"),
+		sessionDuration:   envString("QURL_EXPIRY_E2E_SESSION_DURATION", "90s"),
+		targetURLBase:     strings.TrimRight(envString("QURL_EXPIRY_E2E_TARGET_URL_BASE", "https://example.com/qurl-expiry-e2e"), "/"),
+		runID:             envString("QURL_EXPIRY_E2E_RUN_ID", strconv.FormatInt(time.Now().UTC().UnixNano(), 36)),
+		massCount:         intEnv(t, "QURL_EXPIRY_E2E_MASS_COUNT", 50),
+		testTimeout:       durationEnv(t, "QURL_EXPIRY_E2E_TEST_TIMEOUT", 20*time.Minute),
+		waitTimeout:       durationEnv(t, "QURL_EXPIRY_E2E_WAIT_TIMEOUT", 8*time.Minute),
+		pollInterval:      durationEnv(t, "QURL_EXPIRY_E2E_POLL_INTERVAL", 3*time.Second),
+		requestSpacing:    durationEnv(t, "QURL_EXPIRY_E2E_REQUEST_SPACING", 1300*time.Millisecond),
+		apiRetryTimeout:   durationEnv(t, "QURL_EXPIRY_E2E_API_RETRY_TIMEOUT", 3*time.Minute),
+		deferHold:         durationEnv(t, "QURL_EXPIRY_E2E_DEFER_HOLD", 20*time.Second),
+		testStartedAt:     time.Now().UTC(),
+		invokeScanner:     envBool(t, "QURL_EXPIRY_E2E_INVOKE_SCANNER", true),
+		requireDLQEmpty:   !envBool(t, "QURL_EXPIRY_E2E_ALLOW_SHARED_DLQ_BACKLOG", false),
+		requireQueueEmpty: !envBool(t, "QURL_EXPIRY_E2E_ALLOW_SHARED_QUEUE_BACKLOG", false),
+		skipScannerErrors: envBool(t, "QURL_EXPIRY_E2E_SKIP_SCANNER_ERROR_CHECK", false),
 	}
 	if cfg.massCount < 2 {
 		t.Fatalf("QURL_EXPIRY_E2E_MASS_COUNT=%d; want at least 2", cfg.massCount)
@@ -467,7 +465,7 @@ func (cfg *expiryConfig) waitForDedupeMarker(ctx context.Context, t *testing.T, 
 		return found, err
 	})
 	if err != nil {
-		t.Fatalf("%v (%s)", err, schemaDriftHint)
+		t.Fatalf("%v (%s)", err, schemaMismatchHint)
 	}
 }
 
@@ -516,9 +514,9 @@ func (cfg *expiryConfig) waitForAllDedupeMarkers(ctx context.Context, t *testing
 		select {
 		case <-deadline.Done():
 			if lastErr != nil {
-				t.Fatalf("timed out waiting for %d %s markers; missing sample=%v; last error: %v (%s)", len(missing), eventType, sampleKeys(missing, 5), lastErr, schemaDriftHint)
+				t.Fatalf("timed out waiting for %d %s markers; missing sample=%v; last error: %v (%s)", len(missing), eventType, sampleKeys(missing, 5), lastErr, schemaMismatchHint)
 			}
-			t.Fatalf("timed out waiting for %d %s markers; missing sample=%v (%s)", len(missing), eventType, sampleKeys(missing, 5), schemaDriftHint)
+			t.Fatalf("timed out waiting for %d %s markers; missing sample=%v (%s)", len(missing), eventType, sampleKeys(missing, 5), schemaMismatchHint)
 		case <-ticker.C:
 		}
 	}
@@ -584,7 +582,7 @@ func (cfg *expiryConfig) hasDedupeMarker(ctx context.Context, eventType, primary
 	out, err := cfg.ddb.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(cfg.webhookDedupeTable),
 		Key: map[string]ddbtypes.AttributeValue{
-			"pk": &ddbtypes.AttributeValueMemberS{Value: webhookEventDedupePK(eventType, primaryID)},
+			expiryContract.WebhookDedupe.PartitionKey: &ddbtypes.AttributeValueMemberS{Value: webhookEventDedupePK(eventType, primaryID)},
 		},
 		ConsistentRead: aws.Bool(true),
 	})
@@ -594,11 +592,11 @@ func (cfg *expiryConfig) hasDedupeMarker(ctx context.Context, eventType, primary
 	if len(out.Item) == 0 {
 		return false, nil
 	}
-	if got := stringAttr(out.Item, "event_type"); got != eventType {
-		return false, fmt.Errorf("dedupe marker event_type = %q, want %q", got, eventType)
+	if got := stringAttr(out.Item, expiryContract.WebhookDedupe.EventTypeAttribute); got != eventType {
+		return false, fmt.Errorf("dedupe marker %s = %q, want %q", expiryContract.WebhookDedupe.EventTypeAttribute, got, eventType)
 	}
-	if got := stringAttr(out.Item, "primary_id"); got != primaryID {
-		return false, fmt.Errorf("dedupe marker primary_id = %q, want %q", got, primaryID)
+	if got := stringAttr(out.Item, expiryContract.WebhookDedupe.PrimaryIDAttribute); got != primaryID {
+		return false, fmt.Errorf("dedupe marker %s = %q, want %q", expiryContract.WebhookDedupe.PrimaryIDAttribute, got, primaryID)
 	}
 	return true, nil
 }
@@ -648,9 +646,8 @@ func (cfg *expiryConfig) resourceTombstoned(ctx context.Context, resourceID stri
 	out, err := cfg.ddb.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(cfg.resourcesTable),
 		Key: map[string]ddbtypes.AttributeValue{
-			// Mirrors qurl-service's qurl-resources table primary key shape.
-			"resource_id": &ddbtypes.AttributeValueMemberS{Value: resourceID},
-			"sk":          &ddbtypes.AttributeValueMemberS{Value: "RESOURCE"},
+			expiryContract.Resources.PartitionKey: &ddbtypes.AttributeValueMemberS{Value: resourceID},
+			expiryContract.Resources.SortKey:      &ddbtypes.AttributeValueMemberS{Value: expiryContract.Resources.ResourceSortKeyValue},
 		},
 		ConsistentRead: aws.Bool(true),
 	})
@@ -660,11 +657,10 @@ func (cfg *expiryConfig) resourceTombstoned(ctx context.Context, resourceID stri
 	if len(out.Item) == 0 {
 		return false, fmt.Errorf("resource %s not found in %s", resourceID, cfg.resourcesTable)
 	}
-	// Mirrors qurl-service's tombstone attributes on the RESOURCE item.
-	if stringAttr(out.Item, "resource_tombstoned_at") == "" {
+	if stringAttr(out.Item, expiryContract.Resources.TombstonedAtAttribute) == "" {
 		return false, nil
 	}
-	ttl := numberAttr(out.Item, "tombstone_ttl")
+	ttl := numberAttr(out.Item, expiryContract.Resources.TombstoneTTLAttribute)
 	if ttl == "" {
 		return false, nil
 	}
@@ -681,14 +677,13 @@ func (cfg *expiryConfig) lookupQURLIDForResource(ctx context.Context, t *testing
 	var qurlID string
 	err := cfg.waitFor(ctx, "qURL id for resource "+resourceID, func(ctx context.Context) (bool, error) {
 		out, err := cfg.ddb.Query(ctx, &dynamodb.QueryInput{
-			// Mirrors qurl-service's access-token GSI and qURL-id projection.
 			TableName:              aws.String(cfg.accessTokensTable),
-			IndexName:              aws.String("resource-token-index"),
-			KeyConditionExpression: aws.String("resource_id = :rid"),
+			IndexName:              aws.String(expiryContract.AccessTokens.ResourceIndex),
+			KeyConditionExpression: aws.String(expiryContract.AccessTokens.ResourceIndexPartitionKey + " = :rid"),
 			ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
 				":rid": &ddbtypes.AttributeValueMemberS{Value: resourceID},
 			},
-			ProjectionExpression: aws.String("nhp_resource_id"),
+			ProjectionExpression: aws.String(expiryContract.AccessTokens.QURLIDProjectionAttribute),
 			Limit:                aws.Int32(1),
 		})
 		if err != nil {
@@ -697,7 +692,7 @@ func (cfg *expiryConfig) lookupQURLIDForResource(ctx context.Context, t *testing
 		if len(out.Items) == 0 {
 			return false, nil
 		}
-		qurlID = stringAttr(out.Items[0], "nhp_resource_id")
+		qurlID = stringAttr(out.Items[0], expiryContract.AccessTokens.QURLIDProjectionAttribute)
 		return qurlID != "", nil
 	})
 	if err != nil {
@@ -711,12 +706,11 @@ func (cfg *expiryConfig) waitForActiveSession(ctx context.Context, t *testing.T,
 
 	err := cfg.waitFor(ctx, "active session for resource "+resourceID, func(ctx context.Context) (bool, error) {
 		out, err := cfg.ddb.Query(ctx, &dynamodb.QueryInput{
-			// Mirrors qurl-service's session table resource partition key.
 			TableName:              aws.String(cfg.sessionsTable),
-			KeyConditionExpression: aws.String("resource_id = :rid"),
-			FilterExpression:       aws.String("#ttl > :now"),
+			KeyConditionExpression: aws.String(expiryContract.Sessions.PartitionKey + " = :rid"),
+			FilterExpression:       aws.String(expiryContract.Sessions.ActiveFilterExpression),
 			ExpressionAttributeNames: map[string]string{
-				"#ttl": "ttl",
+				expiryContract.Sessions.TTLPlaceholder: expiryContract.Sessions.TTLAttribute,
 			},
 			ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
 				":rid": &ddbtypes.AttributeValueMemberS{Value: resourceID},
@@ -1185,42 +1179,11 @@ func opaqueSecretString(value any) bool {
 func extractAccessToken(t *testing.T, qurlLink string) string {
 	t.Helper()
 
-	parsed, err := url.Parse(qurlLink)
+	accessToken, err := extractAccessTokenFromQURLLink(qurlLink)
 	if err != nil {
-		t.Fatalf("parse qurl_link: %v", err)
+		t.Fatal(err)
 	}
-	fragment := parsed.Fragment
-	if strings.HasPrefix(fragment, "at_") {
-		return fragment
-	}
-	if strings.HasPrefix(fragment, "qv1.") {
-		payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(fragment, "qv1."))
-		if err != nil {
-			t.Fatalf("decode qv1 qurl_link fragment: %v", err)
-		}
-		var bundle struct {
-			AccessToken string `json:"access_token"`
-		}
-		if err := json.Unmarshal(payload, &bundle); err != nil {
-			t.Fatalf("parse qv1 qurl_link bundle: %v", err)
-		}
-		if bundle.AccessToken == "" {
-			t.Fatalf("qv1 qurl_link bundle missing access_token")
-		}
-		// qv1 bundles carry the same at_ access-token shape accepted by /v1/resolve.
-		return bundle.AccessToken
-	}
-	t.Fatalf("qurl_link fragment does not carry an at_ token or qv1 bundle")
-	return ""
-}
-
-func webhookEventDedupePK(eventType, primaryID string) string {
-	// Mirrors qurl-service's webhook-event dedupe PK helper
-	// (internal/domain/webhook.go). Keep this format in lockstep with the
-	// qurl-api consumer before changing the harness or service schema.
-	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%d:%s:%d:%s", len(eventType), eventType, len(primaryID), primaryID)
-	return hex.EncodeToString(h.Sum(nil))
+	return accessToken
 }
 
 func stringAttr(item map[string]ddbtypes.AttributeValue, key string) string {

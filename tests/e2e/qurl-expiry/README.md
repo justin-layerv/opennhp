@@ -16,9 +16,24 @@ not require.
 The harness also mirrors a few qurl-service/qurl-api storage contracts so it can
 verify producer-side expiry effects from this repo: the webhook dedupe PK,
 resource/session/access-token table key shapes, tombstone attributes, and the
-`qurl_link` fragment formats (`at_` token or `qv1.` base64url bundle). Keep those
-helpers in lockstep with qurl-service schema changes; #2932 tracks a more durable
-shared contract/fixture so this live harness does not silently drift.
+`qurl_link` fragment formats (`at_` token or `qv1.` base64url bundle). Those
+mirrored names and formats live in `qurl_expiry_contract.json`, which records the
+qurl-service source files and commit used to verify them. The normal unit lane
+runs the manifest-backed contract tests without touching AWS, so local edits to
+the live harness or manifest fail before the sandbox-only e2e path silently
+drifts. The always-on local fence strictly parses the manifest and verifies the
+webhook dedupe PK vectors; table, attribute, link, and source-path names are
+checked locally and then consumed by the live harness, not fetched from
+qurl-service at test time. `verified_commit` is a manual verification anchor for
+that mirror. The qurl-service-owned generated/shared fixture that would remove
+the remaining manual mirror is tracked in layervai/qurl-service#1061.
+When changing a mirrored value, re-derive it from qurl-service at the recorded
+commit and update `verified_commit` in the same PR.
+
+Root `make test` intentionally compiles this package from the separate
+`tests/e2e` module so the always-on fence runs without AWS credentials. Root
+`make init` also tidies `tests/e2e`, keeping dependency metadata aligned with
+the unit-lane contract check.
 
 The harness is live-AWS only and skips unless explicitly enabled:
 
