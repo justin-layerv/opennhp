@@ -127,18 +127,24 @@ type UdpAC struct {
 	bpfFlusherSkippedCount func() uint64
 
 	// bpfConntrackStats is the BpfFlusher's conntrack occupancy + quiet-reaper
-	// stats reader, set alongside bpfFlusherSkippedCount when the scheduler is
-	// constructed in EBPFXDP mode on Linux. nil otherwise. The indirection keeps
-	// registration.go build-tag-free while still publishing eBPF conntrack cache
-	// saturation signals during the FilterMode flip.
+	// cached stats reader, set alongside bpfFlusherSkippedCount when the
+	// scheduler is constructed in EBPFXDP mode on Linux. nil otherwise. The
+	// indirection keeps registration.go build-tag-free while still publishing
+	// eBPF conntrack cache saturation signals during the FilterMode flip.
 	bpfConntrackStats func() BpfConntrackStats
+
+	// bpfConntrackSamplerStop stops the BpfFlusher-owned sample/reap loop. It
+	// is wired with bpfConntrackStats in EBPFXDP mode but started only after AC
+	// registration starts successfully, so failed Start paths do not leak a
+	// lifecycle goroutine.
+	bpfConntrackSamplerStop func(context.Context) error
 
 	// bpfConntrackSampleErrorsReported is the cumulative sampler-error
 	// watermark already emitted as reset-per-flush publisher counter events.
-	// BpfFlusher owns the raw cumulative count because sampling is cached across
-	// all conntrack gauge reads; UdpAC converts only the unseen delta into
-	// MetricEbpfConntrackSampleErrors so the CloudWatch alarm can recover after
-	// transient failures.
+	// BpfFlusher owns the raw cumulative count because the lifecycle sampler
+	// updates the snapshot shared by all conntrack gauge reads; UdpAC converts
+	// only the unseen delta into MetricEbpfConntrackSampleErrors so the
+	// CloudWatch alarm can recover after transient failures.
 	bpfConntrackSampleErrorsReported atomic.Uint64
 
 	// bpfConntrackPartialSamplesReported is the cumulative partial-sample
@@ -452,6 +458,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	// with EnableL3FlushOnExpiry=true but no flusher would silently
 	// late-fire forever (worst-of-both-worlds for an L3-only
 	// enforcement contract).
+	var bpfFlusher *BpfFlusher
 	if a.config.EnableL3FlushOnExpiry {
 		// Backend was normalized to a known value at config load (unknown
 		// → exec with a Warning), so ok is guaranteed here; ignore it.
@@ -467,8 +474,10 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 		// metrics-publisher path stay cross-platform — the
 		// non-Linux stub returns 0 from SkippedCount.
 		if bf, ok := flusher.(*BpfFlusher); ok && bf != nil {
+			bpfFlusher = bf
 			a.bpfFlusherSkippedCount = bf.SkippedCount
 			a.bpfConntrackStats = bf.ConntrackStats
+			a.bpfConntrackSamplerStop = bf.StopConntrackSampler
 			// Bind the surgical conntrack-teardown seam to the same
 			// EBPFXDP-on-Linux BpfFlusher. This is what flips
 			// flushEntryNow from coarse-only allow-rule reschedule to the
@@ -535,6 +544,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			a.expirySched = nil
 			a.bpfFlusherSkippedCount = nil
 			a.bpfConntrackStats = nil
+			a.bpfConntrackSamplerStop = nil
 			a.surgicalConnFlush = nil
 			a.enumerateConnSrcPorts = nil
 			a.surgicalConnFlushV6 = nil
@@ -568,6 +578,26 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	}
 	if err := a.registration.Start(); err != nil {
 		return fmt.Errorf("failed to start AC registration manager: %w", err)
+	}
+
+	if bpfFlusher != nil {
+		// Start the lifecycle-owned sample/reap loop after registration gauge
+		// registration succeeds, but before AC message goroutines can admit new
+		// flows.
+		bpfFlusher.StartConntrackSampler()
+		// Forward-looking guard: there is no current error return after the
+		// sampler starts, but future startup work added below this point must not
+		// leak the lifecycle goroutine on failure.
+		defer func() {
+			if err == nil {
+				return
+			}
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if stopErr := bpfFlusher.StopConntrackSampler(cleanupCtx); stopErr != nil {
+				log.Error("[BpfFlusher] cleanup stop after AC Start failure timed out: %v", stopErr)
+			}
+		}()
 	}
 
 	// start ac routines
@@ -628,6 +658,17 @@ func (ac *UdpAC) Stop() {
 		if err := ac.expirySched.Shutdown(shutdownCtx); err != nil {
 			log.Error("[L3FlushSched] shutdown drain timed out: %v", err)
 		}
+	}
+	if ac.bpfConntrackSamplerStop != nil {
+		// Keep defer-cancel scoped to this shutdown call while retaining the
+		// sibling block's panic-safe cancellation pattern.
+		func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := ac.bpfConntrackSamplerStop(shutdownCtx); err != nil {
+				log.Warning("[BpfFlusher] conntrack sampler shutdown timed out: %v", err)
+			}
+		}()
 	}
 	// Close the iptables conntrack flusher's netlink socket pool, if any.
 	// AFTER the scheduler drained above, so no Flush is mid-dump on a

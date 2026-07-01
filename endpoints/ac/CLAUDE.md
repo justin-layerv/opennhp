@@ -46,11 +46,20 @@ must update this list and audit all existing call sites.
   these locks (so no inversion is possible from outside-in callers).
   When extending the scheduler, keep the lock discipline documented
   in the scheduler godoc rather than duplicating it here.
-- **`BpfFlusher.statsMu` is leaf-most and internal.** `ConntrackStats`
-  holds it across the eBPF conntrack walk/reap cache refresh, but that path
-  does not call back into `UdpAC`, `ACRegistration`, metrics publisher locks,
-  or scheduler/tokenstore locks. Keep it leaf-most; future changes that invoke
-  AC callbacks while holding `statsMu` must audit this table first.
+- **`BpfFlusher.statsMu` is leaf-most and internal.** The lifecycle sampler
+  serializes eBPF conntrack walk/reap work in its own goroutine and briefly
+  takes `statsMu` only to publish the cached snapshot. `ConntrackStats` takes
+  only `statsMu`, so gauge reads return the last snapshot without waiting on a
+  map walk. Neither path calls back into `UdpAC`, `ACRegistration`, metrics
+  publisher locks, or scheduler/tokenstore locks. Keep `statsMu` leaf-most;
+  future changes that invoke AC callbacks while holding it must audit this
+  table first.
+- **`BpfFlusher.conntrackSamplerMu` guards only sampler lifecycle state.**
+  Start/stop paths take it to read or swap the sampler pointer; they do not
+  hold it while walking eBPF maps or waiting for sampler shutdown. The sampler
+  goroutine clears the pointer during teardown and then closes `done`, so
+  callers that wait for shutdown must snapshot the pointer, release the mutex,
+  and only then wait.
 - **`tokenStore.mu` is never held while scheduler `shard.mu` /
   `wheelMu` are acquired** (#2172). The
   `TokenStore.OnExpire` hook wired by `(*UdpAC).Start` calls

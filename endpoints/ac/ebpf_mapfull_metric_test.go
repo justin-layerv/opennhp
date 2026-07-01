@@ -160,7 +160,7 @@ func TestACRegistration_EbpfConntrackGauges_ReadWiredStats(t *testing.T) {
 	}
 }
 
-func TestACRegistration_ConntrackGaugeCollectionDrivesStatsSampler(t *testing.T) {
+func TestACRegistration_ConntrackGaugeCollectionReadsCachedStatsAndPublishesCounterDeltas(t *testing.T) {
 	publisher := metrics.NewPublisherForTest(t)
 	calls := 0
 	a := &UdpAC{
@@ -181,7 +181,7 @@ func TestACRegistration_ConntrackGaugeCollectionDrivesStatsSampler(t *testing.T)
 	gauges := publisher.GaugesForTest(t)
 
 	if calls == 0 {
-		t.Fatal("conntrack gauge collection did not call BpfConntrackStats; quiet-entry reaping depends on this side effect")
+		t.Fatal("conntrack gauge collection did not read the cached BpfConntrackStats snapshot")
 	}
 	if got := gauges[MetricEbpfConntrackV4Entries]; got != 42 {
 		t.Fatalf("%s gauge after collection = %v, want 42", MetricEbpfConntrackV4Entries, got)

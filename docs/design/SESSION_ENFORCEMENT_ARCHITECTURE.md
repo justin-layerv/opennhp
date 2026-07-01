@@ -209,17 +209,17 @@ Correctness still holds: if an allow-rule matches, the packet returns
 `XDP_PASS`; it simply remains uncached and pays the full allow-rule scan on each
 packet until a cache slot is made available. If no allow-rule matches, it still
 `XDP_DROP`s. Dead quiet entries are reclaimed by the userspace conntrack
-stats/reaper (`nhp/utils/ebpf/conntrack_stats_linux.go`), wired through
-`BpfFlusher.ConntrackStats`: once per metrics flush sample it applies the same
+stats/reaper (`nhp/utils/ebpf/conntrack_stats_linux.go`), wired through the
+BpfFlusher lifecycle sampler: once per sampler interval it applies the same
 `timestamp + ttl_ns < now` predicate as `check_conn_expiry` and deletes expired
 entries from `conn_track` / `conn_track_v6`, even when the flow will never send
 the next packet that would trigger datapath GC. Reclamation cadence is therefore
-the AC metrics flush cadence (60s today). The 30s conntrack stats cache dedupes
-the multiple conntrack gauges inside one flush; it does not create a faster
-independent reaper cadence. Each sample deletes at most 100,000 expired quiet
-entries per conntrack family, up to ~200,000 across V4+V6; at today's cadence
-that is roughly 100,000 entries/minute per family, so a mass-expiry event cannot
-issue unbounded delete syscalls on the metrics goroutine and may drain gradually.
+the sampler cadence (60s today), while conntrack GaugeFuncs only read the cached
+snapshot the sampler published. Each sample deletes at most 100,000 expired
+quiet entries per conntrack family, up to ~200,000 across V4+V6; at today's
+cadence that is roughly 100,000 entries/minute per family, so a mass-expiry
+event cannot issue unbounded delete syscalls on the metrics publisher and may
+drain gradually.
 The reaper uses the package's existing kernel-time helper; on
 non-suspending EC2 hosts it is equivalent to XDP's `bpf_ktime_get_ns`, and even
 under clock-domain skew the worst case is premature cache reaping followed by
@@ -236,12 +236,10 @@ without evicting an existing established entry.
 This removes the E5 flip blocker in #2814. The remaining capacity concern is
 operational sizing: a full conntrack HASH map is a performance cliff for
 new/uncached flows, not a fail-open or collateral-kill condition. Sizing stays
-coupled to `max_entries`, instance type, and the E5 flip readiness checks; a
-near-`max_entries` conntrack walk measurement on the target AC instance type is
-a hard E5 flip gate until #2928 removes the full-walk publisher dependency.
-Do not treat the metrics-path reaper as capacity-safety evidence for E5 without
-either landing #2928's decoupled/batched path or recording why sizing plus
-datapath GC are sufficient without it.
+coupled to `max_entries`, instance type, and the E5 flip readiness checks. A
+near-`max_entries` conntrack walk measurement on the target AC instance type
+remains hard E5 flip evidence: #2928 removes the full-walk publisher dependency,
+but slow samples still make cached snapshots stale and delay quiet-entry reaping.
 
 ### Capacity / `max_entries` sizing and kernel-memory cost
 
@@ -428,7 +426,7 @@ Conntrack cache pressure is intentionally separate from `EbpfMapFull`:
 | `EbpfConntrackV4UsagePercent` / `EbpfConntrackV6UsagePercent` | Post-reap occupancy vs the map's `max_entries` |
 | `EbpfConntrackV4OldestAgeSeconds` / `EbpfConntrackV6OldestAgeSeconds` | Oldest surviving entry idle age observed in the sample; during an expiry backlog above the delete budget, this can under-report while expired survivors wait for a later pass |
 | `EbpfConntrackV4ExpiredReaped` / `EbpfConntrackV6ExpiredReaped` | Per-period quiet expired entries deleted by the sampler/reaper |
-| `EbpfConntrackSampleSeconds` | Wall-clock duration of the most recent sample/reap attempt; use `Maximum` during flip validation to catch full-map walk latency |
+| `EbpfConntrackSampleSeconds` | Wall-clock duration of the most recent lifecycle sampler/reap attempt; use `Maximum` during flip validation to catch full-map walk latency |
 | `EbpfConntrackSampleErrors` | Per-period failures to sample/reap the pinned conntrack maps |
 | `EbpfConntrackPartialSamples` | Per-period incomplete HASH walks caused by concurrent churn; usage gauges may undercount for those samples. The alarm pages only on sustained partials, not isolated churny walks |
 

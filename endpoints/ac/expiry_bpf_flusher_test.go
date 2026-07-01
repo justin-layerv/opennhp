@@ -5,6 +5,7 @@ package ac
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -222,11 +223,211 @@ func TestBpfFlusher_FlushConnV6_CanceledCtx(t *testing.T) {
 	}
 }
 
-func TestBpfConntrackStatsCacheTTLBelowPublisherFlushInterval(t *testing.T) {
+func TestBpfConntrackSampleIntervalMatchesPublisherFlushInterval(t *testing.T) {
 	flushInterval := metrics.FlushIntervalForTest(t)
-	if bpfConntrackStatsCacheTTL >= flushInterval {
-		t.Fatalf("bpfConntrackStatsCacheTTL = %s, want < metrics flush interval %s so each flush can drive at most one fresh conntrack walk/reap",
-			bpfConntrackStatsCacheTTL, flushInterval)
+	if bpfConntrackSampleInterval != flushInterval {
+		t.Fatalf("bpfConntrackSampleInterval = %s, want metrics flush interval %s to preserve the previous conntrack map-walk cadence",
+			bpfConntrackSampleInterval, flushInterval)
+	}
+}
+
+func TestBpfConntrackStatsFromRaw_ZeroMaxEntriesUsesZeroUsagePercent(t *testing.T) {
+	stats := bpfConntrackStatsFromRaw(utilebpf.ConnTrackStats{}, 0, 0, 0, 0)
+	if stats.V4MaxEntries != 0 || stats.V4UsagePercent != 0 {
+		t.Fatalf("v4 zero snapshot = max %d usage %v, want max 0 usage 0", stats.V4MaxEntries, stats.V4UsagePercent)
+	}
+	if stats.V6MaxEntries != 0 || stats.V6UsagePercent != 0 {
+		t.Fatalf("v6 zero snapshot = max %d usage %v, want max 0 usage 0", stats.V6MaxEntries, stats.V6UsagePercent)
+	}
+}
+
+func TestBpfFlusher_ConntrackStatsReturnsCachedSnapshotWithoutSampling(t *testing.T) {
+	calls := 0
+	want := BpfConntrackStats{V4Entries: 7, V6Entries: 3}
+	f := &BpfFlusher{
+		stats: want,
+		sampleConntrack: func() (utilebpf.ConnTrackStats, error) {
+			calls++
+			return utilebpf.ConnTrackStats{}, nil
+		},
+	}
+
+	got := f.ConntrackStats()
+
+	if got != want {
+		t.Fatalf("ConntrackStats = %+v, want cached snapshot %+v", got, want)
+	}
+	if calls != 0 {
+		t.Fatalf("ConntrackStats invoked sampler %d time(s), want 0; gauges must not drive map walks", calls)
+	}
+}
+
+func TestBpfFlusher_ConntrackSamplerSamplesEachInterval(t *testing.T) {
+	samples := make(chan int32, 3)
+	var calls atomic.Int32
+	f := &BpfFlusher{
+		sampleConntrack: func() (utilebpf.ConnTrackStats, error) {
+			call := calls.Add(1)
+			select {
+			case samples <- call:
+			default:
+			}
+			return utilebpf.ConnTrackStats{
+				V4: utilebpf.ConnTrackMapStats{
+					Entries:    uint64(call),
+					MaxEntries: 10,
+				},
+			}, nil
+		},
+	}
+
+	f.startConntrackSampler(10 * time.Millisecond)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := f.StopConntrackSampler(ctx); err != nil {
+			t.Fatalf("StopConntrackSampler err = %v", err)
+		}
+	}()
+
+	for want := int32(1); want <= 3; want++ {
+		select {
+		case got := <-samples:
+			if got != want {
+				t.Fatalf("sample call = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for sample call %d", want)
+		}
+	}
+}
+
+func TestBpfFlusher_ConntrackSamplerNonPositiveIntervalFallsBackToDefault(t *testing.T) {
+	sampled := make(chan struct{}, 1)
+	f := &BpfFlusher{
+		sampleConntrack: func() (utilebpf.ConnTrackStats, error) {
+			select {
+			case sampled <- struct{}{}:
+			default:
+			}
+			return utilebpf.ConnTrackStats{}, nil
+		},
+	}
+
+	f.startConntrackSampler(0)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := f.StopConntrackSampler(ctx); err != nil {
+			t.Fatalf("StopConntrackSampler err = %v", err)
+		}
+	}()
+
+	select {
+	case <-sampled:
+	case <-time.After(time.Second):
+		t.Fatal("sampler did not run immediate sample with fallback interval")
+	}
+}
+
+func TestBpfFlusher_ConntrackSamplerStartStopWaitsForInFlightSample(t *testing.T) {
+	sampleStarted := make(chan struct{})
+	releaseSample := make(chan struct{})
+	var calls atomic.Int32
+	f := &BpfFlusher{
+		sampleConntrack: func() (utilebpf.ConnTrackStats, error) {
+			if calls.Add(1) == 1 {
+				close(sampleStarted)
+			}
+			<-releaseSample
+			return utilebpf.ConnTrackStats{
+				V4: utilebpf.ConnTrackMapStats{Entries: 1, MaxEntries: 10},
+			}, nil
+		},
+	}
+
+	f.startConntrackSampler(time.Hour)
+	f.startConntrackSampler(time.Hour)
+
+	select {
+	case <-sampleStarted:
+	case <-time.After(time.Second):
+		t.Fatal("sampler did not start an immediate sample")
+	}
+
+	stopReturned := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		stopReturned <- f.StopConntrackSampler(ctx)
+	}()
+
+	select {
+	case err := <-stopReturned:
+		t.Fatalf("StopConntrackSampler returned before in-flight sample completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseSample)
+	select {
+	case err := <-stopReturned:
+		if err != nil {
+			t.Fatalf("StopConntrackSampler err = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("StopConntrackSampler did not return after in-flight sample completed")
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("sample calls after duplicate start + stop = %d, want 1", got)
+	}
+	if err := f.StopConntrackSampler(context.Background()); err != nil {
+		t.Fatalf("second StopConntrackSampler err = %v, want nil", err)
+	}
+}
+
+func TestBpfFlusher_ConntrackSamplerStopTimeoutLeavesSamplerRegistered(t *testing.T) {
+	sampleStarted := make(chan struct{})
+	releaseSample := make(chan struct{})
+	f := &BpfFlusher{
+		sampleConntrack: func() (utilebpf.ConnTrackStats, error) {
+			select {
+			case <-sampleStarted:
+			default:
+				close(sampleStarted)
+			}
+			<-releaseSample
+			return utilebpf.ConnTrackStats{
+				V4: utilebpf.ConnTrackMapStats{Entries: 1, MaxEntries: 10},
+			}, nil
+		},
+	}
+
+	f.startConntrackSampler(time.Hour)
+	select {
+	case <-sampleStarted:
+	case <-time.After(time.Second):
+		t.Fatal("sampler did not start an immediate sample")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := f.StopConntrackSampler(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("StopConntrackSampler err = %v, want context.Canceled", err)
+	}
+
+	f.conntrackSamplerMu.Lock()
+	registered := f.conntrackSampler != nil
+	f.conntrackSamplerMu.Unlock()
+	if !registered {
+		t.Fatal("sampler unregistered before the blocked sample exited")
+	}
+
+	close(releaseSample)
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := f.StopConntrackSampler(waitCtx); err != nil {
+		t.Fatalf("StopConntrackSampler after releasing sample err = %v, want nil", err)
 	}
 }
 

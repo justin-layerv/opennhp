@@ -86,7 +86,7 @@ Actions:
 - Check `EbpfConntrackV4MaxEntries` / `EbpfConntrackV6MaxEntries` to confirm which ceiling is actually loaded on the affected fleet.
 - Check `EbpfConntrackV4OldestAgeSeconds` / `EbpfConntrackV6OldestAgeSeconds`. This is idle age since the last packet, not total entry lifetime; a rising value with low reaped counts means most entries may still be live.
   During an expiry backlog above the 100,000-entry delete budget, oldest-age can under-report because expired entries left for a later pass are excluded from the survivor-age calculation.
-- Check `EbpfConntrackSampleSeconds` with `Maximum`. Values near the metrics flush interval mean full-map walks are delaying publishing; keep this evidence with the #2928/#2930 flip-gate records.
+- Check `EbpfConntrackSampleSeconds` with `Maximum`. Values near the sampler interval mean full-map walks are making cached snapshots stale and quiet-entry reaping lag; keep this evidence with the #2928/#2930 flip-gate records.
 - Check `EbpfConntrackSampleErrors` `Sum`. Any non-zero value in the current period means the sampler/reaper may be blind or stalled; inspect AC logs for `[BpfFlusher] conntrack stats/reaper sample failed`.
 - Check `EbpfConntrackPartialSamples` `Sum`. Any non-zero value means the HASH walk aborted under concurrent churn; usage may be undercounting and the quiet reaper skipped deletes for that sample.
 - If occupancy stays high after reaping, scale AC capacity or reduce long-lived flow creation.
@@ -119,8 +119,8 @@ Actions:
   partial samples is not proof of safety until complete samples resume.
 - Check AC logs for `conntrack v4 stats/reaper sample was partial` or `conntrack v6 stats/reaper sample was partial` to identify the affected family.
 - If partial samples persist with high usage, reduce new-flow churn or scale AC capacity before raising map ceilings.
-- Treat nhp#2928's reaper/metrics decoupling decision as hard E5 EBPFXDP flip-gate evidence: land the decoupled/batched path, or explicitly record why sizing plus datapath GC are safe without relying on metrics-path reaping.
-- Treat the near-`max_entries` conntrack walk measurement as a hard E5 EBPFXDP flip gate: confirm it exercises the 100,000-delete path without pushing metrics publishing beyond the acceptable flush window on the target AC instance type, and keep the result with the nhp#2928/#2930 evidence.
+- Treat nhp#2928's reaper/metrics decoupling decision as hard E5 EBPFXDP flip-gate evidence: the lifecycle sampler must stay independent of GaugeFunc publication, or sizing plus datapath GC need an explicit replacement decision.
+- Treat the near-`max_entries` conntrack walk measurement as a hard E5 EBPFXDP flip gate: confirm it exercises the 100,000-delete path without making sampler snapshots too stale on the target AC instance type, and keep the result with the nhp#2928/#2930 evidence.
 
 ## Metric Meaning
 
@@ -128,19 +128,15 @@ Actions:
 
 `EbpfConntrack*UsagePercent` is a cache-pressure signal. It means established-flow conntrack occupancy is high after the userspace quiet-entry reaper ran.
 
-The quiet-entry reaper runs as part of the AC metrics flush cadence (60s today)
-and deletes at most 100,000 expired quiet entries per conntrack family per
-sample, up to ~200,000 across V4+V6. The 30s conntrack stats cache dedupes the
-multiple conntrack gauge callbacks inside one flush; it does not create a faster
-independent reaper cadence. At today's cadence, the designed reclaim ceiling is
-therefore roughly 100,000 entries/minute per family, or ~200,000/minute across
-V4+V6; slower draining under a larger quiet backlog is expected, not evidence
-that the reaper is stuck. If the CloudWatch metrics
-publisher is disabled or fails to initialize, this GaugeFunc-driven reaper stops
-too; quiet entries are then reclaimed only by datapath GC on a later packet
-until nhp#2928 decouples the reaper from metrics collection. Treat that
-decoupling decision as flip-gate evidence, not a soft follow-up. If sample
-errors or partial samples are firing, conntrack occupancy telemetry and
-quiet-entry reclamation can both be stale or incomplete.
+The quiet-entry reaper runs from the BpfFlusher lifecycle sampler (60s today),
+not from GaugeFunc collection. Each sample deletes at most 100,000 expired quiet
+entries per conntrack family, up to ~200,000 across V4+V6. At today's cadence,
+the designed reclaim ceiling is therefore roughly 100,000 entries/minute per
+family, or ~200,000/minute across V4+V6; slower draining under a larger quiet
+backlog is expected, not evidence that the reaper is stuck. Conntrack gauges are
+cached snapshot reads; if a sample is slow, metrics may publish the previous
+snapshot for one flush while the sampler continues outside the publisher path.
+If sample errors or partial samples are firing, conntrack occupancy telemetry
+and quiet-entry reclamation can both be stale or incomplete.
 
 Do not use `EbpfMapFull` as a proxy for conntrack saturation, and do not use conntrack usage as proof that admissions are being denied.

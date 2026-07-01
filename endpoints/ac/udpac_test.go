@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"context"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,32 @@ func createTestAC(t *testing.T) *UdpAC {
 	}
 	ac.device = device
 	return ac
+}
+
+func TestUdpACStopInvokesBpfConntrackSamplerStop(t *testing.T) {
+	ac := createTestAC(t)
+	ac.signals.stop = make(chan struct{})
+	ac.signals.serverMapUpdated = make(chan struct{})
+	ac.sendMsgCh = make(chan *core.MsgData)
+
+	var called atomic.Bool
+	ac.bpfConntrackSamplerStop = func(ctx context.Context) error {
+		called.Store(true)
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Error("sampler stop context has no deadline")
+		}
+		if ok && time.Until(deadline) <= 0 {
+			t.Error("sampler stop context deadline is already expired")
+		}
+		return nil
+	}
+
+	ac.Stop()
+
+	if !called.Load() {
+		t.Fatal("UdpAC.Stop did not invoke bpfConntrackSamplerStop")
+	}
 }
 
 // connRoutineHarness drives ac.connectionRoutine against a stub AC; see TestConnectionRoutine_*.

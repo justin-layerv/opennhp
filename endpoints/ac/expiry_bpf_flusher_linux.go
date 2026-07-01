@@ -36,9 +36,9 @@ import (
 //
 // **Quiet-flow residual** (acknowledged in QUIET_STREAM_RESIDUAL.md): a
 // connection with no traffic at the moment of allow-rule deletion will not
-// trigger datapath GC on its own. ConntrackStats runs a metrics-path sampler
-// and quiet-entry reaper over conn_track / conn_track_v6 once per cache window
-// so dead quiet entries do not keep HASH maps saturated before the next packet
+// trigger datapath GC on its own. StartConntrackSampler owns a lifecycle ticker
+// that samples and reaps conn_track / conn_track_v6 once per sample interval, so
+// dead quiet entries do not keep HASH maps saturated before the next packet
 // attempt; Flush stays latency-bounded and per-key.
 //
 // # Multi-map delete
@@ -106,22 +106,37 @@ type BpfFlusher struct {
 	// E2 s5 flagged (#2778).
 	metricSkipped atomic.Uint64
 
+	conntrackSamplerMu sync.Mutex
+	conntrackSampler   *bpfConntrackSampler
+
+	sampleConntrack func() (utilebpf.ConnTrackStats, error)
+
 	statsMu sync.Mutex
-	statsAt time.Time
 	stats   BpfConntrackStats
 
-	conntrackSampleErrors    atomic.Uint64
-	conntrackPartialSamples  atomic.Uint64
-	conntrackExpiredReapedV4 atomic.Uint64
-	conntrackExpiredReapedV6 atomic.Uint64
+	// Sampler-private cumulative counters. refreshConntrackStats is the only
+	// reader/writer; it publishes their values into stats under statsMu for
+	// cross-goroutine gauge reads.
+	conntrackSampleErrors    uint64
+	conntrackPartialSamples  uint64
+	conntrackExpiredReapedV4 uint64
+	conntrackExpiredReapedV6 uint64
+}
+
+type bpfConntrackSampler struct {
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 const (
-	// Shorter than endpoints/metrics.flushInterval (60s today) by design:
-	// this dedupes the many conntrack GaugeFuncs inside one metrics flush,
-	// not across independent flush windows. Revisit if the publisher cadence
-	// drops below this value.
-	bpfConntrackStatsCacheTTL       = 30 * time.Second
+	// Matches endpoints/metrics.flushInterval (60s today) so the lifecycle
+	// sampler preserves the previous map-walk cadence while GaugeFuncs remain
+	// pure cache readers. The sampler free-runs from the publisher, so snapshots
+	// can be up to one interval old; keep this equality intentional so publisher
+	// cadence changes force an explicit sampler cost/freshness retune.
+	bpfConntrackSampleInterval = 60 * time.Second
+
 	bpfConntrackSampleSlowThreshold = 2 * time.Second
 )
 
@@ -141,35 +156,127 @@ func (f *BpfFlusher) SkippedCount() uint64 {
 	return f.metricSkipped.Load()
 }
 
-// ConntrackStats samples the pinned eBPF conntrack maps, reaps entries whose
-// XDP ttl has expired but whose flows went quiet, and returns a cached
-// cross-platform stats view for CloudWatch gauges. This is intentionally not a
-// pure getter: quiet-entry reclamation runs at metrics-flush cadence, and the
-// cache ensures the many GaugeFuncs in one flush share one map walk. statsMu is
-// held across that walk/delete pass; the work is bounded to once per cache
-// window, not once per gauge.
+// StartConntrackSampler starts the lifecycle-owned conntrack sample/reap loop.
+// It is idempotent and its goroutine kicks one immediate refresh before
+// entering the ticker so gauges get a fresh snapshot without making gauge
+// collection perform the destructive map walk. Gauge reads racing a slow first
+// sample return the existing cached snapshot until that async pass publishes.
+func (f *BpfFlusher) StartConntrackSampler() {
+	f.startConntrackSampler(bpfConntrackSampleInterval)
+}
+
+func (f *BpfFlusher) startConntrackSampler(interval time.Duration) {
+	if f == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = bpfConntrackSampleInterval
+	}
+
+	f.conntrackSamplerMu.Lock()
+	if f.conntrackSampler != nil {
+		f.conntrackSamplerMu.Unlock()
+		return
+	}
+	sampler := &bpfConntrackSampler{
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	f.conntrackSampler = sampler
+	f.conntrackSamplerMu.Unlock()
+
+	go f.runConntrackSampler(sampler, interval)
+}
+
+// StopConntrackSampler stops the lifecycle-owned conntrack sampler and waits
+// for any in-flight map walk/delete pass to finish. If ctx expires, the sampler
+// remains registered until that pass exits. A timeout does not leave AC-owned
+// map handles dangling: SampleAndReapConnTrack opens and closes pinned eBPF map
+// handles per pass, and the EBPFXDP path has no conntrackFlusher pool to close.
+func (f *BpfFlusher) StopConntrackSampler(ctx context.Context) error {
+	if f == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	f.conntrackSamplerMu.Lock()
+	sampler := f.conntrackSampler
+	f.conntrackSamplerMu.Unlock()
+	if sampler == nil {
+		return nil
+	}
+
+	sampler.stopSampler()
+	select {
+	case <-sampler.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (f *BpfFlusher) runConntrackSampler(sampler *bpfConntrackSampler, interval time.Duration) {
+	defer func() {
+		f.conntrackSamplerMu.Lock()
+		if f.conntrackSampler == sampler {
+			f.conntrackSampler = nil
+		}
+		f.conntrackSamplerMu.Unlock()
+		close(sampler.done)
+	}()
+
+	select {
+	case <-sampler.stop:
+		return
+	default:
+	}
+	f.refreshConntrackStats()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			f.refreshConntrackStats()
+		case <-sampler.stop:
+			return
+		}
+	}
+}
+
+func (s *bpfConntrackSampler) stopSampler() {
+	s.stopOnce.Do(func() {
+		close(s.stop)
+	})
+}
+
+// ConntrackStats returns the cached cross-platform stats view for CloudWatch
+// gauges. The lifecycle sampler owns map walking and quiet-entry reaping;
+// GaugeFuncs are pure readers so metrics publication cannot trigger duplicate
+// conntrack walks or block on a destructive maintenance burst.
 func (f *BpfFlusher) ConntrackStats() BpfConntrackStats {
 	if f == nil {
 		return BpfConntrackStats{}
 	}
 
-	now := time.Now()
 	f.statsMu.Lock()
 	defer f.statsMu.Unlock()
-	if !f.statsAt.IsZero() && now.Sub(f.statsAt) < bpfConntrackStatsCacheTTL {
-		return f.stats
-	}
+	return f.stats
+}
 
+func (f *BpfFlusher) refreshConntrackStats() {
 	sampleStart := time.Now()
-	raw, err := utilebpf.SampleAndReapConnTrack()
+	raw, err := f.sampleAndReapConnTrack()
 	sampleElapsed := time.Since(sampleStart)
 	slowSample := sampleElapsed > bpfConntrackSampleSlowThreshold
 	if slowSample {
 		if err != nil {
-			log.Warning("[BpfFlusher] conntrack stats/reaper sample took %s (> %s) and failed: %v; full HASH map walks may delay metrics publishing (see nhp#2928)",
+			log.Warning("[BpfFlusher] conntrack sampler/reaper pass took %s (> %s) and failed: %v; full HASH map walks may lag quiet-entry reaping (see nhp#2928)",
 				sampleElapsed, bpfConntrackSampleSlowThreshold, err)
 		} else {
-			log.Warning("[BpfFlusher] conntrack stats/reaper sample took %s (> %s); full HASH map walks may delay metrics publishing (v4=%d/%d v6=%d/%d, see nhp#2928)",
+			log.Warning("[BpfFlusher] conntrack sampler/reaper pass took %s (> %s); full HASH map walks may lag quiet-entry reaping (v4=%d/%d v6=%d/%d, see nhp#2928)",
 				sampleElapsed, bpfConntrackSampleSlowThreshold, raw.V4.Entries, raw.V4.MaxEntries, raw.V6.Entries, raw.V6.MaxEntries)
 		}
 	}
@@ -177,33 +284,43 @@ func (f *BpfFlusher) ConntrackStats() BpfConntrackStats {
 		// SampleErrors is per refresh attempt (a joined v4/v6 sample/reap
 		// pass); PartialSamples below is per family because HASH iteration can
 		// abort in one map while the other family returns a complete sample.
-		f.conntrackSampleErrors.Add(1)
+		f.conntrackSampleErrors++
 		if !slowSample {
 			log.Warning("[BpfFlusher] conntrack stats/reaper sample failed: %v", err)
 		}
 	}
 	if raw.V4.PartialSample {
-		f.conntrackPartialSamples.Add(1)
+		f.conntrackPartialSamples++
 		log.Warning("[BpfFlusher] conntrack v4 stats/reaper sample was partial; occupancy may undercount during high churn")
 	}
 	if raw.V6.PartialSample {
-		f.conntrackPartialSamples.Add(1)
+		f.conntrackPartialSamples++
 		log.Warning("[BpfFlusher] conntrack v6 stats/reaper sample was partial; occupancy may undercount during high churn")
 	}
-	f.conntrackExpiredReapedV4.Add(raw.V4.ExpiredDeleted)
-	f.conntrackExpiredReapedV6.Add(raw.V6.ExpiredDeleted)
+	f.conntrackExpiredReapedV4 += raw.V4.ExpiredDeleted
+	f.conntrackExpiredReapedV6 += raw.V6.ExpiredDeleted
 
 	nextStats := bpfConntrackStatsFromRaw(
 		raw,
-		f.conntrackSampleErrors.Load(),
-		f.conntrackPartialSamples.Load(),
-		f.conntrackExpiredReapedV4.Load(),
-		f.conntrackExpiredReapedV6.Load(),
+		f.conntrackSampleErrors,
+		f.conntrackPartialSamples,
+		f.conntrackExpiredReapedV4,
+		f.conntrackExpiredReapedV6,
 	)
 	nextStats.SampleDurationSeconds = sampleElapsed.Seconds()
+
+	// The lifecycle sampler goroutine is the sole writer of f.stats, so the
+	// prior snapshot it merges against cannot change while this sample runs.
+	f.statsMu.Lock()
 	f.stats = bpfConntrackStatsPreserveConservativeOccupancy(nextStats, f.stats, raw, err)
-	f.statsAt = time.Now()
-	return f.stats
+	f.statsMu.Unlock()
+}
+
+func (f *BpfFlusher) sampleAndReapConnTrack() (utilebpf.ConnTrackStats, error) {
+	if f.sampleConntrack != nil {
+		return f.sampleConntrack()
+	}
+	return utilebpf.SampleAndReapConnTrack()
 }
 
 func bpfConntrackStatsFromRaw(raw utilebpf.ConnTrackStats, sampleErrors, partialSamples, expiredReapedV4, expiredReapedV6 uint64) BpfConntrackStats {

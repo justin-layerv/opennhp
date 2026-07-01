@@ -1296,11 +1296,19 @@ func (r *ACRegistration) Start() error {
 }
 
 func (r *ACRegistration) registerConntrackGaugeFuncs() {
-	// These conntrack gauges intentionally have a side effect under EBPFXDP:
-	// BpfFlusher.ConntrackStats also reaps expired quiet entries and emits
-	// reset-per-flush sample/partial/expired-reaped counters. Keep them in the
-	// collected gauge path when the BpfFlusher stats reader is wired, unless
-	// reaping gets its own scheduler (tracked in nhp#2928).
+	// These conntrack gauges are registered only when the EBPFXDP BpfFlusher
+	// stats reader is wired. Quiet-entry reaping is owned by BpfFlusher's
+	// lifecycle sampler; gauge collection reads the cached snapshot and converts
+	// unseen cumulative sample/partial/expired-reaped watermarks into
+	// reset-per-flush counters. The publisher calls each GaugeFunc separately,
+	// so these helpers may revisit the same cached snapshot in one collection
+	// cycle; the delta watermarks are intentionally idempotent, and only the
+	// first gauge read after a sampler advance emits each unseen counter delta.
+	// If a sampler pass publishes mid-collection, occupancy gauges in the same
+	// publisher flush can straddle two snapshots; this is eventually consistent
+	// by design because the destructive map walk is no longer publisher-owned.
+	// Before the sampler's async first pass publishes, the zero snapshot emits
+	// zero occupancy/age instead of triggering any high-watermark signal.
 	if r == nil || r.metrics == nil || r.ac == nil || r.ac.bpfConntrackStats == nil {
 		return
 	}
