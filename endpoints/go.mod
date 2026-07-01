@@ -13,7 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.40.6
 	github.com/aws/smithy-go v1.27.2
 	github.com/cilium/ebpf v0.21.0
-	github.com/coreos/go-oidc/v3 v3.18.0
+	github.com/coreos/go-oidc/v3 v3.19.0
 	github.com/fengyily/nhp-plugins-sdk v0.1.30
 	github.com/florianl/go-conntrack v0.7.0
 	github.com/fsnotify/fsnotify v1.10.1
