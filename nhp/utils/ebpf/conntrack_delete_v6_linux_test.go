@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -31,6 +32,25 @@ import (
 func newTestConnTrackMapV6(t *testing.T) (*ebpf.Map, bool) {
 	t.Helper()
 	return newTestConnTrackMapSized(t, "e2s5_ctv6_test", connTrackKeyV6Size)
+}
+
+func newTestFragStateMapV6(t *testing.T) (*ebpf.Map, bool) {
+	t.Helper()
+	m, err := ebpf.NewMap(&ebpf.MapSpec{
+		Name:       "frag_state_v6_test",
+		Type:       ebpf.Hash,
+		KeySize:    ipv6FragKeySize,
+		ValueSize:  ipv6FragValueSize,
+		MaxEntries: 16,
+	})
+	if err != nil {
+		if os.Getenv("NHP_REQUIRE_BPF_TESTS") == "1" {
+			t.Fatalf("NHP_REQUIRE_BPF_TESTS=1 but BPF map creation failed — the frag_state_v6 revocation semantic proof cannot run on this runner. err=%v", err)
+		}
+		t.Skipf("cannot create BPF map on this host (need CAP_BPF / privileged kernel); skipping real-map frag_state_v6 revocation test. err=%v", err)
+		return nil, false
+	}
+	return m, true
 }
 
 // TestConnTrackDeleteV6_Surgical_SiblingSurvives is the v6 semantic proof: in a
@@ -109,5 +129,99 @@ func TestConnTrackDeleteV6_Idempotent_NoEntry(t *testing.T) {
 
 	if err := delEbpfConnTrackOnMapV6(m, "2001:db8::7", "2001:db8::10", 6, 43210, 443); err != nil {
 		t.Errorf("delete of absent v6 conntrack entry = %v, want nil (idempotent ENOENT→nil)", err)
+	}
+}
+
+func TestFragStateDeletePinnedV6_MissingPinIsTolerated(t *testing.T) {
+	err := delEbpfFragStatePinnedForTupleV6("/sys/fs/bpf/nhp-test-missing-frag-state-v6", "2001:db8::7", "2001:db8::10", 6, 43210, 443)
+	if err != nil {
+		t.Fatalf("missing frag_state_v6 pin purge err = %v, want nil mixed-rollout tolerance", err)
+	}
+}
+
+func TestFragStateDeleteV6_Surgical_AllTargetFragmentsRemoved(t *testing.T) {
+	m, ok := newTestFragStateMapV6(t)
+	if !ok {
+		return
+	}
+	defer func() { _ = m.Close() }()
+
+	const (
+		srcStr     = "2001:db8::7"
+		dstStr     = "2001:db8::10"
+		proto      = uint8(6)
+		dport      = uint16(443)
+		targetPort = uint16(43210)
+		siblingPrt = uint16(43211)
+		otherDport = uint16(8443)
+	)
+	src, err := parseIP6(srcStr)
+	if err != nil {
+		t.Fatalf("parseIP6(src): %v", err)
+	}
+	dst, err := parseIP6(dstStr)
+	if err != nil {
+		t.Fatalf("parseIP6(dst): %v", err)
+	}
+
+	mkKey := func(srcIP, dstIP [16]byte, id uint32) []byte {
+		return (&ipv6FragKey{SrcIP: srcIP, DstIP: dstIP, Identification: id, FragNextHdr: proto}).ToFragKey()
+	}
+	mkVal := func(sport, dstPort uint16) []byte {
+		return (&ipv6FragValue{ExpireTime: 1 << 62, DstPort: dstPort, SrcPort: sport, L4Proto: proto}).ToFragValue()
+	}
+	targetA := mkKey(src, dst, 0x11111111)
+	targetB := mkKey(src, dst, 0x22222222)
+	targetReverse := mkKey(dst, src, 0x22222223)
+	sibling := mkKey(src, dst, 0x33333333)
+	otherPort := mkKey(src, dst, 0x44444444)
+
+	if err := m.Put(targetA, mkVal(targetPort, dport)); err != nil {
+		t.Fatalf("put targetA: %v", err)
+	}
+	if err := m.Put(targetB, mkVal(targetPort, dport)); err != nil {
+		t.Fatalf("put targetB: %v", err)
+	}
+	if err := m.Put(targetReverse, mkVal(dport, targetPort)); err != nil {
+		t.Fatalf("put reverse target: %v", err)
+	}
+	if err := m.Put(sibling, mkVal(siblingPrt, dport)); err != nil {
+		t.Fatalf("put sibling: %v", err)
+	}
+	if err := m.Put(otherPort, mkVal(targetPort, otherDport)); err != nil {
+		t.Fatalf("put other dport: %v", err)
+	}
+
+	if err := delEbpfFragStateForTupleOnMapV6(m, srcStr, dstStr, proto, targetPort, dport); err != nil {
+		t.Fatalf("delEbpfFragStateForTupleOnMapV6(target): %v", err)
+	}
+
+	out := make([]byte, ipv6FragValueSize)
+	if err := m.Lookup(targetA, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Errorf("targetA lookup err = %v, want ErrKeyNotExist", err)
+	}
+	if err := m.Lookup(targetB, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Errorf("targetB lookup err = %v, want ErrKeyNotExist", err)
+	}
+	if err := m.Lookup(targetReverse, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Errorf("targetReverse lookup err = %v, want ErrKeyNotExist", err)
+	}
+	if err := m.Lookup(sibling, &out); err != nil {
+		t.Errorf("sibling lookup err = %v, want nil — deleting one source port must not purge a same-allow-rule sibling", err)
+	}
+	if err := m.Lookup(otherPort, &out); err != nil {
+		t.Errorf("other dport lookup err = %v, want nil — deleting one destination port must not purge another tuple", err)
+	}
+}
+
+func TestFragStateDeleteV6_Idempotent_NoEntry(t *testing.T) {
+	m, ok := newTestFragStateMapV6(t)
+	if !ok {
+		return
+	}
+	defer func() { _ = m.Close() }()
+
+	if err := delEbpfFragStateForTupleOnMapV6(m, "2001:db8::7", "2001:db8::10", 6, 43210, 443); err != nil {
+		t.Errorf("delete of absent v6 fragment state = %v, want nil", err)
 	}
 }

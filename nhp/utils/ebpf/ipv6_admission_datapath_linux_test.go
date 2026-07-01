@@ -92,6 +92,12 @@ const (
 	// in an earlier map would PASS first and never consult src_port_v6).
 	srcPortV6MapName = "src_port_v6"
 
+	// fragStateV6MapName is the SEC(".maps") symbol of the IPv6 fragment-state
+	// map. First fragments admitted through the normal TCP/UDP allow-rule
+	// cascade populate this map; later fragments pass only on a matching,
+	// unexpired entry.
+	fragStateV6MapName = "frag_state_v6"
+
 	// portListV6MapName is the SEC(".maps") symbol of the v6 src+port-range
 	// allow-rule map (`} port_list_v6 SEC(".maps");`). Its key is
 	// port_list_key_v6 = src_ip+min_port+max_port (20 bytes), serialized via
@@ -129,6 +135,10 @@ const (
 	ipprotoMobility   = 135 // IPv6 Mobility extension header
 	ipprotoUnknown    = 253 // RFC 4727 experimental/reserved, unsupported here
 	icmpv6EchoRequest = 128 // ICMPV6_ECHO_REQUEST (type)
+
+	ipv6FragMoreFlag     uint16 = 0x0001
+	ipv6FragReservedBits uint16 = 0x0002
+	ipv6FragOffsetOne    uint16 = 0x0008 // offset=1 in 8-byte units, encoded in bits 3..15
 )
 
 // seedWhitelistValue builds a whitelist_value byte buffer of the map's
@@ -375,11 +385,7 @@ func craftIPv6PacketWithTruncatedAH(t *testing.T, srcIP6, dstIP6 [16]byte) []byt
 	return craftIPv6PacketWithNextHeader(srcIP6, dstIP6, ipprotoAH, ah)
 }
 
-// craftTCPv6FragmentPacket builds a TCP-looking IPv6 packet with a Fragment
-// header in front of TCP. The current datapath deliberately fails Fragment
-// headers closed: later fragments have no ports, and safely admitting them needs
-// fragment-aware state instead of the ordinary 5-tuple conn_track_v6 entry.
-func craftTCPv6FragmentPacket(t *testing.T, srcIP6, dstIP6 [16]byte, srcPort, dstPort uint16) []byte {
+func craftTCPv6FirstFragmentPacket(t *testing.T, srcIP6, dstIP6 [16]byte, srcPort, dstPort uint16, identification uint32) []byte {
 	t.Helper()
 
 	const (
@@ -389,11 +395,129 @@ func craftTCPv6FragmentPacket(t *testing.T, srcIP6, dstIP6 [16]byte, srcPort, ds
 	pkt := ethIPv6Header(srcIP6, dstIP6, ipprotoFragment, fragLen+tcpLen)
 
 	frag := make([]byte, fragLen)
-	frag[0] = ipprotoTCP                             // next header after Fragment
-	binary.BigEndian.PutUint16(frag[2:4], uint16(1)) // first fragment with M flag set
+	frag[0] = ipprotoTCP
+	binary.BigEndian.PutUint16(frag[2:4], ipv6FragMoreFlag)
+	binary.BigEndian.PutUint32(frag[4:8], identification)
 	pkt = append(pkt, frag...)
 
 	return appendTCPv6Header(pkt, srcPort, dstPort)
+}
+
+func craftTCPv6FirstFragmentPacketWithHopByHop(t *testing.T, srcIP6, dstIP6 [16]byte, srcPort, dstPort uint16, identification uint32) []byte {
+	t.Helper()
+
+	const (
+		hopByHopLen = 8
+		fragLen     = 8
+		tcpLen      = 20
+	)
+	pkt := ethIPv6Header(srcIP6, dstIP6, ipprotoHopByHop, hopByHopLen+fragLen+tcpLen)
+
+	hopByHop := make([]byte, hopByHopLen)
+	hopByHop[0] = ipprotoFragment
+	hopByHop[1] = 0
+	pkt = append(pkt, hopByHop...)
+
+	frag := make([]byte, fragLen)
+	frag[0] = ipprotoTCP
+	binary.BigEndian.PutUint16(frag[2:4], ipv6FragMoreFlag)
+	binary.BigEndian.PutUint32(frag[4:8], identification)
+	pkt = append(pkt, frag...)
+
+	return appendTCPv6Header(pkt, srcPort, dstPort)
+}
+
+func craftTCPv6AtomicFragmentPacket(t *testing.T, srcIP6, dstIP6 [16]byte, srcPort, dstPort uint16, identification uint32) []byte {
+	t.Helper()
+
+	pkt := craftTCPv6FirstFragmentPacket(t, srcIP6, dstIP6, srcPort, dstPort, identification)
+	const fragOffStart = 14 + 40 + 2
+	binary.BigEndian.PutUint16(pkt[fragOffStart:fragOffStart+2], 0)
+	return pkt
+}
+
+func craftUDPv6FirstFragmentPacket(t *testing.T, srcIP6, dstIP6 [16]byte, srcPort, dstPort uint16, identification uint32) []byte {
+	t.Helper()
+
+	const (
+		fragLen = 8
+		udpLen  = 8
+	)
+	pkt := ethIPv6Header(srcIP6, dstIP6, ipprotoFragment, fragLen+udpLen)
+
+	frag := make([]byte, fragLen)
+	frag[0] = ipprotoUDP
+	binary.BigEndian.PutUint16(frag[2:4], ipv6FragMoreFlag)
+	binary.BigEndian.PutUint32(frag[4:8], identification)
+	pkt = append(pkt, frag...)
+
+	return appendUDPv6Header(pkt, srcPort, dstPort)
+}
+
+func craftTCPv6LaterFragmentPacket(t *testing.T, srcIP6, dstIP6 [16]byte, identification uint32) []byte {
+	return craftIPv6LaterFragmentPacket(t, srcIP6, dstIP6, ipprotoTCP, identification)
+}
+
+func craftTCPv6LaterFragmentPacketWithHopByHop(t *testing.T, srcIP6, dstIP6 [16]byte, identification uint32) []byte {
+	t.Helper()
+
+	const (
+		hopByHopLen = 8
+		fragLen     = 8
+		payloadLen  = 8
+	)
+	pkt := ethIPv6Header(srcIP6, dstIP6, ipprotoHopByHop, hopByHopLen+fragLen+payloadLen)
+
+	hopByHop := make([]byte, hopByHopLen)
+	hopByHop[0] = ipprotoFragment
+	hopByHop[1] = 0
+	pkt = append(pkt, hopByHop...)
+
+	frag := make([]byte, fragLen)
+	frag[0] = ipprotoTCP
+	binary.BigEndian.PutUint16(frag[2:4], ipv6FragOffsetOne)
+	binary.BigEndian.PutUint32(frag[4:8], identification)
+	pkt = append(pkt, frag...)
+
+	return append(pkt, bytes.Repeat([]byte{0xA5}, payloadLen)...)
+}
+
+func craftUDPv6LaterFragmentPacket(t *testing.T, srcIP6, dstIP6 [16]byte, identification uint32) []byte {
+	return craftIPv6LaterFragmentPacket(t, srcIP6, dstIP6, ipprotoUDP, identification)
+}
+
+func craftIPv6LaterFragmentPacket(t *testing.T, srcIP6, dstIP6 [16]byte, fragNextHdr uint8, identification uint32) []byte {
+	t.Helper()
+
+	const (
+		fragLen    = 8
+		payloadLen = 8
+	)
+	pkt := ethIPv6Header(srcIP6, dstIP6, ipprotoFragment, fragLen+payloadLen)
+
+	frag := make([]byte, fragLen)
+	frag[0] = fragNextHdr
+	binary.BigEndian.PutUint16(frag[2:4], ipv6FragOffsetOne)
+	binary.BigEndian.PutUint32(frag[4:8], identification)
+	pkt = append(pkt, frag...)
+
+	return append(pkt, bytes.Repeat([]byte{0xA5}, payloadLen)...)
+}
+
+func craftTCPv6MalformedFragmentPacket(t *testing.T, srcIP6, dstIP6 [16]byte, srcPort, dstPort uint16, identification uint32) []byte {
+	t.Helper()
+
+	pkt := craftTCPv6FirstFragmentPacket(t, srcIP6, dstIP6, srcPort, dstPort, identification)
+	const fragOffStart = 14 + 40 + 2
+	binary.BigEndian.PutUint16(pkt[fragOffStart:fragOffStart+2], ipv6FragMoreFlag|ipv6FragReservedBits)
+	return pkt
+}
+
+func craftIPv6PacketWithTruncatedFragmentHeader(t *testing.T, srcIP6, dstIP6 [16]byte) []byte {
+	t.Helper()
+	frag := make([]byte, 4)
+	frag[0] = ipprotoTCP
+	return craftIPv6PacketWithNextHeader(srcIP6, dstIP6, ipprotoFragment, frag)
 }
 
 func appendUDPv6Header(pkt []byte, srcPort, dstPort uint16) []byte {
@@ -836,13 +960,176 @@ func TestIPv6AdmissionDatapathAHRoutingMobilityHeaders(t *testing.T) {
 	}
 }
 
-// TestIPv6AdmissionDatapathFragmentHeaderFailClosed documents the deliberate
-// Fragment policy: even a first fragment whose Fragment header points at TCP is
-// denied. Admitting full fragmented flows safely needs fragment-aware state for
-// non-first fragments, which do not carry the L4 ports used by the allow-rule
-// cascade.
-func TestIPv6AdmissionDatapathFragmentHeaderFailClosed(t *testing.T) {
+// TestIPv6AdmissionDatapathFragments proves fragment-aware admission:
+//
+//   - an allowed first fragment resolves the real TCP ports, passes the normal
+//     sdwhitelist_v6 cascade, and seeds frag_state_v6;
+//   - an allowed first fragment on an already-established 5-tuple seeds a fresh
+//     per-datagram fragment-state entry from the conntrack-hit path;
+//   - a first fragment behind a prior extension header still resolves to TCP,
+//     seeds state, and admits its matching later fragment;
+//   - an atomic fragment (offset=0,M=0) passes as a complete packet without
+//     consuming fragment-state capacity;
+//   - a later fragment with the same fragment tuple passes via that state;
+//   - a later fragment without matching state drops fail-closed;
+//   - malformed Fragment headers drop before admission.
+func TestIPv6AdmissionDatapathFragments(t *testing.T) {
 	prog, coll, cleanup := loadXDPCollectionV6(t)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	sdMap := requireMap(t, coll, sdWhitelistV6MapName)
+	fragMap := requireMap(t, coll, fragStateV6MapName)
+
+	allowedSrc, dstIP, _ := v6TestAddrs(t)
+	sdKey := (&srcDestKeyV6{SrcIP: allowedSrc, DstIP: dstIP}).ToSdKeyV6()
+	sdVal := seedWhitelistValue(t, sdMap.ValueSize())
+	if err := sdMap.Put(sdKey, sdVal); err != nil {
+		t.Fatalf("seed sdwhitelist_v6[allow]: %v", err)
+	}
+
+	const (
+		srcPort    uint16 = 51000
+		dstPort    uint16 = 443
+		tcpFragID  uint32 = 0x12345678
+		tcpFragID2 uint32 = 0x12345679
+		extFragID  uint32 = 0x1234567B
+		atomicID   uint32 = 0x1234567A
+		udpFragID  uint32 = 0x22345678
+	)
+	first := craftTCPv6FirstFragmentPacket(t, allowedSrc, dstIP, srcPort, dstPort, tcpFragID)
+	if got := runVerdict(t, prog, first); got != xdpPass {
+		t.Fatalf("first-fragment PASS case: verdict = %d (%s), want XDP_PASS(%d) — an allowed first fragment must use the normal TCP allow-rule cascade and seed fragment state",
+			got, xdpName(got), xdpPass)
+	}
+
+	fragKey := (&ipv6FragKey{SrcIP: allowedSrc, DstIP: dstIP, Identification: tcpFragID, FragNextHdr: ipprotoTCP}).ToFragKey()
+	fragOut := make([]byte, fragMap.ValueSize())
+	if err := fragMap.Lookup(fragKey, &fragOut); err != nil {
+		t.Fatalf("frag_state_v6 lookup after first fragment = %v, want seeded state", err)
+	}
+	fragVal, err := ipv6FragValueFromBytes(fragOut)
+	if err != nil {
+		t.Fatalf("decode seeded frag_state_v6 value: %v", err)
+	}
+	if fragVal.SrcPort != srcPort || fragVal.DstPort != dstPort || fragVal.L4Proto != ipprotoTCP {
+		t.Fatalf("seeded frag_state_v6 value = %+v, want sport=%d dport=%d proto=TCP", fragVal, srcPort, dstPort)
+	}
+	if fragVal.ExpireTime >= uint64(1)<<62 {
+		t.Fatalf("seeded frag_state_v6 expire_time = %d, want capped below the long allow-rule deadline", fragVal.ExpireTime)
+	}
+
+	later := craftTCPv6LaterFragmentPacket(t, allowedSrc, dstIP, tcpFragID)
+	if got := runVerdict(t, prog, later); got != xdpPass {
+		t.Fatalf("later-fragment PASS case: verdict = %d (%s), want XDP_PASS(%d) — a later fragment with matching unexpired frag_state_v6 must pass even though it has no L4 ports",
+			got, xdpName(got), xdpPass)
+	}
+
+	secondFirst := craftTCPv6FirstFragmentPacket(t, allowedSrc, dstIP, srcPort, dstPort, tcpFragID2)
+	if got := runVerdict(t, prog, secondFirst); got != xdpPass {
+		t.Fatalf("established-flow first-fragment PASS case: verdict = %d (%s), want XDP_PASS(%d) — a first fragment on a conntrack-hit 5-tuple must seed fragment state before passing",
+			got, xdpName(got), xdpPass)
+	}
+	fragKey2 := (&ipv6FragKey{SrcIP: allowedSrc, DstIP: dstIP, Identification: tcpFragID2, FragNextHdr: ipprotoTCP}).ToFragKey()
+	fragOut2 := make([]byte, fragMap.ValueSize())
+	if err := fragMap.Lookup(fragKey2, &fragOut2); err != nil {
+		t.Fatalf("frag_state_v6 lookup after established-flow first fragment = %v, want seeded state", err)
+	}
+	secondLater := craftTCPv6LaterFragmentPacket(t, allowedSrc, dstIP, tcpFragID2)
+	if got := runVerdict(t, prog, secondLater); got != xdpPass {
+		t.Fatalf("established-flow later-fragment PASS case: verdict = %d (%s), want XDP_PASS(%d) — later fragments for a subsequent datagram on the same 5-tuple must pass via newly seeded state",
+			got, xdpName(got), xdpPass)
+	}
+
+	extFirst := craftTCPv6FirstFragmentPacketWithHopByHop(t, allowedSrc, dstIP, srcPort, dstPort, extFragID)
+	if got := runVerdict(t, prog, extFirst); got != xdpPass {
+		t.Fatalf("extension-before-fragment PASS case: verdict = %d (%s), want XDP_PASS(%d) — Hop-by-Hop -> Fragment -> TCP must resolve the first fragment's TCP ports and seed fragment state",
+			got, xdpName(got), xdpPass)
+	}
+	extFragKey := (&ipv6FragKey{SrcIP: allowedSrc, DstIP: dstIP, Identification: extFragID, FragNextHdr: ipprotoTCP}).ToFragKey()
+	extFragOut := make([]byte, fragMap.ValueSize())
+	if err := fragMap.Lookup(extFragKey, &extFragOut); err != nil {
+		t.Fatalf("frag_state_v6 lookup after extension-before-fragment first fragment = %v, want seeded state", err)
+	}
+	extLater := craftTCPv6LaterFragmentPacketWithHopByHop(t, allowedSrc, dstIP, extFragID)
+	if got := runVerdict(t, prog, extLater); got != xdpPass {
+		t.Fatalf("extension-before-fragment later-fragment PASS case: verdict = %d (%s), want XDP_PASS(%d) — matching later fragments must pass even when a supported extension header precedes Fragment",
+			got, xdpName(got), xdpPass)
+	}
+
+	atomic := craftTCPv6AtomicFragmentPacket(t, allowedSrc, dstIP, srcPort, dstPort, atomicID)
+	if got := runVerdict(t, prog, atomic); got != xdpPass {
+		t.Fatalf("atomic-fragment PASS case: verdict = %d (%s), want XDP_PASS(%d) — offset=0,M=0 should behave like a complete TCP packet",
+			got, xdpName(got), xdpPass)
+	}
+	atomicKey := (&ipv6FragKey{SrcIP: allowedSrc, DstIP: dstIP, Identification: atomicID, FragNextHdr: ipprotoTCP}).ToFragKey()
+	atomicOut := make([]byte, fragMap.ValueSize())
+	if err := fragMap.Lookup(atomicKey, &atomicOut); !isEbpfNoEntry(err) {
+		t.Fatalf("atomic fragment frag_state_v6 lookup err = %v, want no-entry because no later fragments can follow", err)
+	}
+
+	udpFirst := craftUDPv6FirstFragmentPacket(t, allowedSrc, dstIP, srcPort+1, 53, udpFragID)
+	if got := runVerdict(t, prog, udpFirst); got != xdpPass {
+		t.Fatalf("UDP first-fragment PASS case: verdict = %d (%s), want XDP_PASS(%d) — fragment-aware admission must support UDP as well as TCP",
+			got, xdpName(got), xdpPass)
+	}
+	udpLater := craftUDPv6LaterFragmentPacket(t, allowedSrc, dstIP, udpFragID)
+	if got := runVerdict(t, prog, udpLater); got != xdpPass {
+		t.Fatalf("UDP later-fragment PASS case: verdict = %d (%s), want XDP_PASS(%d) — UDP later fragments must pass only via matching fragment state",
+			got, xdpName(got), xdpPass)
+	}
+
+	noState := craftTCPv6LaterFragmentPacket(t, allowedSrc, dstIP, 0x32345678)
+	if got := runVerdict(t, prog, noState); got != xdpDrop {
+		t.Fatalf("later-fragment no-state case: verdict = %d (%s), want XDP_DROP(%d) — out-of-order or unmatched later fragments must fail closed",
+			got, xdpName(got), xdpDrop)
+	}
+
+	malformed := craftTCPv6MalformedFragmentPacket(t, allowedSrc, dstIP, srcPort, dstPort, 0x42345678)
+	if got := runVerdict(t, prog, malformed); got != xdpDrop {
+		t.Fatalf("malformed-fragment reserved-bits case: verdict = %d (%s), want XDP_DROP(%d) — reserved Fragment bits must fail closed before allow-rule admission",
+			got, xdpName(got), xdpDrop)
+	}
+
+	truncated := craftIPv6PacketWithTruncatedFragmentHeader(t, allowedSrc, dstIP)
+	if got := runVerdict(t, prog, truncated); got != xdpDrop {
+		t.Fatalf("malformed-fragment truncated-header case: verdict = %d (%s), want XDP_DROP(%d) — truncated Fragment headers must fail closed",
+			got, xdpName(got), xdpDrop)
+	}
+}
+
+func TestIPv6AdmissionDatapathFragmentStateExpiry(t *testing.T) {
+	prog, coll, cleanup := loadXDPCollectionV6(t)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	fragMap := requireMap(t, coll, fragStateV6MapName)
+
+	allowedSrc, dstIP, _ := v6TestAddrs(t)
+	const fragID uint32 = 0xABCDEF01
+	fragKey := (&ipv6FragKey{SrcIP: allowedSrc, DstIP: dstIP, Identification: fragID, FragNextHdr: ipprotoTCP}).ToFragKey()
+	expiredVal := (&ipv6FragValue{ExpireTime: 1, DstPort: 443, SrcPort: 51000, L4Proto: ipprotoTCP}).ToFragValue()
+	if err := fragMap.Put(fragKey, expiredVal); err != nil {
+		t.Fatalf("seed expired frag_state_v6: %v", err)
+	}
+
+	later := craftTCPv6LaterFragmentPacket(t, allowedSrc, dstIP, fragID)
+	if got := runVerdict(t, prog, later); got != xdpDrop {
+		t.Fatalf("expired-fragment-state case: verdict = %d (%s), want XDP_DROP(%d) — later fragments must not pass after the fragment state's admission deadline",
+			got, xdpName(got), xdpDrop)
+	}
+	out := make([]byte, fragMap.ValueSize())
+	if err := fragMap.Lookup(fragKey, &out); !isEbpfNoEntry(err) {
+		t.Fatalf("expired frag_state_v6 lookup err = %v, want no-entry after datapath expiry cleanup", err)
+	}
+}
+
+func TestIPv6AdmissionDatapathFragmentStateCapacityFailClosed(t *testing.T) {
+	prog, coll, cleanup := loadXDPCollectionInnerWithSpecMutator(t, func(spec *ebpf.CollectionSpec) {
+		if m := spec.Maps[fragStateV6MapName]; m != nil {
+			m.MaxEntries = 1
+		}
+	})
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -855,9 +1142,15 @@ func TestIPv6AdmissionDatapathFragmentHeaderFailClosed(t *testing.T) {
 		t.Fatalf("seed sdwhitelist_v6[allow]: %v", err)
 	}
 
-	pkt := craftTCPv6FragmentPacket(t, allowedSrc, dstIP, 51000, 443)
-	if got := runVerdict(t, prog, pkt); got != xdpDrop {
-		t.Fatalf("Fragment header: verdict = %d (%s), want XDP_DROP(%d) — Fragment must stay fail-closed until the datapath has fragment-aware state for later fragments without L4 ports",
+	first := craftTCPv6FirstFragmentPacket(t, allowedSrc, dstIP, 51000, 443, 0x10000001)
+	if got := runVerdict(t, prog, first); got != xdpPass {
+		t.Fatalf("first fragment filling one-entry frag_state_v6: verdict = %d (%s), want XDP_PASS(%d)",
+			got, xdpName(got), xdpPass)
+	}
+
+	overflow := craftTCPv6FirstFragmentPacket(t, allowedSrc, dstIP, 51001, 443, 0x10000002)
+	if got := runVerdict(t, prog, overflow); got != xdpDrop {
+		t.Fatalf("fragment-state capacity case: verdict = %d (%s), want XDP_DROP(%d) — first-fragment admission must fail closed when frag_state_v6 cannot record later-fragment state",
 			got, xdpName(got), xdpDrop)
 	}
 }

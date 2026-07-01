@@ -121,6 +121,7 @@ type BpfFlusher struct {
 	conntrackPartialSamples  uint64
 	conntrackExpiredReapedV4 uint64
 	conntrackExpiredReapedV6 uint64
+	fragStateExpiredReapedV6 uint64
 }
 
 type bpfConntrackSampler struct {
@@ -297,8 +298,13 @@ func (f *BpfFlusher) refreshConntrackStats() {
 		f.conntrackPartialSamples++
 		log.Warning("[BpfFlusher] conntrack v6 stats/reaper sample was partial; occupancy may undercount during high churn")
 	}
+	if raw.FragV6.PartialSample {
+		f.conntrackPartialSamples++
+		log.Warning("[BpfFlusher] IPv6 fragment-state stats/reaper sample was partial; occupancy may undercount during high churn")
+	}
 	f.conntrackExpiredReapedV4 += raw.V4.ExpiredDeleted
 	f.conntrackExpiredReapedV6 += raw.V6.ExpiredDeleted
+	f.fragStateExpiredReapedV6 += raw.FragV6.ExpiredDeleted
 
 	nextStats := bpfConntrackStatsFromRaw(
 		raw,
@@ -306,6 +312,7 @@ func (f *BpfFlusher) refreshConntrackStats() {
 		f.conntrackPartialSamples,
 		f.conntrackExpiredReapedV4,
 		f.conntrackExpiredReapedV6,
+		f.fragStateExpiredReapedV6,
 	)
 	nextStats.SampleDurationSeconds = sampleElapsed.Seconds()
 
@@ -323,22 +330,27 @@ func (f *BpfFlusher) sampleAndReapConnTrack() (utilebpf.ConnTrackStats, error) {
 	return utilebpf.SampleAndReapConnTrack()
 }
 
-func bpfConntrackStatsFromRaw(raw utilebpf.ConnTrackStats, sampleErrors, partialSamples, expiredReapedV4, expiredReapedV6 uint64) BpfConntrackStats {
+func bpfConntrackStatsFromRaw(raw utilebpf.ConnTrackStats, sampleErrors, partialSamples, expiredReapedV4, expiredReapedV6, fragExpiredReapedV6 uint64) BpfConntrackStats {
 	v4Entries := bpfConntrackPostReapEntries(raw.V4)
 	v6Entries := bpfConntrackPostReapEntries(raw.V6)
+	fragV6Entries := bpfConntrackPostReapEntries(raw.FragV6)
 	return BpfConntrackStats{
-		V4Entries:          v4Entries,
-		V4MaxEntries:       raw.V4.MaxEntries,
-		V4UsagePercent:     bpfConntrackUsagePercent(v4Entries, raw.V4.MaxEntries),
-		V4OldestAgeSeconds: bpfConntrackAgeSeconds(raw.V4.OldestAgeNanos),
-		V4ExpiredReaped:    expiredReapedV4,
-		V6Entries:          v6Entries,
-		V6MaxEntries:       raw.V6.MaxEntries,
-		V6UsagePercent:     bpfConntrackUsagePercent(v6Entries, raw.V6.MaxEntries),
-		V6OldestAgeSeconds: bpfConntrackAgeSeconds(raw.V6.OldestAgeNanos),
-		V6ExpiredReaped:    expiredReapedV6,
-		SampleErrors:       sampleErrors,
-		PartialSamples:     partialSamples,
+		V4Entries:           v4Entries,
+		V4MaxEntries:        raw.V4.MaxEntries,
+		V4UsagePercent:      bpfConntrackUsagePercent(v4Entries, raw.V4.MaxEntries),
+		V4OldestAgeSeconds:  bpfConntrackAgeSeconds(raw.V4.OldestAgeNanos),
+		V4ExpiredReaped:     expiredReapedV4,
+		V6Entries:           v6Entries,
+		V6MaxEntries:        raw.V6.MaxEntries,
+		V6UsagePercent:      bpfConntrackUsagePercent(v6Entries, raw.V6.MaxEntries),
+		V6OldestAgeSeconds:  bpfConntrackAgeSeconds(raw.V6.OldestAgeNanos),
+		V6ExpiredReaped:     expiredReapedV6,
+		V6FragEntries:       fragV6Entries,
+		V6FragMaxEntries:    raw.FragV6.MaxEntries,
+		V6FragUsagePercent:  bpfConntrackUsagePercent(fragV6Entries, raw.FragV6.MaxEntries),
+		V6FragExpiredReaped: fragExpiredReapedV6,
+		SampleErrors:        sampleErrors,
+		PartialSamples:      partialSamples,
 	}
 }
 
@@ -355,11 +367,19 @@ func bpfConntrackStatsPreserveConservativeOccupancy(next, previous BpfConntrackS
 		next.V6UsagePercent = previous.V6UsagePercent
 		next.V6OldestAgeSeconds = previous.V6OldestAgeSeconds
 	}
+	if sampleErr != nil && bpfConntrackMapStatsLacksUsableOccupancy(raw.FragV6) {
+		next.V6FragEntries = previous.V6FragEntries
+		next.V6FragMaxEntries = previous.V6FragMaxEntries
+		next.V6FragUsagePercent = previous.V6FragUsagePercent
+	}
 	if raw.V4.PartialSample {
 		next = bpfConntrackStatsPreservePartialV4(next, previous)
 	}
 	if raw.V6.PartialSample {
 		next = bpfConntrackStatsPreservePartialV6(next, previous)
+	}
+	if raw.FragV6.PartialSample {
+		next = bpfConntrackStatsPreservePartialFragV6(next, previous)
 	}
 	return next
 }
@@ -384,6 +404,15 @@ func bpfConntrackStatsPreservePartialV6(next, previous BpfConntrackStats) BpfCon
 	}
 	if next.V6OldestAgeSeconds < previous.V6OldestAgeSeconds {
 		next.V6OldestAgeSeconds = previous.V6OldestAgeSeconds
+	}
+	return next
+}
+
+func bpfConntrackStatsPreservePartialFragV6(next, previous BpfConntrackStats) BpfConntrackStats {
+	if next.V6FragUsagePercent < previous.V6FragUsagePercent {
+		next.V6FragEntries = previous.V6FragEntries
+		next.V6FragMaxEntries = previous.V6FragMaxEntries
+		next.V6FragUsagePercent = previous.V6FragUsagePercent
 	}
 	return next
 }

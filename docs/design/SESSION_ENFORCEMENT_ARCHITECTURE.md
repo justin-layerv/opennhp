@@ -325,9 +325,10 @@ puts on the BPF bump) — never a unilateral `maxelem` bump. The `max_entries` a
 
 #### IPv6 maps: `MAX_ENTRIES_V6` (separate, right-sized ceiling)
 
-The IPv6 allow-rule + conntrack maps (added in the E2 IPv6
+The IPv6 allow-rule + conntrack + fragment-state maps (added across the E2 IPv6
 slice — `spp_v6`, `src_port_v6`, `icmp_wl_v6`, `sdwhitelist_v6`,
-`port_list_v6` as `HASH`, and `conn_track_v6` as `HASH`) are sized by a
+`port_list_v6` as `HASH`, `conn_track_v6` as `HASH`, and `frag_state_v6` as
+`HASH`) are sized by a
 **separate** `MAX_ENTRIES_V6`, deliberately **not** reused from `MAX_ENTRIES`.
 The production knock NLB is **IPv4-only**, so v6 enforcement scale is far smaller
 than v4 today; sizing the v6 maps at the v4 1M ceiling would preallocate ~0.5 GB
@@ -336,9 +337,11 @@ of unswappable kernel memory for a near-empty workload. `MAX_ENTRIES_V6` is
 
 Kernel-memory cost, using the same preallocation model as above (the
 `htab_elem + round_up(key,8) + round_up(value,8) + bucket` formula, `LRU_HASH`
-+≈16 B/entry). The v6 keys (asserted packed sizes in `nhp_ebpf_xdp.c`) all reuse
-the IP-agnostic 16 B `*_value` types (`round_up(16,8)=16`); `conn_track_v6`
-reuses the 40 B `conn_value`. (`MB` below is decimal, 10⁶ B; ≈89 MiB binary.)
++≈16 B/entry). The v6 allow-rule keys (asserted packed sizes in
+`nhp_ebpf_xdp.c`) all reuse the IP-agnostic 16 B `*_value` types
+(`round_up(16,8)=16`); `conn_track_v6` reuses the 40 B `conn_value`;
+`frag_state_v6` uses a 37 B packed key and 16 B value. (`MB` below is decimal,
+10⁶ B; ≈102 MiB binary.)
 
 | Map | Type | Key (packed → `round_up/8`) | B/entry | At 131072 |
 |---|---|---|---|---|
@@ -349,9 +352,10 @@ reuses the 40 B `conn_value`. (`MB` below is decimal, 10⁶ B; ≈89 MiB binary.
 | `port_list_v6` | HASH | 20 → 24 | 104 | ≈ 13.6 MB |
 | **5 HASH allow-rule maps** | | | **552** | **≈ 72.3 MB** |
 | `conn_track_v6` | HASH | 38 → 40 | 144 | ≈ 18.9 MB |
-| **Total (6 v6 maps)** | | | | **≈ 91 MB** |
+| `frag_state_v6` | HASH | 37 → 40 | 120 | ≈ 15.7 MB |
+| **Total (7 v6 maps)** | | | | **≈ 107 MB** |
 
-≈91 MB is trivial on an 8 GB `c6i.xlarge` (or even the 4 GB `t3.medium`
+≈107 MB is trivial on an 8 GB `c6i.xlarge` (or even the 4 GB `t3.medium`
 sandbox) AC. There is deliberately **no `protocol_port_v6` map**: the
 `protocol_port` key (`{dst_port, protocol}`) carries no IP address, so a
 proto+dst-port allow-rule is IP-family-agnostic — the existing v4
@@ -383,15 +387,55 @@ against the chosen instance type, co-decided under
 > to the kernel stack after `XDP_PASS`; XDP only classifies through the header to
 > preserve the admission decision.
 >
-> The parser still fails closed for anything it cannot safely classify:
-> Fragment headers, ESP, No Next Header, unknown protocols, truncated headers,
-> and chains longer than the cap all drop and emit a v6 DENY event with ports
-> set to zero. Fragment remains a deliberate deny policy, not an accidental
-> parser gap: non-first fragments do not carry the L4 ports that the XDP
-> allow-rule and conntrack keys need, so admitting fragmented flows safely needs
-> fragment-aware state rather than treating the first fragment as sufficient.
-> That follow-up is tracked in
-> [nhp#2865](https://github.com/layervai/nhp/issues/2865).
+> Fragment headers are TCP/UDP stateful: a first fragment must resolve the real
+> L4 ports and pass the normal allow-rule cascade before it can create
+> `frag_state_v6`; later fragments pass only on a matching, unexpired fragment
+> state entry. First fragments on an already-established conntrack 5-tuple still
+> seed fresh per-datagram fragment state before passing, so every fragment
+> identification is authorized independently. TCP/UDP atomic fragments
+> (`offset=0,M=0`) behave like complete packets and do not consume
+> fragment-state capacity; ICMPv6 packets carrying a Fragment header still stay
+> on the stricter TCP/UDP-only fragment policy below. State insertion is
+> verdict-bearing for fragmented flows: a full `conn_track_v6` or
+> `frag_state_v6` map fails the first fragment closed instead of allowing a flow
+> whose later-fragment authority or established-flow cache could not be recorded.
+> Non-fragmented packets keep the legacy slow-path fallback when conntrack is
+> full, but first fragments take the conservative drop. If fragment-state
+> insertion fails after the first fragment refreshes `conn_track_v6`, the denied
+> fragmented datagram still drops with DENY telemetry; the retained conntrack
+> entry may pass a later non-fragmented packet for the same
+> allow-rule-authorized 5-tuple. Fragment state expires at the earlier of the
+> associated admission deadline and the IPv6 reassembly window (60s), and the
+> userspace sampler/reaper proactively deletes expired quiet entries. Fragmented
+> ICMPv6 and malformed fragments remain fail-closed. Later-fragment ACCEPT
+> telemetry is intentionally suppressed because those packets carry no L4 ports;
+> the first admitted fragment on a new allow-rule match emits ACCEPT,
+> conntrack-hit first fragments stay silent like established-flow packets, and
+> later-fragment drops still emit DENY. A later fragment that arrives before its
+> first fragment is therefore dropped before kernel reassembly can buffer it; TCP
+> can recover through retransmission, while UDP treats that reordered datagram as
+> loss. Flip owners should confirm no in-scope UDP-over-fragmented-IPv6 path
+> depends on out-of-order fragment buffering.
+>
+> Later-fragment state keys on `{src, dst, fragment ID, next header}` because
+> later fragments do not contain TCP/UDP ports. A non-conforming later fragment
+> whose Fragment-header Next Header does not match the seeded first fragment
+> misses state and drops fail-closed rather than aliasing another datagram. The
+> accepted residual risk is the normal IPv6-fragmentation surface: a
+> source-spoofing actor that can also guess or observe a 32-bit fragment ID for
+> an in-flight admitted datagram may get spoofed later fragments to kernel
+> reassembly, where the kernel remains responsible for RFC reassembly and
+> overlap handling. XDP still fails closed on missing, expired, duplicate,
+> malformed, or reserved-bit-set Fragment headers; the reserved-bit check is
+> deliberately stricter than RFC 8200's instruction to ignore those bits on
+> receipt. An allowed source that emits many distinct first fragments can
+> saturate `frag_state_v6` until TTL/reaper drain, but saturation remains
+> fail-closed and does not evict unrelated fragment state.
+>
+> The parser still fails closed for anything else it cannot safely classify:
+> ESP, No Next Header, unknown protocols, truncated headers, malformed
+> fragments, and chains longer than the cap all drop and emit a v6 DENY event
+> with ports set to zero.
 >
 > Minimum-kernel verifier proof for the current E5 target floor was recorded
 > while closing [nhp#2869](https://github.com/layervai/nhp/issues/2869) in
@@ -399,7 +443,11 @@ against the chosen instance type, co-decided under
 > the proof if the target AC AMI, active running kernel, instance architecture,
 > eBPF source, or pinned eBPF toolchain changes; if verifier acceptance
 > regresses, keep v6 XDP gated. The flip-time revalidation/hold obligation is
-> tracked in [nhp#2945](https://github.com/layervai/nhp/issues/2945).
+> tracked in [nhp#2945](https://github.com/layervai/nhp/issues/2945), including
+> validation that the loaded XDP object pins `frag_state_v6` with the conntrack
+> maps before the new AC sampler runs and that the `EbpfFragStateV6*`
+> gauges/counter are present before relying on EBPFXDP for IPv6 fragmented-flow
+> admission.
 
 ### Fail-closed observability (`MetricEbpfMapFull`)
 
@@ -415,9 +463,10 @@ not silently evicting). The CloudWatch alarm in
 `docs/runbooks/ebpf-map-capacity.md`. This is inert in prod under iptables
 FilterMode (the map is never loaded, so the metric never fires).
 
-### Conntrack saturation observability and quiet-entry reclamation
+### Conntrack and fragment-state saturation observability
 
-Conntrack cache pressure is intentionally separate from `EbpfMapFull`:
+Conntrack cache and IPv6 fragment-state pressure are intentionally separate from
+`EbpfMapFull`:
 
 | Metric | Meaning |
 |---|---|
@@ -426,14 +475,24 @@ Conntrack cache pressure is intentionally separate from `EbpfMapFull`:
 | `EbpfConntrackV4UsagePercent` / `EbpfConntrackV6UsagePercent` | Post-reap occupancy vs the map's `max_entries` |
 | `EbpfConntrackV4OldestAgeSeconds` / `EbpfConntrackV6OldestAgeSeconds` | Oldest surviving entry idle age observed in the sample; during an expiry backlog above the delete budget, this can under-report while expired survivors wait for a later pass |
 | `EbpfConntrackV4ExpiredReaped` / `EbpfConntrackV6ExpiredReaped` | Per-period quiet expired entries deleted by the sampler/reaper |
+| `EbpfFragStateV6Entries` / `EbpfFragStateV6MaxEntries` / `EbpfFragStateV6UsagePercent` | Post-reap occupancy for IPv6 later-fragment admission state, separate from established-flow `conn_track_v6` |
+| `EbpfFragStateV6ExpiredReaped` | Per-period expired IPv6 fragment-state entries deleted by the sampler/reaper |
 | `EbpfConntrackSampleSeconds` | Wall-clock duration of the most recent lifecycle sampler/reap attempt; use `Maximum` during flip validation to catch full-map walk latency |
 | `EbpfConntrackSampleErrors` | Per-period failures to sample/reap the pinned conntrack maps |
 | `EbpfConntrackPartialSamples` | Per-period incomplete HASH walks caused by concurrent churn; usage gauges may undercount for those samples. The alarm pages only on sustained partials, not isolated churny walks |
 
-Terraform alarms page separately on high v4/v6 conntrack usage and sampler
-errors or partial samples. A conntrack usage alarm means new/uncached flows may
-lose the fast-path cache and fall back to the allow-rule cascade; it does
-**not** mean admissions are being rejected. `EbpfMapFull` is the
+Terraform alarms page separately on high v4/v6 conntrack usage, high
+`frag_state_v6` usage, and sampler errors or partial samples. A conntrack usage
+alarm means new/uncached flows may lose the fast-path cache and fall back to the
+allow-rule cascade; it does **not** mean admissions are being rejected. A
+fragment-state usage alarm means new or established IPv6 fragmented first
+packets are nearing the fail-closed `frag_state_v6` ceiling; because
+established-flow first fragments must still record per-datagram state for later
+fragments, saturation can temporarily degrade already-authorized fragmented
+flows until entries expire or are reaped. Authorized fragment churn can also
+raise `EbpfConntrackV6UsagePercent`, because the first fragment seeds or
+refreshes conntrack before fragment-state insertion decides pass/drop.
+`EbpfMapFull` is the
 admission-fail-closed signal.
 
 ## Alternative considered: stateless signed cookie

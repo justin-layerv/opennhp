@@ -61,23 +61,20 @@ int tc_egress_prog(struct __sk_buff *ctx)
     __be32 dst_ip = iph->daddr;
     __u8 protocol = iph->protocol;
 
-    __be16 sport = 0, dport = 0;
+    __be16 sport = 0;
 
     if (protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void *)iph + (iph->ihl * 4);
         if ((void *)(tcp + 1) > data_end)
             return TC_ACT_OK;
         sport = tcp->source;
-        dport = tcp->dest;
     } else if (protocol == IPPROTO_UDP) {
         struct udphdr *udp = (void *)iph + (iph->ihl * 4);
         if ((void *)(udp + 1) > data_end)
             return TC_ACT_OK;
         sport = udp->source;
-        dport = udp->dest;
     } else if (protocol == IPPROTO_ICMP) {
         sport = 0;
-        dport = 0;
     } else {
         return TC_ACT_OK;
     }

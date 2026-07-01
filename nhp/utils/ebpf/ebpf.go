@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"strconv"
 	"syscall"
@@ -287,6 +288,29 @@ type connTrackKeyV6 struct {
 	Flags   uint8    `ebpf:"flags"`   // __u8 flags (CT_DIR_INGRESS=0)
 }
 
+// ipv6FragKey mirrors `struct ipv6_frag_key`, the fragment-state lookup key
+// used by later IPv6 fragments that lack L4 ports. Ports deliberately do NOT
+// live in this key because later fragments cannot provide them; the first
+// fragment stores the original ports in ipv6FragValue so revocation can purge
+// exact 5-tuples by iterating the map.
+type ipv6FragKey struct {
+	SrcIP          [16]byte `ebpf:"src_ip"`
+	DstIP          [16]byte `ebpf:"dst_ip"`
+	Identification uint32   `ebpf:"identification"`
+	FragNextHdr    uint8    `ebpf:"frag_nexthdr"`
+}
+
+// ipv6FragValue mirrors `struct ipv6_frag_value`. ExpireTime is an absolute
+// bpf_ktime deadline capped to the IPv6 reassembly window and never later than
+// the associated allow-rule/conntrack admission; ports/proto identify the
+// admitted first-fragment 5-tuple for userspace revocation purge.
+type ipv6FragValue struct {
+	ExpireTime uint64 `ebpf:"expire_time"`
+	DstPort    uint16 `ebpf:"dport"`
+	SrcPort    uint16 `ebpf:"sport"`
+	L4Proto    uint8  `ebpf:"l4_proto"`
+}
+
 // On-wire sizes of the packed `*_v6` C structs. Each MUST equal the matching
 // `_Static_assert(sizeof(struct ...) == N)` in nhp/ebpf/xdp/nhp_ebpf_xdp.c —
 // that equality is the load-bearing C↔Go contract this slice exists to fence
@@ -300,6 +324,10 @@ const (
 	srcPortListKeyV6Size = 16 + 2                  // 18: struct src_port_list_key_v6
 	portListKeyV6Size    = 16 + 2 + 2              // 20: struct port_list_key_v6
 	connTrackKeyV6Size   = 16 + 16 + 2 + 2 + 1 + 1 // 38: struct ipv6_ct_tuple
+	ipv6FragKeySize      = 16 + 16 + 4 + 1         // 37: struct ipv6_frag_key
+	ipv6FragValueSize    = 16                      // struct ipv6_frag_value: u64 + ports/proto + trailing pad
+
+	fragStateRevokeScanAttempts = 2
 )
 
 // ToWlKeyV6 serializes whitelistKeyV6 into the 35 packed bytes of
@@ -383,6 +411,55 @@ func (r *connTrackKeyV6) ToCtKeyV6() []byte {
 	keyBytes[36] = r.NextHdr
 	keyBytes[37] = r.Flags
 	return keyBytes
+}
+
+// ToFragKey serializes ipv6FragKey into the 37 packed bytes of
+// `struct ipv6_frag_key`: src_ip[16] + dst_ip[16] + BigEndian fragment ID[4] +
+// fragment-next-header[1].
+func (r *ipv6FragKey) ToFragKey() []byte {
+	keyBytes := make([]byte, ipv6FragKeySize)
+	copy(keyBytes[0:16], r.SrcIP[:])
+	copy(keyBytes[16:32], r.DstIP[:])
+	binary.BigEndian.PutUint32(keyBytes[32:36], r.Identification)
+	keyBytes[36] = r.FragNextHdr
+	return keyBytes
+}
+
+func ipv6FragKeyFromBytes(buf []byte) (ipv6FragKey, error) {
+	if len(buf) != ipv6FragKeySize {
+		return ipv6FragKey{}, fmt.Errorf("ipv6 fragment key length %d, want %d (packed ipv6_frag_key)", len(buf), ipv6FragKeySize)
+	}
+	var k ipv6FragKey
+	copy(k.SrcIP[:], buf[0:16])
+	copy(k.DstIP[:], buf[16:32])
+	k.Identification = binary.BigEndian.Uint32(buf[32:36])
+	k.FragNextHdr = buf[36]
+	return k, nil
+}
+
+// ToFragValue serializes ipv6FragValue into the 16-byte natural C layout:
+// expire_time uses the same little-endian host-u64 convention as conn_value's
+// timestamp/ttl fields, followed by network-order ports, l4_proto, then zero
+// trailing pad.
+func (r *ipv6FragValue) ToFragValue() []byte {
+	valueBytes := make([]byte, ipv6FragValueSize)
+	binary.LittleEndian.PutUint64(valueBytes[0:8], r.ExpireTime)
+	binary.BigEndian.PutUint16(valueBytes[8:10], r.DstPort)
+	binary.BigEndian.PutUint16(valueBytes[10:12], r.SrcPort)
+	valueBytes[12] = r.L4Proto
+	return valueBytes
+}
+
+func ipv6FragValueFromBytes(buf []byte) (ipv6FragValue, error) {
+	if len(buf) != ipv6FragValueSize {
+		return ipv6FragValue{}, fmt.Errorf("ipv6 fragment value length %d, want %d (ipv6_frag_value)", len(buf), ipv6FragValueSize)
+	}
+	return ipv6FragValue{
+		ExpireTime: binary.LittleEndian.Uint64(buf[0:8]),
+		DstPort:    binary.BigEndian.Uint16(buf[8:10]),
+		SrcPort:    binary.BigEndian.Uint16(buf[10:12]),
+		L4Proto:    buf[12],
+	}, nil
 }
 
 // connTrackKeyV6FromBytes is the EXACT inverse of ToCtKeyV6 (E2 slice 5): it
@@ -484,6 +561,13 @@ const (
 	// byte-identical to the C map's SEC(".maps") name — a typo here opens the
 	// wrong path and a v6 surgical delete silently lands nowhere (ENOENT → no-op).
 	PinPathConnTrackV6 = "/sys/fs/bpf/conn_track_v6"
+
+	// PinPathFragStateV6 is the IPv6 fragment-admission state map. First
+	// fragments admitted through the normal TCP/UDP allow-rule cascade create
+	// entries here; later fragments pass only while the matching entry is live.
+	// The v6 conntrack delete path also purges this map so revocation removes
+	// fragmented-flow state along with conn_track_v6.
+	PinPathFragStateV6 = "/sys/fs/bpf/frag_state_v6"
 )
 
 // IPv6 pinned-map filesystem paths (E2 slice 4). One-for-one mirror of the v4
@@ -1391,12 +1475,12 @@ func delEbpfConnTrackOnMap(m *ebpf.Map, srcIPStr, dstIPStr string, protocol uint
 // DelEbpfConnTrackEntryV6 is the IPv6 twin of DelEbpfConnTrackEntry (E2 slice
 // 5): it deletes a single established v6 flow from the pinned conn_track_v6 map
 // (PinPathConnTrackV6) by its full 5-tuple, including the per-flow source port.
-// This is the v6 surgical-revocation primitive — deleting the conntrack entry by
-// 5-tuple tears down EXACTLY the target flow and leaves a sibling flow on the
-// same allow-rule tuple (different source port) untouched, and forces the next
-// packet back through the (also-removed) allow-rule path → XDP_DROP. Idempotent
-// on no-match (ENOENT → nil): kernel GC or a concurrent flush may have removed
-// the entry first. Mirrors DelEbpfConnTrackEntry's contract exactly.
+// This is the v6 surgical-revocation primitive: deleting the conntrack entry by
+// 5-tuple tears down EXACTLY the target flow, purging frag_state_v6 for the same
+// 5-tuple prevents later IPv6 fragments from surviving the revoke, and a sibling
+// flow on the same allow-rule tuple (different source port) is left untouched.
+// Idempotent on no-match (ENOENT → nil): kernel GC or a concurrent flush may
+// have removed the entry first. Mirrors DelEbpfConnTrackEntry's contract exactly.
 //
 // TEARDOWN-COMPLETENESS ASSUMPTION (code-verified against nhp/ebpf/xdp/
 // nhp_ebpf_xdp.c, must be re-checked if the v6 datapath changes — same as the v4
@@ -1413,7 +1497,30 @@ func DelEbpfConnTrackEntryV6(srcIPStr, dstIPStr string, protocol uint8, srcPort,
 		return fmt.Errorf("load pinned conn_track_v6: %w", err)
 	}
 	defer func() { _ = m.Close() }()
-	return delEbpfConnTrackOnMapV6(m, srcIPStr, dstIPStr, protocol, srcPort, dstPort)
+	if err := delEbpfConnTrackOnMapV6(m, srcIPStr, dstIPStr, protocol, srcPort, dstPort); err != nil {
+		return err
+	}
+
+	// Purging fragment state is O(N) when frag_state_v6 is non-empty: later
+	// fragment keys omit ports, so revocation must match the original 5-tuple in
+	// each value. The helper has an empty-map fast path for the common case.
+	// Conntrack is already torn down if this scan later errors; callers surface
+	// that as a hard fail because matching later-fragment state can survive until
+	// its admission-capped 60s TTL or the next successful reaper pass.
+	return delEbpfFragStatePinnedForTupleV6(PinPathFragStateV6, srcIPStr, dstIPStr, protocol, srcPort, dstPort)
+}
+
+func delEbpfFragStatePinnedForTupleV6(pinPath, srcIPStr, dstIPStr string, protocol uint8, srcPort, dstPort uint16) error {
+	fragMap, err := ebpf.LoadPinnedMap(pinPath, nil)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			log.Warning("frag_state_v6 map is not pinned while revoking v6 conntrack entry; skipping fragment-state purge")
+			return nil
+		}
+		return fmt.Errorf("load pinned frag_state_v6: %w", err)
+	}
+	defer func() { _ = fragMap.Close() }()
+	return delEbpfFragStateForTupleOnMapV6(fragMap, srcIPStr, dstIPStr, protocol, srcPort, dstPort)
 }
 
 // delEbpfConnTrackOnMapV6 is the map-handle-injectable core of
@@ -1441,6 +1548,89 @@ func delEbpfConnTrackOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, protocol ui
 	}
 	if err := m.Delete(key.ToCtKeyV6()); err != nil && !isEbpfNoEntry(err) {
 		return fmt.Errorf("delete from conn_track_v6: %w", err)
+	}
+	return nil
+}
+
+// delEbpfFragStateForTupleOnMapV6 purges every IPv6 fragment-state entry whose
+// first fragment belonged to the exact revoked 5-tuple. Later fragments cannot
+// carry ports, so frag_state_v6 keys only on {src,dst,fragment-id,frag-next};
+// the original ports/proto are stored in the value and matched here.
+func delEbpfFragStateForTupleOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, protocol uint8, srcPort, dstPort uint16) error {
+	srcIP, err := parseIP6(srcIPStr)
+	if err != nil {
+		return err
+	}
+	dstIP, err := parseIP6(dstIPStr)
+	if err != nil {
+		return err
+	}
+
+	info, err := m.Info()
+	if err != nil {
+		return fmt.Errorf("frag_state_v6 map info: %w", err)
+	}
+	if int(info.KeySize) != ipv6FragKeySize {
+		return fmt.Errorf("frag_state_v6 map key size %d, want %d (packed ipv6_frag_key) — wrong map pinned at %s?", info.KeySize, ipv6FragKeySize, PinPathFragStateV6)
+	}
+	if int(info.ValueSize) != ipv6FragValueSize {
+		return fmt.Errorf("frag_state_v6 map value size %d, want %d (ipv6_frag_value) — wrong map pinned at %s?", info.ValueSize, ipv6FragValueSize, PinPathFragStateV6)
+	}
+	firstKey, err := m.NextKeyBytes(nil)
+	if err != nil {
+		return fmt.Errorf("probe frag_state_v6 first key: %w", err)
+	}
+	if firstKey == nil {
+		return nil
+	}
+
+	keyBytes := make([]byte, ipv6FragKeySize)
+	valBytes := make([]byte, ipv6FragValueSize)
+	var deleteKeys [][]byte
+
+	for attempt := 1; attempt <= fragStateRevokeScanAttempts; attempt++ {
+		deleteKeys = deleteKeys[:0]
+		iter := m.Iterate()
+		for iter.Next(&keyBytes, &valBytes) {
+			key, derr := ipv6FragKeyFromBytes(keyBytes)
+			if derr != nil {
+				return fmt.Errorf("decode frag_state_v6 key: %w", derr)
+			}
+			val, derr := ipv6FragValueFromBytes(valBytes)
+			if derr != nil {
+				return fmt.Errorf("decode frag_state_v6 value: %w", derr)
+			}
+			forwardMatch := key.SrcIP == srcIP &&
+				key.DstIP == dstIP &&
+				val.L4Proto == protocol &&
+				val.SrcPort == srcPort &&
+				val.DstPort == dstPort
+			// The reverse arm is intentionally fail-closed defensive cleanup: it can
+			// over-purge a mirror 5-tuple's fragment state, but never admits traffic.
+			reverseMatch := key.SrcIP == dstIP &&
+				key.DstIP == srcIP &&
+				val.L4Proto == protocol &&
+				val.SrcPort == dstPort &&
+				val.DstPort == srcPort
+			if forwardMatch || reverseMatch {
+				keyCopy := make([]byte, len(keyBytes))
+				copy(keyCopy, keyBytes)
+				deleteKeys = append(deleteKeys, keyCopy)
+			}
+		}
+		if err := iter.Err(); err != nil {
+			if errors.Is(err, ebpf.ErrIterationAborted) && attempt < fragStateRevokeScanAttempts {
+				continue
+			}
+			return fmt.Errorf("iterate frag_state_v6: %w", err)
+		}
+		break
+	}
+
+	for _, key := range deleteKeys {
+		if err := m.Delete(key); err != nil && !isEbpfNoEntry(err) {
+			return fmt.Errorf("delete from frag_state_v6: %w", err)
+		}
 	}
 	return nil
 }

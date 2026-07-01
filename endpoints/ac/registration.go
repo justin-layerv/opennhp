@@ -639,15 +639,15 @@ const (
 	// the eBPF FilterMode flip.
 	MetricEbpfMapFull = "EbpfMapFull"
 
-	// eBPF established-flow conntrack cache telemetry. Entries/max/usage/age
-	// values are gauges produced by BpfFlusher.ConntrackStats when EBPFXDP is
-	// wired; the gauge funcs are not registered in iptables mode, avoiding inert
-	// pre-flip custom metrics. ExpiredReaped values are emitted as
-	// reset-per-flush counters from the same stats snapshot. The split is
-	// intentional because conn_track and conn_track_v6 have independent
-	// max_entries ceilings and E5 needs to distinguish allow-rule admission
-	// saturation (MetricEbpfMapFull) from conntrack cache saturation (slow-path
-	// pressure for new/uncached flows).
+	// eBPF established-flow conntrack and IPv6 fragment-state telemetry.
+	// Entries/max/usage/age values are gauges produced by
+	// BpfFlusher.ConntrackStats when EBPFXDP is wired; the gauge funcs are not
+	// registered in iptables mode, avoiding inert pre-flip custom metrics.
+	// ExpiredReaped values are emitted as reset-per-flush counters from the same
+	// stats snapshot. The split is intentional because allow rules, conntrack,
+	// and fragment state have independent max_entries ceilings and E5 needs to
+	// distinguish allow-rule admission saturation (MetricEbpfMapFull) from cache
+	// or later-fragment-state saturation.
 	MetricEbpfConntrackV4Entries          = "EbpfConntrackV4Entries"
 	MetricEbpfConntrackV4MaxEntries       = "EbpfConntrackV4MaxEntries"
 	MetricEbpfConntrackV4UsagePercent     = "EbpfConntrackV4UsagePercent"
@@ -658,6 +658,10 @@ const (
 	MetricEbpfConntrackV6UsagePercent     = "EbpfConntrackV6UsagePercent"
 	MetricEbpfConntrackV6OldestAgeSeconds = "EbpfConntrackV6OldestAgeSeconds"
 	MetricEbpfConntrackV6ExpiredReaped    = "EbpfConntrackV6ExpiredReaped"
+	MetricEbpfFragStateV6Entries          = "EbpfFragStateV6Entries"
+	MetricEbpfFragStateV6MaxEntries       = "EbpfFragStateV6MaxEntries"
+	MetricEbpfFragStateV6UsagePercent     = "EbpfFragStateV6UsagePercent"
+	MetricEbpfFragStateV6ExpiredReaped    = "EbpfFragStateV6ExpiredReaped"
 	MetricEbpfConntrackSampleSeconds      = "EbpfConntrackSampleSeconds"
 
 	// MetricEbpfConntrackSampleErrors counts stats/reaper sample failures per
@@ -666,10 +670,11 @@ const (
 	// pinned-map problem clears.
 	MetricEbpfConntrackSampleErrors = "EbpfConntrackSampleErrors"
 
-	// MetricEbpfConntrackPartialSamples counts conntrack HASH map iterations
-	// that were aborted by concurrent map churn before a complete pass. It is a
-	// reset-per-flush counter because the occupancy gauges from that sample may
-	// undercount and the quiet reaper skips deletes from incomplete walks.
+	// MetricEbpfConntrackPartialSamples counts conntrack and IPv6 fragment-state
+	// HASH map iterations that were aborted by concurrent map churn before a
+	// complete pass. It is a reset-per-flush counter because the occupancy gauges
+	// from that sample may undercount and the quiet reaper skips deletes from
+	// incomplete walks.
 	MetricEbpfConntrackPartialSamples = "EbpfConntrackPartialSamples"
 )
 
@@ -1361,6 +1366,9 @@ func (r *ACRegistration) registerConntrackGaugeFuncs() {
 	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV6MaxEntries, r.ebpfConntrackV6MaxEntriesGauge)
 	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV6UsagePercent, r.ebpfConntrackV6UsagePercentGauge)
 	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackV6OldestAgeSeconds, r.ebpfConntrackV6OldestAgeSecondsGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfFragStateV6Entries, r.ebpfFragStateV6EntriesGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfFragStateV6MaxEntries, r.ebpfFragStateV6MaxEntriesGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfFragStateV6UsagePercent, r.ebpfFragStateV6UsagePercentGauge)
 	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackSampleSeconds, r.ebpfConntrackSampleSecondsGauge)
 }
 
@@ -1711,6 +1719,15 @@ func (r *ACRegistration) ebpfConntrackV6UsagePercentGauge() float64 {
 }
 func (r *ACRegistration) ebpfConntrackV6OldestAgeSecondsGauge() float64 {
 	return r.ebpfConntrackStatsSnapshot().V6OldestAgeSeconds
+}
+func (r *ACRegistration) ebpfFragStateV6EntriesGauge() float64 {
+	return float64(r.ebpfConntrackStatsSnapshot().V6FragEntries)
+}
+func (r *ACRegistration) ebpfFragStateV6MaxEntriesGauge() float64 {
+	return float64(r.ebpfConntrackStatsSnapshot().V6FragMaxEntries)
+}
+func (r *ACRegistration) ebpfFragStateV6UsagePercentGauge() float64 {
+	return r.ebpfConntrackStatsSnapshot().V6FragUsagePercent
 }
 func (r *ACRegistration) ebpfConntrackSampleSecondsGauge() float64 {
 	return r.ebpfConntrackStatsSnapshot().SampleDurationSeconds

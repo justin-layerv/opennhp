@@ -159,6 +159,7 @@ type UdpAC struct {
 	// into fleet-shared CloudWatch streams.
 	bpfConntrackExpiredReapedV4Reported atomic.Uint64
 	bpfConntrackExpiredReapedV6Reported atomic.Uint64
+	bpfFragStateExpiredReapedV6Reported atomic.Uint64
 
 	// conntrackFlusher holds the FilterMode_IPTABLES flusher so Stop can
 	// Close it (the netlink backend owns a pool of netlink sockets). nil
@@ -358,6 +359,7 @@ func (a *UdpAC) BpfConntrackStats() (BpfConntrackStats, bool) {
 	a.recordBpfConntrackPartialSamples(stats.PartialSamples)
 	a.recordBpfConntrackExpiredReapedV4(stats.V4ExpiredReaped)
 	a.recordBpfConntrackExpiredReapedV6(stats.V6ExpiredReaped)
+	a.recordBpfFragStateExpiredReapedV6(stats.V6FragExpiredReaped)
 	return stats, true
 }
 
@@ -375,6 +377,10 @@ func (a *UdpAC) recordBpfConntrackExpiredReapedV4(expiredReaped uint64) {
 
 func (a *UdpAC) recordBpfConntrackExpiredReapedV6(expiredReaped uint64) {
 	a.recordBpfConntrackCounterDeltas(&a.bpfConntrackExpiredReapedV6Reported, expiredReaped, MetricEbpfConntrackV6ExpiredReaped)
+}
+
+func (a *UdpAC) recordBpfFragStateExpiredReapedV6(expiredReaped uint64) {
+	a.recordBpfConntrackCounterDeltas(&a.bpfFragStateExpiredReapedV6Reported, expiredReaped, MetricEbpfFragStateV6ExpiredReaped)
 }
 
 func (a *UdpAC) recordBpfConntrackCounterDeltas(reported *atomic.Uint64, watermark uint64, metricName string) {

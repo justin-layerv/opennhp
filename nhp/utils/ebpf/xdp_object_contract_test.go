@@ -322,6 +322,7 @@ func TestCommittedXDPObject_ConnTrackABI(t *testing.T) {
 	assertCommittedXDPObjectStrippedBTF(t, objPath)
 	assertConnTrackMapContract(t, spec, "conn_track", connTrackKeySize)
 	assertConnTrackMapContract(t, spec, "conn_track_v6", connTrackKeyV6Size)
+	assertFragStateV6MapContract(t, spec)
 
 	if hasELFSymbol(t, objPath, "__packed") {
 		t.Fatalf("%s still contains an ELF symbol named __packed; regenerate it after removing the no-op C token", committedXDPObjectRel)
@@ -342,6 +343,25 @@ func assertConnTrackMapContract(t *testing.T, spec *ebpf.CollectionSpec, mapName
 		t.Fatalf("committed %s KeySize = %d, want %d", mapName, got, want)
 	}
 	assertConnTrackValueLayout(t, spec, mapName)
+}
+
+func assertFragStateV6MapContract(t *testing.T, spec *ebpf.CollectionSpec) {
+	t.Helper()
+	const mapName = "frag_state_v6"
+	m := spec.Maps[mapName]
+	if m == nil {
+		t.Fatalf("%s has no %s map", committedXDPObjectRel, mapName)
+	}
+	if got, want := m.Pinning, ebpf.PinByName; got != want {
+		t.Fatalf("committed %s Pinning = %s, want %s so the AC loader pins it under /sys/fs/bpf/%s",
+			mapName, got, want, mapName)
+	}
+	if got, want := m.KeySize, uint32(ipv6FragKeySize); got != want {
+		t.Fatalf("committed %s KeySize = %d, want %d", mapName, got, want)
+	}
+	if got, want := m.ValueSize, uint32(ipv6FragValueSize); got != want {
+		t.Fatalf("committed %s ValueSize = %d, want %d", mapName, got, want)
+	}
 }
 
 func assertConnTrackValueLayout(t *testing.T, spec *ebpf.CollectionSpec, mapName string) {

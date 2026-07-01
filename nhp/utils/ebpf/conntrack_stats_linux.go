@@ -13,6 +13,8 @@ import (
 
 const connTrackExpiredDeleteBudget = 100_000
 
+var ErrFragStateMapNotPinned = errors.New("frag_state_v6 bpf map not pinned")
+
 // ConnTrackMapStats is a point-in-time sample of one eBPF conntrack map.
 // Entries is the number of elements observed before any expired-key deletions
 // from this sample. OldestAgeNanos is idle age since last packet among
@@ -31,10 +33,12 @@ type ConnTrackMapStats struct {
 	MapNotPinned     bool
 }
 
-// ConnTrackStats samples and reaps both established-flow conntrack maps.
+// ConnTrackStats samples and reaps established-flow conntrack maps plus IPv6
+// fragment-admission state.
 type ConnTrackStats struct {
-	V4 ConnTrackMapStats
-	V6 ConnTrackMapStats
+	V4     ConnTrackMapStats
+	V6     ConnTrackMapStats
+	FragV6 ConnTrackMapStats
 }
 
 type connTrackFamily int
@@ -60,20 +64,27 @@ func SampleAndReapConnTrack() (ConnTrackStats, error) {
 
 	v4, v4err := sampleAndReapConnTrackPinned(PinPathConnTrack, connTrackFamilyV4, now)
 	v6, v6err := sampleAndReapConnTrackPinned(PinPathConnTrackV6, connTrackFamilyV6, now)
+	fragV6, fragV6err := sampleAndReapFragStatePinned(PinPathFragStateV6, now)
 
-	return ConnTrackStats{V4: v4, V6: v6}, errors.Join(v4err, v6err)
+	return ConnTrackStats{V4: v4, V6: v6, FragV6: fragV6}, errors.Join(v4err, v6err, fragV6err)
 }
 
 func sampleAndReapConnTrackPinned(pinPath string, family connTrackFamily, nowNanos uint64) (ConnTrackMapStats, error) {
+	return sampleAndReapPinnedMap(pinPath, "conntrack", ErrConnTrackMapNotPinned, func(m *ebpf.Map) (ConnTrackMapStats, error) {
+		return sampleAndReapConnTrackOnMap(m, family, nowNanos)
+	})
+}
+
+func sampleAndReapPinnedMap(pinPath string, label string, notPinnedErr error, reap func(*ebpf.Map) (ConnTrackMapStats, error)) (ConnTrackMapStats, error) {
 	m, err := ebpf.LoadPinnedMap(pinPath, nil)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return ConnTrackMapStats{MapNotPinned: true, SampleError: true}, fmt.Errorf("%w: %s: %s", ErrConnTrackMapNotPinned, pinPath, err.Error())
+			return ConnTrackMapStats{MapNotPinned: true, SampleError: true}, fmt.Errorf("%w: %s: %s", notPinnedErr, pinPath, err.Error())
 		}
-		return ConnTrackMapStats{SampleError: true}, fmt.Errorf("load pinned conntrack map %s: %w", pinPath, err)
+		return ConnTrackMapStats{SampleError: true}, fmt.Errorf("load pinned %s map %s: %w", label, pinPath, err)
 	}
 	defer func() { _ = m.Close() }()
-	return sampleAndReapConnTrackOnMap(m, family, nowNanos)
+	return reap(m)
 }
 
 func sampleAndReapConnTrackOnMap(m *ebpf.Map, family connTrackFamily, nowNanos uint64) (ConnTrackMapStats, error) {
@@ -81,21 +92,77 @@ func sampleAndReapConnTrackOnMap(m *ebpf.Map, family connTrackFamily, nowNanos u
 }
 
 func sampleAndReapConnTrackOnMapWithBudget(m *ebpf.Map, family connTrackFamily, nowNanos uint64, deleteBudget int) (ConnTrackMapStats, error) {
-	info, err := m.Info()
-	if err != nil {
-		return ConnTrackMapStats{SampleError: true}, fmt.Errorf("conntrack map info: %w", err)
-	}
 	wantKeySize := connTrackKeySize
 	mapName := PinPathConnTrack
 	if family == connTrackFamilyV6 {
 		wantKeySize = connTrackKeyV6Size
 		mapName = PinPathConnTrackV6
 	}
-	if int(info.KeySize) != wantKeySize {
-		return ConnTrackMapStats{SampleError: true, MaxEntries: uint64(info.MaxEntries)}, fmt.Errorf("conntrack map key size %d, want %d — wrong map pinned at %s?", info.KeySize, wantKeySize, mapName)
+	return sampleAndReapMapWithBudget(m, nowNanos, deleteBudget, reapSpec{
+		label: "conntrack",
+		validate: func(info *ebpf.MapInfo) error {
+			if int(info.KeySize) != wantKeySize {
+				return fmt.Errorf("conntrack map key size %d, want %d — wrong map pinned at %s?", info.KeySize, wantKeySize, mapName)
+			}
+			if info.ValueSize < connTrackValueMinSize || int(info.ValueSize) > connTrackValueSizeMax {
+				return fmt.Errorf("conntrack map value size %d out of range (%d..%d) — wrong map pinned at %s?", info.ValueSize, connTrackValueMinSize, connTrackValueSizeMax, mapName)
+			}
+			return nil
+		},
+		decode:   connTrackValueTimes,
+		trackAge: true,
+	})
+}
+
+func sampleAndReapFragStatePinned(pinPath string, nowNanos uint64) (ConnTrackMapStats, error) {
+	// Unlike revocation's mixed-rollout best-effort purge, the sampler treats a
+	// missing frag_state_v6 pin as a load/staleness error: after the EBPFXDP flip,
+	// the XDP object must pin conntrack and fragment-state maps together.
+	return sampleAndReapPinnedMap(pinPath, "fragment-state", ErrFragStateMapNotPinned, func(m *ebpf.Map) (ConnTrackMapStats, error) {
+		return sampleAndReapFragStateOnMap(m, nowNanos)
+	})
+}
+
+func sampleAndReapFragStateOnMap(m *ebpf.Map, nowNanos uint64) (ConnTrackMapStats, error) {
+	return sampleAndReapFragStateOnMapWithBudget(m, nowNanos, connTrackExpiredDeleteBudget)
+}
+
+func sampleAndReapFragStateOnMapWithBudget(m *ebpf.Map, nowNanos uint64, deleteBudget int) (ConnTrackMapStats, error) {
+	return sampleAndReapMapWithBudget(m, nowNanos, deleteBudget, reapSpec{
+		label: "fragment-state",
+		validate: func(info *ebpf.MapInfo) error {
+			if int(info.KeySize) != ipv6FragKeySize {
+				return fmt.Errorf("frag_state_v6 map key size %d, want %d — wrong map pinned at %s?", info.KeySize, ipv6FragKeySize, PinPathFragStateV6)
+			}
+			if int(info.ValueSize) != ipv6FragValueSize {
+				return fmt.Errorf("frag_state_v6 map value size %d, want %d — wrong map pinned at %s?", info.ValueSize, ipv6FragValueSize, PinPathFragStateV6)
+			}
+			return nil
+		},
+		decode: func(valBytes []byte) (expiresAt uint64, lastSeen uint64, err error) {
+			val, derr := ipv6FragValueFromBytes(valBytes)
+			if derr != nil {
+				return 0, 0, derr
+			}
+			return val.ExpireTime, 0, nil
+		},
+	})
+}
+
+type reapSpec struct {
+	label    string
+	validate func(info *ebpf.MapInfo) error
+	decode   func(valBytes []byte) (expiresAt uint64, lastSeen uint64, err error)
+	trackAge bool
+}
+
+func sampleAndReapMapWithBudget(m *ebpf.Map, nowNanos uint64, deleteBudget int, spec reapSpec) (ConnTrackMapStats, error) {
+	info, err := m.Info()
+	if err != nil {
+		return ConnTrackMapStats{SampleError: true}, fmt.Errorf("%s map info: %w", spec.label, err)
 	}
-	if info.ValueSize < connTrackValueMinSize || int(info.ValueSize) > connTrackValueSizeMax {
-		return ConnTrackMapStats{SampleError: true, MaxEntries: uint64(info.MaxEntries)}, fmt.Errorf("conntrack map value size %d out of range (%d..%d) — wrong map pinned at %s?", info.ValueSize, connTrackValueMinSize, connTrackValueSizeMax, mapName)
+	if err := spec.validate(info); err != nil {
+		return ConnTrackMapStats{SampleError: true, MaxEntries: uint64(info.MaxEntries)}, err
 	}
 
 	stats := ConnTrackMapStats{MaxEntries: uint64(info.MaxEntries)}
@@ -106,12 +173,12 @@ func sampleAndReapConnTrackOnMapWithBudget(m *ebpf.Map, family connTrackFamily, 
 	iter := m.Iterate()
 	for iter.Next(&keyBytes, &valBytes) {
 		stats.Entries++
-		expiresAt, lastSeen, derr := connTrackValueTimes(valBytes)
+		expiresAt, lastSeen, derr := spec.decode(valBytes)
 		if derr != nil {
 			return ConnTrackMapStats{SampleError: true, MaxEntries: uint64(info.MaxEntries)}, derr
 		}
 		expired := nowNanos > expiresAt
-		if !expired && lastSeen <= nowNanos {
+		if spec.trackAge && !expired && lastSeen <= nowNanos {
 			if age := nowNanos - lastSeen; age > stats.OldestAgeNanos {
 				stats.OldestAgeNanos = age
 			}
@@ -133,14 +200,14 @@ func sampleAndReapConnTrackOnMapWithBudget(m *ebpf.Map, family connTrackFamily, 
 			stats.PartialSample = true
 			return stats, nil
 		}
-		return ConnTrackMapStats{SampleError: true, MaxEntries: uint64(info.MaxEntries)}, fmt.Errorf("iterate conntrack map: %w", err)
+		return ConnTrackMapStats{SampleError: true, MaxEntries: uint64(info.MaxEntries)}, fmt.Errorf("iterate %s map: %w", spec.label, err)
 	}
 
 	for _, key := range expiredKeys {
-		// A same-5-tuple recreate between sample and delete only loses the
-		// fast-path cache for that flow. The next packet pays the allow-rule
-		// slow path and repopulates if the admission is still valid; it never
-		// creates a fail-open or silent-eviction condition.
+		// A same-key recreate between sample and delete only loses cached
+		// admission state for that key. Subsequent packets re-enter datapath
+		// policy instead of bypassing admission; this never creates a fail-open
+		// or silent eviction.
 		if err := m.Delete(key); err != nil {
 			if !isEbpfNoEntry(err) {
 				stats.DeleteErrorCount++
@@ -153,7 +220,7 @@ func sampleAndReapConnTrackOnMapWithBudget(m *ebpf.Map, family connTrackFamily, 
 	}
 	if stats.DeleteErrorCount > 0 {
 		stats.SampleError = true
-		return stats, fmt.Errorf("delete expired conntrack entries: %d error(s)", stats.DeleteErrorCount)
+		return stats, fmt.Errorf("delete expired %s entries: %d error(s)", spec.label, stats.DeleteErrorCount)
 	}
 	return stats, nil
 }

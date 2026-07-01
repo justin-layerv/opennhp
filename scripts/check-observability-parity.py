@@ -70,6 +70,7 @@ AC_CORE_ALARM_NAMES = (
     "ebpf_map_full",
     "ebpf_conntrack_v4_usage_high",
     "ebpf_conntrack_v6_usage_high",
+    "ebpf_frag_state_v6_usage_high",
     "ebpf_conntrack_sample_errors",
     "ebpf_conntrack_partial_samples",
 )

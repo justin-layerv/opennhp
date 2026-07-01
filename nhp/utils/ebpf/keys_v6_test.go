@@ -34,6 +34,8 @@ const (
 	cSrcPortListKeyV6Size = 18 // struct src_port_list_key_v6
 	cPortListKeyV6Size    = 20 // struct port_list_key_v6
 	cConnTrackKeyV6Size   = 38 // struct ipv6_ct_tuple
+	cIPv6FragKeySize      = 37 // struct ipv6_frag_key
+	cIPv6FragValueSize    = 16 // struct ipv6_frag_value
 )
 
 // TestKeyV6Sizes_MatchCStaticAsserts is the load-bearing guard against the
@@ -51,6 +53,8 @@ func TestKeyV6Sizes_MatchCStaticAsserts(t *testing.T) {
 		{"src_port_list_key_v6", srcPortListKeyV6Size, cSrcPortListKeyV6Size},
 		{"port_list_key_v6", portListKeyV6Size, cPortListKeyV6Size},
 		{"ipv6_ct_tuple", connTrackKeyV6Size, cConnTrackKeyV6Size},
+		{"ipv6_frag_key", ipv6FragKeySize, cIPv6FragKeySize},
+		{"ipv6_frag_value", ipv6FragValueSize, cIPv6FragValueSize},
 	}
 	for _, tc := range cases {
 		if tc.goSize != tc.cSize {
@@ -80,6 +84,8 @@ func TestKeyV6Serializers_Length(t *testing.T) {
 		{"ToSpKeyV6", (&srcIPdstPortKeyV6{SrcIP: v6a, DstPort: 443}).ToSpKeyV6(), cSrcPortListKeyV6Size},
 		{"ToPlKeyV6", (&portListKeyV6{SrcIP: v6a, DstPortStart: 1, DstPortEnd: 2}).ToPlKeyV6(), cPortListKeyV6Size},
 		{"ToCtKeyV6", (&connTrackKeyV6{DstIP: v6b, SrcIP: v6a, DstPort: 443, SrcPort: 43210, NextHdr: 6, Flags: ctDirIngress}).ToCtKeyV6(), cConnTrackKeyV6Size},
+		{"ToFragKey", (&ipv6FragKey{SrcIP: v6a, DstIP: v6b, Identification: 0x01020304, FragNextHdr: 6}).ToFragKey(), cIPv6FragKeySize},
+		{"ToFragValue", (&ipv6FragValue{ExpireTime: 1, DstPort: 443, SrcPort: 43210, L4Proto: 6}).ToFragValue(), cIPv6FragValueSize},
 	}
 	for _, tc := range cases {
 		if len(tc.got) != tc.want {
@@ -446,6 +452,79 @@ func TestConnTrackKeyV6_SiblingsDifferOnlyInSrcPort(t *testing.T) {
 	// confirming the full __be16 is serialized, not just one half.
 	if a[34] == b[34] {
 		t.Errorf("sport high byte (34) did NOT differ between 0x0100 and 0x0200 — sport high half not serialized")
+	}
+}
+
+func TestIPv6FragKey_ToFragKey_GoldenBytes(t *testing.T) {
+	srcIP, err := parseIP6("2001:db8::7")
+	if err != nil {
+		t.Fatalf("parseIP6(src): %v", err)
+	}
+	dstIP, err := parseIP6("2001:db8::10")
+	if err != nil {
+		t.Fatalf("parseIP6(dst): %v", err)
+	}
+	key := &ipv6FragKey{
+		SrcIP:          srcIP,
+		DstIP:          dstIP,
+		Identification: 0x01020304,
+		FragNextHdr:    6,
+	}
+	got := key.ToFragKey()
+	if len(got) != ipv6FragKeySize {
+		t.Fatalf("ToFragKey length = %d, want ipv6FragKeySize=%d (packed ipv6_frag_key)", len(got), ipv6FragKeySize)
+	}
+
+	want := []byte{
+		// src_ip = 2001:db8::7
+		0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+		// dst_ip = 2001:db8::10
+		0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+		0x01, 0x02, 0x03, 0x04, // identification, network order
+		0x06, // fragment header next-header byte
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("ToFragKey bytes = % x, want % x", got, want)
+	}
+
+	roundTrip, err := ipv6FragKeyFromBytes(got)
+	if err != nil {
+		t.Fatalf("ipv6FragKeyFromBytes(ToFragKey): %v", err)
+	}
+	if roundTrip != *key {
+		t.Fatalf("ipv6FragKeyFromBytes(ToFragKey) = %+v, want %+v", roundTrip, *key)
+	}
+}
+
+func TestIPv6FragValue_ToFragValue_GoldenBytes(t *testing.T) {
+	value := &ipv6FragValue{
+		ExpireTime: 0x0102030405060708,
+		DstPort:    443,
+		SrcPort:    43210,
+		L4Proto:    17,
+	}
+	got := value.ToFragValue()
+	if len(got) != ipv6FragValueSize {
+		t.Fatalf("ToFragValue length = %d, want ipv6FragValueSize=%d", len(got), ipv6FragValueSize)
+	}
+
+	want := make([]byte, ipv6FragValueSize)
+	binary.LittleEndian.PutUint64(want[0:8], value.ExpireTime)
+	binary.BigEndian.PutUint16(want[8:10], value.DstPort)
+	binary.BigEndian.PutUint16(want[10:12], value.SrcPort)
+	want[12] = value.L4Proto
+	if !bytes.Equal(got, want) {
+		t.Fatalf("ToFragValue bytes = % x, want % x", got, want)
+	}
+
+	roundTrip, err := ipv6FragValueFromBytes(got)
+	if err != nil {
+		t.Fatalf("ipv6FragValueFromBytes(ToFragValue): %v", err)
+	}
+	if roundTrip != *value {
+		t.Fatalf("ipv6FragValueFromBytes(ToFragValue) = %+v, want %+v", roundTrip, *value)
 	}
 }
 

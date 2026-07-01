@@ -1,9 +1,9 @@
 package ac
 
-// BpfConntrackStats is the build-tag-free AC view of the eBPF established-flow
-// conntrack maps. The Linux BpfFlusher fills it from nhp/utils/ebpf; non-Linux
-// and non-EBPFXDP paths return the zero value so registration.go can publish
-// gauges without taking a build-tag dependency.
+// BpfConntrackStats is the build-tag-free AC view of the eBPF conntrack and
+// IPv6 fragment-state maps. The Linux BpfFlusher fills it from nhp/utils/ebpf;
+// non-Linux and non-EBPFXDP paths return the zero value so registration.go can
+// publish gauges without taking a build-tag dependency.
 //
 // UdpAC also consumes the cumulative counter watermarks while metrics gauge
 // callbacks run serially. A future concurrent/direct reader must make the
@@ -24,6 +24,13 @@ type BpfConntrackStats struct {
 	V6OldestAgeSeconds float64
 	// V6ExpiredReaped is the v6 twin of V4ExpiredReaped.
 	V6ExpiredReaped uint64
+	// V6Frag* tracks the IPv6 later-fragment admission-state map separately
+	// from established-flow conn_track_v6 so fragment churn cannot hide inside
+	// ordinary conntrack occupancy.
+	V6FragEntries       uint64
+	V6FragMaxEntries    uint64
+	V6FragUsagePercent  float64
+	V6FragExpiredReaped uint64
 	// SampleDurationSeconds is the wall-clock duration of the most recent
 	// sample/reap attempt. It is a gauge so flip validation can see full-map
 	// walk latency in CloudWatch instead of relying only on AC logs.

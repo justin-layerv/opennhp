@@ -122,6 +122,10 @@ func TestACRegistration_EbpfConntrackGauges_ReadWiredStats(t *testing.T) {
 		V6UsagePercent:        30,
 		V6OldestAgeSeconds:    1.5,
 		V6ExpiredReaped:       5,
+		V6FragEntries:         4,
+		V6FragMaxEntries:      16,
+		V6FragUsagePercent:    25,
+		V6FragExpiredReaped:   6,
 		SampleDurationSeconds: 1.25,
 	}
 	a := &UdpAC{
@@ -155,6 +159,15 @@ func TestACRegistration_EbpfConntrackGauges_ReadWiredStats(t *testing.T) {
 	if got := reg.ebpfConntrackV6OldestAgeSecondsGauge(); got != 1.5 {
 		t.Fatalf("V6 oldest age gauge = %v, want 1.5", got)
 	}
+	if got := reg.ebpfFragStateV6EntriesGauge(); got != 4 {
+		t.Fatalf("V6 fragment entries gauge = %v, want 4", got)
+	}
+	if got := reg.ebpfFragStateV6MaxEntriesGauge(); got != 16 {
+		t.Fatalf("V6 fragment max entries gauge = %v, want 16", got)
+	}
+	if got := reg.ebpfFragStateV6UsagePercentGauge(); got != 25 {
+		t.Fatalf("V6 fragment usage gauge = %v, want 25", got)
+	}
 	if got := reg.ebpfConntrackSampleSecondsGauge(); got != 1.25 {
 		t.Fatalf("sample seconds gauge = %v, want 1.25", got)
 	}
@@ -170,6 +183,8 @@ func TestACRegistration_ConntrackGaugeCollectionReadsCachedStatsAndPublishesCoun
 				V4Entries:             42,
 				V4ExpiredReaped:       11,
 				V6ExpiredReaped:       5,
+				V6FragEntries:         6,
+				V6FragExpiredReaped:   7,
 				SampleDurationSeconds: 1.25,
 			}
 		},
@@ -189,6 +204,9 @@ func TestACRegistration_ConntrackGaugeCollectionReadsCachedStatsAndPublishesCoun
 	if _, ok := gauges[MetricEbpfConntrackV6UsagePercent]; !ok {
 		t.Fatalf("%s gauge was not registered; conntrack gauge block must stay in the collected gauge path", MetricEbpfConntrackV6UsagePercent)
 	}
+	if got := gauges[MetricEbpfFragStateV6Entries]; got != 6 {
+		t.Fatalf("%s gauge after collection = %v, want 6", MetricEbpfFragStateV6Entries, got)
+	}
 	if got := gauges[MetricEbpfConntrackSampleSeconds]; got != 1.25 {
 		t.Fatalf("%s gauge after collection = %v, want 1.25", MetricEbpfConntrackSampleSeconds, got)
 	}
@@ -197,6 +215,9 @@ func TestACRegistration_ConntrackGaugeCollectionReadsCachedStatsAndPublishesCoun
 	}
 	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 5 {
 		t.Fatalf("%s counter after collection = %v, want 5", MetricEbpfConntrackV6ExpiredReaped, got)
+	}
+	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 7 {
+		t.Fatalf("%s counter after collection = %v, want 7", MetricEbpfFragStateV6ExpiredReaped, got)
 	}
 }
 
@@ -215,6 +236,9 @@ func TestACRegistration_ConntrackGaugeRegistrationSkipsUnwired(t *testing.T) {
 		MetricEbpfConntrackV6MaxEntries,
 		MetricEbpfConntrackV6UsagePercent,
 		MetricEbpfConntrackV6OldestAgeSeconds,
+		MetricEbpfFragStateV6Entries,
+		MetricEbpfFragStateV6MaxEntries,
+		MetricEbpfFragStateV6UsagePercent,
 		MetricEbpfConntrackSampleSeconds,
 	} {
 		if _, ok := gauges[name]; ok {
@@ -231,6 +255,9 @@ func TestACRegistration_EbpfConntrackGauges_ZeroWhenUnwired(t *testing.T) {
 	if got := reg.ebpfConntrackV6UsagePercentGauge(); got != 0 {
 		t.Fatalf("V6 usage gauge = %v, want 0 without BpfFlusher wiring", got)
 	}
+	if got := reg.ebpfFragStateV6UsagePercentGauge(); got != 0 {
+		t.Fatalf("V6 fragment usage gauge = %v, want 0 without BpfFlusher wiring", got)
+	}
 	if got := reg.ebpfConntrackSampleSecondsGauge(); got != 0 {
 		t.Fatalf("sample seconds gauge = %v, want 0 without BpfFlusher wiring", got)
 	}
@@ -239,9 +266,9 @@ func TestACRegistration_EbpfConntrackGauges_ZeroWhenUnwired(t *testing.T) {
 func TestUdpAC_BpfConntrackStats_RecordsCounterDeltas(t *testing.T) {
 	publisher := metrics.NewPublisherForTest(t)
 	samples := []BpfConntrackStats{
-		{SampleErrors: 2, PartialSamples: 1, V4ExpiredReaped: 11, V6ExpiredReaped: 5},
-		{SampleErrors: 2, PartialSamples: 1, V4ExpiredReaped: 11, V6ExpiredReaped: 5},
-		{SampleErrors: 5, PartialSamples: 4, V4ExpiredReaped: 17, V6ExpiredReaped: 9},
+		{SampleErrors: 2, PartialSamples: 1, V4ExpiredReaped: 11, V6ExpiredReaped: 5, V6FragExpiredReaped: 6},
+		{SampleErrors: 2, PartialSamples: 1, V4ExpiredReaped: 11, V6ExpiredReaped: 5, V6FragExpiredReaped: 6},
+		{SampleErrors: 5, PartialSamples: 4, V4ExpiredReaped: 17, V6ExpiredReaped: 9, V6FragExpiredReaped: 12},
 	}
 	idx := 0
 	a := &UdpAC{
@@ -273,6 +300,9 @@ func TestUdpAC_BpfConntrackStats_RecordsCounterDeltas(t *testing.T) {
 	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 5 {
 		t.Fatalf("v6 expired-reaped counter after first sample = %v, want 5", got)
 	}
+	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 6 {
+		t.Fatalf("v6 fragment expired-reaped counter after first sample = %v, want 6", got)
+	}
 
 	if _, ok := a.BpfConntrackStats(); !ok {
 		t.Fatal("BpfConntrackStats ok = false on cached cumulative sample, want true")
@@ -290,6 +320,9 @@ func TestUdpAC_BpfConntrackStats_RecordsCounterDeltas(t *testing.T) {
 	}
 	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 5 {
 		t.Fatalf("v6 expired-reaped counter after repeated watermark = %v, want still 5", got)
+	}
+	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 6 {
+		t.Fatalf("v6 fragment expired-reaped counter after repeated watermark = %v, want still 6", got)
 	}
 
 	if _, ok := a.BpfConntrackStats(); !ok {
@@ -309,6 +342,9 @@ func TestUdpAC_BpfConntrackStats_RecordsCounterDeltas(t *testing.T) {
 	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 9 {
 		t.Fatalf("v6 expired-reaped counter after advanced watermark = %v, want 9", got)
 	}
+	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 12 {
+		t.Fatalf("v6 fragment expired-reaped counter after advanced watermark = %v, want 12", got)
+	}
 }
 
 func TestUdpAC_BpfConntrackStats_DoesNotConsumeCounterDeltasWithoutPublisher(t *testing.T) {
@@ -316,10 +352,11 @@ func TestUdpAC_BpfConntrackStats_DoesNotConsumeCounterDeltasWithoutPublisher(t *
 	a := &UdpAC{
 		bpfConntrackStats: func() BpfConntrackStats {
 			return BpfConntrackStats{
-				SampleErrors:    2,
-				PartialSamples:  1,
-				V4ExpiredReaped: 11,
-				V6ExpiredReaped: 5,
+				SampleErrors:        2,
+				PartialSamples:      1,
+				V4ExpiredReaped:     11,
+				V6ExpiredReaped:     5,
+				V6FragExpiredReaped: 6,
 			}
 		},
 	}
@@ -333,6 +370,9 @@ func TestUdpAC_BpfConntrackStats_DoesNotConsumeCounterDeltasWithoutPublisher(t *
 	if got := a.bpfConntrackExpiredReapedV4Reported.Load(); got != 0 {
 		t.Fatalf("v4 expired-reaped watermark advanced without publisher: got %d, want 0", got)
 	}
+	if got := a.bpfFragStateExpiredReapedV6Reported.Load(); got != 0 {
+		t.Fatalf("v6 fragment expired-reaped watermark advanced without publisher: got %d, want 0", got)
+	}
 
 	a.registration = &ACRegistration{metrics: publisher}
 	if _, ok := a.BpfConntrackStats(); !ok {
@@ -343,6 +383,9 @@ func TestUdpAC_BpfConntrackStats_DoesNotConsumeCounterDeltasWithoutPublisher(t *
 	}
 	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 11 {
 		t.Fatalf("v4 expired-reaped counter after publisher attach = %v, want 11", got)
+	}
+	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 6 {
+		t.Fatalf("v6 fragment expired-reaped counter after publisher attach = %v, want 6", got)
 	}
 }
 

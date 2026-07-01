@@ -168,6 +168,58 @@ func TestSampleAndReapConnTrackOnMapV6_DeletesExpiredQuietEntries(t *testing.T) 
 	}
 }
 
+func TestSampleAndReapFragStateV6OnMap_DeletesExpiredEntries(t *testing.T) {
+	m, ok := newTestFragStateMapV6(t)
+	if !ok {
+		return
+	}
+	defer func() { _ = m.Close() }()
+
+	src, err := parseIP6("2001:db8::7")
+	if err != nil {
+		t.Fatalf("parseIP6(src): %v", err)
+	}
+	dst, err := parseIP6("2001:db8::10")
+	if err != nil {
+		t.Fatalf("parseIP6(dst): %v", err)
+	}
+
+	expiredKey := (&ipv6FragKey{SrcIP: src, DstIP: dst, Identification: 0x01020304, FragNextHdr: 6}).ToFragKey()
+	liveKey := (&ipv6FragKey{SrcIP: src, DstIP: dst, Identification: 0x01020305, FragNextHdr: 6}).ToFragKey()
+	expiredVal := (&ipv6FragValue{ExpireTime: 100, DstPort: 443, SrcPort: 43210, L4Proto: 6}).ToFragValue()
+	liveVal := (&ipv6FragValue{ExpireTime: 500, DstPort: 443, SrcPort: 43211, L4Proto: 6}).ToFragValue()
+
+	if err := m.Put(expiredKey, expiredVal); err != nil {
+		t.Fatalf("put expired frag state: %v", err)
+	}
+	if err := m.Put(liveKey, liveVal); err != nil {
+		t.Fatalf("put live frag state: %v", err)
+	}
+
+	stats, err := sampleAndReapFragStateOnMap(m, 200)
+	if err != nil {
+		t.Fatalf("sampleAndReapFragStateOnMap: %v", err)
+	}
+	if stats.Entries != 2 {
+		t.Fatalf("FragV6 Entries = %d, want 2 (pre-reap sample should count both entries)", stats.Entries)
+	}
+	if stats.MaxEntries != 16 {
+		t.Fatalf("FragV6 MaxEntries = %d, want 16", stats.MaxEntries)
+	}
+	if stats.ExpiredDeleted != 1 {
+		t.Fatalf("FragV6 ExpiredDeleted = %d, want 1", stats.ExpiredDeleted)
+	}
+
+	out := make([]byte, ipv6FragValueSize)
+	if err := m.Lookup(expiredKey, &out); !isEbpfNoEntry(err) {
+		t.Fatalf("expired frag_state_v6 lookup err = %v, want no-entry after reaper", err)
+	}
+	out = make([]byte, ipv6FragValueSize)
+	if err := m.Lookup(liveKey, &out); err != nil {
+		t.Fatalf("live frag_state_v6 lookup err = %v, want survivor untouched", err)
+	}
+}
+
 func TestSampleAndReapConnTrackOnMap_RespectsDeleteBudget(t *testing.T) {
 	m, ok := newTestConnTrackMap(t)
 	if !ok {
@@ -235,6 +287,19 @@ func TestSampleAndReapConnTrackPinned_MissingMapIsSampleError(t *testing.T) {
 	stats, err := sampleAndReapConnTrackPinned("/sys/fs/bpf/nhp-test-missing-conn-track", connTrackFamilyV4, 200)
 	if !errors.Is(err, ErrConnTrackMapNotPinned) {
 		t.Fatalf("sample missing pinned map err = %v, want ErrConnTrackMapNotPinned", err)
+	}
+	if !stats.MapNotPinned {
+		t.Fatal("MapNotPinned = false, want true")
+	}
+	if !stats.SampleError {
+		t.Fatal("SampleError = false, want true so AC emits MetricEbpfConntrackSampleErrors")
+	}
+}
+
+func TestSampleAndReapFragStatePinned_MissingMapIsSampleError(t *testing.T) {
+	stats, err := sampleAndReapFragStatePinned("/sys/fs/bpf/nhp-test-missing-frag-state-v6", 200)
+	if !errors.Is(err, ErrFragStateMapNotPinned) {
+		t.Fatalf("sample missing pinned frag_state_v6 err = %v, want ErrFragStateMapNotPinned", err)
 	}
 	if !stats.MapNotPinned {
 		t.Fatal("MapNotPinned = false, want true")

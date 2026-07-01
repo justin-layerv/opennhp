@@ -308,6 +308,35 @@ resource "aws_cloudwatch_metric_alarm" "ebpf_conntrack_v6_usage_high" {
   })
 }
 
+resource "aws_cloudwatch_metric_alarm" "ebpf_frag_state_v6_usage_high" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-ebpf-frag-state-v6-usage-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "EbpfFragStateV6UsagePercent"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 85
+  alarm_description   = "AC eBPF IPv6 fragment-admission HASH state exceeded 85% after expired-state reaping. New fragmented flows fail closed when frag_state_v6 is full; inspect current fragment churn, EbpfFragStateV6ExpiredReaped, and conntrack sample health. See docs/runbooks/ebpf-map-capacity.md."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name  = "${var.name_prefix}-ac-ebpf-frag-state-v6-usage-high"
+    Issue = "2865"
+  })
+}
+
 resource "aws_cloudwatch_metric_alarm" "ebpf_conntrack_sample_errors" {
   count = var.enable_cloudwatch_alarms ? 1 : 0
 

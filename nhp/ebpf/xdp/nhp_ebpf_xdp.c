@@ -21,6 +21,14 @@
 #define IPV6_NEXTHDR_DEST 60
 #define IPV6_NEXTHDR_MOBILITY 135
 #define IPV6_EXT_MAX_HEADERS 6
+#define IPV6_FRAG_OFFSET_MASK 0xfff8
+#define IPV6_FRAG_MORE_FLAG 0x0001
+// Deliberately stricter than RFC 8200's ignore-on-receipt rule: nonzero
+// reserved fragment bits fail closed at XDP instead of reaching reassembly.
+#define IPV6_FRAG_RESERVED_MASK 0x0006
+// Match Linux's default net.ipv6.ip6frag_time reassembly window; operators who
+// raise that sysctl should revisit this cap before relying on late fragments.
+#define IPV6_FRAG_STATE_TTL_NS (60ULL * 1000000000ULL)
 // ICMPv6 Echo Request / Echo Reply (RFC 4443 §4) — the v6 equivalents of v4's
 // ICMP_ECHO(8)/ICMP_ECHOREPLY(0). Different numbering: 128/129, not 8/0.
 #define ICMPV6_ECHO_REQUEST 128
@@ -47,8 +55,8 @@
 // MAX_ENTRIES_V6: separate, right-sized ceiling for the IPv6 maps (E2 slice 1).
 // Deliberately NOT reused from MAX_ENTRIES (1,000,000): the prod knock NLB is
 // IPv4-only, so v6 enforcement scale is far smaller than v4 today. 131072 (128K,
-// power of two) is a comfortable near-term v6 ceiling, ≈93 MB of preallocated
-// kernel memory across all 6 v6 maps — trivial on an 8 GB c6i.xlarge AC. The
+// power of two) is a comfortable near-term v6 ceiling, ≈107 MB of preallocated
+// kernel memory across all 7 v6 maps — trivial on an 8 GB c6i.xlarge AC. The
 // per-map kernel-memory breakdown lives in docs/design/
 // SESSION_ENFORCEMENT_ARCHITECTURE.md ("Capacity / max_entries sizing" → IPv6
 // subsection); any bump is a flip-time concern (#2813) and must re-run that math
@@ -401,6 +409,30 @@ struct ipv6_ct_tuple {
 _Static_assert(sizeof(struct ipv6_ct_tuple) == 38,
                "ipv6_ct_tuple must be exactly 38 bytes (packed)");
 
+// IPv6 fragment admission state. Later fragments do not carry L4 ports, so
+// they cannot safely consult the normal allow-rule cascade. A first fragment
+// that is admitted through the ordinary TCP/UDP path creates this bounded state;
+// later fragments pass only when the same {src,dst,fragment-id,fragment-next}
+// tuple is present and unexpired. The ports live in the value so userspace can
+// purge fragment state for an exact revoked 5-tuple by iterating this map.
+struct ipv6_frag_key {
+    struct in6_addr src_ip;        // 16
+    struct in6_addr dst_ip;        // 16
+    __be32 identification;         //  4
+    __u8 frag_nexthdr;             //  1: Fragment header's next-header byte
+} __attribute__((packed));         // = 37 bytes (KeySize for frag_state_v6)
+_Static_assert(sizeof(struct ipv6_frag_key) == 37,
+               "ipv6_frag_key must be exactly 37 bytes (packed)");
+
+struct ipv6_frag_value {
+    __u64 expire_time;             // min(allow-rule deadline, reassembly window)
+    __be16 dport;                  // original first-fragment L4 destination port
+    __be16 sport;                  // original first-fragment L4 source port
+    __u8 l4_proto;                 // final resolved TCP/UDP protocol
+};                                 // = 16 bytes with natural trailing padding
+_Static_assert(sizeof(struct ipv6_frag_value) == 16,
+               "ipv6_frag_value must remain 16 bytes (expire_time + ports + proto + trailing pad)");
+
 struct conn_value {
     __u64 timestamp;
     __u64 last_timestamp;
@@ -455,6 +487,18 @@ struct {
     __type(value, struct conn_value);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } conn_track_v6 SEC(".maps");
+
+// Fragment state is authoritative for later IPv6 fragments, so it is HASH
+// rather than LRU_HASH: when the table is full, first-fragment admission fails
+// closed instead of evicting some other fragmented flow's state and causing a
+// non-deterministic mid-flow drop.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES_V6);
+    __type(key, struct ipv6_frag_key);        // KeySize 37
+    __type(value, struct ipv6_frag_value);    // ValueSize 16
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} frag_state_v6 SEC(".maps");
 
 struct event_t {
     __u64 timestamp;
@@ -759,11 +803,12 @@ static __always_inline bool check_conn_expiry(struct conn_value *val) {
 // TCP/UDP/ICMPv6 still starts at (ip6h + 1); packets carrying Hop-by-Hop,
 // Routing, Destination Options, Mobility, or AH headers advance through those
 // headers (with a fixed hop cap and data_end checks at every step) until the
-// final TCP/UDP/ICMPv6 protocol is found. Anything unresolved fails CLOSED:
-// Fragment (no reassembly/port visibility for non-first fragments), ESP, No
-// Next Header, unknown protocols, truncated headers, or a chain longer than
-// IPV6_EXT_MAX_HEADERS. This keeps extension headers from bypassing admission
-// while admitting the ordinary inspectable chains that terminate in an L4 header.
+// final TCP/UDP/ICMPv6 protocol is found. IPv6 Fragment headers get split
+// handling: first fragments keep walking to the real L4 header and must pass the
+// normal allow-rule cascade, while later fragments are admitted only from
+// frag_state_v6 created by an allowed first fragment. Anything else unresolved
+// fails CLOSED: ESP, No Next Header, unknown protocols, malformed fragments,
+// truncated headers, or a chain longer than IPV6_EXT_MAX_HEADERS.
 //
 // LIMITATION — DENY/ACCEPT events carry zeroed IPv4 address fields. struct
 // event_t is IPv4-shaped (__be32 src_ip/dst_ip); it cannot hold a 128-bit v6
@@ -784,11 +829,25 @@ static __always_inline bool check_conn_expiry(struct conn_value *val) {
 // function scope; combined with the per-rule { } blocks below, this lets clang
 // reuse one stack slot for the large v6 key structs instead of summing them
 // (the 512-byte BPF stack limit is the real constraint here, not insn count).
-static __always_inline bool resolve_ipv6_l4(struct ipv6hdr *ip6h,
-                                            void *data_end,
-                                            void **l4_out,
-                                            __u8 *nexthdr_out,
-                                            __u8 *deny_nexthdr_out) {
+enum ipv6_l4_result {
+    IPV6_L4_DROP = 0,
+    IPV6_L4_RESOLVED = 1,
+    IPV6_L4_LATER_FRAGMENT = 2,
+};
+
+struct ipv6_frag_info {
+    __u8 present;
+    __u8 needs_state;
+    __u8 frag_nexthdr;
+    __be32 identification;
+};
+
+static __always_inline int resolve_ipv6_l4(struct ipv6hdr *ip6h,
+                                           void *data_end,
+                                           void **l4_out,
+                                           __u8 *nexthdr_out,
+                                           __u8 *deny_nexthdr_out,
+                                           struct ipv6_frag_info *frag) {
     __u8 nexthdr = ip6h->nexthdr;
     __u64 offset = sizeof(struct ipv6hdr);
 
@@ -799,17 +858,43 @@ static __always_inline bool resolve_ipv6_l4(struct ipv6hdr *ip6h,
             nexthdr == IPPROTO_ICMPV6) {
             *l4_out = (void *)ip6h + offset;
             *nexthdr_out = nexthdr;
-            return true;
+            return IPV6_L4_RESOLVED;
         }
 
         *deny_nexthdr_out = nexthdr;
         if (i == IPV6_EXT_MAX_HEADERS)
-            return false;
+            return IPV6_L4_DROP;
 
         if (nexthdr == IPV6_NEXTHDR_NONE ||
-            nexthdr == IPV6_NEXTHDR_ESP ||
-            nexthdr == IPV6_NEXTHDR_FRAGMENT) {
-            return false;
+            nexthdr == IPV6_NEXTHDR_ESP) {
+            return IPV6_L4_DROP;
+        }
+
+        if (nexthdr == IPV6_NEXTHDR_FRAGMENT) {
+            struct frag_hdr *fh = (void *)ip6h + offset;
+            if ((void *)(fh + 1) > data_end)
+                return IPV6_L4_DROP;
+
+            // A second Fragment header is invalid for this datapath. Drop it
+            // rather than letting nested fragment state alias the first one.
+            if (frag->present)
+                return IPV6_L4_DROP;
+
+            __u16 frag_off = bpf_ntohs(fh->frag_off);
+            if (frag_off & IPV6_FRAG_RESERVED_MASK)
+                return IPV6_L4_DROP;
+
+            __u16 fragment_offset = frag_off & IPV6_FRAG_OFFSET_MASK;
+            frag->present = 1;
+            frag->needs_state = fragment_offset != 0 || (frag_off & IPV6_FRAG_MORE_FLAG);
+            frag->frag_nexthdr = fh->nexthdr;
+            frag->identification = fh->identification;
+            nexthdr = fh->nexthdr;
+            offset += sizeof(struct frag_hdr);
+
+            if (fragment_offset != 0)
+                return IPV6_L4_LATER_FRAGMENT;
+            continue;
         }
 
         if (nexthdr == IPV6_NEXTHDR_HOP ||
@@ -822,10 +907,10 @@ static __always_inline bool resolve_ipv6_l4(struct ipv6hdr *ip6h,
             // enough to classify the final L4 protocol for admission.
             struct ipv6_opt_hdr *eh = (void *)ip6h + offset;
             if ((void *)(eh + 1) > data_end)
-                return false;
+                return IPV6_L4_DROP;
             __u64 hdr_len = ((__u64)eh->hdrlen + 1) << 3;
             if ((void *)eh + hdr_len > data_end)
-                return false;
+                return IPV6_L4_DROP;
             nexthdr = eh->nexthdr;
             offset += hdr_len;
             continue;
@@ -834,26 +919,137 @@ static __always_inline bool resolve_ipv6_l4(struct ipv6hdr *ip6h,
         if (nexthdr == IPV6_NEXTHDR_AH) {
             struct ipv6_opt_hdr *ah = (void *)ip6h + offset;
             if ((void *)(ah + 1) > data_end)
-                return false;
+                return IPV6_L4_DROP;
             // AH semantic validation (minimum RFC 4302 length, SPI/sequence,
             // authentication data) is left to the kernel stack after XDP_PASS;
             // XDP only needs a bounds-safe skip to classify the final L4 header
             // for admission.
             __u64 hdr_len = ((__u64)ah->hdrlen + 2) << 2;
             if ((void *)ah + hdr_len > data_end)
-                return false;
+                return IPV6_L4_DROP;
             nexthdr = ah->nexthdr;
             offset += hdr_len;
             continue;
         }
 
-        return false;
+        return IPV6_L4_DROP;
     }
 
     // Defensive tail for C control-flow completeness if the cap expression is
     // ever rewritten; the i == IPV6_EXT_MAX_HEADERS guard returns first today.
     *deny_nexthdr_out = nexthdr;
-    return false;
+    return IPV6_L4_DROP;
+}
+
+static __always_inline int ipv6_later_fragment_verdict(struct xdp_md *ctx,
+                                                       struct ipv6hdr *ip6h,
+                                                       struct ipv6_frag_info *frag,
+                                                       __be16 total_len) {
+    struct ipv6_frag_key fkey = {
+        .src_ip = ip6h->saddr,
+        .dst_ip = ip6h->daddr,
+        .identification = frag->identification,
+        .frag_nexthdr = frag->frag_nexthdr,
+    };
+    struct ipv6_frag_value *fval = bpf_map_lookup_elem(&frag_state_v6, &fkey);
+    if (!fval) {
+        if (should_emit_deny_event())
+            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, frag->frag_nexthdr, total_len);
+        return XDP_DROP;
+    }
+
+    __u64 now = bpf_ktime_get_ns();
+    if (fval->expire_time < now) {
+        bpf_map_delete_elem(&frag_state_v6, &fkey);
+        if (should_emit_deny_event())
+            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, frag->frag_nexthdr, total_len);
+        return XDP_DROP;
+    }
+    // No ACCEPT event here: later fragments carry no L4 ports. The admitted
+    // first fragment already emitted ACCEPT; later-fragment drops still DENY.
+    return XDP_PASS;
+}
+
+static __always_inline __u64 conn_value_expire_time(struct conn_value *val) {
+    __u64 expires_at = val->timestamp + val->ttl_ns;
+    if (expires_at < val->timestamp)
+        return ~0ULL;
+    return expires_at;
+}
+
+static __always_inline __u64 ipv6_fragment_expire_time(__u64 admission_expire_time) {
+    __u64 now = bpf_ktime_get_ns();
+    __u64 reassembly_expire_time = now + IPV6_FRAG_STATE_TTL_NS;
+    if (reassembly_expire_time < now)
+        reassembly_expire_time = ~0ULL;
+    if (reassembly_expire_time < admission_expire_time)
+        return reassembly_expire_time;
+    return admission_expire_time;
+}
+
+static __always_inline int populate_ipv6_fragment_state(struct ipv6_frag_info *frag,
+                                                        struct ipv6hdr *ip6h,
+                                                        __u8 l4_proto,
+                                                        __be16 sport,
+                                                        __be16 dport,
+                                                        __u64 admission_expire_time) {
+    if (!frag->needs_state)
+        return 0;
+
+    struct ipv6_frag_key fkey = {
+        .src_ip = ip6h->saddr,
+        .dst_ip = ip6h->daddr,
+        .identification = frag->identification,
+        .frag_nexthdr = frag->frag_nexthdr,
+    };
+    struct ipv6_frag_value fval = {
+        .expire_time = ipv6_fragment_expire_time(admission_expire_time),
+        .dport = dport,
+        .sport = sport,
+        .l4_proto = l4_proto,
+    };
+    if (bpf_map_update_elem(&frag_state_v6, &fkey, &fval, BPF_ANY) != 0)
+        return -1;
+    return 0;
+}
+
+static __always_inline int populate_ipv6_admission_state(struct ipv6_ct_tuple *ct_key,
+                                                         struct conn_value *new_val,
+                                                         struct ipv6_frag_info *frag,
+                                                         struct ipv6hdr *ip6h,
+                                                         __u8 l4_proto,
+                                                         __be16 sport,
+                                                         __be16 dport,
+                                                         __u64 expire_time) {
+    if (!frag->needs_state) {
+        bpf_map_update_elem(&conn_track_v6, ct_key, new_val, BPF_ANY);
+        return 0;
+    }
+
+    // Fragmented first packets require both conntrack and fragment-state
+    // bookkeeping to succeed. Non-fragmented packets can fall back to the
+    // allow-rule slow path if conn_track_v6 is full, but fragments need an
+    // explicit fail-closed signal before any later-fragment authority exists.
+    if (bpf_map_update_elem(&conn_track_v6, ct_key, new_val, BPF_ANY) != 0)
+        return -1;
+
+    // If frag_state_v6 is full, keep conn_track_v6 and fail this fragmented
+    // datagram closed. Rolling back could delete a pre-existing conntrack
+    // entry for the same 5-tuple; non-fragmented packets may still pass.
+    if (populate_ipv6_fragment_state(frag, ip6h, l4_proto, sport, dport, expire_time) != 0)
+        return -1;
+    return 0;
+}
+
+static __always_inline int ipv6_admission_state_failure_verdict(struct xdp_md *ctx,
+                                                                struct ipv6hdr *ip6h,
+                                                                __be16 sport,
+                                                                __be16 dport,
+                                                                __u8 nexthdr,
+                                                                __be16 total_len) {
+    if (should_emit_deny_event())
+        submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
+    return XDP_DROP;
 }
 
 static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
@@ -879,7 +1075,11 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
     void *l4 = 0;
     __u8 nexthdr = 0;
     __u8 deny_nexthdr = ip6h->nexthdr;
-    if (!resolve_ipv6_l4(ip6h, data_end, &l4, &nexthdr, &deny_nexthdr)) {
+    struct ipv6_frag_info frag = {};
+    int l4_result = resolve_ipv6_l4(ip6h, data_end, &l4, &nexthdr, &deny_nexthdr, &frag);
+    if (l4_result == IPV6_L4_LATER_FRAGMENT)
+        return ipv6_later_fragment_verdict(ctx, ip6h, &frag, total_len);
+    if (l4_result != IPV6_L4_RESOLVED) {
         // Fixed header is valid, so saddr/daddr ARE readable. Emit a DENY with
         // real addresses before DROP so unsupported/truncated extension chains
         // and fragments are visible. Ports stay 0 because no trustworthy L4
@@ -887,6 +1087,15 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
         // parsing (Fragment/ESP/unknown/etc.).
         if (should_emit_deny_event())
             submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, deny_nexthdr, total_len);
+        return XDP_DROP;
+    }
+
+    // Fragment-aware admission state is TCP/UDP-only. ICMPv6 fragments remain
+    // fail-closed because the later fragments carry no type/code context and the
+    // ICMPv6 branch has deliberately different control-plane exceptions.
+    if (frag.present && nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP) {
+        if (should_emit_deny_event())
+            submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, 0, 0, nexthdr, total_len);
         return XDP_DROP;
     }
 
@@ -1021,16 +1230,21 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
     ct_key.nexthdr = nexthdr;
     ct_key.flags = CT_DIR_INGRESS;
 
+    // Conntrack hit counters are best-effort traffic counters: fragmented hits
+    // refresh them before fail-closed frag_state_v6 insertion can reject this packet.
     struct conn_value *existing_val = bpf_map_lookup_elem(&conn_track_v6, &ct_key);
     if (existing_val) {
         if (check_conn_expiry(existing_val)) {
             bpf_map_delete_elem(&conn_track_v6, &ct_key);
             return XDP_DROP;
         }
+        __u64 existing_expire_time = conn_value_expire_time(existing_val);
         struct conn_value new_val = *existing_val;
         new_val.tx_packets++;
         new_val.last_timestamp = bpf_ktime_get_ns();
         bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_EXIST);
+        if (populate_ipv6_fragment_state(&frag, ip6h, nexthdr, sport, dport, existing_expire_time) != 0)
+            return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
         return XDP_PASS;
     }
     reverseTuple_v6(&ct_key);
@@ -1041,11 +1255,14 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
             reverseTuple_v6(&ct_key);
             return XDP_DROP;
         }
+        __u64 existing_expire_time = conn_value_expire_time(existing_val);
         struct conn_value new_val = *existing_val;
         new_val.rx_packets++;
         new_val.last_timestamp = bpf_ktime_get_ns();
         bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_EXIST);
         reverseTuple_v6(&ct_key);
+        if (populate_ipv6_fragment_state(&frag, ip6h, nexthdr, sport, dport, existing_expire_time) != 0)
+            return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
         return XDP_PASS;
     }
     reverseTuple_v6(&ct_key);   // restore forward tuple for conntrack population
@@ -1071,7 +1288,6 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (w_val->allowed == 1) {
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -1081,7 +1297,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                     .rx_packets = 1,
                     .tx_packets = 0,
                 };
-                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, w_val->expire_time) != 0)
+                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 return XDP_PASS;
             }
         }
@@ -1100,7 +1318,6 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (sd_val->allowed == 1) {
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -1110,7 +1327,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                     .rx_packets = 1,
                     .tx_packets = 0,
                 };
-                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, sd_val->expire_time) != 0)
+                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 return XDP_PASS;
             }
         }
@@ -1129,7 +1348,6 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (sp_val->allowed == 1) {
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -1139,7 +1357,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                     .rx_packets = 1,
                     .tx_packets = 0,
                 };
-                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, sp_val->expire_time) != 0)
+                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 return XDP_PASS;
             }
         }
@@ -1159,7 +1379,6 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (pl_val->allowed == 1) {
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -1169,7 +1388,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                     .rx_packets = 1,
                     .tx_packets = 0,
                 };
-                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, pl_val->expire_time) != 0)
+                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 return XDP_PASS;
             }
         }
@@ -1190,7 +1411,6 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (pp_val->allowed == 1) {
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 struct conn_value new_val = {
                     .timestamp = bpf_ktime_get_ns(),
                     .last_timestamp = bpf_ktime_get_ns(),
@@ -1200,7 +1420,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                     .rx_packets = 1,
                     .tx_packets = 0,
                 };
-                bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_ANY);
+                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, pp_val->expire_time) != 0)
+                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
+                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
                 return XDP_PASS;
             }
         }
@@ -1404,7 +1626,6 @@ static __always_inline int xdp_white_prog(struct xdp_md *ctx) {
         .min_port = MIN_PORT,
         .max_port = MAX_PORT
     };
-    __u16 dst_port = bpf_ntohs(ct_key.dport);
 
     struct protocol_port_key pp_key = {
         .dst_port = ct_key.dport,

@@ -44,7 +44,20 @@ proof; #2945 owns the future flip-time revalidation/hold obligations.
       AC AMI, running kernel, AC instance architecture, eBPF source, or pinned
       eBPF toolchain changes after the evidence above, re-run `make test-ebpf`
       or an equivalent load + `BPF_PROG_TEST_RUN` proof on the new floor before
-      flipping v6 XDP.
+      flipping v6 XDP. For the #2865 fragment-state work, also verify the new
+      AC binary loads and pins the XDP object before the sampler runs:
+      `/sys/fs/bpf/frag_state_v6` must be pinned alongside `conn_track_v6`, and
+      the `EbpfFragStateV6*` usage/reap metrics must publish under EBPFXDP.
+      A new sampler against an old object with no `frag_state_v6` pin is a
+      failed flip state and should hold/roll back instead of being treated as a
+      mixed-rollout success. Confirm
+      `${name_prefix}-ac-ebpf-frag-state-v6-usage-high` is present before
+      relying on v6 XDP for fragmented-flow admission, and record the committed
+      XDP object's load-relevant hash (this PR regenerated
+      `764ab9baae061725cc7a2742891ad8f028c5c0a1b4a4d2f42dd6d4ea0f929da8`).
+      During flip watch, tell on-call that later-fragment DENYs can be benign
+      fail-closed reordering and explicitly confirm no in-scope
+      UDP-over-fragmented-IPv6 path depends on out-of-order fragment buffering.
 - [ ] Rollback/hold (tracked by #2945): if the min-kernel proof rejects
       `resolve_ipv6_l4` / `xdp_white_prog_v6`, keep prod v6 XDP gated and leave
       prod on `FilterMode=IPTABLES` until the helper is adjusted and this proof

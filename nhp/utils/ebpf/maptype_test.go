@@ -112,6 +112,7 @@ func TestXdpSource_AdmissionMapsAndConnTrackAreHash(t *testing.T) {
 		"port_list_v6":   "BPF_MAP_TYPE_HASH",
 		"conn_track":     "BPF_MAP_TYPE_HASH",
 		"conn_track_v6":  "BPF_MAP_TYPE_HASH",
+		"frag_state_v6":  "BPF_MAP_TYPE_HASH",
 	}
 
 	for name, wantType := range want {
