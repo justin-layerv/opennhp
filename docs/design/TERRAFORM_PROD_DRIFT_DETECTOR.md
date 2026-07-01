@@ -282,6 +282,48 @@ expected exit codes; the same suite runs in CI under
   merge once `Terraform Prod-Drift Lint (PR)` is listed in the
   `main` branch protection required-checks. Tracked as #1425.
 
+## Update: resource-create coverage (#2996)
+
+Class A was always defined as "a consumer — data source **or resource** —
+that requires an IAM action the apply role does not have" (see *Failure
+classes*), but the original detector only walked `data` blocks. #2996 hit
+the resource half: `aws_cloudwatch_composite_alarm` needs
+`cloudwatch:PutCompositeAlarm`, a distinct action from the
+`cloudwatch:PutMetricAlarm` the apply role already granted. PR-time
+`terraform plan` runs under the read-only plan role and never calls the
+write API, so the gap was invisible until the post-merge `terraform apply`
+turned `main` red — the same "green at PR, red at apply" signature as
+#1323, one step later in the lifecycle.
+
+`check-terraform-iam-coverage.py` now walks `resource "aws_*"` blocks too,
+against `RESOURCE_ACTIONS`. The design deliberately differs from the
+data-source half in one respect: the resource map is **not** seeded
+exhaustively. The tree has ~130 resource types vs. ~17 data-source types,
+and hand-deriving provider-accurate create/update/delete action sets for
+all 130 up front would be error-prone and mostly redundant (every type is
+already exercised by a passing apply). So:
+
+- `RESOURCE_ACTIONS` maps the types we choose to action-check — seeded
+  with the CloudWatch alarm/dashboard family (the #2996 incident domain
+  and its siblings).
+- `RESOURCE_UNCHECKED_ACK` grandfathers every other resource type present
+  when the half shipped: an explicit, reviewed allowlist that is skipped,
+  with a standing burn-down to migrate entries into `RESOURCE_ACTIONS`.
+- A resource type in **neither** set is **fail-closed** (exit 2),
+  preserving the "no silent passthrough" posture for genuinely new types.
+  A new resource type in a PR forces a map-or-grandfather decision — the
+  #2996 catch, one merge earlier.
+
+This trades the data-source half's complete-coverage guarantee for
+tractability. The resource half catches (a) regressions on mapped types
+and (b) any brand-new resource type; it does **not** catch a new action
+requirement on an already-grandfathered type until that type is burned
+down into `RESOURCE_ACTIONS`. That residual is the acknowledged cost of
+not hand-mapping 130 types on day one. Regression fixtures:
+`resource-iam-gap-2996` (mapped type, missing action → exit 1),
+`unmapped-resource` (type in neither set → exit 2), `resource-alarm-covered`
+(mapped + fully granted → exit 0).
+
 ## Acceptance / done criteria (from #1324)
 
 - [x] Design doc in `docs/design/` comparing the four candidates.

@@ -1,19 +1,36 @@
 #!/usr/bin/env python3
 """check-terraform-iam-coverage.py
 
-Class-A drift detector (#1324). Asserts every `data "aws_*"` block in the
+Class-A drift detector (#1324). Asserts that every IAM-consuming block in the
 terraform configuration has matching IAM actions granted somewhere in the
-`aws_iam_role.github_actions` role's policy set.
+`aws_iam_role.github_actions` role's policy set. Two consumer kinds:
+
+- `data "aws_*"` blocks — the *read* actions `terraform plan`'s refresh
+  calls. Checked against DATA_SOURCE_ACTIONS (fail-closed on unmapped).
+- `resource "aws_*"` blocks — the *write* actions `terraform apply`'s
+  create/update/destroy calls. Checked against RESOURCE_ACTIONS, with
+  RESOURCE_UNCHECKED_ACK grandfathering the not-yet-mapped remainder
+  (fail-closed on any type in neither set).
 
 Why this exists
 ===============
 
-#1323: `data "aws_cloudformation_stack" "website_api"` was added to
-`terraform/main.tf` and gated on a prod-only tfvar. Sandbox `terraform plan`
-never refreshed the data source (count = 0), so the missing
+#1323 (data-source half): `data "aws_cloudformation_stack" "website_api"` was
+added to `terraform/main.tf` and gated on a prod-only tfvar. Sandbox
+`terraform plan` never refreshed the data source (count = 0), so the missing
 `cloudformation:DescribeStacks` + `cloudformation:GetTemplate` grants on
 `nhp-prod-github-actions` were invisible until prod-promote tried the
-refresh. This lint catches the same class statically — at PR time, no AWS
+refresh.
+
+#2996 (resource half): `aws_cloudwatch_composite_alarm` was added needing
+`cloudwatch:PutCompositeAlarm` — a distinct action from the
+`cloudwatch:PutMetricAlarm` the apply role already granted. The PR-time
+`terraform plan` runs under a read-only role and never calls the write API,
+so the gap was invisible until the post-merge `terraform apply` hit
+`AccessDenied: PutCompositeAlarm` and turned `main` red. The resource-side
+map closes this class.
+
+Both halves catch the same failure statically — at PR time, no AWS
 credentials needed (#1121's privesc gate stays closed).
 
 What it does NOT check
@@ -28,8 +45,14 @@ What it does NOT check
   failure mode is "no grant anywhere in source" — which the union check
   catches.
 - Resource-ARN scope. The lint only checks action names, not whether the
-  Resource glob covers the data source's target. Tightening this is
-  follow-up work.
+  Resource glob covers the consumer's target — a green check is necessary
+  but not sufficient for a clean apply (a scoped-down Resource can still
+  deny with the verb present).
+- `count`/`for_each` gating. Consumers are checked as a union regardless of
+  gating, so a mapped resource that is `count = 0` in every environment
+  still demands its grants exist. This errs toward requiring grants (safe
+  direction) and matches the data-source union behavior above; a mapped
+  type added purely as dead/conditional code could produce a false red.
 
 See `docs/runbooks/terraform-prod-drift.md` for what to do when this fires.
 """
@@ -84,7 +107,10 @@ from _tf_lint_lib import (  # noqa: E402  # pyright: ignore[reportMissingImports
 # unauthenticated (aws_ip_ranges hits a public S3 URL), or the action is
 # implicitly allowed for every authenticated principal
 # (sts:GetCallerIdentity).
-DataSourceActions = list[str] | Callable[[dict[str, Any]], list[str]]
+#
+# `ActionSpec` is the map-value shape shared by DATA_SOURCE_ACTIONS and
+# RESOURCE_ACTIONS: a static action list, or a body-aware callable.
+ActionSpec = list[str] | Callable[[dict[str, Any]], list[str]]
 
 
 def _route53_zone_actions(body: dict[str, Any]) -> list[str]:
@@ -98,7 +124,7 @@ def _route53_zone_actions(body: dict[str, Any]) -> list[str]:
     return actions
 
 
-DATA_SOURCE_ACTIONS: dict[str, DataSourceActions] = {
+DATA_SOURCE_ACTIONS: dict[str, ActionSpec] = {
     # No-grant data sources -------------------------------------------
     # internal/service/iam/policy_document_data_source.go — no API call.
     "aws_iam_policy_document": [],
@@ -165,6 +191,275 @@ DATA_SOURCE_ACTIONS: dict[str, DataSourceActions] = {
     # kms:Get* which covers this via IAM glob.
     "aws_kms_public_key": ["kms:GetPublicKey"],
 }
+
+
+# Map of `resource "aws_<type>"` -> IAM actions the CI apply role needs to
+# create/update/delete it. Same two value shapes as DATA_SOURCE_ACTIONS
+# (static `list[str]` or body-aware `Callable[[dict], list[str]]`).
+#
+# Class A (#1324) is defined as "a consumer — data source OR RESOURCE —
+# that requires an IAM action the apply role does not have." The
+# data-source half shipped first; this is the resource half, added after
+# #2996: `aws_cloudwatch_composite_alarm` needs `cloudwatch:PutCompositeAlarm`
+# — a DISTINCT action from the `cloudwatch:PutMetricAlarm` the apply role
+# already had — so `terraform plan` (read-only role) was green while the
+# post-merge `apply` hit `AccessDenied: PutCompositeAlarm`.
+#
+# Unlike DATA_SOURCE_ACTIONS, this map does NOT enumerate every resource
+# type in the tree (there are ~130). It maps the types we've chosen to
+# action-check; the rest are grandfathered in RESOURCE_UNCHECKED_ACK
+# below, and any type in NEITHER set is fail-closed. Burn the grandfather
+# set down by moving entries here over time.
+#
+# When adding an entry: read the terraform-aws-provider service package
+# for the type, list the create/update/delete (and tag) API calls its
+# CRUD functions make, and translate to IAM action names — same
+# convention as DATA_SOURCE_ACTIONS, each entry citing its provider
+# source file. Over-listing a read/tag action the apply role covers via a
+# broad `Describe*`/`List*`/`Get*` grant is harmless (glob-matched); the
+# load-bearing entries are the mutating `Put*`/`Delete*`/`Create*` verbs
+# the least-privilege apply policy enumerates explicitly. Under-listing a
+# mutating verb is the only real risk (a passing apply surfaces it) — the
+# action sets are hand-derived and unversioned against the provider, so
+# re-check the mapped families on a terraform-aws-provider major bump; the
+# per-entry source citations make that tractable.
+
+# Tag actions are listed UNCONDITIONALLY for taggable types — not gated on
+# an explicit `tags` block. Every `provider "aws"` in
+# terraform/environments/{prod,sandbox}/backend.tf sets `default_tags`, so
+# the provider tags every taggable resource at apply and reads tags on
+# every refresh (to populate `tags_all`) even when the HCL omits `tags`. A
+# `if "tags" in body` conditional would therefore under-require the tag
+# trio for an untagged alarm and re-open the green-at-PR / red-at-apply gap
+# this lint exists to close — narrower, but the same class. That's why
+# these are static lists, not body-aware callables like the data-source
+# `_route53_zone_actions` (whose `tags` is a read-time *filter arg*, a
+# different semantic from resource tagging under default_tags). The
+# `resource-metric-alarm-tag-gap` fixture fences the regression: an
+# *untagged* alarm whose apply role lacks a tag verb must still flag.
+RESOURCE_ACTIONS: dict[str, ActionSpec] = {
+    # internal/service/cloudwatch/metric_alarm.go — PutMetricAlarm on
+    # create/update, DescribeAlarms on read, DeleteAlarms on destroy, and
+    # the tag trio (ListTagsForResource read + TagResource/UntagResource)
+    # exercised via default_tags. The composite alarm's sibling; mapped
+    # together so the whole alarm family is covered, not just the subtype
+    # that bit us in #2996.
+    "aws_cloudwatch_metric_alarm": [
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:DeleteAlarms",
+        "cloudwatch:ListTagsForResource",
+        "cloudwatch:TagResource",
+        "cloudwatch:UntagResource",
+    ],
+    # internal/service/cloudwatch/composite_alarm.go — PutCompositeAlarm on
+    # create/update (DISTINCT from PutMetricAlarm — the exact #2996 gap),
+    # DescribeAlarms on read, DeleteAlarms on destroy (there is no separate
+    # DeleteCompositeAlarms action; DeleteAlarms deletes both kinds), tag
+    # trio via default_tags. The regression this extension exists to catch.
+    "aws_cloudwatch_composite_alarm": [
+        "cloudwatch:PutCompositeAlarm",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:DeleteAlarms",
+        "cloudwatch:ListTagsForResource",
+        "cloudwatch:TagResource",
+        "cloudwatch:UntagResource",
+    ],
+    # internal/service/cloudwatch/dashboard.go: PutDashboard on
+    # create/update, GetDashboard on read, DeleteDashboards on destroy.
+    # CloudWatch dashboards are not taggable, so no tag actions.
+    "aws_cloudwatch_dashboard": [
+        "cloudwatch:PutDashboard",
+        "cloudwatch:GetDashboard",
+        "cloudwatch:DeleteDashboards",
+    ],
+}
+
+# Grandfathered resource types: present in `terraform/` when resource-create
+# coverage was added, but not yet action-mapped in RESOURCE_ACTIONS. The
+# coverage check SKIPS these — the
+# apply role already carries whatever their CRUD needs (every one is
+# exercised by a passing apply today), so re-deriving and asserting their
+# action sets is burn-down work, not a live gap.
+#
+# What makes this safe (and NOT the silent-passthrough the data-source
+# lint was built to kill): a resource type in NEITHER RESOURCE_ACTIONS NOR
+# this set is FAIL-CLOSED (exit 2). A genuinely new resource type added in
+# a PR forces an explicit, reviewed decision — map its actions
+# (RESOURCE_ACTIONS) or grandfather it here — which is the #2996-class
+# catch, one PR before apply. This is an explicit allowlist, not a
+# per-line escape hatch.
+#
+# Burn down by moving entries into RESOURCE_ACTIONS, highest-value first:
+# the write-heavy services whose action sets are non-obvious and
+# least-privilege-enumerated (events:, lambda:, sqs:, dynamodb:, sns:,
+# iam:). Tracked in #2998.
+#
+# This set is PROD-DERIVED — the resource types in `terraform/` only.
+# Fixture-only scaffolding types live in `_FIXTURE_SCAFFOLD_ACK` below,
+# kept separate so (a) this set regenerates cleanly from `terraform/` alone
+# and (b) the fixture-only fail-closed erosion stays explicit, not buried
+# here. A type later removed from `terraform/` leaves a stale entry —
+# harmless, since a type absent from the scanned tree is never iterated, so
+# no lockstep-drift gate guards this set.
+#
+# Regenerate (resource types in terraform/, minus the mapped keys above):
+#   grep -rhoE 'resource[[:space:]]+"aws_[a-z0-9_]+"' terraform \
+#     --include='*.tf' | grep -oE 'aws_[a-z0-9_]+' | sort -u
+RESOURCE_UNCHECKED_ACK: frozenset[str] = frozenset({
+    "aws_acm_certificate",
+    "aws_acm_certificate_validation",
+    "aws_api_gateway_account",
+    "aws_apigatewayv2_api",
+    "aws_apigatewayv2_api_mapping",
+    "aws_apigatewayv2_authorizer",
+    "aws_apigatewayv2_domain_name",
+    "aws_apigatewayv2_integration",
+    "aws_apigatewayv2_route",
+    "aws_apigatewayv2_stage",
+    "aws_appautoscaling_policy",
+    "aws_appautoscaling_target",
+    "aws_athena_workgroup",
+    "aws_autoscaling_attachment",
+    "aws_autoscaling_group",
+    "aws_autoscaling_lifecycle_hook",
+    "aws_autoscaling_policy",
+    "aws_bcmdataexports_export",
+    "aws_ce_cost_allocation_tag",
+    "aws_chatbot_slack_channel_configuration",
+    "aws_cloudfront_cache_policy",
+    "aws_cloudfront_distribution",
+    "aws_cloudfront_function",
+    "aws_cloudfront_monitoring_subscription",
+    "aws_cloudfront_origin_access_control",
+    "aws_cloudfront_response_headers_policy",
+    "aws_cloudtrail",
+    "aws_cloudwatch_event_rule",
+    "aws_cloudwatch_event_target",
+    "aws_cloudwatch_log_delivery",
+    "aws_cloudwatch_log_delivery_destination",
+    "aws_cloudwatch_log_delivery_source",
+    "aws_cloudwatch_log_group",
+    "aws_cloudwatch_log_metric_filter",
+    "aws_config_config_rule",
+    "aws_config_configuration_recorder",
+    "aws_config_configuration_recorder_status",
+    "aws_config_delivery_channel",
+    "aws_dynamodb_table",
+    "aws_dynamodb_table_item",
+    "aws_ecr_lifecycle_policy",
+    "aws_ecr_registry_policy",
+    "aws_ecr_replication_configuration",
+    "aws_ecr_repository",
+    "aws_ecr_repository_policy",
+    "aws_ecs_cluster",
+    "aws_ecs_service",
+    "aws_ecs_task_definition",
+    "aws_efs_access_point",
+    "aws_efs_backup_policy",
+    "aws_efs_file_system",
+    "aws_efs_mount_target",
+    "aws_eip",
+    "aws_elasticache_serverless_cache",
+    "aws_elasticache_subnet_group",
+    "aws_flow_log",
+    "aws_glue_catalog_database",
+    "aws_glue_catalog_table",
+    "aws_guardduty_detector",
+    "aws_guardduty_detector_feature",
+    "aws_iam_access_key",
+    "aws_iam_account_password_policy",
+    "aws_iam_instance_profile",
+    "aws_iam_openid_connect_provider",
+    "aws_iam_policy",
+    "aws_iam_role",
+    "aws_iam_role_policy",
+    "aws_iam_role_policy_attachment",
+    "aws_iam_user",
+    "aws_iam_user_policy",
+    "aws_internet_gateway",
+    "aws_kms_alias",
+    "aws_kms_key",
+    "aws_lambda_event_source_mapping",
+    "aws_lambda_function",
+    "aws_lambda_function_event_invoke_config",
+    "aws_lambda_function_url",
+    "aws_lambda_invocation",
+    "aws_lambda_layer_version",
+    "aws_lambda_permission",
+    "aws_launch_template",
+    "aws_lb",
+    "aws_lb_listener",
+    "aws_lb_listener_rule",
+    "aws_lb_target_group",
+    "aws_nat_gateway",
+    "aws_network_acl",
+    "aws_route53_record",
+    "aws_route53_zone",
+    "aws_route_table",
+    "aws_route_table_association",
+    "aws_s3_bucket",
+    "aws_s3_bucket_acl",
+    "aws_s3_bucket_lifecycle_configuration",
+    "aws_s3_bucket_ownership_controls",
+    "aws_s3_bucket_policy",
+    "aws_s3_bucket_public_access_block",
+    "aws_s3_bucket_server_side_encryption_configuration",
+    "aws_s3_bucket_versioning",
+    "aws_s3_object",
+    "aws_secretsmanager_secret",
+    "aws_secretsmanager_secret_rotation",
+    "aws_secretsmanager_secret_version",
+    "aws_security_group",
+    "aws_security_group_rule",
+    "aws_securityhub_account",
+    "aws_securityhub_product_subscription",
+    "aws_securityhub_standards_subscription",
+    "aws_service_discovery_private_dns_namespace",
+    "aws_service_discovery_service",
+    "aws_sfn_state_machine",
+    "aws_sns_topic",
+    "aws_sns_topic_policy",
+    "aws_sns_topic_subscription",
+    "aws_sqs_queue",
+    "aws_sqs_queue_redrive_policy",
+    "aws_ssm_association",
+    "aws_ssm_document",
+    "aws_ssm_parameter",
+    "aws_subnet",
+    "aws_vpc",
+    "aws_vpc_endpoint",
+    "aws_vpc_security_group_egress_rule",
+    "aws_vpc_security_group_ingress_rule",
+    "aws_wafv2_web_acl",
+    "aws_wafv2_web_acl_association",
+    "aws_wafv2_web_acl_logging_configuration",
+})
+
+# IAM-management resource types used ONLY by this lint's own fixtures (to
+# exercise role-attribution / attachment shapes) and NOT present in the
+# real `terraform/` tree. Grandfathered so those fixtures don't trip the
+# resource fail-closed, but kept OUT of the prod-derived
+# RESOURCE_UNCHECKED_ACK above.
+#
+# TRADEOFF (cr #2997): the lint can't tell a fixture scan from a real-tree
+# scan, so these are grandfathered on every scan. Today that only bites
+# during fixture runs — the CI scan roots at `terraform/`, where none of
+# these types are present, so nothing is actually skipped there. The
+# erosion only becomes real if one is later ADDED to production needing a
+# new IAM action, at which point the check won't force the
+# map-or-grandfather decision. Accepted as low risk: they're IAM-management
+# types unlikely to land in the NHP tree, and the apply role's `iam:` grants
+# are broad. If one does move to production, delete it here and let the
+# fail-closed force the decision (or map it in RESOURCE_ACTIONS).
+_FIXTURE_SCAFFOLD_ACK: frozenset[str] = frozenset({
+    "aws_iam_group",
+    "aws_iam_group_policy",
+    "aws_iam_policy_attachment",
+    "aws_iam_role_policies_exclusive",
+    "aws_iam_role_policy_attachments_exclusive",
+})
+
 
 # The canonical `nhp-${env}-github-actions` role is declared in
 # `terraform/modules/ecr/main.tf`. Other modules (e.g.
@@ -519,11 +814,79 @@ def action_allowed(required: str, allowed: Iterable[str]) -> bool:
     return False
 
 
+def _required_actions(
+    entry: ActionSpec, body: Any
+) -> list[str]:
+    """Resolve a DATA_SOURCE_ACTIONS / RESOURCE_ACTIONS map value to a
+    concrete action list.
+
+    A static `list[str]` entry passes through; a body-aware `Callable`
+    entry is invoked with `body`, coerced to `{}` when it isn't a dict.
+    The coercion matters for the resource side: `iter_resources` (unlike
+    `iter_data_sources`) doesn't coerce a malformed block's body, so a
+    callable that indexes `body` would otherwise crash. `_check_consumer_type`
+    calls this for every consumer (data source or resource), so the callable
+    path has a single implementation to test.
+    """
+    if callable(entry):
+        return entry(body if isinstance(body, dict) else {})
+    return list(entry)
+
+
+def _check_consumer_type(
+    consumers: list[tuple[Path, str, str, Any]],
+    action_map: dict[str, ActionSpec],
+    unchecked_ack: frozenset[str] | None,
+    role_actions: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Check one class of `aws_*` consumers against its action map.
+
+    Data sources and resources share this: for each consumer whose type is
+    in `action_map`, `_required_actions` resolves the required actions and
+    each is checked against `role_actions`; a gap lands in `findings`. A
+    type NOT in the map is `unmapped` (fail-closed) — UNLESS `unchecked_ack`
+    lists it, in which case it's grandfathered (skipped).
+
+    The grandfather tier is the only thing that differs between the two
+    consumer classes, and it's pure data: data sources pass
+    `unchecked_ack=None` (every unmapped type fails closed); resources pass
+    the grandfather set (RESOURCE_UNCHECKED_ACK + the fixture-scaffold set).
+    Returns `(findings, unmapped)`.
+    """
+    findings: list[dict[str, Any]] = []
+    unmapped: list[dict[str, Any]] = []
+    for file, ctype, name, body in consumers:
+        if not ctype.startswith("aws_"):
+            continue
+        if ctype in action_map:
+            required = _required_actions(action_map[ctype], body)
+            missing = [a for a in required if not action_allowed(a, role_actions)]
+            if missing:
+                findings.append(
+                    {
+                        "file": str(file),
+                        "type": ctype,
+                        "name": name,
+                        "missing_actions": missing,
+                    }
+                )
+        elif unchecked_ack is not None and ctype in unchecked_ack:
+            # Grandfathered — the apply role already covers its CRUD; the
+            # action set just isn't re-derived here yet. Skip, don't flag.
+            continue
+        else:
+            # Fail-closed: a type in no map. For resources this is the
+            # #2996-class catch; for data sources the #1323-class catch.
+            unmapped.append({"file": str(file), "type": ctype, "name": name})
+    return findings, unmapped
+
+
 def main() -> int:
     epilog = (
-        "Exit codes: 0 = clean; 1 = at least one data source missing required "
-        "actions; 2 = at least one data source has a type not in "
-        "DATA_SOURCE_ACTIONS (fail-closed — add the entry in the same PR); "
+        "Exit codes: 0 = clean; 1 = a data source or resource is missing a "
+        "required action; 2 = a data source type is not in DATA_SOURCE_ACTIONS, "
+        "or a resource type is in neither RESOURCE_ACTIONS nor "
+        "RESOURCE_UNCHECKED_ACK (fail-closed — add the entry in the same PR); "
         "3 = internal error."
     )
     ap = argparse.ArgumentParser(epilog=epilog)
@@ -538,6 +901,23 @@ def main() -> int:
         help="Emit findings as JSON instead of human-readable text.",
     )
     args = ap.parse_args()
+
+    # The grandfather set the resource check consults: prod-derived types
+    # plus the fixture-only scaffolding types.
+    grandfathered = RESOURCE_UNCHECKED_ACK | _FIXTURE_SCAFFOLD_ACK
+    # A resource type must be either action-checked (RESOURCE_ACTIONS) or
+    # grandfathered, never both — an entry in both lets the grandfather skip
+    # shadow the action check. Fail fast with exit 3 (internal error) rather
+    # than silently preferring one.
+    overlap = set(RESOURCE_ACTIONS) & grandfathered
+    if overlap:
+        error(
+            f"resource type(s) appear in BOTH RESOURCE_ACTIONS and the "
+            f"grandfather set (RESOURCE_UNCHECKED_ACK / _FIXTURE_SCAFFOLD_ACK): "
+            f"{', '.join(sorted(overlap))}. Remove them from the grandfather "
+            f"set — a mapped type is not grandfathered."
+        )
+        return 3
 
     root = Path(args.terraform_root)
     if not root.is_dir():
@@ -558,57 +938,48 @@ def main() -> int:
     # (load-bearing fail-loud). Better: detect the empty-attribution case
     # specifically and surface the coupling, so the next maintainer doesn't
     # have to reverse-engineer the failure cascade.
-    # Cache the data-source list: `iter_data_sources` is a generator,
-    # and the empty-attribution diagnostic + the findings loop both
-    # walk it. Materializing once means the parse tree is walked once
-    # instead of twice — negligible perf today, code hygiene for when
-    # the tree grows.
+    # Cache the data-source and resource lists: `iter_*` are generators,
+    # and the empty-attribution diagnostic + the findings loops each walk
+    # them. Materializing once means the parse tree is walked once instead
+    # of twice — negligible perf today, code hygiene for when the tree
+    # grows.
     data_sources = list(iter_data_sources(parsed))
-    has_data_sources = any(
+    resources = list(iter_resources(parsed))
+    # Only *mapped* consumers need a grant, so only they can distinguish a
+    # genuine empty-attribution (canonical role module path drifted) from
+    # a legitimately grant-free tree. Unmapped/grandfathered blocks don't
+    # require role_actions, so they can't feed this diagnostic.
+    has_grant_needing_consumer = any(
         dtype.startswith("aws_") and DATA_SOURCE_ACTIONS.get(dtype)
         for _, dtype, _, _ in data_sources
-    )
-    if has_data_sources and not role_actions:
+    ) or any(rtype in RESOURCE_ACTIONS for _, rtype, _, _ in resources)
+    if has_grant_needing_consumer and not role_actions:
         error(
             "collect_role_actions returned an empty action set, but the "
-            "terraform tree contains data sources that require IAM "
-            "grants. The canonical role's module path may have moved "
-            "from `terraform/modules/ecr/` — update "
+            "terraform tree contains data sources or resources that "
+            "require IAM grants. The canonical role's module path may have "
+            "moved from `terraform/modules/ecr/` — update "
             "`CANONICAL_ROLE_MODULE_PATH` in "
             ".github/scripts/check-terraform-iam-coverage.py."
         )
         return 3
 
-    findings: list[dict[str, Any]] = []
-    unmapped: list[dict[str, Any]] = []
-
-    for file, dtype, name, body in data_sources:
-        if not dtype.startswith("aws_"):
-            continue
-        if dtype not in DATA_SOURCE_ACTIONS:
-            unmapped.append({"file": str(file), "type": dtype, "name": name})
-            continue
-        # Each entry is either a static `list[str]` or a body-aware
-        # `Callable[[dict], list[str]]`. Dispatch in one place so
-        # adding a new body-aware data source doesn't grow this loop.
-        entry = DATA_SOURCE_ACTIONS[dtype]
-        required = entry(body) if callable(entry) else list(entry)
-        missing = [a for a in required if not action_allowed(a, role_actions)]
-        if missing:
-            findings.append(
-                {
-                    "file": str(file),
-                    "type": dtype,
-                    "name": name,
-                    "missing_actions": missing,
-                }
-            )
+    # Data sources have no grandfather tier (unchecked_ack=None → every
+    # unmapped type fails closed); resources pass the grandfather set.
+    findings, unmapped = _check_consumer_type(
+        data_sources, DATA_SOURCE_ACTIONS, None, role_actions
+    )
+    resource_findings, resource_unmapped = _check_consumer_type(
+        resources, RESOURCE_ACTIONS, grandfathered, role_actions
+    )
 
     if args.json:
         json.dump(
             {
                 "findings": findings,
                 "unmapped": unmapped,
+                "resource_findings": resource_findings,
+                "resource_unmapped": resource_unmapped,
                 "role_actions": sorted(role_actions),
             },
             sys.stdout,
@@ -617,10 +988,9 @@ def main() -> int:
         sys.stdout.write("\n")
     else:
         # Pin unmapped errors to the lint script (the file that needs the new
-        # entry), not to the .tf file containing the data source — the .tf
-        # is fine, the lint just doesn't know about that data source type.
-        # The path to .tf + data source name is in the message body so the
-        # author knows where the use site is.
+        # entry), not to the .tf file containing the block — the .tf is
+        # fine, the lint just doesn't know about that type. The .tf path +
+        # block name is in the message body so the author knows the use site.
         lint_script = Path(".github/scripts/check-terraform-iam-coverage.py")
         for u in unmapped:
             error(
@@ -628,6 +998,20 @@ def main() -> int:
                 f"{u['file']}) is not in DATA_SOURCE_ACTIONS — add an "
                 f"entry with the IAM actions terraform-aws-provider's "
                 f"read function calls.",
+                file=lint_script,
+            )
+        for u in resource_unmapped:
+            error(
+                f"resource `{u['type']}.{u['name']}` (declared at "
+                f"{u['file']}) is in neither RESOURCE_ACTIONS nor "
+                f"RESOURCE_UNCHECKED_ACK. Either map it in RESOURCE_ACTIONS "
+                f"(with the IAM actions its create/update/delete calls make) "
+                f"or grandfather it in RESOURCE_UNCHECKED_ACK — but ONLY "
+                f"after confirming the apply role already covers its CRUD "
+                f"(e.g. this type already applies cleanly elsewhere in the "
+                f"tree). An unverified grandfather claim silently re-opens "
+                f"the exact gap this check exists to close. Same PR, "
+                f"fail-closed.",
                 file=lint_script,
             )
         for f in findings:
@@ -640,18 +1024,31 @@ def main() -> int:
                 f"least-privilege ARN scoping manually.",
                 file=Path(f["file"]),
             )
-        if findings or unmapped:
+        for f in resource_findings:
+            error(
+                f"resource `{f['type']}.{f['name']}` requires IAM action(s) "
+                f"not granted to `aws_iam_role.github_actions`: "
+                f"{', '.join(f['missing_actions'])}. The apply role can't "
+                f"create/update/destroy it — extend the `terraform_apply_*` "
+                f"policy in terraform/modules/ecr/main.tf. NOTE: this lint "
+                f"does not verify Resource scope — apply least-privilege ARN "
+                f"scoping manually.",
+                file=Path(f["file"]),
+            )
+        total_gaps = len(findings) + len(resource_findings)
+        total_unmapped = len(unmapped) + len(resource_unmapped)
+        if total_gaps or total_unmapped:
             print(
-                f"\nterraform IAM coverage check: FAILED ({len(findings)} gap(s), "
-                f"{len(unmapped)} unmapped)",
+                f"\nterraform IAM coverage check: FAILED "
+                f"({total_gaps} gap(s), {total_unmapped} unmapped)",
                 file=sys.stderr,
             )
         else:
             print("terraform IAM coverage check: OK")
 
-    if unmapped:
+    if unmapped or resource_unmapped:
         return 2
-    if findings:
+    if findings or resource_findings:
         return 1
     return 0
 

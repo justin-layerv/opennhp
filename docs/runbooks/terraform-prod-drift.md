@@ -45,6 +45,14 @@ required IAM actions in `DATA_SOURCE_ACTIONS` (a curated map in
 union of policies attached to `aws_iam_role.github_actions` allows
 each action via direct match or wildcard.
 
+For every `resource "aws_*"` block it does the same against
+`RESOURCE_ACTIONS`, but only for the resource types mapped there.
+Types in `RESOURCE_UNCHECKED_ACK` are grandfathered (skipped); a type
+in neither map is fail-closed (see "Unmapped resource" below). This
+half exists because #2996's `aws_cloudwatch_composite_alarm` needed
+`cloudwatch:PutCompositeAlarm` — a write action the read-only PR plan
+never exercises, so the gap only surfaced at the post-merge apply.
+
 ### Action
 
 1. **Add the missing grant.** Most github_actions role policies live
@@ -106,12 +114,70 @@ without an IAM grant". If the map silently passed unknown data sources,
 the next #1323-class slip would land. The added one-line cost on every
 new data source is the price.
 
+## Resource coverage finding
+
+Format:
+
+```
+resource `aws_<type>.<name>` requires IAM action(s) not granted to
+`aws_iam_role.github_actions`: <action>...
+```
+
+### What it means
+
+The apply role can't create/update/destroy the resource. The read-only
+PR-time `terraform plan` never calls the write API, so this gap is
+invisible until the post-merge `terraform apply` — exactly what turned
+`main` red in #2996 (`aws_cloudwatch_composite_alarm` needs
+`cloudwatch:PutCompositeAlarm`, a distinct action from the
+`cloudwatch:PutMetricAlarm` the role already had).
+
+### Action
+
+1. **Add the missing grant** to the relevant `terraform_apply_*` policy
+   in `terraform/modules/ecr/main.tf`. The least-privilege apply
+   policies enumerate actions explicitly, so a new resource subtype
+   often needs a new verb even when a sibling verb is already granted
+   (`PutCompositeAlarm` ≠ `PutMetricAlarm`). #2996 is the worked
+   example.
+2. **Watch the IAM-propagation race.** When the same apply both grants
+   the action and creates the resource, the IAM evaluator can lag ~60s
+   and the fresh resource hits `AccessDenied` anyway — see the
+   `time_sleep` shim pattern in `terraform/CLAUDE.md`.
+
+To discover a new type's required actions, use the same empirical loop
+as for data sources (minimal-grant apply, collect each `AccessDenied`),
+or read the terraform-aws-provider service package's create/update/
+delete functions. Cite the provider source in the `RESOURCE_ACTIONS`
+comment.
+
+### Unmapped resource ("neither RESOURCE_ACTIONS nor RESOURCE_UNCHECKED_ACK")
+
+The resource half is fail-closed on genuinely new resource types. When
+a PR adds a `resource "aws_<type>"` the lint has never seen, decide in
+the same PR:
+
+1. **Map it** — add `aws_<type>` to `RESOURCE_ACTIONS` with the IAM
+   actions its create/update/delete calls make. Strongest option: the
+   type is action-checked from then on.
+2. **Grandfather it** — add `aws_<type>` to `RESOURCE_UNCHECKED_ACK`
+   when the apply role already covers its CRUD (a passing apply proves
+   this) and deriving its full action set is more than the PR warrants.
+   This is an explicit, reviewed acknowledgement — not silent
+   passthrough — with a standing invitation to burn it down into
+   `RESOURCE_ACTIONS` later.
+
+`RESOURCE_UNCHECKED_ACK` is seeded from every resource type present when
+the resource half shipped, so this only fires on a type new to the
+tree. Stale entries (a type later removed) are harmless — they're just
+never iterated.
+
 ### Exit code 3 — `CANONICAL_ROLE_MODULE_PATH may have moved`
 
 ```
 ::error::collect_role_actions returned an empty action set, but the
-terraform tree contains data sources that require IAM grants. The
-canonical role's module path may have moved from
+terraform tree contains data sources or resources that require IAM
+grants. The canonical role's module path may have moved from
 `terraform/modules/ecr/` — update `CANONICAL_ROLE_MODULE_PATH` in
 .github/scripts/check-terraform-iam-coverage.py.
 ```

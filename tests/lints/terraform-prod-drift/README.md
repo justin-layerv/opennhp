@@ -3,7 +3,8 @@
 Regression fixtures for the PR-time terraform drift detectors. There are two
 scripts; the second carries three logical guards:
 
-- `.github/scripts/check-terraform-iam-coverage.py` — Class A (#1323).
+- `.github/scripts/check-terraform-iam-coverage.py` — Class A: data-source
+  reads (#1323) and resource creates (#2996).
 - `.github/scripts/check-terraform-policy-conditions.py` — Class B (#1316,
   banned Condition keys), plus the nhp#1146 Route53 guard (wildcard-record
   mutations and the github_actions permission-boundary check) and the #1523 KMS
@@ -24,7 +25,11 @@ intentionally duplicated in the Python condition lint and
 | `iam-gap-1323` | A — #1323 regression | exit 1 (gap) | exit 0 |
 | `policy-condition-1316` | B — #1316 regression (`aws:SourceAccount`) | exit 0 | exit 1 (banned condition) |
 | `policy-condition-1316-sourcearn` | B — #1316 sibling (`aws:SourceArn`) | exit 0 | exit 1 (banned condition) |
-| `unmapped-data-source` | A — fail-closed on unmapped | exit 2 (unmapped) | exit 0 |
+| `unmapped-data-source` | A — fail-closed on unmapped data source | exit 2 (unmapped) | exit 0 |
+| `resource-iam-gap-2996` | A — #2996 regression: resource create needs `cloudwatch:PutCompositeAlarm` | exit 1 (gap) | exit 0 |
+| `unmapped-resource` | A — fail-closed on resource type in neither `RESOURCE_ACTIONS` nor `RESOURCE_UNCHECKED_ACK` | exit 2 (unmapped) | exit 0 |
+| `resource-alarm-covered` | A — alarm-family positive path (mapped + fully granted) | exit 0 | exit 0 |
+| `resource-metric-alarm-tag-gap` | A — default_tags correctness: an *untagged* alarm still requires the tag trio, role missing `cloudwatch:TagResource` | exit 1 (gap) | exit 0 |
 | `indexed-managed-policy` | A — count-gated `aws_iam_policy.X[0].arn` (cr round 1) | exit 0 | exit 0 |
 | `single-statement-dict` | A — IAM shorthand `Statement = {...}` (cr round 1) | exit 0 | exit 0 |
 | `ternary-policy` | A — union of both `jsonencode` legs (cr round 1) | exit 0 | exit 0 |
@@ -120,6 +125,8 @@ make lint-terraform-drift          # run from repo root
 
 ## Adding a fixture
 
-When extending `DATA_SOURCE_ACTIONS` or `BANNED_CONDITIONS`, add a
-fixture for the new case here and a row in `run-fixtures.sh`. The
+When extending `DATA_SOURCE_ACTIONS`, `RESOURCE_ACTIONS`,
+`RESOURCE_UNCHECKED_ACK`, or `BANNED_CONDITIONS`, add a fixture for the
+new case here and a row in `run-fixtures.sh` (the harness asserts the
+`FIXTURES` array and this directory stay in lockstep by name). The
 fixture should be small enough to read in one screen.
