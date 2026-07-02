@@ -65,7 +65,7 @@ func TestForwardHop_SenderRoundTrip(t *testing.T) {
 	}
 	// Incoming hop 0 (origin) → forwarder must emit hop 1.
 	ctx := contextWithForwardHop(context.Background(), 0)
-	if _, err := f.ForwardHttpKnock(ctx, "ac-test", req, &common.ResourceData{}); err != nil {
+	if _, _, err := f.ForwardHttpKnock(ctx, "ac-test", req, &common.ResourceData{}); err != nil {
 		t.Fatalf("ForwardHttpKnock: %v", err)
 	}
 
@@ -127,7 +127,7 @@ func TestForwardHop_SenderNoKeypairNoAttestation(t *testing.T) {
 	}
 
 	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil) // attestation NOT enabled
-	if _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{}); err != nil {
+	if _, _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{}); err != nil {
 		t.Fatalf("ForwardHttpKnock: %v", err)
 	}
 

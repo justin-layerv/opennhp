@@ -267,7 +267,7 @@ func TestFanoutHttpKnock_ReachesEveryAssignedPeer(t *testing.T) {
 
 	// Legacy first-success forward hits exactly ONE peer.
 	hits.Store(0)
-	if _, err := newF().ForwardHttpKnock(context.Background(), "sandbox-ac", &common.HttpKnockRequest{}, &common.ResourceData{}); err != nil {
+	if _, _, err := newF().ForwardHttpKnock(context.Background(), "sandbox-ac", &common.HttpKnockRequest{}, &common.ResourceData{}); err != nil {
 		t.Fatalf("ForwardHttpKnock error: %v", err)
 	}
 	if got := hits.Load(); got != 1 {

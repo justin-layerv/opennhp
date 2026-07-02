@@ -198,6 +198,25 @@ const (
 	// degraded AC before the threshold actually triggers re-registration.
 	MetricAllUnconnectedDetected = "AllUnconnectedDetected"
 
+	// Phase 0D (qurl-service#976): all-unconnected episode DURATIONS, so the
+	// ~30s outage (link (c)) is measurable, not just counted.
+	// MetricAllUnconnectedDurationMs is the first-detected -> threshold-tripped
+	// span (detector latency); MetricAllUnconnectedRecoveryMs is the
+	// first-detected -> episode-closed span — a time-to-remediation gauge closed
+	// by whichever fires first: an observed reconnect (a healthy keepalive tick)
+	// OR a successful NLB re-registration (the remediation itself). Read it as
+	// MTTR, not strictly "viewer traffic flowing again", and as a LOWER BOUND on
+	// the viewer-facing outage: re-registration success closes the episode a beat
+	// before the actual UDP re-establishment the next tick would confirm, so a
+	// re-reg-won episode stops the clock early. If servers are still down
+	// checkAllUnconnected opens a fresh episode. Because a
+	// still-down fleet reopens a fresh episode, one real outage can emit several
+	// RecoveryMs samples — so a dashboard/alarm must read it as a percentile
+	// (p50/p90), never a sum or count, or a flapping outage looks like many short
+	// recoveries (dashboard guidance tracked in #3001).
+	MetricAllUnconnectedDurationMs = "AllUnconnectedDurationMs"
+	MetricAllUnconnectedRecoveryMs = "AllUnconnectedRecoveryMs"
+
 	// MetricReconcileOverlap is incremented when reconcileDevicePeers enters
 	// while another reconcile is already in flight — i.e., the orphan-
 	// precondition for the synchronous-reconcile model (#1680). Wired into
@@ -1038,6 +1057,21 @@ type ACRegistration struct {
 	// the counter. Atomic because keepaliveLoop increments/reads it while
 	// re-registration goroutines reset it.
 	allUnconnectedTicks atomic.Uint32
+
+	// allUnconnectedSinceNano timestamps the first tick of the CURRENT
+	// all-unconnected EPISODE (0 = not currently all-unconnected), so the outage
+	// can be measured as a DURATION, not just counted (Phase 0D, qurl-service#976
+	// link (c) — the fixed ~30s MTTR). Set once per episode (CAS 0->now),
+	// emitted+cleared on reconnect. Spans repeated threshold trips within one
+	// outage -> RecoveryMs.
+	allUnconnectedSinceNano atomic.Int64
+
+	// allUnconnectedWindowStartNano timestamps the start of the current
+	// threshold WINDOW (reset every tick-counter 0->1), distinct from the
+	// episode start above. DurationMs (detector-trip latency) is measured from
+	// this, so a re-trip during a sustained outage reports the window latency,
+	// not an ever-growing episode age.
+	allUnconnectedWindowStartNano atomic.Int64
 
 	// nlbReregistrationInterval is the effective (config + per-AC jitter)
 	// interval for the periodic NLB re-registration safety net. Computed
@@ -3035,6 +3069,7 @@ func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
 			r.serverDownReregCooldownUntil.Store(0)
 			r.lastNLBRegistrationNano.Store(time.Now().UnixNano())
 			r.allUnconnectedTicks.Store(0)
+			r.markAllUnconnectedRecovered() // Phase 0D: close the episode now, not on the next healthy tick
 			// Reset iptables to restore port hiding after successful re-registration
 			r.resetIptables()
 			return
@@ -3143,6 +3178,7 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 				r.serverDownReregCooldownUntil.Store(0)
 				r.lastNLBRegistrationNano.Store(time.Now().UnixNano())
 				r.allUnconnectedTicks.Store(0)
+				r.markAllUnconnectedRecovered() // Phase 0D: close the episode now, not on the next healthy tick
 				r.resetIptables()
 				return
 			}
@@ -3198,6 +3234,28 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 // would race with a concurrent HandleRedispatch that might have just
 // installed a fresh set of valid servers and silently drop those
 // legitimate assignments.
+// markAllUnconnectedRecovered closes an open all-unconnected episode (Phase 0D)
+// and emits the recovery latency — the first-detected -> reconnected span, i.e.
+// the outage the viewer experiences. Atomically reads+clears the episode timer,
+// so it is a no-op when no episode is open and safe to call on every healthy
+// tick / from any recovery path.
+func (r *ACRegistration) markAllUnconnectedRecovered() {
+	// Clear the window timer too, for symmetry — no stale value survives an
+	// episode close (it is otherwise only read right after a fresh Store).
+	// Best-effort under concurrent recovery: checkAllUnconnected (keepalive
+	// goroutine) and the re-reg success paths both touch these atomics, so a rare
+	// interleave can drop or slightly skew a single latency sample — acceptable
+	// for an observability gauge.
+	r.allUnconnectedWindowStartNano.Store(0)
+	if since := r.allUnconnectedSinceNano.Swap(0); since != 0 {
+		recoveryMs := elapsedSinceNano(since).Milliseconds()
+		r.metrics.RecordLatency(MetricAllUnconnectedRecoveryMs, float64(recoveryMs))
+		// RecordLatency carries no acId dimension; log it so a long outage can
+		// still be attributed to a specific AC (per-AC MTTR via logs).
+		log.Info("AC %s: recovered from all-unconnected episode after %dms", r.ac.config.ACId, recoveryMs)
+	}
+}
+
 func (r *ACRegistration) checkAllUnconnected() {
 	r.mu.RLock()
 	servers := slices.Clone(r.assignedServers)
@@ -3206,14 +3264,19 @@ func (r *ACRegistration) checkAllUnconnected() {
 	if len(servers) == 0 {
 		// Initial registration hasn't completed yet (or we just stopped).
 		// Reset the counter so a brand-new bootstrap doesn't immediately
-		// trip the threshold based on stale state.
+		// trip the threshold based on stale state. Phase 0D: also drop any open
+		// outage timers — an empty set is a teardown/redispatch, not a reconnect,
+		// so clear (no RecoveryMs) rather than let a stale episode start leak.
 		r.allUnconnectedTicks.Store(0)
+		r.allUnconnectedSinceNano.Store(0)
+		r.allUnconnectedWindowStartNano.Store(0)
 		return
 	}
 
 	for _, server := range servers {
 		if server.IsConnected() {
 			r.allUnconnectedTicks.Store(0)
+			r.markAllUnconnectedRecovered() // Phase 0D: close any open outage episode
 			return
 		}
 	}
@@ -3226,6 +3289,12 @@ func (r *ACRegistration) checkAllUnconnected() {
 	// convention used by MetricServerHealthFailures so operators can pivot
 	// on which AC is degraded.
 	if newTicks == 1 {
+		// Phase 0D: episode timer is idempotent (CAS(0, now) fires only on the
+		// 0->episode transition, so a threshold-trip's tick reset doesn't restart
+		// it mid-outage); the window timer restarts every window for DurationMs.
+		now := time.Now().UnixNano()
+		r.allUnconnectedSinceNano.CompareAndSwap(0, now)
+		r.allUnconnectedWindowStartNano.Store(now)
 		r.metrics.IncrCounterWithDims(MetricAllUnconnectedDetected, []types.Dimension{
 			r.acIdDimension(),
 		})
@@ -3249,15 +3318,30 @@ func (r *ACRegistration) checkAllUnconnected() {
 	// docstring above for why.
 	log.Warning("AC %s: all assigned servers unconnected for %d consecutive ticks, triggering NLB re-registration",
 		r.ac.config.ACId, newTicks)
+	// Phase 0D: detector-trip latency for THIS window (window-start -> threshold),
+	// not the episode age — so a re-trip during a sustained outage reports the
+	// window latency. The episode timer stays open for RecoveryMs on reconnect.
+	if ws := r.allUnconnectedWindowStartNano.Load(); ws != 0 {
+		r.metrics.RecordLatency(MetricAllUnconnectedDurationMs, float64(elapsedSinceNano(ws).Milliseconds()))
+	}
 	r.allUnconnectedTicks.Store(0)
 	r.TriggerReregistration(ReasonAllServersUnconnected)
+}
+
+// elapsedSinceNano returns the time elapsed since a unix-nanosecond instant,
+// centralizing the time.Since(time.Unix(0, …)) idiom the AC's atomic
+// outage/registration timers share. Callers guard nano != 0 before treating the
+// result as a real sample (nano == 0 is "no open episode", which would yield a
+// meaninglessly large duration).
+func elapsedSinceNano(nano int64) time.Duration {
+	return time.Since(time.Unix(0, nano))
 }
 
 // timeSinceLastNLBRegistration returns the duration since the most recent
 // successful NLB re-registration. Reads the atomic timestamp once so the
 // caller sees a consistent value across the elapsed/threshold comparison.
 func (r *ACRegistration) timeSinceLastNLBRegistration() time.Duration {
-	return time.Since(time.Unix(0, r.lastNLBRegistrationNano.Load()))
+	return elapsedSinceNano(r.lastNLBRegistrationNano.Load())
 }
 
 // checkPeriodicNLBReregistration is the bounded NLB re-registration

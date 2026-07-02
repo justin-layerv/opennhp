@@ -1300,6 +1300,25 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		OpenTime:          res.OpenTime,
 	}
 
+	// Phase 0B: one bounded reason per FAILED knock, emitted once on return so
+	// every failure exit funnels through a single point ("" = success = no emit).
+	// KnockNoAC + the ErrServerACOpsFailed path stay for alarm continuity.
+	var knockFailReason KnockFailReason
+	defer func() {
+		// Structural backstop against silent under-counting (the failure mode
+		// hardest to notice): every error return must be attributed. If a FUTURE
+		// exit sets err but forgets to classify a reason, surface it as unknown
+		// rather than drop it — a rising unknown_all_ac_ops_failed bar is
+		// self-evident on the dashboard. Success paths return err==nil, so this
+		// never false-positives. (err is a named return, readable here.)
+		if knockFailReason == "" && err != nil {
+			knockFailReason = KnockFailUnknownAllACOpsFailed
+		}
+		if knockFailReason != "" {
+			s.recordKnockFailReason(knockFailReason)
+		}
+	}()
+
 	if len(res.Resources) == 0 {
 		// Defensive catalog guard: callers that reach the open path
 		// with no concrete AC destinations should fail before any
@@ -1309,6 +1328,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		err = common.ErrResourceNotFound
 		ackMsg.ErrCode = common.ErrResourceNotFound.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
+		knockFailReason = KnockFailNoResources // Phase 0B (emitted on return)
 		return
 	}
 
@@ -1372,6 +1392,19 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 	ackMsg.PreAccessActions = make(map[string]*common.PreAccessInfo)
 
 	knockHadNoAC := false
+	// Phase 0B: capture the no-local-AC failover forward so the terminal failure
+	// label can be derived from its 0A outcome. Single-resource for qURL;
+	// multi-resource keeps the last attempt and lets a forward outcome win over a
+	// sibling resource's local AC-op failure — a bounded dominant choice, adjacent
+	// to the multi-resource re-resolve limitation tracked in #2452.
+	forwardAttempted := false
+	var lastForwardOutcome ForwardOutcome
+	// Phase 0F: the acId a failed knock was for, so the server-side failure can
+	// be JOINED offline to the AC-side all-unconnected episode (0D) by acId +
+	// time — that join is what distinguishes "AC absent cell-wide" (AC was
+	// all-unconnected then) from "AC mis-routed" (AC was connected elsewhere).
+	// A single server cannot determine cell-wide reachability alone.
+	var lastKnockACID string
 
 	// openTime is loop-invariant — derived only from res.OpenTime and
 	// knkMsg.HeaderType, both fixed for this call. Hoisted out so the
@@ -1390,6 +1423,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 			continue
 		}
 		acId := resInfo.ACId
+		lastKnockACID = acId // Phase 0F: for the offline AC-reachability join
 		connsCopy, droppedStale := s.snapshotLiveACConns(acId)
 		if droppedStale > 0 {
 			log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[handleHttpOpenResource] filtered %d stale/closed AC connection(s) (threshold=%v)",
@@ -1421,8 +1455,12 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 				// req, so forward a copy that carries the identity. See
 				// buildForwardedKnock for the full rationale.
 				fwdReq, fwdRes := buildForwardedKnock(req, res)
-				fwdAck, fwdErr := hs.httpForwarder.ForwardHttpKnock(fwdCtx, acId, fwdReq, fwdRes)
+				fwdAck, fwdOutcome, fwdErr := hs.httpForwarder.ForwardHttpKnock(fwdCtx, acId, fwdReq, fwdRes)
 				fwdCancel() // cancel immediately; defer would accumulate across loop iterations
+				// Phase 0A: split the opaque KnockForwardFailure by cause. The
+				// KnockForwardSuccess/Failure counters below stay for alarm continuity.
+				s.recordKnockForwardOutcome(fwdOutcome)
+				forwardAttempted, lastForwardOutcome = true, fwdOutcome // Phase 0B
 				if fwdErr == nil && fwdAck != nil && fwdAck.ErrCode == common.ErrSuccess.ErrorCode() {
 					log.Info("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] knock forwarded successfully", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId)
 					s.metrics.IncrCounter(MetricKnockForwardSuccess)
@@ -1490,6 +1528,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		log.Error("httpserver-agent(%s#%s@%s)[handleHttpOpenResource] failed to persist ACK token metadata: %v", knkMsg.UserId, knkMsg.DeviceId, srcIp, publishErr)
 		ackMsg.ErrCode = common.ErrServerTokenPersistFailed.ErrorCode()
 		ackMsg.ErrMsg = common.ErrServerTokenPersistFailed.Error()
+		knockFailReason = KnockFailTokenPublishFailed // Phase 0B (emitted on return)
 		return ackMsg, common.ErrServerTokenPersistFailed
 	}
 
@@ -1514,7 +1553,28 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 				details = append(details, fmt.Sprintf("%s: %s", resName, artMsg.ErrMsg))
 			}
 		}
-		log.Error("httpserver-agent(%s#%s@%s)[handleHttpOpenResource] all AC operations failed: %v", knkMsg.UserId, knkMsg.DeviceId, srcIp, details)
+		// Phase 0B reason (emitted once on return via the deferred emit above).
+		// Phase 0F: fold the AC-reachability join key (reason, ac_id, local_no_ac,
+		// forward_outcome) INTO this single knock-failure log rather than a second
+		// per-failure line — pair it offline with the AC-side all-unconnected
+		// episode (0D) by acId+time to split "absent cell-wide" (Candidate F) from
+		// "mis-routed" (Candidates A/B/D/E). src_ip is the log prefix below.
+		// Phase 0E: server_asg names the color/ASG this qURL knock landed on, so a
+		// mis-route (knock reached a server whose cell can't admit it) is visible
+		// here on the failure path without any per-knock work on the success path.
+		// s (== hs.udpServer) is non-nil here: the broadcast path above already
+		// dereferenced it unguarded (snapshotLiveACConns, the AC-ops broadcast), so
+		// reaching this exit guarantees it. The guard is cheap belt-and-suspenders
+		// for a FUTURE refactor that might reach an error exit before those derefs
+		// — the 0B deferred emit is nil-safe for the same forward-looking reason —
+		// since ASGName takes a lock and would panic on a nil receiver.
+		serverASG := ""
+		if s != nil {
+			serverASG = s.ASGName()
+		}
+		knockFailReason = deriveKnockFailReason(artMsgs, forwardAttempted, lastForwardOutcome)
+		log.Error("httpserver-agent(%s#%s@%s)[handleHttpOpenResource] all AC operations failed: reason=%s ac_id=%s local_no_ac=%t forward_outcome=%s server_asg=%s details=%v",
+			knkMsg.UserId, knkMsg.DeviceId, srcIp, knockFailReason, lastKnockACID, knockHadNoAC, lastForwardOutcome, serverASG, details)
 		if len(details) > 0 {
 			err = fmt.Errorf("%w (%s)", common.ErrServerACOpsFailed, strings.Join(details, "; "))
 		} else {
@@ -1853,7 +1913,12 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 	// Server-to-server forwards (empty Source) set Forwarded=true to prevent loops.
 	switch fwdReq.Source {
 	case SourceAPI:
-		// API-originated: allow forwarding to find the correct server
+		// API-originated: allow forwarding to find the correct server.
+		// Phase 0E routing exposure (which color a qURL knock landed on, origin
+		// CloudMap today) is captured on the FAILURE path only — see server_asg in
+		// the terminal "all AC operations failed" log in handleHttpOpenResource —
+		// so no ASGName/AC-conn lock runs per knock on the success hot path, and
+		// the signal lands exactly where it matters (a mis-routed knock fails).
 	case "":
 		// Server-to-server: block re-forwarding (loop prevention)
 		fwdReq.Request.Forwarded = true

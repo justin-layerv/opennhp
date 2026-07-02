@@ -255,7 +255,7 @@ func TestForwardHttpKnock_MarksFailedServers(t *testing.T) {
 
 	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil)
 
-	_, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
 		t.Fatal("Expected error")
 	}
@@ -292,7 +292,7 @@ func TestForwardHttpKnock_InvalidatesCacheOnTotalFailure(t *testing.T) {
 	mock := NewMockHealthChecker(map[string]bool{"127.0.0.1": true})
 	f := NewHttpKnockForwarder(storage, mock, "10.0.0.99", port, nil, nil)
 
-	_, _ = f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, _ = f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 
 	// Verify cache was invalidated
 	if !mock.cacheInvalidated.Load() {
@@ -335,7 +335,7 @@ func TestForwardHttpKnock_DoesNotInvalidateCacheOnPartialSuccess(t *testing.T) {
 	mock := NewMockHealthChecker(map[string]bool{"127.0.0.1": true})
 	f := NewHttpKnockForwarder(storage, mock, "10.0.0.99", port, nil, nil)
 
-	ack, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	ack, _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err != nil {
 		t.Fatalf("Expected success on second attempt, got error: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestForwardHttpKnock_RejectsWhenStopped(t *testing.T) {
 	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 	f.Stop()
 
-	_, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if !errors.Is(err, errForwarderStopped) {
 		t.Errorf("Expected errForwarderStopped, got %v", err)
 	}
@@ -391,7 +391,7 @@ func TestForwardHttpKnock_RespectsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := f.ForwardHttpKnock(ctx, "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(ctx, "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -448,7 +448,7 @@ func TestForwardHttpKnock_RollingDeploySimulation(t *testing.T) {
 	}
 
 	// Forward should succeed by falling through dead server A to healthy server B
-	ack, err := f.ForwardHttpKnock(context.Background(), "layerv-ac-tf", &common.HttpKnockRequest{}, &common.ResourceData{})
+	ack, _, err := f.ForwardHttpKnock(context.Background(), "layerv-ac-tf", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err != nil {
 		t.Fatalf("Expected successful forward (should skip dead server A), got error: %v", err)
 	}
@@ -491,7 +491,7 @@ func TestForwardHttpKnock_SecondRequestSkipsDeadServer(t *testing.T) {
 	f.markFailed("10.0.0.2")
 
 	// Forward should skip dead server and go directly to healthy
-	ack, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	ack, _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err != nil {
 		t.Fatalf("Expected success, got error: %v", err)
 	}
@@ -531,7 +531,7 @@ func TestForwardHttpKnock_NilCloudMapDoesNotPanic(t *testing.T) {
 	// Explicitly pass nil CloudMap (the prod scenario)
 	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil)
 
-	ack, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	ack, _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err != nil {
 		t.Fatalf("Expected success with nil CloudMap, got error: %v", err)
 	}
@@ -574,7 +574,7 @@ func TestForwardHttpKnock_AllFailedThenCacheInvalidatedThenRetrySucceeds(t *test
 	f := NewHttpKnockForwarder(storage, mock, "10.0.0.99", port, nil, nil)
 
 	// First attempt: all fail → cache invalidated
-	_, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
 		t.Fatal("Expected error on first attempt")
 	}
@@ -584,7 +584,7 @@ func TestForwardHttpKnock_AllFailedThenCacheInvalidatedThenRetrySucceeds(t *test
 
 	// Second attempt: server has recovered (mock returns success on call 2+)
 	// Failed server should be in the fallback path since it's the only non-self server
-	ack, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	ack, _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err != nil {
 		t.Fatalf("Expected success on retry, got error: %v", err)
 	}

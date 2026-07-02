@@ -107,6 +107,17 @@ const (
 	MetricKnockForwardFailure        = "KnockForwardFailure"
 	MetricKnockForwardSkippedDead    = "KnockForwardSkippedDead"
 	MetricKnockForwardFallback       = "KnockForwardFallback"
+	// MetricKnockForwardOutcome is the cause-split of a ForwardHttpKnock call
+	// (qurl-service#976 Phase 0A). Emitted once per forward with an "outcome"
+	// dimension (the ForwardOutcome enum), so KnockForwardFailure — which stays
+	// for alarm continuity — can be broken down by why it failed (notably
+	// remote_no_ac, the 06:47 "peer alive, holds no AC" signature).
+	MetricKnockForwardOutcome = "KnockForwardOutcome"
+	// MetricKnockFailReason is the top-level cause of a FAILED qURL knock at
+	// handleHttpOpenResource (qurl-service#976 Phase 0B), with a "Reason"
+	// dimension (the KnockFailReason enum). Emitted once per failed knock;
+	// KnockNoAC and the ErrServerACOpsFailed path stay for alarm continuity.
+	MetricKnockFailReason = "KnockFailReason"
 	// Cell-wide knock AC fan-out (qurl-service#948, Config.EnableKnockACFanout).
 	// Unlike the forward counters above (a no-local-AC FAILOVER to one peer),
 	// these track the coverage FAN-OUT an origin knock sends to ALL assigned peer
@@ -2016,6 +2027,50 @@ func (s *UdpServer) autoAssignAC(
 		TTL:             &ttl,
 	}
 
+	// Phase 0C (qurl-service#976): flag a BAD assignment set at the write point.
+	// ACs connect over the VPC InternalIP, so an empty or non-private InternalIP
+	// is an unreachable target — this is the 3.17.248.131 stale-EIP signature
+	// that stranded an AC on a single unreachable server for a fixed ~30s.
+	// (AssignmentRewroteHealthySet is deliberately NOT computed here: it needs
+	// the old set + a Cloud Map health judgment that is unreliable in the very
+	// fail-open window it measures — it belongs to Candidate A. See the plan.)
+	// The AC dials each assigned server's InternalIP (serverInfosToRedirectTargets):
+	// a NON-PRIVATE InternalIP is dialed-but-unreachable (the 3.17.248.131
+	// signature); an EMPTY InternalIP is silently skipped there (#832), shrinking
+	// the reachable set. Count them separately and base "below quorum" on the
+	// servers the AC can actually reach.
+	publicIPTargets, emptyIPTargets := 0, 0
+	for _, srv := range selected {
+		switch {
+		case srv.InternalIP == "":
+			emptyIPTargets++
+		case !isPrivateIP(srv.InternalIP):
+			publicIPTargets++
+		}
+	}
+	dialable := len(selected) - publicIPTargets - emptyIPTargets
+	// Critically low = the AC is left one termination away from all-unconnected
+	// (<=1 dialable server). A healthy cell with >=2 reachable servers reads 0
+	// here, unlike a plain below-target(<MaxServers) count that fires on every
+	// small-cell write and can't be alarmed on.
+	criticallyLow := dialable <= 1
+	if s.metrics != nil {
+		if publicIPTargets > 0 {
+			s.metrics.IncrCounter(MetricACAssignmentSelectedPublicIP)
+		}
+		if criticallyLow {
+			s.metrics.IncrCounter(MetricACAssignmentSelectedCriticallyLow)
+		}
+	}
+	// Log only the real anomaly — a dialed-but-unreachable public-IP target.
+	// criticallyLow alone can still be a legitimately tiny (1-server) cell rather
+	// than a churn-induced collapse, so the metric carries it; a Warning per write
+	// would bury the public-IP signal.
+	if publicIPTargets > 0 {
+		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] phase0c bad-set: selected=%d dialable=%d public_ip_targets=%d empty_ip_targets=%d critically_low=%t version=%d asg_fail_open=%t",
+			acId, transactionId, addrStr, len(selected), dialable, publicIPTargets, emptyIPTargets, criticallyLow, version, asgFailOpen)
+	}
+
 	// Populate customer ID from license if available.
 	//
 	// #1157 F4 trust contract: console-side License.Validate rejects
@@ -2139,6 +2194,24 @@ const (
 	// fall to ~0 in steady state once all assignments reach
 	// MaxServersPerAssignment.
 	MetricACAssignmentGrew = "ACAssignmentGrew"
+
+	// Phase 0C (qurl-service#976) assignment write-quality attribution.
+	// MetricACAssignmentSelectedPublicIP fires when autoAssignAC persists an
+	// assignment containing a server with a NON-PRIVATE InternalIP — a
+	// dialed-but-unreachable target (the 3.17.248.131 stale-EIP signature).
+	// Steady state is 0; a spike during a deploy is a prime suspect for the "AC
+	// absent" class. MetricACAssignmentSelectedCriticallyLow fires when the AC is
+	// left with <=1 DIALABLE server (private InternalIP, after empty-InternalIP
+	// #832 skips and public-IP targets are excluded) — one termination away from
+	// all-unconnected. Deliberately NOT a plain "below target (<MaxServers)" count:
+	// that fires on every write in any cell smaller than MaxServersPerAssignment
+	// (a steady non-zero baseline that can't be alarmed on and hides the real
+	// event). The <=1 floor instead has a clean steady state of 0 in any healthy
+	// cell with >=2 reachable servers, so it separates near-isolation from a
+	// merely-small cell and catches the 06:47 collapse-to-one-target signature
+	// (dialable==0).
+	MetricACAssignmentSelectedPublicIP      = "ACAssignmentSelectedPublicIP"
+	MetricACAssignmentSelectedCriticallyLow = "ACAssignmentSelectedCriticallyLow"
 )
 
 // saveAssignmentWithRetry performs a bounded retry loop around

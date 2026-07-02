@@ -156,7 +156,7 @@ func TestFilterForwardTargets_AllSelf(t *testing.T) {
 func TestForwardHttpKnock_NoStorage(t *testing.T) {
 	f := &HttpKnockForwarder{}
 
-	_, err := f.ForwardHttpKnock(context.Background(), "ac-1", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(context.Background(), "ac-1", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
 		t.Fatal("Expected error when storage is nil")
 	}
@@ -166,7 +166,7 @@ func TestForwardHttpKnock_AssignmentNotFound(t *testing.T) {
 	storage := newMockStorageBackend()
 	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil)
 
-	_, err := f.ForwardHttpKnock(context.Background(), "ac-not-found", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(context.Background(), "ac-not-found", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
 		t.Fatal("Expected error when assignment not found")
 	}
@@ -182,7 +182,7 @@ func TestForwardHttpKnock_AssignmentExpired(t *testing.T) {
 	}
 	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil)
 
-	_, err := f.ForwardHttpKnock(context.Background(), "ac-expired", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(context.Background(), "ac-expired", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
 		t.Fatal("Expected error for expired assignment")
 	}
@@ -196,7 +196,7 @@ func TestForwardHttpKnock_NoAvailableServers(t *testing.T) {
 	}
 	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil)
 
-	_, err := f.ForwardHttpKnock(context.Background(), "ac-self-only", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(context.Background(), "ac-self-only", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
 		t.Fatal("Expected error when only self is available")
 	}
@@ -237,7 +237,7 @@ func TestForwardHttpKnock_SuccessfulForward(t *testing.T) {
 
 	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil) // different IP than 127.0.0.1
 
-	ack, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
+	ack, _, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err != nil {
 		t.Fatalf("Expected successful forward, got error: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestForwardHttpKnock_ServerReturnsError(t *testing.T) {
 
 	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil)
 
-	_, err := f.ForwardHttpKnock(context.Background(), "ac-err", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(context.Background(), "ac-err", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
 		t.Fatal("Expected error when remote returns error")
 	}
@@ -286,7 +286,7 @@ func TestForwardHttpKnock_RejectsPublicIP(t *testing.T) {
 	}
 	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil)
 
-	_, err := f.ForwardHttpKnock(context.Background(), "ac-public", &common.HttpKnockRequest{}, &common.ResourceData{})
+	_, _, err := f.ForwardHttpKnock(context.Background(), "ac-public", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
 		t.Fatal("Expected error for public IP target (SSRF prevention)")
 	}

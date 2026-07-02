@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -104,6 +105,71 @@ type ForwardHopAttestation struct {
 type HttpKnockForwardResponse struct {
 	AckMsg *common.ServerKnockAckMsg `json:"ack_msg"`
 	Error  string                    `json:"error,omitempty"`
+}
+
+// ForwardOutcome is the bounded, low-cardinality classification of a single
+// ForwardHttpKnock call, for failure attribution (qurl-service#976 Phase 0A).
+// It splits the pre-existing single KnockForwardFailure counter by *cause* so a
+// deploy produces a histogram instead of one opaque number — in particular it
+// gives the 06:47 "peer is alive but holds no AC" signature its own bucket
+// (ForwardRemoteNoAC). It is a metric dimension value, so it MUST stay a small
+// closed set; never fold raw ids/ips/error-strings into it.
+type ForwardOutcome string
+
+const (
+	ForwardSuccess             ForwardOutcome = "success"
+	ForwardForwarderStopped    ForwardOutcome = "forwarder_stopped"
+	ForwardNoStorage           ForwardOutcome = "no_storage"
+	ForwardNoAssignment        ForwardOutcome = "no_assignment"
+	ForwardStorageError        ForwardOutcome = "storage_error"
+	ForwardAssignmentExpired   ForwardOutcome = "assignment_expired"
+	ForwardAllTargetsFiltered  ForwardOutcome = "all_targets_filtered"
+	ForwardContextCanceled     ForwardOutcome = "context_canceled"
+	ForwardRequestFailed       ForwardOutcome = "request_failed"
+	ForwardRemoteHTTPError     ForwardOutcome = "remote_http_error"
+	ForwardRemoteDecodeError   ForwardOutcome = "remote_decode_error"
+	ForwardRemoteNoAC          ForwardOutcome = "remote_no_ac"
+	ForwardRemoteACOpsFailed   ForwardOutcome = "remote_ac_ops_failed"
+	ForwardRemoteNonSuccessAck ForwardOutcome = "remote_non_success_ack"
+)
+
+// classifyForwardAttempt maps a single forwardToServer (ack, err) result to a
+// ForwardOutcome. On the remote-error path forwardToServer returns the parsed
+// peer ack alongside the error (so ack != nil), which lets us read the peer's
+// structured ErrCode/ErrMsg rather than string-matching the transport error.
+// The 06:47 no-AC signature arrives as the aggregate ErrServerACOpsFailed whose
+// detail carries ErrACConnectionNotFound's message, so we check both the code
+// and that message before falling back to the generic AC-ops bucket.
+func classifyForwardAttempt(ack *common.ServerKnockAckMsg, err error) ForwardOutcome {
+	if err == nil {
+		return ForwardSuccess
+	}
+	// Structured peer response (HTTP 200 with a non-success ack).
+	if ack != nil {
+		switch {
+		case ack.ErrCode == common.ErrACConnectionNotFound.ErrorCode() ||
+			strings.Contains(ack.ErrMsg, common.ErrACConnectionNotFound.Error()):
+			return ForwardRemoteNoAC
+		case ack.ErrCode == common.ErrServerACOpsFailed.ErrorCode():
+			return ForwardRemoteACOpsFailed
+		default:
+			return ForwardRemoteNonSuccessAck
+		}
+	}
+	// Transport / protocol errors carry no parsed ack. Keep this coarse and
+	// string-based only here (these buckets are rare and not the signal we
+	// chase); the important remote_* buckets above are structured.
+	msg := err.Error()
+	switch {
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		return ForwardContextCanceled
+	case strings.Contains(msg, "unmarshal response"):
+		return ForwardRemoteDecodeError
+	case strings.Contains(msg, "server returned "), strings.Contains(msg, "response too large"):
+		return ForwardRemoteHTTPError
+	default:
+		return ForwardRequestFailed
+	}
 }
 
 // HttpKnockForwarder forwards HTTP knock requests to assigned servers when
@@ -220,41 +286,63 @@ func (f *HttpKnockForwarder) Stop() {
 }
 
 // ForwardHttpKnock looks up the AC assignment and forwards the knock to an assigned server.
-// Returns nil if no assignment exists or all assigned servers fail.
+// Returns (ack, outcome, error): on success ack is non-nil and outcome is
+// ForwardSuccess; on failure the outcome is a bounded ForwardOutcome (Phase 0A,
+// qurl-service#976) so callers can split the opaque KnockForwardFailure counter
+// by cause. The (ack, error) semantics are unchanged — outcome is additive.
 func (f *HttpKnockForwarder) ForwardHttpKnock(
 	ctx context.Context,
 	acID string,
 	req *common.HttpKnockRequest,
 	res *common.ResourceData,
-) (*common.ServerKnockAckMsg, error) {
+) (ack *common.ServerKnockAckMsg, outcome ForwardOutcome, err error) {
+	// Attribution fields for the structured failure log emitted on return.
+	var assignmentVersion, assignmentSize, selectedTargets, attemptedTargets int
+	var lastTargetID, lastTargetIP, remoteAckErrCode string
+	defer func() {
+		// Failure attribution is a Debug detail line: the KnockForwardOutcome
+		// metric + the handler's terminal "all AC operations failed" Error carry
+		// the signal, so this stays off the trough hot path (benign buckets like
+		// no_assignment/all_targets_filtered would otherwise spam Warning). Success
+		// skips it entirely (no formatting cost).
+		if outcome == ForwardSuccess {
+			return
+		}
+		log.Debug("http knock forward attribution outcome=%s ac=%s assignment_version=%d assignment_size=%d selected_targets=%d attempted_targets=%d last_target_id=%s last_target_ip=%s remote_ack_err_code=%s",
+			outcome, acID, assignmentVersion, assignmentSize, selectedTargets, attemptedTargets, lastTargetID, lastTargetIP, remoteAckErrCode)
+	}()
+
 	if f.stopped.Load() {
-		return nil, errForwarderStopped
+		return nil, ForwardForwarderStopped, errForwarderStopped
 	}
 	f.wg.Add(1)
 	defer f.wg.Done()
 
 	if f.storage == nil {
-		return nil, fmt.Errorf("no storage backend configured")
+		return nil, ForwardNoStorage, fmt.Errorf("no storage backend configured")
 	}
 
 	// Look up AC assignment
-	assignment, err := f.storage.GetACAssignment(ctx, acID)
-	if err != nil {
-		if IsNotFoundError(err) {
-			return nil, fmt.Errorf("no AC assignment found for %s", acID)
+	assignment, gerr := f.storage.GetACAssignment(ctx, acID)
+	if gerr != nil {
+		if IsNotFoundError(gerr) {
+			return nil, ForwardNoAssignment, fmt.Errorf("no AC assignment found for %s", acID)
 		}
-		return nil, fmt.Errorf("storage error for AC %s: %w", acID, err)
+		return nil, ForwardStorageError, fmt.Errorf("storage error for AC %s: %w", acID, gerr)
 	}
+	assignmentVersion = assignment.Version
+	assignmentSize = len(assignment.AssignedServers)
 
 	// Check TTL expiry
 	if assignment.TTL != nil && *assignment.TTL < time.Now().Unix() {
-		return nil, fmt.Errorf("AC assignment expired for %s", acID)
+		return nil, ForwardAssignmentExpired, fmt.Errorf("AC assignment expired for %s", acID)
 	}
 
 	// Filter to healthy servers, excluding self
 	servers := f.filterForwardTargets(ctx, assignment.AssignedServers)
-	if len(servers) == 0 {
-		return nil, fmt.Errorf("no available servers to forward knock for AC %s", acID)
+	selectedTargets = len(servers)
+	if selectedTargets == 0 {
+		return nil, ForwardAllTargetsFiltered, fmt.Errorf("no available servers to forward knock for AC %s", acID)
 	}
 
 	// Shuffle for load distribution
@@ -264,19 +352,25 @@ func (f *HttpKnockForwarder) ForwardHttpKnock(
 
 	// Try each server until one succeeds
 	var lastErr error
+	var lastAck *common.ServerKnockAckMsg
 	for _, srv := range servers {
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("context canceled before trying %s: %w", srv.ID, ctx.Err())
+			return nil, ForwardContextCanceled, fmt.Errorf("context canceled before trying %s: %w", srv.ID, ctx.Err())
 		}
-		ackMsg, err := f.forwardToServer(ctx, srv, req, res)
-		if err != nil {
-			log.Warning("HTTP knock forward to %s (%s) failed: %v", srv.ID, srv.InternalIP, err)
+		attemptedTargets++
+		lastTargetID, lastTargetIP = srv.ID, srv.InternalIP
+		ackMsg, ferr := f.forwardToServer(ctx, srv, req, res)
+		if ferr != nil {
+			log.Warning("HTTP knock forward to %s (%s) failed: %v", srv.ID, srv.InternalIP, ferr)
 			f.markFailed(srv.InternalIP)
-			lastErr = err
+			lastErr, lastAck = ferr, ackMsg
+			if ackMsg != nil {
+				remoteAckErrCode = ackMsg.ErrCode
+			}
 			continue
 		}
 		log.Info("HTTP knock forwarded to %s (%s) for AC %s", srv.ID, srv.InternalIP, acID)
-		return ackMsg, nil
+		return ackMsg, ForwardSuccess, nil
 	}
 
 	// All forwards failed — invalidate CloudMap cache so next attempt gets fresh data
@@ -284,7 +378,7 @@ func (f *HttpKnockForwarder) ForwardHttpKnock(
 		f.cloudMap.InvalidateCache()
 	}
 
-	return nil, fmt.Errorf("all %d servers failed for AC %s: %w", len(servers), acID, lastErr)
+	return nil, classifyForwardAttempt(lastAck, lastErr), fmt.Errorf("all %d servers failed for AC %s: %w", len(servers), acID, lastErr)
 }
 
 // FanoutHttpKnock forwards the knock to ALL healthy assigned peer servers in
@@ -539,7 +633,11 @@ func (f *HttpKnockForwarder) forwardToServer(
 	}
 
 	if fwdResp.Error != "" {
-		return nil, fmt.Errorf("remote error: %s", fwdResp.Error)
+		// Return the parsed peer ack alongside the error (Phase 0A) so callers
+		// can read the peer's structured ErrCode/ErrMsg to classify remote_no_ac
+		// vs remote_ac_ops_failed rather than string-matching the transport error.
+		// Callers that ignore the ack on error (FanoutHttpKnock) are unaffected.
+		return fwdResp.AckMsg, fmt.Errorf("remote error: %s", fwdResp.Error)
 	}
 
 	return fwdResp.AckMsg, nil
