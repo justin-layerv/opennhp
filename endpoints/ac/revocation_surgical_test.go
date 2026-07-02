@@ -75,7 +75,8 @@ func newSurgicalTestAC(t *testing.T, enumerate func(srcIP, dstIP string, proto u
 	return a, fsf
 }
 
-func counter(t *testing.T, a *UdpAC, name string) float64 {
+// incrCounter reads counters emitted through incrMetric/IncrCounter.
+func incrCounter(t *testing.T, a *UdpAC, name string) float64 {
 	t.Helper()
 	counters, _ := a.registration.metrics.CountersForTest(t)
 	return counters[name]
@@ -136,15 +137,15 @@ func TestFlushEntryNow_Surgical_KillsEachSibling(t *testing.T) {
 			t.Errorf("FlushConn for sport %d carried Flow %s, want %s", want, c.Flow, key)
 		}
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 2 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushed); got != 2 {
 		t.Errorf("%s = %v, want 2", MetricRevocationSurgicalFlushed, got)
 	}
 	// Coarse path still fired (drain-once-feed-both): the entry had drained keys.
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (coarse reschedule must run alongside surgical)", MetricRevocationFlushScheduled, got)
 	}
 	// No v6 hard-fail on a v4 entry.
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 on a v4 flow", MetricRevocationIPv6HardFail, got)
 	}
 }
@@ -180,16 +181,16 @@ func TestFlushEntryNow_IPv6_HardFailNoSurgical(t *testing.T) {
 	if n := len(fsf.snapshot()); n != 0 {
 		t.Errorf("FlushConn called %d times for an IPv6 flow, want 0", n)
 	}
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 1 {
 		t.Errorf("%s = %v, want 1 (a v6 flow under EBPFXDP is an immediate-revocation gap, #2778)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0 (no surgical teardown is possible for v6)", MetricRevocationSurgicalFlushed, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0 (v6 seam unwired → hard-fail, nothing flushed)", MetricRevocationSurgicalFlushedV6, got)
 	}
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (per-entry tick; v6 coarse reschedule skipped)", MetricRevocationFlushScheduled, got)
 	}
 }
@@ -224,11 +225,11 @@ func TestFlushEntryNow_ICMPandAny_NoSurgicalNoHardFail(t *testing.T) {
 			if n := len(fsf.snapshot()); n != 0 {
 				t.Errorf("%s: FlushConn called %d times, want 0", proto, n)
 			}
-			if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+			if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 				t.Errorf("%s: %s = %v, want 0 (ICMP/any v4 is not a hard-fail)", proto, MetricRevocationIPv6HardFail, got)
 			}
 			// Coarse path still runs to tear the allow-rule down.
-			if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+			if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 				t.Errorf("%s: %s = %v, want 1", proto, MetricRevocationFlushScheduled, got)
 			}
 		})
@@ -244,8 +245,7 @@ func TestFlushEntryNow_ICMPandAny_NoSurgicalNoHardFail(t *testing.T) {
 // surgical seam unwired DOES hard-fail (#2794), which
 // revocation_iptables_v6_test.go covers.
 func TestFlushEntryNow_CoarseOnlyWhenSurgicalUnwired(t *testing.T) {
-	a, _ := newTestACWithScheduler(t) // leaves surgicalConnFlush + registration nil
-	a.registration = &ACRegistration{metrics: metrics.NewPublisherForTest(t)}
+	a, _ := newTestACWithScheduler(t) // leaves surgicalConnFlush and config nil
 
 	key, err := MakeFlowKey("198.51.100.7", "203.0.113.10", 443, FlowProtoTCP)
 	if err != nil {
@@ -257,13 +257,13 @@ func TestFlushEntryNow_CoarseOnlyWhenSurgicalUnwired(t *testing.T) {
 
 	a.flushEntryNow(entry)
 
-	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0 when surgical seam is unwired", MetricRevocationSurgicalFlushed, got)
 	}
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 for a v4 key with nil config (no v6 gap, no iptables-mode attribution)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (coarse path runs)", MetricRevocationFlushScheduled, got)
 	}
 }

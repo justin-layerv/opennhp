@@ -3,8 +3,6 @@ package ac
 import (
 	"testing"
 	"time"
-
-	"github.com/OpenNHP/opennhp/endpoints/metrics"
 )
 
 // These tests pin the #2794 fix and its #2165 gap-closing follow-up. In
@@ -31,13 +29,12 @@ import (
 // publisher and a started scheduler, leaving the eBPF surgical seam unwired
 // (surgicalConnFlush == nil) — exactly the production iptables-mode shape for
 // the revocation apply path. Mirrors newTestACWithScheduler but pins the filter
-// mode + an observable metrics publisher. Returns the recording flusher too, so a
+// mode. Returns the recording flusher too, so a
 // test that needs to assert which FlowKeys actually reached the flusher (not just
 // revocation counters) can use it; counter-only tests discard it with `_`.
 func newIPTablesTestAC(t *testing.T) (*UdpAC, *recordingFlusher) {
 	t.Helper()
 	a, f := newTestACWithScheduler(t) // surgicalConnFlush left nil → coarse-only
-	a.registration = &ACRegistration{metrics: metrics.NewPublisherForTest(t)}
 	a.config = &Config{FilterMode: FilterMode_IPTABLES}
 	return a, f
 }
@@ -60,7 +57,7 @@ func TestApplyRevocation_IPTablesV6_HardFail(t *testing.T) {
 	a.expirySched.Schedule(key, time.Now().Add(10*time.Second)) // far-future normal expiry
 
 	// Pre-condition: nothing ticked yet.
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Fatalf("precondition: %s = %v, want 0 before revoke", MetricRevocationIPv6HardFail, got)
 	}
 
@@ -72,20 +69,20 @@ func TestApplyRevocation_IPTablesV6_HardFail(t *testing.T) {
 	// THE assertion: a v6 revoke under iptables raises the dedicated hard-fail,
 	// so the revoke breaker/observability can tell "v6 revoke not torn down"
 	// apart from a benign expiry skip.
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 1 {
 		t.Fatalf("%s = %v, want 1 (a v6 revoke under iptables is an immediate-revocation gap, #2794)", MetricRevocationIPv6HardFail, got)
 	}
 	// No eBPF surgical teardown is possible/attempted in iptables mode.
-	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0 (no surgical path in iptables mode)", MetricRevocationSurgicalFlushed, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0 (no v6 surgical path in iptables mode)", MetricRevocationSurgicalFlushedV6, got)
 	}
 	// FlushScheduled ticks once per processed entry (the v6 coarse reschedule is
 	// skipped now — #2778 part 2 — but the per-entry counter still fires), and the
 	// entry was torn out of tokenStore so a re-knock cannot extend it.
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (per-entry tick even when the v6 key hard-fails)", MetricRevocationFlushScheduled, got)
 	}
 	if _, found := a.tokenStore.Load(token); found {
@@ -106,16 +103,16 @@ func TestFlushEntryNow_IPTablesV6_HardFail(t *testing.T) {
 
 	a.flushEntryNow(entry)
 
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 1 {
 		t.Errorf("%s = %v, want 1 (v6 under iptables has no immediate conntrack teardown, #2794)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0 (surgical seam unwired in iptables mode)", MetricRevocationSurgicalFlushed, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0 (v6 surgical seam unwired in iptables mode)", MetricRevocationSurgicalFlushedV6, got)
 	}
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (per-entry tick; v6 coarse reschedule skipped)", MetricRevocationFlushScheduled, got)
 	}
 }
@@ -145,10 +142,10 @@ func TestFlushEntryNow_IPTablesV6_NetlinkBackend_NoHardFail(t *testing.T) {
 	if len(keys) != 1 || keys[0] != key {
 		t.Errorf("flusher saw %v; want exactly [%v] (netlink-capable iptables v6 revoke should flush the v6 key)", keys, key)
 	}
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 (netlink backend coarse Flush is v6-capable; gap closed, #2165)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (coarse path still runs)", MetricRevocationFlushScheduled, got)
 	}
 }
@@ -166,10 +163,10 @@ func TestFlushEntryNow_IPTablesV4_NoHardFail(t *testing.T) {
 
 	a.flushEntryNow(entry)
 
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 for a v4 key under iptables (v4 tears down via conntrack -D; only v6 is the declared gap)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (coarse path runs)", MetricRevocationFlushScheduled, got)
 	}
 }
@@ -181,7 +178,6 @@ func TestFlushEntryNow_IPTablesV4_NoHardFail(t *testing.T) {
 // `a.config != nil` guard in flushEntryNow.
 func TestFlushEntryNow_NilConfigV6_NoHardFail(t *testing.T) {
 	a, _ := newTestACWithScheduler(t) // config + surgicalConnFlush both nil
-	a.registration = &ACRegistration{metrics: metrics.NewPublisherForTest(t)}
 
 	key := mustKey(t, "2001:db8::1", "2001:db8::2", 443, FlowProtoTCP)
 	entry := &AccessEntry{OpenTime: 10}
@@ -189,10 +185,10 @@ func TestFlushEntryNow_NilConfigV6_NoHardFail(t *testing.T) {
 
 	a.flushEntryNow(entry) // must not panic
 
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 with nil config (filter mode unknown — no hard-fail attribution)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (per-entry tick; the v6 coarse reschedule is skipped)", MetricRevocationFlushScheduled, got)
 	}
 }
@@ -251,7 +247,7 @@ func TestFlushEntryNow_IPTablesV6_NotRescheduledIntoFlusher(t *testing.T) {
 		t.Errorf("flusher saw %v; want exactly [%v] (only the v4 key is rescheduled; the v6 key must never reach the v4-only flusher)", keys, v4)
 	}
 	// The v6 revoke is surfaced on the dedicated hard-fail, NOT the expiry-skip path.
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 1 {
 		t.Errorf("%s = %v, want 1 (v6 revoke surfaced on the dedicated hard-fail metric)", MetricRevocationIPv6HardFail, got)
 	}
 }

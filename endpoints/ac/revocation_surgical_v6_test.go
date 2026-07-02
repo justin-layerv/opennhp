@@ -86,19 +86,19 @@ func TestFlushEntryNow_V6Surgical_KillsEachSibling(t *testing.T) {
 			t.Errorf("FlushConnV6 for sport %d carried Flow %s, want %s", want, c.Flow, key)
 		}
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 2 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 2 {
 		t.Errorf("%s = %v, want 2", MetricRevocationSurgicalFlushedV6, got)
 	}
 	// The shared v4 counter must NOT move for a v6 flush — the split is the whole
 	// point of the v6-specific counter (observable by address family for E5).
-	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0 (v6 flushes tick the V6 counter, not the v4 one)", MetricRevocationSurgicalFlushed, got)
 	}
 	// v6 was surgically handled — NOT a hard-fail.
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 (v6 was surgically flushed, not a gap)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (per-entry tick; surgical-v6 teardown, v6 coarse reschedule skipped)", MetricRevocationFlushScheduled, got)
 	}
 }
@@ -131,10 +131,10 @@ func TestFlushEntryNow_V6_ICMP_NoSurgicalNoHardFail(t *testing.T) {
 	if n := len(v6.snapshot()); n != 0 {
 		t.Errorf("FlushConnV6 called %d times for a v6 ICMP flow, want 0", n)
 	}
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 (v6 ICMP/any is not a hard-fail; coarse teardown suffices)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0", MetricRevocationSurgicalFlushedV6, got)
 	}
 }
@@ -165,10 +165,10 @@ func TestFlushEntryNow_V6_NotPinned_SoftFallback(t *testing.T) {
 	if n := len(v6.snapshot()); n != 0 {
 		t.Errorf("FlushConnV6 called %d times when conn_track_v6 not pinned, want 0", n)
 	}
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 (map-not-pinned is a soft fallback, not a hard-fail)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0", MetricRevocationSurgicalFlushedV6, got)
 	}
 }
@@ -195,10 +195,10 @@ func TestFlushEntryNow_V6_EnumerateError_HardFails(t *testing.T) {
 	if n := len(v6.snapshot()); n != 0 {
 		t.Errorf("FlushConnV6 called %d times on enumeration error, want 0", n)
 	}
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 1 {
 		t.Errorf("%s = %v, want 1 (a v6 enumeration error has no coarse fallback — it IS an immediate-revocation gap, #2778)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0", MetricRevocationSurgicalFlushedV6, got)
 	}
 }
@@ -224,13 +224,13 @@ func TestFlushEntryNow_V6_SeamUnwired_StillHardFails(t *testing.T) {
 
 	a.flushEntryNow(entry)
 
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 1 {
 		t.Errorf("%s = %v, want 1 (v6 seam unwired → hard-fail fallback preserved)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0", MetricRevocationSurgicalFlushedV6, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0", MetricRevocationSurgicalFlushed, got)
 	}
 }
@@ -258,15 +258,15 @@ func TestFlushEntryNow_V6_ICMP_SeamUnwired_NoHardFail(t *testing.T) {
 
 	a.flushEntryNow(entry)
 
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 (v6 ICMP has no conn_track_v6 entry; an unwired seam is not a gap — proto check must precede the seam-nil hard-fail)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0 (nothing to surgically flush for v6 ICMP)", MetricRevocationSurgicalFlushedV6, got)
 	}
 	// FlushScheduled ticks per processed entry; the v6 coarse reschedule is
 	// skipped (#2778 part 2), and v6 ICMP has no conn_track_v6 entry to flush.
-	if got := counter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (per-entry tick even when nothing is torn down for v6 ICMP)", MetricRevocationFlushScheduled, got)
 	}
 }
@@ -325,15 +325,15 @@ func TestFlushEntryNow_V6_PerPortFlushError_HardFails(t *testing.T) {
 	}
 
 	// The failed flow has no coarse fallback → it IS an immediate-revocation gap.
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 1 {
 		t.Errorf("%s = %v, want 1 (one per-port FlushConnV6 failed; a v6 flow with no coarse fallback is an immediate-revocation gap)", MetricRevocationIPv6HardFail, got)
 	}
 	// The surviving flow was torn down → the v6 success counter moves exactly once.
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 1 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 1 {
 		t.Errorf("%s = %v, want 1 (the sibling whose delete succeeded)", MetricRevocationSurgicalFlushedV6, got)
 	}
 	// The shared v4 counter must never move for a v6 flush.
-	if got := counter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushed); got != 0 {
 		t.Errorf("%s = %v, want 0 (v6 flushes tick the V6 counter, not the v4 one)", MetricRevocationSurgicalFlushed, got)
 	}
 }

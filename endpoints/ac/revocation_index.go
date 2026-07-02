@@ -361,7 +361,7 @@ func (a *UdpAC) ApplyRevocation(scope revocationScope, scopeKey string, epoch ui
 		if a.revIndex.peekStale(scope, scopeKey, epoch) {
 			a.incrMetric(MetricRevocationStaleDropped)
 		}
-		log.Info("[Revocation] no live entries for scope=%s key=%s epoch=%d", scope, scopeKey, epoch)
+		log.Debug("[Revocation] no live entries for scope=%s key=%s epoch=%d", scope, scopeKey, epoch)
 		return 0
 	}
 	if !a.revIndex.admitEpoch(scope, scopeKey, epoch) {

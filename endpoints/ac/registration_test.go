@@ -56,6 +56,23 @@ func TestNilMetricsPublisher(t *testing.T) {
 	reg.metrics.Stop()
 }
 
+func TestACMetricHelpersNilSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ac   *UdpAC
+	}{
+		{name: "nil registration", ac: &UdpAC{}},
+		{name: "nil publisher", ac: &UdpAC{registration: &ACRegistration{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.ac.incrMetric("TestMetric")
+			if tc.ac.addMetric("TestMetric", 1) {
+				t.Fatalf("addMetric reported success with no metrics publisher")
+			}
+		})
+	}
+}
+
 // mockNetError implements net.Error for testing the typed interface path in classifyError.
 type mockNetError struct {
 	msg     string

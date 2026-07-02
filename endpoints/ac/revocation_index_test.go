@@ -5,13 +5,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // newTestACWithScheduler builds a UdpAC wired with a real tokenStore, a fresh
 // revocation index, and a started L3 flush scheduler backed by a recording
-// flusher, so apply→flush can be observed end-to-end. registration is left nil;
-// incrMetric/addMetric are nil-safe so the revocation metrics no-op in tests.
+// flusher, so apply→flush can be observed end-to-end. It also installs a real
+// in-memory metrics publisher so the revocation apply-path counters are fenced.
 func newTestACWithScheduler(t *testing.T) (*UdpAC, *recordingFlusher) {
 	t.Helper()
 	f := newRecordingFlusher()
@@ -20,9 +21,10 @@ func newTestACWithScheduler(t *testing.T) (*UdpAC, *recordingFlusher) {
 	t.Cleanup(func() { shutdownOrFail(t, sched) })
 
 	a := &UdpAC{
-		tokenStore:  common.NewTokenStore[*AccessEntry](),
-		revIndex:    newRevocationIndex(),
-		expirySched: sched,
+		tokenStore:   common.NewTokenStore[*AccessEntry](),
+		revIndex:     newRevocationIndex(),
+		expirySched:  sched,
+		registration: &ACRegistration{metrics: metrics.NewPublisherForTest(t)},
 	}
 	a.installExpiryHook()
 	return a, f
@@ -56,6 +58,18 @@ func (r *recordingFlusher) snapshotAuthoritative() []bool {
 	out := make([]bool, len(r.authoritative))
 	copy(out, r.authoritative)
 	return out
+}
+
+// dimCounter reads counters emitted through addMetric/AddCounterWithDims with
+// no dimensions. NewPublisherForTest has no base dims, so the dim-counter key
+// is the metric name itself.
+func dimCounter(t *testing.T, a *UdpAC, name string) float64 {
+	t.Helper()
+	if dims := a.registration.metrics.DimensionsForTest(t); len(dims) != 0 {
+		t.Fatalf("dimCounter assumes no base dims, got %d", len(dims))
+	}
+	_, dimCounters := a.registration.metrics.CountersForTest(t)
+	return dimCounters[name]
 }
 
 func TestRevocationIndex_AddLookupRemove(t *testing.T) {
@@ -184,6 +198,15 @@ func TestApplyRevocation_FlushesAndDeletesMatchingEntry(t *testing.T) {
 	if got := flusher.snapshotKeys(); len(got) != 1 || got[0] != key {
 		t.Fatalf("flushed wrong key: got %v want [%v]", got, key)
 	}
+	if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 1 {
+		t.Fatalf("%s = %v, want 1 via AddCounterWithDims", MetricRevocationEntriesFlushed, got)
+	}
+	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
+		t.Fatalf("%s = %v, want 1", MetricRevocationFlushScheduled, got)
+	}
+	if got := incrCounter(t, a, MetricRevocationStaleDropped); got != 0 {
+		t.Fatalf("%s = %v before duplicate, want 0", MetricRevocationStaleDropped, got)
+	}
 
 	// Entry removed from tokenStore so a re-knock cannot extend it.
 	if _, found := a.tokenStore.Load(token); found {
@@ -193,6 +216,24 @@ func TestApplyRevocation_FlushesAndDeletesMatchingEntry(t *testing.T) {
 	if toks := a.revIndex.tokensFor(scopeQurl, "qhashX"); len(toks) != 0 {
 		t.Fatalf("revoked entry still indexed: %v", toks)
 	}
+
+	t.Run("duplicate after apply ticks stale metric", func(t *testing.T) {
+		// A post-apply duplicate has no live entry, but it has a seen epoch and
+		// must still tick the replay/stale metric without adding another flush
+		// count.
+		if n := a.ApplyRevocation(scopeQurl, "qhashX", 1); n != 0 {
+			t.Fatalf("duplicate revoke flushed %d, want 0", n)
+		}
+		if got := incrCounter(t, a, MetricRevocationStaleDropped); got != 1 {
+			t.Fatalf("%s = %v after duplicate, want 1", MetricRevocationStaleDropped, got)
+		}
+		if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 1 {
+			t.Fatalf("%s = %v after duplicate, want unchanged 1", MetricRevocationEntriesFlushed, got)
+		}
+		if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
+			t.Fatalf("%s = %v after duplicate, want unchanged 1", MetricRevocationFlushScheduled, got)
+		}
+	})
 }
 
 func TestApplyRevocation_OnlyTargetEntryRemovedUnderResource(t *testing.T) {
@@ -248,6 +289,9 @@ func TestApplyRevocation_EpochIdempotencyDropsStale(t *testing.T) {
 	if n := a.ApplyRevocation(scopeQurl, "qE", 5); n != 1 {
 		t.Fatalf("epoch 5 should apply, flushed %d", n)
 	}
+	if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 1 {
+		t.Fatalf("%s = %v after first apply, want 1", MetricRevocationEntriesFlushed, got)
+	}
 
 	// Re-admit the same qURL hash (a fresh session/token), then replay older
 	// and equal epochs — both must be DROPPED (no flush, returns 0).
@@ -258,6 +302,12 @@ func TestApplyRevocation_EpochIdempotencyDropsStale(t *testing.T) {
 	if n := a.ApplyRevocation(scopeQurl, "qE", 5); n != 0 {
 		t.Fatalf("duplicate epoch 5 must be dropped, flushed %d", n)
 	}
+	if got := incrCounter(t, a, MetricRevocationStaleDropped); got != 2 {
+		t.Fatalf("%s = %v after stale+duplicate, want 2", MetricRevocationStaleDropped, got)
+	}
+	if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 1 {
+		t.Fatalf("%s = %v after stale+duplicate, want unchanged 1", MetricRevocationEntriesFlushed, got)
+	}
 	// The replayed entry must still be alive — stale events did nothing.
 	if _, found := a.tokenStore.Load(tok2); !found {
 		t.Fatalf("entry wrongly removed by a stale/duplicate epoch")
@@ -267,8 +317,50 @@ func TestApplyRevocation_EpochIdempotencyDropsStale(t *testing.T) {
 	if n := a.ApplyRevocation(scopeQurl, "qE", 6); n != 1 {
 		t.Fatalf("newer epoch 6 should apply, flushed %d", n)
 	}
+	if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 2 {
+		t.Fatalf("%s = %v after epoch 6, want 2", MetricRevocationEntriesFlushed, got)
+	}
 	if _, found := a.tokenStore.Load(tok2); found {
 		t.Fatalf("entry should be gone after epoch 6")
+	}
+}
+
+func TestApplyRevocation_ConcurrentDuplicateEpochAppliesOnce(t *testing.T) {
+	a, _ := newTestACWithScheduler(t)
+	token := a.GenerateAccessToken(qurlV2Entry("qConcurrent", "rConcurrent", "", "aConcurrent"))
+
+	const goroutines = 32
+	start := make(chan struct{})
+	results := make(chan int, goroutines)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- a.ApplyRevocation(scopeQurl, "qConcurrent", 7)
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	total := 0
+	for n := range results {
+		total += n
+	}
+	if total != 1 {
+		t.Fatalf("concurrent duplicate revokes flushed %d total entries, want exactly 1", total)
+	}
+	if _, found := a.tokenStore.Load(token); found {
+		t.Fatalf("entry should be gone after the one admitted concurrent revoke")
+	}
+	if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 1 {
+		t.Fatalf("%s = %v, want 1", MetricRevocationEntriesFlushed, got)
+	}
+	if got := incrCounter(t, a, MetricRevocationStaleDropped); got != goroutines-1 {
+		t.Fatalf("%s = %v, want %d duplicate drops", MetricRevocationStaleDropped, got, goroutines-1)
 	}
 }
 

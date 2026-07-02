@@ -441,9 +441,7 @@ func TestBareScopeKey(t *testing.T) {
 
 // TestHandleUdpACRevocation_RejectsIncrementMetric proves the fail-closed reject
 // paths increment MetricRevocationRejected. It uses a real metrics publisher
-// (not newTestACWithScheduler, which leaves registration nil so incrMetric
-// no-ops — a counter assertion there would be vacuous). Each reject case is its
-// own publisher so the counts don't accumulate across cases. No scheduler is
+// per reject case so counts don't accumulate across cases. No scheduler is
 // needed: every reject returns before the flush.
 func TestHandleUdpACRevocation_RejectsIncrementMetric(t *testing.T) {
 	for _, tc := range []struct {

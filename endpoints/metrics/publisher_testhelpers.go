@@ -139,8 +139,8 @@ func ParseEMFLinesForTest(t testing.TB, data []byte) []map[string]any {
 // CountersForTest returns snapshots of the in-memory counter state. It is
 // intended only for external-package tests that need to assert which metrics
 // were emitted by code under test. The returned maps are deep copies; the
-// dimCounters map is keyed by `<metric>|<dim_name>=<dim_value>|...` for
-// stable substring assertions.
+// dimCounters map uses the same NUL-separated key format as buildDimCounterKey.
+// With no dimensions, the key is the bare metric name.
 func (mp *Publisher) CountersForTest(t testing.TB) (counters map[string]float64, dimCounters map[string]float64) {
 	t.Helper()
 	if mp == nil {
