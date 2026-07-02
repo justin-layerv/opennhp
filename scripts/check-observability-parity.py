@@ -68,6 +68,8 @@ AC_CORE_ALARM_NAMES = (
     "l3_flush_schedule_wait_timeout",
     "publisher_failures",
     "ebpf_map_full",
+    "ebpf_perf_lost_samples",
+    "ebpf_deny_telemetry_suppressed",
     "ebpf_conntrack_v4_usage_high",
     "ebpf_conntrack_v6_usage_high",
     "ebpf_frag_state_v6_usage_high",

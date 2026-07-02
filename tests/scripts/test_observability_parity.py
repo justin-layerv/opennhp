@@ -477,6 +477,10 @@ class ObservabilityParityTests(unittest.TestCase):
     def test_aop_replay_detection_alarm_is_fenced(self) -> None:
         self.assertIn("aop_replay_detected", AC_CORE_ALARMS)
 
+    def test_ebpf_telemetry_sampling_alarms_are_fenced(self) -> None:
+        self.assertIn("ebpf_perf_lost_samples", AC_CORE_ALARMS)
+        self.assertIn("ebpf_deny_telemetry_suppressed", AC_CORE_ALARMS)
+
     def test_in_sync_fixture_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

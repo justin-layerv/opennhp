@@ -671,6 +671,18 @@ const (
 	// the eBPF FilterMode flip.
 	MetricEbpfMapFull = "EbpfMapFull"
 
+	// MetricEbpfPerfLostSamples counts perf-buffer samples the kernel dropped
+	// before the AC reader could drain them. This should stay flat after #2849's
+	// malformed-DENY limiter; any non-zero period means filter-decision telemetry
+	// was lost and the E5 FilterMode flip is no longer observably complete.
+	MetricEbpfPerfLostSamples = "EbpfPerfLostSamples"
+
+	// MetricEbpfDenyTelemetrySuppressed counts malformed/early-drop DENY events
+	// intentionally shed by the #2849 token bucket. A non-zero rate means the
+	// limiter is protecting the perf ring under malformed-packet pressure; it is
+	// expected during an attack/canary and should be flat under normal load.
+	MetricEbpfDenyTelemetrySuppressed = "EbpfDenyTelemetrySuppressed"
+
 	// eBPF established-flow conntrack and IPv6 fragment-state telemetry.
 	// Entries/max/usage/age values are gauges produced by
 	// BpfFlusher.ConntrackStats when EBPFXDP is wired; the gauge funcs are not

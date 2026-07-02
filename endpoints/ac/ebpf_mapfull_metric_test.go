@@ -6,6 +6,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/utils/ebpf"
@@ -110,6 +111,220 @@ func TestRecordEbpfInsertResult_RepeatedMapFull_MonotonicCount(t *testing.T) {
 	}
 }
 
+func TestUdpAC_EbpfTelemetryMetrics_RecordsCounterDeltas(t *testing.T) {
+	publisher := metrics.NewPublisherForTest(t)
+	var lostPerfSamples uint64
+	var suppressedDeny uint64
+	a := &UdpAC{
+		registration: &ACRegistration{metrics: publisher},
+		ebpfLostPerfSamples: func() uint64 {
+			return lostPerfSamples
+		},
+		ebpfDenyTelemetrySuppressed: func() uint64 {
+			return suppressedDeny
+		},
+	}
+
+	lostPerfSamples = 3
+	suppressedDeny = 2
+	a.recordEbpfTelemetryMetricDeltas()
+	if got := counterValueForTest(t, publisher, MetricEbpfPerfLostSamples); got != 3 {
+		t.Fatalf("%s counter after first sample = %v, want 3", MetricEbpfPerfLostSamples, got)
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfDenyTelemetrySuppressed); got != 2 {
+		t.Fatalf("%s counter after first sample = %v, want 2", MetricEbpfDenyTelemetrySuppressed, got)
+	}
+
+	a.recordEbpfTelemetryMetricDeltas()
+	if got := counterValueForTest(t, publisher, MetricEbpfPerfLostSamples); got != 3 {
+		t.Fatalf("%s counter after repeated watermark = %v, want still 3", MetricEbpfPerfLostSamples, got)
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfDenyTelemetrySuppressed); got != 2 {
+		t.Fatalf("%s counter after repeated watermark = %v, want still 2", MetricEbpfDenyTelemetrySuppressed, got)
+	}
+
+	lostPerfSamples = 8
+	suppressedDeny = 10
+	a.recordEbpfTelemetryMetricDeltas()
+	if got := counterValueForTest(t, publisher, MetricEbpfPerfLostSamples); got != 8 {
+		t.Fatalf("%s counter after advanced watermark = %v, want 8", MetricEbpfPerfLostSamples, got)
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfDenyTelemetrySuppressed); got != 10 {
+		t.Fatalf("%s counter after advanced watermark = %v, want 10", MetricEbpfDenyTelemetrySuppressed, got)
+	}
+}
+
+func TestUdpAC_EbpfTelemetryMetrics_DoesNotConsumeCounterDeltasWithoutPublisher(t *testing.T) {
+	publisher := metrics.NewPublisherForTest(t)
+	a := &UdpAC{
+		ebpfLostPerfSamples: func() uint64 {
+			return 5
+		},
+		ebpfDenyTelemetrySuppressed: func() uint64 {
+			return 4
+		},
+	}
+
+	a.recordEbpfTelemetryMetricDeltas()
+	if got := a.ebpfLostPerfSamplesReported.Load(); got != 0 {
+		t.Fatalf("lost perf watermark advanced without publisher: got %d, want 0", got)
+	}
+	if got := a.ebpfDenyTelemetrySuppressedReported.Load(); got != 0 {
+		t.Fatalf("suppressed-DENY watermark advanced without publisher: got %d, want 0", got)
+	}
+
+	a.registration = &ACRegistration{metrics: publisher}
+	a.recordEbpfTelemetryMetricDeltas()
+	if got := counterValueForTest(t, publisher, MetricEbpfPerfLostSamples); got != 5 {
+		t.Fatalf("%s counter after publisher attach = %v, want 5", MetricEbpfPerfLostSamples, got)
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfDenyTelemetrySuppressed); got != 4 {
+		t.Fatalf("%s counter after publisher attach = %v, want 4", MetricEbpfDenyTelemetrySuppressed, got)
+	}
+}
+
+func TestUdpAC_EbpfTelemetryMetricPublisher_StartGating(t *testing.T) {
+	tests := []struct {
+		name              string
+		filterMode        int
+		registrationWired bool
+		metricsWired      bool
+		wantStarted       bool
+	}{
+		{
+			name:              "ebpf with metrics starts",
+			filterMode:        FilterMode_EBPFXDP,
+			registrationWired: true,
+			metricsWired:      true,
+			wantStarted:       true,
+		},
+		{
+			name:              "iptables with metrics does not start",
+			filterMode:        FilterMode_IPTABLES,
+			registrationWired: true,
+			metricsWired:      true,
+			wantStarted:       false,
+		},
+		{
+			name:              "ebpf without registration does not start",
+			filterMode:        FilterMode_EBPFXDP,
+			registrationWired: false,
+			metricsWired:      false,
+			wantStarted:       false,
+		},
+		{
+			name:              "ebpf without metrics does not start",
+			filterMode:        FilterMode_EBPFXDP,
+			registrationWired: true,
+			metricsWired:      false,
+			wantStarted:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var publisher *metrics.Publisher
+			var registration *ACRegistration
+			if tt.registrationWired {
+				registration = &ACRegistration{}
+				if tt.metricsWired {
+					publisher = metrics.NewPublisherForTest(t)
+					registration.metrics = publisher
+				}
+			}
+			a := &UdpAC{
+				config:       &Config{FilterMode: tt.filterMode},
+				registration: registration,
+				ebpfLostPerfSamples: func() uint64 {
+					return 7
+				},
+				ebpfDenyTelemetrySuppressed: func() uint64 {
+					return 9
+				},
+			}
+			a.signals.stop = make(chan struct{})
+
+			a.startEbpfTelemetryMetricPublisher()
+			if gotStarted := a.ebpfTelemetryPublisherDone != nil; gotStarted != tt.wantStarted {
+				t.Fatalf("publisher started = %t, want %t", gotStarted, tt.wantStarted)
+			}
+			firstDone := a.ebpfTelemetryPublisherDone
+			a.startEbpfTelemetryMetricPublisher()
+			if a.ebpfTelemetryPublisherDone != firstDone {
+				t.Fatalf("second publisher start changed done channel: got %p, want %p", a.ebpfTelemetryPublisherDone, firstDone)
+			}
+			close(a.signals.stop)
+
+			done := make(chan struct{})
+			go func() {
+				a.wg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("telemetry metric publisher did not stop")
+			}
+
+			if publisher == nil {
+				return
+			}
+			if got := counterValueForTest(t, publisher, MetricEbpfPerfLostSamples); got != 0 {
+				t.Fatalf("%s counter after publisher stop = %v, want 0; Stop owns the final flush", MetricEbpfPerfLostSamples, got)
+			}
+			if got := counterValueForTest(t, publisher, MetricEbpfDenyTelemetrySuppressed); got != 0 {
+				t.Fatalf("%s counter after publisher stop = %v, want 0; Stop owns the final flush", MetricEbpfDenyTelemetrySuppressed, got)
+			}
+		})
+	}
+}
+
+func TestUdpAC_EbpfTelemetryMetricPublisher_StopFlushPublishesTrailingDelta(t *testing.T) {
+	publisher := metrics.NewPublisherForTest(t)
+	var lostPerfSamples uint64
+	var suppressedDeny uint64
+	a := &UdpAC{
+		config:       &Config{FilterMode: FilterMode_EBPFXDP},
+		registration: &ACRegistration{metrics: publisher},
+		ebpfLostPerfSamples: func() uint64 {
+			return lostPerfSamples
+		},
+		ebpfDenyTelemetrySuppressed: func() uint64 {
+			return suppressedDeny
+		},
+	}
+	a.signals.stop = make(chan struct{})
+
+	a.startEbpfTelemetryMetricPublisher()
+	if a.ebpfTelemetryPublisherDone == nil {
+		t.Fatal("telemetry metric publisher did not start")
+	}
+
+	lostPerfSamples = 11
+	suppressedDeny = 13
+	close(a.signals.stop)
+	a.flushEbpfTelemetryOnStop()
+	select {
+	case <-a.ebpfTelemetryPublisherDone:
+	default:
+		t.Fatal("telemetry metric publisher still running after stop flush")
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfPerfLostSamples); got != 11 {
+		t.Fatalf("%s counter after stop flush = %v, want 11", MetricEbpfPerfLostSamples, got)
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfDenyTelemetrySuppressed); got != 13 {
+		t.Fatalf("%s counter after stop flush = %v, want 13", MetricEbpfDenyTelemetrySuppressed, got)
+	}
+
+	a.flushEbpfTelemetryOnStop()
+	if got := counterValueForTest(t, publisher, MetricEbpfPerfLostSamples); got != 11 {
+		t.Fatalf("%s counter after repeated stop flush = %v, want still 11", MetricEbpfPerfLostSamples, got)
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfDenyTelemetrySuppressed); got != 13 {
+		t.Fatalf("%s counter after repeated stop flush = %v, want still 13", MetricEbpfDenyTelemetrySuppressed, got)
+	}
+}
+
 func TestACRegistration_EbpfConntrackGauges_ReadWiredStats(t *testing.T) {
 	want := BpfConntrackStats{
 		V4Entries:             7,
@@ -210,13 +425,13 @@ func TestACRegistration_ConntrackGaugeCollectionReadsCachedStatsAndPublishesCoun
 	if got := gauges[MetricEbpfConntrackSampleSeconds]; got != 1.25 {
 		t.Fatalf("%s gauge after collection = %v, want 1.25", MetricEbpfConntrackSampleSeconds, got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 11 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 11 {
 		t.Fatalf("%s counter after collection = %v, want 11", MetricEbpfConntrackV4ExpiredReaped, got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 5 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 5 {
 		t.Fatalf("%s counter after collection = %v, want 5", MetricEbpfConntrackV6ExpiredReaped, got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 7 {
+	if got := counterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 7 {
 		t.Fatalf("%s counter after collection = %v, want 7", MetricEbpfFragStateV6ExpiredReaped, got)
 	}
 }
@@ -286,63 +501,63 @@ func TestUdpAC_BpfConntrackStats_RecordsCounterDeltas(t *testing.T) {
 	if _, ok := a.BpfConntrackStats(); !ok {
 		t.Fatal("BpfConntrackStats ok = false, want true")
 	}
-	sampleErrors := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackSampleErrors)
+	sampleErrors := counterValueForTest(t, publisher, MetricEbpfConntrackSampleErrors)
 	if got := sampleErrors; got != 2 {
 		t.Fatalf("sample error counter after first sample = %v, want 2", got)
 	}
-	partialSamples := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackPartialSamples)
+	partialSamples := counterValueForTest(t, publisher, MetricEbpfConntrackPartialSamples)
 	if got := partialSamples; got != 1 {
 		t.Fatalf("partial sample counter after first sample = %v, want 1", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 11 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 11 {
 		t.Fatalf("v4 expired-reaped counter after first sample = %v, want 11", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 5 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 5 {
 		t.Fatalf("v6 expired-reaped counter after first sample = %v, want 5", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 6 {
+	if got := counterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 6 {
 		t.Fatalf("v6 fragment expired-reaped counter after first sample = %v, want 6", got)
 	}
 
 	if _, ok := a.BpfConntrackStats(); !ok {
 		t.Fatal("BpfConntrackStats ok = false on cached cumulative sample, want true")
 	}
-	sampleErrors = conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackSampleErrors)
+	sampleErrors = counterValueForTest(t, publisher, MetricEbpfConntrackSampleErrors)
 	if got := sampleErrors; got != 2 {
 		t.Fatalf("sample error counter after repeated watermark = %v, want still 2", got)
 	}
-	partialSamples = conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackPartialSamples)
+	partialSamples = counterValueForTest(t, publisher, MetricEbpfConntrackPartialSamples)
 	if got := partialSamples; got != 1 {
 		t.Fatalf("partial sample counter after repeated watermark = %v, want still 1", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 11 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 11 {
 		t.Fatalf("v4 expired-reaped counter after repeated watermark = %v, want still 11", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 5 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 5 {
 		t.Fatalf("v6 expired-reaped counter after repeated watermark = %v, want still 5", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 6 {
+	if got := counterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 6 {
 		t.Fatalf("v6 fragment expired-reaped counter after repeated watermark = %v, want still 6", got)
 	}
 
 	if _, ok := a.BpfConntrackStats(); !ok {
 		t.Fatal("BpfConntrackStats ok = false on advanced cumulative sample, want true")
 	}
-	sampleErrors = conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackSampleErrors)
+	sampleErrors = counterValueForTest(t, publisher, MetricEbpfConntrackSampleErrors)
 	if got := sampleErrors; got != 5 {
 		t.Fatalf("sample error counter after advanced watermark = %v, want 5", got)
 	}
-	partialSamples = conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackPartialSamples)
+	partialSamples = counterValueForTest(t, publisher, MetricEbpfConntrackPartialSamples)
 	if got := partialSamples; got != 4 {
 		t.Fatalf("partial sample counter after advanced watermark = %v, want 4", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 17 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 17 {
 		t.Fatalf("v4 expired-reaped counter after advanced watermark = %v, want 17", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 9 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackV6ExpiredReaped); got != 9 {
 		t.Fatalf("v6 expired-reaped counter after advanced watermark = %v, want 9", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 12 {
+	if got := counterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 12 {
 		t.Fatalf("v6 fragment expired-reaped counter after advanced watermark = %v, want 12", got)
 	}
 }
@@ -378,18 +593,18 @@ func TestUdpAC_BpfConntrackStats_DoesNotConsumeCounterDeltasWithoutPublisher(t *
 	if _, ok := a.BpfConntrackStats(); !ok {
 		t.Fatal("BpfConntrackStats ok = false with publisher, want true")
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackSampleErrors); got != 2 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackSampleErrors); got != 2 {
 		t.Fatalf("sample-error counter after publisher attach = %v, want 2", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 11 {
+	if got := counterValueForTest(t, publisher, MetricEbpfConntrackV4ExpiredReaped); got != 11 {
 		t.Fatalf("v4 expired-reaped counter after publisher attach = %v, want 11", got)
 	}
-	if got := conntrackCounterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 6 {
+	if got := counterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 6 {
 		t.Fatalf("v6 fragment expired-reaped counter after publisher attach = %v, want 6", got)
 	}
 }
 
-func conntrackCounterValueForTest(t *testing.T, publisher *metrics.Publisher, name string) float64 {
+func counterValueForTest(t *testing.T, publisher *metrics.Publisher, name string) float64 {
 	t.Helper()
 
 	counters, dimCounters := publisher.CountersForTest(t)

@@ -161,6 +161,23 @@ type UdpAC struct {
 	bpfConntrackExpiredReapedV6Reported atomic.Uint64
 	bpfFragStateExpiredReapedV6Reported atomic.Uint64
 
+	// ebpfTelemetry*Reported are cumulative eBPF telemetry watermarks already
+	// emitted as reset-per-flush publisher counter events. The raw counters live
+	// in endpoints/ac/ebpf because the perf readers and deny_suppressed poller
+	// own those datapath-adjacent signals.
+	ebpfLostPerfSamplesReported         atomic.Uint64
+	ebpfDenyTelemetrySuppressedReported atomic.Uint64
+
+	// ebpfLostPerfSamples / ebpfDenyTelemetrySuppressed are test seams for the
+	// package-level counters in endpoints/ac/ebpf. Production leaves them nil.
+	ebpfLostPerfSamples         func() uint64
+	ebpfDenyTelemetrySuppressed func() uint64
+
+	// ebpfTelemetryPublisherDone lets Stop wait for this one lifecycle goroutine
+	// before registration.Stop() flushes metrics, without reordering the broader
+	// ac.wg.Wait() shutdown sequence that other AC goroutines depend on.
+	ebpfTelemetryPublisherDone chan struct{}
+
 	// conntrackFlusher holds the FilterMode_IPTABLES flusher so Stop can
 	// Close it (the netlink backend owns a pool of netlink sockets). nil
 	// in EBPFXDP / non-Linux / L3-disabled. Atomic because metrics readers
@@ -396,26 +413,47 @@ func (a *UdpAC) BpfConntrackStats() (BpfConntrackStats, bool) {
 }
 
 func (a *UdpAC) recordBpfConntrackSampleErrors(sampleErrors uint64) {
-	a.recordBpfConntrackCounterDeltas(&a.bpfConntrackSampleErrorsReported, sampleErrors, MetricEbpfConntrackSampleErrors)
+	a.recordCumulativeMetricDelta(&a.bpfConntrackSampleErrorsReported, sampleErrors, MetricEbpfConntrackSampleErrors)
 }
 
 func (a *UdpAC) recordBpfConntrackPartialSamples(partialSamples uint64) {
-	a.recordBpfConntrackCounterDeltas(&a.bpfConntrackPartialSamplesReported, partialSamples, MetricEbpfConntrackPartialSamples)
+	a.recordCumulativeMetricDelta(&a.bpfConntrackPartialSamplesReported, partialSamples, MetricEbpfConntrackPartialSamples)
 }
 
 func (a *UdpAC) recordBpfConntrackExpiredReapedV4(expiredReaped uint64) {
-	a.recordBpfConntrackCounterDeltas(&a.bpfConntrackExpiredReapedV4Reported, expiredReaped, MetricEbpfConntrackV4ExpiredReaped)
+	a.recordCumulativeMetricDelta(&a.bpfConntrackExpiredReapedV4Reported, expiredReaped, MetricEbpfConntrackV4ExpiredReaped)
 }
 
 func (a *UdpAC) recordBpfConntrackExpiredReapedV6(expiredReaped uint64) {
-	a.recordBpfConntrackCounterDeltas(&a.bpfConntrackExpiredReapedV6Reported, expiredReaped, MetricEbpfConntrackV6ExpiredReaped)
+	a.recordCumulativeMetricDelta(&a.bpfConntrackExpiredReapedV6Reported, expiredReaped, MetricEbpfConntrackV6ExpiredReaped)
 }
 
 func (a *UdpAC) recordBpfFragStateExpiredReapedV6(expiredReaped uint64) {
-	a.recordBpfConntrackCounterDeltas(&a.bpfFragStateExpiredReapedV6Reported, expiredReaped, MetricEbpfFragStateV6ExpiredReaped)
+	a.recordCumulativeMetricDelta(&a.bpfFragStateExpiredReapedV6Reported, expiredReaped, MetricEbpfFragStateV6ExpiredReaped)
 }
 
-func (a *UdpAC) recordBpfConntrackCounterDeltas(reported *atomic.Uint64, watermark uint64, metricName string) {
+func (a *UdpAC) recordEbpfTelemetryMetricDeltas() {
+	// Callers gate this to EBPFXDP startup/shutdown paths; ungated pre-load
+	// calls read zero from the package counters and stay silent.
+	a.recordCumulativeMetricDelta(&a.ebpfLostPerfSamplesReported, a.currentEbpfLostPerfSamples(), MetricEbpfPerfLostSamples)
+	a.recordCumulativeMetricDelta(&a.ebpfDenyTelemetrySuppressedReported, a.currentEbpfDenyTelemetrySuppressed(), MetricEbpfDenyTelemetrySuppressed)
+}
+
+func (a *UdpAC) currentEbpfLostPerfSamples() uint64 {
+	if a != nil && a.ebpfLostPerfSamples != nil {
+		return a.ebpfLostPerfSamples()
+	}
+	return ebpflocal.LostPerfSamples()
+}
+
+func (a *UdpAC) currentEbpfDenyTelemetrySuppressed() uint64 {
+	if a != nil && a.ebpfDenyTelemetrySuppressed != nil {
+		return a.ebpfDenyTelemetrySuppressed()
+	}
+	return ebpflocal.SuppressedDenyEvents()
+}
+
+func (a *UdpAC) recordCumulativeMetricDelta(reported *atomic.Uint64, watermark uint64, metricName string) {
 	if a == nil || a.registration == nil || a.registration.metrics == nil {
 		return
 	}
@@ -426,14 +464,55 @@ func (a *UdpAC) recordBpfConntrackCounterDeltas(reported *atomic.Uint64, waterma
 		}
 		if reported.CompareAndSwap(prev, watermark) {
 			if !a.addMetric(metricName, watermark-prev) {
-				// collectGauges invokes gauge funcs serially today; if this stats
-				// path gets concurrent callers, replace rollback with a stronger
-				// publish/commit protocol rather than clobbering a racing advance.
+				// Do not consume a watermark that did not reach the publisher.
+				// Current callers serialize per source (gauge collection is
+				// single-threaded; Stop joins the telemetry publisher before its
+				// final flush). If a future path publishes concurrently around
+				// addMetric failures, replace this rollback with a stronger
+				// publish/commit protocol.
 				reported.CompareAndSwap(watermark, prev)
 			}
 			return
 		}
 	}
+}
+
+const ebpfTelemetryMetricPollInterval = 60 * time.Second
+
+func (a *UdpAC) startEbpfTelemetryMetricPublisher() {
+	// FilterMode is startup-scoped like the BpfFlusher wiring; config-watch
+	// reloads do not live-start eBPF telemetry for a running IPTABLES AC.
+	if a == nil || a.config == nil || a.config.FilterMode != FilterMode_EBPFXDP {
+		return
+	}
+	if a.registration == nil || a.registration.metrics == nil {
+		log.Debug("[EbpfTelemetry] publisher not started: registration metrics not wired")
+		return
+	}
+	// Start is the only production call site; this guard prevents accidental
+	// duplicate lifecycle goroutines, not concurrent Start synchronization.
+	if a.ebpfTelemetryPublisherDone != nil {
+		return
+	}
+	// Keep package-level perf-ring telemetry separate from the BpfFlusher
+	// conntrack sampler so Stop can join this publisher before metrics teardown.
+	done := make(chan struct{})
+	a.ebpfTelemetryPublisherDone = done
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		defer close(done)
+		ticker := time.NewTicker(ebpfTelemetryMetricPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				a.recordEbpfTelemetryMetricDeltas()
+			case <-a.signals.stop:
+				return
+			}
+		}
+	}()
 }
 
 type UdpConn struct {
@@ -693,6 +772,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	if err := a.registration.Start(); err != nil {
 		return fmt.Errorf("failed to start AC registration manager: %w", err)
 	}
+	a.startEbpfTelemetryMetricPublisher()
 
 	if bpfFlusher != nil {
 		// Start the lifecycle-owned sample/reap loop after registration gauge
@@ -725,9 +805,24 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	return nil
 }
 
+func (a *UdpAC) flushEbpfTelemetryOnStop() {
+	if a == nil || a.config == nil || a.config.FilterMode != FilterMode_EBPFXDP {
+		return
+	}
+	// Wait only for the telemetry publisher to exit before the final telemetry
+	// flush. This keeps ticker-path AddCounterWithDims from racing
+	// registration.Stop()'s publisher flush without moving the full AC wg.Wait()
+	// earlier and reopening the shutdown deadlock described below.
+	if done := a.ebpfTelemetryPublisherDone; done != nil {
+		<-done
+	}
+	a.recordEbpfTelemetryMetricDeltas()
+}
+
 func (ac *UdpAC) Stop() {
 	ac.running.Store(false)
 	close(ac.signals.stop)
+	ac.flushEbpfTelemetryOnStop()
 	// Stop registration manager.
 	//
 	// Ordering note: ac.registration.Stop() runs BEFORE ac.wg.Wait()

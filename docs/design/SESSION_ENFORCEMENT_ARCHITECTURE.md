@@ -463,6 +463,29 @@ not silently evicting). The CloudWatch alarm in
 `docs/runbooks/ebpf-map-capacity.md`. This is inert in prod under iptables
 FilterMode (the map is never loaded, so the metric never fires).
 
+### Malformed-DENY telemetry sampling observability
+
+The eBPF datapath rate-limits only malformed/early-drop DENY telemetry: truncated
+headers, unsupported/unparseable L4, and related fail-closed parser exits before
+normal allow-rule evaluation. No-match DENYs remain unrate-limited because they
+are unauthorized-access audit signals, and ACCEPT events remain unrate-limited
+for admission visibility.
+
+The limiter is a per-CPU token bucket configured through `deny_rl_config` at XDP
+load. The default is 1000 burst tokens refilled at 1000 tokens/second per CPU;
+capacity `0` disables the limiter/fails open to always-emit if the config is not
+written. Suppressed events increment the per-CPU `deny_suppressed` map, which the
+AC sums and exports as the reset-per-flush counter
+`EbpfDenyTelemetrySuppressed`. Perf-ring loss is still tracked separately as
+`EbpfPerfLostSamples`: suppression is intentional and observable, while lost
+samples mean userspace missed telemetry.
+
+Terraform alarms page on any `EbpfPerfLostSamples` and on sustained
+`EbpfDenyTelemetrySuppressed`. At the E5 flip, `EbpfPerfLostSamples` must stay
+zero and `EbpfDenyTelemetrySuppressed` should be flat under normal load; a
+controlled malformed-packet canary may raise suppression, but it must return to
+zero afterward.
+
 ### Conntrack and fragment-state saturation observability
 
 Conntrack cache and IPv6 fragment-state pressure are intentionally separate from

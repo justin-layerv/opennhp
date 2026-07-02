@@ -151,10 +151,10 @@ func TestFlushEntryNow_V6Surgical_SingleFlowFallbackStillFlushesSiblings(t *test
 	if !got[targetPort] || !got[siblingPrt] {
 		t.Fatalf("single-flow fallback flushes = %+v; want both source ports %d and %d", flushed, targetPort, siblingPrt)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 2 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 2 {
 		t.Errorf("%s = %v, want 2", MetricRevocationSurgicalFlushedV6, got)
 	}
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 0 {
 		t.Errorf("%s = %v, want 0 (single-flow fallback flushed both siblings)", MetricRevocationIPv6HardFail, got)
 	}
 }
@@ -190,10 +190,10 @@ func TestFlushEntryNow_V6Surgical_BatchResultLengthMismatchHardFailsAllPorts(t *
 	if flushed := v6.snapshot(); len(flushed) != 0 {
 		t.Fatalf("single-flow fallback should not run after a malformed non-nil batch result; got flushes %+v", flushed)
 	}
-	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 2 {
+	if got := incrCounter(t, a, MetricRevocationIPv6HardFail); got != 2 {
 		t.Errorf("%s = %v, want 2 (fail closed for every enumerated source port when batch result cardinality is malformed)", MetricRevocationIPv6HardFail, got)
 	}
-	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+	if got := incrCounter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
 		t.Errorf("%s = %v, want 0", MetricRevocationSurgicalFlushedV6, got)
 	}
 }

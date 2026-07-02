@@ -250,6 +250,69 @@ resource "aws_cloudwatch_metric_alarm" "ebpf_map_full" {
   })
 }
 
+resource "aws_cloudwatch_metric_alarm" "ebpf_perf_lost_samples" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-ebpf-perf-lost-samples"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "EbpfPerfLostSamples"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "AC eBPF perf ring dropped filter-decision samples before userspace could read them. The malformed-DENY limiter should keep this flat; any non-zero period means telemetry completeness regressed and E5 flip evidence is invalid until investigated."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name  = "${var.name_prefix}-ac-ebpf-perf-lost-samples"
+    Issue = "2849"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "ebpf_deny_telemetry_suppressed" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  # Suppression is expected under a malformed-packet attack or explicit canary,
+  # but should be flat in normal traffic. Require two consecutive windows so a
+  # tiny probe does not page; sustained shedding means the limiter is actively
+  # protecting the perf ring and operators should correlate with deny logs.
+  alarm_name          = "${var.name_prefix}-ac-ebpf-deny-telemetry-suppressed"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  metric_name         = "EbpfDenyTelemetrySuppressed"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "AC eBPF malformed/early-drop DENY telemetry is being shed by the #2849 token bucket. This confirms the perf-ring guard is active under malformed-packet pressure; it should be flat under normal load."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name  = "${var.name_prefix}-ac-ebpf-deny-telemetry-suppressed"
+    Issue = "2849"
+  })
+}
+
 resource "aws_cloudwatch_metric_alarm" "ebpf_conntrack_v4_usage_high" {
   count = var.enable_cloudwatch_alarms ? 1 : 0
 

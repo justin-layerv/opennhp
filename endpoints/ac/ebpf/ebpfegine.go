@@ -275,11 +275,9 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 				log.Error("Error reading eBPF v4 event: %v", err)
 				continue
 			}
-			// No-silent-loss safety net (E3): the kernel overwrites the oldest
-			// samples when the per-CPU ring is full and reports the count here.
-			// Active rate-limiting/sampling of the malformed-packet DENY flood is
-			// deferred to E4 (#2849), so surfacing LostSamples is the cheap
-			// guard that the flood is never silent.
+			// No-silent-loss safety net: #2849 caps the malformed-DENY flood
+			// before it should overflow the perf ring, but if the kernel still
+			// drops samples this counter feeds the AC CloudWatch metric path.
 			if record.LostSamples > 0 {
 				recordLostSamples(record.LostSamples)
 				log.Warning("eBPF v4 perf buffer overflow: lost %d sample(s) (cumulative %d) — filter-decision events were dropped before userspace could read them", record.LostSamples, LostPerfSamples())
@@ -386,9 +384,9 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 	// never touches the datapath. INERT until the flip, like the readers above.
 	//
 	// SuppressedDenyEvents() therefore lags by up to one poll interval (and is
-	// unset for the first interval). Fine for this WARN path; the follow-up that
-	// wires it into a CloudWatch metric should choose the alarm period/threshold
-	// with that staleness in mind.
+	// unset for the first interval). The AC metric publisher exports unseen
+	// deltas as MetricEbpfDenyTelemetrySuppressed on its own cadence, so this
+	// warning and the CloudWatch counter share the same cumulative source.
 	const denySuppressedPollInterval = 60 * time.Second
 	go func() {
 		ticker := time.NewTicker(denySuppressedPollInterval)

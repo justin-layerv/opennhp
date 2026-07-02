@@ -9,6 +9,8 @@ Use this runbook for AC eBPF/XDP map capacity alarms and supporting metrics:
 - `EbpfFragStateV6MaxEntries`: loaded IPv6 fragment-state map ceiling reported by pinned map metadata.
 - `EbpfConntrackSampleErrors`: per-period conntrack stats/reaper sample failures.
 - `EbpfConntrackPartialSamples`: per-period incomplete conntrack or IPv6 fragment-state HASH walks caused by concurrent churn.
+- `EbpfPerfLostSamples`: per-period perf-buffer samples dropped before the AC could read them.
+- `EbpfDenyTelemetrySuppressed`: per-period malformed/early-drop DENY events shed by the #2849 token bucket.
 
 ## First Checks
 
@@ -78,6 +80,62 @@ Actions:
 - If customers are blocked, roll the affected ACs back to `FilterMode=IPTABLES` or scale out while investigating.
 - Do not raise `MAX_ENTRIES` ad hoc. BPF HASH maps preallocate unswappable kernel memory at load time; any increase must be paired with the AC instance RAM review in `docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md`.
 
+## If `EbpfPerfLostSamples` Fired
+
+The kernel reported perf-ring overflow: filter-decision samples were dropped
+before userspace could log them. This should be zero after #2849 because only
+malformed/early-drop DENY telemetry is attacker-controllable and that path is
+token-bucketed before emission.
+
+Detection latency is poll/period based: the AC publishes telemetry deltas every
+60s, and this alarm evaluates 300s CloudWatch Sum periods. A brand-new drop can
+therefore take several minutes to appear or clear in alarm state.
+These telemetry guarantees assume graceful AC shutdown; a crash or SIGKILL can
+lose up to one AC poll interval of unpublished deltas, so corroborate
+restart-adjacent incidents with AC/eBPF logs.
+
+Actions:
+
+- Check `EbpfDenyTelemetrySuppressed` in the same window. If it is non-zero, the
+  malformed-DENY limiter is active but still did not fully protect the ring; keep
+  the E5 flip blocked until the cap, perf-reader cadence, or instance size is
+  adjusted and the metric is flat.
+- If `EbpfDenyTelemetrySuppressed` is zero, investigate other event volume:
+  normal ACCEPT/no-match DENY traffic, a stalled AC process, or a perf-reader
+  regression. No-match DENYs and ACCEPTs are intentionally not rate-limited.
+- Inspect AC logs for `eBPF v4 perf buffer overflow` / `eBPF v6 perf buffer
+  overflow` to identify address family and instance.
+- Roll back affected ACs to `FilterMode=IPTABLES` if telemetry completeness is
+  required for the current incident response.
+
+## If `EbpfDenyTelemetrySuppressed` Fired
+
+The #2849 limiter intentionally shed malformed/early-drop DENY events before
+emitting to the perf ring. The datapath still drops the packets; this alarm is
+an observability signal that malformed-packet pressure exists and is being
+capped. It should be flat under normal load.
+
+Detection latency is longer than `EbpfPerfLostSamples`: the eBPF package
+refreshes the suppressed-event snapshot every 60s, the AC publishes telemetry on
+its own 60s poll, and the alarm then requires two consecutive 300s CloudWatch Sum
+periods. During E5 canaries, do not treat a brief quiet window as proof that
+suppression never occurred or has already cleared.
+For shutdown-adjacent incidents, a graceful AC stop flushes the latest cached
+suppressed-event snapshot; events that have not yet reached the eBPF package's
+60s snapshot can be absent from the final delta.
+
+Actions:
+
+- Confirm `EbpfPerfLostSamples` is zero. If lost samples are also firing, treat
+  this as telemetry loss, not just successful suppression.
+- Correlate with AC deny logs and network telemetry for a malformed-packet flood.
+  The limiter preserves the first burst per CPU and then sheds at the configured
+  refill rate.
+- During an intentional E5 canary, record the suppression rate and verify it
+  returns to zero after the canary stops.
+- Do not rate-limit no-match DENYs to quiet this alarm; those are unauthorized
+  access audit signals, not malformed-packet flood telemetry.
+
 ## If Conntrack Usage Fired
 
 This is established-flow cache pressure, not allow-rule admission failure. Correctness remains fail-closed: a full conntrack HASH cache makes new or uncached flows pay the allow-rule slow path; it does not fail open and does not evict an existing conntrack entry.
@@ -133,6 +191,13 @@ Actions:
 `EbpfMapFull` is an admission failure signal. It means allow-rule map capacity was exhausted and new sessions are being denied.
 
 `EbpfConntrack*UsagePercent` is a cache-pressure signal. It means established-flow conntrack occupancy is high after the userspace quiet-entry reaper ran.
+
+`EbpfPerfLostSamples` is unintended telemetry loss. It should remain zero; a
+non-zero Sum means the perf ring dropped samples before userspace logged them.
+
+`EbpfDenyTelemetrySuppressed` is intentional sampling. It counts malformed or
+early-drop DENY telemetry events that the #2849 token bucket shed to protect the
+perf ring. It proves suppression was observable, not silent.
 
 The quiet-entry reaper runs from the BpfFlusher lifecycle sampler (60s today),
 not from GaugeFunc collection. Each sample deletes at most 100,000 expired quiet

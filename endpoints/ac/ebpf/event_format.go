@@ -22,13 +22,10 @@ import (
 // reports a per-read LostSamples count when its per-CPU ring fills before
 // userspace drains it; we accumulate it here as the no-silent-loss safety net.
 //
-// E3 ships VISIBILITY (this counter + a WARN log per overflow) rather than
-// active rate-limiting/sampling of the malformed-packet DENY flood, which is
-// deferred to E4. A non-zero, growing value is the signal that the flood is
-// real and the E4 sampling work is a prerequisite for the E5 FilterMode flip —
-// it must never be silent. Wiring this into the AC's CloudWatch metric pipeline
-// (alongside MetricEbpfMapFull) is part of that E5 flip-readiness work; until
-// then the WARN log surfaces it to CloudWatch Logs.
+// The #2849 malformed-DENY limiter should keep this flat by bounding the
+// attacker-controllable early-DENY surface before the ring overflows. A non-zero,
+// growing value means filter-decision telemetry still escaped userspace and must
+// page via MetricEbpfPerfLostSamples, not just a WARN log.
 var lostPerfSamples atomic.Uint64
 
 // recordLostSamples adds n to the cumulative lost-sample counter. Safe for
@@ -38,8 +35,9 @@ func recordLostSamples(n uint64) {
 }
 
 // LostPerfSamples returns the cumulative number of perf-buffer samples dropped
-// by the kernel across both readers since process start. Exported so future
-// metric wiring (and tests) can observe it.
+// by the kernel across both readers since process start. This accessor stays in
+// the build-tag-free file so untagged AC metric code compiles on non-Linux
+// targets, where no reader runs and the counter remains zero.
 func LostPerfSamples() uint64 {
 	return lostPerfSamples.Load()
 }
@@ -94,7 +92,8 @@ func recordSuppressedDeny(total uint64) {
 }
 
 // SuppressedDenyEvents returns the latest cumulative count of DENY telemetry
-// events shed by the rate limiter across all CPUs since process start.
+// events shed by the rate limiter across all CPUs since process start. This
+// accessor stays build-tag-free for the same reason as LostPerfSamples.
 func SuppressedDenyEvents() uint64 {
 	return suppressedDenyEvents.Load()
 }
