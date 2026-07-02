@@ -6,11 +6,14 @@ import (
 )
 
 var (
-	dimNameCallerIP = aws.String("CallerIP")
-	dimNameReason   = aws.String("Reason")
-	dimNameSource   = aws.String("Source")
-	dimNameOutcome  = aws.String("Outcome")
+	dimNameCallerIP   = aws.String("CallerIP")
+	dimNameReason     = aws.String("Reason")
+	dimNameSource     = aws.String("Source")
+	dimNameOutcome    = aws.String("Outcome")
+	dimNameFanoutMode = aws.String("FanoutMode")
 )
+
+const revocationFanoutUnknown = "unknown"
 
 // recordKnockForwardOutcome emits the outcome of a single ForwardHttpKnock call
 // (qurl-service#976 Phase 0A) on BOTH success and failure, so the Outcome
@@ -74,6 +77,39 @@ func normalizeInternalKnockMetricSource(source string) string {
 		return "server"
 	default:
 		return "unknown"
+	}
+}
+
+// recordRevocationFanoutSent emits the existing base RevocationFanoutSent stream
+// plus a bounded FanoutMode breakdown. The base stream preserves the rollout
+// smoke/runbook contract; the targeted-only stream lets the #2790 drift alarm
+// distinguish targeted fanout collapse from unrelated cell-wide revokes.
+// The handler fanout-mode gate accepts only the two known modes; normalize anyway
+// so a future caller cannot create unbounded CloudWatch dimensions by bypassing
+// that gate. Dashboards graphing this metric should pin either the base
+// {Environment, Cell} stream or a specific FanoutMode stream so base + breakdown
+// series are not double-counted. Publisher drops zero-valued counters at flush,
+// so sent=0 makes the targeted FanoutMode series absent rather than explicitly
+// zero; the #2790 alarm's FILL expression and rollout breach-path proof are
+// load-bearing for pure zero-match buckets.
+func (s *UdpServer) recordRevocationFanoutSent(fanoutMode string, sent int) {
+	if s == nil {
+		return
+	}
+	fanoutMode = normalizeRevocationFanoutMetricMode(fanoutMode)
+	value := float64(sent)
+	s.metrics.AddCounterWithDims(MetricRevocationFanoutSent, value, nil)
+	s.metrics.AddCounterWithDims(MetricRevocationFanoutSent, value, []types.Dimension{
+		{Name: dimNameFanoutMode, Value: aws.String(fanoutMode)},
+	})
+}
+
+func normalizeRevocationFanoutMetricMode(fanoutMode string) string {
+	switch fanoutMode {
+	case revocationFanoutCellWide, revocationFanoutTargeted:
+		return fanoutMode
+	default:
+		return revocationFanoutUnknown
 	}
 }
 

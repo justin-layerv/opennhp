@@ -236,6 +236,9 @@ _REVOCATION_RAW_REF = "aws_cloudwatch_metric_alarm.revocation_aged_out.alarm_nam
 _REVOCATION_WINDOW_REF = "aws_cloudwatch_metric_alarm.revocation_deploy_window.alarm_name"
 
 
+# Lightweight HCL scanners for fixed repository-owned Terraform snippets. They
+# count raw braces and are not string-aware; use a real HCL parser if a guard
+# needs to inspect arbitrary string contents with unmatched braces.
 def _tf_resource_block(tf_text: str, resource_type: str, name: str) -> str:
     marker = f'resource "{resource_type}" "{name}"'
     start = tf_text.find(marker)
@@ -382,6 +385,42 @@ def _tf_statement_blocks_with_put_metric_data(tf_text: str) -> list[str]:
                         blocks.append(tf_text[brace_start : index + 1])
                     break
     return blocks
+
+
+def _tf_nested_blocks(tf_text: str, block_type: str) -> list[str]:
+    blocks: list[str] = []
+    marker = f"{block_type} {{"
+    search_from = 0
+    while True:
+        start = tf_text.find(marker, search_from)
+        if start == -1:
+            return blocks
+        brace_start = tf_text.find("{", start)
+        if brace_start == -1:
+            return blocks
+
+        depth = 0
+        for index in range(brace_start, len(tf_text)):
+            char = tf_text[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(tf_text[start : index + 1])
+                    search_from = index + 1
+                    break
+        else:
+            return blocks
+
+
+def _tf_assignment_count(tf_text: str, name: str, raw_value: str) -> int:
+    pattern = rf"(?m)^\s*{re.escape(name)}\s*=\s*{re.escape(raw_value)}\s*$"
+    return len(re.findall(pattern, tf_text))
+
+
+def _tf_has_assignment(tf_text: str, name: str, raw_value: str) -> bool:
+    return _tf_assignment_count(tf_text, name, raw_value) > 0
 
 
 def _assert_revocation_ageout_alarm_rules(tf_text: str, failures: list[str]) -> None:
@@ -836,6 +875,183 @@ variable "metrics_namespace" {
         and bool(local_expression_deploy_namespace_failures)
         and bool(variable_expression_deploy_namespace_failures)
         and bool(duplicate_deploy_grant_failures)
+    )
+
+
+def _assert_revocation_targeted_zero_match_alarm(tf_text: str, failures: list[str]) -> None:
+    """Pin the #2790 targeted zero-match alarm to the fleet drift shape."""
+    block = _tf_resource_block(
+        tf_text, "aws_cloudwatch_metric_alarm", "revocation_targeted_zero_match"
+    )
+    if not _check(
+        "monitoring targeted zero-match alarm exists",
+        bool(block),
+        "revocation-targeted-zero-match alarm is the #2790 watched canary",
+    ):
+        failures.append("revocation-targeted-zero-match alarm missing")
+        return
+    query_blocks = {
+        match.group(1): query
+        for query in _tf_nested_blocks(block, "metric_query")
+        if (match := re.search(r'\bid\s*=\s*"([^"]+)"', query))
+    }
+    drift_query = query_blocks.get("targeted_drift", "")
+    zero_match_query = query_blocks.get("zero_match", "")
+    targeted_fanout_query = query_blocks.get("targeted_fanout", "")
+    expected_expression = (
+        '"IF(zero_match >= 1 AND FILL(targeted_fanout, 0) < 1, 1, 0)"'
+    )
+    if not _check(
+        "monitoring targeted zero-match alarm uses shape, not ratio",
+        _tf_has_assignment(drift_query, "expression", expected_expression),
+        "must breach on zero-match activity while targeted fanout is zero",
+    ):
+        failures.append("revocation-targeted-zero-match expression drifted")
+    if not _check(
+        "monitoring targeted zero-match alarm uses raw canary metric",
+        _tf_has_assignment(
+            zero_match_query, "metric_name", '"RevocationTargetedZeroMatch"'
+        ),
+        "zero_match query must read RevocationTargetedZeroMatch",
+    ):
+        failures.append("revocation-targeted-zero-match zero_match metric drifted")
+    if not _check(
+        "monitoring targeted zero-match alarm uses targeted fanout metric",
+        _tf_has_assignment(
+            targeted_fanout_query, "metric_name", '"RevocationFanoutSent"'
+        )
+        and _tf_has_assignment(targeted_fanout_query, "FanoutMode", '"targeted"'),
+        "targeted_fanout query must read RevocationFanoutSent{FanoutMode=targeted}",
+    ):
+        failures.append("revocation-targeted-zero-match targeted fanout dimensions drifted")
+    if not _check(
+        "monitoring targeted zero-match alarm pages and recovers",
+        _tf_has_assignment(block, "alarm_actions", "[aws_sns_topic.alerts.arn]")
+        and _tf_has_assignment(block, "ok_actions", "[aws_sns_topic.alerts.arn]"),
+        "identifier drift must page, and recovery should notify operators",
+    ):
+        failures.append("revocation-targeted-zero-match action wiring drifted")
+    if not _check(
+        "monitoring targeted zero-match alarm has one returned expression",
+        _tf_assignment_count(block, "return_data", "false") == 2
+        and _tf_assignment_count(block, "return_data", "true") == 1
+        and _tf_has_assignment(drift_query, "return_data", "true")
+        and _tf_has_assignment(zero_match_query, "return_data", "false")
+        and _tf_has_assignment(targeted_fanout_query, "return_data", "false"),
+        "drift expression must return data; input metric queries must set return_data=false",
+    ):
+        failures.append("revocation-targeted-zero-match return_data semantics drifted")
+    if not _check(
+        "monitoring targeted zero-match alarm stays quiet before targeted traffic",
+        _tf_has_assignment(block, "treat_missing_data", '"notBreaching"'),
+        "pre-enable no-data must not page before qurl-service emits targeted fanout",
+    ):
+        failures.append("revocation-targeted-zero-match missing-data posture drifted")
+
+
+def _assert_revocation_targeted_zero_match_alarm_self_test() -> bool:
+    good = '''
+resource "aws_cloudwatch_metric_alarm" "revocation_targeted_zero_match" {
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "targeted_drift"
+    expression  = "IF(zero_match >= 1 AND FILL(targeted_fanout, 0) < 1, 1, 0)"
+    return_data = true
+  }
+
+  metric_query {
+    id = "zero_match"
+    return_data = false
+    metric {
+      metric_name = "RevocationTargetedZeroMatch"
+    }
+  }
+
+  metric_query {
+    id = "targeted_fanout"
+    return_data = false
+    metric {
+      metric_name = "RevocationFanoutSent"
+      dimensions = {
+        FanoutMode  = "targeted"
+      }
+    }
+  }
+}
+'''
+    bad_ratio = good.replace(
+        'expression  = "IF(zero_match >= 1 AND FILL(targeted_fanout, 0) < 1, 1, 0)"',
+        'expression  = "FILL(zero_match, 0) / (FILL(zero_match, 0) + FILL(targeted_fanout, 0))"',
+    )
+    missing_fanout_dim = good.replace('        FanoutMode  = "targeted"\n', "")
+    missing_actions = good.replace("  alarm_actions       = [aws_sns_topic.alerts.arn]\n", "")
+    missing_input_return_data = good.replace("    return_data = false\n", "")
+    swapped_return_data = good.replace(
+        '    id          = "targeted_drift"\n'
+        '    expression  = "IF(zero_match >= 1 AND FILL(targeted_fanout, 0) < 1, 1, 0)"\n'
+        "    return_data = true\n",
+        '    id          = "targeted_drift"\n'
+        '    expression  = "IF(zero_match >= 1 AND FILL(targeted_fanout, 0) < 1, 1, 0)"\n'
+        "    return_data = false\n",
+    ).replace(
+        '    id = "zero_match"\n'
+        "    return_data = false\n",
+        '    id = "zero_match"\n'
+        "    return_data = true\n",
+    )
+    spacing_variant = (
+        good.replace("  alarm_actions       =", "  alarm_actions=")
+        .replace("  ok_actions          =", "  ok_actions =")
+        .replace("  treat_missing_data  =", "  treat_missing_data=")
+        .replace("    expression  =", "    expression =")
+        .replace("        FanoutMode  =", "        FanoutMode =")
+    )
+
+    good_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_targeted_zero_match_alarm(good, good_failures)
+
+    spacing_variant_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_targeted_zero_match_alarm(
+            spacing_variant, spacing_variant_failures
+        )
+
+    bad_ratio_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_targeted_zero_match_alarm(bad_ratio, bad_ratio_failures)
+
+    missing_dim_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_targeted_zero_match_alarm(missing_fanout_dim, missing_dim_failures)
+
+    missing_actions_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_targeted_zero_match_alarm(missing_actions, missing_actions_failures)
+
+    missing_input_return_data_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_targeted_zero_match_alarm(
+            missing_input_return_data, missing_input_return_data_failures
+        )
+
+    swapped_return_data_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_targeted_zero_match_alarm(
+            swapped_return_data, swapped_return_data_failures
+        )
+
+    return (
+        not good_failures
+        and not spacing_variant_failures
+        and bool(bad_ratio_failures)
+        and bool(missing_dim_failures)
+        and bool(missing_actions_failures)
+        and bool(missing_input_return_data_failures)
+        and bool(swapped_return_data_failures)
     )
 
 # Gate matchers — anchored regexes, NOT plain substrings. The naïve
@@ -4921,6 +5137,12 @@ def main() -> int:
         "the IAM hardening guard accepted a missing deny or broadened deploy role grant",
     ):
         return 1
+    if not _check(
+        "self-test: revocation targeted zero-match guard rejects bad semantics",
+        _assert_revocation_targeted_zero_match_alarm_self_test(),
+        "the targeted zero-match guard accepted a ratio, missing dimension, missing action, or bad return_data fixture",
+    ):
+        return 1
 
     wf = yaml.safe_load(WORKFLOW.read_text())
     build_and_push_wf = yaml.safe_load(BUILD_AND_PUSH_WORKFLOW.read_text())
@@ -4984,6 +5206,7 @@ def main() -> int:
         terraform_tf_texts,
         failures,
     )
+    _assert_revocation_targeted_zero_match_alarm(monitoring_tf_text, failures)
 
     if failures:
         print()

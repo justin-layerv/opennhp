@@ -190,8 +190,10 @@ func (hs *HttpServer) handleInternalRevocation(ctx *gin.Context) {
 	}
 
 	// Record how many ACs this event was enqueued for (0 on a no-matching-AC
-	// no-op). AddCounterWithDims is nil-safe.
-	hs.udpServer.metrics.AddCounterWithDims(MetricRevocationFanoutSent, float64(sent), nil)
+	// no-op). The helper preserves the base stream and emits a FanoutMode
+	// breakdown for the targeted-zero-match alarm. The metrics publisher is
+	// nil-safe.
+	hs.udpServer.recordRevocationFanoutSent(evt.FanoutMode, sent)
 
 	// Targeted-zero-match canary (#2790). A targeted event reaching here is
 	// provably complete (the incomplete-targeted gate 400'd above), so it NAMED a

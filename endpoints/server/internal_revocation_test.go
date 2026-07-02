@@ -266,6 +266,16 @@ func TestInternalRevocation_CellWideFansOutToAllACs(t *testing.T) {
 	if resp.ACsTargeted != 3 {
 		t.Errorf("acs_targeted=%d, want 3", resp.ACsTargeted)
 	}
+	_, dimCounters := s.metrics.CountersForTest(t)
+	if got := dimCounters[MetricRevocationFanoutSent]; got != 3 {
+		t.Errorf("base %s dim counter=%v, want 3", MetricRevocationFanoutSent, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricRevocationFanoutSent, "FanoutMode=cell-wide"); got != 3 {
+		t.Errorf("%s{FanoutMode=cell-wide}=%v, want 3", MetricRevocationFanoutSent, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricRevocationFanoutSent, "FanoutMode=targeted"); got != 0 {
+		t.Errorf("%s{FanoutMode=targeted}=%v, want 0 for cell-wide fanout", MetricRevocationFanoutSent, got)
+	}
 }
 
 func TestInternalRevocation_TargetedFansOutToFilteredACsOnly(t *testing.T) {
@@ -315,6 +325,13 @@ func TestInternalRevocation_TargetedFansOutToFilteredACsOnly(t *testing.T) {
 	if seen[bPub] {
 		t.Errorf("targeted fanout reached non-targeted ac-b")
 	}
+	_, dimCounters := s.metrics.CountersForTest(t)
+	if got := dimCounters[MetricRevocationFanoutSent]; got != 2 {
+		t.Errorf("base %s dim counter=%v, want 2", MetricRevocationFanoutSent, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricRevocationFanoutSent, "FanoutMode=targeted"); got != 2 {
+		t.Errorf("%s{FanoutMode=targeted}=%v, want 2", MetricRevocationFanoutSent, got)
+	}
 }
 
 func TestInternalRevocation_EmptyMatchIsNoOp200(t *testing.T) {
@@ -333,6 +350,43 @@ func TestInternalRevocation_EmptyMatchIsNoOp200(t *testing.T) {
 	}
 	if got := drainSend(s); len(got) != 0 {
 		t.Fatalf("empty match still sent %d msgs", len(got))
+	}
+}
+
+func TestRecordRevocationFanoutSent_NormalizesUnknownFanoutMode(t *testing.T) {
+	s := newRevocationTestServer(t, 0)
+
+	s.recordRevocationFanoutSent("broadcast", 3)
+
+	_, dimCounters := s.metrics.CountersForTest(t)
+	if got := dimCounters[MetricRevocationFanoutSent]; got != 3 {
+		t.Errorf("base %s dim counter=%v, want 3", MetricRevocationFanoutSent, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricRevocationFanoutSent, "FanoutMode="+revocationFanoutUnknown); got != 3 {
+		t.Errorf("%s{FanoutMode=unknown}=%v, want 3", MetricRevocationFanoutSent, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricRevocationFanoutSent, "FanoutMode=broadcast"); got != 0 {
+		t.Errorf("%s{FanoutMode=broadcast}=%v, want 0", MetricRevocationFanoutSent, got)
+	}
+}
+
+func TestRecordRevocationFanoutSent_TargetedZeroRecordsAbsentSeriesShape(t *testing.T) {
+	s := newRevocationTestServer(t, 0)
+
+	s.recordRevocationFanoutSent(revocationFanoutTargeted, 0)
+
+	_, dimCounters := s.metrics.CountersForTest(t)
+	if got, ok := dimCounters[MetricRevocationFanoutSent]; !ok || got != 0 {
+		t.Errorf("base %s dim counter=%v, want 0 before publisher flush drops it", MetricRevocationFanoutSent, got)
+	}
+	if got := countDimCounterMatching(dimCounters, MetricRevocationFanoutSent, "FanoutMode=targeted"); got != 1 {
+		t.Errorf("%s{FanoutMode=targeted} entry count=%d, want 1 zero-valued pre-flush entry", MetricRevocationFanoutSent, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricRevocationFanoutSent, "FanoutMode=targeted"); got != 0 {
+		t.Errorf("%s{FanoutMode=targeted}=%v, want 0 before publisher flush drops it", MetricRevocationFanoutSent, got)
+	}
+	if got := sumDimCounterMatching(dimCounters, MetricRevocationFanoutSent, "FanoutMode="+revocationFanoutUnknown); got != 0 {
+		t.Errorf("%s{FanoutMode=unknown}=%v, want 0 for known targeted mode", MetricRevocationFanoutSent, got)
 	}
 }
 

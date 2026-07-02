@@ -946,33 +946,58 @@ Delivery requirements:
   is a cross-repo, string-equality contract with no shared schema: if either side
   ever changes what it stores in that field (a pubkey hash, a DB row id, a
   blue/green-suffixed id, a re-normalized form), targeted fanout silently matches
-  nothing and **fails open** (the missed `NHP_REV` leaves the AC entry to expire).
-  The server side (P4e Slice 2, nhp #2789) builds and unit-tests the targeted
+  nothing and **fails open** (the missed `NHP_REV` leaves the AC entry to expire);
+- until the remaining nhp #2790 gates pass, the incomplete-targeted reject is the
+  interim backstop;
+- the server side (P4e Slice 2, nhp #2789) builds and unit-tests the targeted
   path, and the **"targeted matched zero ACs" observability guard now exists**
-  (`RevocationTargetedZeroMatch`, nhp #2790): a targeted event that named a
+  (`RevocationTargetedZeroMatch`, nhp #2790). A targeted event that named a
   non-empty `target_ac_ids` set but matched no connected AC on a server increments
   the counter, so an identifier-space drift is a countable signal instead of a
-  silent no-op. Read it FLEET-WIDE — a single server legitimately zero-matches when
+  silent no-op. Read it FLEET-WIDE: a single server legitimately zero-matches when
   the named ACs are connected to sibling servers, so the drift signature is every
-  server zero-matching at once (fleet `RevocationFanoutSent` for targeted events
-  collapsing to 0 while this counter spikes), not any one server's count. The
-  counter catches this all-or-nothing drift (a shared-convention change that
-  misses on every server); a PARTIAL intra-event drift — some `target_ac_ids`
-  still match a live `ACConn.ACId` while others don't — leaves the match set
-  non-empty and is NOT caught (the drifted id's `NHP_REV` still fails open). That
-  is an accepted blind spot given the single shared id encoding. Three things gate
-  enabling targeted fanout cross-repo, all tracked in nhp #2790: (1) qurl-service
-  emits **cell-wide only** until the P3c `admitted_ac_ids` builder wiring lands;
-  (2) the id-correspondence MUST be proven end-to-end (a `target_ac_ids` value
-  emitted by qurl-service string-equals a live `ACConn.ACId` a running nhp-server
-  holds); and (3) a fleet-wide CloudWatch alarm on `RevocationTargetedZeroMatch`
-  (spiking while targeted `RevocationFanoutSent` collapses to 0) MUST be wired at
-  enable time so the canary is actually watched — it is intentionally NOT wired
-  now, since the metric is inert and would only no-data/flap pre-enable. Alarm on
-  the two series' shapes, NOT a literal ratio: `RevocationTargetedZeroMatch` is +1
+  server zero-matching at once while fleet `RevocationFanoutSent` for targeted
+  events collapses to 0. The counter catches this all-or-nothing drift; a PARTIAL
+  intra-event drift leaves the match set non-empty and is NOT caught, so the
+  drifted id's `NHP_REV` still fails open. That is an accepted blind spot given
+  the single shared id encoding;
+- three things gate enabling targeted fanout cross-repo, all tracked in nhp
+  #2790: (1) qurl-service emits **cell-wide only** until the P3c
+  `admitted_ac_ids` builder wiring lands; (2) the id-correspondence MUST be
+  proven end-to-end; and (3) the fleet-wide CloudWatch alarm on
+  `RevocationTargetedZeroMatch` MUST be deployed and verified before targeted
+  fanout is enabled;
+- that alarm is now provisioned by `terraform/modules/monitoring` and reads the
+  two series' shapes, NOT a literal ratio: `RevocationTargetedZeroMatch` is +1
   per event while `RevocationFanoutSent` is +N per event (N = ACs matched), so
-  dividing them mixes events with AC-deliveries. The incomplete-targeted reject is
-  the interim backstop;
+  dividing them mixes events with AC-deliveries. It watches for zero-match
+  activity while the `FanoutMode=targeted` `RevocationFanoutSent` stream stays at
+  0 in the same window; using the targeted-only stream prevents unrelated
+  cell-wide revokes from masking id drift;
+- the alarm is an intentional fail-loud triage signal, not proof by itself that
+  the identifier contract drifted. A legitimate event whose named ACs are all
+  disconnected fleet-wide can produce the same shape. The inverse blind spot is
+  also possible inside a single 5-minute bucket: a drifted targeted event can be
+  masked if a different targeted event in that bucket successfully fans out, so
+  incident review must inspect raw zero-match logs/events around the alarm window;
+- any dashboard that graphs `RevocationFanoutSent` should pin the base
+  `{Environment, Cell}` stream or a specific `FanoutMode` stream; broad
+  all-dimension aggregation double-counts the base and breakdown series;
+- the alarm remains no-data/not-breaching until targeted events exist. During a
+  pure zero-match bucket, the metrics publisher drops the zero-valued
+  `RevocationFanoutSent{FanoutMode=targeted}` counter, so the alarm is
+  intentionally proving FILL over an absent targeted-fanout series rather than
+  over an explicit zero datapoint. Before enabling targeted fanout, the rollout
+  gate must exercise the breach path as a hard, non-skippable gate with a
+  controlled synthetic `RevocationTargetedZeroMatch` datapoint and no matching
+  `FanoutMode=targeted` fanout datapoint, proving the
+  `FILL(targeted_fanout, 0)` expression enters ALARM for the actual absent-series
+  drift shape. The applied/not-ALARM check is not a substitute for this proof; it
+  only verifies the alarm exists after the absent-series ALARM transition has
+  been proven;
+- the remaining pre-enable work is to complete the qurl-service builder wiring,
+  prove id-correspondence end to end, prove the alarm breach path, and confirm
+  the applied alarm is present, actions are enabled, and the alarm is not ALARM;
 - bounded retry with dead-letter visibility;
 - AC ack recorded for operational proof;
 - a defined end-to-end revocation-latency SLO (e.g. p99 from revoke API to AC

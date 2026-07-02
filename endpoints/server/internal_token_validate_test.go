@@ -182,6 +182,23 @@ func sumDimCounterMatching(dimCounters map[string]float64, substrings ...string)
 	return total
 }
 
+func countDimCounterMatching(dimCounters map[string]float64, substrings ...string) int {
+	var count int
+	for key := range dimCounters {
+		matches := true
+		for _, substring := range substrings {
+			if !strings.Contains(key, substring) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			count++
+		}
+	}
+	return count
+}
+
 func TestInternalTokenValidate_ResponseAuthWireContract(t *testing.T) {
 	const nonce = "0123456789abcdef0123456789abcdef"
 

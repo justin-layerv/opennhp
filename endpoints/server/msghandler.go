@@ -362,11 +362,17 @@ const (
 	// MetricRevocationReceived counts events that pass the request-auth gate and
 	// validation (one per accepted POST, before fanout). MetricRevocationFanoutSent
 	// is the per-event count of ACs an NHP_REV was enqueued for (0 on a
-	// no-matching-AC no-op). MetricRevocationFanoutBackpressure fires when the
-	// shared send queue is full mid-fanout and the handler fails closed with 503
-	// so qurl-service's at-least-once Publisher retries; a nonzero value means
-	// the send pipeline is saturated and revocations are being deferred (page if
-	// sustained — a revoke is security-relevant and the retry budget is finite).
+	// no-matching-AC no-op). It is emitted as the original base {Environment,Cell}
+	// stream and as a bounded FanoutMode breakdown; the #2790 targeted-zero-match
+	// alarm reads the FanoutMode=targeted stream so cell-wide traffic cannot mask
+	// targeted fanout collapse. Console dashboards should pin either that specific
+	// stream or the base {Environment,Cell} stream; aggregating all dimensions for
+	// this metric name double-counts base + breakdown series.
+	// MetricRevocationFanoutBackpressure fires when the shared send queue is full
+	// mid-fanout and the handler fails closed with 503 so qurl-service's
+	// at-least-once Publisher retries; a nonzero value means the send pipeline is
+	// saturated and revocations are being deferred (page if sustained — a revoke
+	// is security-relevant and the retry budget is finite).
 	MetricRevocationReceived           = "RevocationReceived"
 	MetricRevocationFanoutSent         = "RevocationFanoutSent"
 	MetricRevocationFanoutBackpressure = "RevocationFanoutBackpressure"

@@ -1623,7 +1623,9 @@ func (s *UdpServer) snapshotAllACConnections() []*ACConn {
 // The returned slice holds *ACConn pointers the caller reads lock-free.
 // fanoutMode is assumed pre-validated by the handler (revocationFanoutTargeted /
 // revocationFanoutCellWide); any other value selects nothing (defensive — the
-// handler rejects unknown modes with 400 before calling this).
+// handler rejects unknown modes with 400 before calling this). Metric emission
+// still normalizes fanoutMode defensively in recordRevocationFanoutSent so a
+// future caller cannot create unbounded CloudWatch FanoutMode values.
 //
 // An empty result is a legitimate success case (cell-wide with no connected
 // ACs, or targeted with no matching ACId on this server): there is simply

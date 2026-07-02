@@ -1719,6 +1719,87 @@ resource "aws_cloudwatch_composite_alarm" "revocation_aged_out_suppressed" {
   })
 }
 
+# Targeted revocation identifier-space drift canary (#2790). The raw
+# RevocationTargetedZeroMatch counter increments on every server that receives a
+# complete targeted event with a non-empty target_ac_ids set but matches no local
+# ACConn.ACId. A single server zero-match is expected when the named ACs live on
+# sibling servers; the drift signature is fleet-wide zero-match activity while
+# the targeted-only RevocationFanoutSent stream collapses to zero. This metric
+# math alarm watches that shape directly instead of using a ratio, because
+# RevocationTargetedZeroMatch is +1 per zero-match event while FanoutSent is +N
+# per matched AC delivery.
+#
+# The FanoutMode dimension is required: the base RevocationFanoutSent stream also
+# includes cell-wide revokes, and unrelated cell-wide traffic must not mask a
+# targeted identifier drift.
+#
+# Both metric queries rely on the server publisher's shared dim set staying
+# {Environment, Cell}. If a future publisher change adds an instance/host dim,
+# this alarm must explicitly aggregate across that dim to remain fleet-wide.
+#
+# evaluation_periods=1 is intentional: this sparse security signal should page on
+# the first affected 5-minute bucket. A legitimate event whose target ACs are all
+# disconnected fleet-wide can also produce this shape, so the page is fail-loud
+# triage rather than proof that the id contract drifted. If targeted fanout makes
+# this too noisy in practice, tune with observed incident data instead of
+# dampening the pre-enable canary path speculatively. OK actions intentionally
+# notify the same topic: a one-bucket benign flap should leave both ALARM and
+# recovery breadcrumbs for on-call triage. Downstream paging policy should treat
+# the OK as recovery/informational rather than a second incident page.
+resource "aws_cloudwatch_metric_alarm" "revocation_targeted_zero_match" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-revocation-targeted-zero-match"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  threshold           = 1
+  alarm_description   = "qURL v2 targeted revocation fail-loud canary (#2790): zero-match activity while FanoutMode=targeted RevocationFanoutSent is zero in the same 5-minute window. Means the fleet delivered no NHP_REV; verify target_ac_ids still string-equals ACConn.ACId and that targeted ACs were not all disconnected."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "targeted_drift"
+    expression  = "IF(zero_match >= 1 AND FILL(targeted_fanout, 0) < 1, 1, 0)"
+    label       = "Targeted revocation zero-match with no targeted fanout"
+    return_data = true
+  }
+
+  metric_query {
+    id          = "zero_match"
+    return_data = false
+    metric {
+      metric_name = "RevocationTargetedZeroMatch"
+      namespace   = "LayerV/NHP"
+      period      = 300
+      stat        = "Sum"
+      dimensions = {
+        Environment = var.environment
+        Cell        = var.cell_id
+      }
+    }
+  }
+
+  metric_query {
+    id          = "targeted_fanout"
+    return_data = false
+    metric {
+      metric_name = "RevocationFanoutSent"
+      namespace   = "LayerV/NHP"
+      period      = 300
+      stat        = "Sum"
+      dimensions = {
+        Environment = var.environment
+        Cell        = var.cell_id
+        FanoutMode  = "targeted"
+      }
+    }
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
 # Revocation untrackable — an invariant-break signal, distinct from retry
 # age-out. ANY nonzero value means an NHP_REV was enqueued to a live AC
 # connection, but the retry engine could not key that target to ACId +
