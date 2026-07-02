@@ -86,8 +86,9 @@ skip):
   qurl-link-frontend, protocol-surface (real TLS cert), internal-api
   source-IP — skip via `requireRemote(t)` at the top of the test. (The
   qURL-MINTING tests — happy-path resolve, accept-negotiation,
-  qurl-router-authz-gate — were removed entirely; see the qURL-ownership
-  note below.)
+  qurl-router-authz-gate, and the real-resolve knock-ready lie detector — were
+  removed from nhp; see the qURL-ownership note below for where those signals
+  moved.)
 - AWS-infra fences (blue/green, canary, EIP, alarms, CW logs, SSM runbook,
   custom-domain, Docker image) skip via `requireRemote` (in the central
   `getSSMParameter` / `requireCWLogs` / `requireActiveColor` /
@@ -240,11 +241,16 @@ about a later `18_+` test inheriting a still-open `*.qurl.site:443`
 pinhole and false-passing no longer applies. `10_resolve_test.go` now
 exercises only the bad-token→403 rejection path, which mints nothing.
 
-The deployed-nhp `/plugins/qurl` resolve contract these covered (302 +
-cookie domain + `Accept`-negotiation, the qurl-router silent-drop gate, and
-the knock-ready "lie detector") has no qurl-service equivalent yet; backfill
-is tracked in
-[qurl-service#1020](https://github.com/layervai/qurl-service/issues/1020).
+The deleted HTTP-era coverage is no longer an unowned gap:
+[qurl-service#1018](https://github.com/layervai/qurl-service/pull/1018)
+re-homed the deployed `/plugins/qurl` response shape (302, cookie domain,
+`Accept` negotiation, and CORS), the qurl-router silent-drop gate, and the
+real-resolve knock-ready "lie detector". qURL v2 live resolve coverage is
+being restored in qurl-service via `EnterPortal`; the remaining cutover work is
+tracked by
+[qurl-service#1047](https://github.com/layervai/qurl-service/issues/1047).
+The removed `TestTiming_ResolveMax` latency/SLO signal remains a separate
+decision item in [nhp#2799](https://github.com/layervai/nhp/issues/2799).
 
 ### Deploy-mode tier mapping
 

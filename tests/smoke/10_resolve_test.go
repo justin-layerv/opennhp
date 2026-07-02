@@ -8,11 +8,10 @@ package smoke
 //
 // The happy-path resolve tests (mint a real QURL via qurl-service +
 // Auth0, assert the 302 → r_{id}.qurl.site redirect, cookies, and
-// Accept-negotiation) were removed: qURL minting is a qurl-service
-// concern, not nhp's (see tests/smoke/CLAUDE.md).
-// TODO(qurl-service#1020): backfill the deleted /plugins/qurl resolve,
-// qurl-router silent-drop, and knock-ready "lie detector" coverage in
-// qurl-service so this gap can't quietly become permanent.
+// Accept-negotiation) were removed from nhp and re-homed in
+// qurl-service#1018 because qURL minting is a qurl-service concern, not
+// nhp's (see tests/smoke/CLAUDE.md). qURL v2 live resolve coverage now
+// continues in qurl-service#1047.
 // What remains here is the rejection contract, which is pure NHP-handler
 // behavior and needs no minted QURL — a bogus token is enough to reach
 // the 403 path.
@@ -136,7 +135,7 @@ func TestResolve_MalformedTokenReturns403(t *testing.T) {
 //
 // Deployed v2 admission (a real signed link → relay knock → ServerDenyError)
 // needs a LayerV-minted link and stays a qurl-service concern; see
-// tests/smoke/CLAUDE.md and qurl-service#1020.
+// tests/smoke/CLAUDE.md and qurl-service#1047.
 func TestResolveV2_SDKRejectsBadLinks(t *testing.T) {
 	ctx := context.Background()
 
