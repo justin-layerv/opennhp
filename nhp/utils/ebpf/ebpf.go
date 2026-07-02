@@ -601,6 +601,15 @@ const (
 // during AC boot enumeration
 const WhitelistValueSize = int(unsafe.Sizeof(whitelistValue{}))
 
+// whitelistKeySize is the on-wire size of a whitelistKey (the `spp`/sdwhitelist
+// map key: src+dst+dport+proto, packed = 11 bytes). Derived from the ToWlKey
+// serializer rather than unsafe.Sizeof (the Go struct is padded to 12; the
+// packed on-wire form is 11) so it stays the single source of truth with the
+// serializer. A var, not a const, because len() of a method result isn't
+// constant-foldable. Unexported (unlike WhitelistValueSize, which endpoints/ac
+// decodes) because only this package's spp reaper needs the key size today.
+var whitelistKeySize = len((&whitelistKey{}).ToWlKey())
+
 // ExpireTimeOffset is the byte offset of the ExpireTime field
 // within whitelistValue. Boot enumeration in
 // endpoints/ac/expiry_enumerate_ebpf_linux.go decodes the value

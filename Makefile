@@ -540,6 +540,14 @@ test:
 	# This intentionally enters tests/e2e's separate module so module drift cannot
 	# hide the always-on fence behind the tagged live-e2e lane.
 	cd tests/e2e && go test ./qurl-expiry -count=1
+	# The eBPF shared-map parity guards are pure .c-source parsers — no kernel,
+	# compiled object, or CAP_BPF needed — so they run here in the plain lane too,
+	# not only via the privileged test-ebpf runner. This keeps the "never again"
+	# map-type divergence guard (the #2163/#3019 class: an spp declared HASH in one
+	# object and LRU_HASH in the other) effective even when the eBPF datapath lane
+	# is skipped/red for an unrelated reason. Kernel-requiring tests in the package
+	# are excluded by -run, so no CAP_BPF is needed here (#3019 review).
+	cd nhp && go test -count=1 ./utils/ebpf/ -run 'TestXdpSource_AdmissionMapsAndConnTrackAreHash|TestTcEgressSource_SppIsHash|TestSharedPinnedMaps_XdpTcParity'
 	@echo "$(COLOUR_GREEN)[OpenNHP] Unit Tests Done!$(END_COLOUR)"
 
 # test-ebpf compiles the real XDP object and runs the eBPF datapath tests

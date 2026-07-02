@@ -180,6 +180,35 @@ atomic unit," because the call sites have two shapes:
 Either way no *existing* admitted session is evicted — which is the whole point
 of the `LRU_HASH`→`HASH` change.
 
+**The tc-egress datapath also writes `spp` (return-path pinholes).**
+`tc_egress.c`'s `tc_egress_prog` inserts a reversed-tuple entry into the *same*
+`spp` map on every egress packet (`BPF_ANY`, 180s `expire_time`) so return
+traffic is admitted. So two consequences of `spp` being `HASH` span the datapath,
+not just userspace admissions:
+
+- **Fill is fail-closed datapath-wide.** A burst of distinct egress flows fills
+  `spp` with datapath-created pinholes; at `max_entries` (1,000,000) new inserts —
+  *including* userspace admissions — get `-E2BIG` and fail closed. This is the
+  intended #2163 tradeoff (never silently evict an admitted session), now also
+  meaning the egress datapath can pressure the admission map.
+- **GC of tc-written entries is a periodic sweep.** The L3 expiry scheduler
+  flushes *admission*-created allow-rules at their deadline, and the XDP read path
+  deletes an entry lazily when it looks it up and finds `expire_time` past
+  (`nhp_ebpf_xdp.c`) — but neither covers a tc-written pinhole whose return
+  traffic never arrives. So the lifecycle reaper (`utilebpf.ReapExpiredWhitelist`,
+  driven by the same sampler that reaps `conn_track` in
+  `expiry_bpf_flusher_linux.go`) periodically walks `spp` and only ever *targets*
+  already-expired entries. Keys are sampled then deleted in a later pass, so a
+  same-key re-admission in that window is removed despite now carrying a future
+  `expire_time` — but the cost is at most a re-knock on the next packet, never a
+  fail-open (the accepted conn_track-reaper recreate semantic). Reaped counts
+  publish as `MetricEbpfSppExpiredReaped`; a chronically-partial sweep (the HASH
+  walk aborting under churn) shows up as `MetricEbpfSppReapPartialSamples`.
+
+This was latent until #2961 enabled `FilterMode=EBPFXDP`: before that the
+shared-map type mismatch crash-looped the AC (fixed in #3019), so the tc datapath
+never actually ran.
+
 **`conn_track` and `conn_track_v6` are also `HASH` (#2814).** They are
 per-flow established-connection caches that the datapath populates (with
 `BPF_ANY`) only *after* an allow-rule match; a conntrack hit short-circuits to

@@ -706,7 +706,25 @@ const (
 	MetricEbpfFragStateV6MaxEntries       = "EbpfFragStateV6MaxEntries"
 	MetricEbpfFragStateV6UsagePercent     = "EbpfFragStateV6UsagePercent"
 	MetricEbpfFragStateV6ExpiredReaped    = "EbpfFragStateV6ExpiredReaped"
-	MetricEbpfConntrackSampleSeconds      = "EbpfConntrackSampleSeconds"
+	// MetricEbpfSppExpiredReaped counts expired entries the lifecycle reaper
+	// deletes from the shared `spp` allow-rule map — the GC bound on tc-egress
+	// datapath-written return-path pinholes (spp is HASH since #2163, no LRU).
+	// MetricEbpfSppReapPartialSamples / MetricEbpfSppReapErrors are the sweep's own
+	// health signals (HASH walk aborted under churn / reap failed), kept separate
+	// from the conntrack ones; sustained SppReapPartialSamples means the fill
+	// defense isn't engaging under the churn it defends against.
+	MetricEbpfSppExpiredReaped      = "EbpfSppExpiredReaped"
+	MetricEbpfSppReapPartialSamples = "EbpfSppReapPartialSamples"
+	MetricEbpfSppReapErrors         = "EbpfSppReapErrors"
+	// MetricEbpfSpp{Entries,MaxEntries,UsagePercent} are the point-in-time `spp`
+	// allow-rule occupancy gauges — the direct burst-fill signal for the prod
+	// EBPFXDP flip (occupancy → max_entries → -E2BIG on new admissions), which the
+	// reaper's reset-per-flush counters can't show because a within-TTL burst fills
+	// faster than entries become reap-eligible.
+	MetricEbpfSppEntries             = "EbpfSppEntries"
+	MetricEbpfSppMaxEntries          = "EbpfSppMaxEntries"
+	MetricEbpfSppUsagePercent        = "EbpfSppUsagePercent"
+	MetricEbpfConntrackSampleSeconds = "EbpfConntrackSampleSeconds"
 
 	// MetricEbpfConntrackSampleErrors counts stats/reaper sample failures per
 	// publisher interval. It intentionally uses reset-per-flush counter
@@ -1431,6 +1449,9 @@ func (r *ACRegistration) registerConntrackGaugeFuncs() {
 	r.metrics.RegisterGaugeFunc(MetricEbpfFragStateV6Entries, r.ebpfFragStateV6EntriesGauge)
 	r.metrics.RegisterGaugeFunc(MetricEbpfFragStateV6MaxEntries, r.ebpfFragStateV6MaxEntriesGauge)
 	r.metrics.RegisterGaugeFunc(MetricEbpfFragStateV6UsagePercent, r.ebpfFragStateV6UsagePercentGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfSppEntries, r.ebpfSppEntriesGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfSppMaxEntries, r.ebpfSppMaxEntriesGauge)
+	r.metrics.RegisterGaugeFunc(MetricEbpfSppUsagePercent, r.ebpfSppUsagePercentGauge)
 	r.metrics.RegisterGaugeFunc(MetricEbpfConntrackSampleSeconds, r.ebpfConntrackSampleSecondsGauge)
 }
 
@@ -1823,6 +1844,15 @@ func (r *ACRegistration) ebpfFragStateV6MaxEntriesGauge() float64 {
 }
 func (r *ACRegistration) ebpfFragStateV6UsagePercentGauge() float64 {
 	return r.ebpfConntrackStatsSnapshot().V6FragUsagePercent
+}
+func (r *ACRegistration) ebpfSppEntriesGauge() float64 {
+	return float64(r.ebpfConntrackStatsSnapshot().SppEntries)
+}
+func (r *ACRegistration) ebpfSppMaxEntriesGauge() float64 {
+	return float64(r.ebpfConntrackStatsSnapshot().SppMaxEntries)
+}
+func (r *ACRegistration) ebpfSppUsagePercentGauge() float64 {
+	return r.ebpfConntrackStatsSnapshot().SppUsagePercent
 }
 func (r *ACRegistration) ebpfConntrackSampleSecondsGauge() float64 {
 	return r.ebpfConntrackStatsSnapshot().SampleDurationSeconds

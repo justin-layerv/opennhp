@@ -291,7 +291,7 @@ func TestBpfConntrackSampleIntervalMatchesPublisherFlushInterval(t *testing.T) {
 }
 
 func TestBpfConntrackStatsFromRaw_ZeroMaxEntriesUsesZeroUsagePercent(t *testing.T) {
-	stats := bpfConntrackStatsFromRaw(utilebpf.ConnTrackStats{}, 0, 0, 0, 0, 0)
+	stats := bpfConntrackStatsFromRaw(utilebpf.ConnTrackStats{}, bpfReapWatermarks{})
 	if stats.V4MaxEntries != 0 || stats.V4UsagePercent != 0 {
 		t.Fatalf("v4 zero snapshot = max %d usage %v, want max 0 usage 0", stats.V4MaxEntries, stats.V4UsagePercent)
 	}
@@ -321,6 +321,71 @@ func TestBpfFlusher_ConntrackStatsReturnsCachedSnapshotWithoutSampling(t *testin
 	}
 	if calls != 0 {
 		t.Fatalf("ConntrackStats invoked sampler %d time(s), want 0; gauges must not drive map walks", calls)
+	}
+}
+
+// TestBpfFlusher_RefreshConntrackStats_SppAccounting drives refreshConntrackStats
+// through the injectable reapWhitelist seam to cover the spp reaper's accounting,
+// which otherwise has no unit coverage at the flusher layer (#3019 review): the
+// cumulative health counters (reaped / partial / errors) and the occupancy gauge's
+// conservative-publish rules — preserve on a hard error, preserve a partial walk
+// that would LOWER occupancy (it's the burst-fill signal, so churn must not mask a
+// rising fill), and keep a higher partial reading.
+func TestBpfFlusher_RefreshConntrackStats_SppAccounting(t *testing.T) {
+	var spp utilebpf.WhitelistReapStats
+	var sppErr error
+	f := &BpfFlusher{
+		// Isolate spp: an empty, error-free conntrack sample contributes no
+		// conntrack occupancy and no conntrack error to the shared pass.
+		sampleConntrack: func() (utilebpf.ConnTrackStats, error) {
+			return utilebpf.ConnTrackStats{}, nil
+		},
+		reapWhitelist: func() (utilebpf.WhitelistReapStats, error) {
+			return spp, sppErr
+		},
+	}
+
+	// Pass 1 — normal: publishes occupancy and accumulates the reaped counter.
+	spp, sppErr = utilebpf.WhitelistReapStats{Reaped: 5, Entries: 100, MaxEntries: 1000}, nil
+	f.refreshConntrackStats()
+	got := f.ConntrackStats()
+	if got.SppExpiredReaped != 5 || got.SppEntries != 100 || got.SppMaxEntries != 1000 || got.SppUsagePercent != 10 {
+		t.Fatalf("pass1 spp = reaped %d entries %d/%d usage %v, want 5 100/1000 10", got.SppExpiredReaped, got.SppEntries, got.SppMaxEntries, got.SppUsagePercent)
+	}
+
+	// Pass 2 — hard reap error: increments SppReapErrors and PRESERVES the prior
+	// occupancy (a zeroed error sample must not mask a fill; the counter alarms).
+	spp, sppErr = utilebpf.WhitelistReapStats{}, errors.New("reap failed")
+	f.refreshConntrackStats()
+	got = f.ConntrackStats()
+	if got.SppReapErrors != 1 {
+		t.Fatalf("pass2 SppReapErrors = %d, want 1", got.SppReapErrors)
+	}
+	if got.SppEntries != 100 || got.SppUsagePercent != 10 {
+		t.Fatalf("pass2 occupancy = %d/%v, want preserved 100/10 across a hard spp error", got.SppEntries, got.SppUsagePercent)
+	}
+
+	// Pass 3 — partial walk reading LOWER: increments SppReapPartialSamples and
+	// preserves the higher prior occupancy (a partial HASH walk undercounts).
+	spp, sppErr = utilebpf.WhitelistReapStats{Entries: 50, MaxEntries: 1000, Partial: true}, nil
+	f.refreshConntrackStats()
+	got = f.ConntrackStats()
+	if got.SppReapPartialSamples != 1 {
+		t.Fatalf("pass3 SppReapPartialSamples = %d, want 1", got.SppReapPartialSamples)
+	}
+	if got.SppEntries != 100 || got.SppUsagePercent != 10 {
+		t.Fatalf("pass3 occupancy = %d/%v, want preserved 100/10 (a partial lower reading must not lower the gauge)", got.SppEntries, got.SppUsagePercent)
+	}
+
+	// Pass 4 — partial walk reading HIGHER: kept, because it still reveals the fill.
+	spp, sppErr = utilebpf.WhitelistReapStats{Entries: 300, MaxEntries: 1000, Partial: true}, nil
+	f.refreshConntrackStats()
+	got = f.ConntrackStats()
+	if got.SppEntries != 300 || got.SppUsagePercent != 30 {
+		t.Fatalf("pass4 occupancy = %d/%v, want 300/30 (a higher partial reading still surfaces the fill)", got.SppEntries, got.SppUsagePercent)
+	}
+	if got.SppReapPartialSamples != 2 {
+		t.Fatalf("pass4 SppReapPartialSamples = %d, want 2 (cumulative)", got.SppReapPartialSamples)
 	}
 }
 
@@ -515,7 +580,16 @@ func TestBpfConntrackStatsFromRaw_PostReapOccupancyAndCumulativeCounters(t *test
 		},
 	}
 
-	got := bpfConntrackStatsFromRaw(raw, 2, 1, 11, 7, 13)
+	got := bpfConntrackStatsFromRaw(raw, bpfReapWatermarks{
+		sampleErrors:        2,
+		partialSamples:      1,
+		expiredReapedV4:     11,
+		expiredReapedV6:     7,
+		fragExpiredReapedV6: 13,
+		sppExpiredReaped:    17,
+		sppReapPartial:      19,
+		sppReapErrors:       23,
+	})
 	if got.V4Entries != 7 {
 		t.Fatalf("V4Entries = %d, want post-reap 7", got.V4Entries)
 	}
@@ -548,6 +622,15 @@ func TestBpfConntrackStatsFromRaw_PostReapOccupancyAndCumulativeCounters(t *test
 	}
 	if got.V6FragExpiredReaped != 13 {
 		t.Fatalf("V6FragExpiredReaped = %d, want cumulative 13", got.V6FragExpiredReaped)
+	}
+	if got.SppExpiredReaped != 17 {
+		t.Fatalf("SppExpiredReaped = %d, want cumulative 17", got.SppExpiredReaped)
+	}
+	if got.SppReapPartialSamples != 19 {
+		t.Fatalf("SppReapPartialSamples = %d, want cumulative 19", got.SppReapPartialSamples)
+	}
+	if got.SppReapErrors != 23 {
+		t.Fatalf("SppReapErrors = %d, want cumulative 23", got.SppReapErrors)
 	}
 	if got.SampleErrors != 2 {
 		t.Fatalf("SampleErrors = %d, want 2", got.SampleErrors)
@@ -589,7 +672,11 @@ func TestBpfConntrackStatsPreserveLastGoodOnHardSampleError(t *testing.T) {
 		},
 	}
 
-	next := bpfConntrackStatsFromRaw(raw, 1, 0, 9, 5, 0)
+	next := bpfConntrackStatsFromRaw(raw, bpfReapWatermarks{
+		sampleErrors:    1,
+		expiredReapedV4: 9,
+		expiredReapedV6: 5,
+	})
 	got := bpfConntrackStatsPreserveConservativeOccupancy(next, previous, raw, errTestConntrackSample)
 
 	if got.V4Entries != previous.V4Entries || got.V4MaxEntries != previous.V4MaxEntries ||
@@ -653,7 +740,12 @@ func TestBpfConntrackStatsPreserveConservativeOccupancyOnPartialSample(t *testin
 		},
 	}
 
-	next := bpfConntrackStatsFromRaw(raw, 0, 3, 7, 11, 13)
+	next := bpfConntrackStatsFromRaw(raw, bpfReapWatermarks{
+		partialSamples:      3,
+		expiredReapedV4:     7,
+		expiredReapedV6:     11,
+		fragExpiredReapedV6: 13,
+	})
 	got := bpfConntrackStatsPreserveConservativeOccupancy(next, previous, raw, nil)
 
 	if got.V4Entries != previous.V4Entries || got.V4MaxEntries != previous.V4MaxEntries ||

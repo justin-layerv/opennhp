@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -123,17 +124,20 @@ func TestXdpSource_AdmissionMapsAndConnTrackAreHash(t *testing.T) {
 	}
 }
 
-// readXdpSource loads the XDP source from either the full monorepo layout or an
-// isolated nhp module checkout.
-func readXdpSource(t *testing.T) string {
+// readEbpfSource loads an eBPF .c source by base name from the eBPF source dir
+// (resolves either the full monorepo layout or an isolated nhp module checkout).
+func readEbpfSource(t *testing.T, name string) string {
 	t.Helper()
-	srcPath := filepath.Join(resolveEbpfTestPaths(t).xdpSourceDir, "nhp_ebpf_xdp.c")
+	srcPath := filepath.Join(resolveEbpfTestPaths(t).xdpSourceDir, name)
 	b, err := os.ReadFile(srcPath)
 	if err != nil {
-		t.Fatalf("reading XDP source %s: %v", srcPath, err)
+		t.Fatalf("reading eBPF source %s: %v", srcPath, err)
 	}
 	return string(b)
 }
+
+// readXdpSource loads the XDP source (both .c files live in nhp/ebpf/xdp/).
+func readXdpSource(t *testing.T) string { return readEbpfSource(t, "nhp_ebpf_xdp.c") }
 
 // mapTypeDeclRe matches a `__uint(type, BPF_MAP_TYPE_*)` declaration. It is
 // invariant across maps (the per-map part is the terminator regex built in
@@ -160,4 +164,169 @@ func mapTypeForName(t *testing.T, src, name string) string {
 		return ""
 	}
 	return matches[len(matches)-1][1]
+}
+
+// readTcEgressSource loads the tc egress source (same dir as the XDP source).
+func readTcEgressSource(t *testing.T) string { return readEbpfSource(t, "tc_egress.c") }
+
+// TestTcEgressSource_SppIsHash extends the #2163 map-type guard to the tc_egress
+// source. The original guard (TestXdpSource_AdmissionMapsAndConnTrackAreHash)
+// only checked the XDP source — the exact gap that let tc_egress's duplicate
+// `spp` stay LRU_HASH after #2163 flipped the XDP `spp` to HASH, which crash-
+// looped every AC once #2961 enabled FilterMode=EBPFXDP in sandbox.
+func TestTcEgressSource_SppIsHash(t *testing.T) {
+	src := readTcEgressSource(t)
+	if got := mapTypeForName(t, src, "spp"); got != "BPF_MAP_TYPE_HASH" {
+		t.Errorf("tc_egress `spp` declared as %s, want BPF_MAP_TYPE_HASH — it is the SAME pinned map as nhp_ebpf_xdp.c's `spp`; LRU_HASH silently evicts admitted sessions (#2163) and mismatches the XDP HASH, boot-failing the AC under FilterMode=EBPFXDP", got)
+	}
+}
+
+// pinnedMapDecl is a LIBBPF_PIN_BY_NAME map declaration parsed from an eBPF .c
+// source. Two objects that both declare a map with the same SEC(".maps") name
+// and LIBBPF_PIN_BY_NAME resolve to ONE kernel map at /sys/fs/bpf/<name>, so
+// every field here must be identical across objects or the second object's
+// LoadAndAssign fails with an incompatible-pinned-map error.
+type pinnedMapDecl struct {
+	typ        string // BPF_MAP_TYPE_*
+	key        string // __type(key, …), whitespace-normalized
+	value      string // __type(value, …), whitespace-normalized
+	maxEntries string // __uint(max_entries, …), macro-resolved to its numeric value
+}
+
+var (
+	// One map declaration: `struct { … } <name> SEC(".maps");`. The map bodies
+	// contain no nested braces, so [^}]* safely spans the (multi-line) body up to
+	// the closing brace. Anonymous `struct {` only matches map literals, never a
+	// named `struct foo {` type.
+	ebpfMapDeclRe   = regexp.MustCompile(`struct\s*\{([^}]*)\}\s*(\w+)\s+SEC\("\.maps"\)\s*;`)
+	mapKeyRe        = regexp.MustCompile(`__type\(\s*key\s*,\s*(.+?)\s*\)`)
+	mapValueRe      = regexp.MustCompile(`__type\(\s*value\s*,\s*(.+?)\s*\)`)
+	mapMaxEntriesRe = regexp.MustCompile(`__uint\(\s*max_entries\s*,\s*(\w+)\s*\)`)
+	mapPinByNameRe  = regexp.MustCompile(`__uint\(\s*pinning\s*,\s*LIBBPF_PIN_BY_NAME\s*\)`)
+	ebpfWSRe        = regexp.MustCompile(`\s+`)
+	macroNumericRe  = regexp.MustCompile(`^\d+$`)
+	lineCommentRe   = regexp.MustCompile(`//[^\n]*`)
+	blockCommentRe  = regexp.MustCompile(`(?s)/\*.*?\*/`)
+)
+
+// resolveMacro resolves a `max_entries` token to its numeric value using the
+// file's own `#define`s, so the parity check compares VALUES not tokens: two
+// files both writing `MAX_ENTRIES` but with different `#define MAX_ENTRIES N`
+// would still mismatch the kernel's pinned-map size check, so they must diff
+// here too. A bare numeric literal is returned as-is; an unresolved token falls
+// back to itself (still catches a token rename).
+func resolveMacro(src, token string) string {
+	if token == "" || macroNumericRe.MatchString(token) {
+		return token
+	}
+	re := regexp.MustCompile(`(?m)^\s*#define\s+` + regexp.QuoteMeta(token) + `\s+(\S+)`)
+	if m := re.FindStringSubmatch(src); m != nil {
+		return m[1]
+	}
+	return token
+}
+
+// parsePinnedMaps returns every LIBBPF_PIN_BY_NAME map in src, keyed by its
+// SEC(".maps") symbol name. Non-pinned maps are skipped: they get an unpinned
+// per-object instance, so they cannot collide at a shared /sys/fs/bpf/<name>.
+func parsePinnedMaps(t *testing.T, src string) map[string]pinnedMapDecl {
+	t.Helper()
+	out := map[string]pinnedMapDecl{}
+	norm := func(re *regexp.Regexp, body string) string {
+		if m := re.FindStringSubmatch(body); m != nil {
+			return ebpfWSRe.ReplaceAllString(strings.TrimSpace(m[1]), " ")
+		}
+		return ""
+	}
+	for _, m := range ebpfMapDeclRe.FindAllStringSubmatch(src, -1) {
+		body, name := m[1], m[2]
+		if !mapPinByNameRe.MatchString(body) {
+			continue
+		}
+		d := pinnedMapDecl{
+			typ:        norm(mapTypeDeclRe, body),
+			key:        norm(mapKeyRe, body),
+			value:      norm(mapValueRe, body),
+			maxEntries: resolveMacro(src, norm(mapMaxEntriesRe, body)),
+		}
+		out[name] = d
+	}
+	return out
+}
+
+// structBody returns the whitespace-normalized field list of the `struct <name>`
+// definition referenced by a map's __type(key|value, …). typeToken looks like
+// "struct whitelist_key"; a non-"struct X" token (a scalar) is returned verbatim
+// (the token equality check already covers it). The map bodies have no nested
+// braces and neither do these small POD structs, so [^}]* captures the body.
+func structBody(t *testing.T, src, typeToken string) string {
+	t.Helper()
+	name := strings.TrimSpace(strings.TrimPrefix(typeToken, "struct"))
+	if name == "" || name == typeToken {
+		return typeToken // not a "struct X" reference — nothing to expand
+	}
+	// Capture the field body AND the post-brace attributes (e.g.
+	// `__attribute__((packed))`), since packed-ness changes the on-wire size just
+	// like a field edit does.
+	re := regexp.MustCompile(`struct\s+` + regexp.QuoteMeta(name) + `\s*\{([^}]*)\}([^;]*);`)
+	m := re.FindStringSubmatch(src)
+	if m == nil {
+		t.Fatalf("struct %q (referenced by a pinned map) not found in source", name)
+		return ""
+	}
+	// Strip comments so field-size annotations present in one file's copy (the XDP
+	// source annotates `// 4`, `// 2`, …; tc_egress.c does not) don't read as a
+	// divergence — only the actual fields + packed-ness matter.
+	body := blockCommentRe.ReplaceAllString(m[1]+" "+m[2], "")
+	body = lineCommentRe.ReplaceAllString(body, "")
+	return ebpfWSRe.ReplaceAllString(strings.TrimSpace(body), " ")
+}
+
+// TestSharedPinnedMaps_XdpTcParity is the "never again" guard for the sandbox
+// crash: every LIBBPF_PIN_BY_NAME map declared in BOTH the XDP and TC objects is
+// one shared kernel map at /sys/fs/bpf/<name>, so their declarations must match
+// exactly (type + key + value + max_entries) or the second LoadAndAssign fails
+// and the AC boot-fails under FilterMode=EBPFXDP. Parses the .c sources so it
+// fails at PR time on any machine — no kernel, no compiled object needed. This
+// is the check that #2163 (XDP-only) lacked when it flipped `spp` to HASH.
+func TestSharedPinnedMaps_XdpTcParity(t *testing.T) {
+	xdpSrc := readXdpSource(t)
+	tcSrc := readTcEgressSource(t)
+	xdp := parsePinnedMaps(t, xdpSrc)
+	tc := parsePinnedMaps(t, tcSrc)
+
+	shared := 0
+	for name, x := range xdp {
+		c, ok := tc[name]
+		if !ok {
+			continue
+		}
+		shared++
+		// Report the specific diverging field (type/key/value/max_entries) rather
+		// than a struct dump — any one mismatch fails the second LoadAndAssign and
+		// boot-fails the AC under FilterMode=EBPFXDP (the #2163/#2961 crash-loop).
+		diff := func(field, xv, cv string) {
+			if xv != cv {
+				t.Errorf("pinned map %q: %s differs — nhp_ebpf_xdp.c=%q vs tc_egress.c=%q. Both pin /sys/fs/bpf/%s, so the declarations MUST be identical.", name, field, xv, cv, name)
+			}
+		}
+		diff("type", x.typ, c.typ)
+		diff("key", x.key, c.key)
+		diff("value", x.value, c.value)
+		diff("max_entries", x.maxEntries, c.maxEntries)
+		// Compare the referenced key/value STRUCT BODIES, not just the type token.
+		// The structs are defined inline in each .c (not a shared header), so a
+		// field edit to one file's copy would keep the token equal while diverging
+		// the kernel's pinned-map key/value SIZE — the exact incompatible-pinned-map
+		// failure this guard exists to catch. (Done here rather than a compile-time
+		// _Static_assert in nhp_ebpf_xdp.c: that object is committed and
+		// freshness-gated, so an added assert churns its bytes.)
+		diff("key struct body", structBody(t, xdpSrc, x.key), structBody(t, tcSrc, c.key))
+		diff("value struct body", structBody(t, xdpSrc, x.value), structBody(t, tcSrc, c.value))
+	}
+	// Non-vacuous: today `spp` is the shared pinned map. If a refactor removes all
+	// overlap this guard becomes a no-op silently, so fail loudly instead.
+	if shared == 0 {
+		t.Fatal("no LIBBPF_PIN_BY_NAME map is shared between nhp_ebpf_xdp.c and tc_egress.c (expected at least `spp`); the parser or the sources changed — re-verify this parity guard is still exercised")
+	}
 }

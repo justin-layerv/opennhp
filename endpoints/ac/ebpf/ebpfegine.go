@@ -6,6 +6,7 @@ import (
 	// "log"
 
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -104,23 +105,23 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 	tcSpecPath := filepath.Join(bpfDir, tcObjName)
 
 	if _, err := os.Stat(specPath); os.IsNotExist(err) {
-		log.Error("eBPF object file not found ")
+		log.Error("eBPF object file not found: %s (cwd-relative; shipped by the AC Docker image / make ebpf-objects)", specPath)
 		return err
 	}
 	if _, err := os.Stat(tcSpecPath); os.IsNotExist(err) {
-		log.Error("tc eBPF object file not found ")
+		log.Error("tc eBPF object file not found: %s (cwd-relative; shipped by the AC Docker image / make ebpf-objects)", tcSpecPath)
 		return err
 	}
 
 	spec, err := ebpf.LoadCollectionSpec(specPath)
 	if err != nil {
-		log.Error("failed to load eBPF object")
+		log.Error("failed to load eBPF object %s: %v", specPath, err)
 		return err
 	}
 	// Load tc eBPF object
 	tcSpec, err := ebpf.LoadCollectionSpec(tcSpecPath)
 	if err != nil {
-		log.Error("failed to load tc eBPF object")
+		log.Error("failed to load tc eBPF object %s: %v", tcSpecPath, err)
 		return err
 	}
 
@@ -136,8 +137,13 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 			PinPath: "/sys/fs/bpf/", // automatically mounted to
 		},
 	}); err != nil {
-		log.Error("Failed to load and assign eBPF objects")
-		return err
+		// Log the underlying error, not a bare message: the cause (verifier
+		// reject, incompatible pinned map, arch/kernel mismatch) is what an
+		// operator needs, and swallowing it here made the #2961 crash-loop
+		// invisible in CloudWatch. cilium/ebpf's *VerifierError formats its full
+		// log under %+v.
+		log.Error("Failed to load and assign XDP eBPF objects (%s): %+v", ebpfenginename, err)
+		return fmt.Errorf("load and assign XDP eBPF objects (%s): %w", ebpfenginename, err)
 	}
 
 	var tcObjs tcBpfObjects
@@ -146,17 +152,20 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 			PinPath: "/sys/fs/bpf/", // automatically mounted to
 		},
 	}); err != nil {
-		log.Error("Failed to load and assign tc eBPF objects")
-		return err
+		// See above — surface the real cause. This is the exact site that hid the
+		// spp HASH-vs-LRU_HASH incompatible-pinned-map failure (tc_egress spp had
+		// diverged from the XDP spp) behind a generic message.
+		log.Error("Failed to load and assign tc eBPF objects (%s): %+v", tcObjName, err)
+		return fmt.Errorf("load and assign tc eBPF objects (%s): %w", tcObjName, err)
 	}
 
 	if err := objs.XdpProg.Pin("/sys/fs/bpf/xdp_white_prog"); err != nil {
-		log.Error("failed to pin XDP program xdp_white_prog to /sys/fs/bpf/")
-		return err
+		log.Error("failed to pin XDP program xdp_white_prog to /sys/fs/bpf/: %v", err)
+		return fmt.Errorf("pin XDP program xdp_white_prog: %w", err)
 	}
 	if err := tcObjs.TcEgressProg.Pin("/sys/fs/bpf/tc_egress_prog"); err != nil {
-		log.Error("failed to pin TC egress program tc_egress_prog to /sys/fs/bpf/")
-		return err
+		log.Error("failed to pin TC egress program tc_egress_prog to /sys/fs/bpf/: %v", err)
+		return fmt.Errorf("pin TC egress program tc_egress_prog: %w", err)
 	}
 
 	ifaceName, err := getDefaultRouteInterface()

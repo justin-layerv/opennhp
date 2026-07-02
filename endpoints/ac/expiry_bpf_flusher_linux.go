@@ -59,8 +59,13 @@ import (
 // # Idempotency
 //
 // Per-map Delete returns ebpf.ErrKeyNotExist on no-match; the
-// nhp/utils/ebpf helpers translate that to nil. Kernel GC may
-// race with us — that's fine.
+// nhp/utils/ebpf helpers translate that to nil. Three deleters can
+// race for the same expired key — this scheduled Flush, the XDP
+// datapath's lazy delete-on-lookup, and the periodic spp reaper
+// (utilebpf.ReapExpiredWhitelist). Whoever loses gets a no-match
+// Delete that returns nil, so processEntry logs no error and ticks
+// no error metric, and the wheel entry is dropped regardless — a
+// clean no-op with no orphaned bookkeeping. That's fine.
 //
 // # Per-call open/close cost
 //
@@ -110,6 +115,11 @@ type BpfFlusher struct {
 	conntrackSampler   *bpfConntrackSampler
 
 	sampleConntrack func() (utilebpf.ConnTrackStats, error)
+	// reapWhitelist is the injectable seam for the spp allow-rule sweep, mirroring
+	// sampleConntrack. nil in production (calls utilebpf.ReapExpiredWhitelist); a
+	// unit test sets it to drive the sppErr / partial / occupancy accounting in
+	// refreshConntrackStats without a real pinned map.
+	reapWhitelist func() (utilebpf.WhitelistReapStats, error)
 
 	statsMu sync.Mutex
 	stats   BpfConntrackStats
@@ -122,6 +132,9 @@ type BpfFlusher struct {
 	conntrackExpiredReapedV4 uint64
 	conntrackExpiredReapedV6 uint64
 	fragStateExpiredReapedV6 uint64
+	sppExpiredReaped         uint64
+	sppReapPartialSamples    uint64
+	sppReapErrors            uint64
 }
 
 type bpfConntrackSampler struct {
@@ -270,16 +283,31 @@ func (f *BpfFlusher) ConntrackStats() BpfConntrackStats {
 func (f *BpfFlusher) refreshConntrackStats() {
 	sampleStart := time.Now()
 	raw, err := f.sampleAndReapConnTrack()
+	// The lifecycle sampler is the periodic eBPF-map-maintenance owner. Besides
+	// conn_track it also sweeps expired entries from the shared `spp` allow-rule
+	// map: the tc-egress datapath fills spp with return-path pinholes that have no
+	// other scheduled GC (admission rules use the L3 expiry scheduler; spp is HASH
+	// since #2163, so no LRU eviction). Run inside the same timed pass so
+	// SampleDurationSeconds and the slow-sample warning cover BOTH full-map walks
+	// (the spp sweep is a second ~1M-entry walk under EBPFXDP). See
+	// utilebpf.ReapExpiredWhitelist and SESSION_ENFORCEMENT_ARCHITECTURE.md.
+	sppStats, sppErr := f.sampleAndReapWhitelist()
 	sampleElapsed := time.Since(sampleStart)
 	slowSample := sampleElapsed > bpfConntrackSampleSlowThreshold
 	if slowSample {
-		if err != nil {
-			log.Warning("[BpfFlusher] conntrack sampler/reaper pass took %s (> %s) and failed: %v; full HASH map walks may lag quiet-entry reaping (see nhp#2928)",
-				sampleElapsed, bpfConntrackSampleSlowThreshold, err)
-		} else {
-			log.Warning("[BpfFlusher] conntrack sampler/reaper pass took %s (> %s); full HASH map walks may lag quiet-entry reaping (v4=%d/%d v6=%d/%d, see nhp#2928)",
-				sampleElapsed, bpfConntrackSampleSlowThreshold, raw.V4.Entries, raw.V4.MaxEntries, raw.V6.Entries, raw.V6.MaxEntries)
+		// One combined warning on a slow pass; the per-error branches below stay
+		// quiet when slow (their `!slowSample` guards) to avoid double-logging, so
+		// this line must carry BOTH walks' error detail — otherwise a slow pass
+		// where one walk failed drops that error, leaving only its counter
+		// (nhp#3019 round-6). The partial-sample branches are NOT gated and still
+		// log unconditionally (matching the conn_track partial branches); a slow
+		// partial pass logging twice is accepted.
+		msg := fmt.Sprintf("[BpfFlusher] conntrack+spp sampler/reaper pass took %s (> %s); full HASH map walks may lag quiet-entry reaping (v4=%d/%d v6=%d/%d spp_reaped=%d, see nhp#2928)",
+			sampleElapsed, bpfConntrackSampleSlowThreshold, raw.V4.Entries, raw.V4.MaxEntries, raw.V6.Entries, raw.V6.MaxEntries, sppStats.Reaped)
+		if err != nil || sppErr != nil {
+			msg += fmt.Sprintf(" [errors: conntrack=%v spp=%v]", err, sppErr)
 		}
+		log.Warning("%s", msg)
 	}
 	if err != nil {
 		// SampleErrors is per refresh attempt (a joined v4/v6 sample/reap
@@ -306,20 +334,40 @@ func (f *BpfFlusher) refreshConntrackStats() {
 	f.conntrackExpiredReapedV6 += raw.V6.ExpiredDeleted
 	f.fragStateExpiredReapedV6 += raw.FragV6.ExpiredDeleted
 
-	nextStats := bpfConntrackStatsFromRaw(
-		raw,
-		f.conntrackSampleErrors,
-		f.conntrackPartialSamples,
-		f.conntrackExpiredReapedV4,
-		f.conntrackExpiredReapedV6,
-		f.fragStateExpiredReapedV6,
-	)
+	// spp reap health uses DEDICATED counters (not the conntrack ones) so an
+	// spp-specific partial/failure stays distinguishable from a conntrack signal
+	// in dashboards.
+	f.sppExpiredReaped += sppStats.Reaped
+	if sppStats.Partial {
+		f.sppReapPartialSamples++
+		log.Warning("[BpfFlusher] spp allow-rule reap was partial (HASH walk aborted under churn); expired return-path pinholes may accumulate until a complete pass")
+	}
+	if sppErr != nil {
+		f.sppReapErrors++
+		if !slowSample {
+			log.Warning("[BpfFlusher] spp allow-rule expired-entry reap failed: %v", sppErr)
+		}
+	}
+
+	nextStats := bpfConntrackStatsFromRaw(raw, bpfReapWatermarks{
+		sampleErrors:        f.conntrackSampleErrors,
+		partialSamples:      f.conntrackPartialSamples,
+		expiredReapedV4:     f.conntrackExpiredReapedV4,
+		expiredReapedV6:     f.conntrackExpiredReapedV6,
+		fragExpiredReapedV6: f.fragStateExpiredReapedV6,
+		sppExpiredReaped:    f.sppExpiredReaped,
+		sppReapPartial:      f.sppReapPartialSamples,
+		sppReapErrors:       f.sppReapErrors,
+	})
 	nextStats.SampleDurationSeconds = sampleElapsed.Seconds()
 
 	// The lifecycle sampler goroutine is the sole writer of f.stats, so the
 	// prior snapshot it merges against cannot change while this sample runs.
 	f.statsMu.Lock()
-	f.stats = bpfConntrackStatsPreserveConservativeOccupancy(nextStats, f.stats, raw, err)
+	previous := f.stats
+	next := bpfConntrackStatsPreserveConservativeOccupancy(nextStats, previous, raw, err)
+	next = bpfConntrackStatsApplySppOccupancy(next, previous, sppStats, sppErr)
+	f.stats = next
 	f.statsMu.Unlock()
 }
 
@@ -330,27 +378,52 @@ func (f *BpfFlusher) sampleAndReapConnTrack() (utilebpf.ConnTrackStats, error) {
 	return utilebpf.SampleAndReapConnTrack()
 }
 
-func bpfConntrackStatsFromRaw(raw utilebpf.ConnTrackStats, sampleErrors, partialSamples, expiredReapedV4, expiredReapedV6, fragExpiredReapedV6 uint64) BpfConntrackStats {
+func (f *BpfFlusher) sampleAndReapWhitelist() (utilebpf.WhitelistReapStats, error) {
+	if f.reapWhitelist != nil {
+		return f.reapWhitelist()
+	}
+	return utilebpf.ReapExpiredWhitelist()
+}
+
+// bpfReapWatermarks carries the flusher's cumulative sampler/reaper counters
+// into bpfConntrackStatsFromRaw by name. Grouped into a struct rather than passed
+// positionally: the list grew to eight same-typed uint64s (conntrack + spp),
+// which are trivial to transpose at the call site.
+type bpfReapWatermarks struct {
+	sampleErrors        uint64
+	partialSamples      uint64
+	expiredReapedV4     uint64
+	expiredReapedV6     uint64
+	fragExpiredReapedV6 uint64
+	sppExpiredReaped    uint64
+	sppReapPartial      uint64
+	sppReapErrors       uint64
+}
+
+func bpfConntrackStatsFromRaw(raw utilebpf.ConnTrackStats, wm bpfReapWatermarks) BpfConntrackStats {
 	v4Entries := bpfConntrackPostReapEntries(raw.V4)
 	v6Entries := bpfConntrackPostReapEntries(raw.V6)
 	fragV6Entries := bpfConntrackPostReapEntries(raw.FragV6)
 	return BpfConntrackStats{
-		V4Entries:           v4Entries,
-		V4MaxEntries:        raw.V4.MaxEntries,
-		V4UsagePercent:      bpfConntrackUsagePercent(v4Entries, raw.V4.MaxEntries),
-		V4OldestAgeSeconds:  bpfConntrackAgeSeconds(raw.V4.OldestAgeNanos),
-		V4ExpiredReaped:     expiredReapedV4,
-		V6Entries:           v6Entries,
-		V6MaxEntries:        raw.V6.MaxEntries,
-		V6UsagePercent:      bpfConntrackUsagePercent(v6Entries, raw.V6.MaxEntries),
-		V6OldestAgeSeconds:  bpfConntrackAgeSeconds(raw.V6.OldestAgeNanos),
-		V6ExpiredReaped:     expiredReapedV6,
-		V6FragEntries:       fragV6Entries,
-		V6FragMaxEntries:    raw.FragV6.MaxEntries,
-		V6FragUsagePercent:  bpfConntrackUsagePercent(fragV6Entries, raw.FragV6.MaxEntries),
-		V6FragExpiredReaped: fragExpiredReapedV6,
-		SampleErrors:        sampleErrors,
-		PartialSamples:      partialSamples,
+		V4Entries:             v4Entries,
+		V4MaxEntries:          raw.V4.MaxEntries,
+		V4UsagePercent:        bpfConntrackUsagePercent(v4Entries, raw.V4.MaxEntries),
+		V4OldestAgeSeconds:    bpfConntrackAgeSeconds(raw.V4.OldestAgeNanos),
+		V4ExpiredReaped:       wm.expiredReapedV4,
+		V6Entries:             v6Entries,
+		V6MaxEntries:          raw.V6.MaxEntries,
+		V6UsagePercent:        bpfConntrackUsagePercent(v6Entries, raw.V6.MaxEntries),
+		V6OldestAgeSeconds:    bpfConntrackAgeSeconds(raw.V6.OldestAgeNanos),
+		V6ExpiredReaped:       wm.expiredReapedV6,
+		V6FragEntries:         fragV6Entries,
+		V6FragMaxEntries:      raw.FragV6.MaxEntries,
+		V6FragUsagePercent:    bpfConntrackUsagePercent(fragV6Entries, raw.FragV6.MaxEntries),
+		V6FragExpiredReaped:   wm.fragExpiredReapedV6,
+		SppExpiredReaped:      wm.sppExpiredReaped,
+		SppReapPartialSamples: wm.sppReapPartial,
+		SppReapErrors:         wm.sppReapErrors,
+		SampleErrors:          wm.sampleErrors,
+		PartialSamples:        wm.partialSamples,
 	}
 }
 
@@ -380,6 +453,32 @@ func bpfConntrackStatsPreserveConservativeOccupancy(next, previous BpfConntrackS
 	}
 	if raw.FragV6.PartialSample {
 		next = bpfConntrackStatsPreservePartialFragV6(next, previous)
+	}
+	return next
+}
+
+// bpfConntrackStatsApplySppOccupancy publishes the spp allow-rule occupancy gauge
+// from this pass's reaper stats, using the same conservative rules as the
+// conn_track occupancy: a hard reap error preserves the previous gauge (this
+// pass's reading is unreliable — SppReapErrors carries the alarm), and a partial
+// walk that would LOWER the gauge preserves the previous value (a partial HASH
+// walk undercounts, and since this gauge is the burst-fill signal, churn must
+// never mask a rising occupancy). A partial walk reading HIGHER than before is
+// kept — it still reveals the fill.
+func bpfConntrackStatsApplySppOccupancy(next, previous BpfConntrackStats, spp utilebpf.WhitelistReapStats, sppErr error) BpfConntrackStats {
+	if sppErr != nil {
+		next.SppEntries = previous.SppEntries
+		next.SppMaxEntries = previous.SppMaxEntries
+		next.SppUsagePercent = previous.SppUsagePercent
+		return next
+	}
+	next.SppEntries = spp.Entries
+	next.SppMaxEntries = spp.MaxEntries
+	next.SppUsagePercent = bpfConntrackUsagePercent(spp.Entries, spp.MaxEntries)
+	if spp.Partial && next.SppUsagePercent < previous.SppUsagePercent {
+		next.SppEntries = previous.SppEntries
+		next.SppMaxEntries = previous.SppMaxEntries
+		next.SppUsagePercent = previous.SppUsagePercent
 	}
 	return next
 }

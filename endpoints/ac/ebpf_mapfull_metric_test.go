@@ -400,6 +400,9 @@ func TestACRegistration_ConntrackGaugeCollectionReadsCachedStatsAndPublishesCoun
 				V6ExpiredReaped:       5,
 				V6FragEntries:         6,
 				V6FragExpiredReaped:   7,
+				SppExpiredReaped:      17,
+				SppReapPartialSamples: 19,
+				SppReapErrors:         23,
 				SampleDurationSeconds: 1.25,
 			}
 		},
@@ -433,6 +436,15 @@ func TestACRegistration_ConntrackGaugeCollectionReadsCachedStatsAndPublishesCoun
 	}
 	if got := counterValueForTest(t, publisher, MetricEbpfFragStateV6ExpiredReaped); got != 7 {
 		t.Fatalf("%s counter after collection = %v, want 7", MetricEbpfFragStateV6ExpiredReaped, got)
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfSppExpiredReaped); got != 17 {
+		t.Fatalf("%s counter after collection = %v, want 17", MetricEbpfSppExpiredReaped, got)
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfSppReapPartialSamples); got != 19 {
+		t.Fatalf("%s counter after collection = %v, want 19", MetricEbpfSppReapPartialSamples, got)
+	}
+	if got := counterValueForTest(t, publisher, MetricEbpfSppReapErrors); got != 23 {
+		t.Fatalf("%s counter after collection = %v, want 23", MetricEbpfSppReapErrors, got)
 	}
 }
 

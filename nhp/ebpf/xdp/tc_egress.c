@@ -28,8 +28,30 @@ struct whitelist_value {
     __u64 expire_time;
 };
 
+// These two must match nhp_ebpf_xdp.c's whitelist_key/value byte-for-byte —
+// spp is a shared LIBBPF_PIN_BY_NAME map, and the kernel rejects a second load
+// whose key/value size disagrees with the already-pinned map. The sizes are
+// asserted in both files (XDP: whitelist_key==11) so an independent struct edit
+// here fails the eBPF compile instead of boot-failing the AC at load time.
+_Static_assert(sizeof(struct whitelist_key) == 11,
+               "whitelist_key must be exactly 11 bytes (packed) — must match nhp_ebpf_xdp.c");
+_Static_assert(sizeof(struct whitelist_value) == 16,
+               "whitelist_value must be exactly 16 bytes — must match nhp_ebpf_xdp.c");
+
+// `spp` is the SAME pinned map as `spp` in nhp_ebpf_xdp.c — both declare
+// LIBBPF_PIN_BY_NAME, so at load time they resolve to one kernel map at
+// /sys/fs/bpf/spp. Its definition MUST match the XDP declaration byte-for-byte
+// (type, key, value, max_entries) or the second object's LoadAndAssign fails
+// with an incompatible-pinned-map error and the AC boot-fails under
+// FilterMode=EBPFXDP. It MUST be BPF_MAP_TYPE_HASH, not LRU_HASH: #2163 flipped
+// the XDP allow-rule maps HASH so a full map fails a NEW admission (-E2BIG)
+// instead of silently evicting an EXISTING admitted session ("kill a random
+// session"). That fix missed this duplicate here, which stayed LRU_HASH and
+// crash-looped every AC once #2961 enabled eBPF filter mode in sandbox. The
+// cross-object parity guard is TestSharedPinnedMaps_XdpTcParity in
+// nhp/utils/ebpf/maptype_test.go. Rationale: docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md.
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct whitelist_key);
     __type(value, struct whitelist_value);
     __uint(max_entries, MAX_ENTRIES);

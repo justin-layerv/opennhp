@@ -204,10 +204,14 @@ func sampleAndReapMapWithBudget(m *ebpf.Map, nowNanos uint64, deleteBudget int, 
 	}
 
 	for _, key := range expiredKeys {
-		// A same-key recreate between sample and delete only loses cached
-		// admission state for that key. Subsequent packets re-enter datapath
-		// policy instead of bypassing admission; this never creates a fail-open
-		// or silent eviction.
+		// A same-key recreate between sample and delete is safe for every caller of
+		// this shared loop: it only drops that one key's entry, and the next packet
+		// re-enters datapath policy instead of bypassing it — never a fail-open or
+		// silent eviction. The two callers differ in what the dropped entry was:
+		// conn_track loses cached tracking state (re-tracked on the next packet);
+		// the spp allow-rule reaper (utilebpf.ReapExpiredWhitelist) drops the
+		// admission itself, so the next packet fail-closes to a re-knock. Both are
+		// fail-closed, and this loop only ever deletes already-expired keys.
 		if err := m.Delete(key); err != nil {
 			if !isEbpfNoEntry(err) {
 				stats.DeleteErrorCount++

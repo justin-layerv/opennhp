@@ -160,6 +160,9 @@ type UdpAC struct {
 	bpfConntrackExpiredReapedV4Reported atomic.Uint64
 	bpfConntrackExpiredReapedV6Reported atomic.Uint64
 	bpfFragStateExpiredReapedV6Reported atomic.Uint64
+	bpfSppExpiredReapedReported         atomic.Uint64
+	bpfSppReapPartialSamplesReported    atomic.Uint64
+	bpfSppReapErrorsReported            atomic.Uint64
 
 	// ebpfTelemetry*Reported are cumulative eBPF telemetry watermarks already
 	// emitted as reset-per-flush publisher counter events. The raw counters live
@@ -409,6 +412,9 @@ func (a *UdpAC) BpfConntrackStats() (BpfConntrackStats, bool) {
 	a.recordBpfConntrackExpiredReapedV4(stats.V4ExpiredReaped)
 	a.recordBpfConntrackExpiredReapedV6(stats.V6ExpiredReaped)
 	a.recordBpfFragStateExpiredReapedV6(stats.V6FragExpiredReaped)
+	a.recordBpfSppExpiredReaped(stats.SppExpiredReaped)
+	a.recordBpfSppReapPartialSamples(stats.SppReapPartialSamples)
+	a.recordBpfSppReapErrors(stats.SppReapErrors)
 	return stats, true
 }
 
@@ -430,6 +436,18 @@ func (a *UdpAC) recordBpfConntrackExpiredReapedV6(expiredReaped uint64) {
 
 func (a *UdpAC) recordBpfFragStateExpiredReapedV6(expiredReaped uint64) {
 	a.recordCumulativeMetricDelta(&a.bpfFragStateExpiredReapedV6Reported, expiredReaped, MetricEbpfFragStateV6ExpiredReaped)
+}
+
+func (a *UdpAC) recordBpfSppExpiredReaped(expiredReaped uint64) {
+	a.recordCumulativeMetricDelta(&a.bpfSppExpiredReapedReported, expiredReaped, MetricEbpfSppExpiredReaped)
+}
+
+func (a *UdpAC) recordBpfSppReapPartialSamples(partialSamples uint64) {
+	a.recordCumulativeMetricDelta(&a.bpfSppReapPartialSamplesReported, partialSamples, MetricEbpfSppReapPartialSamples)
+}
+
+func (a *UdpAC) recordBpfSppReapErrors(reapErrors uint64) {
+	a.recordCumulativeMetricDelta(&a.bpfSppReapErrorsReported, reapErrors, MetricEbpfSppReapErrors)
 }
 
 func (a *UdpAC) recordEbpfTelemetryMetricDeltas() {
