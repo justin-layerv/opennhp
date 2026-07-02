@@ -11,6 +11,7 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/OpenNHP/opennhp/nhp/utils/ebpf"
 )
 
 // testPrivateKey returns a valid 32-byte private key for testing.
@@ -1212,4 +1213,100 @@ func TestCloudModeSkipsFailOpen(t *testing.T) {
 			t.Log("Fix: empty array is now detected and fail-open logic is skipped")
 		}
 	})
+}
+
+// TestEbpfInfraExemptRules fences the FilterMode_EBPFXDP startup exemption set:
+// one sdwhitelist rule per server peer PLUS exactly one address-agnostic
+// protocol_port rule for the health-check port. The health-port rule is the
+// one whose absence fail-closed drops the NLB probe on Traefik's /ping, flaps
+// every AC target unhealthy, and black-holes the fleet — regressing it must
+// turn this test red.
+func TestEbpfInfraExemptRules(t *testing.T) {
+	cfg := &Config{
+		DefaultIp:       "10.100.0.57",
+		HealthCheckPort: 8080,
+		Servers: []*core.UdpPeer{
+			{Ip: "10.100.10.73"},
+			{Ip: "10.100.11.85"},
+		},
+	}
+
+	rules := ebpfInfraExemptRules(cfg)
+
+	if got, want := len(rules), len(cfg.Servers)+1; got != want {
+		t.Fatalf("rule count = %d, want %d (one per server peer + one health-check rule)", got, want)
+	}
+
+	// Server-peer rules come first, in cfg.Servers order: sdwhitelist
+	// (mapType 2), SrcIP=peer, DstIP=DefaultIp, long-lived TTL.
+	for i, server := range cfg.Servers {
+		r := rules[i]
+		if r.mapType != ebpf.MapTypeSdWhitelist {
+			t.Errorf("server rule %d: mapType = %d, want %d (sdwhitelist)", i, r.mapType, ebpf.MapTypeSdWhitelist)
+		}
+		if r.params.SrcIP != server.Ip || r.params.DstIP != cfg.DefaultIp {
+			t.Errorf("server rule %d: addr = %s->%s, want %s->%s", i, r.params.SrcIP, r.params.DstIP, server.Ip, cfg.DefaultIp)
+		}
+		if r.ttlSec != infraExemptTTLSec {
+			t.Errorf("server rule %d: ttl = %d, want %d", i, r.ttlSec, infraExemptTTLSec)
+		}
+	}
+
+	// Health-check rule is last: address-agnostic protocol_port (mapType 6)
+	// admitting tcp/HealthCheckPort. Address-agnostic on purpose — the probe
+	// arrives from the NLB's ephemeral cross-AZ subnet IPs.
+	hc := rules[len(rules)-1]
+	if hc.mapType != ebpf.MapTypeProtocolPort {
+		t.Errorf("health rule: mapType = %d, want %d (protocol_port)", hc.mapType, ebpf.MapTypeProtocolPort)
+	}
+	if hc.params.Protocol != "tcp" || hc.params.DstPort != cfg.HealthCheckPort {
+		t.Errorf("health rule: %s/%d, want tcp/%d", hc.params.Protocol, hc.params.DstPort, cfg.HealthCheckPort)
+	}
+	if hc.params.SrcIP != "" || hc.params.DstIP != "" {
+		t.Errorf("health rule must carry no address (protocol_port is address-agnostic), got src=%q dst=%q", hc.params.SrcIP, hc.params.DstIP)
+	}
+	if hc.ttlSec != infraExemptTTLSec {
+		t.Errorf("health rule: ttl = %d, want %d", hc.ttlSec, infraExemptTTLSec)
+	}
+}
+
+// TestEbpfInfraExemptRules_HealthPortAdmittedWithoutServers proves the
+// health-check exemption does not depend on any server peer being configured
+// and honors a non-default HealthCheckPort.
+func TestEbpfInfraExemptRules_HealthPortAdmittedWithoutServers(t *testing.T) {
+	cfg := &Config{DefaultIp: "10.0.0.1", HealthCheckPort: 9090}
+
+	rules := ebpfInfraExemptRules(cfg)
+
+	if len(rules) != 1 {
+		t.Fatalf("rule count = %d, want 1 (health-check rule only)", len(rules))
+	}
+	hc := rules[0]
+	if hc.mapType != ebpf.MapTypeProtocolPort || hc.params.Protocol != "tcp" || hc.params.DstPort != 9090 {
+		t.Errorf("health rule = map %d %s/%d, want map %d tcp/9090",
+			hc.mapType, hc.params.Protocol, hc.params.DstPort, ebpf.MapTypeProtocolPort)
+	}
+}
+
+// TestEbpfInfraExemptRules_NonPositivePortOmitsHealthRule proves the helper is
+// correct independent of the config-normalization contract: a caller on an
+// un-normalized Config (HealthCheckPort ≤ 0) must not seed a useless tcp/0
+// admission — only the server-peer rules are returned.
+func TestEbpfInfraExemptRules_NonPositivePortOmitsHealthRule(t *testing.T) {
+	for _, port := range []int{0, -1} {
+		cfg := &Config{
+			DefaultIp:       "10.0.0.1",
+			Servers:         []*core.UdpPeer{{Ip: "10.0.0.2"}},
+			HealthCheckPort: port,
+		}
+		rules := ebpfInfraExemptRules(cfg)
+		if len(rules) != len(cfg.Servers) {
+			t.Errorf("HealthCheckPort=%d: got %d rules, want %d (server rules only)", port, len(rules), len(cfg.Servers))
+		}
+		for _, r := range rules {
+			if r.mapType == ebpf.MapTypeProtocolPort {
+				t.Errorf("HealthCheckPort=%d: helper must not seed a protocol_port (tcp/%d) rule", port, r.params.DstPort)
+			}
+		}
+	}
 }

@@ -547,6 +547,67 @@ func (c *UdpConn) Close() {
 	}
 }
 
+// infraExemptTTLSec is the TTL for long-lived, non-session XDP allow-rules
+// (server peers + the health-check port). One year — effectively permanent for
+// the instance lifetime; these are re-seeded on every boot and are
+// INTENTIONALLY not wired into the L3 flush scheduler (whose scope is
+// per-session NHP-AOP entries only).
+const infraExemptTTLSec = 31536000
+
+// ebpfInfraRule is one long-lived XDP whitelist allow-rule the AC installs at
+// startup in FilterMode_EBPFXDP, independent of any knock.
+type ebpfInfraRule struct {
+	mapType int
+	params  ebpf.EbpfRuleParams
+	ttlSec  int
+}
+
+// ebpfInfraExemptRules returns the infrastructure allow-rules that must be
+// admitted through the XDP whitelist at startup in FilterMode_EBPFXDP. The
+// datapath (nhp/ebpf/xdp/nhp_ebpf_xdp.c) fails closed on every port that isn't
+// per-knock authorized or hardcoded-exempt (only :22/DHCP/DNS), so anything
+// the AC needs reachable without a knock has to be seeded here:
+//
+//   - The AC's own server peers (sdwhitelist, address pair) — so registration
+//     and keepalive replies from the assigned servers are admitted.
+//   - The load-balancer health-check port (protocol_port, {dst_port, tcp}) —
+//     so the NLB's HTTP probe on Traefik's /ping reaches the local listener.
+//     protocol_port is address-agnostic: the probe arrives from the NLB's
+//     ephemeral cross-AZ subnet IPs, so a source-keyed rule can't express it.
+//     Network scoping to the VPC CIDR therefore rests SOLELY on the security
+//     group in this mode — unlike FilterMode_IPTABLES, which also double-scopes
+//     the port with an explicit VPC-CIDR iptables ACCEPT, so a future SG
+//     loosening has a wider blast radius under EBPFXDP. Accepted trade-off (the
+//     map has no source-address key by design). Without this rule the probe is
+//     XDP_DROP'd before iptables, every AC target flaps unhealthy, and the NLB
+//     pulls the whole fleet — black-holing all resource traffic even though the
+//     datapath and Traefik are healthy.
+//
+// Pure and kernel-free so the exemption policy is unit-testable; the caller
+// (Start) performs the actual map writes via ebpfRuleAddFailClosed.
+func ebpfInfraExemptRules(cfg *Config) []ebpfInfraRule {
+	rules := make([]ebpfInfraRule, 0, len(cfg.Servers)+1)
+	for _, server := range cfg.Servers {
+		rules = append(rules, ebpfInfraRule{
+			mapType: ebpf.MapTypeSdWhitelist,
+			params:  ebpf.EbpfRuleParams{SrcIP: server.Ip, DstIP: cfg.DefaultIp},
+			ttlSec:  infraExemptTTLSec,
+		})
+	}
+	// Guard on > 0 so the helper is correct independent of the config
+	// normalization contract: updateBaseConfig defaults ≤0 to
+	// DefaultHealthCheckPort before Start runs, but a caller on an
+	// un-normalized Config must not seed a useless tcp/0 admission.
+	if cfg.HealthCheckPort > 0 {
+		rules = append(rules, ebpfInfraRule{
+			mapType: ebpf.MapTypeProtocolPort,
+			params:  ebpf.EbpfRuleParams{Protocol: "tcp", DstPort: cfg.HealthCheckPort},
+			ttlSec:  infraExemptTTLSec,
+		})
+	}
+	return rules
+}
+
 /*
 dirPath: the path of app or shared library entry point
 logLevel: 0: silent, 1: error, 2: info, 3: debug, 4: verbose
@@ -638,24 +699,18 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	}
 
 	if a.config.FilterMode == FilterMode_EBPFXDP {
-		// Long-lived infrastructure routes (1-year TTL) for the AC's
-		// own server peers. INTENTIONALLY not wired into the L3 flush
-		// scheduler — these aren't session-tied; the scheduler's scope
-		// is per-session NHP-AOP entries only. An operator who removes
-		// a server from config + restarts AC will leave the stale
-		// kernel rule until natural 1-year TTL expiry; the iptables
-		// path makes the same trade-off by skipping tempset in boot
-		// enumeration
-		for _, server := range a.config.Servers {
-			ebpfHashStr := ebpf.EbpfRuleParams{
-				SrcIP: server.Ip,
-				DstIP: a.config.DefaultIp,
-			}
-			log.Info("server ip is %s", server.Ip)
-			err = a.ebpfRuleAddFailClosed(2, ebpfHashStr, 31536000)
-			if err != nil {
-				log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
-				continue
+		// Seed the long-lived (non-session) XDP allow-rules: the AC's own
+		// server peers AND the LB health-check port. See ebpfInfraExemptRules
+		// for why each is required and why the health port in particular must
+		// be admitted here (an omitted probe rule flaps every target unhealthy
+		// and black-holes the fleet). An operator who removes a server from
+		// config + restarts AC leaves the stale kernel rule until natural TTL
+		// expiry; the iptables path makes the same trade-off by skipping
+		// tempset in boot enumeration.
+		for _, r := range ebpfInfraExemptRules(a.config) {
+			if addErr := a.ebpfRuleAddFailClosed(r.mapType, r.params, r.ttlSec); addErr != nil {
+				log.Error("[EbpfRuleAdd] infra exempt rule (map=%s src=%s dst=%s port=%d proto=%s) error: %v",
+					ebpf.MapTypeName(r.mapType), r.params.SrcIP, r.params.DstIP, r.params.DstPort, r.params.Protocol, addErr)
 			}
 		}
 	}

@@ -38,6 +38,19 @@ locals {
   # True when an SNS alert destination is actually wired. trimspace guards
   # against a whitespace-only ARN; try() handles the null default.
   sns_destination_present = try(trimspace(var.alerts_sns_topic_arn) != "", false)
+
+  # The load-balancer health-check port — Traefik's `/ping` entrypoint. SINGLE
+  # SOURCE OF TRUTH shared by (1) the ac_tcp / ac_tcp_green target-group
+  # health_check blocks and (2) the AC's config.toml `HealthCheckPort`. In
+  # FilterMode_EBPFXDP the AC admits this exact port through the XDP whitelist
+  # at startup (endpoints/ac/udpac.go::ebpfInfraExemptRules); if the probed
+  # port and the admitted port ever diverge, the XDP datapath fail-closed drops
+  # the NLB probe, every AC target flaps unhealthy, and the NLB black-holes the
+  # fleet. Keeping both TG colors and the datapath on this one local is what
+  # makes that divergence structurally impossible. The
+  # `ac_user_data_health_check_port_render_check` resource below asserts the
+  # config.toml render, mirroring the FilterMode render guard.
+  ac_health_check_port = 8080
 }
 
 resource "terraform_data" "sns_alerts_contract" {
@@ -491,10 +504,16 @@ resource "aws_vpc_security_group_ingress_rule" "ac_ssh" {
 resource "aws_vpc_security_group_ingress_rule" "ac_traefik_health" {
   security_group_id = aws_security_group.ac.id
   description       = "Traefik health check from VPC (NLB)"
-  from_port         = 8080
-  to_port           = 8080
-  ip_protocol       = "tcp"
-  cidr_ipv4         = var.vpc_cidr
+  # Sourced from the same local as the TG health_check blocks, the AC's
+  # config.toml HealthCheckPort, and the EBPFXDP datapath exemption. This ENI
+  # gate sits upstream of XDP in BOTH filter modes, so wiring it here completes
+  # the single-source-of-truth end-to-end — otherwise a future port change
+  # would move every other layer but leave the SG dropping the probe one hop
+  # earlier (the same failure class this fix closes).
+  from_port   = local.ac_health_check_port
+  to_port     = local.ac_health_check_port
+  ip_protocol = "tcp"
+  cidr_ipv4   = var.vpc_cidr
 
   tags = {
     Name = "${var.name_prefix}-ac-traefik-health"
@@ -960,12 +979,13 @@ locals {
     name_prefix         = var.name_prefix
     secrets_kms_key_arn = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
     # AC configuration options
-    log_level         = var.log_level
-    ac_filter_mode    = var.ac_filter_mode
-    ac_id             = var.ac_id
-    auth_service_id   = var.auth_service_id
-    resource_ids      = jsonencode(var.resource_ids)
-    server_secret_arn = var.server_secret_arn
+    log_level            = var.log_level
+    ac_filter_mode       = var.ac_filter_mode
+    ac_health_check_port = local.ac_health_check_port
+    ac_id                = var.ac_id
+    auth_service_id      = var.auth_service_id
+    resource_ids         = jsonencode(var.resource_ids)
+    server_secret_arn    = var.server_secret_arn
     # Cloud mode registration (license key is globally unique)
     license_key     = var.license_key
     server_endpoint = var.server_endpoint
@@ -1061,6 +1081,22 @@ resource "terraform_data" "ac_user_data_filter_mode_render_check" {
     precondition {
       condition     = strcontains(local.user_data, "\nFilterMode = ${var.ac_filter_mode}\n")
       error_message = "AC user_data must render config.toml with unquoted numeric `FilterMode = var.ac_filter_mode` so the eBPF rollout smoke can verify the active datapath."
+    }
+  }
+}
+
+# The AC datapath admits exactly this port through the XDP whitelist in
+# FilterMode_EBPFXDP (endpoints/ac/udpac.go::ebpfInfraExemptRules). It MUST be
+# the same port the target groups health-check, and both come from
+# local.ac_health_check_port — this render check asserts config.toml carries it
+# as unquoted numeric TOML so a datapath/health-check divergence can't ship.
+resource "terraform_data" "ac_user_data_health_check_port_render_check" {
+  input = sha256(local.user_data)
+
+  lifecycle {
+    precondition {
+      condition     = strcontains(local.user_data, "\nHealthCheckPort = ${local.ac_health_check_port}\n")
+      error_message = "AC user_data must render config.toml with unquoted numeric `HealthCheckPort = local.ac_health_check_port` so FilterMode_EBPFXDP admits the load-balancer probe on the same port the target groups health-check."
     }
   }
 }
@@ -1512,7 +1548,7 @@ resource "aws_lb_target_group" "ac_tcp" {
   health_check {
     enabled             = true
     protocol            = "HTTP"
-    port                = "8080"
+    port                = tostring(local.ac_health_check_port)
     path                = "/ping"
     matcher             = "200"
     interval            = 30
@@ -1690,7 +1726,7 @@ resource "aws_lb_target_group" "ac_frps_control" {
   health_check {
     enabled             = true
     protocol            = "HTTP"
-    port                = "8080"
+    port                = tostring(local.ac_health_check_port)
     path                = "/ping"
     matcher             = "200"
     interval            = 30
@@ -1777,7 +1813,7 @@ resource "aws_lb_target_group" "ac_frps_control_additional" {
   health_check {
     enabled             = true
     protocol            = "HTTP"
-    port                = "8080"
+    port                = tostring(local.ac_health_check_port)
     path                = "/ping"
     matcher             = "200"
     interval            = 30

@@ -192,11 +192,14 @@ resource "aws_lb_target_group" "ac_tcp_green" {
   target_type       = "instance"
   proxy_protocol_v2 = true
 
-  # HTTP health check on Traefik's ping endpoint (port 8080)
+  # HTTP health check on Traefik's ping endpoint (port 8080). Port is sourced
+  # from local.ac_health_check_port (main.tf) so this green TG, the blue ac_tcp
+  # TG, and the AC's config.toml HealthCheckPort can never diverge — the
+  # divergence that fail-closed drops the probe under FilterMode_EBPFXDP.
   health_check {
     enabled             = true
     protocol            = "HTTP"
-    port                = "8080"
+    port                = tostring(local.ac_health_check_port)
     path                = "/ping"
     matcher             = "200"
     interval            = 30

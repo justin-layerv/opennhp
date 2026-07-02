@@ -1015,6 +1015,11 @@ LogLevel = ${log_level}
 AuthServiceId = "${auth_service_id}"
 ResourceIds = ${resource_ids}
 FilterMode = ${ac_filter_mode}
+# LB health-check port (Traefik /ping). In FilterMode_EBPFXDP the AC admits this
+# TCP port through the XDP whitelist at startup so the NLB probe isn't
+# fail-closed dropped; MUST equal the target-group health_check port (both are
+# sourced from local.ac_health_check_port in terraform/modules/ac).
+HealthCheckPort = ${ac_health_check_port}
 
 # L3 flush-on-expiry. Toml keys match the Go struct field names
 # (endpoints/ac/config.go) — not the json tags, which the toml unmarshaler

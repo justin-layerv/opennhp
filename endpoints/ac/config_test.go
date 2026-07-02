@@ -206,6 +206,58 @@ FilterMode = 0
 	}
 }
 
+// TestLoadBaseConfig_HealthCheckPort verifies the health-check port normalizes
+// to DefaultHealthCheckPort when config.toml omits it (so an in-place AC
+// upgrade self-heals health checks even before user_data re-renders the field)
+// and preserves an explicit value otherwise.
+func TestLoadBaseConfig_HealthCheckPort(t *testing.T) {
+	const base = `
+ACId = "test-ac"
+DefaultIp = "10.0.0.1"
+PrivateKeyBase64 = "dGVzdHByaXZhdGVrZXkxMjM0NTY3ODkwYWJjZGVm"
+LogLevel = 4
+AuthServiceId = "agent"
+ResourceIds = ["demo"]
+FilterMode = 1
+`
+	load := func(t *testing.T, content string) *Config {
+		t.Helper()
+		dir := setupTestDir(t)
+		if err := os.WriteFile(filepath.Join(dir, "etc", "config.toml"), []byte(content), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		oldExeDirPath := ExeDirPath
+		ExeDirPath = dir
+		defer func() { ExeDirPath = oldExeDirPath }()
+		ac := setupTestAC(t, dir)
+		if err := ac.loadBaseConfig(); err != nil {
+			t.Fatalf("loadBaseConfig: %v", err)
+		}
+		return ac.config
+	}
+
+	t.Run("unset defaults", func(t *testing.T) {
+		if got := load(t, base).HealthCheckPort; got != DefaultHealthCheckPort {
+			t.Errorf("HealthCheckPort = %d, want default %d", got, DefaultHealthCheckPort)
+		}
+	})
+
+	t.Run("explicit value preserved", func(t *testing.T) {
+		// config.toml keys are the Go struct field names, not json tags.
+		if got := load(t, base+"HealthCheckPort = 9091\n").HealthCheckPort; got != 9091 {
+			t.Errorf("HealthCheckPort = %d, want 9091", got)
+		}
+	})
+
+	t.Run("out of range falls back to default", func(t *testing.T) {
+		// >65535 would truncate to a wrong port at uint16 narrowing; the
+		// normalizer must reject it rather than silently seed a bad rule.
+		if got := load(t, base+"HealthCheckPort = 70000\n").HealthCheckPort; got != DefaultHealthCheckPort {
+			t.Errorf("HealthCheckPort = %d, want default %d (out-of-range fallback)", got, DefaultHealthCheckPort)
+		}
+	})
+}
+
 func TestLoadHttpConfig_MissingFile_OK(t *testing.T) {
 	dir := setupTestDir(t)
 

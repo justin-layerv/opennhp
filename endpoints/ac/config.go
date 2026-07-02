@@ -47,6 +47,23 @@ const (
 	// registration.go.
 	DefaultL3FlushErrorThreshold = 10
 	DefaultL3FlushErrorWindowSec = 60
+
+	// DefaultHealthCheckPort is the TCP port the load balancer HTTP-probes
+	// for target health (Traefik's `/ping` entrypoint). In FilterMode_EBPFXDP
+	// the AC admits this port through the XDP whitelist at startup so the
+	// probe isn't fail-closed dropped before it reaches the local listener;
+	// see the ebpfInfraExemptRules install in (*UdpAC).Start.
+	//
+	// This default only self-heals a config.toml that predates the
+	// HealthCheckPort field, so an in-place AC upgrade fixes health checks
+	// without waiting on a user_data re-render. It MUST track
+	// local.ac_health_check_port in terraform/modules/ac (which renders
+	// config.toml and sources every target-group health_check block plus the
+	// SG ingress rule). The terraform render check asserts config.toml carries
+	// the terraform value, but nothing cross-checks this Go constant against
+	// it — and the self-heal window is exactly when an old instance would fall
+	// back to this constant while the TGs probe the new port. Change both.
+	DefaultHealthCheckPort = 8080
 )
 
 type Config struct {
@@ -60,6 +77,17 @@ type Config struct {
 	LogLevel            int             `json:"logLevel"`
 	DefaultCipherScheme int             `json:"defaultCipherScheme"`
 	FilterMode          int             `json:"filterMode"`
+
+	// HealthCheckPort is the TCP port the load balancer HTTP-probes for
+	// target health (Traefik's `/ping`). FilterMode_EBPFXDP fails closed on
+	// every port that isn't per-knock authorized or hardcoded-exempt, so the
+	// AC must explicitly admit this port through the XDP whitelist at startup
+	// or every target flaps unhealthy and the NLB black-holes all resource
+	// traffic. Rendered from config.toml; normalized to DefaultHealthCheckPort
+	// when unset (≤0) or out of range (>65535). Ignored in FilterMode_IPTABLES,
+	// where user_data opens the same port with an explicit iptables ACCEPT from
+	// the VPC CIDR.
+	HealthCheckPort int `json:"healthCheckPort"`
 
 	// L3 flush-on-expiry: actively flushes kernel flow state on
 	// ipset/BPF entry expiry so existing TCP connections terminate
@@ -360,6 +388,20 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 		// Normalize the netlink pool size: ≤0 → default 16, and clamp a
 		// too-large value (typo) so it can't exhaust file descriptors.
 		conf.L3FlushConntrackPoolSize = normalizeConntrackPoolSize(conf.L3FlushConntrackPoolSize)
+		// Normalize the LB health-check port. Consumed once at Start to seed
+		// the FilterMode_EBPFXDP whitelist exemption (like FilterMode itself,
+		// a start-time-only setting — a live reload does not re-install the
+		// rule), so it only needs defaulting on the first-load path. ≤0 →
+		// DefaultHealthCheckPort so a config.toml that predates the field
+		// still admits the probe instead of fail-closed dropping it.
+		conf.HealthCheckPort = intOrDefault(conf.HealthCheckPort, DefaultHealthCheckPort)
+		// EbpfRuleAdd narrows DstPort to uint16, so a >65535 typo would
+		// silently truncate and seed a rule for the wrong port — re-introducing
+		// this outage in a hard-to-spot way. Surface it at boot and fall back.
+		if conf.HealthCheckPort > 65535 {
+			log.Warning("HealthCheckPort=%d out of range (1-65535); falling back to %d", conf.HealthCheckPort, DefaultHealthCheckPort)
+			conf.HealthCheckPort = DefaultHealthCheckPort
+		}
 		a.serverPeerMutex.Lock()
 		a.config = &conf
 		a.serverPubKeyAllowlist = set
