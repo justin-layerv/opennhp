@@ -782,9 +782,12 @@ static __always_inline void reverseTuple_v6(struct ipv6_ct_tuple *key) {
 #define __constant_htons(x) ((__u16)((((x) & 0xFF00) >> 8) | (((x) & 0x00FF) << 8)))
 #endif
 
-static __always_inline bool check_conn_expiry(struct conn_value *val) {
-    __u64 now = bpf_ktime_get_ns();
+static __always_inline bool check_conn_expiry_at(struct conn_value *val, __u64 now) {
     return (now > val->timestamp + val->ttl_ns);
+}
+
+static __always_inline bool check_conn_expiry(struct conn_value *val) {
+    return check_conn_expiry_at(val, bpf_ktime_get_ns());
 }
 
 // ----------------------------------------------------------------------------
@@ -977,8 +980,8 @@ static __always_inline __u64 conn_value_expire_time(struct conn_value *val) {
     return expires_at;
 }
 
-static __always_inline __u64 ipv6_fragment_expire_time(__u64 admission_expire_time) {
-    __u64 now = bpf_ktime_get_ns();
+static __always_inline __u64 ipv6_fragment_expire_time(__u64 admission_expire_time,
+                                                       __u64 now) {
     __u64 reassembly_expire_time = now + IPV6_FRAG_STATE_TTL_NS;
     if (reassembly_expire_time < now)
         reassembly_expire_time = ~0ULL;
@@ -992,7 +995,8 @@ static __always_inline int populate_ipv6_fragment_state(struct ipv6_frag_info *f
                                                         __u8 l4_proto,
                                                         __be16 sport,
                                                         __be16 dport,
-                                                        __u64 admission_expire_time) {
+                                                        __u64 admission_expire_time,
+                                                        __u64 now) {
     if (!frag->needs_state)
         return 0;
 
@@ -1003,7 +1007,7 @@ static __always_inline int populate_ipv6_fragment_state(struct ipv6_frag_info *f
         .frag_nexthdr = frag->frag_nexthdr,
     };
     struct ipv6_frag_value fval = {
-        .expire_time = ipv6_fragment_expire_time(admission_expire_time),
+        .expire_time = ipv6_fragment_expire_time(admission_expire_time, now),
         .dport = dport,
         .sport = sport,
         .l4_proto = l4_proto,
@@ -1020,7 +1024,8 @@ static __always_inline int populate_ipv6_admission_state(struct ipv6_ct_tuple *c
                                                          __u8 l4_proto,
                                                          __be16 sport,
                                                          __be16 dport,
-                                                         __u64 expire_time) {
+                                                         __u64 expire_time,
+                                                         __u64 now) {
     if (!frag->needs_state) {
         bpf_map_update_elem(&conn_track_v6, ct_key, new_val, BPF_ANY);
         return 0;
@@ -1036,7 +1041,7 @@ static __always_inline int populate_ipv6_admission_state(struct ipv6_ct_tuple *c
     // If frag_state_v6 is full, keep conn_track_v6 and fail this fragmented
     // datagram closed. Rolling back could delete a pre-existing conntrack
     // entry for the same 5-tuple; non-fragmented packets may still pass.
-    if (populate_ipv6_fragment_state(frag, ip6h, l4_proto, sport, dport, expire_time) != 0)
+    if (populate_ipv6_fragment_state(frag, ip6h, l4_proto, sport, dport, expire_time, now) != 0)
         return -1;
     return 0;
 }
@@ -1050,6 +1055,34 @@ static __always_inline int ipv6_admission_state_failure_verdict(struct xdp_md *c
     if (should_emit_deny_event())
         submit_event_v6(ctx, 0, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
     return XDP_DROP;
+}
+
+static __always_inline int admit_ipv6_and_pass(struct xdp_md *ctx,
+                                               struct ipv6_ct_tuple *ct_key,
+                                               struct ipv6_frag_info *frag,
+                                               struct ipv6hdr *ip6h,
+                                               __u8 nexthdr,
+                                               __be16 sport,
+                                               __be16 dport,
+                                               __be16 total_len,
+                                               __u64 expire_time,
+                                               __u64 now) {
+    struct conn_value new_val = {
+        .timestamp = now,
+        .last_timestamp = now,
+        .ttl_ns = expire_time - now,
+        .state = CT_ESTABLISHED,
+        .flags = CT_FLAG_NONE,
+        .rx_packets = 1,
+        .tx_packets = 0,
+    };
+    if (populate_ipv6_admission_state(ct_key, &new_val, frag, ip6h,
+                                      nexthdr, sport, dport, expire_time,
+                                      now) != 0)
+        return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport,
+                                                    nexthdr, total_len);
+    submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
+    return XDP_PASS;
 }
 
 static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
@@ -1234,23 +1267,23 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
     // refresh them before fail-closed frag_state_v6 insertion can reject this packet.
     struct conn_value *existing_val = bpf_map_lookup_elem(&conn_track_v6, &ct_key);
     if (existing_val) {
-        if (check_conn_expiry(existing_val)) {
+        if (check_conn_expiry_at(existing_val, now)) {
             bpf_map_delete_elem(&conn_track_v6, &ct_key);
             return XDP_DROP;
         }
         __u64 existing_expire_time = conn_value_expire_time(existing_val);
         struct conn_value new_val = *existing_val;
         new_val.tx_packets++;
-        new_val.last_timestamp = bpf_ktime_get_ns();
+        new_val.last_timestamp = now;
         bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_EXIST);
-        if (populate_ipv6_fragment_state(&frag, ip6h, nexthdr, sport, dport, existing_expire_time) != 0)
+        if (populate_ipv6_fragment_state(&frag, ip6h, nexthdr, sport, dport, existing_expire_time, now) != 0)
             return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
         return XDP_PASS;
     }
     reverseTuple_v6(&ct_key);
     existing_val = bpf_map_lookup_elem(&conn_track_v6, &ct_key);
     if (existing_val) {
-        if (check_conn_expiry(existing_val)) {
+        if (check_conn_expiry_at(existing_val, now)) {
             bpf_map_delete_elem(&conn_track_v6, &ct_key);
             reverseTuple_v6(&ct_key);
             return XDP_DROP;
@@ -1258,10 +1291,10 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
         __u64 existing_expire_time = conn_value_expire_time(existing_val);
         struct conn_value new_val = *existing_val;
         new_val.rx_packets++;
-        new_val.last_timestamp = bpf_ktime_get_ns();
+        new_val.last_timestamp = now;
         bpf_map_update_elem(&conn_track_v6, &ct_key, &new_val, BPF_EXIST);
         reverseTuple_v6(&ct_key);
-        if (populate_ipv6_fragment_state(&frag, ip6h, nexthdr, sport, dport, existing_expire_time) != 0)
+        if (populate_ipv6_fragment_state(&frag, ip6h, nexthdr, sport, dport, existing_expire_time, now) != 0)
             return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
         return XDP_PASS;
     }
@@ -1288,19 +1321,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (w_val->allowed == 1) {
-                struct conn_value new_val = {
-                    .timestamp = bpf_ktime_get_ns(),
-                    .last_timestamp = bpf_ktime_get_ns(),
-                    .ttl_ns = w_val->expire_time - now,
-                    .state = CT_ESTABLISHED,
-                    .flags = CT_FLAG_NONE,
-                    .rx_packets = 1,
-                    .tx_packets = 0,
-                };
-                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, w_val->expire_time) != 0)
-                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
-                return XDP_PASS;
+                return admit_ipv6_and_pass(ctx, &ct_key, &frag, ip6h,
+                                           nexthdr, sport, dport, total_len,
+                                           w_val->expire_time, now);
             }
         }
     }
@@ -1318,19 +1341,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (sd_val->allowed == 1) {
-                struct conn_value new_val = {
-                    .timestamp = bpf_ktime_get_ns(),
-                    .last_timestamp = bpf_ktime_get_ns(),
-                    .ttl_ns = sd_val->expire_time - now,
-                    .state = CT_ESTABLISHED,
-                    .flags = CT_FLAG_NONE,
-                    .rx_packets = 1,
-                    .tx_packets = 0,
-                };
-                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, sd_val->expire_time) != 0)
-                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
-                return XDP_PASS;
+                return admit_ipv6_and_pass(ctx, &ct_key, &frag, ip6h,
+                                           nexthdr, sport, dport, total_len,
+                                           sd_val->expire_time, now);
             }
         }
     }
@@ -1348,19 +1361,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (sp_val->allowed == 1) {
-                struct conn_value new_val = {
-                    .timestamp = bpf_ktime_get_ns(),
-                    .last_timestamp = bpf_ktime_get_ns(),
-                    .ttl_ns = sp_val->expire_time - now,
-                    .state = CT_ESTABLISHED,
-                    .flags = CT_FLAG_NONE,
-                    .rx_packets = 1,
-                    .tx_packets = 0,
-                };
-                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, sp_val->expire_time) != 0)
-                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
-                return XDP_PASS;
+                return admit_ipv6_and_pass(ctx, &ct_key, &frag, ip6h,
+                                           nexthdr, sport, dport, total_len,
+                                           sp_val->expire_time, now);
             }
         }
     }
@@ -1379,19 +1382,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (pl_val->allowed == 1) {
-                struct conn_value new_val = {
-                    .timestamp = bpf_ktime_get_ns(),
-                    .last_timestamp = bpf_ktime_get_ns(),
-                    .ttl_ns = pl_val->expire_time - now,
-                    .state = CT_ESTABLISHED,
-                    .flags = CT_FLAG_NONE,
-                    .rx_packets = 1,
-                    .tx_packets = 0,
-                };
-                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, pl_val->expire_time) != 0)
-                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
-                return XDP_PASS;
+                return admit_ipv6_and_pass(ctx, &ct_key, &frag, ip6h,
+                                           nexthdr, sport, dport, total_len,
+                                           pl_val->expire_time, now);
             }
         }
     }
@@ -1411,19 +1404,9 @@ static __always_inline int xdp_white_prog_v6(struct xdp_md *ctx,
                 return XDP_DROP;
             }
             if (pp_val->allowed == 1) {
-                struct conn_value new_val = {
-                    .timestamp = bpf_ktime_get_ns(),
-                    .last_timestamp = bpf_ktime_get_ns(),
-                    .ttl_ns = pp_val->expire_time - now,
-                    .state = CT_ESTABLISHED,
-                    .flags = CT_FLAG_NONE,
-                    .rx_packets = 1,
-                    .tx_packets = 0,
-                };
-                if (populate_ipv6_admission_state(&ct_key, &new_val, &frag, ip6h, nexthdr, sport, dport, pp_val->expire_time) != 0)
-                    return ipv6_admission_state_failure_verdict(ctx, ip6h, sport, dport, nexthdr, total_len);
-                submit_event_v6(ctx, 1, ip6h->saddr, ip6h->daddr, sport, dport, nexthdr, total_len);
-                return XDP_PASS;
+                return admit_ipv6_and_pass(ctx, &ct_key, &frag, ip6h,
+                                           nexthdr, sport, dport, total_len,
+                                           pp_val->expire_time, now);
             }
         }
     }
