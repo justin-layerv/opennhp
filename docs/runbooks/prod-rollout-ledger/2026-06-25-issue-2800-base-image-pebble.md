@@ -1,26 +1,20 @@
-# 2026-06-25 · Issue #2800 · Base-image pebble CVEs — rebuild + redeploy prod
+# 2026-06-25 · Issue #2800 · Base-image pebble CVEs — prod server/AC redeploy
 
 - **Owner:** prod rollout coordinator
-- **Source:** https://github.com/layervai/nhp/issues/2800 (and the PR that adds this entry)
+- **Source:** https://github.com/layervai/nhp/issues/2800,
+  https://github.com/layervai/nhp/issues/3002, and the code-side fixes
+  (#2802, #2914, #2944)
 
-The `ubuntu:26.04` base image (pinned by digest in all three Dockerfiles) bakes
-in Canonical's `pebble` service manager at `/usr/bin/pebble` — an unused Go
-binary built with `golang.org/x/net v0.40.0` + Go stdlib `1.26.2` (7 HIGH CVEs).
-trivy flags it and fails `Build {server,ac,relay}` repo-wide. Our own binaries
-(`nhp-serverd` / `nhp-acd` / `nhp-relayd`) were always clean (`x/net v0.55.0`,
-`go 1.26.4`); the original "stale buildx cache" diagnosis was a misattribution
-of the SARIF `x/net v0.40.0` line, which actually pointed at `/usr/bin/pebble`.
-This PR removes pebble in each runtime stage, so a rebuild produces clean images.
+Code-side #2800 fixes are merged; #3002 owns the remaining patched-image prod
+server/AC redeploy, current prod-state checks, and post-rollout evidence.
 
-Prod server/ac/relay images built before this PR merges still contain the
-vulnerable `/usr/bin/pebble`. They must be rebuilt and redeployed.
+Prod relay remains dark (`deploy_relay = false`); do not auto-promote prod from
+this issue-cleanup PR.
 
-- [ ] Rollout: after merge, the main build rebuilds + pushes patched
-      server/ac/relay images. Redeploy prod (instance refresh per the deploy
-      runbook) so the running containers no longer contain `/usr/bin/pebble`.
-- [ ] Post-rollout: confirm a deployed prod image digest no longer carries
-      pebble — `docker run <digest> ls /usr/bin/pebble` returns not-found, or
-      `trivy image <digest>` shows the 7 HIGH CVEs gone.
-- [ ] Note: the 2026-06-25 buildx gha cache purge done during triage was
-      unnecessary for this bug (the caches regenerate; no harm). It is not a
-      required rollout step.
+- [ ] Rollout: choose and execute a safe prod server/AC image redeploy strategy
+      in #3002.
+- [ ] Post-rollout: confirm a deployed prod server/AC image digest no longer
+      carries pebble — `docker run <digest> ls /usr/bin/pebble` returns
+      not-found, or `trivy image <digest>` shows the HIGH CVEs gone.
+- [ ] Closeout: record the verification evidence on #2800 or #3002, delete this
+      ledger entry, then close #2800.
