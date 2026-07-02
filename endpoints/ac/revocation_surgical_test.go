@@ -29,9 +29,10 @@ import (
 // error) while the others succeed — the call is still recorded so the test can
 // prove every sibling was attempted.
 type fakeSurgicalFlusher struct {
-	mu      sync.Mutex
-	flushed []ConnFlowKey
-	errFor  func(ConnFlowKey) error
+	mu         sync.Mutex
+	flushed    []ConnFlowKey
+	batchCalls int
+	errFor     func(ConnFlowKey) error
 }
 
 func (f *fakeSurgicalFlusher) flushConn(_ context.Context, conn ConnFlowKey) error {
@@ -44,12 +45,33 @@ func (f *fakeSurgicalFlusher) flushConn(_ context.Context, conn ConnFlowKey) err
 	return nil
 }
 
+func (f *fakeSurgicalFlusher) flushConnBatch(_ context.Context, key FlowKey, srcPorts []uint16) []error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.batchCalls++
+	errs := make([]error, len(srcPorts))
+	for i, srcPort := range srcPorts {
+		conn := ConnFlowKey{Flow: key, SrcPort: srcPort}
+		f.flushed = append(f.flushed, conn)
+		if f.errFor != nil {
+			errs[i] = f.errFor(conn)
+		}
+	}
+	return errs
+}
+
 func (f *fakeSurgicalFlusher) snapshot() []ConnFlowKey {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]ConnFlowKey, len(f.flushed))
 	copy(out, f.flushed)
 	return out
+}
+
+func (f *fakeSurgicalFlusher) batchCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.batchCalls
 }
 
 // newSurgicalTestAC builds a UdpAC with a started scheduler, a real metrics

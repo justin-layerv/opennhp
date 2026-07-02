@@ -211,18 +211,19 @@ type UdpAC struct {
 	// rig. Only read when surgicalConnFlush != nil.
 	enumerateConnSrcPorts func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
 
-	// surgicalConnFlushV6 / enumerateConnSrcPortsV6 are the IPv6 twins of the
-	// two fields above (E2 slice 5). Bound to BpfFlusher.FlushConnV6 and
-	// utilebpf.EnumerateConnTrackSrcPortsV6 in the same EBPFXDP-on-Linux Start()
-	// block; nil otherwise. When both are non-nil, surgicalFlushFlowKey performs
-	// surgical conntrack teardown for v6 flows (closing the #2778 IPv6
-	// immediate-revocation gap on the eBPF/XDP path) instead of the v6 hard-fail;
-	// when either is nil (iptables mode, non-Linux, L3 disabled) it keeps the
-	// hard-fail fallback. Same func-field indirection rationale as the v4 fields:
-	// keeps revocation_index.go build-tag-free and lets a test inject fakes (the
-	// pinned conn_track_v6 map is absent off a kernel rig).
-	surgicalConnFlushV6     func(context.Context, ConnFlowKey) error
-	enumerateConnSrcPortsV6 func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
+	// surgicalConnFlushBatchV6 / surgicalConnFlushV6 / enumerateConnSrcPortsV6
+	// are the IPv6 twins of the two v4 fields above (E2 slice 5). Start binds the
+	// production EBPFXDP path to BpfFlusher.FlushConnsV6 so one allow-rule revoke
+	// reuses the pinned conn_track_v6 and frag_state_v6 handles across every
+	// enumerated source-port sibling. surgicalConnFlushV6 remains as a narrow
+	// fallback seam for tests and future single-flow injectors. When enumeration
+	// plus at least one v6 flush seam is present, surgicalFlushFlowKey performs v6
+	// conntrack teardown (closing the #2778 IPv6 immediate-revocation gap on the
+	// eBPF/XDP path) instead of the v6 hard-fail; when either side is missing
+	// (iptables mode, non-Linux, L3 disabled) it keeps the hard-fail fallback.
+	surgicalConnFlushBatchV6 func(context.Context, FlowKey, []uint16) []error
+	surgicalConnFlushV6      func(context.Context, ConnFlowKey) error
+	enumerateConnSrcPortsV6  func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
 }
 
 // BpfFlusherSkippedCount returns the BpfFlusher's non-IPv4 skip
@@ -600,8 +601,10 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			a.enumerateConnSrcPorts = ebpf.EnumerateConnTrackSrcPorts
 			// IPv6 twins (E2 slice 5): bind the v6 surgical seam to the same
 			// EBPFXDP-on-Linux BpfFlusher so a v6 revoke gets immediate
-			// conntrack teardown instead of the #2778 hard-fail. FlushConnV6
-			// mirrors FlushConn but targets the conn_track_v6 map.
+			// conntrack teardown instead of the #2778 hard-fail. FlushConnsV6
+			// batches all source-port siblings for one allow-rule revoke,
+			// reusing the pinned conn_track_v6 / frag_state_v6 handles.
+			a.surgicalConnFlushBatchV6 = bf.FlushConnsV6
 			a.surgicalConnFlushV6 = bf.FlushConnV6
 			a.enumerateConnSrcPortsV6 = ebpf.EnumerateConnTrackSrcPortsV6
 		}
@@ -657,6 +660,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 			a.bpfConntrackSamplerStop = nil
 			a.surgicalConnFlush = nil
 			a.enumerateConnSrcPorts = nil
+			a.surgicalConnFlushBatchV6 = nil
 			a.surgicalConnFlushV6 = nil
 			a.enumerateConnSrcPortsV6 = nil
 			// Close the netlink socket pool we opened above (same

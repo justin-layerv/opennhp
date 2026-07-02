@@ -670,15 +670,18 @@ func (a *UdpAC) surgicalFlushFlowKey(ctx context.Context, key FlowKey) {
 //     established-flow short-circuit is port-keyed); there is nothing to tear
 //     down. No hard-fail, wired seam or not.
 //   - TCP/UDP + v6 seam NOT wired (enumerateConnSrcPortsV6 == nil ||
-//     surgicalConnFlushV6 == nil) → MetricRevocationIPv6HardFail and RETURN.
-//     This is the iptables / non-Linux / L3-disabled fallback: there is no
-//     conn_track_v6 to enumerate, and the coarse allow-rule path is v4-only (so
-//     flushEntryNow skipped it for this v6 key), so the flow dies at kernel TTL —
-//     an explicit hard-fail, NOT a silent success. (#2778 eBPF path; #2794 covers
-//     the iptables-mode v6 path separately.)
-//   - TCP/UDP + seam wired → enumerate conn_track_v6 source ports and
-//     FlushConnV6 each 5-tuple, ticking MetricRevocationSurgicalFlushedV6 per
-//     flow (the v6-specific counter, NOT the shared v4 one).
+//     neither surgicalConnFlushBatchV6 nor surgicalConnFlushV6 is available) →
+//     MetricRevocationIPv6HardFail and RETURN. This is the iptables / non-Linux /
+//     L3-disabled fallback: there is no conn_track_v6 to enumerate, and the
+//     coarse allow-rule path is v4-only (so flushEntryNow skipped it for this v6
+//     key), so the flow dies at kernel TTL — an explicit hard-fail, NOT a silent
+//     success. (#2778 eBPF path; #2794 covers the iptables-mode v6 path
+//     separately.)
+//   - TCP/UDP + seam wired → enumerate conn_track_v6 source ports and batch
+//     FlushConnsV6 all sibling 5-tuples when available, falling back to
+//     FlushConnV6 per 5-tuple for injected single-flow seams. Tick
+//     MetricRevocationSurgicalFlushedV6 per flushed flow (the v6-specific
+//     counter, NOT the shared v4 one).
 //
 // Enumeration "map not pinned" (XDP not attached at the v6 pin) is a soft
 // fallback: the v6 datapath is inert, so there is no live v6 flow to tear down —
@@ -706,7 +709,7 @@ func (a *UdpAC) surgicalFlushFlowKeyV6(ctx context.Context, key FlowKey) {
 		// immediate-revocation gap (it never had a conntrack entry to leak).
 		return
 	}
-	if a.enumerateConnSrcPortsV6 == nil || a.surgicalConnFlushV6 == nil {
+	if a.enumerateConnSrcPortsV6 == nil || (a.surgicalConnFlushBatchV6 == nil && a.surgicalConnFlushV6 == nil) {
 		// v6 seam not wired AND this is a TCP/UDP key that DOES have a
 		// conn_track_v6 entry: no surgical path, and the coarse path is v4-only
 		// (so flushEntryNow skipped it for this v6 key), so the flow genuinely
@@ -729,6 +732,30 @@ func (a *UdpAC) surgicalFlushFlowKeyV6(ctx context.Context, key FlowKey) {
 		// gap; surface it on the hard-fail metric (asymmetry vs v4, see godoc).
 		a.incrMetric(MetricRevocationIPv6HardFail)
 		log.Error("[Revocation] conn_track_v6 enumeration failed for %s; v6 flow has no immediate teardown (#2778): %v", key, err)
+		return
+	}
+	if a.surgicalConnFlushBatchV6 != nil {
+		errs := a.surgicalConnFlushBatchV6(ctx, key, sports)
+		if len(errs) != len(sports) {
+			for range sports {
+				a.incrMetric(MetricRevocationIPv6HardFail)
+			}
+			log.Error("[Revocation] surgical FlushConnsV6 returned %d results for %d source ports on %s; treating the batch as a v6 immediate-teardown gap (#2778)", len(errs), len(sports), key)
+			return
+		}
+		for i, sport := range sports {
+			conn := ConnFlowKey{Flow: key, SrcPort: sport}
+			if ferr := errs[i]; ferr != nil {
+				// A batch result error has the same fail-closed meaning as the
+				// per-flow FlushConnV6 error below: conntrack deletion failed, or
+				// conntrack was deleted but matching frag_state_v6 cleanup was not
+				// verifiably completed.
+				a.incrMetric(MetricRevocationIPv6HardFail)
+				log.Error("[Revocation] surgical FlushConnsV6 failed for %s; v6 flow has no immediate teardown (#2778): %v", conn, ferr)
+				continue
+			}
+			a.incrMetric(MetricRevocationSurgicalFlushedV6)
+		}
 		return
 	}
 	for _, sport := range sports {

@@ -214,6 +214,67 @@ func TestFragStateDeleteV6_Surgical_AllTargetFragmentsRemoved(t *testing.T) {
 	}
 }
 
+func TestFragStateDeleteV6_Batch_RemovesOnlyBatchSourcePorts(t *testing.T) {
+	m, ok := newTestFragStateMapV6(t)
+	if !ok {
+		return
+	}
+	defer func() { _ = m.Close() }()
+
+	const (
+		srcStr      = "2001:db8::7"
+		dstStr      = "2001:db8::10"
+		proto       = uint8(6)
+		dport       = uint16(443)
+		targetPortA = uint16(43210)
+		targetPortB = uint16(43211)
+		siblingPrt  = uint16(43212)
+	)
+	src, err := parseIP6(srcStr)
+	if err != nil {
+		t.Fatalf("parseIP6(src): %v", err)
+	}
+	dst, err := parseIP6(dstStr)
+	if err != nil {
+		t.Fatalf("parseIP6(dst): %v", err)
+	}
+
+	mkKey := func(id uint32) []byte {
+		return (&ipv6FragKey{SrcIP: src, DstIP: dst, Identification: id, FragNextHdr: proto}).ToFragKey()
+	}
+	mkVal := func(sport uint16) []byte {
+		return (&ipv6FragValue{ExpireTime: 1 << 62, DstPort: dport, SrcPort: sport, L4Proto: proto}).ToFragValue()
+	}
+	targetA := mkKey(0x11111111)
+	targetB := mkKey(0x22222222)
+	sibling := mkKey(0x33333333)
+
+	if err := m.Put(targetA, mkVal(targetPortA)); err != nil {
+		t.Fatalf("put targetA: %v", err)
+	}
+	if err := m.Put(targetB, mkVal(targetPortB)); err != nil {
+		t.Fatalf("put targetB: %v", err)
+	}
+	if err := m.Put(sibling, mkVal(siblingPrt)); err != nil {
+		t.Fatalf("put sibling: %v", err)
+	}
+
+	if err := delEbpfFragStateForTuplesOnMapV6(m, srcStr, dstStr, proto, []uint16{targetPortA, targetPortB}, dport); err != nil {
+		t.Fatalf("delEbpfFragStateForTuplesOnMapV6(batch): %v", err)
+	}
+
+	out := make([]byte, ipv6FragValueSize)
+	if err := m.Lookup(targetA, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Errorf("targetA lookup err = %v, want ErrKeyNotExist", err)
+	}
+	if err := m.Lookup(targetB, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Errorf("targetB lookup err = %v, want ErrKeyNotExist", err)
+	}
+	if err := m.Lookup(sibling, &out); err != nil {
+		t.Errorf("sibling lookup err = %v, want nil — batch delete must not purge source ports outside the revoked batch", err)
+	}
+}
+
 func TestFragStateDeleteV6_Idempotent_NoEntry(t *testing.T) {
 	m, ok := newTestFragStateMapV6(t)
 	if !ok {

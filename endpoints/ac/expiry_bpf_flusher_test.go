@@ -223,6 +223,65 @@ func TestBpfFlusher_FlushConnV6_CanceledCtx(t *testing.T) {
 	}
 }
 
+func TestBpfFlusher_FlushConnsV6_V4Mapped_NoOpPerPort(t *testing.T) {
+	f := &BpfFlusher{}
+	k, err := MakeFlowKey("192.0.2.1", "192.0.2.2", 443, FlowProtoTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := f.FlushConnsV6(context.Background(), k, []uint16{43210, 43211})
+	if len(errs) != 2 {
+		t.Fatalf("FlushConnsV6 errors len = %d, want 2", len(errs))
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("FlushConnsV6 v4-mapped err[%d] = %v, want nil no-op", i, err)
+		}
+	}
+	if got := f.SkippedCount(); got != 2 {
+		t.Errorf("SkippedCount after 2 v4-mapped FlushConnsV6 ports: got %d want 2", got)
+	}
+}
+
+func TestBpfFlusher_FlushConnsV6_NonConnProto_ErrorsPerPort(t *testing.T) {
+	f := &BpfFlusher{}
+	k, err := MakeFlowKey("2001:db8::1", "2001:db8::2", 0, FlowProtoICMP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := f.FlushConnsV6(context.Background(), k, []uint16{43210, 43211})
+	if len(errs) != 2 {
+		t.Fatalf("FlushConnsV6 errors len = %d, want 2", len(errs))
+	}
+	for i, err := range errs {
+		if err == nil {
+			t.Errorf("FlushConnsV6 ICMP err[%d] = nil, want protocol error", i)
+		}
+	}
+	if got := f.SkippedCount(); got != 0 {
+		t.Errorf("SkippedCount after v6 batch protocol-guard case: got %d want 0", got)
+	}
+}
+
+func TestBpfFlusher_FlushConnsV6_CanceledCtxErrorsPerPort(t *testing.T) {
+	f := &BpfFlusher{}
+	k, err := MakeFlowKey("2001:db8::1", "2001:db8::2", 443, FlowProtoTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	errs := f.FlushConnsV6(ctx, k, []uint16{43210, 43211})
+	if len(errs) != 2 {
+		t.Fatalf("FlushConnsV6 errors len = %d, want 2", len(errs))
+	}
+	for i, err := range errs {
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("FlushConnsV6 canceled err[%d] = %v, want context.Canceled", i, err)
+		}
+	}
+}
+
 func TestBpfConntrackSampleIntervalMatchesPublisherFlushInterval(t *testing.T) {
 	flushInterval := metrics.FlushIntervalForTest(t)
 	if bpfConntrackSampleInterval != flushInterval {

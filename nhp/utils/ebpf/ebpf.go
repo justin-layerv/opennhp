@@ -1492,13 +1492,58 @@ func delEbpfConnTrackOnMap(m *ebpf.Map, srcIPStr, dstIPStr string, protocol uint
 // the single ingress-oriented entry (Flags=ctDirIngress) is sufficient; there is
 // no reversed/egress v6 conntrack entry left behind.
 func DelEbpfConnTrackEntryV6(srcIPStr, dstIPStr string, protocol uint8, srcPort, dstPort uint16) error {
+	results := DelEbpfConnTrackEntriesV6(srcIPStr, dstIPStr, protocol, []uint16{srcPort}, dstPort)
+	if len(results) == 0 {
+		return nil
+	}
+	return results[0].Err
+}
+
+// ConnTrackDeleteResultV6 reports the per-source-port outcome from a batched
+// conn_track_v6 revocation. Err is nil when both the conntrack delete and the
+// matching fragment-state purge completed for SrcPort.
+type ConnTrackDeleteResultV6 struct {
+	SrcPort uint16
+	Err     error
+}
+
+// DelEbpfConnTrackEntriesV6 deletes every supplied source-port sibling for one
+// v6 allow-rule tuple while opening each pinned map at most once. It preserves
+// DelEbpfConnTrackEntryV6's per-flow contract: no-entry deletes are successful,
+// conn_track_v6 load/delete errors are reported for the affected flow, and a
+// frag_state_v6 scan/delete error is reported against every conntrack entry that
+// was already torn down but whose later-fragment state was not verifiably purged.
+// That shared-scan failure can move caller hard-fail counters by batch size; the
+// counter continues to represent affected flows, not kernel map operations.
+func DelEbpfConnTrackEntriesV6(srcIPStr, dstIPStr string, protocol uint8, srcPorts []uint16, dstPort uint16) []ConnTrackDeleteResultV6 {
+	results := make([]ConnTrackDeleteResultV6, len(srcPorts))
+	for i, srcPort := range srcPorts {
+		results[i].SrcPort = srcPort
+	}
+	if len(results) == 0 {
+		return results
+	}
+
 	m, err := ebpf.LoadPinnedMap(PinPathConnTrackV6, nil)
 	if err != nil {
-		return fmt.Errorf("load pinned conn_track_v6: %w", err)
+		err = fmt.Errorf("load pinned conn_track_v6: %w", err)
+		for i := range results {
+			results[i].Err = err
+		}
+		return results
 	}
 	defer func() { _ = m.Close() }()
-	if err := delEbpfConnTrackOnMapV6(m, srcIPStr, dstIPStr, protocol, srcPort, dstPort); err != nil {
-		return err
+
+	purgedSrcPorts := make([]uint16, 0, len(srcPorts))
+	for i, srcPort := range srcPorts {
+		if err := delEbpfConnTrackOnMapV6(m, srcIPStr, dstIPStr, protocol, srcPort, dstPort); err != nil {
+			results[i].Err = err
+			continue
+		}
+		purgedSrcPorts = append(purgedSrcPorts, srcPort)
+	}
+	if len(purgedSrcPorts) == 0 {
+		return results
 	}
 
 	// Purging fragment state is O(N) when frag_state_v6 is non-empty: later
@@ -1507,10 +1552,24 @@ func DelEbpfConnTrackEntryV6(srcIPStr, dstIPStr string, protocol uint8, srcPort,
 	// Conntrack is already torn down if this scan later errors; callers surface
 	// that as a hard fail because matching later-fragment state can survive until
 	// its admission-capped 60s TTL or the next successful reaper pass.
-	return delEbpfFragStatePinnedForTupleV6(PinPathFragStateV6, srcIPStr, dstIPStr, protocol, srcPort, dstPort)
+	if err := delEbpfFragStatePinnedForTuplesV6(PinPathFragStateV6, srcIPStr, dstIPStr, protocol, purgedSrcPorts, dstPort); err != nil {
+		for i := range results {
+			if results[i].Err == nil {
+				results[i].Err = err
+			}
+		}
+	}
+	return results
 }
 
 func delEbpfFragStatePinnedForTupleV6(pinPath, srcIPStr, dstIPStr string, protocol uint8, srcPort, dstPort uint16) error {
+	return delEbpfFragStatePinnedForTuplesV6(pinPath, srcIPStr, dstIPStr, protocol, []uint16{srcPort}, dstPort)
+}
+
+func delEbpfFragStatePinnedForTuplesV6(pinPath, srcIPStr, dstIPStr string, protocol uint8, srcPorts []uint16, dstPort uint16) error {
+	if len(srcPorts) == 0 {
+		return nil
+	}
 	fragMap, err := ebpf.LoadPinnedMap(pinPath, nil)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1520,7 +1579,7 @@ func delEbpfFragStatePinnedForTupleV6(pinPath, srcIPStr, dstIPStr string, protoc
 		return fmt.Errorf("load pinned frag_state_v6: %w", err)
 	}
 	defer func() { _ = fragMap.Close() }()
-	return delEbpfFragStateForTupleOnMapV6(fragMap, srcIPStr, dstIPStr, protocol, srcPort, dstPort)
+	return delEbpfFragStateForTuplesOnMapV6(fragMap, srcIPStr, dstIPStr, protocol, srcPorts, dstPort)
 }
 
 // delEbpfConnTrackOnMapV6 is the map-handle-injectable core of
@@ -1557,6 +1616,13 @@ func delEbpfConnTrackOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, protocol ui
 // carry ports, so frag_state_v6 keys only on {src,dst,fragment-id,frag-next};
 // the original ports/proto are stored in the value and matched here.
 func delEbpfFragStateForTupleOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, protocol uint8, srcPort, dstPort uint16) error {
+	return delEbpfFragStateForTuplesOnMapV6(m, srcIPStr, dstIPStr, protocol, []uint16{srcPort}, dstPort)
+}
+
+func delEbpfFragStateForTuplesOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, protocol uint8, srcPorts []uint16, dstPort uint16) error {
+	if len(srcPorts) == 0 {
+		return nil
+	}
 	srcIP, err := parseIP6(srcIPStr)
 	if err != nil {
 		return err
@@ -1564,6 +1630,10 @@ func delEbpfFragStateForTupleOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, pro
 	dstIP, err := parseIP6(dstIPStr)
 	if err != nil {
 		return err
+	}
+	srcPortSet := make(map[uint16]struct{}, len(srcPorts))
+	for _, srcPort := range srcPorts {
+		srcPortSet[srcPort] = struct{}{}
 	}
 
 	info, err := m.Info()
@@ -1603,15 +1673,19 @@ func delEbpfFragStateForTupleOnMapV6(m *ebpf.Map, srcIPStr, dstIPStr string, pro
 			forwardMatch := key.SrcIP == srcIP &&
 				key.DstIP == dstIP &&
 				val.L4Proto == protocol &&
-				val.SrcPort == srcPort &&
 				val.DstPort == dstPort
+			if forwardMatch {
+				_, forwardMatch = srcPortSet[val.SrcPort]
+			}
 			// The reverse arm is intentionally fail-closed defensive cleanup: it can
 			// over-purge a mirror 5-tuple's fragment state, but never admits traffic.
 			reverseMatch := key.SrcIP == dstIP &&
 				key.DstIP == srcIP &&
 				val.L4Proto == protocol &&
-				val.SrcPort == dstPort &&
-				val.DstPort == srcPort
+				val.SrcPort == dstPort
+			if reverseMatch {
+				_, reverseMatch = srcPortSet[val.DstPort]
+			}
 			if forwardMatch || reverseMatch {
 				keyCopy := make([]byte, len(keyBytes))
 				copy(keyCopy, keyBytes)

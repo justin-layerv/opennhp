@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -11,14 +12,15 @@ import (
 // This file proves the E2-slice-5 IPv6 surgical-revocation WIRING: that
 // flushEntryNow → surgicalFlushFlowKey → surgicalFlushFlowKeyV6 drives the v6
 // surgical conntrack path correctly off the injected v6 seams
-// (surgicalConnFlushV6 + enumerateConnSrcPortsV6). It is the v6 twin of
+// (surgicalConnFlushBatchV6 / surgicalConnFlushV6 + enumerateConnSrcPortsV6).
+// It is the v6 twin of
 // revocation_surgical_test.go's v4 wiring proofs. Neither proves the live XDP
 // datapath drops the next real v6 packet — that is the #2779 kernel-rig gate.
 //
 // The injected-seam design exists precisely so this runs cross-platform: the
 // pinned conn_track_v6 map is absent in unit tests, so the production
 // EnumerateConnTrackSrcPortsV6 would return ErrConnTrackMapNotPinned and the
-// FlushConnV6-per-source-port drive could never be observed off a kernel rig.
+// FlushConnsV6 batch drive could never be observed off a kernel rig.
 
 // newSurgicalV6TestAC builds a UdpAC with BOTH the v4 and v6 surgical seams
 // bound — mirroring the EBPFXDP-on-Linux Start() binding (which binds both pairs
@@ -31,19 +33,22 @@ func newSurgicalV6TestAC(t *testing.T, enumerateV6 func(srcIP, dstIP string, pro
 	t.Helper()
 	a, _ := newSurgicalTestAC(t, func(_, _ string, _ uint8, _ uint16) ([]uint16, error) { return nil, nil })
 	v6 := &fakeSurgicalFlusher{}
+	a.surgicalConnFlushBatchV6 = v6.flushConnBatch
 	a.surgicalConnFlushV6 = v6.flushConn
 	a.enumerateConnSrcPortsV6 = enumerateV6
 	return a, v6
 }
 
-// TestFlushEntryNow_V6Surgical_KillsEachSibling is the core proof of the slice:
+// TestFlushEntryNow_V6Surgical_BatchesAndKillsEachSibling is the core proof of the slice:
 // for a v6 TCP entry with the v6 seam wired, flushEntryNow enumerates the live
-// conn_track_v6 source ports on the allow-rule tuple and FlushConnV6's EXACTLY
-// each one — both the target admission and a same-allow-tuple sibling (different
-// source port) are torn down individually by their full 5-tuple. This is the v6
-// equivalent of #2784's v4 resolution, closing the #2778 immediate-revocation
-// gap on the eBPF/XDP path.
-func TestFlushEntryNow_V6Surgical_KillsEachSibling(t *testing.T) {
+// conn_track_v6 source ports on the allow-rule tuple and hands them to
+// FlushConnsV6 in one batch — both the target admission and a same-allow-tuple
+// sibling (different source port) are torn down individually by their full
+// 5-tuple while reusing the pinned conn_track_v6 / frag_state_v6 handles for the
+// revocation. This is the v6 equivalent of #2784's v4 resolution, closing the
+// #2778 immediate-revocation gap on the eBPF/XDP path without the O(K * N)
+// frag_state_v6 scan from issue #2977.
+func TestFlushEntryNow_V6Surgical_BatchesAndKillsEachSibling(t *testing.T) {
 	const (
 		srcIP      = "2001:db8::7"
 		dstIP      = "2001:db8::10"
@@ -70,7 +75,10 @@ func TestFlushEntryNow_V6Surgical_KillsEachSibling(t *testing.T) {
 
 	flushed := v6.snapshot()
 	if len(flushed) != 2 {
-		t.Fatalf("FlushConnV6 called %d times, want 2 (one per enumerated v6 source port): %+v", len(flushed), flushed)
+		t.Fatalf("FlushConnsV6 recorded %d source-port flushes, want 2 (one per enumerated v6 source port): %+v", len(flushed), flushed)
+	}
+	if got := v6.batchCallCount(); got != 1 {
+		t.Fatalf("FlushConnsV6 batch calls = %d, want 1 (all v6 source-port siblings for one allow-rule revoke must share one pinned-map batch)", got)
 	}
 	got := map[uint16]ConnFlowKey{}
 	for _, c := range flushed {
@@ -100,6 +108,93 @@ func TestFlushEntryNow_V6Surgical_KillsEachSibling(t *testing.T) {
 	}
 	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Errorf("%s = %v, want 1 (per-entry tick; surgical-v6 teardown, v6 coarse reschedule skipped)", MetricRevocationFlushScheduled, got)
+	}
+}
+
+func TestFlushEntryNow_V6Surgical_SingleFlowFallbackStillFlushesSiblings(t *testing.T) {
+	const (
+		srcIP      = "2001:db8::7"
+		dstIP      = "2001:db8::10"
+		dport      = 443
+		targetPort = uint16(43210)
+		siblingPrt = uint16(43211)
+	)
+	enumerate := func(s, d string, proto uint8, dp uint16) ([]uint16, error) {
+		if s == srcIP && d == dstIP && proto == 6 && dp == dport {
+			return []uint16{targetPort, siblingPrt}, nil
+		}
+		return nil, nil
+	}
+	a, v6 := newSurgicalV6TestAC(t, enumerate)
+	a.surgicalConnFlushBatchV6 = nil
+
+	key, err := MakeFlowKey(srcIP, dstIP, dport, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey(v6): %v", err)
+	}
+	entry := &AccessEntry{OpenTime: 10}
+	entry.recordScheduledKey(key)
+
+	a.flushEntryNow(entry)
+
+	if got := v6.batchCallCount(); got != 0 {
+		t.Fatalf("FlushConnsV6 batch calls = %d, want 0 when only the single-flow fallback seam is wired", got)
+	}
+	flushed := v6.snapshot()
+	if len(flushed) != 2 {
+		t.Fatalf("single-flow FlushConnV6 fallback recorded %d source-port flushes, want 2: %+v", len(flushed), flushed)
+	}
+	got := map[uint16]bool{}
+	for _, c := range flushed {
+		got[c.SrcPort] = true
+	}
+	if !got[targetPort] || !got[siblingPrt] {
+		t.Fatalf("single-flow fallback flushes = %+v; want both source ports %d and %d", flushed, targetPort, siblingPrt)
+	}
+	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 2 {
+		t.Errorf("%s = %v, want 2", MetricRevocationSurgicalFlushedV6, got)
+	}
+	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 0 {
+		t.Errorf("%s = %v, want 0 (single-flow fallback flushed both siblings)", MetricRevocationIPv6HardFail, got)
+	}
+}
+
+func TestFlushEntryNow_V6Surgical_BatchResultLengthMismatchHardFailsAllPorts(t *testing.T) {
+	const (
+		srcIP      = "2001:db8::7"
+		dstIP      = "2001:db8::10"
+		dport      = 443
+		targetPort = uint16(43210)
+		siblingPrt = uint16(43211)
+	)
+	enumerate := func(s, d string, proto uint8, dp uint16) ([]uint16, error) {
+		if s == srcIP && d == dstIP && proto == 6 && dp == dport {
+			return []uint16{targetPort, siblingPrt}, nil
+		}
+		return nil, nil
+	}
+	a, v6 := newSurgicalV6TestAC(t, enumerate)
+	a.surgicalConnFlushBatchV6 = func(context.Context, FlowKey, []uint16) []error {
+		return []error{nil}
+	}
+
+	key, err := MakeFlowKey(srcIP, dstIP, dport, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey(v6): %v", err)
+	}
+	entry := &AccessEntry{OpenTime: 10}
+	entry.recordScheduledKey(key)
+
+	a.flushEntryNow(entry)
+
+	if flushed := v6.snapshot(); len(flushed) != 0 {
+		t.Fatalf("single-flow fallback should not run after a malformed non-nil batch result; got flushes %+v", flushed)
+	}
+	if got := counter(t, a, MetricRevocationIPv6HardFail); got != 2 {
+		t.Errorf("%s = %v, want 2 (fail closed for every enumerated source port when batch result cardinality is malformed)", MetricRevocationIPv6HardFail, got)
+	}
+	if got := counter(t, a, MetricRevocationSurgicalFlushedV6); got != 0 {
+		t.Errorf("%s = %v, want 0", MetricRevocationSurgicalFlushedV6, got)
 	}
 }
 
@@ -316,6 +411,9 @@ func TestFlushEntryNow_V6_PerPortFlushError_HardFails(t *testing.T) {
 	// Both 5-tuples were ATTEMPTED — one failed delete must not abort the
 	// surviving sibling's flush.
 	flushed := v6.snapshot()
+	if got := v6.batchCallCount(); got != 1 {
+		t.Fatalf("FlushConnsV6 batch calls = %d, want 1 (mixed per-flow results must be accounted through the batch path)", got)
+	}
 	got := map[uint16]bool{}
 	for _, c := range flushed {
 		got[c.SrcPort] = true

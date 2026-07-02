@@ -585,10 +585,23 @@ func (f *BpfFlusher) FlushConn(ctx context.Context, conn ConnFlowKey) error {
 // FlushConn: this requires a real (non-IPv4-mapped) v6 key — a v4 key reaching
 // here is the upstream-regression case, surfaced the same observable way.
 func (f *BpfFlusher) FlushConnV6(ctx context.Context, conn ConnFlowKey) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	// FlushConnsV6 returns one error slot per input source port.
+	return f.FlushConnsV6(ctx, conn.Flow, []uint16{conn.SrcPort})[0]
+}
+
+// FlushConnsV6 is the batched IPv6 twin of FlushConnV6 for one allow-rule
+// revocation. It opens conn_track_v6 and frag_state_v6 once across all
+// enumerated source-port siblings, while returning one error slot per input
+// source port so revocation_index.go can preserve per-flow success and hard-fail
+// accounting.
+func (f *BpfFlusher) FlushConnsV6(ctx context.Context, key FlowKey, srcPorts []uint16) []error {
+	errs := make([]error, len(srcPorts))
+	if len(srcPorts) == 0 {
+		return errs
 	}
-	key := conn.Flow
+	if err := ctx.Err(); err != nil {
+		return fillErrs(errs, err)
+	}
 
 	// Inverse of FlushConn's gate: the conn_track_v6 map keys on struct
 	// ipv6_ct_tuple (in6_addr addrs), so this targets v6 flows only. An
@@ -596,17 +609,33 @@ func (f *BpfFlusher) FlushConnV6(ctx context.Context, conn ConnFlowKey) error {
 	// v4 to FlushConn); surface it the same observable way FlushConn surfaces a
 	// leaked v6 key — count it and no-op rather than mis-key the v6 map.
 	if isIPv4Mapped(key.SrcIP) || isIPv4Mapped(key.DstIP) {
-		f.metricSkipped.Add(1)
-		log.Warning("[BpfFlusher] IPv4-mapped conn key %s reached the IPv6-only eBPF conntrack flusher — upstream regression? (silently no-op'd; tracked in metricSkipped)", conn)
-		return nil
+		f.metricSkipped.Add(uint64(len(srcPorts)))
+		log.Warning("[BpfFlusher] IPv4-mapped flow key %s reached the IPv6-only eBPF conntrack batch flusher with %d source ports — upstream regression? (silently no-op'd; tracked in metricSkipped)", key, len(srcPorts))
+		return errs
 	}
 
 	proto, ok := key.Protocol.ianaL4Proto()
 	if !ok {
-		return fmt.Errorf("BpfFlusher.FlushConnV6: protocol %s for %s has no conntrack entry (only TCP/UDP do)", key.Protocol, conn)
+		err := fmt.Errorf("BpfFlusher.FlushConnsV6: protocol %s for %s has no conntrack entry (only TCP/UDP do)", key.Protocol, key)
+		return fillErrs(errs, err)
 	}
 
-	return utilebpf.DelEbpfConnTrackEntryV6(key.SrcIPString(), key.DstIPString(), proto, conn.SrcPort, key.DstPort)
+	results := utilebpf.DelEbpfConnTrackEntriesV6(key.SrcIPString(), key.DstIPString(), proto, srcPorts, key.DstPort)
+	if len(results) != len(srcPorts) {
+		err := fmt.Errorf("BpfFlusher.FlushConnsV6: conn_track_v6 batch returned %d results for %d source ports", len(results), len(srcPorts))
+		return fillErrs(errs, err)
+	}
+	for i, result := range results {
+		errs[i] = result.Err
+	}
+	return errs
+}
+
+func fillErrs(errs []error, err error) []error {
+	for i := range errs {
+		errs[i] = err
+	}
+	return errs
 }
 
 // isIPv4Mapped returns true if the [16]byte holds an IPv4-mapped

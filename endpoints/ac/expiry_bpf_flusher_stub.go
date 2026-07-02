@@ -43,6 +43,17 @@ func (f *BpfFlusher) FlushConnV6(_ context.Context, _ ConnFlowKey) error {
 	return errors.New("BpfFlusher.FlushConnV6: not supported on this platform")
 }
 
+// FlushConnsV6 is the non-Linux stub for the batched IPv6 surgical
+// conntrack-teardown primitive.
+func (f *BpfFlusher) FlushConnsV6(_ context.Context, _ FlowKey, srcPorts []uint16) []error {
+	errs := make([]error, len(srcPorts))
+	err := errors.New("BpfFlusher.FlushConnsV6: not supported on this platform")
+	for i := range errs {
+		errs[i] = err
+	}
+	return errs
+}
+
 // SkippedCount is the cross-platform symmetry stub for the Linux
 // implementation's non-IPv4 skip counter. Returns 0 on non-Linux —
 // the production AC never executes this path; the stub exists so
