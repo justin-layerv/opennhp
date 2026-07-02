@@ -360,6 +360,12 @@ constant today. The per-customer mapping and extra relay config entries activate
 when cell 2 arrives, with no protocol or relay change. This keeps the contract
 multi-cell-ready without building the mapping logic yet.
 
+Blue/green server colors are not separate relay cells under this contract. The
+active-color switch decision is documented in
+[`RELAY_ACTIVE_CELL_ROUTING.md`](RELAY_ACTIVE_CELL_ROUTING.md): keep one
+cell-level server identity / `serverId`, and make the relay target source
+active-color-aware behind that stable identity.
+
 This seam is already partly real in the IaC, not just aspirational:
 `terraform/modules/compute` carries a `cell_id` variable, tags resources with
 `Cell = var.cell_id`, and documents the `${name_prefix}[-${cell_id}]-server` secret
@@ -586,7 +592,11 @@ thread worked out across several PRs.
    workflow skips the public UDP listener flip when it is absent (the internal NLB
    uses a static both-color attach). Activation checklist (incl. the
    AC-registration-via-internal-NLB smoke under `preserve_client_ip`) lives in the
-   #2628 prod-rollout-ledger entry.
+   #2628 prod-rollout-ledger entry. The next active-color refinement is the
+   shared-identity routing decision in
+   [`RELAY_ACTIVE_CELL_ROUTING.md`](RELAY_ACTIVE_CELL_ROUTING.md): #2645 makes
+   the internal relay target source active-color-only, #3014 tracks the later
+   dynamic relay resolver, and #3015 tracks the separate AC routing story.
 
 ### Phase 3 — Footprint cleanup (parallel after Phase 2)
 

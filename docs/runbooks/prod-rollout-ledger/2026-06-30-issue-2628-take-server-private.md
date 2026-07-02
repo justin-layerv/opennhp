@@ -2,7 +2,9 @@
 
 - **Owner:** prod rollout coordinator
 - **Source:** https://github.com/layervai/nhp/issues/2628 (epic #2208 phase #8);
-  depends on #6 (#2680) + #7. Architecture: `docs/design/NHP_RELAY_TOPOLOGY.md`.
+  depends on #6 (#2680) + #7. Architecture:
+  `docs/design/NHP_RELAY_TOPOLOGY.md`; relay active-color follow-up:
+  `docs/design/RELAY_ACTIVE_CELL_ROUTING.md`.
 
 Adds a `take_server_private` flag (default false) that removes the public server
 knock NLB (UDP 62206 + 0.0.0.0/0 ingress) and repoints the in-VPC AC +

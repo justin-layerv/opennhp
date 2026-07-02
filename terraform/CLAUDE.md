@@ -77,6 +77,14 @@ Parameters using this pattern:
 - Auth0 backend credentials secret version - Auth0 provider returns empty `client_secret`
 - Dev portal management credentials secret version - same Auth0 provider limitation
 
+**Relay active-color routing guardrail (#2658).** Blue/green server colors are
+deploy slots inside one relay cell, not separate relay cells. Do not create
+blue/green `serverId` values or color-specific qURL bootstrap server keys as an
+incidental Terraform target-group/listener detail. The accepted model keeps one
+cell-level server identity and makes the relay target source active-color-aware
+behind that stable identity; see
+[`../docs/design/RELAY_ACTIVE_CELL_ROUTING.md`](../docs/design/RELAY_ACTIVE_CELL_ROUTING.md).
+
 **ASG capacity is co-owned with CI/CD.** Three ASGs use
 `lifecycle { ignore_changes = [desired_capacity, min_size] }` for
 the same reason as the SSM params above — CI/CD scales them during

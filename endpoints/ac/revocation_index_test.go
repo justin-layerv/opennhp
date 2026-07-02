@@ -201,10 +201,10 @@ func TestApplyRevocation_FlushesAndDeletesMatchingEntry(t *testing.T) {
 	if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 1 {
 		t.Fatalf("%s = %v, want 1 via AddCounterWithDims", MetricRevocationEntriesFlushed, got)
 	}
-	if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
+	if got := counterValue(t, a, MetricRevocationFlushScheduled); got != 1 {
 		t.Fatalf("%s = %v, want 1", MetricRevocationFlushScheduled, got)
 	}
-	if got := incrCounter(t, a, MetricRevocationStaleDropped); got != 0 {
+	if got := counterValue(t, a, MetricRevocationStaleDropped); got != 0 {
 		t.Fatalf("%s = %v before duplicate, want 0", MetricRevocationStaleDropped, got)
 	}
 
@@ -224,13 +224,13 @@ func TestApplyRevocation_FlushesAndDeletesMatchingEntry(t *testing.T) {
 		if n := a.ApplyRevocation(scopeQurl, "qhashX", 1); n != 0 {
 			t.Fatalf("duplicate revoke flushed %d, want 0", n)
 		}
-		if got := incrCounter(t, a, MetricRevocationStaleDropped); got != 1 {
+		if got := counterValue(t, a, MetricRevocationStaleDropped); got != 1 {
 			t.Fatalf("%s = %v after duplicate, want 1", MetricRevocationStaleDropped, got)
 		}
 		if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 1 {
 			t.Fatalf("%s = %v after duplicate, want unchanged 1", MetricRevocationEntriesFlushed, got)
 		}
-		if got := incrCounter(t, a, MetricRevocationFlushScheduled); got != 1 {
+		if got := counterValue(t, a, MetricRevocationFlushScheduled); got != 1 {
 			t.Fatalf("%s = %v after duplicate, want unchanged 1", MetricRevocationFlushScheduled, got)
 		}
 	})
@@ -302,7 +302,7 @@ func TestApplyRevocation_EpochIdempotencyDropsStale(t *testing.T) {
 	if n := a.ApplyRevocation(scopeQurl, "qE", 5); n != 0 {
 		t.Fatalf("duplicate epoch 5 must be dropped, flushed %d", n)
 	}
-	if got := incrCounter(t, a, MetricRevocationStaleDropped); got != 2 {
+	if got := counterValue(t, a, MetricRevocationStaleDropped); got != 2 {
 		t.Fatalf("%s = %v after stale+duplicate, want 2", MetricRevocationStaleDropped, got)
 	}
 	if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 1 {
@@ -359,7 +359,7 @@ func TestApplyRevocation_ConcurrentDuplicateEpochAppliesOnce(t *testing.T) {
 	if got := dimCounter(t, a, MetricRevocationEntriesFlushed); got != 1 {
 		t.Fatalf("%s = %v, want 1", MetricRevocationEntriesFlushed, got)
 	}
-	if got := incrCounter(t, a, MetricRevocationStaleDropped); got != goroutines-1 {
+	if got := counterValue(t, a, MetricRevocationStaleDropped); got != goroutines-1 {
 		t.Fatalf("%s = %v, want %d duplicate drops", MetricRevocationStaleDropped, got, goroutines-1)
 	}
 }

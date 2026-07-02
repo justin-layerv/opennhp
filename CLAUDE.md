@@ -251,6 +251,7 @@ This file stays light. Subtree-scoped rules live in nested `CLAUDE.md` files (au
 | Upstream sync process | `docs/UPSTREAM_SYNC.md` |
 | Session enforcement (server-side authz) | `docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md` |
 | NHP-Relay topology + re-knock authz (taking nhp-server private, #2208) | `docs/design/NHP_RELAY_TOPOLOGY.md` |
+| Relay active-cell routing decision (server blue/green switch point, #2658) | `docs/design/RELAY_ACTIVE_CELL_ROUTING.md` |
 | qURL agent-key DDB schema contract | `docs/design/QURL_AGENT_KEYS_SCHEMA.md` |
 | qURL v2 keyed identity + admission contract (signed claims, NHP Server Contract) | `docs/design/QURL_V2_KEYED_IDENTITY.md` |
 | Commit convention + scopes table | `docs/COMMIT_CONVENTION.md` |
