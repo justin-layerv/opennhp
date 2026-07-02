@@ -813,8 +813,9 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	}
 
 	// start ac routines
-	a.wg.Add(4)
+	a.wg.Add(5)
 	go a.tokenStore.RunRefreshRoutine(&a.wg, a.signals.stop, TokenStoreRefreshInterval)
+	go a.runRevocationWatermarkSweepRoutine()
 	go a.sendMessageRoutine()
 	go a.recvMessageRoutine()
 	go a.maintainServerConnectionRoutine()

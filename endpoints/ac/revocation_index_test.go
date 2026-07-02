@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -146,6 +147,189 @@ func TestRevocationIndex_AddIdempotent(t *testing.T) {
 	}
 }
 
+func TestRevocationIndex_SweepLastEpochPrunesOnlyInactiveExpiredWatermarks(t *testing.T) {
+	ri := newRevocationIndex()
+	now := time.Unix(1_725_000_000, 0)
+	ri.now = func() time.Time { return now }
+
+	if !ri.admitEpoch(scopeQurl, "qOld", 1) {
+		t.Fatal("first qOld epoch should apply")
+	}
+	live := qurlV2Entry("qLive", "rLive", "", "aLive")
+	ri.add("tok-live", live)
+	if !ri.admitEpoch(scopeQurl, "qLive", 3) {
+		t.Fatal("first qLive epoch should apply")
+	}
+
+	now = now.Add(revocationWatermarkTTL - time.Second)
+	if !ri.admitEpoch(scopeQurl, "qFresh", 2) {
+		t.Fatal("first qFresh epoch should apply")
+	}
+
+	now = time.Unix(1_725_000_000, 0).Add(revocationWatermarkTTL + time.Nanosecond)
+	if removed := ri.sweepLastEpoch(revocationWatermarkTTL); removed != 1 {
+		t.Fatalf("sweep removed %d watermarks, want 1 inactive+expired", removed)
+	}
+	if ri.peekStale(scopeQurl, "qOld", 1) {
+		t.Fatal("expired inactive qOld watermark should be pruned")
+	}
+	if !ri.peekStale(scopeQurl, "qLive", 3) {
+		t.Fatal("live qLive watermark must survive even when older than TTL")
+	}
+	if ri.admitEpoch(scopeQurl, "qLive", 2) {
+		t.Fatal("older qLive epoch should remain rejected after sweep preserves the live watermark")
+	}
+	if !ri.peekStale(scopeQurl, "qFresh", 2) {
+		t.Fatal("fresh inactive qFresh watermark should survive until TTL")
+	}
+	if got := ri.watermarkCount(); got != 2 {
+		t.Fatalf("watermarkCount = %d, want 2 after first sweep", got)
+	}
+
+	ri.remove("tok-live", live)
+	if removed := ri.sweepLastEpoch(revocationWatermarkTTL); removed != 1 {
+		t.Fatalf("second sweep removed %d watermarks, want 1 newly-inactive expired live key", removed)
+	}
+	if ri.peekStale(scopeQurl, "qLive", 3) {
+		t.Fatal("qLive watermark should prune once the key is inactive and past TTL")
+	}
+	if got := ri.watermarkCount(); got != 1 {
+		t.Fatalf("watermarkCount = %d, want only qFresh remaining", got)
+	}
+}
+
+func TestRevocationIndex_SweepLastEpochAllowsSameEpochAfterPrune(t *testing.T) {
+	ri := newRevocationIndex()
+	now := time.Unix(1_725_010_000, 0)
+	ri.now = func() time.Time { return now }
+
+	if !ri.admitEpoch(scopeQurl, "qPruned", 7) {
+		t.Fatal("first qPruned epoch should apply")
+	}
+	now = now.Add(revocationWatermarkTTL + time.Nanosecond)
+	if removed := ri.sweepLastEpoch(revocationWatermarkTTL); removed != 1 {
+		t.Fatalf("sweep removed %d watermarks, want 1 inactive+expired", removed)
+	}
+	if !ri.admitEpoch(scopeQurl, "qPruned", 7) {
+		t.Fatal("same epoch should apply again after its inactive watermark is pruned")
+	}
+}
+
+func TestRevocationIndex_SweepLastEpochConcurrentWithAdmitEpoch(t *testing.T) {
+	ri := newRevocationIndex()
+
+	live := qurlV2Entry("qRaceLive", "rRaceLive", "", "aRaceLive")
+	ri.add("tok-live", live)
+	if !ri.admitEpoch(scopeQurl, "qRaceLive", 1) {
+		t.Fatal("first qRaceLive epoch should apply")
+	}
+
+	const (
+		writers    = 8
+		sweepers   = 2
+		iterations = 200
+	)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := 0; g < writers; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				key := "qRace-" + strconv.Itoa(g) + "-" + strconv.Itoa(i)
+				if !ri.admitEpoch(scopeQurl, key, uint64(i+1)) {
+					t.Errorf("first epoch for %s should apply", key)
+				}
+			}
+		}()
+	}
+	for g := 0; g < sweepers; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				ri.sweepLastEpoch(time.Nanosecond)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if !ri.peekStale(scopeQurl, "qRaceLive", 1) {
+		t.Fatal("live qRaceLive watermark must survive concurrent inactive sweeps")
+	}
+}
+
+func TestACRegistration_RevocationWatermarksGauge(t *testing.T) {
+	ri := newRevocationIndex()
+	reg := &ACRegistration{ac: &UdpAC{revIndex: ri}}
+
+	if got := reg.revocationWatermarksGauge(); got != 0 {
+		t.Fatalf("empty revocationWatermarksGauge = %v, want 0", got)
+	}
+	if !ri.admitEpoch(scopeQurl, "qGauge", 1) {
+		t.Fatal("first qGauge epoch should apply")
+	}
+	if !ri.admitEpoch(scopeResource, "rGauge", 1) {
+		t.Fatal("first rGauge epoch should apply")
+	}
+	if got := reg.revocationWatermarksGauge(); got != 2 {
+		t.Fatalf("revocationWatermarksGauge = %v, want 2", got)
+	}
+
+	reg.ac.revIndex = nil
+	if got := reg.revocationWatermarksGauge(); got != 0 {
+		t.Fatalf("nil revIndex revocationWatermarksGauge = %v, want 0", got)
+	}
+	reg.ac = nil
+	if got := reg.revocationWatermarksGauge(); got != 0 {
+		t.Fatalf("nil AC revocationWatermarksGauge = %v, want 0", got)
+	}
+}
+
+func TestUdpAC_RevocationWatermarkSweepLoopPrunesEmitsMetricAndStops(t *testing.T) {
+	ri := newRevocationIndex()
+	now := time.Unix(1_725_020_000, 0)
+	ri.now = func() time.Time { return now }
+	if !ri.admitEpoch(scopeQurl, "qSweepLoop", 1) {
+		t.Fatal("first qSweepLoop epoch should apply")
+	}
+	now = now.Add(revocationWatermarkTTL + time.Nanosecond)
+
+	publisher := metrics.NewPublisherForTest(t)
+	a := &UdpAC{
+		revIndex:     ri,
+		registration: &ACRegistration{metrics: publisher},
+	}
+	a.signals.stop = make(chan struct{})
+	ticks := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.runRevocationWatermarkSweepLoop(ticks)
+	}()
+
+	select {
+	case ticks <- now:
+	case <-time.After(time.Second):
+		t.Fatal("timed out sending sweep tick")
+	}
+	waitForMetricValue(t, publisher, MetricRevocationWatermarksPruned, 1)
+	if got := ri.watermarkCount(); got != 0 {
+		t.Fatalf("watermarkCount = %d after sweep loop tick, want 0", got)
+	}
+
+	close(a.signals.stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sweep loop did not stop after signals.stop closed")
+	}
+}
+
 func TestScopeKeysForEntry_LegacyAndSessionSeam(t *testing.T) {
 	// Legacy / non-qURL-v2 entry: no metadata → no index keys at all.
 	if got := scopeKeysForEntry(&AccessEntry{OpenTime: 5}); len(got) != 0 {
@@ -166,6 +350,24 @@ func TestScopeKeysForEntry_LegacyAndSessionSeam(t *testing.T) {
 	got = scopeKeysForEntry(qurlV2Entry("q", "r", "sess", "a"))
 	if len(got) != 4 {
 		t.Fatalf("expected 4 keys with populated session, got %v", got)
+	}
+}
+
+func waitForMetricValue(t *testing.T, publisher *metrics.Publisher, name string, want float64) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if got := counterValueForTest(t, publisher, name); got == want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("%s counter did not reach %v; got %v", name, want, counterValueForTest(t, publisher, name))
+		case <-tick.C:
+		}
 	}
 }
 

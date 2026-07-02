@@ -60,13 +60,51 @@ const (
 	scopeAdmission revocationScope = "admission"
 )
 
+const (
+	// revocationWatermarkTTL bounds how long an inactive epoch watermark stays
+	// resident after the AC applied a revoke for that (scope, scopeKey). It must
+	// stay longer than the producer/server redelivery horizon. Today qurl-service
+	// publishes revokes over a direct signed HTTP sink on a 10s detached
+	// compensation context (5s per-request default), keeps only in-process
+	// retry/dead-letter buffers, and documents rollback as having no persisted
+	// redrive state; managed NHP fleets then retry NHP_REV to ACs for 60s before
+	// age-out. This 24h default deliberately leaves wide slack over those bounded
+	// paths without letting the map grow for an entire AC process lifetime. If a
+	// future producer adds durable queue/DLQ redrive, its max retention must stay
+	// below this TTL or this constant must move in the same rollout. This is a
+	// code constant on purpose: setting it below a producer redrive horizon is a
+	// correctness bug, not an operator preference.
+	//
+	// Scope-key reuse still relies on admitEpoch's cross-service contract below:
+	// qurl-service must either deny re-admission of a revoked key or emit a
+	// strictly advancing epoch for that (scope, scopeKey). The sweep only bounds
+	// inactive retention; it does not weaken that contract. After a watermark is
+	// pruned, a very late duplicate can be accepted cold again, but an inactive
+	// key has no entries to flush, so the observable effect is a fresh ack/metric
+	// rather than data-plane churn. A key that keeps getting re-admitted and
+	// re-revoked with newer epochs stays retained, which represents active
+	// producer input rather than stale AC-only residue.
+	revocationWatermarkTTL = 24 * time.Hour
+	// revocationWatermarkSweepInterval is coarse on purpose: the map is not on a
+	// hot path, and pruning stale inactive watermarks does not need second-level
+	// precision.
+	revocationWatermarkSweepInterval = 5 * time.Minute
+)
+
 // indexKey is the composite key the secondary index is keyed by: the revocation
 // scope plus the per-scope hash/id. Keeping scope in the key prevents a
 // qurl-hash from colliding with a resource-hash that happens to share bytes, and
-// lets one map serve all scopes.
+// lets one map serve all scopes. scopeKeysForEntry and admitEpoch must derive
+// identical keys for the same producer scope/key; the live-watermark guard in
+// sweepLastEpoch relies on that staying true as scopes evolve.
 type indexKey struct {
 	scope revocationScope
 	key   string
+}
+
+type revocationEpochWatermark struct {
+	epoch     uint64
+	appliedAt time.Time
 }
 
 // scopeKeysForEntry returns the (scope, scopeKey) pairs an AccessEntry should be
@@ -122,16 +160,23 @@ type revocationIndex struct {
 	byKey map[indexKey]map[string]struct{}
 	// lastEpoch tracks the highest revocation epoch already applied per
 	// (scope, scopeKey), for idempotency / ordering (mirrors P4d). An event
-	// with epoch <= lastEpoch[k] is a stale duplicate and is dropped. Retains a
-	// watermark per revoked key even after its entries are gone; sweep tracked
-	// in #2782 (see remove godoc).
-	lastEpoch map[indexKey]uint64
+	// with epoch <= lastEpoch[k].epoch is a stale duplicate and is dropped.
+	// admitEpoch refreshes appliedAt whenever it accepts a newer epoch, so
+	// retention is measured from the latest applied revoke.
+	// Retains a watermark per revoked key even after its entries are gone, but
+	// only until sweepLastEpoch proves the key is inactive and the watermark has
+	// outlived the upstream redelivery horizon (#2782).
+	lastEpoch map[indexKey]revocationEpochWatermark
+	// now is set once by newRevocationIndex. Tests may replace it before
+	// concurrent use starts, but production code must not mutate it at runtime.
+	now func() time.Time
 }
 
 func newRevocationIndex() *revocationIndex {
 	return &revocationIndex{
 		byKey:     make(map[indexKey]map[string]struct{}),
-		lastEpoch: make(map[indexKey]uint64),
+		lastEpoch: make(map[indexKey]revocationEpochWatermark),
+		now:       time.Now,
 	}
 }
 
@@ -160,13 +205,11 @@ func (ri *revocationIndex) add(token string, entry *AccessEntry) {
 
 // remove drops token from every revocation key the entry carries, pruning empty
 // sets so the map does not grow unbounded as qURLs come and go. The lastEpoch
-// watermark is intentionally NOT pruned with the set: a revoke can arrive after
-// the last matching entry is gone (e.g. the session already expired), and the
-// watermark must still reject a later stale-epoch duplicate. lastEpoch is
-// bounded by the number of distinct revoked keys, which ages out with TTL on the
-// qurl-service side; an AC-side sweep is a future optimization, not a leak that
-// matters at current scale. A periodic sweep / removal-on-last-entry to reclaim
-// stale watermarks is tracked in #2782.
+// watermark is intentionally NOT pruned synchronously with the set: a revoke can
+// arrive after the last matching entry is gone (e.g. the session already
+// expired), and the watermark must still reject a later stale-epoch duplicate.
+// The background sweep reclaims inactive watermarks only after their appliedAt
+// timestamp is older than revocationWatermarkTTL (#2782).
 func (ri *revocationIndex) remove(token string, entry *AccessEntry) {
 	if ri == nil || token == "" {
 		return
@@ -187,6 +230,44 @@ func (ri *revocationIndex) remove(token string, entry *AccessEntry) {
 			delete(ri.byKey, k)
 		}
 	}
+}
+
+// sweepLastEpoch prunes inactive epoch watermarks that have outlived ttl. A key
+// still present in byKey is live and must keep its watermark regardless of age:
+// without that guard, an ancient duplicate could flush a currently admitted
+// entry after the sweep forgot the older epoch. The full O(n) scan is held under
+// ri.mu because the background cadence is coarse and the TTL now bounds the map;
+// split this into batches if watermark cardinality ever makes that visible.
+func (ri *revocationIndex) sweepLastEpoch(ttl time.Duration) int {
+	if ri == nil || ttl <= 0 {
+		return 0
+	}
+	// ri.now is immutable after construction; tests swap it before concurrency.
+	cutoff := ri.now().Add(-ttl)
+	removed := 0
+
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	for k, wm := range ri.lastEpoch {
+		if len(ri.byKey[k]) != 0 {
+			continue
+		}
+		if wm.appliedAt.After(cutoff) {
+			continue
+		}
+		delete(ri.lastEpoch, k)
+		removed++
+	}
+	return removed
+}
+
+func (ri *revocationIndex) watermarkCount() int {
+	if ri == nil {
+		return 0
+	}
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	return len(ri.lastEpoch)
 }
 
 // tokensFor returns a snapshot copy of the tokens currently indexed under
@@ -276,10 +357,13 @@ func (ri *revocationIndex) admitEpoch(scope revocationScope, scopeKey string, ep
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
 	last, seen := ri.lastEpoch[k]
-	if seen && epoch <= last {
+	if seen && epoch <= last.epoch {
 		return false
 	}
-	ri.lastEpoch[k] = epoch
+	ri.lastEpoch[k] = revocationEpochWatermark{
+		epoch:     epoch,
+		appliedAt: ri.now(),
+	}
 	return true
 }
 
@@ -297,7 +381,45 @@ func (ri *revocationIndex) peekStale(scope revocationScope, scopeKey string, epo
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
 	last, seen := ri.lastEpoch[indexKey{scope, scopeKey}]
-	return seen && epoch <= last
+	return seen && epoch <= last.epoch
+}
+
+func (a *UdpAC) runRevocationWatermarkSweepRoutine() {
+	defer a.wg.Done()
+	defer log.Debug("revocationWatermarkSweepRoutine stopped")
+
+	log.Debug("revocationWatermarkSweepRoutine started (ttl=%s interval=%s)",
+		revocationWatermarkTTL, revocationWatermarkSweepInterval)
+
+	ticker := time.NewTicker(revocationWatermarkSweepInterval)
+	defer ticker.Stop()
+	a.runRevocationWatermarkSweepLoop(ticker.C)
+}
+
+func (a *UdpAC) runRevocationWatermarkSweepLoop(ticks <-chan time.Time) {
+	for {
+		select {
+		case <-a.signals.stop:
+			return
+		case _, ok := <-ticks:
+			if !ok {
+				return
+			}
+			a.sweepRevocationWatermarksOnce()
+		}
+	}
+}
+
+func (a *UdpAC) sweepRevocationWatermarksOnce() {
+	if a == nil || a.revIndex == nil {
+		return
+	}
+	removed := a.revIndex.sweepLastEpoch(revocationWatermarkTTL)
+	if removed > 0 {
+		a.addMetric(MetricRevocationWatermarksPruned, uint64(removed))
+		log.Info("[Revocation] pruned %d inactive epoch watermarks older than %s",
+			removed, revocationWatermarkTTL)
+	}
 }
 
 // ApplyRevocation is the local apply primitive and the seam P4e calls once it

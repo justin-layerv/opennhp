@@ -60,6 +60,15 @@ must update this list and audit all existing call sites.
   goroutine clears the pointer during teardown and then closes `done`, so
   callers that wait for shutdown must snapshot the pointer, release the mutex,
   and only then wait.
+- **`revocationIndex.mu` is leaf-most and internal.** The revocation index
+  protects its token sets plus per-key epoch watermarks with one mutex. Apply
+  paths snapshot tokens and release the mutex before touching tokenStore,
+  scheduler, flusher, metrics, or registration state; add/remove paths are
+  called after tokenStore operations have returned. The watermark TTL sweep may
+  scan the map while holding this mutex, but it does not call back into any AC
+  subsystem. Future changes that hold `revocationIndex.mu` while invoking
+  tokenStore, scheduler, flusher, metrics, or registration code must audit this
+  table first.
 - **ConntrackFlusher netlink locks are leaf-most and internal.** `ctConn.mu`
   serializes request/response use of one pooled ctnetlink socket and may be held
   across dump/delete syscalls; `ctEventIndex.mu` guards the #2908 event-fed

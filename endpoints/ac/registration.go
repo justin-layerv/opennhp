@@ -635,6 +635,15 @@ const (
 	//     ANY nonzero reading is a real immediate-revocation gap worth alarming on. The split's
 	//     full rationale — incl. the deferred-tick residual (#2901) — is in the
 	//     flushEntryNow godoc / the QURL_V2_KEYED_IDENTITY.md Filter-mode/IPv6 caveat.
+	//   - MetricRevocationWatermarks — current count of per-(scope,scope_key)
+	//     epoch watermarks retained for stale/duplicate rejection. Expected to
+	//     track distinct revoked keys over roughly the last
+	//     revocationWatermarkTTL plus currently-live keys, not AC process
+	//     lifetime. A monotonic climb without drops means the #2782 sweep is not
+	//     running or every retained key is still live.
+	//   - MetricRevocationWatermarksPruned — count of inactive epoch watermarks
+	//     the #2782 sweep reclaimed after the retention TTL. This is capacity
+	//     hygiene only; it is not a revocation-delivery signal.
 	MetricRevocationStaleDropped      = "RevocationStaleDropped"
 	MetricRevocationEntriesFlushed    = "RevocationEntriesFlushed"
 	MetricRevocationFlushScheduled    = "RevocationFlushScheduled"
@@ -642,6 +651,8 @@ const (
 	MetricRevocationSurgicalFlushed   = "RevocationSurgicalFlushed"
 	MetricRevocationSurgicalFlushedV6 = "RevocationSurgicalFlushedV6"
 	MetricRevocationIPv6HardFail      = "RevocationIPv6HardFail"
+	MetricRevocationWatermarks        = "RevocationWatermarks"
+	MetricRevocationWatermarksPruned  = "RevocationWatermarksPruned"
 	// MetricRevocationAckSent counts NHP_RVA acks the AC enqueued to the server
 	// after processing a validated NHP_REV (proof-of-delivery, P4e Slice 3
 	// #2793). One per validated NHP_REV regardless of flush count (the ack is a
@@ -1411,6 +1422,7 @@ func (r *ACRegistration) Start() error {
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleRejected, r.l3FlushScheduleRejectedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleAfterShutdown, r.l3FlushScheduleAfterShutdownGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleWaitTimeout, r.l3FlushScheduleWaitTimeoutGauge)
+	r.metrics.RegisterGaugeFunc(MetricRevocationWatermarks, r.revocationWatermarksGauge)
 
 	r.registerConntrackGaugeFuncs()
 
@@ -1583,6 +1595,14 @@ func (r *ACRegistration) l3FlushSnapshot() FlushMetrics {
 func (r *ACRegistration) l3FlushEntriesGauge() float64 {
 	return float64(r.l3FlushSnapshot().Entries)
 }
+
+func (r *ACRegistration) revocationWatermarksGauge() float64 {
+	if r.ac == nil || r.ac.revIndex == nil {
+		return 0
+	}
+	return float64(r.ac.revIndex.watermarkCount())
+}
+
 func (r *ACRegistration) l3FlushFlushTotalGauge() float64 {
 	return float64(r.l3FlushSnapshot().FlushTotal)
 }

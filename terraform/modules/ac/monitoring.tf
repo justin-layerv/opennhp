@@ -787,16 +787,18 @@ locals {
   # Terraform's `cond ? a : b` requires both branches to produce the same
   # tuple type/length, and this list is a heterogeneous tuple of 4 widget
   # objects — a for-expression with an `if` clause is the standard workaround.
-  # Dashboard layout: the existing dashboard ends at y=9 with a height-2
-  # text widget (rows 9 and 10), so the EIP widgets at y=11 are visually
-  # contiguous with the previous row — no gap, no overlap. Each EIP row
-  # is height=6, so the second row starts at y=17. If you re-order the
-  # dashboard, recompute these to match the new previous-widget end.
+  # Dashboard layout: the fixed dashboard rows now end at y=17 with a height-6
+  # revocation watermark widget (rows 17-22), so the optional EIP widgets start
+  # at y=23. The prior y=11/y=17 EIP offsets overlapped fixed widgets in
+  # EIP-enabled dashboards; these offsets keep both optional rows below the
+  # revocation row. Each EIP row is height=6, so the second row starts at y=29.
+  # If you re-order the dashboard, recompute these to match the new
+  # previous-widget end.
   eip_widget_definitions = [
     {
       type   = "metric"
       x      = 0
-      y      = 11 # immediately below the existing y=9, height=2 text widget
+      y      = 23
       width  = 12
       height = 6
       properties = {
@@ -834,7 +836,7 @@ locals {
     {
       type   = "metric"
       x      = 12
-      y      = 11
+      y      = 23
       width  = 12
       height = 6
       properties = {
@@ -858,7 +860,7 @@ locals {
     {
       type   = "metric"
       x      = 0
-      y      = 17
+      y      = 29
       width  = 12
       height = 6
       properties = {
@@ -876,7 +878,7 @@ locals {
     {
       type   = "metric"
       x      = 12
-      y      = 17
+      y      = 29
       width  = 12
       height = 6
       properties = {
@@ -1047,6 +1049,33 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
           view    = "timeSeries"
           stacked = false
           period  = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 17
+        width  = 24
+        height = 6
+        properties = {
+          title  = "AC Revocation Watermark Hygiene"
+          region = data.aws_region.current.id
+          # Observe-only: the retained-watermark gauge should drop after the
+          # TTL sweep, but a paging threshold needs production cardinality
+          # baseline first. Keep the dashboard on the publisher base-dim stream.
+          metrics = [
+            ["LayerV/NHP", "RevocationWatermarks", "Component", "AC", "Environment", var.environment, "Region", data.aws_region.current.id, { "stat" : "Maximum", "label" : "Retained watermarks" }],
+            ["LayerV/NHP", "RevocationWatermarksPruned", "Component", "AC", "Environment", var.environment, "Region", data.aws_region.current.id, { "stat" : "Sum", "label" : "Pruned" }]
+          ]
+          view    = "timeSeries"
+          stacked = false
+          period  = 300
+          yAxis = {
+            left = {
+              min   = 0
+              label = "Count"
+            }
+          }
         }
       }
       ],
