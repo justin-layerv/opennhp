@@ -4,7 +4,9 @@
 put-metric-data is unusual among CloudWatch commands: --dimensions uses the
 AWS CLI's Key=Value map shorthand, while commands such as put-metric-alarm use
 the Name=...,Value=... structure form. This script catches regressions back to
-the wrong put-metric-data form before a deploy workflow can run.
+the wrong put-metric-data form before a deploy workflow can run. It also checks
+literal --metric-data shorthand dimensions (`Dimensions=[{Name=...,Value=...}]`)
+when that form is used instead of JSON.
 """
 
 from __future__ import annotations
@@ -76,6 +78,30 @@ def dimensions_arg(command: str) -> str | None:
     return None
 
 
+def metric_data_args(command: str) -> list[str]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return []
+
+    args: list[str] = []
+    offset = 0
+    while offset < len(tokens):
+        token = tokens[offset]
+        if token.startswith("--metric-data="):
+            args.append(token.split("=", 1)[1])
+            offset += 1
+            continue
+        if token == "--metric-data":
+            offset += 1
+            while offset < len(tokens) and not tokens[offset].startswith("--"):
+                args.append(tokens[offset])
+                offset += 1
+            continue
+        offset += 1
+    return args
+
+
 def has_literal_comma_value(dimensions: str) -> bool:
     if "$" in dimensions:
         return False
@@ -87,6 +113,115 @@ def has_literal_comma_value(dimensions: str) -> bool:
         "=" not in segment or segment.startswith("=")
         for segment in dimensions.split(",")
     )
+
+
+def split_commas_outside_shell_expansions(value: str) -> list[str] | None:
+    parts: list[str] = []
+    start = 0
+    shell_expansion_depth = 0
+    offset = 0
+    while offset < len(value):
+        if value.startswith("${", offset):
+            shell_expansion_depth += 1
+            offset += 2
+            continue
+
+        char = value[offset]
+        if shell_expansion_depth:
+            if char == "}":
+                shell_expansion_depth -= 1
+            offset += 1
+            continue
+        if char == ",":
+            parts.append(value[start:offset].strip())
+            start = offset + 1
+        offset += 1
+
+    if shell_expansion_depth:
+        return None
+    parts.append(value[start:].strip())
+    return parts
+
+
+def metric_data_dimension_entries(dimensions: str) -> list[str] | None:
+    entries: list[str] = []
+    brace_depth = 0
+    shell_expansion_depth = 0
+    entry_start: int | None = None
+    last_entry_end = 0
+    offset = 0
+    while offset < len(dimensions):
+        if dimensions.startswith("${", offset):
+            shell_expansion_depth += 1
+            offset += 2
+            continue
+
+        char = dimensions[offset]
+        if shell_expansion_depth:
+            if char == "}":
+                shell_expansion_depth -= 1
+            offset += 1
+            continue
+        if char == "{":
+            if brace_depth == 0:
+                if dimensions[last_entry_end:offset].strip().strip(","):
+                    return None
+                entry_start = offset + 1
+            brace_depth += 1
+        elif char == "}":
+            if brace_depth == 0:
+                return None
+            brace_depth -= 1
+            if brace_depth == 0:
+                if entry_start is None:
+                    return None
+                entries.append(dimensions[entry_start:offset].strip())
+                last_entry_end = offset + 1
+                entry_start = None
+        offset += 1
+
+    if shell_expansion_depth or brace_depth:
+        return None
+    if dimensions[last_entry_end:].strip().strip(","):
+        return None
+    return entries
+
+
+def metric_data_dimension_errors(metric_data: str) -> list[str]:
+    errors: list[str] = []
+    for match in re.finditer(r"Dimensions=\[([^\]]*)\]", metric_data):
+        dimensions = match.group(1).strip()
+        if not dimensions:
+            errors.append("empty Dimensions list")
+            continue
+
+        entries = metric_data_dimension_entries(dimensions)
+        if not entries:
+            errors.append("Dimensions must contain {Name=...,Value=...} entries")
+            continue
+
+        for entry in entries:
+            parts = split_commas_outside_shell_expansions(entry)
+            if parts is None:
+                errors.append("unterminated shell expansion in metric-data dimension")
+                break
+            if any("=" not in part or part.startswith("=") for part in parts):
+                errors.append(
+                    "dimension values containing literal commas must use metric-data JSON"
+                )
+                break
+            fields = {
+                part.split("=", 1)[0].strip(): part.split("=", 1)[1].strip()
+                for part in parts
+            }
+            if set(fields) != {"Name", "Value"} or any(
+                not value for value in fields.values()
+            ):
+                errors.append(
+                    "each metric-data dimension must have exactly Name and Value fields"
+                )
+                break
+    return errors
 
 
 def check_text(path: Path, text: str) -> list[Failure]:
@@ -109,6 +244,14 @@ def check_text(path: Path, text: str) -> list[Failure]:
                     line,
                     "put-metric-data dimension values containing literal commas "
                     "must use --metric-data JSON",
+                )
+            )
+        for error in metric_data_dimension_errors("\n".join(metric_data_args(command))):
+            failures.append(
+                Failure(
+                    path,
+                    line,
+                    f"put-metric-data --metric-data shorthand dimension drift: {error}",
                 )
             )
     return failures
@@ -155,6 +298,57 @@ def run_self_test() -> None:
               --metric-data '[{"Dimensions":[{"Name":"Environment","Value":"prod"}]}]'
             """,
             False,
+        ),
+        (
+            "metric-data shorthand",
+            """
+            aws cloudwatch put-metric-data \\
+              --namespace LayerV/NHP \\
+              --metric-data "MetricName=DeploymentWindow,Dimensions=[{Name=Environment,Value=${environment}},{Name=Cell,Value=${cell_id}}],Value=1,Unit=Count"
+            """,
+            False,
+        ),
+        (
+            "metric-data shorthand spaced entries",
+            """
+            aws cloudwatch put-metric-data \\
+              --namespace LayerV/NHP \\
+              --metric-data "MetricName=DeploymentWindow,Dimensions=[{Name=Environment,Value=${environment}}, {Name=Cell,Value=${cell_id}}],Value=1,Unit=Count"
+            """,
+            False,
+        ),
+        (
+            "metric-data shorthand shell expansion comma",
+            """
+            aws cloudwatch put-metric-data \\
+              --namespace LayerV/NHP \\
+              --metric-data "MetricName=DeploymentWindow,Dimensions=[{Name=Reason,Value=${reason:-Throttled, transient}}],Value=1,Unit=Count"
+            """,
+            False,
+        ),
+        (
+            "bad metric-data shorthand missing value",
+            """
+            aws cloudwatch put-metric-data \\
+              --metric-data "MetricName=DeploymentWindow,Dimensions=[{Name=Environment},{Name=Cell,Value=cell0}],Value=1,Unit=Count"
+            """,
+            True,
+        ),
+        (
+            "bad metric-data shorthand malformed list",
+            """
+            aws cloudwatch put-metric-data \\
+              --metric-data "MetricName=DeploymentWindow,Dimensions=[Name=Environment,Value=prod],Value=1,Unit=Count"
+            """,
+            True,
+        ),
+        (
+            "bad metric-data shorthand literal comma value",
+            """
+            aws cloudwatch put-metric-data \\
+              --metric-data "MetricName=DeploymentWindow,Dimensions=[{Name=Environment,Value=prod},{Name=Reason,Value=Throttled, transient}],Value=1,Unit=Count"
+            """,
+            True,
         ),
         (
             "bad Name/Value pair form",

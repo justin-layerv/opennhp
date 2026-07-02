@@ -66,7 +66,14 @@ DATE
 set -euo pipefail
 
 STATE_DIR="${FAKE_AWS_STATE_DIR:?}"
+count_file="$STATE_DIR/aws-count"
+count=0
+[[ -f "$count_file" ]] && count=$(cat "$count_file")
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
 printf '%s\n' "$*" > "$STATE_DIR/aws-args"
+printf '%s\n' "$*" > "$STATE_DIR/aws-args-$count"
+printf '%s\n' "$*" >> "$STATE_DIR/aws-args-log"
 
 if [[ "$*" != cloudwatch\ put-metric-data* ]]; then
   echo "unexpected aws invocation: $*" >&2
@@ -89,12 +96,6 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
-
-count_file="$STATE_DIR/aws-count"
-count=0
-[[ -f "$count_file" ]] && count=$(cat "$count_file")
-count=$((count + 1))
-printf '%s' "$count" > "$count_file"
 
 case "${FAKE_PUT_MODE:-success}" in
   success)
@@ -187,20 +188,23 @@ echo "Running emit-deployment-window-metric tests..."
 
 run_case success bash "$SCRIPT" prod cell0 server promote
 assert_rc "single emit succeeds" 0
-assert_contains "success message includes log-only breadcrumbs" "DeploymentWindow metric pushed (Environment=prod Cell=cell0 Component=server Strategy=promote)"
-assert_file_contains "metric namespace is LayerV/NHP" "$LAST_STATE_DIR/aws-args" "--namespace LayerV/NHP"
-assert_file_contains "metric name is DeploymentWindow" "$LAST_STATE_DIR/aws-args" "--metric-name DeploymentWindow"
-assert_file_contains "put metric has bounded connect timeout" "$LAST_STATE_DIR/aws-args" "--cli-connect-timeout 5"
-assert_file_contains "put metric has bounded read timeout" "$LAST_STATE_DIR/aws-args" "--cli-read-timeout 10"
-assert_file_contains "dimensions use put-metric-data shorthand" "$LAST_STATE_DIR/aws-args" "--dimensions Environment=prod,Cell=cell0"
-assert_file_contains "environment dimension is present" "$LAST_STATE_DIR/aws-args" "Environment=prod"
-assert_file_contains "cell dimension is present" "$LAST_STATE_DIR/aws-args" "Cell=cell0"
-assert_file_not_contains "component stays log-only, not a dimension" "$LAST_STATE_DIR/aws-args" "Component="
-assert_file_not_contains "strategy stays log-only, not a dimension" "$LAST_STATE_DIR/aws-args" "Strategy="
+assert_contains "success message includes log-only breadcrumbs" "DeploymentWindow/DeploymentWindowRun metrics pushed (Environment=prod Cell=cell0 Component=server Strategy=promote)"
+assert_file_equals "single emit publishes window and run marker atomically" "$LAST_STATE_DIR/aws-count" "1"
+assert_file_contains "metric namespace is deploy-only" "$LAST_STATE_DIR/aws-args-log" "--namespace LayerV/NHP/Deploy"
+assert_file_contains "metric-data mode is used" "$LAST_STATE_DIR/aws-args-log" "--metric-data"
+assert_file_contains "window metric is present" "$LAST_STATE_DIR/aws-args-log" "MetricName=DeploymentWindow,"
+assert_file_contains "run marker metric is present" "$LAST_STATE_DIR/aws-args-log" "MetricName=DeploymentWindowRun,"
+assert_file_contains "put metric has bounded connect timeout" "$LAST_STATE_DIR/aws-args-log" "--cli-connect-timeout 5"
+assert_file_contains "put metric has bounded read timeout" "$LAST_STATE_DIR/aws-args-log" "--cli-read-timeout 10"
+assert_file_not_contains "dimensions shorthand is not mixed with metric-data" "$LAST_STATE_DIR/aws-args-log" "--dimensions"
+assert_file_contains "environment dimension is present" "$LAST_STATE_DIR/aws-args-log" "Name=Environment,Value=prod"
+assert_file_contains "cell dimension is present" "$LAST_STATE_DIR/aws-args-log" "Name=Cell,Value=cell0"
+assert_file_not_contains "component stays log-only, not a dimension" "$LAST_STATE_DIR/aws-args-log" "Component="
+assert_file_not_contains "strategy stays log-only, not a dimension" "$LAST_STATE_DIR/aws-args-log" "Strategy="
 
 run_case put-failure env FAKE_PUT_MODE=fail bash "$SCRIPT" prod cell0 ac canary
 assert_rc "put-metric-data failure is non-blocking" 0
-assert_contains "failure emits warning" "::warning::Failed to push DeploymentWindow metric (Environment=prod Cell=cell0 Component=ac Strategy=canary); continuing"
+assert_contains "failure emits warning" "::warning::Failed to push DeploymentWindow/DeploymentWindowRun metrics (Environment=prod Cell=cell0 Component=ac Strategy=canary); continuing"
 
 run_case missing-args bash "$SCRIPT" prod cell0
 assert_rc "missing log-only args fail fast" 1
@@ -228,7 +232,7 @@ run_case throttled-helper-retries-failed-put env \
   DEPLOYMENT_WINDOW_EMIT_INTERVAL_SECONDS=60 \
   bash -c 'set -euo pipefail; source "$1"; emit_deployment_window_metric_throttled; emit_deployment_window_metric_throttled' bash "$SCRIPT"
 assert_rc "throttled helper retries failed put" 0
-assert_contains "throttled helper failed put warns" "::warning::Failed to push DeploymentWindow metric (Environment=prod Cell=cell0 Component=server Strategy=canary-poll); continuing"
+assert_contains "throttled helper failed put warns" "::warning::Failed to push DeploymentWindow/DeploymentWindowRun metrics (Environment=prod Cell=cell0 Component=server Strategy=canary-poll); continuing"
 assert_file_equals "failed put does not advance throttle" "$LAST_STATE_DIR/aws-count" "2"
 
 # shellcheck disable=SC2016

@@ -151,6 +151,16 @@ QRTS_TERRAFORM_VARIABLES = (
 )
 QRTS_PROD_TFVARS = REPO_ROOT / "terraform" / "environments" / "prod" / "terraform.tfvars"
 MONITORING_TF = REPO_ROOT / "terraform" / "modules" / "monitoring" / "main.tf"
+COMPUTE_TF = REPO_ROOT / "terraform" / "modules" / "compute" / "main.tf"
+AC_TF = REPO_ROOT / "terraform" / "modules" / "ac" / "main.tf"
+ECR_TF = REPO_ROOT / "terraform" / "modules" / "ecr" / "main.tf"
+TF_PUT_METRIC_DATA_ACTION_RE = re.compile(
+    r'Action\s*=\s*(?:'
+    r'\[[^\]]*"cloudwatch:PutMetricData"[^\]]*\]'
+    r'|"cloudwatch:PutMetricData"'
+    r")",
+    flags=re.DOTALL,
+)
 _TERRAFORM_MODULE_SCAN_PATHS = (
     REPO_ROOT / "terraform" / "main.tf",
     REPO_ROOT / "terraform" / "environments" / "prod" / "main.tf",
@@ -247,6 +257,133 @@ def _tf_resource_block(tf_text: str, resource_type: str, name: str) -> str:
     return ""
 
 
+def _tf_statement_block_by_sid(tf_text: str, sid: str) -> str:
+    match = re.search(rf'\bSid\s*=\s*"{re.escape(sid)}"', tf_text)
+    if not match:
+        return ""
+
+    brace_start = tf_text.rfind("{", 0, match.start())
+    if brace_start == -1:
+        return ""
+
+    depth = 0
+    for index in range(brace_start, len(tf_text)):
+        char = tf_text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return tf_text[brace_start : index + 1]
+    return ""
+
+
+def _tf_namespace_condition_values(block: str) -> set[str]:
+    list_match = re.search(
+        r'"cloudwatch:namespace"\s*=\s*\[([^\]]*)\]',
+        block,
+        flags=re.MULTILINE,
+    )
+    if list_match:
+        return set(re.findall(r'"([^"]+)"', list_match.group(1)))
+
+    string_match = re.search(r'"cloudwatch:namespace"\s*=\s*"([^"]+)"', block)
+    if string_match:
+        return {string_match.group(1)}
+
+    expression_match = re.search(
+        r'"cloudwatch:namespace"\s*=\s*([^\s,}\]]+)',
+        block,
+    )
+    return {expression_match.group(1)} if expression_match else set()
+
+
+def _tf_module_dir(path: str) -> str:
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+
+def _tf_resolve_namespace_expression(
+    expression: str,
+    path: str,
+    terraform_tf_texts: dict[str, str],
+) -> set[str]:
+    if expression.startswith("local."):
+        name = re.escape(expression[len("local.") :])
+        match = re.search(
+            rf"\b{name}\s*=\s*\"([^\"]+)\"",
+            terraform_tf_texts.get(path, ""),
+        )
+        return {match.group(1)} if match else set()
+
+    if expression.startswith("var."):
+        name = re.escape(expression[len("var.") :])
+        module_dir = _tf_module_dir(path)
+        for candidate_path, candidate_text in terraform_tf_texts.items():
+            if _tf_module_dir(candidate_path) != module_dir:
+                continue
+            match = re.search(
+                rf'variable\s+"{name}"\s*{{[^}}]*\bdefault\s*=\s*"([^"]+)"',
+                candidate_text,
+                flags=re.DOTALL,
+            )
+            if match:
+                return {match.group(1)}
+
+    return set()
+
+
+def _tf_namespace_condition_values_with_resolved_expressions(
+    path: str,
+    block: str,
+    terraform_tf_texts: dict[str, str],
+) -> set[str]:
+    values = _tf_namespace_condition_values(block)
+    resolved = set(values)
+    for value in values:
+        resolved.update(
+            _tf_resolve_namespace_expression(value, path, terraform_tf_texts)
+        )
+    return resolved
+
+
+def _tf_statement_allows_put_metric_data(block: str) -> bool:
+    return bool(TF_PUT_METRIC_DATA_ACTION_RE.search(block))
+
+
+def _tf_statement_effect(block: str) -> str:
+    match = re.search(r'\bEffect\s*=\s*"([^"]+)"', block)
+    return match.group(1) if match else ""
+
+
+def _tf_statement_sid(block: str) -> str:
+    match = re.search(r'\bSid\s*=\s*"([^"]+)"', block)
+    return match.group(1) if match else ""
+
+
+def _tf_statement_blocks_with_put_metric_data(tf_text: str) -> list[str]:
+    blocks: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    for match in TF_PUT_METRIC_DATA_ACTION_RE.finditer(tf_text):
+        brace_start = tf_text.rfind("{", 0, match.start())
+        if brace_start == -1:
+            continue
+
+        depth = 0
+        for index in range(brace_start, len(tf_text)):
+            char = tf_text[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    key = (brace_start, index)
+                    if key not in seen:
+                        seen.add(key)
+                        blocks.append(tf_text[brace_start : index + 1])
+                    break
+    return blocks
+
+
 def _assert_revocation_ageout_alarm_rules(tf_text: str, failures: list[str]) -> None:
     """Pin the raw/page/breadcrumb composite semantics for issue #2868."""
     page_block = _tf_resource_block(
@@ -255,11 +392,43 @@ def _assert_revocation_ageout_alarm_rules(tf_text: str, failures: list[str]) -> 
     suppressed_block = _tf_resource_block(
         tf_text, "aws_cloudwatch_composite_alarm", "revocation_aged_out_suppressed"
     )
+    window_block = _tf_resource_block(
+        tf_text, "aws_cloudwatch_metric_alarm", "revocation_deploy_window"
+    )
+    orphaned_window_block = _tf_resource_block(
+        tf_text,
+        "aws_cloudwatch_metric_alarm",
+        "revocation_deploy_window_without_run",
+    )
     raw = _REVOCATION_RAW_REF
     window = _REVOCATION_WINDOW_REF
     page_rule = f'alarm_rule = "ALARM(\\"${{{raw}}}\\") AND NOT ALARM(\\"${{{window}}}\\")"'
     suppressed_rule = f'alarm_rule      = "ALARM(\\"${{{raw}}}\\") AND ALARM(\\"${{{window}}}\\")"'
 
+    if not _check(
+        "monitoring deploy-window suppressor uses deploy-only namespace",
+        'namespace           = local.deploy_metric_namespace' in window_block
+        and 'deploy_metric_namespace = "LayerV/NHP/Deploy"' in tf_text,
+        "DeploymentWindow must not live in the shared LayerV/NHP app namespace",
+    ):
+        failures.append("revocation deploy-window namespace is not hardened")
+    if not _check(
+        "monitoring pages on orphaned deploy-window suppressors",
+        "DeploymentWindowRun" in orphaned_window_block
+        and "alarm_actions = [aws_sns_topic.alerts.arn]" in orphaned_window_block
+        and "evaluation_periods  = 10" in orphaned_window_block
+        and "datapoints_to_alarm = 1" in orphaned_window_block
+        and 'expression  = "IF((FILL(window, 0) - FILL(run, 0)) > 0, 1, 0)"'
+        in orphaned_window_block,
+        "DeploymentWindow without a paired run marker must explicitly fill sparse run-marker samples and stay visible for the suppressor hold",
+    ):
+        failures.append("revocation deploy-window orphan watchdog drifted")
+    if not _check(
+        "monitoring orphan watchdog has no OK action",
+        "ok_actions" not in orphaned_window_block,
+        "a watchdog trip should page on ALARM only; OK transitions are recovery noise",
+    ):
+        failures.append("revocation deploy-window orphan watchdog must not send OK actions")
     if not _check(
         "monitoring page composite pages only outside deploy window",
         page_rule in page_block,
@@ -284,6 +453,35 @@ def _assert_revocation_ageout_alarm_rules_self_test() -> bool:
     raw = _REVOCATION_RAW_REF
     window = _REVOCATION_WINDOW_REF
     good = f'''
+locals {{
+  deploy_metric_namespace = "LayerV/NHP/Deploy"
+}}
+
+resource "aws_cloudwatch_metric_alarm" "revocation_deploy_window" {{
+  namespace           = local.deploy_metric_namespace
+  metric_name         = "DeploymentWindow"
+}}
+
+resource "aws_cloudwatch_metric_alarm" "revocation_deploy_window_without_run" {{
+  evaluation_periods  = 10
+  datapoints_to_alarm = 1
+
+  metric_query {{
+    id          = "orphaned"
+    expression  = "IF((FILL(window, 0) - FILL(run, 0)) > 0, 1, 0)"
+    return_data = true
+  }}
+
+  metric_query {{
+    id = "run"
+    metric {{
+      metric_name = "DeploymentWindowRun"
+    }}
+  }}
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+}}
+
 resource "aws_cloudwatch_composite_alarm" "revocation_aged_out_page" {{
   alarm_rule = "ALARM(\\"${{{raw}}}\\") AND NOT ALARM(\\"${{{window}}}\\")"
   alarm_actions = ["arn:aws:sns:us-east-2:123456789012:alerts"]
@@ -312,7 +510,333 @@ resource "aws_cloudwatch_composite_alarm" "revocation_aged_out_suppressed" {{
     with contextlib.redirect_stdout(io.StringIO()):
         _assert_revocation_ageout_alarm_rules(false_ok, false_ok_failures)
 
-    return not good_failures and bool(swapped_failures) and bool(false_ok_failures)
+    orphan_ok = good.replace(
+        "  alarm_actions = [aws_sns_topic.alerts.arn]",
+        "  alarm_actions = [aws_sns_topic.alerts.arn]\n"
+        "  ok_actions    = [aws_sns_topic.alerts.arn]",
+    )
+    orphan_ok_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_ageout_alarm_rules(orphan_ok, orphan_ok_failures)
+
+    orphan_short_hold = good.replace(
+        "  evaluation_periods  = 10", "  evaluation_periods  = 1"
+    )
+    orphan_short_hold_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_ageout_alarm_rules(
+            orphan_short_hold, orphan_short_hold_failures
+        )
+
+    orphan_m_to_n = good.replace(
+        "  datapoints_to_alarm = 1", "  datapoints_to_alarm = 2"
+    )
+    orphan_m_to_n_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_revocation_ageout_alarm_rules(orphan_m_to_n, orphan_m_to_n_failures)
+
+    return (
+        not good_failures
+        and bool(swapped_failures)
+        and bool(false_ok_failures)
+        and bool(orphan_ok_failures)
+        and bool(orphan_short_hold_failures)
+        and bool(orphan_m_to_n_failures)
+    )
+
+
+def _assert_deploy_window_iam_hardening(
+    compute_tf_text: str,
+    ac_tf_text: str,
+    ecr_tf_text: str,
+    terraform_tf_texts: dict[str, str],
+    failures: list[str],
+) -> None:
+    """Pin the namespace boundary that makes the deploy-window suppressor trusted."""
+    deploy_namespace = "LayerV/NHP/Deploy"
+    expected_deploy_role_namespaces = {
+        "LayerV/NHP",
+        deploy_namespace,
+        "NHP/BlueGreen",
+    }
+
+    for label, tf_text in (
+        ("server", compute_tf_text),
+        ("AC", ac_tf_text),
+    ):
+        deny_block = _tf_statement_block_by_sid(tf_text, "DenyDeploymentWindowNamespace")
+        if not _check(
+            f"{label} app role explicitly denies deploy-window namespace writes",
+            _tf_statement_effect(deny_block) == "Deny"
+            and _tf_statement_allows_put_metric_data(deny_block)
+            and _tf_namespace_condition_values(deny_block) == {deploy_namespace},
+            f"{label} DenyDeploymentWindowNamespace block must deny PutMetricData to {deploy_namespace}",
+        ):
+            failures.append(
+                f"{label} app role deploy-window namespace explicit deny drifted"
+            )
+
+    deploy_put_metric_block = _tf_statement_block_by_sid(
+        ecr_tf_text,
+        "CloudWatchPutMetricData",
+    )
+    if not _check(
+        "deploy role PutMetricData grant is namespace-scoped",
+        _tf_statement_effect(deploy_put_metric_block) == "Allow"
+        and _tf_statement_allows_put_metric_data(deploy_put_metric_block)
+        and _tf_namespace_condition_values(deploy_put_metric_block)
+        == expected_deploy_role_namespaces,
+        (
+            "terraform_apply_services must be limited to "
+            f"{sorted(expected_deploy_role_namespaces)}"
+        ),
+    ):
+        failures.append("deploy role CloudWatch PutMetricData namespace scope drifted")
+
+    deploy_namespace_grants: list[str] = []
+    unexpected_deploy_namespace_grants: list[str] = []
+    unscoped_grants: list[str] = []
+    for path, tf_text in sorted(terraform_tf_texts.items()):
+        for block in _tf_statement_blocks_with_put_metric_data(tf_text):
+            if _tf_statement_effect(block) != "Allow":
+                continue
+
+            namespace_values = _tf_namespace_condition_values(block)
+            boundary_namespace_values = (
+                _tf_namespace_condition_values_with_resolved_expressions(
+                    path,
+                    block,
+                    terraform_tf_texts,
+                )
+            )
+            sid = _tf_statement_sid(block) or "<no Sid>"
+            label = f"{path} ({sid})"
+            if not namespace_values:
+                unscoped_grants.append(label)
+                continue
+            if deploy_namespace in boundary_namespace_values:
+                if (
+                    sid == "CloudWatchPutMetricData"
+                    and boundary_namespace_values == expected_deploy_role_namespaces
+                ):
+                    deploy_namespace_grants.append(label)
+                else:
+                    unexpected_deploy_namespace_grants.append(label)
+
+    if not _check(
+        "all Terraform PutMetricData allow grants are namespace-scoped",
+        not unscoped_grants,
+        f"unscoped grants: {unscoped_grants}",
+    ):
+        failures.append("Terraform PutMetricData allow grant without namespace condition")
+    if not _check(
+        "only deploy role can write deploy-window namespace",
+        not unexpected_deploy_namespace_grants and len(deploy_namespace_grants) == 1,
+        (
+            f"expected deploy grants: {deploy_namespace_grants}; "
+            f"unexpected LayerV/NHP/Deploy grants: {unexpected_deploy_namespace_grants}"
+        ),
+    ):
+        failures.append("non-deploy role can write deploy-window namespace")
+
+
+def _assert_deploy_window_iam_hardening_self_test() -> bool:
+    deny_fixture = '''
+{
+  Sid      = "DenyDeploymentWindowNamespace"
+  Effect   = "Deny"
+  Action   = ["cloudwatch:PutMetricData"]
+  Resource = "*"
+  Condition = {
+    StringEquals = {
+      "cloudwatch:namespace" = "LayerV/NHP/Deploy"
+    }
+  }
+}
+'''
+    deploy_allow_fixture = '''
+{
+  Sid      = "CloudWatchPutMetricData"
+  Effect   = "Allow"
+  Action   = ["cloudwatch:PutMetricData"]
+  Resource = "*"
+  Condition = {
+    StringEquals = {
+      "cloudwatch:namespace" = [
+        "LayerV/NHP",
+        "LayerV/NHP/Deploy",
+        "NHP/BlueGreen"
+      ]
+    }
+  }
+}
+'''
+    good_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_deploy_window_iam_hardening(
+            deny_fixture,
+            deny_fixture,
+            deploy_allow_fixture,
+            {"terraform/modules/deploy/metrics.tf": deploy_allow_fixture},
+            good_failures,
+        )
+
+    missing_deny_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_deploy_window_iam_hardening(
+            deny_fixture.replace('"LayerV/NHP/Deploy"', '"LayerV/NHP"'),
+            deny_fixture,
+            deploy_allow_fixture,
+            {"terraform/modules/deploy/metrics.tf": deploy_allow_fixture},
+            missing_deny_failures,
+        )
+
+    broadened_allow_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_deploy_window_iam_hardening(
+            deny_fixture,
+            deny_fixture,
+            deploy_allow_fixture.replace(
+                '"NHP/BlueGreen"',
+                '"NHP/BlueGreen",\n        "Unexpected/Namespace"',
+            ),
+            {
+                "terraform/modules/deploy/metrics.tf": deploy_allow_fixture.replace(
+                    '"NHP/BlueGreen"',
+                    '"NHP/BlueGreen",\n        "Unexpected/Namespace"',
+                )
+            },
+            broadened_allow_failures,
+        )
+
+    unscoped_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_deploy_window_iam_hardening(
+            deny_fixture,
+            deny_fixture,
+            deploy_allow_fixture,
+            {
+                "terraform/modules/deploy/metrics.tf": deploy_allow_fixture,
+                "terraform/modules/example/main.tf": '''
+{
+  Sid      = "BroadMetrics"
+  Effect   = "Allow"
+  Action   = ["cloudwatch:PutMetricData"]
+  Resource = "*"
+}
+''',
+            },
+            unscoped_failures,
+        )
+
+    nondeploy_deploy_namespace_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_deploy_window_iam_hardening(
+            deny_fixture,
+            deny_fixture,
+            deploy_allow_fixture,
+            {
+                "terraform/modules/deploy/metrics.tf": deploy_allow_fixture,
+                "terraform/modules/example/main.tf": '''
+{
+  Sid      = "WrongDeployNamespaceWriter"
+  Effect   = "Allow"
+  Action   = ["cloudwatch:PutMetricData"]
+  Resource = "*"
+  Condition = {
+    StringEquals = {
+      "cloudwatch:namespace" = "LayerV/NHP/Deploy"
+    }
+  }
+}
+''',
+            },
+            nondeploy_deploy_namespace_failures,
+        )
+
+    local_expression_deploy_namespace_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_deploy_window_iam_hardening(
+            deny_fixture,
+            deny_fixture,
+            deploy_allow_fixture,
+            {
+                "terraform/modules/deploy/metrics.tf": deploy_allow_fixture,
+                "terraform/modules/example/main.tf": '''
+locals {
+  bad_namespace = "LayerV/NHP/Deploy"
+}
+
+{
+  Sid      = "WrongLocalDeployNamespaceWriter"
+  Effect   = "Allow"
+  Action   = ["cloudwatch:PutMetricData"]
+  Resource = "*"
+  Condition = {
+    StringEquals = {
+      "cloudwatch:namespace" = local.bad_namespace
+    }
+  }
+}
+''',
+            },
+            local_expression_deploy_namespace_failures,
+        )
+
+    variable_expression_deploy_namespace_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_deploy_window_iam_hardening(
+            deny_fixture,
+            deny_fixture,
+            deploy_allow_fixture,
+            {
+                "terraform/modules/deploy/metrics.tf": deploy_allow_fixture,
+                "terraform/modules/example/main.tf": '''
+{
+  Sid      = "WrongVariableDeployNamespaceWriter"
+  Effect   = "Allow"
+  Action   = ["cloudwatch:PutMetricData"]
+  Resource = "*"
+  Condition = {
+    StringEquals = {
+      "cloudwatch:namespace" = var.metrics_namespace
+    }
+  }
+}
+''',
+                "terraform/modules/example/variables.tf": '''
+variable "metrics_namespace" {
+  type    = string
+  default = "LayerV/NHP/Deploy"
+}
+''',
+            },
+            variable_expression_deploy_namespace_failures,
+        )
+
+    duplicate_deploy_grant_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_deploy_window_iam_hardening(
+            deny_fixture,
+            deny_fixture,
+            deploy_allow_fixture,
+            {
+                "terraform/modules/deploy/metrics.tf": deploy_allow_fixture,
+                "terraform/modules/example/main.tf": deploy_allow_fixture,
+            },
+            duplicate_deploy_grant_failures,
+        )
+
+    return (
+        not good_failures
+        and bool(missing_deny_failures)
+        and bool(broadened_allow_failures)
+        and bool(unscoped_failures)
+        and bool(nondeploy_deploy_namespace_failures)
+        and bool(local_expression_deploy_namespace_failures)
+        and bool(variable_expression_deploy_namespace_failures)
+        and bool(duplicate_deploy_grant_failures)
+    )
 
 # Gate matchers — anchored regexes, NOT plain substrings. The naïve
 # `"inputs.run_terraform && success" in gate` test passes false-positively
@@ -4391,11 +4915,25 @@ def main() -> int:
         "the alarm-rule guard accepted a swapped page/suppressed fixture",
     ):
         return 1
+    if not _check(
+        "self-test: deploy-window IAM hardening guard rejects bad scope",
+        _assert_deploy_window_iam_hardening_self_test(),
+        "the IAM hardening guard accepted a missing deny or broadened deploy role grant",
+    ):
+        return 1
 
     wf = yaml.safe_load(WORKFLOW.read_text())
     build_and_push_wf = yaml.safe_load(BUILD_AND_PUSH_WORKFLOW.read_text())
     build_lambda_action = yaml.safe_load(BUILD_LAMBDA_PACKAGES_ACTION.read_text())
     monitoring_tf_text = MONITORING_TF.read_text()
+    compute_tf_text = COMPUTE_TF.read_text()
+    ac_tf_text = AC_TF.read_text()
+    ecr_tf_text = ECR_TF.read_text()
+    terraform_tf_texts = {
+        path.relative_to(REPO_ROOT).as_posix(): path.read_text()
+        for path in sorted((REPO_ROOT / "terraform").rglob("*.tf"))
+        if ".terraform" not in path.parts
+    }
     jobs = wf.get("jobs", {})
     build_and_push_jobs = build_and_push_wf.get("jobs", {})
     failures: list[str] = []
@@ -4439,6 +4977,13 @@ def main() -> int:
         fn(build_lambda_action, failures)
 
     _assert_revocation_ageout_alarm_rules(monitoring_tf_text, failures)
+    _assert_deploy_window_iam_hardening(
+        compute_tf_text,
+        ac_tf_text,
+        ecr_tf_text,
+        terraform_tf_texts,
+        failures,
+    )
 
     if failures:
         print()

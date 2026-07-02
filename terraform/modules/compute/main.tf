@@ -681,6 +681,19 @@ resource "aws_iam_role_policy" "server" {
         Action   = ["ec2:DescribeTags"]
         Resource = "*"
       },
+      {
+        Sid      = "DenyDeploymentWindowNamespace"
+        Effect   = "Deny"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        # Defense-in-depth: keep app instances out of the deploy-only
+        # suppressor namespace even if a future allow broadens.
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "LayerV/NHP/Deploy"
+          }
+        }
+      },
       # CloudWatch Agent + application metrics (mem, disk, NHP custom metrics)
       {
         Effect   = "Allow"

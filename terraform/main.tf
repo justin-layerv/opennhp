@@ -4652,6 +4652,11 @@ resource "aws_iam_role_policy" "cloudfront_cidr_drift" {
         Effect   = "Allow"
         Action   = ["cloudwatch:PutMetricData"]
         Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "LayerV/NHP"
+          }
+        }
       }
     ]
   })

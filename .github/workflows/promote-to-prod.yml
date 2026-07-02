@@ -3894,6 +3894,7 @@ jobs:
           # failure demotes status to "failed" so the metric reflects
           # the workflow's actual outcome.
           DEPLOY_STATUS: ${{ steps.final_status.outputs.value }}
+          CELL_ID: ${{ inputs.cell_id }}
         run: |
           # put-metric-data --dimensions uses Key=Value shorthand. Today
           # $DEPLOY_STATUS is constrained to success/failed; if a future
@@ -3906,6 +3907,13 @@ jobs:
             --value 1 \
             --unit Count \
             || echo "::warning::Failed to push deployment metric"
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "DeploymentEvent" \
+            --dimensions "Environment=prod,Cell=$CELL_ID" \
+            --value 1 \
+            --unit Count \
+            || echo "::warning::Failed to push cell-scoped deployment metric"
           echo "  Deployment metric pushed: Status=$DEPLOY_STATUS"
 
       - name: Send SNS notification

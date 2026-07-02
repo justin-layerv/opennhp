@@ -1031,8 +1031,9 @@ Delivery requirements:
     exists, retry keeps pending entries through disconnect and ages them out.
     Production paging is tuned around the known deploy overlap instead: the raw
     `revocation-aged-out` alarm remains `Sum >= 1`, deploy workflows emit and
-    refresh a short-lived `{Environment, Cell}` `DeploymentWindow` metric while
-    long ASG/canary polls are still active, and
+    refresh a short-lived `{Environment, Cell}` `DeploymentWindow` metric in
+    the deploy-only `LayerV/NHP/Deploy` namespace while long ASG/canary polls
+    are still active, and
     `revocation-aged-out-page` pages only when the raw detector is ALARM outside
     the roughly 10-minute window after the latest deploy heartbeat. During the
     window the raw alarm remains visible for audit; outside it, a single
@@ -1044,12 +1045,14 @@ Delivery requirements:
     `RevocationAgedOut` metric and no-action alarm remain visible throughout
     for dashboards, audits, and incident review; the no-action
     `revocation-aged-out-suppressed` composite is an explicit breadcrumb for
-    the `raw ALARM && deploy-window ALARM` case. The suppressor is trust-on-emit
-    in the shared `LayerV/NHP` namespace: any principal with
-    `cloudwatch:PutMetricData` for that namespace, including server instances
-    that publish the raw signal, can emit `DeploymentWindow`; follow-up
-    hardening is tracked in
-    [#2974](https://github.com/layervai/nhp/issues/2974).
+    the `raw ALARM && deploy-window ALARM` case. Issue #2974 hardens the
+    suppressor by moving it out of the shared app namespace: server/AC app
+    metric roles are explicitly denied from `LayerV/NHP/Deploy`, deploy
+    automation emits a paired `DeploymentWindowRun` marker, and
+    `revocation-deploy-window-without-run` pages on unpaired or legacy
+    suppressor writes that omit that run marker. The IAM namespace boundary is
+    the primary control that prevents non-deploy principals from writing paired
+    suppressor metrics.
   - The retry engine is explicitly armed by Terraform-managed server fleets via
     `NHP_REVOCATION_RETRY_ENABLED=true`; changing or disabling it should be
     treated as a security-relevant rollback because it returns server→AC

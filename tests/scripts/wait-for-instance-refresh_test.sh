@@ -101,11 +101,14 @@ fi
 
 case "$1 $2" in
   "cloudwatch put-metric-data")
-    count_file="$STATE_DIR/deployment-window-count"
-    count=0
-    [[ -f "$count_file" ]] && count=$(cat "$count_file")
-    count=$((count + 1))
-    printf '%s' "$count" > "$count_file"
+    METRIC_NAME=$(arg_after --metric-name "$@" || true)
+    if [[ "$METRIC_NAME" == "DeploymentWindow" || "$*" == *"MetricName=DeploymentWindow,"* ]]; then
+      count_file="$STATE_DIR/deployment-window-count"
+      count=0
+      [[ -f "$count_file" ]] && count=$(cat "$count_file")
+      count=$((count + 1))
+      printf '%s' "$count" > "$count_file"
+    fi
     printf '%s\n' "$*" >> "$STATE_DIR/deployment-window-log"
     ;;
 
@@ -338,6 +341,17 @@ assert_file_equals() {
   fi
 }
 
+assert_file_contains() {
+  local label="$1" path="$2" needle="$3"
+  local got=""
+  [[ -f "$path" ]] && got=$(cat "$path")
+  if [[ "$got" == *"$needle"* ]]; then
+    report_pass "$label"
+  else
+    report_fail "$label" "file did not contain '$needle'; file: $got"
+  fi
+}
+
 assert_file_first_line_equals() {
   local label="$1" path="$2" want="$3"
   local got=""
@@ -375,7 +389,8 @@ run_source_case deployment-window-heartbeat \
   DEPLOYMENT_WINDOW_STRATEGY=promote \
   DEPLOYMENT_WINDOW_EMIT_INTERVAL_SECONDS=60
 assert_rc "sourceable helper with deployment-window heartbeat succeeds" 0
-assert_contains "deployment-window heartbeat logs metric push" "DeploymentWindow metric pushed (Environment=prod Cell=cell0 Component=server Strategy=promote)"
+assert_contains "deployment-window heartbeat logs metric push" "DeploymentWindow/DeploymentWindowRun metrics pushed (Environment=prod Cell=cell0 Component=server Strategy=promote)"
+assert_file_contains "deployment-window heartbeat emits run marker" "$LAST_STATE_DIR/deployment-window-log" "MetricName=DeploymentWindowRun,"
 assert_file_equals "deployment-window heartbeat emits during each long poll interval" "$LAST_STATE_DIR/deployment-window-count" "2"
 
 run_source_case deployment-window-date-failure \

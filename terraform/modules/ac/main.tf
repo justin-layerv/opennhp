@@ -710,6 +710,19 @@ resource "aws_iam_role_policy" "ac" {
           ]
           Resource = "${aws_cloudwatch_log_group.ac.arn}:*"
         },
+        {
+          Sid      = "DenyDeploymentWindowNamespace"
+          Effect   = "Deny"
+          Action   = ["cloudwatch:PutMetricData"]
+          Resource = "*"
+          # Defense-in-depth: keep app instances out of the deploy-only
+          # suppressor namespace even if a future allow broadens.
+          Condition = {
+            StringEquals = {
+              "cloudwatch:namespace" = "LayerV/NHP/Deploy"
+            }
+          }
+        },
         # CloudWatch Metrics (disk monitor script + Go app metrics, all use LayerV/NHP)
         {
           Sid      = "CloudWatchMetrics"

@@ -26,6 +26,8 @@ locals {
   # stay on one convention without drifting into ad-hoc interpolations.
   metric_name_suffix = "${var.environment}-${var.cell_id}"
 
+  deploy_metric_namespace = "LayerV/NHP/Deploy"
+
   # Evaluation window for the server_instance_restart alarm's period
   # attribute. Sized to fit a single blue/green deploy (~3 min) with
   # margin, so a clean deploy produces one bucket of startup events
@@ -1538,7 +1540,7 @@ resource "aws_cloudwatch_metric_alarm" "revocation_delivery_latency_high" {
   })
 }
 
-# Deployment window suppressor for revocation age-out paging (#2868).
+# Deployment window suppressor for revocation age-out paging (#2868/#2974).
 #
 # The raw RevocationAgedOut detector below stays threshold=1 because a single
 # non-deploy age-out is still a real immediate-revocation proof failure. Routine
@@ -1547,6 +1549,8 @@ resource "aws_cloudwatch_metric_alarm" "revocation_delivery_latency_high" {
 # long ASG/canary polls are still active, this no-action alarm stays ALARM when
 # at least one datapoint appears in the recent roughly 10-minute deploy window,
 # and the composite pager below requires raw age-out AND NOT deployment-window.
+# DeploymentWindow lives in LayerV/NHP/Deploy, not the shared app namespace, so
+# ordinary app-metric publishers cannot silently suppress revocation pages.
 # The 60s period bounds alarm arming latency near the NLB switch/decommission
 # edge while the heartbeat keeps long refreshes covered. The 10-minute hold
 # after the latest heartbeat bounds the non-paging shadow for a genuine one-shot
@@ -1561,17 +1565,80 @@ resource "aws_cloudwatch_metric_alarm" "revocation_deploy_window" {
   evaluation_periods  = 10
   datapoints_to_alarm = 1
   metric_name         = "DeploymentWindow"
-  namespace           = "LayerV/NHP"
+  namespace           = local.deploy_metric_namespace
   period              = 60
   statistic           = "Sum"
   threshold           = 1
-  alarm_description   = "Recent deploy-window suppressor for qURL v2 RevocationAgedOut paging (#2868). No actions: used only by the revocation-aged-out-page composite so routine server/AC rollouts do not auto-page while the raw detector remains threshold=1."
+  alarm_description   = "Recent deploy-window suppressor for qURL v2 RevocationAgedOut paging (#2868/#2974). No actions: used only by the revocation-aged-out-page composite; emitted from ${local.deploy_metric_namespace} so ordinary app metric publishers cannot suppress revocation pages."
   treat_missing_data  = "notBreaching"
 
   dimensions = {
     Environment = var.environment
     Cell        = var.cell_id
   }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Pages when a DeploymentWindow datapoint exists without its paired
+# DeploymentWindowRun marker in the deploy-only namespace. That should only
+# happen on manual/rogue metric writes or a deploy-helper regression; either
+# case means the suppressor is active without the run signal operators rely on.
+resource "aws_cloudwatch_metric_alarm" "revocation_deploy_window_without_run" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-revocation-deploy-window-without-run"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 10
+  datapoints_to_alarm = 1
+  threshold           = 1
+  alarm_description   = "Pages when qURL v2 DeploymentWindow is active without a paired DeploymentWindowRun marker in ${local.deploy_metric_namespace} (#2974). Treat as an unpaired/legacy suppressor write, manual metric injection, or a deploy-helper regression."
+  treat_missing_data  = "notBreaching"
+
+  # Legitimate deploy helpers emit both metrics atomically into the same
+  # 60-second bucket, so this watchdog uses one breaching datapoint across the
+  # same ten-period window as the paired suppressor. FILL follows the local
+  # sparse-metric alarm convention by explicitly substituting 0 when the run
+  # marker is missing at a window timestamp. The rollout ledger treats the
+  # whole-series-empty orphan case as a blocking live-validation gate before
+  # operators rely on this secondary tripwire.
+  metric_query {
+    id          = "orphaned"
+    expression  = "IF((FILL(window, 0) - FILL(run, 0)) > 0, 1, 0)"
+    label       = "DeploymentWindow without run marker"
+    return_data = true
+  }
+
+  metric_query {
+    id = "window"
+    metric {
+      metric_name = "DeploymentWindow"
+      namespace   = local.deploy_metric_namespace
+      period      = 60
+      stat        = "Sum"
+      dimensions = {
+        Environment = var.environment
+        Cell        = var.cell_id
+      }
+    }
+  }
+
+  metric_query {
+    id = "run"
+    metric {
+      metric_name = "DeploymentWindowRun"
+      namespace   = local.deploy_metric_namespace
+      period      = 60
+      stat        = "Sum"
+      dimensions = {
+        Environment = var.environment
+        Cell        = var.cell_id
+      }
+    }
+  }
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
 
   tags = merge(var.tags, {
     Component = "monitoring"

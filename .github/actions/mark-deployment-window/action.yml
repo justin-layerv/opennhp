@@ -1,5 +1,5 @@
 name: 'Mark Deployment Window'
-description: 'Emit a qURL v2 DeploymentWindow metric for revocation age-out paging suppression.'
+description: 'Emit qURL v2 deploy-window metrics for revocation age-out paging suppression.'
 
 inputs:
   environment:

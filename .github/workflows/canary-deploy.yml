@@ -399,6 +399,7 @@ jobs:
         if: steps.poll-execution.outputs.status == 'SUCCEEDED'
         env:
           ENVIRONMENT: ${{ inputs.environment }}
+          CELL_ID: ${{ inputs.cell_id }}
           COMPONENT: ${{ inputs.component }}
         run: |
           aws cloudwatch put-metric-data \
@@ -406,7 +407,15 @@ jobs:
             --metric-name "DeploymentEvent" \
             --dimensions "Environment=$ENVIRONMENT,Component=$COMPONENT,Strategy=canary" \
             --value 1 \
-            --unit Count
+            --unit Count \
+            || echo "::warning::Failed to push deployment metric"
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "DeploymentEvent" \
+            --dimensions "Environment=$ENVIRONMENT,Cell=$CELL_ID" \
+            --value 1 \
+            --unit Count \
+            || echo "::warning::Failed to push cell-scoped deployment metric"
           echo "Deployment event pushed to LayerV/NHP namespace"
 
   # =============================================================================

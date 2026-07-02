@@ -6,6 +6,8 @@
 # Component and strategy are log-only breadcrumbs. Do not add them as dimensions:
 # the CloudWatch alarm must remain keyed only by {Environment, Cell}.
 
+readonly DEPLOYMENT_WINDOW_METRIC_NAMESPACE="LayerV/NHP/Deploy"
+
 emit_deployment_window_metric() {
   local environment="${1:?Usage: emit_deployment_window_metric <environment> <cell-id> <component> <strategy>}"
   local cell_id="${2:?Usage: emit_deployment_window_metric <environment> <cell-id> <component> <strategy>}"
@@ -15,21 +17,22 @@ emit_deployment_window_metric() {
   DEPLOYMENT_WINDOW_LAST_PUT_SUCCEEDED=0
   export DEPLOYMENT_WINDOW_LAST_PUT_SUCCEEDED
 
+  # Re-emit DeploymentWindowRun on every heartbeat so each 60s bucket is
+  # self-pairing; the orphan watchdog only trips when the companion is absent.
   if ! aws cloudwatch put-metric-data \
     --cli-connect-timeout 5 \
     --cli-read-timeout 10 \
-    --namespace "LayerV/NHP" \
-    --metric-name "DeploymentWindow" \
-    --dimensions "Environment=${environment},Cell=${cell_id}" \
-    --value 1 \
-    --unit Count; then
-    echo "::warning::Failed to push DeploymentWindow metric (Environment=$environment Cell=$cell_id Component=$component Strategy=$strategy); continuing"
+    --namespace "$DEPLOYMENT_WINDOW_METRIC_NAMESPACE" \
+    --metric-data \
+    "MetricName=DeploymentWindow,Dimensions=[{Name=Environment,Value=${environment}},{Name=Cell,Value=${cell_id}}],Value=1,Unit=Count" \
+    "MetricName=DeploymentWindowRun,Dimensions=[{Name=Environment,Value=${environment}},{Name=Cell,Value=${cell_id}}],Value=1,Unit=Count"; then
+    echo "::warning::Failed to push DeploymentWindow/DeploymentWindowRun metrics (Environment=$environment Cell=$cell_id Component=$component Strategy=$strategy); continuing"
     return 0
   fi
 
   DEPLOYMENT_WINDOW_LAST_PUT_SUCCEEDED=1
   export DEPLOYMENT_WINDOW_LAST_PUT_SUCCEEDED
-  echo "DeploymentWindow metric pushed (Environment=$environment Cell=$cell_id Component=$component Strategy=$strategy)"
+  echo "DeploymentWindow/DeploymentWindowRun metrics pushed (Environment=$environment Cell=$cell_id Component=$component Strategy=$strategy)"
 }
 
 emit_deployment_window_metric_throttled() {

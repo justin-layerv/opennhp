@@ -156,6 +156,11 @@ resource "aws_iam_role_policy" "secret_reconciliation_metrics" {
         Effect   = "Allow"
         Action   = ["cloudwatch:PutMetricData"]
         Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "LayerV/NHP"
+          }
+        }
       }
     ]
   })

@@ -1,6 +1,8 @@
 # Observability: CloudWatch Metrics
 
-All NHP components publish metrics to the **`LayerV/NHP`** CloudWatch namespace.
+NHP components publish application metrics to the **`LayerV/NHP`** CloudWatch
+namespace. Deploy automation publishes revocation deploy-window suppressor
+metrics to the deploy-only **`LayerV/NHP/Deploy`** namespace.
 
 ## Shared Dimensions
 
@@ -109,10 +111,17 @@ CloudWatch charges per unique metric time series (unique combination of namespac
 
 ## IAM Permissions
 
-Both server and AC IAM roles need `cloudwatch:PutMetricData` for the `LayerV/NHP` namespace. This is configured in:
+Both server and AC IAM roles need `cloudwatch:PutMetricData` for the
+`LayerV/NHP` namespace and explicitly deny `LayerV/NHP/Deploy` so ordinary app
+metric publishers cannot suppress qURL revocation age-out paging. This is
+configured in:
 
 - Server: `terraform/modules/compute/main.tf` (`cloudwatch_metrics` IAM policy)
 - AC: `terraform/modules/ac/main.tf` (`cloudwatch_metrics` IAM policy)
+
+Deploy workflows use the GitHub Actions Terraform apply role, whose
+`cloudwatch:PutMetricData` grant is namespace-scoped to the app, deploy-window,
+and blue/green deployment-count namespaces in `terraform/modules/ecr/main.tf`.
 
 ## Existing Alarms
 

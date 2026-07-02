@@ -2156,7 +2156,6 @@ resource "aws_iam_policy" "terraform_apply_services" {
           # `PutCompositeAlarm AccessDenied` once a change forced the alarm to
           # update. DeleteAlarms below already covers composite-alarm teardown.
           "cloudwatch:PutCompositeAlarm",
-          "cloudwatch:PutMetricData",
           "cloudwatch:DeleteAlarms",
           "cloudwatch:PutDashboard",
           "cloudwatch:DeleteDashboards",
@@ -2164,6 +2163,21 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "cloudwatch:UntagResource"
         ]
         Resource = "*"
+      },
+      {
+        Sid      = "CloudWatchPutMetricData"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = [
+              "LayerV/NHP",
+              "LayerV/NHP/Deploy",
+              "NHP/BlueGreen"
+            ]
+          }
+        }
       },
       {
         Sid    = "SNSChatbot"
