@@ -603,22 +603,24 @@ qurl_config = {
 }
 
 # ==================== qURL v2 (keyed identity) — sandbox ====================
-# This PR provisions the sandbox issuer signing key (ECDSA P-256) and stages all
-# v2 wiring. Minting + admission stay OFF: qurl-api boots with the issuer config
-# validated but unused (createQurl still mints v1) and the NHP server's trust
-# store stays "{}". To turn v2 ON end-to-end (only AFTER qurl-service PR #1088 —
-# the admission-service wiring — is merged and deployed to sandbox) flip the three
-# flags below to true IN ONE APPLY. They must move together: issuance requires
-# issuer-key + resource-keys, and the NHP-server trust store is only computed when
-# admission_enabled = true, so a partial flip either fails qurl-api's boot
-# validation or mints links no knock can admit.
-#   qurl_v2_resource_keys_enabled = true
-#   qurl_v2_issuance_enabled      = true
-#   qurl_v2_admission_enabled     = true
+# Enable is sequenced across TWO applies to avoid a dead-link window: qurl-api's
+# ECS deploy converges in minutes while the NHP-server blue/green takes ~20+ min,
+# so flipping issuance and admission together would let qurl-api mint v2 links the
+# server can't yet admit (short-lived bootstrap links expire before the fleet
+# catches up). Full rollout checklist + prod sequence:
+# docs/runbooks/prod-rollout-ledger/2026-07-01-qurl-v2-issuer-infra.md
+#   Apply 1 (this state): admission + resource_keys ON, issuance OFF — the fleet
+#                         becomes ready to admit and new resources get their KMS key,
+#                         while qurl-api still mints v1 (no dead-link window).
+#   Apply 2 (next PR):    issuance ON — qurl-api mints v2; the fleet already admits.
+#
+# resource_keys=true depends on the exhaustive CMK-deny in #2990, risk-accepted for
+# sandbox. Preconditions (terraform_data.qurl_v2_flag_invariants) enforce the shape:
+# issuance ⇒ issuer_key + resource_keys + admission; admission ⇒ issuer_key + kid.
 qurl_v2_issuer_key_enabled    = true
-qurl_v2_resource_keys_enabled = false
+qurl_v2_resource_keys_enabled = true
 qurl_v2_issuance_enabled      = false
-qurl_v2_admission_enabled     = false
+qurl_v2_admission_enabled     = true
 qurl_v2_issuer_kid            = "qurl-issuer-sandbox-2026-07"
 qurl_v2_relay_url             = "https://relay.qurl.link.layerv.xyz"
 qurl_v2_relay_allowlist       = "relay.qurl.link.layerv.xyz"
