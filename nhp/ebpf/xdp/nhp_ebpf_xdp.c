@@ -227,7 +227,14 @@ struct port_list_value {
 struct protocol_port_value {
     __u8 allowed;
     __u64 expire_time;
-} __attribute__((packed));
+} __attribute__((packed));    // = 9 bytes (packed, unlike the aligned siblings)
+// Fail loud if this ever drifts: the userspace writer (ppValueBytes in
+// nhp/utils/ebpf/ebpf.go) emits exactly 9 packed bytes to match. If `__packed`
+// is dropped here (→ 16 bytes) without updating that writer in lockstep, the
+// Go Map.Update silently fails and the map stops populating (the #3025/#3027
+// outage). _Static_assert is compile-time only — it adds no bytes to the object.
+_Static_assert(sizeof(struct protocol_port_value) == 9,
+               "protocol_port_value must be exactly 9 bytes (packed)");
 
 // Allow-rule map (src+dst+port+proto). AUTHORITATIVE admission decision:
 // presence of an entry here IS the kernel's "this flow is admitted" answer

@@ -124,12 +124,13 @@ const (
 //
 //	struct protocol_port_value { __u8 allowed; __u64 expire_time; } __packed;
 //
-// so it is 9 bytes with expire_time at offset 1 (NO 7-byte alignment pad). The
-// Go protocolPortValue struct, by contrast, natural-aligns to 16 bytes
+// so it is 9 bytes with expire_time at offset 1 (NO 7-byte alignment pad). A
+// Go value struct with those fields, by contrast, natural-aligns to 16 bytes
 // (WhitelistValueSize), so seedWhitelistValue would (correctly) Fatal on the
-// size mismatch if pointed at this map. This seeder writes the PACKED layout the
-// kernel reads: allowed=1 at byte 0, expire_time=never (1<<62) little-endian at
-// byte 1.
+// size mismatch if pointed at this map — which is exactly why the userspace
+// writer emits packed bytes (ppValueBytes / ToPpValueBytes) rather than a
+// struct. This seeder writes the PACKED layout the kernel reads: allowed=1 at
+// byte 0, expire_time=never (1<<62) little-endian at byte 1.
 //
 // expire_time uses the same 1<<62 never-expire sentinel as seedConnValue /
 // seedWhitelistValue: the kernel checks `val->expire_time < bpf_ktime_get_ns()`
@@ -154,6 +155,9 @@ func seedProtocolPortValue(t *testing.T, valueSize uint32) []byte {
 	}
 	buf := make([]byte, valueSize)
 	buf[0] = 1 // allowed = 1
+	// LittleEndian here == NativeEndian on the LE XDP/CI hosts; the userspace
+	// writer (ppValueBytes) spells the same layout as NativeEndian. Same bytes,
+	// don't "reconcile" them to one spelling — each is deliberate in context.
 	binary.LittleEndian.PutUint64(buf[packedExpireOff:packedExpireOff+8], uint64(1)<<62)
 	return buf
 }

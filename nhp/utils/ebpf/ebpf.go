@@ -493,12 +493,6 @@ type whitelistValue struct {
 	ExpireTime uint64
 }
 
-type protocolPortValue struct {
-	Allowed    uint8
-	_          [7]byte
-	ExpireTime uint64
-}
-
 const (
 	MapTypeWhitelist     = 1
 	MapTypeSdWhitelist   = 2
@@ -688,12 +682,36 @@ func (r *procoPortKey) ToPpKey() []byte {
 	return keyBytes
 }
 
-func (r *procoPortKey) ToPpValue(ttlSec uint64) protocolPortValue {
+// ppValueBytes builds the 9 packed bytes of a `protocol_port` map value:
+// byte 0 = allowed(1), bytes 1..8 = expire_time. Split from ToPpValueBytes so
+// the byte layout is unit-testable with a fixed expire_time (the clock isn't).
+// See ToPpValueBytes for why this map's value is bytes, not a struct.
+func ppValueBytes(expireTime uint64) []byte {
+	b := make([]byte, 9)
+	b[0] = 1 // allowed
+	// Native-endian to match the packed C struct's in-memory image on the
+	// little-endian XDP hosts, consistent with the whitelistValue POD path.
+	binary.NativeEndian.PutUint64(b[1:9], expireTime)
+	return b
+}
+
+// ToPpValueBytes serializes the `protocol_port` allow-rule VALUE into the 9
+// packed bytes the kernel map expects. Unlike every sibling value struct
+// (whitelist_value, port_list_value, …), `struct protocol_port_value` in
+// nhp/ebpf/xdp/nhp_ebpf_xdp.c is `__attribute__((packed))` — {__u8 allowed;
+// __u64 expire_time;} with NO alignment pad = 9 bytes, not the 16 the aligned
+// siblings occupy. A Go struct can't reproduce a 9-byte memory image (the
+// compiler aligns the u64 to offset 8, forcing 16), and cilium/ebpf marshals
+// value structs by raw POD image — so a struct value fails Map.Update with
+// "*ebpf.protocolPortValue doesn't marshal to 9 bytes" and the write silently
+// never lands (which is why protocol_port stayed empty and every mapType-6
+// admission — the LB health port and the per-knock temp-port rule — vanished).
+// Emit the bytes explicitly, exactly as the key path (ToPpKey) already does.
+// COUPLED to the C struct: if that `__packed` is ever removed and the object
+// regenerated, this must become the 16-byte layout in lockstep.
+func (r *procoPortKey) ToPpValueBytes(ttlSec uint64) []byte {
 	now, _ := getBootTimeNanos()
-	return protocolPortValue{
-		Allowed:    1,
-		ExpireTime: now + ttlSec*1_000_000_000,
-	}
+	return ppValueBytes(now + ttlSec*1_000_000_000)
 }
 
 // ToPlKey serializes the `port_list` allow-rule key into the 8 packed bytes
@@ -821,10 +839,13 @@ func AddSdPortlistRule(whitelistMap *ebpf.Map, rule *portListKey, ttlSec uint64)
 // function for update protocol_port map
 func AddPpWhitelistRule(whitelistMap *ebpf.Map, rule *procoPortKey, ttlSec uint64) error {
 	keyBytes := rule.ToPpKey()
-	value := rule.ToPpValue(ttlSec)
+	// Value is a 9-byte packed slice, NOT a struct — see ToPpValueBytes for
+	// why (the C protocol_port_value is __packed = 9 bytes; a struct value
+	// marshals to 16 and Map.Update rejects it).
+	valueBytes := rule.ToPpValueBytes(ttlSec)
 
-	if err := whitelistMap.Update(keyBytes, &value, ebpf.UpdateAny); err != nil {
-		log.Error("failed to update sdwhitelist map: %v", err)
+	if err := whitelistMap.Update(keyBytes, valueBytes, ebpf.UpdateAny); err != nil {
+		log.Error("failed to update protocol_port map: %v", err)
 		return err
 	}
 	return nil
@@ -847,9 +868,11 @@ func AddSrcipDestPortRule(whitelistMap *ebpf.Map, rule *srcIPdstPortKey, ttlSec 
 //
 // One-for-one mirror of the v4 Add* writers above. Each builds the packed v6
 // key via the s2 To*KeyV6 serializer and writes it to the supplied v6 map. The
-// value bytes are family-agnostic: whitelistValue / protocolPortValue carry only
+// value bytes are family-agnostic: whitelistValue carries only
 // {allowed, expire_time} and no address, so the v4 To*Value constructors apply
-// unchanged here (their receiver fields are unused — see ToWlValue).
+// unchanged here (their receiver fields are unused — see ToWlValue). Note
+// protocol_port has no v6 map (it is address-less and shared), so its packed
+// ToPpValueBytes writer is not part of this v6 mirror.
 //
 // FAIL-CLOSED CONTRACT: like the v4 writers, these return the RAW *ebpf.Map
 // Update error unwrapped. That is load-bearing — the admission path wraps
