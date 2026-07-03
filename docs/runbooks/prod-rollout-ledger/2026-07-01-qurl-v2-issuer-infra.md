@@ -23,6 +23,13 @@ nothing (all default off).
 - [ ] **Pre-rollout (HARD, before the enable flip):** qurl-service PR #1088 merged
   and deployed to sandbox (the `/internal/v2/qurl/admissions/*` routes must be
   mounted — they 404 without it, and every qv2 knock would deny at `prepare`).
+- [ ] **Pre-rollout (HARD, before `qurl_v2_resource_keys_enabled=true` in ANY env):**
+  qurl-service PR #1094 (KMS lockout-check bypass) merged and deployed. Without it,
+  the first per-resource `kms:CreateKey` fails with `MalformedPolicyDocumentException`
+  (the tag-scoped qurl-api role can't pass the lockout check at create-time), and
+  `createQurl` treats that as fatal — so **every** `POST /v1/qurls` 500s the moment
+  resource-keys is enabled. Discovered the hard way in sandbox during Apply 1; prod
+  must not repeat it. Confirm the deployed qurl-api image includes #1094 before flipping.
 - [ ] **Rollout (the enable, coordinated, sandbox) — prefer a TWO-apply sequence to
   avoid a cross-fleet race:**
   - **Apply 1:** `qurl_v2_admission_enabled` + `qurl_v2_resource_keys_enabled` (+
