@@ -140,9 +140,19 @@ func authWithNHPClaims(req *common.NhpAuthRequest, helper *plugins.NhpServerPlug
 	// request context); the fall-through prepare/commit each get a fresh one too.
 	requestID := uuid.NewString()
 
+	// qurl-service's qv2 admission endpoints decode AuthenticatedQurlPublicKeyB64
+	// as UNPADDED base64url (RawURLEncoding), per the qURL v2 contract that every
+	// key field is base64url, never standard base64 (QURL_V2_KEYED_IDENTITY.md).
+	// req.PublicKey is STANDARD base64 (nhp/core PublicKeyBase64 — padded, +/
+	// alphabet), which that decoder rejects with HTTP 400, turning every qv2 knock
+	// into ErrKnockApiRequestFailed. Send claims.QurlUserPublicKeyB64 instead: PoP
+	// (check 4 above) proved it equals req.PublicKey, and it is already the same key
+	// in the canonical base64url encoding the admission API expects.
+	authedQurlUserKeyB64 := claims.QurlUserPublicKeyB64
+
 	authzCtx, authzDone := context.WithTimeout(context.Background(), qurlAuthorizeTimeout)
 	authzResp, authzErr := resolver.AuthorizeAdmission(authzCtx, &AdmissionAuthorizeRequest{
-		AuthenticatedQurlPublicKeyB64: req.PublicKey,
+		AuthenticatedQurlPublicKeyB64: authedQurlUserKeyB64,
 		ClientIP:                      clientIP,
 		// VisitorSessionID and ACID are intentionally empty: the browser knock path
 		// has no visitor-session id to present (authorize falls back to ClientIP
@@ -183,7 +193,7 @@ func authWithNHPClaims(req *common.NhpAuthRequest, helper *plugins.NhpServerPlug
 	prepResp, prepErr := resolver.PrepareAdmission(prepCtx, &AdmissionPrepareRequest{
 		QurlClaimsB64:                 claimsB64,
 		QurlIssuerSigB64:              sigB64,
-		AuthenticatedQurlPublicKeyB64: req.PublicKey,
+		AuthenticatedQurlPublicKeyB64: authedQurlUserKeyB64,
 		SrcIP:                         clientIP,
 		// Reuse the qv1 bootstrap user-agent extractor (same UserData key + length
 		// cap) so attribution is consistent across the two qURL flows.

@@ -152,6 +152,11 @@ type admissionRecorder struct {
 	calls  []string
 	server *httptest.Server
 
+	// authorizeReq captures the decoded /authorize request body so a test can
+	// assert the wire shape on the re-knock/refresh path (where prepare is never
+	// called and PrepareRequestShape therefore covers nothing).
+	authorizeReq map[string]any
+
 	// configurable behavior
 	authorizeStatus int
 	authorizeBody   string
@@ -216,11 +221,22 @@ func (rec *admissionRecorder) callOrder() []string {
 	return out
 }
 
+// authorizeRequest returns the decoded /authorize request body captured by the
+// handler (nil if authorize was never called).
+func (rec *admissionRecorder) authorizeRequest() map[string]any {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return rec.authorizeReq
+}
+
 func (rec *admissionRecorder) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == admissionAuthorizePath:
 			rec.record("authorize")
+			rec.mu.Lock()
+			_ = json.NewDecoder(r.Body).Decode(&rec.authorizeReq)
+			rec.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(rec.authorizeStatus)
 			_, _ = w.Write([]byte(rec.authorizeBody))
@@ -277,6 +293,7 @@ type v2Fixture struct {
 	sigB64       string
 	cellStdB64   string
 	agentStdB64  string
+	agentURLB64  string
 	resourceB64  string
 	req          *common.NhpAuthRequest
 	openedCalled *bool
@@ -331,6 +348,7 @@ func newV2Fixture(t *testing.T, mutate func(claims map[string]any)) *v2Fixture {
 		sigB64:       sigB64,
 		cellStdB64:   cellStd,
 		agentStdB64:  agentStd,
+		agentURLB64:  agentURL,
 		resourceB64:  resB64,
 		req:          req,
 		openedCalled: &opened,
@@ -597,6 +615,51 @@ func TestAuthWithNHPClaims_ConsumedReKnock_AuthorizeRefreshes_SessionSurvives(t 
 	order := rec.callOrder()
 	if len(order) != 1 || order[0] != "authorize" {
 		t.Fatalf("call order = %v, want [authorize] only (a consumed re-knock must refresh via authorize, NOT prepare)", order)
+	}
+}
+
+// TestAuthWithNHPClaims_AuthorizeRequestKeyEncoding closes the coverage gap noted
+// in review of the qv2 admission key-encoding fix: PrepareRequestShape asserts only
+// the prepare body, but on the steady-state re-knock path authorize returns a live
+// session and prepare is NEVER called — and authorize is where the live HTTP 400
+// actually fired. Assert the authorize request carries authenticated_qurl_public_key_b64
+// as UNPADDED base64url (what qurl-service's RawURLEncoding decoder accepts), never
+// the std base64 form (padded) that 400'd every qv2 knock.
+func TestAuthWithNHPClaims_AuthorizeRequestKeyEncoding(t *testing.T) {
+	f := newV2Fixture(t, nil)
+	enableV2(t, f.issuer.trustStore(t))
+
+	rec := newAdmissionRecorder(t, defaultACRouting())
+	rec.liveAuthorize("sess_live_1", 120, &ACRouting{ACId: "ac-1", DestHost: "10.0.0.9", DestPort: 9443})
+	setRecordingResolver(t, rec)
+
+	helper := &plugins.NhpServerPluginHelper{
+		AspData:                testAspData(f.resourceB64, 60),
+		ServerCellPublicKeyB64: f.cellStdB64,
+		AuthWithNhpCallbackFunc: func(req *common.NhpAuthRequest, _ *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			req.Ack.ErrCode = common.ErrSuccess.ErrorCode()
+			return req.Ack, nil
+		},
+	}
+	if _, err := AuthWithNHP(f.req, helper); err != nil {
+		t.Fatalf("AuthWithNHP (re-knock refresh): %v", err)
+	}
+
+	// Sanity: authorize alone admitted; prepare was never called — so this test
+	// exercises the authorize-only path PrepareRequestShape cannot reach.
+	if order := rec.callOrder(); len(order) != 1 || order[0] != "authorize" {
+		t.Fatalf("call order = %v, want [authorize] only", order)
+	}
+
+	body := rec.authorizeRequest()
+	if body == nil {
+		t.Fatal("authorize request body was not captured")
+	}
+	if body["authenticated_qurl_public_key_b64"] != f.agentURLB64 {
+		t.Errorf("authorize authenticated_qurl_public_key_b64 = %v, want base64url %q", body["authenticated_qurl_public_key_b64"], f.agentURLB64)
+	}
+	if body["authenticated_qurl_public_key_b64"] == f.agentStdB64 {
+		t.Error("authorize authenticated_qurl_public_key_b64 is Std base64 (padded); qurl-service decodes RawURLEncoding and would 400 it")
 	}
 }
 
@@ -973,8 +1036,16 @@ func TestAuthWithNHPClaims_PrepareRequestShape(t *testing.T) {
 	if gotBody["qurl_issuer_sig_b64"] != f.sigB64 {
 		t.Errorf("prepare qurl_issuer_sig_b64 mismatch")
 	}
-	if gotBody["authenticated_qurl_public_key_b64"] != f.agentStdB64 {
-		t.Errorf("prepare authenticated_qurl_public_key_b64 = %v, want the Noise-authenticated key", gotBody["authenticated_qurl_public_key_b64"])
+	// authenticated_qurl_public_key_b64 MUST be UNPADDED base64url — that is the
+	// encoding qurl-service's admission decoder (RawURLEncoding) accepts, per the
+	// qURL v2 contract. The Noise-authenticated key is the same bytes; sending its
+	// Std base64 form (req.PublicKey / agentStdB64, padded) is the regression that
+	// 400'd every qv2 knock. Assert the base64url form and guard against Std.
+	if gotBody["authenticated_qurl_public_key_b64"] != f.agentURLB64 {
+		t.Errorf("prepare authenticated_qurl_public_key_b64 = %v, want base64url %q", gotBody["authenticated_qurl_public_key_b64"], f.agentURLB64)
+	}
+	if gotBody["authenticated_qurl_public_key_b64"] == f.agentStdB64 {
+		t.Error("prepare authenticated_qurl_public_key_b64 is Std base64 (padded); qurl-service decodes RawURLEncoding and would 400 it")
 	}
 	if gotBody["src_ip"] != "203.0.113.9" {
 		t.Errorf("prepare src_ip = %v, want 203.0.113.9", gotBody["src_ip"])

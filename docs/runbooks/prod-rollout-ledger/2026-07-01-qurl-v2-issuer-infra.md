@@ -30,6 +30,14 @@ nothing (all default off).
   `createQurl` treats that as fatal — so **every** `POST /v1/qurls` 500s the moment
   resource-keys is enabled. Discovered the hard way in sandbox during Apply 1; prod
   must not repeat it. Confirm the deployed qurl-api image includes #1094 before flipping.
+- [ ] **Pre-rollout (HARD, before `qurl_v2_admission_enabled=true` delivers working
+  knocks in ANY env):** nhp server PR #3028 (qv2 admission key-encoding fix) merged
+  and deployed. Without it the server sends `authenticated_qurl_public_key_b64` to
+  qurl-service's admission endpoints as **std base64** (padded), but that endpoint
+  decodes **base64url** (`RawURLEncoding`) — every qv2 knock 400s → `errCode 52001`
+  deny. `admission_enabled` alone only loads the trust store; it does not make the
+  knock succeed. Discovered in sandbox after Apply 2 (minting works, knock denied);
+  confirm the deployed nhp-server image includes #3028 before trusting qv2 admission.
 - [ ] **Rollout (the enable, coordinated, sandbox) — prefer a TWO-apply sequence to
   avoid a cross-fleet race:**
   - **Apply 1:** `qurl_v2_admission_enabled` + `qurl_v2_resource_keys_enabled` (+
