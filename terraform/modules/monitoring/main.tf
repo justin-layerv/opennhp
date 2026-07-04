@@ -66,6 +66,14 @@ locals {
     }
   }
 
+  qurl_v2_security_failure_alarms = {
+    revocation_hash_error = {
+      metric_name = "QurlV2RevocationHashError"
+      suffix      = "qurl-v2-revocation-hash-error"
+      description = "qURL v2 revocation hash generation failed after claims already verified. This counter increments per key hash failure, not per admission; one admission can increment twice if both the qURL-user and resource keys fail. Any nonzero value means an admitted v2 flow may be invisible to targeted revocation and rely on scheduled timer-wheel expiry only."
+    }
+  }
+
   # qURL browser timing rejection-ratio alarms (#1840). The alarm thresholds are
   # rejected browser timing fields per qURL resolve attempt, not percentages of
   # requests. Baseline query captured 2026-06-30 over the prior 14d at 5m
@@ -535,6 +543,29 @@ resource "aws_cloudwatch_dashboard" "main" {
           view    = "timeSeries"
           stacked = false
         }
+      },
+      {
+        # qURL v2 revocation tripwire (#2775). QurlV2RevocationHashError is a
+        # per-key hash-failure counter, not an admission counter: one bad
+        # admission can contribute two samples if both revocation keys fail.
+        # Dims {Environment, Cell} match the plugin helper's server-publisher
+        # stream on the v2 admission path.
+        type   = "metric"
+        x      = 0
+        y      = 30
+        width  = 24
+        height = 6
+        properties = {
+          title  = "qURL v2 Revocation Safety"
+          region = data.aws_region.current.id
+          metrics = [
+            ["LayerV/NHP", "QurlV2RevocationHashError", "Environment", var.environment, "Cell", var.cell_id, { "label" : "Revocation hash failures (per key, not admission)" }]
+          ]
+          period  = 300
+          stat    = "Sum"
+          view    = "timeSeries"
+          stacked = false
+        }
       }
     ]
   })
@@ -992,6 +1023,38 @@ resource "aws_cloudwatch_metric_alarm" "internal_security_failure" {
     Component = "monitoring"
     Cell      = var.cell_id
     Issue     = "1140"
+  })
+}
+
+# qURL v2 security tripwires. These counters are emitted from the qURL plugin
+# through NhpServerPluginHelper.IncrCounter, which binds to the server
+# CloudWatch publisher on the knock/admission path. Keep the alarm dimensions at
+# exactly {Environment, Cell} to match buildServerMetricDimensions() in
+# endpoints/server/udpserver.go.
+resource "aws_cloudwatch_metric_alarm" "qurl_v2_security_failure" {
+  for_each = local.qurl_v2_security_failure_alarms
+
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-${each.value.suffix}"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = each.value.metric_name
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "${each.value.description} Threshold is Sum >= 1 in one 5-minute window; routed to the per-cell alerts SNS topic. #2775."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
   })
 }
 
