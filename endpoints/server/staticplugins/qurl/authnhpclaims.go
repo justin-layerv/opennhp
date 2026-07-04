@@ -217,11 +217,11 @@ func authWithNHPClaims(req *common.NhpAuthRequest, helper *plugins.NhpServerPlug
 	// has not vanished on a transient commit failure; it knows the lease is
 	// pending.) We do NOT open the AC.
 	commitCtx, commitDone := context.WithTimeout(context.Background(), qurlAuthorizeTimeout)
-	commitErr := resolver.CommitAdmission(commitCtx, prepResp.AdmissionID, requestID)
+	commitErr := resolver.CommitAdmission(commitCtx, prepResp.AdmissionID, prepResp.QurlUserPublicKeyHash, clientIP, requestID)
 	commitDone()
 	if commitErr != nil {
 		log.Error("[QURL] authWithNHPClaims: commit failed admission=%s client=%s: %v", prepResp.AdmissionID, clientIP, commitErr)
-		cancelPendingAdmission(prepResp.AdmissionID, requestID, clientIP)
+		cancelPendingAdmission(prepResp.AdmissionID, prepResp.QurlUserPublicKeyHash, requestID, clientIP)
 		return failAck(ackMsg, common.ErrKnockApiRequestFailed, "qurl v2 admission commit failed")
 	}
 
@@ -473,10 +473,10 @@ func buildV2ResourceData(resp *AdmissionPrepareResponse, claims *qurlv2.Claims, 
 // only releases a pending lease), so this is safe even in the unlikely
 // commit-landed-but-response-lost case. Cancel failure is logged, not fatal: the
 // lease TTL is the ultimate backstop.
-func cancelPendingAdmission(admissionID, requestID, clientIP string) {
+func cancelPendingAdmission(admissionID, qurlUserPublicKeyHash, requestID, clientIP string) {
 	ctx, cancel := context.WithTimeout(context.Background(), qurlAuthorizeTimeout)
 	defer cancel()
-	if err := resolver.CancelAdmission(ctx, admissionID, requestID); err != nil {
+	if err := resolver.CancelAdmission(ctx, admissionID, qurlUserPublicKeyHash, clientIP, requestID); err != nil {
 		log.Warning("[QURL] authWithNHPClaims: cancel after failed commit did not confirm admission=%s client=%s (lease TTL will reclaim): %v",
 			admissionID, clientIP, err)
 	}

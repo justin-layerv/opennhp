@@ -180,11 +180,12 @@ func newAdmissionRecorder(t *testing.T, ac *ACRouting) *admissionRecorder {
 	body, _ := json.Marshal(internalAdmissionPrepareResponse{
 		Success: true,
 		Data: &AdmissionPrepareResponse{
-			AdmissionID: "adm_test123",
-			QurlID:      "q_abc12345678",
-			OpenTime:    30,
-			QurlSiteURL: "https://q.qurl.site/p",
-			ACRouting:   ac,
+			QurlUserPublicKeyHash: "test-qhash",
+			AdmissionID:           "adm_test123",
+			QurlID:                "q_abc12345678",
+			OpenTime:              30,
+			QurlSiteURL:           "https://q.qurl.site/p",
+			ACRouting:             ac,
 		},
 	})
 	rec.prepareBody = string(body)
@@ -1010,7 +1011,8 @@ func TestAuthWithNHPClaims_PrepareRequestShape(t *testing.T) {
 			body, _ := json.Marshal(internalAdmissionPrepareResponse{
 				Success: true,
 				Data: &AdmissionPrepareResponse{
-					AdmissionID: "adm_x", QurlID: "q_x", OpenTime: 30,
+					QurlUserPublicKeyHash: "test-qhash",
+					AdmissionID:           "adm_x", QurlID: "q_x", OpenTime: 30,
 					QurlSiteURL: "https://q.qurl.site/p",
 					ACRouting:   defaultACRouting(),
 				},
@@ -1235,10 +1237,11 @@ func TestBuildV2ResourceData_HashError_FailsOpenAndCounts(t *testing.T) {
 	}
 
 	resp := &AdmissionPrepareResponse{
-		AdmissionID: "adm_failopen",
-		QurlID:      "q_failopen",
-		OpenTime:    60,
-		ACRouting:   defaultACRouting(),
+		QurlUserPublicKeyHash: "test-qhash",
+		AdmissionID:           "adm_failopen",
+		QurlID:                "q_failopen",
+		OpenTime:              60,
+		ACRouting:             defaultACRouting(),
 	}
 	// qurl-user key is invalid base64url (padding is rejected by the strict
 	// decoder); resource key is valid. Only the qurl-user hash should fail.
@@ -1286,9 +1289,10 @@ func TestBuildV2ResourceData_NoHashError_DoesNotCount(t *testing.T) {
 	userURL, _ := x25519KeyPair(t, 0x40)
 
 	resp := &AdmissionPrepareResponse{
-		AdmissionID: "adm_ok",
-		OpenTime:    60,
-		ACRouting:   defaultACRouting(),
+		QurlUserPublicKeyHash: "test-qhash",
+		AdmissionID:           "adm_ok",
+		OpenTime:              60,
+		ACRouting:             defaultACRouting(),
 	}
 	claims := &qurlv2.Claims{
 		QurlUserPublicKeyB64: userURL,
@@ -1317,10 +1321,11 @@ func TestBuildV2ResourceData_NoHashError_DoesNotCount(t *testing.T) {
 // observable. The AC pinhole fields (from resp, not claims) stay intact.
 func TestBuildV2ResourceData_NilClaims_GuardedNotPanic(t *testing.T) {
 	resp := &AdmissionPrepareResponse{
-		AdmissionID: "adm_nilclaims",
-		QurlID:      "q_nilclaims",
-		OpenTime:    60,
-		ACRouting:   defaultACRouting(),
+		QurlUserPublicKeyHash: "test-qhash",
+		AdmissionID:           "adm_nilclaims",
+		QurlID:                "q_nilclaims",
+		OpenTime:              60,
+		ACRouting:             defaultACRouting(),
 	}
 
 	var hashErrCount int

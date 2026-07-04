@@ -114,11 +114,21 @@ type ACRouting struct {
 // to the prepare OpenTime; the session lifetime is qurl-service's to enforce, so
 // NHP does not act on session_duration/remaining_seconds on the first knock.
 type AdmissionPrepareResponse struct {
-	AdmissionID string     `json:"admission_id"`
-	QurlID      string     `json:"qurl_id"`
-	OpenTime    uint32     `json:"open_time"`
-	QurlSiteURL string     `json:"qurl_site_url"`
-	ACRouting   *ACRouting `json:"ac_routing"`
+	AdmissionID string `json:"admission_id"`
+	QurlID      string `json:"qurl_id"`
+	// QurlUserPublicKeyHash is the qURL-user public-key hash qurl-service keys the
+	// admission STATE row by (its DDB partition). commit and cancel BOTH require it
+	// in their body to locate that row, so NHP echoes it back from prepare rather
+	// than recomputing qurl-service's hash format. Not a trust input — the
+	// commit/cancel transaction is conditioned on the lease held by admission_id.
+	// Echoing (vs. local recompute) also guarantees the lookup preimage matches
+	// qurl-service's byte-for-byte; per contract both derive it from the same
+	// authenticated qURL-user key (QURL_V2_KEYED_IDENTITY.md), so it stays
+	// consistent with NHP's own qurlUserKeyHash used for the AC revocation index.
+	QurlUserPublicKeyHash string     `json:"qurl_user_public_key_hash"`
+	OpenTime              uint32     `json:"open_time"`
+	QurlSiteURL           string     `json:"qurl_site_url"`
+	ACRouting             *ACRouting `json:"ac_routing"`
 }
 
 // internalAdmissionPrepareResponse is the success/error envelope qurl-service
@@ -290,29 +300,51 @@ func (r *QurlResolver) PrepareAdmission(ctx context.Context, req *AdmissionPrepa
 // the AC. Because a failed commit leaves prepare's lease still pending, the
 // caller releases it via CancelAdmission (the TTL is only the backstop for a
 // vanished client).
-func (r *QurlResolver) CommitAdmission(ctx context.Context, admissionID, requestID string) error {
-	return r.admissionLifecycleCall(ctx, admissionCommitPathFmt, admissionID, requestID, "commit")
+func (r *QurlResolver) CommitAdmission(ctx context.Context, admissionID, qurlUserPublicKeyHash, srcIP, requestID string) error {
+	return r.admissionLifecycleCall(ctx, admissionCommitPathFmt, admissionID, qurlUserPublicKeyHash, srcIP, requestID, "commit")
 }
 
 // CancelAdmission releases the pending prepare lease for admissionID. It is valid
 // ONLY before a successful commit. After commit succeeds, consume/session state
 // is durable and must not be silently undone, so the caller never cancels then.
-func (r *QurlResolver) CancelAdmission(ctx context.Context, admissionID, requestID string) error {
-	return r.admissionLifecycleCall(ctx, admissionCancelPathFmt, admissionID, requestID, "cancel")
+func (r *QurlResolver) CancelAdmission(ctx context.Context, admissionID, qurlUserPublicKeyHash, srcIP, requestID string) error {
+	return r.admissionLifecycleCall(ctx, admissionCancelPathFmt, admissionID, qurlUserPublicKeyHash, srcIP, requestID, "cancel")
+}
+
+// admissionLifecycleRequest is the commit/cancel body. qurl-service keys the
+// admission STATE row by qurl_user_public_key_hash (its DDB partition), so both
+// endpoints require it; the transaction is still conditioned on the lease held by
+// the path admission_id, so the hash is a lookup key, not a trust input. src_ip
+// is the observed client IP recorded on the committed session (qurl-service
+// accepts empty, but NHP always has it here). Cancel intentionally reuses this one
+// struct — src_ip is meaningless for a pure lease release, but it is harmless
+// (omitempty, accepted-empty) and keeps the two lifecycle calls symmetric.
+type admissionLifecycleRequest struct {
+	QurlUserPublicKeyHash string `json:"qurl_user_public_key_hash"`
+	SrcIP                 string `json:"src_ip,omitempty"`
 }
 
 // admissionLifecycleCall is the shared commit/cancel POST. Both take the
-// admission id in the path, no body, and a 2xx means success.
-func (r *QurlResolver) admissionLifecycleCall(ctx context.Context, pathFmt, admissionID, requestID, op string) error {
+// admission id in the path and a body carrying the state-row key
+// (qurl_user_public_key_hash); a 2xx means success.
+func (r *QurlResolver) admissionLifecycleCall(ctx context.Context, pathFmt, admissionID, qurlUserPublicKeyHash, srcIP, requestID, op string) error {
 	if r.serviceToken == "" {
 		return fmt.Errorf("%w: service token is empty", ErrAdmissionService)
 	}
 	if admissionID == "" {
 		return fmt.Errorf("%w: empty admission id for %s", ErrAdmissionService, op)
 	}
+	if qurlUserPublicKeyHash == "" {
+		return fmt.Errorf("%w: empty qurl_user_public_key_hash for %s", ErrAdmissionService, op)
+	}
+
+	body, err := json.Marshal(admissionLifecycleRequest{QurlUserPublicKeyHash: qurlUserPublicKeyHash, SrcIP: srcIP})
+	if err != nil {
+		return fmt.Errorf("%w: marshal %s request: %w", ErrAdmissionService, op, err)
+	}
 
 	path := fmt.Sprintf(pathFmt, url.PathEscape(admissionID))
-	respBody, status, err := r.doAdmissionRequest(ctx, http.MethodPost, path, nil, requestID)
+	respBody, status, err := r.doAdmissionRequest(ctx, http.MethodPost, path, body, requestID)
 	if err != nil {
 		return err
 	}
@@ -486,6 +518,11 @@ func validateAdmissionAuthorizeResponse(resp *AdmissionAuthorizeResponse) error 
 func validateAdmissionPrepareResponse(resp *AdmissionPrepareResponse) error {
 	if resp.AdmissionID == "" {
 		return errors.New("prepare returned empty admission_id")
+	}
+	if resp.QurlUserPublicKeyHash == "" {
+		// commit/cancel key the state row by this hash; without it they cannot
+		// locate the admission and would fail. Reject early with a clear message.
+		return errors.New("prepare returned empty qurl_user_public_key_hash (commit/cancel would fail)")
 	}
 	if resp.OpenTime == 0 {
 		return errors.New("prepare returned open_time=0 (would reset the agent open-timer)")

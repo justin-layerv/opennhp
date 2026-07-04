@@ -599,7 +599,24 @@ Then:
 ```http
 POST /internal/v2/qurl/admissions/{admission_id}/commit
 POST /internal/v2/qurl/admissions/{admission_id}/cancel
+Content-Type: application/json
+
+{
+  "qurl_user_public_key_hash": "...",
+  "src_ip": "203.0.113.10",
+  "visitor_session_id": "..."
+}
 ```
+
+Both commit and cancel take the `admission_id` in the path AND a body. The
+`qurl_user_public_key_hash` is REQUIRED: it is the state-row key qurl-service
+partitions the admission by (path `admission_id` alone does not locate the
+partition), not a trust input — the transaction stays conditioned on the lease
+held by `admission_id`. `src_ip` is the observed client IP recorded on the
+committed session (accepted empty). `visitor_session_id` is optional. Cancel
+reuses the same body shape; `src_ip`/`visitor_session_id` are inert for a lease
+release. This body was under-specified in an earlier revision, which let NHP send
+bodiless commit/cancel POSTs that qurl-service 400'd — keep the schema explicit.
 
 Why two phase:
 

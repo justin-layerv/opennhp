@@ -112,11 +112,12 @@ func (rec *internalPathRecorder) handle(w http.ResponseWriter, r *http.Request) 
 		body, _ := json.Marshal(internalAdmissionPrepareResponse{
 			Success: true,
 			Data: &AdmissionPrepareResponse{
-				AdmissionID: "adm_ws1",
-				QurlID:      "q_ws1abcdef0",
-				OpenTime:    30,
-				QurlSiteURL: "https://q.qurl.site/ws1",
-				ACRouting:   defaultACRouting(),
+				QurlUserPublicKeyHash: "test-qhash",
+				AdmissionID:           "adm_ws1",
+				QurlID:                "q_ws1abcdef0",
+				OpenTime:              30,
+				QurlSiteURL:           "https://q.qurl.site/ws1",
+				ACRouting:             defaultACRouting(),
 			},
 		})
 		_, _ = w.Write(body)

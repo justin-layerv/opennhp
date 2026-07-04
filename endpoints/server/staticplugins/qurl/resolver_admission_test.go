@@ -35,7 +35,8 @@ func TestPrepareAdmission_Success(t *testing.T) {
 		body, _ := json.Marshal(internalAdmissionPrepareResponse{
 			Success: true,
 			Data: &AdmissionPrepareResponse{
-				AdmissionID: "adm_1", QurlID: "q_1", OpenTime: 30,
+				QurlUserPublicKeyHash: "test-qhash",
+				AdmissionID:           "adm_1", QurlID: "q_1", OpenTime: 30,
 				QurlSiteURL: "https://q.qurl.site",
 				ACRouting:   &ACRouting{ACId: "ac-1", DestHost: "10.0.0.1", DestPort: 443},
 			},
@@ -70,9 +71,11 @@ func TestPrepareAdmission_Classification(t *testing.T) {
 		{name: "500 -> service", status: http.StatusInternalServerError, body: ``, wantErr: ErrAdmissionService},
 		{name: "structured unknown code -> service", status: http.StatusOK, body: `{"success":false,"error":{"code":"weird"}}`, wantErr: ErrAdmissionService},
 		{name: "200 success no data -> invalid", status: http.StatusOK, body: `{"success":true}`, wantErr: ErrAdmissionInvalidResponse},
-		{name: "200 open_time=0 -> invalid", status: http.StatusOK, body: `{"success":true,"data":{"admission_id":"a","open_time":0,"ac_routing":{"ac_id":"x","dest_host":"h","dest_port":443}}}`, wantErr: ErrAdmissionInvalidResponse},
-		{name: "200 missing ac_routing -> invalid", status: http.StatusOK, body: `{"success":true,"data":{"admission_id":"a","open_time":30}}`, wantErr: ErrAdmissionInvalidResponse},
-		{name: "200 empty dest_host -> invalid", status: http.StatusOK, body: `{"success":true,"data":{"admission_id":"a","open_time":30,"ac_routing":{"ac_id":"x","dest_port":443}}}`, wantErr: ErrAdmissionInvalidResponse},
+		// missing hash: commit/cancel can't locate the state-row partition key -> reject at prepare.
+		{name: "200 missing qurl_user_public_key_hash -> invalid", status: http.StatusOK, body: `{"success":true,"data":{"admission_id":"a","open_time":30,"ac_routing":{"ac_id":"x","dest_host":"h","dest_port":443}}}`, wantErr: ErrAdmissionInvalidResponse},
+		{name: "200 open_time=0 -> invalid", status: http.StatusOK, body: `{"success":true,"data":{"admission_id":"a","qurl_user_public_key_hash":"h","open_time":0,"ac_routing":{"ac_id":"x","dest_host":"h","dest_port":443}}}`, wantErr: ErrAdmissionInvalidResponse},
+		{name: "200 missing ac_routing -> invalid", status: http.StatusOK, body: `{"success":true,"data":{"admission_id":"a","qurl_user_public_key_hash":"h","open_time":30}}`, wantErr: ErrAdmissionInvalidResponse},
+		{name: "200 empty dest_host -> invalid", status: http.StatusOK, body: `{"success":true,"data":{"admission_id":"a","qurl_user_public_key_hash":"h","open_time":30,"ac_routing":{"ac_id":"x","dest_port":443}}}`, wantErr: ErrAdmissionInvalidResponse},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -91,15 +94,25 @@ func TestPrepareAdmission_Classification(t *testing.T) {
 func TestCommitAdmission(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		var gotPath string
+		var gotBody map[string]any
 		r := newAdmissionTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
 			gotPath = req.URL.Path
+			_ = json.NewDecoder(req.Body).Decode(&gotBody)
 			w.WriteHeader(http.StatusOK)
 		})
-		if err := r.CommitAdmission(context.Background(), "adm_xyz", "req-1"); err != nil {
+		if err := r.CommitAdmission(context.Background(), "adm_xyz", "qhash123", "203.0.113.1", "req-1"); err != nil {
 			t.Fatalf("CommitAdmission: %v", err)
 		}
 		if gotPath != "/internal/v2/qurl/admissions/adm_xyz/commit" {
 			t.Errorf("path = %s", gotPath)
+		}
+		// commit MUST carry the state-row key qurl-service partitions by, else it
+		// 400s (binding:"required") — the mismatch that denied every qv2 knock.
+		if gotBody["qurl_user_public_key_hash"] != "qhash123" {
+			t.Errorf("commit body qurl_user_public_key_hash = %v, want qhash123", gotBody["qurl_user_public_key_hash"])
+		}
+		if gotBody["src_ip"] != "203.0.113.1" {
+			t.Errorf("commit body src_ip = %v, want 203.0.113.1", gotBody["src_ip"])
 		}
 	})
 
@@ -107,7 +120,7 @@ func TestCommitAdmission(t *testing.T) {
 		r := newAdmissionTestResolver(t, func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		})
-		if err := r.CommitAdmission(context.Background(), "adm_xyz", ""); !errors.Is(err, ErrAdmissionService) {
+		if err := r.CommitAdmission(context.Background(), "adm_xyz", "qhash", "", ""); !errors.Is(err, ErrAdmissionService) {
 			t.Fatalf("err = %v, want ErrAdmissionService", err)
 		}
 	})
@@ -118,7 +131,7 @@ func TestCommitAdmission(t *testing.T) {
 			called = true
 			w.WriteHeader(http.StatusOK)
 		})
-		if err := r.CommitAdmission(context.Background(), "", ""); !errors.Is(err, ErrAdmissionService) {
+		if err := r.CommitAdmission(context.Background(), "", "qhash", "", ""); !errors.Is(err, ErrAdmissionService) {
 			t.Fatalf("err = %v, want ErrAdmissionService", err)
 		}
 		if called {
@@ -129,15 +142,22 @@ func TestCommitAdmission(t *testing.T) {
 
 func TestCancelAdmission(t *testing.T) {
 	var gotPath string
+	var gotBody map[string]any
 	r := newAdmissionTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
 		gotPath = req.URL.Path
+		_ = json.NewDecoder(req.Body).Decode(&gotBody)
 		w.WriteHeader(http.StatusOK)
 	})
-	if err := r.CancelAdmission(context.Background(), "adm_abc", "req-2"); err != nil {
+	if err := r.CancelAdmission(context.Background(), "adm_abc", "qhash", "203.0.113.1", "req-2"); err != nil {
 		t.Fatalf("CancelAdmission: %v", err)
 	}
 	if gotPath != "/internal/v2/qurl/admissions/adm_abc/cancel" {
 		t.Errorf("path = %s", gotPath)
+	}
+	// cancel reuses the commit body shape and also requires the hash (qurl-service
+	// locates the lease to release by it); lock the cancel body down too.
+	if gotBody["qurl_user_public_key_hash"] != "qhash" {
+		t.Errorf("cancel body qurl_user_public_key_hash = %v, want qhash", gotBody["qurl_user_public_key_hash"])
 	}
 }
 
@@ -148,10 +168,10 @@ func TestAdmission_EmptyServiceToken(t *testing.T) {
 	if _, err := r.PrepareAdmission(context.Background(), &AdmissionPrepareRequest{}); !errors.Is(err, ErrAdmissionService) {
 		t.Errorf("prepare err = %v", err)
 	}
-	if err := r.CommitAdmission(context.Background(), "a", ""); !errors.Is(err, ErrAdmissionService) {
+	if err := r.CommitAdmission(context.Background(), "a", "qhash", "", ""); !errors.Is(err, ErrAdmissionService) {
 		t.Errorf("commit err = %v", err)
 	}
-	if err := r.CancelAdmission(context.Background(), "a", ""); !errors.Is(err, ErrAdmissionService) {
+	if err := r.CancelAdmission(context.Background(), "a", "qhash", "", ""); !errors.Is(err, ErrAdmissionService) {
 		t.Errorf("cancel err = %v", err)
 	}
 }

@@ -31,13 +31,21 @@ nothing (all default off).
   resource-keys is enabled. Discovered the hard way in sandbox during Apply 1; prod
   must not repeat it. Confirm the deployed qurl-api image includes #1094 before flipping.
 - [ ] **Pre-rollout (HARD, before `qurl_v2_admission_enabled=true` delivers working
-  knocks in ANY env):** nhp server PR #3028 (qv2 admission key-encoding fix) merged
-  and deployed. Without it the server sends `authenticated_qurl_public_key_b64` to
-  qurl-service's admission endpoints as **std base64** (padded), but that endpoint
-  decodes **base64url** (`RawURLEncoding`) — every qv2 knock 400s → `errCode 52001`
-  deny. `admission_enabled` alone only loads the trust store; it does not make the
-  knock succeed. Discovered in sandbox after Apply 2 (minting works, knock denied);
-  confirm the deployed nhp-server image includes #3028 before trusting qv2 admission.
+  knocks in ANY env):** the full server↔qurl-service admission **contract-alignment
+  set** merged and deployed. The two sides drifted from the NHP Server Contract
+  (`QURL_V2_KEYED_IDENTITY.md`) and were never integration-tested (qurl-service
+  #1095), so qv2 admission never worked end-to-end. `admission_enabled` alone only
+  loads the trust store; it does not make the knock succeed. Each fix below was a
+  distinct `errCode 52001` deny surfaced only by re-running a real knock in sandbox:
+    - nhp #3028 — request `authenticated_qurl_public_key_b64` was std base64; the
+      endpoint decodes base64url → authorize 400.
+    - qurl-service #1096 — prepare response used `open_time_seconds` /
+      `session_duration_seconds`; the contract + `validateAdmissionPrepareResponse`
+      require `open_time` / `session_duration` → server rejected `open_time=0`.
+    - nhp #3029 (this PR) — commit/cancel sent no body, but qurl-service requires
+      `qurl_user_public_key_hash` (the state-row partition key) → commit 400.
+  Confirm the deployed nhp-server + qurl-api images include all three, and that the
+  sandbox qv2 EnterPortal smoke (qurl-service #1095) is green, before prod admission.
 - [ ] **Rollout (the enable, coordinated, sandbox) — prefer a TWO-apply sequence to
   avoid a cross-fleet race:**
   - **Apply 1:** `qurl_v2_admission_enabled` + `qurl_v2_resource_keys_enabled` (+
