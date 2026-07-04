@@ -607,18 +607,45 @@ resource "aws_cloudwatch_metric_alarm" "eip_claim_failure" {
 # [Component=AC, Environment=<env>, Region=<region>]. CloudWatch alarms must
 # match this dimension set EXACTLY — a partial dimension set selects a different
 # (non-existent) metric stream and the alarm sits in INSUFFICIENT_DATA forever.
+#
+# STATISTIC/THRESHOLD rationale (ServersHealthy is Minimum-sensitive under
+# blue/green): `ServersHealthy` is a per-AC gauge (healthyServerCount in
+# registration.go) published with NO ACId dimension, so all ACs in the region
+# write one shared stream. Each AC re-registers through the server NLB every
+# ~90s, and — per the accepted RELAY_ACTIVE_CELL_ROUTING decision (#2658) — that
+# NLB is an interim BOTH-attach target group fronting both the active and the
+# warm-standby server color. So a registration is answered by whichever color
+# the NLB picked: the active color hands back its full per-AZ peer set (~3), the
+# standby color hands back its smaller set (as few as 1), and there is a brief
+# reconnect window (~10s) where a freshly-rebuilt assignedServers slice reads 0
+# (HandleRedispatch). The net is an EXPECTED per-AC oscillation (0↔1↔3) that is
+# not a fault — the AC always retains a working server connection and qURL knocks
+# succeed. `Minimum` over a single 5-min period on this shared stream latched the
+# alarm on every one of those transient dips (false pages).
+#
+# Fix: use `Average` over a SUSTAINED window. The steady-state per-AC time-average
+# is ~2.6 (mostly 3, occasionally 1), so `Average < 2` clears the expected flip
+# with headroom yet still fires on a genuine sustained degradation (fleet
+# persistently reaching ≤1 server = a real AC↔server reachability problem).
+# LIMITATION: without an ACId dimension the shared-stream average can mask a
+# single-AC-stuck-at-0 while its siblings are healthy — per-AC granularity is the
+# tracked #946 gauge work (add ACId dim + a per-AC SEARCH/metric-math alarm); the
+# underlying both-attach routing flip is the deferred #2645/#2658 work. Keep the
+# dimension set unchanged here until #946 lands, or this alarm goes
+# INSUFFICIENT_DATA (see the dimension note above).
 resource "aws_cloudwatch_metric_alarm" "servers_healthy_low" {
   count = var.enable_cloudwatch_alarms ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-ac-servers-healthy-low"
   comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 1
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
   metric_name         = "ServersHealthy"
   namespace           = "LayerV/NHP"
   period              = 300
-  statistic           = "Minimum"
+  statistic           = "Average"
   threshold           = 2
-  alarm_description   = "AC has fewer than 2 healthy server connections for 5 minutes. Target is 3 (one per AZ)."
+  alarm_description   = "AC's average healthy server connections stayed below 2 for 15 minutes. Target is 3 (one per AZ); transient dips to 1 are expected under blue/green (#2658) and intentionally tolerated — a sustained low average means real AC-to-server reachability loss."
   treat_missing_data  = "notBreaching"
 
   dimensions = {
