@@ -1,7 +1,7 @@
 # 2026-06-30 · issue #2165 · AC ConntrackFlusher direct-netlink backend (opt-in)
 
 - **Owner:** prod rollout coordinator
-- **Source:** [#2165](https://github.com/layervai/nhp/issues/2165) · [#2908](https://github.com/layervai/nhp/issues/2908) · capacity audit [#2163](https://github.com/layervai/nhp/issues/2163) · v6 gap [#2794](https://github.com/layervai/nhp/issues/2794)/[#2797](https://github.com/layervai/nhp/pull/2797) · exec-backend PR [#2164](https://github.com/layervai/nhp/issues/2164)
+- **Source:** [#2165](https://github.com/layervai/nhp/issues/2165) · [#2908](https://github.com/layervai/nhp/issues/2908) · runtime resync [#2946](https://github.com/layervai/nhp/issues/2946)/[#2966](https://github.com/layervai/nhp/pull/2966) · capacity audit [#2163](https://github.com/layervai/nhp/issues/2163) · v6 gap [#2794](https://github.com/layervai/nhp/issues/2794)/[#2797](https://github.com/layervai/nhp/pull/2797) · exec-backend PR [#2164](https://github.com/layervai/nhp/issues/2164)
 
 Adds `l3FlushConntrackBackend` to AC config. `"exec"` (default) keeps today's
 fork+exec `conntrack -D`. `"netlink"` switches `FilterMode_IPTABLES` L3 flush to a
@@ -37,9 +37,12 @@ dump. While that event stream is healthy, steady-state `Flush` is O(matches): lo
 up the full origin tuples for `{src,dst,dport,proto}` and delete those entries
 without dumping the whole family table. If the event stream errors or is not
 usable, the flusher falls back to the old dump/filter/delete path rather than
-silently missing flows; if an immediate-revocation reschedule needs fresh kernel
+silently missing flows; the #2946/#2966 fix rebuilds a fresh subscription
+generation at runtime so a transient multicast overrun does not pin the AC to
+fallback until restart. If an immediate-revocation reschedule needs fresh kernel
 ground truth, it intentionally uses the same dump/delete path and counts that
-separately. Netlink-only soak-readability metrics:
+separately.
+Netlink-only soak-readability metrics:
 `L3FlushConntrackDeleted` (entries torn down), `L3FlushConntrackIndexedFlushes`
 (event-index hot path used), `L3FlushConntrackIndexFallbackDumps` (safe O(table)
 fallback used because the index was unavailable/unhealthy),
