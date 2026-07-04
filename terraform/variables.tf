@@ -453,6 +453,30 @@ variable "l3_flush_dry_run" {
   default     = true
 }
 
+variable "l3_flush_conntrack_backend" {
+  description = "Root passthrough for the AC module's l3_flush_conntrack_backend. Selects `exec` or `netlink` for FilterMode=IPTABLES L3 flush teardown; ignored under eBPF/XDP."
+  type        = string
+  default     = "exec"
+
+  validation {
+    condition     = contains(["exec", "netlink"], lower(var.l3_flush_conntrack_backend))
+    error_message = "l3_flush_conntrack_backend must be either \"exec\" or \"netlink\"."
+  }
+}
+
+variable "l3_flush_conntrack_pool_size" {
+  description = "Root passthrough for the AC module's l3_flush_conntrack_pool_size. 0 preserves the AC default (currently 16); positive values tune the netlink socket pool."
+  type        = number
+  default     = 0
+
+  # Keep this bound aligned with the AC module and the Go-side
+  # maxConntrackNetlinkPoolSize/defaultConntrackNetlinkPoolSize constants.
+  validation {
+    condition     = var.l3_flush_conntrack_pool_size >= 0 && var.l3_flush_conntrack_pool_size <= 128 && floor(var.l3_flush_conntrack_pool_size) == var.l3_flush_conntrack_pool_size
+    error_message = "l3_flush_conntrack_pool_size must be an integer between 0 and 128; use 0 for the AC default."
+  }
+}
+
 variable "ac_auth_service_id" {
   description = "Authentication service ID for the Access Controller — the NHP aspId the agent-knock dispatch keys on. Default `agent` matches the agent staticplugin's PluginID (endpoints/server/staticplugins/agent/plugin.go); a rename here without renaming the plugin (or vice versa) silently re-introduces 'failed to find service provider' at knock time."
   type        = string

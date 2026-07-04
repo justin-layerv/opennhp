@@ -418,6 +418,9 @@ lint-workflows:
 	@shellcheck scripts/check-revocation-slo-lockstep.sh tests/scripts/check-revocation-slo-lockstep_test.sh
 	@bash tests/scripts/check-revocation-slo-lockstep_test.sh
 	@bash scripts/check-revocation-slo-lockstep.sh
+	@shellcheck scripts/check-l3-conntrack-pool-lockstep.sh tests/scripts/check-l3-conntrack-pool-lockstep_test.sh
+	@bash tests/scripts/check-l3-conntrack-pool-lockstep_test.sh
+	@bash scripts/check-l3-conntrack-pool-lockstep.sh
 	@shellcheck scripts/check-ebpf-load-path-lockstep.sh tests/scripts/check-ebpf-load-path-lockstep_test.sh
 	@bash tests/scripts/check-ebpf-load-path-lockstep_test.sh
 	@bash scripts/check-ebpf-load-path-lockstep.sh

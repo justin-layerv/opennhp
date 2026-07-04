@@ -83,6 +83,22 @@ a minimum interval, so sustained event loss should show bounded
 
 - [ ] Pre-rollout: on a **sandbox** iptables-mode AC, confirm the netlink datapath
       is available — `nf_conntrack_netlink` loadable + AC has `CAP_NET_ADMIN`
+      and the rendered AC config carries the rollout-selected
+      `L3FlushConntrackBackend = "netlink"` plus the accepted
+      `L3FlushConntrackPoolSize` (0 means the AC default, currently 16). The
+      issue #2940 config-gate PR adds Terraform passthrough for those two config
+      keys; without that passthrough, #2940 could not be completed through the
+      managed sandbox AC config because Terraform rendered only
+      `EnableL3FlushOnExpiry` and `L3FlushDryRun`.
+      The same config-gate PR also introduces benign prod launch-template
+      user_data drift: prod continues to render `exec`/`0`, so behavior remains
+      unchanged, but the two explicit config lines will land on the next prod AC
+      instance refresh.
+      As of 2026-07-04, the live sandbox blue and green AC instances render
+      `FilterMode = 1`, `EnableL3FlushOnExpiry = false`, and
+      `L3FlushDryRun = true`; the issue #2940 acceptance run still requires a
+      deliberate iptables-mode sandbox/standby AC validation window rather than
+      interpreting the active eBPF/XDP fleet as netlink evidence.
       (it already manages iptables/ipset/`conntrack -D`, so this should hold; the
       flusher fails Start loud if `conntrack.Open` fails). The #2908 event index
       also makes netlink event subscription and the startup backfill dump fatal

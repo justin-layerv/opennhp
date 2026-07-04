@@ -50,6 +50,16 @@ on:
       - "scripts/check-revocation-slo-lockstep.sh"
       - "endpoints/server/revocation_retry.go"
       - "terraform/modules/monitoring/main.tf"
+      # AC L3 netlink conntrack pool-size lockstep (#2940): trigger on the
+      # script and on every Go/TF source it compares so worker/socket ratio
+      # changes cannot leave stale operator-facing Terraform bounds/docs.
+      - "scripts/check-l3-conntrack-pool-lockstep.sh"
+      - "endpoints/ac/expiry_scheduler.go"
+      - "endpoints/ac/expiry_conntrack_flusher.go"
+      - "terraform/modules/ac/variables.tf"
+      - "terraform/variables.tf"
+      - "terraform/environments/sandbox/variables.tf"
+      - "terraform/environments/prod/variables.tf"
       # eBPF load-path + FilterMode lockstep (#2810, #2812, #2815): trigger on
       # the script + its fixture test and on the source-of-truth sites it
       # compares that aren't watched elsewhere: Go object-path consts
@@ -604,6 +614,18 @@ jobs:
           shellcheck scripts/check-revocation-slo-lockstep.sh tests/scripts/check-revocation-slo-lockstep_test.sh
           bash tests/scripts/check-revocation-slo-lockstep_test.sh
           bash scripts/check-revocation-slo-lockstep.sh
+
+      # AC L3 netlink conntrack pool-size lockstep (#2940): the Go
+      # source-of-truth constants (defaultWorkerCount / workers-per-socket) and
+      # the four Terraform bound/doc surfaces must agree. The fixture suite runs
+      # first so an extractor regression surfaces against synthetic inputs before
+      # the real tree runs. shellcheck both — actionlint's -shellcheck only covers
+      # workflow-embedded scripts.
+      - name: Test + check L3 conntrack pool-size lockstep (Go ↔ Terraform, #2940)
+        run: |
+          shellcheck scripts/check-l3-conntrack-pool-lockstep.sh tests/scripts/check-l3-conntrack-pool-lockstep_test.sh
+          bash tests/scripts/check-l3-conntrack-pool-lockstep_test.sh
+          bash scripts/check-l3-conntrack-pool-lockstep.sh
 
       # eBPF object load-path lockstep (#2810, #2812, #2815): the AC loads its
       # eBPF objects from a dir+filenames that are the runtime source of truth in

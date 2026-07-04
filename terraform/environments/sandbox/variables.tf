@@ -159,6 +159,30 @@ variable "ac_filter_mode" {
   }
 }
 
+variable "l3_flush_conntrack_backend" {
+  description = "AC conntrack teardown backend for sandbox L3 flush: exec or netlink."
+  type        = string
+  default     = "exec"
+
+  validation {
+    condition     = contains(["exec", "netlink"], lower(var.l3_flush_conntrack_backend))
+    error_message = "l3_flush_conntrack_backend must be either \"exec\" or \"netlink\"."
+  }
+}
+
+variable "l3_flush_conntrack_pool_size" {
+  description = "Sandbox AC netlink conntrack socket pool size. 0 preserves the AC default (currently 16)."
+  type        = number
+  default     = 0
+
+  # Keep this bound aligned with the AC module and the Go-side
+  # maxConntrackNetlinkPoolSize/defaultConntrackNetlinkPoolSize constants.
+  validation {
+    condition     = var.l3_flush_conntrack_pool_size >= 0 && var.l3_flush_conntrack_pool_size <= 128 && floor(var.l3_flush_conntrack_pool_size) == var.l3_flush_conntrack_pool_size
+    error_message = "l3_flush_conntrack_pool_size must be an integer between 0 and 128; use 0 for the AC default."
+  }
+}
+
 variable "enable_egress_eips" {
   description = "Allocate Elastic IPs for AC instances for stable egress IPs (2x when blue/green enabled). Customers whitelist these on their origin firewalls."
   type        = bool

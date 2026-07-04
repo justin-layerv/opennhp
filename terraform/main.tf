@@ -1281,8 +1281,10 @@ module "ac" {
   server_secret_arn = module.compute.server_secret_arn
 
   # L3 flush-on-expiry (active session teardown).
-  enable_l3_flush_on_expiry = var.enable_l3_flush_on_expiry
-  l3_flush_dry_run          = var.l3_flush_dry_run
+  enable_l3_flush_on_expiry    = var.enable_l3_flush_on_expiry
+  l3_flush_dry_run             = var.l3_flush_dry_run
+  l3_flush_conntrack_backend   = var.l3_flush_conntrack_backend
+  l3_flush_conntrack_pool_size = var.l3_flush_conntrack_pool_size
 
   # License credentials for cloud mode registration
   # Default to empty strings to prevent null interpolation errors in user_data template

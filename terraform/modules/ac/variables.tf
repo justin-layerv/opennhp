@@ -271,6 +271,32 @@ variable "l3_flush_dry_run" {
   default     = true
 }
 
+variable "l3_flush_conntrack_backend" {
+  description = "Conntrack teardown backend for FilterMode=IPTABLES L3 flush. `exec` preserves the fork+exec conntrack path; `netlink` opts into the direct ctnetlink backend and its event-index rollout gates. Ignored under FilterMode=EBPFXDP, where BpfFlusher owns conntrack teardown."
+  type        = string
+  default     = "exec"
+
+  validation {
+    condition     = contains(["exec", "netlink"], lower(var.l3_flush_conntrack_backend))
+    error_message = "l3_flush_conntrack_backend must be either \"exec\" or \"netlink\"."
+  }
+}
+
+variable "l3_flush_conntrack_pool_size" {
+  description = "Socket pool size for the netlink conntrack backend. 0 preserves the AC default (currently 16); positive values tune the pre-warmed socket pool and are clamped by the AC at its safety maximum."
+  type        = number
+  default     = 0
+
+  # Keep the 128 ceiling in lockstep with maxConntrackNetlinkPoolSize and the
+  # "currently 16" default in lockstep with defaultConntrackNetlinkPoolSize in
+  # endpoints/ac/expiry_conntrack_flusher.go. The AC re-clamps at boot, so drift
+  # fails safe, but the Terraform bound and operator-facing docs should stay true.
+  validation {
+    condition     = var.l3_flush_conntrack_pool_size >= 0 && var.l3_flush_conntrack_pool_size <= 128 && floor(var.l3_flush_conntrack_pool_size) == var.l3_flush_conntrack_pool_size
+    error_message = "l3_flush_conntrack_pool_size must be an integer between 0 and 128; use 0 for the AC default."
+  }
+}
+
 # ============================================================================
 # Cloud Mode Registration
 # AC registers with NHP servers using credentials for DynamoDB license validation

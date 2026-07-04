@@ -1028,6 +1028,8 @@ HealthCheckPort = ${ac_health_check_port}
 # auto-default fenced in endpoints/ac/config.go::updateBaseConfig.
 EnableL3FlushOnExpiry = ${enable_l3_flush_on_expiry}
 L3FlushDryRun = ${l3_flush_dry_run}
+L3FlushConntrackBackend = "${l3_flush_conntrack_backend}"
+L3FlushConntrackPoolSize = ${l3_flush_conntrack_pool_size}
 
 # Cloud mode registration credentials (license key is globally unique)
 LicenseKey = "${license_key}"

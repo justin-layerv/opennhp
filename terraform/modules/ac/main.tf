@@ -973,8 +973,10 @@ locals {
     # dry-run on a boot where EnableL3FlushOnExpiry=true and L3FlushDryRun
     # is unset/false, so a single reload with real-flush requested is still
     # safe; operators acknowledge by reapplying with l3_flush_dry_run=false.
-    enable_l3_flush_on_expiry = var.enable_l3_flush_on_expiry
-    l3_flush_dry_run          = var.l3_flush_dry_run
+    enable_l3_flush_on_expiry    = var.enable_l3_flush_on_expiry
+    l3_flush_dry_run             = var.l3_flush_dry_run
+    l3_flush_conntrack_backend   = lower(var.l3_flush_conntrack_backend)
+    l3_flush_conntrack_pool_size = var.l3_flush_conntrack_pool_size
     # Per-instance key generation
     name_prefix         = var.name_prefix
     secrets_kms_key_arn = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
@@ -1081,6 +1083,20 @@ resource "terraform_data" "ac_user_data_filter_mode_render_check" {
     precondition {
       condition     = strcontains(local.user_data, "\nFilterMode = ${var.ac_filter_mode}\n")
       error_message = "AC user_data must render config.toml with unquoted numeric `FilterMode = var.ac_filter_mode` so the eBPF rollout smoke can verify the active datapath."
+    }
+  }
+}
+
+resource "terraform_data" "ac_user_data_l3_conntrack_render_check" {
+  input = sha256(local.user_data)
+
+  lifecycle {
+    precondition {
+      condition = alltrue([
+        strcontains(local.user_data, "\nL3FlushConntrackBackend = \"${lower(var.l3_flush_conntrack_backend)}\"\n"),
+        strcontains(local.user_data, "\nL3FlushConntrackPoolSize = ${var.l3_flush_conntrack_pool_size}\n"),
+      ])
+      error_message = "AC user_data must render L3FlushConntrackBackend and L3FlushConntrackPoolSize into config.toml so the #2940 netlink rollout gate can be driven through managed Terraform config."
     }
   }
 }

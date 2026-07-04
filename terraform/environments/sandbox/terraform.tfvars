@@ -23,6 +23,10 @@ acme_email         = "admin@layerv.xyz"
 ac_auth_service_id = "agent"
 ac_min_capacity    = 3
 ac_filter_mode     = 1
+# Keep the netlink backend selectable through IaC for issue #2940 without
+# changing today's eBPF/XDP sandbox datapath or enabling L3 flush.
+l3_flush_conntrack_backend   = "netlink"
+l3_flush_conntrack_pool_size = 0
 # Two AC-protected resources, each a distinct identity per NHP spec
 # (CSA "Stealth Mode SDP" Appendix 2, NHP-KNK Message Fields):
 #   - "qurl"               — viewer-side qurl-link / SPA resolve flow
