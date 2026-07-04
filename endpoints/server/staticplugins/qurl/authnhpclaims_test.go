@@ -166,6 +166,34 @@ type admissionRecorder struct {
 	cancelStatus    int
 }
 
+// mustPubKeyHashB64 is the hex(sha256(base64url key)) NHP + qurl-service both use.
+func mustPubKeyHashB64(t *testing.T, b64 string) string {
+	t.Helper()
+	h, err := qurlv2.PublicKeyHashFromB64(b64)
+	if err != nil {
+		t.Fatalf("PublicKeyHashFromB64(%q): %v", b64, err)
+	}
+	return h
+}
+
+// prepareBodyJSON builds a success prepare response body with the given
+// qurl_user_public_key_hash + ac_routing. Extracted so a test can vary the hash
+// (e.g. to exercise the #3032 commit-path drift guard).
+func prepareBodyJSON(hash string, ac *ACRouting) string {
+	body, _ := json.Marshal(internalAdmissionPrepareResponse{
+		Success: true,
+		Data: &AdmissionPrepareResponse{
+			QurlUserPublicKeyHash: hash,
+			AdmissionID:           "adm_test123",
+			QurlID:                "q_abc12345678",
+			OpenTime:              30,
+			QurlSiteURL:           "https://q.qurl.site/p",
+			ACRouting:             ac,
+		},
+	})
+	return string(body)
+}
+
 func newAdmissionRecorder(t *testing.T, ac *ACRouting) *admissionRecorder {
 	t.Helper()
 	rec := &admissionRecorder{
@@ -177,18 +205,12 @@ func newAdmissionRecorder(t *testing.T, ac *ACRouting) *admissionRecorder {
 		commitStatus:    http.StatusOK,
 		cancelStatus:    http.StatusOK,
 	}
-	body, _ := json.Marshal(internalAdmissionPrepareResponse{
-		Success: true,
-		Data: &AdmissionPrepareResponse{
-			QurlUserPublicKeyHash: "test-qhash",
-			AdmissionID:           "adm_test123",
-			QurlID:                "q_abc12345678",
-			OpenTime:              30,
-			QurlSiteURL:           "https://q.qurl.site/p",
-			ACRouting:             ac,
-		},
-	})
-	rec.prepareBody = string(body)
+	// Echo the hash of the fixture's agent key (x25519KeyPair(0x40), the key
+	// newV2Fixture puts in qurl_user_public_key_b64) so first-knock tests take the
+	// NO-drift path through the #3032 commit-path guard by default. A drift test
+	// overrides rec.prepareBody with a mismatched hash.
+	agentURL, _ := x25519KeyPair(t, 0x40)
+	rec.prepareBody = prepareBodyJSON(mustPubKeyHashB64(t, agentURL), ac)
 	return rec
 }
 
@@ -662,6 +684,53 @@ func TestAuthWithNHPClaims_AuthorizeRequestKeyEncoding(t *testing.T) {
 	if body["authenticated_qurl_public_key_b64"] == f.agentStdB64 {
 		t.Error("authorize authenticated_qurl_public_key_b64 is Std base64 (padded); qurl-service decodes RawURLEncoding and would 400 it")
 	}
+}
+
+// TestAuthWithNHPClaims_HashDriftGuard covers the #3032 commit-path guard: when
+// the qurl_user_public_key_hash qurl-service echoes in the prepare response
+// diverges from the hash NHP recomputes locally (the revocation-index preimage),
+// the first-knock commit path bumps MetricQurlV2CommitHashDrift; when they match
+// it stays silent.
+func TestAuthWithNHPClaims_HashDriftGuard(t *testing.T) {
+	runFirstKnock := func(t *testing.T, echoedPrepareHash string) (driftCount int) {
+		f := newV2Fixture(t, nil)
+		enableV2(t, f.issuer.trustStore(t))
+		ac := defaultACRouting()
+		rec := newAdmissionRecorder(t, ac)
+		rec.prepareBody = prepareBodyJSON(echoedPrepareHash, ac) // vary the echoed hash
+		setRecordingResolver(t, rec)
+
+		helper := &plugins.NhpServerPluginHelper{
+			AspData:                testAspData(f.resourceB64, 60),
+			ServerCellPublicKeyB64: f.cellStdB64,
+			IncrCounter: func(name string) {
+				if name == nhpserver.MetricQurlV2CommitHashDrift {
+					driftCount++
+				}
+			},
+			AuthWithNhpCallbackFunc: func(req *common.NhpAuthRequest, _ *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+				req.Ack.ErrCode = common.ErrSuccess.ErrorCode()
+				return req.Ack, nil
+			},
+		}
+		if _, err := AuthWithNHP(f.req, helper); err != nil {
+			t.Fatalf("AuthWithNHP: %v", err)
+		}
+		return driftCount
+	}
+
+	t.Run("drift bumps the metric", func(t *testing.T) {
+		// A value that cannot equal hex(sha256(...)) of the fixture's claims key.
+		if got := runFirstKnock(t, "not-the-real-hash"); got != 1 {
+			t.Errorf("MetricQurlV2CommitHashDrift fired %d times, want 1 (echoed hash != local recompute)", got)
+		}
+	})
+	t.Run("matching hash stays silent", func(t *testing.T) {
+		agentURL, _ := x25519KeyPair(t, 0x40) // the key newV2Fixture signs into the claims
+		if got := runFirstKnock(t, mustPubKeyHashB64(t, agentURL)); got != 0 {
+			t.Errorf("MetricQurlV2CommitHashDrift fired %d times, want 0 (hashes match)", got)
+		}
+	})
 }
 
 // TestAuthWithNHPClaims_LivenessPrecedesAuthorizeRefresh is the #2770 fence:

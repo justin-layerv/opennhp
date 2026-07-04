@@ -216,12 +216,40 @@ func authWithNHPClaims(req *common.NhpAuthRequest, helper *plugins.NhpServerPlug
 	// it. (TTL is the backstop for a client that prepares and then vanishes — NHP
 	// has not vanished on a transient commit failure; it knows the lease is
 	// pending.) We do NOT open the AC.
+	// #3032 drift guard: qurl-service echoed qurl_user_public_key_hash in the
+	// prepare response (commit uses it to locate the admission state row), while
+	// NHP recomputes the same hash locally for the AC revocation index
+	// (revocationHashesFromClaims). Both are hex(sha256(base64url key)) by contract,
+	// so they MUST be equal. If a future hash-format drift makes them differ, commit
+	// still succeeds (the echoed value locates the row) but the revocation index
+	// would key by a different value and targeted user-key revocation would silently
+	// miss — so make the drift observable here instead of latent.
+	if localHash, hErr := qurlv2.PublicKeyHashFromB64(claims.QurlUserPublicKeyB64); hErr == nil && localHash != prepResp.QurlUserPublicKeyHash {
+		log.Warning("[QURL] authWithNHPClaims: qurl_user_public_key_hash DRIFT admission=%s: qurl-service=%s nhp-local=%s (revocation index may silently miss; contract requires the same preimage)",
+			prepResp.AdmissionID, prepResp.QurlUserPublicKeyHash, localHash)
+		// Metric (not just the log) so this security-relevant drift is alertable
+		// rather than reliant on someone reading logs.
+		if helper.IncrCounter != nil {
+			helper.IncrCounter(nhpserver.MetricQurlV2CommitHashDrift)
+		}
+	}
+
 	commitCtx, commitDone := context.WithTimeout(context.Background(), qurlAuthorizeTimeout)
-	commitErr := resolver.CommitAdmission(commitCtx, prepResp.AdmissionID, prepResp.QurlUserPublicKeyHash, clientIP, requestID)
+	commitErr := resolver.CommitAdmission(commitCtx, admissionFinalizeParams{
+		admissionID:           prepResp.AdmissionID,
+		qurlUserPublicKeyHash: prepResp.QurlUserPublicKeyHash,
+		srcIP:                 clientIP,
+		requestID:             requestID,
+	})
 	commitDone()
 	if commitErr != nil {
 		log.Error("[QURL] authWithNHPClaims: commit failed admission=%s client=%s: %v", prepResp.AdmissionID, clientIP, commitErr)
-		cancelPendingAdmission(prepResp.AdmissionID, prepResp.QurlUserPublicKeyHash, requestID, clientIP)
+		cancelPendingAdmission(admissionFinalizeParams{
+			admissionID:           prepResp.AdmissionID,
+			qurlUserPublicKeyHash: prepResp.QurlUserPublicKeyHash,
+			srcIP:                 clientIP,
+			requestID:             requestID,
+		})
 		return failAck(ackMsg, common.ErrKnockApiRequestFailed, "qurl v2 admission commit failed")
 	}
 
@@ -473,12 +501,12 @@ func buildV2ResourceData(resp *AdmissionPrepareResponse, claims *qurlv2.Claims, 
 // only releases a pending lease), so this is safe even in the unlikely
 // commit-landed-but-response-lost case. Cancel failure is logged, not fatal: the
 // lease TTL is the ultimate backstop.
-func cancelPendingAdmission(admissionID, qurlUserPublicKeyHash, requestID, clientIP string) {
+func cancelPendingAdmission(in admissionFinalizeParams) {
 	ctx, cancel := context.WithTimeout(context.Background(), qurlAuthorizeTimeout)
 	defer cancel()
-	if err := resolver.CancelAdmission(ctx, admissionID, qurlUserPublicKeyHash, clientIP, requestID); err != nil {
+	if err := resolver.CancelAdmission(ctx, in); err != nil {
 		log.Warning("[QURL] authWithNHPClaims: cancel after failed commit did not confirm admission=%s client=%s (lease TTL will reclaim): %v",
-			admissionID, clientIP, err)
+			in.admissionID, in.srcIP, err)
 	}
 }
 

@@ -300,15 +300,26 @@ func (r *QurlResolver) PrepareAdmission(ctx context.Context, req *AdmissionPrepa
 // the AC. Because a failed commit leaves prepare's lease still pending, the
 // caller releases it via CancelAdmission (the TTL is only the backstop for a
 // vanished client).
-func (r *QurlResolver) CommitAdmission(ctx context.Context, admissionID, qurlUserPublicKeyHash, srcIP, requestID string) error {
-	return r.admissionLifecycleCall(ctx, admissionCommitPathFmt, admissionID, qurlUserPublicKeyHash, srcIP, requestID, "commit")
+func (r *QurlResolver) CommitAdmission(ctx context.Context, in admissionFinalizeParams) error {
+	return r.admissionLifecycleCall(ctx, admissionCommitPathFmt, in, "commit")
 }
 
 // CancelAdmission releases the pending prepare lease for admissionID. It is valid
 // ONLY before a successful commit. After commit succeeds, consume/session state
 // is durable and must not be silently undone, so the caller never cancels then.
-func (r *QurlResolver) CancelAdmission(ctx context.Context, admissionID, qurlUserPublicKeyHash, srcIP, requestID string) error {
-	return r.admissionLifecycleCall(ctx, admissionCancelPathFmt, admissionID, qurlUserPublicKeyHash, srcIP, requestID, "cancel")
+func (r *QurlResolver) CancelAdmission(ctx context.Context, in admissionFinalizeParams) error {
+	return r.admissionLifecycleCall(ctx, admissionCancelPathFmt, in, "cancel")
+}
+
+// admissionFinalizeParams carries the inputs for a commit/cancel lifecycle call.
+// A struct — not four positional strings — so a call site cannot silently
+// transpose the same-typed srcIP/requestID (a swap would compile and only fail at
+// runtime). See #3031.
+type admissionFinalizeParams struct {
+	admissionID           string
+	qurlUserPublicKeyHash string
+	srcIP                 string
+	requestID             string
 }
 
 // admissionLifecycleRequest is the commit/cancel body. qurl-service keys the
@@ -327,24 +338,24 @@ type admissionLifecycleRequest struct {
 // admissionLifecycleCall is the shared commit/cancel POST. Both take the
 // admission id in the path and a body carrying the state-row key
 // (qurl_user_public_key_hash); a 2xx means success.
-func (r *QurlResolver) admissionLifecycleCall(ctx context.Context, pathFmt, admissionID, qurlUserPublicKeyHash, srcIP, requestID, op string) error {
+func (r *QurlResolver) admissionLifecycleCall(ctx context.Context, pathFmt string, in admissionFinalizeParams, op string) error {
 	if r.serviceToken == "" {
 		return fmt.Errorf("%w: service token is empty", ErrAdmissionService)
 	}
-	if admissionID == "" {
+	if in.admissionID == "" {
 		return fmt.Errorf("%w: empty admission id for %s", ErrAdmissionService, op)
 	}
-	if qurlUserPublicKeyHash == "" {
+	if in.qurlUserPublicKeyHash == "" {
 		return fmt.Errorf("%w: empty qurl_user_public_key_hash for %s", ErrAdmissionService, op)
 	}
 
-	body, err := json.Marshal(admissionLifecycleRequest{QurlUserPublicKeyHash: qurlUserPublicKeyHash, SrcIP: srcIP})
+	body, err := json.Marshal(admissionLifecycleRequest{QurlUserPublicKeyHash: in.qurlUserPublicKeyHash, SrcIP: in.srcIP})
 	if err != nil {
 		return fmt.Errorf("%w: marshal %s request: %w", ErrAdmissionService, op, err)
 	}
 
-	path := fmt.Sprintf(pathFmt, url.PathEscape(admissionID))
-	respBody, status, err := r.doAdmissionRequest(ctx, http.MethodPost, path, body, requestID)
+	path := fmt.Sprintf(pathFmt, url.PathEscape(in.admissionID))
+	respBody, status, err := r.doAdmissionRequest(ctx, http.MethodPost, path, body, in.requestID)
 	if err != nil {
 		return err
 	}

@@ -100,7 +100,7 @@ func TestCommitAdmission(t *testing.T) {
 			_ = json.NewDecoder(req.Body).Decode(&gotBody)
 			w.WriteHeader(http.StatusOK)
 		})
-		if err := r.CommitAdmission(context.Background(), "adm_xyz", "qhash123", "203.0.113.1", "req-1"); err != nil {
+		if err := r.CommitAdmission(context.Background(), admissionFinalizeParams{admissionID: "adm_xyz", qurlUserPublicKeyHash: "qhash123", srcIP: "203.0.113.1", requestID: "req-1"}); err != nil {
 			t.Fatalf("CommitAdmission: %v", err)
 		}
 		if gotPath != "/internal/v2/qurl/admissions/adm_xyz/commit" {
@@ -120,7 +120,7 @@ func TestCommitAdmission(t *testing.T) {
 		r := newAdmissionTestResolver(t, func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		})
-		if err := r.CommitAdmission(context.Background(), "adm_xyz", "qhash", "", ""); !errors.Is(err, ErrAdmissionService) {
+		if err := r.CommitAdmission(context.Background(), admissionFinalizeParams{admissionID: "adm_xyz", qurlUserPublicKeyHash: "qhash", srcIP: "", requestID: ""}); !errors.Is(err, ErrAdmissionService) {
 			t.Fatalf("err = %v, want ErrAdmissionService", err)
 		}
 	})
@@ -131,7 +131,7 @@ func TestCommitAdmission(t *testing.T) {
 			called = true
 			w.WriteHeader(http.StatusOK)
 		})
-		if err := r.CommitAdmission(context.Background(), "", "qhash", "", ""); !errors.Is(err, ErrAdmissionService) {
+		if err := r.CommitAdmission(context.Background(), admissionFinalizeParams{admissionID: "", qurlUserPublicKeyHash: "qhash", srcIP: "", requestID: ""}); !errors.Is(err, ErrAdmissionService) {
 			t.Fatalf("err = %v, want ErrAdmissionService", err)
 		}
 		if called {
@@ -148,7 +148,7 @@ func TestCancelAdmission(t *testing.T) {
 		_ = json.NewDecoder(req.Body).Decode(&gotBody)
 		w.WriteHeader(http.StatusOK)
 	})
-	if err := r.CancelAdmission(context.Background(), "adm_abc", "qhash", "203.0.113.1", "req-2"); err != nil {
+	if err := r.CancelAdmission(context.Background(), admissionFinalizeParams{admissionID: "adm_abc", qurlUserPublicKeyHash: "qhash", srcIP: "203.0.113.1", requestID: "req-2"}); err != nil {
 		t.Fatalf("CancelAdmission: %v", err)
 	}
 	if gotPath != "/internal/v2/qurl/admissions/adm_abc/cancel" {
@@ -168,10 +168,10 @@ func TestAdmission_EmptyServiceToken(t *testing.T) {
 	if _, err := r.PrepareAdmission(context.Background(), &AdmissionPrepareRequest{}); !errors.Is(err, ErrAdmissionService) {
 		t.Errorf("prepare err = %v", err)
 	}
-	if err := r.CommitAdmission(context.Background(), "a", "qhash", "", ""); !errors.Is(err, ErrAdmissionService) {
+	if err := r.CommitAdmission(context.Background(), admissionFinalizeParams{admissionID: "a", qurlUserPublicKeyHash: "qhash", srcIP: "", requestID: ""}); !errors.Is(err, ErrAdmissionService) {
 		t.Errorf("commit err = %v", err)
 	}
-	if err := r.CancelAdmission(context.Background(), "a", "qhash", "", ""); !errors.Is(err, ErrAdmissionService) {
+	if err := r.CancelAdmission(context.Background(), admissionFinalizeParams{admissionID: "a", qurlUserPublicKeyHash: "qhash", srcIP: "", requestID: ""}); !errors.Is(err, ErrAdmissionService) {
 		t.Errorf("cancel err = %v", err)
 	}
 }

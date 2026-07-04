@@ -657,6 +657,15 @@ const (
 	// are silently becoming un-revocable-by-key. Emitted on the knock-path helper
 	// (NewNhpServerHelper binds IncrCounter), so it is live on the real v2 path.
 	MetricQurlV2RevocationHashError = "QurlV2RevocationHashError"
+	// MetricQurlV2CommitHashDrift fires on the first-knock commit path when the
+	// qurl_user_public_key_hash qurl-service echoed in the prepare response
+	// diverges from the hash NHP recomputes locally for the AC revocation index.
+	// Both are hex(sha256(base64url key)) by contract, so a non-zero rate means the
+	// cross-repo hash preimage has drifted: commit still succeeds (the echoed value
+	// locates the state row) but targeted user-key revocation would silently miss.
+	// A metric (not just the log) makes that latent, security-relevant drift
+	// alertable rather than reliant on someone reading logs.
+	MetricQurlV2CommitHashDrift = "QurlV2CommitHashDrift"
 	// MetricLicenseValidationRateLimited fires from BOTH call sites:
 	// the hoisted preflight check (closes the F5 amplification
 	// surface) AND the deeper in-validateACLicense check. It's the
