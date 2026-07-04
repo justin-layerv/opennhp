@@ -1,0 +1,19 @@
+{
+  "data": {
+    "ac_routing": {
+      "ac_id": "ac_use2_01",
+      "dest_host": "app.internal",
+      "dest_port": 443
+    },
+    "admission_id": "adm_2f8c1b",
+    "open_time": 30,
+    "qurl_id": "qurl_abc123",
+    "qurl_site_url": "https://app.example.qurl.site/",
+    "qurl_user_public_key_hash": "fc714cf45d81731af38f58dcd6c7a39f1a37dd699c67281a2f5c99814029b574",
+    "remaining_seconds": 3599,
+    "resource_public_key_b64": "Uai_5UQkykFb3hZayn_vTNfjqmxRzG5YJ1kvxKcj7Yk",
+    "session_duration": 300,
+    "session_id": "qs_9d4e"
+  },
+  "success": true
+}

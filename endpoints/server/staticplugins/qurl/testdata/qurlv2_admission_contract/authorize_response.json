@@ -1,0 +1,12 @@
+{
+  "data": {
+    "ac_routing": {
+      "ac_id": "ac_use2_01",
+      "dest_host": "app.internal",
+      "dest_port": 443
+    },
+    "remaining_seconds": 3540,
+    "session_id": "qs_9d4e"
+  },
+  "success": true
+}

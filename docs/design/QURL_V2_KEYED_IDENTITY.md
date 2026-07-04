@@ -689,6 +689,46 @@ still-open session of a consumed qURL are wrongly denied and the session dies at
 the first `OpenTime` expiry. Today's `AuthorizeResourceAccess` already behaves
 this way; v2 must preserve it and not regress into a qURL-status check.
 
+### Admission-wire contract fixtures (canonical checksum)
+
+This admission wire (the prepare / commit / cancel / authorize request and
+response bodies above) is the source of truth for two independent contract-test
+fixture sets that MUST stay byte-identical:
+
+- **nhp** — `endpoints/server/staticplugins/qurl/testdata/qurlv2_admission_contract/`
+  (asserted by `TestAdmissionWireContract`, which pins the nhp-server client DTOs).
+- **qurl-service** — `tests/contract/testdata/qurlv2_admission/` (asserts the
+  server side).
+
+Both repos additionally assert that their own fixture set hashes to a single
+canonical value:
+
+```
+canonical admission-wire fixture-set SHA256 =
+0967eb6f4107a43028848867b6353db4f6cb2ef14bcdcc74d366009c8aea5678
+```
+
+Computation (identical in both repos): take every `*.json` in the fixture
+directory (`README.md` excluded), sort filenames in byte order, concatenate the
+raw file bytes in that order with **no separators**, then SHA256 and lowercase-hex.
+
+What this checksum does and does not guarantee — be precise:
+
+- It **does** catch a local fixture edit: changing a fixture in one repo without
+  also updating that repo's committed checksum (this value) fails that repo's CI,
+  forcing the editor to bump the hash here and re-copy the fixtures deliberately.
+- It does **not** mechanically detect the other repo silently diverging. Each repo
+  hashes only its own directory against its own copy of this constant; neither
+  side reads the other's bytes. Two-repo byte-identity is a human lockstep
+  discipline, not a mechanically-closed invariant. A green check means "the
+  committed fixtures still hash to this value", not "the two repos agree" and not
+  "these bytes match the live service".
+
+Any change to a fixture MUST therefore update, in lockstep in the same change:
+this hash (in the design doc and each repo's test constant), the fixtures in
+**both** repos, and (if the wire itself changed) the request/response bodies
+documented above.
+
 ## AC Admission and Immediate Revocation
 
 Current AC expiry flushing already uses a hashed timer wheel. That is the right

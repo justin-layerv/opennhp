@@ -1,0 +1,5 @@
+{
+  "agent_key_b64url": "IuLEawuxOn7C6vxo26mscfQ2B5-QjCUHcdrRm_uBgi4",
+  "agent_key_hash_hex": "fc714cf45d81731af38f58dcd6c7a39f1a37dd699c67281a2f5c99814029b574",
+  "note": "hash = hex(sha256(base64url_decode(agent_key_b64url)))"
+}

@@ -22,3 +22,8 @@ Dockerfile* text eol=lf
 # (nhp-server-docker.pkr.hcl was wholly CRLF) can't drift the others.
 *.hcl text eol=lf
 *.pkr.hcl text eol=lf
+
+# qURL v2 admission-wire contract fixtures are byte-sensitive: TestAdmissionWireContract
+# hashes the raw bytes of the set (canonicalFixtureSetSHA256), so a CRLF checkout on
+# Windows would spuriously break the checksum. Pin LF for these fixtures explicitly.
+endpoints/server/staticplugins/qurl/testdata/qurlv2_admission_contract/*.json text eol=lf
