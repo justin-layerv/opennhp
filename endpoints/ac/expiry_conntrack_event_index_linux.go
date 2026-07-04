@@ -25,7 +25,7 @@ import (
 type ctEventIndex struct {
 	mu       sync.RWMutex
 	byQuery  map[ctIndexQueryKey]map[ctOriginKey]struct{}
-	byOrigin map[ctOriginKey]*conntrack.IPTuple
+	byOrigin map[ctOriginKey]struct{}
 	// onUnhealthy is installed only after a generation has completed backfill
 	// while healthy. Resync candidates are armed before the final pre-swap
 	// health/closed checks, so recursive recovery is coalesced by the flusher's
@@ -74,13 +74,19 @@ type ctOriginKey struct {
 	icmpv6ID     uint16
 	icmpv6Type   uint8
 	icmpv6Code   uint8
-	zone         uint16
-	hasZone      bool
+	// protoFields keys on optional field presence, not just value, so present
+	// zero-valued ICMP fields do not collapse into absent fields. Conntrack
+	// reports tuple field presence consistently for a flow across
+	// NEW/UPDATE/DESTROY, so destroy events re-derive the same key for pruning.
+	protoFields uint16
+	zone        uint16
+	hasZone     bool
 }
 
 type ctPendingEvent struct {
 	group  conntrack.NetlinkGroup
-	origin *conntrack.IPTuple
+	origin ctOriginKey
+	ok     bool
 }
 
 // defaultConntrackEventReadBuffer gives the monitor socket more burst headroom
@@ -94,10 +100,21 @@ const defaultConntrackEventReadBuffer = 4 << 20
 // safe dump fallback rather than risking startup OOM on a high-churn table.
 const defaultConntrackEventPendingLimit = 1 << 18
 
+const (
+	ctOriginHasSrcPort uint16 = 1 << iota
+	ctOriginHasDstPort
+	ctOriginHasIcmpID
+	ctOriginHasIcmpType
+	ctOriginHasIcmpCode
+	ctOriginHasIcmpv6ID
+	ctOriginHasIcmpv6Type
+	ctOriginHasIcmpv6Code
+)
+
 func newCtEventIndex() (*ctEventIndex, error) {
 	idx := &ctEventIndex{
 		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin:    make(map[ctOriginKey]struct{}),
 		backfilling: true,
 	}
 
@@ -192,7 +209,7 @@ func (idx *ctEventIndex) reclaimMirrorLocked() {
 		return
 	}
 	idx.byQuery = make(map[ctIndexQueryKey]map[ctOriginKey]struct{})
-	idx.byOrigin = make(map[ctOriginKey]*conntrack.IPTuple)
+	idx.byOrigin = make(map[ctOriginKey]struct{})
 	idx.originCount.Store(0)
 }
 
@@ -267,14 +284,14 @@ func (idx *ctEventIndex) handleEvent(con conntrack.Con) int {
 
 func (idx *ctEventIndex) rebuild(cons []conntrack.Con) int {
 	nextByQuery := make(map[ctIndexQueryKey]map[ctOriginKey]struct{})
-	nextByOrigin := make(map[ctOriginKey]*conntrack.IPTuple)
+	nextByOrigin := make(map[ctOriginKey]struct{})
 	indexed := 0
 	for i := range cons {
-		key, origin, ok := indexedOriginFromCon(&cons[i])
+		key, ok := indexedOriginFromCon(&cons[i])
 		if !ok {
 			continue
 		}
-		addIndexedOrigin(nextByQuery, nextByOrigin, key, origin)
+		addIndexedOrigin(nextByQuery, nextByOrigin, key)
 		indexed++
 	}
 
@@ -314,55 +331,39 @@ func (idx *ctEventIndex) enableUnhealthyCallbackIfHealthy(onUnhealthy func(error
 	return true
 }
 
-func (idx *ctEventIndex) upsertOriginLocked(origin *conntrack.IPTuple, clone bool) {
-	key, ok := originKeyFromIPTuple(origin)
-	if !ok {
-		return
-	}
-	if _, exists := idx.byOrigin[key]; exists {
-		return
-	}
-	if clone {
-		origin = cloneIPTuple(origin)
-		if origin == nil {
-			return
-		}
-	}
-	addIndexedOrigin(idx.byQuery, idx.byOrigin, key, origin)
-	idx.originCount.Add(1)
-}
-
-func (idx *ctEventIndex) removeOriginLocked(origin *conntrack.IPTuple) {
-	key, ok := originKeyFromIPTuple(origin)
-	if !ok {
-		return
-	}
-	if removeIndexedOrigin(idx.byQuery, idx.byOrigin, key) {
-		idx.originCount.Add(-1)
-	}
-}
-
 func pendingEventFromCon(con conntrack.Con) ctPendingEvent {
+	key, ok := originKeyFromIPTuple(con.Origin)
 	return ctPendingEvent{
 		group:  con.Info.NetlinkGroup,
-		origin: cloneIPTuple(con.Origin),
+		origin: key,
+		ok:     ok,
 	}
 }
 
 func (idx *ctEventIndex) applyEventLocked(con conntrack.Con) {
-	idx.applyGroupOriginLocked(con.Info.NetlinkGroup, con.Origin, true)
+	key, ok := originKeyFromIPTuple(con.Origin)
+	idx.applyGroupOriginLocked(con.Info.NetlinkGroup, key, ok)
 }
 
 func (idx *ctEventIndex) applyPendingEventLocked(event ctPendingEvent) {
-	idx.applyGroupOriginLocked(event.group, event.origin, false)
+	idx.applyGroupOriginLocked(event.group, event.origin, event.ok)
 }
 
-func (idx *ctEventIndex) applyGroupOriginLocked(group conntrack.NetlinkGroup, origin *conntrack.IPTuple, clone bool) {
+func (idx *ctEventIndex) applyGroupOriginLocked(group conntrack.NetlinkGroup, key ctOriginKey, ok bool) {
+	if !ok {
+		return
+	}
 	switch group {
 	case conntrack.NetlinkCtDestroy:
-		idx.removeOriginLocked(origin)
+		if removeIndexedOrigin(idx.byQuery, idx.byOrigin, key) {
+			idx.originCount.Add(-1)
+		}
 	case conntrack.NetlinkCtNew, conntrack.NetlinkCtUpdate:
-		idx.upsertOriginLocked(origin, clone)
+		if _, exists := idx.byOrigin[key]; exists {
+			return
+		}
+		addIndexedOrigin(idx.byQuery, idx.byOrigin, key)
+		idx.originCount.Add(1)
 	}
 }
 
@@ -407,11 +408,10 @@ func (idx *ctEventIndex) originsForKey(key FlowKey) ([]*conntrack.IPTuple, bool)
 	}
 	origins := make([]*conntrack.IPTuple, 0, len(originKeys))
 	for originKey := range originKeys {
-		origin, ok := idx.byOrigin[originKey]
-		if !ok {
+		if _, ok := idx.byOrigin[originKey]; !ok {
 			continue
 		}
-		origins = append(origins, cloneIPTuple(origin))
+		origins = append(origins, originTupleFromKey(originKey))
 	}
 	idx.mu.RUnlock()
 	return origins, true
@@ -449,8 +449,8 @@ func (idx *ctEventIndex) PendingOverflowCount() uint64 {
 	return idx.pendingOverflows.Load()
 }
 
-func addIndexedOrigin(byQuery map[ctIndexQueryKey]map[ctOriginKey]struct{}, byOrigin map[ctOriginKey]*conntrack.IPTuple, key ctOriginKey, origin *conntrack.IPTuple) {
-	byOrigin[key] = origin
+func addIndexedOrigin(byQuery map[ctIndexQueryKey]map[ctOriginKey]struct{}, byOrigin map[ctOriginKey]struct{}, key ctOriginKey) {
+	byOrigin[key] = struct{}{}
 	queries, n := indexQueriesForOriginKey(key)
 	for i := 0; i < n; i++ {
 		query := queries[i]
@@ -463,7 +463,7 @@ func addIndexedOrigin(byQuery map[ctIndexQueryKey]map[ctOriginKey]struct{}, byOr
 	}
 }
 
-func removeIndexedOrigin(byQuery map[ctIndexQueryKey]map[ctOriginKey]struct{}, byOrigin map[ctOriginKey]*conntrack.IPTuple, key ctOriginKey) bool {
+func removeIndexedOrigin(byQuery map[ctIndexQueryKey]map[ctOriginKey]struct{}, byOrigin map[ctOriginKey]struct{}, key ctOriginKey) bool {
 	if _, ok := byOrigin[key]; !ok {
 		return false
 	}
@@ -483,19 +483,15 @@ func removeIndexedOrigin(byQuery map[ctIndexQueryKey]map[ctOriginKey]struct{}, b
 	return true
 }
 
-func indexedOriginFromCon(con *conntrack.Con) (ctOriginKey, *conntrack.IPTuple, bool) {
+func indexedOriginFromCon(con *conntrack.Con) (ctOriginKey, bool) {
 	if con == nil {
-		return ctOriginKey{}, nil, false
+		return ctOriginKey{}, false
 	}
 	key, ok := originKeyFromIPTuple(con.Origin)
 	if !ok {
-		return ctOriginKey{}, nil, false
+		return ctOriginKey{}, false
 	}
-	origin := cloneIPTuple(con.Origin)
-	if origin == nil {
-		return ctOriginKey{}, nil, false
-	}
-	return key, origin, true
+	return key, true
 }
 
 func indexQueryForFlowKey(key FlowKey) ctIndexQueryKey {
@@ -572,12 +568,10 @@ func originKeyFromIPTuple(origin *conntrack.IPTuple) (ctOriginKey, bool) {
 
 func originKeyFromTuple(t ctTuple, origin *conntrack.IPTuple) (ctOriginKey, bool) {
 	key := ctOriginKey{
-		family:  familyForIPs(t.srcIP, t.dstIP),
-		srcIP:   t.srcIP,
-		dstIP:   t.dstIP,
-		proto:   t.proto,
-		srcPort: t.srcPort,
-		dstPort: t.dstPort,
+		family: familyForIPs(t.srcIP, t.dstIP),
+		srcIP:  t.srcIP,
+		dstIP:  t.dstIP,
+		proto:  t.proto,
 	}
 	if origin == nil {
 		return key, false
@@ -588,91 +582,100 @@ func originKeyFromTuple(t ctTuple, origin *conntrack.IPTuple) (ctOriginKey, bool
 	}
 	if origin.Proto != nil {
 		p := origin.Proto
+		if p.SrcPort != nil {
+			key.srcPort = *p.SrcPort
+			key.protoFields |= ctOriginHasSrcPort
+		}
+		if p.DstPort != nil {
+			key.dstPort = *p.DstPort
+			key.protoFields |= ctOriginHasDstPort
+		}
 		if p.IcmpID != nil {
 			key.icmpID = *p.IcmpID
+			key.protoFields |= ctOriginHasIcmpID
 		}
 		if p.IcmpType != nil {
 			key.icmpType = *p.IcmpType
+			key.protoFields |= ctOriginHasIcmpType
 		}
 		if p.IcmpCode != nil {
 			key.icmpCode = *p.IcmpCode
+			key.protoFields |= ctOriginHasIcmpCode
 		}
 		if p.Icmpv6ID != nil {
 			key.icmpv6ID = *p.Icmpv6ID
+			key.protoFields |= ctOriginHasIcmpv6ID
 		}
 		if p.Icmpv6Type != nil {
 			key.icmpv6Type = *p.Icmpv6Type
+			key.protoFields |= ctOriginHasIcmpv6Type
 		}
 		if p.Icmpv6Code != nil {
 			key.icmpv6Code = *p.Icmpv6Code
+			key.protoFields |= ctOriginHasIcmpv6Code
 		}
 	}
 	return key, true
 }
 
-func cloneIPTuple(in *conntrack.IPTuple) *conntrack.IPTuple {
-	if in == nil {
-		return nil
+// originTupleFromKey is the inverse of originKeyFromIPTuple for indexed
+// delete/prune flow: removeOrigins re-keys successfully deleted tuples through
+// originKeyFromIPTuple, and the round-trip test fences that coupling.
+func originTupleFromKey(key ctOriginKey) *conntrack.IPTuple {
+	src := ipFromKeyBytes(key.family, key.srcIP)
+	dst := ipFromKeyBytes(key.family, key.dstIP)
+	// ctOriginKey is only created after conToTuple accepts a non-nil
+	// Proto.Number, so the compact key always carries the delete protocol.
+	proto := &conntrack.ProtoTuple{Number: ptrTo(key.proto)}
+	if key.hasProtoField(ctOriginHasSrcPort) {
+		proto.SrcPort = ptrTo(key.srcPort)
 	}
-	out := &conntrack.IPTuple{}
-	if in.Src != nil {
-		src := append(net.IP(nil), (*in.Src)...)
-		out.Src = &src
+	if key.hasProtoField(ctOriginHasDstPort) {
+		proto.DstPort = ptrTo(key.dstPort)
 	}
-	if in.Dst != nil {
-		dst := append(net.IP(nil), (*in.Dst)...)
-		out.Dst = &dst
+	if key.hasProtoField(ctOriginHasIcmpID) {
+		proto.IcmpID = ptrTo(key.icmpID)
 	}
-	if in.Zone != nil {
-		zone := *in.Zone
-		out.Zone = &zone
+	if key.hasProtoField(ctOriginHasIcmpType) {
+		proto.IcmpType = ptrTo(key.icmpType)
 	}
-	if in.Proto != nil {
-		out.Proto = cloneProtoTuple(in.Proto)
+	if key.hasProtoField(ctOriginHasIcmpCode) {
+		proto.IcmpCode = ptrTo(key.icmpCode)
+	}
+	if key.hasProtoField(ctOriginHasIcmpv6ID) {
+		proto.Icmpv6ID = ptrTo(key.icmpv6ID)
+	}
+	if key.hasProtoField(ctOriginHasIcmpv6Type) {
+		proto.Icmpv6Type = ptrTo(key.icmpv6Type)
+	}
+	if key.hasProtoField(ctOriginHasIcmpv6Code) {
+		proto.Icmpv6Code = ptrTo(key.icmpv6Code)
+	}
+	out := &conntrack.IPTuple{
+		Src:   &src,
+		Dst:   &dst,
+		Proto: proto,
+	}
+	if key.hasZone {
+		out.Zone = ptrTo(key.zone)
 	}
 	return out
 }
 
-func cloneProtoTuple(in *conntrack.ProtoTuple) *conntrack.ProtoTuple {
-	if in == nil {
-		return nil
+func (key ctOriginKey) hasProtoField(field uint16) bool {
+	return key.protoFields&field != 0
+}
+
+func ipFromKeyBytes(family conntrack.Family, raw [16]byte) net.IP {
+	// Conntrack delete marshaling receives the netlink family explicitly, so
+	// reconstruct address length from that family instead of re-inferring it
+	// from IPv4-mapped bytes as FlowKey display helpers do.
+	if family == conntrack.IPv4 {
+		return append(net.IP(nil), raw[12:]...)
 	}
-	out := &conntrack.ProtoTuple{}
-	if in.Number != nil {
-		v := *in.Number
-		out.Number = &v
-	}
-	if in.SrcPort != nil {
-		v := *in.SrcPort
-		out.SrcPort = &v
-	}
-	if in.DstPort != nil {
-		v := *in.DstPort
-		out.DstPort = &v
-	}
-	if in.IcmpID != nil {
-		v := *in.IcmpID
-		out.IcmpID = &v
-	}
-	if in.IcmpType != nil {
-		v := *in.IcmpType
-		out.IcmpType = &v
-	}
-	if in.IcmpCode != nil {
-		v := *in.IcmpCode
-		out.IcmpCode = &v
-	}
-	if in.Icmpv6ID != nil {
-		v := *in.Icmpv6ID
-		out.Icmpv6ID = &v
-	}
-	if in.Icmpv6Type != nil {
-		v := *in.Icmpv6Type
-		out.Icmpv6Type = &v
-	}
-	if in.Icmpv6Code != nil {
-		v := *in.Icmpv6Code
-		out.Icmpv6Code = &v
-	}
-	return out
+	return append(net.IP(nil), raw[:]...)
+}
+
+func ptrTo[T any](v T) *T {
+	return &v
 }

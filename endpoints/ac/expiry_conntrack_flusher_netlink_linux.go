@@ -515,9 +515,10 @@ func (f *ConntrackFlusher) deleteMatchedOrigins(ctx context.Context, c *ctConn, 
 			}
 			break
 		}
-		// Reuse the kernel's own reported origin tuple verbatim for the
-		// delete: it carries the full 5-tuple (incl. source port, and for
-		// ICMP the id/type/code) the kernel needs to find the exact entry.
+		// Delete the full origin tuple for this entry. Dump fallback uses the
+		// kernel-reported tuple directly; the indexed path reconstructs it
+		// from the compact ctOriginKey fields the kernel needs to find the
+		// exact entry.
 		if derr := f.deleteOriginWithRetry(ctx, c, family, origin, deadline); derr != nil {
 			consecutiveDeleteErrors++
 			if firstErr == nil {

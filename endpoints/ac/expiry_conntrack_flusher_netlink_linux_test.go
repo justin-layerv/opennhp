@@ -157,6 +157,13 @@ func testConntrackCon(t *testing.T, src, dst string, sport, dport uint16, proto 
 	}}
 }
 
+func testIPLen(ip *net.IP) int {
+	if ip == nil {
+		return 0
+	}
+	return len(*ip)
+}
+
 func testPartialTCPCon(t *testing.T, src, dst string) conntrack.Con {
 	t.Helper()
 	u8 := func(v uint8) *uint8 { return &v }
@@ -306,7 +313,7 @@ func TestFlushNetlinkFakeOpsDeletesMatchingAndCounts(t *testing.T) {
 func TestConntrackEventIndexQueriesAndDestroy(t *testing.T) {
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	con := testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP)
 	if got := idx.rebuild([]conntrack.Con{con}); got != 1 {
@@ -349,7 +356,7 @@ func TestConntrackEventIndexQueriesAndDestroy(t *testing.T) {
 func TestConntrackEventIndexCanonicalizesDontCareFields(t *testing.T) {
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	idx.rebuild([]conntrack.Con{
 		testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
@@ -379,10 +386,314 @@ func TestConntrackEventIndexCanonicalizesDontCareFields(t *testing.T) {
 	}
 }
 
+func TestConntrackEventIndexReconstructsDeleteTupleFromCompactKey(t *testing.T) {
+	ip := func(s string) *net.IP {
+		parsed := net.ParseIP(s)
+		if parsed == nil {
+			t.Fatalf("net.ParseIP(%q) returned nil", s)
+		}
+		return &parsed
+	}
+
+	t.Run("icmp_v4_preserves_presence_and_zero_values", func(t *testing.T) {
+		zone := uint16(12)
+		original := conntrack.Con{Origin: &conntrack.IPTuple{
+			Src:  ip("192.0.2.10"),
+			Dst:  ip("198.51.100.20"),
+			Zone: &zone,
+			Proto: &conntrack.ProtoTuple{
+				Number:   ptrTo(uint8(unix.IPPROTO_ICMP)),
+				IcmpID:   ptrTo(uint16(7)),
+				IcmpType: ptrTo(uint8(8)),
+				IcmpCode: ptrTo(uint8(0)),
+			},
+		}}
+		idx := &ctEventIndex{
+			byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+			byOrigin: make(map[ctOriginKey]struct{}),
+		}
+		idx.rebuild([]conntrack.Con{original})
+
+		key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoICMP)
+		origins, ok := idx.originsForKey(key)
+		if !ok {
+			t.Fatal("originsForKey(ICMP) reported unhealthy index")
+		}
+		if len(origins) != 1 {
+			t.Fatalf("originsForKey(ICMP) len = %d, want 1", len(origins))
+		}
+		got := origins[0]
+		if got.Src == nil || got.Src.String() != "192.0.2.10" || len(*got.Src) != net.IPv4len {
+			t.Fatalf("reconstructed ICMP src = %v len=%d, want 192.0.2.10 len=%d", got.Src, testIPLen(got.Src), net.IPv4len)
+		}
+		if got.Dst == nil || got.Dst.String() != "198.51.100.20" || len(*got.Dst) != net.IPv4len {
+			t.Fatalf("reconstructed ICMP dst = %v len=%d, want 198.51.100.20 len=%d", got.Dst, testIPLen(got.Dst), net.IPv4len)
+		}
+		if got.Zone == nil || *got.Zone != zone {
+			t.Fatalf("reconstructed zone = %v, want %d", got.Zone, zone)
+		}
+		if got.Proto == nil || got.Proto.Number == nil || *got.Proto.Number != unix.IPPROTO_ICMP {
+			t.Fatalf("reconstructed ICMP proto = %+v", got.Proto)
+		}
+		if got.Proto.SrcPort != nil || got.Proto.DstPort != nil {
+			t.Fatalf("reconstructed ICMP tuple gained port filters: %+v", got.Proto)
+		}
+		if got.Proto.IcmpID == nil || *got.Proto.IcmpID != 7 ||
+			got.Proto.IcmpType == nil || *got.Proto.IcmpType != 8 ||
+			got.Proto.IcmpCode == nil || *got.Proto.IcmpCode != 0 {
+			t.Fatalf("reconstructed ICMP fields = %+v, want id=7 type=8 code=0", got.Proto)
+		}
+	})
+
+	t.Run("icmp_v6_preserves_v6_fields_without_v4_icmp_filters", func(t *testing.T) {
+		original := conntrack.Con{Origin: &conntrack.IPTuple{
+			Src: ip("2001:db8::10"),
+			Dst: ip("2001:db8::20"),
+			Proto: &conntrack.ProtoTuple{
+				Number:     ptrTo(uint8(unix.IPPROTO_ICMPV6)),
+				Icmpv6ID:   ptrTo(uint16(9)),
+				Icmpv6Type: ptrTo(uint8(128)),
+				Icmpv6Code: ptrTo(uint8(0)),
+			},
+		}}
+		idx := &ctEventIndex{
+			byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
+			byOrigin: make(map[ctOriginKey]struct{}),
+		}
+		idx.rebuild([]conntrack.Con{original})
+
+		key := mustFlowKey(t, "2001:db8::10", "2001:db8::20", 0, FlowProtoICMP)
+		origins, ok := idx.originsForKey(key)
+		if !ok {
+			t.Fatal("originsForKey(ICMPv6) reported unhealthy index")
+		}
+		if len(origins) != 1 {
+			t.Fatalf("originsForKey(ICMPv6) len = %d, want 1", len(origins))
+		}
+		got := origins[0]
+		if got.Src == nil || got.Src.String() != "2001:db8::10" || len(*got.Src) != net.IPv6len {
+			t.Fatalf("reconstructed ICMPv6 src = %v len=%d, want 2001:db8::10 len=%d", got.Src, testIPLen(got.Src), net.IPv6len)
+		}
+		if got.Dst == nil || got.Dst.String() != "2001:db8::20" || len(*got.Dst) != net.IPv6len {
+			t.Fatalf("reconstructed ICMPv6 dst = %v len=%d, want 2001:db8::20 len=%d", got.Dst, testIPLen(got.Dst), net.IPv6len)
+		}
+		if got.Proto == nil || got.Proto.Number == nil || *got.Proto.Number != unix.IPPROTO_ICMPV6 {
+			t.Fatalf("reconstructed ICMPv6 proto = %+v", got.Proto)
+		}
+		if got.Proto.IcmpID != nil || got.Proto.IcmpType != nil || got.Proto.IcmpCode != nil {
+			t.Fatalf("reconstructed ICMPv6 tuple gained v4 ICMP filters: %+v", got.Proto)
+		}
+		if got.Proto.Icmpv6ID == nil || *got.Proto.Icmpv6ID != 9 ||
+			got.Proto.Icmpv6Type == nil || *got.Proto.Icmpv6Type != 128 ||
+			got.Proto.Icmpv6Code == nil || *got.Proto.Icmpv6Code != 0 {
+			t.Fatalf("reconstructed ICMPv6 fields = %+v, want id=9 type=128 code=0", got.Proto)
+		}
+	})
+}
+
+func TestConntrackOriginKeyRoundTripsThroughReconstructedTuple(t *testing.T) {
+	ip := func(s string) *net.IP {
+		parsed := net.ParseIP(s)
+		if parsed == nil {
+			t.Fatalf("net.ParseIP(%q) returned nil", s)
+		}
+		return &parsed
+	}
+	zone := uint16(0)
+
+	tests := []struct {
+		name          string
+		origin        *conntrack.IPTuple
+		wantSrcPort   *uint16
+		wantDstPort   *uint16
+		wantICMPCode  *uint8
+		wantICMPv6ID  *uint16
+		wantZone      *uint16
+		wantSourceLen int
+	}{
+		{
+			name: "tcp_v4_ports",
+			origin: &conntrack.IPTuple{
+				Src: ip("192.0.2.10"),
+				Dst: ip("198.51.100.20"),
+				Proto: &conntrack.ProtoTuple{
+					Number:  ptrTo(uint8(unix.IPPROTO_TCP)),
+					SrcPort: ptrTo(uint16(51000)),
+					DstPort: ptrTo(uint16(443)),
+				},
+			},
+			wantSrcPort:   ptrTo(uint16(51000)),
+			wantDstPort:   ptrTo(uint16(443)),
+			wantSourceLen: net.IPv4len,
+		},
+		{
+			name: "udp_v4_ports",
+			origin: &conntrack.IPTuple{
+				Src: ip("192.0.2.30"),
+				Dst: ip("198.51.100.40"),
+				Proto: &conntrack.ProtoTuple{
+					Number:  ptrTo(uint8(unix.IPPROTO_UDP)),
+					SrcPort: ptrTo(uint16(53000)),
+					DstPort: ptrTo(uint16(53)),
+				},
+			},
+			wantSrcPort:   ptrTo(uint16(53000)),
+			wantDstPort:   ptrTo(uint16(53)),
+			wantSourceLen: net.IPv4len,
+		},
+		{
+			name: "icmp_v4_zero_code",
+			origin: &conntrack.IPTuple{
+				Src: ip("192.0.2.50"),
+				Dst: ip("198.51.100.60"),
+				Proto: &conntrack.ProtoTuple{
+					Number:   ptrTo(uint8(unix.IPPROTO_ICMP)),
+					IcmpID:   ptrTo(uint16(7)),
+					IcmpType: ptrTo(uint8(8)),
+					IcmpCode: ptrTo(uint8(0)),
+				},
+			},
+			wantICMPCode:  ptrTo(uint8(0)),
+			wantSourceLen: net.IPv4len,
+		},
+		{
+			name: "icmpv6_v6_zero_code",
+			origin: &conntrack.IPTuple{
+				Src: ip("2001:db8::10"),
+				Dst: ip("2001:db8::20"),
+				Proto: &conntrack.ProtoTuple{
+					Number:     ptrTo(uint8(unix.IPPROTO_ICMPV6)),
+					Icmpv6ID:   ptrTo(uint16(9)),
+					Icmpv6Type: ptrTo(uint8(128)),
+					Icmpv6Code: ptrTo(uint8(0)),
+				},
+			},
+			wantICMPv6ID:  ptrTo(uint16(9)),
+			wantSourceLen: net.IPv6len,
+		},
+		{
+			name: "tcp_v6_zone_zero",
+			origin: &conntrack.IPTuple{
+				Src:  ip("2001:db8::30"),
+				Dst:  ip("2001:db8::40"),
+				Zone: &zone,
+				Proto: &conntrack.ProtoTuple{
+					Number:  ptrTo(uint8(unix.IPPROTO_TCP)),
+					SrcPort: ptrTo(uint16(61000)),
+					DstPort: ptrTo(uint16(8443)),
+				},
+			},
+			wantSrcPort:   ptrTo(uint16(61000)),
+			wantDstPort:   ptrTo(uint16(8443)),
+			wantZone:      &zone,
+			wantSourceLen: net.IPv6len,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, ok := originKeyFromIPTuple(tt.origin)
+			if !ok {
+				t.Fatal("originKeyFromIPTuple(original) returned false")
+			}
+
+			reconstructed := originTupleFromKey(key)
+			roundTripped, ok := originKeyFromIPTuple(reconstructed)
+			if !ok {
+				t.Fatal("originKeyFromIPTuple(reconstructed) returned false")
+			}
+			if roundTripped != key {
+				t.Fatalf("round-tripped origin key = %+v, want %+v", roundTripped, key)
+			}
+			if reconstructed.Src == nil || len(*reconstructed.Src) != tt.wantSourceLen {
+				t.Fatalf("reconstructed src len = %d, want %d", testIPLen(reconstructed.Src), tt.wantSourceLen)
+			}
+			if tt.wantSrcPort != nil && (reconstructed.Proto == nil || reconstructed.Proto.SrcPort == nil || *reconstructed.Proto.SrcPort != *tt.wantSrcPort) {
+				t.Fatalf("reconstructed source port = %+v, want %d", reconstructed.Proto, *tt.wantSrcPort)
+			}
+			if tt.wantDstPort != nil && (reconstructed.Proto == nil || reconstructed.Proto.DstPort == nil || *reconstructed.Proto.DstPort != *tt.wantDstPort) {
+				t.Fatalf("reconstructed destination port = %+v, want %d", reconstructed.Proto, *tt.wantDstPort)
+			}
+			if tt.wantICMPCode != nil && (reconstructed.Proto == nil || reconstructed.Proto.IcmpCode == nil || *reconstructed.Proto.IcmpCode != *tt.wantICMPCode) {
+				t.Fatalf("reconstructed ICMP code = %+v, want %d", reconstructed.Proto, *tt.wantICMPCode)
+			}
+			if tt.wantICMPv6ID != nil && (reconstructed.Proto == nil || reconstructed.Proto.Icmpv6ID == nil || *reconstructed.Proto.Icmpv6ID != *tt.wantICMPv6ID) {
+				t.Fatalf("reconstructed ICMPv6 id = %+v, want %d", reconstructed.Proto, *tt.wantICMPv6ID)
+			}
+			if tt.wantZone != nil && (reconstructed.Zone == nil || *reconstructed.Zone != *tt.wantZone) {
+				t.Fatalf("reconstructed zone = %v, want %d", reconstructed.Zone, *tt.wantZone)
+			}
+		})
+	}
+}
+
+func TestConntrackOriginTupleFromKeyPreservesIndependentProtoPresence(t *testing.T) {
+	tcpFlow := mustFlowKey(t, "192.0.2.70", "198.51.100.80", 443, FlowProtoTCP)
+	icmpFlow := mustFlowKey(t, "192.0.2.90", "198.51.100.100", 0, FlowProtoICMP)
+
+	tests := []struct {
+		name  string
+		key   ctOriginKey
+		check func(*conntrack.IPTuple, ctOriginKey)
+	}{
+		{
+			name: "tcp_source_port_without_destination_port",
+			key: ctOriginKey{
+				family:      conntrack.IPv4,
+				srcIP:       tcpFlow.SrcIP,
+				dstIP:       tcpFlow.DstIP,
+				proto:       unix.IPPROTO_TCP,
+				srcPort:     51000,
+				protoFields: ctOriginHasSrcPort,
+			},
+			check: func(got *conntrack.IPTuple, _ ctOriginKey) {
+				if got.Proto == nil || got.Proto.SrcPort == nil || *got.Proto.SrcPort != 51000 {
+					t.Fatalf("reconstructed TCP source port = %+v, want only src=51000", got.Proto)
+				}
+				if got.Proto.DstPort != nil {
+					t.Fatalf("reconstructed TCP tuple gained destination port: %+v", got.Proto)
+				}
+			},
+		},
+		{
+			name: "icmp_id_without_type_or_code",
+			key: ctOriginKey{
+				family:      conntrack.IPv4,
+				srcIP:       icmpFlow.SrcIP,
+				dstIP:       icmpFlow.DstIP,
+				proto:       unix.IPPROTO_ICMP,
+				icmpID:      7,
+				protoFields: ctOriginHasIcmpID,
+			},
+			check: func(got *conntrack.IPTuple, want ctOriginKey) {
+				if got.Proto == nil || got.Proto.IcmpID == nil || *got.Proto.IcmpID != 7 {
+					t.Fatalf("reconstructed ICMP id = %+v, want only id=7", got.Proto)
+				}
+				if got.Proto.IcmpType != nil || got.Proto.IcmpCode != nil {
+					t.Fatalf("reconstructed ICMP tuple gained type/code filters: %+v", got.Proto)
+				}
+				roundTripped, ok := originKeyFromIPTuple(got)
+				if !ok {
+					t.Fatal("originKeyFromIPTuple(ICMP id-only reconstructed tuple) returned false")
+				}
+				if roundTripped != want {
+					t.Fatalf("round-tripped ICMP id-only key = %+v, want %+v", roundTripped, want)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.check(originTupleFromKey(tt.key), tt.key)
+		})
+	}
+}
+
 func TestConntrackEventIndexReplaysEventsAfterBackfill(t *testing.T) {
 	idx := &ctEventIndex{
 		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin:    make(map[ctOriginKey]struct{}),
 		backfilling: true,
 	}
 	destroyedDuringBackfill := testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP)
@@ -431,7 +742,7 @@ func TestConntrackEventIndexPendingReplayOwnsCallbackTuple(t *testing.T) {
 	t.Run("new", func(t *testing.T) {
 		idx := &ctEventIndex{
 			byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-			byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+			byOrigin:    make(map[ctOriginKey]struct{}),
 			backfilling: true,
 		}
 		createdDuringBackfill := testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51001, 443, unix.IPPROTO_TCP)
@@ -463,7 +774,7 @@ func TestConntrackEventIndexPendingReplayOwnsCallbackTuple(t *testing.T) {
 	t.Run("destroy", func(t *testing.T) {
 		idx := &ctEventIndex{
 			byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-			byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+			byOrigin:    make(map[ctOriginKey]struct{}),
 			backfilling: true,
 		}
 		destroyedDuringBackfill := testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP)
@@ -489,7 +800,7 @@ func TestConntrackEventIndexPendingReplayOwnsCallbackTuple(t *testing.T) {
 func TestConntrackEventIndexBackfillDoesNotReviveErroredStream(t *testing.T) {
 	idx := &ctEventIndex{
 		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin:    make(map[ctOriginKey]struct{}),
 		backfilling: true,
 	}
 	idx.markUnhealthy(errors.New("event stream failed during backfill"))
@@ -510,7 +821,7 @@ func TestConntrackEventIndexConcurrentBackfillErrorLeavesUnhealthy(t *testing.T)
 	for i := 0; i < 200; i++ {
 		idx := &ctEventIndex{
 			byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-			byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+			byOrigin:    make(map[ctOriginKey]struct{}),
 			backfilling: true,
 		}
 		snapshot := []conntrack.Con{
@@ -543,7 +854,7 @@ func TestConntrackEventIndexConcurrentBackfillErrorLeavesUnhealthy(t *testing.T)
 func TestConntrackEventIndexBackfillPendingOverflowDisablesIndex(t *testing.T) {
 	idx := &ctEventIndex{
 		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin:    make(map[ctOriginKey]struct{}),
 		backfilling: true,
 		pending:     make([]ctPendingEvent, defaultConntrackEventPendingLimit),
 	}
@@ -579,7 +890,7 @@ func TestRebuildEventIndexDoesNotServeSnapshotAfterBackfillOverflow(t *testing.T
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	idx := &ctEventIndex{
 		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin:    make(map[ctOriginKey]struct{}),
 		backfilling: true,
 		pending:     make([]ctPendingEvent, defaultConntrackEventPendingLimit),
 	}
@@ -621,7 +932,7 @@ func TestRebuildEventIndexDoesNotServeSnapshotAfterBackfillOverflow(t *testing.T
 func TestConntrackEventIndexSkipsMapMutationAfterUnhealthy(t *testing.T) {
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	idx.rebuild([]conntrack.Con{
 		testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
@@ -673,10 +984,10 @@ func TestConntrackEventIndexSkipsMapMutationAfterUnhealthy(t *testing.T) {
 	}
 }
 
-func TestConntrackEventIndexUpdateForExistingOriginDoesNotReindex(t *testing.T) {
+func TestConntrackEventIndexUpdateForExistingOriginKeepsCount(t *testing.T) {
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	con := testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP)
 	idx.rebuild([]conntrack.Con{con})
@@ -684,7 +995,6 @@ func TestConntrackEventIndexUpdateForExistingOriginDoesNotReindex(t *testing.T) 
 	if !ok {
 		t.Fatal("originKeyFromIPTuple returned false")
 	}
-	before := idx.byOrigin[key]
 
 	con.Info = &conntrack.InfoSource{NetlinkGroup: conntrack.NetlinkCtUpdate}
 	idx.handleEvent(con)
@@ -692,8 +1002,8 @@ func TestConntrackEventIndexUpdateForExistingOriginDoesNotReindex(t *testing.T) 
 	if got := idx.OriginCount(); got != 1 {
 		t.Fatalf("OriginCount after duplicate UPDATE = %d, want 1", got)
 	}
-	if after := idx.byOrigin[key]; after != before {
-		t.Fatal("duplicate UPDATE replaced indexed origin; want no reindex churn")
+	if _, ok := idx.byOrigin[key]; !ok {
+		t.Fatal("duplicate UPDATE dropped indexed origin")
 	}
 	if got := idx.EventCount(); got != 1 {
 		t.Fatalf("EventCount after duplicate UPDATE = %d, want 1", got)
@@ -703,7 +1013,7 @@ func TestConntrackEventIndexUpdateForExistingOriginDoesNotReindex(t *testing.T) 
 func TestConntrackEventIndexOriginCountTracksMutations(t *testing.T) {
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	assertCount := func(want int) {
 		t.Helper()
@@ -762,7 +1072,7 @@ func TestFlushNetlinkIndexedUsesIndexWithoutDump(t *testing.T) {
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	idx.rebuild([]conntrack.Con{
 		testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
@@ -823,7 +1133,7 @@ func TestFlushNetlinkAuthoritativeContextBypassesHealthyIndex(t *testing.T) {
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	idx.rebuild([]conntrack.Con{
 		testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
@@ -886,7 +1196,7 @@ func TestFlushNetlinkFallsBackToDumpWhenIndexUnhealthy(t *testing.T) {
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	idx.rebuild(nil)
 	idx.markUnhealthy(errors.New("event stream lost"))
@@ -941,7 +1251,7 @@ func TestConntrackEventIndexResyncRestoresIndexedFlush(t *testing.T) {
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	oldIdx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	oldIdx.rebuild([]conntrack.Con{
 		testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51999, 443, unix.IPPROTO_TCP),
@@ -958,7 +1268,7 @@ func TestConntrackEventIndexResyncRestoresIndexedFlush(t *testing.T) {
 		newEventIndex: func() (*ctEventIndex, error) {
 			candidate = &ctEventIndex{
 				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				byOrigin:    make(map[ctOriginKey]struct{}),
 				backfilling: true,
 			}
 			return candidate, nil
@@ -1046,7 +1356,7 @@ func TestConntrackEventIndexResyncFailureLeavesFallbackVisible(t *testing.T) {
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	oldIdx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	oldIdx.rebuild(nil)
 	oldIdx.markUnhealthy(unix.ENOBUFS)
@@ -1057,7 +1367,7 @@ func TestConntrackEventIndexResyncFailureLeavesFallbackVisible(t *testing.T) {
 		newEventIndex: func() (*ctEventIndex, error) {
 			return &ctEventIndex{
 				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				byOrigin:    make(map[ctOriginKey]struct{}),
 				backfilling: true,
 			}, nil
 		},
@@ -1126,7 +1436,7 @@ func TestConntrackEventIndexResyncUnhealthyDuringBackfillCountsFailure(t *testin
 		newEventIndex: func() (*ctEventIndex, error) {
 			candidate = &ctEventIndex{
 				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				byOrigin:    make(map[ctOriginKey]struct{}),
 				backfilling: true,
 			}
 			return candidate, nil
@@ -1192,7 +1502,7 @@ func TestConntrackEventIndexScheduleResyncHonorsBackoff(t *testing.T) {
 			opened.Add(1)
 			return &ctEventIndex{
 				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				byOrigin:    make(map[ctOriginKey]struct{}),
 				backfilling: true,
 			}, nil
 		},
@@ -1223,7 +1533,7 @@ func TestConntrackEventIndexFallbackFlushSchedulesResync(t *testing.T) {
 	matchingCon := testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP)
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	idx.rebuild(nil)
 	idx.markUnhealthy(unix.ENOBUFS)
@@ -1236,7 +1546,7 @@ func TestConntrackEventIndexFallbackFlushSchedulesResync(t *testing.T) {
 		newEventIndex: func() (*ctEventIndex, error) {
 			return &ctEventIndex{
 				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				byOrigin:    make(map[ctOriginKey]struct{}),
 				backfilling: true,
 			}, nil
 		},
@@ -1291,7 +1601,7 @@ func TestFlushNetlinkHealthyEmptyIndexDoesNotScheduleResync(t *testing.T) {
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	idx.rebuild(nil)
 
@@ -1310,7 +1620,7 @@ func TestFlushNetlinkHealthyEmptyIndexDoesNotScheduleResync(t *testing.T) {
 			<-resyncRelease
 			return &ctEventIndex{
 				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				byOrigin:    make(map[ctOriginKey]struct{}),
 				backfilling: true,
 			}, nil
 		},
@@ -1364,7 +1674,7 @@ func TestConntrackEventIndexResyncClosedFlusherRejected(t *testing.T) {
 func TestConntrackEventIndexUnhealthyCallbackSchedulesResync(t *testing.T) {
 	oldIdx := &ctEventIndex{
 		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin:    make(map[ctOriginKey]struct{}),
 		backfilling: true,
 	}
 	oldIdx.rebuild(nil)
@@ -1375,7 +1685,7 @@ func TestConntrackEventIndexUnhealthyCallbackSchedulesResync(t *testing.T) {
 		newEventIndex: func() (*ctEventIndex, error) {
 			return &ctEventIndex{
 				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				byOrigin:    make(map[ctOriginKey]struct{}),
 				backfilling: true,
 			}, nil
 		},
@@ -1422,7 +1732,7 @@ func TestConntrackStartupUnhealthyIndexFallsBackInsteadOfFailing(t *testing.T) {
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	idx := &ctEventIndex{
 		byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin:    make(map[ctOriginKey]struct{}),
 		backfilling: true,
 	}
 	idx.markUnhealthy(unix.ENOBUFS)
@@ -1462,7 +1772,7 @@ func TestConntrackEventIndexCloseCancelsInFlightResync(t *testing.T) {
 		newEventIndex: func() (*ctEventIndex, error) {
 			return &ctEventIndex{
 				byQuery:     make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-				byOrigin:    make(map[ctOriginKey]*conntrack.IPTuple),
+				byOrigin:    make(map[ctOriginKey]struct{}),
 				backfilling: true,
 			}, nil
 		},
@@ -1535,7 +1845,7 @@ func TestConntrackEventIndexCloseDoesNotDeadlockWithQueuedResync(t *testing.T) {
 			newEventIndexCalls.Add(1)
 			return &ctEventIndex{
 				byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-				byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+				byOrigin: make(map[ctOriginKey]struct{}),
 			}, nil
 		},
 		netlinkIndexBeforeResyncLock: func() {
@@ -1661,7 +1971,7 @@ func TestL3FlushConntrackSkippedGauge(t *testing.T) {
 func TestL3FlushConntrackIndexGauges(t *testing.T) {
 	idx := &ctEventIndex{
 		byQuery: make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: map[ctOriginKey]*conntrack.IPTuple{
+		byOrigin: map[ctOriginKey]struct{}{
 			{srcPort: 101}: {},
 			{srcPort: 102}: {},
 			{srcPort: 103}: {},
@@ -1896,7 +2206,7 @@ func TestFlushNetlinkIndexedStopsAfterDeadlineBetweenSuccessfulDeletes(t *testin
 	key := mustFlowKey(t, "192.0.2.10", "198.51.100.20", 443, FlowProtoTCP)
 	idx := &ctEventIndex{
 		byQuery:  make(map[ctIndexQueryKey]map[ctOriginKey]struct{}),
-		byOrigin: make(map[ctOriginKey]*conntrack.IPTuple),
+		byOrigin: make(map[ctOriginKey]struct{}),
 	}
 	idx.rebuild([]conntrack.Con{
 		testConntrackCon(t, "192.0.2.10", "198.51.100.20", 51000, 443, unix.IPPROTO_TCP),
