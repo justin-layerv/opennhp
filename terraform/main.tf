@@ -2593,12 +2593,13 @@ module "qurl_service" {
   qurl_resources_table_arn                = module.dynamodb.qurl_resources_table_arn
   qurl_access_tokens_table_arn            = module.dynamodb.qurl_access_tokens_table_arn
   qurl_sessions_table_arn                 = module.dynamodb.qurl_sessions_table_arn
-  # Scanner Lambda + resource-lifecycle queue alarms page the cell-wide
-  # alerts topic, same as the AC alarms, billing SQS alarms, and
-  # qurl-service outcome alarms that all wire this output directly. #2491
-  # closed the gap where the root threaded a default-empty var here, so
-  # the alarms entered ALARM but paged no one.
-  scanner_lambda_alarm_sns_topic_arn = module.monitoring.sns_topic_arn
+  # qurl-service alarms (qurl-api log filters, scanner Lambda, and
+  # resource-lifecycle queue) page the cell-wide alerts topic, same as
+  # the AC alarms, billing SQS alarms, and qurl-service outcome alarms
+  # that all wire this output directly. #2491 closed the gap where the
+  # root threaded a default-empty var here, so the alarms entered ALARM
+  # but paged no one.
+  qurl_service_alarm_sns_topic_arn = module.monitoring.sns_topic_arn
 
   # Auth0
   auth0_domain                     = var.qurl_auth0_domain

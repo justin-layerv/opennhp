@@ -156,10 +156,10 @@ resource "aws_sqs_queue_redrive_policy" "resource_lifecycle_queue" {
 # Alarms
 # ============================================================================
 #
-# Both alarms wire `alarm_actions` to the same SNS topic the scanner
-# Lambda's `scan-gap` / `errors-burning` alarms use
-# (`var.scanner_lambda_alarm_sns_topic_arn`), which the root module feeds
-# from the cell-wide alerts topic (`module.monitoring.sns_topic_arn`) —
+# Both alarms wire `alarm_actions` to `local.qurl_service_alarm_actions`,
+# which the root module feeds from the cell-wide alerts topic
+# (`module.monitoring.sns_topic_arn`) through the
+# `var.qurl_service_alarm_sns_topic_arn` input —
 # the topic every other alarm in the cell routes to (#2491). The module
 # keeps the empty-string safe-degrade seam (empty ARN → alarm still fires
 # + appears in CloudWatch, just no notification) so it stays reusable —
@@ -197,8 +197,8 @@ resource "aws_cloudwatch_metric_alarm" "resource_lifecycle_queue_backlog" {
     QueueName = aws_sqs_queue.resource_lifecycle_queue[0].name
   }
 
-  alarm_actions = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
-  ok_actions    = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
+  alarm_actions = local.qurl_service_alarm_actions
+  ok_actions    = local.qurl_service_alarm_actions
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
     Name = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle-queue-backlog"
@@ -228,8 +228,8 @@ resource "aws_cloudwatch_metric_alarm" "resource_lifecycle_queue_dlq_messages" {
     QueueName = aws_sqs_queue.resource_lifecycle_queue_dlq[0].name
   }
 
-  alarm_actions = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
-  ok_actions    = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
+  alarm_actions = local.qurl_service_alarm_actions
+  ok_actions    = local.qurl_service_alarm_actions
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
     Name = "${var.name_prefix}-${var.cell_id}-qurl-resource-lifecycle-dlq-messages"

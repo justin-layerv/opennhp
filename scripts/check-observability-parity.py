@@ -104,6 +104,10 @@ RELAY_SINGLE_EVENT_ALARM_NAMES = (
     "relay_shedding",
     "relay_shedding_unknown_environment",
 )
+QURL_SERVICE_ALARM_ACTION_EXPR = "local.qurl_service_alarm_actions"
+QURL_RESOURCE_KEY_FAILURE_FILTER_PATTERN = (
+    r'"{ $.msg = \"resource-key provisioning failed\" }"'
+)
 ASYNC_RUNTIME_PANIC_MESSAGE = "runtime panic encountered"
 ASYNC_RUNTIME_PANIC_FILTER_PATTERN = (
     r'"\"msgToPacketRoutine\" \"runtime panic encountered\""'
@@ -313,6 +317,13 @@ def require_assignment(block: HclBlock, key: str, expected: str) -> None:
 def require_block_text(block: HclBlock, needle: str, reason: str) -> None:
     if needle not in block.body:
         raise LintError(f"{_block_location(block)} missing `{needle}` ({reason})")
+
+
+def require_block_regex(block: HclBlock, pattern: str, reason: str) -> None:
+    if re.search(pattern, block.body) is None:
+        raise LintError(
+            f"{_block_location(block)} missing pattern `{pattern}` ({reason})"
+        )
 
 
 def has_metric_name(text: str, metric_name: str) -> bool:
@@ -645,6 +656,14 @@ def check_root_module(repo: Path) -> None:
     require_assignment(ac, "alarm_sns_topic_arn", "module.monitoring.sns_topic_arn")
     require_assignment(ac, "alerts_sns_topic_arn", "module.monitoring.sns_topic_arn")
 
+    qurl_service = find_block(root_main, "module", "qurl_service")
+    require_assignment(qurl_service, "count", "var.deploy_qurl_service ? 1 : 0")
+    require_assignment(
+        qurl_service,
+        "qurl_service_alarm_sns_topic_arn",
+        "module.monitoring.sns_topic_arn",
+    )
+
 
 def check_shared_resources(repo: Path) -> None:
     monitoring_main = repo / "terraform" / "modules" / "monitoring" / "main.tf"
@@ -655,6 +674,9 @@ def check_shared_resources(repo: Path) -> None:
     relay_monitoring = repo / "terraform" / "modules" / "relay" / "monitoring.tf"
     relay_compute = repo / "terraform" / "modules" / "relay" / "compute.tf"
     relay_user_data = repo / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+    qurl_service_monitoring = (
+        repo / "terraform" / "modules" / "qurl-service" / "monitoring.tf"
+    )
     server_udp = repo / "endpoints" / "server" / "udpserver.go"
     relay_go = repo / "endpoints" / "relay" / "relay.go"
     core_errors = repo / "nhp" / "core" / "errors.go"
@@ -829,6 +851,68 @@ def check_shared_resources(repo: Path) -> None:
             metric_name,
             "qURL browser rejected ratio denominator/numerator set must not drift",
         )
+
+    qurl_resource_key_failure_filter = find_block(
+        qurl_service_monitoring,
+        'resource "aws_cloudwatch_log_metric_filter"',
+        "qurl_api_resource_key_provisioning_failed",
+    )
+    require_assignment(
+        qurl_resource_key_failure_filter,
+        "log_group_name",
+        "aws_cloudwatch_log_group.qurl.name",
+    )
+    require_assignment(
+        qurl_resource_key_failure_filter,
+        "pattern",
+        QURL_RESOURCE_KEY_FAILURE_FILTER_PATTERN,
+    )
+    require_block_regex(
+        qurl_resource_key_failure_filter,
+        r'\bname\s*=\s*"ResourceKeyProvisioningFailedCount"',
+        "qurl-api resource-key failure alarm depends on this metric filter output",
+    )
+    require_block_regex(
+        qurl_resource_key_failure_filter,
+        r'\bnamespace\s*=\s*"LayerV/QurlService"',
+        "qurl-api resource-key failure alarm depends on this metric namespace",
+    )
+    qurl_resource_key_failure_alarm = find_block(
+        qurl_service_monitoring,
+        'resource "aws_cloudwatch_metric_alarm"',
+        "qurl_api_resource_key_provisioning_failures",
+    )
+    require_assignment(
+        qurl_resource_key_failure_alarm,
+        "alarm_actions",
+        QURL_SERVICE_ALARM_ACTION_EXPR,
+    )
+    require_assignment(qurl_resource_key_failure_alarm, "ok_actions", "[]")
+    require_assignment(
+        qurl_resource_key_failure_alarm,
+        "comparison_operator",
+        '"GreaterThanThreshold"',
+    )
+    require_assignment(qurl_resource_key_failure_alarm, "evaluation_periods", "1")
+    require_assignment(qurl_resource_key_failure_alarm, "datapoints_to_alarm", "1")
+    require_assignment(
+        qurl_resource_key_failure_alarm,
+        "metric_name",
+        '"ResourceKeyProvisioningFailedCount"',
+    )
+    require_assignment(
+        qurl_resource_key_failure_alarm,
+        "namespace",
+        '"LayerV/QurlService"',
+    )
+    require_assignment(qurl_resource_key_failure_alarm, "period", "60")
+    require_assignment(qurl_resource_key_failure_alarm, "statistic", '"Sum"')
+    require_assignment(qurl_resource_key_failure_alarm, "threshold", "0")
+    require_assignment(
+        qurl_resource_key_failure_alarm,
+        "treat_missing_data",
+        '"notBreaching"',
+    )
     # Go-side checks scope to the metric-dimension builders the Terraform
     # selectors depend on. They catch simple emitter renames without pulling a Go
     # parser into this small static lint.

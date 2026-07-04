@@ -213,6 +213,10 @@ resource "aws_ssm_parameter" "default_ac_id" {
 locals {
   is_prod      = var.environment == "prod"
   service_name = "${var.name_prefix}-${var.cell_id}-qurl-api"
+  # The root wires this to the cell-wide alerts topic and the module uses it for
+  # every qurl-service alarm surface (qurl-api, scanner Lambda,
+  # resource-lifecycle queue).
+  qurl_service_alarm_actions = var.qurl_service_alarm_sns_topic_arn != "" ? [var.qurl_service_alarm_sns_topic_arn] : []
   # Shorter name for resources with 32-char limit (ALB/NLB names)
   short_name = "${var.name_prefix}-${var.cell_id}-qurl"
   # DNS-safe form used as the base for AWS resources subject to the 32-char

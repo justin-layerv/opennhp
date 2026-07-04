@@ -31,6 +31,7 @@ AC_CORE_ALARMS = CHECKER.AC_CORE_ALARM_NAMES
 RELAY_ALARM_ACTION_EXPR = CHECKER.RELAY_ALARM_ACTION_EXPR
 RELAY_CORE_ALARMS = CHECKER.RELAY_CORE_ALARM_NAMES
 RELAY_SINGLE_EVENT_ALARMS = CHECKER.RELAY_SINGLE_EVENT_ALARM_NAMES
+QURL_SERVICE_ALARM_ACTION_EXPR = CHECKER.QURL_SERVICE_ALARM_ACTION_EXPR
 
 
 def write(path: Path, body: str) -> None:
@@ -250,6 +251,13 @@ def build_fixture(root: Path) -> None:
           alarm_sns_topic_arn      = module.monitoring.sns_topic_arn
           alerts_sns_topic_arn = module.monitoring.sns_topic_arn
         }
+
+        module "qurl_service" {
+          source = "./modules/qurl-service"
+          count  = var.deploy_qurl_service ? 1 : 0
+
+          qurl_service_alarm_sns_topic_arn = module.monitoring.sns_topic_arn
+        }
         """,
     )
     write(
@@ -345,6 +353,38 @@ def build_fixture(root: Path) -> None:
     write(
         root / "terraform" / "modules" / "relay" / "monitoring.tf",
         "\n\n".join(relay_alarm_block(name) for name in RELAY_CORE_ALARMS),
+    )
+    write(
+        root / "terraform" / "modules" / "qurl-service" / "monitoring.tf",
+        f"""
+        resource "aws_cloudwatch_log_metric_filter" "qurl_api_resource_key_provisioning_failed" {{
+          name           = "${{local.service_name}}-resource-key-provisioning-failed"
+          log_group_name = aws_cloudwatch_log_group.qurl.name
+          pattern        = "{{ $.msg = \\"resource-key provisioning failed\\" }}"
+
+          metric_transformation {{
+            name          = "ResourceKeyProvisioningFailedCount"
+            namespace     = "LayerV/QurlService"
+            value         = "1"
+            default_value = 0
+          }}
+        }}
+
+        resource "aws_cloudwatch_metric_alarm" "qurl_api_resource_key_provisioning_failures" {{
+          comparison_operator = "GreaterThanThreshold"
+          evaluation_periods  = 1
+          datapoints_to_alarm = 1
+          metric_name         = "ResourceKeyProvisioningFailedCount"
+          namespace           = "LayerV/QurlService"
+          period              = 60
+          statistic           = "Sum"
+          threshold           = 0
+          treat_missing_data  = "notBreaching"
+
+          alarm_actions = {QURL_SERVICE_ALARM_ACTION_EXPR}
+          ok_actions    = []
+        }}
+        """,
     )
     write(
         root / "terraform" / "modules" / "relay" / "compute.tf",
@@ -780,6 +820,25 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("alerts_sns_topic_arn", result.stderr)
 
+    def test_qurl_service_alarm_root_wiring_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            main_tf = root / "terraform" / "main.tf"
+            main_tf.write_text(
+                main_tf.read_text(encoding="utf-8").replace(
+                    "  qurl_service_alarm_sns_topic_arn = module.monitoring.sns_topic_arn\n",
+                    "",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_service", result.stderr)
+        self.assertIn("qurl_service_alarm_sns_topic_arn", result.stderr)
+
     def test_ac_alarm_sns_wiring_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1060,6 +1119,72 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("qurl_browser_rejected_ratio", result.stderr)
         self.assertIn("denominator/numerator set", result.stderr)
+
+    def test_qurl_resource_key_failure_filter_pattern_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            qurl_monitoring = (
+                root / "terraform" / "modules" / "qurl-service" / "monitoring.tf"
+            )
+            qurl_monitoring.write_text(
+                qurl_monitoring.read_text(encoding="utf-8").replace(
+                    "resource-key provisioning failed",
+                    "create qurl failed",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_api_resource_key_provisioning_failed", result.stderr)
+        self.assertIn("pattern", result.stderr)
+
+    def test_qurl_resource_key_failure_alarm_routing_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            qurl_monitoring = (
+                root / "terraform" / "modules" / "qurl-service" / "monitoring.tf"
+            )
+            qurl_monitoring.write_text(
+                qurl_monitoring.read_text(encoding="utf-8").replace(
+                    f"  alarm_actions = {QURL_SERVICE_ALARM_ACTION_EXPR}\n",
+                    "  alarm_actions = []\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_api_resource_key_provisioning_failures", result.stderr)
+        self.assertIn("alarm_actions", result.stderr)
+
+    def test_qurl_resource_key_failure_alarm_ok_actions_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            qurl_monitoring = (
+                root / "terraform" / "modules" / "qurl-service" / "monitoring.tf"
+            )
+            qurl_monitoring.write_text(
+                qurl_monitoring.read_text(encoding="utf-8").replace(
+                    "  ok_actions    = []\n",
+                    f"  ok_actions    = {QURL_SERVICE_ALARM_ACTION_EXPR}\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_api_resource_key_provisioning_failures", result.stderr)
+        self.assertIn("ok_actions", result.stderr)
 
     def test_ac_registration_stale_action_wiring_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

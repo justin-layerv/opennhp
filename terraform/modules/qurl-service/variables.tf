@@ -1231,14 +1231,14 @@ variable "scanner_lambda_log_retention_days" {
   }
 }
 
-variable "scanner_lambda_alarm_sns_topic_arn" {
-  description = "SNS topic ARN for the scanner Lambda + resource-lifecycle queue alarm actions. The root module wires this to the cell-wide alerts topic (`module.monitoring.sns_topic_arn`), the same topic every other alarm in the cell routes to (#2491). Empty string keeps the safe-degrade seam — the alarm still fires + appears in CloudWatch, but publishes no notification — so the module stays reusable by a caller with no alerts topic."
+variable "qurl_service_alarm_sns_topic_arn" {
+  description = "SNS topic ARN for qurl-service CloudWatch alarm actions (qurl-api, scanner Lambda, and resource-lifecycle queue). The root module wires this to the cell-wide alerts topic (`module.monitoring.sns_topic_arn`), the same topic every other alarm in the cell routes to (#2491). Empty string keeps the safe-degrade seam — the alarm still fires + appears in CloudWatch, but publishes no notification — so the module stays reusable by a caller with no alerts topic."
   type        = string
   default     = ""
 
   validation {
-    condition     = var.scanner_lambda_alarm_sns_topic_arn == "" || can(regex("^arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9._-]+$", var.scanner_lambda_alarm_sns_topic_arn))
-    error_message = "scanner_lambda_alarm_sns_topic_arn must be empty or a standard SNS topic ARN (arn:aws:sns:<region>:<account>:<name>)."
+    condition     = var.qurl_service_alarm_sns_topic_arn == "" || can(regex("^arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9._-]+$", var.qurl_service_alarm_sns_topic_arn))
+    error_message = "qurl_service_alarm_sns_topic_arn must be empty or a standard SNS topic ARN (arn:aws:sns:<region>:<account>:<name>)."
   }
 }
 

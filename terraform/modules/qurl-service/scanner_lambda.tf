@@ -897,7 +897,7 @@ resource "aws_cloudwatch_metric_alarm" "scanner_invocation_gap" {
     FunctionName = aws_lambda_function.scanner[0].function_name
   }
 
-  alarm_actions = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
+  alarm_actions = local.qurl_service_alarm_actions
   # ok_actions intentionally omitted — see the comment block above.
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
@@ -951,8 +951,8 @@ resource "aws_cloudwatch_metric_alarm" "scanner_errors_burning" {
     FunctionName = aws_lambda_function.scanner[0].function_name
   }
 
-  alarm_actions = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
-  ok_actions    = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
+  alarm_actions = local.qurl_service_alarm_actions
+  ok_actions    = local.qurl_service_alarm_actions
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
     Name = "${local.scanner_lambda_function_name}-errors-burning"
@@ -1000,7 +1000,7 @@ resource "aws_cloudwatch_metric_alarm" "scanner_active_recheck_invocation_gap" {
     FunctionName = aws_lambda_function.scanner_active_recheck[0].function_name
   }
 
-  alarm_actions = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
+  alarm_actions = local.qurl_service_alarm_actions
   # ok_actions intentionally omitted for parity with the per-minute gap alarm.
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
@@ -1032,8 +1032,8 @@ resource "aws_cloudwatch_metric_alarm" "scanner_active_recheck_errors_burning" {
     FunctionName = aws_lambda_function.scanner_active_recheck[0].function_name
   }
 
-  alarm_actions = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
-  ok_actions    = var.scanner_lambda_alarm_sns_topic_arn != "" ? [var.scanner_lambda_alarm_sns_topic_arn] : []
+  alarm_actions = local.qurl_service_alarm_actions
+  ok_actions    = local.qurl_service_alarm_actions
 
   tags = merge(var.tags, local.scanner_lambda_common_tags, {
     Name = "${local.scanner_active_recheck_function_name}-errors-burning"
