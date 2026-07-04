@@ -300,6 +300,33 @@ locals {
     : "{}"
   )
 
+  # Same issuer public key, re-encoded for the qurl.link BROWSER verifier. The NHP
+  # server (Go LoadV2TrustStore) decodes the trust-store value with base64.StdEncoding,
+  # but the browser TrustStore.fromSpkiDerB64 uses STRICT unpadded base64url. So the
+  # KMS-provided standard base64 DER (padded, with +/ and =) is rewritten to unpadded
+  # base64url (-_ , no padding) here — same DER bytes, the encoding both verifiers agree
+  # on for their respective decoders. Gated on the SAME qurl_v2_admission_ready as the
+  # server store so the portal has a trust anchor exactly when the server will admit qv2;
+  # an empty map keeps the portal qv1-only (a #qv2. link fails closed).
+  qurl_v2_issuer_public_key_der_b64url = (
+    local.qurl_v2_admission_ready
+    ? replace(replace(replace(data.aws_kms_public_key.qurl_v2_issuer[0].public_key, "+", "-"), "/", "_"), "=", "")
+    : ""
+  )
+  qurl_v2_portal_issuer_trust_store = (
+    local.qurl_v2_admission_ready
+    ? { (var.qurl_v2_issuer_kid) = local.qurl_v2_issuer_public_key_der_b64url }
+    : {}
+  )
+  # The issuer's relay_url allowlist as a list for the portal RelayAllowlist. Root
+  # var.qurl_v2_relay_allowlist is a comma-separated host[:port] string; split it and
+  # drop empties. Populated only alongside the trust anchor so the two move together.
+  qurl_v2_portal_relay_allowlist = (
+    local.qurl_v2_admission_ready
+    ? compact(split(",", var.qurl_v2_relay_allowlist))
+    : []
+  )
+
   # KMS keys the per-resource-key policy must explicitly Deny destructive actions on:
   # the account encryption CMKs (ebs/efs/secrets/logs/rds) + the issuer key. compact()
   # drops the issuer ARN when its key isn't provisioned (null). Threaded to
@@ -3494,6 +3521,14 @@ module "qurl_link" {
     ? "https://${var.relay_dns_name}"
     : null
   )
+  # qURL v2 issuer trust material for the browser verifier. Empty ({}/[]) until qv2
+  # admission is ready (issuer key provisioned + kid set), matching the server-side
+  # trust store gate; when empty the portal stays qv1-only and a #qv2. link fails
+  # closed. The map values are base64url (browser TrustStore decoder), converted from
+  # the KMS standard-base64 DER above.
+  qurl_v2_issuer_trust_store = local.qurl_v2_portal_issuer_trust_store
+  qurl_v2_relay_allowlist    = local.qurl_v2_portal_relay_allowlist
+
   robots_tag = var.environment == "prod" ? null : "noindex, nofollow"
 
   tags = merge(local.common_tags, { Service = "qurl" })

@@ -54,11 +54,15 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
+	"encoding/json"
 	"image"
 	"image/png"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -105,6 +109,21 @@ func TestQurlLinkFrontend_VerifierWireContract(t *testing.T) {
 			"qurlUserAgent:",
 			"serverStaticPubB64",
 			"relayBaseUrl",
+			// qURL v2 (keyed-identity) verifier wiring must be present in the
+			// JS-agent render regardless of whether qv2 is enabled in this env: the
+			// config keys, the fragment dispatch, and the knock call. This is the
+			// same byte-tripwire posture as the qv1 snippets above — it proves the
+			// glue is deployed, not that a qv2 link opens (that needs a headless
+			// browser, tracked with the qv1 execution gap in #2748). When qv2 is
+			// enabled in an env, TestQurlLinkFrontend_QurlV2ConfigPopulated
+			// additionally asserts issuerTrustStore is non-empty there.
+			"issuerTrustStore:",
+			"relayAllowlist:",
+			"fragment.startsWith('qv2.')",
+			"handleQurlV2Fragment",
+			"agent.TrustStore.fromSpkiDerB64(QURL_LINK_CONFIG.issuerTrustStore)",
+			"new agent.RelayAllowlist(QURL_LINK_CONFIG.relayAllowlist)",
+			"agent.knockQurlV2(fragment,",
 		}
 		var missing []string
 		for _, want := range wantSnippets {
@@ -371,6 +390,275 @@ func TestQurlLinkFrontend_AllowlistContainsServingHost(t *testing.T) {
 	}
 }
 
+// TestQurlLinkFrontend_QurlV2ConfigPopulated fences the qURL v2 (keyed-identity)
+// issuer trust material in the DEPLOYED browser verifier. It mirrors
+// TestQurlLinkFrontend_AllowlistContainsServingHost: the qv2 config KEYS and the
+// dispatch branch must always be present in a JS-agent render (a structural
+// tripwire so an SPA refactor can't silently drop the qv2 glue), and when qv2 is
+// enabled in this env the issuerTrustStore must additionally be POPULATED with the
+// expected kid (and the relayAllowlist with the expected host) rather than the {}
+// fail-closed form — an empty/mismatched store on an enabled env would make every
+// real qv2 link show the invalid-access page.
+//
+// This asserts the LIVE deployed bytes; TestQurlLinkFrontend_QurlV2ConfigRenders-
+// Populated is the companion PRE-DEPLOY check that renders the committed template
+// with the same env inputs. Like the rest of this file this is a deployed
+// byte-contract, not an execution check: it does not verify a signature or open a
+// link (that needs the headless browser harness tracked in #2748). It only proves
+// the trust material reached CloudFront.
+func TestQurlLinkFrontend_QurlV2ConfigPopulated(t *testing.T) {
+	requireRemote(t) // remote-only: serves the qurl.link SPA, which is not part of the NHP stack.
+	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
+	assertStatusCode(t, resp, http.StatusOK)
+
+	// The qv2 verifier glue only ships on the JS-agent render (it needs the
+	// same-origin bundle + relay connect-src). Legacy envs have no qv2 path.
+	if !qurlLinkJSAgentEnabledEnvs[testConfig.Environment] {
+		return
+	}
+	script := inlineVerifierScript(t, string(body))
+	assertQurlV2VerifierWiring(t, script)
+
+	trustStore := qurlV2IssuerTrustStoreLiteral(t, script)
+	relayAllowlist := qurlV2RelayAllowlistLiteral(t, script)
+	env, enabled := qurlLinkQurlV2EnabledEnvs[testConfig.Environment]
+	assertQurlV2ConfigState(t, "deployed", trustStore, relayAllowlist, env, enabled)
+}
+
+// TestQurlLinkFrontend_QurlV2ConfigRendersPopulated is the PRE-DEPLOY companion to
+// TestQurlLinkFrontend_QurlV2ConfigPopulated: it renders the committed qurl-link
+// index.html template with this env's qv2 inputs and asserts the same populated
+// (or empty, fail-closed) shape BEFORE any CloudFront deploy. Terraform computes
+// the issuer trust store from the live KMS key, which is not knowable here, so the
+// render uses a representative SPKI-DER-base64url placeholder for the enabled env
+// while pinning the exact Kid and RelayHost from the env tfvars mirror — the
+// wiring, not the key bytes, is what this fence guards. It performs no network I/O,
+// so it runs in the local tier too (it is the qv2 analogue of the plan-time
+// aws_s3_object.index preconditions, exercised from Go).
+func TestQurlLinkFrontend_QurlV2ConfigRendersPopulated(t *testing.T) {
+	env, enabled := qurlLinkQurlV2EnabledEnvs[testConfig.Environment]
+
+	var trustStoreMap map[string]string
+	var relayAllowlist []string
+	if enabled {
+		// Representative base64url SPKI DER (unpadded, url alphabet) under the real
+		// Kid; a 91-byte P-256 SPKI is 122 base64url chars, but only the alphabet +
+		// presence matters to this wiring fence.
+		trustStoreMap = map[string]string{
+			env.Kid: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExampleSandboxIssuerSpkiDerBase64Url-_",
+		}
+		relayAllowlist = []string{env.RelayHost}
+	} else {
+		// Disabled env: empty map/list -> the {}/[] fail-closed render.
+		trustStoreMap = map[string]string{}
+		relayAllowlist = []string{}
+	}
+
+	script := renderQurlLinkVerifierScript(t, trustStoreMap, relayAllowlist)
+	assertQurlV2VerifierWiring(t, script)
+
+	gotTrust := qurlV2IssuerTrustStoreLiteral(t, script)
+	gotRelay := qurlV2RelayAllowlistLiteral(t, script)
+	assertQurlV2ConfigState(t, "rendered", gotTrust, gotRelay, env, enabled)
+}
+
+// assertQurlV2VerifierWiring checks the qv2 config keys + dispatch branch are
+// present in a verifier script, regardless of qv2 enablement. Shared by the
+// deployed-bytes and rendered-template fences.
+func assertQurlV2VerifierWiring(t *testing.T, script string) {
+	t.Helper()
+	for _, want := range []string{
+		"issuerTrustStore:",
+		"relayAllowlist:",
+		"fragment.startsWith('qv2.')",
+		"handleQurlV2Fragment",
+		"agent.knockQurlV2(fragment,",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("qurl.link verifier is missing qURL v2 wiring %q.", want)
+		}
+	}
+}
+
+// assertQurlV2ConfigState checks the issuerTrustStore/relayAllowlist config
+// literals against the env's qv2 enablement: enabled -> the store carries the
+// expected kid and the allowlist the expected host; disabled -> both are the empty
+// fail-closed form. `source` labels the origin ("deployed" or "rendered") in
+// failure messages.
+func assertQurlV2ConfigState(t *testing.T, source, trustStore, relayAllowlist string, env qurlV2EnabledEnv, enabled bool) {
+	t.Helper()
+	if enabled {
+		if !strings.Contains(trustStore, "\""+env.Kid+"\"") || !strings.Contains(trustStore, ":") {
+			t.Fatalf("env %q enables qURL v2 but the %s verifier issuerTrustStore (%q) does not carry kid %q; qv2 links would fail closed with ErrUnknownKID. "+
+				"Check root local.qurl_v2_portal_issuer_trust_store and the qurl-link templatefile wiring.", testConfig.Environment, source, trustStore, env.Kid)
+		}
+		if !strings.Contains(relayAllowlist, "\""+env.RelayHost+"\"") {
+			t.Fatalf("env %q enables qURL v2 but the %s verifier relayAllowlist (%q) does not carry host %q; every signed relay_url would be rejected.",
+				testConfig.Environment, source, relayAllowlist, env.RelayHost)
+		}
+		return
+	}
+	// Disabled env: both MUST be the empty fail-closed form. A populated store on a
+	// not-yet-enabled env means the enablement gate drifted from the smoke mirror.
+	if strings.TrimSpace(trustStore) != "{}" {
+		t.Fatalf("env %q does not enable qURL v2 (not in qurlLinkQurlV2EnabledEnvs) but the %s verifier issuerTrustStore is populated (%q); "+
+			"add the env to qurlLinkQurlV2EnabledEnvs in the same change that flips its qurl_v2 admission tfvars.", testConfig.Environment, source, trustStore)
+	}
+	if strings.TrimSpace(relayAllowlist) != "[]" {
+		t.Fatalf("env %q does not enable qURL v2 but the %s verifier relayAllowlist is populated (%q); it must be the empty fail-closed form.",
+			testConfig.Environment, source, relayAllowlist)
+	}
+}
+
+// qurlV2IssuerTrustStoreLiteral extracts the JS object literal assigned to
+// issuerTrustStore in the QURL_LINK_CONFIG block. The value is a jsonencode()d
+// map rendered by Terraform, so it is a balanced { ... } with no nested braces
+// (values are strings). See qurlV2ConfigLiteral.
+func qurlV2IssuerTrustStoreLiteral(t *testing.T, script string) string {
+	t.Helper()
+	return qurlV2ConfigLiteral(t, script, "issuerTrustStore:", '{', '}')
+}
+
+// qurlV2RelayAllowlistLiteral extracts the JS array literal assigned to
+// relayAllowlist in the QURL_LINK_CONFIG block. jsonencode()d list of strings, so
+// a balanced [ ... ] with no nested brackets. See qurlV2ConfigLiteral.
+func qurlV2RelayAllowlistLiteral(t *testing.T, script string) string {
+	t.Helper()
+	return qurlV2ConfigLiteral(t, script, "relayAllowlist:", '[', ']')
+}
+
+// qurlV2ConfigLiteral returns the balanced open..close delimited slice assigned to
+// `key` in the verifier script. The value is a jsonencode()d map/list with no
+// nested delimiters (values are strings), so delimiter-matching from the first
+// `open` after the key is exact for that shape. If a future config nests the same
+// delimiter inside this value, replace this with a real JSON scan.
+func qurlV2ConfigLiteral(t *testing.T, script, key string, open, close byte) string {
+	t.Helper()
+	idx := strings.Index(script, key)
+	if idx < 0 {
+		t.Fatalf("verifier has no %s key to extract.", key)
+	}
+	rest := script[idx+len(key):]
+	start := strings.IndexByte(rest, open)
+	if start < 0 {
+		t.Fatalf("%s value does not start with %q: %.40q", key, string(open), rest)
+	}
+	depth := 0
+	for i := start; i < len(rest); i++ {
+		switch rest[i] {
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return rest[start : i+1]
+			}
+		}
+	}
+	t.Fatalf("%s literal is unbalanced: %.80q", key, rest[start:])
+	return ""
+}
+
+// qurlLinkTemplatePath resolves the committed qurl-link index.html template from
+// this test file's location (tests/smoke -> repo root -> the module). Used by the
+// pre-deploy render fence.
+func qurlLinkTemplatePath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot resolve this test file path via runtime.Caller.")
+	}
+	// tests/smoke/16_..._test.go -> repo root is two dirs up.
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	return filepath.Join(repoRoot, "terraform", "modules", "qurl-link", "frontend", "index.html")
+}
+
+// renderQurlLinkVerifierScript renders the committed qurl-link index.html template
+// for the JS-agent posture with the given qv2 trust store / relay allowlist, then
+// returns the inline verifier script. It substitutes the exact template inputs the
+// qurl-link module passes (the qv2 maps as Go-side JSON, mirroring Terraform's
+// jsonencode) and resolves the `%{ if js_agent_enabled ~}` blocks to the enabled
+// branch — the only posture where qv2 is reachable. This is a faithful-enough
+// stand-in for `templatefile` for the config block this fence inspects; it is not
+// a general HCL template engine.
+func renderQurlLinkVerifierScript(t *testing.T, trustStore map[string]string, relayAllowlist []string) string {
+	t.Helper()
+	raw, err := os.ReadFile(qurlLinkTemplatePath(t))
+	if err != nil {
+		t.Fatalf("read qurl-link template: %v", err)
+	}
+	tmpl := string(raw)
+
+	trustJSON, err := json.Marshal(trustStore)
+	if err != nil {
+		t.Fatalf("marshal trust store: %v", err)
+	}
+	relayJSON, err := json.Marshal(relayAllowlist)
+	if err != nil {
+		t.Fatalf("marshal relay allowlist: %v", err)
+	}
+
+	// Scalar ${...} inputs the module passes (JS-agent posture). allowed_hosts_json
+	// and the qv2 maps are jsonencode()d; the rest are plain strings.
+	replacements := map[string]string{
+		"${allowed_hosts_json}":              `["qurl.link.layerv.xyz"]`,
+		"${js_agent_enabled}":                "true",
+		"${js_agent_key}":                    "nhp-agent.min.js",
+		"${js_agent_sri}":                    "sha384-EXAMPLE",
+		"${relay_base_url}":                  "https://relay.qurl.link.layerv.xyz",
+		"${server_static_pub_b64}":           "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		"${qurl_v2_issuer_trust_store_json}": string(trustJSON),
+		"${qurl_v2_relay_allowlist_json}":    string(relayJSON),
+	}
+	for from, to := range replacements {
+		tmpl = strings.ReplaceAll(tmpl, from, to)
+	}
+
+	// Resolve `%{ if js_agent_enabled ~} A %{ else ~} B %{ endif ~}` to A (the
+	// enabled branch). The template uses only this single boolean directive.
+	tmpl = resolveTemplateIfBlocks(tmpl, "js_agent_enabled", true)
+
+	if strings.Contains(tmpl, "${") || strings.Contains(tmpl, "%{") {
+		t.Fatalf("qurl-link template still has unresolved template markers after render; a new ${...}/%%{...} input was added without updating renderQurlLinkVerifierScript.")
+	}
+	return inlineVerifierScript(t, tmpl)
+}
+
+// resolveTemplateIfBlocks resolves `%{ if <name> ~} A [%{ else ~} B] %{ endif ~}`
+// blocks for a single known boolean, keeping the taken branch. It is deliberately
+// narrow — one directive name, optional else, and branch bodies that contain no
+// further directive markers (so a match cannot span across an adjacent block) —
+// matching the qurl-link template's shape; it is not a general HCL parser. Branch
+// bodies are matched as "no `%{` marker inside" via BRANCH so the first (no-else)
+// block cannot greedily pair its `if` with a later block's `else`/`endif`.
+func resolveTemplateIfBlocks(tmpl, name string, cond bool) string {
+	// A branch body: any run that does not contain a `%{` directive opener.
+	const branch = `((?:[^%]|%(?:[^{]|$))*?)`
+	openMarker := `%\{[~\s]*if\s+` + regexp.QuoteMeta(name) + `[~\s]*\}`
+	elseMarker := `%\{[~\s]*else[~\s]*\}`
+	endMarker := `%\{[~\s]*endif[~\s]*\}`
+
+	// if ... else ... endif
+	ifElseRE := regexp.MustCompile(`(?s)` + openMarker + branch + elseMarker + branch + endMarker)
+	tmpl = ifElseRE.ReplaceAllStringFunc(tmpl, func(m string) string {
+		sub := ifElseRE.FindStringSubmatch(m)
+		if cond {
+			return sub[1]
+		}
+		return sub[2]
+	})
+	// if ... endif (no else)
+	ifNoElseRE := regexp.MustCompile(`(?s)` + openMarker + branch + endMarker)
+	tmpl = ifNoElseRE.ReplaceAllStringFunc(tmpl, func(m string) string {
+		sub := ifNoElseRE.FindStringSubmatch(m)
+		if cond {
+			return sub[1]
+		}
+		return ""
+	})
+	return tmpl
+}
+
 // TestQurlLinkFrontend_CSPOmitsUnsafeInlineScript fences both supported CSP postures
 // the response_headers_policy declares:
 //
@@ -427,6 +715,40 @@ var (
 // allowlist.
 var qurlLinkJSAgentEnabledEnvs = map[string]bool{
 	"sandbox": true,
+}
+
+// qurlV2EnabledEnv mirrors the env tfvars that make root
+// local.qurl_v2_admission_ready TRUE, which is what populates the qurl.link
+// browser verifier's qv2 issuer trust material. When an env has an entry here,
+// the rendered issuerTrustStore MUST carry this exact Kid (the issuer signer's
+// QURL_V2_ISSUER_KEY_KID and the NHP-server trust-store key are the same var, so
+// a mismatch here would ErrUnknownKID every admission) and the relayAllowlist MUST
+// carry RelayHost.
+type qurlV2EnabledEnv struct {
+	// Kid is env var.qurl_v2_issuer_kid.
+	Kid string
+	// RelayHost is the single host in env var.qurl_v2_relay_allowlist.
+	RelayHost string
+}
+
+// qurlLinkQurlV2EnabledEnvs mirrors the env-level gate that populates the
+// qurl.link browser verifier's qURL v2 issuer trust material (root
+// local.qurl_v2_admission_ready: qurl_v2_admission_enabled &&
+// qurl_v2_issuer_key_enabled && qurl_v2_issuer_kid != ""). An env absent here is
+// treated as qv2-disabled: its rendered issuerTrustStore must be the empty {}
+// fail-closed form. Add an env here in the SAME change that flips its qurl_v2
+// admission tfvars so this fence tracks the enablement rather than lagging it.
+//
+// sandbox: terraform/environments/sandbox/terraform.tfvars sets
+// qurl_v2_admission_enabled = qurl_v2_issuer_key_enabled = true with
+// qurl_v2_issuer_kid = "qurl-issuer-sandbox-2026-07" and
+// qurl_v2_relay_allowlist = "relay.qurl.link.layerv.xyz", so admission_ready is
+// TRUE and the portal populates. Keep these values in lockstep with that tfvars.
+var qurlLinkQurlV2EnabledEnvs = map[string]qurlV2EnabledEnv{
+	"sandbox": {
+		Kid:       "qurl-issuer-sandbox-2026-07",
+		RelayHost: "relay.qurl.link.layerv.xyz",
+	},
 }
 
 // qurlLinkJSAgentNetworkOrigins mirrors the relay_dns_name Terraform input used

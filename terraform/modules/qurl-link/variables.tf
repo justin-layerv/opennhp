@@ -52,6 +52,51 @@ variable "server_public_key_b64" {
   }
 }
 
+variable "qurl_v2_issuer_trust_store" {
+  description = <<-EOT
+    qURL v2 issuer trust store rendered into the qurl.link verifier: a map of
+    issuer kid -> SPKI-DER-base64url public key (base64URL, unpadded — the exact
+    form the browser TrustStore.fromSpkiDerB64 decodes, NOT standard base64). The
+    root caller converts the KMS GetPublicKey standard-base64 DER to base64url so
+    both the NHP server trust store and this portal verify against the same bytes.
+    Empty map keeps the page qv1-only: a #qv2. fragment then fails closed with a
+    "not configured" error and the at_/qv1. paths are unaffected.
+  EOT
+  type        = map(string)
+  default     = {}
+
+  validation {
+    # base64url alphabet, unpadded (no '=', '+', '/'). A P-256 SPKI DER is 91
+    # bytes -> 122 base64url chars, but keep the bound generous so an encoding
+    # nuance is tolerated; the browser TrustStore import is the real structural gate.
+    condition = alltrue([
+      for kid, der_b64 in var.qurl_v2_issuer_trust_store :
+      kid != "" && can(regex("^[A-Za-z0-9_-]+$", der_b64))
+    ])
+    error_message = "qurl_v2_issuer_trust_store keys (kid) must be non-empty and values must be unpadded base64url SPKI-DER (only [A-Za-z0-9_-], no '=', '+', or '/')."
+  }
+}
+
+variable "qurl_v2_relay_allowlist" {
+  description = <<-EOT
+    Host[:port] allowlist for a qURL v2 signed relay_url, rendered into the
+    verifier as the RelayAllowlist. Bare host matches any port; host:port matches
+    that exact authority (an explicit :443 will not match an https URL — use the
+    bare host). Empty list keeps the page qv1-only (a #qv2. fragment fails closed).
+    Mirror of the issuer's relay_url allowlist (root var.qurl_v2_relay_allowlist).
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for entry in var.qurl_v2_relay_allowlist :
+      can(regex("^[A-Za-z0-9.:_-]+$", entry))
+    ])
+    error_message = "qurl_v2_relay_allowlist entries must be host or host:port (only [A-Za-z0-9.:_-], no scheme, spaces, or path)."
+  }
+}
+
 variable "robots_tag" {
   description = "Optional X-Robots-Tag response header value. Deliberately locked to null or 'noindex, nofollow' so non-prod qurl-link hosts that serve byte-identical HTML cannot broaden crawler directives without a module change."
   type        = string

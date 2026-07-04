@@ -27,6 +27,12 @@ locals {
     js_agent_sri          = local.js_agent_sri
     relay_base_url        = local.relay_connect_src_origin
     server_static_pub_b64 = var.server_public_key_b64
+    # qURL v2 issuer trust material. jsonencode a map -> JS object literal (kid ->
+    # SPKI-DER-base64url) and a list -> JS array of host[:port]. Empty {}/[] when
+    # qv2 is off, so the rendered verifier keeps qv1-only behavior and a #qv2. link
+    # fails closed. The map/list are already validated by the module variables.
+    qurl_v2_issuer_trust_store_json = jsonencode(var.qurl_v2_issuer_trust_store)
+    qurl_v2_relay_allowlist_json    = jsonencode(var.qurl_v2_relay_allowlist)
   })
 
   robots_txt = var.robots_tag == null ? "User-agent: *\nAllow: /\n" : "User-agent: *\nDisallow: /\n"
@@ -528,6 +534,29 @@ resource "aws_s3_object" "index" {
         strcontains(local.index_html, "\"${var.domain_name}\"")
       )
       error_message = "Rendered qurl.link verifier allowedHosts does not contain '${var.domain_name}' (or the config literal's shape changed). Without it, this CloudFront distribution will serve the error page for every verifier visit."
+    }
+
+    precondition {
+      # The qv2 config keys and branch must always render (even when qv2 is off, as
+      # the empty {}/[]-configured fail-closed path) so a render regression that drops
+      # the qv2 wiring fails at plan, mirroring the allowedHosts fence above.
+      condition = (
+        strcontains(local.index_html, "issuerTrustStore") &&
+        strcontains(local.index_html, "relayAllowlist") &&
+        strcontains(local.index_html, "handleQurlV2Fragment")
+      )
+      error_message = "Rendered qurl.link verifier is missing the qURL v2 config keys (issuerTrustStore/relayAllowlist) or the handleQurlV2Fragment branch. Keep the qv2 template wiring intact."
+    }
+
+    precondition {
+      # When qv2 is provisioned (trust store non-empty), the rendered page must carry
+      # each configured issuer kid so an accidental empty/miswired render fails at plan
+      # rather than serving a page that fails-closed on every real qv2 link.
+      condition = length(var.qurl_v2_issuer_trust_store) == 0 || alltrue([
+        for kid in keys(var.qurl_v2_issuer_trust_store) :
+        strcontains(local.index_html, "\"${kid}\"")
+      ])
+      error_message = "Rendered qurl.link verifier issuerTrustStore does not contain every configured issuer kid; the qURL v2 verifier would fail closed on valid links. Check the templatefile qurl_v2_issuer_trust_store_json wiring."
     }
   }
 }
