@@ -181,6 +181,84 @@ func TestTcEgressSource_SppIsHash(t *testing.T) {
 	}
 }
 
+// TestTcEgressSource_WrittenExpiryMapsHaveReapers is the #3022 guard for the
+// "missed the duplicate map" class that caused the spp crash loop and follow-up
+// reaper. Any tc-egress-written, expiry-bearing pinned map is a datapath-fill
+// vector with no scheduler-owned expiry path, so it must be listed in
+// whitelistReapTargets. Conversely, a target that tc_egress does not write is
+// premature sweep work; this intentionally keeps spp_v6 out until the IPv6
+// tc-egress datapath actually writes return-path pinholes there.
+func TestTcEgressSource_WrittenExpiryMapsHaveReapers(t *testing.T) {
+	tcSrc := readTcEgressSource(t)
+	pinned := parsePinnedMaps(t, tcSrc)
+	updateTargetNames, updateCallCount := tcEgressMapUpdateTargetNamesAndCallCount(tcSrc)
+	if len(updateTargetNames) != updateCallCount {
+		t.Fatalf("tc_egress has %d bpf_map_update_elem calls, but the #3022 guard parser only recognizes %d direct `&map` targets; extend tcEgressMapUpdateTargets with the new writer form in the same PR", updateCallCount, len(updateTargetNames))
+	}
+	updated := map[string]struct{}{}
+	for _, name := range updateTargetNames {
+		updated[name] = struct{}{}
+	}
+
+	// Expiry-bearing map values use the shared `expire_time` field name. This is
+	// load-bearing for the guard: a new tc-egress fill vector must keep that
+	// convention, or extend this detector in the same PR.
+	const expiryFieldName = "expire_time"
+
+	writtenExpiryMaps := map[string]struct{}{}
+	for name := range updated {
+		decl, ok := pinned[name]
+		if !ok {
+			continue
+		}
+		if !strings.Contains(structBody(t, tcSrc, decl.value), expiryFieldName) {
+			continue
+		}
+		writtenExpiryMaps[name] = struct{}{}
+	}
+	if len(writtenExpiryMaps) == 0 {
+		t.Fatal("tc_egress has no expiry-bearing pinned map writes; expected at least `spp`, so the #3022 reaper-coverage guard is vacuous")
+	}
+	if len(whitelistReapTargets) != 1 {
+		t.Fatalf("whitelistReapTargets has %d targets; handle multi-target occupancy/error semantics from #3043 in the same PR that adds target #2", len(whitelistReapTargets))
+	}
+
+	reapedMaps := map[string]struct{}{}
+	for _, target := range whitelistReapTargets {
+		reapedMaps[target.mapName] = struct{}{}
+		if _, ok := writtenExpiryMaps[target.mapName]; !ok {
+			t.Errorf("whitelistReapTargets registers %q, but tc_egress does not write that expiry-bearing pinned map; do not add sweep work before the datapath-fill vector exists (#3022)", target.mapName)
+		}
+	}
+	for name := range writtenExpiryMaps {
+		if _, ok := reapedMaps[name]; !ok {
+			t.Errorf("tc_egress writes expiry-bearing pinned map %q via bpf_map_update_elem, but whitelistReapTargets has no matching reaper target; add the target before landing this datapath-fill vector (#3022)", name)
+		}
+	}
+}
+
+func TestTcEgressMapUpdateTargets_IgnoresComments(t *testing.T) {
+	src := `
+// bpf_map_update_elem(&spp_v6, &key, &value, BPF_ANY);
+/*
+ * bpf_map_update_elem(&sdwhitelist, &key, &value, BPF_ANY);
+ */
+const char *example = "bpf_map_update_elem(&sdwhitelist, &key, &value, BPF_ANY);";
+// A /* inside a line comment must not start a block comment that hides code.
+bpf_map_update_elem(&spp, &key, &value, BPF_ANY);
+// */ bpf_map_update_elem(&sdwhitelist, &key, &value, BPF_ANY);
+`
+	got := tcEgressMapUpdateTargets(src)
+	if _, ok := got["spp"]; !ok {
+		t.Fatal("tcEgressMapUpdateTargets missed real spp update")
+	}
+	for _, name := range []string{"spp_v6", "sdwhitelist"} {
+		if _, ok := got[name]; ok {
+			t.Fatalf("tcEgressMapUpdateTargets reported commented update for %q", name)
+		}
+	}
+}
+
 // pinnedMapDecl is a LIBBPF_PIN_BY_NAME map declaration parsed from an eBPF .c
 // source. Two objects that both declare a map with the same SEC(".maps") name
 // and LIBBPF_PIN_BY_NAME resolve to ONE kernel map at /sys/fs/bpf/<name>, so
@@ -198,15 +276,15 @@ var (
 	// contain no nested braces, so [^}]* safely spans the (multi-line) body up to
 	// the closing brace. Anonymous `struct {` only matches map literals, never a
 	// named `struct foo {` type.
-	ebpfMapDeclRe   = regexp.MustCompile(`struct\s*\{([^}]*)\}\s*(\w+)\s+SEC\("\.maps"\)\s*;`)
-	mapKeyRe        = regexp.MustCompile(`__type\(\s*key\s*,\s*(.+?)\s*\)`)
-	mapValueRe      = regexp.MustCompile(`__type\(\s*value\s*,\s*(.+?)\s*\)`)
-	mapMaxEntriesRe = regexp.MustCompile(`__uint\(\s*max_entries\s*,\s*(\w+)\s*\)`)
-	mapPinByNameRe  = regexp.MustCompile(`__uint\(\s*pinning\s*,\s*LIBBPF_PIN_BY_NAME\s*\)`)
-	ebpfWSRe        = regexp.MustCompile(`\s+`)
-	macroNumericRe  = regexp.MustCompile(`^\d+$`)
-	lineCommentRe   = regexp.MustCompile(`//[^\n]*`)
-	blockCommentRe  = regexp.MustCompile(`(?s)/\*.*?\*/`)
+	ebpfMapDeclRe     = regexp.MustCompile(`struct\s*\{([^}]*)\}\s*(\w+)\s+SEC\("\.maps"\)\s*;`)
+	mapKeyRe          = regexp.MustCompile(`__type\(\s*key\s*,\s*(.+?)\s*\)`)
+	mapValueRe        = regexp.MustCompile(`__type\(\s*value\s*,\s*(.+?)\s*\)`)
+	mapMaxEntriesRe   = regexp.MustCompile(`__uint\(\s*max_entries\s*,\s*(\w+)\s*\)`)
+	mapPinByNameRe    = regexp.MustCompile(`__uint\(\s*pinning\s*,\s*LIBBPF_PIN_BY_NAME\s*\)`)
+	tcMapUpdateRe     = regexp.MustCompile(`\bbpf_map_update_elem\s*\(\s*&([A-Za-z_][A-Za-z0-9_]*)\s*,`)
+	tcMapUpdateCallRe = regexp.MustCompile(`\bbpf_map_update_elem\s*\(`)
+	ebpfWSRe          = regexp.MustCompile(`\s+`)
+	macroNumericRe    = regexp.MustCompile(`^\d+$`)
 )
 
 // resolveMacro resolves a `max_entries` token to its numeric value using the
@@ -254,6 +332,27 @@ func parsePinnedMaps(t *testing.T, src string) map[string]pinnedMapDecl {
 	return out
 }
 
+func tcEgressMapUpdateTargets(src string) map[string]struct{} {
+	names, _ := tcEgressMapUpdateTargetNamesAndCallCount(src)
+	out := map[string]struct{}{}
+	for _, name := range names {
+		out[name] = struct{}{}
+	}
+	return out
+}
+
+func tcEgressMapUpdateTargetNamesAndCallCount(src string) ([]string, int) {
+	// Model the direct libbpf helper idiom used by tc_egress.c:
+	// `bpf_map_update_elem(&map, ...)`. If a future datapath writes through a map
+	// pointer or wrapper helper, extend this parser with that form in the same PR.
+	src = stripCCommentsAndLiterals(src)
+	names := []string{}
+	for _, m := range tcMapUpdateRe.FindAllStringSubmatch(src, -1) {
+		names = append(names, m[1])
+	}
+	return names, len(tcMapUpdateCallRe.FindAllStringIndex(src, -1))
+}
+
 // structBody returns the whitespace-normalized field list of the `struct <name>`
 // definition referenced by a map's __type(key|value, …). typeToken looks like
 // "struct whitelist_key"; a non-"struct X" token (a scalar) is returned verbatim
@@ -277,8 +376,7 @@ func structBody(t *testing.T, src, typeToken string) string {
 	// Strip comments so field-size annotations present in one file's copy (the XDP
 	// source annotates `// 4`, `// 2`, …; tc_egress.c does not) don't read as a
 	// divergence — only the actual fields + packed-ness matter.
-	body := blockCommentRe.ReplaceAllString(m[1]+" "+m[2], "")
-	body = lineCommentRe.ReplaceAllString(body, "")
+	body := stripCCommentsAndLiterals(m[1] + " " + m[2])
 	return ebpfWSRe.ReplaceAllString(strings.TrimSpace(body), " ")
 }
 
