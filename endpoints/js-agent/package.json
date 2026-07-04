@@ -28,7 +28,7 @@
     "@layervai/qurl-conformance": "0.1.2",
     "@types/node": "^26.0.1",
     "esbuild": "0.28.1",
-    "eslint": "^10.5.0",
+    "eslint": "^10.6.0",
     "eslint-config-prettier": "^10.1.8",
     "prettier": "^3.8.4",
     "typescript": "^6.0.3",
