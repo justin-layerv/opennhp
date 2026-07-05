@@ -2935,13 +2935,12 @@ resource "aws_ssm_parameter" "qurl_link_url" {
 # TestQURLEndToEndFlow_QV2 + the forged-signature fence -> qurl-go EnterPortal).
 # Published from the SAME source of truth as the NHP server trust store above —
 # var.qurl_v2_issuer_kid + data.aws_kms_public_key.qurl_v2_issuer for the anchor,
-# var.qurl_v2_relay_url for the relay origin — and gated on the SAME
-# local.qurl_v2_admission_ready, so the CI trust anchor can never diverge from
-# what the server actually admits. Adopted from the hand-seeded qurl-service#1097
-# params via environments/sandbox/imports.tf.
+# var.qurl_v2_relay_url for the relay origin. Sandbox's hand-seeded
+# qurl-service#1097 params are adopted by environments/sandbox/imports.tf so
+# the first managed apply does not collide with the existing SSM names.
 resource "aws_ssm_parameter" "qurl_qv2_issuer_key" {
-  count       = local.qurl_v2_admission_ready ? 1 : 0
-  name        = "/${var.environment}/nhp/qurl/qv2-issuer-key"
+  for_each    = local.qurl_v2_admission_ready ? toset([var.environment]) : toset([])
+  name        = "/${each.key}/nhp/qurl/qv2-issuer-key"
   description = "qURL v2 issuer trust anchor '<kid>=<base64-std-DER P-256 SPKI>' - consumed by CI smoke (EnterPortal trust store)"
   type        = "String"
   value       = "${var.qurl_v2_issuer_kid}=${data.aws_kms_public_key.qurl_v2_issuer[0].public_key}"
@@ -2953,8 +2952,8 @@ resource "aws_ssm_parameter" "qurl_qv2_issuer_key" {
 }
 
 resource "aws_ssm_parameter" "qurl_relay_url" {
-  count       = local.qurl_v2_admission_ready ? 1 : 0
-  name        = "/${var.environment}/nhp/qurl/relay-url"
+  for_each    = local.qurl_v2_admission_ready && var.qurl_v2_relay_url != "" ? toset([var.environment]) : toset([])
+  name        = "/${each.key}/nhp/qurl/relay-url"
   description = "qURL v2 relay origin - consumed by CI smoke (EnterPortal relay allowlist)"
   type        = "String"
   value       = var.qurl_v2_relay_url
