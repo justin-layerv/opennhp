@@ -418,7 +418,7 @@ func (d *Device) msgToPacketRoutine(id int) {
 				if d.IsTransactionRequest(mad.HeaderType) {
 					// save initiator transaction
 					mad.BasePacket.KeepAfterSend = true // packet is kept after sending and deleted at transaction level
-					t := newLocalTransaction(mad.header.Counter(), mad.connData, mad, d.LocalTransactionTimeout())
+					t := newLocalTransaction(mad.header.Counter(), mad.connData, mad, d.LocalTransactionTimeout(mad.HeaderType))
 					d.AddLocalTransaction(t)
 					localTransaction = t
 					log.Debug("AddLocalTransaction:deviceType=%d,HeaderType=%d", d.deviceType, mad.HeaderType)

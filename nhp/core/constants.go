@@ -63,7 +63,16 @@ const (
 	ThreatCountBeforeBlock = 1   // block at 2nd attempt
 	CookieRegenerateTime   = 120 // second
 	CookieRoundTripTimeMs  = 20  // millisecond
-	FailureRetryInterval   = 10  // second
+	// FailureRetryInterval is the agent's backoff after a failed knock before it
+	// re-knocks (endpoints/agent/udpagent.go). The knock is user-facing core infra,
+	// so this is DNS-fast at 2s rather than 10s: after a transient failure the agent
+	// re-establishes access in a couple of seconds, not ten. Flood protection does
+	// NOT rest on this backoff — the server's per-source-IP token-bucket rate limiter
+	// (endpoints/server/ratelimiter.go) is the real defense: after the burst/2 starter
+	// it bounds a single source IP to the configured token refill rate no matter how
+	// fast that IP re-knocks, so a stuck/looping agent is capped server-side by the
+	// bucket, not by this sleep — tightening it here does not weaken that posture.
+	FailureRetryInterval = 2 // second
 )
 
 // staleness floor (#1464) — the maximum age, in seconds, that a
@@ -95,9 +104,48 @@ const (
 
 // transaction
 const (
-	AgentLocalTransactionResponseTimeoutMs  = 5 * 1000                                     // millisecond
+	AgentLocalTransactionResponseTimeoutMs = 5 * 1000 // millisecond
+	// ServerLocalTransactionResponseTimeoutMs is the wait for EVERY server-INITIATED
+	// local transaction OTHER than the AC-open — Device.LocalTransactionTimeout returns
+	// it for a NHP_SERVER device on all message types except NHP_AOP (see
+	// nhp/core/transaction.go). That set includes the DB private-key-wrapping NHP_DWR
+	// (a TEE/KMS crypto op with NO retry wrapper) and forwarded knocks NHP_FWD, neither
+	// of which is intra-VPC-fast or idempotently retried — so this stays at the
+	// historical 4.7s. The AC-open (NHP_AOP) is DNS-fast on its own, decoupled
+	// constant below; do NOT lower this one to speed the knock (that was the #3046
+	// review's blast-radius catch — it would risk failing a cold-TEE DB wrap at 1s).
 	ServerLocalTransactionResponseTimeoutMs = AgentLocalTransactionResponseTimeoutMs - 300 // millisecond
-	ACLocalTransactionResponseTimeoutMs     = ServerLocalTransactionResponseTimeoutMs      // millisecond
+	// ServerACOpenTransactionResponseTimeoutMs is the server→AC (NHP-AOP) wait — the
+	// AC-open on the qURL knock hot path, user-facing core infra (click link → resource
+	// opens) that must be DNS-fast. Routed ONLY to NHP_AOP by LocalTransactionTimeout,
+	// so it does not touch the DB/forward paths above. The path is intra-VPC (server→AC
+	// over the internal NLB, both LayerV-controlled), so a healthy AC ACKs in
+	// sub-ms-to-low-ms and the happy path returns the instant that ACK lands — this
+	// bounds only the FAILURE case (a torn-down ACK path during a blue/green AC
+	// reassignment). Kept low at 1.5s (vs the old shared 4.7s) so a dead ACK path is
+	// detected fast and the idempotent AC-open re-knock retry
+	// (endpoints/server/ac_open_reknock_retry.go, which incurs this timeout twice:
+	// initial + one retry) stays cheap — 2×1.5s + backoff ≈ 3.3s worst case, well inside
+	// the agent's 5s wait above (the old shared 4.7s made the doubled retry ~10s, which
+	// OVERRAN that 5s agent wait).
+	//
+	// WHY 1.5s and not 1s: this budget covers more than the network RTT. The AC applies
+	// the ipset/eBPF rule (admitAndIssueToken → HandleAccessControl) BEFORE it sends the
+	// NHP_ART ACK (endpoints/ac/msghandler.go::HandleUdpACOperations), so a slow datapath
+	// write — ipset/eBPF map-lock contention under a knock burst, or an AC GC pause — is
+	// inside this budget; a false timeout there tears down that AC conn (→ re-register +
+	// reknock churn), and a single-conn AC with no sibling hard-fails 52005 with no
+	// server-side recovery. 1.5s widens the margin over the datapath write vs a tighter
+	// 1s while staying comfortably under the 5s budget; the idempotent retry absorbs the
+	// client-facing failure. AC conn teardown/re-register rate is still the first-rollout
+	// watch item (see the #3046 rollout-ledger entry); raise this constant (decoupled for
+	// exactly that) if p99 datapath-write-under-burst approaches it. Fenced by
+	// TestReknockRetryFitsKnockProcessingBudget.
+	ServerACOpenTransactionResponseTimeoutMs = 1500 // millisecond (1.5s)
+	// ACLocalTransactionResponseTimeoutMs bounds AC-INITIATED transactions (NHP-AOL
+	// registration + the server-reconnect cadence in udpac.go). Kept at 4.7s: AC
+	// registration validates a bcrypt license server-side and must not fail-fast.
+	ACLocalTransactionResponseTimeoutMs = AgentLocalTransactionResponseTimeoutMs - 300 // millisecond
 
 	RemoteTransactionProcessTimeoutMs   = 10 * 1000 // millisecond
 	DELocalTransactionResponseTimeoutMs = 5 * 1000

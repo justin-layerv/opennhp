@@ -608,6 +608,21 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	// the deadline/user/admission tuple. The receiver's catalog resource hash
 	// stays authoritative when present. Legacy senders omit the sidecar and
 	// retain the previous catalog-only behavior.
+	//
+	// DELIBERATELY the bare broadcast, NOT broadcastACOpenWithReknock: this is the
+	// UDP server-to-server forward RECEIVER, whose caller is a forwarding server
+	// bounded by the 2s ForwardTimeout (this file, NOT msghandler's unrelated 10s
+	// DefaultForwardTimeout). A reknock
+	// retry adds ~one AC-open transaction timeout + backoff (~1.8s) on top of the
+	// first, so its ~3.3s worst case lands well after the forwarder has already given
+	// up at 2s — there is no in-flight forwarded transaction left to rescue, unlike
+	// the HTTP internal-knock receiver (handleHttpOpenResource), where qurl-service is
+	// still waiting its 7s knock timeout, so THAT path does wrap. The client recovers
+	// via its next re-knock against the by-then-settled topology (the first AOP already
+	// wrote the pinhole idempotently if the AC applied it); wrapping here would only
+	// burn a held goroutine per forwarded timeout during exactly the broad-flip window
+	// forwarding peaks in. If ForwardTimeout is ever raised past the reknock worst
+	// case, revisit this.
 	artMsg, err := f.deps.ProcessACOperationBroadcast(f.deps.LifecycleCtx(), knkMsg, acConns, srcAddr, dstAddrs, openTime, acOperationResData)
 	if err != nil {
 		log.Error("AC operation failed for forwarded knock: %v", err)

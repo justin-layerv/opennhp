@@ -135,12 +135,19 @@ func (d *Device) IsTransactionRequest(t int) bool {
 	return false
 }
 
-func (d *Device) LocalTransactionTimeout() int {
+func (d *Device) LocalTransactionTimeout(msgType int) int {
 	// NHP_KPL is handled separately
 	switch d.deviceType {
 	case NHP_AGENT:
 		return AgentLocalTransactionResponseTimeoutMs
 	case NHP_SERVER:
+		// The server→AC open (NHP_AOP) is the DNS-fast qURL knock hot path and gets its
+		// own aggressive timeout; every OTHER server-initiated transaction (NHP_DWR DB
+		// key-wrap, NHP_FWD forward, …) keeps the conservative shared value — those are
+		// not intra-VPC-fast and are not idempotently retried.
+		if msgType == NHP_AOP {
+			return ServerACOpenTransactionResponseTimeoutMs
+		}
 		return ServerLocalTransactionResponseTimeoutMs
 	case NHP_AC:
 		return ACLocalTransactionResponseTimeoutMs

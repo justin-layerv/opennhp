@@ -46,10 +46,10 @@ import (
 // burst (#1160 T3-04): an attacker rotating source IPs cannot extract
 // the full burst on first sight from each fresh IP. Half-burst was
 // chosen over a zero-token start because the agent retry loop sleeps
-// FailureRetryInterval (10s, nhp/core/constants.go) on each failed
-// transaction, so a strict zero-start would add a full 10s wait
+// FailureRetryInterval (2s, nhp/core/constants.go) on each failed
+// transaction, so a strict zero-start would add a full 2s stall
 // before the first legitimate knock from an unseen IP would succeed
-// — unacceptable for interactive flows. The per-knock transaction
+// — still unacceptable for interactive flows. The per-knock transaction
 // timeout (AgentLocalTransactionResponseTimeoutMs, 5s) bounds how
 // long the agent waits for a response before declaring failure.
 // With Burst=1

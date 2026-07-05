@@ -107,6 +107,27 @@ const (
 	MetricKnockForwardFailure        = "KnockForwardFailure"
 	MetricKnockForwardSkippedDead    = "KnockForwardSkippedDead"
 	MetricKnockForwardFallback       = "KnockForwardFallback"
+	// Knock-path AC-open re-knock retry (blue/green reassignment window,
+	// qurl-service#976). A broadcast whose every AC connection hit the transaction
+	// timeout re-snapshots the connection map after a short backoff; the four
+	// counters map the four outcomes (steady-state all ~0):
+	//   - MetricKnockReknockNoFreshConns: the re-snapshot found NO fresh conn, so no
+	//     retry was issued; a distinct counter because this case increments NEITHER
+	//     Retry counter below (why it gets its own is at the increment site).
+	//   - MetricKnockReknockDeadlineSkipped: fresh conns existed, but less than one
+	//     transaction timeout of the caller's HttpKnockProcessingBudget remained, so
+	//     the retry was skipped (it could not finish before the caller gives up).
+	//   - MetricKnockReknockRetry: a retry WAS issued (fresh conns appeared and the
+	//     deadline allowed it).
+	//   - MetricKnockReknockRetrySuccess: the issued retry then succeeded (an
+	//     ErrServerACOpsFailed/52005 converted into a success).
+	// The on-call decision tree (which combination means absorbed-flip vs ongoing
+	// thrash vs escalate-to-ops/forward vs budget-starved) lives in the qURL AC-open
+	// rollout-ledger entry so it stays single-sourced.
+	MetricKnockReknockRetry           = "KnockReknockRetry"
+	MetricKnockReknockRetrySuccess    = "KnockReknockRetrySuccess"
+	MetricKnockReknockNoFreshConns    = "KnockReknockNoFreshConns"
+	MetricKnockReknockDeadlineSkipped = "KnockReknockDeadlineSkipped"
 	// MetricKnockForwardOutcome is the cause-split of a ForwardHttpKnock call
 	// (qurl-service#976 Phase 0A). Emitted once per forward with an "outcome"
 	// dimension (the ForwardOutcome enum), so KnockForwardFailure — which stays

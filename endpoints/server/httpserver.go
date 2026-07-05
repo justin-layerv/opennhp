@@ -1417,6 +1417,10 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		openTime = 1 // timeout in 1 second
 	}
 
+	// logCtx is the per-knock agent-identity prefix shared by the re-knock
+	// retry's logs; loop-invariant, so build it once.
+	logCtx := fmt.Sprintf("httpserver-agent(%s#%s@%s)", knkMsg.UserId, knkMsg.DeviceId, srcIp)
+
 	for resName, addrs := range acDstIpMap {
 		resInfo := res.Resources[resName]
 		if resInfo == nil {
@@ -1494,11 +1498,15 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		go func(name string, info *common.ResourceInfo, dstAddrs []*common.NetAddress) {
 			defer acWg.Done()
 
-			// resolveProcessACOperationBroadcast lets handler-site
+			// broadcastACOpenWithReknock wraps the broadcast with a single
+			// re-snapshot retry on the blue/green reassignment-window timeout
+			// (qurl-service#976); it still funnels through
+			// resolveProcessACOperationBroadcast, which lets handler-site
 			// integration tests inject a fake AC response — see
-			// httpserver_publish_acktokens_test.go.
+			// httpserver_publish_acktokens_test.go. ctx is the request-scoped
+			// context, so the retry backoff aborts if the client disconnects.
 			// res carries qURL v2 revocation metadata (P4a) for the AOP; nil-safe.
-			artMsg, err := s.resolveProcessACOperationBroadcast()(ctx, knkMsg, connsCopy, srcAddr, dstAddrs, openTime, res)
+			artMsg, err := s.broadcastACOpenWithReknock(ctx, knkMsg, info.ACId, connsCopy, srcAddr, dstAddrs, openTime, res, logCtx)
 			artMsgsMutex.Lock()
 			artMsgs[name] = artMsg
 			if err == nil {
@@ -1928,8 +1936,14 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 	}
 	// Carry the verified hop down to handleHttpOpenResource → the
 	// forwarder, which emits verifiedHop+1 on any onward forward so the
-	// hop counter stays monotonic across the chain.
-	fwdReq.Request.Ctx = contextWithForwardHop(ctx.Request.Context(), verifiedHop)
+	// hop counter stays monotonic across the chain. Bound it with the
+	// knock-processing budget (see withKnockProcessingBudget) so the AC-open
+	// reknock retry short-circuits within that budget (5s, kept ≤ qurl-service's
+	// knock-client budget) on this path — ctx.Request.Context() carries no deadline
+	// of its own. defer cancel() is safe: handleHttpOpenResource runs synchronously below.
+	knockCtx, cancel := withKnockProcessingBudget(contextWithForwardHop(ctx.Request.Context(), verifiedHop))
+	defer cancel()
+	fwdReq.Request.Ctx = knockCtx
 
 	ackMsg, err := hs.handleHttpOpenResource(fwdReq.Request, resolvedResource)
 	resp := HttpKnockForwardResponse{AckMsg: ackMsg}

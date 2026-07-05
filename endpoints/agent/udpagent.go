@@ -716,9 +716,11 @@ func (a *UdpAgent) dhpKnockResourceRoutine() {
 		if err != nil {
 			a.safeTee.Store(false)
 
-			// if error happens wait some time (total AgentLocalTransactionResponseTimeoutMs) to retry
+			// On failure, back off FailureRetryInterval (2s, DNS-fast) before
+			// re-knocking. Kept short so a transient failure re-establishes access in
+			// a couple of seconds; the server's per-IP rate limiter — not this sleep —
+			// is what bounds a knock flood.
 			log.Error("[Agent] DHP knock failed: %v", err)
-			// avoid flood attack from server side
 			time.Sleep(core.FailureRetryInterval * time.Second)
 			continue // retry knock
 		}

@@ -246,6 +246,46 @@ func TestHandleHttpOpenResource_EmptyResourceId_SkipsForward(t *testing.T) {
 	}
 }
 
+// TestHandleInternalKnock_SetsKnockProcessingDeadline fences the wiring on the
+// path that actually matters for qurl-service's headless knock: handleInternalKnock
+// must bound req.Ctx with HttpKnockProcessingBudget so the AC-open reknock retry's
+// deadline short-circuit engages here. (An earlier draft wrapped only the
+// runPluginAuth ASP-plugin path, leaving THIS — the real /nhp/internal/knock path
+// qurl-service calls — unbounded.) It drives a local-AC Source="api" knock to the
+// broadcast seam and asserts the ctx that reached it carries a ≈budget deadline.
+func TestHandleInternalKnock_SetsKnockProcessingDeadline(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hs := newForwardingTestServer(NewMemoryStorage())
+	hs.udpServer.metrics = metrics.NewPublisherForTest(t)
+	hs.udpServer.tokenStore = common.NewTokenStore[*ACTokenEntry]()
+	hs.udpServer.acConnectionMap["test-ac"] = []*ACConn{newACConnWithLastRecv(time.Now().UnixNano())}
+
+	var gotBudget time.Duration
+	var hadDeadline bool
+	before := time.Now()
+	hs.udpServer.processACOperationBroadcastFn = func(ctx context.Context, _ *common.AgentKnockMsg, _ []*ACConn, _ *common.NetAddress, _ []*common.NetAddress, openTime uint32, _ *common.ResourceData) (*common.ACOpsResultMsg, error) {
+		if dl, ok := ctx.Deadline(); ok {
+			hadDeadline = true
+			gotBudget = dl.Sub(before)
+		}
+		return &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode(), ACToken: "ok", OpenTime: openTime}, nil
+	}
+
+	fwdReq := HttpKnockForwardRequest{
+		Source:  SourceAPI,
+		Request: &common.HttpKnockRequest{AuthServiceId: "qurl", ResourceId: "r_test", SrcIp: "10.0.1.50"},
+	}
+	if w := callHandleInternalKnock(t, hs, fwdReq); w.Code != http.StatusOK {
+		t.Fatalf("internal knock failed: %d %s", w.Code, w.Body.String())
+	}
+	if !hadDeadline {
+		t.Fatal("handleInternalKnock must bound req.Ctx with HttpKnockProcessingBudget; the broadcast ctx had no deadline")
+	}
+	if gotBudget < HttpKnockProcessingBudget-2*time.Second || gotBudget > HttpKnockProcessingBudget+2*time.Second {
+		t.Errorf("deadline budget = %v, want ≈ HttpKnockProcessingBudget (%v)", gotBudget, HttpKnockProcessingBudget)
+	}
+}
+
 // TestHandleInternalKnock_HopStrict_SenderBuiltForwardProceeds proves a
 // forward built the way the fixed sender builds it — from a req carrying only
 // aspId, with resId pulled from the resolved resource — clears BOTH gates a

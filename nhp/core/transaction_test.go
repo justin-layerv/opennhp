@@ -388,3 +388,34 @@ func TestRemoteTransaction_FindAfterRunCleanup(t *testing.T) {
 		t.Errorf("stale-pointer SendMessage: got %v, want ErrTransactionClosed", err)
 	}
 }
+
+// TestLocalTransactionTimeout_AOPDecoupledFromSharedServerTimeout fences the #3046
+// blast-radius fix: the server->AC AC-open (NHP_AOP) gets the aggressive DNS-fast 1.5s
+// timeout, while EVERY OTHER server-initiated transaction (DB key-wrap NHP_DWR,
+// forwarded knock NHP_FWD, ...) keeps the conservative shared timeout. A regression
+// that dropped the shared constant to speed the knock, or routed the DB/forward paths
+// through the 1.5s AOP timeout, could fail a cold-TEE DB wrap with no retry to absorb it
+// -- this turns that into a red build instead of a silent prod degradation.
+func TestLocalTransactionTimeout_AOPDecoupledFromSharedServerTimeout(t *testing.T) {
+	server := &Device{deviceType: NHP_SERVER}
+
+	if got := server.LocalTransactionTimeout(NHP_AOP); got != ServerACOpenTransactionResponseTimeoutMs {
+		t.Errorf("server NHP_AOP timeout = %d, want ServerACOpenTransactionResponseTimeoutMs (%d)",
+			got, ServerACOpenTransactionResponseTimeoutMs)
+	}
+	for _, mt := range []int{NHP_DWR, NHP_FWD} {
+		if got := server.LocalTransactionTimeout(mt); got != ServerLocalTransactionResponseTimeoutMs {
+			t.Errorf("server msgType %d timeout = %d, want the shared ServerLocalTransactionResponseTimeoutMs (%d) -- only NHP_AOP is decoupled",
+				mt, got, ServerLocalTransactionResponseTimeoutMs)
+		}
+	}
+	// The decoupling only means something if the AOP timeout is actually tighter.
+	if ServerACOpenTransactionResponseTimeoutMs >= ServerLocalTransactionResponseTimeoutMs {
+		t.Fatalf("AOP timeout (%d) must be < the shared server timeout (%d)",
+			ServerACOpenTransactionResponseTimeoutMs, ServerLocalTransactionResponseTimeoutMs)
+	}
+	// Other device types are unaffected by the msgType arg.
+	if got := (&Device{deviceType: NHP_AGENT}).LocalTransactionTimeout(NHP_AOP); got != AgentLocalTransactionResponseTimeoutMs {
+		t.Errorf("agent timeout = %d, want AgentLocalTransactionResponseTimeoutMs (%d)", got, AgentLocalTransactionResponseTimeoutMs)
+	}
+}

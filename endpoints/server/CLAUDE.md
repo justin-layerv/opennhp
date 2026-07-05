@@ -119,7 +119,7 @@ before adding or moving any step.
    `listenConn` is intentionally **kept open** through step 5; closing
    it pre-drain would cause every in-flight server→AC transaction
    (waiting for an AC response on listenConn) to time out at
-   ServerLocalTransactionResponseTimeoutMs instead of completing
+   ServerACOpenTransactionResponseTimeoutMs instead of completing
    normally — net worse than the race the drain solves.
 5. **`awaitTransactionDrain(shutdownTransactionDrainTimeout)`** —
    waits for in-flight local NHP transactions (server→AC knocks,

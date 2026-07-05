@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -121,6 +122,40 @@ func TestAuthWithAspPlugin_UnknownASPID_Returns404(t *testing.T) {
 	expected := `{"errMsg":"no auth handler provided"}`
 	if body := w.Body.String(); body != expected {
 		t.Errorf("body = %q, want %q", body, expected)
+	}
+}
+
+// TestRunPluginAuth_SetsKnockProcessingDeadline fences the wiring the AC-open
+// reknock retry short-circuit depends on: the HTTP knock path must bound req.Ctx
+// with HttpKnockProcessingBudget. c.Request.Context() carries no deadline of its
+// own, so without this wrap broadcastACOpenWithReknock's ctx.Deadline() check would
+// silently no-op on the HTTP path and the retry could overrun the caller's budget.
+func TestRunPluginAuth_SetsKnockProcessingDeadline(t *testing.T) {
+	hs := newTestHttpServer()
+
+	var gotDeadline time.Time
+	var hadDeadline bool
+	handler := &mockPluginHandler{
+		authWithHttpFn: func(_ *gin.Context, req *common.HttpKnockRequest, _ *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
+			gotDeadline, hadDeadline = req.Ctx.Deadline()
+			return &common.ServerKnockAckMsg{}, nil
+		},
+	}
+
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", nil)
+
+	before := time.Now()
+	hs.runPluginAuth(ctx, &common.HttpKnockRequest{}, handler)
+
+	if !hadDeadline {
+		t.Fatal("req.Ctx has no deadline; the HTTP knock path must bound it with HttpKnockProcessingBudget")
+	}
+	// The deadline should be ≈ HttpKnockProcessingBudget from just before the call
+	// (generous slack for scheduling jitter, tight enough to catch a wrong budget).
+	if budget := gotDeadline.Sub(before); budget < HttpKnockProcessingBudget-2*time.Second || budget > HttpKnockProcessingBudget+2*time.Second {
+		t.Errorf("deadline budget = %v, want ≈ HttpKnockProcessingBudget (%v)", budget, HttpKnockProcessingBudget)
 	}
 }
 

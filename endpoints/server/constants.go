@@ -56,10 +56,14 @@ const (
 	// processACOperationBroadcast — i.e., how long the server waits for an
 	// AC peer to ACK an NHP-AOP. It's intentionally independent of the
 	// HTTP envelope timeouts above (those bound CF↔server connection
-	// state; this one bounds AC-side processing). 10s is sized to absorb
-	// AC startup jitter and short network blips while still cutting off
-	// a wedged AC before it drains the broadcast budget.
-	DefaultBroadcastTimeout = 10 * time.Second
+	// state; this one bounds AC-side processing). It is only a BACKSTOP above
+	// the per-AC AOP transaction timeout (ServerACOpenTransactionResponseTimeoutMs,
+	// 1.5s): that transaction timeout MUST fire first so a dead AC surfaces the
+	// ErrTransactionFailedByTimeout the reknock retry keys on (fenced by
+	// TestBroadcastTimeoutExceedsTransactionTimeout). 3s keeps a comfortable 2×
+	// margin over that 1.5s while still cutting off a wedged AC fast — AC startup
+	// jitter is now absorbed by the fast idempotent retry, not a long wait here.
+	DefaultBroadcastTimeout = 3 * time.Second
 )
 
 // knock
@@ -69,3 +73,49 @@ const (
 	TokenStoreRefreshInterval      = common.TokenStoreRefreshInterval
 	DefaultCookieTimeWindowSeconds = 60
 )
+
+// defaultReknockRetryBackoff is the pause broadcastACOpenWithReknock waits before it
+// re-snapshots AC connections and retries an AC open whose every connection hit the
+// transaction timeout (the blue/green reassignment-window transient,
+// qurl-service#976). Sized to let processACOperation's conn.Close() prune the dead
+// conn and the re-snapshot pick up a still-live SIBLING conn — NOT to let a brand-new
+// AC registration land: a genuine re-register runs NHP_AOL + server-side bcrypt
+// (the ~4.7s work ACLocalTransactionResponseTimeoutMs exists for), which will not
+// finish in 300ms. So the retry's recovery vector is an already-registered green conn
+// (blue/green keeps several per acId via MaxACConnsPerID); a single-conn AC with no
+// sibling deterministically hits NoFreshConns and relies on the client's next
+// re-knock. The backoff also bounds the retry's ADDED latency:
+// the 1.5s transaction timeout twice + this ≈ 3.3s. That is only the AC-open slice of
+// the knock budget — the admission round-trips (prepare/authorize) and NHP
+// transaction setup run BEFORE AC-open, so the real end-to-end headroom is the
+// budget − (admission + setup); TestReknockRetryFitsKnockProcessingBudget fences the
+// AC-open slice, which is necessary but not sufficient. The end-to-end bound is
+// enforced separately by HttpKnockProcessingBudget (below): the reknock retry
+// short-circuits when less than one transaction timeout of that budget remains, so a
+// slow admission cannot let the doubled AC-open push a knock past the caller's
+// budget.
+//
+// broadcastACOpenWithReknock reads UdpServer.reknockRetryBackoff and falls back to
+// this const when that field is zero — the production default. Only tests set the
+// field (via shortenReknockBackoff), so this const is always the production value and
+// TestReknockRetryFitsKnockProcessingBudget can assert against it directly. Keeping the
+// override per-instance (not a package var) means those tests mutate only their own
+// server, so a future t.Parallel() reknock test cannot race it.
+const defaultReknockRetryBackoff = 300 * time.Millisecond
+
+// HttpKnockProcessingBudget is the wall-clock budget withKnockProcessingBudget
+// stamps on an HTTP knock's context (see that helper for WHAT the deadline does and
+// does not bound, and which paths carry it). The knock is user-facing core infra, so
+// this is kept tight at 5s — comfortably above the worst-case AC-open (2×1.5s txn +
+// 300ms backoff ≈ 3.3s) plus admission, and well UNDER qurl-service's knock-client
+// budget so the server always returns a clean timeout before the caller gives up
+// (the reknock retry additionally short-circuits when less than one transaction
+// timeout of budget remains). TestReknockRetryFitsKnockProcessingBudget fences the
+// AC-open slice against this.
+//
+// Cross-repo lockstep: qurl-service's knock client caps its HTTP call at
+// internal/nhp.defaultTimeout (7s), deliberately kept a couple of seconds ABOVE
+// this budget so that client receives the server's authoritative answer rather than
+// racing it. If you raise this budget, raise that client timeout in lockstep (the
+// coupling is comment-only — nothing across the two repos enforces it at build time).
+const HttpKnockProcessingBudget = 5 * time.Second

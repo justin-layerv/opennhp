@@ -353,6 +353,14 @@ type UdpServer struct {
 		res *common.ResourceData,
 	) (*common.ACOpsResultMsg, error)
 
+	// reknockRetryBackoff overrides the pause broadcastACOpenWithReknock waits
+	// before its single retry (the blue/green reassignment window). The
+	// zero value — the production default — resolves to defaultReknockRetryBackoff
+	// at use; timeout-path tests set a tiny value via shortenReknockBackoff to run
+	// fast. Per-instance (not a package var) so those tests mutate only their own
+	// server, which a future t.Parallel() reknock test could not race.
+	reknockRetryBackoff time.Duration
+
 	// agentPeerLookup resolves a knock's RemotePubKey to a registered
 	// agent peer via the qurl-agent-keys DDB table with a 60s LRU.
 	// Populated only in cloud mode when AgentKeysTable is configured;
@@ -1227,7 +1235,7 @@ func (s *UdpServer) Stop() {
 	// — so it's safe to run pre-drain. listenConn is intentionally left
 	// open through the drain: closing it pre-drain would cause every
 	// in-flight server->AC transaction (waiting for an AC response on
-	// listenConn) to time out at ServerLocalTransactionResponseTimeoutMs
+	// listenConn) to time out at ServerACOpenTransactionResponseTimeoutMs
 	// instead of completing normally.
 	if s.forwarder != nil {
 		s.forwarder.Stop()
@@ -1408,14 +1416,16 @@ const drainFlushDelay = 100 * time.Millisecond
 
 // shutdownTransactionDrainTimeout bounds how long Stop() waits for in-flight
 // local transactions to complete before closing connection StopSignals.
-// Sized at ~3× a single ServerLocalTransactionResponseTimeoutMs (4.7s, per
-// nhp/core/constants.go) to cover overlapping in-flight transactions that
-// the qURL plugin's retry loop may have queued back-to-back when shutdown
-// begins. Each individual LocalTransaction self-clears via its own timer
-// branch (nhp/core/transaction.go::LocalTransaction.Run), but multiple
-// queued txs can serialize within this window. If exceeded,
-// MetricShutdownTransactionDrainTimeout fires and outstanding transactions
-// return ErrTransactionFailedByClosedConnection to callers.
+// Sized at ~3× the SHARED ServerLocalTransactionResponseTimeoutMs (4.7s, per
+// nhp/core/constants.go): the LONGEST server-initiated local transaction that can be
+// in flight at shutdown is a DB key-wrap (NHP_DWR) or forward (NHP_FWD) on that shared
+// timeout, so the drain must cover THAT — not the faster 1s AC-open (NHP_AOP). The
+// AC-open path fits comfortably inside this window even with its reknock second
+// transaction (~3.3s worst case, ac_open_reknock_retry.go). Each individual
+// LocalTransaction self-clears via its own timer branch
+// (nhp/core/transaction.go::LocalTransaction.Run), but multiple queued txs can
+// serialize within this window. If exceeded, MetricShutdownTransactionDrainTimeout
+// fires and outstanding transactions return ErrTransactionFailedByClosedConnection.
 const shutdownTransactionDrainTimeout = 15 * time.Second
 
 // shutdownTransactionDrainPollInterval is the polling cadence inside
@@ -4213,6 +4223,10 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		openTime = 1 // timeout in 1 second
 	}
 
+	// logCtx is the per-knock agent-identity prefix shared by the re-knock
+	// retry's logs; loop-invariant, so build it once.
+	logCtx := fmt.Sprintf("server-agent(%s@%s)", knkMsg.UserId, addrStr)
+
 	for resName, addrs := range acDstIpMap {
 		resInfo := res.Resources[resName]
 		if resInfo == nil {
@@ -4241,12 +4255,19 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		go func(name string, info *common.ResourceInfo, dstAddrs []*common.NetAddress) {
 			defer acWg.Done()
 
-			// UDP knock path: no request-scoped context exists, so pass Background.
-			// processACOperationBroadcast discards parent cancellation regardless.
-			// resolveProcessACOperationBroadcast lets handler-site integration
-			// tests inject a fake AC response — see
+			// UDP knock path: no request-scoped context exists, so pass the
+			// server lifecycle context. processACOperationBroadcast WithoutCancel's
+			// it internally, so the AOP send is unaffected by cancellation; the
+			// lifecycle ctx is used only by the re-knock retry's backoff select, so
+			// a retry pending when Stop() cancels lifecycleCtx abandons promptly
+			// instead of firing a fresh server→AC transaction into the drain window.
+			// broadcastACOpenWithReknock wraps the broadcast with a single
+			// re-snapshot retry on the blue/green reassignment-window timeout
+			// (qurl-service#976); it still funnels through
+			// resolveProcessACOperationBroadcast, which lets handler-site
+			// integration tests inject a fake AC response — see
 			// udpserver_publish_acktokens_test.go.
-			artMsg, err := s.resolveProcessACOperationBroadcast()(context.Background(), knkMsg, connsCopy, srcAddr, dstAddrs, openTime, res)
+			artMsg, err := s.broadcastACOpenWithReknock(s.LifecycleCtx(), knkMsg, info.ACId, connsCopy, srcAddr, dstAddrs, openTime, res, logCtx)
 			if artMsg == nil {
 				// Keep the artMsgs map nil-free — the successCount loop and the
 				// failure-log loop below deref entries unconditionally (mirrors the
