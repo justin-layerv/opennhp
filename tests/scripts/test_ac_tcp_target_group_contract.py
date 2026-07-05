@@ -2,176 +2,49 @@
 """Regression fence for the public AC 443 target-group transport contract."""
 
 import re
+import sys
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / ".github" / "scripts"))
+
+from _tf_lint_lib import iter_resources, parse_tf_files, unquote  # noqa: E402
+
+ParsedTf = list[tuple[Path, dict[str, Any]]]
 
 
 def read(rel: str) -> str:
     return (REPO_ROOT / rel).read_text(encoding="utf-8")
 
 
-def resource_block(source: str, resource_type: str, name: str) -> str:
-    needle = f'resource "{resource_type}" "{name}"'
-    start = source.find(needle)
-    assert start != -1, f"missing {needle}"
-
-    brace_start = source.find("{", start)
-    assert brace_start != -1, f"missing opening brace for {needle}"
-
-    # The target-group resource blocks contain no heredocs today. Extend this
-    # scanner or switch to an HCL parser before relying on it for blocks that do.
-    depth = 0
-    in_block_comment = False
-    in_line_comment = False
-    in_string = False
-    escaped = False
-    idx = brace_start
-    while idx < len(source):
-        char = source[idx]
-        next_char = source[idx + 1] if idx + 1 < len(source) else ""
-
-        if in_line_comment:
-            in_line_comment = char != "\n"
-            idx += 1
-            continue
-
-        if in_block_comment:
-            if char == "*" and next_char == "/":
-                in_block_comment = False
-                idx += 2
-                continue
-            idx += 1
-            continue
-
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            idx += 1
-            continue
-
-        if char == "#":
-            in_line_comment = True
-            idx += 1
-            continue
-        if char == "/" and next_char == "/":
-            in_line_comment = True
-            idx += 2
-            continue
-        if char == "/" and next_char == "*":
-            in_block_comment = True
-            idx += 2
-            continue
-        if char == '"':
-            in_string = True
-            idx += 1
-            continue
-
-        char = source[idx]
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return source[start : idx + 1]
-        idx += 1
-
-    raise AssertionError(f"missing closing brace for {needle}")
-
-
-def has_attr(block: str, name: str, value: str) -> bool:
-    block = strip_hcl_comments(block)
-    pattern = rf"(?m)^\s*{re.escape(name)}\s*=\s*{re.escape(value)}\s*(?:#.*)?$"
-    return re.search(pattern, block) is not None
-
-
-def strip_hcl_comments(source: str) -> str:
-    result: list[str] = []
-    in_block_comment = False
-    in_line_comment = False
-    in_string = False
-    escaped = False
-    idx = 0
-    while idx < len(source):
-        char = source[idx]
-        next_char = source[idx + 1] if idx + 1 < len(source) else ""
-
-        if in_line_comment:
-            if char == "\n":
-                in_line_comment = False
-                result.append(char)
-            else:
-                result.append(" ")
-            idx += 1
-            continue
-
-        if in_block_comment:
-            if char == "*" and next_char == "/":
-                in_block_comment = False
-                result.extend("  ")
-                idx += 2
-                continue
-            result.append("\n" if char == "\n" else " ")
-            idx += 1
-            continue
-
-        if in_string:
-            result.append(char)
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            idx += 1
-            continue
-
-        if char == "#":
-            in_line_comment = True
-            result.append(" ")
-            idx += 1
-            continue
-        if char == "/" and next_char == "/":
-            in_line_comment = True
-            result.extend("  ")
-            idx += 2
-            continue
-        if char == "/" and next_char == "*":
-            in_block_comment = True
-            result.extend("  ")
-            idx += 2
-            continue
-        if char == '"':
-            in_string = True
-
-        result.append(char)
-        idx += 1
-
-    return "".join(result)
-
-
 def collapsed(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def assert_ac_tcp_tg_contract(rel: str, name: str) -> None:
-    block = resource_block(read(rel), "aws_lb_target_group", name)
+def target_group_body(parsed: ParsedTf, rel: str, name: str) -> dict[str, Any]:
+    expected_file = REPO_ROOT / rel
+    for _file, rtype, resource_name, body in iter_resources(parsed):
+        if _file == expected_file and rtype == "aws_lb_target_group" and resource_name == name:
+            return body
+    raise AssertionError(f"aws_lb_target_group.{name} not found in {rel}")
 
-    assert has_attr(block, "protocol", '"TCP"'), f"{name} must stay TCP passthrough"
-    assert has_attr(block, "target_type", '"instance"'), f"{name} must stay instance-targeted"
-    assert has_attr(block, "port", "443"), f"{name} must stay on public HTTPS port 443"
-    assert has_attr(block, "preserve_client_ip", "true"), f"{name} must preserve client IP at L3"
-    assert has_attr(block, "proxy_protocol_v2", "false"), f"{name} must not inject Proxy Protocol v2"
-    assert not has_attr(block, "proxy_protocol_v2", "true"), f"{name} must not re-enable Proxy Protocol v2"
+
+def assert_ac_tcp_tg_contract(parsed: ParsedTf, rel: str, name: str) -> None:
+    body = target_group_body(parsed, rel, name)
+
+    assert unquote(body.get("protocol")) == "TCP", f"{name} must stay TCP passthrough"
+    assert unquote(body.get("target_type")) == "instance", f"{name} must stay instance-targeted"
+    assert body.get("port") == 443, f"{name} must stay on public HTTPS port 443"
+    assert body.get("preserve_client_ip") is True, f"{name} must preserve client IP at L3"
+    assert body.get("proxy_protocol_v2") is False, f"{name} must not inject Proxy Protocol v2"
 
 
 def test_blue_and_green_target_groups() -> None:
-    assert_ac_tcp_tg_contract("terraform/modules/ac/main.tf", "ac_tcp")
-    assert_ac_tcp_tg_contract("terraform/modules/ac/blue_green.tf", "ac_tcp_green")
+    parsed = parse_tf_files(REPO_ROOT / "terraform" / "modules" / "ac")
+
+    assert_ac_tcp_tg_contract(parsed, "terraform/modules/ac/main.tf", "ac_tcp")
+    assert_ac_tcp_tg_contract(parsed, "terraform/modules/ac/blue_green.tf", "ac_tcp_green")
 
 
 def test_blue_green_drift_check_pins_transport_contract() -> None:
