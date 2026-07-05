@@ -169,6 +169,24 @@ case "${EBPF_APT_FIXTURE_MODE:-success}" in
         ;;
     esac
     ;;
+  snapshot-update-unavailable-current-success)
+    case " $* " in
+      *" update "*" --snapshot "*)
+        echo "E: Failed to fetch https://snapshot.ubuntu.com/ubuntu/20260628T000000Z/dists/noble/InRelease  503  Service Unavailable" >&2
+        exit 100
+        ;;
+    esac
+    echo "apt ok: $*"
+    ;;
+  snapshot-install-unavailable-current-success)
+    case " $* " in
+      *" install "*" --snapshot "*)
+        echo "E: Failed to fetch https://snapshot.ubuntu.com/ubuntu/pool/main/l/llvm-toolchain-18/clang-18.deb  503  Service Unavailable" >&2
+        exit 100
+        ;;
+    esac
+    echo "apt ok: $*"
+    ;;
   *)
     echo "unknown fixture mode: ${EBPF_APT_FIXTURE_MODE:-}" >&2
     exit 2
@@ -335,7 +353,7 @@ test_transient_update_retries_then_succeeds() {
 test_transient_update_fails_after_attempt_budget() {
   local name="transient update fails after attempt budget"
   local status
-  run_installer always-transient-update env
+  run_installer always-transient-update env EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK=0
   status=$?
   if [ "$status" -eq 0 ]; then
     report_fail "$name" "expected failure, got success"
@@ -346,6 +364,40 @@ test_transient_update_fails_after_attempt_budget() {
     report_pass "$name"
   else
     report_fail "$name" "expected update-only retry exhaustion: $(cat "$LAST_OUTPUT")"
+  fi
+}
+
+test_snapshot_update_falls_back_to_current_indexes() {
+  local name="snapshot update falls back to current indexes"
+  if ! run_installer snapshot-update-unavailable-current-success env; then
+    report_fail "$name" "expected fallback success, got failure: $(cat "$LAST_OUTPUT")"
+    return
+  fi
+  if [ "$(grep -c '^update .* --snapshot ' "$RUN_DIR/calls")" -eq 3 ] &&
+    grep -q '^update -o APT::Update::Error-Mode=any$' "$RUN_DIR/calls" &&
+    grep -q '^install -y --no-install-recommends clang-18=1:18.1.3-1ubuntu1 llvm-18=1:18.1.3-1ubuntu1 libbpf-dev=1:1.3.0-2build2$' "$RUN_DIR/calls" &&
+    ! grep -q '^install .* --snapshot ' "$RUN_DIR/calls" &&
+    grep -q 'falling back to current apt indexes for exact eBPF package pins' "$LAST_OUTPUT"; then
+    report_pass "$name"
+  else
+    report_fail "$name" "expected snapshot update retries then current-index install: calls=$(cat "$RUN_DIR/calls") output=$(cat "$LAST_OUTPUT")"
+  fi
+}
+
+test_snapshot_install_falls_back_to_current_indexes() {
+  local name="snapshot install falls back to current indexes"
+  if ! run_installer snapshot-install-unavailable-current-success env; then
+    report_fail "$name" "expected fallback success, got failure: $(cat "$LAST_OUTPUT")"
+    return
+  fi
+  if grep -q '^update -o APT::Update::Error-Mode=any --snapshot 20260628T000000Z$' "$RUN_DIR/calls" &&
+    [ "$(grep -c '^install .* --snapshot ' "$RUN_DIR/calls")" -eq 3 ] &&
+    grep -q '^update -o APT::Update::Error-Mode=any$' "$RUN_DIR/calls" &&
+    grep -q '^install -y --no-install-recommends clang-18=1:18.1.3-1ubuntu1 llvm-18=1:18.1.3-1ubuntu1 libbpf-dev=1:1.3.0-2build2$' "$RUN_DIR/calls" &&
+    grep -q 'falling back to current apt indexes for exact eBPF package pins' "$LAST_OUTPUT"; then
+    report_pass "$name"
+  else
+    report_fail "$name" "expected snapshot install retries then current-index install: calls=$(cat "$RUN_DIR/calls") output=$(cat "$LAST_OUTPUT")"
   fi
 }
 
@@ -394,6 +446,21 @@ test_noninteger_retry_sleep_fails_before_apt() {
   fi
 }
 
+test_invalid_current_index_fallback_flag_fails_before_apt() {
+  local name="invalid current-index fallback flag fails before apt"
+  local status
+  run_installer success env EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK=maybe
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    report_fail "$name" "expected failure, got success"
+  elif [ ! -e "$RUN_DIR/calls" ] &&
+    grep -q 'EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK must be 0 or 1' "$LAST_OUTPUT"; then
+    report_pass "$name"
+  else
+    report_fail "$name" "expected fallback-flag validation before apt: $(cat "$LAST_OUTPUT")"
+  fi
+}
+
 test_retry_temp_files_are_cleaned() {
   local name="retry temp files are cleaned"
   if ! run_installer success env; then
@@ -432,9 +499,12 @@ test_unmet_dependency_errors_do_not_retry
 test_terminal_update_option_errors_do_not_retry
 test_transient_update_retries_then_succeeds
 test_transient_update_fails_after_attempt_budget
+test_snapshot_update_falls_back_to_current_indexes
+test_snapshot_install_falls_back_to_current_indexes
 test_zero_retry_budget_fails_before_apt
 test_noninteger_retry_budget_fails_before_apt
 test_noninteger_retry_sleep_fails_before_apt
+test_invalid_current_index_fallback_flag_fails_before_apt
 test_retry_temp_files_are_cleaned
 test_forces_c_locale_for_apt_diagnostics
 

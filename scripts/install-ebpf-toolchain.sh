@@ -17,7 +17,9 @@ EBPF_LLVM_PACKAGE="${EBPF_LLVM_PACKAGE:-llvm-18=1:18.1.3-1ubuntu1}"
 EBPF_LIBBPF_DEV_PACKAGE="${EBPF_LIBBPF_DEV_PACKAGE:-libbpf-dev=1:1.3.0-2build2}"
 EBPF_APT_RETRY_ATTEMPTS="${EBPF_APT_RETRY_ATTEMPTS:-3}"
 EBPF_APT_RETRY_SLEEP_SECONDS="${EBPF_APT_RETRY_SLEEP_SECONDS:-10}"
+EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK="${EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK:-1}"
 APT_RETRY_OUTPUTS=()
+APT_RETRY_LAST_TERMINAL=0
 
 cleanup_apt_retry_outputs() {
   if [ "${#APT_RETRY_OUTPUTS[@]}" -gt 0 ]; then
@@ -46,6 +48,14 @@ esac
 # The digits-only check rejects negatives; zero is intentionally valid for
 # fixture tests and for no-wait local retry probes.
 
+case "$EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK" in
+  0|1) ;;
+  *)
+    echo "ERROR: EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK must be 0 or 1; got '$EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK'." >&2
+    exit 2
+    ;;
+esac
+
 run_apt_get() {
   if [ -n "${EBPF_APT_GET_STUB:-}" ]; then
     "$EBPF_APT_GET_STUB" "$@"
@@ -71,6 +81,7 @@ apt_retry() {
   output="$(mktemp)"
   APT_RETRY_OUTPUTS+=("$output")
 
+  APT_RETRY_LAST_TERMINAL=0
   final_status=1
   for ((attempt = 1; attempt <= EBPF_APT_RETRY_ATTEMPTS; attempt++)); do
     if run_apt_get "$@" >"$output" 2>&1; then
@@ -83,6 +94,7 @@ apt_retry() {
     cat "$output" >&2
     if is_terminal_apt_resolution_failure "$output"; then
       echo "apt_retry: terminal package/version resolution failure for: apt-get $*" >&2
+      APT_RETRY_LAST_TERMINAL=1
       final_status="$status"
       break
     fi
@@ -97,9 +109,37 @@ apt_retry() {
   return "$final_status"
 }
 
-apt_retry update -o APT::Update::Error-Mode=any --snapshot "$EBPF_APT_SNAPSHOT"
+EBPF_TOOLCHAIN_PACKAGES=(
+  "$EBPF_CLANG_PACKAGE"
+  "$EBPF_LLVM_PACKAGE"
+  "$EBPF_LIBBPF_DEV_PACKAGE"
+)
+
+install_from_current_indexes() {
+  local reason="$1"
+
+  echo "WARNING: apt snapshot $EBPF_APT_SNAPSHOT failed during $reason; falling back to current apt indexes for exact eBPF package pins." >&2
+  apt_retry update -o APT::Update::Error-Mode=any
+  apt_retry install -y --no-install-recommends "${EBPF_TOOLCHAIN_PACKAGES[@]}"
+}
+
+snapshot_update_status=0
+apt_retry update -o APT::Update::Error-Mode=any --snapshot "$EBPF_APT_SNAPSHOT" || snapshot_update_status=$?
+if [ "$snapshot_update_status" -ne 0 ]; then
+  if [ "$APT_RETRY_LAST_TERMINAL" -eq 1 ] || [ "$EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK" -eq 0 ]; then
+    exit "$snapshot_update_status"
+  fi
+  install_from_current_indexes "snapshot update"
+  exit 0
+fi
+
+snapshot_install_status=0
 apt_retry install -y --no-install-recommends \
   --snapshot "$EBPF_APT_SNAPSHOT" \
-  "$EBPF_CLANG_PACKAGE" \
-  "$EBPF_LLVM_PACKAGE" \
-  "$EBPF_LIBBPF_DEV_PACKAGE"
+  "${EBPF_TOOLCHAIN_PACKAGES[@]}" || snapshot_install_status=$?
+if [ "$snapshot_install_status" -ne 0 ]; then
+  if [ "$APT_RETRY_LAST_TERMINAL" -eq 1 ] || [ "$EBPF_APT_ALLOW_CURRENT_INDEX_FALLBACK" -eq 0 ]; then
+    exit "$snapshot_install_status"
+  fi
+  install_from_current_indexes "snapshot install"
+fi

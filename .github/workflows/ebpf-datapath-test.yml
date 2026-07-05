@@ -172,10 +172,11 @@ jobs:
       # pockets evict them. When these pins move, update EBPF_APT_SNAPSHOT and regenerate
       # endpoints/ac/main/etc/nhp_ebpf_xdp.o with
       # scripts/check-ebpf-committed-object-drift.sh.
-      # Transient snapshot service failures are retried here; persistent
-      # failures mean either the snapshot service is degraded or the pins need
-      # an intentional snapshot/object rebaseline. Both update and install carry
-      # --snapshot so apt fetches and resolves against the same immutable index.
+      # Transient snapshot service failures are retried here; if the snapshot
+      # stays unavailable, the installer falls back to current apt indexes while
+      # keeping the exact package pins. Both snapshot update and install carry
+      # --snapshot so apt fetches and resolves against the same immutable index
+      # whenever the snapshot service is healthy.
       - name: Install eBPF toolchain
         run: bash scripts/install-ebpf-toolchain.sh
 
