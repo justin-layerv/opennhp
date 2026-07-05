@@ -777,15 +777,43 @@ On immediate revoke:
    reschedules them with deadline `now`.
 6. AC removes tokenStore/access entries so refresh/re-knock cannot extend them.
 
-Implementation caveat (forwarded flows): the carrier of this metadata onto the
-AOP/AccessEntry (P4a, nhp PR #2772) populates the per-admission fields
-(`qurl_user_public_key_hash`, `admission_id`, `deadline`) only on the local
-admission path. A flow admitted via the **server-to-server forward path** carries
-`resource_public_key_hash` only (from the catalog row), because the forward
-receiver re-resolves the resource rather than re-running v2 admission. Until the
-forward path carries the per-admission fields, **forwarded flows are revocable by
-resource key only** — a `qurl`/`session`/`admission`-scoped revoke will not match
-them. Tracked in #2774; may be mooted by #2208 (which removes the forward path).
+Forwarded-flow carrier: the native server-to-server forward path re-resolves the
+resource on the receiving server so AC routing and ACK construction stay local
+to that receiver. To preserve targeted revocation metadata across that hop, the
+origin server carries a narrow `admissionRevocationData` sidecar on `NHP_FWD`
+only when the origin admission produced per-admission qURL v2 metadata; catalog
+flows that carry only `resource_public_key_hash` omit the sidecar. Both
+first-success `ForwardKnock` and coverage-only peer `FanoutKnock` use this same
+carrier, so peer fan-out AOPs receive the same targeted-revocation metadata. The
+receiver overlays only the qURL v2 revocation fields
+(`qurl_user_public_key_hash`, `resource_public_key_hash`, `session_id`,
+`admission_id`, `deadline`) onto its locally resolved catalog resource before
+building the AOP. The receiver keeps its local catalog
+`resource_public_key_hash` authoritative when present and uses the sidecar only
+to fill a missing resource hash on forwarded v2 admissions; a stale receiver
+catalog hash can therefore miss a resource-scoped revoke until the catalog
+catches up, which is deliberate because pre-fix behavior was already
+catalog-only and the receiver catalog remains the local source of truth. If the
+sidecar hash differs from a present catalog hash, the receiver keeps the catalog
+hash and emits `ForwardAdmissionResourceHashMismatch` plus a debug log for
+rollout triage. The receiver trusts the
+per-admission fields from an authenticated forwarding cell member over
+server-to-server `NHP_FWD` and does not recompute or revalidate the
+deadline/user/admission tuple; this is the same trust boundary as the forwarded
+AOP itself. A faulty or compromised cell member could stamp a future forwarded
+`deadline`, or mismatched `session_id`, `admission_id`, or
+`qurl_user_public_key_hash` values, so a later targeted revoke may miss that
+forwarded pinhole. That failure mode is within the same in-cell authority the
+member already has to create forwarded AOPs directly, and is no worse than the
+pre-fix resource-key-only fallback. On the AC, `deadline` is stored as qURL
+revocation-index metadata only: `OpenTime`/`ExpireTime`, not this signed-claim
+deadline, still bound firewall and token lifetime. This fix is scoped to the
+native `NHP_FWD` path: the HTTP internal-knock re-entry path currently does not
+originate the signed-claims per-admission fields (`buildV2ResourceData`), so it
+has nothing to carry; if a future HTTP admission path does, it needs a matching
+carrier. During a mixed-version rollout, forwards from old senders still fall
+back to catalog metadata only, so targeted revoke coverage for forwarded flows
+becomes complete once the server fleet has rolled past nhp #2774.
 
 Implementation caveat (pre-epoch re-revoke window): until qurl-service #1010
 emits real per-`(scope, scope_key)` monotonic epochs end-to-end, every revoke

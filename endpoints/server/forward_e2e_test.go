@@ -734,7 +734,7 @@ func TestE2E_ForwarderIntegration(t *testing.T) {
 	userAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 100), Port: 12345}
 	knockData := []byte("encrypted-knock-packet-data")
 
-	result, err := forwarder.ForwardKnock(ctx, assignment, knockData, userAddr)
+	result, err := forwarder.ForwardKnock(ctx, assignment, knockData, userAddr, nil)
 	if err != nil {
 		t.Fatalf("ForwardKnock failed: %v", err)
 	}
@@ -771,6 +771,8 @@ func (d *e2eForwarderDeps) SendMessage(md *core.MsgData) error {
 	d.device.SendMsgToPacket(md)
 	return nil
 }
+
+func (d *e2eForwarderDeps) IncrForwarderMetric(string) {}
 
 func (d *e2eForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
 	return nil
@@ -1113,6 +1115,8 @@ func (d *capturingForwarderDeps) SendMessage(md *core.MsgData) error {
 	return nil
 }
 
+func (d *capturingForwarderDeps) IncrForwarderMetric(string) {}
+
 func (d *capturingForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
 	return nil
 }
@@ -1265,6 +1269,8 @@ func (d *mockACForwarderDeps) SendMessage(md *core.MsgData) error {
 	}
 	return nil
 }
+
+func (d *mockACForwarderDeps) IncrForwarderMetric(string) {}
 
 func (d *mockACForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, res *common.ResourceData) []*ACConn {
 	if d.aspData != nil {
@@ -1830,6 +1836,8 @@ func (d *errorACForwarderDeps) SendMessage(md *core.MsgData) error {
 	return nil
 }
 
+func (d *errorACForwarderDeps) IncrForwarderMetric(string) {}
+
 func (d *errorACForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
 	return []*ACConn{
 		{
@@ -2028,6 +2036,8 @@ func (d *timeoutACForwarderDeps) SendMessage(md *core.MsgData) error {
 	}
 	return nil
 }
+
+func (d *timeoutACForwarderDeps) IncrForwarderMetric(string) {}
 
 func (d *timeoutACForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
 	return []*ACConn{
@@ -2598,7 +2608,7 @@ func TestE2E_ForwardIntegration_HealthTracking(t *testing.T) {
 	// ========================================================================
 	t.Log("=== Test 1: All servers healthy - should use any server ===")
 
-	result1, err := forwarder.ForwardKnock(ctx, assignment, knockData, userAddr)
+	result1, err := forwarder.ForwardKnock(ctx, assignment, knockData, userAddr, nil)
 	if err != nil {
 		t.Fatalf("Forward 1 failed: %v", err)
 	}
@@ -2631,7 +2641,7 @@ func TestE2E_ForwardIntegration_HealthTracking(t *testing.T) {
 	beforeB := requestCounts["server-b"]
 	requestMu.Unlock()
 
-	result2, err := forwarder.ForwardKnock(ctx, assignment, knockData, userAddr)
+	result2, err := forwarder.ForwardKnock(ctx, assignment, knockData, userAddr, nil)
 	if err != nil {
 		t.Fatalf("Forward 2 failed: %v", err)
 	}
@@ -2665,7 +2675,7 @@ func TestE2E_ForwardIntegration_HealthTracking(t *testing.T) {
 	// Small delay to avoid triggering flood protection
 	time.Sleep(100 * time.Millisecond)
 
-	result3, err := forwarder.ForwardKnock(ctx, assignment, knockData, userAddr)
+	result3, err := forwarder.ForwardKnock(ctx, assignment, knockData, userAddr, nil)
 	if err != nil {
 		t.Fatalf("Forward 3 failed: %v", err)
 	}

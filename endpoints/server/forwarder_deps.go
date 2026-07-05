@@ -32,6 +32,10 @@ type ForwarderDeps interface {
 	// through NHP_FRT handling.
 	SendMessage(md *core.MsgData) error
 
+	// IncrForwarderMetric increments a forwarder-owned counter. Production binds
+	// this to the server metrics publisher; tests can capture or no-op it.
+	IncrForwarderMetric(name string)
+
 	// FindACConnectionsForResource finds all AC connections that can handle a
 	// knock for an already-resolved resource. The forward receiver resolves
 	// qURL placement once, then reuses the same ResourceData for AC selection and
@@ -84,11 +88,10 @@ type ForwarderDeps interface {
 	// Returns the first successful result.
 	//
 	// res carries qURL v2 revocation metadata (P4a) to stamp onto the AOP, or
-	// nil for legacy paths. On the forward-receiver path it is the catalog
-	// ResourceData (resData), which carries ResourcePublicKeyHash but not the
-	// per-admission fields — the forward path re-resolves the resource rather
-	// than re-running v2 admission, so admission_id / deadline / qurl-user hash
-	// are not available there and stay omitted.
+	// nil for legacy paths. On the forward-receiver path it is the locally
+	// resolved catalog ResourceData with any origin admission metadata carried on
+	// NHP_FWD overlaid, so routing stays receiver-local while targeted
+	// revocation metadata survives the hop.
 	ProcessACOperationBroadcast(
 		parentCtx context.Context,
 		knkMsg *common.AgentKnockMsg,

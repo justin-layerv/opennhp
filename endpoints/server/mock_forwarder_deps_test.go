@@ -41,6 +41,8 @@ type MockForwarderDeps struct {
 	resolveCtxMu     sync.Mutex
 	lastResolveCtx   context.Context
 	resolvedOwnerIDs map[string]string
+	metricsMu        sync.Mutex
+	counters         map[string]int
 }
 
 // NewMockForwarderDeps creates a new mock with sensible defaults.
@@ -69,6 +71,21 @@ func (m *MockForwarderDeps) SendMessage(md *core.MsgData) error {
 		m.sendCh <- md
 	}
 	return nil
+}
+
+func (m *MockForwarderDeps) IncrForwarderMetric(name string) {
+	m.metricsMu.Lock()
+	defer m.metricsMu.Unlock()
+	if m.counters == nil {
+		m.counters = make(map[string]int)
+	}
+	m.counters[name]++
+}
+
+func (m *MockForwarderDeps) MetricCount(name string) int {
+	m.metricsMu.Lock()
+	defer m.metricsMu.Unlock()
+	return m.counters[name]
 }
 
 func (m *MockForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {

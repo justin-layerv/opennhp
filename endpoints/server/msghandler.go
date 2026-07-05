@@ -414,6 +414,12 @@ const (
 	// collapsing to ~0 while this rises — NOT a literal zeroMatch/(zeroMatch+fanoutSent)
 	// division, which would mix events with AC-deliveries.
 	MetricRevocationTargetedZeroMatch = "RevocationTargetedZeroMatch"
+	// MetricForwardAdmissionResourceHashMismatch counts native forwarded qURL
+	// v2 admissions whose origin sidecar resource hash differs from the
+	// receiver catalog hash. The receiver keeps its catalog hash authoritative,
+	// so this counter is rollout triage for stale catalog rows that can miss a
+	// resource-scoped targeted revoke until the receiver catalog catches up.
+	MetricForwardAdmissionResourceHashMismatch = "ForwardAdmissionResourceHashMismatch"
 	// MetricRevocationAckReceived counts NHP_RVA acks the server received from
 	// ACs (proof-of-delivery, P4e Slice 3 #2793), one per validated ack whose
 	// AC identity resolved from the authenticated connection pubkey. Pairs with

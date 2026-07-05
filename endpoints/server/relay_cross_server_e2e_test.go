@@ -551,6 +551,8 @@ func (d *crossServerForwarderDeps) SendMessage(md *core.MsgData) error {
 	return nil
 }
 
+func (d *crossServerForwarderDeps) IncrForwarderMetric(string) {}
+
 func (d *crossServerForwarderDeps) FindACConnectionsForResource(*common.AgentKnockMsg, *common.ResourceData) []*ACConn {
 	return nil
 }

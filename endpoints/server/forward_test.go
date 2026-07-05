@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -41,6 +43,549 @@ func TestForwardedAgentPubKeyEncodesAuthenticatedKey(t *testing.T) {
 	}
 	if want := base64.StdEncoding.EncodeToString(raw); got != want {
 		t.Fatalf("forwardedAgentPubKey=%q want %q", got, want)
+	}
+}
+
+func TestNativeForwardAdmissionRevocationData_MetadataOnly(t *testing.T) {
+	src := &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			AuthServiceId: "qurl",
+			ResourceId:    "res-from-catalog",
+			OpenTime:      999,
+			Resources: map[string]*common.ResourceInfo{
+				"res-from-catalog": {
+					ACId: "ac-origin",
+					Addr: &common.NetAddress{Ip: "192.0.2.50", Port: 8443},
+				},
+			},
+		},
+		RedirectUrl:           "https://origin.example/should-not-forward",
+		QurlUserPublicKeyHash: "qhash",
+		ResourcePublicKeyHash: "verified-rhash",
+		SessionId:             "sess-live",
+		AdmissionId:           "adm-123",
+		Deadline:              1781910300,
+		RedirectWithParams:    true,
+		SkipAuth:              true,
+		CookieDomain:          "origin.example",
+		ResourcePublicKeyB64:  "catalog-carrier-only",
+		AppKey:                "app-key",
+		AppSecret:             "app-secret",
+		AccessKey:             "access-key",
+		SecretKey:             "secret-key",
+		ExInfo:                map[string]any{"keep": "out"},
+	}
+
+	if got := nativeForwardAdmissionRevocationData(nil); got != nil {
+		t.Fatalf("nil ResourceData should omit the sidecar, got %+v", got)
+	}
+
+	got := nativeForwardAdmissionRevocationData(src)
+	if got == nil {
+		t.Fatal("nativeForwardAdmissionRevocationData returned nil for populated metadata")
+	}
+	if got.QurlUserPublicKeyHash != "qhash" ||
+		got.ResourcePublicKeyHash != "verified-rhash" ||
+		got.SessionId != "sess-live" ||
+		got.AdmissionId != "adm-123" ||
+		got.Deadline != 1781910300 {
+		t.Fatalf("forward metadata = %+v, want only qURL v2 revocation fields", got)
+	}
+	wire, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal forward revocation data: %v", err)
+	}
+	for _, leaked := range []string{"app-secret", "access-key", "origin.example", "catalog-carrier-only"} {
+		if strings.Contains(string(wire), leaked) {
+			t.Fatalf("forward revocation sidecar leaked %q in wire JSON: %s", leaked, wire)
+		}
+	}
+
+	if empty := nativeForwardAdmissionRevocationData(&common.ResourceData{
+		ResourceGroup: common.ResourceGroup{ResourceId: "catalog-only"},
+	}); empty != nil {
+		t.Fatalf("catalog-only ResourceData should omit the sidecar, got %+v", empty)
+	}
+	if hashOnly := nativeForwardAdmissionRevocationData(&common.ResourceData{
+		ResourcePublicKeyHash: "catalog-rhash",
+	}); hashOnly != nil {
+		t.Fatalf("resource-hash-only ResourceData should omit the sidecar, got %+v", hashOnly)
+	}
+}
+
+func TestForwardAdmissionRevocationData_FieldSetMatchesStampedMetadata(t *testing.T) {
+	sidecarType := reflect.TypeOf(common.ForwardAdmissionRevocationData{})
+	gotFields := make([]string, 0, sidecarType.NumField())
+	for i := 0; i < sidecarType.NumField(); i++ {
+		gotFields = append(gotFields, sidecarType.Field(i).Name)
+	}
+	slices.Sort(gotFields)
+
+	wantFields := stampedQurlV2AdmissionFieldNames(t)
+	if !slices.Equal(gotFields, wantFields) {
+		t.Fatalf("ForwardAdmissionRevocationData fields = %v, want stamped qURL v2 field set %v", gotFields, wantFields)
+	}
+
+	acOpsType := reflect.TypeOf(common.ServerACOpsMsg{})
+	for _, fieldName := range wantFields {
+		sidecarField, _ := sidecarType.FieldByName(fieldName)
+		acOpsField, ok := acOpsType.FieldByName(fieldName)
+		if !ok {
+			t.Fatalf("ServerACOpsMsg missing qURL v2 field %s", fieldName)
+		}
+		if got, want := jsonTagName(sidecarField), jsonTagName(acOpsField); got != want {
+			t.Fatalf("ForwardAdmissionRevocationData.%s json tag = %q, want ServerACOpsMsg tag %q", fieldName, got, want)
+		}
+		if got, want := sidecarField.Type, acOpsField.Type; got != want {
+			t.Fatalf("ForwardAdmissionRevocationData.%s type = %s, want ServerACOpsMsg type %s", fieldName, got, want)
+		}
+	}
+
+	overlay, resourceHashMismatch := forwardedACOperationResourceData(&common.ResourceData{}, &common.ForwardAdmissionRevocationData{
+		QurlUserPublicKeyHash: "qhash",
+		ResourcePublicKeyHash: "rhash",
+		SessionId:             "sess-live",
+		AdmissionId:           "adm-123",
+		Deadline:              1781910300,
+	})
+	if resourceHashMismatch.mismatch {
+		t.Fatal("empty receiver catalog should not report a resource hash mismatch")
+	}
+	aop := &common.ServerACOpsMsg{}
+	stampQurlV2RevocationMetadata(aop, overlay)
+
+	if aop.QurlUserPublicKeyHash != "qhash" ||
+		aop.ResourcePublicKeyHash != "rhash" ||
+		aop.SessionId != "sess-live" ||
+		aop.AdmissionId != "adm-123" ||
+		aop.Deadline != 1781910300 ||
+		aop.RevocationEpoch != 0 {
+		t.Fatalf("stamped AOP metadata = %+v, want sidecar field set only", aop)
+	}
+}
+
+func TestForwardAdmissionRevocationData_RoundTripsStampedFields(t *testing.T) {
+	fields := stampedQurlV2AdmissionFieldNames(t)
+	src := &common.ResourceData{}
+	srcValue := reflect.ValueOf(src).Elem()
+	for i, fieldName := range fields {
+		if !setSentinelField(t, srcValue.FieldByName(fieldName), fieldName, i) {
+			t.Fatalf("could not set sentinel for ResourceData.%s", fieldName)
+		}
+	}
+
+	sidecar := nativeForwardAdmissionRevocationData(src)
+	if sidecar == nil {
+		t.Fatal("nativeForwardAdmissionRevocationData omitted populated stamped fields")
+	}
+	assertFieldValuesMatch(t, sidecar, src, fields)
+
+	overlay, resourceHashMismatch := forwardedACOperationResourceData(&common.ResourceData{}, sidecar)
+	if resourceHashMismatch.mismatch {
+		t.Fatal("empty receiver catalog should not report a resource hash mismatch")
+	}
+	assertFieldValuesMatch(t, overlay, sidecar, fields)
+}
+
+func stampedQurlV2AdmissionFieldNames(t *testing.T) []string {
+	t.Helper()
+
+	res := &common.ResourceData{}
+	resValue := reflect.ValueOf(res).Elem()
+	resType := resValue.Type()
+	acOpsType := reflect.TypeOf(common.ServerACOpsMsg{})
+
+	candidates := make([]string, 0)
+	for i := 0; i < resType.NumField(); i++ {
+		field := resType.Field(i)
+		if _, ok := acOpsType.FieldByName(field.Name); !ok {
+			continue
+		}
+		if setSentinelField(t, resValue.Field(i), field.Name, i) {
+			candidates = append(candidates, field.Name)
+		}
+	}
+	if len(candidates) == 0 {
+		t.Fatal("no ResourceData/ServerACOpsMsg shared fields available for stamp drift test")
+	}
+
+	aop := &common.ServerACOpsMsg{}
+	stampQurlV2RevocationMetadata(aop, res)
+	aopValue := reflect.ValueOf(aop).Elem()
+
+	fields := make([]string, 0, len(candidates))
+	for _, fieldName := range candidates {
+		resField := resValue.FieldByName(fieldName)
+		aopField := aopValue.FieldByName(fieldName)
+		if aopField.IsValid() && reflect.DeepEqual(aopField.Interface(), resField.Interface()) {
+			fields = append(fields, fieldName)
+		}
+	}
+	slices.Sort(fields)
+	if len(fields) == 0 {
+		t.Fatal("stampQurlV2RevocationMetadata stamped no ResourceData-derived qURL v2 fields")
+	}
+	return fields
+}
+
+func setSentinelField(t *testing.T, value reflect.Value, fieldName string, index int) bool {
+	t.Helper()
+	if !value.CanSet() {
+		return false
+	}
+	setSentinelValue(t, value, fieldName, index)
+	return true
+}
+
+func setSentinelValue(t *testing.T, value reflect.Value, fieldName string, index int) {
+	t.Helper()
+	switch value.Kind() {
+	case reflect.String:
+		value.SetString("sentinel-" + fieldName)
+	case reflect.Bool:
+		value.SetBool(true)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		value.SetInt(int64(1000 + index))
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		value.SetUint(uint64(1000 + index))
+	case reflect.Float32, reflect.Float64:
+		value.SetFloat(float64(1000 + index))
+	case reflect.Pointer:
+		elem := reflect.New(value.Type().Elem())
+		setSentinelValue(t, elem.Elem(), fieldName, index)
+		value.Set(elem)
+	case reflect.Slice:
+		slice := reflect.MakeSlice(value.Type(), 1, 1)
+		setSentinelValue(t, slice.Index(0), fieldName, index)
+		value.Set(slice)
+	case reflect.Array:
+		if value.Len() == 0 {
+			t.Fatalf("cannot set sentinel for zero-length array ResourceData.%s", fieldName)
+		}
+		setSentinelValue(t, value.Index(0), fieldName, index)
+	default:
+		t.Fatalf("unsupported sentinel kind %s for ResourceData.%s; update drift guard before stamping this field", value.Kind(), fieldName)
+	}
+}
+
+func assertFieldValuesMatch(t *testing.T, got any, want any, fields []string) {
+	t.Helper()
+	gotValue := reflect.ValueOf(got)
+	if gotValue.Kind() == reflect.Pointer {
+		if gotValue.IsNil() {
+			t.Fatalf("got nil %T", got)
+		}
+		gotValue = gotValue.Elem()
+	}
+	wantValue := reflect.ValueOf(want)
+	if wantValue.Kind() == reflect.Pointer {
+		if wantValue.IsNil() {
+			t.Fatalf("want nil %T", want)
+		}
+		wantValue = wantValue.Elem()
+	}
+
+	for _, fieldName := range fields {
+		gotField := gotValue.FieldByName(fieldName)
+		wantField := wantValue.FieldByName(fieldName)
+		if !gotField.IsValid() {
+			t.Fatalf("%T missing field %s", got, fieldName)
+		}
+		if !wantField.IsValid() {
+			t.Fatalf("%T missing field %s", want, fieldName)
+		}
+		if !reflect.DeepEqual(gotField.Interface(), wantField.Interface()) {
+			t.Fatalf("%T.%s = %v, want %T.%s = %v", got, fieldName, gotField.Interface(), want, fieldName, wantField.Interface())
+		}
+	}
+}
+
+func jsonTagName(field reflect.StructField) string {
+	name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+	return name
+}
+
+func TestForwardedACOperationResourceData_OverlaysAdmissionMetadata(t *testing.T) {
+	catalog := &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			AuthServiceId: "qurl",
+			ResourceId:    "res-catalog",
+			OpenTime:      30,
+			Resources: map[string]*common.ResourceInfo{
+				"res-catalog": {
+					ACId: "ac-catalog",
+					Addr: &common.NetAddress{Ip: "10.0.0.5", Port: 443},
+				},
+			},
+		},
+		ResourcePublicKeyHash: "catalog-rhash",
+	}
+	admission := &common.ForwardAdmissionRevocationData{
+		ResourcePublicKeyHash: "verified-rhash",
+		QurlUserPublicKeyHash: "qhash",
+		SessionId:             "sess-live",
+		AdmissionId:           "adm-123",
+		Deadline:              1781910300,
+	}
+
+	got, resourceHashMismatch := forwardedACOperationResourceData(catalog, nil)
+	if got != catalog {
+		t.Fatalf("nil admission sidecar should preserve legacy catalog pointer, got %p want %p", got, catalog)
+	}
+	if resourceHashMismatch.mismatch {
+		t.Fatal("nil admission sidecar should not report a resource hash mismatch")
+	}
+	got, resourceHashMismatch = forwardedACOperationResourceData(catalog, &common.ForwardAdmissionRevocationData{})
+	if got != catalog {
+		t.Fatalf("empty admission sidecar should preserve legacy catalog pointer, got %p want %p", got, catalog)
+	}
+	if resourceHashMismatch.mismatch {
+		t.Fatal("empty admission sidecar should not report a resource hash mismatch")
+	}
+	got, resourceHashMismatch = forwardedACOperationResourceData(catalog, &common.ForwardAdmissionRevocationData{
+		ResourcePublicKeyHash: "crafted-rhash",
+	})
+	if got != catalog {
+		t.Fatalf("hash-only admission sidecar should be ignored as legacy metadata, got %p want %p", got, catalog)
+	}
+	if resourceHashMismatch.mismatch {
+		t.Fatal("hash-only admission sidecar should not report a resource hash mismatch")
+	}
+
+	got, resourceHashMismatch = forwardedACOperationResourceData(catalog, admission)
+	if got == nil {
+		t.Fatal("forwardedACOperationResourceData returned nil")
+	}
+	if !resourceHashMismatch.mismatch {
+		t.Fatal("different populated catalog and admission resource hashes should report a mismatch")
+	}
+	if resourceHashMismatch.catalogHash != "catalog-rhash" || resourceHashMismatch.admissionHash != "verified-rhash" {
+		t.Fatalf("resource hash mismatch decision = %+v, want catalog/admission hashes", resourceHashMismatch)
+	}
+	if got.OpenTime != 30 || got.AuthServiceId != "qurl" || got.ResourceId != "res-catalog" {
+		t.Fatalf("catalog routing fields changed: %+v", got.ResourceGroup)
+	}
+	info := got.Resources["res-catalog"]
+	if info == nil || info.ACId != "ac-catalog" || info.Addr == nil || info.Addr.Ip != "10.0.0.5" || info.Addr.Port != 443 {
+		t.Fatalf("catalog resource info was not preserved: %+v", got.Resources)
+	}
+	if got.QurlUserPublicKeyHash != "qhash" ||
+		got.ResourcePublicKeyHash != "catalog-rhash" ||
+		got.SessionId != "sess-live" ||
+		got.AdmissionId != "adm-123" ||
+		got.Deadline != 1781910300 {
+		t.Fatalf("admission metadata was not overlaid: %+v", got)
+	}
+
+	catalogWithoutResourceHash := cloneResourceData(catalog)
+	catalogWithoutResourceHash.ResourcePublicKeyHash = ""
+	filled, resourceHashMismatch := forwardedACOperationResourceData(catalogWithoutResourceHash, admission)
+	if resourceHashMismatch.mismatch {
+		t.Fatal("missing receiver catalog hash should be filled, not reported as a mismatch")
+	}
+	if filled.ResourcePublicKeyHash != "verified-rhash" {
+		t.Fatalf("missing catalog resource hash was not filled from admission sidecar: %+v", filled)
+	}
+}
+
+func TestHandleDecryptedForwardedKnock_CarriesAdmissionMetadata(t *testing.T) {
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetAuthServiceProvider(&common.AuthServiceProviderData{
+		AuthSvcId: "qurl",
+		ResourceGroups: common.ResourceGroupMap{
+			"res-catalog": {
+				ResourceGroup: common.ResourceGroup{
+					AuthServiceId: "qurl",
+					ResourceId:    "res-catalog",
+					OpenTime:      30,
+					Resources: map[string]*common.ResourceInfo{
+						"res-catalog": {
+							ACId:     "ac-catalog",
+							Hostname: "resource.example",
+							Addr: &common.NetAddress{
+								Ip:       "10.0.0.5",
+								Port:     443,
+								Protocol: "tcp",
+							},
+						},
+					},
+				},
+				ResourcePublicKeyHash: "catalog-rhash",
+			},
+		},
+	})
+	baseDeps.SetACConnection(&ACConn{})
+	deps := &captureBroadcastForwarderDeps{MockForwarderDeps: baseDeps}
+	forwarder := NewServerForwarder(deps)
+
+	knockMsg := &common.AgentKnockMsg{
+		HeaderType:    core.NHP_KNK,
+		UserId:        "user-1",
+		DeviceId:      "device-1",
+		AuthServiceId: "qurl",
+		ResourceId:    "res-catalog",
+	}
+	body, err := json.Marshal(knockMsg)
+	if err != nil {
+		t.Fatalf("marshal knock: %v", err)
+	}
+	fwdMsg := &common.ServerForwardMsg{
+		SourceServer:  "srv-origin",
+		UserAddr:      "203.0.113.10:54321",
+		TransactionId: 77,
+		Timestamp:     time.Now().Unix(),
+		AdmissionRevocationData: &common.ForwardAdmissionRevocationData{
+			QurlUserPublicKeyHash: "qhash",
+			ResourcePublicKeyHash: "verified-rhash",
+			SessionId:             "sess-live",
+			AdmissionId:           "adm-123",
+			Deadline:              1781910300,
+		},
+	}
+	userAddr, err := net.ResolveUDPAddr("udp", fwdMsg.UserAddr)
+	if err != nil {
+		t.Fatalf("resolve user addr: %v", err)
+	}
+
+	forwarder.handleDecryptedForwardedKnock(nil, fwdMsg, userAddr, &core.PacketParserData{
+		BodyMessage:  body,
+		RemotePubKey: make([]byte, 32),
+	})
+
+	got := deps.capturedResource
+	if got == nil {
+		t.Fatal("forward receiver did not call ProcessACOperationBroadcast")
+	}
+	if got.OpenTime != 30 || got.AuthServiceId != "qurl" || got.ResourceId != "res-catalog" {
+		t.Fatalf("receiver must keep catalog routing/openTime fields, got %+v", got.ResourceGroup)
+	}
+	info := got.Resources["res-catalog"]
+	if info == nil || info.ACId != "ac-catalog" || info.Addr == nil || info.Addr.Ip != "10.0.0.5" || info.Addr.Port != 443 {
+		t.Fatalf("receiver catalog Resources were not preserved: %+v", got.Resources)
+	}
+	if got.QurlUserPublicKeyHash != "qhash" ||
+		got.ResourcePublicKeyHash != "catalog-rhash" ||
+		got.SessionId != "sess-live" ||
+		got.AdmissionId != "adm-123" ||
+		got.Deadline != 1781910300 {
+		t.Fatalf("forwarded admission metadata missing from AC operation ResourceData: %+v", got)
+	}
+	if deps.capturedOpenTime != 30 {
+		t.Fatalf("openTime = %d, want receiver catalog openTime 30", deps.capturedOpenTime)
+	}
+	if got := baseDeps.MetricCount(MetricForwardAdmissionResourceHashMismatch); got != 1 {
+		t.Fatalf("%s = %d, want 1 for sidecar/catalog resource-hash mismatch",
+			MetricForwardAdmissionResourceHashMismatch, got)
+	}
+
+	select {
+	case msg := <-baseDeps.GetSendChannel():
+		var result common.ServerForwardResultMsg
+		if err := json.Unmarshal(msg.Message, &result); err != nil {
+			t.Fatalf("parse forward result: %v", err)
+		}
+		if !result.Success {
+			t.Fatalf("forward result failed: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for forward result")
+	}
+}
+
+func TestHandleDecryptedForwardedKnock_ResourceHashMismatchMetricNegativeCases(t *testing.T) {
+	knockMsg := &common.AgentKnockMsg{
+		HeaderType:    core.NHP_KNK,
+		UserId:        "user-1",
+		DeviceId:      "device-1",
+		AuthServiceId: "qurl",
+		ResourceId:    "res-catalog",
+	}
+	body, err := json.Marshal(knockMsg)
+	if err != nil {
+		t.Fatalf("marshal knock: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name             string
+		catalogHash      string
+		admissionHash    string
+		wantResourceHash string
+	}{
+		{
+			name:             "matching catalog and admission hashes",
+			catalogHash:      "verified-rhash",
+			admissionHash:    "verified-rhash",
+			wantResourceHash: "verified-rhash",
+		},
+		{
+			name:             "missing catalog hash filled from admission",
+			catalogHash:      "",
+			admissionHash:    "verified-rhash",
+			wantResourceHash: "verified-rhash",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			baseDeps := NewMockForwarderDeps()
+			baseDeps.SetAuthServiceProvider(&common.AuthServiceProviderData{
+				AuthSvcId: "qurl",
+				ResourceGroups: common.ResourceGroupMap{
+					"res-catalog": {
+						ResourceGroup: common.ResourceGroup{
+							AuthServiceId: "qurl",
+							ResourceId:    "res-catalog",
+							OpenTime:      30,
+							Resources: map[string]*common.ResourceInfo{
+								"res-catalog": {
+									ACId: "ac-catalog",
+									Addr: &common.NetAddress{
+										Ip:       "10.0.0.5",
+										Port:     443,
+										Protocol: "tcp",
+									},
+								},
+							},
+						},
+						ResourcePublicKeyHash: tc.catalogHash,
+					},
+				},
+			})
+			baseDeps.SetACConnection(&ACConn{})
+			deps := &captureBroadcastForwarderDeps{MockForwarderDeps: baseDeps}
+			forwarder := NewServerForwarder(deps)
+
+			fwdMsg := &common.ServerForwardMsg{
+				SourceServer:  "srv-origin",
+				UserAddr:      "203.0.113.10:54321",
+				TransactionId: 77,
+				Timestamp:     time.Now().Unix(),
+				AdmissionRevocationData: &common.ForwardAdmissionRevocationData{
+					QurlUserPublicKeyHash: "qhash",
+					ResourcePublicKeyHash: tc.admissionHash,
+					SessionId:             "sess-live",
+					AdmissionId:           "adm-123",
+					Deadline:              1781910300,
+				},
+			}
+			userAddr, err := net.ResolveUDPAddr("udp", fwdMsg.UserAddr)
+			if err != nil {
+				t.Fatalf("resolve user addr: %v", err)
+			}
+
+			forwarder.handleDecryptedForwardedKnock(nil, fwdMsg, userAddr, &core.PacketParserData{
+				BodyMessage:  body,
+				RemotePubKey: make([]byte, 32),
+			})
+
+			if got := baseDeps.MetricCount(MetricForwardAdmissionResourceHashMismatch); got != 0 {
+				t.Fatalf("%s = %d, want 0", MetricForwardAdmissionResourceHashMismatch, got)
+			}
+			if deps.capturedResource == nil {
+				t.Fatal("forward receiver did not call ProcessACOperationBroadcast")
+			}
+			if got := deps.capturedResource.ResourcePublicKeyHash; got != tc.wantResourceHash {
+				t.Fatalf("ResourcePublicKeyHash = %q, want %q", got, tc.wantResourceHash)
+			}
+		})
 	}
 }
 
@@ -293,7 +838,7 @@ func TestForwardKnock_NoAssignedServers(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err := forwarder.ForwardKnock(ctx, assignment, []byte("knock"), nil)
+	_, err := forwarder.ForwardKnock(ctx, assignment, []byte("knock"), nil, nil)
 	if err == nil {
 		t.Fatal("Expected error for empty assigned servers")
 	}
@@ -318,7 +863,7 @@ func TestForwardKnock_SkipsUnhealthyServers(t *testing.T) {
 	assignment := CreateTestACAssignment("ac-1", "srv-1", "srv-2", "srv-3")
 
 	ctx := context.Background()
-	_, err := forwarder.ForwardKnock(ctx, assignment, []byte("knock"), nil)
+	_, err := forwarder.ForwardKnock(ctx, assignment, []byte("knock"), nil, nil)
 	if err == nil {
 		t.Fatal("Expected error when all servers are unhealthy")
 	}
@@ -341,7 +886,7 @@ func TestForwardKnock_SendFailureReturnsImmediately(t *testing.T) {
 
 	baseDeps := NewMockForwarderDeps()
 	baseDeps.SetDevice(device)
-	deps := &sendFailureForwarderDeps{
+	deps := &captureSendForwarderDeps{
 		MockForwarderDeps: baseDeps,
 		err:               errors.New("prequeue drop"),
 	}
@@ -364,6 +909,7 @@ func TestForwardKnock_SendFailureReturnsImmediately(t *testing.T) {
 		assignment,
 		[]byte("knock"),
 		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+		nil,
 	)
 
 	if err == nil {
@@ -377,6 +923,183 @@ func TestForwardKnock_SendFailureReturnsImmediately(t *testing.T) {
 	}
 	if forwarder.health.IsUnhealthy("srv-send-fail") {
 		t.Fatal("local send failure marked remote server unhealthy")
+	}
+}
+
+func TestForwardKnock_CarriesAdmissionRevocationData(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	sent := make(chan *core.MsgData, 1)
+	deps := &captureSendForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		sent:              sent,
+	}
+	forwarder := NewServerForwarder(deps)
+	assignment := &ACAssignment{
+		ACID: "ac-forward",
+		AssignedServers: []ServerInfo{
+			{
+				ID:         "srv-forward-peer",
+				InternalIP: "10.0.0.61",
+				Port:       common.DefaultNHPPort,
+				PubKey:     device.PublicKeyBase64(),
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan struct {
+		result *common.ServerForwardResultMsg
+		err    error
+	}, 1)
+	go func() {
+		result, err := forwarder.ForwardKnock(
+			ctx,
+			assignment,
+			[]byte("knock"),
+			&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+			&common.ResourceData{
+				QurlUserPublicKeyHash: "qhash",
+				ResourcePublicKeyHash: "verified-rhash",
+				SessionId:             "sess-live",
+				AdmissionId:           "adm-123",
+				Deadline:              1781910300,
+			},
+		)
+		done <- struct {
+			result *common.ServerForwardResultMsg
+			err    error
+		}{result: result, err: err}
+	}()
+
+	var fwdMsg common.ServerForwardMsg
+	select {
+	case md := <-sent:
+		if md.HeaderType != core.NHP_FWD {
+			t.Fatalf("HeaderType=%s, want NHP_FWD", core.HeaderTypeToString(md.HeaderType))
+		}
+		if err := json.Unmarshal(md.Message, &fwdMsg); err != nil {
+			t.Fatalf("unmarshal first-success forward message: %v", err)
+		}
+		got := fwdMsg.AdmissionRevocationData
+		if got == nil {
+			t.Fatal("ForwardKnock omitted admission revocation sidecar")
+		}
+		if got.QurlUserPublicKeyHash != "qhash" ||
+			got.ResourcePublicKeyHash != "verified-rhash" ||
+			got.SessionId != "sess-live" ||
+			got.AdmissionId != "adm-123" ||
+			got.Deadline != 1781910300 {
+			t.Fatalf("forward admission revocation data = %+v, want origin admission metadata", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ForwardKnock send")
+	}
+
+	forwarder.HandleForwardResult(nil, &common.ServerForwardResultMsg{
+		TransactionId: fwdMsg.TransactionId,
+		Success:       true,
+		ACKData:       []byte("ack"),
+	})
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ForwardKnock returned error: %v", got.err)
+		}
+		if got.result == nil || !got.result.Success || string(got.result.ACKData) != "ack" {
+			t.Fatalf("ForwardKnock result = %+v, want successful ack", got.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ForwardKnock result")
+	}
+}
+
+func TestFanoutKnock_CarriesAdmissionRevocationData(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	sent := make(chan *core.MsgData, 1)
+	deps := &captureSendForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		err:               errors.New("prequeue drop"),
+		sent:              sent,
+	}
+	forwarder := NewServerForwarder(deps)
+	assignment := &ACAssignment{
+		ACID: "ac-fanout",
+		AssignedServers: []ServerInfo{
+			{
+				ID:         "srv-fanout-peer",
+				InternalIP: "10.0.0.60",
+				Port:       common.DefaultNHPPort,
+				PubKey:     device.PublicKeyBase64(),
+			},
+		},
+	}
+
+	accepted := forwarder.FanoutKnock(
+		context.Background(),
+		assignment,
+		"10.0.0.1",
+		[]byte("knock"),
+		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+		&common.ResourceData{
+			QurlUserPublicKeyHash: "qhash",
+			ResourcePublicKeyHash: "verified-rhash",
+			SessionId:             "sess-live",
+			AdmissionId:           "adm-123",
+			Deadline:              1781910300,
+		},
+	)
+	if accepted != 0 {
+		t.Fatalf("FanoutKnock accepted peers = %d, want 0 after local send failure", accepted)
+	}
+
+	select {
+	case md := <-sent:
+		if md.HeaderType != core.NHP_FWD {
+			t.Fatalf("HeaderType=%s, want NHP_FWD", core.HeaderTypeToString(md.HeaderType))
+		}
+		var fwdMsg common.ServerForwardMsg
+		if err := json.Unmarshal(md.Message, &fwdMsg); err != nil {
+			t.Fatalf("unmarshal fanout forward message: %v", err)
+		}
+		got := fwdMsg.AdmissionRevocationData
+		if got == nil {
+			t.Fatal("FanoutKnock omitted admission revocation sidecar")
+		}
+		if got.QurlUserPublicKeyHash != "qhash" ||
+			got.ResourcePublicKeyHash != "verified-rhash" ||
+			got.SessionId != "sess-live" ||
+			got.AdmissionId != "adm-123" ||
+			got.Deadline != 1781910300 {
+			t.Fatalf("fanout admission revocation data = %+v, want origin admission metadata", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for FanoutKnock send")
 	}
 }
 
@@ -1224,7 +1947,7 @@ func TestForwardKnock_ContextCancellation(t *testing.T) {
 	cancel() // Cancel immediately
 
 	// Try to forward with canceled context
-	_, err := forwarder.ForwardKnock(ctx, assignment, []byte("test-knock"), nil)
+	_, err := forwarder.ForwardKnock(ctx, assignment, []byte("test-knock"), nil, nil)
 
 	// Should return context error
 	if err == nil {
@@ -1449,13 +2172,41 @@ func TestGetOrCreateServerPeer_UsesStaticIP(t *testing.T) {
 	}
 }
 
-type sendFailureForwarderDeps struct {
+type captureSendForwarderDeps struct {
 	*MockForwarderDeps
-	err error
+	err  error
+	sent chan *core.MsgData
 }
 
-func (d *sendFailureForwarderDeps) SendMessage(*core.MsgData) error {
+func (d *captureSendForwarderDeps) SendMessage(md *core.MsgData) error {
+	if d.sent != nil {
+		d.sent <- md
+	}
 	return d.err
+}
+
+type captureBroadcastForwarderDeps struct {
+	*MockForwarderDeps
+	capturedResource *common.ResourceData
+	capturedOpenTime uint32
+}
+
+func (d *captureBroadcastForwarderDeps) ProcessACOperationBroadcast(
+	_ context.Context,
+	_ *common.AgentKnockMsg,
+	_ []*ACConn,
+	_ *common.NetAddress,
+	_ []*common.NetAddress,
+	openTime uint32,
+	res *common.ResourceData,
+) (*common.ACOpsResultMsg, error) {
+	d.capturedOpenTime = openTime
+	d.capturedResource = cloneResourceData(res)
+	return &common.ACOpsResultMsg{
+		ErrCode:  common.ErrSuccess.ErrorCode(),
+		ACToken:  "tok-forwarded",
+		OpenTime: openTime,
+	}, nil
 }
 
 // testForwarderDepsWithDevice is a minimal ForwarderDeps for unit tests that
@@ -1467,6 +2218,7 @@ type testForwarderDepsWithDevice struct {
 func (d *testForwarderDepsWithDevice) GetHostname() string             { return "test-server" }
 func (d *testForwarderDepsWithDevice) GetDevice() *core.Device         { return d.device }
 func (d *testForwarderDepsWithDevice) SendMessage(*core.MsgData) error { return nil }
+func (d *testForwarderDepsWithDevice) IncrForwarderMetric(string)      {}
 func (d *testForwarderDepsWithDevice) FindACConnectionsForResource(*common.AgentKnockMsg, *common.ResourceData) []*ACConn {
 	return nil
 }

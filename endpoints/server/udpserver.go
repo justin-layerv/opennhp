@@ -3678,8 +3678,10 @@ func (s *UdpServer) dedupeRecvART(ppd *core.PacketParserData) error {
 // from res onto the AOP. Pure + nil-safe so the production stamp and the test
 // doubles share ONE mapping and cannot drift (mirrors the AC-side
 // accessEntryFromAOP extraction). res is nil on the local non-v2 path and a
-// catalog ResourceData on the forward/http paths. All four fields are omitempty,
-// so the AOP stays additive/wire-compatible (pre-v2 ACs ignore unknown keys).
+// catalog ResourceData on legacy forward/http paths. Upgraded native forwards
+// merge the origin admission's narrow revocation sidecar into the receiver's
+// catalog ResourceData before stamping. All fields are omitempty, so the AOP stays
+// additive/wire-compatible (pre-v2 ACs ignore unknown keys).
 // Only the v2 admission path (authWithNHPClaims/buildV2ResourceData) sets
 // qurl_user hash / admission_id / deadline on a ResourceData;
 // resource_public_key_hash can ride a catalog ResourceData for a v2-provisioned
@@ -3689,18 +3691,21 @@ func (s *UdpServer) dedupeRecvART(ppd *core.PacketParserData) error {
 // first-knock path leaves it empty. revocation_epoch is still not carried (no
 // admission response returns it) and has no ResourceData field; it awaits a
 // later contract + slice.
+// Keep this stamped admission-time field set in sync with
+// common.ForwardAdmissionRevocationData plus nativeForwardAdmissionRevocationData
+// / forwardedACOperationResourceData. Any new qURL v2 revocation key that is
+// stamped onto the AOP must also cross native NHP_FWD, or forwarded flows would
+// silently regress to catalog-only metadata for that key.
 //
 // INVARIANT (forward-safety): the per-admission fields (admission_id / deadline /
 // qurl_user hash / session_id) must ONLY ever originate from v2 admission, never
-// from a catalog/storage producer. Today that holds — buildV2ResourceData and
+// from a catalog/storage producer. Today that holds: buildV2ResourceData and
 // buildV2RefreshResourceData (the prepare and authorize paths) are the sole
-// writers of those fields onto any ResourceData (no resource_lookup / storage
-// path sets them) — so stamping unconditionally from a non-nil res is safe on the
-// forward/http catalog paths (they leave the fields empty). If a future change
-// ever persists any of them onto a catalog row, a non-v2 forwarded knock would
-// emit stale per-admission metadata; at that point this stamp must gate them on
-// v2-admission provenance. See #2774 (the forward path is where a v2-fields-on-
-// forward change would land).
+// writers of those fields onto any ResourceData, and the native forward sender
+// carries a narrow revocation sidecar from that admission result. If a future change ever
+// persists any of them onto a catalog row, a non-v2 forwarded knock could emit
+// stale per-admission metadata; at that point this stamp must gate them on
+// v2-admission provenance.
 func stampQurlV2RevocationMetadata(aopMsg *common.ServerACOpsMsg, res *common.ResourceData) {
 	if aopMsg == nil || res == nil {
 		return
@@ -3714,12 +3719,14 @@ func stampQurlV2RevocationMetadata(aopMsg *common.ServerACOpsMsg, res *common.Re
 
 // res carries the qURL v2 revocation metadata (P4a) to stamp onto the AOP. It is
 // nil on the local admission path for non-qURL-v2 knocks, and a catalog
-// ResourceData on the forward/http paths. The stamped fields are all omitempty,
-// so the AOP stays additive and wire-compatible: pre-v2 ACs simply ignore keys
-// they don't know. No flag check is needed here — only the v2 admission path
-// (authWithNHPClaims, gated by v2AdmissionEnabled) sets the per-admission fields
-// (qurl_user hash, admission_id, deadline); resource_public_key_hash rides the
-// catalog ResourceData for v2-provisioned resources (see stampQurlV2RevocationMetadata).
+// ResourceData on legacy forward/http paths. Native forwards merge a narrow
+// revocation sidecar from the origin admission before this stamp. The stamped fields are
+// all omitempty, so the AOP stays additive and wire-compatible: pre-v2 ACs
+// simply ignore keys they don't know. No flag check is needed here — only the v2
+// admission path (authWithNHPClaims, gated by v2AdmissionEnabled) sets the
+// per-admission fields (qurl_user hash, admission_id, deadline);
+// resource_public_key_hash rides the catalog ResourceData for v2-provisioned
+// resources (see stampQurlV2RevocationMetadata).
 func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32, res *common.ResourceData) (artMsg *common.ACOpsResultMsg, err error) {
 	// should not happen
 	if knkMsg == nil || conn == nil {
@@ -4103,7 +4110,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 					}
 					fctx, fcancel := context.WithTimeout(fanoutBase, ForwardTimeout)
 					defer fcancel()
-					accepted := s.forwarder.FanoutKnock(fctx, assignment, s.localIp, req.OriginalPacket, userAddr)
+					accepted := s.forwarder.FanoutKnock(fctx, assignment, s.localIp, req.OriginalPacket, userAddr, res)
 					s.metrics.IncrCounter(MetricKnockFanout)
 					log.Info("server-agent(%s@%s)-ac(%s)[handleNhpOpenResource] knock fan-out opened pinholes on %d peer server(s)", knkMsg.UserId, addrStr, acId, accepted)
 				}(info.ACId)
@@ -4149,7 +4156,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 				fwdCtx, fwdCancel := context.WithTimeout(context.Background(), ForwardTimeout)
 				defer fwdCancel()
 
-				result, fwdErr := s.forwarder.ForwardKnock(fwdCtx, assignment, req.OriginalPacket, userAddr)
+				result, fwdErr := s.forwarder.ForwardKnock(fwdCtx, assignment, req.OriginalPacket, userAddr, res)
 				if fwdErr == nil && result != nil && result.Success {
 					// Forward succeeded - parse and return the ACK from the assigned server
 					var forwardedAck common.ServerKnockAckMsg
@@ -4517,6 +4524,10 @@ func (s *UdpServer) GetHostname() string {
 // GetDevice returns the core.Device for Noise protocol operations.
 func (s *UdpServer) GetDevice() *core.Device {
 	return s.device
+}
+
+func (s *UdpServer) IncrForwarderMetric(name string) {
+	s.metrics.IncrCounter(name)
 }
 
 func (s *UdpServer) connDataForOutboundAddr(remoteAddr *net.UDPAddr, peerPk []byte) (*core.ConnectionData, error) {

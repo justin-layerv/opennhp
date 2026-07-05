@@ -878,6 +878,28 @@ func TestAccessEntry_JSONOmitsQurlV2Metadata(t *testing.T) {
 	}
 }
 
+func TestGenerateAccessToken_IgnoresQurlV2DeadlineForExpiry(t *testing.T) {
+	a := &UdpAC{tokenStore: common.NewTokenStore[*AccessEntry]()}
+	const openTime = 3
+	before := time.Now()
+	entry := &AccessEntry{
+		User:     &common.AgentUser{UserId: "u"},
+		OpenTime: openTime,
+		Deadline: before.Add(24 * time.Hour).Unix(),
+	}
+
+	a.GenerateAccessToken(entry)
+
+	wantMax := before.Add(time.Duration(openTime+accessTokenLatePacketBufferSeconds+1) * time.Second)
+	if entry.ExpireTime.After(wantMax) {
+		t.Fatalf("ExpireTime = %v, want bounded by OpenTime + late-packet buffer (<= %v), not qURL Deadline %d",
+			entry.ExpireTime, wantMax, entry.Deadline)
+	}
+	if got := entry.Deadline; got != before.Add(24*time.Hour).Unix() {
+		t.Fatalf("Deadline = %d, want stored metadata preserved", got)
+	}
+}
+
 // TestBufferAsymmetry_TokenStillValidButFirewallClosed pins the
 // asymmetry between the two #1942 deadlines: there is a window after
 // FirstKnockTime + OpenTime but before FirstKnockTime + OpenTime + buffer

@@ -147,6 +147,7 @@ func (f *ServerForwarder) ForwardKnock(
 	assignment *ACAssignment,
 	knockData []byte,
 	userAddr *net.UDPAddr,
+	admissionResource *common.ResourceData,
 ) (*common.ServerForwardResultMsg, error) {
 	if len(assignment.AssignedServers) == 0 {
 		return nil, errors.New("no assigned servers for AC")
@@ -167,7 +168,7 @@ func (f *ServerForwarder) ForwardKnock(
 			continue
 		}
 
-		result, err := f.forwardToServer(ctx, target, assignment.ACID, knockData, userAddr)
+		result, err := f.forwardToServer(ctx, target, assignment.ACID, knockData, userAddr, admissionResource)
 		if err != nil {
 			log.Warning("Forward to server %s failed for AC %s: %v", target.ID, assignment.ACID, err)
 			if !isLocalForwardSendError(err) {
@@ -210,6 +211,7 @@ func (f *ServerForwarder) FanoutKnock(
 	selfInternalIP string,
 	knockData []byte,
 	userAddr *net.UDPAddr,
+	admissionResource *common.ResourceData,
 ) (peersAccepted int) {
 	if assignment == nil || len(assignment.AssignedServers) == 0 {
 		return 0
@@ -228,7 +230,7 @@ func (f *ServerForwarder) FanoutKnock(
 		wg.Add(1)
 		go func(target ServerInfo) {
 			defer wg.Done()
-			result, ferr := f.forwardToServer(ctx, target, assignment.ACID, knockData, userAddr)
+			result, ferr := f.forwardToServer(ctx, target, assignment.ACID, knockData, userAddr, admissionResource)
 			if ferr != nil {
 				if !isLocalForwardSendError(ferr) {
 					f.health.RecordFailure(target.ID)
@@ -253,6 +255,7 @@ func (f *ServerForwarder) forwardToServer(
 	acID string,
 	knockData []byte,
 	userAddr *net.UDPAddr,
+	admissionResource *common.ResourceData,
 ) (*common.ServerForwardResultMsg, error) {
 	// Get or create peer for target server
 	peer, err := f.getOrCreateServerPeer(target)
@@ -265,11 +268,12 @@ func (f *ServerForwarder) forwardToServer(
 
 	// Create forward message
 	fwdMsg := &common.ServerForwardMsg{
-		KnockData:     knockData,
-		SourceServer:  f.deps.GetHostname(),
-		UserAddr:      userAddr.String(),
-		TransactionId: txID,
-		Timestamp:     time.Now().Unix(),
+		KnockData:               knockData,
+		SourceServer:            f.deps.GetHostname(),
+		UserAddr:                userAddr.String(),
+		TransactionId:           txID,
+		Timestamp:               time.Now().Unix(),
+		AdmissionRevocationData: nativeForwardAdmissionRevocationData(admissionResource),
 	}
 
 	msgBytes, err := json.Marshal(fwdMsg)
@@ -341,6 +345,89 @@ func (f *ServerForwarder) forwardToServer(
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// Keep the copy, presence check, and overlay below in lockstep with
+// common.ForwardAdmissionRevocationData and stampQurlV2RevocationMetadata.
+func nativeForwardAdmissionRevocationData(res *common.ResourceData) *common.ForwardAdmissionRevocationData {
+	if res == nil {
+		return nil
+	}
+	data := &common.ForwardAdmissionRevocationData{
+		QurlUserPublicKeyHash: res.QurlUserPublicKeyHash,
+		ResourcePublicKeyHash: res.ResourcePublicKeyHash,
+		SessionId:             res.SessionId,
+		AdmissionId:           res.AdmissionId,
+		Deadline:              res.Deadline,
+	}
+	if !hasForwardAdmissionRevocationData(data) {
+		return nil
+	}
+	return data
+}
+
+func hasForwardAdmissionRevocationData(data *common.ForwardAdmissionRevocationData) bool {
+	// ResourcePublicKeyHash is copied when a genuine v2 sidecar is already
+	// present, but a hash by itself is catalog metadata. Do not emit or accept a
+	// hash-only sidecar; the receiver's local catalog hash remains authoritative.
+	return data != nil && (data.QurlUserPublicKeyHash != "" ||
+		data.SessionId != "" ||
+		data.AdmissionId != "" ||
+		data.Deadline != 0)
+}
+
+type forwardedAdmissionResourceHashMismatchDecision struct {
+	mismatch      bool
+	catalogHash   string
+	admissionHash string
+}
+
+func forwardedACOperationResourceData(catalog *common.ResourceData, admission *common.ForwardAdmissionRevocationData) (*common.ResourceData, forwardedAdmissionResourceHashMismatchDecision) {
+	if catalog == nil {
+		return nil, forwardedAdmissionResourceHashMismatchDecision{}
+	}
+	if !hasForwardAdmissionRevocationData(admission) {
+		// Legacy/empty-sidecar path intentionally aliases the receiver catalog;
+		// downstream AOP stamping treats ResourceData as read-only.
+		return catalog, forwardedAdmissionResourceHashMismatchDecision{}
+	}
+	resourceHashMismatch := forwardedAdmissionResourceHashMismatch(catalog, admission)
+	res := cloneResourceData(catalog)
+	if admission.QurlUserPublicKeyHash != "" {
+		res.QurlUserPublicKeyHash = admission.QurlUserPublicKeyHash
+	}
+	// Keep the receiver's catalog resource hash authoritative when present. The
+	// origin sidecar only fills older/missing catalog rows so revocation coverage
+	// does not regress during metadata rollout.
+	if res.ResourcePublicKeyHash == "" && admission.ResourcePublicKeyHash != "" {
+		res.ResourcePublicKeyHash = admission.ResourcePublicKeyHash
+	}
+	if admission.SessionId != "" {
+		res.SessionId = admission.SessionId
+	}
+	if admission.AdmissionId != "" {
+		res.AdmissionId = admission.AdmissionId
+	}
+	if admission.Deadline != 0 {
+		res.Deadline = admission.Deadline
+	}
+	return res, resourceHashMismatch
+}
+
+func forwardedAdmissionResourceHashMismatch(catalog *common.ResourceData, admission *common.ForwardAdmissionRevocationData) forwardedAdmissionResourceHashMismatchDecision {
+	// Called only after hasForwardAdmissionRevocationData accepts the sidecar;
+	// hash-only catalog metadata must not reach this mismatch check.
+	var decision forwardedAdmissionResourceHashMismatchDecision
+	if catalog != nil {
+		decision.catalogHash = catalog.ResourcePublicKeyHash
+	}
+	if admission != nil {
+		decision.admissionHash = admission.ResourcePublicKeyHash
+	}
+	decision.mismatch = decision.catalogHash != "" &&
+		decision.admissionHash != "" &&
+		decision.catalogHash != decision.admissionHash
+	return decision
 }
 
 // HandleForwardRequest processes an incoming NHP_FWD message.
@@ -495,6 +582,12 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	if openTime == 0 {
 		openTime = 60 // Default open time
 	}
+	acOperationResData, resourceHashMismatch := forwardedACOperationResourceData(resData, fwdMsg.AdmissionRevocationData)
+	if resourceHashMismatch.mismatch {
+		f.deps.IncrForwarderMetric(MetricForwardAdmissionResourceHashMismatch)
+		log.Debug("forwarded qURL v2 admission resource hash differs from receiver catalog; keeping catalog hash catalog=%s admission=%s",
+			resourceHashMismatch.catalogHash, resourceHashMismatch.admissionHash)
+	}
 
 	// Step 5: Broadcast AOP to all ACs (supports blue/green with same AC ID).
 	// HandleForwardRequest is invoked by the UDP server-to-server path, which
@@ -507,11 +600,15 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	// and any future cancellation-respecting code path consistent across
 	// the forward-receiver call sites.
 	//
-	// resData here is the catalog ResourceData from ResolveResource (not a v2
-	// admission decision), so it carries ResourcePublicKeyHash but not the
-	// per-admission revocation fields. Passing it lets the resource hash reach
-	// the AOP on the forward path; the rest stay omitted (see deps interface).
-	artMsg, err := f.deps.ProcessACOperationBroadcast(f.deps.LifecycleCtx(), knkMsg, acConns, srcAddr, dstAddrs, openTime, resData)
+	// acOperationResData keeps receiver-local catalog placement authoritative
+	// while overlaying the origin admission's qURL v2 revocation metadata when a
+	// newer sender carried it on NHP_FWD. The receiver trusts the per-admission
+	// fields from an authenticated forwarding cell member over NHP_FWD, the same
+	// trust boundary as the forwarded AOP; it does not recompute or revalidate
+	// the deadline/user/admission tuple. The receiver's catalog resource hash
+	// stays authoritative when present. Legacy senders omit the sidecar and
+	// retain the previous catalog-only behavior.
+	artMsg, err := f.deps.ProcessACOperationBroadcast(f.deps.LifecycleCtx(), knkMsg, acConns, srcAddr, dstAddrs, openTime, acOperationResData)
 	if err != nil {
 		log.Error("AC operation failed for forwarded knock: %v", err)
 		errCode := "AC_OP_FAILED"

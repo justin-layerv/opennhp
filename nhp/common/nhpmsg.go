@@ -396,6 +396,21 @@ type ServerDHPKnockAckMsg struct {
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
 // ============================================================================
 
+// ForwardAdmissionRevocationData is the qURL v2 revocation subset an origin
+// server may carry on NHP_FWD after accepting a per-admission signed-claims
+// knock. It intentionally excludes catalog routing and credential fields; the
+// receiving server resolves those locally before overlaying this metadata. The
+// nested tags match the compact qURL v2 fields on ServerACOpsMsg.
+// RevocationEpoch is intentionally absent: epochs ride revoke events, not
+// knock-time admission metadata.
+type ForwardAdmissionRevocationData struct {
+	QurlUserPublicKeyHash string `json:"qurlUsrPubKeyHash,omitempty"`
+	ResourcePublicKeyHash string `json:"resPubKeyHash,omitempty"`
+	SessionId             string `json:"sessId,omitempty"`
+	AdmissionId           string `json:"admId,omitempty"`
+	Deadline              int64  `json:"deadline,omitempty"`
+}
+
 // ServerForwardMsg is sent from one server to another to forward a knock (NHP_FWD).
 // Used when a knock arrives at a non-assigned server and needs to be forwarded
 // to one of the AC's assigned servers.
@@ -405,6 +420,11 @@ type ServerForwardMsg struct {
 	UserAddr      string `json:"userAddr"`     // User's address for response routing
 	TransactionId uint64 `json:"txId"`         // For response correlation
 	Timestamp     int64  `json:"ts"`           // Unix timestamp - reject if >30s old (replay protection)
+
+	// AdmissionRevocationData optionally carries qURL v2 revocation metadata
+	// produced by the origin server's admission decision. Local catalog
+	// resolution remains authoritative for AC routing and ACK construction.
+	AdmissionRevocationData *ForwardAdmissionRevocationData `json:"admissionRevocationData,omitempty"`
 }
 
 // ServerForwardResultMsg is the response to ServerForwardMsg (NHP_FRT).

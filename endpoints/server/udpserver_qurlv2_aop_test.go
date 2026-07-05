@@ -78,10 +78,12 @@ func TestStampQurlV2RevocationMetadata_NilResource(t *testing.T) {
 	}
 }
 
-// TestStampQurlV2RevocationMetadata_ResourceHashOnly covers the forward/http
-// path shape: a catalog ResourceData carries only resource_public_key_hash (the
-// per-admission fields are absent), so only that one field is stamped — matching
-// the documented forward-path coverage (tracked in #2774).
+// TestStampQurlV2RevocationMetadata_ResourceHashOnly covers a catalog-only
+// ResourceData shape: a catalog ResourceData carries only
+// resource_public_key_hash (the per-admission fields are absent), so only that
+// one field is stamped. Upgraded native forwards overlay the narrow admission
+// revocation sidecar before this helper runs; this test keeps the
+// legacy/catalog-only behavior explicit.
 func TestStampQurlV2RevocationMetadata_ResourceHashOnly(t *testing.T) {
 	res := &common.ResourceData{ResourcePublicKeyHash: "catalog_hash"}
 	aop := &common.ServerACOpsMsg{UserId: "u"}
@@ -92,7 +94,7 @@ func TestStampQurlV2RevocationMetadata_ResourceHashOnly(t *testing.T) {
 		t.Errorf("ResourcePublicKeyHash = %q, want %q", aop.ResourcePublicKeyHash, "catalog_hash")
 	}
 	if aop.QurlUserPublicKeyHash != "" || aop.AdmissionId != "" || aop.Deadline != 0 {
-		t.Errorf("forward/catalog path must omit per-admission fields; got user=%q adm=%q deadline=%d",
+		t.Errorf("catalog-only path must omit per-admission fields; got user=%q adm=%q deadline=%d",
 			aop.QurlUserPublicKeyHash, aop.AdmissionId, aop.Deadline)
 	}
 }

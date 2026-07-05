@@ -2,6 +2,7 @@ package common
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -307,5 +308,64 @@ func TestServerACOpsMsg_V2AOP_EmitsExpectedKeys(t *testing.T) {
 		if !strings.Contains(wire, key) {
 			t.Errorf("populated AOP wire missing %s, got: %s", key, wire)
 		}
+	}
+}
+
+func TestServerForwardMsg_AdmissionRevocationDataWireCompat(t *testing.T) {
+	legacy := &ServerForwardMsg{
+		KnockData:     []byte("knock"),
+		SourceServer:  "srv-a",
+		UserAddr:      "203.0.113.10:54321",
+		TransactionId: 1,
+		Timestamp:     1781910000,
+	}
+	legacyBytes, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy forward: %v", err)
+	}
+	if strings.Contains(string(legacyBytes), "admissionRevocationData") {
+		t.Fatalf("legacy forward wire must omit admissionRevocationData, got: %s", legacyBytes)
+	}
+
+	v2 := &ServerForwardMsg{
+		KnockData:     []byte("knock"),
+		SourceServer:  "srv-a",
+		UserAddr:      "203.0.113.10:54321",
+		TransactionId: 1,
+		Timestamp:     1781910000,
+		AdmissionRevocationData: &ForwardAdmissionRevocationData{
+			QurlUserPublicKeyHash: "qhash",
+			ResourcePublicKeyHash: "rhash",
+			SessionId:             "sess-live",
+			AdmissionId:           "adm-123",
+			Deadline:              1781910300,
+		},
+	}
+	v2Bytes, err := json.Marshal(v2)
+	if err != nil {
+		t.Fatalf("marshal v2 forward: %v", err)
+	}
+	wire := string(v2Bytes)
+	for _, want := range []string{
+		`"admissionRevocationData":`,
+		`"qurlUsrPubKeyHash":"qhash"`,
+		`"resPubKeyHash":"rhash"`,
+		`"sessId":"sess-live"`,
+		`"admId":"adm-123"`,
+		`"deadline":1781910300`,
+	} {
+		if !strings.Contains(wire, want) {
+			t.Fatalf("forward wire missing %s, got: %s", want, wire)
+		}
+	}
+	var roundTrip ServerForwardMsg
+	if err := json.Unmarshal(v2Bytes, &roundTrip); err != nil {
+		t.Fatalf("unmarshal v2 forward: %v", err)
+	}
+	if roundTrip.AdmissionRevocationData == nil {
+		t.Fatalf("unmarshaled v2 forward lost admissionRevocationData: %+v", roundTrip)
+	}
+	if !reflect.DeepEqual(roundTrip.AdmissionRevocationData, v2.AdmissionRevocationData) {
+		t.Fatalf("unmarshaled admissionRevocationData = %+v, want %+v", roundTrip.AdmissionRevocationData, v2.AdmissionRevocationData)
 	}
 }

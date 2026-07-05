@@ -322,7 +322,7 @@ func TestFanoutKnock_ReachesEveryNonSelfHealthyPeer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	_ = f.FanoutKnock(ctx, assignment, "10.0.0.9", []byte("knock"),
-		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321})
+		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321}, nil)
 
 	// FanoutKnock waited for all forwardToServer goroutines, so every send is
 	// recorded by now. Count the NHP_FWD sends.
