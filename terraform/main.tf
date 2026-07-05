@@ -2931,6 +2931,40 @@ resource "aws_ssm_parameter" "qurl_link_url" {
   })
 }
 
+# qURL v2 EnterPortal trust config, consumed by CI smoke (qurl-service
+# TestQURLEndToEndFlow_QV2 + the forged-signature fence -> qurl-go EnterPortal).
+# Published from the SAME source of truth as the NHP server trust store above —
+# var.qurl_v2_issuer_kid + data.aws_kms_public_key.qurl_v2_issuer for the anchor,
+# var.qurl_v2_relay_url for the relay origin — and gated on the SAME
+# local.qurl_v2_admission_ready, so the CI trust anchor can never diverge from
+# what the server actually admits. Adopted from the hand-seeded qurl-service#1097
+# params via environments/sandbox/imports.tf.
+resource "aws_ssm_parameter" "qurl_qv2_issuer_key" {
+  count       = local.qurl_v2_admission_ready ? 1 : 0
+  name        = "/${var.environment}/nhp/qurl/qv2-issuer-key"
+  description = "qURL v2 issuer trust anchor '<kid>=<base64-std-DER P-256 SPKI>' - consumed by CI smoke (EnterPortal trust store)"
+  type        = "String"
+  value       = "${var.qurl_v2_issuer_kid}=${data.aws_kms_public_key.qurl_v2_issuer[0].public_key}"
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-ssm-qurl-qv2-issuer-key"
+    Component = "qurl"
+  })
+}
+
+resource "aws_ssm_parameter" "qurl_relay_url" {
+  count       = local.qurl_v2_admission_ready ? 1 : 0
+  name        = "/${var.environment}/nhp/qurl/relay-url"
+  description = "qURL v2 relay origin - consumed by CI smoke (EnterPortal relay allowlist)"
+  type        = "String"
+  value       = var.qurl_v2_relay_url
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-ssm-qurl-relay-url"
+    Component = "qurl"
+  })
+}
+
 # ==================== Cost Analytics ====================
 # AWS Data Exports (CUR 2.0) → S3 (Parquet) → Athena → Grafana dashboard
 # Runs in mgmt/payer account for consolidated billing across all accounts.
