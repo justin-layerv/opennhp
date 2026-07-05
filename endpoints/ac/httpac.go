@@ -20,6 +20,8 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
+const acReadinessPath = "/nhp-ac/ready"
+
 type HttpAC struct {
 	id         string
 	ua         *UdpAC
@@ -136,6 +138,8 @@ func (hs *HttpAC) IsRunning() bool {
 func (ha *HttpAC) initRouter() {
 	g := ha.ginEngine
 
+	g.GET(acReadinessPath, ha.handleReadiness)
+
 	refreshGrp := g.Group("refresh")
 	refreshGrp.GET("/:token", func(ctx *gin.Context) {
 		var err error
@@ -173,6 +177,23 @@ func (ha *HttpAC) initRouter() {
 
 		ha.HandleHttpRefreshOperations(ctx, req)
 	})
+}
+
+// handleReadiness backs the AC NLB health check. It intentionally proves only
+// admission readiness: Traefik can reach nhp-acd on the health-check entrypoint
+// and nhp-acd has a fresh assigned-server path for receiving AOP fanout. That
+// matches today's qURL fanout contract: handleHttpOpenResource fans the knock to
+// assigned peer servers, and processACOperationBroadcast sends the AOP to every
+// local AC connection before the origin ACK is released. If that delivery ever
+// becomes targeted to one AC, this target health check is no longer sufficient
+// to prove a specific admission can land on the selected AC.
+func (ha *HttpAC) handleReadiness(c *gin.Context) {
+	if ha == nil || ha.ua == nil || !ha.ua.registration.hasHealthyServer() {
+		c.String(http.StatusServiceUnavailable, "no healthy assigned server\n")
+		return
+	}
+
+	c.String(http.StatusOK, "ready\n")
 }
 
 func (ha *HttpAC) HandleHttpRefreshOperations(c *gin.Context, req *common.HttpRefreshRequest) {

@@ -44,6 +44,24 @@ design, including dry-run dispatches; run Terraform to reattach valid
 target groups before scaling or switching traffic. The TG-less frps ASG
 is not passed to this preflight.
 
+### AC readiness path cutovers
+
+When a PR changes the AC public TLS/qURL target-group health-check path
+(for example, PR #3050 changed `ac_tcp`/`ac_tcp_green` from `/ping` to
+`/nhp-ac/ready`), treat the path flip as a staged deploy, not an ordinary
+standalone Terraform apply. Target-group health-check paths update in
+place against the currently registered AC instances, but Traefik routes
+from `user_data` only appear after new instances boot.
+
+Refresh or canary AC instances to a build/user_data that serves the new
+path on `:8080` first, verify that path through SSM/curl while the active
+target group is still healthy, then apply/switch the target-group
+health-check path. Applying the path against old AC instances makes every
+old target return 404 and can drain qURL/TLS ingress after
+`interval * unhealthy_threshold` (about 90s for PR #3050). Rollback
+reverses the order: restore the previous health path first, then roll
+instances back.
+
 ## `refresh_timeout_minutes` (default 15)
 
 Bounds how long the workflow waits for `aws autoscaling

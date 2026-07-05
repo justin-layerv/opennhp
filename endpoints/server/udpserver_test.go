@@ -39,6 +39,72 @@ func newSendMessageTestServer(t *testing.T, sendCh chan *core.MsgData) *UdpServe
 	return server
 }
 
+func parsedIncomingKnockForSendMessageRoutineTest(t *testing.T, server *UdpServer, transactionID uint64) *core.PacketParserData {
+	t.Helper()
+
+	agentKey := testPrivateKey()
+	agentKey[0] = 0x7f
+	agentDevice := core.NewDevice(core.NHP_AGENT, agentKey, nil)
+	if agentDevice == nil {
+		t.Fatal("core.NewDevice(agent) returned nil")
+	}
+	server.device.AddPeer(&core.UdpPeer{
+		PubKeyBase64: agentDevice.PublicKeyBase64(),
+		Type:         core.NHP_AGENT,
+	})
+	serverPeer := &core.UdpPeer{
+		PubKeyBase64: server.device.PublicKeyBase64(),
+		Type:         core.NHP_SERVER,
+	}
+	agentConn := &core.ConnectionData{
+		Device:      agentDevice,
+		RemoteAddr:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: common.DefaultNHPPort},
+		InitTime:    time.Now().UnixNano(),
+		CookieStore: &core.CookieStore{},
+	}
+	mad, err := agentDevice.MsgToPacket(&core.MsgData{
+		ConnData:      agentConn,
+		PeerPk:        serverPeer.PublicKey(),
+		HeaderType:    core.NHP_KNK,
+		TransactionId: transactionID,
+		Message:       []byte(`{"probe":true}`),
+	})
+	if err != nil {
+		t.Fatalf("agent MsgToPacket: %v", err)
+	}
+
+	serverConn := &core.ConnectionData{
+		Device:           server.device,
+		LocalAddr:        server.listenAddr,
+		RemoteAddr:       &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000},
+		InitTime:         time.Now().UnixNano(),
+		CookieStore:      &core.CookieStore{},
+		SendQueue:        make(chan *core.Packet, 1),
+		RecvQueue:        make(chan *core.Packet, 1),
+		BlockSignal:      make(chan struct{}),
+		StopSignal:       make(chan struct{}),
+		SetTimeoutSignal: make(chan struct{}, 1),
+	}
+	ppd, err := server.device.PacketToMsg(&core.PacketData{
+		BasePacket: &core.Packet{
+			Content:    append([]byte(nil), mad.BasePacket.Content...),
+			HeaderType: core.NHP_KNK,
+		},
+		ConnData: serverConn,
+		InitTime: time.Now().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("server PacketToMsg: %v", err)
+	}
+	if ppd == nil || ppd.Error != nil {
+		t.Fatalf("server PacketToMsg returned error parser data: %+v", ppd)
+	}
+	if ppd.SenderTrxId != transactionID {
+		t.Fatalf("parsed SenderTrxId = %d, want %d", ppd.SenderTrxId, transactionID)
+	}
+	return ppd
+}
+
 func testServerPeerPk(seed byte) []byte {
 	peerPk := make([]byte, core.PublicKeySize)
 	for i := range peerPk {
@@ -123,6 +189,48 @@ func TestSendMessageCreatesOutboundConnectionForRemoteAddr(t *testing.T) {
 	}
 	if _, found := server.connectionsByIP[remoteAddr.IP.String()]; found {
 		t.Fatal("server-peer connection leaked into connectionsByIP")
+	}
+}
+
+func TestSendMessageRoutineAllowsPrevParserDataWithoutConnData(t *testing.T) {
+	sendCh := make(chan *core.MsgData, 1)
+	server := newSendMessageTestServer(t, sendCh)
+	server.device.Start()
+	ppd := parsedIncomingKnockForSendMessageRoutineTest(t, server, 42)
+
+	done := make(chan struct{})
+	server.wg.Add(1)
+	go func() {
+		server.sendMessageRoutine()
+		close(done)
+	}()
+
+	sendCh <- &core.MsgData{
+		HeaderType:     core.NHP_ACK,
+		PrevParserData: ppd,
+		Message:        []byte(`{"ok":true}`),
+	}
+	select {
+	case pkt := <-ppd.ConnData.SendQueue:
+		if pkt == nil {
+			t.Fatal("sendMessageRoutine delivered nil packet")
+		}
+		defer server.device.ReleasePoolPacket(pkt)
+		if pkt.Counter() != 42 {
+			t.Fatalf("generic send packet counter = %d, want original transaction id 42", pkt.Counter())
+		}
+		if pkt.HeaderType != core.NHP_ACK {
+			t.Fatalf("generic send packet HeaderType = %s, want NHP_ACK", core.HeaderTypeToString(pkt.HeaderType))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sendMessageRoutine did not deliver nil-ConnData response through PrevParserData")
+	}
+	close(sendCh)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sendMessageRoutine did not exit after send channel close")
 	}
 }
 

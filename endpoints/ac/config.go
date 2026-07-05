@@ -49,10 +49,11 @@ const (
 	DefaultL3FlushErrorWindowSec = 60
 
 	// DefaultHealthCheckPort is the TCP port the load balancer HTTP-probes
-	// for target health (Traefik's `/ping` entrypoint). In FilterMode_EBPFXDP
-	// the AC admits this port through the XDP whitelist at startup so the
-	// probe isn't fail-closed dropped before it reaches the local listener;
-	// see the ebpfInfraExemptRules install in (*UdpAC).Start.
+	// for target health. Traefik receives the probe on this port and routes
+	// the qURL/TLS target-group check to nhp-acd readiness. In
+	// FilterMode_EBPFXDP the AC admits this port through the XDP whitelist at
+	// startup so the probe isn't fail-closed dropped before it reaches the
+	// local listener; see the ebpfInfraExemptRules install in (*UdpAC).Start.
 	//
 	// This default only self-heals a config.toml that predates the
 	// HealthCheckPort field, so an in-place AC upgrade fixes health checks
@@ -79,14 +80,15 @@ type Config struct {
 	FilterMode          int             `json:"filterMode"`
 
 	// HealthCheckPort is the TCP port the load balancer HTTP-probes for
-	// target health (Traefik's `/ping`). FilterMode_EBPFXDP fails closed on
-	// every port that isn't per-knock authorized or hardcoded-exempt, so the
-	// AC must explicitly admit this port through the XDP whitelist at startup
-	// or every target flaps unhealthy and the NLB black-holes all resource
-	// traffic. Rendered from config.toml; normalized to DefaultHealthCheckPort
-	// when unset (≤0) or out of range (>65535). Ignored in FilterMode_IPTABLES,
-	// where user_data opens the same port with an explicit iptables ACCEPT from
-	// the VPC CIDR.
+	// target health. Traefik listens on this port; the qURL/TLS target-group
+	// check routes through nhp-acd readiness. FilterMode_EBPFXDP fails closed
+	// on every port that isn't per-knock authorized or hardcoded-exempt, so
+	// the AC must explicitly admit this port through the XDP whitelist at
+	// startup or every target flaps unhealthy and the NLB black-holes all
+	// resource traffic. Rendered from config.toml; normalized to
+	// DefaultHealthCheckPort when unset (≤0) or out of range (>65535).
+	// Ignored in FilterMode_IPTABLES, where user_data opens the same port
+	// with an explicit iptables ACCEPT from the VPC CIDR.
 	HealthCheckPort int `json:"healthCheckPort"`
 
 	// L3 flush-on-expiry: actively flushes kernel flow state on

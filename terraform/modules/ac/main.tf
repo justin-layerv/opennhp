@@ -39,8 +39,17 @@ locals {
   # against a whitespace-only ARN; try() handles the null default.
   sns_destination_present = try(trimspace(var.alerts_sns_topic_arn) != "", false)
 
-  # The load-balancer health-check port — Traefik's `/ping` entrypoint. SINGLE
-  # SOURCE OF TRUTH shared by (1) the ac_tcp / ac_tcp_green target-group
+  # The load-balancer health-check port. Traefik receives the probe on this
+  # port; the qURL/TLS target groups use ac_admission_ready_path so a target is
+  # healthy only when nhp-acd has a recently confirmed assigned-server datapath
+  # for admissions. This deliberately fails closed for an AC with no server
+  # path; a correlated AC->server loss can make every public target unhealthy
+  # after interval*unhealthy_threshold, so rollout verification must prove
+  # server blue/green and registration flips do not zero the fleet.
+  # The 30s freshness window is therefore the production rollout's most
+  # important gate: an otherwise-routine server flip must leave every active AC
+  # with at least one connected, fresh assigned-server path.
+  # SINGLE SOURCE OF TRUTH shared by (1) the ac_tcp / ac_tcp_green target-group
   # health_check blocks and (2) the AC's config.toml `HealthCheckPort`. In
   # FilterMode_EBPFXDP the AC admits this exact port through the XDP whitelist
   # at startup (endpoints/ac/udpac.go::ebpfInfraExemptRules); if the probed
@@ -50,7 +59,29 @@ locals {
   # makes that divergence structurally impossible. The
   # `ac_user_data_health_check_port_render_check` resource below asserts the
   # config.toml render, mirroring the FilterMode render guard.
-  ac_health_check_port = 8080
+  ac_health_check_port    = 8080
+  ac_admission_ready_path = "/nhp-ac/ready"
+  # Single-line anchors intentionally trade contiguous-block precision for
+  # indentation-stable rendering checks, matching the sibling render fences in
+  # this module. The rollout ledger's qURL smoke covers the full routed path.
+  ac_admission_ready_route_render_anchors = [
+    "[http.routers.nhp-ac-ready]",
+    "rule = \"Path(\\`${local.ac_admission_ready_path}\\`)\"",
+    "service = \"nhp-ac\"",
+    "entryPoints = [\"traefik\"]",
+    "priority = 100",
+    "[http.routers.nhp-ac-ready-deny]",
+    "rule = \"Path(\\`${local.ac_admission_ready_path}\\`) || PathPrefix(\\`${local.ac_admission_ready_path}/\\`)\"",
+    "entryPoints = [\"https\"]",
+    "middlewares = [\"nhp-ac-ready-internal-only\"]",
+    "priority = 101",
+    "[http.routers.nhp-ac-ready-deny.tls]",
+    "[http.middlewares.nhp-ac-ready-internal-only.replacePath]",
+    "path = \"/__nhp_ac_ready_internal_only\"",
+    "[http.services.nhp-ac.loadBalancer]",
+    "[[http.services.nhp-ac.loadBalancer.servers]]",
+    "url = \"http://127.0.0.1:8888\"",
+  ]
 }
 
 resource "terraform_data" "sns_alerts_contract" {
@@ -499,11 +530,13 @@ resource "aws_vpc_security_group_ingress_rule" "ac_ssh" {
   }
 }
 
-# Traefik health check endpoint - VPC only (for NLB health checks)
-# Port 8080 is Traefik's dashboard/ping entrypoint
+# Traefik health/readiness endpoint - VPC only (for NLB health checks).
+# Port 8080 serves Traefik ping plus the nhp-acd admission-readiness route, so
+# VPC peers can observe this AC's server-connectivity state. The public :443
+# router hides the same path behind a constant 404.
 resource "aws_vpc_security_group_ingress_rule" "ac_traefik_health" {
   security_group_id = aws_security_group.ac.id
-  description       = "Traefik health check from VPC (NLB)"
+  description       = "Traefik health/readiness check from VPC (NLB)"
   # Sourced from the same local as the TG health_check blocks, the AC's
   # config.toml HealthCheckPort, and the EBPFXDP datapath exemption. This ENI
   # gate sits upstream of XDP in BOTH filter modes, so wiring it here completes
@@ -1035,6 +1068,7 @@ locals {
     # — see the field doc in variables.tf for the load-bearing detail.
     qurl_router_frp_server_urls   = var.qurl_router_config != null ? var.qurl_router_config.frp_server_urls : []
     qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
+    ac_admission_ready_path       = local.ac_admission_ready_path
     # Centralized certificate management (for scalable AC deployments)
     centralized_cert_enabled    = var.centralized_cert_enabled
     centralized_cert_secret_arn = var.centralized_cert_secret_arn != null ? var.centralized_cert_secret_arn : ""
@@ -1113,6 +1147,20 @@ resource "terraform_data" "ac_user_data_health_check_port_render_check" {
     precondition {
       condition     = strcontains(local.user_data, "\nHealthCheckPort = ${local.ac_health_check_port}\n")
       error_message = "AC user_data must render config.toml with unquoted numeric `HealthCheckPort = local.ac_health_check_port` so FilterMode_EBPFXDP admits the load-balancer probe on the same port the target groups health-check."
+    }
+  }
+}
+
+resource "terraform_data" "ac_user_data_admission_ready_route_render_check" {
+  input = sha256(local.user_data)
+
+  lifecycle {
+    precondition {
+      condition = alltrue([
+        for anchor in local.ac_admission_ready_route_render_anchors :
+        strcontains(local.user_data, anchor)
+      ])
+      error_message = "AC user_data must render a Traefik :8080 router for local.ac_admission_ready_path to nhp-acd on 127.0.0.1:8888 plus an https-entrypoint rewrite that keeps the readiness bit internal; the ac_tcp health checks depend on nhp-acd readiness, not Traefik process liveness."
     }
   }
 }
@@ -1558,16 +1606,23 @@ resource "aws_lb_target_group" "ac_tcp" {
   target_type       = "instance"
   proxy_protocol_v2 = true
 
-  # HTTP health check on Traefik's ping endpoint (port 8080)
-  # Port 443 is blocked by default for NHP port hiding - only opened after knock
-  # Port 8080 is allowed from VPC CIDR for health checks
+  # HTTP health check routed by Traefik to nhp-acd readiness. Port 443 is
+  # blocked by default for NHP port hiding - only opened after knock. A target
+  # must have at least one healthy assigned server before the NLB sends
+  # qURL/TLS traffic to it. This proves admission readiness, not the full :443
+  # TLS passthrough leg; the qURL smoke in the rollout ledger covers that path.
+  # Rollout note: health_check.path updates in place. Do not apply this path
+  # cutover to an active AC fleet still running user_data without the
+  # nhp-ac-ready router, or every old target can 404 the probe and go unhealthy
+  # after the 30s*3 unhealthy window. See the PR #3050 rollout ledger.
   health_check {
     enabled             = true
     protocol            = "HTTP"
     port                = tostring(local.ac_health_check_port)
-    path                = "/ping"
+    path                = local.ac_admission_ready_path
     matcher             = "200"
     interval            = 30
+    timeout             = 6
     healthy_threshold   = 2
     unhealthy_threshold = 3
   }
@@ -1699,11 +1754,10 @@ resource "aws_lb_listener" "https" {
 #     terminates at Traefik on the AC instance).
 #
 # Why a separate TG and not reuse `ac_tcp`:
-#   - `ac_tcp` healthchecks on Traefik's port 8080 `/ping` — appropriate
-#     for the HTTPS entrypoint. The FRPS control entrypoint uses the same
-#     Traefik process and the same `/ping` is fine; the new TG exists
-#     because the listener-to-TG binding is 1:1 and the listener targets
-#     a different port.
+#   - `ac_tcp` healthchecks on nhp-acd admission readiness for knocked-in
+#     HTTPS/qURL resource flows. The FRPS control entrypoint has a separate
+#     documented `/ping` caveat below; the new TG exists because the
+#     listener-to-TG binding is 1:1 and the listener targets a different port.
 #   - Proxy Protocol v2 is intentionally OFF here (the FRP control channel
 #     doesn't speak PP, and the Traefik TCP entrypoint would need
 #     `proxyProtocol` awareness to accept it). Preserving client IP for
@@ -2233,6 +2287,7 @@ check "ac_tcp_target_group_drift" {
         aws_lb_target_group.ac_tcp.health_check[0].protocol == aws_lb_target_group.ac_tcp_green[0].health_check[0].protocol &&
         aws_lb_target_group.ac_tcp.health_check[0].matcher == aws_lb_target_group.ac_tcp_green[0].health_check[0].matcher &&
         aws_lb_target_group.ac_tcp.health_check[0].interval == aws_lb_target_group.ac_tcp_green[0].health_check[0].interval &&
+        aws_lb_target_group.ac_tcp.health_check[0].timeout == aws_lb_target_group.ac_tcp_green[0].health_check[0].timeout &&
         aws_lb_target_group.ac_tcp.health_check[0].healthy_threshold == aws_lb_target_group.ac_tcp_green[0].health_check[0].healthy_threshold &&
         aws_lb_target_group.ac_tcp.health_check[0].unhealthy_threshold == aws_lb_target_group.ac_tcp_green[0].health_check[0].unhealthy_threshold
       )

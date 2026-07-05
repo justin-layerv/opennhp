@@ -11,7 +11,7 @@
 #
 # Key Difference from Server:
 # - AC uses a single NLB TCP listener on port 443 (TLS passthrough to Traefik)
-# - Health check on port 8080 /ping (Traefik dashboard/ping entrypoint)
+# - Health check on port 8080 through Traefik to nhp-acd admission readiness
 # - No termination cleanup needed (CloudMap deregistration via systemd ExecStop)
 #
 # Naming Convention:
@@ -192,17 +192,22 @@ resource "aws_lb_target_group" "ac_tcp_green" {
   target_type       = "instance"
   proxy_protocol_v2 = true
 
-  # HTTP health check on Traefik's ping endpoint (port 8080). Port is sourced
+  # HTTP health check routed by Traefik to nhp-acd readiness. Port is sourced
   # from local.ac_health_check_port (main.tf) so this green TG, the blue ac_tcp
   # TG, and the AC's config.toml HealthCheckPort can never diverge — the
-  # divergence that fail-closed drops the probe under FilterMode_EBPFXDP.
+  # divergence that fail-closed drops the probe under FilterMode_EBPFXDP. Keep
+  # timing identical to the blue TG so a color swap cannot silently change the
+  # assigned-server readiness window. Health-check path changes are in-place;
+  # the PR #3050 rollout ledger requires instances to serve nhp-ac-ready before
+  # a color becomes active on this TG.
   health_check {
     enabled             = true
     protocol            = "HTTP"
     port                = tostring(local.ac_health_check_port)
-    path                = "/ping"
+    path                = local.ac_admission_ready_path
     matcher             = "200"
     interval            = 30
+    timeout             = 6
     healthy_threshold   = 2
     unhealthy_threshold = 3
   }
@@ -405,7 +410,12 @@ resource "aws_cloudwatch_metric_alarm" "ac_green_asg_unhealthy" {
   })
 }
 
-# Alarm: Green target group has no healthy targets (critical for rollback)
+# Alarm: Green target group has no healthy targets when green capacity is
+# expected (critical for rollback). HealthyHostCount uses Maximum because with
+# the NLB's multi-AZ/cross-zone shape, a single AZ with no registered target can
+# publish 0 even while another AZ can still serve rollback traffic. Gate on ASG
+# desired capacity so an intentionally cold green standby (desired=0, no TG
+# datapoints) stays OK, while desired>0 with missing/zero TG health still pages.
 resource "aws_cloudwatch_metric_alarm" "ac_green_tg_no_healthy_targets" {
   count = var.enable_blue_green && var.enable_sns_alerts ? 1 : 0
 
@@ -413,16 +423,45 @@ resource "aws_cloudwatch_metric_alarm" "ac_green_tg_no_healthy_targets" {
   alarm_description   = "AC Green target group has no healthy targets - rollback capability impaired"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2
-  metric_name         = "HealthyHostCount"
-  namespace           = "AWS/NetworkELB"
-  period              = 60
-  statistic           = "Minimum"
   threshold           = 1
-  treat_missing_data  = "breaching"
+  treat_missing_data  = "notBreaching"
 
-  dimensions = {
-    TargetGroup  = aws_lb_target_group.ac_tcp_green[0].arn_suffix
-    LoadBalancer = aws_lb.ac.arn_suffix
+  metric_query {
+    id          = "green_capacity_health"
+    expression  = "IF(FILL(desired, 0) > 0, FILL(healthy, 0), 1)"
+    label       = "Green healthy targets when green capacity is desired"
+    return_data = true
+  }
+
+  metric_query {
+    id = "desired"
+
+    metric {
+      metric_name = "GroupDesiredCapacity"
+      namespace   = "AWS/AutoScaling"
+      period      = 60
+      stat        = "Maximum"
+
+      dimensions = {
+        AutoScalingGroupName = aws_autoscaling_group.ac_green[0].name
+      }
+    }
+  }
+
+  metric_query {
+    id = "healthy"
+
+    metric {
+      metric_name = "HealthyHostCount"
+      namespace   = "AWS/NetworkELB"
+      period      = 60
+      stat        = "Maximum"
+
+      dimensions = {
+        TargetGroup  = aws_lb_target_group.ac_tcp_green[0].arn_suffix
+        LoadBalancer = aws_lb.ac.arn_suffix
+      }
+    }
   }
 
   alarm_actions = [var.alerts_sns_topic_arn]

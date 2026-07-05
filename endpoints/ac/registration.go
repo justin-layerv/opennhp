@@ -1585,6 +1585,20 @@ func (r *ACRegistration) connectedServerCount() float64 {
 	return float64(count)
 }
 
+// hasHealthyServer reports whether this AC currently has any recently
+// confirmed assigned NHP server path. The public load balancer readiness
+// endpoint uses this as the minimum datapath condition for serving knocked-in
+// resource flows.
+func (r *ACRegistration) hasHealthyServer() bool {
+	if r == nil {
+		return false
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return healthyAssignedServerCount(r.assignedServers, 1) > 0
+}
+
 // healthyServerCount returns the number of assigned servers that are both
 // connected and have responded within the keepalive health window
 // (KeepaliveInterval * KeepaliveMaxRetries = 30s).
@@ -1592,14 +1606,24 @@ func (r *ACRegistration) connectedServerCount() float64 {
 func (r *ACRegistration) healthyServerCount() float64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return float64(healthyAssignedServerCount(r.assignedServers, 0))
+}
+
+// healthyAssignedServerCount counts healthy assigned servers. Callers must hold
+// the registration lock that protects assignedServers. limit=0 counts all;
+// limit>0 short-circuits once that many healthy servers have been found.
+func healthyAssignedServerCount(servers []*AssignedServer, limit int) int {
 	count := 0
 	healthWindow := KeepaliveInterval * KeepaliveMaxRetries
-	for _, s := range r.assignedServers {
+	for _, s := range servers {
 		if s.IsHealthy(healthWindow) {
 			count++
+			if limit > 0 && count >= limit {
+				return count
+			}
 		}
 	}
-	return float64(count)
+	return count
 }
 
 // l3FlushSnapshot returns the scheduler's metrics snapshot or the

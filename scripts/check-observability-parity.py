@@ -67,6 +67,8 @@ AC_CORE_ALARM_NAMES = (
     "registration_stale",
     "l3_flush_schedule_wait_timeout",
     "publisher_failures",
+    "ac_tg_no_healthy_targets",
+    "ac_tg_no_healthy_targets_any_color",
     "ebpf_map_full",
     "ebpf_perf_lost_samples",
     "ebpf_deny_telemetry_suppressed",

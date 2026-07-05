@@ -1015,10 +1015,12 @@ LogLevel = ${log_level}
 AuthServiceId = "${auth_service_id}"
 ResourceIds = ${resource_ids}
 FilterMode = ${ac_filter_mode}
-# LB health-check port (Traefik /ping). In FilterMode_EBPFXDP the AC admits this
-# TCP port through the XDP whitelist at startup so the NLB probe isn't
-# fail-closed dropped; MUST equal the target-group health_check port (both are
-# sourced from local.ac_health_check_port in terraform/modules/ac).
+# LB health-check port. Traefik receives the probe on this TCP port and routes
+# the qURL/TLS target-group health check to nhp-acd readiness. In
+# FilterMode_EBPFXDP the AC admits this port through the XDP whitelist at
+# startup so the NLB probe isn't fail-closed dropped; MUST equal the
+# target-group health_check port (both are sourced from
+# local.ac_health_check_port in terraform/modules/ac).
 HealthCheckPort = ${ac_health_check_port}
 
 # L3 flush-on-expiry. Toml keys match the Go struct field names
@@ -1055,7 +1057,9 @@ echo "NHP-ACD config.toml created (cloud mode)"
 # HTTP server config for NHP-ACD
 cat > /opt/layerv/nhp-ac/etc/http.toml << 'HTTPEOF'
 # HTTP server config for NHP-ACD
-# This is the NHP protocol's HTTP interface, not Traefik's HTTPS
+# This is the NHP protocol's HTTP interface, not Traefik's HTTPS. Keep it
+# plaintext: Traefik's nhp-ac service points at http://127.0.0.1:8888, and the
+# public AC target-group readiness check now depends on that local hop.
 EnableHttp = true
 EnableTLS = false
 HttpListenIp = "127.0.0.1"
@@ -1306,6 +1310,8 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 # Traefik Dynamic Configuration
 #
 # Router priority hierarchy (higher number = matched first):
+#  101 - nhp-ac-ready-deny :443 rewrites ${ac_admission_ready_path} variants to a 404 path
+#  100 - nhp-ac-ready      :8080 ${ac_admission_ready_path} to nhp-acd readiness
 #   20 - frp-control        /.well-known/layerv-frp or /~!frp → FRP WebSocket (when deploy_frps)
 #   15 - qurl-site          *.qurl.site subdomain routing
 #   10 - nhp-plugins        /plugins/* to NHP Server
@@ -1314,6 +1320,39 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 #    1 - nhp-ac             fallback to nhp-acd for protected resource access
 
 [http.routers]
+  # NLB qURL/TLS target health must prove nhp-acd can receive admissions.
+  [http.routers.nhp-ac-ready]
+    rule = "Path(\`${ac_admission_ready_path}\`)"
+    service = "nhp-ac"
+    entryPoints = ["traefik"]
+    priority = 100
+
+  # Keep the readiness bit internal to the NLB health-check entrypoint. Without
+  # this https router, the priority-1 nhp-ac fallback would also serve
+  # ${ac_admission_ready_path} after a knock. Rewriting to an impossible
+  # nhp-acd path intentionally returns the same 404 independent of readiness
+  # state via gin's default NoRoute handler, using existing backend routing
+  # instead of adding another custom response plugin to the AC boot path.
+  # This reserves ${ac_admission_ready_path} and its subpaths on public :443
+  # across proxied protected resources, by design, to keep the readiness signal
+  # from leaking through qurl-site or the nhp-ac fallback route.
+  [http.routers.nhp-ac-ready-deny]
+    rule = "Path(\`${ac_admission_ready_path}\`) || PathPrefix(\`${ac_admission_ready_path}/\`)"
+    service = "nhp-ac"
+    entryPoints = ["https"]
+    middlewares = ["nhp-ac-ready-internal-only"]
+    priority = 101
+%{ if centralized_cert_enabled ~}
+    # TLS uses centralized certificate from default store
+    [http.routers.nhp-ac-ready-deny.tls]
+%{ else ~}
+    [http.routers.nhp-ac-ready-deny.tls]
+      certResolver = "letsencrypt"
+      [[http.routers.nhp-ac-ready-deny.tls.domains]]
+        main = "${domain_name}"
+        sans = ["*.${domain_name}"]
+%{ endif ~}
+
   # Route /plugins to NHP Server for passcode login and auth
   [http.routers.nhp-plugins]
     rule = "PathPrefix(\`/plugins\`)"
@@ -1347,6 +1386,10 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
         main = "${domain_name}"
         sans = ["*.${domain_name}"]
 %{ endif ~}
+
+[http.middlewares]
+  [http.middlewares.nhp-ac-ready-internal-only.replacePath]
+    path = "/__nhp_ac_ready_internal_only"
 
 [http.services]
   # NHP Server HTTP for plugin endpoints (passcode login, auth)
@@ -2044,10 +2087,10 @@ systemctl start nhp-health-monitor
 # A Traefik that binds successfully here and then segfaults / wedges
 # later (kernel listener up, accept loop wedged, RSTs back to clients)
 # is invisible to this loop — `/ping:8080` would still return 200 from
-# whatever Traefik state holds the HTTP server thread, and the TG HC
-# stays green. Runtime liveness for the frps-control listener is the
-# job of #2007's post-deploy smoke (TCP+FRP handshake from a knocked-
-# in agent); don't conflate the two.
+# whatever Traefik state holds the HTTP server thread, and the
+# frps-control TG HC stays green. Runtime liveness for the frps-control
+# listener is the job of #2007's post-deploy smoke (TCP+FRP handshake
+# from a knocked-in agent); don't conflate the two.
 %{ if frp_control_upstream_host != "" || length(frp_control_additional_upstreams) > 0 ~}
 # Precheck: `nc` is validated at the top of user_data as a baked
 # netcat-openbsd dependency; keep this local guard so the loop below
@@ -2075,9 +2118,9 @@ for FRPS_CONTROL_PORT in ${join(" ", frp_control_listener_ports)}; do
     # endpoint still returns 200, and the ASG would keep this instance
     # in service indefinitely with a half-broken Traefik (every other
     # entrypoint up, frps-control silently dropping SYNs). Stopping the
-    # Traefik unit fails the `/ping:8080` TG healthcheck across BOTH
-    # the existing TG and the new `aws_lb_target_group.ac_frps_control`,
-    # so the NLB sheds load on every entrypoint, the ASG's
+    # Traefik unit fails every port-8080 TG health/readiness probe
+    # (including ac_tcp and `aws_lb_target_group.ac_frps_control`), so
+    # the NLB sheds load on every entrypoint, the ASG's
     # `ELB`-source HC marks the instance unhealthy, and a replacement
     # instance launches. Trade-off: this also takes the AC out of
     # service for QURL routing (which Traefik was serving fine) — but

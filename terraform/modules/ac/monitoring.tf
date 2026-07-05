@@ -805,9 +805,131 @@ resource "aws_cloudwatch_metric_alarm" "publisher_failures" {
   })
 }
 
+# Alarm on the public AC qURL/TLS target group itself, not the AC-published
+# ServersHealthy gauge. This catches the correlated fail-closed mode introduced
+# by admission-readiness target health: if every AC loses its assigned-server
+# path long enough for the NLB to shed them, qURL ingress is black-holed even
+# though the AC publisher's averaged ServersHealthy alarm may still be catching
+# up. In blue/green mode, the sibling metric-math alarm below watches both
+# colors together so a cold/drained standby color does not page while another
+# color still has healthy public AC capacity.
+#
+# Use Maximum rather than Minimum because this NLB is multi-AZ with cross-zone
+# load balancing enabled. HealthyHostCount is AZ-scoped before CloudWatch
+# aggregates it for the TargetGroup/LoadBalancer dimension pair; Maximum < 1 is
+# the "no AZ has a healthy target" invariant this alarm names, while Minimum < 1
+# can page on an enabled AZ with no registered target even though another AZ is
+# serving.
+#
+# Missing target-group datapoints are breaching by design. A full AC refresh that
+# deregisters every target can page after two one-minute periods; routine deploys
+# should preserve at least one active target, and the rollout ledger explicitly
+# validates the alarm route before prod.
+resource "aws_cloudwatch_metric_alarm" "ac_tg_no_healthy_targets" {
+  count = var.enable_cloudwatch_alarms && !var.enable_blue_green ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-tg-no-healthy"
+  alarm_description   = "Public AC qURL/TLS target group has no healthy targets; qURL ingress is unavailable or one health-check window away from being unavailable."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "HealthyHostCount"
+  namespace           = "AWS/NetworkELB"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    TargetGroup  = aws_lb_target_group.ac_tcp.arn_suffix
+    LoadBalancer = aws_lb.ac.arn_suffix
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-tg-no-healthy"
+  })
+}
+
+# Blue/green variant of ac_tg_no_healthy_targets. The listener's active color is
+# operational state in SSM, not Terraform state, and either color may be a
+# legitimate cold/drained standby. Alarm on total healthy target capacity across
+# both colors instead of hardcoding the blue TG, avoiding false pages after a
+# green switch while still catching the correlated fail-closed "no AC color can
+# serve qURL ingress" case this PR introduces. FILL each color to zero because
+# NLB HealthyHostCount can be missing, not zero, when a color has no registered
+# targets.
+resource "aws_cloudwatch_metric_alarm" "ac_tg_no_healthy_targets_any_color" {
+  count = var.enable_cloudwatch_alarms && var.enable_blue_green ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-tg-no-healthy"
+  alarm_description   = "Public AC qURL/TLS target groups have no healthy targets in any color; qURL ingress has no ready AC capacity."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  threshold           = 1
+  treat_missing_data  = "breaching"
+
+  metric_query {
+    id          = "healthy"
+    expression  = "FILL(blue, 0) + FILL(green, 0)"
+    label       = "Healthy AC targets across blue and green"
+    return_data = true
+  }
+
+  metric_query {
+    id          = "blue"
+    return_data = false
+
+    metric {
+      metric_name = "HealthyHostCount"
+      namespace   = "AWS/NetworkELB"
+      period      = 60
+      stat        = "Maximum"
+
+      dimensions = {
+        TargetGroup  = aws_lb_target_group.ac_tcp.arn_suffix
+        LoadBalancer = aws_lb.ac.arn_suffix
+      }
+    }
+  }
+
+  metric_query {
+    id          = "green"
+    return_data = false
+
+    metric {
+      metric_name = "HealthyHostCount"
+      namespace   = "AWS/NetworkELB"
+      period      = 60
+      stat        = "Maximum"
+
+      dimensions = {
+        TargetGroup  = aws_lb_target_group.ac_tcp_green[0].arn_suffix
+        LoadBalancer = aws_lb.ac.arn_suffix
+      }
+    }
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-tg-no-healthy"
+  })
+}
+
 # ==================== CloudWatch Dashboard ====================
 
 locals {
+  ac_tg_no_healthy_alarm_arns = var.enable_cloudwatch_alarms ? (
+    var.enable_blue_green ? [
+      aws_cloudwatch_metric_alarm.ac_tg_no_healthy_targets_any_color[0].arn
+      ] : [
+      aws_cloudwatch_metric_alarm.ac_tg_no_healthy_targets[0].arn
+    ]
+  ) : []
+
   # All EIP dashboard widgets. The list is always defined but only included
   # in the dashboard when var.enable_egress_eips is true (see
   # eip_dashboard_widgets below). The two-step definition is required because
@@ -1003,6 +1125,7 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
             aws_cloudwatch_metric_alarm.udp_handler_panic[0].arn,
             aws_cloudwatch_metric_alarm.l3_flush_schedule_wait_timeout[0].arn,
             ],
+            local.ac_tg_no_healthy_alarm_arns,
             var.enable_egress_eips ? [
               aws_cloudwatch_metric_alarm.eip_pool_utilization_high[0].arn,
               aws_cloudwatch_metric_alarm.eip_claim_failure[0].arn,

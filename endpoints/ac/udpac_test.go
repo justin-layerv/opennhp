@@ -1218,9 +1218,9 @@ func TestCloudModeSkipsFailOpen(t *testing.T) {
 // TestEbpfInfraExemptRules fences the FilterMode_EBPFXDP startup exemption set:
 // one sdwhitelist rule per server peer PLUS exactly one address-agnostic
 // protocol_port rule for the health-check port. The health-port rule is the
-// one whose absence fail-closed drops the NLB probe on Traefik's /ping, flaps
-// every AC target unhealthy, and black-holes the fleet — regressing it must
-// turn this test red.
+// one whose absence fail-closed drops the NLB probe before it can reach
+// Traefik's health entrypoint, flaps every AC target unhealthy, and black-holes
+// the fleet — regressing it must turn this test red.
 func TestEbpfInfraExemptRules(t *testing.T) {
 	cfg := &Config{
 		DefaultIp:       "10.100.0.57",

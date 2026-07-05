@@ -2781,15 +2781,29 @@ func (s *UdpServer) sendMessageRoutine() {
 			if !ok {
 				return
 			}
+			if md == nil {
+				// SendMessage rejects nil; this only protects direct channel
+				// misuse from taking down the sender goroutine.
+				log.Warning("sendMsgRoutine: received nil message")
+				continue
+			}
+			// Some diverted encrypted-packet sends carry PrevParserData without
+			// ConnData; those should fall through to the generic packet path
+			// rather than panic on a nil transaction lookup.
 			if md.PrevParserData != nil && s.device.IsTransactionResponse(md.HeaderType) {
-				// forward to a specific transaction
-				transaction := md.ConnData.FindRemoteTransaction(md.PrevParserData.SenderTrxId)
-				if transaction != nil {
-					if err := transaction.SendMessage(md); err != nil {
-						log.Warning("sendMsgRoutine: transaction %d closed before forward: %v", md.PrevParserData.SenderTrxId, err)
-						s.recordTransactionClosed(err)
+				if md.ConnData == nil {
+					log.Debug("sendMsgRoutine: sending %s response for transaction %d via generic packet path without ConnData",
+						core.HeaderTypeToString(md.HeaderType), md.PrevParserData.SenderTrxId)
+				} else {
+					// forward to a specific transaction
+					transaction := md.ConnData.FindRemoteTransaction(md.PrevParserData.SenderTrxId)
+					if transaction != nil {
+						if err := transaction.SendMessage(md); err != nil {
+							log.Warning("sendMsgRoutine: transaction %d closed before forward: %v", md.PrevParserData.SenderTrxId, err)
+							s.recordTransactionClosed(err)
+						}
+						continue
 					}
-					continue
 				}
 			}
 

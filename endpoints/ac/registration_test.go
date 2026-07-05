@@ -797,6 +797,11 @@ func TestACRegistration_ConnectedServerCount(t *testing.T) {
 	if got := reg.connectedServerCount(); got != 1 {
 		t.Errorf("expected 1 connected server after disconnect, got %v", got)
 	}
+
+	reg.assignedServers[2].SetConnected(false)
+	if got := reg.connectedServerCount(); got != 0 {
+		t.Errorf("expected 0 connected servers after disconnecting all, got %v", got)
+	}
 }
 
 func TestACRegistration_HealthyServerCount(t *testing.T) {
@@ -810,6 +815,9 @@ func TestACRegistration_HealthyServerCount(t *testing.T) {
 
 	if got := reg.healthyServerCount(); got != 0 {
 		t.Errorf("expected 0 healthy servers with empty list, got %v", got)
+	}
+	if reg.hasHealthyServer() {
+		t.Error("expected hasHealthyServer=false with empty assigned server list")
 	}
 
 	healthWindow := KeepaliveInterval * KeepaliveMaxRetries
@@ -831,11 +839,26 @@ func TestACRegistration_HealthyServerCount(t *testing.T) {
 	if got := reg.healthyServerCount(); got != 2 {
 		t.Errorf("expected 2 healthy servers, got %v", got)
 	}
+	if !reg.hasHealthyServer() {
+		t.Error("expected hasHealthyServer=true with at least one fresh connected server")
+	}
 
 	// Mark the stale server as recently seen -> becomes healthy.
 	reg.assignedServers[1].UpdateLastSeen()
 	if got := reg.healthyServerCount(); got != 3 {
 		t.Errorf("expected 3 healthy servers after UpdateLastSeen, got %v", got)
+	}
+
+	for _, server := range reg.assignedServers {
+		server.SetConnected(false)
+	}
+	if reg.hasHealthyServer() {
+		t.Error("expected hasHealthyServer=false after all assigned servers disconnect")
+	}
+
+	var nilReg *ACRegistration
+	if nilReg.hasHealthyServer() {
+		t.Error("nil registration must not report readiness")
 	}
 }
 
