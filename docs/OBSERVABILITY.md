@@ -83,6 +83,60 @@ The `classifyReason()` function bounds re-registration trigger reasons:
 | `connection_timeout` | General connection timeout |
 | `other` | Any unrecognized reason |
 
+## AC L3 Flush Metrics
+
+All AC L3 flush metrics include the AC shared dimensions. Netlink-specific
+conntrack metrics are flat (for always-registered gauges) or absent unless the
+AC is running `l3FlushConntrackBackend = "netlink"`.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `L3FlushConntrackDeleted` | Gauge | Cumulative conntrack entries deleted by the netlink backend. |
+| `L3FlushConntrackSlowDumps` | Gauge | Cumulative per-Flush dumps over the slow threshold. Use as a coarse fallback/authoritative-dump signal. |
+| `L3FlushConntrackDumpLatency` | Histogram (ms) | Successful per-Flush fallback/authoritative netlink dump duration distribution, published with CloudWatch `Values`/`Counts` so percentiles can be queried for the <=200us/op steady-state soak gate. Indexed fast-path Flushes, failed dump attempts, and startup/resync backfill dumps do not produce samples; dump errors/timeouts ride `L3FlushFlushErr` and breaker metrics. Values are rounded to microseconds and floored at `0.001` ms, so low percentiles are not sub-microsecond ground truth. |
+| `L3FlushConntrackDumpLatencyDropped` | Counter | Per-window delta of dump-latency samples dropped because the local histogram buffer filled before the publisher drained it. Alarm on period `Sum > 0`; nonzero means the matching histogram window is incomplete. Pair with `L3FlushConntrackDumpLatencyPublisherDropped` for generic publisher cap/invalid-sample drops. |
+| `L3FlushConntrackDumpLatencyPublisherDropped` | Counter | Generic histogram publisher guardrail for `L3FlushConntrackDumpLatency`: publisher cap overflow or invalid NaN/Inf samples filtered before `PutMetricData`. Alarm on period `Sum > 0` with `L3FlushConntrackDumpLatencyDropped`; steady state is zero and any datapoint means the histogram window is incomplete or instrumentation changed. |
+| `L3FlushConntrackDumpLatencyNegativeDurations` | Gauge | Cumulative impossible negative dump-duration measurements ignored before histogram buffering. The current `time.Since` call path cannot produce this; it is a future-caller/instrumentation guard. Steady state is zero; alarm on nonzero value or increase, not period sum. |
+| `L3FlushConntrackIndexedFlushes` | Gauge | Cumulative Flush calls served from the conntrack event index. |
+| `L3FlushConntrackIndexFallbackDumps` | Gauge | Cumulative Flush calls that fell back to the O(table) dump path because the event index was unavailable or unhealthy. |
+| `L3FlushConntrackIndexAuthoritativeDumps` | Gauge | Cumulative immediate-revocation Flush calls that intentionally used fresh kernel ground truth. |
+| `L3FlushConntrackIndexEventErrors` | Gauge | Cumulative conntrack multicast stream errors that disable indexed Flush until resync. |
+| `L3FlushConntrackIndexPendingOverflows` | Gauge | Cumulative startup pending-buffer overflows during event-index backfill. |
+| `L3FlushConntrackIndexEvents` | Gauge | Cumulative valid conntrack events observed by the event index. |
+| `L3FlushConntrackIndexOrigins` | Gauge | Current full-origin tuple count mirrored in userspace by the event index. |
+| `L3FlushConntrackIndexResyncAttempts` | Gauge | Cumulative runtime event-index resync attempts. |
+| `L3FlushConntrackIndexResyncSuccesses` | Gauge | Cumulative successful runtime event-index resyncs. |
+| `L3FlushConntrackIndexResyncFailures` | Gauge | Cumulative failed runtime event-index resyncs. |
+
+If the generic metrics publisher ever drops histogram samples after collection,
+or filters invalid NaN/Inf samples, it emits `<metric>PublisherDropped`. That
+generic signal intentionally merges those should-never-happen guardrail causes.
+For `L3FlushConntrackDumpLatency`, the AC-local cap intentionally matches the
+publisher cap and the producer emits finite values, so the reachable drop signal
+is the AC flusher's own `L3FlushConntrackDumpLatencyDropped`; a
+`L3FlushConntrackDumpLatencyPublisherDropped` datapoint would indicate a future
+producer exceeded or bypassed the generic publisher guardrails.
+
+At the 10k-sample cap with fully unique microsecond-rounded values, the
+histogram emits at most 67 `MetricDatum` entries, about four `PutMetricData`
+batches per netlink AC per 60s flush. That bounded cost is acceptable for the
+netlink soak; monitor `PublisherFailures` if fleet size or flush cadence changes.
+Histograms intentionally skip the EMF/stdout path and publish only through
+direct `PutMetricData` Values/Counts, so EMF-only consumers will not see this
+distribution.
+Do not treat a healthy `L3FlushConntrackDumpLatency` percentile by itself as
+proof that dump work is healthy: failed or timed-out dumps do not emit histogram
+samples, and startup/runtime resync backfill durations are intentionally outside
+both this histogram and `L3FlushConntrackSlowDumps`. Read the histogram with
+`L3FlushFlushErr`, breaker metrics, resync success/failure gauges, and the
+explicit backfill wall-time evidence required by the rollout gate.
+The histogram is best-effort per flush window: samples are drained from the AC
+buffer immediately before `PutMetricData`, so a failing publish batch is not
+replayed and should be read together with `PublisherFailures`. Companion
+counters emitted by the same drain are added to the same flush window, but still
+follow the publisher's normal counter checkpoint semantics across restarts
+because they use the regular counter plumbing.
+
 ## Publisher Infrastructure Metrics
 
 Emitted by the CloudWatch publisher itself (`endpoints/metrics/publisher.go`),

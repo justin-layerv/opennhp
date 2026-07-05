@@ -13,6 +13,7 @@ import (
 	conntrack "github.com/florianl/go-conntrack"
 	"golang.org/x/sys/unix"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
@@ -78,8 +79,12 @@ import (
 // runtime stream-loss recovery is restoring the hot path (#2946).
 // `L3FlushConntrackIndexEvents` proves the event stream is live, and
 // `L3FlushConntrackIndexOrigins` records the resident userspace mirror size.
-// `L3FlushConntrackSlowDumps` remains the latency signal for fallback,
-// authoritative, startup backfill, and resync backfill dumps.
+// `L3FlushConntrackDumpLatency` publishes the per-Flush dump latency
+// distribution, while `L3FlushConntrackSlowDumps` remains the coarse threshold
+// counter for fallback and authoritative dumps over ~1ms.
+// `L3FlushConntrackDumpLatencyNegativeDurations` surfaces impossible
+// monotonic-clock/instrumentation anomalies that were ignored before histogram
+// buffering.
 
 // defaultNetlinkOpTimeout is the hard ceiling for one netlink Flush when the
 // caller supplies no sooner ctx deadline. It caps socket acquisition, the dump,
@@ -100,6 +105,13 @@ const minNetlinkOpTimeout = time.Millisecond
 // enough that a table-size-knee regression shows up as a rising counter
 // during the soak.
 const netlinkSlowDumpThreshold = 1 * time.Millisecond
+
+// maxNetlinkDumpLatencySamples bounds the per-Flush dump-latency buffer drained
+// by the metrics publisher each flush interval. It intentionally derives from
+// the metrics publisher cap: for this producer, AC-local
+// L3FlushConntrackDumpLatencyDropped is the reachable drop signal, while
+// <metric>PublisherDropped remains a future-producer safety net.
+const maxNetlinkDumpLatencySamples = metrics.MaxHistogramSamples
 
 // defaultNetlinkIndexBackfillTimeout bounds the one-time startup dump that
 // seeds the #2908 event index with flows that existed before subscription and
@@ -429,7 +441,14 @@ func (f *ConntrackFlusher) flushNetlinkByDump(ctx context.Context, key FlowKey, 
 	}
 	defer f.pool.release(c)
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			unlocked = true
+			c.mu.Unlock()
+		}
+	}
+	defer unlock()
 	if err := ctx.Err(); err != nil {
 		// Keep cancellation clean if the caller's ctx flips after acquisition
 		// but before the first syscall.
@@ -439,9 +458,6 @@ func (f *ConntrackFlusher) flushNetlinkByDump(ctx context.Context, key FlowKey, 
 	cons, dumpDuration, err := f.dumpWithRetry(ctx, c, family, deadline, false)
 	if err != nil {
 		return fmt.Errorf("conntrack netlink dump for %s: %w", key, err)
-	}
-	if dumpDuration > netlinkSlowDumpThreshold {
-		f.netlinkSlowDumps.Add(1)
 	}
 
 	// Resolve the match spec ONCE — it depends only on key + family, both
@@ -461,6 +477,12 @@ func (f *ConntrackFlusher) flushNetlinkByDump(ctx context.Context, key FlowKey, 
 	}
 
 	deleted, _, firstErr := f.deleteMatchedOrigins(ctx, c, family, matchedOrigins, deadline, false)
+	unlock()
+
+	f.recordNetlinkDumpLatency(dumpDuration)
+	if dumpDuration > netlinkSlowDumpThreshold {
+		f.netlinkSlowDumps.Add(1)
+	}
 
 	if firstErr != nil {
 		return fmt.Errorf("conntrack netlink delete for %s (deleted %d/%d matched): %w", key, deleted, len(matchedOrigins), firstErr)
@@ -480,16 +502,30 @@ func (f *ConntrackFlusher) flushNetlinkIndexed(ctx context.Context, key FlowKey,
 	if err != nil {
 		return err
 	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			f.pool.release(c)
+		}
+	}
+	defer release()
 	c.mu.Lock()
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			unlocked = true
+			c.mu.Unlock()
+		}
+	}
+	defer unlock()
 	if err := ctx.Err(); err != nil {
-		c.mu.Unlock()
-		f.pool.release(c)
 		return err
 	}
 
 	deleted, deletedOrigins, firstErr := f.deleteMatchedOrigins(ctx, c, family, origins, deadline, true)
-	c.mu.Unlock()
-	f.pool.release(c)
+	unlock()
+	release()
 
 	// A resync can swap generations after this Flush took its origin snapshot.
 	// Removing from the current generation is still correct: missing keys are
@@ -575,6 +611,8 @@ func (f *ConntrackFlusher) rebuildEventIndex(ctx context.Context, idx *ctEventIn
 			return 0, err
 		}
 		c.mu.Lock()
+		// Backfill/resync dump latency is accepted from the rollout gate's wall-time
+		// evidence, not L3FlushConntrackDumpLatency's per-Flush histogram.
 		familyCons, _, dumpErr := f.dumpWithRetry(ctx, c, family, deadline, true)
 		c.mu.Unlock()
 		f.pool.release(c)

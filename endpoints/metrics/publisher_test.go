@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"slices"
 	"testing"
 	"time"
 
@@ -46,6 +48,7 @@ func TestPublisher_NilSafety(t *testing.T) {
 	mp.RecordLatency("test", 1.0)
 	mp.SetGauge("test", 42)
 	mp.RegisterGaugeFunc("test", func() float64 { return 1 })
+	mp.RegisterHistogramFunc("test", types.StandardUnitMilliseconds, func() []float64 { return nil })
 	mp.SetHealthProbe(func(ctx context.Context) bool { return true })
 	mp.Stop()
 	if got := mp.DimensionsForTest(t); got != nil {
@@ -144,6 +147,138 @@ func TestPublisher_RegisterGaugeFunc(t *testing.T) {
 	mp.mu.Unlock()
 	if val != 0 {
 		t.Errorf("expected ACPeerCount=0, got %v", val)
+	}
+}
+
+func TestPublisher_RegisterHistogramFunc(t *testing.T) {
+	mp := newTestPublisher(t, nil)
+
+	pending := []float64{0.125, 0.25, 0.25}
+	mp.RegisterHistogramFunc("ConntrackDumpDuration", types.StandardUnitMilliseconds, func() []float64 {
+		out := pending
+		pending = nil
+		return out
+	})
+
+	mp.collectHistograms()
+	mp.mu.Lock()
+	entry := mp.histograms["ConntrackDumpDuration"]
+	mp.mu.Unlock()
+	if entry == nil {
+		t.Fatal("expected ConntrackDumpDuration histogram to be collected")
+	}
+	if entry.unit != types.StandardUnitMilliseconds {
+		t.Errorf("histogram unit = %v, want Milliseconds", entry.unit)
+	}
+	if got, want := entry.values, []float64{0.125, 0.25, 0.25}; !slices.Equal(got, want) {
+		t.Errorf("histogram values = %v, want %v", got, want)
+	}
+
+	mp.collectHistograms()
+	mp.mu.Lock()
+	again := slices.Clone(mp.histograms["ConntrackDumpDuration"].values)
+	mp.mu.Unlock()
+	if got, want := again, []float64{0.125, 0.25, 0.25}; !slices.Equal(got, want) {
+		t.Errorf("second collect with empty drain changed values = %v, want %v", got, want)
+	}
+}
+
+func TestPublisher_RegisterHistogramFuncInitializesMaps(t *testing.T) {
+	mp := &Publisher{}
+	mp.RegisterHistogramFunc("DumpDuration", types.StandardUnitMilliseconds, func() []float64 {
+		return []float64{1.25}
+	})
+
+	mp.collectHistograms()
+	mp.mu.Lock()
+	entry := mp.histograms["DumpDuration"]
+	dropped := mp.counters[histogramPublisherDroppedMetricName("DumpDuration")]
+	mp.mu.Unlock()
+	if entry == nil {
+		t.Fatal("expected DumpDuration histogram to be collected")
+	}
+	if entry.unit != types.StandardUnitMilliseconds {
+		t.Errorf("histogram unit = %v, want Milliseconds", entry.unit)
+	}
+	if got, want := entry.values, []float64{1.25}; !slices.Equal(got, want) {
+		t.Errorf("histogram values = %v, want %v", got, want)
+	}
+	if dropped != 0 {
+		t.Errorf("%s = %v, want 0", histogramPublisherDroppedMetricName("DumpDuration"), dropped)
+	}
+}
+
+func TestPublisher_RegisterHistogramFuncUpdatesUnit(t *testing.T) {
+	mp := newTestPublisher(t, nil)
+	mp.RegisterHistogramFunc("DumpDuration", types.StandardUnitMilliseconds, func() []float64 {
+		return []float64{1}
+	})
+	mp.collectHistograms()
+
+	// Re-registration is last-unit-wins for buffered samples in the same flush
+	// window. Production registers once at startup, but keep the edge explicit.
+	mp.RegisterHistogramFunc("DumpDuration", types.StandardUnitSeconds, func() []float64 {
+		return []float64{2}
+	})
+	mp.collectHistograms()
+
+	mp.mu.Lock()
+	entry := mp.histograms["DumpDuration"]
+	mp.mu.Unlock()
+	if entry == nil {
+		t.Fatal("expected DumpDuration histogram to be collected")
+	}
+	if entry.unit != types.StandardUnitSeconds {
+		t.Errorf("histogram unit = %v, want Seconds", entry.unit)
+	}
+	if got, want := entry.values, []float64{1, 2}; !slices.Equal(got, want) {
+		t.Errorf("histogram values = %v, want %v", got, want)
+	}
+}
+
+func TestPublisher_HistogramCap(t *testing.T) {
+	mp := newTestPublisher(t, nil)
+
+	values := make([]float64, MaxHistogramSamples+2)
+	for i := range values {
+		values[i] = float64(i)
+	}
+	mp.RegisterHistogramFunc("DumpDuration", types.StandardUnitMilliseconds, func() []float64 {
+		return values
+	})
+
+	mp.collectHistograms()
+	mp.mu.Lock()
+	gotSamples := len(mp.histograms["DumpDuration"].values)
+	gotDropped := mp.counters[histogramPublisherDroppedMetricName("DumpDuration")]
+	mp.mu.Unlock()
+	if gotSamples != MaxHistogramSamples {
+		t.Errorf("histogram samples = %d, want cap %d", gotSamples, MaxHistogramSamples)
+	}
+	if gotDropped != 2 {
+		t.Errorf("%s = %v, want 2", histogramPublisherDroppedMetricName("DumpDuration"), gotDropped)
+	}
+}
+
+func TestPublisher_HistogramFiltersInvalidValuesAsPublisherDropped(t *testing.T) {
+	mp := newTestPublisher(t, nil)
+	mp.RegisterHistogramFunc("DumpDuration", types.StandardUnitMilliseconds, func() []float64 {
+		return []float64{math.NaN(), 0.2, math.Inf(1), 0.1, math.Inf(-1)}
+	})
+
+	mp.collectHistograms()
+	mp.mu.Lock()
+	entry := mp.histograms["DumpDuration"]
+	gotDropped := mp.counters[histogramPublisherDroppedMetricName("DumpDuration")]
+	mp.mu.Unlock()
+	if entry == nil {
+		t.Fatal("expected DumpDuration histogram to be collected")
+	}
+	if got, want := entry.values, []float64{0.2, 0.1}; !slices.Equal(got, want) {
+		t.Errorf("histogram values = %v, want %v", got, want)
+	}
+	if gotDropped != 3 {
+		t.Errorf("%s = %v, want 3", histogramPublisherDroppedMetricName("DumpDuration"), gotDropped)
 	}
 }
 
@@ -527,6 +662,7 @@ func TestPublisher_BuildMetricData(t *testing.T) {
 		dimCounters map[string]*dimCounterEntry
 		gauges      map[string]float64
 		latencies   map[string][]float64
+		histograms  map[string]*histogramEntry
 		wantCount   int
 		verify      func(t *testing.T, data []types.MetricDatum)
 	}{
@@ -610,6 +746,31 @@ func TestPublisher_BuildMetricData(t *testing.T) {
 			},
 		},
 		{
+			name: "histograms produce Values and Counts in their registered unit",
+			histograms: map[string]*histogramEntry{
+				"ConntrackDumpDuration": {
+					unit:   types.StandardUnitMilliseconds,
+					values: []float64{0.2, 0.1, 0.2, math.Inf(1), math.NaN()},
+				},
+			},
+			wantCount: 1,
+			verify: func(t *testing.T, data []types.MetricDatum) {
+				d := data[0]
+				if d.StatisticValues != nil || d.Value != nil {
+					t.Fatalf("ConntrackDumpDuration should use Values/Counts only, got StatisticValues=%v Value=%v", d.StatisticValues, d.Value)
+				}
+				if got, want := d.Values, []float64{0.1, 0.2}; !slices.Equal(got, want) {
+					t.Errorf("Values = %v, want %v", got, want)
+				}
+				if got, want := d.Counts, []float64{1, 2}; !slices.Equal(got, want) {
+					t.Errorf("Counts = %v, want %v", got, want)
+				}
+				if d.Unit != types.StandardUnitMilliseconds {
+					t.Errorf("unit = %v, want Milliseconds", d.Unit)
+				}
+			},
+		},
+		{
 			name:     "zero-value counters are skipped",
 			counters: map[string]float64{"active": 5, "zero": 0},
 			dimCounters: map[string]*dimCounterEntry{
@@ -638,10 +799,13 @@ func TestPublisher_BuildMetricData(t *testing.T) {
 			},
 			gauges:    map[string]float64{"StorageHealthy": 1.0},
 			latencies: map[string][]float64{"KnockLatency": {10.0, 20.0}},
-			wantCount: 5,
+			histograms: map[string]*histogramEntry{
+				"ConntrackDumpDuration": {unit: types.StandardUnitMilliseconds, values: []float64{0.2}},
+			},
+			wantCount: 6,
 			verify: func(t *testing.T, data []types.MetricDatum) {
 				byName := indexByName(data)
-				for _, name := range []string{"KnockRequest", "AuthSuccess", "RegistrationFailure", "StorageHealthy", "KnockLatency"} {
+				for _, name := range []string{"KnockRequest", "AuthSuccess", "RegistrationFailure", "StorageHealthy", "KnockLatency", "ConntrackDumpDuration"} {
 					if _, ok := byName[name]; !ok {
 						t.Errorf("missing expected metric %q", name)
 					}
@@ -661,7 +825,7 @@ func TestPublisher_BuildMetricData(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mp := &Publisher{dims: sharedDims, stop: make(chan struct{})}
-			data := mp.buildMetricData(knownTS, tt.counters, tt.dimCounters, tt.gauges, tt.latencies)
+			data := mp.buildMetricData(knownTS, tt.counters, tt.dimCounters, tt.gauges, tt.latencies, tt.histograms)
 			if len(data) != tt.wantCount {
 				t.Fatalf("expected %d metric datums, got %d", tt.wantCount, len(data))
 			}
@@ -691,20 +855,62 @@ func indexByName(data []types.MetricDatum) map[string]types.MetricDatum {
 	return m
 }
 
+func TestPublisher_BuildMetricData_HistogramChunksValuesCounts(t *testing.T) {
+	values := make([]float64, maxHistogramValuesPerDatum+1)
+	for i := range values {
+		values[i] = float64(i)
+	}
+	values = append(values, 42) // duplicate should increment count, not add a unique value.
+
+	mp := &Publisher{stop: make(chan struct{})}
+	data := mp.buildMetricData(testFlushInstant, nil, nil, nil, nil, map[string]*histogramEntry{
+		"DumpDuration": {
+			unit:   types.StandardUnitMilliseconds,
+			values: values,
+		},
+	})
+
+	if len(data) != 2 {
+		t.Fatalf("expected 2 histogram datums for %d unique values, got %d", maxHistogramValuesPerDatum+1, len(data))
+	}
+	if len(data[0].Values) != maxHistogramValuesPerDatum {
+		t.Fatalf("first histogram datum Values len = %d, want %d", len(data[0].Values), maxHistogramValuesPerDatum)
+	}
+	if len(data[1].Values) != 1 {
+		t.Fatalf("second histogram datum Values len = %d, want 1", len(data[1].Values))
+	}
+	if len(data[0].Counts) != len(data[0].Values) || len(data[1].Counts) != len(data[1].Values) {
+		t.Fatalf("Counts length must match Values length: first %d/%d second %d/%d",
+			len(data[0].Counts), len(data[0].Values), len(data[1].Counts), len(data[1].Values))
+	}
+	for _, d := range data {
+		for i, value := range d.Values {
+			if value == 42 && d.Counts[i] != 2 {
+				t.Fatalf("count for duplicate value 42 = %v, want 2", d.Counts[i])
+			}
+		}
+		if d.Timestamp == nil || !d.Timestamp.Equal(testFlushInstant) {
+			t.Fatalf("histogram datum timestamp = %v, want %s", d.Timestamp, testFlushInstant.Format(time.RFC3339Nano))
+		}
+	}
+}
+
 // newTestPublisher creates a Publisher with initialized maps for testing.
 // Pass nil for client to test nil-client paths.
 func newTestPublisher(t *testing.T, client cloudWatchClient) *Publisher {
 	t.Helper()
 	return &Publisher{
-		client:      client,
-		namespace:   "LayerV/NHP",
-		counters:    make(map[string]float64),
-		dimCounters: make(map[string]*dimCounterEntry),
-		gauges:      make(map[string]float64),
-		latencies:   make(map[string][]float64),
-		gaugeFuncs:  make(map[string]GaugeFunc),
-		stop:        make(chan struct{}),
-		emfWriter:   io.Discard,
+		client:         client,
+		namespace:      "LayerV/NHP",
+		counters:       make(map[string]float64),
+		dimCounters:    make(map[string]*dimCounterEntry),
+		gauges:         make(map[string]float64),
+		latencies:      make(map[string][]float64),
+		histograms:     make(map[string]*histogramEntry),
+		gaugeFuncs:     make(map[string]GaugeFunc),
+		histogramFuncs: make(map[string]histogramFuncEntry),
+		stop:           make(chan struct{}),
+		emfWriter:      io.Discard,
 	}
 }
 
@@ -846,6 +1052,53 @@ func TestPublisher_Flush_IncludesGaugeEmittedCountersInSameWindow(t *testing.T) 
 	}
 	if usage.Unit != types.StandardUnitNone {
 		t.Errorf("ConntrackUsage unit = %v, want None", usage.Unit)
+	}
+}
+
+func TestPublisher_Flush_IncludesHistogramEmittedCountersInSameWindow(t *testing.T) {
+	mockCW := &mockCloudWatchClient{}
+	mp := newTestPublisher(t, mockCW)
+	mp.dims = []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String("sandbox")},
+	}
+	mp.RegisterHistogramFunc("ConntrackDumpDuration", types.StandardUnitMilliseconds, func() []float64 {
+		mp.AddCounterWithDims("ConntrackDumpDurationDropped", 2, nil)
+		return []float64{1.5, 0.2, 1.5}
+	})
+
+	mp.collectHistograms()
+	mp.flush()
+
+	if len(mockCW.calls) != 1 {
+		t.Fatalf("expected 1 PutMetricData call, got %d", len(mockCW.calls))
+	}
+	byName := indexByName(mockCW.calls[0].MetricData)
+	dropped, ok := byName["ConntrackDumpDurationDropped"]
+	if !ok {
+		t.Fatalf("ConntrackDumpDurationDropped counter emitted from histogram func missing from same flush: %+v", mockCW.calls[0].MetricData)
+	}
+	if got := aws.ToFloat64(dropped.Value); got != 2 {
+		t.Errorf("ConntrackDumpDurationDropped value = %v, want 2", got)
+	}
+	if dropped.Unit != types.StandardUnitCount {
+		t.Errorf("ConntrackDumpDurationDropped unit = %v, want Count", dropped.Unit)
+	}
+
+	hist, ok := byName["ConntrackDumpDuration"]
+	if !ok {
+		t.Fatalf("ConntrackDumpDuration histogram missing from same flush: %+v", mockCW.calls[0].MetricData)
+	}
+	if hist.Unit != types.StandardUnitMilliseconds {
+		t.Errorf("ConntrackDumpDuration unit = %v, want Milliseconds", hist.Unit)
+	}
+	if got, want := hist.Values, []float64{0.2, 1.5}; !slices.Equal(got, want) {
+		t.Errorf("ConntrackDumpDuration Values = %v, want %v", got, want)
+	}
+	if got, want := hist.Counts, []float64{1, 2}; !slices.Equal(got, want) {
+		t.Errorf("ConntrackDumpDuration Counts = %v, want %v", got, want)
+	}
+	if hist.Timestamp == nil || dropped.Timestamp == nil || !hist.Timestamp.Equal(*dropped.Timestamp) {
+		t.Errorf("histogram/counter timestamps = %v/%v, want same flush timestamp", hist.Timestamp, dropped.Timestamp)
 	}
 }
 

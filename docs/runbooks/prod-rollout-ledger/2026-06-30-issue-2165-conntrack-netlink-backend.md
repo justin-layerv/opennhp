@@ -54,7 +54,14 @@ pressure tripped the pending cap), `L3FlushConntrackIndexResyncAttempts`,
 `L3FlushConntrackIndexResyncFailures` (runtime #2946 recovery),
 `L3FlushConntrackIndexEvents` (event-stream liveness),
 `L3FlushConntrackIndexOrigins` (resident userspace mirror cardinality),
-`L3FlushConntrackSlowDumps` (fallback/authoritative/backfill dumps over ~1ms),
+`L3FlushConntrackDumpLatency` (per-Flush dump latency distribution in ms for
+CloudWatch percentile reads; fallback/authoritative Flush dumps only, not
+startup/resync backfill dumps), `L3FlushConntrackDumpLatencyDropped` (histogram
+samples dropped from the AC-local buffer before publish; period-Sum delta),
+`L3FlushConntrackDumpLatencyNegativeDurations` (impossible clock/instrumentation
+anomalies ignored before histogram buffering; cumulative gauge),
+`L3FlushConntrackSlowDumps`
+(fallback/authoritative dumps over ~1ms),
 and the existing breaker/`FlushErr` series. During populated-table characterization,
 `IndexedFlushes` should rise with deletes, `IndexEvents` should advance when the
 conntrack table churns, `IndexOrigins` should match the expected table
@@ -142,7 +149,12 @@ a minimum interval, so sustained event loss should show bounded
       `L3FlushConntrackIndexResyncSuccesses`,
       `L3FlushConntrackIndexResyncFailures`,
       `L3FlushConntrackIndexEvents`, `L3FlushConntrackIndexOrigins`,
-      `L3FlushConntrackSlowDumps`, AC process RSS/Go heap, and GC pause. Record
+      `L3FlushConntrackDumpLatency` p50/p95/p99/p999,
+      `L3FlushConntrackDumpLatencyDropped`,
+      `L3FlushConntrackDumpLatencyPublisherDropped`,
+      `L3FlushConntrackDumpLatencyNegativeDurations`,
+      `L3FlushConntrackSlowDumps`, `PublisherFailures`, AC process RSS/Go heap,
+      and GC pause. Record
       the steady-state resident index cost at the target cardinality, not just
       transient dump allocation, because the #2908 index intentionally trades
       repeated O(table) dumps for a full userspace origin mirror.
@@ -150,6 +162,24 @@ a minimum interval, so sustained event loss should show bounded
       target cardinality; a startup that leaves `IndexOrigins = 0` with
       `L3FlushConntrackIndexPendingOverflows`/event errors means the hot path
       failed to arm and cannot support the #2908 throughput claim.
+      `L3FlushConntrackDumpLatency` intentionally proves only steady-state
+      fallback/authoritative `Flush` dump cost; startup/resync backfill dumps
+      are excluded from that histogram and must be accepted or rejected from the
+      backfill wall-time measurement here. A clean percentile envelope alone is
+      not sufficient: failed/timed-out dumps do not sample the histogram, so
+      `FlushErr`/breaker pressure must stay flat while the histogram is healthy.
+      Treat a `L3FlushConntrackDumpLatency` gap during a window with
+      `PublisherFailures > 0` as best-effort publish loss, not proof that no
+      fallback/authoritative dumps occurred.
+      Evaluate `L3FlushConntrackDumpLatencyDropped` and
+      `L3FlushConntrackDumpLatencyPublisherDropped` as per-window deltas, and
+      `L3FlushConntrackDumpLatencyNegativeDurations` as a cumulative value or
+      increase; all three should remain zero.
+      During the first populated-table soak window with more than 150 unique
+      dump-latency values, sanity-check that CloudWatch p50/p95/p99 aggregate
+      across the metric's multiple same-timestamp `Values`/`Counts` datums.
+      Use p50/p95/p99/p999 for acceptance, not min/p0, because the histogram
+      intentionally floors zero or sub-microsecond dumps at `0.001` ms.
       Record the startup backfill dump wall time against the 30s
       `defaultNetlinkIndexBackfillTimeout` budget so the soak distinguishes a
       steady-state throughput win from a startup-availability cliff. Startup
@@ -217,8 +247,20 @@ a minimum interval, so sustained event loss should show bounded
       `L3FlushConntrackIndexPendingOverflows`,
       `L3FlushConntrackIndexResyncFailures`, and post-startup
       `L3FlushConntrackSlowDumps` stay flat except for recorded authoritative
-      dumps. If an event-index error is
-      injected, expect `L3FlushConntrackIndexEventErrors` to move and verify
+      dumps; `L3FlushConntrackDumpLatency` stays within the accepted percentile
+      envelope, `L3FlushConntrackDumpLatencyDropped` remains zero,
+      `L3FlushConntrackDumpLatencyPublisherDropped` remains zero,
+      `L3FlushConntrackDumpLatencyNegativeDurations` remains zero, and
+      `PublisherFailures` remains zero. Treat those histogram percentiles as
+      accepted only when `FlushErr` and breaker pressure are also flat and the
+      separate startup/resync backfill wall-time evidence remains within budget.
+      Before accepting the prod flip, record the post-soak retention decision
+      for `L3FlushConntrackDumpLatency` and its three guardrail signals
+      (`...Dropped`, `...PublisherDropped`, `...NegativeDurations`): either keep
+      them with named alarm/dashboard ownership, or file a labelled follow-up
+      issue to retire the soak-only signals once the netlink backend is proven.
+      If an event-index error is injected, expect
+      `L3FlushConntrackIndexEventErrors` to move and verify
       `L3FlushConntrackIndexResyncAttempts` and
       `L3FlushConntrackIndexResyncSuccesses` advance, event-loss fallback dumps
       stop after the rebuilt generation is installed, and no teardown miss

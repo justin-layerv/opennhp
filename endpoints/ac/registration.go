@@ -493,6 +493,23 @@ const (
 	// revocations are forcing authoritative dumps, or both).
 	// Same backend gating as MetricL3FlushConntrackDeleted.
 	MetricL3FlushConntrackSlowDumps = "L3FlushConntrackSlowDumps"
+	// MetricL3FlushConntrackDumpLatency is the per-Flush netlink conntrack dump
+	// duration distribution, published as CloudWatch Values/Counts in
+	// milliseconds so percentile gates can be read during the #2165/#2908 soak.
+	// It includes fallback and authoritative Flush dumps, not indexed fast-path
+	// Flushes or one-time startup/resync backfill dumps. Rollout sign-off must
+	// judge backfill wall time separately. Only successful dump attempts produce
+	// samples; dump errors and timeouts ride L3FlushFlushErr/breaker metrics.
+	MetricL3FlushConntrackDumpLatency = "L3FlushConntrackDumpLatency"
+	// MetricL3FlushConntrackDumpLatencyDropped counts dump-latency samples that
+	// were dropped because the ConntrackFlusher's local histogram buffer filled
+	// before the metrics publisher drained it. Nonzero means the corresponding
+	// latency distribution is incomplete for that flush window.
+	MetricL3FlushConntrackDumpLatencyDropped = "L3FlushConntrackDumpLatencyDropped"
+	// MetricL3FlushConntrackDumpLatencyNegativeDurations counts impossible
+	// negative dump-duration measurements ignored before histogram buffering.
+	// Nonzero indicates a monotonic-clock or instrumentation anomaly.
+	MetricL3FlushConntrackDumpLatencyNegativeDurations = "L3FlushConntrackDumpLatencyNegativeDurations"
 	// MetricL3FlushConntrackIndexedFlushes is the cumulative count of netlink
 	// Flush calls served from the conntrack event index (#2908), i.e. the
 	// O(matches) path that avoids the per-Flush O(table) dump.
@@ -1409,6 +1426,10 @@ func (r *ACRegistration) Start() error {
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackSkipped, r.l3FlushConntrackSkippedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackDeleted, r.l3FlushConntrackDeletedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackSlowDumps, r.l3FlushConntrackSlowDumpsGauge)
+	// This drain also emits L3FlushConntrackDumpLatencyDropped, so the
+	// histogram samples and local drop counter stay tied to one buffer drain.
+	r.metrics.RegisterHistogramFunc(MetricL3FlushConntrackDumpLatency, types.StandardUnitMilliseconds, r.l3FlushConntrackDumpLatencyHistogram)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackDumpLatencyNegativeDurations, r.l3FlushConntrackDumpLatencyNegativeDurationsGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexedFlushes, r.l3FlushConntrackIndexedFlushesGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexFallbackDumps, r.l3FlushConntrackIndexFallbackDumpsGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushConntrackIndexAuthoritativeDumps, r.l3FlushConntrackIndexAuthoritativeDumpsGauge)
@@ -1708,6 +1729,46 @@ func (r *ACRegistration) l3FlushConntrackSlowDumpsGauge() float64 {
 	}
 	// Same float64 gauge boundary as l3FlushConntrackDeletedGauge; the
 	// counter remains exact for any realistic AC-process lifetime.
+	return float64(count)
+}
+
+// l3FlushConntrackDumpLatencyHistogram drains per-Flush netlink dump durations
+// from the ConntrackFlusher. Values are milliseconds, so sub-millisecond soak
+// gates remain visible in CloudWatch percentile queries. Values are rounded to
+// the nearest microsecond and floored at 0.001ms, so use low percentiles as a
+// positive-floor view rather than sub-microsecond ground truth. This drain may
+// emit the local drop companion counter so both signals share one flush window
+// when a metrics publisher is available.
+func (r *ACRegistration) l3FlushConntrackDumpLatencyHistogram() []float64 {
+	if r == nil || r.ac == nil {
+		return nil
+	}
+	values, dropped, ok := r.ac.DrainConntrackNetlinkDumpLatenciesMillis()
+	if !ok {
+		return nil
+	}
+	if dropped > 0 {
+		// Production registration wires this drain through a non-nil metrics
+		// publisher. Direct tests or defensive calls without one still consume
+		// drops so the flusher buffer remains bounded, but have no counter sink.
+		if r.metrics != nil {
+			// AddCounterWithDims is the public arbitrary-value counter API. This
+			// is a per-drain delta tied to the histogram's best-effort flush
+			// window; nil extra dims publishes with the shared counter dims.
+			r.metrics.AddCounterWithDims(MetricL3FlushConntrackDumpLatencyDropped, float64(dropped), nil)
+		}
+	}
+	return values
+}
+
+func (r *ACRegistration) l3FlushConntrackDumpLatencyNegativeDurationsGauge() float64 {
+	if r == nil || r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.ConntrackNetlinkDumpLatencyNegativeDurationCount()
+	if !ok {
+		return 0
+	}
 	return float64(count)
 }
 

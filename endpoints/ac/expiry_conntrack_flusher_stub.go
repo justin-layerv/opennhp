@@ -51,6 +51,16 @@ func (f *ConntrackFlusher) NetlinkDeletedCount() uint64 { return 0 }
 // cross-platform metrics-gauge reason as NetlinkDeletedCount.
 func (f *ConntrackFlusher) NetlinkSlowDumpCount() uint64 { return 0 }
 
+// NetlinkDumpLatencyNegativeDurationCount is 0 on non-Linux. Present for the
+// same cross-platform metrics-gauge reason as NetlinkDeletedCount.
+func (f *ConntrackFlusher) NetlinkDumpLatencyNegativeDurationCount() uint64 { return 0 }
+
+// DrainNetlinkDumpLatenciesMillis is empty on non-Linux. Present for the same
+// cross-platform metrics reason as NetlinkDeletedCount.
+func (f *ConntrackFlusher) DrainNetlinkDumpLatenciesMillis() ([]float64, uint64) {
+	return nil, 0
+}
+
 // NetlinkIndexedFlushCount is 0 on non-Linux. Present for the same
 // cross-platform metrics-gauge reason as NetlinkDeletedCount.
 func (f *ConntrackFlusher) NetlinkIndexedFlushCount() uint64 { return 0 }

@@ -93,7 +93,10 @@ must update this list and audit all existing call sites.
   backend intentionally avoids nesting `ctConn.mu` and `ctEventIndex.mu`; resync
   may take `netlinkIndexResyncMu` before pooled-socket work and before swapping
   `eventIndexMu`, and no path takes the reverse order. The event-index
-  `onUnhealthy` callback fires only after `ctEventIndex.mu` is released. None of
+  `onUnhealthy` callback fires only after `ctEventIndex.mu` is released. The
+  dump-latency buffer's `netlinkDumpLatenciesMu` guards only buffered histogram
+  samples and the local drop counter; append and drain paths take it briefly and
+  never while calling netlink operations or metrics publisher callbacks. None of
   these locks call back into
   `UdpAC`, `ACRegistration`, metrics publisher locks, tokenstore, or scheduler
   locks. Keep them leaf-most; future changes that invoke AC callbacks while

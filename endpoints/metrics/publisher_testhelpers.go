@@ -29,14 +29,16 @@ import (
 func NewPublisherForTest(t testing.TB) *Publisher {
 	t.Helper()
 	return &Publisher{
-		namespace:   "LayerV/NHP",
-		counters:    make(map[string]float64),
-		dimCounters: make(map[string]*dimCounterEntry),
-		gauges:      make(map[string]float64),
-		latencies:   make(map[string][]float64),
-		gaugeFuncs:  make(map[string]GaugeFunc),
-		stop:        make(chan struct{}),
-		emfWriter:   io.Discard,
+		namespace:      "LayerV/NHP",
+		counters:       make(map[string]float64),
+		dimCounters:    make(map[string]*dimCounterEntry),
+		gauges:         make(map[string]float64),
+		latencies:      make(map[string][]float64),
+		histograms:     make(map[string]*histogramEntry),
+		gaugeFuncs:     make(map[string]GaugeFunc),
+		histogramFuncs: make(map[string]histogramFuncEntry),
+		stop:           make(chan struct{}),
+		emfWriter:      io.Discard,
 	}
 }
 

@@ -17,6 +17,8 @@ import (
 
 	conntrack "github.com/florianl/go-conntrack"
 	"golang.org/x/sys/unix"
+
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 )
 
 // These two tests cover the pure helpers of the netlink datapath and need
@@ -307,6 +309,78 @@ func TestFlushNetlinkFakeOpsDeletesMatchingAndCounts(t *testing.T) {
 	}
 	if got := f.NetlinkSlowDumpCount(); got != 1 {
 		t.Fatalf("NetlinkSlowDumpCount = %d, want 1", got)
+	}
+	if got := f.NetlinkDumpLatencyNegativeDurationCount(); got != 0 {
+		t.Fatalf("NetlinkDumpLatencyNegativeDurationCount = %d, want 0", got)
+	}
+	samples, dropped := f.DrainNetlinkDumpLatenciesMillis()
+	if dropped != 0 {
+		t.Fatalf("DrainNetlinkDumpLatenciesMillis dropped = %d, want 0", dropped)
+	}
+	if len(samples) != 1 {
+		t.Fatalf("DrainNetlinkDumpLatenciesMillis samples = %v, want one sample", samples)
+	}
+	if samples[0] <= 0 {
+		t.Fatalf("dump-latency sample = %v, want positive milliseconds", samples[0])
+	}
+	samples, dropped = f.DrainNetlinkDumpLatenciesMillis()
+	if len(samples) != 0 || dropped != 0 {
+		t.Fatalf("second DrainNetlinkDumpLatenciesMillis = samples %v dropped %d, want empty/0", samples, dropped)
+	}
+}
+
+func TestConntrackFlusherNetlinkDumpLatencyBufferDrops(t *testing.T) {
+	f := &ConntrackFlusher{backend: BackendNetlink}
+	for i := 0; i < maxNetlinkDumpLatencySamples+2; i++ {
+		f.recordNetlinkDumpLatency(time.Duration(i+1) * time.Microsecond)
+	}
+	samples, dropped := f.DrainNetlinkDumpLatenciesMillis()
+	if len(samples) != maxNetlinkDumpLatencySamples {
+		t.Fatalf("dump-latency samples = %d, want cap %d", len(samples), maxNetlinkDumpLatencySamples)
+	}
+	if dropped != 2 {
+		t.Fatalf("dump-latency dropped = %d, want 2", dropped)
+	}
+	samples, dropped = f.DrainNetlinkDumpLatenciesMillis()
+	if len(samples) != 0 || dropped != 0 {
+		t.Fatalf("second drain = samples %d dropped %d, want empty/0", len(samples), dropped)
+	}
+}
+
+func TestConntrackFlusherNetlinkDumpLatencyCapMatchesPublisher(t *testing.T) {
+	// Keep this producer at or below the publisher cap so collectHistograms
+	// never truncates an AC window and biases percentiles toward early samples.
+	// Exact equality is intentional: a smaller producer cap would lower the
+	// soak's per-window sample ceiling without a matching publisher reason.
+	if maxNetlinkDumpLatencySamples != metrics.MaxHistogramSamples {
+		t.Fatalf("maxNetlinkDumpLatencySamples = %d, want publisher cap %d", maxNetlinkDumpLatencySamples, metrics.MaxHistogramSamples)
+	}
+}
+
+func TestConntrackFlusherNetlinkDumpLatencyZeroAndNegativeBuckets(t *testing.T) {
+	f := &ConntrackFlusher{backend: BackendNetlink}
+	f.recordNetlinkDumpLatency(100 * time.Nanosecond)
+	f.recordNetlinkDumpLatency(0)
+	f.recordNetlinkDumpLatency(-time.Nanosecond)
+	f.recordNetlinkDumpLatency(-2 * time.Nanosecond)
+
+	samples, dropped := f.DrainNetlinkDumpLatenciesMillis()
+	if dropped != 0 {
+		t.Fatalf("dump-latency dropped = %d, want 0", dropped)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("dump-latency samples = %v, want positive sub-us and zero-measured samples", samples)
+	}
+	for i, sample := range samples {
+		if sample != 0.001 {
+			t.Fatalf("dump-latency sample[%d] = %v ms, want 0.001 ms", i, sample)
+		}
+	}
+	if got := f.netlinkDumpLatencyNegativeDurations.Load(); got != 2 {
+		t.Fatalf("negative dump-latency measurements = %d, want 2", got)
+	}
+	if got := f.NetlinkDumpLatencyNegativeDurationCount(); got != 2 {
+		t.Fatalf("NetlinkDumpLatencyNegativeDurationCount = %d, want 2", got)
 	}
 }
 
@@ -1119,6 +1193,10 @@ func TestFlushNetlinkIndexedUsesIndexWithoutDump(t *testing.T) {
 	}
 	if got := f.NetlinkDeletedCount(); got != 1 {
 		t.Fatalf("NetlinkDeletedCount = %d, want 1", got)
+	}
+	samples, dropped := f.DrainNetlinkDumpLatenciesMillis()
+	if len(samples) != 0 || dropped != 0 {
+		t.Fatalf("indexed Flush dump latency samples = %v dropped %d, want empty/0", samples, dropped)
 	}
 	origins, ok := idx.originsForKey(key)
 	if !ok {
@@ -1965,6 +2043,67 @@ func TestL3FlushConntrackSkippedGauge(t *testing.T) {
 
 	if got := reg.l3FlushConntrackSkippedGauge(); got != 2 {
 		t.Fatalf("l3FlushConntrackSkippedGauge = %v, want 2", got)
+	}
+}
+
+func TestL3FlushConntrackDumpLatencyHistogram(t *testing.T) {
+	cf := &ConntrackFlusher{backend: BackendNetlink}
+	cf.recordNetlinkDumpLatency(200 * time.Microsecond)
+	cf.recordNetlinkDumpLatency(1500 * time.Microsecond)
+	cf.netlinkDumpLatenciesMu.Lock()
+	cf.netlinkDumpLatenciesDropped = 3
+	cf.netlinkDumpLatenciesMu.Unlock()
+	ac := &UdpAC{config: &Config{ACId: "test-ac"}}
+	ac.conntrackFlusher.Store(cf)
+	reg := &ACRegistration{ac: ac, metrics: metrics.NewPublisherForTest(t)}
+
+	samples := reg.l3FlushConntrackDumpLatencyHistogram()
+	if len(samples) != 2 {
+		t.Fatalf("l3FlushConntrackDumpLatencyHistogram samples = %v, want 2 samples", samples)
+	}
+	if samples[0] != 0.2 || samples[1] != 1.5 {
+		t.Fatalf("l3FlushConntrackDumpLatencyHistogram samples = %v, want [0.2 1.5]", samples)
+	}
+	_, dimCounters := reg.metrics.CountersForTest(t)
+	if got := dimCounters[MetricL3FlushConntrackDumpLatencyDropped]; got != 3 {
+		t.Fatalf("%s = %v, want 3", MetricL3FlushConntrackDumpLatencyDropped, got)
+	}
+	if again := reg.l3FlushConntrackDumpLatencyHistogram(); len(again) != 0 {
+		t.Fatalf("second l3FlushConntrackDumpLatencyHistogram samples = %v, want empty", again)
+	}
+}
+
+func TestL3FlushConntrackDumpLatencyNegativeDurationsGauge(t *testing.T) {
+	cf := &ConntrackFlusher{backend: BackendNetlink}
+	cf.recordNetlinkDumpLatency(-time.Nanosecond)
+	cf.recordNetlinkDumpLatency(-2 * time.Nanosecond)
+
+	ac := &UdpAC{}
+	ac.conntrackFlusher.Store(cf)
+	reg := &ACRegistration{ac: ac}
+
+	if got := reg.l3FlushConntrackDumpLatencyNegativeDurationsGauge(); got != 2 {
+		t.Fatalf("l3FlushConntrackDumpLatencyNegativeDurationsGauge = %v, want 2", got)
+	}
+}
+
+func TestL3FlushConntrackDumpLatencyHistogramDrainsWithoutMetrics(t *testing.T) {
+	cf := &ConntrackFlusher{backend: BackendNetlink}
+	cf.recordNetlinkDumpLatency(200 * time.Microsecond)
+	cf.netlinkDumpLatenciesMu.Lock()
+	cf.netlinkDumpLatenciesDropped = 3
+	cf.netlinkDumpLatenciesMu.Unlock()
+	ac := &UdpAC{config: &Config{ACId: "test-ac"}}
+	ac.conntrackFlusher.Store(cf)
+	reg := &ACRegistration{ac: ac}
+
+	samples := reg.l3FlushConntrackDumpLatencyHistogram()
+	if len(samples) != 1 || samples[0] != 0.2 {
+		t.Fatalf("l3FlushConntrackDumpLatencyHistogram without metrics = %v, want [0.2]", samples)
+	}
+	samples, dropped := cf.DrainNetlinkDumpLatenciesMillis()
+	if len(samples) != 0 || dropped != 0 {
+		t.Fatalf("DrainNetlinkDumpLatenciesMillis after nil-metrics call = samples %v dropped %d, want empty/0", samples, dropped)
 	}
 }
 

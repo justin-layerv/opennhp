@@ -93,6 +93,18 @@ type ConntrackFlusher struct {
 	// Zero on the exec backend.
 	netlinkSlowDumps atomic.Uint64
 
+	// netlinkDumpLatenciesMillis stores successful per-Flush dump durations for
+	// CloudWatch Values/Counts histogram publishing. Samples are drained by the
+	// metrics publisher; the mutex protects both the sample buffer and local
+	// drop count. The buffer is capped so an unhealthy index cannot grow AC
+	// memory without bound while CloudWatch is between flushes.
+	netlinkDumpLatenciesMu      sync.Mutex
+	netlinkDumpLatenciesMillis  []float64
+	netlinkDumpLatenciesDropped uint64
+	// netlinkDumpLatencyNegativeDurations counts impossible negative measurements
+	// and gates the warning so a clock anomaly is visible without log spam.
+	netlinkDumpLatencyNegativeDurations atomic.Uint64
+
 	// eventIndex is the #2908 source-port/full-origin index fed by conntrack
 	// multicast events. When healthy, BackendNetlink Flush uses it to avoid the
 	// O(table) dump and delete only origins already known for the FlowKey. If
@@ -390,6 +402,62 @@ func (f *ConntrackFlusher) NetlinkDeletedCount() uint64 {
 // backend. Read by the L3FlushConntrackSlowDumps gauge.
 func (f *ConntrackFlusher) NetlinkSlowDumpCount() uint64 {
 	return f.netlinkSlowDumps.Load()
+}
+
+// NetlinkDumpLatencyNegativeDurationCount returns the cumulative number of
+// impossible negative dump-duration measurements ignored before histogram
+// buffering. Always 0 on the exec backend.
+func (f *ConntrackFlusher) NetlinkDumpLatencyNegativeDurationCount() uint64 {
+	return f.netlinkDumpLatencyNegativeDurations.Load()
+}
+
+func (f *ConntrackFlusher) recordNetlinkDumpLatency(duration time.Duration) {
+	if f == nil {
+		return
+	}
+	if duration < 0 {
+		// Log only the first anomaly to avoid noisy loops; the cumulative gauge
+		// carries recurrence for alarms and triage.
+		if f.netlinkDumpLatencyNegativeDurations.Add(1) == 1 {
+			log.Warning("[ConntrackFlusher] negative netlink dump latency ignored — duration=%s; cumulative count is published as L3FlushConntrackDumpLatencyNegativeDurations", duration)
+		}
+		return
+	}
+	// Round to microseconds before converting to milliseconds. This preserves
+	// sub-ms gate visibility while giving CloudWatch Values/Counts useful
+	// collisions to compact in busy flush windows. Zero-measured or positive
+	// sub-microsecond dumps are clamped into the smallest positive bucket instead
+	// of publishing exact 0ms samples.
+	rounded := duration.Round(time.Microsecond)
+	if rounded <= 0 {
+		rounded = time.Microsecond
+	}
+	ms := float64(rounded) / float64(time.Millisecond)
+	f.netlinkDumpLatenciesMu.Lock()
+	if len(f.netlinkDumpLatenciesMillis) < maxNetlinkDumpLatencySamples {
+		f.netlinkDumpLatenciesMillis = append(f.netlinkDumpLatenciesMillis, ms)
+	} else {
+		f.netlinkDumpLatenciesDropped++
+	}
+	f.netlinkDumpLatenciesMu.Unlock()
+}
+
+// DrainNetlinkDumpLatenciesMillis returns and clears successful per-Flush dump
+// duration samples plus the number of samples dropped because the local buffer
+// filled before the metrics publisher drained it. Values are milliseconds so
+// sub-millisecond acceptance gates remain readable as fractional values; samples
+// are rounded to the nearest microsecond before storage.
+func (f *ConntrackFlusher) DrainNetlinkDumpLatenciesMillis() ([]float64, uint64) {
+	if f == nil {
+		return nil, 0
+	}
+	f.netlinkDumpLatenciesMu.Lock()
+	values := append([]float64(nil), f.netlinkDumpLatenciesMillis...)
+	f.netlinkDumpLatenciesMillis = f.netlinkDumpLatenciesMillis[:0]
+	dropped := f.netlinkDumpLatenciesDropped
+	f.netlinkDumpLatenciesDropped = 0
+	f.netlinkDumpLatenciesMu.Unlock()
+	return values, dropped
 }
 
 // NetlinkIndexedFlushCount returns the cumulative number of netlink Flush

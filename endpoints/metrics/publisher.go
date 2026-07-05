@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -41,12 +42,33 @@ const (
 	// batchSize is the number of metric datums per PutMetricData API call.
 	// CloudWatch allows up to 1000 per call, but we use a smaller batch to keep
 	// individual request payloads small and reduce the blast radius of failures.
+	// Histogram datums can carry 150 Values and 150 Counts each; a 20-datum
+	// histogram batch remains comfortably within the CloudWatch request-size
+	// limit while preserving the same failure-containment boundary.
 	batchSize = 20
 
 	// maxLatencySamples caps the number of latency observations held between flushes.
 	// Under sustained high load (~170 knocks/sec), the slice would grow to ~10k entries
 	// per 60s flush interval. Beyond this cap, new samples are dropped to bound memory.
 	maxLatencySamples = 10000
+
+	// MaxHistogramSamples caps histogram observations collected between flushes.
+	// Histogram functions are expected to drain process-local buffers, so this
+	// mirrors maxLatencySamples to keep one flush window bounded even if a
+	// producer emits faster than CloudWatch can accept. When this generic
+	// publisher-side cap or finite-value filter drops samples, it reports
+	// <metric>PublisherDropped; producers with their own upstream buffers may
+	// also expose more specific drop metrics.
+	// The AC conntrack-dump producer derives its local cap from this constant
+	// (maxNetlinkDumpLatencySamples); re-check that producer's drop-signal docs
+	// if this value moves.
+	MaxHistogramSamples = 10000
+
+	// maxHistogramValuesPerDatum is CloudWatch's per-MetricDatum Values limit.
+	// Histogram observations are compacted to unique value/count pairs, then
+	// split into chunks at this boundary. A full 10k-unique flush window becomes
+	// 67 datums, or four PutMetricData batches at the publisher's batchSize.
+	maxHistogramValuesPerDatum = 150
 
 	// defaultCheckpointInterval is how often metrics state is saved to disk.
 	// 15s is a quarter of flushInterval (60s): a crash loses at most 15s of
@@ -108,6 +130,34 @@ type HealthProbe func(ctx context.Context) bool
 // Registered via RegisterGaugeFunc, called each flush interval.
 type GaugeFunc func() float64
 
+// HistogramFunc drains pending observations for a histogram metric.
+// The returned values are published in the unit supplied to
+// RegisterHistogramFunc via CloudWatch MetricDatum Values/Counts so percentile
+// statistics remain available. After the call returns, the publisher owns the
+// returned slice and may retain or truncate it; return a copy if the producer
+// reuses its live buffer. Implementations may emit companion counters before
+// returning; histogram functions run outside the publisher lock so those
+// counters join the same flush without lock re-entry.
+type HistogramFunc func() []float64
+
+type histogramFuncEntry struct {
+	unit types.StandardUnit
+	fn   HistogramFunc
+}
+
+type histogramEntry struct {
+	unit   types.StandardUnit
+	values []float64
+}
+
+// histogramPublisherDroppedMetricName reserves the PublisherDropped suffix for
+// the generic histogram guardrail counter. It covers publisher-side cap drops
+// and invalid finite-value-filter drops. Do not register a first-class metric
+// that would intentionally collide with this synthesized name.
+func histogramPublisherDroppedMetricName(name string) string {
+	return name + "PublisherDropped"
+}
+
 // Config configures a metrics Publisher.
 type Config struct {
 	Namespace  string            // CloudWatch namespace (e.g. "NHP/AC", "LayerV/NHP")
@@ -133,20 +183,22 @@ type dimCounterEntry struct {
 // Metrics are accumulated in-memory and flushed periodically to minimize
 // API calls and stay within CloudWatch PutMetricData limits.
 type Publisher struct {
-	client      cloudWatchClient
-	namespace   string
-	mu          sync.RWMutex
-	counters    map[string]float64          // metric name → accumulated count (skipped when 0)
-	dimCounters map[string]*dimCounterEntry // composite key → counter with extra dims
-	gauges      map[string]float64          // metric name → current value (always published)
-	latencies   map[string][]float64        // metric name → recorded latencies
-	dims        []types.Dimension
-	stop        chan struct{}
-	wg          sync.WaitGroup       // tracks flushLoop goroutine for graceful shutdown
-	once        sync.Once            // ensures Stop is idempotent
-	healthProbe HealthProbe          // optional: emits StorageHealthy gauge each flush
-	gaugeFuncs  map[string]GaugeFunc // metric name → func called each flush
-	emfWriter   io.Writer            // destination for EMF JSON lines (defaults to os.Stdout)
+	client         cloudWatchClient
+	namespace      string
+	mu             sync.RWMutex
+	counters       map[string]float64          // metric name → accumulated count (skipped when 0)
+	dimCounters    map[string]*dimCounterEntry // composite key → counter with extra dims
+	gauges         map[string]float64          // metric name → current value (always published)
+	latencies      map[string][]float64        // metric name → recorded latencies
+	histograms     map[string]*histogramEntry  // metric name → pending histogram observations
+	dims           []types.Dimension
+	stop           chan struct{}
+	wg             sync.WaitGroup                // tracks flushLoop goroutine for graceful shutdown
+	once           sync.Once                     // ensures Stop is idempotent
+	healthProbe    HealthProbe                   // optional: emits StorageHealthy gauge each flush
+	gaugeFuncs     map[string]GaugeFunc          // metric name → func called each flush
+	histogramFuncs map[string]histogramFuncEntry // metric name → drain func called each flush
+	emfWriter      io.Writer                     // destination for EMF JSON lines (defaults to os.Stdout)
 
 	// Checkpoint fields (empty checkpointDir means checkpointing disabled)
 	checkpointDir      string
@@ -251,9 +303,11 @@ func NewPublisher(cfg Config) *Publisher {
 		dimCounters:        make(map[string]*dimCounterEntry),
 		gauges:             make(map[string]float64),
 		latencies:          make(map[string][]float64),
+		histograms:         make(map[string]*histogramEntry),
 		dims:               cfg.Dimensions,
 		stop:               make(chan struct{}),
 		gaugeFuncs:         make(map[string]GaugeFunc),
+		histogramFuncs:     make(map[string]histogramFuncEntry),
 		emfWriter:          os.Stdout,
 		checkpointDir:      cpDir,
 		checkpointInterval: cpInterval,
@@ -344,6 +398,30 @@ func (mp *Publisher) RegisterGaugeFunc(name string, fn GaugeFunc) {
 	mp.mu.Unlock()
 }
 
+// RegisterHistogramFunc registers a function that drains pending histogram
+// observations each flush interval. The returned observations are buffered in
+// the publisher for the immediately following flush and emitted with
+// CloudWatch Values/Counts, preserving percentile statistics. Re-registering
+// an existing name is last-unit-wins for any observations already buffered in
+// the current flush window; production callers register once during startup.
+func (mp *Publisher) RegisterHistogramFunc(name string, unit types.StandardUnit, fn HistogramFunc) {
+	if mp == nil {
+		return
+	}
+	mp.mu.Lock()
+	if mp.histogramFuncs == nil {
+		mp.histogramFuncs = make(map[string]histogramFuncEntry)
+	}
+	if mp.histograms == nil {
+		mp.histograms = make(map[string]*histogramEntry)
+	}
+	if mp.counters == nil {
+		mp.counters = make(map[string]float64)
+	}
+	mp.histogramFuncs[name] = histogramFuncEntry{unit: unit, fn: fn}
+	mp.mu.Unlock()
+}
+
 // SetHealthProbe registers a function that is called each flush interval.
 // The result is published as StorageHealthy (1.0 = healthy, 0.0 = unhealthy).
 func (mp *Publisher) SetHealthProbe(probe HealthProbe) {
@@ -385,6 +463,10 @@ func (mp *Publisher) Stop() {
 	mp.once.Do(func() {
 		close(mp.stop)
 		mp.wg.Wait() // wait for flushLoop to exit before final flush
+		// Histogram funcs drain event-like samples from process-local buffers.
+		// Collect once more before the final flush so shutdown does not strand
+		// observations that arrived after the last periodic tick.
+		mp.collectHistograms()
 		mp.flush()
 	})
 }
@@ -414,6 +496,13 @@ func (mp *Publisher) flushLoop() {
 		select {
 		case <-flushTicker.C:
 			mp.collectGauges()
+			// Keep histogram collection adjacent to flush: histogram samples are
+			// not checkpointed, while companion counters emitted by histogram
+			// funcs use the normal counter maps. No checkpoint tick may interleave
+			// between a drain and its PutMetricData attempt. If the process dies
+			// after the drain, or PutMetricData fails, samples from that drain and
+			// same-drain companion counters are best-effort and are not replayed.
+			mp.collectHistograms()
 			mp.probeHealth()
 			mp.flush()
 		case <-cpTickerC:
@@ -460,6 +549,92 @@ func (mp *Publisher) collectGauges() {
 		mp.gauges[name] = val
 	}
 	mp.mu.Unlock()
+}
+
+// collectHistograms calls registered histogram functions outside the publisher
+// lock, then appends the drained observations to the pending histogram buffers.
+func (mp *Publisher) collectHistograms() {
+	mp.mu.RLock()
+	funcs := make(map[string]histogramFuncEntry, len(mp.histogramFuncs))
+	for name, entry := range mp.histogramFuncs {
+		funcs[name] = entry
+	}
+	mp.mu.RUnlock()
+
+	type sampleBatch struct {
+		name   string
+		unit   types.StandardUnit
+		values []float64
+	}
+	batches := make([]sampleBatch, 0, len(funcs))
+	for name, entry := range funcs {
+		if entry.fn == nil {
+			continue
+		}
+		values := entry.fn()
+		if len(values) == 0 {
+			continue
+		}
+		batches = append(batches, sampleBatch{
+			name:   name,
+			unit:   entry.unit,
+			values: values,
+		})
+	}
+
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	for _, batch := range batches {
+		values, invalidDropped := filterInvalidHistogramValues(batch.values)
+		if invalidDropped > 0 {
+			mp.counters[histogramPublisherDroppedMetricName(batch.name)] += float64(invalidDropped)
+		}
+		if len(values) == 0 {
+			continue
+		}
+		entry := mp.histograms[batch.name]
+		if entry == nil {
+			entry = &histogramEntry{unit: batch.unit}
+			mp.histograms[batch.name] = entry
+		}
+		if entry.unit != batch.unit {
+			// Re-registration is last-unit-wins for any unflushed values.
+			entry.unit = batch.unit
+		}
+		remaining := MaxHistogramSamples - len(entry.values)
+		if remaining <= 0 {
+			mp.counters[histogramPublisherDroppedMetricName(batch.name)] += float64(len(values))
+			continue
+		}
+		if len(values) > remaining {
+			mp.counters[histogramPublisherDroppedMetricName(batch.name)] += float64(len(values) - remaining)
+			// The generic cap keeps the earliest collected observations and
+			// reports the tail drop. The current AC producer cannot hit this
+			// branch because its local cap matches MaxHistogramSamples.
+			values = values[:remaining]
+		}
+		entry.values = append(entry.values, values...)
+	}
+}
+
+func filterInvalidHistogramValues(values []float64) ([]float64, int) {
+	var filtered []float64
+	for i, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			if filtered == nil {
+				filtered = make([]float64, 0, len(values)-1)
+				filtered = append(filtered, values[:i]...)
+			}
+			continue
+		}
+		if filtered != nil {
+			filtered = append(filtered, value)
+		}
+	}
+	if filtered == nil {
+		return values, 0
+	}
+	return filtered, len(values) - len(filtered)
 }
 
 // probeHealth runs the health probe (if set) and records the result as a gauge.
@@ -528,10 +703,12 @@ func (mp *Publisher) flush() {
 	dimCounters := mp.dimCounters
 	gauges := mp.gauges
 	latencies := mp.latencies
+	histograms := mp.histograms
 	mp.counters = make(map[string]float64)
 	mp.dimCounters = make(map[string]*dimCounterEntry)
 	mp.gauges = make(map[string]float64)
 	mp.latencies = make(map[string][]float64)
+	mp.histograms = make(map[string]*histogramEntry)
 	mp.mu.Unlock()
 
 	// Drop the checkpoint after the swap so a crash *between this point and
@@ -553,8 +730,11 @@ func (mp *Publisher) flush() {
 	}
 
 	mp.emitEMF(flushStart, latencies)
+	// Histograms publish percentile-compatible Values/Counts through
+	// PutMetricData. Do not mirror them into EMF, or CloudWatch would extract
+	// a second copy of each sample and skew percentile reads.
 
-	metricData := mp.buildMetricData(flushStart, counters, dimCounters, gauges, latencies)
+	metricData := mp.buildMetricData(flushStart, counters, dimCounters, gauges, latencies, histograms)
 
 	if len(metricData) == 0 {
 		return
@@ -741,6 +921,7 @@ func (mp *Publisher) buildMetricData(
 	dimCounters map[string]*dimCounterEntry,
 	gauges map[string]float64,
 	latencies map[string][]float64,
+	histograms map[string]*histogramEntry,
 ) []types.MetricDatum {
 	var metricData []types.MetricDatum
 
@@ -820,6 +1001,60 @@ func (mp *Publisher) buildMetricData(
 		})
 	}
 
+	// Flush histograms using CloudWatch Values/Counts instead of StatisticSet
+	// so percentile statistics remain queryable. collectHistograms accounts
+	// invalid NaN/+/-Inf samples as PublisherDropped; appendHistogramDatums
+	// keeps a final defensive filter because CloudWatch rejects them. Do not
+	// account drops again here, or invalid samples would double-count.
+	for name, entry := range histograms {
+		if entry == nil || len(entry.values) == 0 {
+			continue
+		}
+		metricData = appendHistogramDatums(metricData, tsPtr, name, entry, mp.dims)
+	}
+
+	return metricData
+}
+
+func appendHistogramDatums(metricData []types.MetricDatum, tsPtr *time.Time, name string, entry *histogramEntry, dims []types.Dimension) []types.MetricDatum {
+	countsByValue := make(map[float64]float64, len(entry.values))
+	for _, value := range entry.values {
+		// collectHistograms/filterInvalidHistogramValues owns PublisherDropped
+		// accounting; this final guard only prevents a rejected CloudWatch datum.
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			continue
+		}
+		countsByValue[value]++
+	}
+	if len(countsByValue) == 0 {
+		return metricData
+	}
+
+	values := make([]float64, 0, len(countsByValue))
+	for value := range countsByValue {
+		values = append(values, value)
+	}
+	slices.Sort(values)
+
+	for i := 0; i < len(values); i += maxHistogramValuesPerDatum {
+		end := i + maxHistogramValuesPerDatum
+		if end > len(values) {
+			end = len(values)
+		}
+		chunkValues := values[i:end]
+		chunkCounts := make([]float64, len(chunkValues))
+		for j, value := range chunkValues {
+			chunkCounts[j] = countsByValue[value]
+		}
+		metricData = append(metricData, types.MetricDatum{
+			MetricName: aws.String(name),
+			Dimensions: dims,
+			Values:     chunkValues,
+			Counts:     chunkCounts,
+			Unit:       entry.unit,
+			Timestamp:  tsPtr,
+		})
+	}
 	return metricData
 }
 
@@ -1077,11 +1312,12 @@ func removeCheckpoint(dir string) {
 // checkpoint. The caller must be holding mp.mu so the maps cannot mutate
 // underneath us.
 //
-// gaugeFuncs is intentionally NOT included: they are process-local closures
-// that may read or maintain live process/kernel state on every flush, so they
-// cannot meaningfully survive a process crash. Whatever gauge functions exist
-// after restart are re-registered by the same setup code that registered them
-// the first time, and the next flush will pick up their current values.
+// gaugeFuncs and histogramFuncs are intentionally NOT included: they are
+// process-local closures that may read, maintain, or drain live process/kernel
+// state on every flush, so they cannot meaningfully survive a process crash.
+// Whatever functions exist after restart are re-registered by the same setup
+// code that registered them the first time, and the next flush will pick up
+// their current values.
 func (mp *Publisher) snapshotToCheckpoint() *checkpoint {
 	cp := &checkpoint{
 		Version:   checkpointSchemaVersion,

@@ -296,6 +296,30 @@ func (a *UdpAC) ConntrackNetlinkSlowDumpCount() (uint64, bool) {
 	return cf.NetlinkSlowDumpCount(), true
 }
 
+// ConntrackNetlinkDumpLatencyNegativeDurationCount mirrors
+// ConntrackNetlinkDeletedCount for impossible negative dump-duration
+// measurements ignored before histogram buffering.
+func (a *UdpAC) ConntrackNetlinkDumpLatencyNegativeDurationCount() (uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return 0, false
+	}
+	return cf.NetlinkDumpLatencyNegativeDurationCount(), true
+}
+
+// DrainConntrackNetlinkDumpLatenciesMillis mirrors ConntrackNetlinkDeletedCount
+// for per-Flush netlink dump-latency histogram samples. ok=true only with the
+// netlink backend attached. The returned samples are drained from the flusher's
+// process-local buffer and are measured in milliseconds.
+func (a *UdpAC) DrainConntrackNetlinkDumpLatenciesMillis() ([]float64, uint64, bool) {
+	cf := a.conntrackFlusher.Load()
+	if cf == nil || !cf.IsNetlinkBackend() {
+		return nil, 0, false
+	}
+	values, dropped := cf.DrainNetlinkDumpLatenciesMillis()
+	return values, dropped, true
+}
+
 // ConntrackNetlinkIndexedFlushCount mirrors ConntrackNetlinkDeletedCount for
 // Flush calls served by the #2908 conntrack event index.
 func (a *UdpAC) ConntrackNetlinkIndexedFlushCount() (uint64, bool) {
