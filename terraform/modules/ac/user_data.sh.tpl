@@ -1199,9 +1199,10 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
 [entryPoints]
   [entryPoints.https]
     address = ":443"
-    # ProxyProtocol for NLB - preserves client IP
-    [entryPoints.https.proxyProtocol]
-      trustedIPs = ["${vpc_cidr}"]
+    # The public AC NLB preserves client IP at L3. Do not enable Proxy Protocol
+    # on this entrypoint unless the AC TCP target groups also stop preserving
+    # client IP; otherwise the browser's public IP is the TCP peer that Traefik
+    # evaluates for Proxy Protocol trust and the TLS stream can fail before HTTP.
     [entryPoints.https.forwardedHeaders]
       trustedIPs = ["${vpc_cidr}"]
   [entryPoints.http]
@@ -1211,10 +1212,6 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
       scheme = "https"
   [entryPoints.traefik]
     address = ":8080"
-    # ProxyProtocol required because NLB target group has proxy_protocol_v2 enabled
-    # This affects ALL traffic including health checks
-    [entryPoints.traefik.proxyProtocol]
-      trustedIPs = ["${vpc_cidr}"]
 %{ if frp_control_upstream_host != "" ~}
   # TRANSITIONAL — places the AC in the FRPS data plane as a userspace
   # TCP forwarder. Target shape is AC-as-firewall-manager only, with

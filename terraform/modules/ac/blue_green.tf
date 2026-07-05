@@ -185,12 +185,13 @@ resource "aws_ssm_parameter" "tcp_listener_arn" {
 resource "aws_lb_target_group" "ac_tcp_green" {
   count = var.enable_blue_green ? 1 : 0
 
-  name              = replace("${var.name_prefix}-ac-tcp-grn", "_", "-")
-  port              = 443
-  protocol          = "TCP"
-  vpc_id            = var.vpc_id
-  target_type       = "instance"
-  proxy_protocol_v2 = true
+  name               = replace("${var.name_prefix}-ac-tcp-grn", "_", "-")
+  port               = 443
+  protocol           = "TCP"
+  vpc_id             = var.vpc_id
+  target_type        = "instance"
+  preserve_client_ip = true
+  proxy_protocol_v2  = false
 
   # HTTP health check routed by Traefik to nhp-acd readiness. Port is sourced
   # from local.ac_health_check_port (main.tf) so this green TG, the blue ac_tcp
@@ -214,15 +215,13 @@ resource "aws_lb_target_group" "ac_tcp_green" {
 
   deregistration_delay = 30
 
-  # Mirror the blue AC TCP TG's connection_termination=true (see
-  # main.tf::aws_lb_target_group.ac_tcp for the rationale). Required
-  # for both colors so the blue/green flip in either direction sheds
-  # in-flight TLS flows with RST instead of letting them stall.
-  # Drift between the two colors is fenced at plan time by
-  # `check "ac_tcp_target_group_drift"` in main.tf — that block
-  # asserts {connection_termination, deregistration_delay} +
-  # health_check agreement; do not edit either color without the
-  # same edit here.
+  # Mirror the blue AC TCP TG's connection_termination/client-IP/Proxy Protocol
+  # posture (see main.tf::aws_lb_target_group.ac_tcp for the rationale).
+  # Required for both colors so a blue/green flip cannot revive the qurl.site
+  # pre-HTTP stall fixed by #3052 or regress RST-on-dereg behavior. Drift
+  # between the two colors is fenced at plan time by
+  # `check "ac_tcp_target_group_drift"` in main.tf; do not edit either color
+  # without the same edit here.
   connection_termination = true
 
   tags = merge(var.tags, {

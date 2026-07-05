@@ -1802,11 +1802,11 @@ variable "enable_qurl_site_authz" {
     Traefik's `forwardedHeaders.trustedIPs` being pinned to the
     upstream proxy chain so an attacker cannot spoof
     `X-Forwarded-For: <victim-ip>` and ride the victim's authz
-    cache. The AC's Traefik config pins this to `vpc_cidr` and the
-    HTTPS entrypoint uses PROXY protocol from the NLB — the
-    PROXY-rewritten connection source is what gets checked against
-    the trust set, so external XFF spoofs are rejected before
-    reaching the plugin's client-IP extractor. See
+    cache. The AC's Traefik config pins this to `vpc_cidr`, while
+    the public AC NLB target groups preserve client IP at L3 and do
+    NOT inject PROXY protocol. That means external browsers arrive
+    with their real TCP peer IP for the plugin's client-IP extractor,
+    and external XFF spoofs are still untrusted by Traefik. See
     `terraform/modules/ac/user_data.sh.tpl` (entrypoint config) and
     `extractClientIP` in `layervai/traefik-plugins`'s
     `plugins-local/src/github.com/traefik/qurl-router/qurl_router.go`.

@@ -1596,15 +1596,22 @@ resource "aws_lb" "ac" {
   tags = var.tags
 }
 
-# TCP Target Group (TLS passthrough to Traefik)
-# Proxy Protocol v2 enabled to preserve client IP for NHP firewall rules
+# TCP Target Group (TLS passthrough to Traefik).
+#
+# Keep Proxy Protocol v2 OFF on this target group. The NLB already preserves the
+# browser source IP at L3 (`preserve_client_ip = true`), which is what both the
+# NHP pinhole and qurl-router need. Adding Proxy Protocol on top of preserved
+# client IP prepends bytes before the TLS ClientHello; Traefik's Proxy Protocol
+# trust check then sees the public browser IP as the TCP peer rather than an NLB
+# node, so the stream can die before any qurl-router authorize call is made.
 resource "aws_lb_target_group" "ac_tcp" {
-  name              = replace("${var.name_prefix}-ac-tcp", "_", "-")
-  port              = 443
-  protocol          = "TCP"
-  vpc_id            = var.vpc_id
-  target_type       = "instance"
-  proxy_protocol_v2 = true
+  name               = replace("${var.name_prefix}-ac-tcp", "_", "-")
+  port               = 443
+  protocol           = "TCP"
+  vpc_id             = var.vpc_id
+  target_type        = "instance"
+  preserve_client_ip = true
+  proxy_protocol_v2  = false
 
   # HTTP health check routed by Traefik to nhp-acd readiness. Port 443 is
   # blocked by default for NHP port hiding - only opened after knock. A target
@@ -1761,8 +1768,8 @@ resource "aws_lb_listener" "https" {
 #   - Proxy Protocol v2 is intentionally OFF here (the FRP control channel
 #     doesn't speak PP, and the Traefik TCP entrypoint would need
 #     `proxyProtocol` awareness to accept it). Preserving client IP for
-#     the ipset fence is handled by the NLB's default mode (no PP), which
-#     forwards client IP at L4 — AC instance sees `agent_ip → ac_local_ip:port`.
+#     the ipset fence is explicit below and handled by the NLB at L4
+#     without PP — AC instance sees `agent_ip → ac_local_ip:port`.
 #
 # Conditional on FRPS deployment: when `var.frp_control_upstream_host` is
 # empty (greenfield env, no FRPS), the listener + TG aren't created. The
@@ -1777,6 +1784,10 @@ resource "aws_lb_target_group" "ac_frps_control" {
   protocol    = "TCP"
   vpc_id      = var.vpc_id
   target_type = "instance"
+
+  # Explicit for reader symmetry with `ac_tcp`; this FRPS-control TG is outside
+  # the qurl.site transport contract fenced by `ac_tcp_target_group_drift`.
+  preserve_client_ip = true
 
   # Healthcheck caveat: Traefik `/ping` on 8080 confirms the Traefik
   # process is alive but does NOT verify the `entryPoints.frps-control`
@@ -1875,6 +1886,9 @@ resource "aws_lb_target_group" "ac_frps_control_additional" {
   protocol    = "TCP"
   vpc_id      = var.vpc_id
   target_type = "instance"
+
+  # Same contract scope as the primary FRPS-control TG above.
+  preserve_client_ip = true
 
   # Same caveat as the primary `ac_frps_control` TG: `/ping` proves the
   # Traefik process is alive, not that this specific FRPS-control TCP
@@ -2302,10 +2316,14 @@ check "ac_tcp_target_group_drift" {
       (
         aws_lb_target_group.ac_tcp.connection_termination &&
         aws_lb_target_group.ac_tcp_green[0].connection_termination &&
+        aws_lb_target_group.ac_tcp.preserve_client_ip &&
+        aws_lb_target_group.ac_tcp_green[0].preserve_client_ip &&
+        !aws_lb_target_group.ac_tcp.proxy_protocol_v2 &&
+        !aws_lb_target_group.ac_tcp_green[0].proxy_protocol_v2 &&
         aws_lb_target_group.ac_tcp.deregistration_delay == 30 &&
         aws_lb_target_group.ac_tcp_green[0].deregistration_delay == 30
       )
     )
-    error_message = "BLUE/GREEN AC DEREG SEMANTICS VALUE-ANCHOR: aws_lb_target_group.ac_tcp.{connection_termination,deregistration_delay} (main.tf) and aws_lb_target_group.ac_tcp_green.{connection_termination,deregistration_delay} (blue_green.tf) must satisfy connection_termination=true AND deregistration_delay=30 on BOTH colors. The 2026-05-22 incident regresses if either color drops connection_termination=true; an equality-only assert would let a future PR flip both to false together (silent regression). The 30s deregistration_delay value here is the disjoint LB-side cleanup window (NOT calibrated against the AC health-check timing, which is interval=30 × unhealthy_threshold=3 = 90s — that decoupling is intentional, see compute/main.tf::aws_lb_target_group.https for the disjoint-roles writeup). Edit both colors AND this assert in the same PR; comment cross-reference at blue_green.tf::ac_tcp_green carries the rationale."
+    error_message = "BLUE/GREEN AC TCP SEMANTICS VALUE-ANCHOR: aws_lb_target_group.ac_tcp and aws_lb_target_group.ac_tcp_green must both satisfy connection_termination=true, deregistration_delay=30, preserve_client_ip=true, and proxy_protocol_v2=false. The 2026-05-22 incident regresses if either color drops connection_termination=true; qURL v2 stalls before qurl-router if Proxy Protocol is reintroduced on top of NLB client-IP preservation. Edit both colors AND this assert in the same PR; comment cross-reference at blue_green.tf::ac_tcp_green carries the rationale."
   }
 }

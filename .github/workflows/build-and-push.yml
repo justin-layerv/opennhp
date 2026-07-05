@@ -1517,6 +1517,9 @@ jobs:
       - name: Run Terraform Plan PR read-only policy fixture tests
         run: python3 ./tests/scripts/test_check_terraform_plan_pr_policy_readonly.py
 
+      - name: Check AC TCP target-group transport contract
+        run: python3 ./tests/scripts/test_ac_tcp_target_group_contract.py
+
       - name: Check Terraform Plan PR read-only policy
         run: python3 ./.github/scripts/check-terraform-plan-pr-policy-readonly.py
 
