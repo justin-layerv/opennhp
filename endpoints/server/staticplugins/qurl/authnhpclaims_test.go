@@ -430,8 +430,16 @@ func TestAuthWithNHPClaims_FirstKnock_AuthorizeThenPrepareCommitBeforeACOpen(t *
 				if info.ACId != ac.ACId {
 					t.Errorf("opened ACId = %q, want %q", info.ACId, ac.ACId)
 				}
-				if info.Addr == nil || info.Addr.Ip != ac.DestHost || info.Addr.Port != ac.DestPort {
-					t.Errorf("opened dest = %#v, want %s:%d", info.Addr, ac.DestHost, ac.DestPort)
+				// Addr.Ip MUST be empty (the AC substitutes its own LOCAL_IP via
+				// applyDefaultIpSubstitution) — NOT dest_host, which would fail the
+				// AC's eBPF parseIP for a hostname and mis-key the rule for a raw IP
+				// (see acRoutingToResourceInfo). dest_host is carried informationally
+				// on Hostname; port/proto match the qv1 catalog shape.
+				if info.Addr == nil || info.Addr.Ip != "" || info.Addr.Port != ac.DestPort || info.Addr.Protocol != "tcp" {
+					t.Errorf("opened Addr = %#v, want Ip=\"\" (→AC LOCAL_IP) Port=%d Protocol=tcp", info.Addr, ac.DestPort)
+				}
+				if info.Hostname != ac.DestHost {
+					t.Errorf("opened Hostname = %q, want dest_host %q (informational, feeds ack ResourceHost)", info.Hostname, ac.DestHost)
 				}
 			}
 			req.Ack.ErrCode = common.ErrSuccess.ErrorCode()
@@ -1422,5 +1430,81 @@ func TestBuildV2ResourceData_NilClaims_GuardedNotPanic(t *testing.T) {
 	// Observable: the counter fires once for the nil-claims anomaly.
 	if hashErrCount != 1 {
 		t.Errorf("MetricQurlV2RevocationHashError fired %d times on nil claims, want 1", hashErrCount)
+	}
+}
+
+// TestAcRoutingToResourceInfo_LeavesAddrIpEmpty is the mode-1 regression fence:
+// the AOP destination built from a qurl-service ac_routing must leave Addr.Ip
+// EMPTY (so the AC's applyDefaultIpSubstitution writes its own LOCAL_IP) for BOTH
+// a hostname dest_host (which previously failed the AC's eBPF parseIP →
+// ErrServerACOpsFailed/52005 on every knock) and a raw-IP dest_host (which
+// previously mis-keyed the rule on the resource IP → silent datapath deny of real
+// customer traffic). dest_host must ride Hostname (informational; feeds the ack
+// ResourceHost), and the shape must match the qv1 catalog (Protocol="tcp",
+// Port=dest_port).
+func TestAcRoutingToResourceInfo_LeavesAddrIpEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		destHost string
+	}{
+		{"hostname_dest_was_reproducible_52005", "app.internal"},
+		{"ip_dest_was_silent_datapath_deny", "172.66.147.243"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := acRoutingToResourceInfo(&ACRouting{ACId: "ac-9", DestHost: tc.destHost, DestPort: 8443})
+			if info.Addr == nil {
+				t.Fatal("Addr is nil")
+			}
+			if info.Addr.Ip != "" {
+				t.Errorf("Addr.Ip = %q, want \"\" so the AC substitutes its LOCAL_IP (dest_host must NOT reach the eBPF datapath)", info.Addr.Ip)
+			}
+			if info.Hostname != tc.destHost {
+				t.Errorf("Hostname = %q, want dest_host %q (informational ack ResourceHost)", info.Hostname, tc.destHost)
+			}
+			if info.Addr.Port != 8443 {
+				t.Errorf("Addr.Port = %d, want 8443 (customer-facing/ingress port from dest_port)", info.Addr.Port)
+			}
+			if info.Addr.Protocol != "tcp" {
+				t.Errorf("Addr.Protocol = %q, want tcp (qURL is TCP; matches qv1 catalog)", info.Addr.Protocol)
+			}
+			if info.ACId != "ac-9" {
+				t.Errorf("ACId = %q, want ac-9", info.ACId)
+			}
+			// The ack's ResourceHost still surfaces dest_host via Hostname, so the
+			// datapath fix does not change the ack the agent sees.
+			if got := info.DestHost(); got != tc.destHost {
+				t.Errorf("DestHost() = %q, want %q (ack ResourceHost preserved)", got, tc.destHost)
+			}
+		})
+	}
+}
+
+// TestBuildV2ResourceData_And_Refresh_UseEmptyAddrIp pins that BOTH the
+// first-knock and re-knock builders route ac_routing through
+// acRoutingToResourceInfo, so neither qURL v2 admission path can regress the AC
+// datapath by leaking dest_host into the pinhole destination IP.
+func TestBuildV2ResourceData_And_Refresh_UseEmptyAddrIp(t *testing.T) {
+	noop := func(string) {}
+
+	prep := &AdmissionPrepareResponse{
+		AdmissionID: "adm_1", QurlID: "q_1", QurlUserPublicKeyHash: "h", OpenTime: 60,
+		ACRouting: &ACRouting{ACId: "ac-first", DestHost: "app.internal", DestPort: 443},
+	}
+	// Real (empty) Claims, not nil: the datapath fields under test are independent
+	// of the revocation hashes, and an empty Claims exercises the builder without
+	// tripping revocationHashesFromClaims' fail-open nil-claims error log (empty
+	// key strings decode to empty bytes and hash cleanly — no hash-error log either).
+	first := buildV2ResourceData(prep, &qurlv2.Claims{}, noop)
+	if info := first.Resources["ac-first"]; info == nil || info.Addr == nil || info.Addr.Ip != "" || info.Hostname != "app.internal" {
+		t.Errorf("first-knock: got %#v, want empty Addr.Ip + Hostname=app.internal", first.Resources["ac-first"])
+	}
+
+	auth := &AdmissionAuthorizeResponse{
+		SessionID: "sess_1", RemainingSeconds: 120,
+		ACRouting: &ACRouting{ACId: "ac-refresh", DestHost: "10.0.0.9", DestPort: 9443},
+	}
+	refresh := buildV2RefreshResourceData(auth, &qurlv2.Claims{}, noop)
+	if info := refresh.Resources["ac-refresh"]; info == nil || info.Addr == nil || info.Addr.Ip != "" || info.Hostname != "10.0.0.9" {
+		t.Errorf("re-knock: got %#v, want empty Addr.Ip + Hostname=10.0.0.9", refresh.Resources["ac-refresh"])
 	}
 }

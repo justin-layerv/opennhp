@@ -386,13 +386,7 @@ func buildV2RefreshResourceData(resp *AdmissionAuthorizeResponse, claims *qurlv2
 			AuthServiceId: PluginID,
 			OpenTime:      resp.RemainingSeconds,
 			Resources: map[string]*common.ResourceInfo{
-				resp.ACRouting.ACId: {
-					ACId: resp.ACRouting.ACId,
-					Addr: &common.NetAddress{
-						Ip:   resp.ACRouting.DestHost,
-						Port: resp.ACRouting.DestPort,
-					},
-				},
+				resp.ACRouting.ACId: acRoutingToResourceInfo(resp.ACRouting),
 			},
 		},
 		// No RedirectUrl on a re-knock refresh.
@@ -447,12 +441,67 @@ func revocationHashesFromClaims(claims *qurlv2.Claims, logCtx string, incrCounte
 	return qurlUserKeyHash, resourceKeyHash, claims.Exp
 }
 
+// acRoutingToResourceInfo maps a qurl-service ac_routing into the ResourceInfo
+// the AC-open callback consumes. It is the single source of truth shared by the
+// first-knock (buildV2ResourceData) and re-knock (buildV2RefreshResourceData)
+// builders, and it deliberately mirrors the qv1 catalog shape in
+// endpoints/server/resource_lookup.go (resourceDataFromRow) so the two qURL
+// flows produce byte-identical AOP destinations:
+//
+//   - Addr.Ip is left EMPTY — NOT dest_host. The customer always terminates at the
+//     AC's own ingress (portal domain → AC NLB → Traefik-on-AC → upstream resource),
+//     so the pinhole must key on the AC-local IP, not the resource's — regardless of
+//     whether the upstream is an FRPS backend or an arbitrary URL. The AC's
+//     applyDefaultIpSubstitution (endpoints/ac/msghandler.go) rewrites an empty (or
+//     0.0.0.0) Ip to its DefaultIp (= LOCAL_IP) at rule-write time. Feeding dest_host
+//     here breaks the datapath two ways: a hostname fails the AC's parseIP ("invalid
+//     IP address" → ErrServerACOpsFailed/52005), and a real resource IP keys the rule
+//     on the WRONG dst (silent datapath deny). This is the load-bearing empty-Ip
+//     sentinel the qv1 DDB bridge already documents (terraform/resources.tf), and it
+//     is a DISTINCT field from the NHP-ACK "Resource Address" (carried on Hostname
+//     below) — the pre-fix bug conflated the two.
+//   - Hostname carries dest_host so the ack's ResourceHost stays populated
+//     (ResourceInfo.DestHost() prefers Hostname over Addr.Ip) — same field/shape as
+//     qv1 (qv1 puts the customer FQDN there; here it is the upstream host, but the
+//     value is ack-informational only) and preserves pre-fix qv2 ack behavior.
+//   - Addr.Port is ac_routing.dest_port UNCHANGED (no substitution): per the contract
+//     (QURL_V2_KEYED_IDENTITY.md example shows dest_port=443) it is the AC ingress /
+//     customer-facing port (the Traefik-on-AC listener), NOT the upstream resource
+//     port — so the pinhole (LOCAL_IP, dest_port) matches the customer's connection.
+//     Same as qv1, where terraform maps dest_port = customer_facing_port → Addr.Port.
+//   - PortSuffix is intentionally false (the one divergence from qv1's row.PortSuffix):
+//     it only shapes the ack ResourceHost (bare host vs "host:port"), never the
+//     datapath, and qv2 clients navigate via the redirect qurl_site_url, not by
+//     dialing ResourceHost:port.
+//   - Protocol is "tcp" (matching qv1): every NHP-gated qURL resource is TCP (HTTPS).
+//     This also narrows the AC rule from port-agnostic (pre-fix qv2 left Protocol
+//     empty → the AC adds a no-port rule) to port-specific TCP on Addr.Port — strictly
+//     tighter and the proven qv1 shape, and it is why the dest_port = AC-ingress-port
+//     invariant above is load-bearing (a wrong port would now silently not match).
+//
+// ac is non-nil at both call sites: prepare/authorize responses are validated
+// (validateAdmission{Prepare,Authorize}Response reject a nil ac_routing) before
+// these builders run.
+func acRoutingToResourceInfo(ac *ACRouting) *common.ResourceInfo {
+	return &common.ResourceInfo{
+		ACId:     ac.ACId,
+		Hostname: ac.DestHost, // informational (ack ResourceHost); NOT the datapath dst
+		Addr: &common.NetAddress{
+			// Ip intentionally empty → AC applyDefaultIpSubstitution writes LOCAL_IP.
+			Port:     ac.DestPort,
+			Protocol: "tcp",
+		},
+	}
+}
+
 // buildV2ResourceData maps the prepare response's selected ac_routing into the
 // ResourceData the AC-open callback consumes. NHP opens the AC named in
 // ac_routing (the contract: "NHP opens the AC named in that ac_routing"), so the
 // opened AC matches the ac_id commit recorded into admitted_ac_ids — keeping a
 // targeted revoke's target set complete by construction. handleNhpOpenResource
-// resolves the live AC connection by ACId; dest host/port come from ac_routing.
+// resolves the live AC connection by ACId; the pinhole destination is built by
+// acRoutingToResourceInfo (see it for why dest_host does NOT become the datapath
+// dst IP).
 //
 // It also stamps the P4a revocation metadata onto the ResourceData so it flows
 // down to the AOP builder and on to the AC, via the shared
@@ -474,13 +523,7 @@ func buildV2ResourceData(resp *AdmissionPrepareResponse, claims *qurlv2.Claims, 
 			AuthServiceId: PluginID,
 			OpenTime:      resp.OpenTime,
 			Resources: map[string]*common.ResourceInfo{
-				resp.ACRouting.ACId: {
-					ACId: resp.ACRouting.ACId,
-					Addr: &common.NetAddress{
-						Ip:   resp.ACRouting.DestHost,
-						Port: resp.ACRouting.DestPort,
-					},
-				},
+				resp.ACRouting.ACId: acRoutingToResourceInfo(resp.ACRouting),
 			},
 		},
 		RedirectUrl: resp.QurlSiteURL,
