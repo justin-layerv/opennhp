@@ -161,9 +161,9 @@ func TestCoverageGap948_AdmissionReachesOnlyLocallyConnectedACs(t *testing.T) {
 		"gamma is an NLB-routable AC with NO pinhole -> viewer GET hashed to gamma drops (qurl-service #948)", len(conns))
 }
 
-// TestKnockACFanout_BroadcastWaitsForAllLocalACs proves the LOCAL half of the
+// TestKnockACFanout_BroadcastWaitsForAllLocalACs proves the local half of the
 // #948 fix: with EnableKnockACFanout the broadcast must not ack until every
-// locally-connected AC has written its pinhole (so the ack → 302 → GET cannot
+// selected local AC has written its pinhole (so the ack -> 302 -> GET cannot
 // race a still-in-flight sibling AC), whereas the legacy path acks on the first
 // success. A deliberately slow third AC makes the difference deterministic.
 func TestKnockACFanout_BroadcastWaitsForAllLocalACs(t *testing.T) {
@@ -228,12 +228,12 @@ func TestKnockACFanout_BroadcastWaitsForAllLocalACs(t *testing.T) {
 	}
 }
 
-// TestFanoutHttpKnock_ReachesEveryAssignedPeer proves the cross-server half of
-// the #948 fix on the HTTP qURL path: FanoutHttpKnock forwards to EVERY healthy
-// assigned peer (self excluded), versus the legacy ForwardHttpKnock which stops
+// TestFanoutHttpKnock_ReachesOnePeerPerNonLocalAZ proves the cross-server half
+// of the #948 fix on the HTTP qURL path: FanoutHttpKnock forwards to one healthy
+// assigned peer per non-local AZ, versus the legacy ForwardHttpKnock which stops
 // at the first success. Each forward targets InternalIP:httpPort, so one
-// httptest peer on that port counts the fan-out.
-func TestFanoutHttpKnock_ReachesEveryAssignedPeer(t *testing.T) {
+// httptest peer on that port counts the bounded fan-out.
+func TestFanoutHttpKnock_ReachesOnePeerPerNonLocalAZ(t *testing.T) {
 	var hits atomic.Int32
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
@@ -249,23 +249,23 @@ func TestFanoutHttpKnock_ReachesEveryAssignedPeer(t *testing.T) {
 	storage.assignments["sandbox-ac"] = &ACAssignment{
 		ACID: "sandbox-ac",
 		AssignedServers: []ServerInfo{
-			{ID: "self", InternalIP: "10.0.0.9", Port: port},    // self — must be excluded
-			{ID: "peer-1", InternalIP: "127.0.0.1", Port: port}, // → the httptest peer
-			{ID: "peer-2", InternalIP: "127.0.0.1", Port: port},
-			{ID: "peer-3", InternalIP: "127.0.0.1", Port: port},
+			{ID: "self", InternalIP: "10.0.0.9", AZ: "us-east-2a", Port: port},
+			{ID: "peer-same-az", InternalIP: "127.0.0.1", AZ: "us-east-2a", Port: port},
+			{ID: "peer-b-1", InternalIP: "127.0.0.1", AZ: "us-east-2b", Port: port},
+			{ID: "peer-b-2", InternalIP: "127.0.0.1", AZ: "us-east-2b", Port: port},
+			{ID: "peer-c", InternalIP: "127.0.0.1", AZ: "us-east-2c", Port: port},
 		},
 	}
 	newF := func() *HttpKnockForwarder {
 		return &HttpKnockForwarder{
 			storage:       storage,
-			localIP:       "10.0.0.9", // self
+			localIP:       "10.0.0.9",
 			httpPort:      port,
 			httpClient:    &http.Client{Timeout: 2 * time.Second},
 			failedServers: make(map[string]time.Time),
 		}
 	}
 
-	// Legacy first-success forward hits exactly ONE peer.
 	hits.Store(0)
 	if _, _, err := newF().ForwardHttpKnock(context.Background(), "sandbox-ac", &common.HttpKnockRequest{}, &common.ResourceData{}); err != nil {
 		t.Fatalf("ForwardHttpKnock error: %v", err)
@@ -274,28 +274,124 @@ func TestFanoutHttpKnock_ReachesEveryAssignedPeer(t *testing.T) {
 		t.Fatalf("legacy forward must hit exactly one peer (first-success), hit %d", got)
 	}
 
-	// Cell-wide fan-out hits EVERY assigned peer (self excluded).
 	hits.Store(0)
 	accepted, err := newF().FanoutHttpKnock(context.Background(), "sandbox-ac",
 		&common.HttpKnockRequest{Forwarded: true}, &common.ResourceData{})
 	if err != nil {
 		t.Fatalf("FanoutHttpKnock error: %v", err)
 	}
-	if got := hits.Load(); got != 3 {
-		t.Fatalf("fan-out must reach all 3 assigned peers (self excluded), hit %d", got)
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("fan-out hit %d peers, want 2 (one per non-local AZ)", got)
 	}
-	if accepted != 3 {
-		t.Fatalf("FanoutHttpKnock peersAccepted = %d, want 3", accepted)
+	if accepted != 2 {
+		t.Fatalf("FanoutHttpKnock peersAccepted = %d, want 2", accepted)
 	}
 }
 
-// TestFanoutKnock_ReachesEveryNonSelfHealthyPeer proves the cross-server half of
-// the #948 fix on the native/relay NHP_FWD path: FanoutKnock sends an NHP_FWD to
-// every healthy assigned peer, excluding self and recently-failed peers. Each
+func TestFilterFanoutTargets_SelectsOnePeerPerAZAndIgnoresRecentlyFailedPeers(t *testing.T) {
+	metrics := make(map[string]int)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, func(name string) {
+		metrics[name]++
+	}, nil)
+	f.markFailed("10.0.0.2")
+
+	servers := []ServerInfo{
+		{ID: "self", InternalIP: "10.0.0.1", AZ: "us-east-2a"},
+		{ID: "peer-same-az", InternalIP: "10.0.0.9", AZ: "us-east-2a"},
+		{ID: "peer-stale-failed", InternalIP: "10.0.0.2", AZ: "us-east-2b"},
+		{ID: "peer-b-duplicate", InternalIP: "10.0.0.4", AZ: "us-east-2b"},
+		{ID: "peer-fresh", InternalIP: "10.0.0.3", AZ: "us-east-2c"},
+		{ID: "peer-unknown-1", InternalIP: "10.0.0.5"},
+		{ID: "peer-unknown-2", InternalIP: "10.0.0.6"},
+	}
+
+	result := f.filterFanoutTargets(context.Background(), servers)
+	if len(result) != 3 {
+		t.Fatalf("fanout targets = %d, want 3 (AZ b, AZ c, one unknown-AZ bucket)", len(result))
+	}
+	got := map[string]bool{}
+	for _, srv := range result {
+		got[srv.ID] = true
+	}
+	if !got["peer-stale-failed"] || !got["peer-fresh"] || !got["peer-unknown-1"] {
+		t.Fatalf("fanout targets omitted expected AZ bucket after stale failure cache: got %v", got)
+	}
+	if got["peer-same-az"] || got["peer-b-duplicate"] || got["peer-unknown-2"] {
+		t.Fatalf("fanout targets were not bounded to one per non-local AZ: got %v", got)
+	}
+	if metrics[MetricKnockFanoutDuplicateAZCandidate] != 2 {
+		t.Fatalf("%s metric = %d, want 2 duplicate non-local AZ buckets", MetricKnockFanoutDuplicateAZCandidate, metrics[MetricKnockFanoutDuplicateAZCandidate])
+	}
+}
+
+func TestSelectAssignedFanoutTargetsByAZ_BoundedUnderLargeAssignments(t *testing.T) {
+	servers := make([]ServerInfo, 0, 10001)
+	servers = append(servers, ServerInfo{ID: "self", InternalIP: "10.0.0.1", AZ: "us-east-2a"})
+	for i := 0; i < 10000; i++ {
+		az := "us-east-2b"
+		if i%3 == 1 {
+			az = "us-east-2c"
+		} else if i%3 == 2 {
+			az = ""
+		}
+		servers = append(servers, ServerInfo{
+			ID:         "peer-" + strconv.Itoa(i),
+			InternalIP: "10.1.0." + strconv.Itoa(i%250+1),
+			AZ:         az,
+		})
+	}
+
+	targets := selectAssignedFanoutTargetsByAZ(servers, "10.0.0.1")
+	if len(targets) != 3 {
+		t.Fatalf("selected %d fanout targets from 10k peers, want 3 bounded AZ buckets", len(targets))
+	}
+	if targets[0].AZ != "us-east-2b" || targets[1].AZ != "us-east-2c" || targets[2].AZ != "" {
+		t.Fatalf("fanout targets = %+v, want first peer in AZ b, AZ c, and one unknown-AZ bucket", targets)
+	}
+}
+
+func TestSelectAssignedFanoutTargetsByAZWithHealth_PrefersNonFailedPeerWithinAZ(t *testing.T) {
+	servers := []ServerInfo{
+		{ID: "self", InternalIP: "10.0.0.1", AZ: "us-east-2a"},
+		{ID: "peer-b-failed", InternalIP: "10.0.1.1", AZ: "us-east-2b"},
+		{ID: "peer-b-healthy", InternalIP: "10.0.1.2", AZ: "us-east-2b"},
+		{ID: "peer-c-failed", InternalIP: "10.0.2.1", AZ: "us-east-2c"},
+		{ID: "peer-unknown-failed", InternalIP: "10.0.3.1"},
+		{ID: "peer-unknown-healthy", InternalIP: "10.0.3.2"},
+	}
+	failed := map[string]bool{
+		"peer-b-failed":       true,
+		"peer-c-failed":       true,
+		"peer-unknown-failed": true,
+	}
+
+	targets := selectAssignedFanoutTargetsByAZWithHealth(servers, "10.0.0.1", func(id string) bool {
+		return failed[id]
+	})
+
+	gotIDs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		gotIDs = append(gotIDs, target.ID)
+	}
+	wantIDs := []string{"peer-b-healthy", "peer-c-failed", "peer-unknown-healthy"}
+	if len(gotIDs) != len(wantIDs) {
+		t.Fatalf("selected targets = %v, want %v", gotIDs, wantIDs)
+	}
+	for i := range wantIDs {
+		if gotIDs[i] != wantIDs[i] {
+			t.Fatalf("selected targets = %v, want %v", gotIDs, wantIDs)
+		}
+	}
+}
+
+// TestFanoutKnock_ReachesOnePeerPerNonLocalAZ proves the cross-server half of
+// the #948 fix on the native/relay NHP_FWD path: FanoutKnock sends NHP_FWD to
+// one assigned peer per non-local AZ, excluding self and same-AZ peers but not
+// suppressing an AZ when its only candidate was recently failed. Each
 // forwardToServer records its NHP_FWD send via the mock before blocking on the
-// (absent) NHP_FRT, so a short deadline keeps the test fast; the send count is
+// absent NHP_FRT, so a short deadline keeps the test fast; the send count is
 // the coverage proof.
-func TestFanoutKnock_ReachesEveryNonSelfHealthyPeer(t *testing.T) {
+func TestFanoutKnock_ReachesOnePeerPerNonLocalAZ(t *testing.T) {
 	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
 	if device == nil {
 		t.Fatal("failed to create device")
@@ -311,10 +407,11 @@ func TestFanoutKnock_ReachesEveryNonSelfHealthyPeer(t *testing.T) {
 	assignment := &ACAssignment{
 		ACID: "sandbox-ac",
 		AssignedServers: []ServerInfo{
-			{ID: "self", InternalIP: "10.0.0.9", Port: common.DefaultNHPPort, PubKey: pub},      // self — excluded
-			{ID: "peer-1", InternalIP: "10.0.0.1", Port: common.DefaultNHPPort, PubKey: pub},    // healthy
-			{ID: "peer-2", InternalIP: "10.0.0.2", Port: common.DefaultNHPPort, PubKey: pub},    // healthy
-			{ID: "peer-dead", InternalIP: "10.0.0.3", Port: common.DefaultNHPPort, PubKey: pub}, // unhealthy — skipped
+			{ID: "self", InternalIP: "10.0.0.9", AZ: "us-east-2a", Port: common.DefaultNHPPort, PubKey: pub},
+			{ID: "peer-same-az", InternalIP: "10.0.0.8", AZ: "us-east-2a", Port: common.DefaultNHPPort, PubKey: pub},
+			{ID: "peer-b", InternalIP: "10.0.0.1", AZ: "us-east-2b", Port: common.DefaultNHPPort, PubKey: pub},
+			{ID: "peer-b-duplicate", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: common.DefaultNHPPort, PubKey: pub},
+			{ID: "peer-dead", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: common.DefaultNHPPort, PubKey: pub},
 		},
 	}
 	f.health.RecordFailure("peer-dead")
@@ -323,9 +420,10 @@ func TestFanoutKnock_ReachesEveryNonSelfHealthyPeer(t *testing.T) {
 	defer cancel()
 	_ = f.FanoutKnock(ctx, assignment, "10.0.0.9", []byte("knock"),
 		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321}, nil)
+	if got := deps.MetricCount(MetricKnockFanoutDuplicateAZCandidate); got != 1 {
+		t.Fatalf("%s metric = %d, want 1 duplicate non-local AZ bucket", MetricKnockFanoutDuplicateAZCandidate, got)
+	}
 
-	// FanoutKnock waited for all forwardToServer goroutines, so every send is
-	// recorded by now. Count the NHP_FWD sends.
 	close(deps.sendCh)
 	sent := 0
 	for md := range deps.sendCh {
@@ -334,16 +432,16 @@ func TestFanoutKnock_ReachesEveryNonSelfHealthyPeer(t *testing.T) {
 		}
 	}
 	if sent != 2 {
-		t.Fatalf("fan-out sent %d NHP_FWD messages, want 2 (self excluded, unhealthy peer skipped)", sent)
+		t.Fatalf("fan-out sent %d NHP_FWD messages, want 2 (one per non-local AZ, stale failure cache ignored)", sent)
 	}
 }
 
 // TestHandleHttpOpenResource_FanoutFiresAlongsideLocalBroadcast is the handler-
 // level integration test for the #948 fix on the qURL path: with
 // EnableKnockACFanout on, an origin knock both runs its local broadcast AND fans
-// the knock out to the assigned peer servers, and the handler blocks on the
-// fan-out (defer fanoutWg.Wait) before acking. Runs under -race to fence the
-// concurrent fan-out + broadcast goroutines on the hot path.
+// the knock out to one assigned peer server per non-local AZ, and the handler
+// blocks on the fan-out (defer fanoutWg.Wait) before acking. Runs under -race to
+// fence the concurrent fan-out + broadcast goroutines on the hot path.
 func TestHandleHttpOpenResource_FanoutFiresAlongsideLocalBroadcast(t *testing.T) {
 	const acId, resName = "sandbox-ac", "r_fanout"
 
@@ -362,8 +460,11 @@ func TestHandleHttpOpenResource_FanoutFiresAlongsideLocalBroadcast(t *testing.T)
 	storage.assignments[acId] = &ACAssignment{
 		ACID: acId,
 		AssignedServers: []ServerInfo{
-			{ID: "self", InternalIP: "10.0.0.99", Port: port}, // self — excluded
-			{ID: "peer-1", InternalIP: "127.0.0.1", Port: port},
+			{ID: "self", InternalIP: "10.0.0.99", AZ: "us-east-2a", Port: port},
+			{ID: "peer-same-az", InternalIP: "127.0.0.1", AZ: "us-east-2a", Port: port},
+			{ID: "peer-b", InternalIP: "127.0.0.1", AZ: "us-east-2b", Port: port},
+			{ID: "peer-b-duplicate", InternalIP: "127.0.0.1", AZ: "us-east-2b", Port: port},
+			{ID: "peer-c", InternalIP: "127.0.0.1", AZ: "us-east-2c", Port: port},
 		},
 	}
 
@@ -415,9 +516,9 @@ func TestHandleHttpOpenResource_FanoutFiresAlongsideLocalBroadcast(t *testing.T)
 	if !localBroadcast.Load() {
 		t.Error("local broadcast did not fire (the origin must still open its own ACs)")
 	}
-	// The handler must have blocked on the fan-out before returning, so the peer
-	// forward is already counted (self excluded).
-	if got := fanoutHits.Load(); got != 1 {
-		t.Fatalf("fan-out forward to peer = %d, want 1 (handler must fan out to peers AND wait before acking)", got)
+	// The handler must have blocked on the fan-out before returning, so the
+	// bounded peer forwards are already counted.
+	if got := fanoutHits.Load(); got != 2 {
+		t.Fatalf("fan-out forwards = %d, want 2 (one peer per non-local AZ before ack)", got)
 	}
 }

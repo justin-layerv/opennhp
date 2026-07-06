@@ -30,7 +30,7 @@ type UdpAC struct {
 	config     *Config
 	httpConfig *HttpConfig
 	iptables   *utils.IPTables
-	ipset      *utils.IPSet
+	ipset      ipsetWriter
 
 	// lastInvalidL3FlushConntrackBackend suppresses repeat reload warnings for
 	// the same unknown backend token. The effective config stays normalized to
@@ -176,6 +176,12 @@ type UdpAC struct {
 	ebpfLostPerfSamples         func() uint64
 	ebpfDenyTelemetrySuppressed func() uint64
 
+	// ebpfRuleAdd is the narrow test seam for eBPF admission writes.
+	// Production leaves it nil so ebpfRuleAddFailClosed calls ebpf.EbpfRuleAdd.
+	// Tests use it to prove multi-kernel-write ordering without privileged BPF
+	// maps.
+	ebpfRuleAdd func(int, ebpf.EbpfRuleParams, int) error
+
 	// ebpfTelemetryPublisherDone lets Stop wait for this one lifecycle goroutine
 	// before registration.Stop() flushes metrics, without reordering the broader
 	// ac.wg.Wait() shutdown sequence that other AC goroutines depend on.
@@ -244,6 +250,10 @@ type UdpAC struct {
 	surgicalConnFlushBatchV6 func(context.Context, FlowKey, []uint16) []error
 	surgicalConnFlushV6      func(context.Context, ConnFlowKey) error
 	enumerateConnSrcPortsV6  func(srcIP, dstIP string, proto uint8, dstPort uint16) ([]uint16, error)
+}
+
+type ipsetWriter interface {
+	Add(ipType utils.IPTYPE, t int, expire int, args ...string) (string, error)
 }
 
 // BpfFlusherSkippedCount returns the BpfFlusher's non-IPv4 skip
@@ -672,6 +682,15 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 		err = ebpflocal.EbpfEngineLoad(dirPath, logLevel, a.config.ACId)
 		if err != nil {
 			return err
+		}
+
+		// user_data always installs the iptables default-DROP gate. eBPF/XDP
+		// admissions still need to mirror successful allow-rules into ipset so
+		// packets that XDP_PASS are not dropped before Traefik/nhp-acd.
+		a.ipset, err = utils.NewIPSet(false)
+		if err != nil {
+			log.Error("ipset command not found for eBPF iptables mirror")
+			return
 		}
 	default:
 		log.Error("[HandleAccessControl] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)

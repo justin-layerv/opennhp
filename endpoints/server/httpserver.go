@@ -1346,17 +1346,15 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		}
 	}
 
-	// qurl-service#948: cell-wide knock AC fan-out. The per-resource loop below
-	// opens pinholes only on THIS server's locally-connected ACs, but the
-	// qurl.site AC NLB hashes the viewer's post-resolve GET across the whole
-	// fleet. Fan the knock out to every assigned PEER server so each opens its
-	// local ACs too; the union (local ∪ peers) is the full fleet. Origin knocks
-	// only — a forwarded knock carries Forwarded=true and is skipped, bounding
-	// depth to one hop. The defer makes EVERY return path — including the
-	// no-local-AC failover's early return below — block until peer pinholes are
-	// open before we ack, so qurl-service emits its 302 only once the fleet is
-	// covered. The fan-out is coverage-only; the ack still comes from the local
-	// broadcast / failover.
+	// qurl-service#948: AZ-scoped knock AC fan-out. The per-resource loop below
+	// opens pinholes only on THIS server's locally-connected AC slice, but the
+	// qurl.site AC NLB can send the viewer's post-resolve GET to another AZ. Fan
+	// the knock out through the assignment row so one peer server per non-local AZ
+	// opens its local AC slice too. Origin knocks only: a forwarded knock carries
+	// Forwarded=true and is skipped, bounding depth to one hop. The defer makes
+	// every return path, including the no-local-AC failover's early return below,
+	// block until peer pinholes are open before we ack. The fan-out is
+	// coverage-only; the ack still comes from the local broadcast / failover.
 	if s.knockACFanoutEnabled() && !req.Forwarded && hs.httpForwarder != nil && s.storage != nil {
 		fanoutBase := context.WithoutCancel(ctx)
 		var fanoutWg sync.WaitGroup

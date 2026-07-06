@@ -84,21 +84,19 @@ const flushSafetyMargin = 50 * time.Millisecond
 //
 // What the guarantee IS (and is NOT): the load-bearing property is "no silent
 // eviction of an admitted session, and any allow-rule tuple we fail to insert is
-// fail-closed at the datapath (no rule => XDP_DROP)." It is NOT "an admission is
-// rejected as one atomic unit." Two caller shapes differ:
-//   - Single-rule sites (e.g. mapType 1/2/6) log and RETURN on -E2BIG, so the
-//     whole admission is refused.
-//   - CIDR/range-expansion sites (mapType 4/5 temp-port handlers, and the later
-//     mapType 3 path) log and CONTINUE the per-IP loop — intentionally, so the
-//     rest of the range still gets rules. If the map fills mid-range the result
-//     is a PARTIAL allow-rule set: the inserted tuples pass, the un-inserted ones
-//     drop. That is still fail-closed (an absent rule never admits), just not
-//     all-or-nothing. The per-tuple failures are each logged + metered here.
+// fail-closed at the datapath (no rule => XDP_DROP)." TCP/UDP admission sites
+// return on insert failure so callers do not report success for a range whose
+// net-level ipset mirror was skipped. Supplementary ICMP diagnostics remain
+// warning-only, matching the IPTABLES-mode ICMP path.
 //
 // Inert under FilterMode_IPTABLES (the maps are never loaded), so this path
 // cannot fire in prod until the eBPF FilterMode flip (E5).
 func (a *UdpAC) ebpfRuleAddFailClosed(mapType int, params ebpf.EbpfRuleParams, ttlSec int) error {
-	return a.recordEbpfInsertResult(ebpf.EbpfRuleAdd(mapType, params, ttlSec), params, mapType)
+	add := ebpf.EbpfRuleAdd
+	if a != nil && a.ebpfRuleAdd != nil {
+		add = a.ebpfRuleAdd
+	}
+	return a.recordEbpfInsertResult(add(mapType, params, ttlSec), params, mapType)
 }
 
 // recordEbpfInsertResult is the detect-and-record half of
@@ -112,6 +110,35 @@ func (a *UdpAC) recordEbpfInsertResult(err error, params ebpf.EbpfRuleParams, ma
 	if ebpf.IsMapFull(err) {
 		a.incrMetric(MetricEbpfMapFull)
 		log.Error("[EbpfRuleAdd] ADMISSION FAIL-CLOSED: allow-rule eBPF map %q (mapType %d) full (-E2BIG) — refusing to insert this NEW allow-rule src: %s dst: %s; EXISTING admitted sessions are NOT evicted (#2163). Map at capacity (max_entries); see SESSION_ENFORCEMENT_ARCHITECTURE.md.", ebpf.MapTypeName(mapType), mapType, params.SrcIP, params.DstIP)
+	}
+	return err
+}
+
+// addEbpfxdpIpsetMirror admits the same tuple through the boot-time iptables
+// default-DROP gate after the eBPF allow-rule has already been written.
+//
+// Sandbox/prod user_data installs iptables + ipset for every AC regardless of
+// FilterMode. In FilterMode_EBPFXDP the XDP program returns XDP_PASS for an
+// admitted packet, but that packet still traverses INPUT and is dropped unless
+// defaultset/tempset contains the matching tuple. Keeping this shadow write
+// preserves the existing fail-closed iptables guard instead of loosening the
+// firewall for eBPF mode.
+func (a *UdpAC) addEbpfxdpIpsetMirror(ipType utils.IPTYPE, setType int, ttlSec int, hashStr, caller string) error {
+	if a.ipset == nil {
+		log.Error("[%s] eBPF iptables mirror ipset is nil", caller)
+		return common.ErrACIPSetNotFound
+	}
+	if _, err := a.ipset.Add(ipType, setType, ttlSec, hashStr); err != nil {
+		log.Error("[%s] add eBPF iptables mirror ipset %s error: %v", caller, hashStr, err)
+		return common.ErrACIPSetOperationFailed
+	}
+	return nil
+}
+
+func setArtMsgErrorFromKernelWrite(artMsg *common.ACOpsResultMsg, err error) error {
+	var nhpErr *common.Error
+	if errors.As(err, &nhpErr) {
+		return setArtMsgError(artMsg, nhpErr)
 	}
 	return err
 }
@@ -782,7 +809,7 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 	// the test fixture breaks and t.Fatalf fires — see the test's
 	// PANIC TRIGGER NOTE for guidance on porting the trigger to a
 	// new deep-path nil-deref site rather than deleting the test.
-	if a.config.FilterMode == FilterMode_IPTABLES {
+	if a.config.FilterMode == FilterMode_IPTABLES || a.config.FilterMode == FilterMode_EBPFXDP {
 		if a.ipset == nil {
 			log.Error("[HandleAccessControl] ipset is nil")
 			err = setArtMsgError(artMsg, common.ErrACIPSetNotFound)
@@ -864,6 +891,10 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
 							}
+							if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "HandleAccessControl"); err != nil {
+								err = setArtMsgErrorFromKernelWrite(artMsg, err)
+								return
+							}
 						}
 						if dstAddr.Protocol == "tcp" {
 							ebpfHashStr := ebpf.EbpfRuleParams{
@@ -876,6 +907,10 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 							err = a.ebpfRuleAddFailClosed(1, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf tcp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
+								return
+							}
+							if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "HandleAccessControl"); err != nil {
+								err = setArtMsgErrorFromKernelWrite(artMsg, err)
 								return
 							}
 						}
@@ -913,6 +948,10 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
 							}
+							if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "HandleAccessControl"); err != nil {
+								err = setArtMsgErrorFromKernelWrite(artMsg, err)
+								return
+							}
 						}
 						if dstAddr.Protocol == "udp" {
 							ebpfHashStr := ebpf.EbpfRuleParams{
@@ -926,6 +965,10 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf udp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
+								return
+							}
+							if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "HandleAccessControl"); err != nil {
+								err = setArtMsgErrorFromKernelWrite(artMsg, err)
 								return
 							}
 						}
@@ -957,6 +1000,10 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 							err = a.ebpfRuleAddFailClosed(3, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
+								return
+							}
+							if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "HandleAccessControl"); err != nil {
+								err = setArtMsgErrorFromKernelWrite(artMsg, err)
 								return
 							}
 						default:
@@ -998,9 +1045,9 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 						}
 
 					case FilterMode_EBPFXDP:
-						srcIp, ipnet, err := net.ParseCIDR(netStr)
-						if err != nil {
-							log.Error("[HandleAccessControl] failed to parse CIDR %s: %v", netStr, err)
+						srcIp, ipnet, parseErr := net.ParseCIDR(netStr)
+						if parseErr != nil {
+							log.Error("[HandleAccessControl] failed to parse CIDR %s: %v", netStr, parseErr)
 							continue
 						}
 						if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "tcp" || dstAddr.Protocol == "any" {
@@ -1011,9 +1058,10 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 										SrcIP:   srcIpStr,
 										DstPort: dstAddr.Port,
 									}
-									err = a.ebpfRuleAddFailClosed(4, ebpfHashStr, tempOpenTimeSec)
-									if err != nil {
-										log.Error("[EbpfRuleAdd] add ebpf for tcp dst port src: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPort, err)
+									if addErr := a.ebpfRuleAddFailClosed(4, ebpfHashStr, tempOpenTimeSec); addErr != nil {
+										log.Error("[EbpfRuleAdd] add ebpf for tcp dst port src: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPort, addErr)
+										err = setArtMsgErrorFromKernelWrite(artMsg, addErr)
+										return
 									}
 
 								} else {
@@ -1021,11 +1069,20 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 									// min/max bounds stay in lockstep with the XDP port_list
 									// lookup key (#2843); see allPortsEbpfRuleParams.
 									ebpfHashStr := allPortsEbpfRuleParams(srcIpStr)
-									err = a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec)
-									if err != nil {
-										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, err)
+									if addErr := a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec); addErr != nil {
+										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, addErr)
+										err = setArtMsgErrorFromKernelWrite(artMsg, addErr)
+										return
 									}
 								}
+							}
+							netHashStr := fmt.Sprintf("%s,%d", netStr, dstAddr.Port)
+							if dstAddr.Port == 0 {
+								netHashStr = fmt.Sprintf("%s,1-65535", netStr)
+							}
+							if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, netHashStr, "HandleAccessControl"); err != nil {
+								err = setArtMsgErrorFromKernelWrite(artMsg, err)
+								return
 							}
 						}
 						if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "udp" || dstAddr.Protocol == "any" {
@@ -1037,32 +1094,49 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 										SrcIP:   srcIpStr,
 										DstPort: dstAddr.Port,
 									}
-									err = a.ebpfRuleAddFailClosed(4, ebpfHashStr, tempOpenTimeSec)
-									if err != nil {
-										log.Error("[EbpfRuleAdd] add ebpf for udp dst port src: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPort, err)
+									if addErr := a.ebpfRuleAddFailClosed(4, ebpfHashStr, tempOpenTimeSec); addErr != nil {
+										log.Error("[EbpfRuleAdd] add ebpf for udp dst port src: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPort, addErr)
+										err = setArtMsgErrorFromKernelWrite(artMsg, addErr)
+										return
 									}
 								} else {
 									// All-ports sentinel built via the shared helper so the
 									// min/max bounds stay in lockstep with the XDP port_list
 									// lookup key (#2843); see allPortsEbpfRuleParams.
 									ebpfHashStr := allPortsEbpfRuleParams(srcIpStr)
-									err = a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec)
-									if err != nil {
-										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, err)
+									if addErr := a.ebpfRuleAddFailClosed(5, ebpfHashStr, tempOpenTimeSec); addErr != nil {
+										log.Error("[EbpfRuleAdd] add ebpf src: %s  dstportstart: %d,  dstportend: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstPortStart, ebpfHashStr.DstPortEnd, addErr)
+										err = setArtMsgErrorFromKernelWrite(artMsg, addErr)
+										return
 									}
 								}
 							}
+							netHashStr := fmt.Sprintf("%s,udp:%d", netStr, dstAddr.Port)
+							if dstAddr.Port == 0 {
+								netHashStr = fmt.Sprintf("%s,udp:1-65535", netStr)
+							}
+							if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, netHashStr, "HandleAccessControl"); err != nil {
+								err = setArtMsgErrorFromKernelWrite(artMsg, err)
+								return
+							}
 						}
 						if dstAddr.Port == 0 && (len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "any") {
+							icmpMirrorReady := true
 							for srcIp := srcIp.Mask(ipnet.Mask); ipnet.Contains(srcIp); incrementIP(srcIp) {
 								srcIpStr := srcIp.String()
 								ebpfHashStr := ebpf.EbpfRuleParams{
 									SrcIP: srcIpStr,
 									DstIP: dstAddr.Ip,
 								}
-								err = a.ebpfRuleAddFailClosed(3, ebpfHashStr, openTimeSec)
-								if err != nil {
-									log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
+								if addErr := a.ebpfRuleAddFailClosed(3, ebpfHashStr, tempOpenTimeSec); addErr != nil {
+									log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, addErr)
+									icmpMirrorReady = false
+								}
+							}
+							if icmpMirrorReady {
+								netHashStr := fmt.Sprintf("%s,%s", netStr, utils.ICMPEchoType(ipType))
+								if addErr := a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, netHashStr, "HandleAccessControl"); addErr != nil {
+									log.Warning("[HandleAccessControl] failed to add supplementary eBPF iptables mirror tempset ICMP entry %s: %v", netHashStr, addErr)
 								}
 							}
 						}
@@ -1159,6 +1233,18 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 				log.Error("[EbpfRuleAdd] add ebpf type 6 protocol: %s, dstport :%d, %v", ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 				return
 			}
+			portHashStr := fmt.Sprintf("%s,%d", netStr, tlocalAddr.Port)
+			if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, portHashStr, "HandleAccessControl"); err != nil {
+				err = setArtMsgErrorFromKernelWrite(artMsg, err)
+				return
+			}
+			if netStr1 != "" {
+				portHashStr = fmt.Sprintf("%s,%d", netStr1, tlocalAddr.Port)
+				if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, portHashStr, "HandleAccessControl"); err != nil {
+					err = setArtMsgErrorFromKernelWrite(artMsg, err)
+					return
+				}
+			}
 		default:
 			log.Error("[HandleAccessControl] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
 			return
@@ -1219,6 +1305,18 @@ func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgI
 			if err != nil {
 				log.Error("[EbpfRuleAdd] add ebpf type 6 protocol: %s, dstport :%d, %v", ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 				return
+			}
+			portHashStr := fmt.Sprintf("%s,udp:%d", netStr, tlocalAddr.Port)
+			if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, portHashStr, "HandleAccessControl"); err != nil {
+				err = setArtMsgErrorFromKernelWrite(artMsg, err)
+				return
+			}
+			if netStr1 != "" {
+				portHashStr = fmt.Sprintf("%s,udp:%d", netStr1, tlocalAddr.Port)
+				if err = a.addEbpfxdpIpsetMirror(ipType, 4, tempOpenTimeSec, portHashStr, "HandleAccessControl"); err != nil {
+					err = setArtMsgErrorFromKernelWrite(artMsg, err)
+					return
+				}
 			}
 		default:
 			log.Error("[HandleAccessControl] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
@@ -1439,6 +1537,9 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 					log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 					return
 				}
+				if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "tcpTempAccessHandler"); err != nil {
+					return
+				}
 			default:
 				log.Error("[tcpTempAccessHandler] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
 				return
@@ -1582,6 +1683,9 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 							log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 							return
 						}
+						if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "udpTempAccessHandler"); err != nil {
+							return
+						}
 					}
 					if dstAddr.Protocol == "udp" {
 						ebpfHashStr := ebpf.EbpfRuleParams{
@@ -1595,6 +1699,9 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 
 						if err != nil {
 							log.Error("[EbpfRuleAdd] add ebpf udp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
+							return
+						}
+						if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "udpTempAccessHandler"); err != nil {
 							return
 						}
 					}
@@ -1637,6 +1744,10 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 					if err != nil {
 						log.Error("[EbpfRuleAdd] add ebpf icmp src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 						return
+					}
+					ipHashStr := fmt.Sprintf("%s,%s,%s", remoteAddr.IP.String(), utils.ICMPEchoType(ipType), dstAddr.Ip)
+					if err = a.addEbpfxdpIpsetMirror(ipType, 1, openTimeSec, ipHashStr, "udpTempAccessHandler"); err != nil {
+						log.Warning("[udpTempAccessHandler] failed to add eBPF iptables mirror ICMP rule %s: %v", ipHashStr, err)
 					}
 				default:
 					log.Error("[udpTempAccessHandler] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)

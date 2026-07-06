@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlv2"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
@@ -388,6 +389,97 @@ func TestForwardedACOperationResourceData_OverlaysAdmissionMetadata(t *testing.T
 	}
 }
 
+func TestNativeForwardResolvedResourceData_RoutingOnly(t *testing.T) {
+	src := &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			AuthServiceId:     "qurl",
+			ResourceId:        "q_123456789ab",
+			OpenTime:          300,
+			AuthProviderToken: "must-not-cross",
+			Resources: map[string]*common.ResourceInfo{
+				"ac-a": {
+					ACId:     "ac-a",
+					Hostname: "resource.example",
+					Addr: &common.NetAddress{
+						Ip:       "",
+						Port:     443,
+						Protocol: "tcp",
+					},
+				},
+			},
+		},
+		AppSecret:             "must-not-cross",
+		SecretKey:             "must-not-cross",
+		ExInfo:                map[string]any{"jwt_secret": "must-not-cross"},
+		RedirectUrl:           "https://resource.example",
+		ResourcePublicKeyHash: "rhash",
+		QurlUserPublicKeyHash: "qhash",
+		AdmissionId:           "adm-123",
+	}
+
+	got := nativeForwardResolvedResourceData(src)
+	if got == nil {
+		t.Fatal("nativeForwardResolvedResourceData returned nil")
+	}
+	if got.AuthServiceId != "qurl" || got.ResourceId != "q_123456789ab" || got.OpenTime != 300 || got.ResourcePublicKeyHash != "rhash" {
+		t.Fatalf("resolved route = %+v, want routing scalars plus resource hash", got)
+	}
+	if len(got.Resources) != 1 || got.Resources["ac-a"] == nil || got.Resources["ac-a"].Addr == nil {
+		t.Fatalf("resolved route resources not copied: %+v", got.Resources)
+	}
+	src.Resources["ac-a"].Addr.Port = 8443
+	if got.Resources["ac-a"].Addr.Port != 443 {
+		t.Fatal("resolved route resources alias source ResourceData")
+	}
+
+	if got := nativeForwardResolvedResourceData(&common.ResourceData{
+		ResourceGroup: common.ResourceGroup{AuthServiceId: "qurl", ResourceId: "q_123456789ab"},
+	}); got != nil {
+		t.Fatalf("catalog without Resources should omit resolved route, got %+v", got)
+	}
+}
+
+func TestForwardedResolvedResourceData_BindsQurlV2ResourceIdentity(t *testing.T) {
+	resourceKeyB64 := base64.RawURLEncoding.EncodeToString([]byte("resource-key-identity"))
+	resourceHash, err := qurlv2.PublicKeyHashFromB64(resourceKeyB64)
+	if err != nil {
+		t.Fatalf("hash resource key: %v", err)
+	}
+	route := &common.ForwardResolvedResourceData{
+		AuthServiceId:         "qurl",
+		ResourceId:            "q_123456789ab",
+		OpenTime:              300,
+		ResourcePublicKeyHash: resourceHash,
+		Resources: map[string]*common.ResourceInfo{
+			"ac-a": {
+				ACId: "ac-a",
+				Addr: &common.NetAddress{Port: 443, Protocol: "tcp"},
+			},
+		},
+	}
+	knock := &common.AgentKnockMsg{AuthServiceId: "qurl", ResourceId: resourceKeyB64}
+
+	got, err := forwardedResolvedResourceData(route, nil, knock)
+	if err != nil {
+		t.Fatalf("forwardedResolvedResourceData returned error: %v", err)
+	}
+	if got.ResourceId != "q_123456789ab" || got.ResourcePublicKeyHash != resourceHash || got.OpenTime != 300 {
+		t.Fatalf("resolved fallback ResourceData = %+v", got)
+	}
+
+	badRoute := *route
+	badRoute.ResourcePublicKeyHash = "not-the-knock-hash"
+	if _, err := forwardedResolvedResourceData(&badRoute, nil, knock); err == nil {
+		t.Fatal("expected resource-hash mismatch to reject forwarded route")
+	}
+
+	noHashRoute := *route
+	noHashRoute.ResourcePublicKeyHash = ""
+	if _, err := forwardedResolvedResourceData(&noHashRoute, nil, knock); err == nil {
+		t.Fatal("expected differing resource ids without a hash to reject forwarded route")
+	}
+}
+
 func TestHandleDecryptedForwardedKnock_CarriesAdmissionMetadata(t *testing.T) {
 	baseDeps := NewMockForwarderDeps()
 	baseDeps.SetAuthServiceProvider(&common.AuthServiceProviderData{
@@ -476,6 +568,109 @@ func TestHandleDecryptedForwardedKnock_CarriesAdmissionMetadata(t *testing.T) {
 	if got := baseDeps.MetricCount(MetricForwardAdmissionResourceHashMismatch); got != 1 {
 		t.Fatalf("%s = %d, want 1 for sidecar/catalog resource-hash mismatch",
 			MetricForwardAdmissionResourceHashMismatch, got)
+	}
+
+	select {
+	case msg := <-baseDeps.GetSendChannel():
+		var result common.ServerForwardResultMsg
+		if err := json.Unmarshal(msg.Message, &result); err != nil {
+			t.Fatalf("parse forward result: %v", err)
+		}
+		if !result.Success {
+			t.Fatalf("forward result failed: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for forward result")
+	}
+}
+
+func TestHandleDecryptedForwardedKnock_UsesResolvedResourceFallbackForQurlV2(t *testing.T) {
+	resourceKeyB64 := base64.RawURLEncoding.EncodeToString([]byte("resource-key-identity"))
+	resourceHash, err := qurlv2.PublicKeyHashFromB64(resourceKeyB64)
+	if err != nil {
+		t.Fatalf("hash resource key: %v", err)
+	}
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetAuthServiceProvider(&common.AuthServiceProviderData{
+		AuthSvcId:      "qurl",
+		ResourceGroups: common.ResourceGroupMap{},
+	})
+	baseDeps.SetACConnection(&ACConn{})
+	deps := &captureBroadcastForwarderDeps{MockForwarderDeps: baseDeps}
+	forwarder := NewServerForwarder(deps)
+
+	knockMsg := &common.AgentKnockMsg{
+		HeaderType:    core.NHP_KNK,
+		UserId:        "user-1",
+		DeviceId:      "device-1",
+		AuthServiceId: "qurl",
+		ResourceId:    resourceKeyB64,
+	}
+	body, err := json.Marshal(knockMsg)
+	if err != nil {
+		t.Fatalf("marshal knock: %v", err)
+	}
+	fwdMsg := &common.ServerForwardMsg{
+		SourceServer:  "srv-origin",
+		UserAddr:      "203.0.113.10:54321",
+		TransactionId: 77,
+		Timestamp:     time.Now().Unix(),
+		AdmissionRevocationData: &common.ForwardAdmissionRevocationData{
+			QurlUserPublicKeyHash: "qhash",
+			ResourcePublicKeyHash: resourceHash,
+			AdmissionId:           "adm-123",
+			Deadline:              1781910300,
+		},
+		ResolvedResourceData: &common.ForwardResolvedResourceData{
+			AuthServiceId:         "qurl",
+			ResourceId:            "q_123456789ab",
+			OpenTime:              300,
+			ResourcePublicKeyHash: resourceHash,
+			Resources: map[string]*common.ResourceInfo{
+				"ac-a": {
+					ACId:     "ac-a",
+					Hostname: "resource.example",
+					Addr: &common.NetAddress{
+						Port:     443,
+						Protocol: "tcp",
+					},
+				},
+			},
+		},
+	}
+	userAddr, err := net.ResolveUDPAddr("udp", fwdMsg.UserAddr)
+	if err != nil {
+		t.Fatalf("resolve user addr: %v", err)
+	}
+
+	forwarder.handleDecryptedForwardedKnock(nil, fwdMsg, userAddr, &core.PacketParserData{
+		BodyMessage:  body,
+		RemotePubKey: make([]byte, 32),
+	})
+
+	got := deps.capturedResource
+	if got == nil {
+		t.Fatal("forward receiver did not call ProcessACOperationBroadcast")
+	}
+	if got.AuthServiceId != "qurl" || got.ResourceId != "q_123456789ab" || got.OpenTime != 300 {
+		t.Fatalf("fallback ResourceData routing fields = %+v", got.ResourceGroup)
+	}
+	info := got.Resources["ac-a"]
+	if info == nil || info.ACId != "ac-a" || info.Hostname != "resource.example" || info.Addr == nil || info.Addr.Port != 443 {
+		t.Fatalf("fallback ResourceData resource info = %+v", got.Resources)
+	}
+	if got.ResourcePublicKeyHash != resourceHash ||
+		got.QurlUserPublicKeyHash != "qhash" ||
+		got.AdmissionId != "adm-123" ||
+		got.Deadline != 1781910300 {
+		t.Fatalf("fallback ResourceData admission metadata = %+v", got)
+	}
+	if deps.capturedOpenTime != 300 {
+		t.Fatalf("openTime = %d, want forwarded resolved route openTime 300", deps.capturedOpenTime)
+	}
+	if got := baseDeps.MetricCount(MetricForwardResolvedResourceFallback); got != 1 {
+		t.Fatalf("%s = %d, want 1", MetricForwardResolvedResourceFallback, got)
 	}
 
 	select {
@@ -971,6 +1166,17 @@ func TestForwardKnock_CarriesAdmissionRevocationData(t *testing.T) {
 			[]byte("knock"),
 			&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
 			&common.ResourceData{
+				ResourceGroup: common.ResourceGroup{
+					AuthServiceId: "qurl",
+					ResourceId:    "q_123456789ab",
+					OpenTime:      300,
+					Resources: map[string]*common.ResourceInfo{
+						"ac-a": {
+							ACId: "ac-a",
+							Addr: &common.NetAddress{Port: 443, Protocol: "tcp"},
+						},
+					},
+				},
 				QurlUserPublicKeyHash: "qhash",
 				ResourcePublicKeyHash: "verified-rhash",
 				SessionId:             "sess-live",
@@ -1003,6 +1209,16 @@ func TestForwardKnock_CarriesAdmissionRevocationData(t *testing.T) {
 			got.AdmissionId != "adm-123" ||
 			got.Deadline != 1781910300 {
 			t.Fatalf("forward admission revocation data = %+v, want origin admission metadata", got)
+		}
+		route := fwdMsg.ResolvedResourceData
+		if route == nil {
+			t.Fatal("ForwardKnock omitted resolved resource route")
+		}
+		if route.AuthServiceId != "qurl" || route.ResourceId != "q_123456789ab" || route.OpenTime != 300 || route.ResourcePublicKeyHash != "verified-rhash" {
+			t.Fatalf("forward resolved resource route = %+v, want origin routing snapshot", route)
+		}
+		if route.Resources["ac-a"] == nil || route.Resources["ac-a"].Addr == nil || route.Resources["ac-a"].Addr.Port != 443 {
+			t.Fatalf("forward resolved resource route resources = %+v", route.Resources)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for ForwardKnock send")
@@ -1067,6 +1283,17 @@ func TestFanoutKnock_CarriesAdmissionRevocationData(t *testing.T) {
 		[]byte("knock"),
 		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
 		&common.ResourceData{
+			ResourceGroup: common.ResourceGroup{
+				AuthServiceId: "qurl",
+				ResourceId:    "q_123456789ab",
+				OpenTime:      300,
+				Resources: map[string]*common.ResourceInfo{
+					"ac-a": {
+						ACId: "ac-a",
+						Addr: &common.NetAddress{Port: 443, Protocol: "tcp"},
+					},
+				},
+			},
 			QurlUserPublicKeyHash: "qhash",
 			ResourcePublicKeyHash: "verified-rhash",
 			SessionId:             "sess-live",
@@ -1097,6 +1324,13 @@ func TestFanoutKnock_CarriesAdmissionRevocationData(t *testing.T) {
 			got.AdmissionId != "adm-123" ||
 			got.Deadline != 1781910300 {
 			t.Fatalf("fanout admission revocation data = %+v, want origin admission metadata", got)
+		}
+		route := fwdMsg.ResolvedResourceData
+		if route == nil {
+			t.Fatal("FanoutKnock omitted resolved resource route")
+		}
+		if route.AuthServiceId != "qurl" || route.ResourceId != "q_123456789ab" || route.OpenTime != 300 || route.ResourcePublicKeyHash != "verified-rhash" {
+			t.Fatalf("fanout resolved resource route = %+v, want origin routing snapshot", route)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for FanoutKnock send")

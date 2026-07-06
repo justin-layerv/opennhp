@@ -10,7 +10,40 @@ import (
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
+	"github.com/OpenNHP/opennhp/nhp/utils"
+	"github.com/OpenNHP/opennhp/nhp/utils/ebpf"
 )
+
+type recordingIPSetAdd struct {
+	ipType  utils.IPTYPE
+	setType int
+	expire  int
+	args    []string
+}
+
+type recordingIPSet struct {
+	adds   []recordingIPSetAdd
+	err    error
+	events *[]string
+}
+
+var _ ipsetWriter = (*recordingIPSet)(nil)
+
+func (r *recordingIPSet) Add(ipType utils.IPTYPE, setType int, expire int, args ...string) (string, error) {
+	if r.events != nil {
+		*r.events = append(*r.events, "ipset")
+	}
+	r.adds = append(r.adds, recordingIPSetAdd{
+		ipType:  ipType,
+		setType: setType,
+		expire:  expire,
+		args:    append([]string(nil), args...),
+	})
+	if r.err != nil {
+		return "", r.err
+	}
+	return "", nil
+}
 
 // TestHandleUdpACOperations_DedupeRunsBeforeUnmarshal pins the
 // ordering invariant from issue #1123: the AOP replay-dedupe gate
@@ -415,6 +448,247 @@ func TestHandleAccessControl_RejectsNonPositiveOpenTime(t *testing.T) {
 		if artMsg.ErrCode != common.ErrACInvalidOpenTime.ErrorCode() {
 			t.Errorf("openTimeSec=%d: artMsg.ErrCode = %q, want %q", openTimeSec, artMsg.ErrCode, common.ErrACInvalidOpenTime.ErrorCode())
 		}
+	}
+}
+
+func TestHandleAccessControl_EBPFXDPMirrorsDirectTCPAdmissionToIpset(t *testing.T) {
+	events := []string{}
+	ipset := &recordingIPSet{events: &events}
+	var ebpfCalls []struct {
+		mapType int
+		params  ebpf.EbpfRuleParams
+		ttlSec  int
+	}
+	a := &UdpAC{
+		config: &Config{
+			DefaultIp:  "10.100.1.11",
+			FilterMode: FilterMode_EBPFXDP,
+		},
+		ipset: ipset,
+		ebpfRuleAdd: func(mapType int, params ebpf.EbpfRuleParams, ttlSec int) error {
+			if len(ipset.adds) != 0 {
+				t.Fatalf("ipset mirror written before eBPF allow-rule: %+v", ipset.adds)
+			}
+			events = append(events, "ebpf")
+			ebpfCalls = append(ebpfCalls, struct {
+				mapType int
+				params  ebpf.EbpfRuleParams
+				ttlSec  int
+			}{mapType: mapType, params: params, ttlSec: ttlSec})
+			return nil
+		},
+	}
+	entry := &AccessEntry{
+		SrcAddrs: []*common.NetAddress{{Ip: "198.51.100.7"}},
+		DstAddrs: []*common.NetAddress{{
+			Ip:       "",
+			Port:     443,
+			Protocol: "tcp",
+		}},
+	}
+
+	artMsg, err := a.HandleAccessControl(entry, 300, nil)
+	if err != nil {
+		t.Fatalf("HandleAccessControl returned error: %v", err)
+	}
+	if artMsg.ErrCode != common.ErrSuccess.ErrorCode() {
+		t.Fatalf("artMsg.ErrCode = %q, want success", artMsg.ErrCode)
+	}
+	if len(ebpfCalls) != 1 {
+		t.Fatalf("eBPF calls = %d, want 1: %+v", len(ebpfCalls), ebpfCalls)
+	}
+	call := ebpfCalls[0]
+	if call.mapType != 1 || call.ttlSec != 300 {
+		t.Fatalf("eBPF call = mapType %d ttl %d, want mapType 1 ttl 300", call.mapType, call.ttlSec)
+	}
+	if call.params.SrcIP != "198.51.100.7" || call.params.DstIP != "10.100.1.11" || call.params.DstPort != 443 || call.params.Protocol != "tcp" {
+		t.Fatalf("eBPF params = %+v, want direct TCP admission to DefaultIp", call.params)
+	}
+	if len(ipset.adds) != 1 {
+		t.Fatalf("ipset adds = %d, want 1: %+v", len(ipset.adds), ipset.adds)
+	}
+	add := ipset.adds[0]
+	if add.ipType != utils.IPV4 || add.setType != 1 || add.expire != 300 {
+		t.Fatalf("ipset add metadata = %+v, want ipv4 defaultset ttl 300", add)
+	}
+	if len(add.args) != 1 || add.args[0] != "198.51.100.7,443,10.100.1.11" {
+		t.Fatalf("ipset add args = %+v, want qURL defaultset tuple", add.args)
+	}
+	if len(events) != 2 || events[0] != "ebpf" || events[1] != "ipset" {
+		t.Fatalf("kernel write order = %+v, want [ebpf ipset]", events)
+	}
+}
+
+func TestHandleAccessControl_EBPFXDPCIDRICMPMirrorUsesSameTempTTL(t *testing.T) {
+	ipset := &recordingIPSet{}
+	var ebpfCalls []struct {
+		mapType int
+		params  ebpf.EbpfRuleParams
+		ttlSec  int
+	}
+	a := &UdpAC{
+		config: &Config{
+			DefaultIp:  "10.100.1.11",
+			FilterMode: FilterMode_EBPFXDP,
+			IpPassMode: PASS_KNOCKIP_WITH_RANGE,
+		},
+		ipset: ipset,
+		ebpfRuleAdd: func(mapType int, params ebpf.EbpfRuleParams, ttlSec int) error {
+			ebpfCalls = append(ebpfCalls, struct {
+				mapType int
+				params  ebpf.EbpfRuleParams
+				ttlSec  int
+			}{mapType: mapType, params: params, ttlSec: ttlSec})
+			return nil
+		},
+	}
+	entry := &AccessEntry{
+		SrcAddrs: []*common.NetAddress{{Ip: "198.51.100.7"}},
+		DstAddrs: []*common.NetAddress{{
+			Ip:       "10.100.1.11",
+			Port:     0,
+			Protocol: "any",
+		}},
+	}
+
+	artMsg, err := a.HandleAccessControl(entry, 300, nil)
+	if err != nil {
+		t.Fatalf("HandleAccessControl returned error: %v", err)
+	}
+	if artMsg.ErrCode != common.ErrSuccess.ErrorCode() {
+		t.Fatalf("artMsg.ErrCode = %q, want success", artMsg.ErrCode)
+	}
+
+	foundCIDRICMP := false
+	for _, call := range ebpfCalls {
+		if call.mapType == 3 && call.ttlSec == TempPortOpenTime {
+			foundCIDRICMP = true
+			break
+		}
+	}
+	if !foundCIDRICMP {
+		t.Fatalf("did not find range-mode ICMP eBPF rule with temp ttl %d in calls %+v", TempPortOpenTime, ebpfCalls)
+	}
+
+	icmpMirror := false
+	for _, add := range ipset.adds {
+		if add.setType != 4 || add.expire != TempPortOpenTime {
+			continue
+		}
+		for _, arg := range add.args {
+			if arg == "198.51.100.0/25,icmp:8/0" {
+				icmpMirror = true
+			}
+		}
+	}
+	if !icmpMirror {
+		t.Fatalf("did not find range-mode ICMP ipset mirror with temp ttl %d in adds %+v", TempPortOpenTime, ipset.adds)
+	}
+}
+
+func TestHandleAccessControl_EBPFXDPCIDRRangeTCPInsertFailureFailsClosed(t *testing.T) {
+	ipset := &recordingIPSet{}
+	ebpfErr := errors.New("synthetic range insert failure")
+	rangeCalls := 0
+	a := &UdpAC{
+		config: &Config{
+			DefaultIp:  "10.100.1.11",
+			FilterMode: FilterMode_EBPFXDP,
+			IpPassMode: PASS_KNOCKIP_WITH_RANGE,
+		},
+		ipset: ipset,
+		ebpfRuleAdd: func(mapType int, _ ebpf.EbpfRuleParams, _ int) error {
+			if mapType == 4 {
+				rangeCalls++
+				if rangeCalls == 2 {
+					return ebpfErr
+				}
+			}
+			return nil
+		},
+	}
+	entry := &AccessEntry{
+		SrcAddrs: []*common.NetAddress{{Ip: "198.51.100.7"}},
+		DstAddrs: []*common.NetAddress{{
+			Ip:       "10.100.1.11",
+			Port:     443,
+			Protocol: "tcp",
+		}},
+	}
+
+	_, err := a.HandleAccessControl(entry, 300, nil)
+	if !errors.Is(err, ebpfErr) {
+		t.Fatalf("error = %v, want synthetic range eBPF failure", err)
+	}
+	if rangeCalls != 2 {
+		t.Fatalf("range eBPF calls = %d, want failure on second call", rangeCalls)
+	}
+	for _, add := range ipset.adds {
+		if add.setType == 4 {
+			t.Fatalf("range ipset mirror should not be written after partial eBPF insert failure: %+v", ipset.adds)
+		}
+	}
+}
+
+func TestHandleAccessControl_EBPFXDPDoesNotMirrorWhenEbpfInsertFails(t *testing.T) {
+	ipset := &recordingIPSet{}
+	ebpfErr := errors.New("synthetic ebpf insert failure")
+	a := &UdpAC{
+		config: &Config{
+			DefaultIp:  "10.100.1.11",
+			FilterMode: FilterMode_EBPFXDP,
+		},
+		ipset: ipset,
+		ebpfRuleAdd: func(int, ebpf.EbpfRuleParams, int) error {
+			return ebpfErr
+		},
+	}
+	entry := &AccessEntry{
+		SrcAddrs: []*common.NetAddress{{Ip: "198.51.100.7"}},
+		DstAddrs: []*common.NetAddress{{
+			Port:     443,
+			Protocol: "tcp",
+		}},
+	}
+
+	_, err := a.HandleAccessControl(entry, 300, nil)
+	if !errors.Is(err, ebpfErr) {
+		t.Fatalf("error = %v, want synthetic eBPF failure", err)
+	}
+	if len(ipset.adds) != 0 {
+		t.Fatalf("ipset mirror should not be written after eBPF failure: %+v", ipset.adds)
+	}
+}
+
+func TestHandleAccessControl_EBPFXDPRequiresIpsetMirror(t *testing.T) {
+	ebpfCalled := false
+	a := &UdpAC{
+		config: &Config{
+			DefaultIp:  "10.100.1.11",
+			FilterMode: FilterMode_EBPFXDP,
+		},
+		ebpfRuleAdd: func(int, ebpf.EbpfRuleParams, int) error {
+			ebpfCalled = true
+			return nil
+		},
+	}
+	entry := &AccessEntry{
+		SrcAddrs: []*common.NetAddress{{Ip: "198.51.100.7"}},
+		DstAddrs: []*common.NetAddress{{
+			Port:     443,
+			Protocol: "tcp",
+		}},
+	}
+
+	artMsg, err := a.HandleAccessControl(entry, 300, nil)
+	if !errors.Is(err, common.ErrACIPSetNotFound) {
+		t.Fatalf("error = %v, want ErrACIPSetNotFound", err)
+	}
+	if artMsg == nil || artMsg.ErrCode != common.ErrACIPSetNotFound.ErrorCode() {
+		t.Fatalf("artMsg = %+v, want ErrACIPSetNotFound", artMsg)
+	}
+	if ebpfCalled {
+		t.Fatal("eBPF insert should not run when the iptables mirror is unavailable")
 	}
 }
 

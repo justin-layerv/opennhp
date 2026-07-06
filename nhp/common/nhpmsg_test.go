@@ -326,6 +326,9 @@ func TestServerForwardMsg_AdmissionRevocationDataWireCompat(t *testing.T) {
 	if strings.Contains(string(legacyBytes), "admissionRevocationData") {
 		t.Fatalf("legacy forward wire must omit admissionRevocationData, got: %s", legacyBytes)
 	}
+	if strings.Contains(string(legacyBytes), "resolvedResourceData") {
+		t.Fatalf("legacy forward wire must omit resolvedResourceData, got: %s", legacyBytes)
+	}
 
 	v2 := &ServerForwardMsg{
 		KnockData:     []byte("knock"),
@@ -340,6 +343,19 @@ func TestServerForwardMsg_AdmissionRevocationDataWireCompat(t *testing.T) {
 			AdmissionId:           "adm-123",
 			Deadline:              1781910300,
 		},
+		ResolvedResourceData: &ForwardResolvedResourceData{
+			AuthServiceId:         "qurl",
+			ResourceId:            "q_123456789ab",
+			OpenTime:              300,
+			ResourcePublicKeyHash: "rhash",
+			Resources: map[string]*ResourceInfo{
+				"ac-a": {
+					ACId:     "ac-a",
+					Hostname: "resource.example",
+					Addr:     &NetAddress{Port: 443, Protocol: "tcp"},
+				},
+			},
+		},
 	}
 	v2Bytes, err := json.Marshal(v2)
 	if err != nil {
@@ -353,6 +369,11 @@ func TestServerForwardMsg_AdmissionRevocationDataWireCompat(t *testing.T) {
 		`"sessId":"sess-live"`,
 		`"admId":"adm-123"`,
 		`"deadline":1781910300`,
+		`"resolvedResourceData":`,
+		`"aspId":"qurl"`,
+		`"resId":"q_123456789ab"`,
+		`"opnTime":300`,
+		`"resInfo":`,
 	} {
 		if !strings.Contains(wire, want) {
 			t.Fatalf("forward wire missing %s, got: %s", want, wire)
@@ -367,5 +388,8 @@ func TestServerForwardMsg_AdmissionRevocationDataWireCompat(t *testing.T) {
 	}
 	if !reflect.DeepEqual(roundTrip.AdmissionRevocationData, v2.AdmissionRevocationData) {
 		t.Fatalf("unmarshaled admissionRevocationData = %+v, want %+v", roundTrip.AdmissionRevocationData, v2.AdmissionRevocationData)
+	}
+	if !reflect.DeepEqual(roundTrip.ResolvedResourceData, v2.ResolvedResourceData) {
+		t.Fatalf("unmarshaled resolvedResourceData = %+v, want %+v", roundTrip.ResolvedResourceData, v2.ResolvedResourceData)
 	}
 }

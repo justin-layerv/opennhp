@@ -536,26 +536,172 @@ func TestHandleACServerAssignment_CrossColorSaveFailureDoesNotCountMigration(t *
 	}
 }
 
+// TestHandleACServerAssignment_SuppressesCrossColorMigrationWhenTargetWouldShrinkCoverage
+// fences the qURL timeout class seen in sandbox: a shared ACId had a healthy
+// three-server assignment, but a cross-color registration rewrote it to the one
+// visible server in the other color. qURL admission then reached only that
+// server's AC connection while browser traffic landed on a different active AC.
+func TestHandleACServerAssignment_SuppressesCrossColorMigrationWhenTargetWouldShrinkCoverage(t *testing.T) {
+	const (
+		blueASG  = "layerv-nhp-sandbox-server"
+		greenASG = "layerv-nhp-sandbox-server-green"
+		acID     = "layerv-ac-shrink"
+	)
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba", ASGName: blueASG},
+			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-bb", ASGName: blueASG},
+			{ID: "i-blue-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-bc", ASGName: blueASG},
+			{ID: "i-green-a", IP: "10.0.1.1", InternalIP: "10.0.1.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ga", ASGName: greenASG},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments[acID] = &ACAssignment{
+		ACID:    acID,
+		Version: 5,
+		AssignedServers: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba"},
+			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-bb"},
+			{ID: "i-blue-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-bc"},
+		},
+		CreatedAt: now,
+		LastSeen:  now,
+		TTL:       &ttl,
+	}
+
+	srv, mp := newColorTestServer(t, storage, cloudMap, "i-green-a", greenASG, "10.0.1.1")
+	aolMsg := &common.ACOnlineMsg{ACId: acID}
+
+	redirected, peers, err := srv.handleACServerAssignment(newACOnlinePPD(), aolMsg, 55555, "10.99.0.5:62206")
+	if err != nil {
+		t.Fatalf("handleACServerAssignment returned error: %v", err)
+	}
+	if !redirected {
+		t.Fatal("expected suppressed migration to redirect/fail closed instead of accepting locally")
+	}
+	if peers != nil {
+		t.Fatalf("expected no assigned peers on redirected path, got %d", len(peers))
+	}
+	srv.wg.Wait()
+
+	storage.mu.Lock()
+	saved := storage.assignments[acID]
+	storage.mu.Unlock()
+	if saved == nil {
+		t.Fatal("assignment missing after suppressed migration")
+	}
+	if saved.Version != 6 {
+		t.Errorf("expected Version to refresh to 6, got %d", saved.Version)
+	}
+	if len(saved.AssignedServers) != MaxServersPerAssignment {
+		t.Fatalf("expected existing %d-server assignment to remain intact, got %d", MaxServersPerAssignment, len(saved.AssignedServers))
+	}
+	for _, srvInfo := range saved.AssignedServers {
+		if srvInfo.ID == "i-green-a" {
+			t.Fatal("coverage-shrinking green singleton was persisted")
+		}
+	}
+
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricACAssignmentColorMigration] != 0 {
+		t.Errorf("expected %s=0 when migration is suppressed, got %v", MetricACAssignmentColorMigration, counters[MetricACAssignmentColorMigration])
+	}
+	if counters[MetricACAssignmentColorMigrationSuppressed] != 1 {
+		t.Errorf("expected %s=1, got %v", MetricACAssignmentColorMigrationSuppressed, counters[MetricACAssignmentColorMigrationSuppressed])
+	}
+}
+
+func TestHandleACServerAssignment_SuppressesCrossColorMigrationWhenTargetWouldLoseAZCoverage(t *testing.T) {
+	const (
+		blueASG  = "layerv-nhp-sandbox-server"
+		greenASG = "layerv-nhp-sandbox-server-green"
+		acID     = "layerv-ac-az-shrink"
+	)
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba", ASGName: blueASG},
+			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-bb", ASGName: blueASG},
+			{ID: "i-blue-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-bc", ASGName: blueASG},
+			// Three dialable green targets, but all in one AZ. That would
+			// preserve count while losing the one-pinhole-per-AZ invariant.
+			{ID: "i-green-a", IP: "10.0.1.1", InternalIP: "10.0.1.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ga", ASGName: greenASG},
+			{ID: "i-green-b", IP: "10.0.1.2", InternalIP: "10.0.1.2", AZ: "us-east-2a", Port: 62206, PubKey: "pk-gb", ASGName: greenASG},
+			{ID: "i-green-c", IP: "10.0.1.3", InternalIP: "10.0.1.3", AZ: "us-east-2a", Port: 62206, PubKey: "pk-gc", ASGName: greenASG},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments[acID] = &ACAssignment{
+		ACID:    acID,
+		Version: 8,
+		AssignedServers: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba"},
+			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-bb"},
+			{ID: "i-blue-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-bc"},
+		},
+		CreatedAt: now,
+		LastSeen:  now,
+		TTL:       &ttl,
+	}
+
+	srv, mp := newColorTestServer(t, storage, cloudMap, "i-green-a", greenASG, "10.0.1.1")
+	aolMsg := &common.ACOnlineMsg{ACId: acID}
+
+	redirected, _, err := srv.handleACServerAssignment(newACOnlinePPD(), aolMsg, 55556, "10.99.0.6:62206")
+	if err != nil {
+		t.Fatalf("handleACServerAssignment returned error: %v", err)
+	}
+	if !redirected {
+		t.Fatal("expected AZ-coverage-losing migration to be suppressed")
+	}
+	srv.wg.Wait()
+
+	storage.mu.Lock()
+	saved := storage.assignments[acID]
+	storage.mu.Unlock()
+	if saved.Version != 9 {
+		t.Errorf("expected Version to refresh to 9, got %d", saved.Version)
+	}
+	for _, srvInfo := range saved.AssignedServers {
+		if srvInfo.ASGName == greenASG || srvInfo.ID == "i-green-a" || srvInfo.ID == "i-green-b" || srvInfo.ID == "i-green-c" {
+			t.Fatalf("AZ-coverage-losing green assignment was persisted: %v", saved.AssignedServers)
+		}
+	}
+
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricACAssignmentColorMigrationSuppressed] != 1 {
+		t.Errorf("expected %s=1, got %v", MetricACAssignmentColorMigrationSuppressed, counters[MetricACAssignmentColorMigrationSuppressed])
+	}
+}
+
 // TestHandleACServerAssignment_MigratesWhenSelfNotYetInSnapshot fences the
 // subtlest edge of the migration path: when this server (the answering
 // new-color server) has not yet propagated to Cloud Map, the wholesale
-// reassign builds the new assignment from the visible new-color subset and
+// reassign builds the new assignment from a complete visible new-color set and
 // can legitimately EXCLUDE self. The result must still be all-new-color (never
-// re-create a cross-color set) and non-empty; the AC picks up the rest —
-// including self — on a later re-registration once it propagates.
+// re-create a cross-color set) and preserve coverage; the AC picks up self on a
+// later re-registration once it propagates.
 func TestHandleACServerAssignment_MigratesWhenSelfNotYetInSnapshot(t *testing.T) {
 	const (
 		blueASG  = "layerv-nhp-sandbox-server"
 		greenASG = "layerv-nhp-sandbox-server-green"
 		acID     = "layerv-ac-selfmissing"
 	)
-	// Cloud Map shows the old (blue) servers + two NEW (green) servers, but NOT
-	// this server (i-green-a) — it hasn't registered/propagated yet.
+	// Cloud Map shows the old (blue) servers + three NEW (green) servers, but
+	// NOT this server (i-green-a) — it hasn't registered/propagated yet.
 	cloudMap := &CloudMapClient{
 		cachedInstances: []ServerInfo{
 			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba", ASGName: blueASG},
 			{ID: "i-blue-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-bb", ASGName: blueASG},
 			{ID: "i-blue-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-bc", ASGName: blueASG},
+			{ID: "i-green-d", IP: "10.0.1.4", InternalIP: "10.0.1.4", AZ: "us-east-2a", Port: 62206, PubKey: "pk-gd", ASGName: greenASG},
 			{ID: "i-green-b", IP: "10.0.1.2", InternalIP: "10.0.1.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-gb", ASGName: greenASG},
 			{ID: "i-green-c", IP: "10.0.1.3", InternalIP: "10.0.1.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-gc", ASGName: greenASG},
 		},
@@ -594,6 +740,9 @@ func TestHandleACServerAssignment_MigratesWhenSelfNotYetInSnapshot(t *testing.T)
 	}
 	if len(saved.AssignedServers) == 0 {
 		t.Fatal("migration produced an empty assignment")
+	}
+	if len(saved.AssignedServers) != MaxServersPerAssignment {
+		t.Fatalf("expected migration to preserve %d-server coverage, got %d", MaxServersPerAssignment, len(saved.AssignedServers))
 	}
 	// All NEW color, no blue survivors → never cross-color.
 	blueIDs := map[string]bool{"i-blue-a": true, "i-blue-b": true, "i-blue-c": true}
@@ -836,6 +985,52 @@ func TestRefreshAssignmentTTL_NoGrowAtMax(t *testing.T) {
 	}
 	if saved.Version != 4 {
 		t.Errorf("expected Version=4 (existing+1), got %d", saved.Version)
+	}
+}
+
+func TestRefreshAssignmentTTLOnly_DoesNotGrowFromCurrentColor(t *testing.T) {
+	const (
+		blueASG  = "layerv-nhp-sandbox-server"
+		greenASG = "layerv-nhp-sandbox-server-green"
+	)
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-green-a", IP: "10.0.1.1", InternalIP: "10.0.1.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ga", ASGName: greenASG},
+			{ID: "i-green-b", IP: "10.0.1.2", InternalIP: "10.0.1.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-gb", ASGName: greenASG},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments["ac-suppressed"] = &ACAssignment{
+		ACID:    "ac-suppressed",
+		Version: 1,
+		AssignedServers: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ba", ASGName: blueASG},
+		},
+		LastSeen: now,
+		TTL:      &ttl,
+	}
+	srv := &UdpServer{
+		storage:  storage,
+		cloudMap: cloudMap,
+		asgName:  greenASG,
+		config:   &Config{Hostname: "test", ListenPort: 62206},
+	}
+
+	srv.refreshAssignmentTTLOnly("ac-suppressed")
+	srv.wg.Wait()
+
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	saved := storage.assignments["ac-suppressed"]
+	if saved.Version != 2 {
+		t.Fatalf("Version = %d, want TTL-only refresh to bump to 2", saved.Version)
+	}
+	if len(saved.AssignedServers) != 1 || saved.AssignedServers[0].ID != "i-blue-a" {
+		t.Fatalf("TTL-only refresh grew or changed suppressed assignment: %+v", saved.AssignedServers)
 	}
 }
 

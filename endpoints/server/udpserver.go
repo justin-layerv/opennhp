@@ -3912,10 +3912,10 @@ func (s *UdpServer) knockACFanoutEnabled() bool {
 	return s.config != nil && s.config.EnableKnockACFanout
 }
 
-// processACOperationBroadcast sends NHP-AOP to ALL local AC connections in
-// parallel. Each AC in a different AZ must receive the knock so its ipset/eBPF
-// pinhole is opened for the client IP — the AC NLB round-robins the client's
-// subsequent HTTPS request, so every AC needs the entry.
+// processACOperationBroadcast sends NHP-AOP to the live local AC connections
+// selected for one acId. That local slice is capped by MaxACConnsPerID; cross-AZ
+// coverage is handled by the assignment-scoped server fan-out below, not by
+// broadcasting to the full AC fleet from one server.
 //
 // Return timing depends on Config.EnableKnockACFanout (knockACFanoutEnabled):
 //
@@ -3926,15 +3926,15 @@ func (s *UdpServer) knockACFanoutEnabled() bool {
 //     the ack (which unblocks the synchronous knock → 302) can fire before a
 //     sibling AC's pinhole write completes, and a viewer GET the NLB hashes to
 //     that AC is dropped.
-//   - ON: waits for EVERY local AC to complete before returning, so the ack
-//     means "all live local ACs have the pinhole." Success/failure semantics are
-//     unchanged (success with the first successful ART if ≥1 AC succeeded — a
+//   - ON: waits for every selected local AC to complete before returning, so the
+//     ack means the local slice has the pinhole. Success/failure semantics are
+//     unchanged (success with the first successful ART if >=1 AC succeeded; a
 //     partial failure does not fail an otherwise-good knock; the last error if
-//     every AC failed); only the TIMING moves from fastest-AC to slowest-AC. The
+//     every AC failed); only the timing moves from fastest-AC to slowest-AC. The
 //     wait is bounded per-AC by the broadcast context + the AC transaction
 //     timeout, so a wedged AC delays this knock by at most that budget. This is
 //     the local half of the #948 fix; the handler pairs it with a cross-server
-//     fan-out so peer ACs are covered too.
+//     fan-out so one peer per assigned AZ is covered too.
 func (s *UdpServer) processACOperationBroadcast(
 	parentCtx context.Context,
 	knkMsg *common.AgentKnockMsg,
@@ -3997,9 +3997,9 @@ func (s *UdpServer) processACOperationBroadcast(
 
 	// Wait for results. With fan-out OFF (legacy) return on first success to
 	// unblock the client, letting remaining goroutines finish in the background
-	// (fire-and-forget AOP). With fan-out ON wait for EVERY AC so the ack means
-	// "all live local ACs have the pinhole" (qurl-service#948). Either way, if
-	// all fail, return the last error.
+	// (fire-and-forget AOP). With fan-out ON wait for every selected local AC so
+	// the ack means the local slice has the pinhole (qurl-service#948). Either
+	// way, if all fail, return the last error.
 	waitAll := s.knockACFanoutEnabled()
 	var lastErr error
 	var lastArtMsg *common.ACOpsResultMsg
@@ -4100,16 +4100,15 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		}
 	}
 
-	// qurl-service#948: cell-wide knock AC fan-out (native/relay knock path).
-	// handleNhpOpenResource only ever runs for ORIGIN knocks — a forwarded knock
-	// is processed by ServerForwarder.handleDecryptedForwardedKnock, which never
-	// re-forwards — so no Forwarded guard is needed. The per-resource loop below
-	// opens pinholes only on THIS server's local ACs, but the qurl.site NLB hashes
-	// the viewer's GET across the whole fleet; fan the knock out (NHP_FWD) to every
-	// assigned PEER server so each opens its local ACs too. The defer makes EVERY
-	// return path — including the no-local-AC forward early-return below — block
-	// until peer pinholes are open before we ack. Coverage-only; the ack still
-	// comes from the local broadcast / forward.
+	// qurl-service#948: AZ-scoped knock AC fan-out (native/relay knock path).
+	// handleNhpOpenResource only ever runs for origin knocks: a forwarded knock is
+	// processed by ServerForwarder.handleDecryptedForwardedKnock, which never
+	// re-forwards, so no Forwarded guard is needed. The per-resource loop below
+	// opens pinholes only on THIS server's local AC slice; FanoutKnock uses the
+	// assignment row to send NHP_FWD to one peer server per non-local AZ. The
+	// defer makes every return path, including the no-local-AC forward early
+	// return below, block until peer pinholes are open before we ack.
+	// Coverage-only; the ack still comes from the local broadcast / forward.
 	if s.knockACFanoutEnabled() && s.storage != nil && s.forwarder != nil && len(req.OriginalPacket) > 0 {
 		if userAddr, parseErr := net.ResolveUDPAddr("udp", addrStr); parseErr == nil {
 			fanoutBase := context.WithoutCancel(context.Background())

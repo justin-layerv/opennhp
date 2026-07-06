@@ -381,12 +381,12 @@ func (f *HttpKnockForwarder) ForwardHttpKnock(
 	return nil, classifyForwardAttempt(lastAck, lastErr), fmt.Errorf("all %d servers failed for AC %s: %w", len(servers), acID, lastErr)
 }
 
-// FanoutHttpKnock forwards the knock to ALL healthy assigned peer servers in
-// parallel — not first-success — purely so each peer opens ITS local AC
-// pinholes. This is the cross-server half of the qurl-service#948 fix: the
-// origin server already opened its own local ACs, but the qurl.site NLB hashes
-// the viewer's GET across the whole fleet, so every assigned peer must open its
-// ACs too before the knock is acked.
+// FanoutHttpKnock forwards the knock to one currently healthy assigned peer
+// server per non-local AZ in parallel -- not first-success -- purely so each AZ
+// opens its local AC pinhole. This is the HTTP qURL half of the
+// qurl-service#948 fix: the origin server already opened its local ACs, and the
+// assignment row is the bounded routing table for the AZs that still need the
+// forwarded knock.
 //
 // It does NOT produce the knock ack (the caller owns that from its local
 // broadcast / failover); the return is coverage observability only —
@@ -426,10 +426,12 @@ func (f *HttpKnockForwarder) FanoutHttpKnock(
 		return 0, fmt.Errorf("AC assignment expired for %s", acID)
 	}
 
-	// Healthy assigned peers, self and recently-failed excluded. Zero peers is
-	// not an error: a single-server cell's local broadcast already covers the
-	// whole fleet.
-	servers := f.filterForwardTargets(ctx, assignment.AssignedServers)
+	// Current healthy assigned peers, bounded to one target per non-local AZ.
+	// Unlike first-success ForwardHttpKnock, coverage fanout intentionally
+	// ignores the stale local failure cache: a transient failure must not
+	// suppress an entire AZ's pinhole attempt. Zero peers is not an error: a
+	// single-server cell has no non-local AZ target to forward to.
+	servers := f.filterFanoutTargets(ctx, assignment.AssignedServers)
 	if len(servers) == 0 {
 		return 0, nil
 	}
@@ -460,6 +462,31 @@ func (f *HttpKnockForwarder) FanoutHttpKnock(
 	}
 	wg.Wait()
 	return int(accepted.Load()), nil
+}
+
+// filterFanoutTargets returns at most one currently healthy assigned server per
+// non-local AZ. Coverage fanout does not consult failedServers because that
+// cache is intentionally stale for httpForwardHealthDecay, while fanout is the
+// mechanism that creates one effective pinhole per assigned AZ. This path still
+// treats CloudMap health as authoritative, unlike native fanout's local
+// failure-cache fallback: an AZ whose only peer is CloudMap-unhealthy is skipped
+// rather than retried as stale-local-health.
+func (f *HttpKnockForwarder) filterFanoutTargets(ctx context.Context, servers []ServerInfo) []ServerInfo {
+	healthy := servers
+	if f.cloudMap != nil && !f.cloudMap.IsNil() {
+		healthy = FilterHealthyServers(ctx, f.cloudMap, servers)
+	}
+	// Count after CloudMap filtering because HTTP fanout treats unhealthy peers
+	// as absent. Native fanout counts the raw assignment instead because its
+	// local failure cache is only a stale preference signal.
+	if duplicateAZBuckets := countDuplicateFanoutAZBuckets(healthy, f.localIP); duplicateAZBuckets > 0 {
+		for i := 0; i < duplicateAZBuckets; i++ {
+			f.metric(MetricKnockFanoutDuplicateAZCandidate)
+		}
+		log.Warning("knock fan-out saw %d non-local AZ bucket(s) with multiple healthy assigned peer candidates; still selecting one peer per AZ", duplicateAZBuckets)
+	}
+
+	return selectAssignedFanoutTargetsByAZ(healthy, f.localIP)
 }
 
 // filterForwardTargets returns assigned servers that are healthy and not this server.

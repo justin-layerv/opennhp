@@ -103,10 +103,15 @@ const (
 	// steady-state recovery path, not the convergence signal this counter
 	// tracks.
 	MetricACAssignmentColorMigration = "ACAssignmentColorMigration"
-	MetricKnockForwardSuccess        = "KnockForwardSuccess"
-	MetricKnockForwardFailure        = "KnockForwardFailure"
-	MetricKnockForwardSkippedDead    = "KnockForwardSkippedDead"
-	MetricKnockForwardFallback       = "KnockForwardFallback"
+	// MetricACAssignmentColorMigrationSuppressed fires when the blue/green
+	// migration fast-path detects that the current-color Cloud Map view would
+	// reduce an AC's dialable assignment coverage. The handler keeps the
+	// existing healthy assignment instead of persisting a thinner one.
+	MetricACAssignmentColorMigrationSuppressed = "ACAssignmentColorMigrationSuppressed"
+	MetricKnockForwardSuccess                  = "KnockForwardSuccess"
+	MetricKnockForwardFailure                  = "KnockForwardFailure"
+	MetricKnockForwardSkippedDead              = "KnockForwardSkippedDead"
+	MetricKnockForwardFallback                 = "KnockForwardFallback"
 	// Knock-path AC-open re-knock retry (blue/green reassignment window,
 	// qurl-service#976). A broadcast whose every AC connection hit the transaction
 	// timeout re-snapshots the connection map after a short backoff; the four
@@ -141,11 +146,17 @@ const (
 	MetricKnockFailReason = "KnockFailReason"
 	// Cell-wide knock AC fan-out (qurl-service#948, Config.EnableKnockACFanout).
 	// Unlike the forward counters above (a no-local-AC FAILOVER to one peer),
-	// these track the coverage FAN-OUT an origin knock sends to ALL assigned peer
-	// servers so every AC the qurl.site NLB can route to opens the pinhole.
+	// these track the coverage fan-out an origin knock sends to one assigned peer
+	// server per non-local AZ so the qurl.site AC AZ set opens the pinhole.
 	MetricKnockFanout            = "KnockFanout"            // origin knocks that fanned out (per acId)
 	MetricKnockFanoutPeerSuccess = "KnockFanoutPeerSuccess" // peer servers that accepted a fan-out knock
 	MetricKnockFanoutPeerFail    = "KnockFanoutPeerFail"    // peer servers a fan-out knock could not reach
+	// MetricKnockFanoutDuplicateAZCandidate flags a topology/precondition drift:
+	// a bounded fan-out selector saw more than one eligible assigned peer in at
+	// least one non-local AZ bucket. Fan-out still sends one peer per AZ; this
+	// metric tells rollout validation that the one-server-per-AZ assumption is no
+	// longer true for that AC assignment.
+	MetricKnockFanoutDuplicateAZCandidate = "KnockFanoutDuplicateAZCandidate"
 	// MetricRelayForward counts every NHP_RLY packet (relay-forwarded agent
 	// knock, #2208) RECEIVED past the outer Noise auth. It is incremented at
 	// handler entry, BEFORE the relay-peer / source / inner-packet validation,
@@ -441,6 +452,13 @@ const (
 	// so this counter is rollout triage for stale catalog rows that can miss a
 	// resource-scoped targeted revoke until the receiver catalog catches up.
 	MetricForwardAdmissionResourceHashMismatch = "ForwardAdmissionResourceHashMismatch"
+	// MetricForwardResolvedResourceFallback counts NHP_FWD receivers that could
+	// not resolve the inner knock ResourceId from their local catalog and used
+	// the origin server's validated routing snapshot instead. This is expected
+	// for qURL v2 browser knocks: the wire ResourceId is the protected-resource
+	// public key while the origin's admission response carries the q_ resource
+	// row needed to open the peer AZ's AC pinhole.
+	MetricForwardResolvedResourceFallback = "ForwardResolvedResourceFallback"
 	// MetricRevocationAckReceived counts NHP_RVA acks the server received from
 	// ACs (proof-of-delivery, P4e Slice 3 #2793), one per validated ack whose
 	// AC identity resolved from the authenticated connection pubkey. Pairs with
@@ -1941,15 +1959,29 @@ func (s *UdpServer) handleACServerAssignment(
 	// ticks no metric, and self-heals on the next ≤90s re-registration (same as
 	// the expired/unhealthy autoAssignAC fallbacks).
 	//
-	// Transient redundancy: with only a SUBSET of the new color propagated, the
-	// reassign drops to the visible subset (as few as one server, and may omit
-	// THIS server if it hasn't propagated — selectServersForAssignment injects
-	// self only when self is in the snapshot). Still never cross-color
-	// (assignmentIsCrossColor guarantees ≥1 same-color server). The deploy gates
-	// on the new ASG being in-service before the switch and ACs re-grow on
-	// re-registration; watched by the ledger's ACAssignmentColorMigration
-	// spike-then-zero check.
+	// Coverage preservation: with only a SUBSET of the new color propagated, a
+	// wholesale reassign can shrink a healthy 3-server assignment to a singleton.
+	// That is worse than staying pinned to the old healthy set: qURL admissions
+	// may only reach the one server/AC pair that received the AOP while the
+	// viewer's NLB flow lands on a different active AC. Suppress the migration
+	// until the current-color target set can preserve the existing dialable
+	// coverage.
 	if crossColor, discovered := s.assignmentIsCrossColor(cloudMapCtx, healthyServers); crossColor {
+		if suppress, current, target := s.crossColorMigrationShrinksCoverage(discovered, healthyServers); suppress {
+			log.Warning("server-ac(%s#%d@%s)[HandleACOnline] suppressing cross-color assignment migration: current_dialable=%d current_azs=%d target_dialable=%d target_azs=%d existing=%d",
+				acId, transactionId, addrStr, current.dialable, current.azs, target.dialable, target.azs, len(healthyServers))
+			s.metrics.IncrCounter(MetricACAssignmentColorMigrationSuppressed)
+			s.refreshAssignmentTTLOnly(acId)
+			if ardErr := s.sendARD(ppd, acId, transactionId, addrStr, healthyServers); ardErr != nil {
+				log.Warning("server-ac(%s#%d@%s)[HandleACOnline] failed to send ARD after suppressing cross-color migration: %v", acId, transactionId, addrStr, ardErr)
+			}
+			// Do not accept/register locally when migration is suppressed. A
+			// failed ARD relies on the existing AC re-registration cadence (same
+			// <=90s self-heal window used by assignment save-conflict fallbacks)
+			// to retry the redirect, while accepting locally would immediately
+			// persist the very coverage split this guard prevents.
+			return true, nil, nil
+		}
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] assignment is cross-color (this server %s differs from assigned color), reassigning to current color", acId, transactionId, addrStr, serverID)
 		persisted, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version, discovered)
 		// Count only durable migrations: autoAssignAC can fall through to
@@ -2456,6 +2488,18 @@ func (s *UdpServer) getServerID() string {
 // the recycle-driven refresh is gone, growth happens here, F4 binding does
 // not.
 func (s *UdpServer) refreshAssignmentTTL(acID string) {
+	s.refreshAssignmentTTLWithGrowth(acID, true)
+}
+
+// refreshAssignmentTTLOnly extends TTL without opportunistic growth. It is used
+// when a cross-color migration is deliberately suppressed: keeping the old
+// healthy assignment alive is correct, but growing it from this new-color
+// server's Cloud Map view could persist cross-color contamination.
+func (s *UdpServer) refreshAssignmentTTLOnly(acID string) {
+	s.refreshAssignmentTTLWithGrowth(acID, false)
+}
+
+func (s *UdpServer) refreshAssignmentTTLWithGrowth(acID string, allowGrowth bool) {
 	// Throttle: skip if we refreshed recently for this AC
 	now := time.Now()
 	if v, loaded := s.ttlRefreshTimes.LoadOrStore(acID, now); loaded {
@@ -2494,18 +2538,22 @@ func (s *UdpServer) refreshAssignmentTTL(acID string) {
 		// whole TTL window (issue #1681).
 		refreshed.Version = existing.Version + 1
 
-		// Issue #1681: opportunistically grow under-filled assignments when
-		// new healthy servers have appeared in Cloud Map since the assignment
-		// was created. Without this, an assignment created when only N<3
-		// servers were healthy stays at N forever — re-registrations to the
-		// assigned servers see "this server is in the set, return the set"
-		// and never converge to MaxServersPerAssignment.
-		// Pass the cloned slice rather than existing.AssignedServers so the
-		// no-aliasing-of-cache property is syntactically obvious, not just
-		// contractually documented on maybeGrowAssignedServers.
-		grown, didGrow := s.maybeGrowAssignedServers(refreshed.AssignedServers)
-		if didGrow {
-			refreshed.AssignedServers = grown
+		var didGrow bool
+		var grown []ServerInfo
+		if allowGrowth {
+			// Issue #1681: opportunistically grow under-filled assignments when
+			// new healthy servers have appeared in Cloud Map since the assignment
+			// was created. Without this, an assignment created when only N<3
+			// servers were healthy stays at N forever — re-registrations to the
+			// assigned servers see "this server is in the set, return the set"
+			// and never converge to MaxServersPerAssignment.
+			// Pass the cloned slice rather than existing.AssignedServers so the
+			// no-aliasing-of-cache property is syntactically obvious, not just
+			// contractually documented on maybeGrowAssignedServers.
+			grown, didGrow = s.maybeGrowAssignedServers(refreshed.AssignedServers)
+			if didGrow {
+				refreshed.AssignedServers = grown
+			}
 		}
 
 		saveCtx, saveCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
@@ -2777,6 +2825,47 @@ func (s *UdpServer) assignmentIsCrossColor(ctx context.Context, healthyAssigned 
 		}
 	}
 	return false, nil
+}
+
+type assignmentCoverage struct {
+	dialable int
+	azs      int
+}
+
+func (s *UdpServer) crossColorMigrationShrinksCoverage(discovered []ServerInfo, healthyAssigned []ServerInfo) (bool, assignmentCoverage, assignmentCoverage) {
+	current := dialableAssignmentCoverage(healthyAssigned)
+	if current.dialable == 0 {
+		return false, current, assignmentCoverage{}
+	}
+
+	sameColor, failOpen := filterServersByASG(discovered, s.ASGName())
+	if failOpen {
+		return true, current, assignmentCoverage{}
+	}
+	selected := s.selectServersForAssignment(sameColor, MaxServersPerAssignment)
+	target := dialableAssignmentCoverage(selected)
+	if target.dialable < current.dialable {
+		return true, current, target
+	}
+	if current.azs > 0 && target.azs < current.azs {
+		return true, current, target
+	}
+	return false, current, target
+}
+
+func dialableAssignmentCoverage(servers []ServerInfo) assignmentCoverage {
+	var coverage assignmentCoverage
+	azs := make(map[string]bool, len(servers))
+	for _, srv := range servers {
+		if srv.InternalIP != "" && isPrivateIP(srv.InternalIP) {
+			coverage.dialable++
+			if srv.AZ != "" {
+				azs[srv.AZ] = true
+			}
+		}
+	}
+	coverage.azs = len(azs)
+	return coverage
 }
 
 // updateAssignmentWithSelf adds this server to an existing AC assignment,

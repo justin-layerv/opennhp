@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
+	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlv2"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
@@ -189,12 +190,11 @@ func (f *ServerForwarder) ForwardKnock(
 	return nil, errors.New("all assigned servers unreachable or unhealthy")
 }
 
-// FanoutKnock sends the knock to ALL healthy assigned peer servers in parallel —
-// not first-success — purely so each peer opens ITS local AC pinholes. This is
-// the NHP_FWD (native/relay knock path) half of the qurl-service#948 fix: the
-// origin server already opened its own local ACs, but the qurl.site NLB hashes
-// the viewer's GET across the whole fleet, so every assigned peer must open its
-// ACs too before the knock is acked.
+// FanoutKnock sends the knock to one assigned peer server per non-local AZ in
+// parallel -- not first-success -- purely so each AZ opens its local AC pinhole.
+// This is the NHP_FWD (native/relay knock path) half of the qurl-service#948
+// fix: the origin server already opened its own local ACs, and the assignment
+// row is the bounded routing table for the AZs that still need an NHP_FWD.
 //
 // selfInternalIP is this server's VPC IP; a target matching it is skipped (the
 // origin already opened its local ACs). The receiver runs HandleForwardRequest →
@@ -217,16 +217,29 @@ func (f *ServerForwarder) FanoutKnock(
 		return 0
 	}
 
+	// Native fanout counts duplicate AZ candidates on the raw assignment. This
+	// is a topology-drift signal: unlike the HTTP path's CloudMap-filtered
+	// count, the local failure cache below is stale by design and must not hide
+	// a duplicate-AZ assignment from rollout validation.
+	if duplicateAZBuckets := countDuplicateFanoutAZBuckets(assignment.AssignedServers, selfInternalIP); duplicateAZBuckets > 0 {
+		// Forwarder metrics are exposed as increment-only callbacks, so emit one
+		// sample per duplicate AZ bucket.
+		for i := 0; i < duplicateAZBuckets; i++ {
+			f.deps.IncrForwarderMetric(MetricKnockFanoutDuplicateAZCandidate)
+		}
+		log.Warning("Knock fan-out for AC %s saw %d non-local AZ bucket(s) with multiple assigned peer candidates; still selecting one peer per AZ", assignment.ACID, duplicateAZBuckets)
+	}
+	targets := selectAssignedFanoutTargetsByAZWithHealth(assignment.AssignedServers, selfInternalIP, f.health.IsUnhealthy)
 	var wg sync.WaitGroup
 	var accepted atomic.Int32
-	for _, target := range assignment.AssignedServers {
-		// Skip self (already opened local ACs) and recently-failed peers.
-		if selfInternalIP != "" && target.InternalIP == selfInternalIP {
-			continue
-		}
-		if f.health.IsUnhealthy(target.ID) {
-			continue
-		}
+	for _, target := range targets {
+		// Unlike first-success ForwardKnock, coverage fanout never skips an AZ
+		// only because its selected peer is in the stale local failure cache.
+		// The selector prefers a non-failed peer within the AZ when one exists,
+		// but falls back to the failed peer if it is the AZ's only candidate.
+		// The HTTP fanout path intentionally uses CloudMap health instead; a
+		// CloudMap-unhealthy server is treated as absent rather than as a stale
+		// local-forward failure.
 		wg.Add(1)
 		go func(target ServerInfo) {
 			defer wg.Done()
@@ -246,6 +259,107 @@ func (f *ServerForwarder) FanoutKnock(
 	}
 	wg.Wait()
 	return int(accepted.Load())
+}
+
+const unknownFanoutAZ = "<unknown>"
+
+// selectAssignedFanoutTargetsByAZ returns the bounded coverage target set for
+// an origin knock: skip the origin server, skip the origin AZ when it is known,
+// then keep at most one assigned server for each remaining AZ. Missing AZ
+// metadata is collapsed to one bucket so a metadata regression cannot turn
+// fan-out into an unbounded parallel blast.
+func selectAssignedFanoutTargetsByAZ(servers []ServerInfo, selfInternalIP string) []ServerInfo {
+	return selectAssignedFanoutTargetsByAZWithHealth(servers, selfInternalIP, nil)
+}
+
+// selectAssignedFanoutTargetsByAZWithHealth keeps fan-out bounded by AZ while
+// preferring a peer not currently in the caller's local failure cache. A stale
+// failure must not suppress an entire AZ's pinhole attempt, so the first peer in
+// an AZ remains the fallback when every candidate for that AZ is marked failed.
+func selectAssignedFanoutTargetsByAZWithHealth(servers []ServerInfo, selfInternalIP string, isUnhealthy func(string) bool) []ServerInfo {
+	selfAZ := fanoutSelfAZ(servers, selfInternalIP)
+
+	type candidate struct {
+		server    ServerInfo
+		unhealthy bool
+	}
+
+	selected := make(map[string]candidate, len(servers))
+	order := make([]string, 0, len(servers))
+	for _, srv := range servers {
+		if skipFanoutCandidate(srv, selfInternalIP, selfAZ) {
+			continue
+		}
+
+		key := fanoutAZKey(srv)
+
+		unhealthy := false
+		if isUnhealthy != nil {
+			unhealthy = isUnhealthy(srv.ID)
+		}
+		current, ok := selected[key]
+		if !ok {
+			selected[key] = candidate{server: srv, unhealthy: unhealthy}
+			order = append(order, key)
+			continue
+		}
+		if current.unhealthy && !unhealthy {
+			selected[key] = candidate{server: srv, unhealthy: unhealthy}
+		}
+	}
+
+	targets := make([]ServerInfo, 0, len(order))
+	for _, key := range order {
+		targets = append(targets, selected[key].server)
+	}
+	return targets
+}
+
+func countDuplicateFanoutAZBuckets(servers []ServerInfo, selfInternalIP string) int {
+	selfAZ := fanoutSelfAZ(servers, selfInternalIP)
+	counts := make(map[string]int, len(servers))
+	for _, srv := range servers {
+		if skipFanoutCandidate(srv, selfInternalIP, selfAZ) {
+			continue
+		}
+		counts[fanoutAZKey(srv)]++
+	}
+
+	duplicates := 0
+	for _, count := range counts {
+		if count > 1 {
+			duplicates++
+		}
+	}
+	return duplicates
+}
+
+func fanoutSelfAZ(servers []ServerInfo, selfInternalIP string) string {
+	if selfInternalIP == "" {
+		return ""
+	}
+	for _, srv := range servers {
+		if srv.InternalIP == selfInternalIP {
+			return srv.AZ
+		}
+	}
+	return ""
+}
+
+func skipFanoutCandidate(srv ServerInfo, selfInternalIP, selfAZ string) bool {
+	if selfInternalIP != "" && srv.InternalIP == selfInternalIP {
+		return true
+	}
+	// If selfAZ is missing, same-AZ exclusion is unknowable. Keep fan-out
+	// bounded by letting unknown-AZ peers collapse into the single unknown bucket.
+	return selfAZ != "" && srv.AZ == selfAZ
+}
+
+func fanoutAZKey(srv ServerInfo) string {
+	if srv.AZ == "" {
+		return unknownFanoutAZ
+	}
+	return srv.AZ
 }
 
 // forwardToServer sends an NHP_FWD message to a specific server.
@@ -274,6 +388,7 @@ func (f *ServerForwarder) forwardToServer(
 		TransactionId:           txID,
 		Timestamp:               time.Now().Unix(),
 		AdmissionRevocationData: nativeForwardAdmissionRevocationData(admissionResource),
+		ResolvedResourceData:    nativeForwardResolvedResourceData(admissionResource),
 	}
 
 	msgBytes, err := json.Marshal(fwdMsg)
@@ -430,6 +545,91 @@ func forwardedAdmissionResourceHashMismatch(catalog *common.ResourceData, admiss
 	return decision
 }
 
+func nativeForwardResolvedResourceData(res *common.ResourceData) *common.ForwardResolvedResourceData {
+	if res == nil || res.AuthServiceId == "" || res.ResourceId == "" || len(res.Resources) == 0 {
+		return nil
+	}
+	return &common.ForwardResolvedResourceData{
+		AuthServiceId:         res.AuthServiceId,
+		ResourceId:            res.ResourceId,
+		OpenTime:              res.OpenTime,
+		Resources:             cloneResourceInfoMap(res.Resources),
+		ResourcePublicKeyHash: res.ResourcePublicKeyHash,
+	}
+}
+
+func forwardedResolvedResourceData(
+	route *common.ForwardResolvedResourceData,
+	admission *common.ForwardAdmissionRevocationData,
+	knkMsg *common.AgentKnockMsg,
+) (*common.ResourceData, error) {
+	if route == nil {
+		return nil, errors.New("missing origin resolved resource data")
+	}
+	if knkMsg == nil {
+		return nil, errors.New("missing forwarded knock message")
+	}
+	if route.AuthServiceId == "" || route.AuthServiceId != knkMsg.AuthServiceId {
+		return nil, fmt.Errorf("origin resolved resource aspId %q does not match knock aspId %q",
+			route.AuthServiceId, knkMsg.AuthServiceId)
+	}
+	if route.ResourceId == "" {
+		return nil, errors.New("origin resolved resource id is empty")
+	}
+	if len(route.Resources) != 1 {
+		return nil, fmt.Errorf("origin resolved resource has %d resource entries, want exactly 1", len(route.Resources))
+	}
+	res := &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			AuthServiceId: route.AuthServiceId,
+			ResourceId:    route.ResourceId,
+			OpenTime:      route.OpenTime,
+			Resources:     cloneResourceInfoMap(route.Resources),
+		},
+		ResourcePublicKeyHash: route.ResourcePublicKeyHash,
+	}
+	info := qurlplacement.OnlyResourceInfo(res)
+	if info == nil || info.ACId == "" || info.Addr == nil {
+		return nil, errors.New("origin resolved resource routing is incomplete")
+	}
+	if err := bindForwardedResolvedResourceIdentity(res, admission, knkMsg); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func bindForwardedResolvedResourceIdentity(
+	res *common.ResourceData,
+	admission *common.ForwardAdmissionRevocationData,
+	knkMsg *common.AgentKnockMsg,
+) error {
+	if res == nil || knkMsg == nil {
+		return errors.New("missing resource identity inputs")
+	}
+	if res.ResourceId == knkMsg.ResourceId {
+		return nil
+	}
+	resourceHash := res.ResourcePublicKeyHash
+	if resourceHash == "" && admission != nil {
+		resourceHash = admission.ResourcePublicKeyHash
+	}
+	if resourceHash == "" {
+		return fmt.Errorf("origin resolved resource id %q differs from knock resource id %q without a resource public-key hash",
+			res.ResourceId, knkMsg.ResourceId)
+	}
+	knockHash, err := qurlv2.PublicKeyHashFromB64(knkMsg.ResourceId)
+	if err != nil {
+		return fmt.Errorf("knock resource id %q is not a qURL v2 public key: %w", knkMsg.ResourceId, err)
+	}
+	if knockHash != resourceHash {
+		return fmt.Errorf("origin resolved resource hash %q does not match knock resource hash %q", resourceHash, knockHash)
+	}
+	if res.ResourcePublicKeyHash == "" {
+		res.ResourcePublicKeyHash = resourceHash
+	}
+	return nil
+}
+
 // HandleForwardRequest processes an incoming NHP_FWD message.
 // This is called on the ASSIGNED server when another server forwards a knock.
 func (f *ServerForwarder) HandleForwardRequest(
@@ -525,9 +725,16 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	// placement cannot pick AZ A for the AC operation while ACK'ing AZ B.
 	resData := qurlplacement.ResolveResource(knkMsg.ResourceId, placementIdentity, aspData)
 	if resData == nil {
-		log.Error("Resource not found for forwarded knock: %s", knkMsg.ResourceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_NOT_FOUND", "Resource not found")
-		return
+		var routeErr error
+		resData, routeErr = forwardedResolvedResourceData(fwdMsg.ResolvedResourceData, fwdMsg.AdmissionRevocationData, knkMsg)
+		if routeErr != nil {
+			log.Error("Resource not found for forwarded knock: %s (origin routing unusable: %v)", knkMsg.ResourceId, routeErr)
+			f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_NOT_FOUND", "Resource not found")
+			return
+		}
+		f.deps.IncrForwarderMetric(MetricForwardResolvedResourceFallback)
+		log.Info("Using origin-resolved resource routing for forwarded knock resource=%s resolvedResource=%s txID=%d",
+			knkMsg.ResourceId, resData.ResourceId, fwdMsg.TransactionId)
 	}
 
 	resInfo := qurlplacement.OnlyResourceInfo(resData)

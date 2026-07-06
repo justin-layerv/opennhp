@@ -189,8 +189,8 @@ type ServerACAckMsg struct {
 
 	// Peers lists the AC's assigned servers (typically 3, one per AZ).
 	// When present, the AC should establish direct connections to each peer.
-	// This ensures knock fan-out works: each assigned server can send
-	// NHP-AOP to this AC, opening ipset pinholes across all AZs.
+	// This lets origin servers route knock fan-out through one assigned peer per
+	// AZ, so each AZ's AC path can open its local ipset/eBPF pinhole.
 	// Omitted when the server doesn't have assignment information.
 	Peers []RedirectTarget `json:"peers,omitempty"`
 }
@@ -411,6 +411,19 @@ type ForwardAdmissionRevocationData struct {
 	Deadline              int64  `json:"deadline,omitempty"`
 }
 
+// ForwardResolvedResourceData is the origin server's already-authorized,
+// already-resolved AC routing snapshot for NHP_FWD receivers. It intentionally
+// carries only pinhole routing fields plus the qURL v2 resource hash used to
+// bind the snapshot back to the knock identity. It must not grow ResourceData's
+// credential or extension fields (app secrets, access keys, exinfo, redirects).
+type ForwardResolvedResourceData struct {
+	AuthServiceId         string                   `json:"aspId,omitempty"`
+	ResourceId            string                   `json:"resId,omitempty"`
+	OpenTime              uint32                   `json:"opnTime,omitempty"`
+	Resources             map[string]*ResourceInfo `json:"resInfo,omitempty"`
+	ResourcePublicKeyHash string                   `json:"resPubKeyHash,omitempty"`
+}
+
 // ServerForwardMsg is sent from one server to another to forward a knock (NHP_FWD).
 // Used when a knock arrives at a non-assigned server and needs to be forwarded
 // to one of the AC's assigned servers.
@@ -425,6 +438,13 @@ type ServerForwardMsg struct {
 	// produced by the origin server's admission decision. Local catalog
 	// resolution remains authoritative for AC routing and ACK construction.
 	AdmissionRevocationData *ForwardAdmissionRevocationData `json:"admissionRevocationData,omitempty"`
+
+	// ResolvedResourceData optionally carries the origin's resolved routing row
+	// so a peer can still open its local AC pinhole when the inner knock
+	// ResourceId is not a catalog key on that peer (for example qURL v2's
+	// protected-resource public key). Receivers validate it before use and only
+	// fall back to it when local catalog placement cannot resolve the resource.
+	ResolvedResourceData *ForwardResolvedResourceData `json:"resolvedResourceData,omitempty"`
 }
 
 // ServerForwardResultMsg is the response to ServerForwardMsg (NHP_FRT).

@@ -157,34 +157,41 @@ type Config struct {
 	// to the default.
 	StaleACConnThresholdSeconds int `json:"staleACConnThresholdSeconds"`
 
-	// EnableKnockACFanout makes admission cover EVERY AC the qurl.site NLB can
-	// route a viewer's request to, not just the ACs connected to the single
-	// server that happens to handle the knock. It closes the firewall-coverage
-	// race in qurl-service#948: the qurl.site AC fleet shares one acId behind an
-	// NLB with no stickiness, so the viewer's post-resolve GET 5-tuple-hashes
-	// across the whole fleet, but a knock opens pinholes only on the handling
-	// server's locally-connected ACs (snapshotLiveACConns is per-server; only
-	// NHP_REV revocation fans out cell-wide). A GET hashed to an AC the knock
-	// never reached is silently dropped → the ~10-30s "awaiting headers" timeout.
+	// EnableKnockACFanout makes admission cover the qurl.site AC AZ set, not just
+	// the ACs connected to the single server that happens to handle the knock. It
+	// closes the firewall-coverage race in qurl-service#948: the qurl.site AC
+	// fleet shares one acId behind an NLB with no stickiness, so the viewer's
+	// post-resolve GET 5-tuple-hashes across the fleet, but a knock opens
+	// pinholes only on the handling server's locally-connected ACs
+	// (snapshotLiveACConns is per-server; only NHP_REV revocation fans out
+	// cell-wide). A GET hashed to an AC the knock never reached is silently
+	// dropped, surfacing as the ~10-30s "awaiting headers" timeout.
 	//
 	// When true, an ORIGIN knock (not a server-to-server forward):
-	//   1. waits for ALL its locally-connected ACs to ack the NHP-AOP before
-	//      returning (processACOperationBroadcast stops returning on first
-	//      success), so the ack means "every local AC has the pinhole"; and
-	//   2. fans the knock out to all healthy assigned PEER servers in parallel
-	//      (reusing the existing forward transport — HTTP /nhp/internal/knock on
-	//      the qURL path, NHP_FWD on the native/relay path — with the existing
-	//      Forwarded loop-guard), so every peer opens ITS local ACs too. The
-	//      union (local ∪ all peers) is the whole fleet. The handler waits for
-	//      the fan-out before acking.
+	//   1. waits for its bounded local AC connection set (per acId, capped by
+	//      MaxACConnsPerID) to ack the NHP-AOP before returning
+	//      (processACOperationBroadcast stops returning on first success), so the
+	//      ack means the local slice has the pinhole; and
+	//   2. fans the knock out to one healthy assigned peer server per non-local AZ
+	//      (reusing the existing forward transport: HTTP /nhp/internal/knock on
+	//      the qURL path, NHP_FWD on the native/relay path, with the existing
+	//      Forwarded loop-guard). Each peer opens its local AC slice. The handler
+	//      waits for the fan-out before acking.
+	//
+	// Load-bearing topology precondition: the selected set {origin server plus
+	// one assigned peer server per non-local AZ} must cover every AC instance the
+	// public qurl.site NLB can hash to for that shared acId. Sandbox satisfies
+	// this with one active AC and one assigned server per AZ. If an AZ has more
+	// than one eligible assigned peer, fan-out still selects exactly one peer to
+	// stay bounded; MetricKnockFanoutDuplicateAZCandidate is the rollout signal
+	// that the precondition needs attention before promotion.
 	//
 	// Forwarded knocks never re-fan-out (loop-safe), so the depth is one hop.
-	// Cost is a parallel forward per assigned peer per knock plus the slower of
-	// the local ACs — negligible at current knock volume; revisit the amplification
-	// if knock rate grows (see docs/runbooks/prod-rollout-ledger).
+	// Cost is bounded by assigned AZ count per knock plus the local AC slice
+	// (MaxACConnsPerID). The flag is the clean rollback for this hot-path change;
+	// flip it per environment.
 	//
-	// Default false preserves the legacy first-success, local-only behavior. The
-	// flag is the clean rollback for this hot-path change; flip it per environment.
+	// Default false preserves the legacy first-success, local-only behavior.
 	EnableKnockACFanout bool `json:"enableKnockACFanout"`
 
 	// ACPeerGracePeriodSeconds overrides the default grace window for the
