@@ -695,7 +695,7 @@ jobs:
       # so the cache key and scope are consistent across jobs.
       - name: Setup Go (module + build cache for docker tests)
         if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: |
@@ -2711,7 +2711,7 @@ jobs:
       # end-to-end coverage moves to the relay path (#6/#2680) + the activation smokes.
       - name: Setup Go for Integration Tests
         if: needs.deploy-sandbox-infra.outputs.nlb_dns != ''
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: |
