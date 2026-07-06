@@ -617,14 +617,36 @@ type ebpfInfraRule struct {
 //     pulls the whole fleet — black-holing all resource traffic even though the
 //     datapath and Traefik are healthy.
 //
-// Pure and kernel-free so the exemption policy is unit-testable; the caller
-// (Start) performs the actual map writes via ebpfRuleAddFailClosed.
-func ebpfInfraExemptRules(cfg *Config) []ebpfInfraRule {
-	rules := make([]ebpfInfraRule, 0, len(cfg.Servers)+1)
-	for _, server := range cfg.Servers {
+// Kernel-free (no map writes) so the exemption policy is unit-testable; the
+// caller (Start) snapshots the inputs under serverPeerMutex and performs the
+// actual map writes via ebpfRuleAddFailClosed. servers and defaultIp are passed
+// explicitly (not read from a live *Config) because both are rewritten by a
+// config reload concurrently with Start's boot-time seeding — servers by
+// updateServerPeers, defaultIp by updateBaseConfig — so the caller must read
+// them under serverPeerMutex or the boot loop races the reload (#3085, adapted
+// from OpenNHP 3e56ffc7). healthCheckPort is start-time-only (written once on
+// first load, never on reload — see updateBaseConfig), so it needs no snapshot.
+func ebpfInfraExemptRules(servers []*core.UdpPeer, defaultIp string, healthCheckPort int) []ebpfInfraRule {
+	rules := make([]ebpfInfraRule, 0, len(servers)+1)
+	for _, server := range servers {
+		// A DNS-only server peer (Hostname set, no static Ip) has no source IP
+		// to key on. An sdwhitelist rule with SrcIP="" is kernel-rejected or —
+		// worse — matches every source, so skip it rather than seed a bogus
+		// rule. Reachability does not depend on this static rule: the XDP
+		// allow-rule cascade checks the tc/egress-seeded return-path map (spp)
+		// BEFORE sdwhitelist (nhp_ebpf_xdp.c), so once serverDiscovery resolves
+		// the host and sends its outbound registration, tc/egress admits the
+		// server's replies by reverse tuple (tc_egress.c) with no static rule.
+		// This boot loop only seeds the static sdwhitelist fast-path, which a
+		// DNS-only peer cannot populate at boot (#3085, from 3e56ffc7).
+		if server.Ip == "" {
+			log.Info("[EbpfRuleAdd] skipping server peer %s: no static Ip (Host=%q); DNS-only peers seed no boot-time XDP rule",
+				server.PublicKeyBase64(), server.Hostname)
+			continue
+		}
 		rules = append(rules, ebpfInfraRule{
 			mapType: ebpf.MapTypeSdWhitelist,
-			params:  ebpf.EbpfRuleParams{SrcIP: server.Ip, DstIP: cfg.DefaultIp},
+			params:  ebpf.EbpfRuleParams{SrcIP: server.Ip, DstIP: defaultIp},
 			ttlSec:  infraExemptTTLSec,
 		})
 	}
@@ -632,14 +654,35 @@ func ebpfInfraExemptRules(cfg *Config) []ebpfInfraRule {
 	// normalization contract: updateBaseConfig defaults ≤0 to
 	// DefaultHealthCheckPort before Start runs, but a caller on an
 	// un-normalized Config must not seed a useless tcp/0 admission.
-	if cfg.HealthCheckPort > 0 {
+	if healthCheckPort > 0 {
 		rules = append(rules, ebpfInfraRule{
 			mapType: ebpf.MapTypeProtocolPort,
-			params:  ebpf.EbpfRuleParams{Protocol: "tcp", DstPort: cfg.HealthCheckPort},
+			params:  ebpf.EbpfRuleParams{Protocol: "tcp", DstPort: healthCheckPort},
 			ttlSec:  infraExemptTTLSec,
 		})
 	}
 	return rules
+}
+
+// snapshotInfraRuleInputs copies, under serverPeerMutex, the reload-mutable
+// config inputs that ebpfInfraExemptRules needs, so Start's boot-time XDP
+// seeding does not race the config-reload watchers (updateServerPeers rewrites
+// Servers; updateBaseConfig patches DefaultIp — both under this lock). Only the
+// slice header is copied; the caller releases the lock (on return) before the
+// kernel-free build and the eBPF syscalls, so a slow kernel call can't stall a
+// pending reload. HealthCheckPort is start-time-only (never reload-patched) but
+// is read here too so all three inputs come from one locked snapshot.
+//
+// Start AND the -race fences call this same reader, so the reader-side lock is a
+// tested invariant: dropping the RLock trips the race detector in
+// TestUpdateServerPeers_ReloadVsRead / TestBaseConfigReloadVsBootLoopRead
+// against their real reload writers (#3085, adapted from OpenNHP 3e56ffc7).
+func (a *UdpAC) snapshotInfraRuleInputs() (servers []*core.UdpPeer, defaultIp string, healthCheckPort int) {
+	a.serverPeerMutex.RLock()
+	defer a.serverPeerMutex.RUnlock()
+	servers = make([]*core.UdpPeer, len(a.config.Servers))
+	copy(servers, a.config.Servers)
+	return servers, a.config.DefaultIp, a.config.HealthCheckPort
 }
 
 /*
@@ -750,7 +793,14 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 		// config + restarts AC leaves the stale kernel rule until natural TTL
 		// expiry; the iptables path makes the same trade-off by skipping
 		// tempset in boot enumeration.
-		for _, r := range ebpfInfraExemptRules(a.config) {
+		//
+		// snapshotInfraRuleInputs copies the reload-mutable inputs (Servers,
+		// DefaultIp) under serverPeerMutex and releases it before this
+		// build+install, so the config-reload watchers can't race the seeding and
+		// the kernel-free ebpfInfraExemptRules build + the ebpfRuleAddFailClosed
+		// syscalls run lock-free. Adapted from OpenNHP 3e56ffc7 (#3085).
+		serverPeers, defaultIp, healthCheckPort := a.snapshotInfraRuleInputs()
+		for _, r := range ebpfInfraExemptRules(serverPeers, defaultIp, healthCheckPort) {
 			if addErr := a.ebpfRuleAddFailClosed(r.mapType, r.params, r.ttlSec); addErr != nil {
 				log.Error("[EbpfRuleAdd] infra exempt rule (map=%s src=%s dst=%s port=%d proto=%s) error: %v",
 					ebpf.MapTypeName(r.mapType), r.params.SrcIP, r.params.DstIP, r.params.DstPort, r.params.Protocol, addErr)
@@ -2398,6 +2448,22 @@ func (a *UdpAC) RemoveServerPeer(serverKey string) {
 	}
 }
 
+// GetConfig returns the live *Config pointer. Reload-mutable fields — Servers
+// and DefaultIp (written under serverPeerMutex; see updateServerPeers /
+// updateBaseConfig), plus the allowlist fields patched by reloadARDTrust and the
+// still-unlocked IpPassMode/DefaultCipherScheme/LogLevel — are NOT safe to read
+// off the returned pointer concurrently with a config reload; a reader that
+// needs one under reload pressure must snapshot it under serverPeerMutex (as
+// Start's eBPF boot loop does for Servers + DefaultIp).
+//
+// #3085 closes only the boot-loop reader race. Other live readers still read
+// reload-mutable fields unlocked — notably HandleAccessControl's per-knock path
+// (DefaultIp via applyDefaultIpSubstitution, IpPassMode via IpPassMode()). Those
+// reads race the now-locked reload writes; hardening them needs a hot-path
+// lock-order audit (HandleAccessControl runs under the endpoints/ac lock order)
+// plus a coherent ownership model for all reload-mutable a.config fields. That
+// is deliberately out of scope for this point-fix (which adapts upstream
+// 3e56ffc7) and is tracked in #3098.
 func (a *UdpAC) GetConfig() *Config {
 	return a.config // return  config
 }

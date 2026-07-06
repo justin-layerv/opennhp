@@ -241,6 +241,16 @@ func (a *UdpAC) loadBaseConfig() error {
 
 	baseConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("[AC] base config %s has been updated, reloading", fileName)
+		// The server-peer watcher decodes into a fresh Peers each reload to keep
+		// *UdpPeer structs out of the boot-loop snapshot (#3085). Reusing the
+		// captured conf here has no such hazard today: updateBaseConfig copies
+		// each reload-mutable field into the separate a.config struct — DefaultIp
+		// is a value-typed string, and ServerPubKeyAllowlist is slices.Clone'd
+		// before publish (see reloadARDTrust) — so no serverPeerMutex snapshot
+		// reader aliases this decoder-owned conf. A future field published as a
+		// raw decoder-owned pointer/slice would reintroduce that hazard; unifying
+		// all three watchers on fresh-decode (+ logging the reload parse error
+		// this one still swallows) is tracked in #3102.
 		if content, err = a.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &conf); err == nil {
 				if updateErr := a.updateBaseConfig(conf); updateErr != nil {
@@ -313,12 +323,27 @@ func (a *UdpAC) loadPeers() error {
 
 	serverPeerWatch = utils.WatchFile(fileName, func() {
 		log.Info("[AC] server peer config %s has been updated, reloading", fileName)
-		if content, err = a.loadConfigFile(fileName); err == nil {
-			if err = toml.Unmarshal(content, &peers); err == nil {
-				if updateErr := a.updateServerPeers(peers.Servers); updateErr != nil {
-					log.Error("[AC] failed to apply server peer update from %s: %v", fileName, updateErr)
-				}
-			}
+		// Decode into a FRESH Peers (and fresh content/err locals) each reload.
+		// The unconditional win: reload parse errors are logged below instead of
+		// being silently swallowed by the previous reused-variable form. Secondary
+		// (future-proofing): the boot-loop snapshot copies a.config.Servers' slice
+		// header, then dereferences server.Ip / server.Hostname after releasing
+		// serverPeerMutex. Those fields are immutable after construction
+		// (nhp/core/peer.go) and go-toml allocates fresh elements today, so no
+		// live aliasing hazard exists — but decoding into a fresh struct
+		// guarantees no *UdpPeer is ever shared with a prior parse a reader still
+		// holds, independent of decoder behavior (#3085 review).
+		content, err := a.loadConfigFile(fileName)
+		if err != nil {
+			return // loadConfigFile already logged the read error
+		}
+		var peers Peers
+		if err := toml.Unmarshal(content, &peers); err != nil {
+			log.Error("[AC] failed to parse server peer update from %s: %v", fileName, err)
+			return
+		}
+		if updateErr := a.updateServerPeers(peers.Servers); updateErr != nil {
+			log.Error("[AC] failed to apply server peer update from %s: %v", fileName, updateErr)
 		}
 	})
 
@@ -422,22 +447,37 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 		return nil
 	}
 
-	// update — the fields below are NOT read by ardTrustSnapshot
-	// so they're patched without the mutex (existing convention).
-	// If you add a new field to ardTrustSnapshot's read set, the
-	// corresponding write MUST move into reloadARDTrust's
-	// grouped-under-lock block (or its own locked section) to
-	// preserve the "snapshot-read fields written under
-	// serverPeerMutex" invariant.
+	// update — the fields below (except DefaultIp, see next paragraph) are
+	// NOT read under serverPeerMutex by any concurrent reader, so they're
+	// patched without the mutex (existing convention). If you add a new field
+	// to ardTrustSnapshot's read set — or otherwise start reading a field
+	// under serverPeerMutex — the corresponding write MUST move into
+	// reloadARDTrust's grouped-under-lock block (or its own locked section) to
+	// preserve the "snapshot-read fields written under serverPeerMutex"
+	// invariant.
+	//
+	// DefaultIp IS such a snapshot-read field: Start's eBPF boot loop reads it
+	// under serverPeerMutex (see the ebpfInfraExemptRules caller), so its
+	// reload write below is taken under the same lock. The base-config watcher
+	// is installed before the boot loop runs, so without this an operator
+	// editing DefaultIp during the boot window would race the loop's read
+	// (#3085, adapted from OpenNHP 3e56ffc7).
 	if a.config.LogLevel != conf.LogLevel {
 		log.Info("set base log level to %d", conf.LogLevel)
 		a.log.SetLogLevel(conf.LogLevel)
 		a.config.LogLevel = conf.LogLevel
 	}
 
+	// The compare-read is unlocked while the write below takes serverPeerMutex.
+	// That asymmetry is safe: updateBaseConfig runs only on the single
+	// config-watcher goroutine, so it is the sole writer of DefaultIp and never
+	// races its own read. The lock exists solely to publish the write to the
+	// boot-loop RLock reader (the ebpfInfraExemptRules caller).
 	if a.config.DefaultIp != conf.DefaultIp {
 		log.Info("set default ip mode to %s", conf.DefaultIp)
+		a.serverPeerMutex.Lock()
 		a.config.DefaultIp = conf.DefaultIp
+		a.serverPeerMutex.Unlock()
 	}
 
 	if a.config.IpPassMode != conf.IpPassMode {
@@ -727,11 +767,17 @@ func (a *UdpAC) updateServerPeers(peers []*core.UdpPeer) (err error) {
 		a.device.AddPeer(p)
 		serverPeerMap[p.PublicKeyBase64()] = p
 	}
-	a.config.Servers = peers
 
 	// remove old peers from device
 	a.serverPeerMutex.Lock()
 	defer a.serverPeerMutex.Unlock()
+	// Assign a.config.Servers under serverPeerMutex — the same lock that
+	// guards a.serverPeerMap. The config-reload watcher runs updateServerPeers
+	// concurrently with Start's eBPF boot-loop reader (see ebpfInfraExemptRules
+	// caller) and any GetConfig() reader; an unlocked slice-header write here
+	// raced those reads under reload pressure (a -race-detectable data race).
+	// Adapted from OpenNHP 3e56ffc7 (#3085).
+	a.config.Servers = peers
 	for pubKey := range a.serverPeerMap {
 		if _, found := serverPeerMap[pubKey]; !found {
 			a.device.RemovePeer(pubKey)

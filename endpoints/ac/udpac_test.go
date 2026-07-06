@@ -2,6 +2,7 @@ package ac
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -1231,7 +1232,7 @@ func TestEbpfInfraExemptRules(t *testing.T) {
 		},
 	}
 
-	rules := ebpfInfraExemptRules(cfg)
+	rules := ebpfInfraExemptRules(cfg.Servers, cfg.DefaultIp, cfg.HealthCheckPort)
 
 	if got, want := len(rules), len(cfg.Servers)+1; got != want {
 		t.Fatalf("rule count = %d, want %d (one per server peer + one health-check rule)", got, want)
@@ -1276,7 +1277,7 @@ func TestEbpfInfraExemptRules(t *testing.T) {
 func TestEbpfInfraExemptRules_HealthPortAdmittedWithoutServers(t *testing.T) {
 	cfg := &Config{DefaultIp: "10.0.0.1", HealthCheckPort: 9090}
 
-	rules := ebpfInfraExemptRules(cfg)
+	rules := ebpfInfraExemptRules(cfg.Servers, cfg.DefaultIp, cfg.HealthCheckPort)
 
 	if len(rules) != 1 {
 		t.Fatalf("rule count = %d, want 1 (health-check rule only)", len(rules))
@@ -1299,7 +1300,7 @@ func TestEbpfInfraExemptRules_NonPositivePortOmitsHealthRule(t *testing.T) {
 			Servers:         []*core.UdpPeer{{Ip: "10.0.0.2"}},
 			HealthCheckPort: port,
 		}
-		rules := ebpfInfraExemptRules(cfg)
+		rules := ebpfInfraExemptRules(cfg.Servers, cfg.DefaultIp, cfg.HealthCheckPort)
 		if len(rules) != len(cfg.Servers) {
 			t.Errorf("HealthCheckPort=%d: got %d rules, want %d (server rules only)", port, len(rules), len(cfg.Servers))
 		}
@@ -1309,4 +1310,168 @@ func TestEbpfInfraExemptRules_NonPositivePortOmitsHealthRule(t *testing.T) {
 			}
 		}
 	}
+}
+
+// assertNoEmptySrcIPRule fails if any sdwhitelist rule carries an empty SrcIP —
+// the bogus boot-time rule a hostname-only server peer would leak before the
+// #3085 skip. protocol_port health rules are legitimately address-agnostic and
+// carry no SrcIP, so they are exempt from this check.
+func assertNoEmptySrcIPRule(t *testing.T, rules []ebpfInfraRule) {
+	t.Helper()
+	for i, r := range rules {
+		if r.mapType == ebpf.MapTypeSdWhitelist && r.params.SrcIP == "" {
+			t.Errorf("rule %d: sdwhitelist rule with empty SrcIP must never be seeded", i)
+		}
+	}
+}
+
+// TestEbpfInfraExemptRules_DNSOnlyPeerSeedsNoRule proves the boot-time XDP
+// seeding skips a server peer configured by hostname only (Ip == "", resolved
+// on the data path). Such a peer has no source IP to key on; an sdwhitelist
+// rule with SrcIP="" is kernel-rejected or matches every source. Regression
+// fence for #3085 bug 2 (adapted from OpenNHP 3e56ffc7).
+func TestEbpfInfraExemptRules_DNSOnlyPeerSeedsNoRule(t *testing.T) {
+	// Mixed fleet: one static-IP peer (installs a rule) plus one DNS-only peer
+	// (Ip == "", must be skipped) — proves the skip is selective.
+	cfg := &Config{
+		DefaultIp:       "10.100.0.57",
+		HealthCheckPort: 8080,
+		Servers: []*core.UdpPeer{
+			{Ip: "10.100.10.73"},
+			{Hostname: "server.nhp.internal"}, // Ip == "" → skipped
+		},
+	}
+	rules := ebpfInfraExemptRules(cfg.Servers, cfg.DefaultIp, cfg.HealthCheckPort)
+	assertNoEmptySrcIPRule(t, rules)
+	if got, want := len(rules), 2; got != want { // static-IP server rule + health rule
+		t.Fatalf("mixed fleet: rule count = %d, want %d (static-IP server rule + health rule)", got, want)
+	}
+	if rules[0].mapType != ebpf.MapTypeSdWhitelist || rules[0].params.SrcIP != "10.100.10.73" {
+		t.Errorf("mixed fleet: rule 0 = map %d src %q, want sdwhitelist src 10.100.10.73",
+			rules[0].mapType, rules[0].params.SrcIP)
+	}
+
+	// DNS-only fleet: no static IPs at all → zero server rules (only the health
+	// rule survives), and never an empty-SrcIP rule.
+	dnsOnly := &Config{
+		DefaultIp:       "10.100.0.57",
+		HealthCheckPort: 8080,
+		Servers:         []*core.UdpPeer{{Hostname: "a.internal"}, {Hostname: "b.internal"}},
+	}
+	rules = ebpfInfraExemptRules(dnsOnly.Servers, dnsOnly.DefaultIp, dnsOnly.HealthCheckPort)
+	assertNoEmptySrcIPRule(t, rules)
+	if got, want := len(rules), 1; got != want { // health rule only
+		t.Fatalf("DNS-only fleet: rule count = %d, want %d (health rule only)", got, want)
+	}
+	if rules[0].mapType != ebpf.MapTypeProtocolPort {
+		t.Errorf("DNS-only fleet: sole rule = map %d, want protocol_port health rule", rules[0].mapType)
+	}
+}
+
+// snapshotAndBuildInfraRules exercises Start's ACTUAL boot-loop reader —
+// a.snapshotInfraRuleInputs (the production locked snapshot) — then builds the
+// exempt rules from it. Sharing the production reader (rather than
+// re-implementing the RLock+copy in the test) makes the reader-side lock a
+// tested invariant: dropping the RLock in snapshotInfraRuleInputs trips the race
+// detector in the fences below against their real reload writers.
+func snapshotAndBuildInfraRules(ac *UdpAC) []ebpfInfraRule {
+	servers, defaultIp, healthCheckPort := ac.snapshotInfraRuleInputs()
+	return ebpfInfraExemptRules(servers, defaultIp, healthCheckPort)
+}
+
+// TestUpdateServerPeers_ReloadVsRead_NoRaceDetectorTrip fences the #3085 bug 1
+// data race on a.config.Servers: updateServerPeers (the server-peer reload
+// watcher) rewrites the slice while Start's eBPF boot loop reads it. Before the
+// fix, updateServerPeers assigned a.config.Servers OUTSIDE serverPeerMutex, so
+// that slice-header write raced any concurrent read (-race-detectable). The fix
+// assigns it under serverPeerMutex, and the boot-loop reader snapshots it under
+// the same lock. This test drives the writer against lock-holding readers that
+// mirror the boot-loop snapshot; the race detector is the contract. Adapted
+// from OpenNHP 3e56ffc7.
+func TestUpdateServerPeers_ReloadVsRead_NoRaceDetectorTrip(t *testing.T) {
+	ac := createTestAC(t)
+	ac.config = &Config{DefaultIp: "10.0.0.1", HealthCheckPort: 8080}
+
+	// Distinct peer sets so each reload actually swaps the slice header. All
+	// peers carry a static Ip so the readers don't spam the DNS-only skip log.
+	const sets = 4
+	peerSets := make([][]*core.UdpPeer, sets)
+	for i := range peerSets {
+		peerSets[i] = []*core.UdpPeer{
+			{PubKeyBase64: fmt.Sprintf("peer-a-%d", i), Ip: fmt.Sprintf("10.0.1.%d", i)},
+			{PubKeyBase64: fmt.Sprintf("peer-b-%d", i), Ip: fmt.Sprintf("10.0.2.%d", i)},
+		}
+	}
+
+	const readers, iterations = 4, 200
+	var wg sync.WaitGroup
+
+	// Writer: the server-peer reload path.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			if err := ac.updateServerPeers(peerSets[i%sets]); err != nil {
+				t.Errorf("updateServerPeers: %v", err)
+				return
+			}
+		}
+	}()
+
+	// Readers: mirror Start's boot-loop snapshot.
+	wg.Add(readers)
+	for r := 0; r < readers; r++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_ = snapshotAndBuildInfraRules(ac)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// TestBaseConfigReloadVsBootLoopRead_DefaultIp_NoRaceDetectorTrip fences the
+// #3085 DefaultIp half of the same class of race: updateBaseConfig (the
+// base-config reload watcher) patches a.config.DefaultIp while Start's eBPF boot
+// loop reads it via ebpfInfraExemptRules. The base-config watcher is installed
+// before the boot loop runs, so an operator editing DefaultIp during the boot
+// window would race the read. The fix takes serverPeerMutex around the DefaultIp
+// reload write, and the boot-loop reader snapshots DefaultIp under the same
+// lock. This drives the real updateBaseConfig reload path against readers that
+// mirror the boot-loop snapshot; the race detector is the contract.
+func TestBaseConfigReloadVsBootLoopRead_DefaultIp_NoRaceDetectorTrip(t *testing.T) {
+	ac := createTestAC(t)
+	ac.config = &Config{DefaultIp: "10.0.0.1", HealthCheckPort: 8080}
+
+	const readers, iterations = 4, 200
+	var wg sync.WaitGroup
+
+	// Writer: the base-config reload path, toggling DefaultIp through the real
+	// updateBaseConfig (a.config != nil selects the reload branch).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			conf := Config{DefaultIp: fmt.Sprintf("10.0.0.%d", i%8+1), HealthCheckPort: 8080}
+			if err := ac.updateBaseConfig(conf); err != nil {
+				t.Errorf("updateBaseConfig: %v", err)
+				return
+			}
+		}
+	}()
+
+	// Readers: mirror Start's boot-loop snapshot (which reads DefaultIp).
+	wg.Add(readers)
+	for r := 0; r < readers; r++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_ = snapshotAndBuildInfraRules(ac)
+			}
+		}()
+	}
+
+	wg.Wait()
 }
