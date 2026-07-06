@@ -52,7 +52,8 @@ func Close() {
 // and asynchronously starts the knock loop thread.
 //
 // Returns the number of resources being knocked, or -1 if the agent is not
-// initialized.
+// initialized OR not running (e.g. racing a Stop()/RestartAgent, so the loop
+// wasn't started). Native/cgo callers must treat -1 as "not started", not a count.
 func KnockloopStart() int {
 	if instance == nil {
 		return -1

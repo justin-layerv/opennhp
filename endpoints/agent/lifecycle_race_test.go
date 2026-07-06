@@ -616,6 +616,49 @@ func TestRestart_ConcurrentMapDelete_NoMapRace(t *testing.T) {
 	a.Stop()
 }
 
+// TestRestart_ConcurrentMapUpdatedSignal_NoFieldRace fences the #3095 post-merge
+// finding: knockTargetMapUpdated is reassigned in Start() under lifecycleMu.Lock,
+// but its senders (AddResource / RemoveResource / the debounced updateResources
+// callback) read the field to send on it. It hammers the exact send pattern those
+// three sites use — mapUpdatedSignal() snapshot + non-blocking send — against a
+// concurrent restart. With the snapshot under RLock there's a happens-before with
+// Start()'s Lock-write; without it the field read/write is a DATA RACE.
+// (TestRestart_ConcurrentMapDelete uses no-match removers that never reach the
+// send, so it does not cover this.)
+func TestRestart_ConcurrentMapUpdatedSignal_NoFieldRace(t *testing.T) {
+	a, dir := newStartedTestAgent(t)
+
+	done := make(chan struct{})
+	var hammers sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		hammers.Add(1)
+		go func() {
+			defer hammers.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				// exactly what AddResource/RemoveResource/updateResources do
+				mapUpdated := a.mapUpdatedSignal()
+				select {
+				case mapUpdated <- struct{}{}:
+				default:
+				}
+			}
+		}()
+	}
+
+	a.Stop()
+	if err := a.Start(dir, 1); err != nil {
+		t.Fatalf("restart Start: %v", err)
+	}
+	close(done)
+	hammers.Wait()
+	a.Stop()
+}
+
 // TestStop_ConcurrentResponseAwaitingCalls_NoHang hammers the three response-
 // awaiting SDK methods against a concurrent Stop() and asserts every call
 // returns. Without the receive-side guard, a send stranded in sendMsgCh's buffer

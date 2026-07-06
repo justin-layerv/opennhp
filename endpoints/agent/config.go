@@ -297,8 +297,9 @@ func (a *UdpAgent) updateResources(file string) (err error) {
 	// once the consumer routine had exited. knockTargetMapUpdated is never
 	// closed (see Stop()), so a late send lands harmlessly in the size-1
 	// buffer.
+	mapUpdated := a.mapUpdatedSignal() // snapshot under RLock (#3103)
 	select {
-	case a.signals.knockTargetMapUpdated <- struct{}{}:
+	case mapUpdated <- struct{}{}:
 	default:
 	}
 

@@ -134,9 +134,14 @@ The concurrency gaps this port surfaced were closed here rather than deferred:
 
 - **#3103** — `Start()`'s lock-free field reassignment vs concurrent SDK reads,
   and the direct-`sdk.KnockResource` / `Stop()`-racing-`Start()` "WaitGroup
-  reused" panic. Closed by `lifecycleMu` (invariant #5's serialization bullet);
-  fenced by `TestBeginTrackedOp_ConcurrentStop_NoWaitGroupReusePanic` and
-  `TestRestart_ConcurrentSendOrStop_NoFieldRace`.
+  reused" panic. Closed by `lifecycleMu` (invariant #5) for the reassigned
+  channels — `signals.stop` / `sendMsgCh` / `knockTargetMapUpdated` are read via
+  `RLock` snapshots (`stopSignal` / `sendOrStop` / `mapUpdatedSignal`) — and by
+  taking `knockTargetMapMutex` / `serverPeerMutex` around the map re-init. Fenced
+  by `TestBeginTrackedOp_ConcurrentStop_NoWaitGroupReusePanic`,
+  `TestRestart_ConcurrentSendOrStop_NoFieldRace`,
+  `TestRestart_ConcurrentMapDelete_NoMapRace`, and
+  `TestRestart_ConcurrentMapUpdatedSignal_NoFieldRace`.
 - **#3104** — executable fence for the transaction-owned `ResponseMsgCh`
   single-writer leg: `TestLocalTransactionResponseMsgChWrittenExactlyOnce`
   (invariant #4).
@@ -153,3 +158,14 @@ drain-safe for every in-tree caller: `sdk.Close` only nils the GC-live singleton
 and the web-console `restartAgent` handler + `main` return without reusing a
 device-touched resource — no caller treats a `Stop()` return as "teardown fully
 drained."
+
+## Open follow-up
+
+- **#3114** — `Start()` also reassigns **`a.device`** (and `a.config`) lock-free,
+  raced by unsynchronized SDK reads: `AddServer` (`a.device.AddPeer`) and the
+  request methods (`RequestOtp`/`RegisterPublicKey`/`ListResource` → `newMsgData`
+  → `a.device.NextCounterIndex`, gated only by `IsRunning()` so no `wg` token pins
+  `a.device`). Bounded to the agent field-publish — `nhp/core`'s `Device` is
+  already thread-safe (`AddPeer` locks `peerMapMutex`; `Stop()` deliberately
+  doesn't invalidate `peerMap`) — but spans ~15 heterogeneously-guarded sites plus
+  `a.config`, so scoped to its own focused PR rather than the #3084 teardown fixes.

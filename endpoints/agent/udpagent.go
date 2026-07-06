@@ -300,7 +300,13 @@ func (a *UdpAgent) RestartAgent() error {
 }
 
 // StartKnockLoop launches the preset-resource knock loop and returns the number
-// of knock targets. It must follow a Start() (or RestartAgent()), not a bare
+// of knock targets, or -1 if the agent isn't running (e.g. racing a Stop() /
+// RestartAgent) so the loop was not started — the same "-1 = can't start"
+// sentinel sdk.KnockloopStart already uses for an uninitialized agent. Callers
+// treating the result as an unsigned count (incl. the cgo/iOS exports) must
+// handle -1.
+//
+// It must follow a Start() (or RestartAgent()), not a bare
 // StopKnockLoop(): knockTargetStop and its guarding knockTargetStopOnce are
 // re-armed only in Start(), so a StartKnockLoop() after a StopKnockLoop() with no
 // intervening Start() would spawn a knockResourceRoutine that immediately sees
@@ -464,6 +470,19 @@ func (a *UdpAgent) stopSignal() <-chan struct{} {
 	a.lifecycleMu.RLock()
 	defer a.lifecycleMu.RUnlock()
 	return a.signals.stop
+}
+
+// mapUpdatedSignal snapshots a.signals.knockTargetMapUpdated under lifecycleMu.RLock,
+// mirroring stopSignal for the one remaining Start()-reassigned channel with
+// unsynchronized senders: AddResource/RemoveResource (SDK) and the debounced
+// updateResources file-watcher callback. Without it those sends race Start()'s
+// reassignment of the field (#3103). Returns the sendable channel; the non-blocking
+// send stays outside the lock (knockTargetMapUpdated is never closed, so a snapshot
+// of the previous cycle's channel just lands harmlessly in its size-1 buffer).
+func (a *UdpAgent) mapUpdatedSignal() chan struct{} {
+	a.lifecycleMu.RLock()
+	defer a.lifecycleMu.RUnlock()
+	return a.signals.knockTargetMapUpdated
 }
 
 // deviceKey returns the agent's device public key for log identification, or ""
@@ -978,8 +997,9 @@ func (a *UdpAgent) AddResource(res *KnockResource) error {
 		// same pattern as updateResources / RemoveResource.
 		// knockTargetMapUpdated is never closed (see Stop()), so a late
 		// send lands harmlessly in the buffer.
+		mapUpdated := a.mapUpdatedSignal() // snapshot under RLock (#3103)
 		select {
-		case a.signals.knockTargetMapUpdated <- struct{}{}:
+		case mapUpdated <- struct{}{}:
 		default:
 		}
 	}
@@ -1002,8 +1022,9 @@ func (a *UdpAgent) RemoveResource(aspId string, resId string) {
 	if beforeSize != afterSize {
 		// renew knock cycle. See AddResource: non-blocking send so a
 		// concurrent caller or a racing Stop() can't block or panic.
+		mapUpdated := a.mapUpdatedSignal() // snapshot under RLock (#3103)
 		select {
-		case a.signals.knockTargetMapUpdated <- struct{}{}:
+		case mapUpdated <- struct{}{}:
 		default:
 		}
 	}
