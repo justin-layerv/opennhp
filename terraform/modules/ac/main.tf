@@ -1124,16 +1124,26 @@ resource "terraform_data" "ac_user_data_filter_mode_render_check" {
   }
 }
 
+# Plan-time render lint for the four operator-drivable L3 flush-on-expiry
+# fields in config.toml. All four are env-root tfvars levers consumed by the AC
+# at config load (endpoints/ac/config.go), so a template typo/refactor that
+# drops any line silently no-ops the operator's IaC control with no plan-time
+# failure: EnableL3FlushOnExpiry / L3FlushDryRun are the #2192 flush flags;
+# L3FlushConntrackBackend / L3FlushConntrackPoolSize drive the #2940 netlink
+# rollout gate. Anchors are boolean/quoted/numeric TOML lines rendered
+# adjacently in user_data.sh.tpl.
 resource "terraform_data" "ac_user_data_l3_conntrack_render_check" {
   input = sha256(local.user_data)
 
   lifecycle {
     precondition {
       condition = alltrue([
+        strcontains(local.user_data, "\nEnableL3FlushOnExpiry = ${var.enable_l3_flush_on_expiry}\n"),
+        strcontains(local.user_data, "\nL3FlushDryRun = ${var.l3_flush_dry_run}\n"),
         strcontains(local.user_data, "\nL3FlushConntrackBackend = \"${lower(var.l3_flush_conntrack_backend)}\"\n"),
         strcontains(local.user_data, "\nL3FlushConntrackPoolSize = ${var.l3_flush_conntrack_pool_size}\n"),
       ])
-      error_message = "AC user_data must render L3FlushConntrackBackend and L3FlushConntrackPoolSize into config.toml so the #2940 netlink rollout gate can be driven through managed Terraform config."
+      error_message = "AC user_data must render EnableL3FlushOnExpiry, L3FlushDryRun, L3FlushConntrackBackend, and L3FlushConntrackPoolSize into config.toml so the #2192 flush-on-expiry flags and the #2940 netlink rollout gate can be driven through managed Terraform config."
     }
   }
 }
