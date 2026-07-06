@@ -1127,6 +1127,21 @@ const (
 	// deferred to #2563.
 	MetricGlobalCapRejections = "GlobalCapRejections"
 
+	// MetricHandlerBudgetExhausted counts agent-facing handler dispatches
+	// shed because the MaxConcurrentHandlers goroutine budget was full
+	// (see dispatchHandler). Steady-state value is zero: 4096 in-flight
+	// handshake-class handlers is far above any legitimate concurrency,
+	// so a non-zero value means the server is shedding knock-class work —
+	// either a spoofed/distributed flood that bypasses the per-IP rate
+	// limiter, or a stalled downstream (e.g. an unresponsive AC) keeping
+	// handlers parked in-flight. The shed itself is graceful: the packet
+	// is dropped and the agent retries, so this is a load/health signal,
+	// not a correctness failure. Auto-surfaces in CloudWatch via the
+	// publisher flush loop (no registration needed); a `>= 1` single-event
+	// alarm is deferred to #3097 (sibling of MetricGlobalCapRejections'
+	// #2563 — both are steady-state-zero DoS-shed detectors).
+	MetricHandlerBudgetExhausted = "HandlerBudgetExhausted"
+
 	// MetricACConnStaleFiltered counts AC connections skipped by the
 	// broadcast-time staleness filter (DefaultStaleACConnThreshold or its
 	// per-server override). A non-zero rate is expected during AC

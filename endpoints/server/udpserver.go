@@ -320,6 +320,23 @@ type UdpServer struct {
 	rateLimiter    *IPRateLimiter
 	rateLimitDrops atomic.Int64 // total dropped packets, for sampled logging
 
+	// handlerSem bounds the number of in-flight agent-facing handler
+	// goroutines dispatchReceivedMessage runs concurrently (see
+	// MaxConcurrentHandlers). Buffered to that capacity; dispatchHandler
+	// acquires with a NON-BLOCKING send so recvMessageRoutine never
+	// head-of-line-blocks on a full budget (#1163) — excess dispatches
+	// are shed and the agent retries. A nil sem means unbounded; that is
+	// a test-only affordance (bare &UdpServer{} literals), the
+	// constructor always initializes it in production.
+	handlerSem chan struct{}
+	// handlerShedCount throttles the shed warn-log to 1 + every 1000th
+	// shed — the same lifetime-modulus sampled-log idiom as rateLimitDrops
+	// and perIPEvictionWarns. It never resets, so the log is only a
+	// sample; MetricHandlerBudgetExhausted is the durable per-incident
+	// signal (a later, smaller shed burst may not cross a 1000-boundary
+	// and log nothing, but it always ticks the metric).
+	handlerShedCount atomic.Int64
+
 	// Per-IP agent-conn eviction warning counter, for sampled logging.
 	// MetricAgentConnPerIPEvictions is the source of truth; this counter
 	// just throttles the warn-log to 1 + every 1000th eviction.
@@ -822,6 +839,13 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	s.rateLimiter = NewIPRateLimiter(rlCfg)
 	log.Info("UDP rate limiter initialized: %.0f pps sustained, %d burst per source IP",
 		rlCfg.Rate, rlCfg.Burst)
+
+	// Bound in-flight agent-facing handler goroutines. Buffered to
+	// MaxConcurrentHandlers; dispatchHandler acquires non-blocking so the
+	// receive path never stalls (#1163). Complements the per-IP rate
+	// limiter above: that caps a single source, this caps aggregate
+	// in-flight handlers under a spoofed/distributed flood.
+	s.handlerSem = make(chan struct{}, MaxConcurrentHandlers)
 
 	// Initialize server-to-server forwarder
 	s.forwarder = NewServerForwarder(s)
@@ -2848,6 +2872,45 @@ func (s *UdpServer) recvMessageRoutine() {
 	}
 }
 
+// dispatchHandler runs fn(ppd) in its own goroutine under the
+// handlerSem budget. The acquire is a NON-BLOCKING send: when the
+// budget is full the dispatch is shed — MetricHandlerBudgetExhausted
+// ticks, a rate-limited warning logs, and the packet is dropped so the
+// agent retries — rather than blocking recvMessageRoutine, which would
+// re-introduce the head-of-line blocking #1163 removed. See
+// MaxConcurrentHandlers for why the pre-dispatch per-IP rate limiter
+// can't provide this ceiling on its own.
+//
+// A nil handlerSem means unbounded — a test-only affordance for bare
+// &UdpServer{} literals; the constructor always initializes it.
+func (s *UdpServer) dispatchHandler(ppd *core.PacketParserData, fn func(*core.PacketParserData) error) {
+	// handlerSem is set once in Start() before the receive routines
+	// launch and never reassigned, so a single read decides bounded vs.
+	// the (test-only) unbounded path for both acquire and release.
+	bounded := s.handlerSem != nil
+	if bounded {
+		select {
+		case s.handlerSem <- struct{}{}:
+		default:
+			s.metrics.IncrCounter(MetricHandlerBudgetExhausted)
+			if sheds := s.handlerShedCount.Add(1); sheds == 1 || sheds%1000 == 0 {
+				log.Warning("[Server] handler budget (%d) exhausted, shedding %s from %s (total sheds: %d)",
+					cap(s.handlerSem), core.HeaderTypeToString(ppd.HeaderType),
+					ppd.ConnData.RemoteAddr.String(), sheds)
+			}
+			return
+		}
+	}
+	go func() {
+		if bounded {
+			defer func() { <-s.handlerSem }()
+		}
+		if err := fn(ppd); err != nil {
+			log.Error("[Server] %s handler failed: %v", core.HeaderTypeToString(ppd.HeaderType), err)
+		}
+	}()
+}
+
 // dispatchReceivedMessage routes a decrypted PPD to its handler.
 // Every handler arm dispatches asynchronously via a goroutine:
 // recvMsgCh feeds packetToMsgRoutine, and a slow handler on this
@@ -2858,16 +2921,35 @@ func (s *UdpServer) recvMessageRoutine() {
 // spawning — there's no handler to run. The extraction also makes
 // the async-dispatch property directly testable without standing
 // up a full listener loop.
+//
+// Agent-facing handshake-class arms (KNK/RKN/EXT/DHP_KNK, OTP, REG,
+// LST, DAR, DRG, DAV, and the relay-forwarded knock RLY) go through
+// dispatchHandler, which caps concurrent handlers at
+// MaxConcurrentHandlers and sheds when full — these are the
+// attacker-influenced, expensive arms (a knock runs buildKnockAck +
+// an AC-open round-trip). Infra arms stay unbounded: they arrive from
+// IP-gated trusted peers and must not compete with an agent-knock flood
+// for slots — shedding a legitimate AC-online behind a flood would be
+// worse than the flood itself. AOL/DOL (AC/DB online) and RVA
+// (revocation-ack) are also cheap. FWD/FRT (server-to-server) are the
+// exception worth naming: a forwarded knock runs the SAME expensive
+// buildKnockAck + AC-open pipeline, so leaving it unbounded is
+// load-bearing on the peer-server trust boundary. It's safe because
+// NHP_FWD is accepted only from source-restricted peer servers (not
+// spoofable within the boundary). The transitive bound is PER peer, not a
+// global 4096: N peers can drive up to 4096×N expensive FWD handlers
+// here, none counted against this server's budget; and it assumes a
+// homogeneous fleet — an un-upgraded peer mid-rollout has no handlerSem,
+// and a single compromised peer sidesteps the ceiling. Acceptable only
+// because that aggregate stays inside the trusted server mesh; #3100
+// tracks bounding FWD/FRT per-peer to close the residual.
 func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 	switch ppd.HeaderType {
 	case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT, core.DHP_KNK:
-		go func() {
-			if knockErr := s.HandleKnockRequest(ppd); knockErr != nil {
-				log.Error("[Server] HandleKnockRequest failed: %v", knockErr)
-			}
-		}()
+		s.dispatchHandler(ppd, s.HandleKnockRequest)
 
 	case core.NHP_AOL:
+		// Infra (AC online) — unbounded; see dispatchReceivedMessage doc.
 		go func() {
 			if aolErr := s.HandleACOnline(ppd); aolErr != nil {
 				log.Error("[Server] HandleACOnline failed: %v", aolErr)
@@ -2875,6 +2957,7 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 		}()
 
 	case core.NHP_DOL:
+		// Infra (DB online) — unbounded.
 		go func() {
 			if dolErr := s.HandleDBOnline(ppd); dolErr != nil {
 				log.Error("[Server] HandleDBOnline failed: %v", dolErr)
@@ -2882,58 +2965,44 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 		}()
 
 	case core.NHP_OTP:
-		go func() {
-			if otpErr := s.HandleOTPRequest(ppd); otpErr != nil {
-				log.Error("[Server] HandleOTPRequest failed: %v", otpErr)
-			}
-		}()
+		s.dispatchHandler(ppd, s.HandleOTPRequest)
 
 	case core.NHP_REG:
-		go func() {
-			if regErr := s.HandleRegisterRequest(ppd); regErr != nil {
-				log.Error("[Server] HandleRegisterRequest failed: %v", regErr)
-			}
-		}()
+		s.dispatchHandler(ppd, s.HandleRegisterRequest)
 
 	case core.NHP_LST:
-		go func() {
-			if listErr := s.HandleListRequest(ppd); listErr != nil {
-				log.Error("[Server] HandleListRequest failed: %v", listErr)
-			}
-		}()
-	case core.NHP_DAR:
-		go func() {
-			if darErr := s.HandleDHPDARMessage(ppd); darErr != nil {
-				log.Error("[Server] HandleDHPDARMessage failed: %v", darErr)
-			}
-		}()
-	case core.NHP_DRG:
-		go func() {
-			if drgErr := s.HandleDHPDRGMessage(ppd); drgErr != nil {
-				log.Error("[Server] HandleDHPDRGMessage failed: %v", drgErr)
-			}
-		}()
-	case core.NHP_DAV:
-		go func() {
-			if davErr := s.HandleDHPDAVMessage(ppd); davErr != nil {
-				log.Error("[Server] HandleDHPDAVMessage failed: %v", davErr)
-			}
-		}()
+		s.dispatchHandler(ppd, s.HandleListRequest)
 
-	// Server-to-server forwarding
+	case core.NHP_DAR:
+		s.dispatchHandler(ppd, s.HandleDHPDARMessage)
+
+	case core.NHP_DRG:
+		s.dispatchHandler(ppd, s.HandleDHPDRGMessage)
+
+	case core.NHP_DAV:
+		s.dispatchHandler(ppd, s.HandleDHPDAVMessage)
+
+	// Server-to-server forwarding — infra, unbounded.
 	case core.NHP_FWD:
 		go s.HandleForwardRequest(ppd)
 	case core.NHP_FRT:
 		go s.HandleForwardResult(ppd)
 
-	// NHP-Relay forwarded agent knock (#2208)
+	// NHP-Relay forwarded agent knock (#2208). Runs the same knock
+	// pipeline as a direct knock (buildKnockAck + AC-open), so it is
+	// bounded with the other agent-facing arms. HandleRelayForward
+	// returns no error, so it is wrapped to the dispatchHandler signature.
 	case core.NHP_RLY:
-		go s.HandleRelayForward(ppd)
+		s.dispatchHandler(ppd, func(p *core.PacketParserData) error {
+			s.HandleRelayForward(p)
+			return nil
+		})
 
 	// qURL v2 revocation ack from an AC (P4e Slice 3, #2793). Unsolicited
 	// AC→server push acknowledging an NHP_REV; clears the per-AC-slot
-	// pending-revoke tracker so the retry-until-ack loop stops. Dispatched async
-	// like every other arm so a slow handler cannot head-of-line-block the
+	// pending-revoke tracker so the retry-until-ack loop stops. Infra
+	// (AC→server), so unbounded like the other trusted-peer arms;
+	// dispatched async so a slow handler cannot head-of-line-block the
 	// receive queue.
 	case core.NHP_RVA:
 		go func() {

@@ -24,6 +24,43 @@ const (
 	DefaultACConnectionTimeoutMs    = common.ServerSideConnectionTimeoutMs // 300 seconds to delete idle connection
 	DefaultDBConnectionTimeoutMs    = common.ServerSideConnectionTimeoutMs // 300 seconds to delete idle connection
 	PacketQueueSizePerConnection    = 256
+	// MaxConcurrentHandlers bounds in-flight agent-facing handler
+	// goroutines dispatchReceivedMessage runs concurrently. Per-packet
+	// async dispatch is deliberate (#1163: a slow handler must not
+	// head-of-line-block the receive path), but the spawn was unbounded.
+	// The fork's per-IP rate limiter (100 pps, ratelimiter.go) already
+	// neutralizes upstream's stated single-peer threat, but it is keyed
+	// on source IP: a spoofed-source or distributed knock flood bypasses
+	// per-IP fairness, and MaxConcurrentConnection bounds only unique
+	// remote addrs — not how many in-flight handlers exist across them.
+	// In cloud mode an unknown agent's knock reaches HandleKnockRequest,
+	// which holds its slot for the handler's full duration — dominated by
+	// the AC-open round-trip, up to ~3.3s on the reknock-retry path (two
+	// 1.5s transaction timeouts + defaultReknockRetryBackoff) and longer
+	// still if a plugin/DDB call stalls — so under a flood handlers
+	// accumulate faster than they retire and drive the process toward OOM.
+	// This ceiling converts that tail from a crash into a graceful shed
+	// (MetricHandlerBudgetExhausted). One caveat of a single global budget:
+	// during a sustained distributed flood, legitimate agent knocks share
+	// these slots and are shed too once saturated. The sustained shed floor
+	// is budget/hold — many thousands of knocks/s under a healthy AC (sub-
+	// millisecond holds), but dropping toward ~1k/s when AC-open is slow —
+	// which is the correct tradeoff (a bounded shed + agent retry beats an
+	// OOM that drops every tenant); per-class slot reservation is left as a
+	// future refinement if flood-time shedding of legit knocks shows up.
+	// The ceiling is load-bearing on every agent-facing handler being
+	// TIME-BOUNDED (ServerACOpenTransactionResponseTimeoutMs and friends):
+	// a slot only returns when fn returns, so a future handler that could
+	// block forever would erode the effective budget monotonically. 4096
+	// is sized to absorb a large legitimate burst even at a slow-AC hold
+	// (budget/hold headroom) while capping worst-case in-flight goroutine
+	// memory well under the box and sitting 5× below MaxConcurrentConnection;
+	// it matches upstream OpenNHP bc499d7c (#1552 H2). The right value is
+	// fleet-dependent (decrypt throughput × handler latency) — #3099 tracks
+	// making it operator-tunable. Infra arms (AOL/DOL/FWD/FRT/RVA) are
+	// intentionally NOT bounded — see dispatchReceivedMessage for the
+	// per-arm trust rationale.
+	MaxConcurrentHandlers = 4096
 )
 
 // Compile-time assertion that MaxAgentConnsPerIP ≥ 1. The eviction
