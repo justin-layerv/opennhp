@@ -274,19 +274,32 @@ func (a *UdpAgent) updateResources(file string) (err error) {
 		}
 	}
 
-	if a.knockTargetMap == nil {
-		a.knockTargetMap = targetMap
-		return nil
-	}
-
-	// update
 	a.knockTargetMapMutex.Lock()
+	firstLoad := a.knockTargetMap == nil
 	a.knockTargetMap = targetMap
 	a.knockTargetMapMutex.Unlock()
 
-	// renew knock cycle
-	if len(a.signals.knockTargetMapUpdated) == 0 {
-		a.signals.knockTargetMapUpdated <- struct{}{}
+	if firstLoad {
+		// Initial load during Start() (before the knock loop and file-watcher
+		// exist), so there's nothing to notify. The write above is taken under
+		// the mutex anyway — uniformly with the reload path below — so a
+		// programmatic-init caller that races the watcher callback can't trip
+		// -race on knockTargetMap.
+		return nil
+	}
+
+	// renew knock cycle. Non-blocking send (matches AddResource /
+	// RemoveResource): this runs from a debounced file-watcher callback
+	// (utils.WatchFile fires via time.AfterFunc, untracked by any
+	// WaitGroup) that can land after Stop(). The previous blocking send
+	// guarded only by a len()==0 check both raced (two watchers could each
+	// observe 0, and the second would block) and risked blocking forever
+	// once the consumer routine had exited. knockTargetMapUpdated is never
+	// closed (see Stop()), so a late send lands harmlessly in the size-1
+	// buffer.
+	select {
+	case a.signals.knockTargetMapUpdated <- struct{}{}:
+	default:
 	}
 
 	return nil

@@ -16,7 +16,19 @@ import (
 )
 
 func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, err error) {
-	a.wg.Add(1)
+	// Register against teardown before doing any work: beginTrackedOp does the
+	// running check + a.wg.Add(1) under lifecycleMu.RLock, so a DIRECT SDK Knock
+	// (sdk.KnockResource, no parent wg token) racing a Stop() already at
+	// wg.Wait()==0 can't trip the "WaitGroup reused before Wait returned" panic
+	// (#3103). If the agent isn't running, synthesize a stopped ack — the SDK
+	// export reads ackMsg (not err), and knockResourceRoutine retries then bails
+	// on knockTargetStop.
+	if !a.beginTrackedOp() {
+		return &common.ServerKnockAckMsg{
+			ErrCode: common.ErrPacketToMessageRoutineStopped.ErrorCode(),
+			ErrMsg:  common.ErrPacketToMessageRoutineStopped.Error(),
+		}, common.ErrPacketToMessageRoutineStopped
+	}
 	defer a.wg.Done()
 
 	errWaitTime := (core.AgentLocalTransactionResponseTimeoutMs - 100) * time.Millisecond
@@ -29,15 +41,53 @@ func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, er
 		// use flat calling
 		ackMsg, err = a.knockRequest(res, true)
 	}
+	// knockRequest returns (nil, err) on its early-error paths: resolveServerAddr
+	// failing (nil peer, or a DNS-unresolvable / unparseable server address,
+	// nhp/core/peer.go SendAddr()), and — practically unreachable — a json.Marshal
+	// failure on the knock message. Synthesize an ackMsg from err so the
+	// ackMsg.ErrCode read below — and every later Knock caller, the live
+	// knockResourceRoutine (udpagent.go) and the SDK KnockResource export
+	// (sdk/ops.go) — can't dereference nil and crash.
+	//
+	// Adapted from upstream c6f9c769: the fork has no common.ErrorToErrorCode, so
+	// recover the wire code by unwrapping the *common.Error (resolveServerAddr
+	// returns common.ErrKnockServerNotFound), falling back to its code for any
+	// non-*common.Error (e.g. the marshal path). err.Error() is always carried in
+	// ErrMsg, so that fallback code is only a best-effort label for the rare
+	// non-*common.Error case.
+	if ackMsg == nil {
+		if err == nil {
+			err = common.ErrKnockServerNotFound
+		}
+		code := common.ErrKnockServerNotFound.ErrorCode()
+		var cerr *common.Error
+		if errors.As(err, &cerr) {
+			code = cerr.ErrorCode()
+		}
+		ackMsg = &common.ServerKnockAckMsg{
+			ErrCode: code,
+			ErrMsg:  err.Error(),
+		}
+	}
 	if ackMsg.ErrCode == common.ErrPacketEncryptionFailed.ErrorCode() {
 		// local failure, packet not sent
 		return ackMsg, err
 	}
 	if err != nil {
-		// if local error happens, wait some time to return
+		// If a local error happens, wait some time before returning so the
+		// caller (knockResourceRoutine) backs off between retries — but bail
+		// immediately on Stop(). Knock is a.wg-tracked and Stop() runs
+		// a.wg.Wait() before device.Stop(), so an unconditional sleep here would
+		// delay a whole teardown by up to ~errWaitTime (~4.9s) per active knock
+		// target, defeating the fast bail-on-signals.stop this PR is built around.
+		// (a.signals.stop is nil only for a never-Start()ed agent, e.g. the
+		// nil-guard unit test, where the nil case is simply never ready.)
 		elapsedTime := time.Since(startTime)
 		if elapsedTime < errWaitTime {
-			time.Sleep(errWaitTime - elapsedTime)
+			select {
+			case <-time.After(errWaitTime - elapsedTime):
+			case <-a.signals.stop:
+			}
 		}
 		return ackMsg, err
 	}
@@ -95,23 +145,40 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 	}
 	// #1154 invariant: wire arg here MUST equal knkMsg.HeaderType above.
 	knkMd := a.newMsgData(addr, headerType, knkBytes, serverPeer.PublicKey())
-	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
+	knkMd.ResponseMsgCh = make(chan *core.PacketParserData, 1) // buffered: see awaitTransactionResponse
 
 	ackMsg = &common.ServerKnockAckMsg{}
 	if !a.IsRunning() {
-		log.Error("agent(%s#%d)[KnockRequest] MsgData channel closed or being closed, skip sending", knkMsg.UserId, knkMd.TransactionId)
+		// Not-running only happens during/after Stop(): expected teardown, not an
+		// error — log at Debug so routine restarts don't trip error-log alerting.
+		log.Debug("agent(%s#%d)[KnockRequest] MsgData channel closed or being closed, skip sending", knkMsg.UserId, knkMd.TransactionId)
 		err = common.ErrPacketToMessageRoutineStopped
 		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
 		return ackMsg, err
 	}
 
-	// device will create or find existing connection and sends the MsgAssembler via that connection
-	a.sendMsgCh <- knkMd
+	// Guarded send (see sendOrStop). knockRequest is wg-tracked (via Knock), so
+	// bailing here keeps a full-buffer block from deadlocking Stop()'s wg.Wait().
+	if !a.sendOrStop(knkMd) {
+		log.Error("agent(%s#%d)[KnockRequest] message routine stopped, skip sending", knkMsg.UserId, knkMd.TransactionId)
+		err = common.ErrPacketToMessageRoutineStopped
+		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return ackMsg, err
+	}
 
-	// block until transaction completes
-	serverPpd := <-knkMd.ResponseMsgCh
-	close(knkMd.ResponseMsgCh)
+	// Block for the transaction response, bailing out on Stop(). knockRequest is
+	// wg-tracked (via Knock), so a hang here would deadlock Stop()'s wg.Wait();
+	// see awaitTransactionResponse.
+	serverPpd, ok := a.awaitTransactionResponse(knkMd.ResponseMsgCh)
+	if !ok {
+		log.Error("agent(%s#%d)[KnockRequest] message routine stopped, skip waiting for response", knkMsg.UserId, knkMd.TransactionId)
+		err = common.ErrPacketToMessageRoutineStopped
+		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return ackMsg, err
+	}
 
 	if serverPpd.Error != nil {
 		log.Error("agent(%s#%d)[KnockRequest] failed to receive response from server %s: %v", knkMsg.UserId, knkMd.TransactionId, addrStr, serverPpd.Error)
@@ -191,23 +258,40 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	}
 	// #1154 invariant: wire arg here MUST equal knkMsg.HeaderType above.
 	knkMd := a.newMsgData(addr, headerType, knkBytes, serverPeer.PublicKey())
-	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
+	knkMd.ResponseMsgCh = make(chan *core.PacketParserData, 1) // buffered: see awaitTransactionResponse
 
 	ackMsg = &common.ServerKnockAckMsg{}
 	if !a.IsRunning() {
-		log.Error("agent(%s#%d)[ExitKnockRequest] MsgData channel closed or being closed, skip sending", knkMsg.UserId, knkMd.TransactionId)
+		// Not-running only happens during/after Stop(): expected teardown (this
+		// runs from the knock sub-routine's defer on every restart), not an error.
+		log.Debug("agent(%s#%d)[ExitKnockRequest] MsgData channel closed or being closed, skip sending", knkMsg.UserId, knkMd.TransactionId)
 		err = common.ErrPacketToMessageRoutineStopped
 		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
 		return ackMsg, err
 	}
 
-	// device will create or find existing connection and sends the MsgAssembler via that connection
-	a.sendMsgCh <- knkMd
+	// Guarded send (see sendOrStop). ExitKnockRequest is reachable directly from
+	// the unsynchronized SDK export (NhpAgentExitResource -> sdk.ExitResource)
+	// and is not wg-tracked.
+	if !a.sendOrStop(knkMd) {
+		log.Error("agent(%s#%d)[ExitKnockRequest] message routine stopped, skip sending", knkMsg.UserId, knkMd.TransactionId)
+		err = common.ErrPacketToMessageRoutineStopped
+		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return ackMsg, err
+	}
 
-	// block until transaction completes
-	serverPpd := <-knkMd.ResponseMsgCh
-	close(knkMd.ResponseMsgCh)
+	// Block for the transaction response, bailing out on Stop(); see
+	// awaitTransactionResponse.
+	serverPpd, ok := a.awaitTransactionResponse(knkMd.ResponseMsgCh)
+	if !ok {
+		log.Error("agent(%s#%d)[ExitKnockRequest] message routine stopped, skip waiting for response", knkMsg.UserId, knkMd.TransactionId)
+		err = common.ErrPacketToMessageRoutineStopped
+		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return ackMsg, err
+	}
 
 	if serverPpd.Error != nil {
 		log.Error("agent(%s#%d)[ExitKnockRequest] failed to receive response from server %s: %v", knkMsg.UserId, knkMd.TransactionId, addrStr, serverPpd.Error)
@@ -320,7 +404,7 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 	}
 
 	accMd := a.newMsgData(udpACAddr, core.NHP_ACC, accBytes, acPk)
-	accMd.EncryptedPktCh = make(chan *core.MsgAssemblerData)
+	accMd.EncryptedPktCh = make(chan *core.MsgAssemblerData, 1) // buffered size-1: see awaitOrStop
 
 	if !a.IsRunning() {
 		log.Error("agent(%s)[PreAccessRequest] MsgData channel closed or being closed, skip sending", accMsg.UserId)
@@ -330,9 +414,32 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 	// start message encryption
 	a.device.SendMsgToPacket(accMd)
 
-	// waiting for message encryption
-	accMad := <-accMd.EncryptedPktCh
-	close(accMd.EncryptedPktCh)
+	// Wait for the encrypted packet, bailing on Stop() OR the encrypt deadline.
+	// preAccessRequest is reachable synchronously from the a.wg-tracked Knock and
+	// Stop() runs a.wg.Wait() before device.Stop(), so a bare <-EncryptedPktCh
+	// would strand that Wait if the packet was discarded (SendMsgToPacket is
+	// non-blocking) or the device is mid-teardown. The deadline additionally bounds
+	// the discard-while-running case — this direct encrypt-await, unlike the
+	// transaction paths, has no transaction-layer timeout of its own. See
+	// docs/design/AGENT_LIFECYCLE_TEARDOWN.md invariant #3 for the buffered-size-1 /
+	// close-on-receive / leave-open-on-bail contract and the pool-reclaim tradeoff.
+	stopCh := a.stopSignal() // snapshot under RLock (#3103); reused by the bail classify below
+	encryptTimer := time.NewTimer(core.AgentLocalTransactionResponseTimeoutMs * time.Millisecond)
+	defer encryptTimer.Stop()
+	accMad, ok := awaitOrDeadline(accMd.EncryptedPktCh, stopCh, encryptTimer.C)
+	if !ok {
+		// Classify stop vs deadline for the log + error (best-effort — a
+		// simultaneous stop+deadline reports stop). The knock already succeeded;
+		// the caller only logs this, so pre-access is genuinely best-effort.
+		select {
+		case <-stopCh:
+			log.Debug("agent(%s)[PreAccessRequest] message routine stopped, skip pre-access", accMsg.UserId)
+			return common.ErrPacketToMessageRoutineStopped
+		default:
+			log.Error("agent(%s)[PreAccessRequest] timed out waiting for access-packet encryption (msgToPacketQueue overloaded?), skip pre-access", accMsg.UserId)
+			return common.ErrTransactionFailedByTimeout
+		}
+	}
 
 	if accMad.Error != nil {
 		log.Error("agent(%s)[PreAccessRequest] failed to encrypt access message: %v", accMsg.UserId, accMad.Error)
@@ -413,23 +520,40 @@ func (a *UdpAgent) KnockDHP() (ackMsg *common.ServerDHPKnockAckMsg, err error) {
 		return nil, marshalErr
 	}
 	knkMd := a.newMsgData(addr, core.DHP_KNK, knkBytes, serverPeer.PublicKey())
-	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
+	knkMd.ResponseMsgCh = make(chan *core.PacketParserData, 1) // buffered: see awaitTransactionResponse
 
 	ackMsg = &common.ServerDHPKnockAckMsg{}
 	if !a.IsRunning() {
-		log.Error("agent(%s#%d)[KnockDHP] MsgData channel closed or being closed, skip sending", knkMsg.UserId, knkMd.TransactionId)
+		// Not-running only happens during/after Stop(): expected teardown, not an error.
+		log.Debug("agent(%s#%d)[KnockDHP] MsgData channel closed or being closed, skip sending", knkMsg.UserId, knkMd.TransactionId)
 		err = common.ErrPacketToMessageRoutineStopped
 		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
 		return ackMsg, err
 	}
 
-	// device will create or find existing connection and sends the MsgAssembler via that connection
-	a.sendMsgCh <- knkMd
+	// Guarded send (see sendOrStop). KnockDHP is wg-tracked (via
+	// dhpKnockResourceRoutine), so bailing here keeps a full-buffer block from
+	// deadlocking Stop()'s wg.Wait().
+	if !a.sendOrStop(knkMd) {
+		log.Error("agent(%s#%d)[KnockDHP] message routine stopped, skip sending", knkMsg.UserId, knkMd.TransactionId)
+		err = common.ErrPacketToMessageRoutineStopped
+		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return ackMsg, err
+	}
 
-	// block until transaction completes
-	serverPpd := <-knkMd.ResponseMsgCh
-	close(knkMd.ResponseMsgCh)
+	// Block for the transaction response, bailing out on Stop(). KnockDHP is
+	// wg-tracked (via dhpKnockResourceRoutine), so a hang here would deadlock
+	// Stop()'s wg.Wait(); see awaitTransactionResponse.
+	serverPpd, ok := a.awaitTransactionResponse(knkMd.ResponseMsgCh)
+	if !ok {
+		log.Error("agent(%s#%d)[KnockDHP] message routine stopped, skip waiting for response", knkMsg.UserId, knkMd.TransactionId)
+		err = common.ErrPacketToMessageRoutineStopped
+		ackMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return ackMsg, err
+	}
 
 	if serverPpd.Error != nil {
 		log.Error("agent(%s#%d)[KnockDHP] failed to receive response from server %s: %v", knkMsg.UserId, knkMd.TransactionId, addrStr, serverPpd.Error)

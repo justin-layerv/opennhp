@@ -253,7 +253,17 @@ func (t *LocalTransaction) Run() {
 		close(t.done)
 		device.localTransactionMutex.Unlock()
 
-		// if local transaction is expecting a response, return an error
+		// if local transaction is expecting a response, return an error.
+		// ResponseMsgCh single-writer invariant: this defer and the
+		// ExternalMsgCh completion below are the transaction's only two writers,
+		// and they're mutually exclusive (the completion path returns with
+		// err == nil, so this defer's `err != nil` guard skips). Exactly one
+		// write per transaction is a universal contract for every ResponseMsgCh
+		// consumer: the unbuffered block-receive consumers (endpoints/{server,
+		// ac,db}) would leave a second writer blocked forever, and the
+		// close-on-receive + size-1-buffer consumer (endpoints/agent's
+		// awaitTransactionResponse) would get a send-on-closed panic /
+		// full-buffer deadlock. Don't add a second writer.
 		if err != nil && t.mad.ResponseMsgCh != nil {
 			t.mad.ResponseMsgCh <- &PacketParserData{Error: err}
 		}
@@ -276,7 +286,9 @@ func (t *LocalTransaction) Run() {
 		return
 
 	case ppd := <-t.ExternalMsgCh:
-		// redirect it to mad.ResponseMsgCh and complete the transaction externally
+		// redirect it to mad.ResponseMsgCh and complete the transaction
+		// externally. Second of the transaction's two mutually-exclusive
+		// ResponseMsgCh writers (see the single-writer note in the defer above).
 		if t.mad.ResponseMsgCh != nil {
 			t.mad.ResponseMsgCh <- ppd
 		}

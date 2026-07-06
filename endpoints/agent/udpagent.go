@@ -105,11 +105,29 @@ type UdpAgent struct {
 	wg      sync.WaitGroup
 	running atomic.Bool
 
+	// lifecycleMu serializes Start()/Stop() — which reassign signals.stop /
+	// sendMsgCh / knockTargetStopOnce and flip running — against each other and
+	// against SDK entry points that snapshot those fields or call a.wg.Add.
+	// Start/Stop hold it for writing; SDK ops hold the RLock only long enough to
+	// snapshot the channels or register on a.wg, never across a blocking
+	// send/receive (that would deadlock a concurrent Stop). Closes the
+	// RestartAgent field-reassignment data race and the "WaitGroup is reused
+	// before previous Wait has returned" panic (#3103).
+	lifecycleMu sync.RWMutex
+
 	signals struct {
 		stop                  chan struct{}
 		knockTargetStop       chan struct{}
 		knockTargetMapUpdated chan struct{}
 	}
+	// knockTargetStopOnce guards close(knockTargetStop). Both
+	// StopKnockLoop() (an exported SDK entry point via sdk.KnockloopStop)
+	// and Stop() close this channel; the documented RestartAgent flow
+	// calls the former before the latter, so an unguarded close
+	// double-closes and panics. Re-armed in Start() (see Start) because a
+	// sync.Once is spent after its first Do and RestartAgent reuses the
+	// same *UdpAgent.
+	knockTargetStopOnce sync.Once
 
 	recvMsgCh <-chan *core.PacketParserData
 	sendMsgCh chan *core.MsgData
@@ -208,11 +226,34 @@ func (a *UdpAgent) Start(dirPath string, logLevel int) (err error) {
 	// `if a.knockTargetMap == nil { a.knockTargetMap = targetMap }`
 	// fallback, but it lives behind the same early-return so it
 	// doesn't cover the missing-file path either.
+	// #3103: reassign these maps under their own mutexes (the same ones
+	// AddResource/AddServer/RemoveResource and the config.go reload path take), so
+	// an unsynchronized SDK AddServer/AddResource racing a RestartAgent Start()
+	// can't data-race the map-header write. lifecycleMu (below) covers only the
+	// lifecycle channels; these two fields have their own locks.
+	a.knockTargetMapMutex.Lock()
 	a.knockTargetMap = make(map[string]*KnockTarget)
+	a.knockTargetMapMutex.Unlock()
+	a.serverPeerMutex.Lock()
 	a.serverPeerMap = make(map[string]*core.UdpPeer)
+	a.serverPeerMutex.Unlock()
 
+	// #3103: reassign the lifecycle channels (+ the guarding Once) and flip
+	// running under lifecycleMu, so a concurrent SDK op that RLocks never reads a
+	// half-reassigned field set and its wg.Add can't race this transition.
+	a.lifecycleMu.Lock()
 	a.signals.stop = make(chan struct{})
 	a.signals.knockTargetStop = make(chan struct{})
+	// Re-arm the once alongside the channel it guards. RestartAgent reuses
+	// the same *UdpAgent (Stop() -> Start()), and a sync.Once is spent
+	// after its first Do. Without this reset, every post-restart
+	// stopKnockLoop() (from both StopKnockLoop() and Stop()) would no-op,
+	// leaving the new knockTargetStop never closed — so knockResourceRoutine
+	// (which only selects on knockTargetStop / knockTargetMapUpdated, never
+	// signals.stop) never stops and Stop()'s wg.Wait() deadlocks. Assigning
+	// a fresh zero Once is the idiomatic re-arm (go vet does not flag it —
+	// it isn't a copy of an in-use lock).
+	a.knockTargetStopOnce = sync.Once{}
 	a.signals.knockTargetMapUpdated = make(chan struct{}, 1)
 
 	// load knock resources
@@ -237,6 +278,8 @@ func (a *UdpAgent) Start(dirPath string, logLevel int) (err error) {
 	go a.recvMessageRoutine()
 
 	a.running.Store(true)
+	a.lifecycleMu.Unlock()
+
 	a.safeTee.Store(false)
 
 	time.Sleep(1000 * time.Millisecond)
@@ -256,24 +299,42 @@ func (a *UdpAgent) RestartAgent() error {
 	return nil
 }
 
+// StartKnockLoop launches the preset-resource knock loop and returns the number
+// of knock targets. It must follow a Start() (or RestartAgent()), not a bare
+// StopKnockLoop(): knockTargetStop and its guarding knockTargetStopOnce are
+// re-armed only in Start(), so a StartKnockLoop() after a StopKnockLoop() with no
+// intervening Start() would spawn a knockResourceRoutine that immediately sees
+// the already-closed knockTargetStop and exits. StopKnockLoop/StartKnockLoop are
+// therefore not a standalone reusable pair.
 func (a *UdpAgent) StartKnockLoop() int {
 	a.knockTargetMapMutex.Lock()
 	size := len(a.knockTargetMap)
 	a.knockTargetMapMutex.Unlock()
-	// start knock preset resources
-	a.wg.Add(1)
-	go a.knockResourceRoutine()
+	// start knock preset resources (guarded wg.Add + launch — see
+	// launchTrackedRoutine; #3103)
+	if !a.launchTrackedRoutine(a.knockResourceRoutine) {
+		return -1 // agent not running (e.g. racing a Stop) — loop not started
+	}
 
 	return size
 }
 
 func (a *UdpAgent) StartDHPKnockLoop() {
-	a.wg.Add(1)
-	go a.dhpKnockResourceRoutine()
+	a.launchTrackedRoutine(a.dhpKnockResourceRoutine)
+}
+
+// stopKnockLoop closes knockTargetStop exactly once, so callers may
+// invoke it from StopKnockLoop() and Stop() in any order (e.g. the
+// RestartAgent flow stops the knock loop before tearing the agent down)
+// without risking a double-close panic.
+func (a *UdpAgent) stopKnockLoop() {
+	a.knockTargetStopOnce.Do(func() {
+		close(a.signals.knockTargetStop)
+	})
 }
 
 func (a *UdpAgent) StopKnockLoop() {
-	close(a.signals.knockTargetStop)
+	a.stopKnockLoop()
 }
 
 func (a *UdpAgent) SetKnockUser(usrId string, orgId string, userData map[string]any) {
@@ -294,14 +355,59 @@ func (a *UdpAgent) SetCheckResults(results map[string]any) {
 
 // export Stop
 func (a *UdpAgent) Stop() {
-	a.running.Store(false)
-	close(a.signals.knockTargetStop)
+	// Teardown model + the invariants the inline comments below rest on:
+	// docs/design/AGENT_LIFECYCLE_TEARDOWN.md
+	//
+	// Idempotent, concurrency-safe teardown: only the caller that flips running
+	// true->false proceeds. A second or concurrent Stop() — e.g. two web-console
+	// RestartAgent requests, or an SDK Close racing RestartAgent — returns early
+	// instead of double-closing signals.stop / re-stopping the device (the same
+	// double-close panic class this PR guards for knockTargetStop via
+	// knockTargetStopOnce). Also makes a pre-Start Stop() a safe no-op, since the
+	// signals channels are still nil.
+	//
+	// lifecycleMu (held for the CAS + stopKnockLoop + close, released before the
+	// wg.Wait below) serializes this against Start()'s reassignment and against
+	// SDK ops' guarded a.wg.Add: it closes the Stop()-racing-an-in-progress-Start()
+	// window (Stop() now blocks on Start()'s Lock and stops the fully-started
+	// agent instead of CAS-failing mid-launch) and the "WaitGroup reused before
+	// Wait" panic (a beginTrackedOp Add can't interleave past this CAS). #3103.
+	a.lifecycleMu.Lock()
+	if !a.running.CompareAndSwap(true, false) {
+		a.lifecycleMu.Unlock()
+		return
+	}
+	a.stopKnockLoop()
 	close(a.signals.stop)
-	a.device.Stop()
+	a.lifecycleMu.Unlock()
 	a.StopConfigWatch()
+	// Wait for the agent's own routines to exit BEFORE stopping the device:
+	// device.Stop() closes msgToPacketQueue, which sendMessageRoutine feeds, so
+	// tearing the device down first races that feed into a send-on-closed panic
+	// (nhp/core/device.go). wg.Wait() can't hang when run first — every a.wg
+	// routine returns on signals.stop (closed above) without needing the device:
+	// sendMessageRoutine's device.SendMsgToPacket is a NON-BLOCKING send
+	// (discard-on-full — see the breadcrumb there), and the wg-tracked knock
+	// paths bail on signals.stop at their blocking receives — the transaction
+	// response and preAccessRequest's encrypted-packet receive, both via
+	// awaitOrStop — rather than waiting for device.Stop() to unblock them; those
+	// receive guards are the load-bearing prerequisite. (device.Stop()'s own
+	// termination depends on device-internal routines, but those are device.wg,
+	// drained by device.Stop() after this Wait — not a gate on a.wg.Wait().)
+	// Full rationale: docs/design/AGENT_LIFECYCLE_TEARDOWN.md ("Stop() ordering").
 	a.wg.Wait()
-	close(a.sendMsgCh)
-	close(a.signals.knockTargetMapUpdated)
+	a.device.Stop()
+	// Deliberately do NOT close sendMsgCh or knockTargetMapUpdated. Their
+	// consumers already return on signals.stop, so a close is redundant — but
+	// not harmless: not every sender is wg-tracked (the SDK request methods,
+	// ExitKnockRequest, the DHP DAR/DAV sends, and a resource-config
+	// file-watcher's debounced time.AfterFunc callback all run untracked), so
+	// wg.Wait() above doesn't fence them. A send case on an already-closed
+	// channel is still "ready" in a select and can be chosen (panicking), so the
+	// select-on-signals.stop guard every untracked sender uses only narrows the
+	// window — not closing is what removes it. (Upstream 8e983f1d did this for
+	// knockTargetMapUpdated; extended here to sendMsgCh.)
+	// See docs/design/AGENT_LIFECYCLE_TEARDOWN.md invariant #1.
 
 	log.Info("=========================")
 	log.Info("=== NHP-Agent stopped ===")
@@ -311,6 +417,65 @@ func (a *UdpAgent) Stop() {
 
 func (a *UdpAgent) IsRunning() bool {
 	return a.running.Load()
+}
+
+// beginTrackedOp registers an a.wg-tracked operation against teardown. It returns
+// false (the caller MUST abort) if the agent isn't running; on true the caller
+// MUST defer a.wg.Done(). The running check + a.wg.Add(1) run under
+// lifecycleMu.RLock, so the Add cannot race Stop()'s Lock+CAS+wg.Wait — closing
+// the "WaitGroup is reused before previous Wait has returned" panic reachable from
+// a direct SDK Knock (#3103). Holding a wg token also pins the lifecycle field
+// set: Stop() can't drain wg.Wait and Start() can't reassign signals.stop /
+// sendMsgCh until the op calls Done, so the op's later channel snapshots are
+// stable. RLock is held only across the check+Add, never a blocking send/receive.
+func (a *UdpAgent) beginTrackedOp() bool {
+	a.lifecycleMu.RLock()
+	defer a.lifecycleMu.RUnlock()
+	if !a.running.Load() {
+		return false
+	}
+	a.wg.Add(1)
+	return true
+}
+
+// launchTrackedRoutine starts fn as an a.wg-tracked goroutine iff the agent is
+// running, doing the wg.Add + go under lifecycleMu.RLock so the Add can't race
+// Stop()'s wg.Wait (#3103, same class as beginTrackedOp but for the routine
+// launchers reachable from the SDK — sdk.KnockloopStart -> StartKnockLoop). fn
+// MUST call a.wg.Done() on exit (the knock routines defer it). Returns false if
+// the agent isn't running, in which case no routine is started.
+func (a *UdpAgent) launchTrackedRoutine(fn func()) bool {
+	a.lifecycleMu.RLock()
+	defer a.lifecycleMu.RUnlock()
+	if !a.running.Load() {
+		return false
+	}
+	a.wg.Add(1)
+	go fn()
+	return true
+}
+
+// stopSignal snapshots a.signals.stop under lifecycleMu.RLock so an SDK-reachable
+// reader can't race Start()'s reassignment (#3103). The returned channel is safe
+// to select on without the lock: Stop() only ever closes the current stop channel
+// (never reassigns a live one), and Start() installs a fresh one only after
+// Stop()'s wg.Wait, so a snapshot either fires (teardown) or stays the live one.
+func (a *UdpAgent) stopSignal() <-chan struct{} {
+	a.lifecycleMu.RLock()
+	defer a.lifecycleMu.RUnlock()
+	return a.signals.stop
+}
+
+// deviceKey returns the agent's device public key for log identification, or ""
+// if the device isn't initialized. Nil-safe: some log sites (the address-parse
+// Criticals in SendDAR/DAVMsgToServer) fire before the IsRunning() gate, so on a
+// never-Start()ed agent a.device can be nil — a bare a.device.PublicKeyBase64()
+// there would nil-deref.
+func (a *UdpAgent) deviceKey() string {
+	if a.device == nil {
+		return ""
+	}
+	return a.device.PublicKeyBase64()
 }
 
 func (a *UdpAgent) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
@@ -365,6 +530,9 @@ func (a *UdpAgent) sendMessageRoutine() {
 			return
 
 		case md, ok := <-a.sendMsgCh:
+			// sendMsgCh is intentionally never closed (see Stop()), so this
+			// !ok branch is currently unreachable; retained as defensive code
+			// so the routine still terminates if that invariant ever changes.
 			if !ok {
 				return
 			}
@@ -640,7 +808,17 @@ func (a *UdpAgent) knockResourceRoutine() {
 				defer knockRoutineWg.Done()
 				defer log.Info("knock %s sub-routine stopped", knockStr)
 				defer func() {
-					if _, exitErr := a.ExitKnockRequest(res); exitErr != nil {
+					_, exitErr := a.ExitKnockRequest(res)
+					switch {
+					case exitErr == nil:
+					case errors.Is(exitErr, common.ErrPacketToMessageRoutineStopped):
+						// This defer runs on every sub-routine exit, including a
+						// normal Stop()/RestartAgent where ExitKnockRequest bails on
+						// signals.stop and returns the stopped-error for each active
+						// target. That's expected teardown, not a failure — log at
+						// Debug so routine restarts don't spam Error-level lines.
+						log.Debug("[Agent] exit knock request skipped for %s during teardown: %v", knockStr, exitErr)
+					default:
 						log.Error("[Agent] exit knock request failed for %s: %v", knockStr, exitErr)
 					}
 				}()
@@ -661,8 +839,15 @@ func (a *UdpAgent) knockResourceRoutine() {
 
 					ackMsg, err := a.Knock(res) // timeout in AgentLocalTransactionTimeoutMs
 					if err != nil {
-						// if error happens wait some time (total AgentLocalTransactionResponseTimeoutMs) to retry
-						log.Error("[Agent] knock failed for resource %s: %v", knockStr, err)
+						// if error happens wait some time (total AgentLocalTransactionResponseTimeoutMs) to retry.
+						// A knock bailing on signals.stop during teardown is expected,
+						// not a failure — log it at Debug so a routine Stop()/restart
+						// doesn't emit an Error line per active target.
+						if errors.Is(err, common.ErrPacketToMessageRoutineStopped) {
+							log.Debug("[Agent] knock for resource %s stopped during teardown: %v", knockStr, err)
+						} else {
+							log.Error("[Agent] knock failed for resource %s: %v", knockStr, err)
+						}
 						continue // retry knock
 					}
 
@@ -716,13 +901,24 @@ func (a *UdpAgent) dhpKnockResourceRoutine() {
 		if err != nil {
 			a.safeTee.Store(false)
 
+			// A DHP knock bailing on signals.stop during teardown is expected, not
+			// a failure — log at Debug so routine restarts don't emit Error noise.
+			if errors.Is(err, common.ErrPacketToMessageRoutineStopped) {
+				log.Debug("[Agent] DHP knock stopped during teardown: %v", err)
+			} else {
+				log.Error("[Agent] DHP knock failed: %v", err)
+			}
 			// On failure, back off FailureRetryInterval (2s, DNS-fast) before
 			// re-knocking. Kept short so a transient failure re-establishes access in
 			// a couple of seconds; the server's per-IP rate limiter — not this sleep —
-			// is what bounds a knock flood.
-			log.Error("[Agent] DHP knock failed: %v", err)
-			time.Sleep(core.FailureRetryInterval * time.Second)
-			continue // retry knock
+			// is what bounds a knock flood. Interruptible on signals.stop so this
+			// wg-tracked routine's backoff can't delay Stop()'s wg.Wait() (same as
+			// Knock's error backoff).
+			select {
+			case <-time.After(core.FailureRetryInterval * time.Second):
+			case <-a.signals.stop:
+			}
+			continue // retry knock (exits at the top select once signals.stop is closed)
 		}
 
 		log.Info("knock succeeded, next knock in %d seconds", ackMsg.OpenTime)
@@ -776,9 +972,15 @@ func (a *UdpAgent) AddResource(res *KnockResource) error {
 	a.knockTargetMapMutex.Unlock()
 
 	if updated {
-		// renew knock cycle
-		if len(a.signals.knockTargetMapUpdated) == 0 {
-			a.signals.knockTargetMapUpdated <- struct{}{}
+		// renew knock cycle. Non-blocking send (channel is buffered size
+		// 1): coalesces with an already-queued update and, critically,
+		// can't block forever or panic if a concurrent Stop() raced us —
+		// same pattern as updateResources / RemoveResource.
+		// knockTargetMapUpdated is never closed (see Stop()), so a late
+		// send lands harmlessly in the buffer.
+		select {
+		case a.signals.knockTargetMapUpdated <- struct{}{}:
+		default:
 		}
 	}
 
@@ -798,9 +1000,11 @@ func (a *UdpAgent) RemoveResource(aspId string, resId string) {
 	a.knockTargetMapMutex.Unlock()
 
 	if beforeSize != afterSize {
-		// renew knock cycle
-		if len(a.signals.knockTargetMapUpdated) == 0 {
-			a.signals.knockTargetMapUpdated <- struct{}{}
+		// renew knock cycle. See AddResource: non-blocking send so a
+		// concurrent caller or a racing Stop() can't block or panic.
+		select {
+		case a.signals.knockTargetMapUpdated <- struct{}{}:
+		default:
 		}
 	}
 }
@@ -1025,12 +1229,12 @@ func (a *UdpAgent) GetFirstServerPeer() (serverPeer *core.UdpPeer) {
 func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (bool, *common.DAGMsg) {
 	sendAddr := server.SendAddr()
 	if sendAddr == nil {
-		log.Critical("device(%v)[SendDARMsgToServer] register server IP cannot be parsed", a)
+		log.Critical("device(%s)[SendDARMsgToServer] register server IP cannot be parsed", a.deviceKey())
 		return false, nil
 	}
 	udpAddr, ok := sendAddr.(*net.UDPAddr)
 	if !ok {
-		log.Critical("device(%v)[SendDARMsgToServer] unexpected address type %T", a, sendAddr)
+		log.Critical("device(%s)[SendDARMsgToServer] unexpected address type %T", a.deviceKey(), sendAddr)
 		return false, nil
 	}
 	drgBytes, marshalErr := json.Marshal(msg)
@@ -1045,7 +1249,7 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 		Compress:      true,
 		Message:       drgBytes,
 		PeerPk:        server.PublicKey(),
-		ResponseMsgCh: make(chan *core.PacketParserData),
+		ResponseMsgCh: make(chan *core.PacketParserData, 1), // buffered: see awaitTransactionResponse
 	}
 
 	currTime := time.Now().UnixNano()
@@ -1053,12 +1257,21 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 		log.Error("[Agent] send channel closed or closing, skipping message send")
 		return false, nil
 	}
-	// device will create or find existing connection and sends the MsgAssembler via that connection
-	a.sendMsgCh <- drgMd
+	// Guarded send (see sendOrStop); runs on the untracked DHP web-console
+	// goroutine. On success the device creates or finds a connection and sends
+	// the MsgAssembler via it.
+	if !a.sendOrStop(drgMd) {
+		log.Error("device(%s)[SendDARMsgToServer] message routine stopped, skipping message send", a.deviceKey())
+		return false, nil
+	}
 	server.UpdateSend(currTime)
-	// block until transaction completes
-	serverPpd := <-drgMd.ResponseMsgCh
-	close(drgMd.ResponseMsgCh)
+	// Block for the transaction response, bailing out on Stop() (this runs on the
+	// untracked DHP web-console goroutine); see awaitTransactionResponse.
+	serverPpd, ok := a.awaitTransactionResponse(drgMd.ResponseMsgCh)
+	if !ok {
+		log.Error("device(%s)[SendDARMsgToServer] message routine stopped, skip waiting for response", a.deviceKey())
+		return false, nil
+	}
 
 	// Parse DSA response
 	dsaMsg := &common.DSAMsg{}
@@ -1117,12 +1330,12 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (bool, *common.DAGMsg) {
 	sendAddr := server.SendAddr()
 	if sendAddr == nil {
-		log.Critical("device(%v)[SendDAVMsgToServer] register server IP cannot be parsed", a)
+		log.Critical("device(%s)[SendDAVMsgToServer] register server IP cannot be parsed", a.deviceKey())
 		return false, nil
 	}
 	udpAddr, ok := sendAddr.(*net.UDPAddr)
 	if !ok {
-		log.Critical("device(%v)[SendDAVMsgToServer] unexpected address type %T", a, sendAddr)
+		log.Critical("device(%s)[SendDAVMsgToServer] unexpected address type %T", a.deviceKey(), sendAddr)
 		return false, nil
 	}
 	davBytes, marshalErr := json.Marshal(msg)
@@ -1137,7 +1350,7 @@ func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (
 		Compress:      true,
 		Message:       davBytes,
 		PeerPk:        server.PublicKey(),
-		ResponseMsgCh: make(chan *core.PacketParserData),
+		ResponseMsgCh: make(chan *core.PacketParserData, 1), // buffered: see awaitTransactionResponse
 	}
 
 	currTime := time.Now().UnixNano()
@@ -1145,12 +1358,19 @@ func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (
 		log.Error("[Agent] send channel closed or closing, skipping message send")
 		return false, nil
 	}
-	// device will create or find existing connection and sends the MsgAssembler via that connection
-	a.sendMsgCh <- davMd
+	// Guarded send (see sendOrStop); untracked DHP web-console goroutine.
+	if !a.sendOrStop(davMd) {
+		log.Error("device(%s)[SendDAVMsgToServer] message routine stopped, skipping message send", a.deviceKey())
+		return false, nil
+	}
 	server.UpdateSend(currTime)
-	// block until transaction completes
-	serverPpd := <-davMd.ResponseMsgCh
-	close(davMd.ResponseMsgCh)
+	// Block for the transaction response, bailing out on Stop() (untracked DHP
+	// web-console goroutine); see awaitTransactionResponse.
+	serverPpd, ok := a.awaitTransactionResponse(davMd.ResponseMsgCh)
+	if !ok {
+		log.Error("device(%s)[SendDAVMsgToServer] message routine stopped, skip waiting for response", a.deviceKey())
+		return false, nil
+	}
 
 	dagMsg := &common.DAGMsg{}
 	if serverPpd.Error != nil {

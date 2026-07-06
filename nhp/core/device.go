@@ -338,6 +338,11 @@ func (d *Device) msgToPacketRoutine(id int) {
 						if localTransaction != nil {
 							// Once a local transaction owns mad, complete it through the
 							// transaction path so its defer remains the single cleanup owner.
+							// This preserves the ResponseMsgCh single-writer invariant: a
+							// given channel is written exactly once — here (via the
+							// transaction) OR by the pre-transaction error paths above,
+							// never both. Every ResponseMsgCh consumer relies on that (see
+							// the transaction.go note); don't add a second direct writer.
 							if txErr := localTransaction.SendExternalMsg(&PacketParserData{Error: err}); txErr != nil {
 								log.Debug("msgToPacketRoutine %d: [%s] recovered error after local transaction closed: %v", id, msgType, txErr)
 							}
@@ -637,6 +642,14 @@ func (d *Device) PacketToMsg(pd *PacketData) (ppd *PacketParserData, err error) 
 	return ppd, nil
 }
 
+// SendMsgToPacket enqueues md for the msgToPacketRoutine to encrypt and send.
+//
+// This send MUST stay non-blocking (discard-on-full). endpoints/agent's Stop()
+// reorders a.wg.Wait() ahead of device.Stop() specifically because this can't
+// stall a caller: sendMessageRoutine returns on the agent's stop signal without
+// the device torn down. Making this a blocking send would silently reintroduce
+// a teardown deadlock/panic window there — see
+// docs/design/AGENT_LIFECYCLE_TEARDOWN.md ("Stop() ordering").
 func (d *Device) SendMsgToPacket(md *MsgData) {
 	select {
 	case d.msgToPacketQueue <- md:

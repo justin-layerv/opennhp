@@ -290,6 +290,7 @@ This file stays light. Subtree-scoped rules live in nested `CLAUDE.md` files (au
 | Relay active-cell routing decision (server blue/green switch point, #2658) | `docs/design/RELAY_ACTIVE_CELL_ROUTING.md` |
 | qURL agent-key DDB schema contract | `docs/design/QURL_AGENT_KEYS_SCHEMA.md` |
 | qURL v2 keyed identity + admission contract (signed claims, NHP Server Contract) | `docs/design/QURL_V2_KEYED_IDENTITY.md` |
+| Agent lifecycle / `Stop()`/`RestartAgent()` teardown invariants (#3084) | `docs/design/AGENT_LIFECYCLE_TEARDOWN.md` |
 | Commit convention + scopes table | `docs/COMMIT_CONVENTION.md` |
 | Runbooks index | `docs/runbooks/README.md` |
 | Security monitoring + secrets / `NHP_INTERNAL_AUTH_SECRET` / KMS exception | `docs/SECURITY.md` |

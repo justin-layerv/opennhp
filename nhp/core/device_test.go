@@ -65,6 +65,182 @@ func TestMsgToPacketRoutineMissingConnDataReturnsError(t *testing.T) {
 	}
 }
 
+// TestResponseMsgChWrittenExactlyOnce fences the single-writer invariant that
+// endpoints/agent's awaitTransactionResponse depends on: because that consumer
+// closes ResponseMsgCh on receive and leaves it open (size-1 buffer) on a
+// stop-bail, a SECOND write to the same channel would reintroduce a
+// send-on-closed panic or a full-buffer deadlock in the agent. The four writer
+// sites (transaction.go's completion + error defers, device.go's two
+// pre-transaction error paths) are structurally mutually exclusive; this test
+// covers the cleanly-drivable device.go pre-transaction error path (missing
+// ConnData) and asserts exactly one write, then none. The transaction-owned
+// paths route through SendExternalMsg and stay covered by the structure + the
+// back-reference comments at those sites.
+func TestResponseMsgChWrittenExactlyOnce(t *testing.T) {
+	silenceGlobalLogger(t)
+
+	serverKey := make([]byte, PrivateKeySize)
+	serverKey[0] = 1
+	peerKey := make([]byte, PrivateKeySize)
+	peerKey[0] = 2
+
+	device := NewDevice(NHP_SERVER, serverKey, nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	peer := NewDevice(NHP_SERVER, peerKey, nil)
+	if peer == nil {
+		t.Fatal("NewDevice(peer) returned nil")
+	}
+
+	device.Start()
+	t.Cleanup(device.Stop)
+
+	// Buffered size 1, matching how endpoints/agent allocates ResponseMsgCh.
+	responseCh := make(chan *PacketParserData, 1)
+	device.SendMsgToPacket(&MsgData{
+		HeaderType:    NHP_FWD,
+		CipherScheme:  common.CIPHER_SCHEME_CURVE,
+		TransactionId: 1,
+		PeerPk:        peer.staticEcdh.PublicKey(),
+		Message:       []byte(`{"probe":true}`),
+		ResponseMsgCh: responseCh,
+	})
+
+	select {
+	case got := <-responseCh:
+		if got == nil || got.Error == nil {
+			t.Fatalf("got response %#v, want an error write", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the single error write")
+	}
+
+	// Exactly one write: nothing more must ever land on responseCh. A second
+	// writer would break the agent's close-on-receive assumption.
+	select {
+	case got := <-responseCh:
+		t.Fatalf("second write on ResponseMsgCh (%#v) — single-writer invariant broken; see the back-reference comments in transaction.go/device.go", got)
+	case <-time.After(200 * time.Millisecond):
+		// good: exactly one write
+	}
+}
+
+// TestEncryptedPktChWrittenExactlyOnce is the EncryptedPktCh sibling of
+// TestResponseMsgChWrittenExactlyOnce. endpoints/agent's awaitOrDeadline closes
+// EncryptedPktCh on receive (fail-loud tripwire), which is only safe because the
+// two msgToPacketRoutine writers (device.go: the success return and the error
+// defer) are mutually exclusive — exactly one write per MsgAssemblerData. This
+// fences that invariant executably so a future second-writer regression on the
+// encrypt path trips here instead of as a send-on-closed panic / device.Stop()
+// deadlock in the agent.
+func TestEncryptedPktChWrittenExactlyOnce(t *testing.T) {
+	silenceGlobalLogger(t)
+
+	serverKey := make([]byte, PrivateKeySize)
+	serverKey[0] = 1
+	peerKey := make([]byte, PrivateKeySize)
+	peerKey[0] = 2
+
+	device := NewDevice(NHP_SERVER, serverKey, nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	peer := NewDevice(NHP_SERVER, peerKey, nil)
+	if peer == nil {
+		t.Fatal("NewDevice(peer) returned nil")
+	}
+
+	device.Start()
+	t.Cleanup(device.Stop)
+
+	// Buffered size 1, matching how endpoints/agent allocates EncryptedPktCh
+	// (knock.go preAccessRequest). Routing a MsgData through the encrypt pipeline
+	// with EncryptedPktCh set writes the assembled packet (or an error) there.
+	encCh := make(chan *MsgAssemblerData, 1)
+	device.SendMsgToPacket(&MsgData{
+		HeaderType:     NHP_FWD,
+		CipherScheme:   common.CIPHER_SCHEME_CURVE,
+		TransactionId:  1,
+		PeerPk:         peer.staticEcdh.PublicKey(),
+		Message:        []byte(`{"probe":true}`),
+		EncryptedPktCh: encCh,
+	})
+
+	select {
+	case got := <-encCh:
+		if got == nil {
+			t.Fatal("got nil MsgAssemblerData, want a single write")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the single encrypt write")
+	}
+
+	// Exactly one write: nothing more must ever land on encCh. A second writer
+	// would break awaitOrDeadline's close-on-receive assumption.
+	select {
+	case got := <-encCh:
+		t.Fatalf("second write on EncryptedPktCh (%#v) — single-writer invariant broken; see the two writer sites in device.go's msgToPacketRoutine", got)
+	case <-time.After(200 * time.Millisecond):
+		// good: exactly one write
+	}
+}
+
+// TestLocalTransactionResponseMsgChWrittenExactlyOnce fences the transaction-OWNED
+// ResponseMsgCh writer leg (#3104) — the subtle half that
+// TestResponseMsgChWrittenExactlyOnce (the device.go pre-transaction leg) leaves
+// to structure + comments. transaction.go's Run() has two mutually-exclusive
+// ResponseMsgCh writers: the ExternalMsgCh completion (returns err == nil) and the
+// cleanup defer's error write (err != nil). Driving a real completion asserts
+// exactly one write and that the error defer skips, so a future change that let
+// the completion path also fall through the error defer (or added a third writer)
+// trips here instead of as a send-on-closed panic / full-buffer deadlock in
+// endpoints/agent's awaitOrDeadline.
+func TestLocalTransactionResponseMsgChWrittenExactlyOnce(t *testing.T) {
+	silenceGlobalLogger(t)
+
+	key := make([]byte, PrivateKeySize)
+	key[0] = 1
+	device := NewDevice(NHP_AGENT, key, nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	device.Start()
+	t.Cleanup(device.Stop)
+
+	// Buffered size 1, matching endpoints/agent's ResponseMsgCh allocation; Run()
+	// reads only connData.StopSignal and mad.device, so a minimal pair suffices.
+	responseCh := make(chan *PacketParserData, 1)
+	mad := &MsgAssemblerData{device: device, ResponseMsgCh: responseCh}
+	connData := &ConnectionData{StopSignal: make(chan struct{})}
+	txn := newLocalTransaction(1, connData, mad, 5000)
+	device.AddLocalTransaction(txn) // does device.wg.Add(1) + go txn.Run()
+
+	// Complete via the transaction-owned ExternalMsgCh leg. err stays nil, so the
+	// cleanup defer's `err != nil` write must skip.
+	completed := &PacketParserData{}
+	if err := txn.SendExternalMsg(completed); err != nil {
+		t.Fatalf("SendExternalMsg: %v", err)
+	}
+
+	select {
+	case got := <-responseCh:
+		if got != completed {
+			t.Fatalf("got %#v, want the completion ppd (not an error write)", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the single completion write")
+	}
+
+	// Exactly one write: the error defer must NOT also write.
+	select {
+	case got := <-responseCh:
+		t.Fatalf("second write on ResponseMsgCh (%#v) — transaction-owned single-writer invariant broken; see transaction.go's completion vs error-defer writers", got)
+	case <-time.After(200 * time.Millisecond):
+		// good: exactly one write
+	}
+}
+
 func TestMsgToPacketRoutineRecoversForwardOutboundPanic(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
