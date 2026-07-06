@@ -41,6 +41,8 @@ module "nhp" {
   ac_resource_ids              = var.ac_resource_ids
   ac_min_capacity              = var.ac_min_capacity
   ac_filter_mode               = var.ac_filter_mode
+  enable_l3_flush_on_expiry    = var.enable_l3_flush_on_expiry
+  l3_flush_dry_run             = var.l3_flush_dry_run
   l3_flush_conntrack_backend   = var.l3_flush_conntrack_backend
   l3_flush_conntrack_pool_size = var.l3_flush_conntrack_pool_size
   enable_egress_eips           = var.enable_egress_eips

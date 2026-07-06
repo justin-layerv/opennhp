@@ -36,10 +36,16 @@ ac_auth_service_id = "agent"
 # DO NOT add `frps-*` aliases here — those were a pre-spec naming where
 # the resId conflated implementation (FRPS) and placement (env/region)
 # with resource identity. Hard-cutover rename in PR shipping this file.
-ac_resource_ids    = ["qurl", "qurl-tunnel-server"]
-ac_min_capacity    = 3
-ac_max_capacity    = 10
-ac_filter_mode     = 0
+ac_resource_ids = ["qurl", "qurl-tunnel-server"]
+ac_min_capacity = 3
+ac_max_capacity = 10
+ac_filter_mode  = 0
+# L3 flush-on-expiry rollout levers (docs/runbooks/l3-flush-*.md). Off by
+# default via the module; the prod flip is the higher-stakes one, so drive it
+# from here — uncomment, enable with dry-run first, soak, then set
+# l3_flush_dry_run = false to acknowledge real-flush.
+# enable_l3_flush_on_expiry = false
+# l3_flush_dry_run          = true
 enable_egress_eips = true
 
 # Terraform state bucket for GitHub Actions permissions

@@ -159,6 +159,18 @@ variable "ac_filter_mode" {
   }
 }
 
+variable "enable_l3_flush_on_expiry" {
+  description = "Sandbox AC L3 flush-on-expiry scheduler: actively tear down kernel allow-state (ipset/BPF map + conntrack) at session end. Off by default (pre-flush baseline). Full semantics in modules/ac/variables.tf, rollout in docs/runbooks/l3-flush-*.md."
+  type        = bool
+  default     = false
+}
+
+variable "l3_flush_dry_run" {
+  description = "Gate the sandbox L3 flush scheduler into log-only mode (default true); no effect unless enable_l3_flush_on_expiry=true. Full semantics + the first-load dry-run safety in modules/ac/variables.tf."
+  type        = bool
+  default     = true
+}
+
 variable "l3_flush_conntrack_backend" {
   description = "AC conntrack teardown backend for sandbox L3 flush: exec or netlink."
   type        = string

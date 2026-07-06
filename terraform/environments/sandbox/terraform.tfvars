@@ -23,6 +23,12 @@ acme_email         = "admin@layerv.xyz"
 ac_auth_service_id = "agent"
 ac_min_capacity    = 3
 ac_filter_mode     = 1
+# L3 flush-on-expiry rollout levers (docs/runbooks/l3-flush-*.md). Held at the
+# safe defaults so this stays pure plumbing — the scheduler is off, and dry-run
+# is the log-only guard for when it is first turned on. Drive the sandbox
+# rollout from here: flip enable=true (dry-run first), soak, then dry_run=false.
+enable_l3_flush_on_expiry = false
+l3_flush_dry_run          = true
 # Keep the netlink backend selectable through IaC for issue #2940 without
 # changing today's eBPF/XDP sandbox datapath or enabling L3 flush.
 l3_flush_conntrack_backend   = "netlink"

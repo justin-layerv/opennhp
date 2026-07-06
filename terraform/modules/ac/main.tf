@@ -1138,6 +1138,24 @@ resource "terraform_data" "ac_user_data_l3_conntrack_render_check" {
   }
 }
 
+# Fences the L3 flush-on-expiry master switch + dry-run guard into config.toml,
+# the same way the conntrack knobs above are fenced. These render on adjacent
+# template lines (user_data.sh.tpl) and are now operator-drivable from env
+# tfvars, so assert they reach the AC and a rollout flip can't silently no-op.
+resource "terraform_data" "ac_user_data_l3_flush_render_check" {
+  input = sha256(local.user_data)
+
+  lifecycle {
+    precondition {
+      condition = alltrue([
+        strcontains(local.user_data, "\nEnableL3FlushOnExpiry = ${var.enable_l3_flush_on_expiry}\n"),
+        strcontains(local.user_data, "\nL3FlushDryRun = ${var.l3_flush_dry_run}\n"),
+      ])
+      error_message = "AC user_data must render EnableL3FlushOnExpiry and L3FlushDryRun into config.toml so the L3 flush-on-expiry rollout can be driven through managed Terraform config."
+    }
+  }
+}
+
 # The AC datapath admits exactly this port through the XDP whitelist in
 # FilterMode_EBPFXDP (endpoints/ac/udpac.go::ebpfInfraExemptRules). It MUST be
 # the same port the target groups health-check, and both come from
