@@ -11,7 +11,7 @@
 #
 # Key Difference from Server:
 # - AC uses a single NLB TCP listener on port 443 (TLS passthrough to Traefik)
-# - Health check on port 8080 through Traefik to nhp-acd admission readiness
+# - Health check on the dedicated Traefik nhp-health entrypoint (:8080) to nhp-acd admission readiness
 # - No termination cleanup needed (CloudMap deregistration via systemd ExecStop)
 #
 # Naming Convention:

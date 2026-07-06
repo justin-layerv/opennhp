@@ -75,6 +75,38 @@ def test_traefik_entrypoints_do_not_expect_proxy_protocol() -> None:
     assert "public AC NLB preserves client IP at L3" in user_data
 
 
+def test_ac_readiness_uses_dedicated_health_entrypoint() -> None:
+    user_data = read("terraform/modules/ac/user_data.sh.tpl")
+    main_tf = read("terraform/modules/ac/main.tf")
+
+    for snippet in [
+        "insecure = false",
+        "dashboard = false",
+        'entryPoint = "nhp-health"',
+        "[entryPoints.nhp-health]",
+        'address = ":${ac_health_check_port}"',
+        'entryPoints = ["nhp-health"]',
+    ]:
+        assert snippet in user_data, f"user_data must render dedicated health entrypoint snippet {snippet!r}"
+
+    for stale in [
+        "insecure = true",
+        "dashboard = true",
+        'entryPoint = "traefik"',
+        "[entryPoints.traefik]",
+        'entryPoints = ["traefik"]',
+        "dashboard :8080",
+    ]:
+        assert stale not in user_data, f"user_data must not reuse Traefik's internal entrypoint: {stale!r}"
+
+    for snippet in [
+        "[entryPoints.nhp-health]",
+        'address = \\":${local.ac_health_check_port}\\"',
+        'entryPoints = [\\"nhp-health\\"]',
+    ]:
+        assert snippet in main_tf, f"render check must pin dedicated health entrypoint snippet {snippet!r}"
+
+
 def test_qurl_site_authz_docs_describe_l3_client_ip_preservation() -> None:
     variables_tf = collapsed(read("terraform/variables.tf"))
 
@@ -87,4 +119,5 @@ if __name__ == "__main__":
     test_blue_and_green_target_groups()
     test_blue_green_drift_check_pins_transport_contract()
     test_traefik_entrypoints_do_not_expect_proxy_protocol()
+    test_ac_readiness_uses_dedicated_health_entrypoint()
     test_qurl_site_authz_docs_describe_l3_client_ip_preservation()

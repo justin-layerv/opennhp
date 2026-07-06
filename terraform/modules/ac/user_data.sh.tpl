@@ -726,7 +726,7 @@ if ! iptables-restore <<'IPTABLES_RULES'
 -A NHP_DENY -j DROP
 -A INPUT -i lo -j ACCEPT
 -A INPUT -p tcp -s ${vpc_cidr} --dport 22 -j ACCEPT
--A INPUT -p tcp -s ${vpc_cidr} --dport 8080 -j ACCEPT
+-A INPUT -p tcp -s ${vpc_cidr} --dport ${ac_health_check_port} -j ACCEPT
 -A INPUT -p tcp -s ${vpc_cidr} --dport 8888 -j ACCEPT
 -A INPUT -m state --state ESTABLISHED -j ACCEPT
 -A INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst
@@ -758,7 +758,7 @@ echo "IPv4 iptables rules persisted to /etc/iptables/rules.v4"
 # IPv6 firewall rules (mirrors IPv4 NHP ipset rules using *_v6 sets)
 # Applied atomically via ip6tables-restore for the same safety guarantees.
 #
-# Note: IPv4 VPC CIDR rules (SSH/8080/8888) are intentionally omitted here.
+# Note: IPv4 VPC CIDR rules (SSH/health-check/8888) are intentionally omitted here.
 # AWS VPC CIDRs are IPv4-only; internal traffic uses IPv4 addressing.
 # ============================================================================
 if [ -n "$IP6TABLES" ] && [ $IPSET6_OK -eq 1 ]; then
@@ -1190,11 +1190,17 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
   filePath = "/var/log/traefik/access.log"
 
 [api]
-  dashboard = true
-  insecure = true
+  # API and dashboard stay off. With the insecure API enabled, Traefik would
+  # create its reserved `traefik` entrypoint and serve API/dashboard requests
+  # there ahead of file-provider routers — which made the NLB readiness route
+  # return Traefik's own 404 even with the nhp-ac-ready router loaded. dashboard
+  # is explicitly false so a future secure api@internal router can't accidentally
+  # re-expose it.
+  dashboard = false
+  insecure = false
 
 [ping]
-  entryPoint = "traefik"
+  entryPoint = "nhp-health"
 
 [entryPoints]
   [entryPoints.https]
@@ -1210,8 +1216,8 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
     [entryPoints.http.http.redirections.entryPoint]
       to = "https"
       scheme = "https"
-  [entryPoints.traefik]
-    address = ":8080"
+  [entryPoints.nhp-health]
+    address = ":${ac_health_check_port}"
 %{ if frp_control_upstream_host != "" ~}
   # TRANSITIONAL — places the AC in the FRPS data plane as a userspace
   # TCP forwarder. Target shape is AC-as-firewall-manager only, with
@@ -1308,7 +1314,7 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 #
 # Router priority hierarchy (higher number = matched first):
 #  101 - nhp-ac-ready-deny :443 rewrites ${ac_admission_ready_path} variants to a 404 path
-#  100 - nhp-ac-ready      :8080 ${ac_admission_ready_path} to nhp-acd readiness
+#  100 - nhp-ac-ready      :${ac_health_check_port} ${ac_admission_ready_path} to nhp-acd readiness
 #   20 - frp-control        /.well-known/layerv-frp or /~!frp → FRP WebSocket (when deploy_frps)
 #   15 - qurl-site          *.qurl.site subdomain routing
 #   10 - nhp-plugins        /plugins/* to NHP Server
@@ -1321,7 +1327,7 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
   [http.routers.nhp-ac-ready]
     rule = "Path(\`${ac_admission_ready_path}\`)"
     service = "nhp-ac"
-    entryPoints = ["traefik"]
+    entryPoints = ["nhp-health"]
     priority = 100
 
   # Keep the readiness bit internal to the NLB health-check entrypoint. Without
@@ -2083,7 +2089,7 @@ systemctl start nhp-health-monitor
 # SCOPE: this is a BIND-TIME fence only, NOT a runtime liveness check.
 # A Traefik that binds successfully here and then segfaults / wedges
 # later (kernel listener up, accept loop wedged, RSTs back to clients)
-# is invisible to this loop — `/ping:8080` would still return 200 from
+# is invisible to this loop — `/ping:${ac_health_check_port}` would still return 200 from
 # whatever Traefik state holds the HTTP server thread, and the
 # frps-control TG HC stays green. Runtime liveness for the frps-control
 # listener is the job of #2007's post-deploy smoke (TCP+FRP handshake
@@ -2111,11 +2117,11 @@ for FRPS_CONTROL_PORT in ${join(" ", frp_control_listener_ports)}; do
     echo "FATAL: Traefik did not bind tcp/$FRPS_CONTROL_PORT within ~60s — the frps-control entrypoint failed to bind. Check journalctl -u traefik for parse errors in /home/ubuntu/traefik/frps-control.toml. See #2007 for the broader observability story." >&2
     # Pull this instance out of service. `exit 1` alone marks user_data
     # as failed in cloud-init but does NOT auto-terminate the instance:
-    # Traefik's systemd unit is already started, its `/ping:8080`
+    # Traefik's systemd unit is already started, its `/ping:${ac_health_check_port}`
     # endpoint still returns 200, and the ASG would keep this instance
     # in service indefinitely with a half-broken Traefik (every other
     # entrypoint up, frps-control silently dropping SYNs). Stopping the
-    # Traefik unit fails every port-8080 TG health/readiness probe
+    # Traefik unit fails every port-${ac_health_check_port} TG health/readiness probe
     # (including ac_tcp and `aws_lb_target_group.ac_frps_control`), so
     # the NLB sheds load on every entrypoint, the ASG's
     # `ELB`-source HC marks the instance unhealthy, and a replacement
@@ -2156,7 +2162,7 @@ echo "Public IP: $PUBLIC_IP"
 echo "Local IP: $LOCAL_IP"
 echo ""
 echo "Services (fully infrastructure-driven from ECR):"
-echo "  - Traefik (HTTPS proxy): :443, :80, dashboard :8080"
+echo "  - Traefik (HTTPS proxy): :443, :80, health :${ac_health_check_port}"
 echo "  - nhp-acd: localhost:8888 (HTTP), localhost:62206 (NHP)"
 echo ""
 echo "Traefik plugins directory: /home/ubuntu/traefik/plugins-local"

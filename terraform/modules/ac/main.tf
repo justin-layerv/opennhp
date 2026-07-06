@@ -65,10 +65,12 @@ locals {
   # indentation-stable rendering checks, matching the sibling render fences in
   # this module. The rollout ledger's qURL smoke covers the full routed path.
   ac_admission_ready_route_render_anchors = [
+    "[entryPoints.nhp-health]",
+    "address = \":${local.ac_health_check_port}\"",
     "[http.routers.nhp-ac-ready]",
     "rule = \"Path(\\`${local.ac_admission_ready_path}\\`)\"",
     "service = \"nhp-ac\"",
-    "entryPoints = [\"traefik\"]",
+    "entryPoints = [\"nhp-health\"]",
     "priority = 100",
     "[http.routers.nhp-ac-ready-deny]",
     "rule = \"Path(\\`${local.ac_admission_ready_path}\\`) || PathPrefix(\\`${local.ac_admission_ready_path}/\\`)\"",
@@ -531,9 +533,10 @@ resource "aws_vpc_security_group_ingress_rule" "ac_ssh" {
 }
 
 # Traefik health/readiness endpoint - VPC only (for NLB health checks).
-# Port 8080 serves Traefik ping plus the nhp-acd admission-readiness route, so
-# VPC peers can observe this AC's server-connectivity state. The public :443
-# router hides the same path behind a constant 404.
+# The dedicated nhp-health entrypoint serves Traefik ping plus the nhp-acd
+# admission-readiness route, so VPC peers can observe this AC's
+# server-connectivity state. The public :443 router hides the same path behind
+# a constant 404.
 resource "aws_vpc_security_group_ingress_rule" "ac_traefik_health" {
   security_group_id = aws_security_group.ac.id
   description       = "Traefik health/readiness check from VPC (NLB)"
@@ -1160,16 +1163,17 @@ resource "terraform_data" "ac_user_data_admission_ready_route_render_check" {
         for anchor in local.ac_admission_ready_route_render_anchors :
         strcontains(local.user_data, anchor)
       ])
-      error_message = "AC user_data must render a Traefik :8080 router for local.ac_admission_ready_path to nhp-acd on 127.0.0.1:8888 plus an https-entrypoint rewrite that keeps the readiness bit internal; the ac_tcp health checks depend on nhp-acd readiness, not Traefik process liveness."
+      error_message = "AC user_data must render a dedicated Traefik nhp-health entrypoint/router for local.ac_admission_ready_path to nhp-acd on 127.0.0.1:8888 plus an https-entrypoint rewrite that keeps the readiness bit internal; the ac_tcp health checks depend on nhp-acd readiness, not Traefik process liveness."
     }
   }
 }
 
 # Plan-time render lint for the FRPS-behind-AC Traefik bits. The TG
-# healthcheck for `ac_frps_control` probes Traefik's `/ping` on :8080,
-# which confirms the Traefik PROCESS is alive but says nothing about
-# whether the `entryPoints.frps-control` listener on the customer-
-# facing port actually bound or whether `frps-control.toml` parsed
+# healthcheck for `ac_frps_control` probes Traefik's `/ping` on the
+# dedicated health-check port, which confirms the Traefik PROCESS is
+# alive but says nothing about whether the `entryPoints.frps-control`
+# listener on the customer-facing port actually bound or whether
+# `frps-control.toml` parsed
 # and installed the TCP router. A templatefile-render regression
 # (template-condition typo, accidental deletion of one of the two
 # `%{ if frp_control_upstream_host != "" ~}` blocks in
@@ -1789,10 +1793,11 @@ resource "aws_lb_target_group" "ac_frps_control" {
   # the qurl.site transport contract fenced by `ac_tcp_target_group_drift`.
   preserve_client_ip = true
 
-  # Healthcheck caveat: Traefik `/ping` on 8080 confirms the Traefik
-  # process is alive but does NOT verify the `entryPoints.frps-control`
-  # listener on `:${var.frp_control_port}` actually bound or that
-  # `frps-control.toml` parsed and installed the TCP router. A drift
+  # Healthcheck caveat: Traefik `/ping` on the dedicated health-check
+  # port confirms the Traefik process is alive but does NOT verify the
+  # `entryPoints.frps-control` listener on `:${var.frp_control_port}`
+  # actually bound or that `frps-control.toml` parsed and installed the
+  # TCP router. A drift
   # mode scoped to the new entrypoint (typo in template render,
   # quote-escape regression, partial templatefile output) keeps `/ping`
   # returning 200 while customer SYNs to `:7000` hang at the Traefik
