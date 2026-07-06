@@ -1392,6 +1392,15 @@ jobs:
         working-directory: terraform/environments/sandbox
         run: terraform fmt -check -recursive ../../
 
+      - name: Check AC boot heredoc command-substitution guard
+        # AC boot-file heredocs are rendered by bash during user-data boot.
+        # Unquoted delimiters still evaluate markdown-style backticks / $()
+        # in generated comments, which can hang cloud-init before services start.
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        run: |
+          bash tests/scripts/check-ac-user-data-heredoc-backticks_test.sh
+          bash scripts/check-ac-user-data-heredoc-backticks.sh
+
       - name: Terraform Init (no backend)
         if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/${{ matrix.environment }}

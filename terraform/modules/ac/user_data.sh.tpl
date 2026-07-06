@@ -1177,7 +1177,7 @@ echo "Certificate loaded: $CERT_SUBJECT, expires: $CERT_EXPIRY"
 
 # Traefik configuration for this environment
 # Note: traefik-plugins repo deploys plugins to /home/ubuntu/traefik/plugins-local via SSM
-cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
+cat > /home/ubuntu/traefik/traefik.toml << 'TRAEFIKEOF'
 [global]
   checkNewVersion = false
   sendAnonymousUsage = false
@@ -1482,13 +1482,13 @@ cat >> /home/ubuntu/traefik/dynamic.toml << QURLDYNAMICEOF
   instanceDiscoveryTtl = ${qurl_router_instance_discovery_ttl_seconds}
   enableQurlSiteAuthz = ${qurl_router_enable_qurl_site_authz}
   # Per-AZ qurl-reverse-tunnel-server boundary allowlist. Plural field
-  # `frpServerUrls` (plugin Config: FRPServerURLs []string) — the legacy
-  # singular `frpServerUrl` was dropped from the plugin's Config struct,
-  # so emitting `frpServerUrl = ""` is silently ignored and leaves the
+  # \`frpServerUrls\` (plugin Config: FRPServerURLs []string) — the legacy
+  # singular \`frpServerUrl\` was dropped from the plugin's Config struct,
+  # so emitting \`frpServerUrl = ""\` is silently ignored and leaves the
   # plural list empty. With an empty plural list the plugin's ServeHTTP
-  # hits the `q.frpFallback == nil` gate on every tunnel resource and
+  # hits the \`q.frpFallback == nil\` gate on every tunnel resource and
   # silentDrop's (when enableQurlSiteAuthz=true) or 502s — per-resource
-  # `upstream_addr` from the QURL API is consulted ONLY after that gate
+  # \`upstream_addr\` from the QURL API is consulted ONLY after that gate
   # passes. So this MUST be non-empty for tunnel resources to route at
   # all; the entries are the operator-declared allowlist that
   # per-resource upstream_addr values are checked against.
@@ -1583,7 +1583,7 @@ echo "Custom domain routing enabled (catch-all router + TLS certs via custom-dom
 # clients can connect and register tunnels, but vhost HTTP (customer
 # subdomain routing through the plugin to frps:8080) would be missing.
 # Without both, don't advertise the control endpoint.
-cat >> /home/ubuntu/traefik/dynamic.toml << FRPDYNAMICEOF
+cat >> /home/ubuntu/traefik/dynamic.toml << 'FRPDYNAMICEOF'
 
 # FRP WebSocket control channel
 #
@@ -1615,7 +1615,7 @@ cat >> /home/ubuntu/traefik/dynamic.toml << FRPDYNAMICEOF
   path = "/~!frp"
 
 [http.routers.frp-control]
-  rule = "Path(\`/.well-known/layerv-frp\`) || Path(\`/~!frp\`)"
+  rule = "Path(`/.well-known/layerv-frp`) || Path(`/~!frp`)"
   service = "frp-control"
   middlewares = ["frp-path-rewrite"]
   entryPoints = ["https"]
