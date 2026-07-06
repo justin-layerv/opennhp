@@ -2,12 +2,12 @@
 # resolve-active-image-tag_test.sh — fixture tests for
 # .github/scripts/resolve-active-image-tag.sh
 # ----------------------------------------------------------------------------
-# The canonical active-color → slot resolver is load-bearing for four callers
+# The canonical active-color -> logical slot resolver is load-bearing for four callers
 # (build-and-push.yml, promote-to-prod.yml, blue-green-deploy.yml,
 # trigger-prod-deploy.sh) and previously had no unit coverage. This fences its
-# contract: green → green-image-tag, blue → image-tag, and fail-closed on a
-# read error, an unexpected/corrupt active-color, an unsupported environment,
-# or an invalid component.
+# contract: active green -> green-image-tag, active blue -> image-tag, standby
+# to the opposite slot, and fail-closed on a read error, an unexpected/corrupt
+# active-color, an unsupported environment, or invalid inputs.
 #
 # Each case puts a fake `aws` on PATH returning canned SSM values from a fixture
 # file (one "<param> <value>" per line; a missing param errors + exit 255,
@@ -46,74 +46,97 @@ EOF
   chmod +x "$dir/aws"
 }
 
-# _run <env> <comp> <fixture-body> -> sets GOT (stdout) and RC (exit code)
+# _run <env> <comp> <slot-or-default> <fixture-body> -> sets GOT and RC.
+# Pass "-" for slot-or-default to exercise the resolver's default active mode.
 GOT=""; RC=0
 _run() {
-  local env="$1" comp="$2" body="$3" dir
+  local env="$1" comp="$2" slot="$3" body="$4" dir
   dir=$(mktemp -d)
   printf '%s\n' "$body" > "$dir/fixture.txt"
   _make_aws_shim "$dir" "$dir/fixture.txt"
-  GOT=$(PATH="$dir:$PATH" AWS_PROFILE=test bash "$SCRIPT" "$env" "$comp" 2>/dev/null); RC=$?
+  if [[ "$slot" == "-" ]]; then
+    GOT=$(PATH="$dir:$PATH" AWS_PROFILE=test bash "$SCRIPT" "$env" "$comp" 2>/dev/null); RC=$?
+  else
+    GOT=$(PATH="$dir:$PATH" AWS_PROFILE=test bash "$SCRIPT" "$env" "$comp" "$slot" 2>/dev/null); RC=$?
+  fi
   rm -rf "$dir"
 }
 
-# _assert_tag <name> <env> <comp> <expected-stdout> <body>
+# _assert_tag <name> <env> <comp> <slot-or-default> <expected-stdout> <body>
 _assert_tag() {
-  local name="$1" env="$2" comp="$3" want="$4" body="$5"
-  _run "$env" "$comp" "$body"
+  local name="$1" env="$2" comp="$3" slot="$4" want="$5" body="$6"
+  _run "$env" "$comp" "$slot" "$body"
   if [[ "$RC" -eq 0 && "$GOT" == "$want" ]]; then report_pass "$name"
   else report_fail "$name" "rc=$RC out='$GOT' (want rc=0 out='$want')"; fi
 }
 
-# _assert_fail <name> <env> <comp> <body>
+# _assert_fail <name> <env> <comp> <slot-or-default> <body>
 _assert_fail() {
-  local name="$1" env="$2" comp="$3" body="$4"
-  _run "$env" "$comp" "$body"
+  local name="$1" env="$2" comp="$3" slot="$4" body="$5"
+  _run "$env" "$comp" "$slot" "$body"
   if [[ "$RC" -ne 0 ]]; then report_pass "$name"
   else report_fail "$name" "rc=0 out='$GOT' (want non-zero)"; fi
 }
 
 echo "Running resolve-active-image-tag tests..."
 
-# Core: the live tag follows active-color, NOT a fixed slot.
-_assert_tag "active=green -> green-image-tag" sandbox server "GREENTAG" \
+# Core: the live tag follows active-color, NOT a fixed slot. The omitted slot
+# argument preserves backward compatibility with existing active-tag callers.
+_assert_tag "active=green default -> green-image-tag" sandbox server - "GREENTAG" \
 "/sandbox/nhp/server/active-color green
 /sandbox/nhp/server/image-tag BLUETAG
 /sandbox/nhp/server/green-image-tag GREENTAG"
 
-_assert_tag "active=blue -> image-tag" sandbox server "BLUETAG" \
+_assert_tag "active=blue explicit -> image-tag" sandbox server active "BLUETAG" \
 "/sandbox/nhp/server/active-color blue
 /sandbox/nhp/server/image-tag BLUETAG
 /sandbox/nhp/server/green-image-tag GREENTAG"
 
-_assert_tag "ac component honours active=green" sandbox ac "ACGREEN" \
+_assert_tag "standby with active=green -> image-tag" sandbox server standby "BLUETAG" \
+"/sandbox/nhp/server/active-color green
+/sandbox/nhp/server/image-tag BLUETAG
+/sandbox/nhp/server/green-image-tag GREENTAG"
+
+_assert_tag "standby with active=blue -> green-image-tag" sandbox server standby "GREENTAG" \
+"/sandbox/nhp/server/active-color blue
+/sandbox/nhp/server/image-tag BLUETAG
+/sandbox/nhp/server/green-image-tag GREENTAG"
+
+_assert_tag "ac component honours active=green" sandbox ac active "ACGREEN" \
 "/sandbox/nhp/ac/active-color green
 /sandbox/nhp/ac/image-tag ACBLUE
 /sandbox/nhp/ac/green-image-tag ACGREEN"
 
 # Fail-closed: unexpected/corrupt active-color is rejected, never guessed.
-_assert_fail "unexpected active-color rejected" sandbox server \
+_assert_fail "unexpected active-color rejected" sandbox server active \
 "/sandbox/nhp/server/active-color magenta
 /sandbox/nhp/server/image-tag BLUETAG
 /sandbox/nhp/server/green-image-tag GREENTAG"
 
 # Fail-closed: active-color read failure (e.g. missing / transient) -> exit 1.
-_assert_fail "active-color read failure -> non-zero" sandbox server \
+_assert_fail "active-color read failure -> non-zero" sandbox server active \
 "/sandbox/nhp/server/image-tag BLUETAG"
 
 # Fail-closed: slot read failure (active=green but green slot missing) -> exit 1.
-_assert_fail "missing resolved slot -> non-zero" sandbox server \
+_assert_fail "missing active resolved slot -> non-zero" sandbox server active \
 "/sandbox/nhp/server/active-color green
 /sandbox/nhp/server/image-tag BLUETAG"
 
+_assert_fail "missing standby resolved slot -> non-zero" sandbox server standby \
+"/sandbox/nhp/server/active-color green
+/sandbox/nhp/server/green-image-tag GREENTAG"
+
 # Input validation: only sandbox is supported (prod is canary, read directly).
-_assert_fail "non-sandbox environment rejected" prod server \
+_assert_fail "non-sandbox environment rejected" prod server active \
 "/prod/nhp/server/active-color blue
 /prod/nhp/server/image-tag PRODTAG"
 
 # Input validation: invalid component.
-_assert_fail "invalid component rejected" sandbox database \
+_assert_fail "invalid component rejected" sandbox database active \
 "/sandbox/nhp/database/active-color blue"
+
+_assert_fail "invalid slot rejected" sandbox server passive \
+"/sandbox/nhp/server/active-color blue"
 
 # Input validation: missing args (exits before any SSM read).
 if "$SCRIPT" sandbox >/dev/null 2>&1; then

@@ -405,6 +405,12 @@ jobs:
           shellcheck .github/scripts/blue-green-switch.sh tests/scripts/blue-green-switch_test.sh
           bash tests/scripts/blue-green-switch_test.sh
 
+      - name: Test blue/green active-tag assertions
+        run: |
+          shellcheck .github/scripts/assert-blue-green-image-tag.sh tests/scripts/assert-blue-green-image-tag_test.sh tests/scripts/check-blue-green-active-tag-assertions_test.sh
+          bash tests/scripts/assert-blue-green-image-tag_test.sh
+          bash tests/scripts/check-blue-green-active-tag-assertions_test.sh
+
       # Shared by the Server and AC Packer post-processors. This keeps
       # Packer's region:ami-* artifact_id parsing from drifting across both
       # callers.

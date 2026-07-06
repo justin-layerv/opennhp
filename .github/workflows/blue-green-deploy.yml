@@ -966,6 +966,26 @@ jobs:
           component: ${{ inputs.component }}
           strategy: blue-green-switch
 
+      # Pre-switch target-slot proof catches stale app bytes before traffic
+      # moves. The post-switch active-slot proof below still runs to verify
+      # active-color -> slot convergence before the child workflow reports
+      # success to the parent deploy tracker.
+      - name: "[Server] Assert Standby Image Tag Matches Target"
+        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          EXPECTED_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
+        run: |
+          ./.github/scripts/assert-blue-green-image-tag.sh "$ENVIRONMENT" server standby "$EXPECTED_TAG"
+
+      - name: "[AC] Assert Standby Image Tag Matches Target"
+        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          EXPECTED_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
+        run: |
+          ./.github/scripts/assert-blue-green-image-tag.sh "$ENVIRONMENT" ac standby "$EXPECTED_TAG"
+
       - name: "[Server] Switch NLB Listeners"
         if: needs.prepare.outputs.deploy_server == 'true'
         env:
@@ -997,6 +1017,27 @@ jobs:
           fi
           chmod +x .github/scripts/blue-green-switch.sh
           .github/scripts/blue-green-switch.sh "$ENVIRONMENT" "$STANDBY_COLOR" ac
+
+      # Active-tag proof is deploy correctness, not optional post-switch smoke.
+      # Keep it in switch-traffic so a dispatched blue/green run cannot report
+      # success when the listener/active-color moved but the active slot still
+      # resolves to stale app bytes. build-and-push.yml depends on this child
+      # workflow returning failure before it can advance to deployment tracking.
+      - name: "[Server] Assert Active Image Tag Matches Target"
+        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          EXPECTED_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
+        run: |
+          ./.github/scripts/assert-blue-green-image-tag.sh "$ENVIRONMENT" server active "$EXPECTED_TAG"
+
+      - name: "[AC] Assert Active Image Tag Matches Target"
+        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          EXPECTED_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
+        run: |
+          ./.github/scripts/assert-blue-green-image-tag.sh "$ENVIRONMENT" ac active "$EXPECTED_TAG"
 
       # After the server NLB switch, ACs are still connected to the OLD
       # servers via existing UDP sessions. NLB doesn't break existing UDP
@@ -1255,67 +1296,6 @@ jobs:
             echo "::error::AC state inconsistency! SSM=$SSM_COLOR, listener=$LISTENER_COLOR"
             exit 1
           fi
-
-      # Cross-component drift tripwire — defense in depth against any
-      # *new* mechanism that lands server and AC on different active
-      # tags after a component=both deploy. Comparison is against
-      # inputs.image_tag because prepare's "Validate Inputs" step
-      # sets both server_target_image_tag and ac_target_image_tag to
-      # that value for action=deploy; a future variant where the two
-      # diverge would need this rewritten against the target outputs.
-      #
-      # Intentionally fires only when BOTH components are deployed in
-      # this dispatch. Back-to-back component=server then component=ac
-      # deploys land on the divergent-active state this tripwire is
-      # built to catch, but checking on every single-component deploy
-      # would false-positive any deliberately-staggered sequence
-      # (where the operator wants the two components on different
-      # tags transiently). The dispatcher in build-and-push.yml is
-      # also `component=both` today, so the gap only opens for manual
-      # workflow_dispatch sequences.
-      #
-      # Does NOT catch mid-switch cancellation (separate mechanism,
-      # tracked for the per-component image_tag follow-up).
-      - name: "[Both] Assert Server and AC Active Tags Match Input"
-        # Env-gate lives inside the script (not the if:) so a future
-        # prod blue/green deploy doesn't silently skip the assertion.
-        if: |
-          needs.prepare.outputs.deploy_server == 'true' &&
-          needs.prepare.outputs.deploy_ac == 'true' &&
-          inputs.action == 'deploy' &&
-          inputs.dry_run != true
-        env:
-          ENVIRONMENT: ${{ inputs.environment }}
-          EXPECTED_TAG: ${{ inputs.image_tag }}
-        run: |
-          set -euo pipefail
-          if [[ "$ENVIRONMENT" != "sandbox" ]]; then
-            echo "::notice::Cross-component active-tag assertion skipped (env=$ENVIRONMENT; resolver only models sandbox blue/green slot indirection). Add prod support to resolve-active-image-tag.sh before relying on this tripwire outside sandbox."
-            exit 0
-          fi
-          if [[ -z "$EXPECTED_TAG" ]]; then
-            echo "::error::No image_tag input on a deploy action — should have failed at Validate Inputs"
-            exit 1
-          fi
-          SERVER_ACTIVE=$(./.github/scripts/resolve-active-image-tag.sh sandbox server)
-          AC_ACTIVE=$(./.github/scripts/resolve-active-image-tag.sh sandbox ac)
-          echo "expected:        $EXPECTED_TAG"
-          echo "server active:   $SERVER_ACTIVE"
-          echo "ac     active:   $AC_ACTIVE"
-          FAILED=false
-          if [[ "$SERVER_ACTIVE" != "$EXPECTED_TAG" ]]; then
-            echo "::error::Server active tag ($SERVER_ACTIVE) != deployed tag ($EXPECTED_TAG)"
-            FAILED=true
-          fi
-          if [[ "$AC_ACTIVE" != "$EXPECTED_TAG" ]]; then
-            echo "::error::AC active tag ($AC_ACTIVE) != deployed tag ($EXPECTED_TAG)"
-            FAILED=true
-          fi
-          if [[ "$FAILED" == "true" ]]; then
-            echo "::error::Component drift detected post-switch. Investigate which slot diverged before re-running — for non-builder-race mechanisms (e.g., switch-traffic mid-cancel) a same-tag re-deploy may not heal. Inspect /sandbox/nhp/{server,ac}/active-color and the matching {,green-}image-tag slot, then if the drift is a stuck slot value: gh workflow run blue-green-deploy.yml -f environment=sandbox -f component=both -f action=deploy -f image_tag=${EXPECTED_TAG}"
-            exit 1
-          fi
-          echo "Cross-component active-tag assertion passed."
 
       # After the traffic switch, the AC restart step forces ACs to
       # reconnect to the new servers. Verify every newly-active server

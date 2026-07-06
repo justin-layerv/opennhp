@@ -660,6 +660,47 @@ func TestHandleAccessControl_EBPFXDPDoesNotMirrorWhenEbpfInsertFails(t *testing.
 	}
 }
 
+func TestHandleAccessControl_EBPFXDPMirrorFailureFailsAdmission(t *testing.T) {
+	ipset := &recordingIPSet{err: errors.New("synthetic ipset mirror failure")}
+	ebpfCalls := 0
+	a := &UdpAC{
+		config: &Config{
+			DefaultIp:  "10.100.1.11",
+			FilterMode: FilterMode_EBPFXDP,
+		},
+		ipset: ipset,
+		ebpfRuleAdd: func(int, ebpf.EbpfRuleParams, int) error {
+			ebpfCalls++
+			return nil
+		},
+	}
+	entry := &AccessEntry{
+		SrcAddrs: []*common.NetAddress{{Ip: "198.51.100.7"}},
+		DstAddrs: []*common.NetAddress{{
+			Port:     443,
+			Protocol: "tcp",
+		}},
+	}
+
+	artMsg, err := a.HandleAccessControl(entry, 300, nil)
+	if !errors.Is(err, common.ErrACIPSetOperationFailed) {
+		t.Fatalf("error = %v, want ErrACIPSetOperationFailed", err)
+	}
+	if artMsg == nil || artMsg.ErrCode != common.ErrACIPSetOperationFailed.ErrorCode() {
+		t.Fatalf("artMsg = %+v, want ErrACIPSetOperationFailed", artMsg)
+	}
+	if ebpfCalls != 1 {
+		t.Fatalf("eBPF calls = %d, want 1 before mirror failure", ebpfCalls)
+	}
+	if len(ipset.adds) != 1 {
+		t.Fatalf("ipset mirror attempts = %d, want 1: %+v", len(ipset.adds), ipset.adds)
+	}
+	add := ipset.adds[0]
+	if len(add.args) != 1 || add.args[0] != "198.51.100.7,443,10.100.1.11" {
+		t.Fatalf("ipset mirror args = %+v, want direct TCP qURL tuple", add.args)
+	}
+}
+
 func TestHandleAccessControl_EBPFXDPRequiresIpsetMirror(t *testing.T) {
 	ebpfCalled := false
 	a := &UdpAC{
