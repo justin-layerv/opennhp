@@ -1,9 +1,11 @@
 #!/bin/bash
-# Ensure sandbox has the specified commit deployed via blue/green deployment.
+# Ensure sandbox has the specified commit deployed through build-and-push.yml.
 #
 # This script checks whether the target commit is already deployed to sandbox.
-# If not, it ensures the image exists in ECR (triggering a build if needed),
-# then deploys to sandbox using the blue-green-deploy workflow.
+# If not, it dispatches build-and-push.yml in sandbox deploy mode. That workflow
+# owns image build decisions, blue/green rollout, relay/qurl deploy checks, live
+# app-image drift detection, and deployed-commit stamping. Do not bypass it with
+# a direct blue-green-deploy.yml dispatch here.
 #
 # Usage: ensure-sandbox-deployed.sh
 #
@@ -11,23 +13,21 @@
 #   HEAD_SHA:                Full git commit SHA to deploy
 #   SANDBOX_ALREADY:         "true" if sandbox already has this commit deployed
 #   GH_TOKEN:                GitHub token for workflow dispatch
-#   AWS_REGION:              AWS region (default: us-east-2)
 #
 # Outputs (via GITHUB_OUTPUT):
 #   image_tag:               The image tag that is/will be deployed
-#   method:                  How deployment was handled (already-deployed|blue-green|build-then-blue-green)
+#   method:                  How deployment was handled (already-deployed|build-and-push-deploy)
 
 set -euo pipefail
 
-AWS_REGION="${AWS_REGION:-us-east-2}"
-ECR_REPO_SERVER="layerv/nhp-server"
-SSM_DEPLOYED_COMMIT="/sandbox/nhp/deploy/deployed-commit"
-SSM_DEPLOYED_AT="/sandbox/nhp/deploy/deployed-at"
-POLL_INTERVAL=30
-POLL_TIMEOUT=2700  # 45 minutes
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
+POLL_TIMEOUT="${POLL_TIMEOUT:-9000}"  # 150 minutes; build-and-push may run tests, infra, and blue/green.
+FIND_RETRIES="${FIND_RETRIES:-24}"
+FIND_DELAY_SECONDS="${FIND_DELAY_SECONDS:-5}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "============================================"
-echo "Ensure Sandbox Deployed (Blue/Green)"
+echo "Ensure Sandbox Deployed (build-and-push)"
 echo "============================================"
 echo "HEAD SHA:          $HEAD_SHA"
 echo "Sandbox Already:   ${SANDBOX_ALREADY:-false}"
@@ -35,6 +35,8 @@ echo ""
 
 # If sandbox already has this commit, skip
 if [[ "${SANDBOX_ALREADY:-false}" == "true" ]]; then
+  # This trusts the deployed-commit stamping invariant: build-and-push.yml
+  # writes the value only after live active image tags prove the target app tree.
   echo "Sandbox already has commit $HEAD_SHA deployed. Skipping."
   echo "image_tag=$HEAD_SHA" >> "$GITHUB_OUTPUT"
   echo "method=already-deployed" >> "$GITHUB_OUTPUT"
@@ -72,135 +74,24 @@ poll_workflow_run() {
   return 1
 }
 
-# Find a workflow run created after $dispatch_time, for dispatches that
-# don't carry a correlation_id yet (currently: build-and-push.yml — it
-# doesn't have a workflow_dispatch correlation input, so we fall back
-# to timestamp + status matching).
-#
-# The status filter accepts every non-terminal state GitHub reports
-# before jobs actually begin (queued, waiting, pending, in_progress)
-# plus completed, so a run held by a concurrency group or environment
-# approval gate isn't invisible here. See find-dispatched-run.sh for
-# the correlation_id approach, which is strictly better and is used
-# for blue-green-deploy and canary-deploy dispatches.
-find_triggered_run() {
-  local workflow="$1"
-  local dispatch_time="$2"
-  local retries=6
-  local run_id=""
-
-  for i in $(seq 1 "$retries"); do
-    sleep 10
-    run_id=$(gh run list \
-      --workflow "$workflow" \
-      --json databaseId,createdAt,status \
-      --jq "[.[] | select(.createdAt >= \"$dispatch_time\") | select(.status == \"in_progress\" or .status == \"queued\" or .status == \"waiting\" or .status == \"pending\" or .status == \"completed\")] | .[0].databaseId // empty" \
-      2>/dev/null || echo "")
-
-    if [[ -n "$run_id" ]]; then
-      echo "$run_id"
-      return 0
-    fi
-    echo "  Waiting for workflow run to appear (attempt $i/$retries)..." >&2
-  done
-
-  echo ""
-  return 1
-}
-
-# Step 1: Ensure image exists in ECR
-echo "Checking ECR for image tag: $HEAD_SHA"
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-IMAGE_EXISTS="false"
-if aws ecr describe-images \
-  --repository-name "$ECR_REPO_SERVER" \
-  --image-ids imageTag="$HEAD_SHA" \
-  --region "$AWS_REGION" > /dev/null 2>&1; then
-  IMAGE_EXISTS="true"
-  echo "Image found in ECR: $ECR_REGISTRY/$ECR_REPO_SERVER:$HEAD_SHA"
-fi
-
-BUILD_METHOD="blue-green"
-
-if [[ "$IMAGE_EXISTS" != "true" ]]; then
-  # Image not in ECR - build it first via build-and-push (build only, no deploy)
-  echo ""
-  echo "Image not found in ECR. Triggering build-and-push to build image..."
-  BUILD_METHOD="build-then-blue-green"
-
-  # Check for an already-running build-and-push workflow
-  ACTIVE_RUN_ID=$(gh run list \
-    --workflow build-and-push.yml \
-    --branch main \
-    --status in_progress \
-    --json databaseId \
-    --jq '.[0].databaseId // empty' 2>/dev/null || echo "")
-
-  if [[ -n "$ACTIVE_RUN_ID" ]]; then
-    echo "Found active build-and-push run: $ACTIVE_RUN_ID. Waiting for it to complete."
-    RUN_ID="$ACTIVE_RUN_ID"
-  else
-    BUILD_DISPATCH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    gh workflow run build-and-push.yml \
-      --ref main \
-      -f environment=sandbox \
-      -f deploy=false
-
-    RUN_ID=$(find_triggered_run "build-and-push.yml" "$BUILD_DISPATCH_TIME")
-    if [[ -z "$RUN_ID" ]]; then
-      echo "ERROR: Could not find build-and-push run"
-      exit 1
-    fi
-    echo "Triggered build-and-push run: $RUN_ID"
-  fi
-
-  poll_workflow_run "$RUN_ID" "Image build (build-and-push)"
-  echo ""
-  echo "Image built successfully. Proceeding to blue/green deployment."
-fi
-
-# Step 2: Deploy to sandbox via blue/green
 echo ""
-echo "--- Deploying to Sandbox (blue/green) ---"
-# Use a correlation_id + run-name match so the dispatched run is
-# unambiguously identifiable even if another dispatch lands in the
-# same window or the run is held by the blue-green-${env} concurrency
-# group. Format matches dispatch-and-poll-*.sh.
-BG_CORRELATION_ID="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-$(date +%s)-$$"
-echo "  correlation_id: $BG_CORRELATION_ID"
-gh workflow run blue-green-deploy.yml \
+echo "--- Deploying to Sandbox via build-and-push.yml ---"
+echo "build-and-push owns the app-image drift gate and deployed-commit update."
+CORRELATION_ID="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-$(date +%s)-$$"
+echo "correlation_id: $CORRELATION_ID"
+gh workflow run build-and-push.yml \
   --ref main \
   -f environment=sandbox \
-  -f component=both \
-  -f action=deploy \
-  -f image_tag="$HEAD_SHA" \
-  -f cell_id=cell0 \
-  -f correlation_id="$BG_CORRELATION_ID"
+  -f deploy=true \
+  -f correlation_id="$CORRELATION_ID"
 
-# 24 retries × 5s = 120s window. gh run list has a ~30s
-# eventual-consistency delay before newly-dispatched runs appear;
-# anything under ~45s races the API. Matches dispatch-and-poll-*.sh.
-if ! BG_RUN_ID=$(./.github/scripts/find-dispatched-run.sh \
-    blue-green-deploy.yml "$BG_CORRELATION_ID" 24 5); then
-  echo "ERROR: Could not find blue-green-deploy run for correlation_id=$BG_CORRELATION_ID"
+if ! RUN_ID=$("$SCRIPT_DIR/find-dispatched-run.sh" \
+    build-and-push.yml "$CORRELATION_ID" "$FIND_RETRIES" "$FIND_DELAY_SECONDS"); then
+  echo "ERROR: Could not find build-and-push run for correlation_id=$CORRELATION_ID"
   exit 1
 fi
-echo "Triggered blue-green-deploy run: $BG_RUN_ID"
-poll_workflow_run "$BG_RUN_ID" "Sandbox blue/green deploy"
-
-# Update deployment tracking
-echo ""
-echo "Updating sandbox deployment tracking..."
-aws ssm put-parameter \
-  --name "$SSM_DEPLOYED_COMMIT" \
-  --value "$HEAD_SHA" --type String --overwrite \
-  --region "$AWS_REGION" || echo "::warning::Failed to update SSM $SSM_DEPLOYED_COMMIT"
-aws ssm put-parameter \
-  --name "$SSM_DEPLOYED_AT" \
-  --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
-  --region "$AWS_REGION" || echo "::warning::Failed to update SSM $SSM_DEPLOYED_AT"
+echo "Triggered build-and-push run: $RUN_ID"
+poll_workflow_run "$RUN_ID" "Sandbox deploy (build-and-push)"
 
 echo "image_tag=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-echo "method=$BUILD_METHOD" >> "$GITHUB_OUTPUT"
+echo "method=build-and-push-deploy" >> "$GITHUB_OUTPUT"

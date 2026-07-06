@@ -222,6 +222,20 @@ jobs:
           python3 -m pip --version
           python3 -m pip install --no-cache-dir pyyaml
 
+      # resolve-app-image-required_test.sh verifies that the relay image's
+      # hand-maintained path list covers the actual Go import surface. Pin and
+      # warm the endpoints module here so that regression fence does not depend
+      # on ubuntu-latest's incidental preinstalled Go version or a cold cache.
+      - name: Set up Go for relay dependency lockstep
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: endpoints/go.mod
+          cache-dependency-path: endpoints/go.sum
+
+      - name: Warm endpoints Go module cache
+        working-directory: endpoints
+        run: go mod download
+
       # Run the scope-drift fixture tests BEFORE the real check. If the
       # extractors regress in a way that parses both real files to a
       # matching empty set, the real check would pass false-positive
@@ -287,7 +301,12 @@ jobs:
       # idempotency guard / SSM-sourced image tag regress. actionlint can't
       # catch a silent removal; this asserts it against the real workflow.
       - name: Test sandbox qurl ECS roll (issue #1634)
-        run: bash tests/scripts/check-sandbox-qurl-roll_test.sh
+        run: |
+          shellcheck .github/scripts/resolve-app-image-required.sh .github/scripts/resolve-live-app-image-required.sh .github/scripts/verify-live-app-images-ready.sh tests/scripts/resolve-app-image-required_test.sh tests/scripts/resolve-live-app-image-required_test.sh tests/scripts/verify-live-app-images-ready_test.sh
+          bash tests/scripts/resolve-app-image-required_test.sh
+          bash tests/scripts/resolve-live-app-image-required_test.sh
+          bash tests/scripts/verify-live-app-images-ready_test.sh
+          bash tests/scripts/check-sandbox-qurl-roll_test.sh
 
       # PR-time fence for the #2680 post-deploy relay smoke helper. The live
       # network probe runs only after sandbox deploy, but parser/token/SRI guard
@@ -325,6 +344,7 @@ jobs:
             .github/scripts/deploy-relay.sh \
             .github/scripts/dispatch-and-poll-blue-green.sh \
             .github/scripts/dispatch-and-poll-canary.sh \
+            .github/scripts/ensure-sandbox-deployed.sh \
             .github/scripts/emit-deployment-window-metric.sh \
             .github/scripts/verify-asg-instances-healthy.sh \
             .github/scripts/recover-relay-deposed-sg.sh \
@@ -332,6 +352,7 @@ jobs:
             tests/scripts/prune-missing-asg-target-groups_test.sh \
             tests/scripts/wait-for-instance-refresh_test.sh \
             tests/scripts/deploy-relay_test.sh \
+            tests/scripts/ensure-sandbox-deployed_test.sh \
             tests/scripts/emit-deployment-window-metric_test.sh \
             tests/scripts/verify-asg-instances-healthy_test.sh \
             tests/scripts/recover-relay-deposed-sg_test.sh \
@@ -339,6 +360,7 @@ jobs:
           bash tests/scripts/prune-missing-asg-target-groups_test.sh
           bash tests/scripts/wait-for-instance-refresh_test.sh
           bash tests/scripts/deploy-relay_test.sh
+          bash tests/scripts/ensure-sandbox-deployed_test.sh
           bash tests/scripts/emit-deployment-window-metric_test.sh
           bash tests/scripts/verify-asg-instances-healthy_test.sh
           bash tests/scripts/recover-relay-deposed-sg_test.sh

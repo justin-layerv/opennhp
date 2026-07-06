@@ -365,12 +365,12 @@ lint-cis-metric-filter-patterns:
 #   - validate-workflows.yml       → actionlint + shellcheck + scope-drift
 #   - validate-issue-templates.yml → shim to ops-routines-workflows reusable
 # `make lint-workflows` runs the equivalent of both locally.
-# Requires actionlint, shellcheck, check-jsonschema, and python3+PyYAML
+# Requires actionlint, shellcheck, check-jsonschema, Go, Node.js, and python3+PyYAML
 # on PATH:
-#   macOS:  brew install actionlint shellcheck && pipx install 'check-jsonschema==0.37.1'
+#   macOS:  brew install actionlint shellcheck go node && pipx install 'check-jsonschema==0.37.1'
 #           && python3 -m pip install pyyaml
 #   Linux:  see https://github.com/rhysd/actionlint#install,
-#           your distro's shellcheck + python3-yaml packages, and
+#           your distro's shellcheck + Go + Node.js + python3-yaml packages, and
 #           `pipx install 'check-jsonschema==0.37.1'` (or `pip install --user`)
 # NB: check-jsonschema version is pinned in lockstep with the reusable
 # (layervai/ops-routines-workflows validate-issue-templates.yml); the
@@ -396,6 +396,10 @@ lint-workflows:
 	}
 	@command -v check-jsonschema >/dev/null 2>&1 || { \
 		echo "$(COLOUR_RED)[OpenNHP] check-jsonschema not found. Install: pipx install 'check-jsonschema==0.37.1' (version pinned to match the ops-routines reusable)$(END_COLOUR)"; \
+		exit 1; \
+	}
+	@command -v go >/dev/null 2>&1 || { \
+		echo "$(COLOUR_RED)[OpenNHP] go not found. Install the Go toolchain pinned by endpoints/go.mod to run relay dependency lockstep tests$(END_COLOUR)"; \
 		exit 1; \
 	}
 	@actionlint -color -shellcheck "$$(command -v shellcheck)" .github/workflows/*.yml
@@ -447,9 +451,10 @@ lint-workflows:
 	@bash tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh
 	@bash scripts/check-nhp-server-internal-url-validation-drift.sh
 	@bash tests/scripts/check-image-tag-writer-allowlist_test.sh
-	@shellcheck .github/scripts/wait-for-instance-refresh.sh .github/scripts/deploy-relay.sh .github/scripts/dispatch-and-poll-blue-green.sh .github/scripts/dispatch-and-poll-canary.sh .github/scripts/emit-deployment-window-metric.sh tests/scripts/wait-for-instance-refresh_test.sh tests/scripts/deploy-relay_test.sh tests/scripts/emit-deployment-window-metric_test.sh
+	@shellcheck .github/scripts/wait-for-instance-refresh.sh .github/scripts/deploy-relay.sh .github/scripts/dispatch-and-poll-blue-green.sh .github/scripts/dispatch-and-poll-canary.sh .github/scripts/ensure-sandbox-deployed.sh .github/scripts/emit-deployment-window-metric.sh tests/scripts/wait-for-instance-refresh_test.sh tests/scripts/deploy-relay_test.sh tests/scripts/ensure-sandbox-deployed_test.sh tests/scripts/emit-deployment-window-metric_test.sh
 	@bash tests/scripts/wait-for-instance-refresh_test.sh
 	@bash tests/scripts/deploy-relay_test.sh
+	@bash tests/scripts/ensure-sandbox-deployed_test.sh
 	@bash tests/scripts/emit-deployment-window-metric_test.sh
 	@shellcheck .github/scripts/resolve-active-image-tag.sh tests/scripts/resolve-active-image-tag_test.sh
 	@bash tests/scripts/resolve-active-image-tag_test.sh
@@ -471,6 +476,10 @@ lint-workflows:
 		exit 1; \
 	}
 	@python3 tests/scripts/test_promote_to_prod_gating.py
+	@shellcheck .github/scripts/resolve-app-image-required.sh .github/scripts/resolve-live-app-image-required.sh .github/scripts/verify-live-app-images-ready.sh tests/scripts/resolve-app-image-required_test.sh tests/scripts/resolve-live-app-image-required_test.sh tests/scripts/verify-live-app-images-ready_test.sh
+	@bash tests/scripts/resolve-app-image-required_test.sh
+	@bash tests/scripts/resolve-live-app-image-required_test.sh
+	@bash tests/scripts/verify-live-app-images-ready_test.sh
 	@bash tests/scripts/check-sandbox-qurl-roll_test.sh
 	@command -v node >/dev/null 2>&1 || { \
 		echo "$(COLOUR_RED)[OpenNHP] node not found. Install Node.js 18+ to run the qURL relay bootstrap smoke self-test$(END_COLOUR)"; \

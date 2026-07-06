@@ -3,9 +3,8 @@
 #
 # Mirrors dispatch-and-poll-canary.sh, but for the blue-green-deploy.yml
 # workflow. Centralises the dispatch + find-triggered-run + poll logic so
-# build-and-push.yml (sandbox) and ensure-sandbox-deployed.sh (manual /
-# scheduled-release) share a single implementation, instead of two near-
-# identical inline copies that drift over time.
+# build-and-push.yml's sandbox deploy path uses this helper instead of inline
+# copies that drift over time.
 #
 # Usage: dispatch-and-poll-blue-green.sh <environment> <component> <image-tag>
 #

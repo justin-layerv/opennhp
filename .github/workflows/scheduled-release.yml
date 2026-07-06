@@ -3,7 +3,7 @@ name: Scheduled Release Pipeline
 # Deploys accumulated main branch changes on a schedule.
 #
 # Pipeline flow:
-#   check-pending-changes → ensure-sandbox-deployed (blue/green) → soak → promote-to-prod (canary) → tag-and-track → notify
+#   check-pending-changes → ensure-sandbox-deployed (build-and-push sandbox deploy) → soak → promote-to-prod (canary) → tag-and-track → notify
 #
 # Sandbox uses blue/green deployment (instant traffic switch via NLB listener).
 # Production uses canary deployment (Step Functions gradual rollout with auto-rollback).
@@ -235,7 +235,7 @@ jobs:
     needs: [check-pending-changes]
     if: needs.check-pending-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     outputs:
       image_tag: ${{ steps.deploy.outputs.image_tag }}
       method: ${{ steps.deploy.outputs.method }}

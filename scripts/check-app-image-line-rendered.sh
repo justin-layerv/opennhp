@@ -34,26 +34,27 @@
 # dropped, the APP_REBUILT input wiring pruned, or the render block detached from
 # its gate. This lint pins each:
 #
-#   C1.  `changes` ∈ notify.needs            (APP_REBUILT's source job)
-#   C2.  APP_REBUILT forwarded from needs.changes.outputs.app (else: always "unknown")
-#   C3.  `setup` ∈ notify.needs              (IMAGE_TAG's source job)
-#   C4.  IMAGE_TAG forwarded from needs.setup.outputs.image_tag (else the rebuilt
+#   C1.  `app-image-build-required` ∈ notify.needs (APP_REBUILT's source job)
+#   C2.  APP_REBUILT consumes
+#        needs.app-image-build-required.outputs.app_image_build_required
+#   C4.  `setup` ∈ notify.needs              (IMAGE_TAG's source job)
+#   C5.  IMAGE_TAG forwarded from needs.setup.outputs.image_tag (else the rebuilt
 #        branch's short sha resolves to empty backticks)
-#   C5.  the rebuilt branch condition  "$APP_REBUILT" == "true"
-#   C6.  the rebuilt branch carries the short sha  ${IMAGE_TAG:0:7}  (else a
-#        "rebuilt →" with no tag — useless; its source is pinned by C3/C4)
-#   C7.  the unchanged branch condition  "$APP_REBUILT" == "false"
-#   C8.  the unchanged branch emits an APP_IMAGE string containing the
+#   C6.  the rebuilt branch condition  "$APP_REBUILT" == "true"
+#   C7.  the rebuilt branch carries the short sha  ${IMAGE_TAG:0:7}  (else a
+#        "rebuilt →" with no tag — useless; its source is pinned by C4/C5)
+#   C8.  the unchanged branch condition  "$APP_REBUILT" == "false"
+#   C9.  the unchanged branch emits an APP_IMAGE string containing the
 #        distinguishing token `unchanged`
-#   C9.  the unknown/fallback branch (the `else`) emits an APP_IMAGE string
+#   C10. the unknown/fallback branch (the `else`) emits an APP_IMAGE string
 #        containing the distinguishing token `unknown`
-#   C10. the whole computation is gated on "$SANDBOX_DEPLOYED" == "true", tied to
+#   C11. the whole computation is gated on "$SANDBOX_DEPLOYED" == "true", tied to
 #        the APP_IMAGE="" initializer (else the line renders on build-only runs)
-#   C11. the *App image:* Slack block is present AND tied to its `-n "$APP_IMAGE"`
+#   C12. the *App image:* Slack block is present AND tied to its `-n "$APP_IMAGE"`
 #        render gate (else the computed line never reaches Slack, or an empty
 #        "App image:" renders on no-deploy runs)
 #
-# C10/C11 are proximity checks (need_window): a bare "both strings exist
+# C11/C12 are proximity checks (need_window): a bare "both strings exist
 # somewhere" can't tell that the gate still guards the thing it's supposed to
 # guard. Pinning the anchor→target window catches a detached gate that two
 # existence greps miss.
@@ -66,9 +67,9 @@
 # branch-condition rewrite: single brackets, a `case`) trips the fence. That's
 # intended: the token is what makes a re-roll distinguishable from a fresh ship,
 # so it IS the invariant; if you change it (or reshape a branch condition),
-# update these patterns in lockstep. Likewise C1/C3 pin the multi-line
+# update these patterns in lockstep. Likewise C1/C4 pin the multi-line
 # block-list `needs:` form the notify job uses today; a refactor to the flow
-# form (`needs: [changes, setup]`) would false-fail and must update them in
+# form (`needs: [app-image-build-required, setup]`) would false-fail and must update them in
 # lockstep (the sibling packer fence pins `- packer-build` the same way). The
 # fixture test alongside
 # (tests/scripts/check-app-image-line-rendered_test.sh) covers the extractor and
@@ -144,52 +145,52 @@ need_window() { # need_window <anchor-egrep> <gap> <target-egrep> <human message
   fi
 }
 
-# C1: the `changes` job is in notify.needs (source of APP_REBUILT).
-need '^[[:space:]]*-[[:space:]]+changes([[:space:]]|$)' \
-  "notify job is missing 'changes' in its needs: — APP_REBUILT can't resolve, so the App-image line is always 'unknown' (#2264)"
+# C1: the shared classifier job is in notify.needs (source of APP_REBUILT).
+need '^[[:space:]]*-[[:space:]]+app-image-build-required([[:space:]]|$)' \
+  "notify job is missing 'app-image-build-required' in its needs: — APP_REBUILT can't resolve, so the App-image line is always 'unknown' (#2264)"
 
-# C2: APP_REBUILT forwarded from needs.changes.outputs.app.
-need 'APP_REBUILT:[[:space:]]*\$\{\{[[:space:]]*needs\.changes\.outputs\.app' \
-  "notify job does not forward APP_REBUILT from needs.changes.outputs.app — the App-image line would always render 'unknown'"
+# C2: APP_REBUILT consumes the shared classifier output.
+need 'APP_REBUILT:[[:space:]]*\$\{\{[[:space:]]*needs\.app-image-build-required\.outputs\.app_image_build_required' \
+  "notify job does not consume app-image-build-required.outputs.app_image_build_required — the App-image line would not reflect rebuilt/unchanged state"
 
-# C3: the `setup` job is in notify.needs (source of IMAGE_TAG).
+# C4: the `setup` job is in notify.needs (source of IMAGE_TAG).
 need '^[[:space:]]*-[[:space:]]+setup([[:space:]]|$)' \
   "notify job is missing 'setup' in its needs: — IMAGE_TAG can't resolve, so the rebuilt branch's short sha is empty (#2264)"
 
-# C4: IMAGE_TAG forwarded from needs.setup.outputs.image_tag (the source the
+# C5: IMAGE_TAG forwarded from needs.setup.outputs.image_tag (the source the
 # rebuilt branch's ${IMAGE_TAG:0:7} below depends on; without it C6's sha is
 # present in the code but resolves to empty backticks at runtime).
 need 'IMAGE_TAG:[[:space:]]*\$\{\{[[:space:]]*needs\.setup\.outputs\.image_tag' \
   "notify job does not forward IMAGE_TAG from needs.setup.outputs.image_tag — the rebuilt branch would render an empty short sha"
 
-# C5: the rebuilt branch condition.
+# C6: the rebuilt branch condition.
 # shellcheck disable=SC2016  # literal grep pattern; the '$' must NOT expand
 need '"\$APP_REBUILT"[[:space:]]*==[[:space:]]*"true"' \
   "notify job is missing the APP_REBUILT==true branch — a fresh app-image ship would not be labeled 'rebuilt'"
 
-# C6: the rebuilt branch carries the short sha (a bare "rebuilt →" is useless).
+# C7: the rebuilt branch carries the short sha (a bare "rebuilt →" is useless).
 # shellcheck disable=SC2016  # literal grep pattern; the '$' must NOT expand
 need 'APP_IMAGE=.*\$\{IMAGE_TAG:0:7\}' \
   "notify job's rebuilt branch dropped the \${IMAGE_TAG:0:7} short sha — 'rebuilt' would render without the shipped tag"
 
-# C7: the unchanged branch condition.
+# C8: the unchanged branch condition.
 # shellcheck disable=SC2016  # literal grep pattern; the '$' must NOT expand
 need '"\$APP_REBUILT"[[:space:]]*==[[:space:]]*"false"' \
   "notify job is missing the APP_REBUILT==false branch — a re-roll would not be labeled 'unchanged'"
 
-# C8: the unchanged branch emits an APP_IMAGE string carrying the `unchanged`
+# C9: the unchanged branch emits an APP_IMAGE string carrying the `unchanged`
 # token. Pinned within the APP_IMAGE assignment (not bare) and as a token (not
 # the full prose) so rewording the rest of the message doesn't false-fail.
 need 'APP_IMAGE=.*unchanged' \
   "notify job's unchanged branch no longer sets an 'unchanged' APP_IMAGE string — a re-roll could masquerade as a fresh ship (#2264)"
 
-# C9: the unknown/fallback branch (the `else`) emits an APP_IMAGE string carrying
+# C10: the unknown/fallback branch (the `else`) emits an APP_IMAGE string carrying
 # the `unknown` token. Must stay anchored to APP_IMAGE= — bare `unknown` also
 # appears in the unrelated DURATION="unknown" logic in this same block.
 need 'APP_IMAGE=.*unknown' \
   "notify job's fallback branch no longer sets an 'unknown' APP_IMAGE string — an unreported rebuild status would render wrong or empty"
 
-# C10: the computation is gated on SANDBOX_DEPLOYED==true, tied to the
+# C11: the computation is gated on SANDBOX_DEPLOYED==true, tied to the
 # APP_IMAGE="" initializer so the gate can't be detached and leave the line
 # rendering on build-only runs (where no deploy happened). gap=6 gives an
 # inserted comment or two between the initializer and the gate some slack (the
@@ -199,7 +200,7 @@ need 'APP_IMAGE=.*unknown' \
 need_window 'APP_IMAGE=""' 6 '"\$SANDBOX_DEPLOYED"[[:space:]]*==[[:space:]]*"true"' \
   "notify job's App-image computation is not gated on SANDBOX_DEPLOYED==true — it would render on build-only runs that never deployed"
 
-# C11: the *App image:* Slack block is present AND tied to its `-n "$APP_IMAGE"`
+# C12: the *App image:* Slack block is present AND tied to its `-n "$APP_IMAGE"`
 # render gate, so the computed line actually reaches Slack and an empty line
 # can't render on a no-deploy run. gap=14 vs a real distance of 6: this Slack
 # `section` block is the part most likely to grow (added fields), and unlike

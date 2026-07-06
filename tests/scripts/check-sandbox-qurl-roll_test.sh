@@ -69,7 +69,7 @@ assert_in() {
 extract_step() {
   local block="$1" step="$2"
   awk -v step="$step" '
-    $0 ~ "^[[:space:]]*- name: " step "[[:space:]]*$" { capture=1; print; next }
+    /^[[:space:]]*- name: / && $0 == "      - name: " step { capture=1; print; next }
     capture && /^[[:space:]]*- name: / { exit }
     capture { print }
   ' <<< "$block"
@@ -117,6 +117,77 @@ assert_step_order() {
 
 echo "check-sandbox-qurl-roll:"
 
+SETUP=$(extract_job setup)
+if [[ -z "$SETUP" ]]; then
+  report_fail "setup job exists" \
+    "no '  setup:' job header found in build-and-push.yml"
+else
+  report_pass "setup job exists"
+  assert_step_in "$SETUP" setup "Set metadata" "setup image tag is always the workflow commit" \
+    'image_tag=\$\{\{ github\.sha \}\}'
+fi
+
+GUARD=$(extract_job sandbox-environment-guard)
+if [[ -z "$GUARD" ]]; then
+  report_fail "sandbox-environment-guard job exists" \
+    "no '  sandbox-environment-guard:' job header found in build-and-push.yml"
+else
+  report_pass "sandbox-environment-guard job exists"
+  assert_in "$GUARD" sandbox-environment-guard "environment guard runs on pull requests as API smoke" \
+    'github\.event_name == .pull_request.'
+  assert_in "$GUARD" sandbox-environment-guard "environment guard can read deployment environment metadata" \
+    'deployments: read'
+  assert_in "$GUARD" sandbox-environment-guard "environment guard checks sandbox protection rules" \
+    'protection_rules'
+  assert_in "$GUARD" sandbox-environment-guard "environment guard fails protected sandbox env red" \
+    'must not wait for approval'
+fi
+
+DRIFT=$(extract_job sandbox-app-image-drift)
+if [[ -z "$DRIFT" ]]; then
+  report_fail "sandbox-app-image-drift job exists" \
+    "no '  sandbox-app-image-drift:' job header found in build-and-push.yml"
+else
+  report_pass "sandbox-app-image-drift job exists"
+  assert_in "$DRIFT" sandbox-app-image-drift "drift waits for sandbox environment guard" \
+    'needs:.*sandbox-environment-guard'
+  # SC2016: $HEAD_SHA is literal workflow text in the grep pattern.
+  # shellcheck disable=SC2016
+  assert_in "$DRIFT" sandbox-app-image-drift "drift job compares live tags against HEAD" \
+    'resolve-live-app-image-required\.sh sandbox "\$HEAD_SHA"'
+fi
+
+APPBUILD=$(extract_job app-image-build-required)
+if [[ -z "$APPBUILD" ]]; then
+  report_fail "app-image-build-required job exists" \
+    "no '  app-image-build-required:' job header found in build-and-push.yml"
+else
+  report_pass "app-image-build-required job exists"
+  assert_in "$APPBUILD" app-image-build-required "app-image build classifier waits for changes and drift" \
+    'needs:.*changes.*sandbox-app-image-drift'
+  assert_in "$APPBUILD" app-image-build-required "app-image build classifier exposes a single workflow output" \
+    'app_image_build_required'
+  assert_in "$APPBUILD" app-image-build-required "app-image build classifier folds app changes and live drift" \
+    'APP_CHANGED_THIS_COMMIT.*LIVE_APP_IMAGE_REQUIRED'
+fi
+
+BUILD=$(extract_job build)
+if [[ -z "$BUILD" ]]; then
+  report_fail "build job exists" \
+    "no '  build:' job header found in build-and-push.yml"
+else
+  assert_in "$BUILD" build "build waits for sandbox environment guard" \
+    'needs:.*sandbox-environment-guard'
+  assert_in "$BUILD" build "build requires sandbox environment guard success/skipped" \
+    'sandbox-environment-guard\.result == .success.'
+  assert_in "$BUILD" build "build waits for sandbox app-image drift detection" \
+    'needs:.*sandbox-app-image-drift'
+  assert_in "$BUILD" build "build waits for app-image build classification" \
+    'needs:.*app-image-build-required'
+  assert_in "$BUILD" build "build consumes the single app-image build classification output" \
+    'app-image-build-required\.outputs\.app_image_build_required'
+fi
+
 JOB=$(extract_job deploy-sandbox-qurl)
 if [[ -z "$JOB" ]]; then
   report_fail "deploy-sandbox-qurl job exists" \
@@ -124,6 +195,19 @@ if [[ -z "$JOB" ]]; then
   echo; echo "  passed: $pass  failed: $fail"; exit 1
 fi
 report_pass "deploy-sandbox-qurl job exists"
+
+INFRA=$(extract_job deploy-sandbox-infra)
+if [[ -z "$INFRA" ]]; then
+  report_fail "deploy-sandbox-infra job exists" \
+    "no '  deploy-sandbox-infra:' job header found in build-and-push.yml"
+else
+  assert_in "$INFRA" deploy-sandbox-infra "infra deploy waits for sandbox environment guard" \
+    'needs:.*sandbox-environment-guard'
+  assert_in "$INFRA" deploy-sandbox-infra "infra deploy requires sandbox environment guard success/skipped" \
+    'sandbox-environment-guard\.result == .success.'
+  assert_in "$INFRA" deploy-sandbox-infra "infra deploy consumes the single app-image build classification output" \
+    'app-image-build-required\.outputs\.app_image_build_required'
+fi
 
 # Gated on the TF-apply job — that is the job that registers new revisions.
 assert_in "$JOB" deploy-sandbox-qurl "gated on deploy-sandbox-infra success" \
@@ -206,12 +290,51 @@ else
     "needs\.deploy-sandbox-relay\.result == 'success'"
   assert_step_in "$VALIDATE" deploy-sandbox-validate "Update Deployment Tracking" "deployment tracking requires prior step success" \
     'success\(\).*needs\.deploy-sandbox-relay\.result'
+  # SC2016: $NEW_SHA is literal workflow text in the grep pattern.
+  # shellcheck disable=SC2016
+  assert_step_in "$VALIDATE" deploy-sandbox-validate "Update Deployment Tracking" "deployment tracking re-checks live app image drift" \
+    'verify-live-app-images-ready\.sh sandbox "\$NEW_SHA"'
+  assert_step_in "$VALIDATE" deploy-sandbox-validate "Update Deployment Tracking" "deployment tracking refuses stale live app images" \
+    'verify-live-app-images-ready\.sh'
   assert_in "$VALIDATE" deploy-sandbox-validate "relay smoke uses the SSM-resolved qurl link URL" \
     'QURL_LINK_URL:.*qurl-domain-sandbox\.outputs\.qurl_link_url'
   # SC2016: the $QURL_LINK_URL in the grep pattern is literal workflow text.
   # shellcheck disable=SC2016
   assert_in "$VALIDATE" deploy-sandbox-validate "relay smoke invokes qurl-relay-bootstrap-smoke helper" \
     'node scripts/qurl-relay-bootstrap-smoke\.mjs "\$QURL_LINK_URL"'
+fi
+
+RELAY=$(extract_job deploy-sandbox-relay)
+if [[ -z "$RELAY" ]]; then
+  report_fail "deploy-sandbox-relay job exists" \
+    "no '  deploy-sandbox-relay:' job header found in build-and-push.yml"
+else
+  assert_in "$RELAY" deploy-sandbox-relay "relay deploy waits for app-image build classification" \
+    'needs:.*app-image-build-required'
+  assert_step_in "$RELAY" deploy-sandbox-relay "Deploy relay (SSM image-tag + ASG instance refresh)" "relay treats stale live app images as app-changed" \
+    'APP_IMAGE_BUILD_REQUIRED'
+fi
+
+BLUEGREEN=$(extract_job deploy-sandbox-blue-green)
+if [[ -z "$BLUEGREEN" ]]; then
+  report_fail "deploy-sandbox-blue-green job exists" \
+    "no '  deploy-sandbox-blue-green:' job header found in build-and-push.yml"
+else
+  assert_in "$BLUEGREEN" deploy-sandbox-blue-green "blue/green waits for build and drift detection" \
+    'needs:.*app-image-build-required.*build'
+  assert_step_in "$BLUEGREEN" deploy-sandbox-blue-green "Resolve Image Tag" "blue/green deploys github.sha when app image drift requires it" \
+    'APP_IMAGE_BUILD_REQUIRED'
+fi
+
+NOTIFY=$(extract_job notify)
+if [[ -z "$NOTIFY" ]]; then
+  report_fail "notify job exists" \
+    "no '  notify:' job header found in build-and-push.yml"
+else
+  assert_in "$NOTIFY" notify "notify waits on sandbox environment guard" \
+    'sandbox-environment-guard'
+  assert_in "$NOTIFY" notify "notify reports the single app-image build classification output" \
+    'APP_REBUILT: \$\{\{ needs\.app-image-build-required\.outputs\.app_image_build_required \}\}'
 fi
 
 echo

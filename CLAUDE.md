@@ -173,6 +173,42 @@ gh workflow run build-and-push.yml --ref main \
   -f environment=sandbox -f force_build=true -f deploy=true
 ```
 
+### Sandbox app-image drift gate
+
+`build-and-push.yml` intentionally treats live sandbox app-image drift as a
+deploy blocker. On every workflow-triggering `main` push and sandbox deploy
+dispatch, `sandbox-app-image-drift` reads the configured server, AC, and relay
+image tags from SSM and compares their app trees to the workflow SHA. While
+drift is unhealed, even infra-only or CI-only pushes build, scan, and roll fresh
+app images; a broken app tree therefore blocks sandbox deploys until the app fix
+lands or the breakage is reverted. This is deliberate: do not bypass the gate or
+manually advance `/sandbox/nhp/deploy/deployed-commit` while live tags cannot
+prove the target SHA. `force_build=true` only asks the workflow to build the
+target tree; it is not an escape hatch for a broken app tree.
+
+The SSM reads are strict by design. A transient AWS/SSM failure in either the
+pre-build drift job or the post-switch `Update Deployment Tracking` gate should
+fail the run red and be rerun after AWS recovers, not guessed clean. If the
+post-switch gate fails after a healthy rollout, leave `deployed-commit` stale so
+the next scheduled deploy re-proves the live configured tags before recording
+the SHA.
+
+If an active image tag points at a commit GitHub can no longer fetch, the drift
+gate also fails closed into a forced app build/roll until the live tags converge
+and deployment tracking can be stamped honestly again.
+
+Only pushes matching `build-and-push.yml`'s `on.push.paths` start this gate, so
+a docs-only `main` push does not heal pre-existing drift by itself. The scheduled
+deploy path and an explicit sandbox `workflow_dispatch` do run the same drift
+gate and can heal drift by building/rolling the target tree when the app is
+healthy. On-call triage lives in
+`docs/runbooks/sandbox-app-image-drift.md`.
+
+Keep the GitHub `sandbox` environment free of required reviewers/protection
+rules while `sandbox-app-image-drift` is on the main-push path, or revisit this
+workflow first; otherwise every `main` push can pause for manual approval before
+the drift gate runs.
+
 ## Key Ports
 
 | Port | Protocol | Component | Purpose |

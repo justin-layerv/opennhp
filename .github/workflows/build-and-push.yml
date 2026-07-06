@@ -1,13 +1,21 @@
 name: Build and Deploy NHP
 
+# run-name embeds an optional correlation_id so parent workflows can
+# reliably find the specific build-and-push run they dispatched via
+# find-dispatched-run.sh. This avoids timestamp matching races with
+# concurrent main pushes or other manual dispatches.
+run-name: "Build and Deploy NHP${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
+
 on:
   push:
     branches:
       - main
     paths:
       - 'nhp/**'
+      - 'internalauth/**'
       - 'endpoints/**'
       - 'docker/**'
+      - 'Makefile'
       - 'terraform/**'
       - 'scripts/**'
       - 'tests/**'
@@ -53,6 +61,11 @@ on:
         required: false
         default: false
         type: boolean
+      correlation_id:
+        description: 'Optional unique ID set by the parent dispatcher so it can reliably find this run (see find-dispatched-run.sh).'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   id-token: write
@@ -134,16 +147,22 @@ jobs:
             # workflow-only edits.
             code:
               - 'nhp/**'
+              - 'internalauth/**'
               - 'endpoints/**'
               - 'docker/**'
+              - 'Makefile'
               - 'terraform/**'
               - 'scripts/**'
               - 'tests/**'
               - '.github/workflows/**'
             app:
               - 'nhp/**'
+              - 'internalauth/**'
               - 'endpoints/**'
               - 'docker/**'
+              # Makefile is intentionally broad: it owns the app build entrypoints
+              # for server, AC, relay, and image contents.
+              - 'Makefile'
               # .trivyignore is consumed by the image-scan job; without it
               # in the path filter, a PR that only edits the ignore file
               # skips the trivy gate entirely and silently "passes."
@@ -153,7 +172,9 @@ jobs:
             tests:
               - 'tests/**'
               - 'nhp/**'
+              - 'internalauth/**'
               - 'endpoints/**'
+              - 'Makefile'
             lambdas:
               - 'terraform/modules/**/lambda/**'
               - 'terraform/lambda/**'
@@ -171,7 +192,7 @@ jobs:
             echo "| Category | Changed |"
             echo "|----------|---------|"
             echo "| Any code | ${{ steps.filter.outputs.code }} |"
-            echo "| App (nhp, endpoints, docker) | ${{ steps.filter.outputs.app }} |"
+            echo "| App (nhp, internalauth, endpoints, docker, Makefile, .trivyignore) | ${{ steps.filter.outputs.app }} |"
             echo "| Infrastructure (terraform) | ${{ steps.filter.outputs.infra }} |"
             echo "| Tests | ${{ steps.filter.outputs.tests }} |"
             echo "| Lambdas | ${{ steps.filter.outputs.lambdas }} |"
@@ -236,9 +257,130 @@ jobs:
             echo "environment=dev" >> "$GITHUB_OUTPUT"
           fi
           {
+            # Always the workflow commit, including workflow_dispatch. The
+            # dispatch ref guard above keeps deployable manual runs on main, so
+            # deployed-commit records the same commit whose images were built.
             echo "image_tag=${{ github.sha }}"
             echo "start_time=$(date +%s)"
           } >> "$GITHUB_OUTPUT"
+
+  # ============================================================================
+  # SANDBOX APP IMAGE DRIFT - Detect stale live app images before deploy
+  # ============================================================================
+  # The per-commit paths-filter only answers "did this commit touch app paths?"
+  # It does not answer whether sandbox actually runs all app changes through
+  # this SHA. If an app-changing deploy fails and a later infra-only commit
+  # succeeds, relying only on the later commit's path filter can re-roll the old
+  # image and then stamp deployed-commit as current. Compare HEAD against the
+  # live active image tags so the next successful deploy heals that drift.
+  # On-call runbook for this intentional coupling: while drift is unhealed,
+  # even infra-only/CI-only pushes build+scan+roll app images, and a broken app
+  # tree blocks sandbox deploys until the app fix lands or the breakage is
+  # reverted. That is the safety tradeoff: sandbox must not stamp a SHA deployed
+  # while serving older app bytes.
+  # This deliberately makes main-push builds depend on SSM: if we cannot prove
+  # the configured live tags, the deploy must fail red rather than guess.
+  # ============================================================================
+  sandbox-environment-guard:
+    name: Sandbox Environment Guard
+    if: |
+      github.event_name == 'pull_request' ||
+      (
+        (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'sandbox')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: read
+      contents: read
+      deployments: read
+    steps:
+      - name: Verify sandbox environment has no protection rules
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          ENV_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/environments/sandbox")
+          PROTECTION_RULE_COUNT=$(jq '.protection_rules // [] | length' <<< "$ENV_JSON")
+          if (( PROTECTION_RULE_COUNT != 0 )); then
+            echo "::error::The sandbox GitHub environment has protection rules, but sandbox-app-image-drift runs on the main-push path and must not wait for approval."
+            echo "::error::Remove sandbox environment protection rules or move the drift gate off the protected environment before merging main-push workflow changes."
+            jq -c '.protection_rules // []' <<< "$ENV_JSON"
+            exit 1
+          fi
+
+          echo "::notice::sandbox GitHub environment has no protection rules; app-image drift detection can run without approval."
+
+  sandbox-app-image-drift:
+    name: Sandbox App Image Drift
+    needs: [changes, setup, sandbox-environment-guard]
+    if: |
+      github.event_name != 'pull_request' &&
+      (
+        (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'sandbox')
+      )
+    runs-on: ubuntu-latest
+    # This job is on the main-push path. Keep the `sandbox` environment free of
+    # required reviewers/protection while this gate uses sandbox OIDC/SSM access,
+    # or every qualifying main push will pause before drift detection. See
+    # CLAUDE.md "Sandbox App-Image Drift Gate" for the operational tradeoff.
+    environment: sandbox
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      app_image_required: ${{ steps.resolve.outputs.app_image_required }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve app image drift
+        id: resolve
+        env:
+          HEAD_SHA: ${{ needs.setup.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          ./.github/scripts/resolve-live-app-image-required.sh sandbox "$HEAD_SHA"
+
+  app-image-build-required:
+    name: App Image Build Required
+    needs: [changes, sandbox-app-image-drift]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      app_image_build_required: ${{ steps.classify.outputs.app_image_build_required }}
+    steps:
+      - name: Classify app-image build requirement
+        id: classify
+        env:
+          APP_CHANGED_THIS_COMMIT: ${{ needs.changes.outputs.app }}
+          LIVE_APP_IMAGE_REQUIRED: ${{ needs.sandbox-app-image-drift.outputs.app_image_required }}
+        run: |
+          set -euo pipefail
+
+          required=""
+          if [[ "$APP_CHANGED_THIS_COMMIT" == "true" || "$LIVE_APP_IMAGE_REQUIRED" == "true" ]]; then
+            required="true"
+          elif [[ "$APP_CHANGED_THIS_COMMIT" == "false" && "$LIVE_APP_IMAGE_REQUIRED" != "true" ]]; then
+            required="false"
+          fi
+
+          echo "app_image_build_required=$required" >> "$GITHUB_OUTPUT"
+          echo "::notice::app_image_build_required=${required:-unset}"
 
   # ============================================================================
   # PACKER - Build runtime-baked AMIs if missing or packer files changed
@@ -924,7 +1066,7 @@ jobs:
   # ============================================================================
   build:
     name: Build ${{ matrix.image }}
-    needs: [changes, setup, terraform-validate, terraform-plan]
+    needs: [changes, setup, sandbox-environment-guard, sandbox-app-image-drift, app-image-build-required, terraform-validate, terraform-plan]
     runs-on: ubuntu-latest
     # attestations: write + id-token: write let the post-push attest steps
     # (SLSA provenance + SBOM) mint keyless Sigstore attestations and push
@@ -940,6 +1082,9 @@ jobs:
     # Note: We still skip at step level to ensure matrix expands and check names are created
     if: |
       always() &&
+      (needs.sandbox-environment-guard.result == 'success' || needs.sandbox-environment-guard.result == 'skipped') &&
+      (needs.sandbox-app-image-drift.result == 'success' || needs.sandbox-app-image-drift.result == 'skipped') &&
+      needs.app-image-build-required.result == 'success' &&
       (needs.terraform-validate.result == 'success' || needs.terraform-validate.result == 'skipped') &&
       (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped')
     timeout-minutes: 15
@@ -971,38 +1116,39 @@ jobs:
             platform: linux/amd64
     steps:
       # Skip at step level (not job level) so matrix expands and check names are created
-      # Build only when app code changes (nhp/**, endpoints/**, docker/**)
+      # Build only when this commit changed app paths, or the live sandbox app
+      # images lag app changes already present in the target SHA.
       - name: Skip notice
-        if: needs.changes.outputs.app != 'true'
+        if: needs.app-image-build-required.outputs.app_image_build_required != 'true'
         run: |
-          echo "::notice::Skipping build - no app code changes detected (only infra or docs changed)"
+          echo "::notice::Skipping build - live app image tags already contain app paths at this SHA"
           echo "This job reports success to satisfy branch protection requirements."
 
       - name: Checkout code
-        if: needs.changes.outputs.app == 'true'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # ECR is hosted in the sandbox account (primary_account). Prod pulls cross-account
       # via ECR repository policy (see terraform/modules/ecr/main.tf). Images are always
       # pushed to sandbox ECR, so we always use the sandbox role here.
       - name: Configure AWS credentials
-        if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
 
       - name: Set up Docker Buildx
-        if: needs.changes.outputs.app == 'true'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true'
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Build image
-        if: needs.changes.outputs.app == 'true'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true'
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         # Cache hygiene: CACHE_SCOPE is the single source of truth that both
         # cache-from and cache-to consume below, so the read scope can never
@@ -1034,7 +1180,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ env.CACHE_SCOPE }}
 
       - name: Set image name for scanning
-        if: needs.changes.outputs.app == 'true'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true'
         id: image
         run: |
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
@@ -1058,7 +1204,7 @@ jobs:
       # build -> scan -> push. The registry attach (by digest) happens post-push.
       - name: Generate SBOM
         id: sbom
-        if: needs.changes.outputs.app == 'true'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true'
         continue-on-error: true
         # renovate: datasource=github-releases depName=anchore/sbom-action
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -1076,7 +1222,7 @@ jobs:
       # (which fails the job) still publishes the SBOM. Retrieval is documented
       # in docs/SECURITY.md.
       - name: Upload SBOM artifact
-        if: always() && needs.changes.outputs.app == 'true'
+        if: always() && needs.app-image-build-required.outputs.app_image_build_required == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-${{ matrix.image }}
@@ -1086,7 +1232,7 @@ jobs:
 
       - name: Scan image
         id: trivy
-        if: needs.changes.outputs.app == 'true'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true'
         # renovate: datasource=github-releases depName=aquasecurity/trivy-action
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -1132,14 +1278,14 @@ jobs:
 
       - name: Upload scan results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always() && needs.changes.outputs.app == 'true'
+        if: always() && needs.app-image-build-required.outputs.app_image_build_required == 'true'
         with:
           name: trivy-results-${{ matrix.image }}
           path: '${{ matrix.image }}-trivy-results.sarif'
           retention-days: 7
 
       - name: Push to ECR
-        if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
@@ -1167,7 +1313,7 @@ jobs:
       # their `steps.digest.outputs.digest != ''` gate.
       - name: Capture pushed image digest
         id: digest
-        if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
         continue-on-error: true
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -1230,7 +1376,7 @@ jobs:
       # the per-image outcome in the run summary and ::warning:: loudly when an
       # attestation was expected (digest resolved) but did not get produced.
       - name: Attestation summary
-        if: always() && needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'
+        if: always() && needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
         env:
           IMAGE: ${{ matrix.image }}
           DIGEST: ${{ steps.digest.outputs.digest }}
@@ -1730,10 +1876,13 @@ jobs:
 
   deploy-sandbox-infra:
     name: Deploy Sandbox - Infrastructure
-    needs: [changes, setup, test, test-lambdas, build, terraform-plan]
+    needs: [changes, setup, sandbox-environment-guard, sandbox-app-image-drift, app-image-build-required, test, test-lambdas, build, terraform-plan]
     if: |
       always() &&
-      (needs.changes.outputs.app == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.sandbox-environment-guard.result == 'success' || needs.sandbox-environment-guard.result == 'skipped') &&
+      (needs.sandbox-app-image-drift.result == 'success' || needs.sandbox-app-image-drift.result == 'skipped') &&
+      needs.app-image-build-required.result == 'success' &&
+      (needs.app-image-build-required.outputs.app_image_build_required == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch') &&
       (needs.test.result == 'success' || needs.test.result == 'skipped') &&
       (needs.test-lambdas.result == 'success' || needs.test-lambdas.result == 'skipped') &&
       needs.build.result == 'success' &&
@@ -2056,7 +2205,7 @@ jobs:
             echo "::warning::Detected deposed relay node security group pending destroy; refreshing relay ASG before Terraform retries DeleteSecurityGroup"
             ../../../.github/scripts/recover-relay-deposed-sg.sh \
               sandbox \
-              "${{ needs.changes.outputs.app }}" \
+              "${{ needs.app-image-build-required.outputs.app_image_build_required == 'true' && 'true' || 'false' }}" \
               "${{ needs.setup.outputs.image_tag }}"
 
             # Refreshing the ASG changes live instance attachments and may update
@@ -2416,12 +2565,12 @@ jobs:
   # by promote-to-prod.yml regardless; this sandbox leg is a no-op until #6
   # flips deploy_relay=true.
   #
-  # IMAGE TAG: only written when app code changed this commit (the build matrix
-  # actually pushed layerv/nhp-relay:${github.sha} to ECR). On an infra-only
-  # commit github.sha was NOT pushed, so we must NOT write it — the SSM param
+  # IMAGE TAG: written when this commit touched app paths OR the live relay tag
+  # lags app changes already present in HEAD (the sandbox-app-image-drift job
+  # forces a build in that case). On a truly infra-only commit with no live app
+  # drift, github.sha was NOT pushed, so we must NOT write it — the SSM param
   # keeps the currently-running tag and the refresh still propagates any
-  # launch-template / user_data / relay.toml change from terraform apply (the
-  # same "refresh on every build" rationale as blue-green, PR #820/#994).
+  # launch-template / user_data / relay.toml change from terraform apply.
   #
   # IAM: reuses AWS_ROLE_ARN (the github_actions role). It already grants
   # ssm:GetParameter (Resource=*), ssm:PutParameter (Resource=*), and
@@ -2429,8 +2578,8 @@ jobs:
   # relay ASG is layerv-nhp-${env}-relay, inside that wildcard. No IAM change.
   deploy-sandbox-relay:
     name: Deploy Sandbox - Relay
-    # changes + setup: needed for the app-changed gate + the freshly-built tag.
-    needs: [changes, setup, deploy-sandbox-infra]
+    # setup + app-image-build-required: needed for the app-image gate + tag.
+    needs: [setup, app-image-build-required, deploy-sandbox-infra]
     if: always() && needs.deploy-sandbox-infra.result == 'success'
     runs-on: ubuntu-latest
     environment: sandbox
@@ -2472,9 +2621,15 @@ jobs:
       # absent → ParameterNotFound → skip).
       - name: Deploy relay (SSM image-tag + ASG instance refresh)
         env:
-          APP_CHANGED: ${{ needs.changes.outputs.app }}
+          APP_IMAGE_BUILD_REQUIRED: ${{ needs.app-image-build-required.outputs.app_image_build_required }}
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
-        run: ./.github/scripts/deploy-relay.sh sandbox "$APP_CHANGED" "$IMAGE_TAG"
+        run: |
+          set -euo pipefail
+          EFFECTIVE_APP_CHANGED=false
+          if [[ "$APP_IMAGE_BUILD_REQUIRED" == "true" ]]; then
+            EFFECTIVE_APP_CHANGED=true
+          fi
+          ./.github/scripts/deploy-relay.sh sandbox "$EFFECTIVE_APP_CHANGED" "$IMAGE_TAG"
 
   # Dispatch blue/green deployment instead of doing direct instance refresh.
   # This ensures every CI deploy alternates between blue and green ASGs,
@@ -2484,8 +2639,8 @@ jobs:
   # is shared with ensure-sandbox-deployed.sh (scheduled-release path).
   deploy-sandbox-blue-green:
     name: Deploy Sandbox - Blue/Green
-    needs: [changes, setup, deploy-sandbox-infra]
-    if: always() && needs.deploy-sandbox-infra.result == 'success' && needs.deploy-sandbox-infra.outputs.server_asg != ''
+    needs: [setup, app-image-build-required, build, deploy-sandbox-infra]
+    if: always() && needs.build.result == 'success' && needs.deploy-sandbox-infra.result == 'success' && needs.deploy-sandbox-infra.outputs.server_asg != ''
     runs-on: ubuntu-latest
     environment: sandbox
     # Job timeout must cover the dispatch step's worst case plus a buffer for
@@ -2531,14 +2686,14 @@ jobs:
 
       # Resolve the image tag to deploy.
       #
-      #   - App-changing commits: every CI run on main rebuilds and pushes
+      #   - App-image-required commits: every CI run on main rebuilds and pushes
       #     layerv/nhp-server:${github.sha} + layerv/nhp-ac:${github.sha}
-      #     via the `build` matrix, so github.sha is guaranteed to exist
-      #     in ECR and is the right thing to deploy.
+      #     via the `build` matrix when either this commit changed app paths OR
+      #     the live active tags lag app changes already present in HEAD.
       #
-      #   - Infra-only commits: `Build server` / `Build ac` step-level-skip
-      #     (needs.changes.outputs.app == 'false'), so github.sha is NEVER
-      #     pushed to ECR. Dispatching blue/green with that tag explodes in
+      #   - True infra-only commits: `Build server` / `Build ac` step-level-skip
+      #     only when live active tags already contain HEAD's app paths, so
+      #     github.sha is NEVER pushed to ECR. Dispatching blue/green with that tag explodes in
       #     the downstream "Validate Image Exists in ECR" step. The right
       #     behaviour is to dispatch with the *currently-deployed* tag so
       #     instance refresh still runs — which is the mechanism by which
@@ -2562,18 +2717,19 @@ jobs:
       - name: Resolve Image Tag
         id: resolve-tag
         env:
-          APP_CHANGED: ${{ needs.changes.outputs.app }}
+          APP_IMAGE_BUILD_REQUIRED: ${{ needs.app-image-build-required.outputs.app_image_build_required }}
           GITHUB_SHA_INPUT: ${{ needs.setup.outputs.image_tag }}
         run: |
           set -euo pipefail
 
-          if [[ "$APP_CHANGED" == "true" ]]; then
-            # Both components were freshly built and pushed at this github.sha,
-            # so both deploy the same tag (the planner collapses this to a
-            # single component=both dispatch).
+          if [[ "$APP_IMAGE_BUILD_REQUIRED" == "true" ]]; then
+            # Both components were freshly built and pushed at this github.sha:
+            # either this commit changed app paths, or live sandbox images lag
+            # app changes already present in HEAD. In both cases this SHA is
+            # the only tag that can honestly satisfy deployed-commit.
             SERVER_TAG="$GITHUB_SHA_INPUT"
             AC_TAG="$GITHUB_SHA_INPUT"
-            echo "App code changed on this commit — dispatching both components with freshly-built tag: $GITHUB_SHA_INPUT"
+            echo "App image required — dispatching both components with freshly-built tag: $GITHUB_SHA_INPUT"
             echo "source=github-sha" >> "$GITHUB_OUTPUT"
           else
             echo "No app code changes on this commit — resolving current active image tags from SSM so the blue/green refresh picks up any launch-template / user_data / boot-config changes from terraform apply."
@@ -2688,6 +2844,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # resolve-live-app-image-required.sh can fetch an active image tag by
+          # SHA from this origin when the post-switch gate detects drift.
+          fetch-depth: 1
 
       - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
@@ -2915,12 +3075,34 @@ jobs:
       - name: Update Deployment Tracking
         if: success() && needs.deploy-sandbox-relay.result == 'success'
         env:
-          NEW_SHA: ${{ github.sha }}
+          # Keep this expression in lockstep with sandbox-app-image-drift's
+          # HEAD_SHA so both gates evaluate the same target app tree.
+          NEW_SHA: ${{ needs.setup.outputs.image_tag }}
         run: |
+          set -euo pipefail
           # #2680 treats the JS-agent -> relay cutover as part of a complete
           # sandbox deploy. If the relay leg failed/skipped and the smoke could
           # not run, leave deployed-commit on the previous SHA so the scheduled
           # deploy path retries instead of recording an unverified cutover.
+          #
+          # Also fail closed on stale live app images. A failed app rollout
+          # followed by a successful infra-only deploy must not mark the later
+          # SHA as deployed while server/AC/relay still run an older app tree.
+          # Re-read live tags here instead of trusting the earlier drift job:
+          # blue/green may have switched active color, and this is the
+          # authoritative post-switch gate before recording deployed-commit.
+          # dispatch-and-poll-blue-green.sh returns success only after the
+          # dispatched blue-green-deploy.yml run concludes success. That run's
+          # switch-traffic job calls blue-green-switch.sh, which writes
+          # active-color before the validate job reconciles listener and SSM
+          # state, so success means active-color has already flipped before
+          # this post-switch re-read.
+          # This proves configured active tags, not per-instance runtime bytes;
+          # rollout health checks above remain responsible for ASG convergence.
+          # If this trips after rollout, leave deployed-commit stale and fail red
+          # so the next deploy retries instead of recording unproven live bytes.
+          ./.github/scripts/verify-live-app-images-ready.sh sandbox "$NEW_SHA"
+
           # Save the current deployed-commit as -previous before overwriting,
           # so sandbox rollback tooling can target the actual previous version
           # (not the current — possibly broken — one). Mirrors the prod pattern
@@ -2995,10 +3177,12 @@ jobs:
     name: Notify
     needs:
       - setup
-      # changes.outputs.app: true when the path filter saw app changes OR
-      # force_build was set. Used to label the Slack status with whether a new
-      # app image actually shipped vs. a re-roll of the existing one.
       - changes
+      - sandbox-environment-guard
+      - sandbox-app-image-drift
+      # app-image-build-required labels whether a new app image actually
+      # shipped vs. a re-roll.
+      - app-image-build-required
       - test
       - test-lambdas
       - build
@@ -3055,9 +3239,10 @@ jobs:
           SANDBOX_RELAY: ${{ needs.deploy-sandbox-relay.result }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-sandbox.result }}
-          # true when a new app image was built this run (vs. a re-roll of the
-          # existing image on a terraform/config/CI-only deploy)
-          APP_REBUILT: ${{ needs.changes.outputs.app }}
+          # true when a new app image was built this run: either this commit
+          # changed app paths, or live sandbox images lagged app changes
+          # already present in HEAD and the drift gate forced a rebuild.
+          APP_REBUILT: ${{ needs.app-image-build-required.outputs.app_image_build_required }}
           # Metadata
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
@@ -3219,11 +3404,13 @@ jobs:
           # shipping the commit's code — which is how a stale binary can look
           # "live" for days. Only meaningful when a sandbox deploy ran.
           #
-          # "rebuilt" tracks APP_REBUILT (changes.outputs.app), i.e. a new
-          # sha-tagged image was built+pushed. Note the `app` path filter also
-          # includes .trivyignore, so a .trivyignore-only commit reads "rebuilt"
-          # even though the Go/Docker bytes are identical — still accurate (a new
-          # image *is* produced and rolled), just not a source-code change.
+          # "rebuilt" tracks APP_REBUILT, i.e. a new sha-tagged image was
+          # built+pushed because this commit touched app paths OR because live
+          # sandbox images lagged app changes already present in HEAD. Note the
+          # app path filter also includes .trivyignore, so a .trivyignore-only
+          # commit reads "rebuilt" even though the Go/Docker bytes are identical
+          # — still accurate (a new image is produced and rolled), just not a
+          # source-code change.
           APP_IMAGE=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
             if [[ "$APP_REBUILT" == "true" ]]; then
