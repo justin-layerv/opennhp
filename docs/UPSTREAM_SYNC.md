@@ -6,13 +6,13 @@ This document tracks the synchronization status between this fork (LayerV NHP) a
 
 | Field | Value |
 |-------|-------|
-| **Last reviewed upstream SHA** | e903f92c |
-| **Last review date** | 2026-06-01 |
+| **Last reviewed upstream SHA** | 0589c360 |
+| **Last review date** | 2026-07-01 |
 | **Reviewer** | Claude Code |
 
 > **HOW TO USE:** When checking for updates, run:
 > ```bash
-> git log e903f92c..upstream/main --oneline
+> git log 0589c360..upstream/main --oneline
 > ```
 > This shows ONLY new commits since last review. Update the SHA after each review.
 
@@ -94,6 +94,26 @@ Values where the fork intentionally diverges from upstream. **If an upstream com
 ---
 
 ## Sync History
+
+### 2026-07-01 - Routine Review (No Direct Sync — 4 Follow-Up Ports Tracked)
+
+- **Reviewed up to:** 0589c360
+- **Commits reviewed:** 113 (non-merge)
+- **PRs created:** None
+- **Commits synced:** None — but the #1552 / #1563 cross-check below found pre-existing shared-code bugs that apply to the fork; tracked for separate ports in #3084–#3087.
+- **Summary:**
+  - 30 Dependabot/dependency updates (auto-skipped) — includes 2 GMSM bumps, 2 docs-site CVE bumps (vite, basic-ftp/ws), 2 upstream-plugin go-toml alignments (`66bc7815`, `a3c3e8f6`), and a wazero+etcd build-dep bump (`7e0ecc8d`)
+  - 1 Version bump to 0.8.0 (`1d638cbd`, skipped — upstream versioning)
+  - 12 Demo infrastructure changes (upstream multi-cluster demo, skipped)
+  - 3 CI/GitHub Actions workflow changes (auto-skipped — Claude PR review tweaks from justin-layerv)
+  - 3 Documentation/sponsor changes (auto-skipped)
+  - 1 js-agent multi-cluster demo host-picker (`322fa9d1`, skipped — upstream multi-cluster demo wiring)
+  - 2 HeaderType authentication commits (`cfa08718`, `d10afec2`) — already tracked as SKIP (fork is the SOURCE; see 2026-06-15 entries below)
+  - 1 Test maintenance PR #1563 (`449e2c0d`) — SKIP as a whole (fork's `log_test.go` is already superior), but its `api_test.go` dead-code cleanup **does apply** — tracked in **#3087** (see the `449e2c0d` row for detail)
+  - 60 commits in PR #1552 (feat/phase2-multi-instance-peers) — multi-instance server clusters. The **feature** is skipped (fork has its own AWS ASG/NLB/etcd approach). Its fix/perf commits were cross-checked commit-by-commit: most are **already carried in the fork** or feature-coupled N/A, but a residual set of **pre-existing shared-code bugs applies** and is tracked for separate ports — **#3084** (agent panics), **#3085** (AC data race + eBPF), **#3086** (server hardening). See the `f8e471c0` row under Individual Commit Decisions for the per-commit split.
+- **Notes:** PR #1552 is the most significant upstream development this period (multi-cluster support, stateless overload cookies, per-connection stickiness). Two durable notes for future reviewers:
+  1. **Don't conflate the two "multi-cluster" concepts.** #1552 is **server-side** clustering — skipped, since the fork uses AWS ASG/NLB/etcd. The relay's **per-cell** routing is a separate thing, adopted under #2208 (see "Relay + JS-Agent: now ADOPTED" above).
+  2. **"Skip the feature" ≠ "skip the branch."** The per-commit cross-check surfaced shared-code fixes that DO apply even though the feature is skipped (panic prevention → SYNC, per the Decision Matrix) — see the bullet above and the `f8e471c0` row. If the relay adoption (#2208) later needs multi-cluster routing, revisit PR #1552's cluster abstraction then.
 
 ### 2026-06-01 - Routine Review (No Sync Required)
 
@@ -266,6 +286,14 @@ Non-obvious skips that don't fit Auto-Skip Categories:
 | cc36a684 | feat(js-agent): CBOR token support | SKIP | Upstream-only JS agent component | 2026-06-01 |
 | cfa08718 | fix(server,agent): authenticate knock HeaderType (reject on-path flips) | SKIP — fork is the SOURCE | Our own #1154/#1257 work, re-contributed upstream as [OpenNHP#1584](https://github.com/OpenNHP/opennhp/pull/1584) (author justin-layerv). Merged 2026-06-15, **after** the e903f92c baseline, so it WILL surface in the next `git log e903f92c..upstream/main` walk — and the Decision Matrix would mis-classify it "security → SYNC IMMEDIATELY." The fork already carries a strict SUPERSET: the gated permit→strict `endpoints/server/knock_headertype_gate.go` + errors 52009/52010/**52011** (landed in #1249). **Do NOT replace the gate with upstream's unconditional reject** — it would lock out fork-only non-agent knock clients (qurl-tunnel-client/fileviewer/e2e) that still emit a legacy zero headerType (#1257). | 2026-06-15 |
 | d10afec2 | fix(js-agent): authenticate knock HeaderType (mirror wire type in body) | SKIP — fork is the SOURCE | js-agent half of OpenNHP#1584. The fork's js-agent already sets the body `headerType`, in different files (`endpoints/js-agent/src/agent/knock.ts`, not upstream's `NHPAgent.ts`). Upstream's cookie-resend RKN mutation fix is N/A here — the fork's RKN re-knock path isn't built yet (#2208 PR-5c, gated on #2611, where the body-`headerType`=`NHP_RKN` requirement is recorded). | 2026-06-15 |
+| f8e471c0 | feat: phase2 multi-instance peers (PR #1552, 60 commits) | SKIP (feature) — partial ports tracked | Multi-instance **server-side** clusters (load balancing, stateless overload cookies, cluster abstraction). The feature is skipped: fork has its own multi-instance approach (AWS ASG/NLB/etcd), distinct from the relay per-cell routing under #2208. The 60-commit branch was cross-checked commit-by-commit — most fix/perf commits are **already in the fork** (stateless cookies, conn-counter accounting, config-reload fail-close, and the `e9be6c7a` attestation-bypass/nil-deref fixes — e.g. the fork's DAV handler in `endpoints/server/msghandler.go` already skips attestation on a config-read error) or feature-coupled N/A. Pre-existing shared-code bugs that DO apply are tracked for manual adaptation: agent-lifecycle panics (`af931432`, `bf3e5efe`, `8e983f1d`, `568cb53f`, `c6f9c769`) → **#3084**; AC `config.Servers` data race + empty-SrcIP eBPF rule (`3e56ffc7`) → **#3085**; optional server-dispatch handler bound (`bc499d7c` H2) → **#3086**. `16b71809` (AC etcd-load fail-close) is N/A — fork's AC loads peers from a file, not etcd. | 2026-07-01 |
+| 449e2c0d | chore: improve opennhp maintenance path (PR #1563) | SKIP (whole PR) — `api_test.go` cleanup tracked | Fork's `log_test.go` already has superior tests (`TestLog_CloseTwice`, JSON format tests, etc.), so the PR as a whole is SKIP. But its `api_test.go` cleanup **does apply**: the fork still carries the dead `/* ... */` block (`nhp/test/api_test.go:8-87`) — vestigial upstream Zhejiang-gov SSO demo code + hardcoded demo creds (dead in the fork; an upstream integration we don't use) — and a no-op `TestUrlEncoding`. Tracked for manual adaptation in **#3087**. (Prior "cherry-pick not possible without upstream git access" reasoning was wrong — the fork adapts manually.) | 2026-07-01 |
+| 7e0ecc8d | build(deps): bump wazero to v1.12.0 and etcd client to v3.6.12 | SKIP | Fork manages dependencies separately | 2026-07-01 |
+| a3c3e8f6 | fix: bump go-toml to v2.4.1 in plugin modules | SKIP | Upstream plugin modules; fork has different plugin layout | 2026-07-01 |
+| 66bc7815 | chore(deps): align example plugins with go-toml v2.4.2 | SKIP | Upstream plugin modules; fork has different plugin layout | 2026-07-01 |
+| 5764feb1 | fix(deps): bump vite in docs for CVE | SKIP | Upstream docs website only | 2026-07-01 |
+| e5542bdf | fix(deps): fix basic-ftp and ws vulnerabilities in docs | SKIP | Upstream docs website only | 2026-07-01 |
+| 1d638cbd | chore: bump version to 0.8.0 | SKIP | Upstream versioning | 2026-07-01 |
 
 ---
 
@@ -301,6 +329,8 @@ gh pr create --title "chore: sync upstream <category>"
 ```
 
 ### When Cherry-Pick Fails
+
+> **"Can't cherry-pick cleanly" is never by itself a SKIP reason.** The fork routinely adapts upstream fixes by hand — a SKIP must stand on the change *not applying to fork code*, not on cherry-pick friction. If it applies, adapt it (or open a tracking issue to adapt it).
 
 If cherry-pick fails due to fork differences (e.g., GMSM removal):
 
