@@ -2919,5 +2919,109 @@ class TestContractFixtureKeys(unittest.TestCase):
         mock_delete.assert_called_once_with(_CONTRACT_FIXTURE['domain_name'])
 
 
+class TestAcmeStackCompat(unittest.TestCase):
+    """Mock-free fence for the acme/josepy/pyOpenSSL CSR-parsing contract.
+
+    pyOpenSSL>=24.0 removed OpenSSL.crypto.X509Req and load_certificate_request.
+    acme<3 (through josepy<2's ComparableX509) called them inside
+    ClientV2.new_order(), so with the pinned pyOpenSSL==26.3.0 every real cert
+    provision/renewal crashed with "module 'OpenSSL.crypto' has no attribute
+    'X509Req'" and marked custom domains `failed` — while pip resolution and the
+    fully-mocked tests above stayed green (none call the real new_order()).
+    acme>=3 / josepy>=2 parse CSRs with `cryptography` instead.
+
+    This drives a real CSR (built like request_certificate: single CN + SAN)
+    through the pinned acme's new_order() with only the HTTP transport mocked,
+    so a future dependency bump that reintroduces the removed pyOpenSSL APIs
+    fails here instead of silently in production.
+
+    Scope: it guards the specific CSR-parse crash site (new_order). The wider
+    acme surface the handler uses (account registration, DNS-01 challenge,
+    poll_and_finalize, fullchain_pem) stays mock-covered here and was verified
+    by hand against acme 5.6.0 for this bump.
+    """
+
+    def test_new_order_parses_csr_without_pyopenssl_x509req(self):
+        cm.lazy_import_acme()  # exercise the Lambda's own import path
+        from acme import client, messages
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        # josepy>=2 dropped the pyOpenSSL ComparableX509 wrapper.
+        self.assertFalse(hasattr(cm.josepy, 'ComparableX509'))
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        domain = 'regression.example.com'
+        csr_pem = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)]))
+            .add_extension(
+                x509.SubjectAlternativeName([x509.DNSName(domain)]), critical=False)
+            .sign(key, hashes.SHA256())
+            .public_bytes(serialization.Encoding.PEM)
+        )
+
+        acme_client = client.ClientV2(
+            messages.Directory({'newOrder': 'https://acme.test/new-order'}),
+            net=client.ClientNetwork(cm.josepy.JWKRSA(key=key)),
+        )
+
+        # new_order() parses the CSR into an order (the historic X509Req crash
+        # site) before its first _post. Assert our domain survived the parse —
+        # not merely that _post was reached — so the guard holds even if a future
+        # acme reorders parse vs. that _post.
+        class _StopBeforeHTTP(Exception):
+            pass
+
+        with patch.object(acme_client, '_post', side_effect=_StopBeforeHTTP) as mock_post:
+            with self.assertRaises(_StopBeforeHTTP):
+                acme_client.new_order(csr_pem)
+
+        # new_order() calls self._post(url, order) positionally, so args[1] is the
+        # order it built from the CSR. Coupled to the pinned acme's convention: a
+        # future acme passing order= as a kwarg would break this line, not the
+        # handler — fine for a version-pinned fence.
+        order = mock_post.call_args.args[1]
+        self.assertIn(domain, [ident.value for ident in order.identifiers])
+
+    def test_handler_acme_surface_resolves(self):
+        """The renewal path calls a wider acme surface than new_order (account
+        registration, DNS-01 challenge, poll_and_finalize) that stays fully
+        MOCKED in the tests above. Across the 2.11->5.6 jump (skipping 3.x/4.x)
+        any of these could have been renamed or removed — which would crash the
+        handler at runtime exactly like the X509Req bug, invisibly to the mocked
+        tests. Resolve every symbol the handler binds to so a drift fails in CI
+        instead of in production. This does NOT assert parameter names, so full
+        behaviour still rests on the mocked tests + hand verification against
+        acme 5.6.0."""
+        cm.lazy_import_acme()
+        import inspect
+        from acme import challenges, client, errors, messages
+
+        # (owner, attribute, signature_check) for every acme/josepy symbol the
+        # handler binds to. hasattr/callable catch a rename or removal; for the
+        # callables the handler passes arguments to, inspect.signature() also
+        # catches a replacement that is no longer introspectable (it does not
+        # check parameter names). Skip it for the exception/message classes.
+        for obj, attr, sig_check in [
+            (client, 'ClientNetwork', False), (client, 'ClientV2', False),
+            (client.ClientV2, 'new_order', True), (client.ClientV2, 'new_account', True),
+            (client.ClientV2, 'query_registration', True),
+            (client.ClientV2, 'answer_challenge', True), (client.ClientV2, 'poll_and_finalize', True),
+            (messages, 'Directory', False), (messages.Directory, 'from_json', True),
+            (messages, 'NewRegistration', False), (messages.NewRegistration, 'from_data', True),
+            (messages, 'RegistrationResource', False), (messages, 'Registration', False),
+            (challenges, 'DNS01', False), (errors, 'ConflictError', False),
+            (cm.josepy, 'JWKRSA', False),
+        ]:
+            self.assertTrue(hasattr(obj, attr), f'{obj!r} no longer has {attr}')
+            member = getattr(obj, attr)
+            self.assertTrue(callable(member), f'{attr} is not callable')
+            if sig_check:
+                inspect.signature(member)
+
+
 if __name__ == '__main__':
     unittest.main()

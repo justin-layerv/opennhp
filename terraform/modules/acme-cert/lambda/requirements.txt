@@ -10,11 +10,16 @@
 #
 # All packages must have manylinux2014_x86_64 wheels for Lambda compatibility.
 
-# ACME client library (Let's Encrypt protocol)
-acme==2.11.0
+# ACME client library. Keep >=3.0.0 in lockstep with josepy>=2.0.0 and pyOpenSSL
+# below: acme<3 (via josepy<2's ComparableX509) parsed CSRs with the
+# OpenSSL.crypto.X509Req APIs that pyOpenSSL>=24 removed — pip resolves the old
+# combo fine, but it crashes at runtime. acme>=3/josepy>=2 use `cryptography`.
+# The TestAcmeStackCompat fence (test_acme_cert_manager.py) + its docstring guard this.
+acme==5.6.0
 
-# JSON Object Signing and Encryption (ACME dependency)
-josepy==1.15.0
+# JSON Object Signing and Encryption (ACME dependency). >=2.0.0 dropped the
+# pyOpenSSL ComparableX509 wrapper — see the acme note above.
+josepy==2.2.0
 
 # Cryptography for key generation and certificate handling
 # Pinned >=49 in lockstep with pyOpenSSL 26.3.0 (requires cryptography<50,>=49).
@@ -23,8 +28,19 @@ cryptography==49.0.0
 # DNS resolver for propagation verification
 dnspython==2.8.0
 
-# Required transitive dependencies (with manylinux wheels)
+# Required transitive dependencies (with manylinux wheels). This list must be
+# the COMPLETE closure: build.sh installs the zip with `pip --no-deps` (strict,
+# fatal), so any transitive omitted here is silently absent from the Lambda
+# package and fails at runtime with ImportError.
+#
+# pyOpenSSL is still an acme dependency, but with acme>=3 nothing on our cert
+# path calls its removed X509Req/load_certificate_request APIs (see acme note).
 pyOpenSSL==26.3.0
+# typing_extensions is imported by pyOpenSSL 26.x (OpenSSL/SSL.py). acme.client
+# -> crypto_util -> OpenSSL pulls it in on the handler's import path, so it MUST
+# be listed for the --no-deps build (was previously only backfilled by build.sh's
+# non-fatal second pass).
+typing_extensions==4.16.0
 cffi>=2.0.0
 pycparser==2.23
 pyrfc3339==1.1

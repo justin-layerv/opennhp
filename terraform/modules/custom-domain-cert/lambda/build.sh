@@ -125,6 +125,32 @@ if [[ ! -f "${BUILD_DIR}/custom_domain_cert_manager.py" ]]; then
     exit 1
 fi
 
+# Import smoke: dir-presence (above) is not importability. This validates the
+# shipped ARTIFACT — it imports the handler's dependency graph from BUILD_DIR
+# under `python3 -S`, so it sees ONLY the zip (not the caller's site-packages: a
+# dev running this inside a venv that already has acme must not get a false pass)
+# and fails the build if anything is missing. It checks the built tree (the union
+# of the strict --no-deps pass and the non-fatal resolving pass), so it proves
+# the zip imports, NOT that the --no-deps list is a complete closure on its own.
+# Runs only where the manylinux2014 wheels load (Linux x86_64 + python
+# ${PYTHON_VERSION}); skipped elsewhere. The import list is the handler's load
+# path (incl. OpenSSL.crypto, reached transitively via acme) — extend it if the
+# handler starts importing a new top-level package.
+if [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] && \
+   python3 -c "import sys; sys.exit(0 if sys.version_info[:2]==(${PYTHON_VERSION/./, }) else 1)" 2>/dev/null; then
+    echo ""
+    echo "Verifying the built package imports..."
+    if ! PYTHONPATH="${BUILD_DIR}" python3 -S -c "import acme.client, acme.messages, acme.challenges, acme.errors, josepy, cryptography.x509, dns.resolver, OpenSSL.crypto"; then
+        echo "ERROR: built package failed to import — a dependency is missing from the zip."
+        echo "Add it to requirements.txt; the --no-deps install does not pull transitives."
+        exit 1
+    fi
+    echo "  [OK] built package imports cleanly"
+else
+    echo ""
+    echo "Skipping import smoke (needs Linux-x86_64 + python ${PYTHON_VERSION} to load the manylinux2014 wheels; host is $(uname -s)-$(uname -m))"
+fi
+
 # Restore .gitkeep placeholder
 cat > "${BUILD_DIR}/.gitkeep" << 'GITKEEP'
 # Placeholder for Lambda package. Populated by lambda/build.sh

@@ -4,9 +4,12 @@
 # Pin test tooling so promote-to-prod Lambda tests are reproducible across re-runs.
 pytest==9.1.1
 
-# AWS SDK (provided by Lambda runtime, needed for testing)
-boto3==1.43.29
-botocore==1.43.33
+# AWS SDK (provided by Lambda runtime, needed for testing).
+# Kept in lockstep with custom-domain-cert/lambda/requirements-test.txt: CI
+# installs both cert-lambda test requirement sets into one env, so divergent
+# boto3/botocore pins here would only ever be shadowed (last-write-wins).
+boto3==1.43.38
+botocore==1.43.38
 
 # The Lambda dependencies (for running tests)
 -r requirements.txt

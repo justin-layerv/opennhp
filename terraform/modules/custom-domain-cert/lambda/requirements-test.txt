@@ -1,13 +1,18 @@
 # Test-only dependencies for custom-domain-cert Lambda unit tests.
 #
-# These are NOT bundled into the Lambda zip — they're only installed in
-# CI and on developer machines. The runtime dependencies live in
-# requirements.txt.
+# The test tooling (pytest/boto3) is NOT bundled into the Lambda zip — it's
+# only installed in CI and on developer machines.
+#
+# The runtime deps are pulled in via `-r requirements.txt` so this suite is
+# self-sufficient: TestAcmeStackCompat drives a real CSR through the pinned
+# acme/josepy, so acme + cryptography must be importable wherever these tests
+# run (not only when a sibling module's install happens to seed them first).
 #
 # Pin versions explicitly so CI runs are reproducible across re-triggers
 # and so that an upstream pytest/boto3 release can't cause a surprise
 # test failure during a security-critical merge window.
 
+-r requirements.txt
 pytest==9.1.1
 boto3==1.43.38
 botocore==1.43.38
