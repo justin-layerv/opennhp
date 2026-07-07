@@ -23,15 +23,12 @@ acme_email         = "admin@layerv.xyz"
 ac_auth_service_id = "agent"
 ac_min_capacity    = 3
 ac_filter_mode     = 1
-# L3 flush-on-expiry rollout levers (docs/runbooks/l3-flush-*.md). Held at the
-# safe defaults so this stays pure plumbing — the scheduler is off, and dry-run
-# is the log-only guard for when it is first turned on. Drive the sandbox
-# rollout from here: flip enable=true (dry-run first), soak, then dry_run=false.
-enable_l3_flush_on_expiry = false
-l3_flush_dry_run          = true
-# Keep the netlink backend selectable through IaC for issue #2940 without
-# changing today's eBPF/XDP sandbox datapath or enabling L3 flush.
-l3_flush_conntrack_backend   = "netlink"
+# L3 flush-on-expiry sandbox rollout levers. Sandbox remains on
+# FilterMode=EBPFXDP, so enabled L3 flush uses BpfFlusher; the conntrack backend
+# knob is only load-bearing under FilterMode=IPTABLES.
+enable_l3_flush_on_expiry    = true
+l3_flush_dry_run             = false
+l3_flush_conntrack_backend   = "exec"
 l3_flush_conntrack_pool_size = 0
 # Two AC-protected resources, each a distinct identity per NHP spec
 # (CSA "Stealth Mode SDP" Appendix 2, NHP-KNK Message Fields):
