@@ -74,6 +74,7 @@ def _assert_renewal_metric_dimensions(mock_put_metric_data):
         cm.CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES,
         cm.CW_METRIC_RENEWAL_ORPHANED_CERTS,
         cm.CW_METRIC_RENEWAL_PROCESSING_FAILURES,
+        cm.CW_METRIC_RENEWAL_STATUS_RECOVERED,
     ):
         assert dimensions[metric_name] == expected
 
@@ -185,6 +186,11 @@ def test_renewal_metric_contract_matches_terraform_alarms():
             'period': 900,
             'evaluation_periods': 2,
             'datapoints_to_alarm': 2,
+        },
+        cm.CW_METRIC_RENEWAL_STATUS_RECOVERED: {
+            'period': 900,
+            'evaluation_periods': 1,
+            'datapoints_to_alarm': 1,
         },
     }
     for metric_name, contract in expected_count_alarm_contract.items():
@@ -984,7 +990,10 @@ class TestRenewalScan(unittest.TestCase):
         self._get_item_patcher = patch.object(cm.dynamodb_client, 'get_item')
         self.mock_get_item = self._get_item_patcher.start()
         self.mock_get_item.return_value = {
-            'Item': {'verification_token': {'S': 'lv_verify_test_token'}}
+            'Item': {
+                'status': {'S': cm.STATUS_ACTIVE},
+                'verification_token': {'S': 'lv_verify_test_token'},
+            }
         }
 
     def tearDown(self):
@@ -1011,7 +1020,52 @@ class TestRenewalScan(unittest.TestCase):
         result = cm.renewal_scan()
         assert result['renewed'] == 1
         assert result['scanned'] == 1
-        mock_provision.assert_called_once()
+        mock_provision.assert_called_once_with(
+            'expiring.com',
+            'expiring--com',
+            skip_sync=True,
+            emit_per_domain_signals=False,
+            mark_failed_on_error=False,
+            expected_verification_token='lv_verify_test_token',
+        )
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_RENEWAL)
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_due_renewal_falls_back_when_preloaded_domain_row_is_unavailable(
+        self, mock_list, mock_cw, mock_provision, mock_sync,
+    ):
+        """A transient pre-read DDB blip should not be counted as DNS ownership drift."""
+        del mock_cw
+        self.mock_get_item.side_effect = ClientError(
+            {'Error': {'Code': 'ProvisionedThroughputExceededException', 'Message': 'throttled'}},
+            'GetItem',
+        )
+        mock_list.return_value = [
+            {
+                'Name': '/nhp/certs/expiring.com/meta',
+                'Value': json.dumps({
+                    'expires_at': '2026-03-15T00:00:00+00:00',
+                    'acme_subdomain': 'expiring--com',
+                }),
+            },
+        ]
+        mock_provision.return_value = {'status': 'provisioned'}
+
+        result = cm.renewal_scan()
+
+        assert result['renewed'] == 1
+        assert result['dns_ownership_failed'] == 0
+        assert result['orphaned'] == 0
+        mock_provision.assert_called_once_with(
+            'expiring.com',
+            'expiring--com',
+            skip_sync=True,
+            emit_per_domain_signals=False,
+            mark_failed_on_error=False,
+        )
         mock_sync.assert_called_once_with(cm.BATCH_SYNC_RENEWAL)
 
     @patch('custom_domain_cert_manager.trigger_cert_sync')
@@ -1092,6 +1146,8 @@ class TestRenewalScan(unittest.TestCase):
             'no-acme--com',
             skip_sync=True,
             emit_per_domain_signals=False,
+            mark_failed_on_error=False,
+            expected_verification_token='lv_verify_test_token',
         )
 
     @patch.object(cm.cloudwatch_client, 'put_metric_data')
@@ -1169,7 +1225,12 @@ class TestRenewalScan(unittest.TestCase):
                 }),
             },
         ]
-        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_renewed'}}}
+        mock_get.return_value = {
+            'Item': {
+                'status': {'S': cm.STATUS_ACTIVE},
+                'verification_token': {'S': 'lv_verify_renewed'},
+            }
+        }
         mock_provision.return_value = {'status': cm.RESULT_PROVISIONED}
 
         result = cm.renewal_scan()
@@ -1183,6 +1244,8 @@ class TestRenewalScan(unittest.TestCase):
             'renewed--com',
             skip_sync=True,
             emit_per_domain_signals=False,
+            mark_failed_on_error=False,
+            expected_verification_token='lv_verify_renewed',
         )
         mock_sync.assert_called_once_with(cm.BATCH_SYNC_RENEWAL)
         mock_failure_metric.assert_not_called()
@@ -1258,11 +1321,12 @@ class TestRenewalScan(unittest.TestCase):
     @patch.object(cm, 'publish_failure_metric')
     @patch('custom_domain_cert_manager.trigger_cert_sync')
     @patch('custom_domain_cert_manager.provision_certificate')
+    @patch('custom_domain_cert_manager.recover_failed_domain_with_valid_cert')
     @patch.object(cm.cloudwatch_client, 'put_metric_data')
     @patch('custom_domain_cert_manager.list_cert_meta_params')
     def test_processing_failure_is_scan_aggregate(
-        self, mock_list, mock_cw, mock_provision, mock_sync, mock_failure_metric,
-        mock_alert,
+        self, mock_list, mock_cw, mock_recover, mock_provision, mock_sync,
+        mock_failure_metric, mock_alert,
     ):
         """Scheduled renewal infra faults should aggregate without per-domain paging."""
         expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
@@ -1275,10 +1339,12 @@ class TestRenewalScan(unittest.TestCase):
                 }),
             },
         ]
+        mock_recover.return_value = False
         mock_provision.side_effect = Exception('kms throttle')
 
         result = cm.renewal_scan()
 
+        assert result['status_recovered'] == 0
         assert result['failed'] == 1
         assert result['dns_ownership_failed'] == 0
         assert result['renewed'] == 0
@@ -1290,6 +1356,125 @@ class TestRenewalScan(unittest.TestCase):
         assert metric_values[cm.CW_METRIC_RENEWAL_SCAN_RUNS] == 1
         assert metric_values[cm.CW_METRIC_RENEWAL_ORPHANED_CERTS] == 0
         assert metric_values[cm.CW_METRIC_RENEWAL_PROCESSING_FAILURES] == 1
+        assert metric_values[cm.CW_METRIC_RENEWAL_STATUS_RECOVERED] == 0
+        _assert_renewal_metric_dimensions(mock_cw)
+        mock_recover.assert_called_once()
+
+    @patch('custom_domain_cert_manager._verify_dns_ownership_txt')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_recovery_dns_resolution_fault_does_not_skip_due_renewal(
+        self, mock_list, mock_cw, mock_provision, mock_sync, mock_verify_txt,
+    ):
+        del mock_cw
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        self.mock_get_item.return_value = {
+            'Item': {
+                'status': {'S': cm.STATUS_FAILED},
+                'verification_token': {'S': 'lv_verify_test_token'},
+            }
+        }
+        mock_list.return_value = [
+            {
+                'Name': '/nhp/certs/failed-due.com/meta',
+                'Value': json.dumps({
+                    'expires_at': expiring,
+                    'acme_subdomain': 'failed-due--com',
+                }),
+            },
+        ]
+        mock_verify_txt.side_effect = cm.DnsOwnershipResolutionError('SERVFAIL')
+        mock_provision.return_value = {'status': 'provisioned'}
+
+        result = cm.renewal_scan()
+
+        assert result['status_recovered'] == 0
+        assert result['failed'] == 0
+        assert result['renewed'] == 1
+        mock_verify_txt.assert_called_once_with('failed-due.com', 'lv_verify_test_token')
+        mock_provision.assert_called_once_with(
+            'failed-due.com',
+            'failed-due--com',
+            skip_sync=True,
+            emit_per_domain_signals=False,
+            mark_failed_on_error=False,
+            expected_verification_token='lv_verify_test_token',
+        )
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_RENEWAL)
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch('custom_domain_cert_manager.recover_failed_domain_with_valid_cert')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_recovered_domain_still_attempts_due_renewal_and_records_aggregate_failure(
+        self, mock_list, mock_cw, mock_recover, mock_provision, mock_sync,
+        mock_failure_metric, mock_alert,
+    ):
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        mock_list.return_value = [
+            {
+                'Name': '/nhp/certs/recovered.com/meta',
+                'Value': json.dumps({
+                    'expires_at': expiring,
+                    'acme_subdomain': 'recovered--com',
+                }),
+            },
+        ]
+        mock_recover.return_value = True
+        mock_provision.side_effect = Exception('kms throttle')
+
+        result = cm.renewal_scan()
+
+        assert result['status_recovered'] == 1
+        assert result['failed'] == 1
+        assert result['renewed'] == 0
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_RENEWAL)
+        mock_failure_metric.assert_not_called()
+        mock_alert.assert_not_called()
+        metric_values = _metric_values(mock_cw)
+        assert metric_values[cm.CW_METRIC_RENEWAL_STATUS_RECOVERED] == 1
+        assert metric_values[cm.CW_METRIC_RENEWAL_PROCESSING_FAILURES] == 1
+        _assert_renewal_metric_dimensions(mock_cw)
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch('custom_domain_cert_manager.recover_failed_domain_with_valid_cert')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_recovered_domain_syncs_even_when_not_due_for_renewal(
+        self, mock_list, mock_cw, mock_recover, mock_provision, mock_sync,
+        mock_failure_metric, mock_alert,
+    ):
+        future = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+        mock_list.return_value = [
+            {
+                'Name': '/nhp/certs/recovered-valid.com/meta',
+                'Value': json.dumps({
+                    'expires_at': future,
+                    'acme_subdomain': 'recovered-valid--com',
+                }),
+            },
+        ]
+        mock_recover.return_value = True
+
+        result = cm.renewal_scan()
+
+        assert result['status_recovered'] == 1
+        assert result['renewed'] == 0
+        assert result['skipped'] == 1
+        mock_provision.assert_not_called()
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_RENEWAL)
+        mock_failure_metric.assert_not_called()
+        mock_alert.assert_not_called()
+        metric_values = _metric_values(mock_cw)
+        assert metric_values[cm.CW_METRIC_RENEWAL_STATUS_RECOVERED] == 1
         _assert_renewal_metric_dimensions(mock_cw)
 
     @patch.object(cm.cloudwatch_client, 'put_metric_data')
@@ -1306,6 +1491,7 @@ class TestRenewalScan(unittest.TestCase):
             cm.CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES: 0,
             cm.CW_METRIC_RENEWAL_ORPHANED_CERTS: 0,
             cm.CW_METRIC_RENEWAL_PROCESSING_FAILURES: 0,
+            cm.CW_METRIC_RENEWAL_STATUS_RECOVERED: 0,
         }
         _assert_renewal_metric_dimensions(mock_cw)
 
@@ -1390,8 +1576,16 @@ class TestCheckOrphanForMeta(unittest.TestCase):
 
     @patch.object(cm.dynamodb_client, 'get_item')
     def test_returns_none_for_valid_managed_row(self, mock_get):
-        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc'}}}
+        mock_get.return_value = {
+            'Item': {
+                'status': {'S': cm.STATUS_ACTIVE},
+                'verification_token': {'S': 'lv_verify_abc'},
+            }
+        }
         assert cm.check_orphan_for_meta('managed.com') is None
+        reason, item = cm._managed_domain_row_for_meta('managed.com')
+        assert reason is None
+        assert item == mock_get.return_value['Item']
 
     @patch.object(cm.dynamodb_client, 'get_item')
     def test_orphan_when_row_missing(self, mock_get):
@@ -1829,7 +2023,7 @@ class TestVerifyDnsOwnership(unittest.TestCase):
             {'Error': {'Code': 'InternalServerError', 'Message': 'boom'}},
             'GetItem',
         )
-        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+        with self.assertRaises(cm.DnsOwnershipResolutionError) as ctx:
             cm.verify_dns_ownership('example.com')
         msg = str(ctx.exception)
         assert 'Failed to fetch' in msg
@@ -1872,7 +2066,7 @@ class TestVerifyDnsOwnership(unittest.TestCase):
         mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc123'}}}
         stub_resolver, _ = _install_dns_stubs()
         stub_resolver.Resolver.return_value.resolve.side_effect = _StubTimeout()
-        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+        with self.assertRaises(cm.DnsOwnershipResolutionError) as ctx:
             cm.verify_dns_ownership('slow.com')
         assert 'timed out' in str(ctx.exception)
 
@@ -1885,7 +2079,7 @@ class TestVerifyDnsOwnership(unittest.TestCase):
             pass
 
         stub_resolver.Resolver.return_value.resolve.side_effect = _NoNameservers()
-        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+        with self.assertRaises(cm.DnsOwnershipResolutionError) as ctx:
             cm.verify_dns_ownership('broken.com')
         assert 'could not resolve' in str(ctx.exception)
         # Type name surfaces but raw exception args do not.
@@ -1910,6 +2104,17 @@ class TestVerifyDnsOwnership(unittest.TestCase):
         mock_rdata.strings = (b'lv_verify_abc123',)
         stub_resolver.Resolver.return_value.resolve.return_value = [mock_rdata]
         cm.verify_dns_ownership('good.com')
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_passes_with_preloaded_token_without_dynamodb_read(self, mock_get):
+        stub_resolver, _ = _install_dns_stubs()
+        mock_rdata = MagicMock()
+        mock_rdata.strings = (b'lv_verify_preloaded',)
+        stub_resolver.Resolver.return_value.resolve.return_value = [mock_rdata]
+
+        cm.verify_dns_ownership('good.com', 'lv_verify_preloaded')
+
+        mock_get.assert_not_called()
 
     @patch.object(cm.dynamodb_client, 'get_item')
     def test_passes_with_multistring_txt(self, mock_get):
@@ -2155,6 +2360,130 @@ class TestFailureCategoryMetrics(unittest.TestCase):
         mock_metric.assert_called_once_with(cm.FAILURE_CERT_STORAGE)
         mock_release.assert_called_once_with("example.com")
 
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
+    @patch('custom_domain_cert_manager.record_domain_renewal_failure')
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.request_certificate')
+    @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
+    @patch('custom_domain_cert_manager.lazy_import_acme')
+    @patch('custom_domain_cert_manager.verify_dns_ownership')
+    def test_renewal_acme_failure_preserves_active_status(
+        self, mock_verify, mock_import, mock_lock, mock_acme, mock_request,
+        mock_status, mock_alert, mock_metric, mock_record, mock_release,
+    ):
+        """Renewal ACME failures must not mark an otherwise-valid domain failed."""
+        del mock_verify, mock_import, mock_lock, mock_acme  # @patch suppresses side effects only
+        mock_request.side_effect = Exception("rateLimited: duplicate certificate limit")
+
+        with patch.object(cm, 'cryptography', self._mock_cryptography()):
+            with self.assertRaises(Exception):
+                cm.provision_certificate(
+                    "example.com",
+                    "example--com",
+                    emit_per_domain_signals=False,
+                    mark_failed_on_error=False,
+                )
+
+        mock_status.assert_not_called()
+        mock_record.assert_called_once_with("example.com", "rateLimited: duplicate certificate limit")
+        mock_alert.assert_not_called()
+        mock_metric.assert_not_called()
+        mock_release.assert_called_once_with("example.com")
+
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
+    @patch('custom_domain_cert_manager.record_domain_renewal_failure')
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.request_certificate')
+    @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
+    @patch('custom_domain_cert_manager.lazy_import_acme')
+    @patch('custom_domain_cert_manager.verify_dns_ownership')
+    def test_renewal_dns_validation_failure_preserves_active_status(
+        self, mock_verify, mock_import, mock_lock, mock_acme, mock_request,
+        mock_status, mock_alert, mock_metric, mock_record, mock_release,
+    ):
+        """Renewal DNS-01 validation faults are operational, not a reason to demote status."""
+        del mock_verify, mock_import, mock_lock, mock_acme  # @patch suppresses side effects only
+        mock_request.side_effect = cm.DnsValidationError("TXT record not found")
+
+        with patch.object(cm, 'cryptography', self._mock_cryptography()):
+            with self.assertRaises(cm.DnsValidationError):
+                cm.provision_certificate(
+                    "example.com",
+                    "example--com",
+                    emit_per_domain_signals=False,
+                    mark_failed_on_error=False,
+                )
+
+        mock_status.assert_not_called()
+        mock_record.assert_called_once_with("example.com", "TXT record not found")
+        mock_alert.assert_not_called()
+        mock_metric.assert_not_called()
+        mock_release.assert_called_once_with("example.com")
+
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
+    @patch('custom_domain_cert_manager.record_domain_renewal_failure')
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
+    @patch('custom_domain_cert_manager.verify_dns_ownership')
+    def test_renewal_dns_resolution_failure_preserves_active_status(
+        self, mock_verify, mock_lock, mock_status, mock_alert, mock_metric,
+        mock_record, mock_release,
+    ):
+        """Resolver outages during renewal are operational faults, not ownership drift."""
+        del mock_lock
+        mock_verify.side_effect = cm.DnsOwnershipResolutionError("SERVFAIL")
+
+        with self.assertRaises(cm.DnsOwnershipResolutionError):
+            cm.provision_certificate(
+                "example.com",
+                "example--com",
+                emit_per_domain_signals=False,
+                mark_failed_on_error=False,
+            )
+
+        mock_status.assert_not_called()
+        mock_record.assert_called_once_with("example.com", "SERVFAIL")
+        mock_alert.assert_not_called()
+        mock_metric.assert_not_called()
+        mock_release.assert_called_once_with("example.com")
+
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
+    @patch('custom_domain_cert_manager.record_domain_renewal_failure')
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
+    @patch('custom_domain_cert_manager.verify_dns_ownership')
+    def test_renewal_dns_ownership_failure_still_marks_failed(
+        self, mock_verify, mock_lock, mock_status, mock_alert, mock_metric,
+        mock_record, mock_release,
+    ):
+        """Ownership drift is security-relevant, so renewal mode still fails closed."""
+        del mock_lock  # @patch suppresses side effects only
+        mock_verify.side_effect = cm.DnsOwnershipError("TXT mismatch")
+
+        with self.assertRaises(cm.DnsOwnershipError):
+            cm.provision_certificate(
+                "example.com",
+                "example--com",
+                emit_per_domain_signals=False,
+                mark_failed_on_error=False,
+            )
+
+        mock_status.assert_called_once_with("example.com", cm.STATUS_FAILED, error="TXT mismatch")
+        mock_record.assert_not_called()
+        mock_alert.assert_not_called()
+        mock_metric.assert_not_called()
+        mock_release.assert_called_once_with("example.com")
+
     @patch('custom_domain_cert_manager.publish_failure_metric')
     @patch.object(cm.dynamodb_client, 'query')
     def test_dynamodb_failure_in_provision_pending_publishes_metric(
@@ -2210,6 +2539,300 @@ class TestFailureCategoryMetrics(unittest.TestCase):
         # Should be called exactly once (in provision_certificate), not twice
         mock_metric.assert_called_once_with(cm.FAILURE_DNS_VALIDATION)
 
+
+class TestRenewalFailureDiagnostics(unittest.TestCase):
+    """Tests for recording renewal failures without changing domain status."""
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_records_renewal_failure_without_status_update(self, mock_update):
+        cm.record_domain_renewal_failure('example.com', 'rateLimited' * 100)
+
+        kw = mock_update.call_args.kwargs
+        assert kw['TableName'] == cm.QURL_DOMAINS_TABLE
+        assert kw['Key'] == {'domain': {'S': 'example.com'}}
+        assert kw['ConditionExpression'] == 'attribute_exists(#d)'
+        assert kw['ExpressionAttributeNames']['#d'] == 'domain'
+        assert '#s' not in kw['ExpressionAttributeNames']
+        assert 'status' not in kw['ExpressionAttributeNames'].values()
+        assert cm.FIELD_LAST_RENEWAL_FAILED_AT in kw['ExpressionAttributeNames'].values()
+        assert cm.FIELD_LAST_RENEWAL_FAILURE_REASON in kw['ExpressionAttributeNames'].values()
+        assert len(kw['ExpressionAttributeValues'][':reason']['S']) == 500
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_renewal_failure_diagnostics_skip_deleted_rows(self, mock_update):
+        mock_update.side_effect = ClientError(
+            {'Error': {'Code': 'ConditionalCheckFailedException', 'Message': ''}},
+            'UpdateItem',
+        )
+
+        with patch.object(cm, 'logger') as mock_logger:
+            cm.record_domain_renewal_failure('example.com', 'rateLimited')
+
+        mock_logger.info.assert_called_once()
+        mock_logger.error.assert_not_called()
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_active_status_clears_stale_failure_reason(self, mock_update):
+        cm.update_domain_status(
+            'example.com',
+            cm.STATUS_ACTIVE,
+            cert_param_prefix='/nhp/certs/example.com',
+            cert_expires_at='2026-07-20T21:02:09+00:00',
+        )
+
+        kw = mock_update.call_args.kwargs
+        assert '#err' in kw['ExpressionAttributeNames']
+        assert kw['ExpressionAttributeNames']['#err'] == 'failure_reason'
+        assert kw['ExpressionAttributeNames']['#lrfa'] == cm.FIELD_LAST_RENEWAL_FAILED_AT
+        assert kw['ExpressionAttributeNames']['#lrfr'] == cm.FIELD_LAST_RENEWAL_FAILURE_REASON
+        assert 'REMOVE' in kw['UpdateExpression']
+        assert '#err' in kw['UpdateExpression']
+        assert '#lrfa' in kw['UpdateExpression']
+        assert '#lrfr' in kw['UpdateExpression']
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_active_status_can_be_conditioned_on_failed_status(self, mock_update):
+        updated = cm.update_domain_status(
+            'example.com',
+            cm.STATUS_ACTIVE,
+            cert_param_prefix='/nhp/certs/example.com',
+            cert_expires_at='2026-07-20T21:02:09+00:00',
+            expected_status=cm.STATUS_FAILED,
+        )
+
+        assert updated is True
+        kw = mock_update.call_args.kwargs
+        assert kw['ConditionExpression'] == '#s = :expected_status'
+        assert kw['ExpressionAttributeNames']['#s'] == 'status'
+        assert kw['ExpressionAttributeValues'][':expected_status'] == {'S': cm.STATUS_FAILED}
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_active_status_can_preserve_original_activation_time(self, mock_update):
+        updated = cm.update_domain_status(
+            'example.com',
+            cm.STATUS_ACTIVE,
+            cert_param_prefix='/nhp/certs/example.com',
+            cert_expires_at='2026-07-20T21:02:09+00:00',
+            set_activated_at=False,
+        )
+
+        assert updated is True
+        kw = mock_update.call_args.kwargs
+        assert '#aa' not in kw['ExpressionAttributeNames']
+        assert ':activated_at' not in kw['ExpressionAttributeValues']
+        assert 'activated_at' not in kw['UpdateExpression']
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_update_domain_status_returns_false_on_conditional_race(self, mock_update):
+        mock_update.side_effect = ClientError(
+            {'Error': {'Code': 'ConditionalCheckFailedException', 'Message': ''}},
+            'UpdateItem',
+        )
+
+        with patch.object(cm, 'logger') as mock_logger:
+            updated = cm.update_domain_status(
+                'example.com',
+                cm.STATUS_ACTIVE,
+                cert_param_prefix='/nhp/certs/example.com',
+                cert_expires_at='2026-07-20T21:02:09+00:00',
+                expected_status=cm.STATUS_FAILED,
+            )
+
+        assert updated is False
+        mock_logger.info.assert_called_once()
+        mock_logger.error.assert_not_called()
+
+
+class TestFailedDomainRecovery(unittest.TestCase):
+    """Tests for recovering failed rows that still have valid cert material."""
+
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_cert_material_exists_checks_key_and_chain_without_decryption(self, mock_get):
+        mock_get.return_value = {'Parameter': {'Name': 'present'}}
+
+        assert cm.cert_material_exists('example.com') is True
+
+        assert mock_get.call_args_list == [
+            call(Name='/nhp/certs/example.com/key', WithDecryption=False),
+            call(Name='/nhp/certs/example.com/chain', WithDecryption=False),
+        ]
+
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_cert_material_exists_returns_false_when_key_or_chain_missing(self, mock_get):
+        mock_get.side_effect = ClientError(
+            {'Error': {'Code': 'ParameterNotFound', 'Message': 'missing'}},
+            'GetParameter',
+        )
+
+        assert cm.cert_material_exists('example.com') is False
+
+    @patch.object(cm.ssm_client, 'get_parameter')
+    def test_cert_material_exists_returns_false_on_non_client_ssm_error(self, mock_get):
+        mock_get.side_effect = RuntimeError('network unavailable')
+
+        assert cm.cert_material_exists('example.com') is False
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.cert_material_exists')
+    @patch('custom_domain_cert_manager._verify_dns_ownership_txt')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_recovers_failed_row_with_valid_cert_and_dns_ownership(
+        self, mock_get, mock_verify_txt, mock_material_exists, mock_status,
+    ):
+        mock_material_exists.return_value = True
+        mock_status.return_value = True
+        expires_at = datetime.now(timezone.utc) + timedelta(days=10)
+        expires_at_str = expires_at.isoformat()
+        domain_item = {
+            'status': {'S': cm.STATUS_FAILED},
+            'verification_token': {'S': 'lv_verify_test'},
+        }
+
+        recovered = cm.recover_failed_domain_with_valid_cert(
+            'example.com',
+            expires_at,
+            expires_at_str,
+            datetime.now(timezone.utc),
+            domain_item,
+        )
+
+        assert recovered is True
+        mock_get.assert_not_called()
+        mock_verify_txt.assert_called_once_with('example.com', 'lv_verify_test')
+        mock_material_exists.assert_called_once_with('example.com')
+        mock_status.assert_called_once_with(
+            'example.com',
+            cm.STATUS_ACTIVE,
+            cert_param_prefix='/nhp/certs/example.com',
+            cert_expires_at=expires_at_str,
+            expected_status=cm.STATUS_FAILED,
+            set_activated_at=False,
+        )
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager._verify_dns_ownership_txt')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_does_not_recover_failed_row_when_dns_ownership_fails(
+        self, mock_get, mock_verify_txt, mock_status,
+    ):
+        expires_at = datetime.now(timezone.utc) + timedelta(days=10)
+        mock_get.return_value = {
+            'Item': {
+                'status': {'S': cm.STATUS_FAILED},
+                'verification_token': {'S': 'lv_verify_test'},
+            }
+        }
+        mock_verify_txt.side_effect = cm.DnsOwnershipError('TXT mismatch')
+
+        recovered = cm.recover_failed_domain_with_valid_cert(
+            'example.com',
+            expires_at,
+            expires_at.isoformat(),
+            datetime.now(timezone.utc),
+        )
+
+        assert recovered is False
+        mock_status.assert_not_called()
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.cert_material_exists')
+    @patch('custom_domain_cert_manager._verify_dns_ownership_txt')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_does_not_raise_when_recovery_dns_resolution_is_unavailable(
+        self, mock_get, mock_verify_txt, mock_material_exists, mock_status,
+    ):
+        expires_at = datetime.now(timezone.utc) + timedelta(days=10)
+        mock_get.return_value = {
+            'Item': {
+                'status': {'S': cm.STATUS_FAILED},
+                'verification_token': {'S': 'lv_verify_test'},
+            }
+        }
+        mock_verify_txt.side_effect = cm.DnsOwnershipResolutionError('SERVFAIL')
+
+        recovered = cm.recover_failed_domain_with_valid_cert(
+            'example.com',
+            expires_at,
+            expires_at.isoformat(),
+            datetime.now(timezone.utc),
+        )
+
+        assert recovered is False
+        mock_verify_txt.assert_called_once_with('example.com', 'lv_verify_test')
+        mock_material_exists.assert_not_called()
+        mock_status.assert_not_called()
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager._verify_dns_ownership_txt')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_does_not_recover_non_failed_or_expired_rows(
+        self, mock_get, mock_verify_txt, mock_status,
+    ):
+        mock_get.return_value = {'Item': {'status': {'S': cm.STATUS_ACTIVE}}}
+        future = datetime.now(timezone.utc) + timedelta(days=10)
+        expired = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+        assert cm.recover_failed_domain_with_valid_cert(
+            'example.com', future, future.isoformat(), datetime.now(timezone.utc)) is False
+        assert cm.recover_failed_domain_with_valid_cert(
+            'example.com', expired, expired.isoformat(), datetime.now(timezone.utc)) is False
+        mock_verify_txt.assert_not_called()
+        mock_status.assert_not_called()
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.cert_material_exists')
+    @patch('custom_domain_cert_manager._verify_dns_ownership_txt')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_does_not_recover_failed_row_when_cert_material_is_missing(
+        self, mock_get, mock_verify_txt, mock_material_exists, mock_status,
+    ):
+        expires_at = datetime.now(timezone.utc) + timedelta(days=10)
+        mock_get.return_value = {
+            'Item': {
+                'status': {'S': cm.STATUS_FAILED},
+                'verification_token': {'S': 'lv_verify_test'},
+            }
+        }
+        mock_material_exists.return_value = False
+
+        recovered = cm.recover_failed_domain_with_valid_cert(
+            'example.com',
+            expires_at,
+            expires_at.isoformat(),
+            datetime.now(timezone.utc),
+        )
+
+        assert recovered is False
+        mock_verify_txt.assert_called_once_with('example.com', 'lv_verify_test')
+        mock_status.assert_not_called()
+
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.cert_material_exists')
+    @patch('custom_domain_cert_manager._verify_dns_ownership_txt')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_does_not_report_recovered_when_status_write_loses_race(
+        self, mock_get, mock_verify_txt, mock_material_exists, mock_status,
+    ):
+        expires_at = datetime.now(timezone.utc) + timedelta(days=10)
+        mock_get.return_value = {
+            'Item': {
+                'status': {'S': cm.STATUS_FAILED},
+                'verification_token': {'S': 'lv_verify_test'},
+            }
+        }
+        mock_material_exists.return_value = True
+        mock_status.return_value = False
+
+        recovered = cm.recover_failed_domain_with_valid_cert(
+            'example.com',
+            expires_at,
+            expires_at.isoformat(),
+            datetime.now(timezone.utc),
+        )
+
+        assert recovered is False
+        mock_verify_txt.assert_called_once_with('example.com', 'lv_verify_test')
+        mock_material_exists.assert_called_once_with('example.com')
 
 
 class TestProvisioningIdempotencyLock(unittest.TestCase):

@@ -717,6 +717,13 @@ locals {
       evaluation_periods  = 2
       datapoints_to_alarm = 2
     }
+    "RenewalStatusRecovered" = {
+      slug                = "renewal-status-recovered"
+      description         = "Scheduled renewal scan recovered a custom-domain row that was failed while SSM still had a valid cert and DNS ownership still verified; treat as self-healing evidence that the demotion failure mode occurred, not as a renewal failure (per-environment/cell scan-level count; see docs/runbooks/custom-domain-cert-dns-ownership.md)"
+      period              = 900
+      evaluation_periods  = 1
+      datapoints_to_alarm = 1
+    }
   }
 }
 
@@ -772,7 +779,7 @@ resource "aws_cloudwatch_metric_alarm" "cert_renewal_scan_counts" {
     CellID      = var.cell_id
   }
 
-  # Three OKs per env/cell clear (one per renewal metric), not one per cert.
+  # Four OKs per env/cell clear (one per renewal metric), not one per cert.
   alarm_actions = [local.sns_topic_arn]
   ok_actions    = [local.sns_topic_arn]
 

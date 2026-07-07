@@ -11,6 +11,7 @@ Or these scheduled renewal aggregate alarms:
 - `layerv-nhp-prod-cert-renewal-dns-ownership-failures`
 - `layerv-nhp-prod-cert-renewal-orphaned-certs`
 - `layerv-nhp-prod-cert-renewal-processing-failures`
+- `layerv-nhp-prod-cert-renewal-status-recovered`
 - `layerv-nhp-prod-cert-renewal-scan-missing`
 
 ## What This Means
@@ -40,14 +41,25 @@ environment's domain state, or restore that environment's verification TXT. Do
 not suppress the smoke failure without accepting the stale-renewal risk.
 
 Scheduled renewal scans publish scan-level counts for DNS ownership failures,
-orphaned cert metadata, and other processing failures. They do not publish one
-`ProvisioningFailures` datapoint or SNS message per affected cert; the matching
-CloudWatch alarms keep their previous state while no scan datapoint exists and
-clear only after a later scan reports zero. The Lambda still updates the
-per-domain `qurl-domains` status and `failure_reason` during scheduled renewal
+orphaned cert metadata, other processing failures, and failed rows recovered
+because SSM still has a valid cert while DNS ownership still verifies. They do
+not publish one `ProvisioningFailures` datapoint or SNS message per affected
+cert; the matching CloudWatch alarms keep their previous state while no scan
+datapoint exists and clear only after a later scan reports zero. The Lambda
+still updates the per-domain `qurl-domains` row during scheduled renewal
 failures so support can diagnose the affected domain without paging once per
-cert. The scan metrics and alarms are dimensioned by `Environment` and `CellID`
-so future cells do not aggregate into the same alarm stream.
+cert. DNS ownership drift still moves the domain to `status=failed`;
+non-ownership processing failures such as ACME rate limits, KMS/SSM/DDB faults,
+DNS-01 validation faults, DNS resolver outages, or sync errors leave the current
+status and `cert_expires_at` intact and write
+`last_renewal_failed_at` / `last_renewal_failure_reason` instead, so a still-valid
+active cert keeps serving until expiry. To deliberately disable a custom domain,
+use the normal qurl-service domain delete/offboard flow so the row and SSM cert
+material are cleaned up together; do not leave a bare `status=failed` row with
+valid SSM key/chain material, because the recovery guard treats that state as an
+erroneous renewal demotion once DNS ownership still verifies. The scan metrics
+and alarms are dimensioned by `Environment` and `CellID` so future cells do not
+aggregate into the same alarm stream.
 If scan count metric publishing fails after the Lambda's in-process retries, the
 Lambda Errors alarm may be the only renewal page for that cycle; use the Lambda
 logs to find any per-category renewal failures and confirm the next scan
@@ -178,6 +190,7 @@ AWS_PROFILE=layerv-prod aws cloudwatch describe-alarms \
     layerv-nhp-prod-cert-renewal-dns-ownership-failures \
     layerv-nhp-prod-cert-renewal-orphaned-certs \
     layerv-nhp-prod-cert-renewal-processing-failures \
+    layerv-nhp-prod-cert-renewal-status-recovered \
     layerv-nhp-prod-cert-renewal-scan-missing
 ```
 

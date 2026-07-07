@@ -158,6 +158,11 @@ class DnsOwnershipError(Exception):
     pass
 
 
+class DnsOwnershipResolutionError(Exception):
+    """Raised when public DNS cannot answer the ownership TXT check."""
+    pass
+
+
 class RenewalScanMetricPublishError(Exception):
     """Raised after renewal work when scan-level CloudWatch telemetry failed."""
     pass
@@ -169,6 +174,13 @@ FIELD_ACCOUNT_KEY = 'account_key'
 FIELD_EXPIRES_AT = 'expires_at'
 FIELD_DOMAIN = 'domain'
 FIELD_ACME_SUBDOMAIN = 'acme_subdomain'
+
+# qurl-domains renewal diagnostic field names. These are separate from the
+# customer-facing failure_reason/status pair so a failed renewal attempt cannot
+# demote an otherwise-valid active domain.
+FIELD_LAST_RENEWAL_FAILED_AT = 'last_renewal_failed_at'
+FIELD_LAST_RENEWAL_FAILURE_REASON = 'last_renewal_failure_reason'
+FAILURE_REASON_MAX = 500
 
 # CloudWatch metric constants (must match alarm definitions in main.tf)
 CW_NAMESPACE = 'NHP/CustomDomainCerts'
@@ -183,6 +195,7 @@ CW_METRIC_RENEWAL_SCAN_RUNS = 'RenewalScanRuns'
 CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES = 'RenewalDnsOwnershipFailures'
 CW_METRIC_RENEWAL_ORPHANED_CERTS = 'RenewalOrphanedCerts'
 CW_METRIC_RENEWAL_PROCESSING_FAILURES = 'RenewalProcessingFailures'
+CW_METRIC_RENEWAL_STATUS_RECOVERED = 'RenewalStatusRecovered'
 RENEWAL_SCAN_METRIC_RETRY_DELAYS_SECONDS = (1, 2)
 
 # Failure category constants — published as the FailureCategory dimension on
@@ -637,8 +650,8 @@ def _txt_rdata_to_string(rdata: Any) -> str:
     return str(rdata).strip('"')
 
 
-def check_orphan_for_meta(domain: str) -> Optional[str]:
-    """Detect SSM ↔ qurl-domains drift before doing any renewal work for a domain.
+def _managed_domain_row_for_meta(domain: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Read and validate the managed qurl-domains row for an SSM /meta cert.
 
     Reconciliation safety net (Option B from qurl-service#148 / nhp#1990): if a
     domain has SSM cert material but no managed qurl-domains row, the cleanup
@@ -655,18 +668,20 @@ def check_orphan_for_meta(domain: str) -> Optional[str]:
         domain: The custom domain to check.
 
     Returns:
-        A short reason string if the SSM cert is orphaned, or None if a valid
-        managed row exists. Transient DDB errors (ClientError) return None to
-        avoid spurious orphan alerts during a DDB blip — the next scan
-        (15 min later) will re-evaluate.
+        (reason, item), where reason is a short string if the SSM cert is
+        orphaned, otherwise None, and item is the strongly-consistent
+        qurl-domains row read for non-orphaned domains. Transient DDB errors
+        (ClientError) return (None, None) to avoid spurious orphan alerts
+        during a DDB blip — the next scan (15 min later) will re-evaluate.
     """
     if not QURL_DOMAINS_TABLE:
-        return None
+        return None, None
     try:
         response = dynamodb_client.get_item(
             TableName=QURL_DOMAINS_TABLE,
             Key={'domain': {'S': domain}},
-            ProjectionExpression='verification_token',
+            ProjectionExpression='#s, verification_token',
+            ExpressionAttributeNames={'#s': 'status'},
             ConsistentRead=True,
         )
     except ClientError as e:
@@ -675,72 +690,29 @@ def check_orphan_for_meta(domain: str) -> Optional[str]:
             f"Orphan-check GetItem failed for {domain}: code={error_code}; "
             f"deferring orphan determination to next scan"
         )
-        return None
+        return None, None
     item = response.get('Item')
     if not item:
         # Collapses two cases: row entirely missing, or row exists without the
         # projected verification_token attribute (the post-incident partial-row
         # shape from update_domain_status writes). Both are equivalent here.
-        return "no qurl-domains row with verification_token"
+        return "no qurl-domains row with verification_token", None
     token_attr = item.get('verification_token')
     if token_attr is None:
-        return "verification_token attribute missing"
+        return "verification_token attribute missing", None
     token = token_attr.get('S', '') if isinstance(token_attr, dict) else ''
     if not token:
-        return "verification_token empty"
-    return None
+        return "verification_token empty", None
+    return None, item
 
 
-def verify_dns_ownership(domain: str) -> None:
-    """Re-verify DNS ownership before certificate issuance (TOCTOU mitigation).
+def check_orphan_for_meta(domain: str) -> Optional[str]:
+    """Detect SSM ↔ qurl-domains drift before doing any renewal work for a domain."""
+    reason, _ = _managed_domain_row_for_meta(domain)
+    return reason
 
-    Resolves _layerv-verify.{domain} TXT record and confirms it still matches
-    the verification_token stored in the qurl-domains DynamoDB table. This
-    closes the time-of-check-time-of-use gap between the Go service's initial
-    DNS verification and the Lambda's certificate issuance.
 
-    Note: this check runs on **every** call to provision_certificate, including
-    renewals scheduled by renewal_scan(). Customers must therefore keep the
-    _layerv-verify TXT record in place for the lifetime of the domain — not
-    only during initial onboarding. This is an intentional security property:
-    if a domain changes hands, the new owner cannot inherit our certificate
-    issuance just by leaving the ACME CNAME in place.
-
-    Args:
-        domain: The custom domain to verify ownership of.
-
-    Raises:
-        DnsOwnershipError: If the TXT record is missing, mismatched, or the
-            verification token cannot be retrieved from DynamoDB.
-    """
-    if not QURL_DOMAINS_TABLE:
-        logger.warning("No QURL_DOMAINS_TABLE configured, skipping DNS ownership re-verification")
-        return
-
-    # 1. Fetch the expected verification token from DynamoDB.
-    # Use ConsistentRead so we never race against an in-flight Update from the
-    # Go service that just rotated the token (e.g. operator-initiated reset).
-    try:
-        response = dynamodb_client.get_item(
-            TableName=QURL_DOMAINS_TABLE,
-            Key={'domain': {'S': domain}},
-            ProjectionExpression='verification_token',
-            ConsistentRead=True,
-        )
-    except ClientError as e:
-        # Surface the AWS error code in logs but keep the customer-visible
-        # error message generic so we never leak account/table identifiers.
-        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-        logger.error(
-            f"DynamoDB GetItem failed during DNS ownership re-verification for {domain}: "
-            f"code={error_code} err={e}"
-        )
-        raise DnsOwnershipError(
-            f"Failed to fetch verification token from DynamoDB for {domain} "
-            f"(code={error_code})"
-        ) from e
-
-    item = response.get('Item')
+def _verification_token_from_item(domain: str, item: Optional[Dict[str, Any]]) -> str:
     if not item:
         raise DnsOwnershipError(
             f"Domain {domain} not found in DynamoDB during DNS ownership re-verification"
@@ -765,14 +737,16 @@ def verify_dns_ownership(domain: str) -> None:
             f"verification_token stored for {domain} in DynamoDB is empty "
             f"(possible tampering — investigate)"
         )
+    return expected_token
 
-    # 2. Resolve _layerv-verify.{domain} TXT record via public DNS.
-    # We deliberately bypass the VPC resolver here to mirror the path Let's
-    # Encrypt itself uses (public recursive resolvers) — anything reachable
-    # only from inside our VPC would be a false positive. Timeout values
-    # are module-level constants (DNS_QUERY_TIMEOUT_SECONDS / _LIFETIME /
-    # _SLOW_WARNING) so they're easy to tune without hunting through the
-    # function body.
+
+def _verify_dns_ownership_txt(domain: str, expected_token: str) -> None:
+    # Resolve _layerv-verify.{domain} TXT record via public DNS. We deliberately
+    # bypass the VPC resolver here to mirror the path Let's Encrypt itself uses
+    # (public recursive resolvers) — anything reachable only from inside our VPC
+    # would be a false positive. Timeout values are module-level constants
+    # (DNS_QUERY_TIMEOUT_SECONDS / _LIFETIME / _SLOW_WARNING) so they're easy to
+    # tune without hunting through the function body.
     lazy_import_dns()
     verify_name = f"_layerv-verify.{domain}"
     res = dns_resolver.Resolver()
@@ -794,13 +768,13 @@ def verify_dns_ownership(domain: str) -> None:
             f"{verify_name} has no TXT records"
         ) from e
     except dns_exception.Timeout as e:
-        raise DnsOwnershipError(
+        raise DnsOwnershipResolutionError(
             f"DNS ownership check failed for {domain}: "
             f"timed out resolving {verify_name} TXT record"
         ) from e
     except dns_exception.DNSException as e:
         # Catch-all for other dnspython errors (NoNameservers, ServFail, etc).
-        raise DnsOwnershipError(
+        raise DnsOwnershipResolutionError(
             f"DNS ownership check failed for {domain}: "
             f"could not resolve {verify_name} TXT record: {type(e).__name__}"
         ) from e
@@ -817,7 +791,7 @@ def verify_dns_ownership(domain: str) -> None:
                 f"(threshold {DNS_SLOW_WARNING_SECONDS}s, lifetime {DNS_QUERY_LIFETIME_SECONDS}s)"
             )
 
-    # 3. Compare resolved TXT value against expected token.
+    # Compare resolved TXT value against expected token.
     #
     # Comparison is byte-for-byte case-sensitive on purpose. The Go service
     # generates verification tokens via crypto/rand and base64-url-encodes
@@ -858,11 +832,73 @@ def verify_dns_ownership(domain: str) -> None:
     )
 
 
+def verify_dns_ownership(domain: str, expected_token: Optional[str] = None) -> None:
+    """Re-verify DNS ownership before certificate issuance (TOCTOU mitigation).
+
+    Resolves _layerv-verify.{domain} TXT record and confirms it still matches
+    the verification_token stored in the qurl-domains DynamoDB table. This
+    closes the time-of-check-time-of-use gap between the Go service's initial
+    DNS verification and the Lambda's certificate issuance.
+
+    Note: this check runs on **every** call to provision_certificate, including
+    renewals scheduled by renewal_scan(). Customers must therefore keep the
+    _layerv-verify TXT record in place for the lifetime of the domain — not
+    only during initial onboarding. This is an intentional security property:
+    if a domain changes hands, the new owner cannot inherit our certificate
+    issuance just by leaving the ACME CNAME in place.
+
+    Args:
+        domain: The custom domain to verify ownership of.
+        expected_token: Optional verification token from a prior consistent
+            qurl-domains read. When provided, avoids a second DynamoDB read
+            but still performs the public DNS TXT lookup.
+
+    Raises:
+        DnsOwnershipError: If the TXT record is missing, mismatched, or the
+            verification token cannot be retrieved from DynamoDB.
+    """
+    if expected_token:
+        _verify_dns_ownership_txt(domain, expected_token)
+        return
+
+    if not QURL_DOMAINS_TABLE:
+        logger.warning("No QURL_DOMAINS_TABLE configured, skipping DNS ownership re-verification")
+        return
+
+    # 1. Fetch the expected verification token from DynamoDB.
+    # Use ConsistentRead so we never race against an in-flight Update from the
+    # Go service that just rotated the token (e.g. operator-initiated reset).
+    try:
+        response = dynamodb_client.get_item(
+            TableName=QURL_DOMAINS_TABLE,
+            Key={'domain': {'S': domain}},
+            ProjectionExpression='verification_token',
+            ConsistentRead=True,
+        )
+    except ClientError as e:
+        # Surface the AWS error code in logs but keep the customer-visible
+        # error message generic so we never leak account/table identifiers.
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        logger.error(
+            f"DynamoDB GetItem failed during DNS ownership re-verification for {domain}: "
+            f"code={error_code} err={e}"
+        )
+        raise DnsOwnershipResolutionError(
+            f"Failed to fetch verification token from DynamoDB for {domain} "
+            f"(code={error_code})"
+        ) from e
+
+    expected_token = _verification_token_from_item(domain, response.get('Item'))
+    _verify_dns_ownership_txt(domain, expected_token)
+
+
 def provision_certificate(
     domain: str,
     acme_subdomain: str,
     skip_sync: bool = False,
     emit_per_domain_signals: bool = True,
+    mark_failed_on_error: bool = True,
+    expected_verification_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Provision a new TLS certificate for a custom domain.
@@ -879,8 +915,18 @@ def provision_certificate(
         emit_per_domain_signals: If False, suppress per-domain SNS and
                         ProvisioningFailures metrics. Scheduled renewal scans
                         use aggregate scan metrics instead so one bad fleet
-                        state does not page once per cert; domain status and
-                        failure_reason still update for per-domain triage.
+                        state does not page once per cert.
+        mark_failed_on_error: If False, ACME/DNS-validation/storage/DDB/sync
+                        failures are recorded in renewal diagnostic fields
+                        without changing the domain status. Scheduled renewals
+                        use this so a rate-limited or otherwise failed renewal
+                        does not burn a still-valid active custom domain. DNS
+                        ownership failures are still marked failed because they
+                        indicate the customer no longer proves control.
+        expected_verification_token: Optional token from a prior
+                        strongly-consistent qurl-domains read. Scheduled
+                        renewal scans pass this to avoid rereading the row
+                        while still performing DNS ownership verification.
 
     Returns:
         Status dict with provisioning outcome
@@ -905,7 +951,7 @@ def provision_certificate(
         # This confirms that _layerv-verify.{domain} TXT still matches the
         # token in DynamoDB, preventing cert issuance if DNS changed since
         # the Go service's initial verification.
-        verify_dns_ownership(domain)
+        verify_dns_ownership(domain, expected_verification_token)
 
         failure_category = FAILURE_ACME_ACCOUNT
         lazy_import_acme()
@@ -974,21 +1020,42 @@ def provision_certificate(
         _release_provisioning_lock(domain)
         raise
     except DnsValidationError as e:
-        logger.error(f"Certificate provisioning failed for {domain}: {str(e)}", exc_info=True)
-        update_domain_status(domain, STATUS_FAILED, error=str(e))
-        if emit_per_domain_signals:
-            send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
-            publish_failure_metric(FAILURE_DNS_VALIDATION)
-        _release_provisioning_lock(domain)
+        _handle_provisioning_failure(
+            domain,
+            e,
+            FAILURE_DNS_VALIDATION,
+            mark_failed_on_error,
+            emit_per_domain_signals,
+        )
         raise
     except Exception as e:
-        logger.error(f"Certificate provisioning failed for {domain}: {str(e)}", exc_info=True)
-        update_domain_status(domain, STATUS_FAILED, error=str(e))
-        if emit_per_domain_signals:
-            send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
-            publish_failure_metric(failure_category)
-        _release_provisioning_lock(domain)
+        _handle_provisioning_failure(
+            domain,
+            e,
+            failure_category,
+            mark_failed_on_error,
+            emit_per_domain_signals,
+        )
         raise
+
+
+def _handle_provisioning_failure(
+    domain: str,
+    error: Exception,
+    failure_category: str,
+    mark_failed_on_error: bool,
+    emit_per_domain_signals: bool,
+):
+    """Handle non-ownership provisioning failures with renewal-aware status writes."""
+    logger.error(f"Certificate provisioning failed for {domain}: {str(error)}", exc_info=True)
+    if mark_failed_on_error:
+        update_domain_status(domain, STATUS_FAILED, error=str(error))
+    else:
+        record_domain_renewal_failure(domain, str(error))
+    if emit_per_domain_signals:
+        send_alert(f"Certificate provisioning FAILED for {domain}: {str(error)}")
+        publish_failure_metric(failure_category)
+    _release_provisioning_lock(domain)
 
 
 def _parse_iso_expiry(expires_at_str: str) -> datetime:
@@ -1023,6 +1090,7 @@ def renewal_scan() -> Dict[str, Any]:
         'dns_ownership_failed': 0,
         'skipped': 0,
         'orphaned': 0,
+        'status_recovered': 0,
         'heartbeat_publish_failed': False,
         'metric_publish_failed': False,
         'details': []
@@ -1061,7 +1129,7 @@ def renewal_scan() -> Dict[str, Any]:
             # qurl-domains row. Cleaner than letting DnsOwnershipError fire
             # 200 times every two days, and surfaces orphans the moment they
             # appear rather than waiting for the 30-day renewal window.
-            orphan_reason = check_orphan_for_meta(domain)
+            orphan_reason, domain_item = _managed_domain_row_for_meta(domain)
             if orphan_reason:
                 logger.error(f"Orphan cert detected for {domain}: {orphan_reason}")
                 orphans.append((domain, orphan_reason))
@@ -1084,6 +1152,13 @@ def renewal_scan() -> Dict[str, Any]:
             expires_at = _parse_iso_expiry(expires_at_str)
             now = datetime.now(timezone.utc)
             days_until_expiry = (expires_at - now).days
+            if recover_failed_domain_with_valid_cert(domain, expires_at, expires_at_str, now, domain_item):
+                results['status_recovered'] += 1
+                results['details'].append({
+                    'domain': domain,
+                    'action': 'status_recovered',
+                    'days_until_expiry': days_until_expiry,
+                })
 
             # Collect metric for batched publish
             expiry_metrics.append({
@@ -1100,11 +1175,17 @@ def renewal_scan() -> Dict[str, Any]:
                     logger.warning(f"Meta for {domain} missing '{FIELD_ACME_SUBDOMAIN}' field, deriving from domain name")
                     acme_subdomain = domain_to_acme_subdomain(domain)
 
+                provision_kwargs = {
+                    'skip_sync': True,
+                    'emit_per_domain_signals': False,
+                    'mark_failed_on_error': False,
+                }
+                if domain_item is not None:
+                    provision_kwargs['expected_verification_token'] = _verification_token_from_item(domain, domain_item)
                 result = provision_certificate(
                     domain,
                     acme_subdomain,
-                    skip_sync=True,
-                    emit_per_domain_signals=False,
+                    **provision_kwargs,
                 )
                 if result.get('status') == RESULT_SKIPPED:
                     results['skipped'] += 1
@@ -1166,15 +1247,21 @@ def renewal_scan() -> Dict[str, Any]:
 
     results['metric_publish_failed'] = not publish_renewal_scan_metrics(results)
 
-    # Trigger a single cert sync after all renewals (instead of per-domain)
-    if results['renewed'] > 0:
-        logger.info(f"Triggering cert sync after {results['renewed']} renewal(s)")
+    # Trigger a single cert sync after all renewals/recoveries (instead of per-domain).
+    # Recovery does not change cert material, but a batch sync is idempotent and
+    # makes the serving layer converge after a failed row is restored to active.
+    if results['renewed'] > 0 or results['status_recovered'] > 0:
+        logger.info(
+            f"Triggering cert sync after {results['renewed']} renewal(s) and "
+            f"{results['status_recovered']} status recovery/recoveries"
+        )
         trigger_cert_sync(BATCH_SYNC_RENEWAL)
 
     logger.info(f"Renewal scan complete: {results['scanned']} scanned, "
                 f"{results['renewed']} renewed, {results['failed']} failed, "
                 f"{results['dns_ownership_failed']} DNS ownership blocked, "
-                f"{results['skipped']} skipped, {results['orphaned']} orphaned")
+                f"{results['skipped']} skipped, {results['orphaned']} orphaned, "
+                f"{results['status_recovered']} status-recovered")
 
     if results['failed'] > 0:
         logger.error(f"Renewal scan completed with {results['failed']} non-ownership processing failure(s)")
@@ -1281,8 +1368,99 @@ def publish_renewal_scan_metrics(results: Dict[str, Any]) -> bool:
                 'Value': results['failed'],
                 'Unit': 'Count',
             },
+            {
+                'MetricName': CW_METRIC_RENEWAL_STATUS_RECOVERED,
+                'Dimensions': RENEWAL_SCAN_METRIC_DIMENSIONS,
+                'Value': results['status_recovered'],
+                'Unit': 'Count',
+            },
         ],
         'renewal scan count metrics',
+    )
+
+
+def cert_material_exists(domain: str) -> bool:
+    """Return True only when both key and chain SSM params still exist."""
+    cert_prefix = f"{SSM_CERT_PREFIX}/{domain}"
+    for suffix in ('key', 'chain'):
+        name = f"{cert_prefix}/{suffix}"
+        try:
+            ssm_client.get_parameter(Name=name, WithDecryption=False)
+        except ClientError as e:
+            code = e.response.get('Error', {}).get('Code', 'Unknown')
+            logger.warning(
+                f"Certificate material check failed for {domain}: missing {suffix} "
+                f"parameter or SSM error code={code}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(
+                f"Certificate material check failed for {domain}: SSM {suffix} "
+                f"probe raised {type(e).__name__}"
+            )
+            return False
+    return True
+
+
+def recover_failed_domain_with_valid_cert(
+    domain: str,
+    expires_at: datetime,
+    expires_at_str: str,
+    now: datetime,
+    domain_item: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Recover a failed row when SSM still has a valid cert and DNS ownership holds.
+
+    This closes the bad state created when an older renewal scan marked an active
+    domain failed because the new ACME order hit a processing fault (for example
+    Let's Encrypt duplicate-certificate rate limiting). The old cert can still
+    be valid and deployable; qurl-service should keep honoring it until expiry.
+    """
+    if not QURL_DOMAINS_TABLE:
+        return False
+
+    if expires_at <= now:
+        return False
+
+    item = domain_item
+    if item is None:
+        _, item = _managed_domain_row_for_meta(domain)
+        item = item or {}
+
+    status = item.get('status', {}).get('S', '')
+    if status != STATUS_FAILED:
+        return False
+
+    try:
+        expected_token = _verification_token_from_item(domain, item)
+        _verify_dns_ownership_txt(domain, expected_token)
+    except DnsOwnershipResolutionError as e:
+        logger.warning(f"Not recovering failed domain {domain}: DNS ownership check unavailable: {e}")
+        return False
+    except DnsOwnershipError as e:
+        logger.warning(f"Not recovering failed domain {domain}: DNS ownership still fails: {e}")
+        return False
+
+    if not cert_material_exists(domain):
+        logger.warning(
+            f"Not recovering failed domain {domain}: SSM key/chain material is incomplete"
+        )
+        return False
+
+    logger.warning(
+        f"Recovering failed domain {domain}: SSM still has a valid cert "
+        f"until {expires_at_str} and DNS ownership still verifies"
+    )
+    # The renewal scan only iterates SSM /meta rows written after key/chain
+    # material, so a valid future expires_at here is evidence of deployed cert
+    # material rather than an isolated metadata placeholder.
+    return update_domain_status(
+        domain,
+        STATUS_ACTIVE,
+        cert_param_prefix=f"{SSM_CERT_PREFIX}/{domain}",
+        cert_expires_at=expires_at_str,
+        expected_status=STATUS_FAILED,
+        set_activated_at=False,
     )
 
 
@@ -2058,16 +2236,24 @@ def store_certificate(domain: str, private_key_pem: str, cert_pem: str, chain_pe
     return param_prefix
 
 
+def _domain_status_update_failed(domain: str, error: Exception) -> bool:
+    logger.error(f"Failed to update domain status for {domain}: {error}")
+    return False
+
+
 def update_domain_status(domain: str, status: str, cert_param_prefix: Optional[str] = None,
-                         cert_expires_at: Optional[str] = None, error: Optional[str] = None):
+                         cert_expires_at: Optional[str] = None, error: Optional[str] = None,
+                         expected_status: Optional[str] = None,
+                         set_activated_at: bool = True) -> bool:
     """Update domain status in the qurl-domains DynamoDB table.
 
     Clears provisioning_started_at when transitioning to active or failed
-    so the idempotency lock is released for any subsequent attempt.
+    so the idempotency lock is released for any subsequent attempt. Returns
+    False if the row cannot be updated, including a conditional race.
     """
     if not QURL_DOMAINS_TABLE:
         logger.info("No QURL_DOMAINS_TABLE configured, skipping status update")
-        return
+        return False
 
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -2092,7 +2278,7 @@ def update_domain_status(domain: str, status: str, cert_param_prefix: Optional[s
             expr_names['#cea'] = 'cert_expires_at'
             expr_values[':cert_expires_at'] = {'S': cert_expires_at}
 
-        if status == STATUS_ACTIVE:
+        if status == STATUS_ACTIVE and set_activated_at:
             update_expr_parts.append('#aa = :activated_at')
             expr_names['#aa'] = 'activated_at'
             expr_values[':activated_at'] = {'S': now_iso}
@@ -2100,7 +2286,13 @@ def update_domain_status(domain: str, status: str, cert_param_prefix: Optional[s
         if error:
             update_expr_parts.append('#err = :error')
             expr_names['#err'] = 'failure_reason'
-            expr_values[':error'] = {'S': error[:500]}
+            expr_values[':error'] = {'S': error[:FAILURE_REASON_MAX]}
+        elif status == STATUS_ACTIVE:
+            remove_expr_parts.append('#err')
+            expr_names['#err'] = 'failure_reason'
+            remove_expr_parts.extend(['#lrfa', '#lrfr'])
+            expr_names['#lrfa'] = FIELD_LAST_RENEWAL_FAILED_AT
+            expr_names['#lrfr'] = FIELD_LAST_RENEWAL_FAILURE_REASON
 
         if status in (STATUS_ACTIVE, STATUS_FAILED):
             remove_expr_parts.append('#psa')
@@ -2110,18 +2302,79 @@ def update_domain_status(domain: str, status: str, cert_param_prefix: Optional[s
         if remove_expr_parts:
             update_expression += ' REMOVE ' + ', '.join(remove_expr_parts)
 
-        dynamodb_client.update_item(
-            TableName=QURL_DOMAINS_TABLE,
-            Key={
+        update_kwargs = {
+            'TableName': QURL_DOMAINS_TABLE,
+            'Key': {
                 'domain': {'S': domain}
             },
-            UpdateExpression=update_expression,
-            ExpressionAttributeNames=expr_names,
-            ExpressionAttributeValues=expr_values
-        )
+            'UpdateExpression': update_expression,
+            'ExpressionAttributeNames': expr_names,
+            'ExpressionAttributeValues': expr_values,
+        }
+        if expected_status:
+            expr_values[':expected_status'] = {'S': expected_status}
+            update_kwargs['ConditionExpression'] = '#s = :expected_status'
+
+        dynamodb_client.update_item(**update_kwargs)
         logger.info(f"Updated domain status for {domain}: {status}")
+        return True
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'Unknown')
+        if code == 'ConditionalCheckFailedException':
+            logger.info(
+                "Skipped domain status update for %s: expected status %s no longer matched",
+                domain,
+                expected_status,
+            )
+            return False
+        return _domain_status_update_failed(domain, e)
     except Exception as e:
-        logger.error(f"Failed to update domain status for {domain}: {e}")
+        return _domain_status_update_failed(domain, e)
+
+
+def record_domain_renewal_failure(domain: str, error: str):
+    """Record a scheduled-renewal failure without changing domain usability.
+
+    Renewal failures are different from first-time provisioning failures: the
+    old cert may still be valid and already deployed, so setting status=failed
+    would make qurl-service stop honoring the custom domain before TLS actually
+    expires. Keep status/cert_expires_at intact and store diagnostics in
+    renewal-specific fields instead.
+    """
+    if not QURL_DOMAINS_TABLE:
+        logger.info("No QURL_DOMAINS_TABLE configured, skipping renewal failure diagnostic update")
+        return
+
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        dynamodb_client.update_item(
+            TableName=QURL_DOMAINS_TABLE,
+            Key={'domain': {'S': domain}},
+            UpdateExpression='SET #ua = :updated_at, #lrfa = :failed_at, #lrfr = :reason',
+            ConditionExpression='attribute_exists(#d)',
+            ExpressionAttributeNames={
+                '#d': 'domain',
+                '#ua': 'updated_at',
+                '#lrfa': FIELD_LAST_RENEWAL_FAILED_AT,
+                '#lrfr': FIELD_LAST_RENEWAL_FAILURE_REASON,
+            },
+            ExpressionAttributeValues={
+                ':updated_at': {'S': now_iso},
+                ':failed_at': {'S': now_iso},
+                ':reason': {'S': error[:FAILURE_REASON_MAX]},
+            },
+        )
+        logger.info(f"Recorded renewal failure diagnostics for {domain}")
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'Unknown')
+        if code == 'ConditionalCheckFailedException':
+            logger.info(
+                f"Skipped renewal failure diagnostics for {domain}: row no longer exists"
+            )
+            return
+        logger.error(f"Failed to record renewal failure diagnostics for {domain}: {e}")
+    except Exception as e:
+        logger.error(f"Failed to record renewal failure diagnostics for {domain}: {e}")
 
 
 def handle_domain_cleanup(payload: Dict[str, Any]) -> Dict[str, Any]:
