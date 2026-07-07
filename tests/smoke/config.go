@@ -261,9 +261,10 @@ func skipIfResolveEndpointDisabled(t *testing.T) {
 // + {color}-udp-tg-arn SSM params that a blue/green flip switches. #2628 gates
 // that surface on public_server_surface_enabled (= !take_server_private): taking
 // the server private removes the public UDP 62206 NLB, its listener, and those
-// SSM params, and the relay/AC reach the cell over the internal NLB instead
-// (a static single-TG forward with both color ASGs attached — no active-color
-// listener flip to assert).
+// SSM params, and the relay/AC reach the cell over the internal NLB instead.
+// The internal relay listener still has an active-color contract: it points at
+// /{env}/nhp/server/{active}-internal-udp-tg-arn and is asserted by
+// TestBlueGreen_ActiveListenersPointToActiveColorTGs when present.
 //
 // This is a DISTINCT surface from the HTTPS resolve endpoint
 // (skipIfResolveEndpointDisabled / ResolveEndpointEnabled). take_server_private

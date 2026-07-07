@@ -1687,7 +1687,7 @@ variable "enable_blue_green" {
 }
 
 variable "green_standby_min_size" {
-  description = "Min instances for green ASG in standby (1=warm, 0=cold)"
+  description = "Min instances for green ASG in standby (1=warm with strict target-health alarms, 0=cold with missing-data pages suppressed until warmed)"
   type        = number
   default     = 1
 }

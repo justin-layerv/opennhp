@@ -398,12 +398,13 @@ jobs:
 
       # Fence the blue/green listener switch's #2628 private-server contract: when
       # nhp-server is private the public udp-listener-arn SSM param is gone, so the
-      # switch must SKIP the public UDP flip (and still record active-color) for the
-      # server component while a missing primary listener stays a hard error for AC.
+      # switch must flip the internal relay UDP listener before recording
+      # active-color while a missing primary listener stays a hard error for AC.
       - name: Test blue/green listener switch
         run: |
-          shellcheck .github/scripts/blue-green-switch.sh tests/scripts/blue-green-switch_test.sh
+          shellcheck .github/scripts/blue-green-switch.sh tests/scripts/blue-green-switch_test.sh .github/scripts/check-internal-relay-migration-active-color.sh tests/scripts/check-internal-relay-migration-active-color_test.sh
           bash tests/scripts/blue-green-switch_test.sh
+          bash tests/scripts/check-internal-relay-migration-active-color_test.sh
 
       - name: Test blue/green active-tag assertions
         run: |

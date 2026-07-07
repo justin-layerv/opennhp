@@ -50,12 +50,23 @@ output "internal_udp_target_group_arn_suffix" {
   value       = one(aws_lb_target_group.udp_internal[*].arn_suffix)
 }
 
-# Full ARN of the internal relay UDP target group. #2628: the status page repoints
-# its server target-health check here when the server is private (the public TGs are
-# gone). null when relay_enabled=false; the consumer gates on take_server_private.
+# Full ARN of the BLUE internal relay UDP target group. #2628: the status page
+# repoints its server target-health check here when the server is private (the
+# public TGs are gone). null when relay_enabled=false; the consumer gates on
+# take_server_private.
 output "internal_udp_target_group_arn" {
-  description = "Internal relay UDP target group ARN (null when relay not deployed)."
+  description = "Blue internal relay UDP target group ARN (null when relay not deployed)."
   value       = one(aws_lb_target_group.udp_internal[*].arn)
+}
+
+output "internal_udp_target_group_green_arn" {
+  description = "Green internal relay UDP target group ARN (null when relay or blue/green is not enabled)."
+  value       = one(aws_lb_target_group.udp_internal_green[*].arn)
+}
+
+output "internal_udp_listener_arn" {
+  description = "Internal relay UDP listener ARN (null when relay not deployed)."
+  value       = one(aws_lb_listener.udp_internal[*].arn)
 }
 
 output "asg_name" {

@@ -52,11 +52,16 @@ That means clients cannot distinguish blue from green today, and they should not
 need to. The active-color decision belongs in the relay target source behind the
 stable cell identity, not in the browser-visible `serverId`.
 
-The current internal relay NLB is an interim both-attach design: one internal UDP
-target group fronts both blue and green server ASGs. This keeps the relay path
-reachable across a color flip, but it does not make the relay path
-active-color-only. A fraction of relay knocks can still land on the warm-standby
-color.
+The original internal relay NLB was an interim both-attach design: one internal
+UDP target group fronted both blue and green server ASGs. That kept the relay
+path reachable across a color flip, but it did not make the relay path
+active-color-only. A fraction of relay knocks could still land on the
+warm-standby color.
+
+That interim state is not safe for one-time qURLs. A standby server can accept a
+relay knock far enough to commit qURL admission, then fail the AC-open if that
+standby is not in the live AC assignment set. The internal relay listener must
+therefore route only to the active server color.
 
 ## Accepted Routing Model
 
@@ -71,12 +76,17 @@ active-color-only. The low-risk first step is tracked in
 3. Flip the internal relay NLB listener in the same blue/green switch path that
    updates `/<environment>/nhp/server/active-color`.
 4. Add validation that reconciles active color with the internal listener target
-   group when the public UDP listener is absent.
+   group.
 5. Preserve the current standby health and post-switch knock-readiness gates.
 
 This still uses an NLB listener internally, so it is not the final "relay-owned
 dynamic resolver" endpoint. It is the conservative bridge that removes
 both-color relay routing without touching browser/qURL identity contracts.
+The steady state is active-color-only; during a blue/green switch there is still
+a brief transition window between listener flips and full AC/server convergence.
+That remaining window belongs to the dynamic relay resolver and AC routing work
+tracked in [#3014](https://github.com/layervai/nhp/issues/3014) and
+[#3015](https://github.com/layervai/nhp/issues/3015).
 
 ### Final implementation: dynamic relay active-color resolver
 

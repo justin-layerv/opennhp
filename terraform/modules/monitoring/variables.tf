@@ -34,14 +34,15 @@ variable "https_green_target_group_arn_suffix" {
 # #2628: gates the three NLB health/flow alarms (UnHealthyHostCount, no-healthy-hosts,
 # TCP resets). When nhp-server is private the public NLB is gone and the root repoints
 # the dashboard widgets at the internal relay NLB — but these three alarms are gated OFF
-# rather than repointed, because the internal NLB already carries its own
-# no-healthy-targets alarm (modules/compute::internal_tg_no_healthy_targets); repointing
-# them would duplicate that page (and TCP_Target_Reset_Count is dataless on a UDP TG).
+# rather than repointed, because the internal NLB already carries per-color
+# no-healthy-targets alarms (modules/compute::internal_tg_no_healthy_targets and
+# green_internal_tg_no_healthy_targets); repointing them would duplicate those pages
+# (and TCP_Target_Reset_Count is dataless on a UDP TG).
 # STATIC bool (root passes !var.take_server_private), NOT derived from a computed
 # nlb_arn_suffix — gating count on a computed ARN trips "Invalid count argument" on
 # greenfield applies (cf. the enable_sns_alerts precedent).
 variable "nlb_alarms_enabled" {
-  description = "Create the public-NLB health/flow CloudWatch alarms. Set false when the server is private (#2628); the internal relay NLB has its own no-healthy-targets alarm, so these would duplicate it. Default true."
+  description = "Create the public-NLB health/flow CloudWatch alarms. Set false when the server is private (#2628); the internal relay NLB has its own per-color no-healthy-targets alarms, so these would duplicate them. Default true."
   type        = bool
   default     = true
 }

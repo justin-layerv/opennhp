@@ -611,17 +611,13 @@ resource "aws_cloudwatch_metric_alarm" "eip_claim_failure" {
 # STATISTIC/THRESHOLD rationale (ServersHealthy is Minimum-sensitive under
 # blue/green): `ServersHealthy` is a per-AC gauge (healthyServerCount in
 # registration.go) published with NO ACId dimension, so all ACs in the region
-# write one shared stream. Each AC re-registers through the server NLB every
-# ~90s, and — per the accepted RELAY_ACTIVE_CELL_ROUTING decision (#2658) — that
-# NLB is an interim BOTH-attach target group fronting both the active and the
-# warm-standby server color. So a registration is answered by whichever color
-# the NLB picked: the active color hands back its full per-AZ peer set (~3), the
-# standby color hands back its smaller set (as few as 1), and there is a brief
-# reconnect window (~10s) where a freshly-rebuilt assignedServers slice reads 0
-# (HandleRedispatch). The net is an EXPECTED per-AC oscillation (0↔1↔3) that is
-# not a fault — the AC always retains a working server connection and qURL knocks
-# succeed. `Minimum` over a single 5-min period on this shared stream latched the
-# alarm on every one of those transient dips (false pages).
+# write one shared stream. During the interim both-attach relay design, an AC
+# registration could be answered by either server color; the active color handed
+# back its full per-AZ peer set (~3), while the standby color handed back its
+# smaller set (as few as 1). Even with active-color-only relay routing, there is
+# still a brief reconnect window (~10s) where a freshly-rebuilt assignedServers
+# slice reads 0 (HandleRedispatch). `Minimum` over a single 5-min period latched
+# the alarm on those transient dips (false pages).
 #
 # Fix: use `Average` over a SUSTAINED window. The steady-state per-AC time-average
 # is ~2.6 (mostly 3, occasionally 1), so `Average < 2` clears the expected flip
@@ -629,9 +625,8 @@ resource "aws_cloudwatch_metric_alarm" "eip_claim_failure" {
 # persistently reaching ≤1 server = a real AC↔server reachability problem).
 # LIMITATION: without an ACId dimension the shared-stream average can mask a
 # single-AC-stuck-at-0 while its siblings are healthy — per-AC granularity is the
-# tracked #946 gauge work (add ACId dim + a per-AC SEARCH/metric-math alarm); the
-# underlying both-attach routing flip is the deferred #2645/#2658 work. Keep the
-# dimension set unchanged here until #946 lands, or this alarm goes
+# tracked #946 gauge work (add ACId dim + a per-AC SEARCH/metric-math alarm).
+# Keep the dimension set unchanged here until #946 lands, or this alarm goes
 # INSUFFICIENT_DATA (see the dimension note above).
 resource "aws_cloudwatch_metric_alarm" "servers_healthy_low" {
   count = var.enable_cloudwatch_alarms ? 1 : 0

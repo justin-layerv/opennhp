@@ -2140,6 +2140,14 @@ jobs:
 
           plan_with_attachment_migration_guard "initial plan"
 
+          guard_internal_relay_migration() {
+            # #2645 / #3123 migration gate: if this plan is the first apply that
+            # creates the green internal relay TG, applying while server
+            # active-color=green would leave the retained internal listener on
+            # blue until a switch runs. Block that silent split before apply.
+            ../../../.github/scripts/check-internal-relay-migration-active-color.sh sandbox plan-show.json
+          }
+
           show_current_plan() {
             local context="$1"
             if ! terraform show -no-color tfplan > plan-show.txt; then
@@ -2150,6 +2158,7 @@ jobs:
               echo "::error::terraform show -json tfplan failed${context}; cannot inspect deposed relay SGs"
               exit 1
             fi
+            guard_internal_relay_migration
           }
 
           # Handle ASGs left tainted by a prior partial-create failure.
@@ -2254,14 +2263,14 @@ jobs:
               echo "::error::Re-plan failed after untaint. Manual intervention may be required."
               exit 1
             fi
+            show_current_plan " after untaint"
             # Fail fast if the re-plan re-tainted something. plan.txt
-            # is the fresh post-re-plan output (just tee'd above), so
-            # no `terraform show` needed here — that's why the data
-            # source is asymmetric with the initial scan above. If we
-            # let apply run, it would hit `AlreadyExists` — exactly
-            # the loop this handler exists to prevent. The next CI run
-            # picks it up; failing here surfaces the recovery story in
-            # this run's log instead of as a cryptic apply error.
+            # is the fresh post-re-plan output (just tee'd above), while
+            # show_current_plan refreshed plan-show.json for the migration
+            # guard. If we let a tainted-ASG apply run, it would hit
+            # `AlreadyExists` — exactly the loop this handler exists to prevent.
+            # The next CI run picks it up; failing here surfaces the recovery
+            # story in this run's log instead of as a cryptic apply error.
             if grep -qE "aws_autoscaling_group\.[^ ]+ is tainted, so must be replaced" plan.txt; then
               echo "::error::Re-plan after untaint still shows tainted ASG(s); aborting to avoid the AlreadyExists loop at apply time. Re-run the workflow on the next CI cycle."
               # Name the still-tainted address(es) in the log so the

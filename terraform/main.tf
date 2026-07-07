@@ -1115,11 +1115,15 @@ module "status_page" {
   acm_certificate_arn = var.status_page_domain != null ? aws_acm_certificate_validation.status_page[0].certificate_arn : null
 
   # Target group ARNs for health checks. #2628: when the server is private the public
-  # UDP TGs are gone (their arns go null → compact strips them → []), which would blank
-  # the status page's server-health tile. Repoint at the internal relay UDP TG so the
-  # page keeps reflecting real server health (non-null because take_server_private
-  # requires deploy_relay). Public path unchanged → zero prod diff.
-  server_nlb_tg_arns = var.take_server_private ? compact([module.compute.internal_udp_target_group_arn]) : compact([
+  # UDP TGs are gone (their arns go null -> compact strips them -> []), which would blank
+  # the status page's server-health tile. Repoint at the internal relay UDP TGs so the
+  # page reflects relay fleet readiness across active + standby colors, not just the
+  # current active color (non-null because take_server_private requires deploy_relay).
+  # Public path unchanged -> zero prod diff.
+  server_nlb_tg_arns = var.take_server_private ? compact([
+    module.compute.internal_udp_target_group_arn,
+    module.compute.internal_udp_target_group_green_arn,
+    ]) : compact([
     module.compute.udp_target_group_blue_arn,
     module.compute.udp_target_group_green_arn,
   ])

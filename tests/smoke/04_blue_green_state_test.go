@@ -107,18 +107,22 @@ func TestBlueGreen_ActiveListenersPointToActiveColorTGs(t *testing.T) {
 	env := testConfig.Environment
 
 	// Listeners to verify: AC TCP (customer proxied traffic) always; server/udp
-	// (NHP knock) and server/https (QURL resolve) only where their respective
-	// public surface is still deployed. Two independent #2628/#2208 topology
-	// gates each remove a server-side public listener and its SSM param, so a
-	// static three-listener check would fail on the now-absent param — append
-	// each on its own signal:
-	//   - server/udp:   serverPublicKnockSurfaceEnabled(t)  (take_server_private)
-	//   - server/https: testConfig.ResolveEndpointEnabled   (qurl_link_js_agent)
-	// The two gates are independent and must NOT be collapsed — see the
-	// serverPublicKnockSurfaceEnabled doc and CLAUDE.md's resolve-endpoint gate
-	// section for why (distinct surfaces, one-way precondition, valid
-	// resolve-off+UDP-public intermediate state). Any param listed below that is
-	// missing fails the test (not skips); the gates decide inclusion.
+	// (public NHP knock), server/internal-udp (relay NHP knock), and server/https
+	// (QURL resolve) only where their respective surfaces are deployed. Two
+	// independent #2628/#2208 topology gates each remove a server-side public
+	// listener and its SSM param, so a static three-listener check would fail on
+	// the now-absent param — append each on its own signal:
+	//   - server/udp:          serverPublicKnockSurfaceEnabled(t)  (take_server_private)
+	//   - server/internal-udp: internal relay listener SSM param exists, and is
+	//                          REQUIRED when server/udp is private
+	//   - server/https:        testConfig.ResolveEndpointEnabled   (qurl_link_js_agent)
+	// The public UDP and HTTPS gates are independent and must NOT be collapsed —
+	// see the serverPublicKnockSurfaceEnabled doc and CLAUDE.md's
+	// resolve-endpoint gate section for why (distinct surfaces, one-way
+	// precondition, valid resolve-off+UDP-public intermediate state). Any param
+	// listed below that is missing fails the test (not skips); the gates decide
+	// inclusion.
+	publicKnockSurface := serverPublicKnockSurfaceEnabled(t)
 	checks := []listenerToTGCheck{
 		{
 			label:          "ac/tcp",
@@ -126,12 +130,22 @@ func TestBlueGreen_ActiveListenersPointToActiveColorTGs(t *testing.T) {
 			activeTGSSMKey: "/" + env + "/nhp/ac/" + acActive + "-tcp-tg-arn",
 		},
 	}
-	if serverPublicKnockSurfaceEnabled(t) {
+	if publicKnockSurface {
 		checks = append(checks, listenerToTGCheck{
 			label:          "server/udp",
 			listenerSSM:    "/" + env + "/nhp/server/udp-listener-arn",
 			activeTGSSMKey: "/" + env + "/nhp/server/" + serverActive + "-udp-tg-arn",
 		})
+	}
+	internalListenerSSM := "/" + env + "/nhp/server/internal-udp-listener-arn"
+	if _, ok := getSSMParameter(t, internalListenerSSM); ok {
+		checks = append(checks, listenerToTGCheck{
+			label:          "server/internal-udp",
+			listenerSSM:    internalListenerSSM,
+			activeTGSSMKey: "/" + env + "/nhp/server/" + serverActive + "-internal-udp-tg-arn",
+		})
+	} else if !publicKnockSurface {
+		t.Fatalf("server is private but internal relay listener SSM param %s is missing", internalListenerSSM)
 	}
 	if testConfig.ResolveEndpointEnabled {
 		checks = append(checks, listenerToTGCheck{

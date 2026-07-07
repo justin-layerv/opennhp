@@ -153,6 +153,9 @@ jobs:
       server_primary_listener_arn: ${{ steps.server-state.outputs.primary_listener_arn }}
       server_blue_primary_tg_arn: ${{ steps.server-state.outputs.blue_primary_tg_arn }}
       server_green_primary_tg_arn: ${{ steps.server-state.outputs.green_primary_tg_arn }}
+      server_internal_listener_arn: ${{ steps.server-state.outputs.internal_listener_arn }}
+      server_blue_internal_tg_arn: ${{ steps.server-state.outputs.blue_internal_tg_arn }}
+      server_green_internal_tg_arn: ${{ steps.server-state.outputs.green_internal_tg_arn }}
       server_secondary_listener_arn: ${{ steps.server-state.outputs.secondary_listener_arn }}
       server_blue_secondary_tg_arn: ${{ steps.server-state.outputs.blue_secondary_tg_arn }}
       server_green_secondary_tg_arn: ${{ steps.server-state.outputs.green_secondary_tg_arn }}
@@ -262,12 +265,11 @@ jobs:
             echo "standby_image_tag=$BLUE_TAG" >> "$GITHUB_OUTPUT"
           fi
 
-          # Server listeners: primary=UDP, secondary=HTTPS — both OPTIONAL.
+          # Server listeners: primary=public UDP, internal=relay UDP, secondary=HTTPS.
           # #2628: the UDP (primary) switch params are ABSENT when nhp-server is private
           # (take_server_private removes the public NLB + its blue/green switch params).
-          # Tolerate their absence exactly like the HTTPS reads below; the switch step
-          # (blue-green-switch.sh) skips the public UDP flip in that state — the internal
-          # relay NLB fronts both colors via a static attach and needs no listener flip.
+          # Tolerate public UDP absence exactly like the HTTPS reads below; the switch step
+          # (blue-green-switch.sh) flips the internal relay UDP listener in that state.
           PRIMARY_LISTENER=$(aws ssm get-parameter \
             --name "${SSM_BASE}/udp-listener-arn" \
             --query "Parameter.Value" --output text 2>/dev/null) || PRIMARY_LISTENER=""
@@ -279,6 +281,20 @@ jobs:
               --query "Parameter.Value" --output text)" >> "$GITHUB_OUTPUT"
             echo "green_primary_tg_arn=$(aws ssm get-parameter \
               --name "${SSM_BASE}/green-udp-tg-arn" \
+              --query "Parameter.Value" --output text)" >> "$GITHUB_OUTPUT"
+          fi
+
+          INTERNAL_LISTENER=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/internal-udp-listener-arn" \
+            --query "Parameter.Value" --output text 2>/dev/null) || INTERNAL_LISTENER=""
+          echo "internal_listener_arn=$INTERNAL_LISTENER" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$INTERNAL_LISTENER" ]]; then
+            echo "blue_internal_tg_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/blue-internal-udp-tg-arn" \
+              --query "Parameter.Value" --output text)" >> "$GITHUB_OUTPUT"
+            echo "green_internal_tg_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/green-internal-udp-tg-arn" \
               --query "Parameter.Value" --output text)" >> "$GITHUB_OUTPUT"
           fi
 
@@ -1202,9 +1218,9 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # #2628: skipped when the server is private (no public UDP listener ARN — the
-      # internal relay NLB needs no per-deploy flip, so there is nothing to verify here;
-      # the activation-checklist smokes cover the internal knock path).
+      # Public UDP listener verification is skipped when the server is private
+      # (no public UDP listener ARN). The internal relay UDP listener has its own
+      # verification below and is the active knock path in that state.
       - name: "[Server] Verify Traffic Switch"
         if: needs.prepare.outputs.deploy_server == 'true' && needs.prepare.outputs.server_primary_listener_arn != ''
         env:
@@ -1225,8 +1241,8 @@ jobs:
             exit 1
           fi
 
-      # #2628: skipped when the server is private (no public UDP listener to reconcile;
-      # the internal relay NLB uses a static both-color attach with no SSM-tracked flip).
+      # Public UDP listener reconciliation is skipped when the server is private.
+      # The internal relay UDP listener has its own reconciliation below.
       - name: "[Server] Reconcile Listener and SSM State"
         if: needs.prepare.outputs.deploy_server == 'true' && needs.prepare.outputs.server_primary_listener_arn != ''
         env:
@@ -1249,6 +1265,51 @@ jobs:
             echo "Server reconciliation passed: SSM ($SSM_COLOR) matches listener ($LISTENER_COLOR)"
           else
             echo "::error::Server state inconsistency! SSM=$SSM_COLOR, listener=$LISTENER_COLOR"
+            exit 1
+          fi
+
+      - name: "[Server] Verify Internal Relay Traffic Switch"
+        if: needs.prepare.outputs.deploy_server == 'true' && needs.prepare.outputs.server_internal_listener_arn != ''
+        env:
+          STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
+          INTERNAL_LISTENER: ${{ needs.prepare.outputs.server_internal_listener_arn }}
+          GREEN_INTERNAL_TG: ${{ needs.prepare.outputs.server_green_internal_tg_arn }}
+          BLUE_INTERNAL_TG: ${{ needs.prepare.outputs.server_blue_internal_tg_arn }}
+        run: |
+          CURRENT_TG=$(aws elbv2 describe-listeners \
+            --listener-arns "$INTERNAL_LISTENER" \
+            --query "Listeners[0].DefaultActions[0].TargetGroupArn" --output text)
+          if [[ "$STANDBY_COLOR" == "green" ]]; then EXPECTED_TG="$GREEN_INTERNAL_TG"
+          else EXPECTED_TG="$BLUE_INTERNAL_TG"; fi
+          if [[ "$CURRENT_TG" == "$EXPECTED_TG" ]]; then
+            echo "Server internal relay traffic verified: UDP listener pointing to $STANDBY_COLOR target group"
+          else
+            echo "::error::Server internal relay traffic mismatch! Expected $EXPECTED_TG but got $CURRENT_TG"
+            exit 1
+          fi
+
+      - name: "[Server] Reconcile Internal Relay Listener and SSM State"
+        if: needs.prepare.outputs.deploy_server == 'true' && needs.prepare.outputs.server_internal_listener_arn != ''
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          INTERNAL_LISTENER: ${{ needs.prepare.outputs.server_internal_listener_arn }}
+          GREEN_INTERNAL_TG: ${{ needs.prepare.outputs.server_green_internal_tg_arn }}
+          BLUE_INTERNAL_TG: ${{ needs.prepare.outputs.server_blue_internal_tg_arn }}
+        run: |
+          echo "Running server internal relay listener/SSM state reconciliation check..."
+          SSM_COLOR=$(aws ssm get-parameter \
+            --name "/${ENVIRONMENT}/nhp/server/active-color" \
+            --query "Parameter.Value" --output text)
+          LISTENER_TG=$(aws elbv2 describe-listeners \
+            --listener-arns "$INTERNAL_LISTENER" \
+            --query "Listeners[0].DefaultActions[0].TargetGroupArn" --output text)
+          if [[ "$LISTENER_TG" == "$BLUE_INTERNAL_TG" ]]; then LISTENER_COLOR="blue"
+          elif [[ "$LISTENER_TG" == "$GREEN_INTERNAL_TG" ]]; then LISTENER_COLOR="green"
+          else echo "::error::Server internal relay listener pointing to unknown TG: $LISTENER_TG"; exit 1; fi
+          if [[ "$SSM_COLOR" == "$LISTENER_COLOR" ]]; then
+            echo "Server internal relay reconciliation passed: SSM ($SSM_COLOR) matches listener ($LISTENER_COLOR)"
+          else
+            echo "::error::Server internal relay state inconsistency! SSM=$SSM_COLOR, listener=$LISTENER_COLOR"
             exit 1
           fi
 

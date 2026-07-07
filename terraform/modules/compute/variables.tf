@@ -740,7 +740,7 @@ variable "enable_blue_green" {
 }
 
 variable "green_standby_min_size" {
-  description = "Minimum instance count for green ASG in standby mode. 1 = warm standby (instant switch), 0 = cold standby (requires scale-up before switch)."
+  description = "Minimum instance count for green ASG in standby mode. 1 = warm standby (instant switch and strict missing-data target-health alarms), 0 = cold standby (requires scale-up before switch; green target-health alarms do not page on missing data while intentionally cold)."
   type        = number
   default     = 1
 

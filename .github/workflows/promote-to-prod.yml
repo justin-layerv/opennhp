@@ -1807,6 +1807,8 @@ jobs:
           TF_VAR_cell_id: ${{ inputs.cell_id }}
         run: |
           terraform plan -no-color -out=tfplan 2>&1 | tee plan-output.txt
+          terraform show -json tfplan > plan-show.json
+          ../../../.github/scripts/check-internal-relay-migration-active-color.sh prod plan-show.json
 
           # Write plan to step summary so reviewer can see it before approving apply
           {

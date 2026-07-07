@@ -180,8 +180,11 @@ on this gate.
 `take_server_private` (→ `public_server_surface_enabled = !take_server_private`)
 removes the *public* UDP 62206 NLB, its listener, and the
 `udp-listener-arn` / `{color}-udp-tg-arn` SSM params — the relay/AC then reach
-the cell over the internal NLB (a static single-TG forward, no active-color flip
-to assert). This is **distinct from** the resolve/JS-agent gate above:
+the cell over the internal NLB. The internal relay listener still follows
+active color via `internal-udp-listener-arn` and
+`{color}-internal-udp-tg-arn`, so `04_blue_green` asserts it whenever that
+listener exists, and requires it when the public UDP surface is private. This is
+**distinct from** the resolve/JS-agent gate above:
 `take_server_private=true` *requires* the resolve endpoint already be off
 (`terraform/main.tf` precondition), but not vice-versa, so "resolve off + UDP
 still public" is a valid intermediate rollout state (sandbox pre-#2628; prod

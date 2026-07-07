@@ -585,18 +585,19 @@ thread worked out across several PRs.
    + UDP listener + `0.0.0.0/0` ingress are removed (QURL-only end-state — see Out of
    scope), the in-VPC AC `ServerEndpoint` and qurl-service `nhp_server_host` repoint
    from the public NLB to the **internal** relay NLB (`internal_nlb_dns_name`), and
-   the public-NLB CloudWatch alarms gate off (the internal NLB keeps
-   `internal_tg_no_healthy_targets`). Requires `deploy_relay` +
+   the public-NLB CloudWatch alarms gate off (the internal NLB keeps per-color
+   target-health alarms: `internal_tg_no_healthy_targets` plus
+   `green_internal_tg_no_healthy_targets`). Requires `deploy_relay` +
    `qurl_link_js_agent_enabled` (hard precondition). Sandbox flips it first as the
    soak; prod stays public until a dedicated cutover PR. The blue/green deploy
-   workflow skips the public UDP listener flip when it is absent (the internal NLB
-   uses a static both-color attach). Activation checklist (incl. the
-   AC-registration-via-internal-NLB smoke under `preserve_client_ip`) lives in the
-   #2628 prod-rollout-ledger entry. The next active-color refinement is the
+   workflow skips the public UDP listener flip when it is absent and instead
+   flips the internal relay UDP listener between per-color internal target groups.
+   Activation checklist (incl. the AC-registration-via-internal-NLB smoke under
+   `preserve_client_ip`) lives in the #2628 prod-rollout-ledger entry. The
    shared-identity routing decision in
-   [`RELAY_ACTIVE_CELL_ROUTING.md`](RELAY_ACTIVE_CELL_ROUTING.md): #2645 makes
-   the internal relay target source active-color-only, #3014 tracks the later
-   dynamic relay resolver, and #3015 tracks the separate AC routing story.
+   [`RELAY_ACTIVE_CELL_ROUTING.md`](RELAY_ACTIVE_CELL_ROUTING.md) requires that
+   active-color-only internal target source; #3014 tracks the later dynamic relay
+   resolver, and #3015 tracks the separate AC routing story.
 
 ### Phase 3 — Footprint cleanup (parallel after Phase 2)
 

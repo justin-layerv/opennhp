@@ -143,7 +143,8 @@ resource "aws_ssm_parameter" "ecr_repo_name" {
 
 resource "aws_ssm_parameter" "blue_udp_tg_arn" {
   # #2628: also gated on public_server_surface_enabled — when the server is private
-  # there is no public UDP TG to switch (blue-green-switch.sh skips the UDP flip).
+  # there is no public UDP TG to switch; blue-green-switch.sh flips the internal
+  # relay UDP listener instead.
   count = var.enable_blue_green && var.public_server_surface_enabled ? 1 : 0
 
   name        = "/${var.environment}/nhp/server/blue-udp-tg-arn"
@@ -177,8 +178,8 @@ resource "aws_ssm_parameter" "green_udp_tg_arn" {
 resource "aws_ssm_parameter" "udp_listener_arn" {
   # #2628: gated on public_server_surface_enabled. When absent (server private),
   # blue-green-switch.sh confirms the take-server-private marker (below) is "true"
-  # before skipping the public UDP flip — a missing param WITHOUT the marker is
-  # treated as a botched public deploy and hard-fails, not a silent skip.
+  # before falling back to the internal relay UDP listener — a missing param WITHOUT
+  # the marker is treated as a botched public deploy and hard-fails, not a silent skip.
   count = var.enable_blue_green && var.public_server_surface_enabled ? 1 : 0
 
   name        = "/${var.environment}/nhp/server/udp-listener-arn"
@@ -188,6 +189,51 @@ resource "aws_ssm_parameter" "udp_listener_arn" {
 
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-ssm-udp-listener"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+resource "aws_ssm_parameter" "blue_internal_udp_tg_arn" {
+  count = var.enable_blue_green && var.relay_enabled ? 1 : 0
+
+  name        = "/${var.environment}/nhp/server/blue-internal-udp-tg-arn"
+  description = "Blue internal relay UDP target group ARN for active-color traffic switching"
+  type        = "String"
+  value       = aws_lb_target_group.udp_internal[0].arn
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ssm-blue-internal-udp-tg"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+resource "aws_ssm_parameter" "green_internal_udp_tg_arn" {
+  count = var.enable_blue_green && var.relay_enabled ? 1 : 0
+
+  name        = "/${var.environment}/nhp/server/green-internal-udp-tg-arn"
+  description = "Green internal relay UDP target group ARN for active-color traffic switching"
+  type        = "String"
+  value       = aws_lb_target_group.udp_internal_green[0].arn
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ssm-green-internal-udp-tg"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+resource "aws_ssm_parameter" "internal_udp_listener_arn" {
+  count = var.enable_blue_green && var.relay_enabled ? 1 : 0
+
+  name        = "/${var.environment}/nhp/server/internal-udp-listener-arn"
+  description = "Internal relay UDP listener ARN for active-color traffic switching"
+  type        = "String"
+  value       = aws_lb_listener.udp_internal[0].arn
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ssm-internal-udp-listener"
     Component = "compute"
     Cell      = var.cell_id
   })
@@ -306,6 +352,42 @@ resource "aws_lb_target_group" "udp_green" {
   })
 }
 
+# Internal UDP target group for the GREEN server ASG. The listener lives in
+# main.tf and flips between this TG and aws_lb_target_group.udp_internal (blue).
+resource "aws_lb_target_group" "udp_internal_green" {
+  count = var.enable_blue_green && var.relay_enabled ? 1 : 0
+
+  name        = replace("${var.name_prefix}-srv-int-grn", "_", "-")
+  port        = 62206
+  protocol    = "UDP"
+  vpc_id      = var.vpc_id
+  target_type = "instance"
+
+  # Preserve the relay instance IP on the server-side packet so the server replies
+  # directly to the relay. Must match the blue internal TG in main.tf.
+  preserve_client_ip = true
+
+  health_check {
+    enabled             = true
+    protocol            = "HTTP"
+    port                = "8888"
+    path                = "/health/live"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    interval            = 30
+    matcher             = "200"
+  }
+
+  deregistration_delay = 30
+
+  tags = merge(var.tags, {
+    Name        = "${var.name_prefix}-tg-srv-int-udp-green"
+    Component   = "compute"
+    Cell        = var.cell_id
+    DeployColor = "green"
+  })
+}
+
 # HTTPS Target Group for Green ASG (conditional on QURL endpoint)
 resource "aws_lb_target_group" "https_green" {
   count = var.enable_blue_green && var.enable_qurl_resolve_endpoint ? 1 : 0
@@ -410,17 +492,15 @@ resource "aws_autoscaling_group" "server_green" {
     "GroupTotalInstances",
   ]
 
-  # Attach to green target groups. Includes the internal UDP NLB's TG (#2208 #8)
-  # when relay_enabled, so the relay->server internal NLB reaches the GREEN fleet
-  # too (the blue ASG attaches to the same TG via aws_autoscaling_attachment.server_internal).
-  # See the aws_lb_target_group.udp_internal block in main.tf for the both-attach
-  # rationale + the active-color-only refinement (#2645).
+  # Attach to green target groups. The relay->server internal NLB uses per-color
+  # TGs, so the green ASG attaches only to the green internal TG and never shares
+  # the blue TG with the warm-standby path.
   target_group_arns = compact(concat(
     # #2628: drop the public UDP TG when the server is private — the green fleet then
     # serves knocks only via the internal relay NLB's TG (last entry).
     var.public_server_surface_enabled ? [aws_lb_target_group.udp_green[0].arn] : [],
     var.enable_qurl_resolve_endpoint ? [aws_lb_target_group.https_green[0].arn] : [],
-    var.relay_enabled ? [aws_lb_target_group.udp_internal[0].arn] : []
+    var.relay_enabled ? [aws_lb_target_group.udp_internal_green[0].arn] : []
   ))
 
   tag {
@@ -647,7 +727,11 @@ resource "aws_cloudwatch_metric_alarm" "green_asg_unhealthy" {
   })
 }
 
-# Alarm: Green target group has no healthy targets (critical for rollback)
+# Alarm: Green target group has no healthy targets (critical for rollback).
+# Warm standby treats missing data as breaching; cold standby intentionally has
+# no green targets until it is warmed, so missing datapoints do not page.
+# This same warm/cold gate applies to the pre-existing public green TG alarm,
+# not just the new internal relay green TG alarm below.
 resource "aws_cloudwatch_metric_alarm" "green_tg_no_healthy_targets" {
   # Gate on the STATIC enable_sns_alerts, not the computed
   # alerts_sns_topic_arn != null, to avoid count-depends-on-computed
@@ -655,9 +739,8 @@ resource "aws_cloudwatch_metric_alarm" "green_tg_no_healthy_targets" {
   #
   # #2628: also gated on public_server_surface_enabled — this alarm keys on the
   # PUBLIC NLB + the public green UDP TG, both removed when the server is private.
-  # The internal relay NLB has its own no-healthy-targets alarm
-  # (internal_tg_no_healthy_targets in main.tf), which covers the knock path for
-  # both colors in the private topology.
+  # The internal relay NLB has per-color no-healthy-targets alarms for the private
+  # knock path.
   count = var.enable_blue_green && var.enable_sns_alerts && var.public_server_surface_enabled ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-green-tg-no-healthy"
@@ -669,7 +752,7 @@ resource "aws_cloudwatch_metric_alarm" "green_tg_no_healthy_targets" {
   period              = 60
   statistic           = "Minimum"
   threshold           = 1
-  treat_missing_data  = "breaching"
+  treat_missing_data  = var.green_standby_min_size > 0 ? "breaching" : "notBreaching"
 
   dimensions = {
     TargetGroup  = aws_lb_target_group.udp_green[0].arn_suffix
@@ -681,6 +764,42 @@ resource "aws_cloudwatch_metric_alarm" "green_tg_no_healthy_targets" {
 
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-green-tg-health-alarm"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+# Alarm: the GREEN internal relay target group has no healthy targets. The BLUE
+# internal TG alarm lives next to aws_lb_target_group.udp_internal in main.tf;
+# this sibling keeps green-side relay routing covered now that the internal relay
+# path is per-color instead of a single both-color TG. Warm standby pages on
+# missing HealthyHostCount because an unhealthy standby color is unsafe to flip
+# to; cold standby suppresses missing-data pages until green is intentionally
+# warmed.
+resource "aws_cloudwatch_metric_alarm" "green_internal_tg_no_healthy_targets" {
+  count = var.enable_blue_green && var.relay_enabled && var.enable_sns_alerts ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-srv-int-green-tg-no-healthy"
+  alarm_description   = "Green internal relay target group has no healthy targets - green relay knocks would fail if green is or becomes active"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "HealthyHostCount"
+  namespace           = "AWS/NetworkELB"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 1
+  treat_missing_data  = var.green_standby_min_size > 0 ? "breaching" : "notBreaching"
+
+  dimensions = {
+    TargetGroup  = aws_lb_target_group.udp_internal_green[0].arn_suffix
+    LoadBalancer = aws_lb.server_internal[0].arn_suffix
+  }
+
+  alarm_actions = [var.alerts_sns_topic_arn]
+  ok_actions    = [var.alerts_sns_topic_arn]
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-srv-int-green-tg-health-alarm"
     Component = "compute"
     Cell      = var.cell_id
   })

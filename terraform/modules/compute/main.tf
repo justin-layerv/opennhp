@@ -1440,18 +1440,11 @@ resource "aws_lb_listener" "udp" {
 #   - internal = true + private subnets (this is the in-VPC relay->server hop,
 #     not an internet edge);
 #   - UDP-only: NO resolver HTTPS listener/TG (the relay speaks only UDP knock);
-#   - blue/green: a SINGLE internal TG fronts BOTH colors — the blue ASG via
-#     aws_autoscaling_attachment.server_internal below, the green ASG via its
-#     target_group_arns (blue_green.tf) — and the listener forwards statically to
-#     it. The public path instead keeps per-color TGs and FLIPS its listener's
-#     default_action in blue-green-deploy.yml's switch-traffic. Both-attach keeps
-#     the internal NLB pointed at the active color's fleet across a flip (a
-#     blue-only attach would route the relay to the stale warm-standby after a
-#     green-active deploy). Trade-off: a fraction of knocks reach the warm-standby
-#     (min=1, maybe old-image) color — benign, the NHP protocol is version-stable
-#     and the relay forwards opaque packets. Active-color-only routing (full
-#     public-path parity: green internal TG + listener flip) is tracked for #6 in
-#     #2645.
+#   - blue/green: per-color internal TGs plus listener flips, matching the
+#     public UDP path. The relay keeps one stable cell/server identity, but the
+#     target source behind that identity must be active-color-only. Routing
+#     one-time qURL knocks to a warm-standby server can commit qURL admission and
+#     then fail AC-open if that standby is not in the live AC assignment set.
 #
 # preserve_client_ip = true (mirrors the public TG's behaviour, see below): the
 # server sees the relay INSTANCE's IP as the packet source and replies DIRECTLY
@@ -1485,7 +1478,9 @@ resource "aws_lb" "server_internal" {
   })
 }
 
-# Internal UDP Target Group (mirrors aws_lb_target_group.udp).
+# Internal UDP Target Group for the BLUE server ASG (mirrors
+# aws_lb_target_group.udp). The existing resource/name is retained as the blue
+# target group to avoid replacing the live relay NLB TG during this migration.
 resource "aws_lb_target_group" "udp_internal" {
   count       = var.relay_enabled ? 1 : 0
   name        = replace("${var.name_prefix}-srv-int-udp", "_", "-")
@@ -1514,26 +1509,25 @@ resource "aws_lb_target_group" "udp_internal" {
   deregistration_delay = 30
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-tg-srv-int-udp"
-    Component = "compute"
-    Cell      = var.cell_id
+    Name        = "${var.name_prefix}-tg-srv-int-udp-blue"
+    Component   = "compute"
+    Cell        = var.cell_id
+    DeployColor = "blue"
   })
 }
 
-# Attach the BLUE server ASG to the internal TG (multi-TG attach on this ASG is
-# already in use — aws_autoscaling_attachment.https alongside .server). The GREEN
-# ASG attaches to the SAME internal TG via its target_group_arns (blue_green.tf),
-# see the udp_internal block comment above for the both-attach blue/green rationale.
+# Attach the BLUE server ASG to the BLUE internal TG (multi-TG attach on this ASG
+# is already in use — aws_autoscaling_attachment.https alongside .server). The
+# GREEN ASG attaches to its own internal TG in blue_green.tf.
 resource "aws_autoscaling_attachment" "server_internal" {
   count                  = var.relay_enabled ? 1 : 0
   autoscaling_group_name = aws_autoscaling_group.server.name
   lb_target_group_arn    = aws_lb_target_group.udp_internal[0].arn
 }
 
-# Internal UDP Listener. Forwards statically to the single internal TG (which
-# fronts both colors), so — unlike the public UDP listener — it is NOT flipped by
-# the blue/green switch and needs no ignore_changes. Active-color-only routing via
-# a per-color listener flip is the #2645 refinement.
+# Internal UDP Listener. Blue/green switch flips this listener between the blue
+# and green internal TGs in the same operation that updates active-color. Keep
+# Terraform from resetting a live green-active deployment back to blue.
 resource "aws_lb_listener" "udp_internal" {
   count             = var.relay_enabled ? 1 : 0
   load_balancer_arn = aws_lb.server_internal[0].arn
@@ -1550,14 +1544,21 @@ resource "aws_lb_listener" "udp_internal" {
     Component = "compute"
     Cell      = var.cell_id
   })
+
+  lifecycle {
+    ignore_changes = [default_action]
+  }
 }
 
-# Alarm: the internal cell-NLB target group has no healthy targets. Mirrors
-# green_tg_no_healthy_targets (blue_green.tf) for the relay->server hop — the
-# internal NLB is the relay's ONLY path to the cell servers, so a fully unhealthy
-# internal TG silently fails every relayed knock once the relay is live (#2645;
-# flagged in the #2641 review). treat_missing_data=breaching matches that
-# sibling: a TG reporting no HealthyHostCount is itself the failure to page on.
+# Alarm: the BLUE internal cell-NLB target group has no healthy targets. Mirrors
+# green_internal_tg_no_healthy_targets (blue_green.tf) for the relay->server hop.
+# The internal NLB is the relay's ONLY path to the cell servers, so a fully
+# unhealthy internal TG silently fails relayed knocks when that color is active,
+# and is unsafe to flip to when that color is standby.
+# treat_missing_data=breaching matches that sibling: a TG reporting no
+# HealthyHostCount is itself the failure to page on.
+# No cold-standby gate here: blue is the always-warm baseline ASG, while only
+# the green standby ASG can intentionally scale to zero.
 #
 # Count gates on relay_enabled (the internal NLB only exists where the relay is
 # deployed) + the STATIC enable_sns_alerts — NOT green_tg's computed
@@ -1571,7 +1572,7 @@ resource "aws_cloudwatch_metric_alarm" "internal_tg_no_healthy_targets" {
   count = var.relay_enabled && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-srv-int-tg-no-healthy"
-  alarm_description   = "Internal cell-NLB target group has no healthy targets - the relay->server knock hop is down"
+  alarm_description   = "Blue internal relay target group has no healthy targets - blue relay knocks would fail if blue is or becomes active"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2
   metric_name         = "HealthyHostCount"
