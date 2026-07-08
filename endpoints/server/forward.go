@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,15 +24,17 @@ import (
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md sections 6.3-6.5 for details.
 //
 // When a knock arrives at a server that doesn't have a connection to the
-// target AC, the knock is forwarded to one of the AC's assigned servers
-// via NHP_FWD. The assigned server handles the knock and returns the
-// result via NHP_FRT.
+// target AC, ForwardKnock races the AC's healthy assigned servers via NHP_FWD
+// and returns the first successful NHP_FRT result. FanoutKnock is coverage-only
+// and sends one NHP_FWD per non-local AZ.
 //
 // Key design decisions:
 // - Uses Noise K pattern for forward secrecy (per-server keypairs)
-// - Random shuffle + health tracking for load distribution
+// - Health tracking skips recently failed peers without poisoning on local pressure
+//   unless skipping would leave a retry-less admission with zero attempts
+// - Bounded first-success fan-out for retry-less forwarded admission
 // - 30-second health decay for automatic recovery
-// - 2-second timeout per forward attempt
+// - 2-second timeout for the forwarded admission budget
 // ============================================================================
 
 const (
@@ -47,13 +48,28 @@ const (
 	MaxTimestampAge = 30 * time.Second
 
 	// MaxPendingForwards is the maximum number of concurrent pending forwards.
-	// This prevents unbounded memory growth under DDoS or slow downstream.
-	MaxPendingForwards = 10000
+	// ForwardKnock can schedule up to MaxServersPerAssignment per user knock, so
+	// keep this at 3x the old single-peer cap to preserve effective headroom
+	// while still preventing unbounded growth under DDoS or slow downstream.
+	MaxPendingForwards = 30000
+
+	// ForwardNoResponseFailureThreshold is the number of consecutive full-budget
+	// no-response outcomes required before a peer is marked unhealthy. A single
+	// shared budget expiry must not poison every assigned owner; if all owners
+	// are cached unhealthy, ForwardKnock still falls back to attempting the
+	// bounded assignment row so a retry-less admission never turns into zero
+	// forward attempts.
+	ForwardNoResponseFailureThreshold = 2
 )
 
 type localForwardSendError struct {
 	err error
 }
+
+var (
+	errAllAssignedServersUnhealthy = errors.New("all assigned servers unreachable or unhealthy")
+	errForwardTimeout              = errors.New("forward timeout")
+)
 
 func (e *localForwardSendError) Error() string {
 	return e.err.Error()
@@ -66,6 +82,37 @@ func (e *localForwardSendError) Unwrap() error {
 func isLocalForwardSendError(err error) bool {
 	var localErr *localForwardSendError
 	return errors.As(err, &localErr)
+}
+
+func shouldRecordForwardFailure(err error) bool {
+	return err != nil &&
+		!isLocalForwardSendError(err) &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) &&
+		// handleNhpOpenResource gives ForwardKnock the same ForwardTimeout as
+		// each peer attempt, so errForwardTimeout is shared-budget exhaustion in
+		// this path rather than proof that one peer should be marked unhealthy.
+		!errors.Is(err, errForwardTimeout)
+}
+
+func shouldRecordForwardNoResponse(err error) bool {
+	return errors.Is(err, errForwardTimeout) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// recordForwardPeerFailure applies the shared peer-health policy for a failed
+// forward attempt: real peer failures poison health immediately, while local
+// pressure, cancellation, and single shared-budget expiries are ignored, and a
+// persistent full-budget no-response only marks the peer unhealthy after the
+// consecutive threshold. op labels the calling path for the threshold warning.
+func (f *ServerForwarder) recordForwardPeerFailure(op, serverID, acID string, err error) {
+	if shouldRecordForwardFailure(err) {
+		f.health.RecordFailure(serverID)
+		return
+	}
+	if shouldRecordForwardNoResponse(err) && f.health.RecordNoResponse(serverID) {
+		log.Warning("%s to server %s for AC %s hit %d consecutive full-budget no-response outcomes; marking peer unhealthy",
+			op, serverID, acID, ForwardNoResponseFailureThreshold)
+	}
 }
 
 // ServerForwarder handles server-to-server knock forwarding.
@@ -92,8 +139,9 @@ type PendingForward struct {
 
 // ServerHealthTracker tracks server health for smart forwarding.
 type ServerHealthTracker struct {
-	failures map[string]time.Time // Server ID -> last failure time
-	mu       sync.RWMutex
+	failures    map[string]time.Time // Server ID -> last failure time
+	noResponses map[string]int       // Server ID -> consecutive full-budget no-response count
+	mu          sync.RWMutex
 }
 
 // NewServerForwarder creates a new server forwarder.
@@ -115,7 +163,8 @@ func NewServerForwarder(deps ForwarderDeps) *ServerForwarder {
 // NewServerHealthTracker creates a new health tracker.
 func NewServerHealthTracker() *ServerHealthTracker {
 	return &ServerHealthTracker{
-		failures: make(map[string]time.Time),
+		failures:    make(map[string]time.Time),
+		noResponses: make(map[string]int),
 	}
 }
 
@@ -132,6 +181,31 @@ func (h *ServerHealthTracker) RecordFailure(serverID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.failures[serverID] = time.Now()
+	delete(h.noResponses, serverID)
+}
+
+// RecordNoResponse records a full-budget no-response outcome. It returns true
+// when the peer crossed the consecutive threshold and was marked unhealthy.
+func (h *ServerHealthTracker) RecordNoResponse(serverID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.noResponses[serverID]++
+	if h.noResponses[serverID] < ForwardNoResponseFailureThreshold {
+		return false
+	}
+
+	h.failures[serverID] = time.Now()
+	delete(h.noResponses, serverID)
+	return true
+}
+
+// ClearNoResponse clears only the soft consecutive no-response debt. It does
+// not clear a real failure/unhealthy mark.
+func (h *ServerHealthTracker) ClearNoResponse(serverID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.noResponses, serverID)
 }
 
 // RecordSuccess records a successful communication (clears failure).
@@ -139,10 +213,25 @@ func (h *ServerHealthTracker) RecordSuccess(serverID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.failures, serverID)
+	delete(h.noResponses, serverID)
 }
 
-// ForwardKnock forwards a knock to one of the AC's assigned servers.
-// Returns the ACK data to send to the user, or an error if all servers failed.
+// ForwardKnock forwards a knock to the AC's healthy assigned servers and
+// returns the first successful ACK data to send to the user.
+//
+// Unlike FanoutKnock -- which bounds to one peer per non-local AZ purely for
+// pinhole coverage -- ForwardKnock deliberately races every healthy assigned
+// server. The customer's single admission attempt gets no second chance, so it
+// spends the redundant assigned owners already in the placement row rather than
+// letting one slow or non-owner peer consume the whole timeout. Do not AZ-bound
+// this path. This applies to every native no-local-AC forward, not just qURL v2
+// admission; receivers may all open valid pinholes, so rollout validation should
+// watch MetricKnockForwardPeerAttempt alongside AC operation volume. Native
+// receiver-side plugin work must be idempotent enough for that bounded
+// duplicate processing. For qURL v2, qurl-service prepare/commit already ran
+// once on the origin before this call; forwarded receivers only open AC pinholes
+// with the committed admission metadata sidecar, so fan-out does not multiply
+// one-time-use or session-count commits.
 func (f *ServerForwarder) ForwardKnock(
 	ctx context.Context,
 	assignment *ACAssignment,
@@ -153,41 +242,126 @@ func (f *ServerForwarder) ForwardKnock(
 	if len(assignment.AssignedServers) == 0 {
 		return nil, errors.New("no assigned servers for AC")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	// Copy and shuffle servers for load distribution
-	servers := slices.Clone(assignment.AssignedServers)
+	// Placement should keep assigned server IDs unique; enforce that locally so
+	// topology drift cannot double-send, double-open AC pinholes, or double-write
+	// health for the same peer in one user knock.
+	servers := make([]ServerInfo, 0, len(assignment.AssignedServers))
+	seenServerIDs := make(map[string]struct{}, len(assignment.AssignedServers))
+	for _, server := range assignment.AssignedServers {
+		if _, ok := seenServerIDs[server.ID]; ok {
+			log.Warning("Skipping duplicate assigned server %s for AC %s in forward fan-out", server.ID, assignment.ACID)
+			continue
+		}
+		seenServerIDs[server.ID] = struct{}{}
+		servers = append(servers, server)
+	}
+
+	// Shuffle goroutine launch order so equal-latency responses are not always
+	// biased by assignment ordering. All healthy targets are still contacted.
 	rand.Shuffle(len(servers), func(i, j int) {
 		servers[i], servers[j] = servers[j], servers[i]
 	})
 
-	// Try each server in order, skipping unhealthy ones
-	var lastErr error
+	targets := make([]ServerInfo, 0, len(servers))
 	for _, target := range servers {
-		// Skip servers we've recently seen fail
 		if f.health.IsUnhealthy(target.ID) {
 			log.Debug("Skipping unhealthy server %s for AC %s", target.ID, assignment.ACID)
 			continue
 		}
+		targets = append(targets, target)
+	}
+	if len(targets) == 0 {
+		// Do not let the local health cache convert a retry-less forwarded
+		// admission into an immediate zero-attempt denial. If every assigned
+		// owner is cached unhealthy, spend the bounded unique assignment row and
+		// let the current attempt prove whether any owner has recovered.
+		log.Warning("All %d assigned servers for AC %s are cached unhealthy; attempting all unique owners for retry-less forwarded admission",
+			len(servers), assignment.ACID)
+		targets = append(targets, servers...)
+	}
 
-		result, err := f.forwardToServer(ctx, target, assignment.ACID, knockData, userAddr, admissionResource)
-		if err != nil {
-			log.Warning("Forward to server %s failed for AC %s: %v", target.ID, assignment.ACID, err)
-			if !isLocalForwardSendError(err) {
-				f.health.RecordFailure(target.ID)
-			}
-			lastErr = err
+	type forwardOutcome struct {
+		target ServerInfo
+		result *common.ServerForwardResultMsg
+		err    error
+	}
+
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// The buffer size is load-bearing: ForwardKnock returns on first success,
+	// so losing goroutines must be able to report their outcome without blocking
+	// even when this caller stops ranging the channel.
+	outcomes := make(chan forwardOutcome, len(targets))
+	var wg sync.WaitGroup
+	for _, target := range targets {
+		if f.deps != nil {
+			f.deps.IncrForwarderMetric(MetricKnockForwardPeerAttempt)
+		}
+		wg.Add(1)
+		go func(target ServerInfo) {
+			defer wg.Done()
+			result, err := f.forwardToServer(attemptCtx, target, assignment.ACID, knockData, userAddr, admissionResource)
+			outcomes <- forwardOutcome{target: target, result: result, err: err}
+		}(target)
+	}
+	go func() {
+		wg.Wait()
+		close(outcomes)
+	}()
+
+	var lastErr error
+	for outcome := range outcomes {
+		if outcome.err != nil {
+			log.Warning("Forward to server %s failed for AC %s: %v", outcome.target.ID, assignment.ACID, outcome.err)
+			f.recordForwardPeerFailure("Forward", outcome.target.ID, assignment.ACID, outcome.err)
+			lastErr = outcome.err
 			continue
 		}
 
-		// Success
-		f.health.RecordSuccess(target.ID)
-		return result, nil
+		// Reachability health is separate from AC ownership. A non-success
+		// response can still prove the peer answered, while other owners race.
+		f.health.RecordSuccess(outcome.target.ID)
+		if outcome.result != nil && outcome.result.Success {
+			for _, target := range targets {
+				if target.ID != outcome.target.ID {
+					f.health.ClearNoResponse(target.ID)
+				}
+			}
+			cancel()
+			return outcome.result, nil
+		}
+
+		lastErr = forwardUnsuccessfulResultError(outcome.target, assignment.ACID, outcome.result)
+		log.Warning("Forward to server %s returned unsuccessful result for AC %s: %v", outcome.target.ID, assignment.ACID, lastErr)
 	}
 
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, errors.New("all assigned servers unreachable or unhealthy")
+	// Defensive safety net: targets is non-empty, and every non-success outcome
+	// above sets lastErr. Keep a deterministic error if that invariant changes.
+	return nil, errAllAssignedServersUnhealthy
+}
+
+func forwardUnsuccessfulResultError(target ServerInfo, acID string, result *common.ServerForwardResultMsg) error {
+	prefix := fmt.Sprintf("forward to server %s for AC %s", target.ID, acID)
+	switch {
+	case result == nil:
+		return fmt.Errorf("%s returned nil result", prefix)
+	case result.ErrCode == "" && result.ErrMsg == "":
+		return fmt.Errorf("%s returned unsuccessful result", prefix)
+	case result.ErrCode == "":
+		return fmt.Errorf("%s rejected: %s", prefix, result.ErrMsg)
+	case result.ErrMsg == "":
+		return fmt.Errorf("%s rejected with %s", prefix, result.ErrCode)
+	default:
+		return fmt.Errorf("%s rejected with %s: %s", prefix, result.ErrCode, result.ErrMsg)
+	}
 }
 
 // FanoutKnock sends the knock to one assigned peer server per non-local AZ in
@@ -221,7 +395,7 @@ func (f *ServerForwarder) FanoutKnock(
 	// is a topology-drift signal: unlike the HTTP path's CloudMap-filtered
 	// count, the local failure cache below is stale by design and must not hide
 	// a duplicate-AZ assignment from rollout validation.
-	if duplicateAZBuckets := countDuplicateFanoutAZBuckets(assignment.AssignedServers, selfInternalIP); duplicateAZBuckets > 0 {
+	if duplicateAZBuckets := countDuplicateFanoutAZBuckets(assignment.AssignedServers, selfInternalIP); duplicateAZBuckets > 0 && f.deps != nil {
 		// Forwarder metrics are exposed as increment-only callbacks, so emit one
 		// sample per duplicate AZ bucket.
 		for i := 0; i < duplicateAZBuckets; i++ {
@@ -245,9 +419,7 @@ func (f *ServerForwarder) FanoutKnock(
 			defer wg.Done()
 			result, ferr := f.forwardToServer(ctx, target, assignment.ACID, knockData, userAddr, admissionResource)
 			if ferr != nil {
-				if !isLocalForwardSendError(ferr) {
-					f.health.RecordFailure(target.ID)
-				}
+				f.recordForwardPeerFailure("Knock fan-out", target.ID, assignment.ACID, ferr)
 				log.Warning("Knock fan-out to server %s failed for AC %s: %v", target.ID, assignment.ACID, ferr)
 				return
 			}
@@ -408,7 +580,9 @@ func (f *ServerForwarder) forwardToServer(
 	f.pendingMutex.Lock()
 	if len(f.pendingFwds) >= MaxPendingForwards {
 		f.pendingMutex.Unlock()
-		return nil, errors.New("too many pending forwards")
+		return nil, &localForwardSendError{
+			err: errors.New("too many pending forwards"),
+		}
 	}
 	f.pendingFwds[txID] = pending
 	f.pendingMutex.Unlock()
@@ -456,7 +630,7 @@ func (f *ServerForwarder) forwardToServer(
 	case result := <-responseCh:
 		return result, nil
 	case <-time.After(ForwardTimeout):
-		return nil, errors.New("forward timeout")
+		return nil, errForwardTimeout
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -974,7 +1148,10 @@ func (f *ServerForwarder) HandleForwardResult(
 	f.pendingMutex.RUnlock()
 
 	if !ok {
-		log.Warning("Received NHP_FRT for unknown transaction %d", resultMsg.TransactionId)
+		if f.deps != nil {
+			f.deps.IncrForwarderMetric(MetricServerForwardUnknownResult)
+		}
+		log.Debug("Received NHP_FRT for unknown transaction %d; expected when a first-success forward already returned", resultMsg.TransactionId)
 		return
 	}
 

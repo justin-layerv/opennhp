@@ -151,6 +151,17 @@ const (
 	MetricKnockFanout            = "KnockFanout"            // origin knocks that fanned out (per acId)
 	MetricKnockFanoutPeerSuccess = "KnockFanoutPeerSuccess" // peer servers that accepted a fan-out knock
 	MetricKnockFanoutPeerFail    = "KnockFanoutPeerFail"    // peer servers a fan-out knock could not reach
+	// MetricKnockForwardPeerAttempt counts each scheduled native NHP_FWD peer
+	// attempt from the no-local-AC forward path. Local pending-forward
+	// backpressure can still abort before a packet is sent. ForwardKnock now
+	// races every healthy assigned owner, so this is the graphable multiplier
+	// behind AC AOP volume during blue/green and qURL admission burn-in.
+	MetricKnockForwardPeerAttempt = "KnockForwardPeerAttempt"
+	// MetricServerForwardUnknownResult counts NHP_FRT responses that arrive after
+	// the origin has already stopped waiting for that transaction. That is
+	// expected for first-success ForwardKnock losers, but the counter keeps the
+	// volume visible without warning-level log noise.
+	MetricServerForwardUnknownResult = "ServerForwardUnknownResult"
 	// MetricKnockFanoutDuplicateAZCandidate flags a topology/precondition drift:
 	// a bounded fan-out selector saw more than one eligible assigned peer in at
 	// least one non-local AZ bucket. Fan-out still sends one peer per AZ; this

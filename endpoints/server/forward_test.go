@@ -18,6 +18,13 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
+// forwardKnockOutcome captures a ForwardKnock return value so tests can run the
+// call in a goroutine and select on its completion.
+type forwardKnockOutcome struct {
+	result *common.ServerForwardResultMsg
+	err    error
+}
+
 func TestForwardedAgentPubKeyRejectsEmpty(t *testing.T) {
 	if got, ok := forwardedAgentPubKey(&core.PacketParserData{}); ok || got != "" {
 		t.Fatalf("forwardedAgentPubKey(empty)=(%q,%v), want empty,false", got, ok)
@@ -807,6 +814,49 @@ func TestServerHealthTracker_RecordFailure(t *testing.T) {
 	}
 }
 
+func TestServerHealthTracker_RecordNoResponseThreshold(t *testing.T) {
+	tracker := NewServerHealthTracker()
+
+	if tracker.RecordNoResponse("srv-1") {
+		t.Fatal("first no-response should not mark server unhealthy")
+	}
+	if tracker.IsUnhealthy("srv-1") {
+		t.Fatal("server should stay healthy after one no-response")
+	}
+	if !tracker.RecordNoResponse("srv-1") {
+		t.Fatal("second consecutive no-response should mark server unhealthy")
+	}
+	if !tracker.IsUnhealthy("srv-1") {
+		t.Fatal("server should be unhealthy after no-response threshold")
+	}
+
+	tracker.RecordSuccess("srv-1")
+	if tracker.IsUnhealthy("srv-1") {
+		t.Fatal("success should clear no-response unhealthy state")
+	}
+	if tracker.RecordNoResponse("srv-1") {
+		t.Fatal("success should reset no-response counter")
+	}
+}
+
+func TestServerHealthTracker_ClearNoResponsePreservesFailure(t *testing.T) {
+	tracker := NewServerHealthTracker()
+
+	if tracker.RecordNoResponse("srv-1") {
+		t.Fatal("first no-response should not mark server unhealthy")
+	}
+	tracker.ClearNoResponse("srv-1")
+	if tracker.RecordNoResponse("srv-1") {
+		t.Fatal("ClearNoResponse should reset no-response counter")
+	}
+
+	tracker.RecordFailure("srv-1")
+	tracker.ClearNoResponse("srv-1")
+	if !tracker.IsUnhealthy("srv-1") {
+		t.Fatal("ClearNoResponse should not clear hard failure state")
+	}
+}
+
 func TestServerHealthTracker_RecordSuccess(t *testing.T) {
 	tracker := NewServerHealthTracker()
 
@@ -1042,28 +1092,119 @@ func TestForwardKnock_NoAssignedServers(t *testing.T) {
 	}
 }
 
-func TestForwardKnock_SkipsUnhealthyServers(t *testing.T) {
-	forwarder := &ServerForwarder{
-		health:      NewServerHealthTracker(),
-		pendingFwds: make(map[uint64]*PendingForward),
-		serverPeers: make(map[string]*core.UdpPeer),
-		nextTxID:    1000,
+func TestForwardKnock_SkipsUnhealthyServersWhenHealthyTargetsRemain(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
 	}
 
-	// Mark all servers as unhealthy
-	forwarder.health.RecordFailure("srv-1")
-	forwarder.health.RecordFailure("srv-2")
-	forwarder.health.RecordFailure("srv-3")
-
-	assignment := CreateTestACAssignment("ac-1", "srv-1", "srv-2", "srv-3")
-
-	ctx := context.Background()
-	_, err := forwarder.ForwardKnock(ctx, assignment, []byte("knock"), nil, nil)
-	if err == nil {
-		t.Fatal("Expected error when all servers are unhealthy")
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
 	}
-	if err.Error() != "all assigned servers unreachable or unhealthy" {
-		t.Errorf("Unexpected error: %v", err)
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	sent := make(chan *core.MsgData, 3)
+	deps := &captureSendForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		sent:              sent,
+	}
+	forwarder := NewServerForwarder(deps)
+	forwarder.health.RecordFailure("srv-a")
+	assignment := &ACAssignment{
+		ACID: "ac-skip-unhealthy",
+		AssignedServers: []ServerInfo{
+			{ID: "srv-a", InternalIP: "10.0.0.71", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-b", InternalIP: "10.0.0.72", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-c", InternalIP: "10.0.0.73", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := forwarder.ForwardKnock(
+			ctx,
+			assignment,
+			[]byte("knock"),
+			&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+			nil,
+		)
+		done <- err
+	}()
+
+	forwarded := collectForwardedMsgData(t, sent, 2)
+	assertForwardedRemoteIPs(t, forwarded, []string{"10.0.0.72", "10.0.0.73"})
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ForwardKnock error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ForwardKnock skip-unhealthy attempt")
+	}
+}
+
+func TestForwardKnock_AllUnhealthyServersStillAttempted(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	sent := make(chan *core.MsgData, 3)
+	deps := &captureSendForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		sent:              sent,
+	}
+	forwarder := NewServerForwarder(deps)
+	assignment := &ACAssignment{
+		ACID: "ac-all-unhealthy",
+		AssignedServers: []ServerInfo{
+			{ID: "srv-a", InternalIP: "10.0.0.74", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-b", InternalIP: "10.0.0.75", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-c", InternalIP: "10.0.0.76", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+		},
+	}
+	for _, target := range assignment.AssignedServers {
+		forwarder.health.RecordFailure(target.ID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := forwarder.ForwardKnock(
+			ctx,
+			assignment,
+			[]byte("knock"),
+			&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+			nil,
+		)
+		done <- err
+	}()
+
+	forwarded := collectForwardedMsgData(t, sent, 3)
+	assertForwardedRemoteIPs(t, forwarded, []string{"10.0.0.74", "10.0.0.75", "10.0.0.76"})
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ForwardKnock error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ForwardKnock all-unhealthy fallback")
 	}
 }
 
@@ -1121,6 +1262,55 @@ func TestForwardKnock_SendFailureReturnsImmediately(t *testing.T) {
 	}
 }
 
+func TestForwardKnock_PendingBackpressureDoesNotPoisonPeerHealth(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	forwarder := NewServerForwarder(baseDeps)
+	for i := 0; i < MaxPendingForwards; i++ {
+		forwarder.pendingFwds[uint64(i+1)] = &PendingForward{TransactionID: uint64(i + 1)}
+	}
+
+	assignment := &ACAssignment{
+		ACID: "ac-backpressure",
+		AssignedServers: []ServerInfo{
+			{
+				ID:         "srv-backpressure",
+				InternalIP: "10.0.0.55",
+				Port:       common.DefaultNHPPort,
+				PubKey:     device.PublicKeyBase64(),
+			},
+		},
+	}
+
+	_, err := forwarder.ForwardKnock(
+		context.Background(),
+		assignment,
+		[]byte("knock"),
+		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("ForwardKnock returned nil error, want pending-forward backpressure")
+	}
+	if !strings.Contains(err.Error(), "too many pending forwards") {
+		t.Fatalf("ForwardKnock error = %q, want pending-forward backpressure", err)
+	}
+	if forwarder.health.IsUnhealthy("srv-backpressure") {
+		t.Fatal("local pending-forward backpressure marked remote server unhealthy")
+	}
+}
+
 func TestForwardKnock_CarriesAdmissionRevocationData(t *testing.T) {
 	testPrivateKey := make([]byte, 32)
 	for i := range testPrivateKey {
@@ -1155,10 +1345,7 @@ func TestForwardKnock_CarriesAdmissionRevocationData(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	done := make(chan struct {
-		result *common.ServerForwardResultMsg
-		err    error
-	}, 1)
+	done := make(chan forwardKnockOutcome, 1)
 	go func() {
 		result, err := forwarder.ForwardKnock(
 			ctx,
@@ -1184,10 +1371,7 @@ func TestForwardKnock_CarriesAdmissionRevocationData(t *testing.T) {
 				Deadline:              1781910300,
 			},
 		)
-		done <- struct {
-			result *common.ServerForwardResultMsg
-			err    error
-		}{result: result, err: err}
+		done <- forwardKnockOutcome{result: result, err: err}
 	}()
 
 	var fwdMsg common.ServerForwardMsg
@@ -1240,6 +1424,398 @@ func TestForwardKnock_CarriesAdmissionRevocationData(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for ForwardKnock result")
+	}
+}
+
+func TestForwardKnock_FansOutAssignedServersAndReturnsFirstSuccess(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	sent := make(chan *core.MsgData, 3)
+	deps := &captureSendForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		sent:              sent,
+	}
+	forwarder := NewServerForwarder(deps)
+	assignment := &ACAssignment{
+		ACID: "ac-forward",
+		AssignedServers: []ServerInfo{
+			{ID: "srv-a", InternalIP: "10.0.0.61", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-b", InternalIP: "10.0.0.62", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-c", InternalIP: "10.0.0.63", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+		},
+	}
+	for _, target := range assignment.AssignedServers {
+		if forwarder.health.RecordNoResponse(target.ID) {
+			t.Fatalf("first no-response for %s should not mark server unhealthy", target.ID)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan forwardKnockOutcome, 1)
+	go func() {
+		result, err := forwarder.ForwardKnock(
+			ctx,
+			assignment,
+			[]byte("knock"),
+			&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+			nil,
+		)
+		done <- forwardKnockOutcome{result: result, err: err}
+	}()
+
+	forwarded := collectForwardedMessages(t, sent, 3)
+	if got := baseDeps.MetricCount(MetricKnockForwardPeerAttempt); got != 3 {
+		t.Fatalf("%s metric = %d, want one per assigned peer", MetricKnockForwardPeerAttempt, got)
+	}
+
+	forwarder.HandleForwardResult(nil, &common.ServerForwardResultMsg{
+		TransactionId: forwarded[0].TransactionId,
+		Success:       false,
+		ErrCode:       "AC_NOT_CONNECTED",
+		ErrMsg:        "AC not connected to this server",
+	})
+
+	select {
+	case got := <-done:
+		t.Fatalf("ForwardKnock returned after an unsuccessful peer result: result=%+v err=%v", got.result, got.err)
+	default:
+	}
+
+	forwarder.HandleForwardResult(nil, &common.ServerForwardResultMsg{
+		TransactionId: forwarded[1].TransactionId,
+		Success:       true,
+		ACKData:       []byte("ack"),
+	})
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ForwardKnock returned error despite a successful peer: %v", got.err)
+		}
+		if got.result == nil || !got.result.Success || string(got.result.ACKData) != "ack" {
+			t.Fatalf("ForwardKnock result = %+v, want successful ack", got.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ForwardKnock result")
+	}
+
+	for _, target := range assignment.AssignedServers {
+		if forwarder.health.RecordNoResponse(target.ID) {
+			t.Fatalf("first-success should clear stale no-response debt for %s", target.ID)
+		}
+	}
+
+	waitForPendingForwardRemoval(t, forwarder, forwarded[2].TransactionId)
+	forwarder.HandleForwardResult(nil, &common.ServerForwardResultMsg{
+		TransactionId: forwarded[2].TransactionId,
+		Success:       true,
+		ACKData:       []byte("late-loser-ack"),
+	})
+	if got := baseDeps.MetricCount(MetricServerForwardUnknownResult); got != 1 {
+		t.Fatalf("%s metric = %d, want late loser response counted once", MetricServerForwardUnknownResult, got)
+	}
+}
+
+func TestForwardKnock_AllPeersRejectReturnsErrorAfterAllResults(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	sent := make(chan *core.MsgData, 2)
+	deps := &captureSendForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		sent:              sent,
+	}
+	forwarder := NewServerForwarder(deps)
+	assignment := &ACAssignment{
+		ACID: "ac-reject",
+		AssignedServers: []ServerInfo{
+			{ID: "srv-a", InternalIP: "10.0.0.71", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-b", InternalIP: "10.0.0.72", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan forwardKnockOutcome, 1)
+	go func() {
+		result, err := forwarder.ForwardKnock(
+			ctx,
+			assignment,
+			[]byte("knock"),
+			&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+			nil,
+		)
+		done <- forwardKnockOutcome{result: result, err: err}
+	}()
+
+	forwarded := collectForwardedMessages(t, sent, 2)
+	forwarder.HandleForwardResult(nil, &common.ServerForwardResultMsg{
+		TransactionId: forwarded[0].TransactionId,
+		Success:       false,
+		ErrCode:       "AC_NOT_CONNECTED",
+		ErrMsg:        "first peer had no AC",
+	})
+
+	select {
+	case got := <-done:
+		t.Fatalf("ForwardKnock returned before every assigned peer answered: result=%+v err=%v", got.result, got.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	forwarder.HandleForwardResult(nil, &common.ServerForwardResultMsg{
+		TransactionId: forwarded[1].TransactionId,
+		Success:       false,
+		ErrCode:       "AC_NOT_CONNECTED",
+		ErrMsg:        "second peer had no AC",
+	})
+
+	select {
+	case got := <-done:
+		if got.result != nil {
+			t.Fatalf("ForwardKnock result = %+v, want nil result after all peers reject", got.result)
+		}
+		if got.err == nil || !strings.Contains(got.err.Error(), "AC_NOT_CONNECTED") {
+			t.Fatalf("ForwardKnock error = %v, want AC_NOT_CONNECTED rejection", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ForwardKnock rejection")
+	}
+}
+
+func TestForwardKnock_BudgetTimeoutDoesNotPoisonAssignedServers(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	sent := make(chan *core.MsgData, 3)
+	deps := &captureSendForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		sent:              sent,
+	}
+	forwarder := NewServerForwarder(deps)
+	assignment := &ACAssignment{
+		ACID: "ac-budget-timeout",
+		AssignedServers: []ServerInfo{
+			{ID: "srv-a", InternalIP: "10.0.0.81", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-b", InternalIP: "10.0.0.82", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-c", InternalIP: "10.0.0.83", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan forwardKnockOutcome, 1)
+	go func() {
+		result, err := forwarder.ForwardKnock(
+			ctx,
+			assignment,
+			[]byte("knock"),
+			&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+			nil,
+		)
+		done <- forwardKnockOutcome{result: result, err: err}
+	}()
+
+	collectForwardedMessages(t, sent, 3)
+
+	select {
+	case got := <-done:
+		if got.result != nil {
+			t.Fatalf("ForwardKnock result = %+v, want nil result after budget timeout", got.result)
+		}
+		if !errors.Is(got.err, context.DeadlineExceeded) {
+			t.Fatalf("ForwardKnock error = %v, want context deadline exceeded", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ForwardKnock budget timeout")
+	}
+
+	for _, target := range assignment.AssignedServers {
+		if forwarder.health.IsUnhealthy(target.ID) {
+			t.Fatalf("shared budget timeout marked %s unhealthy", target.ID)
+		}
+	}
+}
+
+func TestForwardKnock_RepeatedBudgetTimeoutMarksNoResponsePeersUnhealthy(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	sent := make(chan *core.MsgData, 6)
+	deps := &captureSendForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		sent:              sent,
+	}
+	forwarder := NewServerForwarder(deps)
+	assignment := &ACAssignment{
+		ACID: "ac-repeated-budget-timeout",
+		AssignedServers: []ServerInfo{
+			{ID: "srv-a", InternalIP: "10.0.0.91", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-b", InternalIP: "10.0.0.92", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-c", InternalIP: "10.0.0.93", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+		},
+	}
+
+	for attempt := 1; attempt <= ForwardNoResponseFailureThreshold; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		done := make(chan error, 1)
+		go func() {
+			_, err := forwarder.ForwardKnock(
+				ctx,
+				assignment,
+				[]byte("knock"),
+				&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+				nil,
+			)
+			done <- err
+		}()
+
+		collectForwardedMessages(t, sent, len(assignment.AssignedServers))
+
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("attempt %d error = %v, want context deadline exceeded", attempt, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timeout waiting for ForwardKnock attempt %d", attempt)
+		}
+		cancel()
+
+		for _, target := range assignment.AssignedServers {
+			gotUnhealthy := forwarder.health.IsUnhealthy(target.ID)
+			wantUnhealthy := attempt == ForwardNoResponseFailureThreshold
+			if gotUnhealthy != wantUnhealthy {
+				t.Fatalf("attempt %d: IsUnhealthy(%s) = %v, want %v",
+					attempt, target.ID, gotUnhealthy, wantUnhealthy)
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := forwarder.ForwardKnock(
+			ctx,
+			assignment,
+			[]byte("knock"),
+			&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+			nil,
+		)
+		done <- err
+	}()
+
+	collectForwardedMessages(t, sent, len(assignment.AssignedServers))
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("all-unhealthy fallback error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ForwardKnock all-unhealthy fallback")
+	}
+}
+
+func TestForwardKnock_DeduplicatesAssignedServers(t *testing.T) {
+	testPrivateKey := make([]byte, 32)
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey, nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	baseDeps := NewMockForwarderDeps()
+	baseDeps.SetDevice(device)
+	sent := make(chan *core.MsgData, 3)
+	deps := &captureSendForwarderDeps{
+		MockForwarderDeps: baseDeps,
+		sent:              sent,
+	}
+	forwarder := NewServerForwarder(deps)
+	assignment := &ACAssignment{
+		ACID: "ac-duplicate-assignment",
+		AssignedServers: []ServerInfo{
+			{ID: "srv-a", InternalIP: "10.0.0.101", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-a", InternalIP: "10.0.0.102", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+			{ID: "srv-b", InternalIP: "10.0.0.103", Port: common.DefaultNHPPort, PubKey: device.PublicKeyBase64()},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := forwarder.ForwardKnock(
+			ctx,
+			assignment,
+			[]byte("knock"),
+			&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 54321},
+			nil,
+		)
+		done <- err
+	}()
+
+	collectForwardedMessages(t, sent, 2)
+	select {
+	case md := <-sent:
+		t.Fatalf("unexpected duplicate forward packet after dedupe: tx=%d", md.TransactionId)
+	default:
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ForwardKnock error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ForwardKnock duplicate-assignment timeout")
 	}
 }
 
@@ -1651,7 +2227,9 @@ func TestHandleForwardResult_MatchingTransaction(t *testing.T) {
 }
 
 func TestHandleForwardResult_UnknownTransaction(t *testing.T) {
+	deps := NewMockForwarderDeps()
 	forwarder := &ServerForwarder{
+		deps:        deps,
 		health:      NewServerHealthTracker(),
 		pendingFwds: make(map[uint64]*PendingForward),
 		serverPeers: make(map[string]*core.UdpPeer),
@@ -1663,9 +2241,11 @@ func TestHandleForwardResult_UnknownTransaction(t *testing.T) {
 		Success:       true,
 	}
 
-	// Should not panic, just log warning
+	// Should not panic; unknown results are counted instead of warning-spamming.
 	forwarder.HandleForwardResult(nil, resultMsg)
-	// If we get here without panic, test passes
+	if got := deps.MetricCount(MetricServerForwardUnknownResult); got != 1 {
+		t.Fatalf("%s metric = %d, want 1", MetricServerForwardUnknownResult, got)
+	}
 }
 
 // ============================================================================
@@ -2410,6 +2990,76 @@ type captureSendForwarderDeps struct {
 	*MockForwarderDeps
 	err  error
 	sent chan *core.MsgData
+}
+
+func collectForwardedMessages(t *testing.T, sent <-chan *core.MsgData, want int) []common.ServerForwardMsg {
+	t.Helper()
+
+	msgs := collectForwardedMsgData(t, sent, want)
+	forwarded := make([]common.ServerForwardMsg, 0, want)
+	for _, md := range msgs {
+		var fwdMsg common.ServerForwardMsg
+		if err := json.Unmarshal(md.Message, &fwdMsg); err != nil {
+			t.Fatalf("unmarshal forward message: %v", err)
+		}
+		forwarded = append(forwarded, fwdMsg)
+	}
+	return forwarded
+}
+
+func collectForwardedMsgData(t *testing.T, sent <-chan *core.MsgData, want int) []*core.MsgData {
+	t.Helper()
+
+	forwarded := make([]*core.MsgData, 0, want)
+	for len(forwarded) < want {
+		select {
+		case md := <-sent:
+			if md.HeaderType != core.NHP_FWD {
+				t.Fatalf("HeaderType=%s, want NHP_FWD", core.HeaderTypeToString(md.HeaderType))
+			}
+			forwarded = append(forwarded, md)
+		case <-time.After(time.Second):
+			t.Fatalf("timeout waiting for parallel forwards; got %d, want %d", len(forwarded), want)
+		}
+	}
+	return forwarded
+}
+
+func assertForwardedRemoteIPs(t *testing.T, forwarded []*core.MsgData, want []string) {
+	t.Helper()
+
+	got := make([]string, 0, len(forwarded))
+	for _, md := range forwarded {
+		if md.RemoteAddr == nil {
+			t.Fatal("RemoteAddr is nil, want *net.UDPAddr")
+		}
+		got = append(got, md.RemoteAddr.IP.String())
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("forwarded remote IPs = %v, want %v", got, want)
+	}
+}
+
+func waitForPendingForwardRemoval(t *testing.T, forwarder *ServerForwarder, txID uint64) {
+	t.Helper()
+
+	deadline := time.After(time.Second)
+	for {
+		forwarder.pendingMutex.RLock()
+		_, exists := forwarder.pendingFwds[txID]
+		forwarder.pendingMutex.RUnlock()
+		if !exists {
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("timeout waiting for pending forward %d to be removed", txID)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func (d *captureSendForwarderDeps) SendMessage(md *core.MsgData) error {

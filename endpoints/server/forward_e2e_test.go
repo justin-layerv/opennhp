@@ -2603,10 +2603,12 @@ func TestE2E_ForwardIntegration_HealthTracking(t *testing.T) {
 	ctx := context.Background()
 
 	// ========================================================================
-	// Test 1: With all servers healthy, both should receive requests
-	// (due to random shuffling, we don't know which gets called first)
+	// Test 1: With all servers healthy, both should receive the bounded
+	// single-attempt fan-out. First success still wins the ACK, but a slow peer
+	// must not consume the whole customer-facing forward budget before the
+	// other assigned peer gets a chance.
 	// ========================================================================
-	t.Log("=== Test 1: All servers healthy - should use any server ===")
+	t.Log("=== Test 1: All servers healthy - should fan out to all healthy assigned servers ===")
 
 	result1, err := forwarder.ForwardKnock(ctx, assignment, knockData, userAddr, nil)
 	if err != nil {
@@ -2616,12 +2618,20 @@ func TestE2E_ForwardIntegration_HealthTracking(t *testing.T) {
 		t.Errorf("Forward 1 should succeed, got: %s", result1.ErrCode)
 	}
 
-	requestMu.Lock()
-	total1 := requestCounts["server-a"] + requestCounts["server-b"]
-	requestMu.Unlock()
+	var total1 int
+	deadline := time.Now().Add(time.Second)
+	for {
+		requestMu.Lock()
+		total1 = requestCounts["server-a"] + requestCounts["server-b"]
+		requestMu.Unlock()
+		if total1 >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
-	if total1 != 1 {
-		t.Errorf("Expected exactly 1 request after first forward, got %d", total1)
+	if total1 != 2 {
+		t.Errorf("Expected both healthy assigned servers to receive the first forward, got %d request(s)", total1)
 	}
 
 	// ========================================================================
@@ -2719,6 +2729,7 @@ func TestE2E_ForwardIntegration_HealthTracking(t *testing.T) {
 	t.Log("SUCCESS: Health tracking test passed!")
 	t.Log("============================================================")
 	t.Log("Verified:")
+	t.Log("  ✓ Healthy assigned servers receive bounded first-attempt fan-out")
 	t.Log("  ✓ Unhealthy servers are skipped")
 	t.Log("  ✓ Healthy fallback servers receive requests")
 	t.Log("  ✓ Multiple requests skip unhealthy server consistently")

@@ -4244,7 +4244,9 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			// Parse user address for forwarding
 			userAddr, parseErr := net.ResolveUDPAddr("udp", addrStr)
 			if parseErr == nil {
-				// Forward the knock to assigned servers
+				// Forward the knock to assigned servers. Keep this caller budget
+				// equal to forward.go's per-peer ForwardTimeout; a full-budget
+				// expiry is shared admission exhaustion, not peer-health proof.
 				fwdCtx, fwdCancel := context.WithTimeout(context.Background(), ForwardTimeout)
 				defer fwdCancel()
 
