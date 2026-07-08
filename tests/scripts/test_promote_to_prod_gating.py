@@ -353,6 +353,19 @@ def _tf_statement_allows_put_metric_data(block: str) -> bool:
     return bool(TF_PUT_METRIC_DATA_ACTION_RE.search(block))
 
 
+def _tf_action_values(block: str) -> set[str]:
+    list_match = re.search(
+        r"\bAction\s*=\s*\[([^\]]*)\]",
+        block,
+        flags=re.MULTILINE,
+    )
+    if list_match:
+        return set(re.findall(r'"([^"]+)"', list_match.group(1)))
+
+    string_match = re.search(r'\bAction\s*=\s*"([^"]+)"', block)
+    return {string_match.group(1)} if string_match else set()
+
+
 def _tf_statement_effect(block: str) -> str:
     match = re.search(r'\bEffect\s*=\s*"([^"]+)"', block)
     return match.group(1) if match else ""
@@ -596,6 +609,7 @@ def _assert_deploy_window_iam_hardening(
     expected_deploy_role_namespaces = {
         "LayerV/NHP",
         deploy_namespace,
+        "LayerV/QURLServiceCI",
         "NHP/BlueGreen",
     }
 
@@ -704,6 +718,7 @@ def _assert_deploy_window_iam_hardening_self_test() -> bool:
       "cloudwatch:namespace" = [
         "LayerV/NHP",
         "LayerV/NHP/Deploy",
+        "LayerV/QURLServiceCI",
         "NHP/BlueGreen"
       ]
     }
@@ -875,6 +890,81 @@ variable "metrics_namespace" {
         and bool(local_expression_deploy_namespace_failures)
         and bool(variable_expression_deploy_namespace_failures)
         and bool(duplicate_deploy_grant_failures)
+    )
+
+
+def _assert_ecr_push_supports_qurl_pr_cleanup(
+    ecr_tf_text: str,
+    failures: list[str],
+) -> None:
+    """Pin successful qurl-service PR image tag cleanup for the shared ECR role."""
+    ecr_push_block = _tf_statement_block_by_sid(ecr_tf_text, "ECRPush")
+    push_actions = _tf_action_values(ecr_push_block)
+    if not _check(
+        "ECR push role keeps broad push permission without broad delete permission",
+        "ecr:PutImage" in push_actions and "ecr:BatchDeleteImage" not in push_actions,
+        f"ECRPush actions: {sorted(push_actions)}",
+    ):
+        failures.append("ECRPush must not grant broad image deletion")
+
+    qurl_cleanup_block = _tf_statement_block_by_sid(ecr_tf_text, "QURLPrImageCleanup")
+    qurl_cleanup_actions = _tf_action_values(qurl_cleanup_block)
+    qurl_cleanup_is_narrow = (
+        'aws_ecr_repository.main["nhp-qurl"].arn' in qurl_cleanup_block
+        and "local.ecr_repos" not in qurl_cleanup_block
+        and "for repo in" not in qurl_cleanup_block
+    )
+    if not _check(
+        "qurl PR image cleanup deletes only from the qurl ECR repo",
+        qurl_cleanup_actions == {"ecr:BatchDeleteImage"} and qurl_cleanup_is_narrow,
+        "QURLPrImageCleanup must grant only ecr:BatchDeleteImage on aws_ecr_repository.main[\"nhp-qurl\"].arn",
+    ):
+        failures.append("qurl PR image cleanup permission missing or too broad")
+
+
+def _assert_ecr_push_supports_qurl_pr_cleanup_self_test() -> bool:
+    good_fixture = '''
+{
+  Sid    = "ECRPush"
+  Effect = "Allow"
+  Action = [
+    "ecr:BatchCheckLayerAvailability",
+    "ecr:PutImage"
+  ]
+  Resource = [for repo in local.ecr_repos : aws_ecr_repository.main[repo].arn]
+},
+{
+  Sid      = "QURLPrImageCleanup"
+  Effect   = "Allow"
+  Action   = ["ecr:BatchDeleteImage"]
+  Resource = [aws_ecr_repository.main["nhp-qurl"].arn]
+}
+'''
+    good_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_ecr_push_supports_qurl_pr_cleanup(good_fixture, good_failures)
+
+    missing_delete_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_ecr_push_supports_qurl_pr_cleanup(
+            good_fixture.replace('  Action   = ["ecr:BatchDeleteImage"]\n', ""),
+            missing_delete_failures,
+        )
+
+    broad_delete_failures: list[str] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        _assert_ecr_push_supports_qurl_pr_cleanup(
+            good_fixture.replace(
+                'Resource = [aws_ecr_repository.main["nhp-qurl"].arn]',
+                "Resource = [for repo in local.ecr_repos : aws_ecr_repository.main[repo].arn]",
+            ),
+            broad_delete_failures,
+        )
+
+    return (
+        not good_failures
+        and bool(missing_delete_failures)
+        and bool(broad_delete_failures)
     )
 
 
@@ -5138,6 +5228,12 @@ def main() -> int:
     ):
         return 1
     if not _check(
+        "self-test: ECR push cleanup guard rejects missing delete permission",
+        _assert_ecr_push_supports_qurl_pr_cleanup_self_test(),
+        "the ECR push cleanup guard accepted a role without BatchDeleteImage",
+    ):
+        return 1
+    if not _check(
         "self-test: revocation targeted zero-match guard rejects bad semantics",
         _assert_revocation_targeted_zero_match_alarm_self_test(),
         "the targeted zero-match guard accepted a ratio, missing dimension, missing action, or bad return_data fixture",
@@ -5206,6 +5302,7 @@ def main() -> int:
         terraform_tf_texts,
         failures,
     )
+    _assert_ecr_push_supports_qurl_pr_cleanup(ecr_tf_text, failures)
     _assert_revocation_targeted_zero_match_alarm(monitoring_tf_text, failures)
 
     if failures:

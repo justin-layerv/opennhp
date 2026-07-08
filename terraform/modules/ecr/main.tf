@@ -902,50 +902,62 @@ resource "aws_iam_role_policy" "ecr_push" {
 
   policy = var.is_primary_account ? jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Sid      = "ECRAuth"
-        Effect   = "Allow"
-        Action   = ["ecr:GetAuthorizationToken"]
-        Resource = "*"
-      },
-      {
-        Sid    = "ECRPush"
-        Effect = "Allow"
-        Action = [
-          "ecr:BatchCheckLayerAvailability",
-          "ecr:GetDownloadUrlForLayer",
-          "ecr:BatchGetImage",
-          "ecr:PutImage",
-          "ecr:InitiateLayerUpload",
-          "ecr:UploadLayerPart",
-          "ecr:CompleteLayerUpload",
-          "ecr:DescribeRepositories",
-          "ecr:DescribeImages"
-        ]
-        Resource = [for repo in local.ecr_repos : aws_ecr_repository.main[repo].arn]
-      },
-      {
-        Sid    = "ECRReplication"
-        Effect = "Allow"
-        Action = [
-          "ecr:PutReplicationConfiguration",
-          "ecr:DescribeRegistry"
-        ]
-        Resource = "*"
-      },
-      {
-        Sid      = "ECRReplicationSLR"
-        Effect   = "Allow"
-        Action   = ["iam:CreateServiceLinkedRole"]
-        Resource = "arn:aws:iam::*:role/aws-service-role/replication.ecr.amazonaws.com/*"
-        Condition = {
-          StringEquals = {
-            "iam:AWSServiceName" = "replication.ecr.amazonaws.com"
+    Statement = concat(
+      [
+        {
+          Sid      = "ECRAuth"
+          Effect   = "Allow"
+          Action   = ["ecr:GetAuthorizationToken"]
+          Resource = "*"
+        },
+        {
+          Sid    = "ECRPush"
+          Effect = "Allow"
+          Action = [
+            "ecr:BatchCheckLayerAvailability",
+            "ecr:GetDownloadUrlForLayer",
+            "ecr:BatchGetImage",
+            "ecr:PutImage",
+            "ecr:InitiateLayerUpload",
+            "ecr:UploadLayerPart",
+            "ecr:CompleteLayerUpload",
+            "ecr:DescribeRepositories",
+            "ecr:DescribeImages"
+          ]
+          Resource = [for repo in local.ecr_repos : aws_ecr_repository.main[repo].arn]
+        },
+      ],
+      var.deploy_qurl_ecr ? [
+        {
+          Sid      = "QURLPrImageCleanup"
+          Effect   = "Allow"
+          Action   = ["ecr:BatchDeleteImage"]
+          Resource = [aws_ecr_repository.main["nhp-qurl"].arn]
+        }
+      ] : [],
+      [
+        {
+          Sid    = "ECRReplication"
+          Effect = "Allow"
+          Action = [
+            "ecr:PutReplicationConfiguration",
+            "ecr:DescribeRegistry"
+          ]
+          Resource = "*"
+        },
+        {
+          Sid      = "ECRReplicationSLR"
+          Effect   = "Allow"
+          Action   = ["iam:CreateServiceLinkedRole"]
+          Resource = "arn:aws:iam::*:role/aws-service-role/replication.ecr.amazonaws.com/*"
+          Condition = {
+            StringEquals = {
+              "iam:AWSServiceName" = "replication.ecr.amazonaws.com"
+            }
           }
         }
-      }
-    ]
+      ]
+    )
     }) : jsonencode({
     # Secondary account - ECR pull (local registry when replicated, cross-account otherwise)
     Version = "2012-10-17"
@@ -2174,6 +2186,9 @@ resource "aws_iam_policy" "terraform_apply_services" {
             "cloudwatch:namespace" = [
               "LayerV/NHP",
               "LayerV/NHP/Deploy",
+              # Cross-repo: qurl-service #1163 emits SandboxLiveEnvLockFailure
+              # from the shared-sandbox premerge gate through this role.
+              "LayerV/QURLServiceCI",
               "NHP/BlueGreen"
             ]
           }
