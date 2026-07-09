@@ -181,6 +181,8 @@ FIELD_ACME_SUBDOMAIN = 'acme_subdomain'
 FIELD_LAST_RENEWAL_FAILED_AT = 'last_renewal_failed_at'
 FIELD_LAST_RENEWAL_FAILURE_REASON = 'last_renewal_failure_reason'
 FAILURE_REASON_MAX = 500
+SSM_STANDARD_PARAMETER_VALUE_MAX_BYTES = 4096
+SSM_ADVANCED_PARAMETER_VALUE_MAX_BYTES = 8192
 
 # CloudWatch metric constants (must match alarm definitions in main.tf)
 CW_NAMESPACE = 'NHP/CustomDomainCerts'
@@ -196,6 +198,7 @@ CW_METRIC_RENEWAL_DNS_OWNERSHIP_FAILURES = 'RenewalDnsOwnershipFailures'
 CW_METRIC_RENEWAL_ORPHANED_CERTS = 'RenewalOrphanedCerts'
 CW_METRIC_RENEWAL_PROCESSING_FAILURES = 'RenewalProcessingFailures'
 CW_METRIC_RENEWAL_STATUS_RECOVERED = 'RenewalStatusRecovered'
+CW_METRIC_CERT_PAIR_ROLLBACK_FAILURES = 'CertPairRollbackFailures'
 RENEWAL_SCAN_METRIC_RETRY_DELAYS_SECONDS = (1, 2)
 
 # Failure category constants — published as the FailureCategory dimension on
@@ -2177,18 +2180,150 @@ def wait_for_dns_propagation(record_name: str, expected_value: str, max_attempts
     logger.warning(f"Could not confirm DNS propagation after {max_attempts} attempts, proceeding anyway")
 
 
+def _ssm_tier_for_secure_value(name: str, value: str) -> str:
+    value_len = len(value.encode('utf-8'))
+    if value_len > SSM_ADVANCED_PARAMETER_VALUE_MAX_BYTES:
+        raise ValueError(
+            f"SSM SecureString value for {name} is {value_len} bytes, "
+            f"exceeding the {SSM_ADVANCED_PARAMETER_VALUE_MAX_BYTES}-byte advanced limit"
+        )
+    if value_len > SSM_STANDARD_PARAMETER_VALUE_MAX_BYTES:
+        return 'Advanced'
+    return 'Standard'
+
+
+def _is_advanced_to_standard_tier_error(error: ClientError) -> bool:
+    # GetParameter does not return Tier, and DescribeParameters would require a
+    # broader list-style IAM permission. Match the AWS ValidationException shape
+    # only as a fallback after the safe Standard write is rejected. If AWS or
+    # botocore changes this message shape, the renewal fails closed and should be
+    # re-validated from the RenewalProcessingFailures page.
+    aws_error = error.response.get('Error', {})
+    message = aws_error.get('Message', '').lower()
+    return (
+        aws_error.get('Code') == 'ValidationException'
+        and 'advanced' in message
+        and 'standard' in message
+        and ('tier' in message or 'parameter' in message)
+    )
+
+
+def _validate_certificate_key_pair(domain: str, private_key_pem: str, cert_pem: str):
+    lazy_import_crypto()
+    private_key = cryptography['serialization'].load_pem_private_key(
+        private_key_pem.encode('utf-8'),
+        password=None,
+        backend=cryptography['default_backend'](),
+    )
+    cert = cryptography['x509'].load_pem_x509_certificate(
+        cert_pem.encode('utf-8'),
+        cryptography['default_backend'](),
+    )
+    encoding = cryptography['serialization'].Encoding.DER
+    public_format = cryptography['serialization'].PublicFormat.SubjectPublicKeyInfo
+    key_public = private_key.public_key().public_bytes(encoding, public_format)
+    cert_public = cert.public_key().public_bytes(encoding, public_format)
+    if key_public != cert_public:
+        raise ValueError(f"certificate private key does not match leaf certificate for {domain}")
+
+
+def _preflight_certificate_storage(domain: str, private_key_pem: str, cert_pem: str, fullchain: str):
+    """Validate cert material and SSM limits before overwriting any live params."""
+    _validate_certificate_key_pair(domain, private_key_pem, cert_pem)
+    _ssm_tier_for_secure_value(f"{SSM_CERT_PREFIX}/{domain}/key", private_key_pem)
+    _ssm_tier_for_secure_value(f"{SSM_CERT_PREFIX}/{domain}/chain", fullchain)
+
+
+def _get_existing_ssm_secure_param(name: str) -> Optional[str]:
+    try:
+        response = ssm_client.get_parameter(Name=name, WithDecryption=True)
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'Unknown')
+        if code == 'ParameterNotFound':
+            return None
+        raise
+    return response.get('Parameter', {}).get('Value')
+
+
 def _put_ssm_secure_param(name: str, value: str):
     """Store a SecureString parameter in SSM, optionally encrypted with KMS CMK."""
+    tier = _ssm_tier_for_secure_value(name, value)
     put_kwargs = {
         'Name': name,
         'Value': value,
         'Type': 'SecureString',
         'Overwrite': True,
-        'Tier': 'Standard',
+        'Tier': tier,
     }
     if KMS_KEY_ARN:
         put_kwargs['KeyId'] = KMS_KEY_ARN
-    ssm_client.put_parameter(**put_kwargs)
+    try:
+        ssm_client.put_parameter(**put_kwargs)
+    except ClientError as e:
+        if tier != 'Standard' or not _is_advanced_to_standard_tier_error(e):
+            raise
+        # AWS allows Standard -> Advanced, but not Advanced -> Standard. If a
+        # fullchain later shrinks below 4 KiB, keep the existing Advanced tier
+        # instead of breaking renewal or rollback restore.
+        put_kwargs['Tier'] = 'Advanced'
+        ssm_client.put_parameter(**put_kwargs)
+
+
+def _delete_ssm_param_if_present(name: str):
+    try:
+        ssm_client.delete_parameter(Name=name)
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'Unknown')
+        if code != 'ParameterNotFound':
+            raise
+
+
+def _restore_ssm_secure_param(name: str, value: Optional[str]):
+    if value is None:
+        _delete_ssm_param_if_present(name)
+    else:
+        _put_ssm_secure_param(name, value)
+
+
+def _store_cert_pair_with_rollback(param_prefix: str, private_key_pem: str, fullchain: str):
+    """Store key+chain as a pair, restoring the previous pair if either write fails."""
+    key_name = f"{param_prefix}/key"
+    chain_name = f"{param_prefix}/chain"
+    previous_key = _get_existing_ssm_secure_param(key_name)
+    previous_chain = _get_existing_ssm_secure_param(chain_name)
+
+    try:
+        # Write the larger/more-failure-prone value first. If the key write then
+        # fails, restore the old pair. An AC sync can still observe the transient
+        # new-chain/old-key window; its staging validation rejects that mismatch.
+        # The normal post-renewal incremental sync is triggered by the caller only
+        # after store_certificate writes /meta, so only a concurrent full sync
+        # should be able to hit this window.
+        _put_ssm_secure_param(chain_name, fullchain)
+        _put_ssm_secure_param(key_name, private_key_pem)
+    except Exception:
+        logger.error("Certificate material write failed; restoring previous SSM key/chain pair")
+        # Restore both params even if the first put raised. A ClientError means
+        # AWS reported failure, but ambiguous client/network failures can happen
+        # after the service-side write landed; redundant same-value restores are
+        # cheaper than leaving an uncertain key/chain pair behind.
+        restore_failed = False
+        for restore_name, restore_value in (
+            (chain_name, previous_chain),
+            (key_name, previous_key),
+        ):
+            try:
+                _restore_ssm_secure_param(restore_name, restore_value)
+            except Exception:
+                restore_failed = True
+                logger.error(
+                    "Failed to restore previous SSM cert material for %s after partial write",
+                    restore_name,
+                    exc_info=True,
+                )
+        if restore_failed:
+            publish_metric(CW_METRIC_CERT_PAIR_ROLLBACK_FAILURES, 1)
+        raise
 
 
 def store_certificate(domain: str, private_key_pem: str, cert_pem: str, chain_pem: str,
@@ -2211,14 +2346,17 @@ def store_certificate(domain: str, private_key_pem: str, cert_pem: str, chain_pe
 
     logger.info(f"Storing certificate in SSM Parameter Store: {param_prefix}")
 
-    # Write order is load-bearing: key → chain → meta, with /meta LAST.
+    _preflight_certificate_storage(domain, private_key_pem, cert_pem, fullchain)
+
+    # Write order is load-bearing: key+chain pair first, then /meta LAST.
     # _recover_provisioned_cert() (nhp#977) treats a present /meta as proof that
     # the key+chain material was already written, so it can reconcile a stuck row
     # to active off /meta alone (a plain String — no KMS decrypt). Writing /meta
     # before key/chain would let recovery mark a domain active before its cert
-    # material exists. Keep /meta the final write here.
-    _put_ssm_secure_param(f"{param_prefix}/key", private_key_pem)
-    _put_ssm_secure_param(f"{param_prefix}/chain", fullchain)
+    # material exists. Keep /meta the final write here. The preflight above catches
+    # key/cert mismatches and SSM size-limit failures before either live param is
+    # overwritten; the pair write rolls back AWS-side partial writes.
+    _store_cert_pair_with_rollback(param_prefix, private_key_pem, fullchain)
 
     # Store metadata (plain String — not sensitive, no KMS cost)
     ssm_client.put_parameter(

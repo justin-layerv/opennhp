@@ -36,6 +36,20 @@ AWS_CALLS="$WORKDIR/aws-calls.log"
 cat > "$SHIM_DIR/aws" <<EOF
 #!/usr/bin/env bash
 echo "\$@" >> "$AWS_CALLS"
+if [[ "\$*" == *"ssm get-parameters-by-path"* && -n "\${AWS_PARAMS_JSON_FILE:-}" ]]; then
+  cat "\$AWS_PARAMS_JSON_FILE"
+  exit 0
+fi
+if [[ "\$*" == *"ssm get-parameter"* ]]; then
+  if [[ "\$*" == *"/key"* && -n "\${AWS_KEY_VALUE_FILE:-}" ]]; then
+    cat "\$AWS_KEY_VALUE_FILE"
+    exit 0
+  fi
+  if [[ "\$*" == *"/chain"* && -n "\${AWS_CHAIN_VALUE_FILE:-}" ]]; then
+    cat "\$AWS_CHAIN_VALUE_FILE"
+    exit 0
+  fi
+fi
 exit 0
 EOF
 chmod +x "$SHIM_DIR/aws"
@@ -83,6 +97,18 @@ assert_eq() {
         FAIL=$((FAIL + 1))
     fi
 }
+assert_file_eq() {
+    local expected_file="$1" actual_file="$2" desc="$3"
+    if cmp -s "$expected_file" "$actual_file"; then
+        log "PASS: $desc"
+        PASS=$((PASS + 1))
+    else
+        log "FAIL: $desc (files differ)"
+        log "  expected_file: $expected_file"
+        log "  actual_file:   $actual_file"
+        FAIL=$((FAIL + 1))
+    fi
+}
 assert_present() {
     local pattern="$1" file="$2" desc="$3"
     if grep -Fq "$pattern" "$file"; then
@@ -99,6 +125,26 @@ assert_absent() {
     if grep -Fq "$pattern" "$file" 2>/dev/null; then
         log "FAIL: $desc (pattern still in $file)"
         log "  pattern: $pattern"
+        FAIL=$((FAIL + 1))
+    else
+        log "PASS: $desc"
+        PASS=$((PASS + 1))
+    fi
+}
+assert_dir_present() {
+    local path="$1" desc="$2"
+    if [[ -d "$path" ]]; then
+        log "PASS: $desc"
+        PASS=$((PASS + 1))
+    else
+        log "FAIL: $desc (directory missing: $path)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+assert_dir_absent() {
+    local path="$1" desc="$2"
+    if [[ -d "$path" ]]; then
+        log "FAIL: $desc (directory still present: $path)"
         FAIL=$((FAIL + 1))
     else
         log "PASS: $desc"
@@ -267,6 +313,161 @@ if SENTINEL_FILE="$SENTINEL" TRAEFIK_USER="nhp-absent-test-user" \
 else
     assert_present "FATAL" "$WORKDIR/t7b.out" "sentinel-present + absent user fails loud (FATAL, exit 1)"
 fi
+
+# --- Test 8: incremental mismatch must not overwrite existing live files -----
+log "Test 8: incremental key/cert mismatch preserves existing live cert files"
+mkdir -p "$CERT_DIR/mismatch.example.com"
+printf "old-fullchain\n" > "$CERT_DIR/mismatch.example.com/fullchain.pem"
+printf "old-key\n" > "$CERT_DIR/mismatch.example.com/privkey.pem"
+cat > "$CONFIG_FILE" <<EOF
+# Custom Domain Traefik Configuration
+
+[[tls.certificates]]
+  certFile = "$CERT_DIR/mismatch.example.com/fullchain.pem"
+  keyFile = "$CERT_DIR/mismatch.example.com/privkey.pem"
+EOF
+openssl genrsa -out "$WORKDIR/mismatch-good.key" 2048 >/dev/null 2>&1
+openssl req -new -x509 -key "$WORKDIR/mismatch-good.key" \
+  -out "$WORKDIR/mismatch.crt" -subj "/CN=mismatch.example.com" -days 1 >/dev/null 2>&1
+openssl genrsa -out "$WORKDIR/mismatch-bad.key" 2048 >/dev/null 2>&1
+if AWS_KEY_VALUE_FILE="$WORKDIR/mismatch-bad.key" AWS_CHAIN_VALUE_FILE="$WORKDIR/mismatch.crt" \
+     bash "$TARGET_SCRIPT" --domain mismatch.example.com > "$WORKDIR/t8.out" 2>&1; then
+    log "FAIL: mismatched incremental sync unexpectedly succeeded"
+    cat "$WORKDIR/t8.out"
+    FAIL=$((FAIL + 1))
+else
+    assert_present "Certificate/key mismatch" "$WORKDIR/t8.out" "mismatched SSM material is rejected"
+fi
+assert_eq "old-fullchain" "$(tr -d '\n' < "$CERT_DIR/mismatch.example.com/fullchain.pem")" "existing fullchain preserved after mismatch"
+assert_eq "old-key" "$(tr -d '\n' < "$CERT_DIR/mismatch.example.com/privkey.pem")" "existing private key preserved after mismatch"
+assert_present "mismatch.example.com/fullchain.pem" "$CONFIG_FILE" "existing TOML block preserved after mismatch"
+
+# --- Test 9: stale temp cert dirs are swept on startup -------------------------
+log "Test 9: stale temp cert dirs are swept on startup"
+STALE_TMP_DIR="$CERT_DIR/.stale.example.com.tmp.ABC123"
+STALE_OLD_DIR="$CERT_DIR/.stale.example.com.old.ABC123"
+FRESH_TMP_DIR="$CERT_DIR/.fresh.example.com.tmp.ABC123"
+mkdir -p "$STALE_TMP_DIR" "$STALE_OLD_DIR" "$FRESH_TMP_DIR"
+printf "stale-key\n" > "$STALE_TMP_DIR/privkey.pem"
+printf "stale-key\n" > "$STALE_OLD_DIR/privkey.pem"
+printf "fresh-key\n" > "$FRESH_TMP_DIR/privkey.pem"
+touch -t 202001010000 "$STALE_TMP_DIR" "$STALE_OLD_DIR"
+bash "$TARGET_SCRIPT" --delete cleanup-missing.example.com > "$WORKDIR/t9.out" 2>&1 || {
+    log "FAIL: --delete cleanup-missing.example.com exited non-zero"
+    cat "$WORKDIR/t9.out"
+    exit 1
+}
+assert_dir_absent "$STALE_TMP_DIR" "stale staging dir removed on startup"
+assert_dir_absent "$STALE_OLD_DIR" "stale backup dir removed on startup"
+assert_dir_present "$FRESH_TMP_DIR" "fresh staging dir preserved on startup"
+
+# --- Test 10: ECDSA cert/key pairs are accepted -------------------------------
+log "Test 10: ECDSA incremental sync is accepted"
+openssl ecparam -name prime256v1 -genkey -noout -out "$WORKDIR/ecdsa.key" >/dev/null 2>&1
+openssl req -new -x509 -key "$WORKDIR/ecdsa.key" \
+  -out "$WORKDIR/ecdsa.crt" -subj "/CN=ecdsa.example.com" -days 1 >/dev/null 2>&1
+if AWS_KEY_VALUE_FILE="$WORKDIR/ecdsa.key" AWS_CHAIN_VALUE_FILE="$WORKDIR/ecdsa.crt" \
+     bash "$TARGET_SCRIPT" --domain ecdsa.example.com > "$WORKDIR/t10.out" 2>&1; then
+    assert_present "Certificate loaded" "$WORKDIR/t10.out" "ECDSA cert/key pair loads"
+else
+    log "FAIL: ECDSA incremental sync exited non-zero"
+    cat "$WORKDIR/t10.out"
+    FAIL=$((FAIL + 1))
+fi
+assert_dir_present "$CERT_DIR/ecdsa.example.com" "ECDSA cert directory installed"
+assert_present "ecdsa.example.com/fullchain.pem" "$CONFIG_FILE" "ECDSA TOML block written"
+
+# --- Test 11: full sync preserves present-but-invalid SSM domains -------------
+log "Test 11: full sync mismatch preserves last-known-good live cert"
+FULL_MISMATCH_DOMAIN="full-mismatch.example.com"
+FULL_EXPIRED_DOMAIN="full-expired.example.com"
+FULL_STALE_DOMAIN="full-stale.example.com"
+FULL_ACTIVE_SUBDOMAIN="a.example.com"
+FULL_OVERLAP_STALE_DOMAIN="example.com"
+mkdir -p \
+  "$CERT_DIR/$FULL_MISMATCH_DOMAIN" \
+  "$CERT_DIR/$FULL_EXPIRED_DOMAIN" \
+  "$CERT_DIR/$FULL_STALE_DOMAIN" \
+  "$CERT_DIR/$FULL_OVERLAP_STALE_DOMAIN"
+printf "stale-fullchain\n" > "$CERT_DIR/$FULL_STALE_DOMAIN/fullchain.pem"
+printf "stale-key\n" > "$CERT_DIR/$FULL_STALE_DOMAIN/privkey.pem"
+printf "overlap-stale-fullchain\n" > "$CERT_DIR/$FULL_OVERLAP_STALE_DOMAIN/fullchain.pem"
+printf "overlap-stale-key\n" > "$CERT_DIR/$FULL_OVERLAP_STALE_DOMAIN/privkey.pem"
+cat > "$CONFIG_FILE" <<EOF
+# Custom Domain Traefik Configuration
+
+[[tls.certificates]]
+  certFile = "$CERT_DIR/$FULL_MISMATCH_DOMAIN/fullchain.pem"
+  keyFile = "$CERT_DIR/$FULL_MISMATCH_DOMAIN/privkey.pem"
+
+[[tls.certificates]]
+  certFile = "$CERT_DIR/$FULL_EXPIRED_DOMAIN/fullchain.pem"
+  keyFile = "$CERT_DIR/$FULL_EXPIRED_DOMAIN/privkey.pem"
+
+[[tls.certificates]]
+  certFile = "$CERT_DIR/$FULL_STALE_DOMAIN/fullchain.pem"
+  keyFile = "$CERT_DIR/$FULL_STALE_DOMAIN/privkey.pem"
+
+[[tls.certificates]]
+  certFile = "$CERT_DIR/$FULL_OVERLAP_STALE_DOMAIN/fullchain.pem"
+  keyFile = "$CERT_DIR/$FULL_OVERLAP_STALE_DOMAIN/privkey.pem"
+EOF
+openssl genrsa -out "$WORKDIR/full-good.key" 2048 >/dev/null 2>&1
+openssl req -new -x509 -key "$WORKDIR/full-good.key" \
+  -out "$WORKDIR/full.crt" -subj "/CN=$FULL_MISMATCH_DOMAIN" -days 1 >/dev/null 2>&1
+openssl genrsa -out "$WORKDIR/full-bad.key" 2048 >/dev/null 2>&1
+cp "$WORKDIR/full.crt" "$CERT_DIR/$FULL_MISMATCH_DOMAIN/fullchain.pem"
+cp "$WORKDIR/full-good.key" "$CERT_DIR/$FULL_MISMATCH_DOMAIN/privkey.pem"
+openssl genrsa -out "$WORKDIR/full-expired.key" 2048 >/dev/null 2>&1
+openssl x509 -new -key "$WORKDIR/full-expired.key" \
+  -out "$WORKDIR/full-expired.crt" -subj "/CN=$FULL_EXPIRED_DOMAIN" \
+  -not_before 20240101000000Z -not_after 20240102000000Z >/dev/null 2>&1
+if openssl x509 -in "$WORKDIR/full-expired.crt" -noout -enddate >/dev/null 2>&1 && \
+   ! openssl x509 -in "$WORKDIR/full-expired.crt" -noout -checkend 0 >/dev/null 2>&1; then
+    log "PASS: expired fixture is parseable and past notAfter"
+    PASS=$((PASS + 1))
+else
+    log "FAIL: expired fixture is not a parseable expired certificate"
+    FAIL=$((FAIL + 1))
+fi
+cp "$WORKDIR/full-expired.crt" "$CERT_DIR/$FULL_EXPIRED_DOMAIN/fullchain.pem"
+cp "$WORKDIR/full-expired.key" "$CERT_DIR/$FULL_EXPIRED_DOMAIN/privkey.pem"
+openssl genrsa -out "$WORKDIR/full-active.key" 2048 >/dev/null 2>&1
+openssl req -new -x509 -key "$WORKDIR/full-active.key" \
+  -out "$WORKDIR/full-active.crt" -subj "/CN=$FULL_ACTIVE_SUBDOMAIN" -days 1 >/dev/null 2>&1
+FULL_KEY_JSON=$(jq -Rs . < "$WORKDIR/full-bad.key")
+FULL_CHAIN_JSON=$(jq -Rs . < "$WORKDIR/full.crt")
+FULL_EXPIRED_KEY_JSON=$(jq -Rs . < "$WORKDIR/full-expired.key")
+FULL_EXPIRED_CHAIN_JSON=$(jq -Rs . < "$WORKDIR/full-expired.crt")
+FULL_ACTIVE_KEY_JSON=$(jq -Rs . < "$WORKDIR/full-active.key")
+FULL_ACTIVE_CHAIN_JSON=$(jq -Rs . < "$WORKDIR/full-active.crt")
+cat > "$WORKDIR/full-params.json" <<EOF
+{"Parameters":[
+  {"Name":"/nhp/certs/$FULL_MISMATCH_DOMAIN/key","Value":$FULL_KEY_JSON},
+  {"Name":"/nhp/certs/$FULL_MISMATCH_DOMAIN/chain","Value":$FULL_CHAIN_JSON},
+  {"Name":"/nhp/certs/$FULL_EXPIRED_DOMAIN/key","Value":$FULL_EXPIRED_KEY_JSON},
+  {"Name":"/nhp/certs/$FULL_EXPIRED_DOMAIN/chain","Value":$FULL_EXPIRED_CHAIN_JSON},
+  {"Name":"/nhp/certs/$FULL_ACTIVE_SUBDOMAIN/key","Value":$FULL_ACTIVE_KEY_JSON},
+  {"Name":"/nhp/certs/$FULL_ACTIVE_SUBDOMAIN/chain","Value":$FULL_ACTIVE_CHAIN_JSON}
+]}
+EOF
+AWS_PARAMS_JSON_FILE="$WORKDIR/full-params.json" bash "$TARGET_SCRIPT" > "$WORKDIR/t11.out" 2>&1 || {
+    log "FAIL: full sync mismatch fixture exited non-zero"
+    cat "$WORKDIR/t11.out"
+    exit 1
+}
+assert_present "Preserving existing certificate for $FULL_MISMATCH_DOMAIN" "$WORKDIR/t11.out" "full sync preserves present mismatched domain"
+assert_present "Existing certificate for $FULL_EXPIRED_DOMAIN is expired or invalid; not preserving" "$WORKDIR/t11.out" "full sync refuses to preserve expired local cert"
+assert_file_eq "$WORKDIR/full.crt" "$CERT_DIR/$FULL_MISMATCH_DOMAIN/fullchain.pem" "full sync keeps old fullchain after mismatch"
+assert_file_eq "$WORKDIR/full-good.key" "$CERT_DIR/$FULL_MISMATCH_DOMAIN/privkey.pem" "full sync keeps old private key after mismatch"
+assert_dir_absent "$CERT_DIR/$FULL_EXPIRED_DOMAIN" "full sync removes expired local cert instead of preserving"
+assert_dir_absent "$CERT_DIR/$FULL_STALE_DOMAIN" "full sync still removes domains absent from SSM"
+assert_dir_absent "$CERT_DIR/$FULL_OVERLAP_STALE_DOMAIN" "full sync exact-match cleanup removes parent domain when only subdomain is active"
+assert_dir_present "$CERT_DIR/$FULL_ACTIVE_SUBDOMAIN" "full sync installs active subdomain fixture"
+assert_present "$FULL_MISMATCH_DOMAIN/fullchain.pem" "$CONFIG_FILE" "full sync keeps TOML block for mismatched present domain"
+assert_absent "$FULL_EXPIRED_DOMAIN/fullchain.pem" "$CONFIG_FILE" "full sync removes TOML block for expired local cert"
+assert_absent "$FULL_STALE_DOMAIN/fullchain.pem" "$CONFIG_FILE" "full sync removes TOML block for absent stale domain"
+assert_absent "$CERT_DIR/$FULL_OVERLAP_STALE_DOMAIN/fullchain.pem" "$CONFIG_FILE" "full sync removes TOML block for exact-match stale parent domain"
 
 # --- Summary -----------------------------------------------------------------
 log "--------------------------------------------------"

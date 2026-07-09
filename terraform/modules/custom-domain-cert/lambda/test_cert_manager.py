@@ -41,6 +41,36 @@ os.environ.setdefault('CELL_ID', 'cell0')
 import custom_domain_cert_manager as cm
 
 
+def _self_signed_cert_pair(common_name='example.com'):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+    ])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode('utf-8')
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode('utf-8')
+    return key_pem, cert_pem
+
+
 def test_required_env_fails_loud(monkeypatch):
     monkeypatch.delenv('ENVIRONMENT', raising=False)
 
@@ -930,14 +960,16 @@ class TestStoreCertificate(unittest.TestCase):
     @patch.object(cm.ssm_client, 'put_parameter')
     def test_stores_three_params(self, mock_put):
         """Should store key, chain, and meta as separate SSM parameters."""
-        result = cm.store_certificate(
-            domain='example.com',
-            private_key_pem='test-key-pem-data',
-            cert_pem='test-cert-pem-data',
-            chain_pem='test-chain-pem-data',
-            expires_at='2026-06-01T00:00:00+00:00',
-            acme_subdomain='example--com',
-        )
+        with patch('custom_domain_cert_manager._preflight_certificate_storage'):
+            with patch('custom_domain_cert_manager._get_existing_ssm_secure_param', return_value=None):
+                result = cm.store_certificate(
+                    domain='example.com',
+                    private_key_pem='test-key-pem-data',
+                    cert_pem='test-cert-pem-data',
+                    chain_pem='test-chain-pem-data',
+                    expires_at='2026-06-01T00:00:00+00:00',
+                    acme_subdomain='example--com',
+                )
 
         assert mock_put.call_count == 3
         assert result == '/nhp/certs/example.com'
@@ -966,16 +998,235 @@ class TestStoreCertificate(unittest.TestCase):
     @patch.object(cm.ssm_client, 'put_parameter')
     def test_chain_is_fullchain(self, mock_put):
         """Chain param should contain cert + chain concatenated."""
-        cm.store_certificate(
-            domain='test.org',
-            private_key_pem='key-pem',
-            cert_pem='cert-pem',
-            chain_pem='chain-pem',
-            expires_at='2026-06-01T00:00:00+00:00',
-        )
+        with patch('custom_domain_cert_manager._preflight_certificate_storage'):
+            with patch('custom_domain_cert_manager._get_existing_ssm_secure_param', return_value=None):
+                cm.store_certificate(
+                    domain='test.org',
+                    private_key_pem='key-pem',
+                    cert_pem='cert-pem',
+                    chain_pem='chain-pem',
+                    expires_at='2026-06-01T00:00:00+00:00',
+                )
 
         chain_call = [c for c in mock_put.call_args_list if c.kwargs['Name'].endswith('/chain')][0]
         assert chain_call.kwargs['Value'] == 'cert-pemchain-pem'
+
+    @patch.object(cm.ssm_client, 'put_parameter')
+    def test_rejects_key_cert_mismatch_before_any_ssm_write(self, mock_put):
+        """A renewal must not poison live SSM params with a key for another cert."""
+        # Keep the certificate from one pair, then pass a key from another pair.
+        _, cert_pem = _self_signed_cert_pair('example.com')
+        wrong_key, _ = _self_signed_cert_pair('other.example.com')
+
+        with pytest.raises(ValueError, match='does not match leaf certificate'):
+            cm.store_certificate(
+                domain='example.com',
+                private_key_pem=wrong_key,
+                cert_pem=cert_pem,
+                chain_pem='',
+                expires_at='2026-06-01T00:00:00+00:00',
+            )
+
+        mock_put.assert_not_called()
+
+    @patch.object(cm.ssm_client, 'put_parameter')
+    def test_rejects_oversized_secure_value_before_any_ssm_write(self, mock_put):
+        """Preflight must catch values beyond SSM's advanced limit before writes."""
+        oversized_chain = 'x' * (cm.SSM_ADVANCED_PARAMETER_VALUE_MAX_BYTES + 1)
+
+        with patch('custom_domain_cert_manager._validate_certificate_key_pair'):
+            with pytest.raises(ValueError, match='advanced limit'):
+                cm.store_certificate(
+                    domain='example.com',
+                    private_key_pem='key-pem',
+                    cert_pem='cert-pem',
+                    chain_pem=oversized_chain,
+                    expires_at='2026-06-01T00:00:00+00:00',
+                )
+
+        mock_put.assert_not_called()
+
+    @patch.object(cm.ssm_client, 'put_parameter')
+    def test_uses_advanced_tier_for_large_fullchain(self, mock_put):
+        """Large fullchains should renew instead of failing after key overwrite."""
+        large_chain = 'c' * (cm.SSM_STANDARD_PARAMETER_VALUE_MAX_BYTES + 1)
+
+        with patch('custom_domain_cert_manager._preflight_certificate_storage'):
+            with patch('custom_domain_cert_manager._get_existing_ssm_secure_param', return_value=None):
+                cm.store_certificate(
+                    domain='large.example.com',
+                    private_key_pem='key-pem',
+                    cert_pem='cert-pem',
+                    chain_pem=large_chain,
+                    expires_at='2026-06-01T00:00:00+00:00',
+                )
+
+        key_call = [c for c in mock_put.call_args_list if c.kwargs['Name'].endswith('/key')][0]
+        chain_call = [c for c in mock_put.call_args_list if c.kwargs['Name'].endswith('/chain')][0]
+        assert key_call.kwargs['Tier'] == 'Standard'
+        assert chain_call.kwargs['Tier'] == 'Advanced'
+
+    @patch.object(cm.ssm_client, 'put_parameter')
+    def test_preserves_advanced_tier_when_fullchain_later_fits_standard(self, mock_put):
+        """SSM rejects Advanced -> Standard; renewal should keep Advanced and continue."""
+        def put_parameter(**kwargs):
+            if kwargs['Name'].endswith('/chain') and kwargs['Tier'] == 'Standard':
+                raise ClientError(
+                    {'Error': {
+                        'Code': 'ValidationException',
+                        'Message': 'Cannot change advanced parameter to standard tier',
+                    }},
+                    'PutParameter',
+                )
+
+        mock_put.side_effect = put_parameter
+
+        with patch('custom_domain_cert_manager._preflight_certificate_storage'):
+            with patch('custom_domain_cert_manager._get_existing_ssm_secure_param', return_value='old-value'):
+                cm.store_certificate(
+                    domain='large.example.com',
+                    private_key_pem='key-pem',
+                    cert_pem='cert-pem',
+                    chain_pem='small-chain-pem',
+                    expires_at='2026-06-01T00:00:00+00:00',
+                )
+
+        chain_tiers = [
+            c.kwargs['Tier']
+            for c in mock_put.call_args_list
+            if c.kwargs['Name'].endswith('/chain')
+        ]
+        assert chain_tiers == ['Standard', 'Advanced']
+        meta_call = mock_put.call_args_list[-1]
+        assert meta_call.kwargs['Name'] == '/nhp/certs/large.example.com/meta'
+
+    @patch.object(cm.ssm_client, 'get_parameter')
+    @patch.object(cm.ssm_client, 'put_parameter')
+    def test_restores_previous_pair_when_key_write_fails(self, mock_put, mock_get):
+        """If one SSM write fails, restore the old key+chain pair."""
+        def get_parameter(**kwargs):
+            if kwargs['Name'].endswith('/key'):
+                return {'Parameter': {'Value': 'old-key-pem'}}
+            if kwargs['Name'].endswith('/chain'):
+                return {'Parameter': {'Value': 'old-fullchain-pem'}}
+            raise AssertionError(f"unexpected get_parameter call: {kwargs}")
+
+        def put_parameter(**kwargs):
+            if kwargs['Name'].endswith('/key') and kwargs['Value'] == 'new-key-pem':
+                raise ClientError(
+                    {'Error': {'Code': 'InternalServerError', 'Message': 'transient'}},
+                    'PutParameter',
+                )
+
+        mock_get.side_effect = get_parameter
+        mock_put.side_effect = put_parameter
+
+        with patch('custom_domain_cert_manager._preflight_certificate_storage'):
+            with pytest.raises(ClientError):
+                cm.store_certificate(
+                    domain='example.com',
+                    private_key_pem='new-key-pem',
+                    cert_pem='new-cert-pem',
+                    chain_pem='new-chain-pem',
+                    expires_at='2026-06-01T00:00:00+00:00',
+                )
+
+        writes = [(c.kwargs['Name'], c.kwargs['Value']) for c in mock_put.call_args_list]
+        assert writes == [
+            ('/nhp/certs/example.com/chain', 'new-cert-pemnew-chain-pem'),
+            ('/nhp/certs/example.com/key', 'new-key-pem'),
+            ('/nhp/certs/example.com/chain', 'old-fullchain-pem'),
+            ('/nhp/certs/example.com/key', 'old-key-pem'),
+        ]
+        assert not any(name.endswith('/meta') for name, _ in writes)
+
+    @patch.object(cm.ssm_client, 'delete_parameter')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    @patch.object(cm.ssm_client, 'put_parameter')
+    def test_first_issuance_key_write_failure_deletes_orphan_chain(
+            self, mock_put, mock_get, mock_delete):
+        """If first issuance writes chain but not key, rollback deletes the orphan."""
+        mock_get.side_effect = cm.ssm_client.exceptions.ParameterNotFound(
+            {'Error': {'Code': 'ParameterNotFound', 'Message': 'not found'}},
+            'GetParameter',
+        )
+
+        def put_parameter(**kwargs):
+            if kwargs['Name'].endswith('/key') and kwargs['Value'] == 'new-key-pem':
+                raise ClientError(
+                    {'Error': {'Code': 'InternalServerError', 'Message': 'key write failed'}},
+                    'PutParameter',
+                )
+
+        mock_put.side_effect = put_parameter
+
+        with patch('custom_domain_cert_manager._preflight_certificate_storage'):
+            with pytest.raises(ClientError, match='key write failed'):
+                cm.store_certificate(
+                    domain='first.example.com',
+                    private_key_pem='new-key-pem',
+                    cert_pem='new-cert-pem',
+                    chain_pem='new-chain-pem',
+                    expires_at='2026-06-01T00:00:00+00:00',
+                )
+
+        writes = [(c.kwargs['Name'], c.kwargs['Value']) for c in mock_put.call_args_list]
+        assert writes == [
+            ('/nhp/certs/first.example.com/chain', 'new-cert-pemnew-chain-pem'),
+            ('/nhp/certs/first.example.com/key', 'new-key-pem'),
+        ]
+        mock_delete.assert_has_calls([
+            call(Name='/nhp/certs/first.example.com/chain'),
+            call(Name='/nhp/certs/first.example.com/key'),
+        ])
+        assert not any(name.endswith('/meta') for name, _ in writes)
+
+    @patch('custom_domain_cert_manager.publish_metric')
+    @patch.object(cm.ssm_client, 'get_parameter')
+    @patch.object(cm.ssm_client, 'put_parameter')
+    def test_restore_attempts_key_even_when_chain_restore_fails(
+            self, mock_put, mock_get, mock_publish_metric):
+        """Rollback restore should attempt each param independently."""
+        def get_parameter(**kwargs):
+            if kwargs['Name'].endswith('/key'):
+                return {'Parameter': {'Value': 'old-key-pem'}}
+            if kwargs['Name'].endswith('/chain'):
+                return {'Parameter': {'Value': 'old-fullchain-pem'}}
+            raise AssertionError(f"unexpected get_parameter call: {kwargs}")
+
+        def put_parameter(**kwargs):
+            if kwargs['Name'].endswith('/key') and kwargs['Value'] == 'new-key-pem':
+                raise ClientError(
+                    {'Error': {'Code': 'InternalServerError', 'Message': 'key write failed'}},
+                    'PutParameter',
+                )
+            if kwargs['Name'].endswith('/chain') and kwargs['Value'] == 'old-fullchain-pem':
+                raise ClientError(
+                    {'Error': {'Code': 'InternalServerError', 'Message': 'chain restore failed'}},
+                    'PutParameter',
+                )
+
+        mock_get.side_effect = get_parameter
+        mock_put.side_effect = put_parameter
+
+        with patch('custom_domain_cert_manager._preflight_certificate_storage'):
+            with pytest.raises(ClientError, match='key write failed'):
+                cm.store_certificate(
+                    domain='example.com',
+                    private_key_pem='new-key-pem',
+                    cert_pem='new-cert-pem',
+                    chain_pem='new-chain-pem',
+                    expires_at='2026-06-01T00:00:00+00:00',
+                )
+
+        writes = [(c.kwargs['Name'], c.kwargs['Value']) for c in mock_put.call_args_list]
+        assert writes == [
+            ('/nhp/certs/example.com/chain', 'new-cert-pemnew-chain-pem'),
+            ('/nhp/certs/example.com/key', 'new-key-pem'),
+            ('/nhp/certs/example.com/chain', 'old-fullchain-pem'),
+            ('/nhp/certs/example.com/key', 'old-key-pem'),
+        ]
+        mock_publish_metric.assert_called_once_with(cm.CW_METRIC_CERT_PAIR_ROLLBACK_FAILURES, 1)
 
 
 class TestRenewalScan(unittest.TestCase):

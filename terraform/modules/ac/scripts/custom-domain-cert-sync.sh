@@ -83,9 +83,47 @@ LIB_SH="${LIB_SH:-/home/ubuntu/scripts/lib.sh}"
 # shellcheck source=/dev/null
 [ -f "$LIB_SH" ] && source "$LIB_SH"
 
-# Clean up temp files on exit (TEMP_CONFIG set later in both incremental and full mode)
-trap 'rm -f "$TEMP_CONFIG" 2>/dev/null' EXIT
+# Clean up temp files on exit (TEMP_CONFIG set later in multiple modes; cert
+# staging/backup dirs are registered by process_domain_cert).
 TEMP_CONFIG=""
+TEMP_DIRS_TO_CLEAN=()
+
+cleanup_temp_artifacts() {
+    rm -f "$TEMP_CONFIG" 2>/dev/null || true
+
+    local DIR
+    [ "${#TEMP_DIRS_TO_CLEAN[@]}" -gt 0 ] || return 0
+    for DIR in "${TEMP_DIRS_TO_CLEAN[@]}"; do
+        [ -z "$DIR" ] || rm -rf "$DIR" 2>/dev/null || true
+    done
+}
+trap cleanup_temp_artifacts EXIT
+
+register_temp_dir() {
+    TEMP_DIRS_TO_CLEAN+=("$1")
+}
+
+sweep_stale_cert_temp_dirs() {
+    find "$CERT_DIR" -mindepth 1 -maxdepth 1 -type d \
+        \( -name '.*.tmp.*' -o -name '.*.old.*' \) \
+        -mmin +60 -exec rm -rf {} + 2>/dev/null || \
+        echo "WARNING: Failed to sweep stale custom-domain cert temp dirs under $CERT_DIR"
+}
+
+move_dir_into_place() {
+    local SOURCE_DIR="$1"
+    local DEST_DIR="$2"
+
+    # GNU mv -T avoids nesting SOURCE_DIR inside DEST_DIR if another sync creates
+    # the destination between backup and install. The fallback keeps macOS fixture
+    # tests runnable while preserving the same "destination must be absent" guard.
+    if mv -T "$SOURCE_DIR" "$DEST_DIR" 2>/dev/null; then
+        return 0
+    fi
+
+    [ ! -e "$DEST_DIR" ] || return 1
+    mv "$SOURCE_DIR" "$DEST_DIR"
+}
 
 # Create directories. chown every level this mkdir creates to $TRAEFIK_USER so a
 # non-root Traefik can traverse them regardless of the SSM-agent umask: the 0600
@@ -100,6 +138,7 @@ chown "$TRAEFIK_USER:$TRAEFIK_USER" "$TRAEFIK_DIR/certs" "$CERT_DIR"
 # 700-owner-only-parent defense holds on the per-instance-ACME path too (where
 # this script, not boot, first creates certs/ under the SSM-agent umask).
 chmod 700 "$TRAEFIK_DIR/certs"
+sweep_stale_cert_temp_dirs
 
 # ==============================================================================
 # Append a [[tls.certificates]] entry to a TOML config file
@@ -132,6 +171,35 @@ validate_domain() {
     fi
     if [[ "$DOMAIN" == *"*"* ]]; then
         echo "WARNING: Wildcard domains not supported: $DOMAIN"
+        return 1
+    fi
+    return 0
+}
+
+local_cert_dir_is_servable() {
+    local DOMAIN="$1"
+    local DOMAIN_CERT_DIR="$2"
+
+    [ -f "$DOMAIN_CERT_DIR/fullchain.pem" ] && [ -f "$DOMAIN_CERT_DIR/privkey.pem" ] || return 1
+
+    if ! openssl x509 -in "$DOMAIN_CERT_DIR/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1; then
+        echo "WARNING: Existing certificate for $DOMAIN is expired or invalid; not preserving"
+        return 1
+    fi
+
+    local CERT_PUBKEY_DIGEST KEY_PUBKEY_DIGEST
+    CERT_PUBKEY_DIGEST=$(openssl x509 -in "$DOMAIN_CERT_DIR/fullchain.pem" -pubkey -noout 2>/dev/null | \
+        openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -binary | openssl base64) || {
+        echo "WARNING: Cannot read existing certificate public key for $DOMAIN; not preserving"
+        return 1
+    }
+    KEY_PUBKEY_DIGEST=$(openssl pkey -in "$DOMAIN_CERT_DIR/privkey.pem" -pubout -outform DER 2>/dev/null | \
+        openssl dgst -sha256 -binary | openssl base64) || {
+        echo "WARNING: Cannot read existing private key public key for $DOMAIN; not preserving"
+        return 1
+    }
+    if [ "$CERT_PUBKEY_DIGEST" != "$KEY_PUBKEY_DIGEST" ]; then
+        echo "WARNING: Existing certificate/key mismatch for $DOMAIN; not preserving"
         return 1
     fi
     return 0
@@ -193,45 +261,93 @@ process_domain_cert() {
 
     echo "Processing certificate for: $DOMAIN"
 
-    # Create domain cert directory (chown so the 0600 privkey.pem leaf stays
-    # traversable by a non-root Traefik regardless of umask — see $CERT_DIR above).
+    # Stage into a temporary dir first. A renewal can leave SSM temporarily
+    # inconsistent if only one of key/chain was overwritten; validating in staging
+    # keeps an existing live cert directory intact on mismatch.
     local DOMAIN_CERT_DIR="$CERT_DIR/$DOMAIN"
-    mkdir -p "$DOMAIN_CERT_DIR"
-    chown "$TRAEFIK_USER:$TRAEFIK_USER" "$DOMAIN_CERT_DIR"
+    local STAGING_DIR
+    STAGING_DIR=$(mktemp -d "$CERT_DIR/.${DOMAIN}.tmp.XXXXXX")
+    register_temp_dir "$STAGING_DIR"
+    chown "$TRAEFIK_USER:$TRAEFIK_USER" "$STAGING_DIR"
 
     # Write cert files
-    echo "$CHAIN_VALUE" > "$DOMAIN_CERT_DIR/fullchain.pem"
-    echo "$KEY_VALUE" > "$DOMAIN_CERT_DIR/privkey.pem"
+    echo "$CHAIN_VALUE" > "$STAGING_DIR/fullchain.pem"
+    echo "$KEY_VALUE" > "$STAGING_DIR/privkey.pem"
 
     # Set permissions and ownership
-    chmod 600 "$DOMAIN_CERT_DIR/privkey.pem"
-    chmod 644 "$DOMAIN_CERT_DIR/fullchain.pem"
-    chown "$TRAEFIK_USER:$TRAEFIK_USER" "$DOMAIN_CERT_DIR/privkey.pem" "$DOMAIN_CERT_DIR/fullchain.pem"
+    chmod 600 "$STAGING_DIR/privkey.pem"
+    chmod 644 "$STAGING_DIR/fullchain.pem"
+    chown "$TRAEFIK_USER:$TRAEFIK_USER" "$STAGING_DIR/privkey.pem" "$STAGING_DIR/fullchain.pem"
 
     # Verify cert is not expired and extract expiry date
     local CERT_INFO
-    CERT_INFO=$(openssl x509 -in "$DOMAIN_CERT_DIR/fullchain.pem" -noout -checkend 0 -enddate 2>/dev/null) || {
+    CERT_INFO=$(openssl x509 -in "$STAGING_DIR/fullchain.pem" -noout -checkend 0 -enddate 2>/dev/null) || {
         echo "WARNING: Certificate for $DOMAIN is expired or invalid, skipping"
+        rm -rf "$STAGING_DIR"
         return 1
     }
     local CERT_EXPIRY
     CERT_EXPIRY=$(echo "$CERT_INFO" | grep '^notAfter=' | cut -d= -f2)
 
-    # Verify private key matches certificate
-    local CERT_MOD KEY_MOD
-    CERT_MOD=$(openssl x509 -noout -modulus -in "$DOMAIN_CERT_DIR/fullchain.pem" 2>/dev/null) || {
-        echo "WARNING: Cannot read certificate modulus for $DOMAIN, skipping"
+    # Verify private key matches certificate. Compare the SubjectPublicKeyInfo
+    # digest instead of RSA modulus so valid EC keys are accepted too.
+    local CERT_PUBKEY_DIGEST KEY_PUBKEY_DIGEST
+    CERT_PUBKEY_DIGEST=$(openssl x509 -in "$STAGING_DIR/fullchain.pem" -pubkey -noout 2>/dev/null | \
+        openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -binary | openssl base64) || {
+        echo "WARNING: Cannot read certificate public key for $DOMAIN, skipping"
+        rm -rf "$STAGING_DIR"
         return 1
     }
-    KEY_MOD=$(openssl rsa -noout -modulus -in "$DOMAIN_CERT_DIR/privkey.pem" 2>/dev/null) || {
-        echo "WARNING: Cannot read private key modulus for $DOMAIN, skipping"
+    KEY_PUBKEY_DIGEST=$(openssl pkey -in "$STAGING_DIR/privkey.pem" -pubout -outform DER 2>/dev/null | \
+        openssl dgst -sha256 -binary | openssl base64) || {
+        echo "WARNING: Cannot read private key public key for $DOMAIN, skipping"
+        rm -rf "$STAGING_DIR"
         return 1
     }
-    if [ "$CERT_MOD" != "$KEY_MOD" ]; then
+    if [ "$CERT_PUBKEY_DIGEST" != "$KEY_PUBKEY_DIGEST" ]; then
         echo "WARNING: Certificate/key mismatch for $DOMAIN, skipping"
+        rm -rf "$STAGING_DIR"
         return 1
     fi
 
+    local BACKUP_DIR=""
+    if [ -d "$DOMAIN_CERT_DIR" ]; then
+        # The live dir is absent only between the same-filesystem backup rename
+        # and staged install below. Do not register BACKUP_DIR in the EXIT trap:
+        # trap cleanup must not delete the only on-disk copy if a trappable signal
+        # lands mid-swap. An untrappable kill can leave only the .old dir behind;
+        # the next sync re-installs from SSM, and the stale .old sweep removes
+        # abandoned backups after they age out.
+        BACKUP_DIR=$(mktemp -d "$CERT_DIR/.${DOMAIN}.old.XXXXXX")
+        rmdir "$BACKUP_DIR"
+        if ! mv "$DOMAIN_CERT_DIR" "$BACKUP_DIR"; then
+            if [ -d "$DOMAIN_CERT_DIR" ]; then
+                echo "WARNING: Failed to back up existing certificate for $DOMAIN"
+                rm -rf "$STAGING_DIR"
+                rmdir "$BACKUP_DIR" 2>/dev/null || true
+                return 1
+            fi
+            # Another sync already moved the live dir between the [ -d ] check and
+            # mv. Proceed without a backup; move_dir_into_place will either install
+            # this staging dir into the now-empty slot or fail if the other sync won.
+            BACKUP_DIR=""
+        fi
+    fi
+    if move_dir_into_place "$STAGING_DIR" "$DOMAIN_CERT_DIR"; then
+        [ -z "$BACKUP_DIR" ] || rm -rf "$BACKUP_DIR"
+    else
+        echo "WARNING: Failed to install staged certificate for $DOMAIN"
+        if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
+            if [ -e "$DOMAIN_CERT_DIR" ]; then
+                echo "WARNING: Not restoring backup for $DOMAIN because another sync recreated $DOMAIN_CERT_DIR"
+                rm -rf "$BACKUP_DIR"
+            elif ! mv "$BACKUP_DIR" "$DOMAIN_CERT_DIR"; then
+                echo "WARNING: Failed to restore backup certificate directory for $DOMAIN"
+            fi
+        fi
+        rm -rf "$STAGING_DIR"
+        return 1
+    fi
     echo "  Certificate loaded, expires: $CERT_EXPIRY"
     return 0
 }
@@ -362,8 +478,10 @@ if [ "$SYNC_MODE" = "incremental" ] && [ -n "$TARGET_DOMAIN" ]; then
             splice_tls_block_for_dir "$DOMAIN_CERT_DIR" "$CONFIG_FILE" "$TEMP_CONFIG"
         else
             # First domain on this host — write a fresh header into staging.
-            echo "# Custom Domain Traefik Configuration" > "$TEMP_CONFIG"
-            echo "# Auto-generated by custom-domain-cert-sync.sh" >> "$TEMP_CONFIG"
+            {
+                echo "# Custom Domain Traefik Configuration"
+                echo "# Auto-generated by custom-domain-cert-sync.sh"
+            } > "$TEMP_CONFIG"
         fi
         append_tls_entry "$DOMAIN_CERT_DIR" "$TEMP_CONFIG"
         chmod 644 "$TEMP_CONFIG"
@@ -403,7 +521,6 @@ DOMAINS_JSON=$(echo "$ALL_PARAMS" | jq '
         key: (map(select(.Name | endswith("/key"))) | .[0].Value // ""),
         chain: (map(select(.Name | endswith("/chain"))) | .[0].Value // "")
       })
-    | map(select(.key != "" and .chain != ""))
 ') || {
     echo "ERROR: Failed to parse SSM parameters with jq"
     exit 1
@@ -421,13 +538,19 @@ DOMAIN_COUNT_TOTAL=$(echo "$DOMAINS_JSON" | jq 'length')
 
 # Start building new config
 TEMP_CONFIG=$(mktemp)
-echo "# Custom Domain Traefik Configuration" > "$TEMP_CONFIG"
-echo "# Auto-generated by custom-domain-cert-sync.sh at $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$TEMP_CONFIG"
-echo "# DO NOT EDIT MANUALLY" >> "$TEMP_CONFIG"
-echo "" >> "$TEMP_CONFIG"
+{
+    echo "# Custom Domain Traefik Configuration"
+    echo "# Auto-generated by custom-domain-cert-sync.sh at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    echo "# DO NOT EDIT MANUALLY"
+    echo ""
+} > "$TEMP_CONFIG"
 
 DOMAIN_COUNT=0
 FAILED_COUNT=0
+# Domains whose live cert directories and TOML entries should remain after this
+# full sync. Includes successfully refreshed certs and last-known-good local
+# certs preserved because SSM still has material for the domain but that material
+# failed validation in this run.
 ACTIVE_DOMAINS=""
 
 # Process each domain (per-element jq extraction required because PEM values are multi-line)
@@ -445,16 +568,29 @@ for i in $(seq 0 $((DOMAIN_COUNT_TOTAL - 1))); do
         ACTIVE_DOMAINS="$ACTIVE_DOMAINS $DOMAIN"
         DOMAIN_COUNT=$((DOMAIN_COUNT + 1))
     else
+        DOMAIN_CERT_DIR="$CERT_DIR/$DOMAIN"
+        # Treat present-but-invalid SSM material (including empty values) as an
+        # active domain when a last-known-good local cert exists. A real deletion
+        # comes through --delete after the lambda removes the SSM params; this path
+        # favors continuing to serve the known-good cert over dropping customer TLS
+        # on a transient or partial read.
+        if validate_domain "$DOMAIN" && local_cert_dir_is_servable "$DOMAIN" "$DOMAIN_CERT_DIR"; then
+            echo "Preserving existing certificate for $DOMAIN because SSM material is present but failed validation"
+            append_tls_entry "$DOMAIN_CERT_DIR" "$TEMP_CONFIG"
+            ACTIVE_DOMAINS="$ACTIVE_DOMAINS $DOMAIN"
+        fi
         FAILED_COUNT=$((FAILED_COUNT + 1))
     fi
 done
 
-# Remove stale cert directories for domains no longer in SSM
+# Remove stale cert directories for domains no longer in SSM. The glob
+# intentionally excludes hidden .tmp/.old dirs; sweep_stale_cert_temp_dirs owns
+# those, so do not enable dotglob before this loop without revisiting cleanup.
 if [ -d "$CERT_DIR" ]; then
     for DIR in "$CERT_DIR"/*/; do
         [ -d "$DIR" ] || continue
         DIR_DOMAIN=$(basename "$DIR")
-        if ! echo "$ACTIVE_DOMAINS" | grep -Fwq "$DIR_DOMAIN"; then
+        if ! printf '%s\n' "$ACTIVE_DOMAINS" | tr ' ' '\n' | grep -Fxq -- "$DIR_DOMAIN"; then
             echo "Removing stale cert directory for: $DIR_DOMAIN"
             rm -rf "$DIR"
         fi

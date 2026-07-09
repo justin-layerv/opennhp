@@ -488,8 +488,13 @@ resource "aws_cloudwatch_metric_alarm" "cert_sync_failures" {
   dimensions = {
     Component = "AC"
   }
-  period             = 21600 # 6 hours (matches SSM association interval)
-  statistic          = "Maximum"
+  period    = 21600 # 6 hours (matches SSM association interval)
+  statistic = "Maximum"
+  # Threshold stays >0 intentionally: a preserved last-known-good cert whose SSM
+  # material remains invalid should keep paging once per association period until
+  # repaired, rather than being treated as healthy because customer TLS stayed up.
+  # Present-but-empty material during initial provisioning can also page; confirm
+  # it clears on the next issuance scan or repair the partial SSM state.
   threshold          = 0
   alarm_description  = "Custom domain cert sync encountered failures on AC instances"
   treat_missing_data = "notBreaching"

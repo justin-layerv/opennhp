@@ -594,6 +594,29 @@ resource "aws_cloudwatch_metric_alarm" "cert_provisioning_failures" {
   })
 }
 
+# Alarm for failed rollback after a partial SSM key/chain write. This is distinct
+# from ordinary renewal/provisioning failures because SSM may now require manual
+# repair before AC syncs can install that domain again.
+resource "aws_cloudwatch_metric_alarm" "cert_pair_rollback_failures" {
+  alarm_name          = "${var.name_prefix}-custom-domain-cert-pair-rollback-failures"
+  alarm_description   = "Custom domain cert key/chain rollback failed after a partial SSM write; inspect and repair SSM material before AC sync"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CertPairRollbackFailures"
+  namespace           = "NHP/CustomDomainCerts"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [local.sns_topic_arn]
+  ok_actions    = [local.sns_topic_arn]
+
+  tags = merge(local.common_tags, {
+    Name = "${var.name_prefix}-custom-domain-cert-pair-rollback-failures"
+  })
+}
+
 # Recovery-storm alarm for the #977 cert-recovery path (publish_recovery_metric).
 #
 # A *single* recovery is benign — it is the #977 fix working as intended (a
