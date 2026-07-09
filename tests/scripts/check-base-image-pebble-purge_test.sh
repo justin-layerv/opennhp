@@ -36,7 +36,7 @@ new_fixture() {
 # An ubuntu-based runtime Dockerfile that DOES purge pebble.
 write_ubuntu_purged() {
   cat > "$1" <<'EOF'
-FROM golang:1.26.4-bookworm AS builder
+FROM golang:1.26.5-bookworm AS builder
 RUN true
 FROM ubuntu:26.04@sha256:deadbeef AS runtime
 RUN apt-get update \
@@ -97,7 +97,7 @@ assert_fail "ubuntu Dockerfile without purge fails" "$d" "docker/Dockerfile.ac"
 d="$ROOT/non-ubuntu-ignored"; new_fixture "$d"
 write_ubuntu_purged "$d/docker/Dockerfile.server"
 cat > "$d/docker/Dockerfile.agent" <<'EOF'
-FROM golang:1.26.4-bookworm AS builder
+FROM golang:1.26.5-bookworm AS builder
 RUN true
 EOF
 assert_pass "golang-only Dockerfile is not required to purge" "$d"
@@ -123,7 +123,7 @@ assert_fail "--platform ubuntu FROM is detected" "$d" "docker/Dockerfile.app"
 #    silently pass on nothing).
 d="$ROOT/no-ubuntu"; new_fixture "$d"
 cat > "$d/docker/Dockerfile.agent" <<'EOF'
-FROM golang:1.26.4-bookworm AS builder
+FROM golang:1.26.5-bookworm AS builder
 RUN true
 EOF
 assert_fail "no ubuntu Dockerfile is a hard error" "$d" "no ubuntu-based Dockerfile"

@@ -45,7 +45,7 @@ new_fixture() {
 # An ubuntu runtime Dockerfile pinning $2 as its digest.
 write_ubuntu() {
   cat > "$1" <<EOF
-FROM golang:1.26.4-bookworm AS builder
+FROM golang:1.26.5-bookworm AS builder
 RUN true
 FROM ubuntu:26.04@$2 AS runtime
 RUN apt-get update && rm -rf /var/lib/apt/lists/*
@@ -55,7 +55,7 @@ EOF
 # A golang-only Dockerfile (no ubuntu FROM) — nothing this lint requires.
 write_golang_only() {
   cat > "$1" <<'EOF'
-FROM golang:1.26.4-bookworm AS builder
+FROM golang:1.26.5-bookworm AS builder
 RUN true
 EOF
 }

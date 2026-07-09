@@ -1,6 +1,6 @@
 module github.com/layerv/nhp/tests/local
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/pelletier/go-toml/v2 v2.4.2
