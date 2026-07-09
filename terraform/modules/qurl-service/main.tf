@@ -523,6 +523,21 @@ locals {
       { name = "QURL_V2_RESOURCE_KEYS_ENABLED", value = "true" },
       { name = "QURL_V2_RESOURCE_KEY_SERVICE_ROLE_ARN", value = aws_iam_role.task.arn },
       { name = "QURL_V2_RESOURCE_KEY_ACCOUNT_ROOT_ARN", value = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" },
+      # ENVELOPE_KMS_ARN is the single shared CMK software custody wraps private
+      # keys under (grant: see task_qurl_v2_resource_key_envelope); required when
+      # resource keys are on because software is the default custody. SOFTWARE_DEFAULT is the
+      # dark-launch ramp: off ⇒ hardware-for-all (byte-identical to today); on ⇒
+      # custody is chosen per owner by the HardwareKeyStorage entitlement.
+      { name = "QURL_V2_RESOURCE_KEY_ENVELOPE_KMS_ARN", value = var.qurl_v2_resource_key_envelope_key_arn },
+      { name = "QURL_V2_RESOURCE_KEY_SOFTWARE_DEFAULT", value = var.qurl_v2_resource_key_software_default ? "true" : "false" },
+    ] : [],
+    # Periodic resource-key reaper: reconciles the per-resource CMK population
+    # against live resources and schedules deletion of orphans (dead/revoked/
+    # tombstoned owners). Paired with the discovery IAM policy below
+    # (task_qurl_v2_resource_key_reaper).
+    var.qurl_v2_resource_key_reaper_enabled ? [
+      { name = "QURL_V2_RESOURCE_KEY_REAPER_ENABLED", value = "true" },
+      { name = "QURL_V2_RESOURCE_KEY_REAPER_INTERVAL_SECONDS", value = tostring(var.qurl_v2_resource_key_reaper_interval_seconds) },
     ] : [],
     var.qurl_v2_issuer_key_enabled ? [
       { name = "QURL_V2_ISSUER_KEY_ENABLED", value = "true" },
@@ -769,6 +784,80 @@ resource "aws_iam_role_policy" "task_qurl_v2_issuer_signing" {
       Resource = [var.qurl_v2_issuer_key_arn]
     }]
   })
+}
+
+# qURL v2 software-custody envelope — kms:GenerateDataKey on the single shared
+# envelope key (module.kms.qurl_v2_resource_key_envelope_key_arn) used to wrap
+# SOFTWARE-custody resource private keys. Scoped to exactly that ARN AND
+# conditioned on the encryption context the app sets, so the grant cannot wrap
+# under an unrelated context. This is EXACTLY what the software provider calls
+# today — kms:Decrypt (the delegation-proof read path) and kms:DescribeKey are
+# deliberately NOT granted until the code that exercises them ships; note that
+# DescribeKey carries no encryption context, so it can never be granted inside
+# this conditioned statement (it would be dead — grant it condition-less when
+# needed). Deliberately no kms:Sign. Gated on the resource-keys flag (the ARN
+# comes from module.kms, so count keys on the flag only — see the issuer-signing
+# note above); the precondition enforces the flag→ARN invariant the root wiring
+# otherwise merely arranges.
+resource "aws_iam_role_policy" "task_qurl_v2_resource_key_envelope" {
+  count = var.qurl_v2_resource_keys_enabled ? 1 : 0
+  name  = "qurl-v2-resource-key-envelope"
+  role  = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "QurlV2ResourceKeyEnvelopeWrap"
+      Effect   = "Allow"
+      Action   = ["kms:GenerateDataKey"]
+      Resource = [var.qurl_v2_resource_key_envelope_key_arn]
+      Condition = {
+        StringEquals = {
+          # Lockstep: must equal qurl-service internal/resourcekey/envelope.go
+          # softwareKeyPurpose (the context the app stamps on GenerateDataKey).
+          "kms:EncryptionContext:purpose" = "qurl-v2-resource-software-key"
+        }
+      }
+    }]
+  })
+
+  lifecycle {
+    precondition {
+      condition     = var.qurl_v2_resource_key_envelope_key_arn != ""
+      error_message = "qurl_v2_resource_keys_enabled requires a non-empty qurl_v2_resource_key_envelope_key_arn (root threads module.kms.qurl_v2_resource_key_envelope_key_arn when the flag is on)."
+    }
+  }
+}
+
+# qURL v2 resource-key reaper — discovery grant for the periodic reconcile sweep
+# (qurl-service internal/resourcekeyreap) that schedules deletion of per-resource
+# CMKs whose owning resource is gone or terminally closed. tag:GetResources is a
+# read-only tag-inventory action and cannot be resource-scoped; the DESTRUCTIVE
+# half of the reaper (kms:DescribeKey/ScheduleKeyDeletion) rides the tag-scoped
+# lifecycle statement in task_qurl_v2_resource_keys below, and the explicit Deny
+# list there still fences the account CMKs. Gated on the reaper flag; its
+# precondition keeps the flag from being enabled without the lifecycle grants.
+resource "aws_iam_role_policy" "task_qurl_v2_resource_key_reaper" {
+  count = var.qurl_v2_resource_key_reaper_enabled ? 1 : 0
+  name  = "qurl-v2-resource-key-reaper"
+  role  = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "QurlV2ResourceKeyReaperDiscovery"
+      Effect   = "Allow"
+      Action   = ["tag:GetResources"]
+      Resource = "*"
+    }]
+  })
+
+  lifecycle {
+    precondition {
+      condition     = var.qurl_v2_resource_keys_enabled
+      error_message = "qurl_v2_resource_key_reaper_enabled requires qurl_v2_resource_keys_enabled = true (the reaper's kms:DescribeKey/ScheduleKeyDeletion come from the tag-scoped resource-key policy)."
+    }
+  }
 }
 
 # qURL v2 per-resource keys — qurl-service mints a KMS key per protected resource

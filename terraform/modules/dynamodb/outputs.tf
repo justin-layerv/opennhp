@@ -215,5 +215,7 @@ output "qurl_table_arns" {
     aws_dynamodb_table.qurl_access_codes[0].arn,
     aws_dynamodb_table.qurl_agent_keys[0].arn,
     aws_dynamodb_table.qurl_v2_admissions[0].arn,
+    aws_dynamodb_table.qurl_resource_key_material[0].arn,
   ] : []
 }
+

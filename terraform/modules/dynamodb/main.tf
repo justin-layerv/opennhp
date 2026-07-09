@@ -1446,6 +1446,54 @@ resource "aws_dynamodb_table" "qurl_v2_admissions" {
   })
 }
 
+# qurl-resource-key-material: envelope-wrapped private half of SOFTWARE-custody
+# qURL v2 resource keys, one item per mint keyed by material_id. Name + key
+# schema MUST mirror qurl-service's schema registry
+# (internal/repository/dynamodb/schema.go::TableResourceKeyMaterial) exactly —
+# drift 503s /health/ready on every task, like the qurl_v2_admissions
+# precedent. Deliberately
+# separate from qurl-resources so the admission/liveness hot path never reads
+# secret material, and so any future envelope-key read grant can be scoped to
+# just this access path. SSE-KMS is defense-in-depth (the blob is already
+# envelope-encrypted at the app layer). No TTL — material lives as long as its
+# resource; lifecycle convergence (orphans from crashes/revokes) is the
+# resource-key reaper's job, mirroring the CMK population. Gated on
+# deploy_qurl_tables (NOT the resource-keys feature flag) on purpose: toggling
+# the app feature must not create/destroy a table that may hold material, and an
+# empty table in a feature-off env is free. PITR/deletion-protection are
+# prod-only like the sibling tables — acceptable for the data class because
+# accidental loss of the app-encrypted blob is not disclosure, and v2 never
+# reads it.
+resource "aws_dynamodb_table" "qurl_resource_key_material" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-resource-key-material"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "material_id"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "material_id"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-resource-key-material"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "qURL v2 software-custody resource-key wrapped private material"
+  })
+}
+
 # qurl-customers: Stores customer records for quota and billing
 # PK: auth0_subject (Auth0 user ID or "email:<sha256>" for bridge keys)
 resource "aws_dynamodb_table" "qurl_customers" {

@@ -382,3 +382,54 @@ resource "aws_kms_alias" "qurl_v2_issuer" {
   name          = "alias/${var.name_prefix}-qurl-v2-issuer"
   target_key_id = aws_kms_key.qurl_v2_issuer[0].key_id
 }
+
+# Symmetric (AES-256) CMK that envelope-encrypts SOFTWARE-custody qURL v2
+# resource private keys. qurl-service calls kms:GenerateDataKey per resource to
+# wrap the in-process-generated private key, and stores only the wrapped blob in
+# the qurl-resource-key-material DynamoDB table. kms:Decrypt is unused by v2
+# admission and deliberately NOT granted to any qurl-service principal yet — the
+# grant lands with the future delegation-proof read path. A SINGLE shared key
+# wraps every software resource key — that is the cost win over the per-resource
+# CMKs hardware custody mints at runtime.
+#
+# Gated on qurl_v2_resource_keys_enabled (software is the default custody once
+# the feature is on). Key rotation is enabled and safe: KMS retains prior backing
+# material, so already-wrapped DEKs stay decryptable across rotations. The task-role
+# grant lives in the qurl-service module (see task_qurl_v2_resource_key_envelope
+# — the single authority on which actions are granted; root-account delegation
+# in the key policy lets IAM grant it). This key deliberately grants no
+# kms:Sign to anyone but the account root admin.
+resource "aws_kms_key" "qurl_v2_resource_key_envelope" {
+  count = var.qurl_v2_resource_keys_enabled ? 1 : 0
+
+  description             = "NHP ${var.environment} - qURL v2 software-custody resource-key envelope key (AES-256)"
+  deletion_window_in_days = local.is_prod ? 30 : 7
+  enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EnableRootAccount"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action   = "kms:*"
+        Resource = "*"
+      },
+    ]
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-kms-qurl-v2-resource-key-envelope"
+    Component = "kms"
+    Purpose   = "qURL v2 software-custody resource-key envelope encryption"
+  })
+}
+
+resource "aws_kms_alias" "qurl_v2_resource_key_envelope" {
+  count         = var.qurl_v2_resource_keys_enabled ? 1 : 0
+  name          = "alias/${var.name_prefix}-qurl-v2-resource-key-envelope"
+  target_key_id = aws_kms_key.qurl_v2_resource_key_envelope[0].key_id
+}

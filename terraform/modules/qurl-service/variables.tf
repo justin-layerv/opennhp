@@ -1259,6 +1259,40 @@ variable "qurl_v2_resource_keys_enabled" {
   default     = false
 }
 
+variable "qurl_v2_resource_key_envelope_key_arn" {
+  description = "ARN of the single shared envelope CMK (from module.kms.qurl_v2_resource_key_envelope_key_arn) used to wrap SOFTWARE-custody resource private keys. Must be a key ARN, never an alias ARN (the validation rejects aliases). Emitted as QURL_V2_RESOURCE_KEY_ENVELOPE_KMS_ARN and granted kms:GenerateDataKey only (Decrypt lands with the delegation-proof read path). Required (non-empty) when qurl_v2_resource_keys_enabled = true."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_v2_resource_key_envelope_key_arn == "" || can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-z0-9-]+$", var.qurl_v2_resource_key_envelope_key_arn))
+    error_message = "qurl_v2_resource_key_envelope_key_arn must be empty or a valid KMS key ARN."
+  }
+}
+
+variable "qurl_v2_resource_key_software_default" {
+  description = "Dark-launch ramp for software key custody. false ⇒ hardware-for-all (KMS CMK per resource, byte-identical to pre-software behavior) even for unentitled owners; true ⇒ custody chosen per owner (HardwareKeyStorage entitlement ⇒ KMS, else software). Emitted as QURL_V2_RESOURCE_KEY_SOFTWARE_DEFAULT. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_resource_key_reaper_enabled" {
+  description = "Run the periodic resource-key reaper in qurl-api: reconciles per-resource KMS CMKs against live resources and schedules deletion of orphans (dead/revoked/tombstoned owners), which otherwise bill ~$1/month each forever. Emits QURL_V2_RESOURCE_KEY_REAPER_* env and grants tag:GetResources. Requires qurl_v2_resource_keys_enabled. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_resource_key_reaper_interval_seconds" {
+  description = "Resource-key reaper sweep cadence in seconds. Default 21600 (6h) — cost granularity is $1/key/month, so tighter cadences buy nothing."
+  type        = number
+  default     = 21600
+
+  validation {
+    condition     = var.qurl_v2_resource_key_reaper_interval_seconds >= 300
+    error_message = "qurl_v2_resource_key_reaper_interval_seconds must be >= 300 (matches the service-side config floor)."
+  }
+}
+
 variable "qurl_v2_issuance_enabled" {
   description = "Emit QURL_V2_ISSUANCE_ENABLED + QURL_V2_RELAY_URL so createQurl mints v2 signed-claims links (and mounts the admission surface). Requires issuer-key + resource-keys enabled. Default false."
   type        = bool

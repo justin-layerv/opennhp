@@ -2291,6 +2291,24 @@ variable "qurl_v2_resource_keys_enabled" {
   default     = false
 }
 
+variable "qurl_v2_resource_key_software_default" {
+  description = "Dark-launch ramp for qURL v2 software key custody. false ⇒ hardware-for-all (KMS CMK per resource) even for unentitled owners; true ⇒ custody chosen per owner (HardwareKeyStorage entitlement ⇒ KMS, else envelope-wrapped software). Only meaningful when qurl_v2_resource_keys_enabled = true. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_resource_key_reaper_enabled" {
+  description = "Run the periodic resource-key reaper in qurl-api (reconcile-and-delete orphaned per-resource CMKs). Requires qurl_v2_resource_keys_enabled. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_v2_resource_key_reaper_interval_seconds" {
+  description = "Resource-key reaper sweep cadence in seconds. Default 21600 (6h); cost granularity is $1/key/month, so tighter cadences buy nothing."
+  type        = number
+  default     = 21600
+}
+
 variable "qurl_v2_issuance_enabled" {
   description = "Enable qURL v2 link minting on qurl-api (requires issuer-key + resource-keys). Default false."
   type        = bool

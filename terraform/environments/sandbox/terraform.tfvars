@@ -623,11 +623,23 @@ qurl_config = {
 # Rollback: set issuance=false (createQurl reverts to v1); the rest can stay on.
 qurl_v2_issuer_key_enabled    = true
 qurl_v2_resource_keys_enabled = true
-qurl_v2_issuance_enabled      = true
-qurl_v2_admission_enabled     = true
-qurl_v2_issuer_kid            = "qurl-issuer-sandbox-2026-07"
-qurl_v2_relay_url             = "https://relay.qurl.link.layerv.xyz"
-qurl_v2_relay_allowlist       = "relay.qurl.link.layerv.xyz"
+# Software custody is the DEFAULT for unentitled owners (cost decision
+# 2026-07-09: per-resource CMKs at ~$1/mo each were the dominant KMS spend —
+# software custody mints zero CMKs). Ships ON: the software path goes live at
+# the first deploy of the custody-aware qurl-service image. Hardware (KMS) is
+# per-customer opt-in via CustomerInfo.HardwareKeyStorage. Prod flips together
+# with qv2 prod enablement (resource keys are off there; the flag-invariant
+# precondition rejects ramp-on without them).
+qurl_v2_resource_key_software_default = true
+# Periodic reaper: keeps the per-resource CMK population converged with live
+# resources (one-time backlog sweep executed 2026-07-09; the reaper prevents
+# regrowth from test churn until the software-custody ramp flips).
+qurl_v2_resource_key_reaper_enabled = true
+qurl_v2_issuance_enabled            = true
+qurl_v2_admission_enabled           = true
+qurl_v2_issuer_kid                  = "qurl-issuer-sandbox-2026-07"
+qurl_v2_relay_url                   = "https://relay.qurl.link.layerv.xyz"
+qurl_v2_relay_allowlist             = "relay.qurl.link.layerv.xyz"
 
 # Uses same secret as QURL service for internal API auth
 qurl_service_token_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token-XgjoDM"

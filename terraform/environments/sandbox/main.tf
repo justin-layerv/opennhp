@@ -124,13 +124,16 @@ module "nhp" {
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
 
   # qURL v2 (keyed identity) — all default off; flip in tfvars to enable.
-  qurl_v2_issuer_key_enabled    = var.qurl_v2_issuer_key_enabled
-  qurl_v2_resource_keys_enabled = var.qurl_v2_resource_keys_enabled
-  qurl_v2_issuance_enabled      = var.qurl_v2_issuance_enabled
-  qurl_v2_admission_enabled     = var.qurl_v2_admission_enabled
-  qurl_v2_issuer_kid            = var.qurl_v2_issuer_kid
-  qurl_v2_relay_url             = var.qurl_v2_relay_url
-  qurl_v2_relay_allowlist       = var.qurl_v2_relay_allowlist
+  qurl_v2_issuer_key_enabled                   = var.qurl_v2_issuer_key_enabled
+  qurl_v2_resource_keys_enabled                = var.qurl_v2_resource_keys_enabled
+  qurl_v2_resource_key_software_default        = var.qurl_v2_resource_key_software_default
+  qurl_v2_resource_key_reaper_enabled          = var.qurl_v2_resource_key_reaper_enabled
+  qurl_v2_resource_key_reaper_interval_seconds = var.qurl_v2_resource_key_reaper_interval_seconds
+  qurl_v2_issuance_enabled                     = var.qurl_v2_issuance_enabled
+  qurl_v2_admission_enabled                    = var.qurl_v2_admission_enabled
+  qurl_v2_issuer_kid                           = var.qurl_v2_issuer_kid
+  qurl_v2_relay_url                            = var.qurl_v2_relay_url
+  qurl_v2_relay_allowlist                      = var.qurl_v2_relay_allowlist
 
   # QURL Link redirect page
   deploy_qurl_link                = var.deploy_qurl_link

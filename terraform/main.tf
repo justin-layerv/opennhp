@@ -268,7 +268,8 @@ module "kms" {
   name_prefix = local.name_prefix
   tags        = local.common_tags
 
-  qurl_v2_issuer_key_enabled = var.qurl_v2_issuer_key_enabled
+  qurl_v2_issuer_key_enabled    = var.qurl_v2_issuer_key_enabled
+  qurl_v2_resource_keys_enabled = var.qurl_v2_resource_keys_enabled
 }
 
 # qURL v2 issuer public key (base64 DER SPKI) read from the provisioned issuer KMS
@@ -348,6 +349,12 @@ locals {
     module.kms.logs_key_arn,
     module.kms.rds_key_arn,
     module.kms.qurl_v2_issuer_key_arn,
+    # The software-custody envelope CMK is root-delegating like the rest, so
+    # without this Deny entry a compromised task could TagResource it with
+    # purpose=qurl-v2-resource-key and reach it via the tag-scoped
+    # ScheduleKeyDeletion grant — deleting the key every wrapped software
+    # resource key depends on. compact() drops the null when the feature is off.
+    module.kms.qurl_v2_resource_key_envelope_key_arn,
   ])
 }
 
@@ -366,6 +373,14 @@ resource "terraform_data" "qurl_v2_flag_invariants" {
     precondition {
       condition     = !var.qurl_v2_issuance_enabled || (var.qurl_v2_issuer_key_enabled && var.qurl_v2_resource_keys_enabled)
       error_message = "qurl_v2_issuance_enabled requires qurl_v2_issuer_key_enabled and qurl_v2_resource_keys_enabled."
+    }
+    precondition {
+      # The ramp flag's env var is only emitted when resource keys are on, so
+      # software_default=true with resource_keys=false applies green and
+      # silently no-ops — custody stays hardware while the operator believes
+      # the ramp is live. Fail the plan instead.
+      condition     = !var.qurl_v2_resource_key_software_default || var.qurl_v2_resource_keys_enabled
+      error_message = "qurl_v2_resource_key_software_default requires qurl_v2_resource_keys_enabled = true (otherwise the ramp env is never emitted and the flag silently no-ops)."
     }
     precondition {
       # issuance + admission must flip together: minting v2 links (issuance) while the
@@ -2905,9 +2920,16 @@ module "qurl_service" {
   qurl_v2_resource_keys_enabled = var.qurl_v2_resource_keys_enabled
   qurl_v2_issuance_enabled      = var.qurl_v2_issuance_enabled
   qurl_v2_issuer_key_arn        = var.qurl_v2_issuer_key_enabled ? module.kms.qurl_v2_issuer_key_arn : ""
-  qurl_v2_issuer_kid            = var.qurl_v2_issuer_kid
-  qurl_v2_relay_url             = var.qurl_v2_relay_url
-  qurl_v2_relay_allowlist       = var.qurl_v2_relay_allowlist
+  # Envelope key is minted by module.kms only when resource keys are enabled; the
+  # ternary keeps the ARN empty otherwise (module var validation + config both
+  # require it non-empty exactly when the feature is on).
+  qurl_v2_resource_key_envelope_key_arn        = var.qurl_v2_resource_keys_enabled ? module.kms.qurl_v2_resource_key_envelope_key_arn : ""
+  qurl_v2_resource_key_software_default        = var.qurl_v2_resource_key_software_default
+  qurl_v2_resource_key_reaper_enabled          = var.qurl_v2_resource_key_reaper_enabled
+  qurl_v2_resource_key_reaper_interval_seconds = var.qurl_v2_resource_key_reaper_interval_seconds
+  qurl_v2_issuer_kid                           = var.qurl_v2_issuer_kid
+  qurl_v2_relay_url                            = var.qurl_v2_relay_url
+  qurl_v2_relay_allowlist                      = var.qurl_v2_relay_allowlist
   # Explicit-Deny targets for the per-resource-key policy (encryption CMKs + issuer).
   qurl_v2_resource_key_protected_kms_arns = local.qurl_v2_resource_key_protected_kms_arns
 

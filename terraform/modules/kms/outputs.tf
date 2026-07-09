@@ -62,3 +62,9 @@ output "qurl_v2_issuer_key_alias" {
   description = "Alias name of the qURL v2 issuer signing key; null when not provisioned"
   value       = one(aws_kms_alias.qurl_v2_issuer[*].name)
 }
+
+output "qurl_v2_resource_key_envelope_key_arn" {
+  description = "ARN of the qURL v2 software-custody resource-key envelope key (AES-256); null when qurl_v2_resource_keys_enabled = false"
+  value       = one(aws_kms_key.qurl_v2_resource_key_envelope[*].arn)
+}
+

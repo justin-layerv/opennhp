@@ -322,13 +322,19 @@ lifecycle. Long term it replaces the protected resource ID for AC routing.
 - In v2, `resource_public_key_b64` is the actual protected-resource public key.
   It is the NHP knock resource identity and the AC routing/admission key. It is
   not a lookup alias, and it is not interchangeable with `resource_key_id`.
-- v2 admission does not perform a resource-private-key signature/proof. If
-  qurl-service owns the private half, it remains non-exportable in KMS, reserved
-  for a future resource-delegation proof, with no hot read/sign path in v2. The
-  KMS key policy MUST grant `kms:Sign` to no v2 principal (Sign is added only when
-  the delegation feature ships), so a code regression cannot quietly sign with a
-  resource key. Do not claim resource-private-key authorization until that proof
-  protocol exists.
+- v2 admission does not perform a resource-private-key signature/proof. The
+  private half is reserved for a future resource-delegation proof, with no hot
+  read/sign path in v2, under one of two custody modes chosen per owner
+  (nhp #3137 / qurl-service #1175): HARDWARE custody keeps it non-exportable in
+  a per-resource KMS CMK whose key policy MUST grant `kms:Sign` to no v2
+  principal (Sign is added only when the delegation feature ships), so a code
+  regression cannot quietly sign with a resource key; SOFTWARE custody (the
+  default for unentitled owners) generates the keypair in-process and stores the
+  private half only KMS-envelope-wrapped in `qurl-resource-key-material` —
+  satisfying Goal 9's "KMS custody or KMS-wrapped storage" — with the
+  compile-time no-Sign provider seam as the equivalent no-signing guarantee.
+  Do not claim resource-private-key authorization until that proof protocol
+  exists.
 - `resource_key_id` may exist as a DNS/API-safe alias derived from the public key,
   but it is never the NHP knock resource identity and never the authorization
   cache key.
