@@ -25,3 +25,15 @@ variable "qurl_v2_resource_keys_enabled" {
   type        = bool
   default     = false
 }
+
+# Opaque ordering token (a `time_sleep` id from the root module's
+# IAM-propagation shim) that must settle before the envelope CMK is created,
+# so the CI apply role's freshly granted kms:EnableKeyRotation has propagated
+# through the IAM auth evaluator before EnableKeyRotation runs at create time.
+# See terraform/CLAUDE.md → "IAM eventual-consistency shim pattern". Null when
+# qurl_v2_resource_keys_enabled is false (no key, so nothing to gate).
+variable "resource_key_envelope_create_after" {
+  description = "Opaque dependency token (root-module time_sleep id) gating envelope-CMK creation until the CI role's kms:EnableKeyRotation grant has propagated. Null when qurl_v2_resource_keys_enabled is false."
+  type        = string
+  default     = null
+}

@@ -2058,12 +2058,24 @@ resource "aws_iam_policy" "terraform_apply_iam" {
         # Uses StringEqualsIfExists because kms:CreateKey is
         # non-resource-scoped (the key doesn't exist yet at request time);
         # IfExists permits it while still bounding the resource-scoped
-        # actions (ScheduleKeyDeletion, *Alias, *Tag, PutKeyPolicy) to
-        # in-account keys.
+        # actions (ScheduleKeyDeletion, EnableKeyRotation, *Alias, *Tag,
+        # PutKeyPolicy) to in-account keys.
+        #
+        # kms:EnableKeyRotation is exercised at create time for any new
+        # symmetric CMK with enable_key_rotation=true — the qURL v2 software-
+        # custody envelope key (modules/kms, #3137) is the first such key added
+        # since this statement was scoped. Pre-existing symmetric keys already
+        # have rotation enabled in state, so TF never re-issues the call and the
+        # gap stayed invisible until this key's create hit AccessDenied. The
+        # same-apply grant+create races the IAM auth evaluator, so the envelope
+        # key waits on time_sleep.qurl_v2_resource_key_envelope_iam_propagation
+        # (terraform/main.tf). Read-side kms:GetKeyRotationStatus is already
+        # covered by kms:Get* in the KMSDescribeInAccount statement above.
         Sid    = "KMS"
         Effect = "Allow"
         Action = [
           "kms:CreateKey",
+          "kms:EnableKeyRotation",
           "kms:ScheduleKeyDeletion",
           "kms:CreateAlias",
           "kms:DeleteAlias",
@@ -3317,6 +3329,26 @@ output "terraform_apply_services_policy_arn" {
 output "terraform_apply_services_attachment_id" {
   description = "ID of the role-policy attachment for terraform-apply-services. Forces a `time_sleep` shim to order AFTER the attachment lands at AWS — see qurl_link_static_attachment_id above for the same shape."
   value       = aws_iam_role_policy_attachment.terraform_apply_services.id
+}
+
+# Trigger sources for `time_sleep.qurl_v2_resource_key_envelope_iam_propagation`
+# — see that resource in `terraform/main.tf`. Same triplet shape as
+# terraform_apply_services above; this is the policy that carries the KMS
+# key-management grant (Sid "KMS"), whose kms:EnableKeyRotation action the qURL
+# v2 envelope CMK's create needs freshly propagated.
+output "terraform_apply_iam_policy_doc_hash" {
+  description = "sha256 of the terraform-apply-iam CI policy doc; trigger source for the envelope-CMK EnableKeyRotation IAM-propagation shim."
+  value       = sha256(aws_iam_policy.terraform_apply_iam.policy)
+}
+
+output "terraform_apply_iam_policy_arn" {
+  description = "ARN of the terraform-apply-iam CI policy. Catches the rename-via-`name` case in IAM-propagation shim triggers."
+  value       = aws_iam_policy.terraform_apply_iam.arn
+}
+
+output "terraform_apply_iam_attachment_id" {
+  description = "ID of the role-policy attachment for terraform-apply-iam. Forces a `time_sleep` shim to order AFTER the attachment lands at AWS — see qurl_link_static_attachment_id above for the same shape."
+  value       = aws_iam_role_policy_attachment.terraform_apply_iam.id
 }
 
 # Trigger sources for Route53 record-change IAM propagation shims. The inline

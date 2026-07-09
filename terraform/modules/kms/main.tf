@@ -383,6 +383,17 @@ resource "aws_kms_alias" "qurl_v2_issuer" {
   target_key_id = aws_kms_key.qurl_v2_issuer[0].key_id
 }
 
+# Ordering anchor for the CI-role IAM-propagation shim. Consuming the opaque
+# token forces the envelope key below to wait on the root-module `time_sleep`
+# (whose id only settles after the kms:EnableKeyRotation grant has propagated),
+# without taking a coarse module-level depends_on that would order every KMS key
+# behind the shim and risk an ecr<->kms cycle. See terraform/CLAUDE.md → "IAM
+# eventual-consistency shim pattern".
+resource "terraform_data" "resource_key_envelope_iam_gate" {
+  count = var.qurl_v2_resource_keys_enabled ? 1 : 0
+  input = var.resource_key_envelope_create_after
+}
+
 # Symmetric (AES-256) CMK that envelope-encrypts SOFTWARE-custody qURL v2
 # resource private keys. qurl-service calls kms:GenerateDataKey per resource to
 # wrap the in-process-generated private key, and stores only the wrapped blob in
@@ -405,6 +416,10 @@ resource "aws_kms_key" "qurl_v2_resource_key_envelope" {
   description             = "NHP ${var.environment} - qURL v2 software-custody resource-key envelope key (AES-256)"
   deletion_window_in_days = local.is_prod ? 30 : 7
   enable_key_rotation     = true
+
+  # enable_key_rotation calls kms:EnableKeyRotation at create time; wait for that
+  # grant to propagate to the CI apply role before the create runs (see anchor above).
+  depends_on = [terraform_data.resource_key_envelope_iam_gate]
 
   policy = jsonencode({
     Version = "2012-10-17"

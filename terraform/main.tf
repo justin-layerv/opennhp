@@ -270,6 +270,11 @@ module "kms" {
 
   qurl_v2_issuer_key_enabled    = var.qurl_v2_issuer_key_enabled
   qurl_v2_resource_keys_enabled = var.qurl_v2_resource_keys_enabled
+
+  # Gate envelope-CMK creation on the CI-role kms:EnableKeyRotation grant having
+  # propagated (see time_sleep.qurl_v2_resource_key_envelope_iam_propagation).
+  # Null when the key isn't created, so envs with the flag off take no edge.
+  resource_key_envelope_create_after = var.qurl_v2_resource_keys_enabled ? time_sleep.qurl_v2_resource_key_envelope_iam_propagation[0].id : null
 }
 
 # qURL v2 issuer public key (base64 DER SPKI) read from the provisioned issuer KMS
@@ -4203,6 +4208,36 @@ resource "time_sleep" "qurl_link_static_iam_propagation" {
     policy_doc_hash = module.ecr.qurl_link_static_policy_doc_hash
     policy_arn      = module.ecr.qurl_link_static_policy_arn
     attachment_id   = module.ecr.qurl_link_static_attachment_id
+  }
+
+  create_duration = local.iam_propagation_duration
+}
+
+# IAM eventual-consistency shim for the qURL v2 software-custody envelope CMK.
+# The same apply that adds kms:EnableKeyRotation to the terraform-apply-iam CI
+# policy (module.ecr, Sid "KMS") also creates the envelope key (module.kms),
+# whose enable_key_rotation=true issues EnableKeyRotation at create time. That
+# grant+create in one graph races the IAM auth evaluator and surfaces as
+# AccessDenied on the fresh key (run 29053939368). The envelope key consumes
+# this sleep's id via var.resource_key_envelope_create_after so it waits for the
+# grant to propagate before EnableKeyRotation runs.
+#
+# 60s (local.iam_propagation_duration), not 180s: this is an action-list
+# addition on an already-scoped policy (the qurl_link_static shape above), not a
+# freshly-scoped resource-prefix grant (the bootstrap_alb shape below). The Sid
+# "KMS" Resource is already "*" (in-account); no new resource shape to propagate.
+#
+# Gate matches the sole consumer's condition (var.qurl_v2_resource_keys_enabled,
+# which is what creates the envelope key in module.kms) per terraform/CLAUDE.md →
+# "IAM eventual-consistency shim pattern". attachment_id is present so the sleep
+# orders AFTER the attachment lands at AWS, not merely after the policy resource.
+resource "time_sleep" "qurl_v2_resource_key_envelope_iam_propagation" {
+  count = var.qurl_v2_resource_keys_enabled ? 1 : 0
+
+  triggers = {
+    policy_doc_hash = module.ecr.terraform_apply_iam_policy_doc_hash
+    policy_arn      = module.ecr.terraform_apply_iam_policy_arn
+    attachment_id   = module.ecr.terraform_apply_iam_attachment_id
   }
 
   create_duration = local.iam_propagation_duration
