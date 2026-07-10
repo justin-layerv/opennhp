@@ -27,3 +27,10 @@ Dockerfile* text eol=lf
 # hashes the raw bytes of the set (canonicalFixtureSetSHA256), so a CRLF checkout on
 # Windows would spuriously break the checksum. Pin LF for these fixtures explicitly.
 endpoints/server/staticplugins/qurl/testdata/qurlv2_admission_contract/*.json text eol=lf
+
+# The NHP agent-registration golden vector is byte-sensitive twice over: the
+# roundtrip fence pins its sha256 (agentRegFixtureSHA256), and the upstream-drift
+# check (scripts/check-agent-reg-vector-drift.sh) byte-compares it against the LF
+# raw blob fetched from qurl-conformance. A CRLF checkout would spuriously break
+# both. Pin LF explicitly so byte-exactness holds on any runner.
+nhp/core/testdata/agent_registration_golden.json text eol=lf

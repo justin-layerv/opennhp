@@ -101,6 +101,11 @@ on:
       # Go/Node toolchain). Watch the script so an edit re-fires its shellcheck +
       # the fixture test here; the test file rides tests/scripts/** below.
       - "scripts/check-conformance-parity.sh"
+      # The agent-reg upstream-drift check's fixture test runs in THIS workflow
+      # (its live cross-repo fetch runs in agent-reg-vector-drift.yml). Watch the
+      # script so an edit re-fires its shellcheck + the fixture test here; the
+      # test file rides tests/scripts/** below.
+      - "scripts/check-agent-reg-vector-drift.sh"
       # All cross-language golden-vector files are listed so a one-sided edit to
       # ANY of them fires the Go↔TS cross-check (scripts/check-golden-vectors.sh)
       # — including the Go-side files, which the path-scoped js-agent.yml never
@@ -533,6 +538,21 @@ jobs:
         run: |
           shellcheck scripts/check-conformance-parity.sh tests/scripts/check-conformance-parity_test.sh
           bash tests/scripts/check-conformance-parity_test.sh
+
+      # Fixture-test for the agent-registration upstream-drift check's DECISION
+      # logic (#3138): canonical==local→0/OK, differ→1/DRIFT, upstream-absent
+      # (404) and fetch-failure→0/SKIP, missing-local→1. The real
+      # scripts/check-agent-reg-vector-drift.sh fetches the canonical
+      # agent_registration_golden.json from qurl-conformance via `gh api`, so its
+      # live fetch runs in its own scheduled workflow (agent-reg-vector-drift.yml).
+      # This pure-shell job shellchecks both files and runs the network-free
+      # fixture test (which injects REMOTE_VECTOR to bypass the fetch), guarding
+      # the compare/skip/exit logic here without network. Mirrors the
+      # conformance-parity test wiring above.
+      - name: Test agent-reg vector drift decision logic (#3138)
+        run: |
+          shellcheck scripts/check-agent-reg-vector-drift.sh tests/scripts/check-agent-reg-vector-drift_test.sh
+          bash tests/scripts/check-agent-reg-vector-drift_test.sh
 
       # Structural fence for the qurl-service /internal/* public-ALB
       # lockdown body contract (PR #1635; rearchitected by #1645). The

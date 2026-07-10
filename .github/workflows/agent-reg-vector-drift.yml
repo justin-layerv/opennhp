@@ -1,0 +1,95 @@
+# Detect UPSTREAM drift of the vendored NHP agent-registration golden vectors
+# (nhp#3138).
+#
+# nhp/core/testdata/agent_registration_golden.json is a byte-for-byte re-host of
+# layervai/qurl-conformance's vectors/agent_registration_golden.json (nhp stays
+# dependency-free — the js-agent knock.json precedent). nhp/core's roundtrip
+# fence pins the LOCAL copy with a hardcoded agentRegFixtureSHA256 constant.
+#
+# THE GAP — that SHA pin compares the LOCAL copy against a LOCAL constant, both
+# in this repo. It catches a local edit or a partial re-sync, but NOT a silent
+# UPSTREAM change: if the canonical qurl-conformance artifact changes and nobody
+# re-syncs nhp, the local bytes and the local constant stay mutually consistent,
+# so the fence passes against stale bytes. scripts/check-agent-reg-vector-drift.sh
+# fetches the canonical artifact and byte-compares it against the vendored copy,
+# failing on drift — the missing cross-repo half of the pin.
+#
+# WHY A DEDICATED WORKFLOW (vs. an existing job):
+#   - This is the ONLY nhp check that reaches OVER THE NETWORK to another repo.
+#     The pure-shell golden/parity fences in validate-workflows.yml compare only
+#     in-repo (or toolchain-resolved) bytes; this one must fetch cross-repo, so
+#     it does not belong in that toolchain-free lint job.
+#   - The failure mode #3138 names — the canonical drifts while NOBODY touches
+#     nhp — is invisible to any PR-triggered check, because there is no PR. So
+#     this runs on a SCHEDULE (weekly) as the primary trigger, plus on PRs that
+#     touch the vendored file / pin / script / this workflow so a re-sync PR is
+#     validated at PR time too.
+#   - The DECISION logic (compare / skip / exit codes) is unit-tested WITHOUT the
+#     network by tests/scripts/check-agent-reg-vector-drift_test.sh, which runs in
+#     validate-workflows.yml + `make lint-workflows` (the fixture-test precedent
+#     of the conformance-parity check). This workflow runs the REAL fetch.
+#
+# ROBUSTNESS — the script SKIPs (exit 0) on a transient fetch failure (network /
+# GitHub outage / rate-limit) and on the canonical being ABSENT at the source ref
+# (HTTP 404: not published yet — the current pre-merge state of qurl-conformance#20),
+# and FAILS (exit 1) only on a real present-but-different drift. So a GitHub
+# outage or a not-yet-published canonical never reddens this job; only genuine
+# drift does. The source ref is a single re-point knob in the script (branch ->
+# main after #20 merges -> a release tag once one carries the file); nhp#3144
+# tracks that re-point (+ the 404 SKIP->FAIL flip) so the currently-dormant
+# cross-repo half becomes a live guard and is not lost.
+#
+# BRANCH-PROTECTION NOTE — the pull_request trigger is path-filtered, so do NOT
+# make this check *required* as-is: GitHub leaves a required path-filtered check
+# "pending" forever on PRs that do not touch these paths (see the same note in
+# js-agent.yml / qurl-v2-conformance-parity.yml). Keep it non-required.
+name: agent-reg vector drift
+
+on:
+  schedule:
+    # Mondays 12:00 UTC — the shared fleet-watchdog slot (domain-expiry-watchdog
+    # et al.). Weekly is ample: the vectors are frozen golden bytes that change
+    # rarely, and any intentional upstream change is a reviewed qurl-conformance
+    # PR, not a surprise between two Mondays.
+    - cron: "0 12 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "nhp/core/testdata/agent_registration_golden.json"
+      - "nhp/core/agent_registration_roundtrip_test.go"
+      - "scripts/check-agent-reg-vector-drift.sh"
+      - "tests/scripts/check-agent-reg-vector-drift_test.sh"
+      - ".github/workflows/agent-reg-vector-drift.yml"
+
+# Serialize cron + manual dispatches + PR runs on a ref so two runs can't race.
+concurrency:
+  group: "agent-reg-vector-drift-${{ github.head_ref || github.ref_name }}"
+  cancel-in-progress: true
+
+# Least privilege: the check only reads this repo's checkout and calls the
+# GitHub API (public read of qurl-conformance) with the default token.
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: canonical vs vendored agent-reg vectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Self-contained: the script fetches the canonical bytes (via `gh api`,
+      # authenticated by GITHUB_TOKEN) and byte-compares. Same command run
+      # locally and in CI. shellcheck it here too — actionlint's -shellcheck
+      # only covers workflow-embedded scripts, and the fixture test that guards
+      # the decision logic runs in validate-workflows.yml, not here.
+      - name: Check upstream agent-reg vector drift
+        env:
+          # `gh` reads GH_TOKEN; the default GITHUB_TOKEN can read the public
+          # qurl-conformance repo and avoids anonymous API rate limits.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shellcheck scripts/check-agent-reg-vector-drift.sh
+          bash scripts/check-agent-reg-vector-drift.sh
