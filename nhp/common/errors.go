@@ -26,6 +26,13 @@ func (e *Error) ErrorNumber() int {
 }
 
 func newError(code string, msg string) *Error {
+	if dup, exists := errorMap[code]; exists {
+		// Package-init fail-fast: a duplicated code would otherwise silently
+		// clobber the earlier entry in errorMap and misreport every
+		// ErrorCodeToError lookup for it. Any test run (or process start)
+		// trips this immediately, so collisions cannot ship.
+		panic("nhp/common: duplicate error code " + code + " (already used by " + dup.msg + ")")
+	}
 	e := &Error{
 		code: code,
 		msg:  msg,
@@ -215,6 +222,34 @@ var (
 	// qURL link to mint a fresh session, not to present a credential. The
 	// js-agent (P6) branches on this code.
 	ErrQurlSessionExpired = newError("52024", "qurl session expired or not authorized for this client")
+
+	// server: agent registration (52100+). Reject vocabulary for NHP-native
+	// agent self-registration (NHP_OTP / NHP_REG / NHP_RAK). Reserved as its
+	// own hundred-block — mirroring the agentsdk block at 51100 — so the flat
+	// 520xx gate sequence above keeps appending without interleaving.
+	// These travel to the agent in ServerRegisterAckMsg.ErrCode once the
+	// registration dispatch and plugin land (agent-registration N2/N3); like
+	// the gate errors above, the agent-visible strings stay issue-number-free
+	// so agent logs are grep-friendly.
+
+	// ErrRegistrationCredentialInvalid — the presented registration credential (OTP or bootstrap material) does not verify.
+	ErrRegistrationCredentialInvalid = newError("52100", "registration credential invalid")
+	// ErrRegistrationCredentialExpired — the credential's validity window has lapsed (or no live credential exists for this identity); the agent should request a fresh one.
+	ErrRegistrationCredentialExpired = newError("52101", "registration credential expired")
+	// ErrRegistrationAttemptsExceeded — too many failed credential presentations for this identity; distinct from rate limiting so lockout is not misread as load shedding.
+	ErrRegistrationAttemptsExceeded = newError("52102", "registration attempts exceeded")
+	// ErrRegistrationIdentityConflict — the requested identity (agent id / pubkey binding) is already registered to different key material.
+	ErrRegistrationIdentityConflict = newError("52103", "registration identity conflict")
+	// ErrRegistrationRateLimited — registration traffic from this source is being shed; retry later (load protection, not a verdict on the credential).
+	ErrRegistrationRateLimited = newError("52104", "registration rate limited")
+	// ErrRegistrationEmailUnavailable — the account has no deliverable email on file for the one-time code; the owner must attach one in the console (or register with a pre-issued bootstrap key).
+	ErrRegistrationEmailUnavailable = newError("52105", "account email unavailable")
+	// ErrRegistrationApiKeyInvalid — the API key presented to authorize the registration is unknown or malformed.
+	ErrRegistrationApiKeyInvalid = newError("52106", "invalid api key")
+	// ErrRegistrationDisabled — self-registration is administratively switched off for this server/service.
+	ErrRegistrationDisabled = newError("52107", "registration disabled")
+	// ErrRegistrationBootstrapKeyConsumed — the one-shot bootstrap key was already used; it cannot register a second agent.
+	ErrRegistrationBootstrapKeyConsumed = newError("52108", "bootstrap key consumed")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")

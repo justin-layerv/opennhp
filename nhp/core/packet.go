@@ -249,7 +249,21 @@ func (d *Device) CheckRecvHeaderType(t int) bool {
 		}
 	case NHP_RELAY:
 		switch t {
-		case NHP_REG, NHP_KNK, NHP_ACK, NHP_LST, NHP_LRT, NHP_COK, NHP_RKN, NHP_EXT:
+		// NHP_OTP, NHP_RAK: agent self-registration through the HTTPS relay.
+		// The relay runs RecvPrecheck on every inner packet — both the
+		// client-POSTed request and the server's reply read off the shared
+		// socket (endpoints/relay innerCounter, called from handleRelay and
+		// recvLoop) — so this gate must admit the registration pair: NHP_OTP
+		// requests (fire-and-forget per the CSA NHP spec; the server never
+		// replies to them) and the NHP_RAK acks a server sends back for a
+		// relayed NHP_REG. NHP_REG itself was already admitted (though its
+		// RAK reply was not — this closes that asymmetry). Inert until the
+		// registration dispatch lands (agent-registration N2), and not by
+		// client abstinence: the relay will now forward a crafted OTP/REG,
+		// but the server's HandleRelayForward inner-type gate
+		// (endpoints/server/relay.go) admits only KNK/RKN/EXT and drops
+		// everything else — that server-side gate is the operative stop.
+		case NHP_REG, NHP_KNK, NHP_ACK, NHP_LST, NHP_LRT, NHP_COK, NHP_RKN, NHP_OTP, NHP_RAK, NHP_EXT:
 			return true
 		}
 

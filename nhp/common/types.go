@@ -150,8 +150,15 @@ func (asp *AuthServiceProviderData) GetResourceData(resourceId string) *Resource
 
 // requests
 type NhpOTPRequest struct {
-	Msg     *AgentOTPMsg `json:"msg"`
-	SrcAddr *NetAddress  `json:"srcAddr"`
+	Msg *AgentOTPMsg `json:"msg"`
+	// PublicKey is the base64 (std encoding) of the Noise-authenticated
+	// initiator static key — the same value NhpRegisterRequest.PublicKey
+	// carries on the register path. HandleOTPRequest populates it from
+	// ppd.RemotePubKey so OTP-consuming plugins can bind a one-time
+	// credential to the requesting agent key rather than to spoofable
+	// message fields.
+	PublicKey string      `json:"pubKey"`
+	SrcAddr   *NetAddress `json:"srcAddr"`
 }
 
 type NhpRegisterRequest struct {

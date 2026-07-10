@@ -1281,8 +1281,13 @@ func (s *UdpServer) HandleOTPRequest(ppd *core.PacketParserData) (err error) {
 		return common.ErrAuthHandlerNotFound
 	}
 
+	// Same population as the register path below: the Noise-authenticated
+	// initiator static key, std-base64 like every other pubKey field.
+	agentPubkey := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
+
 	otpReq := &common.NhpOTPRequest{
-		Msg: otpMsg,
+		Msg:       otpMsg,
+		PublicKey: agentPubkey,
 		SrcAddr: &common.NetAddress{
 			Ip:   ppd.ConnData.RemoteAddr.IP.String(),
 			Port: ppd.ConnData.RemoteAddr.Port,

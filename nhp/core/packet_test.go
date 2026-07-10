@@ -153,3 +153,62 @@ func TestNHPRVAHeaderType_ServerReachability(t *testing.T) {
 		t.Fatalf("HeaderTypeToString(NHP_RVA) = %q, want %q", got, "NHP-RVA")
 	}
 }
+
+// TestNHPRelayRecvHeaderType_AllowlistMatrix pins the FULL receive-gate matrix
+// for the NHP_RELAY device role. The relay's innerCounter (endpoints/relay)
+// runs RecvPrecheck on both the client-POSTed inner packet (handleRelay) and
+// the server reply read off the shared socket (recvLoop), so this allowlist is
+// the single chokepoint deciding which inner header types can transit the
+// HTTPS relay in either direction. The relay handler tests exercise real
+// encrypted NHP_KNK/NHP_ACK packets but not the full type matrix — a stray
+// addition here (e.g. an AC- or DB-plane type) would silently widen what an
+// unauthenticated HTTP client can bounce at a server, so the matrix is pinned
+// exhaustively: every type NOT explicitly allowed must be rejected.
+//
+// NHP_OTP and NHP_RAK are the agent self-registration additions (N1): the
+// relay must precheck-accept client-POSTed NHP_OTP requests (fire-and-forget
+// per the CSA NHP spec — no reply ever returns) and the NHP_RAK acks a server
+// sends back for a relayed NHP_REG.
+//
+// The loop bound is the nhpHeaderTypeStrings table, so a future header type
+// appended to the const block (and its string entry) lands in this matrix
+// automatically with want=false — the fail-closed default a new type should
+// have until someone deliberately adds it to the relay allowlist AND this map.
+func TestNHPRelayRecvHeaderType_AllowlistMatrix(t *testing.T) {
+	relayDev := &Device{deviceType: NHP_RELAY}
+
+	// NHP_KPL is absent by design: RecvPrecheck short-circuits keepalives
+	// before consulting CheckRecvHeaderType ("NHP_KPL is handled elsewhere"),
+	// so the gate itself reports false for it.
+	allowed := map[int]bool{
+		NHP_REG: true, // agent→server register request (client-POSTed)
+		NHP_KNK: true, // agent→server knock (client-POSTed)
+		NHP_ACK: true, // server→agent knock ack (reply path)
+		NHP_LST: true, // agent→server list request (client-POSTed)
+		NHP_LRT: true, // server→agent list result (reply path)
+		NHP_COK: true, // server→agent cookie (reply path)
+		NHP_RKN: true, // agent→server reknock (client-POSTed)
+		NHP_OTP: true, // agent→server OTP request (client-POSTed, no reply)
+		NHP_RAK: true, // server→agent register ack (reply path)
+		NHP_EXT: true, // agent→server disconnect (client-POSTed)
+	}
+
+	for typ := 0; typ < len(nhpHeaderTypeStrings); typ++ {
+		got := relayDev.CheckRecvHeaderType(typ)
+		if want := allowed[typ]; got != want {
+			t.Errorf("CheckRecvHeaderType(%s) = %v for NHP_RELAY, want %v",
+				HeaderTypeToString(typ), got, want)
+		}
+	}
+
+	// The sender identities of the two newly relay-permitted types are
+	// unchanged by the allowlist edit; pin them here so the registration wire
+	// contract (agent sends NHP_OTP, server sends NHP_RAK) is asserted next to
+	// the gate that now lets them transit the relay.
+	if got := HeaderTypeToDeviceType(NHP_OTP); got != NHP_AGENT {
+		t.Errorf("HeaderTypeToDeviceType(NHP_OTP) = %d, want NHP_AGENT (%d)", got, NHP_AGENT)
+	}
+	if got := HeaderTypeToDeviceType(NHP_RAK); got != NHP_SERVER {
+		t.Errorf("HeaderTypeToDeviceType(NHP_RAK) = %d, want NHP_SERVER (%d)", got, NHP_SERVER)
+	}
+}
