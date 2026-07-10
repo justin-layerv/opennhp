@@ -62,6 +62,19 @@ import (
 // of the fleet rather than a parallel convention.
 const MetricRelayShed = "RelayShed"
 
+// MetricRelayOTPForward counts inner NHP_OTP requests the relay forwarded to a
+// cell server on the fire-and-forget path (agent-registration N2): forwarded
+// WITHOUT registering a reply-waiter and answered HTTP 202 Accepted immediately
+// (per the CSA NHP spec, the server never replies to an OTP). It is the relay's
+// only visibility that a relayed registration OTP passed through — a round-trip
+// forward is implicitly observable via the shed/pending machinery, but an OTP
+// parks nothing, so without this counter it would be invisible. Published into
+// the same LayerV/NHP namespace via the shared endpoints/metrics publisher, at
+// the relay's base [Environment] dims (no per-cell breakdown — an OTP-forward is
+// not an incident signal the way a shed is; it is a throughput counter). Inert
+// until a client actually POSTs an OTP through the relay (N3 client + flag).
+const MetricRelayOTPForward = "RelayOTPForward"
+
 // dimNameCell is the CloudWatch dimension naming the cell a shed was routed to.
 // Its value is the relay's configured cell_servers[].Name; a per-cell relay shed
 // series sits alongside that cell's server metrics ONLY insofar as that name
@@ -556,7 +569,7 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	counter, err := rs.innerCounter(inner)
+	counter, innerType, err := rs.innerCounterAndType(inner)
 	if err != nil {
 		log.Warning("relay: rejecting malformed inner packet from %s: %v", r.RemoteAddr, err)
 		http.Error(w, "malformed packet", http.StatusBadRequest)
@@ -566,9 +579,46 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	sourceAddr := rs.deriveSourceAddr(r)
 	clientKey := sourceAddr.String()
 
-	// Register the ACK waiter BEFORE sending so a fast server reply can't race us.
-	// The per-request seq keeps two same-(counter,client) requests from
-	// overwriting each other and ensures each deletes only its own entry.
+	// FIRE-AND-FORGET branch for an inner NHP_OTP. Per the CSA NHP spec an OTP
+	// request is fire-and-forget — the server NEVER replies to it (it triggers a
+	// one-time-credential side effect and returns nothing). So the relay must NOT
+	// register a pending reply-waiter for it: with no reply ever arriving, the
+	// waiter would sit until responseTimeout and the handler would return 504,
+	// wrongly signaling failure for a request that in fact succeeded. Instead we
+	// forward the packet on the SAME send path and return HTTP 202 Accepted the
+	// instant the forward is on the wire.
+	//
+	// In-flight accounting: this path does NOT register a waiter and does NOT
+	// park on responseTimeout, so the in-flight slot acquired above is released
+	// (by the deferred `<-srv.inFlight`) as soon as this returns — i.e. within a
+	// forward's ~encryptTimeout worst case, never held for the ~5s reply window a
+	// round-trip holds it. The slot is still ACQUIRED (OTP counts against the cap
+	// while it is genuinely in flight, so an OTP flood is still shed at the cap),
+	// it is simply released promptly rather than parked. Keeping the acquire (not
+	// bypassing it) means the backpressure structure is uniform across every
+	// forwarded type; the "no long-lived parked slot" goal is met by returning
+	// immediately, not by skipping the semaphore.
+	if innerType == core.NHP_OTP {
+		if err := rs.forward(srv, sourceAddr, inner); err != nil {
+			log.Error("relay: OTP forward to %s failed: %v", srv.name, err)
+			http.Error(w, "forward failed", http.StatusBadGateway)
+			return
+		}
+		// Count the forward only after it succeeds, so MetricRelayOTPForward
+		// means "OTP delivered to a cell" (failed forwards return 502 above and
+		// are not counted here).
+		rs.metrics.IncrCounter(MetricRelayOTPForward)
+		// 202 Accepted: the relay has forwarded the OTP; there is no server reply
+		// to relay back (fire-and-forget). The browser treats 202 as "OTP request
+		// accepted; watch for the delivered credential out-of-band".
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	// Round-trip types (KNK/RKN/EXT/REG): register the reply waiter BEFORE sending
+	// so a fast server reply can't race us. The per-request seq keeps two
+	// same-(counter,client) requests from overwriting each other and ensures each
+	// deletes only its own entry.
 	respCh := make(chan []byte, 1)
 	key := pendingKey{counter: counter, clientAddr: clientKey, seq: rs.seq.Add(1)}
 	rs.pendingMu.Lock()
@@ -703,8 +753,27 @@ func (rs *RelayServer) dispatch(counter uint64, raw []byte) {
 
 // innerCounter validates a raw NHP packet's header and returns its cleartext
 // transaction counter — readable without decryption, the same value the agent
-// matches its ACK on.
+// matches its ACK on. Thin wrapper over innerCounterAndType for the recvLoop
+// dispatch path, which correlates by counter alone and does not need the type.
 func (rs *RelayServer) innerCounter(raw []byte) (uint64, error) {
+	counter, _, err := rs.innerCounterAndType(raw)
+	return counter, err
+}
+
+// innerCounterAndType validates a raw NHP packet's header and returns BOTH its
+// cleartext transaction counter and its deobfuscated header type. The type is
+// what the forward path branches on to distinguish a fire-and-forget inner
+// NHP_OTP (no reply-waiter, immediate 202) from a round-trip type (KNK/RKN/EXT/
+// REG). RecvPrecheck already deobfuscates and validates the header and returns
+// the type as its first value, so obtaining the type is free here — the same
+// validation innerCounter has always done, surfacing one more field it computed.
+//
+// Both the client-POSTed request (handleRelay) and the server's reply
+// (recvLoop) flow through this; CheckRecvHeaderType (inside RecvPrecheck, on the
+// NHP_RELAY device) admits exactly the relayable set — KNK/RKN/EXT/OTP/REG plus
+// the reply types ACK/RAK/COK/LRT — so an inner type outside that set is
+// rejected here as a precheck error, never reaching the forward switch.
+func (rs *RelayServer) innerCounterAndType(raw []byte) (uint64, int, error) {
 	// Length guard BEFORE RecvPrecheck. Unlike PacketToMsg, RecvPrecheck is not
 	// wrapped in recover() and reads the header (Content[0:4], [4:8], …) without
 	// a lower-bound check — a short/empty datagram would panic. A bare 0-length
@@ -713,22 +782,23 @@ func (rs *RelayServer) innerCounter(raw []byte) (uint64, error) {
 	// panic and crash the process (remote DoS). Mirrors the server's
 	// recvPacketRoutine MinimalLength discard.
 	if len(raw) < core.HeaderCommonSize {
-		return 0, errors.New("packet too short")
+		return 0, 0, errors.New("packet too short")
 	}
 	if len(raw) > maxInnerPacketSize {
-		return 0, errors.New("packet too large")
+		return 0, 0, errors.New("packet too large")
 	}
 	pkt := rs.device.AllocatePoolPacket()
 	if pkt == nil {
-		return 0, errors.New("packet pool exhausted")
+		return 0, 0, errors.New("packet pool exhausted")
 	}
 	defer rs.device.ReleasePoolPacket(pkt)
 	copy(pkt.Buf[:len(raw)], raw)
 	pkt.Content = pkt.Buf[:len(raw)]
-	if _, _, err := rs.device.RecvPrecheck(pkt); err != nil {
-		return 0, err
+	headerType, _, err := rs.device.RecvPrecheck(pkt)
+	if err != nil {
+		return 0, 0, err
 	}
-	return pkt.Counter(), nil
+	return pkt.Counter(), headerType, nil
 }
 
 // assertTrustedHeaderBindCoherent fails closed (#2553) on a relay config that

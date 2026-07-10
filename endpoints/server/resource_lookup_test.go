@@ -20,6 +20,7 @@ import (
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
 )
 
@@ -1755,12 +1756,44 @@ func TestResourceLookup_CacheHitRepublishes(t *testing.T) {
 // supposed to keep distinct. The fix moved metric ownership inside
 // the resolver; these tests fence the contract via the live counter
 // publisher (metrics.NewPublisherForTest).
+// aspLoadSafeFields returns the UdpServer fields the DDB-bridge plugin-load path
+// dereferences (s.log, s.config, and a non-nil pluginHandlerMap), so a test that
+// drives applyAspMapDelta / ResolveAuthSvcProvider with a REAL aspId can survive
+// the lazy loadPluginOnce → LoadPlugin call. This became load-bearing once the
+// real "agent" static plugin is linked into the server test binary (the N3 e2e
+// in relay_dispatch_test.go imports staticplugins/agent): loadPluginOnce("agent")
+// now resolves a real factory and runs LoadPlugin, which reads s.log/s.config and
+// writes s.pluginHandlerMap — whereas before it warn-skipped on the unregistered
+// aspId. Callers spread these into their own literal. The logger writes to a temp
+// dir at Error level (quiet); config carries a placeholder hostname.
+//
+// WHY THIS LIVES IN THE TEST HARNESS, NOT A PRODUCTION LoadPlugin NIL-GUARD:
+// hardening LoadPlugin to tolerate a nil s.log/s.config was considered and
+// rejected. It is whack-a-mole — guarding s.log just moves the panic to the next
+// unset field (s.pluginHandlerMap, then s.config, …), and each guard adds dead,
+// never-exercised branches to a hot production path. A real server ALWAYS
+// constructs log/config/pluginHandlerMap before any knock can trigger a plugin
+// load, so the only thing that ever hits an unset field is a bare test server.
+// Supplying the fields in the few unit tests that drive the real load path is the
+// contained, correct fix; the production invariant (server construction populates
+// these) stays intact and untested-branch-free.
+func aspLoadSafeFields(t *testing.T) (log0 *log.Logger, cfg0 *Config, phm map[string]plugins.PluginHandler) {
+	t.Helper()
+	lg := log.NewLogger("test-server", log.LogLevelError, t.TempDir(), "server")
+	t.Cleanup(lg.Close)
+	return lg, &Config{Hostname: "test-host"}, map[string]plugins.PluginHandler{}
+}
+
 func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 	t.Run("in_memory_hit_short_circuits_no_counters", func(t *testing.T) {
 		existing := &common.AuthServiceProviderData{AuthSvcId: "agent"}
+		lg, cfg, phm := aspLoadSafeFields(t)
 		s := &UdpServer{
-			metrics:        metrics.NewPublisherForTest(t),
-			authServiceMap: common.AuthSvcProviderMap{"agent": existing},
+			metrics:          metrics.NewPublisherForTest(t),
+			authServiceMap:   common.AuthSvcProviderMap{"agent": existing},
+			log:              lg,
+			config:           cfg,
+			pluginHandlerMap: phm,
 		}
 
 		got := s.ResolveAuthSvcProvider(context.Background(), "agent", "test")
@@ -1797,10 +1830,17 @@ func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 	t.Run("nil_ctx_falls_back_to_background", func(t *testing.T) {
 		q := newFakeResourcesQuerier()
 		putTunnelServerRow(q, "qurl-tunnel-server")
+		// This subtest RESOLVES a matching row, so it reaches the successful
+		// queryAndCache → applyAspMapDelta → loadPluginOnce("agent") →
+		// LoadPlugin path; the load-safe fields keep that from nil-deref'ing now
+		// that the real agent plugin is linked into the test binary.
+		lg, cfg, phm := aspLoadSafeFields(t)
 		s := &UdpServer{
 			metrics:          metrics.NewPublisherForTest(t),
 			authServiceMap:   common.AuthSvcProviderMap{},
-			pluginHandlerMap: map[string]plugins.PluginHandler{},
+			log:              lg,
+			config:           cfg,
+			pluginHandlerMap: phm,
 		}
 		lookup, err := NewResourceLookup(q, "test-table", nhpSystemCustomerID, s)
 		if err != nil {
@@ -2127,8 +2167,16 @@ func TestApplyAspMapDelta_FastPathPointerEqual(t *testing.T) {
 		AuthSvcId:      "agent",
 		ResourceGroups: common.ResourceGroupMap{},
 	}
+	// applyAspMapDelta always calls ensurePluginLoaded, which now loads the real
+	// "agent" plugin (linked via the N3 e2e import); the load-safe fields prevent
+	// that best-effort load from nil-deref'ing. The plugin-load is incidental to
+	// what this test asserts (the map-header fast-path).
+	lg, cfg, phm := aspLoadSafeFields(t)
 	s := &UdpServer{
-		authServiceMap: common.AuthSvcProviderMap{"agent": fresh},
+		authServiceMap:   common.AuthSvcProviderMap{"agent": fresh},
+		log:              lg,
+		config:           cfg,
+		pluginHandlerMap: phm,
 	}
 	mapHeaderBefore := reflect.ValueOf(s.authServiceMap).Pointer()
 
@@ -2318,10 +2366,16 @@ func TestResourceLookup_SingleflightDedupsConcurrentMiss(t *testing.T) {
 // agent plugin's lock-free helper.AspData reads stay safe against
 // concurrent publishes.
 func TestApplyAspMapDelta_BuildFreshThenSwap(t *testing.T) {
+	// Load-safe fields: the swap path also ends in ensurePluginLoaded("agent"),
+	// which now runs the real agent plugin's LoadPlugin (see aspLoadSafeFields).
+	lg, cfg, phm := aspLoadSafeFields(t)
 	s := &UdpServer{
 		authServiceMap: common.AuthSvcProviderMap{
 			"existing": &common.AuthServiceProviderData{AuthSvcId: "existing"},
 		},
+		log:              lg,
+		config:           cfg,
+		pluginHandlerMap: phm,
 	}
 	oldMap := s.authServiceMap
 	oldExisting := s.authServiceMap["existing"]

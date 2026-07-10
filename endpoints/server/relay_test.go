@@ -17,7 +17,16 @@ import (
 // Pure validation helpers — the relay's security boundary
 // ============================================================================
 
-func TestValidateRelaySourceAddr(t *testing.T) {
+// TestValidateRelaySourceAddrSyntactic fences the SHAPE-only validator applied to
+// every forwarded inner type (the synthetic decrypt address must be well-formed
+// before the inner type is known). It deliberately does NOT assert routable/public:
+// a private/loopback/CGNAT source is syntactically VALID here and must be ACCEPTED
+// — the registration path (OTP/REG) relies on that (same-host dev/smoke relays),
+// and the stricter routable-public gate is applied only in the knock dispatch arm
+// (inline isRoutablePublicIP, covered by TestIsRoutablePublicIP + the end-to-end
+// TestHandleRelayForward_PrivateSource_* cases). So the non-routable rows below
+// EXPECT acceptance, not rejection.
+func TestValidateRelaySourceAddrSyntactic(t *testing.T) {
 	cases := []struct {
 		name    string
 		addr    *common.NetAddress
@@ -28,15 +37,17 @@ func TestValidateRelaySourceAddr(t *testing.T) {
 		{"negative port", &common.NetAddress{Ip: "203.0.113.7", Port: -1}, "invalid source port"},
 		{"port too high", &common.NetAddress{Ip: "203.0.113.7", Port: 70000}, "invalid source port"},
 		{"unparseable ip", &common.NetAddress{Ip: "not-an-ip", Port: 443}, "unparseable source ip"},
-		{"private ip", &common.NetAddress{Ip: "192.168.1.10", Port: 443}, "non-routable"},
-		{"loopback", &common.NetAddress{Ip: "127.0.0.1", Port: 443}, "non-routable"},
-		{"cgnat", &common.NetAddress{Ip: "100.64.0.1", Port: 443}, "non-routable"},
+		// Non-routable but syntactically valid → ACCEPTED (syntactic check does not
+		// judge routability; the knock arm does that separately).
+		{"private ip accepted (syntactic only)", &common.NetAddress{Ip: "192.168.1.10", Port: 443}, ""},
+		{"loopback accepted (syntactic only)", &common.NetAddress{Ip: "127.0.0.1", Port: 443}, ""},
+		{"cgnat accepted (syntactic only)", &common.NetAddress{Ip: "100.64.0.1", Port: 443}, ""},
 		{"public v4", &common.NetAddress{Ip: "203.0.113.7", Port: 44444}, ""},
 		{"public v6", &common.NetAddress{Ip: "2606:4700:4700::1111", Port: 443}, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := validateRelaySourceAddr(tc.addr)
+			got, err := validateRelaySourceAddrSyntactic(tc.addr)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)

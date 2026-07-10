@@ -401,6 +401,53 @@ func TestPublisher_DimCounterAccumulation(t *testing.T) {
 	}
 }
 
+// TestPublisher_AddCounterExplicitDims proves the explicit-dims emit publishes at
+// the EXACT dim set given — the shared base dims (mp.dims) are NOT prepended.
+// This is the primitive that lets a fleet-wide alarm select a dim set that is a
+// STRICT SUBSET of the publisher base (e.g. [Environment] against an [Environment,
+// Cell] server publisher — the round-9 OTP-shed launch-blocker). Contrast with
+// AddCounterWithDims, which prepends the base.
+func TestPublisher_AddCounterExplicitDims(t *testing.T) {
+	mp := &Publisher{
+		counters:    make(map[string]float64),
+		dimCounters: make(map[string]*dimCounterEntry),
+		latencies:   make(map[string][]float64),
+		// Base dims = [Environment, Cell] — like the nhp-server publisher.
+		dims: []types.Dimension{
+			{Name: aws.String("Environment"), Value: aws.String("prod")},
+			{Name: aws.String("Cell"), Value: aws.String("cell7")},
+		},
+		stop: make(chan struct{}),
+	}
+
+	envOnly := []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String("prod")},
+	}
+	mp.IncrCounterExplicitDims("OTPRejectRateLimited", envOnly)
+	mp.AddCounterExplicitDims("OTPRejectRateLimited", 2, envOnly) // same set → accumulates
+
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	if len(mp.dimCounters) != 1 {
+		t.Fatalf("expected exactly 1 dimCounter entry (one [Environment]-only stream), got %d: %v", len(mp.dimCounters), mp.dimCounters)
+	}
+	for _, entry := range mp.dimCounters {
+		if entry.value != 3 {
+			t.Errorf("accumulated value = %v, want 3 (1 + 2 on the same dim set)", entry.value)
+		}
+		// The CRITICAL assertion: dims are EXACTLY [Environment], with NO Cell — the
+		// base was not prepended. A leaked Cell would be the [Environment, Cell] set
+		// the fleet-wide alarm can never bind to.
+		if len(entry.dims) != 1 {
+			t.Fatalf("explicit-dims entry has %d dims, want exactly 1 ([Environment] only, base NOT prepended); dims=%v", len(entry.dims), entry.dims)
+		}
+		if *entry.dims[0].Name != "Environment" || *entry.dims[0].Value != "prod" {
+			t.Errorf("dim = %s=%s, want Environment=prod", *entry.dims[0].Name, *entry.dims[0].Value)
+		}
+	}
+}
+
 func TestPublisher_AddCounterWithDims(t *testing.T) {
 	mp := &Publisher{
 		counters:    make(map[string]float64),

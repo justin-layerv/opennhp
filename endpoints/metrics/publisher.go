@@ -375,6 +375,45 @@ func (mp *Publisher) AddCounterWithDims(name string, value float64, extraDims []
 	mp.mu.Unlock()
 }
 
+// IncrCounterExplicitDims increments a counter metric by 1 at an EXPLICIT,
+// ABSOLUTE dimension set — the publisher's shared base dims are NOT prepended.
+// Convenience wrapper over AddCounterExplicitDims.
+func (mp *Publisher) IncrCounterExplicitDims(name string, dims []types.Dimension) {
+	mp.AddCounterExplicitDims(name, 1, dims)
+}
+
+// AddCounterExplicitDims adds a value to a counter metric at the EXACT dimension
+// set given — unlike AddCounterWithDims, the publisher's shared base dims (mp.dims)
+// are NOT prepended. Use this when a CloudWatch alarm must select a dim set that is
+// a STRICT SUBSET of the publisher's base dims (e.g. an [Environment]-only
+// fleet-wide alarm against the nhp-server publisher whose base is [Environment,
+// Cell]): a plain IncrCounter would publish only at [Environment, Cell], which the
+// [Environment] alarm can never bind to (an alarm's dim set must match the
+// published series exactly). Pair it with the normal IncrCounter breakdown to
+// dual-publish a base stream + a per-Cell breakdown, mirroring the RelayShed
+// pattern (endpoints/relay/relay.go recordShed) for a base whose dims differ from
+// the alarm's. Metrics with the same name + dim set are batched together.
+func (mp *Publisher) AddCounterExplicitDims(name string, value float64, dims []types.Dimension) {
+	if mp == nil {
+		return
+	}
+
+	explicitDims := slices.Clone(dims)
+	key := buildDimCounterKey(name, explicitDims)
+
+	mp.mu.Lock()
+	entry, exists := mp.dimCounters[key]
+	if !exists {
+		entry = &dimCounterEntry{
+			metricName: name,
+			dims:       explicitDims,
+		}
+		mp.dimCounters[key] = entry
+	}
+	entry.value += value
+	mp.mu.Unlock()
+}
+
 // SetGauge sets a gauge metric to the given value.
 // Gauges are always published (even when 0), making them suitable for
 // state indicators like peer counts or health status.

@@ -19,24 +19,30 @@ import (
 //	Browser JS-Agent -> NHP-Relay (internet-facing) -> private NHP-Server -> AC
 //
 // The relay terminates TLS, observes the real client IP at its edge, wraps the
-// agent's opaque inner NHP knock in a RelayForwardMsg{SourceAddr, InnerPacket}
+// agent's opaque inner NHP packet in a RelayForwardMsg{SourceAddr, InnerPacket}
 // and sends it to the (private) server as an NHP_RLY packet.
 //
-// HandleRelayForward decrypts the inner knock with the shared server key (the
-// relay cannot read it — inner crypto is end-to-end agent<->server), runs the
-// exact same pipeline as a direct knock via buildKnockAck, and replies with a
-// normal NHP_ACK that is:
+// HandleRelayForward decrypts the inner packet with the shared server key (the
+// relay cannot read it — inner crypto is end-to-end agent<->server) and
+// DISPATCHES BY INNER TYPE (agent-registration N2):
+//   - KNK / RKN / EXT → the knock pipeline (buildKnockAck), reply NHP_ACK.
+//   - NHP_OTP         → the OTP dispatch (dispatchOTP). FIRE-AND-FORGET: no reply
+//                       (the relay already answered the browser HTTP 202; there
+//                       is no parked reply-waiter to receive one).
+//   - NHP_REG         → the register dispatch (buildRegisterAck), reply NHP_RAK.
+//
+// A reply (NHP_ACK or NHP_RAK) is:
 //   - encrypted for the AGENT (from the inner packet's cipher state),
-//   - correlated to the INNER knock counter,
+//   - correlated to the INNER request counter,
 //   - but transported back to the RELAY's address, which forwards the opaque
 //     bytes to the browser.
 //
 // The reply rides the inner packet's cipher state via the EncryptedPktCh divert
 // + a manual WriteToUDP to the relay (NOT forwardToTransaction — there is no
-// RemoteTransaction for a synthetically-decrypted inner packet). This avoids the
-// core ConnectionData surgery (RealRemoteAddr + a per-relay connection map) that
-// upstream uses; the round-trip is fenced by
-// relay_ack_roundtrip_spike_test.go.
+// RemoteTransaction for a synthetically-decrypted inner packet); sendRelayReply
+// generalizes that divert to a header type. This avoids the core ConnectionData
+// surgery (RealRemoteAddr + a per-relay connection map) that upstream uses; the
+// round-trip is fenced by relay_ack_roundtrip_spike_test.go.
 //
 // Trust model: the relay is authenticated by Noise IK while the OUTER NHP_RLY
 // packet is decrypted — it cannot complete the handshake without the fleet
@@ -117,10 +123,18 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		return
 	}
 
-	sourceAddr, err := validateRelaySourceAddr(rlyMsg.SourceAddr)
+	// SYNTACTIC source-address validation for ALL inner types: the source address
+	// becomes the synthetic ConnData.RemoteAddr the inner packet is decrypted
+	// against (decryptRelayInnerKnock), so it must be well-formed before the inner
+	// type is even known. The stricter ROUTABLE-PUBLIC gate is TYPE-DEPENDENT and
+	// applied later, inside the dispatch switch, ONLY for the AC-pinhole-opening
+	// knock types (KNK/RKN/EXT) — NOT for the registration types (OTP/REG), which
+	// open no pinhole and whose SourceAddr is purely informational/audit. See the
+	// dispatch switch for the full rationale.
+	sourceAddr, err := validateRelaySourceAddrSyntactic(rlyMsg.SourceAddr)
 	if err != nil {
 		s.metrics.IncrCounter(MetricRelayForwardReject)
-		log.Error("server-relay(@%s)[HandleRelayForward] rejecting relay-reported source address: %v", relayAddr, err)
+		log.Error("server-relay(@%s)[HandleRelayForward] rejecting malformed relay-reported source address: %v", relayAddr, err)
 		return
 	}
 
@@ -144,14 +158,16 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 	}
 
 	// CRYPTO-AUTH BOUNDARY: the inner decrypt above authenticated the agent
-	// (Noise populated innerPpd.RemotePubKey). This is NOT yet the ack-vs-drop
-	// boundary — two PRE-ACK fail-closed guards still remain below (the
-	// missing-pubkey fail-safe and the inner header-type gate); they drop
-	// WITHOUT an ack because a packet with no agent key, or a non-knock type,
-	// yields no knock-ack to build. The ack-vs-drop boundary is buildKnockAck:
-	// from there an auth REJECT is DELIVERED as an ack (the verdict rides in the
-	// bytes) and only a marshal/encrypt failure drops silently. Every drop ABOVE
-	// the decrypt is pre-auth — no authenticated agent to encrypt an ack for.
+	// (Noise populated innerPpd.RemotePubKey). This is NOT yet the reply-vs-drop
+	// boundary — two PRE-REPLY fail-closed guards still remain below (the
+	// missing-pubkey fail-safe and the inner header-type dispatch's default arm);
+	// they drop WITHOUT a reply because a packet with no agent key, or an
+	// unrelayable type, yields no reply to build. Past those, each dispatch arm
+	// decides its own reply contract: KNK/RKN/EXT and REG DELIVER their verdict as
+	// an ack/RAK (the verdict rides in the bytes; only a marshal/encrypt failure
+	// drops silently), while NHP_OTP is fire-and-forget and intentionally replies
+	// with nothing. Every drop ABOVE the decrypt is pre-auth — no authenticated
+	// agent to encrypt a reply for.
 
 	// Fail closed if the responder did not populate the agent's static key (the
 	// inner knock must authenticate the agent before its src IP can steer an AC
@@ -167,38 +183,110 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		return
 	}
 
-	// Inner header-type gate. Unlike upstream (which injects the inner packet
-	// into a generic connection routine that dispatches by type), we reuse the
-	// knock-specific buildKnockAck, so the inner packet MUST be a browser knock
-	// type. DHP_KNK and every non-knock type are not a relay use case -> reject.
+	// Inner header-type DISPATCH. Unlike upstream (which injects the inner packet
+	// into a generic connection routine that dispatches by type), we route each
+	// admitted inner type to the matching server handler here:
+	//
+	//   NHP_KNK / NHP_RKN / NHP_EXT  → the knock pipeline (buildKnockAck), reply
+	//                                  NHP_ACK via sendRelayAck (unchanged).
+	//   NHP_OTP                      → the OTP dispatch (dispatchOTP), reply
+	//                                  NOTHING — OTP is FIRE-AND-FORGET per the CSA
+	//                                  NHP spec, and the relay already answered the
+	//                                  browser 202 Accepted without parking a
+	//                                  reply-waiter. Sending anything here would
+	//                                  have no waiter to receive it.
+	//   NHP_REG                      → the register dispatch (buildRegisterAck),
+	//                                  reply NHP_RAK via sendRelayReply. buildRegisterAck
+	//                                  fails CLOSED: while the agent plugin is
+	//                                  stubbed (N3 pending) the RAK carries a mapped
+	//                                  registration errCode rather than dropping.
+	//   default                      → reject + MetricRelayForwardReject (DHP_KNK
+	//                                  and every non-registration/non-knock type
+	//                                  are not a relay use case).
+	//
+	// All handlers read innerPpd.ConnData.RemoteAddr (= sourceAddr, the real
+	// client) for src attribution / AC pinhole, never the relay address.
+	//
+	// TYPE-DEPENDENT SOURCE-ADDRESS GATE: the knock arm (KNK/RKN/EXT) additionally
+	// requires sourceAddr to be a ROUTABLE PUBLIC IP, because that address opens an
+	// AC pinhole — a spoofable/private/loopback source there is a real security
+	// concern. The registration arms (OTP/REG) do NOT re-check that: registration
+	// opens NO AC pinhole (SourceAddr is purely informational/audit for OTP/REG),
+	// so a loopback or RFC1918 relay source — same-host smoke tests, a dev relay —
+	// MUST be accepted. Rejecting a private source on the registration path would
+	// make it silently drop AFTER the relay already returned HTTP 202, i.e. a
+	// registration that looks accepted but never processed. Only the syntactic
+	// check (validateRelaySourceAddrSyntactic, applied above for every type) gates
+	// OTP/REG.
 	switch innerPpd.HeaderType {
 	case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT:
-		// browser knock family — proceed
+		// Routable-public gate — knock-path only (opens an AC pinhole). Reject a
+		// non-routable source here even though it passed the syntactic check above.
+		// Inline isRoutablePublicIP against the ALREADY-PARSED sourceAddr (from the
+		// syntactic check at ~line 134) — no second parse/alloc on this hot path.
+		// The routable-public logic is unit-tested directly (TestIsRoutablePublicIP),
+		// and the shipped rejection is covered end-to-end by
+		// TestHandleRelayForward_PrivateSource_RegistrationAcceptedKnockRejected
+		// (a private source ⇒ KNK rejected, OTP/REG accepted) — so shipped == tested
+		// without a combined helper.
+		if !isRoutablePublicIP(sourceAddr.IP) {
+			s.metrics.IncrCounter(MetricRelayForwardReject)
+			log.Error("server-relay(@%s src=%s)[HandleRelayForward] non-routable source ip for knock type %s (opens an AC pinhole); dropping",
+				relayAddr, sourceAddr, core.HeaderTypeToString(innerPpd.HeaderType))
+			return
+		}
+		ackBytes, userID, buildErr := s.buildKnockAck(innerPpd)
+		if buildErr != nil {
+			// Marshal failure only — an auth reject returns nil error with the
+			// verdict in ackBytes and is sent below.
+			log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to build knock ack: %v",
+				relayAddr, sourceAddr, userID, buildErr)
+			return
+		}
+		if err := s.sendRelayAck(innerPpd, relayAddr, ackBytes); err != nil {
+			log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to send relayed ack: %v",
+				relayAddr, sourceAddr, userID, err)
+			return
+		}
+		log.Info("server-relay(@%s src=%s user=%s)[HandleRelayForward] delivered relayed ack", relayAddr, sourceAddr, userID)
+
+	case core.NHP_OTP:
+		// Fire-and-forget: run the shared OTP dispatch and send NOTHING. Errors
+		// (including the expected ErrPluginNotRegistered while N3 is pending, and
+		// a rate-limit drop) are logged inside dispatchOTP and swallowed here —
+		// there is no reply channel for an OTP.
+		s.metrics.IncrCounter(MetricRelayOTP)
+		if otpErr := s.dispatchOTP(innerPpd); otpErr != nil {
+			keyPrefix := pubkeyLogPrefix(base64.StdEncoding.EncodeToString(innerPpd.RemotePubKey))
+			log.Error("server-relay(@%s src=%s key=%s)[HandleRelayForward] relayed OTP dispatch error (swallowed, fire-and-forget): %v",
+				relayAddr, sourceAddr, keyPrefix, otpErr)
+		}
+
+	case core.NHP_REG:
+		s.metrics.IncrCounter(MetricRelayRegister)
+		keyPrefix := pubkeyLogPrefix(base64.StdEncoding.EncodeToString(innerPpd.RemotePubKey))
+		rakBytes, buildErr := s.buildRegisterAck(innerPpd)
+		if buildErr != nil {
+			// Marshal failure only — a plugin/auth reject is carried IN the RAK
+			// bytes (fail-closed errCode), not returned here. Nothing to deliver.
+			log.Error("server-relay(@%s src=%s key=%s)[HandleRelayForward] failed to build relayed RAK: %v",
+				relayAddr, sourceAddr, keyPrefix, buildErr)
+			return
+		}
+		if err := s.sendRelayReply(innerPpd, relayAddr, core.NHP_RAK, rakBytes); err != nil {
+			log.Error("server-relay(@%s src=%s key=%s)[HandleRelayForward] failed to send relayed RAK: %v",
+				relayAddr, sourceAddr, keyPrefix, err)
+			return
+		}
+		log.Info("server-relay(@%s src=%s key=%s)[HandleRelayForward] delivered relayed RAK",
+			relayAddr, sourceAddr, keyPrefix)
+
 	default:
 		s.metrics.IncrCounter(MetricRelayForwardReject)
-		log.Error("server-relay(@%s src=%s)[HandleRelayForward] inner packet header=%s is not a relayable knock type; dropping",
+		log.Error("server-relay(@%s src=%s)[HandleRelayForward] inner packet header=%s is not a relayable type; dropping",
 			relayAddr, sourceAddr, core.HeaderTypeToString(innerPpd.HeaderType))
 		return
 	}
-
-	// Run the exact knock pipeline. buildKnockAck reads ppd.ConnData.RemoteAddr
-	// (= sourceAddr) for the AC pinhole and AgentAddr, so the AC opens for the
-	// real client, never the relay.
-	ackBytes, userID, buildErr := s.buildKnockAck(innerPpd)
-	if buildErr != nil {
-		// Marshal failure only — an auth reject returns nil error with the
-		// verdict in ackBytes and is sent below.
-		log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to build knock ack: %v",
-			relayAddr, sourceAddr, userID, buildErr)
-		return
-	}
-
-	if err := s.sendRelayAck(innerPpd, relayAddr, ackBytes); err != nil {
-		log.Error("server-relay(@%s src=%s user=%s)[HandleRelayForward] failed to send relayed ack: %v",
-			relayAddr, sourceAddr, userID, err)
-		return
-	}
-	log.Info("server-relay(@%s src=%s user=%s)[HandleRelayForward] delivered relayed ack", relayAddr, sourceAddr, userID)
 }
 
 // decryptRelayInnerKnock decrypts a forwarded inner NHP packet against the
@@ -229,16 +317,29 @@ func (s *UdpServer) decryptRelayInnerKnock(innerBytes []byte, sourceAddr *net.UD
 	return innerPpd, nil
 }
 
-// sendRelayAck encrypts the NHP_ACK from the inner packet's cipher state (so the
-// AGENT can decrypt it and it correlates to the inner knock counter) and writes
-// the bytes to the RELAY's address, which forwards them to the browser. Uses the
-// EncryptedPktCh divert + a manual WriteToUDP rather than forwardToTransaction,
-// since the synthetic inner packet has no RemoteTransaction to forward through.
-func (s *UdpServer) sendRelayAck(innerPpd *core.PacketParserData, relayAddr *net.UDPAddr, ackBytes []byte) error {
-	ackMd := makeMsgData(innerPpd, core.NHP_ACK, ackBytes)
+// sendRelayReply encrypts a reply of the given header type from the inner
+// packet's cipher state (so the AGENT can decrypt it and it correlates to the
+// inner request counter) and writes the bytes to the RELAY's address, which
+// forwards them to the browser.
+//
+// THE DIVERT: this uses the EncryptedPktCh divert + a manual WriteToUDP rather
+// than forwardToTransaction, because the inner packet was decrypted onto a
+// SYNTHETIC ConnData (decryptRelayInnerKnock) and therefore has no
+// RemoteTransaction to forward a reply through. makeMsgData(innerPpd, ...) still
+// carries the inner packet's cipher state (PrevParserData) and SenderTrxId, so
+// the encrypted reply is end-to-end for the agent and counter-correlated; we
+// just place the finished bytes on the wire toward the relay ourselves. The
+// architecture spike that proves an agent can decrypt such a divert-built reply
+// is relay_ack_roundtrip_spike_test.go.
+//
+// headerType is the ONLY per-reply-kind variable: NHP_ACK for a relayed knock
+// reply, NHP_RAK for a relayed register reply. OTP is fire-and-forget and never
+// calls this.
+func (s *UdpServer) sendRelayReply(innerPpd *core.PacketParserData, relayAddr *net.UDPAddr, headerType int, body []byte) error {
+	replyMd := makeMsgData(innerPpd, headerType, body)
 	encCh := make(chan *core.MsgAssemblerData, 1)
-	ackMd.EncryptedPktCh = encCh
-	s.device.SendMsgToPacket(ackMd)
+	replyMd.EncryptedPktCh = encCh
+	s.device.SendMsgToPacket(replyMd)
 
 	select {
 	case mad := <-encCh:
@@ -265,15 +366,31 @@ func (s *UdpServer) sendRelayAck(innerPpd *core.PacketParserData, relayAddr *net
 			case <-time.After(ForwardTimeout):
 			}
 		}()
-		return fmt.Errorf("timeout encrypting relayed ack")
+		return fmt.Errorf("timeout encrypting relayed reply")
 	}
 }
 
-// validateRelaySourceAddr validates the relay-reported client address and
-// returns it as a *net.UDPAddr. The address opens an AC pinhole, so it must be a
-// real, routable public client address. Ported from upstream (validateRelay
-// SourceAddr / isRoutablePublicIP); GMSM paths dropped.
-func validateRelaySourceAddr(addr *common.NetAddress) (*net.UDPAddr, error) {
+// sendRelayAck is the thin NHP_ACK wrapper over sendRelayReply, kept so the
+// existing knock-reply call site (and the relay_ack_roundtrip_spike_test.go
+// harness) don't churn when the reply mechanism generalized to a header type.
+func (s *UdpServer) sendRelayAck(innerPpd *core.PacketParserData, relayAddr *net.UDPAddr, ackBytes []byte) error {
+	return s.sendRelayReply(innerPpd, relayAddr, core.NHP_ACK, ackBytes)
+}
+
+// validateRelaySourceAddrSyntactic validates ONLY the SHAPE of the
+// relay-reported client address — non-nil, a parseable IP, and a valid port —
+// and returns it as a *net.UDPAddr. It deliberately does NOT assert the IP is
+// routable/public.
+//
+// This is the check applied to EVERY forwarded inner type, because the source
+// address becomes the synthetic ConnData.RemoteAddr the inner packet is
+// decrypted against (decryptRelayInnerKnock), so it must at least be well-formed
+// before the type is even known. The stricter routable-public assertion is
+// layered on top ONLY for the AC-pinhole-opening knock types, as an inline
+// isRoutablePublicIP check in HandleRelayForward's knock dispatch arm (see the
+// type-dependent gate there) — the registration types (NHP_OTP / NHP_REG) use
+// ONLY this syntactic check.
+func validateRelaySourceAddrSyntactic(addr *common.NetAddress) (*net.UDPAddr, error) {
 	if addr == nil {
 		return nil, fmt.Errorf("missing source address")
 	}
@@ -283,9 +400,6 @@ func validateRelaySourceAddr(addr *common.NetAddress) (*net.UDPAddr, error) {
 	ip := net.ParseIP(addr.Ip)
 	if ip == nil {
 		return nil, fmt.Errorf("unparseable source ip %q", addr.Ip)
-	}
-	if !isRoutablePublicIP(ip) {
-		return nil, fmt.Errorf("non-routable source ip %s", ip)
 	}
 	return &net.UDPAddr{IP: ip, Port: addr.Port}, nil
 }

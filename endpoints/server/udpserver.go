@@ -52,22 +52,53 @@ var (
 // dimension values.
 var dimNameInstanceId = aws.String("InstanceId")
 
+// buildServerEnvDimension returns the [Environment]-ONLY CloudWatch dimension set
+// (the fleet-wide dim, no Cell). It is the base of buildServerMetricDimensions and
+// is also the exact set a fleet-wide alarm must select — e.g. the agent-OTP-shed
+// launch-blocking alarm keys on {Environment} only, so OTPRejectRateLimited is
+// dual-published at this set (via the publisher's explicit-dims emit) in ADDITION
+// to the [Environment, Cell] breakdown. Sourced from the SAME NHP_ENVIRONMENT var
+// as the full dim set so the Environment value can never drift between the base
+// stream and the breakdown (a drift would land the base metric at a different
+// Environment and silently blind the alarm — cf. the relay's buildRelayMetricDimensions
+// NB note). Keep NHP_ENVIRONMENT wired in user_data.
+func buildServerEnvDimension() []types.Dimension {
+	return []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String(serverEnvironmentValue())},
+	}
+}
+
+// serverEnvironmentValue is the single source of the Environment dimension value
+// (NHP_ENVIRONMENT, "unknown" fallback). Shared by buildServerEnvDimension and
+// buildServerMetricDimensions so the Environment value can never drift between the
+// [Environment]-only base (used by the OTPRejectRateLimited dual-publish) and the
+// full [Environment, Cell] set.
+func serverEnvironmentValue() string {
+	environment := os.Getenv("NHP_ENVIRONMENT")
+	if environment == "" {
+		environment = "unknown"
+	}
+	return environment
+}
+
 // buildServerMetricDimensions returns the CloudWatch dimensions derived from environment
 // variables. Dimensions: [Environment, Cell]. CloudWatch alarms and Grafana dashboard
 // panels match on this exact set. Adding or removing dimensions creates a separate
 // metric time series that existing alarms/panels won't find.
 func buildServerMetricDimensions() []types.Dimension {
-	environment := os.Getenv("NHP_ENVIRONMENT")
-	if environment == "" {
-		environment = "unknown"
-	}
 	cellID := os.Getenv("NHP_CELL_ID")
 	if cellID == "" {
 		cellID = "cell0"
 	}
 
+	// [Environment, Cell], listed literally. Environment uses the same package
+	// `environment` value as buildServerEnvDimension (the [Environment]-only base the
+	// OTPRejectRateLimited dual-publish emits), so the value cannot drift between the
+	// two. The names are pinned here directly — not via append(buildServerEnvDimension(),
+	// …) — because observability-parity's static fence matches the relay_forward_reject
+	// alarm's dimension selectors against this builder's own body.
 	return []types.Dimension{
-		{Name: aws.String("Environment"), Value: aws.String(environment)},
+		{Name: aws.String("Environment"), Value: aws.String(serverEnvironmentValue())},
 		{Name: aws.String("Cell"), Value: aws.String(cellID)},
 	}
 }
@@ -319,6 +350,14 @@ type UdpServer struct {
 	// before any cryptographic processing occurs.
 	rateLimiter    *IPRateLimiter
 	rateLimitDrops atomic.Int64 // total dropped packets, for sampled logging
+
+	// Pre-plugin OTP rate limiter, keyed by the inner device pubkey (b64), for
+	// both the direct (HandleOTPRequest) and relayed (HandleRelayForward)
+	// NHP_OTP dispatch. Defense-in-depth against per-key OTP/email floods; the
+	// authoritative limits live qurl-service-side (Q2). Nil means unbounded — a
+	// test-only affordance; the constructor initializes it in production. See
+	// agent_otp_ratelimit.go.
+	otpRateLimiter *OTPRateLimiter
 
 	// handlerSem bounds the number of in-flight agent-facing handler
 	// goroutines dispatchReceivedMessage runs concurrently (see
@@ -839,6 +878,14 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	s.rateLimiter = NewIPRateLimiter(rlCfg)
 	log.Info("UDP rate limiter initialized: %.0f pps sustained, %d burst per source IP",
 		rlCfg.Rate, rlCfg.Burst)
+
+	// Initialize the pre-plugin OTP rate limiter (keyed by device pubkey). Guards
+	// the OTP dispatch — direct and relayed — before the plugin/email cost. This
+	// is defense-in-depth; the authoritative limits are qurl-service-side (Q2).
+	otpCfg := DefaultOTPRateLimiterConfig()
+	s.otpRateLimiter = NewOTPRateLimiter(otpCfg)
+	log.Info("OTP rate limiter initialized: capacity %d, refill 1 per %s per key, global ~%.1f/min",
+		otpCfg.Capacity, otpCfg.RefillInterval, otpCfg.GlobalRate*60)
 
 	// Bound in-flight agent-facing handler goroutines. Buffered to
 	// MaxConcurrentHandlers; dispatchHandler acquires non-blocking so the

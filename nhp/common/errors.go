@@ -250,6 +250,8 @@ var (
 	ErrRegistrationDisabled = newError("52107", "registration disabled")
 	// ErrRegistrationBootstrapKeyConsumed — the one-shot bootstrap key was already used; it cannot register a second agent.
 	ErrRegistrationBootstrapKeyConsumed = newError("52108", "bootstrap key consumed")
+	// ErrRegistrationInvalidInput — a registration request identifier is malformed or unknown (e.g. an invalid device_id, reachable via a client-side WithDeviceID override). Distinct from ErrRegistrationApiKeyInvalid so a bad device_id does not surface the misleading "invalid api key" string to the agent; both are terminal client errors (not load shedding), so neither should be retried.
+	ErrRegistrationInvalidInput = newError("52109", "invalid registration input")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")

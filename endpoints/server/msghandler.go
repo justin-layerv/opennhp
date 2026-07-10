@@ -200,7 +200,34 @@ const (
 	// missing inner agent pubkey. These are pre-auth drops with no ack sent
 	// (there is no authenticated agent to encrypt one for); auth REJECTS after
 	// the inner decrypt are delivered as acks and counted by MetricAuthFailure.
-	MetricRelayForwardReject        = "RelayForwardReject"
+	MetricRelayForwardReject = "RelayForwardReject"
+	// MetricRelayOTP counts relayed NHP_OTP inner packets that passed the
+	// inner-type gate in HandleRelayForward and were handed to dispatchOTP
+	// (agent-registration N2). Fire-and-forget: no ack is sent for these (the
+	// relay already answered the browser 202), so this is the only server-side
+	// visibility that a relayed OTP attempt was seen. It is incremented at the
+	// gate, BEFORE dispatchOTP runs, so it counts EVERY relayed OTP attempt
+	// regardless of downstream outcome — including a stubbed-plugin
+	// ErrPluginNotRegistered AND a rate-limited drop (the OTP limiter is the
+	// first step INSIDE dispatchOTP, so a shed relayed OTP ticks both this and
+	// MetricOTPRejectRateLimited). It is therefore a SUPERSET of the relayed
+	// portion of MetricOTPRejectRateLimited: admitted relayed OTPs ≈ MetricRelayOTP
+	// minus the relayed share of MetricOTPRejectRateLimited.
+	MetricRelayOTP = "RelayOTP"
+	// MetricRelayRegister counts relayed NHP_REG inner packets that reached the
+	// register dispatch (buildRegisterAck) in HandleRelayForward. Unlike OTP,
+	// REG always produces a RAK reply (delivered via sendRelayReply), including
+	// the fail-closed RAK while the plugin is stubbed (N3 pending).
+	MetricRelayRegister = "RelayRegister"
+	// MetricOTPRejectRateLimited counts OTP requests (direct or relayed)
+	// dropped by the pre-plugin OTP rate limiter (agent_otp_ratelimit.go) BEFORE
+	// the plugin/email cost. A silent, spec-aligned default-deny drop; a non-zero
+	// rate means a per-key or aggregate OTP flood is being shed at the server
+	// (defense-in-depth; the authoritative limits are qurl-service-side, Q2).
+	// NOTE: deliberately NOT prefixed "Relay" (unlike MetricRelayOTP/
+	// MetricRelayRegister, which are relay-path only) because it ticks for a
+	// DIRECT-UDP OTP as well as a relayed one — it spans both dispatch paths.
+	MetricOTPRejectRateLimited      = "OTPRejectRateLimited"
 	MetricCloudMapDeregisterFailure = "CloudMapDeregisterFailure"
 	// MetricShutdownTransactionDrainTimeout increments when graceful shutdown's
 	// in-flight transaction drain exhausts its budget with non-zero local
@@ -1262,28 +1289,77 @@ func makeMsgData(ppd *core.PacketParserData, headerType int, msg []byte) *core.M
 
 // HandleOTPRequest
 // Server will not respond to agent's otp request
+//
+// Fire-and-forget per the CSA NHP spec: the server never replies to an OTP,
+// direct or relayed. This is the DIRECT (agent→server UDP) path; the RELAYED
+// path (HandleRelayForward) calls dispatchOTP against a synthetic inner ppd.
+// Both share dispatchOTP so the rate-limit → plugin-load → RequestOTP core is
+// identical on either ingress.
 func (s *UdpServer) HandleOTPRequest(ppd *core.PacketParserData) (err error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
+	return s.dispatchOTP(ppd)
+}
 
+// dispatchOTP runs the shared OTP plugin-dispatch core for both the direct
+// (HandleOTPRequest) and relayed (HandleRelayForward → NHP_OTP) paths. It parses
+// the AgentOTPMsg, applies the pre-plugin OTP rate limiter, loads + resolves the
+// agent plugin, and calls RequestOTP. It NEVER sends a reply (fire-and-forget);
+// it returns only an error for the caller to log-and-swallow. A plugin
+// ErrPluginNotRegistered (N3 not yet implemented) is an expected, non-fatal
+// return here.
+//
+// ppd must carry a decrypted OTP body plus the Noise-authenticated RemotePubKey
+// (the direct path has both from the responder; the relay path's synthetic
+// decrypt populates both — see decryptRelayInnerKnock).
+func (s *UdpServer) dispatchOTP(ppd *core.PacketParserData) error {
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
 
 	otpMsg := &common.AgentOTPMsg{}
-	err = json.Unmarshal(ppd.BodyMessage, otpMsg)
-	if err != nil {
+	if err := json.Unmarshal(ppd.BodyMessage, otpMsg); err != nil {
 		log.Error("server-agent(#%d@%s)[HandleOTPRequest] failed to parse %s message: %v", transactionId, addrStr, core.HeaderTypeToString(ppd.HeaderType), err)
 		return err
 	}
+
+	// Same population as the register path below: the Noise-authenticated
+	// initiator static key, std-base64 like every other pubKey field. Also the
+	// rate-limiter key (defense-in-depth against per-key OTP/email floods).
+	agentPubkey := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
+
+	// Pre-plugin OTP rate limiter (defense-in-depth; authoritative limits are
+	// qurl-service-side, Q2). Applied BEFORE loading/calling the plugin so a
+	// flood of OTP requests — which each cost an email downstream — is shed
+	// before it can reach the credential issuer. Spec-aligned default-deny:
+	// on reject, drop SILENTLY with no reply (OTP is fire-and-forget anyway).
+	if s.otpRateLimiter != nil && !s.otpRateLimiter.Allow(agentPubkey) {
+		// DUAL-PUBLISH the shed metric (cf. relay recordShed): the launch-blocking
+		// agent-OTP-shed alarm (T1) selects on {Environment} ONLY, but the server
+		// publisher's base dims are [Environment, Cell], so a plain IncrCounter would
+		// publish only at [Environment, Cell] and the {Environment} alarm could never
+		// bind (it would sit in INSUFFICIENT_DATA, and treat_missing_data=notBreaching
+		// keeps the page silently green). So emit BOTH: an explicit [Environment]-only
+		// base stream the alarm binds to, PLUS the normal [Environment, Cell]
+		// breakdown for per-cell dashboards/attribution. Do NOT drop the explicit
+		// base emit — it is the ONLY stream the launch-blocking alarm can match.
+		s.metrics.IncrCounterExplicitDims(MetricOTPRejectRateLimited, buildServerEnvDimension())
+		s.metrics.IncrCounter(MetricOTPRejectRateLimited)
+		log.Warning("server-agent(key=%s#%d@%s)[HandleOTPRequest] OTP rate limited; dropping", pubkeyLogPrefix(agentPubkey), transactionId, addrStr)
+		return nil
+	}
+
+	// Ensure the plugin for this aspId is loaded before resolving it. Unlike the
+	// knock path (which loads via updateResources / the DDB resolve bridge on
+	// knock), the OTP/REG dispatch calls FindPluginHandler DIRECTLY — a plain map
+	// read that does NOT trigger a lazy load — so without this an agent's very
+	// first OTP (before any knock warmed the plugin) would find no handler.
+	// Idempotent per-aspId sync.Once; a no-op once loaded.
+	s.loadPluginOnce(otpMsg.AuthServiceId, "")
 
 	handler := s.FindPluginHandler(otpMsg.AuthServiceId)
 	if handler == nil {
 		return common.ErrAuthHandlerNotFound
 	}
-
-	// Same population as the register path below: the Noise-authenticated
-	// initiator static key, std-base64 like every other pubKey field.
-	agentPubkey := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
 
 	otpReq := &common.NhpOTPRequest{
 		Msg:       otpMsg,
@@ -1298,45 +1374,98 @@ func (s *UdpServer) HandleOTPRequest(ppd *core.PacketParserData) (err error) {
 	// these flows (passcode, OIDC) carry their own SDK-backed
 	// resourceHandler and don't read helper.AspData. The host server's
 	// aspMap is plumbed through only for the knock path today.
-	err = handler.RequestOTP(otpReq, s.NewNhpServerHelper(ppd, nil))
-	if err != nil {
-		log.Error("server-agent(%s#%d@%s)[HandleOTPRequest] error: %v", otpMsg.UserId, transactionId, addrStr, err)
+	if err := handler.RequestOTP(otpReq, s.NewNhpServerHelper(ppd, nil)); err != nil {
+		// Redact the identity in the error log: usrId is now a key id (an agent
+		// self-registers before it is a known user), so log the truncated
+		// pubkey rather than the client-chosen UserId. See pubkeyLogPrefix.
+		log.Error("server-agent(key=%s#%d@%s)[HandleOTPRequest] error: %v", pubkeyLogPrefix(agentPubkey), transactionId, addrStr, err)
 		return err
 	}
 
-	log.Info("server-agent(%s#%d@%s)[HandleOTPRequest] succeeded", otpMsg.UserId, transactionId, addrStr)
+	log.Info("server-agent(key=%s#%d@%s)[HandleOTPRequest] succeeded", pubkeyLogPrefix(agentPubkey), transactionId, addrStr)
 	return nil
 }
 
 // HandleRegisterRequest
 // Server will respond with success or error with NHP_RAK message
+//
+// This is the DIRECT (agent→server UDP) path: it builds the RAK via
+// buildRegisterAck and delivers it through the agent's real transaction
+// (forwardToTransaction) — unchanged on the wire. The RELAYED path
+// (HandleRelayForward → NHP_REG) shares buildRegisterAck for the marshal-the-ack
+// core but diverts the reply through the relay (sendRelayReply), since a
+// synthetically-decrypted inner packet has no RemoteTransaction to forward
+// through.
 func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
+
+	rakBytes, buildErr := s.buildRegisterAck(ppd)
+	if buildErr != nil {
+		// Marshal failure only — a plugin/auth reject is carried IN the ack
+		// bytes (fail-closed errCode), not returned as buildErr. Nothing to
+		// deliver, so drop.
+		log.Error("server-agent(key=%s#%d@%s)[HandleRegisterRequest] failed to build RAK: %v",
+			pubkeyLogPrefix(base64.StdEncoding.EncodeToString(ppd.RemotePubKey)), transactionId, addrStr, buildErr)
+		return buildErr
+	}
+
+	rakMd := makeMsgData(ppd, core.NHP_RAK, rakBytes)
+	if fwdErr := s.forwardToTransaction(ppd.ConnData, transactionId, rakMd, "server-agent", "HandleRegisterRequest",
+		pubkeyLogPrefix(base64.StdEncoding.EncodeToString(ppd.RemotePubKey)), addrStr); fwdErr != nil {
+		return fwdErr
+	}
+	return nil
+}
+
+// buildRegisterAck runs the register plugin-dispatch core — parse
+// AgentRegisterMsg → load + resolve the agent plugin → RegisterAgent → marshal
+// the ServerRegisterAckMsg — and returns the NHP_RAK body bytes. Shared by the
+// direct path (HandleRegisterRequest, which then forwardToTransactions) and the
+// relay path (HandleRelayForward, which then sendRelayReply(NHP_RAK)).
+//
+// FAIL-CLOSED ACK CONTRACT: the returned error is ONLY a marshal failure (drop,
+// nothing to send). Every logical failure — parse error, no handler, or a plugin
+// error — is instead encoded IN the returned ack bytes with a populated ErrCode,
+// so the agent always receives a decryptable RAK carrying a verdict rather than a
+// silent timeout. In particular, with the agent plugin still stubbed (N3
+// pending) RegisterAgent returns ErrPluginNotRegistered and this yields a RAK
+// whose ErrCode is the mapped fail-closed code (registerErrToCode) — the
+// inertness N2 relies on.
+//
+// PublicKey is populated with base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
+// exactly as before, so a registration plugin can bind the credential to the
+// Noise-authenticated agent key rather than to spoofable message fields.
+func (s *UdpServer) buildRegisterAck(ppd *core.PacketParserData) ([]byte, error) {
+	transactionId := ppd.SenderTrxId
+	addrStr := ppd.ConnData.RemoteAddr.String()
+	agentPubkey := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
+
 	regMsg := &common.AgentRegisterMsg{}
 	rakMsg := &common.ServerRegisterAckMsg{}
 
 	func() {
-		err = json.Unmarshal(ppd.BodyMessage, regMsg)
-		if err != nil {
+		if err := json.Unmarshal(ppd.BodyMessage, regMsg); err != nil {
 			log.Error("server-agent(#%d@%s)[HandleRegisterRequest] failed to parse %s message: %v", transactionId, addrStr, core.HeaderTypeToString(ppd.HeaderType), err)
 			rakMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
 			rakMsg.ErrMsg = err.Error()
 			return
 		}
 
+		// Load the plugin before resolving it: the OTP/REG dispatch calls
+		// FindPluginHandler directly (a plain map read, no lazy load), unlike the
+		// knock path — see dispatchOTP for the full rationale. Idempotent.
+		s.loadPluginOnce(regMsg.AuthServiceId, "")
+
 		handler := s.FindPluginHandler(regMsg.AuthServiceId)
 		if handler == nil {
-			err = common.ErrAuthHandlerNotFound
 			rakMsg.ErrCode = common.ErrAuthHandlerNotFound.ErrorCode()
-			rakMsg.ErrMsg = err.Error()
+			rakMsg.ErrMsg = common.ErrAuthHandlerNotFound.Error()
 			return
 		}
-
-		agentPubkey := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
 
 		regReq := &common.NhpRegisterRequest{
 			Msg:       regMsg,
@@ -1348,27 +1477,51 @@ func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error
 			},
 		}
 
-		rakMsg, err = handler.RegisterAgent(regReq, s.NewNhpServerHelper(ppd, nil))
-		if err != nil {
-			log.Error("server-agent(%s#%d@%s)[HandleRegisterRequest] error: %v", regMsg.UserId, transactionId, addrStr, err)
+		ack, regErr := handler.RegisterAgent(regReq, s.NewNhpServerHelper(ppd, nil))
+		if regErr != nil {
+			// Fail closed: keep a non-nil ack carrying a mapped errCode so the
+			// agent gets a verdict, never a nil/`null` RAK. The plugin may (N3)
+			// return a populated ack alongside the error; prefer it, else fall
+			// back to the pre-populated rakMsg and stamp the mapped code.
+			if ack != nil {
+				rakMsg = ack
+			}
+			if common.IsSuccessErrCode(rakMsg.ErrCode) {
+				rakMsg.ErrCode = registerErrToCode(regErr).ErrorCode()
+				rakMsg.ErrMsg = regErr.Error()
+			}
+			log.Error("server-agent(key=%s#%d@%s)[HandleRegisterRequest] error: %v", pubkeyLogPrefix(agentPubkey), transactionId, addrStr, regErr)
 			return
 		}
+		if ack != nil {
+			rakMsg = ack
+		}
 
-		log.Info("server-agent(%s#%d@%s)[HandleRegisterRequest] succeeded", regMsg.UserId, transactionId, addrStr)
+		log.Info("server-agent(key=%s#%d@%s)[HandleRegisterRequest] succeeded", pubkeyLogPrefix(agentPubkey), transactionId, addrStr)
 	}()
 
-	// send NHP_RAK message
 	rakBytes, marshalErr := json.Marshal(rakMsg)
 	if marshalErr != nil {
-		log.Error("server-agent(%s#%d@%s)[HandleRegisterRequest] failed to marshal RAK message: %v", regMsg.UserId, transactionId, addrStr, marshalErr)
-		return marshalErr
+		log.Error("server-agent(key=%s#%d@%s)[HandleRegisterRequest] failed to marshal RAK message: %v", pubkeyLogPrefix(agentPubkey), transactionId, addrStr, marshalErr)
+		return nil, marshalErr
 	}
-	rakMd := makeMsgData(ppd, core.NHP_RAK, rakBytes)
+	return rakBytes, nil
+}
 
-	if fwdErr := s.forwardToTransaction(ppd.ConnData, transactionId, rakMd, "server-agent", "HandleRegisterRequest", regMsg.UserId, addrStr); fwdErr != nil {
-		return fwdErr
+// registerErrToCode maps a plugin RegisterAgent error to a fail-closed
+// registration errCode for the RAK. A *common.Error already carries its own code
+// (used verbatim). Everything else — notably plugins.ErrPluginNotRegistered (a
+// bare errors.New that the N3-pending agent stub returns) — maps to
+// ErrRegistrationDisabled: "self-registration is administratively switched off
+// for this server/service", which is the honest state until N3 lands. The point
+// is that the agent always receives a concrete registration errCode rather than a
+// silent drop or a success sentinel.
+func registerErrToCode(err error) *common.Error {
+	var ce *common.Error
+	if errors.As(err, &ce) {
+		return ce
 	}
-	return err
+	return common.ErrRegistrationDisabled
 }
 
 // HandleListRequest
