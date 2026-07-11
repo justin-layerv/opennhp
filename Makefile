@@ -475,6 +475,8 @@ lint-workflows:
 	@command -v terraform >/dev/null 2>&1 || \
 		echo "$(COLOUR_YELLOW)[OpenNHP] terraform not found: relay DMZ Terraform-backed tests skip locally; set REQUIRE_TERRAFORM=1 for CI parity.$(END_COLOUR)"
 	@python3 tests/scripts/test_check_relay_dmz_plan.py
+	@python3 -m py_compile scripts/check-relay-dmz-live.py
+	@python3 tests/scripts/test_check_relay_dmz_live.py
 	@python3 -c 'import yaml' 2>/dev/null || { \
 		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \
 		echo "$(COLOUR_RED)  Match the CI install: python3 -m pip install --no-cache-dir pyyaml$(END_COLOUR)"; \

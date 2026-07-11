@@ -93,6 +93,7 @@ on:
       - "docker/start-ac.sh"
       - "terraform/modules/ac/main.tf"
       - "Makefile"
+      - "scripts/check-relay-dmz-live.py"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
       - "scripts/check-packer-failure-surfaced.sh"
       - "scripts/check-app-image-line-rendered.sh"
@@ -455,6 +456,11 @@ jobs:
         run: |
           python3 -m py_compile .github/scripts/check-relay-dmz-plan.py
           python3 tests/scripts/test_check_relay_dmz_plan.py
+
+      - name: Test relay DMZ live detector
+        run: |
+          python3 -m py_compile scripts/check-relay-dmz-live.py
+          python3 tests/scripts/test_check_relay_dmz_live.py
 
       # Structural fence for the dependabot-go-tidy bot-identity preflight
       # (PR #1777). PR #1384 used `gh api /user`, which 403s on App
