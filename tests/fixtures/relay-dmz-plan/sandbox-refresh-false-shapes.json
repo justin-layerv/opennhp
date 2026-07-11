@@ -1,0 +1,1483 @@
+{
+  "_fixture": {
+    "aws_provider_version": "6.54.0",
+    "capture_terraform_version": "1.14.3",
+    "cross_validated_terraform_version": "1.15.7",
+    "provenance": "Sanitized schema slice of a real sandbox terraform show -json plan captured with refresh=false and the workflow-pinned Terraform toolchain on 2026-07-10.",
+    "sanitization": "Only relay subnet/public-IP, interface private-DNS, logs-KMS rotation, ALB/ASG, launch-template, durable-secret move, and nested subnet/route-table configuration shapes are retained; unique IDs, user data, policies, and unrelated or sensitive values are removed.",
+    "source_sha256": "4221c9b816bcc6e1a104574f23afa8fcb24dd57f2e33abf38fe4aaf8779f4422",
+    "workflow_terraform_version_files": [
+      ".github/workflows/build-and-push.yml",
+      ".github/workflows/promote-to-prod.yml",
+      ".github/workflows/terraform-plan-pr.yml",
+      ".github/workflows/validate-workflows.yml"
+    ]
+  },
+  "configuration": {
+    "root_module": {
+      "module_calls": {
+        "nhp": {
+          "module": {
+            "module_calls": {
+              "relay": {
+                "count_expression": {
+                  "references": [
+                    "var.deploy_relay"
+                  ]
+                },
+                "depends_on": [
+                  "module.relay_network"
+                ],
+                "expressions": {
+                  "account_id": {
+                    "references": [
+                      "data.aws_caller_identity.current.account_id",
+                      "data.aws_caller_identity.current"
+                    ]
+                  },
+                  "alarm_sns_topic_arn": {
+                    "references": [
+                      "module.monitoring.sns_topic_arn",
+                      "module.monitoring"
+                    ]
+                  },
+                  "asg_name": {
+                    "references": [
+                      "local.name_prefix"
+                    ]
+                  },
+                  "cell_servers": {
+                    "references": [
+                      "var.environment",
+                      "var.cell_id",
+                      "module.compute.server_public_key_b64",
+                      "module.compute",
+                      "module.compute.internal_nlb_dns_name",
+                      "module.compute"
+                    ]
+                  },
+                  "certificate_arn": {
+                    "references": [
+                      "local.relay_effective_certificate_arn"
+                    ]
+                  },
+                  "cors_allowed_origins": {
+                    "references": [
+                      "var.qurl_link_frontend_domain",
+                      "var.qurl_link_frontend_domain"
+                    ]
+                  },
+                  "ebs_kms_key_arn": {
+                    "references": [
+                      "module.kms.ebs_key_arn",
+                      "module.kms"
+                    ]
+                  },
+                  "environment": {
+                    "references": [
+                      "var.environment"
+                    ]
+                  },
+                  "logs_kms_key_arn": {
+                    "references": [
+                      "module.kms.logs_key_arn",
+                      "module.kms"
+                    ]
+                  },
+                  "name_prefix": {
+                    "references": [
+                      "local.name_prefix"
+                    ]
+                  },
+                  "nhp_server_cidr_blocks": {
+                    "references": [
+                      "module.networking.private_subnet_cidr_blocks",
+                      "module.networking"
+                    ]
+                  },
+                  "public_subnet_ids": {
+                    "references": [
+                      "module.relay_network[0].public_subnet_ids",
+                      "module.relay_network[0]"
+                    ]
+                  },
+                  "relay_repo_arn": {
+                    "references": [
+                      "module.ecr.relay_repo_arn",
+                      "module.ecr"
+                    ]
+                  },
+                  "relay_repo_url": {
+                    "references": [
+                      "module.ecr.relay_repo_url",
+                      "module.ecr"
+                    ]
+                  },
+                  "relay_secret_arn": {
+                    "references": [
+                      "module.relay_identity[0].secret_arn",
+                      "module.relay_identity[0]"
+                    ]
+                  },
+                  "relay_subnet_ids": {
+                    "references": [
+                      "module.relay_network[0].relay_subnet_ids",
+                      "module.relay_network[0]"
+                    ]
+                  },
+                  "scale_requests_per_target": {
+                    "references": [
+                      "var.relay_scale_requests_per_target"
+                    ]
+                  },
+                  "secrets_kms_key_arn": {
+                    "references": [
+                      "module.kms.secrets_key_arn",
+                      "module.kms"
+                    ]
+                  },
+                  "server_ami_id": {
+                    "references": [
+                      "var.server_ami_id"
+                    ]
+                  },
+                  "server_security_group_id": {
+                    "references": [
+                      "module.compute.security_group_id",
+                      "module.compute"
+                    ]
+                  },
+                  "ssm_image_tag_parameter": {
+                    "references": [
+                      "aws_ssm_parameter.relay_image_tag[0].name",
+                      "aws_ssm_parameter.relay_image_tag[0]",
+                      "aws_ssm_parameter.relay_image_tag"
+                    ]
+                  },
+                  "tags": {
+                    "references": [
+                      "local.common_tags"
+                    ]
+                  },
+                  "vpc_endpoint_security_group_id": {
+                    "references": [
+                      "module.relay_network[0].endpoint_security_group_id",
+                      "module.relay_network[0]"
+                    ]
+                  },
+                  "vpc_id": {
+                    "references": [
+                      "module.relay_network[0].vpc_id",
+                      "module.relay_network[0]"
+                    ]
+                  },
+                  "waf_rate_limit_per_source_ip": {
+                    "references": [
+                      "var.relay_waf_rate_limit_per_source_ip"
+                    ]
+                  }
+                },
+                "module": {
+                  "module_calls": {},
+                  "resources": [
+                    {
+                      "address": "aws_launch_template.relay",
+                      "expressions": {
+                        "block_device_mappings": [
+                          {
+                            "device_name": {
+                              "constant_value": "/dev/sda1"
+                            },
+                            "ebs": [
+                              {
+                                "delete_on_termination": {
+                                  "constant_value": true
+                                },
+                                "encrypted": {
+                                  "constant_value": true
+                                },
+                                "kms_key_id": {
+                                  "references": [
+                                    "var.ebs_kms_key_arn"
+                                  ]
+                                },
+                                "volume_size": {
+                                  "constant_value": 20
+                                },
+                                "volume_type": {
+                                  "constant_value": "gp3"
+                                }
+                              }
+                            ]
+                          }
+                        ],
+                        "iam_instance_profile": [
+                          {
+                            "arn": {
+                              "references": [
+                                "aws_iam_instance_profile.relay.arn",
+                                "aws_iam_instance_profile.relay"
+                              ]
+                            }
+                          }
+                        ],
+                        "image_id": {
+                          "references": [
+                            "local.ami_id"
+                          ]
+                        },
+                        "instance_type": {
+                          "references": [
+                            "var.instance_type"
+                          ]
+                        },
+                        "metadata_options": [
+                          {
+                            "http_endpoint": {
+                              "constant_value": "enabled"
+                            },
+                            "http_put_response_hop_limit": {
+                              "constant_value": 1
+                            },
+                            "http_tokens": {
+                              "constant_value": "required"
+                            },
+                            "instance_metadata_tags": {
+                              "constant_value": "enabled"
+                            }
+                          }
+                        ],
+                        "monitoring": [
+                          {
+                            "enabled": {
+                              "constant_value": true
+                            }
+                          }
+                        ],
+                        "name_prefix": {
+                          "references": [
+                            "var.name_prefix"
+                          ]
+                        },
+                        "network_interfaces": [
+                          {
+                            "associate_public_ip_address": {
+                              "constant_value": false
+                            },
+                            "security_groups": {
+                              "references": [
+                                "aws_security_group.relay.id",
+                                "aws_security_group.relay"
+                              ]
+                            }
+                          }
+                        ],
+                        "tag_specifications": [
+                          {
+                            "resource_type": {
+                              "constant_value": "instance"
+                            },
+                            "tags": {
+                              "references": [
+                                "local.tags",
+                                "var.name_prefix"
+                              ]
+                            }
+                          }
+                        ],
+                        "tags": {
+                          "references": [
+                            "local.tags"
+                          ]
+                        },
+                        "user_data": {
+                          "references": [
+                            "local.user_data"
+                          ]
+                        }
+                      },
+                      "mode": "managed",
+                      "name": "relay",
+                      "provider_config_key": "aws",
+                      "schema_version": 1,
+                      "type": "aws_launch_template"
+                    }
+                  ]
+                },
+                "source": "./modules/relay"
+              },
+              "relay_network": {
+                "count_expression": {
+                  "references": [
+                    "var.deploy_relay"
+                  ]
+                },
+                "depends_on": [
+                  "terraform_data.relay_dmz_preconditions",
+                  "time_sleep.relay_dmz_iam_propagation"
+                ],
+                "expressions": {
+                  "environment": {
+                    "references": [
+                      "var.environment"
+                    ]
+                  },
+                  "main_private_route_table_ids": {
+                    "references": [
+                      "module.networking.private_route_table_ids",
+                      "module.networking"
+                    ]
+                  },
+                  "main_private_subnet_cidr_blocks": {
+                    "references": [
+                      "module.networking.private_subnet_cidr_blocks",
+                      "module.networking"
+                    ]
+                  },
+                  "main_vpc_id": {
+                    "references": [
+                      "module.networking.vpc_id",
+                      "module.networking"
+                    ]
+                  },
+                  "name_prefix": {
+                    "references": [
+                      "local.name_prefix"
+                    ]
+                  },
+                  "relay_image_tag_parameter_name": {
+                    "references": [
+                      "var.environment"
+                    ]
+                  },
+                  "relay_repo_arn": {
+                    "references": [
+                      "module.ecr.relay_repo_arn",
+                      "module.ecr"
+                    ]
+                  },
+                  "relay_secret_arn": {
+                    "references": [
+                      "module.relay_identity[0].secret_arn",
+                      "module.relay_identity[0]"
+                    ]
+                  },
+                  "tags": {
+                    "references": [
+                      "local.common_tags"
+                    ]
+                  },
+                  "vpc_cidr": {
+                    "references": [
+                      "var.relay_vpc_cidr"
+                    ]
+                  }
+                },
+                "module": {
+                  "module_calls": {},
+                  "resources": [
+                    {
+                      "address": "aws_route_table_association.endpoint",
+                      "count_expression": {
+                        "constant_value": 3
+                      },
+                      "expressions": {
+                        "route_table_id": {
+                          "references": [
+                            "aws_route_table.endpoint",
+                            "count.index"
+                          ]
+                        },
+                        "subnet_id": {
+                          "references": [
+                            "aws_subnet.endpoint",
+                            "count.index"
+                          ]
+                        }
+                      },
+                      "mode": "managed",
+                      "name": "endpoint",
+                      "provider_config_key": "aws",
+                      "schema_version": 0,
+                      "type": "aws_route_table_association"
+                    },
+                    {
+                      "address": "aws_route_table_association.public",
+                      "count_expression": {
+                        "constant_value": 3
+                      },
+                      "expressions": {
+                        "route_table_id": {
+                          "references": [
+                            "aws_route_table.public.id",
+                            "aws_route_table.public"
+                          ]
+                        },
+                        "subnet_id": {
+                          "references": [
+                            "aws_subnet.public",
+                            "count.index"
+                          ]
+                        }
+                      },
+                      "mode": "managed",
+                      "name": "public",
+                      "provider_config_key": "aws",
+                      "schema_version": 0,
+                      "type": "aws_route_table_association"
+                    },
+                    {
+                      "address": "aws_route_table_association.relay",
+                      "count_expression": {
+                        "constant_value": 3
+                      },
+                      "expressions": {
+                        "route_table_id": {
+                          "references": [
+                            "aws_route_table.relay",
+                            "count.index"
+                          ]
+                        },
+                        "subnet_id": {
+                          "references": [
+                            "aws_subnet.relay",
+                            "count.index"
+                          ]
+                        }
+                      },
+                      "mode": "managed",
+                      "name": "relay",
+                      "provider_config_key": "aws",
+                      "schema_version": 0,
+                      "type": "aws_route_table_association"
+                    },
+                    {
+                      "address": "aws_subnet.endpoint",
+                      "count_expression": {
+                        "constant_value": 3
+                      },
+                      "expressions": {
+                        "availability_zone": {
+                          "references": [
+                            "local.azs",
+                            "count.index"
+                          ]
+                        },
+                        "cidr_block": {
+                          "references": [
+                            "local.endpoint_subnet_cidr_blocks",
+                            "count.index"
+                          ]
+                        },
+                        "map_public_ip_on_launch": {
+                          "constant_value": false
+                        },
+                        "tags": {
+                          "references": [
+                            "local.tags",
+                            "var.name_prefix",
+                            "local.azs",
+                            "count.index"
+                          ]
+                        },
+                        "vpc_id": {
+                          "references": [
+                            "aws_vpc.relay.id",
+                            "aws_vpc.relay"
+                          ]
+                        }
+                      },
+                      "mode": "managed",
+                      "name": "endpoint",
+                      "provider_config_key": "aws",
+                      "schema_version": 1,
+                      "type": "aws_subnet"
+                    },
+                    {
+                      "address": "aws_subnet.public",
+                      "count_expression": {
+                        "constant_value": 3
+                      },
+                      "expressions": {
+                        "availability_zone": {
+                          "references": [
+                            "local.azs",
+                            "count.index"
+                          ]
+                        },
+                        "cidr_block": {
+                          "references": [
+                            "local.public_subnet_cidr_blocks",
+                            "count.index"
+                          ]
+                        },
+                        "map_public_ip_on_launch": {
+                          "constant_value": false
+                        },
+                        "tags": {
+                          "references": [
+                            "local.tags",
+                            "var.name_prefix",
+                            "local.azs",
+                            "count.index"
+                          ]
+                        },
+                        "vpc_id": {
+                          "references": [
+                            "aws_vpc.relay.id",
+                            "aws_vpc.relay"
+                          ]
+                        }
+                      },
+                      "mode": "managed",
+                      "name": "public",
+                      "provider_config_key": "aws",
+                      "schema_version": 1,
+                      "type": "aws_subnet"
+                    },
+                    {
+                      "address": "aws_subnet.relay",
+                      "count_expression": {
+                        "constant_value": 3
+                      },
+                      "expressions": {
+                        "availability_zone": {
+                          "references": [
+                            "local.azs",
+                            "count.index"
+                          ]
+                        },
+                        "cidr_block": {
+                          "references": [
+                            "local.relay_subnet_cidr_blocks",
+                            "count.index"
+                          ]
+                        },
+                        "map_public_ip_on_launch": {
+                          "constant_value": false
+                        },
+                        "tags": {
+                          "references": [
+                            "local.tags",
+                            "var.name_prefix",
+                            "local.azs",
+                            "count.index"
+                          ]
+                        },
+                        "vpc_id": {
+                          "references": [
+                            "aws_vpc.relay.id",
+                            "aws_vpc.relay"
+                          ]
+                        }
+                      },
+                      "mode": "managed",
+                      "name": "relay",
+                      "provider_config_key": "aws",
+                      "schema_version": 1,
+                      "type": "aws_subnet"
+                    }
+                  ]
+                },
+                "source": "./modules/relay-network"
+              }
+            },
+            "resources": []
+          },
+          "source": "../.."
+        }
+      },
+      "resources": []
+    }
+  },
+  "format_version": "1.2",
+  "resource_changes": [
+    {
+      "action_reason": "replace_because_cannot_update",
+      "address": "module.nhp.module.relay[0].aws_autoscaling_group.relay",
+      "change": {
+        "actions": [
+          "create",
+          "delete"
+        ],
+        "after": {
+          "desired_capacity": 3,
+          "max_size": 6,
+          "min_size": 3
+        },
+        "after_unknown": {},
+        "before": {
+          "desired_capacity": 3,
+          "max_size": 6,
+          "min_size": 3
+        }
+      },
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay[0]",
+      "name": "relay",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_autoscaling_group"
+    },
+    {
+      "address": "module.nhp.module.relay[0].aws_launch_template.relay",
+      "change": {
+        "actions": [
+          "update"
+        ],
+        "after": {
+          "metadata_options": [
+            {
+              "http_endpoint": "enabled",
+              "http_protocol_ipv6": "",
+              "http_put_response_hop_limit": 1,
+              "http_tokens": "required",
+              "instance_metadata_tags": "enabled"
+            }
+          ],
+          "network_interfaces": [
+            {
+              "associate_carrier_ip_address": "",
+              "associate_public_ip_address": "false",
+              "connection_tracking_specification": [],
+              "delete_on_termination": "",
+              "description": "",
+              "device_index": 0,
+              "ena_srd_specification": [],
+              "interface_type": "",
+              "ipv4_address_count": 0,
+              "ipv4_addresses": [],
+              "ipv4_prefix_count": 0,
+              "ipv4_prefixes": [],
+              "ipv6_address_count": 0,
+              "ipv6_addresses": [],
+              "ipv6_prefix_count": 0,
+              "ipv6_prefixes": [],
+              "network_card_index": 0,
+              "network_interface_id": "",
+              "primary_ipv6": "",
+              "private_ip_address": "",
+              "subnet_id": ""
+            }
+          ]
+        },
+        "after_sensitive": {
+          "network_interfaces": [
+            {
+              "connection_tracking_specification": [],
+              "ena_srd_specification": [],
+              "ipv4_addresses": [],
+              "ipv4_prefixes": [],
+              "ipv6_addresses": [],
+              "ipv6_prefixes": [],
+              "security_groups": []
+            }
+          ]
+        },
+        "after_unknown": {
+          "image_id": true,
+          "network_interfaces": [
+            {
+              "connection_tracking_specification": [],
+              "ena_srd_specification": [],
+              "ipv4_addresses": [],
+              "ipv4_prefixes": [],
+              "ipv6_addresses": [],
+              "ipv6_prefixes": [],
+              "security_groups": true
+            }
+          ],
+          "user_data": true
+        },
+        "before": {
+          "network_interfaces": [
+            {
+              "associate_carrier_ip_address": "",
+              "associate_public_ip_address": "false",
+              "connection_tracking_specification": [],
+              "delete_on_termination": "",
+              "description": "",
+              "device_index": 0,
+              "ena_srd_specification": [],
+              "interface_type": "",
+              "ipv4_address_count": 0,
+              "ipv4_addresses": [],
+              "ipv4_prefix_count": 0,
+              "ipv4_prefixes": [],
+              "ipv6_address_count": 0,
+              "ipv6_addresses": [],
+              "ipv6_prefix_count": 0,
+              "ipv6_prefixes": [],
+              "network_card_index": 0,
+              "network_interface_id": "",
+              "primary_ipv6": "",
+              "private_ip_address": "",
+              "security_groups": [
+                "sg-SANITIZED"
+              ],
+              "subnet_id": ""
+            }
+          ]
+        },
+        "before_sensitive": {
+          "network_interfaces": [
+            {
+              "connection_tracking_specification": [],
+              "ena_srd_specification": [],
+              "ipv4_addresses": [],
+              "ipv4_prefixes": [],
+              "ipv6_addresses": [],
+              "ipv6_prefixes": [],
+              "security_groups": [
+                false
+              ]
+            }
+          ]
+        }
+      },
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay[0]",
+      "name": "relay",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_launch_template"
+    },
+    {
+      "action_reason": "replace_by_triggers",
+      "address": "module.nhp.module.relay[0].aws_lb.relay",
+      "change": {
+        "actions": [
+          "delete",
+          "create"
+        ],
+        "after": {
+          "internal": false
+        },
+        "after_unknown": {},
+        "before": {
+          "internal": false
+        }
+      },
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay[0]",
+      "name": "relay",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_lb"
+    },
+    {
+      "address": "module.nhp.module.relay_identity[0].aws_secretsmanager_secret.relay",
+      "change": {
+        "actions": [
+          "no-op"
+        ],
+        "after": {
+          "arn": "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox-relay-ABC123",
+          "name": "layerv-nhp-sandbox-relay",
+          "region": "us-east-2"
+        },
+        "after_identity": {
+          "arn": "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox-relay-ABC123"
+        },
+        "after_sensitive": {},
+        "after_unknown": {},
+        "before": {
+          "arn": "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox-relay-ABC123",
+          "name": "layerv-nhp-sandbox-relay",
+          "region": "us-east-2"
+        },
+        "before_identity": {
+          "arn": "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox-relay-ABC123"
+        },
+        "before_sensitive": {}
+      },
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_identity[0]",
+      "name": "relay",
+      "previous_address": "module.nhp.module.relay[0].aws_secretsmanager_secret.relay",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_secretsmanager_secret"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_kms_key.logs",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "enable_key_rotation": true
+        },
+        "after_unknown": {},
+        "before": null
+      },
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "logs",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_kms_key"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_subnet.endpoint[0]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "assign_ipv6_address_on_creation": false,
+          "cidr_block": "10.101.20.0/24",
+          "customer_owned_ipv4_pool": null,
+          "enable_dns64": false,
+          "enable_lni_at_device_index": null,
+          "enable_resource_name_dns_a_record_on_launch": false,
+          "enable_resource_name_dns_aaaa_record_on_launch": false,
+          "ipv4_ipam_pool_id": null,
+          "ipv4_netmask_length": null,
+          "ipv6_ipam_pool_id": null,
+          "ipv6_native": false,
+          "ipv6_netmask_length": null,
+          "map_customer_owned_ip_on_launch": null,
+          "map_public_ip_on_launch": false,
+          "outpost_arn": null,
+          "region": "us-east-2",
+          "timeouts": null
+        },
+        "after_identity": {
+          "account_id": null,
+          "id": null,
+          "region": null
+        },
+        "after_sensitive": {
+          "tags": {},
+          "tags_all": {}
+        },
+        "after_unknown": {
+          "arn": true,
+          "availability_zone": true,
+          "availability_zone_id": true,
+          "id": true,
+          "ipv6_cidr_block": true,
+          "ipv6_cidr_block_association_id": true,
+          "owner_id": true,
+          "private_dns_hostname_type_on_launch": true,
+          "tags": true,
+          "tags_all": true,
+          "vpc_id": true
+        },
+        "before": null,
+        "before_sensitive": false
+      },
+      "index": 0,
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "endpoint",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_subnet"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_subnet.endpoint[1]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "assign_ipv6_address_on_creation": false,
+          "cidr_block": "10.101.21.0/24",
+          "customer_owned_ipv4_pool": null,
+          "enable_dns64": false,
+          "enable_lni_at_device_index": null,
+          "enable_resource_name_dns_a_record_on_launch": false,
+          "enable_resource_name_dns_aaaa_record_on_launch": false,
+          "ipv4_ipam_pool_id": null,
+          "ipv4_netmask_length": null,
+          "ipv6_ipam_pool_id": null,
+          "ipv6_native": false,
+          "ipv6_netmask_length": null,
+          "map_customer_owned_ip_on_launch": null,
+          "map_public_ip_on_launch": false,
+          "outpost_arn": null,
+          "region": "us-east-2",
+          "timeouts": null
+        },
+        "after_identity": {
+          "account_id": null,
+          "id": null,
+          "region": null
+        },
+        "after_sensitive": {
+          "tags": {},
+          "tags_all": {}
+        },
+        "after_unknown": {
+          "arn": true,
+          "availability_zone": true,
+          "availability_zone_id": true,
+          "id": true,
+          "ipv6_cidr_block": true,
+          "ipv6_cidr_block_association_id": true,
+          "owner_id": true,
+          "private_dns_hostname_type_on_launch": true,
+          "tags": true,
+          "tags_all": true,
+          "vpc_id": true
+        },
+        "before": null,
+        "before_sensitive": false
+      },
+      "index": 1,
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "endpoint",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_subnet"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_subnet.endpoint[2]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "assign_ipv6_address_on_creation": false,
+          "cidr_block": "10.101.22.0/24",
+          "customer_owned_ipv4_pool": null,
+          "enable_dns64": false,
+          "enable_lni_at_device_index": null,
+          "enable_resource_name_dns_a_record_on_launch": false,
+          "enable_resource_name_dns_aaaa_record_on_launch": false,
+          "ipv4_ipam_pool_id": null,
+          "ipv4_netmask_length": null,
+          "ipv6_ipam_pool_id": null,
+          "ipv6_native": false,
+          "ipv6_netmask_length": null,
+          "map_customer_owned_ip_on_launch": null,
+          "map_public_ip_on_launch": false,
+          "outpost_arn": null,
+          "region": "us-east-2",
+          "timeouts": null
+        },
+        "after_identity": {
+          "account_id": null,
+          "id": null,
+          "region": null
+        },
+        "after_sensitive": {
+          "tags": {},
+          "tags_all": {}
+        },
+        "after_unknown": {
+          "arn": true,
+          "availability_zone": true,
+          "availability_zone_id": true,
+          "id": true,
+          "ipv6_cidr_block": true,
+          "ipv6_cidr_block_association_id": true,
+          "owner_id": true,
+          "private_dns_hostname_type_on_launch": true,
+          "tags": true,
+          "tags_all": true,
+          "vpc_id": true
+        },
+        "before": null,
+        "before_sensitive": false
+      },
+      "index": 2,
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "endpoint",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_subnet"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_subnet.public[0]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "assign_ipv6_address_on_creation": false,
+          "cidr_block": "10.101.0.0/24",
+          "customer_owned_ipv4_pool": null,
+          "enable_dns64": false,
+          "enable_lni_at_device_index": null,
+          "enable_resource_name_dns_a_record_on_launch": false,
+          "enable_resource_name_dns_aaaa_record_on_launch": false,
+          "ipv4_ipam_pool_id": null,
+          "ipv4_netmask_length": null,
+          "ipv6_ipam_pool_id": null,
+          "ipv6_native": false,
+          "ipv6_netmask_length": null,
+          "map_customer_owned_ip_on_launch": null,
+          "map_public_ip_on_launch": false,
+          "outpost_arn": null,
+          "region": "us-east-2",
+          "timeouts": null
+        },
+        "after_identity": {
+          "account_id": null,
+          "id": null,
+          "region": null
+        },
+        "after_sensitive": {
+          "tags": {},
+          "tags_all": {}
+        },
+        "after_unknown": {
+          "arn": true,
+          "availability_zone": true,
+          "availability_zone_id": true,
+          "id": true,
+          "ipv6_cidr_block": true,
+          "ipv6_cidr_block_association_id": true,
+          "owner_id": true,
+          "private_dns_hostname_type_on_launch": true,
+          "tags": true,
+          "tags_all": true,
+          "vpc_id": true
+        },
+        "before": null,
+        "before_sensitive": false
+      },
+      "index": 0,
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "public",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_subnet"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_subnet.public[1]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "assign_ipv6_address_on_creation": false,
+          "cidr_block": "10.101.1.0/24",
+          "customer_owned_ipv4_pool": null,
+          "enable_dns64": false,
+          "enable_lni_at_device_index": null,
+          "enable_resource_name_dns_a_record_on_launch": false,
+          "enable_resource_name_dns_aaaa_record_on_launch": false,
+          "ipv4_ipam_pool_id": null,
+          "ipv4_netmask_length": null,
+          "ipv6_ipam_pool_id": null,
+          "ipv6_native": false,
+          "ipv6_netmask_length": null,
+          "map_customer_owned_ip_on_launch": null,
+          "map_public_ip_on_launch": false,
+          "outpost_arn": null,
+          "region": "us-east-2",
+          "timeouts": null
+        },
+        "after_identity": {
+          "account_id": null,
+          "id": null,
+          "region": null
+        },
+        "after_sensitive": {
+          "tags": {},
+          "tags_all": {}
+        },
+        "after_unknown": {
+          "arn": true,
+          "availability_zone": true,
+          "availability_zone_id": true,
+          "id": true,
+          "ipv6_cidr_block": true,
+          "ipv6_cidr_block_association_id": true,
+          "owner_id": true,
+          "private_dns_hostname_type_on_launch": true,
+          "tags": true,
+          "tags_all": true,
+          "vpc_id": true
+        },
+        "before": null,
+        "before_sensitive": false
+      },
+      "index": 1,
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "public",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_subnet"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_subnet.public[2]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "assign_ipv6_address_on_creation": false,
+          "cidr_block": "10.101.2.0/24",
+          "customer_owned_ipv4_pool": null,
+          "enable_dns64": false,
+          "enable_lni_at_device_index": null,
+          "enable_resource_name_dns_a_record_on_launch": false,
+          "enable_resource_name_dns_aaaa_record_on_launch": false,
+          "ipv4_ipam_pool_id": null,
+          "ipv4_netmask_length": null,
+          "ipv6_ipam_pool_id": null,
+          "ipv6_native": false,
+          "ipv6_netmask_length": null,
+          "map_customer_owned_ip_on_launch": null,
+          "map_public_ip_on_launch": false,
+          "outpost_arn": null,
+          "region": "us-east-2",
+          "timeouts": null
+        },
+        "after_identity": {
+          "account_id": null,
+          "id": null,
+          "region": null
+        },
+        "after_sensitive": {
+          "tags": {},
+          "tags_all": {}
+        },
+        "after_unknown": {
+          "arn": true,
+          "availability_zone": true,
+          "availability_zone_id": true,
+          "id": true,
+          "ipv6_cidr_block": true,
+          "ipv6_cidr_block_association_id": true,
+          "owner_id": true,
+          "private_dns_hostname_type_on_launch": true,
+          "tags": true,
+          "tags_all": true,
+          "vpc_id": true
+        },
+        "before": null,
+        "before_sensitive": false
+      },
+      "index": 2,
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "public",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_subnet"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_subnet.relay[0]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "assign_ipv6_address_on_creation": false,
+          "cidr_block": "10.101.10.0/24",
+          "customer_owned_ipv4_pool": null,
+          "enable_dns64": false,
+          "enable_lni_at_device_index": null,
+          "enable_resource_name_dns_a_record_on_launch": false,
+          "enable_resource_name_dns_aaaa_record_on_launch": false,
+          "ipv4_ipam_pool_id": null,
+          "ipv4_netmask_length": null,
+          "ipv6_ipam_pool_id": null,
+          "ipv6_native": false,
+          "ipv6_netmask_length": null,
+          "map_customer_owned_ip_on_launch": null,
+          "map_public_ip_on_launch": false,
+          "outpost_arn": null,
+          "region": "us-east-2",
+          "timeouts": null
+        },
+        "after_identity": {
+          "account_id": null,
+          "id": null,
+          "region": null
+        },
+        "after_sensitive": {
+          "tags": {},
+          "tags_all": {}
+        },
+        "after_unknown": {
+          "arn": true,
+          "availability_zone": true,
+          "availability_zone_id": true,
+          "id": true,
+          "ipv6_cidr_block": true,
+          "ipv6_cidr_block_association_id": true,
+          "owner_id": true,
+          "private_dns_hostname_type_on_launch": true,
+          "tags": true,
+          "tags_all": true,
+          "vpc_id": true
+        },
+        "before": null,
+        "before_sensitive": false
+      },
+      "index": 0,
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "relay",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_subnet"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_subnet.relay[1]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "assign_ipv6_address_on_creation": false,
+          "cidr_block": "10.101.11.0/24",
+          "customer_owned_ipv4_pool": null,
+          "enable_dns64": false,
+          "enable_lni_at_device_index": null,
+          "enable_resource_name_dns_a_record_on_launch": false,
+          "enable_resource_name_dns_aaaa_record_on_launch": false,
+          "ipv4_ipam_pool_id": null,
+          "ipv4_netmask_length": null,
+          "ipv6_ipam_pool_id": null,
+          "ipv6_native": false,
+          "ipv6_netmask_length": null,
+          "map_customer_owned_ip_on_launch": null,
+          "map_public_ip_on_launch": false,
+          "outpost_arn": null,
+          "region": "us-east-2",
+          "timeouts": null
+        },
+        "after_identity": {
+          "account_id": null,
+          "id": null,
+          "region": null
+        },
+        "after_sensitive": {
+          "tags": {},
+          "tags_all": {}
+        },
+        "after_unknown": {
+          "arn": true,
+          "availability_zone": true,
+          "availability_zone_id": true,
+          "id": true,
+          "ipv6_cidr_block": true,
+          "ipv6_cidr_block_association_id": true,
+          "owner_id": true,
+          "private_dns_hostname_type_on_launch": true,
+          "tags": true,
+          "tags_all": true,
+          "vpc_id": true
+        },
+        "before": null,
+        "before_sensitive": false
+      },
+      "index": 1,
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "relay",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_subnet"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_subnet.relay[2]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "assign_ipv6_address_on_creation": false,
+          "cidr_block": "10.101.12.0/24",
+          "customer_owned_ipv4_pool": null,
+          "enable_dns64": false,
+          "enable_lni_at_device_index": null,
+          "enable_resource_name_dns_a_record_on_launch": false,
+          "enable_resource_name_dns_aaaa_record_on_launch": false,
+          "ipv4_ipam_pool_id": null,
+          "ipv4_netmask_length": null,
+          "ipv6_ipam_pool_id": null,
+          "ipv6_native": false,
+          "ipv6_netmask_length": null,
+          "map_customer_owned_ip_on_launch": null,
+          "map_public_ip_on_launch": false,
+          "outpost_arn": null,
+          "region": "us-east-2",
+          "timeouts": null
+        },
+        "after_identity": {
+          "account_id": null,
+          "id": null,
+          "region": null
+        },
+        "after_sensitive": {
+          "tags": {},
+          "tags_all": {}
+        },
+        "after_unknown": {
+          "arn": true,
+          "availability_zone": true,
+          "availability_zone_id": true,
+          "id": true,
+          "ipv6_cidr_block": true,
+          "ipv6_cidr_block_association_id": true,
+          "owner_id": true,
+          "private_dns_hostname_type_on_launch": true,
+          "tags": true,
+          "tags_all": true,
+          "vpc_id": true
+        },
+        "before": null,
+        "before_sensitive": false
+      },
+      "index": 2,
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "relay",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_subnet"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_vpc_endpoint.interface[\"ecr-api\"]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "private_dns_enabled": true
+        },
+        "after_unknown": {},
+        "before": null
+      },
+      "index": "ecr-api",
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "interface",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_vpc_endpoint"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_vpc_endpoint.interface[\"ecr-dkr\"]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "private_dns_enabled": true
+        },
+        "after_unknown": {},
+        "before": null
+      },
+      "index": "ecr-dkr",
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "interface",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_vpc_endpoint"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_vpc_endpoint.interface[\"guardduty-data\"]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "private_dns_enabled": true
+        },
+        "after_unknown": {},
+        "before": null
+      },
+      "index": "guardduty-data",
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "interface",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_vpc_endpoint"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_vpc_endpoint.interface[\"logs\"]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "private_dns_enabled": true
+        },
+        "after_unknown": {},
+        "before": null
+      },
+      "index": "logs",
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "interface",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_vpc_endpoint"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_vpc_endpoint.interface[\"monitoring\"]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "private_dns_enabled": true
+        },
+        "after_unknown": {},
+        "before": null
+      },
+      "index": "monitoring",
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "interface",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_vpc_endpoint"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_vpc_endpoint.interface[\"secretsmanager\"]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "private_dns_enabled": true
+        },
+        "after_unknown": {},
+        "before": null
+      },
+      "index": "secretsmanager",
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "interface",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_vpc_endpoint"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_vpc_endpoint.interface[\"ssm\"]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "private_dns_enabled": true
+        },
+        "after_unknown": {},
+        "before": null
+      },
+      "index": "ssm",
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "interface",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_vpc_endpoint"
+    },
+    {
+      "address": "module.nhp.module.relay_network[0].aws_vpc_endpoint.interface[\"ssmmessages\"]",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "after": {
+          "private_dns_enabled": true
+        },
+        "after_unknown": {},
+        "before": null
+      },
+      "index": "ssmmessages",
+      "mode": "managed",
+      "module_address": "module.nhp.module.relay_network[0]",
+      "name": "interface",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "type": "aws_vpc_endpoint"
+    }
+  ],
+  "terraform_version": "1.14.3"
+}

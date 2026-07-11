@@ -2101,6 +2101,16 @@ variable "deploy_relay" {
   description = "Deploy the NHP-Relay stack (autoscaling fleet + internet-facing ALB). Default off; prod stays dark until a dedicated enable PR. The fleet shares one keypair and authenticates by pubkey + relay.toml registration (not source IP) once the server runs DisableRelayPeerValidation=true (5c, #2627); baseline one instance per AZ. See #2629."
   type        = bool
   default     = false
+
+  # The committed plan/live contract is sandbox-specific. Comments and a false
+  # tfvars value are not an adequate security gate: without this validation a
+  # one-line prod flag flip would create the fleet and its Run Command IAM before
+  # a production plan checker existed. Remove this hard stop only in the PR that
+  # completes #3154 and wires the production saved-plan/live gates.
+  validation {
+    condition     = !var.deploy_relay
+    error_message = "Production relay enablement is blocked until #3154 adds and wires the production relay-DMZ plan/live contract."
+  }
 }
 
 # Keep canonical-key and ordering rules in lockstep with terraform/variables.tf,

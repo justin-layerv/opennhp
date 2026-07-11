@@ -89,6 +89,13 @@ Parameters using this pattern:
 - Auth0 backend credentials secret version - Auth0 provider returns empty `client_secret`
 - Dev portal management credentials secret version - same Auth0 provider limitation
 
+**Relay DMZ Terraform contract.** Before changing `modules/relay`, the root
+relay control-plane resources, relay networking, endpoint policies, IAM, or
+telemetry, inspect and update
+[`../.github/scripts/check-relay-dmz-plan.py`](../.github/scripts/check-relay-dmz-plan.py)
+and its mutation tests in the same PR. PR #3150 activates that checker against
+the sandbox plan; partial contract overrides are intentionally rejected.
+
 **Relay active-color routing guardrail (#2658).** Blue/green server colors are
 deploy slots inside one relay cell, not separate relay cells. Do not create
 blue/green `serverId` values or color-specific qURL bootstrap server keys as an
