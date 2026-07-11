@@ -1066,6 +1066,13 @@ QURL_IDLE_CONN_TIMEOUT=${qurl_idle_conn_timeout}
 QURL_V2_ADMISSION_ENABLED=true
 QURL_V2_ISSUER_TRUST_STORE=${qurl_v2_issuer_trust_store}
 %{ endif ~}
+%{ if agent_otp_registration_enabled ~}
+# Agent-registration email OTP (T1) — NHP-server QURL plugin side. Rendered only
+# when the plugin's agent-OTP registration path is enabled, so a dark env's
+# user_data is byte-unchanged (no fleet roll until the coordinated PATH B enable,
+# flipped in lockstep with qurl-service's QURL_AGENT_OTP_ENABLED).
+AGENT_OTP_REGISTRATION_ENABLED=true
+%{ endif ~}
 %{ endif ~}
 %{ if cloudfront_cidrs_ssm_parameter != null ~}
 NHP_TRUSTED_PROXY_CIDRS=$CF_CIDRS

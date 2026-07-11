@@ -991,6 +991,67 @@ variable "enable_qurl_agent_bootstrap" {
   default     = false
 }
 
+# ==================== Agent registration + email OTP (T1) ====================
+#
+# Two independent activation flags layered on top of the Wave-5 bootstrap chain,
+# both default-dark so an un-opted env (sandbox until burn-in, prod until launch)
+# provisions nothing new and its task defs / user_data are byte-unchanged:
+#   PATH A — agent_registration_enabled: qurl-service accepts the internal
+#     agent-register credential-exchange path (QURL_AGENT_REGISTRATION_ENABLED).
+#     qurl-service's boot Config.Validate requires the bootstrap chain enabled +
+#     a relay base URL when this is on, enforced here by preconditions on the
+#     qurl_service / compute module invocations.
+#   PATH B — agent_otp_enabled + agent_otp_registration_enabled: the email-OTP
+#     register flow, split across the two services. qurl-service (OTP_ENABLED)
+#     sends + verifies the OTP and requires registration + email_from + the pepper
+#     secret; the NHP-server QURL plugin (AGENT_OTP_REGISTRATION_ENABLED) accepts
+#     the OTP-registered agent. Both flip together.
+# The SES sender infra (agent_otp_ses.tf) and the pepper secret are gated on
+# agent_otp_enabled, so PATH B is the only flag that creates cloud resources.
+
+variable "agent_registration_enabled" {
+  description = "PATH A gate — QURL_AGENT_REGISTRATION_ENABLED on the qurl-service task def. Requires deploy_qurl_bootstrap_chain + enable_qurl_agent_bootstrap = true and a non-empty agent_registration_relay_base_url (enforced by a precondition on module.qurl_service). Default false."
+  type        = bool
+  default     = false
+}
+
+variable "agent_otp_enabled" {
+  description = "PATH B gate (qurl-service side) — QURL_AGENT_OTP_ENABLED on the qurl-service task def, AND the create-gate for the SES sender infra (agent_otp_ses.tf) + the QURL_AGENT_OTP_PEPPER secret. Requires agent_registration_enabled = true and a non-empty agent_otp_email_from (enforced by a precondition on module.qurl_service). Flip in lockstep with agent_otp_registration_enabled (NHP-server side). Default false → OTP path inert, SES creates nothing."
+  type        = bool
+  default     = false
+}
+
+variable "agent_otp_registration_enabled" {
+  description = "PATH B gate (NHP-server QURL plugin side) — AGENT_OTP_REGISTRATION_ENABLED, rendered into nhp-server user_data only when qurl_config.enabled. Flip in lockstep with agent_otp_enabled (qurl-service side); enabling only one side leaves the OTP register flow half-wired. Default false → user_data byte-unchanged."
+  type        = bool
+  default     = false
+}
+
+variable "agent_otp_email_from" {
+  description = "From address qurl-service stamps on OTP emails (QURL_AGENT_OTP_EMAIL_FROM), e.g. `noreply@notify.layerv.ai`. The root derives the SES sender domain from the part after `@` (agent_otp_ses.tf). Required (non-empty) when agent_otp_enabled = true; empty when the OTP path is dark. Do NOT set to an address whose domain is outside the Route53 zone this env manages (hosted_zone_id) — SES DKIM/MAIL-FROM records are written into that zone."
+  type        = string
+  default     = ""
+
+  validation {
+    # Empty (dark) or a bare local@domain addr-spec — the root splits on `@` to
+    # derive the SES identity domain, so a display name / angle brackets would
+    # break derivation. qurl-service boot config is the authoritative parser.
+    condition     = var.agent_otp_email_from == "" || can(regex("^[^@[:space:]]+@[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.agent_otp_email_from))
+    error_message = "agent_otp_email_from must be empty (OTP dark) or a bare local@domain address (no display name, angle brackets, or whitespace)."
+  }
+}
+
+variable "agent_registration_relay_base_url" {
+  description = "Base URL of the nhp relay the agent-register flow points clients at (QURL_NHP_RELAY_BASE_URL on the qurl-service task def). Required (non-empty https URL) when agent_registration_enabled = true. Empty when registration is dark."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.agent_registration_relay_base_url == "" || can(regex("^https://", var.agent_registration_relay_base_url))
+    error_message = "agent_registration_relay_base_url must be empty (registration dark) or an https:// URL."
+  }
+}
+
 variable "qurl_default_ac_port" {
   description = "Default AC port for new QURL resources"
   type        = number
@@ -2840,6 +2901,92 @@ variable "bootstrap_rate_limited_threshold_per_minute" {
   validation {
     condition     = var.bootstrap_rate_limited_threshold_per_minute >= 1 && var.bootstrap_rate_limited_threshold_per_minute <= 1000
     error_message = "bootstrap_rate_limited_threshold_per_minute must be 1 ≤ x ≤ 1000 (per `bootstrap_unauthorized_threshold_per_minute` rationale — floor catches the 0-trap, ceiling catches typo-class mistakes)."
+  }
+}
+
+# ── Agent registration + email OTP alarm thresholds (T1) ──
+# All feed alarms in `terraform/qurl_service_outcomes.tf` gated on
+# agent_registration_enabled / agent_otp_enabled, and all use
+# `GreaterThanThreshold` so a default of `N` fires at N+1/min. Same 1..1000
+# floor/ceiling rationale as the bootstrap thresholds above: floor 1 avoids
+# paging on a single legitimate event during a rollout/smoke window; ceiling
+# 1000 catches typo-class mistakes that would effectively disable the alarm
+# (agent-register + OTP traffic is sparse at steady state).
+
+variable "agent_otp_send_failed_threshold_per_minute" {
+  description = "Threshold for the `agent-otp-send-failed-spike` alarm (counts `agent_otp_completed` slog events whose `outcome=\"send_failed\"`). LAUNCH-BLOCKING: send_failed means SES rejected the OTP email — a silent wire failure the user never sees (they just never get a code). Default 0 so the alarm pages on the FIRST send failure (comparator GreaterThanThreshold → >0 = ≥1); a healthy SES sender never emits send_failed. Set low in prod."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.agent_otp_send_failed_threshold_per_minute >= 0 && var.agent_otp_send_failed_threshold_per_minute <= 1000
+    error_message = "agent_otp_send_failed_threshold_per_minute must be 0 ≤ x ≤ 1000. Floor 0 is intentional here (unlike the bootstrap thresholds): send_failed is a silent SES wire failure, so the first one must page. Ceiling 1000 catches typo-class mistakes."
+  }
+}
+
+variable "agent_otp_bounce_threshold_per_minute" {
+  description = "Threshold for the `agent-otp-bounce` alarm (SUM of AWS/SES `Bounce` + `Complaint` + `Reject` per minute on the `<name_prefix>-agent-otp` configuration set). LAUNCH-BLOCKING: these are ASYNC deliverability failures SES reports out-of-band on a message it ACCEPTED at send time — a hard bounce, spam complaint, or filter reject means the user silently never gets the code, the same failure class as send_failed but not caught by the synchronous send_failed alarm. Default 0 so the alarm pages on the FIRST async failure (GreaterThanThreshold → >0 = ≥1); a healthy verified sender emits none. Set low in prod."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.agent_otp_bounce_threshold_per_minute >= 0 && var.agent_otp_bounce_threshold_per_minute <= 1000
+    error_message = "agent_otp_bounce_threshold_per_minute must be 0 ≤ x ≤ 1000. Floor 0 is intentional (first async bounce/complaint/reject must page, like send_failed); ceiling 1000 catches typo-class mistakes."
+  }
+}
+
+variable "agent_otp_rate_limited_threshold_per_minute" {
+  description = "Threshold for the `agent-otp-rate-limited-spike` alarm (counts `agent_otp_completed` slog events whose `outcome=\"rate_limited\"`). A sustained OTP rate-limit spike implies an email-bombing / enumeration attempt against the register endpoint, or a client retry loop. Default 5 (fires at 6+/min sustained 3-of-5); tune in prod."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.agent_otp_rate_limited_threshold_per_minute >= 1 && var.agent_otp_rate_limited_threshold_per_minute <= 1000
+    error_message = "agent_otp_rate_limited_threshold_per_minute must be 1 ≤ x ≤ 1000 (floor catches the 0-trap, ceiling catches typo-class mistakes)."
+  }
+}
+
+variable "agent_register_attempts_exceeded_threshold_per_minute" {
+  description = "Threshold for the `agent-register-attempts-exceeded-spike` alarm (counts `agent_register_completed` slog events whose `outcome=\"attempts_exceeded\"`). BRUTE-FORCE signal: attempts_exceeded means a caller burned the per-credential attempt budget — a code/credential guessing attack. Default 3 (fires at 4+/min sustained 3-of-5); tune in prod."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.agent_register_attempts_exceeded_threshold_per_minute >= 1 && var.agent_register_attempts_exceeded_threshold_per_minute <= 1000
+    error_message = "agent_register_attempts_exceeded_threshold_per_minute must be 1 ≤ x ≤ 1000 (floor catches the 0-trap, ceiling catches typo-class mistakes)."
+  }
+}
+
+variable "agent_register_credential_invalid_threshold_per_minute" {
+  description = "Threshold for the `agent-register-credential-invalid-spike` alarm (counts `agent_register_completed` slog events whose `outcome=\"credential_invalid\"`). Lower-priority companion to attempts_exceeded: a clustered credential_invalid burst can be an early brute-force probe (before the attempt budget is hit) or a broken client sending malformed credentials. Default 10 (fires at 11+/min sustained 3-of-5) — deliberately higher than attempts_exceeded so it's the softer, secondary signal. Tune in prod."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.agent_register_credential_invalid_threshold_per_minute >= 1 && var.agent_register_credential_invalid_threshold_per_minute <= 1000
+    error_message = "agent_register_credential_invalid_threshold_per_minute must be 1 ≤ x ≤ 1000 (floor catches the 0-trap, ceiling catches typo-class mistakes)."
+  }
+}
+
+variable "agent_register_rate_limited_threshold_per_minute" {
+  description = "Threshold for the `agent-register-rate-limited-spike` alarm (counts `agent_register_completed` slog events whose `outcome=\"rate_limited\"`). A register rate-limit spike implies a client retry loop or an enumeration attempt against the credential-exchange path. Default 5 (fires at 6+/min sustained 3-of-5); tune in prod."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.agent_register_rate_limited_threshold_per_minute >= 1 && var.agent_register_rate_limited_threshold_per_minute <= 1000
+    error_message = "agent_register_rate_limited_threshold_per_minute must be 1 ≤ x ≤ 1000 (floor catches the 0-trap, ceiling catches typo-class mistakes)."
+  }
+}
+
+variable "relay_otp_reject_rate_limited_threshold_per_minute" {
+  description = "Threshold for the `relay-otp-reject-rate-limited` alarm (CloudWatch metric `OTPRejectRateLimited`, namespace `LayerV/NHP`, dim Environment=<env>, emitted from the shared OTP dispatch core in endpoints/server — both the direct-UDP and relayed OTP paths, so despite the relay-cap framing it is NOT relay-only). NOTE: the nhp-server publisher's base dim set is [Environment, Cell], so this alarm's {Environment}-only selection binds ONLY because the server dual-publishes an explicit [Environment]-only BASE stream on the shed path (IncrCounterExplicitDims, the RelayShed pattern) in addition to the [Environment, Cell] breakdown; if that base emit is removed the alarm silently stops binding (INSUFFICIENT_DATA + notBreaching = green). A reject means the fleet-wide GLOBAL 30/min OTP cap was hit and legitimate OTP sends are being shed. Default 0 → pages on the first reject (a healthy fleet under the 30/min cap never rejects), matching the first-event posture. The alarm is gated on `agent_otp_alarms_enabled || deploy_relay`, so with OTP enabled it IS created in prod even while the relay stays dark (the metric still emits on the direct path). Tune in prod once real OTP volume is known relative to the 30/min cap."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.relay_otp_reject_rate_limited_threshold_per_minute >= 0 && var.relay_otp_reject_rate_limited_threshold_per_minute <= 1000
+    error_message = "relay_otp_reject_rate_limited_threshold_per_minute must be 0 ≤ x ≤ 1000. Floor 0 is intentional (first-reject page, like the relay shed alarm); ceiling 1000 catches typo-class mistakes against the nhp-server's 30/min global OTP cap."
   }
 }
 

@@ -1356,3 +1356,65 @@ variable "qurl_v2_resource_key_protected_kms_arns" {
   type        = list(string)
   default     = []
 }
+
+# ==================== Agent registration + email OTP (T1) ====================
+#
+# Two independent flags with a dependency order enforced by qurl-service's own
+# boot-time Config.Validate (fail-closed), mirrored here in env-var emission so a
+# dark env's task def is byte-unchanged:
+#   OTP_ENABLED   ⇒ REGISTRATION_ENABLED + EMAIL_FROM + PEPPER
+#   REGISTRATION_ENABLED ⇒ bootstrap-enabled + a relay URL
+# The pepper is the only secret — it rides `container_secrets` (valueFrom the
+# Secrets Manager ARN), everything else is a plain env var.
+
+variable "agent_registration_enabled" {
+  description = "PATH A gate — drives QURL_AGENT_REGISTRATION_ENABLED on the qurl-service task def. When true qurl-service accepts the internal agent-register credential-exchange path. qurl-service's Config.Validate requires the agent bootstrap chain to be enabled and a relay base URL to be set when this is on; the root wires QURL_NHP_RELAY_BASE_URL alongside it. Default false leaves prod/any un-opted env byte-unchanged."
+  type        = bool
+  default     = false
+}
+
+variable "agent_otp_enabled" {
+  description = "PATH B gate — drives QURL_AGENT_OTP_ENABLED on the qurl-service task def. When true qurl-service serves the email-OTP register flow (send OTP via SES, then verify). qurl-service's Config.Validate requires agent_registration_enabled + a non-empty email_from + the pepper secret when this is on. Default false: the OTP path stays inert (and the SES infra at the root creates nothing) until flipped per-env."
+  type        = bool
+  default     = false
+}
+
+variable "agent_otp_email_from" {
+  description = "Envelope/From address qurl-service stamps on OTP emails (QURL_AGENT_OTP_EMAIL_FROM), e.g. `noreply@notify.layerv.ai`. The root derives the SES sender domain from this value. Required (non-empty) when agent_otp_enabled = true; leave empty when the OTP path is dark."
+  type        = string
+  default     = ""
+
+  validation {
+    # Empty (dark) or a bare RFC5322-ish addr-spec — no display name, no angle
+    # brackets, no whitespace — because the root's `split(\"@\", ...)` derives the
+    # SES identity domain from the part after the single `@`. qurl-service's boot
+    # config remains the authoritative parser; this only fences the shape the
+    # root's domain-derivation relies on.
+    condition     = var.agent_otp_email_from == "" || can(regex("^[^@[:space:]]+@[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.agent_otp_email_from))
+    error_message = "agent_otp_email_from must be empty (OTP dark) or a bare local@domain address (no display name, angle brackets, or whitespace) — the root derives the SES sender domain from the part after `@`."
+  }
+}
+
+variable "agent_otp_relay_base_url" {
+  description = "Base URL of the nhp relay the agent-register flow points clients at (QURL_NHP_RELAY_BASE_URL). Required (non-empty https URL) when agent_registration_enabled = true — qurl-service's Config.Validate rejects registration-on with no relay URL. Empty when registration is dark."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.agent_otp_relay_base_url == "" || can(regex("^https://", var.agent_otp_relay_base_url))
+    error_message = "agent_otp_relay_base_url must be empty (registration dark) or an https:// URL."
+  }
+}
+
+variable "agent_otp_pepper_secret_arn" {
+  description = "Secrets Manager ARN of the QURL_AGENT_OTP_PEPPER secret (32+ chars), created + seeded at the root and gated on agent_otp_enabled. Added to container_secrets (valueFrom) and to the execution role's GetSecretValue statement only when non-empty. Empty when the OTP path is dark → no secret is referenced and no IAM grant is added."
+  type        = string
+  default     = ""
+
+  validation {
+    # Empty (dark) or a Secrets Manager ARN — accepts commercial (aws), GovCloud
+    # (aws-us-gov), and China (aws-cn) partitions. Mirrors nhp_internal_auth_secret_arn.
+    condition     = var.agent_otp_pepper_secret_arn == "" || can(regex("^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]+:secret:.+$", var.agent_otp_pepper_secret_arn))
+    error_message = "agent_otp_pepper_secret_arn must be empty (OTP dark) or a valid Secrets Manager ARN."
+  }
+}

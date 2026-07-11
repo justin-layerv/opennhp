@@ -529,6 +529,128 @@ variable "enable_qurl_agent_bootstrap" {
   default     = false
 }
 
+# ── Agent registration + email OTP (T1) — pass-through to module "nhp" ──
+# See the root terraform/variables.tf for full rationale. PATH A (registration),
+# PATH B (OTP, split across qurl-service + nhp-server), email_from, relay URL, and
+# the alarm thresholds. All default dark so an env stays dark until tfvars opts in.
+
+variable "agent_registration_enabled" {
+  description = "PATH A gate — QURL_AGENT_REGISTRATION_ENABLED on qurl-service. Requires enable_qurl_agent_bootstrap + a relay URL (enforced at the root). Default false."
+  type        = bool
+  default     = false
+}
+
+variable "agent_otp_enabled" {
+  description = "PATH B gate (qurl-service side) — QURL_AGENT_OTP_ENABLED + the create-gate for SES infra + the pepper secret. Requires agent_registration_enabled + email_from + agent_otp_registration_enabled. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "agent_otp_registration_enabled" {
+  description = "PATH B gate (nhp-server QURL plugin side) — AGENT_OTP_REGISTRATION_ENABLED in user_data. Flip in lockstep with agent_otp_enabled. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "agent_otp_email_from" {
+  description = "From address for OTP emails (QURL_AGENT_OTP_EMAIL_FROM); the root derives the SES sender domain from it. Required when agent_otp_enabled. Empty when dark."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.agent_otp_email_from == "" || can(regex("^[^@[:space:]]+@[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.agent_otp_email_from))
+    error_message = "agent_otp_email_from must be empty (OTP dark) or a bare local@domain address (no display name, angle brackets, or whitespace)."
+  }
+}
+
+variable "agent_registration_relay_base_url" {
+  description = "Relay base URL the register flow advertises (QURL_NHP_RELAY_BASE_URL). Required (https) when agent_registration_enabled. Empty when dark."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.agent_registration_relay_base_url == "" || can(regex("^https://", var.agent_registration_relay_base_url))
+    error_message = "agent_registration_relay_base_url must be empty (registration dark) or an https:// URL."
+  }
+}
+
+variable "agent_otp_send_failed_threshold_per_minute" {
+  description = "Threshold for the agent-otp-send-failed-spike alarm (LAUNCH-BLOCKING; SES rejecting sends). Default 0 → page on first failure."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.agent_otp_send_failed_threshold_per_minute >= 0 && var.agent_otp_send_failed_threshold_per_minute <= 1000
+    error_message = "agent_otp_send_failed_threshold_per_minute must be 0 ≤ x ≤ 1000."
+  }
+}
+
+variable "agent_otp_bounce_threshold_per_minute" {
+  description = "Threshold for the agent-otp-bounce alarm (LAUNCH-BLOCKING; SUM of AWS/SES Bounce+Complaint+Reject on the OTP config set — async deliverability failures send_failed misses). Default 0 → page on first async failure."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.agent_otp_bounce_threshold_per_minute >= 0 && var.agent_otp_bounce_threshold_per_minute <= 1000
+    error_message = "agent_otp_bounce_threshold_per_minute must be 0 ≤ x ≤ 1000."
+  }
+}
+
+variable "agent_otp_rate_limited_threshold_per_minute" {
+  description = "Threshold for the agent-otp-rate-limited-spike alarm. Default 5."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.agent_otp_rate_limited_threshold_per_minute >= 1 && var.agent_otp_rate_limited_threshold_per_minute <= 1000
+    error_message = "agent_otp_rate_limited_threshold_per_minute must be 1 ≤ x ≤ 1000."
+  }
+}
+
+variable "agent_register_attempts_exceeded_threshold_per_minute" {
+  description = "Threshold for the agent-register-attempts-exceeded-spike alarm (brute-force). Default 3."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.agent_register_attempts_exceeded_threshold_per_minute >= 1 && var.agent_register_attempts_exceeded_threshold_per_minute <= 1000
+    error_message = "agent_register_attempts_exceeded_threshold_per_minute must be 1 ≤ x ≤ 1000."
+  }
+}
+
+variable "agent_register_credential_invalid_threshold_per_minute" {
+  description = "Threshold for the agent-register-credential-invalid-spike alarm (lower-priority brute-force companion). Default 10."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.agent_register_credential_invalid_threshold_per_minute >= 1 && var.agent_register_credential_invalid_threshold_per_minute <= 1000
+    error_message = "agent_register_credential_invalid_threshold_per_minute must be 1 ≤ x ≤ 1000."
+  }
+}
+
+variable "agent_register_rate_limited_threshold_per_minute" {
+  description = "Threshold for the agent-register-rate-limited-spike alarm. Default 5."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.agent_register_rate_limited_threshold_per_minute >= 1 && var.agent_register_rate_limited_threshold_per_minute <= 1000
+    error_message = "agent_register_rate_limited_threshold_per_minute must be 1 ≤ x ≤ 1000."
+  }
+}
+
+variable "relay_otp_reject_rate_limited_threshold_per_minute" {
+  description = "Threshold for the relay-otp-reject-rate-limited alarm (nhp-server global ~30/min OTP cap, fleet-wide; the metric emits from the shared OTP dispatch core so it spans the direct-UDP and relayed paths — the 'relay' name is legacy). Gated on agent_otp_alarms_enabled || deploy_relay, so it is created in prod with OTP on even while the relay stays dark. Default 0 → page on first reject."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.relay_otp_reject_rate_limited_threshold_per_minute >= 0 && var.relay_otp_reject_rate_limited_threshold_per_minute <= 1000
+    error_message = "relay_otp_reject_rate_limited_threshold_per_minute must be 0 ≤ x ≤ 1000."
+  }
+}
+
 variable "qurl_jwt_secret_arn" {
   description = "Secrets Manager ARN for QURL JWT signing secret"
   type        = string

@@ -123,6 +123,22 @@ module "nhp" {
   qurl_config                   = var.qurl_config
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
 
+  # Agent registration + email OTP (T1). Sandbox: DARK (all flags false / empty in
+  # terraform.tfvars). Thresholds still flow through so a future sandbox enable is
+  # a focused tfvars flip. With the flags off the root creates nothing.
+  agent_registration_enabled                             = var.agent_registration_enabled
+  agent_otp_enabled                                      = var.agent_otp_enabled
+  agent_otp_registration_enabled                         = var.agent_otp_registration_enabled
+  agent_otp_email_from                                   = var.agent_otp_email_from
+  agent_registration_relay_base_url                      = var.agent_registration_relay_base_url
+  agent_otp_send_failed_threshold_per_minute             = var.agent_otp_send_failed_threshold_per_minute
+  agent_otp_bounce_threshold_per_minute                  = var.agent_otp_bounce_threshold_per_minute
+  agent_otp_rate_limited_threshold_per_minute            = var.agent_otp_rate_limited_threshold_per_minute
+  agent_register_attempts_exceeded_threshold_per_minute  = var.agent_register_attempts_exceeded_threshold_per_minute
+  agent_register_credential_invalid_threshold_per_minute = var.agent_register_credential_invalid_threshold_per_minute
+  agent_register_rate_limited_threshold_per_minute       = var.agent_register_rate_limited_threshold_per_minute
+  relay_otp_reject_rate_limited_threshold_per_minute     = var.relay_otp_reject_rate_limited_threshold_per_minute
+
   # qURL v2 (keyed identity) — all default off; flip in tfvars to enable.
   qurl_v2_issuer_key_enabled                   = var.qurl_v2_issuer_key_enabled
   qurl_v2_resource_keys_enabled                = var.qurl_v2_resource_keys_enabled

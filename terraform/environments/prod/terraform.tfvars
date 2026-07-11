@@ -493,6 +493,87 @@ qurl_config = {
 qurl_service_token_secret_arn = "arn:aws:secretsmanager:us-east-2:235500187906:secret:layerv-nhp-prod/qurl-internal-service-token-ETbWzv"
 
 # ==============================================================================
+# Agent registration + email OTP (T1) — PROD: registration + OTP ON AT LAUNCH
+# ==============================================================================
+# PATH A (agent_registration_enabled) and PATH B (agent_otp_enabled +
+# agent_otp_registration_enabled) are both committed ON in prod for the launch.
+# ⚠️ This is a live-launch merge, NOT a dark launch — read the warning below.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ ⚠️  MERGE = PROD LAUNCH.  READ BEFORE MERGING THIS PR.                      │
+# └──────────────────────────────────────────────────────────────────────────┘
+# These three flags are committed `true` by an EXPLICIT decision — this is NOT a
+# dark launch, and they are deliberately NOT defaulted `false`. The FIRST prod
+# `terraform apply` after this PR merges — INCLUDING an apply triggered by an
+# UNRELATED change (e.g. a routine image bump) — activates BOTH enrollment paths
+# in one shot: NHP agent registration AND OTP email sending via SES to the
+# `notify.layerv.ai` sender domain (real emails to real users). There is no
+# second "flip" step; merging + the next apply IS the go-live.
+#
+# Therefore MERGE THIS PR ONLY inside the launch window, and ONLY after ALL of
+# the following are confirmed (this human gate is the real safety net):
+#   1. SES PRODUCTION ACCESS granted for the sender domain (out of the SES
+#      sandbox) — otherwise every OTP send fails closed.
+#   2. DKIM + MAIL-FROM DNS records VERIFIED for notify.layerv.ai (SES shows the
+#      domain Verified, DKIM Successful, MAIL FROM MX resolving).
+#   3. The OTP pepper secret (${name_prefix}-agent-otp-pepper) SEEDED (≥32 chars).
+#   4. relay.layerv.ai REACHABLE if/when deploy_relay flips (prod keeps it false
+#      today; the register flow advertises this URL to clients regardless).
+#   5. An OPERATOR STANDING BY to watch the launch-blocking alarms on first real
+#      traffic: -agent-otp-send-failed-spike and -agent-otp-bounce (both page at
+#      the first failure — a misconfigured sender surfaces here first).
+#
+# Terraform preconditions (main.tf) only check flag COHERENCE (registration ⇒
+# bootstrap chain + relay URL; OTP ⇒ registration + email_from + both PATH B
+# flags). They CANNOT verify SES production access or DNS propagation — so a plan/
+# apply will happily succeed against an unverified sender. Do not rely on TF to
+# catch a premature launch; rely on the checklist above. Full staged procedure:
+# docs/runbooks/prod-rollout-ledger/2026-07-08-agent-registration-ses.md.
+#
+# The flip injects QURL_AGENT_REGISTRATION_ENABLED / QURL_AGENT_OTP_ENABLED /
+# QURL_AGENT_OTP_EMAIL_FROM / QURL_NHP_RELAY_BASE_URL + QURL_AGENT_OTP_PEPPER on
+# the qurl-service task def, renders AGENT_OTP_REGISTRATION_ENABLED into nhp-server
+# user_data (a ~20-min fleet blue/green roll), and CREATES the SES identity +
+# DKIM/MAIL-FROM DNS + config set + the pepper secret (agent_otp_ses.tf).
+agent_registration_enabled     = true
+agent_otp_enabled              = true
+agent_otp_registration_enabled = true
+
+# From address for OTP emails. The SES sender domain is derived from the part
+# after `@` (here: notify.layerv.ai), and DKIM + MAIL FROM records land in the
+# layerv.ai zone (hosted_zone_id = Z0748438C8EK6UAW94ST, cross-account layerv-mgmt).
+# This IS the intended launch value (committed by the keep-true decision). SES
+# production access + DKIM/MAIL-FROM verification for THIS domain are pre-merge
+# checklist items in the ⚠️ warning above — a live apply mails from here for real.
+agent_otp_email_from = "noreply@notify.layerv.ai"
+
+# Relay base URL the agent-register flow points clients at (QURL_NHP_RELAY_BASE_URL).
+# NOTE: prod keeps deploy_relay=false (the relay is dark until its dedicated
+# prod-enable PR), so this is the PUBLIC relay origin the register flow advertises,
+# not a module reference. This IS the intended launch value (committed by the
+# keep-true decision); relay.layerv.ai reachability is a pre-merge checklist item
+# in the ⚠️ warning above. (If registration must not go live until the relay is up,
+# coordinate this flip with deploy_relay in the same rollout window.)
+agent_registration_relay_base_url = "https://relay.layerv.ai"
+
+# Agent-registration + OTP alarm thresholds (qurl_service_outcomes.tf). Defaults
+# are sensible for launch; set explicitly here so prod values are auditable and
+# the send_failed / relay-shed pages are pinned at first-event.
+agent_otp_send_failed_threshold_per_minute             = 0 # LAUNCH-BLOCKING: page on the first SES send failure
+agent_otp_bounce_threshold_per_minute                  = 0 # LAUNCH-BLOCKING: page on the first SES bounce/complaint/reject
+agent_otp_rate_limited_threshold_per_minute            = 5
+agent_register_attempts_exceeded_threshold_per_minute  = 3
+agent_register_credential_invalid_threshold_per_minute = 10
+agent_register_rate_limited_threshold_per_minute       = 5
+# OTP-shed alarm (OTPRejectRateLimited) is gated on agent_otp_enabled OR
+# deploy_relay, so with OTP on it IS created in prod even though the relay is dark
+# (deploy_relay=false) — the metric is emitted on the direct-UDP OTP path
+# regardless of the relay. Threshold pinned to 0 here (matching the default) so the
+# launch value is explicit/auditable: the first OTP-cap reject pages, whether it
+# comes via the direct path today or the relay once it goes live.
+relay_otp_reject_rate_limited_threshold_per_minute = 0
+
+# ==============================================================================
 # Observability (Phase 2)
 # ==============================================================================
 

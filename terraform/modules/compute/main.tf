@@ -879,6 +879,10 @@ locals {
     # plugin's LoadConfig base64-decodes it. Mirrors NHP_COOKIE_KEYS in this template.
     qurl_v2_admission_enabled  = var.qurl_v2_admission_enabled
     qurl_v2_issuer_trust_store = base64encode(var.qurl_v2_issuer_trust_store)
+    # Agent-registration email OTP (T1). Bool gate; rendered inside the qurl_enabled
+    # block below. Off env's user_data is byte-unchanged (no fleet roll until the
+    # coordinated PATH B enable with qurl-service's QURL_AGENT_OTP_ENABLED).
+    agent_otp_registration_enabled = var.agent_otp_registration_enabled
     # Blue/Green deployment configuration
     enable_blue_green = var.enable_blue_green
     # Cookie signing secret (shared across all instances)

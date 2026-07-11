@@ -2247,6 +2247,44 @@ resource "aws_iam_policy" "terraform_apply_services" {
         Resource = "*"
       },
       {
+        # Agent-registration email OTP (T1). The apply role needs SES v2
+        # create/update/delete on the sender identity, its MAIL FROM
+        # attributes, and the configuration set + event destination
+        # (terraform/agent_otp_ses.tf), plus the read verbs terraform plan's
+        # refresh calls. Resource = "*": SES email-identity / configuration-set
+        # APIs are account/region-scoped and several (GetEmailIdentity,
+        # PutConfigurationSet*) don't accept a resource ARN, matching the
+        # "*"-scoped service-management statements above (EFS, ServiceDiscovery,
+        # Chatbot). Without this the SES resources apply green at PR (read-only
+        # plan role) but fail post-merge apply with AccessDenied — the #2996
+        # class this repo's IAM-coverage lint guards. All resources are gated on
+        # agent_otp_enabled, so a dark env's apply never exercises these.
+        Sid    = "SESAgentOTP"
+        Effect = "Allow"
+        Action = [
+          "ses:CreateEmailIdentity",
+          "ses:DeleteEmailIdentity",
+          "ses:GetEmailIdentity",
+          "ses:PutEmailIdentityDkimSigningAttributes",
+          "ses:PutEmailIdentityMailFromAttributes",
+          "ses:PutEmailIdentityConfigurationSetAttributes",
+          "ses:CreateConfigurationSet",
+          "ses:DeleteConfigurationSet",
+          "ses:GetConfigurationSet",
+          "ses:PutConfigurationSetDeliveryOptions",
+          "ses:PutConfigurationSetReputationOptions",
+          "ses:PutConfigurationSetSendingOptions",
+          "ses:CreateConfigurationSetEventDestination",
+          "ses:UpdateConfigurationSetEventDestination",
+          "ses:DeleteConfigurationSetEventDestination",
+          "ses:GetConfigurationSetEventDestinations",
+          "ses:TagResource",
+          "ses:UntagResource",
+          "ses:ListTagsForResource"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "EFS"
         Effect = "Allow"
         Action = [

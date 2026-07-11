@@ -273,6 +273,60 @@ RESOURCE_ACTIONS: dict[str, ActionSpec] = {
         "cloudwatch:GetDashboard",
         "cloudwatch:DeleteDashboards",
     ],
+    # Agent-registration email OTP (T1), terraform/agent_otp_ses.tf.
+    # internal/service/sesv2/email_identity.go — CreateEmailIdentity on create,
+    # GetEmailIdentity on read, DeleteEmailIdentity on destroy,
+    # PutEmailIdentityDkimSigningAttributes on the EasyDKIM key-length update,
+    # PutEmailIdentityConfigurationSetAttributes to associate/alter the
+    # configuration_set_name on the identity (a clean create may ride
+    # CreateEmailIdentity, but a later config-set change issues this Put), plus
+    # the tag trio (TagResource/UntagResource/ListTagsForResource) via
+    # default_tags. Matches the "SESAgentOTP" statement added to the
+    # github_actions apply role in modules/ecr/main.tf.
+    "aws_sesv2_email_identity": [
+        "ses:CreateEmailIdentity",
+        "ses:GetEmailIdentity",
+        "ses:DeleteEmailIdentity",
+        "ses:PutEmailIdentityDkimSigningAttributes",
+        "ses:PutEmailIdentityConfigurationSetAttributes",
+        "ses:TagResource",
+        "ses:UntagResource",
+        "ses:ListTagsForResource",
+    ],
+    # internal/service/sesv2/email_identity_mail_from_attributes.go —
+    # PutEmailIdentityMailFromAttributes on create/update AND destroy (destroy
+    # resets the MAIL FROM to the default), GetEmailIdentity on read. Not
+    # separately taggable (attributes of the identity).
+    "aws_sesv2_email_identity_mail_from_attributes": [
+        "ses:PutEmailIdentityMailFromAttributes",
+        "ses:GetEmailIdentity",
+    ],
+    # internal/service/sesv2/configuration_set.go — CreateConfigurationSet on
+    # create, GetConfigurationSet on read, DeleteConfigurationSet on destroy,
+    # the three Put*Options calls the update path issues (delivery/reputation/
+    # sending), plus the tag trio via default_tags.
+    "aws_sesv2_configuration_set": [
+        "ses:CreateConfigurationSet",
+        "ses:GetConfigurationSet",
+        "ses:DeleteConfigurationSet",
+        "ses:PutConfigurationSetDeliveryOptions",
+        "ses:PutConfigurationSetReputationOptions",
+        "ses:PutConfigurationSetSendingOptions",
+        "ses:TagResource",
+        "ses:UntagResource",
+        "ses:ListTagsForResource",
+    ],
+    # internal/service/sesv2/configuration_set_event_destination.go —
+    # CreateConfigurationSetEventDestination on create,
+    # UpdateConfigurationSetEventDestination on update,
+    # DeleteConfigurationSetEventDestination on destroy,
+    # GetConfigurationSetEventDestinations on read. Not separately taggable.
+    "aws_sesv2_configuration_set_event_destination": [
+        "ses:CreateConfigurationSetEventDestination",
+        "ses:UpdateConfigurationSetEventDestination",
+        "ses:DeleteConfigurationSetEventDestination",
+        "ses:GetConfigurationSetEventDestinations",
+    ],
 }
 
 # Grandfathered resource types: present in `terraform/` when resource-create

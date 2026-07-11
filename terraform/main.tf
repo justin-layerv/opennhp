@@ -197,6 +197,83 @@ resource "terraform_data" "qurl_bootstrap_activation_preconditions" {
   }
 }
 
+# ── Agent registration + email OTP flag coherence (T1) ──
+# Mirror qurl-service's boot-time Config.Validate (fail-closed) at plan time so a
+# half-wired activation surfaces as a plan error, not a crash-looping task or a
+# silently-inert flag. PATH A (registration) has no cloud-resource side effect;
+# PATH B (OTP) is the flag that creates the SES infra + pepper secret, so getting
+# its preconditions right before apply is what keeps a dark env dark.
+resource "terraform_data" "agent_registration_preconditions" {
+  count = var.agent_registration_enabled ? 1 : 0
+
+  lifecycle {
+    # REGISTRATION ⇒ bootstrap chain enabled. qurl-service refuses to boot with
+    # registration on but the bootstrap chain off (no server identity to bind the
+    # registered agent to). enable_qurl_agent_bootstrap ⇒ deploy_qurl_bootstrap_chain
+    # is already enforced above, so requiring the activation flag transitively
+    # requires the structural gate too.
+    precondition {
+      condition     = var.enable_qurl_agent_bootstrap
+      error_message = "agent_registration_enabled=true requires enable_qurl_agent_bootstrap=true (and thus deploy_qurl_bootstrap_chain=true). qurl-service's Config.Validate rejects agent registration with the bootstrap chain off — there is no server identity to bind a registered agent to. Enable the bootstrap chain in the same apply."
+    }
+    # REGISTRATION ⇒ relay URL. QURL_NHP_RELAY_BASE_URL must be set so the
+    # register flow can point clients at the relay. Empty → qurl-service boot fails.
+    precondition {
+      condition     = var.agent_registration_relay_base_url != ""
+      error_message = "agent_registration_enabled=true requires a non-empty agent_registration_relay_base_url (https URL). It becomes QURL_NHP_RELAY_BASE_URL on the qurl-service task def; qurl-service's Config.Validate rejects registration-on with no relay URL."
+    }
+  }
+}
+
+resource "terraform_data" "agent_otp_preconditions" {
+  count = var.agent_otp_enabled ? 1 : 0
+
+  lifecycle {
+    # OTP ⇒ REGISTRATION. The email-OTP flow layers on the register path.
+    precondition {
+      condition     = var.agent_registration_enabled
+      error_message = "agent_otp_enabled=true requires agent_registration_enabled=true. The email-OTP register flow (QURL_AGENT_OTP_ENABLED) is a layer on the agent-register credential exchange (QURL_AGENT_REGISTRATION_ENABLED); qurl-service's Config.Validate rejects OTP-on without registration-on."
+    }
+    # OTP ⇒ EMAIL_FROM. Required for the SES sender identity + QURL_AGENT_OTP_EMAIL_FROM.
+    precondition {
+      condition     = var.agent_otp_email_from != ""
+      error_message = "agent_otp_enabled=true requires a non-empty agent_otp_email_from. It sets QURL_AGENT_OTP_EMAIL_FROM and the root derives the SES sender domain from it (agent_otp_ses.tf); qurl-service's Config.Validate rejects OTP-on with no from-address."
+    }
+    # OTP ⇒ both sides flip together. Enabling the qurl-service side without the
+    # NHP-server plugin side (or vice-versa) leaves the OTP register flow
+    # half-wired — the plugin would reject OTP-registered agents, or qurl-service
+    # would send OTPs the plugin won't honor.
+    precondition {
+      condition     = var.agent_otp_registration_enabled
+      error_message = "agent_otp_enabled=true (qurl-service side) requires agent_otp_registration_enabled=true (NHP-server QURL plugin side). Flip both PATH B flags in the same apply; enabling one side alone leaves the OTP register flow half-wired."
+    }
+  }
+}
+
+# Inverse: the NHP-server plugin side flipped without the qurl-service side. The
+# plugin would accept OTP-registered agents that qurl-service never mints.
+resource "terraform_data" "agent_otp_registration_plugin_preconditions" {
+  count = var.agent_otp_registration_enabled ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.agent_otp_enabled
+      error_message = "agent_otp_registration_enabled=true (NHP-server QURL plugin side) requires agent_otp_enabled=true (qurl-service side). The plugin's AGENT_OTP_REGISTRATION_ENABLED accepts OTP-registered agents, but with the qurl-service OTP path off no agent is ever OTP-registered — flip both PATH B flags together."
+    }
+    # PLUGIN-ON. AGENT_OTP_REGISTRATION_ENABLED is only rendered into nhp-server
+    # user_data INSIDE the `qurl_enabled` block (modules/compute/user_data.sh.tpl,
+    # where the compute module sets qurl_enabled = qurl_config != null &&
+    # qurl_config.enabled). With the QURL plugin off, the flag silently drops from
+    # user_data while qurl-service still mints OTP-registered agents the plugin
+    # would never honor — the half-wired trap this precondition closes. Mirror the
+    # compute module's exact qurl_enabled expression so the gate matches the render.
+    precondition {
+      condition     = var.qurl_config != null && var.qurl_config.enabled
+      error_message = "agent_otp_registration_enabled=true requires the NHP-server QURL plugin to be ON (qurl_config != null && qurl_config.enabled). AGENT_OTP_REGISTRATION_ENABLED is only rendered into nhp-server user_data inside the qurl_enabled block, so with the plugin off the flag silently drops while qurl-service still mints OTP-registered agents the plugin never honors. Enable qurl_config in the same apply."
+    }
+  }
+}
+
 # ==================== Locals ====================
 
 locals {
@@ -720,6 +797,11 @@ module "compute" {
   # above from the issuer KMS key; both are the "off" shape until enabled.
   qurl_v2_admission_enabled  = var.qurl_v2_admission_enabled
   qurl_v2_issuer_trust_store = local.qurl_v2_issuer_trust_store
+
+  # Agent-registration email OTP (T1) — NHP-server QURL plugin side. Flipped in
+  # lockstep with qurl-service's QURL_AGENT_OTP_ENABLED (PATH B). Default false
+  # keeps a dark env's user_data byte-unchanged.
+  agent_otp_registration_enabled = var.agent_otp_registration_enabled
 
   # Shared HMAC secret; seed ordering enforced via depends_on below.
   nhp_internal_auth_secret_arn = aws_secretsmanager_secret.nhp_internal_auth.arn
@@ -2779,6 +2861,22 @@ module "qurl_service" {
     ? "https://${var.relay_dns_name}"
     : ""
   )
+
+  # ── Agent registration + email OTP (T1) ──
+  # PATH A (registration) and PATH B (email OTP) flags flow env→module. The
+  # pepper secret ARN is passed only when OTP is enabled — the secret is created
+  # + seeded below (aws_secretsmanager_secret.agent_otp_pepper, in
+  # agent_otp_ses.tf) gated on the same flag, so a dark env references nothing.
+  # Plan-time preconditions on this module invocation (below) enforce the same
+  # dependency order qurl-service's boot Config.Validate does:
+  #   registration ⇒ bootstrap chain enabled + relay URL;
+  #   OTP ⇒ registration + email_from + pepper.
+  agent_registration_enabled  = var.agent_registration_enabled
+  agent_otp_enabled           = var.agent_otp_enabled
+  agent_otp_email_from        = var.agent_otp_email_from
+  agent_otp_relay_base_url    = var.agent_registration_relay_base_url
+  agent_otp_pepper_secret_arn = var.agent_otp_enabled ? aws_secretsmanager_secret.agent_otp_pepper[0].arn : ""
+
   # nhp_server_port is intentionally NOT threaded from a root variable.
   # The port is a code-level constant (62206) hardcoded in three places —
   # `modules/compute/main.tf` (UDP TG), `modules/ac/main.tf` (AC

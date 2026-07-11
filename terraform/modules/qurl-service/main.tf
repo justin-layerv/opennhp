@@ -213,6 +213,12 @@ resource "aws_ssm_parameter" "default_ac_id" {
 locals {
   is_prod      = var.environment == "prod"
   service_name = "${var.name_prefix}-${var.cell_id}-qurl-api"
+
+  # Agent-OTP SES sender domain, derived from the From address (noreply@<domain>
+  # → <domain>) — the SES identity is a DOMAIN identity, so ses:SendEmail scopes to
+  # identity/<domain>. Empty-safe: when the OTP path is dark agent_otp_email_from
+  # is "" and this local is "" (the SES send policy is count=0 anyway).
+  agent_otp_sender_domain = var.agent_otp_email_from != "" ? split("@", var.agent_otp_email_from)[1] : ""
   # The root wires this to the cell-wide alerts topic and the module uses it for
   # every qurl-service alarm surface (qurl-api, scanner Lambda,
   # resource-lifecycle queue).
@@ -551,18 +557,51 @@ locals {
       { name = "QURL_V2_ISSUANCE_ENABLED", value = "true" },
       { name = "QURL_V2_RELAY_URL", value = var.qurl_v2_relay_url },
     ] : [],
+
+    # ==================== Agent registration + email OTP (T1) ====================
+    # Two flag-gated blocks with a dependency order matched to qurl-service's
+    # boot-time Config.Validate (fail-closed), so a dark env's task def is
+    # byte-identical to today:
+    #   REGISTRATION_ENABLED ⇒ bootstrap-enabled (QURL_AGENT_BOOTSTRAP_ENABLED,
+    #     emitted by the deploy_qurl_bootstrap_chain block above) + a relay URL.
+    #   OTP_ENABLED          ⇒ REGISTRATION_ENABLED + EMAIL_FROM + PEPPER (secret,
+    #     in container_secrets below).
+    # PATH A (registration) can be flipped on alone for the internal
+    # credential-exchange smoke; PATH B (OTP) layers the email flow on top. The
+    # pepper is the only secret and rides container_secrets — everything here is
+    # a plain env var. Emitting REGISTRATION_ENABLED and the relay URL together
+    # keeps the root from having to reason about the two vars separately: the
+    # root's precondition (see main.tf) fails plan if registration is on without
+    # a relay URL, matching the qurl-service validator.
+    var.agent_registration_enabled ? [
+      { name = "QURL_AGENT_REGISTRATION_ENABLED", value = "true" },
+      { name = "QURL_NHP_RELAY_BASE_URL", value = var.agent_otp_relay_base_url },
+    ] : [],
+    var.agent_otp_enabled ? [
+      { name = "QURL_AGENT_OTP_ENABLED", value = "true" },
+      { name = "QURL_AGENT_OTP_EMAIL_FROM", value = var.agent_otp_email_from },
+    ] : [],
   )
 
   # Secrets and SSM parameters resolved by ECS at task launch time.
   # Despite the field name, ECS "secrets" supports both Secrets Manager ARNs
   # and SSM Parameter Store ARNs — it's the mechanism for dynamic value resolution.
-  container_secrets = [
+  container_secrets = concat([
     { name = "QURL_JWT_SECRET", valueFrom = var.jwt_secret_arn },
     { name = "QURL_INTERNAL_SERVICE_TOKEN", valueFrom = var.internal_service_token_arn },
     { name = "QURL_AC_ID", valueFrom = aws_ssm_parameter.default_ac_id.arn },
     # Shared HMAC secret — signer side of the /nhp/internal/knock contract with nhp-server.
     { name = "NHP_INTERNAL_AUTH_SECRET", valueFrom = var.nhp_internal_auth_secret_arn },
-  ]
+    ],
+    # Agent OTP pepper (T1). valueFrom the Secrets Manager ARN the root creates +
+    # seeds; ECS resolves it at task launch. Gated on a non-empty ARN so a dark
+    # env references no secret and the execution role gains no GetSecretValue grant
+    # for it (see aws_iam_role_policy.execution_secrets below). The ARN is passed
+    # only when agent_otp_enabled = true at the root.
+    var.agent_otp_pepper_secret_arn != "" ? [
+      { name = "QURL_AGENT_OTP_PEPPER", valueFrom = var.agent_otp_pepper_secret_arn },
+    ] : [],
+  )
 }
 
 # ==================== CloudWatch Log Group ====================
@@ -642,7 +681,10 @@ resource "aws_iam_role_policy" "execution_secrets" {
             var.nhp_internal_auth_secret_arn,
           ],
           # Add Grafana Cloud secret when ADOT sidecar is enabled
-          var.grafana_cloud_enabled && var.grafana_secret_arn != null ? [var.grafana_secret_arn] : []
+          var.grafana_cloud_enabled && var.grafana_secret_arn != null ? [var.grafana_secret_arn] : [],
+          # Agent OTP pepper (T1) — only when the OTP path is enabled (root passes
+          # a non-empty ARN). Off → no grant, mirroring container_secrets above.
+          var.agent_otp_pepper_secret_arn != "" ? [var.agent_otp_pepper_secret_arn] : []
         )
       },
       {
@@ -987,6 +1029,43 @@ resource "aws_iam_role_policy" "task_stripe_secret" {
         Action   = ["kms:Decrypt"]
         Resource = [var.secrets_kms_key_arn]
     }] : [])
+  })
+}
+
+# Agent-registration email OTP (T1): the RUNTIME grant that lets the qurl-service
+# TASK role actually send OTP mail. The APPLY role (modules/ecr SESAgentOTP) only
+# manages the SES identity/config-set; the EXECUTION role only reads the pepper
+# secret — neither lets the running container call SES. Without this, the first
+# real OTP SendEmail returns AccessDenied → outcome=send_failed → the
+# launch-blocking -agent-otp-send-failed-spike page fires on go-live.
+#
+# ses:SendEmail ONLY (no ses:SendRawEmail): the Q1 sender (qurl-service
+# internal/email/ses_sender.go) uses the SES v2 SendEmail API with a Simple
+# (non-raw) message — v2 SendEmail authorizes under the ses:SendEmail action.
+#
+# Gated on agent_otp_enabled (count) so a DARK env gets NO SES grant, matching the
+# dark-launch discipline of every other agent-OTP resource. Scoped to the sender
+# DOMAIN identity (identity/<domain>, mirroring modules/billing + modules/auth0),
+# NOT Resource="*", and further constrained by a ses:FromAddress condition to the
+# configured sender so the role can only send AS that address.
+resource "aws_iam_role_policy" "task_agent_otp_ses" {
+  count = var.agent_otp_enabled ? 1 : 0
+  name  = "agent-otp-ses-send"
+  role  = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "AgentOTPSendEmail"
+      Effect   = "Allow"
+      Action   = ["ses:SendEmail"]
+      Resource = ["arn:aws:ses:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:identity/${local.agent_otp_sender_domain}"]
+      Condition = {
+        "StringEquals" = {
+          "ses:FromAddress" = var.agent_otp_email_from
+        }
+      }
+    }]
   })
 }
 

@@ -474,6 +474,18 @@ variable "qurl_v2_issuer_trust_store" {
   default     = "{}"
 }
 
+# Agent-registration email OTP (T1) — NHP-server QURL plugin side. Drives the
+# AGENT_OTP_REGISTRATION_ENABLED env var. The user_data template renders it only
+# inside the `qurl_enabled` block, so an env with the plugin off never emits it.
+# Default false keeps a dark env's user_data byte-unchanged (no fleet roll until
+# the coordinated PATH B enable, flipped in lockstep with qurl-service's
+# QURL_AGENT_OTP_ENABLED).
+variable "agent_otp_registration_enabled" {
+  description = "Enable the NHP-server QURL plugin's agent-OTP registration path (AGENT_OTP_REGISTRATION_ENABLED). Rendered only when qurl_config.enabled is true. Default false → user_data byte-unchanged."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_service_token_secret_arn" {
   description = "ARN of Secrets Manager secret containing the QURL service token for API authentication"
   type        = string

@@ -645,6 +645,33 @@ qurl_v2_relay_allowlist             = "relay.qurl.link.layerv.xyz"
 qurl_service_token_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token-XgjoDM"
 
 # ==============================================================================
+# Agent registration + email OTP (T1) — SANDBOX: DARK
+# ==============================================================================
+# Intentionally dark for the SES / agent-register surface: both PATHs off,
+# email_from/relay empty. With these flags false the qurl-service task def and
+# nhp-server user_data are byte-unchanged, the SES sender infra (agent_otp_ses.tf)
+# and the QURL_AGENT_OTP_PEPPER secret are NOT created, and the slog-based
+# agent-register/OTP alarms (gated on agent_registration_enabled/agent_otp_enabled)
+# are NOT provisioned. Sandbox opts into the SES/register surface only after prod
+# launch burn-in (mirrors the Wave-5 bootstrap-chain posture — sandbox led there;
+# here prod leads and sandbox stays dark until validated).
+#
+# ONE EXCEPTION — the OTP-shed alarm IS created in sandbox: agent-relay-otp-reject-
+# rate-limited gates on `agent_otp_alarms_enabled || var.deploy_relay`, and sandbox
+# runs the relay (deploy_relay = true below), so it arms (threshold 0, 1-of-1,
+# first-reject page → sandbox SNS). That is deliberate: OTPRejectRateLimited is
+# emitted by EVERY nhp-server from the shared OTP dispatch core (not just when the
+# SES path is on), so a sandbox relay load test that trips the ~30/min global OTP
+# cap SHOULD page. Do not read "sandbox is dark" as "sandbox provisions nothing" —
+# it is dark for the SES/register surface, but this one relay-side alarm still arms.
+# Left explicit (not relying on defaults) so the dark posture reads as deliberate.
+agent_registration_enabled        = false
+agent_otp_enabled                 = false
+agent_otp_registration_enabled    = false
+agent_otp_email_from              = ""
+agent_registration_relay_base_url = ""
+
+# ==============================================================================
 # QURL Link Redirect Page
 # Hosts the redirect page that extracts tokens and sends users to NHP Server
 # ==============================================================================
