@@ -1661,9 +1661,9 @@ jobs:
         run: python3 ./.github/scripts/check-terraform-iam-coverage.py
 
       - name: Run terraform IAM coverage unit tests (#2996 resource internals)
-        # Covers the resource-coverage internals the exit-code fixtures
-        # can't reach: the body-aware RESOURCE_ACTIONS callable dispatch
-        # and the RESOURCE_ACTIONS/RESOURCE_UNCHECKED_ACK overlap guard.
+        # Covers internals the exit-code fixtures can't reach: the body-aware
+        # RESOURCE_ACTIONS callable dispatch, the map-overlap guard, and the
+        # canonical role's managed-policy attachment quota calculation.
         run: python3 ./tests/scripts/test_check_terraform_iam_coverage.py
 
       - name: Check terraform policy-condition denylist (#1316 regression fence)

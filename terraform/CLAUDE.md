@@ -53,6 +53,18 @@ changes the AWS-matchable `sub` to `repo:ORG/REPO:environment:NAME`. Prod-only
 Terraform PRs should skip the sandbox plan and rely on prod validation rather
 than being blocked by unrelated sandbox state.
 
+## GitHub Actions Apply-Role IAM Quotas
+
+The shared `modules/ecr` GitHub Actions apply role currently declares a
+worst-case 9 of AWS's default 10 managed-policy attachments. The IAM coverage
+lint counts all conditional bindings as enabled and fails above
+`GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT`; this conservative union is
+deliberate because the module serves every environment. Filling slot 10
+exhausts the default runway. Before adding any subsequent managed-policy
+attachment, either consolidate existing grants or raise the IAM quota in every
+environment account and update the lint limit in the same change. Do not bump
+the code constant based on only one account's quota.
+
 ## State Drift Protection for CI/CD-Managed Values
 
 Some SSM parameters are created by Terraform but updated by CI/CD (e.g., image tags, blue/green deployment state). These use `lifecycle { ignore_changes = [value] }` to prevent Terraform from overwriting CI/CD updates:
@@ -189,8 +201,9 @@ or update the regex if the format drifted.
 
 When the same `terraform apply` both grants a new permission to a CI
 role's policy AND creates a resource that needs that permission, the
-IAM authorization evaluator can lag the API call by up to ~60s and the
-fresh resource hits AccessDenied. The shim is a `time_sleep` keyed
+IAM authorization evaluator can lag long enough for the fresh resource
+to hit AccessDenied (including an observed ~2m resource-prefix case).
+The shim is a `time_sleep` keyed
 on a policy fingerprint; the consumer adds `depends_on` on the
 sleep. Existing instances of the pattern:
 
@@ -205,6 +218,9 @@ sleep. Existing instances of the pattern:
   propagation on a freshly-scoped *resource-prefix* grant — see
   nhp #2072 / run 26251713769 for the 60s-isn't-enough evidence).
   Trigger source: same shape as qurl_link_static.
+- `time_sleep.agent_otp_ses_iam_propagation` (180s; first-ever
+  role-to-policy attachment, with no prior evaluator entry to update).
+  Resource=`"*"` does not reduce this first-attachment propagation risk.
 
 Pick by what you're racing: a resource creation → resource-dep
 trigger; an in-place policy doc edit → content-hash trigger.
@@ -216,7 +232,7 @@ after #1812: `modules/ci-policies/`) computed as
 `sha256(aws_iam_policy.<policy>.policy)` and
 `aws_iam_policy.<policy>.arn`. Add a `time_sleep` keyed on both
 in `terraform/main.tf`, gated on the OR of every consumer's
-condition (so envs without consumers don't pay the 60s), and add
+condition (so envs without consumers don't pay the wait), and add
 `depends_on` on each consumer needing the freshly granted perm.
 Pick a `create_duration` by what the policy edit looks like, not a
 single floor: 10s for APIGW's bounded async check; 60s for an
@@ -225,7 +241,9 @@ shape); 180s for a freshly-scoped resource-prefix grant where the
 evaluator must propagate a new bucket/ARN target through its
 caches (bootstrap_alb shape, evidence from nhp #2072 / run
 26251713769 — the 60s shim let the sibling lifecycle resource
-exhaust SDK retries before propagation cleared).
+exhaust SDK retries before propagation cleared); and 180s for a
+brand-new role-to-policy attachment even when its resource scope is
+`"*"` (agent_otp_ses shape).
 
 The two triggers cover different races: the doc hash catches
 in-place perm edits (the common case); the ARN rotates on a
@@ -235,6 +253,12 @@ from `arn:aws:iam::ACCT:policy/NAME`, so a taint+recreate reads
 back an identical string and `triggers` compares strings, not
 resource identities. For the taint case, also taint the
 `time_sleep` so the wait re-fires.
+
+For a brand-new-attachment shim, retain the policy document hash even
+though later action-list edits will conservatively repay 180s: newly
+added actions can be consumed by the same apply and still need an
+ordering gate. The rare extra two minutes is preferable to leaving
+those later edits exposed to an IAM propagation race.
 
 `depends_on` defends create + replace paths only. For an in-place
 update on an existing resource that exercises a freshly granted

@@ -33,6 +33,11 @@ map closes this class.
 Both halves catch the same failure statically — at PR time, no AWS
 credentials needed (#1121's privesc gate stays closed).
 
+The same pass also counts the canonical role's worst-case customer-managed
+policy attachments and rejects configurations above AWS's default quota of 10.
+Conditional attachments count as enabled so every shared-module environment is
+covered; an unbounded computed cardinality fails closed.
+
 What it does NOT check
 ======================
 
@@ -281,8 +286,9 @@ RESOURCE_ACTIONS: dict[str, ActionSpec] = {
     # configuration_set_name on the identity (a clean create may ride
     # CreateEmailIdentity, but a later config-set change issues this Put), plus
     # the tag trio (TagResource/UntagResource/ListTagsForResource) via
-    # default_tags. Matches the "SESAgentOTP" statement added to the
-    # github_actions apply role in modules/ecr/main.tf.
+    # default_tags. Matches the "SESAgentOTP" statement in the dedicated
+    # terraform_apply_ses policy attached to the github_actions apply role in
+    # modules/ecr/main.tf.
     "aws_sesv2_email_identity": [
         "ses:CreateEmailIdentity",
         "ses:GetEmailIdentity",
@@ -548,6 +554,12 @@ CROSS_MODULE_ROLE_REF = "module.ecr.github_actions_role_name"
 # ends.
 LITERAL_ROLE_NAME_PREFIX = "nhp-"
 LITERAL_ROLE_NAME_SUFFIX = "-github-actions"
+# AWS's default quota is 10 managed policies attached to one IAM role. Count
+# every conditional attachment as present so PR linting models the maximum
+# configured shape across environments, not whichever tfvars happen to be
+# active in CI. This is one shared ceiling across accounts: raise it only after
+# every environment account has the matching quota increase.
+GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT = 10
 
 
 # Set by `main()` from the `--terraform-root` argument so
@@ -609,6 +621,71 @@ def _attached_to_github_actions(file: Path, role_ref: str) -> bool:
     ):
         return True
     return False
+
+
+def count_github_actions_managed_policy_attachments(
+    parsed: list[tuple[Path, dict[str, Any]]],
+) -> int:
+    """Return the canonical role's worst-case managed-policy attachment count.
+
+    A simple conditional ``count`` with numeric branches uses the larger branch,
+    so ``var.enabled ? 1 : 0`` counts as one. Every other computed count fails
+    closed above the limit rather than guessing at arithmetic. This relies on
+    python-hcl2 rendering expressions as ``${...}``; the real-HCL integration
+    test fences that parser contract so a dependency change fails loud.
+    Environment-gated bindings are intentionally treated as enabled: the quota
+    must hold for every environment represented by the shared module. It is a
+    conservative union, not a constraint solver: mutually exclusive attachment
+    blocks are summed. Keep attachment cardinalities literal or a simple
+    numeric-branch ternary.
+    """
+
+    def instance_count(body: dict[str, Any]) -> int:
+        count = body.get("count")
+        if isinstance(count, int):
+            return max(count, 0)
+        if isinstance(count, str):
+            ternary = re.fullmatch(
+                r"\$\{[^?]+\?\s*(\d+)\s*:\s*(\d+)\s*\}", count
+            )
+            if ternary:
+                return max(int(ternary.group(1)), int(ternary.group(2)))
+            return GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT + 1
+        for_each = body.get("for_each")
+        if isinstance(for_each, dict):
+            return len(for_each)
+        if for_each is not None:
+            return GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT + 1
+        return 1
+
+    total = 0
+    for file, rtype, _name, body in iter_resources(parsed):
+        if not isinstance(body, dict):
+            continue
+        if rtype == "aws_iam_role_policy_attachment":
+            if _attached_to_github_actions(file, str(body.get("role", ""))):
+                total += instance_count(body)
+        elif rtype == "aws_iam_policy_attachment":
+            roles = body.get("roles")
+            if isinstance(roles, list) and any(
+                _attached_to_github_actions(file, str(role)) for role in roles
+            ):
+                total += instance_count(body)
+        elif rtype == "aws_iam_role_policy_attachments_exclusive":
+            if _attached_to_github_actions(file, str(body.get("role_name", ""))):
+                policy_arns = body.get("policy_arns")
+                # A computed list cannot be bounded statically, so fail closed
+                # above the quota. Literal lists get their exact cardinality.
+                # Provider guidance forbids mixing this authoritative resource
+                # with singular attachments for the same role; if mixed, the
+                # conservative counter sums both and fails safe.
+                policy_count = (
+                    len(policy_arns)
+                    if isinstance(policy_arns, list)
+                    else GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT + 1
+                )
+                total += instance_count(body) * policy_count
+    return total
 
 
 def collect_role_actions(
@@ -937,8 +1014,9 @@ def _check_consumer_type(
 
 def main() -> int:
     epilog = (
-        "Exit codes: 0 = clean; 1 = a data source or resource is missing a "
-        "required action; 2 = a data source type is not in DATA_SOURCE_ACTIONS, "
+        "Exit codes: 0 = clean; 1 = a data source/resource is missing a "
+        "required action or the canonical role exceeds its managed-policy "
+        "attachment quota; 2 = a data source type is not in DATA_SOURCE_ACTIONS, "
         "or a resource type is in neither RESOURCE_ACTIONS nor "
         "RESOURCE_UNCHECKED_ACK (fail-closed — add the entry in the same PR); "
         "3 = internal error."
@@ -984,6 +1062,13 @@ def main() -> int:
 
     parsed = parse_tf_files(root)
     role_actions = collect_role_actions(parsed)
+    managed_policy_attachment_count = count_github_actions_managed_policy_attachments(
+        parsed
+    )
+    attachment_quota_exceeded = (
+        managed_policy_attachment_count
+        > GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT
+    )
 
     # Sanity check the module-scoping coupling. If `CANONICAL_ROLE_MODULE_PATH`
     # ever drifts from where `aws_iam_role.github_actions` actually lives,
@@ -1035,6 +1120,8 @@ def main() -> int:
                 "resource_findings": resource_findings,
                 "resource_unmapped": resource_unmapped,
                 "role_actions": sorted(role_actions),
+                "managed_policy_attachment_count": managed_policy_attachment_count,
+                "managed_policy_attachment_limit": GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT,
             },
             sys.stdout,
             indent=2,
@@ -1089,12 +1176,25 @@ def main() -> int:
                 f"scoping manually.",
                 file=Path(f["file"]),
             )
+        if attachment_quota_exceeded:
+            error(
+                f"`aws_iam_role.github_actions` declares "
+                f"{managed_policy_attachment_count} worst-case managed-policy "
+                f"attachments, exceeding AWS's default per-role quota of "
+                f"{GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT}. Consolidate "
+                f"existing grants or raise the account quota before adding the "
+                f"attachment. Keep attachment count/for_each cardinalities "
+                f"statically bounded; computed or mutually exclusive shapes "
+                f"are conservatively over-counted.",
+                file=Path("terraform/modules/ecr/main.tf"),
+            )
         total_gaps = len(findings) + len(resource_findings)
         total_unmapped = len(unmapped) + len(resource_unmapped)
-        if total_gaps or total_unmapped:
+        if total_gaps or total_unmapped or attachment_quota_exceeded:
             print(
                 f"\nterraform IAM coverage check: FAILED "
-                f"({total_gaps} gap(s), {total_unmapped} unmapped)",
+                f"({total_gaps} gap(s), {total_unmapped} unmapped, "
+                f"{int(attachment_quota_exceeded)} attachment-quota violation(s))",
                 file=sys.stderr,
             )
         else:
@@ -1103,6 +1203,8 @@ def main() -> int:
     if unmapped or resource_unmapped:
         return 2
     if findings or resource_findings:
+        return 1
+    if attachment_quota_exceeded:
         return 1
     return 0
 

@@ -8,7 +8,9 @@ tests/lints/terraform-prod-drift/ can't reach:
   so no exit-code fixture exercises this), and
 - the RESOURCE_ACTIONS / RESOURCE_UNCHECKED_ACK disjointness guard, whose
   positive path (overlap -> exit 3) needs the module maps mutated, which a
-  terraform-tree fixture cannot do.
+  terraform-tree fixture cannot do, and
+- the canonical role's managed-policy attachment ceiling, including the
+  fail-closed path for an unbounded computed cardinality.
 
 Fixtures cover terraform-tree behavior; these cover the script's own
 invariants. Run directly (wired into build-and-push.yml): `python3 <this>`.
@@ -20,6 +22,8 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -110,6 +114,179 @@ class RequiredActionsDispatch(unittest.TestCase):
 
         IAM._required_actions(entry, "not-a-dict")
         self.assertEqual(received["body"], {})
+
+
+class ManagedPolicyAttachmentQuota(unittest.TestCase):
+    def _count(self, *resources):
+        parsed = [
+            (
+                Path("terraform/modules/ecr/main.tf"),
+                {"resource": list(resources)},
+            )
+        ]
+        original_root = IAM._TERRAFORM_ROOT
+        try:
+            IAM._TERRAFORM_ROOT = Path("terraform").resolve()
+            return IAM.count_github_actions_managed_policy_attachments(parsed)
+        finally:
+            IAM._TERRAFORM_ROOT = original_root
+
+    def test_counts_conditional_bindings_as_worst_case(self):
+        original_root = IAM._TERRAFORM_ROOT
+        original_argv = sys.argv
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                module = root / "modules" / "ecr"
+                module.mkdir(parents=True)
+                attachments = "\n".join(
+                    f'''resource "aws_iam_role_policy_attachment" "p{i}" {{
+  count      = var.enabled ? 1 : 0
+  role       = aws_iam_role.github_actions.name
+  policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+}}'''
+                    for i in range(11)
+                )
+                (module / "main.tf").write_text(attachments)
+                IAM._TERRAFORM_ROOT = root.resolve()
+                parsed = IAM.parse_tf_files(root)
+                self.assertEqual(
+                    IAM.count_github_actions_managed_policy_attachments(parsed), 11
+                )
+                stderr = StringIO()
+                sys.argv = [
+                    "check-terraform-iam-coverage",
+                    "--terraform-root",
+                    str(root),
+                ]
+                with redirect_stderr(stderr):
+                    self.assertEqual(IAM.main(), 1)
+                self.assertIn(
+                    "11 worst-case managed-policy attachments", stderr.getvalue()
+                )
+        finally:
+            IAM._TERRAFORM_ROOT = original_root
+            sys.argv = original_argv
+
+    def test_condition_integer_does_not_change_ternary_cardinality(self):
+        count = self._count(
+            {
+                "aws_iam_role_policy_attachment": {
+                    "comparison_literal": {
+                        "count": "${var.max_azs >= 3 ? 1 : 0}",
+                        "role": "${aws_iam_role.github_actions.name}",
+                        "policy_arn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+                    }
+                }
+            }
+        )
+        self.assertEqual(count, 1)
+
+    def test_arithmetic_count_fails_closed(self):
+        count = self._count(
+            {
+                "aws_iam_role_policy_attachment": {
+                    "arithmetic": {
+                        "count": "${3 * var.multiplier}",
+                        "role": "${aws_iam_role.github_actions.name}",
+                        "policy_arn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+                    }
+                }
+            }
+        )
+        self.assertGreater(count, IAM.GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT)
+
+    def test_nested_ternary_count_fails_closed(self):
+        count = self._count(
+            {
+                "aws_iam_role_policy_attachment": {
+                    "nested_ternary": {
+                        "count": "${var.a ? (var.b ? 2 : 1) : 0}",
+                        "role": "${aws_iam_role.github_actions.name}",
+                        "policy_arn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+                    }
+                }
+            }
+        )
+        self.assertGreater(count, IAM.GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT)
+
+    def test_unbounded_for_each_fails_closed(self):
+        count = self._count(
+            {
+                "aws_iam_role_policy_attachment": {
+                    "unbounded": {
+                        "for_each": "${var.policy_arns}",
+                        "role": "${aws_iam_role.github_actions.name}",
+                        "policy_arn": "${each.value}",
+                    }
+                }
+            }
+        )
+        self.assertGreater(count, IAM.GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT)
+
+    def test_counts_literal_for_each_map(self):
+        count = self._count(
+            {
+                "aws_iam_role_policy_attachment": {
+                    "literal_map": {
+                        "for_each": {"first": "policy-a", "second": "policy-b"},
+                        "role": "${aws_iam_role.github_actions.name}",
+                        "policy_arn": "${each.value}",
+                    }
+                }
+            }
+        )
+        self.assertEqual(count, 2)
+
+    def test_counts_integer_legacy_and_exclusive_shapes(self):
+        count = self._count(
+            {
+                "aws_iam_role_policy_attachment": {
+                    "integer_count": {
+                        "count": 3,
+                        "role": "${aws_iam_role.github_actions.name}",
+                        "policy_arn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+                    }
+                }
+            },
+            {
+                "aws_iam_policy_attachment": {
+                    "legacy_multi_role": {
+                        "roles": [
+                            "${aws_iam_role.github_actions.name}",
+                            "${aws_iam_role.other.name}",
+                        ],
+                        "policy_arn": "arn:aws:iam::aws:policy/SecurityAudit",
+                    }
+                }
+            },
+            {
+                "aws_iam_role_policy_attachments_exclusive": {
+                    "literal_list": {
+                        # Arithmetic-only fixture: two authoritative resources
+                        # for one role are not a supported Terraform pattern.
+                        "count": 2,
+                        "role_name": "${aws_iam_role.github_actions.name}",
+                        "policy_arns": ["policy-a", "policy-b"],
+                    }
+                }
+            },
+        )
+        # 3 counted instances + 1 legacy policy + (2 instances * 2 policies).
+        self.assertEqual(count, 8)
+
+    def test_computed_exclusive_list_fails_closed(self):
+        count = self._count(
+            {
+                "aws_iam_role_policy_attachments_exclusive": {
+                    "computed_list": {
+                        "role_name": "${aws_iam_role.github_actions.name}",
+                        "policy_arns": "${var.policy_arns}",
+                    }
+                }
+            }
+        )
+        self.assertGreater(count, IAM.GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT)
 
 
 class OverlapGuard(unittest.TestCase):

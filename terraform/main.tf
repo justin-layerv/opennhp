@@ -570,6 +570,8 @@ module "ecr" {
   website_api_cfn_stack_name            = var.website_api_cfn_stack_name
   route53_change_record_hosted_zone_ids = local.route53_change_record_hosted_zone_ids
   route53_change_record_name_patterns   = local.route53_change_record_name_patterns
+  # Must remain the same flag that gates consumers in agent_otp_ses.tf.
+  agent_otp_ses_enabled = local.agent_otp_ses_enabled
 }
 
 # Networking Module - VPC, Subnets, Security Groups
@@ -1651,7 +1653,9 @@ locals {
       (var.bootstrap_alb_manage_dns_alias || var.bootstrap_alb_provision_certificate)
     )
   )
+  # Standard edits use 60s; slow resource-prefix and first-attachment paths use 180s.
   iam_propagation_duration                       = "60s"
+  iam_conservative_propagation_duration          = "180s"
   route53_record_change_iam_propagation_enabled  = length(local.route53_change_record_hosted_zone_ids) > 0 || length(local.route53_change_record_name_patterns) > 0
   route53_record_change_iam_propagation_triggers = module.ecr.route53_record_change_policy_triggers
 
@@ -5625,5 +5629,25 @@ resource "time_sleep" "bootstrap_alb_iam_propagation" {
   # well above the ~2m observed. The 60s precedent on
   # `qurl_link_static_iam_propagation` predates this evidence — leave
   # it as-is until/unless that shim trips the same race.
-  create_duration = "180s"
+  create_duration = local.iam_conservative_propagation_duration
+}
+
+# The agent-registration SES resources and their apply-role grant can be
+# introduced by the same apply. A new role-to-policy attachment has no existing
+# evaluator entry to update, so use the conservative 180s window rather than
+# the shared 60s action-list-edit duration. This prevents the policy-size fix
+# from trading the deterministic 6,144-character failure for an intermittent
+# first-apply AccessDenied.
+resource "time_sleep" "agent_otp_ses_iam_propagation" {
+  # Keep this gate aligned with the nullable module outputs below; without it,
+  # disabled environments would feed null values into the triggers map.
+  count = local.agent_otp_ses_enabled ? 1 : 0
+
+  triggers = {
+    policy_doc_hash = module.ecr.terraform_apply_ses_policy_doc_hash
+    policy_arn      = module.ecr.terraform_apply_ses_policy_arn
+    attachment_id   = module.ecr.terraform_apply_ses_attachment_id
+  }
+
+  create_duration = local.iam_conservative_propagation_duration
 }

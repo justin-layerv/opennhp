@@ -187,6 +187,8 @@ resource "terraform_data" "agent_otp_pepper_seed" {
 resource "aws_sesv2_email_identity" "agent_otp_sender" {
   count = local.agent_otp_ses_enabled ? 1 : 0
 
+  depends_on = [time_sleep.agent_otp_ses_iam_propagation]
+
   email_identity         = local.agent_otp_sender_domain
   configuration_set_name = aws_sesv2_configuration_set.agent_otp[0].configuration_set_name
 
@@ -292,6 +294,8 @@ resource "aws_route53_record" "agent_otp_mail_from_txt" {
 # events are the corroborating deliverability signal).
 resource "aws_sesv2_configuration_set" "agent_otp" {
   count = local.agent_otp_ses_enabled ? 1 : 0
+
+  depends_on = [time_sleep.agent_otp_ses_iam_propagation]
 
   configuration_set_name = local.agent_otp_config_set_name
 

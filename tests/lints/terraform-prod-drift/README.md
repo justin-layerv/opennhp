@@ -4,7 +4,8 @@ Regression fixtures for the PR-time terraform drift detectors. There are two
 scripts; the second carries three logical guards:
 
 - `.github/scripts/check-terraform-iam-coverage.py` — Class A: data-source
-  reads (#1323) and resource creates (#2996).
+  reads (#1323), resource creates (#2996), and the canonical GitHub Actions
+  role's default 10-managed-policy attachment ceiling.
 - `.github/scripts/check-terraform-policy-conditions.py` — Class B (#1316,
   banned Condition keys), plus the nhp#1146 Route53 guard (wildcard-record
   mutations and the github_actions permission-boundary check) and the #1523 KMS

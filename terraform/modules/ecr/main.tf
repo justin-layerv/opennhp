@@ -153,6 +153,12 @@ variable "environment" {
   default     = "sandbox"
 }
 
+variable "agent_otp_ses_enabled" {
+  description = "Whether this environment provisions agent-registration SES resources and needs the matching Terraform apply grant"
+  type        = bool
+  default     = false
+}
+
 variable "create_oidc_provider" {
   description = <<-EOT
     Whether to create the GitHub OIDC provider.
@@ -2247,44 +2253,6 @@ resource "aws_iam_policy" "terraform_apply_services" {
         Resource = "*"
       },
       {
-        # Agent-registration email OTP (T1). The apply role needs SES v2
-        # create/update/delete on the sender identity, its MAIL FROM
-        # attributes, and the configuration set + event destination
-        # (terraform/agent_otp_ses.tf), plus the read verbs terraform plan's
-        # refresh calls. Resource = "*": SES email-identity / configuration-set
-        # APIs are account/region-scoped and several (GetEmailIdentity,
-        # PutConfigurationSet*) don't accept a resource ARN, matching the
-        # "*"-scoped service-management statements above (EFS, ServiceDiscovery,
-        # Chatbot). Without this the SES resources apply green at PR (read-only
-        # plan role) but fail post-merge apply with AccessDenied — the #2996
-        # class this repo's IAM-coverage lint guards. All resources are gated on
-        # agent_otp_enabled, so a dark env's apply never exercises these.
-        Sid    = "SESAgentOTP"
-        Effect = "Allow"
-        Action = [
-          "ses:CreateEmailIdentity",
-          "ses:DeleteEmailIdentity",
-          "ses:GetEmailIdentity",
-          "ses:PutEmailIdentityDkimSigningAttributes",
-          "ses:PutEmailIdentityMailFromAttributes",
-          "ses:PutEmailIdentityConfigurationSetAttributes",
-          "ses:CreateConfigurationSet",
-          "ses:DeleteConfigurationSet",
-          "ses:GetConfigurationSet",
-          "ses:PutConfigurationSetDeliveryOptions",
-          "ses:PutConfigurationSetReputationOptions",
-          "ses:PutConfigurationSetSendingOptions",
-          "ses:CreateConfigurationSetEventDestination",
-          "ses:UpdateConfigurationSetEventDestination",
-          "ses:DeleteConfigurationSetEventDestination",
-          "ses:GetConfigurationSetEventDestinations",
-          "ses:TagResource",
-          "ses:UntagResource",
-          "ses:ListTagsForResource"
-        ]
-        Resource = "*"
-      },
-      {
         Sid    = "EFS"
         Effect = "Allow"
         Action = [
@@ -2505,6 +2473,23 @@ resource "aws_iam_policy" "terraform_apply_services" {
       }
     ]
   })
+
+  lifecycle {
+    postcondition {
+      # IAM rejects customer-managed policy documents above 6,144
+      # non-whitespace characters. Because jsonencode emits no insignificant
+      # whitespace, length(self.policy) equals AWS's quota-counted length and
+      # catches regressions during plan instead of the post-merge apply.
+      # Keep this policy document fully plan-known: introducing an apply-time
+      # unknown would defer this postcondition to apply and lose the PR fence.
+      # The current 5,602-character document intentionally leaves only 542
+      # characters: the next substantial grant must split into another policy.
+      # At current prod inputs the next-largest sibling is terraform_apply_iam
+      # at 2,679 characters (3,465 headroom), so only services merits a guard.
+      condition     = length(self.policy) <= 6144
+      error_message = "terraform_apply_services exceeds IAM's 6,144-character customer-managed policy quota; split statements into a dedicated policy before applying."
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "route53_managed_zone_record_changes" {
@@ -2572,6 +2557,75 @@ resource "aws_iam_role_policy" "route53_computed_zone_record_changes" {
 resource "aws_iam_role_policy_attachment" "terraform_apply_services" {
   role       = aws_iam_role.github_actions.name
   policy_arn = aws_iam_policy.terraform_apply_services.arn
+}
+
+# Part 3b: Agent-registration email OTP (SES v2)
+#
+# Keep this separate from terraform_apply_services. Adding these actions to
+# that already-large policy exceeded IAM's 6,144-character managed-policy
+# quota in sandbox run 29138466833, so Terraform could not create a new policy
+# version and the entire deploy stopped before SES was touched.
+# When enabled this is the ninth managed-policy attachment on today's prod role
+# (AWS defaults to 10 per role), leaving one default slot. Dark environments do
+# not create or attach it.
+# check-terraform-iam-coverage.py counts the shared module's worst-case bindings
+# and fails above 10. Filling the last slot exhausts the runway; any subsequent
+# split must consolidate grants or deliberately raise both the account quota
+# and the checked limit.
+resource "aws_iam_policy" "terraform_apply_ses" {
+  count = var.agent_otp_ses_enabled ? 1 : 0
+
+  name        = "nhp-${var.environment}-github-actions-terraform-apply-ses"
+  description = "SES permissions for Terraform apply (${var.environment})"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # The apply role needs SES v2 create/update/delete on the sender
+        # identity, its MAIL FROM attributes, and the configuration set + event
+        # destination (terraform/agent_otp_ses.tf), plus the read verbs used by
+        # Terraform refresh. Several SES identity/configuration-set APIs do not
+        # support resource-level permissions, so this account/region-scoped
+        # control plane grant must use Resource="*".
+        Sid    = "SESAgentOTP"
+        Effect = "Allow"
+        Action = [
+          "ses:CreateEmailIdentity",
+          "ses:DeleteEmailIdentity",
+          "ses:GetEmailIdentity",
+          "ses:PutEmailIdentityDkimSigningAttributes",
+          "ses:PutEmailIdentityMailFromAttributes",
+          "ses:PutEmailIdentityConfigurationSetAttributes",
+          "ses:CreateConfigurationSet",
+          "ses:DeleteConfigurationSet",
+          "ses:GetConfigurationSet",
+          "ses:PutConfigurationSetDeliveryOptions",
+          "ses:PutConfigurationSetReputationOptions",
+          "ses:PutConfigurationSetSendingOptions",
+          "ses:CreateConfigurationSetEventDestination",
+          "ses:UpdateConfigurationSetEventDestination",
+          "ses:DeleteConfigurationSetEventDestination",
+          "ses:GetConfigurationSetEventDestinations",
+          "ses:TagResource",
+          "ses:UntagResource",
+          "ses:ListTagsForResource"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+
+  # Unlike terraform_apply_services, this dedicated document is far below the
+  # 6,144-character ceiling. Keep the plan-time size guard on the policy that
+  # is actually near the quota rather than duplicating a vacuous invariant.
+}
+
+resource "aws_iam_role_policy_attachment" "terraform_apply_ses" {
+  count = var.agent_otp_ses_enabled ? 1 : 0
+
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.terraform_apply_ses[0].arn
 }
 
 # Part 4: Data Services (DynamoDB, RDS, Lambda, SSM, ACM)
@@ -3367,6 +3421,24 @@ output "terraform_apply_services_policy_arn" {
 output "terraform_apply_services_attachment_id" {
   description = "ID of the role-policy attachment for terraform-apply-services. Forces a `time_sleep` shim to order AFTER the attachment lands at AWS — see qurl_link_static_attachment_id above for the same shape."
   value       = aws_iam_role_policy_attachment.terraform_apply_services.id
+}
+
+# Trigger sources for `time_sleep.agent_otp_ses_iam_propagation` in the root
+# module. The SES resources are created by the same apply that first creates and
+# attaches this policy, so they must wait for the IAM evaluator to observe it.
+output "terraform_apply_ses_policy_doc_hash" {
+  description = "sha256 of the terraform-apply-ses CI policy doc; trigger source for the agent-OTP SES IAM-propagation shim."
+  value       = var.agent_otp_ses_enabled ? sha256(aws_iam_policy.terraform_apply_ses[0].policy) : null
+}
+
+output "terraform_apply_ses_policy_arn" {
+  description = "ARN of the terraform-apply-ses CI policy."
+  value       = var.agent_otp_ses_enabled ? aws_iam_policy.terraform_apply_ses[0].arn : null
+}
+
+output "terraform_apply_ses_attachment_id" {
+  description = "ID of the role-policy attachment for terraform-apply-ses; orders SES creation after the grant is attached."
+  value       = var.agent_otp_ses_enabled ? aws_iam_role_policy_attachment.terraform_apply_ses[0].id : null
 }
 
 # Trigger sources for `time_sleep.qurl_v2_resource_key_envelope_iam_propagation`
