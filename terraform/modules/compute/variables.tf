@@ -526,10 +526,7 @@ variable "relay_trusted_public_keys_b64" {
   validation {
     condition = alltrue([
       for key in var.relay_trusted_public_keys_b64 :
-      can(base64decode(key)) ? (
-        length(base64decode(key)) == 32 &&
-        base64encode(base64decode(key)) == key
-      ) : false
+      can(regex("^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$", key))
     ])
     error_message = "relay_trusted_public_keys_b64 entries must be canonical standard-base64 encodings of exactly 32 bytes."
   }

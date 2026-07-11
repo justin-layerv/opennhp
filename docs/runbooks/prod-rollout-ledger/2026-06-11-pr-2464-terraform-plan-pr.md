@@ -38,7 +38,21 @@ reported as skipped so unrelated sandbox state does not block prod-only changes.
       Secrets Manager reads are limited to `Describe*`/`Get*` on NHP secrets
       with no account-wide `ListSecrets`. KMS decrypt is constrained to
       `alias/terraform-state` plus the NHP KMS aliases via
-      `kms:ResourceAliases`. KMS metadata reads intentionally
+      `kms:ResourceAliases`. The sole non-read-verb exception is
+      `lambda:InvokeFunction` on the exact `${name_prefix}-relay-status`
+      function. Its distinct handler accepts only `confirmed-status`; its
+      execution role can read the exact relay secret and public parameter and
+      write only its own scoped CloudWatch log stream. It cannot invoke the
+      multi-action identity/keygen handler or mutate relay identity state.
+      Sign-off must explicitly accept both this semantic-read invocation and
+      its bounded log side effect. Each Terraform-touching PR plan therefore
+      decrypts the full relay private key inside the scoped status Lambda long
+      enough to derive and validate its public half; the response and Terraform
+      state contain only version IDs and public keys, with code-only errors and
+      redaction tests guarding the boundary. Sign-off must accept that cadence
+      and must also accept that an `AWSCURRENT`/public-parameter divergence
+      intentionally blocks every unrelated Terraform PR until `promote` repair
+      or `sync-current` restores equality. KMS metadata reads intentionally
       use `StringEqualsIfExists` because some KMS list APIs do not carry
       `aws:ResourceAccount`; sign-off must explicitly accept that metadata/list
       exposure can be broader than a strict sandbox-account-only boundary. Only
@@ -46,6 +60,8 @@ reported as skipped so unrelated sandbox state does not block prod-only changes.
       Treat the read-only policy linter as a scoped-Sid tripwire: before adding
       any new value-bearing read Sid, extend the exact resource/condition
       assertions in `.github/scripts/check-terraform-plan-pr-policy-readonly.py`.
+      That lint must also keep the relay-status Invoke Sid, action, exact ARN,
+      and duplicate-Sid rejection pinned.
       The workflow fetches the Auth0 token using a base-commit copy of sandbox
       `terraform.tfvars` so PR-head `auth0_domain` edits cannot redirect the
       long-lived client secret to another host, but the actual plan still
@@ -80,8 +96,8 @@ reported as skipped so unrelated sandbox state does not block prod-only changes.
 - [ ] Rollout: add `Terraform Plan (PR)` (not `Comment Terraform Plan (PR)`)
       to the required PR status checks once the workflow has reported at least
       one successful Terraform-touching run that exercises the scoped sandbox
-      SSM, Secrets Manager, S3, and KMS reads behind the plan role, not just a
-      skip/no-op path.
+      SSM, Secrets Manager, S3, and KMS reads plus the exact read-only relay
+      status invocation behind the plan role, not just a skip/no-op path.
 - [ ] Post-rollout: verify a Terraform-touching PR receives the structured plan
       comment and a passing `Terraform Plan (PR)` check.
 - [ ] Rollback: remove the required check and repository secret, then revert PR

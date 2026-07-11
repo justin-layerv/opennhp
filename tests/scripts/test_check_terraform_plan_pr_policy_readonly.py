@@ -172,6 +172,14 @@ def policy_fixture(
         """,
         """
         {
+          Sid      = "RelayIdentityStatusInvoke"
+          Effect   = "Allow"
+          Action   = ["lambda:InvokeFunction"]
+          Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status"]
+        }
+        """,
+        """
+        {
           Sid    = "SQSRead"
           Effect = "Allow"
           Action = [
@@ -324,6 +332,71 @@ class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
         self.assertIn("missing APIGatewayRead", result.stderr)
+
+    def test_relay_status_invoke_resource_is_pinned(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status"',
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exact read-only relay status Lambda", result.stderr)
+
+    def test_lambda_invoke_outside_relay_status_sid_is_rejected(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid      = "OtherLambdaInvoke"
+                  Effect   = "Allow"
+                  Action   = ["lambda:InvokeFunction"]
+                  Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:other"]
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("outside scoped Sids", result.stderr)
+
+    def test_duplicate_relay_status_sid_cannot_hide_broad_invoke(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Sid      = "RelayIdentityStatusInvoke"
+                  Effect   = "Allow"
+                  Action   = ["lambda:InvokeFunction"]
+                  Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:*"]
+                }
+                """
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("duplicate Allow Sid: RelayIdentityStatusInvoke", result.stderr)
+
+    def test_multiple_sidless_metadata_reads_do_not_false_positive(self) -> None:
+        result = self.run_lint(
+            policy_fixture(
+                """
+                {
+                  Effect   = "Allow"
+                  Action   = ["ec2:DescribeInstances"]
+                  Resource = "*"
+                }
+                """,
+                """
+                {
+                  Effect   = "Allow"
+                  Action   = ["ec2:DescribeVolumes"]
+                  Resource = "*"
+                }
+                """,
+            )
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
     def test_sqs_read_action_is_pinned(self) -> None:
         result = self.run_lint_with_replacement(

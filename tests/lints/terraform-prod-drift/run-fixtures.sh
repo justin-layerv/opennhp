@@ -22,6 +22,7 @@ COND_LINT="$REPO_ROOT/.github/scripts/check-terraform-policy-conditions.py"
 # previously fired against valid input — cr round 10).
 FIXTURES=(
   "clean|0|0||"
+  "lambda-invocation-data-source|0|0||"
   "iam-gap-1323|1|0||"
   "policy-condition-1316|0|1||"
   "policy-condition-1316-sourcearn|0|1||"

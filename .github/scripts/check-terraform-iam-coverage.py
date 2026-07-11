@@ -145,6 +145,9 @@ DATA_SOURCE_ACTIONS: dict[str, ActionSpec] = {
     # https://ip-ranges.amazonaws.com/ip-ranges.json over HTTPS, no AWS auth.
     "aws_ip_ranges": [],
     # Real-grant data sources -----------------------------------------
+    # internal/service/lambda/invocation_data_source.go invokes the named
+    # function during Read.
+    "aws_lambda_invocation": ["lambda:InvokeFunction"],
     # internal/service/ec2/availability_zones_data_source.go calls
     # ec2:DescribeAvailabilityZones.
     "aws_availability_zones": ["ec2:DescribeAvailabilityZones"],

@@ -7,9 +7,12 @@ const {
   PutSecretValueCommand,
   SecretsManagerClient,
 } = require("@aws-sdk/client-secrets-manager");
-const { PutParameterCommand, SSMClient } = require("@aws-sdk/client-ssm");
+const { GetParameterCommand, PutParameterCommand, SSMClient } = require("@aws-sdk/client-ssm");
 
 const PRIVATE_DER_PREFIX = Buffer.from("302e020100300506032b656e04220420", "hex");
+const PUBLICATION_CONFIRM_ATTEMPTS = 10;
+const PUBLICATION_CONFIRM_INITIAL_DELAY_MS = 100;
+const PUBLICATION_CONFIRM_MAX_DELAY_MS = 1000;
 const defaultSecrets = new SecretsManagerClient({});
 const defaultSsm = new SSMClient({});
 
@@ -26,7 +29,14 @@ function fail(code) {
   return new RelayIdentityError(code);
 }
 
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 function decodeCanonicalKey(value, field) {
+  // This prefilter pins length/alphabet only. The encode round-trip below is
+  // the canonicality check and rejects non-zero pad bits, matching Terraform's
+  // stricter final-character class without duplicating that opaque alphabet.
   if (typeof value !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(value)) {
     throw fail(`invalid-${field}`);
   }
@@ -102,7 +112,7 @@ function requireEvent(event) {
   if (props.PublicKeyParameter !== `/${props.Environment}/nhp/relay/identity/current-public-key`) {
     throw fail("invalid-public-key-parameter");
   }
-  if (!["ensure-current", "publish-current", "stage-pending", "status"].includes(action)) {
+  if (!["ensure-current", "publish-current", "stage-pending", "status", "confirmed-status"].includes(action)) {
     throw fail("invalid-action");
   }
   return { action, props };
@@ -136,12 +146,51 @@ async function describe(secrets, secretId) {
   }
 }
 
-async function publish(ssm, parameterName, publicKey) {
+async function confirmPublished(ssm, parameterName, publicKey, sleepFn, warn) {
+  // Parameter Store reads are eventually consistent. Do not authorize the
+  // Terraform consumer merely because PutParameter returned success: a read
+  // immediately after the write can still return the bootstrap placeholder.
+  // Confirm the exact public value with bounded backoff before reporting a
+  // successful publication. Read errors stay redacted and consume the same
+  // finite budget as stale values. This same-client confirmation narrows but
+  // cannot eliminate cross-principal visibility lag. Terraform therefore uses
+  // this invocation's validated public-key result rather than racing a second
+  // Parameter Store read from another session.
+  let readErrorLogged = false;
+  for (let attempt = 0; attempt < PUBLICATION_CONFIRM_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await ssm.send(new GetParameterCommand({ Name: parameterName }));
+      if (response && response.Parameter && response.Parameter.Value === publicKey) return;
+    } catch {
+      // Intentionally treat every GetParameter exception as a retryable read
+      // failure. SDK error taxonomies can change; the finite budget, fixed log,
+      // and code-only terminal error preserve both diagnosis and fail-closed
+      // behavior without reflecting an unexpected exception shape.
+      if (!readErrorLogged) {
+        // Preserve a diagnostic distinction without reflecting SDK messages,
+        // parameter values, or secret material into CloudWatch.
+        warn("relay identity public-key confirmation read failed");
+        readErrorLogged = true;
+      }
+    }
+    if (attempt + 1 < PUBLICATION_CONFIRM_ATTEMPTS) {
+      const delay = Math.min(
+        PUBLICATION_CONFIRM_INITIAL_DELAY_MS * (2 ** attempt),
+        PUBLICATION_CONFIRM_MAX_DELAY_MS,
+      );
+      await sleepFn(delay);
+    }
+  }
+  throw fail("public-key-confirmation-failed");
+}
+
+async function publish(ssm, parameterName, publicKey, sleepFn, warn) {
   try {
     await ssm.send(new PutParameterCommand({ Name: parameterName, Type: "String", Value: publicKey, Overwrite: true }));
   } catch {
     throw fail("public-key-publish-failed");
   }
+  await confirmPublished(ssm, parameterName, publicKey, sleepFn, warn);
 }
 
 async function ensureCurrent(secrets, props) {
@@ -168,7 +217,7 @@ async function ensureCurrent(secrets, props) {
   return { action: "ensure-current", currentVersionId: current.versionId, currentPublicKey: current.publicKey };
 }
 
-async function publishCurrent(secrets, ssm, props) {
+async function publishCurrent(secrets, ssm, props, sleepFn, warn) {
   const versions = stageMap(await describe(secrets, props.SecretId));
   const currentId = versionForStage(versions, "AWSCURRENT");
   if (!currentId) {
@@ -177,7 +226,7 @@ async function publishCurrent(secrets, ssm, props) {
     throw fail("current-version-missing");
   }
   const current = await readVersion(secrets, props.SecretId, props.Environment, currentId, "AWSCURRENT");
-  await publish(ssm, props.PublicKeyParameter, current.publicKey);
+  await publish(ssm, props.PublicKeyParameter, current.publicKey, sleepFn, warn);
   return { action: "publish-current", currentVersionId: current.versionId, currentPublicKey: current.publicKey };
 }
 
@@ -229,12 +278,33 @@ async function status(secrets, props) {
   return result;
 }
 
+async function confirmedStatus(secrets, ssm, props, sleepFn, warn) {
+  const result = await status(secrets, props);
+  const current = result.versions.AWSCURRENT;
+  if (!current) {
+    throw fail("current-version-missing");
+  }
+  // Terraform alone uses this stricter action as its refreshable trust source.
+  // Ordinary status must remain introspection-only so the rotation helper can
+  // diagnose and repair an intentional partial-promotion SSM mismatch.
+  await confirmPublished(ssm, props.PublicKeyParameter, current.publicKey, sleepFn, warn);
+  result.action = "confirmed-status";
+  return result;
+}
+
 async function run(event, clients = {}) {
   const { action, props } = requireEvent(event);
+  // Keep confirmed-status exclusive to statusHandler's read-only execution
+  // role; the multi-action keygen handler must never become a second entrypoint.
+  if (action === "confirmed-status") {
+    throw fail("invalid-event");
+  }
   const secrets = clients.secrets || defaultSecrets;
   const ssm = clients.ssm || defaultSsm;
+  const sleepFn = clients.sleep || sleep;
+  const warn = clients.warn || console.warn;
   if (action === "ensure-current") return ensureCurrent(secrets, props);
-  if (action === "publish-current") return publishCurrent(secrets, ssm, props);
+  if (action === "publish-current") return publishCurrent(secrets, ssm, props, sleepFn, warn);
   if (action === "stage-pending") return stagePending(secrets, props);
   return status(secrets, props);
 }
@@ -253,6 +323,28 @@ async function handle(event, clients = {}) {
   }
 }
 
-exports.handler = async (event) => handle(event);
+async function handleConfirmedStatus(event, clients = {}) {
+  try {
+    const { action, props } = requireEvent(event);
+    if (action !== "confirmed-status") {
+      throw fail("invalid-event");
+    }
+    const secrets = clients.secrets || defaultSecrets;
+    const ssm = clients.ssm || defaultSsm;
+    const sleepFn = clients.sleep || sleep;
+    const warn = clients.warn || console.warn;
+    console.log("relay identity read-only action", action);
+    return await confirmedStatus(secrets, ssm, props, sleepFn, warn);
+  } catch (error) {
+    if (error instanceof RelayIdentityError) throw error;
+    throw fail("internal-error");
+  }
+}
 
-exports._test = { generateKeyPair, handle, run, validateKeyPair, versionForStage };
+exports.handler = async (event) => handle(event);
+// This distinct handler is the only entry point exposed to the PR-plan role.
+// It cannot dispatch mutation actions, and its Lambda execution role has no
+// relay-identity mutation permissions even if a future refactor widens this guard.
+exports.statusHandler = async (event) => handleConfirmedStatus(event);
+
+exports._test = { generateKeyPair, handle, handleConfirmedStatus, run, validateKeyPair, versionForStage };

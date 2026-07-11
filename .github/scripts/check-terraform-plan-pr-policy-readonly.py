@@ -25,10 +25,15 @@ from _tf_lint_lib import (  # noqa: E402  # pyright: ignore[reportMissingImports
 READ_ACTION_RE = re.compile(r"^[a-z0-9-]+:(?:describe|get|list)[a-z0-9*]*$")
 EXACT_ALLOWED_ACTIONS = {
     "kms:decrypt",
+    # Invoke is allowed only for the exact semantic-read Lambda pinned below.
+    # validate_sensitive_statement_scopes rejects this action in every other
+    # Sid and rejects any broader function resource.
+    "lambda:invokefunction",
 }
 VALUE_BEARING_SCOPED_SIDS = {
     "APIGatewayRead",
     "KMSDecryptInAccount",
+    "RelayIdentityStatusInvoke",
     "S3ObjectRead",
     "SecretsManagerRead",
     "SSMDocumentRead",
@@ -37,6 +42,7 @@ VALUE_BEARING_SCOPED_SIDS = {
 VALUE_BEARING_ACTIONS = {
     "apigateway:get",
     "kms:decrypt",
+    "lambda:invokefunction",
     "s3:get*",
     "s3:getobject",
     "s3:getobject*",
@@ -98,6 +104,12 @@ APIGATEWAY_READ_ACTIONS = {
 }
 APIGATEWAY_READ_RESOURCES = {
     "arn:aws:apigateway:${local.region}::/*",
+}
+RELAY_IDENTITY_STATUS_INVOKE_ACTIONS = {
+    "lambda:invokefunction",
+}
+RELAY_IDENTITY_STATUS_INVOKE_RESOURCES = {
+    "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status",
 }
 SQS_READ_ACTIONS = {
     "sqs:getqueueattributes",
@@ -185,6 +197,7 @@ def is_value_bearing_action(action: str) -> bool:
 def validate_sensitive_statement_scopes(file: Path, policy: dict) -> list[str]:
     statements = statements_by_sid(policy)
     violations: list[str] = []
+    seen_allow_sids: set[str] = set()
 
     for stmt in policy.get("Statement", []) or []:
         if not isinstance(stmt, dict):
@@ -192,6 +205,10 @@ def validate_sensitive_statement_scopes(file: Path, policy: dict) -> list[str]:
         if not is_allow_statement(stmt):
             continue
         sid = unquote(stmt.get("Sid", "<missing Sid>")) if isinstance(stmt.get("Sid"), str) else "<missing Sid>"
+        if sid != "<missing Sid>":
+            if sid in seen_allow_sids:
+                violations.append(f"duplicate Allow Sid: {sid}")
+            seen_allow_sids.add(sid)
         if sid in VALUE_BEARING_SCOPED_SIDS:
             continue
         value_actions = sorted(
@@ -275,6 +292,18 @@ def validate_sensitive_statement_scopes(file: Path, policy: dict) -> list[str]:
             violations.append("APIGatewayRead must only include apigateway:GET")
         if set(normalized_strings(apigateway.get("Resource"))) != APIGATEWAY_READ_RESOURCES:
             violations.append("APIGatewayRead resources must stay on the reviewed API Gateway refresh path")
+
+    relay_status = statements.get("RelayIdentityStatusInvoke")
+    if not relay_status:
+        violations.append("missing RelayIdentityStatusInvoke")
+    else:
+        relay_status_actions = {
+            action.lower() for action in normalized_strings(relay_status.get("Action"))
+        }
+        if relay_status_actions != RELAY_IDENTITY_STATUS_INVOKE_ACTIONS:
+            violations.append("RelayIdentityStatusInvoke must only include lambda:InvokeFunction")
+        if set(normalized_strings(relay_status.get("Resource"))) != RELAY_IDENTITY_STATUS_INVOKE_RESOURCES:
+            violations.append("RelayIdentityStatusInvoke must stay scoped to the exact read-only relay status Lambda")
 
     sqs = statements.get("SQSRead")
     if not sqs:

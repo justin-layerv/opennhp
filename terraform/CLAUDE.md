@@ -30,7 +30,12 @@ queue URLs, and queue tags on `layerv-nhp-*` queues, ElastiCache reads are
 `Describe*`/`List*`, and API Gateway reads use `apigateway:GET` and are treated
 as value-bearing because API Gateway can return plaintext API key values. KMS
 decrypt is constrained to the Terraform state alias plus NHP key aliases with
-`kms:ResourceAliases`. The workflow also fetches
+`kms:ResourceAliases`. The sole non-read-verb exception is
+`lambda:InvokeFunction` on the exact `${name_prefix}-relay-status` function.
+That function has a distinct handler and execution role which can only read the
+relay secret and public-key parameter, aside from writing its own scoped log
+stream; the multi-action identity/keygen Lambda is not invokable by the PR role.
+The workflow also fetches
 Auth0 Terraform credentials before planning, so the rollout sign-off must
 confirm that PR-head code execution with the short-lived Auth0 token and
 sandbox read role is accepted, including plan-time exfil paths such as

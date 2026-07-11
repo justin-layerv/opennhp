@@ -1544,6 +1544,14 @@ resource "aws_iam_policy" "terraform_plan_pr_read" {
         Resource = "*"
       },
       {
+        # This Lambda has a distinct read-only handler and execution role. The
+        # exact ARN is the sole semantic-read exception to the verb gate below.
+        Sid      = "RelayIdentityStatusInvoke"
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status"]
+      },
+      {
         Sid    = "AutoScalingRead"
         Effect = "Allow"
         Action = [

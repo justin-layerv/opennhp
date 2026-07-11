@@ -34,19 +34,31 @@ Terraform. Rotation is a dual-trust rollout, not an in-place secret overwrite.
   swap is committed and its plan is byte-identical for server user data. During
   this intentional fail-closed window, the newly current key is still listed as
   additional trust, so any unrelated apply must fail the duplicate-key guard.
-- Treat `lambda:InvokeFunction` on the identity Lambda as a privileged rotation
-  capability. The handler validates the environment and parameter path, while
-  its `SecretId` blast radius is enforced by the Lambda role's resource-scoped
-  IAM rather than an additional handler equality check. Invoke can stage a
-  pending version but cannot promote one; promotion requires the operator's
-  separate Secrets Manager stage permission. Keep invoke narrowly granted and
-  audit every invocation.
-- The Lambda has one reserved concurrency slot and serializes every action, not
-  only mutations. A concurrent Terraform invocation, `stage`, `sync-current`, or
-  `status` can therefore return the helper's `identity Lambda invocation failed`
-  throttle error. Wait for the in-flight operation, re-run `status`, and verify
-  topology before retrying; do not treat a client-side throttle as an identity
-  fault or evidence that any mutation occurred.
+  The required `Terraform Plan (PR)` check also invokes the read-only confirmed
+  status path and therefore goes red on every unrelated Terraform-touching PR
+  while `AWSCURRENT` and the public parameter diverge. Do not bypass that red
+  check. Complete the in-progress `promote` repair, or after verifying topology
+  use `sync-current`, then re-run the plan only after the public parameter
+  matches `AWSCURRENT`.
+- Treat `lambda:InvokeFunction` on the multi-action identity/keygen Lambda as a
+  privileged rotation capability. The handler validates the environment and
+  parameter path, while its `SecretId` blast radius is enforced by the Lambda
+  role's resource-scoped IAM rather than an additional handler equality check.
+  Invoke can stage a pending version but cannot promote one; promotion requires
+  the operator's separate Secrets Manager stage permission. Keep invoke narrowly
+  granted and audit every invocation. The separate `${name_prefix}-relay-status`
+  Lambda is not a rotation capability: its distinct handler accepts only
+  `confirmed-status`, and its execution role has no relay-identity mutation
+  permissions. The sandbox PR-plan role may invoke only that exact status ARN.
+- The multi-action identity/keygen Lambda has one reserved concurrency slot and
+  serializes every helper action, not only mutations. A concurrent `stage`,
+  `sync-current`, or helper `status` can therefore return the helper's
+  `identity Lambda invocation failed` throttle error. Terraform uses the
+  separate read-only status Lambda, so a PR-plan status read does not consume
+  the keygen function's singleton slot. Wait for the in-flight keygen operation,
+  re-run helper `status`, and verify topology before retrying; do not treat a
+  client-side throttle as an identity fault or evidence that any mutation
+  occurred.
 - Terraform intentionally does not self-heal a deleted or corrupted public-only
   parameter. The static `publish_public_key` migration invocation does not rerun
   on Lambda code or out-of-band SSM changes; use only the validated

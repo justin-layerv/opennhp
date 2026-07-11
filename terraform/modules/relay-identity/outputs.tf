@@ -15,13 +15,16 @@ output "secret_name" {
 }
 
 output "relay_public_key_b64" {
-  description = "Public X25519 identity trusted by NHP servers, read from a public-only SSM parameter. Private material never enters this output or Terraform state."
-  # This is safe only because the Lambda derives, validates, and publishes the
-  # public half into a non-SecureString parameter. Do not cargo-cult
-  # nonsensitive() onto the adjacent Secrets Manager material.
-  value      = nonsensitive(data.aws_ssm_parameter.relay_public_key.value)
+  description = "Live AWSCURRENT public X25519 identity trusted by NHP servers, returned after the identity Lambda confirms the public-only SSM parameter. Private material never enters this output or Terraform state."
+  # This is safe only because the refreshable status invocation derives and
+  # validates the public half, then confirms it matches SSM. Its postcondition
+  # validates this exact result. The provider already marks invocation results
+  # non-sensitive, so an explicit sensitivity cast is redundant and obscures
+  # the provider contract. Do not copy this treatment onto adjacent Secrets
+  # Manager material.
+  value      = jsondecode(data.aws_lambda_invocation.status.result).versions.AWSCURRENT.publicKey
   sensitive  = false
-  depends_on = [aws_lambda_invocation.publish_public_key]
+  depends_on = [data.aws_lambda_invocation.status]
 }
 
 output "public_key_parameter_name" {
