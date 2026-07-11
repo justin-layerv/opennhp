@@ -137,17 +137,19 @@ RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ub
     && rm -f /usr/bin/pebble && rm -rf /var/lib/pebble
 
 # Install Traefik v3 with retry logic for GitHub rate limits
-# 3.6.19 fixes CVE-2026-48020 (StripPrefix route-level auth bypass),
+# 3.6.23 is built with Go 1.26.5, which fixes CVE-2026-39822 (os.Root escape
+# via a trailing-slash symlink), and fixes CVE-2026-48020 (StripPrefix
+# route-level auth bypass),
 # CVE-2026-35051 (ForwardAuth X-Forwarded-Prefix spoofing),
 # CVE-2026-39858 (forwarded alias spoofing pre-auth bypass), and
 # CVE-2026-40912 (StripPrefixRegex Path/RawPath desync auth bypass).
-# Also bundles go-jose v4.1.4, go-acme/lego v4.35.2, grpc v1.80.0, otel v1.43.0.
-ARG TRAEFIK_VERSION=3.6.19
+# Also bundles go-jose v4.1.4, go-acme/lego v5.2.2, grpc v1.81.1, otel v1.44.0.
+ARG TRAEFIK_VERSION=3.6.23
 # SHA256 of traefik_v${TRAEFIK_VERSION}_linux_amd64.tar.gz, copied from
 # https://github.com/traefik/traefik/releases/download/v${TRAEFIK_VERSION}/traefik_v${TRAEFIK_VERSION}_checksums.txt
 # Bump in lockstep with TRAEFIK_VERSION — sha256sum -c will fail the build
 # if this drifts from the published artifact.
-ARG TRAEFIK_SHA256=3b14da980b6d25f10eb3a93b43b9019e4faa4a1ed069a706e8212b615b8009cd
+ARG TRAEFIK_SHA256=72e2ce7a8adb25a98447fdc591adaf2bbc13787f5d6e9b766d6195ac2849d475
 RUN set -ex && \
     for i in 1 2 3 4 5; do \
         curl -fsSL --retry 3 --retry-delay 5 \
