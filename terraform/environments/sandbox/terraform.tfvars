@@ -645,31 +645,46 @@ qurl_v2_relay_allowlist             = "relay.qurl.link.layerv.xyz"
 qurl_service_token_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token-XgjoDM"
 
 # ==============================================================================
-# Agent registration + email OTP (T1) — SANDBOX: DARK
+# Agent registration + email OTP (T1) — SANDBOX: ON (PATH A + PATH B)
 # ==============================================================================
-# Intentionally dark for the SES / agent-register surface: both PATHs off,
-# email_from/relay empty. With these flags false the qurl-service task def and
-# nhp-server user_data are byte-unchanged, the SES sender infra (agent_otp_ses.tf)
-# and the QURL_AGENT_OTP_PEPPER secret are NOT created, and the slog-based
-# agent-register/OTP alarms (gated on agent_registration_enabled/agent_otp_enabled)
-# are NOT provisioned. Sandbox opts into the SES/register surface only after prod
-# launch burn-in (mirrors the Wave-5 bootstrap-chain posture — sandbox led there;
-# here prod leads and sandbox stays dark until validated).
+# Both enrollment paths are ON in sandbox: PATH A (agent_registration_enabled) and
+# PATH B (agent_otp_enabled + agent_otp_registration_enabled). Enabled after prod
+# launch burn-in (this block previously held sandbox dark under a "prod leads,
+# sandbox validates" posture).
 #
-# ONE EXCEPTION — the OTP-shed alarm IS created in sandbox: agent-relay-otp-reject-
-# rate-limited gates on `agent_otp_alarms_enabled || var.deploy_relay`, and sandbox
-# runs the relay (deploy_relay = true below), so it arms (threshold 0, 1-of-1,
-# first-reject page → sandbox SNS). That is deliberate: OTPRejectRateLimited is
-# emitted by EVERY nhp-server from the shared OTP dispatch core (not just when the
-# SES path is on), so a sandbox relay load test that trips the ~30/min global OTP
-# cap SHOULD page. Do not read "sandbox is dark" as "sandbox provisions nothing" —
-# it is dark for the SES/register surface, but this one relay-side alarm still arms.
-# Left explicit (not relying on defaults) so the dark posture reads as deliberate.
-agent_registration_enabled        = false
-agent_otp_enabled                 = false
-agent_otp_registration_enabled    = false
-agent_otp_email_from              = ""
-agent_registration_relay_base_url = ""
+# ⚠️  MERGE ≈ SANDBOX GO-LIVE — there is no separate flip step. build-and-push runs
+# `terraform apply` to sandbox on main-push, so the first apply after this merges
+# (INCLUDING one triggered by an unrelated image bump) activates BOTH paths at once:
+# NHP agent registration AND OTP email via SES from the notify.layerv.xyz sender to
+# real recipients. The two usual OTP gates are already handled for sandbox:
+#   1. PEPPER — auto-seeded on apply by terraform_data.agent_otp_pepper_seed
+#      (get-random-password 48 chars → put-secret-value; the value never enters TF
+#      state). No manual seed needed; an operator MAY hand-populate instead (ledger
+#      step c), but it is optional.
+#   2. SES — the sandbox account already has SES production access
+#      (ProductionAccessEnabled + SendingEnabled + HEALTHY in us-east-2, confirmed
+#      2026-07-11), so OTP reaches any recipient. The notify.layerv.xyz identity +
+#      DKIM + MAIL FROM are created by TF in the layerv.xyz zone (hosted_zone above,
+#      same-account) and verify a few minutes after apply.
+# Remaining human step: an operator watching -agent-otp-send-failed-spike /
+# -agent-otp-bounce on first real traffic. TF preconditions (main.tf) check only
+# flag COHERENCE, not SES/DNS — but both gates above are already satisfied.
+#
+# The flip injects QURL_AGENT_REGISTRATION_ENABLED / QURL_AGENT_OTP_ENABLED /
+# QURL_AGENT_OTP_EMAIL_FROM / QURL_NHP_RELAY_BASE_URL + QURL_AGENT_OTP_PEPPER on the
+# qurl-service task def, renders AGENT_OTP_REGISTRATION_ENABLED into nhp-server
+# user_data (~20-min fleet blue/green), and CREATES the SES identity + DKIM/MAIL
+# FROM DNS + config set + the pepper secret + the task-role SES grant.
+#
+# Values: agent_otp_email_from → SES domain identity notify.layerv.xyz (sender
+# domain = part after @). agent_registration_relay_base_url → the LIVE sandbox relay
+# (deploy_relay = true below → relay.qurl.link.layerv.xyz), so unlike prod's dark
+# relay, registration points clients at a reachable relay.
+agent_registration_enabled        = true
+agent_otp_enabled                 = true
+agent_otp_registration_enabled    = true
+agent_otp_email_from              = "noreply@notify.layerv.xyz"
+agent_registration_relay_base_url = "https://relay.qurl.link.layerv.xyz"
 
 # ==============================================================================
 # QURL Link Redirect Page
