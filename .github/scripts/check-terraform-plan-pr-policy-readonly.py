@@ -109,7 +109,7 @@ RELAY_IDENTITY_STATUS_INVOKE_ACTIONS = {
     "lambda:invokefunction",
 }
 RELAY_IDENTITY_STATUS_INVOKE_RESOURCES = {
-    "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status",
+    "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST",
 }
 SQS_READ_ACTIONS = {
     "sqs:getqueueattributes",

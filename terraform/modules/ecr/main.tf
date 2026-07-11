@@ -1545,11 +1545,13 @@ resource "aws_iam_policy" "terraform_plan_pr_read" {
       },
       {
         # This Lambda has a distinct read-only handler and execution role. The
-        # exact ARN is the sole semantic-read exception to the verb gate below.
+        # data source invokes with the explicit $LATEST qualifier, so IAM evaluates
+        # this exact qualified ARN rather than the unqualified function ARN.
+        # It is the sole semantic-read exception to the verb gate below.
         Sid      = "RelayIdentityStatusInvoke"
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
-        Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status"]
+        Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST"]
       },
       {
         Sid    = "AutoScalingRead"

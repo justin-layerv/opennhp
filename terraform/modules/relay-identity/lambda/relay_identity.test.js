@@ -117,6 +117,9 @@ describe("relay identity validation", () => {
     assert.match(terraform, /Action\s*=\s*\["ssm:GetParameter", "ssm:PutParameter"\]/);
     assert.match(lambda[1], /depends_on\s*=\s*\[time_sleep\.keygen_iam_propagation\]/);
     assert.match(statusLambda[1], /handler\s*=\s*"relay_identity\.statusHandler"/);
+    // This verbatim bootstrap tripwire is intentionally coupled to the pending
+    // status-only config change; revisit it in #3150 after the live policy proof.
+    assert.match(statusLambda[1], /description\s*=\s*"Read-only relay identity status \(\$LATEST-qualified invocation\)"/);
     assert.match(statusLambda[1], /role\s*=\s*aws_iam_role\.status_lambda\.arn/);
     const statusActions = [...statusPolicy[1].matchAll(/Action\s*=\s*\[([^\]]*)\]/g)]
       .flatMap((block) => [...block[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]))
@@ -134,7 +137,7 @@ describe("relay identity validation", () => {
     assert.match(statusPolicy[1], /Resource\s*=\s*\["\$\{aws_cloudwatch_log_group\.status\.arn\}:\*"\]/);
     assert.match(statusPolicy[1], /Resource\s*=\s*\[var\.secrets_kms_key_arn\]/);
     assert.doesNotMatch(terraform, /resource "aws_iam_role_policy_attachment" "status_lambda_basic"/);
-    assert.match(planPolicy, /Sid\s*=\s*"RelayIdentityStatusInvoke"[\s\S]*Action\s*=\s*\["lambda:InvokeFunction"\][\s\S]*function:\$\{var\.name_prefix\}-relay-status/);
+    assert.match(planPolicy, /Sid\s*=\s*"RelayIdentityStatusInvoke"[\s\S]*Action\s*=\s*\["lambda:InvokeFunction"\][\s\S]*function:\$\{var\.name_prefix\}-relay-status:\$LATEST/);
     assert.match(statusLambda[1], /function_name\s*=\s*"\$\{var\.name_prefix\}-relay-status"/);
     assert.match(publish[1], /Action\s*=\s*"publish-current"/);
     assert.match(publish[1], /aws_lambda_invocation\.keygen/);
@@ -142,6 +145,7 @@ describe("relay identity validation", () => {
     assert.match(publish[1], /can\(regex\([\s\S]*"\^\[A-Za-z0-9\+\/\]\{42\}\[AEIMQUYcgkosw048\]=\$"[\s\S]*currentPublicKey/);
     assert.match(status[1], /Action\s*=\s*"confirmed-status"/);
     assert.match(status[1], /aws_lambda_function\.status\.function_name/);
+    assert.match(status[1], /qualifier\s*=\s*"\$LATEST"/);
     assert.match(status[1], /aws_lambda_invocation\.publish_public_key/);
     assert.match(status[1], /versions\.AWSCURRENT[\s\S]*publicKey/);
     assert.doesNotMatch(terraform, /data "aws_ssm_parameter" "relay_public_key"/);

@@ -174,10 +174,13 @@ resource "aws_lambda_function" "keygen" {
 
 resource "aws_lambda_function" "status" {
   function_name = "${var.name_prefix}-relay-status"
-  role          = aws_iam_role.status_lambda.arn
-  handler       = "relay_identity.statusHandler"
-  runtime       = "nodejs22.x"
-  timeout       = 30
+  # The data source references this resource, so this status-only pending config
+  # change defers the bootstrap status read until apply.
+  description = "Read-only relay identity status ($LATEST-qualified invocation)"
+  role        = aws_iam_role.status_lambda.arn
+  handler     = "relay_identity.statusHandler"
+  runtime     = "nodejs22.x"
+  timeout     = 30
 
   # Intentionally use the account's bounded unreserved pool: concurrent PR
   # plans must not contend with the keygen singleton or a tiny status-specific
@@ -295,6 +298,10 @@ resource "aws_lambda_invocation" "publish_public_key" {
 # cross-principal Parameter Store read in Terraform.
 data "aws_lambda_invocation" "status" {
   function_name = aws_lambda_function.status.function_name
+  # Pin the provider's default explicitly. Lambda authorizes qualified invokes
+  # against the qualified ARN, so the PR-plan role grants this exact $LATEST
+  # target rather than a wildcard across versions or aliases.
+  qualifier = "$LATEST"
 
   input = jsonencode({
     Action = "confirmed-status"

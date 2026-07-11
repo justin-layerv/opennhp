@@ -39,11 +39,20 @@ reported as skipped so unrelated sandbox state does not block prod-only changes.
       with no account-wide `ListSecrets`. KMS decrypt is constrained to
       `alias/terraform-state` plus the NHP KMS aliases via
       `kms:ResourceAliases`. The sole non-read-verb exception is
-      `lambda:InvokeFunction` on the exact `${name_prefix}-relay-status`
-      function. Its distinct handler accepts only `confirmed-status`; its
+      `lambda:InvokeFunction` on the exact
+      `${name_prefix}-relay-status:$LATEST` qualified function ARN. The data
+      source pins `$LATEST` explicitly because the unqualified function ARN
+      does not authorize a qualified invocation. Its distinct handler accepts
+      only `confirmed-status`; its
       execution role can read the exact relay secret and public parameter and
       write only its own scoped CloudWatch log stream. It cannot invoke the
       multi-action identity/keygen handler or mutate relay identity state.
+      The status-only description update that defers the qualifier hotfix's
+      pre-policy read to apply is a one-time bootstrap artifact, not a
+      steady-state dependency of the plan gate. After the post-merge sandbox
+      apply and restricted-role re-plan prove the qualified policy live, remove
+      this bootstrap note, the status Lambda description, and its verbatim test
+      tripwire together.
       Sign-off must explicitly accept both this semantic-read invocation and
       its bounded log side effect. Each Terraform-touching PR plan therefore
       decrypts the full relay private key inside the scoped status Lambda long
@@ -60,8 +69,8 @@ reported as skipped so unrelated sandbox state does not block prod-only changes.
       Treat the read-only policy linter as a scoped-Sid tripwire: before adding
       any new value-bearing read Sid, extend the exact resource/condition
       assertions in `.github/scripts/check-terraform-plan-pr-policy-readonly.py`.
-      That lint must also keep the relay-status Invoke Sid, action, exact ARN,
-      and duplicate-Sid rejection pinned.
+      That lint must also keep the relay-status Invoke Sid, action, exact
+      `$LATEST` ARN, and duplicate-Sid rejection pinned.
       The workflow fetches the Auth0 token using a base-commit copy of sandbox
       `terraform.tfvars` so PR-head `auth0_domain` edits cannot redirect the
       long-lived client secret to another host, but the actual plan still

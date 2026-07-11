@@ -175,7 +175,7 @@ def policy_fixture(
           Sid      = "RelayIdentityStatusInvoke"
           Effect   = "Allow"
           Action   = ["lambda:InvokeFunction"]
-          Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status"]
+          Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST"]
         }
         """,
         """
@@ -335,8 +335,35 @@ class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
 
     def test_relay_status_invoke_resource_is_pinned(self) -> None:
         result = self.run_lint_with_replacement(
-            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status"',
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST"',
             '"arn:aws:lambda:${local.region}:${local.account_id}:function:*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exact read-only relay status Lambda", result.stderr)
+
+    def test_relay_status_invoke_requires_latest_qualifier(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST"',
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exact read-only relay status Lambda", result.stderr)
+
+    def test_relay_status_invoke_rejects_qualifier_wildcard(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST"',
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exact read-only relay status Lambda", result.stderr)
+
+    def test_relay_status_invoke_rejects_alternate_qualifier(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST"',
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:prod"',
         )
 
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
