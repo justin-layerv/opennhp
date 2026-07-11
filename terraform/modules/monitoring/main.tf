@@ -1419,13 +1419,14 @@ resource "aws_cloudwatch_metric_alarm" "server_forward_target_drop" {
 # #2208). nhp-server emits RelayForwardReject (MetricRelayForwardReject,
 # endpoints/server/relay.go) on every NHP_RLY forward it drops PRE-AUTH — most
 # operationally, the empty-relayPeerMap rejection (relay.go lookupRelayPeer
-# gate) that a server booting WITHOUT relay.toml produces. The boot trap: with
-# deploy_relay=true a transient Secrets Manager / IAM-lag failure makes
-# user_data skip writing relay.toml, the server starts with a nil relayPeerMap,
-# and it rejects EVERY relayed knock while only logging a user-data WARNING — a
-# silent misconfiguration. A sustained nonzero rate while the relay is wired is
-# also an attack signal (a non-relay peer injecting NHP_RLY, or a spoofed
-# SourceAddr). Either way: page.
+# gate) that a server with missing or stale relay.toml produces. Relay trust is
+# now rendered from a validated public-only SSM value: a missing/malformed key
+# fails Terraform before launch, and user_data writes relay.toml unconditionally
+# whenever relay is enabled. The remaining operational trap is incomplete server
+# fleet convergence after a trust overlap/retirement change (or out-of-band file
+# damage), leaving an instance unable to authorize the active relay identity. A
+# sustained nonzero rate is also an attack signal (a non-relay peer injecting
+# NHP_RLY, or a spoofed SourceAddr). Either way: page.
 #
 # DIM SET — {Environment, Cell}: emitted via Publisher.IncrCounter
 # (endpoints/metrics/publisher.go) with the publisher's base dims only (no extra
@@ -1474,7 +1475,7 @@ resource "aws_cloudwatch_metric_alarm" "relay_forward_reject" {
   period              = 300
   statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "nhp-server rejected >=1 NHP_RLY relay forward in the trailing hour while the relay is deployed. Most likely the server booted without relay.toml (transient Secrets Manager / IAM lag → user_data skipped writing it → empty relayPeerMap rejects every relayed knock, logged only as a user-data WARNING); a sustained rate can also be a spoofed/unregistered NHP_RLY sender. Check the cell server's user-data.log for the relay-secret fetch and that relay.toml exists, and server logs for HandleRelayForward drops. #2643."
+  alarm_description   = "nhp-server rejected >=1 NHP_RLY relay forward in the trailing hour while the relay is deployed. Most likely a server fleet did not fully refresh after a relay trust change, or relay.toml is missing/damaged; a sustained rate can also be a spoofed/unregistered NHP_RLY sender. Verify every server ASG instance uses its target launch-template version, inspect the rendered public-key set in relay.toml, and inspect server logs for HandleRelayForward drops. #2643."
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"

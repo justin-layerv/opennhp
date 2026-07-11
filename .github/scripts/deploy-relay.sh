@@ -75,6 +75,14 @@ fi
 ENVIRONMENT="$1"
 APP_CHANGED="$2"
 IMAGE_TAG="$3"
+if [[ "$ENVIRONMENT" != "sandbox" && "$ENVIRONMENT" != "prod" ]]; then
+  echo "Invalid environment '$ENVIRONMENT'; expected sandbox or prod." >&2
+  exit 1
+fi
+if [[ "$APP_CHANGED" != "true" && "$APP_CHANGED" != "false" ]]; then
+  echo "Invalid app_changed '$APP_CHANGED'; expected true or false." >&2
+  exit 1
+fi
 # aws-actions/configure-aws-credentials exports AWS_REGION into the step env, so
 # in CI this inherits the workflow region; the us-east-2 literal is only a local
 # fallback and won't silently diverge if the workflow region ever changes.

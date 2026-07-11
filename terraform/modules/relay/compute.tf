@@ -14,31 +14,6 @@ resource "aws_cloudwatch_log_group" "relay" {
   tags = merge(local.tags, { Name = "${var.name_prefix}-logs-relay" })
 }
 
-# Current deployed image tag — seeded by Terraform, updated by the CI deploy leg
-# (a follow-up). `ignore_changes=[value]` so CI updates don't drift.
-resource "aws_ssm_parameter" "image_tag" {
-  name        = "/${var.environment}/nhp/relay/image-tag"
-  description = "NHP Relay Docker image tag — updated by CI/CD"
-  type        = "String"
-  value       = var.image_tag
-
-  tags = merge(local.tags, { Name = "${var.name_prefix}-ssm-relay-image-tag" })
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
-
-# ASG name — for the CI deploy leg's instance-refresh.
-resource "aws_ssm_parameter" "asg_name" {
-  name        = "/${var.environment}/nhp/relay/asg-name"
-  description = "NHP Relay Auto Scaling Group name — used by CI/CD for instance refresh"
-  type        = "String"
-  value       = aws_autoscaling_group.relay.name
-
-  tags = merge(local.tags, { Name = "${var.name_prefix}-ssm-relay-asg-name" })
-}
-
 # ── IAM ──
 
 resource "aws_iam_role" "relay" {
@@ -72,7 +47,7 @@ resource "aws_iam_role_policy" "relay" {
       {
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
-        Resource = [aws_secretsmanager_secret.relay.arn]
+        Resource = [var.relay_secret_arn]
       },
       {
         Effect   = "Allow"
@@ -91,8 +66,8 @@ resource "aws_iam_role_policy" "relay" {
       },
       {
         Effect   = "Allow"
-        Action   = ["ssm:GetParameter", "ssm:GetParameters"]
-        Resource = ["arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter/${var.environment}/nhp/relay/*"]
+        Action   = ["ssm:GetParameter"]
+        Resource = ["arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_image_tag_parameter}"]
       },
       # Boot-failure metric (user_data emits LayerV/NHP BootstrapFailure).
       {
@@ -293,8 +268,6 @@ resource "aws_launch_template" "relay" {
       error_message = "relay max_capacity (${local.relay_max_capacity}) must be >= min_capacity (${local.relay_min_capacity})."
     }
   }
-
-  depends_on = [aws_lambda_invocation.keygen]
 }
 
 # ── ASG: horizontal fleet, one instance per AZ ──

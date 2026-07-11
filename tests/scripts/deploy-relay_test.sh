@@ -378,6 +378,18 @@ LAST_RC=$?
 assert_rc "wrong arg count fails" 1
 assert_contains "wrong arg count prints usage" "Usage: "
 
+run_case_env staging invalid-environment true deadbeef
+assert_rc "invalid environment fails" 1
+assert_contains "invalid environment is explicit" "Invalid environment 'staging'; expected sandbox or prod."
+assert_file_absent "invalid environment performs no SSM write" "$LAST_STATE_DIR/put"
+assert_file_absent "invalid environment performs no ASG refresh" "$LAST_STATE_DIR/refresh"
+
+run_case invalid-app-changed TRUE deadbeef
+assert_rc "invalid app_changed fails" 1
+assert_contains "invalid app_changed is explicit" "Invalid app_changed 'TRUE'; expected true or false."
+assert_file_absent "invalid app_changed performs no SSM write" "$LAST_STATE_DIR/put"
+assert_file_absent "invalid app_changed performs no ASG refresh" "$LAST_STATE_DIR/refresh"
+
 run_case dark-skip true deadbeef FAKE_GET_MODE=notfound
 assert_rc "dark relay skips cleanly" 0
 assert_contains "dark skip emits notice" "relay not deployed in sandbox"

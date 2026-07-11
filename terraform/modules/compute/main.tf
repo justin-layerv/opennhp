@@ -601,13 +601,6 @@ resource "aws_iam_role_policy" "server" {
           [var.etcd_tls_secret_arn],
           [var.qurl_service_token_secret_arn],
           [var.nhp_internal_auth_secret_arn],
-          # #2208 5c: read the relay fleet's keypair to render relay.toml at boot
-          # (the server trusts the relay's pubkey). Constructed ARN by name — NOT
-          # module.relay.secret_arn, which would close a compute→relay module
-          # cycle (relay already consumes module.compute.server_public_key_b64).
-          # `-*` matches Secrets Manager's random suffix; compact() drops the ""
-          # when the relay is not deployed (relay_enabled=false).
-          [var.relay_enabled ? "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-relay-*" : ""]
         ))
       },
       {
@@ -917,14 +910,22 @@ locals {
     http_read_timeout_ms  = var.http_timeouts_ms.read
     http_write_timeout_ms = var.http_timeouts_ms.write
     http_idle_timeout_ms  = var.http_timeouts_ms.idle
-    # #2208 5c: server trusts the relay. relay_enabled (= deploy_relay) drives
-    # DisableRelayValidation in config.toml AND gates the relay.toml render (the
-    # server fetches the relay fleet pubkey from Secrets Manager at boot). Prod
-    # (deploy_relay=false) → DisableRelayValidation=false + no relay.toml, so it
-    # stays behaviorally dark. relay_secret_name is the deterministic relay secret
-    # name (constructed, not a module ref → no compute→relay cycle).
-    relay_enabled     = var.relay_enabled
-    relay_secret_name = "${var.name_prefix}-relay"
+    # #2208 5c: server trusts public relay identities supplied by the independent
+    # relay-identity module. The server never reads the relay private-key secret.
+    # relay_enabled remains the static topology gate for config/count resources;
+    # the launch-template precondition below requires a non-empty trust set when lit.
+    # The template's disabled branch deliberately preserves the former
+    # comment-only output byte-for-byte so this sandbox-only migration does not
+    # publish a production server launch-template change. Do not editorially
+    # simplify that branch without accepting and planning a prod server roll.
+    relay_enabled                 = var.relay_enabled
+    relay_trusted_public_keys_b64 = var.relay_trusted_public_keys_b64
+    # chomp removes the rendered template's terminal newline because the
+    # user-data interpolation line contributes it. Without this, relay.toml
+    # receives a cosmetic blank line immediately before its heredoc delimiter.
+    relay_toml = var.relay_enabled ? chomp(templatefile("${path.module}/relay.toml.tpl", {
+      relay_trusted_public_keys_b64 = var.relay_trusted_public_keys_b64
+    })) : ""
   })
 
   # Launch template user_data — small fetcher when the plugin bucket exists,
@@ -1028,6 +1029,37 @@ chmod +x /tmp/server-init.sh
 exec /tmp/server-init.sh
 BOOTSTRAP
   ) : base64gzip(local.user_data) # legacy inline path — only kept as a structural fallback for bucket-not-yet-provisioned bootstrap; fails for the same size reason this PR exists to fix, so it's not a viable runtime rollback. To roll back, revert this PR.
+}
+
+# Plan-time fence required by terraform/CLAUDE.md for the first multi-line
+# templatefile variable embedded in this bash template. The relay TOML is safe
+# only because it occupies the body of a single-quoted heredoc; keep that exact
+# placement and independently reject an unescaped interpolation in bash comments
+# so a future documentation/refactor edit cannot reintroduce the #2044 class.
+resource "terraform_data" "relay_toml_render_fence" {
+  count = var.relay_enabled ? 1 : 0
+
+  # Make template edits visible on this otherwise state-only guard as well as
+  # on the launch template that consumes the rendered user data.
+  input = filesha256("${path.module}/user_data.sh.tpl")
+
+  lifecycle {
+    precondition {
+      condition = length(regexall(
+        "(?m)cat > /opt/layerv/nhp-server/etc/relay\\.toml << 'RELAYEOF'\\n\\$\\{relay_toml\\}\\nRELAYEOF",
+        file("${path.module}/user_data.sh.tpl"),
+      )) == 1
+      error_message = "user_data.sh.tpl must interpolate relay_toml exactly once as the body of the single-quoted RELAYEOF heredoc; review the multi-line templatefile safety rule in terraform/CLAUDE.md before changing this placement."
+    }
+
+    precondition {
+      condition = length(regexall(
+        "(?m)(^|[[:space:]])#(?:[^\\n]*[^$\\n])?\\$\\{relay_toml\\}",
+        file("${path.module}/user_data.sh.tpl"),
+      )) == 0
+      error_message = "user_data.sh.tpl must not interpolate the multi-line relay_toml value inside a bash comment; escape a documentation-only token or keep the value inside its single-quoted heredoc."
+    }
+  }
 }
 
 # Server bootstrap script in S3 (mirrors AC module pattern). The rendered
@@ -1149,6 +1181,14 @@ resource "aws_launch_template" "server" {
     precondition {
       condition     = (var.plugin_bucket_name == null) == (var.plugin_download_policy_arn == null)
       error_message = "plugin_bucket_name and plugin_download_policy_arn must be set together — the bucket needs the policy's KMS Decrypt grant or instances brick at boot."
+    }
+
+    precondition {
+      condition = (
+        (var.relay_enabled && length(var.relay_trusted_public_keys_b64) > 0) ||
+        (!var.relay_enabled && length(var.relay_trusted_public_keys_b64) == 0)
+      )
+      error_message = "relay_enabled and relay_trusted_public_keys_b64 must be enabled together: a lit relay needs at least one public trust key, while a dark environment must not render relay.toml."
     }
   }
 

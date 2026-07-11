@@ -3015,6 +3015,30 @@ variable "deploy_relay" {
   default     = false
 }
 
+# Canonical-key and ordering rules are mirrored by both environment wrappers
+# and modules/compute's final trust-set input; keep those contracts in lockstep.
+variable "relay_additional_trusted_public_keys_b64" {
+  description = "Canonically sorted public-only X25519 keys trusted during guarded relay identity rotation. Never pass private key material here."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for key in var.relay_additional_trusted_public_keys_b64 :
+      can(base64decode(key)) ? (
+        length(base64decode(key)) == 32 &&
+        base64encode(base64decode(key)) == key
+      ) : false
+    ])
+    error_message = "Every additional relay public key must be canonical standard Base64 encoding exactly 32 bytes."
+  }
+
+  validation {
+    condition     = var.relay_additional_trusted_public_keys_b64 == sort(distinct(var.relay_additional_trusted_public_keys_b64))
+    error_message = "relay_additional_trusted_public_keys_b64 must already be sorted and duplicate-free."
+  }
+}
+
 # #2208 phase #8 / #2628: the final cutover that takes nhp-server OFF the internet.
 # When true, the PUBLIC knock NLB (aws_lb.server: UDP 62206 listener + 0.0.0.0/0
 # ingress) is removed and the in-VPC AC + qurl-service server host repoint to the

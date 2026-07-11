@@ -25,6 +25,8 @@ runbook file is added, renamed, or removed.
 - [qurl-service internal v1 triage](qurl-internal-v1-triage.md)
 - [qurl-api webhook events dropped](qurl-webhook-suppressed-lookup-failed.md)
 - [Relay CloudWatch alarms](relay-alarms.md)
+- [Relay identity rotation](relay-identity-rotation.md)
+- [Sandbox relay control-plane migration](sandbox-relay-control-plane-migration.md)
 - [Sandbox app-image drift gate](sandbox-app-image-drift.md)
 - [NHP server forward-send safety](server-forward-safety.md)
 - [terraform-prod-drift detector findings](terraform-prod-drift.md)

@@ -60,6 +60,7 @@ on:
       - "terraform/variables.tf"
       - "terraform/environments/sandbox/variables.tf"
       - "terraform/environments/prod/variables.tf"
+      - "terraform/modules/compute/variables.tf"
       # eBPF load-path + FilterMode lockstep (#2810, #2812, #2815): trigger on
       # the script + its fixture test and on the source-of-truth sites it
       # compares that aren't watched elsewhere: Go object-path consts
@@ -354,6 +355,7 @@ jobs:
             .github/scripts/verify-asg-instances-healthy.sh \
             .github/scripts/recover-relay-deposed-sg.sh \
             .github/scripts/check-relay-deposed-sg-clear.sh \
+            scripts/rotate-relay-identity.sh \
             tests/scripts/prune-missing-asg-target-groups_test.sh \
             tests/scripts/wait-for-instance-refresh_test.sh \
             tests/scripts/deploy-relay_test.sh \
@@ -361,7 +363,8 @@ jobs:
             tests/scripts/emit-deployment-window-metric_test.sh \
             tests/scripts/verify-asg-instances-healthy_test.sh \
             tests/scripts/recover-relay-deposed-sg_test.sh \
-            tests/scripts/check-relay-deposed-sg-clear_test.sh
+            tests/scripts/check-relay-deposed-sg-clear_test.sh \
+            tests/scripts/rotate-relay-identity_test.sh
           bash tests/scripts/prune-missing-asg-target-groups_test.sh
           bash tests/scripts/wait-for-instance-refresh_test.sh
           bash tests/scripts/deploy-relay_test.sh
@@ -370,6 +373,10 @@ jobs:
           bash tests/scripts/verify-asg-instances-healthy_test.sh
           bash tests/scripts/recover-relay-deposed-sg_test.sh
           bash tests/scripts/check-relay-deposed-sg-clear_test.sh
+          bash tests/scripts/rotate-relay-identity_test.sh
+          node --test terraform/modules/relay-identity/lambda/relay_identity.test.js
+          node --test terraform/modules/compute/relay_toml_template.test.js
+          python3 tests/scripts/test_relay_trusted_key_validation_lockstep.py
 
       # Regression fence for aws cloudwatch put-metric-data: its --dimensions
       # option uses command-specific Key=Value shorthand, not the

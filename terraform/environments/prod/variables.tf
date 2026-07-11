@@ -2103,6 +2103,30 @@ variable "deploy_relay" {
   default     = false
 }
 
+# Keep canonical-key and ordering rules in lockstep with terraform/variables.tf,
+# the sandbox wrapper, and modules/compute/variables.tf.
+variable "relay_additional_trusted_public_keys_b64" {
+  description = "Sorted, duplicate-free public X25519 keys trusted temporarily during relay identity rotation."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for key in var.relay_additional_trusted_public_keys_b64 :
+      can(base64decode(key)) ? (
+        length(base64decode(key)) == 32 &&
+        base64encode(base64decode(key)) == key
+      ) : false
+    ])
+    error_message = "Every additional relay public key must be canonical standard Base64 encoding exactly 32 bytes."
+  }
+
+  validation {
+    condition     = var.relay_additional_trusted_public_keys_b64 == sort(distinct(var.relay_additional_trusted_public_keys_b64))
+    error_message = "relay_additional_trusted_public_keys_b64 must already be sorted and duplicate-free."
+  }
+}
+
 # #2208 phase #8 / #2628: prod stays PUBLIC (false) until a dedicated prod-cutover
 # PR after the relay carries real browser traffic in prod (#6/#2680) + the resolve
 # plugin is retired (#7). Forwarded to module.nhp; flipping it requires deploy_relay

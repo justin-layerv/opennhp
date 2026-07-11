@@ -1564,6 +1564,13 @@ jobs:
         working-directory: terraform/environments/${{ matrix.environment }}
         run: terraform validate
 
+      - name: Test actual relay TOML Terraform rendering
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        working-directory: tests/terraform/relay-toml-render
+        run: |
+          terraform init -backend=false
+          terraform test
+
       - name: Check qurl SLO lockstep (variables.tf vs dashboard JSON)
         # Repo-wide invariant check; run once on the sandbox leg so a
         # mismatch fails once, not twice.

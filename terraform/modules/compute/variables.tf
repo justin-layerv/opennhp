@@ -511,9 +511,33 @@ variable "enable_qurl_resolve_endpoint" {
 }
 
 variable "relay_enabled" {
-  description = "#2208 5c: whether an NHP-Relay is deployed (= var.deploy_relay). When true, the server renders relay.toml with the relay fleet's pubkey (boot-read from Secrets Manager) and sets DisableRelayValidation=true so it trusts the shared-keypair relay fleet. A plain bool (NOT a module.relay ref) to avoid a compute→relay module cycle. Default false → server stays behaviorally dark (no relay peers, validation at default)."
+  description = "#2208 5c: whether an NHP-Relay is deployed (= var.deploy_relay). When true, the server renders relay.toml from relay_trusted_public_keys_b64 and sets DisableRelayValidation=true. This remains a static bool because it gates count/for_each resources; public trust material is a separate explicit input. Default false keeps the server behaviorally dark."
   type        = bool
   default     = false
+}
+
+# Keep canonical-key and ordering rules in lockstep with the root additional-key
+# input and both environment wrappers; this is the final server trust-set gate.
+variable "relay_trusted_public_keys_b64" {
+  description = "Public-only X25519 relay identities trusted by the server. Root passes the current relay identity plus any temporary overlap key during rotation. The server instance role never reads the relay private-key secret. Must be non-empty exactly when relay_enabled=true."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for key in var.relay_trusted_public_keys_b64 :
+      can(base64decode(key)) ? (
+        length(base64decode(key)) == 32 &&
+        base64encode(base64decode(key)) == key
+      ) : false
+    ])
+    error_message = "relay_trusted_public_keys_b64 entries must be canonical standard-base64 encodings of exactly 32 bytes."
+  }
+
+  validation {
+    condition     = var.relay_trusted_public_keys_b64 == sort(distinct(var.relay_trusted_public_keys_b64))
+    error_message = "relay_trusted_public_keys_b64 must be unique and canonically sorted."
+  }
 }
 
 variable "qurl_resolve_certificate_arn" {

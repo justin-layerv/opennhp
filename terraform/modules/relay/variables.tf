@@ -29,7 +29,7 @@ variable "environment" {
 }
 
 variable "name_prefix" {
-  description = "Resource name prefix (e.g. `layerv-nhp-sandbox`). Drives the Secrets Manager secret name (`$${name_prefix}-relay`), IAM role/profile, SG, and log-group names."
+  description = "Resource name prefix for the environment's single relay fleet."
   type        = string
 }
 
@@ -133,9 +133,24 @@ variable "server_ami_id" {
   default     = null
 }
 
-variable "image_tag" {
-  description = "Initial relay Docker image tag seeded into the SSM image-tag parameter. CI updates the SSM value on deploy (the param has `ignore_changes=[value]`), so this is only the bootstrap value. Use a pullable deploying commit SHA — the relay build leg (build-and-push.yml) tags `layerv/nhp-relay` by the same SHA as the server/ac images. Do not apply the relay module with a placeholder/non-existent seed tag: infra-only refreshes intentionally keep the current SSM tag and roll the fleet on it."
+variable "ssm_image_tag_parameter" {
+  description = "Root-owned shared SSM parameter name containing the relay image tag."
   type        = string
+
+  validation {
+    condition     = var.ssm_image_tag_parameter == "/${var.environment}/nhp/relay/image-tag"
+    error_message = "ssm_image_tag_parameter must use the stable /<environment>/nhp/relay/image-tag path."
+  }
+}
+
+variable "relay_secret_arn" {
+  description = "ARN of the independently owned relay identity secret. Only relay instances receive read access."
+  type        = string
+
+  validation {
+    condition     = can(regex("^arn:(aws|aws-us-gov|aws-cn):secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$", var.relay_secret_arn))
+    error_message = "relay_secret_arn must be a Secrets Manager secret ARN."
+  }
 }
 
 variable "instance_type" {
@@ -267,62 +282,14 @@ variable "secrets_kms_key_arn" {
   default     = null
 }
 
-# ── DNS + cert (mirrors modules/bootstrap-alb) ──
-
-variable "dns_name" {
-  description = "Public DNS name fronting the relay ALB. Sandbox: `relay.qurl.link.layerv.xyz`. Browsers POST `https://{dns_name}/relay/{serverId}`."
+variable "certificate_arn" {
+  description = "Root-owned regional ACM certificate ARN attached to this fleet's HTTPS listener."
   type        = string
 
   validation {
-    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.dns_name))
-    error_message = "dns_name must be a valid lowercase FQDN."
+    condition     = can(regex("^arn:(aws|aws-us-gov|aws-cn):acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9-]{36}$", var.certificate_arn))
+    error_message = "certificate_arn must be a valid regional ACM ARN."
   }
-}
-
-variable "route53_zone_id" {
-  description = "Hosted zone ID for the parent of `dns_name`. Required when `provision_certificate=true` (ACM DNS-validation CNAMEs) or `manage_dns_alias=true` (alias record). Empty when both are false (cross-account, operator-managed DNS)."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.route53_zone_id == "" || can(regex("^Z[A-Z0-9]{8,}$", var.route53_zone_id))
-    error_message = "route53_zone_id must be a Route53 zone ID (uppercase, starting with Z) or empty string."
-  }
-}
-
-variable "provision_certificate" {
-  description = "Whether this module provisions+validates a regional ACM cert for `dns_name`. True when the parent zone is same-account (DNS validation writes CNAMEs there). Sandbox: true (`layerv.xyz`). Prod: false (operator pre-provisions cross-account; supply `existing_certificate_arn`)."
-  type        = bool
-  default     = false
-}
-
-variable "existing_certificate_arn" {
-  description = "Regional ACM cert ARN to attach when `provision_certificate=false`. Must be in the same region+account as the ALB (ACM certs are not cross-account-attachable to an ALB)."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.existing_certificate_arn == "" || can(regex("^arn:(aws|aws-us-gov|aws-cn):acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9-]{36}$", var.existing_certificate_arn))
-    error_message = "existing_certificate_arn must be empty or a valid regional ACM ARN."
-  }
-}
-
-variable "manage_dns_alias" {
-  description = "Whether this module writes the A-alias from `dns_name` to the ALB. True when the parent zone is same-account. Sandbox: true. Prod: false (operator writes the alias cross-account)."
-  type        = bool
-  default     = false
-}
-
-variable "route53_record_change_iam_propagation_triggers" {
-  description = "Optional trigger map for waiting on Terraform CI Route53 record-change IAM propagation before same-account DNS writes."
-  type        = map(string)
-  default     = {}
-}
-
-variable "route53_record_change_iam_propagation_duration" {
-  description = "Duration to wait for Route53 record-change IAM propagation before same-account DNS writes."
-  type        = string
-  default     = "60s"
 }
 
 # ── WAF ──

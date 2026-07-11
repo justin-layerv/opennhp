@@ -773,12 +773,10 @@ module "compute" {
   # Deployment configuration
   image_tag = var.image_tag
 
-  # #2208 5c: gate the server's relay trust on whether a relay is deployed (what
-  # the flag renders is documented on the module's relay_enabled variable). Pass a
-  # plain bool, NOT module.relay.* — module.relay already consumes
-  # module.compute.server_public_key_b64, so a back-reference would close a
-  # compute<->relay cycle.
-  relay_enabled = var.deploy_relay
+  # Servers receive public trust material only. Private relay identity custody
+  # remains in relay-identity and is never granted to the server role.
+  relay_enabled                 = var.deploy_relay
+  relay_trusted_public_keys_b64 = local.relay_trusted_public_keys_b64
 
   # #2208 #8 / #2628: when take_server_private=true, the module drops the PUBLIC
   # knock NLB (UDP 62206 + 0.0.0.0/0 ingress) and the relay's internal NLB becomes
@@ -5436,18 +5434,10 @@ module "bootstrap_alb" {
   depends_on = [time_sleep.bootstrap_alb_iam_propagation]
 }
 
-# NHP-Relay (#2208 Phase-2 #5): internet-facing autoscaling relay fleet (one
-# instance per AZ baseline) that forwards browser knocks to the (private) cell
-# servers. Shipped DARK until 5c (#2627): until the server boot-reads the relay
-# fleet pubkey from Secrets Manager into its relay.toml AND sets
-# DisableRelayValidation=true, every forward is rejected at the server's Noise
-# layer, so the surface is internet-reachable but inert. 5c gates both on
-# var.deploy_relay (module "compute" relay_enabled) and reconstructs the secret
-# name by convention rather than consuming module.relay.* — a back-reference
-# would close a compute<->relay cycle (this module already consumes
-# module.compute.server_public_key_b64). The fleet authenticates by pubkey +
-# relay.toml, not source IP. See docs/design/NHP_RELAY_TOPOLOGY.md + the tracking
-# issue #2629.
+# NHP relay fleet. Shared identity, image pin, certificate, and DNS live in
+# relay_control_plane.tf so the fleet can be replaced by the DMZ deployment
+# without rotating or recreating durable control-plane resources. There is one
+# fleet per environment.
 module "relay" {
   count  = var.deploy_relay ? 1 : 0
   source = "./modules/relay"
@@ -5470,10 +5460,13 @@ module "relay" {
 
   # Relay image (5b-1 ECR repo) + AMI (reuse the server AMI: Docker + awscli +
   # the systemd-resolved stub fix the relay's startup CloudMap resolve needs).
-  relay_repo_url = module.ecr.relay_repo_url
-  relay_repo_arn = module.ecr.relay_repo_arn
-  server_ami_id  = var.server_ami_id
-  image_tag      = var.image_tag
+  relay_repo_url          = module.ecr.relay_repo_url
+  relay_repo_arn          = module.ecr.relay_repo_arn
+  server_ami_id           = var.server_ami_id
+  ssm_image_tag_parameter = aws_ssm_parameter.relay_image_tag[0].name
+
+  relay_secret_arn = module.relay_identity[0].secret_arn
+  certificate_arn  = local.relay_effective_certificate_arn
 
   # Cell routing: one entry per cell. Today there is a single cell (the cell0
   # compute module). The serverId in /relay/{id} is the cell pubkey's
@@ -5515,13 +5508,6 @@ module "relay" {
   # e.g. join("," [...]) — the daemon already accepts a list.
   cors_allowed_origins = var.qurl_link_frontend_domain != null ? "https://${var.qurl_link_frontend_domain}" : ""
 
-  # DNS + cert (mirrors the bootstrap_alb provision-or-existing posture).
-  dns_name                 = var.relay_dns_name
-  route53_zone_id          = var.relay_route53_zone_id
-  provision_certificate    = var.relay_provision_certificate
-  manage_dns_alias         = var.relay_manage_dns_alias
-  existing_certificate_arn = var.relay_existing_certificate_arn
-
   # WAF + scaling knobs surfaced to the env layer so #6 tuning is a tfvars change.
   waf_rate_limit_per_source_ip = var.relay_waf_rate_limit_per_source_ip
   scale_requests_per_target    = var.relay_scale_requests_per_target
@@ -5530,9 +5516,6 @@ module "relay" {
   # topic modules/ac uses for its alarm_actions. module.monitoring is
   # unconditional, so passing it into the count-gated relay module is safe.
   alarm_sns_topic_arn = module.monitoring.sns_topic_arn
-
-  route53_record_change_iam_propagation_triggers = local.route53_record_change_iam_propagation_triggers
-  route53_record_change_iam_propagation_duration = local.iam_propagation_duration
 }
 
 # #2208 #8 / #2628: hard prerequisites for take_server_private. Removing the public
@@ -5554,42 +5537,6 @@ resource "terraform_data" "take_server_private_preconditions" {
       condition     = var.qurl_link_js_agent_enabled
       error_message = "take_server_private=true requires qurl_link_js_agent_enabled=true: browser knocks must already route through the relay and the public resolve endpoint must be disabled (enable_qurl_resolve_endpoint = deploy_qurl_link && !qurl_link_js_agent_enabled) before the public knock surface is removed."
     }
-  }
-}
-
-# #2208 5c: guardrail for the relay-secret name coupling. module.compute does NOT
-# reference module.relay (that would close a compute<->relay module cycle —
-# module.relay already consumes module.compute.server_public_key_b64). Instead the
-# server reconstructs the relay secret name as "${local.name_prefix}-relay" by
-# convention (config.toml DisableRelayValidation, the relay.toml boot-read, and
-# the secret:${local.name_prefix}-relay-* IAM grant all derive from it). Nothing
-# else keeps the two sides in lockstep, so a relay-side rename would silently
-# darken the server's relay trust at boot (relay.toml skipped, every NHP_RLY
-# rejected, only a WARNING in user-data.log). This check SURFACES that drift as a
-# plan-time WARNING — terraform `check` assertions are advisory (they don't fail
-# plan/apply), so it's a visibility aid, not a hard gate. `one(module.relay[*].secret_arn)`
-# is null when deploy_relay=false (index-safe), so the disabled case passes. #2634
-# is the structural fence: hoist the name to a shared root local threaded into both
-# modules (cycle-free), making drift impossible and retiring this advisory check.
-check "relay_secret_name_convention" {
-  assert {
-    condition = (
-      var.deploy_relay == false ||
-      can(regex(":secret:${local.name_prefix}-relay-", one(module.relay[*].secret_arn)))
-    )
-    error_message = <<-EOT
-      module.relay's secret ARN no longer matches the name
-      "${local.name_prefix}-relay" that module.compute reconstructs by
-      convention. The server fleet would boot, find no readable relay secret,
-      skip writing relay.toml, and reject every NHP_RLY (relay path dark) with
-      only a WARNING in user-data.log.
-
-      Fix: keep modules/relay's aws_secretsmanager_secret "relay" name in
-      lockstep with the "${local.name_prefix}-relay" reconstruction in module
-      "compute" (relay_secret_name + the IAM grant), or thread the name
-      explicitly. The name is reconstructed rather than referenced to avoid a
-      compute<->relay module cycle.
-    EOT
   }
 }
 
