@@ -100,8 +100,13 @@ Parameters using this pattern:
 relay control-plane resources, relay networking, endpoint policies, IAM, or
 telemetry, inspect and update
 [`../.github/scripts/check-relay-dmz-plan.py`](../.github/scripts/check-relay-dmz-plan.py)
-and its mutation tests in the same PR. PR #3150 activates that checker against
-the sandbox plan; partial contract overrides are intentionally rejected.
+and its mutation tests in the same PR. Until PR #3150 lands, that canonical
+path is a temporary dispatcher: the current contract remains inline, while the
+HTTPS-only contract and its mutation suite use the `-https.py` siblings. Keep
+the dispatcher, both contract suites, and the transition suite in lockstep. PR
+#3150 promotes the HTTPS-only checker back to the canonical path and activates
+it against the sandbox plan; partial contract overrides are intentionally
+rejected.
 
 **Relay active-color routing guardrail (#2658).** Blue/green server colors are
 deploy slots inside one relay cell, not separate relay cells. Do not create

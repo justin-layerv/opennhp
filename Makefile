@@ -472,9 +472,12 @@ lint-workflows:
 	@python3 tests/scripts/test_summarize_terraform_plan.py
 	@python3 tests/scripts/test_relay_trusted_key_validation_lockstep.py
 	@python3 -m py_compile .github/scripts/check-relay-dmz-plan.py
+	@python3 -m py_compile .github/scripts/check-relay-dmz-plan-https.py
 	@command -v terraform >/dev/null 2>&1 || \
 		echo "$(COLOUR_YELLOW)[OpenNHP] terraform not found: relay DMZ Terraform-backed tests skip locally; set REQUIRE_TERRAFORM=1 for CI parity.$(END_COLOUR)"
 	@python3 tests/scripts/test_check_relay_dmz_plan.py
+	@python3 tests/scripts/test_check_relay_dmz_plan_https.py
+	@python3 tests/scripts/test_check_relay_dmz_plan_transition.py
 	@python3 -m py_compile scripts/check-relay-dmz-live.py
 	@python3 tests/scripts/test_check_relay_dmz_live.py
 	@python3 -c 'import yaml' 2>/dev/null || { \
