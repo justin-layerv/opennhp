@@ -851,6 +851,37 @@ resource "aws_iam_role" "github_actions" {
               "repo:${var.github_org}/${var.qurl_github_repo}:environment:sandbox",
               "repo:${var.github_org}/${var.qurl_github_repo}:environment:production"
             ] : [],
+            # QURL Service gated pre-merge Environment — SANDBOX-ONLY.
+            #
+            # qurl-service split its shared `sandbox` Environment so main-branch
+            # deploys run ungated (continuous deployment) while same-repo PR code
+            # (the qv2 pre-merge smoke and its docker-build image push) stays
+            # behind a required-reviewers approval on the `sandbox-premerge`
+            # Environment before it can assume this role. Like every entry here it
+            # is an `:environment:` claim (no bare `:ref:refs/heads/main`), so the
+            # GH Environment approval gate is the security boundary — see the
+            # qurl-reverse-tunnel-server threat-model note below.
+            #
+            # Gated on `var.environment == "sandbox"` (mirrors
+            # `enable_terraform_plan_pr_role` above) so this claim never lands on
+            # the `nhp-prod-github-actions` role. `sandbox-premerge` exists only
+            # for qurl-service's sandbox PR smoke, which assumes the sandbox-
+            # account role; because it carries UNTRUSTED PR code, least-privilege
+            # matters more than for the trusted merged-code `:environment:sandbox`
+            # / `:production` claims — the prod role must not trust it.
+            #
+            # NOTE for reviewers of the `sandbox-premerge` GH Environment: this
+            # role is terraform-apply-equivalent on sandbox (EC2/networking, IAM,
+            # ECS, SES, data, qurl-link CloudFront/S3 — not just ECR push), and a
+            # PR runs arbitrary PR-head code in its steps. So approving a
+            # `sandbox-premerge` deployment hands that PR code the full sandbox
+            # apply-equivalent STS creds — the approval is a CODE-TRUST gate, not
+            # a deploy-confirmation click. Vet the PR's workflow/Dockerfile/test
+            # changes before approving. Narrowing this to an ECR/ECS-scoped role
+            # is tracked as a follow-up (nhp#3182).
+            var.deploy_qurl_ecr && var.qurl_github_repo != "" && var.environment == "sandbox" ? [
+              "repo:${var.github_org}/${var.qurl_github_repo}:environment:sandbox-premerge"
+            ] : [],
             # qurl-reverse-tunnel-server repo (publishes its image to ECR).
             #
             # Intentionally NOT gated on a `deploy_frps`-style flag (asymmetric
