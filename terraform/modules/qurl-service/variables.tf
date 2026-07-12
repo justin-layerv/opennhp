@@ -1418,3 +1418,9 @@ variable "agent_otp_pepper_secret_arn" {
     error_message = "agent_otp_pepper_secret_arn must be empty (OTP dark) or a valid Secrets Manager ARN."
   }
 }
+
+variable "agent_otp_config_set_name" {
+  description = "Name of the SES v2 configuration set qurl-service passes as configuration_set_name on every OTP SendEmail — created at the ROOT (agent_otp_ses.tf) as `<name_prefix>-agent-otp` and wired in from there. SESv2 SendEmail WITH a configuration set authorizes ses:SendEmail against BOTH the sender identity AND the config-set resource, so the task-role send grant (task_agent_otp_ses) must list this config-set ARN alongside the identity ARN — omitting it yields AccessDenied on ses:SendEmail for the config-set. Empty when the OTP path is dark: the send grant is count-gated on agent_otp_enabled, so this stays unreferenced (empty-safe)."
+  type        = string
+  default     = ""
+}

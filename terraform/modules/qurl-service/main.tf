@@ -216,8 +216,10 @@ locals {
 
   # Agent-OTP SES sender domain, derived from the From address (noreply@<domain>
   # → <domain>) — the SES identity is a DOMAIN identity, so ses:SendEmail scopes to
-  # identity/<domain>. Empty-safe: when the OTP path is dark agent_otp_email_from
-  # is "" and this local is "" (the SES send policy is count=0 anyway).
+  # identity/<domain> (and, because qurl-service names a configuration set on every
+  # send, also to configuration-set/<name> — see task_agent_otp_ses below). Empty-
+  # safe: when the OTP path is dark agent_otp_email_from is "" and this local is ""
+  # (the SES send policy is count=0 anyway).
   agent_otp_sender_domain = var.agent_otp_email_from != "" ? split("@", var.agent_otp_email_from)[1] : ""
   # The root wires this to the cell-wide alerts topic and the module uses it for
   # every qurl-service alarm surface (qurl-api, scanner Lambda,
@@ -1045,9 +1047,13 @@ resource "aws_iam_role_policy" "task_stripe_secret" {
 #
 # Gated on agent_otp_enabled (count) so a DARK env gets NO SES grant, matching the
 # dark-launch discipline of every other agent-OTP resource. Scoped to the sender
-# DOMAIN identity (identity/<domain>, mirroring modules/billing + modules/auth0),
-# NOT Resource="*", and further constrained by a ses:FromAddress condition to the
-# configured sender so the role can only send AS that address.
+# DOMAIN identity (identity/<domain>, mirroring modules/billing + modules/auth0)
+# AND the configuration-set/<name> qurl-service names on every send — SESv2
+# SendEmail with a configuration_set_name authorizes ses:SendEmail against the
+# config-set resource too, so an identity-only grant AccessDenies on the config-set
+# — NOT Resource="*", and further constrained by a ses:FromAddress condition to the
+# configured sender so the role can only send AS that address (the condition applies
+# correctly to both resources).
 resource "aws_iam_role_policy" "task_agent_otp_ses" {
   count = var.agent_otp_enabled ? 1 : 0
   name  = "agent-otp-ses-send"
@@ -1056,10 +1062,17 @@ resource "aws_iam_role_policy" "task_agent_otp_ses" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid      = "AgentOTPSendEmail"
-      Effect   = "Allow"
-      Action   = ["ses:SendEmail"]
-      Resource = ["arn:aws:ses:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:identity/${local.agent_otp_sender_domain}"]
+      Sid    = "AgentOTPSendEmail"
+      Effect = "Allow"
+      Action = ["ses:SendEmail"]
+      Resource = [
+        # The sender DOMAIN identity...
+        "arn:aws:ses:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:identity/${local.agent_otp_sender_domain}",
+        # ...AND the config set qurl-service names on every send: SESv2 SendEmail
+        # with a configuration_set_name authorizes ses:SendEmail against the
+        # config-set resource too, so identity-only 403s on the config-set.
+        "arn:aws:ses:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:configuration-set/${var.agent_otp_config_set_name}",
+      ]
       Condition = {
         "StringEquals" = {
           "ses:FromAddress" = var.agent_otp_email_from

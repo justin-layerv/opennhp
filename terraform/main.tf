@@ -2878,6 +2878,10 @@ module "qurl_service" {
   agent_otp_email_from        = var.agent_otp_email_from
   agent_otp_relay_base_url    = var.agent_registration_relay_base_url
   agent_otp_pepper_secret_arn = var.agent_otp_enabled ? aws_secretsmanager_secret.agent_otp_pepper[0].arn : ""
+  # Config-set name the task role's ses:SendEmail grant must also authorize (SESv2
+  # SendEmail with a configuration_set_name authorizes against the config-set
+  # resource too, not just the identity). Single source of truth: agent_otp_ses.tf.
+  agent_otp_config_set_name = local.agent_otp_config_set_name
 
   # nhp_server_port is intentionally NOT threaded from a root variable.
   # The port is a code-level constant (62206) hardcoded in three places —
