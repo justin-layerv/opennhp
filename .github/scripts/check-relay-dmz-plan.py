@@ -82,6 +82,7 @@ EXPECTED_HTTPS_PORT = 443
 EXPECTED_RELAY_BACKEND_PORT = 8080
 EXPECTED_NHP_SERVER_PORT = 62206
 EXPECTED_RELAY_ACK_PORT = 62207
+EXPECTED_DEREGISTRATION_DELAY = 30
 EXPECTED_METRIC_NAMESPACE = "LayerV/NHP"
 EXPECTED_RELAY_HEALTH_PATH = "/health/live"
 EXPECTED_NATIVE_RELAY_HEALTH_PATH = "/health/native-ready"
@@ -367,6 +368,7 @@ class PlannedResource:
     resource_type: str
     name: str
     values: dict[str, Any]
+    after_unknown: dict[str, Any] | None
     before: dict[str, Any] | None
     actions: tuple[str, ...]
 
@@ -419,6 +421,9 @@ def active_resources(plan: dict[str, Any]) -> list[PlannedResource]:
                 resource_type=str(raw.get("type", "")),
                 name=str(raw.get("name", "")),
                 values=after,
+                after_unknown=change.get("after_unknown")
+                if isinstance(change.get("after_unknown"), dict)
+                else None,
                 before=change.get("before")
                 if isinstance(change.get("before"), dict)
                 else None,
@@ -583,6 +588,13 @@ def references(value: Any) -> set[str]:
         for child in value:
             found.update(references(child))
     return found
+
+
+def matches_exact_int_or_int_string(value: Any, expected: int) -> bool:
+    """Accept the canonical decimal string form or an exact JSON integer."""
+    # `type(...) is int` intentionally excludes bool (an int subclass), while
+    # the explicit type check rejects 30.0, which otherwise compares equal to 30.
+    return (type(value) is int and value == expected) or value == str(expected)
 
 
 def expression_refs(resource: dict[str, Any] | None, attribute: str) -> set[str]:
@@ -1940,23 +1952,26 @@ def validate_plan(
     resolver_log_group = v.one(
         network_named("aws_cloudwatch_log_group", "resolver"), "DMZ Resolver log group"
     )
+    log_groups = (flow_log_group, resolver_log_group)
     known_log_key_ids = {
         group.values.get("kms_key_id")
-        for group in (flow_log_group, resolver_log_group)
+        for group in log_groups
         if group and isinstance(group.values.get("kms_key_id"), str)
     }
-    # PR plans may leave one or both new KMS IDs unknown. Compare every concrete
-    # value available here; final pre-apply mode above requires both IDs known,
-    # while config-graph checks below pin both groups to aws_kms_key.logs.
-    if require_pr0_applied:
+    # A first DMZ apply necessarily leaves the new KMS key ARN unknown. In every
+    # mode, accept only a concrete string value or Terraform's explicit unknown
+    # marker. The exact configuration-graph checks below bind unknown values
+    # directly to aws_kms_key.logs.arn.
+    for group in log_groups:
+        if group is None:
+            continue
+        kms_id_unknown = (
+            group.after_unknown is not None
+            and group.after_unknown.get("kms_key_id") is True
+        )
         v.require(
-            flow_log_group is not None
-            and resolver_log_group is not None
-            and all(
-                isinstance(group.values.get("kms_key_id"), str)
-                for group in (flow_log_group, resolver_log_group)
-            ),
-            "both DMZ log-group KMS key IDs must be fully known in the final pre-apply plan",
+            isinstance(group.values.get("kms_key_id"), str) or kms_id_unknown,
+            f"{group.name} log-group KMS key ID must be concrete or explicitly apply-time unknown",
         )
     if known_log_key_ids:
         v.require(
@@ -2599,10 +2614,16 @@ def validate_plan(
         v.require(
             target_group.values.get("protocol") == "HTTPS"
             and target_group.values.get("port") == EXPECTED_RELAY_BACKEND_PORT
+            # Same schema-native string / defensive integer contract as the
+            # native target group below.
+            and matches_exact_int_or_int_string(
+                target_group.values.get("deregistration_delay"),
+                EXPECTED_DEREGISTRATION_DELAY,
+            )
             and len(health) == 1
             and health[0].get("protocol") == "HTTPS"
             and health[0].get("path") == EXPECTED_RELAY_HEALTH_PATH,
-            "relay target group must use HTTPS:8080 with /health/live",
+            f"relay target group must use HTTPS:8080, {EXPECTED_DEREGISTRATION_DELAY}s draining, and /health/live",
         )
     native_target_group = v.one(
         relay_named("aws_lb_target_group", "native_nhp"),
@@ -2615,7 +2636,12 @@ def validate_plan(
             and native_target_group.values.get("port") == EXPECTED_NHP_SERVER_PORT
             and native_target_group.values.get("target_type") == "instance"
             and native_target_group.values.get("preserve_client_ip") == "true"
-            and native_target_group.values.get("deregistration_delay") == 30
+            # The provider's schema-native value is the decimal string; accept
+            # an exact JSON integer only as a defensive cross-version fallback.
+            and matches_exact_int_or_int_string(
+                native_target_group.values.get("deregistration_delay"),
+                EXPECTED_DEREGISTRATION_DELAY,
+            )
             and len(health) == 1
             and health[0].get("enabled") is True
             and health[0].get("protocol") == "HTTPS"
@@ -2626,7 +2652,7 @@ def validate_plan(
             and health[0].get("unhealthy_threshold") == 2
             and health[0].get("interval") == 15
             and health[0].get("timeout") == 5,
-            "native NHP target group must be instance UDP:62206 with client IP preservation and HTTPS:8080 /health/native-ready checks",
+            f"native NHP target group must be instance UDP:62206 with {EXPECTED_DEREGISTRATION_DELAY}s draining, client IP preservation, and HTTPS:8080 /health/native-ready checks",
         )
     native_nlb = v.one(relay_named("aws_lb", "native_nhp"), "public native NHP NLB")
     if native_nlb:

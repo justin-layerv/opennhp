@@ -46,6 +46,20 @@ FIXTURE_RELAY_SECRET_ARN = (
 FIXTURE_SECRETS_KMS_ARN = (
     f"arn:aws:kms:us-east-2:{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:key/example"
 )
+CANONICAL_DEREGISTRATION_DELAY_VALUES = (30, "30")
+INVALID_DEREGISTRATION_DELAY_VALUES = (
+    29,
+    "29",
+    30.0,
+    "30.0",
+    " 30",
+    "30 ",
+    "+30",
+    "030",
+    None,
+    True,
+    False,
+)
 
 
 def endpoint_policy(key: str) -> str:
@@ -1735,6 +1749,7 @@ def clean_plan() -> dict[str, Any]:
         {
             "protocol": "HTTPS",
             "port": checker.EXPECTED_RELAY_BACKEND_PORT,
+            "deregistration_delay": "30",
             "health_check": [
                 {
                     "protocol": "HTTPS",
@@ -1758,7 +1773,7 @@ def clean_plan() -> dict[str, Any]:
             "port": 62206,
             "target_type": "instance",
             "preserve_client_ip": "true",
-            "deregistration_delay": 30,
+            "deregistration_delay": "30",
             "health_check": [
                 {
                     "enabled": True,
@@ -3617,6 +3632,22 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         resource(plan, ".aws_lb_target_group.relay")["change"]["after"]["port"] = 443
         self.assert_violation(plan, "HTTPS:8080")
 
+    def test_relay_target_group_deregistration_delay_accepts_canonical_types(
+        self,
+    ) -> None:
+        for value in CANONICAL_DEREGISTRATION_DELAY_VALUES:
+            with self.subTest(value=value):
+                plan = clean_plan()
+                target_group = resource(plan, ".aws_lb_target_group.relay")
+                target_group["change"]["after"]["deregistration_delay"] = value
+                self.assertEqual([], checker.validate_plan(plan))
+
+    def test_relay_target_group_deregistration_delay_is_pinned(self) -> None:
+        plan = clean_plan()
+        target_group = resource(plan, ".aws_lb_target_group.relay")
+        target_group["change"]["after"]["deregistration_delay"] = "60"
+        self.assert_violation(plan, "relay target group must use HTTPS:8080")
+
     def test_public_alb_ingress_cidr_is_pinned(self) -> None:
         plan = clean_plan()
         ingress = resource(plan, ".aws_vpc_security_group_ingress_rule.alb_https")
@@ -3648,6 +3679,34 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             plan,
             "instance UDP:62206",
         )
+
+    def test_native_nhp_deregistration_delay_accepts_provider_canonical_types(
+        self,
+    ) -> None:
+        for value in CANONICAL_DEREGISTRATION_DELAY_VALUES:
+            with self.subTest(value=value):
+                plan = clean_plan()
+                target_group = resource(plan, ".aws_lb_target_group.native_nhp")
+                target_group["change"]["after"]["deregistration_delay"] = value
+                self.assertEqual([], checker.validate_plan(plan))
+
+    def test_native_nhp_deregistration_delay_rejects_other_shapes(self) -> None:
+        for value in INVALID_DEREGISTRATION_DELAY_VALUES:
+            with self.subTest(value=value):
+                plan = clean_plan()
+                target_group = resource(plan, ".aws_lb_target_group.native_nhp")
+                target_group["change"]["after"]["deregistration_delay"] = value
+                self.assert_violation(
+                    plan, "native NHP target group must be instance UDP:62206"
+                )
+
+    def test_exact_int_or_int_string_helper(self) -> None:
+        for value in CANONICAL_DEREGISTRATION_DELAY_VALUES:
+            with self.subTest(accepted=value):
+                self.assertTrue(checker.matches_exact_int_or_int_string(value, 30))
+        for value in INVALID_DEREGISTRATION_DELAY_VALUES:
+            with self.subTest(rejected=value):
+                self.assertFalse(checker.matches_exact_int_or_int_string(value, 30))
 
     def test_native_listener_rejects_unreviewed_conditional_reference(self) -> None:
         plan = clean_plan()
@@ -4632,49 +4691,95 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         self.assert_violation(plan, "relay telemetry KMS alias name changed")
 
     def test_log_group_must_use_dedicated_key(self) -> None:
-        plan = clean_plan()
-        resolver = resource(plan, ".aws_cloudwatch_log_group.resolver")
-        resolver["change"]["after"]["kms_key_id"] = (
-            "arn:aws:kms:us-east-2:767397897469:key/shared"
-        )
-        self.assert_violation(plan, "same dedicated KMS key")
+        for name in ("flow", "resolver"):
+            with self.subTest(log_group=name):
+                plan = clean_plan()
+                log_group = resource(plan, f".aws_cloudwatch_log_group.{name}")
+                log_group["change"]["after"]["kms_key_id"] = (
+                    "arn:aws:kms:us-east-2:767397897469:key/shared"
+                )
+                self.assert_violation(plan, "same dedicated KMS key")
 
-    def test_final_preapply_requires_both_log_group_kms_key_ids_known(self) -> None:
+    def test_final_preapply_allows_new_log_key_arn_to_remain_unknown(self) -> None:
         plan = clean_plan()
         resolver = resource(plan, ".aws_cloudwatch_log_group.resolver")
         resolver["change"]["after"]["kms_key_id"] = None
         resolver["change"]["after_unknown"]["kms_key_id"] = True
 
         self.assertEqual([], checker.validate_plan(plan))
-        errors = checker.validate_plan(plan, require_pr0_applied=True)
-        self.assertTrue(
-            any(
-                "both DMZ log-group KMS key IDs must be fully known" in error
-                for error in errors
-            ),
-            errors,
-        )
+        self.assertEqual([], checker.validate_plan(plan, require_pr0_applied=True))
+
+    def test_concrete_null_log_group_kms_key_is_rejected_in_every_mode(
+        self,
+    ) -> None:
+        for name in ("flow", "resolver"):
+            for require_pr0_applied in (False, True):
+                with self.subTest(
+                    log_group=name, require_pr0_applied=require_pr0_applied
+                ):
+                    plan = clean_plan()
+                    log_group = resource(plan, f".aws_cloudwatch_log_group.{name}")
+                    log_group["change"]["after"]["kms_key_id"] = None
+                    log_group["change"]["after_unknown"].pop("kms_key_id", None)
+
+                    errors = checker.validate_plan(
+                        plan, require_pr0_applied=require_pr0_applied
+                    )
+                    self.assertTrue(
+                        any(
+                            f"{name} log-group KMS key ID must be concrete or explicitly apply-time unknown"
+                            in error
+                            for error in errors
+                        ),
+                        errors,
+                    )
+
+    def test_malformed_log_group_after_unknown_shape_fails_closed(self) -> None:
+        for name in ("flow", "resolver"):
+            for after_unknown in (True, False, "unexpected", [], None):
+                with self.subTest(log_group=name, after_unknown=after_unknown):
+                    plan = clean_plan()
+                    log_group = resource(plan, f".aws_cloudwatch_log_group.{name}")
+                    log_group["change"]["after"]["kms_key_id"] = None
+                    log_group["change"]["after_unknown"] = after_unknown
+
+                    self.assert_violation(
+                        plan,
+                        f"{name} log-group KMS key ID must be concrete or explicitly apply-time unknown",
+                    )
 
     def test_both_unknown_log_group_keys_require_exact_config_references(
         self,
     ) -> None:
-        plan = clean_plan()
-        for name in ("flow", "resolver"):
-            log_group = resource(plan, f".aws_cloudwatch_log_group.{name}")
-            log_group["change"]["after"]["kms_key_id"] = None
-            log_group["change"]["after_unknown"]["kms_key_id"] = True
+        for redirected_name in ("flow", "resolver"):
+            with self.subTest(redirected_log_group=redirected_name):
+                plan = clean_plan()
+                for name in ("flow", "resolver"):
+                    log_group = resource(plan, f".aws_cloudwatch_log_group.{name}")
+                    log_group["change"]["after"]["kms_key_id"] = None
+                    log_group["change"]["after_unknown"]["kms_key_id"] = True
 
-        self.assertEqual([], checker.validate_plan(plan))
+                self.assertEqual([], checker.validate_plan(plan))
+                self.assertEqual(
+                    [], checker.validate_plan(plan, require_pr0_applied=True)
+                )
 
-        resolver_config = configured_resource(
-            plan, "relay_network", "aws_cloudwatch_log_group", "resolver"
-        )
-        resolver_config["expressions"]["kms_key_id"]["references"] = [
-            "aws_kms_key.unreviewed.arn"
-        ]
-        self.assert_violation(
-            plan, "resolver log group must use the dedicated relay logs KMS key"
-        )
+                log_group_config = configured_resource(
+                    plan,
+                    "relay_network",
+                    "aws_cloudwatch_log_group",
+                    redirected_name,
+                )
+                log_group_config["expressions"]["kms_key_id"]["references"] = [
+                    "aws_kms_key.unreviewed.arn"
+                ]
+                expected = f"{redirected_name} log group must use the dedicated relay logs KMS key"
+                self.assert_violation(plan, expected)
+                errors = checker.validate_plan(plan, require_pr0_applied=True)
+                self.assertTrue(
+                    any(expected in error for error in errors),
+                    errors,
+                )
 
     def test_flow_logs_describe_groups_must_use_wildcard_resource(self) -> None:
         plan = clean_plan()
