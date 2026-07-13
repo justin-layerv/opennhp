@@ -268,10 +268,8 @@ type RelayServer struct {
 
 	responseTimeout time.Duration // how long a handler waits for the server return
 
-	pendingMu        sync.Mutex
-	pending          map[string]relayPendingEntry // relay request ID -> expected cell and exact HTTP waiter
-	requestMu        sync.Mutex
-	activeRequestIDs map[string]struct{}
+	pendingMu sync.Mutex
+	pending   map[string]relayPendingEntry // reserved relay request ID -> expected cell and exact HTTP waiter
 
 	wg             sync.WaitGroup
 	handlerStartMu sync.Mutex
@@ -389,15 +387,14 @@ func New(cfg *Config) (*RelayServer, error) {
 	}
 
 	rs := &RelayServer{
-		config:           cfg,
-		device:           device,
-		udpConn:          udpConn,
-		servers:          servers,
-		cors:             newCORSAllowlist(cfg.CORSAllowedOrigins),
-		pending:          make(map[string]relayPendingEntry),
-		activeRequestIDs: make(map[string]struct{}),
-		responseTimeout:  relayResponseTimeout,
-		stopCh:           make(chan struct{}),
+		config:          cfg,
+		device:          device,
+		udpConn:         udpConn,
+		servers:         servers,
+		cors:            newCORSAllowlist(cfg.CORSAllowedOrigins),
+		pending:         make(map[string]relayPendingEntry),
+		responseTimeout: relayResponseTimeout,
+		stopCh:          make(chan struct{}),
 	}
 
 	// Boot the CloudWatch metrics publisher (#2649) — the relay's first metrics
@@ -435,18 +432,18 @@ func New(cfg *Config) (*RelayServer, error) {
 	return rs, nil
 }
 
-func (rs *RelayServer) reserveRequestID() (string, error) {
+func (rs *RelayServer) reservePending(serverID string, reply chan []byte) (string, error) {
 	for range requestIDCollisionAttempts {
 		id, err := common.NewRelayRequestID()
 		if err != nil {
 			return "", err
 		}
-		rs.requestMu.Lock()
-		_, exists := rs.activeRequestIDs[id]
+		rs.pendingMu.Lock()
+		_, exists := rs.pending[id]
 		if !exists {
-			rs.activeRequestIDs[id] = struct{}{}
+			rs.pending[id] = relayPendingEntry{serverID: serverID, reply: reply}
 		}
-		rs.requestMu.Unlock()
+		rs.pendingMu.Unlock()
 		if !exists {
 			return id, nil
 		}
@@ -454,7 +451,7 @@ func (rs *RelayServer) reserveRequestID() (string, error) {
 	return "", errors.New("relay: repeated random request ID collision")
 }
 
-func (rs *RelayServer) releaseRequestID(id string) {
+func (rs *RelayServer) releasePending(id string) {
 	// Release makes this value eligible for a future reservation. A late return
 	// plus a fresh 128-bit RNG collision for the same configured server could
 	// therefore reach the new waiter after this point. The relay treats the
@@ -462,9 +459,9 @@ func (rs *RelayServer) releaseRequestID(id string) {
 	// cause a spurious protocol failure; it cannot expose cross-client plaintext.
 	// Keeping server-fingerprint binding in dispatch is load-bearing
 	// for that property.
-	rs.requestMu.Lock()
-	delete(rs.activeRequestIDs, id)
-	rs.requestMu.Unlock()
+	rs.pendingMu.Lock()
+	delete(rs.pending, id)
+	rs.pendingMu.Unlock()
 }
 
 // startBackground launches the NHP device and the UDP receive loop (everything
@@ -655,25 +652,16 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	requestID, err := rs.reserveRequestID()
+	// Reserve and populate the exact waiter atomically so request-ID collision
+	// detection and return dispatch share one lifecycle map and one lock.
+	respCh := make(chan []byte, 1)
+	requestID, err := rs.reservePending(srv.id, respCh)
 	if err != nil {
 		log.Error("relay: reserve request ID: %v", err)
 		http.Error(w, "relay unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	defer rs.releaseRequestID(requestID)
-
-	// Register the exact request-ID waiter BEFORE sending so a fast return cannot
-	// race us. Agent counters are deliberately not used for correlation.
-	respCh := make(chan []byte, 1)
-	rs.pendingMu.Lock()
-	rs.pending[requestID] = relayPendingEntry{serverID: srv.id, reply: respCh}
-	rs.pendingMu.Unlock()
-	defer func() {
-		rs.pendingMu.Lock()
-		delete(rs.pending, requestID)
-		rs.pendingMu.Unlock()
-	}()
+	defer rs.releasePending(requestID)
 
 	if err := rs.forward(srv, sourceAddr, inner, requestID); err != nil {
 		log.Error("relay: forward to %s failed: %v", srv.name, err)

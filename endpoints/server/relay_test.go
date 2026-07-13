@@ -579,6 +579,9 @@ func TestHandleRelayForward_OverloadCookieRoundTrip(t *testing.T) {
 	if got := counters[MetricRelayForwardReject]; got != 0 {
 		t.Errorf("MetricRelayForwardReject = %v, want 0", got)
 	}
+	if got := counters[MetricRelayOverloadCookieReturn]; got != 1 {
+		t.Errorf("MetricRelayOverloadCookieReturn = %v, want 1", got)
+	}
 }
 
 // ============================================================================

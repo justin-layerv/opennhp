@@ -1350,23 +1350,25 @@ func TestRelay_RandomRequestIDsDoNotOverwrite(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
 	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
 
-	k1, err := common.NewRelayRequestID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	k2, err := common.NewRelayRequestID()
-	if err != nil {
-		t.Fatal(err)
-	}
 	ch1 := make(chan []byte, 1)
 	ch2 := make(chan []byte, 1)
 	serverID := utils.PubKeyFingerprint(serverPub)
+	k1, err := rs.reservePending(serverID, ch1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rs.releasePending(k1)
+	k2, err := rs.reservePending(serverID, ch2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rs.releasePending(k2)
+
 	rs.pendingMu.Lock()
-	rs.pending[k1] = relayPendingEntry{serverID: serverID, reply: ch1}
-	rs.pending[k2] = relayPendingEntry{serverID: serverID, reply: ch2}
+	pendingCount := len(rs.pending)
 	rs.pendingMu.Unlock()
-	if len(rs.pending) != 2 {
-		t.Fatalf("distinct random request IDs collapsed to %d pending entries", len(rs.pending))
+	if pendingCount != 2 {
+		t.Fatalf("distinct random request IDs collapsed to %d pending entries", pendingCount)
 	}
 
 	rs.dispatch(k1, serverID, []byte("ack"))

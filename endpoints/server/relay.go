@@ -154,6 +154,8 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 	if len(cookieBytes) > 0 {
 		if err := s.sendRelayReturn(outerPpd, rlyMsg.RequestID, cookieBytes); err != nil {
 			log.Error("server-relay(@%s src=%s)[HandleRelayForward] failed to return overload cookie: %v", relayAddr, sourceAddr, err)
+		} else {
+			s.metrics.IncrCounter(MetricRelayOverloadCookieReturn)
 		}
 		return
 	}
@@ -197,9 +199,10 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		// The current browser HTTPS relay rejects DHP_KNK before forwarding, so
 		// this arm is unreachable from that ingress today. Retain it as
 		// defense-in-depth for any future authenticated NHP_RLY ingress: DHP uses
-		// the shared knock/ACK crypto pipeline below, but only appraises device
-		// evidence and does not open an AC pinhole. Keep the syntactic source
-		// check without imposing the public-IP knock gate.
+		// the direct path's existing NHP_ACK wire type with a
+		// ServerDHPKnockAckMsg body; there is no separate DHP ack header constant.
+		// DHP only appraises device evidence and does not open an AC pinhole, so
+		// keep the syntactic source check without imposing the public-IP knock gate.
 	case core.NHP_OTP:
 		// Fire-and-forget: the relay has no pending waiter for OTP.
 		s.metrics.IncrCounter(MetricRelayOTP)

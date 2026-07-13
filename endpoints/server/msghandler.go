@@ -181,6 +181,11 @@ const (
 	// worth a dedicated counter. (P5/P7 alarm authors: read processed as the
 	// difference, and treat it as ~delivered modulo those rare internal failures.)
 	MetricRelayForward = "RelayForward"
+	// MetricRelayOverloadCookieReturn counts authenticated COK challenges
+	// successfully returned through NHP_RLY while the server is overloaded.
+	// Together with MetricOverloadCookieMintFailure, it distinguishes a working
+	// relay overload challenge path from mint or relay-return send failures.
+	MetricRelayOverloadCookieReturn = "RelayOverloadCookieReturn"
 	// MetricOverloadCookieProcessLocalKey is 1 while this server is using a
 	// random per-process overload-cookie signing key and 0 when a shared key is
 	// configured. Process-local mode is valid only for single-instance

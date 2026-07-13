@@ -753,6 +753,9 @@ func TestHandleRelayForward_InnerLST_PluginErrorReturnsFailClosedLRT(t *testing.
 	}
 }
 
+// Direct DHP uses NHP_ACK as its wire response type and carries the distinct
+// ServerDHPKnockAckMsg body; the relayed defense-in-depth arm must preserve that
+// existing protocol shape rather than inventing an unsupported DHP ack type.
 func TestHandleRelayForward_InnerDHPKnock_ReturnsAuthenticatedACK(t *testing.T) {
 	const innerTrx = uint64(171717)
 	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableAgentPeerValidation: true})
