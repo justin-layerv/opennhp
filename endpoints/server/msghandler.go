@@ -144,6 +144,12 @@ const (
 	// dimension (the KnockFailReason enum). Emitted once per failed knock;
 	// KnockNoAC and the ErrServerACOpsFailed path stay for alarm continuity.
 	MetricKnockFailReason = "KnockFailReason"
+	// MetricKnockForwardMissingPacket fires when a knock needs fan-out or
+	// no-local-AC forwarding but BasePacketContent() returned nil: a guard-drift
+	// canary for the IsForwardableKnockType clone guard in decryptBody. It covers
+	// both gates in handleNhpOpenResource, so a single knock can increment it
+	// twice; treat any nonzero value as investigate-worthy, not a per-packet count.
+	MetricKnockForwardMissingPacket = "KnockForwardMissingPacket"
 	// Cell-wide knock AC fan-out (qurl-service#948, Config.EnableKnockACFanout).
 	// Unlike the forward counters above (a no-local-AC FAILOVER to one peer),
 	// these track the coverage fan-out an origin knock sends to one assigned peer

@@ -210,9 +210,10 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 		}
 
 		authReq := &common.NhpAuthRequest{
-			Msg:       knkMsg,
-			Ack:       ackMsg,
-			PublicKey: base64.StdEncoding.EncodeToString(ppd.RemotePubKey),
+			Msg:            knkMsg,
+			Ack:            ackMsg,
+			PublicKey:      base64.StdEncoding.EncodeToString(ppd.RemotePubKey),
+			WireHeaderType: ppd.HeaderType,
 			SrcAddr: &common.NetAddress{
 				Ip:   ppd.ConnData.RemoteAddr.IP.String(),
 				Port: ppd.ConnData.RemoteAddr.Port,

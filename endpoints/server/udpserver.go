@@ -3228,6 +3228,9 @@ func (s *UdpServer) dispatchAsync(fn func()) {
 // tracks bounding FWD/FRT per-peer to close the residual.
 func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 	switch ppd.HeaderType {
+	// DHP_KNK intentionally enters HandleKnockRequest but returns before the
+	// forwardable-knock BasePacketContent path; do not narrow this dispatcher to
+	// IsForwardableKnockType.
 	case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT, core.DHP_KNK:
 		s.dispatchHandler(ppd, s.HandleKnockRequest)
 
@@ -4438,6 +4441,16 @@ func (s *UdpServer) processACOperationBroadcast(
 	return lastArtMsg, lastErr
 }
 
+// warnKnockOriginalPacketMissing emits the guard-drift canary (log + metric)
+// when a knock needs fan-out or no-local-AC forwarding but BasePacketContent()
+// returned nil. Both gates in handleNhpOpenResource share this so the message
+// and MetricKnockForwardMissingPacket cannot drift apart.
+func (s *UdpServer) warnKnockOriginalPacketMissing(gate, userId, addrStr string, wireHeaderType, bodyHeaderType int) {
+	log.Warning("server-agent(%s@%s)[handleNhpOpenResource] knock %s skipped: BasePacketContent() returned nil for wire_header=%s body_header=%s; check IsForwardableKnockType guard in decryptBody",
+		userId, addrStr, gate, core.HeaderTypeToString(wireHeaderType), core.HeaderTypeToString(bodyHeaderType))
+	s.metrics.IncrCounter(MetricKnockForwardMissingPacket)
+}
+
 func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *common.ResourceData) (ackMsg *common.ServerKnockAckMsg, err error) {
 	knkMsg := req.Msg
 	srcAddr := req.SrcAddr
@@ -4464,7 +4477,10 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	// defer makes every return path, including the no-local-AC forward early
 	// return below, block until peer pinholes are open before we ack.
 	// Coverage-only; the ack still comes from the local broadcast / forward.
-	if s.knockACFanoutEnabled() && s.storage != nil && s.forwarder != nil && len(req.OriginalPacket) > 0 {
+	fanoutReady := s.knockACFanoutEnabled() && s.storage != nil && s.forwarder != nil
+	if fanoutReady && len(req.OriginalPacket) == 0 {
+		s.warnKnockOriginalPacketMissing("fan-out", knkMsg.UserId, addrStr, req.WireHeaderType, knkMsg.HeaderType)
+	} else if fanoutReady {
 		if userAddr, parseErr := net.ResolveUDPAddr("udp", addrStr); parseErr == nil {
 			fanoutBase := context.WithoutCancel(context.Background())
 			var fanoutWg sync.WaitGroup
@@ -4517,7 +4533,10 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	}
 
 	// Try forwarding if: AC not connected, storage available, original packet available
-	if needsForwarding && s.storage != nil && s.forwarder != nil && len(req.OriginalPacket) > 0 {
+	forwardReady := needsForwarding && s.storage != nil && s.forwarder != nil
+	if forwardReady && len(req.OriginalPacket) == 0 {
+		s.warnKnockOriginalPacketMissing("forward", knkMsg.UserId, addrStr, req.WireHeaderType, knkMsg.HeaderType)
+	} else if forwardReady {
 		log.Info("server-agent(%s@%s)[handleNhpOpenResource] AC %s not connected, attempting forward",
 			knkMsg.UserId, addrStr, forwardACId)
 

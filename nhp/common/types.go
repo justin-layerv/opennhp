@@ -173,6 +173,7 @@ type NhpAuthRequest struct {
 	Ack            *ServerKnockAckMsg `json:"ack"`
 	PublicKey      string             `json:"pubKey"`
 	SrcAddr        *NetAddress        `json:"srcAddr"`
+	WireHeaderType int                `json:"-"` // Outer packet HeaderType; Msg.HeaderType is the authenticated body type.
 	OriginalPacket []byte             `json:"-"` // Original encrypted knock packet for server-to-server forwarding
 }
 

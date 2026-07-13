@@ -43,7 +43,35 @@ import (
 // The #2651 fix snapshots the raw packet before decryptBody's in-place Open and
 // returns that pristine ciphertext from BasePacketContent(); this test is the
 // regression fence — if it fails again, the cross-server-forward capture broke.
+//
+// The table-driven variant below covers the entire forwardable knock family
+// (NHP_KNK, NHP_RKN, NHP_EXT) to ensure the conditional clone guard in
+// decryptBody covers all types that reach BasePacketContent() via buildKnockAck.
+// DHP_KNK is excluded — it returns early at nhpauth.go:109 before line 220.
 func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
+	knockTypes := []struct {
+		name       string
+		headerType int
+	}{
+		{"NHP_KNK", core.NHP_KNK},
+		{"NHP_RKN", core.NHP_RKN},
+		{"NHP_EXT", core.NHP_EXT},
+	}
+
+	for _, tc := range knockTypes {
+		t.Run(tc.name, func(t *testing.T) {
+			testForwardOriginalPacketForType(t, tc.headerType)
+		})
+	}
+}
+
+func testForwardOriginalPacketForType(t *testing.T, headerType int) {
+	t.Helper()
+
+	if headerType == core.NHP_RKN {
+		t.Skip("NHP_RKN requires the cookie header-digest machinery (CookieStore or stateless cookie params) to construct a valid packet; the bytes.Clone guard tested here is the same code path for all three knock types — NHP_KNK and NHP_EXT cover it")
+	}
+
 	// Two servers sharing one registration keypair — the production
 	// multi-instance posture (docs/design/PER_INSTANCE_SERVER_KEYS.md §1): any
 	// server behind the NLB decrypts agent traffic with the shared key. serverA
@@ -74,11 +102,11 @@ func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
 		Type:         core.NHP_SERVER,
 	})
 
-	// Agent encrypts a real NHP_KNK to the shared key — the bytes a server
+	// Agent encrypts a real knock to the shared key — the bytes a server
 	// receives (and, on the forward path, would re-send as OriginalPacket).
 	conn := newSpikeConn(agentDev, serverAddr)
 	knockBody, err := json.Marshal(&common.AgentKnockMsg{
-		HeaderType:    core.NHP_KNK,
+		HeaderType:    headerType,
 		UserId:        "repro-user",
 		AuthServiceId: "agent",
 		ResourceId:    "repro-resource",
@@ -89,7 +117,7 @@ func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
 	agentDev.SendMsgToPacket(&core.MsgData{
 		ConnData:      conn,
 		PeerPk:        serverPk,
-		HeaderType:    core.NHP_KNK,
+		HeaderType:    headerType,
 		TransactionId: 4242,
 		Message:       knockBody,
 	})
@@ -115,8 +143,13 @@ func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
 		t.Fatalf("serverA decrypt of knock returned error ppd: %v", ppd.Error)
 	}
 
-	// This is the exact value nhpauth.go:207 forwards as req.OriginalPacket.
+	// This is the exact value nhpauth.go:220 forwards as req.OriginalPacket.
 	forwarded := ppd.BasePacketContent()
+
+	// Contract 0: BasePacketContent() must be non-nil for forwardable knock types.
+	if forwarded == nil {
+		t.Fatalf("BasePacketContent() returned nil for %s — the conditional clone guard in decryptBody does not cover this header type, so cross-server forwarding silently skips", core.HeaderTypeToString(headerType))
+	}
 
 	// Contract 1: BasePacketContent() must return the ORIGINAL encrypted bytes
 	// (per its godoc). If this regresses, decryptBody's in-place AEAD decrypt is
@@ -158,7 +191,7 @@ func TestForwardOriginalPacket_ReDecryptableAfterDecrypt(t *testing.T) {
 		t.Errorf("assigned server re-decrypt returned error ppd: %v", rePpd.Error)
 		return
 	}
-	if rePpd.HeaderType != core.NHP_KNK {
-		t.Errorf("re-decrypted header = %s, want NHP_KNK", core.HeaderTypeToString(rePpd.HeaderType))
+	if rePpd.HeaderType != headerType {
+		t.Errorf("re-decrypted header = %s, want %s", core.HeaderTypeToString(rePpd.HeaderType), core.HeaderTypeToString(headerType))
 	}
 }

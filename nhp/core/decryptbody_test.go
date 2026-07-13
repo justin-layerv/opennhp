@@ -553,6 +553,51 @@ func TestDecryptBodyConcurrent(t *testing.T) {
 	}
 }
 
+// TestDecryptBodyBasePacketContentByHeaderType verifies the bytes.Clone skip
+// introduced by the IsForwardableKnockType guard in decryptBody: forwardable
+// types (NHP_KNK, NHP_RKN, NHP_EXT) snapshot the original ciphertext so
+// BasePacketContent() returns non-nil, while non-forwardable types skip the
+// clone and BasePacketContent() returns nil. Fences the negative direction —
+// a regression that re-added the unconditional bytes.Clone would pass every
+// other test in this file because buildDecryptBodyPPD leaves ppd.HeaderType
+// at zero (NHP_KPL, non-forwardable) by default.
+func TestDecryptBodyBasePacketContentByHeaderType(t *testing.T) {
+	body := []byte(`{"type":"knock","resource":"test"}`)
+
+	tests := []struct {
+		name       string
+		headerType int
+		wantNil    bool
+	}{
+		{"NHP_KPL (non-forwardable)", NHP_KPL, true},
+		{"NHP_ACK (non-forwardable)", NHP_ACK, true},
+		{"NHP_KNK (forwardable)", NHP_KNK, false},
+		{"NHP_RKN (forwardable)", NHP_RKN, false},
+		{"NHP_EXT (forwardable)", NHP_EXT, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ppd := buildDecryptBodyPPD(t, body, false)
+			ppd.HeaderType = tt.headerType
+
+			if err := ppd.decryptBody(); err != nil {
+				t.Fatalf("decryptBody() failed: %v", err)
+			}
+
+			got := ppd.BasePacketContent()
+			if tt.wantNil && got != nil {
+				t.Errorf("BasePacketContent() = %d bytes, want nil for header type %d",
+					len(got), tt.headerType)
+			}
+			if !tt.wantNil && got == nil {
+				t.Errorf("BasePacketContent() = nil, want non-nil for header type %d",
+					tt.headerType)
+			}
+		})
+	}
+}
+
 // BenchmarkDecryptBodyCompressed benchmarks decryptBody() with compressed data
 // to measure the cost of decompression in the decryption path.
 func BenchmarkDecryptBodyCompressed(b *testing.B) {

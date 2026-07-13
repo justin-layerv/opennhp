@@ -187,15 +187,15 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 	// Dispatch through the same handlers used by direct traffic. RequestID only
 	// changes the authenticated relay return transport; it must not fork direct
 	// OTP/REG/LST semantics, rate limits, plugin loading, metrics, or error mapping.
-	switch innerPpd.HeaderType {
-	case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT:
+	switch {
+	case core.IsForwardableKnockType(innerPpd.HeaderType):
 		if !isRoutablePublicIP(sourceAddr.IP) {
 			s.metrics.IncrCounter(MetricRelayForwardReject)
 			log.Error("server-relay(@%s src=%s)[HandleRelayForward] non-routable source ip for knock type %s (opens an AC pinhole); dropping",
 				relayAddr, sourceAddr, core.HeaderTypeToString(innerPpd.HeaderType))
 			return
 		}
-	case core.DHP_KNK:
+	case innerPpd.HeaderType == core.DHP_KNK:
 		// The current browser HTTPS relay rejects DHP_KNK before forwarding, so
 		// this arm is unreachable from that ingress today. Retain it as
 		// defense-in-depth for any future authenticated NHP_RLY ingress: DHP uses
@@ -203,7 +203,7 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		// ServerDHPKnockAckMsg body; there is no separate DHP ack header constant.
 		// DHP only appraises device evidence and does not open an AC pinhole, so
 		// keep the syntactic source check without imposing the public-IP knock gate.
-	case core.NHP_OTP:
+	case innerPpd.HeaderType == core.NHP_OTP:
 		// Fire-and-forget: the relay has no pending waiter for OTP.
 		s.metrics.IncrCounter(MetricRelayOTP)
 		if otpErr := s.dispatchOTP(innerPpd); otpErr != nil {
@@ -212,7 +212,7 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 				relayAddr, sourceAddr, keyPrefix, otpErr)
 		}
 		return
-	case core.NHP_REG:
+	case innerPpd.HeaderType == core.NHP_REG:
 		s.metrics.IncrCounter(MetricRelayRegister)
 		keyPrefix := pubkeyLogPrefix(base64.StdEncoding.EncodeToString(innerPpd.RemotePubKey))
 		rakBytes, buildErr := s.buildRegisterAck(innerPpd)
@@ -232,7 +232,7 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 				relayAddr, sourceAddr, keyPrefix, returnErr)
 		}
 		return
-	case core.NHP_LST:
+	case innerPpd.HeaderType == core.NHP_LST:
 		lrtBytes, userID, listErr := s.buildListResult(innerPpd)
 		// Logical/plugin failures are encoded in a populated LRT and must reach
 		// the agent. Nil alone means the LRT verdict could not be marshaled.

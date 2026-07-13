@@ -222,3 +222,24 @@ func TestNHPRelayRecvHeaderType_AllowlistMatrix(t *testing.T) {
 		t.Errorf("HeaderTypeToDeviceType(NHP_RAK) = %d, want NHP_SERVER (%d)", got, NHP_SERVER)
 	}
 }
+
+func TestIsForwardableKnockType(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ht   int
+		want bool
+	}{
+		{"NHP_KNK", NHP_KNK, true},
+		{"NHP_RKN", NHP_RKN, true},
+		{"NHP_EXT", NHP_EXT, true},
+		{"DHP_KNK", DHP_KNK, false},
+		{"NHP_ACK", NHP_ACK, false},
+		{"NHP_AOP", NHP_AOP, false},
+		{"NHP_RLY", NHP_RLY, false},
+		{"NHP_FWD", NHP_FWD, false},
+	} {
+		if got := IsForwardableKnockType(tc.ht); got != tc.want {
+			t.Errorf("IsForwardableKnockType(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

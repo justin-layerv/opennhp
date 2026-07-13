@@ -138,6 +138,14 @@ func HeaderTypeToDeviceType(t int) int {
 	return NHP_NO_DEVICE
 }
 
+// IsForwardableKnockType reports whether a browser knock header can travel
+// through server-to-server forwarding or the relay path. The same set also
+// marks packets whose original ciphertext must be retained by decryptBody so
+// BasePacketContent can re-forward the authenticated knock unchanged.
+func IsForwardableKnockType(t int) bool {
+	return t == NHP_KNK || t == NHP_RKN || t == NHP_EXT
+}
+
 type PacketBuffer = [PacketBufferSize]byte
 
 // packet buffer pool
