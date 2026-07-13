@@ -105,8 +105,11 @@ SG inventory, and Flow Logs to prove it is not publicly accepted.
 
 ## Gate 5: idempotency and evidence
 
-The deployment workflow creates a post-apply plan. It must be empty, and the
-plan checker must pass with `--require-dmz-boundary-noop`. Archive:
+The deployment workflow creates a full post-apply plan and checks its JSON with
+`--require-pr0-applied --require-dmz-boundary-noop`. Every fenced relay-DMZ
+boundary address must be a no-op. Unrelated provider- or CI-owned resources may
+still appear in the full-stack plan; they do not weaken this boundary-specific
+idempotency proof and remain owned by their normal drift workflows. Archive:
 
 - reviewed SHA and image digest;
 - saved plan and plan JSON;
@@ -114,7 +117,7 @@ plan checker must pass with `--require-dmz-boundary-noop`. Archive:
 - relay HTTPS smoke;
 - assigned-cell external UDP 62206 smoke;
 - listener/SG/Flow proof that public UDP 62207 is absent;
-- post-apply empty plan.
+- post-apply plan JSON proving every relay-DMZ boundary address is a no-op.
 
 ## Rollback
 

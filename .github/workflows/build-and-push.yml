@@ -1908,7 +1908,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: sandbox
     # Includes rare ~15m SG recovery, the bounded 5m structural convergence
-    # gate, and a final full post-apply idempotency plan before outputs unblock.
+    # gate, and a final post-apply DMZ-boundary idempotency proof before outputs
+    # unblock.
     timeout-minutes: 55
     concurrency:
       group: deploy-sandbox-infra
@@ -2376,23 +2377,21 @@ jobs:
         run: |
           set -euo pipefail
           rm -f relay-dmz-post-apply.tfplan relay-dmz-post-apply.json
-          set +e
-          terraform plan -detailed-exitcode -no-color \
+          # setup-terraform's wrapper deliberately translates Terraform plan
+          # exit 2 (changes present) into process success. Do not use that exit
+          # code as an emptiness proof. The full sandbox stack also contains
+          # unrelated provider/CI-owned drift; the load-bearing contract here
+          # is that every fenced relay-DMZ boundary address remains a no-op.
+          # Re-planning re-proves the pre-apply contract after convergence.
+          terraform plan -no-color \
             -out=relay-dmz-post-apply.tfplan 2>&1 | tee relay-dmz-post-apply.txt
-          plan_rc=${PIPESTATUS[0]}
-          set -e
-          if [[ "$plan_rc" -eq 2 ]]; then
-            echo "::error::Post-apply Terraform plan is not empty; relay DMZ route ownership is not idempotent."
-            exit 1
-          elif [[ "$plan_rc" -ne 0 ]]; then
-            echo "::error::Post-apply Terraform plan failed with exit $plan_rc."
-            exit "$plan_rc"
-          fi
           test -s relay-dmz-post-apply.tfplan
           terraform show -json relay-dmz-post-apply.tfplan \
             > relay-dmz-post-apply.json
           python3 ../../../.github/scripts/check-relay-dmz-plan.py \
-            --require-pr0-applied relay-dmz-post-apply.json
+            --require-pr0-applied \
+            --require-dmz-boundary-noop \
+            relay-dmz-post-apply.json
 
       - name: Get Terraform Outputs
         id: outputs

@@ -306,15 +306,19 @@ else
     'terraform apply -auto-approve tfplan'
   assert_step_in "$INFRA" deploy-sandbox-infra \
     "Verify relay DMZ post-apply idempotency" \
-    "post-apply gate requires an empty detailed-exitcode plan" \
-    'terraform plan -detailed-exitcode'
+    "post-apply gate creates a saved plan for exact JSON validation" \
+    'terraform plan -no-color'
+  assert_step_not_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ post-apply idempotency" \
+    "post-apply gate does not trust setup-terraform detailed-exitcode" \
+    'detailed-exitcode|PIPESTATUS|plan_rc'
   assert_step_in "$INFRA" deploy-sandbox-infra \
     "Verify relay DMZ post-apply idempotency" \
     "post-apply plan is rechecked against the final DMZ contract" \
-    '--require-pr0-applied relay-dmz-post-apply\.json'
-  assert_step_not_in "$INFRA" deploy-sandbox-infra \
+    '--require-pr0-applied'
+  assert_step_in "$INFRA" deploy-sandbox-infra \
     "Verify relay DMZ post-apply idempotency" \
-    "post-apply validation does not require a no-op boundary twice" \
+    "post-apply validation fails closed on every fenced DMZ mutation" \
     '--require-dmz-boundary-noop'
   assert_step_not_in "$INFRA" deploy-sandbox-infra \
     "Verify relay DMZ post-apply idempotency" \
