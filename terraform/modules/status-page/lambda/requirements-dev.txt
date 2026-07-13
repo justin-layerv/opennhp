@@ -5,7 +5,7 @@
 pytest>=8.4.2
 
 # AWS SDK (provided by Lambda runtime, needed for testing)
-boto3>=1.43.40
+boto3>=1.43.46
 
 # Mocking AWS services
 moto>=5.0.0
