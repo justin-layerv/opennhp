@@ -1187,7 +1187,11 @@ def clean_plan() -> dict[str, Any]:
 
     nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"]["module"]
     nhp_module["outputs"] = {
-        "nlb_dns_name": {"expression": {"references": ["module.compute.nlb_dns_name"]}},
+        "nlb_dns_name": {
+            "expression": {
+                "references": ["module.compute.nlb_dns_name", "module.compute"]
+            }
+        },
     }
     nhp_module["resources"].append(
         config_resource(
@@ -1233,8 +1237,12 @@ def clean_plan() -> dict[str, Any]:
     )
     nhp_module["module_calls"]["dns"] = {
         "expressions": {
-            "nlb_dns_name": {"references": ["module.compute.nlb_dns_name"]},
-            "nlb_zone_id": {"references": ["module.compute.nlb_zone_id"]},
+            "nlb_dns_name": {
+                "references": ["module.compute.nlb_dns_name", "module.compute"]
+            },
+            "nlb_zone_id": {
+                "references": ["module.compute.nlb_zone_id", "module.compute"]
+            },
         },
         "module": {"module_calls": {}, "resources": []},
     }
@@ -4600,6 +4608,53 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             "references": ["module.relay[0].dns_name"]
         }
         self.assert_violation(plan, "assigned cell's server NLB directly")
+
+    def test_public_nhp_dns_and_output_accept_terraform_dual_references(self) -> None:
+        plan = clean_plan()
+        nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]
+        self.assertEqual(
+            ["module.compute.nlb_dns_name", "module.compute"],
+            nhp_module["module_calls"]["dns"]["expressions"]["nlb_dns_name"][
+                "references"
+            ],
+        )
+        self.assertEqual(
+            ["module.compute.nlb_dns_name", "module.compute"],
+            nhp_module["outputs"]["nlb_dns_name"]["expression"]["references"],
+        )
+        self.assertEqual([], checker.validate_plan(plan))
+
+    def test_public_nhp_dns_rejects_incomplete_leaf_only_reference(self) -> None:
+        plan = clean_plan()
+        nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]
+        nhp_module["module_calls"]["dns"]["expressions"]["nlb_dns_name"] = {
+            "references": ["module.compute.nlb_dns_name"]
+        }
+        self.assert_violation(plan, "assigned cell's server NLB directly")
+
+    def test_public_nlb_output_must_expose_assigned_cell_nlb(self) -> None:
+        plan = clean_plan()
+        nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]
+        nhp_module["outputs"]["nlb_dns_name"] = {
+            "expression": {"references": ["module.relay[0].dns_name"]}
+        }
+        self.assert_violation(plan, "public nlb_dns_name output")
+
+    def test_public_nlb_output_rejects_incomplete_leaf_only_reference(self) -> None:
+        plan = clean_plan()
+        nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]
+        nhp_module["outputs"]["nlb_dns_name"] = {
+            "expression": {"references": ["module.compute.nlb_dns_name"]}
+        }
+        self.assert_violation(plan, "public nlb_dns_name output")
 
     def test_s3_egress_must_use_prefix_list(self) -> None:
         plan = clean_plan()

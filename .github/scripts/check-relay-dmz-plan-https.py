@@ -580,6 +580,10 @@ def config_output_refs(module: dict[str, Any] | None, name: str) -> set[str]:
 
 
 def references(value: Any) -> set[str]:
+    # Terraform 1.14.x serializes a module-output traversal as both the leaf and
+    # its enclosing module (for example, module.compute.nlb_dns_name plus
+    # module.compute). Exact graph contracts must pin both; a Terraform upgrade
+    # that changes this shape requires the documented real-plan recapture.
     found: set[str] = set()
     if isinstance(value, dict):
         raw_refs = value.get("references")
@@ -2293,13 +2297,14 @@ def validate_plan(
     dns_name_refs = call_refs(dns_call, "nlb_dns_name")
     dns_zone_refs = call_refs(dns_call, "nlb_zone_id")
     v.require(
-        dns_name_refs == {"module.compute.nlb_dns_name"}
-        and dns_zone_refs == {"module.compute.nlb_zone_id"},
+        dns_name_refs == {"module.compute.nlb_dns_name", "module.compute"}
+        and dns_zone_refs == {"module.compute.nlb_zone_id", "module.compute"},
         "public NHP DNS must target the assigned cell's server NLB directly",
     )
     public_nlb_output_refs = config_output_refs(parent_module, "nlb_dns_name")
     v.require(
-        public_nlb_output_refs == {"module.compute.nlb_dns_name"},
+        public_nlb_output_refs
+        == {"module.compute.nlb_dns_name", "module.compute"},
         "public nlb_dns_name output must expose the assigned cell's server NLB",
     )
 
