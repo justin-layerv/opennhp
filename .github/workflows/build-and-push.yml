@@ -4,7 +4,7 @@ name: Build and Deploy NHP
 # reliably find the specific build-and-push run they dispatched via
 # find-dispatched-run.sh. This avoids timestamp matching races with
 # concurrent main pushes or other manual dispatches.
-run-name: "Build and Deploy NHP${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
+run-name: "Build and Deploy NHP${{ inputs.relay_dmz_cutover && ' [relay-dmz-cutover]' || '' }}${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
 
 on:
   push:
@@ -58,6 +58,11 @@ on:
         type: boolean
       force_build:
         description: 'Force image build even without app code changes'
+        required: false
+        default: false
+        type: boolean
+      relay_dmz_cutover:
+        description: 'Authorize the one-time sandbox relay DMZ Terraform boundary cutover'
         required: false
         default: false
         type: boolean
@@ -2085,6 +2090,7 @@ jobs:
       - name: Handle ASG Attachment Migrations and Taint Recovery
         working-directory: terraform/environments/sandbox
         env:
+          RELAY_DMZ_CUTOVER: ${{ inputs.relay_dmz_cutover && 'true' || 'false' }}
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
@@ -2100,15 +2106,19 @@ jobs:
           # Clean up any stale plan files from previous failed runs
           rm -f tfplan plan.txt plan-show.txt plan-show.json plan-boundary-preflight.json
 
-          preflight_relay_dmz_boundary_noop() {
+          preflight_relay_dmz_boundary() {
             # This must run before the recovery helper can call `terraform state
             # rm`, untaint, or refresh a relay ASG. The named final pre-apply
             # step repeats the same gate against the post-recovery artifact.
             terraform show -json tfplan > plan-boundary-preflight.json
+            relay_dmz_args=(--require-pr0-applied)
+            if [[ "$RELAY_DMZ_CUTOVER" == "true" ]]; then
+              echo "::notice::Explicit relay DMZ cutover authorized; validating the complete target boundary before apply."
+            else
+              relay_dmz_args+=(--require-dmz-boundary-noop)
+            fi
             python3 ../../../.github/scripts/check-relay-dmz-plan.py \
-              --require-pr0-applied \
-              --require-dmz-boundary-noop \
-              plan-boundary-preflight.json
+              "${relay_dmz_args[@]}" plan-boundary-preflight.json
           }
 
           plan_with_attachment_migration_guard() {
@@ -2138,7 +2148,7 @@ jobs:
               exit 1
             fi
 
-            preflight_relay_dmz_boundary_noop
+            preflight_relay_dmz_boundary
 
             # Find any aws_autoscaling_attachment resources being destroyed.
             # Pattern matches both indexed (foo[0]) and non-indexed (foo) resources.
@@ -2312,18 +2322,24 @@ jobs:
 
       - name: Verify relay DMZ plan contract before apply
         working-directory: terraform/environments/sandbox
+        env:
+          RELAY_DMZ_CUTOVER: ${{ inputs.relay_dmz_cutover && 'true' || 'false' }}
         run: |
           set -euo pipefail
           test -s tfplan
           test -s plan-show.json
-          # Push-to-main is not the first-cutover or boundary-mutation path.
-          # Any such diff fails here and points the operator to the exact
-          # reviewed saved-plan runbook. After that manual apply, rerunning this
-          # workflow is allowed only when every fenced address is a no-op.
+          # Push-to-main and ordinary manual deploys are not boundary-mutation
+          # paths. Only an explicit relay_dmz_cutover dispatch may apply the
+          # first transition; afterward all normal runs require every fenced
+          # address to be a no-op.
+          relay_dmz_args=(--require-pr0-applied)
+          if [[ "$RELAY_DMZ_CUTOVER" == "true" ]]; then
+            echo "::notice::Applying the explicitly authorized relay DMZ boundary cutover from this checked saved plan."
+          else
+            relay_dmz_args+=(--require-dmz-boundary-noop)
+          fi
           python3 ../../../.github/scripts/check-relay-dmz-plan.py \
-            --require-pr0-applied \
-            --require-dmz-boundary-noop \
-            plan-show.json
+            "${relay_dmz_args[@]}" plan-show.json
 
       # TF_VAR_frps_image_tag (when SSM has a non-bootstrap value) was
       # exported to GITHUB_ENV by the

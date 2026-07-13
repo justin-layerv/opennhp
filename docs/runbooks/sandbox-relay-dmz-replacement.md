@@ -34,26 +34,28 @@ mkdir -p "$RELAY_DMZ_EVIDENCE_DIR"
 
 ## Gate 1: reviewed saved plan
 
-Generate one saved sandbox plan under GitHub OIDC, export its JSON, and run the
-DMZ contract checker against that exact artifact. Review all creates, updates,
-and destroys. The plan must retain the compute module's public server NLB,
-public UDP 62206 listener/target group, and internal UDP 62206 listener while
-showing no relay NLB, relay UDP listener, or relay-native alarm/DNS resources.
+Dispatch the sandbox deployment workflow from `main` with the explicit one-time
+cutover authorization. The workflow assumes the sandbox GitHub OIDC role,
+generates a saved Terraform plan, exports its JSON, and runs the DMZ contract
+checker against that exact artifact before applying it. The plan must retain the
+compute module's public server NLB, public UDP 62206 listener/target group, and
+internal UDP 62206 listener while showing no relay NLB, relay UDP listener, or
+relay-native alarm/DNS resources.
 
 ```bash
-export RELAY_DMZ_PLAN="$RELAY_DMZ_EVIDENCE_DIR/relay-dmz.tfplan"
-terraform -chdir=terraform/environments/sandbox plan -out="$RELAY_DMZ_PLAN"
-terraform -chdir=terraform/environments/sandbox show -json "$RELAY_DMZ_PLAN" \
-  > "$RELAY_DMZ_EVIDENCE_DIR/relay-dmz.tfplan.json"
-python3 .github/scripts/check-relay-dmz-plan.py \
-  "$RELAY_DMZ_EVIDENCE_DIR/relay-dmz.tfplan.json"
+gh workflow run build-and-push.yml --ref main \
+  -f environment=sandbox \
+  -f deploy=true \
+  -f skip_tests=false \
+  -f force_build=false \
+  -f relay_dmz_cutover=true
 ```
 
-Apply only the saved artifact that passed review:
-
-```bash
-terraform -chdir=terraform/environments/sandbox apply "$RELAY_DMZ_PLAN"
-```
+The boolean is deliberately absent from push deployments and defaults to
+`false`. Normal runs continue to require every fenced DMZ address to be a no-op.
+The authorized cutover run still requires the complete target-state contract
+and `--require-pr0-applied`, then applies only the checked `tfplan` file. The
+same job runs structural convergence and a full no-op plan after apply.
 
 ## Gate 2: structural proof
 
