@@ -97,8 +97,10 @@ resource "aws_route53_resolver_firewall_rule" "block_all" {
 resource "aws_route53_resolver_firewall_rule_group_association" "relay" {
   name                   = "${var.name_prefix}-relay-dmz"
   firewall_rule_group_id = aws_route53_resolver_firewall_rule_group.relay.id
-  priority               = 100
-  vpc_id                 = aws_vpc.relay.id
+  # AWS reserves the boundary value 100 even though its validation error says
+  # the accepted range begins at 100. Use the first non-reserved value.
+  priority = 101
+  vpc_id   = aws_vpc.relay.id
   # Keep this Terraform-owned association rollback-safe. The AWS provider's
   # destroy path does not disable mutation protection before disassociating, so
   # ENABLED would make a reviewed revert/apply fail. CI plan checks plus the

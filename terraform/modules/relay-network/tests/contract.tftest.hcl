@@ -53,8 +53,7 @@ run "dmz_contract" {
 
   assert {
     condition = (
-      jsondecode(aws_kms_key.logs.policy).Statement[1].Condition.StringEquals["kms:CallerAccount"] == "767397897469" &&
-      jsondecode(aws_kms_key.logs.policy).Statement[1].Condition.StringEquals["kms:ViaService"] == "logs.us-east-2.amazonaws.com" &&
+      toset(keys(jsondecode(aws_kms_key.logs.policy).Statement[1].Condition)) == toset(["ArnEquals"]) &&
       toset(jsondecode(aws_kms_key.logs.policy).Statement[1].Condition.ArnEquals["kms:EncryptionContext:aws:logs:arn"]) == toset([
         "arn:aws:logs:us-east-2:767397897469:log-group:/layerv/nhp/sandbox/relay-dmz/flow",
         "arn:aws:logs:us-east-2:767397897469:log-group:/layerv/nhp/sandbox/relay-dmz/resolver",
@@ -135,6 +134,7 @@ run "dmz_contract" {
     condition = (
       aws_route53_resolver_firewall_config.relay.firewall_fail_open == "DISABLED" &&
       aws_route53_resolver_firewall_rule_group_association.relay.mutation_protection == "DISABLED" &&
+      aws_route53_resolver_firewall_rule_group_association.relay.priority == 101 &&
       aws_route53_resolver_firewall_rule.allow.priority == 200 &&
       aws_route53_resolver_firewall_rule.block_all.priority == 900 &&
       aws_route53_resolver_firewall_rule.block_all.action == "BLOCK" &&

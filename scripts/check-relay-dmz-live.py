@@ -2928,11 +2928,6 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             or statement.get("Effect") != "Allow"
             or _statement_actions(statement) != expected_kms_actions
             or _statement_resources(statement) != {"*"}
-            or statement.get("Condition", {}).get("StringEquals")
-            != {
-                "kms:CallerAccount": str(account_id),
-                "kms:ViaService": f"logs.{region}.amazonaws.com",
-            }
             or set(
                 _as_list(
                     statement.get("Condition", {})
@@ -2941,7 +2936,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
                 )
             )
             != expected_kms_contexts
-            or set(statement.get("Condition", {})) != {"StringEquals", "ArnEquals"}
+            or set(statement.get("Condition", {})) != {"ArnEquals"}
         ):
             errors.append(
                 "logs KMS CloudWatch statement conditions or encryption context are not exact"
@@ -2968,9 +2963,12 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
     if len(associations) != 1 or associations[0].get("status") != "COMPLETE":
         errors.append("DMZ must have one complete Resolver Firewall association")
     else:
-        if associations[0].get("mutation_protection") != "DISABLED":
+        if (
+            associations[0].get("mutation_protection") != "DISABLED"
+            or associations[0].get("priority") != 101
+        ):
             errors.append(
-                "Resolver Firewall association mutation protection must stay DISABLED"
+                "Resolver Firewall association must stay rollback-safe at non-reserved priority 101"
             )
         rules = associations[0].get("rules", [])
         if len(rules) != len(ADVANCED_DNS_PROTECTION_PRIORITIES) + 2:

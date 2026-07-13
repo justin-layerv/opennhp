@@ -233,7 +233,7 @@ else
     "final Terraform plan is checked after every recovery path"
   RECOVERY_STEP=$(extract_step "$INFRA" "Handle ASG Attachment Migrations and Taint Recovery")
   assert_text_order "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
-    "            preflight_relay_dmz_boundary_noop" \
+    "            preflight_relay_dmz_boundary" \
     'terraform state rm "$att"' \
     "relay DMZ boundary is checked before any Terraform state mutation"
   assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \

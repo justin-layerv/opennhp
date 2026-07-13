@@ -12,11 +12,10 @@ resource "time_sleep" "relay_dmz_iam_propagation" {
     attachment_id   = module.ecr.terraform_apply_relay_dmz_attachment_id
   }
 
-  # Action-list expansion on an already-scoped apply role. This mirrors the
-  # repository's 60-second IAM propagation pattern; the relay-network module
-  # depends on the wait before exercising Flow Logs, peering, Resolver, or the
-  # first-use Resolver service-linked-role grant.
-  create_duration = local.iam_propagation_duration
+  # This is a new managed-policy attachment on the first cutover, not merely an
+  # action-list edit. Use the conservative window before exercising Flow Logs,
+  # peering, Resolver, or the first-use Resolver service-linked-role grant.
+  create_duration = local.iam_conservative_propagation_duration
 
   # Keep the CIDR-overlap proof in every targeted path that reaches the DMZ
   # apply barrier without reintroducing a broad module dependency.

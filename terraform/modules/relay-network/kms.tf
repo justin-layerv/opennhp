@@ -39,10 +39,6 @@ resource "aws_kms_key" "logs" {
         ]
         Resource = "*"
         Condition = {
-          StringEquals = {
-            "kms:CallerAccount" = data.aws_caller_identity.current.account_id
-            "kms:ViaService"    = "logs.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
-          }
           ArnEquals = {
             "kms:EncryptionContext:aws:logs:arn" = [
               local.flow_log_group_arn,

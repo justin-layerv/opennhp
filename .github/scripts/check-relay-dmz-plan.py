@@ -1291,7 +1291,7 @@ def check_logs_kms_policy(v: Validation, policy_text: str) -> None:
         and service.get("Resource") == "*",
         "relay logs KMS service grant changed",
     )
-    equals = string_condition(service, "StringEquals")
+    conditions = service.get("Condition")
     arn_equals = string_condition(service, "ArnEquals")
     contexts = (
         as_strings(arn_equals.get("kms:EncryptionContext:aws:logs:arn"))
@@ -1299,12 +1299,8 @@ def check_logs_kms_policy(v: Validation, policy_text: str) -> None:
         else []
     )
     v.require(
-        equals is not None
-        and set(equals) == {"kms:CallerAccount", "kms:ViaService"}
-        and equals.get("kms:CallerAccount") == EXPECTED_SANDBOX_ACCOUNT_ID
-        and equals.get("kms:ViaService")
-        == f"logs.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-        "relay logs KMS grant must require the sandbox CallerAccount and regional Logs ViaService",
+        isinstance(conditions, dict) and set(conditions) == {"ArnEquals"},
+        "relay logs KMS grant must use only the exact Logs encryption-context condition",
     )
     v.require(
         len(contexts) == 2
@@ -2134,8 +2130,9 @@ def validate_plan(
         # association. Terraform must be able to disassociate it during rollback;
         # the post-apply live detector fails if that association is missing.
         v.require(
-            firewall_assoc.values.get("mutation_protection") == "DISABLED",
-            "DNS Firewall mutation protection must stay disabled so Terraform rollback can disassociate it",
+            firewall_assoc.values.get("mutation_protection") == "DISABLED"
+            and firewall_assoc.values.get("priority") == 101,
+            "DNS Firewall association must stay rollback-safe at non-reserved priority 101",
         )
     v.one(
         network_named("aws_route53_resolver_query_log_config", "relay"),
@@ -3016,6 +3013,18 @@ def validate_plan(
                 for field in ("cidr_ipv4", "cidr_ipv6", "prefix_list_id")
             ),
             "relay UDP 62207 ACK ingress must not use any public or CIDR source",
+        )
+    ack_config = config_resource(
+        v,
+        relay_config,
+        "aws_vpc_security_group_ingress_rule",
+        "relay_udp_ack_return",
+    )
+    if ack_config:
+        v.require(
+            set(ack_config.get("depends_on") or [])
+            == {"terraform_data.network_ready"},
+            "relay UDP 62207 ACK ingress must wait for the active cross-VPC peering barrier",
         )
     for resource_type, name, expected_owner_ref, expected_peer_ref, label in (
         (

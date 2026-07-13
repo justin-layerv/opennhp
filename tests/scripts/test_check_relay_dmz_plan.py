@@ -372,10 +372,6 @@ def logs_kms_policy() -> str:
                     "Action": sorted(checker.EXPECTED_LOG_KMS_ACTIONS),
                     "Resource": "*",
                     "Condition": {
-                        "StringEquals": {
-                            "kms:CallerAccount": checker.EXPECTED_SANDBOX_ACCOUNT_ID,
-                            "kms:ViaService": "logs.us-east-2.amazonaws.com",
-                        },
                         "ArnEquals": {
                             "kms:EncryptionContext:aws:logs:arn": [
                                 f"arn:aws:logs:us-east-2:{checker.EXPECTED_SANDBOX_ACCOUNT_ID}:log-group:/layerv/nhp/sandbox/relay-dmz/flow",
@@ -1025,6 +1021,9 @@ def clean_plan() -> dict[str, Any]:
                                                         ]
                                                     },
                                                 },
+                                                depends_on=[
+                                                    "terraform_data.network_ready"
+                                                ],
                                             ),
                                             config_resource(
                                                 "aws_vpc_security_group_ingress_rule",
@@ -1720,7 +1719,7 @@ def clean_plan() -> dict[str, Any]:
         f"{network}.aws_route53_resolver_firewall_rule_group_association.relay",
         "aws_route53_resolver_firewall_rule_group_association",
         "relay",
-        {"mutation_protection": "DISABLED"},
+        {"mutation_protection": "DISABLED", "priority": 101},
     )
     add(
         f"{network}.aws_route53_resolver_query_log_config.relay",
@@ -2243,8 +2242,9 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             REPO_ROOT / "docs" / "runbooks" / "sandbox-relay-dmz-replacement.md"
         ).read_text()
         anchors = [
-            'export RELAY_DMZ_PLAN="$RELAY_DMZ_EVIDENCE_DIR/relay-dmz.tfplan"',
-            'terraform -chdir=terraform/environments/sandbox apply "$RELAY_DMZ_PLAN"',
+            "gh workflow run build-and-push.yml --ref main",
+            "-f force_build=true",
+            "-f relay_dmz_cutover=true",
             "## Gate 2: structural proof",
             '.github/scripts/deploy-relay.sh sandbox true "$REVIEWED_IMAGE_TAG"',
             "## Gate 4: direct SDK UDP proof",
@@ -3875,7 +3875,15 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             plan, ".aws_route53_resolver_firewall_rule_group_association.relay"
         )
         association["change"]["after"]["mutation_protection"] = "ENABLED"
-        self.assert_violation(plan, "rollback can disassociate")
+        self.assert_violation(plan, "rollback-safe at non-reserved priority 101")
+
+    def test_dns_association_priority_must_avoid_reserved_boundary(self) -> None:
+        plan = clean_plan()
+        association = resource(
+            plan, ".aws_route53_resolver_firewall_rule_group_association.relay"
+        )
+        association["change"]["after"]["priority"] = 100
+        self.assert_violation(plan, "rollback-safe at non-reserved priority 101")
 
     def test_backend_port_regression_is_rejected(self) -> None:
         plan = clean_plan()
@@ -4475,6 +4483,17 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         )
         ingress["change"]["after"]["cidr_ipv4"] = "0.0.0.0/0"
         self.assert_violation(plan, "must not use any public or CIDR source")
+
+    def test_private_ack_ingress_must_wait_for_active_peering(self) -> None:
+        plan = clean_plan()
+        ingress = configured_resource(
+            plan,
+            "relay",
+            "aws_vpc_security_group_ingress_rule",
+            "relay_udp_ack_return",
+        )
+        ingress["depends_on"] = []
+        self.assert_violation(plan, "active cross-VPC peering barrier")
 
     def test_private_ack_ingress_rejects_configured_cidr_branch(self) -> None:
         plan = clean_plan()
@@ -5360,23 +5379,15 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         key["change"]["after"]["policy"] = json.dumps(policy)
         self.assert_violation(plan, "exactly the flow and Resolver log groups")
 
-    def test_logs_kms_viaservice_is_required(self) -> None:
+    def test_logs_kms_rejects_unsupported_viaservice_condition(self) -> None:
         plan = clean_plan()
         key = resource(plan, ".aws_kms_key.logs")
         policy = json.loads(key["change"]["after"]["policy"])
-        del policy["Statement"][1]["Condition"]["StringEquals"]["kms:ViaService"]
+        policy["Statement"][1]["Condition"]["StringEquals"] = {
+            "kms:ViaService": "logs.us-east-2.amazonaws.com"
+        }
         key["change"]["after"]["policy"] = json.dumps(policy)
-        self.assert_violation(plan, "regional Logs ViaService")
-
-    def test_logs_kms_caller_account_is_pinned(self) -> None:
-        plan = clean_plan()
-        key = resource(plan, ".aws_kms_key.logs")
-        policy = json.loads(key["change"]["after"]["policy"])
-        policy["Statement"][1]["Condition"]["StringEquals"]["kms:CallerAccount"] = (
-            "000000000000"
-        )
-        key["change"]["after"]["policy"] = json.dumps(policy)
-        self.assert_violation(plan, "sandbox CallerAccount")
+        self.assert_violation(plan, "only the exact Logs encryption-context")
 
     def test_logs_kms_administration_is_pinned_to_sandbox_root(self) -> None:
         plan = clean_plan()

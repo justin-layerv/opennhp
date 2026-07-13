@@ -194,6 +194,11 @@ resource "aws_vpc_security_group_ingress_rule" "relay_udp_ack_return" {
   referenced_security_group_id = var.server_security_group_id
 
   tags = { Name = "${var.name_prefix}-relay-udp-ack-return" }
+
+  # Cross-VPC SG references are valid only after the same-region peering is
+  # active. The root network-ready token collapses that complete dependency;
+  # without it EC2 can report the two SGs as belonging to different networks.
+  depends_on = [terraform_data.network_ready]
 }
 
 # Data-plane egress: NHP_RLY only, UDP 62206, to the private subnet CIDRs that

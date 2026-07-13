@@ -47,7 +47,7 @@ gh workflow run build-and-push.yml --ref main \
   -f environment=sandbox \
   -f deploy=true \
   -f skip_tests=false \
-  -f force_build=false \
+  -f force_build=true \
   -f relay_dmz_cutover=true
 ```
 

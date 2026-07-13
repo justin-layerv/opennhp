@@ -251,6 +251,19 @@ jobs:
           GITHUB_REF: ${{ github.ref }}
         run: bash scripts/print-dispatch-ref-error.sh
 
+      - name: Validate relay DMZ cutover dispatch
+        if: inputs.relay_dmz_cutover
+        env:
+          DEPLOY: ${{ inputs.deploy }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+          SKIP_TESTS: ${{ inputs.skip_tests }}
+        run: |
+          set -euo pipefail
+          if [[ "$DEPLOY" != "true" || "$FORCE_BUILD" != "true" || "$SKIP_TESTS" == "true" ]]; then
+            echo "::error::relay_dmz_cutover requires deploy=true, force_build=true, and skip_tests=false"
+            exit 1
+          fi
+
       - name: Set metadata
         id: meta
         run: |

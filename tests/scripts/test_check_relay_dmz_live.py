@@ -474,10 +474,6 @@ def good_snapshot() -> dict:
                     ],
                     "Resource": "*",
                     "Condition": {
-                        "StringEquals": {
-                            "kms:CallerAccount": "767397897469",
-                            "kms:ViaService": "logs.us-east-2.amazonaws.com",
-                        },
                         "ArnEquals": {
                             "kms:EncryptionContext:aws:logs:arn": [
                                 "arn:aws:logs:us-east-2:767397897469:log-group:/layerv/nhp/sandbox/relay-dmz/flow",
@@ -495,7 +491,7 @@ def good_snapshot() -> dict:
                     "id": "rslvr-frgassoc-dmz",
                     "status": "COMPLETE",
                     "mutation_protection": "DISABLED",
-                    "priority": 100,
+                    "priority": 101,
                     "rules": dns_rules,
                 }
             ],
