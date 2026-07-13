@@ -1263,6 +1263,12 @@ func TestRelay_Timeout_504(t *testing.T) {
 	if w.Code != http.StatusGatewayTimeout {
 		t.Errorf("status = %d, want 504 when no ACK arrives", w.Code)
 	}
+	rs.pendingMu.Lock()
+	pendingCount := len(rs.pending)
+	rs.pendingMu.Unlock()
+	if pendingCount != 0 {
+		t.Errorf("pending request IDs after timeout = %d, want 0", pendingCount)
+	}
 }
 
 // Keep the production response window longer than the encryption hand-off

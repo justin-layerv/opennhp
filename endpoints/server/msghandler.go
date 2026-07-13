@@ -182,9 +182,10 @@ const (
 	// difference, and treat it as ~delivered modulo those rare internal failures.)
 	MetricRelayForward = "RelayForward"
 	// MetricRelayOverloadCookieReturn counts authenticated COK challenges
-	// successfully returned through NHP_RLY while the server is overloaded.
-	// Together with MetricOverloadCookieMintFailure, it distinguishes a working
-	// relay overload challenge path from mint or relay-return send failures.
+	// successfully encrypted and written to the private relay-return UDP socket
+	// while the server is overloaded. During a known overload window, correlate
+	// it with MetricOverloadCookieMintFailure and relay-return send-failure logs;
+	// a successful socket write does not by itself prove relay receipt.
 	MetricRelayOverloadCookieReturn = "RelayOverloadCookieReturn"
 	// MetricOverloadCookieProcessLocalKey is 1 while this server is using a
 	// random per-process overload-cookie signing key and 0 when a shared key is
