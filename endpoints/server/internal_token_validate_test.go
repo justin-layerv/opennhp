@@ -29,6 +29,8 @@ import (
 //
 //   - happy path returns the entry's metadata
 //   - expired entry returns valid=false, error="expired"
+//   - live entry with an omitted or different asserted RunID returns
+//     valid=false, error="run_id_mismatch"
 //   - zero ExpireTime treated as expired (fail-closed)
 //   - unknown token returns valid=false, error="not_found"
 //   - HMAC mismatch in strict mode returns 401
@@ -163,6 +165,39 @@ func verifyValidateResponseSignature(t *testing.T, signer *internalauth.Signer, 
 	if err := signer.Verify(rec.Header().Get(internalauth.Header), http.MethodPost, authPath, rec.Body.Bytes(), 0); err != nil {
 		t.Fatalf("response signature did not verify: %v\nheader=%q\nbody=%s", err, rec.Header().Get(internalauth.Header), rec.Body.String())
 	}
+}
+
+func assertRunIDMismatchResponse(t *testing.T, rec *httptest.ResponseRecorder, wantRunID string, wantRunIDPresent bool) internalTokenValidateResponse {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+
+	var got internalTokenValidateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v. body=%s", err, rec.Body.String())
+	}
+	if got.Valid || got.Error != "run_id_mismatch" || got.RunID != wantRunID {
+		t.Fatalf("response = %+v, want invalid run_id_mismatch with run_id %q", got, wantRunID)
+	}
+	if got.KnockSrcIP != "" || got.KnockUser != "" || got.OwnerId != "" || got.ExpiresAt != "" {
+		t.Fatalf("mismatch response leaked stored metadata: %+v", got)
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
+		t.Fatalf("decode response fields: %v", err)
+	}
+	for _, key := range []string{"knock_src_ip", "knock_user", "owner_id", "expires_at"} {
+		if _, present := fields[key]; present {
+			t.Errorf("mismatch response contains %q: %s", key, rec.Body.String())
+		}
+	}
+	_, runIDPresent := fields["run_id"]
+	if runIDPresent != wantRunIDPresent {
+		t.Errorf("run_id field present = %v, want %v. body=%s", runIDPresent, wantRunIDPresent, rec.Body.String())
+	}
+	return got
 }
 
 func sumDimCounterMatching(dimCounters map[string]float64, substrings ...string) float64 {
@@ -350,7 +385,7 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 	}
 	storeTestACToken(t, us, "ac-token-happy", entry)
 
-	body := `{"token":"ac-token-happy","agent_run_id":"run-from-caller"}`
+	body := `{"token":"ac-token-happy","agent_run_id":"run-happy"}`
 	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
 
 	if rec.Code != http.StatusOK {
@@ -379,12 +414,10 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 	if got.OwnerId != "owner-from-pubkey-lookup" {
 		t.Errorf("OwnerId = %q, want %q", got.OwnerId, "owner-from-pubkey-lookup")
 	}
-	// RunID echoes the entry's stored RunID, not the request's
-	// agent_run_id, when the entry has one. PR-2c's handoff is
-	// "trust the entry over the caller" so a misbehaving caller
-	// can't claim ownership of a different run's pinhole.
+	// RunID echoes the request after its non-empty value has matched
+	// the entry's stored binding.
 	if got.RunID != "run-happy" {
-		t.Errorf("RunID = %q, want %q (entry.RunID wins over request.agent_run_id)", got.RunID, "run-happy")
+		t.Errorf("RunID = %q, want request echo %q", got.RunID, "run-happy")
 	}
 	if got.Error != "" {
 		t.Errorf("Error = %q, want empty", got.Error)
@@ -416,6 +449,66 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 	}
 }
 
+// TestInternalTokenValidate_RunIDMismatchRejectsWithoutMetadata fences
+// the stored token binding: once the entry carries a non-empty RunID,
+// omission and inequality are both authoritative negative results. The
+// response echoes only the request value, so omission never exposes the
+// stored binding.
+func TestInternalTokenValidate_RunIDMismatchRejectsWithoutMetadata(t *testing.T) {
+	cases := []struct {
+		name             string
+		body             string
+		wantRunID        string
+		wantRunIDPresent bool
+	}{
+		{
+			name:             "different asserted run id",
+			body:             `{"token":"ac-token-run-id-mismatch","agent_run_id":"requested-run"}`,
+			wantRunID:        "requested-run",
+			wantRunIDPresent: true,
+		},
+		{
+			name: "omitted run id",
+			body: `{"token":"ac-token-run-id-mismatch"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, signer, us, _ := newTokenValidateRouterWithCounters(t, true)
+			storeTestACToken(t, us, "ac-token-run-id-mismatch", &ACTokenEntry{
+				User:       &common.AgentUser{UserId: "user-secret", OwnerId: "owner-secret"},
+				ResourceId: "r-secret",
+				KnockSrcIP: "203.0.113.44",
+				RunID:      "stored-run",
+				OpenTime:   60,
+				ExpireTime: time.Now().Add(time.Minute).UTC(),
+			})
+
+			rec := doValidateRequest(t, r, tc.body, signValidate(t, signer, tc.body))
+			assertRunIDMismatchResponse(t, rec, tc.wantRunID, tc.wantRunIDPresent)
+
+			counters, dimCounters := us.metrics.CountersForTest(t)
+			if got := counters[MetricInternalTokenValidateFailure]; got != 1 {
+				t.Fatalf("%s base counter = %v, want 1", MetricInternalTokenValidateFailure, got)
+			}
+			if got := sumDimCounterMatching(dimCounters, MetricInternalTokenValidateFailure, "CallerIP=127.0.0.1", "Reason=run_id_mismatch"); got != 1 {
+				t.Fatalf("%s CallerIP/Reason breakdown = %v, want 1 (dimCounters=%v)", MetricInternalTokenValidateFailure, got, dimCounters)
+			}
+			var reasonOnly float64
+			for key, value := range dimCounters {
+				if strings.Contains(key, MetricInternalTokenValidateFailure) &&
+					strings.Contains(key, "Reason=run_id_mismatch") &&
+					!strings.Contains(key, "CallerIP=") {
+					reasonOnly += value
+				}
+			}
+			if reasonOnly != 1 {
+				t.Fatalf("%s Reason-only stream = %v, want 1 (dimCounters=%v)", MetricInternalTokenValidateFailure, reasonOnly, dimCounters)
+			}
+		})
+	}
+}
+
 func TestInternalTokenValidate_ResponseAuthSignsNonceBoundBody(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 
@@ -434,7 +527,7 @@ func TestInternalTokenValidate_ResponseAuthSignsNonceBoundBody(t *testing.T) {
 	}
 	storeTestACToken(t, us, "ac-token-response-auth", entry)
 
-	body := `{"token":"ac-token-response-auth","agent_run_id":"run-from-caller"}`
+	body := `{"token":"ac-token-response-auth","agent_run_id":"run-response-auth"}`
 	nonce := "0123456789abcdef0123456789abcdef"
 	rec := doValidateRequestWithNonce(t, r, body, signValidate(t, signer, body), nonce)
 
@@ -504,7 +597,7 @@ func TestInternalTokenValidate_ResponseAuthProductionMiddlewareDoesNotContentEnc
 		ExpireTime: time.Now().Add(60 * time.Second).UTC(),
 	})
 
-	body := `{"token":"ac-token-no-content-encoding","agent_run_id":"run-from-caller"}`
+	body := `{"token":"ac-token-no-content-encoding","agent_run_id":"run-no-content-encoding"}`
 	nonce := "77777777777777777777777777777777"
 	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/token/validate", strings.NewReader(body))
 	req.RemoteAddr = "127.0.0.1:54321"
@@ -526,11 +619,12 @@ func TestInternalTokenValidate_ResponseAuthProductionMiddlewareDoesNotContentEnc
 
 func TestInternalTokenValidate_ResponseAuthSignsInvalidResponses(t *testing.T) {
 	cases := []struct {
-		name  string
-		token string
-		setup func(t *testing.T, us *UdpServer)
-		want  string
-		nonce string
+		name      string
+		token     string
+		setup     func(t *testing.T, us *UdpServer)
+		want      string
+		nonce     string
+		omitRunID bool
 	}{
 		{
 			name:  "not found",
@@ -552,6 +646,37 @@ func TestInternalTokenValidate_ResponseAuthSignsInvalidResponses(t *testing.T) {
 			want:  "expired",
 			nonce: "22222222222222222222222222222222",
 		},
+		{
+			name:  "run id mismatch",
+			token: "ac-token-response-auth-run-id-mismatch",
+			setup: func(t *testing.T, us *UdpServer) {
+				t.Helper()
+				storeTestACToken(t, us, "ac-token-response-auth-run-id-mismatch", &ACTokenEntry{
+					User:       &common.AgentUser{UserId: "user-mismatch", OwnerId: "owner-mismatch"},
+					ResourceId: "r-mismatch",
+					RunID:      "stored-run",
+					ExpireTime: time.Now().Add(time.Minute).UTC(),
+				})
+			},
+			want:  "run_id_mismatch",
+			nonce: "99999999999999999999999999999999",
+		},
+		{
+			name:  "run id omitted",
+			token: "ac-token-response-auth-run-id-omitted",
+			setup: func(t *testing.T, us *UdpServer) {
+				t.Helper()
+				storeTestACToken(t, us, "ac-token-response-auth-run-id-omitted", &ACTokenEntry{
+					User:       &common.AgentUser{UserId: "user-omitted", OwnerId: "owner-omitted"},
+					ResourceId: "r-omitted",
+					RunID:      "stored-run",
+					ExpireTime: time.Now().Add(time.Minute).UTC(),
+				})
+			},
+			want:      "run_id_mismatch",
+			nonce:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			omitRunID: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -562,6 +687,11 @@ func TestInternalTokenValidate_ResponseAuthSignsInvalidResponses(t *testing.T) {
 			}
 
 			body := `{"token":"` + tc.token + `","agent_run_id":"run-invalid-signed"}`
+			wantRunID := "run-invalid-signed"
+			if tc.omitRunID {
+				body = `{"token":"` + tc.token + `"}`
+				wantRunID = ""
+			}
 			rec := doValidateRequestWithNonce(t, r, body, signValidate(t, signer, body), tc.nonce)
 
 			if rec.Code != http.StatusOK {
@@ -578,6 +708,9 @@ func TestInternalTokenValidate_ResponseAuthSignsInvalidResponses(t *testing.T) {
 			}
 			if got.Error != tc.want {
 				t.Fatalf("Error = %q, want %q. body=%s", got.Error, tc.want, rec.Body.String())
+			}
+			if got.RunID != wantRunID {
+				t.Fatalf("RunID = %q, want request echo %q. body=%s", got.RunID, wantRunID, rec.Body.String())
 			}
 		})
 	}
@@ -663,7 +796,7 @@ func TestInternalTokenValidate_ResponseAuthAbsentWithoutNonce(t *testing.T) {
 	}
 	storeTestACToken(t, us, "ac-token-no-nonce", entry)
 
-	body := `{"token":"ac-token-no-nonce","agent_run_id":"run-from-caller"}`
+	body := `{"token":"ac-token-no-nonce","agent_run_id":"run-no-nonce"}`
 	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
 
 	if rec.Code != http.StatusOK {
@@ -1211,7 +1344,7 @@ func TestInternalTokenValidate_SharedStoreHitOnLocalMiss(t *testing.T) {
 	store := &fakeACKTokenStore{entry: entry, found: true}
 	us.ackTokenStore = store
 
-	body := `{"token":"ac-token-shared","agent_run_id":"caller-run"}`
+	body := `{"token":"ac-token-shared","agent_run_id":"run-shared"}`
 	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
 
 	if rec.Code != http.StatusOK {
@@ -1234,7 +1367,7 @@ func TestInternalTokenValidate_SharedStoreHitOnLocalMiss(t *testing.T) {
 		t.Errorf("OwnerId = %q, want %q", got.OwnerId, "owner-shared")
 	}
 	if got.RunID != "run-shared" {
-		t.Errorf("RunID = %q, want %q (entry.RunID wins over caller)", got.RunID, "run-shared")
+		t.Errorf("RunID = %q, want request echo %q", got.RunID, "run-shared")
 	}
 	if got.KnockSrcIP != "203.0.113.77" {
 		t.Errorf("KnockSrcIP = %q, want %q", got.KnockSrcIP, "203.0.113.77")
@@ -1248,6 +1381,60 @@ func TestInternalTokenValidate_SharedStoreHitOnLocalMiss(t *testing.T) {
 	}
 	if got := counters[MetricACKTokenSharedStoreReadFailure]; got != 0 {
 		t.Fatalf("%s counter = %v, want 0", MetricACKTokenSharedStoreReadFailure, got)
+	}
+}
+
+func TestInternalTokenValidate_SharedStoreRunIDMismatchRejects(t *testing.T) {
+	cases := []struct {
+		name             string
+		body             string
+		wantRunID        string
+		wantRunIDPresent bool
+	}{
+		{
+			name:             "different asserted run id",
+			body:             `{"token":"ac-token-shared-mismatch","agent_run_id":"requested-shared-run"}`,
+			wantRunID:        "requested-shared-run",
+			wantRunIDPresent: true,
+		},
+		{
+			name: "omitted run id",
+			body: `{"token":"ac-token-shared-mismatch"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, signer, us := newTokenValidateRouter(t, true)
+			us.metrics = metrics.NewPublisherForTest(t)
+			store := &fakeACKTokenStore{
+				found: true,
+				entry: &ACTokenEntry{
+					User:       &common.AgentUser{UserId: "user-shared-secret", OwnerId: "owner-shared-secret"},
+					ResourceId: "r-shared-secret",
+					KnockSrcIP: "203.0.113.79",
+					RunID:      "stored-shared-run",
+					OpenTime:   60,
+					ExpireTime: time.Now().Add(time.Minute).UTC(),
+				},
+			}
+			us.ackTokenStore = store
+
+			rec := doValidateRequest(t, r, tc.body, signValidate(t, signer, tc.body))
+			assertRunIDMismatchResponse(t, rec, tc.wantRunID, tc.wantRunIDPresent)
+			if store.loadCalls != 1 {
+				t.Fatalf("shared-store LoadACToken calls = %d, want 1", store.loadCalls)
+			}
+			if _, found := us.tokenStore.Load("ac-token-shared-mismatch"); found {
+				t.Fatal("shared mismatch warmed local tokenStore, want no cache fill")
+			}
+			counters, _ := us.metrics.CountersForTest(t)
+			if got := counters[MetricACKTokenSharedStoreHit]; got != 1 {
+				t.Fatalf("%s counter = %v, want 1 for live shared-store entry", MetricACKTokenSharedStoreHit, got)
+			}
+			if got := counters[MetricInternalTokenValidateFailure]; got != 1 {
+				t.Fatalf("%s counter = %v, want 1", MetricInternalTokenValidateFailure, got)
+			}
+		})
 	}
 }
 
@@ -1269,7 +1456,7 @@ func TestInternalTokenValidate_LocalHitDoesNotConsultSharedStore(t *testing.T) {
 	store := &fakeACKTokenStore{err: errors.New("shared store should not be called on local hit")}
 	us.ackTokenStore = store
 
-	body := `{"token":"ac-token-local","agent_run_id":"caller-run"}`
+	body := `{"token":"ac-token-local","agent_run_id":"run-local"}`
 	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
 
 	if rec.Code != http.StatusOK {
@@ -1463,7 +1650,7 @@ func TestInternalTokenValidate_Idempotent(t *testing.T) {
 		ExpireTime: time.Now().Add(60 * time.Second).UTC(),
 	})
 
-	body := `{"token":"ac-token-idem"}`
+	body := `{"token":"ac-token-idem","agent_run_id":"run-idem"}`
 	auth := signValidate(t, signer, body)
 
 	first := doValidateRequest(t, r, body, auth).Body.Bytes()
@@ -1480,6 +1667,16 @@ func TestInternalTokenValidate_Idempotent(t *testing.T) {
 	}
 	if !got.Valid {
 		t.Fatalf("idempotency test must run on a happy-path response; got %+v", got)
+	}
+	if got.RunID != "run-idem" {
+		t.Fatalf("RunID = %q, want request echo %q", got.RunID, "run-idem")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(first, &fields); err != nil {
+		t.Fatalf("decode response fields: %v", err)
+	}
+	if _, present := fields["run_id"]; !present {
+		t.Fatalf("response omitted asserted matching run_id: %s", first)
 	}
 }
 

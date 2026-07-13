@@ -301,26 +301,22 @@ resource "aws_cloudwatch_metric_alarm" "min_client_version_sync_failure" {
 
 # ==================== Knock-token validation outcomes ====================
 #
-# Per `qurl-reverse-tunnel-server` CLAUDE.md "Knock-event tag taxonomy",
-# the FRP-Login knock validator emits one of five structured slog events
-# (handler.go around `tagKnockInvalid` / `tagKnockExpired` / etc):
+# In the target rollout with qurl-reverse-tunnel-server #221, the structured
+# outcomes relevant to these filters are:
 #
-#   knock_token_invalid              ← rejected (require=true) or
-#                                      validator returned valid=false
+#   knock_token_invalid              ← validator returned valid=false
 #   knock_token_validator_error      ← transport / upstream / parse fail
-#   knock_token_missing              ← observation-only under require=false
-#   knock_token_ip_mismatch          ← observation-only (always accepted)
-#   knock_token_run_id_mismatch      ← observation-only (always accepted)
+#   knock_token_missing              ← rejected in tunnel-auth mode
+#   knock_token_run_id_mismatch      ← rejected by qurl-reverse-tunnel-server
+#                                      #221's defensive valid=true check
 #
-# Today only the binary FRPSErrorCount alarm above covers any of this;
-# `[E]`-tagged log lines aren't a subset of these events, and there's
-# no shape that lets an operator break "client misconfig vs upstream
-# nhp-server outage" apart.
-#
-# v1 customer-ship goal: surface invalid + validator_error specifically.
-# missing / ip_mismatch / run_id_mismatch are deliberately NOT alarmed —
-# they're observation-only flags whose paging would be noise during
-# every NAT-egress mutation or pre-strict-mode client.
+# The invalid + validator_error metrics remain the primary alarms. A
+# producer-side run_id_mismatch is an NHP valid=false result, flows through
+# knock_token_invalid, and increments NHP InternalTokenValidateFailure. By
+# contrast, #221's defensive valid=true mismatch means the producer regressed:
+# qurl-reverse-tunnel-server hard-rejects the Login fail closed, while the
+# additional knock_token_run_id_mismatch telemetry is log-only and is NOT
+# covered by the NHP failure metric or a dedicated CloudWatch filter here.
 #
 # Cardinality / dim-set note: the slog payload also carries `run_id` /
 # `frpc_user` / `client_address`, but the metric is *intentionally*
@@ -373,35 +369,25 @@ resource "aws_cloudwatch_log_metric_filter" "knock_token_validator_error" {
   }
 }
 
-# Aggregate "knock-token reject rate" alarm. Pages on > 3/min sustained
+# Aggregate token-validation failure alarm. Pages on > 3/min sustained
 # 3-of-5 minutes — the bootstrap surface produces ~50 req/min steady
 # state per the bootstrap-alb tuning note, and Login QPS is bounded by
 # the same population, so 3/min sustained is unambiguous noise that
 # warrants paging.
 #
 # Combines both filters via metric math: `invalid + validator_error`.
-# Both reflect "Login attempt rejected at the knock-validation gate".
-# **Single-emit invariant**: each Login path in
-# `qurl-reverse-tunnel-server/internal/tunnelauth/handler.go` emits
-# exactly ONE of these two events (see the `if knockToken == "" { ... }
-# else { switch { case verr != nil: ..., case !vresp.Valid: ..., default:
-# ... } }` structure around line 634). No Login produces both; the sum
-# is therefore the unique-event count, not a double-count. Splitting
-# them at alarm time would just page twice for the same upstream outage.
-# Test fence for both the field-name dependency AND the single-emit
-# invariant tracked in qurl-reverse-tunnel-server#122.
-#
-# **Customer-install symptom**: a customer sidecar whose
-# `LAYERV_REQUIRE_KNOCK=true` but whose knock UDP path is blocked by a
-# GCP firewall will produce a sustained burst of `knock_token_invalid`
-# (no token landed → require=true rejects locally before the validator
-# even fires). This alarm catches the case where the install runbook's
-# UDP-firewall step was skipped.
+# A validator-backed Login failure emits at most one of these events,
+# so the sum does not double-count. It is deliberately not an aggregate
+# of every Login denial: empty tokens (`knock_token_missing`) and
+# defensive post-validation contract rejects such as a mismatched valid=true
+# RunID are still hard Login rejects, but their additional telemetry remains
+# log-only. The field-name dependency and no-double-emit invariant are tracked
+# in qurl-reverse-tunnel-server#122.
 resource "aws_cloudwatch_metric_alarm" "knock_token_reject_rate" {
   count = var.enable_cloudwatch_alarms ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-frps-knock-token-reject-rate"
-  alarm_description   = "FRP server rejected >${var.knock_token_reject_threshold_per_minute} Login attempts/min at the knock-validation gate (invalid token OR upstream nhp-server validator error). Customer-install symptom: blocked UDP knock path on the customer side, or NHP server outage. Triage: grep frps log group for `event=knock_token_invalid` (look at `validator_error` field to distinguish `empty_token_local_skip` vs `not_found`/`expired`/`invalid_format`)."
+  alarm_description   = "FRP server observed >${var.knock_token_reject_threshold_per_minute} invalid-token or upstream nhp-server validator-error outcomes/min. Triage: grep frps log group for `event=knock_token_invalid`; after qurl-reverse-tunnel-server #221, the `validator_error` field distinguishes `not_found`, `expired`, `invalid_format`, and `run_id_mismatch`. Empty tokens and defensive post-validation contract rejects still fail closed but have log-only telemetry and are not part of this alarm."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 5
   datapoints_to_alarm = 3

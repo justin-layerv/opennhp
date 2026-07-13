@@ -47,4 +47,4 @@ Confirm all three paths:
 
 1. A fresh knock succeeds and returns an ACK token.
 2. `/nhp/internal/token/validate` succeeds when it lands on a different NHP instance from the knock.
-3. `ACKTokenSharedStoreHit` increments during the cross-instance validation test, while write/read failure counters stop increasing.
+3. `ACKTokenSharedStoreHit` increments during the cross-instance validation test, while write/read failure counters stop increasing. Treat this as a successful shared-store retrieval signal, not proof that the later authorization result was valid; a RunID mismatch increments both this counter and `InternalTokenValidateFailure`.

@@ -118,7 +118,14 @@ func (hs *HttpServer) recordInternalTokenValidateFailure(callerIP, reason string
 	if hs == nil || hs.udpServer == nil {
 		return
 	}
+	// Publish three exact dimension sets:
+	//   - base: aggregate failure alarm,
+	//   - Reason: bounded reason-specific detection (including the RunID alarm),
+	//   - CallerIP/Reason: attribution.
 	hs.udpServer.metrics.IncrCounter(MetricInternalTokenValidateFailure)
+	hs.udpServer.metrics.IncrCounterWithDims(MetricInternalTokenValidateFailure, []types.Dimension{
+		{Name: dimNameReason, Value: aws.String(reason)},
+	})
 	hs.udpServer.metrics.IncrCounterWithDims(MetricInternalTokenValidateFailure, []types.Dimension{
 		{Name: dimNameCallerIP, Value: aws.String(callerIP)},
 		{Name: dimNameReason, Value: aws.String(reason)},

@@ -43,15 +43,12 @@ const (
 // (ackMsg.ACTokens[resourceId]) — the same value the agent will
 // attach to its FRP login Metas as `qurl_knock_token`.
 //
-// AgentRunID is optional. Plan PR-2c populates it once the agent
-// registration path threads RunID through the ACK construction
-// sites; until then, callers omit the field. The response's
-// `run_id` also carries `omitempty`, so when neither the entry's
-// stored RunID nor the request's AgentRunID is set the field is
-// absent from the response body rather than serialized as an
-// empty string. Callers using `run_id` as a correlation key
-// should treat its absence as "no run identifier on either side"
-// and not key off an empty string.
+// AgentRunID is optional only while the live token entry has no stored
+// RunID (the pre-#3226 producer shape). Once an entry has a
+// non-empty RunID, the request must supply the same value; omission or
+// inequality is rejected as run_id_mismatch. The response `run_id`
+// always echoes AgentRunID and carries `omitempty`, so a rejection for
+// omission does not expose the stored run identifier.
 type internalTokenValidateRequest struct {
 	Token      string `json:"token"`
 	AgentRunID string `json:"agent_run_id,omitempty"`
@@ -59,9 +56,9 @@ type internalTokenValidateRequest struct {
 
 // maxAgentRunIDBytes caps the size of req.AgentRunID. The handler
 // echoes AgentRunID verbatim into the response `run_id` field on
-// every code path; without a cap, a (HMAC-authed) caller could
-// amplify any future tunnel-server response-by-hash cache by
-// inflating agent_run_id up to the 4 KiB body limit. 256 bytes
+// every validation-result path; without a cap, a (HMAC-authed)
+// caller could amplify any future tunnel-server response-by-hash
+// cache by inflating agent_run_id up to the 4 KiB body limit. 256 bytes
 // is well above any plausible legitimate run identifier (UUIDs,
 // ULIDs, hex SHAs are all under 64 bytes) while keeping the
 // echoed wire shape bounded. Oversize is rejected (not truncated)
@@ -79,24 +76,25 @@ const maxAgentRunIDBytes = 256
 //
 // Error vocabulary (Error field, populated only when Valid=false):
 //
-//	"not_found"      — token absent from tokenStore. This collapses
-//	                    two operationally distinct cases the consumer
-//	                    cannot distinguish from the wire shape alone:
-//	                    (a) the token was never issued by any server,
-//	                    or (b) it was issued by a different server in
-//	                    a multi-server fleet and this one never saw
-//	                    it, or (c) it was issued here but already
-//	                    swept by CleanExpired. A spike in not_found
-//	                    can mean any of the three; operators triaging
-//	                    should pair with the issuing-server's emit
-//	                    counter to disambiguate.
+//	"not_found"      — token absent from the local tokenStore and the
+//	                    configured fleet-visible fallback. This
+//	                    collapses cases the consumer cannot distinguish
+//	                    from the wire shape alone: the token was never
+//	                    issued, was already swept, or was minted on a
+//	                    different server while the shared fallback was
+//	                    disabled. Operators should pair a spike with
+//	                    issuing-server and shared-store telemetry.
 //	"expired"        — entry present but ExpireTime <= now. The
 //	                    sweeper runs every TokenStoreRefreshInterval
 //	                    seconds, so an entry can linger past its
 //	                    ExpireTime briefly — the handler must
 //	                    re-check rather than trust the absence-
 //	                    of-not-found as proof of validity.
-//	"invalid_format" — reserved for future shape checks (e.g. a
+//	"run_id_mismatch" — a live entry carries a non-empty RunID and
+//	                    the request omits agent_run_id or supplies a
+//	                    different value. The response echoes only the
+//	                    request value and omits all stored metadata.
+//	"invalid_format"  — reserved for future shape checks (e.g. a
 //	                    length floor) once the AC token shape is
 //	                    fenced; not emitted today. Empty tokens
 //	                    are rejected pre-handler with HTTP 400
@@ -148,12 +146,11 @@ type internalTokenValidateResponse struct {
 	// either fall back to other identity signals or reject per
 	// their own policy.
 	OwnerId string `json:"owner_id,omitempty"`
-	// RunID echoes the entry's stored RunID when set, otherwise
-	// the caller-supplied agent_run_id. Field-name asymmetry
-	// (request agent_run_id vs response run_id) is intentional —
-	// the request labels the field as the agent's identifier; the
-	// response carries it as a correlation key the tunnel-server
-	// may also merge with its own run_id sources.
+	// RunID echoes only the caller-supplied agent_run_id. Field-name
+	// asymmetry (request agent_run_id vs response run_id) is
+	// intentional: the response confirms the caller's asserted
+	// identifier, while entry.RunID remains a server-side binding
+	// used to reject a non-empty mismatch.
 	RunID string `json:"run_id,omitempty"`
 	// ExpiresAt is the entry's ExpireTime, RFC3339Nano in UTC.
 	//
@@ -514,12 +511,11 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	// year 1, before any real now) but kept as an explicit assertion
 	// — readers don't have to puzzle out the After-vs-zero case.
 	if entry.ExpireTime.IsZero() || time.Now().After(entry.ExpireTime) {
-		// Echo req.AgentRunID rather than entry.RunID even though
-		// the entry is present here. The "entry wins over caller"
-		// rule on the happy path is about ownership of the live
-		// pinhole; the expired branch has no live pinhole, so the
-		// echoed run_id is purely a request/response correlation
-		// key and the caller's value is the safer default.
+		// Echo req.AgentRunID rather than entry.RunID even though the
+		// entry is present here. The expired branch has no live
+		// pinhole, so the echoed run_id is purely a request/response
+		// correlation key; the live-entry binding check below does not
+		// apply.
 		hs.recordInternalTokenValidateFailure(srcIP, "expired")
 		respond(http.StatusOK, internalTokenValidateResponse{
 			Valid: false,
@@ -536,27 +532,37 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		// whether this validate request landed on the issuing process.
 		hs.udpServer.metrics.IncrCounter(MetricACKTokenSharedStoreHit)
 	}
+	// Before #3226 populates entry.RunID, request-only and empty/empty values
+	// stay compatible. Once a live entry carries a binding, however, the
+	// caller must assert the exact same value: omission is a mismatch, not a
+	// compatibility escape hatch.
+	if entry.RunID != "" && entry.RunID != req.AgentRunID {
+		// Echo only the request value so every negative result remains
+		// correlatable without leaking the stored binding or any other
+		// token metadata. On omission, omitempty keeps run_id off the wire.
+		hs.recordInternalTokenValidateFailure(srcIP, "run_id_mismatch")
+		respond(http.StatusOK, internalTokenValidateResponse{
+			Valid: false,
+			RunID: req.AgentRunID,
+			Error: "run_id_mismatch",
+		})
+		return
+	}
 
 	// Happy path. Populate everything the tunnel-server's
 	// knock_validator expects:
 	//   - knock_src_ip: the IP the agent knocked from. The
-	//     tunnel-server may compare to ClientAddress on the FRP
-	//     login (logs a warn on mismatch but does not reject —
-	//     GCP Cloud NAT egress varies, see plan PR-2c).
+	//     tunnel-server uses this response-authenticated source for
+	//     connector fairness; it must not compare it to FRP's
+	//     ClientAddress, which is the shared AC/Traefik peer in the
+	//     supported topology.
 	//   - knock_user:   the AgentUser.UserId (omits DeviceId /
 	//     OrgId / AuthServiceId; the tunnel-server only uses the
 	//     UserId for audit-log annotation today).
-	//   - run_id:       entry.RunID wins when set; otherwise the
-	//     handler echoes the caller-supplied agent_run_id. "Trust
-	//     the entry over the caller" so a misbehaving caller can't
-	//     claim ownership of a different run's pinhole. Plan PR-2c
-	//     populates entry.RunID once the agent-registration thread
-	//     is wired; until then ACK-path entries hold the empty
-	//     string and the request's agent_run_id is echoed so a
-	//     caller-side correlation key works regardless of which
-	//     side is ahead in the rollout. See the precedence rule on
-	//     internalTokenValidateResponse.RunID for the canonical
-	//     statement.
+	//   - run_id:       echoes the caller-supplied agent_run_id after
+	//     the stored binding check above. If the caller omits it, a
+	//     valid response is possible only for a pre-#3226 entry whose
+	//     stored RunID is also empty.
 	//   - expires_at:   RFC3339Nano to keep the response self-
 	//     describing across language clients AND preserve the
 	//     sub-second precision the in-memory ExpireTime carries.
@@ -579,16 +585,12 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		user = entry.User.UserId
 		ownerId = entry.User.OwnerId
 	}
-	runID := entry.RunID
-	if runID == "" {
-		runID = req.AgentRunID
-	}
 	respond(http.StatusOK, internalTokenValidateResponse{
 		Valid:      true,
 		KnockSrcIP: entry.KnockSrcIP,
 		KnockUser:  user,
 		OwnerId:    ownerId,
-		RunID:      runID,
+		RunID:      req.AgentRunID,
 		ExpiresAt:  entry.ExpireTime.UTC().Format(time.RFC3339Nano),
 	})
 }

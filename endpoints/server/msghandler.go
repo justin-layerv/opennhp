@@ -347,9 +347,11 @@ const (
 	MetricACKTokenSharedStoreReadFailure = "ACKTokenSharedStoreReadFailure"
 	// MetricACKTokenSharedStoreHit fires when /nhp/internal/token/validate
 	// recovers a live, unexpired token from the shared store after a
-	// local tokenStore miss. A non-zero rate is expected in multi-server
-	// deployments where knocks and validator calls land on different
-	// instances.
+	// local tokenStore miss. It records successful metadata retrieval,
+	// not successful authorization: a later RunID mismatch also increments
+	// MetricInternalTokenValidateFailure. A non-zero hit rate is expected in
+	// multi-server deployments where knocks and validator calls land on
+	// different instances.
 	MetricACKTokenSharedStoreHit = "ACKTokenSharedStoreHit"
 	// MetricInternalAuthFailPermit / MetricInternalAuthFailStrict count
 	// signed /nhp/internal requests whose HMAC verification failed.
@@ -417,8 +419,9 @@ const (
 	// verifier nonce-shape bugs without redefining request-auth success.
 	MetricInternalTokenValidateBadNonce = "InternalTokenValidateBadNonce"
 	// MetricInternalTokenValidateFailure counts authoritative negative
-	// /nhp/internal/token/validate results (not_found or expired). It is
-	// dual-published as a base counter for a grinding alarm and as a
+	// /nhp/internal/token/validate results (not_found, expired, or
+	// run_id_mismatch). It is published as a base counter for the aggregate
+	// alarm, a bounded Reason stream for reason-specific alarms, and a
 	// CallerIP/Reason breakdown stream for attribution.
 	MetricInternalTokenValidateFailure = "InternalTokenValidateFailure"
 	MetricACPeerCount                  = "ACPeerCount"

@@ -62,7 +62,7 @@ locals {
       metric_name = "InternalTokenValidateFailure"
       suffix      = "internal-token-validate-failure"
       threshold   = 10
-      description = "NHP internal token validation returned not_found/expired more than 10 times in 5 minutes. Check CallerIP/Reason breakdown streams for token grinding, replay, or a caller routing to the wrong server."
+      description = "NHP internal token validation returned not_found, expired, or run_id_mismatch more than 10 times in 5 minutes. Check CallerIP/Reason breakdown streams for token grinding, replay, wrong-server routing, or producer/consumer RunID contract drift. RunID mismatches also have a dedicated zero-tolerance alarm."
     }
   }
 
@@ -1163,10 +1163,10 @@ resource "aws_cloudwatch_metric_alarm" "ack_token_shared_store_failure" {
   })
 }
 
-# Internal-surface security failures. The Go publisher dual-publishes
-# these as:
-#   - a base stream at {Environment, Cell}, which alarms can match, and
-#   - dimensioned breakdown streams (CallerIP/Reason) for attribution.
+# Internal-surface security failures. The Go publisher emits a base stream at
+# {Environment, Cell}, which these aggregate alarms match. Token-validation
+# failures also emit bounded {Environment, Cell, Reason} and attribution
+# {Environment, Cell, CallerIP, Reason} streams.
 resource "aws_cloudwatch_metric_alarm" "internal_security_failure" {
   for_each = local.internal_security_failure_alarms
 
@@ -1192,6 +1192,40 @@ resource "aws_cloudwatch_metric_alarm" "internal_security_failure" {
     Component = "monitoring"
     Cell      = var.cell_id
     Issue     = "1140"
+  })
+}
+
+# RunID binding is a zero-tolerance contract: one mismatch means the producer,
+# consumer, or rollout ordering drifted. Select the bounded Reason-only stream
+# rather than the aggregate base metric so not_found/expired traffic cannot
+# trigger this tripwire. The Go publisher emits this exact dimension set from
+# recordInternalTokenValidateFailure; omitting Reason or adding CallerIP would
+# select a different CloudWatch series and leave this alarm blind.
+resource "aws_cloudwatch_metric_alarm" "internal_token_validate_run_id_mismatch" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-internal-token-validate-run-id-mismatch"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  metric_name         = "InternalTokenValidateFailure"
+  namespace           = "LayerV/NHP"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "NHP observed at least one token-validation RunID mismatch in 1 minute. This is zero-tolerance producer/consumer binding drift: stop the qurl-reverse-tunnel-server rollout, compare the stored token RunID with the asserted Login RunID, and verify the consumer never omits agent_run_id. #3224."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+    Reason      = "run_id_mismatch"
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+    Issue     = "3224"
   })
 }
 

@@ -524,6 +524,22 @@ def mutate_relay_alarm(root: Path, name: str, old: str, new: str) -> None:
 
 
 class ObservabilityParityTests(unittest.TestCase):
+    def test_run_id_mismatch_alarm_is_one_minute_zero_tolerance(self) -> None:
+        alarm = CHECKER.find_block(
+            REPO_ROOT / "terraform" / "modules" / "monitoring" / "main.tf",
+            'resource "aws_cloudwatch_metric_alarm"',
+            "internal_token_validate_run_id_mismatch",
+        )
+
+        CHECKER.require_assignment(alarm, "comparison_operator", '"GreaterThanThreshold"')
+        CHECKER.require_assignment(alarm, "evaluation_periods", "1")
+        CHECKER.require_assignment(alarm, "datapoints_to_alarm", "1")
+        CHECKER.require_assignment(alarm, "period", "60")
+        CHECKER.require_assignment(alarm, "statistic", '"Sum"')
+        CHECKER.require_assignment(alarm, "threshold", "0")
+        CHECKER.require_assignment(alarm, "treat_missing_data", '"notBreaching"')
+        self.assertIn('Reason      = "run_id_mismatch"', alarm.body)
+
     def test_aop_replay_detection_alarm_is_fenced(self) -> None:
         self.assertIn("aop_replay_detected", AC_CORE_ALARMS)
 
