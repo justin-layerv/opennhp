@@ -119,9 +119,7 @@ func TestRelay_InnerOTP_Returns202NoWaiter(t *testing.T) {
 
 	// No pending waiter may have been registered (the whole point — otherwise the
 	// map/goroutine would grow and a never-arriving reply would 504).
-	rs.pendingMu.Lock()
-	n := len(rs.pending)
-	rs.pendingMu.Unlock()
+	n := relayPendingCount(rs)
 	if n != 0 {
 		t.Errorf("rs.pending has %d entries after an OTP; a fire-and-forget OTP must register NO reply-waiter", n)
 	}

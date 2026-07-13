@@ -182,7 +182,7 @@ const (
 	// difference, and treat it as ~delivered modulo those rare internal failures.)
 	MetricRelayForward = "RelayForward"
 	// MetricRelayOverloadCookieReturn counts authenticated COK challenges
-	// successfully encrypted and written to the private relay-return UDP socket
+	// successfully encrypted and written to the relay-return UDP socket
 	// while the server is overloaded. During a known overload window, correlate
 	// it with MetricOverloadCookieMintFailure and relay-return send-failure logs;
 	// a successful socket write does not by itself prove relay receipt.

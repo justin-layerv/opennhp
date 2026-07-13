@@ -38,6 +38,12 @@ func keyBytes(seed byte) []byte {
 	return k
 }
 
+func relayPendingCount(rs *RelayServer) int {
+	rs.pendingMu.Lock()
+	defer rs.pendingMu.Unlock()
+	return len(rs.pending)
+}
+
 func waitForRelayCondition(t *testing.T, timeout time.Duration, what string, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -765,9 +771,7 @@ func TestRelay_InFlightCap_Sheds(t *testing.T) {
 		srv.inFlight <- struct{}{}
 	}
 
-	rs.pendingMu.Lock()
-	pendingBefore := len(rs.pending)
-	rs.pendingMu.Unlock()
+	pendingBefore := relayPendingCount(rs)
 	req := httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerKnock))
 	req.RemoteAddr = "203.0.113.7:44444"
 	req.Header.Set("Origin", testKnockOrigin)
@@ -794,9 +798,7 @@ func TestRelay_InFlightCap_Sheds(t *testing.T) {
 	}
 	// The shed must happen before any pending registration — otherwise the map
 	// (and goroutine count) would still grow under a stuck cell, defeating the cap.
-	rs.pendingMu.Lock()
-	pendingAfter := len(rs.pending)
-	rs.pendingMu.Unlock()
+	pendingAfter := relayPendingCount(rs)
 	if pendingAfter != pendingBefore {
 		t.Errorf("pending grew from %d to %d on a shed request; the cap must shed BEFORE registering a waiter", pendingBefore, pendingAfter)
 	}
@@ -1263,9 +1265,7 @@ func TestRelay_Timeout_504(t *testing.T) {
 	if w.Code != http.StatusGatewayTimeout {
 		t.Errorf("status = %d, want 504 when no ACK arrives", w.Code)
 	}
-	rs.pendingMu.Lock()
-	pendingCount := len(rs.pending)
-	rs.pendingMu.Unlock()
+	pendingCount := relayPendingCount(rs)
 	if pendingCount != 0 {
 		t.Errorf("pending request IDs after timeout = %d, want 0", pendingCount)
 	}
@@ -1370,9 +1370,7 @@ func TestRelay_RandomRequestIDsDoNotOverwrite(t *testing.T) {
 	}
 	defer rs.releasePending(k2)
 
-	rs.pendingMu.Lock()
-	pendingCount := len(rs.pending)
-	rs.pendingMu.Unlock()
+	pendingCount := relayPendingCount(rs)
 	if pendingCount != 2 {
 		t.Fatalf("distinct random request IDs collapsed to %d pending entries", pendingCount)
 	}
