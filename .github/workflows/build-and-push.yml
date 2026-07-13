@@ -2255,12 +2255,21 @@ jobs:
           # Give the live AWS ENI probe a small retry budget for transient CLI/API
           # failures. In --needs-recovery mode the helper returns immediately once
           # it confirms attached ENIs, so this does not delay real recovery.
-          set +e
-          RELAY_DEPOSED_SG_CHECK_MAX_ITERATIONS=3 \
-          RELAY_DEPOSED_SG_CHECK_INTERVAL_SECS=5 \
-            ../../../.github/scripts/check-relay-deposed-sg-clear.sh --needs-recovery plan-show.json
-          RELAY_DEPOSED_STATUS=$?
-          set -e
+          if [[ "$RELAY_DMZ_CUTOVER" == "true" ]]; then
+            # The first DMZ cutover intentionally replaces the entire relay
+            # fleet across VPCs. Refreshing the old ASG cannot attach its ENIs
+            # to the new-VPC SG and would loop forever; Terraform must instead
+            # destroy the old ASG before deleting its old SG.
+            echo "::notice::Skipping same-VPC deposed-SG refresh during the cross-VPC relay DMZ cutover."
+            RELAY_DEPOSED_STATUS=1
+          else
+            set +e
+            RELAY_DEPOSED_SG_CHECK_MAX_ITERATIONS=3 \
+            RELAY_DEPOSED_SG_CHECK_INTERVAL_SECS=5 \
+              ../../../.github/scripts/check-relay-deposed-sg-clear.sh --needs-recovery plan-show.json
+            RELAY_DEPOSED_STATUS=$?
+            set -e
+          fi
 
           if [[ "$RELAY_DEPOSED_STATUS" -eq 0 ]]; then
             echo "::warning::Detected deposed relay node security group pending destroy; refreshing relay ASG before Terraform retries DeleteSecurityGroup"

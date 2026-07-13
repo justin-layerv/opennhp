@@ -248,6 +248,9 @@ else
   assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
     "recovery preflight checks its dedicated saved-plan JSON" \
     'plan-boundary-preflight\.json'
+  assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
+    "cross-VPC cutover skips impossible same-VPC SG refresh" \
+    'RELAY_DMZ_CUTOVER.*true'
   if grep -Eq -- '--allow-disabled' <<< "$RECOVERY_STEP"; then
     report_fail "recovery preflight cannot use bootstrap tolerance" \
       "unexpected --allow-disabled in recovery preflight"
