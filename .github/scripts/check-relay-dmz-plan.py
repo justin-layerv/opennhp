@@ -1923,10 +1923,49 @@ def validate_plan(
         network_named("aws_security_group", "endpoints"), "endpoint security group"
     )
     if endpoint_sg:
+        # After a partial apply/provider refresh, aws_security_group can project
+        # the separately managed HTTPS rule into this legacy aggregate field
+        # even though configuration still declares explicit empty inline lists.
+        # Accept only that exact projection; the config-graph check below still
+        # rejects any actual inline rule declaration.
+        endpoint_ingress = endpoint_sg.values.get("ingress") or []
+        endpoint_https_rule = v.one(
+            relay_named(
+                "aws_vpc_security_group_ingress_rule",
+                "vpc_endpoints_from_relay",
+            ),
+            "standalone endpoint HTTPS ingress rule projection",
+        )
+        relay_node_sg_id = (
+            endpoint_https_rule.values.get("referenced_security_group_id")
+            if endpoint_https_rule is not None
+            else None
+        )
+        projected_ingress_is_exact = endpoint_ingress == []
+        if len(endpoint_ingress) == 1 and isinstance(endpoint_ingress[0], dict):
+            rule = endpoint_ingress[0]
+            projected_ingress_is_exact = (
+                rule.get("description") == "HTTPS from relay nodes only"
+                and rule.get("from_port") == EXPECTED_HTTPS_PORT
+                and rule.get("to_port") == EXPECTED_HTTPS_PORT
+                and rule.get("protocol") == "tcp"
+                and isinstance(relay_node_sg_id, str)
+                and set(as_strings(rule.get("security_groups")))
+                == {relay_node_sg_id}
+                and all(
+                    not rule.get(field)
+                    for field in (
+                        "cidr_blocks",
+                        "ipv6_cidr_blocks",
+                        "prefix_list_ids",
+                    )
+                )
+                and rule.get("self") in (None, False)
+            )
         v.require(
-            endpoint_sg.values.get("ingress", []) == []
-            and endpoint_sg.values.get("egress", []) == [],
-            "endpoint SG must not acquire inline/default rules",
+            projected_ingress_is_exact
+            and (endpoint_sg.values.get("egress") or []) == [],
+            "endpoint SG aggregate rules must be empty or exactly the standalone relay HTTPS projection",
         )
 
     logs_key = v.one(

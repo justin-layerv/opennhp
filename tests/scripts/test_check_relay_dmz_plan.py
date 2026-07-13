@@ -3070,6 +3070,35 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
                 }
                 self.assert_violation(plan, needle)
 
+    def test_endpoint_sg_accepts_only_exact_standalone_rule_projection(self) -> None:
+        plan = clean_plan()
+        endpoint_sg = resource(plan, ".aws_security_group.endpoints")
+        endpoint_rule = resource(
+            plan, ".aws_vpc_security_group_ingress_rule.vpc_endpoints_from_relay"
+        )
+        endpoint_rule["change"]["after"]["referenced_security_group_id"] = (
+            "sg-relay"
+        )
+        endpoint_sg["change"]["after"]["ingress"] = [
+            {
+                "description": "HTTPS from relay nodes only",
+                "from_port": 443,
+                "to_port": 443,
+                "protocol": "tcp",
+                "security_groups": ["sg-relay"],
+                "cidr_blocks": [],
+                "ipv6_cidr_blocks": [],
+                "prefix_list_ids": [],
+                "self": False,
+            }
+        ]
+        self.assertEqual([], checker.validate_plan(plan))
+
+        endpoint_sg["change"]["after"]["ingress"][0]["cidr_blocks"] = [
+            "0.0.0.0/0"
+        ]
+        self.assert_violation(plan, "exactly the standalone relay HTTPS projection")
+
     def test_root_level_main_egress_replacement_is_rejected(self) -> None:
         plan = clean_plan()
         nested_root = plan["configuration"]["root_module"]
