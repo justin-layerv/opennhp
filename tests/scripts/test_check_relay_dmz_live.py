@@ -75,7 +75,7 @@ def endpoint_policy(service: str) -> dict:
                     checker.EXPECTED_ENDPOINT_ACTIONS[service]
                     - {"ecr:GetAuthorizationToken"}
                 ),
-                "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/layerv-nhp-{environment}-relay",
+                "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/layerv/nhp-relay",
             },
         ]
     elif service == "ecr.dkr":
@@ -84,7 +84,7 @@ def endpoint_policy(service: str) -> dict:
                 "Effect": "Allow",
                 "Principal": "*",
                 "Action": sorted(checker.EXPECTED_ENDPOINT_ACTIONS[service]),
-                "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/layerv-nhp-{environment}-relay",
+                "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/layerv/nhp-relay",
             }
         ]
     elif service == "ssm":
@@ -325,7 +325,9 @@ def good_snapshot() -> dict:
                 "confidence_threshold": None,
                 "block_response": None,
                 "redirection_action": "TRUST_REDIRECTION_DOMAIN",
-                "domains": sorted(checker._expected_dns_domains(region)),
+                "domains": sorted(
+                    f"{domain}." for domain in checker._expected_dns_domains(region)
+                ),
             },
             {
                 "action": "BLOCK",
@@ -334,7 +336,7 @@ def good_snapshot() -> dict:
                 "confidence_threshold": None,
                 "block_response": "NODATA",
                 "redirection_action": None,
-                "domains": ["*"],
+                "domains": ["*."],
             },
         ]
     )
@@ -497,7 +499,7 @@ def good_snapshot() -> dict:
             ],
             "query_log_configs": [
                 {
-                    "association_status": "CREATED",
+                    "association_status": "ACTIVE",
                     "status": "CREATED",
                     "destination_arn": "arn:aws:logs:us-east-2:767397897469:log-group:/layerv/nhp/sandbox/relay-dmz/resolver",
                     "name": "layerv-nhp-sandbox-relay-dmz",

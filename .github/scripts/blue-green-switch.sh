@@ -14,6 +14,8 @@
 # Environment Variables (optional):
 #   AWS_REGION    - AWS region (default: us-east-2)
 #   DRY_RUN       - Set to "true" to show what would be done without executing
+#   RECONCILE_CURRENT - Set to "true" to re-apply the current active color to
+#                       every listener instead of treating it as a no-op
 #
 # Example:
 #   ./blue-green-switch.sh sandbox green
@@ -46,6 +48,7 @@ TARGET_COLOR="$2"
 COMPONENT="${3:-server}"
 AWS_REGION="${AWS_REGION:-us-east-2}"
 DRY_RUN="${DRY_RUN:-false}"
+RECONCILE_CURRENT="${RECONCILE_CURRENT:-false}"
 
 # Validate target color
 if [[ "$TARGET_COLOR" != "blue" && "$TARGET_COLOR" != "green" ]]; then
@@ -56,6 +59,11 @@ fi
 # Validate component
 if [[ "$COMPONENT" != "server" && "$COMPONENT" != "ac" ]]; then
     log_error "Invalid component: $COMPONENT. Must be 'server' or 'ac'."
+    exit 1
+fi
+
+if [[ "$RECONCILE_CURRENT" != "true" && "$RECONCILE_CURRENT" != "false" ]]; then
+    log_error "RECONCILE_CURRENT must be 'true' or 'false'."
     exit 1
 fi
 
@@ -139,8 +147,11 @@ fi
 log_info "Current active color: $CURRENT_COLOR"
 
 if [[ "$CURRENT_COLOR" == "$TARGET_COLOR" ]]; then
-    log_warn "Traffic is already routed to $TARGET_COLOR. Nothing to do."
-    exit 0
+    if [[ "$RECONCILE_CURRENT" != "true" ]]; then
+        log_warn "Traffic is already routed to $TARGET_COLOR. Nothing to do."
+        exit 0
+    fi
+    log_warn "Reconciling every listener to the existing active color $TARGET_COLOR."
 fi
 
 # Component-specific listener type mapping

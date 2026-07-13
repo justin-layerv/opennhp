@@ -2551,10 +2551,10 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
                     for action in repository_actions
                 )
             )
-            if len(repository_resources) != 1 or not all(
-                resource.endswith(f":repository/layerv-nhp-{environment}-relay")
-                for resource in repository_resources
-            ):
+            expected_repository = (
+                f"arn:aws:ecr:{region}:{account_id}:repository/layerv/nhp-relay"
+            )
+            if repository_resources != {expected_repository}:
                 errors.append(
                     f"{service} endpoint is not scoped to the relay repository"
                 )
@@ -2997,14 +2997,20 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
         allows = [rule for rule in rules if rule.get("action") == "ALLOW"]
         if len(allows) != 1 or _exact_nonnegative_int(allows[0].get("priority")) != 200:
             errors.append("Resolver allowlist rule must be unique at priority 200")
-        elif set(allows[0].get("domains", [])) != _expected_dns_domains(str(region)):
+        elif {
+            str(domain).removesuffix(".") for domain in allows[0].get("domains", [])
+        } != _expected_dns_domains(str(region)):
             errors.append(
                 "Resolver allowlist domains differ from the exact regional contract"
             )
         blocks = [
             rule
             for rule in rules
-            if rule.get("action") == "BLOCK" and set(rule.get("domains", [])) == {"*"}
+            if rule.get("action") == "BLOCK"
+            and {
+                str(domain).removesuffix(".") for domain in rule.get("domains", [])
+            }
+            == {"*"}
         ]
         if (
             len(blocks) != 1
@@ -3016,7 +3022,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             )
     query_logs = resolver.get("query_log_configs", [])
     if len(query_logs) != 1 or any(
-        row.get("association_status") != "CREATED"
+        row.get("association_status") != "ACTIVE"
         or row.get("status") != "CREATED"
         or str(row.get("destination_arn", "")).removesuffix(":*")
         != security_log_groups.get("resolver", {}).get("arn")

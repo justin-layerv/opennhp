@@ -84,18 +84,18 @@ AWS
   chmod +x "$dir/aws"
 }
 
-# _run <component> <target_color> — runs the real script with the fake aws on
+# _run <component> <target_color> [reconcile_current] — runs the real script with the fake aws on
 # PATH. Sets RC, OUT (combined stdout+stderr), and the marker-file paths.
 RC=0; OUT=""
 _run() {
-  local component="$1" target_color="$2"
+  local component="$1" target_color="$2" reconcile_current="${3:-false}"
   local bindir; bindir=$(mktemp -d)
   make_fake_aws "$bindir"
   export FAKE_PARAMS FAKE_PUTS FAKE_MODIFY FAKE_FAIL_MODIFY_LISTENER
   export FAKE_FAIL_MODIFY_CALLS FAKE_FAIL_PUT_NAME
   : > "$FAKE_PUTS"
   : > "$FAKE_MODIFY"
-  OUT=$(PATH="$bindir:$PATH" DRY_RUN=false AWS_REGION=us-east-2 \
+  OUT=$(PATH="$bindir:$PATH" DRY_RUN=false RECONCILE_CURRENT="$reconcile_current" AWS_REGION=us-east-2 \
         bash "$SCRIPT" sandbox "$target_color" "$component" 2>&1)
   RC=$?
   rm -rf "$bindir"
@@ -355,6 +355,30 @@ if [[ "$RC" -ne 0 ]] && [[ "$modify_lines" == "6" ]] \
   report_pass "rollback failure does not prevent remaining listener repairs"
 else
   report_fail "rollback remains best effort across all listeners" "rc=$RC modify=$(cat "$FAKE_MODIFY") out=<<<$OUT>>>"
+fi
+
+# --- Case 14: a newly created listener can default to blue while the existing
+# active-color marker is green. Explicit reconciliation must not take the normal
+# current==target no-op; it re-applies green to both public and internal UDP.
+{
+  printf '/sandbox/nhp/server/active-color\tgreen\n'
+  printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
+  printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
+  printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+  printf '/sandbox/nhp/relay/asg-name\tlayerv-nhp-sandbox-relay-dmz\n'
+  printf '/sandbox/nhp/server/internal-udp-listener-arn\tarn:aws:elbv2:::listener/internal-udp\n'
+  printf '/sandbox/nhp/server/blue-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-blue\n'
+  printf '/sandbox/nhp/server/green-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-green\n'
+} > "$FAKE_PARAMS"
+_run server green true
+if [[ "$RC" -eq 0 ]] \
+   && grep -q 'listener/udp.*tg/green' "$FAKE_MODIFY" \
+   && grep -q 'listener/internal-udp.*tg/internal-green' "$FAKE_MODIFY" \
+   && grep -qE 'active-color[[:space:]]+green' "$FAKE_PUTS" \
+   && [[ "$OUT" == *"Reconciling every listener"* ]]; then
+  report_pass "explicit reconciliation re-applies the current color to every server listener"
+else
+  report_fail "current-color listener reconciliation" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
 fi
 
 echo

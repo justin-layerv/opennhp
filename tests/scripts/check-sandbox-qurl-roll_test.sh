@@ -263,6 +263,10 @@ else
     "relay DMZ plan contract gates Terraform apply"
   assert_step_order "$INFRA" deploy-sandbox-infra \
     "Terraform Apply" \
+    "Reconcile server listeners to active color after DMZ cutover" \
+    "cutover reconciles newly created listeners before structural proof"
+  assert_step_order "$INFRA" deploy-sandbox-infra \
+    "Reconcile server listeners to active color after DMZ cutover" \
     "Verify AWS CLI major for relay DMZ detector" \
     "AWS CLI major is fenced before the structural live detector"
   assert_step_order "$INFRA" deploy-sandbox-infra \

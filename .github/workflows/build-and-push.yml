@@ -2390,6 +2390,22 @@ jobs:
           echo "::notice::Applying checked saved plan ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
           terraform apply -auto-approve tfplan
 
+      - name: Reconcile server listeners to active color after DMZ cutover
+        if: inputs.relay_dmz_cutover
+        run: |
+          set -euo pipefail
+          active_color=$(aws ssm get-parameter \
+            --region "$AWS_REGION" \
+            --name "/sandbox/nhp/server/active-color" \
+            --query 'Parameter.Value' \
+            --output text)
+          if [[ "$active_color" != "blue" && "$active_color" != "green" ]]; then
+            echo "::error::Unexpected sandbox server active color: $active_color"
+            exit 1
+          fi
+          RECONCILE_CURRENT=true \
+            bash .github/scripts/blue-green-switch.sh sandbox "$active_color" server
+
       - name: Verify AWS CLI major for relay DMZ detector
         run: |
           set -euo pipefail
