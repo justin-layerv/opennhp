@@ -137,6 +137,13 @@ assert_text_order() {
 
 echo "check-sandbox-qurl-roll:"
 
+if grep -Eq 'relay_dmz_''cutover|RELAY_DMZ_''CUTOVER' "$WF"; then
+  report_fail "one-time relay DMZ cutover authorization is removed" \
+    "build-and-push.yml still contains a standing relay DMZ cutover bypass"
+else
+  report_pass "one-time relay DMZ cutover authorization is removed"
+fi
+
 SETUP=$(extract_job setup)
 if [[ -z "$SETUP" ]]; then
   report_fail "setup job exists" \
@@ -248,9 +255,6 @@ else
   assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
     "recovery preflight checks its dedicated saved-plan JSON" \
     'plan-boundary-preflight\.json'
-  assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
-    "cross-VPC cutover skips impossible same-VPC SG refresh" \
-    'RELAY_DMZ_CUTOVER.*true'
   if grep -Eq -- '--allow-disabled' <<< "$RECOVERY_STEP"; then
     report_fail "recovery preflight cannot use bootstrap tolerance" \
       "unexpected --allow-disabled in recovery preflight"
@@ -263,12 +267,8 @@ else
     "relay DMZ plan contract gates Terraform apply"
   assert_step_order "$INFRA" deploy-sandbox-infra \
     "Terraform Apply" \
-    "Reconcile server listeners to active color after DMZ cutover" \
-    "cutover reconciles newly created listeners before structural proof"
-  assert_step_order "$INFRA" deploy-sandbox-infra \
-    "Reconcile server listeners to active color after DMZ cutover" \
     "Verify AWS CLI major for relay DMZ detector" \
-    "AWS CLI major is fenced before the structural live detector"
+    "AWS CLI major is fenced immediately after the checked apply"
   assert_step_order "$INFRA" deploy-sandbox-infra \
     "Verify AWS CLI major for relay DMZ detector" \
     "Verify relay DMZ structural boundary" \
@@ -323,6 +323,15 @@ else
   assert_step_not_in "$INFRA" deploy-sandbox-infra "Terraform Apply" \
     "Terraform apply has no unchecked fresh-plan fallback" \
     'terraform apply -auto-approve[[:space:]]*$'
+  assert_step_in "$INFRA" deploy-sandbox-infra "Get Terraform Outputs" \
+    "infra outputs read Terraform state once as JSON" \
+    'terraform output -json'
+  assert_step_not_in "$INFRA" deploy-sandbox-infra "Get Terraform Outputs" \
+    "nullable etcd output cannot leak a setup-terraform diagnostic" \
+    'terraform output -raw etcd_endpoint'
+  assert_step_in "$INFRA" deploy-sandbox-infra "Get Terraform Outputs" \
+    "nullable etcd output becomes an empty integration-test endpoint" \
+    '\.etcd_endpoint\.value // empty'
 fi
 
 PLAN_JOB=$(extract_job_from "$PLAN_WF" terraform-plan)

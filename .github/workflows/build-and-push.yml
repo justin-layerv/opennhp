@@ -4,7 +4,7 @@ name: Build and Deploy NHP
 # reliably find the specific build-and-push run they dispatched via
 # find-dispatched-run.sh. This avoids timestamp matching races with
 # concurrent main pushes or other manual dispatches.
-run-name: "Build and Deploy NHP${{ inputs.relay_dmz_cutover && ' [relay-dmz-cutover]' || '' }}${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
+run-name: "Build and Deploy NHP${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
 
 on:
   push:
@@ -58,11 +58,6 @@ on:
         type: boolean
       force_build:
         description: 'Force image build even without app code changes'
-        required: false
-        default: false
-        type: boolean
-      relay_dmz_cutover:
-        description: 'Authorize the one-time sandbox relay DMZ Terraform boundary cutover'
         required: false
         default: false
         type: boolean
@@ -250,19 +245,6 @@ jobs:
         env:
           GITHUB_REF: ${{ github.ref }}
         run: bash scripts/print-dispatch-ref-error.sh
-
-      - name: Validate relay DMZ cutover dispatch
-        if: inputs.relay_dmz_cutover
-        env:
-          DEPLOY: ${{ inputs.deploy }}
-          FORCE_BUILD: ${{ inputs.force_build }}
-          SKIP_TESTS: ${{ inputs.skip_tests }}
-        run: |
-          set -euo pipefail
-          if [[ "$DEPLOY" != "true" || "$FORCE_BUILD" != "true" || "$SKIP_TESTS" == "true" ]]; then
-            echo "::error::relay_dmz_cutover requires deploy=true, force_build=true, and skip_tests=false"
-            exit 1
-          fi
 
       - name: Set metadata
         id: meta
@@ -2103,7 +2085,6 @@ jobs:
       - name: Handle ASG Attachment Migrations and Taint Recovery
         working-directory: terraform/environments/sandbox
         env:
-          RELAY_DMZ_CUTOVER: ${{ inputs.relay_dmz_cutover && 'true' || 'false' }}
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
@@ -2124,14 +2105,10 @@ jobs:
             # rm`, untaint, or refresh a relay ASG. The named final pre-apply
             # step repeats the same gate against the post-recovery artifact.
             terraform show -json tfplan > plan-boundary-preflight.json
-            relay_dmz_args=(--require-pr0-applied)
-            if [[ "$RELAY_DMZ_CUTOVER" == "true" ]]; then
-              echo "::notice::Explicit relay DMZ cutover authorized; validating the complete target boundary before apply."
-            else
-              relay_dmz_args+=(--require-dmz-boundary-noop)
-            fi
             python3 ../../../.github/scripts/check-relay-dmz-plan.py \
-              "${relay_dmz_args[@]}" plan-boundary-preflight.json
+              --require-pr0-applied \
+              --require-dmz-boundary-noop \
+              plan-boundary-preflight.json
           }
 
           plan_with_attachment_migration_guard() {
@@ -2255,21 +2232,12 @@ jobs:
           # Give the live AWS ENI probe a small retry budget for transient CLI/API
           # failures. In --needs-recovery mode the helper returns immediately once
           # it confirms attached ENIs, so this does not delay real recovery.
-          if [[ "$RELAY_DMZ_CUTOVER" == "true" ]]; then
-            # The first DMZ cutover intentionally replaces the entire relay
-            # fleet across VPCs. Refreshing the old ASG cannot attach its ENIs
-            # to the new-VPC SG and would loop forever; Terraform must instead
-            # destroy the old ASG before deleting its old SG.
-            echo "::notice::Skipping same-VPC deposed-SG refresh during the cross-VPC relay DMZ cutover."
-            RELAY_DEPOSED_STATUS=1
-          else
-            set +e
-            RELAY_DEPOSED_SG_CHECK_MAX_ITERATIONS=3 \
-            RELAY_DEPOSED_SG_CHECK_INTERVAL_SECS=5 \
-              ../../../.github/scripts/check-relay-deposed-sg-clear.sh --needs-recovery plan-show.json
-            RELAY_DEPOSED_STATUS=$?
-            set -e
-          fi
+          set +e
+          RELAY_DEPOSED_SG_CHECK_MAX_ITERATIONS=3 \
+          RELAY_DEPOSED_SG_CHECK_INTERVAL_SECS=5 \
+            ../../../.github/scripts/check-relay-deposed-sg-clear.sh --needs-recovery plan-show.json
+          RELAY_DEPOSED_STATUS=$?
+          set -e
 
           if [[ "$RELAY_DEPOSED_STATUS" -eq 0 ]]; then
             echo "::warning::Detected deposed relay node security group pending destroy; refreshing relay ASG before Terraform retries DeleteSecurityGroup"
@@ -2344,24 +2312,16 @@ jobs:
 
       - name: Verify relay DMZ plan contract before apply
         working-directory: terraform/environments/sandbox
-        env:
-          RELAY_DMZ_CUTOVER: ${{ inputs.relay_dmz_cutover && 'true' || 'false' }}
         run: |
           set -euo pipefail
           test -s tfplan
           test -s plan-show.json
-          # Push-to-main and ordinary manual deploys are not boundary-mutation
-          # paths. Only an explicit relay_dmz_cutover dispatch may apply the
-          # first transition; afterward all normal runs require every fenced
-          # address to be a no-op.
-          relay_dmz_args=(--require-pr0-applied)
-          if [[ "$RELAY_DMZ_CUTOVER" == "true" ]]; then
-            echo "::notice::Applying the explicitly authorized relay DMZ boundary cutover from this checked saved plan."
-          else
-            relay_dmz_args+=(--require-dmz-boundary-noop)
-          fi
+          # The initial relay DMZ cutover is complete. Every normal deployment
+          # must leave all fenced security-boundary resources unchanged.
           python3 ../../../.github/scripts/check-relay-dmz-plan.py \
-            "${relay_dmz_args[@]}" plan-show.json
+            --require-pr0-applied \
+            --require-dmz-boundary-noop \
+            plan-show.json
 
       # TF_VAR_frps_image_tag (when SSM has a non-bootstrap value) was
       # exported to GITHUB_ENV by the
@@ -2389,22 +2349,6 @@ jobs:
           test -s tfplan
           echo "::notice::Applying checked saved plan ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
           terraform apply -auto-approve tfplan
-
-      - name: Reconcile server listeners to active color after DMZ cutover
-        if: inputs.relay_dmz_cutover
-        run: |
-          set -euo pipefail
-          active_color=$(aws ssm get-parameter \
-            --region "$AWS_REGION" \
-            --name "/sandbox/nhp/server/active-color" \
-            --query 'Parameter.Value' \
-            --output text)
-          if [[ "$active_color" != "blue" && "$active_color" != "green" ]]; then
-            echo "::error::Unexpected sandbox server active color: $active_color"
-            exit 1
-          fi
-          RECONCILE_CURRENT=true \
-            bash .github/scripts/blue-green-switch.sh sandbox "$active_color" server
 
       - name: Verify AWS CLI major for relay DMZ detector
         run: |
@@ -2454,11 +2398,21 @@ jobs:
         id: outputs
         working-directory: terraform/environments/sandbox
         run: |
+          set -euo pipefail
+          # Read state once as JSON. `terraform output -raw` exits nonzero for
+          # a null output, and setup-terraform's wrapper writes its diagnostic
+          # to stdout; command substitution previously promoted that diagnostic
+          # into ETCD_ENDPOINTS and made integration tests dial it as a host.
+          terraform_outputs=$(terraform output -json)
+          server_asg=$(jq -er '.asg_name.value | select(type == "string" and length > 0)' <<< "$terraform_outputs")
+          ac_asg=$(jq -er '.ac_asg_name.value | select(type == "string" and length > 0)' <<< "$terraform_outputs")
+          nlb_dns=$(jq -er '.nlb_dns_name.value | select(type == "string" and length > 0)' <<< "$terraform_outputs")
+          etcd_endpoint=$(jq -r '.etcd_endpoint.value // empty' <<< "$terraform_outputs")
           {
-            echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')"
-            echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')"
-            echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')"
-            echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')"
+            echo "server_asg=$server_asg"
+            echo "ac_asg=$ac_asg"
+            echo "nlb_dns=$nlb_dns"
+            echo "etcd_endpoint=$etcd_endpoint"
           } >> "$GITHUB_OUTPUT"
 
   # =============================================================================

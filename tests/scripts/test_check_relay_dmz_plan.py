@@ -2163,7 +2163,7 @@ def counted_parent_plan() -> dict[str, Any]:
 
 
 def boundary_noop_plan() -> dict[str, Any]:
-    """Return the complete DMZ graph after the manual cutover has converged."""
+    """Return the complete DMZ graph after the automated cutover has converged."""
     plan = clean_plan()
     for change in plan["resource_changes"]:
         if not checker.is_dmz_boundary_address(str(change.get("address", ""))):
@@ -2237,22 +2237,22 @@ def run_checker_cli(
 
 
 class RelayDmzPlanCheckerTests(unittest.TestCase):
-    def test_runbook_orders_saved_plan_apply_and_proof(self) -> None:
+    def test_runbook_orders_normal_deploy_and_proof(self) -> None:
         runbook = (
             REPO_ROOT / "docs" / "runbooks" / "sandbox-relay-dmz-replacement.md"
         ).read_text()
         anchors = [
             "gh workflow run build-and-push.yml --ref main",
-            "-f force_build=true",
-            "-f relay_dmz_cutover=true",
             "## Gate 2: structural proof",
-            '.github/scripts/deploy-relay.sh sandbox true "$REVIEWED_IMAGE_TAG"',
+            "## Gate 3: relay fleet and HTTPS proof",
+            "--mode functional",
             "## Gate 4: direct SDK UDP proof",
         ]
         positions = [runbook.find(anchor) for anchor in anchors]
         self.assertNotIn(-1, positions)
         self.assertEqual(sorted(positions), positions)
-        self.assertEqual(1, runbook.count("deploy-relay.sh sandbox true"))
+        self.assertNotIn("deploy-relay.sh sandbox true", runbook)
+        self.assertNotIn("relay_dmz_" "cutover", runbook)
         self.assertIn("assigned-cell server NLB UDP 62206 exactly once", runbook)
         self.assertIn("no internet-facing relay NLB or relay UDP listener", runbook)
 

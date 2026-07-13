@@ -32,30 +32,28 @@ export RELAY_DMZ_EVIDENCE_DIR=<absolute-evidence-directory>
 mkdir -p "$RELAY_DMZ_EVIDENCE_DIR"
 ```
 
-## Gate 1: reviewed saved plan
+## Gate 1: normal CI deployment
 
-Dispatch the sandbox deployment workflow from `main` with the explicit one-time
-cutover authorization. The workflow assumes the sandbox GitHub OIDC role,
-generates a saved Terraform plan, exports its JSON, and runs the DMZ contract
-checker against that exact artifact before applying it. The plan must retain the
-compute module's public server NLB, public UDP 62206 listener/target group, and
-internal UDP 62206 listener while showing no relay NLB, relay UDP listener, or
-relay-native alarm/DNS resources.
+The initial sandbox DMZ cutover completed through CI on 2026-07-13. A merge to
+`main` now runs the normal deployment automatically. To re-run it explicitly,
+dispatch the workflow from `main`; it assumes the sandbox GitHub OIDC role,
+generates a saved Terraform plan, exports its JSON, and checks that every
+fenced DMZ boundary address is a no-op before applying that exact artifact.
 
 ```bash
 gh workflow run build-and-push.yml --ref main \
   -f environment=sandbox \
   -f deploy=true \
   -f skip_tests=false \
-  -f force_build=true \
-  -f relay_dmz_cutover=true
+  -f force_build=false
 ```
 
-The boolean is deliberately absent from push deployments and defaults to
-`false`. Normal runs continue to require every fenced DMZ address to be a no-op.
-The authorized cutover run still requires the complete target-state contract
-and `--require-pr0-applied`, then applies only the checked `tfplan` file. The
-same job runs structural convergence and a full no-op plan after apply.
+There is no standing cutover override. The plan must retain the assigned-cell
+public server NLB and its sole UDP 62206 listener/target group, the internal UDP
+62206 listener, and the HTTPS-only relay ALB while showing no relay NLB or
+public UDP 62207. Any future boundary migration must add a newly reviewed,
+temporary mechanism. The same job runs structural convergence and a full
+post-apply no-op plan.
 
 ## Gate 2: structural proof
 
@@ -82,12 +80,11 @@ Also inspect ELB listeners and server/relay SGs directly. The evidence must show
 
 ## Gate 3: relay fleet and HTTPS proof
 
-Refresh the relay to the reviewed image using the deployment helper, then run
-functional validation. Functional target health covers the HTTPS target group
-only.
+The workflow refreshes the canonical relay ASG to the reviewed image and then
+runs functional validation. Functional target health covers the HTTPS target
+group only. The detector can be repeated independently as a read-only check:
 
 ```bash
-.github/scripts/deploy-relay.sh sandbox true "$REVIEWED_IMAGE_TAG"
 python3 scripts/check-relay-dmz-live.py --environment sandbox --mode functional \
   | tee "$RELAY_DMZ_EVIDENCE_DIR/functional.json"
 ```
@@ -108,8 +105,8 @@ SG inventory, and Flow Logs to prove it is not publicly accepted.
 
 ## Gate 5: idempotency and evidence
 
-Create a new post-apply plan. It must be empty, and the plan checker must pass
-with the boundary-noop option used by the deployment workflow. Archive:
+The deployment workflow creates a post-apply plan. It must be empty, and the
+plan checker must pass with `--require-dmz-boundary-noop`. Archive:
 
 - reviewed SHA and image digest;
 - saved plan and plan JSON;

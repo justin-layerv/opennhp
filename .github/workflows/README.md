@@ -29,19 +29,16 @@ to the relay HTTP path; WAF cannot inspect direct server UDP.
 Neither live-detector mode is the warning-only general deployment validator.
 Production is unaffected because `deploy_relay=false` and has no relay fleet.
 
-The automatic push-to-main Terraform job is not authorized to perform the
-initial relay-DMZ cutover, recover a partial cutover, or mutate that security
-boundary. Its final plan checker uses `--require-dmz-boundary-noop` and fails
-before any Terraform state/taint/relay-refresh recovery and again before apply
-if the dedicated network/fleet, main-private route-table cutover,
-server return rule, assigned-cell public NHP edge, sandbox CI IAM, or durable ASG handoff
-would change.
-An operator must use the
-[sandbox relay DMZ replacement runbook](../../docs/runbooks/sandbox-relay-dmz-replacement.md)
-to review, archive, hash, and apply the exact saved plan. Rerun the failed
-workflow after that manual cutover; it proceeds only when every fenced address
-is a no-op. This intentional red-to-manual handoff prevents a merge-triggered
-job from applying a newly generated, unreviewed cutover plan.
+The initial sandbox relay-DMZ cutover is complete. Every push-to-main and manual
+Terraform deployment now uses `--require-dmz-boundary-noop` before any
+state/taint/relay-refresh recovery and again before apply. The job fails if the
+dedicated network/fleet, main-private route-table ownership, server return
+rule, assigned-cell public NHP edge, sandbox CI IAM, or durable ASG handoff
+would change. A future boundary migration must introduce a newly reviewed,
+temporary authorization path; there is no standing workflow input that can
+bypass this steady-state fence. The
+[sandbox relay DMZ runbook](../../docs/runbooks/sandbox-relay-dmz-replacement.md)
+documents normal deployment and verification.
 
 ### `terraform-plan-pr.yml` — Terraform Plan (PR)
 

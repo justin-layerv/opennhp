@@ -292,16 +292,16 @@ DURABLE_RELAY_RESOURCES = {
 }
 
 
-# The ordinary push-to-main workflow is intentionally not a relay-DMZ cutover
-# mechanism. These address families comprise the new boundary, the singleton
+# The initial relay-DMZ cutover is complete. These address families comprise the
+# steady-state boundary, the singleton
 # fleet that inhabits it, the main-VPC route-table cutover, the server return
 # hole, the sandbox-only CI IAM grants, and the two durable handoff resources.
-# A non-noop action in any family must be applied from the exact reviewed saved
-# plan in the operator runbook. This intentionally includes the shared legacy
-# context_lookups policy: even an unrelated edit to that policy must leave the
-# automatic apply path and use a reviewed saved plan because it shares the IAM
-# document that carries relay discovery. Prefix/suffix regexes deliberately
-# support the root, nested-module, and counted-parent Terraform JSON shapes.
+# A non-noop action in any family must fail ordinary deployment and require a
+# newly reviewed migration mechanism. This intentionally includes the shared
+# legacy context_lookups policy: even an unrelated edit to that policy must fail
+# the automatic apply path because it shares the IAM document that carries relay
+# discovery. Prefix/suffix regexes deliberately support the root, nested-module,
+# and counted-parent Terraform JSON shapes.
 DMZ_BOUNDARY_ADDRESS_PATTERNS = (
     re.compile(r"(?:^|\.)module\.relay_network(?:\[[^]]+\])?\."),
     re.compile(r"(?:^|\.)module\.relay(?:\[[^]]+\])?\."),
@@ -3732,7 +3732,7 @@ def main() -> int:
         action="store_true",
         help=(
             "fail if the automatic apply plan changes the relay DMZ boundary; "
-            "the exact saved-plan runbook is the only cutover path"
+            "future migrations require a newly reviewed temporary path"
         ),
     )
     args = parser.parse_args()
