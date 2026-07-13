@@ -488,6 +488,7 @@ lint-workflows:
 		exit 1; \
 	}
 	@python3 tests/scripts/test_promote_to_prod_gating.py
+	@python3 tests/scripts/test_ac_readiness_dependency.py
 	@shellcheck .github/scripts/resolve-app-image-required.sh .github/scripts/resolve-live-app-image-required.sh .github/scripts/verify-live-app-images-ready.sh tests/scripts/resolve-app-image-required_test.sh tests/scripts/resolve-live-app-image-required_test.sh tests/scripts/verify-live-app-images-ready_test.sh
 	@bash tests/scripts/resolve-app-image-required_test.sh
 	@bash tests/scripts/resolve-live-app-image-required_test.sh

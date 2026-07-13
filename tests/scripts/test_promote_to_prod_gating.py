@@ -2842,8 +2842,6 @@ if len(_LAMBDA_LOUD_FAIL_ALLOWLIST) > 1:
 # narrowing module depends_on). Mechanism and safety argument live in the
 # runbook's "Loud-fail vs deferred-to-apply" section.
 _LAMBDA_DEFERRED_MODULES = {
-    "lambda-ac-keygen": "ac",
-    "lambda-ac-secret-reconciliation": "ac",
     "lambda-compute-keygen": "compute",
     "lambda-compute-termination-cleanup": "compute",
     "lambda-playground-proxy": "developer_portal",

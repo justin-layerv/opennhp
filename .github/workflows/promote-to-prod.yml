@@ -1895,9 +1895,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      # Deferred-to-apply: module "ac" has a module-wide depends_on. #2284.
-      # `if:` still gates the toggle-off case (a deploy_ac=false plan shows
-      # full AC teardown — caught at the prod approval gate).
+      # Strict plan-time artifact: the AC module's dependency is now scoped to
+      # its launch template, so archive_file materializes during plan. This
+      # restores the loud-fail half of #2284 for AC Lambdas.
       - name: Upload AC keygen Lambda
         if: inputs.deploy_ac
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1905,10 +1905,10 @@ jobs:
           name: lambda-ac-keygen
           path: terraform/modules/ac/keygen_lambda.zip
           retention-days: 1
-          if-no-files-found: ignore
+          if-no-files-found: error
 
-      # Deferred-to-apply: same module "ac" depends_on. #2284.
-      # Additionally gated by `var.enable_secret_reconciliation`.
+      # Strict for the same narrowed AC dependency. The direct Terraform gate
+      # remains `var.enable_secret_reconciliation`.
       - name: Upload AC secret reconciliation Lambda
         if: inputs.deploy_ac
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1916,7 +1916,7 @@ jobs:
           name: lambda-ac-secret-reconciliation
           path: terraform/modules/ac/lambda/ac_secret_reconciliation.zip
           retention-days: 1
-          if-no-files-found: ignore
+          if-no-files-found: error
 
       # Deferred-to-apply: module "compute" has a module-wide depends_on. #2284.
       # Always-on, so any missing plan-time zip is the deferral case.
@@ -2257,7 +2257,6 @@ jobs:
       - name: Download AC keygen Lambda
         if: inputs.deploy_ac
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        continue-on-error: true # deferred-to-apply (#2284)
         with:
           name: lambda-ac-keygen
           path: terraform/modules/ac
@@ -2265,7 +2264,6 @@ jobs:
       - name: Download AC secret reconciliation Lambda
         if: inputs.deploy_ac
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        continue-on-error: true # deferred-to-apply (#2284)
         with:
           name: lambda-ac-secret-reconciliation
           path: terraform/modules/ac/lambda

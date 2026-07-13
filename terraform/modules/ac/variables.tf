@@ -97,6 +97,12 @@ variable "route53_record_change_iam_propagation_duration" {
   default     = "60s"
 }
 
+variable "qurl_internal_alb_readiness_token" {
+  description = "Opaque root-produced token that orders only the AC launch template after qurl-service internal-ALB certificate validation and DNS alias readiness. Empty when that path is disabled."
+  type        = string
+  default     = ""
+}
+
 variable "acme_email" {
   description = "Email for Let's Encrypt certificate registration"
   type        = string

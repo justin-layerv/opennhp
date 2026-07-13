@@ -306,7 +306,9 @@ jobs:
       # FAILED loop). actionlint can't catch a silent loosening of the
       # if-expressions, so this is the regression guard.
       - name: Test promote-to-prod gating (issue #1322)
-        run: python3 tests/scripts/test_promote_to_prod_gating.py
+        run: |
+          python3 tests/scripts/test_promote_to_prod_gating.py
+          python3 tests/scripts/test_ac_readiness_dependency.py
 
       # Regression guard for #1634: build-and-push.yml's sandbox deploy must
       # roll qurl-service onto the latest TF-registered task def after apply

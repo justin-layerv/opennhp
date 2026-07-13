@@ -1329,6 +1329,18 @@ module "ac" {
   route53_record_change_iam_propagation_triggers = local.route53_record_change_iam_propagation_triggers
   route53_record_change_iam_propagation_duration = local.iam_propagation_duration
 
+  # Keep only the AC launch-template path behind the qurl-service internal
+  # ALB's TLS/DNS readiness fence. Passing a token preserves the cross-stack
+  # ordering without a module-wide depends_on, which would defer unrelated AC
+  # data sources and turn its stable Route53 zone id into an apply-time unknown.
+  # The alias fqdn is plan-known, but its resource-attribute reference still
+  # creates Terraform's implicit graph edge; do not replace it with the equal
+  # domain string or the launch template could race alias creation.
+  qurl_internal_alb_readiness_token = local.qurl_internal_alb_enabled ? sha256(join("|", [
+    aws_acm_certificate_validation.qurl_internal[0].id,
+    aws_route53_record.qurl_internal_alias[0].fqdn,
+  ])) : ""
+
   acme_email         = var.acme_email
   vpc_id             = module.networking.vpc_id
   vpc_cidr           = var.vpc_cidr
@@ -1532,26 +1544,6 @@ module "ac" {
     : {}
   )
 
-  # Order the AC launch-template render after the internal-ALB stack is
-  # reachable. The module's qurl_router_config.api_url points at
-  # internal-api.qurl.layerv.{xyz,ai} when qurl_internal_service_domain is
-  # set; the cert-validation + alias resources below are count-gated on the
-  # same condition (local.qurl_internal_alb_enabled), so when the variable
-  # is unset both depend_on entries collapse to empty resource sets and
-  # this is a no-op. When set, AC ASG instances refresh only after TLS+DNS
-  # are live, eliminating a first-apply window where Traefik would render
-  # an api_url that NXDOMAINs.
-  #
-  # Granularity: module-wide depends_on rather than per-resource. Terraform
-  # doesn't expose per-output depends_on, and gating only the launch
-  # template would require restructuring module.ac to expose internal
-  # resources. Module-wide serializes a few unrelated AC resources behind
-  # cert validation on first apply (minutes, not hours); accepted as the
-  # cost of the simpler boundary.
-  depends_on = [
-    aws_acm_certificate_validation.qurl_internal,
-    aws_route53_record.qurl_internal_alias,
-  ]
 }
 
 # Data source for hosted zone
@@ -2145,13 +2137,15 @@ module "qurl_reverse_tunnel_server" {
   # above, so the module count only needs to key off `deploy_frps`.
   count = var.deploy_frps ? 1 : 0
 
-  # Mirror module.ac's depends_on (terraform/main.tf:953-956): the FRP
-  # launch template renders local.qurl_consumer_api_url, which can
+  # The FRP launch template renders local.qurl_consumer_api_url, which can
   # interpolate the internal-ALB hostname; on first apply the cert+DNS
   # must be live before any FRP instance reads its env. This dependency
   # became load-bearing with the FRP ASG instance_refresh added in #2181
   # (closing #1629): launch-template changes now roll the fleet, so the
   # template must not render internal-origin env before the origin exists.
+  # Unlike module.ac, this module has no Route53 zone data source or public
+  # DNS records that a module-wide dependency could defer into replacement;
+  # module.ac therefore uses its narrower launch-template readiness token.
   # No-op when qurl_internal_service_domain is null (count-gated resources
   # collapse to empty).
   depends_on = [

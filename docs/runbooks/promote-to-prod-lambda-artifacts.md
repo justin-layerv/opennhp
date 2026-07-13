@@ -4,7 +4,7 @@
 
 Every prod-deployed Lambda whose ZIP is built via `data "archive_file"` needs a paired upload (in `terraform-plan`) + download (in `terraform-apply`) in `.github/workflows/promote-to-prod.yml`. Sandbox plan/apply share a runner so the gap is silent there; prod splits them across runners and apply fails with `Error: reading ZIP file (.../<lambda>.zip): open ...: no such file or directory`.
 
-> **Operator note:** uploads split into two `if-no-files-found` classes (full rationale in [Loud-fail vs deferred-to-apply](#loud-fail-vs-deferred-to-apply)). Only the **6 strict-`error` uploads** hard-fail the **`terraform-plan` job** (the upload step after the plan command) when their zip is absent. For the toggle-gated entries below, flipping one of their toggles to `false` in `terraform/environments/prod/terraform.tfvars` requires removing the matching upload + download pair in the same patch; the always-on nhp-keypair zip is expected to materialize on every prod plan:
+> **Operator note:** uploads split into two `if-no-files-found` classes (full rationale in [Loud-fail vs deferred-to-apply](#loud-fail-vs-deferred-to-apply)). Only the **8 strict-`error` uploads** hard-fail the **`terraform-plan` job** (the upload step after the plan command) when their zip is absent. For the toggle-gated entries below, flipping one of their toggles to `false` in `terraform/environments/prod/terraform.tfvars` requires removing the matching upload + download pair in the same patch; the always-on nhp-keypair zip is expected to materialize on every prod plan:
 >
 > ```
 > centralized_cert_enabled                     (lambda-acme-cert)
@@ -12,10 +12,12 @@ Every prod-deployed Lambda whose ZIP is built via `data "archive_file"` needs a 
 > enable_stale_finding_watchdog                (lambda-stale-finding-watchdog)
 > deploy_status_page                           (lambda-status-page-aggregator)
 > deploy_qurl_link + enable_resolve_cloudfront (lambda-cloudfront-cidr-drift)
+> deploy_ac                                    (lambda-ac-keygen)
+> deploy_ac + enable_secret_reconciliation     (lambda-ac-secret-reconciliation)
 > always-on                                    (lambda-nhp-keypair-keygen)
 > ```
 >
-> The other **7 uploads are `if-no-files-found: ignore`** and do NOT hard-fail on a missing zip: the **6 deferred-to-apply** Lambdas (parent module has a module-wide `depends_on`, so terraform defers their `archive_file` to apply — `lambda-ac-keygen`, `lambda-ac-secret-reconciliation`, `lambda-compute-keygen`, `lambda-compute-termination-cleanup`, `lambda-playground-proxy`, `lambda-developer-portal-auth0-cleanup`; #2284) plus the deprecated `lambda-custom-domain-cert` escape hatch (#1383).
+> The other **5 uploads are `if-no-files-found: ignore`** and do NOT hard-fail on a missing zip: the **4 deferred-to-apply** Lambdas (parent module has a module-wide `depends_on`, so terraform defers their `archive_file` to apply — `lambda-compute-keygen`, `lambda-compute-termination-cleanup`, `lambda-playground-proxy`, `lambda-developer-portal-auth0-cleanup`; #2284) plus the deprecated `lambda-custom-domain-cert` escape hatch (#1383). Issue #3232 narrows the AC module dependency to its launch template, so `lambda-ac-keygen` and `lambda-ac-secret-reconciliation` materialize at plan and return to strict `error`; this partially resolves #2284.
 >
 > The strict-`error` loud-fail is intentional — the 2026-04-24 hot-patch (#1328) took the toggle-only shortcut and silently disabled the watchdog. Don't reach for a paired change at 3am without reading the [intentional disable](#when-you-intentionally-need-to-disable-a-lambda-in-an-emergency) section first.
 
@@ -58,13 +60,13 @@ Pin the action SHAs to whatever the existing Lambda upload/download steps in the
 
 **Short answer:** disable the toggle *and* remove (or comment out) the corresponding upload + download steps in `promote-to-prod.yml` in the same patch. The 2026-04-24 hot-patch (#1328) took the toggle-only shortcut and silently disabled the watchdog; the loud-fail at plan exists to make a repeat impossible — the trade-off is intentional: ergonomics for impossible-to-silently-disable.
 
-**Why the loud-fail fires (strict-`error` uploads only):** the 6 strict-`error` uploads use `if-no-files-found: error` (per the [Currently covered Lambdas](#currently-covered-lambdas) table). The upload step fails *at plan-time* if the zip isn't produced, which for those 6 happens whenever:
+**Why the loud-fail fires (strict-`error` uploads only):** the 8 strict-`error` uploads use `if-no-files-found: error` (per the [Currently covered Lambdas](#currently-covered-lambdas) table). The upload step fails *at plan-time* if the zip isn't produced, which for those 8 happens whenever:
 
 - A Lambda's `data "archive_file"` evaluates to `count = 0` (its conditional toggle was flipped — `var.enable_stale_finding_watchdog` + `var.enable_guardduty`, `var.enable_canary_deployment`, `var.enable_resolve_cloudfront`), or
 - A Lambda's parent module's `count` evaluates to 0 (e.g. `var.deploy_status_page` or `var.deploy_qurl_link` flipped off), or
 - The source `.py` file is missing or unreadable.
 
-The 6 [deferred-to-apply](#loud-fail-vs-deferred-to-apply) Lambdas use `if-no-files-found: ignore` instead — their `archive_file` legitimately reads at apply because their parent module carries a module-wide `depends_on`. A `count=0` on *those* no longer hard-fails at plan; it surfaces as the corresponding module or Lambda resources being destroyed in the plan, caught at the prod approval gate. A genuinely missing or renamed source file for those 6 also skips the plan-time upload hard-fail and instead fails later when the deferred `archive_file` re-reads and can't find the source; #2284 is the structural fix that restores plan-time loud-fail for them.
+The 4 [deferred-to-apply](#loud-fail-vs-deferred-to-apply) Lambdas use `if-no-files-found: ignore` instead — their `archive_file` legitimately reads at apply because their parent module carries a module-wide `depends_on`. A `count=0` on *those* no longer hard-fails at plan; it surfaces as the corresponding module or Lambda resources being destroyed in the plan, caught at the prod approval gate. A genuinely missing or renamed source file for those 4 also skips the plan-time upload hard-fail and instead fails later when the deferred `archive_file` re-reads and can't find the source; #2284 is the structural fix that restores plan-time loud-fail for them.
 
 #### Cross-toggle footguns (read first if you're chasing an unrelated incident)
 
@@ -77,13 +79,13 @@ If you're 3am-debugging a hard-fail in the `terraform-plan` job and the failing 
 
 #### The `ignore` entries
 
-`ignore` uploads come in two flavors (see [Loud-fail vs deferred-to-apply](#loud-fail-vs-deferred-to-apply)): the 6 **deferred-to-apply** Lambdas (#2284) and the deprecated `lambda-custom-domain-cert` escape hatch (#1383). **The rule is NOT "feature-gated → ignore"** — `enable_canary_deployment`, `deploy_status_page`, `deploy_qurl_link`, etc. are feature-gated and still use `error`. `custom-domain-cert` is on `ignore` because the pattern predates the loud-fail policy and we kept it as a future prod rollback / toggle-off escape hatch (`promote-to-prod.yml` only runs in prod, so the toggle's flexibility has to live in this workflow). [#1382](https://github.com/layervai/nhp/issues/1382) tracks the trade-off where `continue-on-error: true` on the matching download also masks transient artifact-API failures while the toggle is on — the same caveat now applies to the 6 deferred downloads.
+`ignore` uploads come in two flavors (see [Loud-fail vs deferred-to-apply](#loud-fail-vs-deferred-to-apply)): the 4 **deferred-to-apply** Lambdas (#2284) and the deprecated `lambda-custom-domain-cert` escape hatch (#1383). **The rule is NOT "feature-gated → ignore"** — `enable_canary_deployment`, `deploy_status_page`, `deploy_qurl_link`, etc. are feature-gated and still use `error`. `custom-domain-cert` is on `ignore` because the pattern predates the loud-fail policy and we kept it as a future prod rollback / toggle-off escape hatch (`promote-to-prod.yml` only runs in prod, so the toggle's flexibility has to live in this workflow). [#1382](https://github.com/layervai/nhp/issues/1382) tracks the trade-off where `continue-on-error: true` on the matching download also masks transient artifact-API failures while the toggle is on — the same caveat now applies to the 4 deferred downloads.
 
 > **What the loud-fail policy does NOT cover:** the structural test now fences artifact `name:` pairing AND `path:` symmetry (download `path:` matches the parent dir of upload `path:`) — closing the typo case [#1381](https://github.com/layervai/nhp/issues/1381) originally tracked. **It does NOT verify the upload `path:` matches the actual `archive_file.output_path` in terraform** — a typo on the workflow upload side (e.g. `terraform/modules/ac/lamda/foo.zip` while terraform writes to `…/lambda/foo.zip`) would pass this PR's checks symmetrically and only fail at apply time. Closing that gap requires the structural test to parse terraform; tracked under [#1380](https://github.com/layervai/nhp/issues/1380)'s terraform-tree-walker option, alongside the broader "added an `archive_file` with no upload/download anywhere" case.
 
 ### Per-step comment-density convention
 
-The workflow's upload block has intentional asymmetry: the 6 deferred-to-apply uploads carry a `# Deferred-to-apply: module "X" … #2284` annotation; the other uploads carry a short `# Module-level toggle: var.X` / `# Conditional toggle: var.Y` / `# Always-on (no toggle):` annotation; three are longer.
+The workflow's upload block has intentional asymmetry: the 4 deferred-to-apply uploads carry a `# Deferred-to-apply: module "X" … #2284` annotation; the other uploads carry a short `# Module-level toggle: var.X` / `# Conditional toggle: var.Y` / `# Always-on (no toggle):` annotation; three are longer.
 
 - **`lambda-stale-finding-watchdog`**: longer comment because the watchdog is the security control whose silent disable started this whole bug class (#1137). The comment names the AND-chain that gates it so an operator reading the workflow doesn't have to grep terraform.
 - **`lambda-cloudfront-cidr-drift`**: longer comment because the `archive_file` lives in the root terraform module (not under `terraform/modules/**`) and is easy to miss when sweeping for `archive_file` blocks during an audit.
@@ -107,19 +109,19 @@ Sandbox is unaffected — `build-and-push.yml` runs plan and apply in the same j
 
 **`ignore` (paired with a `continue-on-error: true` download) — two cases:**
 
-1. **Deferred-to-apply** (`_LAMBDA_DEFERRED_TO_APPLY` in the gating test; **#2284**). When a Lambda's parent `module "X"` block in the prod promote roots (`terraform/main.tf` or `terraform/environments/prod/main.tf`) carries a **module-wide `depends_on`**, terraform defers *every* data source in that module — including the Lambda's `archive_file` — to "read during apply" whenever any `depends_on` target has a pending change. The zip therefore does **not** exist at plan time. This is safe: `terraform apply tfplan` re-reads the deferred data source and regenerates the zip on the apply runner *before* `aws_lambda_function.filename` opens it, so the plan→apply artifact handoff isn't actually needed for these. Surfaced by prod run **26731486546** — the `lambda-ac-keygen` upload hard-failed because `module "ac"`'s module-wide `depends_on` on the qurl-internal Route53 record was dirtied by #2267. The 6 members: `lambda-ac-keygen`, `lambda-ac-secret-reconciliation`, `lambda-compute-keygen`, `lambda-compute-termination-cleanup`, `lambda-playground-proxy`, `lambda-developer-portal-auth0-cleanup`.
+1. **Deferred-to-apply** (`_LAMBDA_DEFERRED_TO_APPLY` in the gating test; **#2284**). When a Lambda's parent `module "X"` block in the prod promote roots (`terraform/main.tf` or `terraform/environments/prod/main.tf`) carries a **module-wide `depends_on`**, terraform defers *every* data source in that module — including the Lambda's `archive_file` — to "read during apply" whenever any `depends_on` target has a pending change. The zip therefore does **not** exist at plan time. This is safe: `terraform apply tfplan` re-reads the deferred data source and regenerates the zip on the apply runner *before* `aws_lambda_function.filename` opens it, so the plan→apply artifact handoff isn't actually needed for these. Surfaced by prod run **26731486546** — the `lambda-ac-keygen` upload hard-failed because `module "ac"`'s former module-wide `depends_on` on the qurl-internal Route53 record was dirtied by #2267. Issue #3232 narrows that AC dependency to the launch template and restores both AC artifacts to strict plan-time upload, partially resolving #2284. The 4 remaining members are `lambda-compute-keygen`, `lambda-compute-termination-cleanup`, `lambda-playground-proxy`, and `lambda-developer-portal-auth0-cleanup`.
 
    **Rule for another entry:** a `lambda-*` joins `_LAMBDA_DEFERRED_TO_APPLY` iff its parent `module "X"` in the prod promote roots has a module-wide `depends_on`. The proper fix — narrowing those module-wide `depends_on` to just the launch template so the archive_files read at plan again and can return to `error` — is tracked in **#2284**.
 
 2. **Deprecated escape hatch** (`_LAMBDA_LOUD_FAIL_ALLOWLIST`; **#1383**). `lambda-custom-domain-cert` only — a pre-policy toggle-off escape hatch being driven to empty. Do **not** add to it; new `ignore` entries go in the deferred set above (or stay `error`).
 
-**Cost of `ignore` for the deferred class:** these 6 lose the plan-time loud-fail that would catch a `var.deploy_*=false` / `inputs.deploy_*=true` mismatch, or a per-Lambda toggle mismatch such as `enable_secret_reconciliation=false` / `enable_termination_cleanup=false`. That mismatch still surfaces as corresponding module or Lambda resource destruction in the plan — caught at the `environment: production` approval gate (unlike the silent watchdog disable that birthed the loud-fail policy).
+**Cost of `ignore` for the deferred class:** these 4 lose the plan-time loud-fail that would catch a `var.deploy_*=false` / `inputs.deploy_*=true` mismatch, or a per-Lambda toggle mismatch such as `enable_termination_cleanup=false`. That mismatch still surfaces as corresponding module or Lambda resource destruction in the plan — caught at the `environment: production` approval gate (unlike the silent watchdog disable that birthed the loud-fail policy). The AC artifacts no longer pay this cost: their narrowed readiness dependency makes a missing plan-time zip fail immediately.
 
 ## Currently covered Lambdas
 
 The PR that closed #1326 swept the workflow for every prod-deployed `data "archive_file"` Lambda — both inside `terraform/modules/**` and at the **root** of `terraform/` itself (`cloudfront_cidr_drift` lives in `terraform/main.tf` rather than in a sub-module). As of that sweep, the workflow uploads + downloads:
 
-Listed in the same order they appear in `.github/workflows/promote-to-prod.yml`'s terraform-plan job (visual diff against the workflow stays straightforward). **6 strict-`error` uploads + 7 `ignore` (6 deferred-to-apply, #2284; 1 deprecated escape hatch, #1383) = 13 total `lambda-*` artifacts.** See [Loud-fail vs deferred-to-apply](#loud-fail-vs-deferred-to-apply) for the two classes; the `deferred` rows below carry a `continue-on-error: true` download.
+Listed in the same order they appear in `.github/workflows/promote-to-prod.yml`'s terraform-plan job (visual diff against the workflow stays straightforward). **8 strict-`error` uploads + 5 `ignore` (4 deferred-to-apply, #2284; 1 deprecated escape hatch, #1383) = 13 total `lambda-*` artifacts.** See [Loud-fail vs deferred-to-apply](#loud-fail-vs-deferred-to-apply) for the two classes; the `deferred` rows below carry a `continue-on-error: true` download.
 
 | Artifact name | Source path | Gating toggle (true in prod) | `if-no-files-found` |
 |---|---|---|---|
@@ -127,8 +129,8 @@ Listed in the same order they appear in `.github/workflows/promote-to-prod.yml`'
 | `lambda-canary-orchestrator` | `terraform/modules/canary-deployment/lambda/canary_orchestrator.zip` | `var.enable_canary_deployment` | **error** |
 | `lambda-playground-proxy` | `terraform/modules/developer-portal/lambda/playground_proxy.zip` | `var.deploy_developer_portal` | ignore (deferred, #2284) |
 | `lambda-stale-finding-watchdog` | `terraform/modules/security/lambda/stale_finding_watchdog.zip` | `var.enable_stale_finding_watchdog` (+ `enable_guardduty`, alerts) | **error** |
-| `lambda-ac-keygen` | `terraform/modules/ac/keygen_lambda.zip` | `var.deploy_ac` | ignore (deferred, #2284) |
-| `lambda-ac-secret-reconciliation` | `terraform/modules/ac/lambda/ac_secret_reconciliation.zip` | `var.enable_secret_reconciliation` (direct) + `var.deploy_ac` (transitive via `module.ac`) | ignore (deferred, #2284) |
+| `lambda-ac-keygen` | `terraform/modules/ac/keygen_lambda.zip` | `var.deploy_ac` | **error** |
+| `lambda-ac-secret-reconciliation` | `terraform/modules/ac/lambda/ac_secret_reconciliation.zip` | `var.enable_secret_reconciliation` (direct) + `var.deploy_ac` (transitive via `module.ac`) | **error** |
 | `lambda-compute-keygen` | `terraform/modules/compute/keygen_lambda.zip` | always-on | ignore (deferred, #2284) |
 | `lambda-compute-termination-cleanup` | `terraform/modules/compute/lambda/server_termination_cleanup.zip` | `var.enable_termination_cleanup` | ignore (deferred, #2284) |
 | `lambda-developer-portal-auth0-cleanup` | `terraform/modules/developer-portal/lambda/auth0_cleanup.zip` | `var.deploy_developer_portal` | ignore (deferred, #2284) |

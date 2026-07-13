@@ -1403,6 +1403,20 @@ resource "terraform_data" "ac_user_data_qurl_router_render_check" {
   }
 }
 
+# Narrow cross-stack readiness fence. The root token depends on the
+# qurl-service internal-ALB certificate validation and DNS alias. Keeping that
+# edge here, next to the sole runtime consumer, avoids making unrelated AC
+# data sources and Route53 records unknown during every internal-ALB change.
+# This resource deliberately remains present with input="" when the internal
+# ALB path is disabled. Its enabled token is unknown on a first apply, so using
+# token != "" as count would make count unknown and fail planning; the empty
+# token carries no live certificate/alias instance edge and is inert.
+# The launch template depends on this resource only for ordering: a later token
+# update intentionally does not create a new template version or roll the fleet.
+resource "terraform_data" "qurl_internal_alb_readiness" {
+  input = var.qurl_internal_alb_readiness_token
+}
+
 # Launch Template
 resource "aws_launch_template" "ac" {
   name_prefix   = "${var.name_prefix}-ac-"
@@ -1540,6 +1554,7 @@ BOOTSTRAP
   # parallel S3 PUT, and a fresh instance would fetch stale init content.
   depends_on = [
     aws_s3_object.init_script,
+    terraform_data.qurl_internal_alb_readiness,
   ]
 }
 
