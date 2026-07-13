@@ -2113,6 +2113,17 @@ variable "deploy_relay" {
   }
 }
 
+variable "relay_vpc_cidr" {
+  description = "Dedicated relay DMZ VPC CIDR. Ignored while deploy_relay=false."
+  type        = string
+  default     = "10.101.0.0/16"
+
+  validation {
+    condition     = can(cidrnetmask(var.relay_vpc_cidr)) && cidrnetmask(var.relay_vpc_cidr) == "255.255.0.0"
+    error_message = "relay_vpc_cidr must be a valid IPv4 /16 CIDR."
+  }
+}
+
 # Keep canonical-key and ordering rules in lockstep with terraform/variables.tf,
 # the sandbox wrapper, and modules/compute/variables.tf.
 variable "relay_additional_trusted_public_keys_b64" {
@@ -2132,16 +2143,6 @@ variable "relay_additional_trusted_public_keys_b64" {
     condition     = var.relay_additional_trusted_public_keys_b64 == sort(distinct(var.relay_additional_trusted_public_keys_b64))
     error_message = "relay_additional_trusted_public_keys_b64 must already be sorted and duplicate-free."
   }
-}
-
-# #2208 phase #8 / #2628: prod stays PUBLIC (false) until a dedicated prod-cutover
-# PR after the relay carries real browser traffic in prod (#6/#2680) + the resolve
-# plugin is retired (#7). Forwarded to module.nhp; flipping it requires deploy_relay
-# (precondition), so it cannot be set while the relay is dark.
-variable "take_server_private" {
-  description = "Take nhp-server off the public internet — remove the public UDP 62206 NLB and repoint the AC + qurl-service to the internal relay NLB. Requires deploy_relay=true and qurl_link_js_agent_enabled=true. Default false (prod stays public until the cutover PR)."
-  type        = bool
-  default     = false
 }
 
 variable "relay_dns_name" {

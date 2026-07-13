@@ -2198,6 +2198,61 @@ func (s *UdpServer) SendPacket(pkt *core.Packet, conn *UdpConn) (n int, err erro
 	return s.listenConn.WriteToUDP(pkt.Content, conn.ConnData.RemoteAddr)
 }
 
+// packetFromUDPDatagram copies one socket read into its owned Packet storage.
+// Standard direct NHP traffic remains hard-capped at PacketBufferSize. Only an
+// exact, clear-header NHP_RLY envelope may use the dedicated larger transport
+// buffer needed to contain a complete standard inner packet. This pre-auth
+// allocation is still bounded: recvPacketRoutine applies the per-source rate
+// limiter first, the socket reads at most 6145 bytes, the type and exact length
+// are checked before borrowing the separate relay sync.Pool, and the fixed
+// receive queue bounds concurrent ownership. The server's UDP 62206 SG admits
+// the existing main-VPC sources plus the relay-DMZ /24s; Noise authentication
+// and registered-relay-key validation, not the SG alone, authorize NHP_RLY.
+// Authenticated returns target the relay's separate private UDP 62207 socket.
+// The accepted steady-state cost is one bounded copy (at most 6 KiB) for each
+// admitted control datagram. That copy is the ownership boundary that lets the
+// single socket reader immediately reuse readBuf; placing it after the block and
+// rate-limit gates also avoids pool traffic for rejected floods. Do not restore
+// the old read-directly-into-a-pooled-packet path without preserving truncation
+// observability and independent ownership across the asynchronous receive queue.
+func packetFromUDPDatagram(device *core.Device, raw []byte) (*core.Packet, int, error) {
+	if len(raw) < core.HeaderCommonSize {
+		return nil, 0, fmt.Errorf("packet too short")
+	}
+	tmp := &core.Packet{Content: raw}
+	headerType, payloadSize := tmp.HeaderTypeAndSize()
+	if len(raw) > core.RelayPacketBufferSize {
+		return nil, headerType, fmt.Errorf("packet exceeds relay transport limit")
+	}
+	if len(raw) > core.PacketBufferSize {
+		if headerType != core.NHP_RLY {
+			return nil, headerType, fmt.Errorf("oversized direct packet type %s", core.HeaderTypeToString(headerType))
+		}
+		if len(raw) != tmp.MinimalLength()+payloadSize {
+			return nil, headerType, fmt.Errorf("relay packet total size is incorrect")
+		}
+		pkt := device.AllocateRelayPacket()
+		copy(pkt.Content, raw)
+		pkt.Content = pkt.Content[:len(raw)]
+		pkt.HeaderType = headerType
+		return pkt, headerType, nil
+	}
+
+	// Preserve the standard-packet fast path exactly as it behaved before relay
+	// envelopes existed: RecvPrecheck performs its full authenticated protocol
+	// validation after this copy. Do not mirror the oversized branch's exact
+	// clear-header length check here; doing so would silently change admission
+	// semantics for every existing <= 4,096-byte direct NHP packet.
+	pkt := device.AllocatePoolPacket()
+	if pkt == nil {
+		return nil, headerType, fmt.Errorf("packet pool exhausted")
+	}
+	copy(pkt.Content, raw)
+	pkt.Content = pkt.Content[:len(raw)]
+	pkt.HeaderType = headerType
+	return pkt, headerType, nil
+}
+
 func (s *UdpServer) recvPacketRoutine() {
 	defer s.wg.Done()
 	defer log.Debug("recvPacketRoutine stopped")
@@ -2213,6 +2268,13 @@ func (s *UdpServer) recvPacketRoutine() {
 		PreCheckThreatCacheTTL,
 		func() { s.metrics.IncrCounter(MetricPreCheckThreatEviction) },
 	)
+	// Load-bearing single-reader invariant: this buffer is reused by exactly one
+	// recvPacketRoutine goroutine and every admitted datagram is copied before the
+	// next read. The extra byte makes a datagram above the authenticated relay
+	// envelope ceiling observable instead of accepting a truncated prefix;
+	// packetFromUDPDatagram moves admitted bytes into independently owned storage.
+	readBuf := make([]byte, core.RelayPacketBufferSize+1)
+	minLen := core.RelayPacketMinimalLength
 
 	for {
 		select {
@@ -2222,13 +2284,9 @@ func (s *UdpServer) recvPacketRoutine() {
 		default:
 		}
 
-		// allocate a new packet buffer for every read
-		pkt := s.device.AllocatePoolPacket()
-
 		// udp recv, blocking until packet arrives or conn.Close()
-		n, remoteAddr, err := s.listenConn.ReadFromUDP(pkt.Buf[:])
+		n, remoteAddr, err := s.listenConn.ReadFromUDP(readBuf)
 		if err != nil {
-			s.device.ReleasePoolPacket(pkt)
 			log.Error("[Server] ReadFromUDP on %s failed: %v", s.listenAddrStr, err)
 			if n == 0 {
 				// listenConn closed
@@ -2245,18 +2303,12 @@ func (s *UdpServer) recvPacketRoutine() {
 		// add total recv bytes
 		atomic.AddUint64(&s.stats.totalRecvBytes, uint64(n))
 
-		// Snapshot MinimalLength() before ReleasePoolPacket: the release
-		// nils pkt.Content, so a post-release call panics via unsafe.Pointer
-		// deref. Fenced by TestPacketMinimalLengthPanicsAfterRelease.
-		minLen := pkt.MinimalLength()
 		if n < minLen {
-			s.device.ReleasePoolPacket(pkt)
 			log.Error("[Server] received UDP packet from %s is too short (%d bytes, min %d), discarding", addrStr, n, minLen)
 			continue
 		}
 
 		if s.isBlockedIP(ipStr) {
-			s.device.ReleasePoolPacket(pkt)
 			log.Critical("Remote address %s is being blocked at the moment, discard.", addrStr)
 			continue
 		}
@@ -2266,7 +2318,6 @@ func (s *UdpServer) recvPacketRoutine() {
 		// application-level defense-in-depth layer; iptables provides the
 		// kernel-level first line of defense.
 		if s.rateLimiter != nil && !s.rateLimiter.Allow(ipStr) {
-			s.device.ReleasePoolPacket(pkt)
 			drops := s.rateLimitDrops.Add(1)
 			if drops == 1 || drops%1000 == 0 {
 				log.Warning("[Server] rate limited UDP packet from %s (total drops: %d)", addrStr, drops)
@@ -2275,7 +2326,13 @@ func (s *UdpServer) recvPacketRoutine() {
 		}
 
 		recvTime := time.Now().UnixNano()
-		pkt.Content = pkt.Buf[:n]
+		pkt, clearType, packetErr := packetFromUDPDatagram(s.device, readBuf[:n])
+		if packetErr != nil {
+			s.recordPreCheckThreat(preCheckThreats, ipStr)
+			msgType := core.HeaderTypeToString(clearType)
+			log.Warning("Receive [%s] packet (%s -> %s), outer-size gate error: %v", msgType, addrStr, s.listenAddrStr, packetErr)
+			continue
+		}
 		//log.Trace("receive udp packet (%s -> %s): %+v", addrStr, s.listenAddrStr, pkt.Content)
 
 		typ, _, err := s.device.RecvPrecheck(pkt) // this check also records packet header type
@@ -2948,13 +3005,27 @@ func (s *UdpServer) dispatchHandler(ppd *core.PacketParserData, fn func(*core.Pa
 			return
 		}
 	}
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		if bounded {
 			defer func() { <-s.handlerSem }()
 		}
 		if err := fn(ppd); err != nil {
 			log.Error("[Server] %s handler failed: %v", core.HeaderTypeToString(ppd.HeaderType), err)
 		}
+	}()
+}
+
+// dispatchAsync tracks trusted-peer handlers without applying the public
+// handlerSem budget. dispatchReceivedMessage is itself called by a wg-tracked
+// receive loop, and Add completes synchronously before that loop can finish, so
+// Stop cannot reach a zero counter before the handler is registered.
+func (s *UdpServer) dispatchAsync(fn func()) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		fn()
 	}()
 }
 
@@ -2997,19 +3068,19 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 
 	case core.NHP_AOL:
 		// Infra (AC online) — unbounded; see dispatchReceivedMessage doc.
-		go func() {
+		s.dispatchAsync(func() {
 			if aolErr := s.HandleACOnline(ppd); aolErr != nil {
 				log.Error("[Server] HandleACOnline failed: %v", aolErr)
 			}
-		}()
+		})
 
 	case core.NHP_DOL:
 		// Infra (DB online) — unbounded.
-		go func() {
+		s.dispatchAsync(func() {
 			if dolErr := s.HandleDBOnline(ppd); dolErr != nil {
 				log.Error("[Server] HandleDBOnline failed: %v", dolErr)
 			}
-		}()
+		})
 
 	case core.NHP_OTP:
 		s.dispatchHandler(ppd, s.HandleOTPRequest)
@@ -3031,9 +3102,9 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 
 	// Server-to-server forwarding — infra, unbounded.
 	case core.NHP_FWD:
-		go s.HandleForwardRequest(ppd)
+		s.dispatchAsync(func() { s.HandleForwardRequest(ppd) })
 	case core.NHP_FRT:
-		go s.HandleForwardResult(ppd)
+		s.dispatchAsync(func() { s.HandleForwardResult(ppd) })
 
 	// NHP-Relay forwarded agent knock (#2208). Runs the same knock
 	// pipeline as a direct knock (buildKnockAck + AC-open), so it is
@@ -3052,11 +3123,11 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 	// dispatched async so a slow handler cannot head-of-line-block the
 	// receive queue.
 	case core.NHP_RVA:
-		go func() {
+		s.dispatchAsync(func() {
 			if ackErr := s.HandleRevocationAck(ppd); ackErr != nil {
 				log.Error("[Server] HandleRevocationAck failed: %v", ackErr)
 			}
-		}()
+		})
 
 	default:
 		// An unknown HeaderType reaching here means the upstream

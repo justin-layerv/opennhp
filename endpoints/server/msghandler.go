@@ -216,8 +216,9 @@ const (
 	MetricRelayOTP = "RelayOTP"
 	// MetricRelayRegister counts relayed NHP_REG inner packets that reached the
 	// register dispatch (buildRegisterAck) in HandleRelayForward. Unlike OTP,
-	// REG always produces a RAK reply (delivered via sendRelayReply), including
-	// the fail-closed RAK while the plugin is stubbed (N3 pending).
+	// REG always produces a RAK reply (wrapped in an authenticated
+	// RelayReturnMsg), including the fail-closed RAK while the plugin is stubbed
+	// (N3 pending).
 	MetricRelayRegister = "RelayRegister"
 	// MetricOTPRejectRateLimited counts OTP requests (direct or relayed)
 	// dropped by the pre-plugin OTP rate limiter (agent_otp_ratelimit.go) BEFORE
@@ -1393,7 +1394,8 @@ func (s *UdpServer) dispatchOTP(ppd *core.PacketParserData) error {
 // buildRegisterAck and delivers it through the agent's real transaction
 // (forwardToTransaction) — unchanged on the wire. The RELAYED path
 // (HandleRelayForward → NHP_REG) shares buildRegisterAck for the marshal-the-ack
-// core but diverts the reply through the relay (sendRelayReply), since a
+// core but diverts the reply through buildRelayInnerReply and an authenticated
+// RelayReturnMsg, since a
 // synthetically-decrypted inner packet has no RemoteTransaction to forward
 // through.
 func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error) {
@@ -1425,7 +1427,8 @@ func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error
 // AgentRegisterMsg → load + resolve the agent plugin → RegisterAgent → marshal
 // the ServerRegisterAckMsg — and returns the NHP_RAK body bytes. Shared by the
 // direct path (HandleRegisterRequest, which then forwardToTransactions) and the
-// relay path (HandleRelayForward, which then sendRelayReply(NHP_RAK)).
+// relay path (HandleRelayForward, which encrypts the inner RAK and wraps it in
+// an authenticated RelayReturnMsg).
 //
 // FAIL-CLOSED ACK CONTRACT: the returned error is ONLY a marshal failure (drop,
 // nothing to send). Every logical failure — parse error, no handler, or a plugin
@@ -1524,31 +1527,60 @@ func registerErrToCode(err error) *common.Error {
 	return common.ErrRegistrationDisabled
 }
 
-// HandleListRequest
-// Server will respond with success or error with NHP_LRT message
+// HandleListRequest responds with a success or fail-closed NHP_LRT message.
+// Logical list failures are protocol verdicts carried by that LRT, so successful
+// delivery returns nil on both direct and relayed paths. Only failures that
+// prevent building or delivering the LRT are returned to dispatchHandler, whose
+// sole use of the error is logging; it drives no metric or control decision.
+// dispatchReceivedMessage is the only production caller and uses that wrapper;
+// future callers must treat a delivered LRT as the result and reserve the Go
+// error for verdict-construction or transport failure.
 func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
+	lrtBytes, userID, resultErr := s.buildListResult(ppd)
+	if lrtBytes == nil {
+		return resultErr
+	}
+	ackMd := makeMsgData(ppd, core.NHP_LRT, lrtBytes)
+	if fwdErr := s.forwardToTransaction(ppd.ConnData, ppd.SenderTrxId, ackMd, "server-agent", "HandleListRequest", userID, ppd.ConnData.RemoteAddr.String()); fwdErr != nil {
+		return fwdErr
+	}
+	// A logical list failure is carried in the fail-closed LRT bytes. Once the
+	// verdict is delivered, returning resultErr would make dispatchHandler log a
+	// second handler failure even though the request completed successfully.
+	// dispatchHandler does not derive a metric or control decision from the
+	// returned error; buildListResult already logs the exact logical failure.
+	return nil
+}
+
+// buildListResult runs the shared LST plugin dispatch and marshals its LRT
+// verdict. Direct traffic forwards the bytes through its transaction;
+// HandleRelayForward encrypts the same bytes for the agent and wraps them in an
+// authenticated RelayReturnMsg. Logical failures still produce an LRT; a nil
+// byte slice means the LRT itself could not be marshaled.
+func (s *UdpServer) buildListResult(ppd *core.PacketParserData) ([]byte, string, error) {
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
 	lstMsg := &common.AgentListMsg{}
 	lrtMsg := &common.ServerListResultMsg{}
+	var resultErr error
 
 	func() {
-		err = json.Unmarshal(ppd.BodyMessage, lstMsg)
-		if err != nil {
-			log.Error("server-agent(#%d@%s)[HandleListRequest] failed to parse %s message: %v", transactionId, addrStr, core.HeaderTypeToString(ppd.HeaderType), err)
+		resultErr = json.Unmarshal(ppd.BodyMessage, lstMsg)
+		if resultErr != nil {
+			log.Error("server-agent(#%d@%s)[HandleListRequest] failed to parse %s message: %v", transactionId, addrStr, core.HeaderTypeToString(ppd.HeaderType), resultErr)
 			lrtMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
-			lrtMsg.ErrMsg = err.Error()
+			lrtMsg.ErrMsg = resultErr.Error()
 			return
 		}
 
 		handler := s.FindPluginHandler(lstMsg.AuthServiceId)
 		if handler == nil {
-			err = common.ErrAuthHandlerNotFound
+			resultErr = common.ErrAuthHandlerNotFound
 			lrtMsg.ErrCode = common.ErrAuthHandlerNotFound.ErrorCode()
-			lrtMsg.ErrMsg = err.Error()
+			lrtMsg.ErrMsg = resultErr.Error()
 			return
 		}
 
@@ -1563,9 +1595,29 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 			},
 		}
 
-		lrtMsg, err = handler.ListService(listReq, s.NewNhpServerHelper(ppd, nil))
-		if err != nil {
-			log.Error("server-agent(%s#%d@%s)[HandleListRequest] error: %v", lstMsg.UserId, transactionId, addrStr, err)
+		pluginLRT, pluginErr := handler.ListService(
+			listReq, s.NewNhpServerHelper(ppd, nil),
+		)
+		if pluginLRT != nil {
+			lrtMsg = pluginLRT
+		}
+		if pluginErr != nil {
+			resultErr = pluginErr
+			// Empty is a protocol success code. When a plugin returns (nil, err),
+			// the zero-valued lrtMsg therefore enters this branch and receives the
+			// mandatory fail-closed code instead of being marshaled as success.
+			if common.IsSuccessErrCode(lrtMsg.ErrCode) {
+				lrtMsg.ErrCode = listErrToCode(pluginErr).ErrorCode()
+				lrtMsg.ErrMsg = pluginErr.Error()
+			}
+			log.Error("server-agent(%s#%d@%s)[HandleListRequest] error: %v", lstMsg.UserId, transactionId, addrStr, pluginErr)
+			return
+		}
+		if pluginLRT == nil {
+			resultErr = errors.New("list plugin returned nil result")
+			lrtMsg.ErrCode = listErrToCode(resultErr).ErrorCode()
+			lrtMsg.ErrMsg = resultErr.Error()
+			log.Error("server-agent(%s#%d@%s)[HandleListRequest] error: %v", lstMsg.UserId, transactionId, addrStr, resultErr)
 			return
 		}
 
@@ -1575,14 +1627,20 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 	lrtBytes, marshalErr := json.Marshal(lrtMsg)
 	if marshalErr != nil {
 		log.Error("server-agent(%s#%d@%s)[HandleListRequest] failed to marshal LRT message: %v", lstMsg.UserId, transactionId, addrStr, marshalErr)
-		return marshalErr
+		return nil, lstMsg.UserId, marshalErr
 	}
-	ackMd := makeMsgData(ppd, core.NHP_LRT, lrtBytes)
+	return lrtBytes, lstMsg.UserId, resultErr
+}
 
-	if fwdErr := s.forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleListRequest", lstMsg.UserId, addrStr); fwdErr != nil {
-		return fwdErr
+// listErrToCode maps plugin errors that do not carry an NHP error code to the
+// existing fail-closed "auth handler unavailable" verdict. A plugin-provided
+// *common.Error remains authoritative and is preserved verbatim.
+func listErrToCode(err error) *common.Error {
+	var ce *common.Error
+	if errors.As(err, &ce) {
+		return ce
 	}
-	return err
+	return common.ErrAuthHandlerNotFound
 }
 
 func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {

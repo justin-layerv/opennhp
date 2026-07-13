@@ -310,12 +310,6 @@ locals {
   cf_origin_read_timeout        = 60
   qurl_resolve_endpoint_enabled = var.deploy_qurl_link && !var.qurl_link_js_agent_enabled
 
-  # #2628: the server's reachable knock endpoint — the internal relay NLB when the
-  # server is private (the public NLB is removed), else the public NLB. Shared by the
-  # in-VPC AC registration (module.ac ServerEndpoint) and the qurl-service bootstrap
-  # host (nhp_server_host) so the two cannot drift. internal_nlb_dns_name is non-null
-  # here because take_server_private requires deploy_relay (root precondition).
-  server_knock_endpoint = var.take_server_private ? module.compute.internal_nlb_dns_name : module.compute.nlb_dns_name
   # cf_keepalive_buffer_seconds is the MINIMUM slack required between the
   # server's IdleTimeout and CF's origin_keepalive_timeout. The actual
   # gap (http_idle_timeout_ms - cf_origin_keepalive_seconds*1000) is
@@ -564,6 +558,10 @@ module "ecr" {
   deploy_qurl_ecr  = var.deploy_qurl_service
   qurl_github_repo = var.qurl_github_repo
 
+  # Count-gates the dedicated relay-DMZ self-apply policy. Production remains
+  # relay-dark and receives no policy-document delta.
+  deploy_relay_network = var.deploy_relay
+
   # qurl-reverse-tunnel-server source repo (for ECR publish workflow OIDC trust)
   qurl_reverse_tunnel_server_github_repo = var.qurl_reverse_tunnel_server_github_repo
 
@@ -590,6 +588,12 @@ module "networking" {
 
   # QURL service VPC endpoints (DynamoDB gateway, SQS interface)
   deploy_vpc_endpoints = var.deploy_vpc_endpoints
+
+  # The relay adds exact return routes to the main private subnet tables. Keep
+  # prod's disabled path on the unchanged inline-NAT tables; sandbox selects a
+  # parallel table set whose routes are exclusively standalone resources.
+  enable_extensible_private_route_tables     = var.deploy_relay
+  extensible_private_route_table_ready_token = var.deploy_relay ? time_sleep.relay_dmz_iam_propagation[0].id : null
 }
 
 # Data Module - etcd, EFS, Secrets, Service Discovery
@@ -736,17 +740,20 @@ check "nhp_internal_auth_secret_populated" {
 module "compute" {
   source = "./modules/compute"
 
-  environment         = var.environment
-  cell_id             = var.cell_id
-  server_ami_id       = var.server_ami_id
-  domain_name         = var.domain_name
-  multi_tenant        = var.multi_tenant
-  min_capacity        = var.min_capacity
-  max_capacity        = var.max_capacity
-  vpc_id              = module.networking.vpc_id
-  vpc_cidr            = var.vpc_cidr
-  public_subnet_ids   = module.networking.public_subnet_ids
-  private_subnet_ids  = module.networking.private_subnet_ids
+  environment        = var.environment
+  cell_id            = var.cell_id
+  server_ami_id      = var.server_ami_id
+  domain_name        = var.domain_name
+  multi_tenant       = var.multi_tenant
+  min_capacity       = var.min_capacity
+  max_capacity       = var.max_capacity
+  vpc_id             = module.networking.vpc_id
+  vpc_cidr           = var.vpc_cidr
+  public_subnet_ids  = module.networking.public_subnet_ids
+  private_subnet_ids = module.networking.private_subnet_ids
+  additional_nhp_udp_ingress_cidrs = (
+    var.deploy_relay ? module.relay_network[0].relay_subnet_cidr_blocks : []
+  )
   server_repo_url     = module.ecr.server_repo_url
   server_repo_arn     = module.ecr.server_repo_arn
   etcd_endpoint       = module.data.etcd_endpoint
@@ -777,13 +784,6 @@ module "compute" {
   # remains in relay-identity and is never granted to the server role.
   relay_enabled                 = var.deploy_relay
   relay_trusted_public_keys_b64 = local.relay_trusted_public_keys_b64
-
-  # #2208 #8 / #2628: when take_server_private=true, the module drops the PUBLIC
-  # knock NLB (UDP 62206 + 0.0.0.0/0 ingress) and the relay's internal NLB becomes
-  # the server's only knock ingress. Default false → public surface stays (no diff).
-  # The cross-flag prerequisites (deploy_relay + qurl_link_js_agent_enabled) are
-  # hard-enforced by terraform_data.take_server_private_preconditions below.
-  public_server_surface_enabled = !var.take_server_private
 
   # Plugin configuration (plugins baked into Docker image, just need names for etcd seeding)
   server_plugins  = var.server_plugins
@@ -906,18 +906,10 @@ module "compute" {
 module "monitoring" {
   source = "./modules/monitoring"
 
-  environment = var.environment
-  cell_id     = var.cell_id
-  # #2628: when take_server_private, the public NLB is gone — point the dashboard's
-  # NLB widgets at the INTERNAL relay NLB (the meaningful knock traffic then; both
-  # suffixes are non-null because take_server_private requires deploy_relay). The
-  # public-NLB health alarms are still gated OFF via nlb_alarms_enabled (the internal
-  # NLB carries its own no-healthy-targets alarm), so this only feeds the widgets.
-  # (Pre-existing: those widgets query the TCP-flavored ActiveFlowCount; the UDP-NLB
-  # metric-name fix is tracked in #2910 — deferred to keep this PR zero-prod-diff.)
-  nlb_alarms_enabled                  = !var.take_server_private
-  nlb_arn_suffix                      = var.take_server_private ? module.compute.internal_nlb_arn_suffix : module.compute.nlb_arn_suffix
-  target_group_arn_suffix             = var.take_server_private ? module.compute.internal_udp_target_group_arn_suffix : module.compute.target_group_arn_suffix
+  environment                         = var.environment
+  cell_id                             = var.cell_id
+  nlb_arn_suffix                      = module.compute.nlb_arn_suffix
+  target_group_arn_suffix             = module.compute.target_group_arn_suffix
   https_target_group_arn_suffix       = module.compute.https_target_group_arn_suffix
   https_green_target_group_arn_suffix = module.compute.https_green_target_group_arn_suffix
   asg_name                            = module.compute.asg_name
@@ -1049,20 +1041,13 @@ module "canary_deployment" {
   component   = "server"
   tags        = merge(local.common_tags, { Service = "nhp-server" })
 
-  asg_name            = module.compute.asg_name
-  asg_arn             = module.compute.asg_arn
-  launch_template_arn = module.compute.launch_template_arn
-  ebs_kms_key_arn     = module.kms.ebs_key_arn
-  # #2628: when the server is private the public NLB target group is gone, so the
-  # canary advances on CPU + ASG-instance health (same path the NLB-less
-  # qurl-reverse-tunnel-server canary uses). nlb_intentionally_absent lets the
-  # canary module accept server + disable_nlb_health_checks (its component_invariants
-  # precondition otherwise rejects that combo); empty suffixes satisfy the
-  # suffix-consistency precondition + the runtime _check_nlb_mode_consistency.
-  disable_nlb_health_checks = var.take_server_private
-  nlb_intentionally_absent  = var.take_server_private
-  nlb_arn_suffix            = var.take_server_private ? "" : module.compute.nlb_arn_suffix
-  target_group_arn_suffix   = var.take_server_private ? "" : module.compute.target_group_arn_suffix
+  asg_name                  = module.compute.asg_name
+  asg_arn                   = module.compute.asg_arn
+  launch_template_arn       = module.compute.launch_template_arn
+  ebs_kms_key_arn           = module.kms.ebs_key_arn
+  disable_nlb_health_checks = false
+  nlb_arn_suffix            = module.compute.nlb_arn_suffix
+  target_group_arn_suffix   = module.compute.target_group_arn_suffix
   alerts_sns_topic_arn      = module.monitoring.sns_topic_arn
   logs_kms_key_arn          = module.kms.logs_key_arn
   ssm_image_tag_parameter   = module.compute.ssm_image_tag_parameter
@@ -1216,16 +1201,9 @@ module "status_page" {
   hosted_zone_id      = null
   acm_certificate_arn = var.status_page_domain != null ? aws_acm_certificate_validation.status_page[0].certificate_arn : null
 
-  # Target group ARNs for health checks. #2628: when the server is private the public
-  # UDP TGs are gone (their arns go null -> compact strips them -> []), which would blank
-  # the status page's server-health tile. Repoint at the internal relay UDP TGs so the
-  # page reflects relay fleet readiness across active + standby colors, not just the
-  # current active color (non-null because take_server_private requires deploy_relay).
-  # Public path unchanged -> zero prod diff.
-  server_nlb_tg_arns = var.take_server_private ? compact([
-    module.compute.internal_udp_target_group_arn,
-    module.compute.internal_udp_target_group_green_arn,
-    ]) : compact([
+  # Native SDK health is the cell's public UDP target groups. The relay's
+  # internal NHP_RLY target is independently monitored.
+  server_nlb_tg_arns = compact([
     module.compute.udp_target_group_blue_arn,
     module.compute.udp_target_group_green_arn,
   ])
@@ -1279,11 +1257,8 @@ module "dns" {
   name_prefix      = local.name_prefix
   tags             = local.common_tags
 
-  # Skip main record when AC is deployed (AC manages the domain for HTTPS), and
-  # always when take_server_private (#2628) — there is no public NLB to alias, so
-  # this record's alias target (nlb_dns_name) is null. deploy_ac is already true in
-  # sandbox+prod, so this OR is defensive belt-and-suspenders for any deploy_ac=false env.
-  skip_main_record = var.deploy_ac || var.take_server_private
+  # Skip the main record when AC owns the domain for HTTPS.
+  skip_main_record = var.deploy_ac
 
   depends_on = [time_sleep.route53_record_change_iam_propagation]
 }
@@ -1379,11 +1354,9 @@ module "ac" {
   ac_filter_mode  = var.ac_filter_mode
   auth_service_id = var.ac_auth_service_id
   resource_ids    = var.ac_resource_ids
-  # AC registration endpoint (config.toml ServerEndpoint → initial NHP_AOL knock).
-  # local.server_knock_endpoint is the internal relay NLB when private (see its
-  # definition); the AC-registration-via-internal-NLB smoke under preserve_client_ip
-  # is the rollout-ledger activation gate.
-  server_endpoint   = local.server_knock_endpoint
+  # AC registration remains on the cell's public NHP NLB and is independent of
+  # whether browser knocks enter through the relay ALB.
+  server_endpoint   = module.compute.nlb_dns_name
   server_secret_arn = module.compute.server_secret_arn
 
   # L3 flush-on-expiry (active session teardown).
@@ -2853,11 +2826,7 @@ module "qurl_service" {
   deploy_qurl_bootstrap_chain = var.deploy_qurl_bootstrap_chain
   enable_qurl_agent_bootstrap = var.enable_qurl_agent_bootstrap
   nhp_server_public_key_b64   = module.compute.server_public_key_b64
-  # #2628: server's reachable host for the qurl-service bootstrap chain —
-  # local.server_knock_endpoint (internal relay NLB when private). In js-agent mode the
-  # browser knock traverses qurl_browser_relay_base_url below; this stays a valid bare
-  # DNS name for the embedded server identity and the non-empty var precondition.
-  nhp_server_host = local.server_knock_endpoint
+  nhp_server_host             = module.compute.nlb_dns_name
   qurl_browser_relay_base_url = (
     var.qurl_link_js_agent_enabled && var.deploy_relay && var.relay_dns_name != ""
     ? "https://${var.relay_dns_name}"
@@ -5454,16 +5423,19 @@ module "relay" {
   account_id = data.aws_caller_identity.current.account_id
   tags       = merge(local.common_tags, { Service = "nhp-relay" })
 
-  # Networking — direct refs (intra-repo).
-  vpc_id                         = module.networking.vpc_id
-  public_subnet_ids              = module.networking.public_subnet_ids
-  private_subnet_ids             = module.networking.private_subnet_ids
-  private_subnet_cidr_blocks     = module.networking.private_subnet_cidr_blocks
+  # Networking — the public ALB and isolated relay nodes live in the dedicated
+  # DMZ VPC. Only UDP 62206 destinations remain the exact main-private CIDRs.
+  vpc_id                         = module.relay_network[0].vpc_id
+  public_subnet_ids              = module.relay_network[0].public_subnet_ids
+  relay_subnet_ids               = module.relay_network[0].relay_subnet_ids
+  nhp_server_cidr_blocks         = module.networking.private_subnet_cidr_blocks
   server_security_group_id       = module.compute.security_group_id
-  vpc_endpoint_security_group_id = module.networking.vpc_endpoint_security_group_id
+  vpc_endpoint_security_group_id = module.relay_network[0].endpoint_security_group_id
+  network_ready_token            = terraform_data.relay_network_ready[0].output
+  asg_name                       = "${local.name_prefix}-relay-dmz"
 
   # Relay image (5b-1 ECR repo) + AMI (reuse the server AMI: Docker + awscli +
-  # the systemd-resolved stub fix the relay's startup CloudMap resolve needs).
+  # the systemd-resolved stub fix used for the relay's internal-NLB lookup).
   relay_repo_url          = module.ecr.relay_repo_url
   relay_repo_arn          = module.ecr.relay_repo_arn
   server_ami_id           = var.server_ami_id
@@ -5475,22 +5447,19 @@ module "relay" {
   # Cell routing: one entry per cell. Today there is a single cell (the cell0
   # compute module). The serverId in /relay/{id} is the cell pubkey's
   # fingerprint. Append entries here as cells are added; one relay fleet fronts
-  # all cells. How each host is resolved (the internal NLB, not CloudMap) is
-  # explained on the host line below.
-  cell_servers = [{
-    name       = "${var.environment}-${var.cell_id}"
-    public_key = module.compute.server_public_key_b64
-    # Internal UDP NLB (modules/compute) instead of raw CloudMap DNS. Go resolves
-    # the relay.toml host ONCE at relay boot, so a CloudMap A-record returned a
-    # single server IP that went stale on fleet churn (#2626). The internal NLB
-    # is a stable, load-balanced, churn-resilient target and survives the server
-    # going private (#8 / #2628). This is the relay's UDP knock hop only — the
-    # in-VPC HTTP token-validation path (qurl-service / qurl-reverse-tunnel-server)
-    # still uses server.<namespace>:8888 and is untouched.
-    host = module.compute.internal_nlb_dns_name
-    port = 62206
-  }]
-
+  # all cells. The plan-visible contract resolves each host through the internal
+  # NLB, not CloudMap, as explained below.
+  cell_servers = terraform_data.relay_cell_routing[0].input
+  # The plan-visible relay_cell_routing resource above binds this module input
+  # to the exact compute public key and internal NLB hostname. Keep the routing
+  # rationale here because this is the operator-facing topology seam.
+  # Internal UDP NLB (modules/compute) instead of raw CloudMap DNS. Go resolves
+  # the relay.toml host ONCE at relay boot, so a CloudMap A-record returned a
+  # single server IP that went stale on fleet churn (#2626). The internal NLB
+  # is a stable, load-balanced, churn-resilient target. This is the relay's
+  # private UDP knock hop only — the
+  # in-VPC HTTP token-validation path (qurl-service / qurl-reverse-tunnel-server)
+  # still uses server.<namespace>:8888 and is untouched.
   # KMS
   ebs_kms_key_arn     = module.kms.ebs_key_arn
   logs_kms_key_arn    = module.kms.logs_key_arn
@@ -5520,28 +5489,7 @@ module "relay" {
   # topic modules/ac uses for its alarm_actions. module.monitoring is
   # unconditional, so passing it into the count-gated relay module is safe.
   alarm_sns_topic_arn = module.monitoring.sns_topic_arn
-}
 
-# #2208 #8 / #2628: hard prerequisites for take_server_private. Removing the public
-# knock NLB repoints the in-VPC AC + qurl-service to module.compute.internal_nlb_dns_name,
-# which is null unless the relay (hence aws_lb.server_internal) is deployed; and the
-# browser knock + resolve teardown must already be on the relay. A terraform_data
-# precondition HARD-FAILS the plan (unlike the advisory `check` below) so a misconfigured
-# cutover can never strand AC registration on a non-existent endpoint. Count-gated so it
-# costs nothing when the flag is off.
-resource "terraform_data" "take_server_private_preconditions" {
-  count = var.take_server_private ? 1 : 0
-
-  lifecycle {
-    precondition {
-      condition     = var.deploy_relay
-      error_message = "take_server_private=true requires deploy_relay=true: the AC + qurl-service repoint to module.compute.internal_nlb_dns_name, which is null unless the relay (and its internal NLB, aws_lb.server_internal) is deployed."
-    }
-    precondition {
-      condition     = var.qurl_link_js_agent_enabled
-      error_message = "take_server_private=true requires qurl_link_js_agent_enabled=true: browser knocks must already route through the relay and the public resolve endpoint must be disabled (enable_qurl_resolve_endpoint = deploy_qurl_link && !qurl_link_js_agent_enabled) before the public knock surface is removed."
-    }
-  }
 }
 
 # IAM eventual-consistency shim for the bootstrap-alb consumers of the

@@ -370,7 +370,7 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 	return ppd, nil
 }
 
-func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, message []byte) (mad *MsgAssemblerData) {
+func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, message []byte, externalPacket *Packet) (mad *MsgAssemblerData) {
 	mad = &MsgAssemblerData{}
 	mad.device = ppd.device
 	mad.connData = ppd.ConnData
@@ -382,7 +382,11 @@ func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, messag
 	mad.bodyMessage = message
 
 	// init packet buffer
-	mad.BasePacket = mad.device.AllocatePoolPacket()
+	if externalPacket != nil {
+		mad.BasePacket = externalPacket
+	} else {
+		mad.BasePacket = mad.device.AllocatePoolPacket()
+	}
 	mad.BasePacket.HeaderType = t
 
 	// create header and init device ecdh
@@ -895,11 +899,10 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 		}()
 
 		// Cap the inflated size as a decompression-bomb guard (#1131). The
-		// on-wire packet is hard-capped at PacketBufferSize, so a single packet
-		// can never reach the former 10 MiB ceiling anyway; MaxDecompressedBodySize
-		// bounds the per-packet decode an order of magnitude below that while
-		// leaving ample headroom over legitimate payloads. See its doc in
-		// constants.go for the measured sizing.
+		// Standard on-wire packets are capped at PacketBufferSize. The dedicated
+		// authenticated relay envelope may reach RelayPacketBufferSize, but the
+		// production relay sends it uncompressed; either way this guard bounds a
+		// malicious authenticated peer's inflate. See constants.go for sizing.
 		limitedReader := io.LimitReader(r, MaxDecompressedBodySize+1) // +1 to detect overflow
 		n, err := io.Copy(buf, limitedReader)
 		if err != nil {
@@ -1151,6 +1154,12 @@ func (ppd *PacketParserData) Destroy() {
 func (ppd *PacketParserData) IsAllowedAtOverload() bool {
 	switch ppd.HeaderType {
 	case NHP_KNK, DHP_KNK, NHP_RKN, NHP_EXT, NHP_AOL, NHP_ART,
+		// NHP_RLY is the authenticated relay envelope for an inner agent knock.
+		// It must reach HandleRelayForward while overloaded so the inner KNK can
+		// take the normal early-cookie path and the relay can return that opaque
+		// COK to the agent. The outer Noise handshake still authenticates the
+		// configured relay before its reported source address is trusted.
+		NHP_RLY,
 		// NHP_RVA is the AC→server revocation proof-of-delivery ack (#2793).
 		// Dropping it under overload would strand the server's pending-revoke
 		// tracker: the AC has already applied the revoke, but its ack is discarded,

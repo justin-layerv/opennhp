@@ -36,3 +36,16 @@ variable "deploy_vpc_endpoints" {
   type        = bool
   default     = false
 }
+
+variable "enable_extensible_private_route_tables" {
+  description = "Create and associate private route tables whose routes are all standalone resources. Enable when another module must add routes; the legacy inline-NAT tables remain as rollback anchors."
+  type        = bool
+  default     = false
+}
+
+variable "extensible_private_route_table_ready_token" {
+  description = "Opaque completion token for the count-gated IAM propagation wait required before replacing live private-subnet route-table associations. Required when extensible tables are enabled."
+  type        = string
+  default     = null
+  nullable    = true
+}

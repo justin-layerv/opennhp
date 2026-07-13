@@ -931,8 +931,8 @@ bootstrap_alb_waf_count_only_rule_groups = ["AWSManagedRulesAmazonIpReputationLi
 
 # ── NHP-Relay (#2208 Phase-2 #5) — sandbox dark launch ──
 # Autoscaling internet-facing relay fleet (one instance per AZ) fronting
-# relay.qurl.link.layerv.xyz, forwarding browser knocks to the (private) cell
-# servers. One-per-AZ in sandbox is deliberate (validates the multi-instance
+# relay.qurl.link.layerv.xyz, forwarding browser knocks to the cells' internal
+# server endpoints. One-per-AZ in sandbox is deliberate (validates the multi-instance
 # fleet + per the one-per-AZ directive), accepting the dark-launch cost of N
 # inert instances until #6. Ships DARK: until 5c (#2627) registers the relay
 # pubkey in the server's relay.toml AND sets DisableRelayPeerValidation=true,
@@ -944,20 +944,11 @@ bootstrap_alb_waf_count_only_rule_groups = ["AWSManagedRulesAmazonIpReputationLi
 # tracked follow-ups (both #6 blockers). `relay_existing_certificate_arn` stays
 # empty (Path 2 requires it).
 deploy_relay                = true
+relay_vpc_cidr              = "10.101.0.0/16"
 relay_dns_name              = "relay.qurl.link.layerv.xyz"
 relay_route53_zone_id       = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
 relay_provision_certificate = true
 relay_manage_dns_alias      = true
-
-# #2208 #8 / #2628: take nhp-server private — remove the public knock NLB (UDP
-# 62206 + 0.0.0.0/0 ingress); the relay reaches the cell via the internal NLB and
-# the in-VPC AC + qurl-service repoint there too. Sandbox is the soak: the public
-# resolve surface is already off here (qurl_link_js_agent_enabled=true), so this
-# brings down the last public surface. Requires deploy_relay=true +
-# qurl_link_js_agent_enabled=true (enforced in main.tf). After apply, run the
-# rollout-ledger activation checklist (esp. the AC-registration-via-internal-NLB
-# smoke). Prod stays false until a dedicated prod-cutover PR (#6/#2680, #7 first).
-take_server_private = true
 
 tags = {
   Organization = "LayerV"

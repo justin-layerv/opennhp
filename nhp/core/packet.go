@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 	"unsafe"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -165,10 +166,65 @@ func (bp *PacketBufferPool) Put(packet *PacketBuffer) {
 
 type Packet struct {
 	Buf           *PacketBuffer
+	externalBuf   []byte
+	relayBuf      *[RelayPacketBufferSize]byte
 	HeaderType    int
 	PoolAllocated bool
 	KeepAfterSend bool // only applicable for sending
 	Content       []byte
+}
+
+var relayPacketPool = sync.Pool{
+	New: func() any { return new([RelayPacketBufferSize]byte) },
+}
+
+// RelayPacketMinimalLength is the fixed Curve header size. It lets receive
+// loops reject undersized datagrams without allocating a relay-sized Packet.
+const RelayPacketMinimalLength = curve.HeaderSize
+
+// NewRelayPacket returns an explicitly caller-owned packet sized for an
+// authenticated NHP_RLY transport envelope. Synchronous MsgToPacket callers
+// retain ExternalPacket ownership after the assembler is destroyed, so this
+// constructor deliberately does not borrow from the relay pool.
+func NewRelayPacket() *Packet {
+	buf := make([]byte, RelayPacketBufferSize)
+	return &Packet{externalBuf: buf, Content: buf}
+}
+
+// AllocateRelayPacket borrows a relay-envelope packet whose ownership is
+// returned by ReleasePoolPacket / MsgAssemblerData.Destroy. Runtime relay
+// forwarding and UDP receive paths use this instead of allocating 6 KiB per
+// packet. Normal NHP packets remain in the device's 4096-byte pool. This
+// sync.Pool has no exhaustion signal; callers must supply their own admission
+// and fixed-queue bounds before borrowing from it.
+func (d *Device) AllocateRelayPacket() *Packet {
+	buf := relayPacketPool.Get().(*[RelayPacketBufferSize]byte)
+	return &Packet{externalBuf: buf[:], relayBuf: buf, Content: buf[:]}
+}
+
+// validateWritableCapacity must run before any header accessor: those accessors
+// intentionally use zero-copy unsafe views and therefore require a complete
+// header-sized backing store. ExternalPacket remains public for existing stack
+// buffer callers, so validate both its lower and upper bounds at the core seam.
+func (pkt *Packet) validateWritableCapacity() error {
+	size := len(pkt.writableBuffer())
+	if size < curve.HeaderSize || size > RelayPacketBufferSize {
+		return ErrPacketSizeExceedsBuffer
+	}
+	return nil
+}
+
+func (pkt *Packet) writableBuffer() []byte {
+	if pkt == nil {
+		return nil
+	}
+	if pkt.externalBuf != nil {
+		return pkt.externalBuf
+	}
+	if pkt.Buf != nil {
+		return pkt.Buf[:]
+	}
+	return pkt.Content[:cap(pkt.Content)]
 }
 
 type Header interface {
@@ -249,20 +305,9 @@ func (d *Device) CheckRecvHeaderType(t int) bool {
 		}
 	case NHP_RELAY:
 		switch t {
-		// NHP_OTP, NHP_RAK: agent self-registration through the HTTPS relay.
-		// The relay runs RecvPrecheck on every inner packet — both the
-		// client-POSTed request and the server's reply read off the shared
-		// socket (endpoints/relay innerCounter, called from handleRelay and
-		// recvLoop) — so this gate must admit the registration pair: NHP_OTP
-		// requests (fire-and-forget per the CSA NHP spec; the server never
-		// replies to them) and the NHP_RAK acks a server sends back for a
-		// relayed NHP_REG. NHP_REG itself was already admitted (though its
-		// RAK reply was not — this closes that asymmetry). Inert until the
-		// registration dispatch lands (agent-registration N2), and not by
-		// client abstinence: the relay will now forward a crafted OTP/REG,
-		// but the server's HandleRelayForward inner-type gate
-		// (endpoints/server/relay.go) admits only KNK/RKN/EXT and drops
-		// everything else — that server-side gate is the operative stop.
+		// DHP_KNK is intentionally absent. DHP is supported only on the native
+		// UDP/62206 path; allowing it here would also widen the unauthenticated
+		// HTTPS relay allowlist used by innerType.
 		case NHP_REG, NHP_KNK, NHP_ACK, NHP_LST, NHP_LRT, NHP_COK, NHP_RKN, NHP_OTP, NHP_RAK, NHP_EXT:
 			return true
 		}
@@ -310,9 +355,19 @@ func (d *Device) AllocatePoolPacket() *Packet {
 }
 
 func (d *Device) ReleasePoolPacket(pkt *Packet) {
+	if pkt != nil && pkt.relayBuf != nil {
+		buf := pkt.relayBuf
+		pkt.relayBuf = nil
+		pkt.externalBuf = nil
+		pkt.Content = nil
+		pkt.HeaderType = 0
+		relayPacketPool.Put(buf)
+		return
+	}
 	if pkt != nil && pkt.Buf != nil && pkt.PoolAllocated {
 		d.pool.Put(pkt.Buf)
 		pkt.Buf = nil
 		pkt.Content = nil
+		pkt.HeaderType = 0
 	}
 }

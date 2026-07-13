@@ -86,6 +86,21 @@ func TestLoadConfig_StrictRejectsUnknownKey(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_RejectsRemovedNativeIngressKeys(t *testing.T) {
+	for _, key := range []string{"native_listen_addr", "native_server"} {
+		t.Run(key, func(t *testing.T) {
+			toml := "listen_addr = \"0.0.0.0:8080\"\n" + key + " = \"removed\"\n"
+			path := filepath.Join(t.TempDir(), "relay.toml")
+			if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadConfig(path); err == nil {
+				t.Fatalf("want error for removed %s key, got nil", key)
+			}
+		})
+	}
+}
+
 // TestHandleHealthLive: GET -> 200 "ok"; any other method -> 405. The probe is
 // process-up only and needs no server/peer state, so a zero-value RelayServer
 // suffices.

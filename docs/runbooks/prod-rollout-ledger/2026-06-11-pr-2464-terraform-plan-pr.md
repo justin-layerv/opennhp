@@ -47,12 +47,6 @@ reported as skipped so unrelated sandbox state does not block prod-only changes.
       execution role can read the exact relay secret and public parameter and
       write only its own scoped CloudWatch log stream. It cannot invoke the
       multi-action identity/keygen handler or mutate relay identity state.
-      The status-only description update that defers the qualifier hotfix's
-      pre-policy read to apply is a one-time bootstrap artifact, not a
-      steady-state dependency of the plan gate. After the post-merge sandbox
-      apply and restricted-role re-plan prove the qualified policy live, remove
-      this bootstrap note, the status Lambda description, and its verbatim test
-      tripwire together.
       Sign-off must explicitly accept both this semantic-read invocation and
       its bounded log side effect. Each Terraform-touching PR plan therefore
       decrypts the full relay private key inside the scoped status Lambda long

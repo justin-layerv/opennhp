@@ -1,27 +1,25 @@
-// Package relay implements the NHP-Relay service (#2208): the internet-facing
-// front that forwards a browser JS-Agent's opaque inner NHP knock to a private
-// cell NHP-Server as an NHP_RLY packet and relays the server's encrypted ACK
-// back to the browser.
+// Package relay implements the stateless NHP relay: the internet-facing DMZ
+// hop that forwards an agent's opaque NHP packet to a cell's internal NHP-Server endpoint
+// and returns the server's opaque reply to the exact originating client.
 //
 //	Browser JS-Agent --HTTPS POST /relay/{serverId}--> NHP-Relay
-//	    --NHP_RLY{SourceAddr, InnerPacket}--> private NHP-Server --> AC
+//	    --internal NHP_RLY{SourceAddr, InnerPacket, RequestID}--> NHP-Server
 //
 // Trust / crypto model:
 //   - The inner packet is end-to-end agent<->server (the relay CANNOT read it);
-//     the relay only wraps it and reads its cleartext header counter for ACK
-//     correlation.
+//     the relay inspects only bounded cleartext header metadata for admission.
 //   - The OUTER NHP_RLY is encrypted relay<->server (Noise IK); the relay must
-//     be a registered NHP_RELAY peer on the server (relay.toml) and must send
-//     from the same UDP socket it listens on (the server replies to the
-//     packet's source address). See endpoints/server/relay.go (PR-B).
+//     be a registered NHP_RELAY peer on the server (relay.toml). The server
+//     wraps its opaque inner ACK/COK/RAK in an authenticated RelayReturnMsg;
+//     the relay validates the server key and dispatches by a random RequestID.
 //   - SourceAddr — the client IP the server opens the AC pinhole for — is the
-//     ONLY trusted source of that IP. It defaults to the real TCP peer
-//     (spoof-proof); a trusted-header mode is opt-in and only safe behind a
-//     front door (see SourceAddrMode).
+//     ONLY trusted source of that IP. HTTPS defaults to the TCP peer;
+//     trusted-header mode is opt-in and only safe
+//     behind a front door (see SourceAddrMode).
 //
-// The relay strips upstream OpenNHP's load-balance package: our cloud reaches a
-// cell server via CloudMap and the server fans out via NHP_FWD, so the relay
-// routes by serverId to one endpoint per cell. See docs/design/NHP_RELAY_TOPOLOGY.md.
+// The relay strips upstream OpenNHP's load-balance package: each serverId maps
+// to the stable internal NLB endpoint for one cell. See
+// docs/design/NHP_RELAY_TOPOLOGY.md.
 package relay
 
 import (
@@ -51,10 +49,9 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/utils"
 )
 
-// MetricRelayShed counts backpressure sheds: each POST /relay/{serverId} the
-// relay rejects with 503 because the target cell's in-flight cap is reached
-// (see maxInFlightPerServer). A shed is a real incident signal — a cell is
-// stuck/slow or the relay is under flood — so this is the graphable/alertable
+// MetricRelayShed counts HTTPS backpressure sheds. A shed is a real incident
+// signal — a cell is stuck/slow
+// or the relay is under flood — so this is the graphable/alertable
 // counterpart to logShed's throttled Warning, alarmed in
 // terraform/modules/relay/monitoring.tf (#2649). Published into the shared
 // LayerV/NHP namespace via the same endpoints/metrics publisher nhp-server uses
@@ -62,18 +59,14 @@ import (
 // of the fleet rather than a parallel convention.
 const MetricRelayShed = "RelayShed"
 
-// MetricRelayOTPForward counts inner NHP_OTP requests the relay forwarded to a
-// cell server on the fire-and-forget path (agent-registration N2): forwarded
-// WITHOUT registering a reply-waiter and answered HTTP 202 Accepted immediately
-// (per the CSA NHP spec, the server never replies to an OTP). It is the relay's
-// only visibility that a relayed registration OTP passed through — a round-trip
-// forward is implicitly observable via the shed/pending machinery, but an OTP
-// parks nothing, so without this counter it would be invisible. Published into
-// the same LayerV/NHP namespace via the shared endpoints/metrics publisher, at
-// the relay's base [Environment] dims (no per-cell breakdown — an OTP-forward is
-// not an incident signal the way a shed is; it is a throughput counter). Inert
-// until a client actually POSTs an OTP through the relay (N3 client + flag).
+// MetricRelayOTPForward counts successfully forwarded fire-and-forget HTTPS
+// OTP requests.
 const MetricRelayOTPForward = "RelayOTPForward"
+
+// MetricRelayReturnServerMismatch counts authenticated returns whose random
+// request ID is active but bound to a different configured server. Delivery is
+// still rejected; the counter makes version drift or a misbehaving cell visible.
+const MetricRelayReturnServerMismatch = "RelayReturnServerMismatch"
 
 // dimNameCell is the CloudWatch dimension naming the cell a shed was routed to.
 // Its value is the relay's configured cell_servers[].Name; a per-cell relay shed
@@ -85,11 +78,16 @@ var dimNameCell = aws.String("Cell")
 
 const (
 	// relayResponseTimeout bounds how long an HTTP request waits for the
-	// server's ACK before returning 504.
+	// server's authenticated return before returning 504.
 	relayResponseTimeout = 5 * time.Second
 
 	// encryptTimeout bounds the device encryption hand-off for an NHP_RLY.
 	encryptTimeout = 2 * time.Second
+
+	// requestIDCollisionAttempts keeps a broken/random-source failure bounded.
+	// One retry is already overwhelming defense for a 128-bit ID; four draws
+	// preserve that margin without allowing an accidental infinite loop.
+	requestIDCollisionAttempts = 4
 
 	// placeholderSourcePort is stamped into SourceAddr when only the client IP
 	// is known (trusted-header mode). The AC firewall rule keys on (src IP, dst
@@ -98,8 +96,8 @@ const (
 	// supply one.
 	placeholderSourcePort = 1
 
-	// maxInFlightPerServer bounds the concurrent POST /relay/{serverId} requests
-	// the relay will hold open for one cell server (#2553). Each in-flight request
+	// maxInFlightPerServer bounds concurrent HTTPS requests held for
+	// one cell server (#2553). Each in-flight request
 	// parks a goroutine and a `pending` map entry for up to relayResponseTimeout
 	// (5s); without a cap, a slow or unreachable cell under re-knock volume grows
 	// both UNBOUNDED — and a stuck cell is exactly when that bites (an
@@ -135,24 +133,18 @@ const (
 	// under a flood or a stuck cell, so a log per shed request would itself flood
 	// CloudWatch (one Warning per inbound request). Instead the relay logs at most
 	// once per window PER cell, carrying the count of sheds since the last log, so a
-	// flood produces a steady trickle rather than a torrent. A graphable shed
-	// counter + alarm is the better long-term signal, but the relay has no metrics
-	// infrastructure yet — tracked in #2649.
+	// flood produces a steady trickle rather than a torrent. RelayShed is the
+	// graphable per-event signal; this log is deliberately only diagnostic detail.
 	shedLogWindow = 10 * time.Second
 )
 
-// pendingKey correlates a server ACK to a waiting HTTP handler. A per-request
-// monotonic seq makes every registration unique so two concurrent requests that
-// share a counter (a browser retrying the same client+counter is the realistic
-// case) cannot overwrite each other in the map, and each handler deletes only
-// its own entry. clientAddr is retained for debugging. Dispatch is by counter
-// alone (the opaque ACK carries no client identity), so every waiter on a
-// counter receives the bytes and only the intended client can decrypt them — a
-// collision costs the others a spurious re-knock, never a cross-client leak.
-type pendingKey struct {
-	counter    uint64
-	clientAddr string
-	seq        uint64
+// relayPendingEntry binds an HTTPS request ID to the one configured cell that
+// received it. Request IDs are unguessable, but the authenticated sender check
+// is still required: a configured cell must not be able to satisfy another
+// cell's pending browser request if an ID is disclosed or a cell is compromised.
+type relayPendingEntry struct {
+	serverID string
+	reply    chan []byte
 }
 
 // serverRuntime is one cell server the relay routes to.
@@ -240,14 +232,15 @@ func buildRelayMetricDimensions() []types.Dimension {
 	}
 }
 
-// recordShed increments the RelayShed counter on each backpressure 503 (#2649).
+// recordShed increments the RelayShed counter on each HTTPS backpressure shed
+// (#2649).
 // It DUAL-PUBLISHES, exactly as terraform/CLAUDE.md prescribes for Go-side
 // alarms: a base counter at the publisher's [Environment] dims (the clean stream
 // the relay_shedding alarm matches on) PLUS a per-cell breakdown carrying the
 // target Cell (for dashboards / attribution). nil-safe via the publisher's nil
 // receiver, so it is unconditional on the shed hot path.
 //
-// Counted per shed (every 503), independently of logShed's throttled Warning:
+// Counted per shed, independently of logShed's throttled Warning:
 // the log is rate-limited to once per window to avoid flooding CloudWatch Logs,
 // but the metric is a cheap in-memory atomic add batched by the publisher's
 // flush loop, so it carries the exact shed rate the alarm needs.
@@ -262,7 +255,7 @@ type RelayServer struct {
 	config     *Config
 	device     *core.Device
 	httpServer *http.Server
-	udpConn    *net.UDPConn              // shared send+recv socket
+	udpConn    *net.UDPConn              // private NHP_RLY send + authenticated return socket
 	servers    map[string]*serverRuntime // by pubkey fingerprint
 	cors       corsAllowlist             // browser CORS allowlist (#2631)
 
@@ -273,16 +266,18 @@ type RelayServer struct {
 	// no-ops, so recordShed never needs a guard. See recordShed.
 	metrics *metrics.Publisher
 
-	responseTimeout time.Duration // how long a handler waits for the server ACK
+	responseTimeout time.Duration // how long a handler waits for the server return
 
-	pendingMu sync.Mutex
-	pending   map[pendingKey]chan []byte
-	seq       atomic.Uint64 // per-request registration id
+	pendingMu        sync.Mutex
+	pending          map[string]relayPendingEntry // relay request ID -> expected cell and exact HTTP waiter
+	requestMu        sync.Mutex
+	activeRequestIDs map[string]struct{}
 
-	wg        sync.WaitGroup
-	stopCh    chan struct{}
-	running   atomic.Bool
-	closeOnce sync.Once // guards udpConn.Close (Stop may run with/without a prior Start)
+	wg             sync.WaitGroup
+	handlerStartMu sync.Mutex
+	stopCh         chan struct{}
+	running        atomic.Bool
+	closeOnce      sync.Once // guards udpConn.Close (Stop may run with/without a prior Start)
 }
 
 // New builds a RelayServer from cfg. It decodes the relay key, creates the
@@ -348,7 +343,10 @@ func New(cfg *Config) (*RelayServer, error) {
 		}
 	}
 
-	device := core.NewDevice(core.NHP_RELAY, prk, nil)
+	// Server return envelopes are Noise-authenticated below against the configured
+	// server pubkeys. Disable the core address-pinned peer lookup because the
+	// internal NLB preserves a dynamic server-instance source address.
+	device := core.NewDevice(core.NHP_RELAY, prk, &core.DeviceOptions{DisableServerPeerValidation: true})
 	if device == nil {
 		return nil, errors.New("relay: failed to create NHP device")
 	}
@@ -364,6 +362,12 @@ func New(cfg *Config) (*RelayServer, error) {
 			return nil, fmt.Errorf("relay: server %q unresolvable %s:%d: %w", sc.Name, sc.Host, sc.Port, err)
 		}
 		id := utils.PubKeyFingerprint(pub)
+		if existing := servers[id]; existing != nil {
+			return nil, fmt.Errorf(
+				"relay: server %q duplicates public key fingerprint %s already used by %q",
+				sc.Name, id, existing.name,
+			)
+		}
 		servers[id] = &serverRuntime{
 			id:       id,
 			name:     sc.Name,
@@ -385,14 +389,15 @@ func New(cfg *Config) (*RelayServer, error) {
 	}
 
 	rs := &RelayServer{
-		config:          cfg,
-		device:          device,
-		udpConn:         udpConn,
-		servers:         servers,
-		cors:            newCORSAllowlist(cfg.CORSAllowedOrigins),
-		pending:         make(map[pendingKey]chan []byte),
-		responseTimeout: relayResponseTimeout,
-		stopCh:          make(chan struct{}),
+		config:           cfg,
+		device:           device,
+		udpConn:          udpConn,
+		servers:          servers,
+		cors:             newCORSAllowlist(cfg.CORSAllowedOrigins),
+		pending:          make(map[string]relayPendingEntry),
+		activeRequestIDs: make(map[string]struct{}),
+		responseTimeout:  relayResponseTimeout,
+		stopCh:           make(chan struct{}),
 	}
 
 	// Boot the CloudWatch metrics publisher (#2649) — the relay's first metrics
@@ -411,12 +416,6 @@ func New(cfg *Config) (*RelayServer, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/relay/", rs.handleRelay)
-	// Liveness probe for the container HEALTHCHECK and the deploy's LB target
-	// group (the relay path itself is POST-only, so it can't double as a GET
-	// health check). Path matches nhp-server's /health/live so the fleet has one
-	// health convention (one LB target-group + dashboard pattern). Cheap and
-	// unauthenticated — it reveals only that the process is up, never any
-	// routing/peer state.
 	mux.HandleFunc("/health/live", rs.handleHealthLive)
 	rs.httpServer = &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -424,7 +423,7 @@ func New(cfg *Config) (*RelayServer, error) {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second, // the POST body is one small NHP packet
 		// WriteTimeout must exceed responseTimeout — it spans the handler's wait
-		// for the server ACK plus the response write, measured from request read.
+		// for the server return plus the response write, measured from request read.
 		WriteTimeout: relayResponseTimeout + 10*time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
@@ -434,6 +433,38 @@ func New(cfg *Config) (*RelayServer, error) {
 		rs.httpServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
 	return rs, nil
+}
+
+func (rs *RelayServer) reserveRequestID() (string, error) {
+	for range requestIDCollisionAttempts {
+		id, err := common.NewRelayRequestID()
+		if err != nil {
+			return "", err
+		}
+		rs.requestMu.Lock()
+		_, exists := rs.activeRequestIDs[id]
+		if !exists {
+			rs.activeRequestIDs[id] = struct{}{}
+		}
+		rs.requestMu.Unlock()
+		if !exists {
+			return id, nil
+		}
+	}
+	return "", errors.New("relay: repeated random request ID collision")
+}
+
+func (rs *RelayServer) releaseRequestID(id string) {
+	// Release makes this value eligible for a future reservation. A late return
+	// plus a fresh 128-bit RNG collision for the same configured server could
+	// therefore reach the new waiter after this point. The relay treats the
+	// inner packet as opaque agent ciphertext, so that collision can at worst
+	// cause a spurious protocol failure; it cannot expose cross-client plaintext.
+	// Keeping server-fingerprint binding in dispatch is load-bearing
+	// for that property.
+	rs.requestMu.Lock()
+	delete(rs.activeRequestIDs, id)
+	rs.requestMu.Unlock()
 }
 
 // startBackground launches the NHP device and the UDP receive loop (everything
@@ -470,7 +501,7 @@ func (rs *RelayServer) Stop(ctx context.Context) error {
 	if !rs.running.CompareAndSwap(true, false) {
 		// Never started (or already stopped) — still release the socket New
 		// opened, so a New()-then-Stop() bring-up error path doesn't leak it.
-		rs.closeOnce.Do(func() { _ = rs.udpConn.Close() })
+		rs.closeSockets()
 		// New always boots the publisher, so flush it on the never-started path
 		// too (idempotent; nil-safe). Otherwise a New()-then-Stop() bring-up
 		// failure would leak the publisher's flush goroutine.
@@ -483,12 +514,24 @@ func (rs *RelayServer) Stop(ctx context.Context) error {
 	// would only become live after Shutdown returns.
 	close(rs.stopCh)
 	err := rs.httpServer.Shutdown(ctx)
-	rs.closeOnce.Do(func() { _ = rs.udpConn.Close() }) // unblocks recvLoop's ReadFromUDP
+	rs.closeSockets() // unblocks the private UDP receive loop
+	// A handler takes handlerStartMu while checking running and registering its
+	// wg ownership. Stop flipped running false above; this barrier guarantees
+	// every handler that observed the old true state completed Add before Wait,
+	// even when HTTP Shutdown returned early on a context deadline.
+	rs.handlerStartMu.Lock()
+	rs.handlerStartMu.Unlock()
 	rs.wg.Wait()
 	rs.device.Stop()
 	// Flush any sheds accumulated since the last 60s flush before exit (nil-safe).
 	rs.metrics.Stop()
 	return err
+}
+
+func (rs *RelayServer) closeSockets() {
+	rs.closeOnce.Do(func() {
+		_ = rs.udpConn.Close()
+	})
 }
 
 // handleHealthLive is the liveness probe (GET /health/live -> 200 "ok").
@@ -518,6 +561,16 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	if origin := r.Header.Get("Origin"); rs.cors.allowed(origin) {
 		rs.cors.setHeaders(w, origin)
 	}
+	rs.handlerStartMu.Lock()
+	if !rs.running.Load() {
+		rs.handlerStartMu.Unlock()
+		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	rs.wg.Add(1)
+	rs.handlerStartMu.Unlock()
+	defer rs.wg.Done()
+
 	// Answer the preflight BEFORE the serverId lookup — a preflight asks about
 	// method/headers, not resource existence, so an unknown serverId must not 404 it.
 	if r.Method == http.MethodOptions {
@@ -569,68 +622,60 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	counter, innerType, err := rs.innerCounterAndType(inner)
+	innerType, err := rs.innerType(inner)
 	if err != nil {
 		log.Warning("relay: rejecting malformed inner packet from %s: %v", r.RemoteAddr, err)
 		http.Error(w, "malformed packet", http.StatusBadRequest)
 		return
 	}
+	// HTTPS carries only NHP agent requests. DHP_KNK and server reply types must
+	// be rejected here instead of consuming a waiter and
+	// a relay/server round trip before the server drops them.
+	if !httpsAgentTypeAllowed(innerType) {
+		log.Warning("relay: rejecting unsupported HTTPS inner type %s from %s", core.HeaderTypeToString(innerType), r.RemoteAddr)
+		http.Error(w, "unsupported packet type", http.StatusBadRequest)
+		return
+	}
 
 	sourceAddr := rs.deriveSourceAddr(r)
-	clientKey := sourceAddr.String()
-
-	// FIRE-AND-FORGET branch for an inner NHP_OTP. Per the CSA NHP spec an OTP
-	// request is fire-and-forget — the server NEVER replies to it (it triggers a
-	// one-time-credential side effect and returns nothing). So the relay must NOT
-	// register a pending reply-waiter for it: with no reply ever arriving, the
-	// waiter would sit until responseTimeout and the handler would return 504,
-	// wrongly signaling failure for a request that in fact succeeded. Instead we
-	// forward the packet on the SAME send path and return HTTP 202 Accepted the
-	// instant the forward is on the wire.
-	//
-	// In-flight accounting: this path does NOT register a waiter and does NOT
-	// park on responseTimeout, so the in-flight slot acquired above is released
-	// (by the deferred `<-srv.inFlight`) as soon as this returns — i.e. within a
-	// forward's ~encryptTimeout worst case, never held for the ~5s reply window a
-	// round-trip holds it. The slot is still ACQUIRED (OTP counts against the cap
-	// while it is genuinely in flight, so an OTP flood is still shed at the cap),
-	// it is simply released promptly rather than parked. Keeping the acquire (not
-	// bypassing it) means the backpressure structure is uniform across every
-	// forwarded type; the "no long-lived parked slot" goal is met by returning
-	// immediately, not by skipping the semaphore.
 	if innerType == core.NHP_OTP {
-		if err := rs.forward(srv, sourceAddr, inner); err != nil {
+		// OTP is fire-and-forget, so this ID is intentionally unreserved: there
+		// is no response waiter or return that could collide with an active ID.
+		requestID, err := common.NewRelayRequestID()
+		if err != nil {
+			http.Error(w, "relay unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if err := rs.forward(srv, sourceAddr, inner, requestID); err != nil {
 			log.Error("relay: OTP forward to %s failed: %v", srv.name, err)
 			http.Error(w, "forward failed", http.StatusBadGateway)
 			return
 		}
-		// Count the forward only after it succeeds, so MetricRelayOTPForward
-		// means "OTP delivered to a cell" (failed forwards return 502 above and
-		// are not counted here).
 		rs.metrics.IncrCounter(MetricRelayOTPForward)
-		// 202 Accepted: the relay has forwarded the OTP; there is no server reply
-		// to relay back (fire-and-forget). The browser treats 202 as "OTP request
-		// accepted; watch for the delivered credential out-of-band".
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
+	requestID, err := rs.reserveRequestID()
+	if err != nil {
+		log.Error("relay: reserve request ID: %v", err)
+		http.Error(w, "relay unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer rs.releaseRequestID(requestID)
 
-	// Round-trip types (KNK/RKN/EXT/REG): register the reply waiter BEFORE sending
-	// so a fast server reply can't race us. The per-request seq keeps two
-	// same-(counter,client) requests from overwriting each other and ensures each
-	// deletes only its own entry.
+	// Register the exact request-ID waiter BEFORE sending so a fast return cannot
+	// race us. Agent counters are deliberately not used for correlation.
 	respCh := make(chan []byte, 1)
-	key := pendingKey{counter: counter, clientAddr: clientKey, seq: rs.seq.Add(1)}
 	rs.pendingMu.Lock()
-	rs.pending[key] = respCh
+	rs.pending[requestID] = relayPendingEntry{serverID: srv.id, reply: respCh}
 	rs.pendingMu.Unlock()
 	defer func() {
 		rs.pendingMu.Lock()
-		delete(rs.pending, key)
+		delete(rs.pending, requestID)
 		rs.pendingMu.Unlock()
 	}()
 
-	if err := rs.forward(srv, sourceAddr, inner); err != nil {
+	if err := rs.forward(srv, sourceAddr, inner, requestID); err != nil {
 		log.Error("relay: forward to %s failed: %v", srv.name, err)
 		http.Error(w, "forward failed", http.StatusBadGateway)
 		return
@@ -649,11 +694,12 @@ func (rs *RelayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 }
 
 // forward wraps the inner packet in an NHP_RLY and sends it to the cell server
-// from the shared UDP socket (so the server's ACK returns to this socket).
-func (rs *RelayServer) forward(srv *serverRuntime, sourceAddr *net.UDPAddr, inner []byte) error {
+// from the shared UDP socket (so the authenticated return reaches this socket).
+func (rs *RelayServer) forward(srv *serverRuntime, sourceAddr *net.UDPAddr, inner []byte, requestID string) error {
 	rlyMsg := &common.RelayForwardMsg{
 		SourceAddr:  &common.NetAddress{Ip: sourceAddr.IP.String(), Port: sourceAddr.Port},
 		InnerPacket: base64.StdEncoding.EncodeToString(inner),
+		RequestID:   requestID,
 	}
 	msgBytes, err := json.Marshal(rlyMsg)
 	if err != nil {
@@ -663,44 +709,82 @@ func (rs *RelayServer) forward(srv *serverRuntime, sourceAddr *net.UDPAddr, inne
 	encCh := make(chan *core.MsgAssemblerData, 1)
 	md := &core.MsgData{
 		HeaderType:     core.NHP_RLY,
+		Compress:       false,
 		Message:        msgBytes,
 		PeerPk:         srv.pubKey,
 		RemoteAddr:     srv.addr,
+		ExternalPacket: rs.device.AllocateRelayPacket(),
 		EncryptedPktCh: encCh,
 	}
 	rs.device.SendMsgToPacket(md)
 
 	select {
 	case mad := <-encCh:
-		if mad.Error != nil {
-			return fmt.Errorf("encrypt NHP_RLY: %w", mad.Error)
+		packet, err := core.ConsumeEncryptedPacket(mad)
+		if err != nil {
+			return fmt.Errorf("encrypt NHP_RLY: %w", err)
 		}
-		packet := append([]byte(nil), mad.BasePacket.Content...)
-		mad.Destroy()
 		if _, err := rs.udpConn.WriteToUDP(packet, srv.addr); err != nil {
 			return fmt.Errorf("write NHP_RLY: %w", err)
 		}
 		return nil
 	case <-time.After(encryptTimeout):
+		// SendMsgToPacket is asynchronous. If its worker completes after our
+		// timeout, the buffered channel owns a pooled packet until it is drained.
+		// Reap one late result so normal late completions return it to the pool.
+		// We cannot release the packet before the worker delivers without a
+		// use-after-release race. If a worker never delivers, it retains one 6 KiB
+		// buffer; surrounding per-cell admission and the fixed device queue bound
+		// cap that ownership instead of letting it grow per public datagram.
+		rs.reapLateEncryptedPacket(encCh)
 		return errors.New("timeout encrypting NHP_RLY")
 	}
 }
 
-// recvLoop reads server ACKs off the shared socket and dispatches them to
-// waiting handlers by inner counter.
+// reapLateEncryptedPacket tracks the bounded late-result drain in the relay's
+// shutdown barrier. handleRelay registers ownership behind handlerStartMu, so
+// Add always happens while the counter is non-zero and before Stop reaches
+// wg.Wait.
+func (rs *RelayServer) reapLateEncryptedPacket(encCh <-chan *core.MsgAssemblerData) {
+	rs.wg.Add(1)
+	go func() {
+		defer rs.wg.Done()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Error("relay: recovered from panic draining late encryption result: %v", recovered)
+			}
+		}()
+		select {
+		case mad := <-encCh:
+			if mad != nil {
+				mad.Destroy()
+			}
+		case <-time.After(encryptTimeout):
+		}
+	}()
+}
+
+// recvLoop reads authenticated server return envelopes off the private socket
+// and dispatches each opaque inner reply by its random relay request ID.
 func (rs *RelayServer) recvLoop() {
 	defer rs.wg.Done()
-	// Sized to the max ACK; a larger datagram is truncated by ReadFromUDP and
-	// then fails RecvPrecheck's size check — dropped, not relayed.
-	buf := make([]byte, maxAckPacketSize)
+	// Sized one byte beyond the maximum return envelope so an oversized datagram
+	// is distinguishable from an exact maximum and rejected by decodeRelayReturn.
+	// One extra byte makes truncation observable. Authenticated relay envelopes
+	// may be larger than a direct NHP packet because they contain a complete
+	// 4096-byte inner packet plus request-correlation metadata.
+	buf := make([]byte, maxAckPacketSize+1)
 	for {
 		select {
 		case <-rs.stopCh:
 			return
 		default:
 		}
-		n, _, err := rs.udpConn.ReadFromUDP(buf)
+		n, from, err := rs.udpConn.ReadFromUDP(buf)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			// Closed socket (Stop) returns here; for a transient error (e.g. a
 			// prior ICMP port-unreachable surfacing as ECONNREFUSED on the next
 			// read) back off briefly so a persistent condition can't busy-spin
@@ -712,93 +796,150 @@ func (rs *RelayServer) recvLoop() {
 			}
 			continue
 		}
-		raw := append([]byte(nil), buf[:n]...)
-		// Per-datagram recover: the length guard in innerCounter already makes a
-		// malformed datagram safe, but one bad packet must never kill the recv
-		// loop (and with it the relay's entire return path).
+		outer := append([]byte(nil), buf[:n]...)
+		// Per-datagram recover: one malformed or unauthenticated return must never
+		// kill the private receive loop.
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Error("relay: recovered from panic processing datagram (%d bytes): %v", n, r)
 				}
 			}()
-			counter, perr := rs.innerCounter(raw)
+			requestID, serverID, inner, perr := rs.decodeRelayReturn(outer, from)
 			if perr != nil {
-				return // not a well-formed NHP packet; drop
+				return
 			}
-			rs.dispatch(counter, raw)
+			rs.dispatch(requestID, serverID, inner)
 		}()
 	}
 }
 
-// dispatch delivers a raw server ACK to every handler waiting on counter.
-func (rs *RelayServer) dispatch(counter uint64, raw []byte) {
+func (rs *RelayServer) decodeRelayReturn(raw []byte, from *net.UDPAddr) (string, string, []byte, error) {
+	if len(raw) < core.RelayPacketMinimalLength || len(raw) > maxAckPacketSize {
+		return "", "", nil, errors.New("invalid relay return packet size")
+	}
+	// ConnectionData allocation precedes Noise authentication. This is acceptable
+	// on the SG-restricted private UDP 62207 return socket: the receive loop is
+	// synchronous (at most one such allocation at a time), and legitimate return
+	// volume is bounded by the relay's in-flight request limits. A future change
+	// to concurrent return decoding must re-budget or reuse ConnectionData before
+	// introducing parallel copies of its channel set.
+	conn := &core.ConnectionData{
+		Device:               rs.device,
+		RemoteAddr:           from,
+		CookieStore:          &core.CookieStore{},
+		SendQueue:            make(chan *core.Packet, 1),
+		RecvQueue:            make(chan *core.Packet, 1),
+		BlockSignal:          make(chan struct{}, 1),
+		SetTimeoutSignal:     make(chan struct{}, 1),
+		StopSignal:           make(chan struct{}),
+		RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+	}
+	defer conn.Close()
+	ppd, err := rs.device.PacketToMsg(&core.PacketData{
+		BasePacket: &core.Packet{Content: raw},
+		ConnData:   conn,
+		InitTime:   time.Now().UnixNano(),
+	})
+	if err != nil {
+		return "", "", nil, fmt.Errorf("decrypt relay return: %w", err)
+	}
+	if ppd == nil {
+		return "", "", nil, errors.New("decrypt relay return returned no packet")
+	}
+	if ppd.HeaderType != core.NHP_ACK {
+		return "", "", nil, fmt.Errorf("unexpected relay return outer type %s", core.HeaderTypeToString(ppd.HeaderType))
+	}
+	serverID := utils.PubKeyFingerprint(ppd.RemotePubKey)
+	if rs.servers[serverID] == nil {
+		return "", "", nil, errors.New("relay return sender is not a configured server")
+	}
+	var returned common.RelayReturnMsg
+	if err := common.DecodeRelayJSONStrict(ppd.BodyMessage, &returned); err != nil {
+		return "", "", nil, fmt.Errorf("parse RelayReturnMsg: %w", err)
+	}
+	if !common.ValidRelayRequestID(returned.RequestID) {
+		return "", "", nil, errors.New("invalid relay return request ID")
+	}
+	if returned.InnerPacket == "" || len(returned.InnerPacket) > base64.StdEncoding.EncodedLen(maxInnerPacketSize) {
+		return "", "", nil, errors.New("invalid relay return inner packet size")
+	}
+	inner, err := base64.StdEncoding.DecodeString(returned.InnerPacket)
+	if err != nil || len(inner) == 0 || len(inner) > maxInnerPacketSize {
+		return "", "", nil, errors.New("invalid relay return inner packet")
+	}
+	innerType, err := rs.innerType(inner)
+	if err != nil {
+		return "", "", nil, errors.New("malformed relay return inner packet")
+	}
+	if !relayReturnTypeAllowed(innerType) {
+		return "", "", nil, fmt.Errorf("unexpected relay return inner type %s", core.HeaderTypeToString(innerType))
+	}
+	return returned.RequestID, serverID, inner, nil
+}
+
+// Keep this response set, httpsAgentTypeAllowed's request set, and core's
+// NHP_RELAY receive gate in lockstep; the union invariant is tested below.
+func relayReturnTypeAllowed(headerType int) bool {
+	switch headerType {
+	case core.NHP_ACK, core.NHP_COK, core.NHP_RAK, core.NHP_LRT:
+		return true
+	default:
+		return false
+	}
+}
+
+func httpsAgentTypeAllowed(headerType int) bool {
+	switch headerType {
+	case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT, core.NHP_OTP, core.NHP_REG, core.NHP_LST:
+		return true
+	default:
+		return false
+	}
+}
+
+// dispatch delivers an authenticated inner reply to its exact random request ID.
+func (rs *RelayServer) dispatch(requestID, serverID string, raw []byte) {
 	rs.pendingMu.Lock()
-	chans := make([]chan []byte, 0, 1)
-	for k, ch := range rs.pending {
-		if k.counter == counter {
-			chans = append(chans, ch)
-		}
-	}
+	entry, ok := rs.pending[requestID]
 	rs.pendingMu.Unlock()
-	// raw is shared across all waiters on this counter; consumers (handleRelay)
-	// only read it (w.Write), never mutate, so sharing the buffer is safe.
-	for _, ch := range chans {
+	if ok {
+		// A cryptographically authenticated but unexpected configured server
+		// must not satisfy this exact waiter.
+		if entry.serverID != serverID {
+			rs.metrics.IncrCounter(MetricRelayReturnServerMismatch)
+			return
+		}
 		select {
-		case ch <- raw:
-		default: // waiter already served or gone
+		case entry.reply <- raw:
+		default:
 		}
 	}
 }
 
-// innerCounter validates a raw NHP packet's header and returns its cleartext
-// transaction counter — readable without decryption, the same value the agent
-// matches its ACK on. Thin wrapper over innerCounterAndType for the recvLoop
-// dispatch path, which correlates by counter alone and does not need the type.
-func (rs *RelayServer) innerCounter(raw []byte) (uint64, error) {
-	counter, _, err := rs.innerCounterAndType(raw)
-	return counter, err
-}
-
-// innerCounterAndType validates a raw NHP packet's header and returns BOTH its
-// cleartext transaction counter and its deobfuscated header type. The type is
-// what the forward path branches on to distinguish a fire-and-forget inner
-// NHP_OTP (no reply-waiter, immediate 202) from a round-trip type (KNK/RKN/EXT/
-// REG). RecvPrecheck already deobfuscates and validates the header and returns
-// the type as its first value, so obtaining the type is free here — the same
-// validation innerCounter has always done, surfacing one more field it computed.
-//
-// Both the client-POSTed request (handleRelay) and the server's reply
-// (recvLoop) flow through this; CheckRecvHeaderType (inside RecvPrecheck, on the
-// NHP_RELAY device) admits exactly the relayable set — KNK/RKN/EXT/OTP/REG plus
-// the reply types ACK/RAK/COK/LRT — so an inner type outside that set is
-// rejected here as a precheck error, never reaching the forward switch.
-func (rs *RelayServer) innerCounterAndType(raw []byte) (uint64, int, error) {
+func (rs *RelayServer) innerType(raw []byte) (int, error) {
 	// Length guard BEFORE RecvPrecheck. Unlike PacketToMsg, RecvPrecheck is not
 	// wrapped in recover() and reads the header (Content[0:4], [4:8], …) without
-	// a lower-bound check — a short/empty datagram would panic. A bare 0-length
-	// UDP datagram arrives as (n=0, err=nil), so this is reachable by anything
-	// that can route UDP to the relay's socket; without the guard recvLoop would
-	// panic and crash the process (remote DoS). Mirrors the server's
-	// recvPacketRoutine MinimalLength discard.
+	// a lower-bound check. An undersized HTTPS body or malformed authenticated
+	// RelayReturn inner packet must be rejected instead of panicking the process.
 	if len(raw) < core.HeaderCommonSize {
-		return 0, 0, errors.New("packet too short")
+		return 0, errors.New("packet too short")
 	}
 	if len(raw) > maxInnerPacketSize {
-		return 0, 0, errors.New("packet too large")
+		return 0, errors.New("packet too large")
 	}
 	pkt := rs.device.AllocatePoolPacket()
 	if pkt == nil {
-		return 0, 0, errors.New("packet pool exhausted")
+		return 0, errors.New("packet pool exhausted")
 	}
 	defer rs.device.ReleasePoolPacket(pkt)
 	copy(pkt.Buf[:len(raw)], raw)
 	pkt.Content = pkt.Buf[:len(raw)]
 	headerType, _, err := rs.device.RecvPrecheck(pkt)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	return pkt.Counter(), headerType, nil
+	return headerType, nil
 }
 
 // assertTrustedHeaderBindCoherent fails closed (#2553) on a relay config that
@@ -957,8 +1098,8 @@ func (rs *RelayServer) deriveSourceAddr(r *http.Request) *net.UDPAddr {
 // maxInnerPacketSize caps the inbound POST body (one NHP packet).
 const maxInnerPacketSize = core.PacketBufferSize
 
-// maxAckPacketSize is the recv-buffer bound for the server's ACK. An NHP_ACK
-// fits one pool buffer — the assembler caps the body at PacketBufferSize -
-// header size (nhp/core/initiator.go). Same value as maxInnerPacketSize, named
-// separately so the inbound-vs-recv bounds are self-documenting.
-const maxAckPacketSize = core.PacketBufferSize
+// maxAckPacketSize is the receive bound for the authenticated server return
+// envelope carrying an opaque ACK/COK/RAK/LRT. The inner packet remains capped
+// at one standard pool buffer; only the authenticated outer envelope gets the
+// dedicated larger bound.
+const maxAckPacketSize = core.RelayPacketBufferSize

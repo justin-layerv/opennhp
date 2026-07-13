@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,74 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
+
+func TestPacketFromUDPDatagramRelayEnvelopeBoundary(t *testing.T) {
+	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableRelayPeerValidation: true})
+	relayDev := newSpikeDevice(t, core.NHP_RELAY, 0x55, nil)
+	serverPub := decodeBase64PubKey(serverDev.PublicKeyBase64())
+	inner := make([]byte, core.PacketBufferSize)
+	body, err := json.Marshal(&common.RelayForwardMsg{
+		SourceAddr: &common.NetAddress{
+			Ip:   "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+			Port: 65535,
+		},
+		InnerPacket: base64.StdEncoding.EncodeToString(inner),
+		RequestID:   testRelayRequestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mad, err := relayDev.MsgToPacket(&core.MsgData{
+		PeerPk:         serverPub,
+		HeaderType:     core.NHP_RLY,
+		TransactionId:  991122,
+		Compress:       false,
+		Message:        body,
+		ExternalPacket: core.NewRelayPacket(),
+	})
+	if err != nil {
+		t.Fatalf("encrypt maximum relay envelope: %v", err)
+	}
+	raw := append([]byte(nil), mad.BasePacket.Content...)
+	if len(raw) != 5844 {
+		t.Fatalf("maximum relay request = %d bytes, want 5844", len(raw))
+	}
+
+	pkt, clearType, err := packetFromUDPDatagram(serverDev, raw)
+	if err != nil {
+		t.Fatalf("receive gate rejected maximum relay envelope: %v", err)
+	}
+	if clearType != core.NHP_RLY || pkt.Buf != nil || len(pkt.Content) != len(raw) {
+		t.Fatalf("admitted packet = type %s, pool=%v, len=%d; want external NHP_RLY len %d", core.HeaderTypeToString(clearType), pkt.Buf != nil, len(pkt.Content), len(raw))
+	}
+	ppd, err := serverDev.PacketToMsg(&core.PacketData{
+		BasePacket: pkt,
+		ConnData: &core.ConnectionData{
+			Device: serverDev, RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 44444},
+		},
+		InitTime: time.Now().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("decrypt admitted maximum relay envelope: %v", err)
+	}
+	if ppd.HeaderType != core.NHP_RLY || !bytes.Equal(ppd.BodyMessage, body) {
+		t.Fatal("maximum relay envelope changed across the receive gate")
+	}
+
+	oversizedDirect := append([]byte(nil), raw[:core.PacketBufferSize+1]...)
+	preamble := binary.BigEndian.Uint32(oversizedDirect[:4])
+	_, payloadSize := (&core.Packet{Content: oversizedDirect}).HeaderTypeAndSize()
+	binary.BigEndian.PutUint32(oversizedDirect[4:8], preamble^uint32(core.NHP_KNK<<16|payloadSize))
+	if pkt, gotType, gateErr := packetFromUDPDatagram(serverDev, oversizedDirect); gateErr == nil || pkt != nil || gotType != core.NHP_KNK {
+		t.Fatalf("4097-byte direct gate = pkt %#v, type %s, err %v; want pre-crypto rejection", pkt, core.HeaderTypeToString(gotType), gateErr)
+	}
+
+	aboveTransport := make([]byte, core.RelayPacketBufferSize+1)
+	copy(aboveTransport, raw)
+	if pkt, gotType, gateErr := packetFromUDPDatagram(serverDev, aboveTransport); gateErr == nil || pkt != nil || gotType != core.NHP_RLY {
+		t.Fatalf("6145-byte relay gate = pkt %#v, type %s, err %v; want observable transport rejection", pkt, core.HeaderTypeToString(gotType), gateErr)
+	}
+}
 
 func newSendMessageTestServer(t *testing.T, sendCh chan *core.MsgData) *UdpServer {
 	t.Helper()

@@ -41,15 +41,15 @@
 # a sustained / permission SSM error fails LOUD — never degrade an error
 # into a silent skip (the #1634 hidden-skip class).
 #
-# READINESS GATE (#2646, gates #6): after starting the refresh we POLL it to a
+# FLEET READINESS GATE (#2646): after starting the refresh we POLL it to a
 # terminal state instead of returning fire-and-forget — succeed on `Successful`,
 # FAIL LOUD on `Failed`/`Cancelled` or a bounded-wait timeout. Because the relay
 # ASG uses health_check_type=ELB (modules/relay/compute.tf), a `Successful`
-# refresh means every replaced instance passed the ALB target group's
-# /health/live check, so the poll doubles as the post-deploy reachability signal
-# (the relay equivalent of blue-green's knock-readiness gate). This converts a
-# boot-failed / crash-looping new relay image from a silent ELB-replacement loop
-# into a red CI job — the prerequisite for putting browser traffic on the relay.
+# refresh means every replaced instance passed all attached target-group health
+# checks through the HTTPS target group's /health/live probe. This proves fleet
+# readiness for the relay's only public surface; native UDP SDK traffic bypasses
+# the relay and targets the assigned cell's public NHP NLB. A boot-failed or
+# crash-looping image therefore turns the deploy red before any cutover.
 #
 # Environment variables:
 #   AWS_REGION:   AWS region (default: us-east-2).
@@ -98,8 +98,10 @@ SSM_PARAM_NOT_FOUND="__NHP_RELAY_SSM_PARAMETER_NOT_FOUND__"
 # could tip past it and false-fail a healthy roll), so this keeps a comfortable
 # cushion over the ~8-min baseline while still failing LOUD on a genuinely
 # wedged/boot-looping roll rather than hanging CI. Stays inside the
-# deploy-sandbox-relay job's 20-min timeout (build-and-push.yml). The interval is
-# overridable so the fixture suite can drive the poll with a no-op sleep.
+# refresh portion of deploy-sandbox-relay's 35-min timeout; the remaining budget
+# covers the downstream 10-min functional DMZ gate plus its final uncached pass.
+# The interval is overridable so the fixture suite can drive the poll with a
+# no-op sleep.
 RELAY_REFRESH_POLL_INTERVAL_SECS="${RELAY_REFRESH_POLL_INTERVAL_SECS:-10}"
 RELAY_REFRESH_MAX_ITERATIONS="${RELAY_REFRESH_MAX_ITERATIONS:-90}"
 # Consecutive describe-instance-refreshes errors (throttle/IAM) tolerated before
@@ -258,10 +260,11 @@ fi
 # blue-green's "refresh on every build" — and accepted: the relay forwards an
 # opaque, version-stable protocol, so a churned roll is benign.
 
-# Poll an instance refresh to a terminal state through the shared helper. Health
-# verification is implicit: the relay ASG is health_check_type=ELB, so a
-# `Successful` refresh means each replaced instance passed the ALB /health/live
-# check.
+# Poll an instance refresh to a terminal state through the shared helper. Fleet
+# health verification is implicit: health_check_type=ELB requires each replaced
+# instance to pass the attached ALB target group's /health/live probe. Native
+# UDP request/ACK validation belongs to the assigned cell NHP NLB, not this
+# HTTPS-only relay deployment.
 poll_refresh() {
   wait_for_instance_refresh \
     "$1" \

@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -41,6 +42,123 @@ func buildRegisterPpd(t *testing.T, aspID string, pubKey []byte) *core.PacketPar
 		HeaderType:   core.NHP_REG,
 		BodyMessage:  body,
 		RemotePubKey: pubKey,
+	}
+}
+
+func buildListPpd(t *testing.T, aspID string, pubKey []byte) *core.PacketParserData {
+	t.Helper()
+	body, err := json.Marshal(&common.AgentListMsg{
+		UserId: "u", DeviceId: "d", AuthServiceId: aspID,
+	})
+	if err != nil {
+		t.Fatalf("marshal AgentListMsg: %v", err)
+	}
+	return &core.PacketParserData{
+		ConnData: &core.ConnectionData{
+			RemoteAddr: &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 55555},
+			StopSignal: make(chan struct{}),
+		},
+		SenderTrxId:  100,
+		HeaderType:   core.NHP_LST,
+		BodyMessage:  body,
+		RemotePubKey: pubKey,
+	}
+}
+
+func TestBuildListResult_PluginFailuresProduceFailClosedLRT(t *testing.T) {
+	const aspID = "asp-list-unit"
+	tests := []struct {
+		name    string
+		plugin  plugins.PluginHandler
+		wantErr error
+	}{
+		{
+			name: "bare plugin error",
+			plugin: &recordingRegOTPPlugin{
+				listErr: plugins.ErrPluginNotRegistered,
+			},
+			wantErr: plugins.ErrPluginNotRegistered,
+		},
+		{
+			name:    "nil result without error",
+			plugin:  &mockPluginHandler{},
+			wantErr: errors.New("list plugin returned nil result"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newRegisterUnitServer(
+				t, map[string]plugins.PluginHandler{aspID: tc.plugin},
+			)
+			lrtBytes, _, err := s.buildListResult(
+				buildListPpd(t, aspID, testPubkey(0xC5)),
+			)
+			if err == nil || err.Error() != tc.wantErr.Error() {
+				t.Fatalf("buildListResult error = %v, want %v", err, tc.wantErr)
+			}
+			if string(lrtBytes) == "null" {
+				t.Fatal("buildListResult marshaled nil plugin result as JSON null")
+			}
+			var got common.ServerListResultMsg
+			if err := json.Unmarshal(lrtBytes, &got); err != nil {
+				t.Fatalf("unmarshal LRT bytes: %v", err)
+			}
+			if got.ErrCode != common.ErrAuthHandlerNotFound.ErrorCode() {
+				t.Errorf(
+					"LRT.ErrCode = %q, want fail-closed %q",
+					got.ErrCode, common.ErrAuthHandlerNotFound.ErrorCode(),
+				)
+			}
+			if common.IsSuccessErrCode(got.ErrCode) {
+				t.Error("plugin failure produced a successful LRT")
+			}
+		})
+	}
+}
+
+func TestHandleListRequest_DeliveredErrorLRTDoesNotReturnLogicalError(t *testing.T) {
+	const aspID = "asp-list-direct-error"
+	s := newRegisterUnitServer(t, map[string]plugins.PluginHandler{
+		aspID: &recordingRegOTPPlugin{listErr: plugins.ErrPluginNotRegistered},
+	})
+	ppd := buildListPpd(t, aspID, testPubkey(0xC6))
+	msgCh := make(chan *core.MsgData, 1)
+	ppd.ConnData.RemoteTransactionMap = map[uint64]*core.RemoteTransaction{
+		ppd.SenderTrxId: core.NewRemoteTransactionForTest(ppd.SenderTrxId, msgCh),
+	}
+
+	if err := s.HandleListRequest(ppd); err != nil {
+		t.Fatalf("HandleListRequest returned delivered logical error: %v", err)
+	}
+
+	select {
+	case md := <-msgCh:
+		if md.HeaderType != core.NHP_LRT {
+			t.Fatalf("delivered header type = %s, want NHP_LRT", core.HeaderTypeToString(md.HeaderType))
+		}
+		var got common.ServerListResultMsg
+		if err := json.Unmarshal(md.Message, &got); err != nil {
+			t.Fatalf("unmarshal delivered LRT: %v", err)
+		}
+		if common.IsSuccessErrCode(got.ErrCode) {
+			t.Fatalf("delivered LRT unexpectedly succeeded: %+v", got)
+		}
+	default:
+		t.Fatal("HandleListRequest did not deliver its fail-closed LRT")
+	}
+}
+
+func TestHandleListRequest_UndeliveredErrorLRTReturnsTransportError(t *testing.T) {
+	const aspID = "asp-list-direct-undeliverable"
+	s := newRegisterUnitServer(t, map[string]plugins.PluginHandler{
+		aspID: &recordingRegOTPPlugin{listErr: plugins.ErrPluginNotRegistered},
+	})
+	ppd := buildListPpd(t, aspID, testPubkey(0xC7))
+	// No remote transaction is registered. The logical plugin failure still
+	// becomes fail-closed LRT bytes, but because those bytes cannot be delivered,
+	// HandleListRequest must surface the transport failure to dispatchHandler.
+	if err := s.HandleListRequest(ppd); !errors.Is(err, common.ErrTransactionIdNotFound) {
+		t.Fatalf("HandleListRequest error = %v, want ErrTransactionIdNotFound", err)
 	}
 }
 
@@ -154,12 +272,13 @@ func TestBuildRegisterAck_PluginProvidedRejectCodePreserved(t *testing.T) {
 	}
 }
 
-// TestSendRelayReply_HeaderTypeParameterized proves sendRelayReply stamps the
-// caller-chosen header type onto the encrypted reply and the agent decrypts it
-// under that type. Runs the same synthetic-decrypt → divert → agent-decrypt
-// round-trip as the spike test, once per (NHP_ACK, NHP_RAK), so the type
-// parameter is exercised for both reply kinds sendRelayReply serves.
-func TestSendRelayReply_HeaderTypeParameterized(t *testing.T) {
+// TestBuildRelayInnerReply_HeaderTypeParameterized proves buildRelayInnerReply
+// stamps the caller-chosen header type onto the encrypted reply and the agent
+// decrypts it under that type. Runs the same synthetic-decrypt → divert →
+// agent-decrypt round-trip as the spike test, once per (NHP_ACK, NHP_RAK), so
+// the type parameter is exercised for both reply kinds the relay return path
+// serves.
+func TestBuildRelayInnerReply_HeaderTypeParameterized(t *testing.T) {
 	cases := []struct {
 		name       string
 		headerType int
@@ -205,16 +324,26 @@ func TestSendRelayReply_HeaderTypeParameterized(t *testing.T) {
 
 			// Server synthetic-decrypts and diverts a reply of tc.headerType.
 			s := &UdpServer{device: serverDev, listenConn: serverListen}
-			innerPpd, err := s.decryptRelayInnerKnock(innerREG, &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444})
+			innerPpd, cookie, innerConn, err := s.decryptRelayInnerKnock(innerREG, &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444})
 			if err != nil {
 				t.Fatalf("decryptRelayInnerKnock: %v", err)
+			}
+			if innerConn != nil {
+				defer innerConn.Close()
+			}
+			if len(cookie) != 0 {
+				t.Fatalf("decryptRelayInnerKnock returned unexpected overload cookie")
 			}
 			replyBody, err := json.Marshal(&common.ServerRegisterAckMsg{ErrCode: common.ErrSuccess.ErrorCode()})
 			if err != nil {
 				t.Fatalf("marshal reply body: %v", err)
 			}
-			if err := s.sendRelayReply(innerPpd, relayAddr, tc.headerType, replyBody); err != nil {
-				t.Fatalf("sendRelayReply(%s): %v", tc.name, err)
+			replyPacket, err := s.buildRelayInnerReply(innerPpd, tc.headerType, replyBody)
+			if err != nil {
+				t.Fatalf("buildRelayInnerReply(%s): %v", tc.name, err)
+			}
+			if _, err := serverListen.WriteToUDP(replyPacket, relayAddr); err != nil {
+				t.Fatalf("write inner reply(%s): %v", tc.name, err)
 			}
 
 			replyBytes := readUDPWithTimeout(t, relayListen, 5*time.Second)
@@ -225,7 +354,7 @@ func TestSendRelayReply_HeaderTypeParameterized(t *testing.T) {
 					t.Fatalf("agent failed to decrypt %s reply: %v", tc.name, serverPpd.Error)
 				}
 				if serverPpd.HeaderType != tc.headerType {
-					t.Errorf("agent decrypted header = %d, want %s (%d) — sendRelayReply must stamp the caller's type",
+					t.Errorf("agent decrypted header = %d, want %s (%d) — buildRelayInnerReply must stamp the caller's type",
 						serverPpd.HeaderType, tc.name, tc.headerType)
 				}
 				if serverPpd.SenderTrxId != innerTrx {

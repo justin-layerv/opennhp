@@ -58,6 +58,7 @@ go.work.sum
 
 # Plan files
 *.tfplan
+*.tfplan.json
 tfplan
 tfplan.*
 

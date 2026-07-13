@@ -174,13 +174,10 @@ resource "aws_lambda_function" "keygen" {
 
 resource "aws_lambda_function" "status" {
   function_name = "${var.name_prefix}-relay-status"
-  # The data source references this resource, so this status-only pending config
-  # change defers the bootstrap status read until apply.
-  description = "Read-only relay identity status ($LATEST-qualified invocation)"
-  role        = aws_iam_role.status_lambda.arn
-  handler     = "relay_identity.statusHandler"
-  runtime     = "nodejs22.x"
-  timeout     = 30
+  role          = aws_iam_role.status_lambda.arn
+  handler       = "relay_identity.statusHandler"
+  runtime       = "nodejs22.x"
+  timeout       = 30
 
   # Intentionally use the account's bounded unreserved pool: concurrent PR
   # plans must not contend with the keygen singleton or a tiny status-specific

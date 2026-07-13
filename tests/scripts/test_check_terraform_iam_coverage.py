@@ -76,6 +76,30 @@ class ShippedConstants(unittest.TestCase):
             self.assertIn(rtype, IAM.RESOURCE_ACTIONS)
             self.assertNotIn(rtype, grandfathered)
 
+    def test_relay_dmz_resource_families_stay_mapped(self):
+        """The PR1 DMZ resource types are action-checked, not grandfathered."""
+        grandfathered = IAM.RESOURCE_UNCHECKED_ACK | IAM._FIXTURE_SCAFFOLD_ACK
+        for rtype in (
+            "aws_route",
+            "aws_vpc_peering_connection",
+            "aws_vpc_peering_connection_options",
+            "aws_route53_resolver_query_log_config",
+            "aws_route53_resolver_query_log_config_association",
+            "aws_route53_resolver_firewall_domain_list",
+            "aws_route53_resolver_firewall_rule_group",
+            "aws_route53_resolver_firewall_rule",
+            "aws_route53_resolver_firewall_rule_group_association",
+            "aws_route53_resolver_firewall_config",
+        ):
+            self.assertIn(rtype, IAM.RESOURCE_ACTIONS)
+            self.assertNotIn(rtype, grandfathered)
+
+        self.assertIn("ec2:ReplaceRoute", IAM.RESOURCE_ACTIONS["aws_route"])
+        self.assertIn(
+            "iam:CreateServiceLinkedRole",
+            IAM.RESOURCE_ACTIONS["aws_route53_resolver_query_log_config_association"],
+        )
+
 
 class RequiredActionsDispatch(unittest.TestCase):
     """The shared `_required_actions` dispatch. All shipped RESOURCE_ACTIONS

@@ -1,7 +1,7 @@
 # S3 buckets for the relay ALB's access logs + Athena query results (#2623).
 #
-# The relay is the INTERNET-FACING knock surface (browser POST /relay/*) — the
-# one component #2208 deliberately exposes so nhp-server can go private. Its
+# The relay is the internet-facing browser knock surface (POST /relay/*); native
+# UDP SDKs use the assigned cell's separate public server NLB. The relay's
 # per-request access logs are the post-incident forensics for that surface and
 # CANNOT be backfilled, so they must exist before #6 routes real browser traffic
 # (today the relay is dark; the dark-launch window's logs are negligible, but the

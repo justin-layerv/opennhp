@@ -60,7 +60,7 @@ resource "aws_vpc_endpoint" "dynamodb" {
   # (e.g. dev) and the gateway endpoint is harmless when unused.
   route_table_ids = concat(
     [aws_route_table.public.id],
-    aws_route_table.private[*].id,
+    local.all_private_route_table_ids,
     [aws_route_table.isolated.id]
   )
 

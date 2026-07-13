@@ -219,6 +219,27 @@ jobs:
             fi
           done
 
+          # Restore the complete checker family from the trusted base, not only
+          # its canonical entrypoint. A trusted dispatcher may import/execute a
+          # base-owned companion during an architecture transition (#3186), and
+          # restoring only the entrypoint would let a PR delete that dependency
+          # and make the secrets-bearing plan gate fail before validation. The
+          # prefix is deliberately narrow: every restored file is base-owned,
+          # and future single-file checkers naturally produce a count of one.
+          trusted_checker_count=0
+          while IFS= read -r trusted_checker_path; do
+            case "$trusted_checker_path" in
+              .github/scripts/check-relay-dmz-plan*.py)
+                git checkout "$BASE_SHA" -- "$trusted_checker_path"
+                trusted_checker_count=$((trusted_checker_count + 1))
+                ;;
+            esac
+          done < <(git ls-tree -r --name-only "$BASE_SHA" -- .github/scripts)
+          if ((trusted_checker_count == 0)); then
+            echo "::error::Trusted base commit $BASE_SHA contains no relay DMZ plan checker."
+            exit 1
+          fi
+
           mkdir -p "$RUNNER_TEMP/terraform-plan-pr"
           git show "$BASE_SHA:terraform/environments/sandbox/terraform.tfvars" > "$RUNNER_TEMP/terraform-plan-pr/sandbox.base.tfvars"
           echo "TRUSTED_AUTH0_TFVARS=$RUNNER_TEMP/terraform-plan-pr/sandbox.base.tfvars" >> "$GITHUB_ENV"
@@ -349,6 +370,11 @@ jobs:
 
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
           echo "show_json_failed=$show_json_failed" >> "$GITHUB_OUTPUT"
+
+      - name: Check relay DMZ plan contract
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.plan.outputs.exit_code == '0'
+        working-directory: terraform/environments/sandbox
+        run: python3 ../../../.github/scripts/check-relay-dmz-plan.py tfplan.json
 
       - name: Summarize Terraform Plan
         if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.plan.outputs.exit_code != ''

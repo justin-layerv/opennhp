@@ -3002,8 +3002,8 @@ variable "knock_token_reject_threshold_per_minute" {
 }
 
 # ── NHP-Relay (#2208 Phase-2 #5) ──
-# Internet-facing relay that forwards browser knocks to the (private) cell
-# server. Ships DARK: until 5c registers the relay pubkey in the server's
+# Internet-facing relay that forwards browser knocks to the cell's internal
+# server endpoint. Ships DARK: until 5c registers the relay pubkey in the server's
 # relay.toml, every forward is rejected at the server's Noise layer, so the
 # relay is internet-reachable but inert (cannot pivot into the private network).
 # DNS/cert vars mirror the bootstrap_alb pattern (same provision-or-existing,
@@ -3013,6 +3013,17 @@ variable "deploy_relay" {
   description = "Deploy the NHP-Relay stack (autoscaling fleet + internet-facing ALB). Default off; sandbox flips it true for the dark launch. The fleet shares one keypair and authenticates by Noise IK pubkey + relay.toml registration (NOT source IP) once the server runs DisableRelayPeerValidation=true (5c, #2627); baseline one instance per AZ. See modules/relay/variables.tf and the tracking issue #2629."
   type        = bool
   default     = false
+}
+
+variable "relay_vpc_cidr" {
+  description = "Dedicated relay DMZ VPC CIDR. Read only when deploy_relay=true; sandbox uses 10.101.0.0/16."
+  type        = string
+  default     = "10.101.0.0/16"
+
+  validation {
+    condition     = can(cidrnetmask(var.relay_vpc_cidr)) && cidrnetmask(var.relay_vpc_cidr) == "255.255.0.0"
+    error_message = "relay_vpc_cidr must be a valid IPv4 /16 CIDR."
+  }
 }
 
 # Canonical-key and ordering rules are mirrored by both environment wrappers
@@ -3034,27 +3045,6 @@ variable "relay_additional_trusted_public_keys_b64" {
     condition     = var.relay_additional_trusted_public_keys_b64 == sort(distinct(var.relay_additional_trusted_public_keys_b64))
     error_message = "relay_additional_trusted_public_keys_b64 must already be sorted and duplicate-free."
   }
-}
-
-# #2208 phase #8 / #2628: the final cutover that takes nhp-server OFF the internet.
-# When true, the PUBLIC knock NLB (aws_lb.server: UDP 62206 listener + 0.0.0.0/0
-# ingress) is removed and the in-VPC AC + qurl-service server host repoint to the
-# INTERNAL relay NLB (module.compute.internal_nlb_dns_name). The already-private
-# CloudMap HTTP token-validation path (local.nhp_server_internal_url, :8888) is
-# untouched. The public RESOLVE HTTPS surface is gated separately via
-# enable_qurl_resolve_endpoint (= deploy_qurl_link && !qurl_link_js_agent_enabled).
-#
-# Default false = current public behaviour (no diff on merge). Requires
-# deploy_relay=true (the internal NLB repoint target only exists then) AND
-# qurl_link_js_agent_enabled=true (browser knocks already on the relay, resolve
-# already off) — enforced by terraform_data.take_server_private_preconditions in
-# main.tf. Sandbox flips it true now as the soak; PROD stays false until a
-# dedicated prod-cutover PR after the relay carries real browser traffic in prod
-# (#6/#2680, #7). See docs/runbooks/prod-rollout-ledger and #2628 acceptance.
-variable "take_server_private" {
-  description = "Remove nhp-server's public knock NLB (UDP 62206) and repoint the in-VPC AC + qurl-service to the internal relay NLB. Requires deploy_relay=true and qurl_link_js_agent_enabled=true. Default false (public). Sandbox: true; prod: false until a dedicated prod-cutover PR (#2628 / #2208 #8)."
-  type        = bool
-  default     = false
 }
 
 variable "relay_dns_name" {

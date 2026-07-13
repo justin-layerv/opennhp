@@ -256,55 +256,6 @@ func skipIfResolveEndpointDisabled(t *testing.T) {
 	}
 }
 
-// serverPublicKnockSurfaceEnabled reports whether the nhp-server still exposes
-// its PUBLIC UDP knock NLB — and therefore the /{env}/nhp/server/udp-listener-arn
-// + {color}-udp-tg-arn SSM params that a blue/green flip switches. #2628 gates
-// that surface on public_server_surface_enabled (= !take_server_private): taking
-// the server private removes the public UDP 62206 NLB, its listener, and those
-// SSM params, and the relay/AC reach the cell over the internal NLB instead.
-// The internal relay listener still has an active-color contract: it points at
-// /{env}/nhp/server/{active}-internal-udp-tg-arn and is asserted by
-// TestBlueGreen_ActiveListenersPointToActiveColorTGs when present.
-//
-// This is a DISTINCT surface from the HTTPS resolve endpoint
-// (skipIfResolveEndpointDisabled / ResolveEndpointEnabled). take_server_private
-// REQUIRES the resolve endpoint already be off (terraform/main.tf precondition:
-// enable_qurl_resolve_endpoint = deploy_qurl_link && !qurl_link_js_agent_enabled),
-// so "resolve off + UDP still public" is a valid intermediate rollout state
-// (sandbox pre-#2628; prod today has both public). The two gates therefore must
-// stay independent — collapsing them would silently skip the UDP-listener
-// assertion while the public knock surface is still live.
-//
-// Source of truth is the Terraform-owned /{env}/nhp/server/take-server-private
-// marker, which exists in EVERY blue/green env (count = enable_blue_green) and
-// flips value between the public and private states — the same signal
-// blue-green-switch.sh keys on. We mirror its fail-closed policy exactly: treat
-// the surface as public UNLESS the marker is explicitly "true", so a "false" or
-// (anomalously) missing marker keeps the udp-listener assertion live and a
-// botched take_server_private apply fails loud instead of silently skipping.
-//
-// Blue/green only — callers must gate with skipIfNotBlueGreen(t) first; the
-// marker is not created in canary/static-pipeline envs.
-func serverPublicKnockSurfaceEnabled(t *testing.T) bool {
-	t.Helper()
-	val, ok := getSSMParameter(t, "/"+testConfig.Environment+"/nhp/server/take-server-private")
-	return publicKnockSurfaceFromMarker(val, ok)
-}
-
-// publicKnockSurfaceFromMarker is the pure fail-closed decision behind
-// serverPublicKnockSurfaceEnabled, split out so its truth table is unit-tested
-// without a live SSM read (config_test.go). The public UDP knock surface is
-// assumed present UNLESS the take-server-private marker is explicitly "true",
-// so a "false", empty, unexpected, or missing (markerPresent=false) marker
-// keeps the udp-listener assertion live. This mirrors blue-green-switch.sh's
-// policy — skip the public flip ONLY when the marker is "true", else treat a
-// missing public listener as a botched deploy rather than an intended private
-// state — so an inverted marker or dropped param fails loud instead of silently
-// skipping.
-func publicKnockSurfaceFromMarker(markerValue string, markerPresent bool) bool {
-	return !(markerPresent && markerValue == "true")
-}
-
 // nhpIngressTLSURL returns the env's externally-reachable NHP HTTPS ingress
 // for TLS-surface assertions: the resolve endpoint (NHPServerBaseURL) where it
 // is live, else the NHP-Relay (RelayBaseURL) under the JS-agent topology. The

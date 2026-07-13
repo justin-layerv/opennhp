@@ -94,6 +94,7 @@ on:
       - "terraform/modules/ac/main.tf"
       - "Makefile"
       - "scripts/check-relay-dmz-live.py"
+      - "scripts/verify-relay-dmz-flow-evidence.py"
       - "scripts/check-frps-az-suffixes-validation-drift.sh"
       - "scripts/check-packer-failure-surfaced.sh"
       - "scripts/check-app-image-line-rendered.sh"
@@ -415,10 +416,9 @@ jobs:
           shellcheck .github/scripts/plan-blue-green-dispatch.sh tests/scripts/plan-blue-green-dispatch_test.sh
           bash tests/scripts/plan-blue-green-dispatch_test.sh
 
-      # Fence the blue/green listener switch's #2628 private-server contract: when
-      # nhp-server is private the public udp-listener-arn SSM param is gone, so the
-      # switch must flip the internal relay UDP listener before recording
-      # active-color while a missing primary listener stays a hard error for AC.
+      # Fence the assigned-cell public UDP invariant: server switches always
+      # require the public udp-listener-arn and switch the internal relay listener
+      # in the same failure-atomic transaction when it exists.
       - name: Test blue/green listener switch
         run: |
           shellcheck .github/scripts/blue-green-switch.sh tests/scripts/blue-green-switch_test.sh .github/scripts/check-internal-relay-migration-active-color.sh tests/scripts/check-internal-relay-migration-active-color_test.sh
@@ -455,15 +455,15 @@ jobs:
           REQUIRE_TERRAFORM: "1"
         run: |
           python3 -m py_compile .github/scripts/check-relay-dmz-plan.py
-          python3 -m py_compile .github/scripts/check-relay-dmz-plan-https.py
           python3 tests/scripts/test_check_relay_dmz_plan.py
-          python3 tests/scripts/test_check_relay_dmz_plan_https.py
-          python3 tests/scripts/test_check_relay_dmz_plan_transition.py
 
       - name: Test relay DMZ live detector
         run: |
           python3 -m py_compile scripts/check-relay-dmz-live.py
           python3 tests/scripts/test_check_relay_dmz_live.py
+
+      - name: Test relay DMZ Flow Log evidence verifier
+        run: python3 tests/scripts/test_verify_relay_dmz_flow_evidence.py
 
       # Structural fence for the dependabot-go-tidy bot-identity preflight
       # (PR #1777). PR #1384 used `gh api /user`, which 403s on App

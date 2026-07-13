@@ -598,7 +598,7 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
 
 # Unhealthy Hosts Alarm
 resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
-  count               = var.nlb_alarms_enabled ? 1 : 0 # #2628: public NLB only
+  count               = 1 # Indexed state address retained from #2628.
   alarm_name          = "${var.name_prefix}-${var.cell_id}-unhealthy-hosts"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
@@ -630,7 +630,7 @@ resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
 # canary deploys too — canary replaces one instance at a time, so
 # HealthyHostCount never hits zero during normal prod deployments.
 resource "aws_cloudwatch_metric_alarm" "no_healthy_hosts" {
-  count               = var.nlb_alarms_enabled ? 1 : 0 # #2628: public NLB only
+  count               = 1 # Indexed state address retained from #2628.
   alarm_name          = "${var.name_prefix}-${var.cell_id}-no-healthy-hosts"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 3
@@ -666,7 +666,7 @@ resource "aws_cloudwatch_metric_alarm" "no_healthy_hosts" {
 # Kept for now to avoid breaking dashboards keyed on this alarm name; safe
 # to delete in a follow-up (tracked in #1798).
 resource "aws_cloudwatch_metric_alarm" "tcp_resets" {
-  count               = var.nlb_alarms_enabled ? 1 : 0 # #2628: public NLB only
+  count               = 1 # Indexed state address retained from #2628.
   alarm_name          = "${var.name_prefix}-${var.cell_id}-tcp-resets"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3

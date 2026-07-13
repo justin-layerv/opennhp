@@ -31,12 +31,6 @@ resource "aws_iam_role" "relay" {
   tags = local.tags
 }
 
-# SSM session access (debugging / patching), mirrors the server role.
-resource "aws_iam_role_policy_attachment" "relay_ssm" {
-  role       = aws_iam_role.relay.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-}
-
 resource "aws_iam_role_policy" "relay" {
   name = "relay-permissions"
   role = aws_iam_role.relay.id
@@ -67,7 +61,50 @@ resource "aws_iam_role_policy" "relay" {
       {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter"]
-        Resource = ["arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_image_tag_parameter}"]
+        Resource = ["arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_image_tag_parameter}"]
+      },
+      {
+        # Pinned SSM Agent core. Deliberately omits wildcard Parameter Store
+        # reads and every ec2messages action from AmazonSSMManagedInstanceCore;
+        # the no-NAT DMZ supports only ssm + ssmmessages.
+        Effect = "Allow"
+        Action = [
+          "ssm:DescribeAssociation",
+          "ssm:DescribeDocument",
+          "ssm:GetDocument",
+          "ssm:GetManifest",
+          "ssm:ListAssociations",
+          "ssm:ListInstanceAssociations",
+          "ssm:PutComplianceItems",
+          "ssm:PutConfigurePackageResult",
+          "ssm:PutInventory",
+          "ssm:UpdateAssociationStatus",
+          "ssm:UpdateInstanceAssociationStatus",
+          "ssm:UpdateInstanceInformation",
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel",
+        ]
+        Resource = "*"
+      },
+      {
+        # SSM Agent and Distributor use the instance role for these regional
+        # buckets when an S3 gateway endpoint is present. ECR starport layers
+        # and AWS document attachments remain signed-URL-only and are omitted.
+        Effect = "Allow"
+        Action = ["s3:GetObject"]
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:s3:::amazon-ssm-${data.aws_region.current.region}/*",
+          "arn:${data.aws_partition.current.partition}:s3:::aws-ssm-${data.aws_region.current.region}/*",
+          "arn:${data.aws_partition.current.partition}:s3:::${data.aws_region.current.region}-birdwatcher-prod/*",
+        ]
       },
       # Boot-failure metric (user_data emits LayerV/NHP BootstrapFailure).
       {
@@ -86,6 +123,12 @@ resource "aws_iam_role_policy" "relay" {
           Effect   = "Allow"
           Action   = ["kms:Decrypt"]
           Resource = [var.secrets_kms_key_arn]
+          Condition = {
+            StringEquals = {
+              "kms:CallerAccount" = data.aws_caller_identity.current.account_id
+              "kms:ViaService"    = "secretsmanager.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"
+            }
+          }
         }
     ] : [])
   })
@@ -136,15 +179,15 @@ resource "aws_vpc_security_group_ingress_rule" "relay_http_from_alb" {
   tags = { Name = "${var.name_prefix}-relay-https-from-alb" }
 }
 
-# Inbound UDP-ACK return from the cell server. SGs are stateful, but the
+# Inbound authenticated UDP return from the cell server. SGs are stateful, but the
 # relay->server hop uses the cell's internal UDP NLB with preserve_client_ip=true:
 # the relay sends to an NLB node, while the server replies from its own ENI. That
 # source differs from the original destination, so conntrack does not reliably
-# classify the ACK as return traffic. Keep the explicit return hole, but scope it
+# classify the datagram as return traffic. Keep the explicit return hole, but scope it
 # to the NHP server SG instead of the whole VPC.
 resource "aws_vpc_security_group_ingress_rule" "relay_udp_ack_return" {
   security_group_id            = aws_security_group.relay.id
-  description                  = "NHP_RLY ACK return from cell server instances"
+  description                  = "NHP_RLY authenticated return from cell server instances"
   from_port                    = var.udp_listen_port
   to_port                      = var.udp_listen_port
   ip_protocol                  = "udp"
@@ -157,7 +200,7 @@ resource "aws_vpc_security_group_ingress_rule" "relay_udp_ack_return" {
 # host the internal cell NLB and server fleet. The relay does not get generic
 # internet egress.
 resource "aws_vpc_security_group_egress_rule" "relay_to_nhp_udp" {
-  for_each = local.private_subnet_cidr_blocks
+  for_each = local.nhp_server_cidr_blocks
 
   security_group_id = aws_security_group.relay.id
   description       = "NHP_RLY to cell servers on UDP 62206"
@@ -181,6 +224,20 @@ resource "aws_vpc_security_group_egress_rule" "relay_to_vpc_endpoints_https" {
   referenced_security_group_id = var.vpc_endpoint_security_group_id
 
   tags = { Name = "${var.name_prefix}-relay-egress-vpce-https" }
+}
+
+# The relay-network module creates the endpoint SG with no broad VPC-CIDR
+# ingress. Owning this rule here avoids a relay-network -> relay-SG dependency
+# and proves that only relay nodes can reach the interface endpoints.
+resource "aws_vpc_security_group_ingress_rule" "vpc_endpoints_from_relay" {
+  security_group_id            = var.vpc_endpoint_security_group_id
+  description                  = "HTTPS from relay nodes only"
+  from_port                    = 443
+  to_port                      = 443
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = aws_security_group.relay.id
+
+  tags = { Name = "${var.name_prefix}-relay-vpce-ingress" }
 }
 
 # ECR image layer downloads resolve to S3. S3 is a gateway endpoint (no endpoint
@@ -207,7 +264,7 @@ resource "aws_launch_template" "relay" {
     arn = aws_iam_instance_profile.relay.arn
   }
 
-  # Private subnets; NAT for egress, no public IP.
+  # Dedicated isolated DMZ subnets: no NAT, no default route, no public IP.
   network_interfaces {
     associate_public_ip_address = false
     security_groups             = [aws_security_group.relay.id]
@@ -279,24 +336,24 @@ resource "aws_launch_template" "relay" {
 # reverted on the next apply; min/max stay TF-owned as the bounds.
 locals {
   # Default capacity = one per AZ. Assumes the networking module's layout of one
-  # private subnet per AZ (true today: slice(azs, 0, 3) → 3 subnets across 3 AZs),
-  # so length(private_subnet_ids) == AZ count. If that layout ever changes to >1
+  # relay subnet per AZ (true today: three subnets across three AZs),
+  # so length(relay_subnet_ids) == AZ count. If that layout ever changes to >1
   # private subnet per AZ, this would over-scale the baseline — revisit the
   # derivation (or pass min_capacity explicitly). max defaults to 2× the baseline
   # (2/AZ ceiling). Override either via the vars.
-  relay_min_capacity = var.min_capacity != null ? var.min_capacity : length(var.private_subnet_ids)
+  relay_min_capacity = var.min_capacity != null ? var.min_capacity : length(var.relay_subnet_ids)
   relay_max_capacity = var.max_capacity != null ? var.max_capacity : local.relay_min_capacity * 2
 }
 
 resource "aws_autoscaling_group" "relay" {
-  name                = "${var.name_prefix}-relay"
-  vpc_zone_identifier = var.private_subnet_ids
+  name                = var.asg_name
+  vpc_zone_identifier = var.relay_subnet_ids
   min_size            = local.relay_min_capacity
   max_size            = local.relay_max_capacity
   desired_capacity    = local.relay_min_capacity
 
-  # Attach to the ALB target group (alb.tf). target_group_arns (vs a separate
-  # aws_autoscaling_attachment) keeps the wiring in one resource.
+  # The relay is browser-HTTPS-only at its public edge. Native UDP SDKs connect
+  # directly to their assigned cell's public server NLB.
   target_group_arns = [aws_lb_target_group.relay.arn]
 
   launch_template {
@@ -323,8 +380,8 @@ resource "aws_autoscaling_group" "relay" {
   # a fleet-wide boot-loop with zero healthy targets. The normal path is safe:
   # build-and-push's deploy job `needs: [..., build, ...]`, so the relay image for
   # the deploy SHA is published before the apply seeds the SSM tag. #2630's
-  # capacity/bootstrap alarms are the backstop for the abnormal case — a hard
-  # pre-#6 gate.
+  # capacity/bootstrap alarms are the backstop for the abnormal case and a hard
+  # pre-cutover gate.
   health_check_type         = "ELB"
   health_check_grace_period = 120
 
@@ -364,6 +421,14 @@ resource "aws_autoscaling_group" "relay" {
     # TF-owned bounds (a scale beyond max should fight the cap, not stick).
     ignore_changes = [desired_capacity]
   }
+
+  # Network and standalone-SG-rule barriers keep the first one-shot bootstrap
+  # from racing any path it needs to pull the image, read config/identity, emit
+  # telemetry, pass load-balancer health, or exchange NHP traffic.
+  depends_on = [
+    terraform_data.network_ready,
+    terraform_data.fleet_security_ready,
+  ]
 }
 
 # Scale on ALB requests per target: sparse knock traffic stays at min_capacity;

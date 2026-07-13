@@ -30,7 +30,9 @@ This document tracks the synchronization status between this fork (LayerV NHP) a
 **Policy reversal (2026-06).** Earlier syncs marked the upstream **relay**
 (`endpoints/relay/`, server `HandleRelayForward`, `common.RelayForwardMsg`) and
 **JS agent** (`endpoints/js-agent/`) as SKIP ("fork doesn't use relay"). That is
-no longer true: issue #2208 adopts them (browser → relay → private nhp-server).
+no longer true: issue #2208 adopts them (browser → HTTPS relay → the cell's
+internal NHP NLB; native UDP SDKs connect directly to the assigned cell's public
+NHP NLB).
 The historical per-commit log below still records the original SKIP decisions —
 those are not rewritten — but do **not** skip these going forward. The following
 previously-skipped commits must be **ported** (tracked under #2208):

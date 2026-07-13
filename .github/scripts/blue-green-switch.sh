@@ -94,21 +94,40 @@ tg_arn() {
 }
 
 # Roll back every listener already switched in this transaction, in reverse
-# order (internal relay before primary), so a failed multi-listener switch leaves
-# all traffic on $CURRENT_COLOR. Safe under set -u: rollback vars are
-# pre-initialized, and rollback TGs are validated before their listeners switch.
+# order, so a failed multi-listener switch leaves all traffic on $CURRENT_COLOR.
+# Rollback is best effort across every listener: one failed repair must not stop
+# the remaining repairs from being attempted.
 rollback_switched_listeners() {
     [[ "$DRY_RUN" == "true" ]] && return 0
+    local rollback_failed=false
+    if [[ "$SECONDARY_SWITCHED" == "true" ]]; then
+        log_warn "Rolling back ${SECONDARY_LISTENER_TYPE} listener to $CURRENT_COLOR..."
+        if ! modify_listener "$SECONDARY_LISTENER_ARN" "$ROLLBACK_SECONDARY_TG_ARN"; then
+            log_error "Failed to roll back ${SECONDARY_LISTENER_TYPE} listener"
+            rollback_failed=true
+        else
+            log_warn "${SECONDARY_LISTENER_TYPE} listener rolled back"
+        fi
+    fi
     if [[ "$INTERNAL_RELAY_SWITCHED" == "true" ]]; then
         log_warn "Rolling back internal relay UDP listener to $CURRENT_COLOR..."
-        modify_listener "$INTERNAL_RELAY_LISTENER_ARN" "$ROLLBACK_INTERNAL_RELAY_TG_ARN"
-        log_warn "internal relay UDP listener rolled back"
+        if ! modify_listener "$INTERNAL_RELAY_LISTENER_ARN" "$ROLLBACK_INTERNAL_RELAY_TG_ARN"; then
+            log_error "Failed to roll back internal relay UDP listener"
+            rollback_failed=true
+        else
+            log_warn "internal relay UDP listener rolled back"
+        fi
     fi
     if [[ "$PRIMARY_SWITCHED" == "true" ]]; then
         log_warn "Rolling back ${PRIMARY_LISTENER_TYPE} listener to $CURRENT_COLOR..."
-        modify_listener "$PRIMARY_LISTENER_ARN" "$ROLLBACK_PRIMARY_TG_ARN"
-        log_warn "${PRIMARY_LISTENER_TYPE} listener rolled back. Traffic remains on $CURRENT_COLOR."
+        if ! modify_listener "$PRIMARY_LISTENER_ARN" "$ROLLBACK_PRIMARY_TG_ARN"; then
+            log_error "Failed to roll back ${PRIMARY_LISTENER_TYPE} listener"
+            rollback_failed=true
+        else
+            log_warn "${PRIMARY_LISTENER_TYPE} listener rolled back"
+        fi
     fi
+    [[ "$rollback_failed" == "false" ]]
 }
 
 # Get current active color
@@ -139,40 +158,13 @@ fi
 
 # Get primary listener ARN.
 #
-# #2628: when nhp-server is private (take_server_private=true), Terraform removes the
-# public UDP NLB and its "${SSM_BASE}/udp-listener-arn" parameter. The relay->server
-# hop is still a real traffic switch point: it uses the INTERNAL NLB listener and
-# per-color internal UDP TGs, so this script must flip that listener before writing
-# active-color.
-#
-# A missing listener alone is NOT enough to skip: a botched public apply, SSM drift,
-# or an accidental param deletion on a PUBLIC server would otherwise silently skip the
-# traffic switch and report the deploy green. So fall back to the internal listener
-# ONLY when the Terraform-written "${SSM_BASE}/take-server-private" marker positively
-# confirms "true"; if the public listener is missing and the marker is anything else
-# (absent / "false"), fail loudly — that is a broken public deploy, not a private
-# server. A missing primary listener for the AC component is still a real fault
-# regardless.
+# The assigned-cell public UDP 62206 listener is required for UDP SDKs. The
+# private internal listener is a second switch point for browser-relay traffic,
+# not a fallback for an absent public edge.
 PRIMARY_LISTENER_ARN=$(get_ssm_param "${SSM_BASE}/${PRIMARY_LISTENER_TYPE}-listener-arn")
 if [[ -z "$PRIMARY_LISTENER_ARN" ]]; then
-    if [[ "$COMPONENT" == "server" ]]; then
-        SERVER_PRIVATE=$(get_ssm_param "${SSM_BASE}/take-server-private")
-        if [[ "$SERVER_PRIVATE" == "true" ]]; then
-            log_warn "No public ${PRIMARY_LISTENER_TYPE} listener ARN in SSM and take-server-private=true — nhp-server is private (#2628). Switching the internal relay UDP listener instead."
-            PRIMARY_LISTENER_TYPE="internal-udp"
-            PRIMARY_LISTENER_ARN=$(get_ssm_param "${SSM_BASE}/${PRIMARY_LISTENER_TYPE}-listener-arn")
-            if [[ -z "$PRIMARY_LISTENER_ARN" ]]; then
-                log_error "take-server-private=true but ${SSM_BASE}/${PRIMARY_LISTENER_TYPE}-listener-arn is missing. The relay path has no active-color switch point; failing before active-color can drift."
-                exit 1
-            fi
-        else
-            log_error "No public ${PRIMARY_LISTENER_TYPE} listener ARN in SSM, but take-server-private is not 'true' (got '${SERVER_PRIVATE:-<absent>}'). A public server must have its listener — failing loudly (likely a partial apply or SSM drift) rather than silently skipping the traffic switch."
-            exit 1
-        fi
-    else
-        log_error "Failed to get ${PRIMARY_LISTENER_TYPE} listener ARN from SSM"
-        exit 1
-    fi
+    log_error "Failed to get required ${PRIMARY_LISTENER_TYPE} listener ARN from SSM"
+    exit 1
 else
     log_info "Primary (${PRIMARY_LISTENER_TYPE}) Listener ARN: $PRIMARY_LISTENER_ARN"
 fi
@@ -181,17 +173,57 @@ PRIMARY_SWITCHED=false
 ROLLBACK_PRIMARY_TG_ARN=""
 INTERNAL_RELAY_SWITCHED=false
 INTERNAL_RELAY_LISTENER_ARN=""
+INTERNAL_RELAY_TARGET_TG_ARN=""
 ROLLBACK_INTERNAL_RELAY_TG_ARN=""
+SECONDARY_SWITCHED=false
+SECONDARY_LISTENER_ARN=""
+SECONDARY_TARGET_GROUP_ARN=""
+ROLLBACK_SECONDARY_TG_ARN=""
+
+# Preflight the internal listener contract before moving the public edge. A
+# deployed relay ASG makes this listener mandatory; when the relay is dark the
+# listener may be absent. If present in either case, both color TGs must exist.
+if [[ "$COMPONENT" == "server" ]]; then
+    RELAY_ASG_NAME=$(get_ssm_param "/${ENVIRONMENT}/nhp/relay/asg-name")
+    INTERNAL_RELAY_LISTENER_ARN=$(get_ssm_param "${SSM_BASE}/internal-udp-listener-arn")
+    if [[ -n "$RELAY_ASG_NAME" && -z "$INTERNAL_RELAY_LISTENER_ARN" ]]; then
+        log_error "Relay ASG $RELAY_ASG_NAME is deployed but the required internal UDP listener ARN is missing from SSM"
+        exit 1
+    fi
+    if [[ -n "$INTERNAL_RELAY_LISTENER_ARN" ]]; then
+        INTERNAL_RELAY_TARGET_TG_ARN=$(tg_arn "$TARGET_COLOR" "internal-udp")
+        ROLLBACK_INTERNAL_RELAY_TG_ARN=$(tg_arn "$CURRENT_COLOR" "internal-udp")
+        if [[ -z "$INTERNAL_RELAY_TARGET_TG_ARN" || -z "$ROLLBACK_INTERNAL_RELAY_TG_ARN" ]]; then
+            log_error "Internal relay listener exists but one or more internal UDP target group ARNs are missing from SSM"
+            exit 1
+        fi
+    fi
+fi
+
+# Preflight the optional secondary listener before the first mutation. If the
+# listener exists, both target and rollback target groups are mandatory so any
+# later failure can restore the complete current-color topology.
+if [[ -n "$SECONDARY_LISTENER_TYPE" ]]; then
+    SECONDARY_LISTENER_ARN=$(get_ssm_param "${SSM_BASE}/${SECONDARY_LISTENER_TYPE}-listener-arn")
+    if [[ -n "$SECONDARY_LISTENER_ARN" ]]; then
+        log_info "Secondary (${SECONDARY_LISTENER_TYPE}) Listener ARN: $SECONDARY_LISTENER_ARN"
+        SECONDARY_TARGET_GROUP_ARN=$(tg_arn "$TARGET_COLOR" "$SECONDARY_LISTENER_TYPE")
+        ROLLBACK_SECONDARY_TG_ARN=$(tg_arn "$CURRENT_COLOR" "$SECONDARY_LISTENER_TYPE")
+        if [[ -z "$SECONDARY_TARGET_GROUP_ARN" || -z "$ROLLBACK_SECONDARY_TG_ARN" ]]; then
+            log_error "${SECONDARY_LISTENER_TYPE} listener exists but one or more ${SECONDARY_LISTENER_TYPE} target group ARNs are missing from SSM"
+            exit 1
+        fi
+        log_info "Target ${SECONDARY_LISTENER_TYPE} TG ARN: $SECONDARY_TARGET_GROUP_ARN"
+    else
+        log_info "No ${SECONDARY_LISTENER_TYPE} listener configured"
+    fi
+fi
 
 # Get target group ARNs based on target color
 PRIMARY_TARGET_GROUP_ARN=$(tg_arn "$TARGET_COLOR" "$PRIMARY_LISTENER_TYPE")
 
 if [[ -z "$PRIMARY_TARGET_GROUP_ARN" ]]; then
-    if [[ "$PRIMARY_LISTENER_TYPE" == "internal-udp" ]]; then
-        log_error "take-server-private=true but ${SSM_BASE}/${TARGET_COLOR}-internal-udp-tg-arn is missing. The relay path has no active-color switch point; failing before active-color can drift."
-    else
-        log_error "Failed to get $TARGET_COLOR ${PRIMARY_LISTENER_TYPE} target group ARN from SSM"
-    fi
+    log_error "Failed to get $TARGET_COLOR ${PRIMARY_LISTENER_TYPE} target group ARN from SSM"
     exit 1
 fi
 log_info "Target ${PRIMARY_LISTENER_TYPE} TG ARN: $PRIMARY_TARGET_GROUP_ARN"
@@ -199,11 +231,7 @@ log_info "Target ${PRIMARY_LISTENER_TYPE} TG ARN: $PRIMARY_TARGET_GROUP_ARN"
 # Get rollback target group ARN (current color) in case we need to revert
 ROLLBACK_PRIMARY_TG_ARN=$(tg_arn "$CURRENT_COLOR" "$PRIMARY_LISTENER_TYPE")
 if [[ -z "$ROLLBACK_PRIMARY_TG_ARN" ]]; then
-    if [[ "$PRIMARY_LISTENER_TYPE" == "internal-udp" ]]; then
-        log_error "take-server-private=true but ${SSM_BASE}/${CURRENT_COLOR}-internal-udp-tg-arn is missing. The relay path cannot be rolled back safely; failing before active-color can drift."
-    else
-        log_error "Failed to get current-color $CURRENT_COLOR ${PRIMARY_LISTENER_TYPE} rollback target group ARN from SSM"
-    fi
+    log_error "Failed to get current-color $CURRENT_COLOR ${PRIMARY_LISTENER_TYPE} rollback target group ARN from SSM"
     exit 1
 fi
 
@@ -221,29 +249,18 @@ fi
 
 PRIMARY_SWITCHED=true
 
-# If the internal relay UDP listener exists alongside a public UDP listener,
-# switch it in the same active-color transaction. In private-server mode the
-# fallback above made internal-udp the primary listener, so this block is skipped.
-# In dual-listener migration mode there is a brief cross-listener skew window:
+# If the internal relay UDP listener exists alongside the required public UDP
+# listener, switch it in the same active-color transaction. There is a brief
+# cross-listener skew window:
 # public UDP flips first, then internal relay. active-color is written only after
 # both switches succeed, and any internal relay failure rolls public UDP back.
-if [[ "$COMPONENT" == "server" && "$PRIMARY_LISTENER_TYPE" != "internal-udp" ]]; then
-    INTERNAL_RELAY_LISTENER_ARN=$(get_ssm_param "${SSM_BASE}/internal-udp-listener-arn")
+if [[ "$COMPONENT" == "server" ]]; then
     if [[ -n "$INTERNAL_RELAY_LISTENER_ARN" ]]; then
-        INTERNAL_RELAY_TARGET_TG_ARN=$(tg_arn "$TARGET_COLOR" "internal-udp")
-        ROLLBACK_INTERNAL_RELAY_TG_ARN=$(tg_arn "$CURRENT_COLOR" "internal-udp")
-
-        if [[ -z "$INTERNAL_RELAY_TARGET_TG_ARN" || -z "$ROLLBACK_INTERNAL_RELAY_TG_ARN" ]]; then
-            log_error "Internal relay listener exists but one or more internal UDP target group ARNs are missing from SSM"
-            rollback_switched_listeners
-            exit 1
-        fi
-
         log_info "Switching internal relay UDP listener to $TARGET_COLOR target group..."
         if [[ "$DRY_RUN" != "true" ]]; then
             if ! modify_listener "$INTERNAL_RELAY_LISTENER_ARN" "$INTERNAL_RELAY_TARGET_TG_ARN"; then
                 log_error "internal relay UDP listener switch failed!"
-                rollback_switched_listeners
+                rollback_switched_listeners || log_error "One or more listener rollbacks failed"
                 exit 1
             fi
             log_info "internal relay UDP listener switched successfully"
@@ -254,60 +271,39 @@ if [[ "$COMPONENT" == "server" && "$PRIMARY_LISTENER_TYPE" != "internal-udp" ]];
     fi
 fi
 
-# Check if secondary listener exists (server only - HTTPS for QURL)
-if [[ -n "$SECONDARY_LISTENER_TYPE" ]]; then
-    SECONDARY_LISTENER_ARN=$(get_ssm_param "${SSM_BASE}/${SECONDARY_LISTENER_TYPE}-listener-arn")
-    if [[ -n "$SECONDARY_LISTENER_ARN" ]]; then
-        log_info "Secondary (${SECONDARY_LISTENER_TYPE}) Listener ARN: $SECONDARY_LISTENER_ARN"
-
-        SECONDARY_TARGET_GROUP_ARN=$(tg_arn "$TARGET_COLOR" "$SECONDARY_LISTENER_TYPE")
-
-        # Validate consistency: if secondary listener exists, TG ARN must also exist
-        if [[ -z "$SECONDARY_TARGET_GROUP_ARN" ]]; then
-            log_error "${SECONDARY_LISTENER_TYPE} listener exists but $TARGET_COLOR ${SECONDARY_LISTENER_TYPE} target group ARN is missing from SSM"
-            log_error "This indicates a configuration inconsistency. Check SSM parameters."
-            # Rollback primary listener since we can't complete the switch atomically
-            rollback_switched_listeners
-            exit 1
-        fi
-        log_info "Target ${SECONDARY_LISTENER_TYPE} TG ARN: $SECONDARY_TARGET_GROUP_ARN"
-
+# Switch the preflighted secondary listener (server HTTPS for QURL), if present.
+if [[ -n "$SECONDARY_LISTENER_ARN" ]]; then
         log_info "Switching ${SECONDARY_LISTENER_TYPE} listener to $TARGET_COLOR target group..."
         if [[ "$DRY_RUN" != "true" ]]; then
             if ! modify_listener "$SECONDARY_LISTENER_ARN" "$SECONDARY_TARGET_GROUP_ARN"; then
                 log_error "${SECONDARY_LISTENER_TYPE} listener switch failed!"
-                # Roll the primary listener back to maintain consistency, but only if it
-                # was actually switched. This guard matches the TG-missing rollback above
-                # and avoids a `set -u` error if a future optional-listener path reaches
-                # this branch before primary switching.
-                rollback_switched_listeners
+                rollback_switched_listeners || log_error "One or more listener rollbacks failed"
                 exit 1
             fi
             log_info "${SECONDARY_LISTENER_TYPE} listener switched successfully"
         else
             log_info "[DRY RUN] Would execute: aws elbv2 modify-listener --listener-arn $SECONDARY_LISTENER_ARN --default-actions Type=forward,TargetGroupArn=$SECONDARY_TARGET_GROUP_ARN"
         fi
-    else
-        log_info "No ${SECONDARY_LISTENER_TYPE} listener configured"
-    fi
+        SECONDARY_SWITCHED=true
 fi
 
 # Update active color in SSM
-# NOTE: SSM is updated AFTER listener switch intentionally. If the script fails between
-# listener switch and SSM update, state becomes temporarily inconsistent. This is handled by:
-# 1. The validate job's reconciliation check detects listener/SSM mismatch
-# 2. Re-running the workflow will correct the state
-# We don't use a "switching" transitional state to keep the logic simple and avoid
-# additional failure modes (e.g., stuck in "switching" state).
+# SSM is the authoritative active-color marker and is written only after every
+# listener succeeds. A failed write rolls every listener back; leaving listeners
+# on the target color with a stale marker would make the next deployment unsafe.
 log_info "Updating active color in SSM to $TARGET_COLOR..."
 if [[ "$DRY_RUN" != "true" ]]; then
-    aws ssm put-parameter \
+    if ! aws ssm put-parameter \
         --name "${SSM_BASE}/active-color" \
         --value "$TARGET_COLOR" \
         --type "String" \
         --overwrite \
         --region "$AWS_REGION" \
-        --output text > /dev/null
+        --output text > /dev/null; then
+        log_error "Failed to update authoritative active-color marker; rolling listeners back"
+        rollback_switched_listeners || log_error "One or more listener rollbacks failed"
+        exit 1
+    fi
     log_info "SSM active-color updated"
 else
     log_info "[DRY RUN] Would execute: aws ssm put-parameter --name ${SSM_BASE}/active-color --value $TARGET_COLOR"
@@ -317,13 +313,15 @@ fi
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 log_info "Recording switch timestamp: $TIMESTAMP"
 if [[ "$DRY_RUN" != "true" ]]; then
-    aws ssm put-parameter \
+    if ! aws ssm put-parameter \
         --name "${SSM_BASE}/last-switch-timestamp" \
         --value "$TIMESTAMP" \
         --type "String" \
         --overwrite \
         --region "$AWS_REGION" \
-        --output text > /dev/null
+        --output text > /dev/null; then
+        log_warn "Failed to record non-authoritative switch timestamp"
+    fi
 fi
 
 log_info "=========================================="

@@ -1,14 +1,14 @@
 # ============================================================================
 # CloudWatch alarms for the relay fleet (#2630, part of #2208).
 #
-# The relay is the only internet-facing surface and ships DARK until #6 (real
-# browser traffic) — but a SYSTEMIC boot failure (e.g. the relay image tag
-# missing in ECR) fails /health/live on every instance, ELB health replaces them
+# The relay's only internet-facing surface is HTTPS. Native UDP SDKs bypass it
+# for their assigned cell's public NHP NLB. A SYSTEMIC boot failure (e.g. the
+# relay image tag missing in ECR) fails /health/live on every instance, ELB health replaces them
 # all, and you get a fleet-wide boot-loop with ZERO healthy targets. With
 # health_check_type=ELB (#2625) the ASG auto-replaces a single wedged instance,
 # so these alarms are no longer the only recovery path — but they are the only
 # VISIBILITY into replacements/boot-failures and the only backstop for the
-# abnormal fleet-wide case. #2630 promoted them to a hard pre-#6 gate.
+# abnormal fleet-wide case. #2630 made them a hard pre-cutover gate.
 #
 # DIM-SET CORRECTNESS (terraform/CLAUDE.md "Metric / Alarm Dim-Set Rules"):
 # a CloudWatch alarm selects its metric stream by EXACT dimension match; a
@@ -17,7 +17,7 @@
 # notes. `terraform validate` is a syntax/type check only and CANNOT catch a
 # wrong dim set; correctness rests on matching the emit sites:
 #   - BootstrapFailure: user_data.sh.tpl (aws cloudwatch put-metric-data)
-#   - UnHealthyHostCount / HealthyHostCount: AWS/ApplicationELB (TG + LB ARN suffixes)
+#   - UnHealthyHostCount / HealthyHostCount: AWS/ApplicationELB for the browser ALB
 #   - GroupInServiceInstances: AWS/AutoScaling (the ASG's enabled_metrics)
 #   - RelayShed: endpoints/relay/relay.go (the relay's endpoints/metrics publisher, #2649).
 #     The normal alarm watches Environment=<env>; the unknown-environment alarm
@@ -93,7 +93,7 @@ resource "aws_cloudwatch_metric_alarm" "relay_tg_unhealthy_hosts" {
 # It does NOT directly catch the terminate -> replacement-not-attached-yet window
 # of a systemic boot-loop, where there can be zero registered healthy targets and
 # UnHealthyHostCount can read as 0/no-data. HealthyHostCount < 1 is the direct
-# "nobody can serve relay traffic" signal #2630 promoted to a hard pre-#6 gate.
+# "nobody can serve relay traffic" signal #2630 made a hard pre-cutover gate.
 #
 # DIM SET — same AWS/ApplicationELB {LoadBalancer, TargetGroup}, NO Region shape
 # as relay_tg_unhealthy_hosts above. Pinning both dims keeps the alarm scoped to
@@ -191,7 +191,7 @@ resource "aws_cloudwatch_metric_alarm" "relay_bootstrap_failure" {
 # ── 4. ASG capacity below baseline ──
 #
 # The relay baseline is local.relay_min_capacity, which defaults to
-# length(private_subnet_ids). In today's networking layout that is one private
+# length(relay_subnet_ids). In today's networking layout that is one relay
 # subnet per AZ, so the default places one relay in each AZ for AZ-redundant HA
 # on the only internet-facing surface. If in-service capacity stays below that
 # baseline, the fleet has lost baseline coverage (boot-loop replacements not

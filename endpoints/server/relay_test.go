@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"net"
@@ -12,6 +13,59 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
+
+const testRelayRequestID = "AQEBAQEBAQEBAQEBAQEBAQ"
+
+func TestRelayLateEncryptReaperIsTracked(t *testing.T) {
+	s := &UdpServer{}
+	encCh := make(chan *core.MsgAssemblerData, 1)
+	s.reapLateEncryptedPacket(encCh, time.Second)
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("shutdown barrier returned before the late encrypt result was reaped")
+	case <-time.After(20 * time.Millisecond):
+	}
+	encCh <- nil
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown barrier did not observe the completed encrypt reaper")
+	}
+}
+
+func TestConsumeEncryptedPacketDestroysErrorResult(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, bytes.Repeat([]byte{0x44}, 32), nil)
+	device.Start()
+	t.Cleanup(device.Stop)
+	encCh := make(chan *core.MsgAssemblerData, 1)
+	device.SendMsgToPacket(&core.MsgData{
+		HeaderType:     core.NHP_ACK,
+		PeerPk:         []byte{1},
+		Message:        []byte(`{}`),
+		ExternalPacket: device.AllocateRelayPacket(),
+		EncryptedPktCh: encCh,
+	})
+	var mad *core.MsgAssemblerData
+	select {
+	case mad = <-encCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for forced encryption error")
+	}
+	if mad == nil || mad.Error == nil {
+		t.Fatalf("forced encryption result = %#v, want non-nil MAD error", mad)
+	}
+	if _, err := core.ConsumeEncryptedPacket(mad); err == nil {
+		t.Fatal("ConsumeEncryptedPacket accepted a forced encryption error")
+	}
+	if mad.BasePacket.Content != nil {
+		t.Fatal("error MAD retained its pooled relay packet after consumption")
+	}
+}
 
 // ============================================================================
 // Pure validation helpers — the relay's security boundary
@@ -146,9 +200,15 @@ func TestDecryptRelayInnerKnock_StampsClientSourceAddr(t *testing.T) {
 	clientAddr := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444}
 	s := &UdpServer{device: serverDev}
 
-	innerPpd, err := s.decryptRelayInnerKnock(innerKnock, clientAddr)
+	innerPpd, cookie, conn, err := s.decryptRelayInnerKnock(innerKnock, clientAddr)
+	if conn != nil {
+		defer conn.Close()
+	}
 	if err != nil {
 		t.Fatalf("decryptRelayInnerKnock: %v", err)
+	}
+	if len(cookie) != 0 {
+		t.Fatal("normal knock unexpectedly produced overload cookie")
 	}
 	if innerPpd.ConnData.RemoteAddr.String() != clientAddr.String() {
 		t.Errorf("inner ConnData.RemoteAddr = %s, want client %s (the AC pinhole source must be the relay-reported client, never the relay)",
@@ -182,7 +242,7 @@ func TestHandleRelayForward_Rejects(t *testing.T) {
 	goodKnock := encryptInnerForRelay(t, agentDev, serverPk, core.NHP_KNK, 1, &common.AgentKnockMsg{
 		HeaderType: core.NHP_KNK, UserId: "u", AuthServiceId: "asp", ResourceId: "res",
 	})
-	nonKnock := encryptInnerForRelay(t, agentDev, serverPk, core.NHP_LST, 2, &common.AgentListMsg{})
+	nonRelayable := encryptInnerForRelay(t, agentDev, serverPk, core.NHP_DAR, 2, map[string]any{})
 
 	pubSource := &common.NetAddress{Ip: "203.0.113.7", Port: 44444}
 
@@ -194,27 +254,27 @@ func TestHandleRelayForward_Rejects(t *testing.T) {
 		{
 			name:      "unregistered relay peer",
 			senderPub: otherPub, // not in relayPeerMap
-			rlyMsg:    &common.RelayForwardMsg{SourceAddr: pubSource, InnerPacket: base64.StdEncoding.EncodeToString(goodKnock)},
+			rlyMsg:    &common.RelayForwardMsg{SourceAddr: pubSource, InnerPacket: base64.StdEncoding.EncodeToString(goodKnock), RequestID: testRelayRequestID},
 		},
 		{
 			name:      "private source address",
 			senderPub: relayPub,
-			rlyMsg:    &common.RelayForwardMsg{SourceAddr: &common.NetAddress{Ip: "192.168.1.5", Port: 443}, InnerPacket: base64.StdEncoding.EncodeToString(goodKnock)},
+			rlyMsg:    &common.RelayForwardMsg{SourceAddr: &common.NetAddress{Ip: "192.168.1.5", Port: 443}, InnerPacket: base64.StdEncoding.EncodeToString(goodKnock), RequestID: testRelayRequestID},
 		},
 		{
 			name:      "nil source address",
 			senderPub: relayPub,
-			rlyMsg:    &common.RelayForwardMsg{SourceAddr: nil, InnerPacket: base64.StdEncoding.EncodeToString(goodKnock)},
+			rlyMsg:    &common.RelayForwardMsg{SourceAddr: nil, InnerPacket: base64.StdEncoding.EncodeToString(goodKnock), RequestID: testRelayRequestID},
 		},
 		{
 			name:      "malformed inner packet",
 			senderPub: relayPub,
-			rlyMsg:    &common.RelayForwardMsg{SourceAddr: pubSource, InnerPacket: "!!!not-base64!!!"},
+			rlyMsg:    &common.RelayForwardMsg{SourceAddr: pubSource, InnerPacket: "!!!not-base64!!!", RequestID: testRelayRequestID},
 		},
 		{
-			name:      "non-knock inner type",
+			name:      "non-relayable inner type",
 			senderPub: relayPub,
-			rlyMsg:    &common.RelayForwardMsg{SourceAddr: pubSource, InnerPacket: base64.StdEncoding.EncodeToString(nonKnock)},
+			rlyMsg:    &common.RelayForwardMsg{SourceAddr: pubSource, InnerPacket: base64.StdEncoding.EncodeToString(nonRelayable), RequestID: testRelayRequestID},
 		},
 	}
 
@@ -297,35 +357,37 @@ func TestHandleRelayForward_RoundTripDeliversAgentAckToRelay(t *testing.T) {
 	})
 	innerKnock := drainEncryptedPacket(t, agentConn)
 
-	relayPub := relayTestPubKey()
-	relayPubB64 := base64.StdEncoding.EncodeToString(relayPub)
+	rlyBytes, err := json.Marshal(&common.RelayForwardMsg{
+		SourceAddr:  &common.NetAddress{Ip: "203.0.113.7", Port: 44444},
+		InnerPacket: base64.StdEncoding.EncodeToString(innerKnock),
+		RequestID:   testRelayRequestID,
+	})
+	if err != nil {
+		t.Fatalf("marshal RelayForwardMsg: %v", err)
+	}
+	outerPpd, relayDev, relayConn := realOuterRelayRequest(t, serverDev, serverListen.LocalAddr().(*net.UDPAddr), relayAddr, rlyBytes)
+	relayPubB64 := base64.StdEncoding.EncodeToString(outerPpd.RemotePubKey)
 	mp := metrics.NewPublisherForTest(t)
 	s := &UdpServer{
 		device:                       serverDev,
 		metrics:                      mp,
 		relayPeerMap:                 map[string]*core.UdpPeer{relayPubB64: {PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}},
-		knockHeaderTypeVerifyRequire: true, // strict gate -> the mismatch is rejected
+		knockHeaderTypeVerifyRequire: true,
 		listenConn:                   serverListen,
-	}
-
-	rlyBytes, err := json.Marshal(&common.RelayForwardMsg{
-		SourceAddr:  &common.NetAddress{Ip: "203.0.113.7", Port: 44444},
-		InnerPacket: base64.StdEncoding.EncodeToString(innerKnock),
-	})
-	if err != nil {
-		t.Fatalf("marshal RelayForwardMsg: %v", err)
-	}
-	outerPpd := &core.PacketParserData{
-		HeaderType:   core.NHP_RLY,
-		RemotePubKey: relayPub,
-		ConnData:     &core.ConnectionData{RemoteAddr: relayAddr},
-		BodyMessage:  rlyBytes,
 	}
 
 	s.HandleRelayForward(outerPpd)
 
 	// The ack must arrive at the RELAY's address (not the client's).
-	ackBytes := readUDPWithTimeout(t, relayListen, 5*time.Second)
+	outerReturnBytes := readUDPWithTimeout(t, relayListen, 5*time.Second)
+	returned := decryptRelayReturnForTest(t, relayDev, relayConn, outerReturnBytes)
+	if returned.RequestID != testRelayRequestID {
+		t.Fatalf("return request ID = %q, want %q", returned.RequestID, testRelayRequestID)
+	}
+	ackBytes, err := base64.StdEncoding.DecodeString(returned.InnerPacket)
+	if err != nil {
+		t.Fatalf("decode returned inner ACK: %v", err)
+	}
 
 	// And the AGENT must be able to decrypt it via its original knock transaction.
 	routeResponseToTransaction(t, agentDev, ackBytes)
@@ -371,9 +433,216 @@ func TestHandleRelayForward_RoundTripDeliversAgentAckToRelay(t *testing.T) {
 	}
 }
 
+func TestSendRelayReturnCarriesMaximumInnerPacket(t *testing.T) {
+	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableRelayPeerValidation: true})
+	serverListen := mustUDPListener(t)
+	relayListen := mustUDPListener(t)
+	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
+	body, err := json.Marshal(&common.RelayForwardMsg{
+		SourceAddr:  &common.NetAddress{Ip: "203.0.113.7", Port: 44444},
+		InnerPacket: base64.StdEncoding.EncodeToString([]byte("request")),
+		RequestID:   testRelayRequestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerPpd, relayDev, relayConn := realOuterRelayRequest(
+		t, serverDev, serverListen.LocalAddr().(*net.UDPAddr), relayAddr, body,
+	)
+	s := &UdpServer{device: serverDev, listenConn: serverListen}
+	inner := make([]byte, core.PacketBufferSize)
+	for i := range inner {
+		inner[i] = byte(i)
+	}
+	if err := s.sendRelayReturn(outerPpd, testRelayRequestID, inner); err != nil {
+		t.Fatalf("send maximum relay return: %v", err)
+	}
+	outerBytes := readUDPWithTimeout(t, relayListen, 5*time.Second)
+	if len(outerBytes) != 5772 {
+		t.Fatalf("maximum relay return = %d bytes, want 5772", len(outerBytes))
+	}
+	returned := decryptRelayReturnForTest(t, relayDev, relayConn, outerBytes)
+	decoded, err := base64.StdEncoding.DecodeString(returned.InnerPacket)
+	if err != nil {
+		t.Fatalf("decode maximum returned inner packet: %v", err)
+	}
+	if !bytes.Equal(decoded, inner) {
+		t.Fatal("maximum inner packet changed in server relay return")
+	}
+}
+
+// An overloaded server must admit the authenticated outer NHP_RLY envelope,
+// issue the normal end-to-end encrypted COK for its inner KNK, and return that
+// opaque packet in a request-correlated RelayReturnMsg. This is the production
+// handler path, not a hand-built return envelope.
+func TestHandleRelayForward_OverloadCookieRoundTrip(t *testing.T) {
+	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableAgentPeerValidation: true})
+	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
+	serverPk := decodeBase64PubKey(serverDev.PublicKeyBase64())
+
+	serverListen := mustUDPListener(t)
+	relayListen := mustUDPListener(t)
+	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
+	agentToServerAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206}
+	agentDev.AddPeer(&core.UdpPeer{
+		PubKeyBase64: serverDev.PublicKeyBase64(),
+		Ip:           agentToServerAddr.IP.String(),
+		Port:         agentToServerAddr.Port,
+		Type:         core.NHP_SERVER,
+	})
+
+	const innerTrx = uint64(515151)
+	agentConn := newSpikeConn(agentDev, agentToServerAddr)
+	knockBody, err := json.Marshal(&common.AgentKnockMsg{
+		HeaderType: core.NHP_KNK, UserId: "overload-user", AuthServiceId: "asp", ResourceId: "res",
+	})
+	if err != nil {
+		t.Fatalf("marshal knock body: %v", err)
+	}
+	agentDev.SendMsgToPacket(&core.MsgData{
+		ConnData:      agentConn,
+		PeerPk:        serverPk,
+		HeaderType:    core.NHP_KNK,
+		TransactionId: innerTrx,
+		Message:       knockBody,
+	})
+	innerKnock := drainEncryptedPacket(t, agentConn)
+
+	rlyBytes, err := json.Marshal(&common.RelayForwardMsg{
+		SourceAddr:  &common.NetAddress{Ip: "203.0.113.7", Port: 44444},
+		InnerPacket: base64.StdEncoding.EncodeToString(innerKnock),
+		RequestID:   testRelayRequestID,
+	})
+	if err != nil {
+		t.Fatalf("marshal RelayForwardMsg: %v", err)
+	}
+
+	// Decrypt the real outer envelope first, exactly as the UDP receive loop
+	// does before dispatch. The core allowlist assertion separately fences that
+	// NHP_RLY reaches this point when overload is already active.
+	outerPpd, relayDev, relayConn := realOuterRelayRequest(t, serverDev, serverListen.LocalAddr().(*net.UDPAddr), relayAddr, rlyBytes)
+	relayPubB64 := base64.StdEncoding.EncodeToString(outerPpd.RemotePubKey)
+	mp := metrics.NewPublisherForTest(t)
+	s := &UdpServer{
+		device:       serverDev,
+		metrics:      mp,
+		relayPeerMap: map[string]*core.UdpPeer{relayPubB64: {PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}},
+		listenConn:   serverListen,
+	}
+
+	serverDev.SetOverload(true)
+	defer serverDev.SetOverload(false)
+	s.HandleRelayForward(outerPpd)
+
+	outerReturnBytes := readUDPWithTimeout(t, relayListen, 5*time.Second)
+	returned := decryptRelayReturnForTest(t, relayDev, relayConn, outerReturnBytes)
+	if returned.RequestID != testRelayRequestID {
+		t.Fatalf("return request ID = %q, want %q", returned.RequestID, testRelayRequestID)
+	}
+	cokBytes, err := base64.StdEncoding.DecodeString(returned.InnerPacket)
+	if err != nil {
+		t.Fatalf("decode returned inner COK: %v", err)
+	}
+	agentPpd, err := agentDev.PacketToMsg(&core.PacketData{
+		BasePacket: &core.Packet{Content: cokBytes},
+		ConnData:   agentConn,
+		InitTime:   time.Now().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("agent failed to decrypt relayed COK: %v", err)
+	}
+	if agentPpd == nil || agentPpd.HeaderType != core.NHP_COK {
+		t.Fatalf("agent decrypted packet = %#v, want NHP_COK", agentPpd)
+	}
+	if agentPpd.SenderTrxId != innerTrx {
+		t.Errorf("COK counter = %d, want inner knock counter %d", agentPpd.SenderTrxId, innerTrx)
+	}
+	var cok common.ServerCookieMsg
+	if err := json.Unmarshal(agentPpd.BodyMessage, &cok); err != nil {
+		t.Fatalf("unmarshal decrypted COK: %v", err)
+	}
+	if cok.TransactionId != innerTrx {
+		t.Errorf("COK payload transaction ID = %d, want %d", cok.TransactionId, innerTrx)
+	}
+	rawCookie, err := base64.StdEncoding.DecodeString(cok.Cookie)
+	if err != nil {
+		t.Fatalf("decode COK cookie: %v", err)
+	}
+	if len(rawCookie) != core.CookieSize {
+		t.Errorf("cookie length = %d, want %d", len(rawCookie), core.CookieSize)
+	}
+
+	counters, _ := mp.CountersForTest(t)
+	if got := counters[MetricRelayForward]; got != 1 {
+		t.Errorf("MetricRelayForward = %v, want 1", got)
+	}
+	if got := counters[MetricRelayForwardReject]; got != 0 {
+		t.Errorf("MetricRelayForwardReject = %v, want 0", got)
+	}
+}
+
 // ============================================================================
 // test helpers
 // ============================================================================
+
+func realOuterRelayRequest(t *testing.T, serverDev *core.Device, serverAddr, relayAddr *net.UDPAddr, body []byte) (*core.PacketParserData, *core.Device, *core.ConnectionData) {
+	t.Helper()
+	relayDev := newSpikeDevice(t, core.NHP_RELAY, 0x55, &core.DeviceOptions{DisableServerPeerValidation: false})
+	relayPub := decodeBase64PubKey(relayDev.PublicKeyBase64())
+	serverPub := decodeBase64PubKey(serverDev.PublicKeyBase64())
+
+	serverDev.AddPeer(&core.UdpPeer{PubKeyBase64: relayDev.PublicKeyBase64(), Ip: relayAddr.IP.String(), Port: relayAddr.Port, Type: core.NHP_RELAY})
+	relayDev.AddPeer(&core.UdpPeer{PubKeyBase64: serverDev.PublicKeyBase64(), Ip: serverAddr.IP.String(), Port: serverAddr.Port, Type: core.NHP_SERVER})
+
+	relayConn := newSpikeConn(relayDev, serverAddr)
+	relayDev.SendMsgToPacket(&core.MsgData{
+		ConnData:      relayConn,
+		PeerPk:        serverPub,
+		HeaderType:    core.NHP_RLY,
+		TransactionId: 991122,
+		Message:       body,
+	})
+	outerBytes := drainEncryptedPacket(t, relayConn)
+	serverConn := newSpikeConn(serverDev, relayAddr)
+	outerPpd, err := serverDev.PacketToMsg(&core.PacketData{
+		BasePacket: &core.Packet{Content: outerBytes},
+		ConnData:   serverConn,
+		InitTime:   time.Now().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("decrypt real outer NHP_RLY: %v", err)
+	}
+	if outerPpd == nil || outerPpd.HeaderType != core.NHP_RLY {
+		t.Fatalf("real outer packet = %#v, want NHP_RLY", outerPpd)
+	}
+	if got := base64.StdEncoding.EncodeToString(outerPpd.RemotePubKey); got != base64.StdEncoding.EncodeToString(relayPub) {
+		t.Fatalf("outer relay pubkey = %q, want %q", got, relayDev.PublicKeyBase64())
+	}
+	return outerPpd, relayDev, relayConn
+}
+
+func decryptRelayReturnForTest(t *testing.T, relayDev *core.Device, relayConn *core.ConnectionData, outerBytes []byte) common.RelayReturnMsg {
+	t.Helper()
+	ppd, err := relayDev.PacketToMsg(&core.PacketData{
+		BasePacket: &core.Packet{Content: outerBytes},
+		ConnData:   relayConn,
+		InitTime:   time.Now().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("relay failed to decrypt outer return: %v", err)
+	}
+	if ppd == nil || ppd.Error != nil {
+		t.Fatalf("relay outer return parser data = %#v", ppd)
+	}
+	if ppd.HeaderType != core.NHP_ACK {
+		t.Fatalf("outer return type = %s, want NHP-ACK", core.HeaderTypeToString(ppd.HeaderType))
+	}
+	var returned common.RelayReturnMsg
+	if err := json.Unmarshal(ppd.BodyMessage, &returned); err != nil {
+		t.Fatalf("unmarshal RelayReturnMsg: %v", err)
+	}
+	return returned
+}
 
 // relayTestPubKey returns a deterministic 32-byte relay public key.
 func relayTestPubKey() []byte {

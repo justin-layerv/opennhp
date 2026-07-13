@@ -2321,6 +2321,17 @@ variable "deploy_relay" {
   default     = false
 }
 
+variable "relay_vpc_cidr" {
+  description = "Dedicated relay DMZ VPC CIDR."
+  type        = string
+  default     = "10.101.0.0/16"
+
+  validation {
+    condition     = can(cidrnetmask(var.relay_vpc_cidr)) && cidrnetmask(var.relay_vpc_cidr) == "255.255.0.0"
+    error_message = "relay_vpc_cidr must be a valid IPv4 /16 CIDR."
+  }
+}
+
 # Keep canonical-key and ordering rules in lockstep with terraform/variables.tf,
 # the prod wrapper, and modules/compute/variables.tf.
 variable "relay_additional_trusted_public_keys_b64" {
@@ -2340,16 +2351,6 @@ variable "relay_additional_trusted_public_keys_b64" {
     condition     = var.relay_additional_trusted_public_keys_b64 == sort(distinct(var.relay_additional_trusted_public_keys_b64))
     error_message = "relay_additional_trusted_public_keys_b64 must already be sorted and duplicate-free."
   }
-}
-
-# #2208 phase #8 / #2628: take nhp-server private (remove the public knock NLB;
-# repoint the in-VPC AC + qurl-service to the internal relay NLB). Forwarded to
-# module.nhp; the module enforces deploy_relay + qurl_link_js_agent_enabled.
-# Sandbox sets this true in terraform.tfvars as the soak.
-variable "take_server_private" {
-  description = "Take nhp-server off the public internet — remove the public UDP 62206 NLB and repoint the AC + qurl-service to the internal relay NLB. Requires deploy_relay=true and qurl_link_js_agent_enabled=true. Default false."
-  type        = bool
-  default     = false
 }
 
 variable "relay_dns_name" {

@@ -55,8 +55,8 @@ type healthCheckItem struct {
 // health behind auth; this is the canary that surfaces it immediately).
 func TestHealthLive_Returns200(t *testing.T) {
 	// /health/* lives on the nhp-server HTTP surface at NHPServerBaseURL.
-	// Envs running the JS-agent + relay topology take nhp-server private
-	// (no public resolve.qurl.link), so this fence skips there and runs
+	// JS-agent environments remove the legacy public resolve.qurl.link HTTPS
+	// surface (while retaining public NHP UDP), so this fence skips there and runs
 	// where the surface is live (prod + the localhost stack). The relay's
 	// own /health/live is ALB-internal-only and not a substitute.
 	skipIfResolveEndpointDisabled(t)

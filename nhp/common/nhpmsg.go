@@ -458,21 +458,31 @@ type ServerForwardResultMsg struct {
 }
 
 // RelayForwardMsg is the AEAD body of an NHP_RLY packet (relay -> private
-// server), ported verbatim from OpenNHP upstream (#2208). The relay wraps a
+// server), derived from OpenNHP upstream (#2208). The relay wraps a
 // browser-originated, end-to-end-encrypted NHP packet (opaque to the relay) in
 // InnerPacket and stamps SourceAddr -- the client address the relay observed at
 // its TLS/TCP edge. SourceAddr is the sole trusted source of the AC pinhole IP
-// (AgentKnockMsg carries no source-IP field). There is no result message type:
-// the server replies with the normal NHP_ACK/NHP_COK, which the relay matches
-// back to the originating request by the inner packet's counter.
+// (AgentKnockMsg carries no source-IP field). RequestID is a relay-generated,
+// cryptographically random correlation ID. The server returns the opaque inner
+// reply inside RelayReturnMsg; counters are not a safe correlation key because
+// independent agents routinely reuse them.
 //
 // InnerPacket is a base64 string (not []byte) for parity with upstream and the
 // TypeScript js-agent, which exchange a pre-encoded base64 string. encoding/json
 // would base64 a []byte to a wire-identical value, but we keep the encoding
 // explicit -- do not "simplify" it to []byte.
 type RelayForwardMsg struct {
-	SourceAddr  *NetAddress `json:"srcAddr"`  // real client address (relay-observed)
-	InnerPacket string      `json:"innerPkt"` // base64-encoded inner NHP packet
+	SourceAddr  *NetAddress `json:"srcAddr"`   // real client address (relay-observed)
+	InnerPacket string      `json:"innerPkt"`  // base64-encoded inner NHP packet
+	RequestID   string      `json:"requestId"` // random relay correlation ID
+}
+
+// RelayReturnMsg is the authenticated server-to-relay envelope. InnerPacket is
+// still encrypted end-to-end for the originating agent; the relay validates and
+// consumes RequestID, then returns the opaque bytes to exactly one waiter.
+type RelayReturnMsg struct {
+	RequestID   string `json:"requestId"`
+	InnerPacket string `json:"innerPkt"`
 }
 
 // RedirectTarget represents an assigned server that the AC should connect to.

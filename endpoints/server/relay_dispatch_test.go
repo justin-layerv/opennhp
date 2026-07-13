@@ -31,12 +31,16 @@ import (
 // OTP/Register calls. RegisterAgent's return is scripted by regAck/regErr.
 type recordingRegOTPPlugin struct {
 	mockPluginHandler
-	otpCalls int
-	otpGot   *common.NhpOTPRequest
-	regCalls int
-	regGot   *common.NhpRegisterRequest
-	regAck   *common.ServerRegisterAckMsg
-	regErr   error
+	otpCalls  int
+	otpGot    *common.NhpOTPRequest
+	regCalls  int
+	regGot    *common.NhpRegisterRequest
+	regAck    *common.ServerRegisterAckMsg
+	regErr    error
+	listCalls int
+	listGot   *common.NhpListRequest
+	listAck   *common.ServerListResultMsg
+	listErr   error
 }
 
 func (p *recordingRegOTPPlugin) RequestOTP(req *common.NhpOTPRequest, _ *plugins.NhpServerPluginHelper) error {
@@ -49,6 +53,12 @@ func (p *recordingRegOTPPlugin) RegisterAgent(req *common.NhpRegisterRequest, _ 
 	p.regCalls++
 	p.regGot = req
 	return p.regAck, p.regErr
+}
+
+func (p *recordingRegOTPPlugin) ListService(req *common.NhpListRequest, _ *plugins.NhpServerPluginHelper) (*common.ServerListResultMsg, error) {
+	p.listCalls++
+	p.listGot = req
+	return p.listAck, p.listErr
 }
 
 // stubbedAgentPlugin models the N3-pending agent plugin: RequestOTP and
@@ -77,6 +87,7 @@ func buildRelayForwardOuterPpd(t *testing.T, relayPub []byte, relayAddr *net.UDP
 	rlyBytes, err := json.Marshal(&common.RelayForwardMsg{
 		SourceAddr:  &common.NetAddress{Ip: "203.0.113.7", Port: 44444},
 		InnerPacket: base64.StdEncoding.EncodeToString(innerPacket),
+		RequestID:   testRelayRequestID,
 	})
 	if err != nil {
 		t.Fatalf("marshal RelayForwardMsg: %v", err)
@@ -87,6 +98,43 @@ func buildRelayForwardOuterPpd(t *testing.T, relayPub []byte, relayAddr *net.UDP
 		ConnData:     &core.ConnectionData{RemoteAddr: relayAddr},
 		BodyMessage:  rlyBytes,
 	}
+}
+
+// buildRealRelayForwardOuterPpd drives a genuine relay->server NHP_RLY Noise
+// exchange so response tests also exercise the authenticated RelayReturnMsg
+// envelope. There is intentionally no empty-request-ID or raw-inner fallback.
+func buildRealRelayForwardOuterPpd(t *testing.T, s *UdpServer, relayAddr *net.UDPAddr, innerPacket []byte, src *common.NetAddress) (*core.PacketParserData, *core.Device, *core.ConnectionData) {
+	t.Helper()
+	if src == nil {
+		src = &common.NetAddress{Ip: "203.0.113.7", Port: 44444}
+	}
+	rlyBytes, err := json.Marshal(&common.RelayForwardMsg{
+		SourceAddr:  src,
+		InnerPacket: base64.StdEncoding.EncodeToString(innerPacket),
+		RequestID:   testRelayRequestID,
+	})
+	if err != nil {
+		t.Fatalf("marshal RelayForwardMsg: %v", err)
+	}
+	serverAddr := s.listenConn.LocalAddr().(*net.UDPAddr)
+	outerPpd, relayDev, relayConn := realOuterRelayRequest(t, s.device, serverAddr, relayAddr, rlyBytes)
+	relayPubB64 := base64.StdEncoding.EncodeToString(outerPpd.RemotePubKey)
+	s.relayPeerMap[relayPubB64] = &core.UdpPeer{PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}
+	return outerPpd, relayDev, relayConn
+}
+
+func readRealRelayInnerReturn(t *testing.T, relayListen *net.UDPConn, relayDev *core.Device, relayConn *core.ConnectionData, timeout time.Duration) []byte {
+	t.Helper()
+	outerBytes := readUDPWithTimeout(t, relayListen, timeout)
+	returned := decryptRelayReturnForTest(t, relayDev, relayConn, outerBytes)
+	if returned.RequestID != testRelayRequestID {
+		t.Fatalf("RelayReturn request ID = %q, want %q", returned.RequestID, testRelayRequestID)
+	}
+	inner, err := base64.StdEncoding.DecodeString(returned.InnerPacket)
+	if err != nil {
+		t.Fatalf("decode RelayReturn inner packet: %v", err)
+	}
+	return inner
 }
 
 // ============================================================================
@@ -275,14 +323,15 @@ func TestHandleRelayForward_InnerREG_DeliversCounterCorrelatedRAK(t *testing.T) 
 		pluginHandlerMap: map[string]plugins.PluginHandler{aspID: plugin},
 	}
 
-	s.HandleRelayForward(buildRelayForwardOuterPpd(t, relayPub, relayAddr, innerREG))
+	outerPpd, relayDev, relayConn := buildRealRelayForwardOuterPpd(t, s, relayAddr, innerREG, nil)
+	s.HandleRelayForward(outerPpd)
 
 	if plugin.regCalls != 1 {
 		t.Fatalf("plugin RegisterAgent called %d times, want 1", plugin.regCalls)
 	}
 
 	// The RAK must arrive at the RELAY's address and decrypt on the agent's txn.
-	rakBytes := readUDPWithTimeout(t, relayListen, 5*time.Second)
+	rakBytes := readRealRelayInnerReturn(t, relayListen, relayDev, relayConn, 5*time.Second)
 	routeResponseToTransaction(t, agentDev, rakBytes)
 	select {
 	case serverPpd := <-respCh:
@@ -364,9 +413,10 @@ func TestHandleRelayForward_InnerREG_StubbedPluginFailsClosed(t *testing.T) {
 		pluginHandlerMap: map[string]plugins.PluginHandler{aspID: &stubbedAgentPlugin{}},
 	}
 
-	s.HandleRelayForward(buildRelayForwardOuterPpd(t, relayPub, relayAddr, innerREG))
+	outerPpd, relayDev, relayConn := buildRealRelayForwardOuterPpd(t, s, relayAddr, innerREG, nil)
+	s.HandleRelayForward(outerPpd)
 
-	rakBytes := readUDPWithTimeout(t, relayListen, 5*time.Second)
+	rakBytes := readRealRelayInnerReturn(t, relayListen, relayDev, relayConn, 5*time.Second)
 	routeResponseToTransaction(t, agentDev, rakBytes)
 	select {
 	case serverPpd := <-respCh:
@@ -495,9 +545,10 @@ func TestHandleRelayForward_InnerREG_RealAgentPluginE2E(t *testing.T) {
 			pluginHandlerMap: map[string]plugins.PluginHandler{aspID: realAgent},
 		}
 
-		s.HandleRelayForward(buildRelayForwardOuterPpd(t, relayPub, relayAddr, innerREG))
+		outerPpd, relayDev, relayConn := buildRealRelayForwardOuterPpd(t, s, relayAddr, innerREG, nil)
+		s.HandleRelayForward(outerPpd)
 
-		rakBytes := readUDPWithTimeout(t, relayListen, 5*time.Second)
+		rakBytes := readRealRelayInnerReturn(t, relayListen, relayDev, relayConn, 5*time.Second)
 		routeResponseToTransaction(t, agentDev, rakBytes)
 		select {
 		case serverPpd := <-respCh:
@@ -577,6 +628,188 @@ func TestHandleRelayForward_InnerREG_RealAgentPluginE2E(t *testing.T) {
 	})
 }
 
+func TestHandleRelayForward_InnerLST_ReturnsAuthenticatedLRT(t *testing.T) {
+	const aspID = "asp-list-relay"
+	const innerTrx = uint64(161616)
+	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableAgentPeerValidation: true})
+	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
+	serverPk := decodeBase64PubKey(serverDev.PublicKeyBase64())
+	serverListen := mustUDPListener(t)
+	relayListen := mustUDPListener(t)
+	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
+	agentToServerAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206}
+	agentDev.AddPeer(&core.UdpPeer{PubKeyBase64: serverDev.PublicKeyBase64(), Ip: agentToServerAddr.IP.String(), Port: agentToServerAddr.Port, Type: core.NHP_SERVER})
+
+	respCh := make(chan *core.PacketParserData, 1)
+	agentConn := newSpikeConn(agentDev, agentToServerAddr)
+	body, err := json.Marshal(&common.AgentListMsg{UserId: "list-user", DeviceId: "dev", AuthServiceId: aspID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentDev.SendMsgToPacket(&core.MsgData{
+		ConnData: agentConn, PeerPk: serverPk, HeaderType: core.NHP_LST,
+		TransactionId: innerTrx, Message: body, ResponseMsgCh: respCh,
+	})
+	innerLST := drainEncryptedPacket(t, agentConn)
+
+	relayPub := relayTestPubKey()
+	relayPubB64 := base64.StdEncoding.EncodeToString(relayPub)
+	plugin := &recordingRegOTPPlugin{listAck: &common.ServerListResultMsg{
+		ErrCode: common.ErrSuccess.ErrorCode(), ListResults: map[string]any{"resource": "allowed"},
+	}}
+	s := &UdpServer{
+		device: serverDev, metrics: metrics.NewPublisherForTest(t), listenConn: serverListen,
+		relayPeerMap:     map[string]*core.UdpPeer{relayPubB64: {PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}},
+		pluginHandlerMap: map[string]plugins.PluginHandler{aspID: plugin},
+	}
+	outerPpd, relayDev, relayConn := buildRealRelayForwardOuterPpd(t, s, relayAddr, innerLST, nil)
+	s.HandleRelayForward(outerPpd)
+	innerLRT := readRealRelayInnerReturn(t, relayListen, relayDev, relayConn, 5*time.Second)
+	routeResponseToTransaction(t, agentDev, innerLRT)
+
+	select {
+	case ppd := <-respCh:
+		if ppd.Error != nil {
+			t.Fatalf("agent failed to decrypt relayed LRT: %v", ppd.Error)
+		}
+		if ppd.HeaderType != core.NHP_LRT || ppd.SenderTrxId != innerTrx {
+			t.Fatalf("LRT header/counter = %s/%d, want NHP-LRT/%d", core.HeaderTypeToString(ppd.HeaderType), ppd.SenderTrxId, innerTrx)
+		}
+		var lrt common.ServerListResultMsg
+		if err := json.Unmarshal(ppd.BodyMessage, &lrt); err != nil {
+			t.Fatal(err)
+		}
+		if lrt.ErrCode != common.ErrSuccess.ErrorCode() || lrt.ListResults["resource"] != "allowed" {
+			t.Fatalf("LRT = %#v, want successful list result", lrt)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent never received relayed LRT")
+	}
+	if plugin.listCalls != 1 || plugin.listGot == nil || plugin.listGot.PublicKey != agentDev.PublicKeyBase64() {
+		t.Fatalf("ListService calls/request = %d/%#v, want one authenticated request", plugin.listCalls, plugin.listGot)
+	}
+}
+
+func TestHandleRelayForward_InnerLST_PluginErrorReturnsFailClosedLRT(t *testing.T) {
+	const aspID = "asp-list-relay-error"
+	const innerTrx = uint64(161617)
+	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableAgentPeerValidation: true})
+	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
+	serverPk := decodeBase64PubKey(serverDev.PublicKeyBase64())
+	serverListen := mustUDPListener(t)
+	relayListen := mustUDPListener(t)
+	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
+	agentToServerAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206}
+	agentDev.AddPeer(&core.UdpPeer{PubKeyBase64: serverDev.PublicKeyBase64(), Ip: agentToServerAddr.IP.String(), Port: agentToServerAddr.Port, Type: core.NHP_SERVER})
+
+	respCh := make(chan *core.PacketParserData, 1)
+	agentConn := newSpikeConn(agentDev, agentToServerAddr)
+	body, err := json.Marshal(&common.AgentListMsg{UserId: "list-user", DeviceId: "dev", AuthServiceId: aspID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentDev.SendMsgToPacket(&core.MsgData{
+		ConnData: agentConn, PeerPk: serverPk, HeaderType: core.NHP_LST,
+		TransactionId: innerTrx, Message: body, ResponseMsgCh: respCh,
+	})
+	innerLST := drainEncryptedPacket(t, agentConn)
+
+	relayPub := relayTestPubKey()
+	relayPubB64 := base64.StdEncoding.EncodeToString(relayPub)
+	plugin := &recordingRegOTPPlugin{listErr: plugins.ErrPluginNotRegistered}
+	s := &UdpServer{
+		device: serverDev, metrics: metrics.NewPublisherForTest(t), listenConn: serverListen,
+		relayPeerMap:     map[string]*core.UdpPeer{relayPubB64: {PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}},
+		pluginHandlerMap: map[string]plugins.PluginHandler{aspID: plugin},
+	}
+	outerPpd, relayDev, relayConn := buildRealRelayForwardOuterPpd(t, s, relayAddr, innerLST, nil)
+	s.HandleRelayForward(outerPpd)
+	innerLRT := readRealRelayInnerReturn(t, relayListen, relayDev, relayConn, 5*time.Second)
+	routeResponseToTransaction(t, agentDev, innerLRT)
+
+	select {
+	case ppd := <-respCh:
+		if ppd.Error != nil {
+			t.Fatalf("agent failed to decrypt fail-closed relayed LRT: %v", ppd.Error)
+		}
+		if ppd.HeaderType != core.NHP_LRT || ppd.SenderTrxId != innerTrx {
+			t.Fatalf("LRT header/counter = %s/%d, want NHP-LRT/%d", core.HeaderTypeToString(ppd.HeaderType), ppd.SenderTrxId, innerTrx)
+		}
+		if string(ppd.BodyMessage) == "null" {
+			t.Fatal("relayed plugin failure returned a JSON null LRT")
+		}
+		var lrt common.ServerListResultMsg
+		if err := json.Unmarshal(ppd.BodyMessage, &lrt); err != nil {
+			t.Fatal(err)
+		}
+		if lrt.ErrCode != common.ErrAuthHandlerNotFound.ErrorCode() || common.IsSuccessErrCode(lrt.ErrCode) {
+			t.Fatalf("LRT = %#v, want fail-closed auth-handler-unavailable verdict", lrt)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent never received fail-closed relayed LRT")
+	}
+	if plugin.listCalls != 1 {
+		t.Fatalf("ListService calls = %d, want 1", plugin.listCalls)
+	}
+}
+
+func TestHandleRelayForward_InnerDHPKnock_ReturnsAuthenticatedACK(t *testing.T) {
+	const innerTrx = uint64(171717)
+	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableAgentPeerValidation: true})
+	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
+	serverPk := decodeBase64PubKey(serverDev.PublicKeyBase64())
+	serverListen := mustUDPListener(t)
+	relayListen := mustUDPListener(t)
+	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
+	agentToServerAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206}
+	agentDev.AddPeer(&core.UdpPeer{PubKeyBase64: serverDev.PublicKeyBase64(), Ip: agentToServerAddr.IP.String(), Port: agentToServerAddr.Port, Type: core.NHP_SERVER})
+
+	respCh := make(chan *core.PacketParserData, 1)
+	agentConn := newSpikeConn(agentDev, agentToServerAddr)
+	body, err := json.Marshal(&common.DHPKnockMsg{UserId: "dhp-user", DeviceId: "dev", Evidence: "not-valid-evidence"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentDev.SendMsgToPacket(&core.MsgData{
+		ConnData: agentConn, PeerPk: serverPk, HeaderType: core.DHP_KNK,
+		TransactionId: innerTrx, Message: body, ResponseMsgCh: respCh,
+	})
+	innerDHP := drainEncryptedPacket(t, agentConn)
+
+	relayPub := relayTestPubKey()
+	relayPubB64 := base64.StdEncoding.EncodeToString(relayPub)
+	s := &UdpServer{
+		device: serverDev, metrics: metrics.NewPublisherForTest(t), listenConn: serverListen,
+		relayPeerMap: map[string]*core.UdpPeer{relayPubB64: {PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}},
+	}
+	// DHP appraises evidence but opens no AC pinhole, so its source needs only
+	// syntactic validation, matching direct DHP semantics.
+	privateSrc := &common.NetAddress{Ip: "127.0.0.1", Port: 44444}
+	outerPpd, relayDev, relayConn := buildRealRelayForwardOuterPpd(t, s, relayAddr, innerDHP, privateSrc)
+	s.HandleRelayForward(outerPpd)
+	innerACK := readRealRelayInnerReturn(t, relayListen, relayDev, relayConn, 5*time.Second)
+	routeResponseToTransaction(t, agentDev, innerACK)
+
+	select {
+	case ppd := <-respCh:
+		if ppd.Error != nil {
+			t.Fatalf("agent failed to decrypt relayed DHP ACK: %v", ppd.Error)
+		}
+		if ppd.HeaderType != core.NHP_ACK || ppd.SenderTrxId != innerTrx {
+			t.Fatalf("DHP ACK header/counter = %s/%d, want NHP-ACK/%d", core.HeaderTypeToString(ppd.HeaderType), ppd.SenderTrxId, innerTrx)
+		}
+		var ack common.ServerDHPKnockAckMsg
+		if err := json.Unmarshal(ppd.BodyMessage, &ack); err != nil {
+			t.Fatal(err)
+		}
+		if ack.ErrCode != common.ErrEvidenceAppraisalFailed.ErrorCode() {
+			t.Fatalf("DHP ACK ErrCode = %q, want evidence-appraisal failure %q", ack.ErrCode, common.ErrEvidenceAppraisalFailed.ErrorCode())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent never received relayed DHP ACK")
+	}
+}
+
 // ============================================================================
 // TYPE-DEPENDENT SOURCE-ADDRESS GATE: OTP/REG accept a private/loopback relay
 // source (they open no AC pinhole; SourceAddr is only informational), while KNK
@@ -589,7 +822,9 @@ func TestHandleRelayForward_InnerREG_RealAgentPluginE2E(t *testing.T) {
 // SourceAddr (so a test can supply a private/loopback source).
 func buildRelayForwardOuterPpdSrc(t *testing.T, relayPub []byte, relayAddr *net.UDPAddr, innerPacket []byte, src *common.NetAddress) *core.PacketParserData {
 	t.Helper()
-	rlyBytes, err := json.Marshal(&common.RelayForwardMsg{SourceAddr: src, InnerPacket: base64.StdEncoding.EncodeToString(innerPacket)})
+	rlyBytes, err := json.Marshal(&common.RelayForwardMsg{
+		SourceAddr: src, InnerPacket: base64.StdEncoding.EncodeToString(innerPacket), RequestID: testRelayRequestID,
+	})
 	if err != nil {
 		t.Fatalf("marshal RelayForwardMsg: %v", err)
 	}
@@ -646,19 +881,19 @@ func TestHandleRelayForward_PrivateSource_RegistrationAcceptedKnockRejected(t *t
 
 	t.Run("REG from private source is accepted (RAK produced)", func(t *testing.T) {
 		plugin := &recordingRegOTPPlugin{regAck: &common.ServerRegisterAckMsg{ErrCode: common.ErrSuccess.ErrorCode(), AuthServiceId: aspID}}
-		s, serverDev, relayPub, relayListen, relayAddr, mp := newServer(t, plugin)
+		s, serverDev, _, relayListen, relayAddr, mp := newServer(t, plugin)
 		serverPk := decodeBase64PubKey(serverDev.PublicKeyBase64())
 		agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
 		innerREG := encryptInnerForRelay(t, agentDev, serverPk, core.NHP_REG, 5002, &common.AgentRegisterMsg{UserId: "u", AuthServiceId: aspID})
 
-		s.HandleRelayForward(buildRelayForwardOuterPpdSrc(t, relayPub, relayAddr, innerREG, privateSrc))
+		outerPpd, relayDev, relayConn := buildRealRelayForwardOuterPpd(t, s, relayAddr, innerREG, privateSrc)
+		s.HandleRelayForward(outerPpd)
 
 		if plugin.regCalls != 1 {
 			t.Fatalf("REG from a private source: RegisterAgent called %d times, want 1 (a private source must be accepted on the REG path)", plugin.regCalls)
 		}
-		// A RAK must have been written toward the relay (registration replies);
-		// readUDPWithTimeout fails the test itself if nothing arrives.
-		_ = readUDPWithTimeout(t, relayListen, 3*time.Second)
+		// A RAK must arrive inside an authenticated, request-correlated return.
+		_ = readRealRelayInnerReturn(t, relayListen, relayDev, relayConn, 3*time.Second)
 		counters, _ := mp.CountersForTest(t)
 		if got := counters[MetricRelayForwardReject]; got != 0 {
 			t.Errorf("MetricRelayForwardReject = %v, want 0 (a private source must NOT be rejected on the REG path)", got)
@@ -705,6 +940,15 @@ func TestRegisterErrToCode(t *testing.T) {
 	// A *common.Error is used verbatim (its own code survives).
 	if got := registerErrToCode(common.ErrRegistrationRateLimited); got != common.ErrRegistrationRateLimited {
 		t.Errorf("registerErrToCode(*common.Error) = %v, want the same error verbatim", got.ErrorCode())
+	}
+}
+
+func TestListErrToCode(t *testing.T) {
+	if got := listErrToCode(plugins.ErrPluginNotRegistered); got != common.ErrAuthHandlerNotFound {
+		t.Errorf("listErrToCode(ErrPluginNotRegistered) = %v, want ErrAuthHandlerNotFound", got.ErrorCode())
+	}
+	if got := listErrToCode(common.ErrInvalidInput); got != common.ErrInvalidInput {
+		t.Errorf("listErrToCode(*common.Error) = %v, want the same error verbatim", got.ErrorCode())
 	}
 }
 

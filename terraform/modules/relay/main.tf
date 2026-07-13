@@ -2,14 +2,12 @@
 #
 # Stands up the internet-facing relay: an autoscaling fleet (one instance per AZ
 # baseline) behind an ALB that forwards a browser's opaque NHP knock to the
-# (private) cell server. The shared-keypair fleet authenticates by Noise pubkey +
-# relay.toml registration, not source IP (server DisableRelayPeerValidation; 5c).
-# Ships DARK — until 5c registers the relay's pubkey in the server's relay.toml,
-# every NHP_RLY is rejected at the server's Noise layer (the relay is not yet a
-# registered peer), so `POST /relay/{id}` returns 504. The relay boots,
-# `/health/live` is 200, and the ALB is internet-reachable, but it can't pivot
-# into the private network until 5c lights it up. See
-# docs/design/NHP_RELAY_TOPOLOGY.md.
+# cell's internal server endpoint. The shared-keypair fleet authenticates by
+# Noise pubkey + relay.toml registration, not source IP (server
+# DisableRelayPeerValidation).
+# PR0 publishes public-only relay trust to the server. Native UDP SDKs bypass
+# this browser relay and connect directly to their assigned cell's public NLB.
+# See docs/design/NHP_RELAY_TOPOLOGY.md.
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
@@ -18,8 +16,31 @@ data "aws_prefix_list" "s3" {
   name = "com.amazonaws.${data.aws_region.current.id}.s3"
 }
 
+resource "terraform_data" "network_ready" {
+  input = var.network_ready_token
+}
+
+# The relay and load-balancer SGs intentionally have no inline/default rules.
+# Collapse every mandatory standalone data/control-plane rule into one barrier
+# so the ASG cannot launch a one-shot bootstrap before its ECR, SSM, Secrets,
+# S3, health-check, or server-return paths exist.
+resource "terraform_data" "fleet_security_ready" {
+  input = aws_security_group.relay.id
+
+  depends_on = [
+    aws_vpc_security_group_ingress_rule.alb_https,
+    aws_vpc_security_group_egress_rule.alb_to_relay,
+    aws_vpc_security_group_ingress_rule.relay_http_from_alb,
+    aws_vpc_security_group_ingress_rule.relay_udp_ack_return,
+    aws_vpc_security_group_egress_rule.relay_to_nhp_udp,
+    aws_vpc_security_group_egress_rule.relay_to_vpc_endpoints_https,
+    aws_vpc_security_group_ingress_rule.vpc_endpoints_from_relay,
+    aws_vpc_security_group_egress_rule.relay_to_s3_https,
+  ]
+}
+
 # AMI: default to the SSM-published server AMI (Docker + awscli + the
-# systemd-resolved stub-disable fix the relay's startup CloudMap resolve needs).
+# systemd-resolved stub-disable fix used for the relay's internal-NLB lookup).
 # A stock Ubuntu AMI would crash-loop on `net.ResolveUDPAddr` against the
 # systemd-resolved stub — see variable.server_ami_id.
 data "aws_ssm_parameter" "server_ami" {
@@ -34,7 +55,7 @@ locals {
 
   nhp_server_udp_port = 62206
 
-  private_subnet_cidr_blocks = toset(var.private_subnet_cidr_blocks)
+  nhp_server_cidr_blocks = toset(var.nhp_server_cidr_blocks)
 
   tags = merge(var.tags, {
     Environment = var.environment

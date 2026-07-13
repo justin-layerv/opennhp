@@ -100,13 +100,9 @@ Parameters using this pattern:
 relay control-plane resources, relay networking, endpoint policies, IAM, or
 telemetry, inspect and update
 [`../.github/scripts/check-relay-dmz-plan.py`](../.github/scripts/check-relay-dmz-plan.py)
-and its mutation tests in the same PR. Until PR #3150 lands, that canonical
-path is a temporary dispatcher: the current contract remains inline, while the
-HTTPS-only contract and its mutation suite use the `-https.py` siblings. Keep
-the dispatcher, both contract suites, and the transition suite in lockstep. PR
-#3150 promotes the HTTPS-only checker back to the canonical path and activates
-it against the sandbox plan; partial contract overrides are intentionally
-rejected.
+and its mutation tests in the same PR. The canonical checker enforces the
+HTTPS-only relay contract and is active against the sandbox plan; partial
+contract overrides are intentionally rejected.
 
 **Relay active-color routing guardrail (#2658).** Blue/green server colors are
 deploy slots inside one relay cell, not separate relay cells. Do not create
@@ -152,22 +148,15 @@ accepts any `*.internal` host with a valid port rather than only
 `server.nhp.<env>.internal`; that preserves nonstandard module uses, but a typo
 can still pass validation and fail later at DNS/runtime.
 
-**`take_server_private` repoints the UDP knock endpoint, NOT this HTTP path
-(#2628).** Two distinct server reach-paths must not be conflated. (1) The HTTP
+**Keep the public and private UDP server paths distinct.** The HTTP
 token-validation path above (`local.nhp_server_internal_url`,
-`server.<namespace>:8888`) stays on Cloud Map regardless of
-`take_server_private` — do not move it. (2) The UDP *knock/registration*
-endpoint — the in-VPC AC's `ServerEndpoint` and qurl-service's
-`nhp_server_host` (both `module.compute.nlb_dns_name`, the PUBLIC NLB) — is what
-`take_server_private` swaps to `module.compute.internal_nlb_dns_name` (the
-internal relay NLB) when the public NLB is removed. That output is null unless
-`deploy_relay=true`, so the flag's precondition
-(`terraform_data.take_server_private_preconditions`) requires
-`deploy_relay && qurl_link_js_agent_enabled`. The internal NLB runs
-`preserve_client_ip=true`, so the server replies to the AC from its instance IP,
-not the NLB IP — the AC-registration smoke in the #2628 rollout-ledger entry
-gates the cutover on that reply being accepted (CloudMap
-`server.<namespace>:62206` is the documented fallback).
+`server.<namespace>:8888`) stays on Cloud Map. Upcoming UDP SDKs use
+`module.compute.nlb_dns_name`, the assigned cell's public server NLB, whose only
+UDP listener is 62206. Browser relay traffic uses
+`module.compute.internal_nlb_dns_name` on private UDP 62206. The relay does not
+own a public UDP NLB or listener; do not add a relay-native cutover flag or
+repoint SDK DNS to the relay. The internal NLB runs `preserve_client_ip=true`,
+so the server replies to the relay/AC from its instance IP, not the NLB IP.
 
 **Static name + `create_before_destroy` invariant.** Every ASG in
 this repo (the three listed above plus their `blue_green.tf` green

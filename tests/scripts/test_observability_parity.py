@@ -513,6 +513,16 @@ def run_check(root: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def mutate_relay_alarm(root: Path, name: str, old: str, new: str) -> None:
+    path = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+    source = path.read_text(encoding="utf-8")
+    block = CHECKER.find_block(path, 'resource "aws_cloudwatch_metric_alarm"', name)
+    if old not in block.body:
+        raise AssertionError(f"{name}: fixture lacks mutation source {old!r}")
+    mutated = block.body.replace(old, new, 1)
+    path.write_text(source.replace(block.body, mutated, 1), encoding="utf-8")
+
+
 class ObservabilityParityTests(unittest.TestCase):
     def test_aop_replay_detection_alarm_is_fenced(self) -> None:
         self.assertIn("aop_replay_detected", AC_CORE_ALARMS)
@@ -560,7 +570,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     'Environment = "unknown"',
@@ -1271,7 +1283,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     'resource "aws_cloudwatch_metric_alarm" "relay_shedding_unknown_environment"',
@@ -1290,7 +1304,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8")
                 + textwrap.dedent(
@@ -1319,7 +1335,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     'Component   = "relay"\n',
@@ -1338,7 +1356,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     "  alarm_actions = local.relay_alarm_actions\n",
@@ -1358,7 +1378,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     "  ok_actions    = []\n",
@@ -1560,9 +1582,7 @@ class ObservabilityParityTests(unittest.TestCase):
                 go_path.write_text(
                     go_path.read_text(encoding="utf-8").replace(
                         "  _ = []types.Dimension{",
-                        "  _ = `raw } brace`\n"
-                        "  _ = '}'\n"
-                        "  _ = []types.Dimension{",
+                        "  _ = `raw } brace`\n  _ = '}'\n  _ = []types.Dimension{",
                         1,
                     ),
                     encoding="utf-8",
@@ -1576,11 +1596,13 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
-                    "--dimensions \"Component=relay,Environment=${environment}\"",
-                    "--dimensions \"Component=relay\"",
+                    '--dimensions "Component=relay,Environment=${environment}"',
+                    '--dimensions "Component=relay"',
                 ),
                 encoding="utf-8",
             )
@@ -1595,7 +1617,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     "Component=relay,Environment=${environment}",
@@ -1613,7 +1637,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     "Component=relay,Environment=${environment}",
@@ -1630,7 +1656,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     "Component=relay,Environment=${environment}",
@@ -1648,7 +1676,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     '  --dimensions "Component=relay,Environment=${environment}"',
@@ -1669,12 +1699,14 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     '  --dimensions "Component=relay,Environment=${environment}"',
                     "  echo 'literal # not a shell comment' && "
-                    'aws cloudwatch put-metric-data --dimensions '
+                    "aws cloudwatch put-metric-data --dimensions "
                     '"Component=relay,Environment=${environment}"',
                 ),
                 encoding="utf-8",
@@ -1688,7 +1720,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     "    TargetGroup  = aws_lb_target_group.relay.arn_suffix\n",
@@ -1708,7 +1742,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     'treat_missing_data = "breaching"',
@@ -1774,7 +1810,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     'metric_name = "GroupInServiceInstances"',
@@ -1793,7 +1831,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     'Environment = "unknown"',
@@ -1812,7 +1852,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             good_block = relay_alarm_block("relay_shedding")
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
@@ -1835,14 +1877,11 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
-            relay_monitoring.write_text(
-                relay_monitoring.read_text(encoding="utf-8").replace(
-                    'comparison_operator = "GreaterThanThreshold"',
-                    'comparison_operator = "GreaterThanOrEqualToThreshold"',
-                    1,
-                ),
-                encoding="utf-8",
+            mutate_relay_alarm(
+                root,
+                "relay_shedding",
+                'comparison_operator = "GreaterThanThreshold"',
+                'comparison_operator = "GreaterThanOrEqualToThreshold"',
             )
 
             result = run_check(root)
@@ -1855,7 +1894,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     'metric_name         = "RelayShed"',
@@ -1875,7 +1916,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             relay_monitoring.write_text(
                 relay_monitoring.read_text(encoding="utf-8").replace(
                     'statistic           = "Sum"',
@@ -1895,7 +1938,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             monitoring_text = relay_monitoring.read_text(encoding="utf-8")
             unknown_alarm_start = monitoring_text.index(
                 'resource "aws_cloudwatch_metric_alarm" '
@@ -1921,7 +1966,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_monitoring = root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            relay_monitoring = (
+                root / "terraform" / "modules" / "relay" / "monitoring.tf"
+            )
             monitoring_text = relay_monitoring.read_text(encoding="utf-8")
             unknown_alarm_start = monitoring_text.index(
                 'resource "aws_cloudwatch_metric_alarm" '
@@ -1987,7 +2034,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     "-e NHP_ENVIRONMENT=${environment}",
@@ -2005,7 +2054,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     "-e NHP_ENVIRONMENT=${environment}",
@@ -2023,7 +2074,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     "-e NHP_ENVIRONMENT=${environment}",
@@ -2041,11 +2094,13 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     "-e NHP_ENVIRONMENT=${environment}",
-                    '-e OTHER_ENVIRONMENT=${environment} # -e NHP_ENVIRONMENT=${environment}',
+                    "-e OTHER_ENVIRONMENT=${environment} # -e NHP_ENVIRONMENT=${environment}",
                 ),
                 encoding="utf-8",
             )
@@ -2059,7 +2114,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            relay_user_data = root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            relay_user_data = (
+                root / "terraform" / "modules" / "relay" / "user_data.sh.tpl"
+            )
             relay_user_data.write_text(
                 relay_user_data.read_text(encoding="utf-8").replace(
                     "-e NHP_ENVIRONMENT=${environment}",
@@ -2106,7 +2163,9 @@ class ObservabilityParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build_fixture(root)
-            sandbox_vars = root / "terraform" / "environments" / "sandbox" / "variables.tf"
+            sandbox_vars = (
+                root / "terraform" / "environments" / "sandbox" / "variables.tf"
+            )
             sandbox_vars.write_text(
                 sandbox_vars.read_text(encoding="utf-8").replace(
                     textwrap.dedent(

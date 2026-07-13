@@ -371,7 +371,18 @@ func (d *Device) msgToPacketRoutine(id int) {
 				if md.HeaderType == NHP_KPL {
 					// createKeepalivePacket returns non-nil mad even on error, so
 					// the deferred err handler above is nil-safe.
-					mad, _ = d.createKeepalivePacket(md)
+					mad, err = d.createKeepalivePacket(md)
+					if err != nil {
+						return
+					}
+					// Match the normal encrypt path's explicit packet diversion. A
+					// KPL caller that supplied EncryptedPktCh owns the assembler and
+					// must consume/destroy it; it must never park waiting while the
+					// packet is instead forwarded to ConnData.
+					if mad.encryptedPktCh != nil {
+						mad.encryptedPktCh <- mad
+						return
+					}
 					if mad.connData == nil {
 						err = fmt.Errorf("missing connection data for %s outbound packet", msgType)
 						log.Error("msgToPacketRoutine %d: [%s] %v", id, msgType, err)
@@ -446,11 +457,13 @@ func (d *Device) MsgToPacket(md *MsgData) (mad *MsgAssemblerData, err error) {
 		}
 	}()
 
-	var buf [PacketBufferSize]byte
-	md.ExternalPacket = &Packet{
-		Buf:        &buf,
-		Content:    buf[:],
-		HeaderType: md.HeaderType,
+	if md.ExternalPacket == nil {
+		var buf [PacketBufferSize]byte
+		md.ExternalPacket = &Packet{
+			Buf:        &buf,
+			Content:    buf[:],
+			HeaderType: md.HeaderType,
+		}
 	}
 	//md.Compress = len(md.Message) > 64 // no gain for compression if size is small
 	// use new transaction id if not specified
@@ -460,8 +473,7 @@ func (d *Device) MsgToPacket(md *MsgData) (mad *MsgAssemblerData, err error) {
 
 	// process keepalive separately
 	if md.HeaderType == NHP_KPL {
-		mad, _ = d.createKeepalivePacket(md)
-		return mad, nil
+		return d.createKeepalivePacket(md)
 	}
 
 	mad, err = d.createMsgAssemblerData(md)

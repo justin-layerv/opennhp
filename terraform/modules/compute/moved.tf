@@ -1,14 +1,9 @@
-# State-address migrations for #2628 (take nhp-server private).
+# Historical #2628 state-address migrations retained for the indexed public edge.
 #
-# These four public-knock-surface resources gained `count =
-# var.public_server_surface_enabled ? 1 : 0`. Adding `count` to a previously
-# un-indexed resource changes its state address (`x` -> `x[0]`), which Terraform
-# would otherwise read as destroy-the-old + create-the-new. These `moved {}` blocks
-# rename the existing state in place so:
-#   - default (public_server_surface_enabled = true, e.g. prod): `x` -> `x[0]`,
-#     config still matches -> NO diff, NO recreation of the live public NLB.
-#   - private (public_server_surface_enabled = false, e.g. sandbox at cutover):
-#     `x` -> `x[0]`, then count=0 destroys `x[0]` -> a clean single destroy.
+# These four public-knock-surface resources previously gained conditional count.
+# They now use constant `count = 1` because the assigned-cell public NHP edge is
+# invariant. The moved blocks retain indexed state addresses and avoid recreating
+# the live public NLB.
 #
 # moved {} blocks are permanent no-ops once applied; leave them in place.
 

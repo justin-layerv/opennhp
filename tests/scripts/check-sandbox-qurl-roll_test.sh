@@ -27,6 +27,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$HERE/../.." && pwd)
 WF="$REPO_ROOT/.github/workflows/build-and-push.yml"
+PLAN_WF="$REPO_ROOT/.github/workflows/terraform-plan-pr.yml"
 
 pass=0
 fail=0
@@ -42,12 +43,17 @@ fi
 # job level) up to the next job header at the same indent. Comment lines
 # (`  # ...`) are not job headers, so extraction does not stop on the comment
 # banner that precedes the next job.
-extract_job() {
-  awk -v job="$1" '
+extract_job_from() {
+  local file="$1" job="$2"
+  awk -v job="$job" '
     $0 ~ "^  " job ":[[:space:]]*$" { capture=1; print; next }
     capture && /^  [A-Za-z][A-Za-z0-9_-]*:[[:space:]]*$/ { exit }
     capture { print }
-  ' "$WF"
+  ' "$file"
+}
+
+extract_job() {
+  extract_job_from "$WF" "$1"
 }
 
 # assert_in <block> <job-name> <label> <ERE> — the pattern must appear within
@@ -112,6 +118,20 @@ assert_step_order() {
     report_pass "$label"
   else
     report_fail "$label" "step '$before' must appear before '$after' in $job job"
+  fi
+}
+
+assert_text_order() {
+  local block="$1" scope="$2" before="$3" after="$4" label="$5"
+  local before_line after_line
+  before_line=$(grep -nF -- "$before" <<< "$block" | head -n1 | cut -d: -f1)
+  after_line=$(grep -nF -- "$after" <<< "$block" | head -n1 | cut -d: -f1)
+  if [[ -z "$before_line" || -z "$after_line" ]]; then
+    report_fail "$label" "missing text in $scope: before='$before' after='$after'"
+  elif [[ "$before_line" -lt "$after_line" ]]; then
+    report_pass "$label"
+  else
+    report_fail "$label" "'$before' must appear before '$after' in $scope"
   fi
 }
 
@@ -207,6 +227,120 @@ else
     'sandbox-environment-guard\.result == .success.'
   assert_in "$INFRA" deploy-sandbox-infra "infra deploy consumes the single app-image build classification output" \
     'app-image-build-required\.outputs\.app_image_build_required'
+  assert_step_order "$INFRA" deploy-sandbox-infra \
+    "Handle ASG Attachment Migrations and Taint Recovery" \
+    "Verify relay DMZ plan contract before apply" \
+    "final Terraform plan is checked after every recovery path"
+  RECOVERY_STEP=$(extract_step "$INFRA" "Handle ASG Attachment Migrations and Taint Recovery")
+  assert_text_order "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
+    "            preflight_relay_dmz_boundary_noop" \
+    'terraform state rm "$att"' \
+    "relay DMZ boundary is checked before any Terraform state mutation"
+  assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
+    "recovery preflight invokes the relay DMZ checker" \
+    'check-relay-dmz-plan\.py'
+  assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
+    "recovery preflight requires PR 0 state convergence" \
+    '--require-pr0-applied'
+  assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
+    "recovery preflight requires a no-op DMZ boundary" \
+    '--require-dmz-boundary-noop'
+  assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
+    "recovery preflight checks its dedicated saved-plan JSON" \
+    'plan-boundary-preflight\.json'
+  if grep -Eq -- '--allow-disabled' <<< "$RECOVERY_STEP"; then
+    report_fail "recovery preflight cannot use bootstrap tolerance" \
+      "unexpected --allow-disabled in recovery preflight"
+  else
+    report_pass "recovery preflight cannot use bootstrap tolerance"
+  fi
+  assert_step_order "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ plan contract before apply" \
+    "Terraform Apply" \
+    "relay DMZ plan contract gates Terraform apply"
+  assert_step_order "$INFRA" deploy-sandbox-infra \
+    "Terraform Apply" \
+    "Verify AWS CLI major for relay DMZ detector" \
+    "AWS CLI major is fenced before the structural live detector"
+  assert_step_order "$INFRA" deploy-sandbox-infra \
+    "Verify AWS CLI major for relay DMZ detector" \
+    "Verify relay DMZ structural boundary" \
+    "live structural proof runs only after the AWS CLI major fence"
+  assert_step_in "$INFRA" deploy-sandbox-infra \
+    "Verify AWS CLI major for relay DMZ detector" \
+    "structural detector accepts only AWS CLI v2 stderr contracts" \
+    '\^aws-cli/2\\\.'
+  assert_step_order "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ structural boundary" \
+    "Verify relay DMZ post-apply idempotency" \
+    "post-apply idempotency runs after live structural proof"
+  assert_step_order "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ post-apply idempotency" \
+    "Get Terraform Outputs" \
+    "infra outputs are withheld until post-apply idempotency passes"
+  assert_step_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ plan contract before apply" \
+    "pre-apply gate checks the final plan JSON" \
+    'check-relay-dmz-plan\.py'
+  assert_step_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ plan contract before apply" \
+    "pre-apply gate requires PR 0 state convergence" \
+    '--require-pr0-applied'
+  assert_step_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ plan contract before apply" \
+    "automatic apply requires the relay DMZ boundary to be converged" \
+    '--require-dmz-boundary-noop'
+  assert_step_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ plan contract before apply" \
+    "pre-apply gate checks the final plan artifact after all strict modes" \
+    'plan-show\.json'
+  assert_step_in "$INFRA" deploy-sandbox-infra "Terraform Apply" \
+    "Terraform apply consumes the checked saved plan" \
+    'terraform apply -auto-approve tfplan'
+  assert_step_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ post-apply idempotency" \
+    "post-apply gate requires an empty detailed-exitcode plan" \
+    'terraform plan -detailed-exitcode'
+  assert_step_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ post-apply idempotency" \
+    "post-apply plan is rechecked against the final DMZ contract" \
+    '--require-pr0-applied relay-dmz-post-apply\.json'
+  assert_step_not_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ post-apply idempotency" \
+    "post-apply validation does not require a no-op boundary twice" \
+    '--require-dmz-boundary-noop'
+  assert_step_not_in "$INFRA" deploy-sandbox-infra \
+    "Verify relay DMZ post-apply idempotency" \
+    "post-apply validation cannot use bootstrap tolerance" \
+    '--allow-disabled'
+  assert_step_not_in "$INFRA" deploy-sandbox-infra "Terraform Apply" \
+    "Terraform apply has no unchecked fresh-plan fallback" \
+    'terraform apply -auto-approve[[:space:]]*$'
+fi
+
+PLAN_JOB=$(extract_job_from "$PLAN_WF" terraform-plan)
+if [[ -z "$PLAN_JOB" ]]; then
+  report_fail "terraform PR-plan job exists" \
+    "no '  terraform-plan:' job header found in terraform-plan-pr.yml"
+else
+  report_pass "terraform PR-plan job exists"
+  assert_step_in "$PLAN_JOB" terraform-plan \
+    "Check relay DMZ plan contract" \
+    "PR plan invokes the relay DMZ checker" \
+    'check-relay-dmz-plan\.py tfplan\.json'
+  for strict_flag in --require-pr0-applied --require-dmz-boundary-noop --allow-disabled; do
+    assert_step_not_in "$PLAN_JOB" terraform-plan \
+      "Check relay DMZ plan contract" \
+      "PR plan remains observation-only without $strict_flag" \
+      "$strict_flag"
+  done
+fi
+
+if grep -R -Eq -- '--allow-disabled' "$REPO_ROOT/.github/workflows"; then
+  report_fail "deployed workflows never use bootstrap-only --allow-disabled" \
+    "found --allow-disabled in a workflow caller"
+else
+  report_pass "deployed workflows never use bootstrap-only --allow-disabled"
 fi
 
 # Gated on the TF-apply job — that is the job that registers new revisions.
@@ -313,6 +447,18 @@ else
     'needs:.*app-image-build-required'
   assert_step_in "$RELAY" deploy-sandbox-relay "Deploy relay (SSM image-tag + ASG instance refresh)" "relay treats stale live app images as app-changed" \
     'APP_IMAGE_BUILD_REQUIRED'
+  assert_in "$RELAY" deploy-sandbox-relay "relay job timeout covers refresh plus functional DMZ retry budget" \
+    'timeout-minutes: 35'
+  assert_step_order "$RELAY" deploy-sandbox-relay \
+    "Verify AWS CLI major for relay DMZ detector" \
+    "Verify relay DMZ functional boundary" \
+    "AWS CLI major is fenced before the functional live detector"
+  assert_step_in "$RELAY" deploy-sandbox-relay \
+    "Verify AWS CLI major for relay DMZ detector" \
+    "functional detector accepts only AWS CLI v2 stderr contracts" \
+    '\^aws-cli/2\\\.'
+  assert_step_in "$RELAY" deploy-sandbox-relay "Verify relay DMZ functional boundary" "functional DMZ gate retains its 10-minute retry budget" \
+    'check-relay-dmz-live\.py --mode functional --environment sandbox --wait-seconds 600'
 fi
 
 BLUEGREEN=$(extract_job deploy-sandbox-blue-green)

@@ -142,10 +142,7 @@ resource "aws_ssm_parameter" "ecr_repo_name" {
 # =============================================================================
 
 resource "aws_ssm_parameter" "blue_udp_tg_arn" {
-  # #2628: also gated on public_server_surface_enabled — when the server is private
-  # there is no public UDP TG to switch; blue-green-switch.sh flips the internal
-  # relay UDP listener instead.
-  count = var.enable_blue_green && var.public_server_surface_enabled ? 1 : 0
+  count = var.enable_blue_green ? 1 : 0
 
   name        = "/${var.environment}/nhp/server/blue-udp-tg-arn"
   description = "Blue UDP target group ARN for traffic switching"
@@ -160,8 +157,7 @@ resource "aws_ssm_parameter" "blue_udp_tg_arn" {
 }
 
 resource "aws_ssm_parameter" "green_udp_tg_arn" {
-  # #2628: see blue_udp_tg_arn — gated on public_server_surface_enabled too.
-  count = var.enable_blue_green && var.public_server_surface_enabled ? 1 : 0
+  count = var.enable_blue_green ? 1 : 0
 
   name        = "/${var.environment}/nhp/server/green-udp-tg-arn"
   description = "Green UDP target group ARN for traffic switching"
@@ -176,11 +172,7 @@ resource "aws_ssm_parameter" "green_udp_tg_arn" {
 }
 
 resource "aws_ssm_parameter" "udp_listener_arn" {
-  # #2628: gated on public_server_surface_enabled. When absent (server private),
-  # blue-green-switch.sh confirms the take-server-private marker (below) is "true"
-  # before falling back to the internal relay UDP listener — a missing param WITHOUT
-  # the marker is treated as a botched public deploy and hard-fails, not a silent skip.
-  count = var.enable_blue_green && var.public_server_surface_enabled ? 1 : 0
+  count = var.enable_blue_green ? 1 : 0
 
   name        = "/${var.environment}/nhp/server/udp-listener-arn"
   description = "NLB UDP listener ARN for traffic switching"
@@ -234,32 +226,6 @@ resource "aws_ssm_parameter" "internal_udp_listener_arn" {
 
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-ssm-internal-udp-listener"
-    Component = "compute"
-    Cell      = var.cell_id
-  })
-}
-
-# #2628: POSITIVE private-state marker for blue-green-switch.sh. The UDP switch
-# params above are ABSENT when the server is private — but absence alone can't tell
-# "intentionally private" from "botched public apply / SSM drift / accidental param
-# deletion." This marker lets the switch script skip the public flip ONLY when it is
-# "true", and hard-fail a missing public listener otherwise (preserving the loud
-# failure that protected public deploys). Exists in BOTH states (value flips) so a
-# truly-absent marker means a non-#2628 / not-yet-applied deploy. Gated on
-# enable_blue_green only (NOT public_server_surface_enabled) so it is present in both
-# the public and private blue/green states; prod (enable_blue_green=false, static
-# pipeline) never creates it — zero prod diff. Terraform owns the value (no
-# ignore_changes); CI never writes it.
-resource "aws_ssm_parameter" "take_server_private" {
-  count = var.enable_blue_green ? 1 : 0
-
-  name        = "/${var.environment}/nhp/server/take-server-private"
-  description = "Whether nhp-server is private (#2628). Gates the public UDP listener switch in blue-green-switch.sh: skip only when 'true'."
-  type        = "String"
-  value       = var.public_server_surface_enabled ? "false" : "true"
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-ssm-take-server-private"
     Component = "compute"
     Cell      = var.cell_id
   })
@@ -320,15 +286,17 @@ resource "aws_ssm_parameter" "https_listener_arn" {
 # limit of 32 characters. The name_prefix can be up to ~20 chars, leaving
 # limited space for the suffix. Full name in tags for clarity.
 resource "aws_lb_target_group" "udp_green" {
-  # #2628: no public UDP TG when the server is private (the green ASG drops this
-  # entry from its target_group_arns below).
-  count = var.enable_blue_green && var.public_server_surface_enabled ? 1 : 0
+  count = var.enable_blue_green ? 1 : 0
 
   name        = replace("${var.name_prefix}-udp-grn", "_", "-")
   port        = 62206
   protocol    = "UDP"
   vpc_id      = var.vpc_id
   target_type = "instance"
+
+  # Must match the blue public UDP target group: direct SDK knocks retain the
+  # original client address at nhp-server after a blue/green switch.
+  preserve_client_ip = true
 
   # HTTP health check on port 8888 (same as blue)
   health_check {
@@ -496,9 +464,7 @@ resource "aws_autoscaling_group" "server_green" {
   # TGs, so the green ASG attaches only to the green internal TG and never shares
   # the blue TG with the warm-standby path.
   target_group_arns = compact(concat(
-    # #2628: drop the public UDP TG when the server is private — the green fleet then
-    # serves knocks only via the internal relay NLB's TG (last entry).
-    var.public_server_surface_enabled ? [aws_lb_target_group.udp_green[0].arn] : [],
+    [aws_lb_target_group.udp_green[0].arn],
     var.enable_qurl_resolve_endpoint ? [aws_lb_target_group.https_green[0].arn] : [],
     var.relay_enabled ? [aws_lb_target_group.udp_internal_green[0].arn] : []
   ))
@@ -737,11 +703,9 @@ resource "aws_cloudwatch_metric_alarm" "green_tg_no_healthy_targets" {
   # alerts_sns_topic_arn != null, to avoid count-depends-on-computed
   # "Invalid count argument" on a greenfield apply (cf. #2664 / #2665).
   #
-  # #2628: also gated on public_server_surface_enabled — this alarm keys on the
-  # PUBLIC NLB + the public green UDP TG, both removed when the server is private.
-  # The internal relay NLB has per-color no-healthy-targets alarms for the private
-  # knock path.
-  count = var.enable_blue_green && var.enable_sns_alerts && var.public_server_surface_enabled ? 1 : 0
+  # The public NLB and green UDP TG remain required; the internal relay NLB has
+  # separate internal-path alarms.
+  count = var.enable_blue_green && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-green-tg-no-healthy"
   alarm_description   = "Green target group has no healthy targets - rollback capability impaired"

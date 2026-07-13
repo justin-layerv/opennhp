@@ -142,41 +142,6 @@ def subnets_in_tier(snapshot: dict, tier: str) -> list[dict]:
     return [row for row in snapshot["subnets"] if row["tier"] == tier]
 
 
-def native_alarm_for(snapshot: dict, suffix: str) -> dict:
-    matches = [
-        alarm
-        for alarm in snapshot["native_alarms"]["metric_alarms"]
-        if str(alarm.get("name", "")).endswith(suffix)
-    ]
-    if len(matches) != 1:
-        raise AssertionError(f"expected one native alarm ending {suffix!r}")
-    return matches[0]
-
-
-NATIVE_LB_ARN = (
-    "arn:aws:elasticloadbalancing:us-east-2:767397897469:"
-    "loadbalancer/net/layerv-nhp-sandbox-relay-nhp/def123"
-)
-NATIVE_TG_ARN = (
-    "arn:aws:elasticloadbalancing:us-east-2:767397897469:"
-    "targetgroup/rlyudp-native/abc123"
-)
-NATIVE_LB_DNS = "layerv-nhp-sandbox-relay-nhp-def123.elb.us-east-2.amazonaws.com"
-NATIVE_LB_ZONE_ID = "ZLMOA37VPKANP"
-NATIVE_ALARM_ACTION_ARN = (
-    "arn:aws:sns:us-east-2:767397897469:layerv-nhp-sandbox-cell0-alerts"
-)
-RECORDED_NATIVE_LB_ARN = (
-    "arn:aws:elasticloadbalancing:us-east-2:767397897469:"
-    "loadbalancer/net/relay-nhp/def456"
-)
-RECORDED_NATIVE_TG_ARN = (
-    "arn:aws:elasticloadbalancing:us-east-2:767397897469:"
-    "targetgroup/rlyudp-recorded/789abc"
-)
-RECORDED_NATIVE_LB_DNS = "relay-nhp-def456.elb.us-east-2.amazonaws.com"
-
-
 def good_snapshot() -> dict:
     region = "us-east-2"
     dmz_vpc = "vpc-dmz"
@@ -184,7 +149,6 @@ def good_snapshot() -> dict:
     peer = "pcx-main"
     relay_sg = "sg-relay"
     alb_sg = "sg-alb"
-    native_nhp_sg = "sg-native-nhp"
     endpoint_sg = "sg-endpoint"
     server_sg = "sg-server"
     relay_cidrs = ["10.101.10.0/24", "10.101.11.0/24", "10.101.12.0/24"]
@@ -310,8 +274,6 @@ def good_snapshot() -> dict:
             "inbound": [
                 rule("tcp", 8080, 8080, "security_group", alb_sg),
                 rule("udp", 62207, 62207, "security_group", server_sg),
-                rule("udp", 62206, 62206, "security_group", native_nhp_sg),
-                rule("tcp", 8080, 8080, "security_group", native_nhp_sg),
             ],
             "outbound": relay_outbound,
         },
@@ -320,15 +282,6 @@ def good_snapshot() -> dict:
             "vpc_id": dmz_vpc,
             "inbound": [rule("tcp", 443, 443, "cidr_ipv4", "0.0.0.0/0")],
             "outbound": [rule("tcp", 8080, 8080, "security_group", relay_sg)],
-        },
-        native_nhp_sg: {
-            "id": native_nhp_sg,
-            "vpc_id": dmz_vpc,
-            "inbound": [rule("udp", 62206, 62206, "cidr_ipv4", "0.0.0.0/0")],
-            "outbound": [
-                rule("udp", 62206, 62206, "security_group", relay_sg),
-                rule("tcp", 8080, 8080, "security_group", relay_sg),
-            ],
         },
         endpoint_sg: {
             "id": endpoint_sg,
@@ -340,7 +293,7 @@ def good_snapshot() -> dict:
             "id": server_sg,
             "vpc_id": main_vpc,
             "inbound": [
-                rule("udp", 62206, 62206, "cidr_ipv4", "10.100.0.0/16"),
+                rule("udp", 62206, 62206, "cidr_ipv4", "0.0.0.0/0"),
                 *(rule("udp", 62206, 62206, "cidr_ipv4", cidr) for cidr in relay_cidrs),
             ],
             "outbound": [],
@@ -387,11 +340,14 @@ def good_snapshot() -> dict:
     )
 
     instance_ids = [row["id"] for row in instances]
-    return {
+    snapshot = {
         "schema_version": checker.SCHEMA_VERSION,
         "environment": "sandbox",
+        "cell_id": "cell0",
         "region": region,
         "account_id": "767397897469",
+        "server_deploy_mode": "blue_green",
+        "server_active_color": "blue",
         "canonical_asg": {
             "name": "layerv-nhp-sandbox-relay-dmz",
             "vpc_id": dmz_vpc,
@@ -407,12 +363,11 @@ def good_snapshot() -> dict:
             ],
             "min_size": 3,
             "desired_capacity": 3,
-            "target_group_arns": ["tg-arn", NATIVE_TG_ARN],
+            "target_group_arns": ["tg-arn"],
         },
         "orphaned_legacy_resources": {
             "asgs": [],
             "main_vpc_security_groups": [],
-            "public_main_vpc_nhp_listeners": [],
             "target_groups": [],
         },
         "vpc": {
@@ -466,7 +421,6 @@ def good_snapshot() -> dict:
             "relay_ids": [relay_sg],
             "endpoint_ids": [endpoint_sg],
             "alb_ids": [alb_sg],
-            "native_nhp_ids": [native_nhp_sg],
             "server_ids": [server_sg],
             "by_id": by_id,
         },
@@ -628,127 +582,6 @@ def good_snapshot() -> dict:
             ],
             "waf_arn": "arn:aws:wafv2:us-east-2:767397897469:regional/webacl/relay/abc",
         },
-        "native_nlb": {
-            "arn": NATIVE_LB_ARN,
-            "name": "layerv-nhp-sandbox-relay-nhp",
-            "dns_name": NATIVE_LB_DNS,
-            "canonical_hosted_zone_id": NATIVE_LB_ZONE_ID,
-            "vpc_id": dmz_vpc,
-            "scheme": "internet-facing",
-            "type": "network",
-            "ip_address_type": "ipv4",
-            "subnet_ids": [f"subnet-public-{index}" for index in range(3)],
-            "cross_zone_enabled": "true",
-            "deletion_protection_enabled": "false",
-            "tags": {
-                "Environment": "sandbox",
-                "Service": "nhp-relay",
-                "Component": "relay",
-                "Name": "layerv-nhp-sandbox-relay-nhp",
-            },
-            "security_group_ids": [native_nhp_sg],
-            "listeners": [
-                {
-                    "arn": "native-listener-arn",
-                    "port": 62206,
-                    "protocol": "UDP",
-                    "actions": [{"Type": "forward", "TargetGroupArn": NATIVE_TG_ARN}],
-                }
-            ],
-            "target_group_arns": [NATIVE_TG_ARN],
-            "target_groups": [
-                {
-                    "arn": NATIVE_TG_ARN,
-                    "vpc_id": dmz_vpc,
-                    "protocol": "UDP",
-                    "port": 62206,
-                    "target_type": "instance",
-                    "preserve_client_ip": "true",
-                    "health_check_enabled": True,
-                    "health_check_protocol": "HTTPS",
-                    "health_check_port": "8080",
-                    "health_check_path": "/health/native-ready",
-                    "health_check_matcher": "200",
-                    "healthy_threshold": 2,
-                    "unhealthy_threshold": 2,
-                    "health_check_interval": 15,
-                    "health_check_timeout": 5,
-                }
-            ],
-        },
-        "native_dns": {
-            "record_count": 1,
-            "hosted_zone_id": "Z10394893FM38A1RXLL32",
-            "name": "native.nhp.layerv.xyz",
-            "type": "A",
-            "alias_dns_name": NATIVE_LB_DNS,
-            "alias_hosted_zone_id": NATIVE_LB_ZONE_ID,
-            "evaluate_target_health": True,
-            "set_identifier": None,
-            "weight": None,
-            "region": None,
-            "failover": None,
-            "multi_value_answer": False,
-            "health_check_id": None,
-            "traffic_policy_instance_id": None,
-            "ttl": None,
-            "resource_record_count": 0,
-        },
-        "native_alarms": {
-            "metric_alarms": [
-                {
-                    "name": "layerv-nhp-sandbox-relay-native-nlb-unhealthy",
-                    "state_value": "OK",
-                    "state_reason": "Threshold Crossed: no unhealthy targets",
-                    "actions_enabled": True,
-                    "alarm_actions": [NATIVE_ALARM_ACTION_ARN],
-                    "ok_actions": [NATIVE_ALARM_ACTION_ARN],
-                    "insufficient_data_actions": [],
-                    "comparison_operator": "GreaterThanThreshold",
-                    "evaluation_periods": 2,
-                    "datapoints_to_alarm": 2,
-                    "metric_name": "UnHealthyHostCount",
-                    "namespace": "AWS/NetworkELB",
-                    "period": 60,
-                    "statistic": "Maximum",
-                    "unit": None,
-                    "threshold": 0,
-                    "treat_missing_data": "notBreaching",
-                    "dimension_count": 2,
-                    "metric_query_count": 0,
-                    "dimensions": {
-                        "LoadBalancer": "net/layerv-nhp-sandbox-relay-nhp/def123",
-                        "TargetGroup": "targetgroup/rlyudp-native/abc123",
-                    },
-                },
-                {
-                    "name": "layerv-nhp-sandbox-relay-native-nlb-zero-healthy",
-                    "state_value": "OK",
-                    "state_reason": "Threshold Crossed: healthy targets present",
-                    "actions_enabled": True,
-                    "alarm_actions": [NATIVE_ALARM_ACTION_ARN],
-                    "ok_actions": [NATIVE_ALARM_ACTION_ARN],
-                    "insufficient_data_actions": [],
-                    "comparison_operator": "LessThanThreshold",
-                    "evaluation_periods": 2,
-                    "datapoints_to_alarm": 2,
-                    "metric_name": "HealthyHostCount",
-                    "namespace": "AWS/NetworkELB",
-                    "period": 60,
-                    "statistic": "Minimum",
-                    "unit": None,
-                    "threshold": 1,
-                    "treat_missing_data": "breaching",
-                    "dimension_count": 2,
-                    "metric_query_count": 0,
-                    "dimensions": {
-                        "LoadBalancer": "net/layerv-nhp-sandbox-relay-nhp/def123",
-                        "TargetGroup": "targetgroup/rlyudp-native/abc123",
-                    },
-                },
-            ],
-            "composite_alarm_names": [],
-        },
         "functional": {
             "target_health": [
                 {
@@ -757,7 +590,7 @@ def good_snapshot() -> dict:
                     "reason": None,
                     "target_group_arn": target_group_arn,
                 }
-                for target_group_arn in ("tg-arn", NATIVE_TG_ARN)
+                for target_group_arn in ("tg-arn",)
                 for instance_id in instance_ids
             ],
             "ssm": [
@@ -793,14 +626,113 @@ def good_snapshot() -> dict:
             ],
         },
     }
+    snapshot["assigned_cell_nhp_listeners"] = [
+        {
+            "load_balancer_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-nlb/cell0",
+            "load_balancer_name": "layerv-nhp-sandbox-nlb",
+            "load_balancer_tags": {
+                "Environment": "sandbox",
+                "Component": "compute",
+                "Cell": "cell0",
+                "Name": "layerv-nhp-sandbox-nlb",
+            },
+            "canonical": True,
+            "listener_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-nlb/cell0/udp",
+            "protocol": "UDP",
+            "port": checker.RELAY_SERVER_UDP_PORT,
+            "target_group_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-udp/cell0",
+            "target_group": {
+                "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-udp/cell0",
+                "name": "layerv-nhp-sandbox-udp",
+                "tags": {
+                    "Environment": "sandbox",
+                    "Component": "compute",
+                    "Cell": "cell0",
+                    "Name": "layerv-nhp-sandbox-tg-udp",
+                },
+                "vpc_id": "vpc-main",
+                "protocol": "UDP",
+                "port": checker.RELAY_SERVER_UDP_PORT,
+                "target_type": "instance",
+                "preserve_client_ip": True,
+                "health_check_enabled": True,
+                "health_check_protocol": "HTTP",
+                "health_check_port": "8888",
+                "health_check_path": "/health/live",
+                "health_check_matcher": "200",
+            },
+            "targets": [
+                {
+                    "id": "i-server-cell0",
+                    "port": checker.RELAY_SERVER_UDP_PORT,
+                    "state": "healthy",
+                    "reason": None,
+                    "asg_name": "layerv-nhp-sandbox-server",
+                    "lifecycle_state": "InService",
+                    "health_status": "HEALTHY",
+                    "security_group_ids": ["sg-server"],
+                }
+            ],
+        }
+    ]
+    snapshot["internal_cell_nhp_listeners"] = [
+        {
+            "load_balancer_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/layerv-nhp-sandbox-srv-int/cell0",
+            "load_balancer_name": "layerv-nhp-sandbox-srv-int",
+            "load_balancer_tags": {
+                "Environment": "sandbox",
+                "Component": "compute",
+                "Cell": "cell0",
+                "Name": "layerv-nhp-sandbox-srv-int-nlb",
+            },
+            "canonical": True,
+            "listener_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:listener/net/layerv-nhp-sandbox-srv-int/cell0/udp",
+            "protocol": "UDP",
+            "port": checker.RELAY_SERVER_UDP_PORT,
+            "target_group_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-srv-int-udp/cell0",
+            "target_group": {
+                "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-srv-int-udp/cell0",
+                "name": "layerv-nhp-sandbox-srv-int-udp",
+                "tags": {
+                    "Environment": "sandbox",
+                    "Component": "compute",
+                    "Cell": "cell0",
+                    "Name": "layerv-nhp-sandbox-tg-srv-int-udp-blue",
+                    "DeployColor": "blue",
+                },
+                "vpc_id": "vpc-main",
+                "protocol": "UDP",
+                "port": checker.RELAY_SERVER_UDP_PORT,
+                "target_type": "instance",
+                "preserve_client_ip": True,
+                "health_check_enabled": True,
+                "health_check_protocol": "HTTP",
+                "health_check_port": "8888",
+                "health_check_path": "/health/live",
+                "health_check_matcher": "200",
+            },
+            "targets": [
+                {
+                    "id": "i-server-cell0",
+                    "port": checker.RELAY_SERVER_UDP_PORT,
+                    "state": "healthy",
+                    "reason": None,
+                    "asg_name": "layerv-nhp-sandbox-server",
+                    "lifecycle_state": "InService",
+                    "health_status": "HEALTHY",
+                    "security_group_ids": ["sg-server"],
+                }
+            ],
+        }
+    ]
+    return snapshot
 
 
 def good_prod_snapshot() -> dict:
     snapshot = json.loads(json.dumps(good_snapshot()).replace("sandbox", "prod"))
+    snapshot["server_deploy_mode"] = "canary"
+    snapshot["server_active_color"] = "blue"
     snapshot["alb"]["deletion_protection_enabled"] = "true"
-    snapshot["native_nlb"]["deletion_protection_enabled"] = "true"
-    snapshot["native_dns"]["name"] = "native.nhp.layerv.ai"
-    snapshot["native_dns"]["hosted_zone_id"] = "Z0748438C8EK6UAW94ST"
     for log_group in snapshot["security_log_groups"].values():
         log_group["retention_in_days"] = 365
     for index, row in enumerate(snapshot["main_private_routes"]):
@@ -869,20 +801,22 @@ class RecordedStructuralAws:
         empty_main_vpc: bool = False,
         empty_dmz_vpc: bool = False,
         empty_dmz_sg_ids: bool = False,
-        extra_untagged_lb_reuses_alb_sg: bool = False,
+        extra_untagged_dmz_lb: bool = False,
         missing_main_peer_vpc_id: bool = False,
-        public_main_vpc_nhp_protocol: str | None = None,
+        public_main_vpc_nhp_protocol: str | None = "UDP",
         public_main_vpc_nhp_name: str = "layerv-nhp-sandbox-nlb",
+        extra_public_main_vpc_nlb: str | None = None,
         waf_absent: bool = False,
     ):
         self.dmz_is_requester = dmz_is_requester
         self.empty_main_vpc = empty_main_vpc
         self.empty_dmz_vpc = empty_dmz_vpc
         self.empty_dmz_sg_ids = empty_dmz_sg_ids
-        self.extra_untagged_lb_reuses_alb_sg = extra_untagged_lb_reuses_alb_sg
+        self.extra_untagged_dmz_lb = extra_untagged_dmz_lb
         self.missing_main_peer_vpc_id = missing_main_peer_vpc_id
         self.public_main_vpc_nhp_protocol = public_main_vpc_nhp_protocol
         self.public_main_vpc_nhp_name = public_main_vpc_nhp_name
+        self.extra_public_main_vpc_nlb = extra_public_main_vpc_nlb
         self.waf_absent = waf_absent
         self.calls: list[tuple[str, str, tuple[str, ...]]] = []
 
@@ -901,7 +835,50 @@ class RecordedStructuralAws:
         )
 
         if (service, operation) == ("ssm", "get-parameter"):
-            return {"Parameter": {"Value": "layerv-nhp-sandbox-relay-dmz"}}
+            parameter_name = args[args.index("--name") + 1]
+            return {
+                "Parameter": {
+                    "Value": (
+                        "cell0"
+                        if parameter_name.endswith("/deploy/cell-id")
+                        else (
+                            "blue_green"
+                            if parameter_name.endswith("/deploy/mode")
+                            else (
+                                "blue"
+                                if parameter_name.endswith("/server/active-color")
+                                else "layerv-nhp-sandbox-relay-dmz"
+                            )
+                        )
+                    )
+                }
+            }
+        if (service, operation) == (
+            "autoscaling",
+            "describe-auto-scaling-instances",
+        ):
+            if "i-standalone-recorded" in args:
+                return {"AutoScalingInstances": []}
+            return {
+                "AutoScalingInstances": [
+                    {
+                        "InstanceId": "i-server-recorded",
+                        "AutoScalingGroupName": "layerv-nhp-sandbox-server",
+                        "LifecycleState": (
+                            "Pending"
+                            if self.extra_public_main_vpc_nlb
+                            == "distinct_target_pending"
+                            else "InService"
+                        ),
+                        "HealthStatus": (
+                            "UNHEALTHY"
+                            if self.extra_public_main_vpc_nlb
+                            == "distinct_target_pending"
+                            else "HEALTHY"
+                        ),
+                    }
+                ]
+            }
         if (service, operation) == (
             "autoscaling",
             "describe-auto-scaling-groups",
@@ -913,7 +890,7 @@ class RecordedStructuralAws:
                         "VPCZoneIdentifier": "subnet-relay-recorded",
                         "MinSize": 1,
                         "DesiredCapacity": 1,
-                        "TargetGroupARNs": ["tg-recorded", RECORDED_NATIVE_TG_ARN],
+                        "TargetGroupARNs": ["tg-recorded"],
                         "Instances": [
                             {
                                 "InstanceId": "i-relay-recorded",
@@ -1012,6 +989,76 @@ class RecordedStructuralAws:
                 ]
             }
         if (service, operation) == ("ec2", "describe-instances"):
+            if any(
+                "Name=network-interface.addresses.private-ip-address,Values=10.100.10.50"
+                == arg
+                for arg in args
+            ):
+                return {
+                    "Reservations": [
+                        {
+                            "Instances": [
+                                {
+                                    "InstanceId": "i-server-recorded",
+                                    "PrivateIpAddress": "10.100.10.50",
+                                    "NetworkInterfaces": [
+                                        {
+                                            "PrivateIpAddresses": [
+                                                {"PrivateIpAddress": "10.100.10.50"}
+                                            ]
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            if "i-server-recorded" in args:
+                return {
+                    "Reservations": [
+                        {
+                            "Instances": [
+                                {
+                                    "InstanceId": "i-server-recorded",
+                                    "PrivateIpAddress": "10.100.10.50",
+                                    "SecurityGroups": [
+                                        {"GroupId": "sg-server-recorded"}
+                                    ],
+                                    "NetworkInterfaces": [
+                                        {
+                                            "PrivateIpAddresses": [
+                                                {"PrivateIpAddress": "10.100.10.50"}
+                                            ]
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            if "i-standalone-recorded" in args:
+                return {
+                    "Reservations": [
+                        {
+                            "Instances": [
+                                {
+                                    "InstanceId": "i-standalone-recorded",
+                                    "PrivateIpAddress": "10.100.10.60",
+                                    "SecurityGroups": [
+                                        {"GroupId": "sg-server-recorded"}
+                                    ],
+                                    "NetworkInterfaces": [
+                                        {
+                                            "PrivateIpAddresses": [
+                                                {"PrivateIpAddress": "10.100.10.60"}
+                                            ]
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                }
             return {
                 "Reservations": [
                     {
@@ -1063,20 +1110,6 @@ class RecordedStructuralAws:
                         if self.empty_dmz_sg_ids
                         else ["sg-alb-recorded"],
                     },
-                    {
-                        "LoadBalancerArn": RECORDED_NATIVE_LB_ARN,
-                        "LoadBalancerName": "layerv-nhp-sandbox-relay-nhp",
-                        "DNSName": RECORDED_NATIVE_LB_DNS,
-                        "CanonicalHostedZoneId": NATIVE_LB_ZONE_ID,
-                        "VpcId": dmz_vpc,
-                        "Type": "network",
-                        "Scheme": "internet-facing",
-                        "IpAddressType": "ipv4",
-                        "AvailabilityZones": [{"SubnetId": "subnet-public-recorded"}],
-                        "SecurityGroups": []
-                        if self.empty_dmz_sg_ids
-                        else ["sg-native-nhp-recorded"],
-                    },
                     *(
                         [
                             {
@@ -1090,6 +1123,34 @@ class RecordedStructuralAws:
                         if self.public_main_vpc_nhp_protocol is not None
                         else []
                     ),
+                    {
+                        "LoadBalancerArn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/internal-main-nhp/current",
+                        "LoadBalancerName": "layerv-nhp-sandbox-srv-int",
+                        "VpcId": main_vpc,
+                        "Type": "network",
+                        "Scheme": "internal",
+                    },
+                    *(
+                        [
+                            {
+                                "LoadBalancerArn": (
+                                    "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/extra-main-nhp/current"
+                                    if self.extra_public_main_vpc_nlb == "nhp"
+                                    else "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/unrelated-main/current"
+                                ),
+                                "LoadBalancerName": (
+                                    "layerv-nhp-sandbox-extra"
+                                    if self.extra_public_main_vpc_nlb == "nhp"
+                                    else "unrelated-product-udp"
+                                ),
+                                "VpcId": main_vpc,
+                                "Type": "network",
+                                "Scheme": "internet-facing",
+                            }
+                        ]
+                        if self.extra_public_main_vpc_nlb is not None
+                        else []
+                    ),
                     *(
                         [
                             {
@@ -1098,10 +1159,10 @@ class RecordedStructuralAws:
                                 "VpcId": dmz_vpc,
                                 "Type": "application",
                                 "Scheme": "internet-facing",
-                                "SecurityGroups": ["sg-alb-recorded"],
+                                "SecurityGroups": ["sg-rogue-recorded"],
                             }
                         ]
-                        if self.extra_untagged_lb_reuses_alb_sg
+                        if self.extra_untagged_dmz_lb
                         else []
                     ),
                 ]
@@ -1152,19 +1213,135 @@ class RecordedStructuralAws:
                 "TagDescriptions": [
                     {
                         "ResourceArn": arn,
-                        "Tags": []
-                        if "/rogue/" in arn
-                        else [
-                            {"Key": "Environment", "Value": "sandbox"},
-                            {"Key": "Service", "Value": "nhp-relay"},
-                            {"Key": "Component", "Value": "relay"},
-                            {
-                                "Key": "Name",
-                                "Value": "layerv-nhp-sandbox-relay-nhp"
-                                if "/net/" in arn
-                                else "layerv-nhp-sandbox-relay",
-                            },
-                        ],
+                        "Tags": (
+                            (
+                                [
+                                    {"Key": "Environment", "Value": "sandbox"},
+                                    {"Key": "Component", "Value": "compute"},
+                                    {"Key": "Cell", "Value": "cell0"},
+                                ]
+                                if self.extra_public_main_vpc_nlb == "tagged_target"
+                                else []
+                            )
+                            if arn == "tg-server-distinct-recorded"
+                            else []
+                            if "/rogue/" in arn
+                            else (
+                                [
+                                    {"Key": "Environment", "Value": "sandbox"},
+                                    {"Key": "Component", "Value": "compute"},
+                                    {"Key": "Cell", "Value": "cell0"},
+                                    {
+                                        "Key": "Name",
+                                        "Value": "layerv-nhp-sandbox-nlb",
+                                    },
+                                ]
+                                if "/net/public-main-nhp/" in arn
+                                else (
+                                    [
+                                        {"Key": "Environment", "Value": "sandbox"},
+                                        {"Key": "Component", "Value": "compute"},
+                                        {"Key": "Cell", "Value": "cell0"},
+                                        {
+                                            "Key": "Name",
+                                            "Value": "layerv-nhp-sandbox-extra",
+                                        },
+                                    ]
+                                    if "/net/extra-main-nhp/" in arn
+                                    else (
+                                        [
+                                            {"Key": "Environment", "Value": "sandbox"},
+                                            {"Key": "Component", "Value": "unrelated"},
+                                            {
+                                                "Key": "Name",
+                                                "Value": "unrelated-product-udp",
+                                            },
+                                        ]
+                                        if "/net/unrelated-main/" in arn
+                                        else (
+                                            [
+                                                {
+                                                    "Key": "Environment",
+                                                    "Value": "sandbox",
+                                                },
+                                                {
+                                                    "Key": "Component",
+                                                    "Value": "compute",
+                                                },
+                                                {"Key": "Cell", "Value": "cell0"},
+                                                {
+                                                    "Key": "Name",
+                                                    "Value": "layerv-nhp-sandbox-srv-int-nlb",
+                                                },
+                                            ]
+                                            if "/net/internal-main-nhp/" in arn
+                                            else (
+                                                [
+                                                    {
+                                                        "Key": "Environment",
+                                                        "Value": "sandbox",
+                                                    },
+                                                    {
+                                                        "Key": "Component",
+                                                        "Value": "compute",
+                                                    },
+                                                    {"Key": "Cell", "Value": "cell0"},
+                                                    {
+                                                        "Key": "Name",
+                                                        "Value": "layerv-nhp-sandbox-tg-udp",
+                                                    },
+                                                ]
+                                                if arn == "tg-server-public-recorded"
+                                                else (
+                                                    [
+                                                        {
+                                                            "Key": "Environment",
+                                                            "Value": "sandbox",
+                                                        },
+                                                        {
+                                                            "Key": "Component",
+                                                            "Value": "compute",
+                                                        },
+                                                        {
+                                                            "Key": "Cell",
+                                                            "Value": "cell0",
+                                                        },
+                                                        {
+                                                            "Key": "Name",
+                                                            "Value": "layerv-nhp-sandbox-tg-srv-int-udp-blue",
+                                                        },
+                                                        {
+                                                            "Key": "DeployColor",
+                                                            "Value": "blue",
+                                                        },
+                                                    ]
+                                                    if arn
+                                                    == "tg-server-internal-recorded"
+                                                    else [
+                                                        {
+                                                            "Key": "Environment",
+                                                            "Value": "sandbox",
+                                                        },
+                                                        {
+                                                            "Key": "Service",
+                                                            "Value": "nhp-relay",
+                                                        },
+                                                        {
+                                                            "Key": "Component",
+                                                            "Value": "relay",
+                                                        },
+                                                        {
+                                                            "Key": "Name",
+                                                            "Value": "layerv-nhp-sandbox-relay",
+                                                        },
+                                                    ]
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        ),
                     }
                     for arn in args[1:]
                 ]
@@ -1176,16 +1353,42 @@ class RecordedStructuralAws:
                 "SecurityGroups": [
                     {
                         "GroupId": group_id,
-                        "VpcId": dmz_vpc,
+                        "VpcId": (
+                            main_vpc if group_id == "sg-server-recorded" else dmz_vpc
+                        ),
                         "GroupName": group_id,
-                        "IpPermissions": [],
+                        "IpPermissions": (
+                            [
+                                {
+                                    "IpProtocol": "udp",
+                                    "FromPort": 62207,
+                                    "ToPort": 62207,
+                                    "UserIdGroupPairs": [
+                                        {"GroupId": "sg-server-recorded"}
+                                    ],
+                                }
+                            ]
+                            if group_id == "sg-relay-recorded"
+                            else (
+                                [
+                                    {
+                                        "IpProtocol": "udp",
+                                        "FromPort": 62206,
+                                        "ToPort": 62206,
+                                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                                    }
+                                ]
+                                if group_id == "sg-server-recorded"
+                                else []
+                            )
+                        ),
                         "IpPermissionsEgress": [],
                     }
                     for group_id in (
                         "sg-relay-recorded",
                         "sg-endpoint-recorded",
                         "sg-alb-recorded",
-                        "sg-native-nhp-recorded",
+                        "sg-server-recorded",
                     )
                     if group_id in args
                 ]
@@ -1253,22 +1456,91 @@ class RecordedStructuralAws:
                             "ListenerArn": "listener-public-main-nhp",
                             "Port": 62206,
                             "Protocol": self.public_main_vpc_nhp_protocol,
+                            "DefaultActions": [
+                                {
+                                    "Type": "forward",
+                                    "TargetGroupArn": "tg-server-public-recorded",
+                                }
+                            ],
                         }
                     ]
                 }
-            if RECORDED_NATIVE_LB_ARN in args:
+            if any("/net/internal-main-nhp/" in arg for arg in args):
                 return {
                     "Listeners": [
                         {
-                            "ListenerArn": "native-listener-recorded",
+                            "ListenerArn": "listener-internal-main-nhp",
                             "Port": 62206,
                             "Protocol": "UDP",
                             "DefaultActions": [
                                 {
                                     "Type": "forward",
-                                    "TargetGroupArn": RECORDED_NATIVE_TG_ARN,
+                                    "TargetGroupArn": "tg-server-internal-recorded",
                                 }
                             ],
+                        }
+                    ]
+                }
+            if any("/net/extra-main-nhp/" in arg for arg in args):
+                return {
+                    "Listeners": [
+                        {
+                            "ListenerArn": "listener-extra-main-nhp",
+                            "Port": 62207,
+                            "Protocol": "UDP",
+                            "DefaultActions": [],
+                        }
+                    ]
+                }
+            if any("/net/unrelated-main/" in arg for arg in args):
+                distinct_target = self.extra_public_main_vpc_nlb in {
+                    "distinct_target",
+                    "distinct_ip_target",
+                    "distinct_standalone_target",
+                    "distinct_target_pending",
+                    "distinct_target_unhealthy",
+                    "tagged_target",
+                }
+                return {
+                    "Listeners": [
+                        {
+                            "ListenerArn": "listener-unrelated-main",
+                            "Port": (
+                                62207
+                                if self.extra_public_main_vpc_nlb
+                                in {
+                                    "shared_target",
+                                    "distinct_target",
+                                    "distinct_ip_target",
+                                    "distinct_standalone_target",
+                                    "distinct_target_pending",
+                                    "distinct_target_unhealthy",
+                                    "tagged_target",
+                                }
+                                else 5353
+                            ),
+                            "Protocol": "UDP",
+                            "DefaultActions": (
+                                [
+                                    {
+                                        "Type": "forward",
+                                        "TargetGroupArn": "tg-server-public-recorded",
+                                    }
+                                ]
+                                if self.extra_public_main_vpc_nlb == "shared_target"
+                                else (
+                                    [
+                                        {
+                                            "Type": "forward",
+                                            "TargetGroupArn": (
+                                                "tg-server-distinct-recorded"
+                                            ),
+                                        }
+                                    ]
+                                    if distinct_target
+                                    else []
+                                )
+                            ),
                         }
                     ]
                 }
@@ -1314,36 +1586,64 @@ class RecordedStructuralAws:
                             "TargetGroupName": "rlytls-current",
                             "VpcId": dmz_vpc,
                         },
-                        {
-                            "TargetGroupArn": RECORDED_NATIVE_TG_ARN,
-                            "TargetGroupName": "rlyudp-current",
-                            "VpcId": dmz_vpc,
-                        },
-                        {
-                            "TargetGroupArn": "tg-dmz-orphan-recorded",
-                            "TargetGroupName": "rlyudp-old",
-                            "VpcId": dmz_vpc,
-                        },
                     ]
                 }
-            if RECORDED_NATIVE_TG_ARN in args:
+            if "tg-server-public-recorded" in args:
                 return {
                     "TargetGroups": [
                         {
-                            "TargetGroupArn": RECORDED_NATIVE_TG_ARN,
-                            "VpcId": dmz_vpc,
+                            "TargetGroupArn": "tg-server-public-recorded",
+                            "TargetGroupName": "layerv-nhp-sandbox-udp",
+                            "VpcId": main_vpc,
                             "Protocol": "UDP",
                             "Port": 62206,
                             "TargetType": "instance",
                             "HealthCheckEnabled": True,
-                            "HealthCheckProtocol": "HTTPS",
-                            "HealthCheckPort": "8080",
-                            "HealthCheckPath": "/health/native-ready",
+                            "HealthCheckProtocol": "HTTP",
+                            "HealthCheckPort": "8888",
+                            "HealthCheckPath": "/health/live",
                             "Matcher": {"HttpCode": "200"},
-                            "HealthyThresholdCount": 2,
-                            "UnhealthyThresholdCount": 2,
-                            "HealthCheckIntervalSeconds": 15,
-                            "HealthCheckTimeoutSeconds": 5,
+                        }
+                    ]
+                }
+            if "tg-server-internal-recorded" in args:
+                return {
+                    "TargetGroups": [
+                        {
+                            "TargetGroupArn": "tg-server-internal-recorded",
+                            "TargetGroupName": "layerv-nhp-sandbox-srv-int-udp",
+                            "VpcId": main_vpc,
+                            "Protocol": "UDP",
+                            "Port": 62206,
+                            "TargetType": "instance",
+                            "HealthCheckEnabled": True,
+                            "HealthCheckProtocol": "HTTP",
+                            "HealthCheckPort": "8888",
+                            "HealthCheckPath": "/health/live",
+                            "Matcher": {"HttpCode": "200"},
+                        }
+                    ]
+                }
+            if "tg-server-distinct-recorded" in args:
+                return {
+                    "TargetGroups": [
+                        {
+                            "TargetGroupArn": "tg-server-distinct-recorded",
+                            "TargetGroupName": "unrelated-looking-target",
+                            "VpcId": main_vpc,
+                            "Protocol": "UDP",
+                            "Port": 62206,
+                            "TargetType": (
+                                "ip"
+                                if self.extra_public_main_vpc_nlb
+                                == "distinct_ip_target"
+                                else "instance"
+                            ),
+                            "HealthCheckEnabled": True,
+                            "HealthCheckProtocol": "HTTP",
+                            "HealthCheckPort": "8888",
+                            "HealthCheckPath": "/health/live",
+                            "Matcher": {"HttpCode": "200"},
                         }
                     ]
                 }
@@ -1367,6 +1667,52 @@ class RecordedStructuralAws:
                     }
                 ]
             }
+        if (service, operation) == ("elbv2", "describe-target-health"):
+            if (
+                "tg-server-public-recorded" in args
+                or "tg-server-internal-recorded" in args
+                or (
+                    "tg-server-distinct-recorded" in args
+                    and self.extra_public_main_vpc_nlb
+                    in {
+                        "distinct_target",
+                        "distinct_ip_target",
+                        "distinct_standalone_target",
+                        "distinct_target_pending",
+                        "distinct_target_unhealthy",
+                    }
+                )
+            ):
+                return {
+                    "TargetHealthDescriptions": [
+                        {
+                            "Target": {
+                                "Id": (
+                                    "10.100.10.50"
+                                    if self.extra_public_main_vpc_nlb
+                                    == "distinct_ip_target"
+                                    else "i-standalone-recorded"
+                                    if self.extra_public_main_vpc_nlb
+                                    == "distinct_standalone_target"
+                                    else "i-server-recorded"
+                                ),
+                                "Port": 62206,
+                            },
+                            "TargetHealth": {
+                                "State": (
+                                    "unhealthy"
+                                    if self.extra_public_main_vpc_nlb
+                                    == "distinct_target_unhealthy"
+                                    else "initial"
+                                    if self.extra_public_main_vpc_nlb
+                                    == "distinct_target_pending"
+                                    else "healthy"
+                                )
+                            },
+                        }
+                    ]
+                }
+            return {"TargetHealthDescriptions": []}
         if (service, operation) == (
             "elbv2",
             "describe-target-group-attributes",
@@ -1485,68 +1831,6 @@ class RecordedStructuralAws:
                     "DestinationArn": resolver_log_group,
                     "Name": "relay-resolver-recorded",
                 }
-            }
-        if (service, operation) == ("route53", "list-resource-record-sets"):
-            return {
-                "ResourceRecordSets": [
-                    {
-                        "Name": "native.nhp.layerv.xyz.",
-                        "Type": "A",
-                        "AliasTarget": {
-                            "DNSName": f"{RECORDED_NATIVE_LB_DNS}.",
-                            "HostedZoneId": NATIVE_LB_ZONE_ID,
-                            "EvaluateTargetHealth": True,
-                        },
-                    }
-                ]
-            }
-        if (service, operation) == ("cloudwatch", "describe-alarms"):
-            dimensions = [
-                {"Name": "LoadBalancer", "Value": "net/relay-nhp/def456"},
-                {
-                    "Name": "TargetGroup",
-                    "Value": "targetgroup/rlyudp-recorded/789abc",
-                },
-            ]
-
-            def alarm(name: str, *, zero_ready: bool) -> dict:
-                return {
-                    "AlarmName": name,
-                    "StateValue": "OK",
-                    "StateReason": "recorded fixture is healthy",
-                    "ActionsEnabled": True,
-                    "AlarmActions": [NATIVE_ALARM_ACTION_ARN],
-                    "OKActions": [NATIVE_ALARM_ACTION_ARN],
-                    "InsufficientDataActions": [],
-                    "ComparisonOperator": (
-                        "LessThanThreshold" if zero_ready else "GreaterThanThreshold"
-                    ),
-                    "EvaluationPeriods": 2,
-                    "DatapointsToAlarm": 2,
-                    "MetricName": (
-                        "HealthyHostCount" if zero_ready else "UnHealthyHostCount"
-                    ),
-                    "Namespace": "AWS/NetworkELB",
-                    "Period": 60,
-                    "Statistic": "Minimum" if zero_ready else "Maximum",
-                    "Unit": None,
-                    "Threshold": 1 if zero_ready else 0,
-                    "TreatMissingData": "breaching" if zero_ready else "notBreaching",
-                    "Dimensions": dimensions,
-                }
-
-            return {
-                "MetricAlarms": [
-                    alarm(
-                        "layerv-nhp-sandbox-relay-native-nlb-unhealthy",
-                        zero_ready=False,
-                    ),
-                    alarm(
-                        "layerv-nhp-sandbox-relay-native-nlb-zero-healthy",
-                        zero_ready=True,
-                    ),
-                ],
-                "CompositeAlarms": [],
             }
         if (service, operation) == ("sts", "get-caller-identity"):
             return {"Account": "767397897469"}
@@ -1898,6 +2182,15 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 aws = RecordedStructuralAws(dmz_is_requester=dmz_is_requester)
                 snapshot = checker.collect_structural("sandbox", aws)
 
+                self.assertEqual("cell0", snapshot["cell_id"])
+                self.assertIn(
+                    (
+                        "ssm",
+                        "get-parameter",
+                        ("--name", "/sandbox/nhp/deploy/cell-id"),
+                    ),
+                    aws.calls,
+                )
                 self.assertEqual("vpc-main-recorded", snapshot["peer"]["main_vpc_id"])
                 self.assertEqual("10.100.0.0/16", snapshot["peer"]["main_vpc_cidr"])
                 self.assertTrue(snapshot["peer"]["dmz_dns_resolution"])
@@ -1943,108 +2236,62 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 self.assertEqual("true", snapshot["alb"]["access_logs_enabled"])
                 self.assertEqual("defensive", snapshot["alb"]["desync_mitigation_mode"])
                 self.assertEqual(
-                    {
-                        "name": "native.nhp.layerv.xyz",
-                        "hosted_zone_id": "Z10394893FM38A1RXLL32",
-                        "type": "A",
-                        "alias_dns_name": RECORDED_NATIVE_LB_DNS,
-                        "alias_hosted_zone_id": NATIVE_LB_ZONE_ID,
-                        "evaluate_target_health": True,
-                    },
-                    {
-                        key: snapshot["native_dns"][key]
-                        for key in (
-                            "name",
-                            "hosted_zone_id",
-                            "type",
-                            "alias_dns_name",
-                            "alias_hosted_zone_id",
-                            "evaluate_target_health",
-                        )
-                    },
-                )
-                self.assertEqual(2, len(snapshot["native_alarms"]["metric_alarms"]))
-                self.assertEqual([], snapshot["native_alarms"]["composite_alarm_names"])
-                self.assertEqual(
-                    RECORDED_NATIVE_LB_DNS, snapshot["native_nlb"]["dns_name"]
-                )
-                self.assertEqual(
-                    NATIVE_LB_ZONE_ID,
-                    snapshot["native_nlb"]["canonical_hosted_zone_id"],
-                )
-                partial_alarm = native_alarm_for(snapshot, "-unhealthy")
-                self.assertEqual(
-                    {
-                        "actions_enabled": True,
-                        "state_value": "OK",
-                        "alarm_actions": [NATIVE_ALARM_ACTION_ARN],
-                        "ok_actions": [NATIVE_ALARM_ACTION_ARN],
-                        "metric_name": "UnHealthyHostCount",
-                        "statistic": "Maximum",
-                        "unit": None,
-                        "threshold": 0,
-                        "dimension_count": 2,
-                        "metric_query_count": 0,
-                        "dimensions": {
-                            "LoadBalancer": "net/relay-nhp/def456",
-                            "TargetGroup": "targetgroup/rlyudp-recorded/789abc",
-                        },
-                    },
-                    {
-                        key: partial_alarm[key]
-                        for key in (
-                            "actions_enabled",
-                            "state_value",
-                            "alarm_actions",
-                            "ok_actions",
-                            "metric_name",
-                            "statistic",
-                            "unit",
-                            "threshold",
-                            "dimension_count",
-                            "metric_query_count",
-                            "dimensions",
-                        )
-                    },
-                )
-                self.assertIn(
-                    (
-                        "route53",
-                        "list-resource-record-sets",
-                        (
-                            "--hosted-zone-id",
-                            "Z10394893FM38A1RXLL32",
-                            "--start-record-name",
-                            "native.nhp.layerv.xyz",
-                            "--start-record-type",
-                            "A",
-                            "--max-items",
-                            "1",
-                        ),
-                    ),
-                    aws.calls,
-                )
-                self.assertIn(
-                    (
-                        "cloudwatch",
-                        "describe-alarms",
-                        (
-                            "--alarm-names",
-                            "layerv-nhp-sandbox-relay-native-nlb-unhealthy",
-                            "layerv-nhp-sandbox-relay-native-nlb-zero-healthy",
-                        ),
-                    ),
-                    aws.calls,
-                )
-                self.assertEqual(
-                    ["tg-dmz-orphan-recorded", "tg-old-recorded"],
+                    ["tg-old-recorded"],
                     snapshot["orphaned_legacy_resources"]["target_groups"],
                 )
                 self.assertEqual(
-                    [],
-                    snapshot["orphaned_legacy_resources"][
-                        "public_main_vpc_nhp_listeners"
+                    [
+                        {
+                            "load_balancer_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/public-main-nhp/legacy",
+                            "load_balancer_name": "layerv-nhp-sandbox-nlb",
+                            "load_balancer_tags": {
+                                "Environment": "sandbox",
+                                "Component": "compute",
+                                "Cell": "cell0",
+                                "Name": "layerv-nhp-sandbox-nlb",
+                            },
+                            "canonical": True,
+                            "listener_arn": "listener-public-main-nhp",
+                            "protocol": "UDP",
+                            "port": 62206,
+                            "target_group_arn": "tg-server-public-recorded",
+                            "target_group": {
+                                "arn": "tg-server-public-recorded",
+                                "name": "layerv-nhp-sandbox-udp",
+                                "tags": {
+                                    "Environment": "sandbox",
+                                    "Component": "compute",
+                                    "Cell": "cell0",
+                                    "Name": "layerv-nhp-sandbox-tg-udp",
+                                },
+                                "vpc_id": "vpc-main-recorded",
+                                "protocol": "UDP",
+                                "port": 62206,
+                                "target_type": "instance",
+                                "preserve_client_ip": True,
+                                "health_check_enabled": True,
+                                "health_check_protocol": "HTTP",
+                                "health_check_port": "8888",
+                                "health_check_path": "/health/live",
+                                "health_check_matcher": "200",
+                            },
+                            "targets": [
+                                {
+                                    "id": "i-server-recorded",
+                                    "port": 62206,
+                                    "state": "healthy",
+                                    "reason": None,
+                                    "instance_id": "i-server-recorded",
+                                    "asg_name": "layerv-nhp-sandbox-server",
+                                    "lifecycle_state": "InService",
+                                    "health_status": "HEALTHY",
+                                    "security_group_ids": ["sg-server-recorded"],
+                                    "private_ip_addresses": ["10.100.10.50"],
+                                }
+                            ],
+                        }
                     ],
+                    snapshot["assigned_cell_nhp_listeners"],
                 )
                 self.assertEqual(
                     [
@@ -2108,42 +2355,116 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
             checker.collect_structural("sandbox", aws)
         self.assertTrue(checker._retryable_inventory_error(raised.exception))
 
-    def test_collect_structural_records_public_main_vpc_nhp_listener_by_shape(
-        self,
-    ) -> None:
-        cases = (
-            ("layerv-nhp-sandbox-nlb", "UDP"),
-            ("renamed-rogue-edge", "TCP_UDP"),
+    def test_collect_structural_binds_public_udp_to_canonical_cell_nlb(self) -> None:
+        snapshot = checker.collect_structural(
+            "sandbox", RecordedStructuralAws(dmz_is_requester=True)
         )
-        for load_balancer_name, protocol in cases:
-            with self.subTest(name=load_balancer_name, protocol=protocol):
-                aws = RecordedStructuralAws(
-                    dmz_is_requester=True,
-                    public_main_vpc_nhp_protocol=protocol,
-                    public_main_vpc_nhp_name=load_balancer_name,
+        self.assertEqual(1, len(snapshot["assigned_cell_nhp_listeners"]))
+        self.assertEqual(1, len(snapshot["internal_cell_nhp_listeners"]))
+        self.assertFalse(
+            any(
+                "assigned cell" in error
+                for error in checker.validate_structural(snapshot)
+            )
+        )
+        self.assertFalse(
+            any(
+                "relay path" in error for error in checker.validate_structural(snapshot)
+            )
+        )
+
+        shared_target = checker.collect_structural(
+            "sandbox",
+            RecordedStructuralAws(
+                dmz_is_requester=True,
+                extra_public_main_vpc_nlb="shared_target",
+            ),
+        )
+        self.assertEqual(2, len(shared_target["assigned_cell_nhp_listeners"]))
+        self.assertTrue(
+            any(
+                "exactly one public UDP listener on 62206" in error
+                for error in checker.validate_structural(shared_target)
+            )
+        )
+
+        for ownership_evidence in (
+            "distinct_target",
+            "distinct_ip_target",
+            "distinct_standalone_target",
+            "distinct_target_pending",
+            "distinct_target_unhealthy",
+            "tagged_target",
+        ):
+            with self.subTest(ownership_evidence=ownership_evidence):
+                distinct_target = checker.collect_structural(
+                    "sandbox",
+                    RecordedStructuralAws(
+                        dmz_is_requester=True,
+                        extra_public_main_vpc_nlb=ownership_evidence,
+                    ),
                 )
-                snapshot = checker.collect_structural("sandbox", aws)
-                self.assertEqual(
-                    [
-                        {
-                            "load_balancer_arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:loadbalancer/net/public-main-nhp/legacy",
-                            "load_balancer_name": load_balancer_name,
-                            "listener_arn": "listener-public-main-nhp",
-                            "protocol": protocol,
-                            "port": 62206,
-                        }
-                    ],
-                    snapshot["orphaned_legacy_resources"][
-                        "public_main_vpc_nhp_listeners"
-                    ],
-                )
+                self.assertEqual(2, len(distinct_target["assigned_cell_nhp_listeners"]))
                 self.assertTrue(
                     any(
-                        "legacy public main-VPC UDP-capable 62206 listeners remain"
-                        in error
-                        for error in checker.validate_structural(snapshot)
+                        "exactly one public UDP listener on 62206" in error
+                        for error in checker.validate_structural(distinct_target)
                     )
                 )
+
+        with self.assertRaisesRegex(
+            checker.RetryableInventoryError,
+            "0 canonical assigned-cell NHP NLBs",
+        ):
+            checker.collect_structural(
+                "sandbox",
+                RecordedStructuralAws(
+                    dmz_is_requester=True,
+                    public_main_vpc_nhp_name="renamed-rogue-edge",
+                ),
+            )
+
+        tcp_udp = checker.collect_structural(
+            "sandbox",
+            RecordedStructuralAws(
+                dmz_is_requester=True,
+                public_main_vpc_nhp_protocol="TCP_UDP",
+            ),
+        )
+        self.assertTrue(
+            any(
+                "canonical tagged compute NLB UDP 62206 edge" in error
+                for error in checker.validate_structural(tcp_udp)
+            )
+        )
+
+        unrelated_aws = RecordedStructuralAws(
+            dmz_is_requester=True, extra_public_main_vpc_nlb="unrelated"
+        )
+        unrelated = checker.collect_structural("sandbox", unrelated_aws)
+        self.assertEqual(1, len(unrelated["assigned_cell_nhp_listeners"]))
+        self.assertTrue(
+            any(
+                service == "elbv2"
+                and operation == "describe-listeners"
+                and any("/net/unrelated-main/" in arg for arg in args)
+                for service, operation, args in unrelated_aws.calls
+            )
+        )
+
+        second_nhp = checker.collect_structural(
+            "sandbox",
+            RecordedStructuralAws(
+                dmz_is_requester=True, extra_public_main_vpc_nlb="nhp"
+            ),
+        )
+        self.assertEqual(2, len(second_nhp["assigned_cell_nhp_listeners"]))
+        self.assertTrue(
+            any(
+                "exactly one public UDP listener on 62206" in error
+                for error in checker.validate_structural(second_nhp)
+            )
+        )
 
     def test_collect_structural_rejects_peer_without_main_vpc_id(self) -> None:
         for dmz_is_requester in (True, False):
@@ -2164,6 +2485,39 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                     if service == "ec2" and operation == "describe-vpcs"
                 ]
                 self.assertEqual([], describe_vpc_calls)
+
+    def test_collect_structural_prod_canary_does_not_read_active_color(self) -> None:
+        class ProdCanaryAws(RecordedStructuralAws):
+            def call(self, service: str, operation: str, *args: str) -> dict:
+                parameter_name = (
+                    args[args.index("--name") + 1]
+                    if (service, operation) == ("ssm", "get-parameter")
+                    else ""
+                )
+                if parameter_name.endswith("/server/active-color"):
+                    raise AssertionError("canary collector must not read active-color")
+                result = super().call(service, operation, *args)
+                if parameter_name.endswith("/deploy/mode"):
+                    result = {"Parameter": {"Value": "canary"}}
+                return json.loads(json.dumps(result).replace("sandbox", "prod"))
+
+        aws = ProdCanaryAws(dmz_is_requester=True)
+        snapshot = checker.collect_structural("prod", aws)
+        self.assertEqual("canary", snapshot["server_deploy_mode"])
+        self.assertEqual("blue", snapshot["server_active_color"])
+        self.assertFalse(
+            any(
+                service == "ssm"
+                and operation == "get-parameter"
+                and any(arg.endswith("/server/active-color") for arg in args)
+                for service, operation, args in aws.calls
+            )
+        )
+        errors = checker.validate_structural(snapshot)
+        self.assertFalse(
+            any("assigned cell" in error or "relay path" in error for error in errors),
+            errors,
+        )
 
     def test_collector_singleton_cardinality_classification_at_raise_site(
         self,
@@ -2187,8 +2541,8 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 elif (service, operation) == (
                     "elbv2",
                     "describe-load-balancers",
-                ) and self.target in {"alb", "native"}:
-                    wanted_type = "application" if self.target == "alb" else "network"
+                ) and self.target == "alb":
+                    wanted_type = "application"
                     rows = result["LoadBalancers"]
                     matched = [row for row in rows if row.get("Type") == wanted_type]
                     others = [row for row in rows if row.get("Type") != wanted_type]
@@ -2213,7 +2567,6 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
         expectations = {
             "asg": "canonical ASG 'layerv-nhp-sandbox-relay-dmz' resolved to {count} groups",
             "alb": "relay DMZ VPC has {count} canonical ALBs",
-            "native": "relay DMZ VPC has {count} canonical native NHP NLBs",
             "peer": "relay DMZ VPC has {count} active peers",
         }
         for target, message in expectations.items():
@@ -2256,12 +2609,12 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
     ) -> None:
         aws = RecordedStructuralAws(
             dmz_is_requester=True,
-            extra_untagged_lb_reuses_alb_sg=True,
+            extra_untagged_dmz_lb=True,
         )
 
         with self.assertRaisesRegex(
             checker.InventoryError,
-            "noncanonical DMZ load balancers reuse a canonical relay edge security group",
+            "load-balancer inventory must contain exactly the canonical HTTPS ALB",
         ):
             checker.collect_structural("sandbox", aws)
 
@@ -2829,33 +3182,9 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
             environment_variables = (
                 REPO_ROOT / f"terraform/environments/{environment}/variables.tf"
             ).read_text()
-            environment_tfvars = (
-                REPO_ROOT / f"terraform/environments/{environment}/terraform.tfvars"
-            ).read_text()
             self.assertRegex(
                 environment_variables,
                 r'(?s)variable "cell_id".*?default\s+=\s+"cell0"',
-            )
-            native_dns = checker.EXPECTED_NATIVE_DNS[environment]
-            domain_name = native_dns["fqdn"].removeprefix("native.")
-            hosted_zone = domain_name.removeprefix("nhp.")
-            self.assertRegex(
-                environment_tfvars,
-                rf'(?m)^domain_name\s+=\s+"{re.escape(domain_name)}"\s*(?:#.*)?$',
-            )
-            self.assertRegex(
-                environment_tfvars,
-                rf'(?m)^hosted_zone\s+=\s+"{re.escape(hosted_zone)}"\s*(?:#.*)?$',
-            )
-            # Prod bypasses lookup with the root hosted_zone_id. Sandbox owns
-            # the zone and resolves it by name; qurl_hosted_zone_id pins the
-            # same layerv.xyz zone ID in that environment file.
-            zone_id_variable = (
-                "hosted_zone_id" if environment == "prod" else "qurl_hosted_zone_id"
-            )
-            self.assertRegex(
-                environment_tfvars,
-                rf'(?m)^{zone_id_variable}\s+=\s+"{re.escape(native_dns["hosted_zone_id"])}"\s*(?:#.*)?$',
             )
 
         for contract in checker.RELAY_DMZ_NETWORK_CONTRACTS.values():
@@ -2864,11 +3193,13 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 for cidr in contract[tier]:
                     self.assertIn(cidr, plan_checker)
         self.assertIn(
-            f'EXPECTED_SANDBOX_NATIVE_NHP_FQDN = "{checker.EXPECTED_NATIVE_DNS["sandbox"]["fqdn"]}"',
+            "assigned cell must retain exactly one canonically named and tagged internet-facing server NLB",
             plan_checker,
         )
-        self.assertIn("relay_native_nlb_unhealthy_targets", plan_checker)
-        self.assertIn("relay_native_nlb_zero_healthy_targets", plan_checker)
+        self.assertIn(
+            "assigned cell public NHP NLB must expose exactly one UDP listener on 62206",
+            plan_checker,
+        )
 
         # Principal="*" is an intentional authored-shape contract shared with
         # the plan checker, not accidental semantic normalization.
@@ -3032,412 +3363,181 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
         self.assertIn("unexpected validator failure (RuntimeError)", output.getvalue())
         self.assertNotIn("Traceback", output.getvalue())
 
-    def test_structural_mutations_fail_closed(self) -> None:
+    def test_direct_cell_and_https_only_structural_mutations_fail_closed(self) -> None:
         cases = {
-            "public address": lambda data: data["instances"][0].update(
-                {"public_ip": "203.0.113.1"}
+            "missing assigned-cell UDP edge": lambda data: data.update(
+                {"assigned_cell_nhp_listeners": []}
             ),
-            "undersized fleet": lambda data: data["instances"].pop(),
-            "ASG member not InService": lambda data: data["canonical_asg"]["members"][
-                0
-            ].update({"lifecycle_state": "Pending"}),
-            "EC2 instance stopped": lambda data: data["instances"][0].update(
-                {"state": "stopped"}
-            ),
-            "legacy ASG remains": lambda data: data["orphaned_legacy_resources"][
-                "asgs"
-            ].append("layerv-nhp-sandbox-relay"),
-            "orphan relay target group remains": lambda data: data[
-                "orphaned_legacy_resources"
-            ]["target_groups"].append("tg-dmz-orphan"),
-            "rogue relay ENI": lambda data: data["relay_network_interfaces"].append(
-                {
-                    "id": "eni-rogue",
-                    "subnet_id": "subnet-relay-0",
-                    "private_ip": "10.101.10.99",
-                    "public_ip": None,
-                    "ipv6": [],
-                    "security_group_ids": ["sg-relay"],
-                    "status": "in-use",
-                }
-            ),
-            "untagged subnet": lambda data: data["subnets"][0].update({"tier": None}),
-            "secondary IPv4 CIDR": lambda data: data["vpc"][
-                "ipv4_cidr_associations"
-            ].append({"cidr": "10.102.0.0/16", "state": "associating"}),
-            "transitional IPv6 CIDR": lambda data: data["vpc"][
-                "ipv6_cidr_associations"
-            ].append({"cidr": "2001:db8::/56", "state": "disassociating"}),
-            "second reverse-direction peer": lambda data: data["peer"].update(
-                {"active_peer_count": 2}
-            ),
-            "relay default route": lambda data: data["subnets"][1]["routes"].append(
-                route("0.0.0.0/0", "nat", "nat-bad")
-            ),
-            "extra public route": lambda data: data["subnets"][0]["routes"].append(
-                route("192.0.2.0/24", "transit_gateway", "tgw-bad")
-            ),
-            "extra relay route": lambda data: data["subnets"][1]["routes"].append(
-                route("192.0.2.0/24", "network_interface", "eni-bad")
-            ),
-            "extra endpoint route": lambda data: data["subnets"][2]["routes"].append(
-                route("192.0.2.0/24", "peering", "pcx-bad")
-            ),
-            "extra relay egress": lambda data: data["security_groups"]["by_id"][
-                "sg-relay"
-            ]["outbound"].append(rule("tcp", 80, 80, "cidr_ipv4", "0.0.0.0/0")),
-            "server broad UDP overlap": lambda data: data["security_groups"]["by_id"][
-                "sg-server"
-            ]["inbound"].append(rule("udp", 0, 65535, "cidr_ipv4", "0.0.0.0/0")),
-            "server all-protocol overlap": lambda data: data["security_groups"][
-                "by_id"
-            ]["sg-server"]["inbound"].append(
-                rule("-1", None, None, "cidr_ipv4", "0.0.0.0/0")
-            ),
-            "endpoint allow all": lambda data: data["endpoints"][0]["policy"][
-                "Statement"
-            ][0].update({"Action": "*"}),
-            "duplicate interface endpoint": lambda data: data["endpoints"].append(
-                copy.deepcopy(data["endpoints"][0])
-            ),
-            "endpoint unexpected write": lambda data: data["endpoints"][5]["policy"][
-                "Statement"
-            ][0].update(
-                {
-                    "Action": [
-                        "secretsmanager:GetSecretValue",
-                        "secretsmanager:PutSecretValue",
-                    ]
-                }
-            ),
-            "noncommercial secret ARN": lambda data: data["endpoints"][5]["policy"][
-                "Statement"
-            ][0].update(
-                {
-                    "Resource": "arn:aws-us-gov:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox-relay-abc"
-                }
-            ),
-            "cross-account secret ARN": lambda data: data["endpoints"][5]["policy"][
-                "Statement"
-            ][0].update(
-                {
-                    "Resource": "arn:aws:secretsmanager:us-east-2:111122223333:secret:layerv-nhp-sandbox-relay-abc"
-                }
-            ),
-            "duplicate GuardDuty endpoint": lambda data: data["endpoints"].append(
-                copy.deepcopy(data["endpoints"][2])
-            ),
-            "GuardDuty policy extra statement": lambda data: data["endpoints"][2][
-                "policy"
-            ]["Statement"].append(
-                {
-                    "Effect": "Allow",
-                    "Principal": "*",
-                    "Action": "guardduty:Put",
-                    "Resource": "*",
-                }
-            ),
-            "incomplete endpoint deny": lambda data: data["endpoints"][3]["policy"][
-                "Statement"
-            ][1].update({"Principal": {"AWS": "*"}}),
-            "missing main return route": lambda data: data["main_private_routes"][0][
-                "routes"
-            ].pop(1),
-            "legacy main private table": lambda data: data["main_private_routes"][0][
-                "route_table_tags"
-            ].update({"Name": "layerv-nhp-sandbox-rtb-private-0"}),
-            "missing main NAT default": lambda data: data["main_private_routes"][0][
-                "routes"
-            ].pop(),
-            "public relay ENI": lambda data: data["relay_network_interfaces"][0].update(
-                {"public_ip": "203.0.113.2"}
-            ),
-            "DNS fail open": lambda data: data["resolver"].update(
-                {"firewall_fail_open": "ENABLED"}
-            ),
-            "Resolver mutation protection": lambda data: data["resolver"][
-                "firewall_associations"
-            ][0].update({"mutation_protection": "ENABLED"}),
-            "extra Resolver rule": lambda data: data["resolver"][
-                "firewall_associations"
-            ][0]["rules"].append(
-                {
-                    "action": "BLOCK",
-                    "priority": 850,
-                    "domains": ["unexpected.example"],
-                    "block_response": "NODATA",
-                    "dns_threat_protection": None,
-                }
-            ),
-            "advanced DNS override response": lambda data: data["resolver"][
-                "firewall_associations"
-            ][0]["rules"][0].update({"block_response": "OVERRIDE"}),
-            "fractional advanced DNS priority": lambda data: data["resolver"][
-                "firewall_associations"
-            ][0]["rules"][0].update({"priority": 100.9}),
-            "catch-all DNS override response": lambda data: data["resolver"][
-                "firewall_associations"
-            ][0]["rules"][-1].update({"block_response": "OVERRIDE"}),
-            "fractional catch-all DNS priority": lambda data: data["resolver"][
-                "firewall_associations"
-            ][0]["rules"][-1].update({"priority": 900.9}),
-            "wrong Resolver log destination": lambda data: data["resolver"][
-                "query_log_configs"
-            ][0].update(
-                {
-                    "destination_arn": "arn:aws:logs:us-east-2:767397897469:log-group:/wrong"
-                }
-            ),
-            "different log KMS keys": lambda data: data["security_log_groups"][
-                "resolver"
-            ].update({"kms_key_id": "arn:aws:kms:us-east-2:767397897469:key/wrong"}),
-            "broad log KMS context": lambda data: data["logs_kms_policy"]["Statement"][
-                1
-            ]["Condition"]["ArnEquals"].update(
-                {"kms:EncryptionContext:aws:logs:arn": ["*"]}
-            ),
-            "extra log KMS statement": lambda data: data["logs_kms_policy"][
-                "Statement"
-            ].append(
-                {
-                    "Effect": "Allow",
-                    "Principal": {"AWS": "*"},
-                    "Action": "kms:Decrypt",
-                    "Resource": "*",
-                }
-            ),
-            "wrong flow log destination": lambda data: data["flow_logs"][0].update(
-                {
-                    "destination_arn": "arn:aws:logs:us-east-2:767397897469:log-group:/wrong"
-                }
-            ),
-            "target group HTTP": lambda data: data["alb"]["target_groups"][0].update(
-                {"protocol": "HTTP"}
-            ),
-            "target group wrong health": lambda data: data["alb"]["target_groups"][
-                0
-            ].update({"health_check_path": "/"}),
-            "missing WAF": lambda data: data["alb"].update({"waf_arn": None}),
-            "ALB deletion protection drift": lambda data: data["alb"].update(
-                {"deletion_protection_enabled": "true"}
-            ),
-            "ALB HTTP hardening drift": lambda data: data["alb"].update(
-                {"drop_invalid_headers_enabled": "false"}
-            ),
-            "ALB XFF client port drift": lambda data: data["alb"].update(
-                {"xff_client_port_enabled": "true"}
-            ),
-            "ALB WAF fail-open drift": lambda data: data["alb"].update(
-                {"waf_fail_open_enabled": "true"}
-            ),
-            "ALB log destination drift": lambda data: data["alb"].update(
-                {"access_logs_bucket": "attacker-controlled-bucket"}
-            ),
-            "ALB ownership tag drift": lambda data: data["alb"]["tags"].pop(
-                "Component"
-            ),
-            "native NHP ack port exposed": lambda data: data["native_nlb"]["listeners"][
+            "public ACK port": lambda data: data["assigned_cell_nhp_listeners"][
                 0
             ].update({"port": 62207}),
-            "native NHP direct IP targets": lambda data: data["native_nlb"][
-                "target_groups"
-            ][0].update({"target_type": "ip"}),
-            "native NHP client IP lost": lambda data: data["native_nlb"][
-                "target_groups"
-            ][0].update({"preserve_client_ip": "false"}),
-            "native NHP liveness is not readiness": lambda data: data["native_nlb"][
-                "target_groups"
-            ][0].update({"health_check_path": "/health/live"}),
-            "native NHP wrong listener target": lambda data: data["native_nlb"][
-                "listeners"
-            ][0]["actions"][0].update({"TargetGroupArn": "wrong-tg"}),
-            "native NHP missing public subnet": lambda data: data["native_nlb"][
-                "subnet_ids"
-            ].pop(),
-            "native NHP cross-zone off": lambda data: data["native_nlb"].update(
-                {"cross_zone_enabled": "false"}
+            "rogue cell NLB identity": lambda data: data["assigned_cell_nhp_listeners"][
+                0
+            ].update({"canonical": False, "load_balancer_name": "rogue-cell-edge"}),
+            "wrong cell ownership tag": lambda data: data[
+                "assigned_cell_nhp_listeners"
+            ][0]["load_balancer_tags"].update({"Cell": "cell1"}),
+            "listener target-group miswire": lambda data: data[
+                "assigned_cell_nhp_listeners"
+            ][0].update({"target_group_arn": "rogue-target-group"}),
+            "public target disables client IP preservation": lambda data: data[
+                "assigned_cell_nhp_listeners"
+            ][0]["target_group"].update({"preserve_client_ip": False}),
+            "unhealthy cell target": lambda data: data["assigned_cell_nhp_listeners"][
+                0
+            ]["targets"][0].update({"state": "unhealthy"}),
+            "rogue target group ownership": lambda data: data[
+                "assigned_cell_nhp_listeners"
+            ][0]["target_group"].update(
+                {"name": "rogue-udp", "tags": {"Name": "rogue-udp"}}
             ),
-            "native NHP ownership tag missing": lambda data: data["native_nlb"][
-                "tags"
-            ].pop("Service"),
-            "native stable alias missing": lambda data: data.update(
-                {"native_dns": {"record_count": 0}}
+            "public target color differs from active marker": lambda data: (
+                data["assigned_cell_nhp_listeners"][0]["target_group"].update(
+                    {
+                        "name": "layerv-nhp-sandbox-udp-grn",
+                        "tags": {
+                            "Environment": "sandbox",
+                            "Component": "compute",
+                            "Cell": "cell0",
+                            "Name": "layerv-nhp-sandbox-tg-udp-green",
+                        },
+                    }
+                ),
+                data["assigned_cell_nhp_listeners"][0]["targets"][0].update(
+                    {"asg_name": "layerv-nhp-sandbox-server-green"}
+                ),
             ),
-            "native stable alias retargeted": lambda data: data["native_dns"].update(
-                {"alias_dns_name": "wrong.elb.us-east-2.amazonaws.com"}
-            ),
-            "native stable alias wrong zone": lambda data: data["native_dns"].update(
-                {"alias_hosted_zone_id": "ZWRONG"}
-            ),
-            "native stable hosted zone wrong": lambda data: data["native_dns"].update(
-                {"hosted_zone_id": "ZWRONG"}
-            ),
-            "native stable alias health disabled": lambda data: data[
-                "native_dns"
-            ].update({"evaluate_target_health": False}),
-            "native stable alias weighted": lambda data: data["native_dns"].update(
-                {"set_identifier": "canary", "weight": 1}
-            ),
-            "native stable alias address record": lambda data: data[
-                "native_dns"
-            ].update({"ttl": 60, "resource_record_count": 1}),
-            "native partial alarm missing": lambda data: data["native_alarms"][
-                "metric_alarms"
-            ].remove(native_alarm_for(data, "-unhealthy")),
-            "native partial alarm wrong metric": lambda data: native_alarm_for(
-                data, "-unhealthy"
-            ).update({"metric_name": "HealthyHostCount"}),
-            "native partial alarm wrong dimension": lambda data: native_alarm_for(
-                data, "-unhealthy"
-            )["dimensions"].update({"LoadBalancer": "net/wrong/deadbeef"}),
-            "native zero alarm missing": lambda data: data["native_alarms"][
-                "metric_alarms"
-            ].remove(native_alarm_for(data, "-zero-healthy")),
-            "native zero alarm wrong missing policy": lambda data: native_alarm_for(
-                data, "-zero-healthy"
-            ).update({"treat_missing_data": "notBreaching"}),
-            "native zero alarm actions disabled": lambda data: native_alarm_for(
-                data, "-zero-healthy"
-            ).update({"actions_enabled": False}),
-            "native alarm wrong unit": lambda data: native_alarm_for(
-                data, "-unhealthy"
-            ).update({"unit": "Bytes"}),
-            "native alarm duplicate dimension": lambda data: native_alarm_for(
-                data, "-unhealthy"
-            ).update({"dimension_count": 3}),
-            "native alarm metric math": lambda data: native_alarm_for(
-                data, "-unhealthy"
-            ).update({"metric_query_count": 1}),
-            "native alarm cross-account action": lambda data: native_alarm_for(
-                data, "-unhealthy"
-            ).update(
+            "wrong target ASG": lambda data: data["assigned_cell_nhp_listeners"][0][
+                "targets"
+            ][0].update({"asg_name": "rogue-asg"}),
+            "wrong target server SG": lambda data: data["assigned_cell_nhp_listeners"][
+                0
+            ]["targets"][0].update({"security_group_ids": ["sg-rogue"]}),
+            "public server ACK SG rule": lambda data: data["security_groups"]["by_id"][
+                data["security_groups"]["server_ids"][0]
+            ]["inbound"].append(
                 {
-                    "alarm_actions": [
-                        "arn:aws:sns:us-east-2:111122223333:wrong-account"
-                    ],
-                    "ok_actions": ["arn:aws:sns:us-east-2:111122223333:wrong-account"],
+                    "protocol": "udp",
+                    "from": 62207,
+                    "to": 62207,
+                    "source_type": "cidr_ipv4",
+                    "source": "0.0.0.0/0",
                 }
             ),
-            "native alarm wrong same-account topic": lambda data: native_alarm_for(
-                data, "-unhealthy"
-            ).update(
+            "second assigned-cell UDP edge": lambda data: data[
+                "assigned_cell_nhp_listeners"
+            ].append(
                 {
-                    "alarm_actions": ["arn:aws:sns:us-east-2:767397897469:wrong-topic"],
-                    "ok_actions": ["arn:aws:sns:us-east-2:767397897469:wrong-topic"],
+                    "load_balancer_arn": "rogue",
+                    "listener_arn": "rogue",
+                    "protocol": "UDP",
+                    "port": 62206,
                 }
             ),
-            "native alarm malformed NLB ARN": lambda data: data["native_nlb"].update(
-                {"arn": "not-an-elbv2-arn"}
+            "missing internal relay edge": lambda data: data.update(
+                {"internal_cell_nhp_listeners": []}
             ),
-            "native canonical composite alarm": lambda data: data["native_alarms"][
-                "composite_alarm_names"
-            ].append("layerv-nhp-sandbox-relay-native-nlb-unhealthy"),
-            "ASG missing native NHP target group": lambda data: data["canonical_asg"][
+            "internal relay ACK port": lambda data: data["internal_cell_nhp_listeners"][
+                0
+            ].update({"port": 62207}),
+            "rogue internal relay NLB identity": lambda data: data[
+                "internal_cell_nhp_listeners"
+            ][0].update({"canonical": False}),
+            "internal relay wrong target group": lambda data: data[
+                "internal_cell_nhp_listeners"
+            ][0]["target_group"].update({"name": "rogue-internal"}),
+            "internal relay disables client IP preservation": lambda data: data[
+                "internal_cell_nhp_listeners"
+            ][0]["target_group"].update({"preserve_client_ip": False}),
+            "unhealthy internal relay target": lambda data: data[
+                "internal_cell_nhp_listeners"
+            ][0]["targets"][0].update({"state": "unhealthy"}),
+            "internal relay wrong server SG": lambda data: data[
+                "internal_cell_nhp_listeners"
+            ][0]["targets"][0].update({"security_group_ids": ["sg-rogue"]}),
+            "relay ASG gains UDP target": lambda data: data["canonical_asg"][
                 "target_group_arns"
-            ].remove(NATIVE_TG_ARN),
-            "empty ASG and load balancer target groups": lambda data: (
-                data["alb"].update({"target_group_arns": []}),
-                data["native_nlb"].update({"target_group_arns": []}),
-                data["canonical_asg"].update({"target_group_arns": []}),
-            ),
+            ].append("udp-target"),
         }
-        expected_errors = {
-            "public address": "public or IPv6 address",
-            "undersized fleet": "desired instance count",
-            "ASG member not InService": "not InService and Healthy",
-            "EC2 instance stopped": "is not running",
-            "legacy ASG remains": "orphaned pre-DMZ relay asgs remain",
-            "orphan relay target group remains": "orphaned relay target groups remain",
-            "rogue relay ENI": "do not map one-to-one",
-            "untagged subnet": "unrecognized or missing Tier tag",
-            "secondary IPv4 CIDR": "unexpected secondary IPv4 CIDR",
-            "transitional IPv6 CIDR": "unexpected IPv6 CIDR",
-            "second reverse-direction peer": "exactly one inventoried active main-VPC peer",
-            "relay default route": "relay subnet subnet-relay-0 has a default route",
-            "extra public route": "public subnet subnet-public-0 route table is not exactly local plus IGW default",
-            "extra relay route": "relay subnet subnet-relay-0 route table is not exactly local, three peer /24s, and S3",
-            "extra endpoint route": "endpoint subnet subnet-endpoint-0 route table is not local-only",
-            "extra relay egress": "relay SG egress",
-            "server broad UDP overlap": "server SG rules covering UDP 62206",
-            "server all-protocol overlap": "server SG rules covering UDP 62206",
-            "endpoint allow all": "interface endpoint ecr.api action set",
-            "duplicate interface endpoint": "interface endpoint set differs from the exact required set",
-            "endpoint unexpected write": "interface endpoint secretsmanager action set",
-            "noncommercial secret ARN": "Secrets Manager endpoint is not scoped",
-            "cross-account secret ARN": "Secrets Manager endpoint is not scoped",
-            "duplicate GuardDuty endpoint": "guardduty-data must be a singleton",
-            "GuardDuty policy extra statement": "guardduty-data policy",
-            "incomplete endpoint deny": "account-boundary deny",
-            "missing main return route": "main private subnet",
-            "legacy main private table": "tagged extensible route tables",
-            "missing main NAT default": "lacks exactly one active NAT default route",
-            "public relay ENI": "relay-subnet network interface eni-relay-0 has a public or IPv6 address",
-            "DNS fail open": "fail closed",
-            "Resolver mutation protection": "mutation protection",
-            "extra Resolver rule": "Resolver firewall rule set must contain exactly the reviewed",
-            "advanced DNS override response": "exact HIGH-confidence NODATA blocks",
-            "fractional advanced DNS priority": "exact HIGH-confidence NODATA blocks",
-            "catch-all DNS override response": "priority-900 NODATA block",
-            "fractional catch-all DNS priority": "priority-900 NODATA block",
-            "wrong Resolver log destination": "query-log association",
-            "different log KMS keys": "do not use the same customer KMS key",
-            "broad log KMS context": "encryption context",
-            "extra log KMS statement": "exactly account admin plus log delivery",
-            "wrong flow log destination": "no healthy ALL-traffic CloudWatch VPC Flow Log",
-            "target group HTTP": "target group is not HTTPS:8080",
-            "target group wrong health": "target group is not HTTPS:8080",
-            "missing WAF": "has no WAF association",
-            "ALB deletion protection drift": "ALB deletion protection, WAF/HTTP hardening, or exact access-log destination",
-            "ALB HTTP hardening drift": "ALB deletion protection, WAF/HTTP hardening, or exact access-log destination",
-            "ALB XFF client port drift": "ALB deletion protection, WAF/HTTP hardening, or exact access-log destination",
-            "ALB WAF fail-open drift": "ALB deletion protection, WAF/HTTP hardening, or exact access-log destination",
-            "ALB log destination drift": "ALB deletion protection, WAF/HTTP hardening, or exact access-log destination",
-            "ALB ownership tag drift": "ALB ownership tags are incomplete",
-            "native NHP ack port exposed": "listener set is not exactly UDP 62206",
-            "native NHP direct IP targets": "target group is not instance UDP:62206",
-            "native NHP client IP lost": "target group is not instance UDP:62206",
-            "native NHP liveness is not readiness": "/health/native-ready",
-            "native NHP wrong listener target": "forwarding to its sole target group",
-            "native NHP missing public subnet": "not in exactly the DMZ public subnets",
-            "native NHP cross-zone off": "cross-zone or deletion-protection",
-            "native NHP ownership tag missing": "ownership tags are incomplete",
-            "native stable alias missing": "stable native NHP Route53 alias is missing",
-            "native stable alias retargeted": "stable native NHP Route53 alias is missing",
-            "native stable alias wrong zone": "stable native NHP Route53 alias is missing",
-            "native stable hosted zone wrong": "stable native NHP Route53 alias is missing",
-            "native stable alias health disabled": "stable native NHP Route53 alias is missing",
-            "native stable alias weighted": "uses an unreviewed routing policy",
-            "native stable alias address record": "uses an unreviewed routing policy",
-            "native partial alarm missing": "alarm inventory must be exactly two metric alarms",
-            "native partial alarm wrong metric": "partial-target-loss alarm",
-            "native partial alarm wrong dimension": "partial-target-loss alarm",
-            "native zero alarm missing": "alarm inventory must be exactly two metric alarms",
-            "native zero alarm wrong missing policy": "zero-ready-target alarm",
-            "native zero alarm actions disabled": "zero-ready-target alarm",
-            "native alarm wrong unit": "partial-target-loss alarm",
-            "native alarm duplicate dimension": "partial-target-loss alarm",
-            "native alarm metric math": "partial-target-loss alarm",
-            "native alarm cross-account action": "partial-target-loss alarm",
-            "native alarm wrong same-account topic": "partial-target-loss alarm",
-            "native alarm malformed NLB ARN": "partial-target-loss alarm",
-            "native canonical composite alarm": "no composite alarms",
-            "ASG missing native NHP target group": "not attached to exactly the HTTPS and native UDP target groups",
-            "empty ASG and load balancer target groups": "not attached to exactly the HTTPS and native UDP target groups",
+        expected = {
+            "missing assigned-cell UDP edge": "exactly one public UDP listener on 62206",
+            "public ACK port": "canonical tagged compute NLB UDP 62206 edge",
+            "rogue cell NLB identity": "canonical tagged compute NLB UDP 62206 edge",
+            "wrong cell ownership tag": "canonical tagged compute NLB UDP 62206 edge",
+            "listener target-group miswire": "canonical UDP 62206 instance target group",
+            "public target disables client IP preservation": "canonical UDP 62206 instance target group",
+            "unhealthy cell target": "healthy active-color server-ASG targets on 62206",
+            "rogue target group ownership": "canonical cell/color ownership",
+            "public target color differs from active marker": "canonical cell/color ownership",
+            "wrong target ASG": "active-color server-ASG targets",
+            "wrong target server SG": "canonical server SG",
+            "public server ACK SG rule": "public UDP-capable ingress must be exactly IPv4 UDP 62206",
+            "second assigned-cell UDP edge": "exactly one public UDP listener on 62206",
+            "missing internal relay edge": "exactly one canonical internal server UDP 62206 listener",
+            "internal relay ACK port": "canonical tagged UDP 62206 NLB edge",
+            "rogue internal relay NLB identity": "canonical tagged UDP 62206 NLB edge",
+            "internal relay wrong target group": "active-color UDP 62206 instance target group",
+            "internal relay disables client IP preservation": "active-color UDP 62206 instance target group",
+            "unhealthy internal relay target": "healthy active-color server-ASG targets on 62206",
+            "internal relay wrong server SG": "canonical server SG",
+            "relay ASG gains UDP target": "attached to exactly the HTTPS target group",
         }
         for name, mutate in cases.items():
             with self.subTest(name=name):
                 snapshot = good_snapshot()
                 mutate(snapshot)
-                errors = checker.validate_snapshot(snapshot, "structural")
                 self.assertTrue(
-                    any(expected_errors[name] in error for error in errors), errors
+                    any(
+                        expected[name] in error
+                        for error in checker.validate_structural(snapshot)
+                    )
                 )
+
+    def test_green_active_color_accepts_matching_public_and_internal_targets(
+        self,
+    ) -> None:
+        snapshot = good_snapshot()
+        snapshot["server_active_color"] = "green"
+        public_edge = snapshot["assigned_cell_nhp_listeners"][0]
+        public_edge["target_group"].update(
+            {
+                "name": "layerv-nhp-sandbox-udp-grn",
+                "tags": {
+                    "Environment": "sandbox",
+                    "Component": "compute",
+                    "Cell": "cell0",
+                    "Name": "layerv-nhp-sandbox-tg-udp-green",
+                },
+            }
+        )
+        public_edge["targets"][0]["asg_name"] = "layerv-nhp-sandbox-server-green"
+        internal_edge = snapshot["internal_cell_nhp_listeners"][0]
+        internal_edge["target_group"].update(
+            {
+                "name": "layerv-nhp-sandbox-srv-int-grn",
+                "tags": {
+                    "Environment": "sandbox",
+                    "Component": "compute",
+                    "Cell": "cell0",
+                    "Name": "layerv-nhp-sandbox-tg-srv-int-udp-green",
+                    "DeployColor": "green",
+                },
+            }
+        )
+        internal_edge["targets"][0]["asg_name"] = "layerv-nhp-sandbox-server-green"
+        errors = checker.validate_structural(snapshot)
+        self.assertFalse(
+            any("assigned cell" in error or "relay path" in error for error in errors),
+            errors,
+        )
 
     def test_core_structural_fences_have_direct_negative_coverage(self) -> None:
         cases = (
             (
-                "schema version",
-                lambda data: data.update({"schema_version": 0}),
+                "previous schema version",
+                lambda data: data.update(
+                    {"schema_version": checker.SCHEMA_VERSION - 1}
+                ),
                 f"snapshot schema_version must be {checker.SCHEMA_VERSION}",
             ),
             (
@@ -3456,11 +3556,9 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 "no relay-subnet network interfaces were inventoried",
             ),
             (
-                "missing public main-VPC NHP listener inventory",
-                lambda data: data["orphaned_legacy_resources"].pop(
-                    "public_main_vpc_nhp_listeners"
-                ),
-                "public main-VPC NHP listener inventory is missing or malformed",
+                "missing assigned-cell NHP listener inventory",
+                lambda data: data.pop("assigned_cell_nhp_listeners"),
+                "assigned-cell public NHP listener inventory is missing or malformed",
             ),
             (
                 "ec2messages endpoint",
@@ -3501,83 +3599,30 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
 
     def test_security_group_contract_mutations_fail_exactly(self) -> None:
         cases = {
-            "non-singular identity": (
-                lambda data: data["security_groups"]["relay_ids"].append(
-                    "sg-relay-extra"
-                ),
-                "relay, ALB, native NHP NLB, endpoint, and server SG identities must each be singular",
-            ),
             "relay ingress": (
                 lambda data: data["security_groups"]["by_id"]["sg-relay"][
                     "inbound"
-                ].pop(),
-                "relay SG ingress differs from ALB:8080, native NHP NLB UDP:62206/health:8080, plus server:62207",
-            ),
-            "ALB ingress": (
-                lambda data: data["security_groups"]["by_id"]["sg-alb"]["inbound"][
-                    0
-                ].update({"source": "10.0.0.0/8"}),
-                "ALB SG ingress is not exactly public TCP 443",
-            ),
-            "ALB egress": (
-                lambda data: data["security_groups"]["by_id"]["sg-alb"]["outbound"][
-                    0
-                ].update({"from": 443, "to": 443}),
-                "ALB SG egress is not exactly relay TCP 8080",
-            ),
-            "native NHP public ACK ingress": (
-                lambda data: data["security_groups"]["by_id"]["sg-native-nhp"][
-                    "inbound"
-                ][0].update({"from": 62207, "to": 62207}),
-                "native NHP NLB SG ingress is not exactly public UDP 62206",
-            ),
-            "native NHP broad egress": (
-                lambda data: data["security_groups"]["by_id"]["sg-native-nhp"][
-                    "outbound"
-                ][0].update({"source_type": "cidr_ipv4", "source": "0.0.0.0/0"}),
-                "native NHP NLB SG egress is not exactly relay UDP 62206 plus HTTPS health TCP 8080",
-            ),
-            "endpoint ingress": (
-                lambda data: data["security_groups"]["by_id"]["sg-endpoint"]["inbound"][
-                    0
-                ].update({"from": 80, "to": 80}),
-                "endpoint SG ingress is not exactly relay TCP 443",
-            ),
-            "endpoint egress": (
-                lambda data: data["security_groups"]["by_id"]["sg-endpoint"][
-                    "outbound"
-                ].append(rule("tcp", 443, 443, "cidr_ipv4", "0.0.0.0/0")),
-                "endpoint SG must have no egress rules",
+                ].append(rule("udp", 62206, 62206, "cidr_ipv4", "0.0.0.0/0")),
+                "relay SG ingress differs from ALB:8080 plus internal server return:62207",
             ),
             "server UDP sources": (
-                lambda data: data["security_groups"]["by_id"]["sg-server"][
-                    "inbound"
-                ].pop(),
-                "server SG rules covering UDP 62206 are not exactly main VPC plus relay /24s",
+                lambda data: data["security_groups"]["by_id"]["sg-server"]["inbound"][
+                    0
+                ].update({"source": "10.100.0.0/16"}),
+                "server SG rules covering UDP 62206 are not exactly public internet plus relay /24s",
+            ),
+            "non-singular identity": (
+                lambda data: data["security_groups"]["relay_ids"].append("sg-rogue"),
+                "relay, ALB, endpoint, and server SG identities must each be singular",
             ),
         }
-        for name, (mutate, expected_error) in cases.items():
+        for name, (mutate, expected) in cases.items():
             with self.subTest(name=name):
                 snapshot = good_snapshot()
                 mutate(snapshot)
-
-                errors = checker.validate_snapshot(snapshot, "structural")
-
-                self.assertIn(expected_error, errors)
+                self.assertIn(expected, checker.validate_structural(snapshot))
 
     def test_missing_inventory_primary_errors_do_not_cascade(self) -> None:
-        snapshot = good_snapshot()
-        snapshot["native_dns"] = {"record_count": 0}
-        errors = checker.validate_snapshot(snapshot, "structural")
-        self.assertIn(
-            "stable native NHP Route53 alias is missing or does not target the canonical NLB",
-            errors,
-        )
-        self.assertNotIn(
-            "stable native NHP Route53 alias uses an unreviewed routing policy",
-            errors,
-        )
-
         snapshot = good_snapshot()
         subnets_in_tier(snapshot, "public-alb")[0]["routes"][1].update(
             {"target_type": "nat", "target": "nat-bad"}
@@ -3899,85 +3944,14 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
                 self.assertIn(expected_error, errors)
 
     def test_functional_mutations_fail_closed(self) -> None:
-        cases = {
-            "unhealthy target": lambda data: data["functional"]["target_health"][
-                0
-            ].update({"state": "unhealthy"}),
-            "old SSM Agent": lambda data: data["functional"]["ssm"][0].update(
-                {"agent_version": "3.2.1.0"}
-            ),
-            "SSM Offline": lambda data: data["functional"]["ssm"][0].update(
-                {"ping_status": "ConnectionLost"}
-            ),
-            "unhealthy GuardDuty": lambda data: data["functional"][
-                "guardduty_coverage"
-            ][0].update({"status": "UNHEALTHY"}),
-            "missing account detector": lambda data: data["functional"].update(
-                {"guardduty_detector_count": 0, "guardduty_coverage": []}
-            ),
-            "multiple account detectors": lambda data: data["functional"].update(
-                {"guardduty_detector_count": 2}
-            ),
-            "missing SSM row": lambda data: data["functional"]["ssm"].pop(0),
-            "missing GuardDuty row": lambda data: data["functional"][
-                "guardduty_coverage"
-            ].pop(0),
-            "missing probe row": lambda data: data["functional"]["probes"].pop(0),
-            "public DNS resolves": lambda data: data["functional"]["probes"][0].update(
-                {"blocked_public_dns": False}
-            ),
-            "approved DNS fails": lambda data: data["functional"]["probes"][0].update(
-                {"allowed_dns": False}
-            ),
-            "direct public route": lambda data: data["functional"]["probes"][0].update(
-                {"public_tcp_unreachable": False}
-            ),
-            "relay stopped": lambda data: data["functional"]["probes"][0].update(
-                {"relay_active": False}
-            ),
-            "probe failed": lambda data: data["functional"]["probes"][0].update(
-                {"status": "Failed"}
-            ),
-            "native alarm breached": lambda data: native_alarm_for(
-                data, "-unhealthy"
-            ).update({"state_value": "ALARM"}),
-            "native alarm insufficient data": lambda data: native_alarm_for(
-                data, "-zero-healthy"
-            ).update({"state_value": "INSUFFICIENT_DATA"}),
-        }
-        expected_errors = {
-            "unhealthy target": "target group tg-arn does not show every canonical relay instance healthy",
-            "old SSM Agent": "relay instance i-relay-0 has SSM Agent below 3.3.40.0",
-            "SSM Offline": "relay instance i-relay-0 is not SSM Online",
-            "unhealthy GuardDuty": "relay instance i-relay-0 lacks healthy GuardDuty runtime coverage",
-            "missing account detector": "AWS account must have exactly one GuardDuty detector (found 0)",
-            "multiple account detectors": "AWS account must have exactly one GuardDuty detector (found 2)",
-            "missing SSM row": "relay instance i-relay-0 is not SSM Online",
-            "missing GuardDuty row": "relay instance i-relay-0 lacks healthy GuardDuty runtime coverage",
-            "missing probe row": "relay instance i-relay-0 SSM boundary probe did not succeed",
-            "public DNS resolves": "relay instance i-relay-0 resolved a non-allowlisted public domain",
-            "approved DNS fails": "relay instance i-relay-0 cannot resolve every approved AWS endpoint",
-            "direct public route": "relay instance i-relay-0 can reach representative public TCP 443 canary",
-            "relay stopped": "relay instance i-relay-0 does not have an active relay service",
-            "probe failed": "relay instance i-relay-0 SSM boundary probe did not succeed",
-            "native alarm breached": "native NHP partial-loss and zero-ready-target alarms must both be in OK state",
-            "native alarm insufficient data": "native NHP partial-loss and zero-ready-target alarms must both be in OK state",
-        }
-        for name, mutate in cases.items():
-            with self.subTest(name=name):
-                snapshot = good_snapshot()
-                mutate(snapshot)
-                errors = checker.validate_snapshot(snapshot, "functional")
-                self.assertIn(expected_errors[name], errors)
-
         snapshot = good_snapshot()
-        snapshot["functional"].update(
-            {"guardduty_detector_count": 0, "guardduty_coverage": []}
-        )
+        snapshot["functional"]["target_health"][0]["state"] = "unhealthy"
         errors = checker.validate_snapshot(snapshot, "functional")
-        self.assertFalse(
-            any("relay instance" in error and "GuardDuty" in error for error in errors),
-            errors,
+        self.assertTrue(
+            any(
+                "does not show every canonical relay instance healthy" in error
+                for error in errors
+            )
         )
 
     def test_functional_empty_instance_set_fails_independently(self) -> None:
@@ -3997,30 +3971,6 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
             [
                 "functional relay boundary validation requires at least one canonical instance"
             ],
-            errors,
-        )
-
-    def test_native_alarm_state_is_a_functional_gate(self) -> None:
-        snapshot = good_snapshot()
-        native_alarm_for(snapshot, "-unhealthy")["state_value"] = "ALARM"
-
-        self.assertEqual([], checker.validate_snapshot(snapshot, "structural"))
-        self.assertIn(
-            "native NHP partial-loss and zero-ready-target alarms must both be in OK state",
-            checker.validate_snapshot(snapshot, "functional"),
-        )
-
-    def test_native_udp_target_health_must_cover_entire_relay_fleet(self) -> None:
-        snapshot = good_snapshot()
-        native_row = next(
-            row
-            for row in snapshot["functional"]["target_health"]
-            if row["target_group_arn"] == NATIVE_TG_ARN
-        )
-        native_row["state"] = "unhealthy"
-        errors = checker.validate_snapshot(snapshot, "functional")
-        self.assertIn(
-            f"target group {NATIVE_TG_ARN} does not show every canonical relay instance healthy",
             errors,
         )
 
@@ -4481,6 +4431,10 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    # The HTTPS-only relay correction and NHP-edge ownership hardening retain 79
+    # detector tests. Keep this floor aligned so accidental discovery loss fails
+    # loud; direct-cell UDP and forbidden relay UDP each retain explicit negative
+    # coverage above.
     minimum_expected_tests = 79
     discovered = suite.countTestCases()
     if discovered < minimum_expected_tests:

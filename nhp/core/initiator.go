@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
@@ -86,9 +87,34 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 	// (device.go msgToPacketRoutine, MsgToPacket) can route through
 	// mad.Error / mad.encryptedPktCh / mad.ResponseMsgCh and Destroy
 	// the pool packet. Lifecycle is the caller's.
+	if md.ExternalPacket != nil {
+		if err = md.ExternalPacket.validateWritableCapacity(); err != nil {
+			return &MsgAssemblerData{
+				device:         d,
+				BasePacket:     md.ExternalPacket,
+				HeaderType:     md.HeaderType,
+				encryptedPktCh: md.EncryptedPktCh,
+				ResponseMsgCh:  md.ResponseMsgCh,
+			}, err
+		}
+		if len(md.ExternalPacket.writableBuffer()) > PacketBufferSize {
+			forwardEnvelope := d.deviceType == NHP_RELAY && md.HeaderType == NHP_RLY && md.PrevParserData == nil
+			returnEnvelope := d.deviceType == NHP_SERVER && md.HeaderType == NHP_ACK &&
+				md.PrevParserData != nil && md.PrevParserData.HeaderType == NHP_RLY
+			if !forwardEnvelope && !returnEnvelope {
+				return &MsgAssemblerData{
+					device:         d,
+					BasePacket:     md.ExternalPacket,
+					HeaderType:     md.HeaderType,
+					encryptedPktCh: md.EncryptedPktCh,
+					ResponseMsgCh:  md.ResponseMsgCh,
+				}, ErrPacketSizeExceedsBuffer
+			}
+		}
+	}
 	if md.PrevParserData != nil {
 		// continue from previous received packet to form one transaction
-		mad = md.PrevParserData.deriveMsgAssemblerData(md.HeaderType, md.Compress, md.Message)
+		mad = md.PrevParserData.deriveMsgAssemblerData(md.HeaderType, md.Compress, md.Message, md.ExternalPacket)
 	} else {
 		mad = &MsgAssemblerData{}
 		mad.device = d
@@ -203,8 +229,10 @@ func (d *Device) createKeepalivePacket(md *MsgData) (mad *MsgAssemblerData, err 
 	mad.HeaderType = NHP_KPL
 	mad.TransactionId = md.TransactionId
 	mad.connData = md.ConnData
-	// Keepalive callers are usually fire-and-forget, but tests and future
-	// callers that provide a response channel should receive assembly errors.
+	// Keepalive callers are normally fire-and-forget. Preserve both optional
+	// completion channels so an asynchronous caller that explicitly waits for
+	// assembly receives either the packet or an error instead of hanging.
+	mad.encryptedPktCh = md.EncryptedPktCh
 	mad.ResponseMsgCh = md.ResponseMsgCh
 
 	// init packet buffer
@@ -214,10 +242,17 @@ func (d *Device) createKeepalivePacket(md *MsgData) (mad *MsgAssemblerData, err 
 		mad.BasePacket = d.AllocatePoolPacket()
 	}
 	mad.BasePacket.HeaderType = NHP_KPL
+	if err = mad.BasePacket.validateWritableCapacity(); err != nil {
+		return mad, err
+	}
+	if len(mad.BasePacket.writableBuffer()) > PacketBufferSize {
+		return mad, ErrPacketSizeExceedsBuffer
+	}
 
 	// create header
 	mad.header = mad.BasePacket.HeaderWithCipherScheme(common.CIPHER_SCHEME_CURVE)
-	mad.BasePacket.Content = mad.BasePacket.Buf[:mad.header.Size()]
+	buf := mad.BasePacket.writableBuffer()
+	mad.BasePacket.Content = buf[:mad.header.Size()]
 
 	// init version
 	mad.header.SetVersion(ProtocolVersionMajor, ProtocolVersionMinor)
@@ -337,7 +372,8 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 		mad.header.SetTypeAndPayloadSize(mad.HeaderType, 0)
 		// set header digest
 		mad.addHeaderDigest(mad.HeaderType == NHP_RKN)
-		mad.BasePacket.Content = mad.BasePacket.Buf[:mad.header.Size()]
+		buf := mad.BasePacket.writableBuffer()
+		mad.BasePacket.Content = buf[:mad.header.Size()]
 		return nil
 	}
 
@@ -378,7 +414,8 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 		mad.BodySize = len(mad.bodyMessage) + GCMTagSize
 	}
 
-	if mad.BodySize > PacketBufferSize-mad.header.Size() {
+	packetBuf := mad.BasePacket.writableBuffer()
+	if mad.BodySize > len(packetBuf)-mad.header.Size() {
 		log.Critical("message too long, send buffer exceeded")
 		err = ErrPacketSizeExceedsBuffer
 		return err
@@ -397,12 +434,12 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 	mad.addHeaderDigest(mad.HeaderType == NHP_RKN)
 
 	// encrypt body and write into mad.BasePacket.Buf space
-	ciphertext := mad.bodyAead.Seal(mad.BasePacket.Buf[mad.header.Size():mad.header.Size()], mad.header.NonceBytes(), body, mad.chainHash.Sum(mad.hashBuf[:0]))
+	ciphertext := mad.bodyAead.Seal(packetBuf[mad.header.Size():mad.header.Size()], mad.header.NonceBytes(), body, mad.chainHash.Sum(mad.hashBuf[:0]))
 	_ = ciphertext
 	//log.Debug("encrypted body: %v, output: %v", body, ciphertext)
 
 	// set valid packet
-	mad.BasePacket.Content = mad.BasePacket.Buf[:packetLen]
+	mad.BasePacket.Content = packetBuf[:packetLen]
 
 	return nil
 }
@@ -444,4 +481,26 @@ func (mad *MsgAssemblerData) Destroy() {
 	}
 	// Defense-in-depth: clear scratch even though hash digests are not key material.
 	SetZero(mad.hashBuf[:])
+}
+
+// ConsumeEncryptedPacket takes ownership of every non-nil assembler result
+// delivered through EncryptedPktCh, including error results. The channel
+// transfers packet lifecycle to its caller, so Destroy runs before every return
+// and the successful wire bytes are cloned before the pooled packet is released.
+func ConsumeEncryptedPacket(mad *MsgAssemblerData) ([]byte, error) {
+	if mad == nil {
+		return nil, errors.New("encryption returned no assembler data")
+	}
+	// An async error result may already have been destroyed by the assembler
+	// routine before it is delivered. Destroy is intentionally idempotent (the
+	// packet release clears its pool-ownership fields), so retaining this defer
+	// gives every consumer path the same ownership rule without a double Put.
+	defer mad.Destroy()
+	if mad.Error != nil {
+		return nil, mad.Error
+	}
+	if mad.BasePacket == nil {
+		return nil, errors.New("encryption returned no packet")
+	}
+	return bytes.Clone(mad.BasePacket.Content), nil
 }

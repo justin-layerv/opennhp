@@ -41,7 +41,7 @@ import (
 // be a separate regression class with its own fence.
 func TestPlugins_UnknownASPIDReturns404(t *testing.T) {
 	// The /plugins dispatcher lives on the nhp-server HTTP surface at
-	// NHPServerBaseURL, which the JS-agent + relay topology takes private.
+	// NHPServerBaseURL. JS-agent environments retire this legacy resolve HTTPS surface.
 	// Runs where that surface is live (prod + localhost), skips in JS-agent envs.
 	skipIfResolveEndpointDisabled(t)
 	resp, body := doGetNoRedirect(t, testConfig.NHPServerBaseURL, "/plugins/nonexistent", nil)

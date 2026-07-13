@@ -459,15 +459,73 @@ def clean_plan() -> dict[str, Any]:
                             "module_calls": {
                                 "relay_network": {
                                     "expressions": {
+                                        "apply_role_ready_token": {
+                                            "references": [
+                                                "time_sleep.relay_dmz_iam_propagation[0].id",
+                                                "time_sleep.relay_dmz_iam_propagation[0]",
+                                                "time_sleep.relay_dmz_iam_propagation",
+                                            ]
+                                        },
                                         "main_private_route_table_ids": {
                                             "references": [
                                                 "module.networking.private_route_table_ids"
                                             ]
-                                        }
+                                        },
                                     },
                                     "module": {
                                         "module_calls": {},
                                         "resources": [
+                                            config_resource(
+                                                "terraform_data",
+                                                "apply_role_ready",
+                                                {
+                                                    "input": {
+                                                        "references": [
+                                                            "var.apply_role_ready_token"
+                                                        ]
+                                                    }
+                                                },
+                                            ),
+                                            config_resource(
+                                                "aws_vpc",
+                                                "relay",
+                                                {},
+                                                depends_on=[
+                                                    "terraform_data.apply_role_ready"
+                                                ],
+                                            ),
+                                            config_resource(
+                                                "aws_iam_role",
+                                                "flow",
+                                                {},
+                                                depends_on=[
+                                                    "terraform_data.apply_role_ready"
+                                                ],
+                                            ),
+                                            config_resource(
+                                                "aws_route53_resolver_firewall_domain_list",
+                                                "allow",
+                                                {},
+                                                depends_on=[
+                                                    "terraform_data.apply_role_ready"
+                                                ],
+                                            ),
+                                            config_resource(
+                                                "aws_route53_resolver_firewall_domain_list",
+                                                "all",
+                                                {},
+                                                depends_on=[
+                                                    "terraform_data.apply_role_ready"
+                                                ],
+                                            ),
+                                            config_resource(
+                                                "aws_route53_resolver_firewall_rule_group",
+                                                "relay",
+                                                {},
+                                                depends_on=[
+                                                    "terraform_data.apply_role_ready"
+                                                ],
+                                            ),
                                             config_resource(
                                                 "aws_route_table", "public", {}
                                             ),
@@ -636,8 +694,11 @@ def clean_plan() -> dict[str, Any]:
                                                             "local.flow_log_group_arn",
                                                             "local.resolver_log_group_arn",
                                                         ]
-                                                    }
+                                                    },
                                                 },
+                                                depends_on=[
+                                                    "terraform_data.apply_role_ready"
+                                                ],
                                             ),
                                             config_resource(
                                                 "aws_cloudwatch_log_group",
@@ -861,21 +922,57 @@ def clean_plan() -> dict[str, Any]:
                                                 "module.compute",
                                             ]
                                         },
-                                        "native_server": {
+                                        "cell_servers": {
                                             "references": [
-                                                "var.environment",
-                                                "var.cell_id",
+                                                "terraform_data.relay_cell_routing[0].input",
+                                                "terraform_data.relay_cell_routing[0]",
+                                                "terraform_data.relay_cell_routing",
                                             ]
                                         },
-                                        "native_nhp_edge_enabled": {
+                                        "network_ready_token": {
                                             "references": [
-                                                "var.relay_native_edge_enabled"
+                                                "terraform_data.relay_network_ready[0].output",
+                                                "terraform_data.relay_network_ready[0]",
+                                                "terraform_data.relay_network_ready",
                                             ]
                                         },
                                     },
                                     "module": {
                                         "module_calls": {},
                                         "resources": [
+                                            config_resource(
+                                                "terraform_data",
+                                                "network_ready",
+                                                {
+                                                    "input": {
+                                                        "references": [
+                                                            "var.network_ready_token"
+                                                        ]
+                                                    }
+                                                },
+                                            ),
+                                            config_resource(
+                                                "terraform_data",
+                                                "fleet_security_ready",
+                                                {
+                                                    "input": {
+                                                        "references": [
+                                                            "aws_security_group.relay.id",
+                                                            "aws_security_group.relay",
+                                                        ]
+                                                    }
+                                                },
+                                                depends_on=[
+                                                    "aws_vpc_security_group_ingress_rule.alb_https",
+                                                    "aws_vpc_security_group_egress_rule.alb_to_relay",
+                                                    "aws_vpc_security_group_ingress_rule.relay_http_from_alb",
+                                                    "aws_vpc_security_group_ingress_rule.relay_udp_ack_return",
+                                                    "aws_vpc_security_group_egress_rule.relay_to_nhp_udp",
+                                                    "aws_vpc_security_group_egress_rule.relay_to_vpc_endpoints_https",
+                                                    "aws_vpc_security_group_ingress_rule.vpc_endpoints_from_relay",
+                                                    "aws_vpc_security_group_egress_rule.relay_to_s3_https",
+                                                ],
+                                            ),
                                             config_resource(
                                                 "aws_security_group",
                                                 "alb",
@@ -888,17 +985,13 @@ def clean_plan() -> dict[str, Any]:
                                                 "aws_security_group", "relay", {}
                                             ),
                                             config_resource(
-                                                "aws_security_group",
-                                                "native_nhp",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    },
-                                                    "ingress": {"constant_value": []},
-                                                    "egress": {"constant_value": []},
-                                                },
+                                                "aws_lb",
+                                                "relay",
+                                                {},
+                                                depends_on=[
+                                                    "aws_s3_bucket_policy.alb_access_logs",
+                                                    "terraform_data.network_ready",
+                                                ],
                                             ),
                                             config_resource(
                                                 "aws_autoscaling_group",
@@ -908,171 +1001,13 @@ def clean_plan() -> dict[str, Any]:
                                                         "references": [
                                                             "aws_lb_target_group.relay.arn",
                                                             "aws_lb_target_group.relay",
-                                                            "var.native_nhp_edge_enabled",
-                                                            "aws_lb_target_group.native_nhp[0].arn",
-                                                            "aws_lb_target_group.native_nhp[0]",
-                                                            "aws_lb_target_group.native_nhp",
-                                                        ]
-                                                    }
-                                                },
-                                            ),
-                                            config_resource(
-                                                "aws_lb",
-                                                "native_nhp",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    },
-                                                    "security_groups": {
-                                                        "references": [
-                                                            "aws_security_group.native_nhp[0].id",
-                                                            "aws_security_group.native_nhp[0]",
-                                                            "aws_security_group.native_nhp",
-                                                        ]
-                                                    },
-                                                    "subnets": {
-                                                        "references": [
-                                                            "var.public_subnet_ids"
                                                         ]
                                                     },
                                                 },
-                                            ),
-                                            config_resource(
-                                                "aws_lb_listener",
-                                                "native_nhp_udp",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    },
-                                                    "load_balancer_arn": {
-                                                        "references": [
-                                                            "aws_lb.native_nhp[0].arn",
-                                                            "aws_lb.native_nhp[0]",
-                                                            "aws_lb.native_nhp",
-                                                        ]
-                                                    },
-                                                    "default_action": {
-                                                        "references": [
-                                                            "aws_lb_target_group.native_nhp[0].arn",
-                                                            "aws_lb_target_group.native_nhp[0]",
-                                                            "aws_lb_target_group.native_nhp",
-                                                        ]
-                                                    },
-                                                },
-                                            ),
-                                            config_resource(
-                                                "aws_lb_target_group",
-                                                "native_nhp",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    },
-                                                    "vpc_id": {
-                                                        "references": ["var.vpc_id"]
-                                                    },
-                                                },
-                                            ),
-                                            config_resource(
-                                                "aws_vpc_security_group_egress_rule",
-                                                "native_nhp_to_relay_udp",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    },
-                                                    "referenced_security_group_id": {
-                                                        "references": [
-                                                            "aws_security_group.relay.id",
-                                                            "aws_security_group.relay",
-                                                        ]
-                                                    },
-                                                    "security_group_id": {
-                                                        "references": [
-                                                            "aws_security_group.native_nhp[0].id",
-                                                            "aws_security_group.native_nhp[0]",
-                                                            "aws_security_group.native_nhp",
-                                                        ]
-                                                    },
-                                                },
-                                            ),
-                                            config_resource(
-                                                "aws_vpc_security_group_egress_rule",
-                                                "native_nhp_health_to_relay",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    },
-                                                    "referenced_security_group_id": {
-                                                        "references": [
-                                                            "aws_security_group.relay.id",
-                                                            "aws_security_group.relay",
-                                                        ]
-                                                    },
-                                                    "security_group_id": {
-                                                        "references": [
-                                                            "aws_security_group.native_nhp[0].id",
-                                                            "aws_security_group.native_nhp[0]",
-                                                            "aws_security_group.native_nhp",
-                                                        ]
-                                                    },
-                                                },
-                                            ),
-                                            config_resource(
-                                                "aws_vpc_security_group_ingress_rule",
-                                                "relay_native_udp_from_nlb",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    },
-                                                    "referenced_security_group_id": {
-                                                        "references": [
-                                                            "aws_security_group.native_nhp[0].id",
-                                                            "aws_security_group.native_nhp[0]",
-                                                            "aws_security_group.native_nhp",
-                                                        ]
-                                                    },
-                                                    "security_group_id": {
-                                                        "references": [
-                                                            "aws_security_group.relay.id",
-                                                            "aws_security_group.relay",
-                                                        ]
-                                                    },
-                                                },
-                                            ),
-                                            config_resource(
-                                                "aws_vpc_security_group_ingress_rule",
-                                                "relay_health_from_nlb",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    },
-                                                    "referenced_security_group_id": {
-                                                        "references": [
-                                                            "aws_security_group.native_nhp[0].id",
-                                                            "aws_security_group.native_nhp[0]",
-                                                            "aws_security_group.native_nhp",
-                                                        ]
-                                                    },
-                                                    "security_group_id": {
-                                                        "references": [
-                                                            "aws_security_group.relay.id",
-                                                            "aws_security_group.relay",
-                                                        ]
-                                                    },
-                                                },
+                                                depends_on=[
+                                                    "terraform_data.network_ready",
+                                                    "terraform_data.fleet_security_ready",
+                                                ],
                                             ),
                                             config_resource(
                                                 "aws_vpc_security_group_ingress_rule",
@@ -1146,27 +1081,6 @@ def clean_plan() -> dict[str, Any]:
                                             ),
                                             config_resource(
                                                 "aws_vpc_security_group_ingress_rule",
-                                                "native_nhp_udp",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    },
-                                                    "security_group_id": {
-                                                        "references": [
-                                                            "aws_security_group.native_nhp[0].id",
-                                                            "aws_security_group.native_nhp[0]",
-                                                            "aws_security_group.native_nhp",
-                                                        ]
-                                                    },
-                                                    "cidr_ipv4": {
-                                                        "constant_value": "0.0.0.0/0"
-                                                    },
-                                                },
-                                            ),
-                                            config_resource(
-                                                "aws_vpc_security_group_ingress_rule",
                                                 "alb_https",
                                                 {
                                                     "security_group_id": {
@@ -1178,28 +1092,6 @@ def clean_plan() -> dict[str, Any]:
                                                     "cidr_ipv4": {
                                                         "constant_value": "0.0.0.0/0"
                                                     },
-                                                },
-                                            ),
-                                            config_resource(
-                                                "aws_cloudwatch_metric_alarm",
-                                                "relay_native_nlb_unhealthy_targets",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    }
-                                                },
-                                            ),
-                                            config_resource(
-                                                "aws_cloudwatch_metric_alarm",
-                                                "relay_native_nlb_zero_healthy_targets",
-                                                {
-                                                    "count": {
-                                                        "references": [
-                                                            "var.native_nhp_edge_enabled"
-                                                        ]
-                                                    }
                                                 },
                                             ),
                                             config_resource(
@@ -1297,45 +1189,31 @@ def clean_plan() -> dict[str, Any]:
     nhp_module["outputs"] = {
         "nlb_dns_name": {
             "expression": {
-                "references": [
-                    "var.take_server_private",
-                    "module.relay[0].native_nlb_dns_name",
-                    "module.compute.nlb_dns_name",
-                ]
-            }
-        },
-        "native_nhp_fqdn": {
-            "expression": {
-                "references": [
-                    "var.hosted_zone",
-                    "var.hosted_zone_id",
-                    "var.relay_native_edge_enabled",
-                    "local.native_nhp_fqdn",
-                ]
+                "references": ["module.compute.nlb_dns_name", "module.compute"]
             }
         },
     }
     nhp_module["resources"].append(
         config_resource(
-            "aws_route53_record",
-            "native_nhp",
+            "time_sleep",
+            "relay_dmz_iam_propagation",
+            {},
+            depends_on=["terraform_data.relay_dmz_preconditions"],
+        )
+    )
+    nhp_module["resources"].append(
+        config_resource(
+            "terraform_data",
+            "relay_cell_routing",
             {
-                "count": {
+                "count": {"references": ["var.deploy_relay"]},
+                "input": {
                     "references": [
-                        "var.relay_native_edge_enabled",
-                        "var.hosted_zone",
-                        "var.hosted_zone_id",
-                    ]
-                },
-                "name": {"references": ["local.native_nhp_fqdn"]},
-                "zone_id": {"references": ["local.main_zone_id"]},
-                "alias": {
-                    "references": [
-                        "var.take_server_private",
-                        "module.relay[0].native_nlb_dns_name",
-                        "module.relay[0].native_nlb_zone_id",
-                        "module.compute.nlb_dns_name",
-                        "module.compute.nlb_zone_id",
+                        "var.environment",
+                        "var.cell_id",
+                        "module.compute.server_public_key_b64",
+                        "module.compute.internal_nlb_dns_name",
+                        "module.compute",
                     ]
                 },
             },
@@ -1344,30 +1222,171 @@ def clean_plan() -> dict[str, Any]:
     nhp_module["resources"].append(
         config_resource(
             "terraform_data",
-            "relay_native_edge_preconditions",
+            "relay_network_ready",
             {
-                "count": {"references": ["var.relay_native_edge_enabled"]},
+                "count": {"references": ["var.deploy_relay"]},
+                "input": {
+                    "references": [
+                        "module.relay_network[0].vpc_id",
+                        "module.relay_network[0]",
+                    ]
+                },
             },
+            depends_on=["module.relay_network"],
         )
     )
     nhp_module["module_calls"]["dns"] = {
         "expressions": {
             "nlb_dns_name": {
-                "references": [
-                    "var.take_server_private",
-                    "module.relay[0].native_nlb_dns_name",
-                    "module.compute.nlb_dns_name",
-                ]
+                "references": ["module.compute.nlb_dns_name", "module.compute"]
             },
             "nlb_zone_id": {
-                "references": [
-                    "var.take_server_private",
-                    "module.relay[0].native_nlb_zone_id",
-                    "module.compute.nlb_zone_id",
-                ]
+                "references": ["module.compute.nlb_zone_id", "module.compute"]
             },
         },
         "module": {"module_calls": {}, "resources": []},
+    }
+    nhp_module["module_calls"]["compute"] = {
+        "expressions": {},
+        "module": {
+            "module_calls": {},
+            "resources": [
+                config_resource("aws_lb", "server", {}),
+                config_resource(
+                    "aws_lb_target_group",
+                    "udp",
+                    {"preserve_client_ip": {"constant_value": True}},
+                ),
+                config_resource(
+                    "aws_lb_listener",
+                    "udp",
+                    {
+                        "load_balancer_arn": {
+                            "references": [
+                                "aws_lb.server[0].arn",
+                                "aws_lb.server[0]",
+                                "aws_lb.server",
+                            ]
+                        },
+                        "default_action": {
+                            "references": [
+                                "aws_lb_target_group.udp[0].arn",
+                                "aws_lb_target_group.udp[0]",
+                                "aws_lb_target_group.udp",
+                            ]
+                        },
+                    },
+                ),
+                config_resource(
+                    "aws_autoscaling_attachment",
+                    "server",
+                    {
+                        "autoscaling_group_name": {
+                            "references": [
+                                "aws_autoscaling_group.server.name",
+                                "aws_autoscaling_group.server",
+                            ]
+                        },
+                        "lb_target_group_arn": {
+                            "references": [
+                                "aws_lb_target_group.udp[0].arn",
+                                "aws_lb_target_group.udp[0]",
+                                "aws_lb_target_group.udp",
+                            ]
+                        },
+                    },
+                ),
+                config_resource("aws_lb", "server_internal", {}),
+                config_resource(
+                    "aws_lb_target_group",
+                    "udp_internal",
+                    {"preserve_client_ip": {"constant_value": True}},
+                ),
+                config_resource(
+                    "aws_lb_target_group",
+                    "udp_green",
+                    {"preserve_client_ip": {"constant_value": True}},
+                ),
+                config_resource(
+                    "aws_lb_target_group",
+                    "udp_internal_green",
+                    {"preserve_client_ip": {"constant_value": True}},
+                ),
+                config_resource(
+                    "aws_autoscaling_group",
+                    "server_green",
+                    {
+                        "target_group_arns": {
+                            "references": [
+                                "aws_lb_target_group.udp_green[0].arn",
+                                "aws_lb_target_group.udp_green[0]",
+                                "aws_lb_target_group.udp_green",
+                                "var.enable_qurl_resolve_endpoint",
+                                "aws_lb_target_group.https_green[0].arn",
+                                "aws_lb_target_group.https_green[0]",
+                                "aws_lb_target_group.https_green",
+                                "var.relay_enabled",
+                                "aws_lb_target_group.udp_internal_green[0].arn",
+                                "aws_lb_target_group.udp_internal_green[0]",
+                                "aws_lb_target_group.udp_internal_green",
+                            ]
+                        }
+                    },
+                ),
+                config_resource(
+                    "aws_lb_listener",
+                    "udp_internal",
+                    {
+                        "load_balancer_arn": {
+                            "references": [
+                                "aws_lb.server_internal[0].arn",
+                                "aws_lb.server_internal[0]",
+                                "aws_lb.server_internal",
+                            ]
+                        },
+                        "default_action": {
+                            "references": [
+                                "aws_lb_target_group.udp_internal[0].arn",
+                                "aws_lb_target_group.udp_internal[0]",
+                                "aws_lb_target_group.udp_internal",
+                            ]
+                        },
+                    },
+                ),
+                config_resource(
+                    "aws_autoscaling_attachment",
+                    "server_internal",
+                    {
+                        "autoscaling_group_name": {
+                            "references": [
+                                "aws_autoscaling_group.server.name",
+                                "aws_autoscaling_group.server",
+                            ]
+                        },
+                        "lb_target_group_arn": {
+                            "references": [
+                                "aws_lb_target_group.udp_internal[0].arn",
+                                "aws_lb_target_group.udp_internal[0]",
+                                "aws_lb_target_group.udp_internal",
+                            ]
+                        },
+                    },
+                ),
+                config_resource("aws_security_group", "server", {}),
+                config_resource(
+                    "aws_vpc_security_group_ingress_rule",
+                    "server_nhp_udp",
+                    {
+                        "security_group_id": {
+                            "references": [
+                                "aws_security_group.server.id",
+                                "aws_security_group.server",
+                            ]
+                        }
+                    },
+                ),
+            ],
+        },
     }
 
     def add(
@@ -1397,6 +1416,21 @@ def clean_plan() -> dict[str, Any]:
     main_network = "module.nhp.module.networking"
     network = "module.nhp.module.relay_network[0]"
     relay = "module.nhp.module.relay[0]"
+    add(
+        "module.nhp.terraform_data.relay_cell_routing[0]",
+        "terraform_data",
+        "relay_cell_routing",
+        {
+            "input": [
+                {
+                    "name": "sandbox-cell0",
+                    "public_key": f"{'A' * 43}=",
+                    "host": "layerv-nhp-sandbox-srv-int-fixture.elb.us-east-2.amazonaws.com",
+                    "port": checker.EXPECTED_NHP_SERVER_PORT,
+                }
+            ]
+        },
+    )
     for index, cidr in enumerate(
         ["10.100.10.0/24", "10.100.11.0/24", "10.100.12.0/24"]
     ):
@@ -1762,103 +1796,21 @@ def clean_plan() -> dict[str, Any]:
         f"{relay}.aws_lb.relay",
         "aws_lb",
         "relay",
-        {"internal": False, "load_balancer_type": "application"},
-    )
-    add(
-        f"{relay}.aws_lb_target_group.native_nhp[0]",
-        "aws_lb_target_group",
-        "native_nhp",
-        {
-            "protocol": "UDP",
-            "port": 62206,
-            "target_type": "instance",
-            "preserve_client_ip": "true",
-            "deregistration_delay": "30",
-            "health_check": [
-                {
-                    "enabled": True,
-                    "protocol": "HTTPS",
-                    "port": "8080",
-                    "path": "/health/native-ready",
-                    "matcher": "200",
-                    "healthy_threshold": 2,
-                    "unhealthy_threshold": 2,
-                    "interval": 15,
-                    "timeout": 5,
-                }
-            ],
-        },
-    )
-    add(
-        f"{relay}.aws_lb.native_nhp[0]",
-        "aws_lb",
-        "native_nhp",
         {
             "internal": False,
-            "load_balancer_type": "network",
-            "ip_address_type": "ipv4",
-            "enable_cross_zone_load_balancing": True,
+            "load_balancer_type": "application",
             "enable_deletion_protection": False,
-            "dns_name": "layerv-nhp-sandbox-relay-nhp.elb.amazonaws.com",
-            "zone_id": "ZRELAYNATIVE",
-            "tags": {
-                "Environment": "sandbox",
-                "Service": "nhp-relay",
-                "Component": "relay",
-                "Name": "layerv-nhp-sandbox-relay-nhp",
-            },
-        },
-    )
-    add(
-        f"{relay}.aws_cloudwatch_metric_alarm.relay_native_nlb_unhealthy_targets[0]",
-        "aws_cloudwatch_metric_alarm",
-        "relay_native_nlb_unhealthy_targets",
-        {
-            "namespace": "AWS/NetworkELB",
-            "metric_name": "UnHealthyHostCount",
-            "comparison_operator": "GreaterThanThreshold",
-            "threshold": 0,
-            "statistic": "Maximum",
-            "period": 60,
-            "evaluation_periods": 2,
-            "datapoints_to_alarm": 2,
-            "treat_missing_data": "notBreaching",
-        },
-    )
-    add(
-        f"{relay}.aws_cloudwatch_metric_alarm.relay_native_nlb_zero_healthy_targets[0]",
-        "aws_cloudwatch_metric_alarm",
-        "relay_native_nlb_zero_healthy_targets",
-        {
-            "namespace": "AWS/NetworkELB",
-            "metric_name": "HealthyHostCount",
-            "comparison_operator": "LessThanThreshold",
-            "threshold": 1,
-            "statistic": "Minimum",
-            "period": 60,
-            "evaluation_periods": 2,
-            "datapoints_to_alarm": 2,
-            "treat_missing_data": "breaching",
-        },
-    )
-    add(
-        f"{relay}.aws_lb_listener.native_nhp_udp[0]",
-        "aws_lb_listener",
-        "native_nhp_udp",
-        {"protocol": "UDP", "port": 62206},
-    )
-    add(
-        "module.nhp.aws_route53_record.native_nhp[0]",
-        "aws_route53_record",
-        "native_nhp",
-        {
-            "name": "native.nhp.layerv.xyz",
-            "type": "A",
-            "alias": [
+            "idle_timeout": 30,
+            "drop_invalid_header_fields": True,
+            "desync_mitigation_mode": "defensive",
+            "xff_header_processing_mode": "append",
+            "enable_xff_client_port": False,
+            "enable_waf_fail_open": False,
+            "access_logs": [
                 {
-                    "name": "layerv-nhp-sandbox-relay-nhp.elb.amazonaws.com",
-                    "zone_id": "ZRELAYNATIVE",
-                    "evaluate_target_health": True,
+                    "enabled": True,
+                    "bucket": "layerv-nhp-sandbox-relay-alb-logs-767397897469",
+                    "prefix": None,
                 }
             ],
         },
@@ -1890,7 +1842,12 @@ def clean_plan() -> dict[str, Any]:
                 {"http_tokens": "required", "http_put_response_hop_limit": 1}
             ],
             "user_data": base64.b64encode(
-                b'native_server = "sandbox-cell0"\n[[servers]]\nname = "sandbox-cell0"\n[[servers]]\nname = "sandbox-cell1"\n'
+                (
+                    '[[servers]]\nname = "sandbox-cell0"\n'
+                    f'public_key = "{"A" * 43}="\n'
+                    'host = "layerv-nhp-sandbox-srv-int-fixture.elb.us-east-2.amazonaws.com"\n'
+                    f"port = {checker.EXPECTED_NHP_SERVER_PORT}\n"
+                ).encode()
             ).decode("ascii"),
         },
     )
@@ -1933,41 +1890,6 @@ def clean_plan() -> dict[str, Any]:
             "relay_udp_ack_return",
             "udp",
             checker.EXPECTED_RELAY_ACK_PORT,
-            None,
-        ),
-        (
-            "aws_vpc_security_group_ingress_rule",
-            "native_nhp_udp",
-            "udp",
-            checker.EXPECTED_NHP_SERVER_PORT,
-            checker.EXPECTED_IPV4_DEFAULT_CIDR,
-        ),
-        (
-            "aws_vpc_security_group_egress_rule",
-            "native_nhp_to_relay_udp",
-            "udp",
-            checker.EXPECTED_NHP_SERVER_PORT,
-            None,
-        ),
-        (
-            "aws_vpc_security_group_egress_rule",
-            "native_nhp_health_to_relay",
-            "tcp",
-            checker.EXPECTED_RELAY_BACKEND_PORT,
-            None,
-        ),
-        (
-            "aws_vpc_security_group_ingress_rule",
-            "relay_native_udp_from_nlb",
-            "udp",
-            checker.EXPECTED_NHP_SERVER_PORT,
-            None,
-        ),
-        (
-            "aws_vpc_security_group_ingress_rule",
-            "relay_health_from_nlb",
-            "tcp",
-            checker.EXPECTED_RELAY_BACKEND_PORT,
             None,
         ),
         (
@@ -2023,20 +1945,180 @@ def clean_plan() -> dict[str, Any]:
             "ip_protocol": "udp",
             "from_port": checker.EXPECTED_NHP_SERVER_PORT,
             "to_port": checker.EXPECTED_NHP_SERVER_PORT,
-            "cidr_ipv4": checker.EXPECTED_SANDBOX_MAIN_VPC_CIDR,
+            "cidr_ipv4": checker.EXPECTED_IPV4_DEFAULT_CIDR,
         },
+    )
+    add(
+        "module.nhp.module.compute.aws_lb.server[0]",
+        "aws_lb",
+        "server",
+        {
+            "name": checker.EXPECTED_SANDBOX_SERVER_NLB_NAME,
+            "internal": False,
+            "load_balancer_type": "network",
+            "tags": {
+                "Environment": "sandbox",
+                "Component": "compute",
+                "Cell": checker.EXPECTED_SANDBOX_CELL_ID,
+                "Name": checker.EXPECTED_SANDBOX_SERVER_NLB_NAME,
+            },
+        },
+    )
+    add(
+        "module.nhp.module.compute.aws_lb_target_group.udp[0]",
+        "aws_lb_target_group",
+        "udp",
+        {
+            "name": checker.EXPECTED_SANDBOX_SERVER_UDP_TG_NAME,
+            "protocol": "UDP",
+            "port": checker.EXPECTED_NHP_SERVER_PORT,
+            "target_type": "instance",
+            "preserve_client_ip": "true",
+            "tags": {
+                "Environment": "sandbox",
+                "Component": "compute",
+                "Cell": checker.EXPECTED_SANDBOX_CELL_ID,
+                "Name": "layerv-nhp-sandbox-tg-udp",
+            },
+            "health_check": [
+                {
+                    "enabled": True,
+                    "protocol": "HTTP",
+                    "port": "8888",
+                    "path": "/health/live",
+                    "matcher": "200",
+                }
+            ],
+        },
+    )
+    add(
+        "module.nhp.module.compute.aws_lb_target_group.udp_green[0]",
+        "aws_lb_target_group",
+        "udp_green",
+        {
+            "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-udp-grn/green",
+            "name": checker.EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME,
+            "protocol": "UDP",
+            "port": checker.EXPECTED_NHP_SERVER_PORT,
+            "target_type": "instance",
+            "preserve_client_ip": "true",
+            "tags": {
+                "Environment": "sandbox",
+                "Component": "compute",
+                "Cell": checker.EXPECTED_SANDBOX_CELL_ID,
+                "Name": "layerv-nhp-sandbox-tg-udp-green",
+                "DeployColor": "green",
+            },
+            "health_check": [
+                {
+                    "enabled": True,
+                    "protocol": "HTTP",
+                    "port": "8888",
+                    "path": "/health/live",
+                    "matcher": "200",
+                }
+            ],
+        },
+    )
+    add(
+        "module.nhp.module.compute.aws_lb_listener.udp[0]",
+        "aws_lb_listener",
+        "udp",
+        {"protocol": "UDP", "port": checker.EXPECTED_NHP_SERVER_PORT},
+    )
+    add(
+        "module.nhp.module.compute.aws_autoscaling_attachment.server[0]",
+        "aws_autoscaling_attachment",
+        "server",
     )
     add(
         "module.nhp.module.compute.aws_lb.server_internal",
         "aws_lb",
         "server_internal",
-        {"internal": True, "load_balancer_type": "network"},
+        {
+            "internal": True,
+            "load_balancer_type": "network",
+            "dns_name": "layerv-nhp-sandbox-srv-int-fixture.elb.us-east-2.amazonaws.com",
+        },
     )
     add(
         "module.nhp.module.compute.aws_lb_listener.udp_internal",
         "aws_lb_listener",
         "udp_internal",
         {"protocol": "UDP", "port": checker.EXPECTED_NHP_SERVER_PORT},
+    )
+    add(
+        "module.nhp.module.compute.aws_lb_target_group.udp_internal",
+        "aws_lb_target_group",
+        "udp_internal",
+        {
+            "name": checker.EXPECTED_SANDBOX_INTERNAL_UDP_TG_NAME,
+            "protocol": "UDP",
+            "port": checker.EXPECTED_NHP_SERVER_PORT,
+            "target_type": "instance",
+            "preserve_client_ip": "true",
+            "tags": {
+                "Environment": "sandbox",
+                "Component": "compute",
+                "Cell": checker.EXPECTED_SANDBOX_CELL_ID,
+                "Name": "layerv-nhp-sandbox-tg-srv-int-udp-blue",
+                "DeployColor": "blue",
+            },
+            "health_check": [
+                {
+                    "enabled": True,
+                    "protocol": "HTTP",
+                    "port": "8888",
+                    "path": "/health/live",
+                    "matcher": "200",
+                }
+            ],
+        },
+    )
+    add(
+        "module.nhp.module.compute.aws_lb_target_group.udp_internal_green[0]",
+        "aws_lb_target_group",
+        "udp_internal_green",
+        {
+            "arn": "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-srv-int-grn/green",
+            "name": checker.EXPECTED_SANDBOX_INTERNAL_UDP_GREEN_TG_NAME,
+            "protocol": "UDP",
+            "port": checker.EXPECTED_NHP_SERVER_PORT,
+            "target_type": "instance",
+            "preserve_client_ip": "true",
+            "tags": {
+                "Environment": "sandbox",
+                "Component": "compute",
+                "Cell": checker.EXPECTED_SANDBOX_CELL_ID,
+                "Name": "layerv-nhp-sandbox-tg-srv-int-udp-green",
+                "DeployColor": "green",
+            },
+            "health_check": [
+                {
+                    "enabled": True,
+                    "protocol": "HTTP",
+                    "port": "8888",
+                    "path": "/health/live",
+                    "matcher": "200",
+                }
+            ],
+        },
+    )
+    add(
+        "module.nhp.module.compute.aws_autoscaling_group.server_green[0]",
+        "aws_autoscaling_group",
+        "server_green",
+        {
+            "target_group_arns": [
+                "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-udp-grn/green",
+                "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/layerv-nhp-sandbox-srv-int-grn/green",
+            ]
+        },
+    )
+    add(
+        "module.nhp.module.compute.aws_autoscaling_attachment.server_internal",
+        "aws_autoscaling_attachment",
+        "server_internal",
     )
     for cidr in tier_cidrs["relay"]:
         add(
@@ -2156,6 +2238,24 @@ def run_checker_cli(
 
 
 class RelayDmzPlanCheckerTests(unittest.TestCase):
+    def test_runbook_orders_saved_plan_apply_and_proof(self) -> None:
+        runbook = (
+            REPO_ROOT / "docs" / "runbooks" / "sandbox-relay-dmz-replacement.md"
+        ).read_text()
+        anchors = [
+            'export RELAY_DMZ_PLAN="$RELAY_DMZ_EVIDENCE_DIR/relay-dmz.tfplan"',
+            'terraform -chdir=terraform/environments/sandbox apply "$RELAY_DMZ_PLAN"',
+            "## Gate 2: structural proof",
+            '.github/scripts/deploy-relay.sh sandbox true "$REVIEWED_IMAGE_TAG"',
+            "## Gate 4: direct SDK UDP proof",
+        ]
+        positions = [runbook.find(anchor) for anchor in anchors]
+        self.assertNotIn(-1, positions)
+        self.assertEqual(sorted(positions), positions)
+        self.assertEqual(1, runbook.count("deploy-relay.sh sandbox true"))
+        self.assertIn("assigned-cell server NLB UDP 62206 exactly once", runbook)
+        self.assertIn("no internet-facing relay NLB or relay UDP listener", runbook)
+
     def assert_violation(
         self, plan: dict[str, Any], needle: str, *, require_enabled: bool = True
     ) -> None:
@@ -2304,13 +2404,21 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             'module.outer[0].module.nhp["sandbox"].module.relay[0].aws_lb.relay',
             "module.outer.module.networking[0].aws_route_table_association.private[2]",
             "module.compute.aws_lb.server[0]",
+            "module.compute.aws_lb.server_internal[0]",
             "module.compute.aws_lb_listener.udp[0]",
+            "module.compute.aws_lb_listener.udp_internal[0]",
             "module.compute.aws_lb_target_group.udp[0]",
             "module.compute.aws_lb_target_group.udp_green[0]",
+            "module.compute.aws_lb_target_group.udp_internal[0]",
+            "module.compute.aws_lb_target_group.udp_internal_green[0]",
             "module.compute.aws_autoscaling_attachment.server[0]",
+            "module.compute.aws_autoscaling_attachment.server_internal[0]",
+            "module.compute.aws_autoscaling_group.server_green[0]",
             "module.compute.aws_vpc_security_group_ingress_rule.server_nhp_udp",
             'module.compute.aws_vpc_security_group_ingress_rule.server_nhp_udp_additional["10.101.10.0/24"]',
             "module.outer[0].module.ecr[0].aws_iam_role_policy.context_lookups_relay_ssm[0]",
+            "module.nhp[0].terraform_data.relay_cell_routing[0]",
+            "module.nhp[0].terraform_data.relay_network_ready[0]",
             "module.nhp[0].aws_route53_record.relay_alias[0]",
         )
         for address in addresses:
@@ -2347,8 +2455,6 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             "module.relay_identity[0].aws_secretsmanager_secret.relay",
             "module.networking.aws_route_table.private[0]",
             "module.compute.aws_security_group.server",
-            "module.compute.aws_lb.server_internal",
-            "module.compute.aws_lb_listener.udp_internal",
             "module.ecr.aws_iam_role_policy.unrelated",
             "aws_route53_record.unrelated",
         ):
@@ -2732,6 +2838,16 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             workflow,
         )
 
+    def test_pr_plan_restores_complete_trusted_checker_family(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "terraform-plan-pr.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'git ls-tree -r --name-only "$BASE_SHA" -- .github/scripts', workflow
+        )
+        self.assertIn(".github/scripts/check-relay-dmz-plan*.py)", workflow)
+        self.assertIn("if ((trusted_checker_count == 0)); then", workflow)
+
     def test_root_level_relay_modules_pass_without_leading_dot_prefixes(self) -> None:
         self.assertEqual([], checker.validate_plan(root_level_plan()))
 
@@ -2767,6 +2883,140 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         vpc = resource(plan, ".module.relay_network[0].aws_vpc.relay")
         vpc["change"]["after"]["cidr_block"] = "10.102.0.0/16"
         self.assert_violation(plan, "sandbox relay VPC must use 10.101.0.0/16")
+
+    def test_broad_relay_module_dependencies_are_rejected(self) -> None:
+        for module_name in ("relay_network", "relay"):
+            with self.subTest(module=module_name):
+                plan = clean_plan()
+                module_call = plan["configuration"]["root_module"]["module_calls"][
+                    "nhp"
+                ]["module"]["module_calls"][module_name]
+                module_call["depends_on"] = ["module.unreviewed"]
+                self.assert_violation(plan, "must not use broad depends_on edges")
+
+    def test_relay_network_apply_role_readiness_chain_is_exact(self) -> None:
+        plan = clean_plan()
+        network_call = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]["module_calls"]["relay_network"]
+        network_call["expressions"]["apply_role_ready_token"]["references"] = [
+            "time_sleep.unreviewed.id"
+        ]
+        self.assert_violation(plan, "must consume only the IAM propagation token")
+
+        plan = clean_plan()
+        gate = configured_resource(
+            plan, "relay_network", "terraform_data", "apply_role_ready"
+        )
+        gate["expressions"]["input"]["references"] = ["var.unreviewed"]
+        self.assert_violation(
+            plan, "must be driven directly by its root readiness input"
+        )
+
+        plan = clean_plan()
+        parent = plan["configuration"]["root_module"]["module_calls"]["nhp"]["module"]
+        iam_wait = next(
+            item
+            for item in parent["resources"]
+            if item["type"] == "time_sleep"
+            and item["name"] == "relay_dmz_iam_propagation"
+        )
+        iam_wait["depends_on"] = []
+        self.assert_violation(
+            plan, "must preserve the root CIDR-overlap precondition dependency"
+        )
+
+    def test_every_independent_network_dag_root_waits_on_apply_role(self) -> None:
+        roots = (
+            ("aws_vpc", "relay"),
+            ("aws_kms_key", "logs"),
+            ("aws_iam_role", "flow"),
+            ("aws_route53_resolver_firewall_domain_list", "allow"),
+            ("aws_route53_resolver_firewall_domain_list", "all"),
+            ("aws_route53_resolver_firewall_rule_group", "relay"),
+        )
+        for resource_type, name in roots:
+            with self.subTest(resource=f"{resource_type}.{name}"):
+                plan = clean_plan()
+                root = configured_resource(plan, "relay_network", resource_type, name)
+                root["depends_on"] = []
+                self.assert_violation(
+                    plan, f"DAG root {resource_type}.{name} must wait only"
+                )
+
+    def test_complete_network_to_fleet_readiness_chain_is_exact(self) -> None:
+        plan = clean_plan()
+        parent = plan["configuration"]["root_module"]["module_calls"]["nhp"]["module"]
+        root_gate = next(
+            item
+            for item in parent["resources"]
+            if item["type"] == "terraform_data"
+            and item["name"] == "relay_network_ready"
+        )
+        root_gate["depends_on"] = []
+        self.assert_violation(plan, "must wait for the complete count-gated DMZ")
+
+        plan = clean_plan()
+        relay_call = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]["module_calls"]["relay"]
+        relay_call["expressions"]["network_ready_token"]["references"] = [
+            "module.relay_network[0].vpc_id"
+        ]
+        self.assert_violation(
+            plan, "must consume only the complete relay-network readiness token"
+        )
+
+        plan = clean_plan()
+        child_gate = configured_resource(
+            plan, "relay", "terraform_data", "network_ready"
+        )
+        child_gate["expressions"]["input"]["references"] = ["var.unreviewed"]
+        self.assert_violation(plan, "must be driven directly by the root network token")
+
+        plan = clean_plan()
+        security_gate = configured_resource(
+            plan, "relay", "terraform_data", "fleet_security_ready"
+        )
+        security_gate["expressions"]["input"]["references"] = [
+            "aws_security_group.unreviewed.id"
+        ]
+        self.assert_violation(plan, "must wait for every mandatory standalone SG path")
+
+        required_security_paths = list(security_gate["depends_on"])
+        for dependency in required_security_paths:
+            with self.subTest(security_path=dependency):
+                plan = clean_plan()
+                security_gate = configured_resource(
+                    plan, "relay", "terraform_data", "fleet_security_ready"
+                )
+                security_gate["depends_on"].remove(dependency)
+                self.assert_violation(
+                    plan, "must wait for every mandatory standalone SG path"
+                )
+
+        plan = clean_plan()
+        lb = configured_resource(plan, "relay", "aws_lb", "relay")
+        lb["depends_on"] = [
+            dependency
+            for dependency in lb["depends_on"]
+            if dependency != "terraform_data.network_ready"
+        ]
+        self.assert_violation(plan, "ALB must wait for complete DMZ network")
+
+        for dependency in (
+            "terraform_data.network_ready",
+            "terraform_data.fleet_security_ready",
+        ):
+            with self.subTest(asg_readiness_dependency=dependency):
+                plan = clean_plan()
+                asg = configured_resource(
+                    plan, "relay", "aws_autoscaling_group", "relay"
+                )
+                asg["depends_on"].remove(dependency)
+                self.assert_violation(
+                    plan, "must wait for network readiness and the complete fleet"
+                )
 
     def test_dmz_route_tables_cannot_gain_inline_routes(self) -> None:
         for tier in ("public", "relay", "endpoint"):
@@ -3654,51 +3904,235 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         ingress["change"]["after"]["cidr_ipv4"] = "10.101.0.0/16"
         self.assert_violation(plan, "IPv4 internet")
 
-    def test_native_nhp_listener_cannot_expose_ack_port(self) -> None:
+    def test_assigned_cell_public_udp_listener_cannot_expose_ack_port(self) -> None:
         plan = clean_plan()
-        listener = resource(plan, ".aws_lb_listener.native_nhp_udp")
+        listener = resource(plan, ".aws_lb_listener.udp[0]")
         listener["change"]["after"]["port"] = 62207
-        self.assert_violation(
-            plan, "native NHP NLB listener set must expose UDP 62206 only"
-        )
+        self.assert_violation(plan, "UDP-capable listener inventory")
 
-    def test_native_nhp_target_group_requires_client_ip_preservation(self) -> None:
+    def test_relay_cell_servers_must_use_internal_nlb(self) -> None:
         plan = clean_plan()
-        target_group = resource(plan, ".aws_lb_target_group.native_nhp")
-        target_group["change"]["after"]["preserve_client_ip"] = False
-        self.assert_violation(
-            plan,
-            "instance UDP:62206",
-        )
+        relay_call = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]["module_calls"]["relay"]
+        relay_call["expressions"]["cell_servers"]["references"] = [
+            "var.environment",
+            "var.cell_id",
+            "module.compute.server_public_key_b64",
+            "module.compute.nlb_dns_name",
+            "module.compute",
+        ]
+        self.assert_violation(plan, "plan-visible cell-routing contract")
 
-    def test_native_nhp_target_group_requires_native_readiness(self) -> None:
+    def test_relay_cell_routing_contract_must_use_internal_nlb(self) -> None:
         plan = clean_plan()
-        target_group = resource(plan, ".aws_lb_target_group.native_nhp")
-        target_group["change"]["after"]["health_check"][0]["path"] = "/health/live"
-        self.assert_violation(
-            plan,
-            "instance UDP:62206",
+        routing = next(
+            item
+            for item in plan["configuration"]["root_module"]["module_calls"]["nhp"][
+                "module"
+            ]["resources"]
+            if item["type"] == "terraform_data" and item["name"] == "relay_cell_routing"
         )
+        routing["expressions"]["input"] = {
+            "references": [
+                "var.environment",
+                "var.cell_id",
+                "module.compute.server_public_key_b64",
+                "module.compute.nlb_dns_name",
+                "module.compute",
+            ]
+        }
+        self.assert_violation(plan, "canonical compute key and internal server NLB")
 
-    def test_native_nhp_deregistration_delay_accepts_provider_canonical_types(
+    def test_relay_cell_routing_contract_must_share_relay_count_gate(self) -> None:
+        plan = clean_plan()
+        routing = next(
+            item
+            for item in plan["configuration"]["root_module"]["module_calls"]["nhp"][
+                "module"
+            ]["resources"]
+            if item["type"] == "terraform_data" and item["name"] == "relay_cell_routing"
+        )
+        routing["count_expression"] = {"constant_value": 1}
+        self.assert_violation(plan, "share the relay fleet gate")
+
+    def test_unknown_relay_cell_routing_input_fails_closed(self) -> None:
+        plan = clean_plan()
+        routing = resource(plan, ".terraform_data.relay_cell_routing[0]")
+        routing["change"]["after"]["input"] = None
+        routing["change"]["after_unknown"]["input"] = True
+        self.assert_violation(plan, "authoritative server public key")
+
+    def test_assigned_cell_public_udp_listener_must_use_public_server_nlb(self) -> None:
+        plan = clean_plan()
+        listener = configured_resource(plan, "compute", "aws_lb_listener", "udp")
+        listener["expressions"]["load_balancer_arn"] = {
+            "references": [
+                "aws_lb.server_internal[0].arn",
+                "aws_lb.server_internal[0]",
+                "aws_lb.server_internal",
+            ]
+        }
+        self.assert_violation(plan, "public UDP listener must forward only")
+
+    def test_assigned_cell_public_udp_listener_must_use_public_udp_tg(self) -> None:
+        plan = clean_plan()
+        listener = configured_resource(plan, "compute", "aws_lb_listener", "udp")
+        listener["expressions"]["default_action"] = {
+            "references": [
+                "aws_lb_target_group.udp_internal[0].arn",
+                "aws_lb_target_group.udp_internal[0]",
+                "aws_lb_target_group.udp_internal",
+            ]
+        }
+        self.assert_violation(plan, "public UDP listener must forward only")
+
+    def test_assigned_cell_public_udp_tg_must_attach_to_server_asg(self) -> None:
+        plan = clean_plan()
+        attachment = configured_resource(
+            plan, "compute", "aws_autoscaling_attachment", "server"
+        )
+        attachment["expressions"]["autoscaling_group_name"] = {
+            "references": ["aws_autoscaling_group.server_green[0].name"]
+        }
+        self.assert_violation(plan, "canonical server ASG")
+
+    def test_assigned_cell_server_asg_must_attach_to_public_udp_tg(self) -> None:
+        plan = clean_plan()
+        attachment = configured_resource(
+            plan, "compute", "aws_autoscaling_attachment", "server"
+        )
+        attachment["expressions"]["lb_target_group_arn"] = {
+            "references": [
+                "aws_lb_target_group.udp_internal[0].arn",
+                "aws_lb_target_group.udp_internal[0]",
+                "aws_lb_target_group.udp_internal",
+            ]
+        }
+        self.assert_violation(plan, "canonical server ASG")
+
+    def test_assigned_cell_public_udp_tg_attachment_is_required(self) -> None:
+        plan = clean_plan()
+        plan["resource_changes"] = [
+            item
+            for item in plan["resource_changes"]
+            if not (
+                item["type"] == "aws_autoscaling_attachment"
+                and item["name"] == "server"
+            )
+        ]
+        self.assert_violation(plan, "public UDP target-group attachment")
+
+    def test_assigned_cell_public_target_group_is_udp_62206(self) -> None:
+        plan = clean_plan()
+        target_group = resource(plan, ".aws_lb_target_group.udp[0]")
+        target_group["change"]["after"]["target_type"] = "ip"
+        self.assert_violation(plan, "instance UDP 62206")
+
+    def test_assigned_cell_public_nlb_identity_and_tags_are_canonical(self) -> None:
+        cases = {
+            "name": lambda values: values.update({"name": "rogue-cell-nlb"}),
+            "cell tag": lambda values: values["tags"].update({"Cell": "cell1"}),
+            "component tag": lambda values: values["tags"].update(
+                {"Component": "relay"}
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                plan = clean_plan()
+                mutate(resource(plan, ".aws_lb.server[0]")["change"]["after"])
+                self.assert_violation(plan, "canonically named and tagged")
+
+    def test_assigned_cell_public_target_group_identity_tags_and_health_are_canonical(
         self,
     ) -> None:
-        for value in CANONICAL_DEREGISTRATION_DELAY_VALUES:
-            with self.subTest(value=value):
+        cases = {
+            "name": lambda values: values.update({"name": "rogue-cell-udp"}),
+            "cell tag": lambda values: values["tags"].update({"Cell": "cell1"}),
+            "health protocol": lambda values: values["health_check"][0].update(
+                {"protocol": "TCP"}
+            ),
+            "health port": lambda values: values["health_check"][0].update(
+                {"port": "62206"}
+            ),
+            "health path": lambda values: values["health_check"][0].update(
+                {"path": "/health/native-ready"}
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
                 plan = clean_plan()
-                target_group = resource(plan, ".aws_lb_target_group.native_nhp")
-                target_group["change"]["after"]["deregistration_delay"] = value
-                self.assertEqual([], checker.validate_plan(plan))
+                mutate(resource(plan, ".aws_lb_target_group.udp[0]")["change"]["after"])
+                self.assert_violation(plan, "canonical identity, tags")
 
-    def test_native_nhp_deregistration_delay_rejects_other_shapes(self) -> None:
-        for value in INVALID_DEREGISTRATION_DELAY_VALUES:
-            with self.subTest(value=value):
+    def test_standby_public_udp_target_group_is_required(self) -> None:
+        plan = clean_plan()
+        plan["resource_changes"] = [
+            item
+            for item in plan["resource_changes"]
+            if not (
+                item["type"] == "aws_lb_target_group" and item["name"] == "udp_green"
+            )
+        ]
+        self.assert_violation(plan, "standby public NHP target group")
+
+    def test_standby_public_udp_target_group_contract_is_exact(self) -> None:
+        cases = {
+            "name": lambda values: values.update({"name": "rogue-green"}),
+            "protocol": lambda values: values.update({"protocol": "TCP_UDP"}),
+            "port": lambda values: values.update({"port": 62207}),
+            "target type": lambda values: values.update({"target_type": "ip"}),
+            "preserve client IP": lambda values: values.update(
+                {"preserve_client_ip": "false"}
+            ),
+            "environment tag": lambda values: values["tags"].update(
+                {"Environment": "prod"}
+            ),
+            "component tag": lambda values: values["tags"].update(
+                {"Component": "relay"}
+            ),
+            "cell tag": lambda values: values["tags"].update({"Cell": "cell1"}),
+            "name tag": lambda values: values["tags"].update({"Name": "rogue-green"}),
+            "color tag": lambda values: values["tags"].update({"DeployColor": "blue"}),
+            "health disabled": lambda values: values["health_check"][0].update(
+                {"enabled": False}
+            ),
+            "health protocol": lambda values: values["health_check"][0].update(
+                {"protocol": "TCP"}
+            ),
+            "health port": lambda values: values["health_check"][0].update(
+                {"port": "62206"}
+            ),
+            "health path": lambda values: values["health_check"][0].update(
+                {"path": "/health/native-ready"}
+            ),
+            "health matcher": lambda values: values["health_check"][0].update(
+                {"matcher": "200-399"}
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
                 plan = clean_plan()
-                target_group = resource(plan, ".aws_lb_target_group.native_nhp")
-                target_group["change"]["after"]["deregistration_delay"] = value
-                self.assert_violation(
-                    plan, "native NHP target group must be instance UDP:62206"
+                mutate(
+                    resource(plan, ".aws_lb_target_group.udp_green[0]")["change"][
+                        "after"
+                    ]
                 )
+                self.assert_violation(plan, "canonical green identity")
+
+    def test_public_udp_preserve_client_ip_must_be_authored_for_both_colors(
+        self,
+    ) -> None:
+        for resource_name in ("udp", "udp_green"):
+            with self.subTest(resource=resource_name):
+                plan = clean_plan()
+                target_group = configured_resource(
+                    plan, "compute", "aws_lb_target_group", resource_name
+                )
+                target_group["expressions"]["preserve_client_ip"] = {
+                    "constant_value": False
+                }
+                self.assert_violation(plan, "preserved client IP")
 
     def test_exact_int_or_int_string_helper(self) -> None:
         for value in CANONICAL_DEREGISTRATION_DELAY_VALUES:
@@ -3708,130 +4142,215 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             with self.subTest(rejected=value):
                 self.assertFalse(checker.matches_exact_int_or_int_string(value, 30))
 
-    def test_native_listener_rejects_unreviewed_conditional_reference(self) -> None:
+    def test_relay_cannot_gain_a_public_udp_listener(self) -> None:
+        plan = clean_plan()
+        listener = copy.deepcopy(resource(plan, ".aws_lb_listener.udp[0]"))
+        listener["address"] = "module.nhp.module.relay[0].aws_lb_listener.udp"
+        plan["resource_changes"].append(listener)
+        self.assert_violation(plan, "listener inventory must be exactly HTTPS 443")
+
+    def test_compute_cannot_gain_a_tcp_udp_listener(self) -> None:
+        plan = clean_plan()
+        listener = copy.deepcopy(resource(plan, ".aws_lb_listener.udp[0]"))
+        listener["address"] = "module.nhp.module.compute.aws_lb_listener.rogue_tcp_udp"
+        listener["name"] = "rogue_tcp_udp"
+        listener["change"]["after"].update(
+            {"protocol": "TCP_UDP", "port": checker.EXPECTED_RELAY_ACK_PORT}
+        )
+        plan["resource_changes"].append(listener)
+        self.assert_violation(plan, "UDP-capable listener inventory")
+
+    def test_internal_udp_listener_cannot_point_at_public_nlb(self) -> None:
         plan = clean_plan()
         listener = configured_resource(
-            plan, "relay", "aws_lb_listener", "native_nhp_udp"
+            plan, "compute", "aws_lb_listener", "udp_internal"
         )
-        listener["expressions"]["load_balancer_arn"]["references"].append(
-            "local.unreviewed_native_nlb_arn"
-        )
-        self.assert_violation(
-            plan,
-            "native NHP UDP listener must forward only to the native relay instance target group",
-        )
-
-    def test_native_nhp_health_port_must_keep_provider_string_type(self) -> None:
-        plan = clean_plan()
-        target_group = resource(plan, ".aws_lb_target_group.native_nhp")
-        target_group["change"]["after"]["health_check"][0]["port"] = 8080
-        self.assert_violation(
-            plan,
-            "instance UDP:62206",
-        )
-
-    def test_native_nhp_fqdn_is_pinned_to_sandbox_profile(self) -> None:
-        plan = clean_plan()
-        native_dns = resource(plan, ".aws_route53_record.native_nhp[0]")
-        native_dns["change"]["after"]["name"] = "native.wrong.example"
-        self.assert_violation(
-            plan,
-            "stable native.nhp.layerv.xyz alias must target the cutover relay native NLB",
-        )
-
-    def test_native_nhp_partial_target_loss_must_alarm(self) -> None:
-        plan = clean_plan()
-        alarm = resource(
-            plan,
-            ".aws_cloudwatch_metric_alarm.relay_native_nlb_unhealthy_targets",
-        )
-        alarm["change"]["after"]["metric_name"] = "HealthyHostCount"
-        self.assert_violation(plan, "any sustained unready target")
-
-    def test_enabled_contract_rejects_relay_on_native_dark_plan(self) -> None:
-        plan = clean_plan()
-        native_edge_resources = {
-            ("aws_lb", "native_nhp"),
-            ("aws_lb_target_group", "native_nhp"),
-            ("aws_lb_target_group_attachment", "relay_native_nhp"),
-            ("aws_lb_listener", "native_nhp_udp"),
-            ("aws_vpc_security_group_ingress_rule", "native_nhp_udp"),
-            ("aws_vpc_security_group_ingress_rule", "relay_native_udp_from_nlb"),
-            ("aws_vpc_security_group_ingress_rule", "relay_health_from_nlb"),
-            ("aws_cloudwatch_metric_alarm", "relay_native_nlb_unhealthy_targets"),
-            ("aws_cloudwatch_metric_alarm", "relay_native_nlb_zero_healthy_targets"),
-            ("aws_route53_record", "native_nhp"),
+        listener["expressions"]["load_balancer_arn"] = {
+            "references": [
+                "aws_lb.server[0].arn",
+                "aws_lb.server[0]",
+                "aws_lb.server",
+            ]
         }
+        self.assert_violation(plan, "private UDP listener must forward only")
+
+    def test_internal_udp_listener_cannot_point_at_public_tg(self) -> None:
+        plan = clean_plan()
+        listener = configured_resource(
+            plan, "compute", "aws_lb_listener", "udp_internal"
+        )
+        listener["expressions"]["default_action"] = {
+            "references": [
+                "aws_lb_target_group.udp[0].arn",
+                "aws_lb_target_group.udp[0]",
+                "aws_lb_target_group.udp",
+            ]
+        }
+        self.assert_violation(plan, "private UDP listener must forward only")
+
+    def test_internal_udp_target_group_attachment_is_required(self) -> None:
+        plan = clean_plan()
         plan["resource_changes"] = [
             item
             for item in plan["resource_changes"]
-            if (item["type"], item["name"]) not in native_edge_resources
+            if not (
+                item["type"] == "aws_autoscaling_attachment"
+                and item["name"] == "server_internal"
+            )
         ]
+        self.assert_violation(plan, "internal server UDP target-group attachment")
 
-        # The strict enabled contract is the final pre-apply/cutover contract.
-        # Native-dark staging is valid only before callers opt into this mode.
-        self.assert_violation(
-            plan, "expected exactly one public native NHP NLB; found 0"
-        )
-
-    def test_native_edge_must_use_separate_staging_gate(self) -> None:
+    def test_internal_udp_target_group_must_attach_to_server_asg(self) -> None:
         plan = clean_plan()
-        relay_call = plan["configuration"]["root_module"]["module_calls"]["nhp"][
-            "module"
-        ]["module_calls"]["relay"]
-        relay_call["expressions"]["native_nhp_edge_enabled"] = {
-            "references": ["var.take_server_private"]
+        attachment = configured_resource(
+            plan, "compute", "aws_autoscaling_attachment", "server_internal"
+        )
+        attachment["expressions"]["autoscaling_group_name"] = {
+            "references": ["aws_autoscaling_group.server_green[0].name"]
         }
-        self.assert_violation(plan, "explicit staging gate")
+        self.assert_violation(plan, "canonical server ASG")
 
-    def test_native_edge_coherence_guard_must_follow_staging_gate(self) -> None:
+    def test_internal_server_asg_must_attach_to_internal_udp_target_group(self) -> None:
         plan = clean_plan()
-        nhp_resources = plan["configuration"]["root_module"]["module_calls"]["nhp"][
-            "module"
-        ]["resources"]
-        guard = next(
-            item
-            for item in nhp_resources
-            if item["type"] == "terraform_data"
-            and item["name"] == "relay_native_edge_preconditions"
+        attachment = configured_resource(
+            plan, "compute", "aws_autoscaling_attachment", "server_internal"
         )
-        guard["count_expression"] = {"references": ["var.deploy_relay"]}
-        self.assert_violation(plan, "coherence preconditions")
-
-    def test_native_resources_must_be_count_gated(self) -> None:
-        plan = clean_plan()
-        relay_resources = plan["configuration"]["root_module"]["module_calls"]["nhp"][
-            "module"
-        ]["module_calls"]["relay"]["module"]["resources"]
-        native_nlb = next(
-            item
-            for item in relay_resources
-            if item["type"] == "aws_lb" and item["name"] == "native_nhp"
-        )
-        native_nlb.pop("count_expression")
-        self.assert_violation(plan, "gated directly by native_nhp_edge_enabled")
-
-    def test_native_dns_is_absent_until_staging_gate(self) -> None:
-        plan = clean_plan()
-        nhp_resources = plan["configuration"]["root_module"]["module_calls"]["nhp"][
-            "module"
-        ]["resources"]
-        native_dns = next(
-            item
-            for item in nhp_resources
-            if item["type"] == "aws_route53_record" and item["name"] == "native_nhp"
-        )
-        native_dns["count_expression"] = {
-            "references": ["var.hosted_zone", "var.hosted_zone_id"]
+        attachment["expressions"]["lb_target_group_arn"] = {
+            "references": [
+                "aws_lb_target_group.udp[0].arn",
+                "aws_lb_target_group.udp[0]",
+                "aws_lb_target_group.udp",
+            ]
         }
-        self.assert_violation(plan, "absent until the explicit native-edge stage")
+        self.assert_violation(plan, "canonical server ASG")
 
-    def test_native_nhp_public_ingress_is_only_udp_62206(self) -> None:
+    def test_internal_green_udp_target_group_is_required(self) -> None:
         plan = clean_plan()
-        ingress = resource(plan, ".aws_vpc_security_group_ingress_rule.native_nhp_udp")
-        ingress["change"]["after"]["from_port"] = 62207
-        ingress["change"]["after"]["to_port"] = 62207
-        self.assert_violation(plan, "UDP 62206")
+        plan["resource_changes"] = [
+            item
+            for item in plan["resource_changes"]
+            if not (
+                item["type"] == "aws_lb_target_group"
+                and item["name"] == "udp_internal_green"
+            )
+        ]
+        self.assert_violation(plan, "internal green server target group")
+
+    def test_internal_udp_target_group_contracts_are_exact_for_both_colors(
+        self,
+    ) -> None:
+        for resource_name in ("udp_internal", "udp_internal_green"):
+            cases = {
+                "name": lambda values: values.update({"name": "rogue-internal"}),
+                "protocol": lambda values: values.update({"protocol": "TCP_UDP"}),
+                "port": lambda values: values.update({"port": 62207}),
+                "target type": lambda values: values.update({"target_type": "ip"}),
+                "preserve client IP": lambda values: values.update(
+                    {"preserve_client_ip": "false"}
+                ),
+                "environment tag": lambda values: values["tags"].update(
+                    {"Environment": "prod"}
+                ),
+                "component tag": lambda values: values["tags"].update(
+                    {"Component": "relay"}
+                ),
+                "cell tag": lambda values: values["tags"].update({"Cell": "cell1"}),
+                "name tag": lambda values: values["tags"].update(
+                    {"Name": "rogue-internal"}
+                ),
+                "color tag": lambda values: values["tags"].update(
+                    {"DeployColor": "wrong"}
+                ),
+                "health disabled": lambda values: values["health_check"][0].update(
+                    {"enabled": False}
+                ),
+                "health protocol": lambda values: values["health_check"][0].update(
+                    {"protocol": "TCP"}
+                ),
+                "health port": lambda values: values["health_check"][0].update(
+                    {"port": "62206"}
+                ),
+                "health path": lambda values: values["health_check"][0].update(
+                    {"path": "/health/native-ready"}
+                ),
+                "health matcher": lambda values: values["health_check"][0].update(
+                    {"matcher": "200-399"}
+                ),
+            }
+            for name, mutate in cases.items():
+                with self.subTest(resource=resource_name, mutation=name):
+                    plan = clean_plan()
+                    target_group = resource(
+                        plan, f".aws_lb_target_group.{resource_name}"
+                    )
+                    mutate(target_group["change"]["after"])
+                    self.assert_violation(
+                        plan,
+                        f"internal {'green' if resource_name.endswith('_green') else 'blue'} server target group",
+                    )
+
+    def test_internal_udp_preserve_client_ip_must_be_authored_for_both_colors(
+        self,
+    ) -> None:
+        for resource_name in ("udp_internal", "udp_internal_green"):
+            with self.subTest(resource=resource_name):
+                plan = clean_plan()
+                target_group = configured_resource(
+                    plan, "compute", "aws_lb_target_group", resource_name
+                )
+                target_group["expressions"]["preserve_client_ip"] = {
+                    "constant_value": False
+                }
+                self.assert_violation(
+                    plan,
+                    f"internal {'green' if resource_name.endswith('_green') else 'blue'} server target group",
+                )
+
+    def test_green_server_asg_is_required(self) -> None:
+        plan = clean_plan()
+        plan["resource_changes"] = [
+            item
+            for item in plan["resource_changes"]
+            if not (
+                item["type"] == "aws_autoscaling_group"
+                and item["name"] == "server_green"
+            )
+        ]
+        self.assert_violation(plan, "green server ASG")
+
+    def test_green_server_asg_planned_targets_include_both_udp_colors(self) -> None:
+        plan = clean_plan()
+        green_asg = resource(plan, ".aws_autoscaling_group.server_green[0]")
+        green_asg["change"]["after"]["target_group_arns"] = [
+            resource(plan, ".aws_lb_target_group.udp_green[0]")["change"]["after"][
+                "arn"
+            ]
+        ]
+        self.assert_violation(plan, "planned values and authored config")
+
+    def test_green_server_asg_planned_targets_reject_extra_literal_arn(self) -> None:
+        plan = clean_plan()
+        green_asg = resource(plan, ".aws_autoscaling_group.server_green[0]")
+        green_asg["change"]["after"]["target_group_arns"].append(
+            "arn:aws:elasticloadbalancing:us-east-2:767397897469:targetgroup/rogue/extra"
+        )
+        self.assert_violation(plan, "planned values and authored config")
+
+    def test_green_server_asg_authored_targets_cannot_omit_internal_udp(self) -> None:
+        plan = clean_plan()
+        green_asg = configured_resource(
+            plan, "compute", "aws_autoscaling_group", "server_green"
+        )
+        green_asg["expressions"]["target_group_arns"]["references"] = [
+            "aws_lb_target_group.udp_green[0].arn",
+            "aws_lb_target_group.udp_green[0]",
+            "aws_lb_target_group.udp_green",
+            "var.enable_qurl_resolve_endpoint",
+            "aws_lb_target_group.https_green[0].arn",
+            "aws_lb_target_group.https_green[0]",
+            "aws_lb_target_group.https_green",
+        ]
+        self.assert_violation(plan, "planned values and authored config")
 
     def test_relay_https_backend_rejects_foreign_peer_sg(self) -> None:
         plan = clean_plan()
@@ -3842,7 +4361,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             "relay_http_from_alb",
         )
         ingress["expressions"]["referenced_security_group_id"] = {
-            "references": ["aws_security_group.native_nhp.id"]
+            "references": ["aws_security_group.unreviewed_foreign.id"]
         }
         self.assert_violation(
             plan, "relay HTTPS backend ingress must use only the reviewed SG-to-SG path"
@@ -3888,20 +4407,6 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
 
     def test_standalone_rule_config_rejects_every_alternate_selector(self) -> None:
         cases = (
-            (
-                "aws_vpc_security_group_ingress_rule",
-                "native_nhp_udp",
-                "security_group_id",
-                {"references": ["aws_security_group.unreviewed.id"]},
-                "public native NHP ingress must use only its reviewed SG",
-            ),
-            (
-                "aws_vpc_security_group_ingress_rule",
-                "native_nhp_udp",
-                "cidr_ipv6",
-                {"constant_value": "::/0"},
-                "public native NHP ingress must use only its reviewed SG",
-            ),
             (
                 "aws_vpc_security_group_egress_rule",
                 "relay_to_vpc_endpoints_https",
@@ -3996,7 +4501,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             "relay_udp_ack_return",
         )
         ingress["expressions"]["security_group_id"] = {
-            "references": ["aws_security_group.native_nhp.id"]
+            "references": ["aws_security_group.unreviewed_foreign.id"]
         }
         self.assert_violation(
             plan,
@@ -4015,7 +4520,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             and item["name"] == "relay_udp_ack_return"
         )
         ingress["expressions"]["referenced_security_group_id"] = {
-            "references": ["aws_security_group.native_nhp.id"]
+            "references": ["aws_security_group.unreviewed_foreign.id"]
         }
         self.assert_violation(
             plan,
@@ -4035,26 +4540,6 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             plan, "must come from the canonical server security group"
         )
 
-    def test_native_nhp_nlb_must_not_target_main_servers_directly(self) -> None:
-        plan = clean_plan()
-        target_group = resource(plan, ".aws_lb_target_group.native_nhp")
-        target_group["change"]["after"]["target_type"] = "ip"
-        self.assert_violation(plan, "instance UDP:62206")
-
-    def test_native_nhp_nlb_must_remain_ipv4_cross_zone(self) -> None:
-        plan = clean_plan()
-        nlb = resource(plan, ".aws_lb.native_nhp")
-        nlb["change"]["after"]["ip_address_type"] = "dualstack"
-        self.assert_violation(plan, "IPv4, cross-zone")
-
-    def test_native_nhp_selector_must_name_one_rendered_cell(self) -> None:
-        plan = clean_plan()
-        launch_template = resource(plan, ".aws_launch_template.relay")
-        launch_template["change"]["after"]["user_data"] = base64.b64encode(
-            b'native_server = "missing-cell"\n[[servers]]\nname = "sandbox-cell0"\n'
-        ).decode("ascii")
-        self.assert_violation(plan, "select exactly one configured cell")
-
     def test_relay_user_data_must_contain_plaintext_relay_toml_markers(self) -> None:
         plan = clean_plan()
         launch_template = resource(plan, ".aws_launch_template.relay")
@@ -4063,7 +4548,70 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         ).decode("ascii")
         self.assert_violation(
             plan,
-            "must remain base64-encoded UTF-8 plaintext containing native_server and [[servers]] relay TOML markers",
+            "must remain base64-encoded UTF-8 plaintext containing [[servers]] relay TOML markers",
+        )
+
+    def test_relay_user_data_rejects_extra_literal_cell_host(self) -> None:
+        plan = clean_plan()
+        launch_template = resource(plan, ".aws_launch_template.relay")
+        rendered = base64.b64decode(launch_template["change"]["after"]["user_data"])
+        rendered += (
+            b'\n[[servers]]\nname = "sandbox-cell1"\n'
+            + f'public_key = "{"B" * 43}="\n'.encode()
+            + b'host = "evil.example"\nport = 62206\n'
+        )
+        launch_template["change"]["after"]["user_data"] = base64.b64encode(
+            rendered
+        ).decode("ascii")
+        self.assert_violation(
+            plan,
+            "exactly match the plan-visible sandbox-cell0 route",
+        )
+
+    def test_relay_user_data_rejects_missing_cell_host(self) -> None:
+        plan = clean_plan()
+        launch_template = resource(plan, ".aws_launch_template.relay")
+        rendered = base64.b64decode(
+            launch_template["change"]["after"]["user_data"]
+        ).decode()
+        rendered = re.sub(r'(?m)^host = "[^"]+"\n', "", rendered)
+        launch_template["change"]["after"]["user_data"] = base64.b64encode(
+            rendered.encode()
+        ).decode("ascii")
+        self.assert_violation(plan, "containing [[servers]] relay TOML markers")
+
+    def test_relay_user_data_rejects_wrong_internal_cell_host(self) -> None:
+        plan = clean_plan()
+        launch_template = resource(plan, ".aws_launch_template.relay")
+        rendered = base64.b64decode(
+            launch_template["change"]["after"]["user_data"]
+        ).decode()
+        rendered = re.sub(r'(?m)^host = "[^"]+"$', 'host = "evil.example"', rendered)
+        launch_template["change"]["after"]["user_data"] = base64.b64encode(
+            rendered.encode()
+        ).decode("ascii")
+        self.assert_violation(
+            plan,
+            "exactly match the plan-visible sandbox-cell0 route",
+        )
+
+    def test_relay_user_data_rejects_well_shaped_wrong_server_key(self) -> None:
+        plan = clean_plan()
+        launch_template = resource(plan, ".aws_launch_template.relay")
+        rendered = base64.b64decode(
+            launch_template["change"]["after"]["user_data"]
+        ).decode()
+        rendered = re.sub(
+            r'(?m)^public_key = "[^"]+"$',
+            f'public_key = "{"B" * 43}="',
+            rendered,
+        )
+        launch_template["change"]["after"]["user_data"] = base64.b64encode(
+            rendered.encode()
+        ).decode("ascii")
+        self.assert_violation(
+            plan,
+            "authoritative server public key",
         )
 
     def test_relay_user_data_rejects_gzipped_payload_with_clear_diagnostic(
@@ -4079,7 +4627,34 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             "gzip or multipart user_data requires an explicitly reviewed parser update",
         )
 
-    def test_public_nhp_dns_must_repoint_to_native_nlb(self) -> None:
+    def test_public_nhp_dns_must_target_assigned_cell_nlb(self) -> None:
+        plan = clean_plan()
+        nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]
+        nhp_module["module_calls"]["dns"]["expressions"]["nlb_dns_name"] = {
+            "references": ["module.relay[0].dns_name"]
+        }
+        self.assert_violation(plan, "assigned cell's server NLB directly")
+
+    def test_public_nhp_dns_and_output_accept_terraform_dual_references(self) -> None:
+        plan = clean_plan()
+        nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]
+        self.assertEqual(
+            ["module.compute.nlb_dns_name", "module.compute"],
+            nhp_module["module_calls"]["dns"]["expressions"]["nlb_dns_name"][
+                "references"
+            ],
+        )
+        self.assertEqual(
+            ["module.compute.nlb_dns_name", "module.compute"],
+            nhp_module["outputs"]["nlb_dns_name"]["expression"]["references"],
+        )
+        self.assertEqual([], checker.validate_plan(plan))
+
+    def test_public_nhp_dns_rejects_incomplete_leaf_only_reference(self) -> None:
         plan = clean_plan()
         nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
             "module"
@@ -4087,22 +4662,27 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         nhp_module["module_calls"]["dns"]["expressions"]["nlb_dns_name"] = {
             "references": ["module.compute.nlb_dns_name"]
         }
-        self.assert_violation(plan, "repoint public NHP DNS")
+        self.assert_violation(plan, "assigned cell's server NLB directly")
 
-    def test_native_listener_must_target_native_relay_group(self) -> None:
+    def test_public_nlb_output_must_expose_assigned_cell_nlb(self) -> None:
         plan = clean_plan()
-        relay_resources = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+        nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
             "module"
-        ]["module_calls"]["relay"]["module"]["resources"]
-        listener = next(
-            item
-            for item in relay_resources
-            if item["type"] == "aws_lb_listener" and item["name"] == "native_nhp_udp"
-        )
-        listener["expressions"]["default_action"] = {
-            "references": ["aws_lb_target_group.relay.arn"]
+        ]
+        nhp_module["outputs"]["nlb_dns_name"] = {
+            "expression": {"references": ["module.relay[0].dns_name"]}
         }
-        self.assert_violation(plan, "forward only to the native relay")
+        self.assert_violation(plan, "public nlb_dns_name output")
+
+    def test_public_nlb_output_rejects_incomplete_leaf_only_reference(self) -> None:
+        plan = clean_plan()
+        nhp_module = plan["configuration"]["root_module"]["module_calls"]["nhp"][
+            "module"
+        ]
+        nhp_module["outputs"]["nlb_dns_name"] = {
+            "expression": {"references": ["module.compute.nlb_dns_name"]}
+        }
+        self.assert_violation(plan, "public nlb_dns_name output")
 
     def test_s3_egress_must_use_prefix_list(self) -> None:
         plan = clean_plan()
@@ -4138,23 +4718,51 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         alb["change"]["actions"] = ["update"]
         self.assert_violation(plan, "must be replaced")
 
+    def test_relay_alb_hardening_and_log_destination_are_exact(self) -> None:
+        cases = {
+            "client port": lambda alb: alb.update({"enable_xff_client_port": True}),
+            "WAF fail open": lambda alb: alb.update({"enable_waf_fail_open": True}),
+            "redirected logs": lambda alb: alb["access_logs"][0].update(
+                {"bucket": "attacker-controlled-bucket"}
+            ),
+            "log prefix": lambda alb: alb["access_logs"][0].update(
+                {"prefix": "redirected"}
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                plan = clean_plan()
+                alb = resource(plan, ".module.relay[0].aws_lb.relay")
+                mutate(alb["change"]["after"])
+                self.assert_violation(
+                    plan,
+                    "exact deletion protection, WAF/XFF/HTTP hardening, and access-log destination",
+                )
+
     def test_broad_server_return_ingress_is_rejected(self) -> None:
         plan = clean_plan()
         rule = resource(plan, '.server_nhp_udp_additional["10.101.10.0/24"]')
         rule["change"]["after"]["cidr_ipv4"] = "10.101.0.0/16"
         self.assert_violation(plan, "exactly the three relay /24s")
 
-    def test_legacy_public_server_nlb_surface_is_rejected(self) -> None:
+    def test_assigned_cell_public_server_nlb_surface_is_required(self) -> None:
         plan = clean_plan()
-        public_nlb = copy.deepcopy(resource(plan, ".aws_lb.server_internal"))
-        public_nlb["address"] = "module.nhp.module.compute.aws_lb.server[0]"
-        public_nlb["name"] = "server"
-        public_nlb["change"]["after"]["internal"] = False
-        public_listener = copy.deepcopy(resource(plan, ".aws_lb_listener.udp_internal"))
-        public_listener["address"] = "module.nhp.module.compute.aws_lb_listener.udp[0]"
-        public_listener["name"] = "udp"
-        plan["resource_changes"].extend((public_nlb, public_listener))
-        self.assert_violation(plan, "legacy main-VPC public server NLB")
+        plan["resource_changes"] = [
+            item
+            for item in plan["resource_changes"]
+            if not (
+                ".module.compute." in item["address"]
+                and (item["type"], item["name"])
+                in {
+                    ("aws_lb", "server"),
+                    ("aws_lb_target_group", "udp"),
+                    ("aws_lb_listener", "udp"),
+                }
+            )
+        ]
+        self.assert_violation(
+            plan, "canonically named and tagged internet-facing server NLB"
+        )
 
     def test_renamed_public_compute_nlb_is_rejected(self) -> None:
         plan = clean_plan()
@@ -4163,13 +4771,107 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         public_nlb["name"] = "renamed_public"
         public_nlb["change"]["after"]["internal"] = False
         plan["resource_changes"].append(public_nlb)
-        self.assert_violation(plan, "internet-facing network load balancer")
+        self.assert_violation(plan, "only internet-facing compute NLB")
 
-    def test_base_server_udp_ingress_cannot_return_to_internet_source(self) -> None:
+    def test_base_server_udp_ingress_must_remain_public(self) -> None:
         plan = clean_plan()
         rule = resource(plan, ".server_nhp_udp")
-        rule["change"]["after"]["cidr_ipv4"] = "0.0.0.0/0"
-        self.assert_violation(plan, "private to the sandbox main VPC CIDR")
+        rule["change"]["after"]["cidr_ipv4"] = "10.100.0.0/16"
+        self.assert_violation(plan, "accept public NHP UDP 62206")
+
+    def test_base_server_udp_ingress_must_belong_to_server_sg(self) -> None:
+        plan = clean_plan()
+        rule = configured_resource(
+            plan,
+            "compute",
+            "aws_vpc_security_group_ingress_rule",
+            "server_nhp_udp",
+        )
+        rule["expressions"]["security_group_id"] = {
+            "references": ["aws_security_group.unreviewed.id"]
+        }
+        self.assert_violation(plan, "canonical server SG")
+
+    def test_server_sg_rejects_inline_public_udp_ack_ingress(self) -> None:
+        plan = clean_plan()
+        server_sg = configured_resource(plan, "compute", "aws_security_group", "server")
+        server_sg["expressions"]["ingress"] = {
+            "constant_value": [
+                {
+                    "protocol": "udp",
+                    "from_port": 62207,
+                    "to_port": 62207,
+                    "cidr_blocks": ["0.0.0.0/0"],
+                }
+            ]
+        }
+        self.assert_violation(plan, "declare no inline ingress or egress")
+
+    def test_compute_rejects_legacy_public_udp_security_group_rule(self) -> None:
+        plan = clean_plan()
+        plan["resource_changes"].append(
+            {
+                "address": (
+                    "module.nhp.module.compute.aws_security_group_rule.rogue_public_ack"
+                ),
+                "mode": "managed",
+                "type": "aws_security_group_rule",
+                "name": "rogue_public_ack",
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {
+                        "type": "ingress",
+                        "security_group_id": "sg-server",
+                        "protocol": "udp",
+                        "from_port": 62207,
+                        "to_port": 62207,
+                        "cidr_blocks": ["0.0.0.0/0"],
+                        "ipv6_cidr_blocks": [],
+                    },
+                    "after_unknown": {},
+                },
+            }
+        )
+        self.assert_violation(plan, "legacy aws_security_group_rule resources")
+
+    def test_server_sg_rejects_second_public_udp_range_covering_nhp(self) -> None:
+        plan = clean_plan()
+        rule = copy.deepcopy(resource(plan, ".server_nhp_udp"))
+        rule["address"] = (
+            "module.nhp.module.compute."
+            "aws_vpc_security_group_ingress_rule.rogue_public_udp_range"
+        )
+        rule["name"] = "rogue_public_udp_range"
+        rule["change"]["after"].update({"from_port": 62000, "to_port": 63000})
+        plan["resource_changes"].append(rule)
+        self.assert_violation(plan, "public UDP-capable ingress")
+
+    def test_server_sg_rejects_public_all_protocol_rule_covering_nhp(self) -> None:
+        plan = clean_plan()
+        rule = copy.deepcopy(resource(plan, ".server_nhp_udp"))
+        rule["address"] = (
+            "module.nhp.module.compute."
+            "aws_vpc_security_group_ingress_rule.rogue_public_all"
+        )
+        rule["name"] = "rogue_public_all"
+        rule["change"]["after"].update(
+            {"ip_protocol": "-1", "from_port": None, "to_port": None}
+        )
+        plan["resource_changes"].append(rule)
+        self.assert_violation(plan, "public UDP-capable ingress")
+
+    def test_server_sg_rejects_public_udp_ack_port(self) -> None:
+        plan = clean_plan()
+        rule = copy.deepcopy(resource(plan, ".server_nhp_udp"))
+        rule["address"] = (
+            "module.nhp.module.compute."
+            "aws_vpc_security_group_ingress_rule.rogue_public_ack"
+        )
+        rule["name"] = "rogue_public_ack"
+        rule["change"]["after"].update({"from_port": 62207, "to_port": 62207})
+        plan["resource_changes"].append(rule)
+        self.assert_violation(plan, "public UDP-capable ingress")
 
     def test_ipv6_internet_wide_security_group_egress_is_rejected(self) -> None:
         plan = clean_plan()
@@ -5091,7 +5793,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         self.assertEqual([], checker.validate_plan(plan, require_enabled=False))
         self.assertTrue(checker.validate_plan(plan, require_enabled=True))
 
-    def test_allow_disabled_still_validates_an_enabled_native_edge(self) -> None:
+    def test_allow_disabled_still_validates_an_enabled_https_relay(self) -> None:
         plan = clean_plan()
         self.assertEqual([], checker.validate_plan(plan, require_enabled=False))
         result = run_checker_cli(plan, "--allow-disabled")

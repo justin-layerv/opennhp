@@ -117,9 +117,6 @@ describe("relay identity validation", () => {
     assert.match(terraform, /Action\s*=\s*\["ssm:GetParameter", "ssm:PutParameter"\]/);
     assert.match(lambda[1], /depends_on\s*=\s*\[time_sleep\.keygen_iam_propagation\]/);
     assert.match(statusLambda[1], /handler\s*=\s*"relay_identity\.statusHandler"/);
-    // This verbatim bootstrap tripwire is intentionally coupled to the pending
-    // status-only config change; revisit it in #3150 after the live policy proof.
-    assert.match(statusLambda[1], /description\s*=\s*"Read-only relay identity status \(\$LATEST-qualified invocation\)"/);
     assert.match(statusLambda[1], /role\s*=\s*aws_iam_role\.status_lambda\.arn/);
     const statusActions = [...statusPolicy[1].matchAll(/Action\s*=\s*\[([^\]]*)\]/g)]
       .flatMap((block) => [...block[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]))

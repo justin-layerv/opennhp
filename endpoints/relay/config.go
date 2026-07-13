@@ -8,24 +8,24 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// Config configures the NHP-Relay service (#2208). The relay is the
-// internet-facing component of the off-internet topology:
+// Config configures the HTTPS-only NHP-Relay service (#2208):
 //
-//	Browser JS-Agent --HTTPS POST--> NHP-Relay --NHP_RLY--> private NHP-Server
+//	Browser JS-Agent --HTTPS POST--> NHP-Relay
+//	    --NHP_RLY--> internal NHP-Server endpoint
 //
-// It forwards an agent's opaque inner NHP knock to a (private) cell server and
-// relays the server's encrypted ACK back to the browser. See
-// docs/design/NHP_RELAY_TOPOLOGY.md.
+// It forwards an agent's opaque inner NHP knock to a cell's internal server
+// endpoint and relays the server's authenticated opaque return back to the
+// client. See docs/design/NHP_RELAY_TOPOLOGY.md.
 type Config struct {
 	// ListenAddr is the host:port the HTTP(S) relay endpoint binds.
 	ListenAddr string `toml:"listen_addr"`
 
 	// UDPListenAddr is the host:port the relay's UDP socket binds for sending
-	// NHP_RLY to cell servers and receiving their ACKs on the SAME socket.
-	// SECURITY: the server pins the relay's source address (CheckRecvAddress)
-	// against its relay.toml entry, so this must be stable and reachable from the
-	// (private) server, and must match what the server registered. Empty binds
-	// an ephemeral port (tests / single-box dev only).
+	// NHP_RLY to cell servers and receiving RelayReturn envelopes on the SAME socket.
+	// Relay authentication is static-public-key based; SGs restrict the transport.
+	// This address must still be stable and server-reachable so authenticated
+	// returns reach the same socket. Empty binds an ephemeral port (tests /
+	// single-box dev only).
 	UDPListenAddr string `toml:"udp_listen_addr"`
 
 	// PrivateKeyBase64 is the relay's NHP static private key (base64, 32 bytes).
@@ -84,7 +84,7 @@ type ServerConfig struct {
 	// PubKeyBase64 is the cell server's NHP static public key (base64). Its
 	// fingerprint (utils.PubKeyFingerprint) is the {serverId} in the relay URL.
 	PubKeyBase64 string `toml:"public_key"`
-	// Host is the server's UDP host (CloudMap DNS, e.g. server.nhp.sandbox.internal).
+	// Host is the stable internal NLB DNS name for the cell server.
 	Host string `toml:"host"`
 	// Port is the server's NHP knock UDP port (62206).
 	Port int `toml:"port"`
@@ -139,8 +139,8 @@ func LoadConfig(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("relay: read config %q: %w", path, err)
 	}
-	// Strict decode: this config is security-critical (source_addr_mode, the UDP
-	// bind the server pins via CheckRecvAddress), and an ignored typo fails *unsafe*
+	// Strict decode: this config is security-critical (source_addr_mode and the
+	// same-socket UDP return bind), and an ignored typo fails *unsafe*
 	// — e.g. `udp_listen_adr` would leave UDPListenAddr empty, bind an ephemeral
 	// port, and the relay would be silently unreachable from the server. Reject
 	// unknown keys at startup instead.

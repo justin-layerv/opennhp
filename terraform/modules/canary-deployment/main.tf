@@ -17,12 +17,9 @@ locals {
 # — qurl-reverse-tunnel-server has no NLB, so the NLB-keyed alarms would sit in
 # INSUFFICIENT_DATA forever and the canary state machine would never
 # advance. Conversely, `component` in {"server","ac"} with
-# `disable_nlb_health_checks = true` would silently skip NLB health
-# fences on a component that DOES have an NLB, hiding rollout-time
-# regressions — UNLESS that component's NLB is intentionally absent
-# (`nlb_intentionally_absent = true`, e.g. nhp-server taken private, #2628), in
-# which case advancing on CPU + ASG health is correct. Other half-mixes fail at
-# plan time.
+# `disable_nlb_health_checks = true` would silently skip NLB health fences on a
+# component that has an NLB and is therefore always rejected. Other half-mixes
+# fail at plan time.
 resource "terraform_data" "component_invariants" {
   lifecycle {
     precondition {
@@ -30,8 +27,8 @@ resource "terraform_data" "component_invariants" {
       error_message = "component = \"frps\" requires disable_nlb_health_checks = true — qurl-reverse-tunnel-server has no NLB and the NLB-keyed alarms would sit in INSUFFICIENT_DATA forever, blocking the canary from advancing."
     }
     precondition {
-      condition     = !contains(["server", "ac"], var.component) || !var.disable_nlb_health_checks || var.nlb_intentionally_absent
-      error_message = "component in {\"server\",\"ac\"} with disable_nlb_health_checks = true would skip NLB-keyed health alarms on a component that has an NLB. Either pass `component = \"frps\"`, leave `disable_nlb_health_checks = false`, or set `nlb_intentionally_absent = true` when the component's NLB is deliberately removed (e.g. nhp-server taken private, #2628) — the canary then advances on CPU + ASG-instance health."
+      condition     = !contains(["server", "ac"], var.component) || !var.disable_nlb_health_checks
+      error_message = "component in {\"server\",\"ac\"} requires disable_nlb_health_checks = false because both components have mandatory NLB-keyed health alarms."
     }
     precondition {
       # NLB / target-group ARN suffixes must be empty when NLB checks are

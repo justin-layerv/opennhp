@@ -37,7 +37,7 @@ import (
 // agent-decryptable ack returns to the originating client THROUGH the relay.
 // Single-cell deployments with a local AC never hit it; the #2208 multi-instance
 // (ASG + DynamoDB) topology can. This is the gap #2546 calls out as the test
-// coverage that de-risks taking nhp-server private (#8 / #2628).
+// coverage that de-risks the browser relay's private cell hop (#8 / #2628).
 //
 // The two load-bearing assertions:
 //
@@ -72,7 +72,7 @@ var relayClientAddr = &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444}
 // transmit NHP_FRT), #2655 (NHP_FWD handled on the recv loop -> NHP_ART timeout
 // + pool-release race), #2656 (mock-AC id != resource ACId) — were fixed in
 // #2650 (#2653 was investigated and closed as not-a-bug). See #2546 for the
-// coverage rationale (de-risks taking nhp-server private, #2208 #8 / #2628).
+// coverage rationale (de-risks the browser relay's private cell hop, #2208).
 func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping cross-server relay e2e test in short mode")
@@ -141,8 +141,9 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 	// wire to server A (which has no agent peer and fails the decrypt).
 	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
 
-	// The relay stand-in: a plain UDP socket. server A's sendRelayAck writes the
-	// final ack here; the test reads it back and feeds it to the agent.
+	// The relay stand-in: a plain UDP socket. server A's buildRelayInnerReply +
+	// sendRelayReturn path writes the final ack here; the test reads it back and
+	// feeds it to the agent.
 	relayListen := mustUDPListener(t)
 	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
 
@@ -288,14 +289,12 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 		Version: 1,
 	})
 
-	relayPub := relayTestPubKey()
-	relayPubB64 := base64.StdEncoding.EncodeToString(relayPub)
 	mp := metrics.NewPublisherForTest(t)
 
 	serverA := &UdpServer{
 		device:       serverANode.device,
 		metrics:      mp,
-		relayPeerMap: map[string]*core.UdpPeer{relayPubB64: {PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}},
+		relayPeerMap: make(map[string]*core.UdpPeer),
 		// A local plugin handler that mirrors the production agent plugin's core
 		// (resolve the qURL tunnel resource off helper.AspData via the real
 		// qurlplacement.ResolveResource, then dispatch through
@@ -317,8 +316,8 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 		// buildKnockAck is skipped (legacy/non-cloud path). The inner knock's
 		// RemotePubKey is populated by the synthetic decrypt under
 		// DisableAgentPeerValidation, which is all AuthWithNHP needs.
-		// listenConn is server A's real socket — sendRelayAck writes the ack to
-		// the relay through it.
+		// listenConn is server A's real socket — sendRelayReturn writes the
+		// wrapped ack to the relay through it.
 		listenConn: serverANode.udpConn,
 	}
 
@@ -351,22 +350,20 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 	rlyBytes, err := json.Marshal(&common.RelayForwardMsg{
 		SourceAddr:  &common.NetAddress{Ip: relayClientAddr.IP.String(), Port: relayClientAddr.Port},
 		InnerPacket: base64.StdEncoding.EncodeToString(innerKnock),
+		RequestID:   testRelayRequestID,
 	})
 	if err != nil {
 		t.Fatalf("marshal RelayForwardMsg: %v", err)
 	}
-	outerPpd := &core.PacketParserData{
-		HeaderType:   core.NHP_RLY,
-		RemotePubKey: relayPub,
-		ConnData:     &core.ConnectionData{RemoteAddr: relayAddr},
-		BodyMessage:  rlyBytes,
-	}
+	outerPpd, relayDev, relayConn := realOuterRelayRequest(t, serverANode.device, serverANode.addr, relayAddr, rlyBytes)
+	relayPubB64 := base64.StdEncoding.EncodeToString(outerPpd.RemotePubKey)
+	serverA.relayPeerMap[relayPubB64] = &core.UdpPeer{PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}
 
 	// ------------------------------------------------------------- drive it
 	// HandleRelayForward blocks through buildKnockAck -> AuthWithNHP ->
 	// handleNhpOpenResource -> ForwardKnock (the real NHP_FWD round-trip) ->
-	// sendRelayAck, so run it in a goroutine and assert on the observable
-	// side effects (the AOP at the AC, the ack at the relay).
+	// buildRelayInnerReply -> sendRelayReturn, so run it in a goroutine and assert
+	// on the observable side effects (the AOP at the AC, the ack at the relay).
 	go serverA.HandleRelayForward(outerPpd)
 
 	// ---- Assertion 1 (the heart of #2546): the relay-reported CLIENT ip
@@ -399,7 +396,15 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 
 	// ---- Assertion 2: the ack is delivered to the RELAY's address (not the
 	// client) and is decryptable by the agent's original knock transaction.
-	ackBytes := readUDPWithTimeout(t, relayListen, 10*time.Second)
+	outerReturnBytes := readUDPWithTimeout(t, relayListen, 10*time.Second)
+	returned := decryptRelayReturnForTest(t, relayDev, relayConn, outerReturnBytes)
+	if returned.RequestID != testRelayRequestID {
+		t.Fatalf("return request ID = %q, want %q", returned.RequestID, testRelayRequestID)
+	}
+	ackBytes, err := base64.StdEncoding.DecodeString(returned.InnerPacket)
+	if err != nil {
+		t.Fatalf("decode returned inner ACK: %v", err)
+	}
 
 	routeResponseToTransaction(t, agentDev, ackBytes)
 	select {

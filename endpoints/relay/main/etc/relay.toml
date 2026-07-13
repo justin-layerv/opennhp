@@ -1,5 +1,5 @@
 # NHP-Relay configuration (#2208). The relay bridges browser JS-agents
-# (HTTPS POST /relay/{serverId}) to the private NHP-Server over NHP_RLY.
+# (HTTPS POST /relay/{serverId}) to the internal NHP-Server endpoint over NHP_RLY.
 # See docs/design/NHP_RELAY_TOPOLOGY.md. This is the example shipped with the
 # binary; the deployment overwrites it (the private_key + servers come from
 # Secrets Manager / per-cell config, P5/P6).
@@ -14,9 +14,10 @@
 listen_addr = "0.0.0.0:8080"
 
 # host:port the relay's UDP socket binds to send NHP_RLY to cell servers and
-# receive their ACKs on the same socket. Must be stable + reachable from the
-# (private) server and match what the server registered as the relay peer — the
-# server pins the relay's source address (CheckRecvAddress).
+# receive their authenticated returns on the same socket. Must be stable and
+# reachable from the server's internal return path; relay authentication is by
+# registered static public key, while security groups restrict this UDP
+# transport.
 udp_listen_addr = "0.0.0.0:62207"
 
 # Relay identity: NHP static private key (base64 of 32 bytes). Generate with
@@ -58,7 +59,7 @@ trusted_proxy = false
 # by its server pubkey fingerprint: POST /relay/{serverId}. Single-cell today
 # (one entry); adding a cell is a config change, not a protocol change.
 [[servers]]
-name = "sandbox-cell0"
+name = "example-cell"
 public_key = ""                       # cell server's NHP static public key (base64)
-host = "server.nhp.sandbox.internal"  # the server's UDP host (CloudMap DNS)
+host = "nhp-cell-internal.example.invalid"  # assigned cell's internal NLB
 port = 62206                          # the server's NHP knock UDP port

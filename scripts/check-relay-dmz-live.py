@@ -60,12 +60,13 @@ from typing import Any
 
 
 # The first committed live snapshot contract started at v2. Version 3 adds the
-# native UDP/62206 NLB, its dedicated SG/target group, and dual-target-group ASG
-# health inventory. Version 4 adds the stable Route53 alias and both native NLB
-# target-loss alarms. Version 5 proves the peered main VPC no longer has a
-# public UDP-capable 62206 listener. Increment this value for incompatible
-# snapshot changes.
-SCHEMA_VERSION = 5
+# relay-owned native UDP edge. Version 6 removes that edge; version 7 binds the
+# replacement public UDP/62206 proof to the assigned-cell compute NLB. Version 8
+# adds the active-color internal relay NLB target/ASG/SG proof and inventories
+# every public main-VPC NLB to detect a second NHP-owned edge. Version 9 resolves
+# IP targets and expands NHP ownership evidence to canonical server ASG, SG, and
+# private-IP identity. Increment for incompatible snapshot changes.
+SCHEMA_VERSION = 9
 EXPECTED_INTERFACE_SERVICES = {
     "ecr.api",
     "ecr.dkr",
@@ -155,31 +156,13 @@ EXPECTED_ENVIRONMENT_REGIONS = {
     "sandbox": "us-east-2",
     "prod": "us-east-2",
 }
-# Sandbox can read its zone with the deployment credentials used by the live
-# gate. Prod structural darkness is intentionally caller/workflow-enforced;
-# unlike functional mode, it has no code fence. Prod's zone is cross-account,
-# and #3154 must run this exact Route53 read under the reviewed management-account
-# role before it enables the prod structural gate.
-EXPECTED_NATIVE_DNS = {
-    "sandbox": {
-        "fqdn": "native.nhp.layerv.xyz",
-        "hosted_zone_id": "Z10394893FM38A1RXLL32",
-    },
-    "prod": {
-        "fqdn": "native.nhp.layerv.ai",
-        "hosted_zone_id": "Z0748438C8EK6UAW94ST",
-    },
-}
-
 RELAY_HTTPS_PORT = 443
 RELAY_BACKEND_PORT = 8080
 RELAY_SERVER_UDP_PORT = 62206
 RELAY_ACK_UDP_PORT = 62207
 RELAY_HEALTH_PATH = "/health/live"
-RELAY_NATIVE_HEALTH_PATH = "/health/native-ready"
 RELAY_TLS_POLICY = "ELBSecurityPolicy-TLS13-1-2-2021-06"
 RELAY_TG_NAME_PREFIX = "rlytls"
-RELAY_NATIVE_TG_NAME_PREFIX = "rlyudp"
 
 # Sandbox and prod deliberately use the same reviewed address plan today. Keep
 # separate entries: a future prod-only CIDR change must update the explicit prod
@@ -408,6 +391,14 @@ def _exact_nonnegative_int(value: Any) -> int | None:
     return None
 
 
+def _valid_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _require_expected_environment_region(environment: str, region: str) -> None:
     expected_region = EXPECTED_ENVIRONMENT_REGIONS.get(environment)
     if expected_region is None:
@@ -602,79 +593,168 @@ def _normalize_endpoint(endpoint: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _dns_name(value: Any) -> str:
-    return str(value or "").rstrip(".").lower()
+def _collect_udp_target_group(
+    aws: AwsCli, target_group_arn: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    target_group_rows = aws.call(
+        "elbv2",
+        "describe-target-groups",
+        "--target-group-arns",
+        target_group_arn,
+    ).get("TargetGroups", [])
+    target_group = None
+    if len(target_group_rows) == 1:
+        row = target_group_rows[0]
+        target_group_attributes = {
+            item.get("Key"): item.get("Value")
+            for item in aws.call(
+                "elbv2",
+                "describe-target-group-attributes",
+                "--target-group-arn",
+                target_group_arn,
+            ).get("Attributes", [])
+        }
+        target_group_tags = aws.call(
+            "elbv2", "describe-tags", "--resource-arns", target_group_arn
+        ).get("TagDescriptions", [])
+        target_group = {
+            "arn": row.get("TargetGroupArn"),
+            "name": row.get("TargetGroupName"),
+            "tags": (
+                _tags(target_group_tags[0].get("Tags"))
+                if len(target_group_tags) == 1
+                else {}
+            ),
+            "vpc_id": row.get("VpcId"),
+            "protocol": row.get("Protocol"),
+            "port": row.get("Port"),
+            "target_type": row.get("TargetType"),
+            "preserve_client_ip": (
+                target_group_attributes.get("preserve_client_ip.enabled") == "true"
+            ),
+            "health_check_enabled": row.get("HealthCheckEnabled"),
+            "health_check_protocol": row.get("HealthCheckProtocol"),
+            "health_check_port": row.get("HealthCheckPort"),
+            "health_check_path": row.get("HealthCheckPath"),
+            "health_check_matcher": row.get("Matcher", {}).get("HttpCode"),
+        }
 
-
-def _normalize_native_dns_record(record: dict[str, Any]) -> dict[str, Any]:
-    alias = record.get("AliasTarget") or {}
-    return {
-        "name": _dns_name(record.get("Name")),
-        "type": record.get("Type"),
-        "alias_dns_name": _dns_name(alias.get("DNSName")),
-        "alias_hosted_zone_id": alias.get("HostedZoneId"),
-        "evaluate_target_health": alias.get("EvaluateTargetHealth"),
-        "set_identifier": record.get("SetIdentifier"),
-        "weight": record.get("Weight"),
-        "region": record.get("Region"),
-        "failover": record.get("Failover"),
-        "multi_value_answer": record.get("MultiValueAnswer", False),
-        "health_check_id": record.get("HealthCheckId"),
-        "traffic_policy_instance_id": record.get("TrafficPolicyInstanceId"),
-        "ttl": record.get("TTL"),
-        "resource_record_count": len(record.get("ResourceRecords", [])),
+    targets = [
+        {
+            "id": row.get("Target", {}).get("Id"),
+            "port": row.get("Target", {}).get("Port"),
+            "state": row.get("TargetHealth", {}).get("State"),
+            "reason": row.get("TargetHealth", {}).get("Reason"),
+        }
+        for row in aws.call(
+            "elbv2",
+            "describe-target-health",
+            "--target-group-arn",
+            target_group_arn,
+        ).get("TargetHealthDescriptions", [])
+    ]
+    target_to_instance_id = {
+        str(row["id"]): str(row["id"])
+        for row in targets
+        if str(row.get("id", "")).startswith("i-")
     }
+    if isinstance(target_group, dict) and target_group.get("target_type") == "ip":
+        ip_target_ids = sorted(
+            {
+                str(row["id"])
+                for row in targets
+                if isinstance(row.get("id"), str) and _valid_ip_address(str(row["id"]))
+            }
+        )
+        target_vpc_id = target_group.get("vpc_id")
+        if ip_target_ids and isinstance(target_vpc_id, str) and target_vpc_id:
+            ip_reservations = aws.call(
+                "ec2",
+                "describe-instances",
+                "--filters",
+                f"Name=vpc-id,Values={target_vpc_id}",
+                "Name=network-interface.addresses.private-ip-address,Values="
+                + ",".join(ip_target_ids),
+            ).get("Reservations", [])
+            for reservation in ip_reservations:
+                for instance in reservation.get("Instances", []):
+                    instance_id = instance.get("InstanceId")
+                    if not isinstance(instance_id, str) or not instance_id:
+                        continue
+                    private_ips = {
+                        str(address.get("PrivateIpAddress"))
+                        for interface in instance.get("NetworkInterfaces", [])
+                        for address in interface.get("PrivateIpAddresses", [])
+                        if address.get("PrivateIpAddress")
+                    }
+                    if instance.get("PrivateIpAddress"):
+                        private_ips.add(str(instance["PrivateIpAddress"]))
+                    for private_ip in private_ips & set(ip_target_ids):
+                        target_to_instance_id[private_ip] = instance_id
 
-
-def _normalize_metric_alarm(alarm: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "name": alarm.get("AlarmName"),
-        "state_value": alarm.get("StateValue"),
-        "state_reason": alarm.get("StateReason"),
-        "actions_enabled": alarm.get("ActionsEnabled"),
-        "alarm_actions": sorted(alarm.get("AlarmActions", [])),
-        "ok_actions": sorted(alarm.get("OKActions", [])),
-        "insufficient_data_actions": sorted(alarm.get("InsufficientDataActions", [])),
-        "comparison_operator": alarm.get("ComparisonOperator"),
-        "evaluation_periods": alarm.get("EvaluationPeriods"),
-        "datapoints_to_alarm": alarm.get("DatapointsToAlarm"),
-        "metric_name": alarm.get("MetricName"),
-        "namespace": alarm.get("Namespace"),
-        "period": alarm.get("Period"),
-        "statistic": alarm.get("Statistic"),
-        "unit": alarm.get("Unit"),
-        "threshold": alarm.get("Threshold"),
-        "treat_missing_data": alarm.get("TreatMissingData"),
-        "dimension_count": len(alarm.get("Dimensions", [])),
-        "metric_query_count": len(alarm.get("Metrics", [])),
-        "dimensions": {
-            str(row.get("Name")): row.get("Value")
-            for row in alarm.get("Dimensions", [])
-            if row.get("Name")
-        },
-    }
-
-
-def _elbv2_metric_dimension(arn: Any, resource: str) -> str | None:
-    value = str(arn or "")
-    patterns = {
-        "load_balancer": (
-            r"arn:aws:elasticloadbalancing:[a-z0-9-]+:\d{12}:"
-            r"loadbalancer/(net/[^/]+/[0-9a-f]+)"
-        ),
-        "target_group": (
-            r"arn:aws:elasticloadbalancing:[a-z0-9-]+:\d{12}:"
-            r"(targetgroup/[^/]+/[0-9a-f]+)"
-        ),
-    }
-    pattern = patterns.get(resource)
-    match = re.fullmatch(pattern or r"(?!)", value)
-    return match.group(1) if match else None
+    instance_ids = sorted(set(target_to_instance_id.values()))
+    if instance_ids:
+        asg_rows = aws.call(
+            "autoscaling",
+            "describe-auto-scaling-instances",
+            "--instance-ids",
+            *instance_ids,
+        ).get("AutoScalingInstances", [])
+        by_instance = {
+            str(row.get("InstanceId")): row for row in asg_rows if row.get("InstanceId")
+        }
+        reservations = aws.call(
+            "ec2", "describe-instances", "--instance-ids", *instance_ids
+        ).get("Reservations", [])
+        target_instance_sgs = {
+            str(instance.get("InstanceId")): sorted(
+                group.get("GroupId")
+                for group in instance.get("SecurityGroups", [])
+                if group.get("GroupId")
+            )
+            for reservation in reservations
+            for instance in reservation.get("Instances", [])
+            if instance.get("InstanceId")
+        }
+        target_instance_private_ips = {
+            str(instance.get("InstanceId")): sorted(
+                {
+                    str(private_ip)
+                    for private_ip in [
+                        instance.get("PrivateIpAddress"),
+                        *(
+                            address.get("PrivateIpAddress")
+                            for interface in instance.get("NetworkInterfaces", [])
+                            for address in interface.get("PrivateIpAddresses", [])
+                        ),
+                    ]
+                    if private_ip
+                }
+            )
+            for reservation in reservations
+            for instance in reservation.get("Instances", [])
+            if instance.get("InstanceId")
+        }
+        for target in targets:
+            instance_id = target_to_instance_id.get(str(target.get("id")))
+            asg_row = by_instance.get(str(instance_id), {})
+            target.update(
+                {
+                    "instance_id": instance_id,
+                    "asg_name": asg_row.get("AutoScalingGroupName"),
+                    "lifecycle_state": asg_row.get("LifecycleState"),
+                    "health_status": asg_row.get("HealthStatus"),
+                    "security_group_ids": target_instance_sgs.get(str(instance_id), []),
+                    "private_ip_addresses": target_instance_private_ips.get(
+                        str(instance_id), []
+                    ),
+                }
+            )
+    return target_group, targets
 
 
 def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
-    native_dns_contract = EXPECTED_NATIVE_DNS.get(environment)
-    if native_dns_contract is None:
+    if environment not in EXPECTED_ENVIRONMENT_REGIONS:
         raise InventoryError(f"unsupported relay DMZ environment {environment!r}")
     parameter_name = f"/{environment}/nhp/relay/asg-name"
     parameter = aws.call("ssm", "get-parameter", "--name", parameter_name)
@@ -844,6 +924,12 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
         error_type = RetryableInventoryError if not relay_lbs else InventoryError
         raise error_type(f"relay DMZ VPC has {len(relay_lbs)} canonical ALBs")
     lb = relay_lbs[0]
+    if len(dmz_lbs) != 1 or dmz_lbs[0].get("LoadBalancerArn") != lb.get(
+        "LoadBalancerArn"
+    ):
+        raise InventoryError(
+            "relay DMZ load-balancer inventory must contain exactly the canonical HTTPS ALB"
+        )
     alb_sg_ids = set(lb.get("SecurityGroups", []))
     alb_attributes = {
         item.get("Key"): item.get("Value")
@@ -855,50 +941,7 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
         ).get("Attributes", [])
     }
     alb_tags = dmz_lb_tags.get(str(lb.get("LoadBalancerArn")), {})
-    native_lbs = [
-        candidate
-        for candidate in lbs
-        if candidate.get("VpcId") == vpc_id
-        and candidate.get("Type") == "network"
-        and candidate.get("LoadBalancerName") == f"layerv-nhp-{environment}-relay-nhp"
-    ]
-    if len(native_lbs) != 1:
-        error_type = RetryableInventoryError if not native_lbs else InventoryError
-        raise error_type(
-            f"relay DMZ VPC has {len(native_lbs)} canonical native NHP NLBs"
-        )
-    native_lb = native_lbs[0]
-    native_nhp_sg_ids = set(native_lb.get("SecurityGroups", []))
-    native_lb_attributes = {
-        item.get("Key"): item.get("Value")
-        for item in aws.call(
-            "elbv2",
-            "describe-load-balancer-attributes",
-            "--load-balancer-arn",
-            native_lb["LoadBalancerArn"],
-        ).get("Attributes", [])
-    }
-    native_lb_tags = dmz_lb_tags.get(str(native_lb.get("LoadBalancerArn")), {})
-    expected_relay_lb_arns = {
-        str(lb.get("LoadBalancerArn")),
-        str(native_lb.get("LoadBalancerArn")),
-    }
-    canonical_edge_sg_ids = alb_sg_ids | native_nhp_sg_ids
-    noncanonical_edge_sg_lbs = sorted(
-        str(
-            candidate.get("LoadBalancerArn")
-            or candidate.get("LoadBalancerName")
-            or "<unknown>"
-        )
-        for candidate in dmz_lbs
-        if str(candidate.get("LoadBalancerArn")) not in expected_relay_lb_arns
-        and canonical_edge_sg_ids & set(candidate.get("SecurityGroups", []))
-    )
-    if noncanonical_edge_sg_lbs:
-        raise InventoryError(
-            "noncanonical DMZ load balancers reuse a canonical relay edge security group: "
-            + ", ".join(noncanonical_edge_sg_lbs)
-        )
+    expected_relay_lb_arns = {str(lb.get("LoadBalancerArn"))}
     tagged_relay_lb_arns = {
         arn
         for arn, tags in dmz_lb_tags.items()
@@ -906,19 +949,16 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
     }
     if tagged_relay_lb_arns != expected_relay_lb_arns:
         raise InventoryError(
-            "relay DMZ load-balancer inventory is not exactly the tagged HTTPS ALB and native NHP NLB"
+            "relay DMZ load-balancer inventory is not exactly the tagged HTTPS ALB"
         )
-    # Tag inventory identifies the two canonical edges. The explicit check
-    # above independently rejects an untagged/noncanonical LB that reuses either
-    # canonical edge SG, closing the only third-LB path to relay port 8080.
+    # Exact VPC inventory plus ownership tags exclude every second public or
+    # private LB, including an untagged NLB with unrelated security groups.
 
-    all_dmz_sg_ids = sorted(
-        relay_sg_ids | endpoint_sg_ids | alb_sg_ids | native_nhp_sg_ids
-    )
+    all_dmz_sg_ids = sorted(relay_sg_ids | endpoint_sg_ids | alb_sg_ids)
     if not all_dmz_sg_ids:
         raise InventoryError("relay DMZ inventory resolved to no security group IDs")
-    # The exact DMZ topology contains only its relay, endpoint, ALB, and native
-    # NLB groups. Batch this call if the reviewed singleton topology expands.
+    # The exact DMZ topology contains only its relay, endpoint, and ALB groups.
+    # Batch this call if the reviewed singleton topology expands.
     raw_groups = aws.call(
         "ec2", "describe-security-groups", "--group-ids", *all_dmz_sg_ids
     ).get("SecurityGroups", [])
@@ -969,42 +1009,319 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
             f"main VPC {main_vpc_id!r} resolved to {len(main_vpcs)} VPCs"
         )
     main_vpc = main_vpcs[0]
-    # Prove the legacy server edge is gone by network shape, not its mutable
-    # name or tags. Scope the sweep to the exact peered main VPC so an unrelated
-    # public UDP workload in another VPC cannot create a false positive. The
-    # relay-owned public UDP 62206 NLB is in the DMZ VPC and remains allowed.
-    public_main_vpc_nhp_listeners: list[dict[str, Any]] = []
-    for candidate in lbs:
-        if not (
-            candidate.get("VpcId") == main_vpc_id
-            and candidate.get("Scheme") == "internet-facing"
-            and candidate.get("Type") == "network"
-        ):
-            continue
+    cell_id = str(
+        aws.call(
+            "ssm",
+            "get-parameter",
+            "--name",
+            f"/{environment}/nhp/deploy/cell-id",
+        )
+        .get("Parameter", {})
+        .get("Value", "")
+    ).strip()
+    if not cell_id:
+        raise RetryableInventoryError("assigned-cell deployment marker is missing")
+    deploy_mode = str(
+        aws.call(
+            "ssm",
+            "get-parameter",
+            "--name",
+            f"/{environment}/nhp/deploy/mode",
+        )
+        .get("Parameter", {})
+        .get("Value", "")
+    ).strip()
+    if deploy_mode == "blue_green":
+        active_color = str(
+            aws.call(
+                "ssm",
+                "get-parameter",
+                "--name",
+                f"/{environment}/nhp/server/active-color",
+            )
+            .get("Parameter", {})
+            .get("Value", "")
+        ).strip()
+    elif deploy_mode == "canary":
+        # Canary/static deployments have only the canonical blue ASG/TGs and do
+        # not create the blue-green active-color parameter.
+        active_color = "blue"
+    else:
+        raise RetryableInventoryError(
+            f"server deployment-mode marker is invalid: {deploy_mode!r}"
+        )
+    if active_color not in {"blue", "green"}:
+        raise RetryableInventoryError(
+            f"server active-color marker is invalid: {active_color!r}"
+        )
+
+    # Upcoming UDP SDKs connect directly to the NHP server NLB of their assigned
+    # cell. Inventory every public NLB in the peered main VPC, but classify only
+    # canonical or NHP-owned edges so an unrelated product NLB remains out of
+    # scope while a second compute/cell NHP edge fails closed.
+    expected_server_lb_name = f"layerv-nhp-{environment}-nlb"
+    canonical_server_lbs = [
+        candidate
+        for candidate in lbs
+        if candidate.get("VpcId") == main_vpc_id
+        and candidate.get("Scheme") == "internet-facing"
+        and candidate.get("Type") == "network"
+        and candidate.get("LoadBalancerName") == expected_server_lb_name
+    ]
+    if len(canonical_server_lbs) != 1:
+        error_type = (
+            RetryableInventoryError if not canonical_server_lbs else InventoryError
+        )
+        raise error_type(
+            f"main VPC has {len(canonical_server_lbs)} canonical assigned-cell NHP NLBs"
+        )
+    canonical_server_lb_arn = str(canonical_server_lbs[0]["LoadBalancerArn"])
+    expected_internal_lb_name = f"layerv-nhp-{environment}-srv-int"
+    internal_server_lbs = [
+        candidate
+        for candidate in lbs
+        if candidate.get("VpcId") == main_vpc_id
+        and candidate.get("Scheme") == "internal"
+        and candidate.get("Type") == "network"
+        and candidate.get("LoadBalancerName") == expected_internal_lb_name
+    ]
+    if len(internal_server_lbs) != 1:
+        error_type = (
+            RetryableInventoryError if not internal_server_lbs else InventoryError
+        )
+        raise error_type(
+            f"main VPC has {len(internal_server_lbs)} canonical internal relay NHP NLBs"
+        )
+    internal_server_lb_arn = str(internal_server_lbs[0]["LoadBalancerArn"])
+    public_main_nlbs = [
+        candidate
+        for candidate in lbs
+        if candidate.get("VpcId") == main_vpc_id
+        and candidate.get("Scheme") == "internet-facing"
+        and candidate.get("Type") == "network"
+    ]
+    inventoried_main_nlb_arns = [
+        str(candidate["LoadBalancerArn"])
+        for candidate in [*public_main_nlbs, *internal_server_lbs]
+        if candidate.get("LoadBalancerArn")
+    ]
+    main_nlb_tags: dict[str, dict[str, str]] = {}
+    if inventoried_main_nlb_arns:
+        for offset in range(0, len(inventoried_main_nlb_arns), 20):
+            tag_descriptions = aws.call(
+                "elbv2",
+                "describe-tags",
+                "--resource-arns",
+                *inventoried_main_nlb_arns[offset : offset + 20],
+            ).get("TagDescriptions", [])
+            main_nlb_tags.update(
+                {
+                    str(row.get("ResourceArn")): _tags(row.get("Tags"))
+                    for row in tag_descriptions
+                    if row.get("ResourceArn")
+                }
+            )
+    # Listener wiring is part of NHP ownership. An untagged/arbitrarily named
+    # public NLB forwarding to the canonical server TG is still an NHP edge and
+    # must not evade the one-port contract. Inventory listeners on every public
+    # main-VPC NLB before classifying unrelated product edges.
+    public_listener_rows_by_lb: dict[str, list[dict[str, Any]]] = {}
+    for candidate in public_main_nlbs:
+        candidate_arn = candidate.get("LoadBalancerArn")
+        if not isinstance(candidate_arn, str) or not candidate_arn:
+            raise InventoryError(
+                "internet-facing main-VPC network load balancer lacks an ARN"
+            )
+        public_listener_rows_by_lb[candidate_arn] = aws.call(
+            "elbv2", "describe-listeners", "--load-balancer-arn", candidate_arn
+        ).get("Listeners", [])
+    public_udp_target_groups: dict[
+        str, tuple[dict[str, Any] | None, list[dict[str, Any]]]
+    ] = {}
+    for public_listener_rows in public_listener_rows_by_lb.values():
+        for listener in public_listener_rows:
+            if str(listener.get("Protocol") or "").upper() not in {
+                "UDP",
+                "TCP_UDP",
+            }:
+                continue
+            for action in listener.get("DefaultActions", []):
+                target_group_arn = action.get("TargetGroupArn")
+                if action.get("Type") != "forward" or not isinstance(
+                    target_group_arn, str
+                ):
+                    continue
+                if target_group_arn not in public_udp_target_groups:
+                    public_udp_target_groups[target_group_arn] = (
+                        _collect_udp_target_group(aws, target_group_arn)
+                    )
+    canonical_target_group_arns = {
+        str(action.get("TargetGroupArn"))
+        for listener in public_listener_rows_by_lb.get(canonical_server_lb_arn, [])
+        if str(listener.get("Protocol") or "").upper() in {"UDP", "TCP_UDP"}
+        for action in listener.get("DefaultActions", [])
+        if action.get("Type") == "forward" and action.get("TargetGroupArn")
+    }
+    expected_server_asg_names = {
+        f"layerv-nhp-{environment}-server",
+        f"layerv-nhp-{environment}-server-green",
+    }
+    canonical_server_targets = [
+        target
+        for target_group_arn in canonical_target_group_arns
+        for target in public_udp_target_groups.get(target_group_arn, (None, []))[1]
+    ]
+    canonical_server_security_group_ids = {
+        str(security_group_id)
+        for target in canonical_server_targets
+        for security_group_id in target.get("security_group_ids", [])
+        if security_group_id
+    }
+    canonical_server_private_ips = {
+        str(private_ip)
+        for target in canonical_server_targets
+        for private_ip in [
+            *target.get("private_ip_addresses", []),
+            target.get("id") if _valid_ip_address(str(target.get("id", ""))) else None,
+        ]
+        if private_ip
+    }
+
+    def has_assigned_cell_target_ownership(target_group_arn: str) -> bool:
+        target_group, targets = public_udp_target_groups.get(
+            target_group_arn, (None, [])
+        )
+        tags = target_group.get("tags", {}) if isinstance(target_group, dict) else {}
+        tagged_for_cell = (
+            tags.get("Environment") == environment
+            and tags.get("Component") == "compute"
+            and tags.get("Cell") == cell_id
+        )
+        has_canonical_target = any(
+            target.get("asg_name") in expected_server_asg_names
+            or bool(
+                set(target.get("security_group_ids", []))
+                & canonical_server_security_group_ids
+            )
+            or str(target.get("id")) in canonical_server_private_ips
+            for target in targets
+        )
+        return tagged_for_cell or has_canonical_target
+
+    assigned_cell_nhp_listeners: list[dict[str, Any]] = []
+    for candidate in public_main_nlbs:
         load_balancer_arn = candidate.get("LoadBalancerArn")
         if not isinstance(load_balancer_arn, str) or not load_balancer_arn:
             raise InventoryError(
                 "internet-facing main-VPC network load balancer lacks an ARN"
             )
-        public_listener_rows = aws.call(
-            "elbv2",
-            "describe-listeners",
-            "--load-balancer-arn",
-            load_balancer_arn,
-        ).get("Listeners", [])
+        load_balancer_tags = main_nlb_tags.get(str(load_balancer_arn), {})
+        public_listener_rows = public_listener_rows_by_lb[load_balancer_arn]
+        shares_canonical_target = any(
+            str(action.get("TargetGroupArn")) in canonical_target_group_arns
+            for listener in public_listener_rows
+            if str(listener.get("Protocol") or "").upper() in {"UDP", "TCP_UDP"}
+            for action in listener.get("DefaultActions", [])
+            if action.get("Type") == "forward" and action.get("TargetGroupArn")
+        )
+        owns_distinct_server_target = any(
+            has_assigned_cell_target_ownership(str(action.get("TargetGroupArn")))
+            for listener in public_listener_rows
+            if str(listener.get("Protocol") or "").upper() in {"UDP", "TCP_UDP"}
+            for action in listener.get("DefaultActions", [])
+            if action.get("Type") == "forward" and action.get("TargetGroupArn")
+        )
+        nhp_owned = (
+            load_balancer_arn == canonical_server_lb_arn
+            or (
+                load_balancer_tags.get("Environment") == environment
+                and (
+                    load_balancer_tags.get("Component") == "compute"
+                    or load_balancer_tags.get("Cell") == cell_id
+                )
+            )
+            or str(candidate.get("LoadBalancerName", "")).startswith(
+                f"layerv-nhp-{environment}-"
+            )
+            or shares_canonical_target
+            or owns_distinct_server_target
+        )
+        if not nhp_owned:
+            continue
         for listener in public_listener_rows:
             port = _exact_nonnegative_int(listener.get("Port"))
             protocol = str(listener.get("Protocol") or "").upper()
-            if port == RELAY_SERVER_UDP_PORT and protocol in {"UDP", "TCP_UDP"}:
-                public_main_vpc_nhp_listeners.append(
+            if protocol in {"UDP", "TCP_UDP"}:
+                actions = listener.get("DefaultActions", [])
+                forward_actions = [
+                    action
+                    for action in actions
+                    if action.get("Type") == "forward" and action.get("TargetGroupArn")
+                ]
+                target_group_arn = (
+                    str(forward_actions[0]["TargetGroupArn"])
+                    if len(forward_actions) == 1
+                    else None
+                )
+                target_group = None
+                targets: list[dict[str, Any]] = []
+                if target_group_arn:
+                    target_group, targets = public_udp_target_groups.get(
+                        target_group_arn, (None, [])
+                    )
+                assigned_cell_nhp_listeners.append(
                     {
                         "load_balancer_arn": load_balancer_arn,
                         "load_balancer_name": candidate.get("LoadBalancerName"),
+                        "load_balancer_tags": load_balancer_tags,
+                        "canonical": load_balancer_arn == canonical_server_lb_arn,
                         "listener_arn": listener.get("ListenerArn"),
                         "protocol": protocol,
                         "port": port,
+                        "target_group_arn": target_group_arn,
+                        "target_group": target_group,
+                        "targets": targets,
                     }
                 )
+
+    internal_cell_nhp_listeners: list[dict[str, Any]] = []
+    internal_candidate = internal_server_lbs[0]
+    internal_listener_rows = aws.call(
+        "elbv2",
+        "describe-listeners",
+        "--load-balancer-arn",
+        internal_server_lb_arn,
+    ).get("Listeners", [])
+    for listener in internal_listener_rows:
+        actions = listener.get("DefaultActions", [])
+        forward_actions = [
+            action
+            for action in actions
+            if action.get("Type") == "forward" and action.get("TargetGroupArn")
+        ]
+        target_group_arn = (
+            str(forward_actions[0]["TargetGroupArn"])
+            if len(forward_actions) == 1
+            else None
+        )
+        target_group = None
+        targets: list[dict[str, Any]] = []
+        if target_group_arn:
+            target_group, targets = _collect_udp_target_group(aws, target_group_arn)
+        internal_cell_nhp_listeners.append(
+            {
+                "load_balancer_arn": internal_server_lb_arn,
+                "load_balancer_name": internal_candidate.get("LoadBalancerName"),
+                "load_balancer_tags": main_nlb_tags.get(internal_server_lb_arn, {}),
+                "canonical": True,
+                "listener_arn": listener.get("ListenerArn"),
+                "protocol": str(listener.get("Protocol") or "").upper(),
+                "port": _exact_nonnegative_int(listener.get("Port")),
+                "target_group_arn": target_group_arn,
+                "target_group": target_group,
+                "targets": targets,
+            }
+        )
     dmz_peer_info = requester if requester.get("VpcId") == vpc_id else accepter
     main_peer_info = accepter if requester.get("VpcId") == vpc_id else requester
 
@@ -1156,115 +1473,6 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
             }
             for row in target_group_rows
         ]
-    native_listeners_raw = aws.call(
-        "elbv2",
-        "describe-listeners",
-        "--load-balancer-arn",
-        native_lb["LoadBalancerArn"],
-    ).get("Listeners", [])
-    native_listeners: list[dict[str, Any]] = []
-    native_target_group_arns: set[str] = set()
-    for listener in native_listeners_raw:
-        actions = listener.get("DefaultActions", [])
-        for action in actions:
-            if action.get("TargetGroupArn"):
-                native_target_group_arns.add(action["TargetGroupArn"])
-            for target in action.get("ForwardConfig", {}).get("TargetGroups", []):
-                if target.get("TargetGroupArn"):
-                    native_target_group_arns.add(target["TargetGroupArn"])
-        native_listeners.append(
-            {
-                "arn": listener.get("ListenerArn"),
-                "port": listener.get("Port"),
-                "protocol": listener.get("Protocol"),
-                "actions": actions,
-            }
-        )
-    native_target_groups: list[dict[str, Any]] = []
-    if native_target_group_arns:
-        # The native NLB contract has exactly one listener and target group.
-        native_target_group_rows = aws.call(
-            "elbv2",
-            "describe-target-groups",
-            "--target-group-arns",
-            *sorted(native_target_group_arns),
-        ).get("TargetGroups", [])
-        for row in native_target_group_rows:
-            attributes = aws.call(
-                "elbv2",
-                "describe-target-group-attributes",
-                "--target-group-arn",
-                row["TargetGroupArn"],
-            ).get("Attributes", [])
-            attribute_map = {item.get("Key"): item.get("Value") for item in attributes}
-            native_target_groups.append(
-                {
-                    "arn": row.get("TargetGroupArn"),
-                    "vpc_id": row.get("VpcId"),
-                    "protocol": row.get("Protocol"),
-                    "port": row.get("Port"),
-                    "target_type": row.get("TargetType"),
-                    "preserve_client_ip": attribute_map.get(
-                        "preserve_client_ip.enabled"
-                    ),
-                    "health_check_enabled": row.get("HealthCheckEnabled"),
-                    "health_check_protocol": row.get("HealthCheckProtocol"),
-                    "health_check_port": row.get("HealthCheckPort"),
-                    "health_check_path": row.get("HealthCheckPath"),
-                    "health_check_matcher": row.get("Matcher", {}).get("HttpCode"),
-                    "healthy_threshold": row.get("HealthyThresholdCount"),
-                    "unhealthy_threshold": row.get("UnhealthyThresholdCount"),
-                    "health_check_interval": row.get("HealthCheckIntervalSeconds"),
-                    "health_check_timeout": row.get("HealthCheckTimeoutSeconds"),
-                }
-            )
-
-    # Route53 permits only one simple record set for a name/type. Starting at
-    # the exact A name and fetching one therefore distinguishes the reviewed
-    # alias from a miss (which returns the next lexical record); exact name,
-    # alias, and routing-policy validation below rejects that next record and
-    # every weighted/failover/multivalue variant. record_count is page presence,
-    # not a claim that this one-item page enumerates neighboring record sets.
-    native_dns_rows = aws.call(
-        "route53",
-        "list-resource-record-sets",
-        "--hosted-zone-id",
-        native_dns_contract["hosted_zone_id"],
-        "--start-record-name",
-        native_dns_contract["fqdn"],
-        "--start-record-type",
-        "A",
-        "--max-items",
-        "1",
-    ).get("ResourceRecordSets", [])
-    native_dns = (
-        _normalize_native_dns_record(native_dns_rows[0]) if native_dns_rows else {}
-    )
-    native_dns["record_count"] = len(native_dns_rows)
-    # This value records the query scope. Its validator comparison protects
-    # imported forensic snapshots; live placement is proved by querying this
-    # exact zone plus the record name/type/alias checks, not by this copy alone.
-    native_dns["hosted_zone_id"] = native_dns_contract["hosted_zone_id"]
-
-    native_alarm_names = (
-        f"layerv-nhp-{environment}-relay-native-nlb-unhealthy",
-        f"layerv-nhp-{environment}-relay-native-nlb-zero-healthy",
-    )
-    native_alarm_response = aws.call(
-        "cloudwatch", "describe-alarms", "--alarm-names", *native_alarm_names
-    )
-    native_metric_alarms = sorted(
-        (
-            _normalize_metric_alarm(alarm)
-            for alarm in native_alarm_response.get("MetricAlarms", [])
-        ),
-        key=lambda alarm: str(alarm.get("name")),
-    )
-    native_composite_alarm_names = sorted(
-        str(alarm.get("AlarmName"))
-        for alarm in native_alarm_response.get("CompositeAlarms", [])
-        if alarm.get("AlarmName")
-    )
     # aws_lb_target_group.relay uses Terraform name_prefix="rlytls" and AWS
     # appends the unique suffix. AWS limits name_prefix to six characters, so it
     # cannot carry the environment. Keep the prefix in lockstep with Terraform;
@@ -1272,9 +1480,7 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
     all_relay_target_groups = [
         row
         for row in aws.call("elbv2", "describe-target-groups").get("TargetGroups", [])
-        if str(row.get("TargetGroupName", "")).startswith(
-            (RELAY_TG_NAME_PREFIX, RELAY_NATIVE_TG_NAME_PREFIX)
-        )
+        if str(row.get("TargetGroupName", "")).startswith(RELAY_TG_NAME_PREFIX)
     ]
     try:
         waf = aws.call(
@@ -1405,6 +1611,9 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
         "environment": environment,
         "region": aws.region,
         "account_id": identity.get("Account"),
+        "cell_id": cell_id,
+        "server_deploy_mode": deploy_mode,
+        "server_active_color": active_color,
         "canonical_asg": {
             "name": asg_name,
             "vpc_id": vpc_id,
@@ -1424,13 +1633,6 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
             "main_vpc_security_groups": sorted(
                 str(row.get("GroupId")) for row in legacy_main_vpc_security_groups
             ),
-            "public_main_vpc_nhp_listeners": sorted(
-                public_main_vpc_nhp_listeners,
-                key=lambda row: (
-                    str(row.get("load_balancer_arn")),
-                    str(row.get("listener_arn")),
-                ),
-            ),
             "target_groups": sorted(
                 str(row.get("TargetGroupArn"))
                 for row in all_relay_target_groups
@@ -1442,11 +1644,21 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
                 if row.get("VpcId") == main_vpc_id
                 or (
                     row.get("VpcId") == vpc_id
-                    and row.get("TargetGroupArn")
-                    not in target_group_arns | native_target_group_arns
+                    and row.get("TargetGroupArn") not in target_group_arns
                 )
             ),
         },
+        "assigned_cell_nhp_listeners": sorted(
+            assigned_cell_nhp_listeners,
+            key=lambda row: (
+                str(row.get("load_balancer_arn")),
+                str(row.get("listener_arn")),
+            ),
+        ),
+        "internal_cell_nhp_listeners": sorted(
+            internal_cell_nhp_listeners,
+            key=lambda row: str(row.get("listener_arn")),
+        ),
         "vpc": {
             "id": vpc_id,
             "cidr": vpc.get("CidrBlock"),
@@ -1504,7 +1716,6 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
             "relay_ids": sorted(relay_sg_ids),
             "endpoint_ids": sorted(endpoint_sg_ids),
             "alb_ids": sorted(alb_sg_ids),
-            "native_nhp_ids": sorted(native_nhp_sg_ids),
             "server_ids": sorted(server_sg_ids),
             "by_id": normalized_groups,
         },
@@ -1561,39 +1772,6 @@ def collect_structural(environment: str, aws: AwsCli) -> dict[str, Any]:
             "target_group_arns": sorted(target_group_arns),
             "target_groups": sorted(target_groups, key=lambda item: item["arn"]),
             "waf_arn": waf.get("ARN"),
-        },
-        "native_nlb": {
-            "arn": native_lb.get("LoadBalancerArn"),
-            "name": native_lb.get("LoadBalancerName"),
-            "dns_name": _dns_name(native_lb.get("DNSName")),
-            "canonical_hosted_zone_id": native_lb.get("CanonicalHostedZoneId"),
-            "vpc_id": native_lb.get("VpcId"),
-            "scheme": native_lb.get("Scheme"),
-            "type": native_lb.get("Type"),
-            "ip_address_type": native_lb.get("IpAddressType"),
-            "subnet_ids": sorted(
-                zone.get("SubnetId")
-                for zone in native_lb.get("AvailabilityZones", [])
-                if zone.get("SubnetId")
-            ),
-            "cross_zone_enabled": native_lb_attributes.get(
-                "load_balancing.cross_zone.enabled"
-            ),
-            "deletion_protection_enabled": native_lb_attributes.get(
-                "deletion_protection.enabled"
-            ),
-            "tags": native_lb_tags,
-            "security_group_ids": sorted(native_lb.get("SecurityGroups", [])),
-            "listeners": native_listeners,
-            "target_group_arns": sorted(native_target_group_arns),
-            "target_groups": sorted(
-                native_target_groups, key=lambda item: str(item["arn"])
-            ),
-        },
-        "native_dns": native_dns,
-        "native_alarms": {
-            "metric_alarms": native_metric_alarms,
-            "composite_alarm_names": native_composite_alarm_names,
         },
     }
 
@@ -1742,6 +1920,12 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
 
     if snapshot.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"snapshot schema_version must be {SCHEMA_VERSION}")
+    deploy_mode = snapshot.get("server_deploy_mode")
+    active_color = snapshot.get("server_active_color")
+    if deploy_mode not in {"blue_green", "canary"}:
+        errors.append("server deployment mode must be exactly blue_green or canary")
+    elif deploy_mode == "canary" and active_color != "blue":
+        errors.append("canary server deployment must use the canonical blue ASG/TGs")
     if asg.get("name") != f"layerv-nhp-{environment}-relay-dmz":
         errors.append(
             "canonical relay ASG parameter does not point to the DMZ-named ASG"
@@ -1970,14 +2154,212 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
                 f"orphaned pre-DMZ relay {resource_type} remain: "
                 f"{sorted(orphaned[resource_type])}"
             )
-    public_main_vpc_nhp_listeners = orphaned.get("public_main_vpc_nhp_listeners")
-    if not isinstance(public_main_vpc_nhp_listeners, list):
-        errors.append("public main-VPC NHP listener inventory is missing or malformed")
-    elif public_main_vpc_nhp_listeners:
+    assigned_cell_nhp_listeners = snapshot.get("assigned_cell_nhp_listeners")
+    if not isinstance(assigned_cell_nhp_listeners, list):
         errors.append(
-            "legacy public main-VPC UDP-capable 62206 listeners remain: "
-            f"{public_main_vpc_nhp_listeners}"
+            "assigned-cell public NHP listener inventory is missing or malformed"
         )
+    elif len(assigned_cell_nhp_listeners) != 1:
+        errors.append(
+            "assigned cell must expose exactly one public UDP listener on 62206: "
+            f"{assigned_cell_nhp_listeners}"
+        )
+    else:
+        cell_edge = assigned_cell_nhp_listeners[0]
+        expected_lb_name = f"layerv-nhp-{environment}-nlb"
+        expected_lb_tags = {
+            "Environment": str(environment),
+            "Component": "compute",
+            "Name": expected_lb_name,
+            "Cell": snapshot.get("cell_id"),
+        }
+        target_group = cell_edge.get("target_group")
+        targets = cell_edge.get("targets")
+        if (
+            cell_edge.get("canonical") is not True
+            or cell_edge.get("load_balancer_name") != expected_lb_name
+            or not cell_edge.get("listener_arn")
+            or cell_edge.get("protocol") != "UDP"
+            or cell_edge.get("port") != RELAY_SERVER_UDP_PORT
+            or any(
+                cell_edge.get("load_balancer_tags", {}).get(key) != value
+                for key, value in expected_lb_tags.items()
+            )
+        ):
+            errors.append(
+                "assigned cell public NHP listener is not the canonical tagged compute NLB UDP 62206 edge"
+            )
+        expected_target_group = {
+            "arn": cell_edge.get("target_group_arn"),
+            "vpc_id": snapshot.get("peer", {}).get("main_vpc_id"),
+            "protocol": "UDP",
+            "port": RELAY_SERVER_UDP_PORT,
+            "target_type": "instance",
+            "preserve_client_ip": True,
+            "health_check_enabled": True,
+            "health_check_protocol": "HTTP",
+            "health_check_port": "8888",
+            "health_check_path": "/health/live",
+            "health_check_matcher": "200",
+        }
+        if not isinstance(target_group, dict) or any(
+            target_group.get(key) != value
+            for key, value in expected_target_group.items()
+        ):
+            errors.append(
+                "assigned cell public UDP listener does not forward to the canonical UDP 62206 instance target group"
+            )
+        expected_target_owners = {
+            f"layerv-nhp-{environment}-udp": {
+                "color": "blue",
+                "asg": f"layerv-nhp-{environment}-server",
+                "tag_name": f"layerv-nhp-{environment}-tg-udp",
+            },
+            f"layerv-nhp-{environment}-udp-grn": {
+                "color": "green",
+                "asg": f"layerv-nhp-{environment}-server-green",
+                "tag_name": f"layerv-nhp-{environment}-tg-udp-green",
+            },
+        }
+        target_owner = (
+            expected_target_owners.get(str(target_group.get("name")))
+            if isinstance(target_group, dict)
+            else None
+        )
+        if (
+            target_owner is None
+            or target_owner.get("color") != snapshot.get("server_active_color")
+            or any(
+                target_group.get("tags", {}).get(key) != value
+                for key, value in {
+                    "Environment": str(environment),
+                    "Component": "compute",
+                    "Cell": snapshot.get("cell_id"),
+                    "Name": (target_owner or {}).get("tag_name"),
+                }.items()
+            )
+        ):
+            errors.append(
+                "assigned cell public UDP target group lacks canonical cell/color ownership"
+            )
+        server_sg_ids = snapshot.get("security_groups", {}).get("server_ids", [])
+        expected_server_sg_id = server_sg_ids[0] if len(server_sg_ids) == 1 else None
+        if (
+            not isinstance(targets, list)
+            or not targets
+            or any(
+                row.get("state") != "healthy"
+                or row.get("port") != RELAY_SERVER_UDP_PORT
+                or not str(row.get("id", "")).startswith("i-")
+                or row.get("asg_name") != (target_owner or {}).get("asg")
+                or row.get("lifecycle_state") != "InService"
+                or row.get("health_status") != "HEALTHY"
+                or row.get("security_group_ids") != [expected_server_sg_id]
+                for row in targets
+            )
+        ):
+            errors.append(
+                "assigned cell public UDP target group must have healthy active-color server-ASG targets on 62206 using the canonical server SG"
+            )
+
+    internal_listeners = snapshot.get("internal_cell_nhp_listeners")
+    active_color = snapshot.get("server_active_color")
+    if not isinstance(internal_listeners, list) or len(internal_listeners) != 1:
+        errors.append(
+            "relay path must have exactly one canonical internal server UDP 62206 listener"
+        )
+    elif active_color not in {"blue", "green"}:
+        errors.append("server active-color marker must be exactly blue or green")
+    else:
+        internal_edge = internal_listeners[0]
+        expected_internal_lb_name = f"layerv-nhp-{environment}-srv-int"
+        expected_internal_lb_tags = {
+            "Environment": str(environment),
+            "Component": "compute",
+            "Cell": snapshot.get("cell_id"),
+            "Name": f"layerv-nhp-{environment}-srv-int-nlb",
+        }
+        internal_tg = internal_edge.get("target_group")
+        expected_internal_owners = {
+            "blue": {
+                "name": f"layerv-nhp-{environment}-srv-int-udp",
+                "tag_name": f"layerv-nhp-{environment}-tg-srv-int-udp-blue",
+                "asg": f"layerv-nhp-{environment}-server",
+            },
+            "green": {
+                "name": f"layerv-nhp-{environment}-srv-int-grn",
+                "tag_name": f"layerv-nhp-{environment}-tg-srv-int-udp-green",
+                "asg": f"layerv-nhp-{environment}-server-green",
+            },
+        }
+        internal_owner = expected_internal_owners[str(active_color)]
+        if (
+            internal_edge.get("canonical") is not True
+            or internal_edge.get("load_balancer_name") != expected_internal_lb_name
+            or not internal_edge.get("listener_arn")
+            or internal_edge.get("protocol") != "UDP"
+            or internal_edge.get("port") != RELAY_SERVER_UDP_PORT
+            or any(
+                internal_edge.get("load_balancer_tags", {}).get(key) != value
+                for key, value in expected_internal_lb_tags.items()
+            )
+        ):
+            errors.append(
+                "relay path internal server listener is not the canonical tagged UDP 62206 NLB edge"
+            )
+        expected_internal_tg = {
+            "arn": internal_edge.get("target_group_arn"),
+            "name": internal_owner["name"],
+            "vpc_id": snapshot.get("peer", {}).get("main_vpc_id"),
+            "protocol": "UDP",
+            "port": RELAY_SERVER_UDP_PORT,
+            "target_type": "instance",
+            "preserve_client_ip": True,
+            "health_check_enabled": True,
+            "health_check_protocol": "HTTP",
+            "health_check_port": "8888",
+            "health_check_path": "/health/live",
+            "health_check_matcher": "200",
+        }
+        if not isinstance(internal_tg, dict) or any(
+            internal_tg.get(key) != value for key, value in expected_internal_tg.items()
+        ):
+            errors.append(
+                "relay path internal listener does not forward to the active-color UDP 62206 instance target group"
+            )
+        if not isinstance(internal_tg, dict) or any(
+            internal_tg.get("tags", {}).get(key) != value
+            for key, value in {
+                "Environment": str(environment),
+                "Component": "compute",
+                "Cell": snapshot.get("cell_id"),
+                "Name": internal_owner["tag_name"],
+                "DeployColor": active_color,
+            }.items()
+        ):
+            errors.append(
+                "relay path internal target group lacks canonical active-color ownership"
+            )
+        internal_targets = internal_edge.get("targets")
+        server_sg_ids = snapshot.get("security_groups", {}).get("server_ids", [])
+        expected_server_sg_id = server_sg_ids[0] if len(server_sg_ids) == 1 else None
+        if (
+            not isinstance(internal_targets, list)
+            or not internal_targets
+            or any(
+                row.get("state") != "healthy"
+                or row.get("port") != RELAY_SERVER_UDP_PORT
+                or not str(row.get("id", "")).startswith("i-")
+                or row.get("asg_name") != internal_owner["asg"]
+                or row.get("lifecycle_state") != "InService"
+                or row.get("health_status") != "HEALTHY"
+                or row.get("security_group_ids") != [expected_server_sg_id]
+                for row in internal_targets
+            )
+        ):
+            errors.append(
+                "relay path internal target group must have healthy active-color server-ASG targets on 62206 using the canonical server SG"
+            )
     if orphaned.get("target_groups"):
         errors.append(
             f"orphaned relay target groups remain: {sorted(orphaned['target_groups'])}"
@@ -2006,18 +2388,12 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             "canonical relay ASG member inventory does not match its instances"
         )
     https_target_group_arns = set(snapshot.get("alb", {}).get("target_group_arns", []))
-    native_target_group_arns = set(
-        snapshot.get("native_nlb", {}).get("target_group_arns", [])
-    )
-    expected_ingress_target_groups = https_target_group_arns | native_target_group_arns
     if (
         len(https_target_group_arns) != 1
-        or len(native_target_group_arns) != 1
-        or len(expected_ingress_target_groups) != 2
-        or set(asg.get("target_group_arns", [])) != expected_ingress_target_groups
+        or set(asg.get("target_group_arns", [])) != https_target_group_arns
     ):
         errors.append(
-            "canonical relay ASG is not attached to exactly the HTTPS and native UDP target groups"
+            "canonical relay ASG is not attached to exactly the HTTPS target group"
         )
     for member in asg_members:
         if (
@@ -2308,24 +2684,17 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
     by_id = security.get("by_id", {})
     relay_ids = security.get("relay_ids", [])
     alb_ids = security.get("alb_ids", [])
-    native_nhp_ids = security.get("native_nhp_ids", [])
     server_ids = security.get("server_ids", [])
     if not (
-        len(relay_ids)
-        == len(alb_ids)
-        == len(native_nhp_ids)
-        == len(endpoint_sg_ids)
-        == len(server_ids)
-        == 1
+        len(relay_ids) == len(alb_ids) == len(endpoint_sg_ids) == len(server_ids) == 1
     ):
         errors.append(
-            "relay, ALB, native NHP NLB, endpoint, and server SG identities must each be singular"
+            "relay, ALB, endpoint, and server SG identities must each be singular"
         )
     else:
-        relay_id, alb_id, native_nhp_id, endpoint_id, server_id = (
+        relay_id, alb_id, endpoint_id, server_id = (
             relay_ids[0],
             alb_ids[0],
-            native_nhp_ids[0],
             next(iter(endpoint_sg_ids)),
             server_ids[0],
         )
@@ -2353,20 +2722,6 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
                 "to": RELAY_ACK_UDP_PORT,
                 "source_type": "security_group",
                 "source": server_id,
-            },
-            {
-                "protocol": "udp",
-                "from": RELAY_SERVER_UDP_PORT,
-                "to": RELAY_SERVER_UDP_PORT,
-                "source_type": "security_group",
-                "source": native_nhp_id,
-            },
-            {
-                "protocol": "tcp",
-                "from": RELAY_BACKEND_PORT,
-                "to": RELAY_BACKEND_PORT,
-                "source_type": "security_group",
-                "source": native_nhp_id,
             },
         ]
         expected_relay_out = [
@@ -2418,7 +2773,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             by_id.get(relay_id, {}).get("inbound", []), expected_relay_in
         ):
             errors.append(
-                "relay SG ingress differs from ALB:8080, native NHP NLB UDP:62206/health:8080, plus server:62207"
+                "relay SG ingress differs from ALB:8080 plus internal server return:62207"
             )
         if not _rules_equal(actual_relay_out, expected_relay_out):
             errors.append(
@@ -2447,38 +2802,6 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             errors.append("ALB SG ingress is not exactly public TCP 443")
         if not _rules_equal(alb_sg.get("outbound", []), expected_alb_out):
             errors.append("ALB SG egress is not exactly relay TCP 8080")
-        expected_native_nhp_in = [
-            {
-                "protocol": "udp",
-                "from": RELAY_SERVER_UDP_PORT,
-                "to": RELAY_SERVER_UDP_PORT,
-                "source_type": "cidr_ipv4",
-                "source": "0.0.0.0/0",
-            }
-        ]
-        expected_native_nhp_out = [
-            {
-                "protocol": "udp",
-                "from": RELAY_SERVER_UDP_PORT,
-                "to": RELAY_SERVER_UDP_PORT,
-                "source_type": "security_group",
-                "source": relay_id,
-            },
-            {
-                "protocol": "tcp",
-                "from": RELAY_BACKEND_PORT,
-                "to": RELAY_BACKEND_PORT,
-                "source_type": "security_group",
-                "source": relay_id,
-            },
-        ]
-        native_nhp_sg = by_id.get(native_nhp_id, {})
-        if not _rules_equal(native_nhp_sg.get("inbound", []), expected_native_nhp_in):
-            errors.append("native NHP NLB SG ingress is not exactly public UDP 62206")
-        if not _rules_equal(native_nhp_sg.get("outbound", []), expected_native_nhp_out):
-            errors.append(
-                "native NHP NLB SG egress is not exactly relay UDP 62206 plus HTTPS health TCP 8080"
-            )
         expected_endpoint_in = [
             {
                 "protocol": "tcp",
@@ -2493,9 +2816,7 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             errors.append("endpoint SG ingress is not exactly relay TCP 443")
         if endpoint_sg.get("outbound", []):
             errors.append("endpoint SG must have no egress rules")
-        allowed_server_sources = relay_cidrs | (
-            {main_vpc_cidr} if main_vpc_cidr_valid else set()
-        )
+        allowed_server_sources = relay_cidrs | {"0.0.0.0/0"}
         expected_server_nhp_rules = [
             {
                 "protocol": "udp",
@@ -2513,7 +2834,27 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
         ]
         if not _rules_equal(actual_server_nhp_rules, expected_server_nhp_rules):
             errors.append(
-                "server SG rules covering UDP 62206 are not exactly main VPC plus relay /24s"
+                "server SG rules covering UDP 62206 are not exactly public internet plus relay /24s"
+            )
+        public_udp_capable_rules = [
+            rule
+            for rule in by_id.get(server_id, {}).get("inbound", [])
+            if rule.get("source_type") in {"cidr_ipv4", "cidr_ipv6"}
+            and rule.get("source") in {"0.0.0.0/0", "::/0"}
+            and str(rule.get("protocol", "")).lower() in {"udp", "-1", "all"}
+        ]
+        expected_public_udp_rule = [
+            {
+                "protocol": "udp",
+                "from": RELAY_SERVER_UDP_PORT,
+                "to": RELAY_SERVER_UDP_PORT,
+                "source_type": "cidr_ipv4",
+                "source": "0.0.0.0/0",
+            }
+        ]
+        if not _rules_equal(public_udp_capable_rules, expected_public_udp_rule):
+            errors.append(
+                "server SG public UDP-capable ingress must be exactly IPv4 UDP 62206"
             )
 
     flow_logs = snapshot.get("flow_logs", [])
@@ -2797,212 +3138,6 @@ def validate_structural(snapshot: dict[str, Any]) -> list[str]:
             errors.append(
                 "relay target group is not HTTPS:8080 with exact HTTPS /health/live checks"
             )
-    native_nlb = snapshot.get("native_nlb", {})
-    if (
-        native_nlb.get("vpc_id") != vpc.get("id")
-        or native_nlb.get("scheme") != "internet-facing"
-        or native_nlb.get("type") != "network"
-        or native_nlb.get("ip_address_type") != "ipv4"
-        or native_nlb.get("name") != f"layerv-nhp-{environment}-relay-nhp"
-    ):
-        errors.append(
-            "canonical native NHP NLB is not the one internet-facing relay-DMZ network LB"
-        )
-    expected_public_subnet_ids = {row.get("id") for row in public_subnets}
-    if set(native_nlb.get("subnet_ids", [])) != expected_public_subnet_ids:
-        errors.append(
-            "canonical native NHP NLB is not in exactly the DMZ public subnets"
-        )
-    if native_nlb.get("cross_zone_enabled") != "true" or native_nlb.get(
-        "deletion_protection_enabled"
-    ) != ("true" if environment == "prod" else "false"):
-        errors.append(
-            "canonical native NHP NLB cross-zone or deletion-protection attributes are incorrect"
-        )
-    expected_native_tags = {
-        "Environment": str(environment),
-        "Service": "nhp-relay",
-        "Component": "relay",
-        "Name": f"layerv-nhp-{environment}-relay-nhp",
-    }
-    if any(
-        native_nlb.get("tags", {}).get(key) != value
-        for key, value in expected_native_tags.items()
-    ):
-        errors.append("canonical native NHP NLB ownership tags are incomplete")
-    if (
-        set(native_nlb.get("security_group_ids", []))
-        != set(security.get("native_nhp_ids", []))
-        or len(native_nlb.get("security_group_ids", [])) != 1
-    ):
-        errors.append("canonical native NHP NLB does not use exactly its dedicated SG")
-    native_listeners = native_nlb.get("listeners", [])
-    if (
-        len(native_listeners) != 1
-        or native_listeners[0].get("port") != RELAY_SERVER_UDP_PORT
-        or native_listeners[0].get("protocol") != "UDP"
-        or len(native_listeners[0].get("actions", [])) != 1
-        or native_listeners[0].get("actions", [])[0].get("Type") != "forward"
-        or native_listeners[0].get("actions", [])[0].get("TargetGroupArn")
-        not in set(native_nlb.get("target_group_arns", []))
-    ):
-        errors.append(
-            "canonical native NHP NLB listener set is not exactly UDP 62206 forwarding to its sole target group"
-        )
-    native_target_groups = native_nlb.get("target_groups", [])
-    if len(native_target_groups) != 1 or {
-        row.get("arn") for row in native_target_groups
-    } != set(native_nlb.get("target_group_arns", [])):
-        errors.append(
-            "canonical native NHP NLB must have exactly one inventoried target group"
-        )
-    else:
-        native_target_group = native_target_groups[0]
-        expected_native_target_group = {
-            "vpc_id": vpc.get("id"),
-            "protocol": "UDP",
-            "port": RELAY_SERVER_UDP_PORT,
-            "target_type": "instance",
-            "preserve_client_ip": "true",
-            "health_check_enabled": True,
-            "health_check_protocol": "HTTPS",
-            "health_check_port": str(RELAY_BACKEND_PORT),
-            "health_check_path": RELAY_NATIVE_HEALTH_PATH,
-            "health_check_matcher": "200",
-            "healthy_threshold": 2,
-            "unhealthy_threshold": 2,
-            "health_check_interval": 15,
-            "health_check_timeout": 5,
-        }
-        if any(
-            native_target_group.get(key) != value
-            for key, value in expected_native_target_group.items()
-        ):
-            errors.append(
-                "native NHP target group is not instance UDP:62206 with preserved client IP and exact HTTPS:8080 /health/native-ready checks"
-            )
-
-    # Snapshot-only: hosted_zone_id equality protects imported forensic data. Live
-    # placement is proved by querying this exact Route 53 zone and then
-    # validating the record name, type, and alias target below.
-    native_dns_contract = EXPECTED_NATIVE_DNS.get(str(environment), {})
-    native_dns = snapshot.get("native_dns", {})
-    if not native_nlb.get("dns_name") or not native_nlb.get("canonical_hosted_zone_id"):
-        errors.append("canonical native NHP NLB DNS identity is missing")
-    if (
-        native_dns.get("record_count") != 1
-        or native_dns.get("hosted_zone_id") != native_dns_contract.get("hosted_zone_id")
-        or native_dns.get("name") != native_dns_contract.get("fqdn")
-        or native_dns.get("type") != "A"
-        or native_dns.get("alias_dns_name") != native_nlb.get("dns_name")
-        or native_dns.get("alias_hosted_zone_id")
-        != native_nlb.get("canonical_hosted_zone_id")
-        or native_dns.get("evaluate_target_health") is not True
-    ):
-        errors.append(
-            "stable native NHP Route53 alias is missing or does not target the canonical NLB"
-        )
-    if native_dns.get("record_count") == 1 and (
-        native_dns.get("set_identifier") is not None
-        or native_dns.get("weight") is not None
-        or native_dns.get("region") is not None
-        or native_dns.get("failover") is not None
-        or native_dns.get("multi_value_answer") is not False
-        or native_dns.get("health_check_id") is not None
-        or native_dns.get("traffic_policy_instance_id") is not None
-        or native_dns.get("ttl") is not None
-        or native_dns.get("resource_record_count") != 0
-    ):
-        errors.append(
-            "stable native NHP Route53 alias uses an unreviewed routing policy"
-        )
-
-    native_alarms = snapshot.get("native_alarms", {})
-    metric_alarms = native_alarms.get("metric_alarms", [])
-    composite_alarm_names = native_alarms.get("composite_alarm_names", [])
-    expected_alarm_names = {
-        f"layerv-nhp-{environment}-relay-native-nlb-unhealthy",
-        f"layerv-nhp-{environment}-relay-native-nlb-zero-healthy",
-    }
-    if (
-        len(metric_alarms) != 2
-        or {alarm.get("name") for alarm in metric_alarms} != expected_alarm_names
-        or composite_alarm_names
-    ):
-        errors.append(
-            "native NHP alarm inventory must be exactly two metric alarms and no composite alarms"
-        )
-    alarms_by_name = {
-        alarm.get("name"): alarm
-        for alarm in metric_alarms
-        if isinstance(alarm, dict) and alarm.get("name")
-    }
-    load_balancer_dimension = _elbv2_metric_dimension(
-        native_nlb.get("arn"), "load_balancer"
-    )
-    target_group_dimension = (
-        _elbv2_metric_dimension(native_target_groups[0].get("arn"), "target_group")
-        if len(native_target_groups) == 1
-        else None
-    )
-    expected_dimensions = {
-        "LoadBalancer": load_balancer_dimension,
-        "TargetGroup": target_group_dimension,
-    }
-    common_alarm = {
-        "actions_enabled": True,
-        "evaluation_periods": 2,
-        "datapoints_to_alarm": 2,
-        "namespace": "AWS/NetworkELB",
-        "period": 60,
-        "unit": None,
-        "dimension_count": 2,
-        "metric_query_count": 0,
-        "dimensions": expected_dimensions,
-    }
-    expected_alarm_action = (
-        f"arn:aws:sns:{snapshot.get('region')}:{snapshot.get('account_id')}:"
-        f"layerv-nhp-{environment}-cell0-alerts"
-    )
-    expected_alarm_shapes = {
-        f"layerv-nhp-{environment}-relay-native-nlb-unhealthy": {
-            **common_alarm,
-            "comparison_operator": "GreaterThanThreshold",
-            "metric_name": "UnHealthyHostCount",
-            "statistic": "Maximum",
-            "threshold": 0,
-            "treat_missing_data": "notBreaching",
-        },
-        f"layerv-nhp-{environment}-relay-native-nlb-zero-healthy": {
-            **common_alarm,
-            "comparison_operator": "LessThanThreshold",
-            "metric_name": "HealthyHostCount",
-            "statistic": "Minimum",
-            "threshold": 1,
-            "treat_missing_data": "breaching",
-        },
-    }
-    for alarm_name, expected_shape in expected_alarm_shapes.items():
-        alarm = alarms_by_name.get(alarm_name, {})
-        actions_are_live = (
-            alarm.get("alarm_actions") == [expected_alarm_action]
-            and alarm.get("ok_actions") == [expected_alarm_action]
-            and alarm.get("insufficient_data_actions") == []
-        )
-        if (
-            load_balancer_dimension is None
-            or target_group_dimension is None
-            or not actions_are_live
-            or any(alarm.get(key) != value for key, value in expected_shape.items())
-        ):
-            short_name = (
-                "partial-target-loss"
-                if alarm_name.endswith("-unhealthy")
-                else "zero-ready-target"
-            )
-            errors.append(
-                f"native NHP {short_name} alarm is missing or has the wrong metric, dimensions, threshold, or actions"
-            )
     return errors
 
 
@@ -3041,10 +3176,7 @@ def collect_functional(
     account_id = _require_account_id(snapshot.get("account_id"))
     instance_ids = snapshot.get("canonical_asg", {}).get("instance_ids", [])
     target_health: list[dict[str, Any]] = []
-    target_group_arns = [
-        *snapshot.get("alb", {}).get("target_group_arns", []),
-        *snapshot.get("native_nlb", {}).get("target_group_arns", []),
-    ]
+    target_group_arns = snapshot.get("alb", {}).get("target_group_arns", [])
     for target_group_arn in target_group_arns:
         rows = aws.call(
             "elbv2", "describe-target-health", "--target-group-arn", target_group_arn
@@ -3248,31 +3380,14 @@ def validate_functional(snapshot: dict[str, Any]) -> list[str]:
             "functional relay boundary validation requires at least one canonical instance"
         )
 
-    expected_native_alarm_names = {
-        f"layerv-nhp-{snapshot.get('environment')}-relay-native-nlb-unhealthy",
-        f"layerv-nhp-{snapshot.get('environment')}-relay-native-nlb-zero-healthy",
-    }
-    native_alarm_states = {
-        alarm.get("name"): alarm.get("state_value")
-        for alarm in snapshot.get("native_alarms", {}).get("metric_alarms", [])
-        if isinstance(alarm, dict) and alarm.get("name") in expected_native_alarm_names
-    }
-    if native_alarm_states != {
-        alarm_name: "OK" for alarm_name in expected_native_alarm_names
-    }:
-        errors.append(
-            "native NHP partial-loss and zero-ready-target alarms must both be in OK state"
-        )
-
     target_health = functional.get("target_health", [])
-    expected_target_group_arns = {
-        *snapshot.get("alb", {}).get("target_group_arns", []),
-        *snapshot.get("native_nlb", {}).get("target_group_arns", []),
-    }
+    expected_target_group_arns = set(
+        snapshot.get("alb", {}).get("target_group_arns", [])
+    )
     observed_target_group_arns = {row.get("target_group_arn") for row in target_health}
     if instance_ids and observed_target_group_arns != expected_target_group_arns:
         errors.append(
-            "functional target health did not inventory both relay target groups"
+            "functional target health did not inventory the relay HTTPS target group"
         )
     for target_group_arn in sorted(expected_target_group_arns):
         healthy_targets = {

@@ -37,7 +37,8 @@ LayerV spans multiple repositories:
 The NHP Server receives knock requests and coordinates with ACs to grant access.
 
 **Key Responsibilities:**
-- Receives UDP knock packets on port 62206 (via NLB)
+- Receives direct SDK UDP knocks on port 62206 through the assigned cell's
+  public NLB and browser-relayed knocks through the private internal NLB
 - Receives HTTP knock requests on port 443 (via Traefik)
 - Loads and manages authentication plugins
 - Communicates with AC instances to open firewall rules
@@ -82,7 +83,8 @@ GET /plugins/:aspid/:resid/valid - Legacy validation endpoint
 ```
 
 **Listens On:**
-- UDP 62206 (via NLB) - NHP protocol knocks
+- UDP 62206 via the assigned cell's public NLB - direct native SDK knocks
+- UDP 62206 via the internal NLB - private NHP_RLY knocks from the HTTPS relay
 - TCP 8888 (HTTP) - Plugin endpoints (passcode login, auth validation)
   - Accessed via AC Traefik (`/plugins/*` routes) or Demo Gateway nginx
 
@@ -91,6 +93,28 @@ GET /plugins/:aspid/:resid/valid - Legacy validation endpoint
    - Traefik routes `/plugins/*` to `http://server.nhp.sandbox.internal:8888`
 2. **Via Demo Gateway** (for qurl.link): `qurl.link/{appId}`
    - nginx routes to `http://server.nhp.sandbox.internal:8888/plugins/passcode?resid={appId}&action=login`
+
+---
+
+### NHP Relay (`nhp/endpoints/relay/`)
+
+The stateless relay is the public HTTPS edge for browser agents while the policy
+engine and AOP signing authority stay private. Browser agents use
+`POST /relay/{serverId}` through the public ALB on HTTPS 443; the ALB
+re-encrypts to relay HTTPS 8080. The relay owns no public UDP listener.
+
+Upcoming UDP SDKs connect directly to the public NHP server NLB for their
+assigned cell. That server NLB exposes exactly one public UDP listener, 62206.
+Browser knocks remain opaque agent-to-server payloads and are wrapped in
+authenticated `NHP_RLY` messages. The relay sends those messages
+from its separate internal UDP 62207 socket to the server's internal UDP 62206
+listener. Each forward has a cryptographically random request ID, and the
+server returns the opaque agent reply in an authenticated `RelayReturnMsg` on
+the same private 62207 socket. Neither UDP port is public on the relay.
+Direct SDK NHP packets retain the protocol's 4,096-byte limit. Because a
+maximum inner packet expands when base64- and metadata-wrapped, only the
+authenticated private NHP_RLY/RelayReturn outer transport has a dedicated
+6,144-byte bound; other message types cannot opt into it.
 
 ---
 
@@ -650,33 +674,15 @@ go test -v -tags=integration ./tests/integration/... -run TestPlugins
 ### UDP Communication Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           KNOCK FLOW                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│   ┌─────────┐     UDP 62206      ┌─────────────┐                        │
-│   │  Agent  │ ─────────────────► │ NHP Server  │                        │
-│   │ (User)  │     (via NLB)      │             │                        │
-│   └─────────┘                    └──────┬──────┘                        │
-│                                         │                               │
-│                                         │ NHP_AOP (UDP)                 │
-│                                         │ (through established conn)    │
-│                                         ▼                               │
-│                                  ┌─────────────┐                        │
-│                                  │   NHP AC    │                        │
-│                                  │  (dials to  │                        │
-│                                  │   server)   │                        │
-│                                  └──────┬──────┘                        │
-│                                         │                               │
-│                                         │ ipset/iptables update         │
-│                                         ▼                               │
-│                                  ┌─────────────┐                        │
-│                                  │  Firewall   │                        │
-│                                  │  (ACCEPT    │                        │
-│                                  │  agent IP)  │                        │
-│                                  └─────────────┘                        │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+Native UDP SDK ──UDP 62206──► assigned-cell public NHP NLB ──► NHP Server
+
+Browser JS-Agent ──HTTPS 443──► relay ALB ──HTTPS 8080──► NHP Relay
+                                                       │
+                                                       └─ private NHP_RLY
+                                                          UDP 62206 ──► NHP Server
+NHP Server ──authenticated RelayReturn UDP 62207 (private)──► NHP Relay
+
+NHP Server ──NHP_AOP──► Access Controller ──► firewall accepts client IP
 ```
 
 ### AC-Server Connection (Critical!)
@@ -1115,9 +1121,11 @@ Terraform was adopted and has different conventions than the Terraform-managed i
 
 ---
 
-### Terraform-Managed Infrastructure (infra/)
+### Terraform-Managed Infrastructure (`terraform/`)
 
-Modern IaC-managed infrastructure with proper scaling, etcd for dynamic config, and CI/CD integration.
+Modern IaC-managed infrastructure with autoscaling, private service discovery,
+and CI/CD integration. The sandbox relay DMZ described below is an apply-gated
+deployment contract: production remains relay-dark with `deploy_relay=false`.
 
 **Environments:**
 
@@ -1125,11 +1133,13 @@ Modern IaC-managed infrastructure with proper scaling, etcd for dynamic config, 
 |----------|---------|------------|
 | AWS Account | 767397897469 | (different) |
 | Region | us-east-2 | us-east-2 |
-| VPC CIDR | 10.100.0.0/16 | (different) |
+| Main VPC CIDR | 10.100.0.0/16 | Environment-specific |
+| Relay DMZ VPC CIDR | 10.101.0.0/16 when applied | Absent (`deploy_relay=false`) |
 | Server ASG | `layerv-nhp-sandbox-server-asg` | `layerv-nhp-prod-server-asg` |
 | AC ASG | `layerv-nhp-sandbox-ac-asg` | `layerv-nhp-prod-ac-asg` |
+| Relay ASG | Singleton canonical target, DMZ-specific remote name | Absent |
 | etcd (ECS) | `etcd.nhp.sandbox.internal:2379` | `etcd.nhp.prod.internal:2379` |
-| NLB | `layerv-nhp-sandbox-nlb` | `layerv-nhp-prod-nlb` |
+| NHP server ingress | Public assigned-cell NLB UDP 62206 for SDKs + internal NLB UDP 62206 for relay | Public assigned-cell NLB UDP 62206; relay path absent while relay-dark |
 
 **Directory Structure (Terraform-managed):**
 ```
@@ -1146,47 +1156,83 @@ Modern IaC-managed infrastructure with proper scaling, etcd for dynamic config, 
 - Immutable deployments via Docker image tags
 - CI/CD pipeline with canary deployments
 - Per-AC cryptographic keys stored in Secrets Manager
+- A dedicated no-NAT relay DMZ in sandbox, with durable relay identity and DNS
+  owned outside the disposable fleet
 
 ---
 
-### Network Architecture (Terraform-managed)
+### Sandbox Relay Network Architecture (Terraform-managed)
+
+The sandbox target makes the DMZ relay fleet the public HTTPS browser-knock
+edge. Direct SDK knocks enter the public NHP server NLB of the assigned cell on
+its only UDP listener, 62206. UDP 62207 is relay-private traffic and is never
+internet-facing. This does not mean the whole account is
+private: AC, qURL, bootstrap, CloudFront, and legacy surfaces are separate
+boundaries. Apply and rollback follow the
+[sandbox relay DMZ replacement runbook](runbooks/sandbox-relay-dmz-replacement.md).
 
 ```
-                    Internet
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│                        NLB                                   │
-│   UDP 62206 → NHP Server    TCP 443 → Traefik on AC         │
-└─────────────────────────────────────────────────────────────┘
-                        │
-           ┌────────────┴────────────┐
-           │                         │
-           ▼                         ▼
-┌─────────────────┐       ┌─────────────────┐
-│   NHP Server    │       │     NHP AC      │
-│   EC2 (ASG)     │       │   EC2 (ASG)     │
-│                 │       │                 │
-│ - UDP listener  │◄─────►│ - Dials to srv  │
-│ - HTTP plugins  │       │ - iptables mgmt │
-│ - etcd watcher  │       │ - Traefik       │
-└─────────────────┘       │ - Console API   │
-                          └─────────────────┘
-                                  │
-                                  ▼
-                          ┌─────────────────┐
-                          │   etcd Cluster  │
-                          │   (ECS Fargate) │
-                          └─────────────────┘
+Internet
+   ├─ HTTPS 443 ─► relay public ALB ─► relay HTTPS 8080
+   └─ UDP 62206 ─► assigned-cell public server NLB ─► NHP server
+   ▼
+┌──────────────────── Relay DMZ VPC (10.101.0.0/16) ────────────────┐
+│ Public load-balancer subnets: IGW default route only               │
+│ ALB ─────────────────► relay ASG in isolated relay subnets         │
+│                                      no public IP / NAT / default  │
+│                                           │                        │
+│                     HTTPS 443 ────────────┼──► interface endpoints │
+│                     HTTPS 443 ────────────└──► S3 gateway endpoint │
+└───────────────────────────────────────────┬────────────────────────┘
+                                            │ VPC peering
+                 private socket UDP 62207   │ NHP_RLY to server UDP 62206
+                 + authenticated return     │
+                                            ▼
+┌──────────────────────── Main VPC (10.100.0.0/16) ──────────────────┐
+│ Public server NLB UDP 62206 + internal relay NLB UDP 62206         │
+│                         NHP server ASGs / policy engine / AOP       │
+└────────────────────────────────────────────────────────────────────┘
 ```
+
+Relay subnet route tables contain only local routes, exact routes to the main
+VPC private subnet CIDRs through peering, and the regional S3 gateway endpoint
+route. Endpoint subnet route tables are local-only. The interface endpoint set
+is ECR API/Docker, Secrets Manager, SSM, SSM Messages, CloudWatch Logs,
+CloudWatch Monitoring, and GuardDuty data. There is no ec2messages endpoint.
+Route 53 Resolver DNS Firewall is fail closed and allows only the concrete
+regional service/S3/ECR/ELB names required by this path. DMZ Flow and Resolver
+logs use a dedicated CMK scoped to exactly those two log groups, leaving the
+shared Logs key and relay-dark production policy unchanged.
 
 ### Security Groups
 
 | Component | Rule | Purpose |
 |-----------|------|---------|
-| Server SG | UDP 62206 from 0.0.0.0/0 | Agent knocks via NLB |
-| AC SG | UDP 62206 from VPC CIDR | Server-to-AC (though AC dials out) |
-| AC SG | TCP 443, 80 from 0.0.0.0/0 | HTTPS via NLB |
+| Relay ALB SG | TCP 443 from `0.0.0.0/0` | Public browser knock edge; WAF applies only here |
+| Relay ALB SG | TCP 8080 to relay node SG | Re-encrypted non-root relay backend |
+| Relay node SG | TCP 8080 from relay ALB SG | ALB-only HTTPS ingress |
+| Relay node SG | UDP 62206 to exact main private-subnet CIDRs | NHP_RLY to the internal server path |
+| Relay node SG | UDP 62207 from server SG | Private authenticated RelayReturn receive socket |
+| Relay node SG | TCP 443 to endpoint SG and regional S3 prefix list | Bounded AWS control-plane/bootstrap egress |
+| Server SG | UDP 62206 from `0.0.0.0/0` | Direct SDK ingress through the assigned-cell public NLB |
+| Server SG | UDP 62206 from the DMZ relay subnet CIDRs | Peered browser-relay forwarding through the internal NLB |
+
+WAF does not inspect direct SDK UDP because that traffic bypasses the relay and
+lands on the assigned cell's NHP server edge. No other relay ingress or egress
+is part of the contract. Persistent relay
+identity, certificate, alias, image pin, and canonical ASG metadata are not
+owned by relay instances, so fleet replacement does not rotate them. Servers
+receive only the trusted relay public-key list; the relay fleet alone can read
+the private identity secret.
+
+For browser-relayed knocks, the server's pre-decrypt limiter sees relay instance
+source IPs rather than the browser address in the authenticated envelope, so
+multiple browsers forwarded by one relay share a server-side bucket. The ALB/WAF
+and relay admission controls are the Internet-abuse boundary for that HTTPS path.
+Direct UDP SDKs bypass the relay: the server edge's kernel aggregate hashlimit,
+per-source hashlimit, application limiter, and connection caps are their abuse
+controls. UDP source spoofing and distributed-flood hardening are tracked against
+that public assigned-cell edge in issue #3184.
 
 ---
 
@@ -1437,7 +1483,7 @@ go test -v -tags=integration ./tests/integration/...
 | `TestEtcd_Connection` | Verify etcd connectivity |
 | `TestEtcd_NHPConfigExists` | Verify `/nhp/config` key exists |
 | `TestEtcd_ACRegistry` | Verify AC registrations |
-| `TestNHPServer_UDPReachable` | Verify NLB UDP connectivity |
+| `TestNHPServer_UDPAddressResolvesAndSendSucceeds` | Verify endpoint resolution and local UDP send; #3184 tracks the valid external SDK round trip |
 | `TestACCerts_Valid` | Verify AWS certificate validity |
 
 ### E2E Tests
@@ -1946,7 +1992,9 @@ nmap -Pn -p 80,443 abc123.qurl.site
 
 | Port | Protocol | Component | Purpose |
 |------|----------|-----------|---------|
-| 62206 | UDP | NHP Server | Knock packets |
+| 62206 | UDP | Assigned-cell public server NLB | Direct SDK knock ingress (the NLB's only UDP listener) |
+| 62206 | UDP | Private NHP Server path | Browser-relayed knock packets through the internal NLB |
+| 62207 | UDP | NHP Relay (private only) | `NHP_RLY` send and authenticated return socket; never public |
 | 443 | TCP | Traefik | HTTPS (TLS termination) |
 | 80 | TCP | Traefik | HTTP → HTTPS redirect |
 | 8888 | TCP | AC (localhost) | HTTP refresh endpoint |

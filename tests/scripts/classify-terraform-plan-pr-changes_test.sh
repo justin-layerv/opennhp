@@ -71,10 +71,10 @@ run_case "auth0 helper triggers sandbox plan" true false false \
 	$'M\t.github/scripts/fetch-auth0-token.sh'
 run_case "classifier helper triggers sandbox plan" true false false \
 	$'M\t.github/scripts/classify-terraform-plan-pr-changes.sh'
-run_case "transition dispatcher triggers sandbox plan" true false false \
+run_case "relay DMZ checker triggers sandbox plan" true false false \
 	$'M\t.github/scripts/check-relay-dmz-plan.py'
-run_case "HTTPS transition checker triggers sandbox plan" true false false \
-	$'M\t.github/scripts/check-relay-dmz-plan-https.py'
+run_case "relay DMZ checker companion triggers sandbox plan" true false false \
+	$'M\t.github/scripts/check-relay-dmz-plan-next.py'
 run_case "unrelated docs stay skipped" false false false \
 	$'M\tdocs/runbooks/example.md'
 run_case "prod terraform plus prod docs stays prod-only" true true false \

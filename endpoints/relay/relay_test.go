@@ -38,6 +38,18 @@ func keyBytes(seed byte) []byte {
 	return k
 }
 
+func waitForRelayCondition(t *testing.T, timeout time.Duration, what string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("condition %q not met within %s", what, timeout)
+}
+
 func writeTestTLSCert(t *testing.T) (certFile, keyFile string, roots *x509.CertPool) {
 	t.Helper()
 
@@ -103,6 +115,13 @@ func devicePubKey(t *testing.T, deviceType int, priv []byte) []byte {
 // carrying the given counter — a well-formed packet the relay can RecvPrecheck.
 func makeInnerKnock(t *testing.T, serverPub []byte, counter uint64) []byte {
 	t.Helper()
+	return makeInnerAgentPacket(t, serverPub, core.NHP_KNK, counter, &common.AgentKnockMsg{
+		HeaderType: core.NHP_KNK, UserId: "u", AuthServiceId: "asp", ResourceId: "res",
+	})
+}
+
+func makeInnerAgentPacket(t *testing.T, serverPub []byte, headerType int, counter uint64, msg any) []byte {
+	t.Helper()
 	agentDev := core.NewDevice(core.NHP_AGENT, keyBytes(0x11), nil)
 	agentDev.Start()
 	t.Cleanup(agentDev.Stop)
@@ -118,14 +137,14 @@ func makeInnerKnock(t *testing.T, serverPub []byte, counter uint64) []byte {
 		SetTimeoutSignal: make(chan struct{}, 1),
 		StopSignal:       make(chan struct{}),
 	}
-	body, err := json.Marshal(&common.AgentKnockMsg{HeaderType: core.NHP_KNK, UserId: "u", AuthServiceId: "asp", ResourceId: "res"})
+	body, err := json.Marshal(msg)
 	if err != nil {
 		t.Fatalf("marshal knock: %v", err)
 	}
 	agentDev.SendMsgToPacket(&core.MsgData{
 		ConnData:      conn,
 		PeerPk:        serverPub,
-		HeaderType:    core.NHP_KNK,
+		HeaderType:    headerType,
 		TransactionId: counter,
 		Message:       body,
 	})
@@ -145,7 +164,9 @@ func testStop(rs *RelayServer) {
 		return
 	}
 	close(rs.stopCh)
-	_ = rs.udpConn.Close()
+	rs.closeSockets()
+	rs.handlerStartMu.Lock()
+	rs.handlerStartMu.Unlock()
 	rs.wg.Wait()
 	rs.device.Stop()
 	rs.metrics.Stop() // New() boots the publisher; reap its flush goroutine (nil-safe), mirroring Stop()
@@ -278,6 +299,150 @@ func makeRealCookie(t *testing.T, serverDev *core.Device, innerKnock []byte, src
 	}
 }
 
+func makeRelayReturnPacket(t *testing.T, serverDev *core.Device, outerPpd *core.PacketParserData, requestID string, inner []byte) []byte {
+	t.Helper()
+	body, err := json.Marshal(&common.RelayReturnMsg{
+		RequestID:   requestID,
+		InnerPacket: base64.StdEncoding.EncodeToString(inner),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encCh := make(chan *core.MsgAssemblerData, 1)
+	md := &core.MsgData{
+		HeaderType:     core.NHP_ACK,
+		Compress:       false,
+		Message:        body,
+		PrevParserData: outerPpd,
+		ExternalPacket: core.NewRelayPacket(),
+		EncryptedPktCh: encCh,
+	}
+	serverDev.SendMsgToPacket(md)
+	select {
+	case mad := <-encCh:
+		if mad.Error != nil {
+			t.Fatalf("encrypt relay return: %v", mad.Error)
+		}
+		packet := append([]byte(nil), mad.BasePacket.Content...)
+		mad.Destroy()
+		return packet
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout encrypting relay return")
+		return nil
+	}
+}
+
+func makeMaxInnerListRequest(t *testing.T, serverPub []byte, counter uint64) []byte {
+	t.Helper()
+	targetBody := core.PacketBufferSize - core.NewRelayPacket().MinimalLength() - core.GCMTagSize
+	msg := &common.AgentListMsg{
+		UserId: "u", DeviceId: "d", AuthServiceId: "asp",
+		UserData: map[string]any{"pad": ""},
+	}
+	empty, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg.UserData["pad"] = strings.Repeat("x", targetBody-len(empty))
+	body, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != targetBody {
+		t.Fatalf("max inner request body = %d, want %d", len(body), targetBody)
+	}
+	packet := makeInnerAgentPacket(t, serverPub, core.NHP_LST, counter, msg)
+	if len(packet) != core.PacketBufferSize {
+		t.Fatalf("max inner request = %d bytes, want %d", len(packet), core.PacketBufferSize)
+	}
+	return packet
+}
+
+func makeMaxInnerListResult(t *testing.T, serverDev *core.Device, innerRequest []byte, srcAddr *net.UDPAddr) []byte {
+	t.Helper()
+	innerPpd, err := serverDev.PacketToMsg(&core.PacketData{
+		BasePacket: &core.Packet{Content: innerRequest},
+		ConnData:   &core.ConnectionData{Device: serverDev, RemoteAddr: srcAddr},
+		InitTime:   time.Now().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("server decrypt max inner request: %v", err)
+	}
+	targetBody := core.PacketBufferSize - core.NewRelayPacket().MinimalLength() - core.GCMTagSize
+	msg := &common.ServerListResultMsg{ErrCode: common.ErrSuccess.ErrorCode(), ListResults: map[string]any{"pad": ""}}
+	empty, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg.ListResults["pad"] = strings.Repeat("x", targetBody-len(empty))
+	body, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != targetBody {
+		t.Fatalf("max inner response body = %d, want %d", len(body), targetBody)
+	}
+	encCh := make(chan *core.MsgAssemblerData, 1)
+	serverDev.SendMsgToPacket(&core.MsgData{
+		HeaderType:     core.NHP_LRT,
+		TransactionId:  innerPpd.SenderTrxId,
+		Compress:       false,
+		PrevParserData: innerPpd,
+		Message:        body,
+		EncryptedPktCh: encCh,
+	})
+	select {
+	case mad := <-encCh:
+		if mad.Error != nil {
+			t.Fatalf("server encrypt max inner response: %v", mad.Error)
+		}
+		packet := append([]byte(nil), mad.BasePacket.Content...)
+		mad.Destroy()
+		if len(packet) != core.PacketBufferSize {
+			t.Fatalf("max inner response = %d bytes, want %d", len(packet), core.PacketBufferSize)
+		}
+		return packet
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout producing max inner response")
+		return nil
+	}
+}
+
+func TestRelayEnvelopeMaximumSchemaMath(t *testing.T) {
+	inner := make([]byte, core.PacketBufferSize)
+	requestID := base64.RawURLEncoding.EncodeToString(make([]byte, common.RelayRequestIDBytes))
+	forward, err := json.Marshal(&common.RelayForwardMsg{
+		SourceAddr: &common.NetAddress{
+			Ip:   "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+			Port: 65535,
+		},
+		InnerPacket: base64.StdEncoding.EncodeToString(inner),
+		RequestID:   requestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	returned, err := json.Marshal(&common.RelayReturnMsg{
+		RequestID: requestID, InnerPacket: base64.StdEncoding.EncodeToString(inner),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	headerAndTag := core.NewRelayPacket().MinimalLength() + core.GCMTagSize
+	if got := len(forward); got != 5588 {
+		t.Fatalf("maximum RelayForwardMsg JSON = %d bytes, want 5588", got)
+	}
+	if got := len(returned); got != 5516 {
+		t.Fatalf("maximum RelayReturnMsg JSON = %d bytes, want 5516", got)
+	}
+	if got := headerAndTag + len(forward); got != 5844 || got > core.RelayPacketBufferSize {
+		t.Fatalf("maximum forward envelope = %d bytes, want 5844 within %d", got, core.RelayPacketBufferSize)
+	}
+	if got := headerAndTag + len(returned); got != 5772 || got > core.RelayPacketBufferSize {
+		t.Fatalf("maximum return envelope = %d bytes, want 5772 within %d", got, core.RelayPacketBufferSize)
+	}
+}
+
 // driveRelayRoundTrip exercises the relay's full forward path for one
 // server->agent reply type: it POSTs a fresh inner knock to handleRelay while a
 // one-shot fake cell server echoes back a real reply built from serverDev. It
@@ -285,7 +450,7 @@ func makeRealCookie(t *testing.T, serverDev *core.Device, innerKnock []byte, src
 // only its reply-specific assertions.
 func driveRelayRoundTrip(t *testing.T, counter uint64, makeReply func(*testing.T, *core.Device, []byte, *net.UDPAddr) []byte) (*RelayServer, *httptest.ResponseRecorder, []byte) {
 	t.Helper()
-	serverDev := core.NewDevice(core.NHP_SERVER, keyBytes(0x40), &core.DeviceOptions{DisableAgentPeerValidation: true})
+	serverDev := core.NewDevice(core.NHP_SERVER, keyBytes(0x40), &core.DeviceOptions{DisableAgentPeerValidation: true, DisableRelayPeerValidation: true})
 	serverDev.Start()
 	t.Cleanup(serverDev.Stop)
 	serverPub, err := base64.StdEncoding.DecodeString(serverDev.PublicKeyBase64())
@@ -302,16 +467,34 @@ func driveRelayRoundTrip(t *testing.T, counter uint64, makeReply func(*testing.T
 	srcAddr := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444}
 	innerKnock := makeInnerKnock(t, serverPub, counter)
 	reply := makeReply(t, serverDev, innerKnock, srcAddr)
+	// makeRealCookie temporarily overloads the fake server to mint the inner COK.
+	// Clear it before the independent outer NHP_RLY decrypt below; production
+	// servers accept the authenticated outer relay envelope before applying
+	// overload handling to its inner KNK.
+	serverDev.SetOverload(false)
 
 	// Fake server: read the NHP_RLY, reply with the real NHP reply to the relay's
 	// source addr (the server replies to the packet's source).
 	go func() {
 		buf := make([]byte, 65536)
-		_, from, rerr := fakeServer.ReadFromUDP(buf)
+		n, from, rerr := fakeServer.ReadFromUDP(buf)
 		if rerr != nil {
 			return
 		}
-		_, _ = fakeServer.WriteToUDP(reply, from)
+		outerPpd, perr := serverDev.PacketToMsg(&core.PacketData{
+			BasePacket: &core.Packet{Content: buf[:n]},
+			ConnData:   &core.ConnectionData{Device: serverDev, RemoteAddr: from},
+			InitTime:   time.Now().UnixNano(),
+		})
+		if perr != nil || outerPpd == nil {
+			return
+		}
+		var forwarded common.RelayForwardMsg
+		if json.Unmarshal(outerPpd.BodyMessage, &forwarded) != nil {
+			return
+		}
+		wrapped := makeRelayReturnPacket(t, serverDev, outerPpd, forwarded.RequestID, reply)
+		_, _ = fakeServer.WriteToUDP(wrapped, from)
 	}()
 
 	rs := newTestRelay(t, serverPub, fakeServer.LocalAddr().(*net.UDPAddr).Port, SourceAddrModeRemoteAddr)
@@ -326,35 +509,32 @@ func driveRelayRoundTrip(t *testing.T, counter uint64, makeReply func(*testing.T
 	return rs, w, reply
 }
 
-// TestRelay_OverloadCookie_RoundTrip is the #2529 proof: an overloaded cell
-// server's NHP_COK reply is correctly dispatched back to the waiting HTTP
-// handler through the one-shot relay path. Before the #2611 fix the COK carried
-// a fresh server-side counter, so the relay (which matches replies to pending
-// requests by the inner KNK counter) silently dropped it and the browser timed
-// out instead of receiving the cookie challenge. The COK challenge is now
-// live-reachable through the relay, unblocking the COK->RKN follow-up.
+// TestRelay_OverloadCookie_RoundTrip proves an overloaded cell server's NHP_COK
+// is returned through the authenticated, request-ID-correlated envelope. The
+// inner COK must still carry the original KNK counter for the agent's own
+// COK->RKN protocol, but the relay never uses that collision-prone value to
+// choose a waiter.
 func TestRelay_OverloadCookie_RoundTrip(t *testing.T) {
 	const counter = uint64(6611)
-	rs, w, realCookie := driveRelayRoundTrip(t, counter, makeRealCookie)
+	_, w, realCookie := driveRelayRoundTrip(t, counter, makeRealCookie)
 
 	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %q — the overload COK was not dispatched back through the relay (counter-correlation regression)", w.Code, w.Body.String())
+		t.Fatalf("status = %d, body = %q — the overload COK was not dispatched back through the relay", w.Code, w.Body.String())
 	}
 	if !bytes.Equal(w.Body.Bytes(), realCookie) {
 		t.Errorf("relayed NHP_COK bytes mismatch (got %d bytes, want %d)", w.Body.Len(), len(realCookie))
 	}
-	// Independently confirm the COK's cleartext counter is the inner KNK counter
-	// the relay keyed its pending request on — the property the dispatch relies on.
-	if cokCounter, cerr := rs.innerCounter(realCookie); cerr != nil {
-		t.Fatalf("innerCounter(COK): %v", cerr)
-	} else if cokCounter != counter {
-		t.Errorf("COK wire counter = %d, want inner KNK counter %d (relay matches replies by this counter)", cokCounter, counter)
+	// Independently confirm the COK retains the inner KNK counter the agent needs
+	// to construct its follow-up RKN. Relay dispatch itself uses RequestID.
+	cokCounter := (&core.Packet{Content: realCookie}).Counter()
+	if cokCounter != counter {
+		t.Errorf("COK wire counter = %d, want inner KNK counter %d", cokCounter, counter)
 	}
 }
 
 // TestRelay_RoundTrip drives the full path: HTTPS POST -> NHP_RLY to the (fake)
-// cell server on the shared socket -> a REAL NHP_ACK, counter-correlated,
-// returned to the HTTP response.
+// cell server on the shared socket -> an authenticated, random-RequestID-
+// correlated REAL NHP_ACK carrying the original agent counter -> HTTP response.
 func TestRelay_RoundTrip(t *testing.T) {
 	const counter = uint64(7777)
 	_, w, realAck := driveRelayRoundTrip(t, counter, makeRealAck)
@@ -444,7 +624,8 @@ func TestRelay_TrustedHeaderForwardStampsAttestedRightmostXFF(t *testing.T) {
 		}
 		rlyCh <- &rlyMsg
 
-		_, _ = fakeServer.WriteToUDP(reply, from)
+		wrapped := makeRelayReturnPacket(t, serverDev, ppd, rlyMsg.RequestID, reply)
+		_, _ = fakeServer.WriteToUDP(wrapped, from)
 	}()
 
 	rs := newTestRelay(
@@ -499,29 +680,48 @@ func TestRelay_TrustedHeaderForwardStampsAttestedRightmostXFF(t *testing.T) {
 	}
 }
 
-// TestRelay_DispatchToConcurrentWaiters fences the composite-key design: two
-// clients sharing a transaction counter both receive the dispatched ACK (the
-// reason registration is (counter, client) but dispatch is by counter).
-func TestRelay_DispatchToConcurrentWaiters(t *testing.T) {
+// TestRelay_DispatchTargetsExactRequestIDAndServer fences that colliding agent
+// counters or a return from the wrong configured server cannot cross-deliver.
+func TestRelay_DispatchTargetsExactRequestIDAndServer(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
 	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
+	// newTestRelay starts a real publisher; stop it before installing the
+	// inspectable test publisher so its flush goroutine is not orphaned.
+	rs.metrics.Stop()
+	rs.metrics = metrics.NewPublisherForTest(t)
 
-	const counter = uint64(9999)
+	id1 := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, common.RelayRequestIDBytes))
+	id2 := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{2}, common.RelayRequestIDBytes))
 	ch1 := make(chan []byte, 1)
 	ch2 := make(chan []byte, 1)
+	serverID := utils.PubKeyFingerprint(serverPub)
 	rs.pendingMu.Lock()
-	rs.pending[pendingKey{counter: counter, clientAddr: "203.0.113.7:1"}] = ch1
-	rs.pending[pendingKey{counter: counter, clientAddr: "198.51.100.4:2"}] = ch2
+	rs.pending[id1] = relayPendingEntry{serverID: serverID, reply: ch1}
+	rs.pending[id2] = relayPendingEntry{serverID: serverID, reply: ch2}
 	rs.pendingMu.Unlock()
 
-	rs.dispatch(counter, []byte("ack-bytes"))
+	rs.dispatch(id1, "different-configured-cell", []byte("wrong-cell"))
+	select {
+	case <-ch1:
+		t.Fatal("request accepted a return from the wrong cell")
+	default:
+	}
+	counters, _ := rs.metrics.CountersForTest(t)
+	if got := counters[MetricRelayReturnServerMismatch]; got != 1 {
+		t.Fatalf("%s counter = %v, want 1", MetricRelayReturnServerMismatch, got)
+	}
 
-	for i, ch := range []chan []byte{ch1, ch2} {
-		select {
-		case <-ch:
-		case <-time.After(time.Second):
-			t.Errorf("waiter %d on the shared counter did not receive the dispatched ACK", i)
-		}
+	rs.dispatch(id1, serverID, []byte("ack-bytes"))
+
+	select {
+	case <-ch1:
+	case <-time.After(time.Second):
+		t.Fatal("matching request-ID waiter did not receive reply")
+	}
+	select {
+	case <-ch2:
+		t.Fatal("reply crossed into a different request ID")
+	default:
 	}
 }
 
@@ -812,6 +1012,28 @@ func TestNew_TrustedHeaderBindCoherence(t *testing.T) {
 	}
 }
 
+func TestNew_RejectsDuplicateServerFingerprint(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	pubKey := base64.StdEncoding.EncodeToString(serverPub)
+	cfg := &Config{
+		PrivateKeyBase64: base64.StdEncoding.EncodeToString(keyBytes(0x80)),
+		UDPListenAddr:    "127.0.0.1:0",
+		Servers: []ServerConfig{
+			{Name: "cell-a", PubKeyBase64: pubKey, Host: "127.0.0.1", Port: 62206},
+			{Name: "cell-b", PubKeyBase64: pubKey, Host: "127.0.0.2", Port: 62206},
+		},
+	}
+
+	rs, err := New(cfg)
+	if rs != nil {
+		_ = rs.udpConn.Close()
+		t.Fatal("New returned a relay after duplicate server fingerprint")
+	}
+	if err == nil || !strings.Contains(err.Error(), "duplicates public key fingerprint") {
+		t.Fatalf("New error = %v, want duplicate fingerprint rejection", err)
+	}
+}
+
 func TestNew_EnableTLSRequiresCertKeyPaths(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
 	base := func() *Config {
@@ -1043,6 +1265,56 @@ func TestRelay_Timeout_504(t *testing.T) {
 	}
 }
 
+// Keep the production response window longer than the encryption hand-off
+// timeout so a stalled encryption fails before the HTTP waiter times out.
+func TestRelay_TimeoutOrdering(t *testing.T) {
+	if encryptTimeout >= relayResponseTimeout {
+		t.Fatalf("encryptTimeout %s must be shorter than relayResponseTimeout %s", encryptTimeout, relayResponseTimeout)
+	}
+}
+
+func TestRelay_HTTPSAgentTypeAdmission(t *testing.T) {
+	tests := []struct {
+		name       string
+		headerType int
+		allowed    bool
+	}{
+		{"knock", core.NHP_KNK, true},
+		{"reknock", core.NHP_RKN, true},
+		{"exit", core.NHP_EXT, true},
+		{"otp", core.NHP_OTP, true},
+		{"register", core.NHP_REG, true},
+		{"list", core.NHP_LST, true},
+		{"DHP knock", core.DHP_KNK, false},
+		{"ack reply", core.NHP_ACK, false},
+		{"cookie reply", core.NHP_COK, false},
+		{"reknock ack reply", core.NHP_RAK, false},
+		{"list reply", core.NHP_LRT, false},
+		{"relay envelope", core.NHP_RLY, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := httpsAgentTypeAllowed(tc.headerType); got != tc.allowed {
+				t.Errorf("HTTPS admission = %v, want %v", got, tc.allowed)
+			}
+		})
+	}
+}
+
+func TestRelay_DeviceAllowlistEqualsHTTPSRequestsAndRelayReturns(t *testing.T) {
+	relayDevice := core.NewDevice(core.NHP_RELAY, keyBytes(0x91), nil)
+	for headerType := core.NHP_KPL; core.HeaderTypeToString(headerType) != "UNKNOWN"; headerType++ {
+		want := httpsAgentTypeAllowed(headerType) || relayReturnTypeAllowed(headerType)
+		if got := relayDevice.CheckRecvHeaderType(headerType); got != want {
+			headerName := core.HeaderTypeToString(headerType)
+			t.Errorf(
+				"NHP_RELAY device admission for %s = %v, want HTTPS-request-or-return admission %v",
+				headerName, got, want,
+			)
+		}
+	}
+}
+
 func TestRelay_MalformedInner_400(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
 	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
@@ -1056,48 +1328,75 @@ func TestRelay_MalformedInner_400(t *testing.T) {
 	}
 }
 
-// TestRelay_SameClientSameCounter_NoOverwrite fences the per-request seq fix:
-// two concurrent requests from the SAME client sharing a counter (a browser
-// retrying an identical knock) must both register and both be served — the
-// pre-fix (counter,client) key was last-writer-wins, 504ing one and deleting
-// the other's registration.
-func TestRelay_SameClientSameCounter_NoOverwrite(t *testing.T) {
+func TestRelay_HTTPSRejectsServerReplyAtEdge(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
-	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
-
-	const counter = uint64(3333)
-	k1 := pendingKey{counter: counter, clientAddr: "203.0.113.7:1", seq: rs.seq.Add(1)}
-	k2 := pendingKey{counter: counter, clientAddr: "203.0.113.7:1", seq: rs.seq.Add(1)}
-	ch1 := make(chan []byte, 1)
-	ch2 := make(chan []byte, 1)
-	rs.pendingMu.Lock()
-	rs.pending[k1] = ch1
-	rs.pending[k2] = ch2
-	rs.pendingMu.Unlock()
-	if len(rs.pending) != 2 {
-		t.Fatalf("same-(counter,client) requests collapsed to %d entries; per-request seq should keep them distinct", len(rs.pending))
-	}
-
-	rs.dispatch(counter, []byte("ack"))
-	for i, ch := range []chan []byte{ch1, ch2} {
-		select {
-		case <-ch:
-		case <-time.After(time.Second):
-			t.Errorf("waiter %d (same client+counter) was not served — map-overwrite regression", i)
-		}
+	innerKnock := makeInnerKnock(t, serverPub, 88_881)
+	innerAck := append([]byte(nil), innerKnock...)
+	pkt := &core.Packet{Content: innerAck}
+	_, payloadSize := pkt.HeaderTypeAndSize()
+	pkt.Header().SetTypeAndPayloadSize(core.NHP_ACK, payloadSize)
+	rs := newTestRelay(t, serverPub, 62299, SourceAddrModeRemoteAddr)
+	serverID := utils.PubKeyFingerprint(serverPub)
+	req := httptest.NewRequest(http.MethodPost, "/relay/"+serverID, bytes.NewReader(innerAck))
+	req.RemoteAddr = "203.0.113.7:44444"
+	w := httptest.NewRecorder()
+	rs.handleRelay(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for server-reply inner type", w.Code)
 	}
 }
 
-// TestRelay_ShortDatagram_NoCrash fences the HIGH finding: a short/empty UDP
-// datagram must be rejected by innerCounter (no header-slice panic) and must not
-// crash recvLoop — otherwise a single bare datagram is a remote process DoS.
+func TestRelay_RandomRequestIDsDoNotOverwrite(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
+
+	k1, err := common.NewRelayRequestID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	k2, err := common.NewRelayRequestID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch1 := make(chan []byte, 1)
+	ch2 := make(chan []byte, 1)
+	serverID := utils.PubKeyFingerprint(serverPub)
+	rs.pendingMu.Lock()
+	rs.pending[k1] = relayPendingEntry{serverID: serverID, reply: ch1}
+	rs.pending[k2] = relayPendingEntry{serverID: serverID, reply: ch2}
+	rs.pendingMu.Unlock()
+	if len(rs.pending) != 2 {
+		t.Fatalf("distinct random request IDs collapsed to %d pending entries", len(rs.pending))
+	}
+
+	rs.dispatch(k1, serverID, []byte("ack"))
+	select {
+	case <-ch1:
+	case <-time.After(time.Second):
+		t.Fatal("first random request ID was not served")
+	}
+	select {
+	case <-ch2:
+		t.Fatal("first reply crossed to second random request ID")
+	default:
+	}
+}
+
+// TestRelay_ShortDatagram_NoCrash proves short private-socket datagrams are
+// rejected before decryption and short inner packets cannot panic innerType.
 func TestRelay_ShortDatagram_NoCrash(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
 	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
 
+	for _, n := range []int{0, core.HeaderCommonSize, core.RelayPacketMinimalLength - 1} {
+		if _, _, _, err := rs.decodeRelayReturn(make([]byte, n), &net.UDPAddr{}); err == nil {
+			t.Errorf("decodeRelayReturn(%d bytes) = nil error, want undersized relay-envelope rejection", n)
+		}
+	}
+
 	for _, n := range []int{0, 1, 7, core.HeaderCommonSize - 1} {
-		if _, err := rs.innerCounter(make([]byte, n)); err == nil {
-			t.Errorf("innerCounter(%d bytes) = nil error, want rejection (no panic)", n)
+		if _, err := rs.innerType(make([]byte, n)); err == nil {
+			t.Errorf("innerType(%d bytes) = nil error, want rejection (no panic)", n)
 		}
 	}
 
@@ -1112,6 +1411,65 @@ func TestRelay_ShortDatagram_NoCrash(t *testing.T) {
 	_, _ = sender.Write([]byte{})        // 0-byte (n==0, err==nil)
 	_, _ = sender.Write([]byte{1, 2, 3}) // 3-byte
 	time.Sleep(50 * time.Millisecond)    // let recvLoop process them
+}
+
+func TestRelay_LateEncryptReaperIsTracked(t *testing.T) {
+	rs := &RelayServer{}
+	encCh := make(chan *core.MsgAssemblerData, 1)
+	rs.reapLateEncryptedPacket(encCh)
+	done := make(chan struct{})
+	go func() {
+		rs.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("shutdown barrier returned before the late encrypt result was reaped")
+	case <-time.After(20 * time.Millisecond):
+	}
+	encCh <- nil
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown barrier did not observe the completed encrypt reaper")
+	}
+}
+
+func TestRelay_ConsumeEncryptedPacketDestroysErrorResult(t *testing.T) {
+	device := core.NewDevice(core.NHP_RELAY, keyBytes(0x80), nil)
+	device.Start()
+	t.Cleanup(device.Stop)
+	encCh := make(chan *core.MsgAssemblerData, 1)
+	device.SendMsgToPacket(&core.MsgData{
+		HeaderType:     core.NHP_RLY,
+		PeerPk:         []byte{1},
+		Message:        []byte(`{}`),
+		ExternalPacket: device.AllocateRelayPacket(),
+		EncryptedPktCh: encCh,
+	})
+	var mad *core.MsgAssemblerData
+	select {
+	case mad = <-encCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for forced encryption error")
+	}
+	if mad == nil || mad.Error == nil {
+		t.Fatalf("forced encryption result = %#v, want non-nil MAD error", mad)
+	}
+	if _, err := core.ConsumeEncryptedPacket(mad); err == nil {
+		t.Fatal("ConsumeEncryptedPacket accepted a forced encryption error")
+	}
+	if mad.BasePacket.Content != nil {
+		t.Fatal("error MAD retained its pooled relay packet after consumption")
+	}
+}
+
+func TestRelay_ReturnRejectsDatagramAboveEnvelopeLimit(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
+	if _, _, _, err := rs.decodeRelayReturn(make([]byte, core.RelayPacketBufferSize+1), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206}); err == nil {
+		t.Fatal("private relay return accepted a 6145-byte datagram")
+	}
 }
 
 func TestRelay_ShortBody_400(t *testing.T) {
@@ -1154,6 +1512,53 @@ func TestRelay_StopUnparksHandler(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("handler did not unpark on stopCh (would stall Shutdown to the 5s timeout)")
+	}
+}
+
+func TestRelay_ExpiredShutdownRejectsHandlerThatHasNotRegistered(t *testing.T) {
+	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
+	rs := newTestRelay(t, serverPub, 62299, SourceAddrModeRemoteAddr)
+	rs.cors = newCORSAllowlist(testKnockOrigin)
+	rs.handlerStartMu.Lock()
+	w := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		req := httptest.NewRequest(http.MethodOptions, "/relay/x", nil)
+		req.Header.Set("Origin", testKnockOrigin)
+		rs.handleRelay(w, req)
+		close(handlerDone)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stopDone := make(chan struct{})
+	go func() {
+		_ = rs.Stop(ctx)
+		close(stopDone)
+	}()
+	waitForRelayCondition(t, time.Second, "relay entered stopping state", func() bool {
+		return !rs.running.Load()
+	})
+	rs.handlerStartMu.Unlock()
+
+	select {
+	case <-handlerDone:
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("late handler status = %d, want 503", w.Code)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != testKnockOrigin {
+			t.Fatalf("late handler CORS origin = %q, want %q", got, testKnockOrigin)
+		}
+		if got := w.Header().Get("Vary"); got != "Origin" {
+			t.Fatalf("late handler Vary = %q, want Origin", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("late handler remained blocked after shutdown barrier release")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expired-context Stop did not finish after rejecting the late handler")
 	}
 }
 
@@ -1311,15 +1716,15 @@ func TestDeriveSourceAddr(t *testing.T) {
 //
 //   - TestRelay_RoutesOnlyByPubKeyFingerprint: routing is keyed strictly by the
 //     per-cell fingerprint (scope: "routes ONLY by fingerprint" + unknown -> 404).
-//   - TestRelay_DispatchesByCounterNeverDecryptsInner: the relay reads only the
-//     cleartext counter and materially cannot decrypt the inner body (scope:
-//     "dispatches by fingerprint + counter only, never decrypts the inner").
+//   - TestRelay_ReadsOnlyCleartextHeaderNeverDecryptsInner: the relay reads only
+//     bounded cleartext header metadata and materially cannot decrypt the inner
+//     body.
 //
 // The complementary halves are already covered and intentionally NOT repeated
 // here: verbatim opaque forwarding (RelayForwardMsg.InnerPacket byte-equality)
 // is asserted by TestRelay_TrustedHeaderForwardStampsAttestedRightmostXFF, and
-// counter-keyed ACK dispatch by TestRelay_DispatchToConcurrentWaiters /
-// TestRelay_SameClientSameCounter_NoOverwrite.
+// exact request-ID reply dispatch is asserted by
+// TestRelay_DispatchTargetsExactRequestIDAndServer.
 // ============================================================================
 
 // newTwoCellTestRelay builds a relay configured for two distinct cells, each
@@ -1477,35 +1882,39 @@ func TestRelay_RoutesOnlyByPubKeyFingerprint(t *testing.T) {
 	})
 }
 
-// TestRelay_DispatchesByCounterNeverDecryptsInner locks the second half of the
-// qURL v2 opacity invariant: the relay dispatches by the inner packet's
-// CLEARTEXT counter and CANNOT read the encrypted inner body (the qURL/knock
+// TestRelay_ReadsOnlyCleartextHeaderNeverDecryptsInner locks the second half of
+// the qURL v2 opacity invariant: the relay can inspect only bounded CLEARTEXT
+// header metadata and CANNOT read the encrypted inner body (the qURL/knock
 // semantics). It asserts both directions on the relay's own code paths:
 //
-//   - innerCounter(inner) returns the agent's counter, read from the cleartext
-//     header WITHOUT decryption (RecvPrecheck parses the header only); and
+//   - innerType(inner) validates the cleartext header and returns its type
+//     WITHOUT decryption (RecvPrecheck parses the header only); and
 //   - the relay's NHP_RELAY device cannot decrypt the inner packet — it is
 //     sealed to the cell SERVER's static key, not the relay's, so PacketToMsg
 //     fails. The relay literally lacks the key to read qURL claims.
 //
 // Verbatim opaque forwarding of those same bytes is fenced by
-// TestRelay_TrustedHeaderForwardStampsAttestedRightmostXFF; counter-keyed reply
-// dispatch by TestRelay_DispatchToConcurrentWaiters. Together they cover
-// "dispatches by fingerprint + counter only, never decrypts the inner packet".
-func TestRelay_DispatchesByCounterNeverDecryptsInner(t *testing.T) {
+// TestRelay_TrustedHeaderForwardStampsAttestedRightmostXFF; exact request-ID
+// return dispatch by TestRelay_DispatchTargetsExactRequestIDAndServer.
+func TestRelay_ReadsOnlyCleartextHeaderNeverDecryptsInner(t *testing.T) {
 	serverPub := devicePubKey(t, core.NHP_SERVER, keyBytes(0x40))
 	rs := newTestRelay(t, serverPub, 62206, SourceAddrModeRemoteAddr)
 
 	const counter = uint64(0xC0FFEE)
 	inner := makeInnerKnock(t, serverPub, counter)
 
-	// 1. The relay reads the counter from the cleartext header — no decryption.
-	got, err := rs.innerCounter(inner)
+	// 1. The relay validates the cleartext header type — no decryption. Inspect
+	// the packet header directly to prove the wire counter remains unchanged even
+	// though relay dispatch no longer reads or uses it.
+	gotType, err := rs.innerType(inner)
 	if err != nil {
-		t.Fatalf("innerCounter returned error for a well-formed inner knock: %v", err)
+		t.Fatalf("innerType returned error for a well-formed inner knock: %v", err)
 	}
-	if got != counter {
-		t.Errorf("innerCounter = %#x, want %#x (the counter is the only inner field the relay reads)", got, counter)
+	if gotType != core.NHP_KNK {
+		t.Errorf("innerType = %s, want NHP_KNK", core.HeaderTypeToString(gotType))
+	}
+	if gotCounter := (&core.Packet{Content: inner}).Counter(); gotCounter != counter {
+		t.Errorf("wire counter = %#x, want %#x", gotCounter, counter)
 	}
 
 	// 2. The relay's NHP_RELAY device cannot decrypt the inner packet: it is

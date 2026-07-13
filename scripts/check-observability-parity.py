@@ -229,11 +229,13 @@ def find_block(path: Path, kind: str, name: str) -> HclBlock:
     )
     match = pattern.search(text)
     if not match:
-        raise LintError(f"{path}: missing {kind} \"{name}\" block")
+        raise LintError(f'{path}: missing {kind} "{name}" block')
 
     open_brace = text.find("{", match.start())
     end = _scan_block_end(text, open_brace)
-    return HclBlock(path=path, kind=kind, name=name, body=text[open_brace + 1 : end - 1])
+    return HclBlock(
+        path=path, kind=kind, name=name, body=text[open_brace + 1 : end - 1]
+    )
 
 
 def find_blocks(path: Path, kind: str) -> list[HclBlock]:
@@ -330,14 +332,11 @@ def require_block_regex(block: HclBlock, pattern: str, reason: str) -> None:
 
 def has_metric_name(text: str, metric_name: str) -> bool:
     return (
-        re.search(rf'\bmetric_name\s*=\s*"{re.escape(metric_name)}"', text)
-        is not None
+        re.search(rf'\bmetric_name\s*=\s*"{re.escape(metric_name)}"', text) is not None
     )
 
 
-def require_hcl_map_entry(
-    block: HclBlock, key: str, value: str, reason: str
-) -> None:
+def require_hcl_map_entry(block: HclBlock, key: str, value: str, reason: str) -> None:
     if not re.search(
         rf'(?m)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*"{re.escape(value)}"[ \t]*$',
         block.body,
@@ -372,9 +371,7 @@ def map_assignment(block: HclBlock, key: str) -> dict[str, str] | None:
     return result
 
 
-def require_map_assignment(
-    block: HclBlock, key: str, expected: dict[str, str]
-) -> None:
+def require_map_assignment(block: HclBlock, key: str, expected: dict[str, str]) -> None:
     actual = map_assignment(block, key)
     expected_norm = {name: _normalise_expr(value) for name, value in expected.items()}
     where = _block_location(block)
@@ -434,7 +431,9 @@ def go_function_body(path: Path, name: str) -> str:
     return text[open_brace + 1 : end - 1]
 
 
-def require_go_function_text(path: Path, function: str, needle: str, reason: str) -> None:
+def require_go_function_text(
+    path: Path, function: str, needle: str, reason: str
+) -> None:
     for line in go_function_body(path, function).splitlines():
         # The pinned dim builders have no raw strings; add a fixture before
         # matching a future Go needle that can contain `//` inside backticks.
@@ -447,7 +446,7 @@ def require_go_function_text(path: Path, function: str, needle: str, reason: str
 def go_new_error_message(path: Path, name: str) -> str:
     text = _read(path)
     pattern = (
-        rf'(?ms)^[ \t]*{re.escape(name)}[ \t]*=[ \t]*'
+        rf"(?ms)^[ \t]*{re.escape(name)}[ \t]*=[ \t]*"
         r'newError\([^,]+,[ \t]*"(?P<message>[^"]+)"\)'
     )
     match = re.search(pattern, text)
@@ -578,8 +577,7 @@ def require_alarm_registry(
     if untracked:
         raise LintError(
             f"{monitoring}: {label} CloudWatch alarm(s) must be added to "
-            f"{names_hint}: "
-            + ", ".join(untracked)
+            f"{names_hint}: " + ", ".join(untracked)
         )
     return blocks
 
@@ -703,7 +701,9 @@ def check_shared_resources(repo: Path) -> None:
         "aws_cloudwatch_log_group.server_stderr.name",
     )
 
-    require_resource(monitoring_main, "aws_cloudwatch_log_metric_filter", "server_panic")
+    require_resource(
+        monitoring_main, "aws_cloudwatch_log_metric_filter", "server_panic"
+    )
     async_panic_filter = find_block(
         monitoring_main,
         'resource "aws_cloudwatch_log_metric_filter"',
@@ -801,9 +801,15 @@ def check_shared_resources(repo: Path) -> None:
         "comparison_operator",
         '"GreaterThanThreshold"',
     )
-    require_assignment(qurl_browser_rejected_ratio, "alarm_actions", "[aws_sns_topic.alerts.arn]")
-    require_assignment(qurl_browser_rejected_ratio, "ok_actions", "[aws_sns_topic.alerts.arn]")
-    require_assignment(qurl_browser_rejected_ratio, "treat_missing_data", '"notBreaching"')
+    require_assignment(
+        qurl_browser_rejected_ratio, "alarm_actions", "[aws_sns_topic.alerts.arn]"
+    )
+    require_assignment(
+        qurl_browser_rejected_ratio, "ok_actions", "[aws_sns_topic.alerts.arn]"
+    )
+    require_assignment(
+        qurl_browser_rejected_ratio, "treat_missing_data", '"notBreaching"'
+    )
     require_map_assignment(
         qurl_browser_rejected_ratio,
         "dimensions",

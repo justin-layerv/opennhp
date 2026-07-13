@@ -1,10 +1,8 @@
-# State-address migrations for #2628 (take nhp-server private).
+# Historical #2628 state-address migrations retained for indexed alarms.
 #
-# These three public-NLB alarms gained `count = var.nlb_alarms_enabled ? 1 : 0`.
-# Adding count to a previously un-indexed resource changes its state address
-# (`x` -> `x[0]`); these `moved {}` blocks rename the existing state in place so the
-# default (nlb_alarms_enabled = true, e.g. prod) shows NO diff — the alarms are not
-# destroyed+recreated — while the private path (sandbox) cleanly destroys them.
+# These three public-NLB alarms previously gained conditional count. They now use
+# constant `count = 1` because the assigned-cell public edge is invariant. The
+# moved blocks retain indexed state addresses and avoid recreating the alarms.
 # Permanent no-ops once applied; leave in place.
 
 moved {

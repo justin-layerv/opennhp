@@ -62,7 +62,7 @@ func TestDeriveMsgAssemblerData_DoesNotCarryChainKey(t *testing.T) {
 		ppd.chainKey[i] = 0xCD
 	}
 
-	mad := ppd.deriveMsgAssemblerData(NHP_ACK, false, nil)
+	mad := ppd.deriveMsgAssemblerData(NHP_ACK, false, nil, nil)
 	if mad == nil {
 		t.Fatal("deriveMsgAssemblerData returned nil")
 	}

@@ -4,6 +4,52 @@ NHP components publish application metrics to the **`LayerV/NHP`** CloudWatch
 namespace. Deploy automation publishes revocation deploy-window suppressor
 metrics to the deploy-only **`LayerV/NHP/Deploy`** namespace.
 
+## Sandbox Relay DMZ Telemetry
+
+The dedicated relay DMZ is sandbox-only; production remains relay-dark with
+`deploy_relay=false`. Once the sandbox DMZ is applied, its network boundary has
+two KMS-encrypted CloudWatch Logs sources:
+
+| Source | Log Group | Retention | Purpose |
+|--------|-----------|-----------|---------|
+| VPC Flow Logs (`ALL`, 60-second aggregation) | `/layerv/nhp/sandbox/relay-dmz/flow` | 30 days | Accepted/rejected IP flows, packet/original addresses, AWS service fields, flow direction, and traffic path |
+| Route 53 Resolver query logs | `/layerv/nhp/sandbox/relay-dmz/resolver` | 30 days | DNS allow/block decisions, including DNS Firewall rule action |
+
+The production retention contract is 365 days if a separate production-enable
+change ever creates the DMZ there. A dedicated relay-DMZ CMK encrypts these two
+groups; its CloudWatch Logs grant is restricted by caller account, regional Logs
+`kms:ViaService`, and encryption contexts naming exactly the Flow and Resolver
+log groups. The dedicated key adds roughly $1/month and avoids changing the
+shared Logs key or creating a production delta while production is relay-dark.
+The DGA, dictionary-DGA, and DNS-tunneling controls use Route 53 Resolver DNS
+Firewall Advanced, which adds its per-query analysis charge on top of standard
+DNS Firewall and query-log ingestion; include that variable usage cost in the
+sandbox budget and re-check current AWS pricing before any production enablement.
+
+VPC Flow Logs do **not** record queries sent to AmazonProvidedDNS. Resolver
+query logs are therefore the authoritative evidence for DNS allowlisting and
+tunneling/DGA blocks; do not infer DNS behavior from an absence of flow records.
+
+The relay has one public edge: the browser ALB on HTTPS 443. Its target-health,
+WAF, access-log, application, and `RelayShed` signals describe the HTTPS relay
+path only. The relay has no native NHP NLB alarms because it owns no public UDP
+edge.
+
+Direct SDK UDP telemetry belongs to the assigned cell's public NHP server NLB
+and server metrics. Deployment evidence includes a real external UDP 62206
+round trip to that server NLB plus listener/SG/Flow proof that no public UDP
+listener other than 62206 exists. A UDP timeout alone is not closure evidence.
+
+The Resolver log group's `BLOCK` events produce the no-dimension
+`LayerV/NHP/RelayDmzDnsBlocked` metric. The
+`<name-prefix>-relay-dmz-dns-blocked` alarm pages on the first blocked query and
+also emits an OK notification on recovery. The controlled functional-gate
+`example.com` lookup remains in Resolver logs but is excluded from this metric,
+so routine deploy verification does not page. Any other block means an
+unexpected runtime dependency or possible exfiltration attempt.
+See [Relay CloudWatch alarms](runbooks/relay-alarms.md) and the
+[sandbox DMZ replacement runbook](runbooks/sandbox-relay-dmz-replacement.md).
+
 ## Shared Dimensions
 
 Every metric includes these base dimensions:

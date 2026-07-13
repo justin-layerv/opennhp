@@ -4,13 +4,66 @@
 
 ### `build-and-push.yml` — Build & Deploy (Sandbox)
 
-Triggered on every push to `main` with app or infra changes. Builds Docker images, pushes to ECR, runs Terraform apply, and triggers instance refresh. Also runs on PRs (plan only, no deploy).
+Triggered on every push to `main` with app or infra changes. Builds Docker
+images, pushes to ECR, runs Terraform apply, and triggers instance refresh. Also
+runs on PRs (plan only, no deploy).
+
+For the sandbox relay DMZ, the workflow separates deployed proof into two hard
+gates. Immediately after Terraform apply it runs
+`scripts/check-relay-dmz-live.py --mode structural --environment sandbox
+--wait-seconds 300` to
+enumerate the live VPC, routes, SGs, endpoints and policies, DNS Firewall/query
+logging, browser ALB, absence of relay UDP/NLB resources, the assigned-cell
+public server NLB's sole UDP 62206 listener, WAF, canonical ASG handoff, exact
+fleet convergence, and
+absence of the pre-DMZ fleet. After `deploy-relay.sh` refreshes that canonical
+ASG and waits for convergence, functional mode runs with `--wait-seconds 600`
+and proves target health, SSM Online
+and Run Command, GuardDuty coverage, approved DNS resolution, catch-all DNS
+blocking, direct-public TCP isolation, the HTTPS target group, and active relay
+services. The later `qurl-relay-bootstrap-smoke` step proves the public browser
+hostname/path. The rollout runbook separately requires a real external SDK NHP
+round trip through the assigned cell's server NLB UDP 62206 listener and
+listener/SG/Flow proof that UDP 62207 is not public. WAF evidence applies only
+to the relay HTTP path; WAF cannot inspect direct server UDP.
+Neither live-detector mode is the warning-only general deployment validator.
+Production is unaffected because `deploy_relay=false` and has no relay fleet.
+
+The automatic push-to-main Terraform job is not authorized to perform the
+initial relay-DMZ cutover, recover a partial cutover, or mutate that security
+boundary. Its final plan checker uses `--require-dmz-boundary-noop` and fails
+before any Terraform state/taint/relay-refresh recovery and again before apply
+if the dedicated network/fleet, main-private route-table cutover,
+server return rule, assigned-cell public NHP edge, sandbox CI IAM, or durable ASG handoff
+would change.
+An operator must use the
+[sandbox relay DMZ replacement runbook](../../docs/runbooks/sandbox-relay-dmz-replacement.md)
+to review, archive, hash, and apply the exact saved plan. Rerun the failed
+workflow after that manual cutover; it proceeds only when every fenced address
+is a no-op. This intentional red-to-manual handoff prevents a merge-triggered
+job from applying a newly generated, unreviewed cutover plan.
 
 ### `terraform-plan-pr.yml` — Terraform Plan (PR)
 
 Runs on every PR so branch protection can require the check; the per-PR runner cost is an accepted tradeoff for a non-deadlocking required check. It skips without AWS credentials unless the PR touches Terraform plan inputs. Markdown-only changes under `terraform/` are treated as docs and do not request AWS credentials, including prod-environment markdown because docs are classified before the prod-only Terraform glob. Prod-only `terraform/environments/prod/**` PRs report `prod-only skipped` instead of hard-gating on unrelated sandbox state.
 
 For sandbox/shared Terraform PRs, the workflow assumes the sandbox-only `AWS_TERRAFORM_PLAN_PR_ROLE_ARN` OIDC role, runs `terraform plan -refresh=false -lock=false -var='cross_account_cost_analytics_role_arn='`, and updates a structured PR comment with add/change/destroy counts, status, and a run link. Detailed redacted failure excerpts stay in the workflow run summary and 7-day artifact rather than the durable PR comment; that artifact exposure assumes this repository stays private. The workflow never applies, but the role is still confidentiality-sensitive: it can read sandbox Terraform state, NHP-scoped SSM values including SecureStrings, Secrets Manager values, KMS-decrypted material, and account-wide IAM, CloudTrail, GuardDuty, Security Hub, and Config metadata needed for data sources and non-refreshing plan setup.
+
+When the relay DMZ is in the planned graph,
+`.github/scripts/check-relay-dmz-plan.py` consumes the actual
+`terraform show -json` artifact. It checks resource cardinality and the
+no-public-IP/no-default-route contract, the HTTPS-only relay ALB and SG, the
+assigned-cell server NLB's sole public UDP 62206 listener and exact target-group
+wiring, no public UDP 62207 or second UDP-capable edge, endpoint policies, S3
+allowlists, fail-closed DNS/query logging, the dedicated DMZ logs CMK
+conditions, and the narrow guardduty-data policy exception. Negative fixtures
+must prove each assertion can fail. This is structural PR evidence only: endpoint
+connectivity, DNS blocking, GuardDuty installation, authenticated UDP return,
+target health, browser relay behavior, a valid external SDK UDP 62206 round trip,
+and listener/SG/Flow negative proof that UDP 62207 is not public remain
+post-apply/post-refresh gates. Deploy
+and converge the compatible server return-envelope build before refreshing the
+relay build; the inverse order is not supported.
 
 The PR role uses a dedicated plan-read managed policy rather than the normal CI `terraform_read` policy, so future apply-role read expansions do not automatically widen the PR-time identity. `ssm:GetParameter*` is scoped to NHP environment paths, the three Auth0 public SPA-output parameters (`api-audience`, `domain`, `spa-client-id`), the shared registration public-key path, and the public Canonical AMI path. Adding another Auth0 SSM output requires an explicit policy and lint allowlist update. `ssm:GetDocument` is scoped to NHP and traefik-plugins sandbox document names. EC2 `Get*` is an explicit allowlist that excludes console output, console screenshots, launch-template data, and password data. S3 object-content reads are scoped to Terraform state plus NHP-managed/plugin bucket patterns. Secrets Manager reads are scoped to `Describe*`/`Get*` on NHP secrets with no account-wide `ListSecrets`. DynamoDB access is metadata-only (`Describe*`/`List*`) with no item reads, so the PR plan runs without live refresh rather than granting access to `aws_dynamodb_table_item` row contents. SQS reads are limited to queue attributes, queue URL, and queue tags on `layerv-nhp-*` queues; ElastiCache reads are `Describe*`/`List*`; API Gateway reads use `apigateway:GET` and are treated as value-bearing by the lint because API Gateway can return plaintext API key values. The cross-account cost-analytics provider assume-role is disabled only for this PR plan, so the PR role does not need `sts:AssumeRole` into the billing account. KMS metadata reads intentionally use `StringEqualsIfExists` because some KMS list APIs do not carry `aws:ResourceAccount` and can therefore expose metadata beyond a strict sandbox-account-only boundary; `kms:Decrypt` is constrained to the Terraform state alias plus NHP key aliases with `kms:ResourceAliases`.
 

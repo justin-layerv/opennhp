@@ -246,6 +246,92 @@ DATA_SOURCE_ACTIONS: dict[str, ActionSpec] = {
 # `resource-metric-alarm-tag-gap` fixture fences the regression: an
 # *untagged* alarm whose apply role lacks a tag verb must still flag.
 RESOURCE_ACTIONS: dict[str, ActionSpec] = {
+    # internal/service/ec2/vpc_route.go — standalone route CRUD uses
+    # CreateRoute, ReplaceRoute, DeleteRoute, and DescribeRouteTables.
+    # Route-table and endpoint-owned inline routes are separate resources.
+    "aws_route": [
+        "ec2:CreateRoute",
+        "ec2:ReplaceRoute",
+        "ec2:DeleteRoute",
+        "ec2:DescribeRouteTables",
+    ],
+    # internal/service/ec2/vpc_peering_connection.go — same-account
+    # auto_accept exercises both create and accept; default_tags exercise the
+    # EC2 tag pair. Read/delete complete the lifecycle.
+    "aws_vpc_peering_connection": [
+        "ec2:CreateVpcPeeringConnection",
+        "ec2:AcceptVpcPeeringConnection",
+        "ec2:DeleteVpcPeeringConnection",
+        "ec2:DescribeVpcPeeringConnections",
+        "ec2:CreateTags",
+        "ec2:DeleteTags",
+    ],
+    # internal/service/ec2/vpc_peering_connection_options.go — both requester
+    # and accepter DNS options are applied through the same modify API.
+    "aws_vpc_peering_connection_options": [
+        "ec2:ModifyVpcPeeringConnectionOptions",
+        "ec2:DescribeVpcPeeringConnections",
+    ],
+    # internal/service/route53resolver/resolver_query_log_config.go.
+    "aws_route53_resolver_query_log_config": [
+        "route53resolver:CreateResolverQueryLogConfig",
+        "route53resolver:GetResolverQueryLogConfig",
+        "route53resolver:DeleteResolverQueryLogConfig",
+        "route53resolver:ListTagsForResource",
+        "route53resolver:TagResource",
+        "route53resolver:UntagResource",
+    ],
+    # internal/service/route53resolver/resolver_query_log_config_association.go.
+    # The first association may create Resolver's service-linked role.
+    "aws_route53_resolver_query_log_config_association": [
+        "route53resolver:AssociateResolverQueryLogConfig",
+        "route53resolver:GetResolverQueryLogConfigAssociation",
+        "route53resolver:DisassociateResolverQueryLogConfig",
+        "iam:CreateServiceLinkedRole",
+    ],
+    # internal/service/route53resolver/firewall_domain_list.go — domains are
+    # populated and changed through UpdateFirewallDomains after list creation.
+    "aws_route53_resolver_firewall_domain_list": [
+        "route53resolver:CreateFirewallDomainList",
+        "route53resolver:GetFirewallDomainList",
+        "route53resolver:ListFirewallDomains",
+        "route53resolver:UpdateFirewallDomains",
+        "route53resolver:DeleteFirewallDomainList",
+        "route53resolver:ListTagsForResource",
+        "route53resolver:TagResource",
+        "route53resolver:UntagResource",
+    ],
+    # internal/service/route53resolver/firewall_rule_group.go.
+    "aws_route53_resolver_firewall_rule_group": [
+        "route53resolver:CreateFirewallRuleGroup",
+        "route53resolver:GetFirewallRuleGroup",
+        "route53resolver:DeleteFirewallRuleGroup",
+        "route53resolver:ListTagsForResource",
+        "route53resolver:TagResource",
+        "route53resolver:UntagResource",
+    ],
+    # internal/service/route53resolver/firewall_rule.go.
+    "aws_route53_resolver_firewall_rule": [
+        "route53resolver:CreateFirewallRule",
+        "route53resolver:ListFirewallRules",
+        "route53resolver:UpdateFirewallRule",
+        "route53resolver:DeleteFirewallRule",
+    ],
+    # internal/service/route53resolver/firewall_rule_group_association.go.
+    "aws_route53_resolver_firewall_rule_group_association": [
+        "route53resolver:AssociateFirewallRuleGroup",
+        "route53resolver:GetFirewallRuleGroupAssociation",
+        "route53resolver:UpdateFirewallRuleGroupAssociation",
+        "route53resolver:DisassociateFirewallRuleGroup",
+        "route53resolver:ListTagsForResource",
+        "route53resolver:TagResource",
+        "route53resolver:UntagResource",
+    ],
+    # internal/service/route53resolver/firewall_config.go.
+    "aws_route53_resolver_firewall_config": [
+        "route53resolver:GetFirewallConfig",
+        "route53resolver:UpdateFirewallConfig",
+    ],
     # internal/service/cloudwatch/metric_alarm.go — PutMetricAlarm on
     # create/update, DescribeAlarms on read, DeleteAlarms on destroy, and
     # the tag trio (ListTagsForResource read + TagResource/UntagResource)

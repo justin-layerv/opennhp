@@ -37,7 +37,6 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 import re
 import sys
 from collections import Counter
@@ -73,6 +72,12 @@ EXPECTED_SANDBOX_DMZ_RESOLVER_LOG_GROUP_ARN = (
 )
 EXPECTED_SANDBOX_MAIN_VPC_CIDR = "10.100.0.0/16"
 EXPECTED_SANDBOX_RELAY_VPC_CIDR = "10.101.0.0/16"
+EXPECTED_SANDBOX_CELL_ID = "cell0"
+EXPECTED_SANDBOX_SERVER_NLB_NAME = "layerv-nhp-sandbox-nlb"
+EXPECTED_SANDBOX_SERVER_UDP_TG_NAME = "layerv-nhp-sandbox-udp"
+EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME = "layerv-nhp-sandbox-udp-grn"
+EXPECTED_SANDBOX_INTERNAL_UDP_TG_NAME = "layerv-nhp-sandbox-srv-int-udp"
+EXPECTED_SANDBOX_INTERNAL_UDP_GREEN_TG_NAME = "layerv-nhp-sandbox-srv-int-grn"
 EXPECTED_SANDBOX_RELAY_SUBNET_CIDRS = {
     "public": ("10.101.0.0/24", "10.101.1.0/24", "10.101.2.0/24"),
     "relay": ("10.101.10.0/24", "10.101.11.0/24", "10.101.12.0/24"),
@@ -86,8 +91,6 @@ EXPECTED_RELAY_ACK_PORT = 62207
 EXPECTED_DEREGISTRATION_DELAY = 30
 EXPECTED_METRIC_NAMESPACE = "LayerV/NHP"
 EXPECTED_RELAY_HEALTH_PATH = "/health/live"
-EXPECTED_NATIVE_RELAY_HEALTH_PATH = "/health/native-ready"
-EXPECTED_SANDBOX_NATIVE_NHP_FQDN = "native.nhp.layerv.xyz"
 EXPECTED_DNS_THREAT_CONFIDENCE = "HIGH"
 
 
@@ -313,9 +316,11 @@ DMZ_BOUNDARY_ADDRESS_PATTERNS = (
     re.compile(
         r"(?:^|\.)module\.compute(?:\[[^]]+\])?\."
         r"(?:aws_lb\.server|"
-        r"aws_lb_listener\.udp|"
-        r"aws_lb_target_group\.(?:udp|udp_green)|"
-        r"aws_autoscaling_attachment\.server|"
+        r"aws_lb\.server_internal|"
+        r"aws_lb_listener\.(?:udp|udp_internal)|"
+        r"aws_lb_target_group\.(?:udp|udp_green|udp_internal|udp_internal_green)|"
+        r"aws_autoscaling_attachment\.(?:server|server_internal)|"
+        r"aws_autoscaling_group\.server_green|"
         r"aws_vpc_security_group_ingress_rule\.server_nhp_udp(?:_additional)?)"
         r"(?:\[|$)"
     ),
@@ -330,6 +335,8 @@ DMZ_BOUNDARY_ADDRESS_PATTERNS = (
         r"(?:^|\.)(?:"
         r"time_sleep\.relay_dmz_iam_propagation|"
         r"terraform_data\.relay_dmz_preconditions|"
+        r"terraform_data\.relay_cell_routing|"
+        r"terraform_data\.relay_network_ready|"
         r"aws_cloudwatch_metric_alarm\.relay_dmz_dns_blocked|"
         r"aws_route53_record\.relay_alias|"
         r"aws_ssm_parameter\.relay_asg_name)(?:\[|$)"
@@ -573,6 +580,10 @@ def config_output_refs(module: dict[str, Any] | None, name: str) -> set[str]:
 
 
 def references(value: Any) -> set[str]:
+    # Terraform 1.14.x serializes a module-output traversal as both the leaf and
+    # its enclosing module (for example, module.compute.nlb_dns_name plus
+    # module.compute). Exact graph contracts must pin both; a Terraform upgrade
+    # that changes this shape requires the documented real-plan recapture.
     found: set[str] = set()
     if isinstance(value, dict):
         raw_refs = value.get("references")
@@ -2226,37 +2237,57 @@ def validate_plan(
         == {"module.compute.security_group_id", "module.compute"},
         "relay private UDP 62207 return source must come from the canonical server security group",
     )
-    v.require(
-        {"var.environment", "var.cell_id"}.issubset(
-            call_refs(relay_call, "native_server")
-        ),
-        "relay native_server must explicitly select the environment cell instead of relying on server-list cardinality",
+    relay_cell_routing_config = config_resource(
+        v, parent_module, "terraform_data", "relay_cell_routing"
     )
     v.require(
-        call_refs(relay_call, "native_nhp_edge_enabled")
-        == {"var.relay_native_edge_enabled"},
-        "relay native NHP edge must use the explicit staging gate so deploy_relay alone remains dark",
-    )
-    native_edge_preconditions = config_resource(
-        v, parent_module, "terraform_data", "relay_native_edge_preconditions"
+        references((relay_cell_routing_config or {}).get("count_expression"))
+        == {"var.deploy_relay"}
+        and expression_refs(relay_cell_routing_config, "input")
+        == {
+            "var.environment",
+            "var.cell_id",
+            "module.compute.server_public_key_b64",
+            "module.compute.internal_nlb_dns_name",
+            "module.compute",
+        },
+        "relay cell-routing contract must share the relay fleet gate and come from the canonical compute key and internal server NLB",
     )
     v.require(
-        references((native_edge_preconditions or {}).get("count_expression"))
-        == {"var.relay_native_edge_enabled"},
-        "native-edge coherence preconditions must be gated directly by relay_native_edge_enabled",
+        call_refs(relay_call, "cell_servers")
+        == {
+            "terraform_data.relay_cell_routing[0].input",
+            "terraform_data.relay_cell_routing[0]",
+            "terraform_data.relay_cell_routing",
+        },
+        "relay cell_servers must come from the plan-visible cell-routing contract",
     )
-
-    def has_relay_native_output(refs: set[str], output_name: str) -> bool:
-        # TODO(#3154): sandbox owns relay at root module.relay. The production
-        # profile must make this matcher parent-prefix-aware before it permits
-        # a nested/counted relay call; do not reuse this root-only regex there.
-        return any(
-            re.fullmatch(
-                rf"module\.relay(?:\[[^]]+\])?(?:\.\*)?\.{re.escape(output_name)}",
-                ref,
+    relay_cell_routing = v.one(
+        (
+            resource
+            for resource in resources
+            if address_is_scoped_resource(
+                resource.address,
+                parent_prefix,
+                "terraform_data",
+                "relay_cell_routing",
             )
-            for ref in refs
-        )
+        ),
+        "plan-visible relay cell-routing contract",
+    )
+    authoritative_cell_servers = (
+        relay_cell_routing.values.get("input")
+        if relay_cell_routing is not None
+        else None
+    )
+    dmz_iam_wait_config = config_resource(
+        v, parent_module, "time_sleep", "relay_dmz_iam_propagation"
+    )
+    v.require(
+        set((dmz_iam_wait_config or {}).get("depends_on") or [])
+        == {"terraform_data.relay_dmz_preconditions"},
+        "relay-DMZ IAM propagation wait must preserve the root CIDR-overlap precondition dependency",
+    )
 
     dns_call = (
         (parent_module.get("module_calls") or {}).get("dns")
@@ -2266,58 +2297,15 @@ def validate_plan(
     dns_name_refs = call_refs(dns_call, "nlb_dns_name")
     dns_zone_refs = call_refs(dns_call, "nlb_zone_id")
     v.require(
-        has_relay_native_output(dns_name_refs, "native_nlb_dns_name")
-        and has_relay_native_output(dns_zone_refs, "native_nlb_zone_id")
-        and "var.take_server_private" in dns_name_refs
-        and "var.take_server_private" in dns_zone_refs
-        and "module.compute.nlb_dns_name" in dns_name_refs
-        and "module.compute.nlb_zone_id" in dns_zone_refs,
-        "take_server_private must repoint public NHP DNS to the relay native NLB",
+        dns_name_refs == {"module.compute.nlb_dns_name", "module.compute"}
+        and dns_zone_refs == {"module.compute.nlb_zone_id", "module.compute"},
+        "public NHP DNS must target the assigned cell's server NLB directly",
     )
     public_nlb_output_refs = config_output_refs(parent_module, "nlb_dns_name")
     v.require(
-        has_relay_native_output(public_nlb_output_refs, "native_nlb_dns_name")
-        and "var.take_server_private" in public_nlb_output_refs
-        and "module.compute.nlb_dns_name" in public_nlb_output_refs,
-        "public nlb_dns_name output must select the relay native NLB when the server is private",
-    )
-    native_fqdn_output_refs = config_output_refs(parent_module, "native_nhp_fqdn")
-    v.require(
-        "local.native_nhp_fqdn" in native_fqdn_output_refs
-        and {
-            "var.relay_native_edge_enabled",
-            "var.hosted_zone",
-            "var.hosted_zone_id",
-        }.issubset(native_fqdn_output_refs),
-        "native_nhp_fqdn output must expose the stable root-owned native hostname only while the staged edge and DNS are configured",
-    )
-    native_dns_config = config_resource(
-        v, parent_module, "aws_route53_record", "native_nhp"
-    )
-    v.require(
-        references((native_dns_config or {}).get("count_expression"))
-        == {
-            "var.relay_native_edge_enabled",
-            "var.hosted_zone",
-            "var.hosted_zone_id",
-        },
-        "stable native NHP DNS must be absent until the explicit native-edge stage and then exist whenever DNS is configured",
-    )
-    v.require(
-        expression_refs(native_dns_config, "name") == {"local.native_nhp_fqdn"}
-        and expression_refs(native_dns_config, "zone_id") == {"local.main_zone_id"},
-        "stable native NHP DNS must use the canonical native hostname in the resolved main zone",
-    )
-    native_dns_alias_refs = expression_refs(native_dns_config, "alias")
-    v.require(
-        has_relay_native_output(native_dns_alias_refs, "native_nlb_dns_name")
-        and has_relay_native_output(native_dns_alias_refs, "native_nlb_zone_id")
-        and {
-            "var.take_server_private",
-            "module.compute.nlb_dns_name",
-            "module.compute.nlb_zone_id",
-        }.issubset(native_dns_alias_refs),
-        "stable native NHP DNS alias must switch from the server NLB to the relay native NLB at take_server_private",
+        public_nlb_output_refs
+        == {"module.compute.nlb_dns_name", "module.compute"},
+        "public nlb_dns_name output must expose the assigned cell's server NLB",
     )
 
     for tier, expected_subnet_refs, expected_route_table_refs in (
@@ -2365,9 +2353,6 @@ def validate_plan(
         v, network_config, "aws_security_group", "endpoints"
     )
     alb_sg_config = config_resource(v, relay_config, "aws_security_group", "alb")
-    native_nhp_sg_config = config_resource(
-        v, relay_config, "aws_security_group", "native_nhp"
-    )
     relay_sg_config = config_resource(v, relay_config, "aws_security_group", "relay")
     v.require(
         has_explicit_empty_rule_lists(endpoint_sg_config),
@@ -2377,30 +2362,6 @@ def validate_plan(
         has_explicit_empty_rule_lists(alb_sg_config),
         "relay ALB SG must declare explicit empty inline ingress and egress lists",
     )
-    v.require(
-        has_explicit_empty_rule_lists(native_nhp_sg_config),
-        "native NHP NLB SG must declare explicit empty inline ingress and egress lists",
-    )
-    native_gated_resources = (
-        ("aws_security_group", "native_nhp"),
-        ("aws_vpc_security_group_ingress_rule", "native_nhp_udp"),
-        ("aws_vpc_security_group_egress_rule", "native_nhp_to_relay_udp"),
-        ("aws_vpc_security_group_egress_rule", "native_nhp_health_to_relay"),
-        ("aws_vpc_security_group_ingress_rule", "relay_native_udp_from_nlb"),
-        ("aws_vpc_security_group_ingress_rule", "relay_health_from_nlb"),
-        ("aws_lb", "native_nhp"),
-        ("aws_lb_target_group", "native_nhp"),
-        ("aws_lb_listener", "native_nhp_udp"),
-        ("aws_cloudwatch_metric_alarm", "relay_native_nlb_unhealthy_targets"),
-        ("aws_cloudwatch_metric_alarm", "relay_native_nlb_zero_healthy_targets"),
-    )
-    for resource_type, resource_name in native_gated_resources:
-        resource_config = config_resource(v, relay_config, resource_type, resource_name)
-        v.require(
-            references((resource_config or {}).get("count_expression"))
-            == {"var.native_nhp_edge_enabled"},
-            f"{resource_type}.{resource_name} must be gated directly by native_nhp_edge_enabled",
-        )
     relay_sg_expressions = (relay_sg_config or {}).get("expressions") or {}
     v.require(
         relay_sg_config is not None
@@ -2473,6 +2434,62 @@ def validate_plan(
         (parent_module.get("module_calls") or {}).get("relay_network")
         if isinstance(parent_module, dict)
         else None
+    )
+    v.require(
+        not (relay_network_call or {}).get("depends_on")
+        and not (relay_call or {}).get("depends_on"),
+        "relay network and fleet module calls must not use broad depends_on edges that defer security policy rendering",
+    )
+    v.require(
+        call_refs(relay_network_call, "apply_role_ready_token")
+        == {
+            "time_sleep.relay_dmz_iam_propagation[0].id",
+            "time_sleep.relay_dmz_iam_propagation[0]",
+            "time_sleep.relay_dmz_iam_propagation",
+        },
+        "relay network apply barrier must consume only the IAM propagation token",
+    )
+    apply_ready_config = config_resource(
+        v, network_config, "terraform_data", "apply_role_ready"
+    )
+    v.require(
+        expression_refs(apply_ready_config, "input") == {"var.apply_role_ready_token"},
+        "relay network apply barrier must be driven directly by its root readiness input",
+    )
+    for resource_type, resource_name in (
+        ("aws_vpc", "relay"),
+        ("aws_kms_key", "logs"),
+        ("aws_iam_role", "flow"),
+        ("aws_route53_resolver_firewall_domain_list", "allow"),
+        ("aws_route53_resolver_firewall_domain_list", "all"),
+        ("aws_route53_resolver_firewall_rule_group", "relay"),
+    ):
+        gated_config = config_resource(v, network_config, resource_type, resource_name)
+        v.require(
+            set((gated_config or {}).get("depends_on") or [])
+            == {"terraform_data.apply_role_ready"},
+            f"relay network DAG root {resource_type}.{resource_name} must wait only on the apply-role readiness barrier",
+        )
+    network_ready_config = config_resource(
+        v, parent_module, "terraform_data", "relay_network_ready"
+    )
+    v.require(
+        references((network_ready_config or {}).get("count_expression"))
+        == {"var.deploy_relay"}
+        and expression_refs(network_ready_config, "input")
+        == {"module.relay_network[0].vpc_id", "module.relay_network[0]"}
+        and set((network_ready_config or {}).get("depends_on") or [])
+        == {"module.relay_network"},
+        "root relay-network readiness barrier must wait for the complete count-gated DMZ module",
+    )
+    v.require(
+        call_refs(relay_call, "network_ready_token")
+        == {
+            "terraform_data.relay_network_ready[0].output",
+            "terraform_data.relay_network_ready[0]",
+            "terraform_data.relay_network_ready",
+        },
+        "relay fleet must consume only the complete relay-network readiness token",
     )
     v.require(
         "module.networking.private_route_table_ids"
@@ -2615,8 +2632,8 @@ def validate_plan(
         v.require(
             target_group.values.get("protocol") == "HTTPS"
             and target_group.values.get("port") == EXPECTED_RELAY_BACKEND_PORT
-            # Same schema-native string / defensive integer contract as the
-            # native target group below.
+            # Accept the provider's schema-native string while rejecting
+            # non-integral or alternative values.
             and matches_exact_int_or_int_string(
                 target_group.values.get("deregistration_delay"),
                 EXPECTED_DEREGISTRATION_DELAY,
@@ -2625,145 +2642,6 @@ def validate_plan(
             and health[0].get("protocol") == "HTTPS"
             and health[0].get("path") == EXPECTED_RELAY_HEALTH_PATH,
             f"relay target group must use HTTPS:8080, {EXPECTED_DEREGISTRATION_DELAY}s draining, and /health/live",
-        )
-    native_target_group = v.one(
-        relay_named("aws_lb_target_group", "native_nhp"),
-        "native NHP UDP target group",
-    )
-    if native_target_group:
-        health = native_target_group.values.get("health_check") or []
-        v.require(
-            native_target_group.values.get("protocol") == "UDP"
-            and native_target_group.values.get("port") == EXPECTED_NHP_SERVER_PORT
-            and native_target_group.values.get("target_type") == "instance"
-            and native_target_group.values.get("preserve_client_ip") == "true"
-            # The provider's schema-native value is the decimal string; accept
-            # an exact JSON integer only as a defensive cross-version fallback.
-            and matches_exact_int_or_int_string(
-                native_target_group.values.get("deregistration_delay"),
-                EXPECTED_DEREGISTRATION_DELAY,
-            )
-            and len(health) == 1
-            and health[0].get("enabled") is True
-            and health[0].get("protocol") == "HTTPS"
-            and health[0].get("port") == str(EXPECTED_RELAY_BACKEND_PORT)
-            and health[0].get("path") == EXPECTED_NATIVE_RELAY_HEALTH_PATH
-            and health[0].get("matcher") == "200"
-            and health[0].get("healthy_threshold") == 2
-            and health[0].get("unhealthy_threshold") == 2
-            and health[0].get("interval") == 15
-            and health[0].get("timeout") == 5,
-            f"native NHP target group must be instance UDP:62206 with {EXPECTED_DEREGISTRATION_DELAY}s draining, client IP preservation, and HTTPS:8080 /health/native-ready checks",
-        )
-    native_nlb = v.one(relay_named("aws_lb", "native_nhp"), "public native NHP NLB")
-    if native_nlb:
-        v.require(
-            native_nlb.values.get("internal") is False
-            and native_nlb.values.get("load_balancer_type") == "network",
-            "native NHP ingress must be one internet-facing network load balancer",
-        )
-        v.require(
-            native_nlb.values.get("ip_address_type") == "ipv4"
-            and native_nlb.values.get("enable_cross_zone_load_balancing") is True
-            and native_nlb.values.get("enable_deletion_protection") is False,
-            "sandbox native NHP NLB must be IPv4, cross-zone, and rollback-deletable",
-        )
-        native_tags = native_nlb.values.get("tags") or {}
-        v.require(
-            native_tags.get("Environment") == "sandbox"
-            and native_tags.get("Service") == "nhp-relay"
-            and native_tags.get("Component") == "relay"
-            and native_tags.get("Name") == "layerv-nhp-sandbox-relay-nhp",
-            "native NHP NLB must retain exact sandbox relay ownership tags",
-        )
-    native_unhealthy_alarm = v.one(
-        relay_named(
-            "aws_cloudwatch_metric_alarm", "relay_native_nlb_unhealthy_targets"
-        ),
-        "native NHP partial target-loss alarm",
-    )
-    if native_unhealthy_alarm:
-        v.require(
-            native_unhealthy_alarm.values.get("namespace") == "AWS/NetworkELB"
-            and native_unhealthy_alarm.values.get("metric_name") == "UnHealthyHostCount"
-            and native_unhealthy_alarm.values.get("comparison_operator")
-            == "GreaterThanThreshold"
-            and native_unhealthy_alarm.values.get("threshold") == 0
-            and native_unhealthy_alarm.values.get("statistic") == "Maximum"
-            and native_unhealthy_alarm.values.get("period") == 60
-            and native_unhealthy_alarm.values.get("evaluation_periods") == 2
-            and native_unhealthy_alarm.values.get("datapoints_to_alarm") == 2
-            and native_unhealthy_alarm.values.get("treat_missing_data")
-            == "notBreaching",
-            "native NHP NLB must alarm on any sustained unready target",
-        )
-    native_zero_alarm = v.one(
-        relay_named(
-            "aws_cloudwatch_metric_alarm", "relay_native_nlb_zero_healthy_targets"
-        ),
-        "native NHP zero-ready-target alarm",
-    )
-    if native_zero_alarm:
-        v.require(
-            native_zero_alarm.values.get("namespace") == "AWS/NetworkELB"
-            and native_zero_alarm.values.get("metric_name") == "HealthyHostCount"
-            and native_zero_alarm.values.get("comparison_operator")
-            == "LessThanThreshold"
-            and native_zero_alarm.values.get("threshold") == 1
-            and native_zero_alarm.values.get("statistic") == "Minimum"
-            and native_zero_alarm.values.get("period") == 60
-            and native_zero_alarm.values.get("evaluation_periods") == 2
-            and native_zero_alarm.values.get("datapoints_to_alarm") == 2
-            and native_zero_alarm.values.get("treat_missing_data") == "breaching",
-            "native NHP NLB must alarm when no ready target remains",
-        )
-    native_dns = v.one(
-        resources_named(resources, "aws_route53_record", "native_nhp"),
-        "stable native NHP DNS alias",
-    )
-    if native_dns:
-        aliases = native_dns.values.get("alias") or []
-        alias_name = aliases[0].get("name") if len(aliases) == 1 else None
-        alias_zone_id = aliases[0].get("zone_id") if len(aliases) == 1 else None
-        native_nlb_dns_name = (
-            native_nlb.values.get("dns_name") if native_nlb is not None else None
-        )
-        native_nlb_zone_id = (
-            native_nlb.values.get("zone_id") if native_nlb is not None else None
-        )
-
-        # Fresh NLB plans commonly leave both sides unknown. The exact config-graph
-        # references above are authoritative until Terraform supplies concrete values;
-        # compare planned values only when both sides are known.
-        alias_name_matches = (
-            alias_name is None
-            or native_nlb_dns_name is None
-            or alias_name == native_nlb_dns_name
-        )
-        alias_zone_matches = (
-            alias_zone_id is None
-            or native_nlb_zone_id is None
-            or alias_zone_id == native_nlb_zone_id
-        )
-        v.require(
-            native_dns.values.get("name") == EXPECTED_SANDBOX_NATIVE_NHP_FQDN
-            and native_dns.values.get("type") == "A"
-            and len(aliases) == 1
-            and aliases[0].get("evaluate_target_health") is True
-            and native_nlb is not None
-            and alias_name_matches
-            and alias_zone_matches,
-            "stable native.nhp.layerv.xyz alias must target the cutover relay native NLB",
-        )
-    native_listener = v.one(
-        relay_named("aws_lb_listener", "native_nhp_udp"),
-        "native NHP UDP listener",
-    )
-    if native_listener:
-        v.require(
-            native_listener.values.get("protocol") == "UDP"
-            and native_listener.values.get("port") == EXPECTED_NHP_SERVER_PORT,
-            "native NHP NLB listener set must expose UDP 62206 only",
         )
     https_listener = v.one(
         relay_named("aws_lb_listener", "https"), "relay HTTPS listener"
@@ -2774,40 +2652,10 @@ def validate_plan(
             and https_listener.values.get("port") == EXPECTED_HTTPS_PORT,
             "relay HTTPS listener must expose TCP/HTTPS 443 only",
         )
-    native_listener_config = config_resource(
-        v, relay_config, "aws_lb_listener", "native_nhp_udp"
-    )
-    v.require(
-        references_exact_resources(
-            expression_refs(native_listener_config, "load_balancer_arn"),
-            {"aws_lb.native_nhp"},
-        )
-        and references_exact_resources(
-            expression_refs(native_listener_config, "default_action"),
-            {"aws_lb_target_group.native_nhp"},
-        ),
-        "native NHP UDP listener must forward only to the native relay instance target group",
-    )
-    native_nlb_config = config_resource(v, relay_config, "aws_lb", "native_nhp")
-    native_target_group_config = config_resource(
-        v, relay_config, "aws_lb_target_group", "native_nhp"
-    )
-    v.require(
-        references_exact_resources(
-            expression_refs(native_nlb_config, "security_groups"),
-            {"aws_security_group.native_nhp"},
-        )
-        and expression_refs(native_nlb_config, "subnets") == {"var.public_subnet_ids"},
-        "native NHP NLB must use only its SG and the relay-DMZ public subnets",
-    )
-    v.require(
-        expression_refs(native_target_group_config, "vpc_id") == {"var.vpc_id"},
-        "native NHP target group must live in the relay-DMZ VPC",
-    )
     v.require(
         {resource.name for resource in relay if resource.resource_type == "aws_lb"}
-        == {"relay", "native_nhp"},
-        "relay module load-balancer inventory must be exactly the HTTPS ALB and native NHP NLB",
+        == {"relay"},
+        "relay module load-balancer inventory must be exactly the HTTPS ALB",
     )
     v.require(
         {
@@ -2815,15 +2663,31 @@ def validate_plan(
             for resource in relay
             if resource.resource_type == "aws_lb_listener"
         }
-        == {"https", "native_nhp_udp"},
-        "relay module listener inventory must be exactly HTTPS 443 and native UDP 62206",
+        == {"https"},
+        "relay module listener inventory must be exactly HTTPS 443",
     )
     alb = v.one(relay_named("aws_lb", "relay"), "public relay ALB")
     if alb:
+        access_logs = alb.values.get("access_logs") or []
         v.require(
             alb.values.get("internal") is False
             and alb.values.get("load_balancer_type") == "application",
             "relay ingress must be an internet-facing application load balancer",
+        )
+        v.require(
+            alb.values.get("enable_deletion_protection") is False
+            and alb.values.get("idle_timeout") == 30
+            and alb.values.get("drop_invalid_header_fields") is True
+            and alb.values.get("desync_mitigation_mode") == "defensive"
+            and alb.values.get("xff_header_processing_mode") == "append"
+            and alb.values.get("enable_xff_client_port") is False
+            and alb.values.get("enable_waf_fail_open") is False
+            and len(access_logs) == 1
+            and access_logs[0].get("enabled") is True
+            and access_logs[0].get("bucket")
+            == f"layerv-nhp-sandbox-relay-alb-logs-{EXPECTED_SANDBOX_ACCOUNT_ID}"
+            and access_logs[0].get("prefix") in (None, ""),
+            "relay ALB must retain exact deletion protection, WAF/XFF/HTTP hardening, and access-log destination",
         )
         if vpc.actions == ("create",) and alb.before and alb.before.get("vpc_id"):
             v.require(
@@ -2842,16 +2706,58 @@ def validate_plan(
             "relay ASG must be the three-instance DMZ fleet with ELB health",
         )
     asg_config = config_resource(v, relay_config, "aws_autoscaling_group", "relay")
-    v.require(
-        "var.native_nhp_edge_enabled"
-        in expression_refs(asg_config, "target_group_arns")
-        and references_exact_resources(
-            expression_refs(asg_config, "target_group_arns"),
-            {"aws_lb_target_group.relay", "aws_lb_target_group.native_nhp"},
-            allowed_metadata=frozenset({"var.native_nhp_edge_enabled"}),
-        ),
-        "relay ASG must attach to exactly the HTTPS and native UDP target groups",
+    alb_config = config_resource(v, relay_config, "aws_lb", "relay")
+    relay_ready_config = config_resource(
+        v, relay_config, "terraform_data", "network_ready"
     )
+    fleet_security_ready_config = config_resource(
+        v, relay_config, "terraform_data", "fleet_security_ready"
+    )
+    v.require(
+        expression_refs(relay_ready_config, "input") == {"var.network_ready_token"},
+        "relay child readiness barrier must be driven directly by the root network token",
+    )
+    expected_fleet_security_dependencies = {
+        "aws_vpc_security_group_ingress_rule.alb_https",
+        "aws_vpc_security_group_egress_rule.alb_to_relay",
+        "aws_vpc_security_group_ingress_rule.relay_http_from_alb",
+        "aws_vpc_security_group_ingress_rule.relay_udp_ack_return",
+        "aws_vpc_security_group_egress_rule.relay_to_nhp_udp",
+        "aws_vpc_security_group_egress_rule.relay_to_vpc_endpoints_https",
+        "aws_vpc_security_group_ingress_rule.vpc_endpoints_from_relay",
+        "aws_vpc_security_group_egress_rule.relay_to_s3_https",
+    }
+    v.require(
+        expression_refs(fleet_security_ready_config, "input")
+        == {"aws_security_group.relay.id", "aws_security_group.relay"}
+        and set((fleet_security_ready_config or {}).get("depends_on") or [])
+        == expected_fleet_security_dependencies,
+        "relay fleet security barrier must wait for every mandatory standalone SG path",
+    )
+    v.require(
+        set((alb_config or {}).get("depends_on") or [])
+        == {
+            "aws_s3_bucket_policy.alb_access_logs",
+            "terraform_data.network_ready",
+        },
+        "public relay ALB must wait for complete DMZ network readiness",
+    )
+    v.require(
+        set((asg_config or {}).get("depends_on") or [])
+        == {
+            "terraform_data.network_ready",
+            "terraform_data.fleet_security_ready",
+        },
+        "relay ASG must wait for network readiness and the complete fleet security barrier",
+    )
+    v.require(
+        references_exact_resources(
+            expression_refs(asg_config, "target_group_arns"),
+            {"aws_lb_target_group.relay"},
+        ),
+        "relay ASG must attach to exactly the HTTPS target group",
+    )
+    rendered_relay_servers: list[dict[str, Any]] = []
     launch_template = v.one(
         relay_named("aws_launch_template", "relay"), "relay launch template"
     )
@@ -2879,30 +2785,39 @@ def validate_plan(
                 ).decode("utf-8")
             except (ValueError, UnicodeDecodeError):
                 pass
-        recognized_plaintext_config = (
-            decoded_user_data is not None
-            and re.search(r"(?m)^native_server\s*=", decoded_user_data) is not None
-            and re.search(r"(?m)^\[\[servers\]\]\s*$", decoded_user_data) is not None
+        server_blocks = (
+            re.findall(
+                r"(?ms)^\[\[servers\]\]\s*\n(.*?)(?=^\[\[servers\]\]\s*$|\Z)",
+                decoded_user_data,
+            )
+            if decoded_user_data is not None
+            else []
+        )
+        for block in server_blocks:
+            quoted = {
+                key: match.group(1) if match else None
+                for key in ("name", "public_key", "host")
+                for match in [re.search(rf'(?m)^\s*{key}\s*=\s*"([^"]*)"\s*$', block)]
+            }
+            port_match = re.search(r"(?m)^\s*port\s*=\s*([0-9]+)\s*$", block)
+            rendered_relay_servers.append(
+                {
+                    **quoted,
+                    "port": int(port_match.group(1)) if port_match else None,
+                }
+            )
+        recognized_plaintext_config = bool(rendered_relay_servers) and all(
+            all(
+                entry.get(key) not in (None, "")
+                for key in ("name", "public_key", "host")
+            )
+            and entry.get("port") is not None
+            for entry in rendered_relay_servers
         )
         v.require(
             recognized_plaintext_config,
-            "rendered relay launch-template user_data must remain base64-encoded UTF-8 plaintext containing native_server and [[servers]] relay TOML markers; gzip or multipart user_data requires an explicitly reviewed parser update",
+            "rendered relay launch-template user_data must remain base64-encoded UTF-8 plaintext containing [[servers]] relay TOML markers; gzip or multipart user_data requires an explicitly reviewed parser update",
         )
-        if not recognized_plaintext_config:
-            decoded_user_data = ""
-        native_servers = re.findall(
-            r'(?m)^native_server\s*=\s*"([^"]+)"\s*$', decoded_user_data
-        )
-        configured_servers = re.findall(
-            r'(?ms)^\[\[servers\]\]\s*\n\s*name\s*=\s*"([^"]+)"',
-            decoded_user_data,
-        )
-        if recognized_plaintext_config:
-            v.require(
-                len(native_servers) == 1
-                and configured_servers.count(native_servers[0]) == 1,
-                "rendered relay config must select exactly one configured cell as native_server",
-            )
 
     relay_repo_parent = child_module_prefix(parent_prefix, "module.ecr")
     relay_repo = v.one(
@@ -3057,41 +2972,6 @@ def validate_plan(
         ),
         (
             "aws_vpc_security_group_ingress_rule",
-            "native_nhp_udp",
-            "udp",
-            EXPECTED_NHP_SERVER_PORT,
-            "public native NHP ingress",
-        ),
-        (
-            "aws_vpc_security_group_egress_rule",
-            "native_nhp_to_relay_udp",
-            "udp",
-            EXPECTED_NHP_SERVER_PORT,
-            "native NHP NLB data egress",
-        ),
-        (
-            "aws_vpc_security_group_egress_rule",
-            "native_nhp_health_to_relay",
-            "tcp",
-            EXPECTED_RELAY_BACKEND_PORT,
-            "native NHP NLB health egress",
-        ),
-        (
-            "aws_vpc_security_group_ingress_rule",
-            "relay_native_udp_from_nlb",
-            "udp",
-            EXPECTED_NHP_SERVER_PORT,
-            "relay native NHP ingress",
-        ),
-        (
-            "aws_vpc_security_group_ingress_rule",
-            "relay_health_from_nlb",
-            "tcp",
-            EXPECTED_RELAY_BACKEND_PORT,
-            "relay native NHP health ingress",
-        ),
-        (
-            "aws_vpc_security_group_ingress_rule",
             "vpc_endpoints_from_relay",
             "tcp",
             EXPECTED_HTTPS_PORT,
@@ -3125,16 +3005,6 @@ def validate_plan(
             alb_ingress.values.get("cidr_ipv4") == EXPECTED_IPV4_DEFAULT_CIDR,
             "public ALB ingress must be TCP 443 from IPv4 internet",
         )
-    native_ingress = v.one(
-        relay_named("aws_vpc_security_group_ingress_rule", "native_nhp_udp"),
-        "public native NHP ingress CIDR",
-    )
-    if native_ingress:
-        v.require(
-            native_ingress.values.get("cidr_ipv4") == "0.0.0.0/0",
-            "public native NHP ingress must be UDP 62206 from IPv4 internet",
-        )
-
     ack_ingress = v.one(
         relay_named("aws_vpc_security_group_ingress_rule", "relay_udp_ack_return"),
         "private relay ACK ingress source",
@@ -3183,34 +3053,6 @@ def validate_plan(
             "var.vpc_endpoint_security_group_id",
             "relay endpoint HTTPS egress",
         ),
-        (
-            "aws_vpc_security_group_egress_rule",
-            "native_nhp_to_relay_udp",
-            "aws_security_group.native_nhp",
-            "aws_security_group.relay",
-            "native NHP NLB UDP egress",
-        ),
-        (
-            "aws_vpc_security_group_egress_rule",
-            "native_nhp_health_to_relay",
-            "aws_security_group.native_nhp",
-            "aws_security_group.relay",
-            "native NHP NLB health egress",
-        ),
-        (
-            "aws_vpc_security_group_ingress_rule",
-            "relay_native_udp_from_nlb",
-            "aws_security_group.relay",
-            "aws_security_group.native_nhp",
-            "relay native NHP ingress",
-        ),
-        (
-            "aws_vpc_security_group_ingress_rule",
-            "relay_health_from_nlb",
-            "aws_security_group.relay",
-            "aws_security_group.native_nhp",
-            "relay native NHP health ingress",
-        ),
     ):
         rule_config = config_resource(v, relay_config, resource_type, name)
         owner_refs = expression_refs(rule_config, "security_group_id")
@@ -3237,11 +3079,6 @@ def validate_plan(
 
     for name, expected_owner_ref, label in (
         ("alb_https", "aws_security_group.alb", "public ALB HTTPS ingress"),
-        (
-            "native_nhp_udp",
-            "aws_security_group.native_nhp",
-            "public native NHP ingress",
-        ),
     ):
         ingress_config = config_resource(
             v, relay_config, "aws_vpc_security_group_ingress_rule", name
@@ -3313,17 +3150,12 @@ def validate_plan(
 
     allowed_ingress_names = {
         "alb_https",
-        "native_nhp_udp",
         "relay_http_from_alb",
-        "relay_health_from_nlb",
-        "relay_native_udp_from_nlb",
         "relay_udp_ack_return",
         "vpc_endpoints_from_relay",
     }
     allowed_egress_names = {
         "alb_to_relay",
-        "native_nhp_health_to_relay",
-        "native_nhp_to_relay_udp",
         "relay_to_nhp_udp",
         "relay_to_vpc_endpoints_https",
         "relay_to_s3_https",
@@ -3340,11 +3172,11 @@ def validate_plan(
             if resource.resource_type == "aws_vpc_security_group_ingress_rule"
         }
         == allowed_ingress_names,
-        "relay/ALB/NLB/endpoint ingress rule inventory changed",
+        "relay/ALB/endpoint ingress rule inventory changed",
     )
     v.require(
         {resource.name for resource in egress_rules} == allowed_egress_names,
-        "relay/ALB/NLB egress rule inventory changed",
+        "relay/ALB egress rule inventory changed",
     )
     v.require(
         all(
@@ -3385,28 +3217,161 @@ def validate_plan(
             resource.name,
         )
     ]
-    legacy_public_server_surface = {
-        ("aws_lb", "server"),
-        ("aws_lb_listener", "udp"),
-        ("aws_lb_target_group", "udp"),
-        ("aws_lb_target_group", "udp_green"),
-        ("aws_autoscaling_attachment", "server"),
+    compute_config_suffix = (
+        f"{parent_config_suffix}.module.compute"
+        if parent_config_suffix
+        else "module.compute"
+    )
+    compute_config = config_module(v, plan, compute_config_suffix)
+    v.require(
+        compute_config is not None,
+        "assigned-cell compute module configuration is missing",
+    )
+    public_server_nlb = resources_named(compute, "aws_lb", "server")
+    public_server_nlb_tags = (
+        public_server_nlb[0].values.get("tags") or []
+        if len(public_server_nlb) == 1
+        else []
+    )
+    expected_public_server_nlb_tags = {
+        "Environment": "sandbox",
+        "Component": "compute",
+        "Cell": EXPECTED_SANDBOX_CELL_ID,
+        "Name": EXPECTED_SANDBOX_SERVER_NLB_NAME,
     }
     v.require(
-        not any(
-            (resource.resource_type, resource.name) in legacy_public_server_surface
-            for resource in compute
+        len(public_server_nlb) == 1
+        and public_server_nlb[0].values.get("internal") is False
+        and public_server_nlb[0].values.get("load_balancer_type") == "network"
+        and public_server_nlb[0].values.get("name") == EXPECTED_SANDBOX_SERVER_NLB_NAME
+        and isinstance(public_server_nlb_tags, dict)
+        and all(
+            public_server_nlb_tags.get(key) == value
+            for key, value in expected_public_server_nlb_tags.items()
         ),
-        "legacy main-VPC public server NLB, UDP listener, target groups, and attachment must be absent",
+        "assigned cell must retain exactly one canonically named and tagged internet-facing server NLB",
+    )
+    public_target_group_specs = (
+        (
+            "udp",
+            EXPECTED_SANDBOX_SERVER_UDP_TG_NAME,
+            "layerv-nhp-sandbox-tg-udp",
+            {},
+            "assigned cell public NHP target group must retain canonical identity, tags, preserved client IP, instance UDP 62206, and HTTP /health/live contract in values and authored config",
+        ),
+        (
+            "udp_green",
+            EXPECTED_SANDBOX_SERVER_UDP_GREEN_TG_NAME,
+            "layerv-nhp-sandbox-tg-udp-green",
+            {"DeployColor": "green"},
+            "standby public NHP target group must retain canonical green identity, tags, preserved client IP, instance UDP 62206, and HTTP /health/live contract in values and authored config",
+        ),
+    )
+    public_target_groups: dict[str, list[PlannedResource]] = {}
+    for (
+        resource_name,
+        expected_name,
+        expected_tag_name,
+        color_tags,
+        error_message,
+    ) in public_target_group_specs:
+        matches = resources_named(compute, "aws_lb_target_group", resource_name)
+        public_target_groups[resource_name] = matches
+        values = matches[0].values if len(matches) == 1 else {}
+        tags = values.get("tags") or []
+        health = values.get("health_check") or []
+        target_group_config = config_resource(
+            v, compute_config, "aws_lb_target_group", resource_name
+        )
+        preserve_expression = (
+            (target_group_config or {}).get("expressions") or {}
+        ).get("preserve_client_ip") or {}
+        expected_tags = {
+            "Environment": "sandbox",
+            "Component": "compute",
+            "Cell": EXPECTED_SANDBOX_CELL_ID,
+            "Name": expected_tag_name,
+            **color_tags,
+        }
+        v.require(
+            len(matches) == 1
+            and values.get("name") == expected_name
+            and values.get("protocol") == "UDP"
+            and values.get("port") == EXPECTED_NHP_SERVER_PORT
+            and values.get("target_type") == "instance"
+            and str(values.get("preserve_client_ip")).lower() == "true"
+            and isinstance(tags, dict)
+            and all(tags.get(key) == value for key, value in expected_tags.items())
+            and len(health) == 1
+            and health[0].get("enabled") is True
+            and health[0].get("protocol") == "HTTP"
+            and str(health[0].get("port")) == "8888"
+            and health[0].get("path") == "/health/live"
+            and health[0].get("matcher") == "200"
+            and preserve_expression.get("constant_value") is True,
+            error_message,
+        )
+    public_server_target_group = public_target_groups["udp"]
+    public_server_green_target_group = public_target_groups["udp_green"]
+    udp_capable_listeners = [
+        resource
+        for resource in compute
+        if resource.resource_type == "aws_lb_listener"
+        and str(resource.values.get("protocol", "")).upper() in {"UDP", "TCP_UDP"}
+    ]
+    v.require(
+        len(udp_capable_listeners) == 2
+        and {resource.name for resource in udp_capable_listeners}
+        == {"udp", "udp_internal"}
+        and all(
+            resource.values.get("protocol") == "UDP"
+            and resource.values.get("port") == EXPECTED_NHP_SERVER_PORT
+            for resource in udp_capable_listeners
+        ),
+        "assigned cell public NHP NLB must expose exactly one UDP listener on 62206; compute UDP-capable listener inventory must also contain only private udp_internal on UDP 62206",
+    )
+    public_listener_config = config_resource(
+        v, compute_config, "aws_lb_listener", "udp"
+    )
+    v.require(
+        references_exact_resources(
+            expression_refs(public_listener_config, "load_balancer_arn"),
+            {"aws_lb.server"},
+        )
+        and references_exact_resources(
+            expression_refs(public_listener_config, "default_action"),
+            {"aws_lb_target_group.udp"},
+        ),
+        "assigned-cell public UDP listener must forward only aws_lb.server to aws_lb_target_group.udp",
+    )
+    public_attachment = v.one(
+        resources_named(compute, "aws_autoscaling_attachment", "server"),
+        "assigned-cell public UDP target-group attachment",
+    )
+    public_attachment_config = config_resource(
+        v, compute_config, "aws_autoscaling_attachment", "server"
+    )
+    v.require(
+        public_attachment is not None
+        and references_exact_resources(
+            expression_refs(public_attachment_config, "autoscaling_group_name"),
+            {"aws_autoscaling_group.server"},
+        )
+        and references_exact_resources(
+            expression_refs(public_attachment_config, "lb_target_group_arn"),
+            {"aws_lb_target_group.udp"},
+        ),
+        "assigned-cell public UDP target group must attach only to the canonical server ASG",
     )
     v.require(
         not any(
             resource.resource_type == "aws_lb"
             and resource.values.get("load_balancer_type") == "network"
             and resource.values.get("internal") is False
+            and resource.name != "server"
             for resource in compute
         ),
-        "main-VPC compute module must not retain any internet-facing network load balancer",
+        "assigned cell server NLB must be the only internet-facing compute NLB",
     )
     server_base = resources_named(
         compute, "aws_vpc_security_group_ingress_rule", "server_nhp_udp"
@@ -3416,8 +3381,69 @@ def validate_plan(
         and server_base[0].values.get("ip_protocol") == "udp"
         and server_base[0].values.get("from_port") == EXPECTED_NHP_SERVER_PORT
         and server_base[0].values.get("to_port") == EXPECTED_NHP_SERVER_PORT
-        and server_base[0].values.get("cidr_ipv4") == EXPECTED_SANDBOX_MAIN_VPC_CIDR,
-        "base server UDP 62206 ingress must be private to the sandbox main VPC CIDR",
+        and server_base[0].values.get("cidr_ipv4") == EXPECTED_IPV4_DEFAULT_CIDR,
+        "assigned cell server SG must accept public NHP UDP 62206",
+    )
+    server_base_config = config_resource(
+        v,
+        compute_config,
+        "aws_vpc_security_group_ingress_rule",
+        "server_nhp_udp",
+    )
+    v.require(
+        references_exact_resources(
+            expression_refs(server_base_config, "security_group_id"),
+            {"aws_security_group.server"},
+        ),
+        "assigned cell public UDP 62206 rule must belong only to the canonical server SG",
+    )
+    server_sg_config = config_resource(
+        v, compute_config, "aws_security_group", "server"
+    )
+    server_sg_expressions = (server_sg_config or {}).get("expressions") or {}
+    v.require(
+        server_sg_config is not None
+        and not ({"ingress", "egress"} & set(server_sg_expressions)),
+        "canonical server SG must use only reviewed standalone rules and declare no inline ingress or egress",
+    )
+    v.require(
+        not any(
+            resource.resource_type == "aws_security_group_rule" for resource in compute
+        ),
+        "legacy aws_security_group_rule resources are forbidden in the assigned-cell compute module",
+    )
+
+    def public_udp_capable_rule(resource: PlannedResource) -> bool:
+        if resource.resource_type not in {
+            "aws_vpc_security_group_ingress_rule",
+            "aws_security_group_rule",
+        }:
+            return False
+        if not (
+            resource.values.get("cidr_ipv4") == EXPECTED_IPV4_DEFAULT_CIDR
+            or resource.values.get("cidr_ipv6") == "::/0"
+        ):
+            return False
+        protocol = str(
+            resource.values.get("ip_protocol", resource.values.get("protocol", ""))
+        ).lower()
+        if protocol not in {"udp", "-1", "all"}:
+            return False
+        return True
+
+    public_server_udp_rules = [
+        resource for resource in compute if public_udp_capable_rule(resource)
+    ]
+    v.require(
+        len(public_server_udp_rules) == 1
+        and public_server_udp_rules[0].name == "server_nhp_udp"
+        and public_server_udp_rules[0].values.get("ip_protocol") == "udp"
+        and public_server_udp_rules[0].values.get("from_port")
+        == EXPECTED_NHP_SERVER_PORT
+        and public_server_udp_rules[0].values.get("to_port") == EXPECTED_NHP_SERVER_PORT
+        and public_server_udp_rules[0].values.get("cidr_ipv4")
+        == EXPECTED_IPV4_DEFAULT_CIDR,
+        "server SG public UDP-capable ingress must be exactly server_nhp_udp on UDP 62206",
     )
     internal_server_nlb = resources_named(compute, "aws_lb", "server_internal")
     v.require(
@@ -3426,6 +3452,34 @@ def validate_plan(
         and internal_server_nlb[0].values.get("load_balancer_type") == "network",
         "server knock path must retain exactly one private main-VPC network load balancer",
     )
+    expected_internal_dns = (
+        internal_server_nlb[0].values.get("dns_name")
+        if len(internal_server_nlb) == 1
+        else None
+    )
+    authoritative_cell_server = (
+        authoritative_cell_servers[0]
+        if isinstance(authoritative_cell_servers, list)
+        and len(authoritative_cell_servers) == 1
+        and isinstance(authoritative_cell_servers[0], dict)
+        else None
+    )
+    v.require(
+        isinstance(expected_internal_dns, str)
+        and bool(expected_internal_dns)
+        and isinstance(authoritative_cell_server, dict)
+        and authoritative_cell_server.get("name") == "sandbox-cell0"
+        and authoritative_cell_server.get("host") == expected_internal_dns
+        and authoritative_cell_server.get("port") == EXPECTED_NHP_SERVER_PORT
+        and re.fullmatch(
+            r"[A-Za-z0-9+/]{43}=",
+            str(authoritative_cell_server.get("public_key", "")),
+        )
+        is not None
+        and len(rendered_relay_servers) == 1
+        and rendered_relay_servers[0] == authoritative_cell_server,
+        "rendered relay server table must exactly match the plan-visible sandbox-cell0 route to the canonical internal NLB DNS on UDP 62206 and its authoritative server public key",
+    )
     internal_server_listener = resources_named(
         compute, "aws_lb_listener", "udp_internal"
     )
@@ -3433,7 +3487,154 @@ def validate_plan(
         len(internal_server_listener) == 1
         and internal_server_listener[0].values.get("protocol") == "UDP"
         and internal_server_listener[0].values.get("port") == EXPECTED_NHP_SERVER_PORT,
-        "private server NLB must retain exactly one UDP 62206 listener",
+        "internal server NLB must retain exactly one UDP 62206 listener",
+    )
+    internal_target_group_specs = (
+        (
+            "udp_internal",
+            EXPECTED_SANDBOX_INTERNAL_UDP_TG_NAME,
+            "layerv-nhp-sandbox-tg-srv-int-udp-blue",
+            "blue",
+        ),
+        (
+            "udp_internal_green",
+            EXPECTED_SANDBOX_INTERNAL_UDP_GREEN_TG_NAME,
+            "layerv-nhp-sandbox-tg-srv-int-udp-green",
+            "green",
+        ),
+    )
+    internal_target_groups: dict[str, PlannedResource | None] = {}
+    for (
+        resource_name,
+        expected_name,
+        expected_tag_name,
+        color,
+    ) in internal_target_group_specs:
+        matches = resources_named(compute, "aws_lb_target_group", resource_name)
+        target_group = matches[0] if len(matches) == 1 else None
+        internal_target_groups[resource_name] = target_group
+        values = target_group.values if target_group is not None else {}
+        tags = values.get("tags") or []
+        health = values.get("health_check") or []
+        target_group_config = config_resource(
+            v, compute_config, "aws_lb_target_group", resource_name
+        )
+        preserve_expression = (
+            (target_group_config or {}).get("expressions") or {}
+        ).get("preserve_client_ip") or {}
+        v.require(
+            len(matches) == 1
+            and values.get("name") == expected_name
+            and values.get("protocol") == "UDP"
+            and values.get("port") == EXPECTED_NHP_SERVER_PORT
+            and values.get("target_type") == "instance"
+            and str(values.get("preserve_client_ip")).lower() == "true"
+            and isinstance(tags, dict)
+            and all(
+                tags.get(key) == value
+                for key, value in {
+                    "Environment": "sandbox",
+                    "Component": "compute",
+                    "Cell": EXPECTED_SANDBOX_CELL_ID,
+                    "Name": expected_tag_name,
+                    "DeployColor": color,
+                }.items()
+            )
+            and len(health) == 1
+            and health[0].get("enabled") is True
+            and health[0].get("protocol") == "HTTP"
+            and str(health[0].get("port")) == "8888"
+            and health[0].get("path") == "/health/live"
+            and health[0].get("matcher") == "200"
+            and preserve_expression.get("constant_value") is True,
+            f"internal {color} server target group must retain canonical identity, tags, preserved client IP, instance UDP 62206, and HTTP /health/live contract in values and authored config",
+        )
+    internal_listener_config = config_resource(
+        v, compute_config, "aws_lb_listener", "udp_internal"
+    )
+    v.require(
+        references_exact_resources(
+            expression_refs(internal_listener_config, "load_balancer_arn"),
+            {"aws_lb.server_internal"},
+        )
+        and references_exact_resources(
+            expression_refs(internal_listener_config, "default_action"),
+            {"aws_lb_target_group.udp_internal"},
+        ),
+        "private UDP listener must forward only aws_lb.server_internal to aws_lb_target_group.udp_internal",
+    )
+    internal_attachment = v.one(
+        resources_named(compute, "aws_autoscaling_attachment", "server_internal"),
+        "internal server UDP target-group attachment",
+    )
+    internal_attachment_config = config_resource(
+        v, compute_config, "aws_autoscaling_attachment", "server_internal"
+    )
+    v.require(
+        internal_attachment is not None
+        and references_exact_resources(
+            expression_refs(internal_attachment_config, "autoscaling_group_name"),
+            {"aws_autoscaling_group.server"},
+        )
+        and references_exact_resources(
+            expression_refs(internal_attachment_config, "lb_target_group_arn"),
+            {"aws_lb_target_group.udp_internal"},
+        ),
+        "internal UDP target group must attach only to the canonical server ASG",
+    )
+    green_asg = v.one(
+        resources_named(compute, "aws_autoscaling_group", "server_green"),
+        "green server ASG",
+    )
+    green_asg_config = config_resource(
+        v, compute_config, "aws_autoscaling_group", "server_green"
+    )
+    green_asg_refs = expression_refs(green_asg_config, "target_group_arns")
+    expected_green_tg_refs = {
+        "aws_lb_target_group.udp_green",
+        "aws_lb_target_group.https_green",
+        "aws_lb_target_group.udp_internal_green",
+    }
+    public_green_arn = (
+        public_server_green_target_group[0].values.get("arn")
+        if len(public_server_green_target_group) == 1
+        else None
+    )
+    internal_green = internal_target_groups.get("udp_internal_green")
+    internal_green_arn = (
+        internal_green.values.get("arn") if internal_green is not None else None
+    )
+    green_asg_target_group_arns = (
+        green_asg.values.get("target_group_arns") if green_asg is not None else None
+    )
+    green_https_target_groups = resources_named(
+        compute, "aws_lb_target_group", "https_green"
+    )
+    green_https_arns = {
+        resource.values.get("arn")
+        for resource in green_https_target_groups
+        if isinstance(resource.values.get("arn"), str)
+    }
+    known_green_arns = {
+        arn for arn in (public_green_arn, internal_green_arn) if isinstance(arn, str)
+    } | green_https_arns
+    v.require(
+        green_asg is not None
+        and references_exact_resources(
+            green_asg_refs,
+            expected_green_tg_refs,
+            allowed_metadata=frozenset(
+                {"var.enable_qurl_resolve_endpoint", "var.relay_enabled"}
+            ),
+        )
+        and (
+            not known_green_arns
+            or (
+                isinstance(green_asg_target_group_arns, list)
+                and set(green_asg_target_group_arns) == known_green_arns
+            )
+        ),
+        "green server ASG must attach to the standby public and internal UDP target groups in planned values and authored config",
     )
     server_return = resources_named(
         resources,
@@ -3463,165 +3664,6 @@ def validate_plan(
         "relay role must not retain AmazonSSMManagedInstanceCore",
     )
     return v.errors
-
-
-HTTPS_CHECKER = Path(__file__).resolve().with_name("check-relay-dmz-plan-https.py")
-
-# Temporary bridge only: PR #3150 removes the native validator and promotes the
-# HTTPS-only validator back to this canonical path after the architecture cutover.
-PROFILE_ABSENT = "absent"
-PROFILE_HTTPS = "https"
-PROFILE_INVALID = "invalid"
-PROFILE_NATIVE = "native"
-
-
-def transition_configuration_shape_error(
-    module: dict[str, Any], path: str = "root_module"
-) -> str | None:
-    """Return the first malformed container that could hide profile evidence."""
-    resources = module.get("resources", [])
-    if not isinstance(resources, list):
-        return f"Terraform plan JSON {path}.resources is not an array"
-    for index, resource in enumerate(resources):
-        resource_path = f"{path}.resources[{index}]"
-        if not isinstance(resource, dict):
-            return f"Terraform plan JSON {resource_path} is not an object"
-        if not isinstance(resource.get("type"), str):
-            return f"Terraform plan JSON {resource_path}.type is not a string"
-        if not isinstance(resource.get("name"), str):
-            return f"Terraform plan JSON {resource_path}.name is not a string"
-        expressions = resource.get("expressions", {})
-        if not isinstance(expressions, dict):
-            return f"Terraform plan JSON {resource_path}.expressions is not an object"
-
-    module_calls = module.get("module_calls", {})
-    if not isinstance(module_calls, dict):
-        return f"Terraform plan JSON {path}.module_calls is not an object"
-    for name, call in module_calls.items():
-        call_path = f"{path}.module_calls.{name}"
-        if not isinstance(call, dict):
-            return f"Terraform plan JSON {call_path} is not an object"
-        expressions = call.get("expressions", {})
-        if not isinstance(expressions, dict):
-            return f"Terraform plan JSON {call_path}.expressions is not an object"
-        child = call.get("module")
-        if child is None:
-            continue
-        if not isinstance(child, dict):
-            return f"Terraform plan JSON {call_path}.module is not an object"
-        if error := transition_configuration_shape_error(child, f"{call_path}.module"):
-            return error
-    return None
-
-
-def detect_contract_profile(plan: dict[str, Any]) -> tuple[str | None, str | None]:
-    """Select exactly one temporary native or HTTPS-only plan contract."""
-    configuration = plan.get("configuration")
-    if not isinstance(configuration, dict) or not isinstance(
-        configuration.get("root_module"), dict
-    ):
-        return (
-            PROFILE_INVALID,
-            "Terraform plan JSON has no configuration.root_module object",
-        )
-    root = configuration["root_module"]
-    if shape_error := transition_configuration_shape_error(root):
-        return PROFILE_INVALID, shape_error
-    modules = [module for _, module in iter_config_modules(root)]
-    relay_calls = [
-        call
-        for module in modules
-        for name, call in module.get("module_calls", {}).items()
-        if name == "relay"
-    ]
-    relay_expressions = [call.get("expressions", {}) for call in relay_calls]
-    resources = [
-        resource
-        for module in modules
-        for resource in module.get("resources", [])
-    ]
-
-    native_args = {
-        name
-        for expressions in relay_expressions
-        for name in ("native_server", "native_nhp_edge_enabled")
-        if name in expressions
-    }
-    native_resource_names = {
-        (resource.get("type"), resource.get("name"))
-        for resource in resources
-        if resource.get("name")
-        in {
-            "native_nhp",
-            "native_nhp_udp",
-            "relay_native_nlb_unhealthy_targets",
-            "relay_native_nlb_zero_healthy_targets",
-        }
-    }
-    native_evidence = bool(native_args or native_resource_names)
-    native_complete = (
-        len(relay_calls) == 1
-        and native_args == {"native_server", "native_nhp_edge_enabled"}
-        and {
-            ("aws_lb", "native_nhp"),
-            ("aws_lb_listener", "native_nhp_udp"),
-            ("aws_lb_target_group", "native_nhp"),
-        }.issubset(native_resource_names)
-    )
-
-    anchors = [
-        resource
-        for resource in resources
-        if resource.get("type") == "terraform_data"
-        and resource.get("name") == "relay_cell_routing"
-    ]
-    anchor_complete = False
-    if len(anchors) == 1:
-        anchor = anchors[0]
-        anchor_complete = references(anchor.get("count_expression")) == {
-            "var.deploy_relay"
-        } and expression_refs(anchor, "input") == {
-            "var.environment",
-            "var.cell_id",
-            "module.compute.server_public_key_b64",
-            "module.compute.internal_nlb_dns_name",
-            "module.compute",
-        }
-    https_cell_refs = [
-        references(expressions.get("cell_servers"))
-        for expressions in relay_expressions
-        if "cell_servers" in expressions
-    ]
-    # The argument itself is evidence. Treating only the expected anchor refs
-    # as evidence would misclassify a direct/foreign cell_servers wiring as a
-    # relay-dark plan and let --allow-disabled bypass the transition gate.
-    https_evidence = bool(anchors or https_cell_refs)
-    https_complete = (
-        len(relay_calls) == 1
-        and anchor_complete
-        and https_cell_refs
-        == [
-            {
-                "terraform_data.relay_cell_routing[0].input",
-                "terraform_data.relay_cell_routing[0]",
-                "terraform_data.relay_cell_routing",
-            }
-        ]
-    )
-
-    if native_evidence and https_evidence:
-        return None, "relay DMZ plan mixes native and HTTPS-only transition profiles"
-    if native_evidence:
-        if native_complete:
-            return PROFILE_NATIVE, None
-        return None, "relay DMZ native transition profile is incomplete"
-    if https_evidence:
-        if https_complete:
-            return PROFILE_HTTPS, None
-        return None, "relay DMZ HTTPS-only transition profile is incomplete"
-    if relay_calls:
-        return None, "relay DMZ transition profile is incomplete"
-    return PROFILE_ABSENT, None
 
 
 def main() -> int:
@@ -3666,41 +3708,6 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-
-    profile, profile_error = detect_contract_profile(plan)
-    if profile == PROFILE_INVALID:
-        print(f"::error::{profile_error}", file=sys.stderr)
-        return 2
-    if profile == PROFILE_ABSENT:
-        # Preserve the existing absent-topology behavior: required mode rejects
-        # it and --allow-disabled accepts only a plan with no relay module call.
-        # Mixed or partial transition evidence still fails before either
-        # validator runs.
-        profile = PROFILE_NATIVE
-    if profile_error:
-        print(f"::error::{profile_error}", file=sys.stderr)
-        return 1
-    if profile == PROFILE_HTTPS:
-        if not HTTPS_CHECKER.is_file():
-            print(
-                f"::error::trusted HTTPS-only relay DMZ checker is missing: {HTTPS_CHECKER.name}",
-                file=sys.stderr,
-            )
-            return 2
-        try:
-            # The child intentionally re-reads the plan to keep the vendored
-            # validator independent. Transition tests keep both CLI flag sets
-            # identical while every original argument is forwarded verbatim.
-            os.execv(
-                sys.executable,
-                [sys.executable, str(HTTPS_CHECKER), *sys.argv[1:]],
-            )
-        except OSError as exc:
-            print(
-                f"::error::cannot execute trusted HTTPS-only relay DMZ checker: {exc}",
-                file=sys.stderr,
-            )
-            return 2
 
     errors = validate_plan(
         plan,

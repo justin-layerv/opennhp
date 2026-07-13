@@ -1571,6 +1571,13 @@ jobs:
           terraform init -backend=false
           terraform test
 
+      - name: Test relay DMZ Terraform contract
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        working-directory: terraform/modules/relay-network
+        run: |
+          terraform init -backend=false
+          terraform test
+
       - name: Check qurl SLO lockstep (variables.tf vs dashboard JSON)
         # Repo-wide invariant check; run once on the sandbox leg so a
         # mismatch fails once, not twice.
@@ -1900,7 +1907,9 @@ jobs:
       )
     runs-on: ubuntu-latest
     environment: sandbox
-    timeout-minutes: 45  # Rare relay SG recovery may spend ~15m refreshing, then a short ENI grace check, before apply.
+    # Includes rare ~15m SG recovery, the bounded 5m structural convergence
+    # gate, and a final full post-apply idempotency plan before outputs unblock.
+    timeout-minutes: 55
     concurrency:
       group: deploy-sandbox-infra
       cancel-in-progress: false  # Let current TF apply finish, queue the next
@@ -2089,7 +2098,18 @@ jobs:
           set -euo pipefail
 
           # Clean up any stale plan files from previous failed runs
-          rm -f tfplan plan.txt plan-show.txt plan-show.json
+          rm -f tfplan plan.txt plan-show.txt plan-show.json plan-boundary-preflight.json
+
+          preflight_relay_dmz_boundary_noop() {
+            # This must run before the recovery helper can call `terraform state
+            # rm`, untaint, or refresh a relay ASG. The named final pre-apply
+            # step repeats the same gate against the post-recovery artifact.
+            terraform show -json tfplan > plan-boundary-preflight.json
+            python3 ../../../.github/scripts/check-relay-dmz-plan.py \
+              --require-pr0-applied \
+              --require-dmz-boundary-noop \
+              plan-boundary-preflight.json
+          }
 
           plan_with_attachment_migration_guard() {
             local context="$1"
@@ -2117,6 +2137,8 @@ jobs:
               echo "::error::Terraform plan failed${context_suffix}. Manual intervention may be required."
               exit 1
             fi
+
+            preflight_relay_dmz_boundary_noop
 
             # Find any aws_autoscaling_attachment resources being destroyed.
             # Pattern matches both indexed (foo[0]) and non-indexed (foo) resources.
@@ -2288,6 +2310,21 @@ jobs:
             fi
           fi
 
+      - name: Verify relay DMZ plan contract before apply
+        working-directory: terraform/environments/sandbox
+        run: |
+          set -euo pipefail
+          test -s tfplan
+          test -s plan-show.json
+          # Push-to-main is not the first-cutover or boundary-mutation path.
+          # Any such diff fails here and points the operator to the exact
+          # reviewed saved-plan runbook. After that manual apply, rerunning this
+          # workflow is allowed only when every fenced address is a no-op.
+          python3 ../../../.github/scripts/check-relay-dmz-plan.py \
+            --require-pr0-applied \
+            --require-dmz-boundary-noop \
+            plan-show.json
+
       # TF_VAR_frps_image_tag (when SSM has a non-bootstrap value) was
       # exported to GITHUB_ENV by the
       # "Resolve qurl-reverse-tunnel-server Image Tag" step earlier in this
@@ -2308,15 +2345,56 @@ jobs:
           TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
-        # Apply the plan generated in previous step (or fresh if no migrations)
+        # Apply exactly the saved plan that passed the DMZ contract above.
         run: |
-          if [[ -f tfplan ]]; then
-            echo "::notice::Applying saved plan from migration step ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
-            terraform apply -auto-approve tfplan
-          else
-            echo "::notice::No saved plan found, running fresh apply"
-            terraform apply -auto-approve
+          set -euo pipefail
+          test -s tfplan
+          echo "::notice::Applying checked saved plan ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
+          terraform apply -auto-approve tfplan
+
+      - name: Verify AWS CLI major for relay DMZ detector
+        run: |
+          set -euo pipefail
+          aws_cli_version=$(aws --version 2>&1)
+          if [[ ! "$aws_cli_version" =~ ^aws-cli/2\. ]]; then
+            echo "::error::Relay DMZ detector stderr contracts require AWS CLI v2; found: $aws_cli_version"
+            exit 1
           fi
+
+      - name: Verify relay DMZ structural boundary
+        run: python3 scripts/check-relay-dmz-live.py --mode structural --environment sandbox --wait-seconds 300
+
+      - name: Verify relay DMZ post-apply idempotency
+        working-directory: terraform/environments/sandbox
+        env:
+          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
+          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
+          TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
+          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
+          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          rm -f relay-dmz-post-apply.tfplan relay-dmz-post-apply.json
+          set +e
+          terraform plan -detailed-exitcode -no-color \
+            -out=relay-dmz-post-apply.tfplan 2>&1 | tee relay-dmz-post-apply.txt
+          plan_rc=${PIPESTATUS[0]}
+          set -e
+          if [[ "$plan_rc" -eq 2 ]]; then
+            echo "::error::Post-apply Terraform plan is not empty; relay DMZ route ownership is not idempotent."
+            exit 1
+          elif [[ "$plan_rc" -ne 0 ]]; then
+            echo "::error::Post-apply Terraform plan failed with exit $plan_rc."
+            exit "$plan_rc"
+          fi
+          test -s relay-dmz-post-apply.tfplan
+          terraform show -json relay-dmz-post-apply.tfplan \
+            > relay-dmz-post-apply.json
+          python3 ../../../.github/scripts/check-relay-dmz-plan.py \
+            --require-pr0-applied relay-dmz-post-apply.json
 
       - name: Get Terraform Outputs
         id: outputs
@@ -2595,8 +2673,12 @@ jobs:
   deploy-sandbox-relay:
     name: Deploy Sandbox - Relay
     # setup + app-image-build-required: needed for the app-image gate + tag.
-    needs: [setup, app-image-build-required, deploy-sandbox-infra]
-    if: always() && needs.deploy-sandbox-infra.result == 'success'
+    # The private relay/server wire uses a versioned request-ID return envelope,
+    # so converge the server blue/green deployment before rolling relay nodes.
+    # This ordering prevents a new relay from expecting RelayReturnMsg while an
+    # old server still emits the former raw inner reply.
+    needs: [setup, app-image-build-required, deploy-sandbox-infra, deploy-sandbox-blue-green]
+    if: always() && needs.deploy-sandbox-infra.result == 'success' && needs.deploy-sandbox-blue-green.result == 'success'
     runs-on: ubuntu-latest
     environment: sandbox
     # deploy-relay.sh starts the instance refresh and POLLS it to completion (the
@@ -2604,9 +2686,10 @@ jobs:
     # then a bounded poll (RELAY_REFRESH_MAX_ITERATIONS × interval, default 15
     # min). This job timeout is therefore load-bearing for the poll ceiling, not
     # just SSM/ASG API headroom: an observed healthy 3-instance roll took ~8m15s,
-    # the script caps the poll at 15 min, and 20m keeps a margin so the script's
-    # own poll timeout fails the deploy loudly before this job timeout can bite.
-    timeout-minutes: 20
+    # the script caps the refresh poll at 15 min, and the functional boundary
+    # gate adds a 10m retry window plus one final uncached collection. The 35m
+    # job bound leaves both components room to emit their own terminal errors.
+    timeout-minutes: 35
     # Direct AWS calls only (no sub-workflow dispatch), so unlike
     # deploy-sandbox-blue-green this needs id-token + contents, NOT actions:write.
     permissions:
@@ -2646,6 +2729,18 @@ jobs:
             EFFECTIVE_APP_CHANGED=true
           fi
           ./.github/scripts/deploy-relay.sh sandbox "$EFFECTIVE_APP_CHANGED" "$IMAGE_TAG"
+
+      - name: Verify AWS CLI major for relay DMZ detector
+        run: |
+          set -euo pipefail
+          aws_cli_version=$(aws --version 2>&1)
+          if [[ ! "$aws_cli_version" =~ ^aws-cli/2\. ]]; then
+            echo "::error::Relay DMZ detector stderr contracts require AWS CLI v2; found: $aws_cli_version"
+            exit 1
+          fi
+
+      - name: Verify relay DMZ functional boundary
+        run: python3 scripts/check-relay-dmz-live.py --mode functional --environment sandbox --wait-seconds 600
 
   # Dispatch blue/green deployment instead of doing direct instance refresh.
   # This ensures every CI deploy alternates between blue and green ASGs,
@@ -2881,21 +2976,23 @@ jobs:
           # Make script executable and run
           chmod +x scripts/validate-deployment.sh
 
-          # Run validation (continue on failure to collect all results)
-          ./scripts/validate-deployment.sh sandbox || VALIDATION_FAILED=1
+          ./scripts/validate-deployment.sh sandbox
 
-          if [ "${VALIDATION_FAILED:-0}" -eq 1 ]; then
-            echo "::warning::Some validation checks failed - see output above"
+      # Integration tests knock the assigned-cell server over its required
+      # public NLB (NHP_SERVER_ENDPOINT) on UDP 62206. Today this proves required
+      # endpoint discovery, DNS resolution, and a UDP send attempt; a valid SDK
+      # protocol round trip remains a separate pre-SDK rollout gate in #3184.
+      # Missing endpoint discovery must never silently skip even this basic gate.
+      - name: Require assigned-cell public NHP endpoint
+        env:
+          NLB_DNS: ${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}
+        run: |
+          if [ -z "$NLB_DNS" ]; then
+            echo "::error::Missing required assigned-cell public NHP NLB DNS output"
+            exit 1
           fi
 
-      # #2628: the integration tests knock the server over its PUBLIC NLB
-      # (NHP_SERVER_ENDPOINT). When take_server_private is set the public NLB is
-      # gone (nlb_dns is empty) and a GitHub-hosted runner outside the VPC cannot
-      # reach the internal relay NLB, so skip cleanly rather than run against an
-      # empty ":62206" host and silently no-op while looking green. Post-cutover
-      # end-to-end coverage moves to the relay path (#6/#2680) + the activation smokes.
       - name: Setup Go for Integration Tests
-        if: needs.deploy-sandbox-infra.outputs.nlb_dns != ''
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -2904,7 +3001,6 @@ jobs:
             endpoints/go.sum
 
       - name: Run Integration Tests
-        if: needs.deploy-sandbox-infra.outputs.nlb_dns != ''
         timeout-minutes: 7
         env:
           NHP_SERVER_ENDPOINT: "${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}:62206"
@@ -2923,9 +3019,7 @@ jobs:
 
           # Note: etcd tests will skip via t.Skip() if ETCD_CA_CERT is not set
           # This is expected in CI until we add etcd mTLS cert handling
-          go test -v -tags=integration -timeout 5m ./... 2>&1 || {
-            echo "::warning::Some integration tests failed or skipped"
-          }
+          go test -v -tags=integration -timeout 5m ./...
 
       - name: Read QURL domain from SSM
         id: qurl-domain-sandbox
@@ -3058,9 +3152,7 @@ jobs:
           RELAY_DEPLOY_RESULT: ${{ needs.deploy-sandbox-relay.result }}
           NLB_DNS: ${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}
         run: |
-          # #2628: nlb_dns is empty when take_server_private (no public NLB) — label it
-          # rather than render an empty backtick pair.
-          NLB_DISPLAY="${NLB_DNS:-none — server private (#2628), relay-only ingress}"
+          NLB_DISPLAY="${NLB_DNS:-missing — assigned-cell public server NLB required}"
           {
             echo "## Sandbox Deployment Complete"
             echo ""

@@ -6,8 +6,21 @@ const ProtocolVersionMinor = 0
 
 // device
 const (
-	MaxMemoryUsage         = 1 * 1024 * 1024 * 1024 // 1GB
-	PacketBufferSize       = 4096
+	MaxMemoryUsage   = 1 * 1024 * 1024 * 1024 // 1GB
+	PacketBufferSize = 4096
+	// RelayPacketBufferSize is reserved for the authenticated NHP_RLY outer
+	// transport. A maximum-size direct NHP packet (4096 bytes) expands to at
+	// most 5844 bytes when base64-wrapped with a request ID and a full textual
+	// IPv6 source address, then sealed under the 240-byte Curve header and
+	// 16-byte body tag. That headroom assumes a zoneless IPv6 string; native and
+	// trusted-header ingress both normalize through net.IP, so a zone identifier
+	// cannot reach SourceAddr. Six KiB carries the envelope without widening the
+	// direct-agent packet limit or every device's pooled buffer. Relay buffers
+	// come from a separate sync.Pool and therefore are not charged against the
+	// standard device pool's overload accounting; callers must place them only
+	// behind the relay/server admission and queue bounds documented at their
+	// allocation sites.
+	RelayPacketBufferSize  = 6 * 1024
 	PacketBufferPoolSize   = MaxMemoryUsage / PacketBufferSize
 	AllocateTimeToOverload = 2 // 2 seconds
 	SendQueueSize          = 10240
@@ -20,12 +33,11 @@ const (
 	// compressed NHP message body — a decompression-bomb guard (#1131).
 	//
 	// decryptBody is a post-authentication path (it runs only after the
-	// handshake + AEAD succeed) and the whole packet arrives in one UDP datagram
-	// read into a single PacketBufferSize buffer (recvPacketRoutine in
-	// endpoints/server/udpserver.go; the WebRTC ingest in webrtcserver.go copies
-	// into the same Buf), so the compressed body is always < 4 KiB and a single
-	// packet can never inflate past ~4 MiB regardless of this constant. The guard
-	// is therefore defense-in-depth, and the binding constraint is the largest
+	// handshake + AEAD succeed). Standard packets are capped at PacketBufferSize;
+	// the only exception is the authenticated RelayPacketBufferSize outer
+	// transport, which this implementation sends uncompressed. Even a malicious
+	// authenticated relay's compressed 6 KiB envelope remains bounded here, so
+	// the guard is defense-in-depth and the binding constraint is the largest
 	// *legitimate* payload, not the bomb: set the ceiling so no real
 	// single-packet body is ever rejected, while staying well under the former
 	// 10 MiB.

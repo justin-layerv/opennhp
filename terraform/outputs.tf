@@ -4,7 +4,7 @@ output "vpc_id" {
 }
 
 output "nlb_dns_name" {
-  description = "NLB DNS name for NHP server"
+  description = "Public cell NLB DNS target for native NHP SDK traffic on UDP 62206."
   value       = module.compute.nlb_dns_name
 }
 

@@ -9,13 +9,14 @@ import (
 )
 
 // maxPooledBufferSize caps the size of buffers we return to the pool.
-// Well-formed NHP packets fit within PacketBufferSize (4 KiB); the 16×
-// multiplier leaves headroom for compressible payloads that expand
-// temporarily during decompression while still capping retention well
-// below the MaxDecompressedBodySize decompression ceiling.
+// Standard NHP packets fit within PacketBufferSize (4 KiB); the dedicated
+// authenticated relay envelope is larger but is emitted uncompressed. The 16×
+// multiplier leaves headroom for standard compressible payloads that expand
+// temporarily during decompression while still capping retention well below
+// the MaxDecompressedBodySize decompression ceiling.
 // Legitimate payloads that decompress to >64 KiB are uncommon in NHP
-// (the on-wire packet is itself capped at PacketBufferSize) but not
-// illegal; such buffers are scrubbed and dropped rather than retained.
+// but are not illegal; such buffers are scrubbed and dropped rather than
+// retained.
 // The cap is about bounding steady-state pool memory, not rejecting
 // traffic.
 const maxPooledBufferSize = 16 * PacketBufferSize

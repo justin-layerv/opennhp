@@ -847,7 +847,7 @@ func TestValidatePeerKnockNotOverloadCompletesHandshake(t *testing.T) {
 // is deliberate, and assert the asymmetry that only the AC→server ack NHP_RVA
 // is admitted, NOT the server→AC revoke push NHP_REV.
 func TestIsAllowedAtOverload(t *testing.T) {
-	allowed := []int{NHP_KNK, DHP_KNK, NHP_RKN, NHP_EXT, NHP_AOL, NHP_ART, NHP_RVA}
+	allowed := []int{NHP_KNK, DHP_KNK, NHP_RKN, NHP_EXT, NHP_AOL, NHP_ART, NHP_RLY, NHP_RVA}
 	for _, ht := range allowed {
 		if !(&PacketParserData{HeaderType: ht}).IsAllowedAtOverload() {
 			t.Errorf("IsAllowedAtOverload(%s) = false, want true (must survive overload)", HeaderTypeToString(ht))

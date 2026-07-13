@@ -1,7 +1,8 @@
 # NHP-Relay module inputs (#2208 Phase-2 #5).
 #
-# The relay is the internet-facing front of the off-internet topology:
-#   Browser JS-Agent --HTTPS POST /relay/{serverId}--> NHP-Relay --NHP_RLY--> private NHP-Server
+# The relay is the HTTPS-only browser edge:
+#   Browser JS-Agent --HTTPS POST /relay/{serverId}--> NHP-Relay
+#     --NHP_RLY--> internal NHP-Server endpoint
 #
 # Horizontal fleet (#2208). The relay fleet shares ONE keypair and autoscales
 # behind the ALB across AZs. The fleet works because the cell server authenticates
@@ -11,7 +12,7 @@
 # = true (set via the server's device options; 5c), which skips the per-peer
 # source-address pin (CheckRecvAddress) that would otherwise reject all-but-one
 # instance under load. Each instance is independent (own UDP socket + pending map;
-# the server replies the ACK to the sending instance, which holds the browser's
+# the server replies with an authenticated return to the sending instance, which holds the browser's
 # HTTP connection) — no cross-instance coordination. The fleet routes by serverId
 # to one of N cells (cell_servers); each cell has its own shared server keypair +
 # server/AC fleets. See docs/design/NHP_RELAY_TOPOLOGY.md.
@@ -60,6 +61,16 @@ variable "vpc_id" {
   type        = string
 }
 
+variable "network_ready_token" {
+  description = "Opaque relay-network readiness token. Public load balancers and the ASG wait on it without deferring this module's provider data sources at plan time."
+  type        = string
+
+  validation {
+    condition     = trimspace(var.network_ready_token) != ""
+    error_message = "network_ready_token must be non-empty."
+  }
+}
+
 variable "vpc_endpoint_security_group_id" {
   description = "Security group ID shared by interface VPC endpoints. Relay instances use this for tightly scoped AWS control-plane egress (ECR, SSM, Secrets Manager, CloudWatch Logs/Metrics) instead of internet-wide outbound."
   type        = string
@@ -71,7 +82,7 @@ variable "vpc_endpoint_security_group_id" {
 }
 
 variable "server_security_group_id" {
-  description = "NHP server instance security group ID. Relay nodes accept only UDP ACK return traffic from this SG."
+  description = "NHP server instance security group ID. Relay nodes accept only authenticated UDP return traffic from this SG."
   type        = string
 
   validation {
@@ -81,7 +92,7 @@ variable "server_security_group_id" {
 }
 
 variable "public_subnet_ids" {
-  description = "Public subnet IDs for the internet-facing ALB (≥2 AZs). Pass `module.networking.public_subnet_ids`."
+  description = "Public subnet IDs for the internet-facing browser ALB (≥2 AZs). Pass the relay-network public subnet IDs."
   type        = list(string)
 
   validation {
@@ -90,28 +101,38 @@ variable "public_subnet_ids" {
   }
 }
 
-variable "private_subnet_ids" {
-  description = "Private subnet IDs for the relay ASG. The relay reaches the (private) server via in-VPC CloudMap DNS and the internet via NAT. Pass `module.networking.private_subnet_ids`."
+variable "relay_subnet_ids" {
+  description = "Isolated relay-DMZ subnet IDs for the relay ASG. These subnets have no NAT, public-IP mapping, or default route."
   type        = list(string)
 
   validation {
-    condition     = length(var.private_subnet_ids) >= 1
-    error_message = "private_subnet_ids must include at least 1 subnet."
+    condition     = length(var.relay_subnet_ids) >= 1
+    error_message = "relay_subnet_ids must include at least 1 subnet."
   }
 }
 
-variable "private_subnet_cidr_blocks" {
-  description = "Private subnet CIDR blocks that host the internal NHP server/NLB path. Relay nodes get UDP 62206 egress only to these CIDRs."
+variable "nhp_server_cidr_blocks" {
+  description = "Exact main-VPC private subnet CIDRs that host the internal NHP server/NLB path. Relay nodes get UDP 62206 egress only to these CIDRs over peering."
   type        = list(string)
 
   validation {
-    condition     = length(var.private_subnet_cidr_blocks) >= 1
-    error_message = "private_subnet_cidr_blocks must include at least 1 CIDR."
+    condition     = length(var.nhp_server_cidr_blocks) >= 1
+    error_message = "nhp_server_cidr_blocks must include at least 1 CIDR."
   }
 
   validation {
-    condition     = alltrue([for cidr in var.private_subnet_cidr_blocks : can(cidrhost(cidr, 0))])
-    error_message = "private_subnet_cidr_blocks entries must be valid CIDR notation."
+    condition     = alltrue([for cidr in var.nhp_server_cidr_blocks : can(cidrhost(cidr, 0))])
+    error_message = "nhp_server_cidr_blocks entries must be valid CIDR notation."
+  }
+}
+
+variable "asg_name" {
+  description = "Remote name for the singleton relay ASG. PR 1 uses a DMZ-specific name so Terraform can create the replacement before retiring the old main-VPC ASG."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_-]{0,254}$", var.asg_name))
+    error_message = "asg_name must be a valid Auto Scaling group name."
   }
 }
 
@@ -128,7 +149,7 @@ variable "relay_repo_arn" {
 }
 
 variable "server_ami_id" {
-  description = "AMI for the relay node. Defaults to the SSM-published server AMI (`/$${environment}/nhp/server/ami-id`) when null — that AMI ships Docker + awscli + openssl + the systemd-resolved stub-disable fix the relay needs (the relay resolves CloudMap DNS at startup via Go's pure resolver, which fails against the systemd-resolved stub; a stock Ubuntu AMI crash-loops). Override only with an AMI that carries the same baked-in fixes."
+  description = "AMI for the relay node. Defaults to the SSM-published server AMI (`/$${environment}/nhp/server/ami-id`) when null — that AMI ships Docker + awscli + openssl + the systemd-resolved stub-disable fix the relay needs when resolving its internal NLB target at startup via Go's pure resolver; a stock Ubuntu AMI crash-loops. Override only with an AMI that carries the same baked-in fixes."
   type        = string
   default     = null
 }
@@ -162,7 +183,7 @@ variable "instance_type" {
 # ── Fleet capacity / autoscaling ──
 
 variable "min_capacity" {
-  description = "Minimum relay instances. Default (null) = ONE PER AZ — length(private_subnet_ids), which is the AZ count — for AZ-redundant HA (the relay is the only internet-facing surface, so it must not be a single point of failure). The fleet authenticates by Noise IK pubkey + relay.toml registration once the server runs DisableRelayPeerValidation=true (5c)."
+  description = "Minimum relay instances. Default (null) = ONE PER AZ — length(relay_subnet_ids), which is the AZ count — for AZ-redundant HA."
   type        = number
   default     = null
 
@@ -243,9 +264,14 @@ variable "listen_port" {
 }
 
 variable "udp_listen_port" {
-  description = "UDP port the relay binds for sending NHP_RLY and receiving the server's ACK on the SAME socket. The server replies to this (instance-IP, port), so the relay SG must allow UDP ingress here from inside the VPC. Distinct from the server's 62206 for clarity."
+  description = "Private UDP port the relay binds for sending NHP_RLY and receiving the server's authenticated RelayReturn on the SAME socket. The server replies to this (instance-IP, port), so the relay SG must allow UDP ingress here from inside the VPC. This is 62207 and must not be public; native SDKs bypass the relay and enter their assigned cell's public NLB on UDP 62206."
   type        = number
   default     = 62207
+
+  validation {
+    condition     = var.udp_listen_port == 62207
+    error_message = "udp_listen_port is the fixed private relay return socket and must remain 62207."
+  }
 }
 
 variable "cors_allowed_origins" {

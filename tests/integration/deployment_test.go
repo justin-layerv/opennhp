@@ -218,13 +218,14 @@ func TestEtcd_ACRegistry(t *testing.T) {
 	}
 }
 
-func TestNHPServer_UDPReachable(t *testing.T) {
+func TestNHPServer_UDPAddressResolvesAndSendSucceeds(t *testing.T) {
 	cfg := loadTestConfig(t)
 	if cfg.nhpServer == "" {
 		t.Skip("NHP_SERVER_ENDPOINT not set, skipping NHP server test")
 	}
 
-	// Try to establish UDP connection to NHP server
+	// Resolve and create a connected UDP socket. UDP has no transport handshake;
+	// this does not prove that the NLB or server processed the datagram.
 	addr, err := net.ResolveUDPAddr("udp", cfg.nhpServer)
 	if err != nil {
 		t.Fatalf("Failed to resolve NHP server address: %v", err)
@@ -239,14 +240,15 @@ func TestNHPServer_UDPReachable(t *testing.T) {
 	// Set a short deadline for the test
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	// Send a small test packet (won't be a valid NHP packet, but tests network reachability)
-	// The server should drop it silently
+	// Send an intentionally invalid NHP packet. A successful Write proves only
+	// local resolution/socket/send behavior. #3184 tracks a valid external SDK
+	// protocol round trip before direct UDP SDK traffic is enabled.
 	_, err = conn.Write([]byte{0x00})
 	if err != nil {
 		t.Fatalf("Failed to write to NHP server: %v", err)
 	}
 
-	t.Logf("NHP server %s is reachable via UDP", cfg.nhpServer)
+	t.Logf("UDP endpoint %s resolved and accepted a local datagram send", cfg.nhpServer)
 }
 
 func TestNHPServer_DNSResolution(t *testing.T) {

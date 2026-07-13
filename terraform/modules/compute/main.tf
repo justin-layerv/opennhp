@@ -730,24 +730,38 @@ resource "aws_security_group" "server" {
 
 # NHP Protocol (UDP 62206) - knock packets.
 #
-# Source CIDR tracks the knock surface. NLBs run preserve_client_ip=true, so the
-# rule must admit the ORIGINAL client IP, not the NLB node IP:
-#   - public (default): 0.0.0.0/0 — the public NLB forwards internet client IPs.
-#   - private (#2628, public_server_surface_enabled=false): var.vpc_cidr — the public
-#     NLB is gone and the ONLY remaining UDP 62206 ingress is the in-VPC internal
-#     relay NLB (relay/AC forwards carry an in-VPC source). This same rule already
-#     admits the relay->server hop today (see the aws_lb.server_internal block), so it
-#     is NARROWED here rather than removed — deleting it would break the relay path too.
+# NLBs preserve the original client IP, so the required public SDK edge needs
+# 0.0.0.0/0 on exactly UDP 62206. Exact peered relay /24 rules below document the
+# internal relay path independently.
 resource "aws_vpc_security_group_ingress_rule" "server_nhp_udp" {
   security_group_id = aws_security_group.server.id
-  description       = var.public_server_surface_enabled ? "NHP Protocol from NLB" : "NHP Protocol from in-VPC relay/AC (server private, #2628)"
+  description       = "NHP Protocol from assigned-cell public NLB"
   from_port         = 62206
   to_port           = 62206
   ip_protocol       = "udp"
-  cidr_ipv4         = var.public_server_surface_enabled ? "0.0.0.0/0" : var.vpc_cidr
+  cidr_ipv4         = "0.0.0.0/0"
 
   tags = {
     Name = "${var.name_prefix}-server-nhp-udp"
+  }
+}
+
+# Peered relay-DMZ ingress. The internal NLB preserves the relay instance's
+# source IP, so the server SG must admit each exact relay subnet CIDR. Keep this
+# separate from server_nhp_udp: the main-VPC rule still serves in-VPC AC traffic,
+# while this set is independently reviewable and removable with the DMZ.
+resource "aws_vpc_security_group_ingress_rule" "server_nhp_udp_additional" {
+  for_each = toset(var.additional_nhp_udp_ingress_cidrs)
+
+  security_group_id = aws_security_group.server.id
+  description       = "NHP Protocol from peered relay DMZ subnet"
+  from_port         = 62206
+  to_port           = 62206
+  ip_protocol       = "udp"
+  cidr_ipv4         = each.value
+
+  tags = {
+    Name = "${var.name_prefix}-server-nhp-udp-${replace(each.value, "/", "-")}"
   }
 }
 
@@ -1363,15 +1377,10 @@ resource "aws_autoscaling_policy" "cpu" {
 # copies DesiredCapacity to the standby ASG, so the spurious 4 propagated
 # permanently. CPU target-tracking (70%) is sufficient for real load scaling.
 
-# Network Load Balancer (PUBLIC knock surface).
-# #2628: count-gated on public_server_surface_enabled so take_server_private removes
-# the entire public NLB. A moved {} block (moved.tf) migrates the pre-existing
-# un-indexed state address to [0], so the default (enabled) path shows NO diff and
-# the disabled path is a clean destroy — never a destroy+recreate. In prod,
-# enable_deletion_protection=true means a future prod cutover must disable protection
-# before this can be destroyed (rollout-ledger checklist).
+# Network Load Balancer (PUBLIC native SDK knock surface). Constant count keeps
+# the indexed state address introduced by #2628.
 resource "aws_lb" "server" {
-  count              = var.public_server_surface_enabled ? 1 : 0
+  count              = 1
   name               = replace("${var.name_prefix}-nlb", "_", "-")
   internal           = false
   load_balancer_type = "network"
@@ -1387,14 +1396,19 @@ resource "aws_lb" "server" {
   })
 }
 
-# UDP Target Group (PUBLIC knock surface) — #2628 count-gated, see aws_lb.server.
+# UDP Target Group (PUBLIC knock surface). Constant count preserves state shape.
 resource "aws_lb_target_group" "udp" {
-  count       = var.public_server_surface_enabled ? 1 : 0
+  count       = 1
   name        = replace("${var.name_prefix}-udp", "_", "-")
   port        = 62206
   protocol    = "UDP"
   vpc_id      = var.vpc_id
   target_type = "instance"
+
+  # Direct SDK knocks must retain the original client address at nhp-server.
+  # Keep this explicit even though AWS enables it for UDP instance targets so
+  # the public edge contract is visible and plan-validated for both colors.
+  preserve_client_ip = true
 
   # HTTP health check on port 8888 (NHP Server HTTP listener)
   # Uses /health/live endpoint for Kubernetes-style liveness probe
@@ -1419,16 +1433,16 @@ resource "aws_lb_target_group" "udp" {
   })
 }
 
-# Attach ASG to Target Group (PUBLIC knock surface) — #2628 count-gated.
+# Attach ASG to the required public UDP target group.
 resource "aws_autoscaling_attachment" "server" {
-  count                  = var.public_server_surface_enabled ? 1 : 0
+  count                  = 1
   autoscaling_group_name = aws_autoscaling_group.server.name
   lb_target_group_arn    = aws_lb_target_group.udp[0].arn
 }
 
-# UDP Listener (PUBLIC knock surface) — #2628 count-gated, see aws_lb.server.
+# UDP Listener (required PUBLIC knock surface).
 resource "aws_lb_listener" "udp" {
-  count             = var.public_server_surface_enabled ? 1 : 0
+  count             = 1
   load_balancer_arn = aws_lb.server[0].arn
   port              = 62206
   protocol          = "UDP"
@@ -1470,13 +1484,9 @@ resource "aws_lb_listener" "udp" {
 # churn). This internal NLB gives the relay a stable, load-balanced,
 # churn-resilient target whose DNS name never changes.
 #
-# This is a NON-BREAKING ADD that runs in parallel with the PUBLIC
-# `aws_lb.server` above — that one stays untouched (legacy UDP agents, the
-# resolver HTTPS listener, and external ACs still depend on it). Gated on
-# var.relay_enabled (= deploy_relay): created ONLY where the relay is deployed,
-# so there is no idle NLB in prod (deploy_relay=false → no relay to dial it; the
-# NLB is created when prod enables the relay). The matching host flip lives in the
-# root `module "relay"` call, which is likewise count-gated on deploy_relay.
+# This internal target always coexists with the public server NLB and serves only
+# relay-to-server NHP_RLY traffic. relay_enabled (= deploy_relay) count-gates it,
+# so dark production creates no idle relay-only NLB.
 #
 # Mirrors the public UDP path's per-resource config (cross-zone, deletion
 # protection per env, UDP 62206, instance target type, /health/live HTTP health
@@ -1490,14 +1500,15 @@ resource "aws_lb_listener" "udp" {
 #     one-time qURL knocks to a warm-standby server can commit qURL admission and
 #     then fail AC-open if that standby is not in the live AC assignment set.
 #
-# preserve_client_ip = true (mirrors the public TG's behaviour, see below): the
-# server sees the relay INSTANCE's IP as the packet source and replies DIRECTLY
-# to it, bypassing an NLB return hop. That is correct here — the relay's recvLoop
-# reads the ACK from any source address and dispatches by inner counter, and the
-# relay SG already admits this return (modules/relay/compute.tf
-# ::aws_vpc_security_group_ingress_rule.relay_udp_ack_return, UDP from the VPC
-# CIDR). The server-side inbound is already covered by
-# aws_vpc_security_group_ingress_rule.server_nhp_udp (UDP 62206 from 0.0.0.0/0).
+# preserve_client_ip = true: the server sees the relay INSTANCE's private source
+# IP and UDP 62207 source port. It returns the authenticated RelayReturnMsg
+# directly to that instance and port, bypassing an NLB return hop. The relay
+# validates the envelope and dispatches by random RequestID; its SG admits UDP
+# 62207 only from the server SG
+# (modules/relay/compute.tf::aws_vpc_security_group_ingress_rule.relay_udp_ack_return).
+# The explicit peered relay-subnet rules preserve auditable topology evidence
+# for this private path. The required public UDP 62206 base rule also remains in
+# force for direct assigned-cell SDK traffic.
 resource "aws_lb" "server_internal" {
   count              = var.relay_enabled ? 1 : 0
   name               = replace("${var.name_prefix}-srv-int", "_", "-")
@@ -1756,10 +1767,7 @@ resource "aws_autoscaling_attachment" "https" {
 resource "aws_lb_listener" "https" {
   count = var.enable_qurl_resolve_endpoint ? 1 : 0
 
-  # aws_lb.server is now count-gated (#2628). enable_qurl_resolve_endpoint is always
-  # false whenever public_server_surface_enabled is false (the take_server_private
-  # precondition forces qurl_link_js_agent_enabled=true, which disables resolve), so
-  # aws_lb.server[0] is guaranteed present whenever this listener exists.
+  # aws_lb.server retains its indexed state address and is always present.
   load_balancer_arn = aws_lb.server[0].arn
   port              = 443
   protocol          = "TLS"
@@ -1781,15 +1789,6 @@ resource "aws_lb_listener" "https" {
     precondition {
       condition     = var.qurl_resolve_certificate_arn != null
       error_message = "qurl_resolve_certificate_arn is required when enable_qurl_resolve_endpoint is true."
-    }
-    # #2628: this listener attaches to the public NLB (aws_lb.server[0]), which is
-    # not created when public_server_surface_enabled is false. The root forbids this
-    # combo (take_server_private forces qurl_link_js_agent_enabled, which disables
-    # enable_qurl_resolve_endpoint), but assert it module-locally so a standalone
-    # module use fails with a clear message instead of an index-out-of-range error.
-    precondition {
-      condition     = var.public_server_surface_enabled
-      error_message = "enable_qurl_resolve_endpoint = true requires public_server_surface_enabled = true: the resolve HTTPS listener attaches to the public NLB (aws_lb.server), which is not created when the public knock surface is removed (#2628)."
     }
     # Same blue/green traffic-switch concern as the UDP listener above —
     # blue-green-switch.sh flips `default_action.target_group_arn` on

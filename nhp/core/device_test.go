@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -183,6 +184,59 @@ func TestEncryptedPktChWrittenExactlyOnce(t *testing.T) {
 		t.Fatalf("second write on EncryptedPktCh (%#v) — single-writer invariant broken; see the two writer sites in device.go's msgToPacketRoutine", got)
 	case <-time.After(200 * time.Millisecond):
 		// good: exactly one write
+	}
+}
+
+func TestKeepaliveEncryptedPktChCompletesOnSuccessAndError(t *testing.T) {
+	silenceGlobalLogger(t)
+	device := NewDevice(NHP_AC, append([]byte{1}, make([]byte, PrivateKeySize-1)...), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	device.Start()
+	t.Cleanup(device.Stop)
+
+	for _, tc := range []struct {
+		name       string
+		external   *Packet
+		wantErr    bool
+		wantPacket bool
+	}{
+		{name: "success", wantPacket: true},
+		{name: "assembly error", external: &Packet{Content: make([]byte, 1)}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encCh := make(chan *MsgAssemblerData, 1)
+			device.SendMsgToPacket(&MsgData{
+				HeaderType:     NHP_KPL,
+				TransactionId:  1,
+				ExternalPacket: tc.external,
+				EncryptedPktCh: encCh,
+			})
+			select {
+			case mad := <-encCh:
+				if mad == nil {
+					t.Fatal("keepalive completion returned nil assembler")
+				}
+				if tc.wantErr && !errors.Is(mad.Error, ErrPacketSizeExceedsBuffer) {
+					t.Fatalf("keepalive error = %v, want ErrPacketSizeExceedsBuffer", mad.Error)
+				}
+				if !tc.wantErr && mad.Error != nil {
+					t.Fatalf("keepalive completion error = %v", mad.Error)
+				}
+				if tc.wantPacket && (mad.BasePacket == nil || mad.BasePacket.HeaderType != NHP_KPL || len(mad.BasePacket.Content) != mad.BasePacket.MinimalLength()) {
+					t.Fatalf("keepalive packet = %#v, want assembled NHP_KPL", mad.BasePacket)
+				}
+				mad.Destroy()
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for keepalive EncryptedPktCh completion")
+			}
+			select {
+			case got := <-encCh:
+				t.Fatalf("second keepalive completion %#v", got)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
 	}
 }
 

@@ -176,28 +176,18 @@ where the surface is live (prod, and the localhost stack). `01_health`,
 all carry the gate; `04_blue_green` drops its `server/https` listener check
 on this gate.
 
-**A second, independent gate covers the UDP knock surface (#2628).**
-`take_server_private` (→ `public_server_surface_enabled = !take_server_private`)
-removes the *public* UDP 62206 NLB, its listener, and the
-`udp-listener-arn` / `{color}-udp-tg-arn` SSM params — the relay/AC then reach
-the cell over the internal NLB. The internal relay listener still follows
-active color via `internal-udp-listener-arn` and
-`{color}-internal-udp-tg-arn`, so `04_blue_green` asserts it whenever that
-listener exists, and requires it when the public UDP surface is private. This is
-**distinct from** the resolve/JS-agent gate above:
-`take_server_private=true` *requires* the resolve endpoint already be off
-(`terraform/main.tf` precondition), but not vice-versa, so "resolve off + UDP
-still public" is a valid intermediate rollout state (sandbox pre-#2628; prod
-today has both public). Do **not** collapse the two gates — that would silently
-skip the UDP-listener assertion while the public knock surface is still live.
-`04_blue_green`'s `server/udp` check gates on `serverPublicKnockSurfaceEnabled(t)`,
-which reads the Terraform-owned `/{env}/nhp/server/take-server-private` marker
-directly from SSM (present in every blue/green env; value flips between states)
-rather than a hardcoded env-list mirror — so unlike `ResolveEndpointEnabled` it
-needs no drift-fence test, and it mirrors `blue-green-switch.sh`'s fail-closed
-policy: skip the check ONLY when the marker is explicitly `"true"`, else keep it
-live so a dropped public listener fails loud. Pure truth table locked in
-`config_test.go::TestPublicKnockSurfaceFromMarker`.
+**UDP 62206 on the assigned cell NHP NLB is a public invariant.** Upcoming
+native UDP SDKs bypass the HTTPS relay and connect directly to their assigned
+cell, so every blue/green environment retains the public server NLB, its sole
+UDP 62206 listener, and the `udp-listener-arn` / `{color}-udp-tg-arn` SSM
+parameters. The relay separately reaches the same cell through the internal
+listener tracked by `internal-udp-listener-arn` and
+`{color}-internal-udp-tg-arn`; `04_blue_green` asserts both active-color
+contracts. The retired `take-server-private` SSM cutover marker has no supported
+consumer and is removed by Terraform. `04_blue_green` unconditionally asserts
+the public listener and active target group. This UDP invariant is independent
+of the legacy HTTPS resolve surface above, which may still be disabled in
+JS-agent environments.
 
 `ResolveEndpointEnabled` MUST stay the inverse of
 `qurlLinkJSAgentEnabledEnvs` (the `16_qurl_link_frontend_test.go` mirror of

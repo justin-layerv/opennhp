@@ -150,6 +150,61 @@ func TestDispatchHandler_NilSemUnbounded(t *testing.T) {
 	}
 }
 
+func TestDispatchHandler_RegistersShutdownOwnershipBeforeLaunch(t *testing.T) {
+	s := newTestServerWithHandlerBudget(t, 1)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s.dispatchHandler(newDispatchPPD(core.NHP_RLY, `{}`), func(_ *core.PacketParserData) error {
+		close(entered)
+		<-release
+		return nil
+	})
+	<-entered
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("shutdown barrier returned while the dispatched relay handler was blocked")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown barrier did not observe the dispatched relay handler exit")
+	}
+}
+
+func TestDispatchAsync_RegistersShutdownOwnershipBeforeLaunch(t *testing.T) {
+	s := &UdpServer{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s.dispatchAsync(func() {
+		close(entered)
+		<-release
+	})
+	<-entered
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("shutdown barrier returned while the trusted-peer handler was blocked")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown barrier did not observe the trusted-peer handler exit")
+	}
+}
+
 // TestDispatchHandler_ReleasesSlotOnError fences that a bounded handler
 // whose fn returns a non-nil error still frees its budget slot. The
 // release rides a defer so it's structurally covered, but without this a

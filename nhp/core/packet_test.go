@@ -37,10 +37,14 @@ func TestPacketMinimalLengthPanicsAfterRelease(t *testing.T) {
 	if got := pkt.MinimalLength(); got == 0 {
 		t.Fatalf("pre-release MinimalLength = %d; want > 0", got)
 	}
+	pkt.HeaderType = NHP_KNK
 
 	device.ReleasePoolPacket(pkt)
 	if pkt.Content != nil {
 		t.Fatalf("ReleasePoolPacket should nil pkt.Content; got len=%d", len(pkt.Content))
+	}
+	if pkt.HeaderType != 0 {
+		t.Fatalf("ReleasePoolPacket retained HeaderType %d", pkt.HeaderType)
 	}
 
 	// Post-release: MinimalLength must panic. A caller that silently
@@ -199,6 +203,12 @@ func TestNHPRelayRecvHeaderType_AllowlistMatrix(t *testing.T) {
 			t.Errorf("CheckRecvHeaderType(%s) = %v for NHP_RELAY, want %v",
 				HeaderTypeToString(typ), got, want)
 		}
+	}
+
+	// DHP_KNK is a native-UDP-only request. Keep it out of this HTTPS relay
+	// gate even though nativePacketCounter deliberately admits it.
+	if relayDev.CheckRecvHeaderType(DHP_KNK) {
+		t.Error("NHP_RELAY CheckRecvHeaderType unexpectedly admits native-only DHP_KNK")
 	}
 
 	// The sender identities of the two newly relay-permitted types are

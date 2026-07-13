@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # blue-green-switch_test.sh — fixture tests for .github/scripts/blue-green-switch.sh
 # ----------------------------------------------------------------------------
-# #2628 takes nhp-server private: the public UDP NLB and its
-# /<env>/nhp/server/udp-listener-arn SSM param are removed, so the blue/green
-# switch must flip the internal relay UDP listener instead. This fences that
-# contract:
-#   - server + MISSING udp-listener-arn + private marker -> flip internal-udp, record active-color, rc=0
-#   - server + present listener + TGs                    -> normal flip still happens (regression guard)
-#   - ac     + MISSING tcp-listener-arn                  -> still a hard error (the server fallback is not global)
+# Direct-cell UDP SDKs require the public server NLB on UDP 62206. This fences
+# the listener-switch contract:
+#   - server always requires udp-listener-arn and its color target groups
+#   - a deployed relay makes its internal listener/TGs mandatory
+#   - every present listener and rollback TG is preflighted before mutation
+#   - any switch or active-color failure rolls all changed listeners back
+#   - AC still requires its TCP listener independently
 #
 # Each case puts a fake `aws` on PATH and runs the REAL switch script. The fake
 # records modify-listener / put-parameter calls so we can assert what happened.
@@ -57,6 +57,9 @@ case "$svc/$sub" in
     ;;
   ssm/put-parameter)
     printf '%s\t%s\n' "$name" "$(opt_val --value "$@" || true)" >> "$FAKE_PUTS"
+    if [[ -n "${FAKE_FAIL_PUT_NAME:-}" && "$name" == "$FAKE_FAIL_PUT_NAME" ]]; then
+      exit 78
+    fi
     ;;
   elbv2/modify-listener)
     listener=$(opt_val --listener-arn "$@" || true)
@@ -64,6 +67,10 @@ case "$svc/$sub" in
     printf 'listener=%s actions=%s\n' \
       "$listener" \
       "$actions" >> "$FAKE_MODIFY"
+    call_no=$(wc -l < "$FAKE_MODIFY" | tr -d ' ')
+    if [[ ",${FAKE_FAIL_MODIFY_CALLS:-}," == *",${call_no},"* ]]; then
+      exit 79
+    fi
     if [[ -n "${FAKE_FAIL_MODIFY_LISTENER:-}" && "$listener" == "$FAKE_FAIL_MODIFY_LISTENER" ]]; then
       exit 77
     fi
@@ -85,6 +92,7 @@ _run() {
   local bindir; bindir=$(mktemp -d)
   make_fake_aws "$bindir"
   export FAKE_PARAMS FAKE_PUTS FAKE_MODIFY FAKE_FAIL_MODIFY_LISTENER
+  export FAKE_FAIL_MODIFY_CALLS FAKE_FAIL_PUT_NAME
   : > "$FAKE_PUTS"
   : > "$FAKE_MODIFY"
   OUT=$(PATH="$bindir:$PATH" DRY_RUN=false AWS_REGION=us-east-2 \
@@ -99,29 +107,27 @@ FAKE_PARAMS="$WORK/params"
 FAKE_PUTS="$WORK/puts"
 FAKE_MODIFY="$WORK/modify"
 FAKE_FAIL_MODIFY_LISTENER=""
+FAKE_FAIL_MODIFY_CALLS=""
+FAKE_FAIL_PUT_NAME=""
 
 echo "Running blue-green-switch tests..."
 
-# --- Case 1: private server — no public udp listener BUT take-server-private=true ->
-# flip the internal relay UDP listener, then record color. Also asserts the
-# SECONDARY (HTTPS) block runs as a safe no-op after the primary switch: https is
-# likewise absent when private, so it must log "No https listener configured".
+# --- Case 1: an HTTPS listener without both target and rollback TGs fails the
+# complete preflight before any listener or authoritative state mutation.
 {
   printf '/sandbox/nhp/server/active-color\tblue\n'
-  printf '/sandbox/nhp/server/take-server-private\ttrue\n'
-  printf '/sandbox/nhp/server/internal-udp-listener-arn\tarn:aws:elbv2:::listener/internal-udp\n'
-  printf '/sandbox/nhp/server/blue-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-blue\n'
-  printf '/sandbox/nhp/server/green-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-green\n'
+  printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
+  printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
+  printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+  printf '/sandbox/nhp/server/https-listener-arn\tarn:aws:elbv2:::listener/https\n'
+  printf '/sandbox/nhp/server/green-https-tg-arn\tarn:aws:elbv2:::tg/https-green\n'
 } > "$FAKE_PARAMS"
 _run server green
-if [[ "$RC" -eq 0 ]] && [[ "$OUT" == *"Switching the internal relay UDP listener instead"* ]] \
-   && [[ "$OUT" == *"No https listener configured"* ]] \
-   && grep -q "listener/internal-udp" "$FAKE_MODIFY" \
-   && grep -q "tg/internal-green" "$FAKE_MODIFY" \
-   && grep -qE "active-color[[:space:]]+green" "$FAKE_PUTS"; then
-  report_pass "private server (marker=true) flips internal relay UDP listener, HTTPS no-ops, records active-color=green"
+if [[ "$RC" -ne 0 ]] && [[ ! -s "$FAKE_MODIFY" ]] && [[ ! -s "$FAKE_PUTS" ]] \
+   && [[ "$OUT" == *"https target group ARNs are missing"* ]]; then
+  report_pass "missing HTTPS rollback TG fails before any traffic mutation"
 else
-  report_fail "private server flips internal relay listener" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
+  report_fail "HTTPS TGs are fully preflighted" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
 fi
 
 # --- Case 2: normal server switch (listener + TGs present) -> flip to green TG
@@ -170,55 +176,50 @@ else
   report_fail "AC missing primary listener errors" "rc=$RC modify=$(cat "$FAKE_MODIFY") out=<<<$OUT>>>"
 fi
 
-# --- Case 5: server with NO udp listener AND NO take-server-private marker -> HARD FAIL.
-# Guards the silent-skip-widening risk: a botched public apply / SSM drift / accidental
-# param deletion on a PUBLIC server must fail loudly, not skip the switch and report green.
+# --- Case 5: a server with no UDP listener hard-fails; the required public edge
+# can never disappear.
 printf '/sandbox/nhp/server/active-color\tblue\n' > "$FAKE_PARAMS"
 _run server green
-if [[ "$RC" -ne 0 ]] && [[ ! -s "$FAKE_MODIFY" ]] && [[ "$OUT" == *"take-server-private is not 'true'"* ]]; then
-  report_pass "server missing listener WITHOUT private marker hard-fails (no silent skip)"
+if [[ "$RC" -ne 0 ]] && [[ ! -s "$FAKE_MODIFY" ]] && [[ "$OUT" == *"required udp listener ARN"* ]]; then
+  report_pass "server missing public UDP listener hard-fails"
 else
-  report_fail "server missing listener without marker hard-fails" "rc=$RC modify=$(cat "$FAKE_MODIFY") out=<<<$OUT>>>"
+  report_fail "server missing public listener hard-fails" "rc=$RC modify=$(cat "$FAKE_MODIFY") out=<<<$OUT>>>"
 fi
 
-# --- Case 6: private marker true but the internal listener SSM contract is absent
-# -> HARD FAIL before active-color is updated. This catches the exact dangerous
-# drift where a private server deploy reports green without an active relay switch
-# point.
-{
-  printf '/sandbox/nhp/server/active-color\tblue\n'
-  printf '/sandbox/nhp/server/take-server-private\ttrue\n'
-} > "$FAKE_PARAMS"
-_run server green
-if [[ "$RC" -ne 0 ]] && [[ ! -s "$FAKE_MODIFY" ]] && [[ ! -s "$FAKE_PUTS" ]] \
-   && [[ "$OUT" == *"relay path has no active-color switch point"* ]]; then
-  report_pass "private server missing internal listener hard-fails before active-color update"
-else
-  report_fail "private server missing internal listener hard-fails" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
-fi
-
-# --- Case 7: migration state with public UDP + internal relay UDP, but the
-# target internal TG is missing -> roll back the already-switched public listener
-# and do not record active-color.
+# --- Case 6: a deployed relay requires the internal listener before any public
+# listener mutation.
 {
   printf '/sandbox/nhp/server/active-color\tblue\n'
   printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
   printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
   printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+  printf '/sandbox/nhp/relay/asg-name\tlayerv-nhp-sandbox-relay-dmz\n'
+} > "$FAKE_PARAMS"
+_run server green
+if [[ "$RC" -ne 0 ]] && [[ ! -s "$FAKE_MODIFY" ]] && [[ ! -s "$FAKE_PUTS" ]] \
+   && [[ "$OUT" == *"required internal UDP listener ARN"* ]]; then
+  report_pass "deployed relay requires internal listener before public switch"
+else
+  report_fail "deployed relay missing internal listener hard-fails" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
+fi
+
+# --- Case 7: public UDP + internal relay UDP, but the target internal TG is
+# missing -> fail preflight before either listener or active-color moves.
+{
+  printf '/sandbox/nhp/server/active-color\tblue\n'
+  printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
+  printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
+  printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+  printf '/sandbox/nhp/relay/asg-name\tlayerv-nhp-sandbox-relay-dmz\n'
   printf '/sandbox/nhp/server/internal-udp-listener-arn\tarn:aws:elbv2:::listener/internal-udp\n'
   printf '/sandbox/nhp/server/blue-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-blue\n'
 } > "$FAKE_PARAMS"
 _run server green
-modify_lines=$(wc -l < "$FAKE_MODIFY" | tr -d ' ')
-first_modify=$(sed -n '1p' "$FAKE_MODIFY")
-second_modify=$(sed -n '2p' "$FAKE_MODIFY")
-if [[ "$RC" -ne 0 ]] && [[ "$modify_lines" == "2" ]] && [[ ! -s "$FAKE_PUTS" ]] \
-   && [[ "$first_modify" == *"listener/udp"* && "$first_modify" == *"tg/green"* ]] \
-   && [[ "$second_modify" == *"listener/udp"* && "$second_modify" == *"tg/blue"* ]] \
+if [[ "$RC" -ne 0 ]] && [[ ! -s "$FAKE_MODIFY" ]] && [[ ! -s "$FAKE_PUTS" ]] \
    && [[ "$OUT" == *"Internal relay listener exists but one or more internal UDP target group ARNs are missing"* ]]; then
-  report_pass "missing internal relay target TG rolls back public UDP and skips active-color"
+  report_pass "missing internal relay target TG fails before public UDP switch"
 else
-  report_fail "missing internal relay target TG rolls back public UDP" "rc=$RC lines=$modify_lines modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
+  report_fail "missing internal relay target TG preflight" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
 fi
 
 # --- Case 8: migration state with public UDP + internal relay UDP, but the
@@ -229,6 +230,7 @@ fi
   printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
   printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
   printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+  printf '/sandbox/nhp/relay/asg-name\tlayerv-nhp-sandbox-relay-dmz\n'
   printf '/sandbox/nhp/server/internal-udp-listener-arn\tarn:aws:elbv2:::listener/internal-udp\n'
   printf '/sandbox/nhp/server/blue-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-blue\n'
   printf '/sandbox/nhp/server/green-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-green\n'
@@ -250,22 +252,23 @@ else
   report_fail "failed internal relay switch rolls back public UDP" "rc=$RC lines=$modify_lines modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
 fi
 
-# --- Case 9: private marker true and internal listener exists, but the target
-# internal TG is missing -> HARD FAIL before any listener switch or active-color
-# write. This keeps the private-only error message explicit about the relay
-# active-color switch point.
+# --- Case 9: failure to write the non-authoritative timestamp does not undo a
+# completed listener switch and authoritative active-color update.
 {
   printf '/sandbox/nhp/server/active-color\tblue\n'
-  printf '/sandbox/nhp/server/take-server-private\ttrue\n'
-  printf '/sandbox/nhp/server/internal-udp-listener-arn\tarn:aws:elbv2:::listener/internal-udp\n'
-  printf '/sandbox/nhp/server/blue-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-blue\n'
+  printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
+  printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
+  printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
 } > "$FAKE_PARAMS"
+FAKE_FAIL_PUT_NAME="/sandbox/nhp/server/last-switch-timestamp"
 _run server green
-if [[ "$RC" -ne 0 ]] && [[ ! -s "$FAKE_MODIFY" ]] && [[ ! -s "$FAKE_PUTS" ]] \
-   && [[ "$OUT" == *"relay path has no active-color switch point"* ]]; then
-  report_pass "private server missing target internal TG hard-fails before active-color update"
+FAKE_FAIL_PUT_NAME=""
+if [[ "$RC" -eq 0 ]] && grep -q 'tg/green' "$FAKE_MODIFY" \
+   && grep -qE 'active-color[[:space:]]+green' "$FAKE_PUTS" \
+   && [[ "$OUT" == *"Failed to record non-authoritative switch timestamp"* ]]; then
+  report_pass "timestamp failure remains non-authoritative after active-color succeeds"
 else
-  report_fail "private server missing target internal TG hard-fails" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
+  report_fail "timestamp write is non-authoritative" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
 fi
 
 # --- Case 10: public switch has the target TG but the current-color rollback TG
@@ -282,6 +285,76 @@ if [[ "$RC" -ne 0 ]] && [[ ! -s "$FAKE_MODIFY" ]] && [[ ! -s "$FAKE_PUTS" ]] \
   report_pass "missing current-color primary rollback TG hard-fails before listener switch"
 else
   report_fail "missing current-color rollback TG hard-fails" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
+fi
+
+# --- Case 11: all three listeners switch, but authoritative active-color write
+# fails. Roll back HTTPS, internal UDP, and public UDP in exact reverse order.
+{
+  printf '/sandbox/nhp/server/active-color\tblue\n'
+  printf '/sandbox/nhp/server/udp-listener-arn\tarn:aws:elbv2:::listener/udp\n'
+  printf '/sandbox/nhp/server/blue-udp-tg-arn\tarn:aws:elbv2:::tg/blue\n'
+  printf '/sandbox/nhp/server/green-udp-tg-arn\tarn:aws:elbv2:::tg/green\n'
+  printf '/sandbox/nhp/server/internal-udp-listener-arn\tarn:aws:elbv2:::listener/internal-udp\n'
+  printf '/sandbox/nhp/server/blue-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-blue\n'
+  printf '/sandbox/nhp/server/green-internal-udp-tg-arn\tarn:aws:elbv2:::tg/internal-green\n'
+  printf '/sandbox/nhp/server/https-listener-arn\tarn:aws:elbv2:::listener/https\n'
+  printf '/sandbox/nhp/server/blue-https-tg-arn\tarn:aws:elbv2:::tg/https-blue\n'
+  printf '/sandbox/nhp/server/green-https-tg-arn\tarn:aws:elbv2:::tg/https-green\n'
+} > "$FAKE_PARAMS"
+FAKE_FAIL_PUT_NAME="/sandbox/nhp/server/active-color"
+_run server green
+FAKE_FAIL_PUT_NAME=""
+modify_lines=$(wc -l < "$FAKE_MODIFY" | tr -d ' ')
+call1=$(sed -n '1p' "$FAKE_MODIFY"); call2=$(sed -n '2p' "$FAKE_MODIFY")
+call3=$(sed -n '3p' "$FAKE_MODIFY"); call4=$(sed -n '4p' "$FAKE_MODIFY")
+call5=$(sed -n '5p' "$FAKE_MODIFY"); call6=$(sed -n '6p' "$FAKE_MODIFY")
+if [[ "$RC" -ne 0 ]] && [[ "$modify_lines" == "6" ]] \
+   && [[ "$call1" == *'listener/udp'* && "$call1" == *'tg/green'* ]] \
+   && [[ "$call2" == *'listener/internal-udp'* && "$call2" == *'tg/internal-green'* ]] \
+   && [[ "$call3" == *'listener/https'* && "$call3" == *'tg/https-green'* ]] \
+   && [[ "$call4" == *'listener/https'* && "$call4" == *'tg/https-blue'* ]] \
+   && [[ "$call5" == *'listener/internal-udp'* && "$call5" == *'tg/internal-blue'* ]] \
+   && [[ "$call6" == *'listener/udp'* && "$call6" == *'tg/blue'* ]]; then
+  report_pass "active-color failure rolls every switched listener back in reverse order"
+else
+  report_fail "active-color failure is transactionally rolled back" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
+fi
+
+# --- Case 12: the secondary HTTPS forward switch fails after public and internal
+# UDP move. Both prior listeners are restored and active-color is not written.
+FAKE_FAIL_MODIFY_LISTENER="arn:aws:elbv2:::listener/https"
+_run server green
+FAKE_FAIL_MODIFY_LISTENER=""
+modify_lines=$(wc -l < "$FAKE_MODIFY" | tr -d ' ')
+call3=$(sed -n '3p' "$FAKE_MODIFY"); call4=$(sed -n '4p' "$FAKE_MODIFY")
+call5=$(sed -n '5p' "$FAKE_MODIFY")
+if [[ "$RC" -ne 0 ]] && [[ "$modify_lines" == "5" ]] && [[ ! -s "$FAKE_PUTS" ]] \
+   && [[ "$call3" == *'listener/https'* && "$call3" == *'tg/https-green'* ]] \
+   && [[ "$call4" == *'listener/internal-udp'* && "$call4" == *'tg/internal-blue'* ]] \
+   && [[ "$call5" == *'listener/udp'* && "$call5" == *'tg/blue'* ]]; then
+  report_pass "failed HTTPS switch restores both earlier UDP listeners"
+else
+  report_fail "failed HTTPS switch rolls back prior listeners" "rc=$RC modify=$(cat "$FAKE_MODIFY") puts=$(cat "$FAKE_PUTS") out=<<<$OUT>>>"
+fi
+
+# --- Case 13: one rollback call fails after the active-color write fails. The
+# rollback routine still attempts every remaining listener repair.
+FAKE_FAIL_PUT_NAME="/sandbox/nhp/server/active-color"
+FAKE_FAIL_MODIFY_CALLS="4"
+_run server green
+FAKE_FAIL_MODIFY_CALLS=""
+FAKE_FAIL_PUT_NAME=""
+modify_lines=$(wc -l < "$FAKE_MODIFY" | tr -d ' ')
+call4=$(sed -n '4p' "$FAKE_MODIFY"); call5=$(sed -n '5p' "$FAKE_MODIFY")
+call6=$(sed -n '6p' "$FAKE_MODIFY")
+if [[ "$RC" -ne 0 ]] && [[ "$modify_lines" == "6" ]] \
+   && [[ "$call4" == *'listener/https'* ]] \
+   && [[ "$call5" == *'listener/internal-udp'* ]] \
+   && [[ "$call6" == *'listener/udp'* ]] \
+   && [[ "$OUT" == *"One or more listener rollbacks failed"* ]]; then
+  report_pass "rollback failure does not prevent remaining listener repairs"
+else
+  report_fail "rollback remains best effort across all listeners" "rc=$RC modify=$(cat "$FAKE_MODIFY") out=<<<$OUT>>>"
 fi
 
 echo

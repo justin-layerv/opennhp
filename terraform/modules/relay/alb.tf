@@ -2,10 +2,9 @@
 # Internet-facing ALB edge for the relay. Client TLS terminates here, then the
 # ALB re-encrypts to the relay backend over HTTPS. The relay trusts
 # X-Forwarded-For (source_addr_mode=trusted_header) only because the ALB appends
-# the client IP and is the relay's sole ingress path. Mirrors modules/bootstrap-
-# alb, trimmed for a single backend service. NOTE: access logs / Athena are
-# intentionally deferred for the dark launch (tracked issue; a #6 blocker —
-# forensics can't be backfilled once real browser traffic flows).
+# the client IP and is the relay's sole browser ingress path. Mirrors
+# modules/bootstrap-alb, trimmed for a single backend service. Access logging,
+# retention, and Athena query support are provisioned with this edge.
 # ============================================================================
 
 locals {
@@ -86,6 +85,8 @@ resource "aws_lb" "relay" {
   # control-char/RFC-7230-violating XFF before append, closing the smuggled-XFF
   # class.
   xff_header_processing_mode = "append"
+  enable_xff_client_port     = false
+  enable_waf_fail_open       = false
 
   enable_deletion_protection = local.is_prod
 
@@ -101,9 +102,21 @@ resource "aws_lb" "relay" {
 
   tags = merge(local.tags, { Name = local.alb_name })
 
+  lifecycle {
+    # The AWS provider models subnet changes as in-place, but SetSubnets cannot
+    # move an ALB across VPCs. The ALB SG is necessarily replaced when vpc_id
+    # changes, so use that replacement as the explicit cross-VPC trigger. Keep
+    # destroy-before-create: the ALB has a static remote name and sandbox outage
+    # is accepted; create_before_destroy would collide with the existing name.
+    replace_triggered_by = [aws_security_group.alb.id]
+  }
+
   # The bucket policy (legacy + modern delivery principals) must exist before the
   # enable test-write ModifyLoadBalancerAttributes runs, or it AccessDenies.
-  depends_on = [aws_s3_bucket_policy.alb_access_logs]
+  depends_on = [
+    aws_s3_bucket_policy.alb_access_logs,
+    terraform_data.network_ready,
+  ]
 }
 
 # ── Target group → relay nodes ──

@@ -180,6 +180,12 @@ variable "deploy_qurl_ecr" {
   default     = false
 }
 
+variable "deploy_relay_network" {
+  description = "Whether this environment creates the dedicated relay DMZ network. Gates its self-apply IAM permissions so relay-dark production has no policy delta."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_github_repo" {
   description = "GitHub repository for QURL service (for GitHub Actions trust policy)"
   type        = string
@@ -294,6 +300,7 @@ data "aws_iam_openid_connect_provider" "github" {
 locals {
   account_id = data.aws_caller_identity.current.account_id
   region     = data.aws_region.current.id
+  partition  = split(":", data.aws_caller_identity.current.arn)[1]
 
   # OIDC Provider ARN - either from created resource or existing data source
   # This abstraction allows the module to work in both self-managed and org-managed scenarios
@@ -1075,7 +1082,65 @@ resource "aws_iam_role_policy" "context_lookups" {
   name = "context-lookups"
   role = aws_iam_role.github_actions.id
 
-  policy = jsonencode({
+  # Keep the disabled/prod JSON document byte-for-byte compatible with the
+  # existing policy. The explicit jsonencode branches are intentional: the
+  # static IAM coverage lint walks both branches, whereas it cannot evaluate a
+  # computed Statement = concat(...) expression.
+  policy = var.deploy_relay_network ? jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ContextLookups"
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeVpcs",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeRouteTables",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeVpcEndpoints",
+          "ec2:DescribeInternetGateways",
+          "ec2:DescribeNatGateways",
+          "ec2:DescribeInstances",
+          "ec2:DescribeTags",
+          "ssm:GetParameter",
+          "route53:ListHostedZones",
+          "route53:ListHostedZonesByName"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ASGRefreshDescribe"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:DescribeInstanceRefreshes",
+          "autoscaling:DescribeAutoScalingGroups"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ASGRefreshManage"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:StartInstanceRefresh",
+          "autoscaling:CancelInstanceRefresh"
+        ]
+        Resource = "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
+      },
+      {
+        # Blue/green Switch Traffic clears stale AC-to-server assignments so the
+        # next AC registration builds fresh assignments pointing at the new active
+        # servers. See .github/scripts/clear-ac-assignments.sh.
+        Sid    = "DynamoDBClearACAssignments"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:Scan",
+          "dynamodb:DeleteItem"
+        ]
+        Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-${var.environment}-*-ac-assignments"
+      }
+    ]
+    }) : jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
@@ -1145,6 +1210,49 @@ resource "aws_iam_role_policy" "context_lookups" {
   })
 }
 
+# Run Command is needed only by the relay-enabled sandbox integration and is
+# isolated from the context-lookups policy so production retains its existing
+# document unchanged. SendCommand authorization evaluates both the document
+# and target node resources; GetCommandInvocation exposes no resource type.
+resource "aws_iam_role_policy" "context_lookups_relay_ssm" {
+  count = var.deploy_relay_network ? 1 : 0
+
+  name = "context-lookups-relay-ssm"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "SSMHealthCheckDocument"
+        Effect   = "Allow"
+        Action   = "ssm:SendCommand"
+        Resource = "arn:aws:ssm:${local.region}::document/AWS-RunShellScript"
+      },
+      {
+        # Environment is the strongest tag shared by every existing sandbox
+        # Run Command target (server, AC, relay, and smoke-test hosts). A
+        # relay-only Component/Service condition would break those probes.
+        Sid      = "SSMHealthCheckSandboxInstances"
+        Effect   = "Allow"
+        Action   = "ssm:SendCommand"
+        Resource = "arn:aws:ec2:${local.region}:${local.account_id}:instance/*"
+        Condition = {
+          StringEquals = {
+            "ssm:resourceTag/Environment" = var.environment
+          }
+        }
+      },
+      {
+        Sid      = "SSMHealthCheckInvocation"
+        Effect   = "Allow"
+        Action   = "ssm:GetCommandInvocation"
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 # Custom managed policy for Terraform read permissions
 # This avoids the chicken-and-egg problem (CI can't add permissions it doesn't have)
 # while following least privilege (only read access to services we use)
@@ -1185,10 +1293,16 @@ resource "aws_iam_policy" "terraform_read" {
       {
         Sid    = "Route53Read"
         Effect = "Allow"
-        Action = [
-          "route53:Get*",
-          "route53:List*"
-        ]
+        Action = concat(
+          [
+            "route53:Get*",
+            "route53:List*",
+          ],
+          var.deploy_relay_network ? [
+            "route53resolver:Get*",
+            "route53resolver:List*",
+          ] : [],
+        )
         Resource = "*"
       },
       {
@@ -1539,7 +1653,9 @@ resource "aws_iam_policy" "terraform_plan_pr_read" {
         Effect = "Allow"
         Action = [
           "route53:Get*",
-          "route53:List*"
+          "route53:List*",
+          "route53resolver:Get*",
+          "route53resolver:List*",
         ]
         Resource = "*"
       },
@@ -1964,6 +2080,95 @@ resource "aws_iam_policy" "terraform_apply_ec2" {
 resource "aws_iam_role_policy_attachment" "terraform_apply_ec2" {
   role       = aws_iam_role.github_actions.name
   policy_arn = aws_iam_policy.terraform_apply_ec2.arn
+}
+
+# Dedicated, count-gated self-apply grant for the relay DMZ. Keeping this out of
+# the broad always-present policies makes production (deploy_relay=false) retain
+# an identical IAM document while sandbox can create the new boundary in one
+# reviewed apply after the propagation shim in the root module.
+resource "aws_iam_policy" "terraform_apply_relay_dmz" {
+  count = var.deploy_relay_network ? 1 : 0
+
+  name        = "nhp-${var.environment}-github-actions-relay-dmz"
+  description = "Relay DMZ network and Resolver permissions for Terraform apply (${var.environment})"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "RelayDmzVpcLifecycle"
+        Effect = "Allow"
+        Action = [
+          "ec2:AcceptVpcPeeringConnection",
+          "ec2:CreateFlowLogs",
+          "ec2:CreateVpcPeeringConnection",
+          "ec2:DeleteFlowLogs",
+          "ec2:DeleteVpcPeeringConnection",
+          "ec2:ModifyVpcPeeringConnectionOptions",
+          "ec2:ReplaceRoute",
+          "ec2:ReplaceRouteTableAssociation",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "RelayDmzResolverLifecycle"
+        Effect = "Allow"
+        Action = [
+          "route53resolver:AssociateFirewallRuleGroup",
+          "route53resolver:AssociateResolverQueryLogConfig",
+          "route53resolver:CreateFirewallDomainList",
+          "route53resolver:CreateFirewallRule",
+          "route53resolver:CreateFirewallRuleGroup",
+          "route53resolver:CreateResolverQueryLogConfig",
+          "route53resolver:DeleteFirewallDomainList",
+          "route53resolver:DeleteFirewallRule",
+          "route53resolver:DeleteFirewallRuleGroup",
+          "route53resolver:DeleteResolverQueryLogConfig",
+          "route53resolver:DisassociateFirewallRuleGroup",
+          "route53resolver:DisassociateResolverQueryLogConfig",
+          "route53resolver:GetFirewallConfig",
+          "route53resolver:GetFirewallDomainList",
+          "route53resolver:GetFirewallRuleGroup",
+          "route53resolver:GetFirewallRuleGroupAssociation",
+          "route53resolver:GetResolverQueryLogConfig",
+          "route53resolver:GetResolverQueryLogConfigAssociation",
+          "route53resolver:ListFirewallDomains",
+          "route53resolver:ListFirewallRules",
+          "route53resolver:ListTagsForResource",
+          "route53resolver:TagResource",
+          "route53resolver:UntagResource",
+          "route53resolver:UpdateFirewallConfig",
+          "route53resolver:UpdateFirewallDomains",
+          "route53resolver:UpdateFirewallRule",
+          "route53resolver:UpdateFirewallRuleGroupAssociation",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid      = "Route53ResolverServiceLinkedRole"
+        Effect   = "Allow"
+        Action   = "iam:CreateServiceLinkedRole"
+        Resource = "arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/route53resolver.amazonaws.com/*"
+        Condition = {
+          StringEquals = {
+            "iam:AWSServiceName" = "route53resolver.amazonaws.com"
+          }
+        }
+      },
+    ]
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-github-actions-relay-dmz"
+    Component = "ecr"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "terraform_apply_relay_dmz" {
+  count = var.deploy_relay_network ? 1 : 0
+
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.terraform_apply_relay_dmz[0].arn
 }
 
 # Part 2: IAM and Security
@@ -3240,8 +3445,10 @@ resource "aws_iam_role_policy_attachment" "qurl_link_static" {
 #                          cloudwatch:Describe*/Get*/List*,
 #                          ssm:Describe*/Get*/List*,
 #                          secretsmanager:Get* (scoped layerv-nhp-*)
-#   - context_lookups:     ssm:SendCommand + ssm:GetCommandInvocation
-#                          (scoped AWS-RunShellScript + instance ARNs)
+#   - context_lookups_relay_ssm: ssm:SendCommand + ssm:GetCommandInvocation
+#                               (relay-enabled sandbox: exact AWS-RunShellScript,
+#                               same-account Environment=sandbox instances, and
+#                               the unavoidable action-only invocation read)
 #   - SSMACMLambda:        ssm:PutParameter (for M2M token cache)
 #   - terraform_apply_*:   cloudwatch:PutMetricData (for smoke metric)
 #
@@ -3480,6 +3687,21 @@ output "terraform_apply_ses_policy_arn" {
 output "terraform_apply_ses_attachment_id" {
   description = "ID of the role-policy attachment for terraform-apply-ses; orders SES creation after the grant is attached."
   value       = var.agent_otp_ses_enabled ? aws_iam_role_policy_attachment.terraform_apply_ses[0].id : null
+}
+
+output "terraform_apply_relay_dmz_policy_doc_hash" {
+  description = "sha256 of the count-gated relay-DMZ self-apply policy, or empty when the relay network is disabled."
+  value       = var.deploy_relay_network ? sha256(aws_iam_policy.terraform_apply_relay_dmz[0].policy) : ""
+}
+
+output "terraform_apply_relay_dmz_policy_arn" {
+  description = "ARN of the relay-DMZ self-apply policy, or empty when disabled."
+  value       = var.deploy_relay_network ? aws_iam_policy.terraform_apply_relay_dmz[0].arn : ""
+}
+
+output "terraform_apply_relay_dmz_attachment_id" {
+  description = "Attachment ID used to order the relay-DMZ IAM propagation wait after the policy reaches the apply role."
+  value       = var.deploy_relay_network ? aws_iam_role_policy_attachment.terraform_apply_relay_dmz[0].id : ""
 }
 
 # Trigger sources for `time_sleep.qurl_v2_resource_key_envelope_iam_propagation`

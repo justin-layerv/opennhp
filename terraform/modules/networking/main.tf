@@ -15,6 +15,8 @@ locals {
   azs     = slice(data.aws_availability_zones.available.names, 0, 3)
   is_prod = var.environment == "prod"
 
+  private_route_table_count = local.is_prod ? 3 : 1
+
   # Interface VPC endpoints to create. Always-on endpoints cover the
   # shared AWS services every workload in the VPC depends on; optional
   # endpoints gated by var.deploy_vpc_endpoints are for QURL-specific
@@ -144,7 +146,7 @@ resource "aws_route_table" "public" {
 
 # Private Route Tables (one per AZ for prod, shared for dev/sandbox)
 resource "aws_route_table" "private" {
-  count  = local.is_prod ? 3 : 1
+  count  = local.private_route_table_count
   vpc_id = aws_vpc.main.id
 
   route {
@@ -156,6 +158,52 @@ resource "aws_route_table" "private" {
     Name      = "${var.name_prefix}-rtb-private-${count.index}"
     Component = "networking"
   })
+}
+
+# A route table cannot combine aws_route_table inline routes with standalone
+# aws_route resources. Keep the existing inline-NAT tables unchanged for the
+# disabled path and as rollback anchors. Environments that need cross-VPC
+# routes use this parallel set, where every non-local route has one standalone
+# owner. The legacy tables are intentionally retained and cost nothing.
+resource "aws_route_table" "private_extensible" {
+  count = var.enable_extensible_private_route_tables ? local.private_route_table_count : 0
+
+  vpc_id = aws_vpc.main.id
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-rtb-private-extensible-${count.index}"
+    Component = "networking"
+  })
+}
+
+resource "aws_route" "private_extensible_default" {
+  count = var.enable_extensible_private_route_tables ? local.private_route_table_count : 0
+
+  route_table_id         = aws_route_table.private_extensible[count.index].id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.main[count.index].id
+}
+
+# The route-table association update calls ReplaceRouteTableAssociation, whose
+# sandbox-only permission is attached in the same apply as the relay DMZ. This
+# token carries the root IAM propagation wait into only the cutover resources;
+# a module-wide depends_on would unnecessarily defer every networking data read.
+resource "terraform_data" "private_extensible_association_ready" {
+  count = var.enable_extensible_private_route_tables ? 1 : 0
+
+  input = var.extensible_private_route_table_ready_token
+
+  lifecycle {
+    precondition {
+      condition     = var.extensible_private_route_table_ready_token != null && trimspace(var.extensible_private_route_table_ready_token) != ""
+      error_message = "extensible_private_route_table_ready_token must prove IAM propagation before private subnet associations move."
+    }
+  }
+}
+
+locals {
+  active_private_route_table_ids = var.enable_extensible_private_route_tables ? aws_route_table.private_extensible[*].id : aws_route_table.private[*].id
+  all_private_route_table_ids    = concat(aws_route_table.private[*].id, aws_route_table.private_extensible[*].id)
 }
 
 # Isolated Route Table (no routes to internet)
@@ -179,7 +227,15 @@ resource "aws_route_table_association" "public" {
 resource "aws_route_table_association" "private" {
   count          = 3
   subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private[local.is_prod ? count.index : 0].id
+  route_table_id = local.active_private_route_table_ids[local.is_prod ? count.index : 0]
+
+  # Do not move a live private subnet until its replacement table already has
+  # the same NAT path. The provider performs route_table_id changes with
+  # ReplaceRouteTableAssociation, leaving the legacy table ready for rollback.
+  depends_on = [
+    aws_route.private_extensible_default,
+    terraform_data.private_extensible_association_ready,
+  ]
 }
 
 # Route Table Associations - Isolated
@@ -261,7 +317,7 @@ resource "aws_vpc_endpoint" "s3" {
   vpc_endpoint_type = "Gateway"
   route_table_ids = concat(
     [aws_route_table.public.id],
-    aws_route_table.private[*].id,
+    local.all_private_route_table_ids,
     [aws_route_table.isolated.id]
   )
 

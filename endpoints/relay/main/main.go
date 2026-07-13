@@ -1,8 +1,9 @@
 // Command nhp-relayd is the NHP-Relay daemon (#2208): it bridges browser
-// JS-agents (HTTPS POST /relay/{serverId}) to the private NHP-Server over an
-// NHP_RLY UDP forward. The forwarding logic lives in package relay; this is the
-// thin daemon wrapper (config load -> New -> Start -> graceful Stop), matching
-// the server/ac/db daemons' cli shape. See docs/design/NHP_RELAY_TOPOLOGY.md.
+// JS-agents (HTTPS POST /relay/{serverId}) to a cell's internal NHP-Server
+// endpoint over an NHP_RLY UDP forward. The forwarding logic lives in package
+// relay; this is the thin daemon wrapper (config load -> New -> Start ->
+// graceful Stop), matching the server/ac/db daemons' cli shape. See
+// docs/design/NHP_RELAY_TOPOLOGY.md.
 package main
 
 import (
@@ -24,7 +25,7 @@ import (
 func main() {
 	app := cli.NewApp()
 	app.Name = "nhp-relayd"
-	app.Usage = "NHP-Relay: bridge HTTPS browser agents to the private NHP-Server (#2208)"
+	app.Usage = "NHP-Relay: bridge HTTPS browser agents to the internal NHP-Server endpoint (#2208)"
 	app.Version = version.Version
 
 	runCmd := &cli.Command{

@@ -84,6 +84,69 @@ Alerts include the following GuardDuty finding details:
 
 ---
 
+## Sandbox Relay DMZ Boundary
+
+The stateless relay is an HTTPS-only DMZ service. Its public surface is the
+relay ALB on TCP 443; the ALB re-encrypts to relay TCP 8080. Relay instances
+have no public IP, NAT gateway, or default route, and the relay VPC contains no
+public UDP load balancer or UDP listener.
+
+Upcoming UDP SDKs bypass the relay. After control-plane assignment, an SDK
+connects directly to the public NHP server NLB for its assigned cell. That NLB
+has exactly one public UDP listener: 62206. UDP 62207 must never be exposed on
+the public NHP edge.
+
+For browser traffic, the relay authenticates and wraps opaque knocks in
+`NHP_RLY`, then sends them over the private peered path to server UDP 62206.
+The relay uses private UDP 62207 for this hop and for authenticated
+`RelayReturnMsg` responses. The relay SG accepts UDP 62207 only from the
+canonical server SG, and its UDP 62206 egress is limited to the exact main-VPC
+private-subnet CIDRs. The server SG keeps public UDP 62206 for direct SDKs and
+the explicit relay-subnet rules for the private relay hop.
+
+AWS WAF protects only the HTTPS `/relay/*` path. Direct SDK UDP does not pass
+through WAF or the relay and relies on the NHP server protocol's authentication,
+server admission controls, NLB/SG shape, Flow Logs, and cell-level monitoring.
+Issue [#3184](https://github.com/layervai/nhp/issues/3184) now tracks direct
+assigned-cell server-edge availability under spoofed UDP floods. It gates
+production rollout of UDP SDK traffic, not deployment of the HTTPS-only relay.
+
+Relay control-plane egress is TCP 443 to dedicated VPC endpoints and the
+regional S3 prefix list. Resolver Firewall is fail closed, and Resolver and VPC
+Flow Logs use the dedicated relay-DMZ logging key. These controls do not govern
+the separate public server NLB.
+
+### Identity and residual risk
+
+Relay instances share a durable relay identity so servers can authenticate
+`NHP_RLY` and `RelayReturnMsg` traffic across fleet replacement. The server's
+registered relay public-key allowlist is authoritative; SGs provide containment,
+not cryptographic authorization. A compromised relay still cannot forge an
+agent-authenticated knock or an NHP-AOP, but it can exercise the bounded private
+server hop and allowed AWS APIs.
+
+The relay deliberately sets core `DisableServerPeerValidation=true` on its
+private UDP return device. The internal NLB preserves a dynamic server-instance
+source address, so an address-pinned peer lookup would reject valid returns.
+This setting does not disable Noise static-key authentication: a datagram may
+reach the decrypt attempt on UDP 62207, but the recovered server public-key
+fingerprint must still match the Terraform-rendered cell allowlist before any
+waiter is satisfied. We explicitly accept that pre-allowlist decrypt surface
+because UDP 62207 is private and the relay SG admits it only from the canonical
+server SG; widening that SG or making return decoding concurrent requires a new
+security and allocation-budget review.
+
+### Proof model
+
+PR-time plan validation proves that the relay owns only its HTTPS ALB and HTTPS
+target group, that the assigned-cell compute module retains its public server
+NLB with exactly UDP 62206, and that private relay UDP 62206/62207 SG paths stay
+bounded. The live detector inventories the same topology: one relay HTTPS
+target group and exactly one UDP-capable public listener in the peered assigned
+cell, on UDP 62206. Functional relay validation covers only the HTTPS relay
+fleet. External UDP smoke must target the assigned cell's server NLB, not the
+relay, and must verify UDP 62207 is absent from the public listener inventory.
+
 ## Responding to GuardDuty Alerts
 
 ### Triage Process
