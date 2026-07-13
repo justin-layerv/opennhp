@@ -2988,8 +2988,9 @@ jobs:
 
       # Integration tests knock the assigned-cell server over its required
       # public NLB (NHP_SERVER_ENDPOINT) on UDP 62206. Today this proves required
-      # endpoint discovery, DNS resolution, and a UDP send attempt; a valid SDK
-      # protocol round trip remains a separate pre-SDK rollout gate in #3184.
+      # endpoint discovery, DNS resolution, and a UDP send attempt; valid SDK
+      # protocol round trips under distributed load are enforced by the manual
+      # Assigned-cell UDP flood readiness workflow before SDK rollout.
       # Missing endpoint discovery must never silently skip even this basic gate.
       - name: Require assigned-cell public NHP endpoint
         env:

@@ -1282,11 +1282,20 @@ echo "Configuring iptables rate limiting for UDP port 62206..."
 # Install iptables if not already present (usually pre-installed on Ubuntu)
 which iptables > /dev/null 2>&1 || apt_get_with_retry install -y iptables
 
+# Hold a fail-closed guard across rule replacement. Without it, a re-run of
+# user_data would briefly leave the old terminal ACCEPT ahead of the newly
+# appended drop layers. If configuration aborts mid-update, the guard remains
+# and UDP/62206 stays closed instead of silently becoming unrated.
+iptables -C INPUT -p udp --dport 62206 \
+  -m comment --comment nhp-knock-reconfigure-guard -j DROP 2>/dev/null || \
+  iptables -I INPUT 1 -p udp --dport 62206 \
+    -m comment --comment nhp-knock-reconfigure-guard -j DROP
+
 # Idempotency: delete each rule first (best-effort, ignore errors if not
 # present) before appending. This prevents duplicate rules accumulating if
 # user_data runs more than once on the same instance — for example after
 # `cloud-init clean && cloud-init init` for debugging, or after a re-image
-# that bakes prior rules into the AMI. The per-IP and default-DROP rules
+# that bakes prior rules into the AMI. The per-source and terminal-admit rules
 # below have a fixed spec, so a literal `iptables -D` with the same spec
 # always matches and is enough.
 #
@@ -1312,37 +1321,33 @@ for line in $(iptables -L INPUT --line-numbers -n 2>/dev/null | awk '/nhp_knock_
   iptables -D INPUT "$line" 2>/dev/null || true
 done
 
-%{ if knock_global_rate_limit_pps > 0 ~}
-# Global cap: drop knocks above the aggregate rate, regardless of source IP.
-# Placed BEFORE the per-IP rule so a distributed flood (each source under
-# the per-IP 100 pps budget but aggregating above ECDH throughput) is shed
-# here. Operators who want per-IP-only fallback set
-# knock_global_rate_limit_pps = 0; this whole block compiles out and the
-# walk-and-delete above already cleared any prior rule.
-#
-# --hashlimit-above + --hashlimit-mode dstip: matches only when the
-# aggregate rate (counted against the single fixed dstip = listen IP)
-# exceeds the limit. Matched packets are DROPped; packets within the
-# aggregate budget fall through to the per-IP rule below.
-iptables -A INPUT -p udp --dport 62206 \
-  -m hashlimit \
-  --hashlimit-above ${knock_global_rate_limit_pps}/sec \
-  --hashlimit-burst ${knock_global_rate_limit_burst} \
-  --hashlimit-mode dstip \
-  --hashlimit-name nhp_knock_global \
-  -j DROP
-echo "iptables global cap: ${knock_global_rate_limit_pps} pps sustained, burst ${knock_global_rate_limit_burst}"
-%{ else ~}
-echo "iptables global cap: DISABLED (knock_global_rate_limit_pps=0)"
-%{ endif ~}
-
-# Rate limit UDP knock packets per source IP using hashlimit module.
-# hashlimit tracks each source IP independently, preventing one abusive IP
-# from exhausting the rate limit for legitimate clients.
-# --hashlimit-upto: sustained rate (packets per second)
+# Rate limit UDP knock packets per source IP using hashlimit module BEFORE the
+# aggregate cap. A few high-rate sources must not consume the shared aggregate
+# allowance and randomly shed a low-rate legitimate client. Source rotation
+# below this limit still reaches the aggregate cap that follows.
+# --hashlimit-above: match only traffic above the source's allowance
 # --hashlimit-burst: initial burst allowance
 # --hashlimit-mode srcip: track by source IP
 # --hashlimit-htable-expire: cleanup idle entries after 120s
+iptables -D INPUT -p udp --dport 62206 \
+  -m hashlimit \
+  --hashlimit-above 100/sec \
+  --hashlimit-burst 50 \
+  --hashlimit-mode srcip \
+  --hashlimit-name nhp_knock \
+  --hashlimit-htable-expire 120000 \
+  -m comment --comment nhp-knock-per-source-drop \
+  -j DROP 2>/dev/null || true
+# Remove the pre-#3184 accept-then-default-drop shape on re-run/upgrade.
+iptables -D INPUT -p udp --dport 62206 \
+  -m hashlimit \
+  --hashlimit-upto 100/sec \
+  --hashlimit-burst 50 \
+  --hashlimit-mode srcip \
+  --hashlimit-name nhp_knock \
+  --hashlimit-htable-expire 120000 \
+  -m comment --comment nhp-knock-per-source-accept \
+  -j ACCEPT 2>/dev/null || true
 iptables -D INPUT -p udp --dport 62206 \
   -m hashlimit \
   --hashlimit-upto 100/sec \
@@ -1353,18 +1358,114 @@ iptables -D INPUT -p udp --dport 62206 \
   -j ACCEPT 2>/dev/null || true
 iptables -A INPUT -p udp --dport 62206 \
   -m hashlimit \
-  --hashlimit-upto 100/sec \
+  --hashlimit-above 100/sec \
   --hashlimit-burst 50 \
   --hashlimit-mode srcip \
   --hashlimit-name nhp_knock \
   --hashlimit-htable-expire 120000 \
-  -j ACCEPT
+  -m comment --comment nhp-knock-per-source-drop \
+  -j DROP
 
-# Drop UDP packets to port 62206 that exceed the rate limit
+# Remove the old terminal-drop forms; the new chain admits traffic explicitly
+# after both independent drop layers.
+iptables -D INPUT -p udp --dport 62206 \
+  -m comment --comment nhp-knock-per-source-drop -j DROP 2>/dev/null || true
 iptables -D INPUT -p udp --dport 62206 -j DROP 2>/dev/null || true
-iptables -A INPUT -p udp --dport 62206 -j DROP
+
+%{ if knock_global_rate_limit_pps > 0 ~}
+# Global cap: after noisy individual sources are shed, drop remaining knocks
+# above the aggregate rate regardless of source IP. This is the distributed
+# low-rate/spoof-rotation backstop. Operators who want per-IP-only fallback set
+# knock_global_rate_limit_pps = 0; the walk-and-delete above removes any old
+# aggregate rule before this conditional block.
+iptables -A INPUT -p udp --dport 62206 \
+  -m hashlimit \
+  --hashlimit-above ${knock_global_rate_limit_pps}/sec \
+  --hashlimit-burst ${knock_global_rate_limit_burst} \
+  --hashlimit-mode dstip \
+  --hashlimit-name nhp_knock_global \
+  -m comment --comment nhp-knock-global-drop \
+  -j DROP
+echo "iptables global cap: ${knock_global_rate_limit_pps} pps sustained, burst ${knock_global_rate_limit_burst}"
+%{ else ~}
+echo "iptables global cap: DISABLED (knock_global_rate_limit_pps=0)"
+%{ endif ~}
+
+# Every surviving UDP/62206 packet is admitted after both drop layers. The
+# marker is load-bearing for exact edge-ingress telemetry.
+iptables -D INPUT -p udp --dport 62206 \
+  -m comment --comment nhp-knock-admitted -j ACCEPT 2>/dev/null || true
+iptables -A INPUT -p udp --dport 62206 \
+  -m comment --comment nhp-knock-admitted -j ACCEPT
+
+# Admission is fully ordered and observable; remove the fail-closed update
+# guard only after all steady-state rules are installed.
+iptables -D INPUT -p udp --dport 62206 \
+  -m comment --comment nhp-knock-reconfigure-guard -j DROP
 
 echo "iptables per-IP rate limiting configured: 100 pps sustained, burst 50 per source IP"
+
+# Emit per-layer UDP admission evidence through the existing CloudWatch Agent
+# log path. The collector publishes EMF deltas for kernel UDP errors, receive-
+# buffer drops, and both iptables drop layers; its heartbeat/error series makes
+# a missing rule or dead collector distinguishable from a quiet edge.
+python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else "nhp-udp-edge-metrics requires Python >= 3.10")'
+cat > /usr/local/bin/nhp-udp-edge-metrics << 'PYEOF'
+${udp_edge_metrics_script}
+PYEOF
+chmod 0755 /usr/local/bin/nhp-udp-edge-metrics
+
+# The collector uses a fixed EMF filename so the CloudWatch Agent can tail it;
+# rotate it independently from the date-stamped application logs. copytruncate
+# preserves the tailed inode while bounding long-lived-instance disk usage.
+which logrotate >/dev/null 2>&1 || apt_get_with_retry install -y logrotate
+cat > /etc/logrotate.d/nhp-udp-edge-metrics << 'EOF'
+/opt/layerv/nhp-server/log/server-udp-edge-metrics.log {
+    daily
+    rotate 7
+    maxsize 10M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+
+cat > /etc/systemd/system/nhp-udp-edge-metrics.service << EOF
+[Unit]
+Description=NHP UDP edge metrics collector
+After=network-online.target amazon-cloudwatch-agent.service
+
+[Service]
+Type=oneshot
+Environment=NHP_ENVIRONMENT=${environment}
+Environment=NHP_CELL_ID=${cell_id}
+Environment=INSTANCE_ID=$INSTANCE_ID
+Environment=NHP_GLOBAL_RATE_LIMIT_ENABLED=${knock_global_rate_limit_pps > 0}
+ExecStart=/usr/local/bin/nhp-udp-edge-metrics
+User=root
+Group=root
+EOF
+
+cat > /etc/systemd/system/nhp-udp-edge-metrics.timer << 'EOF'
+[Unit]
+Description=Collect NHP UDP edge metrics every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+RandomizedDelaySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now nhp-udp-edge-metrics.timer
+systemctl start nhp-udp-edge-metrics.service
 
 # ============================================================================
 # Dedicated unprivileged user for the nhp-server container (#1090)

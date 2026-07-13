@@ -25,9 +25,15 @@ must update this list and audit all existing call sites.
   internally). Do not invert: `isKnownPeerIP` (`udpserver.go`) holds
   the map mutex while iterating peers, and a reverse-order site would
   deadlock against it.
-- **`remoteConnectionMapMutex` is leaf-most for the conn lifecycle**:
-  no other mutex is acquired while holding it. The connection
-  routine's defer takes it briefly to remove the global-map entry.
+- **`remoteConnectionMapMutex` nests only `overloadMu` for connection
+  pressure publication.** The connection routine's defer takes the map lock
+  briefly to remove the global-map entry and may then call
+  `setConnectionOverload`, which acquires `overloadMu`. No other mutex may be
+  acquired while holding `remoteConnectionMapMutex`.
+- **`overloadMu` is leaf-most.** It may be acquired while holding
+  `remoteConnectionMapMutex`; while held, overload publication performs only
+  atomic source reads/stores and `device.SetOverload` (an atomic store). Never
+  acquire a map, peer, plugin, or publisher mutex while holding it.
 - **`outboundConnStartMutex` is not nested with server data locks.**
   `connDataForOutboundAddr` takes it only after releasing
   `remoteConnectionMapMutex`; `Stop()` takes it alone as a barrier before

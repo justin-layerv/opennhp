@@ -75,6 +75,25 @@ Components add their own dimensions on top:
 | `KnockLatency` | Latency (ms) | — | End-to-end knock processing time |
 | `StorageHealthy` | Gauge (0/1) | — | etcd storage health probe |
 | `ServerForwardTargetDrop` | Counter | — | Outbound NHP_FWD target preparation dropped because the peer/tuple was not a configured server target or was owned by a non-promotable connection. Steady state is zero; see [server forward-send safety](runbooks/server-forward-safety.md). |
+| `UDPRateLimitDrop` | Counter | — | Datagram dropped by the application per-source limiter before crypto work. |
+| `PacketDecryptQueueDrop` | Counter | — | Bounded decrypt queue was full; steady state and flood-readiness target are zero. |
+| `DecryptedMessageQueueDrop` | Counter | — | Bounded decrypted-message queue was full; steady state and flood-readiness target are zero. |
+| `HandlerBudgetExhausted` | Counter | — | Total distinct agent-facing dispatch sheds because eligible partitions were full; includes every protected-reserve exhaustion. |
+| `HandlerProtectedReserveExhausted` | Counter | — | Subset of `HandlerBudgetExhausted` where cookie-proven RKN or authenticated relay work exhausted both partitions; do not add the counters without subtracting this overlap. |
+| `HandlerInFlight` | Gauge | — | Best-effort sum of general (3,072) plus protected (1,024) agent-facing handlers. The two partitions are sampled independently, so a scrape may span one admission/release transition; hard ceiling 4,096. |
+| `HandlerProtectedInFlight` | Gauge | — | Protected-reserve handlers. Hard ceiling 1,024. |
+| `HandlerPressureOverload` | Gauge (0/1) | — | Handler pressure is holding overload-cookie mode on. |
+| `PacketDecryptQueueDepth` | Gauge | — | Current bounded inbound decrypt queue occupancy. |
+| `DecryptedMessageQueueDepth` | Gauge | — | Current bounded decrypted-message queue occupancy. |
+| `RuntimeGoroutine` | Gauge | — | Current Go goroutine count for flood-readiness bounds. |
+| `RuntimeHeapAllocBytes` | Gauge (bytes) | — | Current Go heap allocation for flood-readiness bounds. |
+
+Host EMF metrics add `InstanceId` series plus an `{Environment,Cell}` rollup:
+`UDPIngressDatagram`, `UDPKernelReceiveError`, `UDPReceiveBufferDrop`,
+`UDPGlobalRateLimitDrop`, `UDPPerSourceRateLimitDrop`,
+`UDPEdgeCollectorError`, and `UDPEdgeCollectorHeartbeat`. See the
+[assigned-cell UDP flood-readiness runbook](runbooks/assigned-cell-udp-flood-readiness.md)
+for layer-by-layer interpretation and enforced live-test bounds.
 
 ## Server Log-Derived Metrics
 

@@ -1447,8 +1447,12 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 		return
 	}
 
-	// start message decryption
-	a.device.RecvPacketToMsg(pd)
+	// start message decryption. A bounded-queue rejection already releases the
+	// pooled packet; do not wait forever for a decrypt result that cannot arrive.
+	if !a.device.RecvPacketToMsg(pd) {
+		log.Warning("[tcpTempAccessHandler] decrypt queue full, shedding message from %s", remoteAddrStr)
+		return
+	}
 
 	// waiting for message decryption
 	accPpd := <-pd.DecryptedMsgCh
@@ -1610,8 +1614,12 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, au *comm
 		return
 	}
 
-	// start packet decryption
-	a.device.RecvPacketToMsg(pd)
+	// start packet decryption. A bounded-queue rejection already releases the
+	// pooled packet; do not wait forever for a decrypt result that cannot arrive.
+	if !a.device.RecvPacketToMsg(pd) {
+		log.Warning("[udpTempAccessHandler] decrypt queue full, shedding message from %s", remoteAddrStr)
+		return
+	}
 
 	// waiting for packet decryption
 	accPpd := <-pd.DecryptedMsgCh

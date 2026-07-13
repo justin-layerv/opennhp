@@ -1187,6 +1187,21 @@ const (
 	// #2563 — both are steady-state-zero DoS-shed detectors).
 	MetricHandlerBudgetExhausted = "HandlerBudgetExhausted"
 
+	// MetricHandlerProtectedReserveExhausted is the subset of handler sheds
+	// where a cookie-proven RKN or authenticated relay envelope found both the
+	// general partition and its protected reserve full.
+	MetricHandlerProtectedReserveExhausted = "HandlerProtectedReserveExhausted"
+	MetricHandlerInFlight                  = "HandlerInFlight"
+	MetricHandlerProtectedInFlight         = "HandlerProtectedInFlight"
+	MetricHandlerPressureOverload          = "HandlerPressureOverload"
+	MetricUDPRateLimitDrop                 = "UDPRateLimitDrop"
+	MetricPacketDecryptQueueDrop           = "PacketDecryptQueueDrop"
+	MetricDecryptedMessageQueueDrop        = "DecryptedMessageQueueDrop"
+	MetricPacketDecryptQueueDepth          = "PacketDecryptQueueDepth"
+	MetricDecryptedMessageQueueDepth       = "DecryptedMessageQueueDepth"
+	MetricRuntimeGoroutine                 = "RuntimeGoroutine"
+	MetricRuntimeHeapAllocBytes            = "RuntimeHeapAllocBytes"
+
 	// MetricACConnStaleFiltered counts AC connections skipped by the
 	// broadcast-time staleness filter (DefaultStaleACConnThreshold or its
 	// per-server override). A non-zero rate is expected during AC

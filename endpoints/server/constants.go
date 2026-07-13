@@ -40,14 +40,13 @@ const (
 	// still if a plugin/DDB call stalls — so under a flood handlers
 	// accumulate faster than they retire and drive the process toward OOM.
 	// This ceiling converts that tail from a crash into a graceful shed
-	// (MetricHandlerBudgetExhausted). One caveat of a single global budget:
-	// during a sustained distributed flood, legitimate agent knocks share
-	// these slots and are shed too once saturated. The sustained shed floor
-	// is budget/hold — many thousands of knocks/s under a healthy AC (sub-
-	// millisecond holds), but dropping toward ~1k/s when AC-open is slow —
-	// which is the correct tradeoff (a bounded shed + agent retry beats an
-	// OOM that drops every tenant); per-class slot reservation is left as a
-	// future refinement if flood-time shedding of legit knocks shows up.
+	// (MetricHandlerBudgetExhausted). The total is partitioned below:
+	// ordinary first-flight agent work can consume only
+	// HandlerGeneralCapacity, while cookie-proven RKNs and authenticated
+	// relay envelopes can fall back to the protected reserve. Filling the
+	// general partition also enables overload-cookie mode, so a legitimate
+	// direct client can progress from KNK to source-bound RKN and reach the
+	// reserve instead of retrying an already-saturated KNK path.
 	// The ceiling is load-bearing on every agent-facing handler being
 	// TIME-BOUNDED (ServerACOpenTransactionResponseTimeoutMs and friends):
 	// a slot only returns when fn returns, so a future handler that could
@@ -61,6 +60,22 @@ const (
 	// intentionally NOT bounded — see dispatchReceivedMessage for the
 	// per-arm trust rationale.
 	MaxConcurrentHandlers = 4096
+
+	// HandlerProtectedReserve is capacity a source-rotating/spoofed KNK flood
+	// cannot consume. NHP_RKN reaches it only after core verifies its stateless
+	// overload cookie (return-routability proof); NHP_RLY reaches it because its
+	// outer Noise identity is a configured relay. Both prefer general capacity
+	// when available, retaining the reserve for actual contention.
+	HandlerProtectedReserve = MaxConcurrentHandlers / 4
+	HandlerGeneralCapacity  = MaxConcurrentHandlers - HandlerProtectedReserve
+)
+
+// The general partition is derived from the total, so equality cannot drift.
+// These assertions instead guard the two meaningful invariants: both
+// partitions must retain at least one slot.
+const (
+	_ = uint(HandlerProtectedReserve - 1)
+	_ = uint(HandlerGeneralCapacity - 1)
 )
 
 // Compile-time assertion that MaxAgentConnsPerIP ≥ 1. The eviction

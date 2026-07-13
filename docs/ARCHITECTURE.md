@@ -1230,9 +1230,10 @@ source IPs rather than the browser address in the authenticated envelope, so
 multiple browsers forwarded by one relay share a server-side bucket. The ALB/WAF
 and relay admission controls are the Internet-abuse boundary for that HTTPS path.
 Direct UDP SDKs bypass the relay: the server edge's kernel aggregate hashlimit,
-per-source hashlimit, application limiter, and connection caps are their abuse
-controls. UDP source spoofing and distributed-flood hardening are tracked against
-that public assigned-cell edge in issue #3184.
+per-source hashlimit, application limiter, protected handler reserve, and
+connection caps are their abuse controls. The deterministic external
+[UDP flood-readiness rehearsal](runbooks/assigned-cell-udp-flood-readiness.md)
+gates production SDK rollout.
 
 ---
 
@@ -1483,7 +1484,7 @@ go test -v -tags=integration ./tests/integration/...
 | `TestEtcd_Connection` | Verify etcd connectivity |
 | `TestEtcd_NHPConfigExists` | Verify `/nhp/config` key exists |
 | `TestEtcd_ACRegistry` | Verify AC registrations |
-| `TestNHPServer_UDPAddressResolvesAndSendSucceeds` | Verify endpoint resolution and local UDP send; #3184 tracks the valid external SDK round trip |
+| `TestNHPServer_UDPAddressResolvesAndSendSucceeds` | Verify endpoint resolution and local UDP send; the flood-readiness workflow separately enforces a valid external SDK round trip |
 | `TestACCerts_Valid` | Verify AWS certificate validity |
 
 ### E2E Tests

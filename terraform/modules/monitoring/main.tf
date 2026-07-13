@@ -566,8 +566,177 @@ resource "aws_cloudwatch_dashboard" "main" {
           view    = "timeSeries"
           stacked = false
         }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 36
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Public UDP NLB Traffic and Rejects"
+          region = data.aws_region.current.id
+          metrics = [
+            ["AWS/NetworkELB", "ProcessedPackets", "LoadBalancer", var.nlb_arn_suffix, { "label" : "Processed packets" }],
+            [".", "RejectedFlowCount", ".", ".", { "label" : "Rejected flows" }],
+            [".", "SecurityGroupBlockedFlowCount_Inbound", ".", ".", { "label" : "SG-blocked flows" }]
+          ]
+          period  = 60
+          stat    = "Sum"
+          view    = "timeSeries"
+          stacked = false
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 36
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Host and Kernel UDP Admission"
+          region = data.aws_region.current.id
+          metrics = [
+            ["LayerV/NHP", "UDPIngressDatagram", "Environment", var.environment, "Cell", var.cell_id, { "label" : "Kernel ingress" }],
+            [".", "UDPGlobalRateLimitDrop", ".", ".", ".", ".", { "label" : "Aggregate hashlimit drops" }],
+            [".", "UDPPerSourceRateLimitDrop", ".", ".", ".", ".", { "label" : "Per-source hashlimit drops" }],
+            [".", "UDPKernelReceiveError", ".", ".", ".", ".", { "label" : "Kernel receive errors" }],
+            [".", "UDPReceiveBufferDrop", ".", ".", ".", ".", { "label" : "Socket receive-buffer drops" }]
+          ]
+          period  = 60
+          stat    = "Sum"
+          view    = "timeSeries"
+          stacked = false
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 42
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Application UDP Sheds"
+          region = data.aws_region.current.id
+          metrics = [
+            ["LayerV/NHP", "UDPRateLimitDrop", "Environment", var.environment, "Cell", var.cell_id, { "label" : "Application per-source limit" }],
+            [".", "PacketDecryptQueueDrop", ".", ".", ".", ".", { "label" : "Decrypt queue full" }],
+            [".", "DecryptedMessageQueueDrop", ".", ".", ".", ".", { "label" : "Decrypted queue full" }],
+            [".", "HandlerBudgetExhausted", ".", ".", ".", ".", { "label" : "Total handler shed" }],
+            [".", "HandlerProtectedReserveExhausted", ".", ".", ".", ".", { "label" : "Protected reserve shed" }],
+            [".", "GlobalCapRejections", ".", ".", ".", ".", { "label" : "Connection cap reject" }]
+          ]
+          period  = 60
+          stat    = "Sum"
+          view    = "timeSeries"
+          stacked = false
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 42
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Application UDP Capacity"
+          region = data.aws_region.current.id
+          metrics = [
+            ["LayerV/NHP", "HandlerInFlight", "Environment", var.environment, "Cell", var.cell_id, { "label" : "Handlers in flight" }],
+            [".", "HandlerProtectedInFlight", ".", ".", ".", ".", { "label" : "Protected handlers" }],
+            [".", "PacketDecryptQueueDepth", ".", ".", ".", ".", { "label" : "Decrypt queue depth" }],
+            [".", "DecryptedMessageQueueDepth", ".", ".", ".", ".", { "label" : "Decrypted queue depth" }],
+            [".", "RuntimeGoroutine", ".", ".", ".", ".", { "label" : "Goroutines" }],
+            [".", "RuntimeHeapAllocBytes", ".", ".", ".", ".", { "label" : "Heap bytes", "yAxis" : "right" }]
+          ]
+          period  = 60
+          stat    = "Maximum"
+          view    = "timeSeries"
+          stacked = false
+        }
       }
     ]
+  })
+}
+
+locals {
+  udp_edge_single_event_alarms = {
+    protected_reserve_exhausted = {
+      metric      = "HandlerProtectedReserveExhausted"
+      suffix      = "udp-protected-reserve-exhausted"
+      description = "Cookie-proven direct clients or authenticated relay work exhausted the protected handler reserve. Legitimate UDP progress is no longer guaranteed."
+    }
+    decrypt_queue_drop = {
+      metric      = "PacketDecryptQueueDrop"
+      suffix      = "udp-decrypt-queue-drop"
+      description = "The bounded packet decrypt queue dropped at least one UDP packet."
+    }
+    receive_buffer_drop = {
+      metric      = "UDPReceiveBufferDrop"
+      suffix      = "udp-receive-buffer-drop"
+      description = "The kernel UDP receive buffer dropped at least one datagram before application admission."
+    }
+    collector_error = {
+      metric      = "UDPEdgeCollectorError"
+      suffix      = "udp-edge-collector-error"
+      description = "The host UDP edge collector could not find exactly one canonical aggregate and per-source iptables marker."
+    }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "udp_edge_single_event" {
+  for_each = local.udp_edge_single_event_alarms
+
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-${each.value.suffix}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 12
+  datapoints_to_alarm = 1
+  metric_name         = each.value.metric
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "${each.value.description} Inspect the Public UDP NLB, Host and Kernel UDP Admission, Application UDP Sheds, and Application UDP Capacity dashboard panels together. Runbook: docs/runbooks/assigned-cell-udp-flood-readiness.md. #3184."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+    Issue     = "3184"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "udp_edge_collector_missing" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-udp-edge-collector-missing"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  metric_name         = "UDPEdgeCollectorHeartbeat"
+  namespace           = "LayerV/NHP"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "No UDP edge collector heartbeat arrived for three minutes. Host/kernel/hashlimit visibility is blind; do not accept a flood-readiness run until restored. Runbook: docs/runbooks/assigned-cell-udp-flood-readiness.md. #3184."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+    Issue     = "3184"
   })
 }
 

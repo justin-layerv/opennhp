@@ -282,7 +282,11 @@ func (t *LocalTransaction) Run() {
 			InitTime:          time.Now().UnixNano(),
 		}
 
-		device.RecvPacketToMsg(pd)
+		if !device.RecvPacketToMsg(pd) {
+			// Do not leave the transaction waiter without a ResponseMsgCh
+			// writer when bounded decrypt admission rejects the packet.
+			err = ErrServerOverload
+		}
 		return
 
 	case ppd := <-t.ExternalMsgCh:

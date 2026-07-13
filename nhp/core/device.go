@@ -32,6 +32,15 @@ type DeviceOptions struct {
 	DisableDePeerValidation     bool
 }
 
+// ReceiveQueueDrop identifies the bounded inbound stage that shed work. The
+// values are stable metric labels for endpoint-owned telemetry.
+type ReceiveQueueDrop string
+
+const (
+	ReceiveQueueDropDecrypt   ReceiveQueueDrop = "decrypt_queue"
+	ReceiveQueueDropDecrypted ReceiveQueueDrop = "decrypted_queue"
+)
+
 type NhpError interface {
 	Error() string
 	ErrorCode() string
@@ -123,6 +132,10 @@ type Device struct {
 	// Concurrency: set once via SetCookieMintFailureHook BEFORE Start spawns
 	// workers, matching recvReplayDedupeFn's happens-before contract.
 	cookieMintFailureFn func(reason string)
+
+	// receiveQueueDropFn reports bounded inbound queue sheds to the owning
+	// endpoint. Set once before Start; core remains metrics-backend agnostic.
+	receiveQueueDropFn func(ReceiveQueueDrop)
 }
 
 func NewDevice(t int, prk []byte, option *DeviceOptions) *Device {
@@ -189,6 +202,27 @@ func (d *Device) SetRecvReplayDedupe(fn func(*PacketParserData) error) {
 // before Start; devices that do not care about this signal leave it unset.
 func (d *Device) SetCookieMintFailureHook(fn func(reason string)) {
 	d.cookieMintFailureFn = fn
+}
+
+// SetReceiveQueueDropHook installs endpoint-owned telemetry for inbound queue
+// sheds. Call before Start, matching the other lock-free lifecycle hooks.
+func (d *Device) SetReceiveQueueDropHook(fn func(ReceiveQueueDrop)) {
+	d.receiveQueueDropFn = fn
+}
+
+// ReceiveQueueDepths returns observational snapshots of bounded inbound queue
+// occupancy. Callers must not use these values for admission decisions.
+func (d *Device) ReceiveQueueDepths() (decrypt, decrypted int) {
+	if d == nil {
+		return 0, 0
+	}
+	return len(d.packetToMsgQueue), len(d.DecryptedMsgQueue)
+}
+
+func (d *Device) recordReceiveQueueDrop(reason ReceiveQueueDrop) {
+	if d != nil && d.receiveQueueDropFn != nil {
+		d.receiveQueueDropFn(reason)
+	}
 }
 
 func (d *Device) recordCookieMintFailure(reason string) {
@@ -609,6 +643,7 @@ func (d *Device) packetToMsgRoutine(id int) {
 
 				default:
 					// ppd not delivered, set error to destroy the ppd
+					d.recordReceiveQueueDrop(ReceiveQueueDropDecrypted)
 					log.Critical("packetToMsgRoutine: %d: decryptedMessageCh is full, discarding message", id)
 				}
 			}()
@@ -672,13 +707,23 @@ func (d *Device) SendMsgToPacket(md *MsgData) {
 	}
 }
 
-func (d *Device) RecvPacketToMsg(pd *PacketData) {
+// RecvPacketToMsg transfers ownership of pd.BasePacket to Device. It returns
+// false when the bounded decrypt queue is full; that rejection path releases
+// the pooled packet before returning.
+func (d *Device) RecvPacketToMsg(pd *PacketData) bool {
 	select {
 	case d.packetToMsgQueue <- pd:
 		// process decryption and deliver plain text message to DecryptedMessageCh
+		return true
 	default:
-		// discard
+		// Ownership transferred to Device at the call. Release on a failed
+		// enqueue so a flood cannot drain the fixed packet pool.
+		d.recordReceiveQueueDrop(ReceiveQueueDropDecrypt)
+		if pd != nil && pd.BasePacket != nil {
+			d.ReleasePoolPacket(pd.BasePacket)
+		}
 		log.Critical("packetToMsgQueue is full, discarding packet")
+		return false
 	}
 }
 

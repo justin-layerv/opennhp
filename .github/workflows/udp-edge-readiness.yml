@@ -1,0 +1,251 @@
+name: Assigned-cell UDP flood readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Concurrent flood/probe duration
+        required: true
+        default: "300"
+        type: string
+      flood_pps_per_runner:
+        description: Per-runner pps; must exceed the host 100 pps/source limit on eight best-effort distinct runners
+        required: true
+        default: "2000"
+        type: string
+      minimum_probe_success_ratio:
+        description: Required valid SDK knock success ratio
+        required: true
+        default: "0.99"
+        type: string
+      maximum_probe_p99_ms:
+        description: Maximum valid SDK knock p99 latency
+        required: true
+        default: "2000"
+        type: string
+      maximum_cpu_percent:
+        description: Maximum server ASG CPU during the test
+        required: true
+        default: "95"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assigned-cell-udp-flood-readiness-sandbox
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    environment: sandbox
+    outputs:
+      host: ${{ steps.target.outputs.host }}
+      asg_name: ${{ steps.target.outputs.asg_name }}
+      cell_id: ${{ steps.target.outputs.cell_id }}
+      start_epoch: ${{ steps.target.outputs.start_epoch }}
+      end_epoch: ${{ steps.target.outputs.end_epoch }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - id: target
+        name: Resolve and fence the assigned-cell public UDP edge
+        env:
+          DURATION_SECONDS: ${{ inputs.duration_seconds }}
+          FLOOD_PPS: ${{ inputs.flood_pps_per_runner }}
+        run: |
+          set -euo pipefail
+          [[ "$DURATION_SECONDS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::duration_seconds must be a positive integer"; exit 1; }
+          if ! [[ "$FLOOD_PPS" =~ ^[1-9][0-9]*$ ]] || (( FLOOD_PPS <= 100 )); then
+            echo "::error::flood_pps_per_runner must be an integer greater than the 100 pps/source host limit"
+            exit 1
+          fi
+          CELL_ID=$(aws ssm get-parameter --name /sandbox/nhp/deploy/cell-id --query Parameter.Value --output text)
+          [[ "$CELL_ID" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::Invalid sandbox deploy cell id: $CELL_ID"; exit 1; }
+          LISTENER_ARN=$(aws ssm get-parameter --name /sandbox/nhp/server/udp-listener-arn --query Parameter.Value --output text)
+          LB_ARN=$(aws elbv2 describe-listeners --listener-arns "$LISTENER_ARN" --query 'Listeners[0].LoadBalancerArn' --output text)
+          HOST=$(aws elbv2 describe-load-balancers --load-balancer-arns "$LB_ARN" --query 'LoadBalancers[0].DNSName' --output text)
+          LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn "$LB_ARN" --query 'Listeners[].{Protocol:Protocol,Port:Port}' --output json)
+          UDP_LISTENERS=$(jq '[.[] | select(.Protocol == "UDP" or .Protocol == "TCP_UDP")]' <<<"$LISTENERS")
+          [[ "$(jq length <<<"$UDP_LISTENERS")" == "1" ]] || { echo "::error::Assigned-cell public NLB must have exactly one UDP-capable listener: $UDP_LISTENERS"; exit 1; }
+          jq -e '.[0].Protocol == "UDP" and .[0].Port == 62206' <<<"$UDP_LISTENERS" >/dev/null || { echo "::error::Assigned-cell public UDP listener is not exactly UDP 62206: $UDP_LISTENERS"; exit 1; }
+          jq -e 'all(.[]; .Port != 62207)' <<<"$LISTENERS" >/dev/null || { echo "::error::UDP 62207 is publicly exposed: $LISTENERS"; exit 1; }
+          ACTIVE_COLOR=$(aws ssm get-parameter --name /sandbox/nhp/server/active-color --query Parameter.Value --output text)
+          case "$ACTIVE_COLOR" in
+            blue|green) ;;
+            *) echo "::error::Unexpected server active color: $ACTIVE_COLOR"; exit 1 ;;
+          esac
+          ASG_NAME=$(aws ssm get-parameter --name "/sandbox/nhp/server/${ACTIVE_COLOR}-asg-name" --query Parameter.Value --output text)
+          ACTIVE_TG_ARN=$(aws ssm get-parameter --name "/sandbox/nhp/server/${ACTIVE_COLOR}-udp-tg-arn" --query Parameter.Value --output text)
+          DEFAULT_ACTION=$(aws elbv2 describe-listeners --listener-arns "$LISTENER_ARN" --query 'Listeners[0].DefaultActions[0]' --output json)
+          jq -e '.Type == "forward"' <<<"$DEFAULT_ACTION" >/dev/null || { echo "::error::Public UDP listener default action is not forward: $DEFAULT_ACTION"; exit 1; }
+          LISTENER_TG_ARN=$(jq -r '.TargetGroupArn' <<<"$DEFAULT_ACTION")
+          [[ "$LISTENER_TG_ARN" == "$ACTIVE_TG_ARN" ]] || { echo "::error::Public UDP listener target $LISTENER_TG_ARN does not match active color $ACTIVE_COLOR target $ACTIVE_TG_ARN"; exit 1; }
+          START_EPOCH=$(( $(date +%s) + 180 ))
+          END_EPOCH=$(( START_EPOCH + DURATION_SECONDS ))
+          {
+            echo "host=$HOST"
+            echo "asg_name=$ASG_NAME"
+            echo "cell_id=$CELL_ID"
+            echo "start_epoch=$START_EPOCH"
+            echo "end_epoch=$END_EPOCH"
+          } >> "$GITHUB_OUTPUT"
+
+  flood:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Record source and send bounded rotating-tuple flood
+        env:
+          HOST: ${{ needs.prepare.outputs.host }}
+          START_EPOCH: ${{ needs.prepare.outputs.start_epoch }}
+          DURATION_SECONDS: ${{ inputs.duration_seconds }}
+          PPS: ${{ inputs.flood_pps_per_runner }}
+          SOURCE: ${{ matrix.source }}
+        run: |
+          set -euo pipefail
+          PUBLIC_IP=$(curl --fail --silent --show-error --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')
+          echo "Distributed source $SOURCE public IP: $PUBLIC_IP" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/udp-edge-flood.py \
+            --host "$HOST" \
+            --pps "$PPS" \
+            --duration-seconds "$DURATION_SECONDS" \
+            --source-sockets 64 \
+            --seed "$((318400 + SOURCE))" \
+            --start-epoch "$START_EPOCH" | tee "udp-flood-source-${SOURCE}.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: udp-flood-source-${{ matrix.source }}
+          path: udp-flood-source-${{ matrix.source }}.json
+
+  valid-sdk-probe:
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: sandbox
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: endpoints/go.mod
+          cache-dependency-path: |
+            endpoints/go.sum
+            nhp/go.sum
+
+      - name: Run real external NHP SDK round trips during the flood
+        working-directory: endpoints
+        env:
+          NHP_UDP_PROBE_AGENT_PRIVATE_KEY_B64: ${{ secrets.NHP_UDP_READINESS_AGENT_PRIVATE_KEY_B64 }}
+          NHP_UDP_PROBE_SERVER_PUBLIC_KEY_B64: ${{ secrets.NHP_UDP_READINESS_SERVER_PUBLIC_KEY_B64 }}
+          NHP_UDP_PROBE_SERVER_HOST: ${{ needs.prepare.outputs.host }}
+          NHP_UDP_PROBE_ASP_ID: agent
+          NHP_UDP_PROBE_RESOURCE_ID: qurl-tunnel-server
+          NHP_UDP_PROBE_USER_ID: udp-readiness-canary
+          NHP_UDP_PROBE_DURATION_SECONDS: ${{ inputs.duration_seconds }}
+          NHP_UDP_PROBE_INTERVAL_MS: "1000"
+          NHP_UDP_PROBE_MIN_SUCCESS_RATIO: ${{ inputs.minimum_probe_success_ratio }}
+          NHP_UDP_PROBE_MAX_P99_MS: ${{ inputs.maximum_probe_p99_ms }}
+          NHP_UDP_READINESS_START_EPOCH: ${{ needs.prepare.outputs.start_epoch }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/udp-edge-probe | tee ../udp-valid-sdk-probe.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: udp-valid-sdk-probe
+          path: udp-valid-sdk-probe.json
+
+  verify:
+    if: "${{ always() && needs.prepare.result == 'success' }}"
+    needs: [prepare, flood, valid-sdk-probe]
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    environment: sandbox
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download flood timing artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: udp-flood-source-*
+          path: udp-timing
+          merge-multiple: true
+
+      - name: Download SDK probe timing artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: udp-valid-sdk-probe
+          path: udp-timing
+
+      - uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - name: Wait for CloudWatch ingestion
+        env:
+          END_EPOCH: ${{ needs.prepare.outputs.end_epoch }}
+        run: |
+          WAIT_SECONDS=$(( END_EPOCH + 180 - $(date +%s) ))
+          if (( WAIT_SECONDS > 0 )); then sleep "$WAIT_SECONDS"; fi
+
+      - name: Verify topology, UDP 62207 absence, and bounded resource evidence
+        env:
+          START_EPOCH: ${{ needs.prepare.outputs.start_epoch }}
+          END_EPOCH: ${{ needs.prepare.outputs.end_epoch }}
+          ASG_NAME: ${{ needs.prepare.outputs.asg_name }}
+          CELL_ID: ${{ needs.prepare.outputs.cell_id }}
+          MAX_CPU: ${{ inputs.maximum_cpu_percent }}
+        run: |
+          set -o pipefail
+          TIMING_RC=0
+          python3 scripts/verify-udp-edge-overlap.py \
+            --expected-start-epoch "$START_EPOCH" \
+            --expected-end-epoch "$END_EPOCH" \
+            --flood-glob 'udp-timing/udp-flood-source-*.json' \
+            --probe udp-timing/udp-valid-sdk-probe.json | tee udp-timing-evidence.json || TIMING_RC=$?
+          TOPOLOGY_RC=0
+          python3 scripts/check-relay-dmz-live.py --environment sandbox --mode structural --wait-seconds 300 | tee udp-topology.json || TOPOLOGY_RC=$?
+          EVIDENCE_RC=0
+          python3 scripts/verify-udp-edge-readiness.py \
+            --environment sandbox \
+            --cell "$CELL_ID" \
+            --asg-name "$ASG_NAME" \
+            --start-epoch "$((START_EPOCH - 120))" \
+            --end-epoch "$((END_EPOCH + 180))" \
+            --max-cpu-percent "$MAX_CPU" | tee udp-capacity-evidence.json || EVIDENCE_RC=$?
+          if [[ "${{ needs.flood.result }}" != "success" || "${{ needs.valid-sdk-probe.result }}" != "success" || "$TIMING_RC" -ne 0 || "$TOPOLOGY_RC" -ne 0 || "$EVIDENCE_RC" -ne 0 ]]; then
+            echo "::error::UDP readiness failed: flood=${{ needs.flood.result }} probe=${{ needs.valid-sdk-probe.result }} timing_rc=$TIMING_RC topology_rc=$TOPOLOGY_RC evidence_rc=$EVIDENCE_RC"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: udp-readiness-verification
+          path: |
+            udp-topology.json
+            udp-timing-evidence.json
+            udp-capacity-evidence.json

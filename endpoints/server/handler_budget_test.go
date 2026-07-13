@@ -48,6 +48,15 @@ func newTestServerWithHandlerBudget(t *testing.T, budget int) *UdpServer {
 	}
 }
 
+func newTestServerWithPartitionedHandlerBudget(t *testing.T, general, protected int) *UdpServer {
+	t.Helper()
+	return &UdpServer{
+		metrics:             metrics.NewPublisherForTest(t),
+		handlerSem:          make(chan struct{}, general),
+		protectedHandlerSem: make(chan struct{}, protected),
+	}
+}
+
 // TestDispatchHandler_CapsInFlightAndSheds is the core load-test fence.
 // A flood of `flood` dispatches, each running a handler that parks until
 // released, must (1) never block the dispatch loop, (2) run exactly
@@ -120,6 +129,103 @@ func TestDispatchHandler_CapsInFlightAndSheds(t *testing.T) {
 	}
 	if got := s.handlerShedCount.Load(); got != wantShed {
 		t.Fatalf("handlerShedCount changed after a slot was freed: got %d, want %d", got, wantShed)
+	}
+}
+
+func TestDispatchHandler_ProtectedReservePreservesRKNProgress(t *testing.T) {
+	const general = 4
+	s := newTestServerWithPartitionedHandlerBudget(t, general, 2)
+	generalRelease := make(chan struct{})
+	generalEntered := make(chan struct{}, general)
+	for i := 0; i < general; i++ {
+		s.dispatchHandler(newDispatchPPD(core.NHP_KNK, `{}`), func(*core.PacketParserData) error {
+			generalEntered <- struct{}{}
+			<-generalRelease
+			return nil
+		})
+	}
+	for i := 0; i < general; i++ {
+		select {
+		case <-generalEntered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("general handler did not enter")
+		}
+	}
+	if !s.handlerOverload.Load() {
+		t.Fatal("full general partition did not enable overload-cookie mode")
+	}
+
+	// An ordinary KNK cannot consume the reserve.
+	s.dispatchHandler(newDispatchPPD(core.NHP_KNK, `{}`), func(*core.PacketParserData) error {
+		t.Error("unproven KNK ran from protected reserve")
+		return nil
+	})
+	if got := s.handlerShedCount.Load(); got != 1 {
+		t.Fatalf("unproven KNK sheds = %d, want 1", got)
+	}
+
+	// A core-verified RKN can still make progress through the reserve.
+	rknRan := make(chan struct{})
+	s.dispatchHandler(newDispatchPPD(core.NHP_RKN, `{}`), func(*core.PacketParserData) error {
+		close(rknRan)
+		return nil
+	})
+	select {
+	case <-rknRan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cookie-proven RKN did not run from protected reserve")
+	}
+	waitFor(t, 2*time.Second, "protected RKN slot released", func() bool {
+		return len(s.protectedHandlerSem) == 0
+	})
+
+	close(generalRelease)
+	waitFor(t, 2*time.Second, "handler pressure recovered", func() bool {
+		return !s.handlerOverload.Load() && len(s.handlerSem) == 0
+	})
+}
+
+func TestDispatchHandler_ProtectedReserveExhaustionIsDistinct(t *testing.T) {
+	s := newTestServerWithPartitionedHandlerBudget(t, 1, 1)
+	release := make(chan struct{})
+	entered := make(chan struct{}, 2)
+	block := func(*core.PacketParserData) error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	}
+	s.dispatchHandler(newDispatchPPD(core.NHP_KNK, `{}`), block)
+	<-entered
+	s.dispatchHandler(newDispatchPPD(core.NHP_RKN, `{}`), block)
+	<-entered
+
+	s.dispatchHandler(newDispatchPPD(core.NHP_RKN, `{}`), func(*core.PacketParserData) error {
+		t.Error("RKN ran after both handler partitions were full")
+		return nil
+	})
+	counters, _ := s.metrics.CountersForTest(t)
+	if got := counters[MetricHandlerBudgetExhausted]; got != 1 {
+		t.Fatalf("%s = %v, want 1", MetricHandlerBudgetExhausted, got)
+	}
+	if got := counters[MetricHandlerProtectedReserveExhausted]; got != 1 {
+		t.Fatalf("%s = %v, want 1", MetricHandlerProtectedReserveExhausted, got)
+	}
+	close(release)
+	waitFor(t, 2*time.Second, "partitioned handlers released", func() bool {
+		return len(s.handlerSem)+len(s.protectedHandlerSem) == 0
+	})
+}
+
+func TestProtectedHandlerTypes(t *testing.T) {
+	for _, headerType := range []int{core.NHP_RKN, core.NHP_RLY} {
+		if !isProtectedHandlerType(headerType) {
+			t.Errorf("%s must be protected", core.HeaderTypeToString(headerType))
+		}
+	}
+	for _, headerType := range []int{core.NHP_KNK, core.DHP_KNK, core.NHP_EXT, core.NHP_OTP} {
+		if isProtectedHandlerType(headerType) {
+			t.Errorf("%s must not consume protected capacity", core.HeaderTypeToString(headerType))
+		}
 	}
 }
 

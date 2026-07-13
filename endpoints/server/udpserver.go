@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	runtimemetrics "runtime/metrics"
 	"sort"
 	"strings"
 
@@ -359,15 +361,26 @@ type UdpServer struct {
 	// agent_otp_ratelimit.go.
 	otpRateLimiter *OTPRateLimiter
 
-	// handlerSem bounds the number of in-flight agent-facing handler
-	// goroutines dispatchReceivedMessage runs concurrently (see
-	// MaxConcurrentHandlers). Buffered to that capacity; dispatchHandler
-	// acquires with a NON-BLOCKING send so recvMessageRoutine never
+	// handlerSem is the general agent-facing handler partition. The protected
+	// partition below is reserved for source-cookie-proven RKNs and configured
+	// relay envelopes; together they total MaxConcurrentHandlers.
+	// dispatchHandler acquires with a NON-BLOCKING send so recvMessageRoutine never
 	// head-of-line-blocks on a full budget (#1163) — excess dispatches
 	// are shed and the agent retries. A nil sem means unbounded; that is
 	// a test-only affordance (bare &UdpServer{} literals), the
 	// constructor always initializes it in production.
 	handlerSem chan struct{}
+	// protectedHandlerSem cannot be consumed by first-flight KNK or other
+	// unproven public work. It preserves progress after handler pressure flips
+	// core into overload-cookie mode.
+	protectedHandlerSem chan struct{}
+	// overloadMu serializes each pressure-source transition with the derived
+	// core overload write. The source flags remain atomic because tests and
+	// gauges inspect them independently, but neither source may publish from a
+	// stale interleaving and handler transitions must re-check live occupancy.
+	overloadMu         sync.Mutex
+	connectionOverload atomic.Bool
+	handlerOverload    atomic.Bool
 	// handlerShedCount throttles the shed warn-log to 1 + every 1000th
 	// shed — the same lifetime-modulus sampled-log idiom as rateLimitDrops
 	// and perIPEvictionWarns. It never resets, so the log is only a
@@ -887,13 +900,36 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	log.Info("OTP rate limiter initialized: capacity %d, refill 1 per %s per key, global ~%.1f/min",
 		otpCfg.Capacity, otpCfg.RefillInterval, otpCfg.GlobalRate*60)
 
-	// Bound in-flight agent-facing handler goroutines. Buffered to
-	// MaxConcurrentHandlers; dispatchHandler acquires non-blocking so the
-	// receive path never stalls (#1163). Complements the per-IP rate
-	// limiter above: that caps a single source, this caps aggregate
-	// in-flight handlers under a spoofed/distributed flood.
-	s.handlerSem = make(chan struct{}, MaxConcurrentHandlers)
-
+	// Partition the original aggregate handler ceiling. First-flight public
+	// work can fill only the general partition; cookie-proven RKNs and trusted
+	// relay envelopes may fall back to the protected reserve. The total bound
+	// remains MaxConcurrentHandlers.
+	s.handlerSem = make(chan struct{}, HandlerGeneralCapacity)
+	s.protectedHandlerSem = make(chan struct{}, HandlerProtectedReserve)
+	s.metrics.RegisterGaugeFunc(MetricHandlerInFlight, func() float64 {
+		// The two len calls are individually race-safe but not one atomic
+		// cross-partition snapshot. The sum is bounded and operational telemetry;
+		// admission and overload transitions consult the semaphores directly.
+		return float64(len(s.handlerSem) + len(s.protectedHandlerSem))
+	})
+	s.metrics.RegisterGaugeFunc(MetricHandlerProtectedInFlight, func() float64 {
+		return float64(len(s.protectedHandlerSem))
+	})
+	s.metrics.RegisterGaugeFunc(MetricHandlerPressureOverload, func() float64 {
+		if s.handlerOverload.Load() {
+			return 1
+		}
+		return 0
+	})
+	s.metrics.RegisterGaugeFunc(MetricRuntimeGoroutine, func() float64 {
+		return float64(runtime.NumGoroutine())
+	})
+	s.metrics.RegisterGaugeFunc(MetricRuntimeHeapAllocBytes, func() float64 {
+		var samples [1]runtimemetrics.Sample
+		samples[0].Name = "/memory/classes/heap/objects:bytes"
+		runtimemetrics.Read(samples[:])
+		return float64(samples[0].Value.Uint64())
+	})
 	// Initialize server-to-server forwarder
 	s.forwarder = NewServerForwarder(s)
 	s.forwarder.Start()
@@ -1073,6 +1109,9 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		log.Critical("failed to create device")
 		return errors.New("failed to create device")
 	}
+	if err := s.registerReceiveQueueMetrics(); err != nil {
+		return err
+	}
 
 	if err := s.configureStatelessCookieParams(); err != nil {
 		return err
@@ -1217,6 +1256,34 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 
 	s.running.Store(true)
+	return nil
+}
+
+// registerReceiveQueueMetrics wires queue telemetry only after the core device
+// exists. The metric publisher may collect a gauge as soon as it is registered,
+// so registering these closures before NewDevice would introduce a startup race
+// in addition to making SetReceiveQueueDropHook dereference a nil device.
+func (s *UdpServer) registerReceiveQueueMetrics() error {
+	if s.device == nil {
+		return errors.New("cannot register receive queue metrics before device initialization")
+	}
+
+	s.metrics.RegisterGaugeFunc(MetricPacketDecryptQueueDepth, func() float64 {
+		depth, _ := s.device.ReceiveQueueDepths()
+		return float64(depth)
+	})
+	s.metrics.RegisterGaugeFunc(MetricDecryptedMessageQueueDepth, func() float64 {
+		_, depth := s.device.ReceiveQueueDepths()
+		return float64(depth)
+	})
+	s.device.SetReceiveQueueDropHook(func(reason core.ReceiveQueueDrop) {
+		switch reason {
+		case core.ReceiveQueueDropDecrypt:
+			s.metrics.IncrCounter(MetricPacketDecryptQueueDrop)
+		case core.ReceiveQueueDropDecrypted:
+			s.metrics.IncrCounter(MetricDecryptedMessageQueueDrop)
+		}
+	})
 	return nil
 }
 
@@ -2319,6 +2386,7 @@ func (s *UdpServer) recvPacketRoutine() {
 		// kernel-level first line of defense.
 		if s.rateLimiter != nil && !s.rateLimiter.Allow(ipStr) {
 			drops := s.rateLimitDrops.Add(1)
+			s.metrics.IncrCounter(MetricUDPRateLimitDrop)
 			if drops == 1 || drops%1000 == 0 {
 				log.Warning("[Server] rate limited UDP packet from %s (total drops: %d)", addrStr, drops)
 			}
@@ -2486,8 +2554,9 @@ func (s *UdpServer) isKnownDBPeerIP(ipStr string) bool {
 //
 // MetricGlobalCapRejections is incremented AFTER Unlock, not before
 // the return, because IncrCounter takes the publisher mutex and
-// remoteConnectionMapMutex is leaf-most for the conn lifecycle (see
-// endpoints/server/CLAUDE.md). This mirrors admitNewConnection's
+// remoteConnectionMapMutex must not nest the publisher mutex (see
+// endpoints/server/CLAUDE.md); its only permitted nested lock is overloadMu.
+// This mirrors admitNewConnection's
 // eviction counter: mutate-under-lock, unlock, then increment. The
 // counter treats every false return as a dropped packet, so callers
 // MUST discard on false — do not reuse this as a non-dropping capacity
@@ -2496,8 +2565,8 @@ func (s *UdpServer) isKnownDBPeerIP(ipStr string) bool {
 //
 // The deferred Unlock is dropped (explicit Unlock) so the increment
 // lands outside the lock. That is safe only because the remaining
-// under-lock work — len() and SetOverload's atomic store — cannot
-// panic, so there is no leaked-mutex path. A future edit that adds
+// under-lock work — len() and the bounded overload publication — cannot panic,
+// so there is no leaked-mutex path. A future edit that adds
 // panic-able work under this lock must restore a defer (or unlock on
 // the panic path) before doing so.
 //
@@ -2522,9 +2591,48 @@ func (s *UdpServer) globalCapAdmits() bool {
 func (s *UdpServer) globalCapAdmitsLocked() bool {
 	n := len(s.remoteConnectionMap)
 	if n > OverloadConnectionThreshold {
-		s.device.SetOverload(true)
+		s.setConnectionOverload(true)
 	}
 	return n < MaxConcurrentConnection
+}
+
+func (s *UdpServer) setConnectionOverload(overloaded bool) {
+	s.overloadMu.Lock()
+	defer s.overloadMu.Unlock()
+	s.connectionOverload.Store(overloaded)
+	s.publishOverloadLocked()
+}
+
+func (s *UdpServer) setHandlerOverload(overloaded bool) {
+	s.overloadMu.Lock()
+	defer s.overloadMu.Unlock()
+
+	// A dispatch/release decides from an earlier channel snapshot. Re-check
+	// while serializing the pressure transition so a shedder that observed a
+	// full partition cannot re-enable cookie mode after the final recovery
+	// release, and a stale release cannot clear it above the hysteresis floor.
+	next := overloaded
+	if s.handlerSem != nil {
+		next = s.handlerOverload.Load()
+		inFlight := int64(len(s.handlerSem))
+		if overloaded && inFlight >= int64(cap(s.handlerSem)) {
+			next = true
+		} else if !overloaded && inFlight <= handlerPressureRecoveryThreshold(cap(s.handlerSem)) {
+			next = false
+		}
+	}
+	s.handlerOverload.Store(next)
+	s.publishOverloadLocked()
+}
+
+// publishOverloadLocked combines independent pressure sources. Neither handler
+// recovery nor connection cleanup may clear cookie mode while the other source
+// is still above its threshold. The caller holds overloadMu across its source
+// update and this derived write.
+func (s *UdpServer) publishOverloadLocked() {
+	if s.device != nil {
+		s.device.SetOverload(s.connectionOverload.Load() || s.handlerOverload.Load())
+	}
 }
 
 // admitNewConnection registers conn in remoteConnectionMap. For agent
@@ -2659,7 +2767,7 @@ func (s *UdpServer) removeConnection(conn *UdpConn, addrStr string) {
 		conn.perIPElem = nil
 	}
 	if len(s.remoteConnectionMap) <= OverloadConnectionThreshold {
-		s.device.SetOverload(false)
+		s.setConnectionOverload(false)
 	}
 }
 
@@ -2976,30 +3084,54 @@ func (s *UdpServer) recvMessageRoutine() {
 	}
 }
 
-// dispatchHandler runs fn(ppd) in its own goroutine under the
-// handlerSem budget. The acquire is a NON-BLOCKING send: when the
-// budget is full the dispatch is shed — MetricHandlerBudgetExhausted
-// ticks, a rate-limited warning logs, and the packet is dropped so the
-// agent retries — rather than blocking recvMessageRoutine, which would
-// re-introduce the head-of-line blocking #1163 removed. See
-// MaxConcurrentHandlers for why the pre-dispatch per-IP rate limiter
-// can't provide this ceiling on its own.
+// dispatchHandler runs fn(ppd) under the partitioned handler budget. Every arm
+// first tries the general partition. A cookie-proven RKN or authenticated relay
+// envelope may fall back to the protected reserve; first-flight public work
+// cannot. Filling the general partition enables overload-cookie mode so later
+// direct clients can obtain the source-bound proof needed for that reserve.
+// All acquisition remains non-blocking, preserving #1163.
 //
 // A nil handlerSem means unbounded — a test-only affordance for bare
 // &UdpServer{} literals; the constructor always initializes it.
 func (s *UdpServer) dispatchHandler(ppd *core.PacketParserData, fn func(*core.PacketParserData) error) {
-	// handlerSem is set once in Start() before the receive routines
-	// launch and never reassigned, so a single read decides bounded vs.
-	// the (test-only) unbounded path for both acquire and release.
 	bounded := s.handlerSem != nil
+	usedGeneral := false
+	usedProtected := false
 	if bounded {
 		select {
 		case s.handlerSem <- struct{}{}:
+			usedGeneral = true
+			// len is an occupancy snapshot: a concurrent release may hide this
+			// exact saturating admission, but the next rejected admission catches
+			// it and setHandlerOverload re-checks occupancy before transitioning.
+			if inFlight := len(s.handlerSem); s.protectedHandlerSem != nil && inFlight >= cap(s.handlerSem) {
+				s.setHandlerOverload(true)
+			}
 		default:
+			// The production server has a protected reserve. Small unit-test
+			// servers that intentionally construct only a single semaphore do not
+			// participate in overload-cookie recovery and must not retain stale
+			// pressure state after a rejected dispatch.
+			if s.protectedHandlerSem != nil {
+				s.setHandlerOverload(true)
+			}
+			if s.protectedHandlerSem != nil && isProtectedHandlerType(ppd.HeaderType) {
+				select {
+				case s.protectedHandlerSem <- struct{}{}:
+					usedProtected = true
+				default:
+				}
+			}
+			if usedProtected {
+				break
+			}
 			s.metrics.IncrCounter(MetricHandlerBudgetExhausted)
+			if isProtectedHandlerType(ppd.HeaderType) && s.protectedHandlerSem != nil {
+				s.metrics.IncrCounter(MetricHandlerProtectedReserveExhausted)
+			}
 			if sheds := s.handlerShedCount.Add(1); sheds == 1 || sheds%1000 == 0 {
-				log.Warning("[Server] handler budget (%d) exhausted, shedding %s from %s (total sheds: %d)",
-					cap(s.handlerSem), core.HeaderTypeToString(ppd.HeaderType),
+				log.Warning("[Server] handler budget (general=%d protected=%d) exhausted, shedding %s from %s (total sheds: %d)",
+					cap(s.handlerSem), cap(s.protectedHandlerSem), core.HeaderTypeToString(ppd.HeaderType),
 					ppd.ConnData.RemoteAddr.String(), sheds)
 			}
 			return
@@ -3008,13 +3140,46 @@ func (s *UdpServer) dispatchHandler(ppd *core.PacketParserData, fn func(*core.Pa
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		if bounded {
-			defer func() { <-s.handlerSem }()
+		if usedGeneral {
+			defer func() {
+				<-s.handlerSem
+				remaining := int64(len(s.handlerSem))
+				recoveryThreshold := handlerPressureRecoveryThreshold(cap(s.handlerSem))
+				// remaining is the post-release snapshot; reload occupancy in
+				// the condition so a concurrent re-acquire cannot make this
+				// goroutine clear pressure from a stale below-threshold value.
+				if s.protectedHandlerSem != nil && remaining <= recoveryThreshold && int64(len(s.handlerSem)) <= recoveryThreshold {
+					s.setHandlerOverload(false)
+				}
+			}()
+		} else if usedProtected {
+			defer func() {
+				<-s.protectedHandlerSem
+			}()
 		}
 		if err := fn(ppd); err != nil {
 			log.Error("[Server] %s handler failed: %v", core.HeaderTypeToString(ppd.HeaderType), err)
 		}
 	}()
+}
+
+func isProtectedHandlerType(headerType int) bool {
+	// Security boundary: this classifier is reached only after core has built a
+	// decrypted PacketParserData. For NHP_RKN, parseHeadPacket in
+	// nhp/core/responder.go requires the source-bound overload cookie whenever
+	// stateless cookie parameters are configured; the end-to-end rejection
+	// fences are TestCookieVerifyRejectsBadCookieOnNonOverloadedServer and
+	// TestCookieVerifyRejectsWrongRemote. Do not route pre-validation headers
+	// here or the protected reserve would become source-spoofable.
+	return headerType == core.NHP_RKN || headerType == core.NHP_RLY
+}
+
+func handlerPressureRecoveryThreshold(generalCapacity int) int64 {
+	// General pressure turns on overload-cookie mode at capacity and stays on
+	// until occupancy falls to 75%, avoiding mode flaps near the boundary. The
+	// threshold derives from the actual channel capacity so production and
+	// deliberately small test partitions share one formula.
+	return int64(generalCapacity * 3 / 4)
 }
 
 // dispatchAsync tracks trusted-peer handlers without applying the public
@@ -3106,9 +3271,12 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 	case core.NHP_FRT:
 		s.dispatchAsync(func() { s.HandleForwardResult(ppd) })
 
-	// NHP-Relay forwarded agent knock (#2208). Runs the same knock
-	// pipeline as a direct knock (buildKnockAck + AC-open), so it is
-	// bounded with the other agent-facing arms. HandleRelayForward
+	// NHP-Relay forwarded agent knock (#2208). Core dispatches NHP_RLY only
+	// after its outer Noise packet decrypts as a configured relay peer; that
+	// identity proof is why isProtectedHandlerType may grant reserve capacity.
+	// Keep that coupling explicit if relay authentication or routing changes.
+	// It runs the same knock pipeline as a direct knock (buildKnockAck + AC-open),
+	// so it is bounded with the other agent-facing arms. HandleRelayForward
 	// returns no error, so it is wrapped to the dispatchHandler signature.
 	case core.NHP_RLY:
 		s.dispatchHandler(ppd, func(p *core.PacketParserData) error {

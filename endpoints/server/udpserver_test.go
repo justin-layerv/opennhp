@@ -91,6 +91,113 @@ func TestPacketFromUDPDatagramRelayEnvelopeBoundary(t *testing.T) {
 	}
 }
 
+func TestRegisterReceiveQueueMetricsRequiresInitializedDevice(t *testing.T) {
+	server := &UdpServer{metrics: metrics.NewPublisherForTest(t)}
+	if err := server.registerReceiveQueueMetrics(); err == nil {
+		t.Fatal("registerReceiveQueueMetrics accepted a nil device")
+	}
+
+	server.device = core.NewDevice(
+		core.NHP_SERVER,
+		bytes.Repeat([]byte{0x5a}, core.PrivateKeySize),
+		nil,
+	)
+	if server.device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	if err := server.registerReceiveQueueMetrics(); err != nil {
+		t.Fatalf("registerReceiveQueueMetrics: %v", err)
+	}
+
+	for {
+		pkt := server.device.AllocatePoolPacket()
+		if pkt == nil {
+			t.Fatal("AllocatePoolPacket returned nil")
+		}
+		if !server.device.RecvPacketToMsg(&core.PacketData{BasePacket: pkt}) {
+			break
+		}
+	}
+
+	gauges := server.metrics.GaugesForTest(t)
+	if gauges[MetricPacketDecryptQueueDepth] <= 0 {
+		t.Fatalf("%s = %v, want positive depth", MetricPacketDecryptQueueDepth, gauges[MetricPacketDecryptQueueDepth])
+	}
+	if gauges[MetricDecryptedMessageQueueDepth] != 0 {
+		t.Fatalf("%s = %v, want 0", MetricDecryptedMessageQueueDepth, gauges[MetricDecryptedMessageQueueDepth])
+	}
+	counters, _ := server.metrics.CountersForTest(t)
+	if counters[MetricPacketDecryptQueueDrop] != 1 {
+		t.Fatalf("%s = %v, want 1", MetricPacketDecryptQueueDrop, counters[MetricPacketDecryptQueueDrop])
+	}
+}
+
+func TestCombinedOverloadSourcesCannotClearEachOther(t *testing.T) {
+	server := &UdpServer{device: core.NewDevice(
+		core.NHP_SERVER,
+		bytes.Repeat([]byte{0x6b}, core.PrivateKeySize),
+		nil,
+	)}
+	if server.device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+
+	server.setConnectionOverload(true)
+	server.setHandlerOverload(true)
+	server.setConnectionOverload(false)
+	if !server.device.IsOverload() {
+		t.Fatal("connection recovery cleared active handler pressure")
+	}
+	server.setHandlerOverload(false)
+	if server.device.IsOverload() {
+		t.Fatal("device remained overloaded after both sources recovered")
+	}
+
+	server.setConnectionOverload(true)
+	server.setHandlerOverload(true)
+	server.setHandlerOverload(false)
+	if !server.device.IsOverload() {
+		t.Fatal("handler recovery cleared active connection pressure")
+	}
+	server.setConnectionOverload(false)
+	if server.device.IsOverload() {
+		t.Fatal("device remained overloaded after reverse-order recovery")
+	}
+}
+
+func TestHandlerOverloadRejectsStaleActivationAfterRecovery(t *testing.T) {
+	server := &UdpServer{
+		device: core.NewDevice(
+			core.NHP_SERVER,
+			bytes.Repeat([]byte{0x6c}, core.PrivateKeySize),
+			nil,
+		),
+		handlerSem:          make(chan struct{}, 4),
+		protectedHandlerSem: make(chan struct{}, 1),
+	}
+	if server.device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+
+	for i := 0; i < cap(server.handlerSem); i++ {
+		server.handlerSem <- struct{}{}
+	}
+	server.setHandlerOverload(true)
+	if !server.device.IsOverload() {
+		t.Fatal("full handler partition did not enable overload")
+	}
+
+	// Drain to the 75% recovery threshold and clear pressure as the final
+	// releaser would. A shedder carrying an earlier full-partition decision
+	// must re-check occupancy instead of re-enabling overload in a quiet window.
+	<-server.handlerSem
+	server.setHandlerOverload(false)
+	server.setHandlerOverload(true)
+	if server.handlerOverload.Load() || server.device.IsOverload() {
+		t.Fatal("stale saturation decision re-enabled overload after recovery")
+	}
+}
+
 func newSendMessageTestServer(t *testing.T, sendCh chan *core.MsgData) *UdpServer {
 	t.Helper()
 	server := newTestUdpServer(t)

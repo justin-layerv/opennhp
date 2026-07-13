@@ -88,6 +88,8 @@ the correct server NLB endpoint, run a real external NHP UDP 62206 round trip,
 and retain evidence that no public UDP listener other than 62206 exists on the
 assigned cell edge.
 
-Issue [#3184](https://github.com/layervai/nhp/issues/3184) tracks direct
-assigned-cell server-edge availability under spoofed UDP floods and must be
-resolved before production rollout of UDP SDK traffic.
+Direct assigned-cell availability under spoofed/distributed UDP floods is
+gated by the protected handler reserve, layered telemetry, and deterministic
+external rehearsal in
+[the UDP flood-readiness runbook](../runbooks/assigned-cell-udp-flood-readiness.md).
+The rehearsal must pass before production rollout of UDP SDK traffic.

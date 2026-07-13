@@ -107,9 +107,11 @@ the explicit relay-subnet rules for the private relay hop.
 AWS WAF protects only the HTTPS `/relay/*` path. Direct SDK UDP does not pass
 through WAF or the relay and relies on the NHP server protocol's authentication,
 server admission controls, NLB/SG shape, Flow Logs, and cell-level monitoring.
-Issue [#3184](https://github.com/layervai/nhp/issues/3184) now tracks direct
-assigned-cell server-edge availability under spoofed UDP floods. It gates
-production rollout of UDP SDK traffic, not deployment of the HTTPS-only relay.
+Direct assigned-cell availability under spoofed/distributed UDP floods uses a
+protected handler reserve for cookie-proven RKN/authenticated relay work plus
+the [assigned-cell UDP flood rehearsal](runbooks/assigned-cell-udp-flood-readiness.md).
+The rehearsal gates production rollout of UDP SDK traffic, not deployment of
+the HTTPS-only relay.
 
 Relay control-plane egress is TCP 443 to dedicated VPC endpoints and the
 regional S3 prefix list. Resolver Firewall is fail closed, and Resolver and VPC

@@ -537,6 +537,10 @@ func TestCookieRKNReplayAcceptedOnFreshReplicaWithinWindow(t *testing.T) {
 	}
 }
 
+// TestCookieVerifyRejectsBadCookieOnNonOverloadedServer is also the upstream
+// security fence for endpoints/server's protected handler reserve: an RKN with
+// no server-issued proof must fail in core before dispatch can classify it as
+// protected work. Stateless params force this check even after overload clears.
 func TestCookieVerifyRejectsBadCookieOnNonOverloadedServer(t *testing.T) {
 	const window = 60
 	signingKey := bytes.Repeat([]byte{0x42}, SymmetricKeySize)
@@ -592,6 +596,9 @@ func TestCookieVerifyRejectsExpiredWindow(t *testing.T) {
 	}
 }
 
+// TestCookieVerifyRejectsWrongRemote proves the reserve's RKN proof is bound to
+// the observed source, so copying a valid cookie onto spoofed-source traffic
+// still fails before server dispatch.
 func TestCookieVerifyRejectsWrongRemote(t *testing.T) {
 	const window = 60
 	signingKey := bytes.Repeat([]byte{0x42}, SymmetricKeySize)

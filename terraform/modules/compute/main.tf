@@ -915,6 +915,7 @@ locals {
     knock_global_rate_limit_pps   = var.knock_global_rate_limit_pps
     knock_global_rate_limit_burst = var.knock_global_rate_limit_burst
     udp_recv_buffer_bytes         = var.udp_recv_buffer_bytes
+    udp_edge_metrics_script       = chomp(file("${path.module}/udp_edge_metrics.py"))
     # HTTP server timeouts. Surfaced as a TF variable (not hard-coded in
     # the heredoc) so the root module's `aws_cloudfront_distribution.qurl_resolve`
     # lifecycle.precondition can hard-fail plan/apply if IdleTimeoutMs
@@ -1072,6 +1073,20 @@ resource "terraform_data" "relay_toml_render_fence" {
         file("${path.module}/user_data.sh.tpl"),
       )) == 0
       error_message = "user_data.sh.tpl must not interpolate the multi-line relay_toml value inside a bash comment; escape a documentation-only token or keep the value inside its single-quoted heredoc."
+    }
+  }
+}
+
+resource "terraform_data" "udp_edge_metrics_render_fence" {
+  input = filesha256("${path.module}/udp_edge_metrics.py")
+
+  lifecycle {
+    precondition {
+      condition = length(regexall(
+        "(?m)cat > /usr/local/bin/nhp-udp-edge-metrics << 'PYEOF'\\n\\$\\{udp_edge_metrics_script\\}\\nPYEOF",
+        file("${path.module}/user_data.sh.tpl"),
+      )) == 1
+      error_message = "udp_edge_metrics_script must appear exactly once as the body of the single-quoted PYEOF heredoc."
     }
   }
 }
