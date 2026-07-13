@@ -133,6 +133,20 @@ run "dmz_contract" {
   assert {
     condition = (
       aws_route53_resolver_firewall_config.relay.firewall_fail_open == "DISABLED" &&
+      toset(aws_route53_resolver_firewall_domain_list.allow.domains) == toset([
+        "api.ecr.us-east-2.amazonaws.com.",
+        "*.dkr.ecr.us-east-2.amazonaws.com.",
+        "secretsmanager.us-east-2.amazonaws.com.",
+        "ssm.us-east-2.amazonaws.com.",
+        "ssmmessages.us-east-2.amazonaws.com.",
+        "logs.us-east-2.amazonaws.com.",
+        "monitoring.us-east-2.amazonaws.com.",
+        "guardduty-data.us-east-2.amazonaws.com.",
+        "s3.us-east-2.amazonaws.com.",
+        "*.s3.us-east-2.amazonaws.com.",
+        "*.elb.us-east-2.amazonaws.com.",
+      ]) &&
+      toset(aws_route53_resolver_firewall_domain_list.all.domains) == toset(["*."]) &&
       aws_route53_resolver_firewall_rule_group_association.relay.mutation_protection == "DISABLED" &&
       aws_route53_resolver_firewall_rule_group_association.relay.priority == 101 &&
       aws_route53_resolver_firewall_rule.allow.priority == 200 &&
@@ -141,7 +155,7 @@ run "dmz_contract" {
       toset(keys(aws_route53_resolver_firewall_rule.advanced)) == toset(["DGA", "DICTIONARY_DGA", "DNS_TUNNELING"]) &&
       alltrue([for rule in aws_route53_resolver_firewall_rule.advanced : rule.priority < aws_route53_resolver_firewall_rule.allow.priority])
     )
-    error_message = "DNS Firewall must fail closed, stay Terraform-rollback-safe, and evaluate advanced threat blocks before the allowlist and catch-all block."
+    error_message = "DNS Firewall must use AWS-canonical domain entries, fail closed, stay Terraform-rollback-safe, and evaluate advanced threat blocks before the allowlist and catch-all block."
   }
 
   assert {

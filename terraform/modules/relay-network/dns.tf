@@ -21,18 +21,21 @@ resource "aws_route53_resolver_query_log_config_association" "relay" {
 
 resource "aws_route53_resolver_firewall_domain_list" "allow" {
   name = "${var.name_prefix}-relay-dmz-allow"
+  # Route 53 Resolver persists fully-qualified domain-list entries with a
+  # trailing dot. Declare that canonical form so provider refresh cannot turn
+  # this fenced security boundary into a perpetual in-place update.
   domains = [
-    "api.ecr.${data.aws_region.current.region}.amazonaws.com",
-    "*.dkr.ecr.${data.aws_region.current.region}.amazonaws.com",
-    "secretsmanager.${data.aws_region.current.region}.amazonaws.com",
-    "ssm.${data.aws_region.current.region}.amazonaws.com",
-    "ssmmessages.${data.aws_region.current.region}.amazonaws.com",
-    "logs.${data.aws_region.current.region}.amazonaws.com",
-    "monitoring.${data.aws_region.current.region}.amazonaws.com",
-    "guardduty-data.${data.aws_region.current.region}.amazonaws.com",
-    "s3.${data.aws_region.current.region}.amazonaws.com",
-    "*.s3.${data.aws_region.current.region}.amazonaws.com",
-    "*.elb.${data.aws_region.current.region}.amazonaws.com",
+    "api.ecr.${data.aws_region.current.region}.amazonaws.com.",
+    "*.dkr.ecr.${data.aws_region.current.region}.amazonaws.com.",
+    "secretsmanager.${data.aws_region.current.region}.amazonaws.com.",
+    "ssm.${data.aws_region.current.region}.amazonaws.com.",
+    "ssmmessages.${data.aws_region.current.region}.amazonaws.com.",
+    "logs.${data.aws_region.current.region}.amazonaws.com.",
+    "monitoring.${data.aws_region.current.region}.amazonaws.com.",
+    "guardduty-data.${data.aws_region.current.region}.amazonaws.com.",
+    "s3.${data.aws_region.current.region}.amazonaws.com.",
+    "*.s3.${data.aws_region.current.region}.amazonaws.com.",
+    "*.elb.${data.aws_region.current.region}.amazonaws.com.",
   ]
   tags = local.tags
 
@@ -41,7 +44,7 @@ resource "aws_route53_resolver_firewall_domain_list" "allow" {
 
 resource "aws_route53_resolver_firewall_domain_list" "all" {
   name    = "${var.name_prefix}-relay-dmz-all"
-  domains = ["*"]
+  domains = ["*."]
   tags    = local.tags
 
   depends_on = [terraform_data.apply_role_ready]
