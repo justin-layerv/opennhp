@@ -17,7 +17,7 @@ parameterize those expectations together instead of overriding only one of them.
 PR #3150 is the tracked integration layer that wires this otherwise-inert checker
 into the sandbox PR-plan and final pre-apply gates. The integrated PR-plan
 intentionally requires the DMZ to be present; ``--allow-disabled`` is only for
-relay-dark/bootstrap callers. Only the final saved-plan pre-apply gate uses
+relay-dark/bootstrap callers. Only the final deployment pre-apply gate uses
 ``--require-pr0-applied``. Issue #3154 tracks the all-at-once production variant
 required before a future production relay is enabled; implement that variant as
 one environment-profile object rather than a second set of parallel constants.
@@ -231,17 +231,17 @@ EXPECTED_LOG_KMS_ACTIONS = {
 }
 
 EXPECTED_ALLOW_DOMAINS = {
-    f"api.ecr.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"*.dkr.ecr.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"guardduty-data.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"logs.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"monitoring.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"s3.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"*.s3.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"secretsmanager.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"ssm.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"ssmmessages.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
-    f"*.elb.{EXPECTED_SANDBOX_REGION}.amazonaws.com",
+    f"api.ecr.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"*.dkr.ecr.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"guardduty-data.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"logs.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"monitoring.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"s3.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"*.s3.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"secretsmanager.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"ssm.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"ssmmessages.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
+    f"*.elb.{EXPECTED_SANDBOX_REGION}.amazonaws.com.",
 }
 
 # The gateway-endpoint allowlist is intentionally broader than relay IAM: ECR
@@ -363,9 +363,8 @@ def validate_dmz_boundary_noop(plan: dict[str, Any]) -> list[str]:
             errors.append(
                 "automatic apply refuses relay-DMZ boundary change "
                 f"{address} ({', '.join(actions) or 'missing actions'}); "
-                "apply the exact reviewed saved plan with "
-                "docs/runbooks/sandbox-relay-dmz-replacement.md, then rerun "
-                "the workflow against a no-op boundary plan"
+                "ordinary deployments require a no-op boundary; introduce a "
+                "newly reviewed temporary migration path before changing it"
             )
     return errors
 
@@ -2104,8 +2103,8 @@ def validate_plan(
     )
     if all_domains and isinstance(all_domains.values.get("domains"), list):
         v.require(
-            all_domains.values["domains"] == ["*"],
-            "DNS catch-all domain list must be ['*']",
+            all_domains.values["domains"] == ["*."],
+            "DNS catch-all domain list must be ['*.']",
         )
 
     advanced = index_by_address_key(

@@ -1674,7 +1674,7 @@ def clean_plan() -> dict[str, Any]:
         f"{network}.aws_route53_resolver_firewall_domain_list.all",
         "aws_route53_resolver_firewall_domain_list",
         "all",
-        {"domains": ["*"]},
+        {"domains": ["*."]},
     )
     for key, priority in (
         ("DGA", 100),
@@ -2270,6 +2270,24 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
     def test_clean_synthetic_plan_passes(self) -> None:
         self.assertEqual([], checker.validate_plan(clean_plan()))
 
+    def test_dns_domain_lists_require_aws_canonical_trailing_dots(self) -> None:
+        allow_plan = clean_plan()
+        allow = resource(
+            allow_plan, ".aws_route53_resolver_firewall_domain_list.allow"
+        )
+        allow["change"]["after"]["domains"] = [
+            domain.removesuffix(".")
+            for domain in allow["change"]["after"]["domains"]
+        ]
+        self.assert_violation(allow_plan, "DNS allowlist changed")
+
+        catch_all_plan = clean_plan()
+        catch_all = resource(
+            catch_all_plan, ".aws_route53_resolver_firewall_domain_list.all"
+        )
+        catch_all["change"]["after"]["domains"] = ["*"]
+        self.assert_violation(catch_all_plan, "DNS catch-all domain list")
+
     def test_multiple_independent_violations_are_all_reported(self) -> None:
         plan = clean_plan()
         endpoint = resource(plan, '.aws_vpc_endpoint.interface["logs"]')
@@ -2435,7 +2453,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
                 errors = checker.validate_dmz_boundary_noop(plan)
                 self.assertEqual(1, len(errors), errors)
                 self.assertIn(address, errors[0])
-                self.assertIn("exact reviewed saved plan", errors[0])
+                self.assertIn("newly reviewed temporary migration path", errors[0])
 
     def test_automatic_apply_rejects_partial_cutover_after_vpc_exists(self) -> None:
         plan = boundary_noop_plan()
@@ -5889,7 +5907,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         self.assertEqual(1, preapply.returncode, preapply.stderr)
         self.assertIn("PR 0 state move", preapply.stderr)
 
-    def test_cli_reserves_boundary_changes_for_manual_saved_plan(self) -> None:
+    def test_cli_reserves_boundary_changes_for_new_migration_path(self) -> None:
         plan = boundary_noop_plan()
         converged = run_checker_cli(
             plan, "--require-pr0-applied", "--require-dmz-boundary-noop"
@@ -5903,7 +5921,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
         )
         self.assertEqual(1, blocked.returncode, blocked.stderr)
         self.assertIn("automatic apply refuses", blocked.stderr)
-        self.assertIn("sandbox-relay-dmz-replacement.md", blocked.stderr)
+        self.assertIn("newly reviewed temporary migration path", blocked.stderr)
 
     def test_cli_boundary_noop_gate_operates_without_pr0_convergence_gate(self) -> None:
         plan = boundary_noop_plan()
@@ -5914,7 +5932,7 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
 
         self.assertEqual(1, blocked.returncode, blocked.stderr)
         self.assertIn("automatic apply refuses", blocked.stderr)
-        self.assertIn("sandbox-relay-dmz-replacement.md", blocked.stderr)
+        self.assertIn("newly reviewed temporary migration path", blocked.stderr)
         self.assertNotIn("PR 0 state move", blocked.stderr)
 
 
