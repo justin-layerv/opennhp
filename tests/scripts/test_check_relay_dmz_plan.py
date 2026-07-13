@@ -2438,6 +2438,14 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             "module.nhp[0].terraform_data.relay_cell_routing[0]",
             "module.nhp[0].terraform_data.relay_network_ready[0]",
             "module.nhp[0].aws_route53_record.relay_alias[0]",
+            (
+                "module.security."
+                "aws_guardduty_detector_feature.runtime_monitoring[0]"
+            ),
+            (
+                "module.nhp.module.security."
+                "aws_guardduty_detector_feature.runtime_monitoring[0]"
+            ),
         )
         for address in addresses:
             with self.subTest(address=address):
@@ -2474,10 +2482,47 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             "module.networking.aws_route_table.private[0]",
             "module.compute.aws_security_group.server",
             "module.ecr.aws_iam_role_policy.unrelated",
+            (
+                "module.security."
+                "aws_guardduty_detector_feature.lambda_network_logs[0]"
+            ),
             "aws_route53_record.unrelated",
         ):
             with self.subTest(address=address):
                 self.assertFalse(checker.is_dmz_boundary_address(address))
+
+    def test_runtime_monitoring_provider_readback_order_is_pinned(self) -> None:
+        security_main = REPO_ROOT / "terraform/modules/security/main.tf"
+        source = security_main.read_text(encoding="utf-8")
+        match = re.search(
+            r'^resource "aws_guardduty_detector_feature" "runtime_monitoring" '
+            r"\{.*?^\}\s*$",
+            source,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(match, "runtime_monitoring resource block is missing")
+        assert match is not None
+        resource = match.group(0)
+
+        configurations = re.findall(
+            r'additional_configuration\s*\{\s*name\s*=\s*"([^"]+)"\s*'
+            r'status\s*=\s*"([^"]+)"\s*\}',
+            resource,
+        )
+        # Completeness is the API requirement; sequence is the provider-version
+        # hedge for the order-sensitive read-back behavior tracked in #36400.
+        self.assertEqual(
+            [
+                ("EKS_ADDON_MANAGEMENT", "DISABLED"),
+                ("ECS_FARGATE_AGENT_MANAGEMENT", "DISABLED"),
+                ("EC2_AGENT_MANAGEMENT", "ENABLED"),
+            ],
+            configurations,
+        )
+        self.assertIn(
+            "https://github.com/hashicorp/terraform-provider-aws/issues/36400",
+            resource,
+        )
 
     def test_production_wrapper_hard_blocks_relay_until_3154(self) -> None:
         terraform = shutil.which("terraform")

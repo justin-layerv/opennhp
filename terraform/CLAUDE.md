@@ -104,6 +104,16 @@ and its mutation tests in the same PR. The canonical checker enforces the
 HTTPS-only relay contract and is active against the sandbox plan; partial
 contract overrides are intentionally rejected.
 
+GuardDuty Runtime Monitoring remains part of this fail-closed boundary while
+relay replacement requires healthy runtime coverage. Any intentional change to
+its agent-management configuration must use a newly reviewed migration path.
+After an AWS provider bump, re-run live targeted plans in sandbox and prod and
+confirm `aws_guardduty_detector_feature.runtime_monitoring` is a no-op; provider
+issue [hashicorp/terraform-provider-aws#36400](https://github.com/hashicorp/terraform-provider-aws/issues/36400)
+makes the returned block order version-sensitive. Reconsider this classification
+only if relay replacement no longer depends on the GuardDuty functional-boundary
+check.
+
 **Relay active-color routing guardrail (#2658).** Blue/green server colors are
 deploy slots inside one relay cell, not separate relay cells. Do not create
 blue/green `serverId` values or color-specific qURL bootstrap server keys as an

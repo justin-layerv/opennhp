@@ -295,7 +295,8 @@ DURABLE_RELAY_RESOURCES = {
 # The initial relay-DMZ cutover is complete. These address families comprise the
 # steady-state boundary, the singleton
 # fleet that inhabits it, the main-VPC route-table cutover, the server return
-# hole, the sandbox-only CI IAM grants, and the two durable handoff resources.
+# hole, the sandbox-only CI IAM grants, the GuardDuty Runtime Monitoring control
+# plane that covers relay instances, and the two durable handoff resources.
 # A non-noop action in any family must fail ordinary deployment and require a
 # newly reviewed migration mechanism. This intentionally includes the shared
 # legacy context_lookups policy: even an unrelated edit to that policy must fail
@@ -340,6 +341,10 @@ DMZ_BOUNDARY_ADDRESS_PATTERNS = (
         r"aws_cloudwatch_metric_alarm\.relay_dmz_dns_blocked|"
         r"aws_route53_record\.relay_alias|"
         r"aws_ssm_parameter\.relay_asg_name)(?:\[|$)"
+    ),
+    re.compile(
+        r"(?:^|\.)module\.security(?:\[[^]]+\])?\."
+        r"aws_guardduty_detector_feature\.runtime_monitoring(?:\[|$)"
     ),
 )
 

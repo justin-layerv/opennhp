@@ -226,6 +226,25 @@ resource "aws_guardduty_detector_feature" "runtime_monitoring" {
   name        = "RUNTIME_MONITORING"
   status      = "ENABLED"
 
+  # GuardDuty returns all three agent-management configurations even when only
+  # EC2 management is enabled. Declare the disabled defaults too; otherwise the
+  # AWS provider plans their removal on every apply and needlessly rewrites the
+  # unified Runtime Monitoring feature. The resulting EC2 coverage gap makes
+  # the fail-closed relay functional-boundary check reject a replacement.
+  # Keep this provider/API order: the additional_configuration block is ordered
+  # and a different order causes perpetual drift in affected provider versions.
+  # Track provider ordering semantics:
+  # https://github.com/hashicorp/terraform-provider-aws/issues/36400
+  additional_configuration {
+    name   = "EKS_ADDON_MANAGEMENT"
+    status = "DISABLED"
+  }
+
+  additional_configuration {
+    name   = "ECS_FARGATE_AGENT_MANAGEMENT"
+    status = "DISABLED"
+  }
+
   additional_configuration {
     name   = "EC2_AGENT_MANAGEMENT"
     status = "ENABLED"
