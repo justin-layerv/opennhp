@@ -275,9 +275,9 @@ describe("startRenewal (re-knock scheduler)", () => {
 
   it("stops and signals reResolve on a 52024 deny", async () => {
     const h = makeEnv();
-    const reKnock = vi.fn(
-      async (): Promise<KnockResult> => ({ kind: "reResolve" }),
-    );
+    const reKnock = vi.fn(async (): Promise<KnockResult> => ({
+      kind: "reResolve",
+    }));
     const onExpired = vi.fn();
     startRenewal(grant(100), reKnock, { onExpired }, { env: h.env });
 
@@ -453,9 +453,9 @@ describe("startRenewal (re-knock scheduler)", () => {
   it("contains a throwing onExpired on the running-loop path (reResolve)", async () => {
     const h = makeEnv();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const reKnock = vi.fn(
-      async (): Promise<KnockResult> => ({ kind: "reResolve" }),
-    );
+    const reKnock = vi.fn(async (): Promise<KnockResult> => ({
+      kind: "reResolve",
+    }));
     const onExpired = vi.fn(() => {
       throw new Error("page onExpired blew up");
     });

@@ -263,7 +263,7 @@ function scanStrictObject(
     const open = s[i];
     const close = open === "{" ? "}" : "]";
     let depth = 0;
-    for (; i < n; ) {
+    for (; i < n;) {
       const c = s[i];
       if (c === '"') {
         scanString();

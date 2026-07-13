@@ -54,10 +54,7 @@ const SIGNATURE_REJECT_CLASS_NAMES = Object.keys(SIGNATURE_REJECT_CLASSES)
 
 type SignatureRejectClass = keyof typeof SIGNATURE_REJECT_CLASSES;
 type SignaturePayloadField =
-  | "claims_b64"
-  | "sig_b64"
-  | "sig_encoding"
-  | "signing_input_b64";
+  "claims_b64" | "sig_b64" | "sig_encoding" | "signing_input_b64";
 const SIGNATURE_VECTOR_FIELDS = new Set([
   "name",
   "expect",

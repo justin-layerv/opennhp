@@ -48,10 +48,7 @@ export interface KnockCookieChallenge {
 /** The outcome of a knock, for the caller (the qurl.link page, PR-6) to branch
  * on as data. Faults (transport, crypto, correlation) throw instead. */
 export type KnockResult =
-  | KnockSuccess
-  | KnockReResolve
-  | KnockServerError
-  | KnockCookieChallenge;
+  KnockSuccess | KnockReResolve | KnockServerError | KnockCookieChallenge;
 
 /** A single knock's inputs. `serverStaticPub` and `relayBaseUrl` are static
  * qurl.link deployment config. The initial qURL bootstrap passes
