@@ -82,6 +82,58 @@ Status legend: **FIXED** = changed in the PR that introduced this doc; **SAFE**
 | passcode `knock succeeded.%+v res.Resources` ×2 | — | dumps the resource-target sub-field; config secrets (`AppSecret`/`SecretKey`/`ExInfo`) are siblings on `ResourceData`, not in `.Resources` | SAFE (see out-of-scope note) |
 | [`endpoints/agent/knock.go`](../endpoints/agent/knock.go) | `AgentAccessMsg.ACToken` | assigns `info.ACToken` to the outbound struct; all logs use `accMsg.UserId` only — **token never logged** | SAFE |
 
+## Config-secret log sites
+
+The focused follow-up in
+[#3158](https://github.com/layervai/nhp/issues/3158) reviewed the server's
+config load, parse, apply, and watch paths for full TOML bodies, whole config
+structs, and secret-bearing maps. Adjacent secret-bearing local-file paths log
+only filenames, fixed counts/outcomes, or non-decoder errors; they do not dump
+the loaded TOML or parsed configuration. The remote-config leak and adjacent
+decoder boundaries were:
+
+| Site | Secret reachable | How touched | Status |
+|---|---|---|---|
+| [`endpoints/server/config.go`](../endpoints/server/config.go) `updateEtcdConfig` plus its startup/watch callers | `ResourceData.AppSecret`, `AccessKey`, `SecretKey`, and `ExInfo` values such as `JWTSecret` | `%q` of the complete etcd TOML at Info before parsing; malformed updates also propagated decoder errors into caller logs | **FIXED** → byte length plus fixed parse/update outcome metadata; parse failures cross the caller boundary as generic `errLoadConfig`; credential-free operational apply errors retain their diagnostic detail; the terminal marker is deliberately neutral because apply failures remain non-fatal; `TestEtcdAndLocalConfigLogsRedactSecrets` fences successful and malformed secret-bearing TOML |
+| [`endpoints/server/config.go`](../endpoints/server/config.go) `loadResources` initial load/reload parse failures | the same `ResourceData` credentials in local `resource.toml` | `%v` of the TOML decoder error; the pinned decoder currently emits structural diagnostics, but relying on dependency error formatting is brittle | **FIXED** → filename plus fixed failure metadata only; the malformed local-config canary in `TestEtcdAndLocalConfigLogsRedactSecrets` fences the initial-load boundary |
+| [`endpoints/server/config.go`](../endpoints/server/config.go) `initRemoteConn` | etcd `Password` in local `remote.toml` | `%v` of the TOML decoder error locally, then the same error returned to a startup `%v` warning | **FIXED** → filename-only local metadata and generic `errLoadConfig` across the caller boundary; canary-tested |
+| [`endpoints/server/config.go`](../endpoints/server/config.go) `loadBaseConfig` | server `PrivateKeyBase64` and `CookieSigningKeyBase64` in local `config.toml` | TOML decoder error returned through the startup error boundary | **FIXED** → filename plus generic `errLoadConfig`; canary-tested |
+| [`endpoints/server/config.go`](../endpoints/server/config.go) `loadStorageConfig` | etcd `Password` in local `storage.toml` | TOML decoder error returned through the startup error boundary | **FIXED** → filename plus generic `errLoadConfig`; canary-tested |
+
+Decoder details are deliberately not retained even at Debug level for these
+secret-bearing files. Production and support environments may run at Debug, so
+log level is not a redaction boundary. Operators retain the failing filename
+and outcome plus an explicit `validate TOML in a controlled environment; syntax
+detail withheld to avoid logging secrets` hint. Detailed syntax diagnosis for a
+local file should happen where its credential contents are already authorized
+for inspection; a malformed remote etcd payload should likewise be retrieved
+and validated only through authorized tooling rather than copied into logs.
+
+The fixed hint is emitted at the existing operator-visible error boundary:
+`updateEtcdConfig`, `loadResources`, and `initRemoteConn` log it in place, while
+`loadBaseConfig` and `loadStorageConfig` return it with the generic sentinel for
+their callers to log. This preserves one diagnostic per failure without
+returning decoder detail. Etcd payload byte length is deliberately retained as
+non-secret delivery metadata for diagnosing empty or truncated updates; no
+payload content or content-derived identifier is recorded.
+
+The canary test directly executes each initial-load parser. The base/resource
+file-watch reload branches use the same filename-only shapes and are verified
+by inspection rather than a timing-dependent filesystem watcher test; their
+scope is recorded explicitly here so that distinction is not mistaken for
+direct runtime coverage. Deterministic callback-injection coverage without
+filesystem timing is tracked in
+[#3238](https://github.com/layervai/nhp/issues/3238).
+
+Decoder diagnostics remain on credential-free files such as `srcip.toml`
+(network-address mappings), peer files (public keys and addresses), and TEE
+attestation allowlists. Those paths cannot expose a credential value through a
+source excerpt and remain outside this credential-boundary fix.
+Equivalent secret-bearing decoder boundaries in the agent, AC, and DB
+components are tracked explicitly in
+[#3237](https://github.com/layervai/nhp/issues/3237) under the broader
+[#2517](https://github.com/layervai/nhp/issues/2517) hygiene effort.
+
 ## Persistence sites
 
 | Site | Token | How persisted | Notes |
@@ -119,12 +171,12 @@ These surfaced during the sweep but are **not** access tokens and are not
 changed here, to keep the audit scoped to #1426:
 
 - **Config secrets on `ResourceData`** (`AppSecret`, `SecretKey`, `ExInfo`
-  incl. `JWTSecret`). No site currently dumps a whole `ResourceData`, so there
-  is no active leak — but a future `%+v` of one would expose signing keys, and
-  the existing `knock succeeded.%+v res.Resources` dumps (passcode
-  `knockAndIssueTokens` / `exchangeAndKnock`) are SAFE only because secrets are
-  `ResourceData` siblings, not inside `.Resources`. Belongs to a
-  config-secret-hygiene pass, not the token audit — tracked in
+  incl. `JWTSecret`). The active complete-etcd-body leak is fixed and inventoried
+  above by [#3158](https://github.com/layervai/nhp/issues/3158). No site dumps a
+  whole parsed `ResourceData`; the existing `knock succeeded.%+v res.Resources`
+  dumps (passcode `knockAndIssueTokens` / `exchangeAndKnock`) remain SAFE only
+  because secrets are `ResourceData` siblings, not inside `.Resources`. The
+  remaining plugin-config and brittle struct-log cleanup stays tracked in
   [#2517](https://github.com/layervai/nhp/issues/2517).
 - **OIDC plugin** — `log.Info("User profile: %+v", profile)` logs ID-token
   *claims* (PII), not the bearer token (`oauth_token` is stored to session

@@ -22,6 +22,8 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 )
 
+const redactedConfigParseHint = "validate TOML in a controlled environment; syntax detail withheld to avoid logging secrets"
+
 var (
 	baseConfigWatch  io.Closer
 	httpConfigWatch  io.Closer
@@ -258,8 +260,9 @@ func (s *UdpServer) loadBaseConfig() error {
 	}
 
 	var config Config
-	if err := toml.Unmarshal(content, &config); err != nil {
-		return fmt.Errorf("failed to parse base config %s: %w", fileName, err)
+	// Decoder errors may embed secret-bearing source excerpts; discard them.
+	if toml.Unmarshal(content, &config) != nil {
+		return fmt.Errorf("%w: failed to parse base config %s. %s", errLoadConfig, fileName, redactedConfigParseHint)
 	}
 
 	// Validate required fields
@@ -274,12 +277,14 @@ func (s *UdpServer) loadBaseConfig() error {
 	baseConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("[Server] base config %s has been updated, reloading", fileName)
 		if content, err = s.loadConfigFile(fileName); err == nil {
+			// Decoder errors may embed secret-bearing source excerpts; discard them.
 			if err = toml.Unmarshal(content, &config); err == nil {
 				if updateErr := s.updateBaseConfig(config); updateErr != nil {
 					log.Error("[Server] failed to apply base config update from %s: %v", fileName, updateErr)
 				}
+			} else {
+				log.Error("[Server] failed to parse base config %s on reload. %s", fileName, redactedConfigParseHint)
 			}
-
 		}
 	})
 	return nil
@@ -488,9 +493,9 @@ func (s *UdpServer) loadResources() error {
 		return nil // optional config, watcher will pick up changes
 	}
 	aspMap := make(common.AuthSvcProviderMap)
-	// update
-	if err := toml.Unmarshal(content, &aspMap); err != nil {
-		log.Error("[Server] failed to parse resource config %s: %v", fileName, err)
+	// Decoder errors may embed secret-bearing source excerpts; discard them.
+	if toml.Unmarshal(content, &aspMap) != nil {
+		log.Error("[Server] failed to parse resource config %s. %s", fileName, redactedConfigParseHint)
 		return nil
 	}
 	if err := s.updateResources(aspMap); err != nil {
@@ -501,12 +506,13 @@ func (s *UdpServer) loadResources() error {
 		log.Info("[Server] resource config %s has been updated, reloading", fileName)
 		if content, err := s.loadConfigFile(fileName); err == nil {
 			freshAspMap := make(common.AuthSvcProviderMap)
+			// Decoder errors may embed secret-bearing source excerpts; discard them.
 			if err := toml.Unmarshal(content, &freshAspMap); err == nil {
 				if updateErr := s.updateResources(freshAspMap); updateErr != nil {
 					log.Error("[Server] failed to apply resource config update from %s: %v", fileName, updateErr)
 				}
 			} else {
-				log.Error("[Server] failed to parse resource config %s on reload: %v", fileName, err)
+				log.Error("[Server] failed to parse resource config %s on reload. %s", fileName, redactedConfigParseHint)
 			}
 		}
 	})
@@ -562,9 +568,10 @@ func (s *UdpServer) initRemoteConn() error {
 	}
 
 	var conf RemoteConfig
-	if err = toml.Unmarshal(content, &conf); err != nil {
-		log.Error("[Server] failed to parse remote config %s: %v", fileName, err)
-		return err
+	// Decoder errors may embed secret-bearing source excerpts; discard them.
+	if toml.Unmarshal(content, &conf) != nil {
+		log.Error("[Server] failed to parse remote config %s. %s", fileName, redactedConfigParseHint)
+		return errLoadConfig
 	}
 
 	if strings.EqualFold(conf.Provider, "etcd") {
@@ -616,9 +623,8 @@ func (s *UdpServer) loadRemoteConfig() error {
 	go s.etcdConn.WatchValue(func(val []byte) {
 		s.remoteConfigUpdateMutex.Lock()
 		defer s.remoteConfigUpdateMutex.Unlock()
-		if updateErr := s.updateEtcdConfig(val, true); updateErr != nil {
-			log.Error("[Server] failed to apply etcd config update (%d bytes): %v", len(val), updateErr)
-		}
+		// Every failure path emits one redaction-safe diagnostic at its source.
+		_ = s.updateEtcdConfig(val, true)
 	})
 
 	return nil
@@ -629,13 +635,16 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 		err = errLoadConfig
 	})
 
-	log.Info("Parsing etcd config (%d bytes): %q", len(content), string(content))
+	// Remote config can contain application credentials in ResourceData and
+	// ExInfo. Never log the body or a decoder error derived from it; retain only
+	// fixed parse metadata for operators. TestEtcdAndLocalConfigLogsRedactSecrets
+	// pins both the successful and malformed-TOML paths.
+	log.Info("[Server] parsing etcd config (%d bytes)", len(content))
 	var serverEtcdConfig ServerEtcdConfig
-	if err = toml.Unmarshal(content, &serverEtcdConfig); err != nil {
-		log.Error("[Server] failed to parse etcd config (%d bytes): %v", len(content), err)
-		return err
+	if toml.Unmarshal(content, &serverEtcdConfig) != nil {
+		log.Error("[Server] failed to parse etcd config (%d bytes). %s", len(content), redactedConfigParseHint)
+		return errLoadConfig
 	}
-	log.Info("Unmarshaled serverEtcdConfig.AuthServiceId has %d entries", len(serverEtcdConfig.AuthServiceId))
 
 	// SECURITY: Never update base config from etcd.
 	// Private keys, LogLevel, and base config MUST come from local config.toml.
@@ -643,6 +652,9 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	// defaults them to Go's zero values (LogLevel=0, etc.) which would override local settings.
 	// The local config.toml contains the per-instance private key and operational settings.
 	_ = baseLoad // Explicitly ignore - base config always from local
+
+	// The apply helpers below return operational errors, not raw TOML or decoder
+	// diagnostics. Preserve those errors for operator troubleshooting.
 
 	// Only update HttpConfig from etcd if it's explicitly set
 	// (non-zero port or EnableHttp=true). Otherwise keep local http.toml config.
@@ -691,9 +703,6 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 			aspMap[aspId] = aspData
 		}
 		log.Info("Parsed %d AuthServiceId entries from etcd config", len(aspMap))
-		for aspId, aspData := range aspMap {
-			log.Debug("  AuthServiceId[%s]: PluginPath=%q", aspId, aspData.PluginPath)
-		}
 		if updateErr := s.updateResources(aspMap); updateErr != nil {
 			log.Error("[Server] failed to apply resources from etcd: %v", updateErr)
 		}
@@ -716,6 +725,10 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 		log.Error("[Server] failed to apply source IPs from etcd: %v", updateErr)
 	}
 
+	// Individual apply failures are logged at their source and remain non-fatal
+	// by contract, so use a neutral terminal marker rather than implying every
+	// sub-apply succeeded.
+	log.Info("[Server] finished processing etcd config (%d bytes)", len(content))
 	return nil
 }
 
@@ -1332,8 +1345,9 @@ func (s *UdpServer) loadStorageConfig() (*StorageConfig, error) {
 	}
 
 	var cfg StorageConfig
-	if err := toml.Unmarshal(content, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse storage config %s: %w", fileName, err)
+	// Decoder errors may embed secret-bearing source excerpts; discard them.
+	if toml.Unmarshal(content, &cfg) != nil {
+		return nil, fmt.Errorf("%w: failed to parse storage config %s. %s", errLoadConfig, fileName, redactedConfigParseHint)
 	}
 
 	// Apply defaults for unset values
