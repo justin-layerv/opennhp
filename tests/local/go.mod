@@ -3,7 +3,7 @@ module github.com/layerv/nhp/tests/local
 go 1.26.5
 
 require (
-	github.com/pelletier/go-toml/v2 v2.4.2
+	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/testcontainers/testcontainers-go v0.43.0
 	go.etcd.io/etcd/client/v3 v3.6.12
 )
