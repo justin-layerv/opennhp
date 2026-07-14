@@ -110,6 +110,53 @@ QURL_SERVICE_ALARM_ACTION_EXPR = "local.qurl_service_alarm_actions"
 QURL_RESOURCE_KEY_FAILURE_FILTER_PATTERN = (
     r'"{ $.msg = \"resource-key provisioning failed\" }"'
 )
+QURL_CI_LOCK_FAILURE_ALARM_NAME = "qurl_ci_sandbox_live_env_lock_failure"
+QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY = (
+    "SELECT SUM(SandboxLiveEnvLockFailure) "
+    'FROM SCHEMA("LayerV/QURLServiceCI", Reason, Action)'
+)
+QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY_PATTERN = (
+    r'SELECT\s+SUM\(SandboxLiveEnvLockFailure\)\s+'
+    r'FROM\s+SCHEMA\("LayerV/QURLServiceCI",\s*Reason,\s*Action\)'
+)
+QURL_CI_LOCK_FAILURE_RUNBOOK_DIAGNOSTIC_QUERY_PATTERN = (
+    r'```sql\r?\nSELECT SUM\(SandboxLiveEnvLockFailure\)\r?\n'
+    r'FROM SCHEMA\("LayerV/QURLServiceCI", Reason, Action\)\r?\n```'
+)
+QURL_CI_LOCK_FAILURE_BREAKDOWN_QUERY = (
+    "SELECT SUM(SandboxLiveEnvLockFailure) "
+    'FROM SCHEMA("LayerV/QURLServiceCI", Reason, Action) '
+    "GROUP BY Reason, Action ORDER BY SUM() DESC"
+)
+QURL_CI_LOCK_FAILURE_BREAKDOWN_QUERY_PATTERN = (
+    r'```sql\r?\nSELECT SUM\(SandboxLiveEnvLockFailure\)\r?\n'
+    r'FROM SCHEMA\("LayerV/QURLServiceCI", Reason, Action\)\r?\n'
+    r'GROUP BY Reason, Action\r?\nORDER BY SUM\(\) DESC\r?\n```'
+)
+QURL_CI_LOCK_FAILURE_RUNBOOK = "docs/runbooks/qurl-sandbox-live-env-lock-alarm.md"
+QURL_CI_LOCK_FAILURE_RUNBOOK_URL = (
+    "https://github.com/layervai/nhp/blob/main/"
+    f"{QURL_CI_LOCK_FAILURE_RUNBOOK}"
+)
+QURL_CI_LOCK_FAILURE_CANARY_DIMENSIONS = "Reason=AlarmCanary,Action=acquire"
+QURL_CI_LOCK_FAILURE_CONTENTION_CONTRACT = (
+    "7,200-second wait budget is exhausted and the waiting job fails"
+)
+QURL_CI_LOCK_FAILURE_CANARY_PATTERN = (
+    r"aws cloudwatch put-metric-data \\\r?\n"
+    r"\s*--region us-east-2 \\\r?\n"
+    r"\s*--namespace 'LayerV/QURLServiceCI' \\\r?\n"
+    r"\s*--metric-name 'SandboxLiveEnvLockFailure' \\\r?\n"
+    r"\s*--value 1 \\\r?\n"
+    r"\s*--unit Count\r?\n\r?\n"
+    r"aws cloudwatch put-metric-data \\\r?\n"
+    r"\s*--region us-east-2 \\\r?\n"
+    r"\s*--namespace 'LayerV/QURLServiceCI' \\\r?\n"
+    r"\s*--metric-name 'SandboxLiveEnvLockFailure' \\\r?\n"
+    r"\s*--dimensions 'Reason=AlarmCanary,Action=acquire' \\\r?\n"
+    r"\s*--value 1 \\\r?\n"
+    r"\s*--unit Count"
+)
 ASYNC_RUNTIME_PANIC_MESSAGE = "runtime panic encountered"
 ASYNC_RUNTIME_PANIC_FILTER_PATTERN = (
     r'"\"msgToPacketRoutine\" \"runtime panic encountered\""'
@@ -328,6 +375,21 @@ def require_block_regex(block: HclBlock, pattern: str, reason: str) -> None:
         raise LintError(
             f"{_block_location(block)} missing pattern `{pattern}` ({reason})"
         )
+
+
+def require_file_tokens(
+    path: Path, text: str, tokens: tuple[str, ...], reason: str
+) -> None:
+    for token in tokens:
+        if token not in text:
+            raise LintError(f"{path}: missing `{token}` ({reason})")
+
+
+def require_file_regex(
+    path: Path, text: str, pattern: str, expected: str, reason: str
+) -> None:
+    if re.search(pattern, text) is None:
+        raise LintError(f"{path}: missing `{expected}` ({reason})")
 
 
 def has_metric_name(text: str, metric_name: str) -> bool:
@@ -677,6 +739,9 @@ def check_shared_resources(repo: Path) -> None:
     qurl_service_monitoring = (
         repo / "terraform" / "modules" / "qurl-service" / "monitoring.tf"
     )
+    qurl_service_ci = repo / "terraform" / "qurl_service_ci.tf"
+    qurl_service_ci_runbook = repo / QURL_CI_LOCK_FAILURE_RUNBOOK
+    observability_docs = repo / "docs" / "OBSERVABILITY.md"
     server_udp = repo / "endpoints" / "server" / "udpserver.go"
     relay_go = repo / "endpoints" / "relay" / "relay.go"
     core_errors = repo / "nhp" / "core" / "errors.go"
@@ -920,6 +985,144 @@ def check_shared_resources(repo: Path) -> None:
         qurl_resource_key_failure_alarm,
         "treat_missing_data",
         '"notBreaching"',
+    )
+
+    # #3247: publishers emit a dimensionless alarm sample followed by a
+    # Reason/Action diagnostic sample for every failure. Pin the standard alarm
+    # to the exact dimensionless stream so a new diagnostic dimension pair does
+    # not depend on Metrics Insights discovery before the first event can page.
+    qurl_ci_lock_failure_alarm = find_block(
+        qurl_service_ci,
+        'resource "aws_cloudwatch_metric_alarm"',
+        QURL_CI_LOCK_FAILURE_ALARM_NAME,
+    )
+    require_assignment(
+        qurl_ci_lock_failure_alarm,
+        "count",
+        'var.environment == "sandbox" ? 1 : 0',
+    )
+    require_assignment(
+        qurl_ci_lock_failure_alarm,
+        "alarm_name",
+        '"${local.name_prefix}-qurl-service-ci-live-env-lock-failure"',
+    )
+    require_assignment(qurl_ci_lock_failure_alarm, "actions_enabled", "true")
+    require_assignment(
+        qurl_ci_lock_failure_alarm,
+        "comparison_operator",
+        '"GreaterThanThreshold"',
+    )
+    require_assignment(qurl_ci_lock_failure_alarm, "evaluation_periods", "1")
+    require_assignment(qurl_ci_lock_failure_alarm, "datapoints_to_alarm", "1")
+    require_assignment(qurl_ci_lock_failure_alarm, "threshold", "0")
+    require_assignment(
+        qurl_ci_lock_failure_alarm,
+        "treat_missing_data",
+        '"notBreaching"',
+    )
+    require_assignment(
+        qurl_ci_lock_failure_alarm,
+        "alarm_actions",
+        "[module.monitoring.sns_topic_arn]",
+    )
+    require_assignment(
+        qurl_ci_lock_failure_alarm,
+        "ok_actions",
+        "[module.monitoring.sns_topic_arn]",
+    )
+    require_assignment(
+        qurl_ci_lock_failure_alarm,
+        "insufficient_data_actions",
+        "[]",
+    )
+    require_assignment(
+        qurl_ci_lock_failure_alarm,
+        "metric_name",
+        '"SandboxLiveEnvLockFailure"',
+    )
+    require_assignment(
+        qurl_ci_lock_failure_alarm,
+        "namespace",
+        '"LayerV/QURLServiceCI"',
+    )
+    require_assignment(qurl_ci_lock_failure_alarm, "Component", '"qurl-service"')
+    require_assignment(qurl_ci_lock_failure_alarm, "period", "60")
+    require_assignment(qurl_ci_lock_failure_alarm, "statistic", '"Sum"')
+    for key in ("dimensions", "unit"):
+        require_absent_assignment(
+            qurl_ci_lock_failure_alarm,
+            key,
+            "the qURL CI lock alarm must select the exact dimensionless producer stream",
+        )
+    if "metric_query {" in qurl_ci_lock_failure_alarm.body:
+        raise LintError(
+            f"{_block_location(qurl_ci_lock_failure_alarm)} must use the standard "
+            "dimensionless metric fields, not a `metric_query` block"
+        )
+    require_block_text(
+        qurl_ci_lock_failure_alarm,
+        QURL_CI_LOCK_FAILURE_RUNBOOK_URL,
+        "the actionable alarm description must point responders to its runbook",
+    )
+
+    qurl_ci_runbook_text = _read(qurl_service_ci_runbook)
+    require_file_tokens(
+        qurl_service_ci_runbook,
+        qurl_ci_runbook_text,
+        (
+            "layerv-nhp-sandbox-qurl-service-ci-live-env-lock-failure",
+            "layerv-nhp-sandbox-cell0-alerts",
+            "sandbox-alerts-sandbox",
+            "/layerv-nhp-sandbox/qurl-live-env-lock",
+            QURL_CI_LOCK_FAILURE_CANARY_DIMENSIONS,
+            "An ordinary lock collision emits no failure metric.",
+            "`Reason=Contention`",
+            QURL_CI_LOCK_FAILURE_CONTENTION_CONTRACT,
+            "#3244",
+            "#3246",
+            "#3247",
+        ),
+        "qURL CI lock alarm owner/query/runbook contract drift",
+    )
+    require_file_regex(
+        qurl_service_ci_runbook,
+        qurl_ci_runbook_text,
+        QURL_CI_LOCK_FAILURE_RUNBOOK_DIAGNOSTIC_QUERY_PATTERN,
+        QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY,
+        "qURL CI lock alarm owner/query/runbook contract drift",
+    )
+    require_file_regex(
+        qurl_service_ci_runbook,
+        qurl_ci_runbook_text,
+        QURL_CI_LOCK_FAILURE_BREAKDOWN_QUERY_PATTERN,
+        QURL_CI_LOCK_FAILURE_BREAKDOWN_QUERY,
+        "qURL CI lock alarm diagnostic breakdown contract drift",
+    )
+    require_file_regex(
+        qurl_service_ci_runbook,
+        qurl_ci_runbook_text,
+        QURL_CI_LOCK_FAILURE_CANARY_PATTERN,
+        f"dimensionless canary followed by {QURL_CI_LOCK_FAILURE_CANARY_DIMENSIONS}",
+        "qURL CI lock alarm producer/canary contract drift",
+    )
+
+    observability_text = _read(observability_docs)
+    require_file_tokens(
+        observability_docs,
+        observability_text,
+        (
+            "LayerV/QURLServiceCI",
+            "SandboxLiveEnvLockFailure",
+            "runbooks/qurl-sandbox-live-env-lock-alarm.md",
+        ),
+        "qURL CI lock alarm observability documentation drift",
+    )
+    require_file_regex(
+        observability_docs,
+        observability_text,
+        QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY_PATTERN,
+        QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY,
+        "qURL CI lock alarm observability documentation drift",
     )
     # Go-side checks scope to the metric-dimension builders the Terraform
     # selectors depend on. They catch simple emitter renames without pulling a Go

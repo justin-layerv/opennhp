@@ -258,3 +258,25 @@ and blue/green deployment-count namespaces in `terraform/modules/ecr/main.tf`.
 | `ServerConnectionFailure` | `ServerConnectionFailure` | AC (>10 failures in 10 min, 2 consecutive periods) |
 | `ac-publisher-failures` | `PublisherFailures` | AC (>0 in 2 of last 3 five-min windows) |
 | `server-publisher-failures` | `PublisherFailures` | Server (>0 in 2 of last 3 five-min windows) |
+
+### `LayerV/QURLServiceCI` namespace
+
+| Alarm | Metric | Component |
+|-------|--------|-----------|
+| `layerv-nhp-sandbox-qurl-service-ci-live-env-lock-failure` | Dimensionless `SandboxLiveEnvLockFailure`; paired `Reason`/`Action` sample is diagnostic only | qurl-service and NHP sandbox CI |
+
+Each failure independently publishes a dimensionless alarm sample first and a
+`Reason`/`Action` diagnostic sample second. The standard alarm has no dimensions
+and therefore selects the exact dimensionless metric identity; it does not wait
+for Metrics Insights to discover a first-seen diagnostic pair.
+
+Use this Metrics Insights query for a diagnostic aggregate only:
+
+```sql
+SELECT SUM(SandboxLiveEnvLockFailure)
+FROM SCHEMA("LayerV/QURLServiceCI", Reason, Action)
+```
+
+It pages through the shared sandbox monitoring SNS topic. See the
+[qURL sandbox live-environment lock alarm runbook](runbooks/qurl-sandbox-live-env-lock-alarm.md)
+for the breakdown query, notification owner, and reconciliation procedure.

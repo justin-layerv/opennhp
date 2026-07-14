@@ -32,6 +32,37 @@ RELAY_ALARM_ACTION_EXPR = CHECKER.RELAY_ALARM_ACTION_EXPR
 RELAY_CORE_ALARMS = CHECKER.RELAY_CORE_ALARM_NAMES
 RELAY_SINGLE_EVENT_ALARMS = CHECKER.RELAY_SINGLE_EVENT_ALARM_NAMES
 QURL_SERVICE_ALARM_ACTION_EXPR = CHECKER.QURL_SERVICE_ALARM_ACTION_EXPR
+QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY = (
+    CHECKER.QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY
+)
+QURL_CI_LOCK_FAILURE_BREAKDOWN_QUERY = CHECKER.QURL_CI_LOCK_FAILURE_BREAKDOWN_QUERY
+
+QURL_CI_LOCK_FAILURE_ALARM_BLOCK = r'''
+resource "aws_cloudwatch_metric_alarm" "qurl_ci_sandbox_live_env_lock_failure" {
+  count = var.environment == "sandbox" ? 1 : 0
+
+  alarm_name          = "${local.name_prefix}-qurl-service-ci-live-env-lock-failure"
+  alarm_description   = "Runbook: https://github.com/layervai/nhp/blob/main/docs/runbooks/qurl-sandbox-live-env-lock-alarm.md"
+  actions_enabled     = true
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  metric_name         = "SandboxLiveEnvLockFailure"
+  namespace           = "LayerV/QURLServiceCI"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions             = [module.monitoring.sns_topic_arn]
+  ok_actions                = [module.monitoring.sns_topic_arn]
+  insufficient_data_actions = []
+
+  tags = {
+    Component = "qurl-service"
+  }
+}
+'''.strip()
 
 
 def write(path: Path, body: str) -> None:
@@ -387,6 +418,66 @@ def build_fixture(root: Path) -> None:
         """,
     )
     write(
+        root / "terraform" / "qurl_service_ci.tf",
+        QURL_CI_LOCK_FAILURE_ALARM_BLOCK,
+    )
+    write(
+        root / "docs" / "runbooks" / "qurl-sandbox-live-env-lock-alarm.md",
+        f"""
+        # qURL sandbox live-environment lock alarm
+
+        Alarm: `layerv-nhp-sandbox-qurl-service-ci-live-env-lock-failure`
+
+        ```sql
+        SELECT SUM(SandboxLiveEnvLockFailure)
+        FROM SCHEMA("LayerV/QURLServiceCI", Reason, Action)
+        ```
+
+        ```sql
+        SELECT SUM(SandboxLiveEnvLockFailure)
+        FROM SCHEMA("LayerV/QURLServiceCI", Reason, Action)
+        GROUP BY Reason, Action
+        ORDER BY SUM() DESC
+        ```
+
+        Topic: `layerv-nhp-sandbox-cell0-alerts`
+        Subscription: `sandbox-alerts-sandbox`
+        Lock: `/layerv-nhp-sandbox/qurl-live-env-lock`
+        Canary: `Reason=AlarmCanary,Action=acquire`
+        An ordinary lock collision emits no failure metric.
+        `Reason=Contention` is emitted only after the 7,200-second wait budget is exhausted and the waiting job fails.
+
+        ```bash
+        aws cloudwatch put-metric-data \\
+          --region us-east-2 \\
+          --namespace 'LayerV/QURLServiceCI' \\
+          --metric-name 'SandboxLiveEnvLockFailure' \\
+          --value 1 \\
+          --unit Count
+
+        aws cloudwatch put-metric-data \\
+          --region us-east-2 \\
+          --namespace 'LayerV/QURLServiceCI' \\
+          --metric-name 'SandboxLiveEnvLockFailure' \\
+          --dimensions 'Reason=AlarmCanary,Action=acquire' \\
+          --value 1 \\
+          --unit Count
+        ```
+
+        Tracking: #3244, #3246, #3247
+        """,
+    )
+    write(
+        root / "docs" / "OBSERVABILITY.md",
+        f"""
+        # Observability
+
+        `LayerV/QURLServiceCI` publishes `SandboxLiveEnvLockFailure`.
+        The diagnostic query is `{QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY}`.
+        See [the runbook](runbooks/qurl-sandbox-live-env-lock-alarm.md).
+        """,
+    )
+    write(
         root / "terraform" / "modules" / "relay" / "compute.tf",
         """
         resource "aws_autoscaling_group" "relay" {
@@ -523,6 +614,20 @@ def mutate_relay_alarm(root: Path, name: str, old: str, new: str) -> None:
     path.write_text(source.replace(block.body, mutated, 1), encoding="utf-8")
 
 
+def mutate_qurl_ci_lock_alarm(root: Path, old: str, new: str) -> None:
+    path = root / "terraform" / "qurl_service_ci.tf"
+    source = path.read_text(encoding="utf-8")
+    block = CHECKER.find_block(
+        path,
+        'resource "aws_cloudwatch_metric_alarm"',
+        "qurl_ci_sandbox_live_env_lock_failure",
+    )
+    if old not in block.body:
+        raise AssertionError(f"qURL CI fixture lacks mutation source {old!r}")
+    mutated = block.body.replace(old, new, 1)
+    path.write_text(source.replace(block.body, mutated, 1), encoding="utf-8")
+
+
 class ObservabilityParityTests(unittest.TestCase):
     def test_run_id_mismatch_alarm_is_one_minute_zero_tolerance(self) -> None:
         alarm = CHECKER.find_block(
@@ -556,6 +661,290 @@ class ObservabilityParityTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("observability parity surfaces are wired", result.stdout)
+
+    def test_qurl_ci_lock_alarm_contract_drift_fails(self) -> None:
+        mutations = (
+            ('count = var.environment == "sandbox" ? 1 : 0', "count = 1", "count"),
+            (
+                'alarm_name          = "${local.name_prefix}-qurl-service-ci-live-env-lock-failure"',
+                'alarm_name          = "${local.name_prefix}-qurl-service-ci-lock-failure"',
+                "alarm_name",
+            ),
+            (
+                'Component = "qurl-service"',
+                'Component = "qurl-service-ci"',
+                "Component",
+            ),
+            (
+                "actions_enabled     = true",
+                "actions_enabled     = false",
+                "actions_enabled",
+            ),
+            (
+                'comparison_operator = "GreaterThanThreshold"',
+                'comparison_operator = "GreaterThanOrEqualToThreshold"',
+                "comparison_operator",
+            ),
+            (
+                "evaluation_periods  = 1",
+                "evaluation_periods  = 2",
+                "evaluation_periods",
+            ),
+            (
+                "datapoints_to_alarm = 1",
+                "datapoints_to_alarm = 2",
+                "datapoints_to_alarm",
+            ),
+            ("threshold           = 0", "threshold           = 1", "threshold"),
+            (
+                'treat_missing_data  = "notBreaching"',
+                'treat_missing_data  = "missing"',
+                "treat_missing_data",
+            ),
+            (
+                'metric_name         = "SandboxLiveEnvLockFailure"',
+                'metric_name         = "SandboxLiveEnvLockFailureByReason"',
+                "metric_name",
+            ),
+            (
+                'namespace           = "LayerV/QURLServiceCI"',
+                'namespace           = "LayerV/QURLService"',
+                "namespace",
+            ),
+            (
+                "https://github.com/layervai/nhp/blob/main/docs/runbooks/qurl-sandbox-live-env-lock-alarm.md",
+                "https://github.com/layervai/nhp/blob/trunk/docs/runbooks/qurl-sandbox-live-env-lock-alarm.md",
+                "blob/main",
+            ),
+            (
+                "alarm_actions             = [module.monitoring.sns_topic_arn]",
+                "alarm_actions             = []",
+                "alarm_actions",
+            ),
+            (
+                "ok_actions                = [module.monitoring.sns_topic_arn]",
+                "ok_actions                = []",
+                "ok_actions",
+            ),
+            (
+                "insufficient_data_actions = []",
+                "insufficient_data_actions = [module.monitoring.sns_topic_arn]",
+                "insufficient_data_actions",
+            ),
+            ("period              = 60", "period              = 300", "period"),
+            ('statistic           = "Sum"', 'statistic           = "Average"', "statistic"),
+            (
+                "threshold           = 0",
+                'threshold           = 0\n  dimensions          = { Reason = "ReadFailed" }',
+                "dimensions",
+            ),
+            (
+                "threshold           = 0",
+                'threshold           = 0\n  unit                = "Count"',
+                "unit",
+            ),
+        )
+        for old, new, expected in mutations:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                build_fixture(root)
+                mutate_qurl_ci_lock_alarm(root, old, new)
+
+                result = run_check(root)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("qurl_ci_sandbox_live_env_lock_failure", result.stderr)
+                self.assertIn(expected, result.stderr)
+
+    def test_qurl_ci_lock_alarm_rejects_metric_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            mutate_qurl_ci_lock_alarm(
+                root,
+                "  alarm_actions             = [module.monitoring.sns_topic_arn]",
+                '  metric_query {\n    id = "other"\n  }\n\n'
+                "  alarm_actions             = [module.monitoring.sns_topic_arn]",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a `metric_query` block", result.stderr)
+
+    def test_qurl_ci_lock_alarm_missing_resource_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            (root / "terraform" / "qurl_service_ci.tf").unlink()
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qurl_service_ci.tf", result.stderr)
+
+    def test_qurl_ci_lock_alarm_runbook_owner_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            runbook = root / "docs" / "runbooks" / "qurl-sandbox-live-env-lock-alarm.md"
+            runbook.write_text(
+                runbook.read_text(encoding="utf-8").replace(
+                    "sandbox-alerts-sandbox",
+                    "unowned-subscription",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sandbox-alerts-sandbox", result.stderr)
+        self.assertIn("owner/query/runbook contract drift", result.stderr)
+
+    def test_qurl_ci_lock_alarm_runbook_canary_action_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            runbook = root / "docs" / "runbooks" / "qurl-sandbox-live-env-lock-alarm.md"
+            runbook.write_text(
+                runbook.read_text(encoding="utf-8").replace(
+                    "Reason=AlarmCanary,Action=acquire",
+                    "Reason=AlarmCanary,Action=observe",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Reason=AlarmCanary,Action=acquire", result.stderr)
+        self.assertIn("owner/query/runbook contract drift", result.stderr)
+
+    def test_qurl_ci_lock_alarm_runbook_contention_semantics_drift_fails(
+        self,
+    ) -> None:
+        mutations = (
+            (
+                "An ordinary lock collision emits no failure metric.",
+                "An ordinary lock collision emits a failure metric.",
+            ),
+            ("7,200-second wait budget", "initial collision"),
+        )
+        for required, replacement in mutations:
+            with self.subTest(required=required), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                build_fixture(root)
+                runbook = (
+                    root
+                    / "docs"
+                    / "runbooks"
+                    / "qurl-sandbox-live-env-lock-alarm.md"
+                )
+                runbook.write_text(
+                    runbook.read_text(encoding="utf-8").replace(
+                        required,
+                        replacement,
+                    ),
+                    encoding="utf-8",
+                )
+
+                result = run_check(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(required, result.stderr)
+            self.assertIn("owner/query/runbook contract drift", result.stderr)
+
+    def test_qurl_ci_lock_alarm_runbook_requires_dimensionless_canary_first(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            runbook = root / "docs" / "runbooks" / "qurl-sandbox-live-env-lock-alarm.md"
+            source = runbook.read_text(encoding="utf-8")
+            first_command = textwrap.dedent(
+                r"""
+                aws cloudwatch put-metric-data \
+                  --region us-east-2 \
+                  --namespace 'LayerV/QURLServiceCI' \
+                  --metric-name 'SandboxLiveEnvLockFailure' \
+                  --value 1 \
+                  --unit Count
+
+                """
+            ).lstrip()
+            self.assertIn(first_command, source)
+            runbook.write_text(source.replace(first_command, ""), encoding="utf-8")
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dimensionless canary followed by", result.stderr)
+        self.assertIn("producer/canary contract drift", result.stderr)
+
+    def test_qurl_ci_lock_alarm_runbook_query_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            runbook = root / "docs" / "runbooks" / "qurl-sandbox-live-env-lock-alarm.md"
+            source = runbook.read_text(encoding="utf-8")
+            runbook.write_text(
+                source.replace(
+                    'FROM SCHEMA("LayerV/QURLServiceCI", Reason, Action)\n```',
+                    'FROM SCHEMA("LayerV/QURLServiceCI", Reason, Action)\n'
+                    'GROUP BY Reason, Action\n```',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY, result.stderr)
+        self.assertIn("owner/query/runbook contract drift", result.stderr)
+
+    def test_qurl_ci_lock_alarm_runbook_breakdown_selector_drift_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            runbook = root / "docs" / "runbooks" / "qurl-sandbox-live-env-lock-alarm.md"
+            source = runbook.read_text(encoding="utf-8")
+            runbook.write_text(
+                source.replace(
+                    'FROM SCHEMA("LayerV/QURLServiceCI", Reason, Action)\n'
+                    "GROUP BY Reason, Action",
+                    'FROM "LayerV/QURLServiceCI"\nGROUP BY Reason, Action',
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(QURL_CI_LOCK_FAILURE_BREAKDOWN_QUERY, result.stderr)
+        self.assertIn("diagnostic breakdown contract drift", result.stderr)
+
+    def test_qurl_ci_lock_alarm_observability_query_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            docs = root / "docs" / "OBSERVABILITY.md"
+            docs.write_text(
+                docs.read_text(encoding="utf-8").replace(
+                    QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY,
+                    "SELECT SUM(SandboxLiveEnvLockFailure)",
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_check(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(QURL_CI_LOCK_FAILURE_DIAGNOSTIC_QUERY, result.stderr)
+        self.assertIn("observability documentation drift", result.stderr)
 
     def test_relay_unknown_environment_alarm_is_fenced(self) -> None:
         self.assertIn("relay_shedding_unknown_environment", RELAY_CORE_ALARMS)
