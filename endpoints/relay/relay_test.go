@@ -1309,13 +1309,21 @@ func TestRelay_HTTPSAgentTypeAdmission(t *testing.T) {
 
 func TestRelay_DeviceAllowlistEqualsHTTPSRequestsAndRelayReturns(t *testing.T) {
 	relayDevice := core.NewDevice(core.NHP_RELAY, keyBytes(0x91), nil)
+	if relayDevice == nil {
+		t.Fatal("create relay device")
+	}
+
 	for headerType := core.NHP_KPL; core.HeaderTypeToString(headerType) != "UNKNOWN"; headerType++ {
-		want := httpsAgentTypeAllowed(headerType) || relayReturnTypeAllowed(headerType)
+		requestAllowed := httpsAgentTypeAllowed(headerType)
+		returnAllowed := relayReturnTypeAllowed(headerType)
+		if requestAllowed && returnAllowed {
+			t.Errorf("relay inner type %s is admitted as both request and return", core.HeaderTypeToString(headerType))
+		}
+		want := requestAllowed || returnAllowed
 		if got := relayDevice.CheckRecvHeaderType(headerType); got != want {
-			headerName := core.HeaderTypeToString(headerType)
 			t.Errorf(
 				"NHP_RELAY device admission for %s = %v, want HTTPS-request-or-return admission %v",
-				headerName, got, want,
+				core.HeaderTypeToString(headerType), got, want,
 			)
 		}
 	}

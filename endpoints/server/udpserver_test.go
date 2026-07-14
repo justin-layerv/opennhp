@@ -23,6 +23,8 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
+const maxRelayEnvelopeBytes = 5844
+
 func TestPacketFromUDPDatagramRelayEnvelopeBoundary(t *testing.T) {
 	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableRelayPeerValidation: true})
 	relayDev := newSpikeDevice(t, core.NHP_RELAY, 0x55, nil)
@@ -51,8 +53,8 @@ func TestPacketFromUDPDatagramRelayEnvelopeBoundary(t *testing.T) {
 		t.Fatalf("encrypt maximum relay envelope: %v", err)
 	}
 	raw := append([]byte(nil), mad.BasePacket.Content...)
-	if len(raw) != 5844 {
-		t.Fatalf("maximum relay request = %d bytes, want 5844", len(raw))
+	if len(raw) != maxRelayEnvelopeBytes {
+		t.Fatalf("maximum relay request = %d bytes, want %d", len(raw), maxRelayEnvelopeBytes)
 	}
 
 	pkt, clearType, err := packetFromUDPDatagram(serverDev, raw)
@@ -88,6 +90,64 @@ func TestPacketFromUDPDatagramRelayEnvelopeBoundary(t *testing.T) {
 	copy(aboveTransport, raw)
 	if pkt, gotType, gateErr := packetFromUDPDatagram(serverDev, aboveTransport); gateErr == nil || pkt != nil || gotType != core.NHP_RLY {
 		t.Fatalf("6145-byte relay gate = pkt %#v, type %s, err %v; want observable transport rejection", pkt, core.HeaderTypeToString(gotType), gateErr)
+	}
+}
+
+func BenchmarkPacketFromUDPDatagram(b *testing.B) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		b.Fatal("create server device")
+	}
+
+	benchmarks := []struct {
+		name       string
+		headerType int
+		size       int
+		wantError  bool
+	}{
+		// These measure admission/copy only, not Noise decryption. Direct
+		// datagrams take the <=PacketBufferSize fast path; relay also includes
+		// oversized-envelope length validation. maxRelayEnvelopeBytes is pinned by
+		// TestPacketFromUDPDatagramRelayEnvelopeBoundary; core.RelayPacketBufferSize
+		// defines the containing relay pool's ceiling.
+		{name: "direct-512", headerType: core.NHP_KNK, size: 512},
+		{name: "direct-pool-ceiling", headerType: core.NHP_KNK, size: core.PacketBufferSize},
+		{name: fmt.Sprintf("relay-%d", maxRelayEnvelopeBytes), headerType: core.NHP_RLY, size: maxRelayEnvelopeBytes},
+		// Oversized-direct formats the rejected header name; over-limit exits
+		// before that formatting, so their allocation profiles intentionally differ.
+		{name: "reject-direct-oversized", headerType: core.NHP_KNK, size: core.PacketBufferSize + 1, wantError: true},
+		{name: "reject-relay-over-limit", headerType: core.NHP_RLY, size: core.RelayPacketBufferSize + 1, wantError: true},
+	}
+	for _, benchmark := range benchmarks {
+		b.Run(benchmark.name, func(b *testing.B) {
+			// Reused across iterations: packetFromUDPDatagram must only read raw
+			// and copy admitted bytes into packet-pool storage.
+			raw := make([]byte, benchmark.size)
+			header := (&core.Packet{Content: raw}).Header()
+			header.SetTypeAndPayloadSize(benchmark.headerType, benchmark.size-header.Size())
+			b.ReportAllocs()
+			if !benchmark.wantError {
+				b.SetBytes(int64(benchmark.size))
+			}
+			for b.Loop() {
+				pkt, gotType, err := packetFromUDPDatagram(device, raw)
+				// Rejections deliberately retain the parsed clear-header type; pin that
+				// observability contract alongside their error and nil-packet result.
+				if gotType != benchmark.headerType {
+					b.Fatalf("header type = %s, want %s", core.HeaderTypeToString(gotType), core.HeaderTypeToString(benchmark.headerType))
+				}
+				if benchmark.wantError {
+					if err == nil || pkt != nil {
+						b.Fatalf("reject %s datagram = packet %v, error %v", benchmark.name, pkt != nil, err)
+					}
+					continue
+				}
+				if err != nil {
+					b.Fatalf("admit %s datagram: %v", benchmark.name, err)
+				}
+				device.ReleasePoolPacket(pkt)
+			}
+		})
 	}
 }
 

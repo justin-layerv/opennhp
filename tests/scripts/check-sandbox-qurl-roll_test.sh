@@ -121,19 +121,31 @@ assert_step_order() {
   fi
 }
 
-assert_text_order() {
-  local block="$1" scope="$2" before="$3" after="$4" label="$5"
+pattern_precedes_pattern() {
+  local block="$1" before_re="$2" after_re="$3"
   local before_line after_line
-  before_line=$(grep -nF -- "$before" <<< "$block" | head -n1 | cut -d: -f1)
-  after_line=$(grep -nF -- "$after" <<< "$block" | head -n1 | cut -d: -f1)
-  if [[ -z "$before_line" || -z "$after_line" ]]; then
-    report_fail "$label" "missing text in $scope: before='$before' after='$after'"
-  elif [[ "$before_line" -lt "$after_line" ]]; then
+  # Every matching guard invocation must precede the first mutation. Using the
+  # last guard match prevents an earlier valid call from masking a later one.
+  before_line=$(grep -nE -- "$before_re" <<< "$block" | tail -n1 | cut -d: -f1)
+  after_line=$(grep -nE -- "$after_re" <<< "$block" | head -n1 | cut -d: -f1)
+  [[ -n "$before_line" && -n "$after_line" && "$before_line" -lt "$after_line" ]]
+}
+
+assert_pattern_order() {
+  local block="$1" scope="$2" before_re="$3" after_re="$4" label="$5"
+  if pattern_precedes_pattern "$block" "$before_re" "$after_re"; then
     report_pass "$label"
   else
-    report_fail "$label" "'$before' must appear before '$after' in $scope"
+    report_fail "$label" "ordered patterns missing or reversed in $scope: before='$before_re' after='$after_re'"
   fi
 }
+
+# These are shared by the matcher self-tests and the real workflow assertion so
+# the fixtures cannot silently exercise a more permissive pattern.
+BOUNDARY_PREFLIGHT_CALL_RE='^[[:space:]]+preflight_relay_dmz_boundary[[:space:]]*$'
+# SC2016: $att is literal workflow text in the matcher pattern.
+# shellcheck disable=SC2016
+STATE_MUTATION_RE='terraform state rm "\$att"'
 
 echo "check-sandbox-qurl-roll:"
 
@@ -142,6 +154,33 @@ if grep -Eq 'relay_dmz_''cutover|RELAY_DMZ_''CUTOVER' "$WF"; then
     "build-and-push.yml still contains a standing relay DMZ cutover bypass"
 else
   report_pass "one-time relay DMZ cutover authorization is removed"
+fi
+
+ORDER_MATCHER_REINDENTED_FIXTURE=$'  preflight_relay_dmz_boundary() {\n    :\n  }\n\tpreflight_relay_dmz_boundary\n  terraform state rm "$att"'
+if pattern_precedes_pattern "$ORDER_MATCHER_REINDENTED_FIXTURE" \
+  "$BOUNDARY_PREFLIGHT_CALL_RE" "$STATE_MUTATION_RE"; then
+  report_pass "order matcher tolerates invocation reindentation"
+else
+  report_fail "order matcher tolerates invocation reindentation" \
+    "reindented call was not found before the state mutation"
+fi
+
+ORDER_MATCHER_DEFINITION_ONLY_FIXTURE=$'  preflight_relay_dmz_boundary() {\n    :\n  }\n  terraform state rm "$att"'
+if pattern_precedes_pattern "$ORDER_MATCHER_DEFINITION_ONLY_FIXTURE" \
+  "$BOUNDARY_PREFLIGHT_CALL_RE" "$STATE_MUTATION_RE"; then
+  report_fail "order matcher rejects a function definition as an invocation" \
+    "definition-only fixture satisfied the invocation-before-mutation guard"
+else
+  report_pass "order matcher rejects a function definition as an invocation"
+fi
+
+ORDER_MATCHER_POST_MUTATION_CALL_FIXTURE=$'  preflight_relay_dmz_boundary\n  terraform state rm "$att"\n  preflight_relay_dmz_boundary'
+if pattern_precedes_pattern "$ORDER_MATCHER_POST_MUTATION_CALL_FIXTURE" \
+  "$BOUNDARY_PREFLIGHT_CALL_RE" "$STATE_MUTATION_RE"; then
+  report_fail "order matcher rejects an invocation after state mutation" \
+    "an earlier valid call masked a second call after the state mutation"
+else
+  report_pass "order matcher rejects an invocation after state mutation"
 fi
 
 SETUP=$(extract_job setup)
@@ -239,9 +278,8 @@ else
     "Verify relay DMZ plan contract before apply" \
     "final Terraform plan is checked after every recovery path"
   RECOVERY_STEP=$(extract_step "$INFRA" "Handle ASG Attachment Migrations and Taint Recovery")
-  assert_text_order "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
-    "            preflight_relay_dmz_boundary" \
-    'terraform state rm "$att"' \
+  assert_pattern_order "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
+    "$BOUNDARY_PREFLIGHT_CALL_RE" "$STATE_MUTATION_RE" \
     "relay DMZ boundary is checked before any Terraform state mutation"
   assert_in "$RECOVERY_STEP" "deploy-sandbox-infra recovery step" \
     "recovery preflight invokes the relay DMZ checker" \

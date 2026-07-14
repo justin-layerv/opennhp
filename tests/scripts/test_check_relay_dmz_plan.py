@@ -2242,7 +2242,10 @@ class RelayDmzPlanCheckerTests(unittest.TestCase):
             REPO_ROOT / "docs" / "runbooks" / "sandbox-relay-dmz-replacement.md"
         ).read_text()
         anchors = [
+            "before applying that exact artifact",
             "gh workflow run build-and-push.yml --ref main",
+            "-f force_build=false",
+            "There is no standing cutover override.",
             "## Gate 2: structural proof",
             "## Gate 3: relay fleet and HTTPS proof",
             "--mode functional",

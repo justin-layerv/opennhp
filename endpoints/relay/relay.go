@@ -341,9 +341,13 @@ func New(cfg *Config) (*RelayServer, error) {
 		}
 	}
 
-	// Server return envelopes are Noise-authenticated below against the configured
-	// server pubkeys. Disable the core address-pinned peer lookup because the
-	// internal NLB preserves a dynamic server-instance source address.
+	// The internal NLB presents dynamic server-instance source addresses, so the
+	// core address-pinned peer lookup cannot authorize this socket. Disabling it
+	// means PacketToMsg authenticates and decrypts a sender's claimed Noise static
+	// key before decodeRelayReturn enforces the configured-key fingerprint
+	// allowlist. The private UDP 62207 server-SG-only rule is therefore the
+	// pre-decryption admission boundary; the configured key remains the
+	// cryptographic authorization boundary. Keep both controls load-bearing.
 	device := core.NewDevice(core.NHP_RELAY, prk, &core.DeviceOptions{DisableServerPeerValidation: true})
 	if device == nil {
 		return nil, errors.New("relay: failed to create NHP device")

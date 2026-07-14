@@ -23,7 +23,13 @@ Production remains relay-dark until its separate production review and plan.
    healthy. Do not proceed if UDP 62207 or a second UDP listener is present.
 4. Confirm the relay identity secret/public-key registration and the exact main
    private-subnet CIDRs are unchanged.
-5. Create a dedicated evidence directory and retain every plan/check/smoke log.
+5. Record named security approval of the UDP 62207 return-side residual: an
+   SG-reachable sender can consume one synchronous, bounded Noise decrypt before
+   the configured server-key fingerprint allowlist rejects an unknown key. The
+   approver must confirm both the server-SG-only ingress rule and post-decryption
+   allowlist remain load-bearing.
+6. Create a dedicated evidence directory and retain every plan/check/smoke log,
+   including the approval from step 5.
 
 ```bash
 export REVIEWED_SHA=<commit>
@@ -117,6 +123,7 @@ idempotency proof and remain owned by their normal drift workflows. Archive:
 - relay HTTPS smoke;
 - assigned-cell external UDP 62206 smoke;
 - listener/SG/Flow proof that public UDP 62207 is absent;
+- named UDP 62207 return-side residual-risk approval;
 - post-apply plan JSON proving every relay-DMZ boundary address is a no-op.
 
 ## Rollback
