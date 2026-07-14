@@ -55,6 +55,7 @@ type E2ETestNode struct {
 	receivedMsgs chan *ReceivedMsg
 
 	// Message handler callback for routing specific message types
+	handlerMu      sync.RWMutex
 	messageHandler func(msg *ReceivedMsg)
 
 	// Control
@@ -200,7 +201,15 @@ func (n *E2ETestNode) AddPeer(other *E2ETestNode) {
 // SetMessageHandler sets a callback to receive all messages.
 // This is called before messages are placed in the receivedMsgs channel.
 func (n *E2ETestNode) SetMessageHandler(handler func(msg *ReceivedMsg)) {
+	n.handlerMu.Lock()
+	defer n.handlerMu.Unlock()
 	n.messageHandler = handler
+}
+
+func (n *E2ETestNode) currentMessageHandler() func(msg *ReceivedMsg) {
+	n.handlerMu.RLock()
+	defer n.handlerMu.RUnlock()
+	return n.messageHandler
 }
 
 // GetOrCreateConnection gets or creates a ConnectionData for the remote address.
@@ -327,8 +336,8 @@ func (n *E2ETestNode) decryptedMsgLoop() {
 			}
 
 			// Call message handler first if set
-			if n.messageHandler != nil {
-				n.messageHandler(msg)
+			if handler := n.currentMessageHandler(); handler != nil {
+				handler(msg)
 			}
 
 			select {
@@ -405,8 +414,8 @@ func (n *E2ETestNode) processReceivedPacket(data []byte, from *net.UDPAddr) {
 	}
 
 	// Call message handler first if set (for routing to forwarder)
-	if n.messageHandler != nil {
-		n.messageHandler(msg)
+	if handler := n.currentMessageHandler(); handler != nil {
+		handler(msg)
 	}
 
 	select {

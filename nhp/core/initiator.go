@@ -140,7 +140,7 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 		}
 
 		// create header and init device ecdh
-		log.Info("start encryption using CIPHER_SCHEME_CURVE")
+		log.Debug("start encryption using CIPHER_SCHEME_CURVE")
 		mad.header = mad.BasePacket.HeaderWithCipherScheme(mad.CipherScheme)
 		mad.ciphers = NewCipherSuite()
 		mad.deviceEcdh = d.GetEcdhByCipherScheme(mad.CipherScheme)

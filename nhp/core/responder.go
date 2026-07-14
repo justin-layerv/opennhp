@@ -280,7 +280,7 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		ppd.HeaderFlag = ppd.basePacket.Flag()
 		ppd.header = ppd.basePacket.Header()
 		ppd.CipherScheme = ppd.header.CipherScheme()
-		log.Info("start decryption using CIPHER_SCHEME_CURVE")
+		log.Debug("start decryption using CIPHER_SCHEME_CURVE")
 		ppd.Ciphers = NewCipherSuite()
 		ppd.deviceEcdh = d.GetEcdhByCipherScheme(ppd.CipherScheme)
 	}

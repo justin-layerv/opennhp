@@ -104,7 +104,7 @@ func (t *LocalTransaction) Done() <-chan struct{} {
 func (d *Device) IsTransactionRequest(t int) bool {
 
 	// NHP_KPL is handled separately
-	log.Info("IsTransactionRequest: deviceType:%d", d.deviceType)
+	log.Debug("IsTransactionRequest: deviceType:%d", d.deviceType)
 	switch d.deviceType {
 	case NHP_AGENT:
 		switch t {
