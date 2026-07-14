@@ -415,6 +415,13 @@ resource "aws_lambda_permission" "incident_publish_s3" {
   source_arn    = aws_s3_bucket.status.arn
 }
 
+# Keep the apply-role barrier on the one resource that exercises
+# s3:PutBucketNotification. A module-wide depends_on would defer provider data
+# and make status-page IAM/policy values unknown in the saved plan.
+resource "terraform_data" "terraform_apply_services_ready" {
+  input = var.terraform_apply_services_ready
+}
+
 resource "aws_s3_bucket_notification" "status" {
   bucket = aws_s3_bucket.status.id
 
@@ -434,6 +441,7 @@ resource "aws_s3_bucket_notification" "status" {
     aws_lambda_permission.incident_publish_s3,
     aws_s3_object.incidents,
     aws_s3_object.status_snapshot,
+    terraform_data.terraform_apply_services_ready,
   ]
 }
 

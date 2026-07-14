@@ -157,6 +157,12 @@ variable "api_gateway_logging_ready" {
   default     = ""
 }
 
+variable "terraform_apply_services_ready" {
+  description = "Opaque dependency token from the root terraform-apply-services IAM propagation wait. Used only to order the authoritative status-bucket notification."
+  type        = string
+  default     = ""
+}
+
 # ==============================================================================
 # NHP Authentication (Dogfooding)
 # ==============================================================================

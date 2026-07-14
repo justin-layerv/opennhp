@@ -1236,6 +1236,11 @@ module "status_page" {
   # the status module's API stage. A module-wide depends_on would also defer the
   # Lambda artifact path and is fenced by tests/scripts/test_promote_to_prod_gating.py.
   api_gateway_logging_ready = var.deploy_status_page ? one(time_sleep.apigateway_logging_propagation[*].id) : ""
+  # The same apply can add status-bucket actions to the CI role and create or
+  # update the authoritative S3 notification. Thread the established
+  # terraform-apply-services propagation barrier into only that child resource
+  # instead of deferring the status module's provider data and policy rendering.
+  terraform_apply_services_ready = var.deploy_status_page ? one(time_sleep.bootstrap_alb_iam_propagation[*].id) : ""
 
   # Public customer-facing components. The Lambda emits only coarse component
   # status, never response bodies, endpoints, timings, or infrastructure detail.
@@ -5525,24 +5530,22 @@ module "relay" {
 
 }
 
-# IAM eventual-consistency shim for the bootstrap-alb consumers of the
-# terraform-apply-services CI policy. Same pattern + rationale as
+# IAM eventual-consistency shim for bootstrap-alb and status-page consumers of
+# the terraform-apply-services CI policy. Same pattern + rationale as
 # `time_sleep.qurl_link_static_iam_propagation` above (read that block
 # for the trigger-source semantics + the taint/rename + greenfield-CF
 # nuances; this shim mirrors that shape, with `create_duration`
 # divergent — see the comment on `create_duration` below for the
 # 180s-vs-60s rationale).
 #
-# Gated on `var.deploy_bootstrap_alb` per terraform/CLAUDE.md → "IAM
-# eventual-consistency shim pattern": OR of every consumer's condition.
-# `terraform_apply_services` is a broad CI policy; today the only
-# consumer that races freshly-granted perms in it is this module. A
-# future PR that adds a new perm to this policy AND a same-apply
-# consumer that races it must widen the gate (and add `depends_on`
-# on the new consumer) — the policy_doc_hash trigger re-fires the
-# wait on any perm edit, but only resources gated through here pay it.
+# Gated on the OR of every consumer's condition per terraform/CLAUDE.md's IAM
+# eventual-consistency shim pattern. A future PR that adds a new permission to
+# this policy and a same-apply consumer that races it must widen this gate and
+# add a targeted readiness dependency on that consumer. The policy_doc_hash
+# trigger re-fires the wait on any permission edit, but only resources wired to
+# the readiness token pay it.
 resource "time_sleep" "bootstrap_alb_iam_propagation" {
-  count = var.deploy_bootstrap_alb ? 1 : 0
+  count = var.deploy_bootstrap_alb || var.deploy_status_page ? 1 : 0
 
   triggers = {
     policy_doc_hash = module.ecr.terraform_apply_services_policy_doc_hash

@@ -314,6 +314,13 @@ jobs:
           python3 tests/scripts/test_promote_to_prod_gating.py
           python3 tests/scripts/test_ac_readiness_dependency.py
 
+      # Run 29308758963 reached the status-bucket notification before the
+      # same apply's s3:PutBucketNotification grant was usable. Keep the
+      # targeted policy-hash wait in the graph without deferring the module.
+      - name: Test status-page notification IAM readiness
+        run: |
+          python3 tests/scripts/test_status_page_notification_iam_readiness.py
+
       # Regression guard for #1634: build-and-push.yml's sandbox deploy must
       # roll qurl-service onto the latest TF-registered task def after apply
       # (aws_ecs_service.qurl ignores task_definition changes, so the service

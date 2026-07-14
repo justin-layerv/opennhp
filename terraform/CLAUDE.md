@@ -232,10 +232,11 @@ sleep. Existing instances of the pattern:
   evaluator propagation, action-list edits on an already-scoped
   policy). Trigger source: a *content dependency* (sha256 of the
   policy doc + the policy ARN).
-- `time_sleep.bootstrap_alb_iam_propagation` (180s; IAM evaluator
-  propagation on a freshly-scoped *resource-prefix* grant — see
-  nhp #2072 / run 26251713769 for the 60s-isn't-enough evidence).
-  Trigger source: same shape as qurl_link_static.
+- `time_sleep.bootstrap_alb_iam_propagation` (180s; shared by the
+  bootstrap-alb resource-prefix grants and the status-page bucket
+  notification action grant). The duration comes from a freshly-scoped
+  *resource-prefix* grant — see nhp #2072 / run 26251713769 for the
+  60s-isn't-enough evidence. Trigger source: same shape as qurl_link_static.
 - `time_sleep.agent_otp_ses_iam_propagation` (180s; first-ever
   role-to-policy attachment, with no prior evaluator entry to update).
   Resource=`"*"` does not reduce this first-attachment propagation risk.
