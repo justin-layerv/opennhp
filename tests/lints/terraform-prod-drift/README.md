@@ -31,6 +31,7 @@ intentionally duplicated in the Python condition lint and
 | `resource-iam-gap-2996` | A — #2996 regression: resource create needs `cloudwatch:PutCompositeAlarm` | exit 1 (gap) | exit 0 |
 | `unmapped-resource` | A — fail-closed on resource type in neither `RESOURCE_ACTIONS` nor `RESOURCE_UNCHECKED_ACK` | exit 2 (unmapped) | exit 0 |
 | `resource-alarm-covered` | A — alarm-family positive path (mapped + fully granted) | exit 0 | exit 0 |
+| `resource-s3-bucket-notification-covered` | A — S3 bucket notification positive path (mapped + fully granted) | exit 0 | exit 0 |
 | `resource-metric-alarm-tag-gap` | A — default_tags correctness: an *untagged* alarm still requires the tag trio, role missing `cloudwatch:TagResource` | exit 1 (gap) | exit 0 |
 | `indexed-managed-policy` | A — count-gated `aws_iam_policy.X[0].arn` (cr round 1) | exit 0 | exit 0 |
 | `single-statement-dict` | A — IAM shorthand `Statement = {...}` (cr round 1) | exit 0 | exit 0 |

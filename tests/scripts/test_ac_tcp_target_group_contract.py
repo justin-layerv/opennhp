@@ -49,14 +49,24 @@ def test_blue_and_green_target_groups() -> None:
 
 def test_blue_green_drift_check_pins_transport_contract() -> None:
     main_tf = read("terraform/modules/ac/main.tf")
+    compute_tf = read("terraform/modules/compute/main.tf")
 
     for snippet in [
         "aws_lb_target_group.ac_tcp.preserve_client_ip",
         "aws_lb_target_group.ac_tcp_green[0].preserve_client_ip",
-        "!aws_lb_target_group.ac_tcp.proxy_protocol_v2",
-        "!aws_lb_target_group.ac_tcp_green[0].proxy_protocol_v2",
+        "!tobool(aws_lb_target_group.ac_tcp.proxy_protocol_v2)",
+        "!tobool(aws_lb_target_group.ac_tcp_green[0].proxy_protocol_v2)",
+        "Terraform check assertions error on mismatched comparison types",
+        "the provider exposes deregistration_delay as a string",
+        "if a future refactor drops one, tobool(null) makes this",
+        "non-blocking check warn instead of silently weakening this transport",
+        "contract. CI's contract test is the hard gate.",
     ]:
         assert snippet in main_tf, f"ac_tcp_target_group_drift must pin {snippet!r}"
+
+    assert "if a future refactor drops it, tobool(null) makes this" in compute_tf
+    assert "non-blocking check warn instead of silently weakening this" in compute_tf
+    assert "deregistration contract. CI's contract test is the hard gate." in compute_tf
 
 
 def test_traefik_entrypoints_do_not_expect_proxy_protocol() -> None:

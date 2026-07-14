@@ -1000,12 +1000,13 @@ jobs:
 
       - name: Install test dependencies
         if: needs.changes.outputs.lambdas == 'true'
-        # Install from the cert lambdas' pinned/dev requirements so the
-        # standalone Lambda test job covers the same AWS-adjacent suites as
-        # the package-build action.
+        # Install from the Lambda suites' pinned/dev requirements so the
+        # standalone Lambda test job exercises the same versions across
+        # re-triggers instead of inheriting transitive pins from a sibling suite.
         run: |
           pip install -r terraform/modules/acme-cert/lambda/requirements-dev.txt
           pip install -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
+          pip install -r terraform/modules/status-page/lambda/requirements-dev.txt
 
       - name: Run Lambda unit tests
         if: needs.changes.outputs.lambdas == 'true'
@@ -1055,6 +1056,9 @@ jobs:
           # region-resolution coverage. See `lambda_module` fixture
           # in test_ecr_replication_check.py for the xdist caveat.
           (cd terraform/lambda && python -m pytest test_ecr_replication_check.py -v)
+          echo '::endgroup::'
+          echo '::group::Status Page Aggregator Lambda Tests'
+          (cd terraform/modules/status-page/lambda && python -m pytest test_status_aggregator.py -v)
           echo '::endgroup::'
           echo '::group::Auth0 Rotation Lambda Tests (Node)'
           node --test terraform/modules/auth0/lambda/rotate_secret.test.js

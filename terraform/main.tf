@@ -1207,17 +1207,56 @@ module "status_page" {
     module.compute.udp_target_group_blue_arn,
     module.compute.udp_target_group_green_arn,
   ])
+  server_nlb_tg_arns_by_color = var.enable_blue_green ? {
+    blue  = compact([module.compute.udp_target_group_blue_arn])
+    green = compact([module.compute.udp_target_group_green_arn])
+  } : {}
+  server_active_color_parameter = var.enable_blue_green ? module.compute.ssm_active_color_parameter : null
+
   ac_nlb_tg_arns = var.deploy_ac ? compact([
     module.ac[0].tcp_target_group_blue_arn,
     module.ac[0].tcp_target_group_green_arn,
   ]) : []
+  ac_nlb_tg_arns_by_color = var.deploy_ac && var.enable_ac_blue_green ? {
+    blue  = compact([module.ac[0].tcp_target_group_blue_arn])
+    green = compact([module.ac[0].tcp_target_group_green_arn])
+  } : {}
+  ac_active_color_parameter = var.deploy_ac && var.enable_ac_blue_green ? module.ac[0].ssm_active_color_parameter : null
 
   # Monitoring
   server_alarm_prefixes = local.status_page_server_alarm_prefixes
   ac_alarm_prefixes     = local.status_page_ac_alarm_prefixes
-  alarm_name_prefixes   = concat(local.status_page_server_alarm_prefixes, local.status_page_ac_alarm_prefixes)
-  sns_topic_arn         = module.monitoring.sns_topic_arn
-  logs_kms_key_arn      = module.kms.logs_key_arn
+  # Keep this as the union of owned server/ac prefixes. Adding a bare prefix here
+  # would re-enable legacy token fallback and could misattribute qURL/control-plane
+  # alarms with generic suffixes such as high-latency to the NHP Server tile.
+  alarm_name_prefixes = concat(local.status_page_server_alarm_prefixes, local.status_page_ac_alarm_prefixes)
+  sns_topic_arn       = module.monitoring.sns_topic_arn
+  logs_kms_key_arn    = module.kms.logs_key_arn
+  # Thread the root account-level API Gateway logging propagation wait to only
+  # the status module's API stage. A module-wide depends_on would also defer the
+  # Lambda artifact path and is fenced by tests/scripts/test_promote_to_prod_gating.py.
+  api_gateway_logging_ready = var.deploy_status_page ? one(time_sleep.apigateway_logging_propagation[*].id) : ""
+
+  # Public customer-facing components. The Lambda emits only coarse component
+  # status, never response bodies, endpoints, timings, or infrastructure detail.
+  # This merge order is intentional: built-in ids are reserved and appear after
+  # tfvars so accidental duplicate keys cannot override the canonical qURL API /
+  # qURL Link health targets.
+  dependent_service_urls = merge(
+    var.status_page_additional_service_urls,
+    var.deploy_qurl_service && var.qurl_service_domain != null && var.qurl_service_domain != "" ? {
+      qurl_api = "https://${var.qurl_service_domain}/health/ready"
+    } : {},
+    var.deploy_qurl_link && var.qurl_link_domain != null && var.qurl_link_domain != "" ? {
+      # Fragments never reach CloudFront, so this tile proves the static
+      # redemption shell is reachable. /index.html is expected to answer HEAD
+      # with 2xx/3xx in each env; a 4xx on that exact shell path intentionally
+      # leaves this tile amber until the static surface is fixed. Dynamic
+      # redemption/API health is covered by qurl_api and by operator incidents.
+      qurl_link = "https://${var.qurl_link_domain}/index.html"
+    } : {},
+  )
+  display_only_component_ids = var.status_page_display_only_component_ids
 
   # NHP Authentication (dogfooding)
   enable_nhp_auth   = var.status_page_nhp_auth_enabled
@@ -3258,7 +3297,7 @@ resource "aws_iam_role_policy" "smoke_custom_domain_cleanup" {
 # API Gateway access logging.
 
 locals {
-  deploy_any_apigw = var.deploy_developer_portal || var.deploy_billing
+  deploy_any_apigw = var.deploy_developer_portal || var.deploy_billing || var.deploy_status_page
 
   # Shared CORS origins for all API Gateway modules (developer portal, billing).
   # Individual overrides take precedence; fall back to the shared default.

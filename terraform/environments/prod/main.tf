@@ -342,7 +342,6 @@ module "nhp" {
   grafana_auth                      = var.grafana_auth
   grafana_prometheus_datasource_uid = var.grafana_prometheus_datasource_uid
   grafana_tempo_datasource_uid      = var.grafana_tempo_datasource_uid
-  grafana_nhp_dashboard_url         = var.grafana_nhp_dashboard_url
   grafana_cloudwatch_enabled        = var.grafana_cloudwatch_enabled
   grafana_cloud_aws_account_id      = var.grafana_cloud_aws_account_id
   grafana_cloud_external_id         = var.grafana_cloud_external_id
@@ -394,11 +393,13 @@ module "nhp" {
   canary_instance_warmup_seconds  = var.canary_instance_warmup_seconds
 
   # Status page (B1)
-  deploy_status_page            = var.deploy_status_page
-  status_page_domain            = var.status_page_domain
-  status_page_hosted_zone_id    = var.status_page_hosted_zone_id
-  status_page_nhp_auth_enabled  = var.status_page_nhp_auth_enabled
-  status_page_nhp_auth_qurl_url = var.status_page_nhp_auth_qurl_url
+  deploy_status_page                     = var.deploy_status_page
+  status_page_domain                     = var.status_page_domain
+  status_page_hosted_zone_id             = var.status_page_hosted_zone_id
+  status_page_additional_service_urls    = var.status_page_additional_service_urls
+  status_page_display_only_component_ids = var.status_page_display_only_component_ids
+  status_page_nhp_auth_enabled           = var.status_page_nhp_auth_enabled
+  status_page_nhp_auth_qurl_url          = var.status_page_nhp_auth_qurl_url
 
   # Developer Portal
   deploy_developer_portal                 = var.deploy_developer_portal

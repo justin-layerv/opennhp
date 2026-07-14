@@ -71,10 +71,75 @@ variable "server_nlb_tg_arns" {
   default     = []
 }
 
+variable "server_nlb_tg_arns_by_color" {
+  description = "Optional blue/green server target group ARNs keyed by active-color value. When set with server_active_color_parameter, the Lambda checks only the active color; if active-color lookup or mapping fails, the public component becomes unknown instead of aggregating idle-color target groups."
+  type        = map(list(string))
+  default     = {}
+}
+
+variable "server_active_color_parameter" {
+  description = "Optional SSM parameter name containing the active server color (blue or green)."
+  type        = string
+  default     = null
+}
+
 variable "ac_nlb_tg_arns" {
   description = "AC NLB target group ARNs to check health (blue, optionally green)"
   type        = list(string)
   default     = []
+}
+
+variable "ac_nlb_tg_arns_by_color" {
+  description = "Optional blue/green AC target group ARNs keyed by active-color value. When set with ac_active_color_parameter, the Lambda checks only the active color; if active-color lookup or mapping fails, the public component becomes unknown instead of aggregating idle-color target groups."
+  type        = map(list(string))
+  default     = {}
+}
+
+variable "ac_active_color_parameter" {
+  description = "Optional SSM parameter name containing the active AC color (blue or green)."
+  type        = string
+  default     = null
+}
+
+# ==============================================================================
+# Public HTTP Components
+# ==============================================================================
+
+variable "dependent_service_urls" {
+  description = "Map of public component id => HTTPS health check URL. The Lambda performs an HTTP HEAD with GET fallback and one retry, then reports the component on the public status page. URLs should be unauthenticated and return 2xx/3xx when healthy; reachable 401/403/404 and repeated 429 responses report degraded. Display names for known ids live in frontend/index.html."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for url in values(var.dependent_service_urls) : can(regex("^https://", url))])
+    error_message = "dependent_service_urls values must be HTTPS URLs."
+  }
+
+  validation {
+    condition     = alltrue([for id in keys(var.dependent_service_urls) : can(regex("^[a-z0-9_]+$", id))])
+    error_message = "dependent_service_urls keys must be lowercase component ids using letters, numbers, and underscores."
+  }
+
+  validation {
+    condition     = length(var.dependent_service_urls) <= 8
+    error_message = "dependent_service_urls can include at most 8 HTTP components so status snapshots stay within the Lambda duration alarm/timeout budget. This total includes built-in qurl_api/qurl_link checks added by the root module."
+  }
+}
+
+variable "display_only_component_ids" {
+  description = "Component ids to render and track in history but exclude from automated component rollup. Active incidents can still escalate the top-level overall status."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.display_only_component_ids : can(regex("^[a-z0-9_]+$", id))])
+    error_message = "display_only_component_ids values must be lowercase component ids using letters, numbers, and underscores."
+  }
+
+  validation {
+    condition     = length(setintersection(var.display_only_component_ids, toset(["nhp_server", "nhp_ac", "qurl_api", "qurl_link"]))) == 0
+    error_message = "display_only_component_ids cannot include core component ids: nhp_server, nhp_ac, qurl_api, qurl_link."
+  }
 }
 
 # ==============================================================================
@@ -86,6 +151,12 @@ variable "logs_kms_key_arn" {
   type        = string
 }
 
+variable "api_gateway_logging_ready" {
+  description = "Opaque dependency token from the root API Gateway logging propagation wait. Used only to order the compatibility API stage access-log configuration."
+  type        = string
+  default     = ""
+}
+
 # ==============================================================================
 # NHP Authentication (Dogfooding)
 # ==============================================================================
@@ -93,7 +164,9 @@ variable "logs_kms_key_arn" {
 variable "enable_nhp_auth" {
   description = <<-EOT
     Protect the status page with NHP authentication via QURL. When enabled,
-    unauthenticated requests are redirected to the QURL login portal.
+    unauthenticated CloudFront viewer requests are redirected to the QURL login
+    portal. This does not gate the exported compatibility API Gateway URL,
+    which remains public and serves only the redacted status payload.
 
     IMPORTANT: the QURL resource backing nhp_auth_qurl_url must be configured
     so that the nhp_token cookie domain covers the status page host. The

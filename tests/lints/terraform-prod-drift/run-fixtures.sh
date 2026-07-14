@@ -30,6 +30,7 @@ FIXTURES=(
   "resource-iam-gap-2996|1|0||"
   "unmapped-resource|2|0||"
   "resource-alarm-covered|0|0||"
+  "resource-s3-bucket-notification-covered|0|0||"
   "resource-metric-alarm-tag-gap|1|0||"
   "indexed-managed-policy|0|0||"
   "single-statement-dict|0|0||"

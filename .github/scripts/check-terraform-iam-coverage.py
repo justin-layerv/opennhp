@@ -367,6 +367,13 @@ RESOURCE_ACTIONS: dict[str, ActionSpec] = {
         "cloudwatch:GetDashboard",
         "cloudwatch:DeleteDashboards",
     ],
+    # internal/service/s3/bucket_notification.go — PutBucketNotificationConfiguration
+    # on create/update/delete (delete writes an empty notification config), and
+    # GetBucketNotificationConfiguration on read.
+    "aws_s3_bucket_notification": [
+        "s3:GetBucketNotification",
+        "s3:PutBucketNotification",
+    ],
     # Agent-registration email OTP (T1), terraform/agent_otp_ses.tf.
     # internal/service/sesv2/email_identity.go — CreateEmailIdentity on create,
     # GetEmailIdentity on read, DeleteEmailIdentity on destroy,

@@ -194,6 +194,12 @@ _CERT_LAMBDA_REQUIREMENTS = (
     "terraform/modules/acme-cert/lambda/requirements-dev.txt",
     "terraform/modules/custom-domain-cert/lambda/requirements-test.txt",
 )
+_STANDALONE_LAMBDA_REQUIREMENTS = _CERT_LAMBDA_REQUIREMENTS + (
+    # The standalone test-lambdas job also runs the status-page suite, which
+    # imports boto3/botocore directly. Keep it on its own pinned dev deps
+    # instead of inheriting whatever a sibling Lambda suite installed.
+    "terraform/modules/status-page/lambda/requirements-dev.txt",
+)
 
 _CERT_LAMBDA_SUITES = {
     "acme-cert": (
@@ -219,6 +225,13 @@ def _drifted_dummy_aws_env(env: dict) -> dict:
 def _missing_cert_lambda_requirements(run_body: str) -> list[str]:
     return [
         requirement for requirement in _CERT_LAMBDA_REQUIREMENTS
+        if requirement not in run_body
+    ]
+
+
+def _missing_standalone_lambda_requirements(run_body: str) -> list[str]:
+    return [
+        requirement for requirement in _STANDALONE_LAMBDA_REQUIREMENTS
         if requirement not in run_body
     ]
 
@@ -3351,14 +3364,14 @@ def _assert_build_and_push_test_lambdas_hermetic(jobs: dict, failures: list[str]
 
     if install_step is not None:
         install_run = str(install_step.get("run", ""))
-        missing_requirements = _missing_cert_lambda_requirements(install_run)
+        missing_requirements = _missing_standalone_lambda_requirements(install_run)
         if not _check(
-            "`test-lambdas` installs cert Lambda test requirements",
+            "`test-lambdas` installs standalone Lambda test requirements",
             not missing_requirements,
             f"missing requirement installs: {missing_requirements}",
         ):
             failures.append(
-                "`test-lambdas` dependency install no longer covers cert "
+                "`test-lambdas` dependency install no longer covers standalone "
                 f"Lambda test requirements: {missing_requirements}"
             )
 
@@ -4591,6 +4604,35 @@ _BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_CERT_REQUIREMENTS = textwrap.de
 )
 
 
+_BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_STATUS_REQUIREMENTS = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      test-lambdas:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Install test dependencies
+            run: |
+              pip install -r terraform/modules/acme-cert/lambda/requirements-dev.txt
+              pip install -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
+              # Bug: status-page tests run below, but their direct boto3/botocore
+              # pins are missing and would be inherited from sibling suites.
+          - name: Run Lambda unit tests
+            env:
+              AWS_ACCESS_KEY_ID: unit-test
+              AWS_SECRET_ACCESS_KEY: unit-test
+              AWS_SESSION_TOKEN: unit-test
+              AWS_DEFAULT_REGION: us-east-2
+              AWS_REGION: us-east-2
+              AWS_EC2_METADATA_DISABLED: "true"
+            run: |
+              (cd terraform/modules/acme-cert/lambda && python -m pytest test_acme_cert_manager.py -v)
+              (cd terraform/modules/custom-domain-cert/lambda && python -m pytest test_cert_manager.py -v)
+              (cd terraform/modules/status-page/lambda && python -m pytest test_status_aggregator.py -v)
+    """
+)
+
+
 _BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_DUMMY_ENV = textwrap.dedent(
     """
     on: workflow_dispatch
@@ -4602,6 +4644,7 @@ _BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_DUMMY_ENV = textwrap.dedent(
             run: |
               pip install -r terraform/modules/acme-cert/lambda/requirements-dev.txt
               pip install -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
+              pip install -r terraform/modules/status-page/lambda/requirements-dev.txt
           - name: Run Lambda unit tests
             # Bug: no dummy AWS env backstop, so ambient runner credentials or
             # IMDS could be discovered by an unmocked boto3 call.
@@ -4623,6 +4666,7 @@ _BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_ACME_SUITE = textwrap.dedent(
             run: |
               pip install -r terraform/modules/acme-cert/lambda/requirements-dev.txt
               pip install -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
+              pip install -r terraform/modules/status-page/lambda/requirements-dev.txt
           - name: Run Lambda unit tests
             env:
               AWS_ACCESS_KEY_ID: unit-test
@@ -5072,6 +5116,11 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
             "build-and-push standalone Lambda tests missing cert requirements",
             _assert_build_and_push_test_lambdas_hermetic,
             _BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_CERT_REQUIREMENTS,
+        ),
+        (
+            "build-and-push standalone Lambda tests missing status-page requirements",
+            _assert_build_and_push_test_lambdas_hermetic,
+            _BAD_FIXTURE_BUILD_AND_PUSH_TEST_LAMBDAS_MISSING_STATUS_REQUIREMENTS,
         ),
         (
             "build-and-push standalone Lambda tests missing dummy AWS env",

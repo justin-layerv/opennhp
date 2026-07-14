@@ -2217,10 +2217,14 @@ check "https_target_group_blue_green_drift" {
       length(aws_lb_target_group.https) == 0 ||
       length(aws_lb_target_group.https_green) == 0 ||
       (
-        aws_lb_target_group.https[0].connection_termination &&
-        aws_lb_target_group.https_green[0].connection_termination &&
-        aws_lb_target_group.https[0].deregistration_delay == 30 &&
-        aws_lb_target_group.https_green[0].deregistration_delay == 30
+        # connection_termination is explicitly set on both referenced target
+        # groups; if a future refactor drops it, tobool(null) makes this
+        # non-blocking check warn instead of silently weakening this
+        # deregistration contract. CI's contract test is the hard gate.
+        tobool(aws_lb_target_group.https[0].connection_termination) &&
+        tobool(aws_lb_target_group.https_green[0].connection_termination) &&
+        tonumber(aws_lb_target_group.https[0].deregistration_delay) == 30 &&
+        tonumber(aws_lb_target_group.https_green[0].deregistration_delay) == 30
       )
     )
     error_message = "BLUE/GREEN DEREG SEMANTICS VALUE-ANCHOR: aws_lb_target_group.https.{connection_termination,deregistration_delay} (main.tf) and aws_lb_target_group.https_green.{connection_termination,deregistration_delay} (blue_green.tf) must satisfy connection_termination=true AND deregistration_delay=30 on BOTH colors. The 2026-05-22 'CF stalled on stranded green-server flow for 60s' incident regresses if either color drops connection_termination=true (silent failure mode); deregistration_delay=30 here is calibrated against the COMPUTE-side health-check-propagation window (interval=10 × unhealthy_threshold=2 = 20s). The sibling AC value-anchor at ac/main.tf::ac_tcp_target_group_drift also pins =30 but for a DIFFERENT reason (intentional decoupling from AC's interval=30 × unhealthy_threshold=3 = 90s window); don't pattern-match both pins as a parallel calibration. Edit both colors AND this assert in the same PR; the comment block at main.tf::aws_lb_target_group.https carries the full incident history."

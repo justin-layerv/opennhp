@@ -1,11 +1,10 @@
-# Development dependencies for testing Status Aggregator Lambda
+# Test-only dependencies for Status Aggregator Lambda unit tests.
 # Install with: pip install -r requirements-dev.txt
+#
+# Pin versions explicitly (matching the other Lambda test suites) so CI
+# runs are reproducible across re-triggers. AWS calls are stubbed with
+# unittest.mock, so no moto dependency is needed.
 
-# Testing framework
-pytest>=8.4.2
-
-# AWS SDK (provided by Lambda runtime, needed for testing)
-boto3>=1.43.46
-
-# Mocking AWS services
-moto>=5.0.0
+pytest==9.0.3
+boto3==1.43.46
+botocore==1.43.46

@@ -606,6 +606,13 @@ deploy_status_page         = true
 status_page_domain         = "status.layerv.ai"
 status_page_hosted_zone_id = "Z0748438C8EK6UAW94ST" # layerv.ai zone
 
+# Extra public components on the status page (component id => health URL).
+# qURL API + qURL link checks are wired automatically from their domains.
+status_page_additional_service_urls = {
+  website = "https://layerv.ai/"
+}
+status_page_display_only_component_ids = ["website"]
+
 # NHP Authentication (dogfooding) - protect status page with QURL
 # To enable: 1) Create a QURL via API with target_url=https://status.layerv.ai
 #            2) Set the QURL link URL below and enable auth

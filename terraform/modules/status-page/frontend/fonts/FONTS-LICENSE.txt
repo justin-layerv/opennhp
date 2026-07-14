@@ -1,0 +1,22 @@
+Vendored web fonts for the LayerV status page.
+
+These are the same font families the layerv.ai website loads via next/font.
+They are vendored here (instead of loaded from Google Fonts) so the status
+page has zero third-party runtime dependencies and keeps its CSP at
+default-src 'self'.
+
+- manrope-latin-var.woff2
+  Manrope (variable, weights 400-800, latin subset)
+  Copyright 2018 The Manrope Project Authors (https://github.com/sharanda/manrope)
+  Licensed under the SIL Open Font License, Version 1.1
+  https://openfontlicense.org
+
+- archivo-black-latin.woff2
+  Archivo Black (regular, latin subset)
+  Copyright 2017 Omnibus-Type (https://github.com/Omnibus-Type/ArchivoBlack)
+  Licensed under the SIL Open Font License, Version 1.1
+  https://openfontlicense.org
+
+Both files were obtained from the Google Fonts CDN (fonts.gstatic.com).
+The SIL OFL 1.1 permits bundling and redistribution of the font software
+provided it is not sold by itself and copyright/license notices are retained.

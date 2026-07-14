@@ -1554,12 +1554,6 @@ variable "grafana_auth" {
   sensitive   = true
 }
 
-variable "grafana_nhp_dashboard_url" {
-  description = "URL to the NHP Infrastructure Grafana dashboard (shown on status page)"
-  type        = string
-  default     = ""
-}
-
 variable "grafana_cloudwatch_enabled" {
   description = "Enable CloudWatch data source in Grafana for NHP Infrastructure dashboard"
   type        = bool
@@ -1884,6 +1878,41 @@ variable "status_page_hosted_zone_id" {
   validation {
     condition     = var.status_page_hosted_zone_id == null || can(regex("^Z[A-Z0-9]{8,}$", var.status_page_hosted_zone_id))
     error_message = "status_page_hosted_zone_id must be a valid Route53 hosted zone ID (uppercase, starts with Z, at least 9 characters)."
+  }
+}
+
+variable "status_page_additional_service_urls" {
+  description = "Additional public components for the status page (component id => HTTPS health check URL)"
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for url in values(var.status_page_additional_service_urls) : can(regex("^https://", url))])
+    error_message = "status_page_additional_service_urls values must be HTTPS URLs."
+  }
+
+  validation {
+    condition = alltrue([
+      for id in keys(var.status_page_additional_service_urls) :
+      !contains(["qurl_api", "qurl_link", "nhp_server", "nhp_ac"], id)
+    ])
+    error_message = "status_page_additional_service_urls cannot use reserved component ids: qurl_api, qurl_link, nhp_server, nhp_ac."
+  }
+}
+
+variable "status_page_display_only_component_ids" {
+  description = "Status page component ids to render and track but exclude from automated component rollup."
+  type        = set(string)
+  default     = ["website"]
+
+  validation {
+    condition     = alltrue([for id in var.status_page_display_only_component_ids : can(regex("^[a-z0-9_]+$", id))])
+    error_message = "status_page_display_only_component_ids values must be lowercase component ids using letters, numbers, and underscores."
+  }
+
+  validation {
+    condition     = length(setintersection(var.status_page_display_only_component_ids, toset(["nhp_server", "nhp_ac", "qurl_api", "qurl_link"]))) == 0
+    error_message = "status_page_display_only_component_ids cannot include core component ids: nhp_server, nhp_ac, qurl_api, qurl_link."
   }
 }
 

@@ -753,11 +753,18 @@ ac_green_standby_min_size = 1 # Warm standby - 1 instance ready for instant swit
 
 # ==============================================================================
 # Status Page Configuration
-# Deployment visibility dashboard at status.layerv.xyz
+# Public status page at status.layerv.xyz
 # ==============================================================================
 deploy_status_page         = true
 status_page_domain         = "status.layerv.xyz"
 status_page_hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
+
+# Extra public components on the status page (component id => health URL).
+# qURL API + qURL link checks are wired automatically from their domains.
+status_page_additional_service_urls = {
+  website = "https://staging.layerv.ai/"
+}
+status_page_display_only_component_ids = ["website"]
 
 # NHP Authentication (dogfooding) - protect status page with QURL
 # To enable: 1) Create a QURL via API with target_url=https://status.layerv.xyz

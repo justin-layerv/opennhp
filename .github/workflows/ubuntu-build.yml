@@ -150,6 +150,9 @@ jobs:
           [ "$(wc -l < "$calls" | tr -d ' ')" = "5" ] || { echo "ERROR: expected five retry attempts"; exit 1; }
         )
 
+    - name: Check status page public surface
+      run: python3 .github/scripts/check-status-page-public-surface.py
+
   lint:
     runs-on: ubuntu-latest
     strategy:

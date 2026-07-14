@@ -2362,14 +2362,21 @@ check "ac_tcp_target_group_drift" {
       !var.enable_blue_green ||
       length(aws_lb_target_group.ac_tcp_green) == 0 ||
       (
-        aws_lb_target_group.ac_tcp.connection_termination &&
-        aws_lb_target_group.ac_tcp_green[0].connection_termination &&
-        aws_lb_target_group.ac_tcp.preserve_client_ip &&
-        aws_lb_target_group.ac_tcp_green[0].preserve_client_ip &&
-        !aws_lb_target_group.ac_tcp.proxy_protocol_v2 &&
-        !aws_lb_target_group.ac_tcp_green[0].proxy_protocol_v2 &&
-        aws_lb_target_group.ac_tcp.deregistration_delay == 30 &&
-        aws_lb_target_group.ac_tcp_green[0].deregistration_delay == 30
+        # Terraform check assertions error on mismatched comparison types:
+        # the provider exposes deregistration_delay as a string, so normalize
+        # it before comparing to the numeric contract below.
+        # The boolean attributes are explicitly set on both referenced target
+        # groups; if a future refactor drops one, tobool(null) makes this
+        # non-blocking check warn instead of silently weakening this transport
+        # contract. CI's contract test is the hard gate.
+        tobool(aws_lb_target_group.ac_tcp.connection_termination) &&
+        tobool(aws_lb_target_group.ac_tcp_green[0].connection_termination) &&
+        tobool(aws_lb_target_group.ac_tcp.preserve_client_ip) &&
+        tobool(aws_lb_target_group.ac_tcp_green[0].preserve_client_ip) &&
+        !tobool(aws_lb_target_group.ac_tcp.proxy_protocol_v2) &&
+        !tobool(aws_lb_target_group.ac_tcp_green[0].proxy_protocol_v2) &&
+        tonumber(aws_lb_target_group.ac_tcp.deregistration_delay) == 30 &&
+        tonumber(aws_lb_target_group.ac_tcp_green[0].deregistration_delay) == 30
       )
     )
     error_message = "BLUE/GREEN AC TCP SEMANTICS VALUE-ANCHOR: aws_lb_target_group.ac_tcp and aws_lb_target_group.ac_tcp_green must both satisfy connection_termination=true, deregistration_delay=30, preserve_client_ip=true, and proxy_protocol_v2=false. The 2026-05-22 incident regresses if either color drops connection_termination=true; qURL v2 stalls before qurl-router if Proxy Protocol is reintroduced on top of NLB client-IP preservation. Edit both colors AND this assert in the same PR; comment cross-reference at blue_green.tf::ac_tcp_green carries the rationale."

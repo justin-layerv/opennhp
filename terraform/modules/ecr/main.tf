@@ -2576,6 +2576,8 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "s3:PutBucketTagging",
           "s3:PutBucketPolicy",
           "s3:DeleteBucketPolicy",
+          "s3:GetBucketNotification",
+          "s3:PutBucketNotification",
           "s3:PutLifecycleConfiguration",
           "s3:GetLifecycleConfiguration"
         ]

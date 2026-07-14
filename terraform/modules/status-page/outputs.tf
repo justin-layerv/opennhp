@@ -1,7 +1,7 @@
 # Status Page Module Outputs
 
 output "api_url" {
-  description = "API Gateway invoke URL for the status endpoint"
+  description = "Compatibility API Gateway URL for the cached status endpoint; the frontend reads same-origin /status.json."
   value       = "${aws_apigatewayv2_stage.default.invoke_url}/status"
 }
 

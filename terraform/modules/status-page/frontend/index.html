@@ -3,758 +3,1043 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="api-url" content="${api_url}">
-  <title>LayerV NHP Status</title>
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="description" content="Live operational status for the LayerV platform: qURL API, qURL links, NHP network components, and the customer portal. Current incidents and 90 days of uptime history.">
+  <meta name="status-feed-url" content="${status_feed_url}">
+  <meta name="snapshot-cadence-minutes" content="${snapshot_cadence_minutes}">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="preload" href="/fonts/manrope-latin-var.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/archivo-black-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <title>LayerV Status</title>
   <style>
-    /* -- Design System -- */
-    :root {
-      /* Surfaces */
-      --bg-root: #080b10;
-      --bg-surface: rgba(14, 19, 28, 0.7);
-      --bg-surface-hover: rgba(20, 27, 40, 0.8);
-      --bg-elevated: rgba(22, 30, 44, 0.6);
-      --border-subtle: rgba(56, 72, 96, 0.3);
-      --border-default: rgba(72, 92, 120, 0.25);
-      --border-hover: rgba(88, 112, 148, 0.35);
-
-      /* Text */
-      --text-primary: #e8edf4;
-      --text-secondary: #8894a8;
-      --text-tertiary: #5c6878;
-      --text-inverse: #080b10;
-
-      /* Accent */
-      --accent-blue: #4d8dff;
-      --accent-blue-dim: rgba(77, 141, 255, 0.12);
-      --accent-blue-border: rgba(77, 141, 255, 0.25);
-
-      /* Status */
-      --status-healthy: #34d058;
-      --status-healthy-dim: rgba(52, 208, 88, 0.1);
-      --status-healthy-glow: rgba(52, 208, 88, 0.15);
-      --status-degraded: #e8a320;
-      --status-degraded-dim: rgba(232, 163, 32, 0.1);
-      --status-degraded-glow: rgba(232, 163, 32, 0.15);
-      --status-unhealthy: #f04848;
-      --status-unhealthy-dim: rgba(240, 72, 72, 0.1);
-      --status-unhealthy-glow: rgba(240, 72, 72, 0.15);
-      --status-unknown: #6c7a8e;
-      --status-unknown-dim: rgba(108, 122, 142, 0.1);
-
-      /* Spacing */
-      --space-xs: 4px;
-      --space-sm: 8px;
-      --space-md: 16px;
-      --space-lg: 24px;
-      --space-xl: 32px;
-      --space-2xl: 48px;
-
-      /* Radius */
-      --radius-sm: 6px;
-      --radius-md: 10px;
-      --radius-lg: 14px;
-
-      /* Transitions */
-      --transition-fast: 150ms cubic-bezier(0.25, 0.1, 0.25, 1);
-      --transition-base: 250ms cubic-bezier(0.25, 0.1, 0.25, 1);
-      --transition-slow: 400ms cubic-bezier(0.25, 0.1, 0.25, 1);
-
-      /* Glass */
-      --glass-blur: 12px;
-      --glass-bg: rgba(14, 19, 28, 0.65);
-      --glass-border: rgba(72, 92, 120, 0.18);
-
-      /* Typography */
-      --font-sans: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-      --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
-      --text-xs: 11px;
-      --text-sm: 13px;
-      --text-base: 14px;
-      --text-lg: 16px;
-      --text-xl: 20px;
-      --text-2xl: 24px;
-      --weight-normal: 400;
-      --weight-medium: 500;
-      --weight-semibold: 600;
-      --letter-tight: -0.01em;
-      --letter-wide: 0.06em;
+    /* Fonts: vendored, same families as layerv.ai (next/font). OFL-licensed,
+       see /fonts/FONTS-LICENSE.txt. Self-hosted so the page works with
+       default-src 'self' and no third-party dependency during incidents. */
+    @font-face {
+      font-family: 'Manrope';
+      font-style: normal;
+      font-weight: 400 800;
+      font-display: swap;
+      src: url('/fonts/manrope-latin-var.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'Archivo Black';
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url('/fonts/archivo-black-latin.woff2') format('woff2');
     }
 
-    /* -- Reset -- */
+    /* Design tokens: mirrored from website app/globals.css (Mono Extreme).
+       Keep in sync with the site rather than inventing new values. */
+    :root {
+      --bg-primary: #0a0a0a;
+      --bg-secondary: #16161a;
+      --bg-tertiary: #1c1c20;
+      --bg-elevated: #25252b;
+
+      --text-primary: #f5f5f0;
+      --text-secondary: #c9c9c4;
+      --text-tertiary: #939390;
+      --slate-300: #cbd5e1;
+      --slate-400: #94a3b8;
+
+      --accent-lime: #a6ff00;
+      --accent-lime-dim: rgba(166, 255, 0, 0.12);
+      --accent-lime-border: rgba(166, 255, 0, 0.22);
+
+      --status-ok: #10b981;
+      --status-ok-bright: #22c55e;
+      --status-ok-dim: rgba(16, 185, 129, 0.15);
+      --status-warn: #eab308;
+      --status-warn-dim: rgba(234, 179, 8, 0.08);
+      --status-warn-border: rgba(234, 179, 8, 0.25);
+      --status-down: #ef4444;
+      --status-down-dim: rgba(239, 68, 68, 0.08);
+      --status-down-border: rgba(239, 68, 68, 0.25);
+      --status-down-soft: #fca5a5;
+      --status-major: #f97316;
+      --status-none: #232328;
+
+      --border: rgba(255, 255, 255, 0.08);
+      --border-hover: rgba(255, 255, 255, 0.15);
+      --hairline: rgba(255, 255, 245, 0.06);
+
+      --font-sans: 'Manrope', 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      --font-display: 'Archivo Black', 'Manrope', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+
+      --radius-sm: 0.375rem;
+      --radius-md: 0.5rem;
+      --radius-lg: 0.75rem;
+      --radius-full: 9999px;
+
+      --transition-fast: 150ms ease;
+      --transition-base: 250ms ease;
+    }
+
     *, *::before, *::after {
       box-sizing: border-box;
       margin: 0;
       padding: 0;
     }
 
-    /* -- Base -- */
-    body {
-      background: var(--bg-root);
-      color: var(--text-secondary);
-      font-family: var(--font-sans);
-      font-size: var(--text-base);
-      line-height: 1.55;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
+    html {
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
     }
 
-    /* Subtle grid texture on body */
-    body::before {
-      content: '';
-      position: fixed;
-      inset: 0;
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Faint blueprint grid behind the masthead, echoing the site hero.
+       Fades out before the component list so data stays on clean ink. */
+    .grid-veil {
+      position: absolute;
+      inset: 0 0 auto 0;
+      height: 420px;
       background-image:
-        radial-gradient(circle at 20% 20%, rgba(77, 141, 255, 0.03) 0%, transparent 50%),
-        radial-gradient(circle at 80% 80%, rgba(52, 208, 88, 0.02) 0%, transparent 50%);
+        linear-gradient(var(--hairline) 1px, transparent 1px),
+        linear-gradient(90deg, var(--hairline) 1px, transparent 1px);
+      background-size: 72px 72px;
+      -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0.9), transparent);
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,0.9), transparent);
       pointer-events: none;
-      z-index: 0;
     }
 
-    body > * {
-      position: relative;
-      z-index: 1;
-    }
-
-    code, .mono {
-      font-family: var(--font-mono);
-      font-size: 0.9em;
-      letter-spacing: var(--letter-tight);
+    ::selection {
+      background: var(--accent-lime);
+      color: var(--bg-primary);
     }
 
     a {
-      color: var(--accent-blue);
+      color: inherit;
       text-decoration: none;
-      transition: color var(--transition-fast);
     }
 
-    a:hover {
-      color: #6ba3ff;
-      text-decoration: underline;
-    }
-
-    /* -- Focus -- */
     :focus-visible {
-      outline: 2px solid var(--accent-blue);
+      outline: 2px solid var(--accent-lime);
       outline-offset: 2px;
       border-radius: 2px;
     }
 
-    /* -- Animations -- */
-    @keyframes pulse-healthy {
-      0%, 100% { box-shadow: 0 0 0 0 var(--status-healthy-glow); }
-      50% { box-shadow: 0 0 0 5px transparent; }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
     }
 
-    @keyframes pulse-degraded {
-      0%, 100% { box-shadow: 0 0 0 0 var(--status-degraded-glow); opacity: 1; }
-      50% { box-shadow: 0 0 0 5px transparent; opacity: 0.7; }
+    .skip-link {
+      position: absolute;
+      left: 16px;
+      top: -48px;
+      z-index: 10;
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 8px 14px;
+      font-size: 13px;
+      transition: top var(--transition-fast);
     }
 
-    @keyframes pulse-unhealthy {
-      0%, 100% { box-shadow: 0 0 0 0 var(--status-unhealthy-glow); opacity: 1; }
-      50% { box-shadow: 0 0 0 5px transparent; opacity: 0.6; }
+    .skip-link:focus {
+      top: 12px;
     }
 
-    @keyframes shimmer {
-      0% { background-position: -200% 0; }
-      100% { background-position: 200% 0; }
+    /* ---------------------------------------------------------- header */
+    .site-header {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      max-width: 880px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 22px 24px;
     }
 
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(8px); }
-      to { opacity: 1; transform: translateY(0); }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
     }
 
-    @keyframes slideDown {
-      from { opacity: 0; max-height: 0; }
-      to { opacity: 1; max-height: 500px; }
+    .brand img {
+      height: 30px;
+      width: auto;
+      display: block;
     }
 
-    /* -- Header -- */
-    .header {
-      border-bottom: 1px solid var(--border-subtle);
-      padding: var(--space-lg) var(--space-lg);
+    .env-chip {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0;
+      color: var(--slate-400);
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-full);
+      padding: 2px 10px;
+      text-transform: uppercase;
+    }
+
+    .header-links {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-tertiary);
+    }
+
+    .header-links a {
+      transition: color var(--transition-fast);
+    }
+
+    .header-links a:hover {
+      color: var(--accent-lime);
+    }
+
+    /* ----------------------------------------------------------- main */
+    .main {
+      position: relative;
+      flex: 1;
+      width: 100%;
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 28px 24px 72px;
+    }
+
+    /* notice banners (fetch failure / stale data) */
+    .notice {
+      display: none;
+      border-radius: var(--radius-md);
+      padding: 12px 16px;
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 24px;
+    }
+
+    .notice.visible {
+      display: block;
+    }
+
+    .notice-error {
+      background: var(--status-down-dim);
+      border: 1px solid var(--status-down-border);
+      color: var(--status-down-soft);
+    }
+
+    .notice-stale {
+      background: var(--status-warn-dim);
+      border: 1px solid var(--status-warn-border);
+      color: var(--status-warn);
+    }
+
+    noscript .notice {
+      display: block;
+    }
+
+    /* --------------------------------------------------------- overall */
+    .overall {
+      position: relative;
+      padding: 36px 0 44px;
+    }
+
+    .kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      color: var(--accent-lime);
+      margin-bottom: 18px;
+    }
+
+    .kicker-rule {
+      width: 28px;
+      height: 1px;
+      background: var(--accent-lime);
+      opacity: 0.7;
+    }
+
+    .overall-line {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+    }
+
+    .overall-orb {
+      position: relative;
+      width: 18px;
+      height: 18px;
+      border-radius: var(--radius-full);
+      flex-shrink: 0;
+      background: var(--text-tertiary);
+      transition: background var(--transition-base);
+    }
+
+    .overall-orb::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: var(--radius-full);
+      background: inherit;
+    }
+
+    .overall[data-status="operational"] .overall-orb { background: var(--status-ok-bright); }
+    .overall[data-status="degraded"] .overall-orb { background: var(--status-warn); }
+    .overall[data-status="major_outage"] .overall-orb { background: var(--status-down); }
+
+    .overall[data-status="operational"] .overall-orb::after,
+    .overall[data-status="degraded"] .overall-orb::after,
+    .overall[data-status="major_outage"] .overall-orb::after {
+      animation: ping 2.4s cubic-bezier(0, 0, 0.2, 1) infinite;
+    }
+
+    @keyframes ping {
+      75%, 100% {
+        transform: scale(2.1);
+        opacity: 0;
+      }
+    }
+
+    .overall-title {
+      font-family: var(--font-display);
+      font-weight: 400;
+      font-size: 2.75rem;
+      line-height: 1.12;
+      letter-spacing: 0;
+      color: var(--text-primary);
+    }
+
+    .overall-sub {
+      margin-top: 14px;
+      font-size: 14px;
+      color: var(--text-secondary);
+      max-width: 62ch;
+    }
+
+    .overall-meta {
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--text-tertiary);
+    }
+
+    .time-tip {
+      cursor: default;
+      border-bottom: 1px dotted var(--text-tertiary);
+    }
+
+    /* ------------------------------------------------------- incidents */
+    .active-incidents {
+      display: none;
+      flex-direction: column;
+      gap: 16px;
+      margin-bottom: 40px;
+    }
+
+    .active-incidents.visible {
+      display: flex;
+    }
+
+    .incident-panel {
+      border: 1px solid var(--status-warn-border);
+      background: var(--status-warn-dim);
+      border-radius: var(--radius-lg);
+      padding: 20px 22px;
+    }
+
+    .incident-panel[data-impact="critical"],
+    .incident-panel[data-impact="major"] {
+      border-color: var(--status-down-border);
+      background: var(--status-down-dim);
+    }
+
+    .incident-head {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .incident-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-primary);
+      letter-spacing: 0;
+    }
+
+    .impact-chip {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      border-radius: var(--radius-full);
+      padding: 2px 10px;
+      border: 1px solid var(--border);
+      color: var(--text-tertiary);
+    }
+
+    .impact-chip[data-impact="minor"] { color: var(--status-warn); border-color: var(--status-warn-border); }
+    .impact-chip[data-impact="major"] { color: var(--status-major); border-color: rgba(249, 115, 22, 0.35); }
+    .impact-chip[data-impact="critical"] { color: var(--status-down); border-color: var(--status-down-border); }
+
+    .incident-affects {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--text-tertiary);
+    }
+
+    .incident-updates {
+      list-style: none;
+      margin-top: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .incident-update {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .update-status {
+      font-weight: 700;
+      text-transform: capitalize;
+      margin-right: 8px;
+    }
+
+    .update-status[data-status="investigating"] { color: var(--status-warn); }
+    .update-status[data-status="identified"] { color: var(--status-major); }
+    .update-status[data-status="monitoring"] { color: var(--slate-300); }
+    .update-status[data-status="resolved"] { color: var(--status-ok-bright); }
+
+    .update-time {
+      margin-left: 8px;
+      font-size: 11px;
+      color: var(--text-tertiary);
+      white-space: nowrap;
+    }
+
+    /* ------------------------------------------------------ components */
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 4px;
+    }
+
+    .section-title {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      color: var(--slate-400);
+    }
+
+    .legend {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 11px;
+      color: var(--text-tertiary);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .legend-swatch {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+    }
+
+    .legend-swatch.ok { background: var(--status-ok); }
+    .legend-swatch.warn { background: var(--status-warn); }
+    .legend-swatch.down { background: var(--status-down); }
+    .legend-swatch.none { background: var(--status-none); }
+
+    .component-list {
+      list-style: none;
+    }
+
+    .component {
+      padding: 26px 0 22px;
+      border-top: 1px solid var(--hairline);
+    }
+
+    .component:first-child {
+      border-top: none;
+    }
+
+    .component-top {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+
+    .component-name {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+      letter-spacing: 0;
+    }
+
+    .component-name-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .component-scope {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-full);
+      padding: 1px 8px;
+      color: var(--text-tertiary);
+      font-size: 10px;
+      font-weight: 700;
+      line-height: 1.5;
+      text-transform: uppercase;
+    }
+
+    .component-desc {
+      margin-top: 2px;
+      font-size: 12.5px;
+      color: var(--text-tertiary);
+    }
+
+    .component-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: var(--radius-full);
+      flex-shrink: 0;
+    }
+
+    .component-status[data-status="operational"] { color: var(--status-ok-bright); }
+    .component-status[data-status="operational"] .status-dot { background: var(--status-ok-bright); }
+    .component-status[data-status="degraded"] { color: var(--status-warn); }
+    .component-status[data-status="degraded"] .status-dot { background: var(--status-warn); }
+    .component-status[data-status="major_outage"] { color: var(--status-down); }
+    .component-status[data-status="major_outage"] .status-dot { background: var(--status-down); }
+    .component-status[data-status="unknown"] { color: var(--text-tertiary); }
+    .component-status[data-status="unknown"] .status-dot { background: var(--text-tertiary); }
+
+    .uptime-bar {
+      display: flex;
+      gap: 2px;
+      height: 32px;
+    }
+
+    .uptime-cell {
+      flex: 1 1 0;
+      min-width: 2px;
+      border-radius: 1.5px;
+      background: var(--status-none);
+      transition: filter var(--transition-fast);
+    }
+
+    .uptime-cell.ok { background: var(--status-ok); }
+    .uptime-cell.warn { background: var(--status-warn); }
+    .uptime-cell.down { background: var(--status-down); }
+
+    .uptime-cell:hover {
+      filter: brightness(1.45);
+    }
+
+    .uptime-meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 10px;
+      font-size: 11px;
+      color: var(--text-tertiary);
+    }
+
+    .uptime-meta-line {
+      flex: 1;
+      height: 1px;
+      background: var(--hairline);
+    }
+
+    .uptime-pct {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-secondary);
+      letter-spacing: 0;
+    }
+
+    .history-placeholder {
       display: flex;
       align-items: center;
       justify-content: space-between;
       flex-wrap: wrap;
-      gap: var(--space-md);
-      backdrop-filter: blur(8px);
-      background: rgba(8, 11, 16, 0.85);
-    }
-
-    .header-left {
-      display: flex;
-      align-items: center;
-      gap: var(--space-md);
-    }
-
-    .header h1 {
-      font-size: var(--text-xl);
-      font-weight: var(--weight-semibold);
-      color: var(--text-primary);
-      letter-spacing: var(--letter-tight);
-    }
-
-    .env-badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 3px 12px;
-      border-radius: 20px;
-      font-size: var(--text-xs);
-      font-weight: var(--weight-semibold);
-      text-transform: uppercase;
-      letter-spacing: var(--letter-wide);
-      background: var(--accent-blue-dim);
-      color: var(--accent-blue);
-      border: 1px solid var(--accent-blue-border);
-    }
-
-    .header-right {
-      display: flex;
-      align-items: center;
-      gap: var(--space-md);
-      font-size: var(--text-sm);
+      gap: 16px;
+      min-height: 44px;
+      padding: 12px 0;
+      border-top: 1px solid var(--hairline);
+      border-bottom: 1px solid var(--hairline);
       color: var(--text-tertiary);
+      font-size: 12px;
     }
 
-    /* Connection indicator */
-    .conn-indicator {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: var(--text-xs);
-      font-weight: var(--weight-medium);
-      text-transform: uppercase;
-      letter-spacing: var(--letter-wide);
-    }
-
-    .conn-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      transition: background var(--transition-base), box-shadow var(--transition-base);
-    }
-
-    .conn-connected .conn-dot {
-      background: var(--status-healthy);
-      box-shadow: 0 0 6px var(--status-healthy-glow);
-    }
-    .conn-connected .conn-label { color: var(--status-healthy); }
-
-    .conn-refreshing .conn-dot {
-      background: var(--status-degraded);
-      box-shadow: 0 0 6px var(--status-degraded-glow);
-    }
-    .conn-refreshing .conn-label { color: var(--status-degraded); }
-
-    .conn-stale .conn-dot {
-      background: var(--status-unhealthy);
-      box-shadow: 0 0 6px var(--status-unhealthy-glow);
-    }
-    .conn-stale .conn-label { color: var(--status-unhealthy); }
-
-    /* -- Stale banner -- */
-    .stale-banner {
-      display: none;
-      background: var(--status-degraded-dim);
-      border-bottom: 1px solid rgba(232, 163, 32, 0.2);
-      padding: var(--space-sm) var(--space-lg);
-      color: var(--status-degraded);
-      font-size: var(--text-sm);
-      font-weight: var(--weight-medium);
-      text-align: center;
-    }
-
-    .stale-banner.visible {
-      display: block;
-    }
-
-    /* -- Main -- */
-    .main {
-      flex: 1;
-      max-width: 960px;
-      width: 100%;
-      margin: 0 auto;
-      padding: var(--space-xl) var(--space-lg);
-    }
-
-    /* -- Error banner -- */
-    .error-banner {
-      display: none;
-      background: var(--status-unhealthy-dim);
-      border: 1px solid rgba(240, 72, 72, 0.2);
-      border-radius: var(--radius-md);
-      padding: var(--space-md);
-      margin-bottom: var(--space-lg);
-      color: var(--status-unhealthy);
-      font-size: var(--text-sm);
-      font-weight: var(--weight-medium);
-      animation: fadeIn var(--transition-base) ease-out;
-    }
-
-    .error-banner.visible {
-      display: block;
-    }
-
-    /* -- Loading skeleton -- */
-    .loading {
-      display: flex;
-      flex-direction: column;
-      gap: var(--space-md);
-      padding: var(--space-xl) 0;
-    }
-
-    .skeleton-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: var(--space-md);
-    }
-
-    @media (max-width: 640px) {
-      .skeleton-grid {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    .skeleton-card {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-lg);
-      padding: var(--space-lg);
-      height: 260px;
-    }
-
-    .skeleton-line {
-      height: 12px;
-      border-radius: 6px;
-      background: linear-gradient(
-        90deg,
-        rgba(72, 92, 120, 0.08) 25%,
-        rgba(72, 92, 120, 0.18) 50%,
-        rgba(72, 92, 120, 0.08) 75%
-      );
-      background-size: 200% 100%;
-      animation: shimmer 1.8s ease-in-out infinite;
-      margin-bottom: var(--space-md);
-    }
-
-    .skeleton-line:first-child { width: 40%; height: 16px; margin-bottom: var(--space-lg); }
-    .skeleton-line:nth-child(2) { width: 70%; }
-    .skeleton-line:nth-child(3) { width: 55%; }
-    .skeleton-line:nth-child(4) { width: 80%; }
-    .skeleton-line:nth-child(5) { width: 60%; }
-    .skeleton-line:nth-child(6) { width: 90%; }
-
-    .skeleton-alarms {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-lg);
-      padding: var(--space-lg);
-      margin-top: var(--space-md);
-    }
-
-    .skeleton-alarms .skeleton-line:first-child { width: 20%; height: 14px; margin-bottom: var(--space-lg); }
-    .skeleton-alarms .skeleton-line:nth-child(2) { width: 60%; }
-    .skeleton-alarms .skeleton-line:nth-child(3) { width: 45%; }
-
-    /* -- Cards grid -- */
-    .cards-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: var(--space-md);
-      margin-bottom: var(--space-lg);
-    }
-
-    @media (max-width: 640px) {
-      .cards-grid {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    /* -- Card (glassmorphism) -- */
-    .card {
-      background: var(--glass-bg);
-      backdrop-filter: blur(var(--glass-blur));
-      -webkit-backdrop-filter: blur(var(--glass-blur));
-      border: 1px solid var(--glass-border);
-      border-radius: var(--radius-lg);
-      padding: var(--space-lg);
-      transition:
-        border-color var(--transition-base),
-        box-shadow var(--transition-slow),
-        background var(--transition-base);
-      animation: fadeIn var(--transition-slow) ease-out both;
-    }
-
-    .card:nth-child(2) {
-      animation-delay: 80ms;
-    }
-
-    .card:hover {
-      border-color: var(--border-hover);
-      background: var(--bg-surface-hover);
-      box-shadow: 0 0 30px -10px rgba(77, 141, 255, 0.06);
-    }
-
-    /* Glow accent on card based on status */
-    .card[data-status="healthy"]:hover {
-      box-shadow: 0 0 30px -10px var(--status-healthy-glow);
-    }
-    .card[data-status="degraded"]:hover {
-      box-shadow: 0 0 30px -10px var(--status-degraded-glow);
-    }
-    .card[data-status="unhealthy"]:hover {
-      box-shadow: 0 0 30px -10px var(--status-unhealthy-glow);
-    }
-
-    .card-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: var(--space-lg);
-      padding-bottom: var(--space-md);
-      border-bottom: 1px solid var(--border-subtle);
-    }
-
-    .card-title {
-      font-size: var(--text-lg);
-      font-weight: var(--weight-semibold);
-      color: var(--text-primary);
-      letter-spacing: var(--letter-tight);
-    }
-
-    /* -- Status indicator -- */
-    .status-indicator {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      font-size: var(--text-sm);
-      font-weight: var(--weight-medium);
-    }
-
-    .status-dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 50%;
-      flex-shrink: 0;
-      transition: background var(--transition-base), box-shadow var(--transition-base);
-    }
-
-    .status-text {
-      transition: color var(--transition-base);
-    }
-
-    .status-healthy .status-dot {
-      background: var(--status-healthy);
-      box-shadow: 0 0 6px var(--status-healthy-glow);
-    }
-    .status-healthy .status-text { color: var(--status-healthy); }
-
-    .status-degraded .status-dot {
-      background: var(--status-degraded);
-      animation: pulse-degraded 2s ease-in-out infinite;
-    }
-    .status-degraded .status-text { color: var(--status-degraded); }
-
-    .status-unhealthy .status-dot {
-      background: var(--status-unhealthy);
-      animation: pulse-unhealthy 1.5s ease-in-out infinite;
-    }
-    .status-unhealthy .status-text { color: var(--status-unhealthy); }
-
-    .status-unknown .status-dot {
-      background: var(--status-unknown);
-    }
-    .status-unknown .status-text { color: var(--status-unknown); }
-
-    /* -- Card body -- */
-    .card-body {
-      display: flex;
-      flex-direction: column;
-      gap: var(--space-sm);
-    }
-
-    .card-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: var(--text-sm);
-      padding: 3px 0;
-    }
-
-    .card-label {
-      color: var(--text-tertiary);
-      font-weight: var(--weight-medium);
-      font-size: var(--text-xs);
-      text-transform: uppercase;
-      letter-spacing: var(--letter-wide);
-    }
-
-    .card-value {
+    .history-placeholder strong {
       color: var(--text-secondary);
-      text-align: right;
+      font-weight: 600;
     }
 
-    /* -- Alarms section -- */
-    .alarms-section {
-      margin-bottom: var(--space-lg);
-      animation: fadeIn var(--transition-slow) ease-out both;
-      animation-delay: 160ms;
+    /* skeleton rows shown before the first successful fetch */
+    .skeleton .component-name,
+    .skeleton .component-desc,
+    .skeleton .component-status {
+      color: transparent;
+      background: var(--bg-tertiary);
+      border-radius: 4px;
+      animation: shimmer 1.6s ease-in-out infinite;
     }
 
-    .section-title {
-      font-size: var(--text-xs);
-      font-weight: var(--weight-semibold);
+    .skeleton .status-dot { display: none; }
+
+    .skeleton .uptime-bar {
+      background: var(--bg-tertiary);
+      border-radius: 2px;
+      animation: shimmer 1.6s ease-in-out infinite;
+    }
+
+    @keyframes shimmer {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.45; }
+    }
+
+    /* --------------------------------------------------- past incidents */
+    .past-incidents {
+      margin-top: 64px;
+    }
+
+    .incident-day {
+      padding: 18px 0;
+      border-top: 1px solid var(--hairline);
+    }
+
+    .incident-day:first-child {
+      border-top: none;
+    }
+
+    .incident-day-date {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text-primary);
+      letter-spacing: 0;
+    }
+
+    .incident-day-empty {
+      margin-top: 4px;
+      font-size: 12.5px;
       color: var(--text-tertiary);
-      text-transform: uppercase;
-      letter-spacing: var(--letter-wide);
-      margin-bottom: var(--space-md);
     }
 
-    .no-alarms {
-      color: var(--text-tertiary);
-      font-size: var(--text-sm);
-      padding: var(--space-sm) 0;
+    .past-incident {
+      margin-top: 12px;
     }
 
-    /* -- Footer -- */
-    .footer {
-      border-top: 1px solid var(--border-subtle);
-      padding: var(--space-lg);
-      text-align: center;
-      font-size: var(--text-xs);
+    .past-incident .incident-title {
+      font-size: 14px;
+    }
+
+    .incident-duration {
+      margin-top: 2px;
+      font-size: 12px;
       color: var(--text-tertiary);
+    }
+
+    /* ----------------------------------------------------------- footer */
+    .site-footer {
+      border-top: 1px solid var(--hairline);
+      padding: 28px 24px 36px;
+    }
+
+    .footer-inner {
+      max-width: 880px;
+      margin: 0 auto;
       display: flex;
       flex-direction: column;
-      align-items: center;
-      gap: var(--space-sm);
+      gap: 14px;
     }
 
-    .footer-links {
+    .footer-row {
       display: flex;
-      justify-content: center;
-      gap: var(--space-md);
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
       flex-wrap: wrap;
     }
 
     .footer-brand {
-      color: var(--text-tertiary);
-      font-weight: var(--weight-medium);
-      letter-spacing: var(--letter-wide);
-      text-transform: uppercase;
-      font-size: 10px;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
     }
 
-    .footer-brand-accent {
-      color: var(--accent-blue);
-    }
-
-    /* -- Content visibility -- */
-    .content {
-      display: none;
-    }
-
-    .content.visible {
+    .footer-brand img {
+      height: 18px;
+      width: auto;
       display: block;
+    }
+
+    .footer-tagline {
+      font-size: 12px;
+      color: var(--slate-400);
+    }
+
+    .footer-links {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      font-size: 12.5px;
+      font-weight: 500;
+      color: var(--text-tertiary);
+    }
+
+    .footer-links a:hover {
+      color: var(--accent-lime);
+    }
+
+    .footer-fine {
+      font-size: 11px;
+      color: var(--text-tertiary);
+    }
+
+    /* ------------------------------------------------------- responsive */
+    @media (max-width: 720px) {
+      .site-header {
+        padding: 18px 18px;
+        gap: 10px;
+      }
+
+      .brand img {
+        height: 24px;
+      }
+
+      .main {
+        padding: 20px 18px 56px;
+      }
+
+      .overall {
+        padding: 24px 0 32px;
+      }
+
+      .overall-title {
+        font-size: 2.1rem;
+      }
+
+      .overall-line {
+        gap: 13px;
+      }
+
+      .overall-orb {
+        width: 14px;
+        height: 14px;
+      }
+
+      .component-top {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+        margin-bottom: 12px;
+      }
+
+      .uptime-bar {
+        height: 26px;
+      }
+
+      .legend {
+        gap: 10px;
+      }
+
+      .footer-row {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 10px;
+      }
+    }
+
+    @media (max-width: 440px) {
+      .header-links {
+        gap: 12px;
+      }
+
+      .legend-item.none {
+        display: none;
+      }
+
+      .overall-title {
+        font-size: 1.85rem;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
     }
   </style>
 </head>
 <body>
-  <header class="header">
-    <div class="header-left">
-      <h1>LayerV NHP Status</h1>
-      <span class="env-badge" id="env-badge" aria-label="Environment">--</span>
-    </div>
-    <div class="header-right">
-      <span class="conn-indicator conn-stale" id="conn-indicator">
-        <span class="conn-dot" aria-hidden="true"></span>
-        <span class="conn-label">Connecting</span>
-      </span>
-      <span>Updated <span id="last-updated">--</span></span>
-    </div>
+  <div class="grid-veil" aria-hidden="true"></div>
+  <a class="skip-link" href="#main">Skip to status</a>
+
+  <header class="site-header">
+    <a class="brand" href="https://layerv.ai" aria-label="LayerV home">
+      <img src="/wordmark.svg" alt="" aria-hidden="true" width="138" height="30">
+    </a>
+    <span class="env-chip" id="env-chip" hidden></span>
+    <nav class="header-links" aria-label="Status page links">
+      <a href="https://layerv.ai/contact">Support</a>
+    </nav>
   </header>
 
-  <div class="stale-banner" id="stale-banner" role="alert" aria-live="polite">
-    Data may be outdated. Last successful update was more than 2 minutes ago.
-  </div>
-
-  <main class="main">
-    <div class="error-banner" id="error-banner" role="alert" aria-live="polite"></div>
-
-    <div class="loading" id="loading" aria-label="Loading status data">
-      <div class="skeleton-grid">
-        <div class="skeleton-card">
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-        </div>
-        <div class="skeleton-card">
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-          <div class="skeleton-line"></div>
-        </div>
+  <main class="main" id="main">
+    <noscript>
+      <div class="notice notice-error">
+        This page needs JavaScript to show live status. If you suspect an
+        incident, contact us at layerv.ai/contact.
       </div>
-      <div class="skeleton-alarms">
-        <div class="skeleton-line"></div>
-        <div class="skeleton-line"></div>
-        <div class="skeleton-line"></div>
-      </div>
+    </noscript>
+
+    <div class="notice notice-error" id="error-banner" role="alert" aria-live="polite"></div>
+    <div class="notice notice-stale" id="stale-banner" role="status" aria-live="polite">
+      Status updates are delayed. Showing the latest data available.
     </div>
 
-    <div class="content" id="content">
-      <div class="cards-grid" role="status" aria-live="polite">
-        <div class="card" id="card-server" aria-label="Server component status">
-          <div class="card-header">
-            <span class="card-title">Server</span>
-            <div class="status-indicator status-unknown" id="status-server">
-              <span class="status-dot" aria-hidden="true"></span>
-              <span class="status-text">Unknown</span>
-            </div>
-          </div>
-          <div class="card-body" id="server-body">
-            <div class="card-row">
-              <span class="card-label">Public Signal</span>
-              <span class="card-value" id="server-summary">--</span>
-            </div>
-          </div>
-        </div>
+    <section class="overall" id="overall" aria-live="polite" data-status="loading">
+      <span class="kicker"><span class="kicker-rule" aria-hidden="true"></span>Live platform status</span>
+      <div class="overall-line">
+        <span class="overall-orb" aria-hidden="true"></span>
+        <h1 class="overall-title" id="overall-title">Checking status&hellip;</h1>
+      </div>
+      <p class="overall-sub" id="overall-sub">Contacting the LayerV monitoring service.</p>
+      <p class="overall-meta">
+        <span id="last-checked">Awaiting first check</span>
+        <span aria-hidden="true"> &middot; </span>
+        <span id="refresh-note">updates about every minute</span>
+      </p>
+    </section>
 
-        <div class="card" id="card-ac" aria-label="Access Controller component status">
-          <div class="card-header">
-            <span class="card-title">Access Controller</span>
-            <div class="status-indicator status-unknown" id="status-ac">
-              <span class="status-dot" aria-hidden="true"></span>
-              <span class="status-text">Unknown</span>
-            </div>
-          </div>
-          <div class="card-body" id="ac-body">
-            <div class="card-row">
-              <span class="card-label">Public Signal</span>
-              <span class="card-value" id="ac-summary">--</span>
-            </div>
-          </div>
+    <section class="active-incidents" id="active-incidents" aria-label="Active incidents"></section>
+
+    <section aria-label="Component status">
+      <div class="section-head">
+        <h2 class="section-title">Components</h2>
+        <div class="legend" aria-hidden="true">
+          <span class="legend-item"><span class="legend-swatch ok"></span>Operational</span>
+          <span class="legend-item"><span class="legend-swatch warn"></span>Degraded</span>
+          <span class="legend-item"><span class="legend-swatch down"></span>Outage</span>
+          <span class="legend-item none"><span class="legend-swatch none"></span>No data</span>
         </div>
       </div>
+      <ol class="component-list" id="component-list">
+        <li class="component skeleton">
+          <div class="component-top">
+            <div><span class="component-name">Loading component</span>
+            <p class="component-desc">Fetching current status and history</p></div>
+            <span class="component-status">Checking</span>
+          </div>
+          <div class="uptime-bar" aria-hidden="true"></div>
+        </li>
+        <li class="component skeleton">
+          <div class="component-top">
+            <div><span class="component-name">Loading component</span>
+            <p class="component-desc">Fetching current status and history</p></div>
+            <span class="component-status">Checking</span>
+          </div>
+          <div class="uptime-bar" aria-hidden="true"></div>
+        </li>
+        <li class="component skeleton">
+          <div class="component-top">
+            <div><span class="component-name">Loading component</span>
+            <p class="component-desc">Fetching current status and history</p></div>
+            <span class="component-status">Checking</span>
+          </div>
+          <div class="uptime-bar" aria-hidden="true"></div>
+        </li>
+      </ol>
+    </section>
 
-      <div class="alarms-section" id="alarms-section" role="status" aria-live="polite">
-        <div class="section-title">Monitoring</div>
-        <div id="alarms-content">
-          <p class="no-alarms">No monitoring data available.</p>
-        </div>
+    <section class="past-incidents" aria-label="Past incidents">
+      <div class="section-head">
+        <h2 class="section-title">Past incidents</h2>
+        <span class="legend">Last 14 days</span>
       </div>
-    </div>
+      <ol class="component-list" id="incident-days"></ol>
+    </section>
   </main>
 
-  <footer class="footer">
-    <div class="footer-links" id="footer-links">
-      <span id="refresh-info">Auto-refreshes every 30s</span>
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <div class="footer-row">
+        <span class="footer-brand">
+          <img src="/wordmark.svg" alt="LayerV" width="83" height="18">
+          <span class="footer-tagline">The Access Layer for Humans and AI Agents</span>
+        </span>
+        <nav class="footer-links" aria-label="LayerV links">
+          <a href="https://layerv.ai">layerv.ai</a>
+          <a href="https://layerv.ai/docs">Docs</a>
+          <a href="https://layerv.ai/contact">Contact</a>
+        </nav>
+      </div>
+      <div class="footer-row">
+        <span class="footer-fine">qURL&trade; is a trademark of LayerV, Inc.</span>
+      </div>
     </div>
-    <span class="footer-brand">Powered by <span class="footer-brand-accent">LayerV NHP</span></span>
   </footer>
 
+  <!-- Rendered by Terraform templatefile(); keep inline JS free of template literals or other interpolation sequences. -->
   <script>
     (function () {
       'use strict';
 
       /* -- Configuration -- */
-      var apiMeta = document.querySelector('meta[name="api-url"]');
-      var API_URL = apiMeta ? apiMeta.getAttribute('content') : null;
-      if (!API_URL) {
-        document.getElementById('loading').style.display = 'none';
-        document.getElementById('error-banner').textContent = 'Status API URL not configured.';
-        document.getElementById('error-banner').classList.add('visible');
-        return;
-      }
+      var feedMeta = document.querySelector('meta[name="status-feed-url"]');
+      var STATUS_FEED_URL = feedMeta ? feedMeta.getAttribute('content') : null;
+      var cadenceMeta = document.querySelector('meta[name="snapshot-cadence-minutes"]');
+      var cadenceMinutes = cadenceMeta ? Number(cadenceMeta.getAttribute('content')) : 5;
 
       var BASE_INTERVAL = 30000;
       var MAX_INTERVAL = 120000;
       var TICK_INTERVAL = 1000;
-      var STALE_THRESHOLD = 120000; /* 2 minutes */
+      var FETCH_STALE_THRESHOLD = 120000;
       var FETCH_TIMEOUT = 10000;
+      var HISTORY_DAYS = 90;
+      var PAST_INCIDENT_DAYS = 14;
+      var MINUTES_PER_SAMPLE = isFinite(cadenceMinutes) && cadenceMinutes > 0 ? cadenceMinutes : 5;
+      var SNAPSHOT_STALE_THRESHOLD = MINUTES_PER_SAMPLE * 2 * 60 * 1000;
+
+      /* Display metadata per component id. Status and history come from the
+         API; names, descriptions, and ordering are presentation concerns and
+         live here. Unknown ids render with a prettified id. */
+      var COMPONENT_META = {
+        qurl_api: {
+          label: 'qURL™ API',
+          desc: 'Programmatic qURL creation and management'
+        },
+        qurl_link: {
+          label: 'qURL Links',
+          desc: 'Secure link redemption and access portal'
+        },
+        nhp_server: {
+          label: 'NHP Server',
+          desc: 'Knock authentication for hidden infrastructure'
+        },
+        nhp_ac: {
+          label: 'NHP Access Controllers',
+          desc: 'Enforcement points that open access for authorized clients'
+        },
+        website: {
+          label: 'Website & Customer Portal',
+          desc: 'Marketing site and customer dashboard'
+        }
+      };
+      var COMPONENT_ORDER = ['qurl_api', 'qurl_link', 'nhp_server', 'nhp_ac', 'website'];
+
+      var STATUS_META = {
+        operational: { label: 'Operational', cls: 'ok' },
+        degraded: { label: 'Degraded performance', cls: 'warn' },
+        major_outage: { label: 'Outage', cls: 'down' },
+        unknown: { label: 'Unknown', cls: 'unknown' }
+      };
+
+      var OVERALL_COPY = {
+        operational: {
+          title: 'All systems operational',
+          sub: 'Every monitored LayerV component is healthy.'
+        },
+        degraded: {
+          title: 'Degraded performance',
+          sub: 'Some components are experiencing reduced performance. Details below.'
+        },
+        major_outage: {
+          title: 'Service disruption',
+          sub: 'One or more components are currently unavailable. Details below.'
+        },
+        unknown: {
+          title: 'Status partially unavailable',
+          sub: 'Some monitoring telemetry is unavailable. Known component details are shown below.'
+        }
+      };
+
+      var IMPACT_LABELS = { minor: 'Minor', major: 'Major', critical: 'Critical' };
 
       /* -- State -- */
       var lastFetchTime = null;
+      var lastSnapshotTime = null;
       var lastData = null;
       var currentInterval = BASE_INTERVAL;
       var consecutiveFailures = 0;
       var refreshTimer = null;
       var abortController = null;
 
-      /* connection: 'connected' | 'refreshing' | 'stale' */
-      var connectionState = 'stale';
-
-      /* -- DOM references -- */
       var els = {
-        loading: document.getElementById('loading'),
-        content: document.getElementById('content'),
+        envChip: document.getElementById('env-chip'),
         errorBanner: document.getElementById('error-banner'),
         staleBanner: document.getElementById('stale-banner'),
-        envBadge: document.getElementById('env-badge'),
-        lastUpdated: document.getElementById('last-updated'),
-        connIndicator: document.getElementById('conn-indicator'),
-        refreshInfo: document.getElementById('refresh-info'),
-        cardServer: document.getElementById('card-server'),
-        cardAc: document.getElementById('card-ac'),
-        statusServer: document.getElementById('status-server'),
-        serverSummary: document.getElementById('server-summary'),
-        statusAc: document.getElementById('status-ac'),
-        acSummary: document.getElementById('ac-summary'),
-        alarmsContent: document.getElementById('alarms-content')
+        overall: document.getElementById('overall'),
+        overallTitle: document.getElementById('overall-title'),
+        overallSub: document.getElementById('overall-sub'),
+        lastChecked: document.getElementById('last-checked'),
+        refreshNote: document.getElementById('refresh-note'),
+        activeIncidents: document.getElementById('active-incidents'),
+        componentList: document.getElementById('component-list'),
+        incidentDays: document.getElementById('incident-days')
       };
 
-      var STATUS_LABELS = {
-        healthy: 'Operational',
-        degraded: 'Degraded',
-        unhealthy: 'Outage',
-        unknown: 'Unknown'
-      };
-
-      /* -- Helpers -- */
-
-      /**
-       * Clear all children of an element and append new nodes.
-       */
-      function replaceContent(el) {
-        while (el.firstChild) {
-          el.removeChild(el.firstChild);
-        }
-        for (var i = 1; i < arguments.length; i++) {
-          var node = arguments[i];
-          if (node != null) {
-            if (typeof node === 'string') {
-              el.appendChild(document.createTextNode(node));
-            } else {
-              el.appendChild(node);
-            }
-          }
-        }
-      }
-
+      /* -- DOM helpers (textContent only, no HTML sinks) -- */
       function createEl(tag, attrs, children) {
         var el = document.createElement(tag);
         if (attrs) {
           for (var key in attrs) {
-            if (attrs.hasOwnProperty(key)) {
+            if (Object.prototype.hasOwnProperty.call(attrs, key)) {
               if (key === 'className') {
                 el.className = attrs[key];
               } else if (key === 'textContent') {
                 el.textContent = attrs[key];
-              } else if (key === 'style' && typeof attrs[key] === 'object') {
-                for (var prop in attrs[key]) {
-                  if (attrs[key].hasOwnProperty(prop)) {
-                    el.style[prop] = attrs[key][prop];
-                  }
-                }
               } else {
                 el.setAttribute(key, attrs[key]);
               }
@@ -773,119 +1058,402 @@
         return el;
       }
 
-      /* -- Connection state machine -- */
-      function setConnectionState(state) {
-        if (connectionState === state) return;
-        connectionState = state;
-        var indicator = els.connIndicator;
-        indicator.className = 'conn-indicator conn-' + state;
-        var label = indicator.querySelector('.conn-label');
-        var labels = { connected: 'Connected', refreshing: 'Refreshing', stale: 'Disconnected' };
-        label.textContent = labels[state] || 'Unknown';
+      function clearEl(el) {
+        while (el.firstChild) {
+          el.removeChild(el.firstChild);
+        }
       }
 
-      /* -- Stale detection -- */
-      function checkStale() {
-        if (!lastFetchTime) return;
-        var age = Date.now() - lastFetchTime;
-        if (age > STALE_THRESHOLD) {
-          els.staleBanner.classList.add('visible');
-          if (connectionState !== 'refreshing') {
-            setConnectionState('stale');
+      /* -- Time helpers -- */
+      function formatRelativeTime(isoString) {
+        if (!isoString) return null;
+        var then = new Date(isoString);
+        if (isNaN(then.getTime())) return null;
+        var seconds = Math.floor((Date.now() - then.getTime()) / 1000);
+        if (seconds < 45) return 'just now';
+        var minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return minutes + 'm ago';
+        var hours = Math.floor(minutes / 60);
+        if (hours < 24) return hours + 'h ago';
+        return Math.floor(hours / 24) + 'd ago';
+      }
+
+      function formatAbsoluteTime(isoString) {
+        if (!isoString) return '';
+        var d = new Date(isoString);
+        if (isNaN(d.getTime())) return '';
+        return d.toUTCString();
+      }
+
+      function parseTimeMs(isoString) {
+        if (!isoString) return null;
+        var d = new Date(isoString);
+        return isNaN(d.getTime()) ? null : d.getTime();
+      }
+
+      function formatDuration(ms) {
+        if (ms == null || isNaN(ms) || ms < 0) return null;
+        var minutes = Math.round(ms / 60000);
+        if (minutes < 1) return 'under a minute';
+        if (minutes < 60) return minutes + 'm';
+        var hours = Math.floor(minutes / 60);
+        var rem = minutes % 60;
+        if (hours < 24) return rem > 0 ? hours + 'h ' + rem + 'm' : hours + 'h';
+        var days = Math.floor(hours / 24);
+        return days + 'd ' + (hours % 24) + 'h';
+      }
+
+      var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      var MONTHS_LONG = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+      function utcDayKey(date) {
+        return date.toISOString().slice(0, 10);
+      }
+
+      function shortDayLabel(date) {
+        return MONTHS[date.getUTCMonth()] + ' ' + date.getUTCDate();
+      }
+
+      function longDayLabel(date) {
+        return MONTHS_LONG[date.getUTCMonth()] + ' ' + date.getUTCDate() + ', ' + date.getUTCFullYear();
+      }
+
+      function lastNDaysUTC(n) {
+        var days = [];
+        var now = Date.now();
+        for (var i = n - 1; i >= 0; i--) {
+          days.push(new Date(now - i * 86400000));
+        }
+        return days;
+      }
+
+      function statusMeta(status) {
+        return STATUS_META[status] || STATUS_META.unknown;
+      }
+
+      function prettifyId(id) {
+        var words = String(id).split('_');
+        for (var i = 0; i < words.length; i++) {
+          if (words[i].length > 0) {
+            words[i] = words[i].charAt(0).toUpperCase() + words[i].slice(1);
           }
-        } else {
-          els.staleBanner.classList.remove('visible');
+        }
+        return words.join(' ');
+      }
+
+      /* -- Overall -- */
+      function renderOverall(data, activeIncidents) {
+        // status_aggregator._derive_incident_overall owns incident severity
+        // rollup; the browser trusts status.json overall and uses incidents
+        // only for display copy below.
+        var overall = data.overall;
+        if (!OVERALL_COPY[overall]) overall = 'unknown';
+
+        els.overall.setAttribute('data-status', overall);
+        els.overallTitle.textContent = OVERALL_COPY[overall].title;
+        els.overallSub.textContent = activeIncidents.length > 0 && overall !== 'operational'
+          ? 'An incident is in progress. Updates below.'
+          : OVERALL_COPY[overall].sub;
+        document.title = (overall === 'operational' ? 'LayerV Status' : 'LayerV Status: ' + OVERALL_COPY[overall].title);
+      }
+
+      /* -- Components -- */
+      function orderedComponents(components) {
+        var byId = {};
+        var extras = [];
+        for (var i = 0; i < components.length; i++) {
+          byId[components[i].id] = components[i];
+        }
+        var ordered = [];
+        for (var j = 0; j < COMPONENT_ORDER.length; j++) {
+          if (byId[COMPONENT_ORDER[j]]) {
+            ordered.push(byId[COMPONENT_ORDER[j]]);
+            delete byId[COMPONENT_ORDER[j]];
+          }
+        }
+        for (var id in byId) {
+          if (Object.prototype.hasOwnProperty.call(byId, id)) extras.push(byId[id]);
+        }
+        extras.sort(function (a, b) {
+          if (a.id === b.id) return 0;
+          return a.id < b.id ? -1 : 1;
+        });
+        return ordered.concat(extras);
+      }
+
+      function dayCellInfo(counts, date) {
+        var label = shortDayLabel(date);
+        if (!counts) {
+          return { cls: '', title: label + ': no data' };
+        }
+        var ok = counts[0] || 0;
+        var degraded = counts[1] || 0;
+        var down = counts[2] || 0;
+        if (down > 0) {
+          return { cls: 'down', title: label + ': outage, about ' + ((degraded + down) * MINUTES_PER_SAMPLE) + 'm affected' };
+        }
+        if (degraded > 0) {
+          return { cls: 'warn', title: label + ': degraded for about ' + (degraded * MINUTES_PER_SAMPLE) + 'm' };
+        }
+        if (ok > 0) {
+          return { cls: 'ok', title: label + ': operational' };
+        }
+        return { cls: '', title: label + ': no data' };
+      }
+
+      function renderComponents(components, history) {
+        clearEl(els.componentList);
+        var days = lastNDaysUTC(HISTORY_DAYS);
+        var ordered = orderedComponents(components);
+
+        for (var i = 0; i < ordered.length; i++) {
+          var comp = ordered[i];
+          var isDisplayOnly = comp.display_only === true;
+          var meta = COMPONENT_META[comp.id] || { label: prettifyId(comp.id), desc: '' };
+          var sMeta = statusMeta(comp.status);
+
+          var statusEl = createEl('span', {
+            className: 'component-status',
+            'data-status': STATUS_META[comp.status] ? comp.status : 'unknown'
+          }, [
+            createEl('span', { className: 'status-dot', 'aria-hidden': 'true' }),
+            sMeta.label
+          ]);
+
+          var nameRow = [
+            createEl('span', { className: 'component-name', textContent: meta.label })
+          ];
+          if (isDisplayOnly) {
+            nameRow.push(createEl('span', {
+              className: 'component-scope',
+              title: 'Tracked for transparency; does not affect overall status.',
+              textContent: 'Informational'
+            }));
+          }
+          var nameBlock = createEl('div', null, [
+            createEl('div', { className: 'component-name-row' }, nameRow),
+            meta.desc ? createEl('p', { className: 'component-desc', textContent: meta.desc }) : null
+          ]);
+
+          /* uptime bar */
+          var bar = createEl('div', { className: 'uptime-bar', 'aria-hidden': 'true' });
+          var totals = [0, 0, 0];
+          for (var d = 0; d < days.length; d++) {
+            var key = utcDayKey(days[d]);
+            var counts = history && history[key] ? history[key][comp.id] : null;
+            if (counts) {
+              totals[0] += counts[0] || 0;
+              totals[1] += counts[1] || 0;
+              totals[2] += counts[2] || 0;
+            }
+            var info = dayCellInfo(counts, days[d]);
+            bar.appendChild(createEl('span', {
+              className: info.cls ? 'uptime-cell ' + info.cls : 'uptime-cell',
+              title: info.title
+            }));
+          }
+
+          var samples = totals[0] + totals[1] + totals[2];
+          var pctText;
+          var historyBlock = bar;
+          var metaRow = null;
+          if (samples === 0) {
+            pctText = 'history starts after launch';
+            historyBlock = createEl('div', { className: 'history-placeholder', role: 'note' }, [
+              createEl('strong', { textContent: 'Uptime history collecting' }),
+              createEl('span', { textContent: 'Bars appear after deployment snapshots are recorded.' })
+            ]);
+          } else {
+            var pct = (totals[0] / samples) * 100;
+            pctText = (pct >= 99.995 ? '100' : pct.toFixed(2)) + '% fully operational';
+            metaRow = createEl('div', { className: 'uptime-meta', 'aria-hidden': 'true' }, [
+              createEl('span', { textContent: HISTORY_DAYS + ' days ago' }),
+              createEl('span', { className: 'uptime-meta-line' }),
+              createEl('span', { className: 'uptime-pct', textContent: pctText }),
+              createEl('span', { className: 'uptime-meta-line' }),
+              createEl('span', { textContent: 'Today' })
+            ]);
+          }
+
+          var srSummary = createEl('span', {
+            className: 'sr-only',
+            textContent: meta.label + ' is ' + sMeta.label.toLowerCase()
+              + (isDisplayOnly ? ' and is informational.' : '')
+              + '. Last ' + HISTORY_DAYS + ' days: ' + pctText + '.'
+          });
+
+          els.componentList.appendChild(createEl('li', { className: 'component' }, [
+            createEl('div', { className: 'component-top' }, [nameBlock, statusEl]),
+            historyBlock,
+            metaRow,
+            srSummary
+          ]));
         }
       }
 
-      /* -- DOM builders -- */
-
-      function setStatusIndicator(el, status) {
-        var normalized = STATUS_LABELS[status] ? status : 'unknown';
-        el.className = 'status-indicator status-' + normalized;
-        el.querySelector('.status-text').textContent = STATUS_LABELS[normalized];
+      /* -- Incidents -- */
+      function incidentComponentNames(incident) {
+        var ids = incident.components;
+        if (!ids || !ids.length) return null;
+        var names = [];
+        for (var i = 0; i < ids.length; i++) {
+          var meta = COMPONENT_META[ids[i]];
+          names.push(meta ? meta.label : prettifyId(ids[i]));
+        }
+        return names.join(', ');
       }
 
-      function statusSummaryText(status) {
-        if (status === 'healthy') return 'No availability impact detected.';
-        if (status === 'degraded') return 'Some availability checks are degraded.';
-        if (status === 'unhealthy') return 'Service availability is impacted.';
-        return 'Availability status is temporarily unavailable.';
+      function createUpdateItem(update) {
+        var statusWord = String(update.status || 'update');
+        var rel = formatRelativeTime(update.at);
+        var item = createEl('li', { className: 'incident-update' }, [
+          createEl('span', {
+            className: 'update-status',
+            'data-status': statusWord.toLowerCase(),
+            textContent: statusWord
+          }),
+          String(update.body || ''),
+          rel ? createEl('span', {
+            className: 'update-time time-tip',
+            title: formatAbsoluteTime(update.at),
+            textContent: rel
+          }) : null
+        ]);
+        return item;
       }
 
-      function renderComponent(prefix, comp) {
-        var cardEl = prefix === 'server' ? els.cardServer : els.cardAc;
-        var summaryEl = prefix === 'server' ? els.serverSummary : els.acSummary;
-        var statusEl = prefix === 'server' ? els.statusServer : els.statusAc;
+      function createIncidentPanel(incident) {
+        var impact = IMPACT_LABELS[incident.impact] ? incident.impact : 'minor';
+        var panel = createEl('div', { className: 'incident-panel', 'data-impact': impact });
 
-        if (!comp) {
-          setStatusIndicator(statusEl, 'unknown');
-          summaryEl.textContent = statusSummaryText('unknown');
-          cardEl.removeAttribute('data-status');
+        var head = createEl('div', { className: 'incident-head' }, [
+          createEl('span', { className: 'impact-chip', 'data-impact': impact, textContent: IMPACT_LABELS[impact] }),
+          createEl('span', { className: 'incident-title', textContent: String(incident.title || 'Incident') })
+        ]);
+        panel.appendChild(head);
+
+        var affects = incidentComponentNames(incident);
+        if (affects) {
+          panel.appendChild(createEl('p', { className: 'incident-affects', textContent: 'Affects: ' + affects }));
+        }
+
+        var updates = incident.updates || [];
+        if (updates.length > 0) {
+          var list = createEl('ul', { className: 'incident-updates' });
+          /* newest first */
+          var sorted = updates.slice().sort(function (a, b) {
+            return new Date(b.at || 0).getTime() - new Date(a.at || 0).getTime();
+          });
+          for (var i = 0; i < sorted.length; i++) {
+            list.appendChild(createUpdateItem(sorted[i]));
+          }
+          panel.appendChild(list);
+        }
+
+        return panel;
+      }
+
+      function renderActiveIncidents(active) {
+        clearEl(els.activeIncidents);
+        if (active.length === 0) {
+          els.activeIncidents.classList.remove('visible');
           return;
         }
-
-        var status = comp.status || 'unknown';
-        setStatusIndicator(statusEl, status);
-        summaryEl.textContent = statusSummaryText(status);
-        cardEl.setAttribute('data-status', status);
+        for (var i = 0; i < active.length; i++) {
+          els.activeIncidents.appendChild(createIncidentPanel(active[i]));
+        }
+        els.activeIncidents.classList.add('visible');
       }
 
-      function renderAlarms(alarms) {
-        if (!alarms) {
-          replaceContent(els.alarmsContent, createEl('p', {
-            className: 'no-alarms',
-            textContent: 'No monitoring data available.'
-          }));
-          return;
+      function renderPastIncidents(resolved) {
+        clearEl(els.incidentDays);
+        var days = lastNDaysUTC(PAST_INCIDENT_DAYS).reverse();
+        var byDay = {};
+        for (var i = 0; i < resolved.length; i++) {
+          var inc = resolved[i];
+          var startedMs = parseTimeMs(inc.started_at);
+          var resolvedMs = parseTimeMs(inc.resolved_at);
+          var ts = resolvedMs != null ? resolvedMs : startedMs;
+          if (startedMs != null && resolvedMs != null) ts = Math.max(startedMs, resolvedMs);
+          if (ts == null) continue;
+          var dt = new Date(ts);
+          var key = utcDayKey(dt);
+          if (!byDay[key]) byDay[key] = [];
+          byDay[key].push(inc);
         }
 
-        var activeCount = alarms.active_count || 0;
-        var okCount = alarms.ok_count || 0;
-
-        if (activeCount === 0 && okCount === 0) {
-          replaceContent(els.alarmsContent, createEl('p', {
-            className: 'no-alarms',
-            textContent: 'No monitoring signals configured.'
-          }));
-          return;
+        for (var d = 0; d < days.length; d++) {
+          var dayKey = utcDayKey(days[d]);
+          var block = createEl('li', { className: 'incident-day' }, [
+            createEl('h3', { className: 'incident-day-date', textContent: longDayLabel(days[d]) })
+          ]);
+          var entries = byDay[dayKey];
+          if (!entries || entries.length === 0) {
+            block.appendChild(createEl('p', { className: 'incident-day-empty', textContent: 'No incidents reported.' }));
+          } else {
+            for (var e = 0; e < entries.length; e++) {
+              var incident = entries[e];
+              var impact = IMPACT_LABELS[incident.impact] ? incident.impact : 'minor';
+              var item = createEl('div', { className: 'past-incident' }, [
+                createEl('div', { className: 'incident-head' }, [
+                  createEl('span', { className: 'impact-chip', 'data-impact': impact, textContent: IMPACT_LABELS[impact] }),
+                  createEl('span', { className: 'incident-title', textContent: String(incident.title || 'Incident') })
+                ])
+              ]);
+              if (incident.started_at && incident.resolved_at) {
+                var incidentStartedMs = parseTimeMs(incident.started_at);
+                var incidentResolvedMs = parseTimeMs(incident.resolved_at);
+                if (incidentStartedMs != null && incidentResolvedMs != null) {
+                  var dur = formatDuration(incidentResolvedMs - incidentStartedMs);
+                  if (dur) {
+                    item.appendChild(createEl('p', { className: 'incident-duration', textContent: 'Resolved after ' + dur }));
+                  }
+                }
+              }
+              var updates = incident.updates || [];
+              if (updates.length > 0) {
+                var list = createEl('ul', { className: 'incident-updates' });
+                var sorted = updates.slice().sort(function (a, b) {
+                  return new Date(b.at || 0).getTime() - new Date(a.at || 0).getTime();
+                });
+                for (var u = 0; u < sorted.length; u++) {
+                  list.appendChild(createUpdateItem(sorted[u]));
+                }
+                item.appendChild(list);
+              }
+              block.appendChild(item);
+            }
+          }
+          els.incidentDays.appendChild(block);
         }
-
-        var container = document.createDocumentFragment();
-
-        if (activeCount > 0) {
-          container.appendChild(createEl('p', {
-            className: 'no-alarms',
-            textContent: activeCount + ' active monitoring signal' + (activeCount === 1 ? '' : 's') + '.'
-          }));
-        }
-
-        if (activeCount === 0) {
-          container.appendChild(createEl('p', {
-            className: 'no-alarms',
-            textContent: 'All public monitoring signals are normal.'
-          }));
-        }
-
-        replaceContent(els.alarmsContent, container);
       }
 
-      /* -- Render -- */
+      /* -- Render root -- */
       function render(data) {
         lastData = data;
-        els.envBadge.textContent = data.environment || '--';
 
-        var components = data.components || {};
+        if (data.environment && data.environment !== 'prod') {
+          els.envChip.textContent = data.environment;
+          els.envChip.hidden = false;
+        } else {
+          els.envChip.hidden = true;
+        }
 
-        renderComponent('server', components.server);
-        renderComponent('ac', components.ac);
-        renderAlarms(data.alarms);
+        var incidents = data.incidents || [];
+        var active = [];
+        var resolved = [];
+        for (var i = 0; i < incidents.length; i++) {
+          if (incidents[i] && incidents[i].status === 'resolved') resolved.push(incidents[i]);
+          else if (incidents[i]) active.push(incidents[i]);
+        }
 
-        els.loading.style.display = 'none';
-        els.content.classList.add('visible');
+        renderOverall(data, active);
+        renderActiveIncidents(active);
+        renderComponents(data.components || [], data.history || {});
+        renderPastIncidents(resolved);
       }
 
-      /* -- Error handling -- */
+      /* -- Banners -- */
       function showError(msg) {
         els.errorBanner.textContent = msg;
         els.errorBanner.classList.add('visible');
@@ -895,109 +1463,105 @@
         els.errorBanner.classList.remove('visible');
       }
 
-      /* -- Tick updates -- */
-      function updateLastUpdated() {
-        if (!lastFetchTime) {
-          els.lastUpdated.textContent = '--';
-          return;
-        }
-        var diffMs = Date.now() - lastFetchTime;
-        var seconds = Math.floor(diffMs / 1000);
-        if (seconds < 5) {
-          els.lastUpdated.textContent = 'just now';
-        } else if (seconds < 60) {
-          els.lastUpdated.textContent = seconds + 's ago';
+      function checkStale() {
+        var now = Date.now();
+        var fetchStale = lastFetchTime !== null && now - lastFetchTime > FETCH_STALE_THRESHOLD;
+        var snapshotStale = lastSnapshotTime !== null && now - lastSnapshotTime > SNAPSHOT_STALE_THRESHOLD;
+        if (fetchStale || snapshotStale) {
+          els.staleBanner.classList.add('visible');
         } else {
-          var minutes = Math.floor(seconds / 60);
-          els.lastUpdated.textContent = minutes + 'm ago';
+          els.staleBanner.classList.remove('visible');
         }
       }
 
-      function updateRefreshInfo() {
-        var seconds = Math.round(currentInterval / 1000);
-        els.refreshInfo.textContent = 'Auto-refreshes every ' + seconds + 's';
+      function updateLastChecked() {
+        var referenceTime = lastSnapshotTime !== null ? lastSnapshotTime : lastFetchTime;
+        if (referenceTime === null) return;
+        var seconds = Math.floor((Date.now() - referenceTime) / 1000);
+        var text;
+        if (seconds < 5) text = 'Updated just now';
+        else if (seconds < 60) text = 'Updated ' + seconds + 's ago';
+        else text = 'Updated ' + Math.floor(seconds / 60) + 'm ago';
+        els.lastChecked.textContent = text;
+        els.lastChecked.title = lastData && lastData.timestamp ? formatAbsoluteTime(lastData.timestamp) : '';
       }
 
-      /* -- Backoff logic -- */
-      function onFetchSuccess() {
-        consecutiveFailures = 0;
-        currentInterval = BASE_INTERVAL;
-        setConnectionState('connected');
-        updateRefreshInfo();
-        scheduleNextFetch();
-      }
-
-      function onFetchFailure() {
-        consecutiveFailures++;
-        /* Exponential backoff: 30s -> 60s -> 120s (capped) */
-        currentInterval = Math.min(BASE_INTERVAL * Math.pow(2, consecutiveFailures), MAX_INTERVAL);
-        if (connectionState !== 'stale') {
-          /* Only go stale if data is old enough, otherwise just mark as not-connected */
-          var age = lastFetchTime ? (Date.now() - lastFetchTime) : Infinity;
-          if (age > STALE_THRESHOLD) {
-            setConnectionState('stale');
-          }
+      function updateRefreshNote() {
+        if (consecutiveFailures === 0) {
+          els.refreshNote.textContent = 'updates about every minute';
+        } else {
+          els.refreshNote.textContent = 'retrying every ' + Math.round(currentInterval / 1000) + ' seconds';
         }
-        updateRefreshInfo();
-        scheduleNextFetch();
       }
 
+      /* -- Fetch loop with backoff -- */
       function scheduleNextFetch() {
         if (refreshTimer) clearTimeout(refreshTimer);
         refreshTimer = setTimeout(fetchStatus, currentInterval);
       }
 
-      /* -- Fetch -- */
-      function fetchStatus() {
-        /* Abort any in-flight request */
-        if (abortController) {
-          abortController.abort();
-        }
-        abortController = new AbortController();
+      function onFetchSuccess() {
+        consecutiveFailures = 0;
+        currentInterval = BASE_INTERVAL;
+        updateRefreshNote();
+        scheduleNextFetch();
+      }
 
-        setConnectionState('refreshing');
+      function onFetchFailure() {
+        consecutiveFailures++;
+        currentInterval = Math.min(BASE_INTERVAL * Math.pow(2, consecutiveFailures), MAX_INTERVAL);
+        updateRefreshNote();
+        scheduleNextFetch();
+      }
+
+      function fetchStatus() {
+        if (abortController) abortController.abort();
+        abortController = new AbortController();
 
         var timeoutId = setTimeout(function () {
           if (abortController) abortController.abort();
         }, FETCH_TIMEOUT);
 
-        fetch(API_URL, { signal: abortController.signal })
+        fetch(STATUS_FEED_URL, { signal: abortController.signal, cache: 'no-store' })
           .then(function (response) {
             clearTimeout(timeoutId);
-            if (!response.ok) {
-              throw new Error('HTTP ' + response.status);
-            }
+            if (!response.ok) throw new Error('HTTP ' + response.status);
             return response.json();
           })
           .then(function (data) {
             lastFetchTime = Date.now();
+            lastSnapshotTime = parseTimeMs(data.timestamp);
             hideError();
+            checkStale();
             render(data);
+            updateLastChecked();
             onFetchSuccess();
           })
           .catch(function (err) {
             clearTimeout(timeoutId);
-            if (err.name === 'AbortError') {
-              showError('Status request timed out.');
-            } else if (err.message && err.message.indexOf('HTTP ') === 0) {
-              showError('Status endpoint returned ' + err.message + '.');
-            } else {
-              showError('Unable to reach status endpoint.');
-            }
-            /* Show content even on error so stale data is visible */
             if (!lastData) {
-              els.loading.style.display = 'none';
-              els.content.classList.add('visible');
+              els.overall.setAttribute('data-status', 'unknown');
+              els.overallTitle.textContent = OVERALL_COPY.unknown.title;
+              els.overallSub.textContent = OVERALL_COPY.unknown.sub;
+            }
+            if (err && err.name === 'AbortError') {
+              showError('The status check timed out. Retrying automatically.');
+            } else {
+              showError('We could not load live status data. Retrying automatically.');
             }
             onFetchFailure();
           });
       }
 
       /* -- Init -- */
-      fetchStatus();
+      if (!STATUS_FEED_URL) {
+        showError('Status feed is not configured for this deployment.');
+        return;
+      }
 
+      fetchStatus();
       setInterval(function () {
-        updateLastUpdated();
+        updateLastChecked();
         checkStale();
       }, TICK_INTERVAL);
     })();
