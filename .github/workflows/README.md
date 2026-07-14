@@ -218,7 +218,26 @@ Automated pipeline (weekdays 7am UTC): check for pending changes → deploy to s
 | `build-binaries.yml` | Build release binaries |
 | `codeql.yml` | GitHub CodeQL security analysis |
 | `claude-code-review.yml` | AI code review on PRs |
-| `claude.yml` | Claude Code agent for issue triage |
+| `claude.yml` | Claude Code for issue triage and PR slash commands (explicit model pin) |
 | `release-please.yml` | Automated changelog and version bumps |
 | `dependabot-go-tidy.yml` | Auto-fix `go mod tidy` for Dependabot PRs |
 | `prod-rollout-tasks.yml` | Enforce the PR Prod Rollout Tasks checkbox and task-ledger diff contract |
+
+### Updating the Claude model pin
+
+The Claude workflows intentionally use the same proven model. A model upgrade
+must make all of these changes in one PR:
+
+1. Validate the candidate model with the repository credential.
+2. Update `claude_args` in both `claude.yml` and `claude-code-review.yml`.
+3. Add the validated model to `PROVEN_MODELS` in
+   `scripts/check-claude-model-lockstep.py`.
+4. Update the current-pin assertions in
+   `tests/scripts/test_check_claude_model_lockstep.py` when the pinned model
+   changes.
+5. Run `make lint-workflows`.
+
+Keep each `claude_args` value on one single-quoted line and set the model only
+through `--model`. Alternate scalar forms, embedded single quotes, native
+`model:` inputs, and one-sided or unproven pins require an explicit guard design
+change rather than a workflow-only edit.

@@ -33,6 +33,17 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@593d7a5c4e0073569f74772c2b7b64c30ec14707 # v1
+        uses: anthropics/claude-code-action@593d7a5c4e0073569f74772c2b7b64c30ec14707 # v1.0.141
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Keep comment-triggered analysis on the same proven model as the
+          # automatic PR review. The action's implicit default may select the
+          # 1M-context variant, which this repository credential cannot start.
+          # scripts/check-claude-model-lockstep.py enforces this coupling.
+          # Do not add extra allowed tools by default: the action's base GitHub
+          # tools are sufficient here. Its contents, pull-request, and issue
+          # permissions are read-only; id-token: write permits OIDC token
+          # minting but does not grant repository writes. The automatic
+          # review workflow adds its narrow gh command allowlist because its
+          # explicit prompt needs PR inspection.
+          claude_args: '--model claude-opus-4-8'

@@ -365,7 +365,8 @@ lint-cis-metric-filter-patterns:
 #   - validate-workflows.yml       → actionlint + shellcheck + scope-drift
 #   - validate-issue-templates.yml → shim to ops-routines-workflows reusable
 # `make lint-workflows` runs the equivalent of both locally.
-# Requires actionlint, shellcheck, check-jsonschema, Go, Node.js, and python3+PyYAML
+# Requires actionlint, shellcheck, check-jsonschema, Go, Node.js, and Python
+# 3.10+ with PyYAML
 # on PATH:
 #   macOS:  brew install actionlint shellcheck go node && pipx install 'check-jsonschema==0.37.1'
 #           && python3 -m pip install pyyaml
@@ -402,7 +403,18 @@ lint-workflows:
 		echo "$(COLOUR_RED)[OpenNHP] go not found. Install the Go toolchain pinned by endpoints/go.mod to run relay dependency lockstep tests$(END_COLOUR)"; \
 		exit 1; \
 	}
+	@command -v python3 >/dev/null 2>&1 || { \
+		echo "$(COLOUR_RED)[OpenNHP] python3 not found. Install Python 3.10 or newer to run workflow contract checks$(END_COLOUR)"; \
+		exit 1; \
+	}
+	@python3 -c 'import sys; sys.version_info >= (3, 10) or sys.exit("[OpenNHP] Python 3.10 or newer is required for workflow contract checks")'
+	@python3 -c 'import yaml' 2>/dev/null || { \
+		echo "$(COLOUR_RED)[OpenNHP] PyYAML not found. Install: python3 -m pip install pyyaml$(END_COLOUR)"; \
+		exit 1; \
+	}
 	@actionlint -color -shellcheck "$$(command -v shellcheck)" .github/workflows/*.yml
+	@python3 tests/scripts/test_check_claude_model_lockstep.py
+	@python3 scripts/check-claude-model-lockstep.py
 	@bash scripts/lint-issue-templates.sh
 	@bash tests/scripts/check-scope-drift_test.sh
 	@bash scripts/check-scope-drift.sh

@@ -16,6 +16,7 @@ on:
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
       - "scripts/check-go-version-drift.sh"
+      - "scripts/check-claude-model-lockstep.py"
       - "scripts/check-disable-agent-validation.sh"
       - "scripts/check-smoke-tier-filter-coverage.sh"
       # run-smoke.sh now owns the tier -> RUN_FILTER mapping that
@@ -239,6 +240,19 @@ jobs:
           set -euo pipefail
           python3 -m pip --version
           python3 -m pip install --no-cache-dir pyyaml
+
+      # Both Claude entry points must use the same explicit model. Without this
+      # fence, comment-triggered /simplify can drift back to an action default
+      # that the repository credential cannot start while automatic review stays
+      # green on its separately pinned model. These steps intentionally follow
+      # Install PyYAML because the guard uses the composed YAML node tree to
+      # enforce action-step structure and scalar style without indentation
+      # heuristics.
+      - name: Test Claude workflow model lockstep fixtures
+        run: python3 tests/scripts/test_check_claude_model_lockstep.py
+
+      - name: Check Claude workflow model lockstep
+        run: python3 scripts/check-claude-model-lockstep.py
 
       # resolve-app-image-required_test.sh verifies that the relay image's
       # hand-maintained path list covers the actual Go import surface. Pin and
