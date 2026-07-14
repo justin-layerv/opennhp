@@ -2254,8 +2254,9 @@ func (s *UdpServer) SendPacket(pkt *core.Packet, conn *UdpConn) (n int, err erro
 	}()
 
 	pktType := core.HeaderTypeToString(pkt.HeaderType)
-	log.Info("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddrStr, conn.ConnData.RemoteAddr.String(), len(pkt.Content))
-	log.Evaluate("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddrStr, conn.ConnData.RemoteAddr.String(), len(pkt.Content))
+	remoteAddrStr := conn.ConnData.RemoteAddr.String()
+	log.Info("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddrStr, remoteAddrStr, len(pkt.Content))
+	log.Evaluate("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddrStr, remoteAddrStr, len(pkt.Content))
 
 	if conn.isWebRTC && conn.dc != nil {
 		err = conn.dc.Send(pkt.Content)

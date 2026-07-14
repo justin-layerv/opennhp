@@ -1782,15 +1782,17 @@ func (a *UdpAC) SendPacket(pkt *core.Packet, conn *UdpConn) (n int, err error) {
 	}()
 
 	pktType := core.HeaderTypeToString(pkt.HeaderType)
-	//log.Debug("Send [%s] packet (%s -> %s): %+v", pktType, conn.ConnData.LocalAddr.String(), conn.ConnData.RemoteAddr.String(), pkt.Content)
-	log.Info("Send [%s] packet (%s -> %s), %d bytes", pktType, conn.ConnData.LocalAddr.String(), conn.ConnData.RemoteAddr.String(), len(pkt.Content))
-	log.Evaluate("Send [%s] packet (%s -> %s, %d bytes)", pktType, conn.ConnData.LocalAddr.String(), conn.ConnData.RemoteAddr.String(), len(pkt.Content))
+	localAddrStr := conn.ConnData.LocalAddr.String()
+	remoteAddrStr := conn.ConnData.RemoteAddr.String()
+	log.Info("Send [%s] packet (%s -> %s), %d bytes", pktType, localAddrStr, remoteAddrStr, len(pkt.Content))
+	log.Evaluate("Send [%s] packet (%s -> %s, %d bytes)", pktType, localAddrStr, remoteAddrStr, len(pkt.Content))
 	// Use WriteToUDP with explicit destination since we use unconnected sockets
 	return conn.netConn.WriteToUDP(pkt.Content, conn.ConnData.RemoteAddr)
 }
 
 func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 	addrStr := conn.ConnData.RemoteAddr.String()
+	localAddrStr := conn.ConnData.LocalAddr.String()
 
 	defer conn.ConnData.Done()
 	defer log.Debug("recvPacketRoutine for %s stopped", addrStr)
@@ -1844,12 +1846,12 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 
 		typ, _, err := a.device.RecvPrecheck(pkt)
 		msgType := core.HeaderTypeToString(typ)
-		log.Info("Receive [%s] packet (%s -> %s), %d bytes", msgType, actualSource, conn.ConnData.LocalAddr.String(), n)
-		log.Evaluate("Receive [%s] packet (%s -> %s), %d bytes", msgType, actualSource, conn.ConnData.LocalAddr.String(), n)
+		log.Info("Receive [%s] packet (%s -> %s), %d bytes", msgType, actualSource, localAddrStr, n)
+		log.Evaluate("Receive [%s] packet (%s -> %s), %d bytes", msgType, actualSource, localAddrStr, n)
 		if err != nil {
 			a.device.ReleasePoolPacket(pkt)
-			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, actualSource, conn.ConnData.LocalAddr.String(), err)
-			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, actualSource, conn.ConnData.LocalAddr.String(), err)
+			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, actualSource, localAddrStr, err)
+			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, actualSource, localAddrStr, err)
 			continue
 		}
 
@@ -1867,6 +1869,7 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 
 func (a *UdpAC) connectionRoutine(conn *UdpConn) {
 	addrStr := conn.ConnData.RemoteAddr.String()
+	localAddrStr := conn.ConnData.LocalAddr.String()
 
 	defer a.wg.Done()
 	defer log.Debug("Connection routine: %s stopped", addrStr)
@@ -1946,7 +1949,7 @@ func (a *UdpAC) connectionRoutine(conn *UdpConn) {
 
 			if pkt.HeaderType == core.NHP_KPL {
 				a.device.ReleasePoolPacket(pkt)
-				log.Info("Receive [NHP_KPL] message (%s -> %s)", addrStr, conn.ConnData.LocalAddr.String())
+				log.Info("Receive [NHP_KPL] message (%s -> %s)", addrStr, localAddrStr)
 				continue
 			}
 
