@@ -877,8 +877,6 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 		return ErrAEADDecryptionFailed.WithExtra(err)
 	}
 
-	//log.Debug("decrypted body: %v, input: %v", body, ppd.basePacket.Content[ppd.header.Size():])
-
 	// Note: ppd.BodyMessage must be a separate []byte slice because ppd.BasePacket.Buf will be released later
 	if ppd.BodyCompress {
 		buf := getBytesBuffer()
@@ -1052,7 +1050,9 @@ func (ppd *PacketParserData) sendCookie() {
 		Message:        cokBytes,
 	}
 
-	log.Debug("Send cookie back to %s: %s ", ppd.ConnData.RemoteAddr, string(md.Message))
+	// The cookie is a short-lived bearer capability. Keep the destination and
+	// payload size for diagnostics without persisting the credential itself.
+	log.Debug("Send cookie back to %s (%d bytes)", ppd.ConnData.RemoteAddr, len(md.Message))
 	ppd.device.SendMsgToPacket(md)
 }
 

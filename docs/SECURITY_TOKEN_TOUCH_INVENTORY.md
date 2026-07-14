@@ -26,12 +26,16 @@ checked against it.
 | AC access token | 32 opaque bytes, base64-StdEncoding (44 chars) | `UdpAC.GenerateAccessToken` | `ACOpsResultMsg.ACToken`, `PreAccessInfo.ACToken`, `ServerKnockAckMsg.ACTokens`, `AgentAccessMsg.ACToken`, `HttpRefreshRequest.Token` |
 | NHP session JWT / refresh JWT | HS256 JWT | passcode plugin (`JWTToken.GenerateAll`) | `nhp_token` cookie, `nhpplugins.RefreshResponse.NHPToken` / `.NHPRefreshToken` |
 | AuthProviderToken (`aspToken`) | provider-issued bearer | upstream auth service | `ServerKnockAckMsg.AuthProviderToken` |
+| Agent enrollment credential | durable API-key secret, one-shot key, or emailed OTP | qurl-service / account owner | `AgentRegisterMsg.OTP`, `AgentOTPMsg.Passcode` |
+| Overload challenge cookie | opaque process- or fleet-key-derived bytes | NHP server `sendCookie` | `ServerCookieMsg.Cookie`, then the `NHP_RKN` header HMAC |
 
 The redaction contract for a token *value* is `common.RedactToken` (Go), which
 keeps the first `tokenLogPrefixLen` (= 8) characters and appends an ellipsis.
 For a *URL query string* that may carry `token=`, the server uses
 `redactSensitiveQuery` (replaces the `token` param with `[REDACTED]`, no-op
-otherwise). Non-Go components pin the same 8-char prefix convention.
+otherwise). Non-Go components pin the same 8-char prefix convention. Enrollment
+credentials, cookies, and opaque protocol bodies have a stricter contract:
+omit the value entirely and log only non-secret type/size metadata.
 
 ## Audit method
 
@@ -45,8 +49,15 @@ catches dumps under variable names that never contain the word "token" (e.g.
 
 A second pass covered **raw `%s` of response/body strings** (`string(body)`,
 `string(respBody)`, `io.ReadAll` results) — a class the struct-dump pass
-misses because the bytes have no Go type. That pass found the IAM `200`-body
-log below; the remaining hits are non-`200` *error* bodies (see out-of-scope).
+misses because the bytes have no Go type. It includes the generic NHP core,
+where every asynchronous outbound plaintext and recovered inbound plaintext
+previously reached debug/evaluate logs regardless of the typed caller. Those
+core sites and the cookie-specific diagnostic now emit type/size metadata
+only. For a successful round-trip, the outbound pre-compression and inbound
+post-decompression plaintext byte counts are expected to match; the core
+redaction canary test pins both to the same marshalled body length. The pass
+also found the IAM `200`-body log below; the remaining hits are non-`200`
+*error* bodies (see out-of-scope).
 
 A third pass covered **inbound request credentials** — `Authorization` /
 `Cookie` headers and `ctx.Request.URL.RawQuery` (the `nhp_token` cookie and the
@@ -61,6 +72,8 @@ Status legend: **FIXED** = changed in the PR that introduced this doc; **SAFE**
 
 | Site | Token reachable | How touched | Status |
 |---|---|---|---|
+| [`nhp/core/device.go`](../nhp/core/device.go) `msgToPacketRoutine` / `packetToMsgRoutine` | every token or credential carried by an asynchronous NHP body, including REG/OTP enrollment secrets and ACK access tokens | `%s` of the complete plaintext before encryption and after decryption at debug **and** evaluate levels — active generic leak | **FIXED** → header type + plaintext byte length only (post-decompression, not wire-packet size); REG/OTP/ACK canaries are fenced by `TestDeviceAsyncLogsRedactProtocolBodies` |
+| [`nhp/core/responder.go`](../nhp/core/responder.go) `sendCookie` | overload challenge cookie | `%s` of the complete `ServerCookieMsg` JSON at debug level | **FIXED** → destination + byte length only; cookie canary covered by the same core test |
 | [`endpoints/server/staticplugins/passcode/main.go`](../endpoints/server/staticplugins/passcode/main.go) `AuthWithHttpRefresh` (invalid-token branch) | NHP session JWT (validated then rejected) | `%s` of full `nHPToken` — **active leak** | **FIXED** → `common.RedactToken` |
 | [`endpoints/server/staticplugins/passcode/main.go`](../endpoints/server/staticplugins/passcode/main.go) `log.Info("Done %+v", resp)` | `RefreshResponse.NHPToken` + `.NHPRefreshToken` | `%+v` struct dump — **active leak** | **FIXED** → log only the sanitized redirect URL (scheme/host/path) |
 | `nhpplugins.GetRedirectUrlByResource` calls from passcode/OIDC | redirect `access_token` JWT | SDK `v0.1.30` always appends `access_token` to the redirect query and logs the generated token internally (`ServiceInfo JSON...`) — **active leak** | **FIXED** → in-repo `staticplugins/internal/redirecturl.GetByResource` preserves the client URL but emits only sanitized, query/fragment-free logs |
@@ -77,10 +90,11 @@ Status legend: **FIXED** = changed in the PR that introduced this doc; **SAFE**
 | `Authorization` header (`authAccessFromRaaS`) / `nhp_token` cookie | forwarded bearer / session JWT | only presence/absence logged (`"Authorization header is empty"`, `"nhp_token cookie missing"`) — value never logged | SAFE |
 | [`endpoints/ac/httpac.go`](../endpoints/ac/httpac.go) `/refresh` request log | AC access token | `get refresh request` log line | SAFE — already `common.RedactToken` |
 | [`nhp/common/tokenstore.go`](../nhp/common/tokenstore.go) (expire/panic) ×2 | AC access token | store maintenance logs | SAFE — already `common.RedactToken` |
+| [`nhp/core/responder.go`](../nhp/core/responder.go) server header-digest failure | overload challenge cookie / `NHP_RKN` digest | logs `sumCookie` with `%v` | SAFE — `sumCookie` is only the boolean "include cookie in digest" decision; no cookie or HMAC bytes are logged |
 | [`endpoints/ac/msghandler.go`](../endpoints/ac/msghandler.go) `udpTempAccessHandler` | — | `%+v pkt.Content` of an `NHP_ACC` packet, `log.Trace` | SAFE — content is still **ciphertext** at this point (decrypt happens after `PacketData` is built two lines below) |
 | passcode `ackMsg.ResourceHost` ×5; `qurl`/`oidc` `ackMsg.ResourceHost`/`ErrMsg` | — | specific non-token field only | SAFE |
 | passcode `knock succeeded.%+v res.Resources` ×2 | — | dumps the resource-target sub-field; config secrets (`AppSecret`/`SecretKey`/`ExInfo`) are siblings on `ResourceData`, not in `.Resources` | SAFE (see out-of-scope note) |
-| [`endpoints/agent/knock.go`](../endpoints/agent/knock.go) | `AgentAccessMsg.ACToken` | assigns `info.ACToken` to the outbound struct; all logs use `accMsg.UserId` only — **token never logged** | SAFE |
+| [`endpoints/agent/knock.go`](../endpoints/agent/knock.go) | `AgentAccessMsg.ACToken` | assigns `info.ACToken` to the outbound struct; adapter logs use `accMsg.UserId` only and the generic core logs body metadata only | SAFE |
 
 ## Config-secret log sites
 
@@ -148,7 +162,9 @@ components are tracked explicitly in
 `AgentAccessMsg` (agent→AC), `PreAccessInfo` (embedded). These are
 JSON-marshalled onto the encrypted NHP wire; the tokens are protected by the
 transport cipher. The risk is only when one of these structs is **logged** —
-covered by the log-site table above.
+covered by the log-site table above. Generic core transport diagnostics must
+remain body-agnostic: header type and byte length are allowed; plaintext or a
+redacted prefix is not.
 
 ## Replay-window decision
 
@@ -170,6 +186,18 @@ this PR; the decision is recorded here per acceptance criterion 3.
 These surfaced during the sweep but are **not** access tokens and are not
 changed here, to keep the audit scoped to #1426:
 
+- **Plaintext user passcodes** are logged verbatim by multiple success and
+  failure paths in `endpoints/server/staticplugins/passcode`; one failure also
+  embeds the supplied secret in its returned Go error. This is an active
+  credential leak with an omit-entirely (no prefix) contract, tracked in
+  [#3159](https://github.com/layervai/nhp/issues/3159).
+- **Complete etcd configuration bodies** are logged at Info by
+  `UdpServer.updateEtcdConfig` before parsing. Remote config can contain
+  `AppSecret`, `SecretKey`, `JWTSecret`, and other plugin credentials, so this
+  is an active config-secret leak, tracked in
+  [#3158](https://github.com/layervai/nhp/issues/3158) and related to the wider
+  config-log hygiene sweep in
+  [#2517](https://github.com/layervai/nhp/issues/2517).
 - **Config secrets on `ResourceData`** (`AppSecret`, `SecretKey`, `ExInfo`
   incl. `JWTSecret`). The active complete-etcd-body leak is fixed and inventoried
   above by [#3158](https://github.com/layervai/nhp/issues/3158). No site dumps a

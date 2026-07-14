@@ -433,10 +433,8 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 	// set header digest
 	mad.addHeaderDigest(mad.HeaderType == NHP_RKN)
 
-	// encrypt body and write into mad.BasePacket.Buf space
-	ciphertext := mad.bodyAead.Seal(packetBuf[mad.header.Size():mad.header.Size()], mad.header.NonceBytes(), body, mad.chainHash.Sum(mad.hashBuf[:0]))
-	_ = ciphertext
-	//log.Debug("encrypted body: %v, output: %v", body, ciphertext)
+	// encrypt body and write into the packet's writable buffer
+	mad.bodyAead.Seal(packetBuf[mad.header.Size():mad.header.Size()], mad.header.NonceBytes(), body, mad.chainHash.Sum(mad.hashBuf[:0]))
 
 	// set valid packet
 	mad.BasePacket.Content = packetBuf[:packetLen]

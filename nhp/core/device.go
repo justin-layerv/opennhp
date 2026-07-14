@@ -344,8 +344,13 @@ func (d *Device) msgToPacketRoutine(id int) {
 			// message encryption workflow: raw message -> encryption -> raw packet -> connection.SendQueue
 			func() {
 				msgType := HeaderTypeToString(md.HeaderType)
-				log.Debug("msgToPacketRoutine %d: encrypting [%s] raw message: %s", id, msgType, md.Message)
-				log.Evaluate("msgToPacketRoutine %d: encrypting [%s] raw message: %s", id, msgType, md.Message)
+				// Protocol bodies can contain durable API keys, OTPs, access
+				// tokens, and customer metadata. Keep the type and size needed
+				// for transport diagnostics, but never write plaintext bodies to
+				// any log level. TestDeviceAsyncLogsRedactProtocolBodies pins
+				// this metadata-only format.
+				log.Debug("msgToPacketRoutine %d: encrypting [%s] message (%d bytes)", id, msgType, len(md.Message))
+				log.Evaluate("msgToPacketRoutine %d: encrypting [%s] message (%d bytes)", id, msgType, len(md.Message))
 
 				var mad *MsgAssemblerData
 				var err error
@@ -609,8 +614,12 @@ func (d *Device) packetToMsgRoutine(id int) {
 					return
 				}
 
-				log.Debug("packetToMsgRoutine: %d: complete decrypting [%s] message: %s", id, msgType, ppd.BodyMessage)
-				log.Evaluate("packetToMsgRoutine: %d: complete decrypting [%s] message: %s", id, msgType, ppd.BodyMessage)
+				// Decrypted bodies are secret-bearing protocol input. Log only
+				// metadata so REG/OTP credentials and ACK access tokens never
+				// reach the general or evaluate log files.
+				// TestDeviceAsyncLogsRedactProtocolBodies pins this format.
+				log.Debug("packetToMsgRoutine: %d: complete decrypting [%s] message (%d bytes)", id, msgType, len(ppd.BodyMessage))
+				log.Evaluate("packetToMsgRoutine: %d: complete decrypting [%s] message (%d bytes)", id, msgType, len(ppd.BodyMessage))
 				log.Debug("packetToMsgRoutine: complete decrypting feedbackMsgCh:%d,headerType:%s", d.deviceType, HeaderTypeToString(ppd.HeaderType))
 				// deliver decrypted message to specific channel
 				if ppd.decryptedMsgCh != nil {
