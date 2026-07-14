@@ -144,11 +144,86 @@ resource "aws_iam_role_policy" "keygen_lambda_secrets" {
   })
 }
 
+# PR plans may invoke only this application-state-read-only function. A
+# distinct execution role and handler-selected mode prevent an untrusted
+# invocation payload from reaching Seed or PutSecretValue.
+resource "aws_iam_role" "key_validator_lambda" {
+  name = "${var.name_prefix}-key-validator-lambda"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_log_group" "key_validator" {
+  name              = "/aws/lambda/${var.name_prefix}-key-validator"
+  retention_in_days = local.is_prod ? 365 : 30
+  kms_key_id        = var.logs_kms_key_arn
+  tags              = var.tags
+
+  lifecycle {
+    precondition {
+      condition     = try(trimspace(var.logs_kms_key_arn) != "", false)
+      error_message = "key-validator requires logs_kms_key_arn so plan-time validation failures are never written to an unencrypted log group."
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "key_validator_lambda_access" {
+  name = "identity-read-and-logs"
+  role = aws_iam_role.key_validator_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [aws_secretsmanager_secret.server.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = ["${aws_cloudwatch_log_group.key_validator.arn}:*"]
+      }
+      ],
+      var.secrets_kms_key_arn != null ? [
+        {
+          Effect   = "Allow"
+          Action   = ["kms:Decrypt"]
+          Resource = [var.secrets_kms_key_arn]
+        }
+    ] : [])
+  })
+}
+
+# Lambda role/policy creation can precede IAM authorization propagation. This
+# is a brand-new role-to-inline-policy attachment, so retain the repository's
+# conservative 180-second first-use wait and key it to both documents; a first
+# apply must not create the validator while its trust or GET-only policy is
+# still stale. If either IAM resource is tainted without a document change,
+# taint this wait too because its document-hash triggers remain unchanged.
+resource "time_sleep" "key_validator_iam_propagation" {
+  triggers = {
+    assume_role_policy_hash = sha256(aws_iam_role.key_validator_lambda.assume_role_policy)
+    access_policy_hash      = sha256(aws_iam_role_policy.key_validator_lambda_access.policy)
+  }
+
+  create_duration = "180s"
+}
+
 # Lambda function to generate Curve25519 keys
 resource "aws_lambda_function" "keygen" {
   function_name = "${var.name_prefix}-keygen"
   role          = aws_iam_role.keygen_lambda.arn
-  handler       = "index.handler"
+  handler       = "index.seedHandler"
   runtime       = "nodejs22.x"
   timeout       = 30
 
@@ -158,82 +233,40 @@ resource "aws_lambda_function" "keygen" {
   tags = var.tags
 }
 
+# Same audited artifact, but a handler-selected Validate mode and a role with no
+# mutation permissions. The PR plan role is scoped to this function's $LATEST
+# qualifier and cannot invoke aws_lambda_function.keygen.
+# Provision it ahead of the cell-assignment consumer so rollout can prove the
+# validator is read-only before any plan depends on its result.
+resource "aws_lambda_function" "key_validator" {
+  function_name = "${var.name_prefix}-key-validator"
+  role          = aws_iam_role.key_validator_lambda.arn
+  handler       = "index.validateHandler"
+  runtime       = "nodejs22.x"
+  timeout       = 30
+
+  # Intentionally use the account's bounded unreserved pool so concurrent PR
+  # plans do not contend with a validator-specific reservation.
+
+  filename         = data.archive_file.keygen_lambda.output_path
+  source_code_hash = data.archive_file.keygen_lambda.output_base64sha256
+
+  tags = var.tags
+
+  depends_on = [
+    time_sleep.key_validator_iam_propagation,
+    aws_cloudwatch_log_group.key_validator,
+  ]
+}
+
 # Adding a `count` here (or wrapping `module "compute"` in a toggle)
 # requires removing the matching `lambda-compute-keygen` upload+download
 # pair in promote-to-prod.yml in the same patch — see
 # docs/runbooks/promote-to-prod-lambda-artifacts.md (loud-fail policy).
 data "archive_file" "keygen_lambda" {
   type        = "zip"
+  source_file = "${path.module}/lambda/keygen/index.js"
   output_path = "${path.module}/keygen_lambda.zip"
-
-  source {
-    content  = <<-EOF
-const crypto = require('crypto');
-const { SecretsManagerClient, GetSecretValueCommand, PutSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
-
-exports.handler = async (event) => {
-  console.log('RequestType:', event.RequestType);
-
-  if (event.RequestType === 'Delete') {
-    return { PhysicalResourceId: event.PhysicalResourceId };
-  }
-
-  const client = new SecretsManagerClient({});
-  const secretId = event.ResourceProperties.SecretId;
-  const hostname = event.ResourceProperties.Hostname;
-  const environment = event.ResourceProperties.Environment;
-
-  // Check if secret already has a valid key pair
-  try {
-    const existing = await client.send(new GetSecretValueCommand({ SecretId: secretId }));
-    if (existing.SecretString) {
-      const parsed = JSON.parse(existing.SecretString);
-      if (parsed.privateKey && parsed.privateKey.length === 44 && parsed.publicKey && parsed.publicKey.length === 44) {
-        console.log('Secret already has valid key pair, not overwriting');
-        return { PhysicalResourceId: event.PhysicalResourceId || secretId };
-      }
-    }
-  } catch (e) {
-    console.log('No existing secret value, will create new');
-  }
-
-  // Generate X25519 key pair using Node.js crypto
-  const keyPair = crypto.generateKeyPairSync('x25519');
-
-  // Export keys in raw format and base64 encode
-  const privateKeyRaw = keyPair.privateKey.export({ type: 'pkcs8', format: 'der' });
-  const publicKeyRaw = keyPair.publicKey.export({ type: 'spki', format: 'der' });
-
-  // Extract the 32-byte keys from DER format (skip the header bytes)
-  // PKCS8 X25519 private key: 48 bytes, last 32 are the key
-  // SPKI X25519 public key: 44 bytes, last 32 are the key
-  const privateKey = privateKeyRaw.slice(-32);
-  const publicKey = publicKeyRaw.slice(-32);
-
-  const privateKeyBase64 = privateKey.toString('base64');
-  const publicKeyBase64 = publicKey.toString('base64');
-
-  const secretValue = JSON.stringify({
-    privateKey: privateKeyBase64,
-    publicKey: publicKeyBase64,
-    hostname: hostname,
-    environment: environment,
-  });
-
-  await client.send(new PutSecretValueCommand({
-    SecretId: secretId,
-    SecretString: secretValue,
-  }));
-
-  console.log('Generated new key pair, publicKey:', publicKeyBase64);
-
-  return {
-    PhysicalResourceId: event.PhysicalResourceId || secretId,
-  };
-};
-EOF
-    filename = "index.js"
-  }
 }
 
 # Store server configuration in Secrets Manager
@@ -250,9 +283,15 @@ resource "aws_secretsmanager_secret" "server" {
   })
 }
 
-# Custom resource to invoke Lambda for key generation
+# Custom resource to invoke Lambda for key generation. Seed deliberately fails
+# closed if a future taint/replacement finds malformed key material or metadata
+# drift (including hostname or environment mismatch): investigate and
+# explicitly migrate the secret; never self-heal or rotate it from this
+# stateful invocation.
 resource "aws_lambda_invocation" "keygen" {
   function_name = aws_lambda_function.keygen.function_name
+  # Seed may write a missing secret; never invoke it during update or destroy.
+  lifecycle_scope = "CREATE_ONLY"
 
   input = jsonencode({
     RequestType = "Create"
@@ -292,9 +331,9 @@ resource "aws_lambda_invocation" "keygen" {
 # Secrets Manager GET, not a per-resource cost.
 #
 # version_stage = "AWSCURRENT" is the AWS default and is set here
-# explicitly because the keygen Lambda (line 175) writes via
-# PutSecretValueCommand without a VersionStages arg — which also
-# defaults to AWSCURRENT. A future rotation flow that stages a new
+# explicitly because `seedHandler` in lambda/keygen/index.js writes via
+# PutSecretValueCommand without a VersionStages arg — which also defaults to
+# AWSCURRENT. A future rotation flow that stages a new
 # key under AWSPENDING before promoting it would silently desync
 # the terraform-exposed value from the running server until the
 # stage promotion completed; pinning the stage here makes the

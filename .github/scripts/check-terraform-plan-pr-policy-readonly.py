@@ -32,6 +32,7 @@ EXACT_ALLOWED_ACTIONS = {
 }
 VALUE_BEARING_SCOPED_SIDS = {
     "APIGatewayRead",
+    "ComputeServerIdentityValidateInvoke",
     "KMSDecryptInAccount",
     "RelayIdentityStatusInvoke",
     "S3ObjectRead",
@@ -110,6 +111,12 @@ RELAY_IDENTITY_STATUS_INVOKE_ACTIONS = {
 }
 RELAY_IDENTITY_STATUS_INVOKE_RESOURCES = {
     "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST",
+}
+COMPUTE_SERVER_IDENTITY_VALIDATE_INVOKE_ACTIONS = {
+    "lambda:invokefunction",
+}
+COMPUTE_SERVER_IDENTITY_VALIDATE_INVOKE_RESOURCES = {
+    "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-key-validator:$LATEST",
 }
 SQS_READ_ACTIONS = {
     "sqs:getqueueattributes",
@@ -304,6 +311,23 @@ def validate_sensitive_statement_scopes(file: Path, policy: dict) -> list[str]:
             violations.append("RelayIdentityStatusInvoke must only include lambda:InvokeFunction")
         if set(normalized_strings(relay_status.get("Resource"))) != RELAY_IDENTITY_STATUS_INVOKE_RESOURCES:
             violations.append("RelayIdentityStatusInvoke must stay scoped to the exact read-only relay status Lambda")
+
+    compute_validator = statements.get("ComputeServerIdentityValidateInvoke")
+    if not compute_validator:
+        violations.append("missing ComputeServerIdentityValidateInvoke")
+    else:
+        compute_validator_actions = {
+            action.lower() for action in normalized_strings(compute_validator.get("Action"))
+        }
+        if compute_validator_actions != COMPUTE_SERVER_IDENTITY_VALIDATE_INVOKE_ACTIONS:
+            violations.append("ComputeServerIdentityValidateInvoke must only include lambda:InvokeFunction")
+        if (
+            set(normalized_strings(compute_validator.get("Resource")))
+            != COMPUTE_SERVER_IDENTITY_VALIDATE_INVOKE_RESOURCES
+        ):
+            violations.append(
+                "ComputeServerIdentityValidateInvoke must stay scoped to the exact read-only compute validator Lambda"
+            )
 
     sqs = statements.get("SQSRead")
     if not sqs:

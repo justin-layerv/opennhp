@@ -139,6 +139,12 @@ Listed in the same order they appear in `.github/workflows/promote-to-prod.yml`'
 | `lambda-cloudfront-cidr-drift` | `terraform/lambda/.build/cloudfront_cidr_drift.zip` | `var.deploy_qurl_link` + `var.enable_resolve_cloudfront` | **error** |
 | `lambda-custom-domain-cert` | `terraform/modules/custom-domain-cert/build/lambda-custom-domain-cert.zip` | `var.deploy_custom_domain_cert` | ignore (deprecated, #1383) |
 
+`lambda-compute-keygen` contains the shared, handler-selected artifact for both
+the stateful `${name_prefix}-keygen` function and the read-only
+`${name_prefix}-key-validator` function. It remains one archive and therefore
+one upload/download pair; adding a second artifact entry for the validator would
+misrepresent Terraform's `archive_file` boundary.
+
 `archive_file` blocks not in this table are either (a) not deployed in prod (e.g. `module.billing.*` is gated `deploy_billing=false`; `module.e2e_echo_server.*` defaults `deploy_e2e_echo_server=false`; `module.auth0.auth0_rotation` is gated `auth0_enable_rotation=false`; `module.data.etcd_tls_lambda` and `module.data.secrets_rotation` are gated `deploy_etcd=false`) or (b) re-instantiations of an already-covered module (e.g. `module.canary_deployment_ac` shares `lambda-canary-orchestrator`'s zip).
 
 If you flip any of those `deploy_*` / `enable_*` toggles to `true` in prod, **also** add the matching upload/download steps in `.github/workflows/promote-to-prod.yml` for whichever new Lambda becomes in-scope. The structural-symmetry test does NOT catch the "added a new Lambda but no upload/download anywhere" case — it only catches "uploaded without download" or vice versa. Tracked as a known limitation in [#1380](https://github.com/layervai/nhp/issues/1380), which sketches three options (terraform-tree walker, CODEOWNERS rule, naming-convention enforcement test) for closing the omission gap.

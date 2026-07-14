@@ -501,6 +501,7 @@ lint-workflows:
 	@node -e 'const major = Number(process.versions.node.split(".")[0]); if (major < 18) { console.error("Node.js 18+ is required for scripts/qurl-relay-bootstrap-smoke.mjs; found " + process.version); process.exit(1); }'
 	@node --check scripts/qurl-relay-bootstrap-smoke.mjs
 	@node scripts/qurl-relay-bootstrap-smoke.mjs --self-test
+	@node --test terraform/modules/compute/lambda/keygen/index.test.js
 	@shellcheck .github/scripts/deploy-ecs-service.sh tests/scripts/deploy-ecs-service_test.sh
 	@bash tests/scripts/deploy-ecs-service_test.sh
 	@bash tests/scripts/dependabot-go-tidy_test.sh

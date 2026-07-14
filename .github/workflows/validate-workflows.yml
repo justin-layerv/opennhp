@@ -61,6 +61,10 @@ on:
       - "terraform/environments/sandbox/variables.tf"
       - "terraform/environments/prod/variables.tf"
       - "terraform/modules/compute/variables.tf"
+      - "terraform/modules/compute/main.tf"
+      - "terraform/modules/compute/outputs.tf"
+      - "terraform/modules/compute/lambda/keygen/**"
+      - "terraform/modules/ecr/main.tf"
       # eBPF load-path + FilterMode lockstep (#2810, #2812, #2815): trigger on
       # the script + its fixture test and on the source-of-truth sites it
       # compares that aren't watched elsewhere: Go object-path consts
@@ -385,6 +389,7 @@ jobs:
           bash tests/scripts/check-relay-deposed-sg-clear_test.sh
           bash tests/scripts/rotate-relay-identity_test.sh
           node --test terraform/modules/relay-identity/lambda/relay_identity.test.js
+          node --test terraform/modules/compute/lambda/keygen/index.test.js
           node --test terraform/modules/compute/relay_toml_template.test.js
           python3 tests/scripts/test_relay_trusted_key_validation_lockstep.py
 

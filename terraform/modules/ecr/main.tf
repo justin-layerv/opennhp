@@ -1694,11 +1694,20 @@ resource "aws_iam_policy" "terraform_plan_pr_read" {
         # This Lambda has a distinct read-only handler and execution role. The
         # data source invokes with the explicit $LATEST qualifier, so IAM evaluates
         # this exact qualified ARN rather than the unqualified function ARN.
-        # It is the sole semantic-read exception to the verb gate below.
+        # It is one of the exact semantic-read exceptions to the verb gate below.
         Sid      = "RelayIdentityStatusInvoke"
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
         Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST"]
+      },
+      {
+        # The compute validator is a distinct GET-only handler and execution
+        # role. Exact $LATEST qualification prevents this exception from
+        # authorizing the stateful keygen function or a future alias/version.
+        Sid      = "ComputeServerIdentityValidateInvoke"
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-key-validator:$LATEST"]
       },
       {
         Sid    = "AutoScalingRead"
@@ -1955,6 +1964,20 @@ resource "aws_iam_policy" "terraform_plan_pr_read" {
       }
     ]
   })
+
+  lifecycle {
+    postcondition {
+      # IAM rejects customer-managed policy documents above 6,144
+      # non-whitespace characters. Because jsonencode emits no insignificant
+      # whitespace, length(self.policy) equals AWS's quota-counted length and
+      # catches regressions during plan instead of the post-merge apply.
+      # Keep this policy document fully plan-known: introducing an apply-time
+      # unknown would defer this postcondition to apply and lose the PR fence.
+      # Split grants into another policy before they cross this fence.
+      condition     = length(self.policy) <= 6144
+      error_message = "terraform_plan_pr_read exceeds IAM's 6,144-character customer-managed policy quota; split statements into a dedicated policy before applying."
+    }
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "terraform_plan_pr_read" {

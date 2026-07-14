@@ -42,29 +42,30 @@ def normalized_strings(value: object) -> list[str]:
     return [unquote(item) for item in as_list(value) if isinstance(item, str)]
 
 
-def find_policy_statement(terraform_root: Path, policy_name: str, sid: str) -> dict:
+def find_resource_body(terraform_root: Path, resource_type: str, resource_name: str) -> dict:
     for _file, rtype, name, body in iter_resources(parse_tf_files(terraform_root)):
-        if rtype != "aws_iam_policy" or name != policy_name:
-            continue
-        policy = extract_policy_body(body.get("policy"))
-        if policy is None:
-            raise AssertionError(f"aws_iam_policy.{policy_name} policy could not be decoded")
-        for stmt in policy.get("Statement", []) or []:
-            if isinstance(stmt, dict) and unquote(stmt.get("Sid")) == sid:
-                return stmt
-        raise AssertionError(f"aws_iam_policy.{policy_name} has no Sid={sid}")
-    raise AssertionError(f"aws_iam_policy.{policy_name} not found")
+        if rtype == resource_type and name == resource_name:
+            return body
+    raise AssertionError(f"{resource_type}.{resource_name} not found")
+
+
+def find_policy_statement(terraform_root: Path, policy_name: str, sid: str) -> dict:
+    body = find_resource_body(terraform_root, "aws_iam_policy", policy_name)
+    policy = extract_policy_body(body.get("policy"))
+    if policy is None:
+        raise AssertionError(f"aws_iam_policy.{policy_name} policy could not be decoded")
+    for stmt in policy.get("Statement", []) or []:
+        if isinstance(stmt, dict) and unquote(stmt.get("Sid")) == sid:
+            return stmt
+    raise AssertionError(f"aws_iam_policy.{policy_name} has no Sid={sid}")
 
 
 def find_policy_expression(terraform_root: Path, policy_name: str) -> str:
-    for _file, rtype, name, body in iter_resources(parse_tf_files(terraform_root)):
-        if rtype != "aws_iam_policy" or name != policy_name:
-            continue
-        policy = body.get("policy")
-        if not isinstance(policy, str):
-            raise AssertionError(f"aws_iam_policy.{policy_name} policy is not a string expression")
-        return " ".join(policy.split())
-    raise AssertionError(f"aws_iam_policy.{policy_name} not found")
+    body = find_resource_body(terraform_root, "aws_iam_policy", policy_name)
+    policy = body.get("policy")
+    if not isinstance(policy, str):
+        raise AssertionError(f"aws_iam_policy.{policy_name} policy is not a string expression")
+    return " ".join(policy.split())
 
 
 def policy_fixture(
@@ -180,6 +181,14 @@ def policy_fixture(
         """,
         """
         {
+          Sid      = "ComputeServerIdentityValidateInvoke"
+          Effect   = "Allow"
+          Action   = ["lambda:InvokeFunction"]
+          Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-key-validator:$LATEST"]
+        }
+        """,
+        """
+        {
           Sid    = "SQSRead"
           Effect = "Allow"
           Action = [
@@ -242,6 +251,21 @@ class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("terraform_plan_pr_read policy actions", result.stdout)
+
+    def test_real_policy_has_plan_time_iam_size_guard(self) -> None:
+        body = find_resource_body(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "aws_iam_policy",
+            "terraform_plan_pr_read",
+        )
+        lifecycle = as_list(body.get("lifecycle"))
+        self.assertEqual(len(lifecycle), 1)
+        self.assertIsInstance(lifecycle[0], dict)
+        postconditions = as_list(lifecycle[0].get("postcondition"))
+        self.assertEqual(len(postconditions), 1)
+        self.assertIsInstance(postconditions[0], dict)
+        self.assertEqual(postconditions[0].get("condition"), "${length(self.policy) <= 6144}")
+        self.assertIn("6,144-character", unquote(postconditions[0].get("error_message")))
 
     def test_dynamodb_getitem_is_rejected(self) -> None:
         result = self.run_lint(
@@ -368,6 +392,42 @@ class TerraformPlanPrPolicyReadonlyTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
         self.assertIn("exact read-only relay status Lambda", result.stderr)
+
+    def test_compute_validator_invoke_resource_is_pinned(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-key-validator:$LATEST"',
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exact read-only compute validator Lambda", result.stderr)
+
+    def test_compute_validator_invoke_requires_latest_qualifier(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-key-validator:$LATEST"',
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-key-validator"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exact read-only compute validator Lambda", result.stderr)
+
+    def test_compute_validator_invoke_rejects_qualifier_wildcard(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-key-validator:$LATEST"',
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-key-validator:*"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exact read-only compute validator Lambda", result.stderr)
+
+    def test_compute_validator_invoke_rejects_stateful_keygen(self) -> None:
+        result = self.run_lint_with_replacement(
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-key-validator:$LATEST"',
+            '"arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-keygen:$LATEST"',
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exact read-only compute validator Lambda", result.stderr)
 
     def test_lambda_invoke_outside_relay_status_sid_is_rejected(self) -> None:
         result = self.run_lint(
