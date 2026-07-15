@@ -3,6 +3,9 @@ Unit tests for the public LayerV status-page aggregator.
 
 These tests pin the customer-facing contract: coarse component health,
 history counters, sanitized incidents, and no infrastructure detail.
+
+Resolved incident fixtures expected to publish use relative UTC dates because
+fixed dates eventually age out of retention.
 """
 
 import ipaddress
@@ -2296,15 +2299,17 @@ class TestIncidents:
     def test_caps_public_incident_json_bytes_by_dropping_resolved_first(self):
         import status_aggregator as sa
 
+        now = datetime.now(timezone.utc)
+        resolved_started = now - timedelta(days=3)
         raw = {"incidents": [
             {
                 "id": "resolved-old",
                 "title": "Resolved incident",
                 "status": "resolved",
                 "impact": "minor",
-                "started_at": "2026-07-01T00:00:00Z",
+                "started_at": resolved_started.isoformat(),
                 "updates": [{
-                    "at": "2026-07-01T00:05:00Z",
+                    "at": (resolved_started + timedelta(minutes=5)).isoformat(),
                     "status": "resolved",
                     "body": "resolved " * 120,
                 }],
@@ -2314,14 +2319,14 @@ class TestIncidents:
                 "title": "Older active incident",
                 "status": "monitoring",
                 "impact": "minor",
-                "started_at": "2026-07-02T00:00:00Z",
+                "started_at": (now - timedelta(days=2)).isoformat(),
             },
             {
                 "id": "active-new",
                 "title": "Newer active incident",
                 "status": "identified",
                 "impact": "major",
-                "started_at": "2026-07-03T00:00:00Z",
+                "started_at": (now - timedelta(days=1)).isoformat(),
             },
         ]}
         with patch.object(sa, "INCIDENT_PUBLIC_JSON_BYTES_LIMIT", 10**9):
@@ -2492,6 +2497,7 @@ class TestPublicPayloadIsLeakFree:
     def test_payload_shape_and_redaction(self):
         import status_aggregator as sa
 
+        now = datetime.now(timezone.utc)
         history = {"version": 1, "days": {_today_key(): {"qurl_api": [12, 0, 0]}}}
         incidents = {"incidents": [{
             "id": "incident-1",
@@ -2499,7 +2505,7 @@ class TestPublicPayloadIsLeakFree:
             "status": "resolved",
             "impact": "minor",
             "components": ["qurl_api"],
-            "started_at": "2026-07-06T12:00:00Z",
+            "started_at": (now - timedelta(days=3)).isoformat(),
             "internal_notes": "do not publish",
         }]}
 
