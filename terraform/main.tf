@@ -134,28 +134,28 @@ resource "terraform_data" "qurl_site_authz_preconditions" {
 # discovery the per-instance private endpoints are rejected by the AC
 # allowlist. Keep the rollout contract encoded at plan time.
 resource "terraform_data" "qurl_tunnel_active_registration_preconditions" {
-  count = var.qurl_tunnel_active_registrations_enabled ? 1 : 0
+  count = var.qurl_connector_active_registrations_enabled ? 1 : 0
 
   lifecycle {
     precondition {
-      condition     = var.qurl_tunnel_auth_enabled
-      error_message = "qurl_tunnel_active_registrations_enabled=true requires qurl_tunnel_auth_enabled=true so qurl-service mounts the tunnel auth and registration endpoints."
+      condition     = var.qurl_connector_auth_enabled
+      error_message = "qurl_connector_active_registrations_enabled=true requires qurl_connector_auth_enabled=true so qurl-service mounts the tunnel auth and registration endpoints."
     }
     precondition {
       condition     = var.deploy_frps
-      error_message = "qurl_tunnel_active_registrations_enabled=true requires deploy_frps=true so qurl-reverse-tunnel-server can publish active target rows."
+      error_message = "qurl_connector_active_registrations_enabled=true requires deploy_frps=true so qurl-reverse-tunnel-server can publish active target rows."
     }
     precondition {
       condition     = var.qurl_router_enabled
-      error_message = "qurl_tunnel_active_registrations_enabled=true requires qurl_router_enabled=true so qurl-router consumes upstream_addrs."
+      error_message = "qurl_connector_active_registrations_enabled=true requires qurl_router_enabled=true so qurl-router consumes upstream_addrs."
     }
     precondition {
       condition     = var.enable_instance_hrw
-      error_message = "qurl_tunnel_active_registrations_enabled=true requires enable_instance_hrw=true because active registrations publish per-instance private endpoints validated through router discovery."
+      error_message = "qurl_connector_active_registrations_enabled=true requires enable_instance_hrw=true because active registrations publish per-instance private endpoints validated through router discovery."
     }
     precondition {
       condition     = var.qurl_reverse_tunnel_server_cloud_map_routing_policy == "MULTIVALUE"
-      error_message = "qurl_tunnel_active_registrations_enabled=true requires qurl_reverse_tunnel_server_cloud_map_routing_policy=\"MULTIVALUE\" so router discovery sees every active instance IP."
+      error_message = "qurl_connector_active_registrations_enabled=true requires qurl_reverse_tunnel_server_cloud_map_routing_policy=\"MULTIVALUE\" so router discovery sees every active instance IP."
     }
   }
 }
@@ -3013,9 +3013,9 @@ module "qurl_service" {
   grafana_secret_arn    = var.qurl_grafana_secret_arn
   adot_collector_image  = var.qurl_adot_collector_image
 
-  # Tunnel auth feature gate (qurl-service PR #277; default false until #405/#396 land)
-  tunnel_auth_enabled                 = var.qurl_tunnel_auth_enabled
-  tunnel_active_registrations_enabled = var.qurl_tunnel_active_registrations_enabled
+  # Connector auth feature gate (qurl-service PR #277; default false until #405/#396 land)
+  connector_auth_enabled                 = var.qurl_connector_auth_enabled
+  connector_active_registrations_enabled = var.qurl_connector_active_registrations_enabled
 
   # depends_on:
   #  - terraform_data.nhp_internal_auth_seed: ensure the HMAC secret is seeded

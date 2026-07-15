@@ -1566,15 +1566,15 @@ variable "qurl_adot_collector_image" {
   default     = "public.ecr.aws/aws-observability/aws-otel-collector:v0.40.0"
 }
 
-# ==================== QURL Tunnel Auth ====================
+# ==================== QURL Connector Auth ====================
 
-variable "qurl_tunnel_auth_enabled" {
-  description = "Enable qurl-service tunnel-auth endpoint and type=tunnel branches in CreateQurl/CreateResource (qurl-service PR #277 feature gate). Default false keeps the new code paths inert in production until the creation endpoint (qurl-service #405) and per-AZ FRPS assignment (qurl-service #396) are both deployed. Flip per-env via tfvars after the dependent qurl-service work ships and the qurl-service deploy is verified."
+variable "qurl_connector_auth_enabled" {
+  description = "Enable qurl-service connector-auth endpoint and type=tunnel branches in CreateQurl/CreateResource (qurl-service PR #277 feature gate). Default false keeps the new code paths inert in production until the creation endpoint (qurl-service #405) and per-AZ FRPS assignment (qurl-service #396) are both deployed. Flip per-env via tfvars after the dependent qurl-service work ships and the qurl-service deploy is verified."
   type        = bool
   default     = false
 }
 
-variable "qurl_tunnel_active_registrations_enabled" {
+variable "qurl_connector_active_registrations_enabled" {
   description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while the reporter and AC discovery rollout are verified. Flip per-env only after qurl-service, qurl-reverse-tunnel-server, and qurl-router active-target support are deployed and healthy."
   type        = bool
   default     = false

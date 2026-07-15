@@ -724,7 +724,7 @@ variable "enable_qurl_site_authz" {
   default     = false
 }
 
-variable "qurl_tunnel_active_registrations_enabled" {
+variable "qurl_connector_active_registrations_enabled" {
   description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while reporter and AC discovery rollout are verified."
   type        = bool
   default     = false
@@ -1887,8 +1887,8 @@ variable "frps_desired_capacity" {
   }
 }
 
-variable "qurl_tunnel_auth_enabled" {
-  description = "Enable qurl-service tunnel-auth endpoint and type=tunnel branches in CreateQurl/CreateResource (qurl-service PR #277 feature gate). Default false keeps the new code paths inert in production until the creation endpoint (qurl-service #405) and per-AZ FRPS assignment (qurl-service #396) are both deployed. Flip per-env via tfvars after the dependent qurl-service work ships and the qurl-service deploy is verified."
+variable "qurl_connector_auth_enabled" {
+  description = "Enable qurl-service connector-auth endpoint and type=tunnel branches in CreateQurl/CreateResource (qurl-service PR #277 feature gate). Default false keeps the new code paths inert in production until the creation endpoint (qurl-service #405) and per-AZ FRPS assignment (qurl-service #396) are both deployed. Flip per-env via tfvars after the dependent qurl-service work ships and the qurl-service deploy is verified."
   type        = bool
   default     = false
 }

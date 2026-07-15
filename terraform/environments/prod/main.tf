@@ -108,27 +108,27 @@ module "nhp" {
   server_plugins = var.server_plugins
 
   # QURL Service
-  deploy_qurl_service                      = var.deploy_qurl_service
-  qurl_tunnel_active_registrations_enabled = var.qurl_tunnel_active_registrations_enabled
-  deploy_qurl_bootstrap_chain              = var.deploy_qurl_bootstrap_chain
-  enable_qurl_agent_bootstrap              = var.enable_qurl_agent_bootstrap
-  qurl_scanner_lambda_enabled              = var.qurl_scanner_lambda_enabled
-  qurl_scanner_sqs_emit_enabled            = var.qurl_scanner_sqs_emit_enabled
-  qurl_scanner_tombstone_write_enabled     = var.qurl_scanner_tombstone_write_enabled
-  qurl_scanner_active_recheck_enabled      = var.qurl_scanner_active_recheck_enabled
-  qurl_service_domain                      = var.qurl_service_domain
-  qurl_hosted_zone_id                      = var.qurl_hosted_zone_id
-  qurl_jwt_secret_arn                      = var.qurl_jwt_secret_arn
-  qurl_internal_service_token_arn          = var.qurl_internal_service_token_arn
-  qurl_internal_service_domain             = var.qurl_internal_service_domain
-  qurl_additional_allowed_hosts            = var.qurl_additional_allowed_hosts
-  qurl_cors_allowed_origins                = var.qurl_cors_allowed_origins
-  qurl_audit_retention_days                = var.qurl_audit_retention_days
-  qurl_link_domain                         = var.qurl_link_domain
-  qurl_site_domain                         = var.qurl_site_domain
-  qurl_site_hosted_zone_id                 = var.qurl_site_hosted_zone_id
-  qurl_ip_rate_limit                       = var.qurl_ip_rate_limit
-  qurl_ip_rate_burst                       = var.qurl_ip_rate_burst
+  deploy_qurl_service                         = var.deploy_qurl_service
+  qurl_connector_active_registrations_enabled = var.qurl_connector_active_registrations_enabled
+  deploy_qurl_bootstrap_chain                 = var.deploy_qurl_bootstrap_chain
+  enable_qurl_agent_bootstrap                 = var.enable_qurl_agent_bootstrap
+  qurl_scanner_lambda_enabled                 = var.qurl_scanner_lambda_enabled
+  qurl_scanner_sqs_emit_enabled               = var.qurl_scanner_sqs_emit_enabled
+  qurl_scanner_tombstone_write_enabled        = var.qurl_scanner_tombstone_write_enabled
+  qurl_scanner_active_recheck_enabled         = var.qurl_scanner_active_recheck_enabled
+  qurl_service_domain                         = var.qurl_service_domain
+  qurl_hosted_zone_id                         = var.qurl_hosted_zone_id
+  qurl_jwt_secret_arn                         = var.qurl_jwt_secret_arn
+  qurl_internal_service_token_arn             = var.qurl_internal_service_token_arn
+  qurl_internal_service_domain                = var.qurl_internal_service_domain
+  qurl_additional_allowed_hosts               = var.qurl_additional_allowed_hosts
+  qurl_cors_allowed_origins                   = var.qurl_cors_allowed_origins
+  qurl_audit_retention_days                   = var.qurl_audit_retention_days
+  qurl_link_domain                            = var.qurl_link_domain
+  qurl_site_domain                            = var.qurl_site_domain
+  qurl_site_hosted_zone_id                    = var.qurl_site_hosted_zone_id
+  qurl_ip_rate_limit                          = var.qurl_ip_rate_limit
+  qurl_ip_rate_burst                          = var.qurl_ip_rate_burst
 
   # Website email-capture API DNS (cross-account A-alias for web-api.layerv.ai)
   deploy_website_api_dns     = var.deploy_website_api_dns
@@ -208,22 +208,22 @@ module "nhp" {
   # qurl-reverse-tunnel-server (FRPS-behind-AC) — prod env-root close-out.
   # Mirrors the sandbox wiring (#2035): #1745 had threaded only the NEW
   # per-AZ/blue-green/canary/MULTIVALUE vars, leaving `deploy_frps`,
-  # `connect_layerv_host`, `qurl_tunnel_auth_enabled`, `frps_image_tag`,
+  # `connect_layerv_host`, `qurl_connector_auth_enabled`, `frps_image_tag`,
   # the frps ports/suffixes, and the legacy sizing triple undeclared at
   # the prod env-root — so prod tfvars values silently no-op'd as "Value
   # for undeclared variable" warnings (the bug-class #2035 fixed for
   # sandbox). Declaring + threading them here is what makes the prod
   # `deploy_frps = true` / `connect_layerv_host` flip take effect.
-  qurl_tunnel_auth_enabled = var.qurl_tunnel_auth_enabled
-  deploy_frps              = var.deploy_frps
-  connect_layerv_host      = var.connect_layerv_host
-  frps_image_tag           = var.frps_image_tag
-  frps_bind_port           = var.frps_bind_port
-  frps_vhost_http_port     = var.frps_vhost_http_port
-  frps_az_suffixes         = var.frps_az_suffixes
-  frps_min_size            = var.frps_min_size
-  frps_max_size            = var.frps_max_size
-  frps_desired_capacity    = var.frps_desired_capacity
+  qurl_connector_auth_enabled = var.qurl_connector_auth_enabled
+  deploy_frps                 = var.deploy_frps
+  connect_layerv_host         = var.connect_layerv_host
+  frps_image_tag              = var.frps_image_tag
+  frps_bind_port              = var.frps_bind_port
+  frps_vhost_http_port        = var.frps_vhost_http_port
+  frps_az_suffixes            = var.frps_az_suffixes
+  frps_min_size               = var.frps_min_size
+  frps_max_size               = var.frps_max_size
+  frps_desired_capacity       = var.frps_desired_capacity
 
   qurl_reverse_tunnel_server_min_size_per_az               = var.qurl_reverse_tunnel_server_min_size_per_az
   qurl_reverse_tunnel_server_max_size_per_az               = var.qurl_reverse_tunnel_server_max_size_per_az

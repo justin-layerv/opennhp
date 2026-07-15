@@ -2180,14 +2180,14 @@ variable "deploy_vpc_endpoints" {
 
 # ==================== Bootstrap ALB ====================
 # Closes the second class of env-root gap noted in the body of #2035 (the
-# FRPS passthrough PR): `bootstrap_alb_*` and `qurl_tunnel_auth_enabled`
+# FRPS passthrough PR): `bootstrap_alb_*` and `qurl_connector_auth_enabled`
 # (below) are set in env tfvars but were never declared at the env root,
 # so they surfaced as "Value for undeclared variable" warnings at plan
 # time and silently no-op'd at apply — leaving the bootstrap-alb module
 # uninstantiated (no `bootstrap.layerv.xyz` Route53 record, no ACM cert,
-# no qurl-service target group) and `TUNNEL_AUTH_ENABLED=false` on the
+# no qurl-service target group) and `CONNECTOR_AUTH_ENABLED=false` on the
 # qurl-service ECS task def. Threading them here closes that gap so the
-# Wave 5 tunnel-auth + agent-bootstrap chain can actually apply in
+# Wave 5 connector-auth + agent-bootstrap chain can actually apply in
 # sandbox. Same wiring pattern as #2035.
 #
 # All 10 `bootstrap_alb_*` vars are declared here even though sandbox
@@ -2342,16 +2342,16 @@ variable "owner_missing_reject_threshold" {
   }
 }
 
-# ==================== QURL Tunnel Auth ====================
+# ==================== QURL Connector Auth ====================
 # Same env-root-gap class as the Bootstrap ALB section above.
 
-variable "qurl_tunnel_auth_enabled" {
-  description = "Enable qurl-service tunnel-auth endpoint and type=tunnel branches in CreateQurl/CreateResource (qurl-service PR #277 feature gate). Default false keeps the new code paths inert in production until the creation endpoint (qurl-service #405) and per-AZ FRPS assignment (qurl-service #396) are both deployed. Flip per-env via tfvars after the dependent qurl-service work ships and the qurl-service deploy is verified."
+variable "qurl_connector_auth_enabled" {
+  description = "Enable qurl-service connector-auth endpoint and type=tunnel branches in CreateQurl/CreateResource (qurl-service PR #277 feature gate). Default false keeps the new code paths inert in production until the creation endpoint (qurl-service #405) and per-AZ FRPS assignment (qurl-service #396) are both deployed. Flip per-env via tfvars after the dependent qurl-service work ships and the qurl-service deploy is verified."
   type        = bool
   default     = false
 }
 
-variable "qurl_tunnel_active_registrations_enabled" {
+variable "qurl_connector_active_registrations_enabled" {
   description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while reporter and AC discovery rollout are verified."
   type        = bool
   default     = false
