@@ -758,3 +758,14 @@ variable "knock_token_reject_threshold_per_minute" {
     error_message = "knock_token_reject_threshold_per_minute must be 1 ≤ x ≤ 1000. Floor 1: threshold 0 with GreaterThanThreshold pages on the first single reject; a single legitimate `empty_token_local_skip` from a misconfigured operator probe shouldn't wake on-call. Ceiling 1000: catches typo-class mistakes that would effectively disable the alarm."
   }
 }
+
+variable "owner_missing_reject_threshold" {
+  description = "Threshold (single 5-minute Sum, `GreaterThanOrEqualToThreshold`) for the `frps-owner-missing-rejects` alarm — counts frps NewProxy rejections carrying the byte-stable wire string `owner_missing: connector identity missing` (the RejectReason the frps core logs on every owner-missing reject; works on the current server, no cross-repo dependency). A stuck reverse-tunnel connector re-knocks ~every 30s (~10 rejects/5min), so the default `5` is half that full-window count and breaches on a single stuck connector at the next 5-minute period close, while a single transient blip (1-2 rejects from a connector that recovers on its own) stays below threshold. See `monitoring.tf::owner_missing_reject_count` for the wire-string contract and the runbook link."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.owner_missing_reject_threshold >= 1 && var.owner_missing_reject_threshold <= 1000
+    error_message = "owner_missing_reject_threshold must be 1 ≤ x ≤ 1000. Floor 1: threshold 0 under GreaterThanOrEqualToThreshold fires on every window including zero rejects (Sum ≥ 0 is always true) — the always-on trap. Ceiling 1000: catches typo-class mistakes that would effectively disable the alarm."
+  }
+}

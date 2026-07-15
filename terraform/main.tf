@@ -2321,6 +2321,14 @@ module "qurl_reverse_tunnel_server" {
   # without editing the module. Same threading pattern as the
   # bootstrap-outcome thresholds in `terraform/qurl_service_outcomes.tf`.
   knock_token_reject_threshold_per_minute = var.knock_token_reject_threshold_per_minute
+
+  # Threshold for the owner_missing reverse-tunnel reject alarm. Default 5
+  # (page when a single stuck connector — ~10 rejects/5min at its ~30s
+  # re-knock cadence — crosses half a window); env-tunable via the root
+  # var so an operator can quiet it during a known connector force-restart
+  # remediation window. Same threading pattern as
+  # knock_token_reject_threshold_per_minute above.
+  owner_missing_reject_threshold = var.owner_missing_reject_threshold
 }
 
 # State move for the qurl-frps → qurl-reverse-tunnel-server rebrand

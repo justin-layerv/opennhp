@@ -235,6 +235,16 @@ module "nhp" {
   qurl_reverse_tunnel_server_tunnel_auth_mode              = var.qurl_reverse_tunnel_server_tunnel_auth_mode
   qurl_reverse_tunnel_server_min_client_version            = var.qurl_reverse_tunnel_server_min_client_version
 
+  # owner_missing reverse-tunnel reject alarm threshold. Threaded to prod
+  # (unlike the sandbox-only knock-token / bootstrap-outcome thresholds)
+  # because this alarm is PAGE severity on a customer-visible prod outage
+  # whose remediation — a connector force-restart — itself emits a short
+  # owner_missing burst, so the runbook's Tuning step (raise the threshold
+  # to ride out a planned restart window) has to work in prod, not only
+  # sandbox. Same declare-and-thread as the #2035 env-root close-out above;
+  # default 5.
+  owner_missing_reject_threshold = var.owner_missing_reject_threshold
+
   # bootstrap-alb (agent-bootstrap knock-flow ingress) — prod env-root
   # close-out, mirror of sandbox #2054. Declared + threaded so prod tfvars
   # flips reach module.nhp. Prod runs the module's cross-account Path 1

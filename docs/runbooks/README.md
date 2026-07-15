@@ -10,6 +10,7 @@ runbook file is added, renamed, or removed.
 - [ECR cross-account replication failure](ecr-replication-failure.md)
 - [F5 revoked-pubkey alarm](f5-revoked-pubkey-paging.md)
 - [FRPS Cloud Map routing policy flip](frps-cloud-map-routing-policy.md)
+- [FRPS reverse-tunnel owner_missing rejects](frps-owner-missing-rejects.md)
 - [GuardDuty finding triage](guardduty-finding-triage.md)
 - [Knock forward-path failures](knock-forward-path.md)
 - [L3 flush circuit breaker recovery](l3-flush-breaker-recovery.md)

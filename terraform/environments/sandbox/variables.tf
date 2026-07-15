@@ -2328,6 +2328,20 @@ variable "knock_token_reject_threshold_per_minute" {
   }
 }
 
+# Validation mirrored from terraform/variables.tf for root-pointed error
+# attribution; the description is condensed here (see that file for the
+# full rationale). Keep the validation in lockstep.
+variable "owner_missing_reject_threshold" {
+  description = "Threshold value for the `frps-owner-missing-rejects` alarm in the qurl-reverse-tunnel-server module. The alarm uses `GreaterThanOrEqualToThreshold` over a single 5-minute Sum, so a default of `5` — half the ~10 rejects one stuck connector emits per 5-minute window — breaches on a single stuck connector but not on a transient 1-2 blip. Env tfvars may override to quiet the alarm during a known connector force-restart window. See description in terraform/variables.tf for the full rationale."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.owner_missing_reject_threshold >= 1 && var.owner_missing_reject_threshold <= 1000
+    error_message = "owner_missing_reject_threshold must be 1 ≤ x ≤ 1000 (floor avoids the always-on trap under GreaterThanOrEqualToThreshold; ceiling catches typo-class mistakes that would effectively disable the alarm)."
+  }
+}
+
 # ==================== QURL Tunnel Auth ====================
 # Same env-root-gap class as the Bootstrap ALB section above.
 

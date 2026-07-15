@@ -3030,6 +3030,17 @@ variable "knock_token_reject_threshold_per_minute" {
   }
 }
 
+variable "owner_missing_reject_threshold" {
+  description = "Threshold value for the `frps-owner-missing-rejects` alarm in the qurl-reverse-tunnel-server module (counts frps NewProxy rejections carrying the byte-stable wire string `owner_missing: connector identity missing` — a reverse-tunnel connector stuck registering with no connector identity, tunnel dark). The alarm uses `GreaterThanOrEqualToThreshold` over a single 5-minute Sum so a default of `5` — half the ~10 rejects one stuck connector emits per 5-minute window (it re-knocks ~every 30s) — breaches on a single stuck connector at the next 5-minute period close, but not on a transient single blip. Env tfvars may override to quiet the alarm during a known connector force-restart window. See `modules/qurl-reverse-tunnel-server/variables.tf::owner_missing_reject_threshold` for the full rationale and the wire-string contract."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.owner_missing_reject_threshold >= 1 && var.owner_missing_reject_threshold <= 1000
+    error_message = "owner_missing_reject_threshold must be 1 ≤ x ≤ 1000 (floor avoids the always-on trap under GreaterThanOrEqualToThreshold; ceiling catches typo-class mistakes that would effectively disable the alarm)."
+  }
+}
+
 # ── NHP-Relay (#2208 Phase-2 #5) ──
 # Internet-facing relay that forwards browser knocks to the cell's internal
 # server endpoint. Ships DARK: until 5c registers the relay pubkey in the server's

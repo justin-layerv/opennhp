@@ -435,3 +435,147 @@ resource "aws_cloudwatch_metric_alarm" "knock_token_reject_rate" {
     Severity  = "ticket"
   })
 }
+
+# ==================== Reverse-tunnel connector identity rejects ====================
+#
+# frps rejects a NewProxy registration with the wire message
+# `owner_missing: connector identity missing` when a reverse-tunnel
+# connector (e.g. fileviewer / detect) tries to register a proxy but
+# carries no connector identity. When this happens the connector's
+# tunnel goes PERMANENTLY dark — frps refuses every NewProxy, the
+# connector retries on a ~30s loop, and nothing self-heals until the
+# connector task is restarted (or the connector-side re-knock fix
+# ships). This has repeatedly gone undetected for hours because no
+# metric/alarm covered it; that gap is what this filter + alarm close.
+# Runbook: docs/runbooks/frps-owner-missing-rejects.md.
+#
+# WIRE-STRING CONTRACT — pin to the byte-stable reject string. This filter
+# matches the human wire string `owner_missing: connector identity missing`
+# — the RejectReason owned by qurl-reverse-tunnel-server's tunnel-auth
+# handler (handler.go) and emitted by the frps CORE on every owner-missing
+# reject in its bracket/logfmt line:
+#
+#   [server/control.go:387] ... new proxy [X] type [http] error: owner_missing: connector identity missing
+#
+# Matching the wire string (not a structured field) is deliberate and is
+# what makes this detector work on ANY server version with NO cross-repo
+# dependency: the frps core already logs this line (verified live in
+# `/layerv/nhp/<env>/frps`), so the alarm is armed the moment NHP deploys,
+# independent of the server binary in place. The string is the live, shared
+# contract, pinned on BOTH sides by MERGED code (origin/main) — the
+# connector's owner_missing detection (qurl-reverse-tunnel-server-client
+# #431) keys on it verbatim, and server #226 keeps it byte-for-byte — so a
+# reword would break the connector's self-heal too, not just this alarm.
+#
+# It counts exactly ONCE per reject on every server version: the full wire
+# string appears ONLY in the frps-core reject line above. #226 (merged)
+# added a separate structured line — `Warn("rejected", ...
+# event=handler_session_miss, reject_reason=owner_missing)`
+# (handler.go:2033/2050) — whose message is `rejected` and which carries
+# `reject_reason=owner_missing`, a DIFFERENT substring that does NOT contain
+# `owner_missing: connector identity missing`. So a plain quoted substring
+# neither double-counts nor needs an `error:`-prefix anchor.
+#
+# Do NOT repoint this filter at that structured `reject_reason=owner_missing`
+# field: it is OPTIONAL (dashboards only) and requires the #226-carrying
+# server build to be DEPLOYED. NHP's terraform applies before the server
+# binary ships, so a field-based filter would blind-and-green the alarm for
+# the whole window until the server catches up — every release. The wire
+# string works on any server version, so it avoids that window entirely.
+#
+# Quoted-substring (not JSON-path) form, mirroring `frps_errors`'s `[E]`:
+# the reject is emitted by the frps process (bracket/logfmt log family),
+# NOT the slog-JSON tunnelauth handler, so a JSON-path filter would never
+# match it — and a bare substring keeps matching even if frps ever renders
+# the line as JSON (the sentence is still present as a value). Only the
+# pattern SHAPE mirrors `frps_errors`, though — the `default_value = 0`
+# below is NOT on `frps_errors` (which relies on `treat_missing_data =
+# notBreaching` alone); it mirrors the `knock_token_*` filters, keeping the
+# series continuously populated at 0 (the frps log group is high-volume) so
+# the alarm rests in OK rather than INSUFFICIENT_DATA. Because the detector
+# works on the current server, that resting `0` is honest: 0 means no
+# owner_missing rejects (genuinely healthy), not "waiting for a field to
+# exist."
+resource "aws_cloudwatch_log_metric_filter" "owner_missing_reject_count" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  # Filter name mirrors the metric it publishes
+  # (FRPSOwnerMissingRejectCount) and stays distinct from the alarm name
+  # (`-frps-owner-missing-rejects`), following the sibling filter/alarm
+  # split (`-frps-errors` filter → `-frps-log-error-rate` alarm) rather
+  # than reusing one string for both.
+  name           = "${var.name_prefix}-frps-owner-missing-reject-count"
+  log_group_name = aws_cloudwatch_log_group.frps.name
+
+  pattern = "\"owner_missing: connector identity missing\""
+
+  # No `dimensions` block: AWS rejects `metric_transformation` dimensions
+  # when the filter pattern doesn't extract named tokens (a quoted
+  # substring doesn't). Per-cell / per-environment separation comes from
+  # the module being instantiated once per cell — each gets its own log
+  # group (`/layerv/nhp/<env>/frps`), filter, and alarm — the same
+  # structural separation `frps_errors` relies on, not a CloudWatch
+  # dimension. Multi-cell-per-account is #1448-future.
+  metric_transformation {
+    name          = "FRPSOwnerMissingRejectCount"
+    namespace     = "LayerV/NHP"
+    value         = "1"
+    default_value = 0
+  }
+}
+
+# Stuck-connector detector - PAGE severity.
+# A stuck connector re-knocks on a ~30s loop, so one genuinely-stuck
+# connector produces ~10 owner_missing rejects per 5-minute window. The
+# threshold (default 5, `GreaterThanOrEqualToThreshold` over a single
+# 5-minute Sum) is half that expected full-window count, so the alarm
+# needs only ~5 of the ~10 rejects — a connector wedged for even half a
+# window already breaches, without waiting for a full window to
+# accumulate. CloudWatch evaluates the Sum at each 5-minute period close,
+# so ALARM lands at the next period boundary (~5-6 min including
+# evaluation lag); the half-window sensitivity is what keeps that fast
+# without paging on noise. The metric is dimensionless (rejects sum across
+# all connectors), so the literal trigger is "≥5 owner_missing rejects in
+# a window" — one stuck connector is the common case, and a comparable
+# multi-connector burst pages too; a transient single blip (a connector
+# that re-knocks once and recovers, 1-2 rejects) stays well under 5 and
+# never pages. PAGE rather than ticket because the failure is a
+# non-self-healing, customer-visible tunnel outage (the exact class of
+# incident that previously hid for hours); the tuned threshold keeps
+# page-noise low by firing only on genuinely stuck connectors.
+resource "aws_cloudwatch_metric_alarm" "owner_missing_rejects" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-frps-owner-missing-rejects"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "FRPSOwnerMissingRejectCount"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = var.owner_missing_reject_threshold
+  alarm_description   = "FRP server rejected >=${var.owner_missing_reject_threshold} reverse-tunnel NewProxy registrations with `owner_missing: connector identity missing` in 5 minutes. A connector (e.g. fileviewer/detect) is stuck registering with no connector identity and its tunnel is dark; it retries ~every 30s and will NOT self-heal until the connector task is restarted. Runbook: docs/runbooks/frps-owner-missing-rejects.md. Triage: grep the frps log group for `owner_missing: connector identity missing` and read the surrounding `new proxy [name]` to identify the stuck connector."
+  treat_missing_data  = "notBreaching"
+  # `notBreaching` (not `breaching`) is intentional and matches the
+  # log-filter alarm family (log_error_rate / knock_token_reject_rate /
+  # min_client_version_sync_failure): `default_value = 0` keeps the
+  # high-volume series populated every period, so steady state is OK and
+  # a truly missing series means the frps log group has gone fully silent
+  # — already the `-frps-no-healthy-instance` PAGE. `breaching` would only
+  # add page-noise on transient publication gaps. The wire string this
+  # filter matches is byte-stable and emitted by the frps core on the
+  # current server (see the filter comment above), so there is no "field
+  # not live yet" blind window for `notBreaching` to hide.
+
+  # No `dimensions`: matches the dimensionless series the
+  # `owner_missing_reject_count` filter publishes above (see comment there).
+
+  alarm_actions = local.sns_actions
+  ok_actions    = local.sns_actions
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-frps-owner-missing-rejects"
+    Component = "qurl-reverse-tunnel-server"
+    Severity  = "page"
+  })
+}

@@ -236,6 +236,13 @@ module "nhp" {
   # thresholds above; env-tunable for known maintenance windows.
   knock_token_reject_threshold_per_minute = var.knock_token_reject_threshold_per_minute
 
+  # qurl-reverse-tunnel-server owner_missing reverse-tunnel reject alarm
+  # threshold. Same env-wrapper forward as the knock-token threshold above
+  # (root default 5); without this pass-through, the Tuning step in the
+  # runbook ("raise via env tfvars during a planned force-restart window")
+  # would silently no-op on the root default — the #2131 env-root gap.
+  owner_missing_reject_threshold = var.owner_missing_reject_threshold
+
   # qurl-reverse-tunnel-server per-AZ Cloud Map fanout (#1745):
   # blue/green, canary, and MULTIVALUE-flip variables.
   qurl_reverse_tunnel_server_min_size_per_az               = var.qurl_reverse_tunnel_server_min_size_per_az
