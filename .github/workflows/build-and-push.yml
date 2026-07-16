@@ -1568,6 +1568,33 @@ jobs:
         working-directory: terraform/environments/${{ matrix.environment }}
         run: terraform validate
 
+      - name: Terraform Control Init (no backend)
+        if: steps.changes.outputs.terraform_changed == 'true'
+        working-directory: terraform/control/environments/${{ matrix.environment }}
+        run: |
+          export TF_PLUGIN_CACHE_DIR="${HOME}/.terraform.d/plugin-cache"
+          terraform init -backend=false
+
+      - name: Terraform Control Validate
+        if: steps.changes.outputs.terraform_changed == 'true'
+        working-directory: terraform/control/environments/${{ matrix.environment }}
+        run: terraform validate
+
+      - name: Test dark Connector Authority foundation
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        run: |
+          shellcheck \
+            scripts/check-connector-authority-foundation.sh \
+            scripts/check-control-vpc-cidr-overlap.sh \
+            tests/fixtures/control-vpc-cidr-overlap/aws \
+            tests/scripts/check-connector-authority-foundation_test.sh \
+            tests/scripts/check-control-vpc-cidr-overlap_test.sh
+          tests/scripts/check-connector-authority-foundation_test.sh
+          tests/scripts/check-control-vpc-cidr-overlap_test.sh
+          scripts/check-connector-authority-foundation.sh
+          terraform -chdir=terraform/modules/connector-authority-foundation init -backend=false
+          terraform -chdir=terraform/modules/connector-authority-foundation test
+
       - name: Test actual relay TOML Terraform rendering
         if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         working-directory: tests/terraform/relay-toml-render
@@ -1686,6 +1713,15 @@ jobs:
 
       - name: Check terraform policy-condition denylist (#1316 regression fence)
         run: python3 ./.github/scripts/check-terraform-policy-conditions.py
+
+      - name: Check Connector control table schemas
+        # The authority owns global copies of four established qURL identity
+        # tables. Compare their exact keys, attributes, GSIs, and TTL shape to
+        # the canonical cell module so either side cannot drift silently.
+        run: python3 ./.github/scripts/check-connector-control-table-schemas.py
+
+      - name: Run Connector control table schema comparator unit tests
+        run: python3 ./tests/scripts/test_check_connector_control_table_schemas.py
 
       - name: Run Terraform Plan PR read-only policy fixture tests
         run: python3 ./tests/scripts/test_check_terraform_plan_pr_policy_readonly.py

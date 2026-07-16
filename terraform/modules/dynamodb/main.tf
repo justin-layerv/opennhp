@@ -1225,6 +1225,8 @@ resource "aws_dynamodb_table" "qurl_webhook_event_dedupe" {
 # qurl-api-keys: Stores API key hashes and metadata
 # PK: key_hash (SHA-256 of plaintext key)
 # GSI: owner-index (list keys by owner), key-id-index (lookup by public key ID)
+# Keep its control-plane copy schema in lockstep via
+# .github/scripts/check-connector-control-table-schemas.py.
 resource "aws_dynamodb_table" "qurl_api_keys" {
   count = var.deploy_qurl_tables ? 1 : 0
 
@@ -1324,6 +1326,8 @@ resource "aws_dynamodb_table" "qurl_api_keys" {
 # below moves off PAY_PER_REQUEST (unknown-pubkey lookups intentionally
 # bypass the in-process LRU; the bound is rate_limit × 1 Query per
 # distinct pubkey-per-window — see the godoc on `AgentPeerLookup`).
+# Keep its control-plane copy schema in lockstep via
+# .github/scripts/check-connector-control-table-schemas.py.
 resource "aws_dynamodb_table" "qurl_agent_keys" {
   count = var.deploy_qurl_tables ? 1 : 0
 
@@ -1496,6 +1500,8 @@ resource "aws_dynamodb_table" "qurl_resource_key_material" {
 
 # qurl-customers: Stores customer records for quota and billing
 # PK: auth0_subject (Auth0 user ID or "email:<sha256>" for bridge keys)
+# Keep its control-plane copy schema in lockstep via
+# .github/scripts/check-connector-control-table-schemas.py.
 resource "aws_dynamodb_table" "qurl_customers" {
   count = var.deploy_qurl_tables ? 1 : 0
 
@@ -1823,6 +1829,8 @@ resource "aws_dynamodb_table" "qurl_idempotency" {
 #
 # PK: pk (SHA-256 hash of owner_id:idempotency_key, scoped per discord
 #         OAuth state mint). TTL: 24h (matches qurl-idempotency).
+# Keep its control-plane copy schema in lockstep via
+# .github/scripts/check-connector-control-table-schemas.py.
 resource "aws_dynamodb_table" "qurl_apikey_idempotency" {
   count = var.deploy_qurl_tables ? 1 : 0
 

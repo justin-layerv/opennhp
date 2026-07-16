@@ -246,6 +246,40 @@ DATA_SOURCE_ACTIONS: dict[str, ActionSpec] = {
 # `resource-metric-alarm-tag-gap` fixture fences the regression: an
 # *untagged* alarm whose apply role lacks a tag verb must still flag.
 RESOURCE_ACTIONS: dict[str, ActionSpec] = {
+    # internal/service/ec2/vpc_default_security_group.go — the provider adopts
+    # the VPC-created default group, removes/reconciles its rules, and applies
+    # default tags. It does not create or delete the group itself.
+    "aws_default_security_group": [
+        "ec2:DescribeSecurityGroups",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:CreateTags",
+        "ec2:DeleteTags",
+    ],
+    # internal/service/elasticache/user.go — complete user lifecycle plus the
+    # tag APIs exercised by default_tags.
+    "aws_elasticache_user": [
+        "elasticache:CreateUser",
+        "elasticache:ModifyUser",
+        "elasticache:DeleteUser",
+        "elasticache:DescribeUsers",
+        "elasticache:AddTagsToResource",
+        "elasticache:RemoveTagsFromResource",
+        "elasticache:ListTagsForResource",
+    ],
+    # internal/service/elasticache/user_group.go — complete group lifecycle;
+    # ModifyUserGroup owns membership updates.
+    "aws_elasticache_user_group": [
+        "elasticache:CreateUserGroup",
+        "elasticache:ModifyUserGroup",
+        "elasticache:DeleteUserGroup",
+        "elasticache:DescribeUserGroups",
+        "elasticache:AddTagsToResource",
+        "elasticache:RemoveTagsFromResource",
+        "elasticache:ListTagsForResource",
+    ],
     # internal/service/ec2/vpc_route.go — standalone route CRUD uses
     # CreateRoute, ReplaceRoute, DeleteRoute, and DescribeRouteTables.
     # Route-table and endpoint-owned inline routes are separate resources.

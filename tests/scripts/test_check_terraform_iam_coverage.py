@@ -100,6 +100,27 @@ class ShippedConstants(unittest.TestCase):
             IAM.RESOURCE_ACTIONS["aws_route53_resolver_query_log_config_association"],
         )
 
+    def test_connector_foundation_resource_families_stay_mapped(self):
+        """The foundation's new default-SG and Redis RBAC resource types
+        remain action-checked instead of silently grandfathered."""
+        grandfathered = IAM.RESOURCE_UNCHECKED_ACK | IAM._FIXTURE_SCAFFOLD_ACK
+        for rtype in (
+            "aws_default_security_group",
+            "aws_elasticache_user",
+            "aws_elasticache_user_group",
+        ):
+            self.assertIn(rtype, IAM.RESOURCE_ACTIONS)
+            self.assertNotIn(rtype, grandfathered)
+
+        self.assertIn(
+            "ec2:RevokeSecurityGroupEgress",
+            IAM.RESOURCE_ACTIONS["aws_default_security_group"],
+        )
+        self.assertIn(
+            "elasticache:CreateUserGroup",
+            IAM.RESOURCE_ACTIONS["aws_elasticache_user_group"],
+        )
+
 
 class RequiredActionsDispatch(unittest.TestCase):
     """The shared `_required_actions` dispatch. All shipped RESOURCE_ACTIONS

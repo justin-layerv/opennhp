@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+service="$1"
+operation="$2"
+
+case "${service}:${operation}" in
+  sts:get-caller-identity)
+    printf '%s\n' "${FAKE_ACCOUNT_ID:-767397897469}"
+    ;;
+  ec2:describe-vpcs)
+    if [[ -n "${FAKE_VPC_CIDR:-}" ]]; then
+      printf '{"Vpcs":[{"CidrBlockAssociationSet":[{"CidrBlock":"%s","CidrBlockState":{"State":"associated"}}]}]}\n' "$FAKE_VPC_CIDR"
+    else
+      printf '%s\n' '{"Vpcs":[]}'
+    fi
+    ;;
+  ec2:describe-ipams)
+    if [[ -n "${FAKE_IPAM_STATE:-}" ]]; then
+      printf '{"Ipams":[{"State":"%s"}]}\n' "$FAKE_IPAM_STATE"
+    else
+      printf '%s\n' '{"Ipams":[]}'
+    fi
+    ;;
+  ec2:describe-vpc-peering-connections)
+    if [[ -n "${FAKE_PEERING_CIDR:-}" ]]; then
+      printf '{"VpcPeeringConnections":[{"Status":{"Code":"active"},"AccepterVpcInfo":{"CidrBlockSet":[{"CidrBlock":"%s"}]},"RequesterVpcInfo":{"CidrBlockSet":[]}}]}\n' "$FAKE_PEERING_CIDR"
+    else
+      printf '%s\n' '{"VpcPeeringConnections":[]}'
+    fi
+    ;;
+  ec2:describe-transit-gateway-attachments)
+    if [[ -n "${FAKE_TGW_STATE:-}" ]]; then
+      printf '{"TransitGatewayAttachments":[{"State":"%s"}]}\n' "$FAKE_TGW_STATE"
+    else
+      printf '%s\n' '{"TransitGatewayAttachments":[]}'
+    fi
+    ;;
+  ec2:describe-route-tables)
+    if [[ -n "${FAKE_ROUTE_CIDR:-}" ]]; then
+      printf '{"RouteTables":[{"Routes":[{"DestinationCidrBlock":"%s","State":"active"}]}]}\n' "$FAKE_ROUTE_CIDR"
+    else
+      printf '%s\n' '{"RouteTables":[]}'
+    fi
+    ;;
+  ec2:describe-vpn-gateways)
+    printf '%s\n' '{"VpnGateways":[]}'
+    ;;
+  ec2:describe-vpn-connections)
+    printf '%s\n' '{"VpnConnections":[]}'
+    ;;
+  ec2:describe-client-vpn-endpoints)
+    printf '%s\n' '{"ClientVpnEndpoints":[]}'
+    ;;
+  directconnect:describe-connections)
+    printf '%s\n' '{"connections":[]}'
+    ;;
+  directconnect:describe-virtual-interfaces)
+    printf '%s\n' '{"virtualInterfaces":[]}'
+    ;;
+  *)
+    echo "unexpected fake aws call: ${service} ${operation}" >&2
+    exit 2
+    ;;
+esac

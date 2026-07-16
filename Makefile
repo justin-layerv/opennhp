@@ -549,6 +549,10 @@ lint-terraform-drift:
 	@./tests/lints/terraform-prod-drift/run-fixtures.sh
 	@python3 .github/scripts/check-terraform-iam-coverage.py
 	@python3 .github/scripts/check-terraform-policy-conditions.py
+	@python3 .github/scripts/check-connector-control-table-schemas.py
+	@python3 tests/scripts/test_check_connector_control_table_schemas.py
+	@bash tests/scripts/check-connector-authority-foundation_test.sh
+	@bash tests/scripts/check-control-vpc-cidr-overlap_test.sh
 	@python3 tests/scripts/test_check_terraform_plan_pr_policy_readonly.py
 	@python3 tests/scripts/test_ac_tcp_target_group_contract.py
 	@python3 .github/scripts/check-terraform-plan-pr-policy-readonly.py

@@ -3024,9 +3024,46 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "arn:aws:elasticache:${local.region}:${local.account_id}:serverlesscache:layerv-nhp-*",
           "arn:aws:elasticache:${local.region}:${local.account_id}:subnetgroup:layerv-nhp-*"
         ]
+      },
+      {
+        # These are the only ElastiCache users/groups in the repository. Keep
+        # the shared apply role inside this environment's global authority
+        # namespace; Create/ModifyUserGroup requires both user and usergroup
+        # resource types according to the ElastiCache IAM action contract.
+        Sid    = "ElastiCacheControlRBAC"
+        Effect = "Allow"
+        Action = [
+          "elasticache:CreateUser",
+          "elasticache:ModifyUser",
+          "elasticache:DeleteUser",
+          "elasticache:DescribeUsers",
+          "elasticache:CreateUserGroup",
+          "elasticache:ModifyUserGroup",
+          "elasticache:DeleteUserGroup",
+          "elasticache:DescribeUserGroups",
+          "elasticache:ListTagsForResource",
+          "elasticache:AddTagsToResource",
+          "elasticache:RemoveTagsFromResource"
+        ]
+        Resource = [
+          "arn:aws:elasticache:${local.region}:${local.account_id}:user:layerv-nhp-${var.environment}-control-*",
+          "arn:aws:elasticache:${local.region}:${local.account_id}:usergroup:layerv-nhp-${var.environment}-control-*"
+        ]
       }
     ]
   })
+
+  lifecycle {
+    postcondition {
+      # IAM counts non-whitespace characters toward the 6,144-character
+      # customer-managed-policy quota. jsonencode emits no insignificant
+      # whitespace, so this is the exact provider payload length. Environment-
+      # specific renders measured 3,084/3,078 characters after adding the
+      # control-only RBAC statement, leaving 3,060/3,066 characters.
+      condition     = length(self.policy) <= 6144
+      error_message = "terraform_apply_data exceeds IAM's 6,144-character customer-managed policy quota; split statements within the existing attachment budget before applying."
+    }
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "terraform_apply_data" {

@@ -53,7 +53,7 @@ while IFS=$'\t' read -r status file _rest; do
 			terraform_changed=true
 			prod_env_changed=true
 			;;
-		terraform/*|.github/workflows/terraform-plan-pr.yml|.github/actions/build-lambda-packages/*|.github/scripts/classify-terraform-plan-pr-changes.sh|.github/scripts/check-relay-dmz-plan*.py|.github/scripts/fetch-auth0-token.sh)
+		terraform/*|.github/workflows/terraform-plan-pr.yml|.github/actions/build-lambda-packages/*|.github/scripts/classify-terraform-plan-pr-changes.sh|.github/scripts/check-relay-dmz-plan*.py|.github/scripts/fetch-auth0-token.sh|scripts/check-connector-authority-foundation.sh|scripts/check-control-vpc-cidr-overlap.sh)
 			terraform_changed=true
 			non_prod_plan_input_changed=true
 			;;

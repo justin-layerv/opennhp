@@ -804,6 +804,52 @@ class TerraformPlanPrBootstrapTests(unittest.TestCase):
         self.assertNotIn("arn:aws:iam::${local.account_id}:role/nhp-*", resources)
 
 
+class ConnectorAuthorityApplyPolicyTests(unittest.TestCase):
+    def test_apply_data_has_plan_time_iam_size_guard(self) -> None:
+        body = find_resource_body(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "aws_iam_policy",
+            "terraform_apply_data",
+        )
+        lifecycle = as_list(body.get("lifecycle"))
+        self.assertEqual(len(lifecycle), 1)
+        self.assertIsInstance(lifecycle[0], dict)
+        postconditions = as_list(lifecycle[0].get("postcondition"))
+        self.assertEqual(len(postconditions), 1)
+        self.assertIsInstance(postconditions[0], dict)
+        self.assertEqual(postconditions[0].get("condition"), "${length(self.policy) <= 6144}")
+        self.assertIn("6,144-character", unquote(postconditions[0].get("error_message")))
+
+    def test_elasticache_rbac_is_control_namespace_only(self) -> None:
+        stmt = find_policy_statement(
+            REPO_ROOT / "terraform", "terraform_apply_data", "ElastiCacheControlRBAC"
+        )
+
+        self.assertEqual(
+            set(normalized_strings(stmt.get("Resource"))),
+            {
+                "arn:aws:elasticache:${local.region}:${local.account_id}:user:layerv-nhp-${var.environment}-control-*",
+                "arn:aws:elasticache:${local.region}:${local.account_id}:usergroup:layerv-nhp-${var.environment}-control-*",
+            },
+        )
+        self.assertEqual(
+            set(normalized_strings(stmt.get("Action"))),
+            {
+                "elasticache:CreateUser",
+                "elasticache:ModifyUser",
+                "elasticache:DeleteUser",
+                "elasticache:DescribeUsers",
+                "elasticache:CreateUserGroup",
+                "elasticache:ModifyUserGroup",
+                "elasticache:DeleteUserGroup",
+                "elasticache:DescribeUserGroups",
+                "elasticache:ListTagsForResource",
+                "elasticache:AddTagsToResource",
+                "elasticache:RemoveTagsFromResource",
+            },
+        )
+
+
 class DynamoDBReadPolicyTests(unittest.TestCase):
     def test_qurl_agent_keys_read_is_narrowly_scoped(self) -> None:
         policy = find_policy_expression(REPO_ROOT / "terraform", "dynamodb_read")

@@ -281,6 +281,72 @@ jobs:
           role-to-assume: ${{ secrets.AWS_TERRAFORM_PLAN_PR_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Deliberately gate every Terraform-input PR. Shared modules, IAM, and
+      # workflow helpers can affect this root without living below
+      # terraform/control; before its first apply the expected plan is the
+      # additive foundation. The plan contract below also rejects any desired
+      # public-network or runtime resource type from the machine-readable plan.
+      - name: Terraform Control Init
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        working-directory: terraform/control/environments/sandbox
+        run: |
+          export TF_PLUGIN_CACHE_DIR="${HOME}/.terraform.d/plugin-cache"
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure
+
+      - name: Terraform Control Plan
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        id: control_plan
+        working-directory: terraform/control/environments/sandbox
+        run: |
+          set -euo pipefail
+          export TF_PLUGIN_CACHE_DIR="${HOME}/.terraform.d/plugin-cache"
+          rm -f control.tfplan control.tfplan.json control-plan.txt
+
+          set +e
+          terraform plan \
+            -refresh=false \
+            -lock=false \
+            -out=control.tfplan \
+            -no-color 2>&1 | tee control-plan.txt
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ "$status" -eq 0 ]] && ! terraform show -json control.tfplan > control.tfplan.json; then
+            echo "::error::terraform show -json control.tfplan failed"
+            status=1
+          fi
+
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Check Terraform Control Plan Contract
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code == '0'
+        run: scripts/check-connector-authority-foundation.sh terraform/control/environments/sandbox/control.tfplan.json
+
+      - name: Summarize Terraform Control Plan
+        if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code != ''
+        working-directory: terraform/control/environments/sandbox
+        env:
+          CONTROL_PLAN_EXIT_CODE: ${{ steps.control_plan.outputs.exit_code }}
+        run: |
+          result="failed"
+          resource_changes="unavailable"
+          if [[ "$CONTROL_PLAN_EXIT_CODE" == "0" ]]; then
+            result="passed"
+            resource_changes=$(jq '[.resource_changes[]? | select(.change.actions != ["no-op"])] | length' control.tfplan.json)
+          fi
+          {
+            echo "### Terraform Control Plan (sandbox)"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Result | \`$result\` |"
+            echo "| Changed resources | \`$resource_changes\` |"
+            echo "| State | \`nhp/sandbox/control/terraform.tfstate\` |"
+            echo
+            echo "This is the separate environment-global Connector Authority control root; it is planned with refresh disabled and the read-only PR role."
+          } | tee control-plan-summary.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Terraform Init
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
         working-directory: terraform/environments/sandbox
@@ -436,14 +502,15 @@ jobs:
           path: |
             terraform/environments/sandbox/plan-summary.md
             terraform/environments/sandbox/plan-comment-summary.md
+            terraform/control/environments/sandbox/control-plan-summary.md
           if-no-files-found: ignore
           retention-days: 7
 
       # Summarize Terraform Plan must keep converting formatter errors into a
-      # fallback summary and exiting 0. This gate owns the captured non-zero
-      # terraform plan exit so setup and formatter failures stay distinguishable.
-      - name: Fail on plan error
-        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.plan.outputs.exit_code != '' && steps.plan.outputs.exit_code != '0'
+      # fallback summary and exiting 0. This single gate owns either captured
+      # non-zero plan exit so setup and formatter failures stay distinguishable.
+      - name: Fail on Terraform plan error
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && ((steps.control_plan.outputs.exit_code != '' && steps.control_plan.outputs.exit_code != '0') || (steps.plan.outputs.exit_code != '' && steps.plan.outputs.exit_code != '0'))
         run: exit 1
 
   comment:
@@ -480,13 +547,25 @@ jobs:
             const shouldCreate =
               process.env.TERRAFORM_CHANGED === 'true' || process.env.TERRAFORM_PLAN_RESULT === 'failure';
             try {
-              const summaryPaths = [
+              const rootSummaryPaths = [
                 'terraform-plan-pr-summary/plan-comment-summary.md',
+                'terraform-plan-pr-summary/environments/sandbox/plan-comment-summary.md',
                 'terraform-plan-pr-summary/terraform/environments/sandbox/plan-comment-summary.md',
               ];
-              const summaryPath = summaryPaths.find((candidate) => fs.existsSync(candidate));
-              body = summaryPath
-                ? fs.readFileSync(summaryPath, 'utf8')
+              const controlSummaryPaths = [
+                'terraform-plan-pr-summary/control-plan-summary.md',
+                'terraform-plan-pr-summary/control/environments/sandbox/control-plan-summary.md',
+                'terraform-plan-pr-summary/terraform/control/environments/sandbox/control-plan-summary.md',
+              ];
+              const summaryContents = [rootSummaryPaths, controlSummaryPaths]
+                .map((paths) => paths.find((candidate) => fs.existsSync(candidate)))
+                .filter(Boolean)
+                .map((summaryPath) => fs.readFileSync(summaryPath, 'utf8').trim());
+              // Setup failures can leave only the Control summary. Preserve
+              // the stable marker exactly once so the bot updates one comment.
+              const summaryHasMarker = summaryContents.some((summary) => summary.includes(marker));
+              body = summaryContents.length > 0
+                ? `${summaryHasMarker ? '' : `${marker}\n`}${summaryContents.join('\n\n')}\n`
                 : [
                     marker,
                     '### Terraform Plan (sandbox)',
