@@ -662,7 +662,7 @@ resource "aws_cloudfront_response_headers_policy" "status" {
     content_security_policy {
       # default-src 'self' intentionally covers same-origin fonts, favicon, and
       # wordmark assets; add font-src/img-src if future assets move off-origin.
-      content_security_policy = "default-src 'self'; script-src 'self' 'sha256-bFlHsn9Enzj51ySCuKusaEL3SqydjecfjkBGGbeX7AI='; style-src 'self' 'sha256-h10OFbNedvlJHfsFUyApPbAl+d/AAIXBJoq5C1MuJ1w='; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+      content_security_policy = "default-src 'self'; script-src 'self' 'sha256-bFlHsn9Enzj51ySCuKusaEL3SqydjecfjkBGGbeX7AI='; style-src 'self' 'sha256-JLYjh7btQNnePEwh0Bp5AWKH7ub+8XMxV4xP/k5P+A4='; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
       override                = true
     }
     strict_transport_security {

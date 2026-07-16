@@ -31,7 +31,8 @@
       src: url('/fonts/archivo-black-latin.woff2') format('woff2');
     }
 
-    /* Design tokens: mirrored from website app/globals.css (Mono Extreme).
+    /* Design tokens: mirrored from website app/globals.css (wordmark-branded:
+       ink canvas, slate-white text, the logo's cyan as the single UI accent).
        Keep in sync with the site rather than inventing new values. */
     :root {
       --bg-primary: #0a0a0a;
@@ -45,9 +46,7 @@
       --slate-300: #cbd5e1;
       --slate-400: #94a3b8;
 
-      --accent-lime: #a6ff00;
-      --accent-lime-dim: rgba(166, 255, 0, 0.12);
-      --accent-lime-border: rgba(166, 255, 0, 0.22);
+      --accent-cyan: #07dcef;
 
       --status-ok: #10b981;
       --status-ok-bright: #22c55e;
@@ -116,7 +115,7 @@
     }
 
     ::selection {
-      background: var(--accent-lime);
+      background: var(--accent-cyan);
       color: var(--bg-primary);
     }
 
@@ -126,7 +125,7 @@
     }
 
     :focus-visible {
-      outline: 2px solid var(--accent-lime);
+      outline: 2px solid var(--accent-cyan);
       outline-offset: 2px;
       border-radius: 2px;
     }
@@ -212,7 +211,7 @@
     }
 
     .header-links a:hover {
-      color: var(--accent-lime);
+      color: var(--accent-cyan);
     }
 
     /* ----------------------------------------------------------- main */
@@ -269,14 +268,14 @@
       font-weight: 700;
       letter-spacing: 0;
       text-transform: uppercase;
-      color: var(--accent-lime);
+      color: var(--accent-cyan);
       margin-bottom: 18px;
     }
 
     .kicker-rule {
       width: 28px;
       height: 1px;
-      background: var(--accent-lime);
+      background: var(--accent-cyan);
       opacity: 0.7;
     }
 
@@ -737,7 +736,7 @@
     }
 
     .footer-links a:hover {
-      color: var(--accent-lime);
+      color: var(--accent-cyan);
     }
 
     .footer-fine {

@@ -35,23 +35,32 @@
       --quiet: #939390;
       --line: rgba(255, 255, 245, 0.08);
       --line-strong: rgba(255, 255, 245, 0.16);
-      --accent-lime: #a6ff00;
-      --accent-lime-dark: #7ec800;
+      --accent-cyan: #07dcef;
+      /* Channel triplet for rgba(var(--accent-cyan-rgb), <alpha>) derived
+        shades — same pattern as the website's --color-accent-cyan-rgb. */
+      --accent-cyan-rgb: 7, 220, 239;
+      --accent-cyan-bright: #33e4f7;
+      --accent-cyan-dark: #0aa4e4;
       --accent-green: #10b981;
       --threat-red: #ef4444;
       --warning-amber: #eab308;
       --radial-washes:
         radial-gradient(900px 600px at 78% 18%, rgba(255, 255, 245, 0.025), transparent 70%),
-        radial-gradient(700px 500px at 22% 88%, rgba(166, 255, 0, 0.04), transparent 70%);
-      --accent-line: linear-gradient(90deg, transparent, var(--accent-lime), transparent);
+        radial-gradient(700px 500px at 22% 88%, rgba(var(--accent-cyan-rgb), 0.04), transparent 70%);
+      --accent-line: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
       --surface: linear-gradient(180deg, rgba(15, 23, 42, 0.55) 0%, rgba(3, 7, 18, 0.35) 100%);
       --surface-strong: rgba(22, 22, 26, 0.92);
       --shadow: rgba(0, 0, 0, 0.5);
-      /* qurl.link is a strict-CSP static shell. Match the website's Mono
-        Extreme palette and assets here, but keep typography self-contained
-        unless the font files are also served from this bucket. */
+      /* qurl.link is a strict-CSP static shell. Match the website's
+        wordmark-branded palette (ink canvas, slate-white text, the logo's
+        own cyan #07dcef as the single UI accent — see app/globals.css in
+        the website repo) and assets here, but keep typography
+        self-contained unless the font files are also served from this
+        bucket: system stacks stand in for the site's Manrope / Archivo
+        Black / JetBrains Mono. */
       --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
       --font-display: var(--font-sans);
+      --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     }
 
     * {
@@ -91,6 +100,16 @@
     a {
       color: inherit;
       text-decoration: none;
+    }
+
+    ::selection {
+      background: var(--accent-cyan);
+      color: var(--ink);
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--accent-cyan);
+      outline-offset: 2px;
     }
 
     .landing {
@@ -150,7 +169,7 @@
       justify-content: center;
       padding: 0 0.82rem;
       border: 1px solid transparent;
-      border-radius: 999px;
+      border-radius: 8px;
       color: var(--muted);
       font-size: 0.875rem;
       font-weight: 600;
@@ -158,22 +177,21 @@
 
     .nav a:hover,
     .nav a:focus-visible {
-      color: var(--accent-lime);
+      color: var(--accent-cyan);
       border-color: transparent;
       background: transparent;
-      outline: none;
     }
 
     .nav .nav-cta {
       color: var(--ink);
-      background: var(--accent-lime);
-      border-color: rgba(166, 255, 0, 0.4);
+      background: var(--accent-cyan);
+      border-color: var(--accent-cyan);
     }
 
     .nav .nav-cta:hover,
     .nav .nav-cta:focus-visible {
       color: var(--ink);
-      background: #b6ff33;
+      background: var(--accent-cyan-bright);
     }
 
     .hero {
@@ -220,15 +238,27 @@
       width: min(100%, 720px);
     }
 
+    /* Shared mono micro-label voice (site kicker treatment); per-class
+      rules below carry only layout, color, and deliberate size bumps. */
+    .eyebrow,
+    .section-kicker,
+    .demo-kicker,
+    .demo-status,
+    .status-pill {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
     .eyebrow,
     .section-kicker {
       display: inline-flex;
       align-items: center;
       gap: 0.875rem;
-      color: var(--accent-lime);
-      font-size: 0.78rem;
-      font-weight: 700;
-      text-transform: uppercase;
+      color: var(--accent-cyan);
+      font-size: 0.75rem;
     }
 
     .eyebrow::before,
@@ -236,7 +266,7 @@
       content: "";
       width: 2.25rem;
       height: 1px;
-      background: linear-gradient(to left, transparent, var(--accent-lime-dark));
+      background: linear-gradient(to left, transparent, var(--accent-cyan-dark));
     }
 
     h1 {
@@ -245,7 +275,10 @@
       font-family: var(--font-display);
       font-size: 5.4rem;
       line-height: 0.94;
-      font-weight: 400;
+      /* The website sets heroes in Archivo Black; the heaviest system-sans
+        cut is the closest self-contained stand-in. */
+      font-weight: 800;
+      letter-spacing: -0.02em;
       color: var(--paper);
     }
 
@@ -281,43 +314,42 @@
       gap: 0.55rem;
       padding: 0 1.05rem;
       border: 1px solid var(--line-strong);
-      border-radius: 999px;
+      border-radius: 8px;
       font-weight: 700;
-      transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+      transition: transform 160ms ease, background 160ms ease;
     }
 
     .button:hover,
     .button:focus-visible {
       transform: translateY(-2px);
-      outline: none;
     }
 
     .button.primary {
       color: var(--ink);
-      background: var(--accent-lime);
-      border-color: rgba(166, 255, 0, 0.4);
+      background: var(--accent-cyan);
+      border-color: var(--accent-cyan);
       box-shadow:
-        0 0 0 1px rgba(166, 255, 0, 0.12),
-        0 18px 40px -10px rgba(166, 255, 0, 0.25);
+        0 0 0 1px rgba(var(--accent-cyan-rgb), 0.12),
+        0 18px 40px -10px rgba(var(--accent-cyan-rgb), 0.25);
     }
 
     .button.secondary {
-      color: var(--paper);
-      background: rgba(255, 255, 245, 0.06);
+      color: var(--accent-cyan);
+      background: transparent;
+      border-color: var(--accent-cyan);
     }
 
     .button.primary:hover,
     .button.primary:focus-visible {
-      background: #b6ff33;
+      background: var(--accent-cyan-bright);
       box-shadow:
-        0 0 0 1px rgba(166, 255, 0, 0.2),
-        0 22px 52px -10px rgba(166, 255, 0, 0.35);
+        0 0 0 1px rgba(var(--accent-cyan-rgb), 0.2),
+        0 22px 52px -10px rgba(var(--accent-cyan-rgb), 0.35);
     }
 
     .button.secondary:hover,
     .button.secondary:focus-visible {
-      background: rgba(255, 255, 245, 0.1);
-      border-color: rgba(255, 255, 245, 0.24);
+      background: rgba(var(--accent-cyan-rgb), 0.12);
     }
 
     .hero-demo {
@@ -327,7 +359,7 @@
       border: 1px solid var(--line-strong);
       border-radius: 8px;
       background:
-        radial-gradient(420px 260px at 22% 85%, rgba(166, 255, 0, 0.1), transparent 70%),
+        radial-gradient(420px 260px at 22% 85%, rgba(var(--accent-cyan-rgb), 0.1), transparent 70%),
         linear-gradient(180deg, rgba(37, 37, 43, 0.74), rgba(22, 22, 26, 0.88));
       box-shadow: 0 30px 90px rgba(0, 0, 0, 0.34);
       overflow: hidden;
@@ -373,7 +405,7 @@
       display: inline-flex;
       align-items: center;
       gap: 0.45rem;
-      color: var(--accent-lime);
+      color: var(--accent-cyan);
     }
 
     .demo-status::before {
@@ -381,8 +413,8 @@
       width: 0.48rem;
       height: 0.48rem;
       border-radius: 999px;
-      background: var(--accent-lime);
-      box-shadow: 0 0 18px rgba(166, 255, 0, 0.35);
+      background: var(--accent-cyan);
+      box-shadow: 0 0 18px rgba(var(--accent-cyan-rgb), 0.35);
     }
 
     .demo-card {
@@ -396,10 +428,7 @@
     }
 
     .demo-kicker {
-      color: var(--accent-lime);
-      font-size: 0.72rem;
-      font-weight: 800;
-      text-transform: uppercase;
+      color: var(--accent-cyan);
     }
 
     .demo-title {
@@ -440,14 +469,14 @@
     }
 
     .route-node.gate {
-      border-color: rgba(166, 255, 0, 0.35);
-      color: var(--accent-lime);
+      border-color: rgba(var(--accent-cyan-rgb), 0.35);
+      color: var(--accent-cyan);
     }
 
     .route-line {
       height: 2px;
       background: var(--accent-line);
-      box-shadow: 0 0 18px rgba(166, 255, 0, 0.2);
+      box-shadow: 0 0 18px rgba(var(--accent-cyan-rgb), 0.2);
     }
 
     .demo-meta {
@@ -528,6 +557,7 @@
       margin-bottom: 0.85rem;
       font-size: 2.35rem;
       line-height: 1.1;
+      letter-spacing: -0.02em;
     }
 
     .steps,
@@ -565,7 +595,7 @@
       right: 0;
       top: 0;
       height: 3px;
-      background: var(--accent, var(--accent-lime));
+      background: var(--accent, var(--accent-cyan));
     }
 
     .step-number {
@@ -575,7 +605,7 @@
       place-items: center;
       margin-bottom: 1.05rem;
       color: var(--ink);
-      background: var(--accent, var(--accent-lime));
+      background: var(--accent, var(--accent-cyan));
       border-radius: 8px;
       font-weight: 900;
     }
@@ -606,7 +636,7 @@
       border: 1px solid var(--line-strong);
       border-radius: 8px;
       background:
-        linear-gradient(135deg, rgba(166, 255, 0, 0.08), transparent 34%),
+        linear-gradient(135deg, rgba(var(--accent-cyan-rgb), 0.08), transparent 34%),
         linear-gradient(180deg, rgba(255, 255, 245, 0.065), rgba(255, 255, 245, 0.018)),
         var(--surface-strong);
       box-shadow: 0 30px 90px rgba(0, 0, 0, 0.34);
@@ -632,7 +662,7 @@
       top: 50%;
       height: 2px;
       background: var(--accent-line);
-      box-shadow: 0 0 22px rgba(166, 255, 0, 0.28);
+      box-shadow: 0 0 22px rgba(var(--accent-cyan-rgb), 0.28);
     }
 
     .map-node {
@@ -667,7 +697,7 @@
       left: 50%;
       top: 8.25rem;
       transform: translateX(-50%);
-      border-color: rgba(166, 255, 0, 0.35);
+      border-color: rgba(var(--accent-cyan-rgb), 0.35);
     }
 
     .map-node.resource {
@@ -684,8 +714,6 @@
       background: rgba(16, 185, 129, 0.12);
       border: 1px solid rgba(16, 185, 129, 0.28);
       border-radius: 8px;
-      font-size: 0.78rem;
-      font-weight: 850;
     }
 
     .use {
@@ -729,7 +757,7 @@
       place-items: center;
       padding: 1.25rem;
       background:
-        radial-gradient(700px 500px at 22% 12%, rgba(166, 255, 0, 0.06), transparent 70%),
+        radial-gradient(700px 500px at 22% 12%, rgba(var(--accent-cyan-rgb), 0.06), transparent 70%),
         var(--ink);
     }
 
@@ -771,7 +799,7 @@
       height: 2.45rem;
       margin: 1.15rem auto;
       border: 3px solid rgba(255, 255, 245, 0.16);
-      border-top-color: var(--accent-lime);
+      border-top-color: var(--accent-cyan);
       border-radius: 999px;
       animation: spin 900ms linear infinite;
     }
@@ -985,7 +1013,7 @@
         bottom: 4.5rem;
         width: 2px;
         height: auto;
-        background: linear-gradient(180deg, transparent, var(--accent-lime), transparent);
+        background: linear-gradient(180deg, transparent, var(--accent-cyan), transparent);
       }
 
       .map-node {
@@ -1118,7 +1146,7 @@
           </div>
           <div class="steps">
             <!-- Keep --accent values static while style-src allows inline style attributes. -->
-            <article class="step" style="--accent: var(--accent-lime)">
+            <article class="step" style="--accent: var(--accent-cyan)">
               <div class="step-number">1</div>
               <h3>Wrap something private</h3>
               <p>Turn a sensitive URL into a qURL without teaching the recipient a new workflow.</p>
@@ -1174,7 +1202,7 @@
             <h2>Use qURL anywhere a normal link feels too permanent.</h2>
           </div>
           <div class="uses">
-            <article class="use" style="--accent: var(--accent-lime)">
+            <article class="use" style="--accent: var(--accent-cyan)">
               <h3>Client documents</h3>
               <p>Send a private review packet without creating a standing public share URL.</p>
             </article>
@@ -1229,6 +1257,9 @@
         <h2 class="access-title">Verifying access</h2>
         <p class="access-message">Opening this private resource for your browser.</p>
       </div>
+      <!-- The server-side resolve failure page (accessDeniedHTML in
+        endpoints/server/staticplugins/qurl/main.go) mirrors this panel's
+        design; update both surfaces together. -->
       <div class="access-error">
         <h2 class="access-title">Access link invalid</h2>
         <p class="access-message">
