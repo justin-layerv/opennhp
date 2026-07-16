@@ -252,6 +252,30 @@ var (
 	ErrRegistrationBootstrapKeyConsumed = newError("52108", "bootstrap key consumed")
 	// ErrRegistrationInvalidInput — a registration request identifier is malformed or unknown (e.g. an invalid device_id, reachable via a client-side WithDeviceID override). Distinct from ErrRegistrationApiKeyInvalid so a bad device_id does not surface the misleading "invalid api key" string to the agent; both are terminal client errors (not load shedding), so neither should be retried.
 	ErrRegistrationInvalidInput = newError("52109", "invalid registration input")
+	// ErrAssignmentTicketInvalid — the assigned-cell activation ticket failed signature verification or disagreed with the authenticated pubkey, devId, cell, or generation.
+	ErrAssignmentTicketInvalid = newError("52110", "assignment ticket invalid")
+	// ErrAssignmentTicketExpired — the activation ticket expired; the agent must repeat one bounded initial enrollment transaction before retrying registration.
+	ErrAssignmentTicketExpired = newError("52111", "assignment ticket expired")
+	// ErrAgentRegistrationQuotaExceeded — activation would exceed the owner's registered-agent quota.
+	ErrAgentRegistrationQuotaExceeded = newError("52112", "agent registration quota exceeded")
+
+	// server: agent assignment (52200+). These are LRT verdicts from the
+	// environment-level hub. retryAfterSeconds is valid only where the
+	// ServerListResultMsg contract explicitly permits it.
+	ErrAssignmentUnavailable      = newError("52200", "assignment unavailable")
+	ErrAssignmentIdentityRejected = newError("52201", "identity rejected")
+	ErrReassignmentInProgress     = newError("52202", "reassignment in progress")
+	ErrAssignmentQuotaExceeded    = newError("52203", "assignment quota exceeded")
+	ErrAssignmentRateLimited      = newError("52204", "assignment rate limited")
+	ErrInvalidAssignmentRequest   = newError("52205", "invalid assignment request")
+
+	// server: registered-agent completion (52300+). These are LRT verdicts
+	// from the assigned cell after REG/RAK has bound the authenticated peer.
+	ErrCompletionUnavailable         = newError("52300", "completion unavailable")
+	ErrCompletionIdentityRejected    = newError("52301", "completion identity rejected")
+	ErrDeviceCredentialQuotaExceeded = newError("52302", "device credential quota exceeded")
+	ErrDeviceCredentialConflict      = newError("52303", "device credential conflict")
+	ErrInvalidCompletionRequest      = newError("52304", "invalid completion request")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")

@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -194,6 +196,146 @@ func TestBuildRegisterAck_ScriptedAckAndPubKey(t *testing.T) {
 	}
 	if got.ErrCode != common.ErrSuccess.ErrorCode() || got.AuthServiceId != aspID {
 		t.Errorf("RAK = %+v, want the scripted success ack", got)
+	}
+}
+
+func assertPreservedRawPluginRequest(
+	t *testing.T,
+	rawBody, sourceBody []byte,
+	gotPublicKey, wantPublicKey string,
+	request any,
+	rawOnlyMarkers ...string,
+) {
+	t.Helper()
+	wantRaw := bytes.Clone(sourceBody)
+	if !bytes.Equal(rawBody, wantRaw) {
+		t.Fatalf("RawBody = %q, want exact decrypted body %q", rawBody, wantRaw)
+	}
+	if gotPublicKey != wantPublicKey {
+		t.Fatalf("PublicKey = %q, want authenticated ppd key %q", gotPublicKey, wantPublicKey)
+	}
+
+	for i := range sourceBody {
+		sourceBody[i] = 'x'
+	}
+	if !bytes.Equal(rawBody, wantRaw) {
+		t.Fatalf("RawBody changed after source-buffer reuse: got %q want %q", rawBody, wantRaw)
+	}
+
+	serialized, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal plugin request: %v", err)
+	}
+	for _, marker := range rawOnlyMarkers {
+		if strings.Contains(string(serialized), marker) {
+			t.Fatalf("json:\"-\" RawBody leaked %q through request serialization: %s", marker, serialized)
+		}
+	}
+}
+
+// These shared builders serve both direct UDP and relayed inner packets. The
+// typed legacy decode deliberately remains permissive for duplicate and unknown
+// fields, so the role plugin must receive an exact retained body (including
+// trailing whitespace) to apply its stricter contract itself.
+func TestBuildRegisterAck_PreservesIndependentRawBodyForPlugin(t *testing.T) {
+	const aspID = "asp-reg-raw-body"
+	pubKey := testPubkey(0xD1)
+	wantPubKey := base64.StdEncoding.EncodeToString(pubKey)
+	raw := []byte("{\n  \"usrId\":\"first\",\"usrId\":\"final\",\"devId\":\"d\",\"aspId\":\"" + aspID + "\",\"otp\":\"123456\",\"unknown\":\"reg-raw-only\",\"pubKey\":\"attacker-json-key\"\n}\n\t")
+
+	plugin := &recordingRegOTPPlugin{regAck: &common.ServerRegisterAckMsg{ErrCode: common.ErrSuccess.ErrorCode()}}
+	s := newRegisterUnitServer(t, map[string]plugins.PluginHandler{aspID: plugin})
+	ppd := buildRegisterPpd(t, aspID, pubKey)
+	ppd.BodyMessage = raw
+
+	if _, err := s.buildRegisterAck(ppd); err != nil {
+		t.Fatalf("buildRegisterAck: %v", err)
+	}
+	if plugin.regCalls != 1 || plugin.regGot == nil {
+		t.Fatalf("RegisterAgent calls/request = %d/%#v, want one retained request", plugin.regCalls, plugin.regGot)
+	}
+	assertPreservedRawPluginRequest(t,
+		plugin.regGot.RawBody, ppd.BodyMessage,
+		plugin.regGot.PublicKey, wantPubKey,
+		plugin.regGot, "reg-raw-only", "attacker-json-key",
+	)
+}
+
+func TestBuildListResult_PreservesIndependentRawBodyForPlugin(t *testing.T) {
+	const aspID = "asp-list-raw-body"
+	pubKey := testPubkey(0xD2)
+	wantPubKey := base64.StdEncoding.EncodeToString(pubKey)
+	raw := []byte("{\n  \"usrId\":\"first\",\"usrId\":\"final\",\"devId\":\"d\",\"aspId\":\"" + aspID + "\",\"unknown\":\"list-raw-only\",\"pubKey\":\"attacker-json-key\"\n}\n\t")
+
+	plugin := &recordingRegOTPPlugin{listAck: &common.ServerListResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}}
+	s := newRegisterUnitServer(t, map[string]plugins.PluginHandler{aspID: plugin})
+	ppd := buildListPpd(t, aspID, pubKey)
+	ppd.BodyMessage = raw
+
+	if _, _, err := s.buildListResult(ppd); err != nil {
+		t.Fatalf("buildListResult: %v", err)
+	}
+	if plugin.listCalls != 1 || plugin.listGot == nil {
+		t.Fatalf("ListService calls/request = %d/%#v, want one retained request", plugin.listCalls, plugin.listGot)
+	}
+	assertPreservedRawPluginRequest(t,
+		plugin.listGot.RawBody, ppd.BodyMessage,
+		plugin.listGot.PublicKey, wantPubKey,
+		plugin.listGot, "list-raw-only", "attacker-json-key",
+	)
+}
+
+func TestRawBody_InvalidEmptyPayloadNeverReachesPlugin(t *testing.T) {
+	const aspID = "asp-empty-raw-body"
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "nil", body: nil},
+		{name: "empty", body: []byte{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name+" register", func(t *testing.T) {
+			plugin := &recordingRegOTPPlugin{}
+			s := newRegisterUnitServer(t, map[string]plugins.PluginHandler{aspID: plugin})
+			ppd := buildRegisterPpd(t, aspID, testPubkey(0xD3))
+			ppd.BodyMessage = tc.body
+			rakBytes, err := s.buildRegisterAck(ppd)
+			if err != nil {
+				t.Fatalf("buildRegisterAck: %v", err)
+			}
+			if plugin.regCalls != 0 {
+				t.Fatalf("RegisterAgent calls = %d, want 0 for invalid body", plugin.regCalls)
+			}
+			var ack common.ServerRegisterAckMsg
+			if err := json.Unmarshal(rakBytes, &ack); err != nil {
+				t.Fatalf("unmarshal RAK: %v", err)
+			}
+			if ack.ErrCode != common.ErrJsonParseFailed.ErrorCode() {
+				t.Fatalf("RAK errCode = %q, want %q", ack.ErrCode, common.ErrJsonParseFailed.ErrorCode())
+			}
+		})
+
+		t.Run(tc.name+" list", func(t *testing.T) {
+			plugin := &recordingRegOTPPlugin{}
+			s := newRegisterUnitServer(t, map[string]plugins.PluginHandler{aspID: plugin})
+			ppd := buildListPpd(t, aspID, testPubkey(0xD4))
+			ppd.BodyMessage = tc.body
+			lrtBytes, _, err := s.buildListResult(ppd)
+			if err == nil {
+				t.Fatal("buildListResult returned nil parse error")
+			}
+			if plugin.listCalls != 0 {
+				t.Fatalf("ListService calls = %d, want 0 for invalid body", plugin.listCalls)
+			}
+			var result common.ServerListResultMsg
+			if err := json.Unmarshal(lrtBytes, &result); err != nil {
+				t.Fatalf("unmarshal LRT: %v", err)
+			}
+			if result.ErrCode != common.ErrJsonParseFailed.ErrorCode() {
+				t.Fatalf("LRT errCode = %q, want %q", result.ErrCode, common.ErrJsonParseFailed.ErrorCode())
+			}
+		})
 	}
 }
 

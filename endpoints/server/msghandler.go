@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -1504,6 +1505,7 @@ func (s *UdpServer) buildRegisterAck(ppd *core.PacketParserData) ([]byte, error)
 			Msg:       regMsg,
 			Ack:       rakMsg,
 			PublicKey: agentPubkey,
+			RawBody:   bytes.Clone(ppd.BodyMessage),
 			SrcAddr: &common.NetAddress{
 				Ip:   ppd.ConnData.RemoteAddr.IP.String(),
 				Port: ppd.ConnData.RemoteAddr.Port,
@@ -1619,6 +1621,7 @@ func (s *UdpServer) buildListResult(ppd *core.PacketParserData) ([]byte, string,
 			Msg:       lstMsg,
 			Ack:       lrtMsg,
 			PublicKey: agentPubkey,
+			RawBody:   bytes.Clone(ppd.BodyMessage),
 			SrcAddr: &common.NetAddress{
 				Ip:   ppd.ConnData.RemoteAddr.IP.String(),
 				Port: ppd.ConnData.RemoteAddr.Port,

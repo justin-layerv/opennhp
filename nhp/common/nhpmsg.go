@@ -114,9 +114,10 @@ type AgentListMsg struct {
 }
 
 type ServerListResultMsg struct {
-	ErrCode     string         `json:"errCode"`
-	ErrMsg      string         `json:"errMsg,omitempty"`
-	ListResults map[string]any `json:"list,omitempty"`
+	ErrCode           string         `json:"errCode"`
+	ErrMsg            string         `json:"errMsg,omitempty"`
+	ListResults       map[string]any `json:"list,omitempty"`
+	RetryAfterSeconds *uint32        `json:"retryAfterSeconds,omitempty"`
 }
 
 // agent <-> ac

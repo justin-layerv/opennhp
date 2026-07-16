@@ -279,6 +279,47 @@ func TestServerACOpsMsg_LegacyAOP_OmitsQurlV2Metadata(t *testing.T) {
 	}
 }
 
+func TestServerListResultMsg_RetryAfterSecondsWireCompatibility(t *testing.T) {
+	t.Run("absent field preserves legacy JSON", func(t *testing.T) {
+		msg := ServerListResultMsg{
+			ErrCode:     ErrSuccess.ErrorCode(),
+			ListResults: map[string]any{"resource": "allowed"},
+		}
+		got, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal legacy LRT: %v", err)
+		}
+		const want = `{"errCode":"0","list":{"resource":"allowed"}}`
+		if string(got) != want {
+			t.Fatalf("legacy LRT JSON = %s, want byte-exact %s", got, want)
+		}
+	})
+
+	t.Run("positive field emits and round trips", func(t *testing.T) {
+		retryAfter := uint32(17)
+		msg := ServerListResultMsg{
+			ErrCode:           ErrAssignmentUnavailable.ErrorCode(),
+			RetryAfterSeconds: &retryAfter,
+		}
+		got, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal LRT with retry hint: %v", err)
+		}
+		const want = `{"errCode":"52200","retryAfterSeconds":17}`
+		if string(got) != want {
+			t.Fatalf("LRT JSON = %s, want %s", got, want)
+		}
+
+		var roundTrip ServerListResultMsg
+		if err := json.Unmarshal(got, &roundTrip); err != nil {
+			t.Fatalf("unmarshal LRT with retry hint: %v", err)
+		}
+		if roundTrip.RetryAfterSeconds == nil || *roundTrip.RetryAfterSeconds != retryAfter {
+			t.Fatalf("round-trip retryAfterSeconds = %v, want %d", roundTrip.RetryAfterSeconds, retryAfter)
+		}
+	})
+}
+
 // TestServerACOpsMsg_V2AOP_EmitsExpectedKeys pins the on-wire JSON tag names for
 // the populated path, so the server stamper and the AC reader cannot drift to
 // different keys without a test failing. (RevocationEpoch is omitempty, so 0 is

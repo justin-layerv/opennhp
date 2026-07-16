@@ -166,6 +166,10 @@ type NhpRegisterRequest struct {
 	Ack       *ServerRegisterAckMsg `json:"ack"`
 	PublicKey string                `json:"pubKey"`
 	SrcAddr   *NetAddress           `json:"srcAddr"`
+	// RawBody is an exact defensive copy of the decrypted NHP_REG body. It
+	// lets a role-specific plugin perform strict duplicate/unknown/alias-field
+	// checks without trusting the permissive typed decode above.
+	RawBody []byte `json:"-"`
 }
 
 type NhpAuthRequest struct {
@@ -182,6 +186,10 @@ type NhpListRequest struct {
 	Ack       *ServerListResultMsg `json:"ack"`
 	PublicKey string               `json:"pubKey"`
 	SrcAddr   *NetAddress          `json:"srcAddr"`
+	// RawBody is an exact defensive copy of the decrypted NHP_LST body. The
+	// authenticated initiator identity remains PublicKey, populated separately
+	// from PacketParserData.RemotePubKey rather than from these JSON bytes.
+	RawBody []byte `json:"-"`
 }
 
 type HttpKnockRequest struct {
