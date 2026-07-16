@@ -1396,6 +1396,7 @@ func (s *UdpServer) dispatchOTP(ppd *core.PacketParserData) error {
 	otpReq := &common.NhpOTPRequest{
 		Msg:       otpMsg,
 		PublicKey: agentPubkey,
+		RawBody:   bytes.Clone(ppd.BodyMessage),
 		SrcAddr: &common.NetAddress{
 			Ip:   ppd.ConnData.RemoteAddr.IP.String(),
 			Port: ppd.ConnData.RemoteAddr.Port,

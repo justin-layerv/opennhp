@@ -665,6 +665,14 @@ func encryptInnerForRelay(t *testing.T, agentDev *core.Device, serverPk []byte, 
 	if err != nil {
 		t.Fatalf("marshal inner message: %v", err)
 	}
+	return encryptRawInnerForRelay(t, agentDev, serverPk, wireType, trxID, body)
+}
+
+// encryptRawInnerForRelay preserves an already-serialized body byte-for-byte.
+// It is used when a test needs to fence duplicate fields, unknown fields,
+// ordering, or whitespace across the full relay decrypt path.
+func encryptRawInnerForRelay(t *testing.T, agentDev *core.Device, serverPk []byte, wireType int, trxID uint64, body []byte) []byte {
+	t.Helper()
 	conn := newSpikeConn(agentDev, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206})
 	agentDev.SendMsgToPacket(&core.MsgData{
 		ConnData:      conn,

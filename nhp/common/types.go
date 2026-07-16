@@ -159,6 +159,12 @@ type NhpOTPRequest struct {
 	// message fields.
 	PublicKey string      `json:"pubKey"`
 	SrcAddr   *NetAddress `json:"srcAddr"`
+	// RawBody is an exact defensive copy of the decrypted NHP_OTP body. It
+	// lets a role-specific plugin perform strict duplicate/unknown/alias-field
+	// checks without trusting the permissive typed decode above. Both RawBody
+	// and Msg may contain credentials; do not log or persist the enclosing
+	// request verbatim.
+	RawBody []byte `json:"-"`
 }
 
 type NhpRegisterRequest struct {

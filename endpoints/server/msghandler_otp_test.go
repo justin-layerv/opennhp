@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"net"
@@ -24,16 +25,12 @@ func (c *capturingOTPHandler) RequestOTP(req *common.NhpOTPRequest, _ *plugins.N
 	return nil
 }
 
-// TestHandleOTPRequest_PopulatesPublicKey fences the NhpOTPRequest.PublicKey
-// plumbing added for NHP-native agent registration (N1): HandleOTPRequest must
-// hand plugins the Noise-authenticated initiator static key (std-base64 of
-// ppd.RemotePubKey), the same way HandleRegisterRequest populates
-// NhpRegisterRequest.PublicKey. Without this a plugin issuing one-time
-// registration credentials could only key them on message fields the client
-// chooses freely (UserId/DeviceId), not on the cryptographically authenticated
-// agent identity. There was no prior HandleOTPRequest unit test; this also
-// pins the pre-existing Msg/SrcAddr pass-through.
-func TestHandleOTPRequest_PopulatesPublicKey(t *testing.T) {
+// TestHandleOTPRequest_PreservesRawBodyAndPublicKey fences the direct UDP OTP
+// plugin boundary. The plugin receives both the exact decrypted body for strict
+// duplicate/unknown-field validation and the independently Noise-authenticated
+// initiator static key. RawBody must not alias the handler-owned BodyMessage,
+// preserving independent ownership if either side later mutates its slice.
+func TestHandleOTPRequest_PreservesRawBodyAndPublicKey(t *testing.T) {
 	const aspID = "asp-otp-n1"
 	handler := &capturingOTPHandler{}
 	s := &UdpServer{
@@ -41,15 +38,8 @@ func TestHandleOTPRequest_PopulatesPublicKey(t *testing.T) {
 		pluginHandlerMap: map[string]plugins.PluginHandler{aspID: handler},
 	}
 
-	otpMsg := &common.AgentOTPMsg{
-		UserId:        "user-1",
-		DeviceId:      "device-1",
-		AuthServiceId: aspID,
-	}
-	body, err := json.Marshal(otpMsg)
-	if err != nil {
-		t.Fatalf("marshal AgentOTPMsg: %v", err)
-	}
+	body := []byte("{\n  \"usrId\":\"first\",\"usrId\":\"user-1\",\"devId\":\"device-1\",\"aspId\":\"" + aspID + "\",\"pass\":\"secret\",\"unknown\":\"otp-raw-only\",\"pubKey\":\"attacker-json-key\"\n}\n\t")
+	wantRawBody := bytes.Clone(body)
 
 	// A fixed 32-byte "peer static key" as core.responder.validatePeer would
 	// have left it on the ppd after the Noise handshake check.
@@ -75,9 +65,31 @@ func TestHandleOTPRequest_PopulatesPublicKey(t *testing.T) {
 		t.Errorf("NhpOTPRequest.PublicKey = %q, want %q (std-base64 of ppd.RemotePubKey)",
 			handler.got.PublicKey, want)
 	}
-	if handler.got.Msg == nil || handler.got.Msg.UserId != otpMsg.UserId ||
+	if handler.got.Msg == nil || handler.got.Msg.UserId != "user-1" ||
 		handler.got.Msg.AuthServiceId != aspID {
 		t.Errorf("NhpOTPRequest.Msg not passed through: %+v", handler.got.Msg)
+	}
+	if !bytes.Equal(handler.got.RawBody, wantRawBody) {
+		t.Fatalf("NhpOTPRequest.RawBody = %q, want exact decrypted body %q", handler.got.RawBody, wantRawBody)
+	}
+	if &handler.got.RawBody[0] == &body[0] {
+		t.Fatal("NhpOTPRequest.RawBody aliases ppd.BodyMessage; plugin ownership must be defensive")
+	}
+	handler.got.RawBody[0] = '!'
+	if !bytes.Equal(body, wantRawBody) {
+		t.Fatal("mutating NhpOTPRequest.RawBody changed ppd.BodyMessage")
+	}
+	handler.got.RawBody[0] = wantRawBody[0]
+	body[0] = '!'
+	if !bytes.Equal(handler.got.RawBody, wantRawBody) {
+		t.Fatal("reusing ppd.BodyMessage changed NhpOTPRequest.RawBody")
+	}
+	serialized, err := json.Marshal(handler.got)
+	if err != nil {
+		t.Fatalf("marshal NhpOTPRequest: %v", err)
+	}
+	if bytes.Contains(serialized, []byte("otp-raw-only")) || bytes.Contains(serialized, []byte("attacker-json-key")) {
+		t.Fatalf("json:\"-\" RawBody leaked through request serialization: %s", serialized)
 	}
 	if handler.got.SrcAddr == nil || handler.got.SrcAddr.Ip != "10.9.8.7" ||
 		handler.got.SrcAddr.Port != 54321 {

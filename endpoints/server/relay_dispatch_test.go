@@ -152,9 +152,8 @@ func TestHandleRelayForward_InnerOTP_DispatchesPluginNoReply(t *testing.T) {
 	relayListen := mustUDPListener(t)  // stands in for the relay; a reply would land here
 	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
 
-	innerOTP := encryptInnerForRelay(t, agentDev, serverPk, core.NHP_OTP, 9001, &common.AgentOTPMsg{
-		UserId: "u", DeviceId: "d", AuthServiceId: aspID,
-	})
+	rawBody := []byte("{\n  \"usrId\":\"first\",\"usrId\":\"u\",\"devId\":\"d\",\"aspId\":\"" + aspID + "\",\"pass\":\"secret\",\"unknown\":\"relay-otp-raw-only\",\"pubKey\":\"attacker-json-key\"\n}\n\t")
+	innerOTP := encryptRawInnerForRelay(t, agentDev, serverPk, core.NHP_OTP, 9001, rawBody)
 
 	relayPub := relayTestPubKey()
 	relayPubB64 := base64.StdEncoding.EncodeToString(relayPub)
@@ -174,14 +173,17 @@ func TestHandleRelayForward_InnerOTP_DispatchesPluginNoReply(t *testing.T) {
 	if plugin.otpCalls != 1 {
 		t.Fatalf("plugin RequestOTP called %d times, want 1 (relayed OTP must reach the OTP dispatch)", plugin.otpCalls)
 	}
-	if plugin.otpGot == nil || plugin.otpGot.PublicKey != agentPkB64 {
-		t.Errorf("OTP request PublicKey = %q, want authenticated agent key %q", func() string {
-			if plugin.otpGot == nil {
-				return "<nil>"
-			}
-			return plugin.otpGot.PublicKey
-		}(), agentPkB64)
+	if plugin.otpGot == nil {
+		t.Fatal("relayed OTP did not reach the plugin")
 	}
+	if plugin.otpGot.Msg == nil || plugin.otpGot.Msg.UserId != "u" || plugin.otpGot.Msg.AuthServiceId != aspID {
+		t.Fatalf("relayed OTP typed message = %+v, want duplicate-field last value and aspId %q", plugin.otpGot.Msg, aspID)
+	}
+	assertPreservedRawPluginRequest(t,
+		plugin.otpGot.RawBody, rawBody,
+		plugin.otpGot.PublicKey, agentPkB64,
+		plugin.otpGot, "relay-otp-raw-only", "attacker-json-key",
+	)
 
 	// FIRE-AND-FORGET: absolutely nothing may be written back toward the relay.
 	if err := relayListen.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
