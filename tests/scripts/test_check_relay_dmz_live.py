@@ -3952,6 +3952,121 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
             )
         )
 
+    def test_unhealthy_coverage_reports_issue_and_is_a_candidate(self) -> None:
+        snapshot = good_snapshot()
+        snapshot["functional"]["guardduty_coverage"][0]["status"] = "UNHEALTHY"
+        snapshot["functional"]["guardduty_coverage"][0]["issue"] = (
+            "VPC endpoint creation failed"
+        )
+        errors = checker.validate_snapshot(snapshot, "functional")
+        self.assertTrue(
+            any(
+                "GuardDuty runtime coverage is UNHEALTHY: VPC endpoint creation failed"
+                in error
+                for error in errors
+            )
+        )
+        self.assertTrue(checker._unhealthy_coverage_with_issue(snapshot))
+
+    def test_unhealthy_coverage_without_issue_is_not_a_candidate(self) -> None:
+        snapshot = good_snapshot()
+        snapshot["functional"]["guardduty_coverage"][0]["status"] = "UNHEALTHY"
+        snapshot["functional"]["guardduty_coverage"][0]["issue"] = ""
+        errors = checker.validate_snapshot(snapshot, "functional")
+        # Still a violation (not HEALTHY)...
+        self.assertTrue(
+            any(
+                "lacks healthy GuardDuty runtime coverage" in error for error in errors
+            )
+        )
+        # ...but with no Issue detail it is not a terminal fast-fail candidate.
+        self.assertFalse(checker._unhealthy_coverage_with_issue(snapshot))
+
+    def test_unhealthy_coverage_candidate_requires_single_detector(self) -> None:
+        snapshot = good_snapshot()
+        snapshot["functional"]["guardduty_coverage"][0]["status"] = "UNHEALTHY"
+        snapshot["functional"]["guardduty_coverage"][0]["issue"] = (
+            "VPC endpoint creation failed"
+        )
+        # A transient 0/2 detector-count read (eventually consistent after a
+        # refresh) makes the detector-count error authoritative; coverage rows are
+        # not meaningful, so this is not a terminal candidate.
+        snapshot["functional"]["guardduty_detector_count"] = 2
+        self.assertFalse(checker._unhealthy_coverage_with_issue(snapshot))
+
+    def test_candidate_and_validation_agree_on_duplicate_coverage_rows(self) -> None:
+        # If ListCoverage ever returned two rows for one instance, the terminal
+        # candidate check and validate_functional must read the SAME (last-row-wins)
+        # row, so a candidate always has a matching coverage error — no false pass.
+        healthy = {
+            "instance_id": "i-relay-0",
+            "status": "HEALTHY",
+            "issue": "",
+            "agent_version": "v1.15.0",
+            "management_type": "AUTO_MANAGED",
+        }
+        broken = {
+            "instance_id": "i-relay-0",
+            "status": "UNHEALTHY",
+            "issue": "VPC endpoint creation failed",
+            "agent_version": "v1.15.0",
+            "management_type": "AUTO_MANAGED",
+        }
+        for last, expect_candidate in ((healthy, False), (broken, True)):
+            with self.subTest(last_status=last["status"]):
+                snapshot = good_snapshot()
+                first = broken if last is healthy else healthy
+                # Two rows for i-relay-0 (`last` wins under the shared dict view),
+                # one row for every other instance.
+                snapshot["functional"]["guardduty_coverage"] = [first, last] + [
+                    row
+                    for row in snapshot["functional"]["guardduty_coverage"]
+                    if row["instance_id"] != "i-relay-0"
+                ]
+                candidate = checker._unhealthy_coverage_with_issue(snapshot)
+                errors = checker.validate_snapshot(snapshot, "functional")
+                has_unhealthy_error = any(
+                    "i-relay-0 GuardDuty runtime coverage is UNHEALTHY" in error
+                    for error in errors
+                )
+                self.assertEqual(expect_candidate, candidate)
+                # The no-false-pass invariant: candidate <=> a coverage error.
+                self.assertEqual(candidate, has_unhealthy_error)
+
+    def test_terminal_persist_bound_stays_below_functional_wait_window(self) -> None:
+        # The persistence bound must stay below the functional gate's convergence
+        # window or the fast-fail never triggers before the window closes. That
+        # invariant spans this module (Python) and build-and-push.yml (YAML); bind
+        # it in a test rather than leaving it to a comment, matching how the repo
+        # gates every other cross-file drift.
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "build-and-push.yml"
+        ).read_text()
+        # Positional match on the functional invocation's flag order; if the flags
+        # are ever reordered this fails loudly (exactly-one-match assert below)
+        # rather than silently passing.
+        waits = re.findall(
+            r"check-relay-dmz-live\.py --mode functional "
+            r"--environment \S+ --wait-seconds (\d+)",
+            workflow,
+        )
+        self.assertEqual(
+            1, len(waits), "expected exactly one functional gate invocation"
+        )
+        # Upper bound: below the window, or the fast-fail never fires before it
+        # closes (silently neutered).
+        self.assertLess(
+            checker.RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS, int(waits[0])
+        )
+        # Lower bound: a provisioning floor (5 min), so a future edit that lowers
+        # the constant below plausible agent-provisioning time — reintroducing the
+        # false-fail-on-"Waiting for SSM notification" this gate exists to prevent —
+        # fails CI, enforcing the "comfortably longer than provisioning" intent
+        # rather than leaving it to the runbook watch-note.
+        self.assertGreaterEqual(
+            checker.RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS, 300
+        )
+
     def test_functional_empty_instance_set_fails_independently(self) -> None:
         snapshot = good_snapshot()
         snapshot["canonical_asg"]["instance_ids"] = []
@@ -4234,6 +4349,249 @@ class RelayDmzLiveCheckTests(unittest.TestCase):
         self.assertEqual(1, result)
         self.assertEqual(2, collection_count)
         self.assertIn("does not have an active relay service", output.getvalue())
+
+    def test_live_functional_fast_fails_on_persistent_unhealthy_coverage(
+        self,
+    ) -> None:
+        output = io.StringIO()
+
+        def collect_functional(snapshot: dict, aws: object, cache: dict) -> bool:
+            snapshot["functional"] = copy.deepcopy(good_snapshot()["functional"])
+            snapshot["functional"]["guardduty_coverage"][0]["status"] = "UNHEALTHY"
+            snapshot["functional"]["guardduty_coverage"][0]["issue"] = (
+                "SCP blocks guardduty:SendSecurityTelemetry"
+            )
+            return False
+
+        threshold = float(checker.RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS)
+        # Advancing clock: each read jumps a full threshold ahead, so any two
+        # candidate reads are >= threshold apart and the streak crosses the bound
+        # no matter how many monotonic() reads the loop makes. Robust to future
+        # loop edits that add clock reads, unlike a fixed side_effect list.
+        clock = {"t": 0.0}
+
+        def advancing_monotonic() -> float:
+            now = clock["t"]
+            clock["t"] += threshold
+            return now
+
+        with (
+            mock.patch.object(
+                checker, "AwsCli", return_value=mock.Mock(region="us-east-2")
+            ),
+            mock.patch.object(
+                checker,
+                "collect_structural",
+                side_effect=[good_snapshot(), good_snapshot()],
+            ),
+            mock.patch.object(
+                checker, "collect_functional", side_effect=collect_functional
+            ),
+            mock.patch.object(checker, "_sleep_until_retry", return_value=True),
+            mock.patch.object(
+                checker.time, "monotonic", side_effect=advancing_monotonic
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(output),
+        ):
+            result = checker.main(
+                [
+                    "--environment",
+                    "sandbox",
+                    "--mode",
+                    "functional",
+                    "--wait-seconds",
+                    "1200",
+                ]
+            )
+
+        self.assertEqual(1, result)
+        self.assertIn("persistent regression", output.getvalue())
+        self.assertIn("not retrying", output.getvalue())
+        self.assertIn(
+            "GuardDuty runtime coverage is UNHEALTHY: SCP blocks "
+            "guardduty:SendSecurityTelemetry",
+            output.getvalue(),
+        )
+
+    def test_live_functional_transient_unhealthy_coverage_does_not_fast_fail(
+        self,
+    ) -> None:
+        output = io.StringIO()
+        calls = 0
+
+        def collect_functional(snapshot: dict, aws: object, cache: dict) -> bool:
+            nonlocal calls
+            snapshot["functional"] = copy.deepcopy(good_snapshot()["functional"])
+            if calls == 0:
+                # Transient provisioning read: UNHEALTHY + "Waiting for SSM
+                # notification". Must NOT fast-fail; it converges on the next read.
+                snapshot["functional"]["guardduty_coverage"][0]["status"] = "UNHEALTHY"
+                snapshot["functional"]["guardduty_coverage"][0]["issue"] = (
+                    "Waiting for SSM notification"
+                )
+            calls += 1
+            return False
+
+        with (
+            mock.patch.object(
+                checker, "AwsCli", return_value=mock.Mock(region="us-east-2")
+            ),
+            mock.patch.object(
+                checker,
+                "collect_structural",
+                side_effect=[good_snapshot(), good_snapshot()],
+            ),
+            mock.patch.object(
+                checker, "collect_functional", side_effect=collect_functional
+            ),
+            mock.patch.object(checker, "_sleep_until_retry", return_value=True),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(output),
+        ):
+            result = checker.main(
+                [
+                    "--environment",
+                    "sandbox",
+                    "--mode",
+                    "functional",
+                    "--wait-seconds",
+                    "1200",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(2, calls)
+        self.assertNotIn("not retrying", output.getvalue())
+        self.assertIn("still converging", output.getvalue())
+
+    def test_live_functional_persistent_under_threshold_keeps_retrying(self) -> None:
+        # UNHEALTHY+Issue held continuously across several reads but for LESS than
+        # the persistence bound must NOT fast-fail — it patiently retries and fails
+        # only at window close. Pins the discrimination boundary opposite the
+        # fast-fail test above.
+        output = io.StringIO()
+
+        def collect_functional(snapshot: dict, aws: object, cache: dict) -> bool:
+            snapshot["functional"] = copy.deepcopy(good_snapshot()["functional"])
+            snapshot["functional"]["guardduty_coverage"][0]["status"] = "UNHEALTHY"
+            snapshot["functional"]["guardduty_coverage"][0]["issue"] = (
+                "SCP blocks guardduty:SendSecurityTelemetry"
+            )
+            return False
+
+        threshold = float(checker.RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS)
+        # Each read advances by a small fraction of the bound, so across all reads
+        # the streak never crosses it. The loop ends when _sleep_until_retry finally
+        # returns False (window close), not via the terminal fast-fail.
+        clock = {"t": 0.0}
+
+        def crawling_monotonic() -> float:
+            now = clock["t"]
+            clock["t"] += threshold / 10.0
+            return now
+
+        with (
+            mock.patch.object(
+                checker, "AwsCli", return_value=mock.Mock(region="us-east-2")
+            ),
+            mock.patch.object(
+                checker,
+                "collect_structural",
+                side_effect=[good_snapshot() for _ in range(4)],
+            ),
+            mock.patch.object(
+                checker, "collect_functional", side_effect=collect_functional
+            ),
+            mock.patch.object(
+                checker, "_sleep_until_retry", side_effect=[True, True, True, False]
+            ),
+            mock.patch.object(
+                checker.time, "monotonic", side_effect=crawling_monotonic
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(output),
+        ):
+            result = checker.main(
+                [
+                    "--environment",
+                    "sandbox",
+                    "--mode",
+                    "functional",
+                    "--wait-seconds",
+                    "1200",
+                ]
+            )
+
+        self.assertEqual(1, result)
+        self.assertNotIn("not retrying", output.getvalue())
+        self.assertNotIn("persistent regression", output.getvalue())
+        self.assertIn("still converging", output.getvalue())
+
+    def test_live_functional_fleet_union_streak_fast_fails(self) -> None:
+        # Characterizes the deliberate fleet-union semantics documented at
+        # RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS: the streak tracks whether *any*
+        # canonical instance is a candidate, so two instances each a candidate in
+        # sequence (never simultaneously) keep it continuous and fast-fail at the
+        # bound even though no single instance was broken the whole time. Safe only
+        # because the gate runs post-ASG-convergence; a future per-instance rewrite
+        # would intentionally flip this test.
+        output = io.StringIO()
+        calls = 0
+
+        def collect_functional(snapshot: dict, aws: object, cache: dict) -> bool:
+            nonlocal calls
+            snapshot["functional"] = copy.deepcopy(good_snapshot()["functional"])
+            # Read 0: i-relay-0 is the sole candidate; read 1: i-relay-0 has healed
+            # but i-relay-1 is now the candidate — union never sees a clean read.
+            target = "i-relay-0" if calls == 0 else "i-relay-1"
+            for row in snapshot["functional"]["guardduty_coverage"]:
+                if row["instance_id"] == target:
+                    row["status"] = "UNHEALTHY"
+                    row["issue"] = "Waiting for SSM notification"
+            calls += 1
+            return False
+
+        threshold = float(checker.RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS)
+        clock = {"t": 0.0}
+
+        def advancing_monotonic() -> float:
+            now = clock["t"]
+            clock["t"] += threshold
+            return now
+
+        with (
+            mock.patch.object(
+                checker, "AwsCli", return_value=mock.Mock(region="us-east-2")
+            ),
+            mock.patch.object(
+                checker,
+                "collect_structural",
+                side_effect=[good_snapshot(), good_snapshot()],
+            ),
+            mock.patch.object(
+                checker, "collect_functional", side_effect=collect_functional
+            ),
+            mock.patch.object(checker, "_sleep_until_retry", return_value=True),
+            mock.patch.object(
+                checker.time, "monotonic", side_effect=advancing_monotonic
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(output),
+        ):
+            result = checker.main(
+                [
+                    "--environment",
+                    "sandbox",
+                    "--mode",
+                    "functional",
+                    "--wait-seconds",
+                    "1200",
+                ]
+            )
+
+        self.assertEqual(1, result)
+        self.assertIn("not retrying", output.getvalue())
 
     def test_final_fresh_confirmation_rejects_cached_probe_reuse(self) -> None:
         output = io.StringIO()

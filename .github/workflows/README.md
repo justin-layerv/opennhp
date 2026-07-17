@@ -25,7 +25,11 @@ services. The window is 1200s (not the structural 300s) because the refresh
 replaces every instance and the GuardDuty auto-managed runtime coverage the gate
 asserts is observed through the eventually-consistent ListCoverage read, which
 can lag the fast control-plane HEALTHY transition by >10 min on a fresh
-instance; the window is a ceiling that a converged read clears in minutes. The later
+instance; the window is a ceiling that a converged read clears in minutes. So the
+wider window does not also slow detection of a *real* break, the gate fails fast
+once coverage stays `UNHEALTHY` with an `Issue` continuously past a provisioning
+bound — persistence, not a single read, so a still-provisioning agent's transient
+`"Waiting for SSM notification"` never false-fails. The later
 `qurl-relay-bootstrap-smoke` step proves the public browser
 hostname/path. The rollout runbook separately requires a real external SDK NHP
 round trip through the assigned cell's server NLB UDP 62206 listener and

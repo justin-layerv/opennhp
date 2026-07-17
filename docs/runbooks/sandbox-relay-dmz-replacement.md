@@ -91,7 +91,18 @@ runs functional validation. Functional target health covers the HTTPS target
 group only. The detector can be repeated independently as a read-only check.
 Pass `--wait-seconds 1200` (matching CI) when re-running just after a refresh so
 the eventually-consistent GuardDuty `ListCoverage` read has time to catch up;
-without it the detector is one-shot and can false-fail once on that same lag.
+without it the detector is one-shot and can false-fail once on that same lag. A
+*persistent* coverage break (UNHEALTHY with an `Issue` for longer than agent
+provisioning) fails fast without waiting out the window, and prints the Issue — a
+still-provisioning `"Waiting for SSM notification"` read does not.
+
+> **Watch this in the first weeks of relay deploys.** The fast-fail assumes the
+> `UNHEALTHY` + `"Waiting for SSM notification"` provisioning transient always
+> clears in under `RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS` (600s). If a healthy
+> fleet is ever seen sitting in that transient past ~8 min, raise the constant
+> (`scripts/check-relay-dmz-live.py`) — keep it below the functional
+> `--wait-seconds` (a test enforces that). A false fast-fail is a re-runnable red,
+> not an outage.
 
 ```bash
 python3 scripts/check-relay-dmz-live.py --environment sandbox --mode functional \

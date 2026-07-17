@@ -2817,7 +2817,10 @@ jobs:
         # eventually-consistent ListCoverage API, which can lag the fast
         # control-plane HEALTHY transition by >10 min on a fresh instance. The
         # window is a ceiling reached only by a lagging read; keep it in lockstep
-        # with the job timeout-minutes above.
+        # with the job timeout-minutes above. A real break is still caught fast:
+        # coverage that stays UNHEALTHY with an Issue past a provisioning bound
+        # fails the gate without waiting out the full window (the transient
+        # "Waiting for SSM notification" ramp-up does not, so it never false-fails).
         run: python3 scripts/check-relay-dmz-live.py --mode functional --environment sandbox --wait-seconds 1200
 
   # Dispatch blue/green deployment instead of doing direct instance refresh.

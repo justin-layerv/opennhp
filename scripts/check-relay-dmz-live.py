@@ -34,7 +34,10 @@ The functional caller runs a 20-minute convergence window because it asserts
 GuardDuty auto-managed runtime coverage through the eventually-consistent
 ListCoverage read, which can lag the fast control-plane HEALTHY transition by
 >10 min on a freshly refreshed instance; that window is a ceiling that a
-converged read clears in minutes, not a per-deploy cost.
+converged read clears in minutes, not a per-deploy cost. So the wider window does
+not also lengthen detection of a genuine coverage break, the live loop fails fast
+on a break that stays UNHEALTHY-with-Issue past a persistence bound
+(RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS).
 
 Functional mode uses SSM SendCommand. The integration IAM is currently scoped
 to sandbox relay tags while the prod relay remains dark. Enabling this command
@@ -168,6 +171,27 @@ RELAY_ACK_UDP_PORT = 62207
 RELAY_HEALTH_PATH = "/health/live"
 RELAY_TLS_POLICY = "ELBSecurityPolicy-TLS13-1-2-2021-06"
 RELAY_TG_NAME_PREFIX = "rlytls"
+
+# A freshly refreshed relay instance can read GuardDuty coverage UNHEALTHY with a
+# populated Issue *transiently* while its auto-managed agent is still provisioning
+# (Issue "Waiting for SSM notification" — installation "may take a few minutes",
+# per the GuardDuty EC2 runtime-coverage docs). So UNHEALTHY+Issue alone is not a
+# fast-fail: the live functional loop only treats it as a terminal regression once
+# it has persisted continuously for this many seconds — comfortably longer than
+# provisioning plausibly takes, so a normal ramp-up is never mistaken for a stuck
+# misconfiguration. Must stay below the functional --wait-seconds window (1200s in
+# build-and-push.yml) or it never triggers before the window closes. Tunable: raise
+# it if a healthy fleet is ever observed still provisioning past this bound.
+# The streak is fleet-union (fast-fail once *any* canonical instance stays a
+# candidate this long). That is safe only because this gate runs *after*
+# deploy-relay.sh waits for ASG convergence, so the small fleet's per-instance
+# coverage-lag windows overlap rather than chain; moving the gate before
+# convergence, or a much larger fleet, would want per-instance streak tracking.
+# The streak is sampled at retry-loop read boundaries (paced by _sleep_until_retry
+# backoff), so effective fast-fail latency is this bound plus the cadence to the
+# next candidate read past it — a lower bound on a cadence-quantized value, not a
+# precise floor.
+RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS = 600
 
 # Sandbox and prod deliberately use the same reviewed address plan today. Keep
 # separate entries: a future prod-only CIDR change must update the explicit prod
@@ -3380,6 +3404,57 @@ def collect_functional(
     return used_cached_probes
 
 
+def _guardduty_coverage_issue(row: dict[str, Any]) -> str | None:
+    """Issue text when a coverage row reads UNHEALTHY with a populated Issue, else
+    None. (GuardDuty CoverageStatus is HEALTHY or UNHEALTHY; the Issue is the
+    diagnostic detail.)"""
+    if row.get("status") == "UNHEALTHY":
+        issue = row.get("issue")
+        if issue:
+            return str(issue)
+    return None
+
+
+def _coverage_by_instance(
+    functional: dict[str, Any],
+) -> dict[str | None, dict[str, Any]]:
+    """Last-row-wins {instance_id: coverage_row} view of GuardDuty coverage.
+
+    Single-sourced so the terminal-candidate check and validate_functional read the
+    *same* row per instance. If ListCoverage ever returned two rows for one instance
+    (one HEALTHY, one UNHEALTHY+Issue), an any()-over-rows candidate could diverge
+    from the dict the validator uses and let the fast-fail break with no matching
+    error — a false pass. Keying both readers here makes candidate => coverage-error
+    structural, not incidental to ListCoverage's one-row-per-resource behavior.
+    """
+    return {
+        row.get("instance_id"): row
+        for row in functional.get("guardduty_coverage", [])
+    }
+
+
+def _unhealthy_coverage_with_issue(snapshot: dict[str, Any]) -> bool:
+    """Whether any canonical relay instance currently reads GuardDuty coverage
+    UNHEALTHY with a populated Issue — a *candidate* for the live loop's terminal
+    fast-fail, not terminal on its own (see RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS).
+
+    Gated on exactly one detector, matching validate_functional (which only
+    evaluates coverage rows under that same guard): a transient 0/2 detector-count
+    read stays on the patient path where the detector-count error is authoritative.
+    Uses the same per-instance coverage view as validate_functional so a candidate
+    always has a matching coverage error (no false pass).
+    """
+    functional = snapshot.get("functional", {})
+    if functional.get("guardduty_detector_count") != 1:
+        return False
+    instance_ids = set(snapshot.get("canonical_asg", {}).get("instance_ids", []))
+    coverage = _coverage_by_instance(functional)
+    return any(
+        _guardduty_coverage_issue(coverage.get(instance_id, {})) is not None
+        for instance_id in instance_ids
+    )
+
+
 def validate_functional(snapshot: dict[str, Any]) -> list[str]:
     errors = validate_structural(snapshot)
     functional = snapshot.get("functional", {})
@@ -3430,13 +3505,18 @@ def validate_functional(snapshot: dict[str, Any]) -> list[str]:
             f"(found {detector_count!r})"
         )
     else:
-        coverage = {
-            row.get("instance_id"): row
-            for row in functional.get("guardduty_coverage", [])
-        }
+        coverage = _coverage_by_instance(functional)
         for instance_id in sorted(instance_ids):
             row = coverage.get(instance_id, {})
-            if row.get("status") != "HEALTHY" or not row.get("agent_version"):
+            issue = _guardduty_coverage_issue(row)
+            if issue is not None:
+                # Surface the Issue so a persistent-regression fast-fail is
+                # diagnosable; still just a violation that retries until it clears.
+                errors.append(
+                    f"relay instance {instance_id} GuardDuty runtime coverage "
+                    f"is UNHEALTHY: {issue}"
+                )
+            elif row.get("status") != "HEALTHY" or not row.get("agent_version"):
                 errors.append(
                     f"relay instance {instance_id} lacks healthy GuardDuty runtime coverage"
                 )
@@ -3600,6 +3680,10 @@ def main(argv: list[str] | None = None) -> int:
         successful_probe_cache: dict[str, dict[str, Any]] = {}
         retry_attempt = 0
         expect_uncached_confirmation = False
+        # Monotonic time the current UNHEALTHY-coverage-with-Issue streak began, or
+        # None when the last read was healthy/absent. Drives the persistence-gated
+        # terminal fast-fail below.
+        terminal_since: float | None = None
         while True:
             # A failed confirmation may have cached successes before a later
             # instance/API error. Discard that partial state before every retry
@@ -3654,6 +3738,27 @@ def main(argv: list[str] | None = None) -> int:
             except InventoryError as exc:
                 print(f"relay DMZ inventory error: {exc}", file=sys.stderr)
                 return 2
+            # Persistence-gate the terminal fast-fail: only a break that stays
+            # UNHEALTHY-with-Issue continuously past the provisioning bound is
+            # terminal; any healthy/absent read resets the streak. See
+            # RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS.
+            if args.mode == "functional" and _unhealthy_coverage_with_issue(snapshot):
+                candidate_at = time.monotonic()
+                if terminal_since is None:
+                    terminal_since = candidate_at
+                elif (
+                    candidate_at - terminal_since
+                    >= RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS
+                ):
+                    print(
+                        "relay DMZ functional GuardDuty coverage stayed UNHEALTHY "
+                        f"with an Issue for >= {RELAY_GUARDDUTY_TERMINAL_PERSIST_SECONDS}s "
+                        "(persistent regression, not provisioning); not retrying",
+                        file=sys.stderr,
+                    )
+                    break
+            else:
+                terminal_since = None
             if not errors and args.mode == "functional" and used_cached_probes:
                 # Cached green probes reduce repeated SSM execution while other
                 # invariants converge, but can never authorize final success.
