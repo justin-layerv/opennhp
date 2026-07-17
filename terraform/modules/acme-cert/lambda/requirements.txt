@@ -15,7 +15,7 @@
 # OpenSSL.crypto.X509Req APIs that pyOpenSSL>=24 removed — pip resolves the old
 # combo fine, but it crashes at runtime. acme>=3/josepy>=2 use `cryptography`.
 # The TestAcmeStackCompat fence (test_acme_cert_manager.py) + its docstring guard this.
-acme==5.6.0
+acme==5.7.0
 
 # JSON Object Signing and Encryption (ACME dependency). >=2.0.0 dropped the
 # pyOpenSSL ComparableX509 wrapper — see the acme note above.
