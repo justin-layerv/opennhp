@@ -120,6 +120,27 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 5
+    # Keep multi-path actions from the same source repo bumping in one PR.
+    # github/codeql-action is referenced as two steps — /init and /analyze —
+    # and CodeQL hard-requires every step on the SAME version: a split bump
+    # (only one of the two) fails init/analyze with "Loaded a configuration
+    # file for version X, but running version Y" (a configuration error, not
+    # a warning). Dependabot otherwise opens a separate PR per sub-path, each
+    # of which red-lines CI on its own. Grouping guarantees they move in
+    # lockstep, restoring the single "bump github/codeql-action" PR shape.
+    #
+    # Two groups on purpose: a group defaults to `applies-to: version-updates`,
+    # so a codeql-action *security* advisory would still open ungrouped
+    # per-sub-path PRs and re-introduce the same split-bump break. The
+    # security-updates group (same pattern) closes that path too.
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
+      codeql-action-security:
+        applies-to: security-updates
+        patterns:
+          - "github/codeql-action*"
     labels:
       - "dependencies"
       - "ci"
