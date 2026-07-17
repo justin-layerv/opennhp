@@ -481,6 +481,7 @@ lint-workflows:
 	@bash tests/scripts/ami-id-from-manifest_test.sh
 	@shellcheck .github/scripts/classify-terraform-plan-pr-changes.sh tests/scripts/classify-terraform-plan-pr-changes_test.sh
 	@bash tests/scripts/classify-terraform-plan-pr-changes_test.sh
+	@python3 tests/scripts/test_qurl_agent_transact_iam.py
 	@python3 tests/scripts/test_summarize_terraform_plan.py
 	@python3 tests/scripts/test_relay_trusted_key_validation_lockstep.py
 	@python3 -m py_compile .github/scripts/check-relay-dmz-plan.py

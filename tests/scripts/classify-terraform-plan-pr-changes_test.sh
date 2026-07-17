@@ -59,6 +59,10 @@ run_case "prod markdown is docs-only despite prod glob" false false false \
 	$'M\tterraform/environments/prod/README.md'
 run_case "prod terraform is prod-only" true true false \
 	$'M\tterraform/environments/prod/main.tf'
+run_case "staged prod IAM root is prod-only" true true false \
+	$'M\tterraform/staged/qurl-agent-transact-iam/main.tf'
+run_case "staged prod IAM README is docs-only" false false false \
+	$'M\tterraform/staged/qurl-agent-transact-iam/README.md'
 run_case "shared terraform triggers sandbox plan" true false false \
 	$'M\tterraform/modules/ecr/main.tf'
 run_case "plan workflow modification triggers sandbox plan" true false false \

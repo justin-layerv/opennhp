@@ -123,7 +123,7 @@ jobs:
           if [[ "$PROD_ONLY_TERRAFORM_CHANGED" == "true" ]]; then
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "reason=prod_only" >> "$GITHUB_OUTPUT"
-            echo "Only terraform/environments/prod/** changed, so the sandbox plan is skipped instead of gating this PR on unrelated sandbox state." >> "$GITHUB_STEP_SUMMARY"
+            echo "Only production-only Terraform roots changed, so the sandbox plan is skipped instead of gating this PR on unrelated sandbox state." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -171,7 +171,7 @@ jobs:
               ;;
             prod_only)
               result="prod-only skipped"
-              message="Only terraform/environments/prod/** changed, so this required check skips the sandbox plan instead of gating the PR on unrelated sandbox state. Terraform Validate (PR) (prod) still validates the prod configuration."
+              message="Only production-only Terraform roots changed, so this required check skips the sandbox plan instead of gating the PR on unrelated sandbox state. Terraform Validate (PR) still validates the changed configuration."
               ;;
           esac
 
