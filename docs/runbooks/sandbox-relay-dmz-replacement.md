@@ -88,10 +88,14 @@ Also inspect ELB listeners and server/relay SGs directly. The evidence must show
 
 The workflow refreshes the canonical relay ASG to the reviewed image and then
 runs functional validation. Functional target health covers the HTTPS target
-group only. The detector can be repeated independently as a read-only check:
+group only. The detector can be repeated independently as a read-only check.
+Pass `--wait-seconds 1200` (matching CI) when re-running just after a refresh so
+the eventually-consistent GuardDuty `ListCoverage` read has time to catch up;
+without it the detector is one-shot and can false-fail once on that same lag.
 
 ```bash
 python3 scripts/check-relay-dmz-live.py --environment sandbox --mode functional \
+  --wait-seconds 1200 \
   | tee "$RELAY_DMZ_EVIDENCE_DIR/functional.json"
 ```
 

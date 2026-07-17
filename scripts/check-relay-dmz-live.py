@@ -27,9 +27,14 @@ silently accepting a partial inventory.
 
 The 30-second bound is per AWS CLI call, not per structural pass. The integrated
 deployment jobs therefore own the aggregate ceiling: their documented 55-minute
-infrastructure and 35-minute functional timeouts include convergence, plan, and
+infrastructure and 45-minute functional timeouts include convergence, plan, and
 fresh-collection budgets. A slow-but-successful call sequence remains bounded by
 those caller timeouts rather than by an implicit partial-inventory cutoff here.
+The functional caller runs a 20-minute convergence window because it asserts
+GuardDuty auto-managed runtime coverage through the eventually-consistent
+ListCoverage read, which can lag the fast control-plane HEALTHY transition by
+>10 min on a freshly refreshed instance; that window is a ceiling that a
+converged read clears in minutes, not a per-deploy cost.
 
 Functional mode uses SSM SendCommand. The integration IAM is currently scoped
 to sandbox relay tags while the prod relay remains dark. Enabling this command
@@ -3492,8 +3497,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "live-mode convergence deadline for retry sleeps; a collection that "
             "has started is allowed to finish, so wall time may exceed this by "
             "one full collection, plus one fresh functional confirmation when "
-            "cached probes were used (recommended: 300 structural, 600 "
-            "functional). Snapshot mode is always one-shot"
+            "cached probes were used (recommended: 300 structural, 1200 "
+            "functional — the larger functional window absorbs the "
+            "eventually-consistent GuardDuty ListCoverage read on a freshly "
+            "refreshed fleet). Snapshot mode is always one-shot"
         ),
     )
     args = parser.parse_args(argv)

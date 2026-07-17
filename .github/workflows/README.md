@@ -17,11 +17,16 @@ logging, browser ALB, absence of relay UDP/NLB resources, the assigned-cell
 public server NLB's sole UDP 62206 listener, WAF, canonical ASG handoff, exact
 fleet convergence, and
 absence of the pre-DMZ fleet. After `deploy-relay.sh` refreshes that canonical
-ASG and waits for convergence, functional mode runs with `--wait-seconds 600`
+ASG and waits for convergence, functional mode runs with `--wait-seconds 1200`
 and proves target health, SSM Online
 and Run Command, GuardDuty coverage, approved DNS resolution, catch-all DNS
 blocking, direct-public TCP isolation, the HTTPS target group, and active relay
-services. The later `qurl-relay-bootstrap-smoke` step proves the public browser
+services. The window is 1200s (not the structural 300s) because the refresh
+replaces every instance and the GuardDuty auto-managed runtime coverage the gate
+asserts is observed through the eventually-consistent ListCoverage read, which
+can lag the fast control-plane HEALTHY transition by >10 min on a fresh
+instance; the window is a ceiling that a converged read clears in minutes. The later
+`qurl-relay-bootstrap-smoke` step proves the public browser
 hostname/path. The rollout runbook separately requires a real external SDK NHP
 round trip through the assigned cell's server NLB UDP 62206 listener and
 listener/SG/Flow proof that UDP 62207 is not public. WAF evidence applies only

@@ -506,7 +506,7 @@ else
   assert_step_in "$RELAY" deploy-sandbox-relay "Deploy relay (SSM image-tag + ASG instance refresh)" "relay treats stale live app images as app-changed" \
     'APP_IMAGE_BUILD_REQUIRED'
   assert_in "$RELAY" deploy-sandbox-relay "relay job timeout covers refresh plus functional DMZ retry budget" \
-    'timeout-minutes: 35'
+    'timeout-minutes: 45'
   assert_step_order "$RELAY" deploy-sandbox-relay \
     "Verify AWS CLI major for relay DMZ detector" \
     "Verify relay DMZ functional boundary" \
@@ -515,8 +515,8 @@ else
     "Verify AWS CLI major for relay DMZ detector" \
     "functional detector accepts only AWS CLI v2 stderr contracts" \
     '\^aws-cli/2\\\.'
-  assert_step_in "$RELAY" deploy-sandbox-relay "Verify relay DMZ functional boundary" "functional DMZ gate retains its 10-minute retry budget" \
-    'check-relay-dmz-live\.py --mode functional --environment sandbox --wait-seconds 600'
+  assert_step_in "$RELAY" deploy-sandbox-relay "Verify relay DMZ functional boundary" "functional DMZ gate uses a 20-minute retry budget for eventually-consistent GuardDuty coverage" \
+    'check-relay-dmz-live\.py --mode functional --environment sandbox --wait-seconds 1200'
 fi
 
 BLUEGREEN=$(extract_job deploy-sandbox-blue-green)

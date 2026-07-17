@@ -2734,9 +2734,16 @@ jobs:
     # min). This job timeout is therefore load-bearing for the poll ceiling, not
     # just SSM/ASG API headroom: an observed healthy 3-instance roll took ~8m15s,
     # the script caps the refresh poll at 15 min, and the functional boundary
-    # gate adds a 10m retry window plus one final uncached collection. The 35m
-    # job bound leaves both components room to emit their own terminal errors.
-    timeout-minutes: 35
+    # gate adds a 20m retry window plus one final uncached collection. The 20m
+    # window (was 10m) exists because the refresh replaces every instance, and
+    # the GuardDuty auto-managed runtime coverage the gate asserts is observed
+    # through the eventually-consistent ListCoverage read: that read can lag the
+    # (fast) control-plane HEALTHY transition by >10 min for a freshly launched
+    # instance, so 10m intermittently failed a healthy fleet (run 29475851182).
+    # The window is a ceiling — a converged read clears it in minutes — so this
+    # only spends wall time on a genuinely lagging read. The 45m job bound leaves
+    # both components room to emit their own terminal errors.
+    timeout-minutes: 45
     # Direct AWS calls only (no sub-workflow dispatch), so unlike
     # deploy-sandbox-blue-green this needs id-token + contents, NOT actions:write.
     permissions:
@@ -2787,7 +2794,13 @@ jobs:
           fi
 
       - name: Verify relay DMZ functional boundary
-        run: python3 scripts/check-relay-dmz-live.py --mode functional --environment sandbox --wait-seconds 600
+        # 1200s (not 600s): the refresh replaces every instance and the GuardDuty
+        # auto-managed runtime coverage this gate asserts is read via the
+        # eventually-consistent ListCoverage API, which can lag the fast
+        # control-plane HEALTHY transition by >10 min on a fresh instance. The
+        # window is a ceiling reached only by a lagging read; keep it in lockstep
+        # with the job timeout-minutes above.
+        run: python3 scripts/check-relay-dmz-live.py --mode functional --environment sandbox --wait-seconds 1200
 
   # Dispatch blue/green deployment instead of doing direct instance refresh.
   # This ensures every CI deploy alternates between blue and green ASGs,

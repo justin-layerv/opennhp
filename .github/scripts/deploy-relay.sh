@@ -98,8 +98,8 @@ SSM_PARAM_NOT_FOUND="__NHP_RELAY_SSM_PARAMETER_NOT_FOUND__"
 # could tip past it and false-fail a healthy roll), so this keeps a comfortable
 # cushion over the ~8-min baseline while still failing LOUD on a genuinely
 # wedged/boot-looping roll rather than hanging CI. Stays inside the
-# refresh portion of deploy-sandbox-relay's 35-min timeout; the remaining budget
-# covers the downstream 10-min functional DMZ gate plus its final uncached pass.
+# refresh portion of deploy-sandbox-relay's 45-min timeout; the remaining budget
+# covers the downstream 20-min functional DMZ gate plus its final uncached pass.
 # The interval is overridable so the fixture suite can drive the poll with a
 # no-op sleep.
 RELAY_REFRESH_POLL_INTERVAL_SECS="${RELAY_REFRESH_POLL_INTERVAL_SECS:-10}"
