@@ -2,17 +2,55 @@ package sdk
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/agent"
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
+
+const sdkTestAgentPrivateKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+func installTestInstance(t *testing.T, current *agent.UdpAgent) {
+	t.Helper()
+	generationMu.Lock()
+	instanceMu.Lock()
+	previous := instance
+	instance = current
+	instanceMu.Unlock()
+	generationMu.Unlock()
+	t.Cleanup(func() {
+		generationMu.Lock()
+		instanceMu.Lock()
+		instance = previous
+		instanceMu.Unlock()
+		generationMu.Unlock()
+	})
+}
+
+func newSDKTestWorkingDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	etcDir := filepath.Join(dir, "etc")
+	if err := os.MkdirAll(etcDir, 0o755); err != nil {
+		t.Fatalf("mkdir etc: %v", err)
+	}
+	config := []byte(`PrivateKeyBase64 = "` + sdkTestAgentPrivateKey + `"` + "\n")
+	if err := os.WriteFile(filepath.Join(etcDir, "config.toml"), config, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return dir
+}
 
 // TestNilInstanceGuards verifies that every public function handles a nil
 // singleton gracefully (the agent has not been initialized).
 func TestNilInstanceGuards(t *testing.T) {
-	// Ensure instance is nil for this test group.
-	instance = nil
+	installTestInstance(t, nil)
 
 	t.Run("Close", func(t *testing.T) {
 		Close() // should not panic
@@ -65,8 +103,25 @@ func TestNilInstanceGuards(t *testing.T) {
 		}
 	})
 
+	t.Run("KnockResourceWithRunID", func(t *testing.T) {
+		result := KnockResourceWithRunID("asp", "res", "0123456789abcdef", "1.2.3.4", "", common.DefaultNHPPort)
+		var ack common.ServerKnockAckMsg
+		if err := json.Unmarshal([]byte(result), &ack); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if ack.ErrCode != common.ErrNoAgentInstance.ErrorCode() {
+			t.Errorf("expected ErrNoAgentInstance code, got %s", ack.ErrCode)
+		}
+	})
+
 	t.Run("ExitResource", func(t *testing.T) {
 		if ExitResource("asp", "res", "1.2.3.4", "", common.DefaultNHPPort) {
+			t.Error("expected false")
+		}
+	})
+
+	t.Run("ExitResourceWithRunID", func(t *testing.T) {
+		if ExitResourceWithRunID("asp", "res", "0123456789abcdef", "1.2.3.4", "", common.DefaultNHPPort) {
 			t.Error("expected false")
 		}
 	})
@@ -74,10 +129,8 @@ func TestNilInstanceGuards(t *testing.T) {
 
 // TestBuildTargetValidation verifies input validation in buildTarget.
 func TestBuildTargetValidation(t *testing.T) {
-	instance = nil
-
 	t.Run("nil instance", func(t *testing.T) {
-		target, ack := buildTarget("asp", "res", "1.2.3.4", "", common.DefaultNHPPort)
+		target, ack := buildTarget(nil, "asp", "res", "", "1.2.3.4", "", common.DefaultNHPPort)
 		if target != nil {
 			t.Error("expected nil target")
 		}
@@ -85,6 +138,180 @@ func TestBuildTargetValidation(t *testing.T) {
 			t.Errorf("expected ErrNoAgentInstance, got %s", ack.ErrCode)
 		}
 	})
+
+	t.Run("registered agent missing runID", func(t *testing.T) {
+		target, ack := buildTarget(&agent.UdpAgent{}, common.RegisteredAgentAuthServiceID, "res", "", "1.2.3.4", "", common.DefaultNHPPort)
+		if target != nil {
+			t.Error("expected nil target")
+		}
+		if ack.ErrCode != common.ErrKnockRunIDInvalid.ErrorCode() {
+			t.Errorf("expected ErrKnockRunIDInvalid, got %s", ack.ErrCode)
+		}
+	})
+
+	t.Run("noncanonical supplied runID", func(t *testing.T) {
+		target, ack := buildTarget(&agent.UdpAgent{}, "legacy", "res", "invalid", "1.2.3.4", "", common.DefaultNHPPort)
+		if target != nil {
+			t.Error("expected nil target")
+		}
+		if ack.ErrCode != common.ErrKnockRunIDInvalid.ErrorCode() {
+			t.Errorf("expected ErrKnockRunIDInvalid, got %s", ack.ErrCode)
+		}
+	})
+}
+
+func TestRegisteredAgentSDKRunIDGate(t *testing.T) {
+	installTestInstance(t, &agent.UdpAgent{})
+
+	tests := []struct {
+		name string
+		call func() string
+	}{
+		{
+			name: "legacy wrapper has no implicit default",
+			call: func() string {
+				return KnockResource(common.RegisteredAgentAuthServiceID, "res", "127.0.0.1", "", common.DefaultNHPPort)
+			},
+		},
+		{
+			name: "explicit wrapper rejects noncanonical",
+			call: func() string {
+				return KnockResourceWithRunID(common.RegisteredAgentAuthServiceID, "res", "INVALID", "127.0.0.1", "", common.DefaultNHPPort)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var ack common.ServerKnockAckMsg
+			if err := json.Unmarshal([]byte(tt.call()), &ack); err != nil {
+				t.Fatalf("invalid ack JSON: %v", err)
+			}
+			if ack.ErrCode != common.ErrKnockRunIDInvalid.ErrorCode() || ack.ErrMsg != common.ErrKnockRunIDInvalid.Error() {
+				t.Fatalf("ack = (%q, %q), want stable ErrKnockRunIDInvalid", ack.ErrCode, ack.ErrMsg)
+			}
+		})
+	}
+
+	if ExitResource(common.RegisteredAgentAuthServiceID, "res", "127.0.0.1", "", common.DefaultNHPPort) {
+		t.Fatal("legacy registered-agent ExitResource must fail closed without runID")
+	}
+	if ExitResourceWithRunID(common.RegisteredAgentAuthServiceID, "res", "INVALID", "127.0.0.1", "", common.DefaultNHPPort) {
+		t.Fatal("registered-agent ExitResourceWithRunID must reject noncanonical runID")
+	}
+	if AddResource(common.RegisteredAgentAuthServiceID, "res", "127.0.0.1", "", common.DefaultNHPPort) {
+		t.Fatal("registered-agent AddResource must reject unsupported background-loop configuration")
+	}
+}
+
+func TestBuildTargetRetainsExactCallerRunID(t *testing.T) {
+	dir := newSDKTestWorkingDir(t)
+	if !Init(dir, 0) {
+		t.Fatal("Init returned false")
+	}
+	t.Cleanup(Close)
+	if !AddServer(sdkTestAgentPrivateKey, "127.0.0.1", "", common.DefaultNHPPort, 0) {
+		t.Fatal("AddServer returned false")
+	}
+
+	instanceMu.RLock()
+	target, ack := buildTarget(instance, common.RegisteredAgentAuthServiceID, "res", "0123456789abcdef", "127.0.0.1", "", common.DefaultNHPPort)
+	instanceMu.RUnlock()
+	if target == nil {
+		t.Fatalf("buildTarget returned nil target: %#v", ack)
+	}
+	if target.RunID != "0123456789abcdef" {
+		t.Fatalf("target.RunID = %q, want exact caller value", target.RunID)
+	}
+}
+
+func TestSingletonLifecycleSerializesPublicCalls(t *testing.T) {
+	dir := newSDKTestWorkingDir(t)
+	if !Init(dir, 0) {
+		t.Fatal("initial Init returned false")
+	}
+	t.Cleanup(Close)
+
+	var wg sync.WaitGroup
+	errs := make(chan string, 1)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 3 {
+			Close()
+			if !Init(dir, 0) {
+				select {
+				case errs <- "Init returned false during lifecycle race":
+				default:
+				}
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			_ = SetKnockUser("user", "device", "org", `{}`)
+			_ = AddResource(common.RegisteredAgentAuthServiceID, "res", "127.0.0.1", "", common.DefaultNHPPort)
+			_ = KnockResourceWithRunID(common.RegisteredAgentAuthServiceID, "res", "INVALID", "127.0.0.1", "", common.DefaultNHPPort)
+			_ = ExitResourceWithRunID(common.RegisteredAgentAuthServiceID, "res", "INVALID", "127.0.0.1", "", common.DefaultNHPPort)
+		}
+	}()
+	wg.Wait()
+	select {
+	case msg := <-errs:
+		t.Fatal(msg)
+	default:
+	}
+}
+
+func TestCloseInterruptsInFlightRegisteredAgentKnock(t *testing.T) {
+	dir := newSDKTestWorkingDir(t)
+	if !Init(dir, 0) {
+		t.Fatal("Init returned false")
+	}
+	t.Cleanup(Close)
+	const unusedPort = 65534
+	keyParts := strings.SplitN(GenerateKeys(), "|", 2)
+	if len(keyParts) != 2 {
+		t.Fatalf("GenerateKeys returned malformed result")
+	}
+	if !AddServer(keyParts[1], "127.0.0.1", "", unusedPort, 0) {
+		t.Fatal("AddServer returned false")
+	}
+
+	knockDone := make(chan struct{})
+	go func() {
+		defer close(knockDone)
+		_ = KnockResourceWithRunID(common.RegisteredAgentAuthServiceID, "res", "0123456789abcdef", "127.0.0.1", "", unusedPort)
+	}()
+	for i := range 1_000 {
+		_ = SetKnockUser("user", "device", "org", fmt.Sprintf(`{"iteration":%d}`, i))
+	}
+	select {
+	case <-knockDone:
+		t.Fatal("knock returned before Close; test did not reach the response wait")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not interrupt the in-flight knock")
+	}
+	select {
+	case <-knockDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight knock did not return after Close")
+	}
+	if !Init(dir, 0) {
+		t.Fatal("Init could not start a new generation after Close completed")
+	}
 }
 
 // TestAddServerValidation verifies input validation in AddServer.
@@ -92,7 +319,7 @@ func TestAddServerValidation(t *testing.T) {
 	// Use a non-nil instance stub to isolate input validation from nil guard.
 	// We can't easily construct a real UdpAgent, so we only test the nil-instance
 	// and empty-input branches.
-	instance = nil
+	installTestInstance(t, nil)
 
 	t.Run("empty pubkey", func(t *testing.T) {
 		// With nil instance, returns false before reaching validation.

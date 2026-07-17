@@ -109,12 +109,9 @@ func TestStoreACToken_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestStoreACToken_RunIDDefaultEmpty fences the backwards-compat
-// contract on RunID: callers that don't populate it (every ACK site
-// shipped in PR-2a, before PR-2c wires the agent registration path)
-// store the empty string and the entry still round-trips cleanly. A
-// future regression that makes RunID required in the store would
-// surface here as a verify failure.
+// TestStoreACToken_RunIDDefaultEmpty fences the intentional legacy/HTTP
+// contract on RunID: callers outside the registered-agent native UDP path may
+// still store the empty string, and the entry must round-trip cleanly.
 func TestStoreACToken_RunIDDefaultEmpty(t *testing.T) {
 	s := &UdpServer{
 		tokenStore: common.NewTokenStore[*ACTokenEntry](),
@@ -289,15 +286,15 @@ func TestStoreACToken_BufferConstantMatchesAC(t *testing.T) {
 //     openTime (uint32 truncation is the caller's problem).
 //   - ExpireTime sits in the (now+OpenTime, now+OpenTime+5+ε) window
 //     — the +5s late-packet buffer is what the AC honors.
-//   - RunID defaults to "" until PR-2c wires the agent registration
-//     path. A future change that makes RunID required surfaces here.
+//   - RunID is copied exactly from a registered-agent authenticated knock body.
 func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
 	knkMsg := &common.AgentKnockMsg{
 		UserId:         "user-1",
 		DeviceId:       "device-2",
 		OrganizationId: "org-3",
-		AuthServiceId:  "asp-4",
+		AuthServiceId:  common.RegisteredAgentAuthServiceID,
 		ResourceId:     "wire-resource", // intentionally distinct from caller arg
+		RunID:          "0123456789abcdef",
 	}
 	acTokens := map[string]string{"r-1": "ac-tok-abc"}
 
@@ -323,8 +320,8 @@ func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
 	if entry.User.OrganizationId != "org-3" {
 		t.Errorf("User.OrganizationId = %q, want %q", entry.User.OrganizationId, "org-3")
 	}
-	if entry.User.AuthServiceId != "asp-4" {
-		t.Errorf("User.AuthServiceId = %q, want %q", entry.User.AuthServiceId, "asp-4")
+	if entry.User.AuthServiceId != common.RegisteredAgentAuthServiceID {
+		t.Errorf("User.AuthServiceId = %q, want %q", entry.User.AuthServiceId, common.RegisteredAgentAuthServiceID)
 	}
 
 	// ResourceId comes from caller arg, NOT knkMsg.ResourceId.
@@ -367,10 +364,18 @@ func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
 			entry.ExpireTime, wantMin, wantMax)
 	}
 
-	// RunID defaults to "" until PR-2c. A regression that makes
-	// RunID required at construction time fails here.
+	if entry.RunID != knkMsg.RunID {
+		t.Errorf("RunID = %q, want authenticated knock RunID %q", entry.RunID, knkMsg.RunID)
+	}
+}
+
+func TestNewACKTokenEntry_LegacySuppliedRunIDStaysUnbound(t *testing.T) {
+	entry := NewACKTokenEntry(&common.AgentKnockMsg{
+		AuthServiceId: "legacy",
+		RunID:         "0123456789abcdef",
+	}, "resource", map[string]string{"resource": "token"}, "203.0.113.7", 60, "")
 	if entry.RunID != "" {
-		t.Errorf("RunID = %q, want \"\" (PR-2c wires this; PR-2a defaults empty)", entry.RunID)
+		t.Fatalf("legacy entry.RunID = %q, want empty", entry.RunID)
 	}
 }
 

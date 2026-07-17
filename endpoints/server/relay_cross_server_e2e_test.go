@@ -332,6 +332,7 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 		UserId:        "relay-cross-server-user",
 		AuthServiceId: aspID,
 		ResourceId:    qurlplacement.TunnelServerResourceID,
+		RunID:         "0123456789abcdef",
 	})
 	if err != nil {
 		t.Fatalf("marshal knock body: %v", err)

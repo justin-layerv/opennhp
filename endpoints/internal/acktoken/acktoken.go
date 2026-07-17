@@ -35,9 +35,9 @@ const ttlGraceSeconds int64 = 60
 // exposes it so a downstream FRP login can be cross-checked against the IP
 // that earned the pinhole.
 //
-// RunID is the agent's run-scope identifier (nullable; populated via the
-// agent registration path). Legacy ACK paths that carry no RunID write the
-// empty string.
+// RunID is the agent's authenticated knock/Login-cycle identifier. Registered-
+// agent native UDP knocks populate it from the KNK application body; intentional
+// legacy and HTTP ACK paths that carry no RunID write the empty string.
 //
 // User is *common.AgentUser and is legitimately nil during the ACK-path
 // window before the agent identity is captured. Readers (the validate

@@ -60,8 +60,11 @@ const accessTokenLatePacketBufferSeconds = common.AccessTokenLatePacketBufferSec
 //
 // ExpireTime is now + (openTime + accessTokenLatePacketBufferSeconds)s so
 // a delayed PR-2b validate request still resolves while the AC's pinhole
-// is still open. RunID is not yet wired (PR-2c) and stays the empty
-// string here; KnockSrcIP feeds the cross-check against the FRP login IP.
+// is still open. RunID is copied byte-for-byte from the AEAD-authenticated
+// knock body; the registered-agent native UDP boundary guarantees that it is
+// canonical and nonempty before this constructor can be reached. Legacy/HTTP
+// callers retain the empty value. KnockSrcIP feeds the cross-check against the
+// FRP login IP.
 //
 // acTokens is shallow-copied with maps.Clone so each entry holds its
 // own snapshot. The local-knock paths (PublishACKTokens) only call
@@ -84,6 +87,10 @@ const accessTokenLatePacketBufferSeconds = common.AccessTokenLatePacketBufferSec
 // rationale. Empty when the caller has no resolved identity (e.g., the
 // HTTP knock path, which authenticates via a different mechanism and
 // passes "" here).
+//
+// RunID is copied only when AuthServiceId is the registered-agent service.
+// Legacy and HTTP flows remain deliberately unbound even if a generic legacy
+// client supplies a syntactically valid runId extension.
 func NewACKTokenEntry(
 	knkMsg *common.AgentKnockMsg,
 	resourceId string,
@@ -102,6 +109,10 @@ func NewACKTokenEntry(
 	if clonedTokens == nil {
 		clonedTokens = map[string]string{}
 	}
+	runID := ""
+	if knkMsg.AuthServiceId == common.RegisteredAgentAuthServiceID {
+		runID = knkMsg.RunID
+	}
 	return &ACTokenEntry{
 		User: &common.AgentUser{
 			UserId:         knkMsg.UserId,
@@ -113,6 +124,7 @@ func NewACKTokenEntry(
 		ResourceId: resourceId,
 		ACTokens:   clonedTokens,
 		KnockSrcIP: srcIp,
+		RunID:      runID,
 		OpenTime:   openTime,
 		ExpireTime: time.Now().Add(time.Duration(openTime+accessTokenLatePacketBufferSeconds) * time.Second),
 	}

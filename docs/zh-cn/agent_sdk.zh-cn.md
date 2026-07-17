@@ -37,6 +37,38 @@ OpenNHP中提供了SDK样例源码，样例中包含可能用到的初始化代�
 
 SDK样例源码：***opennhp/endpoints/agent/main/export.go***
 
+### 1.3 注册代理的 RunID 约定
+
+精确的 `aspId` 值 `agent` 表示注册代理认证服务。原生 UDP 调用方必须为每个
+访问生命周期持有一个 RunID。RunID 必须恰好为 16 个小写十六进制字符。SDK
+只验证该值，不生成或修改该值；调用方必须在初始 KNK、由 Cookie 触发的 RKN
+以及对应的 EXT 中复用同一个值。
+
+请使用显式携带 RunID 的单次调用方法：
+
+- Go：`sdk.KnockResourceWithRunID` 和 `sdk.ExitResourceWithRunID`
+- C：`nhp_agent_knock_resource_with_run_id` 和
+  `nhp_agent_exit_resource_with_run_id`
+- iOS/gomobile：`NhpAgentKnockResourceWithRunID` 和
+  `NhpAgentExitResourceWithRunID`
+
+旧版敲门和退出方法不携带 RunID，因此在 `aspId="agent"` 时会以失败关闭
+（敲门结果使用错误码 `52025`，退出返回 `false`）。后台资源循环同样不支持
+注册代理认证：`AddResource`/`nhp_agent_add_resource`/
+`NhpAgentAddResource` 返回 `false`，而 `resource.toml` 中的 `agent` 条目会使
+代理启动失败。注册代理集成必须使用单次调用方法，由应用程序而不是周期性
+SDK 循环控制生命周期边界。
+
+维护者约定：已发布的 qurl-conformance 代理敲门应用消息体向量是顶层
+`runId` 字段的事实来源。共享的 `AgentKnockMsg` 解码器会在认证服务分派前，
+针对所有认证服务拒绝重复键、大小写折叠别名和 `run_id` 别名；无关字段的
+重复键仍保留 Go 历史上的“最后值生效”行为。分配有界的顶层歧义扫描必须
+放在标准 JSON 成功解码之后；该顺序提供语法、分隔符配对和嵌套深度验证。
+更改此解析器约定前，必须先更新一致性向量。
+
+下方较长的代码片段和示例使用非 `agent` 认证服务，因此仍演示旧版方法。
+上方列出的导出源文件是当前完整符号集的权威定义。
+
 ```go
 package main
 

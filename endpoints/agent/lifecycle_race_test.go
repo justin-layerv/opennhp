@@ -157,8 +157,8 @@ func TestStop_ConcurrentRequestOtp_NoSendOnClosedPanic(t *testing.T) {
 
 // TestStop_LeavesSendChannelOpen is the deterministic counterpart to the
 // probabilistic race test above: it directly asserts the invariant that makes
-// those untracked sends safe. Every untracked sender (request.go, ExitKnockRequest,
-// the DHP DAR/DAV sends) selects on signals.stop but still names sendMsgCh as a
+// those untracked sends safe. Every untracked sender (request.go and the DHP
+// DAR/DAV sends) selects on signals.stop but still names sendMsgCh as a
 // select case, so if Stop() closed the channel the send could still be chosen and
 // panic. Perform the raw send those methods make and assert it does not panic —
 // re-introducing close(sendMsgCh) in Stop() makes this fail every run.

@@ -3,9 +3,12 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	"github.com/OpenNHP/opennhp/endpoints/agent/sdk"
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 type config struct {
@@ -46,6 +50,31 @@ type result struct {
 	P99MS     int64  `json:"p99_ms"`
 	MaxMS     int64  `json:"max_ms"`
 	LastError string `json:"last_error,omitempty"`
+}
+
+type knockWithRunIDFunc func(aspID, resourceID, runID, serverIP, serverHostname string, serverPort int) string
+
+func generateProbeRunID(random io.Reader) (string, error) {
+	var raw [8]byte
+	if _, err := io.ReadFull(random, raw[:]); err != nil {
+		return "", fmt.Errorf("read cryptographic randomness: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func knockWithFreshRunID(
+	cfg config,
+	generate func() (string, error),
+	knock knockWithRunIDFunc,
+) (string, error) {
+	runID, err := generate()
+	if err != nil {
+		return "", err
+	}
+	if err := common.ValidateAgentKnockRunID(runID); err != nil {
+		return "", fmt.Errorf("generator returned noncanonical RunID: %w", err)
+	}
+	return knock(cfg.ASP, cfg.Resource, runID, "", cfg.ServerHost, 62206), nil
 }
 
 func required(name string) string {
@@ -156,8 +185,16 @@ func run(cfg config) (result, error) {
 	var maximumLatency time.Duration
 	summary := result{StartedEpoch: startedAt.Unix()}
 	for time.Now().Before(deadline) {
+		// Each liveness-probe attempt is its own logical outer cycle, so a fresh
+		// RunID per iteration is intentional. qURL Connector retries instead
+		// reuse one RunID within an outer cycle and must not copy this loop model.
 		started := time.Now()
-		raw := sdk.KnockResource(cfg.ASP, cfg.Resource, "", cfg.ServerHost, 62206)
+		raw, knockErr := knockWithFreshRunID(cfg, func() (string, error) {
+			return generateProbeRunID(rand.Reader)
+		}, sdk.KnockResourceWithRunID)
+		if knockErr != nil {
+			return summary, fmt.Errorf("generate RunID for probe attempt %d: %w", summary.Attempts+1, knockErr)
+		}
 		latency := time.Since(started)
 		summary.Attempts++
 		var response ack

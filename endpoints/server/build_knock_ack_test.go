@@ -32,12 +32,22 @@ func TestBuildKnockAck_RejectReturnsNilErrorWithErrCodeInBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal mismatch knock: %v", err)
 	}
+	missingRunIDBody, err := json.Marshal(&common.AgentKnockMsg{
+		HeaderType:    core.NHP_KNK,
+		UserId:        "missing-run-id-user",
+		AuthServiceId: common.RegisteredAgentAuthServiceID,
+		ResourceId:    "connector",
+	})
+	if err != nil {
+		t.Fatalf("marshal missing-RunID knock: %v", err)
+	}
 
 	cases := []struct {
 		name        string
 		strictGate  bool
 		body        []byte
 		wantErrCode string
+		wantErrMsg  string
 		wantUserID  string
 	}{
 		{
@@ -45,6 +55,20 @@ func TestBuildKnockAck_RejectReturnsNilErrorWithErrCodeInBytes(t *testing.T) {
 			body:        []byte("{ not valid json"),
 			wantErrCode: common.ErrJsonParseFailed.ErrorCode(),
 			wantUserID:  "", // body never parsed, so no user id is recovered
+		},
+		{
+			name:        "registered-agent missing RunID",
+			body:        missingRunIDBody,
+			wantErrCode: common.ErrKnockRunIDInvalid.ErrorCode(),
+			wantErrMsg:  common.ErrKnockRunIDInvalid.Error(),
+			wantUserID:  "missing-run-id-user",
+		},
+		{
+			name:        "registered-agent malformed RunID uses stable protocol error",
+			body:        []byte(`{"headerType":1,"usrId":"invalid-run-id-user","devId":"device","aspId":"agent","resId":"connector","runId":"0123456789ABCDEF"}`),
+			wantErrCode: common.ErrKnockRunIDInvalid.ErrorCode(),
+			wantErrMsg:  common.ErrKnockRunIDInvalid.Error(),
+			wantUserID:  "", // strict parser rejects before committing the decoded struct
 		},
 		{
 			name:        "header-type mismatch under strict gate (#1154)",
@@ -57,9 +81,11 @@ func TestBuildKnockAck_RejectReturnsNilErrorWithErrCodeInBytes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			querier := newFakeAgentKeysQuerier()
 			s := &UdpServer{
 				metrics:                      metrics.NewPublisherForTest(t),
 				knockHeaderTypeVerifyRequire: tc.strictGate,
+				agentPeerLookup:              newTestLookup(t, querier),
 			}
 			ppd := &core.PacketParserData{
 				HeaderType:  core.NHP_KNK,
@@ -85,8 +111,14 @@ func TestBuildKnockAck_RejectReturnsNilErrorWithErrCodeInBytes(t *testing.T) {
 			if ack.ErrCode != tc.wantErrCode {
 				t.Errorf("ack.ErrCode = %q, want %q", ack.ErrCode, tc.wantErrCode)
 			}
+			if tc.wantErrMsg != "" && ack.ErrMsg != tc.wantErrMsg {
+				t.Errorf("ack.ErrMsg = %q, want %q", ack.ErrMsg, tc.wantErrMsg)
+			}
 			if ack.ErrCode == common.ErrSuccess.ErrorCode() {
 				t.Errorf("reject produced the success ErrCode %q — a relayed agent would never see the reject", ack.ErrCode)
+			}
+			if calls := querier.callCount(); calls != 0 {
+				t.Errorf("agent registry DDB calls = %d, want 0; structural and RunID rejects must precede pubkey lookup", calls)
 			}
 		})
 	}

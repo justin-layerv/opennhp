@@ -34,6 +34,7 @@ func TestHandleNhpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 		resName   = "resource-alpha"
 		issuedTok = "ac-token-from-fake-broadcast"
 		knockerIP = "203.0.113.42"
+		wantRunID = "0123456789abcdef"
 		wantOpen  = uint32(60)
 	)
 
@@ -80,8 +81,9 @@ func TestHandleNhpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 		UserId:         "u-int",
 		DeviceId:       "d-int",
 		OrganizationId: "o-int",
-		AuthServiceId:  "asp-int",
+		AuthServiceId:  common.RegisteredAgentAuthServiceID,
 		ResourceId:     resName,
+		RunID:          wantRunID,
 	}
 	srcAddr := &common.NetAddress{Ip: knockerIP, Port: 51820}
 	ackMsg := &common.ServerKnockAckMsg{OpenTime: wantOpen}
@@ -139,6 +141,9 @@ func TestHandleNhpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 	if entry.OpenTime != int(wantOpen) {
 		t.Errorf("entry.OpenTime = %d, want %d", entry.OpenTime, wantOpen)
 	}
+	if entry.RunID != wantRunID {
+		t.Errorf("entry.RunID = %q, want authenticated knock RunID %q", entry.RunID, wantRunID)
+	}
 	if entry.User == nil {
 		t.Fatal("entry.User is nil")
 	}
@@ -154,6 +159,27 @@ func TestHandleNhpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 	// trims the assignment in the AC goroutine would surface here.
 	if got := ackMsg.ACTokens[resName]; got != issuedTok {
 		t.Errorf("ackMsg.ACTokens[%q] = %q, want %q", resName, got, issuedTok)
+	}
+}
+
+func TestPublishACKTokens_LegacySuppliedRunIDStaysUnbound(t *testing.T) {
+	const token = "legacy-token"
+	s := &UdpServer{tokenStore: common.NewTokenStore[*ACTokenEntry]()}
+	err := s.PublishACKTokens(context.Background(), &common.AgentKnockMsg{
+		AuthServiceId: "legacy",
+		RunID:         "0123456789abcdef",
+	}, &common.ServerKnockAckMsg{
+		ACTokens: map[string]string{"resource": token},
+	}, "203.0.113.42", 60, "")
+	if err != nil {
+		t.Fatalf("PublishACKTokens: %v", err)
+	}
+	entry := s.VerifyAccessToken(token)
+	if entry == nil {
+		t.Fatal("VerifyAccessToken returned nil")
+	}
+	if entry.RunID != "" {
+		t.Fatalf("legacy entry.RunID = %q, want empty", entry.RunID)
 	}
 }
 

@@ -64,7 +64,7 @@ func TestHandleHttpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 		UserId:         "u-http",
 		DeviceId:       "d-http",
 		OrganizationId: "o-http",
-		AuthServiceId:  "asp-http",
+		AuthServiceId:  common.RegisteredAgentAuthServiceID,
 		ResourceId:     resName,
 		SrcIp:          knockerIP,
 		Ctx:            context.Background(),
@@ -110,14 +110,17 @@ func TestHandleHttpOpenResource_PublishACKTokens_RoundTrip(t *testing.T) {
 	if entry.OpenTime != int(wantOpen) {
 		t.Errorf("entry.OpenTime = %d, want %d", entry.OpenTime, wantOpen)
 	}
+	if entry.RunID != "" {
+		t.Errorf("entry.RunID = %q, want empty for the intentional legacy HTTP path", entry.RunID)
+	}
 	if entry.User == nil {
 		t.Fatal("entry.User is nil")
 	}
 	if entry.User.UserId != "u-http" {
 		t.Errorf("entry.User.UserId = %q, want %q", entry.User.UserId, "u-http")
 	}
-	if entry.User.AuthServiceId != "asp-http" {
-		t.Errorf("entry.User.AuthServiceId = %q, want %q", entry.User.AuthServiceId, "asp-http")
+	if entry.User.AuthServiceId != common.RegisteredAgentAuthServiceID {
+		t.Errorf("entry.User.AuthServiceId = %q, want registered-agent HTTP auth service %q", entry.User.AuthServiceId, common.RegisteredAgentAuthServiceID)
 	}
 }
 

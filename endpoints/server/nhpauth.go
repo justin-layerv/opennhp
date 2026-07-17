@@ -92,6 +92,17 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 		}
 
 		if closureErr != nil {
+			// Canonical-value failures wrap ErrInvalidAgentKnockRunID and map to
+			// public RunID error 52025. Duplicate/alias/type abuses remain JSON
+			// shape errors by design: conformance requires body-shape rejection to
+			// precede auth-service RunID policy.
+			if errors.Is(closureErr, common.ErrInvalidAgentKnockRunID) {
+				closureErr = common.ErrKnockRunIDInvalid
+				ackMsg.ErrCode = common.ErrKnockRunIDInvalid.ErrorCode()
+				ackMsg.ErrMsg = closureErr.Error()
+				log.Warning("server-agent(#%d@%s)[HandleKnockRequest] rejected knock with malformed runId", transactionId, addrStr)
+				return
+			}
 			log.Error("server-agent(#%d@%s)[HandleKnockRequest] failed to parse %s message: %v", transactionId, addrStr, core.HeaderTypeToString(ppd.HeaderType), closureErr)
 			ackMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
 			ackMsg.ErrMsg = closureErr.Error()
@@ -149,6 +160,21 @@ func (s *UdpServer) buildKnockAck(ppd *core.PacketParserData) ([]byte, string, e
 			return
 		}
 		knkMsg.HeaderType = useType
+
+		// The registered-agent native UDP path is the qURL Connector RunID
+		// producer boundary. Reject omission or a noncanonical value before
+		// pubkey lookup, auth-provider resolution, or any AC work so an old
+		// Connector cannot silently create an unbound ACK token. The generic
+		// parser still permits missing/empty for other auth handlers, and the
+		// separate HTTP knock path does not enter buildKnockAck.
+		if runIDErr := validateRegisteredAgentKnockRunID(knkMsg); runIDErr != nil {
+			closureErr = common.ErrKnockRunIDInvalid
+			ackMsg.ErrCode = common.ErrKnockRunIDInvalid.ErrorCode()
+			ackMsg.ErrMsg = closureErr.Error()
+			log.Warning("server-agent(%s#%d@%s)[HandleKnockRequest] rejected registered-agent knock with missing or invalid runId",
+				knkMsg.UserId, transactionId, addrStr)
+			return
+		}
 
 		// Cloud mode agent peer resolution: with
 		// DisableAgentPeerValidation=true the noise responder skipped

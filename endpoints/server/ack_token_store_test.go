@@ -181,6 +181,46 @@ func TestStoreACToken_PersistsToSharedStore(t *testing.T) {
 	}
 }
 
+func TestPublishACKTokens_PreservesRunIDInSharedAndLocalStores(t *testing.T) {
+	const wantRunID = "0123456789abcdef"
+
+	shared := &recordingACKTokenStore{}
+	s := &UdpServer{
+		tokenStore:    common.NewTokenStore[*ACTokenEntry](),
+		ackTokenStore: shared,
+		metrics:       metrics.NewPublisherForTest(t),
+	}
+	knkMsg := &common.AgentKnockMsg{
+		UserId:        "agent-1",
+		AuthServiceId: common.RegisteredAgentAuthServiceID,
+		ResourceId:    "resource-1",
+		RunID:         wantRunID,
+	}
+	ackMsg := &common.ServerKnockAckMsg{
+		ACTokens: map[string]string{"resource-1": "ac-token"},
+	}
+
+	if err := s.PublishACKTokens(context.Background(), knkMsg, ackMsg, "203.0.113.44", 60, "owner-1"); err != nil {
+		t.Fatalf("PublishACKTokens: %v", err)
+	}
+	if shared.calls != 1 || shared.entry == nil {
+		t.Fatalf("shared store calls = %d entry = %+v, want one persisted entry", shared.calls, shared.entry)
+	}
+	if shared.entry.RunID != wantRunID {
+		t.Fatalf("shared store RunID = %q, want authenticated knock RunID %q", shared.entry.RunID, wantRunID)
+	}
+	local := s.VerifyAccessToken("ac-token")
+	if local == nil {
+		t.Fatal("local tokenStore entry = nil, want persisted entry")
+	}
+	if local.RunID != wantRunID {
+		t.Fatalf("local tokenStore RunID = %q, want authenticated knock RunID %q", local.RunID, wantRunID)
+	}
+	if local != shared.entry {
+		t.Fatal("shared and local stores did not receive the same immutable entry")
+	}
+}
+
 func TestPublishACKTokens_SharedStoreFailureFailsClosed(t *testing.T) {
 	shared := &recordingACKTokenStore{err: errors.New("dynamodb write failed")}
 	s := &UdpServer{

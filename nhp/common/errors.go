@@ -222,6 +222,13 @@ var (
 	// qURL link to mint a fresh session, not to present a credential. The
 	// js-agent (P6) branches on this code.
 	ErrQurlSessionExpired = newError("52024", "qurl session expired or not authorized for this client")
+	// ErrKnockRunIDInvalid rejects registered-agent UDP knocks before pubkey,
+	// resource, or AC work when the authenticated body omits runId or carries a
+	// noncanonical value. Generic/legacy and HTTP parsing may still omit runId;
+	// the strict requirement is scoped to aspId=agent on native UDP paths. The
+	// internal value-shape sentinel [ErrInvalidAgentKnockRunID] maps here at the
+	// direct and forwarded server boundaries.
+	ErrKnockRunIDInvalid = newError("52025", "registered-agent knock runId is missing or invalid")
 
 	// server: agent registration (52100+). Reject vocabulary for NHP-native
 	// agent self-registration (NHP_OTP / NHP_REG / NHP_RAK). Reserved as its

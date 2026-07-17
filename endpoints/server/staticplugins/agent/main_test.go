@@ -454,4 +454,7 @@ func TestPluginID_IsAgent(t *testing.T) {
 	if PluginID != "agent" {
 		t.Fatalf("PluginID=%q want=%q — keep in lockstep with var.ac_auth_service_id default in terraform/variables.tf (CI lint: scripts/check-asp-and-ac-id-lockstep.sh)", PluginID, "agent")
 	}
+	if PluginID != common.RegisteredAgentAuthServiceID {
+		t.Fatalf("PluginID=%q protocol registered-agent aspId=%q", PluginID, common.RegisteredAgentAuthServiceID)
+	}
 }

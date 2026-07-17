@@ -1040,12 +1040,10 @@ func TestInternalTokenValidate_ResponseAuthRejectsMalformedNonceBeforeLookup(t *
 	}
 }
 
-// TestInternalTokenValidate_HappyEchoesRunIDOnEmptyEntry pins the
-// "callers running ahead of PR-2c get their run_id back" contract.
-// Entry.RunID is empty (the ACK-path default until PR-2c plumbs the
-// agent registration thread); the handler must echo the request's
-// agent_run_id so caller-side correlation works during the
-// transition window.
+// TestInternalTokenValidate_HappyEchoesRunIDOnEmptyEntry pins compatibility for
+// intentional legacy/HTTP entries and pre-producer rows. The handler must echo
+// the request's agent_run_id so caller-side correlation still works when the
+// stored entry has no binding.
 func TestInternalTokenValidate_HappyEchoesRunIDOnEmptyEntry(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 
@@ -1053,7 +1051,7 @@ func TestInternalTokenValidate_HappyEchoesRunIDOnEmptyEntry(t *testing.T) {
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r",
 		KnockSrcIP: "10.0.0.5",
-		// RunID intentionally empty — the ACK-path default before PR-2c.
+		// RunID intentionally empty — legacy/HTTP or pre-producer compatibility.
 		OpenTime:   60,
 		ExpireTime: time.Now().Add(60 * time.Second),
 	})
@@ -1175,9 +1173,8 @@ func TestInternalTokenValidate_Expired(t *testing.T) {
 // on the expired path — the rationale is that the live pinhole
 // is gone, so the run_id is purely a request/response
 // correlation key for the caller's log dive. A regression that
-// flipped this to entry.RunID would silently drop the caller's
-// correlation key for ACK-path tokens (where entry.RunID is
-// empty until PR-2c wires the registration thread).
+// flipped this to entry.RunID would silently drop the caller's correlation key
+// for intentional legacy/HTTP entries or pre-producer rows whose RunID is empty.
 func TestInternalTokenValidate_ExpiredEchoesRunID(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 	storeTestACToken(t, us, "ac-token-expired-runid", &ACTokenEntry{

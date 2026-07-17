@@ -10,6 +10,7 @@ import (
 
 	toml "github.com/pelletier/go-toml/v2"
 
+	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/utils"
@@ -124,6 +125,9 @@ func (a *UdpAgent) loadResources() error {
 	fileName := filepath.Join(ExeDirPath, "etc", "resource.toml")
 	// optional config, may not exist yet
 	if updateErr := a.updateResources(fileName); updateErr != nil {
+		if errors.Is(updateErr, ErrRegisteredAgentKnockLoopUnsupported) {
+			return fmt.Errorf("load resource config: %w", updateErr)
+		}
 		log.Debug("resources not loaded: %v", updateErr)
 	}
 
@@ -263,6 +267,9 @@ func (a *UdpAgent) updateResources(file string) (err error) {
 		return err
 	}
 	for _, res := range resources.Resources {
+		if res.AuthServiceId == common.RegisteredAgentAuthServiceID {
+			return ErrRegisteredAgentKnockLoopUnsupported
+		}
 		peer := a.FindServerPeerFromResource(res)
 		if peer == nil {
 			log.Error("[Agent] no server peer found for resource %s (server=%s)", res.Id(), res.ServerHost())

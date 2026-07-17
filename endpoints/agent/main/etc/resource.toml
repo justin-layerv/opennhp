@@ -7,6 +7,9 @@
 # ServerPort: port of the NHP server that manages this resource group.
 # NOTE: ServerHostname, ServerIp and ServerPort must match with the Hostname, Ip and Port of the server defined
 # in server.toml in order for the program to locate the correct server peer
+# Registered-agent authentication (AuthServiceId = "agent") is not supported by
+# this background loop. Its callers must own a per-lifecycle RunID and use the
+# one-shot RunID-bearing SDK knock and exit methods instead.
 [[Resources]]
 AuthServiceId = "example"
 ResourceId = "demo"

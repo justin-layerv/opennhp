@@ -159,15 +159,14 @@ func (a *UdpAgent) awaitTransactionResponse(ch chan *core.PacketParserData) (*co
 }
 
 func (a *UdpAgent) RequestOtp(target *KnockTarget) error {
-	a.knockUserMutex.RLock()
+	state := a.snapshotKnockUserState()
 	otpMsg := &common.AgentOTPMsg{
-		UserId:         a.knockUser.UserId,
-		DeviceId:       a.deviceId,
-		OrganizationId: a.knockUser.OrganizationId,
+		UserId:         state.user.UserId,
+		DeviceId:       state.deviceID,
+		OrganizationId: state.user.OrganizationId,
 		AuthServiceId:  target.AuthServiceId,
-		UserData:       a.knockUser.UserData,
+		UserData:       state.user.UserData,
 	}
-	a.knockUserMutex.RUnlock()
 	// G117 (secret-in-json): AgentOTPMsg's struct type carries a
 	// Passcode field ("pass" on the wire) that has its own struct-tag
 	// `//nolint:gosec // G117` at nhp/common/nhpmsg.go:38. Newer
@@ -219,16 +218,15 @@ func (a *UdpAgent) RequestOtp(target *KnockTarget) error {
 }
 
 func (a *UdpAgent) RegisterPublicKey(otp string, target *KnockTarget) (rakMsg *common.ServerRegisterAckMsg, err error) {
-	a.knockUserMutex.RLock()
+	state := a.snapshotKnockUserState()
 	regMsg := &common.AgentRegisterMsg{
-		UserId:         a.knockUser.UserId,
-		DeviceId:       a.deviceId,
-		OrganizationId: a.knockUser.OrganizationId,
+		UserId:         state.user.UserId,
+		DeviceId:       state.deviceID,
+		OrganizationId: state.user.OrganizationId,
 		AuthServiceId:  target.AuthServiceId,
 		OTP:            otp,
-		UserData:       a.knockUser.UserData,
+		UserData:       state.user.UserData,
 	}
-	a.knockUserMutex.RUnlock()
 	// G117 (secret-in-json): deliberately NOT suppressed here. gosec
 	// v2.11.4's pattern matches "pass"/"passcode" but not "otp", so
 	// marshaling AgentRegisterMsg.OTP (necessarily on the wire — REG
@@ -304,15 +302,14 @@ func (a *UdpAgent) RegisterPublicKey(otp string, target *KnockTarget) (rakMsg *c
 }
 
 func (a *UdpAgent) ListResource(target *KnockTarget) (lrtMsg *common.ServerListResultMsg, err error) {
-	a.knockUserMutex.RLock()
+	state := a.snapshotKnockUserState()
 	lstMsg := &common.AgentListMsg{
-		UserId:         a.knockUser.UserId,
-		DeviceId:       a.deviceId,
-		OrganizationId: a.knockUser.OrganizationId,
+		UserId:         state.user.UserId,
+		DeviceId:       state.deviceID,
+		OrganizationId: state.user.OrganizationId,
 		AuthServiceId:  target.AuthServiceId,
-		UserData:       a.knockUser.UserData,
+		UserData:       state.user.UserData,
 	}
-	a.knockUserMutex.RUnlock()
 	lstBytes, marshalErr := json.Marshal(lstMsg)
 	if marshalErr != nil {
 		log.Error("agent(%s)[ListResource] failed to marshal LST message: %v", lstMsg.UserId, marshalErr)

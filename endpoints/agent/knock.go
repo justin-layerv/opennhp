@@ -16,6 +16,23 @@ import (
 )
 
 func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, err error) {
+	return a.knockWithRequest(res, a.knockRequest)
+}
+
+func (a *UdpAgent) knockWithRequest(
+	res *KnockTarget,
+	request func(*KnockTarget, bool) (*common.ServerKnockAckMsg, error),
+) (ackMsg *common.ServerKnockAckMsg, err error) {
+	requestTarget := res.snapshot()
+
+	// Validate the caller-owned cycle identity before lifecycle checks, address
+	// resolution, message construction, or queueing. Registered-agent callers
+	// must always supply it; legacy auth services may omit it, but may not supply
+	// a malformed value.
+	if err := validateKnockRunID(requestTarget.AuthServiceId, requestTarget.RunID); err != nil {
+		return knockRunIDErrorAck(), err
+	}
+
 	// Register against teardown before doing any work: beginTrackedOp does the
 	// running check + a.wg.Add(1) under lifecycleMu.RLock, so a DIRECT SDK Knock
 	// (sdk.KnockResource, no parent wg token) racing a Stop() already at
@@ -34,12 +51,12 @@ func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, er
 	errWaitTime := (core.AgentLocalTransactionResponseTimeoutMs - 100) * time.Millisecond
 	startTime := time.Now()
 
-	ackMsg, err = a.knockRequest(res, false)
+	ackMsg, err = request(requestTarget, false)
 	if errors.Is(err, common.ErrKnockTerminatedByCookie) {
 		// if cookie is required by server, use cookie to knock
 		// Note: don't use recursive calling method, it may get too deep if cookie message is kept sending
 		// use flat calling
-		ackMsg, err = a.knockRequest(res, true)
+		ackMsg, err = request(requestTarget, true)
 	}
 	// knockRequest returns (nil, err) on its early-error paths: resolveServerAddr
 	// failing (nil peer, or a DNS-unresolvable / unparseable server address,
@@ -55,6 +72,8 @@ func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, er
 	// non-*common.Error (e.g. the marshal path). err.Error() is always carried in
 	// ErrMsg, so that fallback code is only a best-effort label for the rare
 	// non-*common.Error case.
+	// RunID validation happens before request and already returns a stable,
+	// non-nil 52025 ack, so it never enters this nil-ack compatibility path.
 	if ackMsg == nil {
 		if err == nil {
 			err = common.ErrKnockServerNotFound
@@ -95,18 +114,20 @@ func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, er
 	// deal with ac PASS_ACCESS_IP mode
 	if len(ackMsg.PreAccessActions) > 0 {
 		if preErr := a.preAccessRequest(ackMsg); preErr != nil {
-			log.Error("agent(%s)[KnockRequest] pre-access request failed: %v", a.knockUser.UserId, preErr)
+			log.Error("agent(%s)[KnockRequest] pre-access request failed: %v", a.knockUserID(), preErr)
 		}
 	}
+	res.Lock()
 	res.LastKnockSuccessTime = time.Now()
+	res.Unlock()
 
-	log.Info("agent(%s)[KnockRequest] knock for %s:%s success, duration %d seconds", a.knockUser.UserId, res.AuthServiceId, res.ResourceId, ackMsg.OpenTime)
+	log.Info("agent(%s)[KnockRequest] knock for %s:%s success, duration %d seconds", a.knockUserID(), requestTarget.AuthServiceId, requestTarget.ResourceId, ackMsg.OpenTime)
 	return ackMsg, err
 }
 
 func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *common.ServerKnockAckMsg, err error) {
 	serverPeer := res.GetServerPeer()
-	addr, err := resolveServerAddr(serverPeer, a.knockUser.UserId, "KnockRequest")
+	addr, err := resolveServerAddr(serverPeer, a.knockUserID(), "KnockRequest")
 	if err != nil {
 		return nil, err
 	}
@@ -125,18 +146,7 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 		headerType = core.NHP_RKN
 	}
 
-	a.knockUserMutex.RLock()
-	knkMsg := &common.AgentKnockMsg{
-		HeaderType:     headerType, // #1154 invariant: must equal newMsgData wire arg below
-		UserId:         a.knockUser.UserId,
-		DeviceId:       a.deviceId,
-		OrganizationId: a.knockUser.OrganizationId,
-		AuthServiceId:  res.AuthServiceId,
-		ResourceId:     res.ResourceId,
-		CheckResults:   a.checkResults,
-		UserData:       a.knockUser.UserData,
-	}
-	a.knockUserMutex.RUnlock()
+	knkMsg := a.buildAgentKnockMsg(res, headerType)
 
 	knkBytes, marshalErr := json.Marshal(knkMsg)
 	if marshalErr != nil {
@@ -223,8 +233,27 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 }
 
 func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, err error) {
+	res = res.snapshot()
+
+	// Keep validation ahead of resolveServerAddr: invalid registered-agent
+	// requests must be rejected locally without DNS or UDP activity.
+	if err := validateKnockRunID(res.AuthServiceId, res.RunID); err != nil {
+		return knockRunIDErrorAck(), err
+	}
+	// Own a lifecycle token because this API is also called directly by the SDK.
+	// The background knock sub-routine may call it while its parent routine holds
+	// another token; that nested Add is intentional and is serialized against
+	// Stop's Wait by beginTrackedOp's lifecycle lock.
+	if !a.beginTrackedOp() {
+		return &common.ServerKnockAckMsg{
+			ErrCode: common.ErrPacketToMessageRoutineStopped.ErrorCode(),
+			ErrMsg:  common.ErrPacketToMessageRoutineStopped.Error(),
+		}, common.ErrPacketToMessageRoutineStopped
+	}
+	defer a.wg.Done()
+
 	serverPeer := res.GetServerPeer()
-	addr, err := resolveServerAddr(serverPeer, a.knockUser.UserId, "ExitKnockRequest")
+	addr, err := resolveServerAddr(serverPeer, a.knockUserID(), "ExitKnockRequest")
 	if err != nil {
 		return nil, err
 	}
@@ -238,18 +267,7 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	// review-time comment on literal constants.
 	headerType := core.NHP_EXT
 
-	a.knockUserMutex.RLock()
-	knkMsg := &common.AgentKnockMsg{
-		HeaderType:     headerType, // #1154 invariant: must equal newMsgData wire arg below
-		UserId:         a.knockUser.UserId,
-		DeviceId:       a.deviceId,
-		OrganizationId: a.knockUser.OrganizationId,
-		AuthServiceId:  res.AuthServiceId,
-		ResourceId:     res.ResourceId,
-		CheckResults:   a.checkResults,
-		UserData:       a.knockUser.UserData,
-	}
-	a.knockUserMutex.RUnlock()
+	knkMsg := a.buildAgentKnockMsg(res, headerType)
 
 	knkBytes, marshalErr := json.Marshal(knkMsg)
 	if marshalErr != nil {
@@ -272,8 +290,8 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	}
 
 	// Guarded send (see sendOrStop). ExitKnockRequest is reachable directly from
-	// the unsynchronized SDK export (NhpAgentExitResource -> sdk.ExitResource)
-	// and is not wg-tracked.
+	// the SDK export and is tracked above so Stop cannot tear down the device
+	// before the response wait observes signals.stop and returns.
 	if !a.sendOrStop(knkMd) {
 		log.Error("agent(%s#%d)[ExitKnockRequest] message routine stopped, skip sending", knkMsg.UserId, knkMd.TransactionId)
 		err = common.ErrPacketToMessageRoutineStopped
@@ -335,14 +353,44 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	return ackMsg, nil
 }
 
+func (a *UdpAgent) buildAgentKnockMsg(res *KnockTarget, headerType int) *common.AgentKnockMsg {
+	state := a.snapshotKnockUserState()
+	return &common.AgentKnockMsg{
+		HeaderType:     headerType,
+		UserId:         state.user.UserId,
+		DeviceId:       state.deviceID,
+		OrganizationId: state.user.OrganizationId,
+		AuthServiceId:  res.AuthServiceId,
+		ResourceId:     res.ResourceId,
+		RunID:          res.RunID,
+		CheckResults:   state.checkResults,
+		UserData:       state.user.UserData,
+	}
+}
+
+func (a *UdpAgent) knockUserID() string {
+	return a.snapshotKnockUserState().user.UserId
+}
+
+func validateKnockRunID(authServiceID, runID string) error {
+	if err := common.ValidateAgentKnockRunIDForAuthService(authServiceID, runID); err != nil {
+		return common.ErrKnockRunIDInvalid
+	}
+	return nil
+}
+
+func knockRunIDErrorAck() *common.ServerKnockAckMsg {
+	return &common.ServerKnockAckMsg{
+		ErrCode: common.ErrKnockRunIDInvalid.ErrorCode(),
+		ErrMsg:  common.ErrKnockRunIDInvalid.Error(),
+	}
+}
+
 // agent -> ac, pre-access
 func (a *UdpAgent) preAccessRequest(ackMsg *common.ServerKnockAckMsg) (err error) {
-	a.knockUserMutex.RLock()
-	if len(a.knockUser.UserId) == 0 {
-		a.knockUserMutex.RUnlock()
+	if a.knockUserID() == "" {
 		return common.ErrKnockUserNotSpecified
 	}
-	a.knockUserMutex.RUnlock()
 
 	var acWg sync.WaitGroup
 	for _, action := range ackMsg.PreAccessActions {
@@ -362,6 +410,11 @@ func (a *UdpAgent) preAccessRequest(ackMsg *common.ServerKnockAckMsg) (err error
 }
 
 func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
+	state := a.snapshotKnockUserState()
+	if state.user.UserId == "" {
+		return common.ErrKnockUserNotSpecified
+	}
+
 	acIp := net.ParseIP(info.AccessIp)
 	if acIp == nil {
 		return common.ErrInvalidIpAddress
@@ -388,15 +441,13 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 	acPk := acPeer.PublicKey()
 	a.device.AddPeer(acPeer)
 
-	a.knockUserMutex.RLock()
 	accMsg := &common.AgentAccessMsg{
-		UserId:         a.knockUser.UserId,
-		DeviceId:       a.deviceId,
-		OrganizationId: a.knockUser.OrganizationId,
+		UserId:         state.user.UserId,
+		DeviceId:       state.deviceID,
+		OrganizationId: state.user.OrganizationId,
 		ACToken:        info.ACToken,
-		UserData:       a.knockUser.UserData,
+		UserData:       state.user.UserData,
 	}
-	a.knockUserMutex.RUnlock()
 	accBytes, marshalErr := json.Marshal(accMsg)
 	if marshalErr != nil {
 		log.Error("agent(%s)[PreAccessRequest] failed to marshal ACC message: %v", accMsg.UserId, marshalErr)
@@ -491,8 +542,9 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 }
 
 func (a *UdpAgent) KnockDHP() (ackMsg *common.ServerDHPKnockAckMsg, err error) {
+	state := a.snapshotKnockUserState()
 	serverPeer := a.GetFirstServerPeer()
-	addr, err := resolveServerAddr(serverPeer, a.knockUser.UserId, "KnockDHP")
+	addr, err := resolveServerAddr(serverPeer, state.user.UserId, "KnockDHP")
 	if err != nil {
 		return nil, err
 	}
@@ -500,19 +552,17 @@ func (a *UdpAgent) KnockDHP() (ackMsg *common.ServerDHPKnockAckMsg, err error) {
 
 	evidence, err := wasmEngine.GetEvidence()
 	if err != nil {
-		log.Error("agent(%s)[KnockDHP] cannot get evidence: %s", a.knockUser.UserId, err)
+		log.Error("agent(%s)[KnockDHP] cannot get evidence: %s", state.user.UserId, err)
 		return nil, common.ErrEvidenceGetFailed
 	}
 
-	a.knockUserMutex.RLock()
 	knkMsg := &common.DHPKnockMsg{
-		UserId:         a.knockUser.UserId,
-		DeviceId:       a.deviceId,
-		OrganizationId: a.knockUser.OrganizationId,
-		UserData:       a.knockUser.UserData,
+		UserId:         state.user.UserId,
+		DeviceId:       state.deviceID,
+		OrganizationId: state.user.OrganizationId,
+		UserData:       state.user.UserData,
 		Evidence:       evidence,
 	}
-	a.knockUserMutex.RUnlock()
 
 	knkBytes, marshalErr := json.Marshal(knkMsg)
 	if marshalErr != nil {

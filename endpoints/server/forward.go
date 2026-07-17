@@ -857,8 +857,27 @@ func (f *ServerForwarder) handleDecryptedForwardedKnock(
 	// Step 2: Parse the knock message
 	knkMsg := &common.AgentKnockMsg{}
 	if err := json.Unmarshal(knockPpd.BodyMessage, knkMsg); err != nil {
+		// Keep the direct-path classification contract: canonical-value errors
+		// are INVALID_RUN_ID, while duplicate/alias/type abuses are body-shape
+		// parse failures before auth-service policy.
+		if errors.Is(err, common.ErrInvalidAgentKnockRunID) {
+			log.Warning("Rejected forwarded knock with malformed runId: tx=%d", fwdMsg.TransactionId)
+			f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "INVALID_RUN_ID", common.ErrKnockRunIDInvalid.Error())
+			return
+		}
 		log.Error("Failed to parse forwarded knock message: %v", err)
 		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "PARSE_FAILED", err.Error())
+		return
+	}
+	// Mirror buildKnockAck's native registered-agent boundary on the server
+	// that decrypts and executes a forwarded UDP knock. This must precede
+	// authenticated-pubkey, ASP/catalog, placement, and AC work; otherwise the
+	// forwarded path could mint an empty stored binding while the local path
+	// rejects the same packet.
+	if err := validateRegisteredAgentKnockRunID(knkMsg); err != nil {
+		log.Warning("Rejected forwarded registered-agent knock with missing or invalid runId: tx=%d resource=%s",
+			fwdMsg.TransactionId, knkMsg.ResourceId)
+		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "INVALID_RUN_ID", common.ErrKnockRunIDInvalid.Error())
 		return
 	}
 

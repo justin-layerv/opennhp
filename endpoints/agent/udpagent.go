@@ -21,6 +21,12 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/version"
 )
 
+// ErrRegisteredAgentKnockLoopUnsupported is returned when a caller tries to
+// place the registered-agent auth service in the periodic background resource
+// loop. Registered-agent callers own an explicit RunID lifecycle and must use
+// the one-shot knock and exit APIs.
+var ErrRegisteredAgentKnockLoopUnsupported = errors.New("registered-agent background knock loop is unsupported; use the one-shot RunID APIs")
+
 var (
 	ExeDirPath                 string
 	SmartDataPolicyRefreshTime = 15 * int64(time.Second)
@@ -32,9 +38,16 @@ type KnockUser struct {
 	UserData       map[string]any
 }
 
+type knockUserState struct {
+	user         KnockUser
+	deviceID     string
+	checkResults map[string]any
+}
+
 type KnockResource struct {
 	AuthServiceId  string `json:"aspId"`
 	ResourceId     string `json:"resId"`
+	RunID          string `json:"runId,omitempty"`
 	ServerHostname string `json:"serverHostname"`
 	ServerIp       string `json:"serverIp"`
 	ServerPort     int    `json:"serverPort"`
@@ -81,6 +94,19 @@ func (kt *KnockTarget) GetServerPeer() *core.UdpPeer {
 	defer kt.Unlock()
 
 	return kt.ServerPeer
+}
+
+// snapshot returns one immutable view of the per-knock resource and server.
+// In particular, a cookie retry must reuse the exact caller-owned RunID from
+// its initial KNK rather than observing a concurrent resource reload.
+func (kt *KnockTarget) snapshot() *KnockTarget {
+	kt.Lock()
+	defer kt.Unlock()
+
+	return &KnockTarget{
+		KnockResource: kt.KnockResource,
+		ServerPeer:    kt.ServerPeer,
+	}
 }
 
 type UdpAgent struct {
@@ -259,6 +285,11 @@ func (a *UdpAgent) Start(dirPath string, logLevel int) (err error) {
 	// load knock resources
 	if err := a.loadResources(); err != nil {
 		log.Error("[Agent] failed to load resources: %v", err)
+		a.StopConfigWatch()
+		a.lifecycleMu.Unlock()
+		a.device.Stop()
+		a.log.Close()
+		return err
 	}
 
 	a.recvMsgCh = a.device.DecryptedMsgQueue
@@ -345,17 +376,42 @@ func (a *UdpAgent) StopKnockLoop() {
 
 func (a *UdpAgent) SetKnockUser(usrId string, orgId string, userData map[string]any) {
 	a.knockUserMutex.Lock()
+	if a.knockUser == nil {
+		a.knockUser = &KnockUser{}
+	}
 	a.knockUser.UserId = usrId
 	a.knockUser.OrganizationId = orgId
 	a.knockUser.UserData = userData
 	a.knockUserMutex.Unlock()
 }
 
+// snapshotKnockUserState returns one lock-consistent view of the user fields
+// and the device/check metadata protected by the same mutex. A zero-value user
+// represents the valid "not specified" state of a programmatically constructed
+// agent; callers must apply their own operation-specific empty-user policy.
+func (a *UdpAgent) snapshotKnockUserState() knockUserState {
+	a.knockUserMutex.RLock()
+	defer a.knockUserMutex.RUnlock()
+
+	state := knockUserState{
+		deviceID:     a.deviceId,
+		checkResults: a.checkResults,
+	}
+	if a.knockUser != nil {
+		state.user = *a.knockUser
+	}
+	return state
+}
+
 func (a *UdpAgent) SetDeviceId(devId string) {
+	a.knockUserMutex.Lock()
+	defer a.knockUserMutex.Unlock()
 	a.deviceId = devId
 }
 
 func (a *UdpAgent) SetCheckResults(results map[string]any) {
+	a.knockUserMutex.Lock()
+	defer a.knockUserMutex.Unlock()
 	a.checkResults = results
 }
 
@@ -405,8 +461,8 @@ func (a *UdpAgent) Stop() {
 	a.device.Stop()
 	// Deliberately do NOT close sendMsgCh or knockTargetMapUpdated. Their
 	// consumers already return on signals.stop, so a close is redundant — but
-	// not harmless: not every sender is wg-tracked (the SDK request methods,
-	// ExitKnockRequest, the DHP DAR/DAV sends, and a resource-config
+	// not harmless: not every sender is wg-tracked (the other SDK request
+	// methods, the DHP DAR/DAV sends, and a resource-config
 	// file-watcher's debounced time.AfterFunc callback all run untracked), so
 	// wg.Wait() above doesn't fence them. A send case on an already-closed
 	// channel is still "ready" in a select and can be chosen (panicking), so the
@@ -972,6 +1028,9 @@ func (a *UdpAgent) RemoveServer(serverKey string) {
 }
 
 func (a *UdpAgent) AddResource(res *KnockResource) error {
+	if res.AuthServiceId == common.RegisteredAgentAuthServiceID {
+		return ErrRegisteredAgentKnockLoopUnsupported
+	}
 	peer := a.FindServerPeerFromResource(res)
 	if peer == nil {
 		log.Error("[Agent] no server peer found for resource %s (server=%s)", res.Id(), res.ServerHost())

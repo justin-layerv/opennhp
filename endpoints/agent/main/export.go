@@ -76,9 +76,19 @@ func nhp_agent_knock_resource(aspId *C.char, resId *C.char, serverIp *C.char, se
 	return C.CString(sdk.KnockResource(deepCopyCString(aspId), deepCopyCString(resId), deepCopyCString(serverIp), deepCopyCString(serverHostname), int(serverPort)))
 }
 
+//export nhp_agent_knock_resource_with_run_id
+func nhp_agent_knock_resource_with_run_id(aspId *C.char, resId *C.char, runID *C.char, serverIp *C.char, serverHostname *C.char, serverPort C.int) *C.char {
+	return C.CString(sdk.KnockResourceWithRunID(deepCopyCString(aspId), deepCopyCString(resId), deepCopyCString(runID), deepCopyCString(serverIp), deepCopyCString(serverHostname), int(serverPort)))
+}
+
 //export nhp_agent_exit_resource
 func nhp_agent_exit_resource(aspId *C.char, resId *C.char, serverIp *C.char, serverHostname *C.char, serverPort C.int) bool {
 	return sdk.ExitResource(deepCopyCString(aspId), deepCopyCString(resId), deepCopyCString(serverIp), deepCopyCString(serverHostname), int(serverPort))
+}
+
+//export nhp_agent_exit_resource_with_run_id
+func nhp_agent_exit_resource_with_run_id(aspId *C.char, resId *C.char, runID *C.char, serverIp *C.char, serverHostname *C.char, serverPort C.int) bool {
+	return sdk.ExitResourceWithRunID(deepCopyCString(aspId), deepCopyCString(resId), deepCopyCString(runID), deepCopyCString(serverIp), deepCopyCString(serverHostname), int(serverPort))
 }
 
 //export nhp_generate_keys

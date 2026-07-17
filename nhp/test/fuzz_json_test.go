@@ -1,28 +1,57 @@
 package test
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
-// FuzzAgentKnockMsg tests JSON parsing of AgentKnockMsg.
-// This is a security-critical message type used for authentication.
+// FuzzAgentKnockMsg verifies that the strict AgentKnockMsg decoder never accepts
+// input rejected by encoding/json and that every accepted message has a stable
+// canonical wire form. This security-critical type carries authentication data.
 func FuzzAgentKnockMsg(f *testing.F) {
-	// Seed corpus with valid JSON structures
-	f.Add([]byte(`{"userId":"test","deviceId":"dev1"}`))
-	f.Add([]byte(`{"userId":"","deviceId":""}`))
-	f.Add([]byte(`{}`))
-	f.Add([]byte(`{"nested":{"deep":"value"}}`))
-	f.Add([]byte(`[]`))
-	f.Add([]byte(`null`))
-	f.Add([]byte(``))
+	for _, seed := range []string{
+		`{}`,
+		`{"headerType":1,"aspId":"agent","resId":"connector","runId":"0123456789abcdef"}`,
+		`{"headerType":1,"aspId":"other","resId":"connector","usrData":{"nested":["}",",","\\\""]}}`,
+		`{"runId":"0123456789abcdef","r\u0075nId":"fedcba9876543210"}`,
+		`{"RUN_ID":"0123456789abcdef"}`,
+		`[]`,
+		`null`,
+		``,
+	} {
+		f.Add([]byte(seed))
+	}
 
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Fuzz(func(t *testing.T, body []byte) {
+		type encodingJSONBaseline common.AgentKnockMsg
+		var baseline encodingJSONBaseline
+		baselineErr := json.Unmarshal(body, &baseline)
+
 		var msg common.AgentKnockMsg
-		// Should not panic on any JSON input
-		_ = json.Unmarshal(data, &msg)
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return
+		}
+		if baselineErr != nil {
+			t.Fatalf("strict parser accepted body rejected by encoding/json baseline: %v", baselineErr)
+		}
+		wire, err := json.Marshal(&msg)
+		if err != nil {
+			t.Fatalf("marshal accepted message: %v", err)
+		}
+		var roundTrip common.AgentKnockMsg
+		if err := json.Unmarshal(wire, &roundTrip); err != nil {
+			t.Fatalf("strict parser rejected its own canonical marshal: %v", err)
+		}
+		roundTripWire, err := json.Marshal(&roundTrip)
+		if err != nil {
+			t.Fatalf("marshal round-trip message: %v", err)
+		}
+		if !bytes.Equal(wire, roundTripWire) {
+			t.Fatalf("accepted message is not wire-stable: first=%s second=%s", wire, roundTripWire)
+		}
 	})
 }
 

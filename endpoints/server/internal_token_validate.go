@@ -43,12 +43,12 @@ const (
 // (ackMsg.ACTokens[resourceId]) — the same value the agent will
 // attach to its FRP login Metas as `qurl_knock_token`.
 //
-// AgentRunID is optional only while the live token entry has no stored
-// RunID (the pre-#3226 producer shape). Once an entry has a
-// non-empty RunID, the request must supply the same value; omission or
-// inequality is rejected as run_id_mismatch. The response `run_id`
-// always echoes AgentRunID and carries `omitempty`, so a rejection for
-// omission does not expose the stored run identifier.
+// AgentRunID is optional only while the live token entry has no stored RunID,
+// which is intentional for legacy auth services and the HTTP knock path. Once
+// an entry has a non-empty RunID, the request must supply the same value;
+// omission or inequality is rejected as run_id_mismatch. The response `run_id`
+// always echoes AgentRunID and carries `omitempty`, so a rejection for omission
+// does not expose the stored run identifier.
 type internalTokenValidateRequest struct {
 	Token      string `json:"token"`
 	AgentRunID string `json:"agent_run_id,omitempty"`
@@ -532,10 +532,10 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		// whether this validate request landed on the issuing process.
 		hs.udpServer.metrics.IncrCounter(MetricACKTokenSharedStoreHit)
 	}
-	// Before #3226 populates entry.RunID, request-only and empty/empty values
-	// stay compatible. Once a live entry carries a binding, however, the
-	// caller must assert the exact same value: omission is a mismatch, not a
-	// compatibility escape hatch.
+	// Intentional legacy/HTTP entries and pre-producer rows have an empty RunID,
+	// so request-only and empty/empty values stay compatible. Once a live entry
+	// carries a binding, however, the caller must assert the exact same value:
+	// omission is a mismatch, not a compatibility escape hatch.
 	if entry.RunID != "" && entry.RunID != req.AgentRunID {
 		// Echo only the request value so every negative result remains
 		// correlatable without leaking the stored binding or any other
@@ -561,8 +561,8 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	//     UserId for audit-log annotation today).
 	//   - run_id:       echoes the caller-supplied agent_run_id after
 	//     the stored binding check above. If the caller omits it, a
-	//     valid response is possible only for a pre-#3226 entry whose
-	//     stored RunID is also empty.
+	//     valid response is possible only for an intentional legacy/HTTP entry
+	//     or pre-producer row whose stored RunID is also empty.
 	//   - expires_at:   RFC3339Nano to keep the response self-
 	//     describing across language clients AND preserve the
 	//     sub-second precision the in-memory ExpireTime carries.

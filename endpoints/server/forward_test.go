@@ -2149,6 +2149,7 @@ func TestHandleDecryptedForwardedKnock_RejectsEmptyResourceHost(t *testing.T) {
 		DeviceId:      "test-device",
 		AuthServiceId: "agent",
 		ResourceId:    "qurl-tunnel-server",
+		RunID:         "0123456789abcdef",
 	}
 	body, err := json.Marshal(knockMsg)
 	if err != nil {
@@ -2181,6 +2182,74 @@ func TestHandleDecryptedForwardedKnock_RejectsEmptyResourceHost(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for response")
+	}
+}
+
+func TestHandleDecryptedForwardedKnock_RejectsMissingRegisteredAgentRunIDBeforeDependencies(t *testing.T) {
+	mockDeps := NewMockForwarderDeps()
+	forwarder := NewServerForwarder(mockDeps)
+	body, err := json.Marshal(&common.AgentKnockMsg{
+		HeaderType:    core.NHP_KNK,
+		UserId:        "missing-run-id",
+		DeviceId:      "device",
+		AuthServiceId: common.RegisteredAgentAuthServiceID,
+		ResourceId:    "connector",
+	})
+	if err != nil {
+		t.Fatalf("marshal knock: %v", err)
+	}
+	fwdMsg := &common.ServerForwardMsg{TransactionId: 9876}
+	forwarder.handleDecryptedForwardedKnock(nil, fwdMsg, &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 40000}, &core.PacketParserData{
+		BodyMessage:  body,
+		RemotePubKey: make([]byte, 32),
+	})
+
+	select {
+	case msg := <-mockDeps.GetSendChannel():
+		var result common.ServerForwardResultMsg
+		if err := json.Unmarshal(msg.Message, &result); err != nil {
+			t.Fatalf("parse result: %v", err)
+		}
+		if result.ErrCode != "INVALID_RUN_ID" {
+			t.Fatalf("ErrCode=%q ErrMsg=%q, want INVALID_RUN_ID", result.ErrCode, result.ErrMsg)
+		}
+		if result.ErrMsg != common.ErrKnockRunIDInvalid.Error() {
+			t.Fatalf("ErrMsg=%q, want %q", result.ErrMsg, common.ErrKnockRunIDInvalid.Error())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for missing-RunID rejection")
+	}
+	if got := mockDeps.LastResolveCtx(); got != nil {
+		t.Fatalf("auth-provider resolver was called with context %v; missing RunID must reject before dependency work", got)
+	}
+}
+
+func TestHandleDecryptedForwardedKnock_RejectsMalformedRegisteredAgentRunIDWithStableError(t *testing.T) {
+	mockDeps := NewMockForwarderDeps()
+	forwarder := NewServerForwarder(mockDeps)
+	fwdMsg := &common.ServerForwardMsg{TransactionId: 9877}
+	forwarder.handleDecryptedForwardedKnock(nil, fwdMsg, &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 40000}, &core.PacketParserData{
+		BodyMessage:  []byte(`{"headerType":1,"usrId":"malformed-run-id","devId":"device","aspId":"agent","resId":"connector","runId":"0123456789ABCDEF"}`),
+		RemotePubKey: make([]byte, 32),
+	})
+
+	select {
+	case msg := <-mockDeps.GetSendChannel():
+		var result common.ServerForwardResultMsg
+		if err := json.Unmarshal(msg.Message, &result); err != nil {
+			t.Fatalf("parse result: %v", err)
+		}
+		if result.ErrCode != "INVALID_RUN_ID" {
+			t.Fatalf("ErrCode=%q ErrMsg=%q, want INVALID_RUN_ID", result.ErrCode, result.ErrMsg)
+		}
+		if result.ErrMsg != common.ErrKnockRunIDInvalid.Error() {
+			t.Fatalf("ErrMsg=%q, want %q", result.ErrMsg, common.ErrKnockRunIDInvalid.Error())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for malformed-RunID rejection")
+	}
+	if got := mockDeps.LastResolveCtx(); got != nil {
+		t.Fatalf("auth-provider resolver was called with context %v; malformed RunID must reject before dependency work", got)
 	}
 }
 

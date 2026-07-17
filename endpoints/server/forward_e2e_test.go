@@ -1532,6 +1532,26 @@ func (d *mockACForwarderDeps) SetResolvedOwnerID(pubKeyB64, ownerID string) {
 	d.resolvedOwnerIDs[pubKeyB64] = ownerID
 }
 
+func TestForwardPublishACKTokens_LegacySuppliedRunIDStaysUnbound(t *testing.T) {
+	deps := &mockACForwarderDeps{t: t}
+	err := deps.PublishACKTokens(context.Background(), &common.AgentKnockMsg{
+		AuthServiceId: "legacy",
+		RunID:         "0123456789abcdef",
+	}, &common.ServerKnockAckMsg{
+		ACTokens: map[string]string{"resource": "forwarded-legacy-token"},
+	}, "192.0.2.10", 60, "")
+	if err != nil {
+		t.Fatalf("PublishACKTokens: %v", err)
+	}
+	entry := deps.GetStoredACToken("forwarded-legacy-token")
+	if entry == nil {
+		t.Fatal("forwarded legacy token was not stored")
+	}
+	if entry.RunID != "" {
+		t.Fatalf("forwarded legacy entry.RunID = %q, want empty", entry.RunID)
+	}
+}
+
 // TestE2E_HandleForwardRequest_FullACFlow tests the complete forwarding flow
 // with a mock AC that processes NHP_AOP and responds with NHP_ART.
 // This exercises the entire protocol chain with real Noise encryption.
@@ -1638,7 +1658,7 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 			default:
 			}
 		},
-		aspData: newForwardE2EQURLTunnelASP("test-asp-e2e", mockAC.id),
+		aspData: newForwardE2EQURLTunnelASP(common.RegisteredAgentAuthServiceID, mockAC.id),
 	}
 
 	// Pre-install the pubkey→ownerID mapping that the forward-
@@ -1662,8 +1682,9 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 		HeaderType:    core.NHP_KNK,
 		UserId:        "test-user-e2e",
 		DeviceId:      "test-device-e2e",
-		AuthServiceId: "test-asp-e2e",
+		AuthServiceId: common.RegisteredAgentAuthServiceID,
 		ResourceId:    qurlplacement.TunnelServerResourceID,
+		RunID:         "0123456789abcdef",
 		UserData: map[string]any{
 			"passcode": "123456",
 		},
@@ -1773,6 +1794,9 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 	if storedEntry.KnockSrcIP != "192.168.1.100" {
 		t.Errorf("Stored entry KnockSrcIP mismatch: got %q, want %q (must come from fwdMsg.UserAddr's IP component)",
 			storedEntry.KnockSrcIP, "192.168.1.100")
+	}
+	if storedEntry.RunID != knockMsg.RunID {
+		t.Errorf("Stored entry RunID mismatch: got %q, want authenticated forwarded-knock RunID %q", storedEntry.RunID, knockMsg.RunID)
 	}
 
 	// OwnerId is the server-resolved tenant identity that the

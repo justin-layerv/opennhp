@@ -32,6 +32,45 @@ OpenNHP provides sample SDK source code. The samples include methods that might 
 
 SDK Sample Source Code: ***opennhp/endpoints/agent/main/export.go***
 
+### 1.3 Registered-agent RunID contract
+
+The registered-agent authentication service is selected by the exact
+`aspId` value `agent`. Its native UDP callers must own one RunID for each
+access lifecycle. A RunID is exactly 16 lowercase hexadecimal characters. The
+SDK validates the value but never generates or changes it; callers reuse the
+same value for the initial KNK, any cookie-triggered RKN, and the matching EXT.
+
+Use the explicit RunID-bearing one-shot methods:
+
+- Go: `sdk.KnockResourceWithRunID` and `sdk.ExitResourceWithRunID`
+- C: `nhp_agent_knock_resource_with_run_id` and
+  `nhp_agent_exit_resource_with_run_id`
+- iOS/gomobile: `NhpAgentKnockResourceWithRunID` and
+  `NhpAgentExitResourceWithRunID`
+
+The legacy knock and exit methods carry no RunID and therefore fail closed for
+`aspId="agent"` (the knock result uses error code `52025`; exit returns
+`false`). The background resource loop also does not support registered-agent
+authentication: `AddResource`/`nhp_agent_add_resource`/
+`NhpAgentAddResource` return `false`, and an `agent` entry in `resource.toml`
+causes agent startup to fail. Registered-agent integrations must use the
+one-shot methods so the application, rather than a periodic SDK loop, controls
+the lifecycle boundary.
+
+Maintainer contract: the released qurl-conformance agent-knock application-body
+vectors are the source of truth for the top-level `runId` field. The shared
+`AgentKnockMsg` decoder intentionally rejects duplicate `runId` fields plus
+case-folded/`run_id` aliases for every auth service before dispatch, while
+unrelated duplicate fields retain Go's historical last-value behavior. Keep
+the allocation-bounded top-level ambiguity scan after the successful standard
+JSON decode; that order
+provides syntax, delimiter-pairing, and nesting-depth validation. Update the
+conformance vectors before changing this parser contract.
+
+The longer excerpts and examples below use non-`agent` authentication services
+and therefore continue to demonstrate the legacy methods. The exported source
+files above are authoritative for the complete current symbol set.
+
 ```go
 package main
 

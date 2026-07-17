@@ -70,6 +70,11 @@ type ServerRegisterAckMsg struct {
 // zero value here indicates a legacy agent that predates the fix —
 // see endpoints/server/knock_headertype_gate.go for the server-side
 // verification policy.
+//
+// RunID is the caller-owned knock/Login cycle identifier: exactly 16 lowercase
+// hexadecimal characters. Generic legacy messages may omit it, but native UDP
+// knocks dispatched to the registered-agent auth service require it before any
+// registry, resource, or AC work.
 type AgentKnockMsg struct {
 	HeaderType     int            `json:"headerType"`
 	UserId         string         `json:"usrId"`
@@ -77,6 +82,7 @@ type AgentKnockMsg struct {
 	OrganizationId string         `json:"orgId,omitempty"`
 	AuthServiceId  string         `json:"aspId"`
 	ResourceId     string         `json:"resId"`
+	RunID          string         `json:"runId,omitempty"`
 	CheckResults   map[string]any `json:"results,omitempty"`
 	UserData       map[string]any `json:"usrData,omitempty"`
 }

@@ -110,6 +110,7 @@ func testForwardOriginalPacketForType(t *testing.T, headerType int) {
 		UserId:        "repro-user",
 		AuthServiceId: "agent",
 		ResourceId:    "repro-resource",
+		RunID:         "0123456789abcdef",
 	})
 	if err != nil {
 		t.Fatalf("marshal knock body: %v", err)

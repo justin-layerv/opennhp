@@ -47,8 +47,16 @@ func NhpAgentKnockResource(aspId string, resId string, serverIp string, serverHo
 	return sdk.KnockResource(aspId, resId, serverIp, serverHostname, serverPort)
 }
 
+func NhpAgentKnockResourceWithRunID(aspId string, resId string, runID string, serverIp string, serverHostname string, serverPort int) string {
+	return sdk.KnockResourceWithRunID(aspId, resId, runID, serverIp, serverHostname, serverPort)
+}
+
 func NhpAgentExitResource(aspId string, resId string, serverIp string, serverHostname string, serverPort int) bool {
 	return sdk.ExitResource(aspId, resId, serverIp, serverHostname, serverPort)
+}
+
+func NhpAgentExitResourceWithRunID(aspId string, resId string, runID string, serverIp string, serverHostname string, serverPort int) bool {
+	return sdk.ExitResourceWithRunID(aspId, resId, runID, serverIp, serverHostname, serverPort)
 }
 
 //export NhpGenerateKeys
