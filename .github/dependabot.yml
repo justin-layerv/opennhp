@@ -112,6 +112,18 @@ updates:
     labels:
       - "dependencies"
       - "js-agent"
+    ignore:
+      # typescript-eslint hard-caps its typescript peer (>=4.8.4 <6.1.0 as of
+      # 8.64.0 — every published line, alphas included). It lints through the TS
+      # compiler API, so a TS major it hasn't validated is a real break, not a
+      # conservative pin. A typescript major bump therefore ERESOLVEs `npm ci`
+      # and reds every js-agent job (quality, test, parity) before any of them
+      # run — see PR #3298 (TS 6->7). Held until typescript-eslint ships TS-major
+      # support; then bump both together in one coordinated PR and drop this
+      # ignore. Minor/patch TS updates still flow. Security updates are exempt
+      # from ignore, so a TS CVE still surfaces a PR.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
