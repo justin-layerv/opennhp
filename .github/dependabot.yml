@@ -226,6 +226,24 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 3
+    # boto3 and botocore MUST move in lockstep: boto3 X.Y.Z requires
+    # botocore>=X.Y.Z, and CI installs all three lambda test requirement sets
+    # into one env, so a split bump (only one of the pair reaches main first)
+    # fails the "Test Lambdas" install with pip ResolutionImpossible. Grouping
+    # keeps the pair in a single PR. Two groups for the same reason as the
+    # codeql-action block above: a group defaults to `applies-to:
+    # version-updates`, so a botocore security advisory would otherwise open an
+    # ungrouped PR and re-introduce the split-bump break.
+    groups:
+      aws-sdk:
+        patterns:
+          - "boto3"
+          - "botocore"
+      aws-sdk-security:
+        applies-to: security-updates
+        patterns:
+          - "boto3"
+          - "botocore"
     labels:
       - "dependencies"
       - "terraform"
