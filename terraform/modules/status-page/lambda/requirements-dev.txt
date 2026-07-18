@@ -5,6 +5,6 @@
 # runs are reproducible across re-triggers. AWS calls are stubbed with
 # unittest.mock, so no moto dependency is needed.
 
-pytest==9.0.3
+pytest==9.1.1
 boto3==1.43.51
 botocore==1.43.51
