@@ -143,10 +143,9 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
-          # check-live-main-ref.sh performs an authenticated private-repo
-          # ls-remote against origin. Remove this credential immediately after
-          # that final fetch and before Terraform executes.
-          persist-credentials: true
+          # Live-main checks use a step-scoped API token. Never persist a
+          # checkout credential where Terraform could inherit it.
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -166,10 +165,12 @@ jobs:
           restore-keys: terraform-plugins-
 
       - name: Re-read live main before AWS access
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
 
-      - name: Remove checkout credential before Terraform
-        run: git config --local --unset-all http.https://github.com/.extraheader
+      - name: Prove checkout credentials are absent before Terraform
+        run: scripts/check-no-checkout-credentials.sh
 
       - name: Configure sandbox apply role for live planning
         uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
@@ -276,10 +277,9 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.planned_commit_sha }}
-          # check-live-main-ref.sh performs an authenticated private-repo
-          # ls-remote against origin. Remove this credential immediately after
-          # the final pre-apply fetch and before Terraform applies.
-          persist-credentials: true
+          # Live-main checks use a step-scoped API token. Never persist a
+          # checkout credential where Terraform could inherit it.
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -350,8 +350,12 @@ jobs:
 
       - name: Re-read live main before AWS access
         env:
+          GH_TOKEN: ${{ github.token }}
           PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
         run: scripts/check-live-main-ref.sh "$PLANNED_COMMIT_SHA"
+
+      - name: Prove checkout credentials are absent before Terraform
+        run: scripts/check-no-checkout-credentials.sh
 
       - name: Configure sandbox apply role
         uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
@@ -373,10 +377,8 @@ jobs:
           export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
           terraform init -reconfigure -input=false
 
-      - name: Re-prove absent state and apply exact saved plan
+      - name: Re-prove absent state and exact saved plan contract
         working-directory: ${{ env.CONTROL_ROOT }}
-        env:
-          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
         run: |
           set -euo pipefail
           assert_absent() {
@@ -406,16 +408,25 @@ jobs:
           # requires pristine absent state, and rechecks the exact plan contract.
           # Do not reuse this cross-run pattern after the first apply.
           # Re-render and recheck the exact hash-verified binary only after the
-          # final live state/lock proof. The main-ref read and immediate checkout-
-          # credential removal are the only commands between this contract check
-          # and the apply of those same bytes.
+          # final live state/lock proof. The next token-scoped API read and the
+          # credential-free apply are the only remaining steps.
           terraform show -json "$RUNNER_TEMP/control-plan-artifact/tfplan" \
             >"$RUNNER_TEMP/control-plan-artifact/apply-tfplan.json"
           ../../../../.github/scripts/check-control-sandbox-first-apply.py \
             plan "$RUNNER_TEMP/control-plan-artifact/apply-tfplan.json" \
             --expected-action create
-          ../../../../scripts/check-live-main-ref.sh "$PLANNED_COMMIT_SHA"
-          git config --local --unset-all http.https://github.com/.extraheader
+
+      - name: Re-read live main immediately before exact apply
+        working-directory: ${{ env.CONTROL_ROOT }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+        run: ../../../../scripts/check-live-main-ref.sh "$PLANNED_COMMIT_SHA"
+
+      - name: Apply exact saved plan without GitHub credentials
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          ../../../../scripts/check-no-checkout-credentials.sh
           terraform apply -input=false -lock-timeout=5m -no-color \
             "$RUNNER_TEMP/control-plan-artifact/tfplan"
 
@@ -452,10 +463,9 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
-          # check-live-main-ref.sh performs an authenticated private-repo
-          # ls-remote against origin. Remove this credential immediately after
-          # that final fetch and before Terraform executes.
-          persist-credentials: true
+          # Live-main checks use a step-scoped API token. Never persist a
+          # checkout credential where Terraform could inherit it.
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -475,10 +485,12 @@ jobs:
           restore-keys: terraform-plugins-
 
       - name: Re-read live main before AWS access
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
 
-      - name: Remove checkout credential before Terraform
-        run: git config --local --unset-all http.https://github.com/.extraheader
+      - name: Prove checkout credentials are absent before Terraform
+        run: scripts/check-no-checkout-credentials.sh
 
       - name: Configure sandbox apply role
         uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1

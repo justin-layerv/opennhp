@@ -26,12 +26,12 @@ PREFLIGHT_SCRIPT_PATH = (
     ROOT / "scripts/capture-control-sandbox-first-apply-preflight.sh"
 )
 LIVE_MAIN_SCRIPT_PATH = ROOT / "scripts/check-live-main-ref.sh"
+NO_CHECKOUT_CREDENTIALS_SCRIPT_PATH = (
+    ROOT / "scripts/check-no-checkout-credentials.sh"
+)
 SECRET_SEED_SCRIPT_PATH = ROOT / "scripts/ensure-control-otp-pepper.sh"
 REAL_TERRAFORM_NOOP_FIXTURE_PATH = (
     ROOT / "tests/fixtures/qurl-agent-transact-iam/no-op-terraform-1.14.3.json"
-)
-CHECKOUT_CREDENTIAL_REMOVAL = (
-    "git config --local --unset-all http.https://github.com/.extraheader"
 )
 LEDGER_PATH = (
     ROOT
@@ -1325,6 +1325,227 @@ else:
 
 
 class SourceRunAndWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def initialize_checkout_repository(root: Path) -> Path:
+        repository = root / "repository"
+        subprocess.run(["git", "init", "--quiet", repository], check=True, text=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                repository,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/layervai/nhp",
+            ],
+            check=True,
+            text=True,
+        )
+        return repository
+
+    @staticmethod
+    def run_checkout_credential_check(
+        repository: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ)
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
+        env["GITHUB_REPOSITORY"] = "layervai/nhp"
+        return subprocess.run(
+            [str(NO_CHECKOUT_CREDENTIALS_SCRIPT_PATH)],
+            cwd=repository,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_checkout_v7_include_credential_indirection_is_rejected(self) -> None:
+        key = "http.https://github.com/.extraheader"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = self.initialize_checkout_repository(root)
+            credentials = root / "git-credentials.config"
+            subprocess.run(
+                [
+                    "git",
+                    "config",
+                    "--file",
+                    credentials,
+                    key,
+                    "AUTHORIZATION: basic checkout-v7-token",
+                ],
+                check=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repository,
+                    "config",
+                    "--local",
+                    f"includeIf.gitdir:{repository}/.git.path",
+                    str(credentials),
+                ],
+                check=True,
+                text=True,
+            )
+
+            # This is the exact false-negative that motivated the fix: the
+            # header is absent from .git/config but active through includeIf.
+            local_only = subprocess.run(
+                ["git", "config", "--local", "--get-regexp", "extraheader$"],
+                cwd=repository,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            effective = subprocess.run(
+                ["git", "config", "--get-regexp", "extraheader$"],
+                cwd=repository,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(local_only.returncode, 1, local_only.stdout)
+            self.assertEqual(effective.returncode, 0, effective.stderr)
+
+            result = self.run_checkout_credential_check(repository)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("effective git config", result.stdout)
+
+    def test_checkout_credential_boundary_accepts_nonpersistent_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = self.initialize_checkout_repository(
+                Path(directory).resolve()
+            )
+
+            result = self.run_checkout_credential_check(repository)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            leaked_env = dict(os.environ)
+            leaked_env.pop("GITHUB_TOKEN", None)
+            leaked_env.update(
+                {
+                    "GH_TOKEN": "leaked-step-token",
+                    "GITHUB_REPOSITORY": "layervai/nhp",
+                }
+            )
+            leaked = subprocess.run(
+                [str(NO_CHECKOUT_CREDENTIALS_SCRIPT_PATH)],
+                cwd=repository,
+                env=leaked_env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(leaked.returncode, 0)
+            self.assertIn("Terraform step environment", leaked.stdout)
+
+    def test_checkout_credential_boundary_rejects_dangling_include_and_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = self.initialize_checkout_repository(
+                Path(directory).resolve()
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repository,
+                    "config",
+                    "--local",
+                    "includeIf.gitdir:/unmatched/worktree/.git.path",
+                    "/tmp/git-credentials.config",
+                ],
+                check=True,
+                text=True,
+            )
+            dangling = self.run_checkout_credential_check(repository)
+            self.assertNotEqual(dangling.returncode, 0)
+            self.assertIn("credential include", dangling.stdout)
+
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repository,
+                    "config",
+                    "--local",
+                    "--unset-all",
+                    "includeIf.gitdir:/unmatched/worktree/.git.path",
+                ],
+                check=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repository,
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://token@github.com/layervai/nhp",
+                ],
+                check=True,
+                text=True,
+            )
+            embedded_url = self.run_checkout_credential_check(repository)
+            self.assertNotEqual(embedded_url.returncode, 0)
+            self.assertIn("origin URL", embedded_url.stdout)
+
+    def test_live_main_check_uses_authenticated_github_api(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            log_path = root / "gh.log"
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'printf \'%s\\n\' "$*" >"$FAKE_GH_LOG"\n'
+                "printf "
+                "'{\"ref\":\"%s\",\"object\":{\"type\":\"%s\",\"sha\":\"%s\"}}\\n' "
+                '"${FAKE_GH_REF:-refs/heads/main}" '
+                '"${FAKE_GH_TYPE:-commit}" "$FAKE_GH_SHA"\n',
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+            expected_sha = "a" * 40
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "FAKE_GH_LOG": str(log_path),
+                "FAKE_GH_SHA": expected_sha,
+                "GH_TOKEN": "step-scoped-token",
+                "GITHUB_REPOSITORY": "layervai/nhp",
+            }
+            success = subprocess.run(
+                [str(LIVE_MAIN_SCRIPT_PATH), expected_sha],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(success.returncode, 0, success.stderr)
+            self.assertEqual(
+                log_path.read_text().strip(),
+                "api repos/layervai/nhp/git/ref/heads/main",
+            )
+
+            mismatch = subprocess.run(
+                [str(LIVE_MAIN_SCRIPT_PATH), "b" * 40],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn("does not exactly match", mismatch.stderr)
+
     def test_source_run_binding(self) -> None:
         run = {
             "id": 12345,
@@ -1388,22 +1609,36 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow.count("environment: sandbox"), 3)
         self.assertEqual(workflow.count("Re-read live main before AWS access"), 3)
         self.assertEqual(workflow.count("scripts/check-live-main-ref.sh"), 4)
-        self.assertIn("git ls-remote --exit-code origin refs/heads/main", live_main)
+        self.assertEqual(
+            workflow.count("scripts/check-no-checkout-credentials.sh"), 4
+        )
+        self.assertEqual(workflow.count("GH_TOKEN: ${{ github.token }}"), 5)
+        self.assertIn('gh api "repos/$repository/git/ref/heads/main"', live_main)
+        self.assertNotIn("git ls-remote", live_main)
         terraform_apply = workflow.index("terraform apply -input=false")
         final_ref_check = workflow.rfind(
             "scripts/check-live-main-ref.sh", 0, terraform_apply
         )
-        final_credential_removal = workflow.rfind(
-            CHECKOUT_CREDENTIAL_REMOVAL, 0, terraform_apply
+        final_credential_check = workflow.rfind(
+            "scripts/check-no-checkout-credentials.sh", 0, terraform_apply
         )
         self.assertGreater(final_ref_check, -1)
-        self.assertGreater(final_credential_removal, -1)
+        self.assertGreater(final_credential_check, -1)
         self.assertLess(final_ref_check, terraform_apply)
-        self.assertLess(final_ref_check, final_credential_removal)
-        self.assertLess(final_credential_removal, terraform_apply)
+        self.assertLess(final_ref_check, final_credential_check)
+        self.assertLess(final_credential_check, terraform_apply)
         self.assertIn(
-            'scripts/check-live-main-ref.sh "$PLANNED_COMMIT_SHA"\n'
-            f"          {CHECKOUT_CREDENTIAL_REMOVAL}\n"
+            "      - name: Re-read live main immediately before exact apply\n"
+            "        working-directory: ${{ env.CONTROL_ROOT }}\n"
+            "        env:\n"
+            "          GH_TOKEN: ${{ github.token }}\n"
+            "          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}\n"
+            '        run: ../../../../scripts/check-live-main-ref.sh '
+            '"$PLANNED_COMMIT_SHA"\n\n'
+            "      - name: Apply exact saved plan without GitHub credentials\n"
+            "        working-directory: ${{ env.CONTROL_ROOT }}\n"
+            "        run: |\n"
+            "          ../../../../scripts/check-no-checkout-credentials.sh\n"
             "          terraform apply -input=false",
             workflow,
         )
@@ -1446,6 +1681,7 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
 
         for helper in (
             "scripts/check-live-main-ref.sh",
+            "scripts/check-no-checkout-credentials.sh",
             "scripts/ensure-control-otp-pepper.sh",
         ):
             self.assertIn(f'- "{helper}"', validate_workflow)
@@ -1480,9 +1716,9 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
         self.assertIn(
             "strict create-only gate is intentionally temporary", plan_workflow
         )
-        self.assertEqual(workflow.count("persist-credentials: true"), 3)
-        self.assertEqual(workflow.count(CHECKOUT_CREDENTIAL_REMOVAL), 3)
-        self.assertIn("authenticated private-repo", workflow)
+        self.assertEqual(workflow.count("persist-credentials: false"), 3)
+        self.assertNotIn("persist-credentials: true", workflow)
+        self.assertNotIn("--unset-all http.https://github.com/.extraheader", workflow)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ on:
       - "scripts/check-control-global-routing.sh"
       - "scripts/check-control-vpc-cidr-overlap.sh"
       - "scripts/check-live-main-ref.sh"
+      - "scripts/check-no-checkout-credentials.sh"
       - "scripts/ensure-control-otp-pepper.sh"
       - "scripts/verify-control-sandbox-first-apply.sh"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
@@ -524,6 +525,7 @@ jobs:
             scripts/check-control-global-routing.sh \
             scripts/check-control-vpc-cidr-overlap.sh \
             scripts/check-live-main-ref.sh \
+            scripts/check-no-checkout-credentials.sh \
             scripts/ensure-control-otp-pepper.sh \
             scripts/verify-control-sandbox-first-apply.sh \
             tests/fixtures/control-vpc-cidr-overlap/aws \
