@@ -1602,12 +1602,18 @@ jobs:
         if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         run: |
           shellcheck \
+            scripts/capture-control-sandbox-first-apply-preflight.sh \
             scripts/check-connector-authority-foundation.sh \
+            scripts/check-control-global-routing.sh \
             scripts/check-control-vpc-cidr-overlap.sh \
+            scripts/verify-control-sandbox-first-apply.sh \
             tests/fixtures/control-vpc-cidr-overlap/aws \
             tests/scripts/check-connector-authority-foundation_test.sh \
+            tests/scripts/check-control-global-routing_test.sh \
             tests/scripts/check-control-vpc-cidr-overlap_test.sh
+          python3 tests/scripts/test_check_control_sandbox_first_apply.py
           tests/scripts/check-connector-authority-foundation_test.sh
+          tests/scripts/check-control-global-routing_test.sh
           tests/scripts/check-control-vpc-cidr-overlap_test.sh
           scripts/check-connector-authority-foundation.sh
           terraform -chdir=terraform/modules/connector-authority-foundation init -backend=false

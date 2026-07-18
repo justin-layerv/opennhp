@@ -323,6 +323,13 @@ jobs:
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code == '0'
         run: scripts/check-connector-authority-foundation.sh terraform/control/environments/sandbox/control.tfplan.json
 
+      # This strict create-only gate is intentionally temporary. After the
+      # attended first apply, replace it with the reviewed no-op/update policy
+      # in the same cleanup that retires the first-apply workflow.
+      - name: Check Terraform Control First-Apply Plan Contract
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code == '0'
+        run: python3 .github/scripts/check-control-sandbox-first-apply.py plan terraform/control/environments/sandbox/control.tfplan.json --expected-action create
+
       - name: Summarize Terraform Control Plan
         if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code != ''
         working-directory: terraform/control/environments/sandbox

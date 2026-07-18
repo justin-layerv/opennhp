@@ -81,6 +81,8 @@ run_case "relay DMZ checker companion triggers sandbox plan" true false false \
 	$'M\t.github/scripts/check-relay-dmz-plan-next.py'
 run_case "Connector Authority contract checker triggers sandbox plan" true false false \
 	$'M\tscripts/check-connector-authority-foundation.sh'
+run_case "Control first-apply checker triggers sandbox plan" true false false \
+	$'M\t.github/scripts/check-control-sandbox-first-apply.py'
 run_case "control CIDR preflight triggers sandbox plan" true false false \
 	$'M\tscripts/check-control-vpc-cidr-overlap.sh'
 run_case "unrelated docs stay skipped" false false false \

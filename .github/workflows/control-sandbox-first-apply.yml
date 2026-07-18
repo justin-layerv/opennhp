@@ -1,0 +1,525 @@
+name: Control Sandbox First Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'Choose plan, apply a reviewed plan, or verify an already-converged apply whose verification/OTP seed was interrupted'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - verify
+      source_plan_run_id:
+        description: 'Apply only: successful plan workflow run ID'
+        required: false
+        type: string
+      planned_commit_sha:
+        description: 'Apply only: exact 40-hex commit from the reviewed plan summary'
+        required: false
+        type: string
+      plan_sha256:
+        description: 'Apply only: exact 64-hex saved-plan SHA-256 from the reviewed plan summary'
+        required: false
+        type: string
+      cost_confirmation:
+        description: 'Plan/apply: type ACCEPT_SANDBOX_CONTROL_STANDING_COST'
+        required: false
+        type: string
+      apply_confirmation:
+        description: 'PLAN_ONLY, APPLY_SANDBOX_CONTROL_FOUNDATION, or VERIFY_SANDBOX_CONTROL_FOUNDATION (verify requires converged state; it may seed an absent OTP pepper)'
+        required: true
+        default: PLAN_ONLY
+        type: string
+
+# This sandbox root must not race the regular sandbox Terraform writer. The
+# attended workflow can therefore delay a regular sandbox deploy for the active
+# operation's timeout: 30 minutes for plan/verify or 60 minutes for apply.
+concurrency:
+  group: deploy-sandbox-infra
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  AWS_ACCOUNT_ID: '767397897469'
+  TF_VERSION: '1.14.3'
+  CONTROL_ROOT: terraform/control/environments/sandbox
+  STATE_BUCKET: layerv-terraform-state-767397897469
+  STATE_KEY: nhp/sandbox/control/terraform.tfstate
+  STATE_LOCK_KEY: nhp/sandbox/control/terraform.tfstate.tflock
+  PLAN_ARTIFACT_PREFIX: control-sandbox-first-apply-plan
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Require main and exact operation contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Check dispatch boundary
+        env:
+          OPERATION: ${{ inputs.operation }}
+          SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+          PLAN_SHA256: ${{ inputs.plan_sha256 }}
+          COST_CONFIRMATION: ${{ inputs.cost_confirmation }}
+          APPLY_CONFIRMATION: ${{ inputs.apply_confirmation }}
+          ORIGINAL_ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          # Deliberately single-operator for this attended, one-time bootstrap.
+          # The reviewed justin-layerv literal below is the ownership change point.
+          if [[ "$ORIGINAL_ACTOR" != 'justin-layerv' || "$TRIGGERING_ACTOR" != 'justin-layerv' ]]; then
+            echo '::error::Only justin-layerv may originate and trigger this credentialed workflow.'
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
+            echo '::error::Control sandbox first apply runs only from refs/heads/main.'
+            exit 1
+          fi
+          case "$OPERATION" in
+            plan)
+              [[ "$COST_CONFIRMATION" == 'ACCEPT_SANDBOX_CONTROL_STANDING_COST' ]] || {
+                echo '::error::Plan requires exact sandbox standing-cost acceptance.'; exit 1;
+              }
+              [[ "$APPLY_CONFIRMATION" == 'PLAN_ONLY' ]] || {
+                echo '::error::Plan requires APPLY_CONFIRMATION=PLAN_ONLY.'; exit 1;
+              }
+              [[ -z "$SOURCE_PLAN_RUN_ID$PLANNED_COMMIT_SHA$PLAN_SHA256" ]] || {
+                echo '::error::Plan dispatch must not carry apply artifact selectors.'; exit 1;
+              }
+              ;;
+            apply)
+              [[ "$SOURCE_PLAN_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+                echo '::error::Apply requires a source plan run ID.'; exit 1;
+              }
+              [[ "$PLANNED_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+                echo '::error::Apply requires an exact lowercase 40-hex planned commit.'; exit 1;
+              }
+              [[ "$PLAN_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+                echo '::error::Apply requires an exact lowercase 64-hex plan digest.'; exit 1;
+              }
+              [[ "$PLANNED_COMMIT_SHA" == "$GITHUB_SHA" ]] || {
+                echo '::error::Main advanced after planning; dispatch a fresh plan at current main.'; exit 1;
+              }
+              [[ "$COST_CONFIRMATION" == 'ACCEPT_SANDBOX_CONTROL_STANDING_COST' ]] || {
+                echo '::error::Apply requires exact sandbox standing-cost acceptance.'; exit 1;
+              }
+              [[ "$APPLY_CONFIRMATION" == 'APPLY_SANDBOX_CONTROL_FOUNDATION' ]] || {
+                echo '::error::Apply confirmation is not exact.'; exit 1;
+              }
+              ;;
+            verify)
+              [[ "$APPLY_CONFIRMATION" == 'VERIFY_SANDBOX_CONTROL_FOUNDATION' ]] || {
+                echo '::error::Recovery verification confirmation is not exact.'; exit 1;
+              }
+              [[ -z "$SOURCE_PLAN_RUN_ID$PLANNED_COMMIT_SHA$PLAN_SHA256$COST_CONFIRMATION" ]] || {
+                echo '::error::Verify dispatch must not carry plan/apply selectors.'; exit 1;
+              }
+              ;;
+            *)
+              echo '::error::Unknown operation.'
+              exit 1
+              ;;
+          esac
+
+  plan:
+    name: Build immutable sandbox Control plan
+    if: inputs.operation == 'plan'
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact dispatch commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          # check-live-main-ref.sh performs an authenticated private-repo
+          # ls-remote against origin. Remove this credential immediately after
+          # that final fetch and before Terraform executes.
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
+      - name: Re-read live main before AWS access
+        run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
+
+      - name: Remove checkout credential before Terraform
+        run: git config --local --unset-all http.https://github.com/.extraheader
+
+      - name: Configure sandbox apply role for live planning
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: control-first-plan-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prove global routing and CIDR boundary
+        run: scripts/check-control-global-routing.sh - "$AWS_REGION" "$AWS_ACCOUNT_ID" 10.102.0.0/16
+
+      - name: Capture fail-closed IAM, endpoint, KMS, and state preflight
+        run: scripts/capture-control-sandbox-first-apply-preflight.sh "$RUNNER_TEMP/control-plan-preflight"
+
+      - name: Initialize sandbox Control state
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure -input=false
+
+      - name: Create and check exact 41-create plan
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -lock=false -no-color -out=tfplan >/dev/null
+          terraform show -json tfplan >tfplan.json
+          terraform show -no-color tfplan | tee tfplan.txt
+          ../../../../.github/scripts/check-control-sandbox-first-apply.py \
+            plan tfplan.json --expected-action create
+          ../../../../scripts/check-connector-authority-foundation.sh tfplan.json
+
+      - name: Bind immutable plan artifact
+        id: metadata
+        working-directory: ${{ env.CONTROL_ROOT }}
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          commit_sha=$(git rev-parse HEAD)
+          [[ "$commit_sha" == "$GITHUB_SHA" ]] || { echo '::error::Checkout SHA drifted.'; exit 1; }
+          plan_sha256=$(sha256sum tfplan | awk '{print $1}')
+          planned_at_epoch=$(date -u +%s)
+          ../../../../.github/scripts/check-control-sandbox-first-apply.py artifact-create \
+            --plan tfplan \
+            --plan-json tfplan.json \
+            --output plan-metadata.json \
+            --repository "$REPOSITORY" \
+            --commit-sha "$commit_sha" \
+            --plan-sha256 "$plan_sha256" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --planned-at-epoch "$planned_at_epoch" \
+            --workflow-ref "$WORKFLOW_REF" \
+            --terraform-version "$TF_VERSION"
+          {
+            echo "commit_sha=$commit_sha"
+            echo "plan_sha256=$plan_sha256"
+            echo "planned_at_epoch=$planned_at_epoch"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload immutable saved plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PLAN_ARTIFACT_PREFIX }}-${{ github.run_id }}
+          path: |
+            terraform/control/environments/sandbox/tfplan
+            terraform/control/environments/sandbox/tfplan.json
+            terraform/control/environments/sandbox/tfplan.txt
+            terraform/control/environments/sandbox/plan-metadata.json
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Summarize separate apply dispatch
+        run: |
+          {
+            echo '## Sandbox Control first-apply plan'
+            echo
+            echo "- Source plan run ID: \`${GITHUB_RUN_ID}\`"
+            echo "- Planned commit: \`${{ steps.metadata.outputs.commit_sha }}\`"
+            echo "- Saved-plan SHA-256: \`${{ steps.metadata.outputs.plan_sha256 }}\`"
+            echo '- Exact change contract: 41 creates, 0 changes, 0 destroys'
+            echo '- Standing cost explicitly accepted for planning'
+            echo
+            echo '> Review tfplan.txt, then start a separate apply dispatch from this same main commit with the run ID, commit, digest, cost confirmation, and APPLY_SANDBOX_CONTROL_FOUNDATION. Plans expire after two days; main advancement requires a fresh plan.'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: Apply exact reviewed sandbox Control plan
+    if: inputs.operation == 'apply'
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout planned main commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.planned_commit_sha }}
+          # check-live-main-ref.sh performs an authenticated private-repo
+          # ls-remote against origin. Remove this credential immediately after
+          # the final pre-apply fetch and before Terraform applies.
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
+      - name: Verify successful source plan run before AWS access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_PLAN_RUN_ID" \
+            >"$RUNNER_TEMP/source-run.json"
+          .github/scripts/check-control-sandbox-first-apply.py source-run \
+            "$RUNNER_TEMP/source-run.json" \
+            --run-id "$SOURCE_PLAN_RUN_ID" \
+            --commit-sha "$PLANNED_COMMIT_SHA"
+
+      - name: Download immutable artifact from source plan run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.PLAN_ARTIFACT_PREFIX }}-${{ inputs.source_plan_run_id }}
+          path: ${{ runner.temp }}/control-plan-artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_plan_run_id }}
+
+      - name: Verify commit, artifact hashes, and two-day window
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_PLAN_RUN_ID: ${{ inputs.source_plan_run_id }}
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+          PLAN_SHA256: ${{ inputs.plan_sha256 }}
+        run: |
+          set -euo pipefail
+          artifact="$RUNNER_TEMP/control-plan-artifact"
+          [[ "$(git rev-parse HEAD)" == "$PLANNED_COMMIT_SHA" ]] || {
+            echo '::error::Apply checkout does not match the reviewed commit.'; exit 1;
+          }
+          run_attempt=$(jq -er '.run_attempt' "$RUNNER_TEMP/source-run.json")
+          planned_at_epoch=$(jq -er '.planned_at_epoch' "$artifact/plan-metadata.json")
+          .github/scripts/check-control-sandbox-first-apply.py artifact-verify \
+            --plan "$artifact/tfplan" \
+            --plan-json "$artifact/tfplan.json" \
+            --metadata "$artifact/plan-metadata.json" \
+            --repository "$REPOSITORY" \
+            --commit-sha "$PLANNED_COMMIT_SHA" \
+            --plan-sha256 "$PLAN_SHA256" \
+            --run-id "$SOURCE_PLAN_RUN_ID" \
+            --run-attempt "$run_attempt" \
+            --planned-at-epoch "$planned_at_epoch" \
+            --workflow-ref "$REPOSITORY/.github/workflows/control-sandbox-first-apply.yml@refs/heads/main" \
+            --terraform-version "$TF_VERSION"
+
+      - name: Re-read live main before AWS access
+        env:
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+        run: scripts/check-live-main-ref.sh "$PLANNED_COMMIT_SHA"
+
+      - name: Configure sandbox apply role
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: control-first-apply-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Re-prove global routing and CIDR boundary
+        run: scripts/check-control-global-routing.sh - "$AWS_REGION" "$AWS_ACCOUNT_ID" 10.102.0.0/16
+
+      - name: Re-capture fail-closed first-apply preflight
+        run: scripts/capture-control-sandbox-first-apply-preflight.sh "$RUNNER_TEMP/control-apply-preflight"
+
+      - name: Initialize sandbox Control state
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure -input=false
+
+      - name: Re-prove absent state and apply exact saved plan
+        working-directory: ${{ env.CONTROL_ROOT }}
+        env:
+          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}
+        run: |
+          set -euo pipefail
+          assert_absent() {
+            local key="$1"
+            local label="$2"
+            set +e
+            aws s3api head-object --bucket "$STATE_BUCKET" --key "$key" \
+              >"$RUNNER_TEMP/control-head.json" \
+              2>"$RUNNER_TEMP/control-head.err"
+            local status=$?
+            set -e
+            if [[ "$status" -eq 0 ]]; then
+              echo "::error::$label appeared after preflight; refusing apply."
+              exit 1
+            fi
+            grep -Eq '\(404\)|Not Found|NoSuchKey' \
+              "$RUNNER_TEMP/control-head.err" || {
+              sed 's/^/AWS: /' "$RUNNER_TEMP/control-head.err" >&2
+              echo "::error::Could not re-prove $label absence."
+              exit 1
+            }
+          }
+          assert_absent "$STATE_KEY" state
+          assert_absent "$STATE_LOCK_KEY" lock
+          # A saved binary plan is Terraform-version and state-lineage sensitive.
+          # This one-time path is safe because it pins Terraform + the lock file,
+          # requires pristine absent state, and rechecks the exact plan contract.
+          # Do not reuse this cross-run pattern after the first apply.
+          # Re-render and recheck the exact hash-verified binary only after the
+          # final live state/lock proof. The main-ref read and immediate checkout-
+          # credential removal are the only commands between this contract check
+          # and the apply of those same bytes.
+          terraform show -json "$RUNNER_TEMP/control-plan-artifact/tfplan" \
+            >"$RUNNER_TEMP/control-plan-artifact/apply-tfplan.json"
+          ../../../../.github/scripts/check-control-sandbox-first-apply.py \
+            plan "$RUNNER_TEMP/control-plan-artifact/apply-tfplan.json" \
+            --expected-action create
+          ../../../../scripts/check-live-main-ref.sh "$PLANNED_COMMIT_SHA"
+          git config --local --unset-all http.https://github.com/.extraheader
+          terraform apply -input=false -lock-timeout=5m -no-color \
+            "$RUNNER_TEMP/control-plan-artifact/tfplan"
+
+      - name: Verify no-op convergence, dark boundary, state encryption, and secret seed
+        run: scripts/verify-control-sandbox-first-apply.sh \
+          "$CONTROL_ROOT" "$RUNNER_TEMP/control-apply-verification"
+
+      - name: Upload sanitized verification summaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: control-sandbox-first-apply-evidence-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/control-apply-verification/state-list-summary.json
+            ${{ runner.temp }}/control-apply-verification/post-apply-plan-summary.json
+            ${{ runner.temp }}/control-apply-verification/refreshed-state-summary.json
+            ${{ runner.temp }}/control-apply-verification/live-boundary-summary.json
+            ${{ runner.temp }}/control-apply-verification/verification-summary.json
+          retention-days: 14
+          if-no-files-found: error
+
+  # NOTE: verify may seed the OTP pepper; it is not read-only.
+  verify:
+    name: Verify converged sandbox Control apply and recover OTP seed
+    if: inputs.operation == 'verify'
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          # check-live-main-ref.sh performs an authenticated private-repo
+          # ls-remote against origin. Remove this credential immediately after
+          # that final fetch and before Terraform executes.
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
+      - name: Re-read live main before AWS access
+        run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
+
+      - name: Remove checkout credential before Terraform
+        run: git config --local --unset-all http.https://github.com/.extraheader
+
+      - name: Configure sandbox apply role
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: control-first-verify-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Require exact encrypted sandbox Control state
+        run: |
+          set -euo pipefail
+          aws s3api head-object --bucket "$STATE_BUCKET" --key "$STATE_KEY" \
+            >"$RUNNER_TEMP/control-state-head.json"
+          jq -e \
+            --arg key 'arn:aws:kms:us-east-2:767397897469:key/289dbe35-ab5a-4752-8564-4c96c607c9f4' \
+            '.ServerSideEncryption == "aws:kms" and .SSEKMSKeyId == $key and
+             (.VersionId | type == "string" and length > 0 and . != "null")' \
+            "$RUNNER_TEMP/control-state-head.json" >/dev/null || {
+              echo '::error::Sandbox Control state is absent or not encrypted/versioned as reviewed.'; exit 1;
+            }
+
+      - name: Initialize sandbox Control state
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure -input=false
+
+      - name: Require no-op convergence and seed the OTP pepper only if absent
+        run: scripts/verify-control-sandbox-first-apply.sh \
+          "$CONTROL_ROOT" "$RUNNER_TEMP/control-recovery-verification"
+
+      - name: Upload sanitized recovery summaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: control-sandbox-first-apply-recovery-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/control-recovery-verification/state-list-summary.json
+            ${{ runner.temp }}/control-recovery-verification/post-apply-plan-summary.json
+            ${{ runner.temp }}/control-recovery-verification/refreshed-state-summary.json
+            ${{ runner.temp }}/control-recovery-verification/live-boundary-summary.json
+            ${{ runner.temp }}/control-recovery-verification/verification-summary.json
+          retention-days: 14
+          if-no-files-found: error

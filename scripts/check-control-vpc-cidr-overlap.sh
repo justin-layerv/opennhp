@@ -11,11 +11,15 @@ profile="$1"
 region="$2"
 expected_account="$3"
 candidate_cidr="$4"
+profile_args=()
+if [[ "$profile" != "-" ]]; then
+  profile_args=(--profile "$profile")
+fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 account_id="$(aws sts get-caller-identity \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --query Account \
   --output text)"
 if [[ "$account_id" != "$expected_account" ]]; then
@@ -26,43 +30,43 @@ fi
 # Correctness requires AWS CLI v2 default API auto-pagination. Callers must not
 # inject --no-paginate or otherwise truncate any describe response below.
 aws ec2 describe-vpcs \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/vpcs.json"
 aws ec2 describe-ipams \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/ipams.json"
 aws ec2 describe-vpc-peering-connections \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/peerings.json"
 aws ec2 describe-transit-gateway-attachments \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/tgw-attachments.json"
 aws ec2 describe-route-tables \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/route-tables.json"
 aws ec2 describe-vpn-gateways \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/vpn-gateways.json"
 aws ec2 describe-vpn-connections \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/vpn-connections.json"
 aws ec2 describe-client-vpn-endpoints \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/client-vpn-endpoints.json"
 aws directconnect describe-connections \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/direct-connect-connections.json"
 aws directconnect describe-virtual-interfaces \
-  --profile "$profile" \
+  "${profile_args[@]}" \
   --region "$region" \
   --output json >"$tmp_dir/direct-connect-virtual-interfaces.json"
 

@@ -16,6 +16,20 @@ case "${service}:${operation}" in
       printf '%s\n' '{"Vpcs":[]}'
     fi
     ;;
+  ec2:describe-regions)
+    regions="${FAKE_ENABLED_REGIONS:-us-east-2}"
+    first=true
+    printf '%s' '{"Regions":['
+    for region in $regions; do
+      if [[ "$first" == true ]]; then
+        first=false
+      else
+        printf ','
+      fi
+      printf '{"RegionName":"%s","OptInStatus":"opted-in"}' "$region"
+    done
+    printf '%s\n' ']}'
+    ;;
   ec2:describe-ipams)
     if [[ -n "${FAKE_IPAM_STATE:-}" ]]; then
       printf '{"Ipams":[{"State":"%s"}]}\n' "$FAKE_IPAM_STATE"
@@ -58,6 +72,27 @@ case "${service}:${operation}" in
     ;;
   directconnect:describe-virtual-interfaces)
     printf '%s\n' '{"virtualInterfaces":[]}'
+    ;;
+  directconnect:describe-direct-connect-gateways)
+    if [[ -n "${FAKE_DX_GATEWAY_STATE:-}" ]]; then
+      printf '{"directConnectGateways":[{"directConnectGatewayId":"abcdef12-3456-7890-abcd-ef1234567890","directConnectGatewayState":"%s"}]}\n' "$FAKE_DX_GATEWAY_STATE"
+    else
+      printf '%s\n' '{"directConnectGateways":[]}'
+    fi
+    ;;
+  directconnect:describe-direct-connect-gateway-associations)
+    if [[ -n "${FAKE_DX_ASSOCIATION_STATE:-}" ]]; then
+      printf '{"directConnectGatewayAssociations":[{"associationState":"%s"}]}\n' "$FAKE_DX_ASSOCIATION_STATE"
+    else
+      printf '%s\n' '{"directConnectGatewayAssociations":[]}'
+    fi
+    ;;
+  directconnect:describe-direct-connect-gateway-association-proposals)
+    if [[ -n "${FAKE_DX_PROPOSAL_STATE:-}" ]]; then
+      printf '{"directConnectGatewayAssociationProposals":[{"proposalState":"%s"}]}\n' "$FAKE_DX_PROPOSAL_STATE"
+    else
+      printf '%s\n' '{"directConnectGatewayAssociationProposals":[]}'
+    fi
     ;;
   *)
     echo "unexpected fake aws call: ${service} ${operation}" >&2

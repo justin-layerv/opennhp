@@ -42,6 +42,12 @@ on:
       - "scripts/print-dispatch-ref-error.sh"
       - "scripts/check-image-tag-writer-allowlist.sh"
       - "scripts/check-image-tag-writer-allowlist.py"
+      - "scripts/capture-control-sandbox-first-apply-preflight.sh"
+      - "scripts/check-control-global-routing.sh"
+      - "scripts/check-control-vpc-cidr-overlap.sh"
+      - "scripts/check-live-main-ref.sh"
+      - "scripts/ensure-control-otp-pepper.sh"
+      - "scripts/verify-control-sandbox-first-apply.sh"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
       # qURL v2 revocation-latency SLO lockstep (#2817): trigger on the script
       # and on BOTH source-of-truth sites it compares so a one-sided edit to the
@@ -510,6 +516,20 @@ jobs:
 
       - name: Test staged qURL agent transaction IAM boundary
         run: python3 tests/scripts/test_qurl_agent_transact_iam.py
+
+      - name: Test sandbox Control first-apply boundary
+        run: |
+          shellcheck \
+            scripts/capture-control-sandbox-first-apply-preflight.sh \
+            scripts/check-control-global-routing.sh \
+            scripts/check-control-vpc-cidr-overlap.sh \
+            scripts/check-live-main-ref.sh \
+            scripts/ensure-control-otp-pepper.sh \
+            scripts/verify-control-sandbox-first-apply.sh \
+            tests/fixtures/control-vpc-cidr-overlap/aws \
+            tests/scripts/check-control-global-routing_test.sh
+          python3 tests/scripts/test_check_control_sandbox_first_apply.py
+          tests/scripts/check-control-global-routing_test.sh
 
       - name: Setup Terraform for relay DMZ contract test
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
