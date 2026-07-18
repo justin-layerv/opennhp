@@ -135,10 +135,47 @@ env:
 
 jobs:
   # =============================================================================
+  # SANDBOX LIVE-ENVIRONMENT LOCK - Exclude exact-image qv2 proofs
+  # =============================================================================
+  # A blue/green roll temporarily runs both server/AC colors and then switches
+  # the public NHP boundary. qurl-service's exact-image pre-merge qv2 smoke
+  # depends on that boundary remaining stable for the whole proof. The normal
+  # blue-green concurrency group is repository-local, so it cannot serialize
+  # against qurl-service. Hold the shared SSM mutex from before any blue/green
+  # state read/mutation until post-switch validation and scale-down complete.
+  acquire-qurl-live-env-lock:
+    name: Acquire qURL Live-Environment Lock
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-duration-seconds: 10800
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Acquire sandbox live-environment lock
+        id: acquire-sandbox-live-env-lock
+        uses: ./.github/actions/sandbox-live-env-lock
+        with:
+          action: acquire
+          owner: nhp:${{ github.run_id }}:${{ github.run_attempt }}:blue-green
+          ssm-parameter-name: /layerv-nhp-sandbox/qurl-live-env-lock
+          aws-region: ${{ env.AWS_REGION }}
+          ttl-seconds: '14400'
+          wait-seconds: '7200'
+
+  # =============================================================================
   # PREPARE - Read SSM state and determine active/standby colors
   # =============================================================================
   prepare:
     name: Prepare
+    needs: acquire-qurl-live-env-lock
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     timeout-minutes: 5
@@ -1175,7 +1212,7 @@ jobs:
     if: always() && needs.switch-traffic.result == 'success' && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && inputs.action == 'deploy' && inputs.dry_run != true
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
@@ -1204,6 +1241,63 @@ jobs:
             --auto-scaling-group-name "$PREVIOUS_ASG" \
             --min-size 1 --desired-capacity 1
           echo "Previous AC ASG scaled down to 1 instance"
+
+      - name: Wait for Previous Colors to Reach Warm Standby
+        env:
+          DEPLOY_SERVER: ${{ needs.prepare.outputs.deploy_server }}
+          SERVER_PREVIOUS_ASG: ${{ needs.prepare.outputs.server_active_asg }}
+          DEPLOY_AC: ${{ needs.prepare.outputs.deploy_ac }}
+          AC_PREVIOUS_ASG: ${{ needs.prepare.outputs.ac_active_asg }}
+        run: |
+          set -euo pipefail
+
+          labels=()
+          asgs=()
+          if [[ "$DEPLOY_SERVER" == "true" ]]; then
+            labels+=(server)
+            asgs+=("$SERVER_PREVIOUS_ASG")
+          fi
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            labels+=(AC)
+            asgs+=("$AC_PREVIOUS_ASG")
+          fi
+
+          deadline=$((SECONDS + 300))
+          while true; do
+            all_converged=true
+            for index in "${!asgs[@]}"; do
+              label=${labels[$index]}
+              asg=${asgs[$index]}
+              # Backticks are JMESPath literals, not shell substitutions.
+              # shellcheck disable=SC2016
+              read -r desired total healthy_in_service < <(
+                aws autoscaling describe-auto-scaling-groups \
+                  --auto-scaling-group-names "$asg" \
+                  --query 'AutoScalingGroups[0].[DesiredCapacity,length(Instances),length(Instances[?LifecycleState==`InService` && HealthStatus==`Healthy`])]' \
+                  --output text
+              )
+
+              if [[ ! "$desired" =~ ^[0-9]+$ || ! "$total" =~ ^[0-9]+$ || ! "$healthy_in_service" =~ ^[0-9]+$ ]]; then
+                echo "::error::Could not read $label previous-color ASG convergence state for $asg: desired=$desired total=$total healthy-in-service=$healthy_in_service"
+                exit 1
+              fi
+              if [[ "$desired" == "1" && "$total" == "1" && "$healthy_in_service" == "1" ]]; then
+                echo "$label previous-color ASG is at warm standby: $asg (desired=1 total=1 healthy-in-service=1)"
+              else
+                echo "$label previous-color ASG is still converging: $asg (desired=$desired total=$total healthy-in-service=$healthy_in_service)"
+                all_converged=false
+              fi
+            done
+
+            if [[ "$all_converged" == "true" ]]; then
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "::error::Previous-color ASGs did not reach one healthy InService warm-standby instance within 300 seconds"
+              exit 1
+            fi
+            sleep 10
+          done
 
   # =============================================================================
   # VALIDATE - Post-switch validation
@@ -1487,6 +1581,76 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
+  # FINALIZE SANDBOX LIVE-ENVIRONMENT LOCK
+  # =============================================================================
+  # Release only after the complete blue/green mutation reached a verified
+  # terminal state. A failed mutation may leave an instance refresh, listener,
+  # or active-color transition requiring operator reconciliation, so retain the
+  # lock fail-closed instead of admitting an unrelated qv2 proof into it.
+  finalize-qurl-live-env-lock:
+    name: Finalize qURL Live-Environment Lock
+    if: always() && needs.acquire-qurl-live-env-lock.result == 'success'
+    needs:
+      - acquire-qurl-live-env-lock
+      - prepare
+      - deploy-to-standby
+      - switch-traffic
+      - validate
+      - scale-down-previous
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Classify blue/green terminal state
+        id: terminal-state
+        env:
+          ACTION: ${{ inputs.action }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          DEPLOY_RESULT: ${{ needs.deploy-to-standby.result }}
+          SWITCH_RESULT: ${{ needs.switch-traffic.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          SCALE_DOWN_RESULT: ${{ needs.scale-down-previous.result }}
+          DEPLOY_SERVER: ${{ needs.prepare.outputs.deploy_server }}
+          DEPLOY_AC: ${{ needs.prepare.outputs.deploy_ac }}
+        run: |
+          set -euo pipefail
+          safe_to_release=$(bash .github/scripts/classify-blue-green-lock-release.sh \
+            "$ACTION" "$DRY_RUN" "$PREPARE_RESULT" "$DEPLOY_RESULT" \
+            "$SWITCH_RESULT" "$VALIDATE_RESULT" "$SCALE_DOWN_RESULT" \
+            "$DEPLOY_SERVER" "$DEPLOY_AC")
+
+          echo "safe_to_release=$safe_to_release" >> "$GITHUB_OUTPUT"
+          echo "Blue/green terminal state: action=$ACTION prepare=$PREPARE_RESULT deploy=$DEPLOY_RESULT switch=$SWITCH_RESULT validate=$VALIDATE_RESULT scale-down=$SCALE_DOWN_RESULT deploy-server=$DEPLOY_SERVER deploy-ac=$DEPLOY_AC safe-to-release=$safe_to_release"
+
+      - name: Release sandbox live-environment lock
+        if: steps.terminal-state.outputs.safe_to_release == 'true'
+        uses: ./.github/actions/sandbox-live-env-lock
+        with:
+          action: release
+          owner: nhp:${{ github.run_id }}:${{ github.run_attempt }}:blue-green
+          ssm-parameter-name: /layerv-nhp-sandbox/qurl-live-env-lock
+          aws-region: ${{ env.AWS_REGION }}
+          ttl-seconds: '14400'
+          wait-seconds: '7200'
+
+      - name: Retain sandbox live-environment lock after blue/green failure
+        if: always() && steps.terminal-state.outputs.safe_to_release != 'true'
+        run: |
+          echo "::error title=Sandbox blue/green failed - lock retained::Not releasing /layerv-nhp-sandbox/qurl-live-env-lock because the blue/green deployment did not reach a verified terminal state. Reconcile the server and AC colors, instance refreshes, listeners, and readiness before exact-owner release; follow docs/runbooks/sandbox-live-env-lock.md."
+          bash .github/scripts/emit-sandbox-lock-failure-metric.sh RollFailedRetained release
+          exit 1
+
+  # =============================================================================
   # NOTIFY - Send deployment notification to SNS (Slack via AWS Chatbot)
   # =============================================================================
   #
@@ -1497,7 +1661,7 @@ jobs:
   notify:
     name: Notify
     if: always() && github.ref == 'refs/heads/main'
-    needs: [prepare, deploy-to-standby, switch-traffic, scale-down-previous, validate]
+    needs: [prepare, deploy-to-standby, switch-traffic, scale-down-previous, validate, finalize-qurl-live-env-lock]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1519,6 +1683,7 @@ jobs:
           SWITCH_RESULT: ${{ needs.switch-traffic.result }}
           SCALEDOWN_RESULT: ${{ needs.scale-down-previous.result }}
           VALIDATE_RESULT: ${{ needs.validate.result }}
+          LOCK_RESULT: ${{ needs.finalize-qurl-live-env-lock.result }}
           SERVER_ACTIVE_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
           AC_ACTIVE_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1534,7 +1699,9 @@ jobs:
           fi
 
           # Determine overall status
-          if [[ "$VALIDATE_RESULT" == "success" || ("$SWITCH_RESULT" == "success" && "$VALIDATE_RESULT" == "skipped") ]]; then
+          if [[ "$LOCK_RESULT" != "success" ]]; then
+            STATUS="FAILED (sandbox live-environment lock)"
+          elif [[ "$VALIDATE_RESULT" == "success" || ("$SWITCH_RESULT" == "success" && "$VALIDATE_RESULT" == "skipped") ]]; then
             STATUS="SUCCESS"
           elif [[ "$PREPARE_RESULT" != "success" ]]; then
             STATUS="FAILED (prepare)"

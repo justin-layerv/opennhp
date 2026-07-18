@@ -9,8 +9,10 @@
 # consumer 403'd (qurl-service #335). The deploy-sandbox-qurl job closes that
 # gap. It must also hold qurl-service's shared sandbox live-environment lock
 # across every possible ECS mutation (#3244), so an NHP main roll cannot replace
-# an exact PR image during the mandatory pre-merge qv2 proof. The same validate
-# job now also owns the qURL JS-agent → relay bootstrap
+# an exact PR image during the mandatory pre-merge qv2 proof. The server/AC
+# blue-green workflow holds that same cross-repo mutex because the qv2 proof
+# also requires a stable NHP admission boundary. The same validate job now also
+# owns the qURL JS-agent → relay bootstrap
 # smoke (#2680), so this test fences that relay ordering/wiring too. It fails
 # if the load-bearing pieces regress or are removed, so those gaps cannot
 # silently reopen.
@@ -30,10 +32,12 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$HERE/../.." && pwd)
 WF="$REPO_ROOT/.github/workflows/build-and-push.yml"
+BLUE_GREEN_WF="$REPO_ROOT/.github/workflows/blue-green-deploy.yml"
 PLAN_WF="$REPO_ROOT/.github/workflows/terraform-plan-pr.yml"
 ECR_MODULE_PATH="$REPO_ROOT/terraform/modules/ecr/main.tf"
 LOCK_RUNBOOK_PATH="$REPO_ROOT/docs/runbooks/sandbox-live-env-lock.md"
 RUNBOOK_INDEX_PATH="$REPO_ROOT/docs/runbooks/README.md"
+BLUE_GREEN_LOCK_CLASSIFIER="$REPO_ROOT/.github/scripts/classify-blue-green-lock-release.sh"
 
 pass=0
 fail=0
@@ -42,6 +46,15 @@ report_fail() { fail=$((fail + 1)); printf '  \033[31m✗\033[0m %s\n      %s\n'
 
 if [[ ! -f "$WF" ]]; then
   report_fail "workflow present" "build-and-push.yml not found at $WF"
+  echo; echo "  passed: $pass  failed: $fail"; exit 1
+fi
+if [[ ! -f "$BLUE_GREEN_WF" ]]; then
+  report_fail "blue/green workflow present" "blue-green-deploy.yml not found at $BLUE_GREEN_WF"
+  echo; echo "  passed: $pass  failed: $fail"; exit 1
+fi
+if [[ ! -f "$BLUE_GREEN_LOCK_CLASSIFIER" ]]; then
+  report_fail "blue/green lock classifier present" \
+    "classify-blue-green-lock-release.sh not found at $BLUE_GREEN_LOCK_CLASSIFIER"
   echo; echo "  passed: $pass  failed: $fail"; exit 1
 fi
 
@@ -154,6 +167,45 @@ BOUNDARY_PREFLIGHT_CALL_RE='^[[:space:]]+preflight_relay_dmz_boundary[[:space:]]
 STATE_MUTATION_RE='terraform state rm "\$att"'
 
 echo "check-sandbox-qurl-roll:"
+
+# Execute the same classifier used by the workflow. These table cases protect
+# semantic outcomes that regex-only workflow checks cannot prove.
+run_lock_classifier_case() {
+  local expected=$1 label=$2
+  shift 2
+  local actual
+  if ! actual=$(bash "$BLUE_GREEN_LOCK_CLASSIFIER" "$@"); then
+    report_fail "$label" "classifier exited nonzero"
+  elif [[ "$actual" == "$expected" ]]; then
+    report_pass "$label"
+  else
+    report_fail "$label" "expected safe_to_release=$expected, got $actual"
+  fi
+}
+
+# args: action dry-run prepare deploy switch validate scale-down server ac
+run_lock_classifier_case true "lock classifier releases a true dry run" \
+  deploy true success skipped success skipped skipped true true
+run_lock_classifier_case true "lock classifier releases a pre-mutation prepare failure" \
+  deploy false failure skipped skipped skipped skipped false false
+run_lock_classifier_case true "lock classifier releases a read-only no-component no-op" \
+  deploy false success skipped skipped skipped skipped false false
+run_lock_classifier_case true "lock classifier releases a fully verified deploy" \
+  deploy false success success success success success true true
+run_lock_classifier_case false "lock classifier retains a deploy with skipped validation" \
+  deploy false success success success skipped success true true
+run_lock_classifier_case false "lock classifier retains a deploy before scale-down convergence" \
+  deploy false success success success success failure true true
+run_lock_classifier_case false "lock classifier retains a failed traffic switch" \
+  deploy false success success failure skipped skipped true false
+run_lock_classifier_case true "lock classifier releases a validated rollback" \
+  rollback false success skipped success success skipped true false
+run_lock_classifier_case true "lock classifier releases a validated switch-only run" \
+  switch-only false success skipped success success skipped false true
+run_lock_classifier_case false "lock classifier retains a rollback with skipped validation" \
+  rollback false success skipped success skipped skipped true false
+run_lock_classifier_case false "lock classifier retains an unknown mutating action" \
+  unexpected false success success success success success true true
 
 if grep -Eq 'relay_dmz_''cutover|RELAY_DMZ_''CUTOVER' "$WF"; then
   report_fail "one-time relay DMZ cutover authorization is removed" \
@@ -530,6 +582,9 @@ else
     "lock runbook documents the NHP owner shape" \
     'nhp:<run_id>:<run_attempt>:deploy-sandbox-qurl'
   assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook documents the NHP blue/green owner shape" \
+    'nhp:<run_id>:<run_attempt>:blue-green'
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
     "lock runbook pins the same producer contract" \
     'd506fa61a06c7b8b18b5d69dfe65dae15bd19270'
   assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
@@ -544,6 +599,9 @@ else
   assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
     "lock runbook documents the credential-duration safety bound" \
     'requests a 10,800-second AWS session'
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook separates proof isolation from the AC admission defect" \
+    'nhp/issues/2123'
   assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
     "lock runbook forbids release before stable task proof" \
     'The deployment is stable with no pending tasks'
@@ -656,6 +714,92 @@ else
     'needs:.*app-image-build-required.*build'
   assert_step_in "$BLUEGREEN" deploy-sandbox-blue-green "Resolve Image Tag" "blue/green deploys github.sha when app image drift requires it" \
     'APP_IMAGE_BUILD_REQUIRED'
+fi
+
+# qurl-service's exact-image smoke crosses the repository boundary, so the
+# child blue/green workflow itself (not only build-and-push's dispatcher) must
+# hold the shared SSM lock. This covers direct/manual dispatches and keeps the
+# lock alive through post-switch validation and previous-color scale-down.
+BG_ACQUIRE=$(extract_job_from "$BLUE_GREEN_WF" acquire-qurl-live-env-lock)
+BG_PREPARE=$(extract_job_from "$BLUE_GREEN_WF" prepare)
+BG_SCALE_DOWN=$(extract_job_from "$BLUE_GREEN_WF" scale-down-previous)
+BG_FINALIZE=$(extract_job_from "$BLUE_GREEN_WF" finalize-qurl-live-env-lock)
+BG_NOTIFY=$(extract_job_from "$BLUE_GREEN_WF" notify)
+
+if [[ -z "$BG_ACQUIRE" ]]; then
+  report_fail "blue/green lock-acquire job exists" \
+    "no '  acquire-qurl-live-env-lock:' job header found in blue-green-deploy.yml"
+else
+  assert_in "$BG_ACQUIRE" acquire-qurl-live-env-lock "blue/green lock waiter has the full two-hour budget" \
+    'timeout-minutes:[[:space:]]*180'
+  assert_in "$BG_ACQUIRE" acquire-qurl-live-env-lock "blue/green lock waiter requests a three-hour AWS session" \
+    'role-duration-seconds:[[:space:]]*10800'
+  assert_step_in "$BG_ACQUIRE" acquire-qurl-live-env-lock "Acquire sandbox live-environment lock" "blue/green acquires the shared qURL SSM mutex" \
+    'ssm-parameter-name:[[:space:]]*/layerv-nhp-sandbox/qurl-live-env-lock'
+  assert_step_in "$BG_ACQUIRE" acquire-qurl-live-env-lock "Acquire sandbox live-environment lock" "blue/green owner is exact-run scoped" \
+    'owner:[[:space:]]*nhp:\$\{\{ github\.run_id \}\}:\$\{\{ github\.run_attempt \}\}:blue-green'
+  assert_step_in "$BG_ACQUIRE" acquire-qurl-live-env-lock "Acquire sandbox live-environment lock" "blue/green lock keeps the canonical TTL" \
+    "ttl-seconds:[[:space:]]*'14400'"
+  assert_step_in "$BG_ACQUIRE" acquire-qurl-live-env-lock "Acquire sandbox live-environment lock" "blue/green lock keeps the canonical wait budget" \
+    "wait-seconds:[[:space:]]*'7200'"
+fi
+
+if [[ -z "$BG_PREPARE" ]]; then
+  report_fail "blue/green prepare job exists" \
+    "no '  prepare:' job header found in blue-green-deploy.yml"
+else
+  assert_in "$BG_PREPARE" prepare "blue/green prepare cannot race ahead of lock acquisition" \
+    'needs:[[:space:]]*acquire-qurl-live-env-lock'
+fi
+
+if [[ -z "$BG_SCALE_DOWN" ]]; then
+  report_fail "blue/green scale-down job exists" \
+    "no '  scale-down-previous:' job header found in blue-green-deploy.yml"
+else
+  assert_in "$BG_SCALE_DOWN" scale-down-previous "old-color convergence has a bounded job budget" \
+    'timeout-minutes:[[:space:]]*10'
+  assert_step_in "$BG_SCALE_DOWN" scale-down-previous "Wait for Previous Colors to Reach Warm Standby" "old-color convergence uses a bounded state deadline" \
+    'deadline=\$\(\(SECONDS \+ 300\)\)'
+  assert_step_in "$BG_SCALE_DOWN" scale-down-previous "Wait for Previous Colors to Reach Warm Standby" "old-color convergence checks actual instance count" \
+    'length\(Instances\)'
+  assert_step_in "$BG_SCALE_DOWN" scale-down-previous "Wait for Previous Colors to Reach Warm Standby" "old-color convergence requires one healthy InService instance" \
+    'healthy_in_service.*==.*1'
+  assert_step_in "$BG_SCALE_DOWN" scale-down-previous "Wait for Previous Colors to Reach Warm Standby" "old-color convergence reports a bounded timeout" \
+    'did not reach one healthy InService warm-standby instance within 300 seconds'
+  assert_step_in "$BG_SCALE_DOWN" scale-down-previous "Wait for Previous Colors to Reach Warm Standby" "old-color convergence fails closed" \
+    'exit 1'
+fi
+
+if [[ -z "$BG_FINALIZE" ]]; then
+  report_fail "blue/green lock-finalize job exists" \
+    "no '  finalize-qurl-live-env-lock:' job header found in blue-green-deploy.yml"
+else
+  assert_in "$BG_FINALIZE" finalize-qurl-live-env-lock "blue/green lock finalization runs after failed dependencies" \
+    "if: always\(\) && needs\.acquire-qurl-live-env-lock\.result == 'success'"
+  for dependency in prepare deploy-to-standby switch-traffic validate scale-down-previous; do
+    assert_in "$BG_FINALIZE" finalize-qurl-live-env-lock "blue/green lock finalize waits for $dependency" \
+      "-[[:space:]]*$dependency"
+  done
+  assert_step_in "$BG_FINALIZE" finalize-qurl-live-env-lock "Classify blue/green terminal state" "workflow invokes the executable lock classifier" \
+    'classify-blue-green-lock-release\.sh'
+  assert_step_in "$BG_FINALIZE" finalize-qurl-live-env-lock "Classify blue/green terminal state" "classifier receives component mutation flags" \
+    'DEPLOY_SERVER.*DEPLOY_AC'
+  assert_step_in "$BG_FINALIZE" finalize-qurl-live-env-lock "Release sandbox live-environment lock" "blue/green releases only its exact owner" \
+    'owner:[[:space:]]*nhp:\$\{\{ github\.run_id \}\}:\$\{\{ github\.run_attempt \}\}:blue-green'
+  assert_step_in "$BG_FINALIZE" finalize-qurl-live-env-lock "Retain sandbox live-environment lock after blue/green failure" "failed blue/green emits shared retained-lock telemetry" \
+    'emit-sandbox-lock-failure-metric\.sh RollFailedRetained release'
+  assert_step_in "$BG_FINALIZE" finalize-qurl-live-env-lock "Retain sandbox live-environment lock after blue/green failure" "failed blue/green retention remains red" \
+    'exit 1'
+fi
+
+if [[ -z "$BG_NOTIFY" ]]; then
+  report_fail "blue/green notify job exists" \
+    "no '  notify:' job header found in blue-green-deploy.yml"
+else
+  assert_in "$BG_NOTIFY" notify "blue/green notification waits for lock finalization" \
+    'needs:.*finalize-qurl-live-env-lock'
+  assert_in "$BG_NOTIFY" notify "blue/green notification surfaces lock failure" \
+    'FAILED \(sandbox live-environment lock\)'
 fi
 
 NOTIFY=$(extract_job notify)

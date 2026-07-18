@@ -1,7 +1,8 @@
 # qURL sandbox live-environment lock
 
-NHP and qurl-service share one mutable sandbox qURL ECS service. Every workflow
-that can update that service serializes through:
+NHP and qurl-service share one mutable sandbox qURL customer path. Every
+workflow that can replace the qURL ECS task definition or roll the NHP
+server/AC blue-green boundary serializes through:
 
 ```text
 /layerv-nhp-sandbox/qurl-live-env-lock
@@ -45,10 +46,11 @@ is authoritative for alarming and counting; the diagnostic series is
 attribution only. Alarm publication intentionally precedes diagnostic argument
 validation, so a manual or divergent caller with invalid `Reason`/`Action`
 still pages and then exits nonzero without publishing unsafe dimensions. NHP
-publishes `RollFailedRetained` with `Action=release` when the ECS roll does not
-reach verified success/no-op and the workflow therefore retains its exact-owner
-lock. Here `Action` names the release-decision phase: no delete is attempted
-because that phase deliberately chooses retention. The shared helper also
+publishes `RollFailedRetained` with `Action=release` when either its ECS roll or
+server/AC blue-green roll does not reach a verified terminal state and the
+workflow therefore retains its exact-owner lock. Here `Action` names the
+release-decision phase: no delete is attempted because that phase deliberately
+chooses retention. The shared helper also
 publishes `ReadFailed`,
 `PutFailed`, `DeleteFailed`, `Malformed`, and `Contention` for the corresponding
 lock paths. See the
@@ -57,7 +59,8 @@ lock paths. See the
 ## Owner shapes
 
 - qurl-service: `qurl-service:<run_id>:<run_attempt>:<job-name>`
-- NHP: `nhp:<run_id>:<run_attempt>:deploy-sandbox-qurl`
+- NHP qurl-service roll: `nhp:<run_id>:<run_attempt>:deploy-sandbox-qurl`
+- NHP server/AC blue-green: `nhp:<run_id>:<run_attempt>:blue-green`
 
 Open the owning GitHub Actions run before taking recovery action. A live owner
 may be waiting for ECS stability and must not have its lock removed.
@@ -65,9 +68,10 @@ Re-running a failed job does not recover its retained lock: `run_attempt`
 changes the owner token, so the new attempt will wait and eventually fail.
 Reconcile and release the prior attempt's lock using this runbook first.
 Contention is expected only while qurl-service is running its protected
-exact-image smoke/restore path or another NHP main roll is active. Queued main
-pushes and the bounded runner cost are accepted in exchange for preserving that
-proof; do not cancel a healthy waiter merely to free a runner.
+exact-image smoke/restore path, NHP is rolling qurl-service, or an NHP
+blue/green deployment is converging the server/AC boundary. Queued main pushes
+and the bounded runner cost are accepted in exchange for preserving that proof;
+do not cancel a healthy waiter merely to free a runner.
 
 NHP's lock-bearing job requests a 10,800-second AWS session, matching its
 three-hour job timeout, and Terraform permits that duration only on the sandbox
@@ -104,17 +108,47 @@ aws ecs describe-services \
   --query 'services[0].{taskDefinition:taskDefinition,running:runningCount,pending:pendingCount,deployments:deployments[*].{status:status,taskDefinition:taskDefinition,rolloutState:rolloutState}}'
 ```
 
-For an NHP owner, inspect the `Deploy Sandbox - QURL Service` job. A successful
-or no-op `Roll qurl-service to latest task def` step has already verified a
-stable service and normally releases the lock. A release-action failure leaves
-the NHP job red and retains the lock. Any other roll outcome intentionally
-retains the lock. Confirm the service is stable on either the deployer's
-verified target or its circuit-breaker rollback target before release.
+For an NHP `deploy-sandbox-qurl` owner, inspect the `Deploy Sandbox - QURL
+Service` job. A successful or no-op `Roll qurl-service to latest task def` step
+has already verified a stable service and normally releases the lock. A
+release-action failure leaves the NHP job red and retains the lock. Any other
+roll outcome intentionally retains the lock. Confirm the service is stable on
+either the deployer's verified target or its circuit-breaker rollback target
+before release.
 The job acquires before probing whether qurl-service is deployed; that can wait
 unnecessarily in a dark sandbox. Probe-first was rejected because the read-only
 deployment check can become stale before a later mutation, creating two lock
 boundaries and a TOCTOU path around the shared contract. One acquire-first
 boundary keeps every possible ECS mutation strictly behind the same lock.
+
+For an NHP `blue-green` owner, inspect the complete `Blue/Green Deploy` run.
+The lock is acquired before `Prepare`, so direct/manual dispatches and
+build-and-push child runs share the same boundary. A successful deploy releases
+only after the standby refresh, traffic switch, post-switch readiness
+validation, and actual previous-color warm-standby convergence all succeed.
+Rollback and switch-only runs release only after their switch and validation
+succeed; explicitly skipped validation is not release-safe after a mutation. A
+prepare failure, true dry run, or successful prepare that selects no deployable
+component is safe to release because none can mutate live state. Any other
+terminal shape retains the lock: reconcile active-color parameters, listener
+target groups, ASG capacities/refreshes, and knock readiness before exact-owner
+release.
+
+This broader boundary was added after NHP run `29658670289` overlapped
+qurl-service exact-image smoke run `29658663594`. The smoke acquired the old
+ECS-only mutex while blue/green was still running both colors, then exercised
+NHP during the post-switch interval before all new active servers had AC peers.
+The result was NHP `52005`, not a qurl-service code failure. Repository-local
+GitHub concurrency cannot close that race; the shared SSM owner does.
+
+The mutex proves only that an exact-image qv2 smoke did not overlap an NHP
+blue/green mutation or its bounded infrastructure convergence. It does **not**
+certify end-to-end AC admission health, and the warm-standby capacity check is
+not an admission probe. The customer-path defect observed during the incident
+(`PeerGroup` address mismatch while both colors exposed six server peers) and
+its six-peer/two-color acceptance coverage are owned by
+[#2123](https://github.com/layervai/nhp/issues/2123). Do not treat this CI
+serialization as a substitute for that product fix.
 
 Two waiters can rarely observe the same expired lock before either delete
 completes; the loser currently fails closed if its delete sees
@@ -141,10 +175,12 @@ the workflow that registered it.
 Release only after all of these are true:
 
 1. The owning run is terminal.
-2. The service has exactly the intended primary task definition.
-3. The deployment is stable with no pending tasks.
-4. The active image is the intended current-main or explicitly approved PR
-   image for the owning workflow.
+2. For a qurl-service owner, the service has exactly the intended primary task
+   definition. The deployment is stable with no pending tasks and serves the
+   intended current-main or explicitly approved PR image.
+3. For a blue-green owner, server and AC active-color parameters match their
+   listeners, no instance refresh is still running, previous colors are at
+   warm-standby capacity, and every active server reports AC knock readiness.
 
 Then delete only the shared lock parameter:
 
