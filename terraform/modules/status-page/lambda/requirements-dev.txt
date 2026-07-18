@@ -7,4 +7,4 @@
 
 pytest==9.0.3
 boto3==1.43.46
-botocore==1.43.46
+botocore==1.43.51
