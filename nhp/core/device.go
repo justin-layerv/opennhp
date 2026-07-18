@@ -30,6 +30,20 @@ type DeviceOptions struct {
 	DisableACPeerValidation     bool
 	DisableRelayPeerValidation  bool
 	DisableDePeerValidation     bool
+	// AllowUnregisteredAgentLST lets an NHP_SERVER accept NHP_LST from a
+	// Noise-authenticated initiator that is not in the peer registry. It skips
+	// only the registry and source-address checks for that exact receiver/type
+	// pair; static-key authentication, a 30-second future timestamp-skew bound,
+	// the existing replay and past-staleness gates, and body AEAD remain
+	// mandatory. This is deliberately narrower than DisableAgentPeerValidation
+	// and is intended only for a dedicated LST-only assignment Hub. Do not enable
+	// it on a general-purpose or cell NHP server. Skipping registry pinning and
+	// source-address binding means core provides no cross-connection replay or
+	// roaming barrier for this path. Replay, flood, and past-stale packets still
+	// fail with their existing errors, but do not increment threat state or block
+	// their unbound source. The option is inert when DisableAgentPeerValidation
+	// is set; a Hub must never combine the two.
+	AllowUnregisteredAgentLST bool
 }
 
 // ReceiveQueueDrop identifies the bounded inbound stage that shed work. The

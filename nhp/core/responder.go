@@ -222,8 +222,8 @@ type PacketParserData struct {
 	SenderTrxId   uint64
 	// RemoteSendTime is the AEAD-authenticated wall-clock send time
 	// the sender stamped into the packet header (nanos), populated
-	// after the timestamp passes the staleness floor and the
-	// per-connection LastRemoteSendTime gate. Downstream handlers
+	// after the timestamp passes the applicable skew/staleness and
+	// per-connection LastRemoteSendTime gates. Downstream handlers
 	// (e.g., AC AOP dedupe in endpoints/ac/aop_replay_cache.go) use
 	// it to distinguish a captured-and-replayed packet (same
 	// timestamp) from a fresh post-restart packet that happens to
@@ -461,7 +461,9 @@ func shouldCheckRecvAttack(deviceType int, peerType int, msgType int) bool {
 // (endpoints/ac/aop_replay_cache.go) is the real cross-connection defense.
 // #1461 deliberately deferred this symmetric step; #2518 takes it, removing
 // AOP's last per-connection auto-block. Every other (deviceType, peerType,
-// msgType) keeps the default escalation.
+// msgType) keeps the default escalation. The exact unregistered-LST Hub path
+// is separately drop-only at the validatePeer call site because it has no
+// registry-backed source binding.
 func shouldEscalateReplay(deviceType int, peerType int, msgType int) bool {
 	if deviceType == NHP_SERVER && peerType == NHP_AC && msgType == NHP_ART {
 		return false
@@ -587,13 +589,26 @@ func recvStalenessFloor(deviceType int, peerType int, msgType int) int64 {
 // NHP_ART (AC → server) keeps the default escalation: it is exempt
 // from the replay/flood gates but a genuinely stale ART is not an
 // expected legitimate event, so there is no false-reject motivation to
-// suppress the block.
+// suppress the block. The exact unregistered-LST Hub path bypasses this
+// predicate at the validatePeer call site because its source is not bound.
 func shouldEscalateStale(deviceType int, peerType int, msgType int) bool {
 	if deviceType == NHP_AC && peerType == NHP_SERVER && msgType == NHP_AOP {
 		return false
 	}
 	return true
 }
+
+// unregisteredLSTFutureSkewLimit bounds how far a public Hub request may lead
+// the Hub's receive clock. Without this exact-path bound, a valid initiator can
+// stamp an arbitrarily future time and extend the captured packet's
+// cross-connection replay eligibility far beyond the past-staleness floor. It
+// is deliberately not a global clock-policy change: on servers without this
+// option, registered peers retain the historical behavior plus registry and
+// source-address binding. A Hub enabling the option skips those checks for
+// every LST, even if its key is registered, so it must not host registered LST
+// peers. The 600-second past floor stays unchanged until the Hub
+// application-envelope expiry contract is fixed under #3227.
+const unregisteredLSTFutureSkewLimit = 30 * time.Second
 
 func (ppd *PacketParserData) validatePeer() (err error) {
 	peerPk, err := ppd.decryptInitiatorStaticPubKey()
@@ -617,9 +632,12 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	ppd.device.optionMutex.Unlock()
 
 	peerDeviceType = HeaderTypeToDeviceType(ppd.HeaderType)
+	allowUnregisteredLST := !option.DisableAgentPeerValidation &&
+		ppd.device.deviceType == NHP_SERVER &&
+		ppd.HeaderType == NHP_LST && option.AllowUnregisteredAgentLST
 	switch peerDeviceType {
 	case NHP_AGENT:
-		toValidate = !option.DisableAgentPeerValidation
+		toValidate = !option.DisableAgentPeerValidation && !allowUnregisteredLST
 
 	case NHP_SERVER:
 		toValidate = !option.DisableServerPeerValidation
@@ -693,6 +711,11 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	}
 
 	remoteSendTime := int64(binary.BigEndian.Uint64(tsBytes[:]))
+	if allowUnregisteredLST && remoteSendTime > ppd.LocalInitTime+int64(unregisteredLSTFutureSkewLimit) {
+		// Do not escalate: a legitimate fast clock must not self-block; the Hub worker (#3227) must rate-limit abuse.
+		log.Debug("received future-dated unregistered LST from %s, drop packet", ppd.ConnData.RemoteAddr.String())
+		return ErrStalePacketReceived
+	}
 
 	if shouldCheckRecvAttack(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
 		if remoteSendTime < ppd.ConnData.LastRemoteSendTime {
@@ -709,26 +732,32 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 			// still dropped (the replay is rejected) and the cross-connection
 			// dedupe caches are the real cross-connection defense; only the
 			// punitive block is waived. See shouldEscalateReplay.
-			escalate := shouldEscalateReplay(ppd.device.deviceType, peerDeviceType, ppd.HeaderType)
-			// Log severity tracks the escalation decision: for the drop-only
-			// exempt types an in-connection regression is an EXPECTED benign
-			// burst-reorder, so log at Warning to avoid Critical-level spam on
-			// healthy bursty connections (the AC dedupe cache already uses
-			// Warning for the same benign-retry reason); for escalating types
-			// the regression is a genuine attack signal and stays Critical.
-			if escalate {
-				log.Critical("received replay packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
-				// threat plus 1
-				threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
-				// with high queue number, the device may use ConnData channels when conn is already closed
-				if threat > ThreatCountBeforeBlock && !ppd.ConnData.IsClosed() {
-					// clamp threat count to avoid overflow
-					atomic.StoreInt32(&ppd.ConnData.RecvThreatCount, ThreatCountBeforeBlock)
-					// block source address
-					ppd.ConnData.SendBlockSignal()
-				}
+			if allowUnregisteredLST {
+				// The public Hub path deliberately has no registry-backed source
+				// binding, so a captured packet must not block its replayed source.
+				log.Debug("received replay packet from %s, drop unregistered LST without source escalation", ppd.ConnData.RemoteAddr.String())
 			} else {
-				log.Warning("received replay packet from %s, drop packet (drop-only type, not escalated)", ppd.ConnData.RemoteAddr.String())
+				escalate := shouldEscalateReplay(ppd.device.deviceType, peerDeviceType, ppd.HeaderType)
+				// Log severity tracks the escalation decision: for the drop-only
+				// exempt types an in-connection regression is an EXPECTED benign
+				// burst-reorder, so log at Warning to avoid Critical-level spam on
+				// healthy bursty connections (the AC dedupe cache already uses
+				// Warning for the same benign-retry reason); for escalating types
+				// the regression is a genuine attack signal and stays Critical.
+				if escalate {
+					log.Critical("received replay packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
+					// threat plus 1
+					threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
+					// with high queue number, the device may use ConnData channels when conn is already closed
+					if threat > ThreatCountBeforeBlock && !ppd.ConnData.IsClosed() {
+						// clamp threat count to avoid overflow
+						atomic.StoreInt32(&ppd.ConnData.RecvThreatCount, ThreatCountBeforeBlock)
+						// block source address
+						ppd.ConnData.SendBlockSignal()
+					}
+				} else {
+					log.Warning("received replay packet from %s, drop packet (drop-only type, not escalated)", ppd.ConnData.RemoteAddr.String())
+				}
 			}
 			err = ErrReplayPacketReceived
 			return err
@@ -737,14 +766,18 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	if shouldCheckFlood(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
 		if remoteSendTime < ppd.ConnData.LastRemoteSendTime+MinimalRecvIntervalMs*int64(time.Millisecond) {
 			// flood packet, drop
-			log.Critical("received flood packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
-			// threat plus 1
-			threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
-			if threat > ThreatCountBeforeBlock && !ppd.ConnData.IsClosed() {
-				// clamp threat count to avoid overflow
-				atomic.StoreInt32(&ppd.ConnData.RecvThreatCount, ThreatCountBeforeBlock)
-				// block source address
-				ppd.ConnData.SendBlockSignal()
+			if allowUnregisteredLST {
+				log.Debug("received flood packet from %s, drop unregistered LST without source escalation", ppd.ConnData.RemoteAddr.String())
+			} else {
+				log.Critical("received flood packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
+				// threat plus 1
+				threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
+				if threat > ThreatCountBeforeBlock && !ppd.ConnData.IsClosed() {
+					// clamp threat count to avoid overflow
+					atomic.StoreInt32(&ppd.ConnData.RecvThreatCount, ThreatCountBeforeBlock)
+					// block source address
+					ppd.ConnData.SendBlockSignal()
+				}
 			}
 			err = ErrFloodPacketReceived
 			return err
@@ -756,19 +789,23 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 		// AOP (server→AC) uses a tighter floor than the 600 s default to
 		// bound the cross-restart replay window (#1464) — see
 		// recvStalenessFloor.
-		log.Critical("received stale packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
-		// Escalate to threat/block only for message types where a stale
-		// packet is an attack signal rather than a likely clock-skew
-		// artifact. AOP (server→AC) is exempt (#1464) so a benign
-		// skew/boot-clock false-reject is a recoverable drop, not a
-		// connection block — see shouldEscalateStale.
-		if shouldEscalateStale(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
-			threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
-			if threat > ThreatCountBeforeBlock && !ppd.ConnData.IsClosed() {
-				// clamp threat count to avoid overflow
-				atomic.StoreInt32(&ppd.ConnData.RecvThreatCount, ThreatCountBeforeBlock)
-				// block source address
-				ppd.ConnData.SendBlockSignal()
+		if allowUnregisteredLST {
+			log.Debug("received stale packet from %s, drop unregistered LST without source escalation", ppd.ConnData.RemoteAddr.String())
+		} else {
+			log.Critical("received stale packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
+			// Escalate to threat/block only for message types where a stale
+			// packet is an attack signal rather than a likely clock-skew
+			// artifact. AOP (server→AC) is exempt (#1464) so a benign
+			// skew/boot-clock false-reject is a recoverable drop, not a
+			// connection block — see shouldEscalateStale.
+			if shouldEscalateStale(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
+				threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
+				if threat > ThreatCountBeforeBlock && !ppd.ConnData.IsClosed() {
+					// clamp threat count to avoid overflow
+					atomic.StoreInt32(&ppd.ConnData.RecvThreatCount, ThreatCountBeforeBlock)
+					// block source address
+					ppd.ConnData.SendBlockSignal()
+				}
 			}
 		}
 		err = ErrStalePacketReceived
