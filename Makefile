@@ -431,6 +431,9 @@ lint-workflows:
 	@shellcheck scripts/check-ubuntu-base-digest-drift.sh tests/scripts/check-ubuntu-base-digest-drift_test.sh
 	@bash tests/scripts/check-ubuntu-base-digest-drift_test.sh
 	@bash scripts/check-ubuntu-base-digest-drift.sh
+	@shellcheck scripts/check-lambda-boto-pin-lockstep.sh tests/scripts/check-lambda-boto-pin-lockstep_test.sh
+	@bash tests/scripts/check-lambda-boto-pin-lockstep_test.sh
+	@bash scripts/check-lambda-boto-pin-lockstep.sh
 	@shellcheck scripts/check-ac-user-data-heredoc-backticks.sh tests/scripts/check-ac-user-data-heredoc-backticks_test.sh
 	@bash tests/scripts/check-ac-user-data-heredoc-backticks_test.sh
 	@bash scripts/check-ac-user-data-heredoc-backticks.sh

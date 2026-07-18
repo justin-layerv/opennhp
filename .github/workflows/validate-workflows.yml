@@ -128,6 +128,17 @@ on:
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
+      # Lambda boto3/botocore pin lockstep (#3320/#3323):
+      # check-lambda-boto-pin-lockstep.sh fences that every boto3==/botocore==
+      # pin across the terraform/modules/*/lambda requirement files — installed
+      # into ONE shared env by build-and-push.yml's "Test Lambdas" job — stays on
+      # a single version. Watch the lint itself and every requirements*.txt it
+      # scans so a pin edit in ANY such module (including a brand-new one) re-runs
+      # it. custom-domain-cert/lambda/** above already covers that module; this
+      # glob widens coverage to acme-cert, status-page, and future modules. The
+      # paired fixture test rides tests/scripts/** above.
+      - "scripts/check-lambda-boto-pin-lockstep.sh"
+      - "terraform/modules/*/lambda/requirements*.txt"
       # The relay plan checker imports this real-plan schema slice directly;
       # a fixture-only recapture must run the same contract tests.
       - "tests/fixtures/relay-dmz-plan/**"
@@ -319,6 +330,25 @@ jobs:
           shellcheck scripts/check-ubuntu-base-digest-drift.sh tests/scripts/check-ubuntu-base-digest-drift_test.sh
           bash tests/scripts/check-ubuntu-base-digest-drift_test.sh
           bash scripts/check-ubuntu-base-digest-drift.sh
+
+      # Lambda boto3/botocore pin lockstep (#3320/#3323): build-and-push.yml's
+      # "Test Lambdas" job installs every terraform/modules/*/lambda test
+      # requirement file into ONE Python env, each `pip install -r` resolved
+      # per-file. boto3 X.Y.Z requires botocore>=X.Y.Z, so a within-file split
+      # with boto3 ahead fails that file's install loudly (pip
+      # ResolutionImpossible, #3320), while a cross-file split where each file is
+      # internally consistent installs clean but silently last-write-wins — a
+      # suite then runs against an unintended version. This fence catches both.
+      # #3323 unified the pins and added the Dependabot aws-sdk group so the pair
+      # bumps together; this catches a hand-edit or a NEW lambda module that the
+      # group can't. Fixtures run before the real check so a pin-regex/extractor
+      # regression surfaces against known inputs first. shellcheck both —
+      # actionlint's -shellcheck only covers workflow-embedded scripts.
+      - name: Test + check lambda boto3/botocore pin lockstep (#3320/#3323)
+        run: |
+          shellcheck scripts/check-lambda-boto-pin-lockstep.sh tests/scripts/check-lambda-boto-pin-lockstep_test.sh
+          bash tests/scripts/check-lambda-boto-pin-lockstep_test.sh
+          bash scripts/check-lambda-boto-pin-lockstep.sh
 
       # Structural fence for the promote-to-prod gate logic that closed
       # issue #1322 (deploy-* must require terraform-apply success when
