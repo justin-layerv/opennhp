@@ -764,6 +764,13 @@ func udpPeersShareAddress(a, b *UdpPeer) bool {
 }
 
 func (d *Device) AddPeer(peer Peer) {
+	d.TryAddPeer(peer)
+}
+
+// TryAddPeer adds peer and reports whether the device admitted it. It has the
+// same replacement semantics as AddPeer, but lets callers fail before sending
+// traffic when a unique-address UdpPeer is refused by a full PeerGroup.
+func (d *Device) TryAddPeer(peer Peer) bool {
 	d.peerMapMutex.Lock()
 	defer d.peerMapMutex.Unlock()
 
@@ -771,13 +778,13 @@ func (d *Device) AddPeer(peer Peer) {
 	existing, found := d.peerMap[key]
 	if !found {
 		d.peerMap[key] = peer
-		return
+		return true
 	}
 
 	udpPeer, isUdp := peer.(*UdpPeer)
 	if !isUdp {
 		d.peerMap[key] = peer
-		return
+		return true
 	}
 
 	// Existing is already a PeerGroup — add the new member
@@ -787,26 +794,22 @@ func (d *Device) AddPeer(peer Peer) {
 			if len(keyPrefix) > 8 {
 				keyPrefix = keyPrefix[:8] + "..."
 			}
-			// A refused member is absent from the device pool, but the
-			// caller's next packet will still be sent to it. The response
-			// then fails PeerGroup.CheckRecvAddress (the existing members
-			// hold their addresses within MinimalPeerAddressHoldTime) and
-			// surfaces as ErrPeerAddressMismatch — a cryptographic-binding
-			// error — rather than a peer-pool-full signal. This WARNING is
-			// what makes the actual cause findable in the next trace.
+			// A refused member is absent from the device pool. TryAddPeer callers
+			// can fail before sending; legacy AddPeer callers cannot observe the
+			// result, so keep this warning as their explicit capacity signal.
 			log.Warning("AddPeer: peer group for key %s is at MaxPeerGroupSize=%d; refused new member %s — caller cannot reach this peer until the group drains",
 				keyPrefix, MaxPeerGroupSize, udpPeer.Host())
-			return
+			return false
 		}
 		log.Info("AddPeer: added member %s to peer group (size %d)", udpPeer.Host(), group.Len())
-		return
+		return true
 	}
 
 	// Existing is a single UdpPeer — check if same address (re-registration)
 	existingUdp, isExistingUdp := existing.(*UdpPeer)
 	if isExistingUdp && udpPeersShareAddress(existingUdp, udpPeer) {
 		d.peerMap[key] = peer
-		return
+		return true
 	}
 
 	// Different address, same key — promote to PeerGroup
@@ -819,11 +822,12 @@ func (d *Device) AddPeer(peer Peer) {
 		}
 		log.Info("AddPeer: promoted to peer group for key %s (%s + %s)",
 			keyPrefix, existingUdp.Host(), udpPeer.Host())
-		return
+		return true
 	}
 
 	// Existing is some other Peer type — overwrite
 	d.peerMap[key] = peer
+	return true
 }
 
 func (d *Device) RemovePeer(pubKey string) {
@@ -858,6 +862,67 @@ func (d *Device) RemovePeerByAddress(pubKey string, addr string) {
 	case 1:
 		d.peerMap[pubKey] = group.Members()[0]
 	}
+}
+
+// RemovePeerInstance removes peer only if the device still contains that exact
+// *UdpPeer. It is the ownership-safe counterpart to RemovePeerByAddress: a
+// same-key, same-address replacement installed after the caller's snapshot is
+// preserved. It returns whether a peer was removed.
+func (d *Device) RemovePeerInstance(peer *UdpPeer) bool {
+	return d.RemovePeerInstanceAndRestore(peer, nil)
+}
+
+// RemovePeerInstanceAndRestore removes peer only if the device still contains
+// that exact *UdpPeer. When replacement is non-nil, it must have the same
+// public key and network address and replaces peer atomically under the Device
+// map lock. This lets callers restore a statically configured pointer after a
+// same-address transient peer displaced it without exposing a capacity slot to
+// concurrent admissions.
+//
+// The return value reports whether peer was found and removed or replaced.
+func (d *Device) RemovePeerInstanceAndRestore(peer, replacement *UdpPeer) bool {
+	if peer == nil {
+		return false
+	}
+	if replacement != nil && (peer.PublicKeyBase64() != replacement.PublicKeyBase64() || !udpPeersShareAddress(peer, replacement)) {
+		return false
+	}
+
+	d.peerMapMutex.Lock()
+	defer d.peerMapMutex.Unlock()
+
+	key := peer.PublicKeyBase64()
+	existing, found := d.peerMap[key]
+	if !found {
+		return false
+	}
+
+	group, isGroup := existing.(*PeerGroup)
+	if !isGroup {
+		if existing != peer {
+			return false
+		}
+		if replacement != nil {
+			d.peerMap[key] = replacement
+			return true
+		}
+		delete(d.peerMap, key)
+		return true
+	}
+
+	if replacement != nil {
+		return group.replaceMemberInstance(peer, replacement)
+	}
+	if !group.removeMemberInstance(peer) {
+		return false
+	}
+	switch group.Len() {
+	case 0:
+		delete(d.peerMap, key)
+	case 1:
+		d.peerMap[key] = group.Members()[0]
+	}
+	return true
 }
 
 func (d *Device) ResetPeers() {

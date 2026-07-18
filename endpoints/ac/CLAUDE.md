@@ -18,21 +18,51 @@ When acquiring multiple mutexes in `endpoints/ac/`, follow this order
 to prevent deadlocks. New code that takes locks in a different order
 must update this list and audit all existing call sites.
 
-- **`r.mu` then `device.peerMapMutex`, never reversed.** `r.mu` is
+- **`transitionMu` then `r.mu` then `serverPeerMutex` then
+  `device.peerMapMutex`, never reversed.**
+  `transitionMu` serializes authoritative assignment responses across the
+  assigned-server swap, device-pool reconciliation, network connects, and
+  final cleanup. `HandleRedispatch` releases `r.mu` before network waits while
+  retaining `transitionMu`; the direct-AAK path holds both only across its
+  synchronous replace/reconcile/re-add sequence. The AOL network wait does not
+  hold `transitionMu`; its temporary NLB peer is published under
+  `pendingRegistrationPeer`, which every authoritative reconcile snapshots
+  under `r.mu`. Begin, response, timeout, and cancellation mutate that marker
+  under `transitionMu` so a sweep cannot observe a half-transition. `Stop()`
+  atomically establishes `stopped` and closes `stopCh` before waiting for
+  `transitionMu`; this lets an in-flight transition cancel its network waits.
+  It waits for lifecycle goroutines without the transition lock, then takes the
+  lock for final cleanup. Pre-fence transitions still in network waits observe
+  `stopCh`, and every transition gates post-connect publication on `stopped`;
+  post-fence mutation entries observe `stopped` after taking `transitionMu`.
+  `r.mu` is
   acquired in `handleRegistrationResponse`'s direct-AAK branch and in
-  `Stop()`; both call into `device.RemovePeerByAddress` /
+  `Stop()`; both call into `device.RemovePeerInstanceAndRestore` /
   `device.LookupPeer` (which acquire `peerMapMutex` internally) while
-  still holding `r.mu`. `core.Device` methods do not call back into
+  still holding `r.mu`. Reconciliation snapshots static server keys under
+  `serverPeerMutex` and releases that snapshot lock before touching Device.
+  Dynamic-peer removal reacquires `serverPeerMutex` and intentionally holds it
+  through `device.RemovePeerInstanceAndRestore`, atomically preserving a
+  currently configured same-address pointer. `updateServerPeers` may also take
+  `serverPeerMutex` before Device, but never calls registration code.
+  `core.Device` methods do not call back into
   `ACRegistration`, so `peerMapMutex` is leaf-most for the AC; a
   future change that takes `r.mu` while holding `peerMapMutex` would
   deadlock against the direct-AAK reconcile path.
-- **`reconcileDevicePeers` does not acquire `r.mu` itself.** Callers
-  decide. `HandleRedispatch` releases `r.mu` after the
-  `assignedServers` swap and calls reconcile lock-free (the orphan
-  family it admits is documented + surfaced via
-  `MetricReconcileOverlap`). `handleRegistrationResponse`'s
-  direct-AAK branch holds `r.mu` across reconcile to close the
-  orphan-until-restart hole on that path.
+- **`reconcileDevicePeers` runs under transition serialization.** Its
+  production callers hold `transitionMu`; the direct-AAK caller additionally
+  holds `r.mu`, while `HandleRedispatch` releases `r.mu` after the
+  `assignedServers` swap and before reconcile/network work. Reconciliation may
+  briefly snapshot or untrack ownership under `assignmentPeersMu`, but never
+  holds that lock while calling Device. A non-zero `MetricReconcileOverlap`
+  means a future or internal caller bypassed the transition invariant.
+- **`assignmentPeersMu` never nests with Device locks.** AC-owned dynamic peer
+  pointers are tracked under this mutex so reconciliation can distinguish them
+  from static/config peers sharing a key. Add/remove helpers complete the
+  atomic Device operation before taking `assignmentPeersMu`; reconciliation
+  snapshots ownership and releases the mutex before calling Device. Preserve
+  that separation rather than inventing an `assignmentPeersMu` ↔
+  `peerMapMutex` order.
 - **L3 flush scheduler locks are scheduler-internal.** The L3 flush
   scheduler (PR #2164) adds: 256 sharded `shard.mu` entries (the
   index-per-key mutex), `wheelMu` (single mutex protecting wheel

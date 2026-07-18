@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -397,7 +398,9 @@ func TestDeviceAddPeer_AtMaxSize_DoesNotAdd(t *testing.T) {
 	}
 
 	// One more AddPeer with a unique address must not grow the group.
-	d.AddPeer(newTestUdpPeer("10.0.99.99", 62206))
+	if d.TryAddPeer(newTestUdpPeer("10.0.99.99", 62206)) {
+		t.Fatal("TryAddPeer accepted a unique member beyond MaxPeerGroupSize")
+	}
 
 	if group.Len() != MaxPeerGroupSize {
 		t.Fatalf("Device.AddPeer must not grow PeerGroup beyond MaxPeerGroupSize=%d; got %d", MaxPeerGroupSize, group.Len())
@@ -453,6 +456,82 @@ func TestDeviceRemovePeerByAddress(t *testing.T) {
 	got = d.LookupPeer(p1.PublicKey())
 	if got != nil {
 		t.Fatal("expected nil after removing all members")
+	}
+}
+
+func TestDeviceRemovePeerInstancePreservesReplacements(t *testing.T) {
+	d := &Device{peerMap: make(map[string]Peer)}
+	oldAtA := newTestUdpPeer("10.0.1.5", 62206)
+	peerAtB := newTestUdpPeer("10.0.2.8", 62206)
+	d.AddPeer(oldAtA)
+	d.AddPeer(peerAtB)
+
+	// Same-address AddPeer replaces the group member pointer. Cleanup holding
+	// the old pointer must not remove the replacement.
+	replacementAtA := newTestUdpPeer("10.0.1.5", 62206)
+	d.AddPeer(replacementAtA)
+	if d.RemovePeerInstance(oldAtA) {
+		t.Fatal("stale group pointer removed its replacement")
+	}
+	if !d.RemovePeerInstance(peerAtB) {
+		t.Fatal("exact group member was not removed")
+	}
+	if got := d.LookupPeer(replacementAtA.PublicKey()); got != replacementAtA {
+		t.Fatalf("group did not demote to replacement peer: %T", got)
+	}
+
+	// The single-peer branch has the same pointer-identity contract.
+	newSingle := newTestUdpPeer("10.0.1.5", 62206)
+	d.AddPeer(newSingle)
+	if d.RemovePeerInstance(replacementAtA) {
+		t.Fatal("stale single pointer removed its replacement")
+	}
+	if !d.RemovePeerInstance(newSingle) {
+		t.Fatal("exact single peer was not removed")
+	}
+	if got := d.LookupPeer(newSingle.PublicKey()); got != nil {
+		t.Fatalf("exact single removal left device entry: %T", got)
+	}
+}
+
+func TestDeviceRemovePeerInstanceAndRestoreIsAtomicAtCapacity(t *testing.T) {
+	d := &Device{peerMap: make(map[string]Peer)}
+	transient := newTestUdpPeer("10.0.1.1", 62206)
+	static := newTestUdpPeer(transient.Ip, transient.Port)
+	d.AddPeer(transient)
+	for i := 2; i <= MaxPeerGroupSize; i++ {
+		d.AddPeer(newTestUdpPeer(fmt.Sprintf("10.0.1.%d", i), 62206))
+	}
+
+	if !d.RemovePeerInstanceAndRestore(transient, static) {
+		t.Fatal("exact transient group member was not replaced")
+	}
+	group, ok := d.LookupPeer(static.PublicKey()).(*PeerGroup)
+	if !ok {
+		t.Fatalf("at-capacity restore changed peer shape: %T", d.LookupPeer(static.PublicKey()))
+	}
+	if group.Len() != MaxPeerGroupSize {
+		t.Fatalf("at-capacity restore changed group size: got %d want %d", group.Len(), MaxPeerGroupSize)
+	}
+	var restored bool
+	for _, member := range group.Members() {
+		if member == transient {
+			t.Fatal("transient pointer survived atomic restore")
+		}
+		if member == static {
+			restored = true
+		}
+	}
+	if !restored {
+		t.Fatal("static pointer is absent after atomic restore")
+	}
+
+	wrongAddress := newTestUdpPeer("10.0.99.99", 62206)
+	if d.RemovePeerInstanceAndRestore(static, wrongAddress) {
+		t.Fatal("mismatched replacement was accepted")
+	}
+	if !slices.Contains(group.Members(), static) {
+		t.Fatal("rejected replacement changed existing static member")
 	}
 }
 

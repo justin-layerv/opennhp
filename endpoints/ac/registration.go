@@ -2,6 +2,7 @@ package ac
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -217,45 +218,10 @@ const (
 	MetricAllUnconnectedDurationMs = "AllUnconnectedDurationMs"
 	MetricAllUnconnectedRecoveryMs = "AllUnconnectedRecoveryMs"
 
-	// MetricReconcileOverlap is incremented when reconcileDevicePeers enters
-	// while another reconcile is already in flight — i.e., the orphan-
-	// precondition for the synchronous-reconcile model (#1680). Wired into
-	// reconcileDevicePeers itself so both call sites (HandleRedispatch and
-	// handleRegistrationResponse's direct-AAK branch) feed the same counter
-	// and the metric stays a true family-wide signal: HandleRedispatch ↔
-	// HandleRedispatch, HandleRedispatch ↔ direct-AAK, and direct-AAK ↔
-	// direct-AAK overlaps all bump it.
-	//
-	// Counting model: emits N-1 events per overlap window of N concurrent
-	// entrants — every reconcile past the first entrant bumps the counter
-	// once. So 3 simultaneous reconcilers produce 2 metric events, not 1.
-	// Alarm thresholds in #1693 should treat this as a rate signal, not as
-	// a count of distinct overlap incidents.
-	//
-	// Each AC publishes its own per-ACId dim-stream, so any individual
-	// AC sees per-AC overlap events. Fleet-aggregate views (CloudWatch
-	// SUM/COUNT across ACId dims) are the right shape for fleet-wide
-	// alarms; per-AC alarms can be tight since the empty-prior early
-	// return means an AC's own first redispatch doesn't bump this
-	// counter (cr round-38 #2 — the sibling reconcile that DOES have
-	// work catches the overlap when it enters). #1693's alarms should
-	// pick the appropriate view per use case.
-	//
-	// A non-zero rate in production is the signal to invest in a stronger
-	// mitigation (e.g., serialize reconcile under r.mu, add a periodic
-	// device-pool sweep against the live assignedServers, or land the
-	// (pubkey, address) tuple-identity refactor in #1682 that structurally
-	// eliminates the whole bug family).
-	//
-	// Coverage limit: this metric surfaces the orphan-precondition (two
-	// reconciles in-flight). It does NOT directly surface the data-race
-	// family on .Peer field reads under HandleRedispatch overlap (a
-	// sibling connectToServer's .Peer write racing a reconcile's .Peer
-	// read). The two families share the precondition but a partial
-	// pointer read on .Peer doesn't necessarily emit an overlap event for
-	// that exact occurrence — the metric covers the orphan family in
-	// aggregate, not the data-race family in particular. #1670 is the
-	// structural fix for the AssignedServer.Peer field-locking question.
+	// MetricReconcileOverlap is incremented if reconcileDevicePeers runs
+	// concurrently. Production assignment transitions are serialized by
+	// transitionMu, so a non-zero rate means a future or internal call site
+	// bypassed that invariant. It emits N-1 events for N concurrent entrants.
 	MetricReconcileOverlap = "ReconcileOverlap"
 
 	// MetricUnaddressedTarget is incremented when targetActiveKey falls
@@ -288,25 +254,15 @@ const (
 	// metric breakdown.
 	MetricUnaddressedTarget = "UnaddressedTarget"
 
-	// MetricNilNewServersReconcile is incremented when reconcileDevicePeers
-	// runs with newServers=nil — i.e., HandleRedispatch's all-fail
-	// (successCount == 0) eviction branch — AND actually evicts at least
-	// one prior peer. The branch is correct (avoids the orphan leak
-	// Stop()'s invariant assumes away) but it widens the address-aliasing
-	// race window for sibling redispatches: every prior is eligible for
-	// removal, no active-set save can rescue it. Splitting this out from
-	// MetricReconcileOverlap lets soak observation answer whether all-fail
-	// entries dominate the overlap signal during partial-outage incidents
-	// — if they do, the orphan-creation rate from this branch is the
-	// load-bearing question rather than the overlap signal itself. Per-AC
-	// dim so cross-AC alarms can isolate.
+	// MetricNilNewServersReconcile is incremented when HandleRedispatch's
+	// all-fail (successCount == 0) branch actually evicts at least one prior
+	// peer, either during the pre-connect authoritative prune or the final
+	// nil-newServers cleanup. This is a per-AC branch signal for partial-outage
+	// diagnosis, not a count of removed peers.
 	//
-	// Emitted from inside reconcileDevicePeers (not at the call site) so
-	// the race-clean post-snapshot .Peer values gate the eviction count
-	// (cr round-38 #3 — the previous shape did a duplicate racy scan in
-	// the caller). One Incr per all-fail reconcile that did real work,
-	// regardless of how many priors were evicted: branch-entry signal,
-	// not per-element count.
+	// reconcileDevicePeers returns whether its race-clean pass evicted a peer;
+	// HandleRedispatch combines both passes and emits one increment per all-fail
+	// redispatch that did real work, regardless of how many priors were evicted.
 	MetricNilNewServersReconcile = "NilNewServersReconcile"
 
 	// Gauge metrics for AC-to-Server registration health monitoring (issue #239).
@@ -1015,8 +971,9 @@ func (r *ACRegistration) recordResponseError(err error) {
 
 // recordServerConnectionBreakdown emits the per-ErrorCode/ACId breakdown stream
 // for MetricServerConnectionFailure (for dashboards/analysis). The counterpart
-// of recordRegistrationBreakdown; there is no drop variant because every
-// connectToServer failure is alarmable (see recordServerConnectionFailure).
+// of recordRegistrationBreakdown. Lifecycle cancellation is suppressed before
+// this helper is called; every failure that reaches it is operational and
+// alarmable (see recordServerConnectionFailure).
 func (r *ACRegistration) recordServerConnectionBreakdown(errorCode *string) {
 	r.metrics.IncrCounterWithDims(MetricServerConnectionFailure, []types.Dimension{
 		r.acIdDimension(),
@@ -1028,9 +985,11 @@ func (r *ACRegistration) recordServerConnectionBreakdown(errorCode *string) {
 // broken down by ErrorCode and ACId, plus an unbreakdown base counter so the
 // server_connection_failure alarm (keyed on [Component, Environment, Region])
 // has a matching stream. Same rationale as recordRegistrationFailure (#968).
-// Unlike registration there is no drop exclusion: every connectToServer failure
-// is alarmable, including the in-flight failures during an AC instance refresh,
-// which the Sum>10-over-2-periods threshold is meant to ride out.
+// Unlike registration there is no drop stream: handleRedispatchLocked excludes
+// ErrRegistrationStopped and post-fence results before calling this helper, and
+// every remaining connectToServer failure is alarmable. The
+// Sum>10-over-2-periods threshold is meant to ride out bounded operational
+// failures during an AC instance refresh.
 //
 // Concurrency: the per-server connect attempts run on separate goroutines and
 // each publisher call takes the publisher mutex, so individual increments are
@@ -1056,18 +1015,37 @@ type ACRegistration struct {
 	// on this invariant for safe concurrent access.
 	assignedServers []*AssignedServer
 	mu              sync.RWMutex
-	stopCh          chan struct{}
-	wg              sync.WaitGroup
+	// transitionMu serializes authoritative assignment transitions across the
+	// assignedServers swap, peer-pool reconciliation, network connects, and
+	// final cleanup. It is acquired before mu when both are needed; mu is never
+	// held across network waits.
+	transitionMu sync.Mutex
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+
+	// pendingRegistrationPeer is the temporary NLB peer for an in-flight AOL.
+	// Protected by mu. Authoritative reconciles retain it until response,
+	// timeout, or cancellation cleanup clears it under transitionMu.
+	pendingRegistrationPeer *core.UdpPeer
+
+	// assignmentPeers tracks dynamic peers installed by this registration
+	// manager, keyed by public key and address. Pointer identity distinguishes
+	// them from static/config peers sharing the same key and address.
+	assignmentPeersMu sync.Mutex
+	assignmentPeers   map[string]*core.UdpPeer
+
+	// afterRedispatchTransitionLock is a deterministic test seam. Production
+	// construction leaves it nil.
+	afterRedispatchTransitionLock func()
+	// afterRegistrationTransitionLock is the corresponding response-handler
+	// test seam. Production construction leaves it nil.
+	afterRegistrationTransitionLock func()
 
 	// reregistering prevents concurrent re-registration attempts
 	reregistering atomic.Bool
 
-	// reconcileInFlight counts the number of reconcileDevicePeers calls
-	// currently executing. Surfaces the orphan-precondition for
-	// MetricReconcileOverlap. Bumped by recordReconcileEntry inside
-	// reconcileDevicePeers itself so both reconcile call sites
-	// (HandleRedispatch and handleRegistrationResponse's direct-AAK
-	// branch) feed the same family-wide signal.
+	// reconcileInFlight detects any future reconcile call that bypasses the
+	// authoritative transition serialization invariant.
 	reconcileInFlight atomic.Int32
 
 	// stopped prevents double Stop() calls from panicking (closing stopCh twice)
@@ -1271,6 +1249,7 @@ func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
 	return &ACRegistration{
 		ac:                        ac,
 		assignedServers:           make([]*AssignedServer, 0),
+		assignmentPeers:           make(map[string]*core.UdpPeer),
 		stopCh:                    make(chan struct{}),
 		cachedAOLBytes:            aolBytes,
 		cachedACIdDim:             types.Dimension{Name: dimNameACId, Value: aws.String(ac.config.ACId)},
@@ -1494,61 +1473,49 @@ func (r *ACRegistration) registerConntrackGaugeFuncs() {
 // the real registrationLoop. Adding a started.Load() precondition
 // here would silently mask any regression fence keyed on it.
 func (r *ACRegistration) Stop() {
-	// Prevent double Stop() from panicking (closing stopCh twice)
+	// Fence new work and close stopCh before waiting for transitionMu. An
+	// authoritative redispatch holds transitionMu across its bounded network
+	// waits; taking that mutex first would prevent Stop from closing stopCh and
+	// therefore prevent those waits from being canceled promptly.
 	if r.stopped.Swap(true) {
 		return
 	}
+	close(r.stopCh)
 
 	log.Info("Stopping AC registration manager")
-	close(r.stopCh)
 	r.wg.Wait()
 
-	// Clean up all peers
+	// A pre-fence transition observes stopCh and unwinds; a post-fence transition
+	// observes stopped before mutating state. Serialize final cleanup with both
+	// cases after lifecycle goroutines have exited.
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
 	r.mu.Lock()
 	// Clean up registration peer (from NHP_AAK response)
 	if r.registrationPeer != nil {
-		r.ac.device.RemovePeerByAddress(r.registrationPeer.PublicKeyBase64(), r.registrationPeer.Host())
+		r.removeAssignmentPeer(r.registrationPeer)
 		r.registrationPeer = nil
+	}
+	if r.pendingRegistrationPeer != nil {
+		r.removeTransientPeer(r.pendingRegistrationPeer)
+		r.pendingRegistrationPeer = nil
 	}
 	// Clean up connected server peers. HandleRedispatch reconciles the device
 	// peer pool synchronously, so the live assignedServers slice is the
 	// principal reference path at Stop() time.
 	//
-	// Concurrency: Stop ↔ in-flight redispatch.
-	//
-	// Edge case: if a redispatch is between r.mu.Unlock() and connectWg.Wait()
-	// when Stop runs, Stop sees the freshly-installed assignedServers (the
-	// new ones) and evicts those; the prior set is held only by
-	// HandleRedispatch's local priorServers slice, which its in-flight
-	// reconcile then evicts. What ensures the device pool ends fully cleared
-	// is the prior+new disjointness (no peer pointer is shared between Stop's
-	// view and the goroutine's local), not reconcile idempotency on its own
-	// — both halves of the cleanup run against disjoint sets and serialize
-	// through peerMapMutex.
-	//
-	// Stop does not block on an in-flight reconcile (HandleRedispatch is
-	// not in r.wg). If Stop returns while a redispatch is mid-loop, the
-	// AC is shutting down and the device is going with it — residual
-	// peer-pool state on a dying device is not observable, so abandoned
-	// mid-loop evictions don't leave the system in a bad state.
-	//
-	// Concurrency: metric drop semantics.
-	//
-	// An in-flight reconcile that calls IncrCounterWithDims after
-	// r.metrics.Stop() (below) bumps an in-memory counter that is never
-	// flushed. Best-effort by design — the AC is shutting down,
-	// MetricReconcileOverlap is a precondition signal not a correctness
-	// signal, and a metric that doesn't make it to CloudWatch on the
-	// dying-process path is acceptable. #1693's alarms work on
-	// rate-of-arrival and tolerate the rare drop.
 	for _, server := range r.assignedServers {
 		if server.Peer != nil {
-			r.ac.device.RemovePeerByAddress(server.Peer.PublicKeyBase64(), server.Peer.Host())
+			r.removeAssignmentPeer(server.Peer)
 			server.Peer = nil
 		}
 	}
 	r.assignedServers = nil
 	r.mu.Unlock()
+
+	for _, peer := range r.assignmentPeersSnapshot() {
+		r.removeAssignmentPeer(peer)
+	}
 
 	// Flush remaining CloudWatch metrics
 	r.metrics.Stop()
@@ -2020,12 +1987,69 @@ func (r *ACRegistration) registrationLoop() {
 // DefaultServerPort is the default NHP server port.
 const DefaultServerPort = common.DefaultNHPPort
 
+// beginRegistrationAttempt installs and publishes the temporary NLB peer as
+// one atomic assignment transition. A concurrent redispatch that follows sees
+// pendingRegistrationPeer and protects it during the actual-group sweep.
+func (r *ACRegistration) beginRegistrationAttempt(peer *core.UdpPeer) error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	if r.stopped.Load() {
+		return ErrRegistrationStopped
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pendingRegistrationPeer != nil && r.pendingRegistrationPeer != peer {
+		return errors.New("registration attempt already in flight")
+	}
+	r.pendingRegistrationPeer = peer
+	// A prior rotating assignment may already have filled this key's bounded
+	// PeerGroup. Drain stale members only when AddPeer would otherwise refuse the
+	// pending NLB peer; normal cold-start membership is left unchanged until the
+	// assignment response makes its authoritative set known.
+	if group, ok := r.ac.device.LookupPeer(peer.PublicKey()).(*core.PeerGroup); ok && group.Len() >= core.MaxPeerGroupSize {
+		r.reconcileDevicePeers(r.assignedServers, r.assignedServers, peer)
+	}
+	if !r.ac.device.TryAddPeer(peer) {
+		r.pendingRegistrationPeer = nil
+		return fmt.Errorf("registration peer group at capacity for %s", peer.Host())
+	}
+	return nil
+}
+
+// discardRegistrationAttempt removes a pending temporary peer on a local
+// registration failure. If the attempt has already been superseded, leave the
+// newer assignment untouched.
+func (r *ACRegistration) discardRegistrationAttempt(peer *core.UdpPeer) {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pendingRegistrationPeer != peer {
+		return
+	}
+	r.removeTransientPeer(peer)
+	r.pendingRegistrationPeer = nil
+}
+
+// clearRegistrationAttemptLocked clears the in-flight marker after its server
+// response has been handled. The caller holds transitionMu.
+func (r *ACRegistration) clearRegistrationAttemptLocked(peer *core.UdpPeer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pendingRegistrationPeer == peer {
+		r.pendingRegistrationPeer = nil
+	}
+}
+
 // register performs initial registration via ServerEndpoint.
 // It sends NHP_AOL to the ServerEndpoint and handles NHP_ARD (redispatch) or NHP_AAK response.
 func (r *ACRegistration) register() error {
 	// Validate config (ServerEndpoint already validated in Start())
 	if r.ac.config.ServerPubKeyBase64 == "" {
 		return errors.New("ServerPubKeyBase64 is required")
+	}
+	if r.stopped.Load() {
+		return ErrRegistrationStopped
 	}
 
 	// Track attempt after validation so RegistrationAttempts == RegistrationSuccess + RegistrationFailure.
@@ -2066,13 +2090,15 @@ func (r *ACRegistration) register() error {
 	// Add peer to device for encryption
 	// The peer will be kept if NHP_AAK is received (this server is assigned to us)
 	// The peer will be removed if NHP_ARD is received (we'll connect to different servers)
-	r.ac.device.AddPeer(registrationPeer)
+	if err := r.beginRegistrationAttempt(registrationPeer); err != nil {
+		return err
+	}
 
 	// Create message data for sending
 	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
 	udpAddr, ok := sendAddr.(*net.UDPAddr)
 	if !ok {
-		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+		r.discardRegistrationAttempt(registrationPeer)
 		return fmt.Errorf("unexpected address type %T for registration peer", sendAddr)
 	}
 	md := &core.MsgData{
@@ -2087,10 +2113,16 @@ func (r *ACRegistration) register() error {
 
 	// Send NHP_AOL
 	if !r.ac.IsRunning() {
-		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+		r.discardRegistrationAttempt(registrationPeer)
 		return errors.New("AC not running")
 	}
-	r.ac.sendMsgCh <- md
+	select {
+	case <-r.stopCh:
+		r.discardRegistrationAttempt(registrationPeer)
+		r.recordRegistrationDrop(aws.String("canceled"))
+		return ErrRegistrationStopped
+	case r.ac.sendMsgCh <- md:
+	}
 
 	// Wait for response with timeout
 	// Note: We don't close ResponseMsgCh here because the sender (in another goroutine)
@@ -2103,12 +2135,12 @@ func (r *ACRegistration) register() error {
 
 	select {
 	case <-r.stopCh:
-		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+		r.discardRegistrationAttempt(registrationPeer)
 		// Statically-known lifecycle drop (AC shutting down) — breakdown only.
 		r.recordRegistrationDrop(aws.String("canceled"))
-		return errors.New("registration canceled")
+		return ErrRegistrationStopped
 	case <-regTimer.C:
-		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+		r.discardRegistrationAttempt(registrationPeer)
 		// Backstop only: this 30s RegistrationTimeout is almost always beaten by
 		// the ~4.7s local-transaction timeout, which arrives on ResponseMsgCh as
 		// ErrTransactionFailedByTimeout and is dropped by recordResponseError. This
@@ -2148,8 +2180,27 @@ func (r *ACRegistration) register() error {
 // The registrationPeer is removed if NHP_ARD is received (we'll connect to different servers),
 // but kept if NHP_AAK is received (this server will send us NHP_AOP packets).
 func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, registrationPeer *core.UdpPeer) error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	if r.afterRegistrationTransitionLock != nil {
+		r.afterRegistrationTransitionLock()
+	}
+	defer r.clearRegistrationAttemptLocked(registrationPeer)
+	if r.stopped.Load() {
+		r.removeTransientPeer(registrationPeer)
+		return ErrRegistrationStopped
+	}
+	return r.handleRegistrationResponseLocked(ppd, registrationPeer)
+}
+
+// handleRegistrationResponseLocked applies one authoritative registration
+// response. The caller holds transitionMu.
+func (r *ACRegistration) handleRegistrationResponseLocked(ppd *core.PacketParserData, registrationPeer *core.UdpPeer) error {
+	if r.stopped.Load() {
+		return ErrRegistrationStopped
+	}
 	if ppd.Error != nil {
-		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+		r.removeTransientPeer(registrationPeer)
 
 		// Record the failure with a bounded error category. A transaction-layer
 		// timeout arrives here as ErrTransactionFailedByTimeout (no response was
@@ -2164,10 +2215,9 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 
 	switch ppd.HeaderType {
 	case core.NHP_ARD:
-		// Server is not assigned to this AC - parse redispatch message
-		// Remove the registration peer since we'll connect to different servers
-		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
-
+		// The endpoint is not assigned. Retire the temporary peer even when the
+		// response body is malformed; the wrapper clears its pending marker.
+		r.removeTransientPeer(registrationPeer)
 		var ardMsg common.ACRedispatchMsg
 		if err := json.Unmarshal(ppd.BodyMessage, &ardMsg); err != nil {
 			return fmt.Errorf("failed to parse NHP_ARD: %w", err)
@@ -2179,7 +2229,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		// — bounded by in-flight count at Stop and not alert-worthy; the
 		// returned error keeps registrationLoop in retry-mode where its
 		// stopCh select will exit cleanly.
-		if err := r.HandleRedispatch(&ardMsg); err != nil {
+		if err := r.handleRedispatchLocked(&ardMsg, nil); err != nil {
 			if errors.Is(err, ErrRegistrationStopped) {
 				log.Debug("AC stopping during initial-registration NHP_ARD handling, %d targets: %v", len(ardMsg.Targets), err)
 				return err
@@ -2198,12 +2248,12 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		// Server responded with ACK - this server is assigned to us
 		var aakMsg common.ServerACAckMsg
 		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
-			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+			r.removeTransientPeer(registrationPeer)
 			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
 		}
 
 		if !common.IsSuccessErrCode(aakMsg.ErrCode) {
-			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+			r.removeTransientPeer(registrationPeer)
 
 			// Send registration failure metric with server's error code (bounded cardinality).
 			errCode := aakMsg.ErrCode
@@ -2216,7 +2266,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		}
 
 		if !aakMsg.Registered {
-			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+			r.removeTransientPeer(registrationPeer)
 
 			// Send registration failure metric for server-side rejection.
 			r.recordRegistrationFailure(aws.String("registered_false"))
@@ -2255,9 +2305,10 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 						log.Info("Server direct address %s is non-routable, staying on NLB connection", aakMsg.ServerAddr)
 						// Keep using NLB address but update peer's public key to server's key.
 						// Must remove and re-add because device's peer map is keyed by public key.
-						oldPubKey := registrationPeer.PublicKeyBase64()
-						r.ac.device.RemovePeerByAddress(oldPubKey, registrationPeer.Host())
+						r.removeTransientPeer(registrationPeer)
 						registrationPeer.PubKeyBase64 = aakMsg.ServerPubKey
+						// Best-effort offer; the authoritative reconcile and TryAddPeer gate
+						// below revalidate capacity before publishing the assignment.
 						r.ac.device.AddPeer(registrationPeer)
 						serverPeer = registrationPeer
 					} else {
@@ -2274,10 +2325,11 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 							log.Warning("Cannot resolve server direct address %s, falling back to registration peer", aakMsg.ServerAddr)
 							serverPeer = registrationPeer
 						} else {
-							// Add the new direct peer to the device
+							// Best-effort offer; the authoritative reconcile and TryAddPeer gate
+							// below revalidate capacity before publishing the assignment.
 							r.ac.device.AddPeer(serverPeer)
 							// Remove the old registration peer (connected to NLB)
-							r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+							r.removeTransientPeer(registrationPeer)
 							log.Info("Switched from NLB %s:%d to server direct address %s", registrationPeer.Ip, registrationPeer.Port, aakMsg.ServerAddr)
 						}
 					}
@@ -2303,9 +2355,13 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			// preferable to failing registration entirely for a transient DNS issue.
 			log.Warning("Server peer has nil SendAddr, cannot add to assignedServers for keepalive")
 			r.mu.Lock()
-			if r.registrationPeer != nil {
-				r.ac.device.RemovePeerByAddress(r.registrationPeer.PublicKeyBase64(), r.registrationPeer.Host())
+			if r.registrationPeer != nil && r.registrationPeer != serverPeer {
+				r.removeAssignmentPeer(r.registrationPeer)
 			}
+			// This peer is intentionally retained in Device even though it has
+			// no assignedServers entry. Track its ownership so a later
+			// same-key authoritative transition can discover and retire it.
+			r.trackAssignmentPeer(serverPeer)
 			r.registrationPeer = serverPeer
 			r.mu.Unlock()
 			log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v (peer kept but no keepalive)", aakMsg.ACAddr, aakMsg.Registered)
@@ -2318,7 +2374,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 
 		udpAddr, ok := sendAddr.(*net.UDPAddr)
 		if !ok {
-			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+			r.removeTransientPeer(registrationPeer)
 			return fmt.Errorf("unexpected address type %T for server peer", sendAddr)
 		}
 
@@ -2332,39 +2388,65 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 				Targets: aakMsg.Peers,
 				ErrCode: common.ErrSuccess.ErrorCode(),
 			}
-			if err := r.HandleRedispatch(ardMsg); err != nil {
+			// Protect the peer that is actually usable after processing ServerAddr.
+			// It may be the direct serverPeer rather than the original NLB
+			// registrationPeer, which was already exact-removed above.
+			if err := r.handleRedispatchLocked(ardMsg, serverPeer); err != nil {
 				// ErrRegistrationStopped means the manager is being torn
 				// down — there is no "operational" state to preserve, so
 				// don't record success. Mirror the NHP_ARD branch above
 				// and propagate the error so registrationLoop's stopCh
 				// select exits cleanly.
-				//
-				// Peer-leak note: registrationPeer (and serverPeer if the
-				// direct-address branch ran above) remain in the device
-				// peer map on this early-return — Stop's own cleanup
-				// loop walks r.assignedServers and r.registrationPeer
-				// (the struct field, not yet assigned at this point), so
-				// it does not catch them. Bounded by in-flight count at
-				// Stop and harmless until process GC since device.Stop
-				// halts traffic processing. Tracked as concern 1c on
-				// #1670; the structural fence there closes this surface.
 				if errors.Is(err, ErrRegistrationStopped) {
+					r.removeAssignmentPeer(serverPeer)
+					if serverPeer != registrationPeer {
+						r.removeAssignmentPeer(registrationPeer)
+					}
 					log.Debug("AC stopping during NHP_AAK peer handling, %d peers: %v", len(aakMsg.Peers), err)
 					return err
 				}
 				// Genuine connection failure — HandleRedispatch only errors
-				// when zero connections succeeded. The AC still has its NLB
-				// registration peer, so it remains operational; log a
-				// warning and record a (degraded) success rather than
-				// failing the whole registration.
-				log.Warning("Failed to connect to assigned peers (%v), keeping NLB peer", err)
+				// when zero connections succeeded. Re-add the viable response
+				// peer in case a same-address failed attempt replaced it, then
+				// publish and track that exact pointer for Stop and future
+				// authoritative reconciliation.
+				if !r.ac.device.TryAddPeer(serverPeer) {
+					return fmt.Errorf("assigned peer connections failed and response peer group remained at capacity: %w", err)
+				}
+				r.mu.Lock()
+				if r.registrationPeer != nil && r.registrationPeer != serverPeer {
+					r.removeAssignmentPeer(r.registrationPeer)
+				}
+				r.trackAssignmentPeer(serverPeer)
+				r.registrationPeer = serverPeer
+				fallbackIP := serverPeer.Ip
+				if fallbackIP == "" {
+					fallbackIP = udpAddr.IP.String()
+				}
+				r.assignedServers = []*AssignedServer{{
+					Target: common.RedirectTarget{
+						IP:           fallbackIP,
+						Hostname:     serverPeer.Hostname,
+						Port:         udpAddr.Port,
+						PubKeyBase64: serverPeer.PublicKeyBase64(),
+					},
+					Peer:      serverPeer,
+					Connected: true,
+					LastSeen:  time.Now(),
+				}}
+				r.mu.Unlock()
+				log.Warning("Failed to connect to assigned peers (%v), keeping response peer %s", err, serverPeer.Host())
 				r.recordRegistrationSuccess(dimValDirect)
 				return nil
 			}
 
-			// Remove the NLB registration peer only after HandleRedispatch
-			// succeeds — otherwise a failure would leave the AC with no connections.
-			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+			// The embedded peer list is authoritative after success. Exact-pointer
+			// removal retires only the response path; if connectToServer replaced
+			// the same key/address with an assigned peer, that new pointer survives.
+			r.removeAssignmentPeer(serverPeer)
+			if serverPeer != registrationPeer {
+				r.removeAssignmentPeer(registrationPeer)
+			}
 
 			r.recordRegistrationSuccess(dimValPeerRedispatch)
 			return nil
@@ -2373,7 +2455,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		r.mu.Lock()
 		// Clean up old registration peer if exists (re-registration case)
 		if r.registrationPeer != nil && r.registrationPeer.PublicKeyBase64() != serverPeer.PublicKeyBase64() {
-			r.ac.device.RemovePeerByAddress(r.registrationPeer.PublicKeyBase64(), r.registrationPeer.Host())
+			r.removeAssignmentPeer(r.registrationPeer)
 		}
 		r.registrationPeer = serverPeer
 
@@ -2395,30 +2477,34 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		r.assignedServers = []*AssignedServer{assignedServer}
 		newServers := r.assignedServers
 
-		// Hold r.mu across reconcile. Cost analysis (cr round-38):
-		// reconcileDevicePeers does at most len(priorServers) ×
-		// RemovePeerByAddress device-pool calls (each O(1) under
-		// peerMapMutex), so for typical N≈3 the lock-held window is a
-		// few µs of RLock-reader blocking. Releasing the lock here
-		// (the previous shape) admitted an "orphan-until-process-restart"
-		// hole on a racing HandleRedispatch — strictly worse than
-		// blocking three readers for µs.
+		// Hold r.mu across the bounded in-memory reconcile so Stop and readers
+		// cannot observe a half-installed direct assignment. No network wait
+		// occurs in this section.
 		//
-		// serverPeer was added to the device pool earlier in this
-		// response path, so reconcile sees the post-AddPeer state and
+		// serverPeer was offered to the device pool earlier in this
+		// response path, so reconcile sees any admitted post-add state and
 		// only evicts addresses that genuinely retired between the prior
 		// assignment and the new one.
 		//
-		// Direct-AAK is authoritative. NHP_AAK from a registration
-		// server is the canonical answer to "where is this AC assigned
-		// now"; sibling-installed peers from a partial-redispatch
-		// in-flight at NHP_AAK arrival time are evicted by design (not
-		// merged additively). If a future operator sees
-		// MetricReconcileOverlap correlate with multi-target →
-		// single-target collapses on the direct-AAK path, that is the
-		// expected shape — the multi-target redispatch's peers are
-		// retired in favor of the AAK's authoritative single assignment.
+		// Direct-AAK is authoritative. transitionMu ensures any sibling
+		// assignment response completes before this single-target replacement
+		// starts, so transitions cannot partially overwrite one another.
+		r.trackAssignmentPeer(serverPeer)
 		r.reconcileDevicePeers(priorServers, newServers)
+		// The direct peer was first offered before the authoritative set was
+		// known. If stale shared-key members had already filled PeerGroup,
+		// that admission was refused. Try again after reconcile drains stale
+		// owned members; a group still filled by active/static peers cannot be
+		// evicted safely, so fail instead of publishing an unreachable peer.
+		if !r.ac.device.TryAddPeer(serverPeer) {
+			r.assignedServers = nil
+			if r.registrationPeer == serverPeer {
+				r.registrationPeer = nil
+			}
+			r.untrackAssignmentPeer(serverPeer)
+			r.mu.Unlock()
+			return fmt.Errorf("direct assignment peer group remained at capacity for %s", serverPeer.Host())
+		}
 		r.mu.Unlock()
 
 		log.Info("Set server as assignedServer for keepalive: %s:%d", udpAddr.IP.String(), udpAddr.Port)
@@ -2434,7 +2520,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		return nil
 
 	default:
-		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
+		r.removeTransientPeer(registrationPeer)
 		return fmt.Errorf("unexpected response type: %s", core.HeaderTypeToString(ppd.HeaderType))
 	}
 }
@@ -2542,25 +2628,30 @@ func (r *ACRegistration) filterRedispatchTargets(targets []common.RedirectTarget
 // → a new startRegistration cycle, which again lands in entry
 // point 1 or 2 above — not a distinct path.
 //
-// Returns ErrRegistrationStopped after Stop has begun teardown (#1657);
-// callers should errors.Is(err, ErrRegistrationStopped) to discriminate
-// the post-stop case from genuine redispatch errors. See udpac.go::Stop
-// for the ordering rationale. The gate fences this function's own
-// state mutations and goroutine spawns; callers may have already
-// performed side effects (e.g., handleRegistrationResponse's NHP_ARD
-// branch removes the registration peer before reaching here) — those
-// are the desired teardown behaviors and not gated by
-// ErrRegistrationStopped.
-//
-// A goroutine that reads r.stopped == false just before Stop's Swap
-// can still pass the gate. The fallout is bounded: connectToServer's
-// downstream goroutines exit on r.stopCh, so no panic; r.assignedServers
-// may be repopulated post-Stop and any peers AddPeer'd in that window
-// stay in the device peer map until process GC. core.Device.Stop's
-// "tolerant of concurrent AddPeer" contract is load-bearing for the
-// in-flight wg-tracked goroutines that #1655 introduced; the structural
-// fence for the in-flight TOCTOU is tracked in #1670.
+// Returns ErrRegistrationStopped after Stop has established its atomic stop
+// fence. A pre-fence transition observes stopCh and unwinds before Stop's final
+// cleanup; a post-fence transition observes stopped after taking transitionMu
+// and cannot repopulate assignment or device state.
 func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error {
+	return r.handleRedispatch(ardMsg, nil)
+}
+
+// handleRedispatch optionally protects the response's registration peer while
+// reconciling the assigned server set. handleRedispatchLocked also snapshots
+// pendingRegistrationPeer, so ordinary out-of-band NHP_ARD calls cannot evict
+// an NLB peer whose AOL response is still pending.
+func (r *ACRegistration) handleRedispatch(ardMsg *common.ACRedispatchMsg, registrationPeer *core.UdpPeer) error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	if r.afterRedispatchTransitionLock != nil {
+		r.afterRedispatchTransitionLock()
+	}
+	return r.handleRedispatchLocked(ardMsg, registrationPeer)
+}
+
+// handleRedispatchLocked applies one authoritative assignment while the caller
+// holds transitionMu.
+func (r *ACRegistration) handleRedispatchLocked(ardMsg *common.ACRedispatchMsg, registrationPeer *core.UdpPeer) error {
 	if r.stopped.Load() {
 		return ErrRegistrationStopped
 	}
@@ -2588,7 +2679,7 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 
 	r.mu.Lock()
 	// Snapshot the previous assignment so we can reconcile the device peer
-	// pool after the new connections are established. Each HandleRedispatch
+	// pool before the new connections are established. Each HandleRedispatch
 	// creates fresh *AssignedServer structs, so the old slice is independent
 	// of the new — connectToServer mutates only the new structs.
 	priorServers := r.assignedServers
@@ -2601,6 +2692,30 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		log.Info("Assigned server %d: %s:%d (AZ=%s)", i, target.Address(), target.Port, target.AZ)
 	}
 	serversToConnect := r.assignedServers
+	pendingRegistrationPeer := r.pendingRegistrationPeer
+	r.mu.Unlock()
+
+	// Retire peers that are absent from the new authoritative assignment before
+	// adding its members. Shared-key server fleets use a bounded PeerGroup; if
+	// stale members fill that group, AddPeer refuses the new live members and
+	// their replies fail address validation. The active-set check preserves any
+	// address that remains assigned, so this ordering frees only retired slots.
+	preconnectEvicted := r.reconcileDevicePeers(
+		priorServers,
+		serversToConnect,
+		registrationPeer,
+		pendingRegistrationPeer,
+	)
+
+	// The new authoritative assignment supersedes any retained direct-AAK
+	// response peer that is not the response path currently protected by this
+	// transition. Clear it before network waits so an all-failed redispatch does
+	// not leave a side reference to a peer the ownership sweep already retired.
+	r.mu.Lock()
+	if r.registrationPeer != nil && r.registrationPeer != registrationPeer {
+		r.removeAssignmentPeer(r.registrationPeer)
+		r.registrationPeer = nil
+	}
 	r.mu.Unlock()
 
 	// Connect to all assigned servers concurrently. Each connection has its own
@@ -2612,6 +2727,10 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		go func(s *AssignedServer) {
 			defer connectWg.Done()
 			if err := r.connectToServer(s); err != nil {
+				if errors.Is(err, ErrRegistrationStopped) || r.stopped.Load() {
+					log.Debug("AC stopping during assigned-server connection to %s: %v", s.Target.Address(), err)
+					return
+				}
 				log.Warning("Failed to connect to assigned server %s: %v", s.Target.Address(), err)
 
 				// Track individual connection failures for alerting on partial connectivity.
@@ -2622,6 +2741,13 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		}(server)
 	}
 	connectWg.Wait()
+	// stopCh cancellation and a response can become ready together. Even if the
+	// response branch won that select, do not publish connection or registration
+	// success after Stop established the lifecycle fence; Stop performs the final
+	// peer cleanup after this transition releases transitionMu.
+	if r.stopped.Load() {
+		return ErrRegistrationStopped
+	}
 
 	// Fail if no connections succeeded — AC would be unreachable.
 	// Evict prior peers anyway: none of the new connects succeeded, so no
@@ -2631,28 +2757,26 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 	// skips them via srv.Peer == nil, and the genuinely-retired peers
 	// would be orphaned in the device pool — unreachable from any code
 	// path, not just skipped. Pass nil newServers so the active-set check
-	// evicts the whole prior set, restoring the invariant Stop()'s comment
-	// relies on (assignedServers is the only place peers are referenced).
+	// evicts the whole prior set; the ownership map provides the final sweep for
+	// any dynamic peer that is no longer reachable through assignedServers.
 	//
-	// Overlap-family note: this nil-newServers reconcile makes every prior
-	// eligible for removal, which widens the window for the address-aliasing
-	// race documented in reconcileDevicePeers' doc comment — a sibling
-	// redispatch's just-AddPeer'd shared-pubkey peer at a prior's address
-	// can be collateral-evicted (PeerGroup.RemoveMember matches by address;
-	// the LookupPeer defense covers only the non-PeerGroup branch). Same
-	// MetricReconcileOverlap signal applies; #1682 is the structural fix.
-	// Bump MetricNilNewServersReconcile separately so soak observation can
-	// answer whether all-fail entries dominate the overlap signal during
-	// partial-outage incidents.
+	// transitionMu keeps sibling authoritative responses outside this cleanup.
+	// MetricNilNewServersReconcile records that the all-fail branch did work.
 	if successCount == 0 {
 		// nil newServers → activeKeys is empty → every prior is removal-
 		// eligible. The active-set check trivially fails, the LookupPeer
 		// defense still runs, and reconcile evicts the whole prior set.
-		// MetricNilNewServersReconcile is emitted from reconcileDevicePeers
-		// itself when nil newServers actually evicts at least one prior —
-		// using the same race-clean .Peer snapshot the loop already takes
-		// (cr round-38 #3: avoids a duplicate racy scan here).
-		r.reconcileDevicePeers(priorServers, nil)
+		// Combine the race-clean results from the pre-connect prune and this
+		// all-priors cleanup. Emit once when either pass did real work.
+		allFailEvicted := r.reconcileDevicePeers(
+			priorServers,
+			nil,
+			registrationPeer,
+			pendingRegistrationPeer,
+		)
+		if preconnectEvicted || allFailEvicted {
+			r.metrics.IncrCounterWithDims(MetricNilNewServersReconcile, []types.Dimension{r.acIdDimension()})
+		}
 		return errors.New("failed to connect to any assigned servers")
 	}
 
@@ -2663,15 +2787,20 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		log.Info("Successfully connected to all %d assigned servers", successCount)
 	}
 
-	// Reconcile the device peer pool: remove any (pubkey, address) entries that
-	// were in the prior assignment but are not in the new one. Synchronous and
-	// without a grace period — see reconcileDevicePeers and #1680 for why.
-	r.reconcileDevicePeers(priorServers, serversToConnect)
-
 	// Send server connections metric
 	r.metrics.AddCounterWithDims(MetricServerConnections, float64(successCount), []types.Dimension{
 		{Name: dimNameConnectionType, Value: dimValRedispatch},
 	})
+
+	// Success also retires the response path protected by an embedded-peers AAK.
+	// Its caller exact-removes the same pointer after this returns; this cleanup
+	// handles the case where it was already retained in registrationPeer.
+	r.mu.Lock()
+	if r.registrationPeer != nil {
+		r.removeAssignmentPeer(r.registrationPeer)
+		r.registrationPeer = nil
+	}
+	r.mu.Unlock()
 
 	return nil
 }
@@ -2701,14 +2830,16 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	}
 
 	// Add peer to device
-	r.ac.device.AddPeer(peer)
+	if !r.addAssignmentPeer(peer) {
+		return fmt.Errorf("peer group at capacity for assigned server %s", server.Target.Address())
+	}
 	server.Peer = peer
 
 	// Send NHP_AOL to register with this server (use cached bytes)
 	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
 	udpAddr, ok := sendAddr.(*net.UDPAddr)
 	if !ok {
-		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+		r.removeAssignmentPeer(peer)
 		return fmt.Errorf("unexpected address type %T for server %s", sendAddr, server.Target.Address())
 	}
 	md := &core.MsgData{
@@ -2729,11 +2860,17 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 		// other reconcile path picks it up because it's on a fresh
 		// pubkey not in priorServers). Closes the leak that was
 		// pre-existing but reachability-amplified by this PR.
-		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+		r.removeAssignmentPeer(peer)
 		server.Peer = nil
 		return errors.New("AC not running")
 	}
-	r.ac.sendMsgCh <- md
+	select {
+	case <-r.stopCh:
+		r.removeAssignmentPeer(peer)
+		server.Peer = nil
+		return ErrRegistrationStopped
+	case r.ac.sendMsgCh <- md:
+	}
 
 	// Wait for NHP_AAK response with timeout
 	// Note: We don't close ResponseMsgCh here because the sender (in another goroutine)
@@ -2741,34 +2878,34 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	// and the channel will be garbage collected when no longer referenced.
 	select {
 	case <-r.stopCh:
-		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+		r.removeAssignmentPeer(peer)
 		server.Peer = nil
-		return errors.New("connection canceled")
+		return ErrRegistrationStopped
 	case <-time.After(ConnectionTimeout):
-		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+		r.removeAssignmentPeer(peer)
 		server.Peer = nil
 		return fmt.Errorf("connection to %s timed out", server.Target.Address())
 	case ppd := <-md.ResponseMsgCh:
 		if ppd.Error != nil {
-			r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+			r.removeAssignmentPeer(peer)
 			server.Peer = nil
 			return fmt.Errorf("connection failed: %w", ppd.Error)
 		}
 		if ppd.HeaderType != core.NHP_AAK {
-			r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+			r.removeAssignmentPeer(peer)
 			server.Peer = nil
 			return fmt.Errorf("unexpected response type: %s", core.HeaderTypeToString(ppd.HeaderType))
 		}
 
 		var aakMsg common.ServerACAckMsg
 		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
-			r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+			r.removeAssignmentPeer(peer)
 			server.Peer = nil
 			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
 		}
 
 		if !common.IsSuccessErrCode(aakMsg.ErrCode) {
-			r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+			r.removeAssignmentPeer(peer)
 			server.Peer = nil
 			return fmt.Errorf("server rejected: %s - %s", aakMsg.ErrCode, aakMsg.ErrMsg)
 		}
@@ -3536,32 +3673,34 @@ func (r *ACRegistration) checkPeriodicNLBReregistration() {
 	r.TriggerReregistration(ReasonPeriodicNLBRefresh)
 }
 
-// recordReconcileEntry increments the in-flight counter at the point where
-// reconcileDevicePeers begins mutating peer-pool state and returns the
-// matching exit hook to defer. inFlight > 1 emits MetricReconcileOverlap —
-// the orphan-precondition documented on reconcileDevicePeers.
-//
-// Called from inside reconcileDevicePeers (not from its callers), so every
-// reconcile call site contributes to the same family-wide signal. A future
-// third call site that goes through reconcileDevicePeers gets the metric
-// for free; a future reconcile bypass that doesn't would silently miss it.
+// recordReconcileEntry detects violations of the transitionMu serialization
+// invariant. It lives inside reconcileDevicePeers so future internal call sites
+// cannot silently omit the signal.
 //
 // Use as:
 //
 //	exit := r.recordReconcileEntry()
 //	defer exit()
 func (r *ACRegistration) recordReconcileEntry() func() {
-	// entrants is the count AFTER our increment, including ourselves.
-	// We're an overlap-causing entrant when entrants > 1 (i.e., at
-	// least one other reconcile was already in flight when we arrived).
-	// Off-by-one trap to watch for: a future refactor that switches to
-	// CompareAndSwap or pre-increment-compare must keep the
-	// "we're the second-or-later entrant" semantic, not "we observed
-	// any other entrant at any point."
+	// entrants includes this call; the second and later concurrent entrants
+	// each emit one invariant-violation event.
 	if entrants := r.reconcileInFlight.Add(1); entrants > 1 {
 		r.metrics.IncrCounterWithDims(MetricReconcileOverlap, []types.Dimension{r.acIdDimension()})
 	}
 	return func() { r.reconcileInFlight.Add(-1) }
+}
+
+// formatActiveKey frames a public key and endpoint without ambiguous field
+// boundaries. It uses \x00 as the field separator. PubKeyBase64 is RFC 4648
+// base64 (alphabet [A-Za-z0-9+/=]) so "|" would also work, but Hostname is
+// not similarly constrained — a future test/regression injecting a hostname
+// containing "|" would ambiguate "k|host|with|pipes:port" vs
+// "k|host:port|with|pipes". The null-byte separator is unambiguous against
+// any printable input and matches the convention buildDimCounterKey uses in
+// endpoints/metrics. net.JoinHostPort separately frames address and port,
+// including bracketed IPv6 literals.
+func formatActiveKey(pubKeyBase64, addr string, port int) string {
+	return fmt.Sprintf("%s\x00%s", pubKeyBase64, net.JoinHostPort(addr, strconv.Itoa(port)))
 }
 
 // targetActiveKey returns a canonical (pubkey, address) key for active-set
@@ -3569,13 +3708,9 @@ func (r *ACRegistration) recordReconcileEntry() func() {
 //
 // Contract. Keys on RedirectTarget.IP (preferred) or Hostname; both prior
 // and new sets are keyed consistently because RedirectTarget.Validate (#832)
-// requires one of them. PeerGroup.RemoveMember matches on
-// m.Ip == addr || m.Host() == addr; passing peer.Host() at remove time
-// (which prefers Hostname when set and includes the port suffix as
-// "host:port") resolves the correct member via the m.Host() == addr branch.
-// The m.Ip == addr branch does not fire for typical peers because m.Ip is
-// the IP without a port and peer.Host() includes one — the load-bearing
-// match is m.Host() == addr.
+// requires one of them. net.JoinHostPort frames the endpoint so IPv6 address
+// and port tuples cannot collide. udpPeerActiveKey uses the identical framing
+// for actual Device members and assignment-ownership bookkeeping.
 //
 // INVARIANT: callers must ensure both prior and new targets have IP
 // populated. RedirectTarget.Validate (#832) requires IP specifically and
@@ -3618,36 +3753,160 @@ func targetActiveKey(t common.RedirectTarget) (key string, sentinel bool) {
 		addr = "<unaddressed>"
 		sentinel = true
 	}
-	// Use \x00 as the field separator. PubKeyBase64 is RFC 4648 base64
-	// (alphabet [A-Za-z0-9+/=]) so "|" would also work, but Hostname is
-	// not similarly constrained — a future test/regression injecting a
-	// hostname containing "|" would ambiguate "k|host|with|pipes:port"
-	// vs "k|host:port|with|pipes" (cr round-38 #8). The null-byte
-	// separator is unambiguous against any printable input and matches
-	// the convention buildDimCounterKey uses in endpoints/metrics.
-	key = fmt.Sprintf("%s\x00%s:%d", t.PubKeyBase64, addr, t.Port)
+	key = formatActiveKey(t.PubKeyBase64, addr, t.Port)
 	return key, sentinel
 }
 
-// reconcileDevicePeers removes from the device cipher pool the
-// (pubkey, address) entries present in priorServers but absent from
-// newServers. Called synchronously from HandleRedispatch after the new
-// connections have been established.
+func udpPeerActiveKey(peer *core.UdpPeer) string {
+	addr := peer.Ip
+	if addr == "" {
+		addr = peer.Hostname
+	}
+	if addr == "" {
+		addr = "<unaddressed>"
+	}
+	return formatActiveKey(peer.PublicKeyBase64(), addr, peer.Port)
+}
+
+func (r *ACRegistration) trackAssignmentPeer(peer *core.UdpPeer) {
+	if peer == nil {
+		return
+	}
+	r.assignmentPeersMu.Lock()
+	defer r.assignmentPeersMu.Unlock()
+	if r.assignmentPeers == nil {
+		r.assignmentPeers = make(map[string]*core.UdpPeer)
+	}
+	r.assignmentPeers[udpPeerActiveKey(peer)] = peer
+}
+
+func (r *ACRegistration) untrackAssignmentPeer(peer *core.UdpPeer) {
+	if peer == nil {
+		return
+	}
+	r.assignmentPeersMu.Lock()
+	defer r.assignmentPeersMu.Unlock()
+	key := udpPeerActiveKey(peer)
+	if r.assignmentPeers[key] == peer {
+		delete(r.assignmentPeers, key)
+	}
+}
+
+func (r *ACRegistration) assignmentPeersSnapshot() map[string]*core.UdpPeer {
+	r.assignmentPeersMu.Lock()
+	defer r.assignmentPeersMu.Unlock()
+	out := make(map[string]*core.UdpPeer, len(r.assignmentPeers))
+	for key, peer := range r.assignmentPeers {
+		out[key] = peer
+	}
+	return out
+}
+
+func (r *ACRegistration) staticServerActiveKeys() map[string]struct{} {
+	keys := make(map[string]struct{})
+	if r.ac == nil {
+		return keys
+	}
+	r.ac.serverPeerMutex.RLock()
+	defer r.ac.serverPeerMutex.RUnlock()
+	if r.ac.config != nil {
+		for _, peer := range r.ac.config.Servers {
+			if peer != nil {
+				keys[udpPeerActiveKey(peer)] = struct{}{}
+			}
+		}
+	}
+	for _, peer := range r.ac.serverPeerMap {
+		if peer != nil {
+			keys[udpPeerActiveKey(peer)] = struct{}{}
+		}
+	}
+	return keys
+}
+
+// staticServerPeerForActiveKeyLocked returns the configured static pointer for
+// key. The caller holds serverPeerMutex.
+func (r *ACRegistration) staticServerPeerForActiveKeyLocked(key string) *core.UdpPeer {
+	if r.ac.config != nil {
+		for _, peer := range r.ac.config.Servers {
+			if peer != nil && udpPeerActiveKey(peer) == key {
+				return peer
+			}
+		}
+	}
+	for _, peer := range r.ac.serverPeerMap {
+		if peer != nil && udpPeerActiveKey(peer) == key {
+			return peer
+		}
+	}
+	return nil
+}
+
+// removePeerPreservingStatic exact-removes a dynamic peer and atomically
+// restores any currently configured same-key, same-address static pointer.
+// Holding serverPeerMutex through the Device operation keeps config reloads
+// from changing the chosen pointer, while Device's atomic replacement keeps a
+// sibling connection attempt from consuming the freed group slot.
+func (r *ACRegistration) removePeerPreservingStatic(peer *core.UdpPeer) bool {
+	if peer == nil || r.ac == nil {
+		return false
+	}
+	key := udpPeerActiveKey(peer)
+	r.ac.serverPeerMutex.RLock()
+	replacement := r.staticServerPeerForActiveKeyLocked(key)
+	removed := r.ac.device.RemovePeerInstanceAndRestore(peer, replacement)
+	r.ac.serverPeerMutex.RUnlock()
+	return removed
+}
+
+func (r *ACRegistration) removeTransientPeer(peer *core.UdpPeer) bool {
+	return r.removePeerPreservingStatic(peer)
+}
+
+func (r *ACRegistration) addAssignmentPeer(peer *core.UdpPeer) bool {
+	if !r.ac.device.TryAddPeer(peer) {
+		return false
+	}
+	r.trackAssignmentPeer(peer)
+	return true
+}
+
+func (r *ACRegistration) removeAssignmentPeer(peer *core.UdpPeer) bool {
+	if peer == nil {
+		return false
+	}
+	removed := r.removePeerPreservingStatic(peer)
+	r.untrackAssignmentPeer(peer)
+	return removed
+}
+
+// reconcileDevicePeers converges the device cipher pool to newServers plus any
+// explicitly protected in-flight registration peers and statically configured
+// server endpoints. For shared-key
+// PeerGroups it walks the actual members rather than only priorServers, but it
+// removes only exact pointers owned by this registration manager. That closes
+// #2123's rotating-subset accumulation without evicting static/config peers
+// sharing the key. HandleRedispatch calls this before
+// establishing the new connections so retired members cannot consume the
+// bounded PeerGroup slots needed by the new assignment. The direct-AAK path
+// calls it after installing its single new peer while holding r.mu. It reports
+// whether the pass attempted at least one removal from the device pool.
 //
 // Behavior. Two invariants keep this safe with the *core.PeerGroup model
 // that ASGs with shared keypairs land in (issue #1680):
 //
-//  1. Set difference. Only addresses that are NOT in newServers are
-//     candidates for removal. An address that re-appears in the new
-//     assignment is skipped here, preventing the previous async cleanup's
-//     self-inflicted eviction loop.
+//  1. Set difference. Only addresses that are NOT in newServers, are not a
+//     protected registration peer, and are not statically configured are
+//     candidates for removal. An address that re-appears in the new assignment
+//     is skipped here, preventing the previous async cleanup's self-inflicted
+//     eviction loop.
 //
-//  2. Order. connectToServer (which calls device.AddPeer for each new
-//     target) runs BEFORE this function. Addresses removed here are
-//     therefore addresses that have NOT been re-AddPeer'd in this
-//     redispatch — the *UdpPeer member sitting at that address inside
-//     the PeerGroup is still the prior one, so RemovePeerByAddress
-//     evicts the correct peer.
+//  2. Order. HandleRedispatch removes retired addresses BEFORE
+//     connectToServer calls device.AddPeer for the new targets. This prevents
+//     stale shared-key members from filling PeerGroup to MaxPeerGroupSize and
+//     starving live replacements. The active-set check above preserves every
+//     address present in the new assignment. The direct-AAK caller adds its
+//     single new peer first; the same active-set check preserves that address.
 //
 // Replaces the previous oldServerSets + 2-minute-grace-period cleanupWorker.
 // The grace period was non-load-bearing (the only packets that could rely
@@ -3655,102 +3914,60 @@ func targetActiveKey(t common.RedirectTarget) (key string, sentinel bool) {
 // validation outcome no longer affects the user-facing flow), so deleting
 // the async machinery removes a bug surface without changing behavior.
 //
-// Concurrency: overlap windows.
+// Concurrency. Every production caller holds transitionMu across the complete
+// authoritative transition: assignment swap, reconcile, network connects, and
+// final cleanup. That serialization makes the Members snapshot and removals
+// atomic with respect to sibling assignment responses without holding r.mu
+// across network waits. A non-zero MetricReconcileOverlap means a future or
+// internal caller bypassed this contract and is an invariant violation.
 //
-// In the rare case where a second
-// redispatch starts and finishes its reconcile while the first redispatch's
-// connectToServer is still running, the first's late AddPeer can reintroduce
-// a peer at an address the second redispatch had just removed. The resulting
-// orphan sits in the device peer pool with no live AssignedServer pointing
-// at it; nothing routes traffic to it, and the next non-overlapping
-// redispatch evicts it via this function's normal delta path. The symmetric
-// failure is also possible: between this function's targetActiveKey
-// enumeration and its RemovePeerByAddress call, a sibling redispatch can
-// AddPeer at the to-be-removed address — and we then evict that fresh peer.
-// connectToServer's own failure path (AddPeer-then-RemovePeerByAddress on
-// timeout/error) admits the same family of races against a sibling's fresh
-// AddPeer at the same address. All three are the original incident's
-// pointer-aliasing failure mode in miniature; fully eliminating them
-// requires (pubkey, address) tuple identity in core.Device (tracked in
-// #1682), so a non-zero MetricReconcileOverlap rate is the signal for the
-// whole family — not just orphans from this function. Acceptable given
-// that re-registration is gated by reregistering.CompareAndSwap, so
-// HandleRedispatch overlap requires an out-of-band NHP_ARD landing during
-// an in-progress register cycle. Direct-AAK ↔ direct-AAK overlap (two
-// NHP_AAK responses arriving in quick succession) is gated only by network
-// arrival ordering — not by the CAS, which sits on TriggerReregistration
-// rather than the response handler. MetricReconcileOverlap covers both.
-//
-// Concurrency: single-peer branch hazard.
-//
-// core.Device.RemovePeerByAddress's single-peer (non-PeerGroup)
-// branch ignores the addr argument and unconditionally deletes peerMap[K].
-// Under the documented overlap precondition, this means a sibling's just-
-// AddPeer'd single peer at K can be wholesale evicted when this function
-// thinks it's removing the prior K|A — the active-set check above
-// prevents the in-set case but cannot rescue the cross-redispatch race.
-// Tightening that branch to honor addr is part of #1682's tuple-identity
-// surface.
-//
-// Concurrency: field reads under overlap.
-//
-// reconcileDevicePeers reads Target on both priorServers and
-// newServers (immutable after AssignedServer construction in
-// HandleRedispatch), and reads .Peer on priorServers for the
-// RemovePeerByAddress call. Under the documented HandleRedispatch overlap
-// precondition a sibling redispatch's connectToServer can still be writing
-// .Peer on those structs — the read here is intentionally racy in that
-// rare case (the AssignedServer.Peer field-locking question is tracked in
-// #1670). MetricReconcileOverlap surfaces the precondition; if it fires
-// in production, #1670 / #1682 are the structural fixes.
-//
-// priorServers' .Peer fields are also read after handleRegistrationResponse's
-// pre-existing registrationPeer cleanup may have mutated peerMap entries
-// under r.mu; the .Peer reads here are of immutable fields on *core.UdpPeer
-// (PublicKeyBase64, Host()), not of peerMap state, so the device-side
-// cleanup above does not invalidate the captured pointers — the cleanup
-// only changes what's *in* the device pool, not what those pointers refer
-// to.
-//
-// Failure shapes: partial-success / address-aliasing.
-//
-// When HandleRedispatch's
-// connectToServer fails on a target whose address aliases a prior server,
-// connectToServer's failure path calls RemovePeerByAddress on the new
-// peer's pubkey/host — which is the same address as the prior under
-// shared pubkey, so the prior is collateral-evicted. Reconcile here then
-// sees activeKeys including that address (the new entry is in
-// serversToConnect regardless of connect success) and skips the prior,
-// so the device pool ends up missing both peers. Bounded by the next
-// non-overlapping cycle; same family the overlap doc describes; #1688
-// is the right place to track the fix once test-harness work supports
-// driving the partial-failure path deterministically.
-func (r *ACRegistration) reconcileDevicePeers(priorServers, newServers []*AssignedServer) {
-	if len(priorServers) == 0 {
-		// Empty priors → nothing to evict. MetricReconcileOverlap is an
-		// orphan-precondition signal (concurrent reconciles that *could*
-		// evict — i.e., have priors), not a generic data-race detector;
-		// a reconcile with no priors cannot be the orphan-creator, so
-		// returning here without bumping the counter keeps the metric's
-		// semantics tight. cr round-38 #2: the previously-hoisted
-		// recordReconcileEntry produced fleet-warmup baseline noise on
-		// cold-start ACs without adding coverage (the racing
-		// connectToServer-vs-sibling-reconcile case is caught by the
-		// SIBLING reconcile's own entry, not by this empty-prior one).
-		return
+// RemovePeerInstanceAndRestore performs the pointer check and optional static
+// restoration atomically under Device's map lock. A config reload that replaces
+// the same key and address between the Members snapshot and removal is therefore
+// preserved.
+func (r *ACRegistration) reconcileDevicePeers(priorServers, newServers []*AssignedServer, protectedPeers ...*core.UdpPeer) bool {
+	ownedPeers := r.assignmentPeersSnapshot()
+	if len(priorServers) == 0 && len(newServers) == 0 && len(protectedPeers) == 0 && len(ownedPeers) == 0 {
+		// No assignment, protected peer, or retained ownership describes a
+		// public key to inspect.
+		return false
 	}
 
-	// Track concurrent reconcile entries — the orphan precondition for the
-	// whole bug family this function admits. Wired here (not at the
-	// HandleRedispatch / handleRegistrationResponse callers) so every
-	// reconcile call site contributes to MetricReconcileOverlap, including
-	// the realistic HandleRedispatch ↔ direct-AAK overlap that an
-	// out-of-band NHP_ARD landing during a register cycle produces.
-	exitReconcile := r.recordReconcileEntry()
-	defer exitReconcile()
+	// Production call sites are serialized by transitionMu. Keep the detector
+	// here so a future internal bypass is observable rather than silently unsafe.
+	if len(priorServers) > 0 {
+		exitReconcile := r.recordReconcileEntry()
+		defer exitReconcile()
+	}
 	var unaddressedNew, unaddressedPrior int
-	var anyEvicted bool // tracks whether any prior was actually RemovePeerByAddress'd; gates MetricNilNewServersReconcile
-	activeKeys := make(map[string]struct{}, len(newServers))
+	var anyEvicted bool
+	activeKeys := make(map[string]struct{}, len(newServers)+len(protectedPeers))
+	sweepKeys := make(map[string][]byte, len(newServers)+len(priorServers))
+	priorPeers := make(map[string]*core.UdpPeer, len(priorServers))
+	addSweepKey := func(pubKeyBase64 string) {
+		if pubKeyBase64 == "" {
+			return
+		}
+		if _, ok := sweepKeys[pubKeyBase64]; ok {
+			return
+		}
+		pubKey, err := base64.StdEncoding.DecodeString(pubKeyBase64)
+		if err != nil {
+			log.Debug("Skipping AC peer sweep for invalid public key prefix %s", pubKeyPrefix(pubKeyBase64))
+			return
+		}
+		sweepKeys[pubKeyBase64] = pubKey
+	}
+	// Ownership, rather than only the current/prior assignment slices, is the
+	// complete set of dynamic peers this manager may need to retire. In
+	// particular, direct AAK can retain an unaddressed peer outside
+	// assignedServers; a later redispatch under a different public key must still
+	// sweep it.
+	for _, peer := range ownedPeers {
+		if peer != nil {
+			addSweepKey(peer.PublicKeyBase64())
+		}
+	}
 	for _, srv := range newServers {
 		if srv == nil {
 			continue
@@ -3760,22 +3977,73 @@ func (r *ACRegistration) reconcileDevicePeers(priorServers, newServers []*Assign
 			unaddressedNew++
 		}
 		activeKeys[k] = struct{}{}
+		addSweepKey(srv.Target.PubKeyBase64)
+	}
+	for _, peer := range protectedPeers {
+		if peer == nil {
+			continue
+		}
+		activeKeys[udpPeerActiveKey(peer)] = struct{}{}
+		addSweepKey(peer.PublicKeyBase64())
+	}
+	for key := range r.staticServerActiveKeys() {
+		activeKeys[key] = struct{}{}
 	}
 	for _, srv := range priorServers {
 		if srv == nil {
 			continue
 		}
-		// Single-load .Peer into a local. On the direct-AAK reconcile
-		// path priorServers shares the same *AssignedServer pool a
-		// still-running sibling HandleRedispatch.connectToServer may
-		// be writing .Peer into (the failure path nils server.Peer).
-		// A nil-check on srv.Peer followed by srv.Peer.PublicKey()
-		// would crash on a sibling write of nil between check and
-		// dereference. Snapshot the pointer here so the rest of the
-		// loop body is consistent regardless of concurrent writes.
-		// Structural fix is field-level locking on AssignedServer.Peer
-		// via #1715 / #1670; this local-load is the minimum defense
-		// for the immediate nil-deref hazard (cr round-31 #3).
+		addSweepKey(srv.Target.PubKeyBase64)
+		if srv.Peer != nil {
+			priorPeers[udpPeerActiveKey(srv.Peer)] = srv.Peer
+		}
+	}
+
+	// A priorServers delta cannot see members forgotten by earlier rotating
+	// assignment epochs. Sweep the actual PeerGroup membership for every key
+	// touched by this reconcile before falling back to the single-peer-safe
+	// prior loop below. The authoritative active set, not address age, decides
+	// retention; holding stale members for MinimalPeerAddressHoldTime would
+	// recreate the capacity starvation this path exists to prevent.
+	sweptGroups := make(map[string]struct{})
+	for pubKeyBase64, pubKey := range sweepKeys {
+		group, ok := r.ac.device.LookupPeer(pubKey).(*core.PeerGroup)
+		if !ok {
+			continue
+		}
+		sweptGroups[pubKeyBase64] = struct{}{}
+		for _, member := range group.Members() {
+			key := udpPeerActiveKey(member)
+			if owned := ownedPeers[key]; owned != nil && owned != member {
+				// An exact-key replacement proves the older owned pointer is no
+				// longer in Device; retire its bookkeeping without touching the
+				// replacement.
+				r.untrackAssignmentPeer(owned)
+				delete(ownedPeers, key)
+			}
+			if _, active := activeKeys[key]; active {
+				continue
+			}
+			// Device also holds static/config peers. Remove only an exact pointer
+			// installed by this registration manager (including the captured
+			// prior assignment for upgrade/test compatibility). Pointer-aware
+			// removal preserves a same-address config-reload replacement.
+			if ownedPeers[key] != member && priorPeers[key] != member {
+				continue
+			}
+			if r.removeAssignmentPeer(member) {
+				log.Info("Removed unassigned AC-owned peer-group member %s", member.Host())
+				anyEvicted = true
+			}
+			delete(ownedPeers, key)
+		}
+	}
+	for _, srv := range priorServers {
+		if srv == nil {
+			continue
+		}
+		// Snapshot once so the nil check and later device operations use the
+		// same assignment peer.
 		peer := srv.Peer
 		if peer == nil {
 			continue
@@ -3794,51 +4062,30 @@ func (r *ACRegistration) reconcileDevicePeers(priorServers, newServers []*Assign
 		if _, active := activeKeys[k]; active {
 			continue
 		}
-		// Defense against core.Device.RemovePeerByAddress's single-peer
-		// (non-PeerGroup) branch ignoring addr: if the device's current
-		// entry for this pubkey is a *UdpPeer that is NOT the one we
-		// captured at snapshot time, a concurrent AddPeer landed in the
-		// snapshot-to-reconcile window — wholesale deleting peerMap[K]
-		// would wipe that sibling's fresh peer (the original incident's
-		// bug class in miniature, but reachable without two overlapping
-		// reconciles). Skip the device call in that case.
-		//
-		// Single-peer branch only. PeerGroup entries pass through (the
-		// type assertion fails, so the !ok arm of the if leaves us
-		// proceeding to RemoveMember). RemoveMember matches by address,
-		// so under shared-pubkey ASGs (the original incident's shape)
-		// what saves us is invariant 1 — set difference — not this
-		// defense. Single-peer is protected by invariant 1 + this
-		// LookupPeer check; PeerGroup is protected by invariant 1 alone
-		// in the same-redispatch case. The cross-redispatch case
-		// (sibling AddPeer between this enumeration and its
-		// RemovePeerByAddress) is genuinely undefended on the PeerGroup
-		// branch — invariant 1 only saves you when the sibling's
-		// address is in YOUR newServers activeKeys, which it isn't in
-		// cross-redispatch. That residual is part of the overlap family
-		// surfaced by MetricReconcileOverlap; the symmetric
-		// PeerGroup-side LookupMember-style defense is tracked in #1711.
-		//
-		// TOCTOU residual on the single-peer branch too: LookupPeer
-		// releases peerMapMutex before RemovePeerByAddress re-acquires
-		// it. A sibling AddPeer landing in that gap can swap peerMap[K]
-		// to a fresh peer between our identity check and our remove —
-		// and we then evict the fresh peer. The defense closes the
-		// "swap already happened before we checked" case but not the
-		// "swap happens between check and remove" case. Same overlap
-		// family, surfaced by MetricReconcileOverlap; #1682 closes both
-		// cases by making the remove tuple-keyed and atomic.
-		current := r.ac.device.LookupPeer(peer.PublicKey())
-		if current == nil {
+		if _, swept := sweptGroups[peer.PublicKeyBase64()]; swept {
 			continue
 		}
-		if udp, ok := current.(*core.UdpPeer); ok && udp != peer {
-			log.Debug("Skipping device cleanup for retired server %s: pubkey now references a different peer", srv.Target.Address())
+		if r.removeAssignmentPeer(peer) {
+			log.Info("Removed AC-owned device peer for retired server %s", srv.Target.Address())
+			anyEvicted = true
+		}
+		delete(ownedPeers, udpPeerActiveKey(peer))
+	}
+
+	// Retire owned peers that are not reachable from priorServers. This closes
+	// the direct-AAK nil-address case and also drains bookkeeping for pointers
+	// that a same-address static/config replacement already displaced.
+	for key, peer := range ownedPeers {
+		if peer == nil {
 			continue
 		}
-		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
-		log.Info("Removed device peer for retired server %s", srv.Target.Address())
-		anyEvicted = true
+		if _, active := activeKeys[key]; active {
+			continue
+		}
+		if r.removeAssignmentPeer(peer) {
+			log.Info("Removed stale AC-owned device peer %s", peer.Host())
+			anyEvicted = true
+		}
 	}
 	// Emit one log + one metric event per reconcile pass that observed any
 	// unaddressed-sentinel target. Aggregating here keeps the signal loud on
@@ -3853,16 +4100,7 @@ func (r *ACRegistration) reconcileDevicePeers(priorServers, newServers []*Assign
 		r.metrics.AddCounterWithDims(MetricUnaddressedTarget, float64(unaddressedHits), []types.Dimension{r.acIdDimension()})
 	}
 
-	// MetricNilNewServersReconcile fires when the all-fail eviction
-	// branch (HandleRedispatch's successCount == 0 path) actually evicts
-	// at least one prior. Detected here, not at the call site, so the
-	// race-clean post-snapshot .Peer values are used and the duplicate
-	// scan in the caller is eliminated (cr round-38 #3). Branch-entry
-	// signal: one event per all-fail reconcile that did real eviction
-	// work, regardless of how many priors were evicted.
-	if newServers == nil && anyEvicted {
-		r.metrics.IncrCounterWithDims(MetricNilNewServersReconcile, []types.Dimension{r.acIdDimension()})
-	}
+	return anyEvicted
 }
 
 // CGNAT is the Carrier-Grade NAT range (100.64.0.0/10) used by some cloud providers.

@@ -74,6 +74,38 @@ func (pg *PeerGroup) RemoveMember(addr string) *UdpPeer {
 	return nil
 }
 
+// removeMemberInstance removes peer only when that exact pointer is still a
+// group member. Device uses it for ownership-aware cleanup so an address-based
+// removal cannot delete a replacement installed by another subsystem.
+func (pg *PeerGroup) removeMemberInstance(peer *UdpPeer) bool {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+
+	for i, member := range pg.members {
+		if member == peer {
+			pg.members = append(pg.members[:i], pg.members[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// replaceMemberInstance replaces peer only when that exact pointer is still a
+// group member. Device uses it to atomically restore a statically configured
+// pointer after a same-address transient peer displaced it.
+func (pg *PeerGroup) replaceMemberInstance(peer, replacement *UdpPeer) bool {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+
+	for i, member := range pg.members {
+		if member == peer {
+			pg.members[i] = replacement
+			return true
+		}
+	}
+	return false
+}
+
 // Len returns the number of members in the group.
 func (pg *PeerGroup) Len() int {
 	pg.mu.Lock()
