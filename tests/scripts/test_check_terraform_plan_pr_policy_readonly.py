@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,13 @@ DEFAULT_SSM_RESOURCES = (
     "arn:aws:ssm:${local.region}:${local.account_id}:parameter/nhp/pool/*",
     "arn:aws:ssm:${local.region}::parameter/aws/service/canonical/ubuntu/*",
 )
+EXPECTED_DIRECTCONNECT_AUDIT_ACTIONS = {
+    "directconnect:DescribeConnections",
+    "directconnect:DescribeVirtualInterfaces",
+    "directconnect:DescribeDirectConnectGateways",
+    "directconnect:DescribeDirectConnectGatewayAssociations",
+    "directconnect:DescribeDirectConnectGatewayAssociationProposals",
+}
 
 
 def hcl_string_list(values: tuple[str, ...]) -> str:
@@ -40,6 +48,22 @@ def as_list(value: object) -> list[object]:
 
 def normalized_strings(value: object) -> list[str]:
     return [unquote(item) for item in as_list(value) if isinstance(item, str)]
+
+
+def directconnect_audit_actions() -> set[str]:
+    operations: set[str] = set()
+    for relative_path in (
+        "scripts/check-control-vpc-cidr-overlap.sh",
+        "scripts/check-control-global-routing.sh",
+    ):
+        source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        operations.update(
+            re.findall(r"(?m)^\s*aws directconnect ([a-z0-9-]+)\s", source)
+        )
+    return {
+        "directconnect:" + "".join(part.capitalize() for part in operation.split("-"))
+        for operation in operations
+    }
 
 
 def find_resource_body(terraform_root: Path, resource_type: str, resource_name: str) -> dict:
@@ -802,6 +826,59 @@ class TerraformPlanPrBootstrapTests(unittest.TestCase):
         )
         self.assertNotIn("arn:aws:iam::${local.account_id}:role/nhp-*-github-actions*", resources)
         self.assertNotIn("arn:aws:iam::${local.account_id}:role/nhp-*", resources)
+
+
+class ControlRoutingApplyPolicyTests(unittest.TestCase):
+    def test_directconnect_grant_exactly_matches_audit_calls(self) -> None:
+        policy_resource = find_resource_body(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "aws_iam_policy",
+            "terraform_read",
+        )
+        policy = extract_policy_body(policy_resource.get("policy"))
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        stmt = find_policy_statement(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "terraform_read",
+            "DirectConnectRead",
+        )
+        granted_actions = set(normalized_strings(stmt.get("Action")))
+        all_directconnect_actions = {
+            action
+            for policy_stmt in policy.get("Statement", []) or []
+            if isinstance(policy_stmt, dict)
+            for action in normalized_strings(policy_stmt.get("Action"))
+            if action.startswith("directconnect:")
+        }
+        audit_actions = directconnect_audit_actions()
+
+        self.assertEqual(audit_actions, EXPECTED_DIRECTCONNECT_AUDIT_ACTIONS)
+        self.assertEqual(granted_actions, audit_actions)
+        self.assertEqual(all_directconnect_actions, audit_actions)
+        self.assertFalse(
+            any("*" in action for action in all_directconnect_actions),
+            "Control routing audit must not gain wildcard Direct Connect access",
+        )
+        self.assertEqual(unquote(stmt.get("Effect")), "Allow")
+        self.assertEqual(normalized_strings(stmt.get("Resource")), ["*"])
+        self.assertNotIn("Condition", stmt)
+        self.assertNotIn("NotAction", stmt)
+
+    def test_terraform_read_has_exact_iam_size_guard(self) -> None:
+        body = find_resource_body(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "aws_iam_policy",
+            "terraform_read",
+        )
+        lifecycle = as_list(body.get("lifecycle"))
+        self.assertEqual(len(lifecycle), 1)
+        self.assertIsInstance(lifecycle[0], dict)
+        postconditions = as_list(lifecycle[0].get("postcondition"))
+        self.assertEqual(len(postconditions), 1)
+        self.assertIsInstance(postconditions[0], dict)
+        self.assertEqual(postconditions[0].get("condition"), "${length(self.policy) <= 6144}")
+        self.assertIn("6,144-character", unquote(postconditions[0].get("error_message")))
 
 
 class ConnectorAuthorityApplyPolicyTests(unittest.TestCase):

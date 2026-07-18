@@ -1280,6 +1280,22 @@ resource "aws_iam_policy" "terraform_read" {
         Resource = "*"
       },
       {
+        # The attended Control first-apply routing audit enumerates these
+        # regional and global Direct Connect surfaces before it accepts a VPC
+        # CIDR. Keep this list exact and in lockstep with both audit scripts;
+        # broad Direct Connect wildcards are unnecessary for read-only proof.
+        Sid    = "DirectConnectRead"
+        Effect = "Allow"
+        Action = [
+          "directconnect:DescribeConnections",
+          "directconnect:DescribeVirtualInterfaces",
+          "directconnect:DescribeDirectConnectGateways",
+          "directconnect:DescribeDirectConnectGatewayAssociations",
+          "directconnect:DescribeDirectConnectGatewayAssociationProposals"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "S3Read"
         Effect = "Allow"
         Action = [
@@ -1552,6 +1568,16 @@ resource "aws_iam_policy" "terraform_read" {
       }
     ]
   })
+
+  lifecycle {
+    postcondition {
+      # IAM rejects customer-managed policy documents above 6,144
+      # non-whitespace characters. jsonencode emits no insignificant
+      # whitespace, so this checks the exact provider payload before apply.
+      condition     = length(self.policy) <= 6144
+      error_message = "terraform_read exceeds IAM's 6,144-character customer-managed policy quota; consolidate statements within the existing attachment budget before applying."
+    }
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "terraform_read" {
