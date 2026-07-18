@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_repository": "layervai/qurl-service",
+  "source_commit": "d506fa61a06c7b8b18b5d69dfe65dae15bd19270",
+  "files": [
+    {
+      "source": ".github/actions/sandbox-live-env-lock/action.yml",
+      "destination": ".github/actions/sandbox-live-env-lock/action.yml",
+      "sha256": "f859313213595edbd448fc74952107a4e624fdf05615152a65b8ffdd69aa12b0"
+    },
+    {
+      "source": ".github/scripts/ssm-live-env-lock.sh",
+      "destination": ".github/scripts/ssm-live-env-lock.sh",
+      "sha256": "365725cadad772bea2887a6abbf34dc4651712a4ea8d34460ccbf455bd6031a3"
+    },
+    {
+      "source": ".github/scripts/emit-sandbox-lock-failure-metric.sh",
+      "destination": ".github/scripts/emit-sandbox-lock-failure-metric.sh",
+      "sha256": "7981945f18fb53503e6c0a723e2d69fcd824807dc24e51a07ef24f34c5cde5b6"
+    },
+    {
+      "source": "scripts/ssm-read-optional.sh",
+      "destination": "scripts/ssm-read-optional.sh",
+      "sha256": "909b3911490b6341dc46dd22d787924fc8613166d2cac6ff9e7a7f0aecaa1cc6"
+    }
+  ]
+}

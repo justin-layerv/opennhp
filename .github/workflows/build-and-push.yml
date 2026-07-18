@@ -2522,11 +2522,12 @@ jobs:
     if: always() && needs.deploy-sandbox-infra.result == 'success'
     runs-on: ubuntu-latest
     environment: sandbox
-    # Roll budget: deploy-ecs-service.sh waits up to 600s for stability, can add
-    # a 30s two-read floor when verifying a concurrent sandbox roll, then waits
-    # 30s for ALB settle. 15m leaves headroom over that worst case (matches
-    # prod's deploy-qurl) without masking a genuine hang.
-    timeout-minutes: 15
+    # The shared qurl-service sandbox lock may wait for an exact-image pre-merge
+    # qv2 proof for up to two hours. Keep the job timeout above that bounded
+    # waiter plus deploy-ecs-service.sh's 10-minute stability budget and ALB
+    # settle. This cross-repo mutex closes #3244: an NHP main roll must not
+    # overwrite qurl-service's live proof or invalidate its restore target.
+    timeout-minutes: 180
     permissions:
       id-token: write
       contents: read
@@ -2540,12 +2541,32 @@ jobs:
       # Reuses AWS_ROLE_ARN (the sandbox apply role). It already manages the
       # qurl ECS service / task def / SSM params via TF, so it holds the
       # ecs:RegisterTaskDefinition / UpdateService / Describe*, iam:PassRole,
-      # and ssm:Get/PutParameter permissions deploy-ecs-service.sh needs.
+      # and ssm:Get/PutParameter permissions deploy-ecs-service.sh needs. The
+      # requested session matches this job's three-hour ceiling; the ECR module
+      # raises only the sandbox role's maximum to the same bound. Without both,
+      # configure-aws-credentials defaults to one hour and a healthy two-hour
+      # lock wait can fail closed on ExpiredToken before reaching its budget.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-duration-seconds: 10800
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Acquire qURL sandbox live-environment lock
+        id: acquire-qurl-sandbox-live-env-lock
+        # This local action is byte-for-byte vendored from qurl-service at the
+        # provenance recorded in docs/runbooks/sandbox-live-env-lock.md.
+        # Keeping it local is deliberate: the Actions age gate cannot verify
+        # pins into an internal sibling repository with the caller token.
+        uses: ./.github/actions/sandbox-live-env-lock
+        with:
+          action: acquire
+          owner: nhp:${{ github.run_id }}:${{ github.run_attempt }}:deploy-sandbox-qurl
+          ssm-parameter-name: /layerv-nhp-sandbox/qurl-live-env-lock
+          aws-region: ${{ env.AWS_REGION }}
+          ttl-seconds: '14400'
+          wait-seconds: '7200'
 
       # SSM prefix = local.name_prefix = "layerv-nhp-${environment}"
       # (terraform/main.tf), the same prefix the qurl module writes its
@@ -2709,6 +2730,48 @@ jobs:
           else
             echo "- QURL roll: **advanced** (requested SSM tag \`$REQUESTED_IMAGE_TAG\`; helper did not emit deployed outputs)" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Release qURL sandbox live-environment lock
+        id: release-qurl-sandbox-live-env-lock
+        if: >-
+          always() &&
+          steps.acquire-qurl-sandbox-live-env-lock.outcome == 'success' &&
+          steps.roll-qurl.outcome == 'success'
+        # The shared helper releases only an exact owner match. A release
+        # failure therefore leaves the shared lock fail-closed for the qURL
+        # runbook/TTL and fails this job even after an otherwise completed ECS
+        # roll. The red run is the immediate NHP-side signal; the shared alarm
+        # remains the cross-repo paging signal.
+        uses: ./.github/actions/sandbox-live-env-lock
+        with:
+          action: release
+          owner: nhp:${{ github.run_id }}:${{ github.run_attempt }}:deploy-sandbox-qurl
+          ssm-parameter-name: /layerv-nhp-sandbox/qurl-live-env-lock
+          aws-region: ${{ env.AWS_REGION }}
+          # The shared action has one acquire/release schema and always forwards
+          # both budget values. release ignores them; keeping the exact literals
+          # makes the cross-repo contract and structural fence explicit.
+          ttl-seconds: '14400'
+          wait-seconds: '7200'
+
+      - name: Surface qURL sandbox lock release failure
+        if: >-
+          always() &&
+          steps.release-qurl-sandbox-live-env-lock.outcome == 'failure'
+        run: |
+          echo "::error title=qURL sandbox lock retained after successful roll::The ECS roll succeeded, but the exact-owner lock release failed and this job is red. The lock remains fail-closed; reconcile it with docs/runbooks/sandbox-live-env-lock.md before the next deploy waits for the TTL."
+
+      - name: Retain qURL sandbox live-environment lock after roll failure
+        if: >-
+          always() &&
+          steps.acquire-qurl-sandbox-live-env-lock.outcome == 'success' &&
+          steps.roll-qurl.outcome != 'success'
+        run: |
+          echo "::error title=qURL sandbox roll failed - lock retained::Not releasing /layerv-nhp-sandbox/qurl-live-env-lock because deploy-sandbox-qurl did not reach a verified success/no-op. Inspect the ECS service and reconcile the exact lock owner before release; follow docs/runbooks/sandbox-live-env-lock.md."
+          bash .github/scripts/emit-sandbox-lock-failure-metric.sh RollFailedRetained release
+          # Keep retention independently red even if a future workflow edit
+          # broadens this condition beyond an already-failed roll step.
+          exit 1
 
   # =============================================================================
   # DEPLOY SANDBOX - NHP-Relay CD deploy leg (#2624, part of #2208)

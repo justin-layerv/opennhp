@@ -29,6 +29,7 @@ runbook file is added, renamed, or removed.
 - [Relay CloudWatch alarms](relay-alarms.md)
 - [Relay identity rotation](relay-identity-rotation.md)
 - [Sandbox app-image drift gate](sandbox-app-image-drift.md)
+- [Sandbox qURL live-environment lock](sandbox-live-env-lock.md)
 - [Sandbox relay control-plane migration](sandbox-relay-control-plane-migration.md)
 - [Sandbox relay DMZ replacement](sandbox-relay-dmz-replacement.md)
 - [NHP server forward-send safety](server-forward-safety.md)

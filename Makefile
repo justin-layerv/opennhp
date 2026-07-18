@@ -504,9 +504,13 @@ lint-workflows:
 	@python3 tests/scripts/test_ac_readiness_dependency.py
 	@python3 tests/scripts/test_status_page_notification_iam_readiness.py
 	@shellcheck .github/scripts/resolve-app-image-required.sh .github/scripts/resolve-live-app-image-required.sh .github/scripts/verify-live-app-images-ready.sh tests/scripts/resolve-app-image-required_test.sh tests/scripts/resolve-live-app-image-required_test.sh tests/scripts/verify-live-app-images-ready_test.sh
+	@shellcheck .github/scripts/ssm-live-env-lock.sh \
+		.github/scripts/emit-sandbox-lock-failure-metric.sh \
+		scripts/ssm-read-optional.sh
 	@bash tests/scripts/resolve-app-image-required_test.sh
 	@bash tests/scripts/resolve-live-app-image-required_test.sh
 	@bash tests/scripts/verify-live-app-images-ready_test.sh
+	@python3 tests/scripts/test_ssm_live_env_lock.py
 	@bash tests/scripts/check-sandbox-qurl-roll_test.sh
 	@command -v node >/dev/null 2>&1 || { \
 		echo "$(COLOUR_RED)[OpenNHP] node not found. Install Node.js 18+ to run the qURL relay bootstrap smoke self-test$(END_COLOUR)"; \

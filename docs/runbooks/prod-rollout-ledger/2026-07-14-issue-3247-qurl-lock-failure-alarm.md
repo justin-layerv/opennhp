@@ -1,7 +1,7 @@
 # 2026-07-14 · Issue #3247 · qURL sandbox lock failure alarm
 
 - **Owner:** sandbox rollout coordinator and LayerV platform on-call
-- **Source:** https://github.com/layervai/nhp/issues/3247, https://github.com/layervai/nhp/issues/3244, https://github.com/layervai/nhp/pull/3246
+- **Source:** https://github.com/layervai/nhp/issues/3247, https://github.com/layervai/nhp/issues/3244, https://github.com/layervai/nhp/pull/3246, https://github.com/layervai/nhp/pull/3248
 
 Apply the additive sandbox alarm, then deliberately prove the paired producer
 contract: one dimensionless sample drives the standard alarm and one
@@ -33,7 +33,8 @@ obtaining authorization.
   informational recovery notification per isolated event, accepts repeated
   pairs for failures in non-consecutive minutes, and confirms the downstream
   route treats OK as non-paging.
-- [ ] Sandbox rollout: apply the Terraform plan and confirm it creates only
+- [x] Sandbox rollout (2026-07-14, main run `29369516480`): applied the
+  Terraform plan and confirmed it created only
   `aws_cloudwatch_metric_alarm.qurl_ci_sandbox_live_env_lock_failure[0]` with
   name `layerv-nhp-sandbox-qurl-service-ci-live-env-lock-failure`,
   `ActionsEnabled=true`, threshold `> 0`, one-of-one 60-second evaluation,
@@ -41,9 +42,12 @@ obtaining authorization.
   `MetricName=SandboxLiveEnvLockFailure`, `Statistic=Sum`, no dimensions, no
   Metrics Insights query, `treat_missing_data=notBreaching`, and ALARM/OK
   actions both targeting `layerv-nhp-sandbox-cell0-alerts`. Expect one initial
-  informational OK notification when the new alarm first evaluates missing data
-  and transitions from INSUFFICIENT_DATA to OK; confirm it is non-paging and do
-  not treat it as a recovery from a lock failure.
+  informational OK notification when the new alarm first evaluated missing data
+  and transitioned from INSUFFICIENT_DATA to OK. Live read-back confirmed the
+  alarm is `OK`, actions are enabled, the selector has no dimensions, and both
+  action lists target `layerv-nhp-sandbox-cell0-alerts`; no canary datapoint has
+  been emitted. Treat that creation-time OK as non-paging initialization, not a
+  recovery from a lock failure.
 - [ ] Post-rollout canary (authorization required): from
   `AWS_PROFILE=layerv`, `AWS_REGION=us-east-2`, announce and run these two
   producer-shaped commands exactly once, in order:
@@ -79,7 +83,7 @@ obtaining authorization.
   route change until [#3251](https://github.com/layervai/nhp/issues/3251)
   automates non-paging liveness; each interim run is announced and
   authorization-gated because it pages the live sandbox path.
-- [ ] Rollback: if the alarm or notification route is wrong, revert this PR and
+- [ ] Rollback: if the alarm or notification route is wrong, revert #3248 and
   apply sandbox Terraform to remove the alarm. Do not roll back the namespace
   IAM grant or lock producers as part of alarm rollback; lock handling stays
   fail-closed and the metric remains available for manual queries.

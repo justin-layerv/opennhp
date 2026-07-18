@@ -1,0 +1,39 @@
+name: Sandbox live-environment lock
+description: Acquire or release the qURL sandbox live-environment SSM lock.
+
+inputs:
+  action:
+    description: acquire or release
+    required: true
+  owner:
+    description: Unique owner token for this workflow job.
+    required: true
+  ssm-parameter-name:
+    description: SSM parameter that stores the live-environment lock.
+    required: true
+  aws-region:
+    description: AWS region containing the SSM lock parameter. Must be explicit; AWS_DEFAULT_REGION and profile fallback are not used.
+    required: true
+  ttl-seconds:
+    description: Seconds before another waiter may break a stale lock.
+    required: false
+    default: '14400'
+  wait-seconds:
+    description: Seconds to wait for an existing lock before failing. This is the PR queue budget, not the stale-holder breaker; ttl-seconds remains longer than the job timeout so a healthy holder is never stolen.
+    required: false
+    default: '7200'
+
+runs:
+  using: composite
+  steps:
+    - name: Run lock helper
+      shell: bash
+      env:
+        AWS_REGION: ${{ inputs.aws-region }}
+      run: |
+        bash "${{ github.action_path }}/../../scripts/ssm-live-env-lock.sh" \
+          "${{ inputs.action }}" \
+          "${{ inputs.ssm-parameter-name }}" \
+          "${{ inputs.owner }}" \
+          "${{ inputs.ttl-seconds }}" \
+          "${{ inputs.wait-seconds }}"

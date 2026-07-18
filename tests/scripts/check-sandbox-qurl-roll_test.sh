@@ -7,7 +7,10 @@
 # advances unless CI rolls it. Prod (promote-to-prod.yml deploy-qurl) did;
 # sandbox did not, so env-var changes silently no-op'd until a downstream
 # consumer 403'd (qurl-service #335). The deploy-sandbox-qurl job closes that
-# gap. The same validate job now also owns the qURL JS-agent → relay bootstrap
+# gap. It must also hold qurl-service's shared sandbox live-environment lock
+# across every possible ECS mutation (#3244), so an NHP main roll cannot replace
+# an exact PR image during the mandatory pre-merge qv2 proof. The same validate
+# job now also owns the qURL JS-agent → relay bootstrap
 # smoke (#2680), so this test fences that relay ordering/wiring too. It fails
 # if the load-bearing pieces regress or are removed, so those gaps cannot
 # silently reopen.
@@ -28,6 +31,9 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$HERE/../.." && pwd)
 WF="$REPO_ROOT/.github/workflows/build-and-push.yml"
 PLAN_WF="$REPO_ROOT/.github/workflows/terraform-plan-pr.yml"
+ECR_MODULE_PATH="$REPO_ROOT/terraform/modules/ecr/main.tf"
+LOCK_RUNBOOK_PATH="$REPO_ROOT/docs/runbooks/sandbox-live-env-lock.md"
+RUNBOOK_INDEX_PATH="$REPO_ROOT/docs/runbooks/README.md"
 
 pass=0
 fail=0
@@ -428,6 +434,128 @@ assert_in "$JOB" deploy-sandbox-qurl "reads image tag from SSM qurl-api-image-ta
   'qurl-api-image-tag'
 assert_in "$JOB" deploy-sandbox-qurl "preserves qurl-service SSM image writer" \
   'PRESERVE_SSM_IMAGE_TAG: "true"'
+
+# Cross-repo live-environment mutex (#3244). The local action and helpers are
+# byte-for-byte copies of qurl-service@d506fa61; the Python contract test verifies
+# the provenance manifest, hashes, schema, and runtime behavior. Acquire before
+# any roll path, release the same owner only after verified success/no-op, and
+# retain it after an unverified outcome.
+# The two-hour waiter remains below the four-hour stale TTL, while the
+# three-hour job timeout leaves deployment headroom.
+LOCK_ACTION='uses: \./\.github/actions/sandbox-live-env-lock'
+assert_in "$JOB" deploy-sandbox-qurl "qURL sandbox lock uses the vendored producer action" \
+  "$LOCK_ACTION"
+assert_in "$JOB" deploy-sandbox-qurl "qURL sandbox lock uses the shared SSM parameter" \
+  'ssm-parameter-name: /layerv-nhp-sandbox/qurl-live-env-lock'
+assert_step_in "$JOB" deploy-sandbox-qurl \
+  "Acquire qURL sandbox live-environment lock" \
+  "qURL sandbox lock acquisition uses the explicit workflow region" \
+  'aws-region: \$\{\{ env\.AWS_REGION \}\}'
+assert_step_in "$JOB" deploy-sandbox-qurl \
+  "Release qURL sandbox live-environment lock" \
+  "qURL sandbox lock release uses the explicit workflow region" \
+  'aws-region: \$\{\{ env\.AWS_REGION \}\}'
+assert_in "$JOB" deploy-sandbox-qurl "qURL sandbox lock owner is unique to the NHP run attempt" \
+  'owner: nhp:\$\{\{ github\.run_id \}\}:\$\{\{ github\.run_attempt \}\}:deploy-sandbox-qurl'
+assert_in "$JOB" deploy-sandbox-qurl "qURL sandbox lock stale TTL remains four hours" \
+  "ttl-seconds: '14400'"
+assert_in "$JOB" deploy-sandbox-qurl "qURL sandbox lock waiter remains two hours" \
+  "wait-seconds: '7200'"
+assert_in "$JOB" deploy-sandbox-qurl "qURL sandbox roll timeout covers lock wait and deployment" \
+  'timeout-minutes: 180'
+assert_step_in "$JOB" deploy-sandbox-qurl \
+  "Configure AWS credentials" \
+  "qURL sandbox AWS session covers the complete three-hour job ceiling" \
+  'role-duration-seconds: 10800'
+if [[ ! -f "$ECR_MODULE_PATH" ]]; then
+  report_fail "qURL sandbox AWS role duration source exists" \
+    "missing $ECR_MODULE_PATH"
+else
+  ECR_MODULE=$(<"$ECR_MODULE_PATH")
+  assert_in "$ECR_MODULE" terraform/modules/ecr/main.tf \
+    "qURL sandbox AWS role permits the requested three-hour session" \
+    'max_session_duration = var\.environment == "sandbox" \? 10800 : 3600'
+fi
+assert_step_order "$JOB" deploy-sandbox-qurl \
+  "Acquire qURL sandbox live-environment lock" \
+  "Roll qurl-service to latest task def" \
+  "qURL sandbox lock is acquired before the roll can mutate ECS"
+assert_step_order "$JOB" deploy-sandbox-qurl \
+  "Roll qurl-service to latest task def" \
+  "Release qURL sandbox live-environment lock" \
+  "qURL sandbox lock is held through the complete ECS roll"
+assert_step_in "$JOB" deploy-sandbox-qurl \
+  "Release qURL sandbox live-environment lock" \
+  "qURL sandbox lock releases only after a verified roll success or no-op" \
+  "steps\.roll-qurl\.outcome == 'success'"
+assert_step_not_in "$JOB" deploy-sandbox-qurl \
+  "Release qURL sandbox live-environment lock" \
+  "qURL sandbox lock release failure leaves the NHP job red" \
+  'continue-on-error: true'
+assert_step_in "$JOB" deploy-sandbox-qurl \
+  "Surface qURL sandbox lock release failure" \
+  "qURL sandbox lock release failure is visible immediately" \
+  "steps\.release-qurl-sandbox-live-env-lock\.outcome == 'failure'"
+assert_step_order "$JOB" deploy-sandbox-qurl \
+  "Release qURL sandbox live-environment lock" \
+  "Retain qURL sandbox live-environment lock after roll failure" \
+  "qURL sandbox failure-retention branch follows the owned release branch"
+assert_step_in "$JOB" deploy-sandbox-qurl \
+  "Retain qURL sandbox live-environment lock after roll failure" \
+  "qURL sandbox lock is retained on every unverified roll outcome" \
+  "steps\.roll-qurl\.outcome != 'success'"
+assert_step_in "$JOB" deploy-sandbox-qurl \
+  "Retain qURL sandbox live-environment lock after roll failure" \
+  "qURL sandbox retained roll emits the dual-stream failure metric" \
+  'emit-sandbox-lock-failure-metric\.sh RollFailedRetained release'
+assert_step_in "$JOB" deploy-sandbox-qurl \
+  "Retain qURL sandbox live-environment lock after roll failure" \
+  "qURL sandbox lock retention fails independently of prior step state" \
+  'exit 1'
+assert_step_in "$JOB" deploy-sandbox-qurl \
+  "Retain qURL sandbox live-environment lock after roll failure" \
+  "qURL sandbox lock retention points operators to the recovery runbook" \
+  'docs/runbooks/sandbox-live-env-lock\.md'
+
+if [[ ! -f "$LOCK_RUNBOOK_PATH" ]]; then
+  report_fail "qURL sandbox lock recovery runbook exists" \
+    "missing $LOCK_RUNBOOK_PATH"
+else
+  report_pass "qURL sandbox lock recovery runbook exists"
+  LOCK_RUNBOOK=$(<"$LOCK_RUNBOOK_PATH")
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook documents the qurl-service owner shape" \
+    'qurl-service:<run_id>:<run_attempt>:<job-name>'
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook documents the NHP owner shape" \
+    'nhp:<run_id>:<run_attempt>:deploy-sandbox-qurl'
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook pins the same producer contract" \
+    'd506fa61a06c7b8b18b5d69dfe65dae15bd19270'
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook documents the alarm-first dual-stream contract" \
+    'A dimensionless sample drives the Terraform-managed paging alarm'
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook requires cross-repo fanout on producer changes" \
+    'qurl-service/issues/1245'
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook explains why rerun cannot recover a retained lock" \
+    'Re-running a failed job does not recover its retained lock'
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook documents the credential-duration safety bound" \
+    'requests a 10,800-second AWS session'
+  assert_in "$LOCK_RUNBOOK" sandbox-live-env-lock.md \
+    "lock runbook forbids release before stable task proof" \
+    'The deployment is stable with no pending tasks'
+fi
+
+if [[ -f "$RUNBOOK_INDEX_PATH" ]] && \
+  grep -Fq '[Sandbox qURL live-environment lock](sandbox-live-env-lock.md)' "$RUNBOOK_INDEX_PATH"; then
+  report_pass "qURL sandbox lock runbook is indexed"
+else
+  report_fail "qURL sandbox lock runbook is indexed" \
+    "docs/runbooks/README.md does not link sandbox-live-env-lock.md"
+fi
 
 # Loud-fail / quiet-skip: genuine absence of the cluster/service params skips;
 # everything else fails the job. Guard the skip notice so it cannot be deleted

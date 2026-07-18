@@ -799,6 +799,13 @@ resource "aws_iam_role" "github_actions" {
   name        = "nhp-${var.environment}-github-actions"
   description = "GitHub Actions role for ${var.github_org}/${var.github_repo} (${var.environment})"
 
+  # The sandbox qURL live-environment mutex permits a two-hour queue wait
+  # inside a three-hour job. Callers still have to request this duration; this
+  # only raises the role ceiling so lock-bearing sandbox jobs do not lose their
+  # credentials mid-wait or before exact-owner release. Keep prod at AWS's
+  # one-hour default because no prod workflow needs the wider session.
+  max_session_duration = var.environment == "sandbox" ? 10800 : 3600
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
