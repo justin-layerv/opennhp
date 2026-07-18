@@ -10,15 +10,15 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
-func TestAgentKnockRunIDConformanceV020(t *testing.T) {
+func TestAgentKnockRunIDConformanceV060(t *testing.T) {
 	t.Parallel()
 
 	vectors, err := conformance.AgentKnockApplication()
 	if err != nil {
 		t.Fatalf("load qurl-conformance agent knock application vectors: %v", err)
 	}
-	if vectors.SchemaVersion != 2 {
-		t.Fatalf("schema version = %d, want 2", vectors.SchemaVersion)
+	if vectors.SchemaVersion != 3 {
+		t.Fatalf("schema version = %d, want 3", vectors.SchemaVersion)
 	}
 
 	for _, tc := range vectors.RequestCases {
