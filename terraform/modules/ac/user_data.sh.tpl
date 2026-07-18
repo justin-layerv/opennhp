@@ -1480,7 +1480,7 @@ cat >> /home/ubuntu/traefik/dynamic.toml << QURLDYNAMICEOF
   # are not dialable.
   enableInstanceHrw = ${qurl_router_enable_instance_hrw}
   instanceDiscoveryTtl = ${qurl_router_instance_discovery_ttl_seconds}
-  enableQurlSiteAuthz = ${qurl_router_enable_qurl_site_authz}
+  enableQurlSiteAuthz = ${qurl_router_enable_qurl_site_authz}${qurl_router_connector_routing_gate}
   # Per-AZ qurl-reverse-tunnel-server boundary allowlist. Plural field
   # \`frpServerUrls\` (plugin Config: FRPServerURLs []string) — the legacy
   # singular \`frpServerUrl\` was dropped from the plugin's Config struct,

@@ -1870,6 +1870,29 @@ variable "enable_qurl_site_authz" {
   default     = false
 }
 
+variable "require_connector_routing_id" {
+  description = <<-EOT
+    Require the qurl-router plugin to use the qURL Service-issued
+    connector_routing_id for ordinary *.qurl.site Connector traffic.
+
+    Default false keeps the additive producer and consumer rollout dark and
+    renders no new user-data bytes, so adding the unset flag is plan-neutral.
+    Set true only after qurl-service emits connector_routing_id on every API
+    host, the native Connector registers with that exact identity, and the
+    matching qurl-router plugin is deployed to every Access Controller.
+    With the gate enabled, missing or malformed identities fail closed; there
+    is no fallback to the public resource id.
+
+    This is startup-only configuration rendered into AC user data. Applying a
+    value change creates a new launch-template version but does not update a
+    running AC. Activate or roll back the gate through the normal whole-fleet
+    AC restart/rollout, and never admit Connector traffic across a mixed-gate
+    fleet. See NHP #3275 and traefik-plugins #246.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # ==================== Security Alerting ====================
 
 variable "guardduty_alert_emails" {

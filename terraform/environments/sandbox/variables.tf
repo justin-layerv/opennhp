@@ -841,6 +841,12 @@ variable "enable_qurl_site_authz" {
   default     = false
 }
 
+variable "require_connector_routing_id" {
+  description = "Require qurl-router to use the producer-issued connector_routing_id for ordinary *.qurl.site Connector traffic. Default false keeps the cutover dark; changing it requires the normal whole-fleet AC restart/rollout. See terraform/variables.tf and NHP #3275."
+  type        = bool
+  default     = false
+}
+
 # ==================== qurl-reverse-tunnel-server deploy + sizing (per-AZ + blue/green) ====================
 # PR 3 only declares the NEW per-AZ / blue/green / canary variables here.
 # The existing tfvars values for `deploy_frps` / `frps_*` are already

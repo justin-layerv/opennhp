@@ -1620,6 +1620,20 @@ jobs:
           terraform init -backend=false
           terraform test
 
+      - name: Test AC qurl-router routing gate rendering
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        working-directory: tests/terraform/ac-qurl-router-routing-gate
+        run: |
+          terraform init -backend=false
+          terraform test
+
+      - name: Test AC qurl-router routing gate validation
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        working-directory: terraform/modules/ac
+        run: |
+          terraform init -backend=false
+          terraform test
+
       - name: Test relay DMZ Terraform contract
         if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         working-directory: terraform/modules/relay-network

@@ -204,6 +204,7 @@ module "nhp" {
   enable_instance_hrw            = var.enable_instance_hrw
   instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
   enable_qurl_site_authz         = var.enable_qurl_site_authz
+  require_connector_routing_id   = var.require_connector_routing_id
 
   # qurl-reverse-tunnel-server (FRPS-behind-AC) — prod env-root close-out.
   # Mirrors the sandbox wiring (#2035): #1745 had threaded only the NEW

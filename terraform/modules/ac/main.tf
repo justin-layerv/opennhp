@@ -1065,6 +1065,16 @@ locals {
     qurl_router_enable_instance_hrw            = var.qurl_router_config != null ? var.qurl_router_config.enable_instance_hrw : false
     qurl_router_instance_discovery_ttl_seconds = var.qurl_router_config != null ? var.qurl_router_config.instance_discovery_ttl_seconds : 20
     qurl_router_enable_qurl_site_authz         = var.qurl_router_config != null ? var.qurl_router_config.enable_qurl_site_authz : false
+    # Render the routing cutover through a focused template so its exact TOML
+    # shape is covered without constructing this provider-heavy module in a
+    # unit test. False renders the empty string, preserving byte-identical user
+    # data (and therefore a no-op plan) while the gate is unset. True starts
+    # with a newline and appends the exact plugin field to the preceding line.
+    # The production render fence below proves the final AC user data contains
+    # the field if and only if the caller requested it.
+    qurl_router_connector_routing_gate = chomp(templatefile("${path.module}/qurl_router_connector_routing_gate.toml.tpl", {
+      require_connector_routing_id = var.qurl_router_config != null ? var.qurl_router_config.require_connector_routing_id : false
+    }))
     # Per-AZ qurl-reverse-tunnel-server boundaries (plural `frpServerUrls` in
     # the plugin Config). Empty = tunnel routing disabled at the plugin
     # gate, regardless of any per-resource upstream_addr the API returns
@@ -1399,6 +1409,18 @@ resource "terraform_data" "ac_user_data_qurl_router_render_check" {
         || strcontains(local.user_data, "\"http://frps-")
       )
       error_message = "qurl_router_config.frp_server_urls is non-empty but the rendered user_data has no `\"http://frps-` entries in the qurl-router middleware block. A templatefile `%%{ for }` regression (renamed iteration variable, lost interpolation) would silently produce this and leave the plugin's allowlist empty, regressing the silentDrop/502 failure mode #2134 fixed."
+    }
+    precondition {
+      # False deliberately omits the field so an unset/default-dark variable
+      # produces byte-identical user data and no launch-template plan. The
+      # plugin's bool zero-value is false. True must render exactly once: a
+      # dropped module input would otherwise make the cutover impossible, and
+      # duplicates would make the active startup posture ambiguous.
+      condition = length(regexall(
+        "(?m)^  enableQurlSiteAuthz = (true|false)\n  requireConnectorRoutingID = true$",
+        local.user_data,
+      )) == (var.qurl_router_config.require_connector_routing_id ? 1 : 0)
+      error_message = "AC user_data must omit `requireConnectorRoutingID` while qurl_router_config.require_connector_routing_id=false and render exactly one `requireConnectorRoutingID = true` immediately after `enableQurlSiteAuthz` when enabled. The gate is startup-only; missing, moved, duplicated, or stale rendering would make the fleet's active cutover posture unauditable."
     }
   }
 }

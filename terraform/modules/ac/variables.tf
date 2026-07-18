@@ -629,6 +629,7 @@ variable "qurl_router_config" {
       enable_instance_hrw            = false
       instance_discovery_ttl_seconds = 20
       enable_qurl_site_authz         = false
+      require_connector_routing_id   = false
     }
   EOT
   type = object({
@@ -669,6 +670,14 @@ variable "qurl_router_config" {
     # remaining_seconds)). See `var.enable_qurl_site_authz` at the
     # root for the full description.
     enable_qurl_site_authz = optional(bool, false)
+    # Coordinated hard-cutover gate for ordinary *.qurl.site Connector
+    # traffic (traefik-plugins #246). Optional/default false preserves the
+    # dark rollout posture for module-direct callers. The plugin fails closed
+    # on a missing or malformed connector_routing_id when true. This value is
+    # rendered into startup-only user data, so a change requires the normal
+    # whole-fleet AC restart/rollout; an apply alone only creates a new launch
+    # template version.
+    require_connector_routing_id = optional(bool, false)
     # Per-AZ qurl-reverse-tunnel-server boundary URLs. The qurl-router plugin's
     # Config field is `FRPServerURLs []string` (json `frpServerUrls`, plural);
     # empty disables tunnel routing entirely — every tunnel resource that
@@ -767,6 +776,18 @@ variable "qurl_router_config" {
       || try(var.qurl_router_config.enabled, false)
     )
     error_message = "qurl_router_config.enable_qurl_site_authz=true requires qurl_router_config.enabled=true. The L7 gate has no execution path when the qurl-router middleware itself isn't rendered."
+  }
+
+  validation {
+    # Module-direct counterpart to the root precondition. The field renders
+    # only inside the enabled qurl-router middleware block, so accepting true
+    # on a disabled object would silently no-op the requested hard cutover.
+    condition = (
+      var.qurl_router_config == null
+      || !try(var.qurl_router_config.require_connector_routing_id, false)
+      || try(var.qurl_router_config.enabled, false)
+    )
+    error_message = "qurl_router_config.require_connector_routing_id=true requires qurl_router_config.enabled=true. The routing-identity gate has no execution path when the qurl-router middleware isn't rendered."
   }
 }
 

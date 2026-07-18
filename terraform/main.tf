@@ -128,6 +128,25 @@ resource "terraform_data" "qurl_site_authz_preconditions" {
   }
 }
 
+# The Connector routing-identity gate is rendered only when the qurl-router
+# middleware exists. A true value outside that path would silently leave the
+# fleet on legacy routing while presenting an enabled operator variable, so
+# reject that half-configuration at plan time.
+resource "terraform_data" "connector_routing_id_preconditions" {
+  count = var.require_connector_routing_id ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.qurl_router_enabled
+      error_message = "require_connector_routing_id=true requires qurl_router_enabled=true. Without the qurl-router middleware, the Connector routing-identity gate has no execution path."
+    }
+    precondition {
+      condition     = var.deploy_qurl_service
+      error_message = "require_connector_routing_id=true requires deploy_qurl_service=true. The gate consumes connector_routing_id from qurl-service's strict resource projection."
+    }
+  }
+}
+
 # qurl-service's active-registration read gate makes `upstream_addrs`
 # authoritative for tunnel resources. A half flip is worse than a no-op:
 # without reporter writes it fails tunnels closed, and without router
@@ -1482,6 +1501,11 @@ module "ac" {
     enable_instance_hrw            = var.enable_instance_hrw
     instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
     enable_qurl_site_authz         = var.enable_qurl_site_authz
+    # Coordinated hard-cutover gate for ordinary *.qurl.site Connector
+    # traffic (traefik-plugins #246). Keep false through the additive
+    # producer/plugin rollout. The AC module omits the false zero-value so
+    # this wiring is plan-neutral until the deliberate true cutover.
+    require_connector_routing_id = var.require_connector_routing_id
     # qurl-reverse-tunnel-server boundary allowlist. Public FRP control
     # ingress is per-AZ: connect.layerv.* exposes one NHP-protected TCP
     # listener port per suffix, and nhp-server selects one suffix row when

@@ -724,6 +724,12 @@ variable "enable_qurl_site_authz" {
   default     = false
 }
 
+variable "require_connector_routing_id" {
+  description = "Require qurl-router to use the producer-issued connector_routing_id for ordinary *.qurl.site Connector traffic. Default false keeps the cutover dark; changing it requires the normal whole-fleet AC restart/rollout. See terraform/variables.tf and NHP #3275."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_connector_active_registrations_enabled" {
   description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while reporter and AC discovery rollout are verified."
   type        = bool
