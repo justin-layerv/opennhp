@@ -10,7 +10,7 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
-func TestAgentKnockRunIDConformanceV060(t *testing.T) {
+func TestAgentKnockRunIDConformanceSchemaV3(t *testing.T) {
 	t.Parallel()
 
 	vectors, err := conformance.AgentKnockApplication()
