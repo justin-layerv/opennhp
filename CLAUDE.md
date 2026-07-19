@@ -28,6 +28,7 @@ Commit format and full details: see [`docs/COMMIT_CONVENTION.md`](docs/COMMIT_CO
 | `agent` | NHP Agent |
 | `js-agent` | Browser NHP agent (`endpoints/js-agent`) |
 | `relay` | NHP-Relay forwarder (`endpoints/relay`) |
+| `hub` | qURL Connector Hub |
 | `db` | Database service |
 | `nhp` | Core protocol library |
 | `ebpf` | eBPF datapath and committed BPF objects |

@@ -173,6 +173,101 @@ func TestDecodeAssignmentRequestConformanceRejects(t *testing.T) {
 	}
 }
 
+func TestDecodeAssignmentRequestConformanceRejectionClasses(t *testing.T) {
+	t.Parallel()
+	vectors := assignmentVectors(t)
+	peer := agentPeer(t, vectors)
+	for _, test := range vectors.RequestCases {
+		if test.Phase != "initial_assignment" && test.Phase != "refresh_assignment" {
+			continue
+		}
+		t.Run(test.Name, func(t *testing.T) {
+			t.Parallel()
+			request, rejection, err := DecodeAssignmentRequestClassified(testHubEnvironment, []byte(test.BodyJSON), peer)
+			if !errors.Is(err, ErrInvalidAssignmentRequest) || request != (Request{}) {
+				t.Fatalf("request/error = %#v/%v, want zero request and ErrInvalidAssignmentRequest", request, err)
+			}
+			if got, want := string(rejection), test.RejectClass; got != want {
+				t.Fatalf("rejection = %q, want conformance class %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRequestRejectionVocabularyIsFixedAndSecretFree(t *testing.T) {
+	t.Parallel()
+	got := []RequestRejection{
+		RequestRejectionBodyParse,
+		RequestRejectionUnknownField,
+		RequestRejectionMissingField,
+		RequestRejectionWrongType,
+		RequestRejectionSemantic,
+		RequestRejectionPeer,
+		RequestRejectionBodySize,
+		RequestRejectionEnvironment,
+	}
+	want := []RequestRejection{
+		"body_parse",
+		"unknown_field",
+		"missing_field",
+		"wrong_type",
+		"semantic",
+		"authenticated_peer",
+		"body_size",
+		"environment",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rejection vocabulary = %q, want %q", got, want)
+	}
+	seen := make(map[RequestRejection]struct{}, len(got))
+	for _, rejection := range got {
+		if rejection == "" {
+			t.Fatal("rejection vocabulary contains an empty label")
+		}
+		if _, duplicate := seen[rejection]; duplicate {
+			t.Fatalf("rejection vocabulary contains duplicate %q", rejection)
+		}
+		seen[rejection] = struct{}{}
+	}
+
+	const secret = "customer-credential-must-never-be-a-label"
+	body := `{"usrId":"","devId":"agent-conform","aspId":"agent","usrData":{"query":"wrong","version":1,"mode":"enroll","request_nonce":"` + conformance.AgentAssignmentInitialRequestNonceFixture + `","credential":"` + secret + `"}}`
+	_, rejection, err := DecodeAssignmentRequestClassified(testHubEnvironment, []byte(body), make([]byte, 32))
+	if !errors.Is(err, ErrInvalidAssignmentRequest) || rejection != RequestRejectionSemantic {
+		t.Fatalf("error/rejection = %v/%q, want semantic request rejection", err, rejection)
+	}
+	if strings.Contains(string(rejection), secret) || strings.Contains(err.Error(), secret) {
+		t.Fatalf("request rejection reflected credential: %q/%q", rejection, err)
+	}
+}
+
+func TestDecodeAssignmentRequestClassifiedSeparatesNonParserFences(t *testing.T) {
+	t.Parallel()
+	vectors := assignmentVectors(t)
+	body := []byte(vectors.RefreshAssignment.Request.BodyJSON)
+	tests := []struct {
+		name        string
+		environment string
+		body        []byte
+		peer        []byte
+		want        RequestRejection
+		wantErr     error
+	}{
+		{name: "peer", environment: testHubEnvironment, body: body, peer: make([]byte, 31), want: RequestRejectionPeer, wantErr: ErrInvalidAuthenticatedPeer},
+		{name: "body size", environment: testHubEnvironment, body: make([]byte, maxApplicationBodyBytes+1), peer: make([]byte, 32), want: RequestRejectionBodySize, wantErr: ErrAssignmentRequestTooLarge},
+		{name: "environment", environment: "Production-secret", body: body, peer: agentPeer(t, vectors), want: RequestRejectionEnvironment, wantErr: ErrInvalidHubEnvironment},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, rejection, err := DecodeAssignmentRequestClassified(test.environment, test.body, test.peer)
+			if !errors.Is(err, test.wantErr) || rejection != test.want {
+				t.Fatalf("error/rejection = %v/%q, want %v/%q", err, rejection, test.wantErr, test.want)
+			}
+		})
+	}
+}
+
 func TestDecodeAssignmentRequestStrictBodyGrammar(t *testing.T) {
 	t.Parallel()
 	peer := make([]byte, 32)

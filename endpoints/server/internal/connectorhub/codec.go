@@ -72,6 +72,33 @@ var (
 	ErrAssignmentResponseEncoding = errors.New("connector hub: assignment response encoding failed")
 )
 
+// RequestRejection is the complete fixed telemetry vocabulary for strict Hub
+// request decoding. Values never contain request data and are not copied into
+// the public LRT error body.
+type RequestRejection string
+
+const (
+	RequestRejectionBodyParse    RequestRejection = "body_parse"
+	RequestRejectionUnknownField RequestRejection = "unknown_field"
+	RequestRejectionMissingField RequestRejection = "missing_field"
+	RequestRejectionWrongType    RequestRejection = "wrong_type"
+	RequestRejectionSemantic     RequestRejection = "semantic"
+	RequestRejectionPeer         RequestRejection = "authenticated_peer"
+	RequestRejectionBodySize     RequestRejection = "body_size"
+	RequestRejectionEnvironment  RequestRejection = "environment"
+)
+
+type classifiedRequestError struct {
+	class RequestRejection
+}
+
+func (e *classifiedRequestError) Error() string { return ErrInvalidAssignmentRequest.Error() }
+func (e *classifiedRequestError) Unwrap() error { return ErrInvalidAssignmentRequest }
+
+func rejectRequest(class RequestRejection) error {
+	return &classifiedRequestError{class: class}
+}
+
 // Mode is the closed assignment operation decoded from one authenticated LST.
 type Mode uint8
 
@@ -103,21 +130,30 @@ func (r Request) HubRequestID() string {
 // identifier for the immutable Hub environment. The decoded logical nonce is
 // wiped after derivation and is never retained in Request.
 func DecodeAssignmentRequest(environment string, raw, authenticatedPeer []byte) (Request, error) {
+	request, _, err := DecodeAssignmentRequestClassified(environment, raw, authenticatedPeer)
+	return request, err
+}
+
+// DecodeAssignmentRequestClassified is DecodeAssignmentRequest plus a closed,
+// secret-free rejection label for runtime telemetry. It performs the same
+// single parse; the classification is never attacker-controlled or emitted on
+// the public wire.
+func DecodeAssignmentRequestClassified(environment string, raw, authenticatedPeer []byte) (Request, RequestRejection, error) {
 	if len(authenticatedPeer) != x25519PublicKeyBytes {
-		return Request{}, ErrInvalidAuthenticatedPeer
+		return Request{}, RequestRejectionPeer, ErrInvalidAuthenticatedPeer
 	}
 	if len(raw) > maxApplicationBodyBytes {
-		return Request{}, ErrAssignmentRequestTooLarge
+		return Request{}, RequestRejectionBodySize, ErrAssignmentRequestTooLarge
 	}
 	if len(raw) == 0 || !utf8.Valid(raw) {
-		return Request{}, ErrInvalidAssignmentRequest
+		return Request{}, RequestRejectionBodyParse, ErrInvalidAssignmentRequest
 	}
 
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	parsed, err := parseAssignmentRequest(decoder)
 	if err != nil {
-		return Request{}, ErrInvalidAssignmentRequest
+		return Request{}, classifyRequestError(err), ErrInvalidAssignmentRequest
 	}
 
 	request := Request{
@@ -127,37 +163,48 @@ func DecodeAssignmentRequest(environment string, raw, authenticatedPeer []byte) 
 	var operation string
 	switch parsed.mode {
 	case "enroll":
-		if !parsed.credentialPresent || parsed.credential == "" {
-			return Request{}, ErrInvalidAssignmentRequest
+		if !parsed.credentialPresent {
+			return Request{}, RequestRejectionMissingField, ErrInvalidAssignmentRequest
+		}
+		if parsed.credential == "" {
+			return Request{}, RequestRejectionSemantic, ErrInvalidAssignmentRequest
 		}
 		request.Mode = ModeEnroll
 		request.Credential = parsed.credential
 		operation = conformance.ConnectorHubRequestIDOperationIssue
 	case "refresh":
 		if parsed.credentialPresent {
-			return Request{}, ErrInvalidAssignmentRequest
+			return Request{}, RequestRejectionUnknownField, ErrInvalidAssignmentRequest
 		}
 		request.Mode = ModeRefresh
 		operation = conformance.ConnectorHubRequestIDOperationRefresh
 	default:
-		return Request{}, ErrInvalidAssignmentRequest
+		return Request{}, RequestRejectionSemantic, ErrInvalidAssignmentRequest
 	}
 
 	requestNonce, err := conformance.DecodeConnectorHubRequestNonce(parsed.requestNonce)
 	if err != nil {
-		return Request{}, ErrInvalidAssignmentRequest
+		return Request{}, RequestRejectionSemantic, ErrInvalidAssignmentRequest
 	}
 	defer clear(requestNonce)
 	request.hubRequestID, err = conformance.DeriveConnectorHubRequestID(environment, operation, authenticatedPeer, requestNonce)
 	if err != nil {
 		if errors.Is(err, conformance.ErrConnectorHubRequestIDEnvironment) {
-			return Request{}, ErrInvalidHubEnvironment
+			return Request{}, RequestRejectionEnvironment, ErrInvalidHubEnvironment
 		}
 		// Operation, peer, and nonce have already passed closed validation. Keep
 		// any impossible contract drift behind the same opaque request boundary.
-		return Request{}, ErrInvalidAssignmentRequest
+		return Request{}, RequestRejectionSemantic, ErrInvalidAssignmentRequest
 	}
-	return request, nil
+	return request, "", nil
+}
+
+func classifyRequestError(err error) RequestRejection {
+	var classified *classifiedRequestError
+	if errors.As(err, &classified) {
+		return classified.class
+	}
+	return RequestRejectionBodyParse
 }
 
 type parsedRequest struct {
@@ -169,7 +216,7 @@ type parsedRequest struct {
 }
 
 func parseAssignmentRequest(decoder *json.Decoder) (parsedRequest, error) {
-	if err := expectDelimiter(decoder, '{'); err != nil {
+	if err := expectObjectStart(decoder); err != nil {
 		return parsedRequest{}, err
 	}
 
@@ -183,19 +230,28 @@ func parseAssignmentRequest(decoder *json.Decoder) (parsedRequest, error) {
 		switch key {
 		case "usrId":
 			value, err := readString(decoder)
-			if err != nil || value != "" {
-				return parsedRequest{}, ErrInvalidAssignmentRequest
+			if err != nil {
+				return parsedRequest{}, err
+			}
+			if value != "" {
+				return parsedRequest{}, rejectRequest(RequestRejectionSemantic)
 			}
 		case "devId":
 			value, err := readString(decoder)
-			if err != nil || !validAgentID(value) {
-				return parsedRequest{}, ErrInvalidAssignmentRequest
+			if err != nil {
+				return parsedRequest{}, err
+			}
+			if !validAgentID(value) {
+				return parsedRequest{}, rejectRequest(RequestRejectionSemantic)
 			}
 			parsed.agentID = value
 		case "aspId":
 			value, err := readString(decoder)
-			if err != nil || value != assignmentAspID {
-				return parsedRequest{}, ErrInvalidAssignmentRequest
+			if err != nil {
+				return parsedRequest{}, err
+			}
+			if value != assignmentAspID {
+				return parsedRequest{}, rejectRequest(RequestRejectionSemantic)
 			}
 		case "usrData":
 			data, err := parseRequestData(decoder)
@@ -207,14 +263,17 @@ func parseAssignmentRequest(decoder *json.Decoder) (parsedRequest, error) {
 			parsed.credential = data.credential
 			parsed.credentialPresent = data.credentialPresent
 		default:
-			return parsedRequest{}, ErrInvalidAssignmentRequest
+			return parsedRequest{}, rejectRequest(RequestRejectionUnknownField)
 		}
 	}
-	if err := expectDelimiter(decoder, '}'); err != nil || !hasExactly(seen, "usrId", "devId", "aspId", "usrData") {
-		return parsedRequest{}, ErrInvalidAssignmentRequest
+	if err := expectDelimiter(decoder, '}'); err != nil {
+		return parsedRequest{}, err
+	}
+	if !hasExactly(seen, "usrId", "devId", "aspId", "usrData") {
+		return parsedRequest{}, rejectRequest(RequestRejectionMissingField)
 	}
 	if _, err := decoder.Token(); err != io.EOF {
-		return parsedRequest{}, ErrInvalidAssignmentRequest
+		return parsedRequest{}, rejectRequest(RequestRejectionBodyParse)
 	}
 	return parsed, nil
 }
@@ -227,7 +286,7 @@ type parsedRequestData struct {
 }
 
 func parseRequestData(decoder *json.Decoder) (parsedRequestData, error) {
-	if err := expectDelimiter(decoder, '{'); err != nil {
+	if err := expectObjectStart(decoder); err != nil {
 		return parsedRequestData{}, err
 	}
 	var parsed parsedRequestData
@@ -240,47 +299,56 @@ func parseRequestData(decoder *json.Decoder) (parsedRequestData, error) {
 		switch key {
 		case "query":
 			value, err := readString(decoder)
-			if err != nil || value != assignmentQuery {
-				return parsedRequestData{}, ErrInvalidAssignmentRequest
+			if err != nil {
+				return parsedRequestData{}, err
+			}
+			if value != assignmentQuery {
+				return parsedRequestData{}, rejectRequest(RequestRejectionSemantic)
 			}
 		case "version":
 			value, err := decoder.Token()
+			if err != nil {
+				return parsedRequestData{}, rejectRequest(RequestRejectionBodyParse)
+			}
 			number, ok := value.(json.Number)
-			if err != nil || !ok || number.String() != "1" {
-				return parsedRequestData{}, ErrInvalidAssignmentRequest
+			if !ok {
+				return parsedRequestData{}, rejectRequest(RequestRejectionWrongType)
+			}
+			if number.String() != "1" {
+				return parsedRequestData{}, rejectRequest(RequestRejectionSemantic)
 			}
 		case "mode":
 			value, err := readString(decoder)
 			if err != nil {
-				return parsedRequestData{}, ErrInvalidAssignmentRequest
+				return parsedRequestData{}, err
 			}
 			parsed.mode = value
 		case "request_nonce":
 			value, err := readString(decoder)
 			if err != nil {
-				return parsedRequestData{}, ErrInvalidAssignmentRequest
+				return parsedRequestData{}, err
 			}
 			parsed.requestNonce = value
 		case "credential":
 			value, err := readString(decoder)
 			if err != nil {
-				return parsedRequestData{}, ErrInvalidAssignmentRequest
+				return parsedRequestData{}, err
 			}
 			parsed.credential = value
 			parsed.credentialPresent = true
 		default:
-			return parsedRequestData{}, ErrInvalidAssignmentRequest
+			return parsedRequestData{}, rejectRequest(RequestRejectionUnknownField)
 		}
 	}
 	if err := expectDelimiter(decoder, '}'); err != nil {
-		return parsedRequestData{}, ErrInvalidAssignmentRequest
+		return parsedRequestData{}, err
 	}
 	_, queryPresent := seen["query"]
 	_, versionPresent := seen["version"]
 	_, modePresent := seen["mode"]
 	_, requestNoncePresent := seen["request_nonce"]
 	if !queryPresent || !versionPresent || !modePresent || !requestNoncePresent {
-		return parsedRequestData{}, ErrInvalidAssignmentRequest
+		return parsedRequestData{}, rejectRequest(RequestRejectionMissingField)
 	}
 	return parsed, nil
 }
@@ -288,14 +356,14 @@ func parseRequestData(decoder *json.Decoder) (parsedRequestData, error) {
 func readUniqueKey(decoder *json.Decoder, seen map[string]struct{}) (string, error) {
 	token, err := decoder.Token()
 	if err != nil {
-		return "", err
+		return "", rejectRequest(RequestRejectionBodyParse)
 	}
 	key, ok := token.(string)
 	if !ok {
-		return "", ErrInvalidAssignmentRequest
+		return "", rejectRequest(RequestRejectionBodyParse)
 	}
 	if _, duplicate := seen[key]; duplicate {
-		return "", ErrInvalidAssignmentRequest
+		return "", rejectRequest(RequestRejectionBodyParse)
 	}
 	seen[key] = struct{}{}
 	return key, nil
@@ -304,11 +372,11 @@ func readUniqueKey(decoder *json.Decoder, seen map[string]struct{}) (string, err
 func readString(decoder *json.Decoder) (string, error) {
 	token, err := decoder.Token()
 	if err != nil {
-		return "", err
+		return "", rejectRequest(RequestRejectionBodyParse)
 	}
 	value, ok := token.(string)
 	if !ok {
-		return "", ErrInvalidAssignmentRequest
+		return "", rejectRequest(RequestRejectionWrongType)
 	}
 	return value, nil
 }
@@ -316,11 +384,23 @@ func readString(decoder *json.Decoder) (string, error) {
 func expectDelimiter(decoder *json.Decoder, want json.Delim) error {
 	token, err := decoder.Token()
 	if err != nil {
-		return err
+		return rejectRequest(RequestRejectionBodyParse)
 	}
 	delimiter, ok := token.(json.Delim)
 	if !ok || delimiter != want {
-		return ErrInvalidAssignmentRequest
+		return rejectRequest(RequestRejectionBodyParse)
+	}
+	return nil
+}
+
+func expectObjectStart(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return rejectRequest(RequestRejectionBodyParse)
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok || delimiter != '{' {
+		return rejectRequest(RequestRejectionWrongType)
 	}
 	return nil
 }
@@ -373,8 +453,8 @@ type Assignment struct {
 }
 
 // EnrollSuccess contains the one-shot registration material issued by an
-// initial assignment. AssignmentTicketExpiresAt must have second precision
-// and carry the time.UTC location.
+// initial assignment. AssignmentTicketExpiresAt must have second precision,
+// carry the time.UTC location, and strictly precede the assignment lease.
 type EnrollSuccess struct {
 	AgentID                   string
 	Registration              Registration

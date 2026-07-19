@@ -66,6 +66,7 @@ body:
         - agent
         - js-agent
         - relay
+        - hub
         - server
         - ac
         - admin
