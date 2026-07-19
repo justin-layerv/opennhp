@@ -208,7 +208,7 @@ func TestDecodeAssignmentRequestPeerAndSizeFences(t *testing.T) {
 	t.Parallel()
 	vectors := assignmentVectors(t)
 	if got, want := maxApplicationBodyBytes, vectors.AccountCredentialOTP.PacketSizeContract.MaxPlaintextBodyBytes; got != want {
-		t.Fatalf("application body limit = %d, want qurl-conformance v0.7 schema-3 limit %d", got, want)
+		t.Fatalf("application body limit = %d, want qurl-conformance v0.8 schema-4 limit %d", got, want)
 	}
 	body := []byte(vectors.InitialAssignment.Request.BodyJSON)
 	if _, err := DecodeAssignmentRequest(testHubEnvironment, body, make([]byte, 31)); !errors.Is(err, ErrInvalidAuthenticatedPeer) {
@@ -311,6 +311,40 @@ func TestEncodeAssignmentErrorsConformanceGolden(t *testing.T) {
 				t.Fatalf("bodies = refresh:%s enroll:%s, want %s", refreshBody, enrollBody, test.BodyJSON)
 			}
 		})
+	}
+}
+
+func TestAssignmentErrorAcceptedPhasesConformance(t *testing.T) {
+	t.Parallel()
+	vectors := assignmentVectors(t)
+	want52205Phases := []string{"initial_assignment", "refresh_assignment"}
+	found52205 := 0
+
+	// assignmentVectors pins schema v4; these are all error-case groups in that
+	// schema. A future schema bump must update both that pin and this exhaustive
+	// list, rather than silently widening the accepted phase surface.
+	groups := [][]conformance.AgentAssignmentErrorCase{
+		vectors.ErrorContract.AssignmentCases,
+		vectors.ErrorContract.InitialCredentialCases,
+		vectors.ErrorContract.CompletionCases,
+		vectors.ErrorContract.RegistrationCases,
+	}
+	for _, cases := range groups {
+		for _, test := range cases {
+			if test.ErrCode == "52205" {
+				found52205++
+				if !reflect.DeepEqual(test.AcceptedPhases, want52205Phases) {
+					t.Fatalf("52205 accepted phases = %v, want %v", test.AcceptedPhases, want52205Phases)
+				}
+				continue
+			}
+			if test.AcceptedPhases != nil {
+				t.Fatalf("error %s accepted phases = %v, want metadata omitted", test.ErrCode, test.AcceptedPhases)
+			}
+		}
+	}
+	if found52205 != 1 {
+		t.Fatalf("52205 cases = %d, want exactly 1", found52205)
 	}
 }
 
@@ -445,8 +479,8 @@ func assignmentVectors(t *testing.T) *conformance.AgentAssignmentFile {
 	if err != nil {
 		t.Fatalf("load qurl-conformance assignment vectors: %v", err)
 	}
-	if vectors.SchemaVersion != 3 {
-		t.Fatalf("schema version = %d, want 3", vectors.SchemaVersion)
+	if vectors.SchemaVersion != 4 {
+		t.Fatalf("schema version = %d, want 4", vectors.SchemaVersion)
 	}
 	return vectors
 }
