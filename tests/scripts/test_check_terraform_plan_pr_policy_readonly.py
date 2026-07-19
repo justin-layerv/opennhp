@@ -918,26 +918,26 @@ class ControlRoutingApplyPolicyTests(unittest.TestCase):
         preflight = (
             REPO_ROOT / "scripts" / "capture-control-sandbox-first-apply-preflight.sh"
         ).read_text(encoding="utf-8")
-        self.assertEqual(preflight.count("aws iam simulate-principal-policy"), 3)
+        self.assertEqual(preflight.count("aws iam simulate-principal-policy"), 5)
         self.assertEqual(
             preflight.count(
                 '--policy-source-arn "arn:aws:iam::${account_id}:role/${role_name}"'
             ),
-            3,
+            5,
         )
         self.assertEqual(
             preflight.count(
                 "ContextKeyName=aws:ResourceAccount,"
                 "ContextKeyValues=${account_id},ContextKeyType=string"
             ),
-            1,
+            3,
         )
         self.assertEqual(
             preflight.count(
                 "ContextKeyName=aws:RequestedRegion,"
                 "ContextKeyValues=${region},ContextKeyType=string"
             ),
-            1,
+            3,
         )
 
     def test_directconnect_grant_exactly_matches_audit_calls(self) -> None:
@@ -1035,6 +1035,34 @@ class ConnectorAuthorityApplyPolicyTests(unittest.TestCase):
                 "elasticache:AddTagsToResource",
                 "elasticache:RemoveTagsFromResource",
             },
+        )
+
+    def test_cache_user_group_dependency_is_exact(self) -> None:
+        stmt = find_policy_statement(
+            REPO_ROOT / "terraform",
+            "terraform_apply_data",
+            "ElastiCacheControlCacheUserGroupDependency",
+        )
+
+        self.assertEqual(
+            normalized_strings(stmt.get("Resource")),
+            [
+                "arn:aws:elasticache:${local.region}:${local.account_id}:usergroup:layerv-nhp-${var.environment}-control-otp-users"
+            ],
+        )
+        self.assertEqual(
+            set(normalized_strings(stmt.get("Action"))),
+            {
+                "elasticache:CreateServerlessCache",
+                "elasticache:ModifyServerlessCache",
+            },
+        )
+        self.assertNotIn(
+            "elasticache:DeleteServerlessCache",
+            normalized_strings(stmt.get("Action")),
+        )
+        self.assertFalse(
+            any("*" in value for value in normalized_strings(stmt.get("Resource")))
         )
 
 

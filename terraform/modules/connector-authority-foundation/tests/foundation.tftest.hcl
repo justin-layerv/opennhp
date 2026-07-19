@@ -119,7 +119,7 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
     condition = (
       aws_elasticache_user.otp_disabled_default.access_string == "off ~* -@all" &&
       aws_elasticache_user.otp_authority.authentication_mode[0].type == "iam" &&
-      aws_elasticache_user.otp_authority.access_string == "on ~connector:* +@connection +@read +@write +@scripting" &&
+      aws_elasticache_user.otp_authority.access_string == "on ~connector:* -@all +@connection +@read +@write +@scripting" &&
       aws_elasticache_user.otp_authority.user_name == aws_elasticache_user.otp_authority.user_id &&
       length(aws_elasticache_user.otp_disabled_default.user_id) <= 40 &&
       length(aws_elasticache_user.otp_authority.user_id) <= 40 &&

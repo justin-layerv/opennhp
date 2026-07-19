@@ -43,6 +43,7 @@ on:
       - "scripts/check-image-tag-writer-allowlist.sh"
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/capture-control-sandbox-first-apply-preflight.sh"
+      - "scripts/capture-control-sandbox-partial-recovery-state.sh"
       - "scripts/check-control-global-routing.sh"
       - "scripts/check-control-vpc-cidr-overlap.sh"
       - "scripts/check-live-main-ref.sh"
@@ -523,6 +524,7 @@ jobs:
         run: |
           shellcheck \
             scripts/capture-control-sandbox-first-apply-preflight.sh \
+            scripts/capture-control-sandbox-partial-recovery-state.sh \
             scripts/check-control-global-routing.sh \
             scripts/check-control-vpc-cidr-overlap.sh \
             scripts/check-live-main-ref.sh \

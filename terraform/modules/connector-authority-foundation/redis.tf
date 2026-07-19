@@ -38,6 +38,25 @@ resource "aws_elasticache_user" "otp_disabled_default" {
     type = "no-password-required"
   }
 
+  lifecycle {
+    # The provider accepts only no-password-required for configuration while
+    # ElastiCache reads the same secure mode back as no-password. Suppress only
+    # that provider/API spelling loop, then fail closed if the refreshed user
+    # is ever password-backed or carries a password.
+    ignore_changes = [authentication_mode[0].type]
+    postcondition {
+      condition = (
+        length(self.authentication_mode) == 1 &&
+        contains(
+          ["no-password-required", "no-password"],
+          self.authentication_mode[0].type,
+        ) &&
+        self.authentication_mode[0].password_count == 0
+      )
+      error_message = "The disabled Redis default user must remain passwordless."
+    }
+  }
+
   tags = merge(local.common_tags, {
     Name    = "${local.name_prefix}-otp-default"
     Purpose = "Disabled Redis OSS default user"
@@ -49,13 +68,30 @@ resource "aws_elasticache_user" "otp_disabled_default" {
 # state. The access string limits the authority to its own key namespace and
 # the read/write/scripting operations needed for atomic OTP/rate-limit state.
 resource "aws_elasticache_user" "otp_authority" {
-  user_id       = local.otp_redis_authority_user_id
-  user_name     = local.otp_redis_authority_user_id
-  access_string = "on ~connector:* +@connection +@read +@write +@scripting"
+  user_id   = local.otp_redis_authority_user_id
+  user_name = local.otp_redis_authority_user_id
+  # ElastiCache canonicalizes an allow-list ACL by inserting an explicit
+  # category reset. Keep that canonical form in configuration so a live
+  # refresh does not propose a perpetual normalization update.
+  access_string = "on ~connector:* -@all +@connection +@read +@write +@scripting"
   engine        = "redis"
 
   authentication_mode {
     type = "iam"
+  }
+
+  lifecycle {
+    # Keep the live identity mode fail closed as well as the configured mode.
+    # A password-backed authority would put a long-lived Redis credential back
+    # into the design even if Terraform configuration still said IAM.
+    postcondition {
+      condition = (
+        length(self.authentication_mode) == 1 &&
+        self.authentication_mode[0].type == "iam" &&
+        self.authentication_mode[0].password_count == 0
+      )
+      error_message = "The Connector OTP authority must remain IAM-only and passwordless."
+    }
   }
 
   tags = merge(local.common_tags, {

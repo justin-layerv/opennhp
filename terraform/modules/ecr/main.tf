@@ -3078,6 +3078,18 @@ resource "aws_iam_policy" "terraform_apply_data" {
         ]
       },
       {
+        # CreateServerlessCache and ModifyServerlessCache independently
+        # authorize a referenced user group. Keep that dependent-resource
+        # grant to the one exact dark Control group.
+        Sid    = "ElastiCacheControlCacheUserGroupDependency"
+        Effect = "Allow"
+        Action = [
+          "elasticache:CreateServerlessCache",
+          "elasticache:ModifyServerlessCache"
+        ]
+        Resource = "arn:aws:elasticache:${local.region}:${local.account_id}:usergroup:layerv-nhp-${var.environment}-control-otp-users"
+      },
+      {
         # These are the only ElastiCache users/groups in the repository. Keep
         # the shared apply role inside this environment's global authority
         # namespace; Create/ModifyUserGroup requires both user and usergroup
@@ -3110,8 +3122,9 @@ resource "aws_iam_policy" "terraform_apply_data" {
       # IAM counts non-whitespace characters toward the 6,144-character
       # customer-managed-policy quota. jsonencode emits no insignificant
       # whitespace, so this is the exact provider payload length. Environment-
-      # specific renders measured 3,084/3,078 characters after adding the
-      # control-only RBAC statement, leaving 3,060/3,066 characters.
+      # specific renders measured 3,340/3,331 characters in sandbox/production
+      # after adding the Control cache user-group dependency, leaving
+      # 2,804/2,813 characters below the hard quota.
       condition     = length(self.policy) <= 6144
       error_message = "terraform_apply_data exceeds IAM's 6,144-character customer-managed policy quota; split statements within the existing attachment budget before applying."
     }

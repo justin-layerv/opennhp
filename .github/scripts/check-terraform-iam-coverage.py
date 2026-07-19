@@ -280,6 +280,19 @@ RESOURCE_ACTIONS: dict[str, ActionSpec] = {
         "elasticache:RemoveTagsFromResource",
         "elasticache:ListTagsForResource",
     ],
+    # internal/service/elasticache/serverless_cache.go — complete serverless
+    # cache lifecycle plus tag APIs exercised by default_tags. Create/modify
+    # can also authorize the referenced user-group ARN; the apply policy and
+    # Control preflight separately fence that dependent-resource scope.
+    "aws_elasticache_serverless_cache": [
+        "elasticache:CreateServerlessCache",
+        "elasticache:ModifyServerlessCache",
+        "elasticache:DeleteServerlessCache",
+        "elasticache:DescribeServerlessCaches",
+        "elasticache:AddTagsToResource",
+        "elasticache:RemoveTagsFromResource",
+        "elasticache:ListTagsForResource",
+    ],
     # internal/service/ec2/vpc_route.go — standalone route CRUD uses
     # CreateRoute, ReplaceRoute, DeleteRoute, and DescribeRouteTables.
     # Route-table and endpoint-owned inline routes are separate resources.
@@ -550,7 +563,6 @@ RESOURCE_UNCHECKED_ACK: frozenset[str] = frozenset({
     "aws_efs_file_system",
     "aws_efs_mount_target",
     "aws_eip",
-    "aws_elasticache_serverless_cache",
     "aws_elasticache_subnet_group",
     "aws_flow_log",
     "aws_glue_catalog_database",

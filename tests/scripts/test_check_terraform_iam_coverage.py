@@ -108,6 +108,7 @@ class ShippedConstants(unittest.TestCase):
             "aws_default_security_group",
             "aws_elasticache_user",
             "aws_elasticache_user_group",
+            "aws_elasticache_serverless_cache",
         ):
             self.assertIn(rtype, IAM.RESOURCE_ACTIONS)
             self.assertNotIn(rtype, grandfathered)
@@ -119,6 +120,18 @@ class ShippedConstants(unittest.TestCase):
         self.assertIn(
             "elasticache:CreateUserGroup",
             IAM.RESOURCE_ACTIONS["aws_elasticache_user_group"],
+        )
+        self.assertEqual(
+            [
+                "elasticache:CreateServerlessCache",
+                "elasticache:ModifyServerlessCache",
+                "elasticache:DeleteServerlessCache",
+                "elasticache:DescribeServerlessCaches",
+                "elasticache:AddTagsToResource",
+                "elasticache:RemoveTagsFromResource",
+                "elasticache:ListTagsForResource",
+            ],
+            IAM.RESOURCE_ACTIONS["aws_elasticache_serverless_cache"],
         )
 
 

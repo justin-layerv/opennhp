@@ -31,6 +31,9 @@ NO_CHECKOUT_CREDENTIALS_SCRIPT_PATH = (
     ROOT / "scripts/check-no-checkout-credentials.sh"
 )
 SECRET_SEED_SCRIPT_PATH = ROOT / "scripts/ensure-control-otp-pepper.sh"
+REDIS_TF_PATH = (
+    ROOT / "terraform/modules/connector-authority-foundation/redis.tf"
+)
 REAL_TERRAFORM_NOOP_FIXTURE_PATH = (
     ROOT / "tests/fixtures/qurl-agent-transact-iam/no-op-terraform-1.14.3.json"
 )
@@ -89,7 +92,7 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
         ),
         "module.control.aws_elasticache_user.otp_authority": (
             {
-                "access_string": "on ~connector:* +@connection +@read +@write +@scripting",
+                "access_string": "on ~connector:* -@all +@connection +@read +@write +@scripting",
                 "authentication_mode": [{"passwords": None, "type": "iam"}],
                 "engine": "redis",
                 "region": CHECKER.AWS_REGION,
@@ -296,21 +299,101 @@ def configuration_fixture() -> dict:
     }
 
 
+def recovery_drift_fixture() -> list[dict]:
+    result = []
+    for address, auth_type in (
+        ("module.control.aws_elasticache_user.otp_authority", "iam"),
+        ("module.control.aws_elasticache_user.otp_disabled_default", "no-password"),
+    ):
+        before = {
+            "id": address,
+            "authentication_mode": [
+                {"password_count": 0, "passwords": None, "type": auth_type}
+            ],
+        }
+        after = copy.deepcopy(before)
+        after["authentication_mode"][0]["passwords"] = []
+        result.append(
+            {
+                "address": address,
+                "mode": "managed",
+                "type": "aws_elasticache_user",
+                "change": {
+                    "actions": ["update"],
+                    "before": before,
+                    "after": after,
+                    "after_unknown": {},
+                    "before_sensitive": {"authentication_mode": [{"passwords": True}]},
+                    "after_sensitive": {"authentication_mode": [{"passwords": True}]},
+                },
+            }
+        )
+    policy = json.dumps(CHECKER.FLOW_LOG_INLINE_POLICY, separators=(",", ":"))
+    result.append(
+        {
+            "address": "module.control.aws_iam_role.flow_logs",
+            "mode": "managed",
+            "type": "aws_iam_role",
+            "change": {
+                "actions": ["update"],
+                "before": {"id": "flow-logs", "inline_policy": []},
+                "after": {
+                    "id": "flow-logs",
+                    "inline_policy": [{"name": "flow-logs", "policy": policy}],
+                },
+                "after_unknown": {},
+                "before_sensitive": {"inline_policy": []},
+                "after_sensitive": {"inline_policy": [{}]},
+            },
+        }
+    )
+    return result
+
+
 def plan_fixture(action: str = "create") -> dict:
+    if action not in {"create", "no-op", "recover", "recover-config"}:
+        raise ValueError(f"unsupported fixture action: {action}")
     security = planned_security_fixture()
+    if action != "create":
+        vpc = security["module.control.aws_vpc.control"][0]
+        vpc["assign_generated_ipv6_cidr_block"] = False
+        vpc["ipv6_ipam_pool_id"] = ""
+        vpc["ipv6_netmask_length"] = 0
+        for address, auth_type in (
+            ("module.control.aws_elasticache_user.otp_authority", "iam"),
+            (
+                "module.control.aws_elasticache_user.otp_disabled_default",
+                "no-password",
+            ),
+        ):
+            security[address][0]["authentication_mode"] = [
+                {
+                    "password_count": 0,
+                    "passwords": None if action == "recover-config" else [],
+                    "type": auth_type,
+                }
+            ]
     changes = []
     for address, resource_type in CHECKER.EXPECTED_RESOURCES.items():
         after, after_unknown = copy.deepcopy(
             security.get(address, ({"id": address}, {}))
         )
-        before = None if action == "create" else copy.deepcopy(after)
+        resource_action = (
+            "create"
+            if action in {"recover", "recover-config"}
+            and address == "module.control.aws_elasticache_serverless_cache.otp"
+            else "no-op"
+            if action in {"recover", "recover-config"}
+            else action
+        )
+        before = None if resource_action == "create" else copy.deepcopy(after)
         changes.append(
             {
                 "address": address,
                 "mode": "managed",
                 "type": resource_type,
                 "change": {
-                    "actions": [action],
+                    "actions": [resource_action],
                     "before": before,
                     "after": after,
                     "after_unknown": after_unknown,
@@ -322,10 +405,16 @@ def plan_fixture(action: str = "create") -> dict:
         "terraform_version": CHECKER.TF_VERSION,
         "complete": True,
         "errored": False,
-        "applyable": action == "create",
+        "applyable": action in {"create", "recover", "recover-config"},
         "action_invocations": [],
         "configuration": configuration_fixture(),
-        "resource_drift": [],
+        "resource_drift": (
+            recovery_drift_fixture()
+            if action == "recover"
+            else None
+            if action == "recover-config"
+            else []
+        ),
         "resource_changes": changes,
     }
 
@@ -354,6 +443,14 @@ class PlanContractTests(unittest.TestCase):
             CHECKER.check_plan(plan_fixture("no-op"), "no-op")["resource_count"],
             41,
         )
+        recovery = CHECKER.check_plan(plan_fixture("recover"), "recover")
+        self.assertEqual(recovery["resource_count"], 41)
+        self.assertEqual(recovery["create_count"], 1)
+        recovery_config = CHECKER.check_plan(
+            plan_fixture("recover-config"), "recover-config"
+        )
+        self.assertEqual(recovery_config["resource_count"], 41)
+        self.assertEqual(recovery_config["create_count"], 1)
 
         normalized = plan_fixture("no-op")
         normalized_changes = {
@@ -366,11 +463,11 @@ class PlanContractTests(unittest.TestCase):
             ("module.control.aws_elasticache_user.otp_authority", "iam"),
             (
                 "module.control.aws_elasticache_user.otp_disabled_default",
-                "no-password-required",
+                "no-password",
             ),
         ):
             normalized_changes[address]["after"]["authentication_mode"] = [
-                {"password_count": 0, "type": auth_type}
+                {"password_count": 0, "passwords": [], "type": auth_type}
             ]
         normalized_changes["module.control.aws_elasticache_user_group.otp"]["after"][
             "user_ids"
@@ -455,6 +552,52 @@ class PlanContractTests(unittest.TestCase):
         unequal_noop = plan_fixture("no-op")
         unequal_noop["resource_changes"][0]["change"]["after"] = {"id": "changed"}
         self.assert_rejected(unequal_noop, "no-op")
+
+    def test_recovery_rejects_any_extra_change_or_drift(self) -> None:
+        for label, mutation in (
+            (
+                "managed-update",
+                lambda plan: plan["resource_changes"][0]["change"].__setitem__(
+                    "actions", ["update"]
+                ),
+            ),
+            (
+                "cache-replacement",
+                lambda plan: self.change(
+                    plan, "module.control.aws_elasticache_serverless_cache.otp"
+                ).__setitem__("actions", ["delete", "create"]),
+            ),
+            (
+                "extra-drift",
+                lambda plan: plan["resource_drift"].append(
+                    {
+                        "address": "module.control.aws_vpc.control",
+                        "mode": "managed",
+                        "type": "aws_vpc",
+                        "change": {"actions": ["update"]},
+                    }
+                ),
+            ),
+            (
+                "drift-type",
+                lambda plan: plan["resource_drift"][0].__setitem__(
+                    "type", "aws_iam_role"
+                ),
+            ),
+            (
+                "missing-exact-drift",
+                lambda plan: plan.__setitem__("resource_drift", []),
+            ),
+        ):
+            with self.subTest(label=label):
+                candidate = plan_fixture("recover")
+                mutation(candidate)
+                self.assert_rejected(candidate, "recover")
+
+    def test_recovery_config_rejects_any_live_drift(self) -> None:
+        candidate = plan_fixture("recover-config")
+        candidate["resource_drift"] = recovery_drift_fixture()
+        self.assert_rejected(candidate, "recover-config")
 
     def test_configuration_actions_and_provisioners_fail(self) -> None:
         action = plan_fixture()
@@ -760,6 +903,107 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaises(CHECKER.ContractError):
                 CHECKER.create_artifact(self.args(**{field: value}))
 
+    def test_recovery_artifact_round_trip_and_state_binding(self) -> None:
+        write_json(self.plan_json, plan_fixture("recover"))
+        created = CHECKER.create_recovery_artifact(self.args())
+        self.assertEqual(created["plan_mode"], "partial-recovery")
+        self.assertEqual(created["failed_apply_run_id"], CHECKER.FAILED_APPLY_RUN_ID)
+        self.assertEqual(created["state_sha256"], CHECKER.PARTIAL_STATE_SHA256)
+        self.assertEqual(CHECKER.verify_recovery_artifact(self.args()), created)
+
+        metadata = json.loads(self.metadata.read_text(encoding="utf-8"))
+        metadata["state_version_id"] = "stale-version"
+        write_json(self.metadata, metadata)
+        with self.assertRaisesRegex(CHECKER.ContractError, "state_version_id"):
+            CHECKER.verify_recovery_artifact(self.args())
+
+
+class PartialStateTests(unittest.TestCase):
+    def raw_state(self) -> dict:
+        resources = []
+        expected = {
+            **{
+                address: ("managed", kind)
+                for address, kind in CHECKER.EXPECTED_RESOURCES.items()
+                if address
+                != "module.control.aws_elasticache_serverless_cache.otp"
+            },
+            **{
+                address: ("data", kind)
+                for address, kind in CHECKER.EXPECTED_DATA_RESOURCES.items()
+            },
+        }
+        pattern = re.compile(
+            r"^module\.control\.(?:data\.)?([^.]+)\.([^\[]+)(?:\[(.+)\])?$"
+        )
+        for address, (mode, resource_type) in expected.items():
+            match = pattern.fullmatch(address)
+            self.assertIsNotNone(match, address)
+            _, name, raw_index = match.groups()
+            instance = {"schema_version": 0, "attributes": {"id": address}}
+            if raw_index is not None:
+                instance["index_key"] = json.loads(raw_index)
+            resources.append(
+                {
+                    "module": "module.control",
+                    "mode": mode,
+                    "type": resource_type,
+                    "name": name,
+                    "instances": [instance],
+                }
+            )
+        return {
+            "version": 4,
+            "terraform_version": CHECKER.TF_VERSION,
+            "serial": CHECKER.PARTIAL_STATE_SERIAL,
+            "lineage": CHECKER.PARTIAL_STATE_LINEAGE,
+            "resources": resources,
+        }
+
+    def check(self, state: dict) -> dict:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.tfstate"
+            head_path = root / "state-head.json"
+            write_json(state_path, state)
+            write_json(
+                head_path,
+                {
+                    "ContentLength": CHECKER.PARTIAL_STATE_CONTENT_LENGTH,
+                    "ETag": CHECKER.PARTIAL_STATE_ETAG,
+                    "VersionId": CHECKER.PARTIAL_STATE_VERSION_ID,
+                    "ServerSideEncryption": "aws:kms",
+                    "SSEKMSKeyId": CHECKER.STATE_KMS_KEY_ARN,
+                },
+            )
+            old_digest = CHECKER.PARTIAL_STATE_SHA256
+            CHECKER.PARTIAL_STATE_SHA256 = CHECKER.sha256_file(state_path)
+            try:
+                return CHECKER.check_partial_state(state_path, head_path)
+            finally:
+                CHECKER.PARTIAL_STATE_SHA256 = old_digest
+
+    def test_exact_partial_state_passes(self) -> None:
+        result = self.check(self.raw_state())
+        self.assertEqual(result["managed_resource_count"], 40)
+        self.assertEqual(result["data_resource_count"], 4)
+
+    def test_extra_missing_and_deposed_state_fail(self) -> None:
+        for label, mutation in (
+            ("missing", lambda state: state["resources"].pop()),
+            (
+                "deposed",
+                lambda state: state["resources"][0]["instances"][0].__setitem__(
+                    "deposed", "deadbeef"
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                state = self.raw_state()
+                mutation(state)
+                with self.assertRaises(CHECKER.ContractError):
+                    self.check(state)
+
 
 def simulation(
     actions: tuple[str, ...], resources: tuple[str, ...], decision: str
@@ -773,6 +1017,43 @@ def simulation(
                 "MissingContextValues": [],
             }
             for action in actions
+            for resource in resources
+        ]
+    }
+
+
+def cache_dependency_simulation(
+    user_group_resource: str, user_group_decision: str
+) -> dict:
+    resources = (CHECKER.CONTROL_CACHE_RESOURCE, user_group_resource)
+    outer_decision = (
+        "allowed" if user_group_decision == "allowed" else "implicitDeny"
+    )
+    return {
+        "EvaluationResults": [
+            {
+                "EvalActionName": action.lower(),
+                "EvalResourceName": resource,
+                "EvalDecision": outer_decision,
+                "ResourceSpecificResults": [
+                    {
+                        "EvalResourceName": nested_resource,
+                        "EvalResourceDecision": (
+                            "allowed"
+                            if nested_resource == CHECKER.CONTROL_CACHE_RESOURCE
+                            else user_group_decision
+                        ),
+                        "MissingContextValues": (
+                            sorted(CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS)
+                            if nested_resource == user_group_resource
+                            and user_group_decision == "implicitDeny"
+                            else []
+                        ),
+                    }
+                    for nested_resource in resources
+                ],
+            }
+            for action in CHECKER.CACHE_DEPENDENCY_ACTIONS
             for resource in resources
         ]
     }
@@ -807,7 +1088,13 @@ def preflight_fixture(root: Path) -> None:
             "PolicyVersion": {
                 "VersionId": policy_version,
                 "IsDefaultVersion": True,
-                "Document": {"Statement": [CHECKER.EXPECTED_CONTROL_STATEMENT]},
+                "Document": {
+                    "Statement": [
+                        CHECKER.EXPECTED_SERVERLESS_CACHE_STATEMENT,
+                        CHECKER.EXPECTED_CACHE_DEPENDENCY_STATEMENT,
+                        CHECKER.EXPECTED_CONTROL_STATEMENT,
+                    ]
+                },
             }
         },
         "attached-policies.json": {
@@ -830,6 +1117,14 @@ def preflight_fixture(root: Path) -> None:
         ),
         "cell-read-simulation.json": simulation(
             CHECKER.CONTROL_READ_ACTIONS, CHECKER.CELL_RESOURCES, "allowed"
+        ),
+        "cache-control-dependency-simulation.json": cache_dependency_simulation(
+            CHECKER.CONTROL_CACHE_USER_GROUP_RESOURCE,
+            "allowed",
+        ),
+        "cache-cell-dependency-simulation.json": cache_dependency_simulation(
+            CHECKER.CELL_CACHE_USER_GROUP_RESOURCE,
+            "implicitDeny",
         ),
         "endpoint-service.json": {
             "ServiceDetails": [
@@ -885,14 +1180,14 @@ class PreflightTests(unittest.TestCase):
                 "ContextKeyName=aws:ResourceAccount,"
                 "ContextKeyValues=${account_id},ContextKeyType=string"
             ),
-            1,
+            3,
         )
         self.assertEqual(
             preflight.count(
                 "ContextKeyName=aws:RequestedRegion,"
                 "ContextKeyValues=${region},ContextKeyType=string"
             ),
-            1,
+            3,
         )
         cell_write_command = preflight[
             preflight.rfind(
@@ -924,6 +1219,56 @@ class PreflightTests(unittest.TestCase):
             with self.assertRaises(CHECKER.ContractError):
                 CHECKER.check_preflight(root)
 
+    def test_present_state_mode_requires_exact_encrypted_versioned_object(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preflight_fixture(root)
+            state = json.loads((root / "state-status.json").read_text())
+            state["state_exists"] = True
+            write_json(root / "state-status.json", state)
+            state_head = {
+                "ContentLength": 123,
+                "ServerSideEncryption": "aws:kms",
+                "SSEKMSKeyId": CHECKER.STATE_KMS_KEY_ARN,
+                "VersionId": "state-version",
+            }
+            write_json(root / "state-head.json", state_head)
+            write_json(root / "otp-secret-versions.json", {"Versions": []})
+            write_json(root / "otp-cache.json", {"exists": False})
+            self.assertEqual(
+                CHECKER.check_preflight(root, "present")["attachment_count"], 10
+            )
+
+            for key, value in (
+                ("ContentLength", 0),
+                ("ServerSideEncryption", "AES256"),
+                ("SSEKMSKeyId", "wrong"),
+                ("VersionId", "null"),
+            ):
+                with self.subTest(key=key):
+                    broken = dict(state_head)
+                    broken[key] = value
+                    write_json(root / "state-head.json", broken)
+                    with self.assertRaises(CHECKER.ContractError):
+                        CHECKER.check_preflight(root, "present")
+
+            write_json(root / "state-head.json", state_head)
+            for filename, value in (
+                ("otp-secret-versions.json", {"Versions": [{"VersionId": "seeded"}]}),
+                ("otp-cache.json", {"exists": True}),
+            ):
+                with self.subTest(filename=filename):
+                    preflight_fixture(root)
+                    state = json.loads((root / "state-status.json").read_text())
+                    state["state_exists"] = True
+                    write_json(root / "state-status.json", state)
+                    write_json(root / "state-head.json", state_head)
+                    write_json(root / "otp-secret-versions.json", {"Versions": []})
+                    write_json(root / "otp-cache.json", {"exists": False})
+                    write_json(root / filename, value)
+                    with self.assertRaises(CHECKER.ContractError):
+                        CHECKER.check_preflight(root, "present")
+
     def test_cell_grant_and_quota_drift_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -937,6 +1282,48 @@ class PreflightTests(unittest.TestCase):
                 ),
             )
             with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_preflight(root)
+
+    def test_cache_create_dependent_user_group_is_exactly_confined(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preflight_fixture(root)
+            write_json(
+                root / "cache-control-dependency-simulation.json",
+                cache_dependency_simulation(
+                    CHECKER.CONTROL_CACHE_USER_GROUP_RESOURCE,
+                    "implicitDeny",
+                ),
+            )
+            with self.assertRaisesRegex(
+                CHECKER.ContractError,
+                "Control cache dependent user group composite",
+            ):
+                CHECKER.check_preflight(root)
+
+            preflight_fixture(root)
+            write_json(
+                root / "cache-cell-dependency-simulation.json",
+                cache_dependency_simulation(
+                    CHECKER.CELL_CACHE_USER_GROUP_RESOURCE,
+                    "allowed",
+                ),
+            )
+            with self.assertRaisesRegex(
+                CHECKER.ContractError,
+                "cell cache dependent user group composite",
+            ):
+                CHECKER.check_preflight(root)
+
+            preflight_fixture(root)
+            malformed = cache_dependency_simulation(
+                CHECKER.CONTROL_CACHE_USER_GROUP_RESOURCE, "allowed"
+            )
+            malformed["EvaluationResults"][0]["ResourceSpecificResults"].pop()
+            write_json(root / "cache-control-dependency-simulation.json", malformed)
+            with self.assertRaisesRegex(
+                CHECKER.ContractError, "composite authorization matrix drifted"
+            ):
                 CHECKER.check_preflight(root)
 
             preflight_fixture(root)
@@ -1200,7 +1587,7 @@ def state_fixture() -> dict:
             "user_name": "default",
             "access_string": "off ~* -@all",
             "authentication_mode": [
-                {"password_count": 0, "type": "no-password-required"}
+                {"password_count": 0, "type": "no-password"}
             ],
         }
     )
@@ -1208,7 +1595,7 @@ def state_fixture() -> dict:
         {
             "user_id": authority_id,
             "user_name": authority_id,
-            "access_string": "on ~connector:* +@connection +@read +@write +@scripting",
+            "access_string": "on ~connector:* -@all +@connection +@read +@write +@scripting",
             "authentication_mode": [{"password_count": 0, "type": "iam"}],
         }
     )
@@ -1284,6 +1671,35 @@ class StateContractTests(unittest.TestCase):
                 resource["values"]["major_engine_version"] = version
                 with self.assertRaises(CHECKER.ContractError):
                     CHECKER.check_state(state)
+
+    def test_state_redis_users_must_have_zero_passwords(self) -> None:
+        for address in (
+            "module.control.aws_elasticache_user.otp_authority",
+            "module.control.aws_elasticache_user.otp_disabled_default",
+        ):
+            with self.subTest(address=address):
+                state = state_fixture()
+                resource = next(
+                    item
+                    for item in state["values"]["root_module"]["resources"]
+                    if item["address"] == address
+                )
+                resource["values"]["authentication_mode"][0]["password_count"] = 1
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER.check_state(state)
+
+    def test_disabled_user_lifecycle_ignore_is_narrow_and_fail_closed(self) -> None:
+        redis = REDIS_TF_PATH.read_text(encoding="utf-8")
+        self.assertEqual(
+            redis.count("ignore_changes = [authentication_mode[0].type]"), 1
+        )
+        self.assertNotIn("ignore_changes = [authentication_mode]", redis)
+        self.assertIn('["no-password-required", "no-password"]', redis)
+        self.assertIn("self.authentication_mode[0].password_count == 0", redis)
+        self.assertIn(
+            'access_string = "on ~connector:* -@all +@connection +@read +@write +@scripting"',
+            redis,
+        )
 
 
 def live_fixture(root: Path) -> None:
@@ -1774,6 +2190,36 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
                         CHECKER.check_source_run(args)
                     run[actor_field]["login"] = CHECKER.TRUSTED_ACTOR
 
+    def test_failed_apply_binding_is_exact(self) -> None:
+        run = {
+            "id": int(CHECKER.FAILED_APPLY_RUN_ID),
+            "event": "workflow_dispatch",
+            "status": "completed",
+            "conclusion": "failure",
+            "head_branch": "main",
+            "head_sha": CHECKER.FAILED_APPLY_COMMIT,
+            "name": CHECKER.WORKFLOW_NAME,
+            "path": CHECKER.WORKFLOW_PATH,
+            "repository": {"full_name": CHECKER.REPOSITORY},
+            "actor": {"login": CHECKER.TRUSTED_ACTOR},
+            "triggering_actor": {"login": CHECKER.TRUSTED_ACTOR},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "failed-run.json"
+            write_json(path, run)
+            CHECKER.check_failed_run(path)
+            for field, value in (
+                ("id", 1),
+                ("conclusion", "success"),
+                ("head_sha", "a" * 40),
+            ):
+                with self.subTest(field=field):
+                    broken = copy.deepcopy(run)
+                    broken[field] = value
+                    write_json(path, broken)
+                    with self.assertRaises(CHECKER.ContractError):
+                        CHECKER.check_failed_run(path)
+
     def test_workflow_and_ledger_fence_sandbox_only_two_dispatch(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         verifier = VERIFY_SCRIPT_PATH.read_text(encoding="utf-8")
@@ -1800,13 +2246,25 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
             self.assertIn(token, workflow)
         self.assertEqual(workflow.count("TF_VERSION:"), 1)
         self.assertIn(f"TF_VERSION: '{CHECKER.TF_VERSION}'", workflow)
-        self.assertEqual(workflow.count("environment: sandbox"), 3)
-        self.assertEqual(workflow.count("Re-read live main before AWS access"), 3)
-        self.assertEqual(workflow.count("scripts/check-live-main-ref.sh"), 4)
+        self.assertEqual(workflow.count("environment: sandbox"), 5)
+        self.assertEqual(workflow.count("Re-read live main before AWS access"), 5)
+        self.assertEqual(workflow.count("scripts/check-live-main-ref.sh"), 7)
         self.assertEqual(
-            workflow.count("scripts/check-no-checkout-credentials.sh"), 4
+            workflow.count("scripts/check-no-checkout-credentials.sh"), 7
         )
-        self.assertEqual(workflow.count("GH_TOKEN: ${{ github.token }}"), 5)
+        self.assertEqual(workflow.count("GH_TOKEN: ${{ github.token }}"), 10)
+        for recovery_token in (
+            "recover-plan",
+            "recover-apply",
+            "RECOVER_PLAN_ONLY",
+            "RECOVER_APPLY_SANDBOX_CONTROL_FOUNDATION",
+            "recovery-artifact-create",
+            "recovery-artifact-verify",
+            "capture-control-sandbox-partial-recovery-state.sh",
+            "--expected-action recover",
+            "29673343567",
+        ):
+            self.assertIn(recovery_token, workflow)
         self.assertIn('gh api "repos/$repository/git/ref/heads/main"', live_main)
         self.assertNotIn("git ls-remote", live_main)
         terraform_apply = workflow.index("terraform apply -input=false")
@@ -1858,7 +2316,11 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
         self.assertIn("plan assumes the apply-capable sandbox role", ledger)
         self.assertIn("newly enabled region blocks the routing audit", ledger)
         self.assertIn("cannot target production", ledger)
-        self.assertIn("retire the create-only PR-plan checker invocation", ledger)
+        self.assertIn("removes the strict `recover-config` checker step", ledger)
+        self.assertIn(
+            "do not reuse `recover-config` for an apply artifact",
+            ledger,
+        )
 
     def test_security_helpers_remain_in_workflow_lint_boundary(self) -> None:
         validate_workflow = VALIDATE_WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -1874,6 +2336,7 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
         )
 
         for helper in (
+            "scripts/capture-control-sandbox-partial-recovery-state.sh",
             "scripts/check-live-main-ref.sh",
             "scripts/check-no-checkout-credentials.sh",
             "scripts/ensure-control-otp-pepper.sh",
@@ -1886,14 +2349,14 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
             validate_workflow,
         )
 
-    def test_real_pr_plan_runs_strict_first_apply_contract(self) -> None:
+    def test_real_pr_plan_runs_strict_partial_recovery_contract(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         plan_workflow = TERRAFORM_PLAN_WORKFLOW_PATH.read_text(encoding="utf-8")
         foundation_check = plan_workflow.index(
             "      - name: Check Terraform Control Plan Contract\n"
         )
         strict_check = plan_workflow.index(
-            "      - name: Check Terraform Control First-Apply Plan Contract\n"
+            "      - name: Check Terraform Control Partial-Recovery Plan Contract\n"
         )
         summary = plan_workflow.index(
             "      - name: Summarize Terraform Control Plan\n"
@@ -1904,13 +2367,14 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
         self.assertIn(
             "python3 .github/scripts/check-control-sandbox-first-apply.py plan "
             "terraform/control/environments/sandbox/control.tfplan.json "
-            "--expected-action create",
+            "--expected-action recover-config",
             plan_workflow,
         )
         self.assertIn(
-            "strict create-only gate is intentionally temporary", plan_workflow
+            "strict recovery-only gate until the attended recovery converges state",
+            plan_workflow,
         )
-        self.assertEqual(workflow.count("persist-credentials: false"), 3)
+        self.assertEqual(workflow.count("persist-credentials: false"), 5)
         self.assertNotIn("persist-credentials: true", workflow)
         self.assertNotIn("--unset-all http.https://github.com/.extraheader", workflow)
 
