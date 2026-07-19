@@ -283,10 +283,9 @@ jobs:
 
       # Deliberately gate every Terraform-input PR. Shared modules, IAM, and
       # workflow helpers can affect this root without living below
-      # terraform/control. During partial recovery the expected PR plan is one
-      # cache create plus 40 no-ops. The plan contract below also rejects any
-      # desired public-network or runtime resource type from the machine-readable
-      # plan.
+      # terraform/control. The recovered foundation must remain an exact
+      # 41-resource no-op. The plan contract below also rejects any desired
+      # public-network or runtime resource type from the machine-readable plan.
       - name: Terraform Control Init
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
         working-directory: terraform/control/environments/sandbox
@@ -324,16 +323,14 @@ jobs:
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code == '0'
         run: scripts/check-connector-authority-foundation.sh terraform/control/environments/sandbox/control.tfplan.json
 
-      # The original first apply stopped after 40 of 41 resources. Keep this
-      # strict recovery-only gate until the attended recovery converges state;
-      # then replace it with the reviewed no-op/update policy in the same
-      # cleanup that retires the first-apply workflow.
-      - name: Check Terraform Control Partial-Recovery Plan Contract
+      # The attended recovery has converged all 41 managed resources. Keep the
+      # read-only PR lane strict: any configuration change is blocked until a
+      # separately reviewed update policy replaces this exact no-op contract.
+      - name: Check Terraform Control No-Op Plan Contract
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code == '0'
-        # This lane deliberately uses -refresh=false. Its distinct mode checks
-        # the exact recovery configuration without weakening the attended,
-        # refresh-enabled recovery contract's exact live-drift requirement.
-        run: python3 .github/scripts/check-control-sandbox-first-apply.py plan terraform/control/environments/sandbox/control.tfplan.json --expected-action recover-config
+        # This lane deliberately uses -refresh=false as a configuration gate;
+        # the attended verifier remains the refresh-enabled live-drift proof.
+        run: python3 .github/scripts/check-control-sandbox-first-apply.py plan terraform/control/environments/sandbox/control.tfplan.json --expected-action no-op
 
       - name: Summarize Terraform Control Plan
         if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code != ''

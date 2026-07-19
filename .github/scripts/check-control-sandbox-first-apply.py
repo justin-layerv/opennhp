@@ -789,11 +789,11 @@ def _check_planned_security(
         return after, unknown
 
     vpc, _ = values("module.control.aws_vpc.control")
-    # The PR lane plans with -refresh=false, so recover-config deliberately
-    # combines refreshed state shapes with the provider's pre-refresh
-    # `passwords = null`. Keep the complete, provider-version-specific shape
-    # per action visible here rather than deriving its two dimensions
-    # independently.
+    # `recover-config` captured the partial-recovery state's provider shape:
+    # refreshed resource values plus pre-convergence `passwords = null`. The
+    # converged PR lane now uses no-op and reads `passwords = []` even with
+    # -refresh=false. Recovery modes remain only until the tracked one-shot
+    # cleanup removes them. Keep each complete provider-specific shape visible.
     live_values, password_value = {
         "create": (False, None),
         "recover": (True, []),
@@ -1173,19 +1173,29 @@ def check_plan(plan: Any, expected_action: str) -> dict[str, str | int]:
     }
 
 
-def check_state_list(path: Path) -> None:
+def check_state_list(path: Path) -> dict[str, int]:
     try:
         addresses = {
             line.strip() for line in path.read_text().splitlines() if line.strip()
         }
     except OSError as exc:
         raise ContractError(f"cannot read Terraform state list: {exc}") from exc
-    missing = sorted(set(EXPECTED_RESOURCES) - addresses)
-    extra = sorted(addresses - set(EXPECTED_RESOURCES))
+
+    # `terraform state list` includes both managed resources and cached data
+    # sources. Require the reviewed union here; the subsequent JSON state check
+    # remains mode-aware and independently enforces the exact 41 managed
+    # resources plus their types and security-sensitive values.
+    expected = set(EXPECTED_RESOURCES) | set(EXPECTED_DATA_RESOURCES)
+    missing = sorted(expected - addresses)
+    extra = sorted(addresses - expected)
     if missing or extra:
         raise ContractError(
             f"Terraform state inventory mismatch; missing={missing}, extra={extra}"
         )
+    return {
+        "data_resource_count": len(EXPECTED_DATA_RESOURCES),
+        "managed_resource_count": len(EXPECTED_RESOURCES),
+    }
 
 
 def _normalized_statement(statement: Any) -> dict[str, Any]:
@@ -2124,8 +2134,7 @@ def main() -> int:
         if args.command == "plan":
             result = check_plan(load_json(args.plan_json), args.expected_action)
         elif args.command == "state-list":
-            check_state_list(args.path)
-            result = {"resource_count": len(EXPECTED_RESOURCES)}
+            result = check_state_list(args.path)
         elif args.command == "preflight":
             result = check_preflight(args.evidence_dir, args.expected_state)
         elif args.command == "artifact-create":

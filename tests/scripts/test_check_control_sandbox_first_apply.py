@@ -838,6 +838,46 @@ class PlanContractTests(unittest.TestCase):
                 self.assert_rejected(candidate)
 
 
+class StateListTests(unittest.TestCase):
+    def check(self, addresses: list[str]) -> dict[str, int]:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state-list.txt"
+            path.write_text("\n".join(addresses) + "\n", encoding="utf-8")
+            return CHECKER.check_state_list(path)
+
+    def expected_addresses(self) -> list[str]:
+        return [
+            *CHECKER.EXPECTED_RESOURCES,
+            *CHECKER.EXPECTED_DATA_RESOURCES,
+        ]
+
+    def test_exact_managed_and_data_inventory_passes(self) -> None:
+        self.assertEqual(
+            self.check(self.expected_addresses()),
+            {"data_resource_count": 4, "managed_resource_count": 41},
+        )
+
+    def test_missing_managed_or_data_address_fails(self) -> None:
+        for address in (
+            "module.control.aws_vpc.control",
+            "module.control.data.aws_region.current",
+        ):
+            with self.subTest(address=address):
+                addresses = self.expected_addresses()
+                addresses.remove(address)
+                with self.assertRaisesRegex(CHECKER.ContractError, re.escape(address)):
+                    self.check(addresses)
+
+    def test_extra_managed_or_data_address_fails(self) -> None:
+        for address in (
+            "module.control.aws_s3_bucket.forbidden",
+            "module.control.data.aws_vpc.forbidden",
+        ):
+            with self.subTest(address=address):
+                with self.assertRaisesRegex(CHECKER.ContractError, re.escape(address)):
+                    self.check([*self.expected_addresses(), address])
+
+
 class ArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -2325,9 +2365,13 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
         self.assertIn("plan assumes the apply-capable sandbox role", ledger)
         self.assertIn("newly enabled region blocks the routing audit", ledger)
         self.assertIn("cannot target production", ledger)
-        self.assertIn("removes the strict `recover-config` checker step", ledger)
         self.assertIn(
-            "do not reuse `recover-config` for an apply artifact",
+            "#3349 advances the read-only PR-plan gate from the completed "
+            "`recover-config` shape to an exact 41-resource no-op",
+            ledger,
+        )
+        self.assertIn(
+            "Never rerun the original apply, recovery plan, or recovery apply",
             ledger,
         )
 
@@ -2358,14 +2402,14 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
             validate_workflow,
         )
 
-    def test_real_pr_plan_runs_strict_partial_recovery_contract(self) -> None:
+    def test_real_pr_plan_runs_strict_noop_contract(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         plan_workflow = TERRAFORM_PLAN_WORKFLOW_PATH.read_text(encoding="utf-8")
         foundation_check = plan_workflow.index(
             "      - name: Check Terraform Control Plan Contract\n"
         )
         strict_check = plan_workflow.index(
-            "      - name: Check Terraform Control Partial-Recovery Plan Contract\n"
+            "      - name: Check Terraform Control No-Op Plan Contract\n"
         )
         summary = plan_workflow.index(
             "      - name: Summarize Terraform Control Plan\n"
@@ -2376,13 +2420,15 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
         self.assertIn(
             "python3 .github/scripts/check-control-sandbox-first-apply.py plan "
             "terraform/control/environments/sandbox/control.tfplan.json "
-            "--expected-action recover-config",
+            "--expected-action no-op",
             plan_workflow,
         )
         self.assertIn(
-            "strict recovery-only gate until the attended recovery converges state",
+            "recovered foundation must remain an exact",
             plan_workflow,
         )
+        self.assertNotIn("--expected-action recover-config", plan_workflow)
+        self.assertNotIn("Partial-Recovery Plan Contract", plan_workflow)
         self.assertEqual(workflow.count("persist-credentials: false"), 5)
         self.assertNotIn("persist-credentials: true", workflow)
         self.assertNotIn("--unset-all http.https://github.com/.extraheader", workflow)
