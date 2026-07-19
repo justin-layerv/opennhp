@@ -64,17 +64,18 @@ aws iam simulate-principal-policy \
   --action-names "${control_actions[@]}" \
   --resource-arns "${control_resources[@]}" \
   --output json >"$evidence_dir/control-simulation.json"
-# The role has unrelated policies conditioned on aws:ResourceAccount. IAM's
-# simulator reports that context as missing on otherwise implicit-deny actions,
-# so provide the exact account already encoded in every cell ARN. Supplying the
-# real request context preserves fail-closed evaluation: any in-account wildcard
-# write grant would become allowed here and fail the checker.
+# The role has unrelated policies conditioned on aws:ResourceAccount and
+# aws:RequestedRegion. IAM's simulator reports that context as missing on
+# otherwise implicit-deny actions, so provide the real values already encoded
+# by this request. This preserves fail-closed evaluation: any in-account or
+# in-region wildcard write grant would become allowed here and fail the checker.
 aws iam simulate-principal-policy \
   --policy-source-arn "arn:aws:iam::${account_id}:role/${role_name}" \
   --action-names "${control_write_actions[@]}" \
   --resource-arns "${cell_resources[@]}" \
   --context-entries \
     "ContextKeyName=aws:ResourceAccount,ContextKeyValues=${account_id},ContextKeyType=string" \
+    "ContextKeyName=aws:RequestedRegion,ContextKeyValues=${region},ContextKeyType=string" \
   --output json >"$evidence_dir/cell-write-simulation.json"
 # Deliberately omit context here: the reviewed Describe*/List* allow is
 # unconditional. A future condition must surface as missing context and stop

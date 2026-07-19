@@ -829,6 +829,56 @@ class TerraformPlanPrBootstrapTests(unittest.TestCase):
 
 
 class ControlRoutingApplyPolicyTests(unittest.TestCase):
+    def test_control_first_apply_elasticache_read_is_exact_and_unconditional(
+        self,
+    ) -> None:
+        policy_resource = find_resource_body(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "aws_iam_policy",
+            "terraform_read",
+        )
+        policy = extract_policy_body(policy_resource.get("policy"))
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        stmt = find_policy_statement(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "terraform_read",
+            "ElastiCacheRead",
+        )
+        elasticache_actions = {
+            action
+            for policy_stmt in policy.get("Statement", []) or []
+            if isinstance(policy_stmt, dict)
+            for action in normalized_strings(policy_stmt.get("Action"))
+            if action.startswith("elasticache:")
+        }
+
+        self.assertEqual(
+            elasticache_actions,
+            {"elasticache:Describe*", "elasticache:List*"},
+        )
+        self.assertEqual(
+            normalized_strings(stmt.get("Action")),
+            ["elasticache:Describe*", "elasticache:List*"],
+        )
+        self.assertEqual(normalized_strings(stmt.get("Resource")), ["*"])
+        self.assertEqual(unquote(stmt.get("Effect")), "Allow")
+        self.assertNotIn("Condition", stmt)
+        self.assertNotIn("NotAction", stmt)
+        self.assertNotIn("NotResource", stmt)
+
+        attachment = find_resource_body(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "aws_iam_role_policy_attachment",
+            "terraform_read",
+        )
+        self.assertEqual(
+            attachment.get("role"), "${aws_iam_role.github_actions.name}"
+        )
+        self.assertEqual(
+            attachment.get("policy_arn"), "${aws_iam_policy.terraform_read.arn}"
+        )
+
     def test_control_first_apply_simulation_grant_is_self_scoped(self) -> None:
         policy_resource = find_resource_body(
             REPO_ROOT / "terraform" / "modules" / "ecr",
@@ -879,6 +929,13 @@ class ControlRoutingApplyPolicyTests(unittest.TestCase):
             preflight.count(
                 "ContextKeyName=aws:ResourceAccount,"
                 "ContextKeyValues=${account_id},ContextKeyType=string"
+            ),
+            1,
+        )
+        self.assertEqual(
+            preflight.count(
+                "ContextKeyName=aws:RequestedRegion,"
+                "ContextKeyValues=${region},ContextKeyType=string"
             ),
             1,
         )

@@ -1558,6 +1558,15 @@ resource "aws_iam_policy" "terraform_read" {
         Resource = "*"
       },
       {
+        Sid    = "ElastiCacheRead"
+        Effect = "Allow"
+        Action = [
+          "elasticache:Describe*",
+          "elasticache:List*"
+        ]
+        Resource = "*"
+      },
+      {
         # GetItem needed for terraform plan to refresh aws_dynamodb_table_item state
         Sid    = "DynamoDBGetItem"
         Effect = "Allow"

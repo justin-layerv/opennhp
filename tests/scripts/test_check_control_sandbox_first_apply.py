@@ -887,6 +887,30 @@ class PreflightTests(unittest.TestCase):
             ),
             1,
         )
+        self.assertEqual(
+            preflight.count(
+                "ContextKeyName=aws:RequestedRegion,"
+                "ContextKeyValues=${region},ContextKeyType=string"
+            ),
+            1,
+        )
+        cell_write_command = preflight[
+            preflight.rfind(
+                "aws iam simulate-principal-policy",
+                0,
+                preflight.index('>"$evidence_dir/cell-write-simulation.json"'),
+            ) : preflight.index('>"$evidence_dir/cell-write-simulation.json"')
+        ]
+        self.assertIn(
+            "ContextKeyName=aws:RequestedRegion,"
+            "ContextKeyValues=${region},ContextKeyType=string",
+            cell_write_command,
+        )
+        self.assertIn(
+            "ContextKeyName=aws:ResourceAccount,"
+            "ContextKeyValues=${account_id},ContextKeyType=string",
+            cell_write_command,
+        )
 
     def test_exact_preflight_passes_and_drift_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -959,28 +983,89 @@ class PreflightTests(unittest.TestCase):
             ):
                 CHECKER.check_preflight(root)
 
-    def test_missing_context_fails_closed_with_sanitized_exact_key_names(self) -> None:
+    def test_cell_write_tolerates_only_exact_impossible_service_context_keys(
+        self,
+    ) -> None:
+        self.assertEqual(
+            CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS,
+            {
+                "cloudwatch:namespace",
+                "iam:AWSServiceName",
+                "iam:PassedToService",
+                "route53:ChangeResourceRecordSetsNormalizedRecordNames",
+                "ssm:resourceTag/Environment",
+            },
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             preflight_fixture(root)
             payload = json.loads(
                 (root / "cell-write-simulation.json").read_text(encoding="utf-8")
             )
-            payload["EvaluationResults"][0]["MissingContextValues"] = [
-                "aws:ResourceAccount",
-                "aws:RequestTag/Owner\n::error::injected",
-                "aws:ResourceAccount",
-            ]
-            write_json(root / "cell-write-simulation.json", payload)
-
-            with self.assertRaises(CHECKER.ContractError) as raised:
-                CHECKER.check_preflight(root)
-            self.assertEqual(
-                str(raised.exception),
-                "cell write simulation has missing context keys: "
-                '["aws:RequestTag/Owner\\n::error::injected",'
-                '"aws:ResourceAccount"]',
+            payload["EvaluationResults"][0]["MissingContextValues"] = sorted(
+                CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS
             )
+            write_json(root / "cell-write-simulation.json", payload)
+            self.assertEqual(CHECKER.check_preflight(root)["attachment_count"], 10)
+
+            payload = simulation(
+                CHECKER.CONTROL_WRITE_ACTIONS,
+                CHECKER.CELL_RESOURCES,
+                "allowed",
+            )
+            payload["EvaluationResults"][0]["MissingContextValues"] = sorted(
+                CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS
+            )
+            write_json(root / "cell-write-simulation.json", payload)
+            with self.assertRaisesRegex(
+                CHECKER.ContractError,
+                "cell write simulation does not match exact implicitDeny matrix",
+            ):
+                CHECKER.check_preflight(root)
+
+            preflight_fixture(root)
+            payload = json.loads(
+                (root / "cell-write-simulation.json").read_text(encoding="utf-8")
+            )
+
+            for key_name in (
+                "aws:ResourceAccount",
+                "aws:RequestedRegion",
+                "aws:RequestTag/Owner\n::error::injected",
+                "iam:NewServiceContextKey",
+            ):
+                with self.subTest(key_name=key_name):
+                    payload["EvaluationResults"][0]["MissingContextValues"] = [
+                        *sorted(CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS),
+                        key_name,
+                    ]
+                    write_json(root / "cell-write-simulation.json", payload)
+                    with self.assertRaises(CHECKER.ContractError) as raised:
+                        CHECKER.check_preflight(root)
+                    self.assertEqual(
+                        str(raised.exception),
+                        "cell write simulation has missing context keys: "
+                        + json.dumps([key_name], separators=(",", ":")),
+                    )
+
+    def test_other_simulations_reject_cell_write_context_exceptions(self) -> None:
+        for filename in ("control-simulation.json", "cell-read-simulation.json"):
+            with (
+                self.subTest(filename=filename),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                preflight_fixture(root)
+                payload = json.loads((root / filename).read_text(encoding="utf-8"))
+                payload["EvaluationResults"][0]["MissingContextValues"] = [
+                    "iam:PassedToService"
+                ]
+                write_json(root / filename, payload)
+                with self.assertRaisesRegex(
+                    CHECKER.ContractError,
+                    "simulation has missing context keys",
+                ):
+                    CHECKER.check_preflight(root)
 
     def test_bucket_versioning_must_be_enabled(self) -> None:
         for value in ({}, {"Status": "Suspended"}):

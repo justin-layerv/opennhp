@@ -972,12 +972,28 @@ def _normalized_statement(statement: Any) -> dict[str, Any]:
     return normalized
 
 
+# The IAM simulator reports missing values from unrelated statements attached
+# to the shared apply role. These service-specific keys cannot exist on an
+# ElastiCache write request. Keep global aws:* keys out of this exception: they
+# can affect real authorization and must either be supplied or fail closed.
+CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS = frozenset(
+    {
+        "cloudwatch:namespace",
+        "iam:AWSServiceName",
+        "iam:PassedToService",
+        "route53:ChangeResourceRecordSetsNormalizedRecordNames",
+        "ssm:resourceTag/Environment",
+    }
+)
+
+
 def _check_simulation(
     payload: Any,
     actions: Iterable[str],
     resources: Iterable[str],
     decision: str,
     label: str,
+    allowed_missing_context_keys: frozenset[str] = frozenset(),
 ) -> None:
     if not isinstance(payload, dict) or not isinstance(
         payload.get("EvaluationResults"), list
@@ -1011,10 +1027,15 @@ def _check_simulation(
                 )
             missing_context_keys.update(missing)
         actual[key] = result.get("EvalDecision")
-    if missing_context_keys:
+    unexpected_missing_context_keys = (
+        missing_context_keys - allowed_missing_context_keys
+    )
+    if unexpected_missing_context_keys:
         # Context key names are safe diagnostics, but JSON-encode them so a
         # provider-controlled name cannot inject terminal or workflow syntax.
-        names = json.dumps(sorted(missing_context_keys), separators=(",", ":"))
+        names = json.dumps(
+            sorted(unexpected_missing_context_keys), separators=(",", ":")
+        )
         raise ContractError(f"{label} simulation has missing context keys: {names}")
     if set(actual) != expected or set(actual.values()) != {decision}:
         raise ContractError(
@@ -1104,6 +1125,7 @@ def check_preflight(evidence_dir: Path) -> dict[str, Any]:
         CELL_RESOURCES,
         "implicitDeny",
         "cell write",
+        CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS,
     )
     _check_simulation(
         load_json(evidence_dir / "cell-read-simulation.json"),
