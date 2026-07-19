@@ -70,27 +70,27 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 		{
 			name:      "issue assignment",
 			operation: OperationIssueAssignment,
-			target:    aliasARN("IssueAssignment", "live"),
+			target:    aliasARN("IssueAssignment", "active"),
 		},
 		{
 			name:      "refresh assignment",
 			operation: OperationRefreshAssignment,
-			target:    aliasARN("RefreshAssignment", "live"),
+			target:    aliasARN("RefreshAssignment", "active"),
 		},
 		{
 			name:      "issue registration OTP",
 			operation: OperationIssueRegistrationOTP,
-			target:    aliasARN("IssueRegistrationOTP-cell0", "live"),
+			target:    aliasARN("IssueRegistrationOTP-cell0", "active"),
 		},
 		{
 			name:      "activate registration",
 			operation: OperationActivateRegistration,
-			target:    aliasARN("ActivateRegistration-cell0", "live"),
+			target:    aliasARN("ActivateRegistration-cell0", "active"),
 		},
 		{
 			name:      "complete registration",
 			operation: OperationCompleteRegistration,
-			target:    aliasARN("CompleteRegistration-cell0", "live"),
+			target:    aliasARN("CompleteRegistration-cell0", "active"),
 		},
 	}
 

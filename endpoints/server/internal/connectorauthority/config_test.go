@@ -27,16 +27,18 @@ func TestConstructorsValidateBoundaryAndTargets(t *testing.T) {
 		{name: "invalid account", cfg: aws.Config{Region: testRegion}, bound: Boundary{AccountID: "123", Region: testRegion}, targets: validHubTargets(), field: "account_id"},
 		{name: "empty region", cfg: aws.Config{}, bound: Boundary{AccountID: testAccountID}, targets: validHubTargets(), field: "region"},
 		{name: "SDK region mismatch", cfg: aws.Config{Region: "us-east-1"}, bound: boundary, targets: validHubTargets(), field: "sdk_region"},
-		{name: "malformed ARN", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "not-an-arn", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live")}, field: "issue_assignment"},
-		{name: "wrong partition", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws-us-gov:lambda:us-west-2:123456789012:function:IssueAssignment:live", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live")}, field: "issue_assignment"},
-		{name: "wrong service", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws:sqs:us-west-2:123456789012:function:IssueAssignment:live", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live")}, field: "issue_assignment"},
-		{name: "wrong region", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws:lambda:us-east-1:123456789012:function:IssueAssignment:live", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live")}, field: "issue_assignment"},
-		{name: "wrong account", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws:lambda:us-west-2:999999999999:function:IssueAssignment:live", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live")}, field: "issue_assignment"},
-		{name: "unqualified function", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws:lambda:us-west-2:123456789012:function:IssueAssignment", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live")}, field: "issue_assignment"},
-		{name: "numeric version", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "42"), RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live")}, field: "issue_assignment"},
-		{name: "latest", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "$LATEST"), RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live")}, field: "issue_assignment"},
-		{name: "extra qualifier", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "live") + ":extra", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live")}, field: "issue_assignment"},
-		{name: "duplicate target", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "live"), RefreshAssignmentAliasARN: aliasARN("IssueAssignment", "live")}, field: "refresh_assignment"},
+		{name: "malformed ARN", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "not-an-arn", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "wrong partition", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws-us-gov:lambda:us-west-2:123456789012:function:IssueAssignment:active", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "wrong service", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws:sqs:us-west-2:123456789012:function:IssueAssignment:active", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "wrong region", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws:lambda:us-east-1:123456789012:function:IssueAssignment:active", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "wrong account", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws:lambda:us-west-2:999999999999:function:IssueAssignment:active", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "unqualified function", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: "arn:aws:lambda:us-west-2:123456789012:function:IssueAssignment", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "numeric version", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "42"), RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "latest", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "$LATEST"), RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "other named alias", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "live"), RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "case-variant alias", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "Active"), RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "extra qualifier", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "active") + ":extra", RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active")}, field: "issue_assignment"},
+		{name: "duplicate target", cfg: aws.Config{Region: testRegion}, bound: boundary, targets: HubTargets{IssueAssignmentAliasARN: aliasARN("IssueAssignment", "active"), RefreshAssignmentAliasARN: aliasARN("IssueAssignment", "active")}, field: "refresh_assignment"},
 	}
 
 	for _, test := range tests {
@@ -54,7 +56,7 @@ func TestConstructorsValidateBoundaryAndTargets(t *testing.T) {
 	}
 }
 
-func TestConstructorsAcceptExactAliasARNs(t *testing.T) {
+func TestConstructorsAcceptExactActiveAliasARNs(t *testing.T) {
 	t.Parallel()
 
 	cfg := aws.Config{Region: testRegion}
@@ -64,11 +66,6 @@ func TestConstructorsAcceptExactAliasARNs(t *testing.T) {
 	}
 	if _, err := NewCellClient(cfg, boundary, validCellTargets()); err != nil {
 		t.Fatalf("NewCellClient: %v", err)
-	}
-	digitLeadingAlias := validHubTargets()
-	digitLeadingAlias.IssueAssignmentAliasARN = aliasARN("IssueAssignment", "1live")
-	if _, err := NewHubClient(cfg, boundary, digitLeadingAlias); err != nil {
-		t.Fatalf("NewHubClient with digit-leading alias: %v", err)
 	}
 }
 
@@ -104,16 +101,16 @@ func TestLambdaClientForcesDefaultEndpointAndOneAttempt(t *testing.T) {
 
 func validHubTargets() HubTargets {
 	return HubTargets{
-		IssueAssignmentAliasARN:   aliasARN("IssueAssignment", "live"),
-		RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "live"),
+		IssueAssignmentAliasARN:   aliasARN("IssueAssignment", "active"),
+		RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active"),
 	}
 }
 
 func validCellTargets() CellTargets {
 	return CellTargets{
-		IssueRegistrationOTPAliasARN: aliasARN("IssueRegistrationOTP-cell0", "live"),
-		ActivateRegistrationAliasARN: aliasARN("ActivateRegistration-cell0", "live"),
-		CompleteRegistrationAliasARN: aliasARN("CompleteRegistration-cell0", "live"),
+		IssueRegistrationOTPAliasARN: aliasARN("IssueRegistrationOTP-cell0", "active"),
+		ActivateRegistrationAliasARN: aliasARN("ActivateRegistration-cell0", "active"),
+		CompleteRegistrationAliasARN: aliasARN("CompleteRegistration-cell0", "active"),
 	}
 }
 

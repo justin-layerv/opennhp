@@ -12,25 +12,26 @@ import (
 var (
 	accountIDPattern    = regexp.MustCompile(`^[0-9]{12}$`)
 	functionNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	aliasNamePattern    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
-	numericPattern      = regexp.MustCompile(`^[0-9]+$`)
 )
+
+const authorityAliasQualifier = "active"
 
 // Boundary pins every authority target to the expected AWS account and region.
 // Target ARNs remain trusted operator configuration: validation enforces the
-// boundary and alias shape but does not infer deployment-specific function names.
+// boundary and exact active alias but does not infer deployment-specific
+// function names.
 type Boundary struct {
 	AccountID string
 	Region    string
 }
 
-// HubTargets contains the two exact versioned alias ARNs available to a hub worker.
+// HubTargets contains the two exact :active alias ARNs available to a hub worker.
 type HubTargets struct {
 	IssueAssignmentAliasARN   string
 	RefreshAssignmentAliasARN string
 }
 
-// CellTargets contains the three exact versioned alias ARNs available to one cell worker.
+// CellTargets contains the three exact :active alias ARNs available to one cell worker.
 type CellTargets struct {
 	IssueRegistrationOTPAliasARN string
 	ActivateRegistrationAliasARN string
@@ -149,11 +150,9 @@ func validAliasARN(value string, boundary Boundary) bool {
 	}
 
 	parts := strings.Split(target.Resource, ":")
-	// A named alias is required: all-numeric qualifiers are raw versions, and
-	// aliasNamePattern also excludes the special $LATEST qualifier.
+	// AWS alias qualifiers are case-sensitive; accept only the exact active alias.
 	if len(parts) != 3 || parts[0] != "function" ||
-		!functionNamePattern.MatchString(parts[1]) || !aliasNamePattern.MatchString(parts[2]) ||
-		numericPattern.MatchString(parts[2]) {
+		!functionNamePattern.MatchString(parts[1]) || parts[2] != authorityAliasQualifier {
 		return false
 	}
 	return true
