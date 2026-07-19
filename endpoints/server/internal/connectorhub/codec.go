@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	conformance "github.com/layervai/qurl-conformance"
 	"golang.org/x/crypto/curve25519"
 
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -48,6 +49,10 @@ var (
 	// rejection. It intentionally carries no parser detail because the request
 	// may contain a registration credential.
 	ErrInvalidAssignmentRequest = errors.New("connector hub: invalid assignment request")
+	// ErrInvalidHubEnvironment means the immutable deployment environment cannot
+	// participate in the frozen Hub request-ID derivation. The rejected value is
+	// never retained in the error.
+	ErrInvalidHubEnvironment = errors.New("connector hub: invalid environment")
 	// ErrAssignmentRequestTooLarge is separate so the future packet handler can
 	// meter body-size abuse without inspecting a secret-bearing request.
 	ErrAssignmentRequestTooLarge = errors.New("connector hub: assignment request too large")
@@ -76,18 +81,28 @@ const (
 )
 
 // Request is the normalized result of one strict parse. Credential is present
-// only for ModeEnroll. AuthenticatedPeerPublicKeyB64 is derived from the Noise
-// peer bytes; no JSON field can supply or override it.
+// only for ModeEnroll. AuthenticatedPeerPublicKeyB64 and HubRequestID are
+// derived from authenticated inputs; no JSON field can supply or override
+// either value. The raw logical nonce is deliberately not retained.
 type Request struct {
 	Mode                          Mode
 	AgentID                       string
 	AuthenticatedPeerPublicKeyB64 string
 	Credential                    string
+	hubRequestID                  string
 }
 
-// DecodeAssignmentRequest strictly parses one LST body exactly once and binds
-// it to the independently authenticated Noise peer.
-func DecodeAssignmentRequest(raw, authenticatedPeer []byte) (Request, error) {
+// HubRequestID returns the private replay identifier derived for this request.
+// It is sent only to the Connector Authority and never appears in an LRT.
+func (r Request) HubRequestID() string {
+	return r.hubRequestID
+}
+
+// DecodeAssignmentRequest strictly parses one LST body exactly once, binds it
+// to the independently authenticated Noise peer, and derives the private replay
+// identifier for the immutable Hub environment. The decoded logical nonce is
+// wiped after derivation and is never retained in Request.
+func DecodeAssignmentRequest(environment string, raw, authenticatedPeer []byte) (Request, error) {
 	if len(authenticatedPeer) != x25519PublicKeyBytes {
 		return Request{}, ErrInvalidAuthenticatedPeer
 	}
@@ -109,6 +124,7 @@ func DecodeAssignmentRequest(raw, authenticatedPeer []byte) (Request, error) {
 		AgentID:                       parsed.agentID,
 		AuthenticatedPeerPublicKeyB64: base64.StdEncoding.EncodeToString(authenticatedPeer),
 	}
+	var operation string
 	switch parsed.mode {
 	case "enroll":
 		if !parsed.credentialPresent || parsed.credential == "" {
@@ -116,12 +132,29 @@ func DecodeAssignmentRequest(raw, authenticatedPeer []byte) (Request, error) {
 		}
 		request.Mode = ModeEnroll
 		request.Credential = parsed.credential
+		operation = conformance.ConnectorHubRequestIDOperationIssue
 	case "refresh":
 		if parsed.credentialPresent {
 			return Request{}, ErrInvalidAssignmentRequest
 		}
 		request.Mode = ModeRefresh
+		operation = conformance.ConnectorHubRequestIDOperationRefresh
 	default:
+		return Request{}, ErrInvalidAssignmentRequest
+	}
+
+	requestNonce, err := conformance.DecodeConnectorHubRequestNonce(parsed.requestNonce)
+	if err != nil {
+		return Request{}, ErrInvalidAssignmentRequest
+	}
+	defer clear(requestNonce)
+	request.hubRequestID, err = conformance.DeriveConnectorHubRequestID(environment, operation, authenticatedPeer, requestNonce)
+	if err != nil {
+		if errors.Is(err, conformance.ErrConnectorHubRequestIDEnvironment) {
+			return Request{}, ErrInvalidHubEnvironment
+		}
+		// Operation, peer, and nonce have already passed closed validation. Keep
+		// any impossible contract drift behind the same opaque request boundary.
 		return Request{}, ErrInvalidAssignmentRequest
 	}
 	return request, nil
@@ -130,6 +163,7 @@ func DecodeAssignmentRequest(raw, authenticatedPeer []byte) (Request, error) {
 type parsedRequest struct {
 	agentID           string
 	mode              string
+	requestNonce      string
 	credential        string
 	credentialPresent bool
 }
@@ -169,6 +203,7 @@ func parseAssignmentRequest(decoder *json.Decoder) (parsedRequest, error) {
 				return parsedRequest{}, err
 			}
 			parsed.mode = data.mode
+			parsed.requestNonce = data.requestNonce
 			parsed.credential = data.credential
 			parsed.credentialPresent = data.credentialPresent
 		default:
@@ -186,6 +221,7 @@ func parseAssignmentRequest(decoder *json.Decoder) (parsedRequest, error) {
 
 type parsedRequestData struct {
 	mode              string
+	requestNonce      string
 	credential        string
 	credentialPresent bool
 }
@@ -195,7 +231,7 @@ func parseRequestData(decoder *json.Decoder) (parsedRequestData, error) {
 		return parsedRequestData{}, err
 	}
 	var parsed parsedRequestData
-	seen := make(map[string]struct{}, 4)
+	seen := make(map[string]struct{}, 5)
 	for decoder.More() {
 		key, err := readUniqueKey(decoder, seen)
 		if err != nil {
@@ -219,6 +255,12 @@ func parseRequestData(decoder *json.Decoder) (parsedRequestData, error) {
 				return parsedRequestData{}, ErrInvalidAssignmentRequest
 			}
 			parsed.mode = value
+		case "request_nonce":
+			value, err := readString(decoder)
+			if err != nil {
+				return parsedRequestData{}, ErrInvalidAssignmentRequest
+			}
+			parsed.requestNonce = value
 		case "credential":
 			value, err := readString(decoder)
 			if err != nil {
@@ -236,7 +278,8 @@ func parseRequestData(decoder *json.Decoder) (parsedRequestData, error) {
 	_, queryPresent := seen["query"]
 	_, versionPresent := seen["version"]
 	_, modePresent := seen["mode"]
-	if !queryPresent || !versionPresent || !modePresent {
+	_, requestNoncePresent := seen["request_nonce"]
+	if !queryPresent || !versionPresent || !modePresent || !requestNoncePresent {
 		return parsedRequestData{}, ErrInvalidAssignmentRequest
 	}
 	return parsed, nil

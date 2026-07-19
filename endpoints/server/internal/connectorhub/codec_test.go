@@ -5,12 +5,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	conformance "github.com/layervai/qurl-conformance"
 )
+
+const testHubEnvironment = "sandbox"
 
 func TestDecodeAssignmentRequestConformanceGolden(t *testing.T) {
 	t.Parallel()
@@ -29,7 +32,7 @@ func TestDecodeAssignmentRequestConformanceGolden(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			request, err := DecodeAssignmentRequest([]byte(test.body), peer)
+			request, err := DecodeAssignmentRequest(testHubEnvironment, []byte(test.body), peer)
 			if err != nil {
 				t.Fatalf("DecodeAssignmentRequest() error = %v", err)
 			}
@@ -44,6 +47,114 @@ func TestDecodeAssignmentRequestConformanceGolden(t *testing.T) {
 	}
 }
 
+func TestDecodeAssignmentRequestHubRequestIDConformanceKATs(t *testing.T) {
+	t.Parallel()
+	vectors, err := conformance.ConnectorHubRequestID()
+	if err != nil {
+		t.Fatalf("load request-ID vectors: %v", err)
+	}
+
+	for _, test := range vectors.Cases {
+		t.Run(test.Name, func(t *testing.T) {
+			t.Parallel()
+			peer, err := base64.StdEncoding.Strict().DecodeString(test.AuthenticatedPeerPublicKeyB64)
+			if err != nil {
+				t.Fatalf("decode peer: %v", err)
+			}
+			mode := "refresh"
+			if test.Operation == conformance.ConnectorHubRequestIDOperationIssue {
+				mode = "enroll"
+			}
+			requestData := map[string]any{
+				"query": assignmentQuery, "version": assignmentVersion,
+				"mode": mode, "request_nonce": test.RequestNonce,
+			}
+			if test.Operation == conformance.ConnectorHubRequestIDOperationIssue {
+				requestData["credential"] = conformance.AgentAssignmentBootstrapCredentialFixture
+			}
+			body, err := json.Marshal(map[string]any{
+				"usrId": "", "devId": "agent-conform", "aspId": assignmentAspID, "usrData": requestData,
+			})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+
+			request, err := DecodeAssignmentRequest(test.Environment, body, peer)
+			if err != nil {
+				t.Fatalf("DecodeAssignmentRequest() error = %v", err)
+			}
+			if request.HubRequestID() != test.HubRequestID {
+				t.Fatalf("hub request ID = %q, want %q", request.HubRequestID(), test.HubRequestID)
+			}
+		})
+	}
+}
+
+func TestRequestDoesNotRetainLogicalNonce(t *testing.T) {
+	t.Parallel()
+	requestType := reflect.TypeOf(Request{})
+	for index := range requestType.NumField() {
+		field := requestType.Field(index)
+		if strings.Contains(strings.ToLower(field.Name), "nonce") {
+			t.Fatalf("Request field %q retains the logical nonce instead of only its derived private ID", field.Name)
+		}
+	}
+}
+
+func TestDecodeAssignmentRequestIDExcludesBodyEncodingAndSemanticFingerprintFields(t *testing.T) {
+	t.Parallel()
+	vectors := assignmentVectors(t)
+	peer := agentPeer(t, vectors)
+	canonical := vectors.RefreshAssignment.Request.BodyJSON
+	reordered := ` { "usrData" : { "request_nonce" : "` + conformance.AgentAssignmentRefreshRequestNonceFixture + `", "mode" : "refresh", "version" : 1, "query" : "cell_assignment" }, "aspId" : "agent", "devId" : "agent-conform", "usrId" : "" } `
+	changedAgent := strings.Replace(canonical, `"devId":"agent-conform"`, `"devId":"agent-conflict"`, 1)
+
+	first, err := DecodeAssignmentRequest(testHubEnvironment, []byte(canonical), peer)
+	if err != nil {
+		t.Fatalf("decode canonical body: %v", err)
+	}
+	for name, body := range map[string]string{"reordered": reordered, "changed agent": changedAgent} {
+		request, err := DecodeAssignmentRequest(testHubEnvironment, []byte(body), peer)
+		if err != nil {
+			t.Fatalf("decode %s body: %v", name, err)
+		}
+		if first.HubRequestID() == "" || first.HubRequestID() != request.HubRequestID() {
+			t.Fatalf("%s body IDs = %q/%q, want one stable logical ID", name, first.HubRequestID(), request.HubRequestID())
+		}
+	}
+
+	enrollBody := vectors.InitialAssignment.Request.BodyJSON
+	changedCredential := conformance.AgentAssignmentBootstrapCredentialFixture[:len(conformance.AgentAssignmentBootstrapCredentialFixture)-1] + "4"
+	changedEnrollBody := strings.Replace(enrollBody, conformance.AgentAssignmentBootstrapCredentialFixture, changedCredential, 1)
+	changedEnrollBody = strings.Replace(changedEnrollBody, `"devId":"agent-conform"`, `"devId":"agent-conflict"`, 1)
+	enroll, err := DecodeAssignmentRequest(testHubEnvironment, []byte(enrollBody), peer)
+	if err != nil {
+		t.Fatalf("decode canonical enroll body: %v", err)
+	}
+	changedEnroll, err := DecodeAssignmentRequest(testHubEnvironment, []byte(changedEnrollBody), peer)
+	if err != nil {
+		t.Fatalf("decode changed-semantics enroll body: %v", err)
+	}
+	// The private Authority fingerprint, not a new replay key, owns same-nonce
+	// conflicts whose authenticated agent or credential semantics changed.
+	if enroll.HubRequestID() == "" || enroll.HubRequestID() != changedEnroll.HubRequestID() {
+		t.Fatalf("changed-semantics IDs = %q/%q, want Authority fingerprint conflict under one ID", enroll.HubRequestID(), changedEnroll.HubRequestID())
+	}
+}
+
+func TestDecodeAssignmentRequestRejectsInvalidEnvironmentWithoutReflection(t *testing.T) {
+	t.Parallel()
+	vectors := assignmentVectors(t)
+	const invalidEnvironment = "Production-secret"
+	request, err := DecodeAssignmentRequest(invalidEnvironment, []byte(vectors.RefreshAssignment.Request.BodyJSON), agentPeer(t, vectors))
+	if !errors.Is(err, ErrInvalidHubEnvironment) || request != (Request{}) {
+		t.Fatalf("request/error = %#v/%v, want zero request and ErrInvalidHubEnvironment", request, err)
+	}
+	if strings.Contains(err.Error(), invalidEnvironment) || strings.Contains(err.Error(), conformance.AgentAssignmentRefreshRequestNonceFixture) {
+		t.Fatalf("environment error reflected input: %q", err)
+	}
+}
+
 func TestDecodeAssignmentRequestConformanceRejects(t *testing.T) {
 	t.Parallel()
 	vectors := assignmentVectors(t)
@@ -54,7 +165,7 @@ func TestDecodeAssignmentRequestConformanceRejects(t *testing.T) {
 		}
 		t.Run(test.Name, func(t *testing.T) {
 			t.Parallel()
-			_, err := DecodeAssignmentRequest([]byte(test.BodyJSON), peer)
+			_, err := DecodeAssignmentRequest(testHubEnvironment, []byte(test.BodyJSON), peer)
 			if !errors.Is(err, ErrInvalidAssignmentRequest) {
 				t.Fatalf("error = %v, want ErrInvalidAssignmentRequest", err)
 			}
@@ -65,7 +176,7 @@ func TestDecodeAssignmentRequestConformanceRejects(t *testing.T) {
 func TestDecodeAssignmentRequestStrictBodyGrammar(t *testing.T) {
 	t.Parallel()
 	peer := make([]byte, 32)
-	valid := `{"usrId":"","devId":"agent-conform","aspId":"agent","usrData":{"query":"cell_assignment","version":1,"mode":"refresh"}}`
+	valid := `{"usrId":"","devId":"agent-conform","aspId":"agent","usrData":{"query":"cell_assignment","version":1,"mode":"refresh","request_nonce":"` + conformance.AgentAssignmentRefreshRequestNonceFixture + `"}}`
 	tests := []struct {
 		name string
 		body string
@@ -86,7 +197,7 @@ func TestDecodeAssignmentRequestStrictBodyGrammar(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := DecodeAssignmentRequest([]byte(test.body), peer); !errors.Is(err, ErrInvalidAssignmentRequest) {
+			if _, err := DecodeAssignmentRequest(testHubEnvironment, []byte(test.body), peer); !errors.Is(err, ErrInvalidAssignmentRequest) {
 				t.Fatalf("error = %v, want ErrInvalidAssignmentRequest", err)
 			}
 		})
@@ -97,26 +208,27 @@ func TestDecodeAssignmentRequestPeerAndSizeFences(t *testing.T) {
 	t.Parallel()
 	vectors := assignmentVectors(t)
 	if got, want := maxApplicationBodyBytes, vectors.AccountCredentialOTP.PacketSizeContract.MaxPlaintextBodyBytes; got != want {
-		t.Fatalf("application body limit = %d, want qurl-conformance v0.6 limit %d", got, want)
+		t.Fatalf("application body limit = %d, want qurl-conformance v0.7 schema-3 limit %d", got, want)
 	}
 	body := []byte(vectors.InitialAssignment.Request.BodyJSON)
-	if _, err := DecodeAssignmentRequest(body, make([]byte, 31)); !errors.Is(err, ErrInvalidAuthenticatedPeer) {
+	if _, err := DecodeAssignmentRequest(testHubEnvironment, body, make([]byte, 31)); !errors.Is(err, ErrInvalidAuthenticatedPeer) {
 		t.Fatalf("short peer error = %v, want ErrInvalidAuthenticatedPeer", err)
 	}
-	if _, err := DecodeAssignmentRequest(make([]byte, maxApplicationBodyBytes+1), make([]byte, 32)); !errors.Is(err, ErrAssignmentRequestTooLarge) {
+	if _, err := DecodeAssignmentRequest(testHubEnvironment, make([]byte, maxApplicationBodyBytes+1), make([]byte, 32)); !errors.Is(err, ErrAssignmentRequestTooLarge) {
 		t.Fatalf("oversized body error = %v, want ErrAssignmentRequestTooLarge", err)
 	}
 }
 
-func TestDecodeAssignmentRequestErrorsDoNotReflectCredential(t *testing.T) {
+func TestDecodeAssignmentRequestErrorsDoNotReflectCredentialOrNonce(t *testing.T) {
 	t.Parallel()
 	const secret = "customer-registration-secret-must-not-appear"
-	body := `{"usrId":"","devId":"agent-conform","aspId":"agent","usrData":{"query":"wrong","version":1,"mode":"enroll","credential":"` + secret + `"}}`
-	_, err := DecodeAssignmentRequest([]byte(body), make([]byte, 32))
+	const nonce = conformance.AgentAssignmentInitialRequestNonceFixture
+	body := `{"usrId":"","devId":"agent-conform","aspId":"agent","usrData":{"query":"wrong","version":1,"mode":"enroll","request_nonce":"` + nonce + `","credential":"` + secret + `"}}`
+	_, err := DecodeAssignmentRequest(testHubEnvironment, []byte(body), make([]byte, 32))
 	if !errors.Is(err, ErrInvalidAssignmentRequest) {
 		t.Fatalf("error = %v, want ErrInvalidAssignmentRequest", err)
 	}
-	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "wrong") {
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), nonce) || strings.Contains(err.Error(), "wrong") {
 		t.Fatalf("error reflected request data: %q", err)
 	}
 }
@@ -333,8 +445,8 @@ func assignmentVectors(t *testing.T) *conformance.AgentAssignmentFile {
 	if err != nil {
 		t.Fatalf("load qurl-conformance assignment vectors: %v", err)
 	}
-	if vectors.SchemaVersion != 2 {
-		t.Fatalf("schema version = %d, want 2", vectors.SchemaVersion)
+	if vectors.SchemaVersion != 3 {
+		t.Fatalf("schema version = %d, want 3", vectors.SchemaVersion)
 	}
 	return vectors
 }
