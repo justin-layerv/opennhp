@@ -868,12 +868,19 @@ class ControlRoutingApplyPolicyTests(unittest.TestCase):
         preflight = (
             REPO_ROOT / "scripts" / "capture-control-sandbox-first-apply-preflight.sh"
         ).read_text(encoding="utf-8")
-        self.assertEqual(preflight.count("aws iam simulate-principal-policy"), 2)
+        self.assertEqual(preflight.count("aws iam simulate-principal-policy"), 3)
         self.assertEqual(
             preflight.count(
                 '--policy-source-arn "arn:aws:iam::${account_id}:role/${role_name}"'
             ),
-            2,
+            3,
+        )
+        self.assertEqual(
+            preflight.count(
+                "ContextKeyName=aws:ResourceAccount,"
+                "ContextKeyValues=${account_id},ContextKeyType=string"
+            ),
+            1,
         )
 
     def test_directconnect_grant_exactly_matches_audit_calls(self) -> None:

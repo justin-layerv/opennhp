@@ -99,6 +99,20 @@ CONTROL_ACTIONS = (
     "elasticache:AddTagsToResource",
     "elasticache:RemoveTagsFromResource",
 )
+# The shared Terraform read policy intentionally grants ElastiCache Describe*
+# and List* account-wide so Terraform can refresh all managed cache resources.
+# The Control boundary is therefore write confinement, not read concealment:
+# cell-scoped writes must remain denied while these three reads remain allowed.
+# The exact read allow is operational too: Terraform refresh needs this reviewed
+# visibility, so a future narrowing must be reviewed instead of silently passing.
+CONTROL_READ_ACTIONS = (
+    "elasticache:DescribeUsers",
+    "elasticache:DescribeUserGroups",
+    "elasticache:ListTagsForResource",
+)
+CONTROL_WRITE_ACTIONS = tuple(
+    action for action in CONTROL_ACTIONS if action not in CONTROL_READ_ACTIONS
+)
 CONTROL_RESOURCES = (
     f"arn:aws:elasticache:{AWS_REGION}:{ACCOUNT_ID}:user:{CONTROL_PREFIX}-otp-auth",
     f"arn:aws:elasticache:{AWS_REGION}:{ACCOUNT_ID}:usergroup:{CONTROL_PREFIX}-otp-users",
@@ -959,28 +973,49 @@ def _normalized_statement(statement: Any) -> dict[str, Any]:
 
 
 def _check_simulation(
-    payload: Any, resources: Iterable[str], decision: str, label: str
+    payload: Any,
+    actions: Iterable[str],
+    resources: Iterable[str],
+    decision: str,
+    label: str,
 ) -> None:
     if not isinstance(payload, dict) or not isinstance(
         payload.get("EvaluationResults"), list
     ):
         raise ContractError(f"{label} simulation is malformed")
     expected = {
-        (action.lower(), resource)
-        for action in CONTROL_ACTIONS
-        for resource in resources
+        (action.lower(), resource) for action in actions for resource in resources
     }
     actual: dict[tuple[str, str], str] = {}
+    missing_context_keys: set[str] = set()
     for result in payload["EvaluationResults"]:
+        if not isinstance(result, dict):
+            raise ContractError(f"{label} simulation result is malformed")
         key = (
             str(result.get("EvalActionName", "")).lower(),
             str(result.get("EvalResourceName", "")),
         )
         if key in actual:
             raise ContractError(f"{label} simulation contains a duplicate result")
-        if result.get("MissingContextValues") not in (None, []):
-            raise ContractError(f"{label} simulation has missing context")
+        missing = result.get("MissingContextValues")
+        if missing is not None and not isinstance(missing, list):
+            raise ContractError(
+                f"{label} simulation has malformed missing-context metadata"
+            )
+        if isinstance(missing, list):
+            if any(
+                not isinstance(key_name, str) or not key_name for key_name in missing
+            ):
+                raise ContractError(
+                    f"{label} simulation has malformed missing-context metadata"
+                )
+            missing_context_keys.update(missing)
         actual[key] = result.get("EvalDecision")
+    if missing_context_keys:
+        # Context key names are safe diagnostics, but JSON-encode them so a
+        # provider-controlled name cannot inject terminal or workflow syntax.
+        names = json.dumps(sorted(missing_context_keys), separators=(",", ":"))
+        raise ContractError(f"{label} simulation has missing context keys: {names}")
     if set(actual) != expected or set(actual.values()) != {decision}:
         raise ContractError(
             f"{label} simulation does not match exact {decision} matrix"
@@ -1038,9 +1073,9 @@ def check_preflight(evidence_dir: Path) -> dict[str, Any]:
         raise ContractError("sandbox Control ElastiCache statement is not exact")
 
     # This preflight owns POLICY_ARN identity, attachment count/quota, and the
-    # Control-allow/cell-deny simulations below. The other shared-role policy
-    # identities remain the normal Terraform/IAM review surface; this attended
-    # one-time workflow does not duplicate that inventory.
+    # Control-allow and cell write-deny/read-allow simulations below. The other
+    # shared-role policy identities remain the normal Terraform/IAM review
+    # surface; this attended one-time workflow does not duplicate that inventory.
     attached = load_json(evidence_dir / "attached-policies.json").get(
         "AttachedPolicies"
     )
@@ -1058,15 +1093,24 @@ def check_preflight(evidence_dir: Path) -> dict[str, Any]:
 
     _check_simulation(
         load_json(evidence_dir / "control-simulation.json"),
+        CONTROL_ACTIONS,
         CONTROL_RESOURCES,
         "allowed",
         "Control",
     )
     _check_simulation(
-        load_json(evidence_dir / "cell-simulation.json"),
+        load_json(evidence_dir / "cell-write-simulation.json"),
+        CONTROL_WRITE_ACTIONS,
         CELL_RESOURCES,
         "implicitDeny",
-        "cell",
+        "cell write",
+    )
+    _check_simulation(
+        load_json(evidence_dir / "cell-read-simulation.json"),
+        CONTROL_READ_ACTIONS,
+        CELL_RESOURCES,
+        "allowed",
+        "cell read",
     )
 
     details = load_json(evidence_dir / "endpoint-service.json").get("ServiceDetails")

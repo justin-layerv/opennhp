@@ -35,19 +35,22 @@ aws iam list-attached-role-policies \
   --output json >"$evidence_dir/attached-policies.json"
 aws iam get-account-summary --output json >"$evidence_dir/account-summary.json"
 
-control_actions=(
+control_write_actions=(
   elasticache:CreateUser
   elasticache:ModifyUser
   elasticache:DeleteUser
-  elasticache:DescribeUsers
   elasticache:CreateUserGroup
   elasticache:ModifyUserGroup
   elasticache:DeleteUserGroup
-  elasticache:DescribeUserGroups
-  elasticache:ListTagsForResource
   elasticache:AddTagsToResource
   elasticache:RemoveTagsFromResource
 )
+control_read_actions=(
+  elasticache:DescribeUsers
+  elasticache:DescribeUserGroups
+  elasticache:ListTagsForResource
+)
+control_actions=("${control_write_actions[@]}" "${control_read_actions[@]}")
 control_resources=(
   "arn:aws:elasticache:${region}:${account_id}:user:layerv-nhp-sandbox-control-otp-auth"
   "arn:aws:elasticache:${region}:${account_id}:usergroup:layerv-nhp-sandbox-control-otp-users"
@@ -61,11 +64,26 @@ aws iam simulate-principal-policy \
   --action-names "${control_actions[@]}" \
   --resource-arns "${control_resources[@]}" \
   --output json >"$evidence_dir/control-simulation.json"
+# The role has unrelated policies conditioned on aws:ResourceAccount. IAM's
+# simulator reports that context as missing on otherwise implicit-deny actions,
+# so provide the exact account already encoded in every cell ARN. Supplying the
+# real request context preserves fail-closed evaluation: any in-account wildcard
+# write grant would become allowed here and fail the checker.
 aws iam simulate-principal-policy \
   --policy-source-arn "arn:aws:iam::${account_id}:role/${role_name}" \
-  --action-names "${control_actions[@]}" \
+  --action-names "${control_write_actions[@]}" \
   --resource-arns "${cell_resources[@]}" \
-  --output json >"$evidence_dir/cell-simulation.json"
+  --context-entries \
+    "ContextKeyName=aws:ResourceAccount,ContextKeyValues=${account_id},ContextKeyType=string" \
+  --output json >"$evidence_dir/cell-write-simulation.json"
+# Deliberately omit context here: the reviewed Describe*/List* allow is
+# unconditional. A future condition must surface as missing context and stop
+# this exact preflight rather than being silently accepted.
+aws iam simulate-principal-policy \
+  --policy-source-arn "arn:aws:iam::${account_id}:role/${role_name}" \
+  --action-names "${control_read_actions[@]}" \
+  --resource-arns "${cell_resources[@]}" \
+  --output json >"$evidence_dir/cell-read-simulation.json"
 
 aws ec2 describe-vpc-endpoint-services \
   --region "$region" \

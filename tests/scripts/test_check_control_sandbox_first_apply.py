@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -760,7 +761,9 @@ class ArtifactTests(unittest.TestCase):
                 CHECKER.create_artifact(self.args(**{field: value}))
 
 
-def simulation(resources: tuple[str, ...], decision: str) -> dict:
+def simulation(
+    actions: tuple[str, ...], resources: tuple[str, ...], decision: str
+) -> dict:
     return {
         "EvaluationResults": [
             {
@@ -769,7 +772,7 @@ def simulation(resources: tuple[str, ...], decision: str) -> dict:
                 "EvalDecision": decision,
                 "MissingContextValues": [],
             }
-            for action in CHECKER.CONTROL_ACTIONS
+            for action in actions
             for resource in resources
         ]
     }
@@ -817,8 +820,17 @@ def preflight_fixture(root: Path) -> None:
             ]
         },
         "account-summary.json": {"SummaryMap": {"AttachedPoliciesPerRoleQuota": 10}},
-        "control-simulation.json": simulation(CHECKER.CONTROL_RESOURCES, "allowed"),
-        "cell-simulation.json": simulation(CHECKER.CELL_RESOURCES, "implicitDeny"),
+        "control-simulation.json": simulation(
+            CHECKER.CONTROL_ACTIONS, CHECKER.CONTROL_RESOURCES, "allowed"
+        ),
+        "cell-write-simulation.json": simulation(
+            CHECKER.CONTROL_WRITE_ACTIONS,
+            CHECKER.CELL_RESOURCES,
+            "implicitDeny",
+        ),
+        "cell-read-simulation.json": simulation(
+            CHECKER.CONTROL_READ_ACTIONS, CHECKER.CELL_RESOURCES, "allowed"
+        ),
         "endpoint-service.json": {
             "ServiceDetails": [
                 {
@@ -842,6 +854,40 @@ def preflight_fixture(root: Path) -> None:
 
 
 class PreflightTests(unittest.TestCase):
+    def test_preflight_script_preserves_exact_cell_simulation_boundaries(self) -> None:
+        preflight = PREFLIGHT_SCRIPT_PATH.read_text(encoding="utf-8")
+
+        def shell_array(name: str) -> tuple[str, ...]:
+            match = re.search(
+                rf"^{name}=\(\n(?P<body>(?:  [^\n]+\n)+)\)$", preflight, re.M
+            )
+            self.assertIsNotNone(match)
+            assert match is not None
+            return tuple(line.strip() for line in match.group("body").splitlines())
+
+        self.assertEqual(
+            shell_array("control_write_actions"), CHECKER.CONTROL_WRITE_ACTIONS
+        )
+        self.assertEqual(
+            shell_array("control_read_actions"), CHECKER.CONTROL_READ_ACTIONS
+        )
+        self.assertIn('control_actions=("${control_write_actions[@]}"', preflight)
+        self.assertIn('"${control_read_actions[@]}")', preflight)
+        self.assertIn(
+            '--action-names "${control_write_actions[@]}"', preflight
+        )
+        self.assertIn('--action-names "${control_read_actions[@]}"', preflight)
+        self.assertIn("cell-write-simulation.json", preflight)
+        self.assertIn("cell-read-simulation.json", preflight)
+        self.assertNotIn('"$evidence_dir/cell-simulation.json"', preflight)
+        self.assertEqual(
+            preflight.count(
+                "ContextKeyName=aws:ResourceAccount,"
+                "ContextKeyValues=${account_id},ContextKeyType=string"
+            ),
+            1,
+        )
+
     def test_exact_preflight_passes_and_drift_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -859,8 +905,12 @@ class PreflightTests(unittest.TestCase):
             root = Path(directory)
             preflight_fixture(root)
             write_json(
-                root / "cell-simulation.json",
-                simulation(CHECKER.CELL_RESOURCES, "allowed"),
+                root / "cell-write-simulation.json",
+                simulation(
+                    CHECKER.CONTROL_WRITE_ACTIONS,
+                    CHECKER.CELL_RESOURCES,
+                    "allowed",
+                ),
             )
             with self.assertRaises(CHECKER.ContractError):
                 CHECKER.check_preflight(root)
@@ -872,6 +922,65 @@ class PreflightTests(unittest.TestCase):
             )
             with self.assertRaises(CHECKER.ContractError):
                 CHECKER.check_preflight(root)
+
+    def test_cell_read_and_write_decisions_are_checked_separately(self) -> None:
+        self.assertEqual(
+            set(CHECKER.CONTROL_READ_ACTIONS),
+            {
+                "elasticache:DescribeUsers",
+                "elasticache:DescribeUserGroups",
+                "elasticache:ListTagsForResource",
+            },
+        )
+        self.assertEqual(
+            set(CHECKER.CONTROL_WRITE_ACTIONS)
+            | set(CHECKER.CONTROL_READ_ACTIONS),
+            set(CHECKER.CONTROL_ACTIONS),
+        )
+        self.assertFalse(
+            set(CHECKER.CONTROL_WRITE_ACTIONS)
+            & set(CHECKER.CONTROL_READ_ACTIONS)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preflight_fixture(root)
+            write_json(
+                root / "cell-read-simulation.json",
+                simulation(
+                    CHECKER.CONTROL_READ_ACTIONS,
+                    CHECKER.CELL_RESOURCES,
+                    "implicitDeny",
+                ),
+            )
+            with self.assertRaisesRegex(
+                CHECKER.ContractError,
+                "cell read simulation does not match exact allowed matrix",
+            ):
+                CHECKER.check_preflight(root)
+
+    def test_missing_context_fails_closed_with_sanitized_exact_key_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preflight_fixture(root)
+            payload = json.loads(
+                (root / "cell-write-simulation.json").read_text(encoding="utf-8")
+            )
+            payload["EvaluationResults"][0]["MissingContextValues"] = [
+                "aws:ResourceAccount",
+                "aws:RequestTag/Owner\n::error::injected",
+                "aws:ResourceAccount",
+            ]
+            write_json(root / "cell-write-simulation.json", payload)
+
+            with self.assertRaises(CHECKER.ContractError) as raised:
+                CHECKER.check_preflight(root)
+            self.assertEqual(
+                str(raised.exception),
+                "cell write simulation has missing context keys: "
+                '["aws:RequestTag/Owner\\n::error::injected",'
+                '"aws:ResourceAccount"]',
+            )
 
     def test_bucket_versioning_must_be_enabled(self) -> None:
         for value in ({}, {"Status": "Suspended"}):
