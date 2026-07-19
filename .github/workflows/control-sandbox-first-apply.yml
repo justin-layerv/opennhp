@@ -465,8 +465,7 @@ jobs:
             "$RUNNER_TEMP/control-plan-artifact/tfplan"
 
       - name: Verify no-op convergence, dark boundary, state encryption, and secret seed
-        run: scripts/verify-control-sandbox-first-apply.sh \
-          "$CONTROL_ROOT" "$RUNNER_TEMP/control-apply-verification"
+        run: scripts/verify-control-sandbox-first-apply.sh "$CONTROL_ROOT" "$RUNNER_TEMP/control-apply-verification"
 
       - name: Upload sanitized verification summaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -543,12 +542,10 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Capture recovery IAM and absent-cache preflight
-        run: scripts/capture-control-sandbox-first-apply-preflight.sh \
-          "$RUNNER_TEMP/control-recovery-plan-preflight" present
+        run: scripts/capture-control-sandbox-first-apply-preflight.sh "$RUNNER_TEMP/control-recovery-plan-preflight" present
 
       - name: Bind exact partial state before planning
-        run: scripts/capture-control-sandbox-partial-recovery-state.sh \
-          "$RUNNER_TEMP/control-recovery-state-before-plan"
+        run: scripts/capture-control-sandbox-partial-recovery-state.sh "$RUNNER_TEMP/control-recovery-state-before-plan"
 
       - name: Initialize sandbox Control state
         working-directory: ${{ env.CONTROL_ROOT }}
@@ -568,8 +565,7 @@ jobs:
             plan tfplan.json --expected-action recover
 
       - name: Re-bind unchanged partial state after planning
-        run: scripts/capture-control-sandbox-partial-recovery-state.sh \
-          "$RUNNER_TEMP/control-recovery-state-after-plan"
+        run: scripts/capture-control-sandbox-partial-recovery-state.sh "$RUNNER_TEMP/control-recovery-state-after-plan"
 
       - name: Bind immutable recovery artifact
         id: recovery-metadata
@@ -731,12 +727,10 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Re-capture recovery IAM and absent-cache preflight
-        run: scripts/capture-control-sandbox-first-apply-preflight.sh \
-          "$RUNNER_TEMP/control-recovery-apply-preflight" present
+        run: scripts/capture-control-sandbox-first-apply-preflight.sh "$RUNNER_TEMP/control-recovery-apply-preflight" present
 
       - name: Bind exact partial state before initialization
-        run: scripts/capture-control-sandbox-partial-recovery-state.sh \
-          "$RUNNER_TEMP/control-recovery-state-before-init"
+        run: scripts/capture-control-sandbox-partial-recovery-state.sh "$RUNNER_TEMP/control-recovery-state-before-init"
 
       - name: Initialize sandbox Control state
         working-directory: ${{ env.CONTROL_ROOT }}
@@ -761,8 +755,7 @@ jobs:
         run: scripts/check-live-main-ref.sh "$PLANNED_COMMIT_SHA"
 
       - name: Re-bind state immediately before recovery apply
-        run: scripts/capture-control-sandbox-partial-recovery-state.sh \
-          "$RUNNER_TEMP/control-recovery-state-before-apply"
+        run: scripts/capture-control-sandbox-partial-recovery-state.sh "$RUNNER_TEMP/control-recovery-state-before-apply"
 
       - name: Apply exact saved recovery plan without GitHub credentials
         working-directory: ${{ env.CONTROL_ROOT }}
@@ -772,8 +765,7 @@ jobs:
             "$RUNNER_TEMP/control-recovery-artifact/tfplan"
 
       - name: Verify convergence, dark boundary, state encryption, and OTP seed
-        run: scripts/verify-control-sandbox-first-apply.sh \
-          "$CONTROL_ROOT" "$RUNNER_TEMP/control-recovery-verification"
+        run: scripts/verify-control-sandbox-first-apply.sh "$CONTROL_ROOT" "$RUNNER_TEMP/control-recovery-verification"
 
       - name: Upload sanitized recovery verification summaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -861,8 +853,7 @@ jobs:
           terraform init -reconfigure -input=false
 
       - name: Require no-op convergence and seed the OTP pepper only if absent
-        run: scripts/verify-control-sandbox-first-apply.sh \
-          "$CONTROL_ROOT" "$RUNNER_TEMP/control-recovery-verification"
+        run: scripts/verify-control-sandbox-first-apply.sh "$CONTROL_ROOT" "$RUNNER_TEMP/control-recovery-verification"
 
       - name: Upload sanitized recovery summaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

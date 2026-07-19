@@ -1935,6 +1935,15 @@ else:
 
 
 class SourceRunAndWorkflowTests(unittest.TestCase):
+    def test_plain_run_scalars_cannot_hide_shell_continuations(self) -> None:
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        offenders = [
+            f"{line_number}: {line.strip()}"
+            for line_number, line in enumerate(workflow.splitlines(), start=1)
+            if re.match(r"^\s*run:\s+.*\\\s*$", line)
+        ]
+        self.assertEqual([], offenders)
+
     @staticmethod
     def initialize_checkout_repository(root: Path) -> Path:
         repository = root / "repository"
