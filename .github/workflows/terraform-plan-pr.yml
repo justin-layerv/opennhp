@@ -283,9 +283,10 @@ jobs:
 
       # Deliberately gate every Terraform-input PR. Shared modules, IAM, and
       # workflow helpers can affect this root without living below
-      # terraform/control. The recovered foundation must remain an exact
-      # 41-resource no-op. The plan contract below also rejects any desired
-      # public-network or runtime resource type from the machine-readable plan.
+      # terraform/control. The converged 41-resource foundation must remain an
+      # exact no-op unless the introducing PR separately reviews and updates
+      # this policy. The plan contract below also rejects any desired public-
+      # network or runtime resource type from the machine-readable plan.
       - name: Terraform Control Init
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
         working-directory: terraform/control/environments/sandbox
@@ -323,14 +324,13 @@ jobs:
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code == '0'
         run: scripts/check-connector-authority-foundation.sh terraform/control/environments/sandbox/control.tfplan.json
 
-      # The attended recovery has converged all 41 managed resources. Keep the
-      # read-only PR lane strict: any configuration change is blocked until a
-      # separately reviewed update policy replaces this exact no-op contract.
+      # Fail closed on any unreviewed Control mutation. A future intentional
+      # update must revise this policy and its exact tests in the same PR. This
+      # lane deliberately uses -refresh=false as a configuration gate; the
+      # deployment verifier remains the refresh-enabled live-drift proof.
       - name: Check Terraform Control No-Op Plan Contract
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code == '0'
-        # This lane deliberately uses -refresh=false as a configuration gate;
-        # the attended verifier remains the refresh-enabled live-drift proof.
-        run: python3 .github/scripts/check-control-sandbox-first-apply.py plan terraform/control/environments/sandbox/control.tfplan.json --expected-action no-op
+        run: python3 .github/scripts/check-control-sandbox-first-apply.py plan terraform/control/environments/sandbox/control.tfplan.json
 
       - name: Summarize Terraform Control Plan
         if: always() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true' && steps.control_plan.outputs.exit_code != ''

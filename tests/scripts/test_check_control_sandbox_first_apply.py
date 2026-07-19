@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Hermetic fail-closed tests for the sandbox Control first-apply boundary."""
+"""Hermetic fail-closed tests for the sandbox Control foundation boundary."""
 
 from __future__ import annotations
 
-import argparse
 import copy
 import hashlib
 import importlib.util
@@ -18,28 +17,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER_PATH = ROOT / ".github/scripts/check-control-sandbox-first-apply.py"
-WORKFLOW_PATH = ROOT / ".github/workflows/control-sandbox-first-apply.yml"
 VALIDATE_WORKFLOW_PATH = ROOT / ".github/workflows/validate-workflows.yml"
 TERRAFORM_PLAN_WORKFLOW_PATH = ROOT / ".github/workflows/terraform-plan-pr.yml"
 MAKEFILE_PATH = ROOT / "Makefile"
-VERIFY_SCRIPT_PATH = ROOT / "scripts/verify-control-sandbox-first-apply.sh"
-PREFLIGHT_SCRIPT_PATH = (
-    ROOT / "scripts/capture-control-sandbox-first-apply-preflight.sh"
-)
-LIVE_MAIN_SCRIPT_PATH = ROOT / "scripts/check-live-main-ref.sh"
-NO_CHECKOUT_CREDENTIALS_SCRIPT_PATH = (
-    ROOT / "scripts/check-no-checkout-credentials.sh"
-)
 SECRET_SEED_SCRIPT_PATH = ROOT / "scripts/ensure-control-otp-pepper.sh"
 REDIS_TF_PATH = (
     ROOT / "terraform/modules/connector-authority-foundation/redis.tf"
 )
 REAL_TERRAFORM_NOOP_FIXTURE_PATH = (
     ROOT / "tests/fixtures/qurl-agent-transact-iam/no-op-terraform-1.14.3.json"
-)
-LEDGER_PATH = (
-    ROOT
-    / "docs/runbooks/prod-rollout-ledger/2026-07-16-issue-3227-connector-authority-foundation.md"
 )
 SPEC = importlib.util.spec_from_file_location("control_first_apply", CHECKER_PATH)
 assert SPEC and SPEC.loader
@@ -299,101 +285,39 @@ def configuration_fixture() -> dict:
     }
 
 
-def recovery_drift_fixture() -> list[dict]:
-    result = []
+def plan_fixture() -> dict:
+    security = planned_security_fixture()
+    vpc = security["module.control.aws_vpc.control"][0]
+    vpc["assign_generated_ipv6_cidr_block"] = False
+    vpc["ipv6_ipam_pool_id"] = ""
+    vpc["ipv6_netmask_length"] = 0
     for address, auth_type in (
         ("module.control.aws_elasticache_user.otp_authority", "iam"),
-        ("module.control.aws_elasticache_user.otp_disabled_default", "no-password"),
+        (
+            "module.control.aws_elasticache_user.otp_disabled_default",
+            "no-password",
+        ),
     ):
-        before = {
-            "id": address,
-            "authentication_mode": [
-                {"password_count": 0, "passwords": None, "type": auth_type}
-            ],
-        }
-        after = copy.deepcopy(before)
-        after["authentication_mode"][0]["passwords"] = []
-        result.append(
+        security[address][0]["authentication_mode"] = [
             {
-                "address": address,
-                "mode": "managed",
-                "type": "aws_elasticache_user",
-                "change": {
-                    "actions": ["update"],
-                    "before": before,
-                    "after": after,
-                    "after_unknown": {},
-                    "before_sensitive": {"authentication_mode": [{"passwords": True}]},
-                    "after_sensitive": {"authentication_mode": [{"passwords": True}]},
-                },
+                "password_count": 0,
+                "passwords": [],
+                "type": auth_type,
             }
-        )
-    policy = json.dumps(CHECKER.FLOW_LOG_INLINE_POLICY, separators=(",", ":"))
-    result.append(
-        {
-            "address": "module.control.aws_iam_role.flow_logs",
-            "mode": "managed",
-            "type": "aws_iam_role",
-            "change": {
-                "actions": ["update"],
-                "before": {"id": "flow-logs", "inline_policy": []},
-                "after": {
-                    "id": "flow-logs",
-                    "inline_policy": [{"name": "flow-logs", "policy": policy}],
-                },
-                "after_unknown": {},
-                "before_sensitive": {"inline_policy": []},
-                "after_sensitive": {"inline_policy": [{}]},
-            },
-        }
-    )
-    return result
-
-
-def plan_fixture(action: str = "create") -> dict:
-    if action not in {"create", "no-op", "recover", "recover-config"}:
-        raise ValueError(f"unsupported fixture action: {action}")
-    security = planned_security_fixture()
-    if action != "create":
-        vpc = security["module.control.aws_vpc.control"][0]
-        vpc["assign_generated_ipv6_cidr_block"] = False
-        vpc["ipv6_ipam_pool_id"] = ""
-        vpc["ipv6_netmask_length"] = 0
-        for address, auth_type in (
-            ("module.control.aws_elasticache_user.otp_authority", "iam"),
-            (
-                "module.control.aws_elasticache_user.otp_disabled_default",
-                "no-password",
-            ),
-        ):
-            security[address][0]["authentication_mode"] = [
-                {
-                    "password_count": 0,
-                    "passwords": None if action == "recover-config" else [],
-                    "type": auth_type,
-                }
-            ]
+        ]
     changes = []
     for address, resource_type in CHECKER.EXPECTED_RESOURCES.items():
         after, after_unknown = copy.deepcopy(
             security.get(address, ({"id": address}, {}))
         )
-        resource_action = (
-            "create"
-            if action in {"recover", "recover-config"}
-            and address == "module.control.aws_elasticache_serverless_cache.otp"
-            else "no-op"
-            if action in {"recover", "recover-config"}
-            else action
-        )
-        before = None if resource_action == "create" else copy.deepcopy(after)
+        before = copy.deepcopy(after)
         changes.append(
             {
                 "address": address,
                 "mode": "managed",
                 "type": resource_type,
                 "change": {
-                    "actions": [resource_action],
+                    "actions": ["no-op"],
                     "before": before,
                     "after": after,
                     "after_unknown": after_unknown,
@@ -405,16 +329,10 @@ def plan_fixture(action: str = "create") -> dict:
         "terraform_version": CHECKER.TF_VERSION,
         "complete": True,
         "errored": False,
-        "applyable": action in {"create", "recover", "recover-config"},
+        "applyable": False,
         "action_invocations": [],
         "configuration": configuration_fixture(),
-        "resource_drift": (
-            recovery_drift_fixture()
-            if action == "recover"
-            else None
-            if action == "recover-config"
-            else []
-        ),
+        "resource_drift": [],
         "resource_changes": changes,
     }
 
@@ -430,29 +348,14 @@ class PlanContractTests(unittest.TestCase):
         )
         self.assertEqual(real_noop["terraform_version"], CHECKER.TF_VERSION)
 
-        candidate = plan_fixture("no-op")
+        candidate = plan_fixture()
         for field in ("format_version", "complete", "errored", "applyable"):
             candidate[field] = real_noop[field]
-        self.assertEqual(CHECKER.check_plan(candidate, "no-op")["resource_count"], 41)
+        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 41)
 
-    def test_exact_create_and_noop_pass(self) -> None:
-        self.assertEqual(
-            CHECKER.check_plan(plan_fixture(), "create")["resource_count"], 41
-        )
-        self.assertEqual(
-            CHECKER.check_plan(plan_fixture("no-op"), "no-op")["resource_count"],
-            41,
-        )
-        recovery = CHECKER.check_plan(plan_fixture("recover"), "recover")
-        self.assertEqual(recovery["resource_count"], 41)
-        self.assertEqual(recovery["create_count"], 1)
-        recovery_config = CHECKER.check_plan(
-            plan_fixture("recover-config"), "recover-config"
-        )
-        self.assertEqual(recovery_config["resource_count"], 41)
-        self.assertEqual(recovery_config["create_count"], 1)
-
-        normalized = plan_fixture("no-op")
+    def test_exact_noop_passes(self) -> None:
+        self.assertEqual(CHECKER.check_plan(plan_fixture())["resource_count"], 41)
+        normalized = plan_fixture()
         normalized_changes = {
             item["address"]: item["change"] for item in normalized["resource_changes"]
         }
@@ -485,11 +388,11 @@ class PlanContractTests(unittest.TestCase):
             "module.control.aws_security_group.otp_redis",
         ):
             normalized_changes[address]["after_unknown"] = {}
-        self.assertEqual(CHECKER.check_plan(normalized, "no-op")["resource_count"], 41)
+        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 41)
 
-    def assert_rejected(self, plan: dict, action: str = "create") -> None:
+    def assert_rejected(self, plan: dict) -> None:
         with self.assertRaises(CHECKER.ContractError):
-            CHECKER.check_plan(plan, action)
+            CHECKER.check_plan(plan)
 
     def change(self, plan: dict, address: str) -> dict:
         return next(
@@ -521,7 +424,7 @@ class PlanContractTests(unittest.TestCase):
                 "address": "aws_lambda_function.forbidden",
                 "mode": "managed",
                 "type": "aws_lambda_function",
-                "change": {"actions": ["create"], "before": None, "after": {}},
+                "change": {"actions": ["no-op"], "before": {}, "after": {}},
             }
         )
         self.assert_rejected(extra)
@@ -537,7 +440,7 @@ class PlanContractTests(unittest.TestCase):
             ("format_version", "1.3"),
             ("complete", False),
             ("errored", True),
-            ("applyable", False),
+            ("applyable", True),
         ):
             candidate = plan_fixture()
             candidate[field] = value
@@ -549,55 +452,9 @@ class PlanContractTests(unittest.TestCase):
         ]
         self.assert_rejected(drift)
 
-        unequal_noop = plan_fixture("no-op")
+        unequal_noop = plan_fixture()
         unequal_noop["resource_changes"][0]["change"]["after"] = {"id": "changed"}
-        self.assert_rejected(unequal_noop, "no-op")
-
-    def test_recovery_rejects_any_extra_change_or_drift(self) -> None:
-        for label, mutation in (
-            (
-                "managed-update",
-                lambda plan: plan["resource_changes"][0]["change"].__setitem__(
-                    "actions", ["update"]
-                ),
-            ),
-            (
-                "cache-replacement",
-                lambda plan: self.change(
-                    plan, "module.control.aws_elasticache_serverless_cache.otp"
-                ).__setitem__("actions", ["delete", "create"]),
-            ),
-            (
-                "extra-drift",
-                lambda plan: plan["resource_drift"].append(
-                    {
-                        "address": "module.control.aws_vpc.control",
-                        "mode": "managed",
-                        "type": "aws_vpc",
-                        "change": {"actions": ["update"]},
-                    }
-                ),
-            ),
-            (
-                "drift-type",
-                lambda plan: plan["resource_drift"][0].__setitem__(
-                    "type", "aws_iam_role"
-                ),
-            ),
-            (
-                "missing-exact-drift",
-                lambda plan: plan.__setitem__("resource_drift", []),
-            ),
-        ):
-            with self.subTest(label=label):
-                candidate = plan_fixture("recover")
-                mutation(candidate)
-                self.assert_rejected(candidate, "recover")
-
-    def test_recovery_config_rejects_any_live_drift(self) -> None:
-        candidate = plan_fixture("recover-config")
-        candidate["resource_drift"] = recovery_drift_fixture()
-        self.assert_rejected(candidate, "recover-config")
+        self.assert_rejected(unequal_noop)
 
     def test_configuration_actions_and_provisioners_fail(self) -> None:
         action = plan_fixture()
@@ -876,635 +733,6 @@ class StateListTests(unittest.TestCase):
             with self.subTest(address=address):
                 with self.assertRaisesRegex(CHECKER.ContractError, re.escape(address)):
                     self.check([*self.expected_addresses(), address])
-
-
-class ArtifactTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.root = Path(self.tempdir.name)
-        self.plan = self.root / "tfplan"
-        self.plan_json = self.root / "tfplan.json"
-        self.metadata = self.root / "plan-metadata.json"
-        self.plan.write_bytes(b"immutable terraform plan")
-        write_json(self.plan_json, plan_fixture())
-        self.base = {
-            "plan": self.plan,
-            "plan_json": self.plan_json,
-            "metadata": self.metadata,
-            "output": self.metadata,
-            "repository": CHECKER.REPOSITORY,
-            "commit_sha": "a" * 40,
-            "plan_sha256": CHECKER.sha256_file(self.plan),
-            "run_id": "12345",
-            "run_attempt": "1",
-            "planned_at_epoch": "200000",
-            "workflow_ref": (
-                f"{CHECKER.REPOSITORY}/{CHECKER.WORKFLOW_PATH}@refs/heads/main"
-            ),
-            "terraform_version": CHECKER.TF_VERSION,
-            "now_epoch": "200001",
-        }
-
-    def tearDown(self) -> None:
-        self.tempdir.cleanup()
-
-    def args(self, **changes: object) -> argparse.Namespace:
-        values = dict(self.base)
-        values.update(changes)
-        return argparse.Namespace(**values)
-
-    def test_artifact_round_trip(self) -> None:
-        created = CHECKER.create_artifact(self.args())
-        self.assertEqual(created["plan_sha256"], self.base["plan_sha256"])
-        self.assertNotIn("state_was_absent", created)
-        self.assertNotIn("lock_was_absent", created)
-        verified = CHECKER.verify_artifact(self.args())
-        self.assertEqual(verified, created)
-
-    def test_tamper_and_stale_artifact_fail(self) -> None:
-        CHECKER.create_artifact(self.args())
-        self.plan.write_bytes(b"tampered")
-        with self.assertRaises(CHECKER.ContractError):
-            CHECKER.verify_artifact(self.args())
-
-        self.plan.write_bytes(b"immutable terraform plan")
-        with self.assertRaises(CHECKER.ContractError):
-            CHECKER.verify_artifact(
-                self.args(now_epoch=str(200000 + CHECKER.PLAN_MAX_AGE_SECONDS + 1))
-            )
-
-    def test_wrong_source_binding_fails(self) -> None:
-        for field, value in (
-            ("repository", "layervai/not-nhp"),
-            ("commit_sha", "A" * 40),
-            ("run_id", "0"),
-            ("terraform_version", "1.15.0"),
-        ):
-            with self.assertRaises(CHECKER.ContractError):
-                CHECKER.create_artifact(self.args(**{field: value}))
-
-    def test_recovery_artifact_round_trip_and_state_binding(self) -> None:
-        write_json(self.plan_json, plan_fixture("recover"))
-        created = CHECKER.create_recovery_artifact(self.args())
-        self.assertEqual(created["plan_mode"], "partial-recovery")
-        self.assertEqual(created["failed_apply_run_id"], CHECKER.FAILED_APPLY_RUN_ID)
-        self.assertEqual(created["state_sha256"], CHECKER.PARTIAL_STATE_SHA256)
-        self.assertEqual(CHECKER.verify_recovery_artifact(self.args()), created)
-
-        metadata = json.loads(self.metadata.read_text(encoding="utf-8"))
-        metadata["state_version_id"] = "stale-version"
-        write_json(self.metadata, metadata)
-        with self.assertRaisesRegex(CHECKER.ContractError, "state_version_id"):
-            CHECKER.verify_recovery_artifact(self.args())
-
-
-class PartialStateTests(unittest.TestCase):
-    def raw_state(self) -> dict:
-        resources = []
-        expected = {
-            **{
-                address: ("managed", kind)
-                for address, kind in CHECKER.EXPECTED_RESOURCES.items()
-                if address
-                != "module.control.aws_elasticache_serverless_cache.otp"
-            },
-            **{
-                address: ("data", kind)
-                for address, kind in CHECKER.EXPECTED_DATA_RESOURCES.items()
-            },
-        }
-        pattern = re.compile(
-            r"^module\.control\.(?:data\.)?([^.]+)\.([^\[]+)(?:\[(.+)\])?$"
-        )
-        for address, (mode, resource_type) in expected.items():
-            match = pattern.fullmatch(address)
-            self.assertIsNotNone(match, address)
-            _, name, raw_index = match.groups()
-            instance = {"schema_version": 0, "attributes": {"id": address}}
-            if raw_index is not None:
-                instance["index_key"] = json.loads(raw_index)
-            resources.append(
-                {
-                    "module": "module.control",
-                    "mode": mode,
-                    "type": resource_type,
-                    "name": name,
-                    "instances": [instance],
-                }
-            )
-        return {
-            "version": 4,
-            "terraform_version": CHECKER.TF_VERSION,
-            "serial": CHECKER.PARTIAL_STATE_SERIAL,
-            "lineage": CHECKER.PARTIAL_STATE_LINEAGE,
-            "resources": resources,
-        }
-
-    def check(self, state: dict) -> dict:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            state_path = root / "state.tfstate"
-            head_path = root / "state-head.json"
-            write_json(state_path, state)
-            write_json(
-                head_path,
-                {
-                    "ContentLength": CHECKER.PARTIAL_STATE_CONTENT_LENGTH,
-                    "ETag": CHECKER.PARTIAL_STATE_ETAG,
-                    "VersionId": CHECKER.PARTIAL_STATE_VERSION_ID,
-                    "ServerSideEncryption": "aws:kms",
-                    "SSEKMSKeyId": CHECKER.STATE_KMS_KEY_ARN,
-                },
-            )
-            old_digest = CHECKER.PARTIAL_STATE_SHA256
-            CHECKER.PARTIAL_STATE_SHA256 = CHECKER.sha256_file(state_path)
-            try:
-                return CHECKER.check_partial_state(state_path, head_path)
-            finally:
-                CHECKER.PARTIAL_STATE_SHA256 = old_digest
-
-    def test_exact_partial_state_passes(self) -> None:
-        result = self.check(self.raw_state())
-        self.assertEqual(result["managed_resource_count"], 40)
-        self.assertEqual(result["data_resource_count"], 4)
-
-    def test_extra_missing_and_deposed_state_fail(self) -> None:
-        for label, mutation in (
-            ("missing", lambda state: state["resources"].pop()),
-            (
-                "deposed",
-                lambda state: state["resources"][0]["instances"][0].__setitem__(
-                    "deposed", "deadbeef"
-                ),
-            ),
-        ):
-            with self.subTest(label=label):
-                state = self.raw_state()
-                mutation(state)
-                with self.assertRaises(CHECKER.ContractError):
-                    self.check(state)
-
-
-def simulation(
-    actions: tuple[str, ...], resources: tuple[str, ...], decision: str
-) -> dict:
-    return {
-        "EvaluationResults": [
-            {
-                "EvalActionName": action.lower(),
-                "EvalResourceName": resource,
-                "EvalDecision": decision,
-                "MissingContextValues": [],
-            }
-            for action in actions
-            for resource in resources
-        ]
-    }
-
-
-def cache_dependency_simulation(
-    user_group_resource: str, user_group_decision: str
-) -> dict:
-    resources = (CHECKER.CONTROL_CACHE_RESOURCE, user_group_resource)
-    outer_decision = (
-        "allowed" if user_group_decision == "allowed" else "implicitDeny"
-    )
-    return {
-        "EvaluationResults": [
-            {
-                "EvalActionName": action.lower(),
-                "EvalResourceName": resource,
-                "EvalDecision": outer_decision,
-                "ResourceSpecificResults": [
-                    {
-                        "EvalResourceName": nested_resource,
-                        "EvalResourceDecision": (
-                            "allowed"
-                            if nested_resource == CHECKER.CONTROL_CACHE_RESOURCE
-                            else user_group_decision
-                        ),
-                        "MissingContextValues": (
-                            sorted(CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS)
-                            if nested_resource == user_group_resource
-                            and user_group_decision == "implicitDeny"
-                            else []
-                        ),
-                    }
-                    for nested_resource in resources
-                ],
-            }
-            for action in CHECKER.CACHE_DEPENDENCY_ACTIONS
-            for resource in resources
-        ]
-    }
-
-
-def preflight_fixture(root: Path) -> None:
-    policy_version = "v14"
-    fixtures = {
-        "caller.json": {
-            "Account": CHECKER.ACCOUNT_ID,
-            "Arn": (
-                f"arn:aws:sts::{CHECKER.ACCOUNT_ID}:assumed-role/"
-                f"{CHECKER.ROLE_NAME}/control-plan"
-            ),
-        },
-        "state-status.json": {
-            "bucket": CHECKER.STATE_BUCKET,
-            "state_key": CHECKER.STATE_KEY,
-            "lock_key": CHECKER.STATE_LOCK_KEY,
-            "state_exists": False,
-            "lock_exists": False,
-        },
-        "bucket-versioning.json": {"Status": "Enabled"},
-        "policy.json": {
-            "Policy": {
-                "Arn": CHECKER.POLICY_ARN,
-                "AttachmentCount": 1,
-                "DefaultVersionId": policy_version,
-            }
-        },
-        "policy-version.json": {
-            "PolicyVersion": {
-                "VersionId": policy_version,
-                "IsDefaultVersion": True,
-                "Document": {
-                    "Statement": [
-                        CHECKER.EXPECTED_SERVERLESS_CACHE_STATEMENT,
-                        CHECKER.EXPECTED_CACHE_DEPENDENCY_STATEMENT,
-                        CHECKER.EXPECTED_CONTROL_STATEMENT,
-                    ]
-                },
-            }
-        },
-        "attached-policies.json": {
-            "AttachedPolicies": [
-                {"PolicyArn": CHECKER.POLICY_ARN},
-                *(
-                    {"PolicyArn": f"arn:aws:iam::aws:policy/Fake{index}"}
-                    for index in range(9)
-                ),
-            ]
-        },
-        "account-summary.json": {"SummaryMap": {"AttachedPoliciesPerRoleQuota": 10}},
-        "control-simulation.json": simulation(
-            CHECKER.CONTROL_ACTIONS, CHECKER.CONTROL_RESOURCES, "allowed"
-        ),
-        "cell-write-simulation.json": simulation(
-            CHECKER.CONTROL_WRITE_ACTIONS,
-            CHECKER.CELL_RESOURCES,
-            "implicitDeny",
-        ),
-        "cell-read-simulation.json": simulation(
-            CHECKER.CONTROL_READ_ACTIONS, CHECKER.CELL_RESOURCES, "allowed"
-        ),
-        "cache-control-dependency-simulation.json": cache_dependency_simulation(
-            CHECKER.CONTROL_CACHE_USER_GROUP_RESOURCE,
-            "allowed",
-        ),
-        "cache-cell-dependency-simulation.json": cache_dependency_simulation(
-            CHECKER.CELL_CACHE_USER_GROUP_RESOURCE,
-            "implicitDeny",
-        ),
-        "endpoint-service.json": {
-            "ServiceDetails": [
-                {
-                    "ServiceName": f"com.amazonaws.{CHECKER.AWS_REGION}.email",
-                    "ServiceType": [{"ServiceType": "Interface"}],
-                    "AvailabilityZones": ["us-east-2a", "us-east-2b", "us-east-2c"],
-                }
-            ]
-        },
-        "state-kms.json": {
-            "KeyMetadata": {
-                "Arn": CHECKER.STATE_KMS_KEY_ARN,
-                "Enabled": True,
-                "KeyState": "Enabled",
-                "KeyUsage": "ENCRYPT_DECRYPT",
-            }
-        },
-    }
-    for filename, value in fixtures.items():
-        write_json(root / filename, value)
-
-
-class PreflightTests(unittest.TestCase):
-    def test_preflight_script_preserves_exact_cell_simulation_boundaries(self) -> None:
-        preflight = PREFLIGHT_SCRIPT_PATH.read_text(encoding="utf-8")
-
-        def shell_array(name: str) -> tuple[str, ...]:
-            match = re.search(
-                rf"^{name}=\(\n(?P<body>(?:  [^\n]+\n)+)\)$", preflight, re.M
-            )
-            self.assertIsNotNone(match)
-            assert match is not None
-            return tuple(line.strip() for line in match.group("body").splitlines())
-
-        self.assertEqual(
-            shell_array("control_write_actions"), CHECKER.CONTROL_WRITE_ACTIONS
-        )
-        self.assertEqual(
-            shell_array("control_read_actions"), CHECKER.CONTROL_READ_ACTIONS
-        )
-        self.assertIn('control_actions=("${control_write_actions[@]}"', preflight)
-        self.assertIn('"${control_read_actions[@]}")', preflight)
-        self.assertIn(
-            '--action-names "${control_write_actions[@]}"', preflight
-        )
-        self.assertIn('--action-names "${control_read_actions[@]}"', preflight)
-        self.assertIn("cell-write-simulation.json", preflight)
-        self.assertIn("cell-read-simulation.json", preflight)
-        self.assertNotIn('"$evidence_dir/cell-simulation.json"', preflight)
-        self.assertEqual(
-            preflight.count(
-                "ContextKeyName=aws:ResourceAccount,"
-                "ContextKeyValues=${account_id},ContextKeyType=string"
-            ),
-            3,
-        )
-        self.assertEqual(
-            preflight.count(
-                "ContextKeyName=aws:RequestedRegion,"
-                "ContextKeyValues=${region},ContextKeyType=string"
-            ),
-            3,
-        )
-        cell_write_command = preflight[
-            preflight.rfind(
-                "aws iam simulate-principal-policy",
-                0,
-                preflight.index('>"$evidence_dir/cell-write-simulation.json"'),
-            ) : preflight.index('>"$evidence_dir/cell-write-simulation.json"')
-        ]
-        self.assertIn(
-            "ContextKeyName=aws:RequestedRegion,"
-            "ContextKeyValues=${region},ContextKeyType=string",
-            cell_write_command,
-        )
-        self.assertIn(
-            "ContextKeyName=aws:ResourceAccount,"
-            "ContextKeyValues=${account_id},ContextKeyType=string",
-            cell_write_command,
-        )
-
-    def test_exact_preflight_passes_and_drift_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            preflight_fixture(root)
-            self.assertEqual(CHECKER.check_preflight(root)["attachment_count"], 10)
-
-            state = json.loads((root / "state-status.json").read_text())
-            state["state_exists"] = True
-            write_json(root / "state-status.json", state)
-            with self.assertRaises(CHECKER.ContractError):
-                CHECKER.check_preflight(root)
-
-    def test_present_state_mode_requires_exact_encrypted_versioned_object(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            preflight_fixture(root)
-            state = json.loads((root / "state-status.json").read_text())
-            state["state_exists"] = True
-            write_json(root / "state-status.json", state)
-            state_head = {
-                "ContentLength": 123,
-                "ServerSideEncryption": "aws:kms",
-                "SSEKMSKeyId": CHECKER.STATE_KMS_KEY_ARN,
-                "VersionId": "state-version",
-            }
-            write_json(root / "state-head.json", state_head)
-            write_json(root / "otp-secret-versions.json", {"Versions": []})
-            write_json(root / "otp-cache.json", {"exists": False})
-            self.assertEqual(
-                CHECKER.check_preflight(root, "present")["attachment_count"], 10
-            )
-
-            for key, value in (
-                ("ContentLength", 0),
-                ("ServerSideEncryption", "AES256"),
-                ("SSEKMSKeyId", "wrong"),
-                ("VersionId", "null"),
-            ):
-                with self.subTest(key=key):
-                    broken = dict(state_head)
-                    broken[key] = value
-                    write_json(root / "state-head.json", broken)
-                    with self.assertRaises(CHECKER.ContractError):
-                        CHECKER.check_preflight(root, "present")
-
-            write_json(root / "state-head.json", state_head)
-            for filename, value in (
-                ("otp-secret-versions.json", {"Versions": [{"VersionId": "seeded"}]}),
-                ("otp-cache.json", {"exists": True}),
-            ):
-                with self.subTest(filename=filename):
-                    preflight_fixture(root)
-                    state = json.loads((root / "state-status.json").read_text())
-                    state["state_exists"] = True
-                    write_json(root / "state-status.json", state)
-                    write_json(root / "state-head.json", state_head)
-                    write_json(root / "otp-secret-versions.json", {"Versions": []})
-                    write_json(root / "otp-cache.json", {"exists": False})
-                    write_json(root / filename, value)
-                    with self.assertRaises(CHECKER.ContractError):
-                        CHECKER.check_preflight(root, "present")
-
-    def test_cell_grant_and_quota_drift_fail(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            preflight_fixture(root)
-            write_json(
-                root / "cell-write-simulation.json",
-                simulation(
-                    CHECKER.CONTROL_WRITE_ACTIONS,
-                    CHECKER.CELL_RESOURCES,
-                    "allowed",
-                ),
-            )
-            with self.assertRaises(CHECKER.ContractError):
-                CHECKER.check_preflight(root)
-
-    def test_cache_create_dependent_user_group_is_exactly_confined(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            preflight_fixture(root)
-            write_json(
-                root / "cache-control-dependency-simulation.json",
-                cache_dependency_simulation(
-                    CHECKER.CONTROL_CACHE_USER_GROUP_RESOURCE,
-                    "implicitDeny",
-                ),
-            )
-            with self.assertRaisesRegex(
-                CHECKER.ContractError,
-                "Control cache dependent user group composite",
-            ):
-                CHECKER.check_preflight(root)
-
-            preflight_fixture(root)
-            write_json(
-                root / "cache-cell-dependency-simulation.json",
-                cache_dependency_simulation(
-                    CHECKER.CELL_CACHE_USER_GROUP_RESOURCE,
-                    "allowed",
-                ),
-            )
-            with self.assertRaisesRegex(
-                CHECKER.ContractError,
-                "cell cache dependent user group composite",
-            ):
-                CHECKER.check_preflight(root)
-
-            preflight_fixture(root)
-            malformed = cache_dependency_simulation(
-                CHECKER.CONTROL_CACHE_USER_GROUP_RESOURCE, "allowed"
-            )
-            malformed["EvaluationResults"][0]["ResourceSpecificResults"].pop()
-            write_json(root / "cache-control-dependency-simulation.json", malformed)
-            with self.assertRaisesRegex(
-                CHECKER.ContractError, "composite authorization matrix drifted"
-            ):
-                CHECKER.check_preflight(root)
-
-            preflight_fixture(root)
-            write_json(
-                root / "account-summary.json",
-                {"SummaryMap": {"AttachedPoliciesPerRoleQuota": 20}},
-            )
-            with self.assertRaises(CHECKER.ContractError):
-                CHECKER.check_preflight(root)
-
-    def test_cell_read_and_write_decisions_are_checked_separately(self) -> None:
-        self.assertEqual(
-            set(CHECKER.CONTROL_READ_ACTIONS),
-            {
-                "elasticache:DescribeUsers",
-                "elasticache:DescribeUserGroups",
-                "elasticache:ListTagsForResource",
-            },
-        )
-        self.assertEqual(
-            set(CHECKER.CONTROL_WRITE_ACTIONS)
-            | set(CHECKER.CONTROL_READ_ACTIONS),
-            set(CHECKER.CONTROL_ACTIONS),
-        )
-        self.assertFalse(
-            set(CHECKER.CONTROL_WRITE_ACTIONS)
-            & set(CHECKER.CONTROL_READ_ACTIONS)
-        )
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            preflight_fixture(root)
-            write_json(
-                root / "cell-read-simulation.json",
-                simulation(
-                    CHECKER.CONTROL_READ_ACTIONS,
-                    CHECKER.CELL_RESOURCES,
-                    "implicitDeny",
-                ),
-            )
-            with self.assertRaisesRegex(
-                CHECKER.ContractError,
-                "cell read simulation does not match exact allowed matrix",
-            ):
-                CHECKER.check_preflight(root)
-
-    def test_cell_write_tolerates_only_exact_impossible_service_context_keys(
-        self,
-    ) -> None:
-        self.assertEqual(
-            CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS,
-            {
-                "cloudwatch:namespace",
-                "iam:AWSServiceName",
-                "iam:PassedToService",
-                "route53:ChangeResourceRecordSetsNormalizedRecordNames",
-                "ssm:resourceTag/Environment",
-            },
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            preflight_fixture(root)
-            payload = json.loads(
-                (root / "cell-write-simulation.json").read_text(encoding="utf-8")
-            )
-            payload["EvaluationResults"][0]["MissingContextValues"] = sorted(
-                CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS
-            )
-            write_json(root / "cell-write-simulation.json", payload)
-            self.assertEqual(CHECKER.check_preflight(root)["attachment_count"], 10)
-
-            payload = simulation(
-                CHECKER.CONTROL_WRITE_ACTIONS,
-                CHECKER.CELL_RESOURCES,
-                "allowed",
-            )
-            payload["EvaluationResults"][0]["MissingContextValues"] = sorted(
-                CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS
-            )
-            write_json(root / "cell-write-simulation.json", payload)
-            with self.assertRaisesRegex(
-                CHECKER.ContractError,
-                "cell write simulation does not match exact implicitDeny matrix",
-            ):
-                CHECKER.check_preflight(root)
-
-            preflight_fixture(root)
-            payload = json.loads(
-                (root / "cell-write-simulation.json").read_text(encoding="utf-8")
-            )
-
-            for key_name in (
-                "aws:ResourceAccount",
-                "aws:RequestedRegion",
-                "aws:RequestTag/Owner\n::error::injected",
-                "iam:NewServiceContextKey",
-            ):
-                with self.subTest(key_name=key_name):
-                    payload["EvaluationResults"][0]["MissingContextValues"] = [
-                        *sorted(CHECKER.CELL_WRITE_IMPOSSIBLE_CONTEXT_KEYS),
-                        key_name,
-                    ]
-                    write_json(root / "cell-write-simulation.json", payload)
-                    with self.assertRaises(CHECKER.ContractError) as raised:
-                        CHECKER.check_preflight(root)
-                    self.assertEqual(
-                        str(raised.exception),
-                        "cell write simulation has missing context keys: "
-                        + json.dumps([key_name], separators=(",", ":")),
-                    )
-
-    def test_other_simulations_reject_cell_write_context_exceptions(self) -> None:
-        for filename in ("control-simulation.json", "cell-read-simulation.json"):
-            with (
-                self.subTest(filename=filename),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                root = Path(directory)
-                preflight_fixture(root)
-                payload = json.loads((root / filename).read_text(encoding="utf-8"))
-                payload["EvaluationResults"][0]["MissingContextValues"] = [
-                    "iam:PassedToService"
-                ]
-                write_json(root / filename, payload)
-                with self.assertRaisesRegex(
-                    CHECKER.ContractError,
-                    "simulation has missing context keys",
-                ):
-                    CHECKER.check_preflight(root)
-
-    def test_bucket_versioning_must_be_enabled(self) -> None:
-        for value in ({}, {"Status": "Suspended"}):
-            with (
-                self.subTest(value=value),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                root = Path(directory)
-                preflight_fixture(root)
-                write_json(root / "bucket-versioning.json", value)
-                with self.assertRaises(CHECKER.ContractError):
-                    CHECKER.check_preflight(root)
 
 
 def state_fixture() -> dict:
@@ -1974,425 +1202,50 @@ else:
                 self.assertNotIn("put-secret-value", self.log_path.read_text())
 
 
-class SourceRunAndWorkflowTests(unittest.TestCase):
-    def test_plain_run_scalars_cannot_hide_shell_continuations(self) -> None:
-        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
-        offenders = [
-            f"{line_number}: {line.strip()}"
-            for line_number, line in enumerate(workflow.splitlines(), start=1)
-            if re.match(r"^\s*run:\s+.*\\\s*$", line)
-        ]
-        self.assertEqual([], offenders)
-
-    @staticmethod
-    def initialize_checkout_repository(root: Path) -> Path:
-        repository = root / "repository"
-        subprocess.run(["git", "init", "--quiet", repository], check=True, text=True)
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                repository,
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/layervai/nhp",
-            ],
-            check=True,
-            text=True,
-        )
-        return repository
-
-    @staticmethod
-    def run_checkout_credential_check(
-        repository: Path,
-    ) -> subprocess.CompletedProcess[str]:
-        env = dict(os.environ)
-        env.pop("GH_TOKEN", None)
-        env.pop("GITHUB_TOKEN", None)
-        env["GITHUB_REPOSITORY"] = "layervai/nhp"
-        return subprocess.run(
-            [str(NO_CHECKOUT_CREDENTIALS_SCRIPT_PATH)],
-            cwd=repository,
-            env=env,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-
-    def test_checkout_v7_include_credential_indirection_is_rejected(self) -> None:
-        key = "http.https://github.com/.extraheader"
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            repository = self.initialize_checkout_repository(root)
-            credentials = root / "git-credentials.config"
-            subprocess.run(
-                [
-                    "git",
-                    "config",
-                    "--file",
-                    credentials,
-                    key,
-                    "AUTHORIZATION: basic checkout-v7-token",
-                ],
-                check=True,
-                text=True,
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    repository,
-                    "config",
-                    "--local",
-                    f"includeIf.gitdir:{repository}/.git.path",
-                    str(credentials),
-                ],
-                check=True,
-                text=True,
-            )
-
-            # This is the exact false-negative that motivated the fix: the
-            # header is absent from .git/config but active through includeIf.
-            local_only = subprocess.run(
-                ["git", "config", "--local", "--get-regexp", "extraheader$"],
-                cwd=repository,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            effective = subprocess.run(
-                ["git", "config", "--get-regexp", "extraheader$"],
-                cwd=repository,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(local_only.returncode, 1, local_only.stdout)
-            self.assertEqual(effective.returncode, 0, effective.stderr)
-
-            result = self.run_checkout_credential_check(repository)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("effective git config", result.stdout)
-
-    def test_checkout_credential_boundary_accepts_nonpersistent_checkout(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repository = self.initialize_checkout_repository(
-                Path(directory).resolve()
-            )
-
-            result = self.run_checkout_credential_check(repository)
-            self.assertEqual(result.returncode, 0, result.stderr)
-
-            leaked_env = dict(os.environ)
-            leaked_env.pop("GITHUB_TOKEN", None)
-            leaked_env.update(
-                {
-                    "GH_TOKEN": "leaked-step-token",
-                    "GITHUB_REPOSITORY": "layervai/nhp",
-                }
-            )
-            leaked = subprocess.run(
-                [str(NO_CHECKOUT_CREDENTIALS_SCRIPT_PATH)],
-                cwd=repository,
-                env=leaked_env,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertNotEqual(leaked.returncode, 0)
-            self.assertIn("Terraform step environment", leaked.stdout)
-
-    def test_checkout_credential_boundary_rejects_dangling_include_and_url(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repository = self.initialize_checkout_repository(
-                Path(directory).resolve()
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    repository,
-                    "config",
-                    "--local",
-                    "includeIf.gitdir:/unmatched/worktree/.git.path",
-                    "/tmp/git-credentials.config",
-                ],
-                check=True,
-                text=True,
-            )
-            dangling = self.run_checkout_credential_check(repository)
-            self.assertNotEqual(dangling.returncode, 0)
-            self.assertIn("credential include", dangling.stdout)
-
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    repository,
-                    "config",
-                    "--local",
-                    "--unset-all",
-                    "includeIf.gitdir:/unmatched/worktree/.git.path",
-                ],
-                check=True,
-                text=True,
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    repository,
-                    "remote",
-                    "set-url",
-                    "origin",
-                    "https://token@github.com/layervai/nhp",
-                ],
-                check=True,
-                text=True,
-            )
-            embedded_url = self.run_checkout_credential_check(repository)
-            self.assertNotEqual(embedded_url.returncode, 0)
-            self.assertIn("origin URL", embedded_url.stdout)
-
-    def test_live_main_check_uses_authenticated_github_api(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            log_path = root / "gh.log"
-            fake_gh = fake_bin / "gh"
-            fake_gh.write_text(
-                "#!/usr/bin/env bash\n"
-                "set -euo pipefail\n"
-                'printf \'%s\\n\' "$*" >"$FAKE_GH_LOG"\n'
-                "printf "
-                "'{\"ref\":\"%s\",\"object\":{\"type\":\"%s\",\"sha\":\"%s\"}}\\n' "
-                '"${FAKE_GH_REF:-refs/heads/main}" '
-                '"${FAKE_GH_TYPE:-commit}" "$FAKE_GH_SHA"\n',
-                encoding="utf-8",
-            )
-            fake_gh.chmod(0o755)
-            expected_sha = "a" * 40
-            env = {
-                **os.environ,
-                "PATH": f"{fake_bin}:{os.environ['PATH']}",
-                "FAKE_GH_LOG": str(log_path),
-                "FAKE_GH_SHA": expected_sha,
-                "GH_TOKEN": "step-scoped-token",
-                "GITHUB_REPOSITORY": "layervai/nhp",
-            }
-            success = subprocess.run(
-                [str(LIVE_MAIN_SCRIPT_PATH), expected_sha],
-                env=env,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(success.returncode, 0, success.stderr)
-            self.assertEqual(
-                log_path.read_text().strip(),
-                "api repos/layervai/nhp/git/ref/heads/main",
-            )
-
-            mismatch = subprocess.run(
-                [str(LIVE_MAIN_SCRIPT_PATH), "b" * 40],
-                env=env,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertNotEqual(mismatch.returncode, 0)
-            self.assertIn("does not exactly match", mismatch.stderr)
-
-    def test_source_run_binding(self) -> None:
-        run = {
-            "id": 12345,
-            "event": "workflow_dispatch",
-            "status": "completed",
-            "conclusion": "success",
-            "head_branch": "main",
-            "head_sha": "a" * 40,
-            "name": CHECKER.WORKFLOW_NAME,
-            "path": CHECKER.WORKFLOW_PATH,
-            "repository": {"full_name": CHECKER.REPOSITORY},
-            "actor": {"login": CHECKER.TRUSTED_ACTOR},
-            "triggering_actor": {"login": CHECKER.TRUSTED_ACTOR},
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "run.json"
-            write_json(path, run)
-            args = argparse.Namespace(
-                run_json=path, run_id="12345", commit_sha="a" * 40
-            )
-            CHECKER.check_source_run(args)
-            run["conclusion"] = "failure"
-            write_json(path, run)
-            with self.assertRaises(CHECKER.ContractError):
-                CHECKER.check_source_run(args)
-            run["conclusion"] = "success"
-            for actor_field in ("actor", "triggering_actor"):
-                with self.subTest(actor_field=actor_field):
-                    run[actor_field]["login"] = "different-operator"
-                    write_json(path, run)
-                    with self.assertRaises(CHECKER.ContractError):
-                        CHECKER.check_source_run(args)
-                    run[actor_field]["login"] = CHECKER.TRUSTED_ACTOR
-
-    def test_failed_apply_binding_is_exact(self) -> None:
-        run = {
-            "id": int(CHECKER.FAILED_APPLY_RUN_ID),
-            "event": "workflow_dispatch",
-            "status": "completed",
-            "conclusion": "failure",
-            "head_branch": "main",
-            "head_sha": CHECKER.FAILED_APPLY_COMMIT,
-            "name": CHECKER.WORKFLOW_NAME,
-            "path": CHECKER.WORKFLOW_PATH,
-            "repository": {"full_name": CHECKER.REPOSITORY},
-            "actor": {"login": CHECKER.TRUSTED_ACTOR},
-            "triggering_actor": {"login": CHECKER.TRUSTED_ACTOR},
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "failed-run.json"
-            write_json(path, run)
-            CHECKER.check_failed_run(path)
-            for field, value in (
-                ("id", 1),
-                ("conclusion", "success"),
-                ("head_sha", "a" * 40),
-            ):
-                with self.subTest(field=field):
-                    broken = copy.deepcopy(run)
-                    broken[field] = value
-                    write_json(path, broken)
-                    with self.assertRaises(CHECKER.ContractError):
-                        CHECKER.check_failed_run(path)
-
-    def test_workflow_and_ledger_fence_sandbox_only_two_dispatch(self) -> None:
-        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
-        verifier = VERIFY_SCRIPT_PATH.read_text(encoding="utf-8")
-        secret_seed = SECRET_SEED_SCRIPT_PATH.read_text(encoding="utf-8")
-        preflight = PREFLIGHT_SCRIPT_PATH.read_text(encoding="utf-8")
-        live_main = LIVE_MAIN_SCRIPT_PATH.read_text(encoding="utf-8")
-        ledger = LEDGER_PATH.read_text(encoding="utf-8")
-        for token in (
-            "source_plan_run_id",
-            "planned_commit_sha",
-            "plan_sha256",
-            "ACCEPT_SANDBOX_CONTROL_STANDING_COST",
-            "APPLY_SANDBOX_CONTROL_FOUNDATION",
-            "group: deploy-sandbox-infra",
-            "actions/download-artifact@",
-            "run-id: ${{ inputs.source_plan_run_id }}",
-            "secrets.AWS_ROLE_ARN",
-            "terraform apply -input=false",
-            "verify-control-sandbox-first-apply.sh",
-            "ORIGINAL_ACTOR: ${{ github.actor }}",
-            "TRIGGERING_ACTOR: ${{ github.triggering_actor }}",
-            "Only justin-layerv may originate and trigger",
+class WorkflowContractTests(unittest.TestCase):
+    def test_temporary_first_apply_workflow_is_retired(self) -> None:
+        for path in (
+            ROOT / ".github/workflows/control-sandbox-first-apply.yml",
+            ROOT / "scripts/capture-control-sandbox-first-apply-preflight.sh",
+            ROOT / "scripts/capture-control-sandbox-partial-recovery-state.sh",
+            ROOT / "scripts/check-live-main-ref.sh",
+            ROOT / "scripts/check-no-checkout-credentials.sh",
         ):
-            self.assertIn(token, workflow)
-        self.assertEqual(workflow.count("TF_VERSION:"), 1)
-        self.assertIn(f"TF_VERSION: '{CHECKER.TF_VERSION}'", workflow)
-        self.assertEqual(workflow.count("environment: sandbox"), 5)
-        self.assertEqual(workflow.count("Re-read live main before AWS access"), 5)
-        self.assertEqual(workflow.count("scripts/check-live-main-ref.sh"), 7)
-        self.assertEqual(
-            workflow.count("scripts/check-no-checkout-credentials.sh"), 7
-        )
-        self.assertEqual(workflow.count("GH_TOKEN: ${{ github.token }}"), 10)
-        for recovery_token in (
-            "recover-plan",
-            "recover-apply",
-            "RECOVER_PLAN_ONLY",
-            "RECOVER_APPLY_SANDBOX_CONTROL_FOUNDATION",
+            self.assertFalse(path.exists(), path)
+        checker = CHECKER_PATH.read_text(encoding="utf-8")
+        for retired_token in (
+            'sub.add_parser("preflight")',
+            '"artifact-create"',
+            '"artifact-verify"',
+            'sub.add_parser("source-run")',
+            'choices=("create", "no-op")',
+            "--expected-action",
+            "recover-config",
             "recovery-artifact-create",
             "recovery-artifact-verify",
-            "capture-control-sandbox-partial-recovery-state.sh",
-            "--expected-action recover",
-            "29673343567",
+            "FAILED_APPLY_",
+            "PARTIAL_STATE_",
         ):
-            self.assertIn(recovery_token, workflow)
-        self.assertIn('gh api "repos/$repository/git/ref/heads/main"', live_main)
-        self.assertNotIn("git ls-remote", live_main)
-        terraform_apply = workflow.index("terraform apply -input=false")
-        final_ref_check = workflow.rfind(
-            "scripts/check-live-main-ref.sh", 0, terraform_apply
-        )
-        final_credential_check = workflow.rfind(
-            "scripts/check-no-checkout-credentials.sh", 0, terraform_apply
-        )
-        self.assertGreater(final_ref_check, -1)
-        self.assertGreater(final_credential_check, -1)
-        self.assertLess(final_ref_check, terraform_apply)
-        self.assertLess(final_ref_check, final_credential_check)
-        self.assertLess(final_credential_check, terraform_apply)
-        self.assertIn(
-            "      - name: Re-read live main immediately before exact apply\n"
-            "        working-directory: ${{ env.CONTROL_ROOT }}\n"
-            "        env:\n"
-            "          GH_TOKEN: ${{ github.token }}\n"
-            "          PLANNED_COMMIT_SHA: ${{ inputs.planned_commit_sha }}\n"
-            '        run: ../../../../scripts/check-live-main-ref.sh '
-            '"$PLANNED_COMMIT_SHA"\n\n'
-            "      - name: Apply exact saved plan without GitHub credentials\n"
-            "        working-directory: ${{ env.CONTROL_ROOT }}\n"
-            "        run: |\n"
-            "          ../../../../scripts/check-no-checkout-credentials.sh\n"
-            "          terraform apply -input=false",
-            workflow,
-        )
-        for forbidden in (
-            "AWS_PROD_ROLE_ARN",
-            "terraform/control/environments/prod",
-            "environment: production",
-            "get-secret-value",
-        ):
-            self.assertNotIn(forbidden, workflow)
-        self.assertIn('[[ "${#generated_secret}" -ne 48 ]]', secret_seed)
-        self.assertIn("printf '%s' \"$generated_secret\"", secret_seed)
-        self.assertIn(
-            'client_request_token="$(printf \'%s\' "$secret_arn" | sha256sum',
-            secret_seed,
-        )
-        self.assertIn('--client-request-token "$client_request_token"', secret_seed)
-        self.assertNotIn("get-secret-value", verifier)
-        self.assertNotIn("get-secret-value", secret_seed)
-        self.assertIn("aws s3api get-bucket-versioning", preflight)
-        self.assertIn("Control Sandbox First Apply", ledger)
-        self.assertIn("separate apply dispatch", ledger)
-        self.assertIn("plan assumes the apply-capable sandbox role", ledger)
-        self.assertIn("newly enabled region blocks the routing audit", ledger)
-        self.assertIn("cannot target production", ledger)
-        self.assertIn(
-            "#3349 advances the read-only PR-plan gate from the completed "
-            "`recover-config` shape to an exact 41-resource no-op",
-            ledger,
-        )
-        self.assertIn(
-            "Never rerun the original apply, recovery plan, or recovery apply",
-            ledger,
-        )
+            self.assertNotIn(retired_token, checker)
 
     def test_security_helpers_remain_in_workflow_lint_boundary(self) -> None:
         validate_workflow = VALIDATE_WORKFLOW_PATH.read_text(encoding="utf-8")
         makefile = MAKEFILE_PATH.read_text(encoding="utf-8")
         boundary_step = validate_workflow.split(
-            "      - name: Test sandbox Control first-apply boundary\n", 1
+            "      - name: Test sandbox Control foundation boundary\n", 1
         )[1].split("\n      - name:", 1)[0]
         make_shellcheck = next(
             line
             for line in makefile.splitlines()
             if line.startswith("\t@shellcheck ")
-            and "capture-control-sandbox-first-apply-preflight.sh" in line
+            and "verify-control-sandbox-first-apply.sh" in line
         )
 
         for helper in (
-            "scripts/capture-control-sandbox-partial-recovery-state.sh",
-            "scripts/check-live-main-ref.sh",
-            "scripts/check-no-checkout-credentials.sh",
+            "scripts/check-control-global-routing.sh",
+            "scripts/check-control-vpc-cidr-overlap.sh",
             "scripts/ensure-control-otp-pepper.sh",
+            "scripts/verify-control-sandbox-first-apply.sh",
         ):
             self.assertIn(f'- "{helper}"', validate_workflow)
             self.assertIn(helper, boundary_step)
@@ -2403,7 +1256,6 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
         )
 
     def test_real_pr_plan_runs_strict_noop_contract(self) -> None:
-        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         plan_workflow = TERRAFORM_PLAN_WORKFLOW_PATH.read_text(encoding="utf-8")
         foundation_check = plan_workflow.index(
             "      - name: Check Terraform Control Plan Contract\n"
@@ -2419,19 +1271,14 @@ class SourceRunAndWorkflowTests(unittest.TestCase):
         self.assertLess(strict_check, summary)
         self.assertIn(
             "python3 .github/scripts/check-control-sandbox-first-apply.py plan "
-            "terraform/control/environments/sandbox/control.tfplan.json "
-            "--expected-action no-op",
+            "terraform/control/environments/sandbox/control.tfplan.json",
             plan_workflow,
         )
+        self.assertNotIn("--expected-action", plan_workflow)
         self.assertIn(
-            "recovered foundation must remain an exact",
+            "Fail closed on any unreviewed Control mutation",
             plan_workflow,
         )
-        self.assertNotIn("--expected-action recover-config", plan_workflow)
-        self.assertNotIn("Partial-Recovery Plan Contract", plan_workflow)
-        self.assertEqual(workflow.count("persist-credentials: false"), 5)
-        self.assertNotIn("persist-credentials: true", workflow)
-        self.assertNotIn("--unset-all http.https://github.com/.extraheader", workflow)
 
 
 if __name__ == "__main__":

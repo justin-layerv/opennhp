@@ -1314,16 +1314,6 @@ resource "aws_iam_policy" "terraform_read" {
         Resource = "*"
       },
       {
-        # The attended Control first-apply preflight proves this role's exact
-        # Control-scoped ElastiCache grants and its denial on a cell-scoped
-        # resource. Permit policy simulation only for the role itself; the
-        # workflow does not need to inspect any other principal.
-        Sid      = "ControlFirstApplySelfSimulation"
-        Effect   = "Allow"
-        Action   = "iam:SimulatePrincipalPolicy"
-        Resource = aws_iam_role.github_actions.arn
-      },
-      {
         Sid    = "Route53Read"
         Effect = "Allow"
         Action = concat(

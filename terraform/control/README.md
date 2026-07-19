@@ -85,26 +85,25 @@ ElastiCache user and user-group lifecycle/tag actions required by this root.
 Those actions are isolated in `ElastiCacheControlRBAC` and scoped to only the
 current environment's `layerv-nhp-<env>-control-*` user and user-group ARNs;
 they cannot manage cell-scoped Redis identities. PR CI only plans the control
-root, but the same role is the reviewed first-apply identity.
+root and now requires the converged foundation to remain an exact no-op unless
+an intentional update revises that policy and its tests in the same PR.
 `CreateServerlessCache` and `ModifyServerlessCache` also authorize the cache's
 referenced user group as a dependent resource. The separate
 `ElastiCacheControlCacheUserGroupDependency` statement grants only those two
 actions on the exact `layerv-nhp-<env>-control-otp-users` ARN; it grants no
 delete action and cannot associate a cell user group. The attended preflight
-simulates the complete cache-plus-user-group resource matrix for both the
-allowed Control group and a denied cell group. The
+used for sandbox bootstrap simulated the complete cache-plus-user-group
+resource matrix for both the allowed Control group and a denied cell group; its
+self-simulation grant was removed with the one-time workflow. The
 repository-wide IAM coverage gate maps every new resource type to the complete
 provider action set, and the rollout owner must simulate the exact scoped
 actions before first apply. A policy-structure test pins both the complete
 action set and the two environment-global resource patterns.
 
-As of this foundation PR, environment-specific policy renders measured
-`terraform_apply_data` at exactly 3,340 non-whitespace characters in sandbox
-and 3,331 in production, leaving 2,804 and 2,813 characters below IAM's
-6,144-character managed-policy limit.
-A resource postcondition now fails plan before that limit is crossed. This
-change expands the existing policy and adds no attachment. The 2026-07-16 live
-roles had 10 attached policies in sandbox and 8 in production; the static
+A resource postcondition fails plan before the 6,144-character managed-policy
+limit is crossed. The foundation's grants fit within existing policies and add
+no attachment. The 2026-07-16 live roles had 10 attached policies in sandbox
+and 8 in production; the static
 worst-case counter is 10 of 10 because it conservatively includes every
 conditional attachment. Treat attachment runway as zero across the shared
 module: future grants must consolidate within an existing policy or pair a

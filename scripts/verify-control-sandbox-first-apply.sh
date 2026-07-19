@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# Permanent operator-invoked sandbox verifier. Run it only from the reviewed
+# apply path; it is intentionally not scheduled or wired to the retired
+# one-time first-apply workflow.
 set -euo pipefail
 
 if [[ "$#" -ne 2 ]]; then
@@ -42,7 +45,7 @@ if [[ "$plan_status" -ne 0 ]]; then
 fi
 terraform -chdir="$terraform_root" show -json "$evidence_dir/post-apply.tfplan" \
   >"$evidence_dir/post-apply-plan.json"
-python3 "$checker" plan "$evidence_dir/post-apply-plan.json" --expected-action no-op \
+python3 "$checker" plan "$evidence_dir/post-apply-plan.json" \
   | tee "$evidence_dir/post-apply-plan-summary.json"
 python3 "$checker" state "$evidence_dir/post-apply-plan.json" \
   | tee "$evidence_dir/refreshed-state-summary.json"
