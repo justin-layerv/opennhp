@@ -24,10 +24,16 @@ type MsgData struct {
 	Compress       bool
 	ExternalPacket *Packet
 	ExternalCookie *[CookieSize]byte
-	Message        []byte
-	PeerPk         []byte
-	EncryptedPktCh chan *MsgAssemblerData
-	ResponseMsgCh  chan *PacketParserData
+	// HubLSTCookieProof is the raw 32-byte cookie returned by an assignment
+	// Hub's NHP_COK challenge. It is valid only on an uncompressed NHP_LST sent
+	// by an NHP_AGENT. Core stamps the dedicated proof flag and mixes the cookie
+	// into the existing header digest; existing NHP_RKN ExternalCookie behavior
+	// remains separate and unchanged.
+	HubLSTCookieProof *[CookieSize]byte
+	Message           []byte
+	PeerPk            []byte
+	EncryptedPktCh    chan *MsgAssemblerData
+	ResponseMsgCh     chan *PacketParserData
 }
 
 func (d *Device) validateMsgData(md *MsgData) (err error) {
@@ -71,22 +77,40 @@ type MsgAssemblerData struct {
 	HeaderFlag    uint16
 	BodyCompress  bool
 
-	ExternalCookie *[CookieSize]byte
-	RemotePubKey   []byte
-	bodyMessage    []byte
+	ExternalCookie       *[CookieSize]byte
+	HubLSTCookieProof    [CookieSize]byte
+	hasHubLSTCookieProof bool
+	RemotePubKey         []byte
+	bodyMessage          []byte
 
-	encryptedPktCh chan<- *MsgAssemblerData
-	ResponseMsgCh  chan<- *PacketParserData
-	Error          error
+	encryptedPktCh      chan<- *MsgAssemblerData
+	ResponseMsgCh       chan<- *PacketParserData
+	Error               error
+	suppressDiagnostics bool
 }
 
 func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err error) {
-	log.Debug("createMsgAssemblerData: PeerPk len=%d, CipherScheme=%d, HeaderType=%d",
-		len(md.PeerPk), md.CipherScheme, md.HeaderType)
+	return d.createMsgAssemblerDataWithDiagnostics(md, false)
+}
+
+// createMsgAssemblerDataWithDiagnostics is the internal assembly seam used by
+// the public Hub's COK challenge. Suppression is not exposed on MsgData: adding
+// an unexported field to that public wire-input struct would break downstream
+// unkeyed literals. Ordinary callers always go through createMsgAssemblerData.
+func (d *Device) createMsgAssemblerDataWithDiagnostics(md *MsgData, suppressDiagnostics bool) (mad *MsgAssemblerData, err error) {
+	if !suppressDiagnostics {
+		log.Debug("createMsgAssemblerData: PeerPk len=%d, CipherScheme=%d, HeaderType=%d",
+			len(md.PeerPk), md.CipherScheme, md.HeaderType)
+	}
 	// Returns a non-nil mad even on err so the callers' err defers
 	// (device.go msgToPacketRoutine, MsgToPacket) can route through
 	// mad.Error / mad.encryptedPktCh / mad.ResponseMsgCh and Destroy
 	// the pool packet. Lifecycle is the caller's.
+	if md.HubLSTCookieProof != nil {
+		if d.deviceType != NHP_AGENT || md.HeaderType != NHP_LST || md.Compress || md.PrevParserData != nil || md.ExternalCookie != nil {
+			return &MsgAssemblerData{device: d, HeaderType: md.HeaderType}, ErrInvalidHubLSTCookieProof
+		}
+	}
 	if md.ExternalPacket != nil {
 		if err = md.ExternalPacket.validateWritableCapacity(); err != nil {
 			return &MsgAssemblerData{
@@ -138,9 +162,15 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 		if md.ExternalCookie != nil {
 			mad.ExternalCookie = md.ExternalCookie
 		}
+		if md.HubLSTCookieProof != nil {
+			copy(mad.HubLSTCookieProof[:], md.HubLSTCookieProof[:])
+			mad.hasHubLSTCookieProof = true
+		}
 
 		// create header and init device ecdh
-		log.Debug("start encryption using CIPHER_SCHEME_CURVE")
+		if !suppressDiagnostics {
+			log.Debug("start encryption using CIPHER_SCHEME_CURVE")
+		}
 		mad.header = mad.BasePacket.HeaderWithCipherScheme(mad.CipherScheme)
 		mad.ciphers = NewCipherSuite()
 		mad.deviceEcdh = d.GetEcdhByCipherScheme(mad.CipherScheme)
@@ -161,6 +191,7 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 	// away from connData.ForwardOutboundPacket.
 	mad.encryptedPktCh = md.EncryptedPktCh
 	mad.ResponseMsgCh = md.ResponseMsgCh
+	mad.suppressDiagnostics = suppressDiagnostics
 
 	// init chain hash -> ChainHash0
 	// Always reset per packet; intermediate chain-key carry-over was
@@ -278,8 +309,10 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 		return err
 	}
 
-	log.Debug("setPeerPublicKey: checking key length: RemotePubKey len=%d, PublicKeySize=%d",
-		len(mad.RemotePubKey), PublicKeySize)
+	if !mad.suppressDiagnostics {
+		log.Debug("setPeerPublicKey: checking key length: RemotePubKey len=%d, PublicKeySize=%d",
+			len(mad.RemotePubKey), PublicKeySize)
+	}
 	if len(mad.RemotePubKey) != PublicKeySize {
 		log.Error("remote peer public key length mismatch: got %d bytes, expected %d, key=%x",
 			len(mad.RemotePubKey), PublicKeySize, mad.RemotePubKey)
@@ -366,6 +399,13 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 		SetZero(mad.hashBuf[:])
 	}()
 
+	if mad.hasHubLSTCookieProof {
+		mad.HeaderFlag = common.NHP_FLAG_HUB_LST_COOKIE_PROOF
+	}
+	// Set flags before the empty-body branch so the proof contract is not
+	// accidentally bypassed by an empty caller-owned message.
+	mad.header.SetFlag(mad.HeaderFlag)
+
 	// message body is empty, skip encryption. Set header and compute the header digest
 	if len(mad.bodyMessage) == 0 {
 		// set header type and payload size
@@ -413,6 +453,9 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 		body = mad.bodyMessage
 		mad.BodySize = len(mad.bodyMessage) + GCMTagSize
 	}
+	// Compression is decided above, after the early empty-body flag write.
+	// Commit the final flag set before hashing the serialized header.
+	mad.header.SetFlag(mad.HeaderFlag)
 
 	packetBuf := mad.BasePacket.writableBuffer()
 	if mad.BodySize > len(packetBuf)-mad.header.Size() {
@@ -420,9 +463,6 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 		err = ErrPacketSizeExceedsBuffer
 		return err
 	}
-
-	// set header flag
-	mad.header.SetFlag(mad.HeaderFlag)
 
 	// calculate total data length
 	packetLen := mad.header.Size() + mad.BodySize
@@ -463,6 +503,8 @@ func (mad *MsgAssemblerData) addHeaderDigest(sumCookie bool) {
 			mad.digestHash.Write(mad.connData.CookieStore.CurrCookie[:])
 			mad.connData.Unlock()
 		}
+	} else if mad.hasHubLSTCookieProof {
+		mad.digestHash.Write(mad.HubLSTCookieProof[:])
 	}
 	mad.digestHash.Sum(mad.header.HeaderDigestBytes()[:0])
 }
@@ -479,6 +521,7 @@ func (mad *MsgAssemblerData) Destroy() {
 	}
 	// Defense-in-depth: clear scratch even though hash digests are not key material.
 	SetZero(mad.hashBuf[:])
+	SetZero(mad.HubLSTCookieProof[:])
 }
 
 // ConsumeEncryptedPacket takes ownership of every non-nil assembler result

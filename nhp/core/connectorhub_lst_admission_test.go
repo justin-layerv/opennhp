@@ -302,7 +302,7 @@ func TestAllowUnregisteredAgentLSTPreservesStalenessAndReplayGates(t *testing.T)
 		assertConnectorHubDropOnlyState(t, older.receiverConn, newerMad.LocalInitTime)
 	})
 
-	t.Run("same_timestamp_flood", func(t *testing.T) {
+	t.Run("same_timestamp_replay", func(t *testing.T) {
 		fixture := newConnectorHubAdmissionFixture(t, NHP_SERVER, NHP_LST, DeviceOptions{AllowUnregisteredAgentLST: true})
 		initialPPD, err := fixture.parse(t, fixture.packet, time.Now().UnixNano())
 		if initialPPD == nil {
@@ -315,10 +315,10 @@ func TestAllowUnregisteredAgentLSTPreservesStalenessAndReplayGates(t *testing.T)
 		initialPPD.Destroy()
 
 		for attempt := 0; attempt < 2; attempt++ {
-			floodPPD, err := fixture.parse(t, fixture.packet, time.Now().UnixNano())
-			assertNHPError(t, err, ErrFloodPacketReceived)
-			if floodPPD != nil {
-				floodPPD.Destroy()
+			replayPPD, err := fixture.parse(t, fixture.packet, time.Now().UnixNano())
+			assertNHPError(t, err, ErrReplayPacketReceived)
+			if replayPPD != nil {
+				replayPPD.Destroy()
 			}
 		}
 		assertConnectorHubDropOnlyState(t, fixture.receiverConn, fixture.sendTime)

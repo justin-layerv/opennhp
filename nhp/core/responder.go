@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net/netip"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -47,6 +49,61 @@ const (
 	maxStatelessCookieRemoteKey = 64
 	maxStatelessCookieInput     = len(statelessCookieDomain) + 4 + maxStatelessCookieRemoteKey + 4 + PublicKeySize + 8
 )
+
+const (
+	// HubLSTCookieWindowSeconds is frozen by connector_hub_lst_cookie_v1.
+	// Verifiers accept the current and immediately previous window only.
+	HubLSTCookieWindowSeconds int64 = 30
+	hubLSTCookieDomain              = "nhp-connector-hub-lst-cookie-v1\x00"
+	hubLSTCookieIPv4Family    byte  = 0x04
+	hubLSTCookieIPv6Family    byte  = 0x06
+	hubLSTCookieBase64Size          = (CookieSize + 2) / 3 * 4
+)
+
+// canonicalHubLSTSourceIP returns the worker-observed source IP in the exact
+// binary form frozen by connector_hub_lst_cookie_v1. The UDP port is excluded
+// so NAT rebinding and address-fallback retries do not invalidate proof. A
+// relay-provided RealRemoteAddr is deliberately ignored: the dedicated public
+// Hub binds the return route it directly observed.
+func canonicalHubLSTSourceIP(connData *ConnectionData) (family byte, raw []byte, ok bool) {
+	if connData == nil || connData.RemoteAddr == nil || connData.RemoteAddr.IP == nil || connData.RemoteAddr.Zone != "" {
+		return 0, nil, false
+	}
+	addr, ok := netip.AddrFromSlice(connData.RemoteAddr.IP)
+	if !ok {
+		return 0, nil, false
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		v4 := addr.As4()
+		return hubLSTCookieIPv4Family, v4[:], true
+	}
+	if addr.Is6() {
+		v6 := addr.As16()
+		return hubLSTCookieIPv6Family, v6[:], true
+	}
+	return 0, nil, false
+}
+
+// deriveHubLSTCookieInto implements the exact cross-repo HMAC framing:
+// domain || family || u32be(ip length) || ip || u32be(peer length) || peer ||
+// u64be(window index). The domain constant already includes its NUL separator.
+func deriveHubLSTCookieInto(out *[CookieSize]byte, signingKey []byte, family byte, sourceIP, peerPk []byte, windowIndex int64) {
+	mac := hmac.New(sha256.New, signingKey)
+	_, _ = io.WriteString(mac, hubLSTCookieDomain)
+	mac.Write([]byte{family})
+	var framed [8]byte
+	binary.BigEndian.PutUint32(framed[:4], uint32(len(sourceIP)))
+	mac.Write(framed[:4])
+	mac.Write(sourceIP)
+	binary.BigEndian.PutUint32(framed[:4], uint32(len(peerPk)))
+	mac.Write(framed[:4])
+	mac.Write(peerPk)
+	binary.BigEndian.PutUint64(framed[:], uint64(windowIndex))
+	mac.Write(framed[:])
+	mac.Sum(out[:0])
+	SetZero(framed[:])
+}
 
 // deriveStatelessCookieInto is a stack-only HMAC-SHA256 implementation for the
 // overloaded RKN flood path so cookie checks add no steady-state heap pressure
@@ -239,6 +296,12 @@ type PacketParserData struct {
 	HeaderFlag   uint16
 	BodyCompress bool
 	Overload     bool
+	// hubLSTPublicPath pins the exact admission mode selected when this packet
+	// parser is created. Device options can be reloaded while workers are live;
+	// every gate for one packet must observe the same mode or a mid-packet
+	// option flip could separate the unregistered-peer bypass from its mandatory
+	// return-routability proof.
+	hubLSTPublicPath bool
 
 	SenderIdentity            []byte
 	SenderMidPublicKey        []byte
@@ -257,6 +320,24 @@ type PacketParserData struct {
 	decryptedMsgCh chan<- *PacketParserData //Plaintext payload dispatched (Decryption cycle completed)
 	feedbackMsgCh  chan<- *PacketParserData
 	Error          error
+}
+
+func (ppd *PacketParserData) isHubLSTPublicPath() bool {
+	return ppd != nil && ppd.hubLSTPublicPath
+}
+
+func (d *Device) isHubLSTPublicHeader(headerType int) bool {
+	if d == nil || d.deviceType != NHP_SERVER || headerType != NHP_LST {
+		return false
+	}
+	d.optionMutex.Lock()
+	option := d.option
+	d.optionMutex.Unlock()
+	return !option.DisableAgentPeerValidation && option.AllowUnregisteredAgentLST
+}
+
+func (ppd *PacketParserData) hasHubLSTCookieProof() bool {
+	return ppd.isHubLSTPublicPath() && ppd.HeaderFlag == common.NHP_FLAG_HUB_LST_COOKIE_PROOF
 }
 
 func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, err error) {
@@ -280,7 +361,6 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		ppd.HeaderFlag = ppd.basePacket.Flag()
 		ppd.header = ppd.basePacket.Header()
 		ppd.CipherScheme = ppd.header.CipherScheme()
-		log.Debug("start decryption using CIPHER_SCHEME_CURVE")
 		ppd.Ciphers = NewCipherSuite()
 		ppd.deviceEcdh = d.GetEcdhByCipherScheme(ppd.CipherScheme)
 	}
@@ -308,6 +388,18 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 	ppd.noise.MixKey(&ppd.chainKey, ppd.chainHash.Sum(ppd.hashBuf[:0]), initialChainKeyBytes)
 
 	ppd.HeaderType, ppd.BodySize = ppd.header.TypeAndPayloadSize()
+	ppd.hubLSTPublicPath = d.isHubLSTPublicHeader(ppd.HeaderType)
+	if !ppd.isHubLSTPublicPath() {
+		log.Debug("start decryption using CIPHER_SCHEME_CURVE")
+	}
+
+	// The dedicated public Hub accepts exactly the two assignment-LST flag
+	// states frozen by conformance: initial (0) or cookie proof (0x0004).
+	// COMPRESS is rejected before body decryption/inflation, and every unknown
+	// bit fails closed. Other NHP roles retain their historical flag behavior.
+	if ppd.isHubLSTPublicPath() && ppd.HeaderFlag != 0 && ppd.HeaderFlag != common.NHP_FLAG_HUB_LST_COOKIE_PROOF {
+		return ppd, ErrInvalidHubLSTFlags
+	}
 
 	// init header digest hash -> DigestHash0
 	ppd.digestHash, err = NewHash(ppd.Ciphers.HashType)
@@ -328,7 +420,9 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 			// overload, further discard unwanted packet type
 			ppd.Overload = true
 			if !ppd.IsAllowedAtOverload() {
-				log.Critical("discard packet type %d due to overload", ppd.HeaderType)
+				if !ppd.isHubLSTPublicPath() {
+					log.Critical("discard packet type %d due to overload", ppd.HeaderType)
+				}
 				err = ErrServerOverload
 				return
 			}
@@ -341,10 +435,18 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		// install stateless params at startup; the CookieStore path remains for
 		// embedded/tests that intentionally leave the params disabled.
 		sumCookie := ppd.HeaderType == NHP_RKN && (overload || ppd.device.statelessCookieParamsConfigured())
-		if !ppd.checkHeaderDigest(sumCookie) {
+		digestOK := false
+		if ppd.hasHubLSTCookieProof() {
+			digestOK = ppd.checkHubLSTCookieProofDigest()
+		} else {
+			digestOK = ppd.checkHeaderDigest(sumCookie)
+		}
+		if !digestOK {
 			// "HMAC" string kept deliberately (#1126): operator-facing log
 			// breadcrumb, matches the preserved ErrServer... message + terraform.
-			log.Error("HMAC validation failed on server side. sumCookie: %v", sumCookie)
+			if !ppd.isHubLSTPublicPath() {
+				log.Error("HMAC validation failed on server side. sumCookie: %v", sumCookie)
+			}
 			err = ErrServerHeaderDigestCheckFailed
 			// bare return: caller's err defer expects named ppd populated
 			return
@@ -611,9 +713,12 @@ func shouldEscalateStale(deviceType int, peerType int, msgType int) bool {
 const unregisteredLSTFutureSkewLimit = 30 * time.Second
 
 func (ppd *PacketParserData) validatePeer() (err error) {
+	publicHubLST := ppd.isHubLSTPublicPath()
 	peerPk, err := ppd.decryptInitiatorStaticPubKey()
 	if err != nil {
-		log.Error("failed to decrypt peer pubkey: %v", err)
+		if !publicHubLST {
+			log.Error("failed to decrypt peer pubkey: %v", err)
+		}
 		return err
 	}
 
@@ -632,9 +737,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	ppd.device.optionMutex.Unlock()
 
 	peerDeviceType = HeaderTypeToDeviceType(ppd.HeaderType)
-	allowUnregisteredLST := !option.DisableAgentPeerValidation &&
-		ppd.device.deviceType == NHP_SERVER &&
-		ppd.HeaderType == NHP_LST && option.AllowUnregisteredAgentLST
+	allowUnregisteredLST := publicHubLST
 	switch peerDeviceType {
 	case NHP_AGENT:
 		toValidate = !option.DisableAgentPeerValidation && !allowUnregisteredLST
@@ -685,7 +788,9 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	// init shared key
 	ss := ppd.deviceEcdh.SharedSecret(peerPk)
 	if ss == nil {
-		log.Error("device ECDH failed with obtained peer")
+		if !publicHubLST {
+			log.Error("device ECDH failed with obtained peer")
+		}
 		err = ErrDeviceECDHObtainedPeerFailed
 		return err
 	}
@@ -701,24 +806,34 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	var tsBytes [TimestampSize]byte
 	aead, err = AeadFromKey(ppd.Ciphers.GcmType, &key)
 	if err != nil {
-		log.Error("failed to create AEAD for timestamp decryption: %v", err)
+		if !publicHubLST {
+			log.Error("failed to create AEAD for timestamp decryption: %v", err)
+		}
 		return err
 	}
 	_, err = aead.Open(tsBytes[:0], ppd.header.NonceBytes(), ppd.header.TimestampBytes(), ppd.chainHash.Sum(ppd.hashBuf[:0]))
 	if err != nil {
-		log.Error("failed to decrypt timestamp")
+		if !publicHubLST {
+			log.Error("failed to decrypt timestamp")
+		}
 		return err
 	}
 
 	remoteSendTime := int64(binary.BigEndian.Uint64(tsBytes[:]))
 	if allowUnregisteredLST && remoteSendTime > ppd.LocalInitTime+int64(unregisteredLSTFutureSkewLimit) {
 		// Do not escalate: a legitimate fast clock must not self-block; the Hub worker (#3227) must rate-limit abuse.
-		log.Debug("received future-dated unregistered LST from %s, drop packet", ppd.ConnData.RemoteAddr.String())
 		return ErrStalePacketReceived
 	}
 
+	lastRemoteSendTime := atomic.LoadInt64(&ppd.ConnData.LastRemoteSendTime)
 	if shouldCheckRecvAttack(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
-		if remoteSendTime < ppd.ConnData.LastRemoteSendTime {
+		// The public Hub waives the coarse 20 ms floor below so the mandatory
+		// one-resend proof can return immediately. Its proof header must be fresh,
+		// so equality is an exact replay there; ordinary NHP paths retain their
+		// historical strict-regression check and flood floor.
+		replayed := remoteSendTime < lastRemoteSendTime ||
+			(publicHubLST && lastRemoteSendTime != 0 && remoteSendTime == lastRemoteSendTime)
+		if replayed {
 			// replay packet, drop. Escalate the drop toward a connection
 			// block only where an in-connection timestamp regression is an
 			// attack signal rather than a likely benign reorder. NHP_ART
@@ -732,11 +847,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 			// still dropped (the replay is rejected) and the cross-connection
 			// dedupe caches are the real cross-connection defense; only the
 			// punitive block is waived. See shouldEscalateReplay.
-			if allowUnregisteredLST {
-				// The public Hub path deliberately has no registry-backed source
-				// binding, so a captured packet must not block its replayed source.
-				log.Debug("received replay packet from %s, drop unregistered LST without source escalation", ppd.ConnData.RemoteAddr.String())
-			} else {
+			if !allowUnregisteredLST {
 				escalate := shouldEscalateReplay(ppd.device.deviceType, peerDeviceType, ppd.HeaderType)
 				// Log severity tracks the escalation decision: for the drop-only
 				// exempt types an in-connection regression is an EXPECTED benign
@@ -763,12 +874,13 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 			return err
 		}
 	}
-	if shouldCheckFlood(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
-		if remoteSendTime < ppd.ConnData.LastRemoteSendTime+MinimalRecvIntervalMs*int64(time.Millisecond) {
+	// A valid Hub proof is a protocol-mandated second LST and may arrive well
+	// inside the inherited 20 ms per-connection floor. The exact-replay check
+	// above plus the Hub worker's bounded admission/replay layer remain active.
+	if !publicHubLST && shouldCheckFlood(ppd.device.deviceType, peerDeviceType, ppd.HeaderType) {
+		if remoteSendTime < lastRemoteSendTime+MinimalRecvIntervalMs*int64(time.Millisecond) {
 			// flood packet, drop
-			if allowUnregisteredLST {
-				log.Debug("received flood packet from %s, drop unregistered LST without source escalation", ppd.ConnData.RemoteAddr.String())
-			} else {
+			if !allowUnregisteredLST {
 				log.Critical("received flood packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
 				// threat plus 1
 				threat := atomic.AddInt32(&ppd.ConnData.RecvThreatCount, 1)
@@ -789,9 +901,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 		// AOP (server→AC) uses a tighter floor than the 600 s default to
 		// bound the cross-restart replay window (#1464) — see
 		// recvStalenessFloor.
-		if allowUnregisteredLST {
-			log.Debug("received stale packet from %s, drop unregistered LST without source escalation", ppd.ConnData.RemoteAddr.String())
-		} else {
+		if !allowUnregisteredLST {
 			log.Critical("received stale packet from %s, drop packet", ppd.ConnData.RemoteAddr.String())
 			// Escalate to threat/block only for message types where a stale
 			// packet is an attack signal rather than a likely clock-skew
@@ -852,7 +962,9 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ppd.header.TimestampBytes())
 	ppd.bodyAead, err = AeadFromKey(ppd.Ciphers.GcmType, &key)
 	if err != nil {
-		log.Error("failed to create AEAD for body decryption: %v", err)
+		if !publicHubLST {
+			log.Error("failed to create AEAD for body decryption: %v", err)
+		}
 		return err
 	}
 
@@ -910,7 +1022,9 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 	// decrypt body and reuse ppd.BasePacket.Content space
 	body, err := ppd.bodyAead.Open(ppd.basePacket.Content[ppd.header.Size():ppd.header.Size()], ppd.header.NonceBytes(), ppd.basePacket.Content[ppd.header.Size():], ppd.chainHash.Sum(ppd.hashBuf[:0]))
 	if err != nil {
-		log.Critical("decrypt body failed: %v", err)
+		if !ppd.isHubLSTPublicPath() {
+			log.Critical("decrypt body failed: %v", err)
+		}
 		return ErrAEADDecryptionFailed.WithExtra(err)
 	}
 
@@ -1091,6 +1205,172 @@ func (ppd *PacketParserData) sendCookie() {
 	// payload size for diagnostics without persisting the credential itself.
 	log.Debug("Send cookie back to %s (%d bytes)", ppd.ConnData.RemoteAddr, len(md.Message))
 	ppd.device.SendMsgToPacket(md)
+}
+
+// checkHubLSTCookieProofDigest verifies the assignment-Hub proof in the
+// existing Curve header digest. It deliberately does not call or share the
+// NHP_RKN stateless-cookie derivation: the domain, flag, source canonicalization
+// and configuration seam are all distinct. The initiator static key must be
+// decrypted before the cookie can be derived, and validatePeer later reuses the
+// cached key so this does not repeat the Noise transcript.
+func (ppd *PacketParserData) checkHubLSTCookieProofDigest() bool {
+	defer func() {
+		ppd.digestHash.Reset()
+		ppd.digestHash = nil
+	}()
+
+	if !ppd.isHubLSTPublicPath() || ppd.HeaderFlag != common.NHP_FLAG_HUB_LST_COOKIE_PROOF ||
+		ppd.device == nil || !ppd.device.hubLSTCookieKeyConfigured() {
+		return false
+	}
+	peerPk, err := ppd.decryptInitiatorStaticPubKey()
+	if err != nil || len(peerPk) != PublicKeySize {
+		return false
+	}
+	family, sourceIP, ok := canonicalHubLSTSourceIP(ppd.ConnData)
+	if !ok || ppd.LocalInitTime <= 0 {
+		return false
+	}
+
+	var activeBuf, previousBuf [SymmetricKeySize]byte
+	active, previous := ppd.device.hubLSTCookieKeysInto(activeBuf[:], previousBuf[:])
+	if len(active) != SymmetricKeySize {
+		return false
+	}
+	defer SetZero(active)
+	defer SetZero(previous)
+
+	headerPrefix := ppd.header.Bytes()[:ppd.header.Size()-HashSize]
+	headerDigest := ppd.header.HeaderDigestBytes()
+	serverPubKey := ppd.deviceEcdh.PublicKey()
+	currentWindow := ppd.LocalInitTime / int64(time.Second) / HubLSTCookieWindowSeconds
+	var cookie [CookieSize]byte
+	defer SetZero(cookie[:])
+	// Frozen verification order: active/current, active/previous-window,
+	// previous/current, previous/previous-window. The order keeps the hot path
+	// first while preserving both time-window and fleet-key rotation grace.
+	for _, key := range [2][]byte{active, previous} {
+		if len(key) == 0 {
+			continue
+		}
+		for _, window := range [2]int64{currentWindow, currentWindow - 1} {
+			deriveHubLSTCookieInto(&cookie, key, family, sourceIP, peerPk, window)
+			ppd.digestHash.Reset()
+			ppd.digestHash.Write(initialHashBytes)
+			ppd.digestHash.Write(serverPubKey)
+			ppd.digestHash.Write(headerPrefix)
+			ppd.digestHash.Write(cookie[:])
+			if hmac.Equal(ppd.digestHash.Sum(ppd.hashBuf[:0]), headerDigest) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// HubLSTCookieChallengeError carries the already-authenticated, encrypted COK
+// datagram that a dedicated synchronous Hub worker may return to the observed
+// UDP source. Error() never includes the cookie or packet. Packet returns an
+// independent copy so the caller cannot alias core's scratch storage.
+type HubLSTCookieChallengeError struct {
+	packet []byte
+}
+
+func (e *HubLSTCookieChallengeError) Error() string {
+	return ErrHubLSTCookieProofRequired.Error()
+}
+
+func (e *HubLSTCookieChallengeError) Unwrap() error {
+	return ErrHubLSTCookieProofRequired
+}
+
+func (e *HubLSTCookieChallengeError) Packet() []byte {
+	if e == nil {
+		return nil
+	}
+	return bytes.Clone(e.packet)
+}
+
+func (e *HubLSTCookieChallengeError) clear() {
+	if e == nil {
+		return
+	}
+	SetZero(e.packet)
+	e.packet = nil
+}
+
+// enforceHubLSTCookieChallenge runs after static/timestamp/body AEAD succeeds
+// and before a decrypted LST can reach any endpoint handler. A source-unproven
+// request receives at most one uncompressed COK, and only if the exact sealed
+// response is strictly smaller than the received datagram. Equality and every
+// construction/configuration failure are silent fail-closed drops represented
+// by ErrHubLSTCookieProofRequired without response bytes.
+//
+// The dedicated Hub worker must use synchronous Device.PacketToMsg, inspect a
+// HubLSTCookieChallengeError, and hand Packet() to its single UDP writer. The
+// legacy asynchronous RecvPacketToMsg path still enforces the gate (so an
+// unproven body cannot reach DecryptedMsgQueue) but intentionally does not send
+// the embedded packet; its ordinary error lifecycle destroys parser state and
+// drops the challenge fail closed.
+func (ppd *PacketParserData) enforceHubLSTCookieChallenge() error {
+	if !ppd.isHubLSTPublicPath() || ppd.hasHubLSTCookieProof() {
+		return nil
+	}
+	// An asynchronous caller may receive the error-bearing parser object on a
+	// completion channel. Never leave a source-unproven assignment body (which
+	// may contain a setup credential) attached to that error result.
+	defer func() {
+		SetZero(ppd.BodyMessage)
+		ppd.BodyMessage = nil
+	}()
+	if ppd.HeaderFlag != 0 || ppd.device == nil || !ppd.device.hubLSTCookieKeyConfigured() {
+		return ErrHubLSTCookieProofRequired
+	}
+	family, sourceIP, ok := canonicalHubLSTSourceIP(ppd.ConnData)
+	if !ok || len(ppd.RemotePubKey) != PublicKeySize || ppd.LocalInitTime <= 0 {
+		return ErrHubLSTCookieProofRequired
+	}
+
+	var activeBuf, previousBuf [SymmetricKeySize]byte
+	active, previous := ppd.device.hubLSTCookieKeysInto(activeBuf[:], previousBuf[:])
+	if len(active) != SymmetricKeySize {
+		return ErrHubLSTCookieProofRequired
+	}
+	defer SetZero(active)
+	defer SetZero(previous)
+	window := ppd.LocalInitTime / int64(time.Second) / HubLSTCookieWindowSeconds
+	var cookie [CookieSize]byte
+	defer SetZero(cookie[:])
+	deriveHubLSTCookieInto(&cookie, active, family, sourceIP, ppd.RemotePubKey, window)
+
+	var cookieBase64 [hubLSTCookieBase64Size]byte
+	defer SetZero(cookieBase64[:])
+	base64.StdEncoding.Encode(cookieBase64[:], cookie[:])
+	// 86 bytes is the compact JSON maximum: 9-byte prefix + 20-digit uint64 +
+	// 11-byte cookie prefix + 44-byte padded base64 + 2-byte suffix.
+	cokBytes := make([]byte, 0, 86)
+	cokBytes = append(cokBytes, `{"trxId":`...)
+	cokBytes = strconv.AppendUint(cokBytes, ppd.SenderTrxId, 10)
+	cokBytes = append(cokBytes, `,"cookie":"`...)
+	cokBytes = append(cokBytes, cookieBase64[:]...)
+	cokBytes = append(cokBytes, `"}`...)
+	defer SetZero(cokBytes)
+	mad, err := ppd.device.msgToPacketWithDiagnostics(&MsgData{
+		HeaderType:     NHP_COK,
+		PrevParserData: ppd,
+		Compress:       false,
+		Message:        cokBytes,
+	}, true)
+	if err != nil || mad == nil || mad.BasePacket == nil {
+		return ErrHubLSTCookieProofRequired
+	}
+	packet := bytes.Clone(mad.BasePacket.Content)
+	mad.Destroy() // explicit ownership release; idempotent after MsgToPacket.
+	if len(packet) >= len(ppd.basePacket.Content) {
+		SetZero(packet)
+		return ErrHubLSTCookieProofRequired
+	}
+	return &HubLSTCookieChallengeError{packet: packet}
 }
 
 // checkHeaderDigest recomputes the unkeyed header digest (see

@@ -45,9 +45,10 @@ export const NHP_ACK = 2; // server → agent: knock result
 export const NHP_COK = 7; // server → agent: re-knock cookie
 export const NHP_RKN = 8;
 
-// Header flags (`nhp/common/packet.go`): EXTENDEDLENGTH = 1<<0, COMPRESS = 1<<1.
-// The browser sends bodies uncompressed, so it never sets COMPRESS — it's here
-// for completeness / decoding.
+// Header flags (`nhp/common/packet.go`): EXTENDEDLENGTH = 1<<0, COMPRESS = 1<<1,
+// HUB_LST_COOKIE_PROOF = 1<<2. The browser sends bodies uncompressed and never
+// performs native Hub assignment, so it sets neither protocol flag — COMPRESS
+// remains here for decoding.
 export const NHP_FLAG_COMPRESS = 1 << 1;
 
 export const PROTOCOL_VERSION_MAJOR = 1;

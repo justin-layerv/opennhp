@@ -1,7 +1,8 @@
 package core
 
-// NHP error codes - pure Go constants matching nhpdevicedef.h
-// This eliminates CGO dependency from the core package.
+// NHP error codes are pure Go constants matching nhpdevicedef.h for the
+// upstream range. LayerV protocol extensions append new non-conflicting values
+// here; the C bridge forwards every NhpError number without its own enum.
 const (
 	// General errors
 	errNhpSuccess              = 0
@@ -40,4 +41,7 @@ const (
 	errNhpPeerNotFound                   = 32016
 	errNhpPeerExpired                    = 32017
 	errNhpPeerAddressMismatch            = 32018
+	errNhpHubLSTCookieProofRequired      = 32019
+	errNhpInvalidHubLSTCookieProof       = 32020
+	errNhpInvalidHubLSTFlags             = 32021
 )

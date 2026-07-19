@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"runtime"
 	"runtime/debug"
@@ -41,8 +42,10 @@ type DeviceOptions struct {
 	// source-address binding means core provides no cross-connection replay or
 	// roaming barrier for this path. Replay, flood, and past-stale packets still
 	// fail with their existing errors, but do not increment threat state or block
-	// their unbound source. The option is inert when DisableAgentPeerValidation
-	// is set; a Hub must never combine the two.
+	// their unbound source. SetHubLSTCookieKeys must install the fleet-shared
+	// active key before traffic is admitted; without it, source-unproven LSTs
+	// fail closed and no application body is returned. The option is inert when
+	// DisableAgentPeerValidation is set; a Hub must never combine the two.
 	AllowUnregisteredAgentLST bool
 }
 
@@ -99,6 +102,17 @@ type Device struct {
 	cookieSigningKey        []byte
 	cookieTimeWindowSec     int64
 	cookieSigningConfigured atomic.Bool
+
+	// hubLSTCookieKeys back the assignment Hub's mandatory LST
+	// return-routability challenge. It is intentionally separate from the
+	// overload-cookie key above: the two protocols have distinct HMAC domains,
+	// flags, and admission semantics, and enabling one must never enable the
+	// other. All Hub replicas behind an edge load balancer configure the same
+	// 32-byte key.
+	hubLSTCookieMu          sync.RWMutex
+	hubLSTCookieActiveKey   []byte
+	hubLSTCookiePreviousKey []byte
+	hubLSTCookieConfigured  atomic.Bool
 
 	wg      sync.WaitGroup
 	signals struct {
@@ -304,6 +318,78 @@ func (d *Device) statelessCookieParamsInto(dst []byte) ([]byte, int64) {
 	return key, d.cookieTimeWindowSec
 }
 
+// SetHubLSTCookieKeys installs the shared active and optional previous 32-byte
+// keys used only by the assignment-Hub NHP_LST return-routability challenge.
+// Minting always uses active; verification tries active then previous. That
+// grace slot lets a proof minted before fleet key rotation land on a replica
+// that has already reloaded. Rotate in two fleet-wide phases: first distribute
+// the next key as previous everywhere, then promote it to active while retaining
+// the old key as previous. Promoting first can mint a proof that a lagging
+// replica cannot verify. Passing two nil keys clears the configuration.
+func (d *Device) SetHubLSTCookieKeys(active, previous []byte) error {
+	if len(active) != 0 && len(active) != SymmetricKeySize {
+		return fmt.Errorf("active hub LST cookie key must be %d bytes, got %d", SymmetricKeySize, len(active))
+	}
+	if len(previous) != 0 && len(previous) != SymmetricKeySize {
+		return fmt.Errorf("previous hub LST cookie key must be %d bytes, got %d", SymmetricKeySize, len(previous))
+	}
+	if len(active) == 0 && len(previous) != 0 {
+		return fmt.Errorf("previous hub LST cookie key requires an active key")
+	}
+
+	d.hubLSTCookieMu.Lock()
+	defer d.hubLSTCookieMu.Unlock()
+
+	if d.hubLSTCookieActiveKey != nil {
+		SetZero(d.hubLSTCookieActiveKey)
+	}
+	if d.hubLSTCookiePreviousKey != nil {
+		SetZero(d.hubLSTCookiePreviousKey)
+	}
+	d.hubLSTCookieActiveKey = nil
+	d.hubLSTCookiePreviousKey = nil
+	if len(active) == 0 {
+		d.hubLSTCookieConfigured.Store(false)
+		return nil
+	}
+	d.hubLSTCookieActiveKey = append([]byte(nil), active...)
+	if len(previous) != 0 {
+		d.hubLSTCookiePreviousKey = append([]byte(nil), previous...)
+	}
+	d.hubLSTCookieConfigured.Store(true)
+	return nil
+}
+
+func (d *Device) hubLSTCookieKeyConfigured() bool {
+	return d != nil && d.hubLSTCookieConfigured.Load()
+}
+
+// hubLSTCookieKeysInto copies the short-lived signing keys into caller-owned
+// storage so HMAC work does not hold the reload lock.
+func (d *Device) hubLSTCookieKeysInto(activeDst, previousDst []byte) (active, previous []byte) {
+	d.hubLSTCookieMu.RLock()
+	defer d.hubLSTCookieMu.RUnlock()
+	if len(d.hubLSTCookieActiveKey) == 0 {
+		return nil, nil
+	}
+	if len(activeDst) < len(d.hubLSTCookieActiveKey) {
+		active = append([]byte(nil), d.hubLSTCookieActiveKey...)
+	} else {
+		active = activeDst[:len(d.hubLSTCookieActiveKey)]
+		copy(active, d.hubLSTCookieActiveKey)
+	}
+	if len(d.hubLSTCookiePreviousKey) == 0 {
+		return active, nil
+	}
+	if len(previousDst) < len(d.hubLSTCookiePreviousKey) {
+		previous = append([]byte(nil), d.hubLSTCookiePreviousKey...)
+	} else {
+		previous = previousDst[:len(d.hubLSTCookiePreviousKey)]
+		copy(previous, d.hubLSTCookiePreviousKey)
+	}
+	return active, previous
+}
+
 func (d *Device) Start() {
 	cpus := runtime.NumCPU()
 	d.wg.Add(2 * cpus)
@@ -502,6 +588,12 @@ func (d *Device) msgToPacketRoutine(id int) {
 
 // Synchronous linear processing.
 func (d *Device) MsgToPacket(md *MsgData) (mad *MsgAssemblerData, err error) {
+	return d.msgToPacketWithDiagnostics(md, false)
+}
+
+// msgToPacketWithDiagnostics keeps public Hub per-challenge assembly out of
+// attacker-amplifiable logs without widening the exported MsgData contract.
+func (d *Device) msgToPacketWithDiagnostics(md *MsgData, suppressDiagnostics bool) (mad *MsgAssemblerData, err error) {
 	defer func() {
 		if x := recover(); x != nil {
 			mad = nil
@@ -529,7 +621,7 @@ func (d *Device) MsgToPacket(md *MsgData) (mad *MsgAssemblerData, err error) {
 		return d.createKeepalivePacket(md)
 	}
 
-	mad, err = d.createMsgAssemblerData(md)
+	mad, err = d.createMsgAssemblerDataWithDiagnostics(md, suppressDiagnostics)
 	defer mad.Destroy()
 	if err != nil {
 		return nil, err
@@ -570,8 +662,11 @@ func (d *Device) packetToMsgRoutine(id int) {
 			// packet decryption workflow: connection.RecvQueue -> raw packet -> decryption -> raw message
 			func() {
 				msgType := HeaderTypeToString(pd.BasePacket.HeaderType)
-				log.Debug("packetToMsgRoutine %d: decrypting [%s] raw packet", id, msgType)
-				log.Evaluate("packetToMsgRoutine %d: decrypting [%s] raw packet", id, msgType)
+				publicHubLST := d.isHubLSTPublicHeader(pd.BasePacket.HeaderType)
+				if !publicHubLST {
+					log.Debug("packetToMsgRoutine %d: decrypting [%s] raw packet", id, msgType)
+					log.Evaluate("packetToMsgRoutine %d: decrypting [%s] raw packet", id, msgType)
+				}
 
 				var ppd *PacketParserData
 				var err error
@@ -594,15 +689,24 @@ func (d *Device) packetToMsgRoutine(id int) {
 
 				ppd, err = d.createPacketParserData(pd)
 				if err != nil {
-					log.Debug("packetToMsgRoutine %d: [%s] packet precheck failed: %v", id, msgType, err)
-					log.Evaluate("packetToMsgRoutine %d: [%s] packet precheck failed: %v", id, msgType, err)
+					if ppd == nil || !ppd.isHubLSTPublicPath() {
+						log.Debug("packetToMsgRoutine %d: [%s] packet precheck failed: %v", id, msgType, err)
+						log.Evaluate("packetToMsgRoutine %d: [%s] packet precheck failed: %v", id, msgType, err)
+					}
 					return
 				}
+				// From this point onward use the parser-pinned admission mode. The
+				// live option may change while a packet is in flight, but its public
+				// logging posture must not diverge from the security gates selected
+				// when the parser was created.
+				publicHubLST = ppd.isHubLSTPublicPath()
 
 				err = ppd.validatePeer()
 				if err != nil {
-					log.Debug("packetToMsgRoutine %d: [%s] packet validation failed: %v", id, msgType, err)
-					log.Evaluate("packetToMsgRoutine %d: [%s] packet validation failed: %v", id, msgType, err)
+					if !ppd.isHubLSTPublicPath() {
+						log.Debug("packetToMsgRoutine %d: [%s] packet validation failed: %v", id, msgType, err)
+						log.Evaluate("packetToMsgRoutine %d: [%s] packet validation failed: %v", id, msgType, err)
+					}
 					return
 				}
 
@@ -615,16 +719,31 @@ func (d *Device) packetToMsgRoutine(id int) {
 				// field doc for why a RESPONSE needs this chokepoint.
 				if d.recvReplayDedupeFn != nil {
 					if err = d.recvReplayDedupeFn(ppd); err != nil {
-						log.Debug("packetToMsgRoutine %d: [%s] packet dropped by replay dedupe: %v", id, msgType, err)
-						log.Evaluate("packetToMsgRoutine %d: [%s] packet dropped by replay dedupe: %v", id, msgType, err)
+						if !publicHubLST {
+							log.Debug("packetToMsgRoutine %d: [%s] packet dropped by replay dedupe: %v", id, msgType, err)
+							log.Evaluate("packetToMsgRoutine %d: [%s] packet dropped by replay dedupe: %v", id, msgType, err)
+						}
 						return
 					}
 				}
 
 				err = ppd.decryptBody()
 				if err != nil {
-					log.Error("packetToMsgRoutine: %d: [%s] packet decryption failed: %v", id, msgType, err)
-					log.Evaluate("packetToMsgRoutine: %d: [%s] packet decryption failed: %v", id, msgType, err)
+					if !ppd.isHubLSTPublicPath() {
+						log.Error("packetToMsgRoutine: %d: [%s] packet decryption failed: %v", id, msgType, err)
+						log.Evaluate("packetToMsgRoutine: %d: [%s] packet decryption failed: %v", id, msgType, err)
+					}
+					return
+				}
+				if err = ppd.enforceHubLSTCookieChallenge(); err != nil {
+					// The legacy async API has no response-writer contract. Strip the
+					// encrypted datagram before surfacing the error so no consumer can
+					// accidentally turn this fail-closed path into a second sender.
+					var challenge *HubLSTCookieChallengeError
+					if errors.As(err, &challenge) {
+						challenge.clear()
+						err = ErrHubLSTCookieProofRequired
+					}
 					return
 				}
 
@@ -632,24 +751,32 @@ func (d *Device) packetToMsgRoutine(id int) {
 				// metadata so REG/OTP credentials and ACK access tokens never
 				// reach the general or evaluate log files.
 				// TestDeviceAsyncLogsRedactProtocolBodies pins this format.
-				log.Debug("packetToMsgRoutine: %d: complete decrypting [%s] message (%d bytes)", id, msgType, len(ppd.BodyMessage))
-				log.Evaluate("packetToMsgRoutine: %d: complete decrypting [%s] message (%d bytes)", id, msgType, len(ppd.BodyMessage))
-				log.Debug("packetToMsgRoutine: complete decrypting feedbackMsgCh:%d,headerType:%s", d.deviceType, HeaderTypeToString(ppd.HeaderType))
+				if !publicHubLST {
+					log.Debug("packetToMsgRoutine: %d: complete decrypting [%s] message (%d bytes)", id, msgType, len(ppd.BodyMessage))
+					log.Evaluate("packetToMsgRoutine: %d: complete decrypting [%s] message (%d bytes)", id, msgType, len(ppd.BodyMessage))
+					log.Debug("packetToMsgRoutine: complete decrypting feedbackMsgCh:%d,headerType:%s", d.deviceType, HeaderTypeToString(ppd.HeaderType))
+				}
 				// deliver decrypted message to specific channel
 				if ppd.decryptedMsgCh != nil {
-					log.Debug("packetToMsgRoutine: complete decrypting decryptedMsgCh is not nil")
+					if !publicHubLST {
+						log.Debug("packetToMsgRoutine: complete decrypting decryptedMsgCh is not nil")
+					}
 					ppd.Destroy()
 					ppd.decryptedMsgCh <- ppd
 					return
 				}
 
 				if ppd.feedbackMsgCh != nil {
-					log.Debug("packetToMsgRoutine: complete decrypting feedbackMsgCh  is not nil")
+					if !publicHubLST {
+						log.Debug("packetToMsgRoutine: complete decrypting feedbackMsgCh  is not nil")
+					}
 					ppd.Destroy()
 					ppd.feedbackMsgCh <- ppd
 					return
 				}
-				log.Debug("packetToMsgRoutine: complete decrypting start IsTransactionRequest:deviceType:%d,headerType:%s", d.deviceType, HeaderTypeToString(ppd.HeaderType))
+				if !publicHubLST {
+					log.Debug("packetToMsgRoutine: complete decrypting start IsTransactionRequest:deviceType:%d,headerType:%s", d.deviceType, HeaderTypeToString(ppd.HeaderType))
+				}
 				// start and save responder transaction
 				if d.IsTransactionRequest(ppd.HeaderType) {
 					// ppd is owned and to be destroyed by transaction
@@ -667,7 +794,9 @@ func (d *Device) packetToMsgRoutine(id int) {
 				default:
 					// ppd not delivered, set error to destroy the ppd
 					d.recordReceiveQueueDrop(ReceiveQueueDropDecrypted)
-					log.Critical("packetToMsgRoutine: %d: decryptedMessageCh is full, discarding message", id)
+					if !publicHubLST {
+						log.Critical("packetToMsgRoutine: %d: decryptedMessageCh is full, discarding message", id)
+					}
 				}
 			}()
 		}
@@ -708,6 +837,10 @@ func (d *Device) PacketToMsg(pd *PacketData) (ppd *PacketParserData, err error) 
 	if err != nil {
 		return nil, err
 	}
+	err = ppd.enforceHubLSTCookieChallenge()
+	if err != nil {
+		return nil, err
+	}
 
 	return ppd, nil
 }
@@ -741,11 +874,14 @@ func (d *Device) RecvPacketToMsg(pd *PacketData) bool {
 	default:
 		// Ownership transferred to Device at the call. Release on a failed
 		// enqueue so a flood cannot drain the fixed packet pool.
+		publicHubLST := pd != nil && pd.BasePacket != nil && d.isHubLSTPublicHeader(pd.BasePacket.HeaderType)
 		d.recordReceiveQueueDrop(ReceiveQueueDropDecrypt)
 		if pd != nil && pd.BasePacket != nil {
 			d.ReleasePoolPacket(pd.BasePacket)
 		}
-		log.Critical("packetToMsgQueue is full, discarding packet")
+		if !publicHubLST {
+			log.Critical("packetToMsgQueue is full, discarding packet")
+		}
 		return false
 	}
 }

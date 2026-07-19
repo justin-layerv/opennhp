@@ -103,4 +103,11 @@ var (
 	ErrPeerNotFound        = newError(errNhpPeerNotFound, "peer not found in peer pool")
 	ErrPeerExpired         = newError(errNhpPeerExpired, "peer expired")
 	ErrPeerAddressMismatch = newError(errNhpPeerAddressMismatch, "peer does not match its previous address")
+	// ErrHubLSTCookieProofRequired is returned only on the exact opt-in
+	// assignment-Hub LST path after a cryptographically valid source-unproven
+	// request. A HubLSTCookieChallengeError wrapping this sentinel carries the
+	// smaller encrypted COK datagram when reflection-safe emission is possible.
+	ErrHubLSTCookieProofRequired = newError(errNhpHubLSTCookieProofRequired, "hub LST return-routability proof required")
+	ErrInvalidHubLSTCookieProof  = newError(errNhpInvalidHubLSTCookieProof, "invalid hub LST cookie proof configuration")
+	ErrInvalidHubLSTFlags        = newError(errNhpInvalidHubLSTFlags, "invalid hub LST header flags")
 )
