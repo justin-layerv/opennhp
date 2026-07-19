@@ -829,6 +829,53 @@ class TerraformPlanPrBootstrapTests(unittest.TestCase):
 
 
 class ControlRoutingApplyPolicyTests(unittest.TestCase):
+    def test_control_first_apply_simulation_grant_is_self_scoped(self) -> None:
+        policy_resource = find_resource_body(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "aws_iam_policy",
+            "terraform_read",
+        )
+        policy = extract_policy_body(policy_resource.get("policy"))
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        stmt = find_policy_statement(
+            REPO_ROOT / "terraform" / "modules" / "ecr",
+            "terraform_read",
+            "ControlFirstApplySelfSimulation",
+        )
+        simulation_actions = {
+            action
+            for policy_stmt in policy.get("Statement", []) or []
+            if isinstance(policy_stmt, dict)
+            for action in normalized_strings(policy_stmt.get("Action"))
+            if action.startswith("iam:Simulate")
+        }
+
+        self.assertEqual(simulation_actions, {"iam:SimulatePrincipalPolicy"})
+        self.assertEqual(
+            normalized_strings(stmt.get("Action")),
+            ["iam:SimulatePrincipalPolicy"],
+        )
+        self.assertEqual(
+            normalized_strings(stmt.get("Resource")),
+            ["${aws_iam_role.github_actions.arn}"],
+        )
+        self.assertEqual(unquote(stmt.get("Effect")), "Allow")
+        self.assertNotIn("Condition", stmt)
+        self.assertNotIn("NotAction", stmt)
+        self.assertNotIn("NotResource", stmt)
+
+        preflight = (
+            REPO_ROOT / "scripts" / "capture-control-sandbox-first-apply-preflight.sh"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(preflight.count("aws iam simulate-principal-policy"), 2)
+        self.assertEqual(
+            preflight.count(
+                '--policy-source-arn "arn:aws:iam::${account_id}:role/${role_name}"'
+            ),
+            2,
+        )
+
     def test_directconnect_grant_exactly_matches_audit_calls(self) -> None:
         policy_resource = find_resource_body(
             REPO_ROOT / "terraform" / "modules" / "ecr",
