@@ -1,0 +1,68 @@
+# Multi-stage build for the private Connector Hub worker. Customer/application
+# traffic is NHP UDP only; the separate TCP port accepts and closes private NLB
+# health checks without reading a payload.
+FROM golang:1.26.5-bookworm@sha256:18aedc16aa19b3fd7ded7245fc14b109e054d65d22ed53c355c899582bbb2113 AS builder
+
+WORKDIR /nhp-hub
+
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY nhp/go.mod nhp/go.sum ./nhp/
+COPY internalauth/go.mod ./internalauth/
+COPY endpoints/go.mod endpoints/go.sum ./endpoints/
+
+RUN cd nhp && go mod download
+RUN cd endpoints && go mod download
+
+COPY . .
+
+ENV CGO_ENABLED=0
+# Dependency manifests were downloaded above; build only the Hub artifact.
+# Avoid the repository-wide init target, whose git clean/tidy work is unrelated
+# to this isolated image and cannot run from a copied Git worktree pointer. The
+# workflow supplies the exact source SHA explicitly so binary provenance never
+# depends on a copied .git directory (a worktree pointer is invalid in-image).
+ARG NHP_BUILD_COMMIT_ID
+ARG NHP_BUILD_COMMIT_TIME
+RUN test -n "$NHP_BUILD_COMMIT_ID" && test -n "$NHP_BUILD_COMMIT_TIME" && \
+    make hubd COMMIT_ID="$NHP_BUILD_COMMIT_ID" COMMIT_TIME="$NHP_BUILD_COMMIT_TIME"
+
+FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ubuntu.com|//azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
+    grep -q azure.archive.ubuntu.com /etc/apt/sources.list.d/ubuntu.sources || \
+        { echo "ERROR: ubuntu.sources mirror substitution failed"; exit 1; } && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
+    ca-certificates \
+    libssl3t64 \
+    openssl-provider-legacy \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libssl3t64)" ge 3.5.5-1ubuntu3.2 \
+        || { echo "ERROR: libssl3t64 < 3.5.5-1ubuntu3.2"; exit 1; } \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/bin/pebble && rm -rf /var/lib/pebble
+
+COPY --from=builder /nhp-hub/release/nhp-hub /nhp-hub
+
+# Second source of truth: this port MUST match the port in hub.toml's
+# health_listen_addr, which is what the process actually binds. They are
+# deliberately decoupled only while the Hub runs dark; the later infrastructure
+# slice that owns the private health path must reconcile them (derive both from
+# one value) before this HEALTHCHECK is load-bearing. Otherwise a hub.toml port
+# change silently probes the wrong port and reports the container unhealthy while
+# the listener is up.
+ENV NHP_HUB_HEALTHCHECK_HOST=127.0.0.1 \
+    NHP_HUB_HEALTHCHECK_PORT=62207
+
+# TCP connect-only liveness. There is deliberately no HTTP handler or payload.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD timeout 2 bash -c 'exec 3<>/dev/tcp/${NHP_HUB_HEALTHCHECK_HOST}/${NHP_HUB_HEALTHCHECK_PORT}' || exit 1
+
+STOPSIGNAL SIGTERM
+USER 65532:65532
+ENTRYPOINT ["/nhp-hub/nhp-hubd"]
+CMD ["run"]

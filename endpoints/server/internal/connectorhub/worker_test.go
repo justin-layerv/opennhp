@@ -568,6 +568,18 @@ func TestNewWorkerRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 
+func TestValidateWorkerKeyMaterialMatchesNewWorkerKeyContract(t *testing.T) {
+	privateKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, core.PrivateKeySize))
+	activeCookieKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, core.SymmetricKeySize))
+	previousCookieKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{3}, core.SymmetricKeySize))
+	if err := ValidateWorkerKeyMaterial(privateKey, activeCookieKey, previousCookieKey); err != nil {
+		t.Fatalf("ValidateWorkerKeyMaterial: %v", err)
+	}
+	if err := ValidateWorkerKeyMaterial(privateKey, activeCookieKey+"\n", previousCookieKey); !errors.Is(err, ErrInvalidWorkerConfiguration) {
+		t.Fatalf("noncanonical key error = %v, want invalid worker configuration", err)
+	}
+}
+
 func TestAggregateAndPeerAdmissionRemainBounded(t *testing.T) {
 	now := time.Unix(100, 0)
 	aggregate := newAggregateAdmission(1, 1, 1, now)

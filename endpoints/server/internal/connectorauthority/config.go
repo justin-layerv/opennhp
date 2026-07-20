@@ -50,18 +50,28 @@ type CredentialRecoveryCellTarget struct {
 
 // NewHubClient constructs a hub-only client with a single-attempt Lambda SDK client.
 func NewHubClient(cfg aws.Config, boundary Boundary, targets HubTargets) (*HubClient, error) {
-	if err := validateBoundary(cfg, boundary); err != nil {
+	if err := ValidateHubTargets(boundary, targets); err != nil {
 		return nil, err
 	}
-	if err := validateTargets(boundary,
-		targetSpec{"issue_assignment", targets.IssueAssignmentAliasARN},
-		targetSpec{"refresh_assignment", targets.RefreshAssignmentAliasARN},
-		targetSpec{"issue_credential_recovery", targets.IssueCredentialRecoveryAliasARN},
-	); err != nil {
+	if err := validateSDKRegion(cfg, boundary); err != nil {
 		return nil, err
 	}
 
 	return newHubClient(newLambdaClient(cfg), targets), nil
+}
+
+// ValidateHubTargets applies the same account, region, and exact :active alias
+// contract as NewHubClient without constructing an AWS client. Process owners
+// use it before loading ambient AWS configuration.
+func ValidateHubTargets(boundary Boundary, targets HubTargets) error {
+	if err := validateBoundaryValues(boundary); err != nil {
+		return err
+	}
+	return validateTargets(boundary,
+		targetSpec{"issue_assignment", targets.IssueAssignmentAliasARN},
+		targetSpec{"refresh_assignment", targets.RefreshAssignmentAliasARN},
+		targetSpec{"issue_credential_recovery", targets.IssueCredentialRecoveryAliasARN},
+	)
 }
 
 // NewCellClient constructs a cell-only client with a single-attempt Lambda SDK client.
@@ -167,14 +177,25 @@ func newLambdaClient(cfg aws.Config) *lambda.Client {
 }
 
 func validateBoundary(cfg aws.Config, boundary Boundary) error {
+	if err := validateBoundaryValues(boundary); err != nil {
+		return err
+	}
+	return validateSDKRegion(cfg, boundary)
+}
+
+func validateSDKRegion(cfg aws.Config, boundary Boundary) error {
+	if cfg.Region != boundary.Region {
+		return &ConfigError{Field: "sdk_region"}
+	}
+	return nil
+}
+
+func validateBoundaryValues(boundary Boundary) error {
 	if !accountIDPattern.MatchString(boundary.AccountID) {
 		return &ConfigError{Field: "account_id"}
 	}
 	if boundary.Region == "" {
 		return &ConfigError{Field: "region"}
-	}
-	if cfg.Region != boundary.Region {
-		return &ConfigError{Field: "sdk_region"}
 	}
 	return nil
 }

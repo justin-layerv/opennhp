@@ -119,6 +119,7 @@ generate-version-and-build:
 	@$(MAKE) acd
 	@$(MAKE) serverd
 	@$(MAKE) relayd
+	@$(MAKE) hubd
 	@$(MAKE) db
 	@$(MAKE) licenseadmin
 	@$(MAKE) linuxagentsdk
@@ -167,6 +168,13 @@ relayd:
 	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-relay/nhp-relayd ./relay/main/main.go && \
 	mkdir -p ../release/nhp-relay/etc; \
 	cp ./relay/main/etc/*.toml ../release/nhp-relay/etc/
+
+hubd:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-hub... $(END_COLOUR)"
+	cd endpoints && \
+	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-hub/nhp-hubd ./server/hub/main/main.go && \
+	mkdir -p ../release/nhp-hub/etc && \
+	cp ./server/hub/main/etc/*.toml ../release/nhp-hub/etc/
 
 db:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-db... $(END_COLOUR)"
@@ -585,6 +593,10 @@ test:
 	# narrow -run allowlist of env-free tests. TestConformanceVectors (the qURL v2
 	# wire-format conformance vectors, server/internal/qurlv2) is one of them.
 	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry|TestConformanceVectors"
+	# Connector Hub process/worker tests are hermetic and security-sensitive.
+	# Run the package by path so the broad name allowlist above cannot silently
+	# skip lifecycle, cancellation, admission, replay, or UDP wire tests.
+	cd endpoints && KBS_SKIP_INIT=1 go test -race ./server/hub/... ./server/internal/connectorhub/...
 	# qURL static-plugin package runs by PATH, not via a -run name token above:
 	# it is hermetic under KBS_SKIP_INIT=1 (no etcd/network/key-init), so the whole
 	# package runs here — the WS1 security gate (TestWS1_NoQv2PathCallsInternalV1:
@@ -773,7 +785,7 @@ fuzz-quick:
 
 archive:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Start archiving... $(END_COLOUR)"
-	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server nhp-relay
+	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server nhp-relay nhp-hub
 	@echo "$(COLOUR_GREEN)[OpenNHP] Package ${PACKAGE_FILE} archived!$(END_COLOUR)"
 
-.PHONY: all generate-version-and-build init agentd acd serverd relayd db licenseadmin linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-smoke-local smoke-build test-smoke-sandbox test-smoke-prod test-all fuzz fuzz-quick archive ebpf clean_ebpf
+.PHONY: all generate-version-and-build init agentd acd serverd relayd hubd db licenseadmin linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-smoke-local smoke-build test-smoke-sandbox test-smoke-prod test-all fuzz fuzz-quick archive ebpf clean_ebpf

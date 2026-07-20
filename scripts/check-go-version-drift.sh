@@ -193,6 +193,7 @@ golang_from_files=(
   "docker/Dockerfile.ac"
   "docker/Dockerfile.ac.aws"
   "docker/Dockerfile.relay"
+  "docker/Dockerfile.hub"
   # Local smoke-stack builder — lives under tests/, not docker/, so the
   # discovery below is widened to that root too (otherwise its golang FROM
   # would silently escape the GO_VERSION lockstep on the next bump).

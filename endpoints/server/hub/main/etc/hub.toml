@@ -1,0 +1,25 @@
+# Example only. Deployment must replace every <required-...> value before the
+# process starts; strict validation fails closed on these placeholders.
+environment = "sandbox"
+
+# Customer/application assignment traffic is UDP only. The separate TCP
+# listener accepts and closes NLB health checks without reading a payload; the
+# later infrastructure slice must restrict it to the private health-check path.
+udp_listen_addr = "0.0.0.0:62206"
+health_listen_addr = "0.0.0.0:62207"
+
+private_key = "<required-canonical-32-byte-base64>"
+active_cookie_key = "<required-canonical-32-byte-base64>"
+previous_cookie_key = ""
+
+aws_region = "us-east-2"
+aws_account_id = "<required-12-digit-account-id>"
+issue_assignment_alias_arn = "<required-issue-assignment-active-alias-arn>"
+refresh_assignment_alias_arn = "<required-refresh-assignment-active-alias-arn>"
+issue_credential_recovery_alias_arn = "<required-issue-credential-recovery-active-alias-arn>"
+
+max_concurrent_packets = 64
+packets_per_second = 128
+packet_burst = 256
+max_concurrent_per_peer = 4
+response_queue_capacity = 64

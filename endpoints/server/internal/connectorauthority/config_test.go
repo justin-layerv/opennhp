@@ -138,6 +138,20 @@ func TestConstructorsRequireDistinctRecoveryAliases(t *testing.T) {
 	}
 }
 
+func TestValidateHubTargetsDoesNotRequireAWSClient(t *testing.T) {
+	t.Parallel()
+
+	boundary := Boundary{AccountID: testAccountID, Region: testRegion}
+	if err := ValidateHubTargets(boundary, validHubTargets()); err != nil {
+		t.Fatalf("ValidateHubTargets: %v", err)
+	}
+	invalid := validHubTargets()
+	invalid.RefreshAssignmentAliasARN = aliasARN("RefreshAssignment", "latest")
+	if err := ValidateHubTargets(boundary, invalid); err == nil {
+		t.Fatal("ValidateHubTargets accepted a non-active alias")
+	}
+}
+
 func TestLambdaClientForcesDefaultEndpointAndOneAttempt(t *testing.T) {
 	t.Parallel()
 

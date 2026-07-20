@@ -49,6 +49,18 @@ type WorkerConfig struct {
 	ResponseQueueCapacity int
 }
 
+type workerKeyMaterial struct {
+	private  []byte
+	active   []byte
+	previous []byte
+}
+
+func (m *workerKeyMaterial) clear() {
+	clear(m.private)
+	clear(m.active)
+	clear(m.previous)
+}
+
 type outboundDatagram struct {
 	payload      []byte
 	remote       *net.UDPAddr
@@ -97,30 +109,21 @@ func NewWorker(conn *net.UDPConn, config WorkerConfig) (*Worker, error) {
 		return nil, ErrInvalidWorkerConfiguration
 	}
 
-	privateKey, err := decodeCanonicalKey(config.PrivateKeyBase64, core.PrivateKeySize)
+	keys, err := decodeWorkerKeyMaterial(
+		config.PrivateKeyBase64,
+		config.ActiveCookieKeyBase64,
+		config.PreviousCookieKeyBase64,
+	)
 	if err != nil {
-		return nil, ErrInvalidWorkerConfiguration
+		return nil, err
 	}
-	defer clear(privateKey)
-	activeCookieKey, err := decodeCanonicalKey(config.ActiveCookieKeyBase64, core.SymmetricKeySize)
-	if err != nil {
-		return nil, ErrInvalidWorkerConfiguration
-	}
-	defer clear(activeCookieKey)
-	var previousCookieKey []byte
-	if config.PreviousCookieKeyBase64 != "" {
-		previousCookieKey, err = decodeCanonicalKey(config.PreviousCookieKeyBase64, core.SymmetricKeySize)
-		if err != nil {
-			return nil, ErrInvalidWorkerConfiguration
-		}
-		defer clear(previousCookieKey)
-	}
+	defer keys.clear()
 
-	device := core.NewDevice(core.NHP_SERVER, privateKey, &core.DeviceOptions{AllowUnregisteredAgentLST: true})
+	device := core.NewDevice(core.NHP_SERVER, keys.private, &core.DeviceOptions{AllowUnregisteredAgentLST: true})
 	if device == nil {
 		return nil, ErrInvalidWorkerConfiguration
 	}
-	if err := device.SetHubLSTCookieKeys(activeCookieKey, previousCookieKey); err != nil {
+	if err := device.SetHubLSTCookieKeys(keys.active, keys.previous); err != nil {
 		return nil, ErrInvalidWorkerConfiguration
 	}
 
@@ -160,6 +163,37 @@ func deriveReplayCapacity(maxConcurrent, ratePerSecond, burst int) (int, bool) {
 		return 0, false
 	}
 	return int(base + uint64(ratePerSecond)*windowSeconds), true
+}
+
+// ValidateWorkerKeyMaterial applies the exact canonical key contract used by
+// NewWorker without retaining decoded key bytes. Process owners use it before
+// loading ambient dependencies or claiming listeners.
+func ValidateWorkerKeyMaterial(privateKeyBase64, activeCookieKeyBase64, previousCookieKeyBase64 string) error {
+	keys, err := decodeWorkerKeyMaterial(privateKeyBase64, activeCookieKeyBase64, previousCookieKeyBase64)
+	keys.clear()
+	return err
+}
+
+func decodeWorkerKeyMaterial(privateKeyBase64, activeCookieKeyBase64, previousCookieKeyBase64 string) (workerKeyMaterial, error) {
+	var keys workerKeyMaterial
+	var err error
+	keys.private, err = decodeCanonicalKey(privateKeyBase64, core.PrivateKeySize)
+	if err != nil {
+		return workerKeyMaterial{}, ErrInvalidWorkerConfiguration
+	}
+	keys.active, err = decodeCanonicalKey(activeCookieKeyBase64, core.SymmetricKeySize)
+	if err != nil {
+		keys.clear()
+		return workerKeyMaterial{}, ErrInvalidWorkerConfiguration
+	}
+	if previousCookieKeyBase64 != "" {
+		keys.previous, err = decodeCanonicalKey(previousCookieKeyBase64, core.SymmetricKeySize)
+		if err != nil {
+			keys.clear()
+			return workerKeyMaterial{}, ErrInvalidWorkerConfiguration
+		}
+	}
+	return keys, nil
 }
 
 func decodeCanonicalKey(encoded string, size int) ([]byte, error) {

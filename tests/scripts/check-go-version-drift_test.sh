@@ -62,7 +62,7 @@ EOF
   GO_TEST_IMAGE: 'golang:${version}-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 EOF
 
-  for dockerfile in Dockerfile.server Dockerfile.ac Dockerfile.ac.aws Dockerfile.relay; do
+  for dockerfile in Dockerfile.server Dockerfile.ac Dockerfile.ac.aws Dockerfile.relay Dockerfile.hub; do
     cat > "$dir/docker/$dockerfile" <<EOF
 FROM golang:${version}-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder
 EOF
@@ -364,6 +364,16 @@ test_docker_digest_drift_fails() {
   assert_failure "$name" "$tmp" "docker/Dockerfile.ac golang FROM: expected Go image"
 }
 
+test_hub_docker_digest_drift_fails() {
+  local name="Hub Dockerfile golang digest drift fails"
+  local tmp
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+  write_good_fixture "$tmp"
+  sed -i.bak 's/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/sha256:9999999999999999999999999999999999999999999999999999999999999999/' "$tmp/docker/Dockerfile.hub"
+  assert_failure "$name" "$tmp" "docker/Dockerfile.hub golang FROM: expected Go image"
+}
+
 test_docker_from_variant_fails_with_variant_error() {
   local name="Dockerfile golang variant fails with variant error"
   local tmp
@@ -523,6 +533,7 @@ test_toolchain_directive_drift_fails
 test_unpinned_test_image_fails
 test_docker_from_drift_fails
 test_docker_digest_drift_fails
+test_hub_docker_digest_drift_fails
 test_docker_from_variant_fails_with_variant_error
 test_duplicate_dockerfile_golang_from_passes
 test_second_dockerfile_golang_from_digest_drift_fails

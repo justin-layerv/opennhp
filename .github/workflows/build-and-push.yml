@@ -88,9 +88,9 @@ env:
   #   - ARG GO_VERSION and verified tarball checksums in
   #     docker/Dockerfile.{app,base}
   #   - `go` directives in the CI-touched Go modules
-  # GO_TEST_IMAGE and docker/Dockerfile.{server,ac,ac.aws} must share
-  # one golang:<version>-bookworm@sha256:<digest> ref (also covers the
-  # FROM tags in those three files). Re-resolve via `docker buildx
+  # GO_TEST_IMAGE and docker/Dockerfile.{server,ac,ac.aws,relay,hub} must share
+  # one golang:<version>-bookworm@sha256:<digest> ref (also covers every
+  # listed Dockerfile's FROM tag). Re-resolve via `docker buildx
   # imagetools inspect golang:${GO_VERSION}-bookworm`, then pick an
   # official OCI index digest that satisfies the Docker age gate.
   # `make lint-workflows` runs scripts/check-go-version-drift.sh over
@@ -1100,6 +1100,7 @@ jobs:
             dockerfile: docker/Dockerfile.server
             repo: layerv/nhp-server
             platform: linux/amd64
+            publish: true
           - image: ac
             dockerfile: docker/Dockerfile.ac.aws
             repo: layerv/nhp-ac
@@ -1108,6 +1109,7 @@ jobs:
             # platform in lockstep with terraform/modules/ac/main.tf until a
             # real non-amd64 BPF load test exists for the flip slice.
             platform: linux/amd64
+            publish: true
           # The NHP-Relay (#2208). Build + scan + push, mirroring the server/ac
           # legs. The CD deploy leg (#2624) is the `deploy-sandbox-relay` job
           # below: it puts this freshly-built tag into /sandbox/nhp/relay/image-tag
@@ -1118,6 +1120,16 @@ jobs:
             dockerfile: docker/Dockerfile.relay
             repo: layerv/nhp-relay
             platform: linux/amd64
+            publish: true
+          # The assignment-only Connector Hub image is built, inventoried, and
+          # scanned in durable CI while the runtime remains dark. Its ECR repo,
+          # publisher IAM, deployment, private health path, and public UDP edge
+          # are separate infrastructure slices; never push before they land.
+          - image: hub
+            dockerfile: docker/Dockerfile.hub
+            repo: layerv/nhp-hub
+            platform: linux/amd64
+            publish: false
     steps:
       # Skip at step level (not job level) so matrix expands and check names are created
       # Build only when this commit changed app paths, or the live sandbox app
@@ -1133,19 +1145,33 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # ECR is hosted in the sandbox account (primary_account). Prod pulls cross-account
-      # via ECR repository policy (see terraform/modules/ecr/main.tf). Images are always
-      # pushed to sandbox ECR, so we always use the sandbox role here.
+      # via ECR repository policy (see terraform/modules/ecr/main.tf). Published matrix
+      # rows always push to sandbox ECR; dark validation-only rows use no AWS identity.
       - name: Configure AWS credentials
-        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && matrix.publish && github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && matrix.publish && github.event_name != 'pull_request'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+
+      - name: Resolve Hub source metadata
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && matrix.image == 'hub'
+        id: source
+        run: |
+          set -euo pipefail
+          commit_time=$(git show -s --format=%cd --date=format:'%Y-%m-%d %H:%M:%S' "$GITHUB_SHA")
+          [[ -n "$commit_time" ]]
+          {
+            echo 'build_args<<EOF'
+            printf 'NHP_BUILD_COMMIT_ID=%s\n' "$GITHUB_SHA"
+            printf 'NHP_BUILD_COMMIT_TIME=%s\n' "$commit_time"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         if: needs.app-image-build-required.outputs.app_image_build_required == 'true'
@@ -1178,6 +1204,10 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          # Dockerfile.hub requires this exact source identity instead of
+          # consulting copied .git state. Other matrix legs receive no Hub-only
+          # arguments, avoiding misleading unconsumed-build-arg warnings.
+          build-args: ${{ steps.source.outputs.build_args }}
           secrets: |
             github_token=${{ secrets.PLUGIN_REPO_TOKEN }}
           cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}
@@ -1289,7 +1319,7 @@ jobs:
           retention-days: 7
 
       - name: Push to ECR
-        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && matrix.publish && github.event_name != 'pull_request'
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
@@ -1317,7 +1347,7 @@ jobs:
       # their `steps.digest.outputs.digest != ''` gate.
       - name: Capture pushed image digest
         id: digest
-        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && matrix.publish && github.event_name != 'pull_request'
         continue-on-error: true
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -1380,7 +1410,7 @@ jobs:
       # the per-image outcome in the run summary and ::warning:: loudly when an
       # attestation was expected (digest resolved) but did not get produced.
       - name: Attestation summary
-        if: always() && needs.app-image-build-required.outputs.app_image_build_required == 'true' && github.event_name != 'pull_request'
+        if: always() && needs.app-image-build-required.outputs.app_image_build_required == 'true' && matrix.publish && github.event_name != 'pull_request'
         env:
           IMAGE: ${{ matrix.image }}
           DIGEST: ${{ steps.digest.outputs.digest }}
