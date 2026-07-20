@@ -277,6 +277,15 @@ type UdpServer struct {
 	// plugin handlers
 	pluginHandlerMapMutex sync.RWMutex
 	pluginHandlerMap      map[string]plugins.PluginHandler
+	// credentialRecoveryHandler is the direct-UDP-only assigned-cell recovery
+	// capability. Nil is the dark, absent-configuration state. It is constructed
+	// once during Start before the listener binds and is never exposed to relay or
+	// generic plugin dispatch.
+	credentialRecoveryHandler credentialRecoveryDirectHandler
+	// observeRelayedCredentialRecoveryBodyCleared is a TEST-ONLY SEAM used to
+	// prove that the production HandleRelayForward path clears its decrypted
+	// recovery request before returning. Production leaves it nil.
+	observeRelayedCredentialRecoveryBodyCleared func([]byte)
 
 	// signals
 	signals struct {
@@ -604,6 +613,9 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	// The private key is per-server and stored in Secrets Manager, not shared etcd
 	err = s.loadBaseConfig()
 	if err != nil {
+		return err
+	}
+	if err := s.configureCredentialRecovery(context.Background(), os.LookupEnv, loadCredentialRecoveryAWSConfig); err != nil {
 		return err
 	}
 

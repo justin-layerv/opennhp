@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorcell"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	wasmEngine "github.com/OpenNHP/opennhp/nhp/core/wasm/engine"
@@ -1571,6 +1572,32 @@ func registerErrToCode(err error) *common.Error {
 func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
+
+	// Assigned-cell credential recovery is a direct-UDP-only capability. This
+	// branch must stay before buildListResult: that shared plugin seam is also
+	// reachable from HandleRelayForward, clones secret-bearing RawBody, and
+	// round-trips results through generic JSON structs.
+	if lrtBytes, handled, deadline, classification, recoveryErr := s.buildDirectCredentialRecoveryResult(ppd); handled {
+		if recoveryErr != nil {
+			s.recordCredentialRecoveryOutcome(classification)
+			return recoveryErr
+		}
+		// Keep the same receipt-anchored absolute deadline through the final
+		// transaction handoff. The response is intentionally not cleared here:
+		// successful SendMessageContext transfers it to asynchronous NHP response
+		// ownership.
+		if forwardErr := s.forwardCredentialRecoveryToTransaction(ppd, lrtBytes, deadline); forwardErr != nil {
+			if errors.Is(forwardErr, errCredentialRecoveryDeadline) {
+				classification = connectorcell.ClassificationDeadlineRejected
+			} else {
+				classification = connectorcell.ClassificationInternalFailure
+			}
+			s.recordCredentialRecoveryOutcome(classification)
+			return forwardErr
+		}
+		s.recordCredentialRecoveryOutcome(classification)
+		return nil
+	}
 
 	lrtBytes, userID, resultErr := s.buildListResult(ppd)
 	if lrtBytes == nil {

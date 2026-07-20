@@ -67,6 +67,41 @@ func TestConstructorsAcceptExactActiveAliasARNs(t *testing.T) {
 	if _, err := NewCellClient(cfg, boundary, validCellTargets()); err != nil {
 		t.Fatalf("NewCellClient: %v", err)
 	}
+	if _, err := NewCredentialRecoveryCellClient(cfg, boundary, validCredentialRecoveryCellTarget()); err != nil {
+		t.Fatalf("NewCredentialRecoveryCellClient: %v", err)
+	}
+}
+
+func TestCredentialRecoveryCellConstructorRejectsEveryAliasBoundaryDrift(t *testing.T) {
+	t.Parallel()
+	cfg := aws.Config{Region: testRegion}
+	boundary := Boundary{AccountID: testAccountID, Region: testRegion}
+	for _, test := range []struct {
+		name  string
+		bound Boundary
+		alias string
+		field string
+	}{
+		{name: "account", bound: Boundary{AccountID: "123", Region: testRegion}, alias: aliasARN("CompleteCredentialRecovery-cell0", "active"), field: "account_id"},
+		{name: "region", bound: Boundary{AccountID: testAccountID}, alias: aliasARN("CompleteCredentialRecovery-cell0", "active"), field: "region"},
+		{name: "empty", bound: boundary, field: "complete_credential_recovery"},
+		{name: "unqualified", bound: boundary, alias: "arn:aws:lambda:us-west-2:123456789012:function:CompleteCredentialRecovery-cell0", field: "complete_credential_recovery"},
+		{name: "numeric", bound: boundary, alias: aliasARN("CompleteCredentialRecovery-cell0", "7"), field: "complete_credential_recovery"},
+		{name: "latest", bound: boundary, alias: aliasARN("CompleteCredentialRecovery-cell0", "$LATEST"), field: "complete_credential_recovery"},
+		{name: "wrong account", bound: boundary, alias: "arn:aws:lambda:us-west-2:999999999999:function:CompleteCredentialRecovery-cell0:active", field: "complete_credential_recovery"},
+		{name: "wrong region", bound: boundary, alias: "arn:aws:lambda:us-east-1:123456789012:function:CompleteCredentialRecovery-cell0:active", field: "complete_credential_recovery"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewCredentialRecoveryCellClient(cfg, test.bound, CredentialRecoveryCellTarget{
+				CompleteCredentialRecoveryAliasARN: test.alias,
+			})
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) || configErr.Field != test.field {
+				t.Fatalf("error = %#v, want ConfigError field %q", err, test.field)
+			}
+		})
+	}
 }
 
 func TestConstructorsRequireDistinctRecoveryAliases(t *testing.T) {
@@ -108,8 +143,9 @@ func TestLambdaClientForcesDefaultEndpointAndOneAttempt(t *testing.T) {
 
 	customEndpoint := "https://attacker.invalid"
 	cfg := aws.Config{
-		Region:       testRegion,
-		BaseEndpoint: &customEndpoint,
+		Region:        testRegion,
+		BaseEndpoint:  &customEndpoint,
+		ClientLogMode: aws.LogRequestWithBody | aws.LogResponseWithBody,
 		EndpointResolver: aws.EndpointResolverFunc(func(string, string) (aws.Endpoint, error) {
 			return aws.Endpoint{URL: customEndpoint}, nil
 		}),
@@ -131,6 +167,9 @@ func TestLambdaClientForcesDefaultEndpointAndOneAttempt(t *testing.T) {
 	if options.RetryMaxAttempts != 1 || options.Retryer.MaxAttempts() != 1 {
 		t.Fatalf("retry options = max %d, retryer attempts %d", options.RetryMaxAttempts, options.Retryer.MaxAttempts())
 	}
+	if options.ClientLogMode != 0 {
+		t.Fatalf("Lambda ClientLogMode = %v, want disabled", options.ClientLogMode)
+	}
 }
 
 func validHubTargets() HubTargets {
@@ -146,6 +185,12 @@ func validCellTargets() CellTargets {
 		IssueRegistrationOTPAliasARN:       aliasARN("IssueRegistrationOTP-cell0", "active"),
 		ActivateRegistrationAliasARN:       aliasARN("ActivateRegistration-cell0", "active"),
 		CompleteRegistrationAliasARN:       aliasARN("CompleteRegistration-cell0", "active"),
+		CompleteCredentialRecoveryAliasARN: aliasARN("CompleteCredentialRecovery-cell0", "active"),
+	}
+}
+
+func validCredentialRecoveryCellTarget() CredentialRecoveryCellTarget {
+	return CredentialRecoveryCellTarget{
 		CompleteCredentialRecoveryAliasARN: aliasARN("CompleteCredentialRecovery-cell0", "active"),
 	}
 }

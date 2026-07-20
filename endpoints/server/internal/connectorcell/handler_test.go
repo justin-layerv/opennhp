@@ -10,6 +10,8 @@ import (
 	"time"
 
 	conformance "github.com/layervai/qurl-conformance"
+
+	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
 func TestNewHandlerRejectsNilAuthority(t *testing.T) {
@@ -137,6 +139,107 @@ func TestCompletionHandlerRequiresLiveDeadline(t *testing.T) {
 		if result.Classification != ClassificationDeadlineRejected || !bytes.Equal(result.Body, want) || authority.callCount() != 0 {
 			t.Fatalf("result = %#v", result)
 		}
+	}
+}
+
+func TestHandleDirectRoutesMalformedRecoveryIntentWithoutAuthority(t *testing.T) {
+	t.Parallel()
+	vectors := recoveryVectors(t)
+	valid := vectors.PublicExchanges[conformance.AgentCredentialRecoveryCellPhase].RequestBodyJSON
+	dataMarker := `"usrData":`
+	dataStart := strings.Index(valid, dataMarker)
+	if dataStart < 0 || !strings.HasSuffix(valid, "}}") {
+		t.Fatal("golden request has unexpected shape")
+	}
+	dataJSON := valid[dataStart+len(dataMarker) : len(valid)-1]
+	duplicateData := valid[:dataStart] + `"usrData":{"query":"ordinary"},"usrData":` + dataJSON + `}`
+	padding := strings.Repeat("x", conformance.AgentCredentialRecoveryMaxBodyBytes)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "duplicate asp exact and other", body: strings.Replace(valid, `"aspId":"agent"`, `"aspId":"other","aspId":"agent"`, 1)},
+		{name: "duplicate query exact and other", body: strings.Replace(valid, `"query":"agent_credential_recovery"`, `"query":"ordinary","query":"agent_credential_recovery"`, 1)},
+		{name: "duplicate usrData exact and other", body: duplicateData},
+		{name: "unknown root field", body: strings.TrimSuffix(valid, "}") + `,"unknown":true}`},
+		{name: "unknown nested field", body: strings.Replace(valid, `"query":"agent_credential_recovery"`, `"unknown":true,"query":"agent_credential_recovery"`, 1)},
+		{name: "trailing object", body: valid + `{}`},
+		{name: "invalid UTF-8 trailing byte", body: valid + string([]byte{0xff})},
+		{name: "type invalid devId", body: strings.Replace(valid, `"devId":"`+vectors.Fixtures.AgentID+`"`, `"devId":42`, 1)},
+		{name: "oversized recovery", body: strings.TrimSuffix(valid, "}") + `,"padding":"` + padding + `"}`},
+	}
+	want, err := EncodeCompletionError(CompletionErrorInvalidRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authority := &fakeAuthority{}
+			result, handled := mustHandler(t, authority).HandleDirect(
+				liveContext(t), []byte(test.body), decodedPeer(t, vectors),
+			)
+			if !handled || result.Classification != ClassificationRequestRejected ||
+				!bytes.Equal(result.Body, want) || authority.callCount() != 0 {
+				t.Fatalf("handled=%v result=%#v calls=%d", handled, result, authority.callCount())
+			}
+		})
+	}
+}
+
+func TestHandleDirectLeavesOrdinaryListRequestUntouched(t *testing.T) {
+	t.Parallel()
+	vectors := recoveryVectors(t)
+	ordinary := []byte(strings.Replace(
+		vectors.PublicExchanges[conformance.AgentCredentialRecoveryCellPhase].RequestBodyJSON,
+		`"query":"agent_credential_recovery"`, `"query":"ordinary"`, 1,
+	))
+	want := bytes.Clone(ordinary)
+	authority := &fakeAuthority{}
+	result, handled := mustHandler(t, authority).HandleDirect(liveContext(t), ordinary, decodedPeer(t, vectors))
+	if handled || result.Body != nil || result.Classification != "" || result.RequestRejection != "" ||
+		authority.callCount() != 0 || !bytes.Equal(ordinary, want) {
+		t.Fatalf("handled=%v result=%#v calls=%d body=%q", handled, result, authority.callCount(), ordinary)
+	}
+}
+
+func TestHandleDirectHandlesNearCeilingDuplicateFlood(t *testing.T) {
+	vectors := recoveryVectors(t)
+	const duplicate = `"aspId":"other","usrData":{"query":"ordinary"},`
+	const exact = `"aspId":"agent","usrData":{"query":"agent_credential_recovery"}`
+	var body strings.Builder
+	body.Grow(core.MaxDecompressedBodySize)
+	body.WriteByte('{')
+	for body.Len()+len(duplicate)+len(exact)+1 <= core.MaxDecompressedBodySize {
+		body.WriteString(duplicate)
+	}
+	body.WriteString(exact)
+	body.WriteByte('}')
+	if body.Len() < core.MaxDecompressedBodyWarnSize {
+		t.Fatalf("adversarial body is only %d bytes", body.Len())
+	}
+
+	bodyBytes := []byte(body.String())
+	if allocs := testing.AllocsPerRun(10, func() {
+		if !routeCompletionIntent(bodyBytes) {
+			panic("near-ceiling exact-last intent was not routed")
+		}
+	}); allocs > 4 {
+		// Regular builds measure zero; race/compiler instrumentation may account
+		// for a couple. This small ceiling still catches the old ~1.2M-allocation
+		// encoding/json duplicate scan without coupling the test to a toolchain.
+		t.Fatalf("route probe allocations = %.0f, want at most 4", allocs)
+	}
+
+	authority := &fakeAuthority{}
+	result, handled := mustHandler(t, authority).HandleDirect(
+		liveContext(t), bodyBytes, decodedPeer(t, vectors),
+	)
+	want, err := EncodeCompletionError(CompletionErrorInvalidRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled || !bytes.Equal(result.Body, want) || authority.callCount() != 0 {
+		t.Fatalf("handled=%v result=%#v calls=%d", handled, result, authority.callCount())
 	}
 }
 

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -65,6 +66,29 @@ func (t *RemoteTransaction) SendMessage(md *MsgData) error {
 		return nil
 	case <-t.done:
 		return common.ErrTransactionClosed
+	}
+}
+
+// SendMessageContext is the bounded handoff used by operations whose absolute
+// receipt deadline is shorter than the generic remote-transaction lifetime. It
+// never spawns a sender goroutine, so returning via ctx leaves no blocked sender
+// that can deliver later. As with every Go select, cancellation racing an already
+// ready receiver may choose either ready case; callers needing receiver-side
+// expiry must carry and enforce that metadata at the receiver too.
+func (t *RemoteTransaction) SendMessageContext(ctx context.Context, md *MsgData) error {
+	if ctx == nil {
+		return context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case t.NextMsgCh <- md:
+		return nil
+	case <-t.done:
+		return common.ErrTransactionClosed
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

@@ -55,15 +55,46 @@ func NewHandler(authority Authority) (*Handler, error) {
 // HandleCompletion performs no retry. The caller owns receipt budgeting and
 // must pass a live deadline covering Authority invocation and response sealing.
 func (h *Handler) HandleCompletion(ctx context.Context, raw, authenticatedPeer []byte) HandleResult {
-	if ctx == nil {
+	if !liveDeadline(ctx) {
 		return unavailable(ClassificationDeadlineRejected)
 	}
-	deadline, ok := ctx.Deadline()
-	if !ok || !deadline.After(time.Now()) || ctx.Err() != nil {
+	request, _, rejection, err := decodeRoutedCompletionRequest(raw, authenticatedPeer)
+	return h.handleDecodedCompletion(ctx, request, rejection, err)
+}
+
+// HandleDirect performs one integrated intent-and-request parse. handled is
+// true only for exact assigned-cell recovery intent, including malformed forms
+// with duplicate/unknown/trailing fields; those fail as frozen 52414 and never
+// fall through the generic ListService path. Ordinary LSTs are not modified.
+func (h *Handler) HandleDirect(ctx context.Context, raw, authenticatedPeer []byte) (result HandleResult, handled bool) {
+	request, routed, rejection, err := decodeRoutedCompletionRequest(raw, authenticatedPeer)
+	if !routed {
+		return HandleResult{}, false
+	}
+	return h.handleDecodedCompletion(ctx, request, rejection, err), true
+}
+
+// RejectRelayedCompletion recognizes the same exact intent without decoding
+// recovery secrets into Go strings. Relay has no Authority capability, so every
+// routed form returns the fixed invalid-request LRT and no attacker-controlled
+// value can influence the response.
+func RejectRelayedCompletion(raw []byte) ([]byte, bool) {
+	if !routeCompletionIntent(raw) {
+		return nil, false
+	}
+	return completionInvalidRequestBody(), true
+}
+
+func (h *Handler) handleDecodedCompletion(
+	ctx context.Context,
+	request CompletionRequest,
+	rejection RequestRejection,
+	decodeErr error,
+) HandleResult {
+	if !liveDeadline(ctx) {
 		return unavailable(ClassificationDeadlineRejected)
 	}
-	request, rejection, err := DecodeCompletionRequest(raw, authenticatedPeer)
-	if err != nil {
+	if decodeErr != nil {
 		return rejectRequest(rejection)
 	}
 	payload, err := encodeAuthorityRequest(request)
@@ -94,6 +125,14 @@ func (h *Handler) HandleCompletion(ctx context.Context, raw, authenticatedPeer [
 		return HandleResult{Body: body, Classification: ClassificationAuthoritySemanticError}
 	}
 	return HandleResult{Body: body, Classification: ClassificationSuccess}
+}
+
+func liveDeadline(ctx context.Context) bool {
+	if ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && deadline.After(time.Now())
 }
 
 func unavailable(classification Classification) HandleResult {

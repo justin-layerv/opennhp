@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"sync"
@@ -48,6 +49,54 @@ func TestRemoteTransaction_SendMessage_AfterDone(t *testing.T) {
 	err := tx.SendMessage(&MsgData{})
 	if !errors.Is(err, common.ErrTransactionClosed) {
 		t.Errorf("SendMessage after done: got %v, want ErrTransactionClosed", err)
+	}
+}
+
+func TestRemoteTransactionSendMessageContextDeadlineHasNoLateDelivery(t *testing.T) {
+	ch := make(chan *MsgData)
+	tx := NewRemoteTransactionForTest(1, ch)
+	t.Cleanup(tx.CloseForTest)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	message := &MsgData{}
+	started := time.Now()
+	if err := tx.SendMessageContext(ctx, message); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SendMessageContext error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed < 10*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("deadline handoff elapsed %s", elapsed)
+	}
+
+	// A goroutine-based timeout wrapper could leave a blocked sender behind and
+	// deliver after returning. Making a receiver available now must observe no
+	// stale message from the completed call.
+	select {
+	case got := <-ch:
+		t.Fatalf("late message delivered after deadline: %p", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestRemoteTransactionSendMessageContextPreCanceledNeverDelivers(t *testing.T) {
+	const iterations = 1000
+	for i := 0; i < iterations; i++ {
+		// A buffered channel makes the send case immediately ready. The explicit
+		// context fence before the select must still make a pre-canceled request
+		// deterministic rather than letting select choose the ready send.
+		ch := make(chan *MsgData, 1)
+		tx := NewRemoteTransactionForTest(uint64(i), ch)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		if err := tx.SendMessageContext(ctx, &MsgData{}); !errors.Is(err, context.Canceled) {
+			tx.CloseForTest()
+			t.Fatalf("iteration %d: SendMessageContext error = %v, want context canceled", i, err)
+		}
+		if len(ch) != 0 {
+			tx.CloseForTest()
+			t.Fatalf("iteration %d: pre-canceled message was delivered", i)
+		}
+		tx.CloseForTest()
 	}
 }
 

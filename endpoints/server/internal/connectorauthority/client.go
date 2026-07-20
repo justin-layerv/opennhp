@@ -60,6 +60,14 @@ type CellClient struct {
 	completeCredentialRecovery string
 }
 
+// CredentialRecoveryCellClient exposes only the completion operation needed by
+// the direct assigned-cell recovery path. It deliberately cannot be widened by
+// passing a different operation at call time.
+type CredentialRecoveryCellClient struct {
+	invoker
+	completeCredentialRecovery string
+}
+
 // IssueAssignment invokes the configured IssueAssignment alias synchronously.
 func (c *HubClient) IssueAssignment(ctx context.Context, payload []byte) ([]byte, error) {
 	return c.invoke(ctx, OperationIssueAssignment, c.issueAssignment, payload)
@@ -92,6 +100,11 @@ func (c *CellClient) CompleteRegistration(ctx context.Context, payload []byte) (
 
 // CompleteCredentialRecovery invokes the configured assigned-cell recovery alias synchronously.
 func (c *CellClient) CompleteCredentialRecovery(ctx context.Context, payload []byte) ([]byte, error) {
+	return c.invoke(ctx, OperationCompleteCredentialRecovery, c.completeCredentialRecovery, payload)
+}
+
+// CompleteCredentialRecovery invokes the one configured assigned-cell recovery alias synchronously.
+func (c *CredentialRecoveryCellClient) CompleteCredentialRecovery(ctx context.Context, payload []byte) ([]byte, error) {
 	return c.invoke(ctx, OperationCompleteCredentialRecovery, c.completeCredentialRecovery, payload)
 }
 

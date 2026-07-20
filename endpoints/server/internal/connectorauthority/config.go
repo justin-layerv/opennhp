@@ -40,6 +40,14 @@ type CellTargets struct {
 	CompleteCredentialRecoveryAliasARN string
 }
 
+// CredentialRecoveryCellTarget is the one alias available to the dedicated
+// assigned-cell recovery composition. Keeping it separate from CellTargets
+// makes least privilege structural: this client cannot invoke OTP or either
+// registration operation even if the containing process is miswired.
+type CredentialRecoveryCellTarget struct {
+	CompleteCredentialRecoveryAliasARN string
+}
+
 // NewHubClient constructs a hub-only client with a single-attempt Lambda SDK client.
 func NewHubClient(cfg aws.Config, boundary Boundary, targets HubTargets) (*HubClient, error) {
 	if err := validateBoundary(cfg, boundary); err != nil {
@@ -73,6 +81,36 @@ func NewCellClient(cfg aws.Config, boundary Boundary, targets CellTargets) (*Cel
 	return newCellClient(newLambdaClient(cfg), targets), nil
 }
 
+// NewCredentialRecoveryCellClient constructs the completion-only assigned-cell
+// client with a single-attempt Lambda SDK client.
+func NewCredentialRecoveryCellClient(
+	cfg aws.Config,
+	boundary Boundary,
+	target CredentialRecoveryCellTarget,
+) (*CredentialRecoveryCellClient, error) {
+	if err := validateBoundary(cfg, boundary); err != nil {
+		return nil, err
+	}
+	if err := ValidateCredentialRecoveryCellTarget(boundary, target); err != nil {
+		return nil, err
+	}
+	return newCredentialRecoveryCellClient(newLambdaClient(cfg), target), nil
+}
+
+// ValidateCredentialRecoveryCellTarget validates the one fully qualified
+// :active alias before ambient AWS configuration is loaded or a listener binds.
+func ValidateCredentialRecoveryCellTarget(boundary Boundary, target CredentialRecoveryCellTarget) error {
+	if !accountIDPattern.MatchString(boundary.AccountID) {
+		return &ConfigError{Field: "account_id"}
+	}
+	if boundary.Region == "" {
+		return &ConfigError{Field: "region"}
+	}
+	return validateTargets(boundary,
+		targetSpec{"complete_credential_recovery", target.CompleteCredentialRecoveryAliasARN},
+	)
+}
+
 func newHubClient(api invokeAPI, targets HubTargets) *HubClient {
 	return &HubClient{
 		invoker:                 invoker{api: api},
@@ -92,6 +130,13 @@ func newCellClient(api invokeAPI, targets CellTargets) *CellClient {
 	}
 }
 
+func newCredentialRecoveryCellClient(api invokeAPI, target CredentialRecoveryCellTarget) *CredentialRecoveryCellClient {
+	return &CredentialRecoveryCellClient{
+		invoker:                    invoker{api: api},
+		completeCredentialRecovery: target.CompleteCredentialRecoveryAliasARN,
+	}
+}
+
 func newLambdaClient(cfg aws.Config) *lambda.Client {
 	// Endpoint and middleware overrides are intentionally discarded. Private
 	// connectivity is supplied by normal Lambda DNS through a VPC interface
@@ -104,6 +149,10 @@ func newLambdaClient(cfg aws.Config) *lambda.Client {
 	cfg.BaseEndpoint = nil
 	cfg.APIOptions = nil
 	cfg.ServiceOptions = nil
+	// Recovery grants and candidate device keys are carried in Lambda payloads.
+	// Ambient SDK body logging must never cross this boundary, even when the
+	// containing process enables it globally for other AWS clients.
+	cfg.ClientLogMode = 0
 	cfg.RetryMaxAttempts = 1
 	cfg.Retryer = func() aws.Retryer { return aws.NopRetryer{} }
 
@@ -111,6 +160,7 @@ func newLambdaClient(cfg aws.Config) *lambda.Client {
 		options.BaseEndpoint = nil
 		options.EndpointResolver = nil
 		options.EndpointResolverV2 = lambda.NewDefaultEndpointResolverV2()
+		options.ClientLogMode = 0
 		options.RetryMaxAttempts = 1
 		options.Retryer = aws.NopRetryer{}
 	})

@@ -233,6 +233,21 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		}
 		return
 	case innerPpd.HeaderType == core.NHP_LST:
+		// Native credential recovery is assigned-cell direct UDP only. Recognize
+		// exact intent (including malformed duplicate/unknown/trailing forms),
+		// wipe its decrypted body, and return one fixed 52414 without entering
+		// buildListResult or holding any Authority capability on the relay path.
+		if rejectedLRT, handled := s.rejectRelayedCredentialRecovery(innerPpd.BodyMessage); handled {
+			innerReply, encryptErr := s.buildRelayInnerReply(innerPpd, core.NHP_LRT, rejectedLRT)
+			if encryptErr != nil {
+				log.Error("server-relay(@%s src=%s)[HandleRelayForward] failed to encrypt credential-recovery rejection: %v", relayAddr, sourceAddr, encryptErr)
+				return
+			}
+			if returnErr := s.sendRelayReturn(outerPpd, rlyMsg.RequestID, innerReply); returnErr != nil {
+				log.Error("server-relay(@%s src=%s)[HandleRelayForward] failed to return credential-recovery rejection: %v", relayAddr, sourceAddr, returnErr)
+			}
+			return
+		}
 		lrtBytes, userID, listErr := s.buildListResult(innerPpd)
 		// Logical/plugin failures are encoded in a populated LRT and must reach
 		// the agent. Nil alone means the LRT verdict could not be marshaled.

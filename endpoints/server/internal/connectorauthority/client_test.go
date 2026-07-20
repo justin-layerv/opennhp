@@ -41,6 +41,7 @@ func TestHubAndCellCapabilitiesAreStructurallySeparated(t *testing.T) {
 
 	hubMethods := exportedMethods(reflect.TypeOf((*HubClient)(nil)))
 	cellMethods := exportedMethods(reflect.TypeOf((*CellClient)(nil)))
+	recoveryMethods := exportedMethods(reflect.TypeOf((*CredentialRecoveryCellClient)(nil)))
 
 	wantHub := []string{"IssueAssignment", "IssueCredentialRecovery", "RefreshAssignment"}
 	wantCell := []string{"ActivateRegistration", "CompleteCredentialRecovery", "CompleteRegistration", "IssueRegistrationOTP"}
@@ -49,6 +50,24 @@ func TestHubAndCellCapabilitiesAreStructurallySeparated(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cellMethods, wantCell) {
 		t.Fatalf("CellClient methods = %v, want %v", cellMethods, wantCell)
+	}
+	if want := []string{"CompleteCredentialRecovery"}; !reflect.DeepEqual(recoveryMethods, want) {
+		t.Fatalf("CredentialRecoveryCellClient methods = %v, want %v", recoveryMethods, want)
+	}
+}
+
+func TestCredentialRecoveryCellClientUsesOnlyPinnedAliasAndOneAttempt(t *testing.T) {
+	t.Parallel()
+	target := validCredentialRecoveryCellTarget()
+	api := &fakeInvokeAPI{output: &lambda.InvokeOutput{StatusCode: http.StatusOK, Payload: []byte(`{"version":1}`)}}
+	client := newCredentialRecoveryCellClient(api, target)
+	response, err := client.CompleteCredentialRecovery(liveContext(t), []byte(`{"version":1}`))
+	if err != nil || string(response) != `{"version":1}` {
+		t.Fatalf("CompleteCredentialRecovery = %q, %v", response, err)
+	}
+	if len(api.inputs) != 1 || api.inputs[0].FunctionName == nil ||
+		*api.inputs[0].FunctionName != target.CompleteCredentialRecoveryAliasARN || len(api.options) != 1 || api.options[0] != 0 {
+		t.Fatalf("invocations = %#v options=%v", api.inputs, api.options)
 	}
 }
 

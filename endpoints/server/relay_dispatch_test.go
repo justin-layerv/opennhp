@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
+	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorcell"
 	agentplugin "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/agent"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -689,6 +691,72 @@ func TestHandleRelayForward_InnerLST_ReturnsAuthenticatedLRT(t *testing.T) {
 	}
 	if plugin.listCalls != 1 || plugin.listGot == nil || plugin.listGot.PublicKey != agentDev.PublicKeyBase64() {
 		t.Fatalf("ListService calls/request = %d/%#v, want one authenticated request", plugin.listCalls, plugin.listGot)
+	}
+}
+
+func TestHandleRelayForward_InnerCredentialRecoveryReturnsFixedRejectionWithoutDispatch(t *testing.T) {
+	const innerTrx = uint64(161619)
+	_, _, recoveryRequest, privateResponse := recoveryFixture(t)
+	authority := &capturingRecoveryAuthority{response: privateResponse}
+	handler, err := connectorcell.NewHandler(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverDev := newSpikeDevice(t, core.NHP_SERVER, 0x22, &core.DeviceOptions{DisableAgentPeerValidation: true})
+	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
+	serverPk := decodeBase64PubKey(serverDev.PublicKeyBase64())
+	serverListen := mustUDPListener(t)
+	relayListen := mustUDPListener(t)
+	relayAddr := relayListen.LocalAddr().(*net.UDPAddr)
+	agentToServerAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62206}
+	agentDev.AddPeer(&core.UdpPeer{PubKeyBase64: serverDev.PublicKeyBase64(), Ip: agentToServerAddr.IP.String(), Port: agentToServerAddr.Port, Type: core.NHP_SERVER})
+
+	respCh := make(chan *core.PacketParserData, 1)
+	agentConn := newSpikeConn(agentDev, agentToServerAddr)
+	agentDev.SendMsgToPacket(&core.MsgData{
+		ConnData: agentConn, PeerPk: serverPk, HeaderType: core.NHP_LST,
+		TransactionId: innerTrx, Message: recoveryRequest, ResponseMsgCh: respCh,
+	})
+	innerLST := drainEncryptedPacket(t, agentConn)
+
+	relayPub := relayTestPubKey()
+	relayPubB64 := base64.StdEncoding.EncodeToString(relayPub)
+	plugin := &recordingRegOTPPlugin{}
+	wiped := false
+	s := &UdpServer{
+		device: serverDev, metrics: metrics.NewPublisherForTest(t), listenConn: serverListen,
+		relayPeerMap:              map[string]*core.UdpPeer{relayPubB64: {PubKeyBase64: relayPubB64, Type: core.NHP_RELAY}},
+		pluginHandlerMap:          map[string]plugins.PluginHandler{"agent": plugin},
+		credentialRecoveryHandler: handler,
+		observeRelayedCredentialRecoveryBodyCleared: func(body []byte) {
+			wiped = allZero(body)
+		},
+	}
+	outerPpd, relayDev, relayConn := buildRealRelayForwardOuterPpd(t, s, relayAddr, innerLST, nil)
+	s.HandleRelayForward(outerPpd)
+	innerLRT := readRealRelayInnerReturn(t, relayListen, relayDev, relayConn, 5*time.Second)
+	routeResponseToTransaction(t, agentDev, innerLRT)
+
+	wantBody, err := connectorcell.EncodeCompletionError(connectorcell.CompletionErrorInvalidRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ppd := <-respCh:
+		if ppd.Error != nil {
+			t.Fatalf("agent failed to decrypt relayed LRT: %v", ppd.Error)
+		}
+		if ppd.HeaderType != core.NHP_LRT || ppd.SenderTrxId != innerTrx {
+			t.Fatalf("LRT header/counter = %s/%d, want NHP-LRT/%d", core.HeaderTypeToString(ppd.HeaderType), ppd.SenderTrxId, innerTrx)
+		}
+		if !bytes.Equal(ppd.BodyMessage, wantBody) {
+			t.Fatalf("recovery relay LRT = %q, want frozen rejection %q", ppd.BodyMessage, wantBody)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent never received relayed recovery rejection")
+	}
+	if plugin.listCalls != 0 || authority.callCount() != 0 || !wiped {
+		t.Fatalf("plugin calls=%d authority calls=%d decrypted body wiped=%v", plugin.listCalls, authority.callCount(), wiped)
 	}
 }
 
