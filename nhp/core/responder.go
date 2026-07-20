@@ -710,7 +710,7 @@ func shouldEscalateStale(deviceType int, peerType int, msgType int) bool {
 // every LST, even if its key is registered, so it must not host registered LST
 // peers. The 600-second past floor stays unchanged until the Hub
 // application-envelope expiry contract is fixed under #3227.
-const unregisteredLSTFutureSkewLimit = 30 * time.Second
+const unregisteredLSTFutureSkewLimit = HubLSTFutureSkewLimitSeconds * time.Second
 
 func (ppd *PacketParserData) validatePeer() (err error) {
 	publicHubLST := ppd.isHubLSTPublicPath()

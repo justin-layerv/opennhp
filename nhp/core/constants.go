@@ -100,6 +100,19 @@ const (
 	// unchanged by #1464.
 	DefaultRecvStalenessFloorSeconds = 600
 
+	// HubLSTFutureSkewLimitSeconds is the maximum amount by which an
+	// unregistered public Hub LST's authenticated send timestamp may lead the
+	// Hub receive clock. Keep the responder gate and the endpoint replay cache
+	// derived from this single protocol value.
+	HubLSTFutureSkewLimitSeconds = 30
+
+	// HubLSTReplayWindowSeconds is the inclusive interval during which an exact
+	// public Hub LST can remain cryptographically valid: a packet accepted at
+	// the future-skew boundary remains within the default past-staleness floor
+	// through this full interval. Endpoint replay state must retain a digest at
+	// the exact boundary and may expire it only after this interval.
+	HubLSTReplayWindowSeconds = DefaultRecvStalenessFloorSeconds + HubLSTFutureSkewLimitSeconds
+
 	// AOPRecvStalenessFloorSeconds is the tighter floor for NHP_AOP
 	// (server→AC). recvStalenessFloor documents WHY AOP gets one (the
 	// cross-restart replay window of #1464); this constant is the

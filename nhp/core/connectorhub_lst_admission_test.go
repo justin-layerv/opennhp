@@ -377,6 +377,9 @@ func TestAllowUnregisteredAgentLSTBoundsFutureTimestampSkew(t *testing.T) {
 	if unregisteredLSTFutureSkewLimit != expectedFutureSkewLimit {
 		t.Fatalf("future skew limit = %s, want %s", unregisteredLSTFutureSkewLimit, expectedFutureSkewLimit)
 	}
+	if HubLSTReplayWindowSeconds != 630 {
+		t.Fatalf("Hub LST replay window = %d seconds, want 630", HubLSTReplayWindowSeconds)
+	}
 
 	t.Run("exact_boundary_allowed", func(t *testing.T) {
 		fixture := newConnectorHubAdmissionFixture(t, NHP_SERVER, NHP_LST, DeviceOptions{AllowUnregisteredAgentLST: true})
