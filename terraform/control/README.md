@@ -10,15 +10,29 @@ They must never import or reference the legacy cell0 state. The exact global
 resource/table prefix is `layerv-nhp-<env>-control`; cell stacks retain
 `layerv-nhp-<env>-<cell_id>`.
 
-The foundation is dark. It creates no Lambda function, alias, caller role, Hub
-worker/listener, load balancer, DNS record, plugin, public HTTP route, or
-runtime activation. Interface and DynamoDB endpoints start with deny-all
+The foundation is dark. It creates no Lambda function, alias, runtime caller
+role, Hub worker/listener, load balancer, DNS record, plugin, public HTTP route,
+or runtime activation. Interface and DynamoDB endpoints start with deny-all
 policies, and their security groups have no ingress. A later reviewed runtime
 slice must replace both boundaries in lockstep with exact qualified alias ARNs
 and operation-specific identities. Because private DNS is already enabled,
 in-VPC AWS SDK service names resolve to these endpoints: changing only the
 endpoint policy or only security-group ingress would route calls privately and
 fail them at the boundary.
+
+The one non-runtime cross-repository identity is the dedicated Connector
+Authority image publisher role. Sandbox trusts only the
+`repo:layervai/qurl-service:environment:sandbox` GitHub OIDC subject;
+production trusts only
+`repo:layervai/qurl-service:environment:production`. Its inline policy can
+obtain the unavoidable account-wide ECR authorization token, push/read and
+verify manifests only in `layerv/qurl-connector-authority`, and get/put only
+`/<env>/nhp/control/connector-authority/image-digest`. It cannot operate
+Lambda or access Control data, network, KMS, Redis, or SES resources. The
+qurl-service publication workflow must derive a registry-confirmed canonical
+lowercase `sha256:<64hex>` digest, validate that exact shape immediately before
+the SSM write, and read the parameter back exactly; IAM can scope the parameter
+ARN but cannot constrain its value.
 
 SES identity/configuration-set ownership is intentionally excluded from this
 slice because sandbox already owns those resources in the legacy state. The
@@ -109,6 +123,12 @@ conditional attachment. Treat attachment runway as zero across the shared
 module: future grants must consolidate within an existing policy or pair a
 new attachment with an intentional consolidation/quota plan.
 
+The publisher role and its inline policy require no expansion of that shared
+apply role: its existing `IAMRoles` statement already admits the
+`layerv-nhp-*` role namespace and the IAM role/policy lifecycle actions that
+Terraform needs. The repository contract test pins that prerequisite; no
+publisher permission is added to the shared role.
+
 ## CI and live-state semantics
 
 The PR control plan uses `-refresh=false` with the narrow read-only plan role.
@@ -119,9 +139,12 @@ apply path.
 
 The plan contract rejects every action set containing `delete`, including a
 Terraform replacement (`delete,create`). That remains intentional after the
-foundation is live. Any necessary ForceNew change needs its own reviewed,
-resource-specific no-data-loss rollout and an explicit narrow contract change;
-do not disable the destructive gate to make a routine PR pass.
+foundation is live. It accepts `create` only for the exact publisher role and
+inline policy, including a one-resource partial retry; after both exist, their
+same exact 43-resource contract is a no-op. Any necessary ForceNew change needs
+its own reviewed, resource-specific no-data-loss rollout and an explicit narrow
+contract change; do not disable the destructive gate to make a routine PR
+pass.
 
 The sandbox and production `main.tf` files are deliberately separate state
 roots with byte-identical module wrappers. The foundation checker enforces that

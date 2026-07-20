@@ -76,6 +76,28 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
             },
             {},
         ),
+        "module.control.aws_iam_role.authority_publisher": (
+            {
+                "assume_role_policy": json.dumps(
+                    CHECKER.AUTHORITY_PUBLISHER_TRUST_POLICY
+                ),
+                "inline_policy": [],
+                "managed_policy_arns": [],
+                "max_session_duration": 3600,
+                "name": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
+                "path": "/",
+                "permissions_boundary": None,
+            },
+            {"managed_policy_arns": []},
+        ),
+        "module.control.aws_iam_role_policy.authority_publisher": (
+            {
+                "name": "publish-connector-authority",
+                "policy": json.dumps(CHECKER.AUTHORITY_PUBLISHER_POLICY),
+                "role": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
+            },
+            {},
+        ),
         "module.control.aws_elasticache_user.otp_authority": (
             {
                 "access_string": "on ~connector:* -@all +@connection +@read +@write +@scripting",
@@ -351,10 +373,10 @@ class PlanContractTests(unittest.TestCase):
         candidate = plan_fixture()
         for field in ("format_version", "complete", "errored", "applyable"):
             candidate[field] = real_noop[field]
-        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 41)
+        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 43)
 
     def test_exact_noop_passes(self) -> None:
-        self.assertEqual(CHECKER.check_plan(plan_fixture())["resource_count"], 41)
+        self.assertEqual(CHECKER.check_plan(plan_fixture())["resource_count"], 43)
         normalized = plan_fixture()
         normalized_changes = {
             item["address"]: item["change"] for item in normalized["resource_changes"]
@@ -388,7 +410,78 @@ class PlanContractTests(unittest.TestCase):
             "module.control.aws_security_group.otp_redis",
         ):
             normalized_changes[address]["after_unknown"] = {}
-        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 41)
+        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 43)
+
+    def test_exact_publisher_first_create_and_partial_retry_pass(self) -> None:
+        for create_addresses in (
+            CHECKER.PUBLISHER_BOOTSTRAP_RESOURCES,
+            frozenset({"module.control.aws_iam_role_policy.authority_publisher"}),
+        ):
+            with self.subTest(create_addresses=create_addresses):
+                candidate = plan_fixture()
+                candidate["applyable"] = True
+                for address in create_addresses:
+                    change = self.change(candidate, address)
+                    change["actions"] = ["create"]
+                    change["before"] = None
+                    if address == "module.control.aws_iam_role.authority_publisher":
+                        change["after_unknown"]["managed_policy_arns"] = True
+                    if (
+                        address
+                        == "module.control.aws_iam_role_policy.authority_publisher"
+                        and "module.control.aws_iam_role.authority_publisher"
+                        in create_addresses
+                    ):
+                        change["after"]["role"] = None
+                        change["after_unknown"]["role"] = True
+                self.assertEqual(
+                    CHECKER.check_plan(candidate)["bootstrap_create_count"],
+                    len(create_addresses),
+                )
+
+    def test_publisher_updates_and_malformed_create_fail(self) -> None:
+        update = plan_fixture()
+        change = self.change(
+            update, "module.control.aws_iam_role.authority_publisher"
+        )
+        change["actions"] = ["update"]
+        change["after"]["max_session_duration"] = 7200
+        update["applyable"] = True
+        self.assert_rejected(update)
+
+        malformed_create = plan_fixture()
+        change = self.change(
+            malformed_create,
+            "module.control.aws_iam_role_policy.authority_publisher",
+        )
+        change["actions"] = ["create"]
+        change["before"] = None
+        change["after"]["policy"] = json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "ssm:*",
+                        "Resource": "*",
+                    }
+                ],
+            }
+        )
+        malformed_create["applyable"] = True
+        self.assert_rejected(malformed_create)
+
+    def test_publisher_role_create_without_policy_create_fails(self) -> None:
+        candidate = plan_fixture()
+        candidate["applyable"] = True
+        change = self.change(
+            candidate, "module.control.aws_iam_role.authority_publisher"
+        )
+        change["actions"] = ["create"]
+        change["before"] = None
+        change["after_unknown"]["managed_policy_arns"] = True
+
+        self.assert_rejected(candidate)
 
     def assert_rejected(self, plan: dict) -> None:
         with self.assertRaises(CHECKER.ContractError):
@@ -711,7 +804,7 @@ class StateListTests(unittest.TestCase):
     def test_exact_managed_and_data_inventory_passes(self) -> None:
         self.assertEqual(
             self.check(self.expected_addresses()),
-            {"data_resource_count": 4, "managed_resource_count": 41},
+            {"data_resource_count": 4, "managed_resource_count": 43},
         )
 
     def test_missing_managed_or_data_address_fails(self) -> None:
@@ -785,6 +878,25 @@ def state_fixture() -> dict:
             "log_destination_type": "cloud-watch-logs",
             "log_destination": "arn:aws:logs:flow-group",
             "iam_role_arn": "arn:aws:iam::role/flow",
+        }
+    )
+    by_address["module.control.aws_iam_role.authority_publisher"].update(
+        {
+            "assume_role_policy": json.dumps(
+                CHECKER.AUTHORITY_PUBLISHER_TRUST_POLICY
+            ),
+            "inline_policy": [],
+            "managed_policy_arns": [],
+            "max_session_duration": 3600,
+            "name": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
+            "permissions_boundary": None,
+        }
+    )
+    by_address["module.control.aws_iam_role_policy.authority_publisher"].update(
+        {
+            "name": "publish-connector-authority",
+            "policy": json.dumps(CHECKER.AUTHORITY_PUBLISHER_POLICY),
+            "role": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
         }
     )
     subnet_ids = []
@@ -881,11 +993,54 @@ class StateContractTests(unittest.TestCase):
         # Update only with an intentional, reviewed address/type inventory change.
         self.assertEqual(
             CHECKER.contract_sha256(),
-            "a97f65c62d1a4c5a6e26f60ef95995b2bd31f24c8d7d5f18fa732fad1e9b4140",
+            "54b15989ec63a4d15b019fb8c4ee2e65e8fccdb5ac71bbc735ac38edea24913a",
         )
 
     def test_exact_state_passes(self) -> None:
-        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 41)
+        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 43)
+
+    def test_publisher_trust_and_permissions_drift_fail(self) -> None:
+        mutations = (
+            (
+                "module.control.aws_iam_role.authority_publisher",
+                "assume_role_policy",
+                json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": "sts:AssumeRoleWithWebIdentity",
+                                "Principal": {"Federated": "*"},
+                            }
+                        ],
+                    }
+                ),
+            ),
+            (
+                "module.control.aws_iam_role_policy.authority_publisher",
+                "policy",
+                json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {"Effect": "Allow", "Action": "ssm:*", "Resource": "*"}
+                        ],
+                    }
+                ),
+            ),
+        )
+        for address, field, value in mutations:
+            with self.subTest(address=address):
+                state = state_fixture()
+                resource = next(
+                    item
+                    for item in state["values"]["root_module"]["resources"]
+                    if item["address"] == address
+                )
+                resource["values"][field] = value
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER.check_state(state)
 
     def test_malformed_prior_state_shapes_fail_with_contract_error(self) -> None:
         for malformed_prior_state in (None, [], "invalid"):
@@ -1255,20 +1410,20 @@ class WorkflowContractTests(unittest.TestCase):
             validate_workflow,
         )
 
-    def test_real_pr_plan_runs_strict_noop_contract(self) -> None:
+    def test_real_pr_plan_runs_convergence_contract(self) -> None:
         plan_workflow = TERRAFORM_PLAN_WORKFLOW_PATH.read_text(encoding="utf-8")
         foundation_check = plan_workflow.index(
             "      - name: Check Terraform Control Plan Contract\n"
         )
-        strict_check = plan_workflow.index(
-            "      - name: Check Terraform Control No-Op Plan Contract\n"
+        convergence_check = plan_workflow.index(
+            "      - name: Check Terraform Control Convergence Plan Contract\n"
         )
         summary = plan_workflow.index(
             "      - name: Summarize Terraform Control Plan\n"
         )
 
-        self.assertLess(foundation_check, strict_check)
-        self.assertLess(strict_check, summary)
+        self.assertLess(foundation_check, convergence_check)
+        self.assertLess(convergence_check, summary)
         self.assertIn(
             "python3 .github/scripts/check-control-sandbox-first-apply.py plan "
             "terraform/control/environments/sandbox/control.tfplan.json",

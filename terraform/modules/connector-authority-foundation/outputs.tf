@@ -123,3 +123,18 @@ output "authority_image_digest_parameter_name" {
   description = "SSM parameter that qurl-service publication updates with an immutable sha256 digest."
   value       = aws_ssm_parameter.authority_image_digest.name
 }
+
+output "authority_publisher_role_arn" {
+  description = "Dedicated qurl-service GitHub Environment OIDC role for publishing the authority image and digest pin."
+  value       = aws_iam_role.authority_publisher.arn
+}
+
+output "authority_publisher_role_name" {
+  description = "Exact dedicated Connector Authority publisher role name."
+  value       = aws_iam_role.authority_publisher.name
+}
+
+output "authority_publisher_github_environment" {
+  description = "Exact qurl-service GitHub Environment admitted by the publisher role."
+  value       = local.authority_publisher_github_environment
+}

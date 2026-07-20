@@ -2,7 +2,7 @@ resource "aws_ecr_repository" "authority" {
   # The repository name is deliberately stable across environment accounts so
   # the publisher targets one well-known path. ECR namespaces are account-local,
   # while the environment-specific ownership remains explicit in tags and ARN.
-  name                 = "layerv/qurl-connector-authority"
+  name                 = local.authority_ecr_repository_name
   image_tag_mutability = "IMMUTABLE"
 
   encryption_configuration {
@@ -28,7 +28,7 @@ resource "aws_ecr_repository" "authority" {
 }
 
 resource "aws_ssm_parameter" "authority_image_digest" {
-  name        = "/${var.environment}/nhp/control/connector-authority/image-digest"
+  name        = local.authority_image_digest_parameter_name
   description = "Immutable sha256 digest for the separately published Connector Authority Lambda image"
   type        = "String"
   value       = "UNPUBLISHED"

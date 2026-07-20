@@ -117,6 +117,63 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
 
   assert {
     condition = (
+      output.authority_publisher_role_name == "layerv-nhp-sandbox-control-connector-authority-publisher" &&
+      output.authority_publisher_github_environment == "sandbox" &&
+      aws_iam_role.authority_publisher.max_session_duration == 3600 &&
+      jsondecode(aws_iam_role.authority_publisher.assume_role_policy) == {
+        Version = "2012-10-17"
+        Statement = [{
+          Sid    = "GitHubEnvironmentPublisher"
+          Effect = "Allow"
+          Principal = {
+            Federated = "arn:aws:iam::767397897469:oidc-provider/token.actions.githubusercontent.com"
+          }
+          Action = "sts:AssumeRoleWithWebIdentity"
+          Condition = {
+            StringEquals = {
+              "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+              "token.actions.githubusercontent.com:sub" = "repo:layervai/qurl-service:environment:sandbox"
+            }
+          }
+        }]
+      }
+    )
+    error_message = "The sandbox publisher must trust only qurl-service's sandbox GitHub Environment."
+  }
+
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement) == 3 &&
+      jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[0] == {
+        Sid      = "ECRAuthorization"
+        Effect   = "Allow"
+        Action   = "ecr:GetAuthorizationToken"
+        Resource = "*"
+      } &&
+      jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[1].Sid == "AuthorityRepository" &&
+      toset(jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[1].Action) == toset([
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:CompleteLayerUpload",
+        "ecr:DescribeImages",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:UploadLayerPart",
+      ]) &&
+      jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[1].Resource == "arn:aws:ecr:us-east-2:767397897469:repository/layerv/qurl-connector-authority" &&
+      jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[2].Sid == "AuthorityDigestPin" &&
+      toset(jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[2].Action) == toset([
+        "ssm:GetParameter",
+        "ssm:PutParameter",
+      ]) &&
+      jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[2].Resource == "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/control/connector-authority/image-digest"
+    )
+    error_message = "The publisher policy must remain exact-repository ECR plus exact-parameter SSM, with only ECR authorization on wildcard resource."
+  }
+
+  assert {
+    condition = (
       aws_elasticache_user.otp_disabled_default.access_string == "off ~* -@all" &&
       aws_elasticache_user.otp_authority.authentication_mode[0].type == "iam" &&
       aws_elasticache_user.otp_authority.access_string == "on ~connector:* -@all +@connection +@read +@write +@scripting" &&
@@ -182,6 +239,17 @@ run "production_tables_are_deletion_protected" {
       aws_dynamodb_table.connector_authority.deletion_protection_enabled,
     ])
     error_message = "Every production control table must have deletion protection."
+  }
+
+  assert {
+    condition = (
+      output.authority_publisher_role_name == "layerv-nhp-prod-control-connector-authority-publisher" &&
+      output.authority_publisher_github_environment == "production" &&
+      jsondecode(aws_iam_role.authority_publisher.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:layervai/qurl-service:environment:production" &&
+      jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[1].Resource == "arn:aws:ecr:us-east-2:235500187906:repository/layerv/qurl-connector-authority" &&
+      jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[2].Resource == "arn:aws:ssm:us-east-2:235500187906:parameter/prod/nhp/control/connector-authority/image-digest"
+    )
+    error_message = "Production publication must use qurl-service's production Environment and only production authority targets."
   }
 }
 

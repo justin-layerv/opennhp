@@ -54,3 +54,15 @@ output "authority_ecr_repository_url" {
 output "authority_image_digest_parameter_name" {
   value = module.control.authority_image_digest_parameter_name
 }
+
+output "authority_publisher_role_arn" {
+  value = module.control.authority_publisher_role_arn
+}
+
+output "authority_publisher_role_name" {
+  value = module.control.authority_publisher_role_name
+}
+
+output "authority_publisher_github_environment" {
+  value = module.control.authority_publisher_github_environment
+}

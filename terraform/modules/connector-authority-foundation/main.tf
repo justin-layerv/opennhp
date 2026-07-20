@@ -7,11 +7,13 @@ data "aws_partition" "current" {}
 data "aws_region" "current" {}
 
 locals {
-  name_prefix          = "layerv-nhp-${var.environment}-control"
-  control_table_prefix = local.name_prefix
-  is_prod              = var.environment == "prod"
-  availability_zones   = slice(data.aws_availability_zones.available.names, 0, 3)
-  otp_sender_domain    = lower(try(split("@", var.otp_email_from)[1], ""))
+  name_prefix                           = "layerv-nhp-${var.environment}-control"
+  control_table_prefix                  = local.name_prefix
+  is_prod                               = var.environment == "prod"
+  availability_zones                    = slice(data.aws_availability_zones.available.names, 0, 3)
+  otp_sender_domain                     = lower(try(split("@", var.otp_email_from)[1], ""))
+  authority_ecr_repository_name         = "layerv/qurl-connector-authority"
+  authority_image_digest_parameter_name = "/${var.environment}/nhp/control/connector-authority/image-digest"
 
   common_tags = merge(var.tags, {
     Application = "nhp"

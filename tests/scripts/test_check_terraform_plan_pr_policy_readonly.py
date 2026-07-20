@@ -958,6 +958,30 @@ class ControlRoutingApplyPolicyTests(unittest.TestCase):
 
 
 class ConnectorAuthorityApplyPolicyTests(unittest.TestCase):
+    def test_existing_apply_role_covers_publisher_role_creation(self) -> None:
+        stmt = find_policy_statement(
+            REPO_ROOT / "terraform", "terraform_apply_iam", "IAMRoles"
+        )
+        actions = set(normalized_strings(stmt.get("Action")))
+        resources = set(normalized_strings(stmt.get("Resource")))
+
+        self.assertTrue(
+            {
+                "iam:CreateRole",
+                "iam:DeleteRole",
+                "iam:PutRolePolicy",
+                "iam:DeleteRolePolicy",
+                "iam:TagRole",
+                "iam:UntagRole",
+                "iam:UpdateAssumeRolePolicy",
+            }
+            <= actions
+        )
+        self.assertIn(
+            "arn:aws:iam::${local.account_id}:role/layerv-nhp-*", resources
+        )
+        self.assertNotIn("arn:aws:iam::*:role/*", resources)
+
     def test_apply_data_has_plan_time_iam_size_guard(self) -> None:
         body = find_resource_body(
             REPO_ROOT / "terraform" / "modules" / "ecr",

@@ -20,6 +20,73 @@ STATE_KMS_KEY_ARN = (
 # Locked by the active no-op plan contract and permanent live-state verifier.
 TF_VERSION = "1.14.3"
 CONTROL_PREFIX = "layerv-nhp-sandbox-control"
+AUTHORITY_PUBLISHER_ROLE_NAME = (
+    "layerv-nhp-sandbox-control-connector-authority-publisher"
+)
+AUTHORITY_PUBLISHER_ECR_ARN = (
+    f"arn:aws:ecr:{AWS_REGION}:{ACCOUNT_ID}:repository/"
+    "layerv/qurl-connector-authority"
+)
+AUTHORITY_PUBLISHER_DIGEST_PARAMETER_ARN = (
+    f"arn:aws:ssm:{AWS_REGION}:{ACCOUNT_ID}:parameter/"
+    "sandbox/nhp/control/connector-authority/image-digest"
+)
+AUTHORITY_PUBLISHER_TRUST_POLICY = {
+    "Statement": [
+        {
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                    "token.actions.githubusercontent.com:sub": (
+                        "repo:layervai/qurl-service:environment:sandbox"
+                    ),
+                }
+            },
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": (
+                    f"arn:aws:iam::{ACCOUNT_ID}:oidc-provider/"
+                    "token.actions.githubusercontent.com"
+                )
+            },
+            "Sid": "GitHubEnvironmentPublisher",
+        }
+    ],
+    "Version": "2012-10-17",
+}
+AUTHORITY_PUBLISHER_POLICY = {
+    "Statement": [
+        {
+            "Action": "ecr:GetAuthorizationToken",
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "ECRAuthorization",
+        },
+        {
+            "Action": [
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:BatchGetImage",
+                "ecr:CompleteLayerUpload",
+                "ecr:DescribeImages",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:InitiateLayerUpload",
+                "ecr:PutImage",
+                "ecr:UploadLayerPart",
+            ],
+            "Effect": "Allow",
+            "Resource": AUTHORITY_PUBLISHER_ECR_ARN,
+            "Sid": "AuthorityRepository",
+        },
+        {
+            "Action": ["ssm:GetParameter", "ssm:PutParameter"],
+            "Effect": "Allow",
+            "Resource": AUTHORITY_PUBLISHER_DIGEST_PARAMETER_ARN,
+            "Sid": "AuthorityDigestPin",
+        },
+    ],
+    "Version": "2012-10-17",
+}
 _DYNAMODB_TABLES = (
     "agent_keys",
     "api_key_idempotency",
@@ -43,6 +110,8 @@ EXPECTED_RESOURCES = {
     "module.control.aws_elasticache_user_group.otp": "aws_elasticache_user_group",
     "module.control.aws_flow_log.control": "aws_flow_log",
     "module.control.aws_iam_role.flow_logs": "aws_iam_role",
+    "module.control.aws_iam_role.authority_publisher": "aws_iam_role",
+    "module.control.aws_iam_role_policy.authority_publisher": "aws_iam_role_policy",
     "module.control.aws_iam_role_policy.flow_logs": "aws_iam_role_policy",
     "module.control.aws_kms_alias.authority_data": "aws_kms_alias",
     "module.control.aws_kms_alias.qat1_signing": "aws_kms_alias",
@@ -71,6 +140,13 @@ EXPECTED_RESOURCES = {
     'module.control.aws_vpc_endpoint.interface["secretsmanager"]': "aws_vpc_endpoint",
     "module.control.terraform_data.foundation_contract": "terraform_data",
 }
+
+PUBLISHER_BOOTSTRAP_RESOURCES = frozenset(
+    {
+        "module.control.aws_iam_role.authority_publisher",
+        "module.control.aws_iam_role_policy.authority_publisher",
+    }
+)
 
 INTERFACE_ENDPOINT_SERVICES = (
     "email",
@@ -245,6 +321,12 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
         ("policy",): ["local.flow_log_group_arn", "local.flow_log_group_arn"],
         ("role",): ["aws_iam_role.flow_logs.id", "aws_iam_role.flow_logs"],
     },
+    "module.control.aws_iam_role_policy.authority_publisher": {
+        ("role",): [
+            "aws_iam_role.authority_publisher.id",
+            "aws_iam_role.authority_publisher",
+        ],
+    },
     "module.control.aws_cloudwatch_log_group.flow_logs": {
         ("kms_key_id",): [
             "aws_kms_key.authority_data.arn",
@@ -285,6 +367,9 @@ for _table in _DYNAMODB_TABLES:
     }
 
 CONFIG_CONSTANT_CONTRACT: dict[str, dict[ExpressionPath, Any]] = {
+    "module.control.aws_iam_role.authority_publisher": {
+        ("max_session_duration",): 3600,
+    },
     "module.control.aws_vpc.control": {
         ("enable_dns_hostnames",): True,
         ("enable_dns_support",): True,
@@ -376,6 +461,11 @@ CONFIG_ABSENT_PATHS: dict[str, tuple[ExpressionPath, ...]] = {
         ("passwords",),
         ("passwords_wo",),
         ("passwords_wo_version",),
+    ),
+    "module.control.aws_iam_role.authority_publisher": (
+        ("inline_policy",),
+        ("managed_policy_arns",),
+        ("permissions_boundary",),
     ),
 }
 
@@ -593,6 +683,43 @@ def _require_json_field(
         raise ContractError(f"{address} {field} differs from the dark contract")
 
 
+def _require_publisher_identity(
+    role: dict[str, Any], policy: dict[str, Any]
+) -> None:
+    role_address = "module.control.aws_iam_role.authority_publisher"
+    policy_address = "module.control.aws_iam_role_policy.authority_publisher"
+    _require_fields(
+        role,
+        {
+            "max_session_duration": 3600,
+            "name": AUTHORITY_PUBLISHER_ROLE_NAME,
+            "permissions_boundary": None,
+        },
+        role_address,
+    )
+    _require_json_field(
+        role,
+        "assume_role_policy",
+        AUTHORITY_PUBLISHER_TRUST_POLICY,
+        role_address,
+    )
+    if role.get("managed_policy_arns") not in (None, []):
+        raise ContractError("authority publisher may not attach managed policies")
+    if role.get("inline_policy") not in (None, []):
+        raise ContractError("authority publisher policy must stay separately auditable")
+    _require_fields(
+        policy,
+        {"name": "publish-connector-authority"},
+        policy_address,
+    )
+    _require_json_field(
+        policy,
+        "policy",
+        AUTHORITY_PUBLISHER_POLICY,
+        policy_address,
+    )
+
+
 def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
     def values(address: str) -> tuple[dict[str, Any], dict[str, Any]]:
         change = by_address[address].get("change", {})
@@ -797,6 +924,46 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
     ):
         raise ContractError("planned OTP Redis usage limits drifted")
 
+    publisher_role_address = "module.control.aws_iam_role.authority_publisher"
+    publisher_role, publisher_role_unknown = values(publisher_role_address)
+    publisher_policy_address = (
+        "module.control.aws_iam_role_policy.authority_publisher"
+    )
+    publisher_policy, publisher_policy_unknown = values(publisher_policy_address)
+    _require_publisher_identity(publisher_role, publisher_policy)
+    _require_fields(
+        publisher_role,
+        {"path": "/"},
+        publisher_role_address,
+    )
+    publisher_role_is_create = (
+        by_address[publisher_role_address].get("change", {}).get("actions")
+        == ["create"]
+    )
+    allowed_managed_policy_unknown = (
+        (None, [], False, True)
+        if publisher_role_is_create
+        else (None, [], False)
+    )
+    if (
+        publisher_role_unknown.get("managed_policy_arns")
+        not in allowed_managed_policy_unknown
+    ):
+        raise ContractError("authority publisher managed policies may not be unknown")
+
+    publisher_policy_is_create = (
+        by_address[publisher_policy_address].get("change", {}).get("actions")
+        == ["create"]
+    )
+    if publisher_policy_is_create and publisher_role_is_create:
+        if (
+            publisher_policy.get("role") is not None
+            or publisher_policy_unknown.get("role") is not True
+        ):
+            raise ContractError("authority publisher create must derive its role")
+    elif publisher_policy.get("role") != AUTHORITY_PUBLISHER_ROLE_NAME:
+        raise ContractError("authority publisher policy role drifted")
+
 
 def check_plan(plan: Any) -> dict[str, str | int]:
     if not isinstance(plan, dict):
@@ -830,23 +997,53 @@ def check_plan(plan: Any) -> dict[str, str | int]:
             f"Terraform resource inventory mismatch; missing={missing}, extra={extra}"
         )
 
+    bootstrap_creates: set[str] = set()
     for address, expected_type in EXPECTED_RESOURCES.items():
         item = by_address[address]
         if item.get("mode") != "managed" or item.get("type") != expected_type:
             raise ContractError(f"unexpected mode/type for {address}")
         change = item.get("change")
-        if not isinstance(change, dict) or change.get("actions") != ["no-op"]:
-            raise ContractError(f"{address} must have exact actions ['no-op']")
-        if change.get("before") != change.get("after"):
-            raise ContractError(f"{address} no-op before and after differ")
+        if not isinstance(change, dict):
+            raise ContractError(f"{address} change is malformed")
+        actions = change.get("actions")
+        if actions == ["no-op"]:
+            if change.get("before") != change.get("after"):
+                raise ContractError(f"{address} no-op before and after differ")
+            continue
+        if address in PUBLISHER_BOOTSTRAP_RESOURCES and actions == ["create"]:
+            if change.get("before") is not None or not isinstance(
+                change.get("after"), dict
+            ):
+                raise ContractError(f"{address} create shape is malformed")
+            bootstrap_creates.add(address)
+            continue
+        raise ContractError(
+            f"{address} must be no-op or an exact publisher bootstrap create"
+        )
+
+    publisher_role_address = "module.control.aws_iam_role.authority_publisher"
+    publisher_policy_address = (
+        "module.control.aws_iam_role_policy.authority_publisher"
+    )
+    if (
+        publisher_role_address in bootstrap_creates
+        and publisher_policy_address not in bootstrap_creates
+    ):
+        raise ContractError(
+            "authority publisher role create requires its inline policy create"
+        )
 
     _check_planned_security(by_address)
 
-    if plan.get("applyable") is not False:
-        raise ContractError("Terraform no-op plan must not be applyable")
+    expected_applyable = bool(bootstrap_creates)
+    if plan.get("applyable") is not expected_applyable:
+        raise ContractError(
+            "Terraform applyability must match exact publisher bootstrap creates"
+        )
     # Return the reviewed contract identity and resource inventory after the
     # per-resource no-op validation above has succeeded.
     return {
+        "bootstrap_create_count": len(bootstrap_creates),
         "contract_sha256": contract_sha256(),
         "resource_count": len(EXPECTED_RESOURCES),
     }
@@ -862,7 +1059,7 @@ def check_state_list(path: Path) -> dict[str, int]:
 
     # `terraform state list` includes both managed resources and cached data
     # sources. Require the reviewed union here; the subsequent JSON state check
-    # remains mode-aware and independently enforces the exact 41 managed
+    # remains mode-aware and independently enforces the exact 43 managed
     # resources plus their types and security-sensitive values.
     expected = set(EXPECTED_RESOURCES) | set(EXPECTED_DATA_RESOURCES)
     missing = sorted(expected - addresses)
@@ -961,6 +1158,14 @@ def check_state(state: Any) -> dict[str, Any]:
         != values["module.control.aws_iam_role.flow_logs"].get("arn")
     ):
         raise ContractError("Control Flow Log state contract drifted")
+
+    publisher_role = values["module.control.aws_iam_role.authority_publisher"]
+    publisher_policy = values[
+        "module.control.aws_iam_role_policy.authority_publisher"
+    ]
+    _require_publisher_identity(publisher_role, publisher_policy)
+    if publisher_policy.get("role") != AUTHORITY_PUBLISHER_ROLE_NAME:
+        raise ContractError("authority publisher inline policy identity drifted")
 
     interface_sg = values["module.control.aws_security_group.interface_endpoints"].get(
         "id"
