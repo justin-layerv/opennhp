@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -30,7 +31,7 @@ const (
 	authorityResponseSemanticError
 )
 
-// encodeAuthorityRequest emits one of the two operation-specific v1 request
+// encodeAuthorityRequest emits one of the three operation-specific v1 request
 // bodies. There is deliberately no generic operation selector or envelope.
 func encodeAuthorityRequest(request Request) ([]byte, error) {
 	if !validAgentID(request.AgentID) || !validAuthorityPeer(request.AuthenticatedPeerPublicKeyB64) ||
@@ -57,12 +58,58 @@ func encodeAuthorityRequest(request Request) ([]byte, error) {
 			Version: conformance.ConnectorAuthorityLambdaRequestVersion, HubRequestID: request.HubRequestID(),
 			AgentID: request.AgentID, AuthenticatedPeerPublicKeyB64: request.AuthenticatedPeerPublicKeyB64,
 		}
+	case ModeRecover:
+		if !validAuthorityAPIKey(request.Credential) {
+			return nil, ErrInvalidAuthorityRequest
+		}
+		return encodeCredentialRecoveryAuthorityRequest(request)
 	default:
 		return nil, ErrInvalidAuthorityRequest
 	}
 
 	body, err := json.Marshal(value)
 	if err != nil || len(body) > conformance.ConnectorAuthorityLambdaMaxRequestBytes {
+		return nil, ErrInvalidAuthorityRequest
+	}
+	return body, nil
+}
+
+const (
+	recoveryAuthorityVersionPrefix = `{"version":`
+	recoveryAuthorityRequestID     = `,"hub_request_id":"`
+	recoveryAuthorityAgentID       = `","agent_id":"`
+	recoveryAuthorityPeer          = `","authenticated_peer_public_key_b64":"`
+	recoveryAuthorityCredential    = `","recovery_credential":"`
+	recoveryAuthoritySuffix        = `"}`
+)
+
+func encodeCredentialRecoveryAuthorityRequest(request Request) ([]byte, error) {
+	// Recovery credentials are secrets. Build directly into the one buffer the
+	// handler owns and wipes instead of leaving a second copy in encoding/json's
+	// pooled state. Every value has already been restricted to JSON-safe ASCII.
+	version := strconv.Itoa(conformance.ConnectorAuthorityLambdaRequestVersion)
+	wantBytes := len(recoveryAuthorityVersionPrefix) + len(version) +
+		len(recoveryAuthorityRequestID) + len(request.HubRequestID()) +
+		len(recoveryAuthorityAgentID) + len(request.AgentID) +
+		len(recoveryAuthorityPeer) + len(request.AuthenticatedPeerPublicKeyB64) +
+		len(recoveryAuthorityCredential) + len(request.Credential) + len(recoveryAuthoritySuffix)
+	if wantBytes > conformance.ConnectorAuthorityLambdaMaxRequestBytes {
+		return nil, ErrInvalidAuthorityRequest
+	}
+	body := make([]byte, 0, wantBytes)
+	body = append(body, recoveryAuthorityVersionPrefix...)
+	body = append(body, version...)
+	body = append(body, recoveryAuthorityRequestID...)
+	body = append(body, request.HubRequestID()...)
+	body = append(body, recoveryAuthorityAgentID...)
+	body = append(body, request.AgentID...)
+	body = append(body, recoveryAuthorityPeer...)
+	body = append(body, request.AuthenticatedPeerPublicKeyB64...)
+	body = append(body, recoveryAuthorityCredential...)
+	body = append(body, request.Credential...)
+	body = append(body, recoveryAuthoritySuffix...)
+	if len(body) != wantBytes || cap(body) != wantBytes {
+		clear(body)
 		return nil, ErrInvalidAuthorityRequest
 	}
 	return body, nil
@@ -83,6 +130,8 @@ func decodeAuthorityResponse(request Request, raw []byte) ([]byte, authorityResp
 		return decodeIssueAssignmentResponse(request.AgentID, envelope)
 	case ModeRefresh:
 		return decodeRefreshAssignmentResponse(request.AgentID, envelope)
+	case ModeRecover:
+		return decodeIssueCredentialRecoveryResponse(request.AgentID, envelope)
 	default:
 		return nil, 0, ErrInvalidAuthorityResponse
 	}
@@ -114,7 +163,7 @@ func decodeAuthorityEnvelope(raw []byte) (authorityEnvelope, error) {
 	if err != nil {
 		return authorityEnvelope{}, ErrInvalidAuthorityResponse
 	}
-	// Neither Hub operation permits retry_after_seconds in an Authority response.
+	// No Hub operation permits retry_after_seconds in an Authority response.
 	// Hub-local rate limiting is a separate pre-invoke decision.
 	if _, present := errorObject["retry_after_seconds"]; present {
 		return authorityEnvelope{}, ErrInvalidAuthorityResponse
@@ -302,7 +351,10 @@ func validAuthorityAPIKey(value string) bool {
 	}
 	encoded := value[len(prefix):]
 	decoded, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
-	return err == nil && len(decoded) == 32 && base64.RawURLEncoding.EncodeToString(decoded) == encoded
+	defer clear(decoded)
+	// Exact encoded length plus Strict decoding pins the canonical unpadded
+	// base64url spelling, including zero trailing pad bits.
+	return err == nil && len(decoded) == 32
 }
 
 func validAuthorityPeer(value string) bool {

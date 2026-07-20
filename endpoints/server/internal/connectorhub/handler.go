@@ -12,10 +12,13 @@ var ErrInvalidHandlerConfiguration = errors.New("connector hub: invalid handler 
 
 // HubAuthority is the complete private authority surface available to the Hub.
 // The separate methods preserve IAM and wire-contract separation; there is no
-// generic operation dispatcher.
+// generic operation dispatcher. Implementations must consume payloads
+// synchronously without retaining or aliasing them and return exclusively owned
+// mutable response buffers. Ownership of each response transfers to Handler.
 type HubAuthority interface {
 	IssueAssignment(context.Context, []byte) ([]byte, error)
 	RefreshAssignment(context.Context, []byte) ([]byte, error)
+	IssueCredentialRecovery(context.Context, []byte) ([]byte, error)
 }
 
 // AdmissionRequest deliberately excludes the credential and agent ID. The
@@ -97,12 +100,18 @@ func (h *Handler) HandleAssignment(ctx context.Context, raw, authenticatedPeer [
 		// assignment phases freeze this unavailable result to the same 52200 body.
 		return h.unavailable(ModeRefresh, ClassificationDeadlineRejected)
 	}
-	request, rejection, err := DecodeAssignmentRequestClassified(h.environment, raw, authenticatedPeer)
+	request, rejection, err := decodeAssignmentRequestClassified(h.environment, raw, authenticatedPeer)
 	if err != nil {
-		// Strict decoding cannot trust a partially observed mode. Use the
-		// assignment-family 52205 response, which qurl-go accepts for both the
-		// initial and refresh exchange, instead of reparsing attacker input.
-		return h.invalidRequest(ModeRefresh, rejection)
+		// The single strict parse preserves only a uniquely decoded closed mode.
+		// That is enough to keep authenticated recovery failures in the 524xx
+		// family without retaining a secret or reparsing attacker input. Rejected
+		// bodies are intentionally field-order-sensitive only at this boundary: a
+		// fault before mode keeps the historical generic assignment rejection.
+		mode := request.Mode
+		if mode == 0 {
+			mode = ModeRefresh
+		}
+		return h.invalidRequest(mode, rejection)
 	}
 
 	// Admit before the stricter private credential grammar so malformed or
@@ -132,6 +141,16 @@ func (h *Handler) HandleAssignment(ctx context.Context, raw, authenticatedPeer [
 		if admission.RetryAfterSeconds == 0 {
 			return h.unavailable(request.Mode, ClassificationAdmissionUnavailable)
 		}
+		if request.Mode == ModeRecover {
+			// Recovery's authenticated rate-limit delay is frozen at 60 seconds.
+			// A differently configured gate is an unavailable admission boundary,
+			// not authority to emit a contract-divergent delay.
+			if admission.RetryAfterSeconds != recoveryRateLimitRetrySeconds {
+				return h.unavailable(request.Mode, ClassificationAdmissionUnavailable)
+			}
+			body, err := EncodeRecoveryError(RecoveryErrorRateLimited)
+			return classifiedBody(body, err, ClassificationRateLimited)
+		}
 		retry := admission.RetryAfterSeconds
 		if request.Mode == ModeEnroll {
 			body, err := EncodeEnrollError(EnrollErrorAssignmentRateLimited, &retry)
@@ -148,9 +167,9 @@ func (h *Handler) HandleAssignment(ctx context.Context, raw, authenticatedPeer [
 	payload, err := encodeAuthorityRequest(request)
 	if err != nil {
 		// The public LST credential is opaque, but the private Authority accepts
-		// only canonical API keys. Reject malformed shapes locally as invalid
-		// enrollment input; only canonical-but-unknown keys reach Authority and
-		// can map to the distinct invalid-API-key result.
+		// only canonical API keys. Reject malformed shapes locally before an
+		// Authority lookup; only canonical-but-unknown keys reach Authority and
+		// can map to the phase-specific credential-rejected result.
 		if request.Mode == ModeEnroll {
 			body, encodeErr := EncodeEnrollError(EnrollErrorInvalidInput, nil)
 			result := classifiedBody(body, encodeErr, ClassificationRequestRejected)
@@ -159,6 +178,7 @@ func (h *Handler) HandleAssignment(ctx context.Context, raw, authenticatedPeer [
 		}
 		return h.invalidRequest(request.Mode, RequestRejectionSemantic)
 	}
+	defer clear(payload)
 	// Keep the final fence adjacent to the separately permissioned call. The
 	// transport still owns cancellation after invocation begins; this prevents
 	// locally observable expiry from starting an Authority operation.
@@ -172,9 +192,12 @@ func (h *Handler) HandleAssignment(ctx context.Context, raw, authenticatedPeer [
 		response, err = h.authority.IssueAssignment(ctx, payload)
 	case ModeRefresh:
 		response, err = h.authority.RefreshAssignment(ctx, payload)
+	case ModeRecover:
+		response, err = h.authority.IssueCredentialRecovery(ctx, payload)
 	default:
 		return h.invalidRequest(request.Mode, RequestRejectionSemantic)
 	}
+	defer clear(response)
 	if err != nil || ctx.Err() != nil {
 		return h.unavailable(request.Mode, ClassificationAuthorityInvocationFailed)
 	}
@@ -194,6 +217,9 @@ func (h *Handler) invalidRequest(mode Mode, rejection RequestRejection) HandleRe
 	if mode == ModeEnroll {
 		body, err := EncodeEnrollError(EnrollErrorInvalidAssignmentRequest, nil)
 		result = classifiedBody(body, err, ClassificationRequestRejected)
+	} else if mode == ModeRecover {
+		body, err := EncodeRecoveryError(RecoveryErrorInvalidRequest)
+		result = classifiedBody(body, err, ClassificationRequestRejected)
 	} else {
 		body, err := EncodeRefreshError(AssignmentErrorInvalidRequest, nil)
 		result = classifiedBody(body, err, ClassificationRequestRejected)
@@ -207,6 +233,10 @@ func (h *Handler) invalidRequest(mode Mode, rejection RequestRejection) HandleRe
 func (h *Handler) unavailable(mode Mode, classification Classification) HandleResult {
 	if mode == ModeEnroll {
 		body, err := EncodeEnrollError(EnrollErrorAssignmentUnavailable, nil)
+		return classifiedBody(body, err, classification)
+	}
+	if mode == ModeRecover {
+		body, err := EncodeRecoveryError(RecoveryErrorUnavailable)
 		return classifiedBody(body, err, classification)
 	}
 	body, err := EncodeRefreshError(AssignmentErrorUnavailable, nil)

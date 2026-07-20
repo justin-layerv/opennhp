@@ -1,11 +1,13 @@
 package connectorhub
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,13 @@ import (
 )
 
 const testHubEnvironment = "sandbox"
+
+func TestAssignmentVersionWireInvariant(t *testing.T) {
+	t.Parallel()
+	if got := strconv.Itoa(assignmentVersion); got != assignmentVersionString {
+		t.Fatalf("assignment version wire form = %q, want %q", got, assignmentVersionString)
+	}
+}
 
 func TestDecodeAssignmentRequestConformanceGolden(t *testing.T) {
 	t.Parallel()
@@ -62,8 +71,11 @@ func TestDecodeAssignmentRequestHubRequestIDConformanceKATs(t *testing.T) {
 				t.Fatalf("decode peer: %v", err)
 			}
 			mode := "refresh"
-			if test.Operation == conformance.ConnectorHubRequestIDOperationIssue {
+			switch test.Operation {
+			case conformance.ConnectorHubRequestIDOperationIssue:
 				mode = "enroll"
+			case conformance.ConnectorHubRequestIDOperationRecover:
+				mode = "recover"
 			}
 			requestData := map[string]any{
 				"query": assignmentQuery, "version": assignmentVersion,
@@ -71,6 +83,8 @@ func TestDecodeAssignmentRequestHubRequestIDConformanceKATs(t *testing.T) {
 			}
 			if test.Operation == conformance.ConnectorHubRequestIDOperationIssue {
 				requestData["credential"] = conformance.AgentAssignmentBootstrapCredentialFixture
+			} else if test.Operation == conformance.ConnectorHubRequestIDOperationRecover {
+				requestData["credential"] = recoveryVectors(t).Fixtures.RecoveryCredential
 			}
 			body, err := json.Marshal(map[string]any{
 				"usrId": "", "devId": "agent-conform", "aspId": assignmentAspID, "usrData": requestData,
@@ -528,6 +542,50 @@ func TestEncodeAssignmentSuccessRejectsInvalidValues(t *testing.T) {
 	expanded.AssignmentTicket = strings.Repeat(`"`, maxAssignmentTicketBytes)
 	if _, err := EncodeEnrollSuccess(expanded); !errors.Is(err, ErrAssignmentResponseTooLarge) {
 		t.Fatalf("JSON-expanded ticket error = %v, want ErrAssignmentResponseTooLarge", err)
+	}
+}
+
+func TestEnrollSuccessOwnedEncoderMatchesJSONMarshal(t *testing.T) {
+	t.Parallel()
+	vectors := assignmentVectors(t)
+	var golden successEnvelope[enrollListWire]
+	if err := json.Unmarshal([]byte(vectors.InitialAssignment.Result.BodyJSON), &golden); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	baseline, err := enrollSuccessFromWire(golden.List)
+	if err != nil {
+		t.Fatalf("convert golden: %v", err)
+	}
+	// appendEscapedTicket relies on validTicket admitting only printable ASCII.
+	// Exercise every byte in that accepted alphabet against encoding/json so a
+	// future validator or encoder change cannot silently break that coupling.
+	tickets := []string{baseline.AssignmentTicket, `ticket-\"\\<>&-safe`}
+	for value := byte(0x21); value <= 0x7e; value++ {
+		tickets = append(tickets, string(value))
+	}
+	for _, ticket := range tickets {
+		candidate := baseline
+		candidate.AssignmentTicket = ticket
+		got, err := EncodeEnrollSuccess(candidate)
+		if err != nil {
+			t.Fatalf("EncodeEnrollSuccess(%q): %v", ticket, err)
+		}
+		want, err := json.Marshal(successEnvelope[enrollListWire]{
+			ErrCode: "0",
+			List: enrollListWire{
+				Query: assignmentQuery, Version: assignmentVersion, Mode: "enroll", AgentID: candidate.AgentID,
+				Registration:              registrationWire{KeyID: candidate.Registration.KeyID, KeyKind: candidate.Registration.KeyKind},
+				Assignment:                toAssignmentWire(candidate.Assignment),
+				AssignmentTicket:          candidate.AssignmentTicket,
+				AssignmentTicketExpiresAt: candidate.AssignmentTicketExpiresAt.Format(time.RFC3339),
+			},
+		})
+		if err != nil {
+			t.Fatalf("json.Marshal expected enroll success: %v", err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("owned enroll encoding differs from encoding/json:\n got: %s\nwant: %s", got, want)
+		}
 	}
 }
 

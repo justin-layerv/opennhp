@@ -148,6 +148,47 @@ func TestHandlerSendsExactDerivedOperationRequestOnce(t *testing.T) {
 	}
 }
 
+func TestAssignmentHandlerWipesOwnedAuthorityBuffers(t *testing.T) {
+	t.Parallel()
+	authorityContract := authorityVectors(t)
+	assignmentContract := assignmentVectors(t)
+	for _, test := range []struct {
+		name     string
+		mode     Mode
+		request  string
+		response string
+	}{
+		{
+			name: "issue", mode: ModeEnroll,
+			request: strings.Replace(assignmentContract.InitialAssignment.Request.BodyJSON,
+				conformance.AgentAssignmentBootstrapCredentialFixture, authorityContract.Fixtures.Credential, 1),
+			response: authorityContract.Operations[conformance.ConnectorAuthorityOperationIssueAssignment].SuccessGolden.BodyJSON,
+		},
+		{
+			name: "refresh", mode: ModeRefresh, request: assignmentContract.RefreshAssignment.Request.BodyJSON,
+			response: authorityContract.Operations[conformance.ConnectorAuthorityOperationRefreshAssignment].SuccessGolden.BodyJSON,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			authority := &retainingAssignmentAuthority{mode: test.mode, response: []byte(test.response)}
+			handler := mustHandler(t, authority, &fakeAdmissionGate{result: AdmissionResult{Decision: AdmissionAllow}})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			result := handler.HandleAssignment(ctx, []byte(test.request), decodedAuthorityPeer(t, authorityContract))
+			if result.Classification != ClassificationSuccess {
+				t.Fatalf("classification = %q, want success", result.Classification)
+			}
+			if !allZero(authority.payload) {
+				t.Fatalf("owned Authority request was not wiped: %q", authority.payload)
+			}
+			if !allZero(authority.response) {
+				t.Fatalf("owned Authority response was not wiped: %q", authority.response)
+			}
+		})
+	}
+}
+
 func TestHandlerFailsClosedWithoutRetry(t *testing.T) {
 	t.Parallel()
 	authorityContract := authorityVectors(t)
@@ -196,6 +237,10 @@ func TestHandlerRejectsInvalidInputAndDeadlineBeforeAuthority(t *testing.T) {
 	assignmentContract := assignmentVectors(t)
 	peer := decodedAuthorityPeer(t, authorityContract)
 	wantInvalid, _ := EncodeRefreshError(AssignmentErrorInvalidRequest, nil)
+	wantEnrollInvalid, _ := EncodeEnrollError(EnrollErrorInvalidAssignmentRequest, nil)
+	if !bytes.Equal(wantEnrollInvalid, wantInvalid) {
+		t.Fatalf("enroll invalid-request body = %s, want shared 52205 body %s", wantEnrollInvalid, wantInvalid)
+	}
 	wantUnavailable, _ := EncodeRefreshError(AssignmentErrorUnavailable, nil)
 
 	tests := []struct {
@@ -210,6 +255,11 @@ func TestHandlerRejectsInvalidInputAndDeadlineBeforeAuthority(t *testing.T) {
 		{
 			name: "malformed request", ctx: liveTestContext, request: `{}`,
 			wantBody: wantInvalid, classification: ClassificationRequestRejected, rejection: RequestRejectionMissingField,
+		},
+		{
+			name: "malformed identifiable enroll keeps shared 52205 wire", ctx: liveTestContext,
+			request:  `{"usrId":"","devId":"agent-conform","aspId":"agent","usrData":{"query":"cell_assignment","version":1,"mode":"enroll","credential":"opaque"}}`,
+			wantBody: wantEnrollInvalid, classification: ClassificationRequestRejected, rejection: RequestRejectionMissingField,
 		},
 		{
 			name: "missing deadline", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} },
@@ -408,12 +458,41 @@ func (f *fakeAdmissionGate) callCount() int {
 type fakeHubAuthority struct {
 	mu sync.Mutex
 
-	issueResponse   []byte
-	refreshResponse []byte
-	issueErr        error
-	refreshErr      error
-	issuePayloads   [][]byte
-	refreshPayloads [][]byte
+	issueResponse    []byte
+	refreshResponse  []byte
+	recoveryResponse []byte
+	issueErr         error
+	refreshErr       error
+	recoveryErr      error
+	issuePayloads    [][]byte
+	refreshPayloads  [][]byte
+	recoveryPayloads [][]byte
+}
+
+type retainingAssignmentAuthority struct {
+	mode     Mode
+	payload  []byte
+	response []byte
+}
+
+func (a *retainingAssignmentAuthority) IssueAssignment(_ context.Context, payload []byte) ([]byte, error) {
+	if a.mode != ModeEnroll {
+		panic("unexpected IssueAssignment")
+	}
+	a.payload = payload
+	return a.response, nil
+}
+
+func (a *retainingAssignmentAuthority) RefreshAssignment(_ context.Context, payload []byte) ([]byte, error) {
+	if a.mode != ModeRefresh {
+		panic("unexpected RefreshAssignment")
+	}
+	a.payload = payload
+	return a.response, nil
+}
+
+func (a *retainingAssignmentAuthority) IssueCredentialRecovery(context.Context, []byte) ([]byte, error) {
+	panic("unexpected IssueCredentialRecovery")
 }
 
 func (f *fakeHubAuthority) IssueAssignment(_ context.Context, payload []byte) ([]byte, error) {
@@ -428,6 +507,19 @@ func (f *fakeHubAuthority) RefreshAssignment(_ context.Context, payload []byte) 
 	defer f.mu.Unlock()
 	f.refreshPayloads = append(f.refreshPayloads, bytes.Clone(payload))
 	return bytes.Clone(f.refreshResponse), f.refreshErr
+}
+
+func (f *fakeHubAuthority) IssueCredentialRecovery(_ context.Context, payload []byte) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recoveryPayloads = append(f.recoveryPayloads, bytes.Clone(payload))
+	return bytes.Clone(f.recoveryResponse), f.recoveryErr
+}
+
+func (f *fakeHubAuthority) recoveryCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.recoveryPayloads)
 }
 
 func (f *fakeHubAuthority) callCounts() (int, int) {

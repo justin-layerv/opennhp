@@ -69,6 +69,40 @@ func TestConstructorsAcceptExactActiveAliasARNs(t *testing.T) {
 	}
 }
 
+func TestConstructorsRequireDistinctRecoveryAliases(t *testing.T) {
+	t.Parallel()
+
+	cfg := aws.Config{Region: testRegion}
+	boundary := Boundary{AccountID: testAccountID, Region: testRegion}
+	hubMissing := validHubTargets()
+	hubMissing.IssueCredentialRecoveryAliasARN = ""
+	hubDuplicate := validHubTargets()
+	hubDuplicate.IssueCredentialRecoveryAliasARN = hubDuplicate.IssueAssignmentAliasARN
+	cellMissing := validCellTargets()
+	cellMissing.CompleteCredentialRecoveryAliasARN = ""
+	cellDuplicate := validCellTargets()
+	cellDuplicate.CompleteCredentialRecoveryAliasARN = cellDuplicate.CompleteRegistrationAliasARN
+
+	for _, test := range []struct {
+		name  string
+		build func() error
+		field string
+	}{
+		{name: "hub missing", build: func() error { _, err := NewHubClient(cfg, boundary, hubMissing); return err }, field: "issue_credential_recovery"},
+		{name: "hub duplicate", build: func() error { _, err := NewHubClient(cfg, boundary, hubDuplicate); return err }, field: "issue_credential_recovery"},
+		{name: "cell missing", build: func() error { _, err := NewCellClient(cfg, boundary, cellMissing); return err }, field: "complete_credential_recovery"},
+		{name: "cell duplicate", build: func() error { _, err := NewCellClient(cfg, boundary, cellDuplicate); return err }, field: "complete_credential_recovery"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var configErr *ConfigError
+			if err := test.build(); !errors.As(err, &configErr) || configErr.Field != test.field {
+				t.Fatalf("error = %#v, want ConfigError field %q", err, test.field)
+			}
+		})
+	}
+}
+
 func TestLambdaClientForcesDefaultEndpointAndOneAttempt(t *testing.T) {
 	t.Parallel()
 
@@ -101,16 +135,18 @@ func TestLambdaClientForcesDefaultEndpointAndOneAttempt(t *testing.T) {
 
 func validHubTargets() HubTargets {
 	return HubTargets{
-		IssueAssignmentAliasARN:   aliasARN("IssueAssignment", "active"),
-		RefreshAssignmentAliasARN: aliasARN("RefreshAssignment", "active"),
+		IssueAssignmentAliasARN:         aliasARN("IssueAssignment", "active"),
+		RefreshAssignmentAliasARN:       aliasARN("RefreshAssignment", "active"),
+		IssueCredentialRecoveryAliasARN: aliasARN("IssueCredentialRecovery", "active"),
 	}
 }
 
 func validCellTargets() CellTargets {
 	return CellTargets{
-		IssueRegistrationOTPAliasARN: aliasARN("IssueRegistrationOTP-cell0", "active"),
-		ActivateRegistrationAliasARN: aliasARN("ActivateRegistration-cell0", "active"),
-		CompleteRegistrationAliasARN: aliasARN("CompleteRegistration-cell0", "active"),
+		IssueRegistrationOTPAliasARN:       aliasARN("IssueRegistrationOTP-cell0", "active"),
+		ActivateRegistrationAliasARN:       aliasARN("ActivateRegistration-cell0", "active"),
+		CompleteRegistrationAliasARN:       aliasARN("CompleteRegistration-cell0", "active"),
+		CompleteCredentialRecoveryAliasARN: aliasARN("CompleteCredentialRecovery-cell0", "active"),
 	}
 }
 

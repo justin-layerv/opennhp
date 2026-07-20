@@ -25,17 +25,19 @@ type Boundary struct {
 	Region    string
 }
 
-// HubTargets contains the two exact :active alias ARNs available to a hub worker.
+// HubTargets contains the three exact :active alias ARNs available to a hub worker.
 type HubTargets struct {
-	IssueAssignmentAliasARN   string
-	RefreshAssignmentAliasARN string
+	IssueAssignmentAliasARN         string
+	RefreshAssignmentAliasARN       string
+	IssueCredentialRecoveryAliasARN string
 }
 
-// CellTargets contains the three exact :active alias ARNs available to one cell worker.
+// CellTargets contains the four exact :active alias ARNs available to one cell worker.
 type CellTargets struct {
-	IssueRegistrationOTPAliasARN string
-	ActivateRegistrationAliasARN string
-	CompleteRegistrationAliasARN string
+	IssueRegistrationOTPAliasARN       string
+	ActivateRegistrationAliasARN       string
+	CompleteRegistrationAliasARN       string
+	CompleteCredentialRecoveryAliasARN string
 }
 
 // NewHubClient constructs a hub-only client with a single-attempt Lambda SDK client.
@@ -46,6 +48,7 @@ func NewHubClient(cfg aws.Config, boundary Boundary, targets HubTargets) (*HubCl
 	if err := validateTargets(boundary,
 		targetSpec{"issue_assignment", targets.IssueAssignmentAliasARN},
 		targetSpec{"refresh_assignment", targets.RefreshAssignmentAliasARN},
+		targetSpec{"issue_credential_recovery", targets.IssueCredentialRecoveryAliasARN},
 	); err != nil {
 		return nil, err
 	}
@@ -62,6 +65,7 @@ func NewCellClient(cfg aws.Config, boundary Boundary, targets CellTargets) (*Cel
 		targetSpec{"issue_registration_otp", targets.IssueRegistrationOTPAliasARN},
 		targetSpec{"activate_registration", targets.ActivateRegistrationAliasARN},
 		targetSpec{"complete_registration", targets.CompleteRegistrationAliasARN},
+		targetSpec{"complete_credential_recovery", targets.CompleteCredentialRecoveryAliasARN},
 	); err != nil {
 		return nil, err
 	}
@@ -71,18 +75,20 @@ func NewCellClient(cfg aws.Config, boundary Boundary, targets CellTargets) (*Cel
 
 func newHubClient(api invokeAPI, targets HubTargets) *HubClient {
 	return &HubClient{
-		invoker:           invoker{api: api},
-		issueAssignment:   targets.IssueAssignmentAliasARN,
-		refreshAssignment: targets.RefreshAssignmentAliasARN,
+		invoker:                 invoker{api: api},
+		issueAssignment:         targets.IssueAssignmentAliasARN,
+		refreshAssignment:       targets.RefreshAssignmentAliasARN,
+		issueCredentialRecovery: targets.IssueCredentialRecoveryAliasARN,
 	}
 }
 
 func newCellClient(api invokeAPI, targets CellTargets) *CellClient {
 	return &CellClient{
-		invoker:              invoker{api: api},
-		issueRegistrationOTP: targets.IssueRegistrationOTPAliasARN,
-		activateRegistration: targets.ActivateRegistrationAliasARN,
-		completeRegistration: targets.CompleteRegistrationAliasARN,
+		invoker:                    invoker{api: api},
+		issueRegistrationOTP:       targets.IssueRegistrationOTPAliasARN,
+		activateRegistration:       targets.ActivateRegistrationAliasARN,
+		completeRegistration:       targets.CompleteRegistrationAliasARN,
+		completeCredentialRecovery: targets.CompleteCredentialRecoveryAliasARN,
 	}
 }
 

@@ -39,21 +39,25 @@ type invoker struct {
 
 // HubClient exposes only environment-global hub authority capabilities. Every
 // method requires a live caller deadline and a non-empty, valid JSON body no
-// larger than 64 KiB.
+// larger than 64 KiB. Payloads are consumed synchronously and never retained;
+// successful callers own the returned mutable buffer exclusively.
 type HubClient struct {
 	invoker
-	issueAssignment   string
-	refreshAssignment string
+	issueAssignment         string
+	refreshAssignment       string
+	issueCredentialRecovery string
 }
 
 // CellClient exposes only assigned-cell authority capabilities. Every method
 // requires a live caller deadline and a non-empty, valid JSON body no larger
-// than 64 KiB.
+// than 64 KiB. Payloads are consumed synchronously and never retained;
+// successful callers own the returned mutable buffer exclusively.
 type CellClient struct {
 	invoker
-	issueRegistrationOTP string
-	activateRegistration string
-	completeRegistration string
+	issueRegistrationOTP       string
+	activateRegistration       string
+	completeRegistration       string
+	completeCredentialRecovery string
 }
 
 // IssueAssignment invokes the configured IssueAssignment alias synchronously.
@@ -64,6 +68,11 @@ func (c *HubClient) IssueAssignment(ctx context.Context, payload []byte) ([]byte
 // RefreshAssignment invokes the configured RefreshAssignment alias synchronously.
 func (c *HubClient) RefreshAssignment(ctx context.Context, payload []byte) ([]byte, error) {
 	return c.invoke(ctx, OperationRefreshAssignment, c.refreshAssignment, payload)
+}
+
+// IssueCredentialRecovery invokes the configured environment-global recovery alias synchronously.
+func (c *HubClient) IssueCredentialRecovery(ctx context.Context, payload []byte) ([]byte, error) {
+	return c.invoke(ctx, OperationIssueCredentialRecovery, c.issueCredentialRecovery, payload)
 }
 
 // IssueRegistrationOTP invokes the configured cell-scoped IssueRegistrationOTP alias synchronously.
@@ -79,6 +88,11 @@ func (c *CellClient) ActivateRegistration(ctx context.Context, payload []byte) (
 // CompleteRegistration invokes the configured cell-scoped CompleteRegistration alias synchronously.
 func (c *CellClient) CompleteRegistration(ctx context.Context, payload []byte) ([]byte, error) {
 	return c.invoke(ctx, OperationCompleteRegistration, c.completeRegistration, payload)
+}
+
+// CompleteCredentialRecovery invokes the configured assigned-cell recovery alias synchronously.
+func (c *CellClient) CompleteCredentialRecovery(ctx context.Context, payload []byte) ([]byte, error) {
+	return c.invoke(ctx, OperationCompleteCredentialRecovery, c.completeCredentialRecovery, payload)
 }
 
 func (c *invoker) invoke(ctx context.Context, operation Operation, target string, payload []byte) ([]byte, error) {
@@ -97,12 +111,20 @@ func (c *invoker) invoke(ctx context.Context, operation Operation, target string
 		return nil, newInvokeError(operation, FailureInvalidRequest, 0)
 	}
 
+	requestPayload := bytes.Clone(payload)
+	defer clear(requestPayload)
 	output, err := c.api.Invoke(ctx, &lambda.InvokeInput{
 		FunctionName:   aws.String(target),
 		InvocationType: types.InvocationTypeRequestResponse,
 		LogType:        types.LogTypeNone,
-		Payload:        bytes.Clone(payload),
+		Payload:        requestPayload,
 	})
+	if output != nil {
+		// The AWS SDK transfers its response buffer to this synchronous caller.
+		// Wipe it on transport, status, function-error, shape-error, and success
+		// paths; only a final validated clone crosses the package boundary.
+		defer clear(output.Payload)
+	}
 	if err != nil {
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, newInvokeError(operation, FailureDeadline, 0)

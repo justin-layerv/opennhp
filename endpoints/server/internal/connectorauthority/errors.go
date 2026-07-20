@@ -6,11 +6,13 @@ import "fmt"
 type Operation string
 
 const (
-	OperationIssueAssignment      Operation = "issue_assignment"
-	OperationRefreshAssignment    Operation = "refresh_assignment"
-	OperationIssueRegistrationOTP Operation = "issue_registration_otp"
-	OperationActivateRegistration Operation = "activate_registration"
-	OperationCompleteRegistration Operation = "complete_registration"
+	OperationIssueAssignment            Operation = "issue_assignment"
+	OperationRefreshAssignment          Operation = "refresh_assignment"
+	OperationIssueCredentialRecovery    Operation = "issue_credential_recovery"
+	OperationIssueRegistrationOTP       Operation = "issue_registration_otp"
+	OperationActivateRegistration       Operation = "activate_registration"
+	OperationCompleteRegistration       Operation = "complete_registration"
+	OperationCompleteCredentialRecovery Operation = "complete_credential_recovery"
 )
 
 // FailureKind is a redacted, programmatic invocation failure classification.

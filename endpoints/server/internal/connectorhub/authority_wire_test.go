@@ -79,6 +79,15 @@ func TestValidAuthorityAPIKeyAcceptsOnlyClosedCanonicalPrefixes(t *testing.T) {
 	if validAuthorityAPIKey("lv_prod_" + encoded) {
 		t.Fatal("validAuthorityAPIKey accepted unversioned production prefix")
 	}
+	const base64URLAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	last := strings.IndexByte(base64URLAlphabet, encoded[len(encoded)-1])
+	if last < 0 || last&3 != 0 {
+		t.Fatalf("fixture has unexpected canonical final sextet %q", encoded[len(encoded)-1])
+	}
+	nonCanonicalPadBits := encoded[:len(encoded)-1] + string(base64URLAlphabet[last+1])
+	if validAuthorityAPIKey("lv_live_" + nonCanonicalPadBits) {
+		t.Fatal("validAuthorityAPIKey accepted non-zero trailing pad bits")
+	}
 }
 
 func TestDecodeAuthorityResponseConformancePublicMappings(t *testing.T) {

@@ -18,15 +18,17 @@ import (
 )
 
 type fakeInvokeAPI struct {
-	output  *lambda.InvokeOutput
-	err     error
-	inputs  []*lambda.InvokeInput
-	options []int
-	mutate  func(*lambda.InvokeInput)
+	output        *lambda.InvokeOutput
+	err           error
+	inputs        []*lambda.InvokeInput
+	payloadCopies [][]byte
+	options       []int
+	mutate        func(*lambda.InvokeInput)
 }
 
 func (f *fakeInvokeAPI) Invoke(_ context.Context, input *lambda.InvokeInput, options ...func(*lambda.Options)) (*lambda.InvokeOutput, error) {
 	f.inputs = append(f.inputs, input)
+	f.payloadCopies = append(f.payloadCopies, bytes.Clone(input.Payload))
 	f.options = append(f.options, len(options))
 	if f.mutate != nil {
 		f.mutate(input)
@@ -40,8 +42,8 @@ func TestHubAndCellCapabilitiesAreStructurallySeparated(t *testing.T) {
 	hubMethods := exportedMethods(reflect.TypeOf((*HubClient)(nil)))
 	cellMethods := exportedMethods(reflect.TypeOf((*CellClient)(nil)))
 
-	wantHub := []string{"IssueAssignment", "RefreshAssignment"}
-	wantCell := []string{"ActivateRegistration", "CompleteRegistration", "IssueRegistrationOTP"}
+	wantHub := []string{"IssueAssignment", "IssueCredentialRecovery", "RefreshAssignment"}
+	wantCell := []string{"ActivateRegistration", "CompleteCredentialRecovery", "CompleteRegistration", "IssueRegistrationOTP"}
 	if !reflect.DeepEqual(hubMethods, wantHub) {
 		t.Fatalf("HubClient methods = %v, want %v", hubMethods, wantHub)
 	}
@@ -78,6 +80,11 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 			target:    aliasARN("RefreshAssignment", "active"),
 		},
 		{
+			name:      "issue credential recovery",
+			operation: OperationIssueCredentialRecovery,
+			target:    aliasARN("IssueCredentialRecovery", "active"),
+		},
+		{
 			name:      "issue registration OTP",
 			operation: OperationIssueRegistrationOTP,
 			target:    aliasARN("IssueRegistrationOTP-cell0", "active"),
@@ -92,6 +99,11 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 			operation: OperationCompleteRegistration,
 			target:    aliasARN("CompleteRegistration-cell0", "active"),
 		},
+		{
+			name:      "complete credential recovery",
+			operation: OperationCompleteCredentialRecovery,
+			target:    aliasARN("CompleteCredentialRecovery-cell0", "active"),
+		},
 	}
 
 	for _, test := range tests {
@@ -103,25 +115,31 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 				Payload:    []byte(` {"ok":true} `),
 			}}
 			hub := newHubClient(api, HubTargets{
-				IssueAssignmentAliasARN:   tests[0].target,
-				RefreshAssignmentAliasARN: tests[1].target,
+				IssueAssignmentAliasARN:         tests[0].target,
+				RefreshAssignmentAliasARN:       tests[1].target,
+				IssueCredentialRecoveryAliasARN: tests[2].target,
 			})
 			cell := newCellClient(api, CellTargets{
-				IssueRegistrationOTPAliasARN: tests[2].target,
-				ActivateRegistrationAliasARN: tests[3].target,
-				CompleteRegistrationAliasARN: tests[4].target,
+				IssueRegistrationOTPAliasARN:       tests[3].target,
+				ActivateRegistrationAliasARN:       tests[4].target,
+				CompleteRegistrationAliasARN:       tests[5].target,
+				CompleteCredentialRecoveryAliasARN: tests[6].target,
 			})
 			switch test.operation {
 			case OperationIssueAssignment:
 				test.call = hub.IssueAssignment
 			case OperationRefreshAssignment:
 				test.call = hub.RefreshAssignment
+			case OperationIssueCredentialRecovery:
+				test.call = hub.IssueCredentialRecovery
 			case OperationIssueRegistrationOTP:
 				test.call = cell.IssueRegistrationOTP
 			case OperationActivateRegistration:
 				test.call = cell.ActivateRegistration
 			case OperationCompleteRegistration:
 				test.call = cell.CompleteRegistration
+			case OperationCompleteCredentialRecovery:
+				test.call = cell.CompleteCredentialRecovery
 			default:
 				t.Fatalf("unhandled operation %q", test.operation)
 			}
@@ -152,8 +170,14 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 			if input.Qualifier != nil || input.ClientContext != nil {
 				t.Fatalf("unexpected qualifier or client context: %#v", input)
 			}
-			if !bytes.Equal(input.Payload, request) {
-				t.Fatalf("Payload = %q, want %q", input.Payload, request)
+			if !bytes.Equal(api.payloadCopies[0], request) {
+				t.Fatalf("Payload = %q, want %q", api.payloadCopies[0], request)
+			}
+			if !zeroBytes(input.Payload) {
+				t.Fatalf("SDK request payload retained after invoke: %q", input.Payload)
+			}
+			if !zeroBytes(api.output.Payload) {
+				t.Fatalf("SDK response payload retained after invoke: %q", api.output.Payload)
 			}
 		})
 	}
@@ -178,6 +202,12 @@ func TestInvokeDefensivelyCopiesPayloads(t *testing.T) {
 	}
 	if request[0] != '{' {
 		t.Fatal("SDK-side request mutation reached the caller buffer")
+	}
+	if !zeroBytes(api.inputs[0].Payload) {
+		t.Fatalf("SDK request payload retained after invoke: %q", api.inputs[0].Payload)
+	}
+	if !zeroBytes(response) {
+		t.Fatalf("SDK response payload retained after invoke: %q", response)
 	}
 	response[0] = ' '
 	if got[0] != '{' {
@@ -241,7 +271,7 @@ func TestInvokeReturnsTypedRedactedFailures(t *testing.T) {
 		kind       FailureKind
 		statusCode int32
 	}{
-		{name: "SDK", err: errors.New("sdk failed with " + secret), kind: FailureSDK},
+		{name: "SDK", output: &lambda.InvokeOutput{Payload: []byte(secret)}, err: errors.New("sdk failed with " + secret), kind: FailureSDK},
 		{name: "deadline during invoke", err: context.DeadlineExceeded, kind: FailureDeadline},
 		{name: "cancel during invoke", err: context.Canceled, kind: FailureDeadline},
 		{name: "throttled", err: &smithy.GenericAPIError{Code: "TooManyRequestsException", Message: secret}, kind: FailureThrottled, statusCode: 429},
@@ -273,8 +303,23 @@ func TestInvokeReturnsTypedRedactedFailures(t *testing.T) {
 			if test.name == "zero status" && !strings.Contains(err.Error(), "(0)") {
 				t.Fatalf("zero status omitted from error: %q", err)
 			}
+			if len(api.inputs) != 1 || !zeroBytes(api.inputs[0].Payload) {
+				t.Fatalf("SDK request payload retained after failure: %#v", api.inputs)
+			}
+			if test.output != nil && !zeroBytes(test.output.Payload) {
+				t.Fatalf("SDK response payload retained after failure: %q", test.output.Payload)
+			}
 		})
 	}
+}
+
+func zeroBytes(value []byte) bool {
+	for _, b := range value {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func liveContext(t *testing.T) context.Context {
