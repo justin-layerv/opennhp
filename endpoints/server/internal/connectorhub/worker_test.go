@@ -55,6 +55,10 @@ func (a *deadlineWorkerAuthority) RefreshAssignment(ctx context.Context, _ []byt
 	return nil, ctx.Err()
 }
 
+func (a *deadlineWorkerAuthority) IssueCredentialRecovery(context.Context, []byte) ([]byte, error) {
+	return nil, errors.New("unexpected credential recovery call")
+}
+
 func (a *deadlineWorkerAuthority) callCounts() (int, int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
