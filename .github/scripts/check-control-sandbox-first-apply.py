@@ -128,6 +128,9 @@ _OUTPUT_CHANGE_KEYS = frozenset(
         "before_sensitive",
     }
 )
+# Value-free masks emitted by Terraform 1.14.3 with AWS provider 6.55.0 for
+# this exact role normalization. Re-review both masks when either pinned version
+# changes; the test lockfile assertion and literal golden move with them.
 _PUBLISHER_REFRESH_BEFORE_SENSITIVE = {
     "inline_policy": [],
     "managed_policy_arns": [],

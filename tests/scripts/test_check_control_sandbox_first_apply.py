@@ -445,6 +445,24 @@ def terraform_1_14_refresh_only_golden(candidate: dict) -> dict:
     }
 
 
+def state_resource(state: dict, address: str) -> dict:
+    """Return the resource at ``address`` from a prior-state tree."""
+    return next(
+        item
+        for item in state["values"]["root_module"]["child_modules"][0][
+            "resources"
+        ]
+        if item["address"] == address
+    )
+
+
+def state_publisher_role(state: dict) -> dict:
+    """Return the authority-publisher role resource from a prior-state tree."""
+    return state_resource(
+        state, "module.control.aws_iam_role.authority_publisher"
+    )
+
+
 def publisher_refresh_candidate() -> tuple[dict, dict]:
     candidate = plan_fixture()
     candidate["applyable"] = True
@@ -482,13 +500,7 @@ def publisher_refresh_candidate() -> tuple[dict, dict]:
         }
     ]
     prior_state = terraform_1_14_refresh_only_golden(candidate)
-    prior_role = next(
-        item
-        for item in prior_state["values"]["root_module"]["child_modules"][0][
-            "resources"
-        ]
-        if item["address"] == "module.control.aws_iam_role.authority_publisher"
-    )
+    prior_role = state_publisher_role(prior_state)
     prior_role["values"] = copy.deepcopy(
         candidate["resource_drift"][0]["change"]["before"]
     )
@@ -848,14 +860,7 @@ class PlanContractTests(unittest.TestCase):
         extra_collection_change["after"]["unexpected_collection"] = []
         extra_collection_change["before_sensitive"]["unexpected_collection"] = []
         extra_collection_change["after_sensitive"]["unexpected_collection"] = []
-        extra_collection_state_role = next(
-            item
-            for item in extra_collection_state["values"]["root_module"][
-                "child_modules"
-            ][0]["resources"]
-            if item["address"]
-            == "module.control.aws_iam_role.authority_publisher"
-        )
+        extra_collection_state_role = state_publisher_role(extra_collection_state)
         extra_collection_state_role["values"]["unexpected_collection"] = []
         self.assert_rejected(extra_collection, extra_collection_state)
 
@@ -868,14 +873,7 @@ class PlanContractTests(unittest.TestCase):
         secret_change = secret_safe["resource_drift"][0]["change"]
         secret_change["before"]["permissions_boundary"] = sentinel
         secret_change["after"]["permissions_boundary"] = sentinel
-        secret_state_role = next(
-            item
-            for item in secret_safe_state["values"]["root_module"][
-                "child_modules"
-            ][0]["resources"]
-            if item["address"]
-            == "module.control.aws_iam_role.authority_publisher"
-        )
+        secret_state_role = state_publisher_role(secret_safe_state)
         secret_state_role["values"]["permissions_boundary"] = sentinel
         secret_change["after_sensitive"] = {"permissions_boundary": True}
         with self.assertRaises(CHECKER.ContractError) as error:
@@ -905,25 +903,14 @@ class PlanContractTests(unittest.TestCase):
         self.assert_rejected(wrong_state_version, wrong_state_version_state)
 
         mismatched_prior, mismatched_prior_state = refresh_candidate()
-        mismatched_role = next(
-            item
-            for item in mismatched_prior_state["values"]["root_module"][
-                "child_modules"
-            ][0]["resources"]
-            if item["address"]
-            == "module.control.aws_iam_role.authority_publisher"
-        )
+        mismatched_role = state_publisher_role(mismatched_prior_state)
         mismatched_role["values"]["max_session_duration"] = 7200
         self.assert_rejected(mismatched_prior, mismatched_prior_state)
 
         state_security, state_security_prior = refresh_candidate()
-        kms_endpoint = next(
-            item
-            for item in state_security_prior["values"]["root_module"][
-                "child_modules"
-            ][0]["resources"]
-            if item["address"]
-            == 'module.control.aws_vpc_endpoint.interface["kms"]'
+        kms_endpoint = state_resource(
+            state_security_prior,
+            'module.control.aws_vpc_endpoint.interface["kms"]',
         )
         kms_endpoint["values"]["private_dns_enabled"] = False
         self.assert_rejected(state_security, state_security_prior)
