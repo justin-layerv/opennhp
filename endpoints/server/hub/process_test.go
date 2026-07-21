@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	conformance "github.com/layervai/qurl-conformance"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorhub"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -45,6 +46,11 @@ func freeUDPAddr(t *testing.T) string {
 	return addr
 }
 
+func runWithTestMetrics(t *testing.T, ctx context.Context, config Config, awsConfig aws.Config) error {
+	t.Helper()
+	return runWithAWSConfig(ctx, config, awsConfig, metrics.NewPublisherForTest(t))
+}
+
 func TestRunLifecycleServesPrivateTCPHealthAndClosesBothListeners(t *testing.T) {
 	config := validConfig()
 	config.UDPListenAddr = freeUDPAddr(t)
@@ -53,7 +59,7 @@ func TestRunLifecycleServesPrivateTCPHealthAndClosesBothListeners(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- runWithAWSConfig(ctx, config, aws.Config{Region: config.AWSRegion})
+		result <- runWithTestMetrics(t, ctx, config, aws.Config{Region: config.AWSRegion})
 	}()
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -110,7 +116,7 @@ func TestRunClosesHealthListenerWhenWorkerConstructionFails(t *testing.T) {
 	config.HealthListenAddr = freeTCPAddr(t)
 	config.MaxConcurrentPackets = core.RecvQueueSize + 1
 
-	err := runWithAWSConfig(context.Background(), config, aws.Config{Region: config.AWSRegion})
+	err := runWithTestMetrics(t, context.Background(), config, aws.Config{Region: config.AWSRegion})
 	if !errors.Is(err, connectorhub.ErrInvalidWorkerConfiguration) {
 		t.Fatalf("runWithAWSConfig error = %v, want invalid worker configuration", err)
 	}
@@ -132,7 +138,7 @@ func TestRunClosesHealthListenerWhenUDPBindFails(t *testing.T) {
 	config.UDPListenAddr = occupiedUDP.LocalAddr().String()
 	config.HealthListenAddr = freeTCPAddr(t)
 
-	err = runWithAWSConfig(context.Background(), config, aws.Config{Region: config.AWSRegion})
+	err = runWithTestMetrics(t, context.Background(), config, aws.Config{Region: config.AWSRegion})
 	if err == nil {
 		t.Fatal("runWithAWSConfig succeeded with an occupied UDP address")
 	}
@@ -150,7 +156,7 @@ func TestRunPreCanceledContextDoesNotClaimListeners(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := runWithAWSConfig(ctx, config, aws.Config{Region: config.AWSRegion})
+	err := runWithTestMetrics(t, ctx, config, aws.Config{Region: config.AWSRegion})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("runWithAWSConfig error = %v, want context.Canceled", err)
 	}
@@ -176,7 +182,7 @@ func TestRunInvalidKeyDoesNotClaimListeners(t *testing.T) {
 	config.HealthListenAddr = freeTCPAddr(t)
 	config.PrivateKeyBase64 += "\n"
 
-	err := runWithAWSConfig(context.Background(), config, aws.Config{Region: config.AWSRegion})
+	err := runWithTestMetrics(t, context.Background(), config, aws.Config{Region: config.AWSRegion})
 	if !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("runWithAWSConfig error = %v, want ErrInvalidConfig", err)
 	}
@@ -194,6 +200,96 @@ func TestRunInvalidKeyDoesNotClaimListeners(t *testing.T) {
 		t.Fatalf("UDP listener was claimed by invalid config: %v", err)
 	}
 	_ = udpConn.Close()
+}
+
+type temporaryAcceptError struct{}
+
+func (temporaryAcceptError) Error() string   { return "temporary accept failure" }
+func (temporaryAcceptError) Timeout() bool   { return false }
+func (temporaryAcceptError) Temporary() bool { return true }
+
+type scriptedHealthAccepter struct {
+	errors []error
+	calls  int
+}
+
+func (a *scriptedHealthAccepter) Accept() (net.Conn, error) {
+	a.calls++
+	if len(a.errors) == 0 {
+		return nil, net.ErrClosed
+	}
+	err := a.errors[0]
+	a.errors = a.errors[1:]
+	return nil, err
+}
+
+func TestServeHealthRetriesTransientAcceptErrors(t *testing.T) {
+	listener := &scriptedHealthAccepter{errors: []error{
+		temporaryAcceptError{},
+		temporaryAcceptError{},
+		net.ErrClosed,
+	}}
+	publisher := metrics.NewPublisherForTest(t)
+
+	err := serveHealthWithBackoff(context.Background(), listener, publisher, time.Millisecond, 2*time.Millisecond)
+	if err != nil {
+		t.Fatalf("serveHealthWithBackoff returned transient error: %v", err)
+	}
+	if listener.calls != 3 {
+		t.Fatalf("Accept calls = %d, want 3", listener.calls)
+	}
+	counters, _ := publisher.CountersForTest(t)
+	if got := counters[metricHubHealthAcceptRetry]; got != 2 {
+		t.Fatalf("%s = %v, want 2", metricHubHealthAcceptRetry, got)
+	}
+}
+
+func TestServeHealthReturnsPermanentAcceptError(t *testing.T) {
+	want := errors.New("permanent accept failure")
+	listener := &scriptedHealthAccepter{errors: []error{want}}
+	publisher := metrics.NewPublisherForTest(t)
+
+	err := serveHealthWithBackoff(context.Background(), listener, publisher, time.Millisecond, 2*time.Millisecond)
+	if !errors.Is(err, want) {
+		t.Fatalf("serveHealthWithBackoff error = %v, want %v", err, want)
+	}
+	if listener.calls != 1 {
+		t.Fatalf("Accept calls = %d, want 1", listener.calls)
+	}
+	counters, _ := publisher.CountersForTest(t)
+	if got := counters[metricHubHealthAcceptRetry]; got != 0 {
+		t.Fatalf("%s = %v, want 0", metricHubHealthAcceptRetry, got)
+	}
+}
+
+type notifyingTemporaryAccepter struct {
+	once   sync.Once
+	called chan struct{}
+}
+
+func (a *notifyingTemporaryAccepter) Accept() (net.Conn, error) {
+	a.once.Do(func() { close(a.called) })
+	return nil, temporaryAcceptError{}
+}
+
+func TestServeHealthTransientBackoffIsCancellable(t *testing.T) {
+	listener := &notifyingTemporaryAccepter{called: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- serveHealthWithBackoff(ctx, listener, nil, time.Hour, time.Hour)
+	}()
+	<-listener.called
+	cancel()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("serveHealthWithBackoff returned on cancellation: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("transient accept backoff did not stop on context cancellation")
+	}
 }
 
 func TestAuthorityAdmissionGateFailsClosed(t *testing.T) {

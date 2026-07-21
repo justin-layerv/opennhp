@@ -5,13 +5,24 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorauthority"
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorhub"
 )
+
+const (
+	healthAcceptInitialBackoff = 10 * time.Millisecond
+	healthAcceptMaxBackoff     = time.Second
+)
+
+type healthAccepter interface {
+	Accept() (net.Conn, error)
+}
 
 type componentResult struct {
 	name string
@@ -38,10 +49,14 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return fmt.Errorf("connector hub: load AWS configuration: %w", err)
 	}
-	return runWithAWSConfig(ctx, config, awsConfig)
+	return runWithAWSConfig(ctx, config, awsConfig, newHubMetricsPublisher(config.Environment, awsConfig))
 }
 
-func runWithAWSConfig(ctx context.Context, config Config, awsConfig aws.Config) error {
+func runWithAWSConfig(ctx context.Context, config Config, awsConfig aws.Config, publisher *metrics.Publisher) error {
+	// This function owns the publisher passed by Run (and the test publisher at
+	// the directly testable seam). Stop is nil-safe and performs the final
+	// CloudWatch flush after the worker-observer exporter has drained below.
+	defer publisher.Stop()
 	if ctx == nil {
 		return ErrInvalidConfig
 	}
@@ -80,12 +95,13 @@ func runWithAWSConfig(ctx context.Context, config Config, awsConfig aws.Config) 
 		_ = healthListener.Close()
 		return fmt.Errorf("connector hub: listen for UDP assignments: %w", err)
 	}
+	observer := newWorkerMetrics()
 	worker, err := connectorhub.NewWorker(udpConn, connectorhub.WorkerConfig{
 		PrivateKeyBase64:        config.PrivateKeyBase64,
 		ActiveCookieKeyBase64:   config.ActiveCookieKeyBase64,
 		PreviousCookieKeyBase64: config.PreviousCookieKeyBase64,
 		Handler:                 handler,
-		Observer:                newWorkerMetrics(),
+		Observer:                observer,
 		MaxConcurrentPackets:    config.MaxConcurrentPackets,
 		PacketsPerSecond:        config.PacketsPerSecond,
 		PacketBurst:             config.PacketBurst,
@@ -97,6 +113,12 @@ func runWithAWSConfig(ctx context.Context, config Config, awsConfig aws.Config) 
 		_ = healthListener.Close()
 		return fmt.Errorf("connector hub: construct UDP worker: %w", err)
 	}
+	metricsStop := make(chan struct{})
+	metricsDone := make(chan struct{})
+	go func() {
+		defer close(metricsDone)
+		observer.exportLoop(metricsStop, publisher)
+	}()
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -113,13 +135,19 @@ func runWithAWSConfig(ctx context.Context, config Config, awsConfig aws.Config) 
 
 	results := make(chan componentResult, 2)
 	go func() { results <- componentResult{name: "udp worker", err: worker.Serve(runCtx)} }()
-	go func() { results <- componentResult{name: "health listener", err: serveHealth(runCtx, healthListener)} }()
+	go func() {
+		results <- componentResult{name: "health listener", err: serveHealth(runCtx, healthListener, publisher)}
+	}()
 
 	first := <-results
 	cancel()
 	_ = healthListener.Close()
 	second := <-results
 	close(closeHealth)
+	// Both producer components have now exited, so no later observation can race
+	// behind the exporter's final drain.
+	close(metricsStop)
+	<-metricsDone
 
 	return joinComponentErrors(first, second)
 }
@@ -157,22 +185,62 @@ func admissibleMode(mode connectorhub.Mode) bool {
 // must restrict this separately configured listener to the NLB health-check
 // path; customers reach only the UDP listener.
 //
-// While the Hub is dark this loop treats only ctx cancellation and net.ErrClosed
-// as clean shutdown and returns any other Accept error, which tears the process
-// down. That is acceptable pre-activation, but the slice that makes this a
-// load-bearing liveness listener must back off and continue on transient
-// net.Error conditions (e.g. EMFILE under fd pressure) so temporary resource
-// pressure cannot become a restart loop.
-func serveHealth(ctx context.Context, listener *net.TCPListener) error {
+// Transient net.Error conditions (including descriptor pressure surfaced as a
+// temporary *net.OpError) retry with capped, cancellation-aware backoff so a
+// short resource-pressure episode cannot turn the private liveness listener
+// into a process restart loop. Permanent errors still fail the component.
+func serveHealth(ctx context.Context, listener healthAccepter, publisher *metrics.Publisher) error {
+	return serveHealthWithBackoff(
+		ctx,
+		listener,
+		publisher,
+		healthAcceptInitialBackoff,
+		healthAcceptMaxBackoff,
+	)
+}
+
+func serveHealthWithBackoff(
+	ctx context.Context,
+	listener healthAccepter,
+	publisher *metrics.Publisher,
+	initialBackoff time.Duration,
+	maxBackoff time.Duration,
+) error {
+	backoff := initialBackoff
 	for {
-		conn, err := listener.AcceptTCP()
+		conn, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			var netErr net.Error
+			// Temporary is deprecated but deliberate: syscall.Errno uses it for
+			// EMFILE/ENFILE, and net has no replacement that preserves that
+			// accept-pressure classification. Timeout also covers a future listener
+			// deadline without changing permanent-error fail-fast behavior.
+			if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+				publisher.IncrCounter(metricHubHealthAcceptRetry)
+				if !waitForHealthRetry(ctx, backoff) {
+					return nil
+				}
+				backoff = min(backoff*2, maxBackoff)
+				continue
+			}
 			return err
 		}
 		_ = conn.Close()
+		backoff = initialBackoff
+	}
+}
+
+func waitForHealthRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 

@@ -274,7 +274,15 @@ func NewPublisher(cfg Config) *Publisher {
 		log.Warning("CloudWatch metrics disabled: %v", err)
 		return nil
 	}
+	return NewPublisherWithAWSConfig(cfg, awsCfg)
+}
 
+// NewPublisherWithAWSConfig creates a CloudWatch metrics publisher from an
+// already-loaded AWS configuration. Use it when the owning process has already
+// loaded and validated its ambient AWS identity so metrics share the same
+// region, credentials, and endpoint configuration instead of performing a
+// second independent config load.
+func NewPublisherWithAWSConfig(cfg Config, awsCfg aws.Config) *Publisher {
 	cpInterval := cfg.CheckpointInterval
 	cpDir := cfg.CheckpointDir
 	if cpDir != "" {

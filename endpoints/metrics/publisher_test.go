@@ -38,6 +38,25 @@ func TestNewPublisher_AWSUnavailable(t *testing.T) {
 	}
 }
 
+func TestNewPublisherWithAWSConfigDoesNotReloadAmbientConfig(t *testing.T) {
+	original := loadAWSConfig
+	loadCalls := 0
+	loadAWSConfig = func(context.Context, ...func(*awsconfig.LoadOptions) error) (aws.Config, error) {
+		loadCalls++
+		return aws.Config{}, errors.New("ambient config must not be loaded")
+	}
+	defer func() { loadAWSConfig = original }()
+
+	publisher := NewPublisherWithAWSConfig(Config{Namespace: "Test"}, aws.Config{Region: "us-east-2"})
+	if publisher == nil {
+		t.Fatal("NewPublisherWithAWSConfig returned nil")
+	}
+	publisher.Stop()
+	if loadCalls != 0 {
+		t.Fatalf("ambient AWS config load calls = %d, want 0", loadCalls)
+	}
+}
+
 func TestPublisher_NilSafety(t *testing.T) {
 	var mp *Publisher
 

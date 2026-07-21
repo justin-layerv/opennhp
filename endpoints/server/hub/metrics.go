@@ -2,8 +2,26 @@ package hub
 
 import (
 	"sync/atomic"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	cloudwatchtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
+
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorhub"
+)
+
+const (
+	hubMetricsDrainInterval = 5 * time.Second
+
+	metricHubWorkerOutcome          = "HubWorkerOutcome"
+	metricHubHandlerClassification  = "HubHandlerClassification"
+	metricHubRequestRejection       = "HubRequestRejection"
+	metricHubUnknownLabel           = "HubUnknownLabel"
+	metricHubChallengeObservation   = "HubChallengeObservation"
+	metricHubChallengeRequestBytes  = "HubChallengeRequestBytes"
+	metricHubChallengeResponseBytes = "HubChallengeResponseBytes"
+	metricHubHealthAcceptRetry      = "HubHealthAcceptRetry"
 )
 
 // workerMetrics is the process's concrete connectorhub.WorkerObserver. Without
@@ -84,6 +102,93 @@ func newWorkerMetrics() *workerMetrics {
 			connectorhub.RequestRejectionBodySize,
 			connectorhub.RequestRejectionEnvironment,
 		}),
+	}
+}
+
+// newHubMetricsPublisher uses the process's already-loaded AWS configuration,
+// so the Hub's authority client and monitoring path share one region and
+// credential identity. The Hub is environment-global rather than cell-local,
+// so its base dimension is Environment only.
+func newHubMetricsPublisher(environment string, awsConfig aws.Config) *metrics.Publisher {
+	// No checkpoint directory is configured intentionally. Hub metrics are
+	// best-effort operational counters, the runtime image has no persistent
+	// writable state, and absence-of-metric alarms cover a dead publication
+	// path. Graceful shutdown still drains the observer and flushes the
+	// publisher; SIGKILL can lose the current in-memory interval.
+	return metrics.NewPublisherWithAWSConfig(metrics.Config{
+		Namespace: "LayerV/NHP",
+		Dimensions: []cloudwatchtypes.Dimension{{
+			Name:  aws.String("Environment"),
+			Value: aws.String(environment),
+		}},
+	}, awsConfig)
+}
+
+// exportLoop periodically transfers the lock-free packet-path counters into the
+// shared CloudWatch publisher. The stop path performs one final drain after the
+// UDP worker has exited, so observations made between the last tick and process
+// shutdown are not stranded in the atomics.
+func (m *workerMetrics) exportLoop(stop <-chan struct{}, publisher *metrics.Publisher) {
+	ticker := time.NewTicker(hubMetricsDrainInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			m.drainTo(publisher)
+		case <-stop:
+			m.drainTo(publisher)
+			return
+		}
+	}
+}
+
+// drainTo swaps only the fixed counters allocated by newWorkerMetrics. It runs
+// off the public packet path, so the Publisher's mutex and small dimension
+// allocations can never delay UDP workers. A nil publisher leaves the atomics
+// intact instead of silently consuming observations with nowhere to send them.
+func (m *workerMetrics) drainTo(publisher *metrics.Publisher) {
+	if publisher == nil {
+		return
+	}
+	for outcome, counter := range m.outcomes {
+		addClosedCounter(publisher, metricHubWorkerOutcome, "Outcome", string(outcome), counter)
+	}
+	for classification, counter := range m.classifications {
+		addClosedCounter(publisher, metricHubHandlerClassification, "Classification", string(classification), counter)
+	}
+	for rejection, counter := range m.rejections {
+		addClosedCounter(publisher, metricHubRequestRejection, "Rejection", string(rejection), counter)
+	}
+	addAtomicCounter(publisher, metricHubUnknownLabel, m.unknown.Swap(0))
+	// These three swaps intentionally remain independent to keep the public
+	// observer lock-free. A concurrent challenge can straddle adjacent drain
+	// windows, but every observation and byte is conserved; dashboards must use
+	// sums over publisher intervals rather than infer an exact per-drain average.
+	addAtomicCounter(publisher, metricHubChallengeObservation, m.challengeObservations.Swap(0))
+	addAtomicCounter(publisher, metricHubChallengeRequestBytes, m.challengeRequestBytes.Swap(0))
+	addAtomicCounter(publisher, metricHubChallengeResponseBytes, m.challengeResponseBytes.Swap(0))
+}
+
+func addClosedCounter(
+	publisher *metrics.Publisher,
+	metricName string,
+	dimensionName string,
+	dimensionValue string,
+	counter *atomic.Uint64,
+) {
+	value := counter.Swap(0)
+	if value == 0 {
+		return
+	}
+	publisher.AddCounterWithDims(metricName, float64(value), []cloudwatchtypes.Dimension{{
+		Name:  aws.String(dimensionName),
+		Value: aws.String(dimensionValue),
+	}})
+}
+
+func addAtomicCounter(publisher *metrics.Publisher, metricName string, value uint64) {
+	if value != 0 {
+		publisher.AddCounterWithDims(metricName, float64(value), nil)
 	}
 }
 
