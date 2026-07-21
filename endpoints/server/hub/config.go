@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"time"
 
 	conformance "github.com/layervai/qurl-conformance"
 	"github.com/pelletier/go-toml/v2"
@@ -41,11 +42,21 @@ type Config struct {
 	IssueAssignmentAliasARN         string `toml:"issue_assignment_alias_arn"`
 	RefreshAssignmentAliasARN       string `toml:"refresh_assignment_alias_arn"`
 	IssueCredentialRecoveryAliasARN string `toml:"issue_credential_recovery_alias_arn"`
-	MaxConcurrentPackets            int    `toml:"max_concurrent_packets"`
-	PacketsPerSecond                int    `toml:"packets_per_second"`
-	PacketBurst                     int    `toml:"packet_burst"`
-	MaxConcurrentPerPeer            int    `toml:"max_concurrent_per_peer"`
-	ResponseQueueCapacity           int    `toml:"response_queue_capacity"`
+
+	// Timing values use explicit Go duration strings. The Lambda value must still
+	// resolve to integral seconds so Terraform can derive it from the same integer
+	// that configures the three Authority functions.
+	AuthorityLambdaTimeout string `toml:"authority_lambda_timeout"`
+	HandlerBudget          string `toml:"handler_budget"`
+	PacketBudget           string `toml:"packet_budget"`
+	ResponseReserve        string `toml:"response_reserve"`
+	WriteBudget            string `toml:"write_budget"`
+
+	MaxConcurrentPackets  int `toml:"max_concurrent_packets"`
+	PacketsPerSecond      int `toml:"packets_per_second"`
+	PacketBurst           int `toml:"packet_burst"`
+	MaxConcurrentPerPeer  int `toml:"max_concurrent_per_peer"`
+	ResponseQueueCapacity int `toml:"response_queue_capacity"`
 }
 
 // LoadConfig reads one bounded, strict TOML document. Key material is never
@@ -74,40 +85,45 @@ func LoadConfig(path string) (Config, error) {
 		// key values out of startup logs by returning only the closed error.
 		return Config{}, ErrInvalidConfig
 	}
-	if _, _, err := config.validate(); err != nil {
+	if _, _, _, err := config.validate(); err != nil {
 		return Config{}, err
 	}
 	return config, nil
 }
 
-// validate parses the two listen addresses and enforces every field bound,
-// returning the parsed UDP and health AddrPorts. It is intentionally idempotent
-// and cheap, and each process entrypoint re-runs it: LoadConfig validates freshly
-// parsed TOML, Run guards its public API against a hand-built Config that never
-// went through LoadConfig, and runWithAWSConfig re-validates at the directly
-// testable seam while reusing the returned addrs. None of the three calls is
+// validate parses the two listen addresses and timing ladder and enforces every
+// field bound, returning the parsed UDP/health AddrPorts and worker timing. It is
+// intentionally idempotent and cheap, and each process entrypoint re-runs it:
+// LoadConfig validates freshly parsed TOML, Run guards its public API against a
+// hand-built Config that never went through LoadConfig, and runWithAWSConfig
+// re-validates at the directly testable seam while reusing the returned values.
+// None of the three calls is
 // therefore dead code. Every failure path returns the closed ErrInvalidConfig
 // sentinel so no parse diagnostic or field value can reach a startup log.
-func (c Config) validate() (netip.AddrPort, netip.AddrPort, error) {
+func (c Config) validate() (netip.AddrPort, netip.AddrPort, connectorhub.WorkerTiming, error) {
 	udpAddr, err := parseListenAddr(c.UDPListenAddr)
 	if err != nil {
-		return netip.AddrPort{}, netip.AddrPort{}, ErrInvalidConfig
+		return netip.AddrPort{}, netip.AddrPort{}, connectorhub.WorkerTiming{}, ErrInvalidConfig
 	}
 	healthAddr, err := parseListenAddr(c.HealthListenAddr)
 	if err != nil {
-		return netip.AddrPort{}, netip.AddrPort{}, ErrInvalidConfig
+		return netip.AddrPort{}, netip.AddrPort{}, connectorhub.WorkerTiming{}, ErrInvalidConfig
 	}
 	if !validEnvironment(c.Environment) || !cleanNonempty(c.AWSRegion) ||
 		c.MaxConcurrentPackets <= 0 || c.PacketsPerSecond <= 0 || c.PacketBurst <= 0 ||
 		c.MaxConcurrentPerPeer <= 0 || c.ResponseQueueCapacity <= 0 {
-		return netip.AddrPort{}, netip.AddrPort{}, ErrInvalidConfig
+		return netip.AddrPort{}, netip.AddrPort{}, connectorhub.WorkerTiming{}, ErrInvalidConfig
+	}
+	timing, err := c.workerTiming()
+	if err != nil {
+		return netip.AddrPort{}, netip.AddrPort{}, connectorhub.WorkerTiming{}, ErrInvalidConfig
 	}
 	if err := connectorhub.ValidateWorkerKeyMaterial(
 		c.PrivateKeyBase64,
 		c.ActiveCookieKeyBase64,
 		c.PreviousCookieKeyBase64,
 	); err != nil {
-		return netip.AddrPort{}, netip.AddrPort{}, ErrInvalidConfig
+		return netip.AddrPort{}, netip.AddrPort{}, connectorhub.WorkerTiming{}, ErrInvalidConfig
 	}
 	if err := connectorauthority.ValidateHubTargets(
 		connectorauthority.Boundary{AccountID: c.AWSAccountID, Region: c.AWSRegion},
@@ -117,9 +133,55 @@ func (c Config) validate() (netip.AddrPort, netip.AddrPort, error) {
 			IssueCredentialRecoveryAliasARN: c.IssueCredentialRecoveryAliasARN,
 		},
 	); err != nil {
-		return netip.AddrPort{}, netip.AddrPort{}, ErrInvalidConfig
+		return netip.AddrPort{}, netip.AddrPort{}, connectorhub.WorkerTiming{}, ErrInvalidConfig
 	}
-	return udpAddr, healthAddr, nil
+	return udpAddr, healthAddr, timing, nil
+}
+
+func (c Config) workerTiming() (connectorhub.WorkerTiming, error) {
+	parse := func(value string) (time.Duration, error) {
+		if !cleanNonempty(value) {
+			return 0, ErrInvalidConfig
+		}
+		duration, err := time.ParseDuration(value)
+		if err != nil {
+			return 0, ErrInvalidConfig
+		}
+		return duration, nil
+	}
+
+	lambdaTimeout, err := parse(c.AuthorityLambdaTimeout)
+	if err != nil {
+		return connectorhub.WorkerTiming{}, err
+	}
+	handlerBudget, err := parse(c.HandlerBudget)
+	if err != nil {
+		return connectorhub.WorkerTiming{}, err
+	}
+	packetBudget, err := parse(c.PacketBudget)
+	if err != nil {
+		return connectorhub.WorkerTiming{}, err
+	}
+	responseReserve, err := parse(c.ResponseReserve)
+	if err != nil {
+		return connectorhub.WorkerTiming{}, err
+	}
+	writeBudget, err := parse(c.WriteBudget)
+	if err != nil {
+		return connectorhub.WorkerTiming{}, err
+	}
+
+	timing := connectorhub.WorkerTiming{
+		AuthorityLambdaTimeout: lambdaTimeout,
+		HandlerBudget:          handlerBudget,
+		PacketBudget:           packetBudget,
+		ResponseReserve:        responseReserve,
+		WriteBudget:            writeBudget,
+	}
+	if err := connectorhub.ValidateWorkerTiming(timing); err != nil {
+		return connectorhub.WorkerTiming{}, ErrInvalidConfig
+	}
+	return timing, nil
 }
 
 func validEnvironment(value string) bool {

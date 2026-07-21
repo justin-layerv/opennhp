@@ -42,7 +42,7 @@ func Run(ctx context.Context, config Config) error {
 	}
 	// Re-validate: Run is a public entrypoint, so a caller may hand-build a
 	// Config that never passed through LoadConfig. See Config.validate.
-	if _, _, err := config.validate(); err != nil {
+	if _, _, _, err := config.validate(); err != nil {
 		return err
 	}
 	awsConfig, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(config.AWSRegion))
@@ -65,7 +65,7 @@ func runWithAWSConfig(ctx context.Context, config Config, awsConfig aws.Config, 
 	}
 	// Re-validate and capture the parsed listen addresses: runWithAWSConfig is a
 	// directly testable seam callers may invoke without Run. See Config.validate.
-	udpAddr, healthAddr, err := config.validate()
+	udpAddr, healthAddr, timing, err := config.validate()
 	if err != nil {
 		return err
 	}
@@ -108,6 +108,7 @@ func runWithAWSConfig(ctx context.Context, config Config, awsConfig aws.Config, 
 		PacketBurst:             config.PacketBurst,
 		MaxConcurrentPerPeer:    config.MaxConcurrentPerPeer,
 		ResponseQueueCapacity:   config.ResponseQueueCapacity,
+		Timing:                  timing,
 	})
 	if err != nil {
 		_ = udpConn.Close()

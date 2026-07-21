@@ -18,6 +18,18 @@ issue_assignment_alias_arn = "<required-issue-assignment-active-alias-arn>"
 refresh_assignment_alias_arn = "<required-refresh-assignment-active-alias-arn>"
 issue_credential_recovery_alias_arn = "<required-issue-credential-recovery-active-alias-arn>"
 
+# Required receipt-anchored measurement/ready ladder. Deployment renders these
+# from one reviewed runtime contract; this source file intentionally contains no
+# experimental or final values.
+# Validation requires 3s <= authority_lambda_timeout < handler_budget <
+# packet_budget < 30s and 0 < write_budget <= response_reserve <=
+# packet_budget - handler_budget.
+authority_lambda_timeout = "<required-integral-seconds-duration>"
+handler_budget = "<required-duration>"
+packet_budget = "<required-duration>"
+response_reserve = "<required-duration>"
+write_budget = "<required-duration>"
+
 max_concurrent_packets = 64
 packets_per_second = 128
 packet_burst = 256

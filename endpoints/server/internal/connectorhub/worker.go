@@ -17,15 +17,15 @@ import (
 )
 
 const (
-	// hubWorkerRequestBudget is anchored when the UDP datagram is read. It
-	// includes admission, authentication, application handling, and response
-	// encryption; the Authority adapter performs no internal retry.
-	hubWorkerRequestBudget = 2500 * time.Millisecond
-	// hubWorkerResponseReserve requires Authority invocation and public result
-	// mapping to finish before the final Noise-sealing, queueing, and UDP-write
-	// window.
-	hubWorkerResponseReserve = 100 * time.Millisecond
-	hubWorkerWriteBudget     = 250 * time.Millisecond
+	// minAuthorityLambdaTimeout is the smallest integral Lambda timeout capable
+	// of containing the Authority runtime's two-second operation budget plus its
+	// separate telemetry and final-response reserves. It is a structural floor,
+	// not a proposed deployment value.
+	minAuthorityLambdaTimeout = 3 * time.Second
+	// maxWorkerPacketBudgetExclusive prevents the server's own packet budget from
+	// reaching qurl-go's 30-second logical transaction ceiling. The final value
+	// and the public-network margins below that ceiling are measurement-owned.
+	maxWorkerPacketBudgetExclusive = 30 * time.Second
 )
 
 var (
@@ -47,6 +47,22 @@ type WorkerConfig struct {
 	PacketBurst           int
 	MaxConcurrentPerPeer  int
 	ResponseQueueCapacity int
+	Timing                WorkerTiming
+}
+
+// WorkerTiming is the complete receipt-anchored Hub deadline ladder. Every
+// value is required; there are deliberately no source defaults because the
+// sandbox measurement phase must distinguish experimental ceilings from the
+// later evidence-backed ready values.
+type WorkerTiming struct {
+	AuthorityLambdaTimeout time.Duration
+	HandlerBudget          time.Duration
+	PacketBudget           time.Duration
+	// ResponseReserve is the minimum receipt-anchored tail left after Handler;
+	// WriteBudget must fit inside it, while the packet deadline remains the
+	// absolute cap when pre-write work consumes part of that tail.
+	ResponseReserve time.Duration
+	WriteBudget     time.Duration
 }
 
 type workerKeyMaterial struct {
@@ -85,6 +101,10 @@ type Worker struct {
 	replay    *packetReplayCache
 	writes    chan outboundDatagram
 
+	packetBudget  time.Duration
+	handlerBudget time.Duration
+	writeBudget   time.Duration
+
 	packetPool sync.Pool
 	workers    sync.WaitGroup
 	writer     sync.WaitGroup
@@ -97,7 +117,8 @@ func NewWorker(conn *net.UDPConn, config WorkerConfig) (*Worker, error) {
 		config.MaxConcurrentPackets <= 0 || config.PacketsPerSecond <= 0 || config.PacketBurst <= 0 ||
 		config.MaxConcurrentPackets > core.RecvQueueSize ||
 		config.MaxConcurrentPerPeer <= 0 || config.MaxConcurrentPerPeer > config.MaxConcurrentPackets ||
-		config.ResponseQueueCapacity <= 0 || config.ResponseQueueCapacity > core.SendQueueSize {
+		config.ResponseQueueCapacity <= 0 || config.ResponseQueueCapacity > core.SendQueueSize ||
+		ValidateWorkerTiming(config.Timing) != nil {
 		return nil, ErrInvalidWorkerConfiguration
 	}
 	// The derived replay ceiling below is also the direct upper bound for
@@ -134,17 +155,41 @@ func NewWorker(conn *net.UDPConn, config WorkerConfig) (*Worker, error) {
 		observer = noopWorkerObserver{}
 	}
 	worker := &Worker{
-		conn:      conn,
-		device:    device,
-		handler:   config.Handler,
-		observer:  observer,
-		aggregate: newAggregateAdmission(config.MaxConcurrentPackets, config.PacketsPerSecond, config.PacketBurst, time.Now()),
-		peers:     newPeerAdmission(config.MaxConcurrentPerPeer),
-		replay:    newPacketReplayCache(replayCapacity),
-		writes:    make(chan outboundDatagram, config.ResponseQueueCapacity),
+		conn:          conn,
+		device:        device,
+		handler:       config.Handler,
+		observer:      observer,
+		aggregate:     newAggregateAdmission(config.MaxConcurrentPackets, config.PacketsPerSecond, config.PacketBurst, time.Now()),
+		peers:         newPeerAdmission(config.MaxConcurrentPerPeer),
+		replay:        newPacketReplayCache(replayCapacity),
+		writes:        make(chan outboundDatagram, config.ResponseQueueCapacity),
+		packetBudget:  config.Timing.PacketBudget,
+		handlerBudget: config.Timing.HandlerBudget,
+		writeBudget:   config.Timing.WriteBudget,
 	}
 	worker.packetPool.New = func() any { return make([]byte, core.PacketBufferSize) }
 	return worker, nil
+}
+
+// ValidateWorkerTiming applies the same no-default deadline contract as
+// NewWorker without claiming a socket or retaining any other worker state.
+func ValidateWorkerTiming(timing WorkerTiming) error {
+	if timing.AuthorityLambdaTimeout < minAuthorityLambdaTimeout || timing.AuthorityLambdaTimeout%time.Second != 0 ||
+		timing.HandlerBudget <= 0 || timing.PacketBudget <= 0 || timing.ResponseReserve <= 0 ||
+		timing.WriteBudget <= 0 || timing.PacketBudget >= maxWorkerPacketBudgetExclusive ||
+		timing.AuthorityLambdaTimeout >= timing.HandlerBudget ||
+		timing.HandlerBudget >= timing.PacketBudget {
+		return ErrInvalidWorkerConfiguration
+	}
+	// ResponseReserve declares the minimum tail the chosen HandlerBudget must
+	// leave; HandlerBudget drives the runtime deadline directly. WriteBudget must
+	// fit inside that declared tail, and the packet deadline remains the absolute
+	// runtime cap when pre-write work consumes some of it.
+	responseTail := timing.PacketBudget - timing.HandlerBudget
+	if timing.ResponseReserve > responseTail || timing.WriteBudget > timing.ResponseReserve {
+		return ErrInvalidWorkerConfiguration
+	}
+	return nil
 }
 
 // deriveReplayCapacity prevents capacity eviction from becoming a replay
@@ -328,7 +373,7 @@ func (w *Worker) handlePacket(parent context.Context, receivedAt time.Time, remo
 		w.packetPool.Put(packet[:core.PacketBufferSize])
 	}()
 
-	deadline := receivedAt.Add(hubWorkerRequestBudget)
+	deadline := receivedAt.Add(w.packetBudget)
 	if parent.Err() != nil || !deadline.After(time.Now()) {
 		w.observer.ObserveWorkerOutcome(WorkerOutcomeDeadlineRejected)
 		return
@@ -392,7 +437,7 @@ func (w *Worker) handlePacket(parent context.Context, receivedAt time.Time, remo
 	}
 	defer releasePeer()
 
-	handlerDeadline := deadline.Add(-hubWorkerResponseReserve)
+	handlerDeadline := receivedAt.Add(w.handlerBudget)
 	if !handlerDeadline.After(time.Now()) {
 		w.observer.ObserveWorkerOutcome(WorkerOutcomeDeadlineRejected)
 		return
@@ -502,7 +547,7 @@ func (w *Worker) writeResponses() {
 	defer w.writer.Done()
 	// A single writer makes UDP socket ownership and payload wiping linear. One
 	// kernel-blocked write can delay later datagrams, but that head-of-line cost
-	// is intentionally capped by hubWorkerWriteBudget, each request's receipt
+	// is intentionally capped by the configured write budget, each request's receipt
 	// deadline, and the bounded nonblocking queue.
 	for response := range w.writes {
 		now := time.Now()
@@ -511,10 +556,7 @@ func (w *Worker) writeResponses() {
 			clear(response.payload)
 			continue
 		}
-		writeDeadline := now.Add(hubWorkerWriteBudget)
-		if response.deadline.Before(writeDeadline) {
-			writeDeadline = response.deadline
-		}
+		writeDeadline := responseWriteDeadline(now, response.deadline, w.writeBudget)
 		if err := w.conn.SetWriteDeadline(writeDeadline); err != nil {
 			w.observer.ObserveWorkerOutcome(WorkerOutcomeWriteFailed)
 			clear(response.payload)
@@ -533,6 +575,14 @@ func (w *Worker) writeResponses() {
 		}
 		clear(response.payload)
 	}
+}
+
+func responseWriteDeadline(now, requestDeadline time.Time, writeBudget time.Duration) time.Time {
+	writeDeadline := now.Add(writeBudget)
+	if requestDeadline.Before(writeDeadline) {
+		return requestDeadline
+	}
+	return writeDeadline
 }
 
 func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {

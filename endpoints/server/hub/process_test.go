@@ -389,6 +389,11 @@ func TestRecoveryRoundTripThroughComposedHub(t *testing.T) {
 		t.Fatalf("ListenUDP(server): %v", err)
 	}
 	observer := newWorkerMetrics()
+	timing, err := base.workerTiming()
+	if err != nil {
+		_ = serverConn.Close()
+		t.Fatalf("workerTiming: %v", err)
+	}
 	worker, err := connectorhub.NewWorker(serverConn, connectorhub.WorkerConfig{
 		PrivateKeyBase64:      base.PrivateKeyBase64,
 		ActiveCookieKeyBase64: base.ActiveCookieKeyBase64,
@@ -399,6 +404,7 @@ func TestRecoveryRoundTripThroughComposedHub(t *testing.T) {
 		PacketBurst:           100,
 		MaxConcurrentPerPeer:  2,
 		ResponseQueueCapacity: 8,
+		Timing:                timing,
 	})
 	if err != nil {
 		_ = serverConn.Close()

@@ -165,6 +165,16 @@ type workerTestAuthority interface {
 	callCounts() (issue, refresh int)
 }
 
+func testWorkerTiming() WorkerTiming {
+	return WorkerTiming{
+		AuthorityLambdaTimeout: 3 * time.Second,
+		HandlerBudget:          3100 * time.Millisecond,
+		PacketBudget:           3500 * time.Millisecond,
+		ResponseReserve:        400 * time.Millisecond,
+		WriteBudget:            173 * time.Millisecond,
+	}
+}
+
 func newWorkerFixture(t *testing.T) *workerFixture {
 	t.Helper()
 	authorityContract := authorityVectors(t)
@@ -202,6 +212,7 @@ func newWorkerFixtureConfigured(t *testing.T, authority workerTestAuthority, con
 		PacketBurst:           100,
 		MaxConcurrentPerPeer:  2,
 		ResponseQueueCapacity: 8,
+		Timing:                testWorkerTiming(),
 	}
 	if configure != nil {
 		configure(&config)
@@ -551,6 +562,7 @@ func TestNewWorkerRejectsInvalidConfiguration(t *testing.T) {
 		PacketBurst:           1,
 		MaxConcurrentPerPeer:  1,
 		ResponseQueueCapacity: 1,
+		Timing:                testWorkerTiming(),
 	}
 	tests := []struct {
 		name   string
@@ -586,6 +598,31 @@ func TestNewWorkerRejectsInvalidConfiguration(t *testing.T) {
 		}},
 		{name: "replay capacity exceeds core packet pool", mutate: func(c *WorkerConfig) {
 			c.PacketsPerSecond = core.PacketBufferPoolSize/int(hubWorkerReplayTTL/time.Second) + 1
+		}},
+		{name: "timing omitted", mutate: func(c *WorkerConfig) { c.Timing = WorkerTiming{} }},
+		{name: "lambda timeout fractional", mutate: func(c *WorkerConfig) {
+			c.Timing.AuthorityLambdaTimeout = 3001 * time.Millisecond
+		}},
+		{name: "lambda timeout below floor", mutate: func(c *WorkerConfig) {
+			c.Timing.AuthorityLambdaTimeout = 2 * time.Second
+		}},
+		{name: "lambda timeout reaches handler", mutate: func(c *WorkerConfig) {
+			c.Timing.AuthorityLambdaTimeout = c.Timing.HandlerBudget
+		}},
+		{name: "handler reaches packet", mutate: func(c *WorkerConfig) {
+			c.Timing.HandlerBudget = c.Timing.PacketBudget
+		}},
+		{name: "response reserve exceeds tail", mutate: func(c *WorkerConfig) {
+			c.Timing.ResponseReserve = c.Timing.PacketBudget - c.Timing.HandlerBudget + time.Millisecond
+		}},
+		{name: "write exceeds response reserve", mutate: func(c *WorkerConfig) {
+			c.Timing.WriteBudget = c.Timing.ResponseReserve + time.Millisecond
+		}},
+		{name: "packet reaches safety ceiling", mutate: func(c *WorkerConfig) {
+			c.Timing.PacketBudget = maxWorkerPacketBudgetExclusive
+		}},
+		{name: "negative handler", mutate: func(c *WorkerConfig) {
+			c.Timing.HandlerBudget = -time.Millisecond
 		}},
 	}
 	for _, test := range tests {
@@ -748,12 +785,42 @@ func TestWorkerClassifiesHandlerDropInvalidResponseAndQueueFull(t *testing.T) {
 	clear(queued.payload)
 }
 
+func TestValidateWorkerTimingAcceptsInclusiveReserveBoundaries(t *testing.T) {
+	timing := WorkerTiming{
+		AuthorityLambdaTimeout: 3 * time.Second,
+		HandlerBudget:          3100 * time.Millisecond,
+		PacketBudget:           3500 * time.Millisecond,
+		ResponseReserve:        400 * time.Millisecond,
+		WriteBudget:            400 * time.Millisecond,
+	}
+	if err := ValidateWorkerTiming(timing); err != nil {
+		t.Fatalf("ValidateWorkerTiming equality boundaries: %v", err)
+	}
+}
+
 func TestWorkerDropsPacketWhoseReceiptBudgetAlreadyExpired(t *testing.T) {
-	f := newWorkerFixture(t)
+	timing := WorkerTiming{
+		AuthorityLambdaTimeout: 3 * time.Second,
+		HandlerBudget:          3200 * time.Millisecond,
+		PacketBudget:           3900 * time.Millisecond,
+		ResponseReserve:        700 * time.Millisecond,
+		WriteBudget:            137 * time.Millisecond,
+	}
+	authorityContract := authorityVectors(t)
+	authority := &fakeHubAuthority{
+		refreshResponse: []byte(authorityContract.Operations[conformance.ConnectorAuthorityOperationRefreshAssignment].SuccessGolden.BodyJSON),
+	}
+	f := newWorkerFixtureConfigured(t, authority, func(config *WorkerConfig) { config.Timing = timing })
+	if f.worker.packetBudget != timing.PacketBudget || f.worker.handlerBudget != timing.HandlerBudget ||
+		f.worker.writeBudget != timing.WriteBudget {
+		t.Fatalf("worker timing = %v/%v/%v, want %v/%v/%v",
+			f.worker.packetBudget, f.worker.handlerBudget, f.worker.writeBudget,
+			timing.PacketBudget, timing.HandlerBudget, timing.WriteBudget)
+	}
 	packet := make([]byte, core.PacketBufferSize)
 	released := false
 	f.worker.workers.Add(1)
-	f.worker.handlePacket(context.Background(), time.Now().Add(-hubWorkerRequestBudget-time.Millisecond),
+	f.worker.handlePacket(context.Background(), time.Now().Add(-timing.PacketBudget-time.Millisecond),
 		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, packet, func() { released = true })
 	if !released {
 		t.Fatal("aggregate admission was not released")
@@ -767,21 +834,28 @@ func TestWorkerDropsPacketWhoseReceiptBudgetAlreadyExpired(t *testing.T) {
 	}
 }
 
-func TestWorkerStopsAuthorityAtResponseReserveDeadline(t *testing.T) {
+func TestWorkerStopsAuthorityAtConfiguredHandlerDeadline(t *testing.T) {
 	authority := &deadlineWorkerAuthority{deadlines: make(chan time.Time, 1)}
-	f := newWorkerFixtureWithAuthority(t, authority)
+	timing := WorkerTiming{
+		AuthorityLambdaTimeout: 3 * time.Second,
+		HandlerBudget:          3150 * time.Millisecond,
+		PacketBudget:           3800 * time.Millisecond,
+		ResponseReserve:        650 * time.Millisecond,
+		WriteBudget:            149 * time.Millisecond,
+	}
+	f := newWorkerFixtureConfigured(t, authority, func(config *WorkerConfig) { config.Timing = timing })
 	cookie, _ := f.challenge(t, 401)
 	proof := f.sealLST(t, 402, &cookie)
 	clear(cookie[:])
 	packet := make([]byte, core.PacketBufferSize)
 	packet = packet[:copy(packet, proof)]
-	receivedAt := time.Now().Add(-(hubWorkerRequestBudget - hubWorkerResponseReserve) + 40*time.Millisecond)
+	receivedAt := time.Now().Add(-timing.HandlerBudget + 40*time.Millisecond)
 	f.worker.workers.Add(1)
 	f.worker.handlePacket(context.Background(), receivedAt, cloneUDPAddr(f.client.LocalAddr().(*net.UDPAddr)), packet, func() {})
 
 	select {
 	case got := <-authority.deadlines:
-		want := receivedAt.Add(hubWorkerRequestBudget - hubWorkerResponseReserve)
+		want := receivedAt.Add(timing.HandlerBudget)
 		if !got.Equal(want) {
 			t.Fatalf("authority deadline = %v, want %v", got, want)
 		}
@@ -831,5 +905,35 @@ func TestWorkerWriterDropsQueuedResponseAfterReceiptBudget(t *testing.T) {
 	buffer := make([]byte, 32)
 	if _, _, err := f.client.ReadFromUDP(buffer); err == nil {
 		t.Fatal("writer sent an expired response")
+	}
+}
+
+func TestResponseWriteDeadlineUsesEarlierConfiguredOrReceiptBound(t *testing.T) {
+	now := time.Unix(100, 0)
+	writeBudget := 137 * time.Millisecond
+	for _, test := range []struct {
+		name            string
+		requestDeadline time.Time
+		writeBudget     time.Duration
+		want            time.Time
+	}{
+		{
+			name:            "configured write cap",
+			requestDeadline: now.Add(time.Second),
+			writeBudget:     writeBudget,
+			want:            now.Add(writeBudget),
+		},
+		{
+			name:            "receipt anchored packet deadline",
+			requestDeadline: now.Add(100 * time.Millisecond),
+			writeBudget:     writeBudget,
+			want:            now.Add(100 * time.Millisecond),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := responseWriteDeadline(now, test.requestDeadline, test.writeBudget); !got.Equal(test.want) {
+				t.Fatalf("responseWriteDeadline = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
