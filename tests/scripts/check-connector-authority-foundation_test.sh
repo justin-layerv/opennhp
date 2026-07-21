@@ -67,6 +67,9 @@ NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 printf '%s\n' '{"resource_changes":[{"address":"aws_vpc.control","type":"aws_vpc","change":{"actions":["update"],"after":{"tags":{"Purpose":"dark"}}}}]}' >"$plan_json"
 NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 
+printf '%s\n' '{"resource_drift":[{"address":"aws_iam_role.authority_publisher","type":"aws_iam_role","change":{"actions":["update"],"after":{"inline_policy":[]}}}]}' >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
 printf '%s\n' '{"resource_changes":[{"address":"aws_lambda_function.forbidden","type":"aws_lambda_function","change":{"actions":["create"],"after":{"name":"forbidden"}}}]}' >"$plan_json"
 expect_failure 'plan contains aws_lambda_function' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
@@ -83,7 +86,10 @@ printf '%s\n' '{"resource_changes":[{"address":"aws_route_table.isolated[0]","ty
 expect_failure 'plan contains inline route declarations' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
 printf '%s\n' '{"format_version":"1.2"}' >"$plan_json"
-expect_failure 'must contain a resource_changes array' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+expect_failure 'must contain a resource_changes array or non-empty resource_drift array' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+
+printf '%s\n' '{"resource_changes":null,"resource_drift":[{"address":"aws_iam_role.authority_publisher","type":"aws_iam_role","change":{"actions":["update"]}}]}' >"$plan_json"
+expect_failure 'resource_changes must be an array' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
 printf '%s\n' 'resource "aws_lambda_function" "forbidden" {}' >>"${module_dir}/main.tf"
 expect_failure 'must not declare aws_lambda_function' env NHP_REPO_ROOT="$fixture_root" "$checker"

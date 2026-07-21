@@ -368,6 +368,27 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
+def use_real_refresh_only_shape(candidate: dict) -> None:
+    """Model Terraform 1.14's omission of refresh-only resource_changes."""
+    resources = []
+    for item in candidate.pop("resource_changes"):
+        resources.append(
+            {
+                "address": item["address"],
+                "mode": item["mode"],
+                "type": item["type"],
+                "values": copy.deepcopy(item["change"]["after"]),
+            }
+        )
+    candidate["planned_values"] = {
+        "root_module": {
+            "child_modules": [
+                {"address": "module.control", "resources": resources}
+            ]
+        }
+    }
+
+
 class PlanContractTests(unittest.TestCase):
     def test_real_terraform_1_14_3_noop_status_contract(self) -> None:
         real_noop = json.loads(
@@ -486,6 +507,7 @@ class PlanContractTests(unittest.TestCase):
                 },
             }
         ]
+        use_real_refresh_only_shape(candidate)
 
         summary = CHECKER.check_plan(candidate)
 
@@ -514,6 +536,7 @@ class PlanContractTests(unittest.TestCase):
                     },
                 }
             ]
+            use_real_refresh_only_shape(candidate)
             return candidate
 
         wrong_address = refresh_candidate()
@@ -554,6 +577,14 @@ class PlanContractTests(unittest.TestCase):
         ordinary_plan = refresh_candidate()
         ordinary_plan["applyable"] = False
         self.assert_rejected(ordinary_plan)
+
+        missing_planned_values = refresh_candidate()
+        del missing_planned_values["planned_values"]
+        self.assert_rejected(missing_planned_values)
+
+        malformed_resource_changes = refresh_candidate()
+        malformed_resource_changes["resource_changes"] = None
+        self.assert_rejected(malformed_resource_changes)
 
     def test_publisher_updates_and_malformed_create_fail(self) -> None:
         update = plan_fixture()

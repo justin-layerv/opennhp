@@ -1071,6 +1071,55 @@ def _check_publisher_state_normalization_drift(
     return 1
 
 
+def _plan_resource_changes(
+    plan: dict[str, Any], drift: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return ordinary changes or reconstruct Terraform's refresh-only shape.
+
+    Terraform 1.14 omits ``resource_changes`` when ``-refresh-only`` has no
+    configuration changes. Preserve the same exact-inventory and planned-value
+    checks by representing every managed ``planned_values`` resource as a
+    no-op. The non-empty drift requirement keeps an ordinary malformed plan
+    from reaching this compatibility path.
+    """
+    if "resource_changes" in plan:
+        changes = plan["resource_changes"]
+        if not isinstance(changes, list):
+            raise ContractError("Terraform plan resource_changes must be an array")
+        return changes
+    if not drift:
+        raise ContractError("Terraform plan resource_changes must be an array")
+
+    planned_values = plan.get("planned_values")
+    root = (
+        planned_values.get("root_module")
+        if isinstance(planned_values, dict)
+        else None
+    )
+    resources = [
+        item for item in _iter_resources(root) if item.get("mode") == "managed"
+    ]
+    changes: list[dict[str, Any]] = []
+    for item in resources:
+        values = item.get("values")
+        if not isinstance(values, dict):
+            raise ContractError("Terraform planned resource values are malformed")
+        changes.append(
+            {
+                "address": item.get("address"),
+                "mode": item.get("mode"),
+                "type": item.get("type"),
+                "change": {
+                    "actions": ["no-op"],
+                    "after": values,
+                    "after_unknown": {},
+                    "before": values,
+                },
+            }
+        )
+    return changes
+
+
 def check_plan(plan: Any) -> dict[str, str | int]:
     if not isinstance(plan, dict):
         raise ContractError("Terraform plan must be an object")
@@ -1083,9 +1132,7 @@ def check_plan(plan: Any) -> dict[str, str | int]:
     drift = _non_noop(plan.get("resource_drift"), "resource_drift")
     _check_no_embedded_actions(plan)
 
-    changes = plan.get("resource_changes")
-    if not isinstance(changes, list):
-        raise ContractError("Terraform plan resource_changes must be an array")
+    changes = _plan_resource_changes(plan, drift)
     by_address: dict[str, dict[str, Any]] = {}
     for item in changes:
         if not isinstance(item, dict) or not isinstance(item.get("address"), str):

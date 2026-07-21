@@ -94,13 +94,18 @@ if [[ -n "$plan_json" ]]; then
     echo "ERROR: Connector Authority plan JSON is not readable: ${plan_json}" >&2
     exit 1
   fi
-  if ! jq -e '(.resource_changes | type) == "array"' "$plan_json" >/dev/null; then
-    echo "ERROR: Connector Authority plan JSON must contain a resource_changes array" >&2
+  if jq -e 'has("resource_changes")' "$plan_json" >/dev/null; then
+    if ! jq -e '(.resource_changes | type) == "array"' "$plan_json" >/dev/null; then
+      echo "ERROR: Connector Authority plan JSON resource_changes must be an array" >&2
+      exit 1
+    fi
+  elif ! jq -e '(.resource_drift | type) == "array" and (.resource_drift | length) > 0' "$plan_json" >/dev/null; then
+    echo "ERROR: Connector Authority plan JSON must contain a resource_changes array or non-empty resource_drift array" >&2
     exit 1
   fi
 
   destructive_resources="$(jq -r '
-    .resource_changes[]?
+    (.resource_changes[]?, .resource_drift[]?)
     | select(.change.actions | index("delete"))
     | "\(.address) [\(.change.actions | join(","))]"
   ' "$plan_json")"
@@ -112,7 +117,7 @@ if [[ -n "$plan_json" ]]; then
 
   for resource_type in "${forbidden_resource_types[@]}"; do
     addresses="$(jq -r --arg resource_type "$resource_type" '
-      .resource_changes[]?
+      (.resource_changes[]?, .resource_drift[]?)
       | select(.type == $resource_type and .change.after != null)
       | .address
     ' "$plan_json")"
@@ -128,7 +133,7 @@ if [[ -n "$plan_json" ]]; then
   # lexical source fence above owns that case; plan JSON independently rejects
   # every known non-empty route list.
   inline_route_tables="$(jq -r '
-    .resource_changes[]?
+    (.resource_changes[]?, .resource_drift[]?)
     | select(.type == "aws_route_table" and .change.after != null)
     | select(((.change.after.route? // []) | length) > 0)
     | .address
