@@ -211,13 +211,17 @@ jobs:
           OPERATION: ${{ inputs.operation }}
         run: |
           set -euo pipefail
+          terraform show -json \
+            "$RUNNER_TEMP/control-state-before-plan/state.tfstate" \
+            >"$RUNNER_TEMP/control-state-before-plan/state.json"
           plan_mode=()
           if [[ "$OPERATION" == 'plan-refresh-only' ]]; then
             plan_mode=(-refresh-only)
           fi
           terraform plan "${plan_mode[@]}" -input=false -lock-timeout=5m -no-color -out=tfplan | tee tfplan.txt
           terraform show -json tfplan >tfplan.json
-          ../../../../.github/scripts/check-control-sandbox-first-apply.py plan tfplan.json \
+          ../../../../.github/scripts/check-control-sandbox-first-apply.py plan \
+            tfplan.json "$RUNNER_TEMP/control-state-before-plan/state.json" \
             | tee plan-contract-summary.json
           ../../../../scripts/check-connector-authority-foundation.sh tfplan.json
 
@@ -469,8 +473,13 @@ jobs:
           set -euo pipefail
           artifact="$RUNNER_TEMP/control-plan-artifact"
           terraform show -json "$artifact/tfplan" >"$RUNNER_TEMP/apply-tfplan.json"
+          terraform show -json \
+            "$RUNNER_TEMP/control-state-before-apply/state.tfstate" \
+            >"$RUNNER_TEMP/control-state-before-apply/state.json"
           ../../../../.github/scripts/check-control-sandbox-first-apply.py plan \
-            "$RUNNER_TEMP/apply-tfplan.json" >"$RUNNER_TEMP/apply-contract-summary.json"
+            "$RUNNER_TEMP/apply-tfplan.json" \
+            "$RUNNER_TEMP/control-state-before-apply/state.json" \
+            >"$RUNNER_TEMP/apply-contract-summary.json"
           cmp "$artifact/plan-contract-summary.json" \
             "$RUNNER_TEMP/apply-contract-summary.json" || {
             echo '::error::Saved plan no longer produces the reviewed checker summary.'
@@ -489,6 +498,34 @@ jobs:
           scripts/verify-control-sandbox-live-boundary.sh \
             "$RUNNER_TEMP/apply-tfplan.json" \
             "$RUNNER_TEMP/control-live-before-apply"
+
+      - name: Re-prove exact live refresh observation before apply
+        working-directory: ${{ env.CONTROL_ROOT }}
+        run: |
+          set -euo pipefail
+          artifact="$RUNNER_TEMP/control-plan-artifact"
+          normalization_count="$(jq -er '.normalization_drift_count' \
+            "$artifact/plan-contract-summary.json")"
+          if [[ "$normalization_count" == "0" ]]; then
+            exit 0
+          fi
+          [[ "$normalization_count" == "1" ]] || {
+            echo '::error::Saved plan has an invalid normalization count.'
+            exit 1
+          }
+          terraform plan -refresh-only -input=false -lock-timeout=5m -no-color \
+            -out="$RUNNER_TEMP/live-refresh-plan" >/dev/null
+          terraform show -json "$RUNNER_TEMP/live-refresh-plan" \
+            >"$RUNNER_TEMP/live-refresh-plan.json"
+          ../../../../.github/scripts/check-control-sandbox-first-apply.py plan \
+            "$RUNNER_TEMP/live-refresh-plan.json" \
+            "$RUNNER_TEMP/control-state-before-apply/state.json" \
+            >"$RUNNER_TEMP/live-refresh-contract-summary.json"
+          cmp "$artifact/plan-contract-summary.json" \
+            "$RUNNER_TEMP/live-refresh-contract-summary.json" || {
+            echo '::error::Live refresh observation moved after the reviewed plan.'
+            exit 1
+          }
 
       - name: Re-read live main and consume saved plan immediately before exact apply
         env:

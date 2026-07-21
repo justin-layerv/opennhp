@@ -713,6 +713,38 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("planned-state-summary.json", upload)
         self.assertNotIn("tfplan.json", upload)
         self.assertNotIn("state.tfstate", upload)
+        self.assertNotIn("state.json", upload)
+
+        self.assertIn(
+            '"$RUNNER_TEMP/control-state-before-plan/state.tfstate"', workflow
+        )
+        self.assertIn(
+            'tfplan.json "$RUNNER_TEMP/control-state-before-plan/state.json"',
+            workflow,
+        )
+        self.assertIn(
+            '"$RUNNER_TEMP/control-state-before-apply/state.tfstate"', workflow
+        )
+        self.assertIn(
+            '"$RUNNER_TEMP/control-state-before-apply/state.json"', workflow
+        )
+        live_refresh = workflow.index(
+            "      - name: Re-prove exact live refresh observation before apply"
+        )
+        consume = workflow.index(
+            "      - name: Re-read live main and consume saved plan immediately before exact apply"
+        )
+        self.assertLess(live_boundary, live_refresh)
+        self.assertLess(live_refresh, consume)
+        live_refresh_step = workflow[live_refresh:consume]
+        for marker in (
+            "terraform plan -refresh-only",
+            "live-refresh-plan.json",
+            "control-state-before-apply/state.json",
+            "live-refresh-contract-summary.json",
+            'normalization_count" == "1"',
+        ):
+            self.assertIn(marker, live_refresh_step)
 
         for session_name, capture_marker in (
             ("control-update-plan-${GITHUB_RUN_ID}", "control-state-before-plan"),

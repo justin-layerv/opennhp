@@ -368,8 +368,14 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
-def use_real_refresh_only_shape(candidate: dict) -> None:
-    """Model Terraform 1.14's omission of refresh-only resource_changes."""
+def terraform_1_14_refresh_only_golden(candidate: dict) -> dict:
+    """Build the exact empirically observed Terraform 1.14 plan/state shape.
+
+    The Control values remain the complete synthetic security fixture so every
+    field can be mutated hermetically. The JSON envelope is the real 1.14.3
+    shape: no ``resource_changes``, empty ``planned_values.root_module``, and a
+    separate format-1.0 state containing the unchanged inventory.
+    """
     resources = []
     for item in candidate.pop("resource_changes"):
         resources.append(
@@ -380,12 +386,17 @@ def use_real_refresh_only_shape(candidate: dict) -> None:
                 "values": copy.deepcopy(item["change"]["after"]),
             }
         )
-    candidate["planned_values"] = {
-        "root_module": {
-            "child_modules": [
-                {"address": "module.control", "resources": resources}
-            ]
-        }
+    candidate["planned_values"] = {"root_module": {}}
+    return {
+        "format_version": "1.0",
+        "terraform_version": CHECKER.TF_VERSION,
+        "values": {
+            "root_module": {
+                "child_modules": [
+                    {"address": "module.control", "resources": resources}
+                ]
+            }
+        },
     }
 
 
@@ -499,23 +510,67 @@ class PlanContractTests(unittest.TestCase):
                 "type": "aws_iam_role",
                 "change": {
                     "actions": ["update"],
+                    "after_sensitive": False,
+                    "after_unknown": {},
                     "before": {
                         **copy.deepcopy(role_change["after"]),
                         "inline_policy": [],
                     },
+                    "before_sensitive": False,
                     "after": copy.deepcopy(role_change["after"]),
                 },
             }
         ]
-        use_real_refresh_only_shape(candidate)
+        prior_state = terraform_1_14_refresh_only_golden(candidate)
+        prior_role = next(
+            item
+            for item in prior_state["values"]["root_module"]["child_modules"][0][
+                "resources"
+            ]
+            if item["address"]
+            == "module.control.aws_iam_role.authority_publisher"
+        )
+        prior_role["values"] = copy.deepcopy(
+            candidate["resource_drift"][0]["change"]["before"]
+        )
 
-        summary = CHECKER.check_plan(candidate)
+        summary = CHECKER.check_plan(candidate, prior_state)
 
         self.assertEqual(summary["bootstrap_create_count"], 0)
         self.assertEqual(summary["normalization_drift_count"], 1)
+        self.assertRegex(summary["normalization_drift_sha256"], r"^[0-9a-f]{64}$")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan_path = root / "plan.json"
+            state_path = root / "state.json"
+            write_json(plan_path, candidate)
+            write_json(state_path, prior_state)
+            result = subprocess.run(
+                [str(CHECKER_PATH), "plan", str(plan_path), str(state_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout)["normalization_drift_count"], 1
+            )
+
+            missing_state = subprocess.run(
+                [str(CHECKER_PATH), "plan", str(plan_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_state.returncode, 0)
+            self.assertIn(
+                f"exact Terraform {CHECKER.TF_VERSION} state JSON",
+                missing_state.stderr,
+            )
 
     def test_publisher_refresh_only_normalization_is_exact(self) -> None:
-        def refresh_candidate() -> dict:
+        def refresh_candidate() -> tuple[dict, dict]:
             candidate = plan_fixture()
             candidate["applyable"] = True
             role_change = self.change(
@@ -528,24 +583,44 @@ class PlanContractTests(unittest.TestCase):
                     "type": "aws_iam_role",
                     "change": {
                         "actions": ["update"],
+                        "after_sensitive": False,
+                        "after_unknown": {},
                         "before": {
                             **copy.deepcopy(role_change["after"]),
                             "inline_policy": [],
                         },
+                        "before_sensitive": False,
                         "after": copy.deepcopy(role_change["after"]),
                     },
                 }
             ]
-            use_real_refresh_only_shape(candidate)
-            return candidate
+            prior_state = terraform_1_14_refresh_only_golden(candidate)
+            prior_role = next(
+                item
+                for item in prior_state["values"]["root_module"]["child_modules"][0][
+                    "resources"
+                ]
+                if item["address"]
+                == "module.control.aws_iam_role.authority_publisher"
+            )
+            prior_role["values"] = copy.deepcopy(
+                candidate["resource_drift"][0]["change"]["before"]
+            )
+            return candidate, prior_state
 
-        wrong_address = refresh_candidate()
+        wrong_address, wrong_address_state = refresh_candidate()
         wrong_address["resource_drift"][0]["address"] = (
             "module.control.aws_iam_role.flow_logs"
         )
-        self.assert_rejected(wrong_address)
+        self.assert_rejected(wrong_address, wrong_address_state)
 
-        extra_drift = refresh_candidate()
+        orphan_drift, orphan_drift_state = refresh_candidate()
+        orphan_drift["resource_drift"][0]["address"] = (
+            "module.control.aws_iam_role.missing"
+        )
+        self.assert_rejected(orphan_drift, orphan_drift_state)
+
+        extra_drift, extra_drift_state = refresh_candidate()
         extra_drift["resource_drift"].append(
             {
                 "address": "module.control.aws_vpc.control",
@@ -554,37 +629,105 @@ class PlanContractTests(unittest.TestCase):
                 "change": {"actions": ["update"], "before": {}, "after": {}},
             }
         )
-        self.assert_rejected(extra_drift)
+        self.assert_rejected(extra_drift, extra_drift_state)
 
-        other_field = refresh_candidate()
+        other_field, other_field_state = refresh_candidate()
         other_field["resource_drift"][0]["change"]["before"][
             "max_session_duration"
         ] = 7200
-        self.assert_rejected(other_field)
+        self.assert_rejected(other_field, other_field_state)
 
-        missing_null_field = refresh_candidate()
+        missing_null_field, missing_null_field_state = refresh_candidate()
         del missing_null_field["resource_drift"][0]["change"]["before"][
             "permissions_boundary"
         ]
-        self.assert_rejected(missing_null_field)
+        self.assert_rejected(missing_null_field, missing_null_field_state)
 
-        wrong_policy = refresh_candidate()
+        wrong_policy, wrong_policy_state = refresh_candidate()
         wrong_policy["resource_drift"][0]["change"]["after"]["inline_policy"][0][
             "policy"
         ] = "{}"
-        self.assert_rejected(wrong_policy)
+        self.assert_rejected(wrong_policy, wrong_policy_state)
 
-        ordinary_plan = refresh_candidate()
+        ordinary_plan, ordinary_plan_state = refresh_candidate()
         ordinary_plan["applyable"] = False
-        self.assert_rejected(ordinary_plan)
+        self.assert_rejected(ordinary_plan, ordinary_plan_state)
 
-        missing_planned_values = refresh_candidate()
-        del missing_planned_values["planned_values"]
-        self.assert_rejected(missing_planned_values)
+        unknown_value, unknown_value_state = refresh_candidate()
+        unknown_value["resource_drift"][0]["change"]["after_unknown"] = {
+            "assume_role_policy": True
+        }
+        self.assert_rejected(unknown_value, unknown_value_state)
 
-        malformed_resource_changes = refresh_candidate()
+        sensitive_value, sensitive_value_state = refresh_candidate()
+        sensitive_value["resource_drift"][0]["change"]["after_sensitive"] = {
+            "permissions_boundary": True
+        }
+        self.assert_rejected(sensitive_value, sensitive_value_state)
+
+        nonempty_sensitive, nonempty_sensitive_state = refresh_candidate()
+        nonempty_sensitive["resource_drift"][0]["change"]["before_sensitive"] = {
+            "permissions_boundary": True
+        }
+        nonempty_sensitive["resource_drift"][0]["change"]["after_sensitive"] = {
+            "permissions_boundary": True
+        }
+        self.assert_rejected(nonempty_sensitive, nonempty_sensitive_state)
+
+        integer_sensitive, integer_sensitive_state = refresh_candidate()
+        integer_sensitive["resource_drift"][0]["change"]["before_sensitive"] = 0
+        integer_sensitive["resource_drift"][0]["change"]["after_sensitive"] = 0
+        self.assert_rejected(integer_sensitive, integer_sensitive_state)
+
+        missing_sensitive, missing_sensitive_state = refresh_candidate()
+        del missing_sensitive["resource_drift"][0]["change"]["before_sensitive"]
+        del missing_sensitive["resource_drift"][0]["change"]["after_sensitive"]
+        self.assert_rejected(missing_sensitive, missing_sensitive_state)
+
+        unexpected_planned_values, unexpected_planned_state = refresh_candidate()
+        unexpected_planned_values["planned_values"] = {
+            "root_module": {"child_modules": []}
+        }
+        self.assert_rejected(unexpected_planned_values, unexpected_planned_state)
+
+        missing_prior_state, _ = refresh_candidate()
+        self.assert_rejected(missing_prior_state)
+
+        wrong_state_format, wrong_state_format_state = refresh_candidate()
+        wrong_state_format_state["format_version"] = "1.1"
+        self.assert_rejected(wrong_state_format, wrong_state_format_state)
+
+        wrong_state_version, wrong_state_version_state = refresh_candidate()
+        wrong_state_version_state["terraform_version"] = "1.15.0"
+        self.assert_rejected(wrong_state_version, wrong_state_version_state)
+
+        mismatched_prior, mismatched_prior_state = refresh_candidate()
+        mismatched_role = next(
+            item
+            for item in mismatched_prior_state["values"]["root_module"][
+                "child_modules"
+            ][0]["resources"]
+            if item["address"]
+            == "module.control.aws_iam_role.authority_publisher"
+        )
+        mismatched_role["values"]["max_session_duration"] = 7200
+        self.assert_rejected(mismatched_prior, mismatched_prior_state)
+
+        state_security, state_security_prior = refresh_candidate()
+        kms_endpoint = next(
+            item
+            for item in state_security_prior["values"]["root_module"][
+                "child_modules"
+            ][0]["resources"]
+            if item["address"]
+            == 'module.control.aws_vpc_endpoint.interface["kms"]'
+        )
+        kms_endpoint["values"]["private_dns_enabled"] = False
+        self.assert_rejected(state_security, state_security_prior)
+
+        malformed_resource_changes, malformed_state = refresh_candidate()
         malformed_resource_changes["resource_changes"] = None
-        self.assert_rejected(malformed_resource_changes)
+        self.assert_rejected(malformed_resource_changes, malformed_state)
 
     def test_publisher_updates_and_malformed_create_fail(self) -> None:
         update = plan_fixture()
@@ -646,9 +789,9 @@ class PlanContractTests(unittest.TestCase):
 
         self.assert_rejected(candidate)
 
-    def assert_rejected(self, plan: dict) -> None:
+    def assert_rejected(self, plan: dict, prior_state: object = None) -> None:
         with self.assertRaises(CHECKER.ContractError):
-            CHECKER.check_plan(plan)
+            CHECKER.check_plan(plan, prior_state)
 
     def change(self, plan: dict, address: str) -> dict:
         return next(

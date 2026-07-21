@@ -481,12 +481,22 @@ def load_json(path: Path) -> Any:
         raise ContractError(f"cannot read JSON {path}: {exc}") from exc
 
 
+def _json_sha256(value: Any) -> str:
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _is_empty_sensitive(value: Any) -> bool:
+    """Return whether value is one of Terraform's two empty sensitivity shapes.
+
+    The explicit identity check keeps integer zero out despite ``0 == False``.
+    """
+    return value is False or (isinstance(value, dict) and not value)
+
+
 def contract_sha256() -> str:
     """Fingerprint the reviewed resource-address/type inventory."""
-    payload = json.dumps(
-        EXPECTED_RESOURCES, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return _json_sha256(EXPECTED_RESOURCES)
 
 
 def _non_noop(items: Any, label: str) -> list[dict[str, Any]]:
@@ -1072,15 +1082,19 @@ def _check_publisher_state_normalization_drift(
 
 
 def _plan_resource_changes(
-    plan: dict[str, Any], drift: list[dict[str, Any]]
+    plan: dict[str, Any],
+    drift: list[dict[str, Any]],
+    prior_state: Any,
 ) -> list[dict[str, Any]]:
     """Return ordinary changes or reconstruct Terraform's refresh-only shape.
 
     Terraform 1.14 omits ``resource_changes`` when ``-refresh-only`` has no
-    configuration changes. Preserve the same exact-inventory and planned-value
-    checks by representing every managed ``planned_values`` resource as a
-    no-op. The non-empty drift requirement keeps an ordinary malformed plan
-    from reaching this compatibility path.
+    configuration changes, and its ``planned_values`` may omit every unchanged
+    resource. Preserve the exact-inventory and planned-value checks by using the
+    separately captured, version-bound pre-plan state for the unchanged
+    inventory and overlaying only the admitted refresh drift. The workflow
+    proves that state object did not move while planning and re-captures the
+    identical object before apply.
     """
     if "resource_changes" in plan:
         changes = plan["resource_changes"]
@@ -1090,37 +1104,108 @@ def _plan_resource_changes(
     if not drift:
         raise ContractError("Terraform plan resource_changes must be an array")
 
-    planned_values = plan.get("planned_values")
+    if plan.get("planned_values") != {"root_module": {}}:
+        raise ContractError(
+            f"refresh-only compatibility requires the exact empty Terraform {TF_VERSION} "
+            "planned_values shape"
+        )
+    if (
+        not isinstance(prior_state, dict)
+        or prior_state.get("format_version") != "1.0"
+        or prior_state.get("terraform_version") != TF_VERSION
+    ):
+        raise ContractError(
+            f"refresh-only compatibility requires exact Terraform {TF_VERSION} state JSON"
+        )
+
+    state_values = prior_state.get("values")
     root = (
-        planned_values.get("root_module")
-        if isinstance(planned_values, dict)
-        else None
+        state_values.get("root_module") if isinstance(state_values, dict) else None
     )
     resources = [
         item for item in _iter_resources(root) if item.get("mode") == "managed"
     ]
+    if not resources:
+        raise ContractError(
+            "refresh-only plan requires the captured pre-plan state inventory"
+        )
+
+    drift_by_address: dict[str, dict[str, Any]] = {}
+    for item in drift:
+        address = item.get("address") if isinstance(item, dict) else None
+        if not isinstance(address, str):
+            raise ContractError("Terraform resource drift is malformed")
+        if address in drift_by_address:
+            raise ContractError(f"duplicate Terraform resource drift: {address}")
+        drift_by_address[address] = item
+
     changes: list[dict[str, Any]] = []
+    matched_drift_addresses: set[str] = set()
     for item in resources:
-        values = item.get("values")
-        if not isinstance(values, dict):
-            raise ContractError("Terraform planned resource values are malformed")
+        address = item.get("address")
+        resource_values = item.get("values")
+        if not isinstance(address, str) or not isinstance(resource_values, dict):
+            raise ContractError("Terraform prior-state resource is malformed")
+        resolved_values = resource_values
+        drift_item = drift_by_address.get(address)
+        if drift_item is not None:
+            matched_drift_addresses.add(address)
+            change = drift_item.get("change")
+            if not isinstance(change, dict):
+                raise ContractError("Terraform resource drift change is malformed")
+            if change.get("after_unknown") != {}:
+                raise ContractError(
+                    "refresh-only publisher drift contains unknown values"
+                )
+            if (
+                "before_sensitive" not in change
+                or "after_sensitive" not in change
+                or change["before_sensitive"] != change["after_sensitive"]
+                or not _is_empty_sensitive(change["before_sensitive"])
+            ):
+                raise ContractError(
+                    "refresh-only publisher drift has unexpected sensitive-value metadata"
+                )
+            # Terraform 1.14.3 renders the same resource values in the captured
+            # state and drift.before. Keep that equality exact: a provider or
+            # Terraform representation change must abort rather than weaken the
+            # state-to-plan binding.
+            if change.get("before") != resource_values:
+                raise ContractError(
+                    f"refresh drift before value does not match captured state: {address}"
+                )
+            resolved_values = change.get("after")
+            if not isinstance(resolved_values, dict):
+                raise ContractError("Terraform resource drift after value is malformed")
         changes.append(
             {
-                "address": item.get("address"),
+                "address": address,
                 "mode": item.get("mode"),
                 "type": item.get("type"),
                 "change": {
                     "actions": ["no-op"],
-                    "after": values,
+                    "after": resolved_values,
                     "after_unknown": {},
-                    "before": values,
+                    "before": resolved_values,
                 },
             }
+        )
+    unmatched_drift = sorted(set(drift_by_address) - matched_drift_addresses)
+    if unmatched_drift:
+        raise ContractError(
+            f"refresh drift is absent from captured state: {unmatched_drift}"
         )
     return changes
 
 
-def check_plan(plan: Any) -> dict[str, str | int]:
+def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
+    """Validate one exact reviewed plan shape.
+
+    ``prior_state`` is required only when Terraform omits ``resource_changes``
+    for the reviewed refresh-only compatibility shape. Ordinary callers, such
+    as the refresh-disabled PR plan lane, may omit it; if their plan shape ever
+    loses ``resource_changes``, this checker deliberately fails closed.
+    """
     if not isinstance(plan, dict):
         raise ContractError("Terraform plan must be an object")
     if plan.get("format_version") != "1.2":
@@ -1132,7 +1217,7 @@ def check_plan(plan: Any) -> dict[str, str | int]:
     drift = _non_noop(plan.get("resource_drift"), "resource_drift")
     _check_no_embedded_actions(plan)
 
-    changes = _plan_resource_changes(plan, drift)
+    changes = _plan_resource_changes(plan, drift, prior_state)
     by_address: dict[str, dict[str, Any]] = {}
     for item in changes:
         if not isinstance(item, dict) or not isinstance(item.get("address"), str):
@@ -1197,11 +1282,13 @@ def check_plan(plan: Any) -> dict[str, str | int]:
             "Terraform applyability must match exact publisher bootstrap creates "
             "or the exact refresh-only state normalization"
         )
-    # Return the reviewed contract identity and resource inventory after the
-    # per-resource no-op validation above has succeeded.
+    # Bind the complete admitted drift across the review-time and immediate
+    # pre-apply plans. Canonical object-key ordering removes JSON presentation
+    # noise, while any value or list-order change intentionally aborts apply.
     return {
         "bootstrap_create_count": len(bootstrap_creates),
         "contract_sha256": contract_sha256(),
+        "normalization_drift_sha256": _json_sha256(drift),
         "normalization_drift_count": normalization_drift_count,
         "resource_count": len(EXPECTED_RESOURCES),
     }
@@ -1535,6 +1622,7 @@ def parse_args() -> argparse.Namespace:
 
     plan = sub.add_parser("plan")
     plan.add_argument("plan_json", type=Path)
+    plan.add_argument("prior_state_json", nargs="?", type=Path)
 
     state_list = sub.add_parser("state-list")
     state_list.add_argument("path", type=Path)
@@ -1550,7 +1638,10 @@ def main() -> int:
     args = parse_args()
     try:
         if args.command == "plan":
-            result = check_plan(load_json(args.plan_json))
+            prior_state = (
+                load_json(args.prior_state_json) if args.prior_state_json else None
+            )
+            result = check_plan(load_json(args.plan_json), prior_state)
         elif args.command == "state-list":
             result = check_state_list(args.path)
         elif args.command == "state":
