@@ -124,7 +124,12 @@ class ArtifactContractTests(unittest.TestCase):
         self.contract_summary = self.root / "plan-contract-summary.json"
         write_json(
             self.contract_summary,
-            {"bootstrap_create_count": 2, "contract_sha256": "a" * 64, "resource_count": 43},
+            {
+                "bootstrap_create_count": 2,
+                "contract_sha256": "a" * 64,
+                "normalization_drift_count": 0,
+                "resource_count": 43,
+            },
         )
         self.contract_checker = self.root / "source-owned-checker.py"
         self.contract_checker.write_text("# reviewed checker\n")
@@ -616,6 +621,8 @@ class WorkflowContractTests(unittest.TestCase):
             "planned_state_version_id",
             "planned_state_serial",
             "planned_state_sha256",
+            "plan-refresh-only",
+            "PLAN_SANDBOX_CONTROL_REFRESH_ONLY",
             "APPLY_SANDBOX_CONTROL_UPDATE",
             "actions/download-artifact@",
             "run-id: ${{ inputs.source_plan_run_id }}",
@@ -626,6 +633,7 @@ class WorkflowContractTests(unittest.TestCase):
             "check-control-sandbox-aws-identity.sh",
             "verify-control-sandbox-live-boundary.sh",
             "terraform apply -input=false -lock-timeout=5m -no-color",
+            "plan_mode=(-refresh-only)",
             "Apply reruns are forbidden",
             "actions: write",
             "actions/artifacts/$artifact_id",
@@ -647,6 +655,11 @@ class WorkflowContractTests(unittest.TestCase):
         )[0]
         self.assertIn("GITHUB_RUN_ATTEMPT", apply_guard)
         self.assertIn("== '1'", apply_guard)
+        refresh_guard = workflow.split("            plan-refresh-only)\n", 1)[1].split(
+            "              ;;\n            apply)", 1
+        )[0]
+        self.assertIn("PLAN_SANDBOX_CONTROL_REFRESH_ONLY", refresh_guard)
+        self.assertIn('[[ -z "$selectors" ]]', refresh_guard)
 
         # The single-use invariant must also live in the apply job itself: a
         # dependency job's guard does not protect a dependent job from GitHub's

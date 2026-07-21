@@ -81,12 +81,17 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
                 "assume_role_policy": json.dumps(
                     CHECKER.AUTHORITY_PUBLISHER_TRUST_POLICY
                 ),
-                "inline_policy": [],
+                "inline_policy": [
+                    {
+                        "name": "publish-connector-authority",
+                        "policy": json.dumps(CHECKER.AUTHORITY_PUBLISHER_POLICY),
+                    }
+                ],
                 "managed_policy_arns": [],
                 "max_session_duration": 3600,
                 "name": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
                 "path": "/",
-                "permissions_boundary": None,
+                "permissions_boundary": "",
             },
             {"managed_policy_arns": []},
         ),
@@ -377,6 +382,14 @@ class PlanContractTests(unittest.TestCase):
 
     def test_exact_noop_passes(self) -> None:
         self.assertEqual(CHECKER.check_plan(plan_fixture())["resource_count"], 43)
+        unrefreshed = plan_fixture()
+        unrefreshed_role = self.change(
+            unrefreshed, "module.control.aws_iam_role.authority_publisher"
+        )
+        unrefreshed_role["before"]["inline_policy"] = []
+        unrefreshed_role["after"]["inline_policy"] = []
+        self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 43)
+
         normalized = plan_fixture()
         normalized_changes = {
             item["address"]: item["change"] for item in normalized["resource_changes"]
@@ -420,11 +433,24 @@ class PlanContractTests(unittest.TestCase):
             with self.subTest(create_addresses=create_addresses):
                 candidate = plan_fixture()
                 candidate["applyable"] = True
+                # Before the separately managed policy exists, the provider has
+                # nothing to reflect onto the role's computed inline_policy.
+                if (
+                    "module.control.aws_iam_role_policy.authority_publisher"
+                    in create_addresses
+                ):
+                    role_change = self.change(
+                        candidate,
+                        "module.control.aws_iam_role.authority_publisher",
+                    )
+                    role_change["before"]["inline_policy"] = []
+                    role_change["after"]["inline_policy"] = []
                 for address in create_addresses:
                     change = self.change(candidate, address)
                     change["actions"] = ["create"]
                     change["before"] = None
                     if address == "module.control.aws_iam_role.authority_publisher":
+                        change["after"]["permissions_boundary"] = None
                         change["after_unknown"]["managed_policy_arns"] = True
                     if (
                         address
@@ -438,6 +464,96 @@ class PlanContractTests(unittest.TestCase):
                     CHECKER.check_plan(candidate)["bootstrap_create_count"],
                     len(create_addresses),
                 )
+
+    def test_exact_publisher_refresh_only_normalization_passes(self) -> None:
+        candidate = plan_fixture()
+        candidate["applyable"] = True
+        role_change = self.change(
+            candidate, "module.control.aws_iam_role.authority_publisher"
+        )
+        candidate["resource_drift"] = [
+            {
+                "address": "module.control.aws_iam_role.authority_publisher",
+                "mode": "managed",
+                "type": "aws_iam_role",
+                "change": {
+                    "actions": ["update"],
+                    "before": {
+                        **copy.deepcopy(role_change["after"]),
+                        "inline_policy": [],
+                    },
+                    "after": copy.deepcopy(role_change["after"]),
+                },
+            }
+        ]
+
+        summary = CHECKER.check_plan(candidate)
+
+        self.assertEqual(summary["bootstrap_create_count"], 0)
+        self.assertEqual(summary["normalization_drift_count"], 1)
+
+    def test_publisher_refresh_only_normalization_is_exact(self) -> None:
+        def refresh_candidate() -> dict:
+            candidate = plan_fixture()
+            candidate["applyable"] = True
+            role_change = self.change(
+                candidate, "module.control.aws_iam_role.authority_publisher"
+            )
+            candidate["resource_drift"] = [
+                {
+                    "address": "module.control.aws_iam_role.authority_publisher",
+                    "mode": "managed",
+                    "type": "aws_iam_role",
+                    "change": {
+                        "actions": ["update"],
+                        "before": {
+                            **copy.deepcopy(role_change["after"]),
+                            "inline_policy": [],
+                        },
+                        "after": copy.deepcopy(role_change["after"]),
+                    },
+                }
+            ]
+            return candidate
+
+        wrong_address = refresh_candidate()
+        wrong_address["resource_drift"][0]["address"] = (
+            "module.control.aws_iam_role.flow_logs"
+        )
+        self.assert_rejected(wrong_address)
+
+        extra_drift = refresh_candidate()
+        extra_drift["resource_drift"].append(
+            {
+                "address": "module.control.aws_vpc.control",
+                "mode": "managed",
+                "type": "aws_vpc",
+                "change": {"actions": ["update"], "before": {}, "after": {}},
+            }
+        )
+        self.assert_rejected(extra_drift)
+
+        other_field = refresh_candidate()
+        other_field["resource_drift"][0]["change"]["before"][
+            "max_session_duration"
+        ] = 7200
+        self.assert_rejected(other_field)
+
+        missing_null_field = refresh_candidate()
+        del missing_null_field["resource_drift"][0]["change"]["before"][
+            "permissions_boundary"
+        ]
+        self.assert_rejected(missing_null_field)
+
+        wrong_policy = refresh_candidate()
+        wrong_policy["resource_drift"][0]["change"]["after"]["inline_policy"][0][
+            "policy"
+        ] = "{}"
+        self.assert_rejected(wrong_policy)
+
+        ordinary_plan = refresh_candidate()
+        ordinary_plan["applyable"] = False
+        self.assert_rejected(ordinary_plan)
 
     def test_publisher_updates_and_malformed_create_fail(self) -> None:
         update = plan_fixture()
@@ -470,6 +586,22 @@ class PlanContractTests(unittest.TestCase):
         )
         malformed_create["applyable"] = True
         self.assert_rejected(malformed_create)
+
+        permissions_boundary = plan_fixture()
+        self.change(
+            permissions_boundary,
+            "module.control.aws_iam_role.authority_publisher",
+        )["after"]["permissions_boundary"] = "arn:aws:iam::123456789012:policy/broad"
+        self.assert_rejected(permissions_boundary)
+
+        malformed_reflection = plan_fixture()
+        reflected_role = self.change(
+            malformed_reflection,
+            "module.control.aws_iam_role.authority_publisher",
+        )
+        reflected_role["after"]["inline_policy"][0]["policy"] = "{}"
+        reflected_role["before"] = copy.deepcopy(reflected_role["after"])
+        self.assert_rejected(malformed_reflection)
 
     def test_publisher_role_create_without_policy_create_fails(self) -> None:
         candidate = plan_fixture()
@@ -885,11 +1017,16 @@ def state_fixture() -> dict:
             "assume_role_policy": json.dumps(
                 CHECKER.AUTHORITY_PUBLISHER_TRUST_POLICY
             ),
-            "inline_policy": [],
+            "inline_policy": [
+                {
+                    "name": "publish-connector-authority",
+                    "policy": json.dumps(CHECKER.AUTHORITY_PUBLISHER_POLICY),
+                }
+            ],
             "managed_policy_arns": [],
             "max_session_duration": 3600,
             "name": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
-            "permissions_boundary": None,
+            "permissions_boundary": "",
         }
     )
     by_address["module.control.aws_iam_role_policy.authority_publisher"].update(
@@ -1016,6 +1153,11 @@ class StateContractTests(unittest.TestCase):
                         ],
                     }
                 ),
+            ),
+            (
+                "module.control.aws_iam_role.authority_publisher",
+                "permissions_boundary",
+                "arn:aws:iam::123456789012:policy/broad",
             ),
             (
                 "module.control.aws_iam_role_policy.authority_publisher",

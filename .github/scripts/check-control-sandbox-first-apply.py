@@ -684,7 +684,10 @@ def _require_json_field(
 
 
 def _require_publisher_identity(
-    role: dict[str, Any], policy: dict[str, Any]
+    role: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    reflected_inline_policy: bool | None,
 ) -> None:
     role_address = "module.control.aws_iam_role.authority_publisher"
     policy_address = "module.control.aws_iam_role_policy.authority_publisher"
@@ -693,7 +696,6 @@ def _require_publisher_identity(
         {
             "max_session_duration": 3600,
             "name": AUTHORITY_PUBLISHER_ROLE_NAME,
-            "permissions_boundary": None,
         },
         role_address,
     )
@@ -705,8 +707,42 @@ def _require_publisher_identity(
     )
     if role.get("managed_policy_arns") not in (None, []):
         raise ContractError("authority publisher may not attach managed policies")
-    if role.get("inline_policy") not in (None, []):
-        raise ContractError("authority publisher policy must stay separately auditable")
+    # The locked AWS provider renders an absent permissions boundary as null on
+    # create and as an empty string after refresh. Configuration validation
+    # independently forbids the input; reject every nonempty live ARN here.
+    if role.get("permissions_boundary") not in (None, ""):
+        raise ContractError("authority publisher may not use a permissions boundary")
+    inline_policies = role.get("inline_policy")
+    if inline_policies in (None, []):
+        if reflected_inline_policy is True:
+            raise ContractError(
+                "authority publisher role must reflect its separately managed inline policy"
+            )
+    else:
+        if reflected_inline_policy is False:
+            raise ContractError(
+                "authority publisher role reflected an inline policy before its separate policy exists"
+            )
+        if (
+            not isinstance(inline_policies, list)
+            or len(inline_policies) != 1
+            or not isinstance(inline_policies[0], dict)
+            or set(inline_policies[0]) != {"name", "policy"}
+        ):
+            raise ContractError(
+                "authority publisher role must reflect exactly its separately managed inline policy"
+            )
+        _require_fields(
+            inline_policies[0],
+            {"name": "publish-connector-authority"},
+            role_address,
+        )
+        _require_json_field(
+            inline_policies[0],
+            "policy",
+            AUTHORITY_PUBLISHER_POLICY,
+            role_address,
+        )
     _require_fields(
         policy,
         {"name": "publish-connector-authority"},
@@ -930,12 +966,6 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
         "module.control.aws_iam_role_policy.authority_publisher"
     )
     publisher_policy, publisher_policy_unknown = values(publisher_policy_address)
-    _require_publisher_identity(publisher_role, publisher_policy)
-    _require_fields(
-        publisher_role,
-        {"path": "/"},
-        publisher_role_address,
-    )
     publisher_role_is_create = (
         by_address[publisher_role_address].get("change", {}).get("actions")
         == ["create"]
@@ -955,6 +985,22 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
         by_address[publisher_policy_address].get("change", {}).get("actions")
         == ["create"]
     )
+    _require_publisher_identity(
+        publisher_role,
+        publisher_policy,
+        # The refresh-disabled PR plan sees the pre-normalization empty
+        # computed field; a refreshed plan sees the exact reflected policy.
+        # Both are safe no-op representations, while create/partial-retry must
+        # remain empty until the separate policy exists.
+        reflected_inline_policy=(
+            False if publisher_role_is_create or publisher_policy_is_create else None
+        ),
+    )
+    _require_fields(
+        publisher_role,
+        {"path": "/"},
+        publisher_role_address,
+    )
     if publisher_policy_is_create and publisher_role_is_create:
         if (
             publisher_policy.get("role") is not None
@@ -963,6 +1009,66 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
             raise ContractError("authority publisher create must derive its role")
     elif publisher_policy.get("role") != AUTHORITY_PUBLISHER_ROLE_NAME:
         raise ContractError("authority publisher policy role drifted")
+
+
+def _check_publisher_state_normalization_drift(
+    drift: list[dict[str, Any]],
+    by_address: dict[str, dict[str, Any]],
+) -> int:
+    """Admit only the provider's exact state-only inline-policy reflection.
+
+    Terraform marks that delta applyable for ``-refresh-only``. An ordinary
+    refresh-enabled plan with no configuration changes is not applyable and is
+    rejected by ``check_plan`` below, independent of the workflow operation.
+    """
+    if not drift:
+        return 0
+    role_address = "module.control.aws_iam_role.authority_publisher"
+    if len(drift) != 1:
+        raise ContractError("refresh-only plan must normalize exactly one resource")
+    item = drift[0]
+    if (
+        item.get("address") != role_address
+        or item.get("mode") != "managed"
+        or item.get("type") != "aws_iam_role"
+    ):
+        raise ContractError("refresh-only plan may normalize only the publisher role")
+    change = item.get("change")
+    if not isinstance(change, dict) or change.get("actions") != ["update"]:
+        raise ContractError("publisher role normalization must be an in-state update")
+    before = change.get("before")
+    after = change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise ContractError("publisher role normalization values are malformed")
+    changed_fields = {
+        field
+        for field in set(before) | set(after)
+        if field not in before or field not in after or before[field] != after[field]
+    }
+    if changed_fields != {"inline_policy"} or before.get("inline_policy") not in (
+        None,
+        [],
+    ):
+        raise ContractError(
+            "publisher role normalization may only reflect its separately managed inline policy; "
+            f"changed_fields={sorted(changed_fields)}"
+        )
+    planned_role = by_address[role_address].get("change", {})
+    if planned_role.get("actions") != ["no-op"] or planned_role.get("after") != after:
+        raise ContractError(
+            "publisher role normalization must match the refresh-only no-op state"
+        )
+    publisher_policy = by_address[
+        "module.control.aws_iam_role_policy.authority_publisher"
+    ].get("change", {}).get("after")
+    if not isinstance(publisher_policy, dict):
+        raise ContractError("publisher policy normalization values are malformed")
+    _require_publisher_identity(
+        after,
+        publisher_policy,
+        reflected_inline_policy=True,
+    )
+    return 1
 
 
 def check_plan(plan: Any) -> dict[str, str | int]:
@@ -974,8 +1080,7 @@ def check_plan(plan: Any) -> dict[str, str | int]:
         raise ContractError(f"Terraform plan must use exact {TF_VERSION}")
     if plan.get("complete") is not True or plan.get("errored") is not False:
         raise ContractError("Terraform plan must be complete and non-errored")
-    if _non_noop(plan.get("resource_drift"), "resource_drift"):
-        raise ContractError("Terraform plan contains live resource drift")
+    drift = _non_noop(plan.get("resource_drift"), "resource_drift")
     _check_no_embedded_actions(plan)
 
     changes = plan.get("resource_changes")
@@ -1035,16 +1140,22 @@ def check_plan(plan: Any) -> dict[str, str | int]:
 
     _check_planned_security(by_address)
 
-    expected_applyable = bool(bootstrap_creates)
+    normalization_drift_count = _check_publisher_state_normalization_drift(
+        drift, by_address
+    )
+
+    expected_applyable = bool(bootstrap_creates or normalization_drift_count)
     if plan.get("applyable") is not expected_applyable:
         raise ContractError(
-            "Terraform applyability must match exact publisher bootstrap creates"
+            "Terraform applyability must match exact publisher bootstrap creates "
+            "or the exact refresh-only state normalization"
         )
     # Return the reviewed contract identity and resource inventory after the
     # per-resource no-op validation above has succeeded.
     return {
         "bootstrap_create_count": len(bootstrap_creates),
         "contract_sha256": contract_sha256(),
+        "normalization_drift_count": normalization_drift_count,
         "resource_count": len(EXPECTED_RESOURCES),
     }
 
@@ -1163,7 +1274,11 @@ def check_state(state: Any) -> dict[str, Any]:
     publisher_policy = values[
         "module.control.aws_iam_role_policy.authority_publisher"
     ]
-    _require_publisher_identity(publisher_role, publisher_policy)
+    _require_publisher_identity(
+        publisher_role,
+        publisher_policy,
+        reflected_inline_policy=True,
+    )
     if publisher_policy.get("role") != AUTHORITY_PUBLISHER_ROLE_NAME:
         raise ContractError("authority publisher inline policy identity drifted")
 

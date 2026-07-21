@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: 'Build a saved plan, apply one reviewed plan, or verify convergence'
+        description: 'Build a saved plan, normalize reviewed state, apply one reviewed plan, or verify convergence'
         required: true
         type: choice
         options:
           - plan
+          - plan-refresh-only
           - apply
           - verify
       source_plan_run_id:
@@ -36,7 +37,7 @@ on:
         required: false
         type: string
       confirmation:
-        description: 'PLAN_SANDBOX_CONTROL_UPDATE, APPLY_SANDBOX_CONTROL_UPDATE, or VERIFY_SANDBOX_CONTROL'
+        description: 'PLAN_SANDBOX_CONTROL_UPDATE, PLAN_SANDBOX_CONTROL_REFRESH_ONLY, APPLY_SANDBOX_CONTROL_UPDATE, or VERIFY_SANDBOX_CONTROL'
         required: true
         default: PLAN_SANDBOX_CONTROL_UPDATE
         type: string
@@ -91,6 +92,14 @@ jobs:
                 echo '::error::Plan must not carry saved-plan selectors.'; exit 1;
               }
               ;;
+            plan-refresh-only)
+              [[ "$CONFIRMATION" == 'PLAN_SANDBOX_CONTROL_REFRESH_ONLY' ]] || {
+                echo '::error::Refresh-only plan confirmation is not exact.'; exit 1;
+              }
+              [[ -z "$selectors" ]] || {
+                echo '::error::Refresh-only plan must not carry saved-plan selectors.'; exit 1;
+              }
+              ;;
             apply)
               [[ "$GITHUB_RUN_ATTEMPT" == '1' ]] || {
                 echo '::error::Apply reruns are forbidden; start a new dispatch so a consumed plan cannot be replayed.'; exit 1;
@@ -136,7 +145,7 @@ jobs:
 
   plan:
     name: Build immutable sandbox Control update plan
-    if: inputs.operation == 'plan'
+    if: inputs.operation == 'plan' || inputs.operation == 'plan-refresh-only'
     needs: guard
     runs-on: ubuntu-latest
     environment: sandbox
@@ -198,9 +207,15 @@ jobs:
 
       - name: Create and check saved update plan
         working-directory: ${{ env.CONTROL_ROOT }}
+        env:
+          OPERATION: ${{ inputs.operation }}
         run: |
           set -euo pipefail
-          terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan | tee tfplan.txt
+          plan_mode=()
+          if [[ "$OPERATION" == 'plan-refresh-only' ]]; then
+            plan_mode=(-refresh-only)
+          fi
+          terraform plan "${plan_mode[@]}" -input=false -lock-timeout=5m -no-color -out=tfplan | tee tfplan.txt
           terraform show -json tfplan >tfplan.json
           ../../../../.github/scripts/check-control-sandbox-first-apply.py plan tfplan.json \
             | tee plan-contract-summary.json
@@ -285,6 +300,7 @@ jobs:
 
       - name: Summarize separate reviewed apply dispatch
         env:
+          SUMMARY_OPERATION: ${{ inputs.operation }}
           SUMMARY_COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
           SUMMARY_PLAN_SHA256: ${{ steps.metadata.outputs.plan_sha256 }}
           SUMMARY_STATE_VERSION_ID: ${{ steps.metadata.outputs.state_version_id }}
@@ -295,6 +311,7 @@ jobs:
           {
             echo '## Sandbox Control update plan'
             echo
+            echo "- Plan operation: \`${SUMMARY_OPERATION}\`"
             echo "- Source plan run ID: \`${GITHUB_RUN_ID}\`"
             echo "- Planned commit: \`${SUMMARY_COMMIT_SHA}\`"
             echo "- Saved-plan SHA-256: \`${SUMMARY_PLAN_SHA256}\`"
