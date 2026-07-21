@@ -128,6 +128,18 @@ _OUTPUT_CHANGE_KEYS = frozenset(
         "before_sensitive",
     }
 )
+_PUBLISHER_REFRESH_BEFORE_SENSITIVE = {
+    "inline_policy": [],
+    "managed_policy_arns": [],
+    "tags": {},
+    "tags_all": {},
+}
+_PUBLISHER_REFRESH_AFTER_SENSITIVE = {
+    "inline_policy": [{}],
+    "managed_policy_arns": [],
+    "tags": {},
+    "tags_all": {},
+}
 
 EXPECTED_RESOURCES = {
     "module.control.aws_cloudwatch_log_group.flow_logs": "aws_cloudwatch_log_group",
@@ -559,14 +571,6 @@ def _is_exact_nonsensitive_output_entry(value: Any) -> bool:
         and set(value) == _OUTPUT_ENTRY_KEYS
         and value.get("sensitive") is False
     )
-
-
-def _is_empty_sensitive(value: Any) -> bool:
-    """Return whether value is one of Terraform's two empty sensitivity shapes.
-
-    The explicit identity check keeps integer zero out despite ``0 == False``.
-    """
-    return value is False or (isinstance(value, dict) and not value)
 
 
 def contract_sha256() -> str:
@@ -1312,8 +1316,14 @@ def _plan_resource_changes(
             if (
                 "before_sensitive" not in change
                 or "after_sensitive" not in change
-                or change["before_sensitive"] != change["after_sensitive"]
-                or not _is_empty_sensitive(change["before_sensitive"])
+                or not _json_equal(
+                    change["before_sensitive"],
+                    _PUBLISHER_REFRESH_BEFORE_SENSITIVE,
+                )
+                or not _json_equal(
+                    change["after_sensitive"],
+                    _PUBLISHER_REFRESH_AFTER_SENSITIVE,
+                )
             ):
                 raise ContractError(
                     "refresh-only publisher drift has unexpected sensitive-value metadata"

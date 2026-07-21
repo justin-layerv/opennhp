@@ -24,6 +24,10 @@ SECRET_SEED_SCRIPT_PATH = ROOT / "scripts/ensure-control-otp-pepper.sh"
 REDIS_TF_PATH = (
     ROOT / "terraform/modules/connector-authority-foundation/redis.tf"
 )
+CONTROL_LOCKFILE_PATH = (
+    ROOT / "terraform/control/environments/sandbox/.terraform.lock.hcl"
+)
+EXPECTED_AWS_PROVIDER_VERSION = "6.55.0"
 REAL_TERRAFORM_NOOP_FIXTURE_PATH = (
     ROOT / "tests/fixtures/qurl-agent-transact-iam/no-op-terraform-1.14.3.json"
 )
@@ -92,6 +96,8 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
                 "name": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
                 "path": "/",
                 "permissions_boundary": "",
+                "tags": {"Component": "connector-authority"},
+                "tags_all": {"Component": "connector-authority"},
             },
             {"managed_policy_arns": []},
         ),
@@ -454,13 +460,23 @@ def publisher_refresh_candidate() -> tuple[dict, dict]:
             "type": "aws_iam_role",
             "change": {
                 "actions": ["update"],
-                "after_sensitive": False,
+                "after_sensitive": {
+                    "inline_policy": [{}],
+                    "managed_policy_arns": [],
+                    "tags": {},
+                    "tags_all": {},
+                },
                 "after_unknown": {},
                 "before": {
                     **copy.deepcopy(role_change["after"]),
                     "inline_policy": [],
                 },
-                "before_sensitive": False,
+                "before_sensitive": {
+                    "inline_policy": [],
+                    "managed_policy_arns": [],
+                    "tags": {},
+                    "tags_all": {},
+                },
                 "after": copy.deepcopy(role_change["after"]),
             },
         }
@@ -578,6 +594,33 @@ class PlanContractTests(unittest.TestCase):
 
     def test_exact_publisher_refresh_only_normalization_passes(self) -> None:
         candidate, prior_state = publisher_refresh_candidate()
+        role_drift = candidate["resource_drift"][0]["change"]
+
+        # This is the value-free sensitivity envelope emitted by the exact
+        # Terraform/provider pair used by the live Control workflow.
+        self.assertEqual(
+            role_drift["before_sensitive"],
+            {
+                "inline_policy": [],
+                "managed_policy_arns": [],
+                "tags": {},
+                "tags_all": {},
+            },
+        )
+        self.assertEqual(
+            role_drift["after_sensitive"],
+            {
+                "inline_policy": [{}],
+                "managed_policy_arns": [],
+                "tags": {},
+                "tags_all": {},
+            },
+        )
+        self.assertRegex(
+            CONTROL_LOCKFILE_PATH.read_text(encoding="utf-8"),
+            rf'provider "registry\.terraform\.io/hashicorp/aws"\s*\{{\s*'
+            rf'version\s*=\s*"{re.escape(EXPECTED_AWS_PROVIDER_VERSION)}"',
+        )
 
         summary = CHECKER.check_plan(candidate, prior_state)
 
@@ -756,24 +799,88 @@ class PlanContractTests(unittest.TestCase):
         self.assert_rejected(unknown_value, unknown_value_state)
 
         sensitive_value, sensitive_value_state = refresh_candidate()
-        sensitive_value["resource_drift"][0]["change"]["after_sensitive"] = {
-            "permissions_boundary": True
-        }
+        sensitive_value["resource_drift"][0]["change"]["after_sensitive"][
+            "inline_policy"
+        ][0]["policy"] = True
         self.assert_rejected(sensitive_value, sensitive_value_state)
 
-        nonempty_sensitive, nonempty_sensitive_state = refresh_candidate()
-        nonempty_sensitive["resource_drift"][0]["change"]["before_sensitive"] = {
-            "permissions_boundary": True
-        }
-        nonempty_sensitive["resource_drift"][0]["change"]["after_sensitive"] = {
-            "permissions_boundary": True
-        }
-        self.assert_rejected(nonempty_sensitive, nonempty_sensitive_state)
+        scalar_masks, scalar_masks_state = refresh_candidate()
+        scalar_masks["resource_drift"][0]["change"]["before_sensitive"] = False
+        scalar_masks["resource_drift"][0]["change"]["after_sensitive"] = False
+        self.assert_rejected(scalar_masks, scalar_masks_state)
+
+        swapped_masks, swapped_masks_state = refresh_candidate()
+        swapped_change = swapped_masks["resource_drift"][0]["change"]
+        (
+            swapped_change["before_sensitive"],
+            swapped_change["after_sensitive"],
+        ) = (
+            swapped_change["after_sensitive"],
+            swapped_change["before_sensitive"],
+        )
+        self.assert_rejected(swapped_masks, swapped_masks_state)
+
+        missing_collection, missing_collection_state = refresh_candidate()
+        missing_collection["resource_drift"][0]["change"]["after_sensitive"] = {}
+        self.assert_rejected(missing_collection, missing_collection_state)
+
+        wrong_collection_length, wrong_collection_length_state = refresh_candidate()
+        wrong_collection_length["resource_drift"][0]["change"][
+            "after_sensitive"
+        ]["inline_policy"] = []
+        self.assert_rejected(wrong_collection_length, wrong_collection_length_state)
+
+        wrong_collection_type, wrong_collection_type_state = refresh_candidate()
+        wrong_collection_type["resource_drift"][0]["change"][
+            "after_sensitive"
+        ]["inline_policy"] = {}
+        self.assert_rejected(wrong_collection_type, wrong_collection_type_state)
+
+        extra_sensitive_key, extra_sensitive_key_state = refresh_candidate()
+        extra_sensitive_key["resource_drift"][0]["change"]["after_sensitive"][
+            "permissions_boundary"
+        ] = False
+        self.assert_rejected(extra_sensitive_key, extra_sensitive_key_state)
+
+        extra_collection, extra_collection_state = refresh_candidate()
+        extra_collection_change = extra_collection["resource_drift"][0]["change"]
+        extra_collection_change["before"]["unexpected_collection"] = []
+        extra_collection_change["after"]["unexpected_collection"] = []
+        extra_collection_change["before_sensitive"]["unexpected_collection"] = []
+        extra_collection_change["after_sensitive"]["unexpected_collection"] = []
+        extra_collection_state_role = next(
+            item
+            for item in extra_collection_state["values"]["root_module"][
+                "child_modules"
+            ][0]["resources"]
+            if item["address"]
+            == "module.control.aws_iam_role.authority_publisher"
+        )
+        extra_collection_state_role["values"]["unexpected_collection"] = []
+        self.assert_rejected(extra_collection, extra_collection_state)
 
         integer_sensitive, integer_sensitive_state = refresh_candidate()
         integer_sensitive["resource_drift"][0]["change"]["before_sensitive"] = 0
-        integer_sensitive["resource_drift"][0]["change"]["after_sensitive"] = 0
         self.assert_rejected(integer_sensitive, integer_sensitive_state)
+
+        sentinel = "publisher-secret-sentinel-79c17e31"
+        secret_safe, secret_safe_state = refresh_candidate()
+        secret_change = secret_safe["resource_drift"][0]["change"]
+        secret_change["before"]["permissions_boundary"] = sentinel
+        secret_change["after"]["permissions_boundary"] = sentinel
+        secret_state_role = next(
+            item
+            for item in secret_safe_state["values"]["root_module"][
+                "child_modules"
+            ][0]["resources"]
+            if item["address"]
+            == "module.control.aws_iam_role.authority_publisher"
+        )
+        secret_state_role["values"]["permissions_boundary"] = sentinel
+        secret_change["after_sensitive"] = {"permissions_boundary": True}
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(secret_safe, secret_safe_state)
+        self.assertNotIn(sentinel, str(error.exception))
 
         missing_sensitive, missing_sensitive_state = refresh_candidate()
         del missing_sensitive["resource_drift"][0]["change"]["before_sensitive"]
