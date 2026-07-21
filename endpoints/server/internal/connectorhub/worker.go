@@ -62,11 +62,13 @@ func (m *workerKeyMaterial) clear() {
 }
 
 type outboundDatagram struct {
-	payload      []byte
-	remote       *net.UDPAddr
-	outcome      WorkerOutcome
-	requestBytes int
-	deadline     time.Time
+	payload              []byte
+	remote               *net.UDPAddr
+	outcome              WorkerOutcome
+	requestBytes         int
+	deadline             time.Time
+	mode                 Mode
+	authorityCompletedAt time.Time
 }
 
 // Worker is the dedicated UDP-only Connector Hub engine. NewWorker transfers
@@ -365,7 +367,7 @@ func (w *Worker) handlePacket(parent context.Context, receivedAt time.Time, remo
 			clear(response)
 			return
 		}
-		w.enqueueResponse(response, remote, WorkerOutcomeChallengeSent, len(packet), deadline)
+		w.enqueueResponse(response, remote, WorkerOutcomeChallengeSent, len(packet), deadline, 0, time.Time{})
 		return
 	}
 	if ppd == nil {
@@ -399,6 +401,9 @@ func (w *Worker) handlePacket(parent context.Context, receivedAt time.Time, remo
 	result := w.handler.HandleAssignment(handlerCtx, ppd.BodyMessage, ppd.RemotePubKey)
 	cancelHandler()
 	w.observer.ObserveHandlerResult(result.Classification, result.RequestRejection)
+	if !result.authorityCompletedAt.IsZero() {
+		w.observer.ObserveAuthorityDuration(result.mode, result.authorityDuration)
+	}
 	if requestCtx.Err() != nil {
 		clear(result.Body)
 		w.observer.ObserveWorkerOutcome(WorkerOutcomeDeadlineRejected)
@@ -436,7 +441,7 @@ func (w *Worker) handlePacket(parent context.Context, receivedAt time.Time, remo
 		w.observer.ObserveWorkerOutcome(WorkerOutcomeDeadlineRejected)
 		return
 	}
-	w.enqueueResponse(response, remote, WorkerOutcomeResponseSent, 0, deadline)
+	w.enqueueResponse(response, remote, WorkerOutcomeResponseSent, 0, deadline, result.mode, result.authorityCompletedAt)
 }
 
 func (w *Worker) acceptReplay(digest [sha256.Size]byte, now time.Time) bool {
@@ -471,6 +476,8 @@ func (w *Worker) enqueueResponse(
 	outcome WorkerOutcome,
 	requestBytes int,
 	deadline time.Time,
+	mode Mode,
+	authorityCompletedAt time.Time,
 ) {
 	if len(payload) == 0 || remote == nil {
 		clear(payload)
@@ -483,6 +490,7 @@ func (w *Worker) enqueueResponse(
 	case w.writes <- outboundDatagram{
 		payload: payload, remote: remote, outcome: outcome,
 		requestBytes: requestBytes, deadline: deadline,
+		mode: mode, authorityCompletedAt: authorityCompletedAt,
 	}:
 	default:
 		clear(payload)
@@ -519,6 +527,8 @@ func (w *Worker) writeResponses() {
 			w.observer.ObserveWorkerOutcome(response.outcome)
 			if response.outcome == WorkerOutcomeChallengeSent {
 				w.observer.ObserveChallengeDatagramBytes(response.requestBytes, len(response.payload))
+			} else if response.outcome == WorkerOutcomeResponseSent && !response.authorityCompletedAt.IsZero() {
+				w.observer.ObservePostAuthorityDuration(response.mode, time.Since(response.authorityCompletedAt))
 			}
 		}
 		clear(response.payload)

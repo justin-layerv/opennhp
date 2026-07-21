@@ -148,6 +148,69 @@ func TestHandlerSendsExactDerivedOperationRequestOnce(t *testing.T) {
 	}
 }
 
+func TestHandlerAttachesTimingOnlyAfterAuthorityInvocation(t *testing.T) {
+	t.Parallel()
+	authorityContract := authorityVectors(t)
+	assignmentContract := assignmentVectors(t)
+	recoveryContract := recoveryVectors(t)
+	tests := []struct {
+		name      string
+		mode      Mode
+		request   string
+		peer      []byte
+		authority *fakeHubAuthority
+	}{
+		{
+			name: "issue", mode: ModeEnroll,
+			request: strings.Replace(assignmentContract.InitialAssignment.Request.BodyJSON,
+				conformance.AgentAssignmentBootstrapCredentialFixture, authorityContract.Fixtures.Credential, 1),
+			peer: decodedAuthorityPeer(t, authorityContract),
+			authority: &fakeHubAuthority{issueResponse: []byte(
+				authorityContract.Operations[conformance.ConnectorAuthorityOperationIssueAssignment].SuccessGolden.BodyJSON)},
+		},
+		{
+			name: "refresh", mode: ModeRefresh,
+			request: assignmentContract.RefreshAssignment.Request.BodyJSON,
+			peer:    decodedAuthorityPeer(t, authorityContract),
+			authority: &fakeHubAuthority{refreshResponse: []byte(
+				authorityContract.Operations[conformance.ConnectorAuthorityOperationRefreshAssignment].SuccessGolden.BodyJSON)},
+		},
+		{
+			name:    "recover",
+			mode:    ModeRecover,
+			request: recoveryContract.PublicExchanges[conformance.AgentCredentialRecoveryHubPhase].RequestBodyJSON,
+			peer:    decodedRecoveryPeer(t, recoveryContract),
+			authority: &fakeHubAuthority{recoveryResponse: []byte(
+				recoveryContract.PrivateOperations[conformance.AgentCredentialRecoveryIssueOperation].SuccessBodyJSON)},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			handler := mustHandler(t, test.authority, &fakeAdmissionGate{result: AdmissionResult{Decision: AdmissionAllow}})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			result := handler.HandleAssignment(ctx, []byte(test.request), test.peer)
+			if result.Classification != ClassificationSuccess {
+				t.Fatalf("classification = %q, want success", result.Classification)
+			}
+			if result.mode != test.mode || result.authorityCompletedAt.IsZero() || result.authorityDuration < 0 {
+				t.Fatalf("authority timing = mode %d, duration %s, completed %v; want mode %d with nonnegative timing",
+					result.mode, result.authorityDuration, result.authorityCompletedAt, test.mode)
+			}
+		})
+	}
+
+	handler := mustHandler(t, &fakeHubAuthority{}, &fakeAdmissionGate{result: AdmissionResult{Decision: AdmissionAllow}})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	rejected := handler.HandleAssignment(ctx, []byte(`{}`), decodedAuthorityPeer(t, authorityContract))
+	if rejected.Classification != ClassificationRequestRejected || rejected.mode != 0 ||
+		rejected.authorityDuration != 0 || !rejected.authorityCompletedAt.IsZero() {
+		t.Fatalf("pre-authority rejection carried invocation timing: %#v", rejected)
+	}
+}
+
 func TestAssignmentHandlerWipesOwnedAuthorityBuffers(t *testing.T) {
 	t.Parallel()
 	authorityContract := authorityVectors(t)
@@ -226,6 +289,9 @@ func TestHandlerFailsClosedWithoutRetry(t *testing.T) {
 			}
 			if strings.Contains(string(result.Body), "secret") || strings.Contains(string(result.Classification), "secret") {
 				t.Fatalf("public result reflected private failure: %#v", result)
+			}
+			if result.mode != ModeRefresh || result.authorityCompletedAt.IsZero() || result.authorityDuration < 0 {
+				t.Fatalf("failed Authority invocation was omitted from timing: %#v", result)
 			}
 		})
 	}

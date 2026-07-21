@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,19 +23,39 @@ const (
 	metricHubChallengeRequestBytes  = "HubChallengeRequestBytes"
 	metricHubChallengeResponseBytes = "HubChallengeResponseBytes"
 	metricHubHealthAcceptRetry      = "HubHealthAcceptRetry"
+
+	metricHubIssueAssignmentInvokeDuration                = "HubIssueAssignmentInvokeDuration"
+	metricHubIssueAssignmentPostAuthorityDuration         = "HubIssueAssignmentPostAuthorityDuration"
+	metricHubRefreshAssignmentInvokeDuration              = "HubRefreshAssignmentInvokeDuration"
+	metricHubRefreshAssignmentPostAuthorityDuration       = "HubRefreshAssignmentPostAuthorityDuration"
+	metricHubIssueCredentialRecoveryInvokeDuration        = "HubIssueCredentialRecoveryInvokeDuration"
+	metricHubIssueCredentialRecoveryPostAuthorityDuration = "HubIssueCredentialRecoveryPostAuthorityDuration"
 )
+
+const durationDroppedSuffix = "Dropped"
+
+type durationSeries struct {
+	mu      sync.Mutex
+	samples []float64
+	dropped atomic.Uint64
+}
+
+type operationDurationSeries struct {
+	invoke        durationSeries
+	postAuthority durationSeries
+}
 
 // workerMetrics is the process's concrete connectorhub.WorkerObserver. Without
 // it the worker falls back to the noop observer and emits nothing.
 //
 // Security properties this composition depends on:
 //
-//   - Nonblocking. Every method performs only atomic adds against counters
-//     allocated once at construction. There are no locks, channels, syscalls,
-//     or allocations on the call path, so a flood on the public UDP edge can
-//     never stall a worker goroutine inside metric emission. The label maps are
-//     written only by newWorkerMetrics and are read-only thereafter, so the
-//     per-packet map reads are safe without synchronization.
+//   - Nonblocking. Counter methods perform atomic adds. Duration observations
+//     use TryLock against fixed-capacity, preallocated slices and drop rather
+//     than wait when collection is contended or full. There are no blocking
+//     locks, channels, syscalls, or allocations on the call path, so a flood on
+//     the public UDP edge cannot stall a worker goroutine inside metric
+//     emission. The maps are immutable after construction.
 //   - Closed label set. The only labels recorded are this composition's own
 //     fixed enum constants; no source address, public key, credential, request
 //     body, or other attacker-controlled value is ever incorporated. A value
@@ -45,6 +66,7 @@ type workerMetrics struct {
 	outcomes        map[connectorhub.WorkerOutcome]*atomic.Uint64
 	classifications map[connectorhub.Classification]*atomic.Uint64
 	rejections      map[connectorhub.RequestRejection]*atomic.Uint64
+	durations       map[connectorhub.Mode]*operationDurationSeries
 
 	// unknown counts any label outside the closed vocabularies above. It is a
 	// drift guard: the worker only emits the enumerated constants today, so a
@@ -102,7 +124,95 @@ func newWorkerMetrics() *workerMetrics {
 			connectorhub.RequestRejectionBodySize,
 			connectorhub.RequestRejectionEnvironment,
 		}),
+		durations: map[connectorhub.Mode]*operationDurationSeries{
+			connectorhub.ModeEnroll:  newOperationDurationSeries(),
+			connectorhub.ModeRefresh: newOperationDurationSeries(),
+			connectorhub.ModeRecover: newOperationDurationSeries(),
+		},
 	}
+}
+
+func newOperationDurationSeries() *operationDurationSeries {
+	return &operationDurationSeries{
+		invoke:        durationSeries{samples: make([]float64, 0, metrics.MaxHistogramSamples)},
+		postAuthority: durationSeries{samples: make([]float64, 0, metrics.MaxHistogramSamples)},
+	}
+}
+
+func (m *workerMetrics) registerHistograms(publisher *metrics.Publisher) {
+	if m == nil || publisher == nil {
+		return
+	}
+	registrations := []struct {
+		mode              connectorhub.Mode
+		invokeName        string
+		postAuthorityName string
+	}{
+		{connectorhub.ModeEnroll, metricHubIssueAssignmentInvokeDuration, metricHubIssueAssignmentPostAuthorityDuration},
+		{connectorhub.ModeRefresh, metricHubRefreshAssignmentInvokeDuration, metricHubRefreshAssignmentPostAuthorityDuration},
+		{connectorhub.ModeRecover, metricHubIssueCredentialRecoveryInvokeDuration, metricHubIssueCredentialRecoveryPostAuthorityDuration},
+	}
+	for _, registration := range registrations {
+		series := m.durations[registration.mode]
+		registerDurationSeries(publisher, registration.invokeName, &series.invoke)
+		registerDurationSeries(publisher, registration.postAuthorityName, &series.postAuthority)
+	}
+}
+
+func registerDurationSeries(publisher *metrics.Publisher, name string, series *durationSeries) {
+	droppedName := name + durationDroppedSuffix
+	publisher.RegisterHistogramFunc(name, cloudwatchtypes.StandardUnitMilliseconds, func() []float64 {
+		values, dropped := series.drain()
+		addAtomicCounter(publisher, droppedName, dropped)
+		return values
+	})
+}
+
+func (s *durationSeries) record(duration time.Duration) {
+	// The Hub supplies monotonic time pairs, so negative means internal timing
+	// drift rather than a real latency sample. Fold it into the validity guard.
+	if duration < 0 || !s.mu.TryLock() {
+		s.dropped.Add(1)
+		return
+	}
+	defer s.mu.Unlock()
+	if len(s.samples) == cap(s.samples) {
+		s.dropped.Add(1)
+		return
+	}
+	// Millisecond floats preserve microsecond resolution while keeping each
+	// observation in the CloudWatch unit registered above. Clamp a real but
+	// sub-microsecond invocation to one microsecond instead of publishing zero.
+	rounded := duration.Round(time.Microsecond)
+	if rounded == 0 {
+		rounded = time.Microsecond
+	}
+	s.samples = append(s.samples, float64(rounded)/float64(time.Millisecond))
+}
+
+func (s *durationSeries) drain() ([]float64, uint64) {
+	// Avoid replacing six empty 10k-capacity buffers on every idle collection.
+	// Keep the active-path replacement allocation outside the mutex: record uses
+	// TryLock and must not lose a load-correlated run of samples to an allocation
+	// performed while the drain owns the lock.
+	s.mu.Lock()
+	empty := len(s.samples) == 0
+	s.mu.Unlock()
+	if empty {
+		return nil, s.dropped.Swap(0)
+	}
+	replacement := make([]float64, 0, metrics.MaxHistogramSamples)
+	s.mu.Lock()
+	// Production has one publisher collector. Retain safe exactly-once behavior
+	// if tests or a future caller invoke two drains concurrently.
+	if len(s.samples) == 0 {
+		s.mu.Unlock()
+		return nil, s.dropped.Swap(0)
+	}
+	values := s.samples
+	s.samples = replacement
+	s.mu.Unlock()
+	return values, s.dropped.Swap(0)
 }
 
 // newHubMetricsPublisher uses the process's already-loaded AWS configuration,
@@ -223,6 +333,27 @@ func (m *workerMetrics) ObserveHandlerResult(classification connectorhub.Classif
 	}
 	if counter := m.rejections[rejection]; counter != nil {
 		counter.Add(1)
+		return
+	}
+	m.unknown.Add(1)
+}
+
+// ObserveAuthorityDuration records one complete synchronous Authority call.
+// Unknown modes fold into the existing drift counter instead of creating a
+// dynamic metric name.
+func (m *workerMetrics) ObserveAuthorityDuration(mode connectorhub.Mode, duration time.Duration) {
+	if series := m.durations[mode]; series != nil {
+		series.invoke.record(duration)
+		return
+	}
+	m.unknown.Add(1)
+}
+
+// ObservePostAuthorityDuration records only successfully written LRTs, from
+// Authority completion through mapping, Noise sealing, queueing, and UDP I/O.
+func (m *workerMetrics) ObservePostAuthorityDuration(mode connectorhub.Mode, duration time.Duration) {
+	if series := m.durations[mode]; series != nil {
+		series.postAuthority.record(duration)
 		return
 	}
 	m.unknown.Add(1)

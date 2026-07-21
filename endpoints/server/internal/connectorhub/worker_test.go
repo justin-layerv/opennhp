@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -22,11 +23,18 @@ import (
 const workerTestTimeout = 3 * time.Second
 
 type recordingWorkerObserver struct {
-	mu              sync.Mutex
-	outcomes        map[WorkerOutcome]int
-	classifications map[Classification]int
-	rejections      map[RequestRejection]int
-	challengeSizes  [][2]int
+	mu               sync.Mutex
+	outcomes         map[WorkerOutcome]int
+	classifications  map[Classification]int
+	rejections       map[RequestRejection]int
+	challengeSizes   [][2]int
+	authorityTimings []durationObservation
+	responseTimings  []durationObservation
+}
+
+type durationObservation struct {
+	mode     Mode
+	duration time.Duration
 }
 
 type deadlineWorkerAuthority struct {
@@ -94,6 +102,18 @@ func (o *recordingWorkerObserver) ObserveChallengeDatagramBytes(requestBytes, re
 	o.mu.Unlock()
 }
 
+func (o *recordingWorkerObserver) ObserveAuthorityDuration(mode Mode, duration time.Duration) {
+	o.mu.Lock()
+	o.authorityTimings = append(o.authorityTimings, durationObservation{mode: mode, duration: duration})
+	o.mu.Unlock()
+}
+
+func (o *recordingWorkerObserver) ObservePostAuthorityDuration(mode Mode, duration time.Duration) {
+	o.mu.Lock()
+	o.responseTimings = append(o.responseTimings, durationObservation{mode: mode, duration: duration})
+	o.mu.Unlock()
+}
+
 func (o *recordingWorkerObserver) outcome(outcome WorkerOutcome) int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -120,6 +140,12 @@ func (o *recordingWorkerObserver) challengeSize() (requestBytes, responseBytes i
 	}
 	last := o.challengeSizes[len(o.challengeSizes)-1]
 	return last[0], last[1], len(o.challengeSizes)
+}
+
+func (o *recordingWorkerObserver) timings() (authority, response []durationObservation) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Clone(o.authorityTimings), slices.Clone(o.responseTimings)
 }
 
 type workerFixture struct {
@@ -334,6 +360,13 @@ func TestWorkerChallengeProofRoundTripCallsAuthorityOnlyAfterProof(t *testing.T)
 	}
 	if f.observer.classification(ClassificationSuccess) != 1 {
 		t.Fatalf("success classifications = %d, want 1", f.observer.classification(ClassificationSuccess))
+	}
+	authorityTimings, responseTimings := f.observer.timings()
+	if len(authorityTimings) != 1 || authorityTimings[0].mode != ModeRefresh || authorityTimings[0].duration < 0 {
+		t.Fatalf("authority timings = %#v, want one nonnegative refresh observation", authorityTimings)
+	}
+	if len(responseTimings) != 1 || responseTimings[0].mode != ModeRefresh || responseTimings[0].duration < 0 {
+		t.Fatalf("post-authority timings = %#v, want one nonnegative refresh observation", responseTimings)
 	}
 	requestBytes, responseBytes, count := f.observer.challengeSize()
 	if count != 1 || responseBytes >= requestBytes {
@@ -682,16 +715,16 @@ func TestWorkerClassifiesHandlerDropInvalidResponseAndQueueFull(t *testing.T) {
 		t.Fatal("nonempty handler body rejected")
 	}
 	invalidRemotePayload := []byte("invalid-remote")
-	worker.enqueueResponse(invalidRemotePayload, nil, WorkerOutcomeResponseSent, 0, time.Now().Add(time.Second))
+	worker.enqueueResponse(invalidRemotePayload, nil, WorkerOutcomeResponseSent, 0, time.Now().Add(time.Second), 0, time.Time{})
 	if !bytes.Equal(invalidRemotePayload, make([]byte, len(invalidRemotePayload))) {
 		t.Fatal("invalid response payload was not wiped")
 	}
-	worker.enqueueResponse(nil, remote, WorkerOutcomeResponseSent, 0, time.Now().Add(time.Second))
+	worker.enqueueResponse(nil, remote, WorkerOutcomeResponseSent, 0, time.Now().Add(time.Second), 0, time.Time{})
 
 	queuedPayload := []byte("queued")
-	worker.enqueueResponse(queuedPayload, remote, WorkerOutcomeResponseSent, 0, time.Now().Add(time.Second))
+	worker.enqueueResponse(queuedPayload, remote, WorkerOutcomeResponseSent, 0, time.Now().Add(time.Second), 0, time.Time{})
 	droppedPayload := []byte("queue-full")
-	worker.enqueueResponse(droppedPayload, remote, WorkerOutcomeResponseSent, 0, time.Now().Add(time.Second))
+	worker.enqueueResponse(droppedPayload, remote, WorkerOutcomeResponseSent, 0, time.Now().Add(time.Second), 0, time.Time{})
 	if !bytes.Equal(droppedPayload, make([]byte, len(droppedPayload))) {
 		t.Fatal("queue-rejected response payload was not wiped")
 	}
@@ -768,18 +801,29 @@ func TestWorkerStopsAuthorityAtResponseReserveDeadline(t *testing.T) {
 	if issueCalls != 0 || refreshCalls != 1 {
 		t.Fatalf("authority calls = %d/%d, want 0/1", issueCalls, refreshCalls)
 	}
+	authorityTimings, responseTimings := f.observer.timings()
+	if len(authorityTimings) != 1 || authorityTimings[0].mode != ModeRefresh || authorityTimings[0].duration < 0 {
+		t.Fatalf("deadline authority timings = %#v, want one nonnegative refresh observation", authorityTimings)
+	}
+	if len(responseTimings) != 1 || responseTimings[0].mode != ModeRefresh || responseTimings[0].duration < 0 {
+		t.Fatalf("deadline response timings = %#v, want one nonnegative refresh observation", responseTimings)
+	}
 }
 
 func TestWorkerWriterDropsQueuedResponseAfterReceiptBudget(t *testing.T) {
 	f := newWorkerFixture(t)
 	f.worker.enqueueResponse([]byte("must-not-send"), f.client.LocalAddr().(*net.UDPAddr),
-		WorkerOutcomeResponseSent, 0, time.Now().Add(-time.Millisecond))
+		WorkerOutcomeResponseSent, 0, time.Now().Add(-time.Millisecond), ModeRefresh, time.Now())
 	deadline := time.Now().Add(time.Second)
 	for f.observer.outcome(WorkerOutcomeDeadlineRejected) == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if f.observer.outcome(WorkerOutcomeDeadlineRejected) != 1 {
 		t.Fatalf("writer deadline outcomes = %d, want 1", f.observer.outcome(WorkerOutcomeDeadlineRejected))
+	}
+	_, responseTimings := f.observer.timings()
+	if len(responseTimings) != 0 {
+		t.Fatalf("expired queued response recorded successful-write timing: %#v", responseTimings)
 	}
 	if err := f.client.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)

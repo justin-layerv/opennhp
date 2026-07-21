@@ -183,6 +183,23 @@ func (mp *Publisher) LatenciesForTest(t testing.TB) map[string][]float64 {
 	return out
 }
 
+// HistogramsForTest drains registered histogram functions and returns a deep
+// copy of the pending percentile-preserving samples by metric name.
+func (mp *Publisher) HistogramsForTest(t testing.TB) map[string][]float64 {
+	t.Helper()
+	if mp == nil {
+		return map[string][]float64{}
+	}
+	mp.collectHistograms()
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	out := make(map[string][]float64, len(mp.histograms))
+	for name, entry := range mp.histograms {
+		out[name] = slices.Clone(entry.values)
+	}
+	return out
+}
+
 // GaugesForTest collects registered gauge functions and returns a snapshot of
 // the in-memory gauge state. Intended only for tests that need to assert state
 // indicators registered via RegisterGaugeFunc.

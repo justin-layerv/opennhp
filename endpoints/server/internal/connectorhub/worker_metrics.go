@@ -1,5 +1,7 @@
 package connectorhub
 
+import "time"
+
 // WorkerOutcome is the closed, low-cardinality packet outcome vocabulary for
 // the dedicated public Hub worker. Values never contain source addresses,
 // public keys, credentials, request bodies, or other attacker-controlled data.
@@ -34,6 +36,12 @@ const (
 type WorkerObserver interface {
 	ObserveWorkerOutcome(WorkerOutcome)
 	ObserveHandlerResult(Classification, RequestRejection)
+	// ObserveAuthorityDuration records the complete private Authority invocation
+	// for one strictly decoded operation, including failures and timeouts.
+	ObserveAuthorityDuration(Mode, time.Duration)
+	// ObservePostAuthorityDuration records response mapping, Noise sealing,
+	// queueing, and the successful UDP write after Authority returned.
+	ObservePostAuthorityDuration(Mode, time.Duration)
 	// ObserveChallengeDatagramBytes records histogram values, never labels.
 	// The worker calls it only after a strictly smaller COK is written.
 	ObserveChallengeDatagramBytes(requestBytes, responseBytes int)
@@ -43,4 +51,6 @@ type noopWorkerObserver struct{}
 
 func (noopWorkerObserver) ObserveWorkerOutcome(WorkerOutcome)                    {}
 func (noopWorkerObserver) ObserveHandlerResult(Classification, RequestRejection) {}
+func (noopWorkerObserver) ObserveAuthorityDuration(Mode, time.Duration)          {}
+func (noopWorkerObserver) ObservePostAuthorityDuration(Mode, time.Duration)      {}
 func (noopWorkerObserver) ObserveChallengeDatagramBytes(int, int)                {}

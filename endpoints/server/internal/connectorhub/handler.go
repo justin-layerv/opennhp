@@ -76,6 +76,13 @@ type HandleResult struct {
 	// RequestRejection is set only for ClassificationRequestRejected. It is a
 	// fixed internal label and never appears in Body.
 	RequestRejection RequestRejection
+
+	// Authority timing stays internal to connectorhub so the Worker can observe
+	// the separately permissioned invocation without widening the public result
+	// contract. A zero completion time means no Authority call occurred.
+	mode                 Mode
+	authorityDuration    time.Duration
+	authorityCompletedAt time.Time
 }
 
 type Handler struct {
@@ -187,6 +194,7 @@ func (h *Handler) HandleAssignment(ctx context.Context, raw, authenticatedPeer [
 	}
 
 	var response []byte
+	authorityStartedAt := time.Now()
 	switch request.Mode {
 	case ModeEnroll:
 		response, err = h.authority.IssueAssignment(ctx, payload)
@@ -197,19 +205,39 @@ func (h *Handler) HandleAssignment(ctx context.Context, raw, authenticatedPeer [
 	default:
 		return h.invalidRequest(request.Mode, RequestRejectionSemantic)
 	}
+	authorityCompletedAt := time.Now()
 	defer clear(response)
 	if err != nil || ctx.Err() != nil {
-		return h.unavailable(request.Mode, ClassificationAuthorityInvocationFailed)
+		return withAuthorityTiming(
+			h.unavailable(request.Mode, ClassificationAuthorityInvocationFailed),
+			request.Mode, authorityStartedAt, authorityCompletedAt,
+		)
 	}
 
 	body, kind, err := decodeAuthorityResponse(request, response)
 	if err != nil {
-		return h.unavailable(request.Mode, ClassificationAuthorityResponseRejected)
+		return withAuthorityTiming(
+			h.unavailable(request.Mode, ClassificationAuthorityResponseRejected),
+			request.Mode, authorityStartedAt, authorityCompletedAt,
+		)
 	}
 	if kind == authorityResponseSemanticError {
-		return HandleResult{Body: body, Classification: ClassificationAuthoritySemanticError}
+		return withAuthorityTiming(
+			HandleResult{Body: body, Classification: ClassificationAuthoritySemanticError},
+			request.Mode, authorityStartedAt, authorityCompletedAt,
+		)
 	}
-	return HandleResult{Body: body, Classification: ClassificationSuccess}
+	return withAuthorityTiming(
+		HandleResult{Body: body, Classification: ClassificationSuccess},
+		request.Mode, authorityStartedAt, authorityCompletedAt,
+	)
+}
+
+func withAuthorityTiming(result HandleResult, mode Mode, startedAt, completedAt time.Time) HandleResult {
+	result.mode = mode
+	result.authorityDuration = completedAt.Sub(startedAt)
+	result.authorityCompletedAt = completedAt
+	return result
 }
 
 func (h *Handler) invalidRequest(mode Mode, rejection RequestRejection) HandleResult {

@@ -2,8 +2,10 @@ package hub
 
 import (
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
@@ -76,6 +78,143 @@ func TestWorkerMetricsChallengeStatsAccumulate(t *testing.T) {
 	observations, requestBytes, responseBytes := m.challengeStats()
 	if observations != 2 || requestBytes != 500 || responseBytes != 200 {
 		t.Fatalf("challenge stats = %d obs, %d req, %d resp; want 2/500/200", observations, requestBytes, responseBytes)
+	}
+}
+
+func TestWorkerMetricsExportsClosedDurationHistograms(t *testing.T) {
+	publisher := metrics.NewPublisherForTest(t)
+	m := newWorkerMetrics()
+	m.registerHistograms(publisher)
+
+	tests := []struct {
+		mode          connectorhub.Mode
+		invokeName    string
+		postName      string
+		invoke        time.Duration
+		postAuthority time.Duration
+	}{
+		{connectorhub.ModeEnroll, metricHubIssueAssignmentInvokeDuration, metricHubIssueAssignmentPostAuthorityDuration, 1500 * time.Microsecond, 2500 * time.Microsecond},
+		{connectorhub.ModeRefresh, metricHubRefreshAssignmentInvokeDuration, metricHubRefreshAssignmentPostAuthorityDuration, 3500 * time.Microsecond, 4500 * time.Microsecond},
+		{connectorhub.ModeRecover, metricHubIssueCredentialRecoveryInvokeDuration, metricHubIssueCredentialRecoveryPostAuthorityDuration, 5500 * time.Microsecond, 6500 * time.Microsecond},
+	}
+	for _, test := range tests {
+		m.ObserveAuthorityDuration(test.mode, test.invoke)
+		m.ObservePostAuthorityDuration(test.mode, test.postAuthority)
+	}
+
+	histograms := publisher.HistogramsForTest(t)
+	if len(histograms) != 6 {
+		t.Fatalf("histogram count = %d, want 6: %#v", len(histograms), histograms)
+	}
+	for _, test := range tests {
+		if got, want := histograms[test.invokeName], []float64{float64(test.invoke) / float64(time.Millisecond)}; !slices.Equal(got, want) {
+			t.Errorf("%s = %v, want %v", test.invokeName, got, want)
+		}
+		if got, want := histograms[test.postName], []float64{float64(test.postAuthority) / float64(time.Millisecond)}; !slices.Equal(got, want) {
+			t.Errorf("%s = %v, want %v", test.postName, got, want)
+		}
+	}
+
+	// Draining is exactly once; a second collection cannot duplicate samples.
+	if got := publisher.HistogramsForTest(t); len(got) != 6 {
+		// Publisher intentionally retains already collected observations until its
+		// flush. Assert the producer buffers themselves are empty below instead.
+		t.Fatalf("publisher unexpectedly changed pending histograms: %#v", got)
+	}
+	for _, series := range m.durations {
+		if values, dropped := series.invoke.drain(); len(values) != 0 || dropped != 0 {
+			t.Fatalf("invoke producer retained values=%v dropped=%d after collection", values, dropped)
+		}
+		if values, dropped := series.postAuthority.drain(); len(values) != 0 || dropped != 0 {
+			t.Fatalf("post-authority producer retained values=%v dropped=%d after collection", values, dropped)
+		}
+	}
+}
+
+func TestDurationSeriesDropsInsteadOfBlockingOrGrowing(t *testing.T) {
+	series := durationSeries{samples: make([]float64, 0, 1)}
+	series.record(500 * time.Nanosecond)
+	series.record(time.Millisecond)
+	series.record(-time.Nanosecond)
+	series.mu.Lock()
+	series.record(time.Millisecond)
+	series.mu.Unlock()
+
+	values, dropped := series.drain()
+	if !slices.Equal(values, []float64{0.001}) || dropped != 3 {
+		t.Fatalf("drain = values %v, dropped %d; want [0.001], 3", values, dropped)
+	}
+	if values, dropped = series.drain(); len(values) != 0 || dropped != 0 {
+		t.Fatalf("second drain = values %v, dropped %d; want empty", values, dropped)
+	}
+}
+
+func TestDurationSeriesIdleDrainDoesNotAllocate(t *testing.T) {
+	series := durationSeries{samples: make([]float64, 0, metrics.MaxHistogramSamples)}
+	if got := testing.AllocsPerRun(1000, func() {
+		series.drain()
+	}); got != 0 {
+		t.Fatalf("idle drain allocations = %v, want 0", got)
+	}
+}
+
+func TestWorkerMetricsExportsDurationDropsWithoutSamples(t *testing.T) {
+	publisher := metrics.NewPublisherForTest(t)
+	m := newWorkerMetrics()
+	m.registerHistograms(publisher)
+	series := &m.durations[connectorhub.ModeRefresh].invoke
+
+	series.mu.Lock()
+	m.ObserveAuthorityDuration(connectorhub.ModeRefresh, time.Millisecond)
+	series.mu.Unlock()
+
+	if histograms := publisher.HistogramsForTest(t); len(histograms) != 0 {
+		t.Fatalf("dropped-only collection published histogram samples: %#v", histograms)
+	}
+	_, counters := publisher.CountersForTest(t)
+	name := metricHubRefreshAssignmentInvokeDuration + durationDroppedSuffix
+	if got := counters[name]; got != 1 {
+		t.Fatalf("%s = %v, want 1", name, got)
+	}
+}
+
+func TestDurationSeriesConcurrentObservationConservesSamplesAndDrops(t *testing.T) {
+	series := durationSeries{samples: make([]float64, 0, metrics.MaxHistogramSamples)}
+	const goroutines = 32
+	const perGoroutine = 1000
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			for range perGoroutine {
+				series.record(time.Millisecond)
+			}
+		}()
+	}
+	wg.Wait()
+	values, dropped := series.drain()
+	if got, want := uint64(len(values))+dropped, uint64(goroutines*perGoroutine); got != want {
+		t.Fatalf("observations conserved = %d, want %d (samples=%d dropped=%d)", got, want, len(values), dropped)
+	}
+}
+
+func TestWorkerMetricsDurationObservationDoesNotAllocate(t *testing.T) {
+	m := newWorkerMetrics()
+	if got := testing.AllocsPerRun(1000, func() {
+		m.ObserveAuthorityDuration(connectorhub.ModeRefresh, time.Millisecond)
+		m.ObservePostAuthorityDuration(connectorhub.ModeRefresh, time.Millisecond)
+	}); got != 0 {
+		t.Fatalf("duration observation allocations = %v, want 0", got)
+	}
+}
+
+func TestWorkerMetricsDurationUnknownModesFoldClosed(t *testing.T) {
+	m := newWorkerMetrics()
+	m.ObserveAuthorityDuration(connectorhub.Mode(255), time.Millisecond)
+	m.ObservePostAuthorityDuration(connectorhub.Mode(255), time.Millisecond)
+	if got := m.unknownCount(); got != 2 {
+		t.Fatalf("unknown duration modes = %d, want 2", got)
 	}
 }
 

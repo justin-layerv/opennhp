@@ -96,6 +96,7 @@ func runWithAWSConfig(ctx context.Context, config Config, awsConfig aws.Config, 
 		return fmt.Errorf("connector hub: listen for UDP assignments: %w", err)
 	}
 	observer := newWorkerMetrics()
+	observer.registerHistograms(publisher)
 	worker, err := connectorhub.NewWorker(udpConn, connectorhub.WorkerConfig{
 		PrivateKeyBase64:        config.PrivateKeyBase64,
 		ActiveCookieKeyBase64:   config.ActiveCookieKeyBase64,
