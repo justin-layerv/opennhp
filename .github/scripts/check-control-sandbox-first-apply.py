@@ -94,6 +94,40 @@ _DYNAMODB_TABLES = (
     "connector_authority",
     "customers",
 )
+# Keep this reviewed inventory synchronized with sandbox/outputs.tf. The
+# refresh-only output-contract test parses that file and fails on either drift.
+EXPECTED_CONTROL_OUTPUTS = frozenset(
+    {
+        "authority_data_kms_key_arn",
+        "authority_ecr_repository_url",
+        "authority_image_digest_parameter_name",
+        "authority_publisher_github_environment",
+        "authority_publisher_role_arn",
+        "authority_publisher_role_name",
+        "control_table_names",
+        "control_table_prefix",
+        "interface_endpoint_ids",
+        "isolated_subnet_ids",
+        "otp_pepper_secret_arn",
+        "otp_redis_authority_user_arn",
+        "otp_redis_endpoint",
+        "otp_redis_user_group_id",
+        "qat1_signing_kms_key_arn",
+        "ses_identity_arn",
+        "vpc_id",
+    }
+)
+_OUTPUT_ENTRY_KEYS = frozenset({"sensitive", "type", "value"})
+_OUTPUT_CHANGE_KEYS = frozenset(
+    {
+        "actions",
+        "after",
+        "after_sensitive",
+        "after_unknown",
+        "before",
+        "before_sensitive",
+    }
+)
 
 EXPECTED_RESOURCES = {
     "module.control.aws_cloudwatch_log_group.flow_logs": "aws_cloudwatch_log_group",
@@ -481,9 +515,50 @@ def load_json(path: Path) -> Any:
         raise ContractError(f"cannot read JSON {path}: {exc}") from exc
 
 
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
 def _json_sha256(value: Any) -> str:
-    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values without Python's ``False == 0`` coercion."""
+    return _canonical_json(left) == _canonical_json(right)
+
+
+def _refresh_only_value_shape(value: Any) -> str:
+    """Return a bounded, value-free diagnostic for Terraform value-tree drift."""
+    if not isinstance(value, dict):
+        return f"planned={type(value).__name__}"
+    root = value.get("root_module")
+    outputs = value.get("outputs")
+    entries = list(outputs.values()) if isinstance(outputs, dict) else []
+    object_entries = [entry for entry in entries if isinstance(entry, dict)]
+    return ";".join(
+        (
+            f"planned=dict:{len(value)}",
+            f"root={type(root).__name__}:"
+            f"{len(root) if isinstance(root, dict) else '-'}",
+            f"outputs={type(outputs).__name__}:"
+            f"{len(outputs) if isinstance(outputs, dict) else '-'}",
+            f"entry_objects={len(object_entries)}",
+            "entry_sensitive_false="
+            f"{sum(entry.get('sensitive') is False for entry in object_entries)}",
+            f"entry_type_present={sum('type' in entry for entry in object_entries)}",
+            f"entry_value_present={sum('value' in entry for entry in object_entries)}",
+        )
+    )
+
+
+def _is_exact_nonsensitive_output_entry(value: Any) -> bool:
+    """Require Terraform's exact non-sensitive root-output entry shape."""
+    return (
+        isinstance(value, dict)
+        and set(value) == _OUTPUT_ENTRY_KEYS
+        and value.get("sensitive") is False
+    )
 
 
 def _is_empty_sensitive(value: Any) -> bool:
@@ -1081,6 +1156,87 @@ def _check_publisher_state_normalization_drift(
     return 1
 
 
+def _check_refresh_only_outputs(
+    plan: dict[str, Any], prior_state: dict[str, Any]
+) -> None:
+    """Bind Terraform's value-only refresh envelope to captured state.
+
+    Terraform 1.14.3 omits unchanged resources from a refresh-only plan, but
+    still serializes all root outputs. Keep the resource/module tree exactly
+    empty and require those outputs, plus their changes, to be exact
+    non-sensitive no-ops against the version-bound pre-plan state.
+    """
+    planned_values = plan.get("planned_values")
+    if (
+        not isinstance(planned_values, dict)
+        or set(planned_values) != {"outputs", "root_module"}
+        or planned_values.get("root_module") != {}
+    ):
+        raise ContractError(
+            f"refresh-only Terraform {TF_VERSION} value tree is malformed; "
+            f"{_refresh_only_value_shape(planned_values)}"
+        )
+
+    planned_outputs = planned_values.get("outputs")
+    state_values = prior_state.get("values")
+    state_outputs = (
+        state_values.get("outputs") if isinstance(state_values, dict) else None
+    )
+    if (
+        not isinstance(planned_outputs, dict)
+        or set(planned_outputs) != EXPECTED_CONTROL_OUTPUTS
+        or not isinstance(state_outputs, dict)
+        or set(state_outputs) != EXPECTED_CONTROL_OUTPUTS
+    ):
+        raise ContractError(
+            f"refresh-only Terraform {TF_VERSION} output inventory is malformed; "
+            f"{_refresh_only_value_shape(planned_values)}"
+        )
+
+    for output_name in EXPECTED_CONTROL_OUTPUTS:
+        planned_output = planned_outputs[output_name]
+        state_output = state_outputs[output_name]
+        # Terraform 1.14.3 collapses non-sensitive scalar and complex root
+        # outputs to the literal false; the version-pinned fixture covers both
+        # object and tuple values so a representation change fails closed.
+        if (
+            not _is_exact_nonsensitive_output_entry(planned_output)
+            or not _is_exact_nonsensitive_output_entry(state_output)
+            or not _json_equal(planned_output, state_output)
+        ):
+            raise ContractError(
+                f"refresh-only Terraform {TF_VERSION} outputs do not match captured state; "
+                f"{_refresh_only_value_shape(planned_values)}"
+            )
+
+    output_changes = plan.get("output_changes")
+    if (
+        not isinstance(output_changes, dict)
+        or set(output_changes) != EXPECTED_CONTROL_OUTPUTS
+    ):
+        raise ContractError(
+            f"refresh-only Terraform {TF_VERSION} output changes are malformed; "
+            f"{_refresh_only_value_shape(planned_values)}"
+        )
+    for output_name in EXPECTED_CONTROL_OUTPUTS:
+        change = output_changes[output_name]
+        output_value = planned_outputs[output_name]["value"]
+        if (
+            not isinstance(change, dict)
+            or set(change) != _OUTPUT_CHANGE_KEYS
+            or change.get("actions") != ["no-op"]
+            or change.get("after_unknown") is not False
+            or change.get("before_sensitive") is not False
+            or change.get("after_sensitive") is not False
+            or not _json_equal(change.get("before"), output_value)
+            or not _json_equal(change.get("after"), output_value)
+        ):
+            raise ContractError(
+                f"refresh-only Terraform {TF_VERSION} outputs must be exact no-ops; "
+                f"{_refresh_only_value_shape(planned_values)}"
+            )
+
+
 def _plan_resource_changes(
     plan: dict[str, Any],
     drift: list[dict[str, Any]],
@@ -1104,11 +1260,6 @@ def _plan_resource_changes(
     if not drift:
         raise ContractError("Terraform plan resource_changes must be an array")
 
-    if plan.get("planned_values") != {"root_module": {}}:
-        raise ContractError(
-            f"refresh-only compatibility requires the exact empty Terraform {TF_VERSION} "
-            "planned_values shape"
-        )
     if (
         not isinstance(prior_state, dict)
         or prior_state.get("format_version") != "1.0"
@@ -1117,6 +1268,7 @@ def _plan_resource_changes(
         raise ContractError(
             f"refresh-only compatibility requires exact Terraform {TF_VERSION} state JSON"
         )
+    _check_refresh_only_outputs(plan, prior_state)
 
     state_values = prior_state.get("values")
     root = (

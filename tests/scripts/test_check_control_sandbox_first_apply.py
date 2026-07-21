@@ -368,13 +368,36 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
+def control_outputs_fixture() -> dict[str, dict]:
+    outputs = {
+        name: {
+            "sensitive": False,
+            "type": "string",
+            "value": f"fixture-{index}",
+        }
+        for index, name in enumerate(sorted(CHECKER.EXPECTED_CONTROL_OUTPUTS))
+    }
+    outputs["control_table_names"] = {
+        "sensitive": False,
+        "type": ["object", {"agents": "string", "customers": "string"}],
+        "value": {"agents": "fixture-agents", "customers": "fixture-customers"},
+    }
+    outputs["isolated_subnet_ids"] = {
+        "sensitive": False,
+        "type": ["tuple", ["string", "string"]],
+        "value": ["subnet-fixture-a", "subnet-fixture-b"],
+    }
+    return outputs
+
+
 def terraform_1_14_refresh_only_golden(candidate: dict) -> dict:
-    """Build the exact empirically observed Terraform 1.14 plan/state shape.
+    """Build the version-pinned Terraform 1.14 refresh plan/state shape.
 
     The Control values remain the complete synthetic security fixture so every
-    field can be mutated hermetically. The JSON envelope is the real 1.14.3
-    shape: no ``resource_changes``, empty ``planned_values.root_module``, and a
-    separate format-1.0 state containing the unchanged inventory.
+    field can be mutated hermetically. The JSON envelope follows the 1.14.3
+    source and local output-bearing reproduction: no ``resource_changes``, all
+    17 root outputs, an empty ``planned_values.root_module``, and a separate
+    format-1.0 state containing the unchanged inventory and output values.
     """
     resources = []
     for item in candidate.pop("resource_changes"):
@@ -386,11 +409,27 @@ def terraform_1_14_refresh_only_golden(candidate: dict) -> dict:
                 "values": copy.deepcopy(item["change"]["after"]),
             }
         )
-    candidate["planned_values"] = {"root_module": {}}
+    outputs = control_outputs_fixture()
+    candidate["planned_values"] = {
+        "outputs": copy.deepcopy(outputs),
+        "root_module": {},
+    }
+    candidate["output_changes"] = {
+        name: {
+            "actions": ["no-op"],
+            "after": copy.deepcopy(output["value"]),
+            "after_sensitive": False,
+            "after_unknown": False,
+            "before": copy.deepcopy(output["value"]),
+            "before_sensitive": False,
+        }
+        for name, output in outputs.items()
+    }
     return {
         "format_version": "1.0",
         "terraform_version": CHECKER.TF_VERSION,
         "values": {
+            "outputs": copy.deepcopy(outputs),
             "root_module": {
                 "child_modules": [
                     {"address": "module.control", "resources": resources}
@@ -398,6 +437,46 @@ def terraform_1_14_refresh_only_golden(candidate: dict) -> dict:
             }
         },
     }
+
+
+def publisher_refresh_candidate() -> tuple[dict, dict]:
+    candidate = plan_fixture()
+    candidate["applyable"] = True
+    role_change = next(
+        item["change"]
+        for item in candidate["resource_changes"]
+        if item["address"] == "module.control.aws_iam_role.authority_publisher"
+    )
+    candidate["resource_drift"] = [
+        {
+            "address": "module.control.aws_iam_role.authority_publisher",
+            "mode": "managed",
+            "type": "aws_iam_role",
+            "change": {
+                "actions": ["update"],
+                "after_sensitive": False,
+                "after_unknown": {},
+                "before": {
+                    **copy.deepcopy(role_change["after"]),
+                    "inline_policy": [],
+                },
+                "before_sensitive": False,
+                "after": copy.deepcopy(role_change["after"]),
+            },
+        }
+    ]
+    prior_state = terraform_1_14_refresh_only_golden(candidate)
+    prior_role = next(
+        item
+        for item in prior_state["values"]["root_module"]["child_modules"][0][
+            "resources"
+        ]
+        if item["address"] == "module.control.aws_iam_role.authority_publisher"
+    )
+    prior_role["values"] = copy.deepcopy(
+        candidate["resource_drift"][0]["change"]["before"]
+    )
+    return candidate, prior_state
 
 
 class PlanContractTests(unittest.TestCase):
@@ -498,41 +577,7 @@ class PlanContractTests(unittest.TestCase):
                 )
 
     def test_exact_publisher_refresh_only_normalization_passes(self) -> None:
-        candidate = plan_fixture()
-        candidate["applyable"] = True
-        role_change = self.change(
-            candidate, "module.control.aws_iam_role.authority_publisher"
-        )
-        candidate["resource_drift"] = [
-            {
-                "address": "module.control.aws_iam_role.authority_publisher",
-                "mode": "managed",
-                "type": "aws_iam_role",
-                "change": {
-                    "actions": ["update"],
-                    "after_sensitive": False,
-                    "after_unknown": {},
-                    "before": {
-                        **copy.deepcopy(role_change["after"]),
-                        "inline_policy": [],
-                    },
-                    "before_sensitive": False,
-                    "after": copy.deepcopy(role_change["after"]),
-                },
-            }
-        ]
-        prior_state = terraform_1_14_refresh_only_golden(candidate)
-        prior_role = next(
-            item
-            for item in prior_state["values"]["root_module"]["child_modules"][0][
-                "resources"
-            ]
-            if item["address"]
-            == "module.control.aws_iam_role.authority_publisher"
-        )
-        prior_role["values"] = copy.deepcopy(
-            candidate["resource_drift"][0]["change"]["before"]
-        )
+        candidate, prior_state = publisher_refresh_candidate()
 
         summary = CHECKER.check_plan(candidate, prior_state)
 
@@ -569,44 +614,95 @@ class PlanContractTests(unittest.TestCase):
                 missing_state.stderr,
             )
 
+    def test_refresh_only_output_contract_is_exact_and_secret_safe(self) -> None:
+        declared_outputs = set(
+            re.findall(
+                r'^output\s+"([^"]+)"',
+                (ROOT / "terraform/control/environments/sandbox/outputs.tf").read_text(
+                    encoding="utf-8"
+                ),
+                flags=re.MULTILINE,
+            )
+        )
+        self.assertEqual(declared_outputs, CHECKER.EXPECTED_CONTROL_OUTPUTS)
+        output_name = min(CHECKER.EXPECTED_CONTROL_OUTPUTS)
+
+        missing_output, missing_output_state = publisher_refresh_candidate()
+        del missing_output["planned_values"]["outputs"][output_name]
+        self.assert_rejected(missing_output, missing_output_state)
+
+        sensitive_output, sensitive_output_state = publisher_refresh_candidate()
+        sensitive_output["planned_values"]["outputs"][output_name]["sensitive"] = True
+        self.assert_rejected(sensitive_output, sensitive_output_state)
+
+        missing_value, missing_value_state = publisher_refresh_candidate()
+        del missing_value["planned_values"]["outputs"][output_name]["value"]
+        self.assert_rejected(missing_value, missing_value_state)
+
+        state_mismatch, state_mismatch_state = publisher_refresh_candidate()
+        state_mismatch["planned_values"]["outputs"][output_name]["value"] = False
+        state_mismatch_state["values"]["outputs"][output_name]["value"] = 0
+        self.assert_rejected(state_mismatch, state_mismatch_state)
+
+        root_resource, root_resource_state = publisher_refresh_candidate()
+        root_resource["planned_values"]["root_module"] = {
+            "resources": [{"address": "redacted"}]
+        }
+        self.assert_rejected(root_resource, root_resource_state)
+
+        extra_top_key, extra_top_key_state = publisher_refresh_candidate()
+        extra_top_key["planned_values"]["unexpected"] = {}
+        self.assert_rejected(extra_top_key, extra_top_key_state)
+
+        missing_change, missing_change_state = publisher_refresh_candidate()
+        del missing_change["output_changes"][output_name]
+        self.assert_rejected(missing_change, missing_change_state)
+
+        changed_output, changed_output_state = publisher_refresh_candidate()
+        changed_output["output_changes"][output_name]["actions"] = ["update"]
+        self.assert_rejected(changed_output, changed_output_state)
+
+        unknown_output, unknown_output_state = publisher_refresh_candidate()
+        unknown_output["output_changes"][output_name]["after_unknown"] = True
+        self.assert_rejected(unknown_output, unknown_output_state)
+
+        integer_sensitivity, integer_sensitivity_state = publisher_refresh_candidate()
+        integer_sensitivity["output_changes"][output_name]["before_sensitive"] = 0
+        self.assert_rejected(integer_sensitivity, integer_sensitivity_state)
+
+        wrong_before, wrong_before_state = publisher_refresh_candidate()
+        wrong_before["output_changes"][output_name]["before"] = "different"
+        self.assert_rejected(wrong_before, wrong_before_state)
+
+        sentinel = "super-secret-output-value-7f510f845f8e"
+        extra_output, extra_output_state = publisher_refresh_candidate()
+        extra_output["planned_values"]["outputs"][sentinel] = {
+            "sensitive": False,
+            "type": "string",
+            "value": sentinel,
+        }
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(extra_output, extra_output_state)
+        self.assertNotIn(sentinel, str(error.exception))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan_path = root / "plan.json"
+            state_path = root / "state.json"
+            write_json(plan_path, extra_output)
+            write_json(state_path, extra_output_state)
+            result = subprocess.run(
+                [str(CHECKER_PATH), "plan", str(plan_path), str(state_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertNotIn(sentinel, result.stderr)
+
     def test_publisher_refresh_only_normalization_is_exact(self) -> None:
-        def refresh_candidate() -> tuple[dict, dict]:
-            candidate = plan_fixture()
-            candidate["applyable"] = True
-            role_change = self.change(
-                candidate, "module.control.aws_iam_role.authority_publisher"
-            )
-            candidate["resource_drift"] = [
-                {
-                    "address": "module.control.aws_iam_role.authority_publisher",
-                    "mode": "managed",
-                    "type": "aws_iam_role",
-                    "change": {
-                        "actions": ["update"],
-                        "after_sensitive": False,
-                        "after_unknown": {},
-                        "before": {
-                            **copy.deepcopy(role_change["after"]),
-                            "inline_policy": [],
-                        },
-                        "before_sensitive": False,
-                        "after": copy.deepcopy(role_change["after"]),
-                    },
-                }
-            ]
-            prior_state = terraform_1_14_refresh_only_golden(candidate)
-            prior_role = next(
-                item
-                for item in prior_state["values"]["root_module"]["child_modules"][0][
-                    "resources"
-                ]
-                if item["address"]
-                == "module.control.aws_iam_role.authority_publisher"
-            )
-            prior_role["values"] = copy.deepcopy(
-                candidate["resource_drift"][0]["change"]["before"]
-            )
-            return candidate, prior_state
+        refresh_candidate = publisher_refresh_candidate
 
         wrong_address, wrong_address_state = refresh_candidate()
         wrong_address["resource_drift"][0]["address"] = (
