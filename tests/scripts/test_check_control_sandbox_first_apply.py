@@ -1363,8 +1363,6 @@ class WorkflowContractTests(unittest.TestCase):
             ROOT / ".github/workflows/control-sandbox-first-apply.yml",
             ROOT / "scripts/capture-control-sandbox-first-apply-preflight.sh",
             ROOT / "scripts/capture-control-sandbox-partial-recovery-state.sh",
-            ROOT / "scripts/check-live-main-ref.sh",
-            ROOT / "scripts/check-no-checkout-credentials.sh",
         ):
             self.assertFalse(path.exists(), path)
         checker = CHECKER_PATH.read_text(encoding="utf-8")

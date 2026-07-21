@@ -44,8 +44,14 @@ on:
       - "scripts/check-image-tag-writer-allowlist.py"
       - "scripts/check-control-global-routing.sh"
       - "scripts/check-control-vpc-cidr-overlap.sh"
+      - "scripts/capture-control-sandbox-update-state.sh"
+      - "scripts/check-control-sandbox-aws-identity.sh"
+      - "scripts/check-live-main-ref.sh"
+      - "scripts/check-no-checkout-credentials.sh"
       - "scripts/ensure-control-otp-pepper.sh"
+      - "scripts/verify-control-otp-pepper.sh"
       - "scripts/verify-control-sandbox-first-apply.sh"
+      - "scripts/verify-control-sandbox-live-boundary.sh"
       - "scripts/check-asp-and-ac-id-lockstep.sh"
       # qURL v2 revocation-latency SLO lockstep (#2817): trigger on the script
       # and on BOTH source-of-truth sites it compares so a one-sided edit to the
@@ -519,13 +525,20 @@ jobs:
       - name: Test sandbox Control foundation boundary
         run: |
           shellcheck \
+            scripts/capture-control-sandbox-update-state.sh \
+            scripts/check-control-sandbox-aws-identity.sh \
             scripts/check-control-global-routing.sh \
             scripts/check-control-vpc-cidr-overlap.sh \
+            scripts/check-live-main-ref.sh \
+            scripts/check-no-checkout-credentials.sh \
             scripts/ensure-control-otp-pepper.sh \
+            scripts/verify-control-otp-pepper.sh \
             scripts/verify-control-sandbox-first-apply.sh \
+            scripts/verify-control-sandbox-live-boundary.sh \
             tests/fixtures/control-vpc-cidr-overlap/aws \
             tests/scripts/check-control-global-routing_test.sh
           python3 tests/scripts/test_check_control_sandbox_first_apply.py
+          python3 tests/scripts/test_check_control_sandbox_update.py
           tests/scripts/check-control-global-routing_test.sh
 
       - name: Setup Terraform for relay DMZ contract test

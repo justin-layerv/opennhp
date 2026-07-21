@@ -49,6 +49,39 @@ bypass this steady-state fence. The
 [sandbox relay DMZ runbook](../../docs/runbooks/sandbox-relay-dmz-replacement.md)
 documents normal deployment and verification.
 
+### `control-sandbox-update.yml` — Control Sandbox Update
+
+Manually plans, applies, or verifies the isolated sandbox Connector Control
+Terraform root. `plan` and `apply` are separate dispatches: the apply operator
+must copy the reviewed plan run, commit, saved-plan digest, and exact versioned
+state identity from the plan summary. The apply then revalidates the successful
+source run, two-day age window, artifact hashes, live `main`, source-owned
+Control plan contract, and unchanged S3 state immediately before applying the
+saved binary plan. Immediately before apply it also proves the untracked live
+dark-network boundary, then deletes the source artifact so the reviewed plan is
+single-use. Apply workflow reruns are rejected. All operations use the
+`sandbox` environment and share the ordinary `deploy-sandbox-infra` writer
+lock. There is no production operation; production Control remains blocked on
+#3279.
+
+The uploaded binary `tfplan` is confidentiality-equivalent to its JSON
+rendering and includes the state snapshot Terraform needs for an exact saved-
+plan apply. Omitting `tfplan.json` and raw `state.tfstate` minimizes retained
+copies; it does not sanitize the binary plan. The exact Control contract is
+currently safe for repository Actions readers because it contains only
+infrastructure and secret metadata: the OTP pepper is seeded out of band,
+Redis is IAM-only and passwordless, and the checked inputs contain no sensitive
+variable. Adding a secret-bearing resource or input requires a newly reviewed
+artifact-custody design before this workflow may carry it.
+
+An apply failure is not retried with the stale plan. The failed run publishes a
+sanitized post-failure state identity when it can safely capture one; recovery
+is a new `plan` dispatch from current `main` and current live state. The
+source-owned Control checker must explicitly accept that partial-retry shape.
+Successful applies and explicit `verify` runs require a refresh-enabled no-op
+and upload only sanitized state, inventory, live-boundary, and secret-readiness
+summaries—not raw Terraform state or plan JSON.
+
 ### `terraform-plan-pr.yml` — Terraform Plan (PR)
 
 Runs on every PR so branch protection can require the check; the per-PR runner cost is an accepted tradeoff for a non-deadlocking required check. It skips without AWS credentials unless the PR touches Terraform plan inputs. Markdown-only changes under `terraform/` are treated as docs and do not request AWS credentials, including prod-environment markdown because docs are classified before the prod-only Terraform glob. Prod-only `terraform/environments/prod/**` PRs report `prod-only skipped` instead of hard-gating on unrelated sandbox state.
