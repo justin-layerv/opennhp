@@ -1091,7 +1091,11 @@ jobs:
       needs.app-image-build-required.result == 'success' &&
       (needs.terraform-validate.result == 'success' || needs.terraform-validate.result == 'skipped') &&
       (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped')
-    timeout-minutes: 15
+    # Keep the normal image legs fail-fast. The AC image temporarily rebuilds
+    # Traefik from source to carry the fixed grpc-go version until upstream
+    # publishes a clean binary (tracked in #3386), so only that matrix row
+    # needs the larger cold-cache budget.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -1101,6 +1105,7 @@ jobs:
             repo: layerv/nhp-server
             platform: linux/amd64
             publish: true
+            timeout_minutes: 15
           - image: ac
             dockerfile: docker/Dockerfile.ac.aws
             repo: layerv/nhp-ac
@@ -1110,6 +1115,7 @@ jobs:
             # real non-amd64 BPF load test exists for the flip slice.
             platform: linux/amd64
             publish: true
+            timeout_minutes: 30
           # The NHP-Relay (#2208). Build + scan + push, mirroring the server/ac
           # legs. The CD deploy leg (#2624) is the `deploy-sandbox-relay` job
           # below: it puts this freshly-built tag into /sandbox/nhp/relay/image-tag
@@ -1121,6 +1127,7 @@ jobs:
             repo: layerv/nhp-relay
             platform: linux/amd64
             publish: true
+            timeout_minutes: 15
           # The assignment-only Connector Hub image is built, inventoried, and
           # scanned in durable CI while the runtime remains dark. Its ECR repo,
           # publisher IAM, deployment, private health path, and public UDP edge
@@ -1130,6 +1137,7 @@ jobs:
             repo: layerv/nhp-hub
             platform: linux/amd64
             publish: false
+            timeout_minutes: 15
     steps:
       # Skip at step level (not job level) so matrix expands and check names are created
       # Build only when this commit changed app paths, or the live sandbox app

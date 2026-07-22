@@ -428,6 +428,9 @@ lint-workflows:
 	@bash scripts/check-scope-drift.sh
 	@bash tests/scripts/check-go-version-drift_test.sh
 	@bash scripts/check-go-version-drift.sh
+	@shellcheck scripts/check-traefik-grpc-pin.sh tests/scripts/check-traefik-grpc-pin_test.sh
+	@bash tests/scripts/check-traefik-grpc-pin_test.sh
+	@bash scripts/check-traefik-grpc-pin.sh
 	@shellcheck scripts/check-smoke-tier-filter-coverage.sh tests/lints/smoke-tier-filter-coverage/run-fixtures.sh
 	@bash tests/lints/smoke-tier-filter-coverage/run-fixtures.sh
 	@bash scripts/check-smoke-tier-filter-coverage.sh

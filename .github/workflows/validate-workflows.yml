@@ -17,6 +17,7 @@ on:
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
       - "scripts/check-go-version-drift.sh"
+      - "scripts/check-traefik-grpc-pin.sh"
       - "scripts/check-claude-model-lockstep.py"
       - "scripts/check-disable-agent-validation.sh"
       - "scripts/check-smoke-tier-filter-coverage.sh"
@@ -317,6 +318,16 @@ jobs:
 
       - name: Check Go version drift
         run: bash scripts/check-go-version-drift.sh
+
+      # GHSA-hrxh-6v49-42gf fence: the newest upstream Traefik release still
+      # embeds vulnerable grpc-go, so Dockerfile.ac.aws temporarily rebuilds
+      # the same Traefik patch from checksum-pinned source. Keep its grpc floor
+      # literal (not a build arg) and prove the produced binary is inspected.
+      - name: Test + check AC Traefik grpc-go security floor
+        run: |
+          shellcheck scripts/check-traefik-grpc-pin.sh tests/scripts/check-traefik-grpc-pin_test.sh
+          bash tests/scripts/check-traefik-grpc-pin_test.sh
+          bash scripts/check-traefik-grpc-pin.sh
 
       # Deterministic guard (#2800/#2804) that every ubuntu-based Dockerfile
       # strips Canonical's /usr/bin/pebble. trivy only covers the gated trio, and
