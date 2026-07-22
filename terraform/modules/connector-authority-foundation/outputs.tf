@@ -85,13 +85,28 @@ output "otp_redis_security_group_id" {
 }
 
 output "otp_redis_user_group_id" {
-  description = "Redis RBAC group with a disabled default user and one IAM-authenticated authority user."
+  description = "Redis RBAC group with a disabled default user and separate IAM-authenticated issuer and activator users."
   value       = aws_elasticache_user_group.otp.user_group_id
 }
 
-output "otp_redis_authority_user_arn" {
-  description = "IAM-authenticated Redis user ARN for the future OTP function elasticache:Connect policy."
-  value       = aws_elasticache_user.otp_authority.arn
+output "otp_redis_issuer_user_id" {
+  description = "Exact Redis IAM user ID for the OTP issuer runtime configuration."
+  value       = aws_elasticache_user.otp_issuer.user_id
+}
+
+output "otp_redis_issuer_user_arn" {
+  description = "Exact Redis IAM user ARN for the OTP issuer execution role."
+  value       = aws_elasticache_user.otp_issuer.arn
+}
+
+output "otp_redis_activator_user_id" {
+  description = "Exact Redis IAM user ID for the OTP activator runtime configuration."
+  value       = aws_elasticache_user.otp_activator.user_id
+}
+
+output "otp_redis_activator_user_arn" {
+  description = "Exact Redis IAM user ARN for the OTP activator execution role."
+  value       = aws_elasticache_user.otp_activator.arn
 }
 
 output "otp_email_from" {

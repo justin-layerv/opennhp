@@ -87,6 +87,27 @@ AUTHORITY_PUBLISHER_POLICY = {
     ],
     "Version": "2012-10-17",
 }
+OTP_REDIS_LEGACY_ACCESS = (
+    "on ~connector:* -@all +@connection +@read +@write +@scripting"
+)
+OTP_REDIS_ISSUER_ACCESS = (
+    "on %W~connector:registration-otp:v2:{*}:challenge "
+    "%W~connector:registration-otp:v2:{*}:state "
+    "~connector:ratelimit:registration-otp:credential:* "
+    "~connector:ratelimit:registration-otp:owner:* "
+    "~connector:ratelimit:registration-otp:peer:* "
+    "~connector:ratelimit:registration-otp:source:* "
+    "-@all +hello +auth +ping +command +cluster|slots "
+    "+multi +exec +discard +del +hset +expire "
+    "+eval +evalsha +zremrangebyscore +zcard +zrange +zadd"
+)
+OTP_REDIS_ACTIVATOR_ACCESS = (
+    "on %R~connector:registration-otp:v2:{*}:challenge "
+    "~connector:registration-otp:v2:{*}:state "
+    "-@all +hello +auth +ping +command +cluster|slots "
+    "+watch +unwatch +multi +exec +discard "
+    "+hmget +hlen +pttl +hset +pexpire"
+)
 _DYNAMODB_TABLES = (
     "agent_keys",
     "api_key_idempotency",
@@ -109,8 +130,11 @@ EXPECTED_CONTROL_OUTPUTS = frozenset(
         "interface_endpoint_ids",
         "isolated_subnet_ids",
         "otp_pepper_secret_arn",
-        "otp_redis_authority_user_arn",
+        "otp_redis_activator_user_arn",
+        "otp_redis_activator_user_id",
         "otp_redis_endpoint",
+        "otp_redis_issuer_user_arn",
+        "otp_redis_issuer_user_id",
         "otp_redis_user_group_id",
         "qat1_signing_kms_key_arn",
         "ses_identity_arn",
@@ -154,8 +178,10 @@ EXPECTED_RESOURCES = {
     "module.control.aws_dynamodb_table.customers": "aws_dynamodb_table",
     "module.control.aws_ecr_repository.authority": "aws_ecr_repository",
     "module.control.aws_elasticache_serverless_cache.otp": "aws_elasticache_serverless_cache",
+    "module.control.aws_elasticache_user.otp_activator": "aws_elasticache_user",
     "module.control.aws_elasticache_user.otp_authority": "aws_elasticache_user",
     "module.control.aws_elasticache_user.otp_disabled_default": "aws_elasticache_user",
+    "module.control.aws_elasticache_user.otp_issuer": "aws_elasticache_user",
     "module.control.aws_elasticache_user_group.otp": "aws_elasticache_user_group",
     "module.control.aws_flow_log.control": "aws_flow_log",
     "module.control.aws_iam_role.flow_logs": "aws_iam_role",
@@ -196,6 +222,20 @@ PUBLISHER_BOOTSTRAP_RESOURCES = frozenset(
         "module.control.aws_iam_role_policy.authority_publisher",
     }
 )
+REDIS_SPLIT_USER_RESOURCES = frozenset(
+    {
+        "module.control.aws_elasticache_user.otp_activator",
+        "module.control.aws_elasticache_user.otp_issuer",
+    }
+)
+
+# Exact value-free Terraform 1.14.3 / AWS provider 6.55.0 create envelope for
+# an IAM-authenticated ElastiCache user. The provider computes password_count
+# only after create; the configured absence of passwords remains a sensitive
+# null. Reproduce and re-review this shape when either pinned version changes.
+_REDIS_IAM_CREATE_AUTHENTICATION_MODE = [{"passwords": None, "type": "iam"}]
+_REDIS_IAM_CREATE_AUTHENTICATION_MODE_UNKNOWN = [{"password_count": True}]
+_REDIS_IAM_CREATE_AUTHENTICATION_MODE_SENSITIVE = [{"passwords": True}]
 
 INTERFACE_ENDPOINT_SERVICES = (
     "email",
@@ -354,8 +394,10 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
         ("user_ids",): [
             "aws_elasticache_user.otp_disabled_default.user_id",
             "aws_elasticache_user.otp_disabled_default",
-            "aws_elasticache_user.otp_authority.user_id",
-            "aws_elasticache_user.otp_authority",
+            "aws_elasticache_user.otp_issuer.user_id",
+            "aws_elasticache_user.otp_issuer",
+            "aws_elasticache_user.otp_activator.user_id",
+            "aws_elasticache_user.otp_activator",
         ],
     },
     "module.control.aws_flow_log.control": {
@@ -450,11 +492,17 @@ CONFIG_CONSTANT_CONTRACT: dict[str, dict[ExpressionPath, Any]] = {
         ("image_scanning_configuration", 0, "scan_on_push"): True,
         ("image_tag_mutability",): "IMMUTABLE",
     },
+    "module.control.aws_elasticache_user.otp_activator": {
+        ("authentication_mode", 0, "type"): "iam",
+    },
     "module.control.aws_elasticache_user.otp_authority": {
         ("authentication_mode", 0, "type"): "iam",
     },
     "module.control.aws_elasticache_user.otp_disabled_default": {
         ("authentication_mode", 0, "type"): "no-password-required",
+    },
+    "module.control.aws_elasticache_user.otp_issuer": {
+        ("authentication_mode", 0, "type"): "iam",
     },
 }
 for _table in _DYNAMODB_TABLES:
@@ -497,6 +545,13 @@ CONFIG_ABSENT_PATHS: dict[str, tuple[ExpressionPath, ...]] = {
         ("daily_snapshot_time",),
         ("snapshot_arns_to_restore",),
     ),
+    "module.control.aws_elasticache_user.otp_activator": (
+        ("authentication_mode", 0, "passwords"),
+        ("no_password_required",),
+        ("passwords",),
+        ("passwords_wo",),
+        ("passwords_wo_version",),
+    ),
     "module.control.aws_elasticache_user.otp_authority": (
         ("authentication_mode", 0, "passwords"),
         ("no_password_required",),
@@ -515,6 +570,13 @@ CONFIG_ABSENT_PATHS: dict[str, tuple[ExpressionPath, ...]] = {
         ("inline_policy",),
         ("managed_policy_arns",),
         ("permissions_boundary",),
+    ),
+    "module.control.aws_elasticache_user.otp_issuer": (
+        ("authentication_mode", 0, "passwords"),
+        ("no_password_required",),
+        ("passwords",),
+        ("passwords_wo",),
+        ("passwords_wo_version",),
     ),
 }
 
@@ -969,8 +1031,15 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
         _require_json_field(after, "policy", DENY_ENDPOINT_POLICY, address)
 
     redis_contracts = {
+        "module.control.aws_elasticache_user.otp_activator": {
+            "access_string": OTP_REDIS_ACTIVATOR_ACCESS,
+            "engine": "redis",
+            "region": AWS_REGION,
+            "user_id": f"{CONTROL_PREFIX}-otp-activator",
+            "user_name": f"{CONTROL_PREFIX}-otp-activator",
+        },
         "module.control.aws_elasticache_user.otp_authority": {
-            "access_string": "on ~connector:* -@all +@connection +@read +@write +@scripting",
+            "access_string": OTP_REDIS_LEGACY_ACCESS,
             "engine": "redis",
             "region": AWS_REGION,
             "user_id": f"{CONTROL_PREFIX}-otp-auth",
@@ -982,6 +1051,13 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
             "region": AWS_REGION,
             "user_id": f"{CONTROL_PREFIX}-otp-default",
             "user_name": "default",
+        },
+        "module.control.aws_elasticache_user.otp_issuer": {
+            "access_string": OTP_REDIS_ISSUER_ACCESS,
+            "engine": "redis",
+            "region": AWS_REGION,
+            "user_id": f"{CONTROL_PREFIX}-otp-issuer",
+            "user_name": f"{CONTROL_PREFIX}-otp-issuer",
         },
         "module.control.aws_elasticache_user_group.otp": {
             "engine": "redis",
@@ -1006,31 +1082,52 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
     # upgrade must regenerate and re-review the plan fixtures before changing
     # this split (including the analogous IPv6 null/empty shapes).
     for address, auth_type in (
+        ("module.control.aws_elasticache_user.otp_activator", "iam"),
         ("module.control.aws_elasticache_user.otp_authority", "iam"),
         (
             "module.control.aws_elasticache_user.otp_disabled_default",
             "no-password",
         ),
+        ("module.control.aws_elasticache_user.otp_issuer", "iam"),
     ):
-        after, _ = values(address)
+        after, unknown = values(address)
         auth = after.get("authentication_mode")
-        if (
-            not isinstance(auth, list)
-            or len(auth) != 1
-            or not isinstance(auth[0], dict)
-            or auth[0].get("type") != auth_type
-            or auth[0].get("passwords") != []
-            or auth[0].get("password_count") not in (None, 0)
-        ):
+        change = by_address[address]["change"]
+        if change.get("actions") == ["create"]:
+            after_sensitive = change.get("after_sensitive")
+            if (
+                address not in REDIS_SPLIT_USER_RESOURCES
+                or auth != _REDIS_IAM_CREATE_AUTHENTICATION_MODE
+                or unknown.get("authentication_mode")
+                != _REDIS_IAM_CREATE_AUTHENTICATION_MODE_UNKNOWN
+                or not isinstance(after_sensitive, dict)
+                or after_sensitive.get("authentication_mode")
+                != _REDIS_IAM_CREATE_AUTHENTICATION_MODE_SENSITIVE
+            ):
+                raise ContractError(
+                    f"{address} IAM create authentication mode is not the exact "
+                    "fail-closed provider shape"
+                )
+            continue
+        expected_auth = [
+            {"password_count": 0, "passwords": [], "type": auth_type}
+        ]
+        if auth != expected_auth or "authentication_mode" in unknown:
             raise ContractError(f"{address} authentication mode is not fail closed")
 
-    group, _ = values("module.control.aws_elasticache_user_group.otp")
+    group, group_unknown = values("module.control.aws_elasticache_user_group.otp")
     expected_users = {
-        f"{CONTROL_PREFIX}-otp-auth",
+        f"{CONTROL_PREFIX}-otp-activator",
         f"{CONTROL_PREFIX}-otp-default",
+        f"{CONTROL_PREFIX}-otp-issuer",
     }
     users = group.get("user_ids")
-    if not isinstance(users, list) or len(users) != 2 or set(users) != expected_users:
+    if (
+        not isinstance(users, list)
+        or len(users) != 3
+        or set(users) != expected_users
+        or "user_ids" in group_unknown
+    ):
         raise ContractError("planned OTP Redis user-group membership drifted")
 
     cache, _ = values("module.control.aws_elasticache_serverless_cache.otp")
@@ -1399,40 +1496,99 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             f"Terraform resource inventory mismatch; missing={missing}, extra={extra}"
         )
 
-    bootstrap_creates: set[str] = set()
+    actual_non_noop: dict[str, list[str]] = {}
     for address, expected_type in EXPECTED_RESOURCES.items():
         item = by_address[address]
         if item.get("mode") != "managed" or item.get("type") != expected_type:
             raise ContractError(f"unexpected mode/type for {address}")
         change = item.get("change")
-        if not isinstance(change, dict):
-            raise ContractError(f"{address} change is malformed")
-        actions = change.get("actions")
+        if not isinstance(change, dict) or not isinstance(
+            change.get("actions"), list
+        ):
+            raise ContractError(f"{address} change/actions are malformed")
+        actions = change["actions"]
         if actions == ["no-op"]:
             if change.get("before") != change.get("after"):
                 raise ContractError(f"{address} no-op before and after differ")
-            continue
-        if address in PUBLISHER_BOOTSTRAP_RESOURCES and actions == ["create"]:
+        else:
+            actual_non_noop[address] = actions
+
+    plan_mode = "no-op"
+    bootstrap_creates: set[str] = set()
+    changed = set(actual_non_noop)
+    publisher_transition = (
+        bool(changed)
+        and changed.issubset(PUBLISHER_BOOTSTRAP_RESOURCES)
+        and all(actual_non_noop[address] == ["create"] for address in changed)
+        and (
+            "module.control.aws_iam_role.authority_publisher" not in changed
+            or "module.control.aws_iam_role_policy.authority_publisher" in changed
+        )
+    )
+    redis_group_address = "module.control.aws_elasticache_user_group.otp"
+    redis_user_addresses = REDIS_SPLIT_USER_RESOURCES
+    changed_redis_user_addresses = changed & redis_user_addresses
+    redis_transition = (
+        redis_group_address in changed
+        and changed.issubset({redis_group_address, *redis_user_addresses})
+        and actual_non_noop.get(redis_group_address) == ["update"]
+        and all(
+            actual_non_noop.get(address) == ["create"]
+            for address in changed_redis_user_addresses
+        )
+    )
+
+    if publisher_transition:
+        plan_mode = "publisher-bootstrap"
+        bootstrap_creates = changed
+        for address in changed:
+            change = by_address[address]["change"]
             if change.get("before") is not None or not isinstance(
                 change.get("after"), dict
             ):
                 raise ContractError(f"{address} create shape is malformed")
-            bootstrap_creates.add(address)
-            continue
-        raise ContractError(
-            f"{address} must be no-op or an exact publisher bootstrap create"
+    elif redis_transition:
+        plan_mode = "redis-split-transition"
+        for address in changed_redis_user_addresses:
+            change = by_address[address]["change"]
+            if change.get("before") is not None or not isinstance(
+                change.get("after"), dict
+            ):
+                raise ContractError("split Redis users must be new resources")
+        group_change = by_address[redis_group_address]["change"]
+        group_before = group_change.get("before")
+        group_after = group_change.get("after")
+        group_before_users = (
+            group_before.get("user_ids") if isinstance(group_before, dict) else None
         )
-
-    publisher_role_address = "module.control.aws_iam_role.authority_publisher"
-    publisher_policy_address = (
-        "module.control.aws_iam_role_policy.authority_publisher"
-    )
-    if (
-        publisher_role_address in bootstrap_creates
-        and publisher_policy_address not in bootstrap_creates
-    ):
+        if (
+            not isinstance(group_before, dict)
+            or not isinstance(group_after, dict)
+            or not isinstance(group_before_users, list)
+            or len(group_before_users) != 2
+            or set(group_before_users)
+            != {
+                f"{CONTROL_PREFIX}-otp-auth",
+                f"{CONTROL_PREFIX}-otp-default",
+            }
+        ):
+            raise ContractError(
+                "Redis split must start from the exact legacy user-group membership"
+            )
+        before_without_users = {
+            key: value for key, value in group_before.items() if key != "user_ids"
+        }
+        after_without_users = {
+            key: value for key, value in group_after.items() if key != "user_ids"
+        }
+        if before_without_users != after_without_users:
+            raise ContractError(
+                "Redis split user-group update may change only user_ids"
+            )
+    elif changed:
         raise ContractError(
-            "authority publisher role create requires its inline policy create"
+            "Terraform changes must be an exact no-op, publisher bootstrap, "
+            f"or reviewed Redis split; got {actual_non_noop}"
         )
 
     _check_planned_security(by_address)
@@ -1441,11 +1597,16 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         drift, by_address
     )
 
-    expected_applyable = bool(bootstrap_creates or normalization_drift_count)
+    if normalization_drift_count and plan_mode != "no-op":
+        raise ContractError(
+            "publisher state normalization cannot be combined with a resource transition"
+        )
+
+    expected_applyable = plan_mode != "no-op" or normalization_drift_count == 1
     if plan.get("applyable") is not expected_applyable:
         raise ContractError(
-            "Terraform applyability must match exact publisher bootstrap creates "
-            "or the exact refresh-only state normalization"
+            f"Terraform {plan_mode} plan applyability must match its exact resource "
+            "transition or the exact refresh-only state normalization"
         )
     # Bind the complete admitted drift across the review-time and immediate
     # pre-apply plans. Canonical object-key ordering removes JSON presentation
@@ -1455,6 +1616,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         "contract_sha256": contract_sha256(),
         "normalization_drift_sha256": _json_sha256(drift),
         "normalization_drift_count": normalization_drift_count,
+        "plan_mode": plan_mode,
         "resource_count": len(EXPECTED_RESOURCES),
     }
 
@@ -1469,7 +1631,7 @@ def check_state_list(path: Path) -> dict[str, int]:
 
     # `terraform state list` includes both managed resources and cached data
     # sources. Require the reviewed union here; the subsequent JSON state check
-    # remains mode-aware and independently enforces the exact 43 managed
+    # remains mode-aware and independently enforces the exact 45 managed
     # resources plus their types and security-sensitive values.
     expected = set(EXPECTED_RESOURCES) | set(EXPECTED_DATA_RESOURCES)
     missing = sorted(expected - addresses)
@@ -1491,6 +1653,22 @@ def _iter_resources(module: Any) -> Iterable[dict[str, Any]]:
         yield resource
     for child in module.get("child_modules", []):
         yield from _iter_resources(child)
+
+
+def _require_iam_redis_user(
+    user: dict[str, Any], user_id: str, access_string: str, message: str
+) -> None:
+    # Every runtime OTP Redis user must be IAM-only, passwordless, name==id, and
+    # pinned to its exact reviewed ACL. Any drift fails the state contract.
+    auth = user.get("authentication_mode", [])
+    if (
+        user.get("user_name") != user_id
+        or user.get("user_id") != user_id
+        or user.get("access_string") != access_string
+        or [item.get("type") for item in auth] != ["iam"]
+        or [item.get("password_count") for item in auth] != [0]
+    ):
+        raise ContractError(message)
 
 
 def check_state(state: Any) -> dict[str, Any]:
@@ -1632,11 +1810,12 @@ def check_state(state: Any) -> dict[str, Any]:
         or set(cache.get("subnet_ids", [])) != subnet_ids
     ):
         raise ContractError("OTP Redis cache contract failed")
+    activator = values["module.control.aws_elasticache_user.otp_activator"]
     disabled = values["module.control.aws_elasticache_user.otp_disabled_default"]
-    authority = values["module.control.aws_elasticache_user.otp_authority"]
+    legacy = values["module.control.aws_elasticache_user.otp_authority"]
+    issuer = values["module.control.aws_elasticache_user.otp_issuer"]
     group = values["module.control.aws_elasticache_user_group.otp"]
     disabled_auth = disabled.get("authentication_mode", [])
-    authority_auth = authority.get("authentication_mode", [])
     if (
         disabled.get("user_name") != "default"
         or disabled.get("access_string") != "off ~* -@all"
@@ -1644,18 +1823,36 @@ def check_state(state: Any) -> dict[str, Any]:
         or [item.get("password_count") for item in disabled_auth] != [0]
     ):
         raise ContractError("Redis default user is not disabled")
+    _require_iam_redis_user(
+        legacy,
+        f"{CONTROL_PREFIX}-otp-auth",
+        OTP_REDIS_LEGACY_ACCESS,
+        "detached legacy Redis authority ACL drifted",
+    )
+    _require_iam_redis_user(
+        issuer,
+        f"{CONTROL_PREFIX}-otp-issuer",
+        OTP_REDIS_ISSUER_ACCESS,
+        "Redis issuer ACL drifted",
+    )
+    _require_iam_redis_user(
+        activator,
+        f"{CONTROL_PREFIX}-otp-activator",
+        OTP_REDIS_ACTIVATOR_ACCESS,
+        "Redis activator ACL drifted",
+    )
+    group_users = group.get("user_ids")
     if (
-        authority.get("user_name") != f"{CONTROL_PREFIX}-otp-auth"
-        or authority.get("user_id") != f"{CONTROL_PREFIX}-otp-auth"
-        or authority.get("access_string")
-        != "on ~connector:* -@all +@connection +@read +@write +@scripting"
-        or [item.get("type") for item in authority_auth] != ["iam"]
-        or [item.get("password_count") for item in authority_auth] != [0]
+        group.get("user_group_id") != f"{CONTROL_PREFIX}-otp-users"
+        or not isinstance(group_users, list)
+        or len(group_users) != 3
+        or set(group_users)
+        != {
+            disabled.get("user_id"),
+            issuer.get("user_id"),
+            activator.get("user_id"),
+        }
     ):
-        raise ContractError("Redis authority ACL drifted")
-    if group.get("user_group_id") != f"{CONTROL_PREFIX}-otp-users" or set(
-        group.get("user_ids", [])
-    ) != {disabled.get("user_id"), authority.get("user_id")}:
         raise ContractError("Redis user-group membership drifted")
 
     return {"resource_count": len(resources), "vpc_id": vpc_id}

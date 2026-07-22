@@ -1,0 +1,38 @@
+{
+  "terraform_version": "1.14.3",
+  "aws_provider_version": "6.55.0",
+  "provenance": {
+    "source": "terraform show -json for a create-only aws_elasticache_user plan",
+    "projection": "change actions plus authentication_mode value, unknown, and sensitive masks",
+    "captured_on": "2026-07-21",
+    "contains_sensitive_values": false
+  },
+  "change": {
+    "actions": [
+      "create"
+    ],
+    "before": null,
+    "after": {
+      "authentication_mode": [
+        {
+          "passwords": null,
+          "type": "iam"
+        }
+      ]
+    },
+    "after_unknown": {
+      "authentication_mode": [
+        {
+          "password_count": true
+        }
+      ]
+    },
+    "after_sensitive": {
+      "authentication_mode": [
+        {
+          "passwords": true
+        }
+      ]
+    }
+  }
+}

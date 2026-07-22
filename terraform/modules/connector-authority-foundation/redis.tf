@@ -19,9 +19,18 @@ resource "aws_security_group" "otp_redis" {
 
 locals {
   # ElastiCache IAM authentication requires user_name == user_id and limits
-  # each to 40 characters. Keep the suffix short enough to leave prefix
-  # headroom, then fence that provider limit in the module contract test.
-  otp_redis_authority_user_id = "${local.name_prefix}-otp-auth"
+  # each to 40 characters. The AWS provider does not reject an overlong ID at
+  # plan time, so foundation_contract fences every derived ID below.
+  otp_redis_disabled_default_user_id = "${local.name_prefix}-otp-default"
+  otp_redis_legacy_authority_user_id = "${local.name_prefix}-otp-auth"
+  otp_redis_issuer_user_id           = "${local.name_prefix}-otp-issuer"
+  otp_redis_activator_user_id        = "${local.name_prefix}-otp-activator"
+  otp_redis_user_ids = [
+    local.otp_redis_disabled_default_user_id,
+    local.otp_redis_legacy_authority_user_id,
+    local.otp_redis_issuer_user_id,
+    local.otp_redis_activator_user_id,
+  ]
 }
 
 # Redis OSS user groups must contain a user named "default". Replace the
@@ -29,7 +38,7 @@ locals {
 # has an unauthenticated compatibility path. This user intentionally uses
 # no-password authentication: its ACL is off and denies every command/key.
 resource "aws_elasticache_user" "otp_disabled_default" {
-  user_id       = "${local.name_prefix}-otp-default"
+  user_id       = local.otp_redis_disabled_default_user_id
   user_name     = "default"
   access_string = "off ~* -@all"
   engine        = "redis"
@@ -58,18 +67,17 @@ resource "aws_elasticache_user" "otp_disabled_default" {
   }
 
   tags = merge(local.common_tags, {
-    Name    = "${local.name_prefix}-otp-default"
+    Name    = local.otp_redis_disabled_default_user_id
     Purpose = "Disabled Redis OSS default user"
   })
 }
 
-# Runtime functions authenticate with their execution role and a short-lived
-# SigV4 token. No long-lived Redis password is generated or stored in Terraform
-# state. The access string limits the authority to its own key namespace and
-# the read/write/scripting operations needed for atomic OTP/rate-limit state.
+# Retain the original IAM user for a non-destructive rollout, but detach it from
+# the active user group below. No runtime role may receive elasticache:Connect
+# to this ARN. A follow-up removes it after the split users are live-proven.
 resource "aws_elasticache_user" "otp_authority" {
-  user_id   = local.otp_redis_authority_user_id
-  user_name = local.otp_redis_authority_user_id
+  user_id   = local.otp_redis_legacy_authority_user_id
+  user_name = local.otp_redis_legacy_authority_user_id
   # ElastiCache canonicalizes an allow-list ACL by inserting an explicit
   # category reset. Keep that canonical form in configuration so a live
   # refresh does not propose a perpetual normalization update.
@@ -95,8 +103,126 @@ resource "aws_elasticache_user" "otp_authority" {
   }
 
   tags = merge(local.common_tags, {
-    Name    = local.otp_redis_authority_user_id
+    Name    = local.otp_redis_legacy_authority_user_id
     Purpose = "IAM-authenticated Connector OTP authority"
+  })
+}
+
+# OTP issuance owns immutable challenge creation, reissue state reset, and the
+# four admission-rate namespaces. Redis OSS 7 is required below because the
+# directional %R/%W key permissions were added in that engine generation.
+# Redis canonicalizes read/write `%RW~pattern` entries to `~pattern`, so the
+# bidirectional namespaces use that canonical form to prevent perpetual drift.
+# Commands are an exact allow list derived from the issuer's transaction and
+# rate-limit script; no broad read, write, or scripting category is granted.
+# The literal `{*}` glob requires the runtime's hash-tagged key shape; the
+# source separately rejects JTI values containing delimiters or braces.
+# ElastiCache Serverless is cluster-mode enabled, so go-redis receives only its
+# exact bootstrap/routing commands and the CLUSTER SLOTS subcommand, not broad
+# connection, CLIENT, or CLUSTER permissions. The runtime disables redirect
+# replay, so ASKING is intentionally absent and an ASK response fails the
+# current operation closed.
+resource "aws_elasticache_user" "otp_issuer" {
+  user_id   = local.otp_redis_issuer_user_id
+  user_name = local.otp_redis_issuer_user_id
+  access_string = join(" ", [
+    "on",
+    "%W~connector:registration-otp:v2:{*}:challenge",
+    "%W~connector:registration-otp:v2:{*}:state",
+    "~connector:ratelimit:registration-otp:credential:*",
+    "~connector:ratelimit:registration-otp:owner:*",
+    "~connector:ratelimit:registration-otp:peer:*",
+    "~connector:ratelimit:registration-otp:source:*",
+    "-@all",
+    "+hello",
+    "+auth",
+    "+ping",
+    "+command",
+    "+cluster|slots",
+    "+multi",
+    "+exec",
+    "+discard",
+    "+del",
+    "+hset",
+    "+expire",
+    "+eval",
+    "+evalsha",
+    "+zremrangebyscore",
+    "+zcard",
+    "+zrange",
+    "+zadd",
+  ])
+  engine = "redis"
+
+  authentication_mode {
+    type = "iam"
+  }
+
+  lifecycle {
+    postcondition {
+      condition = (
+        length(self.authentication_mode) == 1 &&
+        self.authentication_mode[0].type == "iam" &&
+        self.authentication_mode[0].password_count == 0
+      )
+      error_message = "The Connector OTP issuer must remain IAM-only and passwordless."
+    }
+  }
+
+  tags = merge(local.common_tags, {
+    Name    = local.otp_redis_issuer_user_id
+    Purpose = "IAM-authenticated Connector OTP issuer"
+  })
+}
+
+# Activation may read an issued challenge but may mutate only the separate
+# attempt/consumption state key. The source uses WATCH/MULTI/EXEC rather than
+# Lua so Redis never needs write permission on the immutable challenge key.
+# Its cluster client needs the same exact bootstrap/routing permissions.
+resource "aws_elasticache_user" "otp_activator" {
+  user_id   = local.otp_redis_activator_user_id
+  user_name = local.otp_redis_activator_user_id
+  access_string = join(" ", [
+    "on",
+    "%R~connector:registration-otp:v2:{*}:challenge",
+    "~connector:registration-otp:v2:{*}:state",
+    "-@all",
+    "+hello",
+    "+auth",
+    "+ping",
+    "+command",
+    "+cluster|slots",
+    "+watch",
+    "+unwatch",
+    "+multi",
+    "+exec",
+    "+discard",
+    "+hmget",
+    "+hlen",
+    "+pttl",
+    "+hset",
+    "+pexpire",
+  ])
+  engine = "redis"
+
+  authentication_mode {
+    type = "iam"
+  }
+
+  lifecycle {
+    postcondition {
+      condition = (
+        length(self.authentication_mode) == 1 &&
+        self.authentication_mode[0].type == "iam" &&
+        self.authentication_mode[0].password_count == 0
+      )
+      error_message = "The Connector OTP activator must remain IAM-only and passwordless."
+    }
+  }
+
+  tags = merge(local.common_tags, {
+    Name    = local.otp_redis_activator_user_id
+    Purpose = "IAM-authenticated Connector OTP activator"
   })
 }
 
@@ -105,7 +231,8 @@ resource "aws_elasticache_user_group" "otp" {
   user_group_id = "${local.name_prefix}-otp-users"
   user_ids = [
     aws_elasticache_user.otp_disabled_default.user_id,
-    aws_elasticache_user.otp_authority.user_id,
+    aws_elasticache_user.otp_issuer.user_id,
+    aws_elasticache_user.otp_activator.user_id,
   ]
 
   tags = merge(local.common_tags, {

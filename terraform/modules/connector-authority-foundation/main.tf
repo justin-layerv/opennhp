@@ -54,5 +54,10 @@ resource "terraform_data" "foundation_contract" {
       condition     = length(local.availability_zones) == 3
       error_message = "The Control VPC requires three available AZs in its home region."
     }
+
+    precondition {
+      condition     = alltrue([for user_id in local.otp_redis_user_ids : length(user_id) <= 40])
+      error_message = "Every Connector OTP Redis user ID must be at most 40 characters."
+    }
   }
 }

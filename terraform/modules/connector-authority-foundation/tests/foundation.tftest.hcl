@@ -178,12 +178,48 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
       aws_elasticache_user.otp_authority.authentication_mode[0].type == "iam" &&
       aws_elasticache_user.otp_authority.access_string == "on ~connector:* -@all +@connection +@read +@write +@scripting" &&
       aws_elasticache_user.otp_authority.user_name == aws_elasticache_user.otp_authority.user_id &&
+      !contains(aws_elasticache_user_group.otp.user_ids, aws_elasticache_user.otp_authority.user_id) &&
+      aws_elasticache_user.otp_issuer.authentication_mode[0].type == "iam" &&
+      aws_elasticache_user.otp_issuer.access_string == "on %W~connector:registration-otp:v2:{*}:challenge %W~connector:registration-otp:v2:{*}:state ~connector:ratelimit:registration-otp:credential:* ~connector:ratelimit:registration-otp:owner:* ~connector:ratelimit:registration-otp:peer:* ~connector:ratelimit:registration-otp:source:* -@all +hello +auth +ping +command +cluster|slots +multi +exec +discard +del +hset +expire +eval +evalsha +zremrangebyscore +zcard +zrange +zadd" &&
+      aws_elasticache_user.otp_issuer.user_name == aws_elasticache_user.otp_issuer.user_id &&
+      aws_elasticache_user.otp_activator.authentication_mode[0].type == "iam" &&
+      aws_elasticache_user.otp_activator.access_string == "on %R~connector:registration-otp:v2:{*}:challenge ~connector:registration-otp:v2:{*}:state -@all +hello +auth +ping +command +cluster|slots +watch +unwatch +multi +exec +discard +hmget +hlen +pttl +hset +pexpire" &&
+      aws_elasticache_user.otp_activator.user_name == aws_elasticache_user.otp_activator.user_id &&
+      toset(aws_elasticache_user_group.otp.user_ids) == toset([
+        aws_elasticache_user.otp_disabled_default.user_id,
+        aws_elasticache_user.otp_issuer.user_id,
+        aws_elasticache_user.otp_activator.user_id,
+      ]) &&
       length(aws_elasticache_user.otp_disabled_default.user_id) <= 40 &&
       length(aws_elasticache_user.otp_authority.user_id) <= 40 &&
+      length(aws_elasticache_user.otp_issuer.user_id) <= 40 &&
+      length(aws_elasticache_user.otp_activator.user_id) == 40 &&
+      aws_elasticache_serverless_cache.otp.major_engine_version == "7" &&
       aws_elasticache_serverless_cache.otp.user_group_id == aws_elasticache_user_group.otp.user_group_id &&
       aws_elasticache_serverless_cache.otp.snapshot_retention_limit == 0
     )
-    error_message = "OTP Redis must disable its default user, require the IAM-authenticated authority RBAC group, and never snapshot ephemeral state."
+    error_message = "OTP Redis must use Redis OSS 7 read/write key ACLs, detach the legacy authority, split issuer and activator permissions, and never snapshot ephemeral state."
+  }
+
+  assert {
+    condition = (
+      !strcontains(aws_elasticache_user.otp_issuer.access_string, "%R~connector:registration-otp:v2:{*}:challenge") &&
+      !strcontains(aws_elasticache_user.otp_issuer.access_string, "+@read") &&
+      !strcontains(aws_elasticache_user.otp_issuer.access_string, "+@write") &&
+      !strcontains(aws_elasticache_user.otp_issuer.access_string, "+@scripting") &&
+      !strcontains(aws_elasticache_user.otp_activator.access_string, "%W~connector:registration-otp:v2:{*}:challenge") &&
+      !strcontains(aws_elasticache_user.otp_activator.access_string, "%RW~connector:registration-otp:v2:{*}:challenge") &&
+      !strcontains(aws_elasticache_user.otp_activator.access_string, "+eval") &&
+      !strcontains(aws_elasticache_user.otp_activator.access_string, "+evalsha") &&
+      !strcontains(aws_elasticache_user.otp_activator.access_string, "+del") &&
+      !strcontains(aws_elasticache_user.otp_activator.access_string, "+hincrby") &&
+      !strcontains(aws_elasticache_user.otp_activator.access_string, "+hget") &&
+      !strcontains(aws_elasticache_user.otp_issuer.access_string, "+@connection") &&
+      !strcontains(aws_elasticache_user.otp_activator.access_string, "+@connection") &&
+      !strcontains(aws_elasticache_user.otp_issuer.access_string, "+client") &&
+      !strcontains(aws_elasticache_user.otp_activator.access_string, "+client")
+    )
+    error_message = "Issuer challenge reads and activator challenge writes, deletes, scripts, HINCRBY, unused HGET, or broad connection/client permissions must remain denied."
   }
 
   assert {

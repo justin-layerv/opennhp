@@ -31,6 +31,11 @@ EXPECTED_AWS_PROVIDER_VERSION = "6.55.0"
 REAL_TERRAFORM_NOOP_FIXTURE_PATH = (
     ROOT / "tests/fixtures/qurl-agent-transact-iam/no-op-terraform-1.14.3.json"
 )
+REAL_REDIS_IAM_CREATE_FIXTURE_PATH = (
+    ROOT
+    / "tests/fixtures/control-elasticache-user/"
+    "create-authentication-mode-terraform-1.14.3-aws-6.55.0.json"
+)
 SPEC = importlib.util.spec_from_file_location("control_first_apply", CHECKER_PATH)
 assert SPEC and SPEC.loader
 CHECKER = importlib.util.module_from_spec(SPEC)
@@ -111,12 +116,34 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
         ),
         "module.control.aws_elasticache_user.otp_authority": (
             {
-                "access_string": "on ~connector:* -@all +@connection +@read +@write +@scripting",
+                "access_string": CHECKER.OTP_REDIS_LEGACY_ACCESS,
                 "authentication_mode": [{"passwords": None, "type": "iam"}],
                 "engine": "redis",
                 "region": CHECKER.AWS_REGION,
                 "user_id": f"{CHECKER.CONTROL_PREFIX}-otp-auth",
                 "user_name": f"{CHECKER.CONTROL_PREFIX}-otp-auth",
+            },
+            {},
+        ),
+        "module.control.aws_elasticache_user.otp_issuer": (
+            {
+                "access_string": CHECKER.OTP_REDIS_ISSUER_ACCESS,
+                "authentication_mode": [{"passwords": None, "type": "iam"}],
+                "engine": "redis",
+                "region": CHECKER.AWS_REGION,
+                "user_id": f"{CHECKER.CONTROL_PREFIX}-otp-issuer",
+                "user_name": f"{CHECKER.CONTROL_PREFIX}-otp-issuer",
+            },
+            {},
+        ),
+        "module.control.aws_elasticache_user.otp_activator": (
+            {
+                "access_string": CHECKER.OTP_REDIS_ACTIVATOR_ACCESS,
+                "authentication_mode": [{"passwords": None, "type": "iam"}],
+                "engine": "redis",
+                "region": CHECKER.AWS_REGION,
+                "user_id": f"{CHECKER.CONTROL_PREFIX}-otp-activator",
+                "user_name": f"{CHECKER.CONTROL_PREFIX}-otp-activator",
             },
             {},
         ),
@@ -139,8 +166,9 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
                 "region": CHECKER.AWS_REGION,
                 "user_group_id": f"{CHECKER.CONTROL_PREFIX}-otp-users",
                 "user_ids": [
-                    f"{CHECKER.CONTROL_PREFIX}-otp-auth",
+                    f"{CHECKER.CONTROL_PREFIX}-otp-activator",
                     f"{CHECKER.CONTROL_PREFIX}-otp-default",
+                    f"{CHECKER.CONTROL_PREFIX}-otp-issuer",
                 ],
             },
             {},
@@ -325,11 +353,13 @@ def plan_fixture() -> dict:
     vpc["ipv6_ipam_pool_id"] = ""
     vpc["ipv6_netmask_length"] = 0
     for address, auth_type in (
+        ("module.control.aws_elasticache_user.otp_activator", "iam"),
         ("module.control.aws_elasticache_user.otp_authority", "iam"),
         (
             "module.control.aws_elasticache_user.otp_disabled_default",
             "no-password",
         ),
+        ("module.control.aws_elasticache_user.otp_issuer", "iam"),
     ):
         security[address][0]["authentication_mode"] = [
             {
@@ -370,6 +400,42 @@ def plan_fixture() -> dict:
     }
 
 
+def redis_split_transition_fixture(create_addresses: set[str] | None = None) -> dict:
+    result = plan_fixture()
+    result["applyable"] = True
+    changes = {item["address"]: item["change"] for item in result["resource_changes"]}
+    golden = json.loads(
+        REAL_REDIS_IAM_CREATE_FIXTURE_PATH.read_text(encoding="utf-8")
+    )["change"]
+    if create_addresses is None:
+        create_addresses = {
+            "module.control.aws_elasticache_user.otp_activator",
+            "module.control.aws_elasticache_user.otp_issuer",
+        }
+    for address in create_addresses:
+        changes[address]["actions"] = ["create"]
+        changes[address]["before"] = None
+        changes[address]["after"]["authentication_mode"] = copy.deepcopy(
+            golden["after"]["authentication_mode"]
+        )
+        changes[address]["after_unknown"]["authentication_mode"] = copy.deepcopy(
+            golden["after_unknown"]["authentication_mode"]
+        )
+        changes[address]["after_sensitive"] = copy.deepcopy(
+            golden["after_sensitive"]
+        )
+    group = changes["module.control.aws_elasticache_user_group.otp"]
+    group["actions"] = ["update"]
+    group["before"] = {
+        **group["after"],
+        "user_ids": [
+            f"{CHECKER.CONTROL_PREFIX}-otp-auth",
+            f"{CHECKER.CONTROL_PREFIX}-otp-default",
+        ],
+    }
+    return result
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
@@ -402,7 +468,7 @@ def terraform_1_14_refresh_only_golden(candidate: dict) -> dict:
     The Control values remain the complete synthetic security fixture so every
     field can be mutated hermetically. The JSON envelope follows the 1.14.3
     source and local output-bearing reproduction: no ``resource_changes``, all
-    17 root outputs, an empty ``planned_values.root_module``, and a separate
+    20 root outputs, an empty ``planned_values.root_module``, and a separate
     format-1.0 state containing the unchanged inventory and output values.
     """
     resources = []
@@ -517,17 +583,19 @@ class PlanContractTests(unittest.TestCase):
         candidate = plan_fixture()
         for field in ("format_version", "complete", "errored", "applyable"):
             candidate[field] = real_noop[field]
-        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 43)
+        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 45)
 
     def test_exact_noop_passes(self) -> None:
-        self.assertEqual(CHECKER.check_plan(plan_fixture())["resource_count"], 43)
+        summary = CHECKER.check_plan(plan_fixture())
+        self.assertEqual(summary["resource_count"], 45)
+        self.assertEqual(summary["plan_mode"], "no-op")
         unrefreshed = plan_fixture()
         unrefreshed_role = self.change(
             unrefreshed, "module.control.aws_iam_role.authority_publisher"
         )
         unrefreshed_role["before"]["inline_policy"] = []
         unrefreshed_role["after"]["inline_policy"] = []
-        self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 43)
+        self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 45)
 
         normalized = plan_fixture()
         normalized_changes = {
@@ -537,11 +605,13 @@ class PlanContractTests(unittest.TestCase):
             "assign_generated_ipv6_cidr_block"
         ] = False
         for address, auth_type in (
+            ("module.control.aws_elasticache_user.otp_activator", "iam"),
             ("module.control.aws_elasticache_user.otp_authority", "iam"),
             (
                 "module.control.aws_elasticache_user.otp_disabled_default",
                 "no-password",
             ),
+            ("module.control.aws_elasticache_user.otp_issuer", "iam"),
         ):
             normalized_changes[address]["after"]["authentication_mode"] = [
                 {"password_count": 0, "passwords": [], "type": auth_type}
@@ -562,7 +632,7 @@ class PlanContractTests(unittest.TestCase):
             "module.control.aws_security_group.otp_redis",
         ):
             normalized_changes[address]["after_unknown"] = {}
-        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 43)
+        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 45)
 
     def test_exact_publisher_first_create_and_partial_retry_pass(self) -> None:
         for create_addresses in (
@@ -599,10 +669,11 @@ class PlanContractTests(unittest.TestCase):
                     ):
                         change["after"]["role"] = None
                         change["after_unknown"]["role"] = True
+                result = CHECKER.check_plan(candidate)
                 self.assertEqual(
-                    CHECKER.check_plan(candidate)["bootstrap_create_count"],
-                    len(create_addresses),
+                    result["bootstrap_create_count"], len(create_addresses)
                 )
+                self.assertEqual(result["plan_mode"], "publisher-bootstrap")
 
     def test_exact_publisher_refresh_only_normalization_passes(self) -> None:
         candidate, prior_state = publisher_refresh_candidate()
@@ -638,6 +709,7 @@ class PlanContractTests(unittest.TestCase):
 
         self.assertEqual(summary["bootstrap_create_count"], 0)
         self.assertEqual(summary["normalization_drift_count"], 1)
+        self.assertEqual(summary["plan_mode"], "no-op")
         self.assertRegex(summary["normalization_drift_sha256"], r"^[0-9a-f]{64}$")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -979,6 +1051,301 @@ class PlanContractTests(unittest.TestCase):
 
         self.assert_rejected(candidate)
 
+    def test_exact_redis_split_and_partial_retry_transitions_pass(self) -> None:
+        all_users = {
+            "module.control.aws_elasticache_user.otp_activator",
+            "module.control.aws_elasticache_user.otp_issuer",
+        }
+        for create_addresses in (
+            all_users,
+            {"module.control.aws_elasticache_user.otp_activator"},
+            {"module.control.aws_elasticache_user.otp_issuer"},
+            set(),
+        ):
+            with self.subTest(create_addresses=create_addresses):
+                result = CHECKER.check_plan(
+                    redis_split_transition_fixture(create_addresses)
+                )
+                self.assertEqual(result["resource_count"], 45)
+                self.assertEqual(result["plan_mode"], "redis-split-transition")
+
+    def test_redis_iam_create_authentication_mode_matches_real_golden(self) -> None:
+        golden = json.loads(
+            REAL_REDIS_IAM_CREATE_FIXTURE_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(golden["terraform_version"], CHECKER.TF_VERSION)
+        self.assertEqual(
+            golden["aws_provider_version"], EXPECTED_AWS_PROVIDER_VERSION
+        )
+        self.assertEqual(
+            golden["provenance"],
+            {
+                "source": (
+                    "terraform show -json for a create-only "
+                    "aws_elasticache_user plan"
+                ),
+                "projection": (
+                    "change actions plus authentication_mode value, unknown, "
+                    "and sensitive masks"
+                ),
+                "captured_on": "2026-07-21",
+                "contains_sensitive_values": False,
+            },
+        )
+        self.assertEqual(golden["change"]["actions"], ["create"])
+        self.assertIsNone(golden["change"]["before"])
+        self.assertEqual(
+            golden["change"]["after"]["authentication_mode"],
+            CHECKER._REDIS_IAM_CREATE_AUTHENTICATION_MODE,
+        )
+        self.assertEqual(
+            golden["change"]["after_unknown"]["authentication_mode"],
+            CHECKER._REDIS_IAM_CREATE_AUTHENTICATION_MODE_UNKNOWN,
+        )
+        self.assertEqual(
+            golden["change"]["after_sensitive"]["authentication_mode"],
+            CHECKER._REDIS_IAM_CREATE_AUTHENTICATION_MODE_SENSITIVE,
+        )
+        self.assertEqual(
+            CHECKER.check_plan(redis_split_transition_fixture())["plan_mode"],
+            "redis-split-transition",
+        )
+        no_op = plan_fixture()
+        no_op_auth = self.change(
+            no_op, "module.control.aws_elasticache_user.otp_activator"
+        )["after"]["authentication_mode"]
+        self.assertEqual(
+            no_op_auth,
+            [{"password_count": 0, "passwords": [], "type": "iam"}],
+        )
+        self.assertEqual(CHECKER.check_plan(no_op)["plan_mode"], "no-op")
+
+    def test_redis_iam_create_authentication_mode_rejects_shape_drift(self) -> None:
+        for label, path, value, delete in (
+            ("after-null", ("after", "authentication_mode"), None, False),
+            (
+                "after-passwords-known",
+                ("after", "authentication_mode", 0, "passwords"),
+                [],
+                False,
+            ),
+            (
+                "unknown-null",
+                ("after_unknown", "authentication_mode"),
+                None,
+                False,
+            ),
+            (
+                "unknown-missing",
+                ("after_unknown", "authentication_mode"),
+                None,
+                True,
+            ),
+            (
+                "unknown-false",
+                ("after_unknown", "authentication_mode"),
+                [{"password_count": False}],
+                False,
+            ),
+            (
+                "unknown-extra",
+                ("after_unknown", "authentication_mode"),
+                [{"password_count": True, "passwords": True}],
+                False,
+            ),
+            (
+                "sensitive-null",
+                ("after_sensitive", "authentication_mode"),
+                None,
+                False,
+            ),
+            (
+                "sensitive-missing",
+                ("after_sensitive", "authentication_mode"),
+                None,
+                True,
+            ),
+            (
+                "sensitive-false",
+                ("after_sensitive", "authentication_mode"),
+                [{"passwords": False}],
+                False,
+            ),
+        ):
+            with self.subTest(label=label):
+                candidate = redis_split_transition_fixture()
+                change = self.change(
+                    candidate,
+                    "module.control.aws_elasticache_user.otp_activator",
+                )
+                if delete:
+                    delete_expression_path(change, path)
+                else:
+                    set_expression_path(change, path, value)
+                self.assert_rejected(candidate)
+
+    def test_redis_iam_create_envelope_requires_create_with_null_before(self) -> None:
+        update = redis_split_transition_fixture()
+        update_change = self.change(
+            update, "module.control.aws_elasticache_user.otp_activator"
+        )
+        update_change["actions"] = ["update"]
+        update_change["before"] = copy.deepcopy(update_change["after"])
+        self.assert_rejected(update)
+
+        non_null_before = redis_split_transition_fixture()
+        create_change = self.change(
+            non_null_before, "module.control.aws_elasticache_user.otp_activator"
+        )
+        create_change["before"] = copy.deepcopy(create_change["after"])
+        self.assert_rejected(non_null_before)
+
+    def test_non_create_redis_auth_and_group_values_must_be_fully_known(self) -> None:
+        activator = "module.control.aws_elasticache_user.otp_activator"
+        issuer = "module.control.aws_elasticache_user.otp_issuer"
+        group = "module.control.aws_elasticache_user_group.otp"
+        scenarios = (
+            ("full-noop", plan_fixture, activator, "no-op"),
+            (
+                "partial-retry",
+                lambda: redis_split_transition_fixture({activator}),
+                issuer,
+                "redis-split-transition",
+            ),
+        )
+        for scenario, candidate_factory, existing_user, plan_mode in scenarios:
+            with self.subTest(scenario=scenario, shape="baseline"):
+                self.assertEqual(
+                    CHECKER.check_plan(candidate_factory())["plan_mode"], plan_mode
+                )
+
+            for shape in (
+                "whole-auth-unknown",
+                "auth-mask-none",
+                "auth-mask-false",
+                "password-count-unknown",
+                "password-count-none",
+                "passwords-unknown",
+            ):
+                with self.subTest(scenario=scenario, shape=shape):
+                    candidate = candidate_factory()
+                    change = self.change(candidate, existing_user)
+                    if shape == "whole-auth-unknown":
+                        change["after_unknown"]["authentication_mode"] = True
+                    elif shape == "auth-mask-none":
+                        change["after_unknown"]["authentication_mode"] = None
+                    elif shape == "auth-mask-false":
+                        change["after_unknown"]["authentication_mode"] = False
+                    elif shape == "password-count-unknown":
+                        change["after_unknown"]["authentication_mode"] = [
+                            {"password_count": True}
+                        ]
+                    elif shape == "password-count-none":
+                        for side in ("before", "after"):
+                            set_expression_path(
+                                change,
+                                (
+                                    side,
+                                    "authentication_mode",
+                                    0,
+                                    "password_count",
+                                ),
+                                None,
+                            )
+                    else:
+                        change["after_unknown"]["authentication_mode"] = [
+                            {"passwords": True}
+                        ]
+                    self.assert_rejected(candidate)
+
+            with self.subTest(scenario=scenario, shape="group-users-unknown"):
+                candidate = candidate_factory()
+                self.change(candidate, group)["after_unknown"]["user_ids"] = True
+                self.assert_rejected(candidate)
+
+    def test_missing_password_count_counterexample_fails_closed(self) -> None:
+        activator = "module.control.aws_elasticache_user.otp_activator"
+        issuer = "module.control.aws_elasticache_user.otp_issuer"
+        for scenario, candidate_factory, existing_user, plan_mode in (
+            ("full-noop", plan_fixture, activator, "no-op"),
+            (
+                "partial-retry",
+                lambda: redis_split_transition_fixture({activator}),
+                issuer,
+                "redis-split-transition",
+            ),
+        ):
+            with self.subTest(scenario=scenario):
+                candidate = candidate_factory()
+                self.assertEqual(
+                    CHECKER.check_plan(candidate)["plan_mode"], plan_mode
+                )
+                change = self.change(candidate, existing_user)
+                for side in ("before", "after"):
+                    delete_expression_path(
+                        change,
+                        (side, "authentication_mode", 0, "password_count"),
+                    )
+                auth = change["after"]["authentication_mode"]
+                self.assertEqual(auth, [{"passwords": [], "type": "iam"}])
+                # The prior predicate read this missing field as None and
+                # incorrectly treated it as equivalent to a proven zero.
+                self.assertIsNone(auth[0].get("password_count"))
+                self.assert_rejected(candidate)
+
+    def test_redis_split_transition_requires_exact_legacy_membership(self) -> None:
+        for user_ids in (
+            [f"{CHECKER.CONTROL_PREFIX}-otp-default"],
+            [
+                f"{CHECKER.CONTROL_PREFIX}-otp-auth",
+                f"{CHECKER.CONTROL_PREFIX}-otp-default",
+                f"{CHECKER.CONTROL_PREFIX}-otp-default",
+            ],
+            None,
+            "malformed",
+        ):
+            with self.subTest(user_ids=user_ids):
+                candidate = redis_split_transition_fixture()
+                self.change(
+                    candidate, "module.control.aws_elasticache_user_group.otp"
+                )["before"]["user_ids"] = user_ids
+                self.assert_rejected(candidate)
+
+    def test_redis_split_rejects_group_piggyback_and_missing_group_update(self) -> None:
+        piggyback = redis_split_transition_fixture()
+        self.change(piggyback, "module.control.aws_elasticache_user_group.otp")[
+            "after"
+        ]["engine"] = "valkey"
+        self.assert_rejected(piggyback)
+
+        missing_group = redis_split_transition_fixture()
+        group = self.change(
+            missing_group, "module.control.aws_elasticache_user_group.otp"
+        )
+        group["actions"] = ["no-op"]
+        group["before"] = copy.deepcopy(group["after"])
+        self.assert_rejected(missing_group)
+
+    def test_publisher_and_redis_transitions_cannot_be_combined(self) -> None:
+        candidate = redis_split_transition_fixture()
+        for address in CHECKER.PUBLISHER_BOOTSTRAP_RESOURCES:
+            change = self.change(candidate, address)
+            change["actions"] = ["create"]
+            change["before"] = None
+            if address == "module.control.aws_iam_role.authority_publisher":
+                change["after_unknown"]["managed_policy_arns"] = True
+            else:
+                change["after"]["role"] = None
+                change["after_unknown"]["role"] = True
+        self.assert_rejected(candidate)
+
+    def test_redis_and_publisher_normalization_cannot_be_combined(self) -> None:
+        normalization, prior_state = publisher_refresh_candidate()
+        candidate = redis_split_transition_fixture()
+        candidate["resource_drift"] = copy.deepcopy(normalization["resource_drift"])
+
+        self.assert_rejected(candidate, prior_state)
+
     def assert_rejected(self, plan: dict, prior_state: object = None) -> None:
         with self.assertRaises(CHECKER.ContractError):
             CHECKER.check_plan(plan, prior_state)
@@ -1163,6 +1530,18 @@ class PlanContractTests(unittest.TestCase):
                 {"constant_value": ["forbidden-password"]},
             ),
             (
+                "issuer-password",
+                "module.control.aws_elasticache_user.otp_issuer",
+                ("authentication_mode", 0, "passwords"),
+                {"constant_value": ["forbidden-password"]},
+            ),
+            (
+                "activator-password",
+                "module.control.aws_elasticache_user.otp_activator",
+                ("authentication_mode", 0, "passwords"),
+                {"constant_value": ["forbidden-password"]},
+            ),
+            (
                 "default-password",
                 "module.control.aws_elasticache_user.otp_disabled_default",
                 ("passwords",),
@@ -1267,9 +1646,21 @@ class PlanContractTests(unittest.TestCase):
                 False,
             ),
             (
-                "module.control.aws_elasticache_user.otp_authority",
+                "module.control.aws_elasticache_user.otp_issuer",
                 "access_string",
                 "on ~* +@all",
+            ),
+            (
+                "module.control.aws_elasticache_user.otp_activator",
+                "access_string",
+                "on ~* +@all",
+            ),
+            (
+                "module.control.aws_elasticache_user.otp_activator",
+                "access_string",
+                CHECKER.OTP_REDIS_ACTIVATOR_ACCESS.replace(
+                    "+hello +auth +ping +command", "+@connection"
+                ),
             ),
             (
                 "module.control.aws_elasticache_serverless_cache.otp",
@@ -1300,7 +1691,7 @@ class StateListTests(unittest.TestCase):
     def test_exact_managed_and_data_inventory_passes(self) -> None:
         self.assertEqual(
             self.check(self.expected_addresses()),
-            {"data_resource_count": 4, "managed_resource_count": 43},
+            {"data_resource_count": 4, "managed_resource_count": 45},
         )
 
     def test_missing_managed_or_data_address_fails(self) -> None:
@@ -1461,7 +1852,9 @@ def state_fixture() -> dict:
         }
     )
     default_id = f"{CHECKER.CONTROL_PREFIX}-otp-default"
-    authority_id = f"{CHECKER.CONTROL_PREFIX}-otp-auth"
+    legacy_id = f"{CHECKER.CONTROL_PREFIX}-otp-auth"
+    issuer_id = f"{CHECKER.CONTROL_PREFIX}-otp-issuer"
+    activator_id = f"{CHECKER.CONTROL_PREFIX}-otp-activator"
     by_address["module.control.aws_elasticache_user.otp_disabled_default"].update(
         {
             "user_id": default_id,
@@ -1474,16 +1867,32 @@ def state_fixture() -> dict:
     )
     by_address["module.control.aws_elasticache_user.otp_authority"].update(
         {
-            "user_id": authority_id,
-            "user_name": authority_id,
-            "access_string": "on ~connector:* -@all +@connection +@read +@write +@scripting",
+            "user_id": legacy_id,
+            "user_name": legacy_id,
+            "access_string": CHECKER.OTP_REDIS_LEGACY_ACCESS,
+            "authentication_mode": [{"password_count": 0, "type": "iam"}],
+        }
+    )
+    by_address["module.control.aws_elasticache_user.otp_issuer"].update(
+        {
+            "user_id": issuer_id,
+            "user_name": issuer_id,
+            "access_string": CHECKER.OTP_REDIS_ISSUER_ACCESS,
+            "authentication_mode": [{"password_count": 0, "type": "iam"}],
+        }
+    )
+    by_address["module.control.aws_elasticache_user.otp_activator"].update(
+        {
+            "user_id": activator_id,
+            "user_name": activator_id,
+            "access_string": CHECKER.OTP_REDIS_ACTIVATOR_ACCESS,
             "authentication_mode": [{"password_count": 0, "type": "iam"}],
         }
     )
     by_address["module.control.aws_elasticache_user_group.otp"].update(
         {
             "user_group_id": f"{CHECKER.CONTROL_PREFIX}-otp-users",
-            "user_ids": [default_id, authority_id],
+            "user_ids": [default_id, issuer_id, activator_id],
         }
     )
     return {"values": {"root_module": {"resources": resources}}}
@@ -1494,11 +1903,11 @@ class StateContractTests(unittest.TestCase):
         # Update only with an intentional, reviewed address/type inventory change.
         self.assertEqual(
             CHECKER.contract_sha256(),
-            "54b15989ec63a4d15b019fb8c4ee2e65e8fccdb5ac71bbc735ac38edea24913a",
+            "2dac42e4dbe79bd05fde1dfa90db5ac6e9d16f358047406dd19b97427b381fcf",
         )
 
     def test_exact_state_passes(self) -> None:
-        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 43)
+        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 45)
 
     def test_publisher_trust_and_permissions_drift_fail(self) -> None:
         mutations = (
@@ -1570,9 +1979,21 @@ class StateContractTests(unittest.TestCase):
             ),
             ("module.control.aws_kms_key.qat1_signing", "key_usage", "ENCRYPT_DECRYPT"),
             (
-                "module.control.aws_elasticache_user.otp_authority",
+                "module.control.aws_elasticache_user.otp_issuer",
                 "access_string",
                 "on ~* +@all",
+            ),
+            (
+                "module.control.aws_elasticache_user.otp_activator",
+                "access_string",
+                "on ~* +@all",
+            ),
+            (
+                "module.control.aws_elasticache_user.otp_issuer",
+                "access_string",
+                CHECKER.OTP_REDIS_ISSUER_ACCESS.replace(
+                    "+hello +auth +ping +command", "+@connection"
+                ),
             ),
         )
         for address, field, value in mutations:
@@ -1603,8 +2024,10 @@ class StateContractTests(unittest.TestCase):
 
     def test_state_redis_users_must_have_zero_passwords(self) -> None:
         for address in (
+            "module.control.aws_elasticache_user.otp_activator",
             "module.control.aws_elasticache_user.otp_authority",
             "module.control.aws_elasticache_user.otp_disabled_default",
+            "module.control.aws_elasticache_user.otp_issuer",
         ):
             with self.subTest(address=address):
                 state = state_fixture()
@@ -1617,6 +2040,18 @@ class StateContractTests(unittest.TestCase):
                 with self.assertRaises(CHECKER.ContractError):
                     CHECKER.check_state(state)
 
+    def test_state_redis_group_rejects_duplicate_membership(self) -> None:
+        state = state_fixture()
+        group = next(
+            item
+            for item in state["values"]["root_module"]["resources"]
+            if item["address"]
+            == "module.control.aws_elasticache_user_group.otp"
+        )
+        group["values"]["user_ids"].append(group["values"]["user_ids"][0])
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(state)
+
     def test_disabled_user_lifecycle_ignore_is_narrow_and_fail_closed(self) -> None:
         redis = REDIS_TF_PATH.read_text(encoding="utf-8")
         self.assertEqual(
@@ -1625,10 +2060,19 @@ class StateContractTests(unittest.TestCase):
         self.assertNotIn("ignore_changes = [authentication_mode]", redis)
         self.assertIn('["no-password-required", "no-password"]', redis)
         self.assertIn("self.authentication_mode[0].password_count == 0", redis)
-        self.assertIn(
-            'access_string = "on ~connector:* -@all +@connection +@read +@write +@scripting"',
-            redis,
-        )
+        self.assertIn("%W~connector:registration-otp:v2:{*}:challenge", redis)
+        self.assertIn("%R~connector:registration-otp:v2:{*}:challenge", redis)
+        self.assertEqual(redis.count('"+cluster|slots"'), 2)
+        for command in ("hello", "auth", "ping", "command"):
+            self.assertEqual(redis.count(f'"+{command}"'), 2)
+        self.assertNotIn('"+asking"', redis)
+        # The one remaining broad connection category belongs only to the
+        # detached legacy user retained for non-destructive state rollout.
+        self.assertEqual(redis.count("+@connection"), 1)
+        self.assertNotIn('"+client"', redis)
+        self.assertNotIn("+hincrby", redis)
+        self.assertNotIn('"+hget"', redis)
+        self.assertIn("major_engine_version     = \"7\"", redis)
 
 
 def live_fixture(root: Path) -> None:

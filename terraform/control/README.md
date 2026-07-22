@@ -139,12 +139,15 @@ apply path.
 
 The plan contract rejects every action set containing `delete`, including a
 Terraform replacement (`delete,create`). That remains intentional after the
-foundation is live. It accepts `create` only for the exact publisher role and
-inline policy, including a one-resource partial retry; after both exist, their
-same exact 43-resource contract is a no-op. Any necessary ForceNew change needs
-its own reviewed, resource-specific no-data-loss rollout and an explicit narrow
-contract change; do not disable the destructive gate to make a routine PR
-pass.
+foundation is live. It admits only two exact transition families: publisher
+role/policy creation (including the policy-only partial retry), and the
+43-to-45 Redis split (either or both split-user creates plus the exact legacy
+user-group membership replacement). The transitions cannot be combined, and
+neither may be combined with refresh-only state normalization. Once both are
+complete, the same exact 45-resource contract must be a no-op. Any necessary
+ForceNew change needs its own reviewed, resource-specific no-data-loss rollout
+and an explicit narrow contract change; do not disable the destructive gate to
+make a routine PR pass.
 
 The sandbox and production `main.tf` files are deliberately separate state
 roots with byte-identical module wrappers. The foundation checker enforces that

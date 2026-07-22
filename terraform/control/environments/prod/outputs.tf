@@ -38,8 +38,20 @@ output "otp_redis_user_group_id" {
   value = module.control.otp_redis_user_group_id
 }
 
-output "otp_redis_authority_user_arn" {
-  value = module.control.otp_redis_authority_user_arn
+output "otp_redis_issuer_user_id" {
+  value = module.control.otp_redis_issuer_user_id
+}
+
+output "otp_redis_issuer_user_arn" {
+  value = module.control.otp_redis_issuer_user_arn
+}
+
+output "otp_redis_activator_user_id" {
+  value = module.control.otp_redis_activator_user_id
+}
+
+output "otp_redis_activator_user_arn" {
+  value = module.control.otp_redis_activator_user_arn
 }
 
 output "ses_identity_arn" {
