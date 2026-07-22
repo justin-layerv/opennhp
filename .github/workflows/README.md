@@ -259,27 +259,69 @@ Automated pipeline (weekdays 7am UTC): check for pending changes → deploy to s
 | `ubuntu-build.yml` | Build and test Go code on Ubuntu |
 | `build-binaries.yml` | Build release binaries |
 | `codeql.yml` | GitHub CodeQL security analysis |
-| `claude-code-review.yml` | AI code review on PRs |
-| `claude.yml` | Claude Code for issue triage and PR slash commands (explicit model pin) |
+| `claude-code-review.yml` | Ready-candidate AI review from a default-branch-trusted `pull_request_target` workflow |
+| `claude.yml` | Claude Code for trusted default-branch PR issue-comment commands |
 | `release-please.yml` | Automated changelog and version bumps |
 | `dependabot-go-tidy.yml` | Auto-fix `go mod tidy` for Dependabot PRs |
 | `prod-rollout-tasks.yml` | Enforce the PR Prod Rollout Tasks checkbox and task-ledger diff contract |
 
-### Updating the Claude model pin
+### Updating the Claude workflow contract
 
-The Claude workflows intentionally use the same proven model. A model upgrade
-must make all of these changes in one PR:
+The Claude workflows intentionally use the same proven action and model. An
+action or model upgrade must make all of these changes in one PR:
 
-1. Validate the candidate model with the repository credential.
-2. Update `claude_args` in both `claude.yml` and `claude-code-review.yml`.
-3. Add the validated model to `PROVEN_MODELS` in
+1. Validate the candidate action and model with the repository credential,
+   including a fail-closed `is_error: true` result.
+2. Update the immutable action SHA and `claude_args` in both `claude.yml` and
+   `claude-code-review.yml`.
+3. Update `PROVEN_ACTION_REF` and, for a model change, `PROVEN_MODELS` in
    `scripts/check-claude-model-lockstep.py`.
 4. Update the current-pin assertions in
-   `tests/scripts/test_check_claude_model_lockstep.py` when the pinned model
-   changes.
+   `tests/scripts/test_check_claude_model_lockstep.py`.
 5. Run `make lint-workflows`.
 
 Keep each `claude_args` value on one single-quoted line and set the model only
 through `--model`. Alternate scalar forms, embedded single quotes, native
 `model:` inputs, and one-sided or unproven pins require an explicit guard design
-change rather than a workflow-only edit.
+change rather than a workflow-only edit. Interactive commands are PR-only and
+enter only through `issue_comment`, whose workflow definition GitHub loads from
+the default branch. They require a current write-capable collaborator, reject
+fork heads, and check out the API-resolved immutable head SHA. They omit the
+workflow token input and use the action's OIDC/GitHub App token with commit
+signing for accepted edits;
+checkout credentials remain disabled. Before the pinned action performs that
+checkout, the workflow rejects symlinks, gitlinks, and other non-regular leaves
+under v1.0.180's startup-sensitive preservation paths; otherwise the action's
+dereferencing `.claude-pr/` snapshot could materialize an out-of-tree secret.
+Both workflows replace the GitHub remote
+with a local-origin shim that exposes only the validated head and base refs
+while retaining their required reachable history. The interactive path
+preflights the pinned action's dynamic head-depth and shallow-base fetches; the
+automatic path keeps the local workspace on a trusted default-branch snapshot,
+reads PR data only through its GitHub MCP allowlist, and preflights its head/base
+snapshot fetches. Neither path points Git at a credentialed GitHub remote.
+
+Automatic review must retain its default-branch-trusted
+`pull_request_target` event, PR-author bot exclusion, same-repository head and
+base, ready-candidate guard, `opened`/`synchronize`/`reopened`/
+`ready_for_review` triggers, and per-PR cancellation. It uses the narrowly
+scoped workflow token with API signing so v1.0.180 does not install Git
+credentials. Its model receives only the enumerated read/comment GitHub MCP
+tools; local file, shell, network, delegation, and GitHub file-write tools stay
+denied. The interactive tag-mode entry point excludes only the exact
+`github-actions[bot]` login from model context, and human feedback remains in
+scope. Do not add `pull_request`, `pull_request_review`, or
+`pull_request_review_comment` to either secrets-bearing workflow: GitHub loads
+those workflow definitions from the PR merge ref before any job-level guard,
+checkout, or shell preflight can run.
+
+A terminal PR refresh must prove the current and expected repository, branch,
+and commit snapshots still match, the interactive checkout is on the expected
+head, the automatic checkout remains on its recorded trusted snapshot, and both
+checkouts still use their credential-free local origin, submodule-safe fetch
+configuration, and exact head/base source and remote-tracking refs before either
+workflow can pass. Automatic review additionally requires a run-specific marker
+on the final line of the workflow bot's published PR comment; a nonempty action
+execution artifact alone is not publication proof.
+An interactive edit intentionally fails that old-head run and requires a fresh
+terminal pass on the new head.

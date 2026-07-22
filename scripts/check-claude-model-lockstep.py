@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce one model pin across every Claude action workflow.
+"""Enforce the action and model pin across every Claude workflow.
 
 Each workflow must contain exactly one Claude action invocation in a workflow
 step and one single-line, single-quoted ``claude_args`` value. The model must be
@@ -16,7 +16,12 @@ allowlist independently proves credential compatibility: changing quality tiers
 between review entry points requires an explicit guard-design decision. A model
 bump must update both workflows and ``PROVEN_MODELS`` here. At least two
 workflows are intentional; consolidating the entry points also requires updating
-this guard.
+this guard. The action SHA is equally load-bearing: the proven version fails
+closed when the SDK reports ``subtype: success`` with ``is_error: true``.
+
+The workflow-specific security and lifecycle assertions live beside the fixture
+coverage in ``tests/scripts/test_check_claude_model_lockstep.py``; the canonical
+``make lint-workflows`` target runs both.
 """
 
 from __future__ import annotations
@@ -33,11 +38,12 @@ from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 WORKFLOW_DIR = Path(".github/workflows")
 ACTION_REPOSITORY = "anthropics/claude-code-action"
+PROVEN_ACTION_REF = "fa7e2f0a29a126f0b81cdcf360561b36e44cf608"
 PROVEN_MODELS = frozenset({"claude-opus-4-8"})
 
 
 class ContractError(ValueError):
-    """Raised when a workflow does not contain one unambiguous model pin."""
+    """Raised when a Claude workflow violates the guarded contract."""
 
 
 def mapping_values(mapping: MappingNode, key: str) -> list[Node]:
@@ -49,7 +55,9 @@ def mapping_values(mapping: MappingNode, key: str) -> list[Node]:
     ]
 
 
-def mapping_nodes(node: Node, ancestors: frozenset[int] = frozenset()) -> Iterator[MappingNode]:
+def mapping_nodes(
+    node: Node, ancestors: frozenset[int] = frozenset()
+) -> Iterator[MappingNode]:
     """Yield mapping occurrences without looping through recursive aliases."""
     if id(node) in ancestors:
         return
@@ -152,7 +160,8 @@ def claude_args_from_step(path: Path, step: MappingNode) -> str:
     return args_node.value
 
 
-def model_from_workflow(path: Path, document: Node) -> str:
+def claude_action_step(path: Path, document: Node) -> tuple[MappingNode, ScalarNode]:
+    """Return the sole Claude action workflow step and its ``uses`` value."""
     actions = claude_action_invocations(document)
     if len(actions) != 1:
         raise ContractError(
@@ -164,6 +173,19 @@ def model_from_workflow(path: Path, document: Node) -> str:
     if id(step) not in workflow_step_ids(document):
         raise ContractError(f"{path}: Claude action is not inside a workflow step")
 
+    uses_nodes = [
+        node for node in mapping_values(step, "uses") if is_claude_action(node)
+    ]
+    if len(uses_nodes) != 1:
+        raise ContractError(
+            f"{path}: expected exactly one Claude action uses value, "
+            f"found {len(uses_nodes)}"
+        )
+    return step, uses_nodes[0]
+
+
+def model_from_step(path: Path, step: MappingNode) -> str:
+    """Return the explicit model from a validated Claude action step."""
     value = claude_args_from_step(path, step)
     try:
         args = shlex.split(value)
@@ -196,6 +218,13 @@ def model_from_workflow(path: Path, document: Node) -> str:
     return args[model_index + 1]
 
 
+def workflow_contract(path: Path, document: Node) -> tuple[str, str]:
+    """Return the model and immutable action ref after one structural walk."""
+    step, uses_node = claude_action_step(path, document)
+    _, _, action_ref = uses_node.value.partition("@")
+    return model_from_step(path, step), action_ref
+
+
 def claude_workflows(repo_root: Path) -> dict[Path, Node]:
     workflows: dict[Path, Node] = {}
     for path in sorted((repo_root / WORKFLOW_DIR).iterdir()):
@@ -219,10 +248,10 @@ def claude_workflows(repo_root: Path) -> dict[Path, Node]:
 
 def check(repo_root: Path) -> str:
     workflows = claude_workflows(repo_root)
-    pins = {
-        path: model_from_workflow(path, document)
-        for path, document in workflows.items()
+    contracts = {
+        path: workflow_contract(path, document) for path, document in workflows.items()
     }
+    pins = {path: contract[0] for path, contract in contracts.items()}
     models = set(pins.values())
     if len(models) != 1:
         detail = ", ".join(f"{path}={model}" for path, model in pins.items())
@@ -235,6 +264,22 @@ def check(repo_root: Path) -> str:
             f"allowed: {allowed}; update PROVEN_MODELS in "
             "scripts/check-claude-model-lockstep.py after validation"
         )
+
+    action_refs = {path: contract[1] for path, contract in contracts.items()}
+    unproven_refs = {
+        path: action_ref
+        for path, action_ref in action_refs.items()
+        if action_ref != PROVEN_ACTION_REF
+    }
+    if unproven_refs:
+        detail = ", ".join(
+            f"{path}={action_ref}" for path, action_ref in unproven_refs.items()
+        )
+        raise ContractError(
+            f"Claude workflow action refs must use proven SHA "
+            f"{PROVEN_ACTION_REF}: {detail}"
+        )
+
     return model
 
 
@@ -254,7 +299,10 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    print(f"OK: Claude workflows pin the same model ({model})")
+    print(
+        "OK: Claude workflows pin the proven action and model "
+        f"({PROVEN_ACTION_REF}, {model})"
+    )
     return 0
 
 

@@ -264,17 +264,21 @@ jobs:
           python3 -m pip --version
           python3 -m pip install --no-cache-dir pyyaml
 
-      # Both Claude entry points must use the same explicit model. Without this
-      # fence, comment-triggered /simplify can drift back to an action default
-      # that the repository credential cannot start while automatic review stays
-      # green on its separately pinned model. These steps intentionally follow
+      # Both Claude entry points must use the same proven action SHA and explicit
+      # model. Automatic review must remain a default-branch-trusted
+      # pull_request_target, same-repo, non-bot, ready-candidate terminal gate
+      # with per-PR cancellation. PR-only `@claude` commands must enter through
+      # the default-branch issue_comment event and fail closed before immutable
+      # head checkout. Without this fence, a PR-merge-ref workflow can consume
+      # secrets before any job guard or checkout preflight runs.
+      # These steps follow
       # Install PyYAML because the guard uses the composed YAML node tree to
       # enforce action-step structure and scalar style without indentation
       # heuristics.
-      - name: Test Claude workflow model lockstep fixtures
+      - name: Test Claude workflow contract fixtures
         run: python3 tests/scripts/test_check_claude_model_lockstep.py
 
-      - name: Check Claude workflow model lockstep
+      - name: Check Claude workflow contracts
         run: python3 scripts/check-claude-model-lockstep.py
 
       # resolve-app-image-required_test.sh verifies that the relay image's
