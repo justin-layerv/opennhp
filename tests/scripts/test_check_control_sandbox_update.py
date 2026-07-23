@@ -747,7 +747,8 @@ class WorkflowContractTests(unittest.TestCase):
             "control-state-before-apply/state.json",
             "live-refresh-contract-summary.json",
             "live-refresh-drift-summary.raw.json",
-            'normalization_count" == "1"',
+            "publisher-role:1|authority-digest:1|redis-passwords:2",
+            "publisher-role|redis-passwords)",
         ):
             self.assertIn(marker, live_refresh_step)
 

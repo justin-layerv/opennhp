@@ -36,6 +36,11 @@ REAL_REDIS_IAM_CREATE_FIXTURE_PATH = (
     / "tests/fixtures/control-elasticache-user/"
     "create-authentication-mode-terraform-1.14.3-aws-6.55.0.json"
 )
+REAL_REDIS_PASSWORD_REFRESH_FIXTURE_PATH = (
+    ROOT
+    / "tests/fixtures/control-elasticache-user/"
+    "refresh-passwords-null-to-empty-terraform-1.14.3-aws-6.55.0.json"
+)
 SPEC = importlib.util.spec_from_file_location("control_first_apply", CHECKER_PATH)
 assert SPEC and SPEC.loader
 CHECKER = importlib.util.module_from_spec(SPEC)
@@ -646,6 +651,39 @@ def authority_digest_refresh_candidate() -> tuple[dict, dict]:
     return candidate, prior_state
 
 
+def redis_password_refresh_candidate() -> tuple[dict, dict]:
+    candidate = plan_fixture()
+    candidate["applyable"] = True
+    changes = {
+        item["address"]: item["change"] for item in candidate["resource_changes"]
+    }
+    golden = json.loads(
+        REAL_REDIS_PASSWORD_REFRESH_FIXTURE_PATH.read_text(encoding="utf-8")
+    )
+    drift = copy.deepcopy(golden["resource_drift"])
+    for item in drift:
+        address = item["address"]
+        projected = item["change"]
+        after = copy.deepcopy(changes[address]["after"])
+        before = copy.deepcopy(after)
+        before["authentication_mode"] = copy.deepcopy(
+            projected["before"]["authentication_mode"]
+        )
+        after["authentication_mode"] = copy.deepcopy(
+            projected["after"]["authentication_mode"]
+        )
+        projected["before"] = before
+        projected["after"] = after
+    candidate["resource_drift"] = drift
+
+    prior_state = terraform_1_14_refresh_only_golden(candidate)
+    for item in drift:
+        state_resource(prior_state, item["address"])["values"] = copy.deepcopy(
+            item["change"]["before"]
+        )
+    return candidate, prior_state
+
+
 class PlanContractTests(unittest.TestCase):
     def test_real_terraform_1_14_3_noop_status_contract(self) -> None:
         real_noop = json.loads(
@@ -949,6 +987,175 @@ class PlanContractTests(unittest.TestCase):
         CHECKER.check_normalization_drift(
             first_publication, first_publication_state
         )
+
+    def test_exact_redis_password_refresh_only_normalization_passes(self) -> None:
+        golden = json.loads(
+            REAL_REDIS_PASSWORD_REFRESH_FIXTURE_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(golden["terraform_version"], CHECKER.TF_VERSION)
+        self.assertEqual(
+            golden["aws_provider_version"],
+            EXPECTED_AWS_PROVIDER_VERSION,
+        )
+        self.assertEqual(
+            golden["provenance"],
+            {
+                "source": (
+                    "local read-only terraform show -json of the sandbox "
+                    "Control refresh-only plan using the exact workflow "
+                    "Terraform and provider versions"
+                ),
+                "corroborating_run_id": "30030853799",
+                "state_version_id": "32gMsDv0qisFvqpwtlenhmuLED54Zfry",
+                "state_sha256": (
+                    "746fd9ae24a6fe78e403bf5f90e3dae2c27fb0aeb1724e00a7c501a6c1e7f9c8"
+                ),
+                "source_resource_drift_sha256": (
+                    "739af817895f15bb81479053537bfb076d753b6530ecd56d905f3bf0e51df2b9"
+                ),
+                "projection": (
+                    "resource identity plus authentication_mode values, "
+                    "unknown mask, and sensitive masks"
+                ),
+                "captured_on": "2026-07-23",
+                "contains_sensitive_values": False,
+            },
+        )
+        self.assertEqual(
+            tuple(item["address"] for item in golden["resource_drift"]),
+            CHECKER._REDIS_PASSWORD_NORMALIZATION_ADDRESSES,
+        )
+        for item in golden["resource_drift"]:
+            change = item["change"]
+            self.assertEqual(
+                change["before"]["authentication_mode"],
+                [{"password_count": 0, "passwords": None, "type": "iam"}],
+            )
+            self.assertEqual(
+                change["after"]["authentication_mode"],
+                [{"password_count": 0, "passwords": [], "type": "iam"}],
+            )
+            self.assertEqual(change["after_unknown"], {})
+            self.assertEqual(
+                change["before_sensitive"],
+                CHECKER._REDIS_PASSWORD_NORMALIZATION_SENSITIVE,
+            )
+            self.assertEqual(
+                change["after_sensitive"],
+                CHECKER._REDIS_PASSWORD_NORMALIZATION_SENSITIVE,
+            )
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        summary = CHECKER.check_plan(candidate, prior_state)
+
+        self.assertEqual(summary["bootstrap_create_count"], 0)
+        self.assertEqual(summary["normalization_drift_count"], 2)
+        self.assertEqual(
+            summary["normalization_drift_kind"],
+            "redis-passwords",
+        )
+        self.assertEqual(summary["plan_mode"], "no-op")
+        self.assertEqual(
+            summary["normalization_drift_sha256"],
+            CHECKER._json_sha256(candidate["resource_drift"]),
+        )
+
+    def test_redis_password_refresh_only_normalization_is_exact(self) -> None:
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["resource_drift"].pop()
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["resource_drift"].append(
+            copy.deepcopy(candidate["resource_drift"][0])
+        )
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["resource_drift"].reverse()
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        change = candidate["resource_drift"][0]["change"]
+        change["before"]["authentication_mode"], change["after"][
+            "authentication_mode"
+        ] = (
+            change["after"]["authentication_mode"],
+            change["before"]["authentication_mode"],
+        )
+        state_resource(
+            prior_state,
+            candidate["resource_drift"][0]["address"],
+        )["values"] = copy.deepcopy(change["before"])
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["resource_drift"][0]["change"]["after"][
+            "authentication_mode"
+        ][0]["passwords"] = ["must-not-appear"]
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["resource_drift"][0]["change"]["after_unknown"] = {
+            "authentication_mode": [{"passwords": True}]
+        }
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["resource_drift"][0]["change"]["after"]["engine"] = "valkey"
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["resource_drift"][0]["change"]["after_sensitive"] = {}
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        change = candidate["resource_drift"][0]["change"]
+        for side in ("before", "after"):
+            change[side]["authentication_mode"][0]["password_count"] = False
+        state_resource(
+            prior_state,
+            candidate["resource_drift"][0]["address"],
+        )["values"] = copy.deepcopy(change["before"])
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["resource_drift"][0]["change"]["before_sensitive"][
+            "authentication_mode"
+        ][0]["passwords"] = 1
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        change = candidate["resource_drift"][0]["change"]
+        change["before"]["opaque_projection"] = False
+        change["after"]["opaque_projection"] = 0
+        state_resource(
+            prior_state,
+            candidate["resource_drift"][0]["address"],
+        )["values"] = copy.deepcopy(change["before"])
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["resource_drift"][0]["provider_name"] = "example.invalid/aws"
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        candidate["applyable"] = False
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = redis_password_refresh_candidate()
+        digest, _ = authority_digest_refresh_candidate()
+        candidate["resource_drift"].append(
+            copy.deepcopy(digest["resource_drift"][0])
+        )
+        self.assert_rejected(candidate, prior_state)
+
+        normalization, prior_state = redis_password_refresh_candidate()
+        ordinary = plan_fixture()
+        ordinary["resource_drift"] = copy.deepcopy(
+            normalization["resource_drift"]
+        )
+        self.assert_rejected(ordinary, prior_state)
 
     def test_authority_digest_refresh_only_normalization_is_exact(self) -> None:
         for mutation in (

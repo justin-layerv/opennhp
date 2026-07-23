@@ -515,16 +515,20 @@ jobs:
             }
             exit 0
           fi
-          [[ "$normalization_count" == "1" ]] || {
-            echo '::error::Saved plan has an invalid normalization count.'
-            exit 1
-          }
+          case "${normalization_kind}:${normalization_count}" in
+            publisher-role:1|authority-digest:1|redis-passwords:2)
+              ;;
+            *)
+              echo '::error::Saved plan has an invalid normalization kind/count.'
+              exit 1
+              ;;
+          esac
           terraform plan -refresh-only -input=false -lock-timeout=5m -no-color \
             -out="$RUNNER_TEMP/live-refresh-plan" >/dev/null
           terraform show -json "$RUNNER_TEMP/live-refresh-plan" \
             >"$RUNNER_TEMP/live-refresh-plan.json"
           case "$normalization_kind" in
-            publisher-role)
+            publisher-role|redis-passwords)
               ../../../../.github/scripts/check-control-sandbox-first-apply.py plan \
                 "$RUNNER_TEMP/live-refresh-plan.json" \
                 "$RUNNER_TEMP/control-state-before-apply/state.json" \

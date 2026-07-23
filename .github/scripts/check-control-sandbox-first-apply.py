@@ -258,6 +258,17 @@ REDIS_SPLIT_USER_RESOURCES = frozenset(
 _REDIS_IAM_CREATE_AUTHENTICATION_MODE = [{"passwords": None, "type": "iam"}]
 _REDIS_IAM_CREATE_AUTHENTICATION_MODE_UNKNOWN = [{"password_count": True}]
 _REDIS_IAM_CREATE_AUTHENTICATION_MODE_SENSITIVE = [{"passwords": True}]
+_REDIS_PASSWORD_NORMALIZATION_ADDRESSES = (
+    "module.control.aws_elasticache_user.otp_activator",
+    "module.control.aws_elasticache_user.otp_issuer",
+)
+_REDIS_PASSWORD_NORMALIZATION_SENSITIVE = {
+    "authentication_mode": [{"passwords": True}],
+    "passwords": True,
+    "passwords_wo": True,
+    "tags": {},
+    "tags_all": {},
+}
 
 
 def _is_exact_passwordless_authentication_mode(
@@ -1347,8 +1358,10 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
 def _check_state_normalization_drift(
     drift: list[dict[str, Any]],
     by_address: dict[str, dict[str, Any]],
+    *,
+    refresh_only: bool,
 ) -> str:
-    """Admit one exact, reviewed state-only normalization.
+    """Admit one exact, reviewed state-only normalization kind.
 
     Terraform marks that delta applyable for ``-refresh-only``. An ordinary
     refresh-enabled plan with no configuration changes is not applyable and is
@@ -1356,6 +1369,14 @@ def _check_state_normalization_drift(
     """
     if not drift:
         return "none"
+    addresses = tuple(item.get("address") for item in drift)
+    if addresses == _REDIS_PASSWORD_NORMALIZATION_ADDRESSES:
+        if not refresh_only:
+            raise ContractError(
+                "Redis password projection normalization requires a refresh-only plan"
+            )
+        _check_redis_password_normalization(drift, by_address)
+        return "redis-passwords"
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
     item = drift[0]
@@ -1367,6 +1388,101 @@ def _check_state_normalization_drift(
         _check_authority_digest_normalization(item, by_address)
         return "authority-digest"
     raise _unexpected_drift_error(drift)
+
+
+def _check_redis_password_normalization(
+    drift: list[dict[str, Any]],
+    by_address: dict[str, dict[str, Any]],
+) -> None:
+    """Admit the exact one-time null-to-empty provider state projection."""
+    if (
+        len(drift) != len(_REDIS_PASSWORD_NORMALIZATION_ADDRESSES)
+        or tuple(item.get("address") for item in drift)
+        != _REDIS_PASSWORD_NORMALIZATION_ADDRESSES
+    ):
+        raise _unexpected_drift_error(drift)
+
+    for item, address in zip(
+        drift,
+        _REDIS_PASSWORD_NORMALIZATION_ADDRESSES,
+        strict=True,
+    ):
+        expected_identity = {
+            "address": address,
+            "mode": "managed",
+            "module_address": "module.control",
+            "name": address.rsplit(".", 1)[1],
+            "provider_name": "registry.terraform.io/hashicorp/aws",
+            "type": "aws_elasticache_user",
+        }
+        if (
+            set(item) != {*expected_identity, "change"}
+            or any(
+                item.get(field) != value
+                for field, value in expected_identity.items()
+            )
+        ):
+            raise _unexpected_drift_error([item])
+
+        change = item.get("change")
+        if (
+            not isinstance(change, dict)
+            or set(change) != _CHANGE_KEYS
+            or change.get("actions") != ["update"]
+            or not _json_equal(change.get("after_unknown"), {})
+            or not _json_equal(
+                change.get("before_sensitive"),
+                _REDIS_PASSWORD_NORMALIZATION_SENSITIVE,
+            )
+            or not _json_equal(
+                change.get("after_sensitive"),
+                _REDIS_PASSWORD_NORMALIZATION_SENSITIVE,
+            )
+        ):
+            raise ContractError(
+                "Redis password projection normalization envelope is not exact"
+            )
+
+        before = change.get("before")
+        after = change.get("after")
+        if (
+            not isinstance(before, dict)
+            or not isinstance(after, dict)
+            or set(before) != set(after)
+        ):
+            raise ContractError(
+                "Redis password projection normalization values are malformed"
+            )
+        changed_fields = {
+            field
+            for field in before
+            if not _json_equal(before[field], after[field])
+        }
+        if (
+            changed_fields != {"authentication_mode"}
+            or not _json_equal(
+                before.get("authentication_mode"),
+                [{"password_count": 0, "passwords": None, "type": "iam"}],
+            )
+            or not _json_equal(
+                after.get("authentication_mode"),
+                [{"password_count": 0, "passwords": [], "type": "iam"}],
+            )
+        ):
+            raise ContractError(
+                "Redis password projection normalization must be exactly null-to-empty"
+            )
+
+        planned = by_address[address].get("change", {})
+        if (
+            planned.get("actions") != ["no-op"]
+            or not _json_equal(planned.get("before"), after)
+            or not _json_equal(planned.get("after"), after)
+        ):
+            raise ContractError(
+                "Redis password projection normalization must match the "
+                "refresh-only no-op state"
+            )
 
 
 def _check_publisher_role_normalization(
@@ -1543,6 +1659,11 @@ def _validate_authority_digest_normalization(
 def _refresh_sensitive_contract(
     address: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if address in _REDIS_PASSWORD_NORMALIZATION_ADDRESSES:
+        return (
+            _REDIS_PASSWORD_NORMALIZATION_SENSITIVE,
+            _REDIS_PASSWORD_NORMALIZATION_SENSITIVE,
+        )
     if address == "module.control.aws_iam_role.authority_publisher":
         return (
             _PUBLISHER_REFRESH_BEFORE_SENSITIVE,
@@ -1891,9 +2012,13 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     _check_planned_security(by_address)
 
     normalization_drift_kind = _check_state_normalization_drift(
-        drift, by_address
+        drift,
+        by_address,
+        refresh_only="resource_changes" not in plan,
     )
-    normalization_drift_count = int(normalization_drift_kind != "none")
+    # ``_check_state_normalization_drift`` returns "none" iff ``drift`` is
+    # empty, so ``len(drift)`` already yields 0 in that case.
+    normalization_drift_count = len(drift)
 
     if normalization_drift_kind == "publisher-role" and plan_mode != "no-op":
         raise ContractError(
@@ -1910,9 +2035,14 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
                 "authority digest-only state normalization requires a "
                 "refresh-only plan"
             )
+    if normalization_drift_kind == "redis-passwords" and plan_mode != "no-op":
+        raise ContractError(
+            "Redis password projection normalization cannot be combined with "
+            "a resource transition"
+        )
 
     expected_applyable = plan_mode != "no-op" or (
-        normalization_drift_count == 1 and "resource_changes" not in plan
+        normalization_drift_count > 0 and "resource_changes" not in plan
     )
     if plan.get("applyable") is not expected_applyable:
         raise ContractError(
