@@ -14,6 +14,8 @@ locals {
   otp_sender_domain                     = lower(try(split("@", var.otp_email_from)[1], ""))
   authority_ecr_repository_name         = "layerv/qurl-connector-authority"
   authority_image_digest_parameter_name = "/${var.environment}/nhp/control/connector-authority/image-digest"
+  hub_ecr_repository_name               = "layerv/nhp-hub"
+  hub_image_digest_parameter_name       = "/${var.environment}/nhp/control/hub/image-digest"
 
   common_tags = merge(var.tags, {
     Application = "nhp"

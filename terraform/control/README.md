@@ -1,7 +1,8 @@
 # Connector Control Terraform roots
 
-These roots own the environment-global Connector Authority foundation in a
-state that is deliberately separate from every NHP cell:
+These roots own the environment-global Connector Authority foundation and
+Connector Hub artifact boundary in a state that is deliberately separate from
+every NHP cell:
 
 - sandbox: `nhp/sandbox/control/terraform.tfstate`
 - production: `nhp/prod/control/terraform.tfstate`
@@ -12,7 +13,9 @@ resource/table prefix is `layerv-nhp-<env>-control`; cell stacks retain
 
 The foundation is dark. It creates no Lambda function, alias, runtime caller
 role, Hub worker/listener, load balancer, DNS record, plugin, public HTTP route,
-or runtime activation. Interface and DynamoDB endpoints start with deny-all
+or runtime activation. The Hub repository, digest pin, and publisher role are
+artifact prerequisites only; the Hub build matrix remains `publish: false`.
+Interface and DynamoDB endpoints start with deny-all
 policies, and their security groups have no ingress. A later reviewed runtime
 slice must replace both boundaries in lockstep with exact qualified alias ARNs
 and operation-specific identities. Because private DNS is already enabled,
@@ -33,6 +36,39 @@ qurl-service publication workflow must derive a registry-confirmed canonical
 lowercase `sha256:<64hex>` digest, validate that exact shape immediately before
 the SSM write, and read the parameter back exactly; IAM can scope the parameter
 ARN but cannot constrain its value.
+
+NHP has a separate, equally narrow Hub publisher role. Sandbox trusts only
+`repo:layervai/nhp:environment:hub-publish-sandbox`; production trusts only
+`repo:layervai/nhp:environment:hub-publish-production`. The ordinary shared
+`sandbox` and `production` deployment Environments are deliberately not
+admitted. Before either publisher role can be used, the matching dedicated
+`hub-publish-sandbox` or `hub-publish-production` GitHub Environment must be
+configured with a `main`-only deployment branch policy and required human
+review. Publication must remain impossible until a live GitHub settings
+readback proves both protections for the exact Environment; repository code
+and an Environment name alone are not proof. The carrier must repeat that
+readback as a fail-closed preflight before every publication attempt and reject
+a missing required reviewer Justin (`178750268`), any branch policy other than
+the sole custom `main` policy, or either shared deployment Environment name.
+
+The 2026-07-23 live readback established both dedicated Environments with
+required reviewer Justin (`178750268`), a sole custom `main` deployment branch
+policy, `can_admins_bypass=true`, and `prevent_self_review=false`; the shared
+`sandbox` and `production` Environments were unchanged. These observed settings
+do not replace the per-publication preflight.
+
+The role can push/read and verify
+manifests only in `layerv/nhp-hub` and get/put only
+`/<env>/nhp/control/hub/image-digest`; it has no Control-runtime, network,
+KMS, or cell permissions. The repository is KMS-encrypted, immutable, and
+scan-on-push. Its lifecycle expires only untagged uploads after seven days, so
+source-SHA rollback artifacts remain available. A later reviewed publication
+carrier must declare the exact dedicated protected GitHub Environment, refuse
+shared `sandbox` or `production`, publish only the source SHA, use the role's
+read-only `DescribeImageScanFindings` grant to prove scan success, and then
+write/read back the canonical digest pin. Do not publish `latest` or
+environment tags. Do not configure the carrier role reference or enable its
+publication gate before the live protection readback passes.
 
 SES identity/configuration-set ownership is intentionally excluded from this
 slice because sandbox already owns those resources in the legacy state. The
@@ -123,11 +159,11 @@ conditional attachment. Treat attachment runway as zero across the shared
 module: future grants must consolidate within an existing policy or pair a
 new attachment with an intentional consolidation/quota plan.
 
-The publisher role and its inline policy require no expansion of that shared
-apply role: its existing `IAMRoles` statement already admits the
+The two publisher roles and their inline policies require no expansion of that
+shared apply role: its existing `IAMRoles` statement already admits the
 `layerv-nhp-*` role namespace and the IAM role/policy lifecycle actions that
-Terraform needs. The repository contract test pins that prerequisite; no
-publisher permission is added to the shared role.
+Terraform needs. Repository contract tests pin that prerequisite; no publisher
+permission is added to the shared role.
 
 ## CI and live-state semantics
 
@@ -139,15 +175,19 @@ apply path.
 
 The plan contract rejects every action set containing `delete`, including a
 Terraform replacement (`delete,create`). That remains intentional after the
-foundation is live. It admits only two exact transition families: publisher
-role/policy creation (including the policy-only partial retry), and the
+foundation is live. It admits only three exact transition families: Authority
+publisher role/policy creation (including the policy-only partial retry), the
 43-to-45 Redis split (either or both split-user creates plus the exact legacy
-user-group membership replacement). The transitions cannot be combined, and
-neither may be combined with refresh-only state normalization. Once both are
-complete, the same exact 45-resource contract must be a no-op. Any necessary
-ForceNew change needs its own reviewed, resource-specific no-data-loss rollout
-and an explicit narrow contract change; do not disable the destructive gate to
-make a routine PR pass.
+user-group membership replacement), and the five-create Hub artifact bootstrap
+(repository, untagged-only lifecycle, `UNPUBLISHED` digest pin, publisher role,
+and inline policy, including dependency-safe partial retries). The transitions
+cannot be combined. Once they are complete, the same exact 50-resource contract
+must be a no-op. The checker separately admits only the provider's exact
+refresh-only role-policy reflection and externally owned Authority/Hub digest
+value-plus-version projections; every other drift remains rejected. Any
+necessary ForceNew change needs its own reviewed, resource-specific
+no-data-loss rollout and an explicit narrow contract change; do not disable the
+destructive gate to make a routine PR pass.
 
 The sandbox and production `main.tf` files are deliberately separate state
 roots with byte-identical module wrappers. The foundation checker enforces that
@@ -163,7 +203,8 @@ Each environment creates six Interface VPC endpoints in three Availability
 Zones, plus one ElastiCache Serverless cache. The endpoints accrue endpoint
 AZ-hour charges even with deny-all policies and zero ingress; ElastiCache
 accrues its provider minimum and usage charges even before authority traffic
-exists. KMS, CloudWatch Logs, DynamoDB, ECR, and Secrets Manager may also incur
+exists. KMS, CloudWatch Logs, DynamoDB, both ECR repositories, and Secrets
+Manager may also incur
 storage or request charges as their resources are used.
 
 These resources are intentional prerequisites, not evidence that the runtime
@@ -177,9 +218,9 @@ rather than restoring expired or consumed challenge state.
 
 ## Sandbox teardown
 
-The ECR repository uses `prevent_destroy` in sandbox as well as production so
+Both ECR repositories use `prevent_destroy` in sandbox as well as production so
 immutable digest pins and rollback evidence cannot disappear during a routine
 teardown. An intentional sandbox teardown requires a reviewed change removing
-that lifecycle guard, confirmation that no SSM digest pin or rollback still
-references the images, and deletion through Terraform. Do not remove the
+the relevant lifecycle guard, confirmation that no SSM digest pin or rollback
+still references the images, and deletion through Terraform. Do not remove a
 repository from state, which would orphan the protected publisher target.

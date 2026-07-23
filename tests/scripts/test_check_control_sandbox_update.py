@@ -747,13 +747,13 @@ class WorkflowContractTests(unittest.TestCase):
             "control-state-before-apply/state.json",
             "live-refresh-contract-summary.json",
             "live-refresh-drift-summary.raw.json",
-            "publisher-role:1|authority-digest:1|redis-passwords:2",
-            "publisher-role|redis-passwords)",
+            "publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|redis-passwords:2",
+            "publisher-role|hub-publisher-role|redis-passwords)",
         ):
             self.assertIn(marker, live_refresh_step)
 
         authority_drift_case = live_refresh_step.split(
-            "            authority-digest)\n", 1
+            "            authority-digest|hub-digest)\n", 1
         )[1].split("              ;;\n", 1)[0]
         raw_summary = (
             '>"$RUNNER_TEMP/live-refresh-drift-summary.raw.json"'

@@ -90,6 +90,90 @@ AUTHORITY_PUBLISHER_POLICY = {
     ],
     "Version": "2012-10-17",
 }
+HUB_PUBLISHER_ROLE_NAME = f"{CONTROL_PREFIX}-hub-publisher"
+HUB_PUBLISHER_GITHUB_ENVIRONMENT = "hub-publish-sandbox"
+HUB_PUBLISHER_GITHUB_SUBJECT = (
+    f"repo:layervai/nhp:environment:{HUB_PUBLISHER_GITHUB_ENVIRONMENT}"
+)
+HUB_ECR_REPOSITORY_NAME = "layerv/nhp-hub"
+HUB_ECR_REPOSITORY_ARN = (
+    f"arn:aws:ecr:{AWS_REGION}:{ACCOUNT_ID}:repository/{HUB_ECR_REPOSITORY_NAME}"
+)
+HUB_IMAGE_DIGEST_PARAMETER_NAME = "/sandbox/nhp/control/hub/image-digest"
+HUB_IMAGE_DIGEST_PARAMETER_ARN = (
+    f"arn:aws:ssm:{AWS_REGION}:{ACCOUNT_ID}:parameter"
+    f"{HUB_IMAGE_DIGEST_PARAMETER_NAME}"
+)
+HUB_PUBLISHER_TRUST_POLICY = {
+    "Statement": [
+        {
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                    "token.actions.githubusercontent.com:sub": HUB_PUBLISHER_GITHUB_SUBJECT,
+                }
+            },
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": (
+                    f"arn:aws:iam::{ACCOUNT_ID}:oidc-provider/"
+                    "token.actions.githubusercontent.com"
+                )
+            },
+            "Sid": "GitHubEnvironmentPublisher",
+        }
+    ],
+    "Version": "2012-10-17",
+}
+HUB_PUBLISHER_POLICY = {
+    "Statement": [
+        {
+            "Action": "ecr:GetAuthorizationToken",
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "ECRAuthorization",
+        },
+        {
+            "Action": [
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:BatchGetImage",
+                "ecr:CompleteLayerUpload",
+                "ecr:DescribeImages",
+                "ecr:DescribeImageScanFindings",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:InitiateLayerUpload",
+                "ecr:PutImage",
+                "ecr:UploadLayerPart",
+            ],
+            "Effect": "Allow",
+            "Resource": HUB_ECR_REPOSITORY_ARN,
+            "Sid": "HubRepository",
+        },
+        {
+            "Action": ["ssm:GetParameter", "ssm:PutParameter"],
+            "Effect": "Allow",
+            "Resource": HUB_IMAGE_DIGEST_PARAMETER_ARN,
+            "Sid": "HubDigestPin",
+        },
+    ],
+    "Version": "2012-10-17",
+}
+HUB_ECR_LIFECYCLE_POLICY = {
+    "rules": [
+        {
+            "action": {"type": "expire"},
+            "description": "Expire untagged Hub images after 7 days",
+            "rulePriority": 1,
+            "selection": {
+                "countNumber": 7,
+                "countType": "sinceImagePushed",
+                "countUnit": "days",
+                "tagStatus": "untagged",
+            },
+        }
+    ]
+}
 OTP_REDIS_LEGACY_ACCESS = (
     "on ~connector:* -@all +@connection +@read +@write +@scripting"
 )
@@ -130,6 +214,13 @@ EXPECTED_CONTROL_OUTPUTS = frozenset(
         "authority_publisher_role_name",
         "control_table_names",
         "control_table_prefix",
+        "hub_ecr_repository_arn",
+        "hub_ecr_repository_url",
+        "hub_image_digest_parameter_name",
+        "hub_publisher_github_environment",
+        "hub_publisher_github_subject",
+        "hub_publisher_role_arn",
+        "hub_publisher_role_name",
         "interface_endpoint_ids",
         "isolated_subnet_ids",
         "otp_pepper_secret_arn",
@@ -172,7 +263,7 @@ _PUBLISHER_REFRESH_AFTER_SENSITIVE = {
     "tags": {},
     "tags_all": {},
 }
-_AUTHORITY_DIGEST_REFRESH_SENSITIVE = {
+_DIGEST_REFRESH_SENSITIVE = {
     "tags": {},
     "tags_all": {},
     "value": True,
@@ -181,7 +272,31 @@ _AUTHORITY_DIGEST_REFRESH_SENSITIVE = {
 _AUTHORITY_DIGEST_ADDRESS = (
     "module.control.aws_ssm_parameter.authority_image_digest"
 )
-_AUTHORITY_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_HUB_DIGEST_ADDRESS = "module.control.aws_ssm_parameter.hub_image_digest"
+_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_AUTHORITY_DIGEST_SPEC = {
+    "address": _AUTHORITY_DIGEST_ADDRESS,
+    "description": (
+        "Immutable sha256 digest for the separately published Connector "
+        "Authority Lambda image"
+    ),
+    "kind": "authority-digest",
+    "label": "authority",
+    "name": "authority_image_digest",
+    "parameter_arn": AUTHORITY_PUBLISHER_DIGEST_PARAMETER_ARN,
+    "parameter_name": AUTHORITY_PUBLISHER_DIGEST_PARAMETER_NAME,
+}
+_HUB_DIGEST_SPEC = {
+    "address": _HUB_DIGEST_ADDRESS,
+    "description": (
+        "Immutable sha256 digest for the separately published Connector Hub image"
+    ),
+    "kind": "hub-digest",
+    "label": "Hub",
+    "name": "hub_image_digest",
+    "parameter_arn": HUB_IMAGE_DIGEST_PARAMETER_ARN,
+    "parameter_name": HUB_IMAGE_DIGEST_PARAMETER_NAME,
+}
 _DRIFT_IDENTITY_LIMIT = 8
 _DRIFT_IDENTITY_FIELD_MAX_CHARS = 256
 # A separate rendered-JSON ceiling covers escape expansion: 256 source
@@ -198,7 +313,9 @@ EXPECTED_RESOURCES = {
     "module.control.aws_dynamodb_table.api_keys": "aws_dynamodb_table",
     "module.control.aws_dynamodb_table.connector_authority": "aws_dynamodb_table",
     "module.control.aws_dynamodb_table.customers": "aws_dynamodb_table",
+    "module.control.aws_ecr_lifecycle_policy.hub": "aws_ecr_lifecycle_policy",
     "module.control.aws_ecr_repository.authority": "aws_ecr_repository",
+    "module.control.aws_ecr_repository.hub": "aws_ecr_repository",
     "module.control.aws_elasticache_serverless_cache.otp": "aws_elasticache_serverless_cache",
     "module.control.aws_elasticache_user.otp_activator": "aws_elasticache_user",
     "module.control.aws_elasticache_user.otp_authority": "aws_elasticache_user",
@@ -208,8 +325,10 @@ EXPECTED_RESOURCES = {
     "module.control.aws_flow_log.control": "aws_flow_log",
     "module.control.aws_iam_role.flow_logs": "aws_iam_role",
     "module.control.aws_iam_role.authority_publisher": "aws_iam_role",
+    "module.control.aws_iam_role.hub_publisher": "aws_iam_role",
     "module.control.aws_iam_role_policy.authority_publisher": "aws_iam_role_policy",
     "module.control.aws_iam_role_policy.flow_logs": "aws_iam_role_policy",
+    "module.control.aws_iam_role_policy.hub_publisher": "aws_iam_role_policy",
     "module.control.aws_kms_alias.authority_data": "aws_kms_alias",
     "module.control.aws_kms_alias.qat1_signing": "aws_kms_alias",
     "module.control.aws_kms_key.authority_data": "aws_kms_key",
@@ -224,6 +343,7 @@ EXPECTED_RESOURCES = {
     "module.control.aws_security_group.interface_endpoints": "aws_security_group",
     "module.control.aws_security_group.otp_redis": "aws_security_group",
     "module.control.aws_ssm_parameter.authority_image_digest": "aws_ssm_parameter",
+    "module.control.aws_ssm_parameter.hub_image_digest": "aws_ssm_parameter",
     "module.control.aws_subnet.isolated[0]": "aws_subnet",
     "module.control.aws_subnet.isolated[1]": "aws_subnet",
     "module.control.aws_subnet.isolated[2]": "aws_subnet",
@@ -242,6 +362,15 @@ PUBLISHER_BOOTSTRAP_RESOURCES = frozenset(
     {
         "module.control.aws_iam_role.authority_publisher",
         "module.control.aws_iam_role_policy.authority_publisher",
+    }
+)
+HUB_ARTIFACT_BOOTSTRAP_RESOURCES = frozenset(
+    {
+        "module.control.aws_ecr_lifecycle_policy.hub",
+        "module.control.aws_ecr_repository.hub",
+        "module.control.aws_iam_role.hub_publisher",
+        "module.control.aws_iam_role_policy.hub_publisher",
+        "module.control.aws_ssm_parameter.hub_image_digest",
     }
 )
 REDIS_SPLIT_USER_RESOURCES = frozenset(
@@ -488,6 +617,12 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
             "aws_iam_role.authority_publisher",
         ],
     },
+    "module.control.aws_iam_role_policy.hub_publisher": {
+        ("role",): [
+            "aws_iam_role.hub_publisher.id",
+            "aws_iam_role.hub_publisher",
+        ],
+    },
     "module.control.aws_cloudwatch_log_group.flow_logs": {
         ("kms_key_id",): [
             "aws_kms_key.authority_data.arn",
@@ -504,6 +639,18 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
         ("encryption_configuration", 0, "kms_key"): [
             "aws_kms_key.authority_data.arn",
             "aws_kms_key.authority_data",
+        ],
+    },
+    "module.control.aws_ecr_repository.hub": {
+        ("encryption_configuration", 0, "kms_key"): [
+            "aws_kms_key.authority_data.arn",
+            "aws_kms_key.authority_data",
+        ],
+    },
+    "module.control.aws_ecr_lifecycle_policy.hub": {
+        ("repository",): [
+            "aws_ecr_repository.hub.name",
+            "aws_ecr_repository.hub",
         ],
     },
     "module.control.aws_kms_alias.authority_data": {
@@ -529,6 +676,9 @@ for _table in _DYNAMODB_TABLES:
 
 CONFIG_CONSTANT_CONTRACT: dict[str, dict[ExpressionPath, Any]] = {
     "module.control.aws_iam_role.authority_publisher": {
+        ("max_session_duration",): 3600,
+    },
+    "module.control.aws_iam_role.hub_publisher": {
         ("max_session_duration",): 3600,
     },
     "module.control.aws_vpc.control": {
@@ -558,6 +708,11 @@ CONFIG_CONSTANT_CONTRACT: dict[str, dict[ExpressionPath, Any]] = {
         ("vpc_endpoint_type",): "Interface",
     },
     "module.control.aws_ecr_repository.authority": {
+        ("encryption_configuration", 0, "encryption_type"): "KMS",
+        ("image_scanning_configuration", 0, "scan_on_push"): True,
+        ("image_tag_mutability",): "IMMUTABLE",
+    },
+    "module.control.aws_ecr_repository.hub": {
         ("encryption_configuration", 0, "encryption_type"): "KMS",
         ("image_scanning_configuration", 0, "scan_on_push"): True,
         ("image_tag_mutability",): "IMMUTABLE",
@@ -615,6 +770,17 @@ CONFIG_ABSENT_PATHS: dict[str, tuple[ExpressionPath, ...]] = {
         ("daily_snapshot_time",),
         ("snapshot_arns_to_restore",),
     ),
+    "module.control.aws_ssm_parameter.hub_image_digest": (
+        ("allowed_pattern",),
+        ("data_type",),
+        ("has_value_wo",),
+        ("insecure_value",),
+        ("key_id",),
+        ("overwrite",),
+        ("tier",),
+        ("value_wo",),
+        ("value_wo_version",),
+    ),
     "module.control.aws_elasticache_user.otp_activator": (
         ("authentication_mode", 0, "passwords"),
         ("no_password_required",),
@@ -637,6 +803,11 @@ CONFIG_ABSENT_PATHS: dict[str, tuple[ExpressionPath, ...]] = {
         ("passwords_wo_version",),
     ),
     "module.control.aws_iam_role.authority_publisher": (
+        ("inline_policy",),
+        ("managed_policy_arns",),
+        ("permissions_boundary",),
+    ),
+    "module.control.aws_iam_role.hub_publisher": (
         ("inline_policy",),
         ("managed_policy_arns",),
         ("permissions_boundary",),
@@ -997,40 +1168,46 @@ def _require_publisher_identity(
     policy: dict[str, Any],
     *,
     reflected_inline_policy: bool | None,
+    role_address: str,
+    policy_address: str,
+    role_name: str,
+    trust_policy: dict[str, Any],
+    inline_policy_name: str,
+    inline_policy: dict[str, Any],
+    label: str,
 ) -> None:
-    role_address = "module.control.aws_iam_role.authority_publisher"
-    policy_address = "module.control.aws_iam_role_policy.authority_publisher"
     _require_fields(
         role,
         {
             "max_session_duration": 3600,
-            "name": AUTHORITY_PUBLISHER_ROLE_NAME,
+            "name": role_name,
+            "path": "/",
         },
         role_address,
     )
     _require_json_field(
         role,
         "assume_role_policy",
-        AUTHORITY_PUBLISHER_TRUST_POLICY,
+        trust_policy,
         role_address,
     )
     if role.get("managed_policy_arns") not in (None, []):
-        raise ContractError("authority publisher may not attach managed policies")
+        raise ContractError(f"{label} publisher may not attach managed policies")
     # The locked AWS provider renders an absent permissions boundary as null on
     # create and as an empty string after refresh. Configuration validation
     # independently forbids the input; reject every nonempty live ARN here.
     if role.get("permissions_boundary") not in (None, ""):
-        raise ContractError("authority publisher may not use a permissions boundary")
+        raise ContractError(f"{label} publisher may not use a permissions boundary")
     inline_policies = role.get("inline_policy")
     if inline_policies in (None, []):
         if reflected_inline_policy is True:
             raise ContractError(
-                "authority publisher role must reflect its separately managed inline policy"
+                f"{label} publisher role must reflect its separately managed inline policy"
             )
     else:
         if reflected_inline_policy is False:
             raise ContractError(
-                "authority publisher role reflected an inline policy before its separate policy exists"
+                f"{label} publisher role reflected an inline policy before its separate policy exists"
             )
         if (
             not isinstance(inline_policies, list)
@@ -1039,29 +1216,69 @@ def _require_publisher_identity(
             or set(inline_policies[0]) != {"name", "policy"}
         ):
             raise ContractError(
-                "authority publisher role must reflect exactly its separately managed inline policy"
+                f"{label} publisher role must reflect exactly its separately managed inline policy"
             )
         _require_fields(
             inline_policies[0],
-            {"name": "publish-connector-authority"},
+            {"name": inline_policy_name},
             role_address,
         )
         _require_json_field(
             inline_policies[0],
             "policy",
-            AUTHORITY_PUBLISHER_POLICY,
+            inline_policy,
             role_address,
         )
     _require_fields(
         policy,
-        {"name": "publish-connector-authority"},
+        {"name": inline_policy_name},
         policy_address,
     )
     _require_json_field(
         policy,
         "policy",
-        AUTHORITY_PUBLISHER_POLICY,
+        inline_policy,
         policy_address,
+    )
+
+
+def _require_authority_publisher_identity(
+    role: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    reflected_inline_policy: bool | None,
+) -> None:
+    _require_publisher_identity(
+        role,
+        policy,
+        reflected_inline_policy=reflected_inline_policy,
+        role_address="module.control.aws_iam_role.authority_publisher",
+        policy_address="module.control.aws_iam_role_policy.authority_publisher",
+        role_name=AUTHORITY_PUBLISHER_ROLE_NAME,
+        trust_policy=AUTHORITY_PUBLISHER_TRUST_POLICY,
+        inline_policy_name="publish-connector-authority",
+        inline_policy=AUTHORITY_PUBLISHER_POLICY,
+        label="authority",
+    )
+
+
+def _require_hub_publisher_identity(
+    role: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    reflected_inline_policy: bool | None,
+) -> None:
+    _require_publisher_identity(
+        role,
+        policy,
+        reflected_inline_policy=reflected_inline_policy,
+        role_address="module.control.aws_iam_role.hub_publisher",
+        policy_address="module.control.aws_iam_role_policy.hub_publisher",
+        role_name=HUB_PUBLISHER_ROLE_NAME,
+        trust_policy=HUB_PUBLISHER_TRUST_POLICY,
+        inline_policy_name="publish-connector-hub",
+        inline_policy=HUB_PUBLISHER_POLICY,
+        label="Hub",
     )
 
 
@@ -1304,55 +1521,195 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
     ):
         raise ContractError("planned OTP Redis usage limits drifted")
 
-    publisher_role_address = "module.control.aws_iam_role.authority_publisher"
-    publisher_role, publisher_role_unknown = values(publisher_role_address)
-    publisher_policy_address = (
-        "module.control.aws_iam_role_policy.authority_publisher"
-    )
-    publisher_policy, publisher_policy_unknown = values(publisher_policy_address)
-    publisher_role_is_create = (
-        by_address[publisher_role_address].get("change", {}).get("actions")
-        == ["create"]
-    )
-    allowed_managed_policy_unknown = (
-        (None, [], False, True)
-        if publisher_role_is_create
-        else (None, [], False)
-    )
-    if (
-        publisher_role_unknown.get("managed_policy_arns")
-        not in allowed_managed_policy_unknown
-    ):
-        raise ContractError("authority publisher managed policies may not be unknown")
+    authority_data_key, _ = values("module.control.aws_kms_key.authority_data")
+    authority_data_key_arn = authority_data_key.get("arn")
+    if not isinstance(authority_data_key_arn, str):
+        raise ContractError("authority data KMS ARN is absent from the plan")
 
-    publisher_policy_is_create = (
-        by_address[publisher_policy_address].get("change", {}).get("actions")
-        == ["create"]
+    hub_repository_address = "module.control.aws_ecr_repository.hub"
+    hub_repository, _ = values(hub_repository_address)
+    _require_fields(
+        hub_repository,
+        {
+            "encryption_configuration": [
+                {
+                    "encryption_type": "KMS",
+                    "kms_key": authority_data_key_arn,
+                }
+            ],
+            "force_delete": False,
+            "image_scanning_configuration": [{"scan_on_push": True}],
+            "image_tag_mutability": "IMMUTABLE",
+            "name": HUB_ECR_REPOSITORY_NAME,
+            "region": AWS_REGION,
+        },
+        hub_repository_address,
     )
-    _require_publisher_identity(
-        publisher_role,
-        publisher_policy,
-        # The refresh-disabled PR plan sees the pre-normalization empty
-        # computed field; a refreshed plan sees the exact reflected policy.
-        # Both are safe no-op representations, while create/partial-retry must
-        # remain empty until the separate policy exists.
-        reflected_inline_policy=(
-            False if publisher_role_is_create or publisher_policy_is_create else None
-        ),
+    hub_lifecycle_address = "module.control.aws_ecr_lifecycle_policy.hub"
+    hub_lifecycle, _ = values(hub_lifecycle_address)
+    _require_json_field(
+        hub_lifecycle,
+        "policy",
+        HUB_ECR_LIFECYCLE_POLICY,
+        hub_lifecycle_address,
+    )
+    # The repository is a reference in configuration, but its configured name
+    # is known before apply. The locked provider therefore emits the exact name
+    # even when both resources are being created.
+    if hub_lifecycle.get("repository") != HUB_ECR_REPOSITORY_NAME:
+        raise ContractError("Hub lifecycle repository drifted")
+
+    hub_digest_address = "module.control.aws_ssm_parameter.hub_image_digest"
+    hub_digest, hub_digest_unknown = values(hub_digest_address)
+    hub_digest_is_create = (
+        by_address[hub_digest_address].get("change", {}).get("actions")
+        == ["create"]
     )
     _require_fields(
-        publisher_role,
-        {"path": "/"},
-        publisher_role_address,
+        hub_digest,
+        {
+            "description": _HUB_DIGEST_SPEC["description"],
+            "name": HUB_IMAGE_DIGEST_PARAMETER_NAME,
+            "overwrite": None,
+            "region": AWS_REGION,
+            "type": "String",
+            "value_wo": None,
+            "value_wo_version": None,
+        },
+        hub_digest_address,
     )
-    if publisher_policy_is_create and publisher_role_is_create:
-        if (
-            publisher_policy.get("role") is not None
-            or publisher_policy_unknown.get("role") is not True
+    provider_default_fields = {
+        "data_type": "text",
+        "has_value_wo": False,
+        "insecure_value": None,
+        "key_id": "",
+        "tier": "Standard",
+    }
+    if hub_digest_is_create:
+        _require_fields(
+            hub_digest,
+            {"allowed_pattern": None},
+            hub_digest_address,
+        )
+        if hub_digest_unknown.get("allowed_pattern") not in (None, False):
+            raise ContractError(
+                "Hub image digest allowed pattern may not be unknown"
+            )
+        _require_fields(
+            hub_digest,
+            {field: None for field in provider_default_fields},
+            hub_digest_address,
+        )
+        if any(
+            hub_digest_unknown.get(field) is not True
+            for field in provider_default_fields
         ):
-            raise ContractError("authority publisher create must derive its role")
-    elif publisher_policy.get("role") != AUTHORITY_PUBLISHER_ROLE_NAME:
-        raise ContractError("authority publisher policy role drifted")
+            raise ContractError(
+                "Hub image digest create defaults are not the exact "
+                "fail-closed provider shape"
+            )
+    else:
+        _require_fields(
+            hub_digest,
+            {
+                "allowed_pattern": "",
+                **provider_default_fields,
+            },
+            hub_digest_address,
+        )
+        if any(
+            hub_digest_unknown.get(field) not in (None, False)
+            for field in ("allowed_pattern", *provider_default_fields)
+        ):
+            raise ContractError("Hub image digest defaults may not remain unknown")
+
+    hub_digest_value = hub_digest.get("value")
+    if (
+        (hub_digest_is_create and hub_digest_value != "UNPUBLISHED")
+        or (
+            not hub_digest_is_create
+            and hub_digest_value != "UNPUBLISHED"
+            and (
+                not isinstance(hub_digest_value, str)
+                or _DIGEST_PATTERN.fullmatch(hub_digest_value) is None
+            )
+        )
+    ):
+        raise ContractError("planned Hub image digest pin is invalid")
+
+    for (
+        label,
+        publisher_role_address,
+        publisher_policy_address,
+        publisher_role_name,
+        identity_checker,
+    ) in (
+        (
+            "authority",
+            "module.control.aws_iam_role.authority_publisher",
+            "module.control.aws_iam_role_policy.authority_publisher",
+            AUTHORITY_PUBLISHER_ROLE_NAME,
+            _require_authority_publisher_identity,
+        ),
+        (
+            "Hub",
+            "module.control.aws_iam_role.hub_publisher",
+            "module.control.aws_iam_role_policy.hub_publisher",
+            HUB_PUBLISHER_ROLE_NAME,
+            _require_hub_publisher_identity,
+        ),
+    ):
+        publisher_role, publisher_role_unknown = values(publisher_role_address)
+        publisher_policy, publisher_policy_unknown = values(publisher_policy_address)
+        publisher_role_is_create = (
+            by_address[publisher_role_address].get("change", {}).get("actions")
+            == ["create"]
+        )
+        allowed_managed_policy_unknown = (
+            (None, [], False, True)
+            if publisher_role_is_create
+            else (None, [], False)
+        )
+        if (
+            publisher_role_unknown.get("managed_policy_arns")
+            not in allowed_managed_policy_unknown
+        ):
+            raise ContractError(
+                f"{label} publisher managed policies may not be unknown"
+            )
+
+        publisher_policy_is_create = (
+            by_address[publisher_policy_address].get("change", {}).get("actions")
+            == ["create"]
+        )
+        identity_checker(
+            publisher_role,
+            publisher_policy,
+            # The refresh-disabled PR plan sees the pre-normalization empty
+            # computed field; a refreshed plan sees the exact reflected policy.
+            # Both are safe no-op representations, while create/partial-retry
+            # must remain empty until the separate policy exists.
+            reflected_inline_policy=(
+                False
+                if publisher_role_is_create or publisher_policy_is_create
+                else None
+            ),
+        )
+        _require_fields(
+            publisher_role,
+            {"path": "/"},
+            publisher_role_address,
+        )
+        if publisher_policy_is_create and publisher_role_is_create:
+            if (
+                publisher_policy.get("role") is not None
+                or publisher_policy_unknown.get("role") is not True
+            ):
+                raise ContractError(
+                    f"{label} publisher create must derive its role"
+                )
+        elif publisher_policy.get("role") != publisher_role_name:
+            raise ContractError(f"{label} publisher policy role drifted")
 
 
 def _check_state_normalization_drift(
@@ -1380,13 +1737,36 @@ def _check_state_normalization_drift(
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
     item = drift[0]
-    role_address = "module.control.aws_iam_role.authority_publisher"
-    if item.get("address") == role_address:
-        _check_publisher_role_normalization(item, by_address)
+    if item.get("address") == "module.control.aws_iam_role.authority_publisher":
+        _check_publisher_role_normalization(
+            item,
+            by_address,
+            role_address="module.control.aws_iam_role.authority_publisher",
+            policy_address="module.control.aws_iam_role_policy.authority_publisher",
+            identity_checker=_require_authority_publisher_identity,
+            label="authority",
+        )
         return "publisher-role"
+    if item.get("address") == "module.control.aws_iam_role.hub_publisher":
+        _check_publisher_role_normalization(
+            item,
+            by_address,
+            role_address="module.control.aws_iam_role.hub_publisher",
+            policy_address="module.control.aws_iam_role_policy.hub_publisher",
+            identity_checker=_require_hub_publisher_identity,
+            label="Hub",
+        )
+        return "hub-publisher-role"
     if item.get("address") == _AUTHORITY_DIGEST_ADDRESS:
-        _check_authority_digest_normalization(item, by_address)
+        _check_digest_normalization(
+            item,
+            by_address,
+            spec=_AUTHORITY_DIGEST_SPEC,
+        )
         return "authority-digest"
+    if item.get("address") == _HUB_DIGEST_ADDRESS:
+        _check_digest_normalization(item, by_address, spec=_HUB_DIGEST_SPEC)
+        return "hub-digest"
     raise _unexpected_drift_error(drift)
 
 
@@ -1488,9 +1868,13 @@ def _check_redis_password_normalization(
 def _check_publisher_role_normalization(
     item: dict[str, Any],
     by_address: dict[str, dict[str, Any]],
+    *,
+    role_address: str,
+    policy_address: str,
+    identity_checker: Any,
+    label: str,
 ) -> None:
     """Admit the provider's exact state-only inline-policy reflection."""
-    role_address = "module.control.aws_iam_role.authority_publisher"
     if (
         item.get("address") != role_address
         or item.get("mode") != "managed"
@@ -1499,11 +1883,15 @@ def _check_publisher_role_normalization(
         raise _unexpected_drift_error([item])
     change = item.get("change")
     if not isinstance(change, dict) or change.get("actions") != ["update"]:
-        raise ContractError("publisher role normalization must be an in-state update")
+        raise ContractError(
+            f"{label} publisher role normalization must be an in-state update"
+        )
     before = change.get("before")
     after = change.get("after")
     if not isinstance(before, dict) or not isinstance(after, dict):
-        raise ContractError("publisher role normalization values are malformed")
+        raise ContractError(
+            f"{label} publisher role normalization values are malformed"
+        )
     changed_fields = {
         field
         for field in set(before) | set(after)
@@ -1514,55 +1902,62 @@ def _check_publisher_role_normalization(
         [],
     ):
         raise ContractError(
-            "publisher role normalization may only reflect its separately managed inline policy; "
+            f"{label} publisher role normalization may only reflect its separately "
+            "managed inline policy; "
             f"changed_fields={sorted(changed_fields)}"
         )
     planned_role = by_address[role_address].get("change", {})
     if planned_role.get("actions") != ["no-op"] or planned_role.get("after") != after:
         raise ContractError(
-            "publisher role normalization must match the refresh-only no-op state"
+            f"{label} publisher role normalization must match the refresh-only "
+            "no-op state"
         )
-    publisher_policy = by_address[
-        "module.control.aws_iam_role_policy.authority_publisher"
-    ].get("change", {}).get("after")
+    publisher_policy = by_address[policy_address].get("change", {}).get("after")
     if not isinstance(publisher_policy, dict):
-        raise ContractError("publisher policy normalization values are malformed")
-    _require_publisher_identity(
+        raise ContractError(
+            f"{label} publisher policy normalization values are malformed"
+        )
+    identity_checker(
         after,
         publisher_policy,
         reflected_inline_policy=True,
     )
 
 
-def _check_authority_digest_normalization(
+def _check_digest_normalization(
     item: dict[str, Any],
     by_address: dict[str, dict[str, Any]],
+    *,
+    spec: dict[str, str],
 ) -> None:
-    """Admit only qurl-service's externally owned immutable digest update.
+    """Admit only a dedicated publisher's externally owned digest update.
 
     Terraform owns the parameter and intentionally ignores its value after
-    creation; the trusted qurl-service publisher owns subsequent value updates.
+    creation; the trusted repository publisher owns subsequent value updates.
     Bind that observed value/version pair into the saved Control plan. When it
     accompanies the one reviewed Redis transition, the apply workflow re-proves
     the exact live drift immediately before consuming the saved plan.
     """
-    _, after = _validate_authority_digest_normalization(item)
-    planned = by_address[_AUTHORITY_DIGEST_ADDRESS].get("change", {})
+    _, after = _validate_digest_normalization(item, spec=spec)
+    planned = by_address[spec["address"]].get("change", {})
     if planned.get("actions") != ["no-op"] or planned.get("after") != after:
         raise ContractError(
-            "authority digest normalization must match the refreshed planned state"
+            f"{spec['label']} digest normalization must match the refreshed "
+            "planned state"
         )
 
 
-def _validate_authority_digest_normalization(
+def _validate_digest_normalization(
     item: dict[str, Any],
+    *,
+    spec: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate the provider-version-specific external digest drift shape."""
     expected_identity = {
-        "address": _AUTHORITY_DIGEST_ADDRESS,
+        "address": spec["address"],
         "mode": "managed",
         "module_address": "module.control",
-        "name": "authority_image_digest",
+        "name": spec["name"],
         "provider_name": "registry.terraform.io/hashicorp/aws",
         "type": "aws_ssm_parameter",
     }
@@ -1580,20 +1975,21 @@ def _validate_authority_digest_normalization(
         or set(change) != _CHANGE_KEYS
         or change.get("actions") != ["update"]
     ):
-        raise ContractError("authority digest normalization must be an in-state update")
+        raise ContractError(
+            f"{spec['label']} digest normalization must be an in-state update"
+        )
     before = change.get("before")
     after = change.get("after")
     if not isinstance(before, dict) or not isinstance(after, dict):
-        raise ContractError("authority digest normalization values are malformed")
-    parameter_name = AUTHORITY_PUBLISHER_DIGEST_PARAMETER_NAME
+        raise ContractError(
+            f"{spec['label']} digest normalization values are malformed"
+        )
+    parameter_name = spec["parameter_name"]
     parameter_contract = {
         "allowed_pattern": "",
-        "arn": AUTHORITY_PUBLISHER_DIGEST_PARAMETER_ARN,
+        "arn": spec["parameter_arn"],
         "data_type": "text",
-        "description": (
-            "Immutable sha256 digest for the separately published Connector "
-            "Authority Lambda image"
-        ),
+        "description": spec["description"],
         "has_value_wo": False,
         "id": parameter_name,
         "insecure_value": None,
@@ -1609,16 +2005,25 @@ def _validate_authority_digest_normalization(
     value_keys = {*parameter_contract, "tags", "tags_all", "value", "version"}
     if set(before) != value_keys or set(after) != value_keys:
         raise ContractError(
-            "authority digest normalization value shape is not exact"
+            f"{spec['label']} digest normalization value shape is not exact"
         )
-    _require_fields(before, parameter_contract, "authority digest drift before")
-    _require_fields(after, parameter_contract, "authority digest drift after")
+    _require_fields(
+        before,
+        parameter_contract,
+        f"{spec['label']} digest drift before",
+    )
+    _require_fields(
+        after,
+        parameter_contract,
+        f"{spec['label']} digest drift after",
+    )
     # ``before`` and ``after`` share the exact ``value_keys`` set asserted above,
     # so a plain per-key comparison over that set finds every changed field.
     changed_fields = {field for field in value_keys if before[field] != after[field]}
     if changed_fields != {"value", "version"}:
         raise ContractError(
-            "authority digest normalization may change only value and version; "
+            f"{spec['label']} digest normalization may change only value and "
+            "version; "
             f"changed_fields={sorted(changed_fields)}"
         )
     before_value = before.get("value")
@@ -1627,13 +2032,15 @@ def _validate_authority_digest_normalization(
         not isinstance(before_value, str)
         or (
             before_value != "UNPUBLISHED"
-            and _AUTHORITY_DIGEST_PATTERN.fullmatch(before_value) is None
+            and _DIGEST_PATTERN.fullmatch(before_value) is None
         )
         or not isinstance(after_value, str)
-        or _AUTHORITY_DIGEST_PATTERN.fullmatch(after_value) is None
+        or _DIGEST_PATTERN.fullmatch(after_value) is None
         or before_value == after_value
     ):
-        raise ContractError("authority digest normalization values are not immutable digests")
+        raise ContractError(
+            f"{spec['label']} digest normalization values are not immutable digests"
+        )
     before_version = before.get("version")
     after_version = after.get("version")
     if (
@@ -1644,14 +2051,16 @@ def _validate_authority_digest_normalization(
         or before_version < 1
         or after_version <= before_version
     ):
-        raise ContractError("authority digest normalization version did not advance")
+        raise ContractError(
+            f"{spec['label']} digest normalization version did not advance"
+        )
     if (
         change.get("after_unknown") != {}
-        or change.get("before_sensitive") != _AUTHORITY_DIGEST_REFRESH_SENSITIVE
-        or change.get("after_sensitive") != _AUTHORITY_DIGEST_REFRESH_SENSITIVE
+        or change.get("before_sensitive") != _DIGEST_REFRESH_SENSITIVE
+        or change.get("after_sensitive") != _DIGEST_REFRESH_SENSITIVE
     ):
         raise ContractError(
-            "authority digest normalization has unexpected value metadata"
+            f"{spec['label']} digest normalization has unexpected value metadata"
         )
     return before, after
 
@@ -1664,15 +2073,18 @@ def _refresh_sensitive_contract(
             _REDIS_PASSWORD_NORMALIZATION_SENSITIVE,
             _REDIS_PASSWORD_NORMALIZATION_SENSITIVE,
         )
-    if address == "module.control.aws_iam_role.authority_publisher":
+    if address in (
+        "module.control.aws_iam_role.authority_publisher",
+        "module.control.aws_iam_role.hub_publisher",
+    ):
         return (
             _PUBLISHER_REFRESH_BEFORE_SENSITIVE,
             _PUBLISHER_REFRESH_AFTER_SENSITIVE,
         )
-    if address == _AUTHORITY_DIGEST_ADDRESS:
+    if address in (_AUTHORITY_DIGEST_ADDRESS, _HUB_DIGEST_ADDRESS):
         return (
-            _AUTHORITY_DIGEST_REFRESH_SENSITIVE,
-            _AUTHORITY_DIGEST_REFRESH_SENSITIVE,
+            _DIGEST_REFRESH_SENSITIVE,
+            _DIGEST_REFRESH_SENSITIVE,
         )
     raise ContractError(f"refresh drift is not approved for normalization: {address}")
 
@@ -1878,6 +2290,20 @@ def _plan_resource_changes(
     return changes
 
 
+def _require_create_shapes(
+    addresses: set[str],
+    by_address: dict[str, dict[str, Any]],
+    message: str | None = None,
+) -> None:
+    """Assert every address is a pure create (no ``before``, dict ``after``)."""
+    for address in addresses:
+        change = by_address[address]["change"]
+        if change.get("before") is not None or not isinstance(
+            change.get("after"), dict
+        ):
+            raise ContractError(message or f"{address} create shape is malformed")
+
+
 def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     """Validate one exact reviewed plan shape.
 
@@ -1943,6 +2369,19 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             or "module.control.aws_iam_role_policy.authority_publisher" in changed
         )
     )
+    hub_artifact_transition = (
+        bool(changed)
+        and changed.issubset(HUB_ARTIFACT_BOOTSTRAP_RESOURCES)
+        and all(actual_non_noop[address] == ["create"] for address in changed)
+        and (
+            "module.control.aws_iam_role.hub_publisher" not in changed
+            or "module.control.aws_iam_role_policy.hub_publisher" in changed
+        )
+        and (
+            "module.control.aws_ecr_repository.hub" not in changed
+            or "module.control.aws_ecr_lifecycle_policy.hub" in changed
+        )
+    )
     redis_group_address = "module.control.aws_elasticache_user_group.otp"
     redis_user_addresses = REDIS_SPLIT_USER_RESOURCES
     changed_redis_user_addresses = changed & redis_user_addresses
@@ -1959,20 +2398,18 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     if publisher_transition:
         plan_mode = "publisher-bootstrap"
         bootstrap_creates = changed
-        for address in changed:
-            change = by_address[address]["change"]
-            if change.get("before") is not None or not isinstance(
-                change.get("after"), dict
-            ):
-                raise ContractError(f"{address} create shape is malformed")
+        _require_create_shapes(changed, by_address)
+    elif hub_artifact_transition:
+        plan_mode = "hub-artifact-bootstrap"
+        bootstrap_creates = changed
+        _require_create_shapes(changed, by_address)
     elif redis_transition:
         plan_mode = "redis-split-transition"
-        for address in changed_redis_user_addresses:
-            change = by_address[address]["change"]
-            if change.get("before") is not None or not isinstance(
-                change.get("after"), dict
-            ):
-                raise ContractError("split Redis users must be new resources")
+        _require_create_shapes(
+            changed_redis_user_addresses,
+            by_address,
+            "split Redis users must be new resources",
+        )
         group_change = by_address[redis_group_address]["change"]
         group_before = group_change.get("before")
         group_after = group_change.get("after")
@@ -2006,7 +2443,8 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     elif changed:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
-            f"or reviewed Redis split; got {actual_non_noop}"
+            "Hub artifact bootstrap, or reviewed Redis split; "
+            f"got {actual_non_noop}"
         )
 
     _check_planned_security(by_address)
@@ -2020,7 +2458,10 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     # empty, so ``len(drift)`` already yields 0 in that case.
     normalization_drift_count = len(drift)
 
-    if normalization_drift_kind == "publisher-role" and plan_mode != "no-op":
+    if normalization_drift_kind in (
+        "publisher-role",
+        "hub-publisher-role",
+    ) and plan_mode != "no-op":
         raise ContractError(
             "publisher role normalization cannot be combined with a resource transition"
         )
@@ -2034,6 +2475,11 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             raise ContractError(
                 "authority digest-only state normalization requires a "
                 "refresh-only plan"
+            )
+    if normalization_drift_kind == "hub-digest":
+        if plan_mode != "no-op" or "resource_changes" in plan:
+            raise ContractError(
+                "Hub digest state normalization requires a refresh-only plan"
             )
     if normalization_drift_kind == "redis-passwords" and plan_mode != "no-op":
         raise ContractError(
@@ -2073,7 +2519,7 @@ def check_state_list(path: Path) -> dict[str, int]:
 
     # `terraform state list` includes both managed resources and cached data
     # sources. Require the reviewed union here; the subsequent JSON state check
-    # remains mode-aware and independently enforces the exact 45 managed
+    # remains mode-aware and independently enforces the exact 50 managed
     # resources plus their types and security-sensitive values.
     expected = set(EXPECTED_RESOURCES) | set(EXPECTED_DATA_RESOURCES)
     missing = sorted(expected - addresses)
@@ -2100,11 +2546,12 @@ def _iter_resources(module: Any) -> Iterable[dict[str, Any]]:
 def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | int]:
     """Bind a live refresh observation to the externally owned digest drift.
 
-    This narrow mode is used only immediately before applying a saved plan that
-    also contains the reviewed Redis transition. A refresh-only plan at that
-    point legitimately carries pending output changes, so the full plan
-    contract cannot describe it. This check ignores those unapplied outputs and
-    binds only the exact SSM value/version observation to the captured state.
+    This narrow mode is used immediately before applying a saved plan when
+    pending output changes mean the full refresh-only plan contract cannot
+    describe the observation. It covers the Authority digest alongside the
+    reviewed Redis transition and the separately published Hub digest. The
+    check ignores unapplied outputs and binds only the exact SSM value/version
+    observation to the captured state.
     """
     if not isinstance(plan, dict):
         raise ContractError("Terraform normalization plan must be an object")
@@ -2130,9 +2577,16 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
         )
     _check_no_embedded_actions(plan)
     drift = _non_noop(plan.get("resource_drift"), "resource_drift")
-    if len(drift) != 1 or drift[0].get("address") != _AUTHORITY_DIGEST_ADDRESS:
+    if len(drift) != 1:
         raise _unexpected_drift_error(drift)
-    before, _ = _validate_authority_digest_normalization(drift[0])
+    specs = {
+        _AUTHORITY_DIGEST_ADDRESS: _AUTHORITY_DIGEST_SPEC,
+        _HUB_DIGEST_ADDRESS: _HUB_DIGEST_SPEC,
+    }
+    spec = specs.get(drift[0].get("address"))
+    if spec is None:
+        raise _unexpected_drift_error(drift)
+    before, _ = _validate_digest_normalization(drift[0], spec=spec)
 
     if (
         not isinstance(prior_state, dict)
@@ -2150,19 +2604,21 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
         item
         for item in _iter_resources(root)
         if item.get("mode") == "managed"
-        and item.get("address") == _AUTHORITY_DIGEST_ADDRESS
+        and item.get("address") == spec["address"]
     ]
     if len(matches) != 1 or matches[0].get("type") != "aws_ssm_parameter":
         raise ContractError(
-            "captured state does not contain the exact authority digest parameter"
+            f"captured state does not contain the exact {spec['label']} "
+            "digest parameter"
         )
     if matches[0].get("values") != before:
         raise ContractError(
-            "authority digest refresh before value does not match captured state"
+            f"{spec['label']} digest refresh before value does not match "
+            "captured state"
         )
     return {
         "normalization_drift_count": 1,
-        "normalization_drift_kind": "authority-digest",
+        "normalization_drift_kind": spec["kind"],
         "normalization_drift_sha256": _json_sha256(drift),
     }
 
@@ -2263,13 +2719,69 @@ def check_state(state: Any) -> dict[str, Any]:
     publisher_policy = values[
         "module.control.aws_iam_role_policy.authority_publisher"
     ]
-    _require_publisher_identity(
+    _require_authority_publisher_identity(
         publisher_role,
         publisher_policy,
         reflected_inline_policy=True,
     )
     if publisher_policy.get("role") != AUTHORITY_PUBLISHER_ROLE_NAME:
         raise ContractError("authority publisher inline policy identity drifted")
+
+    hub_repository = values["module.control.aws_ecr_repository.hub"]
+    if (
+        hub_repository.get("arn") != HUB_ECR_REPOSITORY_ARN
+        or hub_repository.get("name") != HUB_ECR_REPOSITORY_NAME
+        or hub_repository.get("force_delete") is not False
+        or hub_repository.get("image_tag_mutability") != "IMMUTABLE"
+        or hub_repository.get("image_scanning_configuration")
+        != [{"scan_on_push": True}]
+        or hub_repository.get("encryption_configuration")
+        != [{"encryption_type": "KMS", "kms_key": data_key.get("arn")}]
+    ):
+        raise ContractError("Hub ECR repository security contract drifted")
+    hub_lifecycle = values["module.control.aws_ecr_lifecycle_policy.hub"]
+    if (
+        hub_lifecycle.get("repository") != HUB_ECR_REPOSITORY_NAME
+        or not isinstance(hub_lifecycle.get("policy"), str)
+    ):
+        raise ContractError("Hub ECR lifecycle identity drifted")
+    try:
+        hub_lifecycle_policy = json.loads(hub_lifecycle["policy"])
+    except json.JSONDecodeError as exc:
+        raise ContractError("Hub ECR lifecycle policy is malformed") from exc
+    if hub_lifecycle_policy != HUB_ECR_LIFECYCLE_POLICY:
+        raise ContractError("Hub ECR lifecycle policy drifted")
+
+    hub_digest = values["module.control.aws_ssm_parameter.hub_image_digest"]
+    hub_digest_value = hub_digest.get("value")
+    if (
+        hub_digest.get("arn") != HUB_IMAGE_DIGEST_PARAMETER_ARN
+        or hub_digest.get("name") != HUB_IMAGE_DIGEST_PARAMETER_NAME
+        or hub_digest.get("data_type") != "text"
+        or hub_digest.get("description") != _HUB_DIGEST_SPEC["description"]
+        or hub_digest.get("tier") != "Standard"
+        or hub_digest.get("type") != "String"
+        or (
+            hub_digest_value != "UNPUBLISHED"
+            and (
+                not isinstance(hub_digest_value, str)
+                or _DIGEST_PATTERN.fullmatch(hub_digest_value) is None
+            )
+        )
+    ):
+        raise ContractError("Hub image digest parameter contract drifted")
+
+    hub_publisher_role = values["module.control.aws_iam_role.hub_publisher"]
+    hub_publisher_policy = values[
+        "module.control.aws_iam_role_policy.hub_publisher"
+    ]
+    _require_hub_publisher_identity(
+        hub_publisher_role,
+        hub_publisher_policy,
+        reflected_inline_policy=True,
+    )
+    if hub_publisher_policy.get("role") != HUB_PUBLISHER_ROLE_NAME:
+        raise ContractError("Hub publisher inline policy identity drifted")
 
     interface_sg = values["module.control.aws_security_group.interface_endpoints"].get(
         "id"

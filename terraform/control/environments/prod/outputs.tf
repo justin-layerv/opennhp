@@ -78,3 +78,31 @@ output "authority_publisher_role_name" {
 output "authority_publisher_github_environment" {
   value = module.control.authority_publisher_github_environment
 }
+
+output "hub_ecr_repository_url" {
+  value = module.control.hub_ecr_repository_url
+}
+
+output "hub_ecr_repository_arn" {
+  value = module.control.hub_ecr_repository_arn
+}
+
+output "hub_image_digest_parameter_name" {
+  value = module.control.hub_image_digest_parameter_name
+}
+
+output "hub_publisher_role_arn" {
+  value = module.control.hub_publisher_role_arn
+}
+
+output "hub_publisher_role_name" {
+  value = module.control.hub_publisher_role_name
+}
+
+output "hub_publisher_github_environment" {
+  value = module.control.hub_publisher_github_environment
+}
+
+output "hub_publisher_github_subject" {
+  value = module.control.hub_publisher_github_subject
+}

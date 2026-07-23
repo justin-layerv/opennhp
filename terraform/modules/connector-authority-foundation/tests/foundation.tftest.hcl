@@ -117,6 +117,37 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
 
   assert {
     condition = (
+      aws_ecr_repository.hub.name == "layerv/nhp-hub" &&
+      aws_ecr_repository.hub.image_tag_mutability == "IMMUTABLE" &&
+      aws_ecr_repository.hub.image_scanning_configuration[0].scan_on_push &&
+      aws_ecr_repository.hub.encryption_configuration[0].encryption_type == "KMS" &&
+      aws_ssm_parameter.hub_image_digest.name == "/sandbox/nhp/control/hub/image-digest" &&
+      aws_ssm_parameter.hub_image_digest.value == "UNPUBLISHED"
+    )
+    error_message = "The Hub repository must remain immutable, scanned, Control-KMS encrypted, and unpublished."
+  }
+
+  assert {
+    condition = jsondecode(aws_ecr_lifecycle_policy.hub.policy) == {
+      rules = [{
+        rulePriority = 1
+        description  = "Expire untagged Hub images after 7 days"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 7
+        }
+        action = {
+          type = "expire"
+        }
+      }]
+    }
+    error_message = "The Hub lifecycle may expire only untagged images after seven days."
+  }
+
+  assert {
+    condition = (
       output.authority_publisher_role_name == "layerv-nhp-sandbox-control-connector-authority-publisher" &&
       output.authority_publisher_github_environment == "sandbox" &&
       aws_iam_role.authority_publisher.max_session_duration == 3600 &&
@@ -170,6 +201,65 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
       jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[2].Resource == "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/control/connector-authority/image-digest"
     )
     error_message = "The publisher policy must remain exact-repository ECR plus exact-parameter SSM, with only ECR authorization on wildcard resource."
+  }
+
+  assert {
+    condition = (
+      output.hub_publisher_role_name == "layerv-nhp-sandbox-control-hub-publisher" &&
+      output.hub_publisher_github_environment == "hub-publish-sandbox" &&
+      output.hub_publisher_github_subject == "repo:layervai/nhp:environment:hub-publish-sandbox" &&
+      aws_iam_role.hub_publisher.max_session_duration == 3600 &&
+      jsondecode(aws_iam_role.hub_publisher.assume_role_policy) == {
+        Version = "2012-10-17"
+        Statement = [{
+          Sid    = "GitHubEnvironmentPublisher"
+          Effect = "Allow"
+          Principal = {
+            Federated = "arn:aws:iam::767397897469:oidc-provider/token.actions.githubusercontent.com"
+          }
+          Action = "sts:AssumeRoleWithWebIdentity"
+          Condition = {
+            StringEquals = {
+              "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+              "token.actions.githubusercontent.com:sub" = "repo:layervai/nhp:environment:hub-publish-sandbox"
+            }
+          }
+        }]
+      }
+    )
+    error_message = "The sandbox Hub publisher must trust only NHP's dedicated Hub publication Environment."
+  }
+
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement) == 3 &&
+      jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement[0] == {
+        Sid      = "ECRAuthorization"
+        Effect   = "Allow"
+        Action   = "ecr:GetAuthorizationToken"
+        Resource = "*"
+      } &&
+      jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement[1].Sid == "HubRepository" &&
+      toset(jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement[1].Action) == toset([
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:CompleteLayerUpload",
+        "ecr:DescribeImages",
+        "ecr:DescribeImageScanFindings",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:UploadLayerPart",
+      ]) &&
+      jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement[1].Resource == "arn:aws:ecr:us-east-2:767397897469:repository/layerv/nhp-hub" &&
+      jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement[2].Sid == "HubDigestPin" &&
+      toset(jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement[2].Action) == toset([
+        "ssm:GetParameter",
+        "ssm:PutParameter",
+      ]) &&
+      jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement[2].Resource == "arn:aws:ssm:us-east-2:767397897469:parameter/sandbox/nhp/control/hub/image-digest"
+    )
+    error_message = "The Hub publisher policy must remain limited to exact-repository ECR and exact-parameter SSM."
   }
 
   assert {
@@ -286,6 +376,18 @@ run "production_tables_are_deletion_protected" {
       jsondecode(aws_iam_role_policy.authority_publisher.policy).Statement[2].Resource == "arn:aws:ssm:us-east-2:235500187906:parameter/prod/nhp/control/connector-authority/image-digest"
     )
     error_message = "Production publication must use qurl-service's production Environment and only production authority targets."
+  }
+
+  assert {
+    condition = (
+      output.hub_publisher_role_name == "layerv-nhp-prod-control-hub-publisher" &&
+      output.hub_publisher_github_environment == "hub-publish-production" &&
+      output.hub_publisher_github_subject == "repo:layervai/nhp:environment:hub-publish-production" &&
+      jsondecode(aws_iam_role.hub_publisher.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:layervai/nhp:environment:hub-publish-production" &&
+      jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement[1].Resource == "arn:aws:ecr:us-east-2:235500187906:repository/layerv/nhp-hub" &&
+      jsondecode(aws_iam_role_policy.hub_publisher.policy).Statement[2].Resource == "arn:aws:ssm:us-east-2:235500187906:parameter/prod/nhp/control/hub/image-digest"
+    )
+    error_message = "Production Hub publication must use NHP's dedicated Hub publication Environment and only production Hub targets."
   }
 }
 

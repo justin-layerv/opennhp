@@ -516,7 +516,7 @@ jobs:
             exit 0
           fi
           case "${normalization_kind}:${normalization_count}" in
-            publisher-role:1|authority-digest:1|redis-passwords:2)
+            publisher-role:1|hub-publisher-role:1|authority-digest:1|hub-digest:1|redis-passwords:2)
               ;;
             *)
               echo '::error::Saved plan has an invalid normalization kind/count.'
@@ -528,7 +528,7 @@ jobs:
           terraform show -json "$RUNNER_TEMP/live-refresh-plan" \
             >"$RUNNER_TEMP/live-refresh-plan.json"
           case "$normalization_kind" in
-            publisher-role|redis-passwords)
+            publisher-role|hub-publisher-role|redis-passwords)
               ../../../../.github/scripts/check-control-sandbox-first-apply.py plan \
                 "$RUNNER_TEMP/live-refresh-plan.json" \
                 "$RUNNER_TEMP/control-state-before-apply/state.json" \
@@ -539,7 +539,7 @@ jobs:
                 exit 1
               }
               ;;
-            authority-digest)
+            authority-digest|hub-digest)
               ../../../../.github/scripts/check-control-sandbox-first-apply.py \
                 normalization-drift \
                 "$RUNNER_TEMP/live-refresh-plan.json" \

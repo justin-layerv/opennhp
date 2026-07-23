@@ -153,3 +153,38 @@ output "authority_publisher_github_environment" {
   description = "Exact qurl-service GitHub Environment admitted by the publisher role."
   value       = local.authority_publisher_github_environment
 }
+
+output "hub_ecr_repository_url" {
+  description = "Immutable-tag ECR repository for the separately published Connector Hub image."
+  value       = aws_ecr_repository.hub.repository_url
+}
+
+output "hub_ecr_repository_arn" {
+  description = "Exact Connector Hub ECR repository ARN."
+  value       = aws_ecr_repository.hub.arn
+}
+
+output "hub_image_digest_parameter_name" {
+  description = "SSM parameter that NHP publication updates with the immutable Hub image digest."
+  value       = aws_ssm_parameter.hub_image_digest.name
+}
+
+output "hub_publisher_role_arn" {
+  description = "Dedicated NHP GitHub Environment OIDC role for publishing the Hub image and digest pin."
+  value       = aws_iam_role.hub_publisher.arn
+}
+
+output "hub_publisher_role_name" {
+  description = "Exact dedicated Connector Hub publisher role name."
+  value       = aws_iam_role.hub_publisher.name
+}
+
+output "hub_publisher_github_environment" {
+  description = "Exact dedicated, protected NHP GitHub Environment required for Hub publication."
+  value       = local.hub_publisher_github_environment
+}
+
+output "hub_publisher_github_subject" {
+  description = "Exact NHP GitHub OIDC subject admitted by the Hub publisher role."
+  value       = local.hub_publisher_github_subject
+}

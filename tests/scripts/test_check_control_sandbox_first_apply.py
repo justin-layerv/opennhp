@@ -24,6 +24,21 @@ SECRET_SEED_SCRIPT_PATH = ROOT / "scripts/ensure-control-otp-pepper.sh"
 REDIS_TF_PATH = (
     ROOT / "terraform/modules/connector-authority-foundation/redis.tf"
 )
+AUTHORITY_ECR_TF_PATH = (
+    ROOT / "terraform/modules/connector-authority-foundation/ecr.tf"
+)
+HUB_ARTIFACT_TF_PATH = (
+    ROOT / "terraform/modules/connector-authority-foundation/hub_artifact.tf"
+)
+PUBLISHER_TF_PATH = (
+    ROOT / "terraform/modules/connector-authority-foundation/publisher.tf"
+)
+CONTROL_README_PATH = ROOT / "terraform/control/README.md"
+HUB_ROLLOUT_LEDGER_PATH = (
+    ROOT
+    / "docs/runbooks/prod-rollout-ledger/"
+    "2026-07-23-issue-3227-hub-artifact-foundation.md"
+)
 CONTROL_LOCKFILE_PATH = (
     ROOT / "terraform/control/environments/sandbox/.terraform.lock.hcl"
 )
@@ -48,6 +63,10 @@ SPEC.loader.exec_module(CHECKER)
 
 
 def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
+    data_key_arn = (
+        f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+        "key/data123"
+    )
     result: dict[str, tuple[dict, dict]] = {
         "module.control.aws_vpc.control": (
             {
@@ -72,6 +91,7 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
                 "enable_key_rotation": True,
                 "is_enabled": True,
                 "key_usage": "ENCRYPT_DECRYPT",
+                "arn": data_key_arn,
                 "policy": json.dumps(CHECKER.AUTHORITY_DATA_KMS_POLICY),
                 "region": CHECKER.AWS_REGION,
             },
@@ -116,6 +136,83 @@ def planned_security_fixture() -> dict[str, tuple[dict, dict]]:
                 "name": "publish-connector-authority",
                 "policy": json.dumps(CHECKER.AUTHORITY_PUBLISHER_POLICY),
                 "role": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
+            },
+            {},
+        ),
+        "module.control.aws_ecr_repository.hub": (
+            {
+                "arn": CHECKER.HUB_ECR_REPOSITORY_ARN,
+                "encryption_configuration": [
+                    {"encryption_type": "KMS", "kms_key": data_key_arn}
+                ],
+                "force_delete": False,
+                "image_scanning_configuration": [{"scan_on_push": True}],
+                "image_tag_mutability": "IMMUTABLE",
+                "name": CHECKER.HUB_ECR_REPOSITORY_NAME,
+                "region": CHECKER.AWS_REGION,
+                "repository_url": (
+                    f"{CHECKER.ACCOUNT_ID}.dkr.ecr.{CHECKER.AWS_REGION}."
+                    "amazonaws.com/layerv/nhp-hub"
+                ),
+            },
+            {},
+        ),
+        "module.control.aws_ecr_lifecycle_policy.hub": (
+            {
+                "policy": json.dumps(CHECKER.HUB_ECR_LIFECYCLE_POLICY),
+                "region": CHECKER.AWS_REGION,
+                "repository": CHECKER.HUB_ECR_REPOSITORY_NAME,
+            },
+            {},
+        ),
+        "module.control.aws_ssm_parameter.hub_image_digest": (
+            {
+                "allowed_pattern": "",
+                "data_type": "text",
+                "description": (
+                    "Immutable sha256 digest for the separately published "
+                    "Connector Hub image"
+                ),
+                "has_value_wo": False,
+                "insecure_value": None,
+                "key_id": "",
+                "name": CHECKER.HUB_IMAGE_DIGEST_PARAMETER_NAME,
+                "overwrite": None,
+                "region": CHECKER.AWS_REGION,
+                "tier": "Standard",
+                "type": "String",
+                "value": "UNPUBLISHED",
+                "value_wo": None,
+                "value_wo_version": None,
+            },
+            {},
+        ),
+        "module.control.aws_iam_role.hub_publisher": (
+            {
+                "assume_role_policy": json.dumps(
+                    CHECKER.HUB_PUBLISHER_TRUST_POLICY
+                ),
+                "inline_policy": [
+                    {
+                        "name": "publish-connector-hub",
+                        "policy": json.dumps(CHECKER.HUB_PUBLISHER_POLICY),
+                    }
+                ],
+                "managed_policy_arns": [],
+                "max_session_duration": 3600,
+                "name": CHECKER.HUB_PUBLISHER_ROLE_NAME,
+                "path": "/",
+                "permissions_boundary": "",
+                "tags": {"Component": "connector-hub"},
+                "tags_all": {"Component": "connector-hub"},
+            },
+            {"managed_policy_arns": []},
+        ),
+        "module.control.aws_iam_role_policy.hub_publisher": (
+            {
+                "name": "publish-connector-hub",
+                "policy": json.dumps(CHECKER.HUB_PUBLISHER_POLICY),
+                "role": CHECKER.HUB_PUBLISHER_ROLE_NAME,
             },
             {},
         ),
@@ -441,8 +538,57 @@ def redis_split_transition_fixture(create_addresses: set[str] | None = None) -> 
     return result
 
 
+def hub_artifact_transition_fixture(
+    create_addresses: frozenset[str] | None = None,
+) -> dict:
+    result = plan_fixture()
+    result["applyable"] = True
+    if create_addresses is None:
+        create_addresses = CHECKER.HUB_ARTIFACT_BOOTSTRAP_RESOURCES
+    changes = {item["address"]: item["change"] for item in result["resource_changes"]}
+
+    role_address = "module.control.aws_iam_role.hub_publisher"
+    policy_address = "module.control.aws_iam_role_policy.hub_publisher"
+    digest_address = "module.control.aws_ssm_parameter.hub_image_digest"
+    if policy_address in create_addresses:
+        changes[role_address]["before"]["inline_policy"] = []
+        changes[role_address]["after"]["inline_policy"] = []
+    for address in create_addresses:
+        change = changes[address]
+        change["actions"] = ["create"]
+        change["before"] = None
+        if address == role_address:
+            change["after"]["permissions_boundary"] = None
+            change["after_unknown"]["managed_policy_arns"] = True
+        if address == policy_address and role_address in create_addresses:
+            change["after"]["role"] = None
+            change["after_unknown"]["role"] = True
+        if address == digest_address:
+            change["after"]["allowed_pattern"] = None
+            for field in (
+                "data_type",
+                "has_value_wo",
+                "insecure_value",
+                "key_id",
+                "tier",
+            ):
+                change["after"][field] = None
+                change["after_unknown"][field] = True
+    return result
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def terraform_resource_source(path: Path, resource_type: str, name: str) -> str:
+    """Return one exact top-level resource block from a small module source."""
+    marker = f'resource "{resource_type}" "{name}" {{'
+    source = path.read_text(encoding="utf-8")
+    _, found, remainder = source.partition(marker)
+    if not found or marker in remainder:
+        raise AssertionError(f"expected exactly one Terraform resource: {marker}")
+    return marker + remainder.split('\nresource "', 1)[0]
 
 
 def control_outputs_fixture() -> dict[str, dict]:
@@ -473,7 +619,7 @@ def terraform_1_14_refresh_only_golden(candidate: dict) -> dict:
     The Control values remain the complete synthetic security fixture so every
     field can be mutated hermetically. The JSON envelope follows the 1.14.3
     source and local output-bearing reproduction: no ``resource_changes``, all
-    20 root outputs, an empty ``planned_values.root_module``, and a separate
+    all reviewed root outputs, an empty ``planned_values.root_module``, and a separate
     format-1.0 state containing the unchanged inventory and output values.
     """
     resources = []
@@ -528,23 +674,27 @@ def state_resource(state: dict, address: str) -> dict:
 
 
 def state_publisher_role(state: dict) -> dict:
-    """Return the authority-publisher role resource from a prior-state tree."""
     return state_resource(
         state, "module.control.aws_iam_role.authority_publisher"
     )
 
 
-def publisher_refresh_candidate() -> tuple[dict, dict]:
+def publisher_refresh_candidate(*, hub: bool = False) -> tuple[dict, dict]:
     candidate = plan_fixture()
     candidate["applyable"] = True
+    role_address = (
+        "module.control.aws_iam_role.hub_publisher"
+        if hub
+        else "module.control.aws_iam_role.authority_publisher"
+    )
     role_change = next(
         item["change"]
         for item in candidate["resource_changes"]
-        if item["address"] == "module.control.aws_iam_role.authority_publisher"
+        if item["address"] == role_address
     )
     candidate["resource_drift"] = [
         {
-            "address": "module.control.aws_iam_role.authority_publisher",
+            "address": role_address,
             "mode": "managed",
             "type": "aws_iam_role",
             "change": {
@@ -571,35 +721,30 @@ def publisher_refresh_candidate() -> tuple[dict, dict]:
         }
     ]
     prior_state = terraform_1_14_refresh_only_golden(candidate)
-    prior_role = state_publisher_role(prior_state)
+    prior_role = state_resource(prior_state, role_address)
     prior_role["values"] = copy.deepcopy(
         candidate["resource_drift"][0]["change"]["before"]
     )
     return candidate, prior_state
 
 
-def authority_digest_refresh_candidate() -> tuple[dict, dict]:
+def authority_digest_refresh_candidate(*, hub: bool = False) -> tuple[dict, dict]:
     candidate = plan_fixture()
     candidate["applyable"] = True
+    spec = CHECKER._HUB_DIGEST_SPEC if hub else CHECKER._AUTHORITY_DIGEST_SPEC
     parameter_change = next(
         item["change"]
         for item in candidate["resource_changes"]
-        if item["address"] == CHECKER._AUTHORITY_DIGEST_ADDRESS
+        if item["address"] == spec["address"]
     )
-    parameter_name = "/sandbox/nhp/control/connector-authority/image-digest"
+    parameter_name = spec["parameter_name"]
     old_digest = f"sha256:{'1' * 64}"
     new_digest = f"sha256:{'2' * 64}"
     parameter_change["before"] = {
         "allowed_pattern": "",
-        "arn": (
-            "arn:aws:ssm:us-east-2:767397897469:"
-            "parameter/sandbox/nhp/control/connector-authority/image-digest"
-        ),
+        "arn": spec["parameter_arn"],
         "data_type": "text",
-        "description": (
-            "Immutable sha256 digest for the separately published Connector "
-            "Authority Lambda image"
-        ),
+        "description": spec["description"],
         "has_value_wo": False,
         "id": parameter_name,
         "insecure_value": None,
@@ -619,16 +764,16 @@ def authority_digest_refresh_candidate() -> tuple[dict, dict]:
     parameter_change["after"] = copy.deepcopy(parameter_change["before"])
     candidate["resource_drift"] = [
         {
-            "address": CHECKER._AUTHORITY_DIGEST_ADDRESS,
+            "address": spec["address"],
             "mode": "managed",
             "module_address": "module.control",
-            "name": "authority_image_digest",
+            "name": spec["name"],
             "provider_name": "registry.terraform.io/hashicorp/aws",
             "type": "aws_ssm_parameter",
             "change": {
                 "actions": ["update"],
                 "after_sensitive": copy.deepcopy(
-                    CHECKER._AUTHORITY_DIGEST_REFRESH_SENSITIVE
+                    CHECKER._DIGEST_REFRESH_SENSITIVE
                 ),
                 "after_unknown": {},
                 "before": {
@@ -637,14 +782,14 @@ def authority_digest_refresh_candidate() -> tuple[dict, dict]:
                     "version": 7,
                 },
                 "before_sensitive": copy.deepcopy(
-                    CHECKER._AUTHORITY_DIGEST_REFRESH_SENSITIVE
+                    CHECKER._DIGEST_REFRESH_SENSITIVE
                 ),
                 "after": copy.deepcopy(parameter_change["after"]),
             },
         }
     ]
     prior_state = terraform_1_14_refresh_only_golden(candidate)
-    prior_parameter = state_resource(prior_state, CHECKER._AUTHORITY_DIGEST_ADDRESS)
+    prior_parameter = state_resource(prior_state, spec["address"])
     prior_parameter["values"] = copy.deepcopy(
         candidate["resource_drift"][0]["change"]["before"]
     )
@@ -694,11 +839,11 @@ class PlanContractTests(unittest.TestCase):
         candidate = plan_fixture()
         for field in ("format_version", "complete", "errored", "applyable"):
             candidate[field] = real_noop[field]
-        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 45)
+        self.assertEqual(CHECKER.check_plan(candidate)["resource_count"], 50)
 
     def test_exact_noop_passes(self) -> None:
         summary = CHECKER.check_plan(plan_fixture())
-        self.assertEqual(summary["resource_count"], 45)
+        self.assertEqual(summary["resource_count"], 50)
         self.assertEqual(summary["plan_mode"], "no-op")
         unrefreshed = plan_fixture()
         unrefreshed_role = self.change(
@@ -706,7 +851,7 @@ class PlanContractTests(unittest.TestCase):
         )
         unrefreshed_role["before"]["inline_policy"] = []
         unrefreshed_role["after"]["inline_policy"] = []
-        self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 45)
+        self.assertEqual(CHECKER.check_plan(unrefreshed)["resource_count"], 50)
 
         normalized = plan_fixture()
         normalized_changes = {
@@ -743,7 +888,7 @@ class PlanContractTests(unittest.TestCase):
             "module.control.aws_security_group.otp_redis",
         ):
             normalized_changes[address]["after_unknown"] = {}
-        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 45)
+        self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 50)
 
     def test_exact_refresh_disabled_password_omission_passes(self) -> None:
         candidate = plan_fixture()
@@ -758,7 +903,7 @@ class PlanContractTests(unittest.TestCase):
                 del change[side]["authentication_mode"][0]["passwords"]
 
         summary = CHECKER.check_plan(candidate)
-        self.assertEqual(summary["resource_count"], 45)
+        self.assertEqual(summary["resource_count"], 50)
         self.assertEqual(summary["plan_mode"], "no-op")
 
     def test_exact_refresh_disabled_password_null_passes(self) -> None:
@@ -772,7 +917,7 @@ class PlanContractTests(unittest.TestCase):
                 change[side]["authentication_mode"][0]["passwords"] = None
 
         summary = CHECKER.check_plan(candidate)
-        self.assertEqual(summary["resource_count"], 45)
+        self.assertEqual(summary["resource_count"], 50)
         self.assertEqual(summary["plan_mode"], "no-op")
 
     def test_passwordless_authentication_mode_boundary_is_exact(self) -> None:
@@ -883,6 +1028,117 @@ class PlanContractTests(unittest.TestCase):
                 )
                 self.assertEqual(result["plan_mode"], "publisher-bootstrap")
 
+    def test_exact_hub_artifact_create_and_partial_retry_pass(self) -> None:
+        self.assertEqual(
+            CHECKER.HUB_ARTIFACT_BOOTSTRAP_RESOURCES,
+            frozenset(
+                {
+                    "module.control.aws_ecr_lifecycle_policy.hub",
+                    "module.control.aws_ecr_repository.hub",
+                    "module.control.aws_iam_role.hub_publisher",
+                    "module.control.aws_iam_role_policy.hub_publisher",
+                    "module.control.aws_ssm_parameter.hub_image_digest",
+                }
+            ),
+        )
+        for create_addresses in (
+            CHECKER.HUB_ARTIFACT_BOOTSTRAP_RESOURCES,
+            frozenset(
+                {
+                    "module.control.aws_ecr_lifecycle_policy.hub",
+                    "module.control.aws_iam_role_policy.hub_publisher",
+                    "module.control.aws_ssm_parameter.hub_image_digest",
+                }
+            ),
+        ):
+            with self.subTest(create_addresses=create_addresses):
+                result = CHECKER.check_plan(
+                    hub_artifact_transition_fixture(create_addresses)
+                )
+                self.assertEqual(
+                    result["bootstrap_create_count"], len(create_addresses)
+                )
+                self.assertEqual(result["plan_mode"], "hub-artifact-bootstrap")
+
+    def test_hub_artifact_transition_fails_closed(self) -> None:
+        role_without_policy = hub_artifact_transition_fixture(
+            frozenset({"module.control.aws_iam_role.hub_publisher"})
+        )
+        self.assert_rejected(role_without_policy)
+
+        repository_without_lifecycle = hub_artifact_transition_fixture(
+            frozenset({"module.control.aws_ecr_repository.hub"})
+        )
+        self.assert_rejected(repository_without_lifecycle)
+
+        wrong_pin = hub_artifact_transition_fixture()
+        self.change(
+            wrong_pin,
+            "module.control.aws_ssm_parameter.hub_image_digest",
+        )["after"]["value"] = f"sha256:{'a' * 64}"
+        self.assert_rejected(wrong_pin)
+
+        mutable_tags = hub_artifact_transition_fixture()
+        self.change(
+            mutable_tags,
+            "module.control.aws_ecr_repository.hub",
+        )["after"]["image_tag_mutability"] = "MUTABLE"
+        self.assert_rejected(mutable_tags)
+
+        unknown_repository = hub_artifact_transition_fixture()
+        lifecycle = self.change(
+            unknown_repository,
+            "module.control.aws_ecr_lifecycle_policy.hub",
+        )
+        lifecycle["after"]["repository"] = None
+        lifecycle["after_unknown"]["repository"] = True
+        self.assert_rejected(unknown_repository)
+
+        provider_defaults = {
+            "allowed_pattern": "",
+            "data_type": "text",
+            "has_value_wo": False,
+            "insecure_value": None,
+            "key_id": "",
+            "tier": "Standard",
+        }
+        for field, value in provider_defaults.items():
+            if value is not None:
+                with self.subTest(provider_default_known_on_create=field):
+                    concrete_default = hub_artifact_transition_fixture()
+                    digest = self.change(
+                        concrete_default,
+                        "module.control.aws_ssm_parameter.hub_image_digest",
+                    )
+                    digest["after"][field] = value
+                    self.assert_rejected(concrete_default)
+
+            with self.subTest(provider_default_not_unknown_on_create=field):
+                missing_unknown = hub_artifact_transition_fixture()
+                digest = self.change(
+                    missing_unknown,
+                    "module.control.aws_ssm_parameter.hub_image_digest",
+                )
+                if field == "allowed_pattern":
+                    digest["after_unknown"][field] = True
+                else:
+                    digest["after_unknown"].pop(field)
+                self.assert_rejected(missing_unknown)
+
+        for shared_environment in ("sandbox", "production"):
+            with self.subTest(shared_environment=shared_environment):
+                shared_trust = hub_artifact_transition_fixture()
+                role = self.change(
+                    shared_trust,
+                    "module.control.aws_iam_role.hub_publisher",
+                )["after"]
+                trust = json.loads(role["assume_role_policy"])
+                trust["Statement"][0]["Condition"]["StringEquals"][
+                    "token.actions.githubusercontent.com:sub"
+                ] = f"repo:layervai/nhp:environment:{shared_environment}"
+                role["assume_role_policy"] = json.dumps(trust)
+                self.assert_rejected(shared_trust)
+
     def test_exact_publisher_refresh_only_normalization_passes(self) -> None:
         candidate, prior_state = publisher_refresh_candidate()
         role_drift = candidate["resource_drift"][0]["change"]
@@ -949,6 +1205,42 @@ class PlanContractTests(unittest.TestCase):
                 f"exact Terraform {CHECKER.TF_VERSION} state JSON",
                 missing_state.stderr,
             )
+
+    def test_exact_hub_publisher_refresh_only_normalization_passes(self) -> None:
+        candidate, prior_state = publisher_refresh_candidate(hub=True)
+        summary = CHECKER.check_plan(candidate, prior_state)
+
+        self.assertEqual(summary["normalization_drift_count"], 1)
+        self.assertEqual(
+            summary["normalization_drift_kind"], "hub-publisher-role"
+        )
+        self.assertEqual(summary["plan_mode"], "no-op")
+
+    def test_exact_hub_digest_refresh_only_normalization_passes(self) -> None:
+        candidate, prior_state = authority_digest_refresh_candidate(hub=True)
+        summary = CHECKER.check_plan(candidate, prior_state)
+        observation = CHECKER.check_normalization_drift(candidate, prior_state)
+
+        self.assertEqual(summary["normalization_drift_count"], 1)
+        self.assertEqual(summary["normalization_drift_kind"], "hub-digest")
+        self.assertEqual(summary["plan_mode"], "no-op")
+        self.assertEqual(observation["normalization_drift_kind"], "hub-digest")
+
+        ordinary = plan_fixture()
+        ordinary["resource_drift"] = copy.deepcopy(candidate["resource_drift"])
+        refreshed = ordinary["resource_drift"][0]["change"]["after"]
+        ordinary_hub_digest = next(
+            item["change"]
+            for item in ordinary["resource_changes"]
+            if item["address"] == CHECKER._HUB_DIGEST_ADDRESS
+        )
+        ordinary_hub_digest["before"] = copy.deepcopy(refreshed)
+        ordinary_hub_digest["after"] = copy.deepcopy(refreshed)
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            "Hub digest state normalization requires a refresh-only plan",
+        ):
+            CHECKER.check_plan(ordinary)
 
     def test_exact_authority_digest_refresh_only_normalization_passes(self) -> None:
         candidate, prior_state = authority_digest_refresh_candidate()
@@ -1758,7 +2050,7 @@ class PlanContractTests(unittest.TestCase):
                 result = CHECKER.check_plan(
                     redis_split_transition_fixture(create_addresses)
                 )
-                self.assertEqual(result["resource_count"], 45)
+                self.assertEqual(result["resource_count"], 50)
                 self.assertEqual(result["plan_mode"], "redis-split-transition")
 
     def test_redis_iam_create_authentication_mode_matches_real_golden(self) -> None:
@@ -2241,6 +2533,18 @@ class PlanContractTests(unittest.TestCase):
                 {"constant_value": ["arn:aws:s3:::external/snapshot.rdb"]},
             ),
             (
+                "hub-digest-provider-default",
+                "module.control.aws_ssm_parameter.hub_image_digest",
+                ("tier",),
+                {"references": ["var.untrusted_tier"]},
+            ),
+            (
+                "hub-digest-write-only-value",
+                "module.control.aws_ssm_parameter.hub_image_digest",
+                ("value_wo",),
+                {"references": ["var.untrusted_digest"]},
+            ),
+            (
                 "authority-password",
                 "module.control.aws_elasticache_user.otp_authority",
                 ("authentication_mode", 0, "passwords"),
@@ -2286,6 +2590,10 @@ class PlanContractTests(unittest.TestCase):
                 "module.control.aws_ecr_repository.authority",
                 ("encryption_configuration", 0, "kms_key"),
             ),
+            (
+                "module.control.aws_ecr_repository.hub",
+                ("encryption_configuration", 0, "kms_key"),
+            ),
             *(
                 (
                     f"module.control.aws_dynamodb_table.{table}",
@@ -2312,16 +2620,18 @@ class PlanContractTests(unittest.TestCase):
             (("image_scanning_configuration", 0, "scan_on_push"), False),
             (("image_tag_mutability",), "MUTABLE"),
         )
-        for path, value in mutations:
-            with self.subTest(path=path):
-                candidate = plan_fixture()
-                resource = self.configuration_resource(
-                    candidate, "module.control.aws_ecr_repository.authority"
-                )
-                set_expression_path(
-                    resource["expressions"], path, {"constant_value": value}
-                )
-                self.assert_rejected(candidate)
+        for address in (
+            "module.control.aws_ecr_repository.authority",
+            "module.control.aws_ecr_repository.hub",
+        ):
+            for path, value in mutations:
+                with self.subTest(address=address, path=path):
+                    candidate = plan_fixture()
+                    resource = self.configuration_resource(candidate, address)
+                    set_expression_path(
+                        resource["expressions"], path, {"constant_value": value}
+                    )
+                    self.assert_rejected(candidate)
 
     def test_dark_network_bypass_fields_fail(self) -> None:
         public_ingress = plan_fixture()
@@ -2408,7 +2718,7 @@ class StateListTests(unittest.TestCase):
     def test_exact_managed_and_data_inventory_passes(self) -> None:
         self.assertEqual(
             self.check(self.expected_addresses()),
-            {"data_resource_count": 4, "managed_resource_count": 45},
+            {"data_resource_count": 4, "managed_resource_count": 50},
         )
 
     def test_missing_managed_or_data_address_fails(self) -> None:
@@ -2498,6 +2808,7 @@ def state_fixture() -> dict:
             "managed_policy_arns": [],
             "max_session_duration": 3600,
             "name": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
+            "path": "/",
             "permissions_boundary": "",
         }
     )
@@ -2506,6 +2817,61 @@ def state_fixture() -> dict:
             "name": "publish-connector-authority",
             "policy": json.dumps(CHECKER.AUTHORITY_PUBLISHER_POLICY),
             "role": CHECKER.AUTHORITY_PUBLISHER_ROLE_NAME,
+        }
+    )
+    by_address["module.control.aws_ecr_repository.hub"].update(
+        {
+            "arn": CHECKER.HUB_ECR_REPOSITORY_ARN,
+            "encryption_configuration": [
+                {"encryption_type": "KMS", "kms_key": data_key_arn}
+            ],
+            "force_delete": False,
+            "image_scanning_configuration": [{"scan_on_push": True}],
+            "image_tag_mutability": "IMMUTABLE",
+            "name": CHECKER.HUB_ECR_REPOSITORY_NAME,
+        }
+    )
+    by_address["module.control.aws_ecr_lifecycle_policy.hub"].update(
+        {
+            "policy": json.dumps(CHECKER.HUB_ECR_LIFECYCLE_POLICY),
+            "repository": CHECKER.HUB_ECR_REPOSITORY_NAME,
+        }
+    )
+    by_address["module.control.aws_ssm_parameter.hub_image_digest"].update(
+        {
+            "arn": CHECKER.HUB_IMAGE_DIGEST_PARAMETER_ARN,
+            "data_type": "text",
+            "description": (
+                "Immutable sha256 digest for the separately published "
+                "Connector Hub image"
+            ),
+            "name": CHECKER.HUB_IMAGE_DIGEST_PARAMETER_NAME,
+            "tier": "Standard",
+            "type": "String",
+            "value": "UNPUBLISHED",
+        }
+    )
+    by_address["module.control.aws_iam_role.hub_publisher"].update(
+        {
+            "assume_role_policy": json.dumps(CHECKER.HUB_PUBLISHER_TRUST_POLICY),
+            "inline_policy": [
+                {
+                    "name": "publish-connector-hub",
+                    "policy": json.dumps(CHECKER.HUB_PUBLISHER_POLICY),
+                }
+            ],
+            "managed_policy_arns": [],
+            "max_session_duration": 3600,
+            "name": CHECKER.HUB_PUBLISHER_ROLE_NAME,
+            "path": "/",
+            "permissions_boundary": "",
+        }
+    )
+    by_address["module.control.aws_iam_role_policy.hub_publisher"].update(
+        {
+            "name": "publish-connector-hub",
+            "policy": json.dumps(CHECKER.HUB_PUBLISHER_POLICY),
+            "role": CHECKER.HUB_PUBLISHER_ROLE_NAME,
         }
     )
     subnet_ids = []
@@ -2620,11 +2986,11 @@ class StateContractTests(unittest.TestCase):
         # Update only with an intentional, reviewed address/type inventory change.
         self.assertEqual(
             CHECKER.contract_sha256(),
-            "2dac42e4dbe79bd05fde1dfa90db5ac6e9d16f358047406dd19b97427b381fcf",
+            "193c698ff4ff5a1c8192c87581493021b015e1d84630d0b7af0defec261507ac",
         )
 
     def test_exact_state_passes(self) -> None:
-        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 45)
+        self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 50)
 
     def test_publisher_trust_and_permissions_drift_fail(self) -> None:
         mutations = (
@@ -2660,6 +3026,63 @@ class StateContractTests(unittest.TestCase):
                         ],
                     }
                 ),
+            ),
+            (
+                "module.control.aws_iam_role.hub_publisher",
+                "assume_role_policy",
+                json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": "sts:AssumeRoleWithWebIdentity",
+                                "Principal": {"Federated": "*"},
+                            }
+                        ],
+                    }
+                ),
+            ),
+            (
+                "module.control.aws_iam_role_policy.hub_publisher",
+                "policy",
+                json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {"Effect": "Allow", "Action": "ecr:*", "Resource": "*"}
+                        ],
+                    }
+                ),
+            ),
+            (
+                "module.control.aws_ecr_repository.hub",
+                "image_tag_mutability",
+                "MUTABLE",
+            ),
+            (
+                "module.control.aws_ecr_lifecycle_policy.hub",
+                "policy",
+                json.dumps(
+                    {
+                        "rules": [
+                            {
+                                "rulePriority": 1,
+                                "selection": {
+                                    "tagStatus": "any",
+                                    "countType": "imageCountMoreThan",
+                                    "countNumber": 1,
+                                },
+                                "action": {"type": "expire"},
+                            }
+                        ]
+                    }
+                ),
+            ),
+            (
+                "module.control.aws_ssm_parameter.hub_image_digest",
+                "value",
+                "latest",
             ),
         )
         for address, field, value in mutations:
@@ -2793,6 +3216,103 @@ class StateContractTests(unittest.TestCase):
         self.assertNotIn("+hincrby", redis)
         self.assertNotIn('"+hget"', redis)
         self.assertIn("major_engine_version     = \"7\"", redis)
+
+    def test_artifact_lifecycle_meta_contracts_are_pinned(self) -> None:
+        # Terraform plan/state JSON omits lifecycle meta-arguments, so keep the
+        # destroy fence and external digest ownership under a direct source
+        # contract. Strip comments before matching so prose cannot satisfy it.
+        for label, path, resource_type, name, expected in (
+            (
+                "Authority repository",
+                AUTHORITY_ECR_TF_PATH,
+                "aws_ecr_repository",
+                "authority",
+                r"lifecycle\s*\{\s*prevent_destroy\s*=\s*true\s*\}",
+            ),
+            (
+                "Authority digest",
+                AUTHORITY_ECR_TF_PATH,
+                "aws_ssm_parameter",
+                "authority_image_digest",
+                r"lifecycle\s*\{\s*ignore_changes\s*=\s*\[value\]\s*\}",
+            ),
+            (
+                "Hub repository",
+                HUB_ARTIFACT_TF_PATH,
+                "aws_ecr_repository",
+                "hub",
+                r"lifecycle\s*\{\s*prevent_destroy\s*=\s*true\s*\}",
+            ),
+            (
+                "Hub digest",
+                HUB_ARTIFACT_TF_PATH,
+                "aws_ssm_parameter",
+                "hub_image_digest",
+                r"lifecycle\s*\{\s*ignore_changes\s*=\s*\[value\]\s*\}",
+            ),
+        ):
+            with self.subTest(resource=label):
+                block = terraform_resource_source(path, resource_type, name)
+                uncommented = re.sub(r"(?m)#.*$", "", block)
+                self.assertRegex(uncommented, re.compile(expected, re.DOTALL))
+
+    def test_hub_publisher_source_requires_dedicated_environments(self) -> None:
+        # Environment protection is enforced by GitHub rather than Terraform,
+        # so pin the exact OIDC-subject construction here. Shared deployment
+        # environments must never regain permission through a prose-only check.
+        source = PUBLISHER_TF_PATH.read_text(encoding="utf-8")
+        uncommented = re.sub(r"(?m)#.*$", "", source)
+        self.assertRegex(
+            uncommented,
+            re.compile(
+                r'hub_publisher_github_environment\s*=\s*local\.is_prod\s*'
+                r'\?\s*"hub-publish-production"\s*:\s*"hub-publish-sandbox"'
+            ),
+        )
+        self.assertRegex(
+            uncommented,
+            re.compile(
+                r'hub_publisher_github_subject\s*=\s*'
+                r'"repo:layervai/nhp:environment:'
+                r'\$\{local\.hub_publisher_github_environment\}"'
+            ),
+        )
+        for shared_subject in (
+            "repo:layervai/nhp:environment:sandbox",
+            "repo:layervai/nhp:environment:production",
+        ):
+            with self.subTest(shared_subject=shared_subject):
+                self.assertNotIn(shared_subject, uncommented)
+
+        self.assertEqual(
+            CHECKER.HUB_PUBLISHER_GITHUB_ENVIRONMENT,
+            "hub-publish-sandbox",
+        )
+        self.assertEqual(
+            CHECKER.HUB_PUBLISHER_GITHUB_SUBJECT,
+            "repo:layervai/nhp:environment:hub-publish-sandbox",
+        )
+
+    def test_hub_carrier_transition_requires_live_protection_preflight(self) -> None:
+        for path in (CONTROL_README_PATH, HUB_ROLLOUT_LEDGER_PATH):
+            with self.subTest(path=path):
+                contract = path.read_text(encoding="utf-8")
+                self.assertIn("hub-publish-sandbox", contract)
+                self.assertIn("hub-publish-production", contract)
+                self.assertIn("178750268", contract)
+                normalized = " ".join(contract.split())
+                self.assertIn(
+                    "before every publication attempt", normalized.lower()
+                )
+                self.assertRegex(normalized, re.compile(r"(live-read|readback)"))
+                self.assertIn("required reviewer Justin", normalized)
+                self.assertRegex(
+                    normalized,
+                    re.compile(
+                        r"(sole custom `main`|"
+                        r"only deployment branch policy is custom `main`)"
+                    ),
+                )
 
 
 def live_fixture(root: Path) -> None:
