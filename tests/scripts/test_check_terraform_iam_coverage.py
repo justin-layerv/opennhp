@@ -96,6 +96,53 @@ class TerraformHelperInvokeScope(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 self.assertIsNotNone(IAM._terraform_helper_invoke_scope_error(policy))
 
+    def semantic_read_policy(self):
+        return {
+            "Statement": [
+                {
+                    "Sid": sid,
+                    "Effect": "Allow",
+                    "Action": [IAM.HELPER_INVOKE_ACTION],
+                    "Resource": [resource],
+                }
+                for sid, resource in IAM.SEMANTIC_READ_INVOKE_RESOURCES.items()
+            ]
+        }
+
+    def test_exact_semantic_read_scope_passes(self):
+        self.assertIsNone(
+            IAM._terraform_semantic_read_invoke_scope_error(self.semantic_read_policy())
+        )
+
+    def test_missing_broad_or_wrong_semantic_read_fails(self):
+        mutations = (
+            "missing",
+            "broad",
+            "unqualified",
+            "wrong-resource",
+            "extra-field",
+        )
+        for mutation in mutations:
+            policy = self.semantic_read_policy()
+            if mutation == "missing":
+                policy["Statement"].pop()
+            elif mutation == "broad":
+                policy["Statement"][0]["Action"] = "lambda:*"
+            elif mutation == "unqualified":
+                policy["Statement"][0]["Resource"][0] = policy["Statement"][0][
+                    "Resource"
+                ][0].removesuffix(":$LATEST")
+            elif mutation == "wrong-resource":
+                policy["Statement"][0]["Resource"][0] = policy["Statement"][0][
+                    "Resource"
+                ][0].replace("-relay-status:", "-key-validator:")
+            else:
+                policy["Statement"][0]["Condition"] = {}
+            with self.subTest(mutation=mutation):
+                self.assertIsNotNone(
+                    IAM._terraform_semantic_read_invoke_scope_error(policy)
+                )
+
     def test_real_tree_scope_covers_exact_invocation_inventory(self):
         root = REPO_ROOT / "terraform"
         keygen = "${aws_lambda_function.keygen.function_name}"
@@ -108,8 +155,9 @@ class TerraformHelperInvokeScope(unittest.TestCase):
             if rtype == "aws_lambda_invocation"
         }
         # Read-time data.aws_lambda_invocation calls are intentionally outside
-        # this deploy-time inventory: terraform_read grants their qualified
-        # :$LATEST targets separately. Converting one to a resource makes it
+        # this deploy-time inventory. The same real-tree scope check above
+        # separately requires terraform_read to grant the qualified
+        # relay-status:$LATEST target. Converting it to a resource makes it
         # enter this exact set and requires an explicit apply-role decision.
         self.assertEqual(
             actual,

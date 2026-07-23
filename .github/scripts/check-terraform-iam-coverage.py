@@ -50,7 +50,8 @@ What it does NOT check
   failure mode is "no grant anywhere in source" — which the union check
   catches.
 - Resource-ARN scope, except for the shared apply role's five Terraform helper
-  Lambda invocations. Other consumers still need manual scope review.
+  Lambda invocations and qualified relay semantic-read Lambda invocation. Other
+  consumers still need manual scope review.
 - `count`/`for_each` gating. Consumers are checked as a union regardless of
   gating, so a mapped resource that is `count = 0` in every environment
   still demands its grants exist. This errs toward requiring grants (safe
@@ -128,6 +129,12 @@ HELPER_INVOKE_RESOURCES = frozenset(
     + suffix
     for suffix in _HELPER_SUFFIXES
 )
+SEMANTIC_READ_INVOKE_RESOURCES = {
+    "RelayIdentityStatusInvoke": (
+        "arn:aws:lambda:${local.region}:${local.account_id}:"
+        "function:${var.name_prefix}-relay-status:$LATEST"
+    ),
+}
 
 
 def _terraform_helper_invoke_scope_error(policy: dict[str, Any] | None) -> str | None:
@@ -172,20 +179,73 @@ def _terraform_helper_invoke_scope_error(policy: dict[str, Any] | None) -> str |
     return None
 
 
+def _terraform_semantic_read_invoke_scope_error(
+    policy: dict[str, Any] | None,
+) -> str | None:
+    """Keep refresh-time semantic reads exact on the shared deploy role."""
+
+    if not policy or not isinstance(policy.get("Statement"), list):
+        return "terraform_read policy could not be decoded"
+
+    grants: dict[str, dict[str, Any]] = {}
+    for statement in policy["Statement"]:
+        if not isinstance(statement, dict):
+            continue
+        effect = unquote(statement.get("Effect", "Allow"))
+        if isinstance(effect, str) and effect.lower() != "allow":
+            continue
+        raw_actions = statement.get("Action", [])
+        actions = raw_actions if isinstance(raw_actions, list) else [raw_actions]
+        normalized_actions = [
+            unquote(action).lower() for action in actions if isinstance(action, str)
+        ]
+        if "NotAction" not in statement and not action_allowed(
+            HELPER_INVOKE_ACTION, normalized_actions
+        ):
+            continue
+        sid = unquote(statement.get("Sid", ""))
+        if not isinstance(sid, str) or sid in grants:
+            return "terraform_read must have unique Sids for semantic-read invokes"
+        grants[sid] = statement
+
+    if set(grants) != set(SEMANTIC_READ_INVOKE_RESOURCES):
+        return "terraform_read must grant exactly the qualified relay semantic-read invoke"
+
+    for sid, resource in SEMANTIC_READ_INVOKE_RESOURCES.items():
+        statement = grants[sid]
+        raw_actions = statement.get("Action")
+        actions = raw_actions if isinstance(raw_actions, list) else [raw_actions]
+        raw_resources = statement.get("Resource")
+        resources = (
+            raw_resources if isinstance(raw_resources, list) else [raw_resources]
+        )
+        if (
+            set(statement) != {"Sid", "Effect", "Action", "Resource"}
+            or [unquote(action) for action in actions if isinstance(action, str)]
+            != [HELPER_INVOKE_ACTION]
+            or [unquote(item) for item in resources if isinstance(item, str)]
+            != [resource]
+        ):
+            return f"terraform_read {sid} must grant only its exact qualified target ARN"
+    return None
+
+
 def terraform_helper_invoke_scope_error(
     parsed: list[tuple[Path, dict[str, Any]]],
 ) -> str | None:
-    matches = [
-        body
+    matches = {
+        name: body
         for file, rtype, name, body in iter_resources(parsed)
         if _in_canonical_module(file)
         and rtype == "aws_iam_policy"
-        and name == "terraform_apply_data"
-    ]
-    if len(matches) != 1:
-        return "expected exactly one canonical terraform_apply_data policy"
+        and name in {"terraform_apply_data", "terraform_read"}
+    }
+    if set(matches) != {"terraform_apply_data", "terraform_read"}:
+        return "expected exactly one canonical terraform_apply_data and terraform_read policy"
     return _terraform_helper_invoke_scope_error(
-        extract_policy_body(matches[0].get("policy"))
+        extract_policy_body(matches["terraform_apply_data"].get("policy"))
+    ) or _terraform_semantic_read_invoke_scope_error(
+        extract_policy_body(matches["terraform_read"].get("policy"))
     )
 
 

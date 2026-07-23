@@ -1362,6 +1362,17 @@ resource "aws_iam_policy" "terraform_read" {
         Resource = "*"
       },
       {
+        # This Lambda exposes read-only semantic validation that cannot be
+        # expressed with Lambda Get/List APIs. Keep the shared deploy role on
+        # the same exact qualified target as the isolated PR-plan role below.
+        # Terraform invokes this data source during refresh, before it can apply
+        # any pending IAM-policy change.
+        Sid      = "RelayIdentityStatusInvoke"
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-status:$LATEST"]
+      },
+      {
         Sid    = "AutoScalingRead"
         Effect = "Allow"
         Action = [

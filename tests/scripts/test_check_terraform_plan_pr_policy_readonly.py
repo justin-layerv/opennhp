@@ -829,6 +829,44 @@ class TerraformPlanPrBootstrapTests(unittest.TestCase):
 
 
 class ControlRoutingApplyPolicyTests(unittest.TestCase):
+    def test_shared_apply_read_policy_has_exact_relay_status_invoke(self) -> None:
+        terraform_root = REPO_ROOT / "terraform" / "modules" / "ecr"
+        stmt = find_policy_statement(
+            terraform_root,
+            "terraform_read",
+            "RelayIdentityStatusInvoke",
+        )
+        self.assertEqual(
+            normalized_strings(stmt.get("Action")),
+            ["lambda:InvokeFunction"],
+        )
+        self.assertEqual(
+            normalized_strings(stmt.get("Resource")),
+            [
+                "arn:aws:lambda:${local.region}:${local.account_id}:"
+                "function:${var.name_prefix}-relay-status:$LATEST"
+            ],
+        )
+        self.assertEqual(unquote(stmt.get("Effect")), "Allow")
+        self.assertEqual(
+            set(stmt),
+            {"Sid", "Effect", "Action", "Resource"},
+        )
+
+        attachment = find_resource_body(
+            terraform_root,
+            "aws_iam_role_policy_attachment",
+            "terraform_read",
+        )
+        self.assertEqual(
+            attachment.get("role"),
+            "${aws_iam_role.github_actions.name}",
+        )
+        self.assertEqual(
+            attachment.get("policy_arn"),
+            "${aws_iam_policy.terraform_read.arn}",
+        )
+
     def test_control_first_apply_elasticache_read_is_exact_and_unconditional(
         self,
     ) -> None:
