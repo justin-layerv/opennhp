@@ -62,9 +62,9 @@ type Config struct {
 // LoadConfig reads one bounded, strict TOML document. Key material is never
 // included in returned errors.
 func LoadConfig(path string) (Config, error) {
-	file, err := os.Open(path)
+	file, err := openConfig(path)
 	if err != nil {
-		return Config{}, fmt.Errorf("connector hub: read config: %w", err)
+		return Config{}, err
 	}
 	defer file.Close()
 
@@ -91,15 +91,43 @@ func LoadConfig(path string) (Config, error) {
 	return config, nil
 }
 
+// openConfig rejects paths that could expose or redirect the Hub's private and
+// cookie keys. The before/after identity check also closes the lstat/open race:
+// if the path is replaced between those calls, the opened inode is rejected.
+func openConfig(path string) (*os.File, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("connector hub: read config: %w", err)
+	}
+	if !before.Mode().IsRegular() || before.Mode().Perm()&0o077 != 0 {
+		return nil, ErrInvalidConfig
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("connector hub: read config: %w", err)
+	}
+	after, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("connector hub: read config: %w", err)
+	}
+	if !after.Mode().IsRegular() || after.Mode().Perm()&0o077 != 0 || !os.SameFile(before, after) {
+		_ = file.Close()
+		return nil, ErrInvalidConfig
+	}
+	return file, nil
+}
+
 // validate parses the two listen addresses and timing ladder and enforces every
 // field bound, returning the parsed UDP/health AddrPorts and worker timing. It is
 // intentionally idempotent and cheap, and each process entrypoint re-runs it:
 // LoadConfig validates freshly parsed TOML, Run guards its public API against a
 // hand-built Config that never went through LoadConfig, and runWithAWSConfig
 // re-validates at the directly testable seam while reusing the returned values.
-// None of the three calls is
-// therefore dead code. Every failure path returns the closed ErrInvalidConfig
-// sentinel so no parse diagnostic or field value can reach a startup log.
+// None of the three calls is therefore dead code. Every failure path returns
+// the closed ErrInvalidConfig sentinel so no parse diagnostic or field value
+// can reach a startup log.
 func (c Config) validate() (netip.AddrPort, netip.AddrPort, connectorhub.WorkerTiming, error) {
 	udpAddr, err := parseListenAddr(c.UDPListenAddr)
 	if err != nil {

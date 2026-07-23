@@ -48,19 +48,17 @@ RUN sed -i 's|//archive.ubuntu.com|//azure.archive.ubuntu.com|g; s|//security.ub
 
 COPY --from=builder /nhp-hub/release/nhp-hub /nhp-hub
 
-# Second source of truth: this port MUST match the port in hub.toml's
-# health_listen_addr, which is what the process actually binds. They are
-# deliberately decoupled only while the Hub runs dark; the later infrastructure
-# slice that owns the private health path must reconcile them (derive both from
-# one value) before this HEALTHCHECK is load-bearing. Otherwise a hub.toml port
-# change silently probes the wrong port and reports the container unhealthy while
-# the listener is up.
-ENV NHP_HUB_HEALTHCHECK_HOST=127.0.0.1 \
-    NHP_HUB_HEALTHCHECK_PORT=62207
-
-# TCP connect-only liveness. There is deliberately no HTTP handler or payload.
+# The copied etc/hub.toml is a fail-closed placeholder. Runtime infrastructure
+# must overlay /nhp-hub/etc with one task-scoped config volume, run this image's
+# `materialize-config` command once as a short-lived root init container, and
+# mount the completed file read-only into the long-lived nonroot worker. The
+# worker must not receive the init-only key environment variables.
+#
+# TCP connect-only liveness reads the exact same strict config as the worker and
+# derives its target from health_listen_addr. There is deliberately no second
+# image-level host/port value, HTTP handler, or health payload.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD timeout 2 bash -c 'exec 3<>/dev/tcp/${NHP_HUB_HEALTHCHECK_HOST}/${NHP_HUB_HEALTHCHECK_PORT}' || exit 1
+    CMD ["/nhp-hub/nhp-hubd", "healthcheck"]
 
 STOPSIGNAL SIGTERM
 USER 65532:65532

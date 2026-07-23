@@ -32,6 +32,7 @@ SERVER_AC_IMAGE_PATHS=(
   internalauth
   endpoints
   docker
+  tests/scripts/check-hub-image-contract.sh
   Makefile
   .trivyignore
 )

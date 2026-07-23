@@ -1,5 +1,7 @@
-# Example only. Deployment must replace every <required-...> value before the
-# process starts; strict validation fails closed on these placeholders.
+# Example only. The image intentionally ships this fail-closed placeholder.
+# Runtime infrastructure must overlay /nhp-hub/etc with a fresh task-scoped
+# volume and use the image's one-shot materialize-config command before the
+# nonroot worker starts. It must never edit a running worker's config.
 environment = "sandbox"
 
 # Customer/application assignment traffic is UDP only. The separate TCP

@@ -160,6 +160,10 @@ jobs:
               - 'internalauth/**'
               - 'endpoints/**'
               - 'docker/**'
+              # This script executes the built Hub image contract. A script-only
+              # correction must rebuild the image so the executable gate runs,
+              # not merely pass through the generic shellcheck/test lane.
+              - 'tests/scripts/check-hub-image-contract.sh'
               # Makefile is intentionally broad: it owns the app build entrypoints
               # for server, AC, relay, and image contents.
               - 'Makefile'
@@ -1232,6 +1236,10 @@ jobs:
           else
             echo "name=local/${{ matrix.repo }}:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Verify Hub image contract
+        if: needs.app-image-build-required.outputs.app_image_build_required == 'true' && matrix.image == 'hub'
+        run: tests/scripts/check-hub-image-contract.sh "${{ steps.image.outputs.name }}"
 
       # SBOM (#1333). Generated BEFORE the Trivy scan so it is produced on
       # every build — including a PR whose image has HIGH/CRITICAL findings,

@@ -91,6 +91,45 @@ func TestLoadConfigStrictRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsReadableByGroupOrWorld(t *testing.T) {
+	for _, mode := range []os.FileMode{0o640, 0o604, 0o644} {
+		t.Run(mode.String(), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "hub.toml")
+			if err := os.WriteFile(path, []byte(validConfigTOML(validConfig())), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadConfig(path); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("LoadConfig mode %04o error = %v, want ErrInvalidConfig", mode, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfigRejectsNonRegularAndSymlinkPaths(t *testing.T) {
+	t.Run("directory", func(t *testing.T) {
+		if _, err := LoadConfig(t.TempDir()); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("LoadConfig(directory) error = %v, want ErrInvalidConfig", err)
+		}
+	})
+	t.Run("symlink", func(t *testing.T) {
+		directory := t.TempDir()
+		target := filepath.Join(directory, "target.toml")
+		link := filepath.Join(directory, "hub.toml")
+		if err := os.WriteFile(target, []byte(validConfigTOML(validConfig())), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(link); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("LoadConfig(symlink) error = %v, want ErrInvalidConfig", err)
+		}
+	})
+}
+
 func TestLoadConfigRequiresEveryTimingField(t *testing.T) {
 	contents := validConfigTOML(validConfig())
 	for _, field := range []string{
