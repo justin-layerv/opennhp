@@ -49,10 +49,8 @@ What it does NOT check
   "Out of scope"). For the regression class this lint targets (#1323), the
   failure mode is "no grant anywhere in source" — which the union check
   catches.
-- Resource-ARN scope. The lint only checks action names, not whether the
-  Resource glob covers the consumer's target — a green check is necessary
-  but not sufficient for a clean apply (a scoped-down Resource can still
-  deny with the verb present).
+- Resource-ARN scope, except for the shared apply role's five Terraform helper
+  Lambda invocations. Other consumers still need manual scope review.
 - `count`/`for_each` gating. Consumers are checked as a union regardless of
   gating, so a mapped resource that is `count = 0` in every environment
   still demands its grants exist. This errs toward requiring grants (safe
@@ -116,6 +114,79 @@ from _tf_lint_lib import (  # noqa: E402  # pyright: ignore[reportMissingImports
 # `ActionSpec` is the map-value shape shared by DATA_SOURCE_ACTIONS and
 # RESOURCE_ACTIONS: a static action list, or a body-aware callable.
 ActionSpec = list[str] | Callable[[dict[str, Any]], list[str]]
+
+HELPER_INVOKE_ACTION = "lambda:InvokeFunction"
+_HELPER_SUFFIXES = (
+    "keygen",
+    "ac-keygen",
+    "etcd-tls-gen",
+    "registration-keygen",
+    "relay-keygen",
+)
+HELPER_INVOKE_RESOURCES = frozenset(
+    "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-"
+    + suffix
+    for suffix in _HELPER_SUFFIXES
+)
+
+
+def _terraform_helper_invoke_scope_error(policy: dict[str, Any] | None) -> str | None:
+    """Keep deploy-time helper invokes exact and Authority aliases unreachable."""
+
+    if not policy or not isinstance(policy.get("Statement"), list):
+        return "terraform_apply_data policy could not be decoded"
+
+    def strings(value: Any) -> list[str] | None:
+        values = value if isinstance(value, list) else [value]
+        if not all(isinstance(item, str) for item in values):
+            return None
+        return [unquote(item) for item in values]
+
+    grants = []
+    for statement in policy["Statement"]:
+        if not isinstance(statement, dict):
+            continue
+        effect = unquote(statement.get("Effect", "Allow"))
+        if isinstance(effect, str) and effect.lower() != "allow":
+            continue
+        actions = strings(statement.get("Action")) or []
+        if "NotAction" in statement or action_allowed(
+            HELPER_INVOKE_ACTION, [action.lower() for action in actions]
+        ):
+            grants.append(statement)
+
+    if len(grants) != 1:
+        return "terraform_apply_data must have exactly one InvokeFunction-capable Allow"
+    grant = grants[0]
+    actions = strings(grant.get("Action"))
+    resources = strings(grant.get("Resource"))
+    if (
+        set(grant) != {"Sid", "Effect", "Action", "Resource"}
+        or unquote(grant.get("Sid")) != "TerraformHelperInvoke"
+        or actions != [HELPER_INVOKE_ACTION]
+        or resources is None
+        or len(resources) != len(HELPER_INVOKE_RESOURCES)
+        or set(resources) != HELPER_INVOKE_RESOURCES
+    ):
+        return "TerraformHelperInvoke must grant only the five exact helper ARNs"
+    return None
+
+
+def terraform_helper_invoke_scope_error(
+    parsed: list[tuple[Path, dict[str, Any]]],
+) -> str | None:
+    matches = [
+        body
+        for file, rtype, name, body in iter_resources(parsed)
+        if _in_canonical_module(file)
+        and rtype == "aws_iam_policy"
+        and name == "terraform_apply_data"
+    ]
+    if len(matches) != 1:
+        return "expected exactly one canonical terraform_apply_data policy"
+    return _terraform_helper_invoke_scope_error(
+        extract_policy_body(matches[0].get("policy"))
+    )
 
 
 def _route53_zone_actions(body: dict[str, Any]) -> list[str]:
@@ -1204,6 +1275,9 @@ def main() -> int:
 
     parsed = parse_tf_files(root)
     role_actions = collect_role_actions(parsed)
+    helper_invoke_scope_error = None
+    if root.resolve() == Path(__file__).resolve().parents[2] / "terraform":
+        helper_invoke_scope_error = terraform_helper_invoke_scope_error(parsed)
     managed_policy_attachment_count = count_github_actions_managed_policy_attachments(
         parsed
     )
@@ -1261,6 +1335,7 @@ def main() -> int:
                 "unmapped": unmapped,
                 "resource_findings": resource_findings,
                 "resource_unmapped": resource_unmapped,
+                "helper_invoke_scope_error": helper_invoke_scope_error,
                 "role_actions": sorted(role_actions),
                 "managed_policy_attachment_count": managed_policy_attachment_count,
                 "managed_policy_attachment_limit": GITHUB_ACTIONS_MANAGED_POLICY_ATTACHMENT_LIMIT,
@@ -1275,6 +1350,11 @@ def main() -> int:
         # fine, the lint just doesn't know about that type. The .tf path +
         # block name is in the message body so the author knows the use site.
         lint_script = Path(".github/scripts/check-terraform-iam-coverage.py")
+        if helper_invoke_scope_error:
+            error(
+                helper_invoke_scope_error,
+                file=Path("terraform/modules/ecr/main.tf"),
+            )
         for u in unmapped:
             error(
                 f"data source `{u['type']}.{u['name']}` (used at "
@@ -1332,7 +1412,12 @@ def main() -> int:
             )
         total_gaps = len(findings) + len(resource_findings)
         total_unmapped = len(unmapped) + len(resource_unmapped)
-        if total_gaps or total_unmapped or attachment_quota_exceeded:
+        if (
+            total_gaps
+            or total_unmapped
+            or attachment_quota_exceeded
+            or helper_invoke_scope_error
+        ):
             print(
                 f"\nterraform IAM coverage check: FAILED "
                 f"({total_gaps} gap(s), {total_unmapped} unmapped, "
@@ -1347,6 +1432,8 @@ def main() -> int:
     if findings or resource_findings:
         return 1
     if attachment_quota_exceeded:
+        return 1
+    if helper_invoke_scope_error:
         return 1
     return 0
 

@@ -3025,7 +3025,6 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "lambda:RemovePermission",
           "lambda:TagResource",
           "lambda:UntagResource",
-          "lambda:InvokeFunction",
           "cloudtrail:CreateTrail",
           "cloudtrail:DeleteTrail",
           "cloudtrail:UpdateTrail",
@@ -3036,6 +3035,21 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "cloudtrail:PutEventSelectors"
         ]
         Resource = "*"
+      },
+      {
+        # Terraform invokes exactly these five unqualified helper functions to
+        # seed/read infrastructure state. Connector Authority aliases are
+        # runtime capabilities and must never enter the shared apply role.
+        Sid    = "TerraformHelperInvoke"
+        Effect = "Allow"
+        Action = ["lambda:InvokeFunction"]
+        Resource = [
+          "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-keygen",
+          "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-ac-keygen",
+          "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-etcd-tls-gen",
+          "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-registration-keygen",
+          "arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-relay-keygen",
+        ]
       },
       {
         Sid    = "LambdaLayer"

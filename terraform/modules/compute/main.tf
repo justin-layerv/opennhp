@@ -84,6 +84,11 @@ data "aws_ssm_parameter" "server_ami" {
 locals {
   is_prod = var.environment == "prod"
 
+  # Preserve cell0's established role/profile identity exactly. Future cells
+  # receive an explicit cell-qualified identity so the Connector Authority can
+  # grant each assigned-cell worker only its own qualified aliases.
+  server_role_name = var.cell_id == "cell0" ? "${var.name_prefix}-server" : "${var.name_prefix}-${var.cell_id}-server"
+
   # Fail fast: either var.server_ami_id is set, or SSM parameter must exist.
   server_ami_id = var.server_ami_id != null ? var.server_ami_id : data.aws_ssm_parameter.server_ami[0].value
 
@@ -561,7 +566,7 @@ resource "aws_service_discovery_service" "server" {
 
 # IAM Role for NHP Server instances
 resource "aws_iam_role" "server" {
-  name = "${var.name_prefix}-server"
+  name = local.server_role_name
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -742,7 +747,7 @@ resource "aws_iam_role_policy" "server" {
 }
 
 resource "aws_iam_instance_profile" "server" {
-  name = "${var.name_prefix}-server"
+  name = local.server_role_name
   role = aws_iam_role.server.name
 
   tags = var.tags

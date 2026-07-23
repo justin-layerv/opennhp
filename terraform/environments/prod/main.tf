@@ -694,6 +694,16 @@ output "nlb_dns_name" {
   value       = module.nhp.nlb_dns_name
 }
 
+output "connector_authority_cell_caller_role_name" {
+  description = "Exact NHP server role name for this production cell's future least-privilege Connector Authority calls."
+  value       = module.nhp.connector_authority_cell_caller_role_name
+}
+
+output "connector_authority_cell_caller_role_arn" {
+  description = "Exact NHP server role ARN for this production cell's future least-privilege Connector Authority calls."
+  value       = module.nhp.connector_authority_cell_caller_role_arn
+}
+
 output "server_repo_url" {
   description = "ECR repository URL for NHP Server images"
   value       = module.nhp.server_repo_url

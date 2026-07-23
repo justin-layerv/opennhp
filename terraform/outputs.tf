@@ -8,6 +8,16 @@ output "nlb_dns_name" {
   value       = module.compute.nlb_dns_name
 }
 
+output "connector_authority_cell_caller_role_name" {
+  description = "Exact NHP server role name for this cell's future least-privilege Connector Authority calls."
+  value       = module.compute.server_role_name
+}
+
+output "connector_authority_cell_caller_role_arn" {
+  description = "Exact NHP server role ARN for this cell's future least-privilege Connector Authority calls."
+  value       = module.compute.server_role_arn
+}
+
 output "server_repo_url" {
   description = "ECR repository URL for NHP server"
   value       = module.ecr.server_repo_url

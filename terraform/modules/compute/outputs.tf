@@ -76,6 +76,16 @@ output "server_secret_arn" {
   value       = aws_secretsmanager_secret.server.arn
 }
 
+output "server_role_name" {
+  description = "Exact per-cell NHP server IAM role name. Cell0 retains the legacy unqualified name; future cells are cell-qualified."
+  value       = aws_iam_role.server.name
+}
+
+output "server_role_arn" {
+  description = "Exact per-cell NHP server IAM role ARN used as the assigned-cell Connector Authority caller identity."
+  value       = aws_iam_role.server.arn
+}
+
 # The NHP-server identity public key.
 #
 # Two distinct keypairs operate in this fleet and confusing them

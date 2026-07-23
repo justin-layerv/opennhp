@@ -25,6 +25,7 @@ import unittest
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / ".github" / "scripts" / "check-terraform-iam-coverage.py"
@@ -46,6 +47,103 @@ def _load_module():
 
 
 IAM = _load_module()
+
+
+class TerraformHelperInvokeScope(unittest.TestCase):
+    def policy(self):
+        return {
+            "Statement": [
+                {
+                    "Sid": "OtherApplyActions",
+                    "Effect": "Allow",
+                    "Action": ["lambda:CreateFunction"],
+                    "Resource": "*",
+                },
+                {
+                    "Sid": "TerraformHelperInvoke",
+                    "Effect": "Allow",
+                    "Action": [IAM.HELPER_INVOKE_ACTION],
+                    "Resource": sorted(IAM.HELPER_INVOKE_RESOURCES),
+                },
+            ]
+        }
+
+    def test_exact_helper_scope_passes(self):
+        self.assertIsNone(IAM._terraform_helper_invoke_scope_error(self.policy()))
+
+    def test_broad_or_second_invoke_grant_fails(self):
+        for field, value in (
+            ("Action", "*"),
+            ("Action", "lambda:*"),
+            ("Action", "lambda:Invoke*"),
+            ("NotAction", "lambda:DeleteFunction"),
+        ):
+            policy = self.policy()
+            policy["Statement"][0][field] = value
+            with self.subTest(field=field):
+                self.assertIsNotNone(IAM._terraform_helper_invoke_scope_error(policy))
+
+    def test_missing_extra_or_duplicate_helper_fails(self):
+        for mutation in ("missing", "extra", "duplicate"):
+            policy = self.policy()
+            resources = policy["Statement"][1]["Resource"]
+            if mutation == "missing":
+                resources.pop()
+            elif mutation == "extra":
+                resources.append("arn:aws:lambda:us-east-2:123:function:authority")
+            else:
+                resources[0] = resources[1]
+            with self.subTest(mutation=mutation):
+                self.assertIsNotNone(IAM._terraform_helper_invoke_scope_error(policy))
+
+    def test_real_tree_scope_covers_exact_invocation_inventory(self):
+        root = REPO_ROOT / "terraform"
+        keygen = "${aws_lambda_function.keygen.function_name}"
+        etcd = "${aws_lambda_function.etcd_tls[0].function_name}"
+        parsed = IAM.parse_tf_files(root)
+        self.assertIsNone(IAM.terraform_helper_invoke_scope_error(parsed))
+        actual = {
+            (str(file.relative_to(root)), name, body.get("function_name"))
+            for file, rtype, name, body in IAM.iter_resources(parsed)
+            if rtype == "aws_lambda_invocation"
+        }
+        # Read-time data.aws_lambda_invocation calls are intentionally outside
+        # this deploy-time inventory: terraform_read grants their qualified
+        # :$LATEST targets separately. Converting one to a resource makes it
+        # enter this exact set and requires an explicit apply-role decision.
+        self.assertEqual(
+            actual,
+            {
+                ("modules/ac/main.tf", "keygen", keygen),
+                ("modules/compute/main.tf", "keygen", keygen),
+                ("modules/data/main.tf", "etcd_tls", etcd),
+                ("modules/nhp-keypair/main.tf", "keygen", keygen),
+                ("modules/relay-identity/main.tf", "keygen", keygen),
+                ("modules/relay-identity/main.tf", "publish_public_key", keygen),
+            },
+        )
+
+    def test_main_surfaces_helper_scope_failure(self):
+        original_argv = sys.argv
+        try:
+            sys.argv = [
+                "check-terraform-iam-coverage",
+                "--terraform-root",
+                str(REPO_ROOT / "terraform"),
+            ]
+            stderr = StringIO()
+            with (
+                patch.object(
+                    IAM,
+                    "terraform_helper_invoke_scope_error",
+                    return_value="helper scope broadened",
+                ),
+                redirect_stderr(stderr),
+            ):
+                self.assertEqual(IAM.main(), 1)
+            self.assertIn("helper scope broadened", stderr.getvalue())
+        finally:
+            sys.argv = original_argv
 
 
 class ShippedConstants(unittest.TestCase):
