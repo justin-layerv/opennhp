@@ -121,7 +121,11 @@ resource "aws_elasticache_user" "otp_authority" {
 # exact bootstrap/routing commands and the CLUSTER SLOTS subcommand, not broad
 # connection, CLIENT, or CLUSTER permissions. The runtime disables redirect
 # replay, so ASKING is intentionally absent and an ASK response fails the
-# current operation closed.
+# current operation closed. ElastiCache reads these directional Redis OSS 7
+# users back with an explicit `resetchannels`; configure that fail-closed reset
+# so refresh does not propose removing it forever. The exact live no-op plan
+# separately proves the legacy category-based and disabled users already match
+# without this token; do not generalize it absent new live drift evidence.
 resource "aws_elasticache_user" "otp_issuer" {
   user_id   = local.otp_redis_issuer_user_id
   user_name = local.otp_redis_issuer_user_id
@@ -133,6 +137,7 @@ resource "aws_elasticache_user" "otp_issuer" {
     "~connector:ratelimit:registration-otp:owner:*",
     "~connector:ratelimit:registration-otp:peer:*",
     "~connector:ratelimit:registration-otp:source:*",
+    "resetchannels",
     "-@all",
     "+hello",
     "+auth",
@@ -179,6 +184,7 @@ resource "aws_elasticache_user" "otp_issuer" {
 # attempt/consumption state key. The source uses WATCH/MULTI/EXEC rather than
 # Lua so Redis never needs write permission on the immutable challenge key.
 # Its cluster client needs the same exact bootstrap/routing permissions.
+# Keep the same explicit fail-closed channel reset as the issuer.
 resource "aws_elasticache_user" "otp_activator" {
   user_id   = local.otp_redis_activator_user_id
   user_name = local.otp_redis_activator_user_id
@@ -186,6 +192,7 @@ resource "aws_elasticache_user" "otp_activator" {
     "on",
     "%R~connector:registration-otp:v2:{*}:challenge",
     "~connector:registration-otp:v2:{*}:state",
+    "resetchannels",
     "-@all",
     "+hello",
     "+auth",

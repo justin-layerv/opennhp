@@ -100,14 +100,14 @@ OTP_REDIS_ISSUER_ACCESS = (
     "~connector:ratelimit:registration-otp:owner:* "
     "~connector:ratelimit:registration-otp:peer:* "
     "~connector:ratelimit:registration-otp:source:* "
-    "-@all +hello +auth +ping +command +cluster|slots "
+    "resetchannels -@all +hello +auth +ping +command +cluster|slots "
     "+multi +exec +discard +del +hset +expire "
     "+eval +evalsha +zremrangebyscore +zcard +zrange +zadd"
 )
 OTP_REDIS_ACTIVATOR_ACCESS = (
     "on %R~connector:registration-otp:v2:{*}:challenge "
     "~connector:registration-otp:v2:{*}:state "
-    "-@all +hello +auth +ping +command +cluster|slots "
+    "resetchannels -@all +hello +auth +ping +command +cluster|slots "
     "+watch +unwatch +multi +exec +discard "
     "+hmget +hlen +pttl +hset +pexpire"
 )
@@ -258,6 +258,43 @@ REDIS_SPLIT_USER_RESOURCES = frozenset(
 _REDIS_IAM_CREATE_AUTHENTICATION_MODE = [{"passwords": None, "type": "iam"}]
 _REDIS_IAM_CREATE_AUTHENTICATION_MODE_UNKNOWN = [{"password_count": True}]
 _REDIS_IAM_CREATE_AUTHENTICATION_MODE_SENSITIVE = [{"passwords": True}]
+
+
+def _is_exact_passwordless_authentication_mode(
+    auth: Any,
+    auth_type: str,
+) -> bool:
+    """Accept only the provider's three proven passwordless state projections.
+
+    A refresh-enabled plan materializes the optional sensitive ``passwords``
+    set as an empty list. A refresh-disabled plan can read an older state
+    projection that omits the empty field or a newly applied projection that
+    represents the same known absence as null. All three retain the
+    provider-computed ``password_count = 0`` proof and an exact auth type;
+    after_unknown is rejected separately by the caller. Non-empty,
+    wrong-typed, unknown, or extra fields remain rejected.
+    """
+    if (
+        not isinstance(auth, list)
+        or len(auth) != 1
+        or not isinstance(auth[0], dict)
+    ):
+        return False
+    mode = auth[0]
+    if set(mode) not in (
+        {"password_count", "type"},
+        {"password_count", "passwords", "type"},
+    ):
+        return False
+    password_count = mode.get("password_count")
+    if type(password_count) is not int or password_count != 0:
+        return False
+    if mode.get("type") != auth_type:
+        return False
+    # An absent key reads back as None; of all JSON projections, accept only
+    # that omitted/null form and the provider's explicit empty-list form.
+    return mode.get("passwords") in (None, [])
+
 
 INTERFACE_ENDPOINT_SERVICES = (
     "email",
@@ -1216,10 +1253,10 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
                     "fail-closed provider shape"
                 )
             continue
-        expected_auth = [
-            {"password_count": 0, "passwords": [], "type": auth_type}
-        ]
-        if auth != expected_auth or "authentication_mode" in unknown:
+        if (
+            not _is_exact_passwordless_authentication_mode(auth, auth_type)
+            or "authentication_mode" in unknown
+        ):
             raise ContractError(f"{address} authentication mode is not fail closed")
 
     group, group_unknown = values("module.control.aws_elasticache_user_group.otp")

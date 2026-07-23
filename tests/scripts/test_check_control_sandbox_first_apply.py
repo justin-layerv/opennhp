@@ -707,6 +707,103 @@ class PlanContractTests(unittest.TestCase):
             normalized_changes[address]["after_unknown"] = {}
         self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 45)
 
+    def test_exact_refresh_disabled_password_omission_passes(self) -> None:
+        candidate = plan_fixture()
+        for address in (
+            "module.control.aws_elasticache_user.otp_activator",
+            "module.control.aws_elasticache_user.otp_authority",
+            "module.control.aws_elasticache_user.otp_disabled_default",
+            "module.control.aws_elasticache_user.otp_issuer",
+        ):
+            change = self.change(candidate, address)
+            for side in ("before", "after"):
+                del change[side]["authentication_mode"][0]["passwords"]
+
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["resource_count"], 45)
+        self.assertEqual(summary["plan_mode"], "no-op")
+
+    def test_exact_refresh_disabled_password_null_passes(self) -> None:
+        candidate = plan_fixture()
+        for address in (
+            "module.control.aws_elasticache_user.otp_activator",
+            "module.control.aws_elasticache_user.otp_issuer",
+        ):
+            change = self.change(candidate, address)
+            for side in ("before", "after"):
+                change[side]["authentication_mode"][0]["passwords"] = None
+
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["resource_count"], 45)
+        self.assertEqual(summary["plan_mode"], "no-op")
+
+    def test_passwordless_authentication_mode_boundary_is_exact(self) -> None:
+        for label, mode in (
+            ("passwords-omitted", {"password_count": 0, "type": "iam"}),
+            (
+                "passwords-null",
+                {"password_count": 0, "passwords": None, "type": "iam"},
+            ),
+            (
+                "passwords-empty",
+                {"password_count": 0, "passwords": [], "type": "iam"},
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertTrue(
+                    CHECKER._is_exact_passwordless_authentication_mode(
+                        [mode],
+                        "iam",
+                    )
+                )
+
+        for label, mode in (
+            ("extra-field", {"extra": None, "password_count": 0, "type": "iam"}),
+            ("missing-count", {"passwords": [], "type": "iam"}),
+            ("boolean-count", {"password_count": False, "type": "iam"}),
+            ("nonzero-count", {"password_count": 1, "type": "iam"}),
+            ("missing-type", {"password_count": 0}),
+            ("wrong-type", {"password_count": 0, "type": "password"}),
+            (
+                "passwords-object",
+                {"password_count": 0, "passwords": {}, "type": "iam"},
+            ),
+            (
+                "passwords-nonempty",
+                {
+                    "password_count": 0,
+                    "passwords": ["must-not-appear"],
+                    "type": "iam",
+                },
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertFalse(
+                    CHECKER._is_exact_passwordless_authentication_mode(
+                        [mode],
+                        "iam",
+                    )
+                )
+
+    def test_noop_redis_auth_rejects_unsafe_password_projections(self) -> None:
+        address = "module.control.aws_elasticache_user.otp_activator"
+        for label, passwords in (
+            ("non-empty", ["must-not-appear"]),
+            ("wrong-type", {}),
+        ):
+            with self.subTest(label=label):
+                candidate = plan_fixture()
+                change = self.change(candidate, address)
+                for side in ("before", "after"):
+                    change[side]["authentication_mode"][0]["passwords"] = passwords
+                self.assert_rejected(candidate)
+
+        boolean_count = plan_fixture()
+        change = self.change(boolean_count, address)
+        for side in ("before", "after"):
+            change[side]["authentication_mode"][0]["password_count"] = False
+        self.assert_rejected(boolean_count)
+
     def test_exact_publisher_first_create_and_partial_retry_pass(self) -> None:
         for create_addresses in (
             CHECKER.PUBLISHER_BOOTSTRAP_RESOURCES,
@@ -2475,6 +2572,9 @@ class StateContractTests(unittest.TestCase):
         self.assertIn("self.authentication_mode[0].password_count == 0", redis)
         self.assertIn("%W~connector:registration-otp:v2:{*}:challenge", redis)
         self.assertIn("%R~connector:registration-otp:v2:{*}:challenge", redis)
+        self.assertEqual(redis.count('"resetchannels"'), 2)
+        self.assertNotIn('"allchannels"', redis)
+        self.assertNotIn('"&*"', redis)
         self.assertEqual(redis.count('"+cluster|slots"'), 2)
         for command in ("hello", "auth", "ping", "command"):
             self.assertEqual(redis.count(f'"+{command}"'), 2)
