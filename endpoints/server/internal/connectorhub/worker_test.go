@@ -23,13 +23,14 @@ import (
 const workerTestTimeout = 3 * time.Second
 
 type recordingWorkerObserver struct {
-	mu               sync.Mutex
-	outcomes         map[WorkerOutcome]int
-	classifications  map[Classification]int
-	rejections       map[RequestRejection]int
-	challengeSizes   [][2]int
-	authorityTimings []durationObservation
-	responseTimings  []durationObservation
+	mu                    sync.Mutex
+	outcomes              map[WorkerOutcome]int
+	classifications       map[Classification]int
+	rejections            map[RequestRejection]int
+	challengeSizes        [][2]int
+	authorityTimings      []durationObservation
+	responseTimings       []durationObservation
+	postAuthorityObserved chan struct{}
 }
 
 type durationObservation struct {
@@ -75,9 +76,10 @@ func (a *deadlineWorkerAuthority) callCounts() (int, int) {
 
 func newRecordingWorkerObserver() *recordingWorkerObserver {
 	return &recordingWorkerObserver{
-		outcomes:        make(map[WorkerOutcome]int),
-		classifications: make(map[Classification]int),
-		rejections:      make(map[RequestRejection]int),
+		outcomes:              make(map[WorkerOutcome]int),
+		classifications:       make(map[Classification]int),
+		rejections:            make(map[RequestRejection]int),
+		postAuthorityObserved: make(chan struct{}),
 	}
 }
 
@@ -111,7 +113,23 @@ func (o *recordingWorkerObserver) ObserveAuthorityDuration(mode Mode, duration t
 func (o *recordingWorkerObserver) ObservePostAuthorityDuration(mode Mode, duration time.Duration) {
 	o.mu.Lock()
 	o.responseTimings = append(o.responseTimings, durationObservation{mode: mode, duration: duration})
+	if len(o.responseTimings) == 1 {
+		close(o.postAuthorityObserved)
+	}
 	o.mu.Unlock()
+}
+
+// waitForPostAuthorityObservation synchronizes assertions with the writer's
+// final callback; UDP delivery can wake the client before that callback runs.
+func (o *recordingWorkerObserver) waitForPostAuthorityObservation(t *testing.T) {
+	t.Helper()
+	timer := time.NewTimer(workerTestTimeout)
+	defer timer.Stop()
+	select {
+	case <-o.postAuthorityObserved:
+	case <-timer.C:
+		t.Fatal("worker did not observe a post-Authority response write")
+	}
 }
 
 func (o *recordingWorkerObserver) outcome(outcome WorkerOutcome) int {
@@ -361,6 +379,7 @@ func TestWorkerChallengeProofRoundTripCallsAuthorityOnlyAfterProof(t *testing.T)
 	if !json.Valid(ppd.BodyMessage) || !bytes.Contains(ppd.BodyMessage, []byte(`"nhp_udp_endpoint"`)) {
 		t.Fatalf("unexpected LRT body: %s", ppd.BodyMessage)
 	}
+	f.observer.waitForPostAuthorityObservation(t)
 	issueCalls, refreshCalls = f.authority.callCounts()
 	if issueCalls != 0 || refreshCalls != 1 {
 		t.Fatalf("authority calls after proof = %d/%d, want 0/1", issueCalls, refreshCalls)
@@ -871,6 +890,7 @@ func TestWorkerStopsAuthorityAtConfiguredHandlerDeadline(t *testing.T) {
 	if !bytes.Equal(ppd.BodyMessage, wantBody) {
 		t.Fatalf("deadline LRT body = %s, want %s", ppd.BodyMessage, wantBody)
 	}
+	f.observer.waitForPostAuthorityObservation(t)
 	issueCalls, refreshCalls := authority.callCounts()
 	if issueCalls != 0 || refreshCalls != 1 {
 		t.Fatalf("authority calls = %d/%d, want 0/1", issueCalls, refreshCalls)
