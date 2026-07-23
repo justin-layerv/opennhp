@@ -573,6 +573,79 @@ def publisher_refresh_candidate() -> tuple[dict, dict]:
     return candidate, prior_state
 
 
+def authority_digest_refresh_candidate() -> tuple[dict, dict]:
+    candidate = plan_fixture()
+    candidate["applyable"] = True
+    parameter_change = next(
+        item["change"]
+        for item in candidate["resource_changes"]
+        if item["address"] == CHECKER._AUTHORITY_DIGEST_ADDRESS
+    )
+    parameter_name = "/sandbox/nhp/control/connector-authority/image-digest"
+    old_digest = f"sha256:{'1' * 64}"
+    new_digest = f"sha256:{'2' * 64}"
+    parameter_change["before"] = {
+        "allowed_pattern": "",
+        "arn": (
+            "arn:aws:ssm:us-east-2:767397897469:"
+            "parameter/sandbox/nhp/control/connector-authority/image-digest"
+        ),
+        "data_type": "text",
+        "description": (
+            "Immutable sha256 digest for the separately published Connector "
+            "Authority Lambda image"
+        ),
+        "has_value_wo": False,
+        "id": parameter_name,
+        "insecure_value": None,
+        "key_id": "",
+        "name": parameter_name,
+        "overwrite": None,
+        "region": CHECKER.AWS_REGION,
+        "tags": {},
+        "tags_all": {},
+        "tier": "Standard",
+        "type": "String",
+        "value": new_digest,
+        "value_wo": None,
+        "value_wo_version": None,
+        "version": 8,
+    }
+    parameter_change["after"] = copy.deepcopy(parameter_change["before"])
+    candidate["resource_drift"] = [
+        {
+            "address": CHECKER._AUTHORITY_DIGEST_ADDRESS,
+            "mode": "managed",
+            "module_address": "module.control",
+            "name": "authority_image_digest",
+            "provider_name": "registry.terraform.io/hashicorp/aws",
+            "type": "aws_ssm_parameter",
+            "change": {
+                "actions": ["update"],
+                "after_sensitive": copy.deepcopy(
+                    CHECKER._AUTHORITY_DIGEST_REFRESH_SENSITIVE
+                ),
+                "after_unknown": {},
+                "before": {
+                    **copy.deepcopy(parameter_change["after"]),
+                    "value": old_digest,
+                    "version": 7,
+                },
+                "before_sensitive": copy.deepcopy(
+                    CHECKER._AUTHORITY_DIGEST_REFRESH_SENSITIVE
+                ),
+                "after": copy.deepcopy(parameter_change["after"]),
+            },
+        }
+    ]
+    prior_state = terraform_1_14_refresh_only_golden(candidate)
+    prior_parameter = state_resource(prior_state, CHECKER._AUTHORITY_DIGEST_ADDRESS)
+    prior_parameter["values"] = copy.deepcopy(
+        candidate["resource_drift"][0]["change"]["before"]
+    )
+    return candidate, prior_state
+
+
 class PlanContractTests(unittest.TestCase):
     def test_real_terraform_1_14_3_noop_status_contract(self) -> None:
         real_noop = json.loads(
@@ -709,6 +782,7 @@ class PlanContractTests(unittest.TestCase):
 
         self.assertEqual(summary["bootstrap_create_count"], 0)
         self.assertEqual(summary["normalization_drift_count"], 1)
+        self.assertEqual(summary["normalization_drift_kind"], "publisher-role")
         self.assertEqual(summary["plan_mode"], "no-op")
         self.assertRegex(summary["normalization_drift_sha256"], r"^[0-9a-f]{64}$")
 
@@ -740,6 +814,132 @@ class PlanContractTests(unittest.TestCase):
                 f"exact Terraform {CHECKER.TF_VERSION} state JSON",
                 missing_state.stderr,
             )
+
+    def test_exact_authority_digest_refresh_only_normalization_passes(self) -> None:
+        candidate, prior_state = authority_digest_refresh_candidate()
+
+        summary = CHECKER.check_plan(candidate, prior_state)
+
+        self.assertEqual(summary["bootstrap_create_count"], 0)
+        self.assertEqual(summary["normalization_drift_count"], 1)
+        self.assertEqual(summary["normalization_drift_kind"], "authority-digest")
+        self.assertEqual(summary["plan_mode"], "no-op")
+        self.assertRegex(summary["normalization_drift_sha256"], r"^[0-9a-f]{64}$")
+
+        live_summary = CHECKER.check_normalization_drift(candidate, prior_state)
+        self.assertEqual(
+            live_summary,
+            {
+                "normalization_drift_count": 1,
+                "normalization_drift_kind": "authority-digest",
+                "normalization_drift_sha256": summary[
+                    "normalization_drift_sha256"
+                ],
+            },
+        )
+
+        first_publication, first_publication_state = (
+            authority_digest_refresh_candidate()
+        )
+        first_publication_before = first_publication["resource_drift"][0][
+            "change"
+        ]["before"]
+        first_publication_before["value"] = "UNPUBLISHED"
+        first_publication_before["version"] = 1
+        state_resource(
+            first_publication_state, CHECKER._AUTHORITY_DIGEST_ADDRESS
+        )["values"] = copy.deepcopy(first_publication_before)
+        CHECKER.check_normalization_drift(
+            first_publication, first_publication_state
+        )
+
+    def test_authority_digest_refresh_only_normalization_is_exact(self) -> None:
+        for mutation in (
+            lambda change: change["after"].__setitem__("description", "piggyback"),
+            lambda change: change["after"].__setitem__("value", "latest"),
+            lambda change: change["after"].__setitem__("version", 7),
+            lambda change: change["before"].__setitem__("version", 0),
+            lambda change: change.__setitem__("replace_paths", []),
+            lambda change: change.__setitem__("after_sensitive", {}),
+            lambda change: change.__setitem__("after_unknown", {"version": True}),
+        ):
+            candidate, prior_state = authority_digest_refresh_candidate()
+            mutation(candidate["resource_drift"][0]["change"])
+            self.assert_rejected(candidate, prior_state)
+
+        for mutation in (
+            lambda item: item.__setitem__("provider_name", "example.invalid/aws"),
+            lambda item: item.__setitem__("unexpected", "metadata"),
+        ):
+            candidate, prior_state = authority_digest_refresh_candidate()
+            mutation(candidate["resource_drift"][0])
+            self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = authority_digest_refresh_candidate()
+        drift_change = candidate["resource_drift"][0]["change"]
+        drift_change["before"]["unexpected"] = "stable"
+        drift_change["after"]["unexpected"] = "stable"
+        state_resource(
+            prior_state, CHECKER._AUTHORITY_DIGEST_ADDRESS
+        )["values"]["unexpected"] = "stable"
+        self.assert_rejected(candidate, prior_state)
+
+        candidate, prior_state = authority_digest_refresh_candidate()
+        parameter = state_resource(
+            prior_state, CHECKER._AUTHORITY_DIGEST_ADDRESS
+        )
+        parameter["values"]["version"] = 6
+        self.assert_rejected(candidate, prior_state)
+
+    def test_live_authority_digest_normalization_guards_are_exact(self) -> None:
+        cases = []
+
+        candidate, prior_state = authority_digest_refresh_candidate()
+        candidate["resource_changes"] = []
+        cases.append((candidate, prior_state))
+
+        candidate, prior_state = authority_digest_refresh_candidate()
+        candidate["planned_values"]["root_module"] = {"unexpected": True}
+        cases.append((candidate, prior_state))
+
+        candidate, prior_state = authority_digest_refresh_candidate()
+        prior_state["format_version"] = "1.1"
+        cases.append((candidate, prior_state))
+
+        candidate, prior_state = authority_digest_refresh_candidate()
+        state_resource(
+            prior_state, CHECKER._AUTHORITY_DIGEST_ADDRESS
+        )["values"]["version"] = 6
+        cases.append((candidate, prior_state))
+
+        candidate, prior_state = authority_digest_refresh_candidate()
+        prior_state["values"]["root_module"]["child_modules"][0][
+            "resources"
+        ] = [
+            item
+            for item in prior_state["values"]["root_module"]["child_modules"][
+                0
+            ]["resources"]
+            if item["address"] != CHECKER._AUTHORITY_DIGEST_ADDRESS
+        ]
+        cases.append((candidate, prior_state))
+
+        for candidate, prior_state in cases:
+            with self.subTest(candidate=candidate, prior_state=prior_state):
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER.check_normalization_drift(candidate, prior_state)
+
+    def test_authority_digest_only_ordinary_plan_requires_refresh_only(self) -> None:
+        normalization, prior_state = authority_digest_refresh_candidate()
+        candidate = plan_fixture()
+        candidate["resource_drift"] = copy.deepcopy(normalization["resource_drift"])
+        parameter = self.change(candidate, CHECKER._AUTHORITY_DIGEST_ADDRESS)
+        parameter["before"] = copy.deepcopy(
+            normalization["resource_drift"][0]["change"]["after"]
+        )
+        parameter["after"] = copy.deepcopy(parameter["before"])
+
+        self.assert_rejected(candidate, prior_state)
 
     def test_refresh_only_output_contract_is_exact_and_secret_safe(self) -> None:
         declared_outputs = set(
@@ -1533,6 +1733,31 @@ class PlanContractTests(unittest.TestCase):
         candidate["resource_drift"] = copy.deepcopy(normalization["resource_drift"])
 
         self.assert_rejected(candidate, prior_state)
+
+    def test_redis_may_carry_exact_authority_digest_normalization(self) -> None:
+        normalization, prior_state = authority_digest_refresh_candidate()
+        candidate = redis_split_transition_fixture()
+        candidate["resource_drift"] = copy.deepcopy(normalization["resource_drift"])
+        parameter = self.change(candidate, CHECKER._AUTHORITY_DIGEST_ADDRESS)
+        parameter["before"] = copy.deepcopy(
+            normalization["resource_drift"][0]["change"]["after"]
+        )
+        parameter["after"] = copy.deepcopy(parameter["before"])
+
+        summary = CHECKER.check_plan(candidate, prior_state)
+        self.assertEqual(summary["plan_mode"], "redis-split-transition")
+        self.assertEqual(summary["normalization_drift_kind"], "authority-digest")
+        live_summary = CHECKER.check_normalization_drift(
+            normalization, prior_state
+        )
+        self.assertEqual(
+            summary["normalization_drift_sha256"],
+            live_summary["normalization_drift_sha256"],
+        )
+
+        piggyback = copy.deepcopy(candidate)
+        piggyback["resource_drift"][0]["change"]["after"]["description"] = "changed"
+        self.assert_rejected(piggyback, prior_state)
 
     def assert_rejected(self, plan: dict, prior_state: object = None) -> None:
         with self.assertRaises(CHECKER.ContractError):

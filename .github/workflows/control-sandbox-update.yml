@@ -506,7 +506,13 @@ jobs:
           artifact="$RUNNER_TEMP/control-plan-artifact"
           normalization_count="$(jq -er '.normalization_drift_count' \
             "$artifact/plan-contract-summary.json")"
+          normalization_kind="$(jq -er '.normalization_drift_kind' \
+            "$artifact/plan-contract-summary.json")"
           if [[ "$normalization_count" == "0" ]]; then
+            [[ "$normalization_kind" == "none" ]] || {
+              echo '::error::Zero normalization count has a nonempty kind.'
+              exit 1
+            }
             exit 0
           fi
           [[ "$normalization_count" == "1" ]] || {
@@ -517,15 +523,43 @@ jobs:
             -out="$RUNNER_TEMP/live-refresh-plan" >/dev/null
           terraform show -json "$RUNNER_TEMP/live-refresh-plan" \
             >"$RUNNER_TEMP/live-refresh-plan.json"
-          ../../../../.github/scripts/check-control-sandbox-first-apply.py plan \
-            "$RUNNER_TEMP/live-refresh-plan.json" \
-            "$RUNNER_TEMP/control-state-before-apply/state.json" \
-            >"$RUNNER_TEMP/live-refresh-contract-summary.json"
-          cmp "$artifact/plan-contract-summary.json" \
-            "$RUNNER_TEMP/live-refresh-contract-summary.json" || {
-            echo '::error::Live refresh observation moved after the reviewed plan.'
-            exit 1
-          }
+          case "$normalization_kind" in
+            publisher-role)
+              ../../../../.github/scripts/check-control-sandbox-first-apply.py plan \
+                "$RUNNER_TEMP/live-refresh-plan.json" \
+                "$RUNNER_TEMP/control-state-before-apply/state.json" \
+                >"$RUNNER_TEMP/live-refresh-contract-summary.json"
+              cmp "$artifact/plan-contract-summary.json" \
+                "$RUNNER_TEMP/live-refresh-contract-summary.json" || {
+                echo '::error::Live refresh observation moved after the reviewed plan.'
+                exit 1
+              }
+              ;;
+            authority-digest)
+              ../../../../.github/scripts/check-control-sandbox-first-apply.py \
+                normalization-drift \
+                "$RUNNER_TEMP/live-refresh-plan.json" \
+                "$RUNNER_TEMP/control-state-before-apply/state.json" \
+                >"$RUNNER_TEMP/live-refresh-drift-summary.raw.json"
+              jq -cS . "$RUNNER_TEMP/live-refresh-drift-summary.raw.json" \
+                >"$RUNNER_TEMP/live-refresh-drift-summary.json"
+              jq -cS '{
+                normalization_drift_count,
+                normalization_drift_kind,
+                normalization_drift_sha256
+              }' "$artifact/plan-contract-summary.json" \
+                >"$RUNNER_TEMP/expected-refresh-drift-summary.json"
+              cmp "$RUNNER_TEMP/expected-refresh-drift-summary.json" \
+                "$RUNNER_TEMP/live-refresh-drift-summary.json" || {
+                echo '::error::Live digest refresh observation moved after the reviewed plan.'
+                exit 1
+              }
+              ;;
+            *)
+              echo '::error::Saved plan has an unknown normalization kind.'
+              exit 1
+              ;;
+          esac
 
       - name: Re-read live main and consume saved plan immediately before exact apply
         env:

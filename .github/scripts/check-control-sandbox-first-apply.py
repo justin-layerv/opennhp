@@ -27,9 +27,12 @@ AUTHORITY_PUBLISHER_ECR_ARN = (
     f"arn:aws:ecr:{AWS_REGION}:{ACCOUNT_ID}:repository/"
     "layerv/qurl-connector-authority"
 )
+AUTHORITY_PUBLISHER_DIGEST_PARAMETER_NAME = (
+    "/sandbox/nhp/control/connector-authority/image-digest"
+)
 AUTHORITY_PUBLISHER_DIGEST_PARAMETER_ARN = (
-    f"arn:aws:ssm:{AWS_REGION}:{ACCOUNT_ID}:parameter/"
-    "sandbox/nhp/control/connector-authority/image-digest"
+    f"arn:aws:ssm:{AWS_REGION}:{ACCOUNT_ID}:parameter"
+    f"{AUTHORITY_PUBLISHER_DIGEST_PARAMETER_NAME}"
 )
 AUTHORITY_PUBLISHER_TRUST_POLICY = {
     "Statement": [
@@ -142,7 +145,9 @@ EXPECTED_CONTROL_OUTPUTS = frozenset(
     }
 )
 _OUTPUT_ENTRY_KEYS = frozenset({"sensitive", "type", "value"})
-_OUTPUT_CHANGE_KEYS = frozenset(
+# Exact key set of a Terraform change envelope (shared by resource-drift and
+# output changes in the plan JSON).
+_CHANGE_KEYS = frozenset(
     {
         "actions",
         "after",
@@ -167,6 +172,16 @@ _PUBLISHER_REFRESH_AFTER_SENSITIVE = {
     "tags": {},
     "tags_all": {},
 }
+_AUTHORITY_DIGEST_REFRESH_SENSITIVE = {
+    "tags": {},
+    "tags_all": {},
+    "value": True,
+    "value_wo": True,
+}
+_AUTHORITY_DIGEST_ADDRESS = (
+    "module.control.aws_ssm_parameter.authority_image_digest"
+)
+_AUTHORITY_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _DRIFT_IDENTITY_LIMIT = 8
 _DRIFT_IDENTITY_FIELD_MAX_CHARS = 256
 # A separate rendered-JSON ceiling covers escape expansion: 256 source
@@ -684,7 +699,7 @@ def _drift_identity_diagnostic(drift: list[dict[str, Any]]) -> str:
 def _unexpected_drift_error(drift: list[dict[str, Any]]) -> ContractError:
     """Fail-closed rejection carrying the bounded, value-free drift identity."""
     return ContractError(
-        "unexpected Terraform resource drift; only the exact publisher-role "
+        "unexpected Terraform resource drift; only an exact reviewed state "
         "normalization is admitted; resource_drift_identity="
         f"{_drift_identity_diagnostic(drift)}"
     )
@@ -1292,28 +1307,43 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
         raise ContractError("authority publisher policy role drifted")
 
 
-def _check_publisher_state_normalization_drift(
+def _check_state_normalization_drift(
     drift: list[dict[str, Any]],
     by_address: dict[str, dict[str, Any]],
-) -> int:
-    """Admit only the provider's exact state-only inline-policy reflection.
+) -> str:
+    """Admit one exact, reviewed state-only normalization.
 
     Terraform marks that delta applyable for ``-refresh-only``. An ordinary
     refresh-enabled plan with no configuration changes is not applyable and is
     rejected by ``check_plan`` below, independent of the workflow operation.
     """
     if not drift:
-        return 0
-    role_address = "module.control.aws_iam_role.authority_publisher"
+        return "none"
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
     item = drift[0]
+    role_address = "module.control.aws_iam_role.authority_publisher"
+    if item.get("address") == role_address:
+        _check_publisher_role_normalization(item, by_address)
+        return "publisher-role"
+    if item.get("address") == _AUTHORITY_DIGEST_ADDRESS:
+        _check_authority_digest_normalization(item, by_address)
+        return "authority-digest"
+    raise _unexpected_drift_error(drift)
+
+
+def _check_publisher_role_normalization(
+    item: dict[str, Any],
+    by_address: dict[str, dict[str, Any]],
+) -> None:
+    """Admit the provider's exact state-only inline-policy reflection."""
+    role_address = "module.control.aws_iam_role.authority_publisher"
     if (
         item.get("address") != role_address
         or item.get("mode") != "managed"
         or item.get("type") != "aws_iam_role"
     ):
-        raise _unexpected_drift_error(drift)
+        raise _unexpected_drift_error([item])
     change = item.get("change")
     if not isinstance(change, dict) or change.get("actions") != ["update"]:
         raise ContractError("publisher role normalization must be an in-state update")
@@ -1349,7 +1379,144 @@ def _check_publisher_state_normalization_drift(
         publisher_policy,
         reflected_inline_policy=True,
     )
-    return 1
+
+
+def _check_authority_digest_normalization(
+    item: dict[str, Any],
+    by_address: dict[str, dict[str, Any]],
+) -> None:
+    """Admit only qurl-service's externally owned immutable digest update.
+
+    Terraform owns the parameter and intentionally ignores its value after
+    creation; the trusted qurl-service publisher owns subsequent value updates.
+    Bind that observed value/version pair into the saved Control plan. When it
+    accompanies the one reviewed Redis transition, the apply workflow re-proves
+    the exact live drift immediately before consuming the saved plan.
+    """
+    _, after = _validate_authority_digest_normalization(item)
+    planned = by_address[_AUTHORITY_DIGEST_ADDRESS].get("change", {})
+    if planned.get("actions") != ["no-op"] or planned.get("after") != after:
+        raise ContractError(
+            "authority digest normalization must match the refreshed planned state"
+        )
+
+
+def _validate_authority_digest_normalization(
+    item: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the provider-version-specific external digest drift shape."""
+    expected_identity = {
+        "address": _AUTHORITY_DIGEST_ADDRESS,
+        "mode": "managed",
+        "module_address": "module.control",
+        "name": "authority_image_digest",
+        "provider_name": "registry.terraform.io/hashicorp/aws",
+        "type": "aws_ssm_parameter",
+    }
+    if (
+        set(item) != {*expected_identity, "change"}
+        or any(
+            item.get(field) != value
+            for field, value in expected_identity.items()
+        )
+    ):
+        raise _unexpected_drift_error([item])
+    change = item.get("change")
+    if (
+        not isinstance(change, dict)
+        or set(change) != _CHANGE_KEYS
+        or change.get("actions") != ["update"]
+    ):
+        raise ContractError("authority digest normalization must be an in-state update")
+    before = change.get("before")
+    after = change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise ContractError("authority digest normalization values are malformed")
+    parameter_name = AUTHORITY_PUBLISHER_DIGEST_PARAMETER_NAME
+    parameter_contract = {
+        "allowed_pattern": "",
+        "arn": AUTHORITY_PUBLISHER_DIGEST_PARAMETER_ARN,
+        "data_type": "text",
+        "description": (
+            "Immutable sha256 digest for the separately published Connector "
+            "Authority Lambda image"
+        ),
+        "has_value_wo": False,
+        "id": parameter_name,
+        "insecure_value": None,
+        "key_id": "",
+        "name": parameter_name,
+        "overwrite": None,
+        "region": AWS_REGION,
+        "tier": "Standard",
+        "type": "String",
+        "value_wo": None,
+        "value_wo_version": None,
+    }
+    value_keys = {*parameter_contract, "tags", "tags_all", "value", "version"}
+    if set(before) != value_keys or set(after) != value_keys:
+        raise ContractError(
+            "authority digest normalization value shape is not exact"
+        )
+    _require_fields(before, parameter_contract, "authority digest drift before")
+    _require_fields(after, parameter_contract, "authority digest drift after")
+    # ``before`` and ``after`` share the exact ``value_keys`` set asserted above,
+    # so a plain per-key comparison over that set finds every changed field.
+    changed_fields = {field for field in value_keys if before[field] != after[field]}
+    if changed_fields != {"value", "version"}:
+        raise ContractError(
+            "authority digest normalization may change only value and version; "
+            f"changed_fields={sorted(changed_fields)}"
+        )
+    before_value = before.get("value")
+    after_value = after.get("value")
+    if (
+        not isinstance(before_value, str)
+        or (
+            before_value != "UNPUBLISHED"
+            and _AUTHORITY_DIGEST_PATTERN.fullmatch(before_value) is None
+        )
+        or not isinstance(after_value, str)
+        or _AUTHORITY_DIGEST_PATTERN.fullmatch(after_value) is None
+        or before_value == after_value
+    ):
+        raise ContractError("authority digest normalization values are not immutable digests")
+    before_version = before.get("version")
+    after_version = after.get("version")
+    if (
+        not isinstance(before_version, int)
+        or isinstance(before_version, bool)
+        or not isinstance(after_version, int)
+        or isinstance(after_version, bool)
+        or before_version < 1
+        or after_version <= before_version
+    ):
+        raise ContractError("authority digest normalization version did not advance")
+    if (
+        change.get("after_unknown") != {}
+        or change.get("before_sensitive") != _AUTHORITY_DIGEST_REFRESH_SENSITIVE
+        or change.get("after_sensitive") != _AUTHORITY_DIGEST_REFRESH_SENSITIVE
+    ):
+        raise ContractError(
+            "authority digest normalization has unexpected value metadata"
+        )
+    return before, after
+
+
+def _refresh_sensitive_contract(
+    address: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if address == "module.control.aws_iam_role.authority_publisher":
+        return (
+            _PUBLISHER_REFRESH_BEFORE_SENSITIVE,
+            _PUBLISHER_REFRESH_AFTER_SENSITIVE,
+        )
+    if address == _AUTHORITY_DIGEST_ADDRESS:
+        return (
+            _AUTHORITY_DIGEST_REFRESH_SENSITIVE,
+            _AUTHORITY_DIGEST_REFRESH_SENSITIVE,
+        )
+    raise ContractError(f"refresh drift is not approved for normalization: {address}")
 
 
 def _check_refresh_only_outputs(
@@ -1419,7 +1586,7 @@ def _check_refresh_only_outputs(
         output_value = planned_outputs[output_name]["value"]
         if (
             not isinstance(change, dict)
-            or set(change) != _OUTPUT_CHANGE_KEYS
+            or set(change) != _CHANGE_KEYS
             or change.get("actions") != ["no-op"]
             or change.get("after_unknown") is not False
             or change.get("before_sensitive") is not False
@@ -1503,22 +1670,23 @@ def _plan_resource_changes(
                 raise ContractError("Terraform resource drift change is malformed")
             if change.get("after_unknown") != {}:
                 raise ContractError(
-                    "refresh-only publisher drift contains unknown values"
+                    "refresh-only normalization drift contains unknown values"
                 )
+            before_sensitive, after_sensitive = _refresh_sensitive_contract(address)
             if (
                 "before_sensitive" not in change
                 or "after_sensitive" not in change
                 or not _json_equal(
                     change["before_sensitive"],
-                    _PUBLISHER_REFRESH_BEFORE_SENSITIVE,
+                    before_sensitive,
                 )
                 or not _json_equal(
                     change["after_sensitive"],
-                    _PUBLISHER_REFRESH_AFTER_SENSITIVE,
+                    after_sensitive,
                 )
             ):
                 raise ContractError(
-                    "refresh-only publisher drift has unexpected sensitive-value metadata"
+                    "refresh-only normalization drift has unexpected sensitive-value metadata"
                 )
             # Terraform 1.14.3 renders the same resource values in the captured
             # state and drift.before. Keep that equality exact: a provider or
@@ -1685,16 +1853,30 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
 
     _check_planned_security(by_address)
 
-    normalization_drift_count = _check_publisher_state_normalization_drift(
+    normalization_drift_kind = _check_state_normalization_drift(
         drift, by_address
     )
+    normalization_drift_count = int(normalization_drift_kind != "none")
 
-    if normalization_drift_count and plan_mode != "no-op":
+    if normalization_drift_kind == "publisher-role" and plan_mode != "no-op":
         raise ContractError(
-            "publisher state normalization cannot be combined with a resource transition"
+            "publisher role normalization cannot be combined with a resource transition"
         )
+    if normalization_drift_kind == "authority-digest":
+        if plan_mode not in ("no-op", "redis-split-transition"):
+            raise ContractError(
+                "authority digest normalization may accompany only the reviewed "
+                "Redis split transition"
+            )
+        if plan_mode == "no-op" and "resource_changes" in plan:
+            raise ContractError(
+                "authority digest-only state normalization requires a "
+                "refresh-only plan"
+            )
 
-    expected_applyable = plan_mode != "no-op" or normalization_drift_count == 1
+    expected_applyable = plan_mode != "no-op" or (
+        normalization_drift_count == 1 and "resource_changes" not in plan
+    )
     if plan.get("applyable") is not expected_applyable:
         raise ContractError(
             f"Terraform {plan_mode} plan applyability must match its exact resource "
@@ -1708,6 +1890,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         "contract_sha256": contract_sha256(),
         "normalization_drift_sha256": _json_sha256(drift),
         "normalization_drift_count": normalization_drift_count,
+        "normalization_drift_kind": normalization_drift_kind,
         "plan_mode": plan_mode,
         "resource_count": len(EXPECTED_RESOURCES),
     }
@@ -1745,6 +1928,76 @@ def _iter_resources(module: Any) -> Iterable[dict[str, Any]]:
         yield resource
     for child in module.get("child_modules", []):
         yield from _iter_resources(child)
+
+
+def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | int]:
+    """Bind a live refresh observation to the externally owned digest drift.
+
+    This narrow mode is used only immediately before applying a saved plan that
+    also contains the reviewed Redis transition. A refresh-only plan at that
+    point legitimately carries pending output changes, so the full plan
+    contract cannot describe it. This check ignores those unapplied outputs and
+    binds only the exact SSM value/version observation to the captured state.
+    """
+    if not isinstance(plan, dict):
+        raise ContractError("Terraform normalization plan must be an object")
+    if (
+        plan.get("format_version") != "1.2"
+        or plan.get("terraform_version") != TF_VERSION
+        or plan.get("complete") is not True
+        or plan.get("errored") is not False
+        or plan.get("applyable") is not True
+        or "resource_changes" in plan
+    ):
+        raise ContractError(
+            "Terraform normalization observation must be an exact applyable "
+            f"refresh-only {TF_VERSION} plan"
+        )
+    planned_values = plan.get("planned_values")
+    if (
+        not isinstance(planned_values, dict)
+        or planned_values.get("root_module") != {}
+    ):
+        raise ContractError(
+            "Terraform normalization observation must not plan resource values"
+        )
+    _check_no_embedded_actions(plan)
+    drift = _non_noop(plan.get("resource_drift"), "resource_drift")
+    if len(drift) != 1 or drift[0].get("address") != _AUTHORITY_DIGEST_ADDRESS:
+        raise _unexpected_drift_error(drift)
+    before, _ = _validate_authority_digest_normalization(drift[0])
+
+    if (
+        not isinstance(prior_state, dict)
+        or prior_state.get("format_version") != "1.0"
+        or prior_state.get("terraform_version") != TF_VERSION
+    ):
+        raise ContractError(
+            f"normalization observation requires exact Terraform {TF_VERSION} state JSON"
+        )
+    state_values = prior_state.get("values")
+    root = (
+        state_values.get("root_module") if isinstance(state_values, dict) else None
+    )
+    matches = [
+        item
+        for item in _iter_resources(root)
+        if item.get("mode") == "managed"
+        and item.get("address") == _AUTHORITY_DIGEST_ADDRESS
+    ]
+    if len(matches) != 1 or matches[0].get("type") != "aws_ssm_parameter":
+        raise ContractError(
+            "captured state does not contain the exact authority digest parameter"
+        )
+    if matches[0].get("values") != before:
+        raise ContractError(
+            "authority digest refresh before value does not match captured state"
+        )
+    return {
+        "normalization_drift_count": 1,
+        "normalization_drift_kind": "authority-digest",
+        "normalization_drift_sha256": _json_sha256(drift),
+    }
 
 
 def _require_iam_redis_user(
@@ -2078,6 +2331,10 @@ def parse_args() -> argparse.Namespace:
     plan.add_argument("plan_json", type=Path)
     plan.add_argument("prior_state_json", nargs="?", type=Path)
 
+    normalization_drift = sub.add_parser("normalization-drift")
+    normalization_drift.add_argument("plan_json", type=Path)
+    normalization_drift.add_argument("prior_state_json", type=Path)
+
     state_list = sub.add_parser("state-list")
     state_list.add_argument("path", type=Path)
 
@@ -2096,6 +2353,11 @@ def main() -> int:
                 load_json(args.prior_state_json) if args.prior_state_json else None
             )
             result = check_plan(load_json(args.plan_json), prior_state)
+        elif args.command == "normalization-drift":
+            result = check_normalization_drift(
+                load_json(args.plan_json),
+                load_json(args.prior_state_json),
+            )
         elif args.command == "state-list":
             result = check_state_list(args.path)
         elif args.command == "state":

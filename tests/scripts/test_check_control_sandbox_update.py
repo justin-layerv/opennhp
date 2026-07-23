@@ -634,6 +634,10 @@ class WorkflowContractTests(unittest.TestCase):
             "verify-control-sandbox-live-boundary.sh",
             "terraform apply -input=false -lock-timeout=5m -no-color",
             "plan_mode=(-refresh-only)",
+            "normalization-drift",
+            "normalization_drift_kind",
+            "jq -cS",
+            "live-refresh-drift-summary.raw.json",
             "Apply reruns are forbidden",
             "actions: write",
             "actions/artifacts/$artifact_id",
@@ -742,9 +746,41 @@ class WorkflowContractTests(unittest.TestCase):
             "live-refresh-plan.json",
             "control-state-before-apply/state.json",
             "live-refresh-contract-summary.json",
+            "live-refresh-drift-summary.raw.json",
             'normalization_count" == "1"',
         ):
             self.assertIn(marker, live_refresh_step)
+
+        authority_drift_case = live_refresh_step.split(
+            "            authority-digest)\n", 1
+        )[1].split("              ;;\n", 1)[0]
+        raw_summary = (
+            '>"$RUNNER_TEMP/live-refresh-drift-summary.raw.json"'
+        )
+        canonicalize_live = (
+            'jq -cS . "$RUNNER_TEMP/live-refresh-drift-summary.raw.json"'
+        )
+        canonicalize_expected = "jq -cS '{"
+        compare_summaries = (
+            'cmp "$RUNNER_TEMP/expected-refresh-drift-summary.json"'
+        )
+        self.assertEqual(authority_drift_case.count("jq -cS"), 2)
+        self.assertLess(
+            authority_drift_case.index("normalization-drift"),
+            authority_drift_case.index(raw_summary),
+        )
+        self.assertLess(
+            authority_drift_case.index(raw_summary),
+            authority_drift_case.index(canonicalize_live),
+        )
+        self.assertLess(
+            authority_drift_case.index(canonicalize_live),
+            authority_drift_case.index(canonicalize_expected),
+        )
+        self.assertLess(
+            authority_drift_case.index(canonicalize_expected),
+            authority_drift_case.index(compare_summaries),
+        )
 
         for session_name, capture_marker in (
             ("control-update-plan-${GITHUB_RUN_ID}", "control-state-before-plan"),
