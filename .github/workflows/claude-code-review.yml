@@ -26,7 +26,10 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.base.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Large cross-module reviews have published complete feedback just after
+    # the former 8-minute ceiling, leaving a cancelled required check and
+    # forcing a second paid pass. Keep one bounded terminal pass instead.
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: write

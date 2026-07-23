@@ -649,7 +649,7 @@ class ClaudeWorkflowRepositoryContractTest(unittest.TestCase):
             workflow["concurrency"],
             {"group": COMMAND_CONCURRENCY_GROUP, "cancel-in-progress": False},
         )
-        self.assertEqual(job["timeout-minutes"], 8)
+        self.assertEqual(job["timeout-minutes"], 20)
         self.assertEqual(
             job["permissions"],
             {
@@ -1650,7 +1650,7 @@ esac
             {"group": REVIEW_CONCURRENCY_GROUP, "cancel-in-progress": True},
         )
         self.assertEqual(job["if"], REVIEW_JOB_IF)
-        self.assertEqual(job["timeout-minutes"], 8)
+        self.assertEqual(job["timeout-minutes"], 20)
         self.assertEqual(
             job["permissions"],
             {"contents": "read", "pull-requests": "write", "issues": "read"},

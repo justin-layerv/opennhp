@@ -29,7 +29,9 @@ jobs:
         github.event.comment.author_association == 'COLLABORATOR'
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Match automatic review's bounded budget so a deliberate /simplify can
+    # finish once instead of timing out after applying part of its cleanup.
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
