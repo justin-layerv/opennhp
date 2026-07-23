@@ -991,6 +991,194 @@ class PlanContractTests(unittest.TestCase):
         malformed_resource_changes["resource_changes"] = None
         self.assert_rejected(malformed_resource_changes, malformed_state)
 
+    def test_unexpected_resource_drift_diagnostic_is_value_free(self) -> None:
+        sentinel = "drift-secret-sentinel-598d5135"
+        candidate = plan_fixture()
+        candidate["resource_drift"] = [
+            {
+                "address": "module.control.aws_iam_role.flow_logs",
+                "mode": "managed",
+                "type": "aws_iam_role",
+                "change": {
+                    "actions": ["update"],
+                    "before": {"secret": sentinel},
+                    "after": {"secret": sentinel},
+                },
+            }
+        ]
+
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(candidate)
+
+        message = str(error.exception)
+        self.assertIn(
+            'resource_drift_identity={"count":1,"identities":['
+            '{"address":"module.control.aws_iam_role.flow_logs",'
+            '"mode":"managed","type":"aws_iam_role"}],"truncated":false}',
+            message,
+        )
+        self.assertNotIn(sentinel, message)
+
+    def test_unexpected_resource_drift_diagnostic_is_bounded(self) -> None:
+        hidden_suffix = "hidden-drift-suffix-2a282d43"
+        long_field = "x" * (CHECKER._DRIFT_IDENTITY_FIELD_MAX_CHARS + 1) + hidden_suffix
+        candidate = plan_fixture()
+        candidate["resource_drift"] = [
+            {
+                "address": long_field,
+                "mode": long_field,
+                "type": long_field,
+                "change": {
+                    "actions": ["update"],
+                    "before": {"secret": hidden_suffix},
+                    "after": {"secret": hidden_suffix},
+                },
+            }
+            for _ in range(CHECKER._DRIFT_IDENTITY_LIMIT + 2)
+        ]
+
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(candidate)
+
+        message = str(error.exception)
+        self.assertIn(
+            f'resource_drift_identity={{"count":{CHECKER._DRIFT_IDENTITY_LIMIT + 2},',
+            message,
+        )
+        self.assertIn('"truncated":true', message)
+        self.assertEqual(message.count('"address"'), CHECKER._DRIFT_IDENTITY_LIMIT)
+        self.assertEqual(
+            message.count("<truncated>"), CHECKER._DRIFT_IDENTITY_LIMIT * 3
+        )
+        self.assertNotIn(hidden_suffix, message)
+        self.assertLess(len(message), 8_000)
+
+    def test_unexpected_resource_drift_diagnostic_redacts_instance_keys(
+        self,
+    ) -> None:
+        sentinel = "sensitive-instance-key-85bb4441"
+        candidate = plan_fixture()
+        candidate["resource_drift"] = [
+            {
+                "address": f'module.control.aws_iam_role.publisher["{sentinel}"]',
+                "mode": "managed",
+                "type": "aws_iam_role",
+                "change": {"actions": ["update"]},
+            }
+        ]
+
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(candidate)
+
+        diagnostic = str(error.exception).split("resource_drift_identity=", 1)[1]
+        decoded = json.loads(diagnostic)
+        self.assertEqual(decoded["identities"][0]["address"], "<indexed-address>")
+        self.assertTrue(decoded["truncated"])
+        self.assertNotIn(sentinel, diagnostic)
+
+    def test_unexpected_resource_drift_diagnostic_bounds_json_escape_expansion(
+        self,
+    ) -> None:
+        hidden_suffix = "hidden-unicode-suffix-c0268e7f"
+        long_field = (
+            "\N{GRINNING FACE}" * (CHECKER._DRIFT_IDENTITY_FIELD_MAX_CHARS + 1)
+            + hidden_suffix
+        )
+        candidate = plan_fixture()
+        candidate["resource_drift"] = [
+            {
+                "address": long_field,
+                "mode": long_field,
+                "type": long_field,
+                "change": {"actions": ["update"]},
+            }
+            for _ in range(CHECKER._DRIFT_IDENTITY_LIMIT + 2)
+        ]
+
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(candidate)
+
+        message = str(error.exception)
+        diagnostic = message.split("resource_drift_identity=", 1)[1]
+        self.assertLessEqual(len(diagnostic), CHECKER._DRIFT_DIAGNOSTIC_MAX_CHARS)
+        self.assertTrue(json.loads(diagnostic)["truncated"])
+        self.assertNotIn(hidden_suffix, diagnostic)
+
+    def test_unexpected_resource_drift_diagnostic_keeps_one_unicode_identity(
+        self,
+    ) -> None:
+        hidden_suffix = "hidden-unicode-suffix-7125ad55"
+        long_field = (
+            "\N{GRINNING FACE}" * (CHECKER._DRIFT_IDENTITY_FIELD_MAX_CHARS + 1)
+            + hidden_suffix
+        )
+        candidate = plan_fixture()
+        candidate["resource_drift"] = [
+            {
+                "address": long_field,
+                "mode": long_field,
+                "type": long_field,
+                "change": {"actions": ["update"]},
+            }
+        ]
+
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(candidate)
+
+        diagnostic = str(error.exception).split("resource_drift_identity=", 1)[1]
+        decoded = json.loads(diagnostic)
+        self.assertEqual(len(decoded["identities"]), 1)
+        self.assertTrue(decoded["truncated"])
+        self.assertTrue(
+            all(
+                value.endswith("<truncated>")
+                for value in decoded["identities"][0].values()
+            )
+        )
+        self.assertLessEqual(len(diagnostic), CHECKER._DRIFT_DIAGNOSTIC_MAX_CHARS)
+        self.assertNotIn(hidden_suffix, diagnostic)
+
+    def test_resource_drift_rejects_non_object_entries(self) -> None:
+        candidate = plan_fixture()
+        candidate["resource_drift"] = ["malformed-resource-drift"]
+
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "resource_drift entries must be objects"
+        ):
+            CHECKER.check_plan(candidate)
+
+        candidate["resource_drift"] = [{"change": "malformed-change"}]
+        with self.assertRaisesRegex(
+            CHECKER.ContractError, "resource_drift change entries must be objects"
+        ):
+            CHECKER.check_plan(candidate)
+
+    def test_unexpected_resource_drift_diagnostic_masks_malformed_identity(
+        self,
+    ) -> None:
+        sentinel = "malformed-drift-sentinel-b7f7555e"
+        candidate = plan_fixture()
+        candidate["resource_drift"] = [
+            {
+                "address": {"secret": sentinel},
+                "mode": [sentinel],
+                "type": None,
+                "change": {"actions": ["update"]},
+            }
+        ]
+
+        with self.assertRaises(CHECKER.ContractError) as error:
+            CHECKER.check_plan(candidate)
+
+        message = str(error.exception)
+        self.assertIn(
+            'resource_drift_identity={"count":1,"identities":['
+            '{"address":"<malformed>","mode":"<malformed>",'
+            '"type":"<malformed>"}],"truncated":true}',
+            message,
+        )
+        self.assertNotIn(sentinel, message)
+
     def test_publisher_updates_and_malformed_create_fail(self) -> None:
         update = plan_fixture()
         change = self.change(

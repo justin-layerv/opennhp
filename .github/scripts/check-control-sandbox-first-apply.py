@@ -167,6 +167,13 @@ _PUBLISHER_REFRESH_AFTER_SENSITIVE = {
     "tags": {},
     "tags_all": {},
 }
+_DRIFT_IDENTITY_LIMIT = 8
+_DRIFT_IDENTITY_FIELD_MAX_CHARS = 256
+# A separate rendered-JSON ceiling covers escape expansion: 256 source
+# characters can occupy far more than 256 bytes when ensure_ascii escapes them.
+_DRIFT_IDENTITY_FIELD_MAX_JSON_CHARS = 2_048
+_DRIFT_DIAGNOSTIC_MAX_CHARS = 7_500
+_DRIFT_IDENTITY_FIELDS = ("address", "mode", "type")
 
 EXPECTED_RESOURCES = {
     "module.control.aws_cloudwatch_log_group.flow_logs": "aws_cloudwatch_log_group",
@@ -593,6 +600,9 @@ def load_json(path: Path) -> Any:
 
 
 def _canonical_json(value: Any) -> bytes:
+    # Keep default ensure_ascii=True aligned with the per-field json.dumps
+    # budget in _bounded_drift_identity_field; changing either requires
+    # re-validating the 7,500-character diagnostic ceiling.
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 
@@ -603,6 +613,81 @@ def _json_sha256(value: Any) -> str:
 def _json_equal(left: Any, right: Any) -> bool:
     """Compare JSON values without Python's ``False == 0`` coercion."""
     return _canonical_json(left) == _canonical_json(right)
+
+
+def _bounded_drift_identity_field(field: str, value: Any) -> tuple[str, bool]:
+    """Render one public Terraform identity field without arbitrary values."""
+    if not isinstance(value, str):
+        return "<malformed>", True
+    if field == "address" and ("[" in value or "]" in value):
+        # Terraform addresses embed for_each instance keys in brackets. Even
+        # though the current Control root has only static addresses, never let
+        # a future key cross this value-free diagnostic boundary.
+        return "<indexed-address>", True
+
+    source = value[:_DRIFT_IDENTITY_FIELD_MAX_CHARS]
+    truncated = len(source) != len(value)
+    marker = "<truncated>"
+
+    candidate = source + (marker if truncated else "")
+    if len(json.dumps(candidate)) <= _DRIFT_IDENTITY_FIELD_MAX_JSON_CHARS:
+        return candidate, truncated
+
+    low, high = 0, len(source)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        if len(json.dumps(source[:midpoint] + marker)) <= (
+            _DRIFT_IDENTITY_FIELD_MAX_JSON_CHARS
+        ):
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return source[:low] + marker, True
+
+
+def _drift_identity_diagnostic(drift: list[dict[str, Any]]) -> str:
+    """Return bounded, value-free identities for rejected resource drift."""
+    identities = []
+    fields_truncated = False
+    for item in drift[:_DRIFT_IDENTITY_LIMIT]:
+        item = item if isinstance(item, dict) else {}
+        identity = {}
+        for field in _DRIFT_IDENTITY_FIELDS:
+            rendered, truncated = _bounded_drift_identity_field(
+                field, item.get(field)
+            )
+            identity[field] = rendered
+            fields_truncated = fields_truncated or truncated
+        identities.append(identity)
+    while True:
+        identities_omitted = len(drift) > len(identities)
+        rendered = _canonical_json(
+            {
+                "count": len(drift),
+                "identities": identities,
+                # True means some identity information was omitted, redacted,
+                # or shortened; consumers must not interpret it as row-only.
+                "truncated": identities_omitted or fields_truncated,
+            }
+        ).decode("utf-8")
+        if len(rendered) <= _DRIFT_DIAGNOSTIC_MAX_CHARS:
+            return rendered
+        # One identity always fits: each of its three fields is capped at 2,048
+        # rendered JSON characters, leaving ample room under the 7,500 ceiling
+        # for keys and envelope metadata. Therefore pop() cannot empty the list.
+        # ``_canonical_json`` can expand one Unicode code point into multiple
+        # ASCII escape characters. Drop whole identities until the emitted log
+        # line, rather than only its source fields, satisfies the hard bound.
+        identities.pop()
+
+
+def _unexpected_drift_error(drift: list[dict[str, Any]]) -> ContractError:
+    """Fail-closed rejection carrying the bounded, value-free drift identity."""
+    return ContractError(
+        "unexpected Terraform resource drift; only the exact publisher-role "
+        "normalization is admitted; resource_drift_identity="
+        f"{_drift_identity_diagnostic(drift)}"
+    )
 
 
 def _refresh_only_value_shape(value: Any) -> str:
@@ -648,9 +733,16 @@ def _non_noop(items: Any, label: str) -> list[dict[str, Any]]:
         return []
     if not isinstance(items, list):
         raise ContractError(f"{label} must be an array")
-    return [
-        item for item in items if item.get("change", {}).get("actions") != ["no-op"]
-    ]
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ContractError(f"{label} entries must be objects")
+        change = item.get("change")
+        if not isinstance(change, dict):
+            raise ContractError(f"{label} change entries must be objects")
+        if change.get("actions") != ["no-op"]:
+            result.append(item)
+    return result
 
 
 def _iter_configuration_modules(
@@ -1214,14 +1306,14 @@ def _check_publisher_state_normalization_drift(
         return 0
     role_address = "module.control.aws_iam_role.authority_publisher"
     if len(drift) != 1:
-        raise ContractError("refresh-only plan must normalize exactly one resource")
+        raise _unexpected_drift_error(drift)
     item = drift[0]
     if (
         item.get("address") != role_address
         or item.get("mode") != "managed"
         or item.get("type") != "aws_iam_role"
     ):
-        raise ContractError("refresh-only plan may normalize only the publisher role")
+        raise _unexpected_drift_error(drift)
     change = item.get("change")
     if not isinstance(change, dict) or change.get("actions") != ["update"]:
         raise ContractError("publisher role normalization must be an in-state update")
