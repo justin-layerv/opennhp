@@ -154,32 +154,44 @@ func decodeAuthorityObject(raw []byte, required, allowed []string) (map[string]j
 		token, err = decoder.Token()
 		key, ok := token.(string)
 		if err != nil || !ok {
-			return nil, ErrInvalidAuthorityResponse
+			return rejectAuthorityObject(object)
 		}
 		if _, ok := allowedSet[key]; !ok {
-			return nil, ErrInvalidAuthorityResponse
+			return rejectAuthorityObject(object)
 		}
 		if _, duplicate := object[key]; duplicate {
-			return nil, ErrInvalidAuthorityResponse
+			return rejectAuthorityObject(object)
 		}
 		var value json.RawMessage
 		if err := decoder.Decode(&value); err != nil {
-			return nil, ErrInvalidAuthorityResponse
+			clear(value)
+			return rejectAuthorityObject(object)
 		}
 		object[key] = value
 	}
 	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
-		return nil, ErrInvalidAuthorityResponse
+		return rejectAuthorityObject(object)
 	}
 	if _, err := decoder.Token(); err != io.EOF {
-		return nil, ErrInvalidAuthorityResponse
+		return rejectAuthorityObject(object)
 	}
 	for _, key := range required {
 		if _, ok := object[key]; !ok {
-			return nil, ErrInvalidAuthorityResponse
+			return rejectAuthorityObject(object)
 		}
 	}
 	return object, nil
+}
+
+func rejectAuthorityObject(object map[string]json.RawMessage) (map[string]json.RawMessage, error) {
+	clearRawObject(object)
+	return nil, ErrInvalidAuthorityResponse
+}
+
+func clearRawObject(object map[string]json.RawMessage) {
+	for _, value := range object {
+		clear(value)
+	}
 }
 
 func validPeer(value string) bool {

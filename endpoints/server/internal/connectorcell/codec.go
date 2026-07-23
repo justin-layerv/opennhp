@@ -1,5 +1,5 @@
-// Package connectorcell owns the strict assigned-cell qURL Connector recovery
-// codec and one-attempt application handler composed by the NHP UDP server.
+// Package connectorcell owns the strict assigned-cell qURL Connector lifecycle
+// codecs and one-attempt application handlers composed by the NHP UDP server.
 package connectorcell
 
 import (
