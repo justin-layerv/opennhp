@@ -176,6 +176,53 @@ func TestRunPreCanceledContextDoesNotClaimListeners(t *testing.T) {
 	_ = udpConn.Close()
 }
 
+func TestRunRejectsAuthorityTargetsBeforeAWSLoad(t *testing.T) {
+	config := validConfig()
+	config.RefreshAssignmentAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ra:green"
+	loads := 0
+	err := runWithAWSLoader(context.Background(), config, func(context.Context, string) (aws.Config, error) {
+		loads++
+		return aws.Config{}, nil
+	})
+	if !errors.Is(err, ErrInvalidConfig) || loads != 0 {
+		t.Fatalf("runWithAWSLoader error = %v, loads = %d; want ErrInvalidConfig before AWS load", err, loads)
+	}
+}
+
+func TestRunRejectsAWSConfigReturnedAfterStartupContextExpires(t *testing.T) {
+	config := validConfig()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := runWithAWSLoader(ctx, config, func(_ context.Context, region string) (aws.Config, error) {
+		cancel()
+		return aws.Config{Region: region}, nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runWithAWSLoader error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunBoundsAWSConfigLoad(t *testing.T) {
+	config := validConfig()
+	var remaining time.Duration
+
+	err := runWithAWSLoader(context.Background(), config, func(ctx context.Context, _ string) (aws.Config, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("AWS loader context has no deadline")
+		}
+		remaining = time.Until(deadline)
+		return aws.Config{}, context.DeadlineExceeded
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runWithAWSLoader error = %v, want context.DeadlineExceeded", err)
+	}
+	if remaining <= 0 || remaining > hubAWSLoadTimeout {
+		t.Fatalf("AWS loader deadline remaining = %v, want within (0, %v]", remaining, hubAWSLoadTimeout)
+	}
+}
+
 func TestRunInvalidKeyDoesNotClaimListeners(t *testing.T) {
 	config := validConfig()
 	config.UDPListenAddr = freeUDPAddr(t)
@@ -200,6 +247,52 @@ func TestRunInvalidKeyDoesNotClaimListeners(t *testing.T) {
 		t.Fatalf("UDP listener was claimed by invalid config: %v", err)
 	}
 	_ = udpConn.Close()
+}
+
+func TestRunInvalidAuthorityTargetsDoesNotClaimListeners(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "mixed colors",
+			mutate: func(config *Config) {
+				config.RefreshAssignmentAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ra:green"
+			},
+		},
+		{
+			name: "wrong operation",
+			mutate: func(config *Config) {
+				config.IssueCredentialRecoveryAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ra:blue"
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := validConfig()
+			config.UDPListenAddr = freeUDPAddr(t)
+			config.HealthListenAddr = freeTCPAddr(t)
+			test.mutate(&config)
+
+			err := runWithTestMetrics(t, context.Background(), config, aws.Config{Region: config.AWSRegion})
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("runWithAWSConfig error = %v, want ErrInvalidConfig", err)
+			}
+			healthListener, err := net.Listen("tcp", config.HealthListenAddr)
+			if err != nil {
+				t.Fatalf("health listener was claimed by invalid Authority targets: %v", err)
+			}
+			_ = healthListener.Close()
+			udpAddr, err := net.ResolveUDPAddr("udp", config.UDPListenAddr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			udpConn, err := net.ListenUDP("udp", udpAddr)
+			if err != nil {
+				t.Fatalf("UDP listener was claimed by invalid Authority targets: %v", err)
+			}
+			_ = udpConn.Close()
+		})
+	}
 }
 
 type temporaryAcceptError struct{}

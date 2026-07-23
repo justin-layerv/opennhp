@@ -7,21 +7,24 @@
 Adds the assignment-only `nhp-hubd` process composition and wires it to admit
 `ModeRecover` through the closed `admissibleMode` gate, calling the general
 recovery-capable `connectorauthority.HubClient.IssueCredentialRecovery` via a
-third `:active` alias. The Hub reads that alias from a new `hub.toml` field
+third exact operation-specific alias. The Hub reads that alias from a new `hub.toml` field
 `issue_credential_recovery_alias_arn` (Go `IssueCredentialRecoveryAliasARN`),
 validated alongside issue/refresh by `ValidateHubTargets`. Shipped with a
 placeholder alias that **fails closed** — recovery is inert until the real
-`:active` alias exists and the config value is provisioned.
+`layerv-nhp-<env>-ca-icr:{blue|green}` alias exists, all three Hub targets use
+the same IaC-selected color, and the config value is provisioned.
 
 - [ ] Rollout (prerequisite): confirm the `issue_credential_recovery` Lambda
-      `:active` alias exists in the target environment (produced by the
+      alias exists at the selected `blue` or `green` qualifier in the target
+      environment (produced by the
       Connector Authority runtime / qurl-service producers) **before** setting
-      the `hub.toml` value — the Hub validates all three `:active` aliases at
-      startup and fails closed on an empty/malformed recovery alias.
+      the `hub.toml` value — the Hub validates the exact `ca-ia`, `ca-ra`, and
+      `ca-icr` physical names and their one common color before AWS loading, and
+      fails closed on an empty, malformed, or mixed-color graph.
 - [ ] Rollout: set `issue_credential_recovery_alias_arn` in the prod
-      `nhp-hubd` config to the provisioned `:active` alias ARN (replacing the
-      shipped placeholder). Do NOT enable recovery admission before the alias
-      resolves.
+      `nhp-hubd` config to the provisioned selected-color alias ARN (replacing
+      the shipped placeholder). Do NOT enable recovery admission before that
+      exact alias resolves.
 - [ ] Post-rollout (fail-closed proof): with the placeholder/unprovisioned
       alias, confirm `nhp-hubd` refuses to start (startup validation), and with
       the real alias confirm a recovery LST is admitted (gate allows

@@ -7,32 +7,68 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 var (
-	accountIDPattern    = regexp.MustCompile(`^[0-9]{12}$`)
-	functionNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	accountIDPattern = regexp.MustCompile(`^[0-9]{12}$`)
+	cellIDPattern    = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+	regionPattern    = regexp.MustCompile(`^[a-z]{2}-[a-z]+-[0-9]$`)
 )
 
-const authorityAliasQualifier = "active"
+const (
+	maxCellIDLength = 32
+	maxRegionLength = 32
+)
 
-// Boundary pins every authority target to the expected AWS account and region.
-// Target ARNs remain trusted operator configuration: validation enforces the
-// boundary and exact active alias but does not infer deployment-specific
-// function names.
-type Boundary struct {
-	AccountID string
-	Region    string
+type authorityFunctionSpec struct {
+	operationSuffix string
+	cellScoped      bool
 }
 
-// HubTargets contains the three exact :active alias ARNs available to a hub worker.
+// authorityFunctionInventory is the complete seven-operation Authority graph.
+// Every consumer selects a least-privilege subset from this one closed map;
+// adding a public operation without an explicit physical name and scope is a
+// test failure rather than an ARN accepted by a generic parser.
+var authorityFunctionInventory = map[Operation]authorityFunctionSpec{
+	OperationIssueAssignment:            {operationSuffix: "ia"},
+	OperationRefreshAssignment:          {operationSuffix: "ra"},
+	OperationIssueCredentialRecovery:    {operationSuffix: "icr"},
+	OperationIssueRegistrationOTP:       {operationSuffix: "iro", cellScoped: true},
+	OperationActivateRegistration:       {operationSuffix: "ar", cellScoped: true},
+	OperationCompleteRegistration:       {operationSuffix: "cr", cellScoped: true},
+	OperationCompleteCredentialRecovery: {operationSuffix: "ccr", cellScoped: true},
+}
+
+// Boundary pins Hub-facing authority targets to one deployment environment,
+// AWS account, and region. The environment is part of each exact physical
+// function name, not an untrusted suffix inferred from an ARN.
+type Boundary struct {
+	Environment string
+	AccountID   string
+	Region      string
+}
+
+// CellBoundary adds the provisioned cell identity used by the four cell-scoped
+// physical function names. A separate type prevents Hub construction from
+// accidentally depending on a cell identifier.
+type CellBoundary struct {
+	Boundary
+	CellID string
+}
+
+// HubTargets contains the three exact blue-or-green alias ARNs available to a
+// Hub worker. All three must select the same color.
 type HubTargets struct {
 	IssueAssignmentAliasARN         string
 	RefreshAssignmentAliasARN       string
 	IssueCredentialRecoveryAliasARN string
 }
 
-// CellTargets contains the four exact :active alias ARNs available to one cell worker.
+// CellTargets contains the complete four-alias graph for one cell. It is used
+// as the atomic startup validation surface even though the runtime clients stay
+// split into a three-method registration capability and a one-method recovery
+// capability. All four targets must select the same color.
 type CellTargets struct {
 	IssueRegistrationOTPAliasARN       string
 	ActivateRegistrationAliasARN       string
@@ -68,65 +104,62 @@ func NewHubClient(cfg aws.Config, boundary Boundary, targets HubTargets) (*HubCl
 	return newHubClient(newLambdaClient(cfg), targets), nil
 }
 
-// ValidateHubTargets applies the same account, region, and exact :active alias
-// contract as NewHubClient without constructing an AWS client. Process owners
-// use it before loading ambient AWS configuration.
+// ValidateHubTargets applies the same exact physical-name, account, region, and
+// common blue-or-green alias contract as NewHubClient without constructing an
+// AWS client. Process owners use it before loading ambient AWS configuration.
 func ValidateHubTargets(boundary Boundary, targets HubTargets) error {
 	if err := validateBoundaryValues(boundary); err != nil {
 		return err
 	}
-	return validateTargets(boundary,
-		targetSpec{"issue_assignment", targets.IssueAssignmentAliasARN},
-		targetSpec{"refresh_assignment", targets.RefreshAssignmentAliasARN},
-		targetSpec{"issue_credential_recovery", targets.IssueCredentialRecoveryAliasARN},
+	return validateTargets(boundary, "",
+		targetSpec{"issue_assignment", targets.IssueAssignmentAliasARN, OperationIssueAssignment},
+		targetSpec{"refresh_assignment", targets.RefreshAssignmentAliasARN, OperationRefreshAssignment},
+		targetSpec{"issue_credential_recovery", targets.IssueCredentialRecoveryAliasARN, OperationIssueCredentialRecovery},
 	)
 }
 
-// NewCellClient constructs a cell-only client with a single-attempt Lambda SDK client.
-func NewCellClient(cfg aws.Config, boundary Boundary, targets CellTargets) (*CellClient, error) {
-	if err := validateBoundary(cfg, boundary); err != nil {
-		return nil, err
+// ValidateCellTargets validates one complete cell operation graph before an
+// ambient AWS client is loaded. Partial graphs, cross-cell names, wrong
+// operations, and mixed deployment colors all fail closed.
+func ValidateCellTargets(boundary CellBoundary, targets CellTargets) error {
+	if err := validateCellBoundaryValues(boundary); err != nil {
+		return err
 	}
-	if err := validateTargets(boundary,
-		targetSpec{"issue_registration_otp", targets.IssueRegistrationOTPAliasARN},
-		targetSpec{"activate_registration", targets.ActivateRegistrationAliasARN},
-		targetSpec{"complete_registration", targets.CompleteRegistrationAliasARN},
-		targetSpec{"complete_credential_recovery", targets.CompleteCredentialRecoveryAliasARN},
-	); err != nil {
-		return nil, err
-	}
-
-	return newCellClient(newLambdaClient(cfg), targets), nil
+	return validateTargets(boundary.Boundary, boundary.CellID,
+		targetSpec{"issue_registration_otp", targets.IssueRegistrationOTPAliasARN, OperationIssueRegistrationOTP},
+		targetSpec{"activate_registration", targets.ActivateRegistrationAliasARN, OperationActivateRegistration},
+		targetSpec{"complete_registration", targets.CompleteRegistrationAliasARN, OperationCompleteRegistration},
+		targetSpec{"complete_credential_recovery", targets.CompleteCredentialRecoveryAliasARN, OperationCompleteCredentialRecovery},
+	)
 }
 
 // NewRegistrationCellClient constructs a registration-only cell client with a
 // single-attempt Lambda SDK client.
 func NewRegistrationCellClient(
 	cfg aws.Config,
-	boundary Boundary,
+	boundary CellBoundary,
 	targets RegistrationCellTargets,
 ) (*RegistrationCellClient, error) {
 	if err := ValidateRegistrationCellTargets(boundary, targets); err != nil {
 		return nil, err
 	}
-	if err := validateSDKRegion(cfg, boundary); err != nil {
+	if err := validateSDKRegion(cfg, boundary.Boundary); err != nil {
 		return nil, err
 	}
 	return newRegistrationCellClient(newLambdaClient(cfg), targets), nil
 }
 
-// ValidateRegistrationCellTargets validates the transitional dark-only
-// registration subset before ambient AWS configuration is loaded or a listener
-// binds. Before reachability, the shared cell-target validator replaces its
-// :active contract with one common blue/green registration-and-recovery graph.
-func ValidateRegistrationCellTargets(boundary Boundary, targets RegistrationCellTargets) error {
-	if err := validateBoundaryValues(boundary); err != nil {
+// ValidateRegistrationCellTargets validates the registration-only capability
+// subset. Process startup must additionally validate the complete CellTargets
+// graph so recovery and registration cannot select different colors.
+func ValidateRegistrationCellTargets(boundary CellBoundary, targets RegistrationCellTargets) error {
+	if err := validateCellBoundaryValues(boundary); err != nil {
 		return err
 	}
-	return validateTargets(boundary,
-		targetSpec{"issue_registration_otp", targets.IssueRegistrationOTPAliasARN},
-		targetSpec{"activate_registration", targets.ActivateRegistrationAliasARN},
-		targetSpec{"complete_registration", targets.CompleteRegistrationAliasARN},
+	return validateTargets(boundary.Boundary, boundary.CellID,
+		targetSpec{"issue_registration_otp", targets.IssueRegistrationOTPAliasARN, OperationIssueRegistrationOTP},
+		targetSpec{"activate_registration", targets.ActivateRegistrationAliasARN, OperationActivateRegistration},
+		targetSpec{"complete_registration", targets.CompleteRegistrationAliasARN, OperationCompleteRegistration},
 	)
 }
 
@@ -134,29 +167,27 @@ func ValidateRegistrationCellTargets(boundary Boundary, targets RegistrationCell
 // client with a single-attempt Lambda SDK client.
 func NewCredentialRecoveryCellClient(
 	cfg aws.Config,
-	boundary Boundary,
+	boundary CellBoundary,
 	target CredentialRecoveryCellTarget,
 ) (*CredentialRecoveryCellClient, error) {
-	if err := validateBoundary(cfg, boundary); err != nil {
+	if err := ValidateCredentialRecoveryCellTarget(boundary, target); err != nil {
 		return nil, err
 	}
-	if err := ValidateCredentialRecoveryCellTarget(boundary, target); err != nil {
+	if err := validateSDKRegion(cfg, boundary.Boundary); err != nil {
 		return nil, err
 	}
 	return newCredentialRecoveryCellClient(newLambdaClient(cfg), target), nil
 }
 
 // ValidateCredentialRecoveryCellTarget validates the one fully qualified
-// :active alias before ambient AWS configuration is loaded or a listener binds.
-func ValidateCredentialRecoveryCellTarget(boundary Boundary, target CredentialRecoveryCellTarget) error {
-	if !accountIDPattern.MatchString(boundary.AccountID) {
-		return &ConfigError{Field: "account_id"}
+// blue-or-green alias before ambient AWS configuration is loaded or a listener
+// binds. Process startup also validates it as part of the complete cell graph.
+func ValidateCredentialRecoveryCellTarget(boundary CellBoundary, target CredentialRecoveryCellTarget) error {
+	if err := validateCellBoundaryValues(boundary); err != nil {
+		return err
 	}
-	if boundary.Region == "" {
-		return &ConfigError{Field: "region"}
-	}
-	return validateTargets(boundary,
-		targetSpec{"complete_credential_recovery", target.CompleteCredentialRecoveryAliasARN},
+	return validateTargets(boundary.Boundary, boundary.CellID,
+		targetSpec{"complete_credential_recovery", target.CompleteCredentialRecoveryAliasARN, OperationCompleteCredentialRecovery},
 	)
 }
 
@@ -166,16 +197,6 @@ func newHubClient(api invokeAPI, targets HubTargets) *HubClient {
 		issueAssignment:         targets.IssueAssignmentAliasARN,
 		refreshAssignment:       targets.RefreshAssignmentAliasARN,
 		issueCredentialRecovery: targets.IssueCredentialRecoveryAliasARN,
-	}
-}
-
-func newCellClient(api invokeAPI, targets CellTargets) *CellClient {
-	return &CellClient{
-		invoker:                    invoker{api: api},
-		issueRegistrationOTP:       targets.IssueRegistrationOTPAliasARN,
-		activateRegistration:       targets.ActivateRegistrationAliasARN,
-		completeRegistration:       targets.CompleteRegistrationAliasARN,
-		completeCredentialRecovery: targets.CompleteCredentialRecoveryAliasARN,
 	}
 }
 
@@ -207,6 +228,9 @@ func newLambdaClient(cfg aws.Config) *lambda.Client {
 	cfg.BaseEndpoint = nil
 	cfg.APIOptions = nil
 	cfg.ServiceOptions = nil
+	cfg.ConfigSources = nil
+	cfg.Interceptors = smithyhttp.InterceptorRegistry{}
+	cfg.AuthSchemePreference = nil
 	// Recovery grants and candidate device keys are carried in Lambda payloads.
 	// Ambient SDK body logging must never cross this boundary, even when the
 	// containing process enables it globally for other AWS clients.
@@ -218,17 +242,14 @@ func newLambdaClient(cfg aws.Config) *lambda.Client {
 		options.BaseEndpoint = nil
 		options.EndpointResolver = nil
 		options.EndpointResolverV2 = lambda.NewDefaultEndpointResolverV2()
+		options.EndpointOptions.UseFIPSEndpoint = aws.FIPSEndpointStateDisabled
+		options.EndpointOptions.UseDualStackEndpoint = aws.DualStackEndpointStateDisabled
+		options.Interceptors = smithyhttp.InterceptorRegistry{}
+		options.AuthSchemePreference = nil
 		options.ClientLogMode = 0
 		options.RetryMaxAttempts = 1
 		options.Retryer = aws.NopRetryer{}
 	})
-}
-
-func validateBoundary(cfg aws.Config, boundary Boundary) error {
-	if err := validateBoundaryValues(boundary); err != nil {
-		return err
-	}
-	return validateSDKRegion(cfg, boundary)
 }
 
 func validateSDKRegion(cfg aws.Config, boundary Boundary) error {
@@ -239,46 +260,87 @@ func validateSDKRegion(cfg aws.Config, boundary Boundary) error {
 }
 
 func validateBoundaryValues(boundary Boundary) error {
+	if boundary.Environment != "sandbox" && boundary.Environment != "prod" {
+		return &ConfigError{Field: "environment"}
+	}
 	if !accountIDPattern.MatchString(boundary.AccountID) {
 		return &ConfigError{Field: "account_id"}
 	}
-	if boundary.Region == "" {
+	// Lambda's default resolver incorporates Region into an HTTPS hostname.
+	// Keep it to the bounded canonical AWS region-label shape enforced by
+	// terraform/variables.tf before any SDK
+	// client exists; dots, slashes, URL syntax, and empty label components must
+	// never turn operator configuration into a different DNS authority.
+	if len(boundary.Region) == 0 || len(boundary.Region) > maxRegionLength ||
+		!regionPattern.MatchString(boundary.Region) {
 		return &ConfigError{Field: "region"}
 	}
 	return nil
 }
 
-type targetSpec struct {
-	field string
-	value string
-}
-
-func validateTargets(boundary Boundary, targets ...targetSpec) error {
-	seen := make(map[string]struct{}, len(targets))
-	for _, target := range targets {
-		if !validAliasARN(target.value, boundary) {
-			return &ConfigError{Field: target.field}
-		}
-		if _, ok := seen[target.value]; ok {
-			return &ConfigError{Field: target.field}
-		}
-		seen[target.value] = struct{}{}
+func validateCellBoundaryValues(boundary CellBoundary) error {
+	if err := validateBoundaryValues(boundary.Boundary); err != nil {
+		return err
+	}
+	if len(boundary.CellID) == 0 || len(boundary.CellID) > maxCellIDLength ||
+		!cellIDPattern.MatchString(boundary.CellID) {
+		return &ConfigError{Field: "cell_id"}
 	}
 	return nil
 }
 
-func validAliasARN(value string, boundary Boundary) bool {
+type targetSpec struct {
+	field     string
+	value     string
+	operation Operation
+}
+
+func validateTargets(boundary Boundary, cellID string, targets ...targetSpec) error {
+	selectedColor := ""
+	for _, target := range targets {
+		expectedFunction, found := authorityFunctionName(boundary, cellID, target.operation)
+		if !found {
+			return &ConfigError{Field: target.field}
+		}
+		color, valid := parseAliasARN(target.value, boundary, expectedFunction)
+		if !valid {
+			return &ConfigError{Field: target.field}
+		}
+		if selectedColor == "" {
+			selectedColor = color
+		} else if color != selectedColor {
+			return &ConfigError{Field: target.field}
+		}
+	}
+	return nil
+}
+
+func parseAliasARN(value string, boundary Boundary, expectedFunction string) (string, bool) {
 	target, err := arn.Parse(value)
 	if err != nil || target.Partition != "aws" || target.Service != "lambda" ||
 		target.Region != boundary.Region || target.AccountID != boundary.AccountID {
-		return false
+		return "", false
 	}
 
 	parts := strings.Split(target.Resource, ":")
-	// AWS alias qualifiers are case-sensitive; accept only the exact active alias.
+	// AWS alias qualifiers are case-sensitive. Only the IaC-owned closed pair is
+	// accepted; callers never invoke an unqualified function, version, $LATEST,
+	// legacy active alias, or independently selected per-operation color.
 	if len(parts) != 3 || parts[0] != "function" ||
-		!functionNamePattern.MatchString(parts[1]) || parts[2] != authorityAliasQualifier {
-		return false
+		parts[1] != expectedFunction || (parts[2] != "blue" && parts[2] != "green") {
+		return "", false
 	}
-	return true
+	return parts[2], true
+}
+
+func authorityFunctionName(boundary Boundary, cellID string, operation Operation) (string, bool) {
+	spec, found := authorityFunctionInventory[operation]
+	if !found || spec.cellScoped != (cellID != "") {
+		return "", false
+	}
+	name := "layerv-nhp-" + boundary.Environment + "-ca-" + spec.operationSuffix
+	if spec.cellScoped {
+		name += "-" + cellID
+	}
+	return name, true
 }

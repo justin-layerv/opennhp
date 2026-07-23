@@ -18,6 +18,7 @@ import (
 const (
 	healthAcceptInitialBackoff = 10 * time.Millisecond
 	healthAcceptMaxBackoff     = time.Second
+	hubAWSLoadTimeout          = 5 * time.Second
 )
 
 type healthAccepter interface {
@@ -29,11 +30,21 @@ type componentResult struct {
 	err  error
 }
 
-// Run loads the ambient AWS identity, constructs only the two Hub authority
+type hubAWSLoader func(context.Context, string) (aws.Config, error)
+
+func loadHubAWSConfig(ctx context.Context, region string) (aws.Config, error) {
+	return awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+}
+
+// Run loads the ambient AWS identity, constructs only the three Hub authority
 // capabilities, and serves until ctx is canceled or either listener fails.
 // The same cancellation reaches in-flight synchronous Lambda invocations via
 // the worker's receipt-anchored Handler context.
 func Run(ctx context.Context, config Config) error {
+	return runWithAWSLoader(ctx, config, loadHubAWSConfig)
+}
+
+func runWithAWSLoader(ctx context.Context, config Config, loadAWS hubAWSLoader) error {
 	if ctx == nil {
 		return ErrInvalidConfig
 	}
@@ -45,9 +56,18 @@ func Run(ctx context.Context, config Config) error {
 	if _, _, _, err := config.validate(); err != nil {
 		return err
 	}
-	awsConfig, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(config.AWSRegion))
+	if loadAWS == nil {
+		return ErrInvalidConfig
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, hubAWSLoadTimeout)
+	awsConfig, err := loadAWS(loadCtx, config.AWSRegion)
+	loadErr := loadCtx.Err()
+	cancel()
 	if err != nil {
 		return fmt.Errorf("connector hub: load AWS configuration: %w", err)
+	}
+	if loadErr != nil {
+		return fmt.Errorf("connector hub: load AWS configuration: %w", loadErr)
 	}
 	return runWithAWSConfig(ctx, config, awsConfig, newHubMetricsPublisher(config.Environment, awsConfig))
 }
@@ -71,8 +91,9 @@ func runWithAWSConfig(ctx context.Context, config Config, awsConfig aws.Config, 
 	}
 
 	authority, err := connectorauthority.NewHubClient(awsConfig, connectorauthority.Boundary{
-		AccountID: config.AWSAccountID,
-		Region:    config.AWSRegion,
+		Environment: config.Environment,
+		AccountID:   config.AWSAccountID,
+		Region:      config.AWSRegion,
 	}, connectorauthority.HubTargets{
 		IssueAssignmentAliasARN:         config.IssueAssignmentAliasARN,
 		RefreshAssignmentAliasARN:       config.RefreshAssignmentAliasARN,

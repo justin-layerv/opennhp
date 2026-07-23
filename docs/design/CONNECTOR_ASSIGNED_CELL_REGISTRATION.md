@@ -30,33 +30,38 @@ queries retain their existing dispatch until their separately staged retirement.
 
 ## Startup contract
 
-All ten variables below are one atomic, IaC-owned configuration. If all are
-absent the feature stays dark; if any is missing, empty, malformed, or
-inconsistent, server startup fails before AWS client creation or UDP bind.
+The ten registration variables and three credential-recovery variables below
+are one atomic, IaC-owned cell configuration. If both families are entirely
+absent the feature stays dark. A partial family, only one family, or any empty,
+malformed, or inconsistent value fails server startup before AWS client
+creation or UDP bind.
 
-The current source accepts only `:active` targets as a transitional, dark-only
-composition seam. That selector is not the shipping contract. Before any
-Authority reachability, the shared cell-target validator must replace it with
-one common Terraform-selected `:blue` or `:green` alias across registration and
-credential recovery. It must reject `:active`, `$LATEST`, numeric versions,
-other named aliases, mixed colors, wrong operations, and account or region
-drift before AWS client creation or UDP bind.
+The shared cell-target validator requires one common Terraform-selected
+`:blue` or `:green` graph across all four operations. It rejects `:active`,
+`$LATEST`, numeric versions, other named aliases, mixed colors, wrong
+operations, wrong cells, and environment, account, or region drift before AWS
+client creation or UDP bind. Startup loads one AWS identity only after the
+complete graph passes, then gives registration a three-method client and
+credential recovery a separate one-method client.
 
 | Variable | Contract |
 |----------|----------|
 | `NHP_CONNECTOR_REGISTRATION_AWS_REGION` | AWS region containing the three cell Authority aliases |
 | `NHP_CONNECTOR_REGISTRATION_AWS_ACCOUNT_ID` | AWS account containing those aliases |
-| `NHP_CONNECTOR_REGISTRATION_ISSUE_OTP_ALIAS_ARN` | Current dark-only target: exact `layerv-nhp-<environment>-ca-iro-<cell>:active` alias ARN |
-| `NHP_CONNECTOR_REGISTRATION_ACTIVATE_ALIAS_ARN` | Current dark-only target: exact `layerv-nhp-<environment>-ca-ar-<cell>:active` alias ARN |
-| `NHP_CONNECTOR_REGISTRATION_COMPLETE_ALIAS_ARN` | Current dark-only target: exact `layerv-nhp-<environment>-ca-cr-<cell>:active` alias ARN |
+| `NHP_CONNECTOR_REGISTRATION_ISSUE_OTP_ALIAS_ARN` | Exact `layerv-nhp-<environment>-ca-iro-<cell>:{blue\|green}` alias ARN |
+| `NHP_CONNECTOR_REGISTRATION_ACTIVATE_ALIAS_ARN` | Exact `layerv-nhp-<environment>-ca-ar-<cell>:{blue\|green}` alias ARN |
+| `NHP_CONNECTOR_REGISTRATION_COMPLETE_ALIAS_ARN` | Exact `layerv-nhp-<environment>-ca-cr-<cell>:{blue\|green}` alias ARN |
 | `NHP_CONNECTOR_REGISTRATION_AUTHORITY_LAMBDA_TIMEOUT` | Go duration; integer seconds and at least three seconds |
 | `NHP_CONNECTOR_REGISTRATION_HANDLER_BUDGET` | Receipt-anchored handler budget |
 | `NHP_CONNECTOR_REGISTRATION_PACKET_BUDGET` | Receipt-anchored total packet budget |
 | `NHP_CONNECTOR_REGISTRATION_RESPONSE_RESERVE` | Validation-only response-tail bound |
 | `NHP_CONNECTOR_REGISTRATION_WRITE_BUDGET` | Physical UDP write budget |
+| `NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_REGION` | Must equal the registration AWS region |
+| `NHP_CONNECTOR_CREDENTIAL_RECOVERY_AWS_ACCOUNT_ID` | Must equal the registration AWS account |
+| `NHP_CONNECTOR_CREDENTIAL_RECOVERY_ALIAS_ARN` | Exact same-color `layerv-nhp-<environment>-ca-ccr-<cell>:{blue\|green}` alias ARN |
 
 `NHP_ENVIRONMENT` and `NHP_CELL_ID` are also validated and required explicitly
-once any of the ten variables above enables the composition, but they do not
+once any Authority variable above enables the composition, but they do not
 participate in the all-or-none presence gate and cannot enable it themselves.
 Environment must be `sandbox` or `prod`; the cell ID must be the canonical
 lowercase cell identifier. The duration ladder is strict:
@@ -78,9 +83,10 @@ handoff, write, and short-write failures have distinct counters.
 The Terraform activation PR and its rollout-ledger entry must, before customer
 traffic:
 
-1. replace the transitional `:active` validator with the shared cell-target
-   validator, provision one common selected `:blue` or `:green` graph, and
-   enforce its least-privilege invoke policy;
+1. provision one common selected `:blue` or `:green` four-operation graph and
+   restrict the cell server role and its private Lambda endpoint to those four
+   exact aliases, while retaining the separate three-method registration and
+   one-method recovery clients inside the process;
 2. dashboard request, Authority outcome, and response-delivery counters;
 3. alarm at minimum on `ConnectorRegistrationIngressRejected`,
    `ConnectorRegistrationInvokeFailed`,

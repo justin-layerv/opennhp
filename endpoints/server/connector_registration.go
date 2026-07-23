@@ -6,13 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
-	"strings"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/arn"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorauthority"
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorcell"
@@ -31,7 +25,6 @@ const (
 	ConnectorRegistrationPacketBudgetEnvVar    = "NHP_CONNECTOR_REGISTRATION_PACKET_BUDGET"
 	ConnectorRegistrationResponseReserveEnvVar = "NHP_CONNECTOR_REGISTRATION_RESPONSE_RESERVE"
 	ConnectorRegistrationWriteBudgetEnvVar     = "NHP_CONNECTOR_REGISTRATION_WRITE_BUDGET"
-	connectorRegistrationStartupAWSLoadTimeout = 5 * time.Second
 	connectorRegistrationMinLambdaTimeout      = 3 * time.Second
 	connectorRegistrationMaxPacketBudget       = time.Duration(core.RemoteTransactionProcessTimeoutMs) * time.Millisecond
 )
@@ -44,7 +37,6 @@ var (
 	errConnectorRegistrationResponseHandoff      = errors.New("connector registration: transaction handoff failed")
 	errConnectorRegistrationResponseWrite        = errors.New("connector registration: response write failed")
 	errConnectorRegistrationResponseShortWrite   = errors.New("connector registration: short response write")
-	connectorRegistrationCellIDPattern           = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 )
 
 // Fixed metric names are the complete observer surface for this composition.
@@ -111,12 +103,6 @@ type connectorRegistrationTiming struct {
 	writeBudget     time.Duration
 }
 
-type connectorRegistrationAWSLoader func(context.Context, string) (aws.Config, error)
-
-func loadConnectorRegistrationAWSConfig(ctx context.Context, region string) (aws.Config, error) {
-	return awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
-}
-
 func loadConnectorRegistrationConfig(lookupEnv func(string) (string, bool)) (*connectorRegistrationConfig, error) {
 	if lookupEnv == nil {
 		return nil, errInvalidConnectorRegistrationConfiguration
@@ -137,11 +123,11 @@ func loadConnectorRegistrationConfig(lookupEnv func(string) (string, bool)) (*co
 	}
 	if !regionSet || !accountSet || !issueOTPSet || !activateSet || !completeSet ||
 		!lambdaTimeoutSet || !handlerBudgetSet || !packetBudgetSet || !responseReserveSet || !writeBudgetSet ||
-		!strictConnectorRegistrationEnvValue(region) ||
-		!strictConnectorRegistrationEnvValue(accountID) ||
-		!strictConnectorRegistrationEnvValue(issueOTP) ||
-		!strictConnectorRegistrationEnvValue(activate) ||
-		!strictConnectorRegistrationEnvValue(complete) {
+		!strictConnectorAuthorityEnvValue(region) ||
+		!strictConnectorAuthorityEnvValue(accountID) ||
+		!strictConnectorAuthorityEnvValue(issueOTP) ||
+		!strictConnectorAuthorityEnvValue(activate) ||
+		!strictConnectorAuthorityEnvValue(complete) {
 		return nil, errInvalidConnectorRegistrationConfiguration
 	}
 	timing, err := parseConnectorRegistrationTiming(
@@ -153,13 +139,9 @@ func loadConnectorRegistrationConfig(lookupEnv func(string) (string, bool)) (*co
 
 	environment, environmentSet := lookupEnv("NHP_ENVIRONMENT")
 	cellID, cellSet := lookupEnv("NHP_CELL_ID")
-	// Only deployable cell environments own Authority targets. The literal
-	// :active validation below is a transitional, dark-only composition seam;
-	// the pre-activation shared cell validator replaces it with one common
-	// blue/green target graph and rejects :active and mixed colors. Local and
-	// ad-hoc environments must keep this composition dark.
-	if !environmentSet || !cellSet || (environment != "sandbox" && environment != "prod") ||
-		len(cellID) > 32 || !connectorRegistrationCellIDPattern.MatchString(cellID) {
+	// Only deployable cell environments own Authority targets. Local and ad-hoc
+	// environments must keep this composition dark.
+	if !environmentSet || !cellSet {
 		return nil, errInvalidConnectorRegistrationConfiguration
 	}
 
@@ -167,7 +149,7 @@ func loadConnectorRegistrationConfig(lookupEnv func(string) (string, bool)) (*co
 		environment: environment, cellID: cellID, region: region, accountID: accountID,
 		issueOTPAliasARN: issueOTP, activateAliasARN: activate, completeAliasARN: complete, timing: timing,
 	}
-	boundary := connectorauthority.Boundary{AccountID: accountID, Region: region}
+	boundary := connectorCellBoundary(config)
 	targets := connectorauthority.RegistrationCellTargets{
 		IssueRegistrationOTPAliasARN: issueOTP,
 		ActivateRegistrationAliasARN: activate,
@@ -176,25 +158,7 @@ func loadConnectorRegistrationConfig(lookupEnv func(string) (string, bool)) (*co
 	if err := connectorauthority.ValidateRegistrationCellTargets(boundary, targets); err != nil {
 		return nil, errInvalidConnectorRegistrationConfiguration
 	}
-	expectedFunctions := []struct {
-		aliasARN string
-		name     string
-	}{
-		{issueOTP, fmt.Sprintf("layerv-nhp-%s-ca-iro-%s", environment, cellID)},
-		{activate, fmt.Sprintf("layerv-nhp-%s-ca-ar-%s", environment, cellID)},
-		{complete, fmt.Sprintf("layerv-nhp-%s-ca-cr-%s", environment, cellID)},
-	}
-	for _, target := range expectedFunctions {
-		parsed, err := arn.Parse(target.aliasARN)
-		if err != nil || parsed.Resource != "function:"+target.name+":active" {
-			return nil, errInvalidConnectorRegistrationConfiguration
-		}
-	}
 	return config, nil
-}
-
-func strictConnectorRegistrationEnvValue(value string) bool {
-	return value != "" && strings.TrimSpace(value) == value
 }
 
 func parseConnectorRegistrationTiming(
@@ -213,7 +177,7 @@ func parseConnectorRegistrationTiming(
 	}
 	var durations [len(values)]time.Duration
 	for index, value := range values {
-		if !strictConnectorRegistrationEnvValue(value) {
+		if !strictConnectorAuthorityEnvValue(value) {
 			return connectorRegistrationTiming{}, errInvalidConnectorRegistrationConfiguration
 		}
 		duration, err := time.ParseDuration(value)
@@ -240,53 +204,6 @@ func parseConnectorRegistrationTiming(
 		return connectorRegistrationTiming{}, errInvalidConnectorRegistrationConfiguration
 	}
 	return timing, nil
-}
-
-// configureConnectorRegistration is the startup fail-closed seam. Total
-// absence keeps the composition dark; any partial or malformed configuration
-// fails before AWS configuration is loaded and before the UDP listener binds.
-func (s *UdpServer) configureConnectorRegistration(
-	ctx context.Context,
-	lookupEnv func(string) (string, bool),
-	loadAWS connectorRegistrationAWSLoader,
-) error {
-	s.connectorRegistrationHandler = nil
-	s.connectorRegistrationTiming = connectorRegistrationTiming{}
-	config, err := loadConnectorRegistrationConfig(lookupEnv)
-	if err != nil {
-		return err
-	}
-	if config == nil {
-		return nil
-	}
-	if ctx == nil || loadAWS == nil || ctx.Err() != nil {
-		return errInvalidConnectorRegistrationConfiguration
-	}
-	loadCtx, cancel := context.WithTimeout(ctx, connectorRegistrationStartupAWSLoadTimeout)
-	defer cancel()
-	awsConfig, err := loadAWS(loadCtx, config.region)
-	if err != nil {
-		return fmt.Errorf("connector registration: load AWS configuration: %w", err)
-	}
-	authority, err := connectorauthority.NewRegistrationCellClient(
-		awsConfig,
-		connectorauthority.Boundary{AccountID: config.accountID, Region: config.region},
-		connectorauthority.RegistrationCellTargets{
-			IssueRegistrationOTPAliasARN: config.issueOTPAliasARN,
-			ActivateRegistrationAliasARN: config.activateAliasARN,
-			CompleteRegistrationAliasARN: config.completeAliasARN,
-		},
-	)
-	if err != nil {
-		return errInvalidConnectorRegistrationConfiguration
-	}
-	handler, err := connectorcell.NewRegistrationHandler(authority)
-	if err != nil {
-		return errInvalidConnectorRegistrationConfiguration
-	}
-	s.connectorRegistrationHandler = handler
-	s.connectorRegistrationTiming = config.timing
-	return nil
 }
 
 func connectorRegistrationDeadline(receiptNanos int64, budget time.Duration, now time.Time) (time.Time, bool) {

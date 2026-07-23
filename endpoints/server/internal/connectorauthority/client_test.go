@@ -40,17 +40,12 @@ func TestHubAndCellCapabilitiesAreStructurallySeparated(t *testing.T) {
 	t.Parallel()
 
 	hubMethods := exportedMethods(reflect.TypeOf((*HubClient)(nil)))
-	cellMethods := exportedMethods(reflect.TypeOf((*CellClient)(nil)))
 	registrationMethods := exportedMethods(reflect.TypeOf((*RegistrationCellClient)(nil)))
 	recoveryMethods := exportedMethods(reflect.TypeOf((*CredentialRecoveryCellClient)(nil)))
 
 	wantHub := []string{"IssueAssignment", "IssueCredentialRecovery", "RefreshAssignment"}
-	wantCell := []string{"ActivateRegistration", "CompleteCredentialRecovery", "CompleteRegistration", "IssueRegistrationOTP"}
 	if !reflect.DeepEqual(hubMethods, wantHub) {
 		t.Fatalf("HubClient methods = %v, want %v", hubMethods, wantHub)
-	}
-	if !reflect.DeepEqual(cellMethods, wantCell) {
-		t.Fatalf("CellClient methods = %v, want %v", cellMethods, wantCell)
 	}
 	if want := []string{"ActivateRegistration", "CompleteRegistration", "IssueRegistrationOTP"}; !reflect.DeepEqual(registrationMethods, want) {
 		t.Fatalf("RegistrationCellClient methods = %v, want %v", registrationMethods, want)
@@ -139,37 +134,37 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 		{
 			name:      "issue assignment",
 			operation: OperationIssueAssignment,
-			target:    aliasARN("IssueAssignment", "active"),
+			target:    aliasARN(hubFunction("ia"), "blue"),
 		},
 		{
 			name:      "refresh assignment",
 			operation: OperationRefreshAssignment,
-			target:    aliasARN("RefreshAssignment", "active"),
+			target:    aliasARN(hubFunction("ra"), "blue"),
 		},
 		{
 			name:      "issue credential recovery",
 			operation: OperationIssueCredentialRecovery,
-			target:    aliasARN("IssueCredentialRecovery", "active"),
+			target:    aliasARN(hubFunction("icr"), "blue"),
 		},
 		{
 			name:      "issue registration OTP",
 			operation: OperationIssueRegistrationOTP,
-			target:    aliasARN("IssueRegistrationOTP-cell0", "active"),
+			target:    aliasARN(cellFunction("iro", testCellID), "blue"),
 		},
 		{
 			name:      "activate registration",
 			operation: OperationActivateRegistration,
-			target:    aliasARN("ActivateRegistration-cell0", "active"),
+			target:    aliasARN(cellFunction("ar", testCellID), "blue"),
 		},
 		{
 			name:      "complete registration",
 			operation: OperationCompleteRegistration,
-			target:    aliasARN("CompleteRegistration-cell0", "active"),
+			target:    aliasARN(cellFunction("cr", testCellID), "blue"),
 		},
 		{
 			name:      "complete credential recovery",
 			operation: OperationCompleteCredentialRecovery,
-			target:    aliasARN("CompleteCredentialRecovery-cell0", "active"),
+			target:    aliasARN(cellFunction("ccr", testCellID), "blue"),
 		},
 	}
 
@@ -186,10 +181,12 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 				RefreshAssignmentAliasARN:       tests[1].target,
 				IssueCredentialRecoveryAliasARN: tests[2].target,
 			})
-			cell := newCellClient(api, CellTargets{
-				IssueRegistrationOTPAliasARN:       tests[3].target,
-				ActivateRegistrationAliasARN:       tests[4].target,
-				CompleteRegistrationAliasARN:       tests[5].target,
+			registration := newRegistrationCellClient(api, RegistrationCellTargets{
+				IssueRegistrationOTPAliasARN: tests[3].target,
+				ActivateRegistrationAliasARN: tests[4].target,
+				CompleteRegistrationAliasARN: tests[5].target,
+			})
+			recovery := newCredentialRecoveryCellClient(api, CredentialRecoveryCellTarget{
 				CompleteCredentialRecoveryAliasARN: tests[6].target,
 			})
 			switch test.operation {
@@ -200,13 +197,13 @@ func TestOperationsUseFixedTargetsAndInvokeContract(t *testing.T) {
 			case OperationIssueCredentialRecovery:
 				test.call = hub.IssueCredentialRecovery
 			case OperationIssueRegistrationOTP:
-				test.call = cell.IssueRegistrationOTP
+				test.call = registration.IssueRegistrationOTP
 			case OperationActivateRegistration:
-				test.call = cell.ActivateRegistration
+				test.call = registration.ActivateRegistration
 			case OperationCompleteRegistration:
-				test.call = cell.CompleteRegistration
+				test.call = registration.CompleteRegistration
 			case OperationCompleteCredentialRecovery:
-				test.call = cell.CompleteCredentialRecovery
+				test.call = recovery.CompleteCredentialRecovery
 			default:
 				t.Fatalf("unhandled operation %q", test.operation)
 			}
@@ -358,7 +355,7 @@ func TestInvokeReturnsTypedRedactedFailures(t *testing.T) {
 			t.Parallel()
 
 			api := &fakeInvokeAPI{output: test.output, err: test.err}
-			client := newCellClient(api, validCellTargets())
+			client := newRegistrationCellClient(api, validRegistrationCellTargets())
 			got, err := client.ActivateRegistration(liveContext(t), []byte(`{"request":true}`))
 			if got != nil {
 				t.Fatalf("response = %q, want nil", got)

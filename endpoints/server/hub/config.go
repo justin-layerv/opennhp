@@ -126,7 +126,11 @@ func (c Config) validate() (netip.AddrPort, netip.AddrPort, connectorhub.WorkerT
 		return netip.AddrPort{}, netip.AddrPort{}, connectorhub.WorkerTiming{}, ErrInvalidConfig
 	}
 	if err := connectorauthority.ValidateHubTargets(
-		connectorauthority.Boundary{AccountID: c.AWSAccountID, Region: c.AWSRegion},
+		connectorauthority.Boundary{
+			Environment: c.Environment,
+			AccountID:   c.AWSAccountID,
+			Region:      c.AWSRegion,
+		},
 		connectorauthority.HubTargets{
 			IssueAssignmentAliasARN:         c.IssueAssignmentAliasARN,
 			RefreshAssignmentAliasARN:       c.RefreshAssignmentAliasARN,

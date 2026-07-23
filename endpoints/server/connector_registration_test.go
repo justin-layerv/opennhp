@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	conformance "github.com/layervai/qurl-conformance"
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
@@ -28,9 +27,9 @@ func validConnectorRegistrationEnvironment() map[string]string {
 		"NHP_CELL_ID":                              "cell0",
 		ConnectorRegistrationAWSRegionEnvVar:       "us-east-2",
 		ConnectorRegistrationAWSAccountEnvVar:      "123456789012",
-		ConnectorRegistrationIssueOTPAliasEnvVar:   "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-iro-cell0:active",
-		ConnectorRegistrationActivateAliasEnvVar:   "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ar-cell0:active",
-		ConnectorRegistrationCompleteAliasEnvVar:   "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-cr-cell0:active",
+		ConnectorRegistrationIssueOTPAliasEnvVar:   "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-iro-cell0:blue",
+		ConnectorRegistrationActivateAliasEnvVar:   "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ar-cell0:blue",
+		ConnectorRegistrationCompleteAliasEnvVar:   "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-cr-cell0:blue",
 		ConnectorRegistrationLambdaTimeoutEnvVar:   "3s",
 		ConnectorRegistrationHandlerBudgetEnvVar:   "3200ms",
 		ConnectorRegistrationPacketBudgetEnvVar:    "3900ms",
@@ -105,7 +104,7 @@ func TestConnectorRegistrationConfigurationIsDarkOrAllOrNone(t *testing.T) {
 			env[ConnectorRegistrationActivateAliasEnvVar] = strings.Replace(env[ConnectorRegistrationActivateAliasEnvVar], "us-east-2", "us-west-2", 1)
 		}},
 		{name: "numeric qualifier", mutate: func(env map[string]string) {
-			env[ConnectorRegistrationCompleteAliasEnvVar] = strings.TrimSuffix(env[ConnectorRegistrationCompleteAliasEnvVar], ":active") + ":7"
+			env[ConnectorRegistrationCompleteAliasEnvVar] = strings.TrimSuffix(env[ConnectorRegistrationCompleteAliasEnvVar], ":blue") + ":7"
 		}},
 		{name: "wrong operation", mutate: func(env map[string]string) {
 			env[ConnectorRegistrationIssueOTPAliasEnvVar] = strings.Replace(env[ConnectorRegistrationIssueOTPAliasEnvVar], "ca-iro", "ca-ar", 1)
@@ -134,44 +133,6 @@ func TestConnectorRegistrationConfigurationIsDarkOrAllOrNone(t *testing.T) {
 				t.Fatalf("config = %#v, error = %v", config, err)
 			}
 		})
-	}
-}
-
-func TestConfigureConnectorRegistrationValidatesBeforeAWSLoad(t *testing.T) {
-	t.Parallel()
-	server := &UdpServer{}
-	loads := 0
-	env := validConnectorRegistrationEnvironment()
-	err := server.configureConnectorRegistration(context.Background(), mapEnvironment(env), func(_ context.Context, region string) (aws.Config, error) {
-		loads++
-		return aws.Config{Region: region}, nil
-	})
-	if err != nil || loads != 1 || server.connectorRegistrationHandler == nil {
-		t.Fatalf("configure = %v loads=%d handler=%T", err, loads, server.connectorRegistrationHandler)
-	}
-
-	bad := validConnectorRegistrationEnvironment()
-	bad[ConnectorRegistrationCompleteAliasEnvVar] = strings.Replace(bad[ConnectorRegistrationCompleteAliasEnvVar], "cell0", "cell1", 1)
-	loads = 0
-	if err := server.configureConnectorRegistration(context.Background(), mapEnvironment(bad), func(context.Context, string) (aws.Config, error) {
-		loads++
-		return aws.Config{}, nil
-	}); !errors.Is(err, errInvalidConnectorRegistrationConfiguration) || loads != 0 {
-		t.Fatalf("invalid configure = %v loads=%d; want pre-AWS rejection", err, loads)
-	}
-	if server.connectorRegistrationHandler != nil || server.connectorRegistrationTiming != (connectorRegistrationTiming{}) {
-		t.Fatalf("invalid reconfiguration retained state: handler=%T timing=%+v",
-			server.connectorRegistrationHandler, server.connectorRegistrationTiming)
-	}
-
-	dark := map[string]string{"NHP_ENVIRONMENT": "sandbox", "NHP_CELL_ID": "cell0"}
-	if err := server.configureConnectorRegistration(context.Background(), mapEnvironment(dark), func(context.Context, string) (aws.Config, error) {
-		loads++
-		return aws.Config{}, nil
-	}); err != nil || loads != 0 || server.connectorRegistrationHandler != nil ||
-		server.connectorRegistrationTiming != (connectorRegistrationTiming{}) {
-		t.Fatalf("dark reconfiguration = %v loads=%d handler=%T timing=%+v",
-			err, loads, server.connectorRegistrationHandler, server.connectorRegistrationTiming)
 	}
 }
 

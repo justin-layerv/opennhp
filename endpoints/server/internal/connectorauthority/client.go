@@ -48,22 +48,10 @@ type HubClient struct {
 	issueCredentialRecovery string
 }
 
-// CellClient exposes only assigned-cell authority capabilities. Every method
-// requires a live caller deadline and a non-empty, valid JSON body no larger
-// than 64 KiB. Payloads are consumed synchronously and never retained;
-// successful callers own the returned mutable buffer exclusively.
-type CellClient struct {
-	invoker
-	issueRegistrationOTP       string
-	activateRegistration       string
-	completeRegistration       string
-	completeCredentialRecovery string
-}
-
 // RegistrationCellClient exposes only the three assigned-cell enrollment
-// operations. Keeping it narrower than CellClient makes it impossible for the
-// registration composition to invoke credential recovery, even if a caller is
-// later miswired.
+// operations. Its closed method set makes it impossible for the registration
+// composition to invoke credential recovery, even if a caller is later
+// miswired.
 type RegistrationCellClient struct {
 	invoker
 	issueRegistrationOTP string
@@ -95,21 +83,6 @@ func (c *HubClient) IssueCredentialRecovery(ctx context.Context, payload []byte)
 }
 
 // IssueRegistrationOTP invokes the configured cell-scoped IssueRegistrationOTP alias synchronously.
-func (c *CellClient) IssueRegistrationOTP(ctx context.Context, payload []byte) ([]byte, error) {
-	return c.invoke(ctx, OperationIssueRegistrationOTP, c.issueRegistrationOTP, payload)
-}
-
-// ActivateRegistration invokes the configured cell-scoped ActivateRegistration alias synchronously.
-func (c *CellClient) ActivateRegistration(ctx context.Context, payload []byte) ([]byte, error) {
-	return c.invoke(ctx, OperationActivateRegistration, c.activateRegistration, payload)
-}
-
-// CompleteRegistration invokes the configured cell-scoped CompleteRegistration alias synchronously.
-func (c *CellClient) CompleteRegistration(ctx context.Context, payload []byte) ([]byte, error) {
-	return c.invoke(ctx, OperationCompleteRegistration, c.completeRegistration, payload)
-}
-
-// IssueRegistrationOTP invokes the configured cell-scoped IssueRegistrationOTP alias synchronously.
 func (c *RegistrationCellClient) IssueRegistrationOTP(ctx context.Context, payload []byte) ([]byte, error) {
 	return c.invoke(ctx, OperationIssueRegistrationOTP, c.issueRegistrationOTP, payload)
 }
@@ -122,11 +95,6 @@ func (c *RegistrationCellClient) ActivateRegistration(ctx context.Context, paylo
 // CompleteRegistration invokes the configured cell-scoped CompleteRegistration alias synchronously.
 func (c *RegistrationCellClient) CompleteRegistration(ctx context.Context, payload []byte) ([]byte, error) {
 	return c.invoke(ctx, OperationCompleteRegistration, c.completeRegistration, payload)
-}
-
-// CompleteCredentialRecovery invokes the configured assigned-cell recovery alias synchronously.
-func (c *CellClient) CompleteCredentialRecovery(ctx context.Context, payload []byte) ([]byte, error) {
-	return c.invoke(ctx, OperationCompleteCredentialRecovery, c.completeCredentialRecovery, payload)
 }
 
 // CompleteCredentialRecovery invokes the one configured assigned-cell recovery alias synchronously.

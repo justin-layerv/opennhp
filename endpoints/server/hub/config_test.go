@@ -34,9 +34,9 @@ func validConfig() Config {
 		PreviousCookieKeyBase64:         testKey(3),
 		AWSRegion:                       "us-east-2",
 		AWSAccountID:                    "123456789012",
-		IssueAssignmentAliasARN:         "arn:aws:lambda:us-east-2:123456789012:function:issue-assignment:active",
-		RefreshAssignmentAliasARN:       "arn:aws:lambda:us-east-2:123456789012:function:refresh-assignment:active",
-		IssueCredentialRecoveryAliasARN: "arn:aws:lambda:us-east-2:123456789012:function:issue-credential-recovery:active",
+		IssueAssignmentAliasARN:         "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ia:blue",
+		RefreshAssignmentAliasARN:       "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ra:blue",
+		IssueCredentialRecoveryAliasARN: "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-icr:blue",
 		AuthorityLambdaTimeout:          "3s",
 		HandlerBudget:                   "3100ms",
 		PacketBudget:                    "3500ms",
@@ -59,9 +59,9 @@ active_cookie_key = "` + config.ActiveCookieKeyBase64 + `"
 previous_cookie_key = "` + config.PreviousCookieKeyBase64 + `"
 aws_region = "us-east-2"
 aws_account_id = "123456789012"
-issue_assignment_alias_arn = "arn:aws:lambda:us-east-2:123456789012:function:issue-assignment:active"
-refresh_assignment_alias_arn = "arn:aws:lambda:us-east-2:123456789012:function:refresh-assignment:active"
-issue_credential_recovery_alias_arn = "arn:aws:lambda:us-east-2:123456789012:function:issue-credential-recovery:active"
+issue_assignment_alias_arn = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ia:blue"
+refresh_assignment_alias_arn = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ra:blue"
+issue_credential_recovery_alias_arn = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-icr:blue"
 authority_lambda_timeout = "` + config.AuthorityLambdaTimeout + `"
 handler_budget = "` + config.HandlerBudget + `"
 packet_budget = "` + config.PacketBudget + `"
@@ -215,17 +215,26 @@ func TestConfigRejectsHostnameAndWhitespace(t *testing.T) {
 		"zero key":           func(c *Config) { c.ActiveCookieKeyBase64 = testKey(0) },
 		"bad account":        func(c *Config) { c.AWSAccountID = "1234" },
 		"wrong alias region": func(c *Config) {
-			c.IssueAssignmentAliasARN = "arn:aws:lambda:us-west-2:123456789012:function:issue-assignment:active"
+			c.IssueAssignmentAliasARN = "arn:aws:lambda:us-west-2:123456789012:function:layerv-nhp-sandbox-ca-ia:blue"
 		},
 		"unqualified alias": func(c *Config) {
-			c.RefreshAssignmentAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:refresh-assignment"
+			c.RefreshAssignmentAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ra"
+		},
+		"legacy active alias": func(c *Config) {
+			c.RefreshAssignmentAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ra:active"
+		},
+		"wrong operation alias": func(c *Config) {
+			c.RefreshAssignmentAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ia:blue"
 		},
 		"duplicate alias": func(c *Config) { c.RefreshAssignmentAliasARN = c.IssueAssignmentAliasARN },
-		// The recovery alias is the third :active target wired by this composition;
-		// it must fail closed on the same contract as the other two.
+		"mixed alias color": func(c *Config) {
+			c.RefreshAssignmentAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ra:green"
+		},
+		// The recovery alias is the third operation-specific target wired by
+		// this composition; it must fail closed on the same graph as the other two.
 		"empty recovery alias": func(c *Config) { c.IssueCredentialRecoveryAliasARN = "" },
 		"unqualified recovery alias": func(c *Config) {
-			c.IssueCredentialRecoveryAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:issue-credential-recovery"
+			c.IssueCredentialRecoveryAliasARN = "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-icr"
 		},
 		"duplicate recovery alias":  func(c *Config) { c.IssueCredentialRecoveryAliasARN = c.IssueAssignmentAliasARN },
 		"empty lambda timeout":      func(c *Config) { c.AuthorityLambdaTimeout = "" },

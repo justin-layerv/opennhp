@@ -3,13 +3,7 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
-	"regexp"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/arn"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorauthority"
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/connectorcell"
@@ -25,15 +19,13 @@ const (
 	// connectorCredentialRecoveryBudget is anchored at PacketParserData.LocalInitTime,
 	// the local UDP receipt timestamp. The same absolute deadline covers strict
 	// decoding, the one-attempt Authority call, and transaction handoff.
-	connectorCredentialRecoveryBudget       = 2500 * time.Millisecond
-	credentialRecoveryStartupAWSLoadTimeout = 5 * time.Second
+	connectorCredentialRecoveryBudget = 2500 * time.Millisecond
 )
 
 var (
 	errInvalidCredentialRecoveryConfiguration = errors.New("connector credential recovery: invalid configuration")
 	errCredentialRecoveryDeadline             = errors.New("connector credential recovery: request deadline exhausted")
 	errCredentialRecoveryResponse             = errors.New("connector credential recovery: response unavailable")
-	credentialRecoveryCellIDPattern           = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 )
 
 // Fixed metric names are the complete observer surface for this dark slice.
@@ -63,12 +55,6 @@ type credentialRecoveryConfig struct {
 	aliasARN    string
 }
 
-type credentialRecoveryAWSLoader func(context.Context, string) (aws.Config, error)
-
-func loadCredentialRecoveryAWSConfig(ctx context.Context, region string) (aws.Config, error) {
-	return awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
-}
-
 func loadCredentialRecoveryConfig(lookupEnv func(string) (string, bool)) (*credentialRecoveryConfig, error) {
 	if lookupEnv == nil {
 		return nil, errInvalidCredentialRecoveryConfiguration
@@ -81,7 +67,10 @@ func loadCredentialRecoveryConfig(lookupEnv func(string) (string, bool)) (*crede
 	}
 	// Once any recovery knob is present, all three must be explicitly present
 	// and non-empty. LookupEnv preserves the important empty-vs-absent boundary.
-	if !regionSet || !accountSet || !aliasSet || region == "" || accountID == "" || aliasARN == "" {
+	if !regionSet || !accountSet || !aliasSet ||
+		!strictConnectorAuthorityEnvValue(region) ||
+		!strictConnectorAuthorityEnvValue(accountID) ||
+		!strictConnectorAuthorityEnvValue(aliasARN) {
 		return nil, errInvalidCredentialRecoveryConfiguration
 	}
 	environment, _ := lookupEnv("NHP_ENVIRONMENT")
@@ -93,73 +82,21 @@ func loadCredentialRecoveryConfig(lookupEnv func(string) (string, bool)) (*crede
 		accountID:   accountID,
 		aliasARN:    aliasARN,
 	}
-	if config.environment == "" || config.cellID == "" {
-		return nil, errInvalidCredentialRecoveryConfiguration
+	boundary := connectorauthority.CellBoundary{
+		Boundary: connectorauthority.Boundary{
+			Environment: config.environment,
+			AccountID:   config.accountID,
+			Region:      config.region,
+		},
+		CellID: config.cellID,
 	}
-	if config.environment != "sandbox" && config.environment != "prod" {
-		return nil, errInvalidCredentialRecoveryConfiguration
-	}
-	if len(config.cellID) > 32 || !credentialRecoveryCellIDPattern.MatchString(config.cellID) {
-		return nil, errInvalidCredentialRecoveryConfiguration
-	}
-
-	boundary := connectorauthority.Boundary{AccountID: config.accountID, Region: config.region}
 	target := connectorauthority.CredentialRecoveryCellTarget{
 		CompleteCredentialRecoveryAliasARN: config.aliasARN,
 	}
 	if err := connectorauthority.ValidateCredentialRecoveryCellTarget(boundary, target); err != nil {
 		return nil, errInvalidCredentialRecoveryConfiguration
 	}
-	parsed, err := arn.Parse(config.aliasARN)
-	// The compact physical name leaves room for every Terraform-valid 32-byte
-	// cell id within Lambda's 64-byte function-name limit. The operation remains
-	// spelled CompleteCredentialRecovery in contracts, tags, and documentation.
-	expectedFunction := fmt.Sprintf("layerv-nhp-%s-ca-ccr-%s", config.environment, config.cellID)
-	if err != nil || parsed.Resource != "function:"+expectedFunction+":active" {
-		return nil, errInvalidCredentialRecoveryConfiguration
-	}
 	return config, nil
-}
-
-// configureCredentialRecovery is the small startup seam. Configuration is
-// fully validated before ambient AWS loading; a partial/invalid presence fails
-// Start before UDP bind, while total absence leaves the handler nil.
-func (s *UdpServer) configureCredentialRecovery(
-	ctx context.Context,
-	lookupEnv func(string) (string, bool),
-	loadAWS credentialRecoveryAWSLoader,
-) error {
-	config, err := loadCredentialRecoveryConfig(lookupEnv)
-	if err != nil {
-		return err
-	}
-	if config == nil {
-		s.credentialRecoveryHandler = nil
-		return nil
-	}
-	if ctx == nil || loadAWS == nil || ctx.Err() != nil {
-		return errInvalidCredentialRecoveryConfiguration
-	}
-	loadCtx, cancel := context.WithTimeout(ctx, credentialRecoveryStartupAWSLoadTimeout)
-	defer cancel()
-	awsConfig, err := loadAWS(loadCtx, config.region)
-	if err != nil {
-		return fmt.Errorf("connector credential recovery: load AWS configuration: %w", err)
-	}
-	authority, err := connectorauthority.NewCredentialRecoveryCellClient(
-		awsConfig,
-		connectorauthority.Boundary{AccountID: config.accountID, Region: config.region},
-		connectorauthority.CredentialRecoveryCellTarget{CompleteCredentialRecoveryAliasARN: config.aliasARN},
-	)
-	if err != nil {
-		return errInvalidCredentialRecoveryConfiguration
-	}
-	handler, err := connectorcell.NewHandler(authority)
-	if err != nil {
-		return errInvalidCredentialRecoveryConfiguration
-	}
-	s.credentialRecoveryHandler = handler
-	return nil
 }
 
 // buildDirectCredentialRecoveryResult intercepts only recovery intent. It

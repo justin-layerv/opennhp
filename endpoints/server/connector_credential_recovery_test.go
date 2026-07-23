@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	conformance "github.com/layervai/qurl-conformance"
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
@@ -28,7 +27,7 @@ func validRecoveryEnvironment() map[string]string {
 		"NHP_CELL_ID":     "cell0",
 		ConnectorCredentialRecoveryAWSRegionEnvVar:  "us-east-2",
 		ConnectorCredentialRecoveryAWSAccountEnvVar: "123456789012",
-		ConnectorCredentialRecoveryAliasARNEnvVar:   "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ccr-cell0:active",
+		ConnectorCredentialRecoveryAliasARNEnvVar:   "arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ccr-cell0:blue",
 	}
 }
 
@@ -58,10 +57,15 @@ func TestCredentialRecoveryConfigurationIsDarkWhenAbsentAndFailsClosedWhenPresen
 		{name: "empty region present", mutate: func(env map[string]string) { env[ConnectorCredentialRecoveryAWSRegionEnvVar] = "" }},
 		{name: "empty account present", mutate: func(env map[string]string) { env[ConnectorCredentialRecoveryAWSAccountEnvVar] = "" }},
 		{name: "empty alias present", mutate: func(env map[string]string) { env[ConnectorCredentialRecoveryAliasARNEnvVar] = "" }},
+		{name: "whitespace region", mutate: func(env map[string]string) { env[ConnectorCredentialRecoveryAWSRegionEnvVar] += " " }},
+		{name: "whitespace account", mutate: func(env map[string]string) {
+			env[ConnectorCredentialRecoveryAWSAccountEnvVar] = " " + env[ConnectorCredentialRecoveryAWSAccountEnvVar]
+		}},
+		{name: "whitespace alias", mutate: func(env map[string]string) { env[ConnectorCredentialRecoveryAliasARNEnvVar] += "\t" }},
 		{name: "missing environment", mutate: func(env map[string]string) { delete(env, "NHP_ENVIRONMENT") }},
 		{name: "missing cell", mutate: func(env map[string]string) { delete(env, "NHP_CELL_ID") }},
 		{name: "wrong cell alias", mutate: func(env map[string]string) {
-			env[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.Replace(env[ConnectorCredentialRecoveryAliasARNEnvVar], "cell0:active", "cell1:active", 1)
+			env[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.Replace(env[ConnectorCredentialRecoveryAliasARNEnvVar], "cell0:blue", "cell1:blue", 1)
 		}},
 		{name: "wrong environment alias", mutate: func(env map[string]string) {
 			env[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.Replace(env[ConnectorCredentialRecoveryAliasARNEnvVar], "nhp-sandbox-", "nhp-prod-", 1)
@@ -71,7 +75,7 @@ func TestCredentialRecoveryConfigurationIsDarkWhenAbsentAndFailsClosedWhenPresen
 			env[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.Replace(env[ConnectorCredentialRecoveryAliasARNEnvVar], "nhp-sandbox-", "nhp-staging-", 1)
 		}},
 		{name: "numeric version", mutate: func(env map[string]string) {
-			env[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.TrimSuffix(env[ConnectorCredentialRecoveryAliasARNEnvVar], ":active") + ":7"
+			env[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.TrimSuffix(env[ConnectorCredentialRecoveryAliasARNEnvVar], ":blue") + ":7"
 		}},
 		{name: "whitespace", mutate: func(env map[string]string) { env["NHP_CELL_ID"] = " cell0" }},
 		{name: "leading dash", mutate: func(env map[string]string) { env["NHP_CELL_ID"] = "-cell0" }},
@@ -99,40 +103,11 @@ func TestCredentialRecoveryConfigurationAcceptsTerraformCellIDBoundaries(t *test
 			env := validRecoveryEnvironment()
 			env["NHP_CELL_ID"] = cellID
 			env[ConnectorCredentialRecoveryAliasARNEnvVar] =
-				"arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ccr-" + cellID + ":active"
+				"arn:aws:lambda:us-east-2:123456789012:function:layerv-nhp-sandbox-ca-ccr-" + cellID + ":green"
 			if config, err := loadCredentialRecoveryConfig(mapEnvironment(env)); err != nil || config == nil {
 				t.Fatalf("cell %q config = %#v, %v", cellID, config, err)
 			}
 		})
-	}
-}
-
-func TestConfigureCredentialRecoveryValidatesBeforeAWSLoadAndUsesNarrowClient(t *testing.T) {
-	t.Parallel()
-	env := validRecoveryEnvironment()
-	server := &UdpServer{}
-	loads := 0
-	err := server.configureCredentialRecovery(context.Background(), mapEnvironment(env), func(_ context.Context, region string) (aws.Config, error) {
-		loads++
-		if region != env[ConnectorCredentialRecoveryAWSRegionEnvVar] {
-			t.Fatalf("region = %q", region)
-		}
-		return aws.Config{Region: region}, nil
-	})
-	if err != nil || loads != 1 || server.credentialRecoveryHandler == nil {
-		t.Fatalf("configure = %v loads=%d handler=%T", err, loads, server.credentialRecoveryHandler)
-	}
-
-	bad := validRecoveryEnvironment()
-	bad[ConnectorCredentialRecoveryAliasARNEnvVar] = strings.Replace(
-		bad[ConnectorCredentialRecoveryAliasARNEnvVar], "cell0:active", "cell1:active", 1,
-	)
-	loads = 0
-	if err := server.configureCredentialRecovery(context.Background(), mapEnvironment(bad), func(context.Context, string) (aws.Config, error) {
-		loads++
-		return aws.Config{}, nil
-	}); !errors.Is(err, errInvalidCredentialRecoveryConfiguration) || loads != 0 {
-		t.Fatalf("invalid configure = %v loads=%d; want pre-AWS rejection", err, loads)
 	}
 }
 

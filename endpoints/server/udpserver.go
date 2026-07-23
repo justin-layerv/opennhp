@@ -634,10 +634,11 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	if err != nil {
 		return err
 	}
-	if err := s.configureCredentialRecovery(context.Background(), os.LookupEnv, loadCredentialRecoveryAWSConfig); err != nil {
-		return err
-	}
-	if err := s.configureConnectorRegistration(context.Background(), os.LookupEnv, loadConnectorRegistrationAWSConfig); err != nil {
+	if err := s.configureConnectorCellAuthority(
+		context.Background(),
+		os.LookupEnv,
+		loadConnectorCellAuthorityAWSConfig,
+	); err != nil {
 		return err
 	}
 

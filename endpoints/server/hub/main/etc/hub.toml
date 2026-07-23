@@ -14,9 +14,9 @@ previous_cookie_key = ""
 
 aws_region = "us-east-2"
 aws_account_id = "<required-12-digit-account-id>"
-issue_assignment_alias_arn = "<required-issue-assignment-active-alias-arn>"
-refresh_assignment_alias_arn = "<required-refresh-assignment-active-alias-arn>"
-issue_credential_recovery_alias_arn = "<required-issue-credential-recovery-active-alias-arn>"
+issue_assignment_alias_arn = "<required-issue-assignment-blue-or-green-alias-arn>"
+refresh_assignment_alias_arn = "<required-refresh-assignment-blue-or-green-alias-arn>"
+issue_credential_recovery_alias_arn = "<required-issue-credential-recovery-blue-or-green-alias-arn>"
 
 # Required receipt-anchored measurement/ready ladder. Deployment renders these
 # from one reviewed runtime contract; this source file intentionally contains no
