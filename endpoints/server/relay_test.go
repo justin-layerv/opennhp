@@ -2,8 +2,10 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -16,25 +18,40 @@ import (
 
 const testRelayRequestID = "AQEBAQEBAQEBAQEBAQEBAQ"
 
-func TestRelayLateEncryptReaperIsTracked(t *testing.T) {
-	s := &UdpServer{}
-	encCh := make(chan *core.MsgAssemblerData, 1)
-	s.reapLateEncryptedPacket(encCh, time.Second)
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		t.Fatal("shutdown barrier returned before the late encrypt result was reaped")
-	case <-time.After(20 * time.Millisecond):
+func TestRelayContextHelpersRejectPreCanceledBeforeWork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	socket := &recordingUDPWriteSocket{writeN: -1}
+	s := &UdpServer{udpWriteSocket: socket}
+
+	if _, err := s.buildRelayInnerReplyContext(ctx, nil, core.NHP_ACK, []byte(`{}`)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("buildRelayInnerReplyContext error = %v, want context canceled", err)
 	}
-	encCh <- nil
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("shutdown barrier did not observe the completed encrypt reaper")
+	if err := s.sendRelayReturnContext(ctx, nil, testRelayRequestID, []byte("inner")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("sendRelayReturnContext error = %v, want context canceled", err)
+	}
+	_, writes := socket.snapshot()
+	if writes != 0 {
+		t.Fatalf("pre-canceled relay response performed %d physical writes", writes)
+	}
+}
+
+func TestSendRelayReturnContextClassifiesEncodeFailure(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("create server device")
+	}
+	s := &UdpServer{device: device, udpWriteSocket: &recordingUDPWriteSocket{writeN: -1}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err := s.sendRelayReturnContext(ctx, &core.PacketParserData{}, testRelayRequestID, []byte("inner"))
+	if !errors.Is(err, errRelayReturnEncode) {
+		t.Fatalf("sendRelayReturnContext error = %v, want encode classification", err)
+	}
+	_, writes := s.udpWriteSocket.(*recordingUDPWriteSocket).snapshot()
+	if writes != 0 {
+		t.Fatalf("encode failure performed %d physical writes", writes)
 	}
 }
 
@@ -200,7 +217,8 @@ func TestDecryptRelayInnerKnock_StampsClientSourceAddr(t *testing.T) {
 	clientAddr := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444}
 	s := &UdpServer{device: serverDev}
 
-	innerPpd, cookie, conn, err := s.decryptRelayInnerKnock(innerKnock, clientAddr)
+	receivedAtNanos := time.Now().UnixNano()
+	innerPpd, cookie, conn, err := s.decryptRelayInnerKnock(innerKnock, clientAddr, receivedAtNanos)
 	if conn != nil {
 		defer conn.Close()
 	}
@@ -219,6 +237,9 @@ func TestDecryptRelayInnerKnock_StampsClientSourceAddr(t *testing.T) {
 	}
 	if innerPpd.SenderTrxId != 1234 {
 		t.Errorf("inner SenderTrxId = %d, want 1234", innerPpd.SenderTrxId)
+	}
+	if innerPpd.LocalInitTime != receivedAtNanos {
+		t.Errorf("inner receipt = %d, want inherited outer receipt %d", innerPpd.LocalInitTime, receivedAtNanos)
 	}
 }
 
@@ -293,10 +314,11 @@ func TestHandleRelayForward_Rejects(t *testing.T) {
 				t.Fatalf("marshal RelayForwardMsg: %v", err)
 			}
 			outerPpd := &core.PacketParserData{
-				HeaderType:   core.NHP_RLY,
-				RemotePubKey: tc.senderPub,
-				ConnData:     &core.ConnectionData{RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 6000}},
-				BodyMessage:  body,
+				HeaderType:    core.NHP_RLY,
+				RemotePubKey:  tc.senderPub,
+				ConnData:      &core.ConnectionData{RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 6000}},
+				BodyMessage:   body,
+				LocalInitTime: time.Now().UnixNano(),
 			}
 
 			s.HandleRelayForward(outerPpd)
@@ -468,6 +490,16 @@ func TestSendRelayReturnCarriesMaximumInnerPacket(t *testing.T) {
 	}
 	if !bytes.Equal(decoded, inner) {
 		t.Fatal("maximum inner packet changed in server relay return")
+	}
+
+	writeFailure := errors.New("injected relay write failure")
+	failingSocket := &recordingUDPWriteSocket{writeN: 0, writeErr: writeFailure}
+	s.udpWriteSocket = failingSocket
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = s.sendRelayReturnContext(ctx, outerPpd, testRelayRequestID, inner)
+	if !errors.Is(err, errRelayReturnWrite) || !errors.Is(err, writeFailure) {
+		t.Fatalf("relay write error = %v, want stage and underlying write classifications", err)
 	}
 }
 

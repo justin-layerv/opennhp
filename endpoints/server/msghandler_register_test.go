@@ -466,7 +466,7 @@ func TestBuildRelayInnerReply_HeaderTypeParameterized(t *testing.T) {
 
 			// Server synthetic-decrypts and diverts a reply of tc.headerType.
 			s := &UdpServer{device: serverDev, listenConn: serverListen}
-			innerPpd, cookie, innerConn, err := s.decryptRelayInnerKnock(innerREG, &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444})
+			innerPpd, cookie, innerConn, err := s.decryptRelayInnerKnock(innerREG, &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44444}, time.Now().UnixNano())
 			if err != nil {
 				t.Fatalf("decryptRelayInnerKnock: %v", err)
 			}

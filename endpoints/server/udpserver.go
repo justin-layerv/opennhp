@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/pion/webrtc/v4"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
@@ -117,8 +118,15 @@ type UdpServer struct {
 	listenAddr    *net.UDPAddr
 	listenAddrStr string
 	listenConn    *net.UDPConn
-	localIp       string
-	localMac      string
+	// SetWriteDeadline is socket-global. The weighted gate admits concurrent
+	// ordinary writes but makes deadline mutation exclusive; udpWriteSocket is
+	// a private test seam and is nil in production.
+	udpWriteGateOnce      sync.Once
+	udpWriteGate          *semaphore.Weighted
+	udpWriteDeadlineDirty atomic.Bool
+	udpWriteSocket        udpWriteSocket
+	localIp               string
+	localMac              string
 
 	device       *core.Device
 	httpServer   *HttpServer
@@ -2275,7 +2283,9 @@ func (s *UdpServer) SendPacket(pkt *core.Packet, conn *UdpConn) (n int, err erro
 		return len(pkt.Content), err
 	}
 
-	return s.listenConn.WriteToUDP(pkt.Content, conn.ConnData.RemoteAddr)
+	ctx, cancel := context.WithTimeout(s.LifecycleCtx(), ForwardTimeout)
+	defer cancel()
+	return s.writeUDPDatagram(ctx, pkt.Content, conn.ConnData.RemoteAddr, time.Time{})
 }
 
 // packetFromUDPDatagram copies one socket read into its owned Packet storage.
@@ -2295,7 +2305,10 @@ func (s *UdpServer) SendPacket(pkt *core.Packet, conn *UdpConn) (n int, err erro
 // rate-limit gates also avoids pool traffic for rejected floods. Do not restore
 // the old read-directly-into-a-pooled-packet path without preserving truncation
 // observability and independent ownership across the asynchronous receive queue.
-func packetFromUDPDatagram(device *core.Device, raw []byte) (*core.Packet, int, error) {
+func packetFromUDPDatagram(device *core.Device, raw []byte, receivedAtNanos int64) (*core.Packet, int, error) {
+	if receivedAtNanos <= 0 {
+		return nil, 0, fmt.Errorf("missing UDP receipt time")
+	}
 	if len(raw) < core.HeaderCommonSize {
 		return nil, 0, fmt.Errorf("packet too short")
 	}
@@ -2315,6 +2328,7 @@ func packetFromUDPDatagram(device *core.Device, raw []byte) (*core.Packet, int, 
 		copy(pkt.Content, raw)
 		pkt.Content = pkt.Content[:len(raw)]
 		pkt.HeaderType = headerType
+		pkt.ReceivedAtNanos = receivedAtNanos
 		return pkt, headerType, nil
 	}
 
@@ -2330,6 +2344,7 @@ func packetFromUDPDatagram(device *core.Device, raw []byte) (*core.Packet, int, 
 	copy(pkt.Content, raw)
 	pkt.Content = pkt.Content[:len(raw)]
 	pkt.HeaderType = headerType
+	pkt.ReceivedAtNanos = receivedAtNanos
 	return pkt, headerType, nil
 }
 
@@ -2374,6 +2389,7 @@ func (s *UdpServer) recvPacketRoutine() {
 			}
 			continue
 		}
+		recvTime := time.Now().UnixNano()
 		addrStr := remoteAddr.String()
 		// IP-only key for blockAddrMap (#1160 T3-12), rate limiter, and
 		// preCheckThreats — computed once per packet so the hot path
@@ -2406,8 +2422,7 @@ func (s *UdpServer) recvPacketRoutine() {
 			continue
 		}
 
-		recvTime := time.Now().UnixNano()
-		pkt, clearType, packetErr := packetFromUDPDatagram(s.device, readBuf[:n])
+		pkt, clearType, packetErr := packetFromUDPDatagram(s.device, readBuf[:n], recvTime)
 		if packetErr != nil {
 			s.recordPreCheckThreat(preCheckThreats, ipStr)
 			msgType := core.HeaderTypeToString(clearType)
@@ -2899,11 +2914,7 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 				}
 			}
 
-			pd := &core.PacketData{
-				BasePacket: pkt,
-				ConnData:   conn.ConnData,
-				InitTime:   atomic.LoadInt64(&conn.ConnData.LastLocalRecvTime),
-			}
+			pd := packetDataForInbound(conn.ConnData, pkt)
 			// generic receive
 			s.device.RecvPacketToMsg(pd)
 
@@ -2919,6 +2930,17 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 				log.Error("[Server] failed to send packet to %s: %v", conn.ConnData.RemoteAddr.String(), sendErr)
 			}
 		}
+	}
+}
+
+func packetDataForInbound(connData *core.ConnectionData, pkt *core.Packet) *core.PacketData {
+	// RecvQueue has exactly two production producers: packetFromUDPDatagram and
+	// packetFromWebRTCMessage. Both reject a non-positive receipt timestamp, and
+	// the asynchronous parser intentionally relies on that stamped invariant.
+	return &core.PacketData{
+		BasePacket: pkt,
+		ConnData:   connData,
+		InitTime:   pkt.ReceivedAtNanos,
 	}
 }
 

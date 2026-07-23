@@ -95,10 +95,11 @@ func buildRelayForwardOuterPpd(t *testing.T, relayPub []byte, relayAddr *net.UDP
 		t.Fatalf("marshal RelayForwardMsg: %v", err)
 	}
 	return &core.PacketParserData{
-		HeaderType:   core.NHP_RLY,
-		RemotePubKey: relayPub,
-		ConnData:     &core.ConnectionData{RemoteAddr: relayAddr},
-		BodyMessage:  rlyBytes,
+		HeaderType:    core.NHP_RLY,
+		RemotePubKey:  relayPub,
+		ConnData:      &core.ConnectionData{RemoteAddr: relayAddr},
+		BodyMessage:   rlyBytes,
+		LocalInitTime: time.Now().UnixNano(),
 	}
 }
 
@@ -902,10 +903,11 @@ func buildRelayForwardOuterPpdSrc(t *testing.T, relayPub []byte, relayAddr *net.
 		t.Fatalf("marshal RelayForwardMsg: %v", err)
 	}
 	return &core.PacketParserData{
-		HeaderType:   core.NHP_RLY,
-		RemotePubKey: relayPub,
-		ConnData:     &core.ConnectionData{RemoteAddr: relayAddr},
-		BodyMessage:  rlyBytes,
+		HeaderType:    core.NHP_RLY,
+		RemotePubKey:  relayPub,
+		ConnData:      &core.ConnectionData{RemoteAddr: relayAddr},
+		BodyMessage:   rlyBytes,
+		LocalInitTime: time.Now().UnixNano(),
 	}
 }
 

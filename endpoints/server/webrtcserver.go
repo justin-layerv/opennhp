@@ -141,6 +141,7 @@ func (w *WebRTCServer) setupDataChannel(dc *webrtc.DataChannel) {
 		if m.IsString {
 			return
 		}
+		receivedAtNanos := time.Now().UnixNano()
 		addr := &net.UDPAddr{IP: net.IPv4zero, Port: int(*dc.ID())}
 		key := addr.String()
 		w.us.remoteConnectionMapMutex.Lock()
@@ -149,13 +150,11 @@ func (w *WebRTCServer) setupDataChannel(dc *webrtc.DataChannel) {
 		if !ok {
 			return
 		}
-		pkt := w.us.device.AllocatePoolPacket()
-		copy(pkt.Buf[:], m.Data)
-		pkt.Content = pkt.Buf[:len(m.Data)]
-		if len(pkt.Content) < pkt.MinimalLength() {
-			w.us.device.ReleasePoolPacket(pkt)
+		pkt := packetFromWebRTCMessage(w.us.device, m.Data, receivedAtNanos)
+		if pkt == nil {
 			return
 		}
+		atomic.StoreInt64(&conn.ConnData.LastLocalRecvTime, receivedAtNanos)
 		atomic.AddUint64(&w.us.stats.totalRecvBytes, uint64(len(m.Data)))
 		conn.ConnData.ForwardInboundPacket(pkt)
 	})
@@ -173,6 +172,22 @@ func (w *WebRTCServer) setupDataChannel(dc *webrtc.DataChannel) {
 			conn.Close()
 		}
 	})
+}
+
+func packetFromWebRTCMessage(device *core.Device, data []byte, receivedAtNanos int64) *core.Packet {
+	// Malformed frames are unauthenticated input. Drop them without a per-frame
+	// log so an attacker cannot turn the hard size bound into log amplification.
+	if device == nil || receivedAtNanos <= 0 || len(data) < core.RelayPacketMinimalLength || len(data) > core.PacketBufferSize {
+		return nil
+	}
+	pkt := device.AllocatePoolPacket()
+	if pkt == nil {
+		return nil
+	}
+	copy(pkt.Buf[:], data)
+	pkt.Content = pkt.Buf[:len(data)]
+	pkt.ReceivedAtNanos = receivedAtNanos
+	return pkt
 }
 
 func (w *WebRTCServer) Stop() {

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,6 +13,11 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
+)
+
+var (
+	errRelayReturnEncode = errors.New("relay return encode failed")
+	errRelayReturnWrite  = errors.New("relay return write failed")
 )
 
 // ============================================================================
@@ -28,10 +35,13 @@ import (
 // from that inner cipher state. It then places those still-opaque bytes in an
 // authenticated server->relay RelayReturnMsg carrying the random RequestID.
 //
-// Both encryption layers use EncryptedPktCh because a synthetically decrypted
-// inner packet has no RemoteTransaction to forward through. The server sends
-// the outer return to the authenticated NHP_RLY packet's source; the relay
-// validates the server key and request ID before delivering the inner reply.
+// Both encryption layers are assembled synchronously because a synthetically
+// decrypted inner packet has no RemoteTransaction to forward through. That
+// keeps ownership and deadline enforcement in this request goroutine: no
+// accepted queue item can encrypt or write after the caller has given up. The
+// server sends the outer return to the authenticated NHP_RLY packet's source;
+// the relay validates the server key and request ID before delivering the inner
+// reply.
 //
 // Trust model: the relay is authenticated by Noise IK while the OUTER NHP_RLY
 // packet is decrypted — it cannot complete the handshake without the fleet
@@ -142,7 +152,7 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 	// downstream pipeline (AC pinhole source, echoed AgentAddr, log tags)
 	// attributes the real client and never the relay. Mirrors forward.go
 	// decryptForwardedKnock.
-	innerPpd, cookieBytes, innerConn, err := s.decryptRelayInnerKnock(innerBytes, sourceAddr)
+	innerPpd, cookieBytes, innerConn, err := s.decryptRelayInnerKnock(innerBytes, sourceAddr, outerPpd.LocalInitTime)
 	if innerConn != nil {
 		defer innerConn.Close()
 	}
@@ -307,12 +317,14 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 // one per forward intentionally carries no per-connection replay/flood history;
 // timestamp validation plus the relay's edge admission and in-flight bounds are
 // the authoritative controls for this relayed path.
-func (s *UdpServer) decryptRelayInnerKnock(innerBytes []byte, sourceAddr *net.UDPAddr) (*core.PacketParserData, []byte, *core.ConnectionData, error) {
-	now := time.Now().UnixNano()
+func (s *UdpServer) decryptRelayInnerKnock(innerBytes []byte, sourceAddr *net.UDPAddr, receivedAtNanos int64) (*core.PacketParserData, []byte, *core.ConnectionData, error) {
+	if receivedAtNanos <= 0 {
+		return nil, nil, nil, fmt.Errorf("missing relay receipt time")
+	}
 	conn := &core.ConnectionData{
 		Device:               s.device,
 		RemoteAddr:           sourceAddr,
-		InitTime:             now,
+		InitTime:             receivedAtNanos,
 		CookieStore:          &core.CookieStore{},
 		SendQueue:            make(chan *core.Packet, 1),
 		RecvQueue:            make(chan *core.Packet, 1),
@@ -324,7 +336,7 @@ func (s *UdpServer) decryptRelayInnerKnock(innerBytes []byte, sourceAddr *net.UD
 	pd := &core.PacketData{
 		BasePacket: &core.Packet{Content: innerBytes},
 		ConnData:   conn,
-		InitTime:   now,
+		InitTime:   receivedAtNanos,
 	}
 	innerPpd, err := s.device.PacketToMsg(pd)
 	if err != nil {
@@ -353,78 +365,79 @@ func (s *UdpServer) decryptRelayInnerKnock(innerBytes []byte, sourceAddr *net.UD
 // raw bytes on the relay transport. The caller wraps them in RelayReturnMsg so
 // the relay can correlate by random request ID rather than colliding counters.
 func (s *UdpServer) buildRelayInnerReply(innerPpd *core.PacketParserData, headerType int, body []byte) ([]byte, error) {
-	md := makeMsgData(innerPpd, headerType, body)
-	encCh := make(chan *core.MsgAssemblerData, 1)
-	md.EncryptedPktCh = encCh
-	s.device.SendMsgToPacket(md)
-
-	select {
-	case mad := <-encCh:
-		return core.ConsumeEncryptedPacket(mad)
-	case <-time.After(ForwardTimeout):
-		// The encryption worker may still deliver a mad to the buffered channel
-		// after we stop waiting; release its pool packet in the background so it
-		// isn't leaked. Bounded by a second ForwardTimeout so a dead worker
-		// (e.g. device stopping) can't leak this goroutine.
-		s.reapLateEncryptedPacket(encCh, ForwardTimeout)
-		return nil, fmt.Errorf("timeout encrypting relayed inner reply")
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), ForwardTimeout)
+	defer cancel()
+	return s.buildRelayInnerReplyContext(ctx, innerPpd, headerType, body)
 }
 
-// reapLateEncryptedPacket makes the bounded late-result drain part of graceful
-// shutdown. The dispatch wrapper owns a wg slot before the handler starts, and
-// this nested Add happens synchronously before the handler returns, so Stop
-// cannot enter wg.Wait before the drain is registered.
-func (s *UdpServer) reapLateEncryptedPacket(encCh <-chan *core.MsgAssemblerData, timeout time.Duration) {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		select {
-		case mad := <-encCh:
-			if mad != nil {
-				mad.Destroy()
-			}
-		case <-time.After(timeout):
-		}
-	}()
+func (s *UdpServer) buildRelayInnerReplyContext(ctx context.Context, innerPpd *core.PacketParserData, headerType int, body []byte) ([]byte, error) {
+	if ctx == nil {
+		return nil, context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	md := makeMsgData(innerPpd, headerType, body)
+	var packetBuffer core.PacketBuffer
+	md.ExternalPacket = &core.Packet{Buf: &packetBuffer, Content: packetBuffer[:]}
+	mad, err := s.device.MsgToPacket(md)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if mad == nil || mad.BasePacket == nil {
+		return nil, errors.New("encryption returned no relay inner packet")
+	}
+	return bytes.Clone(mad.BasePacket.Content), nil
 }
 
 // sendRelayReturn wraps an opaque agent reply in an authenticated server->relay
 // NHP_ACK envelope. The outer ACK is encrypted to the registered relay static
 // key; the inner bytes remain encrypted to the agent.
 func (s *UdpServer) sendRelayReturn(outerPpd *core.PacketParserData, requestID string, inner []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), ForwardTimeout)
+	defer cancel()
+	return s.sendRelayReturnContext(ctx, outerPpd, requestID, inner)
+}
+
+func (s *UdpServer) sendRelayReturnContext(ctx context.Context, outerPpd *core.PacketParserData, requestID string, inner []byte) error {
+	if ctx == nil {
+		return context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	body, err := json.Marshal(&common.RelayReturnMsg{
 		RequestID:   requestID,
 		InnerPacket: base64.StdEncoding.EncodeToString(inner),
 	})
 	if err != nil {
-		return fmt.Errorf("marshal RelayReturnMsg: %w", err)
+		return fmt.Errorf("%w: marshal RelayReturnMsg: %w", errRelayReturnEncode, err)
 	}
-	encCh := make(chan *core.MsgAssemblerData, 1)
 	md := makeMsgData(outerPpd, core.NHP_ACK, body)
 	// The authenticated return contains a complete standard NHP packet. Give
 	// only this outer transport a larger buffer; direct NHP replies remain capped
 	// by core.PacketBufferSize.
 	md.Compress = false
-	md.ExternalPacket = s.device.AllocateRelayPacket()
-	md.EncryptedPktCh = encCh
-	s.device.SendMsgToPacket(md)
-	select {
-	case mad := <-encCh:
-		packet, err := core.ConsumeEncryptedPacket(mad)
-		if err != nil {
-			return err
-		}
-		_, err = s.listenConn.WriteToUDP(packet, outerPpd.ConnData.RemoteAddr)
-		return err
-	case <-time.After(ForwardTimeout):
-		// The encryption worker owns the pooled outer packet until it delivers;
-		// releasing it here would race that worker. Drain a normal late result.
-		// A permanently stuck worker can retain one 6 KiB buffer, bounded by the
-		// server's fixed receive/encryption queues rather than by packet volume.
-		s.reapLateEncryptedPacket(encCh, ForwardTimeout)
-		return fmt.Errorf("timeout encrypting relay return envelope")
+	md.ExternalPacket = core.NewRelayPacket()
+	mad, err := s.device.MsgToPacket(md)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errRelayReturnEncode, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if mad == nil || mad.BasePacket == nil {
+		return fmt.Errorf("%w: encryption returned no relay envelope", errRelayReturnEncode)
+	}
+	writeDeadline, _ := ctx.Deadline()
+	n, err := s.writeUDPDatagram(ctx, mad.BasePacket.Content, outerPpd.ConnData.RemoteAddr, writeDeadline)
+	if err != nil {
+		return fmt.Errorf("%w: wrote %d of %d bytes: %w", errRelayReturnWrite, n, len(mad.BasePacket.Content), err)
+	}
+	return nil
 }
 
 // validateRelaySourceAddrSyntactic validates the shape of the relay-reported

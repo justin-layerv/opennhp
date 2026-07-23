@@ -823,7 +823,13 @@ func (d *Device) PacketToMsg(pd *PacketData) (ppd *PacketParserData, err error) 
 		return &PacketParserData{HeaderType: NHP_KPL}, nil
 	}
 
-	pd.InitTime = time.Now().UnixNano()
+	// Callers that captured an immutable transport receipt time must keep it:
+	// downstream receipt-anchored budgets must not restart after queueing or
+	// synchronous precheck work. Legacy callers that do not supply one retain
+	// the historical "now" behavior.
+	if pd.InitTime == 0 {
+		pd.InitTime = time.Now().UnixNano()
+	}
 	ppd, err = d.createPacketParserData(pd)
 	defer ppd.Destroy()
 	if err != nil {

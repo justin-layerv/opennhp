@@ -12,6 +12,33 @@ import (
 	common "github.com/OpenNHP/opennhp/nhp/common"
 )
 
+func TestLocalTransactionPreservesResponseReceiptTime(t *testing.T) {
+	device := &Device{packetToMsgQueue: make(chan *PacketData, 1)}
+	mad := &MsgAssemblerData{device: device}
+	transaction := newLocalTransaction(1, &ConnectionData{StopSignal: make(chan struct{})}, mad, 5000)
+	device.wg.Add(1)
+	go transaction.Run()
+
+	const receivedAtNanos = int64(123456789)
+	packet := &Packet{ReceivedAtNanos: receivedAtNanos}
+	if err := transaction.SendPacket(packet); err != nil {
+		t.Fatalf("SendPacket: %v", err)
+	}
+	select {
+	case pd := <-device.packetToMsgQueue:
+		if pd.InitTime != receivedAtNanos {
+			t.Fatalf("transaction response InitTime = %d, want receipt %d", pd.InitTime, receivedAtNanos)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transaction response was not handed to the decrypt queue")
+	}
+	select {
+	case <-transaction.Done():
+	case <-time.After(time.Second):
+		t.Fatal("local transaction did not complete")
+	}
+}
+
 // TestRemoteTransaction_SendMessage_Delivers verifies the happy path:
 // SendMessage on an active transaction delivers to NextMsgCh.
 func TestRemoteTransaction_SendMessage_Delivers(t *testing.T) {

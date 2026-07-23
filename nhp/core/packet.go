@@ -180,6 +180,10 @@ type Packet struct {
 	PoolAllocated bool
 	KeepAfterSend bool // only applicable for sending
 	Content       []byte
+	// ReceivedAtNanos is the immutable local transport-receipt time for an
+	// inbound packet, expressed as Unix nanoseconds. Outbound packets leave it
+	// zero.
+	ReceivedAtNanos int64
 }
 
 var relayPacketPool = sync.Pool{
@@ -369,6 +373,7 @@ func (d *Device) ReleasePoolPacket(pkt *Packet) {
 		pkt.externalBuf = nil
 		pkt.Content = nil
 		pkt.HeaderType = 0
+		pkt.ReceivedAtNanos = 0
 		relayPacketPool.Put(buf)
 		return
 	}
@@ -377,5 +382,6 @@ func (d *Device) ReleasePoolPacket(pkt *Packet) {
 		pkt.Buf = nil
 		pkt.Content = nil
 		pkt.HeaderType = 0
+		pkt.ReceivedAtNanos = 0
 	}
 }

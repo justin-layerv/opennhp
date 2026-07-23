@@ -300,10 +300,17 @@ func (t *LocalTransaction) Run() {
 
 	select {
 	case pkt := <-t.NextPacketCh:
+		initTime := pkt.ReceivedAtNanos
+		if initTime == 0 {
+			// Non-server transports do not yet stamp Packet. Preserve their
+			// historical behavior while server UDP/WebRTC responses retain the
+			// immutable receipt captured before queueing.
+			initTime = time.Now().UnixNano()
+		}
 		pd := &PacketData{
 			BasePacket:        pkt,
 			PrevAssemblerData: t.mad,
-			InitTime:          time.Now().UnixNano(),
+			InitTime:          initTime,
 		}
 
 		if !device.RecvPacketToMsg(pd) {

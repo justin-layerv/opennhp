@@ -38,6 +38,7 @@ func TestPacketMinimalLengthPanicsAfterRelease(t *testing.T) {
 		t.Fatalf("pre-release MinimalLength = %d; want > 0", got)
 	}
 	pkt.HeaderType = NHP_KNK
+	pkt.ReceivedAtNanos = 123
 
 	device.ReleasePoolPacket(pkt)
 	if pkt.Content != nil {
@@ -45,6 +46,9 @@ func TestPacketMinimalLengthPanicsAfterRelease(t *testing.T) {
 	}
 	if pkt.HeaderType != 0 {
 		t.Fatalf("ReleasePoolPacket retained HeaderType %d", pkt.HeaderType)
+	}
+	if pkt.ReceivedAtNanos != 0 {
+		t.Fatalf("ReleasePoolPacket retained receipt time %d", pkt.ReceivedAtNanos)
 	}
 
 	// Post-release: MinimalLength must panic. A caller that silently

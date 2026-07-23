@@ -57,19 +57,23 @@ func TestPacketFromUDPDatagramRelayEnvelopeBoundary(t *testing.T) {
 		t.Fatalf("maximum relay request = %d bytes, want %d", len(raw), maxRelayEnvelopeBytes)
 	}
 
-	pkt, clearType, err := packetFromUDPDatagram(serverDev, raw)
+	receivedAtNanos := time.Now().UnixNano()
+	pkt, clearType, err := packetFromUDPDatagram(serverDev, raw, receivedAtNanos)
 	if err != nil {
 		t.Fatalf("receive gate rejected maximum relay envelope: %v", err)
 	}
 	if clearType != core.NHP_RLY || pkt.Buf != nil || len(pkt.Content) != len(raw) {
 		t.Fatalf("admitted packet = type %s, pool=%v, len=%d; want external NHP_RLY len %d", core.HeaderTypeToString(clearType), pkt.Buf != nil, len(pkt.Content), len(raw))
 	}
+	if pkt.ReceivedAtNanos != receivedAtNanos {
+		t.Fatalf("relay receipt = %d, want %d", pkt.ReceivedAtNanos, receivedAtNanos)
+	}
 	ppd, err := serverDev.PacketToMsg(&core.PacketData{
 		BasePacket: pkt,
 		ConnData: &core.ConnectionData{
 			Device: serverDev, RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 44444},
 		},
-		InitTime: time.Now().UnixNano(),
+		InitTime: pkt.ReceivedAtNanos,
 	})
 	if err != nil {
 		t.Fatalf("decrypt admitted maximum relay envelope: %v", err)
@@ -82,14 +86,17 @@ func TestPacketFromUDPDatagramRelayEnvelopeBoundary(t *testing.T) {
 	preamble := binary.BigEndian.Uint32(oversizedDirect[:4])
 	_, payloadSize := (&core.Packet{Content: oversizedDirect}).HeaderTypeAndSize()
 	binary.BigEndian.PutUint32(oversizedDirect[4:8], preamble^uint32(core.NHP_KNK<<16|payloadSize))
-	if pkt, gotType, gateErr := packetFromUDPDatagram(serverDev, oversizedDirect); gateErr == nil || pkt != nil || gotType != core.NHP_KNK {
+	if pkt, gotType, gateErr := packetFromUDPDatagram(serverDev, oversizedDirect, receivedAtNanos); gateErr == nil || pkt != nil || gotType != core.NHP_KNK {
 		t.Fatalf("4097-byte direct gate = pkt %#v, type %s, err %v; want pre-crypto rejection", pkt, core.HeaderTypeToString(gotType), gateErr)
 	}
 
 	aboveTransport := make([]byte, core.RelayPacketBufferSize+1)
 	copy(aboveTransport, raw)
-	if pkt, gotType, gateErr := packetFromUDPDatagram(serverDev, aboveTransport); gateErr == nil || pkt != nil || gotType != core.NHP_RLY {
+	if pkt, gotType, gateErr := packetFromUDPDatagram(serverDev, aboveTransport, receivedAtNanos); gateErr == nil || pkt != nil || gotType != core.NHP_RLY {
 		t.Fatalf("6145-byte relay gate = pkt %#v, type %s, err %v; want observable transport rejection", pkt, core.HeaderTypeToString(gotType), gateErr)
+	}
+	if pkt, _, gateErr := packetFromUDPDatagram(serverDev, raw, 0); gateErr == nil || pkt != nil {
+		t.Fatalf("missing receipt gate = pkt %#v, err %v; want rejection", pkt, gateErr)
 	}
 }
 
@@ -130,7 +137,7 @@ func BenchmarkPacketFromUDPDatagram(b *testing.B) {
 				b.SetBytes(int64(benchmark.size))
 			}
 			for b.Loop() {
-				pkt, gotType, err := packetFromUDPDatagram(device, raw)
+				pkt, gotType, err := packetFromUDPDatagram(device, raw, 1)
 				// Rejections deliberately retain the parsed clear-header type; pin that
 				// observability contract alongside their error and nil-packet result.
 				if gotType != benchmark.headerType {
@@ -148,6 +155,42 @@ func BenchmarkPacketFromUDPDatagram(b *testing.B) {
 				device.ReleasePoolPacket(pkt)
 			}
 		})
+	}
+}
+
+func TestPacketFromUDPDatagramPreservesDirectReceipt(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("create server device")
+	}
+	raw := make([]byte, core.PacketBufferSize)
+	header := (&core.Packet{Content: raw}).Header()
+	header.SetTypeAndPayloadSize(core.NHP_KNK, len(raw)-header.Size())
+	const receivedAtNanos = int64(123456789)
+
+	pkt, clearType, err := packetFromUDPDatagram(device, raw, receivedAtNanos)
+	if err != nil {
+		t.Fatalf("packetFromUDPDatagram: %v", err)
+	}
+	defer device.ReleasePoolPacket(pkt)
+	if clearType != core.NHP_KNK || pkt.ReceivedAtNanos != receivedAtNanos {
+		t.Fatalf("direct packet type=%s receipt=%d, want NHP_KNK and %d", core.HeaderTypeToString(clearType), pkt.ReceivedAtNanos, receivedAtNanos)
+	}
+}
+
+func TestPacketDataForInboundUsesEachPacketReceipt(t *testing.T) {
+	connData := &core.ConnectionData{}
+	first := &core.Packet{ReceivedAtNanos: 101}
+	second := &core.Packet{ReceivedAtNanos: 202}
+	atomic.StoreInt64(&connData.LastLocalRecvTime, 999)
+
+	firstData := packetDataForInbound(connData, first)
+	secondData := packetDataForInbound(connData, second)
+	if firstData.InitTime != 101 || secondData.InitTime != 202 {
+		t.Fatalf("packet receipts = (%d, %d), want (101, 202)", firstData.InitTime, secondData.InitTime)
+	}
+	if firstData.InitTime == atomic.LoadInt64(&connData.LastLocalRecvTime) {
+		t.Fatal("first queued packet inherited mutable connection receipt time")
 	}
 }
 

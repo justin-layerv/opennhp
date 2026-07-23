@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"testing"
-	"time"
 )
 
 func relayBufferTestKey(fill byte) []byte {
@@ -61,19 +60,23 @@ func TestRelayExternalPacketPreservesDirectLimitAndRoundTrips(t *testing.T) {
 		t.Fatalf("outer packet length = %d, want (%d,%d]", got, PacketBufferSize, RelayPacketBufferSize)
 	}
 	wire := bytes.Clone(mad.BasePacket.Content)
+	receivedAtNanos := mad.LocalInitTime + 1
 	ppd, err := server.PacketToMsg(&PacketData{
 		BasePacket: &Packet{Content: wire},
 		ConnData: &ConnectionData{
 			Device:     server,
 			RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 62207},
 		},
-		InitTime: time.Now().UnixNano(),
+		InitTime: receivedAtNanos,
 	})
 	if err != nil {
 		t.Fatalf("decrypt external relay packet: %v", err)
 	}
 	if ppd == nil || !bytes.Equal(ppd.BodyMessage, message) {
 		t.Fatalf("external relay body mismatch: ppd=%#v", ppd)
+	}
+	if ppd.LocalInitTime != receivedAtNanos {
+		t.Fatalf("LocalInitTime = %d, want preserved receipt %d", ppd.LocalInitTime, receivedAtNanos)
 	}
 }
 
