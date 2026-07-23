@@ -206,33 +206,50 @@ func TestHandleDirectHandlesNearCeilingDuplicateFlood(t *testing.T) {
 	vectors := recoveryVectors(t)
 	const duplicate = `"aspId":"other","usrData":{"query":"ordinary"},`
 	const exact = `"aspId":"agent","usrData":{"query":"agent_credential_recovery"}`
-	var body strings.Builder
-	body.Grow(core.MaxDecompressedBodySize)
-	body.WriteByte('{')
-	for body.Len()+len(duplicate)+len(exact)+1 <= core.MaxDecompressedBodySize {
-		body.WriteString(duplicate)
-	}
-	body.WriteString(exact)
-	body.WriteByte('}')
-	if body.Len() < core.MaxDecompressedBodyWarnSize {
-		t.Fatalf("adversarial body is only %d bytes", body.Len())
+	duplicateFlood := func(limit int) []byte {
+		var body strings.Builder
+		body.Grow(limit)
+		body.WriteByte('{')
+		for body.Len()+len(duplicate)+len(exact)+1 <= limit {
+			body.WriteString(duplicate)
+		}
+		body.WriteString(exact)
+		body.WriteByte('}')
+		return []byte(body.String())
 	}
 
-	bodyBytes := []byte(body.String())
-	if allocs := testing.AllocsPerRun(10, func() {
-		if !routeCompletionIntent(bodyBytes) {
-			panic("near-ceiling exact-last intent was not routed")
-		}
-	}); allocs > 4 {
-		// Regular builds measure zero; race/compiler instrumentation may account
-		// for a couple. This small ceiling still catches the old ~1.2M-allocation
-		// encoding/json duplicate scan without coupling the test to a toolchain.
-		t.Fatalf("route probe allocations = %.0f, want at most 4", allocs)
+	baselineBody := []byte("{" + duplicate + exact + "}")
+	const allocationProbeSize = 64 << 10
+	allocationBody := duplicateFlood(allocationProbeSize)
+	nearCeilingBody := duplicateFlood(core.MaxDecompressedBodySize)
+	if len(nearCeilingBody) < core.MaxDecompressedBodyWarnSize {
+		t.Fatalf("adversarial body is only %d bytes", len(nearCeilingBody))
+	}
+
+	probeAllocs := func(raw []byte) float64 {
+		return testing.AllocsPerRun(10, func() {
+			if !routeCompletionIntent(raw) {
+				panic("exact-last intent was not routed")
+			}
+		})
+	}
+	baselineAllocs := probeAllocs(baselineBody)
+	largeAllocs := probeAllocs(allocationBody)
+	const allocationNoiseBudget = 16
+	if growth := largeAllocs - baselineAllocs; growth > allocationNoiseBudget {
+		// The margin covers fixed race/runtime measurement noise while remaining
+		// tiny beside the old encoding/json scan's thousands of duplicate-driven
+		// allocations at 64 KiB. Revalidate this invariant on a toolchain that
+		// introduces input-sized instrumentation instead of raising the budget.
+		t.Fatalf(
+			"route probe allocation growth = %.1f (small %.1f, 64 KiB %.1f), want at most %d",
+			growth, baselineAllocs, largeAllocs, allocationNoiseBudget,
+		)
 	}
 
 	authority := &fakeAuthority{}
 	result, handled := mustHandler(t, authority).HandleDirect(
-		liveContext(t), bodyBytes, decodedPeer(t, vectors),
+		liveContext(t), nearCeilingBody, decodedPeer(t, vectors),
 	)
 	want, err := EncodeCompletionError(CompletionErrorInvalidRequest)
 	if err != nil {
