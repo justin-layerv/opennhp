@@ -70,3 +70,33 @@ func TestRouteCompletionIntentDeepCompositeIsIterative(t *testing.T) {
 		t.Fatal("deep unrelated composite routed as recovery")
 	}
 }
+
+func TestRegistrationIntentRoutingOwnsExactAgentWithoutLossyDecode(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		body       string
+		wantOTPREG bool
+		wantLST    bool
+	}{
+		{name: "agent registration", body: `{"aspId":"agent","usrData":{"assignment_ticket":"t"}}`, wantOTPREG: true},
+		{name: "escaped agent", body: `{"asp\u0049d":"ag\u0065nt"`, wantOTPREG: true},
+		{name: "agent completion", body: `{"usrData":{"query":"agent_registration_completion"},"aspId":"agent"}`, wantOTPREG: true, wantLST: true},
+		{name: "malformed exact completion", body: `{"aspId":"agent","usrData":{"query":"agent_registration_completion"`, wantOTPREG: true, wantLST: true},
+		{name: "other asp", body: `{"aspId":"passcode","usrData":{"query":"agent_registration_completion"}}`},
+		{name: "nested agent", body: `{"other":{"aspId":"agent"}}`},
+		{name: "other agent query", body: `{"aspId":"agent","usrData":{"query":"cell_assignment"}}`, wantOTPREG: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsRegistrationOTPIntent([]byte(test.body)); got != test.wantOTPREG {
+				t.Errorf("IsRegistrationOTPIntent = %v, want %v", got, test.wantOTPREG)
+			}
+			if got := IsRegistrationIntent([]byte(test.body)); got != test.wantOTPREG {
+				t.Errorf("IsRegistrationIntent = %v, want %v", got, test.wantOTPREG)
+			}
+			if got := IsRegistrationCompletionIntent([]byte(test.body)); got != test.wantLST {
+				t.Errorf("IsRegistrationCompletionIntent = %v, want %v", got, test.wantLST)
+			}
+		})
+	}
+}

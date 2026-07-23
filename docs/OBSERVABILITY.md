@@ -39,6 +39,8 @@ Direct SDK UDP telemetry belongs to the assigned cell's public NHP server NLB
 and server metrics. Deployment evidence includes a real external UDP 62206
 round trip to that server NLB plus listener/SG/Flow proof that no public UDP
 listener other than 62206 exists. A UDP timeout alone is not closure evidence.
+The [assigned-cell registration design](design/CONNECTOR_ASSIGNED_CELL_REGISTRATION.md)
+defines its dark-startup, direct-ingress, metric, and activation contracts.
 
 The Resolver log group's `BLOCK` events produce the no-dimension
 `LayerV/NHP/RelayDmzDnsBlocked` metric. The

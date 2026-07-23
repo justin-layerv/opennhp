@@ -7,13 +7,14 @@ import (
 	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
-// OTPRateLimiter is a pre-plugin token-bucket limiter for NHP-native agent OTP
-// requests (NHP_OTP, both the direct HandleOTPRequest path and the relayed
-// HandleRelayForward path). It is keyed by the inner device pubkey b64
-// (base64.StdEncoding.EncodeToString(ppd.RemotePubKey)) — the cryptographically
-// authenticated agent identity, not a spoofable message field — so a single
-// registering agent cannot flood the credential issuer with OTP requests (each
-// of which costs an email downstream).
+// OTPRateLimiter is a pre-plugin token-bucket limiter for every native-UDP
+// NHP_OTP request and for generic requests on non-direct ingress that are not
+// claimed as Connector registration. Configured Connector registration on
+// non-direct ingress is rejected before this limiter and counted by
+// MetricConnectorRegistrationIngressRejected. The limiter is keyed by the
+// inner device pubkey b64 (base64.StdEncoding.EncodeToString(ppd.RemotePubKey))
+// — the cryptographically authenticated agent identity, not a spoofable message
+// field — so one agent cannot flood the downstream OTP issuer.
 //
 // It mirrors IPRateLimiter (ratelimiter.go): a limiter-wide mutex guards each
 // Get-then-refill-then-decrement sequence, and per-key buckets live in an
@@ -110,26 +111,24 @@ type OTPRateLimiterConfig struct {
 // above one honest agent's need, well below a flood", which this is, and the
 // authoritative limits live in qurl-service (Q2) anyway.
 //
-// SIZING NOTE (revisit before N3 makes this path reachable): the ~30/min GLOBAL
-// bucket caps AGGREGATE OTP across every key, so a legitimate correlated burst
-// — an enterprise rolling the agent to hundreds of devices on day one — would
-// exhaust it and get silently dropped (default-deny), and on the relay path the
-// client already saw HTTP 202. Before the flow is switched on, size GlobalCapacity/
-// GlobalRate for expected bulk-enrollment peaks and put an alarm on
-// MetricOTPRejectRateLimited so operators see the shed rather than users
-// seeing "accepted, no email". Tracked in T1 (alarms).
+// SIZING NOTE: the ~30/min GLOBAL bucket caps aggregate OTP across every key, so
+// a legitimate correlated burst — an enterprise rolling the agent to hundreds
+// of devices on day one — would exhaust it and get silently dropped
+// (default-deny). For generic relayed OTP
+// that reaches this limiter, the client already saw HTTP 202; configured
+// Connector registration over relay never reaches this point. Before enabling
+// a flow that uses the limiter, size GlobalCapacity/GlobalRate for expected
+// bulk-enrollment peaks and alarm on MetricOTPRejectRateLimited so operators see
+// the shed rather than users seeing "accepted, no email". Tracked in T1.
 //
-// UPSTREAM (RELAY-SIDE) BOUND — DEFENSE-IN-DEPTH GAP: on the relayed path, an OTP
-// forward is fire-and-forget — the relay releases its per-server in-flight slot as
-// soon as it forwards (no reply is awaited), so that slot budget does NOT throttle
-// OTP request RATE the way it does a reply-bearing knock. The only rate bounds an
-// OTP flood actually hits are therefore (1) the relay's per-source-IP UDP limiter
-// (shared with legitimate knocks from that IP) and (2) THIS server-side pre-plugin
-// limiter. A single source rotating device keys behind one IP is bounded by the
-// per-IP UDP limiter + this GLOBAL bucket, but a distributed source is bounded only
-// by this global bucket. If real-world abuse shows that is too coarse, a dedicated
-// relay-side OTP throttle (per-source, on the forward path) may be warranted — call
-// it out here rather than silently assume the knock-path slot accounting covers OTP.
+// UPSTREAM (RELAY-SIDE) BOUND — DEFENSE-IN-DEPTH GAP: on the generic relayed
+// path, an OTP forward is fire-and-forget — the relay releases its per-server
+// in-flight slot as soon as it forwards, so that slot budget does not throttle
+// request rate like it does for a reply-bearing knock. Traffic that reaches this
+// path is bounded by the relay's per-source-IP UDP limiter and this server-side
+// global bucket. Configured Connector lifecycle traffic instead stops at the
+// ingress-rejection gate. If generic relay abuse shows this bound is too coarse,
+// a dedicated relay-side OTP throttle may be warranted.
 func DefaultOTPRateLimiterConfig() OTPRateLimiterConfig {
 	return OTPRateLimiterConfig{
 		Capacity:       3,

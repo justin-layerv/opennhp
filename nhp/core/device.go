@@ -802,6 +802,7 @@ func (d *Device) packetToMsgRoutine(id int) {
 				if d.IsTransactionRequest(ppd.HeaderType) {
 					// ppd is owned and to be destroyed by transaction
 					t := newRemoteTransaction(ppd.SenderTrxId, ppd.ConnData, ppd, d.RemoteTransactionTimeout())
+					ppd.owningRemoteTransaction = t
 					ppd.ConnData.AddRemoteTransaction(t)
 					log.Debug("IsTransactionRequest:true")
 				}

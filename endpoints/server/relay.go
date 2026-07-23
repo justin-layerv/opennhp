@@ -194,9 +194,11 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		return
 	}
 
-	// Dispatch through the same handlers used by direct traffic. RequestID only
-	// changes the authenticated relay return transport; it must not fork direct
-	// OTP/REG/LST semantics, rate limits, plugin loading, metrics, or error mapping.
+	// Browser relay carries application KNK/RKN/EXT, not Connector lifecycle.
+	// During the staged cutover, an active Connector registration composition
+	// claims its exact OTP/REG/completion intents here and drops them before
+	// Authority or legacy plugin dispatch. Other ASPs retain their existing relay
+	// behavior until the separate relay-retirement change removes that surface.
 	switch {
 	case core.IsForwardableKnockType(innerPpd.HeaderType):
 		if !isRoutablePublicIP(sourceAddr.IP) {
@@ -214,6 +216,9 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		// DHP only appraises device evidence and does not open an AC pinhole, so
 		// keep the syntactic source check without imposing the public-IP knock gate.
 	case innerPpd.HeaderType == core.NHP_OTP:
+		if s.rejectConnectorRegistrationOutsideDirectUDP(innerPpd, connectorRegistrationOTP) {
+			return
+		}
 		// Fire-and-forget: the relay has no pending waiter for OTP.
 		s.metrics.IncrCounter(MetricRelayOTP)
 		if otpErr := s.dispatchOTP(innerPpd); otpErr != nil {
@@ -223,6 +228,9 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		}
 		return
 	case innerPpd.HeaderType == core.NHP_REG:
+		if s.rejectConnectorRegistrationOutsideDirectUDP(innerPpd, connectorRegistrationActivation) {
+			return
+		}
 		s.metrics.IncrCounter(MetricRelayRegister)
 		keyPrefix := pubkeyLogPrefix(base64.StdEncoding.EncodeToString(innerPpd.RemotePubKey))
 		rakBytes, buildErr := s.buildRegisterAck(innerPpd)
@@ -243,6 +251,9 @@ func (s *UdpServer) HandleRelayForward(outerPpd *core.PacketParserData) {
 		}
 		return
 	case innerPpd.HeaderType == core.NHP_LST:
+		if s.rejectConnectorRegistrationOutsideDirectUDP(innerPpd, connectorRegistrationCompletion) {
+			return
+		}
 		// Native credential recovery is assigned-cell direct UDP only. Recognize
 		// exact intent (including malformed duplicate/unknown/trailing forms),
 		// wipe its decrypted body, and return one fixed 52414 without entering
@@ -324,6 +335,7 @@ func (s *UdpServer) decryptRelayInnerKnock(innerBytes []byte, sourceAddr *net.UD
 	conn := &core.ConnectionData{
 		Device:               s.device,
 		RemoteAddr:           sourceAddr,
+		IngressTransport:     core.IngressTransportRelayed,
 		InitTime:             receivedAtNanos,
 		CookieStore:          &core.CookieStore{},
 		SendQueue:            make(chan *core.Packet, 1),

@@ -67,8 +67,40 @@ func TestConstructorsAcceptExactActiveAliasARNs(t *testing.T) {
 	if _, err := NewCellClient(cfg, boundary, validCellTargets()); err != nil {
 		t.Fatalf("NewCellClient: %v", err)
 	}
+	if _, err := NewRegistrationCellClient(cfg, boundary, validRegistrationCellTargets()); err != nil {
+		t.Fatalf("NewRegistrationCellClient: %v", err)
+	}
 	if _, err := NewCredentialRecoveryCellClient(cfg, boundary, validCredentialRecoveryCellTarget()); err != nil {
 		t.Fatalf("NewCredentialRecoveryCellClient: %v", err)
+	}
+}
+
+func TestRegistrationCellTargetsRequireThreeDistinctAliases(t *testing.T) {
+	t.Parallel()
+	boundary := Boundary{AccountID: testAccountID, Region: testRegion}
+	for _, test := range []struct {
+		name   string
+		mutate func(*RegistrationCellTargets)
+		field  string
+	}{
+		{name: "missing OTP", mutate: func(targets *RegistrationCellTargets) { targets.IssueRegistrationOTPAliasARN = "" }, field: "issue_registration_otp"},
+		{name: "missing activation", mutate: func(targets *RegistrationCellTargets) { targets.ActivateRegistrationAliasARN = "" }, field: "activate_registration"},
+		{name: "missing completion", mutate: func(targets *RegistrationCellTargets) { targets.CompleteRegistrationAliasARN = "" }, field: "complete_registration"},
+		{name: "duplicate", mutate: func(targets *RegistrationCellTargets) {
+			targets.CompleteRegistrationAliasARN = targets.ActivateRegistrationAliasARN
+		}, field: "complete_registration"},
+		{name: "numeric qualifier", mutate: func(targets *RegistrationCellTargets) {
+			targets.IssueRegistrationOTPAliasARN = aliasARN("IssueRegistrationOTP-cell0", "7")
+		}, field: "issue_registration_otp"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			targets := validRegistrationCellTargets()
+			test.mutate(&targets)
+			var configErr *ConfigError
+			if err := ValidateRegistrationCellTargets(boundary, targets); !errors.As(err, &configErr) || configErr.Field != test.field {
+				t.Fatalf("error=%#v, want field %q", err, test.field)
+			}
+		})
 	}
 }
 
@@ -200,6 +232,14 @@ func validCellTargets() CellTargets {
 		ActivateRegistrationAliasARN:       aliasARN("ActivateRegistration-cell0", "active"),
 		CompleteRegistrationAliasARN:       aliasARN("CompleteRegistration-cell0", "active"),
 		CompleteCredentialRecoveryAliasARN: aliasARN("CompleteCredentialRecovery-cell0", "active"),
+	}
+}
+
+func validRegistrationCellTargets() RegistrationCellTargets {
+	return RegistrationCellTargets{
+		IssueRegistrationOTPAliasARN: aliasARN("IssueRegistrationOTP-cell0", "active"),
+		ActivateRegistrationAliasARN: aliasARN("ActivateRegistration-cell0", "active"),
+		CompleteRegistrationAliasARN: aliasARN("CompleteRegistration-cell0", "active"),
 	}
 }
 

@@ -40,6 +40,14 @@ type CellTargets struct {
 	CompleteCredentialRecoveryAliasARN string
 }
 
+// RegistrationCellTargets is the exact three-alias capability set available
+// to the assigned-cell registration composition.
+type RegistrationCellTargets struct {
+	IssueRegistrationOTPAliasARN string
+	ActivateRegistrationAliasARN string
+	CompleteRegistrationAliasARN string
+}
+
 // CredentialRecoveryCellTarget is the one alias available to the dedicated
 // assigned-cell recovery composition. Keeping it separate from CellTargets
 // makes least privilege structural: this client cannot invoke OTP or either
@@ -91,6 +99,37 @@ func NewCellClient(cfg aws.Config, boundary Boundary, targets CellTargets) (*Cel
 	return newCellClient(newLambdaClient(cfg), targets), nil
 }
 
+// NewRegistrationCellClient constructs a registration-only cell client with a
+// single-attempt Lambda SDK client.
+func NewRegistrationCellClient(
+	cfg aws.Config,
+	boundary Boundary,
+	targets RegistrationCellTargets,
+) (*RegistrationCellClient, error) {
+	if err := ValidateRegistrationCellTargets(boundary, targets); err != nil {
+		return nil, err
+	}
+	if err := validateSDKRegion(cfg, boundary); err != nil {
+		return nil, err
+	}
+	return newRegistrationCellClient(newLambdaClient(cfg), targets), nil
+}
+
+// ValidateRegistrationCellTargets validates the transitional dark-only
+// registration subset before ambient AWS configuration is loaded or a listener
+// binds. Before reachability, the shared cell-target validator replaces its
+// :active contract with one common blue/green registration-and-recovery graph.
+func ValidateRegistrationCellTargets(boundary Boundary, targets RegistrationCellTargets) error {
+	if err := validateBoundaryValues(boundary); err != nil {
+		return err
+	}
+	return validateTargets(boundary,
+		targetSpec{"issue_registration_otp", targets.IssueRegistrationOTPAliasARN},
+		targetSpec{"activate_registration", targets.ActivateRegistrationAliasARN},
+		targetSpec{"complete_registration", targets.CompleteRegistrationAliasARN},
+	)
+}
+
 // NewCredentialRecoveryCellClient constructs the completion-only assigned-cell
 // client with a single-attempt Lambda SDK client.
 func NewCredentialRecoveryCellClient(
@@ -137,6 +176,15 @@ func newCellClient(api invokeAPI, targets CellTargets) *CellClient {
 		activateRegistration:       targets.ActivateRegistrationAliasARN,
 		completeRegistration:       targets.CompleteRegistrationAliasARN,
 		completeCredentialRecovery: targets.CompleteCredentialRecoveryAliasARN,
+	}
+}
+
+func newRegistrationCellClient(api invokeAPI, targets RegistrationCellTargets) *RegistrationCellClient {
+	return &RegistrationCellClient{
+		invoker:              invoker{api: api},
+		issueRegistrationOTP: targets.IssueRegistrationOTPAliasARN,
+		activateRegistration: targets.ActivateRegistrationAliasARN,
+		completeRegistration: targets.CompleteRegistrationAliasARN,
 	}
 }
 

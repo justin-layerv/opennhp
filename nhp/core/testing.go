@@ -1,6 +1,9 @@
 package core
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // NewRemoteTransactionForTest constructs a RemoteTransaction with only
 // the fields tests need — id, message channel, and a fresh done channel
@@ -11,9 +14,46 @@ func NewRemoteTransactionForTest(id uint64, ch chan *MsgData) *RemoteTransaction
 	return &RemoteTransaction{
 		transactionId: id,
 		NextMsgCh:     ch,
+		complete:      make(chan struct{}),
 		done:          make(chan struct{}),
 		testCloseOnce: &sync.Once{},
 	}
+}
+
+// StartRemoteTransactionForTest starts the production RemoteTransaction.Run
+// lifecycle for a synchronously decrypted request. PacketToMsg deliberately
+// does not install transactions (the async packet-to-message routine normally
+// owns that step), so end-to-end transport tests use this helper instead of a
+// channel-only stand-in when they need to exercise responder completion and
+// cleanup exactly as production does.
+func StartRemoteTransactionForTest(parserData *PacketParserData, timeout time.Duration) *RemoteTransaction {
+	timeoutMillis := int(timeout / time.Millisecond)
+	if parserData == nil || parserData.ConnData == nil || timeoutMillis <= 0 {
+		return nil
+	}
+	// PacketToMsg has already called Destroy before returning the parser. Give
+	// Run a cleanup-only shallow copy with no packet ownership so its production
+	// defer cannot release the same pooled packet twice.
+	cleanupParser := *parserData
+	cleanupParser.basePacket = nil
+	cleanupParser.digestHash = nil
+	cleanupParser.chainHash = nil
+	cleanupParser.owningRemoteTransaction = nil
+	if cleanupParser.device == nil {
+		// Synthetic endpoint tests do not have access to PacketParserData's
+		// unexported device field. A zero Device is sufficient for the cleanup-only
+		// parser because ReleasePoolPacket is nil-safe.
+		cleanupParser.device = &Device{}
+	}
+	transaction := newRemoteTransaction(
+		parserData.SenderTrxId,
+		parserData.ConnData,
+		&cleanupParser,
+		timeoutMillis,
+	)
+	parserData.owningRemoteTransaction = transaction
+	parserData.ConnData.AddRemoteTransaction(transaction)
+	return transaction
 }
 
 // CloseForTest closes the transaction's done channel so SendMessage

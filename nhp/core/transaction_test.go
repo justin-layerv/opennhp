@@ -127,6 +127,165 @@ func TestRemoteTransactionSendMessageContextPreCanceledNeverDelivers(t *testing.
 	}
 }
 
+func TestRemoteTransactionCompleteContextDelivers(t *testing.T) {
+	tx := NewRemoteTransactionForTest(1, make(chan *MsgData))
+	t.Cleanup(tx.CloseForTest)
+	received := make(chan struct{})
+	go func() {
+		<-tx.complete
+		close(received)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := tx.CompleteContext(ctx); err != nil {
+		t.Fatalf("CompleteContext: %v", err)
+	}
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatal("completion receiver did not observe rendezvous")
+	}
+}
+
+func TestRemoteTransactionCompleteContextDeadlineHasNoLateDelivery(t *testing.T) {
+	tx := NewRemoteTransactionForTest(1, make(chan *MsgData))
+	t.Cleanup(tx.CloseForTest)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := tx.CompleteContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CompleteContext error = %v, want deadline exceeded", err)
+	}
+
+	// A timed-out goroutine sender could finish the transaction after its caller
+	// had already classified the response as censored. Making the receiver ready
+	// after the deadline must not observe a stale completion.
+	select {
+	case <-tx.complete:
+		t.Fatal("late completion delivered after deadline")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestRemoteTransactionCompleteContextPreCanceledNeverDelivers(t *testing.T) {
+	tx := NewRemoteTransactionForTest(1, make(chan *MsgData))
+	t.Cleanup(tx.CloseForTest)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := tx.CompleteContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CompleteContext error = %v, want context canceled", err)
+	}
+	select {
+	case <-tx.complete:
+		t.Fatal("pre-canceled completion was delivered")
+	default:
+	}
+}
+
+func TestRemoteTransactionCompleteContextAfterClose(t *testing.T) {
+	tx := NewRemoteTransactionForTest(1, make(chan *MsgData))
+	tx.CloseForTest()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := tx.CompleteContext(ctx); !errors.Is(err, common.ErrTransactionClosed) {
+		t.Fatalf("CompleteContext error = %v, want ErrTransactionClosed", err)
+	}
+}
+
+func TestRemoteTransactionCompleteContextRejectsIncompleteTransaction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for _, tx := range []*RemoteTransaction{
+		nil,
+		{done: make(chan struct{})},
+		{complete: make(chan struct{})},
+	} {
+		if err := tx.CompleteContext(ctx); !errors.Is(err, common.ErrTransactionClosed) {
+			t.Fatalf("CompleteContext error = %v, want ErrTransactionClosed", err)
+		}
+	}
+}
+
+func TestRemoteTransactionCompleteContextCloseRace(t *testing.T) {
+	tx := NewRemoteTransactionForTest(1, make(chan *MsgData))
+
+	const callers = 32
+	results := make(chan error, callers)
+	for range callers {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			results <- tx.CompleteContext(ctx)
+		}()
+	}
+	tx.CloseForTest()
+
+	for range callers {
+		select {
+		case err := <-results:
+			if !errors.Is(err, common.ErrTransactionClosed) {
+				t.Fatalf("CompleteContext error = %v, want ErrTransactionClosed", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("CompleteContext remained blocked after transaction close")
+		}
+	}
+}
+
+func TestRemoteTransactionCleanupPreservesSameIDReplacement(t *testing.T) {
+	conn := &ConnectionData{
+		RemoteTransactionMap: make(map[uint64]*RemoteTransaction),
+		StopSignal:           make(chan struct{}),
+	}
+	firstParser := &PacketParserData{
+		device:      &Device{},
+		ConnData:    conn,
+		SenderTrxId: 77,
+	}
+	first := StartRemoteTransactionForTest(firstParser, time.Second)
+	if first == nil || firstParser.OwningRemoteTransaction() != first {
+		t.Fatal("first parser did not carry its owning transaction")
+	}
+	secondParser := &PacketParserData{
+		device:      &Device{},
+		ConnData:    conn,
+		SenderTrxId: 77,
+	}
+	second := StartRemoteTransactionForTest(secondParser, time.Second)
+	if second == nil || secondParser.OwningRemoteTransaction() != second {
+		t.Fatal("second parser did not carry its owning transaction")
+	}
+	if got := conn.FindRemoteTransaction(77); got != second {
+		t.Fatalf("same-id replacement = %p, want second owner %p", got, second)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := first.CompleteContext(ctx); err != nil {
+		t.Fatalf("complete first owner: %v", err)
+	}
+	select {
+	case <-first.Done():
+	case <-time.After(time.Second):
+		t.Fatal("first owner did not finish")
+	}
+	if got := conn.FindRemoteTransaction(77); got != second {
+		t.Fatalf("first cleanup removed replacement: got %p, want %p", got, second)
+	}
+
+	if err := second.CompleteContext(ctx); err != nil {
+		t.Fatalf("complete second owner: %v", err)
+	}
+	select {
+	case <-second.Done():
+	case <-time.After(time.Second):
+		t.Fatal("second owner did not finish")
+	}
+	if got := conn.FindRemoteTransaction(77); got != nil {
+		t.Fatalf("second cleanup retained map entry %p", got)
+	}
+}
+
 // TestRemoteTransaction_SendRacesClose stress-tests the exact race that
 // caused the production crash: many goroutines concurrently call
 // SendMessage while another goroutine signals the transaction as closed.

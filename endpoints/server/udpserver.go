@@ -285,6 +285,17 @@ type UdpServer struct {
 	// plugin handlers
 	pluginHandlerMapMutex sync.RWMutex
 	pluginHandlerMap      map[string]plugins.PluginHandler
+	// connectorRegistrationHandler is the strict qURL Connector assigned-cell
+	// OTP/activation/completion capability. Nil is the dark, absent-config state.
+	// It is constructed before the listener binds and intercepts only exact
+	// top-level aspId=agent registration intent before generic plugin dispatch.
+	connectorRegistrationHandler connectorRegistrationHandler
+	// connectorRegistrationTiming is populated atomically with the handler from
+	// the same all-or-none startup contract. It has no runtime defaults.
+	connectorRegistrationTiming connectorRegistrationTiming
+	// observeConnectorRegistrationRejectedBodyCleared is a TEST-ONLY SEAM proving
+	// registration secrets rejected on non-direct ingress are cleared before return.
+	observeConnectorRegistrationRejectedBodyCleared func([]byte)
 	// credentialRecoveryHandler is the direct-UDP-only assigned-cell recovery
 	// capability. Nil is the dark, absent-configuration state. It is constructed
 	// once during Start before the listener binds and is never exposed to relay or
@@ -371,10 +382,10 @@ type UdpServer struct {
 	rateLimitDrops atomic.Int64 // total dropped packets, for sampled logging
 
 	// Pre-plugin OTP rate limiter, keyed by the inner device pubkey (b64), for
-	// both the direct (HandleOTPRequest) and relayed (HandleRelayForward)
-	// NHP_OTP dispatch. Defense-in-depth against per-key OTP/email floods; the
-	// authoritative limits live qurl-service-side (Q2). Nil means unbounded — a
-	// test-only affordance; the constructor initializes it in production. See
+	// every native-UDP NHP_OTP and generic non-direct NHP_OTP not claimed as
+	// Connector registration. Configured Connector registration on non-direct
+	// ingress is rejected before this limiter. Nil means unbounded — a test-only
+	// affordance; the constructor initializes it in production. See
 	// agent_otp_ratelimit.go.
 	otpRateLimiter *OTPRateLimiter
 
@@ -624,6 +635,9 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		return err
 	}
 	if err := s.configureCredentialRecovery(context.Background(), os.LookupEnv, loadCredentialRecoveryAWSConfig); err != nil {
+		return err
+	}
+	if err := s.configureConnectorRegistration(context.Background(), os.LookupEnv, loadConnectorRegistrationAWSConfig); err != nil {
 		return err
 	}
 
@@ -912,9 +926,10 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	log.Info("UDP rate limiter initialized: %.0f pps sustained, %d burst per source IP",
 		rlCfg.Rate, rlCfg.Burst)
 
-	// Initialize the pre-plugin OTP rate limiter (keyed by device pubkey). Guards
-	// the OTP dispatch — direct and relayed — before the plugin/email cost. This
-	// is defense-in-depth; the authoritative limits are qurl-service-side (Q2).
+	// Initialize the pre-plugin OTP rate limiter (keyed by device pubkey). It
+	// guards every native-UDP OTP and generic non-direct OTP not claimed as
+	// Connector registration; configured Connector registration on non-direct
+	// ingress is rejected before the limiter.
 	otpCfg := DefaultOTPRateLimiterConfig()
 	s.otpRateLimiter = NewOTPRateLimiter(otpCfg)
 	log.Info("OTP rate limiter initialized: capacity %d, refill 1 per %s per key, global ~%.1f/min",
@@ -2497,6 +2512,7 @@ func (s *UdpServer) recvPacketRoutine() {
 				Device:               s.device,
 				LocalAddr:            s.listenAddr,
 				RemoteAddr:           remoteAddr,
+				IngressTransport:     core.IngressTransportDirectUDP,
 				CookieStore:          &core.CookieStore{},
 				RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
 				SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),

@@ -6,3 +6,4 @@ import (
 )
 
 var _ connectorcell.RegistrationAuthority = (*connectorauthority.CellClient)(nil)
+var _ connectorcell.RegistrationAuthority = (*connectorauthority.RegistrationCellClient)(nil)

@@ -41,6 +41,7 @@ func TestHubAndCellCapabilitiesAreStructurallySeparated(t *testing.T) {
 
 	hubMethods := exportedMethods(reflect.TypeOf((*HubClient)(nil)))
 	cellMethods := exportedMethods(reflect.TypeOf((*CellClient)(nil)))
+	registrationMethods := exportedMethods(reflect.TypeOf((*RegistrationCellClient)(nil)))
 	recoveryMethods := exportedMethods(reflect.TypeOf((*CredentialRecoveryCellClient)(nil)))
 
 	wantHub := []string{"IssueAssignment", "IssueCredentialRecovery", "RefreshAssignment"}
@@ -50,6 +51,9 @@ func TestHubAndCellCapabilitiesAreStructurallySeparated(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cellMethods, wantCell) {
 		t.Fatalf("CellClient methods = %v, want %v", cellMethods, wantCell)
+	}
+	if want := []string{"ActivateRegistration", "CompleteRegistration", "IssueRegistrationOTP"}; !reflect.DeepEqual(registrationMethods, want) {
+		t.Fatalf("RegistrationCellClient methods = %v, want %v", registrationMethods, want)
 	}
 	if want := []string{"CompleteCredentialRecovery"}; !reflect.DeepEqual(recoveryMethods, want) {
 		t.Fatalf("CredentialRecoveryCellClient methods = %v, want %v", recoveryMethods, want)
@@ -68,6 +72,50 @@ func TestCredentialRecoveryCellClientUsesOnlyPinnedAliasAndOneAttempt(t *testing
 	if len(api.inputs) != 1 || api.inputs[0].FunctionName == nil ||
 		*api.inputs[0].FunctionName != target.CompleteCredentialRecoveryAliasARN || len(api.options) != 1 || api.options[0] != 0 {
 		t.Fatalf("invocations = %#v options=%v", api.inputs, api.options)
+	}
+}
+
+func TestRegistrationCellClientUsesOnlyPinnedAliasesAndOneAttempt(t *testing.T) {
+	t.Parallel()
+	targets := validRegistrationCellTargets()
+	tests := []struct {
+		name   string
+		target string
+		call   func(*RegistrationCellClient, context.Context, []byte) ([]byte, error)
+	}{
+		{
+			name: "issue OTP", target: targets.IssueRegistrationOTPAliasARN,
+			call: func(client *RegistrationCellClient, ctx context.Context, payload []byte) ([]byte, error) {
+				return client.IssueRegistrationOTP(ctx, payload)
+			},
+		},
+		{
+			name: "activate", target: targets.ActivateRegistrationAliasARN,
+			call: func(client *RegistrationCellClient, ctx context.Context, payload []byte) ([]byte, error) {
+				return client.ActivateRegistration(ctx, payload)
+			},
+		},
+		{
+			name: "complete", target: targets.CompleteRegistrationAliasARN,
+			call: func(client *RegistrationCellClient, ctx context.Context, payload []byte) ([]byte, error) {
+				return client.CompleteRegistration(ctx, payload)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			api := &fakeInvokeAPI{output: &lambda.InvokeOutput{StatusCode: http.StatusOK, Payload: []byte(`{"version":1}`)}}
+			client := newRegistrationCellClient(api, targets)
+			response, err := test.call(client, liveContext(t), []byte(`{"version":1}`))
+			if err != nil || string(response) != `{"version":1}` {
+				t.Fatalf("call = %q, %v", response, err)
+			}
+			if len(api.inputs) != 1 || api.inputs[0].FunctionName == nil ||
+				*api.inputs[0].FunctionName != test.target || len(api.options) != 1 || api.options[0] != 0 {
+				t.Fatalf("invocations = %#v options=%v want target=%q", api.inputs, api.options, test.target)
+			}
+		})
 	}
 }
 

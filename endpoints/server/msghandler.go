@@ -216,32 +216,30 @@ const (
 	// the inner decrypt are delivered as acks and counted by MetricAuthFailure.
 	MetricRelayForwardReject = "RelayForwardReject"
 	// MetricRelayOTP counts relayed NHP_OTP inner packets that passed the
-	// inner-type gate in HandleRelayForward and were handed to dispatchOTP
-	// (agent-registration N2). Fire-and-forget: no ack is sent for these (the
-	// relay already answered the browser 202), so this is the only server-side
-	// visibility that a relayed OTP attempt was seen. It is incremented at the
-	// gate, BEFORE dispatchOTP runs, so it counts EVERY relayed OTP attempt
-	// regardless of downstream outcome — including a stubbed-plugin
-	// ErrPluginNotRegistered AND a rate-limited drop (the OTP limiter is the
-	// first step INSIDE dispatchOTP, so a shed relayed OTP ticks both this and
-	// MetricOTPRejectRateLimited). It is therefore a SUPERSET of the relayed
-	// portion of MetricOTPRejectRateLimited: admitted relayed OTPs ≈ MetricRelayOTP
-	// minus the relayed share of MetricOTPRejectRateLimited.
+	// Connector lifecycle ingress-rejection gate and were handed to dispatchOTP.
+	// Exact Connector registration intent is instead silently dropped and counted
+	// by MetricConnectorRegistrationIngressRejected while that composition is
+	// configured. For the remaining generic/legacy relay path, OTP is
+	// fire-and-forget and this counter is incremented before dispatchOTP, so it
+	// includes every downstream outcome, including a rate-limited drop. A shed
+	// relayed OTP therefore ticks both this and MetricOTPRejectRateLimited.
 	MetricRelayOTP = "RelayOTP"
-	// MetricRelayRegister counts relayed NHP_REG inner packets that reached the
-	// register dispatch (buildRegisterAck) in HandleRelayForward. Unlike OTP,
-	// REG always produces a RAK reply (wrapped in an authenticated
-	// RelayReturnMsg), including the fail-closed RAK while the plugin is stubbed
-	// (N3 pending).
+	// MetricRelayRegister counts relayed NHP_REG inner packets that passed the
+	// Connector lifecycle ingress-rejection gate and reached the generic register
+	// dispatch (buildRegisterAck). Exact Connector registration intent is counted
+	// by MetricConnectorRegistrationIngressRejected instead. Generic REG always
+	// produces a RAK reply wrapped in an authenticated RelayReturnMsg.
 	MetricRelayRegister = "RelayRegister"
-	// MetricOTPRejectRateLimited counts OTP requests (direct or relayed)
-	// dropped by the pre-plugin OTP rate limiter (agent_otp_ratelimit.go) BEFORE
-	// the plugin/email cost. A silent, spec-aligned default-deny drop; a non-zero
-	// rate means a per-key or aggregate OTP flood is being shed at the server
-	// (defense-in-depth; the authoritative limits are qurl-service-side, Q2).
+	// MetricOTPRejectRateLimited counts native-UDP OTP requests (including
+	// Connector registration) and generic requests on non-direct ingress dropped
+	// by the pre-plugin OTP rate limiter (agent_otp_ratelimit.go) before the
+	// downstream cost. Configured Connector registration on non-direct ingress is
+	// rejected before the limiter and counted by
+	// MetricConnectorRegistrationIngressRejected. A non-zero rate means a
+	// per-key or aggregate OTP flood is being shed at the server.
 	// NOTE: deliberately NOT prefixed "Relay" (unlike MetricRelayOTP/
 	// MetricRelayRegister, which are relay-path only) because it ticks for a
-	// DIRECT-UDP OTP as well as a relayed one — it spans both dispatch paths.
+	// direct-UDP OTP as well as an admitted relayed one.
 	MetricOTPRejectRateLimited      = "OTPRejectRateLimited"
 	MetricCloudMapDeregisterFailure = "CloudMapDeregisterFailure"
 	// MetricShutdownTransactionDrainTimeout increments when graceful shutdown's
@@ -1323,29 +1321,32 @@ func makeMsgData(ppd *core.PacketParserData, headerType int, msg []byte) *core.M
 // HandleOTPRequest
 // Server will not respond to agent's otp request
 //
-// Fire-and-forget per the CSA NHP spec: the server never replies to an OTP,
-// direct or relayed. This is the DIRECT (agent→server UDP) path; the RELAYED
-// path (HandleRelayForward) calls dispatchOTP against a synthetic inner ppd.
-// Both share dispatchOTP so the rate-limit → plugin-load → RequestOTP core is
-// identical on either ingress.
+// Fire-and-forget per the CSA NHP spec: the server never replies to an OTP.
+// Native UDP and WebRTC connection dispatch enter here; relay dispatch calls
+// dispatchOTP directly with its synthetic inner ppd. When the Connector
+// composition is configured, exact registration is accepted only from native
+// UDP and silently rejected on every non-direct ingress before generic dispatch.
 func (s *UdpServer) HandleOTPRequest(ppd *core.PacketParserData) (err error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 	return s.dispatchOTP(ppd)
 }
 
-// dispatchOTP runs the shared OTP plugin-dispatch core for both the direct
-// (HandleOTPRequest) and relayed (HandleRelayForward → NHP_OTP) paths. It parses
-// the AgentOTPMsg, applies the pre-plugin OTP rate limiter, loads + resolves the
-// agent plugin, and calls RequestOTP. It NEVER sends a reply (fire-and-forget);
-// it returns only an error for the caller to log-and-swallow. A plugin
-// ErrPluginNotRegistered (N3 not yet implemented) is an expected, non-fatal
-// return here.
+// dispatchOTP first applies the Connector lifecycle ingress gate for every
+// caller. With the composition configured, exact Connector registration takes
+// the strict handler on native UDP; relay, WebRTC, unknown, and future ingress
+// are silently rejected. Requests not claimed as Connector registration
+// continue through the generic core: parse AgentOTPMsg, apply the pre-plugin
+// limiter, resolve the plugin, and call RequestOTP. The function never sends a
+// reply and returns only an error for the caller to log and swallow.
 //
 // ppd must carry a decrypted OTP body plus the Noise-authenticated RemotePubKey
 // (the direct path has both from the responder; the relay path's synthetic
 // decrypt populates both — see decryptRelayInnerKnock).
 func (s *UdpServer) dispatchOTP(ppd *core.PacketParserData) error {
+	if handled, strictErr := s.handleConnectorRegistrationOTP(ppd); handled {
+		return strictErr
+	}
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
 
@@ -1360,24 +1361,7 @@ func (s *UdpServer) dispatchOTP(ppd *core.PacketParserData) error {
 	// rate-limiter key (defense-in-depth against per-key OTP/email floods).
 	agentPubkey := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
 
-	// Pre-plugin OTP rate limiter (defense-in-depth; authoritative limits are
-	// qurl-service-side, Q2). Applied BEFORE loading/calling the plugin so a
-	// flood of OTP requests — which each cost an email downstream — is shed
-	// before it can reach the credential issuer. Spec-aligned default-deny:
-	// on reject, drop SILENTLY with no reply (OTP is fire-and-forget anyway).
-	if s.otpRateLimiter != nil && !s.otpRateLimiter.Allow(agentPubkey) {
-		// DUAL-PUBLISH the shed metric (cf. relay recordShed): the launch-blocking
-		// agent-OTP-shed alarm (T1) selects on {Environment} ONLY, but the server
-		// publisher's base dims are [Environment, Cell], so a plain IncrCounter would
-		// publish only at [Environment, Cell] and the {Environment} alarm could never
-		// bind (it would sit in INSUFFICIENT_DATA, and treat_missing_data=notBreaching
-		// keeps the page silently green). So emit BOTH: an explicit [Environment]-only
-		// base stream the alarm binds to, PLUS the normal [Environment, Cell]
-		// breakdown for per-cell dashboards/attribution. Do NOT drop the explicit
-		// base emit — it is the ONLY stream the launch-blocking alarm can match.
-		s.metrics.IncrCounterExplicitDims(MetricOTPRejectRateLimited, buildServerEnvDimension())
-		s.metrics.IncrCounter(MetricOTPRejectRateLimited)
-		log.Warning("server-agent(key=%s#%d@%s)[HandleOTPRequest] OTP rate limited; dropping", pubkeyLogPrefix(agentPubkey), transactionId, addrStr)
+	if !s.allowOTPRequest(ppd, agentPubkey) {
 		return nil
 	}
 
@@ -1420,20 +1404,48 @@ func (s *UdpServer) dispatchOTP(ppd *core.PacketParserData) error {
 	return nil
 }
 
+// allowOTPRequest keeps the peer-key admission gate shared by the strict qURL
+// Connector OTP path and generic plugin OTP path. It deliberately depends only
+// on the Noise-authenticated peer, never a body credential or client identity.
+// agentPubkey is the std-base64 inner device key the caller already derived
+// (the limiter key), passed in so the hot path does not re-encode it per OTP.
+func (s *UdpServer) allowOTPRequest(ppd *core.PacketParserData, agentPubkey string) bool {
+	if s.otpRateLimiter == nil {
+		return true
+	}
+	if s.otpRateLimiter.Allow(agentPubkey) {
+		return true
+	}
+	// DUAL-PUBLISH the shed metric (cf. relay recordShed): the launch-blocking
+	// alarm selects on {Environment} only, while the ordinary publisher carries
+	// [Environment, Cell]. Keep both fixed-dimension streams.
+	s.metrics.IncrCounterExplicitDims(MetricOTPRejectRateLimited, buildServerEnvDimension())
+	s.metrics.IncrCounter(MetricOTPRejectRateLimited)
+	addrStr := ""
+	if ppd.ConnData != nil && ppd.ConnData.RemoteAddr != nil {
+		addrStr = ppd.ConnData.RemoteAddr.String()
+	}
+	log.Warning("server-agent(key=%s#%d@%s)[HandleOTPRequest] OTP rate limited; dropping",
+		pubkeyLogPrefix(agentPubkey), ppd.SenderTrxId, addrStr)
+	return false
+}
+
 // HandleRegisterRequest
 // Server will respond with success or error with NHP_RAK message
 //
-// This is the DIRECT (agent→server UDP) path: it builds the RAK via
-// buildRegisterAck and delivers it through the agent's real transaction
-// (forwardToTransaction) — unchanged on the wire. The RELAYED path
-// (HandleRelayForward → NHP_REG) shares buildRegisterAck for the marshal-the-ack
-// core but diverts the reply through buildRelayInnerReply and an authenticated
-// RelayReturnMsg, since a
-// synthetically-decrypted inner packet has no RemoteTransaction to forward
-// through.
+// Native UDP and WebRTC connection dispatch enter here. With the Connector
+// composition configured, exact registration takes the strict handler only on
+// native UDP and is silently rejected on WebRTC. Remaining generic requests
+// build a RAK through buildRegisterAck and deliver it through the connection's
+// real transaction. Generic relay REG that survives the same ingress gate also
+// shares buildRegisterAck, then diverts its reply through an authenticated
+// RelayReturnMsg. Configured Connector registration over relay never reaches it.
 func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
+	if handled, strictErr := s.handleDirectConnectorRegistration(ppd, connectorRegistrationActivation); handled {
+		return strictErr
+	}
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -1459,9 +1471,9 @@ func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error
 // buildRegisterAck runs the register plugin-dispatch core — parse
 // AgentRegisterMsg → load + resolve the agent plugin → RegisterAgent → marshal
 // the ServerRegisterAckMsg — and returns the NHP_RAK body bytes. Shared by the
-// direct path (HandleRegisterRequest, which then forwardToTransactions) and the
-// relay path (HandleRelayForward, which encrypts the inner RAK and wraps it in
-// an authenticated RelayReturnMsg).
+// direct generic path and generic relayed REG that passed the Connector
+// lifecycle ingress gate. Configured strict Connector registration is handled
+// before this helper and never reaches it over relay.
 //
 // FAIL-CLOSED ACK CONTRACT: the returned error is ONLY a marshal failure (drop,
 // nothing to send). Every logical failure — parse error, no handler, or a plugin
@@ -1562,8 +1574,10 @@ func registerErrToCode(err error) *common.Error {
 }
 
 // HandleListRequest responds with a success or fail-closed NHP_LRT message.
-// Logical list failures are protocol verdicts carried by that LRT, so successful
-// delivery returns nil on both direct and relayed paths. Only failures that
+// Logical generic-list failures are protocol verdicts carried by that LRT, so
+// successful delivery returns nil on both direct and relayed paths. Exact qURL
+// Connector registration-completion intents are intercepted before generic list
+// dispatch and silently rejected on non-direct ingress. Only failures that
 // prevent building or delivering the LRT are returned to dispatchHandler, whose
 // sole use of the error is logging; it drives no metric or control decision.
 // dispatchReceivedMessage is the only production caller and uses that wrapper;
@@ -1572,6 +1586,12 @@ func registerErrToCode(err error) *common.Error {
 func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
+
+	// qURL Connector post-RAK completion is owned by the strict assigned-cell
+	// handler before either recovery routing or permissive ListService dispatch.
+	if handled, strictErr := s.handleDirectConnectorRegistration(ppd, connectorRegistrationCompletion); handled {
+		return strictErr
+	}
 
 	// Assigned-cell credential recovery is a direct-UDP-only capability. This
 	// branch must stay before buildListResult: that shared plugin seam is also
@@ -1615,11 +1635,12 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 	return nil
 }
 
-// buildListResult runs the shared LST plugin dispatch and marshals its LRT
+// buildListResult runs the generic LST plugin dispatch and marshals its LRT
 // verdict. Direct traffic forwards the bytes through its transaction;
 // HandleRelayForward encrypts the same bytes for the agent and wraps them in an
-// authenticated RelayReturnMsg. Logical failures still produce an LRT; a nil
-// byte slice means the LRT itself could not be marshaled.
+// authenticated RelayReturnMsg. Configured Connector registration completion
+// is intercepted before this helper. Logical failures still produce an LRT; a
+// nil byte slice means the LRT itself could not be marshaled.
 func (s *UdpServer) buildListResult(ppd *core.PacketParserData) ([]byte, string, error) {
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()

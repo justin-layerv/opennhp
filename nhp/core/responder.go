@@ -252,6 +252,11 @@ type PacketData struct {
 type PacketParserData struct {
 	device     *Device
 	basePacket *Packet
+	// owningRemoteTransaction is the exact responder transaction created for
+	// this request. It is immutable after packet-to-message dispatch installs it
+	// and lets specialized handlers retire their own transaction without a
+	// transaction-id lookup that could resolve a newer same-id request.
+	owningRemoteTransaction *RemoteTransaction
 	// originalContent is a pristine snapshot of basePacket.Content captured
 	// before decryptBody's in-place AEAD Open overwrites the body region with
 	// plaintext. BasePacketContent() returns it so cross-server knock
@@ -320,6 +325,16 @@ type PacketParserData struct {
 	decryptedMsgCh chan<- *PacketParserData //Plaintext payload dispatched (Decryption cycle completed)
 	feedbackMsgCh  chan<- *PacketParserData
 	Error          error
+}
+
+// OwningRemoteTransaction returns the exact responder transaction created for
+// this parsed request. Synthetic packets that do not enter the core responder
+// lifecycle (for example relay-inner dispatch) return nil.
+func (ppd *PacketParserData) OwningRemoteTransaction() *RemoteTransaction {
+	if ppd == nil {
+		return nil
+	}
+	return ppd.owningRemoteTransaction
 }
 
 func (ppd *PacketParserData) isHubLSTPublicPath() bool {

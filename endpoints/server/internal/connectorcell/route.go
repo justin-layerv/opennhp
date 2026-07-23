@@ -8,10 +8,43 @@ import "github.com/OpenNHP/opennhp/nhp/core"
 // answer can select only the strict decoder or a frozen rejection; it can never
 // authorize an Authority call by itself.
 func routeCompletionIntent(raw []byte) bool {
+	return routeASPQueryIntent(raw, completionAspID, completionQuery)
+}
+
+// IsRegistrationOTPIntent and IsRegistrationIntent intentionally apply the
+// same body predicate: the authenticated NHP_OTP versus NHP_REG header is the
+// sole operation discriminator. The separate names keep call sites tied to
+// their header dispatch while both conservatively claim only bodies carrying
+// the exact top-level qURL Connector aspId. Once claimed, the strict decoder
+// owns malformed duplicate, unknown, and trailing forms so they cannot fall
+// through to permissive plugin decoding.
+func IsRegistrationOTPIntent(raw []byte) bool { return routeRegistrationASPIntent(raw) }
+
+func IsRegistrationIntent(raw []byte) bool { return routeRegistrationASPIntent(raw) }
+
+// IsRegistrationCompletionIntent additionally requires the exact completion
+// query in the immediate top-level usrData object. Other agent LST operations
+// remain on their existing dispatch paths.
+func IsRegistrationCompletionIntent(raw []byte) bool {
+	return routeASPQueryIntent(raw, registrationAspID, registrationCompletionQuery)
+}
+
+func routeRegistrationASPIntent(raw []byte) bool {
+	return routeIntent(raw, registrationAspID, "", false)
+}
+
+func routeASPQueryIntent(raw []byte, aspID, query string) bool {
+	return routeIntent(raw, aspID, query, true)
+}
+
+func routeIntent(raw []byte, aspID, query string, queryRequired bool) bool {
 	if len(raw) == 0 || len(raw) > core.MaxDecompressedBodySize {
 		return false
 	}
-	s := completionIntentScanner{raw: raw}
+	s := completionIntentScanner{
+		raw: raw, targetASP: aspID, targetQuery: query,
+		hasQuery: !queryRequired,
+	}
 	i := s.space(0)
 	if i >= len(raw) || raw[i] != '{' {
 		return false
@@ -20,9 +53,11 @@ func routeCompletionIntent(raw []byte) bool {
 }
 
 type completionIntentScanner struct {
-	raw      []byte
-	hasASP   bool
-	hasQuery bool
+	raw         []byte
+	targetASP   string
+	targetQuery string
+	hasASP      bool
+	hasQuery    bool
 }
 
 func (s *completionIntentScanner) root(i int) bool {
@@ -44,7 +79,7 @@ func (s *completionIntentScanner) root(i int) bool {
 		case jsonStringTokenEquals(s.raw[keyStart:keyEnd], "aspId"):
 			valueStart, valueEnd, stringOK := s.stringToken(i)
 			if stringOK {
-				s.hasASP = s.hasASP || jsonStringTokenEquals(s.raw[valueStart:valueEnd], completionAspID)
+				s.hasASP = s.hasASP || jsonStringTokenEquals(s.raw[valueStart:valueEnd], s.targetASP)
 				i = valueEnd
 			} else {
 				i, ok = s.value(i)
@@ -102,7 +137,7 @@ func (s *completionIntentScanner) data(i int) (int, bool) {
 		if jsonStringTokenEquals(s.raw[keyStart:keyEnd], "query") {
 			valueStart, valueEnd, stringOK := s.stringToken(i)
 			if stringOK {
-				s.hasQuery = s.hasQuery || jsonStringTokenEquals(s.raw[valueStart:valueEnd], completionQuery)
+				s.hasQuery = s.hasQuery || jsonStringTokenEquals(s.raw[valueStart:valueEnd], s.targetQuery)
 				i = valueEnd
 			} else {
 				i, ok = s.value(i)

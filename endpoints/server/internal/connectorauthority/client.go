@@ -60,6 +60,17 @@ type CellClient struct {
 	completeCredentialRecovery string
 }
 
+// RegistrationCellClient exposes only the three assigned-cell enrollment
+// operations. Keeping it narrower than CellClient makes it impossible for the
+// registration composition to invoke credential recovery, even if a caller is
+// later miswired.
+type RegistrationCellClient struct {
+	invoker
+	issueRegistrationOTP string
+	activateRegistration string
+	completeRegistration string
+}
+
 // CredentialRecoveryCellClient exposes only the completion operation needed by
 // the direct assigned-cell recovery path. It deliberately cannot be widened by
 // passing a different operation at call time.
@@ -95,6 +106,21 @@ func (c *CellClient) ActivateRegistration(ctx context.Context, payload []byte) (
 
 // CompleteRegistration invokes the configured cell-scoped CompleteRegistration alias synchronously.
 func (c *CellClient) CompleteRegistration(ctx context.Context, payload []byte) ([]byte, error) {
+	return c.invoke(ctx, OperationCompleteRegistration, c.completeRegistration, payload)
+}
+
+// IssueRegistrationOTP invokes the configured cell-scoped IssueRegistrationOTP alias synchronously.
+func (c *RegistrationCellClient) IssueRegistrationOTP(ctx context.Context, payload []byte) ([]byte, error) {
+	return c.invoke(ctx, OperationIssueRegistrationOTP, c.issueRegistrationOTP, payload)
+}
+
+// ActivateRegistration invokes the configured cell-scoped ActivateRegistration alias synchronously.
+func (c *RegistrationCellClient) ActivateRegistration(ctx context.Context, payload []byte) ([]byte, error) {
+	return c.invoke(ctx, OperationActivateRegistration, c.activateRegistration, payload)
+}
+
+// CompleteRegistration invokes the configured cell-scoped CompleteRegistration alias synchronously.
+func (c *RegistrationCellClient) CompleteRegistration(ctx context.Context, payload []byte) ([]byte, error) {
 	return c.invoke(ctx, OperationCompleteRegistration, c.completeRegistration, payload)
 }
 

@@ -118,6 +118,7 @@ func (w *WebRTCServer) setupDataChannel(dc *webrtc.DataChannel) {
 			Device:               w.us.device,
 			LocalAddr:            w.us.listenAddr,
 			RemoteAddr:           addr,
+			IngressTransport:     core.IngressTransportWebRTC,
 			CookieStore:          &core.CookieStore{},
 			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
 			SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),

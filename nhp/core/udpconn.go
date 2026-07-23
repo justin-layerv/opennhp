@@ -9,6 +9,19 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
+// IngressTransport is trusted in-process metadata set by the receiving server
+// transport before a packet enters protocol dispatch. Zero is deliberately
+// unknown so security-sensitive handlers must opt in to an exact transport and
+// future transports fail closed until classified.
+type IngressTransport uint8
+
+const (
+	IngressTransportUnknown IngressTransport = iota
+	IngressTransportDirectUDP
+	IngressTransportWebRTC
+	IngressTransportRelayed
+)
+
 // NewStoppedTimer returns a stopped timer; caller must Reset(d) before use. The 1h placeholder is arbitrary — immediately stopped. (Go 1.23+: bare Reset is correct.)
 //
 // Reset-placement conventions in this repo:
@@ -42,6 +55,10 @@ type ConnectionData struct {
 	Device     *Device
 	LocalAddr  *net.UDPAddr
 	RemoteAddr *net.UDPAddr
+	// IngressTransport is immutable after connection construction. It must be
+	// assigned from the trusted local receive path, never from packet content or
+	// a peer-reported source address.
+	IngressTransport IngressTransport
 	// RealRemoteAddr is reserved for relay implementations that keep RemoteAddr
 	// as the relay transport peer and carry the original client separately.
 	// LayerV's current relay handler stamps the client IP into RemoteAddr, so

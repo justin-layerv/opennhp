@@ -24,6 +24,7 @@ type RemoteTransaction struct {
 	connData      *ConnectionData
 	parserData    *PacketParserData
 	NextMsgCh     chan *MsgData // higher level entities should redirect message to this channel
+	complete      chan struct{} // specialized responders finish after diverting encryption/physical write
 	done          chan struct{} // closed by Run() on exit; used by SendMessage() to avoid sending on a closed channel
 	timeout       int
 	testCloseOnce *sync.Once // test-only; nil for real transactions (see NewRemoteTransactionForTest)
@@ -52,6 +53,7 @@ func newRemoteTransaction(id uint64, connData *ConnectionData, parserData *Packe
 		connData:      connData,
 		parserData:    parserData,
 		NextMsgCh:     make(chan *MsgData),
+		complete:      make(chan struct{}),
 		done:          make(chan struct{}),
 		timeout:       timeout,
 	}
@@ -84,6 +86,32 @@ func (t *RemoteTransaction) SendMessageContext(ctx context.Context, md *MsgData)
 	}
 	select {
 	case t.NextMsgCh <- md:
+		return nil
+	case <-t.done:
+		return common.ErrTransactionClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// CompleteContext finishes a remote transaction after a specialized bounded
+// responder has fully consumed the request. The responder may have
+// synchronously encrypted a reply and diverted its physical write from the
+// generic SendMsgToPacket path, or deliberately selected a no-reply terminal
+// outcome. Run remains the sole owner of parser cleanup and map removal, while
+// ctx bounds the completion rendezvous.
+func (t *RemoteTransaction) CompleteContext(ctx context.Context) error {
+	if t == nil || t.complete == nil || t.done == nil {
+		return common.ErrTransactionClosed
+	}
+	if ctx == nil {
+		return context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case t.complete <- struct{}{}:
 		return nil
 	case <-t.done:
 		return common.ErrTransactionClosed
@@ -389,7 +417,12 @@ func (t *RemoteTransaction) Run() {
 		// delivers or takes the done branch — never races a close on
 		// NextMsgCh (that's why we don't close the message channel).
 		conn.RemoteTransactionMutex.Lock()
-		delete(conn.RemoteTransactionMap, t.transactionId)
+		// A later request may occupy the same transaction-id slot while this
+		// owner is still finishing. Stale cleanup must not erase that
+		// replacement.
+		if current := conn.RemoteTransactionMap[t.transactionId]; current == t {
+			delete(conn.RemoteTransactionMap, t.transactionId)
+		}
 		close(t.done)
 		conn.RemoteTransactionMutex.Unlock()
 
@@ -403,6 +436,9 @@ func (t *RemoteTransaction) Run() {
 	case md := <-t.NextMsgCh:
 		md.PrevParserData = t.parserData
 		conn.Device.SendMsgToPacket(md)
+		return
+
+	case <-t.complete:
 		return
 
 	case <-conn.StopSignal:
