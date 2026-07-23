@@ -154,11 +154,24 @@ func makeInnerAgentPacket(t *testing.T, serverPub []byte, headerType int, counte
 		TransactionId: counter,
 		Message:       body,
 	})
+	return drainSenderContent(t, conn, "inner knock")
+}
+
+// drainSenderContent pulls the freshly-encrypted packet off conn's SendQueue and
+// returns a copy of its bytes. As the queue's manual consumer it releases the
+// sender-owned pool packet before returning. label names the emitter for the
+// failure messages.
+func drainSenderContent(t *testing.T, conn *core.ConnectionData, label string) []byte {
+	t.Helper()
 	select {
 	case pkt := <-conn.SendQueue:
+		if pkt == nil {
+			t.Fatalf("%s queue returned nil packet", label)
+		}
+		defer conn.Device.ReleasePoolPacket(pkt)
 		return append([]byte(nil), pkt.Content...)
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout producing inner knock")
+		t.Fatalf("timeout producing %s", label)
 		return nil
 	}
 }
@@ -296,13 +309,7 @@ func makeRealCookie(t *testing.T, serverDev *core.Device, innerKnock []byte, src
 	if _, err := serverDev.PacketToMsg(pd); err == nil {
 		t.Fatal("overloaded server accepted the knock; expected a cookie rejection")
 	}
-	select {
-	case pkt := <-conn.SendQueue:
-		return append([]byte(nil), pkt.Content...)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for the server to emit an overload cookie")
-		return nil
-	}
+	return drainSenderContent(t, conn, "overload cookie")
 }
 
 func makeRelayReturnPacket(t *testing.T, serverDev *core.Device, outerPpd *core.PacketParserData, requestID string, inner []byte) []byte {

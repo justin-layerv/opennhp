@@ -174,13 +174,17 @@ func newSpikeConn(dev *core.Device, remote *net.UDPAddr) *core.ConnectionData {
 }
 
 // drainEncryptedPacket pulls the freshly-encrypted packet off a capture conn's
-// SendQueue and returns a copy of its bytes. The packet is kept (transaction
-// requests set KeepAfterSend), so it is not released here.
+// SendQueue and returns a copy of its bytes. This helper is the queue's manual
+// consumer, so it also releases the sender-owned pool packet.
 func drainEncryptedPacket(t *testing.T, conn *core.ConnectionData) []byte {
 	t.Helper()
 	select {
 	case pkt := <-conn.SendQueue:
-		if pkt == nil || pkt.Content == nil {
+		if pkt == nil {
+			t.Fatal("drained nil packet")
+		}
+		defer conn.Device.ReleasePoolPacket(pkt)
+		if len(pkt.Content) == 0 {
 			t.Fatal("drained nil/empty packet")
 		}
 		return slices.Clone(pkt.Content)

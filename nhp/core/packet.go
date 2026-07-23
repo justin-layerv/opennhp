@@ -366,6 +366,29 @@ func (d *Device) AllocatePoolPacket() *Packet {
 	return &Packet{Buf: buf, Content: buf[:], PoolAllocated: true}
 }
 
+// clonePacketForSend gives the physical sender independent ownership of a
+// transaction packet. The local transaction must retain the assembler's
+// packet until its response, timeout, or connection-close path completes;
+// sharing that packet with an asynchronous sender lets either owner recycle
+// the buffer while the other still uses it.
+func (d *Device) clonePacketForSend(pkt *Packet) (*Packet, error) {
+	if pkt == nil || len(pkt.Content) == 0 || len(pkt.Content) > PacketBufferSize {
+		return nil, errors.New("invalid outbound transaction packet")
+	}
+
+	clone := d.AllocatePoolPacket()
+	if clone == nil {
+		return nil, errors.New("failed to allocate outbound transaction packet")
+	}
+	// Physical senders consume only HeaderType and Content. PoolAllocated comes
+	// from AllocatePoolPacket, and KeepAfterSend must remain false so the sender
+	// releases its independent copy.
+	clone.HeaderType = pkt.HeaderType
+	clone.Content = clone.Buf[:len(pkt.Content)]
+	copy(clone.Content, pkt.Content)
+	return clone, nil
+}
+
 func (d *Device) ReleasePoolPacket(pkt *Packet) {
 	if pkt != nil && pkt.relayBuf != nil {
 		buf := pkt.relayBuf

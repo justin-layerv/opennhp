@@ -455,6 +455,8 @@ func (d *Device) msgToPacketRoutine(id int) {
 				var mad *MsgAssemblerData
 				var err error
 				var localTransaction *LocalTransaction
+				var outboundPacket *Packet
+				var outboundPacketOwned bool
 
 				// error handling
 				defer func() {
@@ -465,6 +467,15 @@ func (d *Device) msgToPacketRoutine(id int) {
 						// message text in this line; Terraform's
 						// server-async-runtime-panic log filter keys on both.
 						log.Error("msgToPacketRoutine %d: [%s] recovered from panic: %v", id, msgType, err)
+					}
+					// Until ForwardOutboundPacket returns, this routine still owns a
+					// transaction packet's sender copy. A panic before queue ownership
+					// transfers (the closed-send path is covered by
+					// TestMsgToPacketRoutineRecoversForwardOutboundPanic) must not leak
+					// that pool allocation.
+					if outboundPacketOwned {
+						d.ReleasePoolPacket(outboundPacket)
+						outboundPacketOwned = false
 					}
 					if err != nil {
 						if mad == nil {
@@ -570,9 +581,18 @@ func (d *Device) msgToPacketRoutine(id int) {
 
 				// create local transaction if needed
 				log.Debug("msgToPacketRoutine IsTransactionRequest:deviceType:%d HeaderType:%d", d.deviceType, mad.HeaderType)
+				outboundPacket = mad.BasePacket
 				if d.IsTransactionRequest(mad.HeaderType) {
+					// The transaction retains mad.BasePacket for response crypto. Give
+					// the asynchronous physical sender an independent pool packet so
+					// transaction completion cannot recycle bytes still being sent.
+					outboundPacket, err = d.clonePacketForSend(mad.BasePacket)
+					if err != nil {
+						return
+					}
+					outboundPacketOwned = true
+
 					// save initiator transaction
-					mad.BasePacket.KeepAfterSend = true // packet is kept after sending and deleted at transaction level
 					t := newLocalTransaction(mad.header.Counter(), mad.connData, mad, d.LocalTransactionTimeout(mad.HeaderType))
 					d.AddLocalTransaction(t)
 					localTransaction = t
@@ -580,7 +600,8 @@ func (d *Device) msgToPacketRoutine(id int) {
 				}
 
 				// send out fully encrypted packet
-				mad.connData.ForwardOutboundPacket(mad.BasePacket)
+				mad.connData.ForwardOutboundPacket(outboundPacket)
+				outboundPacketOwned = false
 			}()
 		}
 	}

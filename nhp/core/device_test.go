@@ -321,6 +321,13 @@ func TestMsgToPacketRoutineRecoversForwardOutboundPanic(t *testing.T) {
 			if device == nil {
 				t.Fatal("NewDevice returned nil")
 			}
+			if tc.headerType == NHP_FWD {
+				// A transaction request uses exactly two packets: the assembler's
+				// retained packet and the sender copy. A two-slot pool makes the
+				// post-panic capacity check below detect a leak of either owner.
+				device.pool = &PacketBufferPool{}
+				device.pool.Init(2)
+			}
 			peer := NewDevice(NHP_SERVER, peerKey, nil)
 			if peer == nil {
 				t.Fatal("NewDevice(peer) returned nil")
@@ -370,6 +377,23 @@ func TestMsgToPacketRoutineRecoversForwardOutboundPanic(t *testing.T) {
 				case <-deadline:
 					t.Fatalf("local transactions still active: %d", device.LocalTransactionCount())
 				case <-time.After(10 * time.Millisecond):
+				}
+			}
+			if tc.headerType == NHP_FWD {
+				allocatedCh := make(chan [2]*Packet, 1)
+				go func() {
+					allocatedCh <- [2]*Packet{
+						device.AllocatePoolPacket(),
+						device.AllocatePoolPacket(),
+					}
+				}()
+				select {
+				case packets := <-allocatedCh:
+					for _, packet := range packets {
+						device.ReleasePoolPacket(packet)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("outbound panic leaked a packet-pool allocation")
 				}
 			}
 

@@ -1213,12 +1213,14 @@ func captureEncryptedPacket(sender, receiver *E2ETestNode, headerType int, messa
 	// (no send loop is reading from this queue)
 	select {
 	case pkt := <-captureConn.SendQueue:
-		if pkt != nil && pkt.Content != nil {
-			// Copy the content since the packet might be released
-			captured := slices.Clone(pkt.Content)
-			return captured, nil
+		if pkt == nil {
+			return nil, errors.New("captured nil packet")
 		}
-		return nil, errors.New("captured empty packet")
+		defer sender.device.ReleasePoolPacket(pkt)
+		if len(pkt.Content) == 0 {
+			return nil, errors.New("captured empty packet")
+		}
+		return slices.Clone(pkt.Content), nil
 	case <-time.After(5 * time.Second):
 		return nil, context.DeadlineExceeded
 	}

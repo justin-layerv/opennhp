@@ -137,7 +137,7 @@ func TestE2E_RelayCrossServer_KnockForwardedToRemoteAC_AckReturnsViaRelay(t *tes
 	// bytes and nothing transmits them), and later decrypts the relay-delivered
 	// ack via its original local transaction (routeResponseToTransaction). Using
 	// a started E2E node instead would spin a connectionSendLoop that races the
-	// transaction's KeepAfterSend packet and would transmit the knock over the
+	// sender-owned packet and would transmit the knock over the
 	// wire to server A (which has no agent peer and fails the decrypt).
 	agentDev := newSpikeDevice(t, core.NHP_AGENT, 0x11, nil)
 

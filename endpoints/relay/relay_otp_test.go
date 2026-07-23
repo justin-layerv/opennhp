@@ -46,13 +46,7 @@ func makeInnerOTP(t *testing.T, serverPub []byte, counter uint64) []byte {
 		TransactionId: counter,
 		Message:       body,
 	})
-	select {
-	case pkt := <-conn.SendQueue:
-		return append([]byte(nil), pkt.Content...)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout producing inner OTP")
-		return nil
-	}
+	return drainSenderContent(t, conn, "inner OTP")
 }
 
 // TestRelay_InnerOTP_Returns202NoWaiter is the fire-and-forget proof: an inner
