@@ -606,20 +606,38 @@ class OverlapGuard(unittest.TestCase):
         appears in the grandfather set must fail main() with exit 3
         (internal error) rather than let the grandfather skip shadow the
         action check. Unreachable by fixtures — needs the module constants
-        mutated, so it lives here."""
+        mutated, so it lives here.
+
+        The guard reports the overlap via `error()`, which prints a literal
+        `::error::` GitHub Actions annotation to stderr. This test provokes
+        that failure deliberately, so it must capture stderr — otherwise the
+        annotation escapes the (passing) unit-test step and surfaces as a
+        spurious job-level error on Terraform Prod-Drift Lint, naming whatever
+        real type iterates first in RESOURCE_ACTIONS (today
+        aws_default_security_group) as if it were genuinely mis-grandfathered.
+        Mirrors test_main_surfaces_helper_scope_failure's stderr capture.
+        """
         mapped = next(iter(IAM.RESOURCE_ACTIONS))
         original_ack = IAM.RESOURCE_UNCHECKED_ACK
         original_argv = sys.argv
+        stderr = StringIO()
         try:
             IAM.RESOURCE_UNCHECKED_ACK = frozenset(original_ack | {mapped})
             with tempfile.TemporaryDirectory() as tmp:
                 # The guard runs before the tree is parsed, so an empty
                 # (but valid) --terraform-root reaches it and returns 3.
                 sys.argv = ["check-terraform-iam-coverage", "--terraform-root", tmp]
-                self.assertEqual(IAM.main(), 3)
+                with redirect_stderr(stderr):
+                    self.assertEqual(IAM.main(), 3)
         finally:
             IAM.RESOURCE_UNCHECKED_ACK = original_ack
             sys.argv = original_argv
+        # Assert on the captured annotation: it must name the injected type and
+        # the guard's remediation. Strengthens coverage and proves the
+        # `::error::` was captured here, not emitted into the CI step.
+        captured = stderr.getvalue()
+        self.assertIn("appear in BOTH RESOURCE_ACTIONS", captured)
+        self.assertIn(mapped, captured)
 
 
 if __name__ == "__main__":

@@ -644,6 +644,29 @@ def require_alarm_registry(
     return blocks
 
 
+# Env roots intentionally exempt from the per-env `module "nhp"` parity wiring
+# (#1141). Keep this set tiny and each entry justified: an exemption means the
+# root does NOT instantiate the giant cell-parameterized `module "nhp"`, so it
+# carries none of the prod/sandbox alarm/metric parity surfaces directly — its
+# observability must ride an env root this same lint already checks.
+#
+#   sandbox-cell1: a deliberately lean, UDP-server-only second cell (cell1) for
+#   the two-cell qURL Connector proof (PR #3413). Its root wires only the
+#   standalone knock path — networking (VPC) + kms + plugins + dynamodb +
+#   nhp-keypair + compute (public UDP:62206 NLB) + dns — and, unlike every
+#   other env root, does NOT instantiate `module "nhp"`. That module's
+#   always-on `module.security` creates ACCOUNT-SINGLETON GuardDuty/Config/
+#   SecurityHub that would collide with cell0 in the same account, so a second
+#   full instantiation is unsafe here. cell1 ships no AC / qurl-service / relay
+#   to alarm on; its L7 data plane and observability ride cell0, which this
+#   lint checks in full. Removing cell1's tree should drop this entry too.
+OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS: frozenset[str] = frozenset(
+    {
+        "sandbox-cell1",
+    }
+)
+
+
 def deployable_env_names(repo: Path) -> tuple[str, ...]:
     env_root = repo / "terraform" / "environments"
     try:
@@ -1280,8 +1303,11 @@ def check_shared_resources(repo: Path) -> None:
 
 def run(repo: Path) -> None:
     # Discover env roots so a future deployable env cannot escape the #1141
-    # guard by omission.
+    # guard by omission. A root may opt out only via the explicit, per-env
+    # justified exemption set (a lean cell whose observability rides cell0).
     for env in deployable_env_names(repo):
+        if env in OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS:
+            continue
         check_env_root(repo, env)
     check_root_module(repo)
     check_shared_resources(repo)

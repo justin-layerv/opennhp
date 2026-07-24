@@ -1054,6 +1054,47 @@ class ObservabilityParityTests(unittest.TestCase):
         self.assertIn("terraform/environments/dev", result.stderr)
         self.assertIn("chatbot_owned_externally", result.stderr)
 
+    def test_exempt_env_root_without_module_nhp_passes(self) -> None:
+        # sandbox-cell1 is a deliberately lean, UDP-server-only cell that does
+        # NOT instantiate `module "nhp"` — its always-on module.security would
+        # collide with cell0's account-singleton GuardDuty/Config/SecurityHub.
+        # It rides cell0 for observability, so it is on the parity guard's
+        # explicit exemption set. A root by that name with no `module "nhp"`
+        # (and none of the passthrough/tfvars wiring the guard otherwise
+        # demands) must pass, whereas any other name fails closed — see
+        # test_new_env_root_is_checked.
+        self.assertIn(
+            "sandbox-cell1", CHECKER.OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture(root)
+            write(
+                root / "terraform" / "environments" / "sandbox-cell1" / "main.tf",
+                """
+                module "networking" {
+                  source = "../../modules/networking"
+                }
+
+                module "compute" {
+                  source = "../../modules/compute"
+                }
+                """,
+            )
+
+            result = run_check(root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("observability parity surfaces are wired", result.stdout)
+
+    def test_env_root_exemptions_stay_narrow(self) -> None:
+        # The #1141 guard must keep checking every real deployable root; only
+        # the explicitly-justified lean cells opt out. Guard against the
+        # exemption set silently widening to cover sandbox/prod.
+        exemptions = CHECKER.OBSERVABILITY_PARITY_ENV_ROOT_EXEMPTIONS
+        self.assertNotIn("sandbox", exemptions)
+        self.assertNotIn("prod", exemptions)
+
     def test_missing_root_stderr_wiring_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
