@@ -461,7 +461,12 @@ def load_verified_manifest(
     return contract, evidence
 
 
-def generated_input(contract: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+def generated_input(
+    contract: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    runtime_functions_enabled: bool = False,
+) -> dict[str, Any]:
     generated = json.loads(json.dumps(contract))
     generated["provisioned_cells_evidence"] = evidence
     generated["global"]["basis_evidence"] = evidence
@@ -469,10 +474,18 @@ def generated_input(contract: dict[str, Any], evidence: dict[str, Any]) -> dict[
     for function in generated["functions"].values():
         function["basis_evidence"] = evidence
         function["result_evidence"] = None
-    return {
+    payload: dict[str, Any] = {
         "authority_runtime_contract": generated,
         "authority_runtime_contract_evidence_verified": True,
     }
+    # Second, independent runtime-slice gate (the Step-4 enablement). Emit the
+    # key ONLY when the caller explicitly opts in; when omitted the key is absent
+    # entirely so the committed Terraform default (false) governs and the
+    # foundation stays dark. The key name matches the Terraform variable
+    # authority_runtime_functions_enabled exactly.
+    if runtime_functions_enabled:
+        payload["authority_runtime_functions_enabled"] = True
+    return payload
 
 
 def atomic_write(path: Path, payload: bytes) -> None:
@@ -502,6 +515,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--expected-checkout-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--runtime-functions-enabled",
+        action="store_true",
+        default=False,
+        help=(
+            "Also emit authority_runtime_functions_enabled=true into the "
+            "generated tfvars (the Step-4 runtime-slice opt-in). Omit to leave "
+            "the key absent so the committed default (false) keeps the "
+            "foundation dark."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         if args.mode != MODE:
@@ -512,7 +536,13 @@ def main(argv: list[str] | None = None) -> int:
         contract, evidence = load_verified_manifest(
             root, args.manifest, args.expected_checkout_commit
         )
-        payload = canonical_json(generated_input(contract, evidence))
+        payload = canonical_json(
+            generated_input(
+                contract,
+                evidence,
+                runtime_functions_enabled=args.runtime_functions_enabled,
+            )
+        )
         atomic_write(args.output, payload)
         print(
             json.dumps(

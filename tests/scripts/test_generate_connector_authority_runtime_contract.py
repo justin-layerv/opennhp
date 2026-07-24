@@ -204,9 +204,10 @@ class GitBindingTests(unittest.TestCase):
         manifest: str = MANIFEST_REL.as_posix(),
         expected: str | None = None,
         output: Path | None = None,
+        runtime_functions_enabled: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         destination = output or (self.root / "generated.tfvars.json")
-        return run(
+        args = [
             "python3",
             str(SCRIPT),
             "--mode",
@@ -219,9 +220,10 @@ class GitBindingTests(unittest.TestCase):
             expected or self.head,
             "--output",
             str(destination),
-            cwd=self.root,
-            check=False,
-        )
+        ]
+        if runtime_functions_enabled:
+            args.append("--runtime-functions-enabled")
+        return run(*args, cwd=self.root, check=False)
 
     def test_generates_stable_blob_owned_evidence_and_private_atomic_output(self) -> None:
         output = self.root / "generated.tfvars.json"
@@ -252,6 +254,50 @@ class GitBindingTests(unittest.TestCase):
         )
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
         self.assertEqual(output.read_text(encoding="utf-8"), canonical(generated))
+
+    def test_runtime_functions_enable_flag_governs_gate_key(self) -> None:
+        # Dark by default: without --runtime-functions-enabled the gate key is
+        # absent entirely, so the committed Terraform default (false) governs.
+        default_output = self.root / "default.tfvars.json"
+        default_result = self.generate(output=default_output)
+        self.assertEqual(default_result.returncode, 0, default_result.stderr)
+        default_generated = json.loads(default_output.read_text(encoding="utf-8"))
+        self.assertNotIn("authority_runtime_functions_enabled", default_generated)
+
+        # Opt-in: the emitted key is exactly the Terraform variable name, set to
+        # a genuine JSON boolean true (assertIs rejects a truthy 1 or "true").
+        enabled_output = self.root / "enabled.tfvars.json"
+        enabled_result = self.generate(
+            output=enabled_output, runtime_functions_enabled=True
+        )
+        self.assertEqual(enabled_result.returncode, 0, enabled_result.stderr)
+        enabled_generated = json.loads(enabled_output.read_text(encoding="utf-8"))
+        self.assertIs(
+            enabled_generated["authority_runtime_functions_enabled"], True
+        )
+
+        # The opt-in adds ONLY that one top-level key; the verified contract and
+        # the evidence latch are otherwise identical to the default output.
+        self.assertEqual(
+            set(enabled_generated) - set(default_generated),
+            {"authority_runtime_functions_enabled"},
+        )
+        self.assertEqual(set(default_generated) - set(enabled_generated), set())
+        self.assertEqual(
+            enabled_generated["authority_runtime_contract"],
+            default_generated["authority_runtime_contract"],
+        )
+        self.assertEqual(
+            enabled_generated["authority_runtime_contract_evidence_verified"],
+            default_generated["authority_runtime_contract_evidence_verified"],
+        )
+
+        # Emission stays deterministic canonical sorted two-space JSON with one
+        # trailing newline, so the apply job's byte cmp against the reviewed plan
+        # input holds whenever the same flag value is passed.
+        self.assertEqual(
+            enabled_output.read_text(encoding="utf-8"), canonical(enabled_generated)
+        )
 
     def test_rejects_mode_path_checkout_and_byte_mismatch(self) -> None:
         cases = {
