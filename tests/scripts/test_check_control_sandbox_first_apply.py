@@ -571,6 +571,119 @@ def plan_fixture() -> dict:
     }
 
 
+def authority_enablement_drift_pair(candidate: dict) -> list[dict]:
+    """Build the exact benign ``resource_drift`` pair the live Step-3 Connector
+    Authority enablement plan carries, and align the planned no-op digest state
+    the digest drift refreshes to.
+
+    The enablement plan's refresh phase always observes TWO independent,
+    externally driven state normalizations at once, so the real plan carries this
+    pair (not a single entry). Each item mirrors the exact single-drift shape
+    proven benign elsewhere:
+
+    * the Hub publisher inline-policy reflection -- see
+      ``test_exact_hub_publisher_refresh_only_normalization_passes`` and
+      ``publisher_refresh_candidate(hub=True)``;
+    * the externally rolled Authority image digest -- see
+      ``test_exact_authority_digest_refresh_only_normalization_passes`` and
+      ``authority_digest_refresh_candidate()``.
+
+    Returned address-sorted; the checker admits either serialization order (see
+    ``test_authority_enablement_drift_pair_is_order_insensitive``).
+    """
+    changes = {
+        item["address"]: item["change"] for item in candidate["resource_changes"]
+    }
+
+    # Hub publisher inline-policy reflection. ``after`` is the planned no-op role
+    # state; ``before`` is that state before the separately managed inline policy
+    # was reflected into role state.
+    role_address = "module.control.aws_iam_role.hub_publisher"
+    role_after = copy.deepcopy(changes[role_address]["after"])
+    role_drift = {
+        "address": role_address,
+        "mode": "managed",
+        "module_address": "module.control",
+        "name": "hub_publisher",
+        "provider_name": "registry.terraform.io/hashicorp/aws",
+        "type": "aws_iam_role",
+        "change": {
+            "actions": ["update"],
+            "after_sensitive": {
+                "inline_policy": [{}],
+                "managed_policy_arns": [],
+                "tags": {},
+                "tags_all": {},
+            },
+            "after_unknown": {},
+            "before": {**copy.deepcopy(role_after), "inline_policy": []},
+            "before_sensitive": {
+                "inline_policy": [],
+                "managed_policy_arns": [],
+                "tags": {},
+                "tags_all": {},
+            },
+            "after": copy.deepcopy(role_after),
+        },
+    }
+
+    # Authority image-digest roll. Terraform owns the parameter and ignores its
+    # value; the external publisher rolls value+version. Bind the planned no-op
+    # state to the refreshed (new) digest the drift lands on so the digest drift's
+    # ``after`` matches the planned state, exactly as the live refresh does.
+    spec = CHECKER._AUTHORITY_DIGEST_SPEC
+    digest_address = spec["address"]
+    parameter_name = spec["parameter_name"]
+    old_digest = f"sha256:{'1' * 64}"
+    new_digest = f"sha256:{'2' * 64}"
+    digest_after = {
+        "allowed_pattern": "",
+        "arn": spec["parameter_arn"],
+        "data_type": "text",
+        "description": spec["description"],
+        "has_value_wo": False,
+        "id": parameter_name,
+        "insecure_value": None,
+        "key_id": "",
+        "name": parameter_name,
+        "overwrite": None,
+        "region": CHECKER.AWS_REGION,
+        "tags": {},
+        "tags_all": {},
+        "tier": "Standard",
+        "type": "String",
+        "value": new_digest,
+        "value_wo": None,
+        "value_wo_version": None,
+        "version": 8,
+    }
+    changes[digest_address]["before"] = copy.deepcopy(digest_after)
+    changes[digest_address]["after"] = copy.deepcopy(digest_after)
+    digest_drift = {
+        "address": digest_address,
+        "mode": "managed",
+        "module_address": "module.control",
+        "name": spec["name"],
+        "provider_name": "registry.terraform.io/hashicorp/aws",
+        "type": "aws_ssm_parameter",
+        "change": {
+            "actions": ["update"],
+            "after_sensitive": copy.deepcopy(CHECKER._DIGEST_REFRESH_SENSITIVE),
+            "after_unknown": {},
+            "before": {
+                **copy.deepcopy(digest_after),
+                "value": old_digest,
+                "version": 7,
+            },
+            "before_sensitive": copy.deepcopy(CHECKER._DIGEST_REFRESH_SENSITIVE),
+            "after": copy.deepcopy(digest_after),
+        },
+    }
+
+    # aws_iam_role.hub_publisher sorts before aws_ssm_parameter.authority_...
+    return [role_drift, digest_drift]
+
+
 def authority_contract_transition_fixture() -> dict:
     result = plan_fixture()
     result["applyable"] = True
@@ -596,6 +709,14 @@ def authority_contract_transition_fixture() -> dict:
             "authority_runtime_contract": True,
         },
     }
+    # Model the REAL Step-3 enablement plan's refresh phase: it always observes
+    # TWO benign, externally driven state normalizations in the same plan, so
+    # resource_drift carries this exact pair (Hub publisher inline-policy
+    # reflection + Authority image-digest roll), not a single entry. (Previously
+    # this fixture left resource_drift empty, which never exercised the 2-drift
+    # combination -- the gap the live plan hit; the #3411 terminal review's
+    # Finding 2.)
+    result["resource_drift"] = authority_enablement_drift_pair(result)
     return result
 
 
@@ -926,6 +1047,28 @@ def redis_password_refresh_candidate() -> tuple[dict, dict]:
     return candidate, prior_state
 
 
+def authority_enablement_refresh_candidate() -> tuple[dict, dict]:
+    """Live pre-apply refresh-only observation carrying the benign enablement pair.
+
+    This is the ``op=apply`` / ``op=verify`` counterpart to
+    ``authority_contract_transition_fixture``: the same benign pair (Hub-publisher
+    inline-policy reflection + Authority image-digest roll), but observed by a
+    ``terraform plan -refresh-only`` (no ``resource_changes``, empty planned
+    root_module) and bound to the captured pre-plan state, exactly the shape the
+    workflow feeds to ``check_normalization_drift``.
+    """
+    candidate = plan_fixture()
+    candidate["applyable"] = True
+    drift = authority_enablement_drift_pair(candidate)
+    candidate["resource_drift"] = drift
+    prior_state = terraform_1_14_refresh_only_golden(candidate)
+    for item in drift:
+        state_resource(prior_state, item["address"])["values"] = copy.deepcopy(
+            item["change"]["before"]
+        )
+    return candidate, prior_state
+
+
 class PlanContractTests(unittest.TestCase):
     def test_real_terraform_1_14_3_noop_status_contract(self) -> None:
         real_noop = json.loads(
@@ -1038,6 +1181,195 @@ class PlanContractTests(unittest.TestCase):
         ):
             normalized_changes[address]["after_unknown"] = {}
         self.assertEqual(CHECKER.check_plan(normalized)["resource_count"], 50)
+
+    def test_authority_enablement_benign_drift_pair_passes(self) -> None:
+        # The REAL Step-3 enablement plan carries exactly two benign refresh-phase
+        # drifts (Hub-publisher inline-policy reflection + Authority image-digest
+        # roll). The pair is admitted as one combined kind, with each item still
+        # validated by its own exact single-drift validator.
+        candidate = authority_contract_transition_fixture()
+        self.assertEqual(
+            {item["address"] for item in candidate["resource_drift"]},
+            {
+                "module.control.aws_iam_role.hub_publisher",
+                CHECKER._AUTHORITY_DIGEST_ADDRESS,
+            },
+        )
+        summary = CHECKER.check_plan(candidate)
+        self.assertEqual(summary["plan_mode"], "authority-contract-binding")
+        self.assertEqual(
+            summary["normalization_drift_kind"],
+            "authority-enablement-normalization",
+        )
+        self.assertEqual(summary["normalization_drift_count"], 2)
+        self.assertEqual(summary["bootstrap_create_count"], 0)
+        self.assertRegex(summary["normalization_drift_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_authority_enablement_drift_pair_is_order_insensitive(self) -> None:
+        # Terraform's resource_drift ordering is not observable locally, so
+        # admission must not depend on it -- each item is validated by address.
+        forward = authority_contract_transition_fixture()
+        reverse = authority_contract_transition_fixture()
+        reverse["resource_drift"].reverse()
+        for label, candidate in (("forward", forward), ("reverse", reverse)):
+            with self.subTest(order=label):
+                summary = CHECKER.check_plan(candidate)
+                self.assertEqual(
+                    summary["normalization_drift_kind"],
+                    "authority-enablement-normalization",
+                )
+                self.assertEqual(summary["normalization_drift_count"], 2)
+
+    def test_authority_enablement_single_benign_drift_still_passes(self) -> None:
+        # The 2-drift branch must not hijack the exact single-drift admissions:
+        # each benign drift on its own keeps its own single-drift kind.
+        role_candidate, role_state = publisher_refresh_candidate(hub=True)
+        self.assertEqual(
+            CHECKER.check_plan(role_candidate, role_state)[
+                "normalization_drift_kind"
+            ],
+            "hub-publisher-role",
+        )
+        digest_candidate, digest_state = authority_digest_refresh_candidate()
+        self.assertEqual(
+            CHECKER.check_plan(digest_candidate, digest_state)[
+                "normalization_drift_kind"
+            ],
+            "authority-digest",
+        )
+        # The digest rolls permanently, so a lone digest drift is also admissible
+        # in the enablement config-change plan (still kept as "authority-digest").
+        digest_only = authority_contract_transition_fixture()
+        digest_only["resource_drift"] = [
+            self.drift(digest_only, CHECKER._AUTHORITY_DIGEST_ADDRESS)
+        ]
+        summary = CHECKER.check_plan(digest_only)
+        self.assertEqual(summary["plan_mode"], "authority-contract-binding")
+        self.assertEqual(summary["normalization_drift_kind"], "authority-digest")
+        self.assertEqual(summary["normalization_drift_count"], 1)
+
+    def test_authority_enablement_drift_pair_other_combinations_fail(self) -> None:
+        role_address = "module.control.aws_iam_role.hub_publisher"
+        digest_address = CHECKER._AUTHORITY_DIGEST_ADDRESS
+
+        # A different address in either slot is not the exact reviewed pair.
+        swapped_role = authority_contract_transition_fixture()
+        self.drift(swapped_role, role_address)["address"] = (
+            "module.control.aws_iam_role.authority_publisher"
+        )
+        self.assert_rejected(swapped_role)
+
+        swapped_digest = authority_contract_transition_fixture()
+        self.drift(swapped_digest, digest_address)["address"] = (
+            CHECKER._HUB_DIGEST_ADDRESS
+        )
+        self.assert_rejected(swapped_digest)
+
+        # A duplicated benign address (len 2, but only one distinct address).
+        duplicated = authority_contract_transition_fixture()
+        role_item = self.drift(duplicated, role_address)
+        duplicated["resource_drift"] = [
+            copy.deepcopy(role_item),
+            copy.deepcopy(role_item),
+        ]
+        self.assert_rejected(duplicated)
+
+        # A third drift beyond the exact pair.
+        extra = authority_contract_transition_fixture()
+        extra["resource_drift"].append(
+            copy.deepcopy(self.drift(extra, digest_address))
+        )
+        self.assert_rejected(extra)
+
+    def test_authority_enablement_drift_pair_each_item_is_validated(self) -> None:
+        role_address = "module.control.aws_iam_role.hub_publisher"
+        digest_address = CHECKER._AUTHORITY_DIGEST_ADDRESS
+
+        # Corrupting the Hub-publisher-role drift beyond a pure inline-policy
+        # reflection must fail: _check_publisher_role_normalization is not
+        # weakened by the pair admission.
+        bad_role = authority_contract_transition_fixture()
+        self.drift(bad_role, role_address)["change"]["after"][
+            "max_session_duration"
+        ] = 7200
+        self.assert_rejected(bad_role)
+
+        # A digest drift whose value did not actually roll must fail: the
+        # _check_digest_normalization immutability proof is not weakened either.
+        bad_digest = authority_contract_transition_fixture()
+        digest_change = self.drift(bad_digest, digest_address)["change"]
+        digest_change["before"]["value"] = digest_change["after"]["value"]
+        self.assert_rejected(bad_digest)
+
+    def test_authority_enablement_drift_pair_admitted_only_for_enablement(
+        self,
+    ) -> None:
+        # The exact same benign pair carries no admission outside the reviewed
+        # enablement transition: a no-op or another transition stays fail-closed.
+        noop = plan_fixture()
+        noop["resource_drift"] = authority_enablement_drift_pair(noop)
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            "admitted only for the Authority contract enablement transition",
+        ):
+            CHECKER.check_plan(noop)
+
+        redis = redis_split_transition_fixture()
+        redis["resource_drift"] = authority_enablement_drift_pair(redis)
+        with self.assertRaisesRegex(
+            CHECKER.ContractError,
+            "admitted only for the Authority contract enablement transition",
+        ):
+            CHECKER.check_plan(redis)
+
+    def test_authority_enablement_tolerates_config_change_plan_metadata(
+        self,
+    ) -> None:
+        # The live Step-3 enablement plan (op=plan, NOT -refresh-only) also
+        # carries the config-change plan metadata the current fixtures omit:
+        # output_changes ("Changes to Outputs: authority_image_uri"),
+        # planned_values, a top-level variables block, and it is checked WITH the
+        # captured prior state (`check_plan plan.json state.json`). check_plan
+        # reconstructs from prior_state and validates outputs/planned_values ONLY
+        # for the refresh-only shape (resource_changes absent); for a
+        # config-change plan those fields are ignored, so the authority_image_uri
+        # output roll must not perturb admission. Lock that tolerance against a
+        # realistic shape so a future output check would have to reckon with it.
+        candidate = authority_contract_transition_fixture()
+        candidate["output_changes"] = {
+            "authority_image_uri": {
+                "actions": ["update"],
+                "before": None,
+                "after": (
+                    f"{CHECKER.ACCOUNT_ID}.dkr.ecr.{CHECKER.AWS_REGION}"
+                    ".amazonaws.com/layerv/nhp-authority@sha256:" + "2" * 64
+                ),
+                "after_unknown": False,
+                "before_sensitive": False,
+                "after_sensitive": False,
+            }
+        }
+        candidate["planned_values"] = {
+            "outputs": {},
+            "root_module": {
+                "child_modules": [{"address": "module.control", "resources": []}]
+            },
+        }
+        candidate["variables"] = {
+            "authority_runtime_contract_evidence_verified": {"value": True}
+        }
+        prior_state = {
+            "format_version": "1.0",
+            "terraform_version": CHECKER.TF_VERSION,
+            "values": {"outputs": {}, "root_module": {}},
+        }
+        summary = CHECKER.check_plan(candidate, prior_state)
+        self.assertEqual(summary["plan_mode"], "authority-contract-binding")
+        self.assertEqual(
+            summary["normalization_drift_kind"],
+            "authority-enablement-normalization",
+        )
+        self.assertEqual(summary["normalization_drift_count"], 2)
 
     def test_exact_refresh_disabled_password_omission_passes(self) -> None:
         candidate = plan_fixture()
@@ -1428,6 +1760,135 @@ class PlanContractTests(unittest.TestCase):
         CHECKER.check_normalization_drift(
             first_publication, first_publication_state
         )
+
+    def test_authority_enablement_pair_normalization_drift_reproof_passes(
+        self,
+    ) -> None:
+        # The op=apply / op=verify live-refresh lane re-proves the SAME benign
+        # pair via check_normalization_drift (the output-ignoring narrow mode);
+        # its {count, kind, sha256} must equal the plan lane's summary so the
+        # workflow's plan-vs-live cmp matches.
+        candidate, prior_state = authority_enablement_refresh_candidate()
+        observation = CHECKER.check_normalization_drift(candidate, prior_state)
+        self.assertEqual(observation["normalization_drift_count"], 2)
+        self.assertEqual(
+            observation["normalization_drift_kind"],
+            "authority-enablement-normalization",
+        )
+        self.assertRegex(
+            observation["normalization_drift_sha256"], r"^[0-9a-f]{64}$"
+        )
+        # check_normalization_drift returns exactly the three fields the workflow
+        # compares (jq '{count, kind, sha256}').
+        self.assertEqual(
+            set(observation),
+            {
+                "normalization_drift_count",
+                "normalization_drift_kind",
+                "normalization_drift_sha256",
+            },
+        )
+
+        plan_summary = CHECKER.check_plan(authority_contract_transition_fixture())
+        for field in (
+            "normalization_drift_count",
+            "normalization_drift_kind",
+            "normalization_drift_sha256",
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(observation[field], plan_summary[field])
+
+    def test_authority_enablement_pair_normalization_drift_is_order_insensitive(
+        self,
+    ) -> None:
+        # Terraform may serialize the live-refresh pair in a different order than
+        # the reviewed plan; the canonical sha256 must still match so the pair is
+        # not spuriously rejected as "moved".
+        plan_sha = CHECKER.check_plan(
+            authority_contract_transition_fixture()
+        )["normalization_drift_sha256"]
+        for label in ("forward", "reverse"):
+            with self.subTest(order=label):
+                candidate, prior_state = authority_enablement_refresh_candidate()
+                if label == "reverse":
+                    candidate["resource_drift"].reverse()
+                observation = CHECKER.check_normalization_drift(
+                    candidate, prior_state
+                )
+                self.assertEqual(observation["normalization_drift_count"], 2)
+                self.assertEqual(
+                    observation["normalization_drift_kind"],
+                    "authority-enablement-normalization",
+                )
+                self.assertEqual(
+                    observation["normalization_drift_sha256"], plan_sha
+                )
+
+    def test_authority_enablement_pair_normalization_drift_fails_closed(
+        self,
+    ) -> None:
+        role_address = "module.control.aws_iam_role.hub_publisher"
+        digest_address = CHECKER._AUTHORITY_DIGEST_ADDRESS
+
+        def assert_rejected(mutate) -> None:
+            candidate, prior_state = authority_enablement_refresh_candidate()
+            mutate(candidate, prior_state)
+            with self.assertRaises(CHECKER.ContractError):
+                CHECKER.check_normalization_drift(candidate, prior_state)
+
+        def swap_role(candidate, _prior) -> None:
+            # A different second address is not the reviewed pair.
+            next(
+                d for d in candidate["resource_drift"] if d["address"] == role_address
+            )["address"] = "module.control.aws_iam_role.authority_publisher"
+
+        def corrupt_role(candidate, _prior) -> None:
+            # The Hub-publisher-role validator is not weakened by the pair path.
+            next(
+                d for d in candidate["resource_drift"] if d["address"] == role_address
+            )["change"]["after"]["max_session_duration"] = 7200
+
+        def move_state(_candidate, prior) -> None:
+            # A moved live observation (drift.before != captured state) must fail
+            # closed so the enablement is re-planned, not applied against a stale
+            # review.
+            state_resource(prior, digest_address)["values"]["version"] = 999
+
+        def drop_policy(_candidate, prior) -> None:
+            # The Hub publisher inline policy proves the role identity.
+            module = prior["values"]["root_module"]["child_modules"][0]
+            module["resources"] = [
+                item
+                for item in module["resources"]
+                if item["address"]
+                != "module.control.aws_iam_role_policy.hub_publisher"
+            ]
+
+        def extra_third(candidate, _prior) -> None:
+            candidate["resource_drift"].append(
+                copy.deepcopy(
+                    next(
+                        d
+                        for d in candidate["resource_drift"]
+                        if d["address"] == digest_address
+                    )
+                )
+            )
+
+        def not_refresh_only(candidate, _prior) -> None:
+            # A config-change plan is not a valid normalization observation.
+            candidate["resource_changes"] = []
+
+        for name, mutate in (
+            ("swap_role", swap_role),
+            ("corrupt_role", corrupt_role),
+            ("move_state", move_state),
+            ("drop_policy", drop_policy),
+            ("extra_third", extra_third),
+            ("not_refresh_only", not_refresh_only),
+        ):
+            with self.subTest(mutation=name):
+                assert_rejected(mutate)
 
     def test_exact_redis_password_refresh_only_normalization_passes(self) -> None:
         golden = json.loads(
@@ -2512,6 +2973,13 @@ class PlanContractTests(unittest.TestCase):
         return next(
             item["change"]
             for item in plan["resource_changes"]
+            if item["address"] == address
+        )
+
+    def drift(self, plan: dict, address: str) -> dict:
+        return next(
+            item
+            for item in plan["resource_drift"]
             if item["address"] == address
         )
 

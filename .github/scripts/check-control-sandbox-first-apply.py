@@ -400,6 +400,32 @@ _REDIS_PASSWORD_NORMALIZATION_SENSITIVE = {
     "tags_all": {},
 }
 
+# The Step-3 Connector Authority enablement plan (plan_mode
+# ``authority-contract-binding``) always refreshes two independent, externally
+# driven state normalizations in the SAME plan, so its ``resource_drift`` carries
+# exactly this benign pair rather than a single entry:
+#   * ``module.control.aws_iam_role.hub_publisher`` -- the provider reflecting the
+#     Hub publisher's separately managed inline policy into role state (validated
+#     by ``_check_publisher_role_normalization`` + ``_require_hub_publisher_identity``;
+#     accepted singly as ``hub-publisher-role``).
+#   * ``_AUTHORITY_DIGEST_ADDRESS`` -- the Authority image-digest SSM value, which
+#     ``layervai/qurl-service`` republishes/ROLLS on every main push and whose value
+#     Terraform intentionally ignores (``ignore_changes=[value]``); validated by
+#     ``_check_digest_normalization`` + ``_AUTHORITY_DIGEST_SPEC`` (accepted singly
+#     as ``authority-digest``).
+# Both drifts are refresh-phase observations that stand independently of the
+# foundation-contract config change, so they co-occur on every enablement plan.
+# Each is still validated against its own exact reviewed shape; only this precise
+# 2-address set (in either serialization order) is admitted, and only for the
+# enablement transition. Any other address, count, or shape still fails closed.
+_AUTHORITY_ENABLEMENT_NORMALIZATION_ADDRESSES = frozenset(
+    {
+        "module.control.aws_iam_role.hub_publisher",
+        _AUTHORITY_DIGEST_ADDRESS,
+    }
+)
+_AUTHORITY_ENABLEMENT_NORMALIZATION_KIND = "authority-enablement-normalization"
+
 
 def _is_exact_passwordless_authentication_mode(
     auth: Any,
@@ -879,6 +905,22 @@ def _json_sha256(value: Any) -> str:
 def _json_equal(left: Any, right: Any) -> bool:
     """Compare JSON values without Python's ``False == 0`` coercion."""
     return _canonical_json(left) == _canonical_json(right)
+
+
+def _normalization_drift_sha256(drift: list[dict[str, Any]]) -> str:
+    """Hash the admitted drift independent of Terraform's serialization order.
+
+    The review-time plan and the immediate pre-apply live-refresh plan observe
+    the same admitted drift, but Terraform does not guarantee the ``resource_drift``
+    array is serialized in an identical order across the two separate plans. The
+    order carries no security weight -- every entry is validated independently
+    against its exact reviewed shape -- so canonicalize by sorting on ``address``
+    before hashing. This is a no-op for the single-drift kinds and for the
+    already-address-sorted Redis pair, and it makes the enablement pair's
+    plan-vs-live ``normalization_drift_sha256`` comparison deterministic.
+    """
+    ordered = sorted(drift, key=lambda item: item.get("address") or "")
+    return _json_sha256(ordered)
 
 
 def _bounded_drift_identity_field(field: str, value: Any) -> tuple[str, bool]:
@@ -1899,6 +1941,40 @@ def _check_state_normalization_drift(
             )
         _check_redis_password_normalization(drift, by_address)
         return "redis-passwords"
+    if (
+        len(drift) == 2
+        and {item.get("address") for item in drift}
+        == _AUTHORITY_ENABLEMENT_NORMALIZATION_ADDRESSES
+    ):
+        # The Step-3 enablement plan refreshes both benign normalizations at
+        # once (see ``_AUTHORITY_ENABLEMENT_NORMALIZATION_ADDRESSES``). Validate
+        # EACH drift against its own exact single-drift reviewed shape -- the
+        # same ``_check_publisher_role_normalization`` /
+        # ``_check_digest_normalization`` used for the singly admitted kinds,
+        # neither weakened -- and admit the pair only when BOTH pass. Dispatch by
+        # address, so admission is independent of the order Terraform serializes
+        # the pair in (we cannot observe the live ordering locally, and order
+        # carries no security weight once each item is exactly validated). The
+        # matched length/set guarantees exactly one of each address. Unlike the
+        # Redis pair, this is admissible in a config-changing (non-refresh-only)
+        # plan: the caller restricts it to ``authority-contract-binding`` because
+        # the authority digest rolls permanently and must bind into the same
+        # enablement plan that changes the foundation contract.
+        by_drift_address = {item.get("address"): item for item in drift}
+        _check_publisher_role_normalization(
+            by_drift_address["module.control.aws_iam_role.hub_publisher"],
+            by_address,
+            role_address="module.control.aws_iam_role.hub_publisher",
+            policy_address="module.control.aws_iam_role_policy.hub_publisher",
+            identity_checker=_require_hub_publisher_identity,
+            label="Hub",
+        )
+        _check_digest_normalization(
+            by_drift_address[_AUTHORITY_DIGEST_ADDRESS],
+            by_address,
+            spec=_AUTHORITY_DIGEST_SPEC,
+        )
+        return _AUTHORITY_ENABLEMENT_NORMALIZATION_KIND
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
     item = drift[0]
@@ -2335,39 +2411,21 @@ def _check_refresh_only_outputs(
             )
 
 
-def _plan_resource_changes(
-    plan: dict[str, Any],
+def _reconstruct_refresh_only_changes(
+    prior_state: dict[str, Any],
     drift: list[dict[str, Any]],
-    prior_state: Any,
 ) -> list[dict[str, Any]]:
-    """Return ordinary changes or reconstruct Terraform's refresh-only shape.
+    """Reconstruct the no-op change set from captured state plus admitted drift.
 
-    Terraform 1.14 omits ``resource_changes`` when ``-refresh-only`` has no
-    configuration changes, and its ``planned_values`` may omit every unchanged
-    resource. Preserve the exact-inventory and planned-value checks by using the
-    separately captured, version-bound pre-plan state for the unchanged
-    inventory and overlaying only the admitted refresh drift. The workflow
-    proves that state object did not move while planning and re-captures the
-    identical object before apply.
+    Shared by the refresh-only ``check_plan`` lane and the pre-apply
+    ``check_normalization_drift`` lane so both bind the same way: every entry is a
+    no-op against the captured pre-plan inventory, and each admitted drift is
+    overlaid only after proving its ``before`` equals the captured state value and
+    its sensitive envelope is the exact reviewed refresh shape. The caller
+    validates ``prior_state``'s format/version before calling; this function then
+    fails closed on any missing inventory, malformed entry, unknown drift value,
+    sensitive-metadata mismatch, or drift address absent from the captured state.
     """
-    if "resource_changes" in plan:
-        changes = plan["resource_changes"]
-        if not isinstance(changes, list):
-            raise ContractError("Terraform plan resource_changes must be an array")
-        return changes
-    if not drift:
-        raise ContractError("Terraform plan resource_changes must be an array")
-
-    if (
-        not isinstance(prior_state, dict)
-        or prior_state.get("format_version") != "1.0"
-        or prior_state.get("terraform_version") != TF_VERSION
-    ):
-        raise ContractError(
-            f"refresh-only compatibility requires exact Terraform {TF_VERSION} state JSON"
-        )
-    _check_refresh_only_outputs(plan, prior_state)
-
     state_values = prior_state.get("values")
     root = (
         state_values.get("root_module") if isinstance(state_values, dict) else None
@@ -2453,6 +2511,41 @@ def _plan_resource_changes(
             f"refresh drift is absent from captured state: {unmatched_drift}"
         )
     return changes
+
+
+def _plan_resource_changes(
+    plan: dict[str, Any],
+    drift: list[dict[str, Any]],
+    prior_state: Any,
+) -> list[dict[str, Any]]:
+    """Return ordinary changes or reconstruct Terraform's refresh-only shape.
+
+    Terraform 1.14 omits ``resource_changes`` when ``-refresh-only`` has no
+    configuration changes, and its ``planned_values`` may omit every unchanged
+    resource. Preserve the exact-inventory and planned-value checks by using the
+    separately captured, version-bound pre-plan state for the unchanged
+    inventory and overlaying only the admitted refresh drift. The workflow
+    proves that state object did not move while planning and re-captures the
+    identical object before apply.
+    """
+    if "resource_changes" in plan:
+        changes = plan["resource_changes"]
+        if not isinstance(changes, list):
+            raise ContractError("Terraform plan resource_changes must be an array")
+        return changes
+    if not drift:
+        raise ContractError("Terraform plan resource_changes must be an array")
+
+    if (
+        not isinstance(prior_state, dict)
+        or prior_state.get("format_version") != "1.0"
+        or prior_state.get("terraform_version") != TF_VERSION
+    ):
+        raise ContractError(
+            f"refresh-only compatibility requires exact Terraform {TF_VERSION} state JSON"
+        )
+    _check_refresh_only_outputs(plan, prior_state)
+    return _reconstruct_refresh_only_changes(prior_state, drift)
 
 
 def _require_create_shapes(
@@ -2671,6 +2764,22 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             "Redis password projection normalization cannot be combined with "
             "a resource transition"
         )
+    if normalization_drift_kind == _AUTHORITY_ENABLEMENT_NORMALIZATION_KIND:
+        # The benign Hub-publisher-role + authority-digest drift pair is admitted
+        # ONLY for the reviewed Authority contract enablement transition. Each
+        # drift was already validated independently in
+        # ``_check_state_normalization_drift``; here we bind it to the exact plan
+        # shape it may accompany. The pair is deliberately admissible in this
+        # config-changing (not refresh-only) plan because the authority image
+        # digest rolls permanently on every upstream publish, so it must bind
+        # into the same enablement plan rather than requiring a separate
+        # refresh-only observation. Any other plan_mode carrying this pair (no-op,
+        # refresh-only, or another transition) stays fail-closed here.
+        if plan_mode != "authority-contract-binding":
+            raise ContractError(
+                "the benign Hub-publisher-role + authority-digest drift pair is "
+                "admitted only for the Authority contract enablement transition"
+            )
 
     expected_applyable = plan_mode != "no-op" or (
         normalization_drift_count > 0 and "resource_changes" not in plan
@@ -2686,7 +2795,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
     return {
         "bootstrap_create_count": len(bootstrap_creates),
         "contract_sha256": contract_sha256(),
-        "normalization_drift_sha256": _json_sha256(drift),
+        "normalization_drift_sha256": _normalization_drift_sha256(drift),
         "normalization_drift_count": normalization_drift_count,
         "normalization_drift_kind": normalization_drift_kind,
         "plan_mode": plan_mode,
@@ -2728,6 +2837,68 @@ def _iter_resources(module: Any) -> Iterable[dict[str, Any]]:
         yield from _iter_resources(child)
 
 
+def _check_authority_enablement_normalization_drift(
+    drift: list[dict[str, Any]],
+    prior_state: Any,
+) -> dict[str, str | int]:
+    """Re-prove the benign enablement drift pair against the captured state.
+
+    Pre-apply live-refresh counterpart to the plan-lane admission in
+    ``_check_state_normalization_drift``: it binds the same benign pair
+    (Hub-publisher inline-policy reflection + Authority image-digest roll) in the
+    output-ignoring ``check_normalization_drift`` mode so ``op=apply`` /
+    ``op=verify`` can re-prove the reviewed drift even though the enablement's
+    unapplied ``authority_image_uri`` output change stops the full refresh-only
+    plan contract from describing the observation.
+
+    The pair is reconstructed from the captured pre-plan state exactly as the
+    refresh-only ``check_plan`` lane does -- ``_reconstruct_refresh_only_changes``
+    binds each drift ``before`` to the captured state value and pins the refresh
+    sensitivity envelope -- then dispatched through the SAME
+    ``_check_state_normalization_drift`` the plan lane uses, so each drift is
+    validated by its existing ``_check_publisher_role_normalization`` /
+    ``_check_digest_normalization`` (neither weakened), order-insensitive. The
+    Authority digest rolls permanently and the Hub-publisher role reflection is
+    benign, so the enablement plan/apply/verify lanes must all bind WITH the pair
+    present. Any other address, count, shape, or an unmatched captured state fails
+    closed. The returned ``normalization_drift_sha256`` is canonical (address
+    sorted) so it matches the plan lane's summary regardless of serialization
+    order.
+    """
+    if (
+        not isinstance(prior_state, dict)
+        or prior_state.get("format_version") != "1.0"
+        or prior_state.get("terraform_version") != TF_VERSION
+    ):
+        raise ContractError(
+            f"normalization observation requires exact Terraform {TF_VERSION} state JSON"
+        )
+    reconstructed = _reconstruct_refresh_only_changes(prior_state, drift)
+    by_address = {item["address"]: item for item in reconstructed}
+    # The pair validators additionally need the Hub publisher inline policy from
+    # the captured inventory to prove the role identity; the policy carries no
+    # drift, so require it explicitly here.
+    for required in (
+        "module.control.aws_iam_role.hub_publisher",
+        "module.control.aws_iam_role_policy.hub_publisher",
+        _AUTHORITY_DIGEST_ADDRESS,
+    ):
+        if required not in by_address:
+            raise ContractError(
+                f"captured state does not contain the exact {required} resource"
+            )
+    kind = _check_state_normalization_drift(drift, by_address, refresh_only=True)
+    if kind != _AUTHORITY_ENABLEMENT_NORMALIZATION_KIND:
+        # The caller matched the exact 2-address set, so the shared dispatch must
+        # return the combined kind. Anything else is a contract regression.
+        raise _unexpected_drift_error(drift)
+    return {
+        "normalization_drift_count": 2,
+        "normalization_drift_kind": kind,
+        "normalization_drift_sha256": _normalization_drift_sha256(drift),
+    }
+
+
 def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | int]:
     """Bind a live refresh observation to the externally owned digest drift.
 
@@ -2762,6 +2933,17 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
         )
     _check_no_embedded_actions(plan)
     drift = _non_noop(plan.get("resource_drift"), "resource_drift")
+    if (
+        len(drift) == 2
+        and {item.get("address") for item in drift}
+        == _AUTHORITY_ENABLEMENT_NORMALIZATION_ADDRESSES
+    ):
+        # The enablement plan binds the benign Hub-publisher-role + authority-digest
+        # pair (see ``_AUTHORITY_ENABLEMENT_NORMALIZATION_ADDRESSES``). The pre-apply
+        # live-refresh lane re-proves the same pair here, in this output-ignoring
+        # narrow mode, because the enablement's unapplied output change means the
+        # full refresh-only ``check_plan`` contract cannot describe the observation.
+        return _check_authority_enablement_normalization_drift(drift, prior_state)
     if len(drift) != 1:
         raise _unexpected_drift_error(drift)
     specs = {
@@ -2804,7 +2986,7 @@ def check_normalization_drift(plan: Any, prior_state: Any) -> dict[str, str | in
     return {
         "normalization_drift_count": 1,
         "normalization_drift_kind": spec["kind"],
-        "normalization_drift_sha256": _json_sha256(drift),
+        "normalization_drift_sha256": _normalization_drift_sha256(drift),
     }
 
 
