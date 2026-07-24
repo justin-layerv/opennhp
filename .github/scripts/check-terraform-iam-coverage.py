@@ -286,6 +286,8 @@ DATA_SOURCE_ACTIONS: dict[str, ActionSpec] = {
     # internal/service/ec2/availability_zones_data_source.go calls
     # ec2:DescribeAvailabilityZones.
     "aws_availability_zones": ["ec2:DescribeAvailabilityZones"],
+    # internal/service/ec2/ec2_ami_data_source.go calls ec2:DescribeImages.
+    "aws_ami": ["ec2:DescribeImages"],
     # internal/service/ec2/vpc_prefix_list_data_source.go calls
     # ec2:DescribePrefixLists.
     "aws_prefix_list": ["ec2:DescribePrefixLists"],

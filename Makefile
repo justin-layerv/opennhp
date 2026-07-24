@@ -514,6 +514,10 @@ lint-workflows:
 	@python3 tests/scripts/test_verify_relay_dmz_flow_evidence.py
 	@terraform -chdir=terraform/modules/relay-network init -backend=false >/dev/null
 	@terraform -chdir=terraform/modules/relay-network test
+	@shellcheck terraform/modules/udp-proof-runner/user_data.sh.tpl
+	@python3 -m unittest -v terraform/modules/udp-proof-runner/lambda/test_broker.py
+	@terraform -chdir=terraform/modules/udp-proof-runner init -backend=false >/dev/null
+	@terraform -chdir=terraform/modules/udp-proof-runner test
 	@python3 -c 'import yaml' 2>/dev/null || { \
 		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \
 		echo "$(COLOUR_RED)  Match the CI install: python3 -m pip install --no-cache-dir pyyaml$(END_COLOUR)"; \
@@ -652,6 +656,7 @@ test-ebpf: $(EBPF_OBJ_XDP)
 test-lambdas: ## Run Lambda unit tests (Python)
 	@echo "[OpenNHP] Running Lambda Unit Tests..."
 	python3 -m pytest terraform/modules/billing/lambda/test_*.py terraform/modules/developer-portal/lambda/test_*.py -v
+	python3 -m unittest -v terraform/modules/udp-proof-runner/lambda/test_broker.py
 	@echo "$(COLOUR_GREEN)[OpenNHP] Lambda Unit Tests Done!$(END_COLOUR)"
 
 test-local: ## Run local e2e tests (requires: docker compose -f tests/local/docker-compose.test.yaml up -d etcd)

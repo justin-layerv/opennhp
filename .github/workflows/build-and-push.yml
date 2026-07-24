@@ -1064,6 +1064,9 @@ jobs:
           echo '::group::Status Page Aggregator Lambda Tests'
           (cd terraform/modules/status-page/lambda && python -m pytest test_status_aggregator.py -v)
           echo '::endgroup::'
+          echo '::group::UDP Proof Runner Broker Tests'
+          python -m unittest -v terraform/modules/udp-proof-runner/lambda/test_broker.py
+          echo '::endgroup::'
           echo '::group::Auth0 Rotation Lambda Tests (Node)'
           node --test terraform/modules/auth0/lambda/rotate_secret.test.js
           echo '::endgroup::'
@@ -1689,6 +1692,15 @@ jobs:
         if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         working-directory: terraform/modules/relay-network
         run: |
+          terraform init -backend=false
+          terraform test
+
+      - name: Test UDP proof runner foundation
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
+        working-directory: terraform/modules/udp-proof-runner
+        run: |
+          shellcheck user_data.sh.tpl
+          python3 -m unittest -v lambda/test_broker.py
           terraform init -backend=false
           terraform test
 

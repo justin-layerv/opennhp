@@ -23,6 +23,7 @@ intentionally duplicated in the Python condition lint and
 | Fixture | Class | Expected `iam-coverage` | Expected `policy-conditions` |
 |---|---|---|---|
 | `clean` | green path | exit 0 | exit 0 |
+| `ami-data-source` | A — AMI metadata lookup requires `ec2:DescribeImages` | exit 0 | exit 0 |
 | `lambda-invocation-data-source` | A — refreshable Lambda invocation requires `lambda:InvokeFunction` | exit 0 | exit 0 |
 | `iam-gap-1323` | A — #1323 regression | exit 1 (gap) | exit 0 |
 | `policy-condition-1316` | B — #1316 regression (`aws:SourceAccount`) | exit 0 | exit 1 (banned condition) |
