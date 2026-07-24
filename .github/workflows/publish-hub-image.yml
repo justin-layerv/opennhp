@@ -1,0 +1,214 @@
+name: Publish Connector Hub Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: Dedicated Hub artifact target
+        required: true
+        type: choice
+        options:
+          - sandbox
+          - production
+
+permissions:
+  actions: read
+  contents: read
+  deployments: read
+  id-token: write
+
+concurrency:
+  group: hub-image-publication-${{ inputs.target_environment }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish immutable Hub image (${{ inputs.target_environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: hub-publish-${{ inputs.target_environment }}
+    steps:
+      - name: Checkout exact main source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve exact source and target contract
+        id: contract
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "layervai/nhp" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+
+          commit_time=$(git show -s --format=%cd --date=format:'%Y-%m-%d %H:%M:%S' "$GITHUB_SHA")
+          [[ "$commit_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]
+
+          case "$TARGET_ENVIRONMENT" in
+            sandbox)
+              account_id="767397897469"
+              terraform_environment="sandbox"
+              ;;
+            production)
+              account_id="235500187906"
+              terraform_environment="prod"
+              ;;
+            *)
+              echo "::error::Unapproved Hub publication target: $TARGET_ENVIRONMENT"
+              exit 1
+              ;;
+          esac
+
+          role_name="layerv-nhp-${terraform_environment}-control-hub-publisher"
+          {
+            echo "account_id=$account_id"
+            echo "role_arn=arn:aws:iam::${account_id}:role/${role_name}"
+            echo "local_image=local/layerv/nhp-hub:${GITHUB_SHA}"
+            echo "publication_environment=hub-publish-${TARGET_ENVIRONMENT}"
+            echo "source_commit_time=$commit_time"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build exact linux/amd64 Hub image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/Dockerfile.hub
+          platforms: linux/amd64
+          push: false
+          load: true
+          # This carrier produces its own secret-free publication record. Keep
+          # the registry tag a single image manifest so ECR scan, architecture,
+          # and config-digest verification all bind the same subject.
+          provenance: false
+          sbom: false
+          tags: ${{ steps.contract.outputs.local_image }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          build-args: |
+            NHP_BUILD_COMMIT_ID=${{ github.sha }}
+            NHP_BUILD_COMMIT_TIME=${{ steps.contract.outputs.source_commit_time }}
+          cache-from: type=gha,scope=hub-publication-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'internalauth/go.mod', 'endpoints/go.mod', 'endpoints/go.sum') }}
+          cache-to: type=gha,mode=max,scope=hub-publication-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'internalauth/go.mod', 'endpoints/go.mod', 'endpoints/go.sum') }}
+
+      # Match the repository's reviewed image policy before obtaining AWS
+      # credentials. ECR's independent scan is mandatory after the push too.
+      - name: Scan exact local Hub image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.contract.outputs.local_image }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          trivyignores: .trivyignore
+
+      # Approval, build, and local scanning can take long enough for main to
+      # advance. Once AWS access starts, this run becomes the publication
+      # operation in flight, so reject a formerly-main dispatch immediately
+      # before that point of no return.
+      - name: Re-read live main before AWS access
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-live-main-ref.sh "$GITHUB_SHA"
+
+      # Environment approval by itself is not enough: settings can drift after
+      # workflow review or during the build. Read the exact live policy beside
+      # the main-ref check so both guards are fresh at the pre-OIDC boundary.
+      - name: Verify protected publication Environment before AWS access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_ENVIRONMENT: hub-publish-${{ inputs.target_environment }}
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "layervai/nhp" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$PUBLICATION_ENVIRONMENT" != "sandbox" ]]
+          [[ "$PUBLICATION_ENVIRONMENT" != "production" ]]
+
+          environment_json="$RUNNER_TEMP/hub-publication-environment.json"
+          branch_policies_json="$RUNNER_TEMP/hub-publication-branch-policies.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/$PUBLICATION_ENVIRONMENT" \
+            > "$environment_json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/$PUBLICATION_ENVIRONMENT/deployment-branch-policies" \
+            > "$branch_policies_json"
+          python3 .github/scripts/check-hub-publication-environment.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --target-environment "$TARGET_ENVIRONMENT" \
+            --publication-environment "$PUBLICATION_ENVIRONMENT" \
+            --environment-json "$environment_json" \
+            --branch-policies-json "$branch_policies_json"
+
+      - name: Configure dedicated Hub publisher session
+        id: aws
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ steps.contract.outputs.role_arn }}
+          role-session-name: hub-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: us-east-2
+          role-duration-seconds: 1800
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Publish, scan, and pin exact source-SHA image
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws.outputs.aws-session-token }}
+          AWS_REGION: us-east-2
+          AWS_DEFAULT_REGION: us-east-2
+          PUBLICATION_ENVIRONMENT: ${{ steps.contract.outputs.publication_environment }}
+          SOURCE_COMMIT_TIME: ${{ steps.contract.outputs.source_commit_time }}
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 .github/scripts/publish-hub-image.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --target-environment "$TARGET_ENVIRONMENT" \
+            --publication-environment "$PUBLICATION_ENVIRONMENT" \
+            --source-ref "$GITHUB_REF" \
+            --source-sha "$GITHUB_SHA" \
+            --source-commit-time "$SOURCE_COMMIT_TIME" \
+            --workflow-ref "$GITHUB_WORKFLOW_REF" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --local-image "${{ steps.contract.outputs.local_image }}" \
+            --provenance-file "$RUNNER_TEMP/hub-publication-provenance.json"
+
+      - name: Remove publisher registry credentials
+        if: always()
+        run: |
+          docker logout \
+            "${{ steps.contract.outputs.account_id }}.dkr.ecr.us-east-2.amazonaws.com" \
+            >/dev/null 2>&1 || true
+
+      - name: Upload secret-free publication provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hub-publication-${{ inputs.target_environment }}-${{ github.sha }}
+          path: ${{ runner.temp }}/hub-publication-provenance.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Summarize dark artifact publication
+        run: |
+          set -euo pipefail
+          provenance="$RUNNER_TEMP/hub-publication-provenance.json"
+          {
+            echo "### Connector Hub artifact publication"
+            echo "- source: \`$(jq -r '.source.sha' "$provenance")\`"
+            echo "- image: \`$(jq -r '.image.reference' "$provenance")\`"
+            echo "- architecture: \`$(jq -r '.image.os + \"/\" + .image.architecture' "$provenance")\`"
+            echo "- ECR scan: \`$(jq -r '.scan.status' "$provenance")\`"
+            echo "- digest pin: \`$(jq -r '.digest_pin.parameter_name' "$provenance")\`"
+            echo "- runtime deployment: **none**"
+          } >> "$GITHUB_STEP_SUMMARY"

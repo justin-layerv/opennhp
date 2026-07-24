@@ -500,6 +500,8 @@ lint-workflows:
 	@shellcheck scripts/capture-control-sandbox-update-state.sh scripts/check-control-sandbox-aws-identity.sh scripts/check-control-global-routing.sh scripts/check-control-vpc-cidr-overlap.sh scripts/check-live-main-ref.sh scripts/check-no-checkout-credentials.sh scripts/ensure-control-otp-pepper.sh scripts/verify-control-otp-pepper.sh scripts/verify-control-sandbox-first-apply.sh scripts/verify-control-sandbox-live-boundary.sh tests/fixtures/control-vpc-cidr-overlap/aws tests/scripts/check-control-global-routing_test.sh
 	@python3 tests/scripts/test_check_control_sandbox_first_apply.py
 	@python3 tests/scripts/test_check_control_sandbox_update.py
+	@python3 tests/scripts/test_check_hub_publication_environment.py
+	@python3 tests/scripts/test_publish_hub_image.py
 	@bash tests/scripts/check-control-global-routing_test.sh
 	@python3 tests/scripts/test_summarize_terraform_plan.py
 	@python3 tests/scripts/test_relay_trusted_key_validation_lockstep.py

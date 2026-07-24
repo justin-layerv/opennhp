@@ -561,6 +561,14 @@ jobs:
           python3 -m py_compile .github/scripts/check-sandbox-terraform-read-recovery.py
           python3 .github/scripts/tests/test_check_sandbox_terraform_read_recovery.py
 
+      - name: Test dark Hub artifact publication carrier
+        run: |
+          python3 -m py_compile \
+            .github/scripts/check-hub-publication-environment.py \
+            .github/scripts/publish-hub-image.py
+          python3 tests/scripts/test_check_hub_publication_environment.py
+          python3 tests/scripts/test_publish_hub_image.py
+
       - name: Setup Terraform for relay DMZ contract test
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:

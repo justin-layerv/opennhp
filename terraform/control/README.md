@@ -55,7 +55,16 @@ The 2026-07-23 live readback established both dedicated Environments with
 required reviewer Justin (`178750268`), a sole custom `main` deployment branch
 policy, `can_admins_bypass=true`, and `prevent_self_review=false`; the shared
 `sandbox` and `production` Environments were unchanged. These observed settings
-do not replace the per-publication preflight.
+do not replace the per-publication preflight. This is deliberately a
+single-operator approval and audit checkpoint, not a two-person-control or
+malicious-repository-admin boundary: the same trusted operator may dispatch and
+approve, and a trusted repository admin retains GitHub's emergency bypass.
+The load-bearing controls against accidental publication, and for the ordinary
+reviewed path, remain the manual exact-live-`main` dispatch, source-SHA
+confirmation, dedicated Environment OIDC subject, sole `main` branch policy,
+and exact publisher-role scope. The checker intentionally permits either
+boolean to become stricter later without a carrier change; widening reviewer or
+branch policy still fails closed.
 
 The role can push/read and verify
 manifests only in `layerv/nhp-hub` and get/put only

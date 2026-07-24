@@ -82,6 +82,34 @@ Successful applies and explicit `verify` runs require a refresh-enabled no-op
 and upload only sanitized state, inventory, live-boundary, and secret-readiness
 summaries—not raw Terraform state or plan JSON.
 
+### `publish-hub-image.yml` — Publish Connector Hub Image
+
+Manual artifact-only carrier for the dark Connector Hub. It runs only from
+`main` and declares the dedicated `hub-publish-sandbox` or
+`hub-publish-production` GitHub Environment. Before requesting an AWS identity,
+the job reads the live Environment settings and requires exactly Justin
+(`178750268`) as the sole reviewer plus exactly one custom `main` branch policy;
+the shared deployment Environments are rejected.
+
+The workflow builds the existing Hub image contract for linux/amd64 with the
+exact source SHA and commit time, applies the repository's HIGH/CRITICAL Trivy
+policy, then re-reads live `main` and rejects a dispatch SHA that became stale
+during approval/build. It assumes only the environment-specific Hub publisher
+role, scopes those AWS credentials to the publish/scan/pin step, and removes
+the registry login before provenance upload. It
+publishes no mutable tag: the sole remote tag is the source SHA. The carrier
+binds the registry manifest digest back to the built config, architecture, and
+OCI source/revision labels; waits for the independent ECR scan to complete with
+zero HIGH/CRITICAL findings; writes only the environment's
+`/<env>/nhp/control/hub/image-digest`; and requires exact readback. A private
+90-day JSON artifact records secret-free source, role, image, scan, and pin
+provenance.
+
+The carrier creates no ECS task, service, NLB, DNS, Authority permission, or
+traffic path. The ordinary `build-and-push.yml` Hub matrix row remains
+`publish: false`; publication is deliberately separate from normal application
+build/deploy credentials.
+
 ### `terraform-plan-pr.yml` — Terraform Plan (PR)
 
 Runs on every PR so branch protection can require the check; the per-PR runner cost is an accepted tradeoff for a non-deadlocking required check. It skips without AWS credentials unless the PR touches Terraform plan inputs. Markdown-only changes under `terraform/` are treated as docs and do not request AWS credentials, including prod-environment markdown because docs are classified before the prod-only Terraform glob. Prod-only `terraform/environments/prod/**` PRs report `prod-only skipped` instead of hard-gating on unrelated sandbox state.
