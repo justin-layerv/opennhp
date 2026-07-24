@@ -1,14 +1,16 @@
 # 2026-07-23 · NHP main deploy semantic invokes
 
 - **Owner:** prod rollout coordinator
-- **Source:** [NHP main deploy run 30047738154](https://github.com/layervai/nhp/actions/runs/30047738154) and [NHP #3405](https://github.com/layervai/nhp/pull/3405)
+- **Source:** [NHP main deploy run 30047738154](https://github.com/layervai/nhp/actions/runs/30047738154), confirming main deploy run [30050586024](https://github.com/layervai/nhp/actions/runs/30050586024), and [NHP #3405](https://github.com/layervai/nhp/pull/3405)
 
 The sandbox deploy role lost its accidental broad Lambda-invoke fallback when
-#3391 narrowed helper access. Restore only the qualified read-only relay-status
-invoke before rerunning the failed deployment, and verify production has the
-same exact grant before its next apply.
+#3391 narrowed helper access. Because Terraform refresh invokes relay-status
+before it can apply the pending read-policy repair, recover through the
+temporary, sandbox-only saved-plan workflow; do not restore broad helper access
+or create a policy version by hand.
 
-- [ ] Pre-rollout: add only `relay-status:$LATEST` to the sandbox `terraform-read` policy, then verify policy simulation permits that ARN and denies the unqualified target plus an Authority alias.
-- [ ] Rollout: rerun current NHP `main` sandbox deployment and require Infrastructure, post-apply plan, validation, and smoke jobs to pass.
-- [ ] Pre-production: verify the production deploy role has the same exact qualified grant before the next production Terraform plan; repair it first if absent.
-- [ ] Post-rollout: record the successful sandbox run and production readback on the hotfix PR, then delete this ledger entry once both environments are complete.
+- [ ] Sandbox recovery: merge the temporary `Recover Sandbox Terraform Read Policy` workflow, dispatch it once from an explicitly confirmed exact live `main`, and require its `-refresh=false` targeted saved-plan checker to prove one in-place `terraform_read` update adding only `RelayIdentityStatusInvoke` on the qualified `relay-status:$LATEST` ARN. Immediately before apply, bind the live managed policy's unchanged default version and exact document to the saved plan's `before` value. Apply that same saved plan under the normal sandbox deploy role, then require a newer live default version whose exact document equals the saved plan's `after` value; never use a raw `iam create-policy-version` escape hatch.
+- [ ] Authorization proof: make up to 24 qualified Lambda `DryRun` attempts with five-second intervals while IAM propagates, then require status `204` on `relay-status:$LATEST`. Require `AccessDeniedException` with no identity-based allow for both the unqualified relay-status function and `layerv-nhp-sandbox-ca-iro-cell0:blue`. `DryRun` must remain load-bearing so no relay or Authority function code executes during these permission probes.
+- [ ] Ordinary rollout: after recovery succeeds, dispatch a fresh normal NHP `main` sandbox deployment from the same still-live commit and require Infrastructure, refresh-enabled post-apply planning, validation, and smoke jobs to pass. Do not rerun the one-time recovery attempt.
+- [ ] Pre-production: before the next production Terraform plan, verify source and live production deploy-role policy contain the same sole exact qualified semantic-read grant. Repair production through its separately reviewed promotion lane if absent; this sandbox workflow has no production role, state, or environment.
+- [ ] Cleanup: record the successful recovery and ordinary sandbox deployment links on #3405, then delete the temporary recovery workflow, its checker/tests, validation wiring, and its entry in `tests/fixtures/relay-dmz-plan/sandbox-refresh-false-shapes.json`. Delete this ledger entry only after that cleanup and the production readback are complete.

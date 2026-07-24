@@ -1,0 +1,320 @@
+name: Recover Sandbox Terraform Read Policy
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_main_sha:
+        description: 'Exact lowercase 40-hex live main commit containing the reviewed recovery'
+        required: true
+        type: string
+      confirmation:
+        description: 'Type APPLY_EXACT_SANDBOX_TERRAFORM_READ_RECOVERY'
+        required: true
+        type: string
+
+# One-time sandbox-only recovery for the refresh-before-apply bootstrap failure
+# from runs 30047738154 and 30050586024. Delete this workflow, its plan
+# checker/tests, and their validation wiring after recovery plus the fresh
+# ordinary main deploy pass.
+concurrency:
+  group: deploy-sandbox-infra
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  TF_VERSION: '1.14.3'
+  TERRAFORM_ROOT: terraform/environments/sandbox
+  TARGET_ADDRESS: module.nhp.module.ecr.aws_iam_policy.terraform_read
+  TARGET_POLICY_ARN: arn:aws:iam::767397897469:policy/nhp-sandbox-github-actions-terraform-read
+  QUALIFIED_RELAY_STATUS_ARN: arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-relay-status:$LATEST
+  UNQUALIFIED_RELAY_STATUS_ARN: arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-relay-status
+  CONNECTOR_AUTHORITY_ALIAS_ARN: arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-iro-cell0:blue
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Require exact live main and one-shot confirmation
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Check dispatch boundary
+        env:
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == '1' ]] || {
+            echo '::error::Recovery reruns are forbidden; inspect the first attempt and dispatch a new run only if no apply occurred.'
+            exit 1
+          }
+          [[ "$GITHUB_REF" == 'refs/heads/main' ]] || {
+            echo '::error::Recovery runs only from refs/heads/main.'
+            exit 1
+          }
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo '::error::expected_main_sha must be exact lowercase 40-hex.'
+            exit 1
+          }
+          [[ "$EXPECTED_MAIN_SHA" == "$GITHUB_SHA" ]] || {
+            echo '::error::Dispatch checkout is not the explicitly confirmed main commit.'
+            exit 1
+          }
+          [[ "$CONFIRMATION" == 'APPLY_EXACT_SANDBOX_TERRAFORM_READ_RECOVERY' ]] || {
+            echo '::error::Recovery confirmation is not exact.'
+            exit 1
+          }
+
+  recover:
+    name: Apply exact sandbox terraform_read recovery
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Reject recover job reruns before any action or AWS access
+        run: |
+          [[ "$GITHUB_RUN_ATTEMPT" == '1' ]] || {
+            echo '::error::The credentialed recover job cannot run on a workflow rerun after a partial or completed apply.'
+            exit 1
+          }
+
+      - name: Checkout exact confirmed main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.expected_main_sha }}
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
+      - name: Re-read live main before AWS access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+        run: scripts/check-live-main-ref.sh "$EXPECTED_MAIN_SHA"
+
+      - name: Prove checkout credentials are absent before Terraform
+        run: scripts/check-no-checkout-credentials.sh
+
+      - name: Configure normal sandbox deploy role
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: sandbox-read-recover-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prove exact sandbox deploy identity
+        run: scripts/check-control-sandbox-aws-identity.sh "sandbox-read-recover-${GITHUB_RUN_ID}"
+
+      - name: Initialize normal sandbox state
+        working-directory: ${{ env.TERRAFORM_ROOT }}
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init -reconfigure -input=false
+
+      - name: Build and mechanically review exact saved recovery plan
+        working-directory: ${{ env.TERRAFORM_ROOT }}
+        env:
+          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          terraform plan \
+            -refresh=false \
+            -target="$TARGET_ADDRESS" \
+            -input=false \
+            -lock-timeout=5m \
+            -no-color \
+            -out=tfplan
+          terraform show -json tfplan >tfplan.json
+          python3 ../../../.github/scripts/check-sandbox-terraform-read-recovery.py \
+            tfplan.json | tee recovery-contract-summary.json
+          terraform show -no-color tfplan
+
+      - name: Re-read live main immediately before exact apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+        run: scripts/check-live-main-ref.sh "$EXPECTED_MAIN_SHA"
+
+      - name: Apply the mechanically reviewed saved plan
+        working-directory: ${{ env.TERRAFORM_ROOT }}
+        run: |
+          set -euo pipefail
+          ../../../scripts/check-no-checkout-credentials.sh
+          python3 ../../../.github/scripts/check-sandbox-terraform-read-recovery.py \
+            tfplan.json >/dev/null
+
+          fetch_live_policy() {
+            local prefix="$1"
+            local metadata="${prefix}-metadata.json"
+            local version="${prefix}-version.json"
+            local confirmed_metadata="${prefix}-metadata-confirmed.json"
+            local default_version
+
+            aws iam get-policy \
+              --policy-arn "$TARGET_POLICY_ARN" \
+              --output json >"$metadata" || return
+            default_version="$(jq -er \
+              '.Policy.DefaultVersionId | select(type == "string" and test("^v[1-9][0-9]*$"))' \
+              "$metadata")" || return
+            aws iam get-policy-version \
+              --policy-arn "$TARGET_POLICY_ARN" \
+              --version-id "$default_version" \
+              --output json >"$version" || return
+            # Close the metadata/document race: the immutable version document
+            # is accepted only while it remains the live default.
+            aws iam get-policy \
+              --policy-arn "$TARGET_POLICY_ARN" \
+              --output json >"$confirmed_metadata" || return
+          }
+
+          fetch_live_policy live-before
+          before_default_version="$(jq -er \
+            '.Policy.DefaultVersionId | select(type == "string" and test("^v[1-9][0-9]*$"))' \
+            live-before-metadata-confirmed.json)"
+          python3 ../../../.github/scripts/check-sandbox-terraform-read-recovery.py \
+            tfplan.json \
+            --live-phase before \
+            --policy-metadata-json live-before-metadata.json \
+            --policy-version-json live-before-version.json \
+            --confirmed-policy-metadata-json live-before-metadata-confirmed.json \
+            >live-before-contract-summary.json
+          echo '::notice::Live terraform_read policy exactly matches the saved plan before value.'
+
+          terraform apply -input=false -lock-timeout=5m -no-color tfplan
+
+          post_apply_verified=false
+          for attempt in {1..24}; do
+            if fetch_live_policy live-after 2>live-after-contract.err && \
+              python3 ../../../.github/scripts/check-sandbox-terraform-read-recovery.py \
+                tfplan.json \
+                --live-phase after \
+                --policy-metadata-json live-after-metadata.json \
+                --policy-version-json live-after-version.json \
+                --confirmed-policy-metadata-json live-after-metadata-confirmed.json \
+                --previous-default-version "$before_default_version" \
+                >live-after-contract-summary.json \
+                2>live-after-contract.err; then
+              post_apply_verified=true
+              break
+            fi
+            if [[ "$attempt" -lt 24 ]]; then
+              sleep 5
+            fi
+          done
+          [[ "$post_apply_verified" == true ]] || {
+            sed 's/^/Policy verification: /' live-after-contract.err >&2
+            echo '::error::Live terraform_read policy did not converge to the exact saved plan after value in 24 bounded attempts.'
+            exit 1
+          }
+          echo '::notice::Live terraform_read policy advanced and exactly matches the saved plan after value.'
+
+          rm -f \
+            tfplan \
+            tfplan.json \
+            recovery-contract-summary.json \
+            live-before-metadata.json \
+            live-before-version.json \
+            live-before-metadata-confirmed.json \
+            live-before-contract-summary.json \
+            live-after-metadata.json \
+            live-after-version.json \
+            live-after-metadata-confirmed.json \
+            live-after-contract-summary.json \
+            live-after-contract.err
+
+      - name: Wait for exact qualified DryRun authorization
+        run: |
+          set -euo pipefail
+          authorized=false
+          for attempt in {1..24}; do
+            error_file="$RUNNER_TEMP/qualified-dry-run.err"
+            if status_code="$(aws lambda invoke \
+              --function-name "$QUALIFIED_RELAY_STATUS_ARN" \
+              --invocation-type DryRun \
+              --query StatusCode \
+              --output text \
+              "$RUNNER_TEMP/qualified-dry-run.json" \
+              2>"$error_file")"; then
+              [[ "$status_code" == '204' ]] || {
+                echo "::error::Qualified relay-status DryRun returned unexpected status $status_code instead of 204."
+                exit 1
+              }
+              authorized=true
+              break
+            fi
+            if ! grep -q 'AccessDeniedException' "$error_file"; then
+              sed 's/^/AWS: /' "$error_file" >&2
+              echo '::error::Qualified relay-status DryRun failed for a reason other than IAM propagation.'
+              exit 1
+            fi
+            if [[ "$attempt" -lt 24 ]]; then
+              sleep 5
+            fi
+          done
+          [[ "$authorized" == true ]] || {
+            echo '::error::Qualified relay-status DryRun did not become authorized after 24 bounded attempts.'
+            exit 1
+          }
+
+      - name: Prove unqualified and Authority aliases remain implicitly denied
+        run: |
+          set -euo pipefail
+          assert_implicit_deny() {
+            local target="$1"
+            local label="$2"
+            local output="$RUNNER_TEMP/${label}.json"
+            local error_file="$RUNNER_TEMP/${label}.err"
+            if aws lambda invoke \
+              --function-name "$target" \
+              --invocation-type DryRun \
+              "$output" \
+              2>"$error_file"; then
+              echo "::error::$label unexpectedly permits lambda:InvokeFunction."
+              exit 1
+            fi
+            # The temporary one-shot intentionally pins AWS CLI's current
+            # implicit identity-policy wording. Any wording drift fails closed.
+            if ! grep -q 'AccessDeniedException' "$error_file" || \
+              ! grep -q 'no identity-based policy allows' "$error_file"; then
+              sed 's/^/AWS: /' "$error_file" >&2
+              echo "::error::$label did not produce the expected implicit identity-policy denial."
+              exit 1
+            fi
+          }
+          # DryRun asks Lambda to authorize the request without executing any
+          # function code, so these probes cannot invoke Authority behavior.
+          assert_implicit_deny "$UNQUALIFIED_RELAY_STATUS_ARN" unqualified-relay-status
+          assert_implicit_deny "$CONNECTOR_AUTHORITY_ALIAS_ARN" connector-authority-alias
+
+      - name: Summarize handoff to ordinary main deployment
+        env:
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+        run: |
+          {
+            echo '## Sandbox terraform_read recovery complete'
+            echo
+            echo "- Exact main: \`$EXPECTED_MAIN_SHA\`"
+            echo "- Change: one in-place update to \`$TARGET_ADDRESS\`"
+            echo "- Positive authorization: qualified \`relay-status:\$LATEST\` DryRun"
+            echo "- Negative authorization: unqualified relay-status and Connector Authority alias remain implicit denies"
+            echo
+            echo 'Dispatch the ordinary Build and Deploy NHP workflow from this exact live main with sandbox deployment enabled. Do not rerun this recovery attempt.'
+          } >>"$GITHUB_STEP_SUMMARY"

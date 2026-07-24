@@ -233,19 +233,23 @@ def _terraform_semantic_read_invoke_scope_error(
 def terraform_helper_invoke_scope_error(
     parsed: list[tuple[Path, dict[str, Any]]],
 ) -> str | None:
-    matches = {
-        name: body
+    matches = [
+        (name, body)
         for file, rtype, name, body in iter_resources(parsed)
         if _in_canonical_module(file)
         and rtype == "aws_iam_policy"
         and name in {"terraform_apply_data", "terraform_read"}
-    }
-    if set(matches) != {"terraform_apply_data", "terraform_read"}:
+    ]
+    if sorted(name for name, _ in matches) != [
+        "terraform_apply_data",
+        "terraform_read",
+    ]:
         return "expected exactly one canonical terraform_apply_data and terraform_read policy"
+    policies = dict(matches)
     return _terraform_helper_invoke_scope_error(
-        extract_policy_body(matches["terraform_apply_data"].get("policy"))
+        extract_policy_body(policies["terraform_apply_data"].get("policy"))
     ) or _terraform_semantic_read_invoke_scope_error(
-        extract_policy_body(matches["terraform_read"].get("policy"))
+        extract_policy_body(policies["terraform_read"].get("policy"))
     )
 
 

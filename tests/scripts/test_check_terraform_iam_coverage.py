@@ -171,6 +171,25 @@ class TerraformHelperInvokeScope(unittest.TestCase):
             },
         )
 
+    def test_duplicate_canonical_policy_definition_fails(self):
+        path = REPO_ROOT / "terraform" / "modules" / "ecr" / "duplicate.tf"
+        parsed = [
+            (
+                path,
+                {
+                    "resource": [
+                        {"aws_iam_policy": {"terraform_apply_data": {}}},
+                        {"aws_iam_policy": {"terraform_apply_data": {}}},
+                        {"aws_iam_policy": {"terraform_read": {}}},
+                    ]
+                },
+            )
+        ]
+        self.assertEqual(
+            IAM.terraform_helper_invoke_scope_error(parsed),
+            "expected exactly one canonical terraform_apply_data and terraform_read policy",
+        )
+
     def test_main_surfaces_helper_scope_failure(self):
         original_argv = sys.argv
         try:
