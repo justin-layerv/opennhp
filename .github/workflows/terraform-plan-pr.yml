@@ -15,6 +15,12 @@ env:
   AWS_REGION: us-east-2
   TF_VERSION: '1.14.3'
   TF_IN_AUTOMATION: "true"
+  # Environment-global Connector Authority control root and the committed
+  # measurement basis its ephemeral runtime contract is generated from. These
+  # mirror .github/workflows/control-sandbox-update.yml so the PR-time control
+  # convergence plan reflects the same live-enabled Authority runtime contract.
+  CONTROL_ROOT: terraform/control/environments/sandbox
+  AUTHORITY_RUNTIME_BASIS: docs/evidence/connector-authority/v1/sandbox-measurement-basis.json
 
 jobs:
   terraform-plan:
@@ -291,6 +297,27 @@ jobs:
       # revise this policy and its exact tests in the same PR. The plan contract
       # below also rejects any desired public-network or runtime resource type
       # from the machine-readable plan.
+
+      # The committed dark Control config carries authority_runtime_contract =
+      # null, but LIVE sandbox Control state has the Connector Authority runtime
+      # contract enabled. Regenerate the same verified ephemeral tfvars that
+      # control-sandbox-update.yml plans with so this PR-time convergence plan
+      # reflects the live-enabled contract instead of planning a revert. The
+      # generator is deterministic from the committed basis and the full Git
+      # history (fetch-depth: 0 above) and needs no AWS access; the read-only
+      # PR plan role can read the resulting data sources
+      # (data.aws_ssm_parameter -> ssm:GetParameter, data.aws_ecr_image ->
+      # ecr:DescribeImages).
+      - name: Generate verified ephemeral Authority runtime input
+        if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
+        run: |
+          .github/scripts/generate-connector-authority-runtime-contract.py \
+            --mode sandbox-exact-main \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --manifest "$AUTHORITY_RUNTIME_BASIS" \
+            --expected-checkout-commit "$GITHUB_SHA" \
+            --output "$CONTROL_ROOT/authority-runtime.generated.tfvars.json"
+
       - name: Terraform Control Init
         if: success() && steps.changes.outputs.terraform_changed == 'true' && steps.plan_config.outputs.enabled == 'true'
         working-directory: terraform/control/environments/sandbox
@@ -312,6 +339,7 @@ jobs:
           terraform plan \
             -refresh=false \
             -lock=false \
+            -var-file=authority-runtime.generated.tfvars.json \
             -out=control.tfplan \
             -no-color 2>&1 | tee control-plan.txt
           status=${PIPESTATUS[0]}
