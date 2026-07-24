@@ -194,6 +194,28 @@ if ! cmp -s "$sandbox_wrapper" "$prod_wrapper"; then
   exit 1
 fi
 
+# This schema-only precursor has no evidence generator. Keep the child-module
+# latch unreachable from either environment root so a caller-supplied contract
+# and caller-supplied boolean can never substitute for exact-main verification.
+for environment in sandbox prod; do
+  environment_root="${control_dir}/environments/${environment}"
+  status=0
+  grep -R -nH -E --include='*.tf' \
+    'authority_runtime_contract_evidence_verified' \
+    "$environment_root" || status=$?
+  case "$status" in
+    0)
+      echo "ERROR: ${environment} Control root must not expose or set the internal Authority runtime evidence latch in this schema-only precursor" >&2
+      exit 1
+      ;;
+    1) ;;
+    *)
+      echo "ERROR: ${environment} Control evidence-latch scan failed with status ${status}" >&2
+      exit 2
+      ;;
+  esac
+done
+
 sandbox_outputs="${control_dir}/environments/sandbox/outputs.tf"
 prod_outputs="${control_dir}/environments/prod/outputs.tf"
 if [[ ! -r "$sandbox_outputs" || ! -r "$prod_outputs" ]]; then

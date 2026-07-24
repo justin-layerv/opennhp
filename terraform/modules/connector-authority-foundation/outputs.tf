@@ -24,6 +24,16 @@ output "control_table_arns" {
   }
 }
 
+output "authority_runtime_contract" {
+  description = "Validated nullable version-1 Authority runtime contract. Both current environment wrappers keep this null and the runtime dark."
+  value       = var.authority_runtime_contract
+}
+
+output "authority_selected_alias_targets" {
+  description = "Plan-derived same-color Hub and provisioned-cell Authority alias ARNs. This schema-only precursor creates no function or caller path."
+  value       = local.authority_selected_alias_targets
+}
+
 output "vpc_id" {
   description = "Dedicated environment-global Control VPC ID."
   value       = aws_vpc.control.id

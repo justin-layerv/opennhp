@@ -127,6 +127,14 @@ printf '%s\n' '# unintended environment drift' >>"${control_dir}/environments/pr
 expect_failure 'module wrappers must remain byte-identical' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
 write_clean_fixture
+for environment in sandbox prod; do
+  printf '%s\n' \
+    '  authority_runtime_contract_evidence_verified = true' \
+    >>"${control_dir}/environments/${environment}/main.tf"
+done
+expect_failure 'must not expose or set the internal Authority runtime evidence latch' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+write_clean_fixture
 printf '%s\n' '# unintended output drift' >>"${control_dir}/environments/prod/outputs.tf"
 expect_failure 'output wrappers must remain byte-identical' env NHP_REPO_ROOT="$fixture_root" "$checker"
 

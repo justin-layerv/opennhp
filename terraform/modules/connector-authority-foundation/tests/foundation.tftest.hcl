@@ -42,6 +42,23 @@ run "sandbox_foundation_is_global_dark_and_isolated" {
   }
 
   assert {
+    condition = (
+      output.authority_runtime_contract == null &&
+      output.authority_selected_alias_targets == null
+    )
+    error_message = "The schema-only sandbox foundation must retain a null Authority contract and no selected targets."
+  }
+
+  assert {
+    condition = toset(keys(terraform_data.foundation_contract.input)) == toset([
+      "account_id",
+      "control_table_prefix",
+      "region",
+    ])
+    error_message = "The schema precursor must not persist the nullable Authority contract or create a Control state transition."
+  }
+
+  assert {
     condition = output.control_table_names == {
       api_keys            = "layerv-nhp-sandbox-control-qurl-api-keys"
       agent_keys          = "layerv-nhp-sandbox-control-qurl-agent-keys"
@@ -365,6 +382,14 @@ run "production_tables_are_deletion_protected" {
       aws_dynamodb_table.connector_authority.deletion_protection_enabled,
     ])
     error_message = "Every production control table must have deletion protection."
+  }
+
+  assert {
+    condition = (
+      output.authority_runtime_contract == null &&
+      output.authority_selected_alias_targets == null
+    )
+    error_message = "Production must retain a null Authority contract and no selected targets."
   }
 
   assert {

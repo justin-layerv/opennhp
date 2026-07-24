@@ -48,6 +48,12 @@ variable "ses_configuration_set_name" {
   default = "layerv-nhp-sandbox-agent-otp"
 }
 
+variable "authority_runtime_contract" {
+  description = "Nullable closed Connector Authority runtime contract. This schema-only precursor intentionally rejects every non-null root value until a later reviewed exact-main evidence composition verifies and supplies the complete sandbox measurement object."
+  type        = any
+  default     = null
+}
+
 variable "tags" {
   type = map(string)
   default = {

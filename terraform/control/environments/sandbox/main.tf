@@ -6,5 +6,6 @@ module "control" {
   vpc_cidr                   = var.vpc_cidr
   otp_email_from             = var.otp_email_from
   ses_configuration_set_name = var.ses_configuration_set_name
+  authority_runtime_contract = var.authority_runtime_contract
   tags                       = var.tags
 }

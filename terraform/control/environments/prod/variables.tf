@@ -48,6 +48,12 @@ variable "ses_configuration_set_name" {
   default = "layerv-nhp-prod-agent-otp"
 }
 
+variable "authority_runtime_contract" {
+  description = "Nullable closed Connector Authority runtime contract. This schema-only precursor intentionally rejects every non-null root value; production must remain null until its independent repository, publication, and measurement evidence are reviewed."
+  type        = any
+  default     = null
+}
+
 variable "tags" {
   type = map(string)
   default = {

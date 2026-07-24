@@ -23,6 +23,22 @@ in-VPC AWS SDK service names resolve to these endpoints: changing only the
 endpoint policy or only security-group ingress would route calls privately and
 fail them at the boundary.
 
+The nullable `authority_runtime_contract` root input is also dark in this
+schema-only precursor. Both environment wrappers intentionally leave the
+module's internal evidence-verification latch false, so any non-null root value
+fails closed. The versioned object freezes the future provisioned-cell,
+operation, concurrency, request-rate, color, and evidence shapes without
+creating a runtime or accepting caller-supplied evidence as proof. A later
+reviewed exact-main composition must verify the immutable provisioned-cell
+catalog evidence against canonical cell-root outputs, verify every referenced
+manifest blob and SSM/ECR/KMS/Redis identity, and only then open the internal
+latch for the generated sandbox measurement contract. Production remains null
+until it has independent environment-specific evidence. This precursor is not
+an enabled 6a deployment. The null contract is deliberately absent from the
+persisted `terraform_data.foundation_contract` input and from both root output
+surfaces, so merging this schema precursor does not create a Control state
+transition or an attended rollout task.
+
 The one non-runtime cross-repository identity is the dedicated Connector
 Authority image publisher role. Sandbox trusts only the
 `repo:layervai/qurl-service:environment:sandbox` GitHub OIDC subject;

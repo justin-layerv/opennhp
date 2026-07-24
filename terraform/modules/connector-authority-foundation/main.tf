@@ -61,5 +61,40 @@ resource "terraform_data" "foundation_contract" {
       condition     = alltrue([for user_id in local.otp_redis_user_ids : length(user_id) <= 40])
       error_message = "Every Connector OTP Redis user ID must be at most 40 characters."
     }
+
+    precondition {
+      condition     = local.authority_contract_shape_valid
+      error_message = "authority_runtime_contract must use the exact closed version-1 object, catalog, caller concurrency/rate, function, and evidence key sets."
+    }
+
+    precondition {
+      condition     = local.authority_contract_identity_valid
+      error_message = "authority_runtime_contract environment, AWS, image, QAT1, Redis, or provisioned-cell identity does not match the live Control foundation."
+    }
+
+    precondition {
+      condition     = local.authority_contract_graph_valid
+      error_message = "authority_runtime_contract must contain the complete Hub group plus only complete provisioned-cell operation groups, and ready must contain exact 3 + 4N."
+    }
+
+    precondition {
+      condition     = local.authority_contract_integer_capacity_valid
+      error_message = "authority_runtime_contract replica, limit, quota, headroom, concurrency, and retention values must be exact Terraform integers."
+    }
+
+    precondition {
+      condition     = local.authority_contract_capacity_valid
+      error_message = "authority_runtime_contract capacity must satisfy caller concurrency/rate aggregation, every provisioned-allocation request-rate ceiling, steady/rollout algebra, rollback bounds, and the retained account-concurrency envelope."
+    }
+
+    precondition {
+      condition     = local.authority_contract_evidence_valid
+      error_message = "authority_runtime_contract catalog, basis, and result evidence must use the exact versioned NHP shape; measurement forbids result evidence and ready requires it."
+    }
+
+    precondition {
+      condition     = local.authority_contract_enablement_valid
+      error_message = "authority_runtime_contract must remain null until the exact-main evidence generator verifies every referenced blob and explicitly opens the internal evidence latch."
+    }
   }
 }
