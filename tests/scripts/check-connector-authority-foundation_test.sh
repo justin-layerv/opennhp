@@ -88,6 +88,15 @@ expect_failure() {
   fi
 }
 
+expect_success() {
+  local output
+  if ! output=$("$@" 2>&1); then
+    echo "ERROR: command unexpectedly failed: $*" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+
 write_clean_fixture
 NHP_REPO_ROOT="$fixture_root" "$checker" >/dev/null
 
@@ -167,19 +176,26 @@ expect_failure 'must pass the internal evidence latch exactly once' env NHP_REPO
 
 write_clean_fixture
 printf '%s\n' '{}' >"${control_dir}/environments/sandbox/unreviewed.auto.tfvars"
-expect_failure 'must not commit generated runtime tfvars' env NHP_REPO_ROOT="$fixture_root" "$checker"
+expect_failure 'must not commit runtime tfvars' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
-# The generated latch tfvars is emitted as JSON (authority-runtime.generated.tfvars.json)
-# and Terraform auto-loads *.tfvars.json / *.auto.tfvars.json, so the committed-tfvars
-# guard must reject those variants too — otherwise a committed *.auto.tfvars.json could
-# open the sandbox evidence latch (which has no root-variable validation).
+# The sanctioned exact-main runtime output authority-runtime.generated.tfvars.json
+# is written into the Control root by the workflow generator at plan time and is
+# the ONLY supported way to open the sandbox latch — it must be ALLOWED even
+# though it matches *.tfvars.json. (The guard previously matched it, which broke
+# the enablement plan.)
 write_clean_fixture
 printf '%s\n' '{}' >"${control_dir}/environments/sandbox/authority-runtime.generated.tfvars.json"
-expect_failure 'must not commit generated runtime tfvars' env NHP_REPO_ROOT="$fixture_root" "$checker"
+expect_success env NHP_REPO_ROOT="$fixture_root" "$checker"
 
+# Any OTHER committed *.tfvars.json / *.auto.tfvars.json is still rejected —
+# Terraform auto-loads it and it could open the latch, so Finding 1 is preserved.
 write_clean_fixture
 printf '%s\n' '{}' >"${control_dir}/environments/sandbox/evil.auto.tfvars.json"
-expect_failure 'must not commit generated runtime tfvars' env NHP_REPO_ROOT="$fixture_root" "$checker"
+expect_failure 'must not commit runtime tfvars' env NHP_REPO_ROOT="$fixture_root" "$checker"
+
+write_clean_fixture
+printf '%s\n' '{}' >"${control_dir}/environments/sandbox/evil.tfvars.json"
+expect_failure 'must not commit runtime tfvars' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
 write_clean_fixture
 sed -i.bak '/Production Authority evidence latch must remain false/d' \

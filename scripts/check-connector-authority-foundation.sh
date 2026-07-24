@@ -206,11 +206,20 @@ for environment in sandbox prod; do
     echo "ERROR: ${environment} Control wrapper must pass the internal evidence latch exactly once from its root variable" >&2
     exit 1
   fi
+  # Reject any COMMITTED tfvars in the Control root (a committed *.auto.tfvars /
+  # *.auto.tfvars.json would be terraform-auto-loaded and could open the latch),
+  # but EXCLUDE the sanctioned exact-main runtime output
+  # `authority-runtime.generated.tfvars.json`: the workflow's byte-verifying
+  # generator writes it into this root at plan time (it is git-ignored and
+  # atomically overwritten every run), so its presence on disk here is expected
+  # and is the only supported way to open the sandbox latch (see the comment
+  # above). Matching it was a regression from adding the `.json` variants.
   if find "$environment_root" -maxdepth 1 -type f \
     \( -name '*.tfvars' -o -name '*.tfvars.json' \
-       -o -name '*.auto.tfvars' -o -name '*.auto.tfvars.json' \) -print -quit \
+       -o -name '*.auto.tfvars' -o -name '*.auto.tfvars.json' \) \
+    ! -name 'authority-runtime.generated.tfvars.json' -print -quit \
     | grep -q .; then
-    echo "ERROR: ${environment} Control root must not commit generated runtime tfvars" >&2
+    echo "ERROR: ${environment} Control root must not commit runtime tfvars" >&2
     exit 1
   fi
 done
