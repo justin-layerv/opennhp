@@ -11,11 +11,16 @@ on:
         description: 'Type APPLY_EXACT_SANDBOX_TERRAFORM_READ_RECOVERY'
         required: true
         type: string
+      stale_lock_confirmation:
+        description: 'Type FORCE_UNLOCK_EXACT_REVIEWED_SANDBOX_PLAN_LOCK'
+        required: true
+        type: string
 
 # One-time sandbox-only recovery for the refresh-before-apply bootstrap failure
-# from runs 30047738154 and 30050586024. Delete this workflow, its plan
-# checker/tests, and their validation wiring after recovery plus the fresh
-# ordinary main deploy pass.
+# from runs 30047738154 and 30050586024. Run 30051956048 then lost its
+# hosted runner during a pre-apply plan, leaving the exact S3 lock recovered
+# below. Delete this workflow, its checkers/tests, and their validation
+# wiring after recovery plus the fresh ordinary main deploy pass.
 concurrency:
   group: deploy-sandbox-infra
   cancel-in-progress: false
@@ -29,6 +34,11 @@ env:
   QUALIFIED_RELAY_STATUS_ARN: arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-relay-status:$LATEST
   UNQUALIFIED_RELAY_STATUS_ARN: arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-relay-status
   CONNECTOR_AUTHORITY_ALIAS_ARN: arn:aws:lambda:us-east-2:767397897469:function:layerv-nhp-sandbox-ca-iro-cell0:blue
+  STALE_LOCK_ID: cf94626e-a9b3-f45f-08cc-c6c68c2f1ed0
+  STATE_BUCKET: layerv-terraform-state-767397897469
+  STATE_LOCK_KEY: nhp/sandbox/terraform.tfstate.tflock
+  STALE_LOCK_SOURCE_RUN_ID: '30051956048'
+  STALE_LOCK_SOURCE_JOB_ID: '89356869295'
 
 permissions:
   contents: read
@@ -44,6 +54,7 @@ jobs:
         env:
           EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
           CONFIRMATION: ${{ inputs.confirmation }}
+          STALE_LOCK_CONFIRMATION: ${{ inputs.stale_lock_confirmation }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_RUN_ATTEMPT" == '1' ]] || {
@@ -66,6 +77,10 @@ jobs:
             echo '::error::Recovery confirmation is not exact.'
             exit 1
           }
+          [[ "$STALE_LOCK_CONFIRMATION" == 'FORCE_UNLOCK_EXACT_REVIEWED_SANDBOX_PLAN_LOCK' ]] || {
+            echo '::error::Stale-lock recovery confirmation is not exact.'
+            exit 1
+          }
 
   recover:
     name: Apply exact sandbox terraform_read recovery
@@ -74,6 +89,7 @@ jobs:
     environment: sandbox
     timeout-minutes: 20
     permissions:
+      actions: read
       contents: read
       id-token: write
     steps:
@@ -131,10 +147,62 @@ jobs:
       - name: Build and mechanically review exact saved recovery plan
         working-directory: ${{ env.TERRAFORM_ROOT }}
         env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
           TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
           TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
         run: |
           set -euo pipefail
+
+          # This job holds the same deploy-sandbox-infra concurrency group as
+          # every repository workflow that can mutate the sandbox backend.
+          # Bind the only remaining owner—the exact stale lock object—to the
+          # exact completed hosted-runner failure before asking Terraform
+          # itself to remove that lock. Never raw-delete the lock or disable
+          # locking.
+          ../../../scripts/check-live-main-ref.sh "$EXPECTED_MAIN_SHA"
+          lock_json="$RUNNER_TEMP/sandbox-terraform.tflock.json"
+          source_run_json="$RUNNER_TEMP/stale-lock-source-run.json"
+          source_job_json="$RUNNER_TEMP/stale-lock-source-job.json"
+          list_lock_key() {
+            aws s3api list-objects-v2 \
+              --bucket "$STATE_BUCKET" \
+              --prefix "$STATE_LOCK_KEY" \
+              --output json \
+              | jq -er --arg key "$STATE_LOCK_KEY" \
+                '[.Contents[]?.Key | select(. == $key)] | length'
+          }
+          aws s3api get-object \
+            --bucket "$STATE_BUCKET" \
+            --key "$STATE_LOCK_KEY" \
+            "$lock_json" >/dev/null
+          lock_count_before="$(list_lock_key)"
+          [[ "$lock_count_before" == '1' ]] || {
+            echo "::error::Expected the exact reviewed lock once before force-unlock; found $lock_count_before."
+            exit 1
+          }
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$STALE_LOCK_SOURCE_RUN_ID" \
+            >"$source_run_json"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/jobs/$STALE_LOCK_SOURCE_JOB_ID" \
+            >"$source_job_json"
+          python3 ../../../.github/scripts/check-sandbox-stale-state-lock.py \
+            "$lock_json" \
+            "$source_run_json" \
+            "$source_job_json" \
+            | tee stale-lock-contract-summary.json
+          jq -e --arg lock_id "$STALE_LOCK_ID" \
+            '.lock_id == $lock_id' \
+            stale-lock-contract-summary.json >/dev/null
+          terraform force-unlock -force "$STALE_LOCK_ID"
+          lock_count_after="$(list_lock_key)"
+          [[ "$lock_count_after" == '0' ]] || {
+            echo "::error::Expected the reviewed lock to be absent after force-unlock; found $lock_count_after."
+            exit 1
+          }
+          echo '::notice::Terraform removed the exact reviewed stale plan lock.'
+
           terraform plan \
             -refresh=false \
             -target="$TARGET_ADDRESS" \
@@ -229,6 +297,7 @@ jobs:
           rm -f \
             tfplan \
             tfplan.json \
+            stale-lock-contract-summary.json \
             recovery-contract-summary.json \
             live-before-metadata.json \
             live-before-version.json \

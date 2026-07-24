@@ -358,6 +358,60 @@ class RecoveryWorkflowContract(unittest.TestCase):
             with self.subTest(literal=literal):
                 self.assertIn(literal, workflow)
 
+    def test_stale_lock_recovery_is_exact_guarded_and_pre_plan(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        plan_step = workflow.index(
+            "      - name: Build and mechanically review exact saved recovery plan"
+        )
+        apply_step = workflow.index(
+            "      - name: Apply the mechanically reviewed saved plan",
+            plan_step,
+        )
+        body = workflow[plan_step:apply_step]
+        live_main = body.index(
+            '../../../scripts/check-live-main-ref.sh "$EXPECTED_MAIN_SHA"'
+        )
+        lock_read = body.index("aws s3api get-object")
+        lock_list_before = body.index(
+            'lock_count_before="$(list_lock_key)"',
+            lock_read,
+        )
+        evidence_check = body.index(
+            "check-sandbox-stale-state-lock.py",
+            lock_list_before,
+        )
+        lock_id_check = body.index(
+            "'.lock_id == $lock_id'",
+            evidence_check,
+        )
+        force_unlock = body.index(
+            'terraform force-unlock -force "$STALE_LOCK_ID"',
+            lock_id_check,
+        )
+        lock_list_after = body.index(
+            'lock_count_after="$(list_lock_key)"',
+            force_unlock,
+        )
+        plan = body.index("terraform plan", lock_list_after)
+        self.assertLess(live_main, lock_read)
+        self.assertLess(lock_read, lock_list_before)
+        self.assertLess(lock_list_before, evidence_check)
+        self.assertLess(evidence_check, lock_id_check)
+        self.assertLess(lock_id_check, force_unlock)
+        self.assertLess(force_unlock, lock_list_after)
+        self.assertLess(lock_list_after, plan)
+        self.assertIn(
+            "FORCE_UNLOCK_EXACT_REVIEWED_SANDBOX_PLAN_LOCK",
+            workflow,
+        )
+        self.assertIn("STALE_LOCK_SOURCE_RUN_ID: '30051956048'", workflow)
+        self.assertIn("STALE_LOCK_SOURCE_JOB_ID: '89356869295'", workflow)
+        self.assertIn("actions: read", workflow)
+        self.assertIn("aws s3api list-objects-v2", body)
+        self.assertNotIn("s3api delete-object", workflow)
+        self.assertNotIn("aws s3api head-object", body)
+        self.assertNotIn("-lock=false", workflow)
+
     def test_apply_binds_live_policy_before_and_after_saved_plan(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         apply_step = workflow.index(
