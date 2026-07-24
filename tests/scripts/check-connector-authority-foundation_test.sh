@@ -110,8 +110,18 @@ NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 printf '%s\n' '{"resource_drift":[{"address":"aws_iam_role.authority_publisher","type":"aws_iam_role","change":{"actions":["update"],"after":{"inline_policy":[]}}}]}' >"$plan_json"
 NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
 
-printf '%s\n' '{"resource_changes":[{"address":"aws_lambda_function.forbidden","type":"aws_lambda_function","change":{"actions":["create"],"after":{"name":"forbidden"}}}]}' >"$plan_json"
-expect_failure 'plan contains aws_lambda_function' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
+# The runtime slice legitimizes aws_lambda_function/aws_lambda_alias; the exact
+# inventory/transition contract in check-control-sandbox-first-apply.py gates
+# them. This lexical fence therefore admits them in both source and plan JSON.
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lambda_function.authority[\"layerv-nhp-sandbox-ca-ia\"]","type":"aws_lambda_function","change":{"actions":["create"],"after":{"function_name":"layerv-nhp-sandbox-ca-ia"}}}]}' >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+printf '%s\n' '{"resource_changes":[{"address":"module.control.aws_lambda_alias.authority[\"layerv-nhp-sandbox-ca-ia:blue\"]","type":"aws_lambda_alias","change":{"actions":["create"],"after":{"name":"blue"}}}]}' >"$plan_json"
+NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json" >/dev/null
+
+# A public Lambda URL surface stays forbidden (no API Gateway / function URL / ALB).
+printf '%s\n' '{"resource_changes":[{"address":"aws_lambda_function_url.forbidden","type":"aws_lambda_function_url","change":{"actions":["create"],"after":{"function_name":"forbidden"}}}]}' >"$plan_json"
+expect_failure 'plan contains aws_lambda_function_url' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
 printf '%s\n' '{"resource_changes":[{"address":"aws_vpc.removed","type":"aws_vpc","change":{"actions":["delete"],"after":null}}]}' >"$plan_json"
 expect_failure 'plan contains destructive actions' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
@@ -131,8 +141,14 @@ expect_failure 'must contain a resource_changes array or non-empty resource_drif
 printf '%s\n' '{"resource_changes":null,"resource_drift":[{"address":"aws_iam_role.authority_publisher","type":"aws_iam_role","change":{"actions":["update"]}}]}' >"$plan_json"
 expect_failure 'resource_changes must be an array' env NHP_REPO_ROOT="$fixture_root" "$checker" "$plan_json"
 
-printf '%s\n' 'resource "aws_lambda_function" "forbidden" {}' >>"${module_dir}/main.tf"
-expect_failure 'must not declare aws_lambda_function' env NHP_REPO_ROOT="$fixture_root" "$checker"
+# Runtime-slice resource types are admitted in source; a public URL surface is not.
+printf '%s\n' 'resource "aws_lambda_function" "authority" {}' >>"${module_dir}/main.tf"
+printf '%s\n' 'resource "aws_lambda_alias" "authority" {}' >>"${module_dir}/main.tf"
+NHP_REPO_ROOT="$fixture_root" "$checker" >/dev/null
+
+write_clean_fixture
+printf '%s\n' 'resource "aws_lambda_function_url" "forbidden" {}' >>"${module_dir}/main.tf"
+expect_failure 'must not declare aws_lambda_function_url' env NHP_REPO_ROOT="$fixture_root" "$checker"
 
 write_clean_fixture
 printf '%s\n' 'resource "aws_egress_only_internet_gateway" "forbidden" {}' >>"${module_dir}/main.tf"

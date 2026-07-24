@@ -8,5 +8,6 @@ module "control" {
   ses_configuration_set_name                   = var.ses_configuration_set_name
   authority_runtime_contract                   = var.authority_runtime_contract
   authority_runtime_contract_evidence_verified = var.authority_runtime_contract_evidence_verified
+  authority_runtime_functions_enabled          = var.authority_runtime_functions_enabled
   tags                                         = var.tags
 }

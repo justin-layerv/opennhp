@@ -381,6 +381,241 @@ REDIS_SPLIT_USER_RESOURCES = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# Connector Authority runtime slice (Step 4).
+#
+# The runtime slice deploys exactly the 3 Hub-facing functions the frozen
+# measurement basis names, both closed blue/green aliases, per-operation
+# execution roles, steady provisioned/reserved concurrency, spillover alarms,
+# a dedicated function SG, and the lockstep opening of ONLY the dependency
+# endpoints those functions reach (DynamoDB gateway + KMS interface). It is an
+# all-or-nothing transition on top of the already-bound contract: the plan's
+# managed inventory is either the base foundation OR the base + this exact
+# runtime set, and nothing else may become non-no-op.
+#
+# CALIBRATION BOUNDARY (POST-STEP-3): the exhaustive value-free create-envelope
+# for every runtime resource (provider default nulls/unknowns, exactly as the
+# base resources are pinned in _check_planned_security) can only be captured
+# from a real Terraform 1.14.3 / AWS provider 6.55.0 Step-4 plan, which requires
+# the Step-3 contract bind to be applied first. This checker therefore enforces
+# the fail-closed STRUCTURE now — exact inventory, exact all-or-nothing
+# transition membership, pure-create vs the exact three endpoint/SG opens, the
+# security content of those opens (principals/actions/resources, no wildcard),
+# the reserved/provisioned concurrency tie-back to the frozen contract, and the
+# dark endpoints staying deny — and the first real plan JSON must extend the
+# per-field envelope before the summary is frozen into the apply gate.
+# ---------------------------------------------------------------------------
+AUTHORITY_RUNTIME_HUB_FUNCTIONS = {
+    f"{CONTROL_PREFIX.removesuffix('-control')}-ca-ia": "issue_assignment",
+    f"{CONTROL_PREFIX.removesuffix('-control')}-ca-ra": "refresh_assignment",
+    f"{CONTROL_PREFIX.removesuffix('-control')}-ca-icr": "issue_credential_recovery",
+}
+AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS = (
+    "module.control.aws_security_group.authority_lambda[0]"
+)
+AUTHORITY_RUNTIME_RESOURCES: dict[str, str] = {}
+for _fn in AUTHORITY_RUNTIME_HUB_FUNCTIONS:
+    AUTHORITY_RUNTIME_RESOURCES[
+        f'module.control.aws_lambda_function.authority["{_fn}"]'
+    ] = "aws_lambda_function"
+    AUTHORITY_RUNTIME_RESOURCES[
+        f'module.control.aws_lambda_alias.authority["{_fn}:blue"]'
+    ] = "aws_lambda_alias"
+    AUTHORITY_RUNTIME_RESOURCES[
+        f'module.control.aws_lambda_alias.authority["{_fn}:green"]'
+    ] = "aws_lambda_alias"
+    AUTHORITY_RUNTIME_RESOURCES[
+        f'module.control.aws_lambda_provisioned_concurrency_config.authority["{_fn}"]'
+    ] = "aws_lambda_provisioned_concurrency_config"
+    AUTHORITY_RUNTIME_RESOURCES[
+        f'module.control.aws_iam_role.authority_exec["{_fn}"]'
+    ] = "aws_iam_role"
+    AUTHORITY_RUNTIME_RESOURCES[
+        f'module.control.aws_iam_role_policy.authority_exec["{_fn}"]'
+    ] = "aws_iam_role_policy"
+    AUTHORITY_RUNTIME_RESOURCES[
+        f'module.control.aws_cloudwatch_log_group.authority["{_fn}"]'
+    ] = "aws_cloudwatch_log_group"
+    AUTHORITY_RUNTIME_RESOURCES[
+        f'module.control.aws_cloudwatch_metric_alarm.authority_spillover["{_fn}"]'
+    ] = "aws_cloudwatch_metric_alarm"
+AUTHORITY_RUNTIME_RESOURCES[AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS] = "aws_security_group"
+
+AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES: dict[str, tuple[str, str, str]] = {
+    "module.control.aws_lambda_function.authority": (
+        "managed",
+        "aws_lambda_function",
+        "aws",
+    ),
+    "module.control.aws_lambda_alias.authority": (
+        "managed",
+        "aws_lambda_alias",
+        "aws",
+    ),
+    "module.control.aws_lambda_provisioned_concurrency_config.authority": (
+        "managed",
+        "aws_lambda_provisioned_concurrency_config",
+        "aws",
+    ),
+    "module.control.aws_iam_role.authority_exec": ("managed", "aws_iam_role", "aws"),
+    "module.control.aws_iam_role_policy.authority_exec": (
+        "managed",
+        "aws_iam_role_policy",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_log_group.authority": (
+        "managed",
+        "aws_cloudwatch_log_group",
+        "aws",
+    ),
+    "module.control.aws_cloudwatch_metric_alarm.authority_spillover": (
+        "managed",
+        "aws_cloudwatch_metric_alarm",
+        "aws",
+    ),
+    "module.control.aws_security_group.authority_lambda": (
+        "managed",
+        "aws_security_group",
+        "aws",
+    ),
+}
+
+# Constructed identities (known at plan time, so the opened endpoint policies
+# are fully checkable). The qat1 KMS key ARN carries a live UUID, matched by
+# pattern rather than a fixed literal.
+AUTHORITY_RUNTIME_EXEC_ROLE_ARNS = frozenset(
+    f"arn:aws:iam::{ACCOUNT_ID}:role/{name}-exec"
+    for name in AUTHORITY_RUNTIME_HUB_FUNCTIONS
+)
+AUTHORITY_RUNTIME_TABLE_ARNS = {
+    "api_keys": (
+        f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
+        f"{CONTROL_PREFIX}-qurl-api-keys"
+    ),
+    "agent_keys": (
+        f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
+        f"{CONTROL_PREFIX}-qurl-agent-keys"
+    ),
+    "connector_authority": (
+        f"arn:aws:dynamodb:{AWS_REGION}:{ACCOUNT_ID}:table/"
+        f"{CONTROL_PREFIX}-connector-authority"
+    ),
+}
+# Per-table resources. Only agent_keys is read through a GSI (the pubkey index
+# used by refresh/recovery identity resolution, agent_keys_repo.go GetByPublicKey);
+# api_keys and connector_authority are reached only by primary key, so they carry
+# no /index/* grant.
+AUTHORITY_RUNTIME_TABLE_RESOURCES = {
+    "api_keys": frozenset({AUTHORITY_RUNTIME_TABLE_ARNS["api_keys"]}),
+    "agent_keys": frozenset(
+        {
+            AUTHORITY_RUNTIME_TABLE_ARNS["agent_keys"],
+            f"{AUTHORITY_RUNTIME_TABLE_ARNS['agent_keys']}/index/*",
+        }
+    ),
+    "connector_authority": frozenset(
+        {AUTHORITY_RUNTIME_TABLE_ARNS["connector_authority"]}
+    ),
+}
+# The DynamoDB gateway-endpoint resource union (coarse gate for all three roles).
+AUTHORITY_RUNTIME_DYNAMODB_RESOURCES = frozenset(
+    arn
+    for resources in AUTHORITY_RUNTIME_TABLE_RESOURCES.values()
+    for arn in resources
+)
+# Shared read set. DescribeTable is REQUIRED: every op verifies its Control
+# tables' SSE-KMS key at cold start (dynamodb_sse.go). BatchGetItem/
+# TransactGetItems are intentionally absent (a read inside a transaction is
+# authorized by GetItem, not a Transact* action).
+AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS = frozenset(
+    {
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:DescribeTable",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+    }
+)
+# IssueAssignment + RefreshAssignment write only the single-item replay Put.
+AUTHORITY_RUNTIME_DYNAMODB_REPLAY_WRITE_ACTIONS = frozenset({"dynamodb:PutItem"})
+# IssueCredentialRecovery additionally UPDATEs the head anchor on the first grant.
+# DeleteItem and TransactWriteItems are intentionally absent.
+AUTHORITY_RUNTIME_DYNAMODB_RECOVERY_WRITE_ACTIONS = frozenset(
+    {"dynamodb:PutItem", "dynamodb:UpdateItem"}
+)
+# The DynamoDB gateway-endpoint action union (reads + the widest write set).
+AUTHORITY_RUNTIME_DYNAMODB_ACTIONS = (
+    AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS
+    | AUTHORITY_RUNTIME_DYNAMODB_RECOVERY_WRITE_ACTIONS
+)
+# Only IssueAssignment reaches KMS: GetPublicKey to load the qat1 key, Sign to
+# mint the ticket. No op uses kms:Verify (verification is local p256).
+AUTHORITY_RUNTIME_KMS_ACTIONS = frozenset({"kms:GetPublicKey", "kms:Sign"})
+# The Lambda-VPC ENI statement keeps the AWS-required Resource="*" (the ONLY
+# sanctioned wildcard in any authority execution policy).
+AUTHORITY_RUNTIME_ENI_ACTIONS = frozenset(
+    {
+        "ec2:AssignPrivateIpAddresses",
+        "ec2:CreateNetworkInterface",
+        "ec2:DeleteNetworkInterface",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:UnassignPrivateIpAddresses",
+    }
+)
+AUTHORITY_RUNTIME_LOG_ACTIONS = frozenset(
+    {"logs:CreateLogStream", "logs:PutLogEvents"}
+)
+# The qat1 endpoint principal and the identity-layer Sign statement open to the
+# IssueAssignment execution role alone.
+_AUTHORITY_SIGN_FUNCTION = next(
+    fn
+    for fn, operation in AUTHORITY_RUNTIME_HUB_FUNCTIONS.items()
+    if operation == "issue_assignment"
+)
+AUTHORITY_RUNTIME_SIGN_ROLE_ARNS = frozenset(
+    {f"arn:aws:iam::{ACCOUNT_ID}:role/{_AUTHORITY_SIGN_FUNCTION}-exec"}
+)
+# Per-operation identity-policy scope, reconciled against the live handler
+# (layervai/qurl-service origin/main).
+AUTHORITY_RUNTIME_OPERATION_IAM = {
+    "issue_assignment": {
+        "read_tables": ("api_keys", "connector_authority"),
+        "write_sid": "AuthorityReplayWrite",
+        "write_actions": AUTHORITY_RUNTIME_DYNAMODB_REPLAY_WRITE_ACTIONS,
+        "signs": True,
+    },
+    "refresh_assignment": {
+        "read_tables": ("agent_keys", "connector_authority"),
+        "write_sid": "AuthorityReplayWrite",
+        "write_actions": AUTHORITY_RUNTIME_DYNAMODB_REPLAY_WRITE_ACTIONS,
+        "signs": False,
+    },
+    "issue_credential_recovery": {
+        "read_tables": ("api_keys", "agent_keys", "connector_authority"),
+        "write_sid": "AuthorityRecoveryWrite",
+        "write_actions": AUTHORITY_RUNTIME_DYNAMODB_RECOVERY_WRITE_ACTIONS,
+        "signs": False,
+    },
+}
+_QAT1_KEY_ARN_RE = re.compile(
+    rf"^arn:aws:kms:{AWS_REGION}:{ACCOUNT_ID}:key/"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+AUTHORITY_RUNTIME_DYNAMODB_ADDRESS = "module.control.aws_vpc_endpoint.dynamodb"
+AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS = (
+    'module.control.aws_vpc_endpoint.interface["kms"]'
+)
+AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS = (
+    "module.control.aws_security_group.interface_endpoints"
+)
+# The exact three base resources whose policy/ingress the runtime slice opens.
+AUTHORITY_RUNTIME_OPENED_ADDRESSES = frozenset(
+    {
+        AUTHORITY_RUNTIME_DYNAMODB_ADDRESS,
+        AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS,
+        AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS,
+    }
+)
+
 # Exact value-free Terraform 1.14.3 / AWS provider 6.55.0 create envelope for
 # an IAM-authenticated ElastiCache user. The provider computes password_count
 # only after create; the configured absence of passwords remains a sensitive
@@ -574,6 +809,11 @@ EXPECTED_CONFIGURATION_RESOURCES.update(
         ),
     }
 )
+# The runtime-slice resources are declared unconditionally in the module (their
+# instances are for_each/count gated), so the CONFIGURATION always lists them,
+# in the dark plan as well as the runtime plan. The managed inventory checked
+# against resource_changes stays gated separately (AUTHORITY_RUNTIME_RESOURCES).
+EXPECTED_CONFIGURATION_RESOURCES.update(AUTHORITY_RUNTIME_CONFIGURATION_RESOURCES)
 
 ExpressionPath = tuple[str | int, ...]
 CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
@@ -604,6 +844,10 @@ CONFIG_REFERENCE_CONTRACT: dict[str, dict[ExpressionPath, list[str]]] = {
     },
     "module.control.aws_security_group.interface_endpoints": {
         ("vpc_id",): ["aws_vpc.control.id", "aws_vpc.control"],
+        # Ingress is the reviewed single local (empty while dark; exactly TLS/443
+        # from the function SG in the runtime slice). Pinning the expression here
+        # binds the opening to that reviewed local in every plan, dark included.
+        ("ingress",): ["local.interface_endpoint_ingress"],
     },
     "module.control.aws_security_group.otp_redis": {
         ("vpc_id",): ["aws_vpc.control.id", "aws_vpc.control"],
@@ -749,7 +993,8 @@ CONFIG_CONSTANT_CONTRACT: dict[str, dict[ExpressionPath, Any]] = {
     },
     "module.control.aws_security_group.interface_endpoints": {
         ("egress",): [],
-        ("ingress",): [],
+        # ingress moved to CONFIG_REFERENCE_CONTRACT: it is now the reviewed
+        # local.interface_endpoint_ingress (empty while dark), not a literal [].
     },
     "module.control.aws_security_group.otp_redis": {
         ("egress",): [],
@@ -1484,7 +1729,9 @@ def _require_foundation_input_known(
         )
 
 
-def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
+def _check_planned_security(
+    by_address: dict[str, dict[str, Any]], *, runtime_mode: bool = False
+) -> None:
     def values(address: str) -> tuple[dict[str, Any], dict[str, Any]]:
         change = by_address[address].get("change", {})
         after = change.get("after")
@@ -1530,6 +1777,15 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
         "module.control.aws_security_group.otp_redis",
     ):
         after, unknown = values(address)
+        # The interface-endpoint SG gains exactly one TLS/443 SG-scoped ingress
+        # in the runtime slice; the default and OTP Redis SGs stay closed. Egress
+        # stays empty on all three.
+        if runtime_mode and address == AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS:
+            _require_fields(after, {"egress": []}, address)
+            if unknown.get("egress", []) != []:
+                raise ContractError(f"{address} has unknown planned egress rules")
+            _check_authority_interface_endpoint_ingress(after, unknown, address)
+            continue
         _require_fields(after, {"ingress": [], "egress": []}, address)
         if unknown.get("ingress", []) != [] or unknown.get("egress", []) != []:
             raise ContractError(f"{address} has unknown planned traffic rules")
@@ -1607,7 +1863,16 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
         if endpoint_type == "Interface":
             expected["private_dns_enabled"] = True
         _require_fields(after, expected, address)
-        _require_json_field(after, "policy", DENY_ENDPOINT_POLICY, address)
+        # In the runtime slice exactly the DynamoDB gateway and KMS interface
+        # endpoints carry a scoped Allow to the execution roles; every other
+        # endpoint (email, lambda [caller-only], logs, monitoring,
+        # secretsmanager) stays deny-all and fails closed here otherwise.
+        if runtime_mode and address == AUTHORITY_RUNTIME_DYNAMODB_ADDRESS:
+            _check_authority_dynamodb_endpoint_policy(after, address)
+        elif runtime_mode and address == AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS:
+            _check_authority_kms_endpoint_policy(after, address)
+        else:
+            _require_json_field(after, "policy", DENY_ENDPOINT_POLICY, address)
 
     redis_contracts = {
         "module.control.aws_elasticache_user.otp_activator": {
@@ -1917,6 +2182,377 @@ def _check_planned_security(by_address: dict[str, dict[str, Any]]) -> None:
                 )
         elif publisher_policy.get("role") != publisher_role_name:
             raise ContractError(f"{label} publisher policy role drifted")
+
+    if runtime_mode:
+        _check_authority_runtime_resources(by_address, foundation)
+
+
+def _authority_runtime_after(
+    by_address: dict[str, dict[str, Any]], address: str
+) -> dict[str, Any]:
+    change = by_address.get(address, {}).get("change", {})
+    after = change.get("after")
+    if not isinstance(after, dict):
+        raise ContractError(f"{address} planned values are malformed")
+    return after
+
+
+def _authority_decode_policy(after: dict[str, Any], address: str) -> Any:
+    raw = after.get("policy")
+    if not isinstance(raw, str):
+        raise ContractError(f"{address} policy must be JSON text")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ContractError(f"{address} policy is malformed JSON: {exc}") from exc
+
+
+def _authority_single_allow_statement(
+    after: dict[str, Any], address: str, expected_sid: str
+) -> dict[str, Any]:
+    policy = _authority_decode_policy(after, address)
+    if not isinstance(policy, dict) or policy.get("Version") != "2012-10-17":
+        raise ContractError(f"{address} scoped policy is not a 2012-10-17 document")
+    statements = policy.get("Statement")
+    if not isinstance(statements, list) or len(statements) != 1:
+        raise ContractError(f"{address} scoped policy must hold exactly one statement")
+    stmt = statements[0]
+    if not isinstance(stmt, dict):
+        raise ContractError(f"{address} scoped statement is malformed")
+    if stmt.get("Effect") != "Allow" or stmt.get("Sid") != expected_sid:
+        raise ContractError(f"{address} scoped statement effect/sid drifted")
+    if any(key in stmt for key in ("NotPrincipal", "NotAction", "NotResource")):
+        raise ContractError(f"{address} scoped statement may not use Not* elements")
+    if "Condition" in stmt:
+        raise ContractError(f"{address} scoped statement may not add a Condition")
+    return stmt
+
+
+def _authority_principal_set(stmt: dict[str, Any], address: str) -> set[str]:
+    principal = stmt.get("Principal")
+    if not isinstance(principal, dict) or set(principal) != {"AWS"}:
+        raise ContractError(f"{address} principal must be an exact AWS role set")
+    aws = principal.get("AWS")
+    values = aws if isinstance(aws, list) else [aws]
+    result: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or value == "*":
+            raise ContractError(f"{address} principal must be exact role ARNs, never '*'")
+        result.add(value)
+    return result
+
+
+def _authority_string_set(value: Any, address: str, field: str) -> set[str]:
+    values = value if isinstance(value, list) else [value]
+    result: set[str] = set()
+    for item in values:
+        if not isinstance(item, str) or item == "*":
+            raise ContractError(f"{address} {field} must be exact strings, never '*'")
+        result.add(item)
+    return result
+
+
+def _check_authority_dynamodb_endpoint_policy(
+    after: dict[str, Any], address: str
+) -> None:
+    stmt = _authority_single_allow_statement(after, address, "AuthorityFunctionsData")
+    if _authority_principal_set(stmt, address) != set(AUTHORITY_RUNTIME_EXEC_ROLE_ARNS):
+        raise ContractError(
+            f"{address} principals must be exactly the three execution roles"
+        )
+    if _authority_string_set(stmt.get("Action"), address, "Action") != set(
+        AUTHORITY_RUNTIME_DYNAMODB_ACTIONS
+    ):
+        raise ContractError(f"{address} actions drifted from the reviewed DynamoDB set")
+    if _authority_string_set(stmt.get("Resource"), address, "Resource") != set(
+        AUTHORITY_RUNTIME_DYNAMODB_RESOURCES
+    ):
+        raise ContractError(
+            f"{address} resources must be exactly the three tables and their indexes"
+        )
+
+
+def _check_authority_kms_endpoint_policy(
+    after: dict[str, Any], address: str
+) -> None:
+    stmt = _authority_single_allow_statement(after, address, "AuthorityFunctionsQat1")
+    if _authority_principal_set(stmt, address) != set(AUTHORITY_RUNTIME_SIGN_ROLE_ARNS):
+        raise ContractError(
+            f"{address} principal must be exactly the IssueAssignment execution role"
+        )
+    if _authority_string_set(stmt.get("Action"), address, "Action") != set(
+        AUTHORITY_RUNTIME_KMS_ACTIONS
+    ):
+        raise ContractError(
+            f"{address} KMS actions must be exactly GetPublicKey+Sign (no kms:Verify)"
+        )
+    resources = _authority_string_set(stmt.get("Resource"), address, "Resource")
+    if len(resources) != 1 or _QAT1_KEY_ARN_RE.fullmatch(next(iter(resources))) is None:
+        raise ContractError(f"{address} must target exactly the qat1 signing key")
+
+
+def _check_authority_interface_endpoint_ingress(
+    after: dict[str, Any], unknown: dict[str, Any], address: str
+) -> None:
+    ingress = after.get("ingress")
+    if not isinstance(ingress, list) or len(ingress) != 1:
+        raise ContractError(f"{address} must open exactly one runtime ingress rule")
+    rule = ingress[0]
+    if not isinstance(rule, dict):
+        raise ContractError(f"{address} ingress rule is malformed")
+    if (
+        rule.get("from_port") != 443
+        or rule.get("to_port") != 443
+        or rule.get("protocol") != "tcp"
+    ):
+        raise ContractError(f"{address} ingress must be exactly TLS/443/tcp")
+    if (
+        rule.get("cidr_blocks") not in (None, [])
+        or rule.get("ipv6_cidr_blocks") not in (None, [])
+        or rule.get("prefix_list_ids") not in (None, [])
+        or rule.get("self") not in (None, False)
+    ):
+        raise ContractError(
+            f"{address} ingress must be SG-scoped, never CIDR/prefix/self reachable"
+        )
+    security_groups = rule.get("security_groups")
+    # The referenced function SG id is computed at create. Accept exactly one
+    # known id, or the provider's single-element unknown projection (empty list
+    # in after with the ingress marked unknown); reject a broader/absent set. If
+    # a future provider render hides the whole rule, this fails closed and the
+    # POST-STEP-3 calibration must observe and admit the exact shape.
+    ingress_unknown = unknown.get("ingress")
+    known_single = isinstance(security_groups, list) and len(security_groups) == 1
+    unknown_single = security_groups in (None, []) and bool(ingress_unknown)
+    if not (known_single or unknown_single):
+        raise ContractError(
+            f"{address} ingress must reference exactly the one function SG"
+        )
+
+
+def _check_authority_exec_role_trust(role_after: dict[str, Any], fn: str) -> None:
+    if role_after.get("permissions_boundary") not in (None, ""):
+        raise ContractError(f"{fn} execution role must not use a permissions boundary")
+    if role_after.get("managed_policy_arns") not in (None, []):
+        raise ContractError(f"{fn} execution role must not attach managed policies")
+    if role_after.get("max_session_duration") != 3600:
+        raise ContractError(f"{fn} execution role session duration drifted")
+    raw = role_after.get("assume_role_policy")
+    if not isinstance(raw, str):
+        raise ContractError(f"{fn} execution role trust policy must be JSON text")
+    try:
+        trust = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ContractError(f"{fn} trust policy is malformed: {exc}") from exc
+    statements = trust.get("Statement") if isinstance(trust, dict) else None
+    if not isinstance(statements, list) or len(statements) != 1:
+        raise ContractError(f"{fn} trust policy must hold exactly one statement")
+    stmt = statements[0]
+    principal = stmt.get("Principal") if isinstance(stmt, dict) else None
+    if (
+        not isinstance(principal, dict)
+        or principal.get("Service") != "lambda.amazonaws.com"
+        or stmt.get("Effect") != "Allow"
+        or stmt.get("Action") != "sts:AssumeRole"
+    ):
+        raise ContractError(f"{fn} trust must allow only the Lambda service to assume")
+    condition = stmt.get("Condition")
+    if not isinstance(condition, dict):
+        raise ContractError(f"{fn} trust must confuse-deputy-scope its source")
+    account = condition.get("StringEquals", {}).get("aws:SourceAccount")
+    source_arn = condition.get("ArnEquals", {}).get("aws:SourceArn")
+    if account != ACCOUNT_ID:
+        raise ContractError(f"{fn} trust must pin the source account")
+    if source_arn != f"arn:aws:lambda:{AWS_REGION}:{ACCOUNT_ID}:function:{fn}":
+        raise ContractError(f"{fn} trust must pin the exact function source ARN")
+
+
+def _check_authority_exec_role_policy(
+    after: dict[str, Any], fn: str, operation: str
+) -> None:
+    """Validate one hub function's per-operation execution (identity) policy.
+
+    Every referenced ARN is plan-known (the own-log-group ARN is a constructed
+    literal, not the computed resource attribute), so the exact least-privilege
+    scope is checkable at first apply: reads including DescribeTable scoped to the
+    op's SSE-verified tables, writes scoped to connector_authority with the op's
+    exact verbs, KMS Sign only for IssueAssignment, and no wildcard resource
+    outside the single AWS-required ENI statement.
+    """
+    spec = AUTHORITY_RUNTIME_OPERATION_IAM.get(operation)
+    if spec is None:
+        raise ContractError(f"{fn} execution policy has unknown operation {operation!r}")
+    policy = _authority_decode_policy(after, fn)
+    if not isinstance(policy, dict) or policy.get("Version") != "2012-10-17":
+        raise ContractError(f"{fn} execution policy is not a 2012-10-17 document")
+    statements = policy.get("Statement")
+    if not isinstance(statements, list):
+        raise ContractError(f"{fn} execution policy Statement must be a list")
+    by_sid: dict[str, dict[str, Any]] = {}
+    for stmt in statements:
+        if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
+            raise ContractError(f"{fn} execution statements must all be Allow objects")
+        if any(
+            key in stmt
+            for key in ("NotAction", "NotResource", "NotPrincipal", "Principal", "Condition")
+        ):
+            raise ContractError(f"{fn} execution statement uses a forbidden element")
+        sid = stmt.get("Sid")
+        if not isinstance(sid, str) or sid in by_sid:
+            raise ContractError(f"{fn} execution statement Sid missing or duplicated")
+        by_sid[sid] = stmt
+
+    expected_sids = {"LambdaVpcEni", "OwnLogStream", "AuthorityReads", spec["write_sid"]}
+    if spec["signs"]:
+        expected_sids.add("Qat1Sign")
+    if set(by_sid) != expected_sids:
+        raise ContractError(
+            f"{fn} execution policy statement set drifted: "
+            f"{sorted(by_sid)} != {sorted(expected_sids)}"
+        )
+
+    # ENI lifecycle: the ONLY statement permitted a wildcard resource.
+    eni = by_sid["LambdaVpcEni"]
+    if _authority_string_set(eni.get("Action"), fn, "ENI Action") != set(
+        AUTHORITY_RUNTIME_ENI_ACTIONS
+    ):
+        raise ContractError(f"{fn} ENI statement actions drifted")
+    if eni.get("Resource") not in ("*", ["*"]):
+        raise ContractError(f"{fn} ENI statement must keep exactly Resource '*'")
+
+    # Own log stream: scoped to this function's own constructed log-group ARN.
+    log_stmt = by_sid["OwnLogStream"]
+    if _authority_string_set(log_stmt.get("Action"), fn, "log Action") != set(
+        AUTHORITY_RUNTIME_LOG_ACTIONS
+    ):
+        raise ContractError(f"{fn} log statement actions drifted")
+    expected_log = f"arn:aws:logs:{AWS_REGION}:{ACCOUNT_ID}:log-group:/aws/lambda/{fn}:*"
+    if _authority_string_set(log_stmt.get("Resource"), fn, "log Resource") != {
+        expected_log
+    }:
+        raise ContractError(f"{fn} log statement must target only its own log group")
+
+    # Reads (including DescribeTable) scoped to the op's SSE-verified tables.
+    reads = by_sid["AuthorityReads"]
+    if _authority_string_set(reads.get("Action"), fn, "read Action") != set(
+        AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS
+    ):
+        raise ContractError(
+            f"{fn} read actions must be exactly the reviewed set including DescribeTable"
+        )
+    expected_read_resources = set().union(
+        *(AUTHORITY_RUNTIME_TABLE_RESOURCES[table] for table in spec["read_tables"])
+    )
+    if (
+        _authority_string_set(reads.get("Resource"), fn, "read Resource")
+        != expected_read_resources
+    ):
+        raise ContractError(f"{fn} read resources must be exactly its SSE-verified tables")
+
+    # Writes: connector_authority only, with the op's exact verbs.
+    write = by_sid[spec["write_sid"]]
+    if _authority_string_set(write.get("Action"), fn, "write Action") != set(
+        spec["write_actions"]
+    ):
+        raise ContractError(f"{fn} write actions drifted from the reviewed per-op set")
+    if _authority_string_set(write.get("Resource"), fn, "write Resource") != set(
+        AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]
+    ):
+        raise ContractError(f"{fn} writes must be scoped to connector_authority only")
+
+    # KMS Sign: IssueAssignment alone (GetPublicKey + Sign on exactly the qat1 key).
+    if spec["signs"]:
+        sign = by_sid["Qat1Sign"]
+        if _authority_string_set(sign.get("Action"), fn, "Sign Action") != set(
+            AUTHORITY_RUNTIME_KMS_ACTIONS
+        ):
+            raise ContractError(f"{fn} qat1 Sign actions must be exactly GetPublicKey+Sign")
+        resources = _authority_string_set(sign.get("Resource"), fn, "Sign Resource")
+        if len(resources) != 1 or _QAT1_KEY_ARN_RE.fullmatch(next(iter(resources))) is None:
+            raise ContractError(f"{fn} Sign statement must target exactly the qat1 key")
+
+
+def _check_authority_runtime_resources(
+    by_address: dict[str, dict[str, Any]], foundation: dict[str, Any]
+) -> None:
+    """Validate the runtime resource security fields against the bound contract.
+
+    Runs on every runtime-inventory plan (the creation transition and the steady
+    post-slice state). The exhaustive per-field create envelope is a POST-STEP-3
+    calibration; these are the security-load-bearing, plan-known fields.
+    """
+    payload = foundation.get("input")
+    contract = payload.get("authority_runtime_contract") if isinstance(payload, dict) else None
+    functions = contract.get("functions") if isinstance(contract, dict) else None
+    image_uri = payload.get("authority_image_uri") if isinstance(payload, dict) else None
+    selected = contract.get("selected_authority_color") if isinstance(contract, dict) else None
+    if not isinstance(functions, dict) or selected not in ("blue", "green"):
+        raise ContractError("runtime slice cannot resolve the bound contract functions")
+
+    for fn, _operation in AUTHORITY_RUNTIME_HUB_FUNCTIONS.items():
+        spec = functions.get(fn)
+        if not isinstance(spec, dict):
+            raise ContractError(f"runtime function {fn} is absent from the bound contract")
+
+        function_after = _authority_runtime_after(
+            by_address, f'module.control.aws_lambda_function.authority["{fn}"]'
+        )
+        if function_after.get("package_type") != "Image":
+            raise ContractError(f"{fn} must be Image-packaged")
+        if function_after.get("image_uri") != image_uri:
+            raise ContractError(f"{fn} image_uri must be the contract-pinned repository@digest")
+        if (
+            function_after.get("reserved_concurrent_executions")
+            != spec.get("steady_reserved_concurrency")
+        ):
+            raise ContractError(
+                f"{fn} reserved concurrency must equal the contract steady reserved envelope"
+            )
+        vpc_config = function_after.get("vpc_config")
+        if not isinstance(vpc_config, list) or len(vpc_config) != 1:
+            raise ContractError(f"{fn} must be attached to exactly the isolated VPC config")
+
+        provisioned_after = _authority_runtime_after(
+            by_address,
+            f'module.control.aws_lambda_provisioned_concurrency_config.authority["{fn}"]',
+        )
+        if (
+            provisioned_after.get("provisioned_concurrent_executions")
+            != spec.get("steady_provisioned_concurrency")
+        ):
+            raise ContractError(
+                f"{fn} provisioned concurrency must equal the contract steady provisioned envelope"
+            )
+        if provisioned_after.get("qualifier") not in (selected, None):
+            raise ContractError(f"{fn} provisioned concurrency must target the selected color")
+
+        _check_authority_exec_role_trust(
+            _authority_runtime_after(
+                by_address, f'module.control.aws_iam_role.authority_exec["{fn}"]'
+            ),
+            fn,
+        )
+        _check_authority_exec_role_policy(
+            _authority_runtime_after(
+                by_address,
+                f'module.control.aws_iam_role_policy.authority_exec["{fn}"]',
+            ),
+            fn,
+            _operation,
+        )
+
+        for color in ("blue", "green"):
+            alias_after = _authority_runtime_after(
+                by_address, f'module.control.aws_lambda_alias.authority["{fn}:{color}"]'
+            )
+            if alias_after.get("name") != color:
+                raise ContractError(f"{fn} {color} alias name drifted")
+
+    lambda_sg_after = _authority_runtime_after(
+        by_address, AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS
+    )
+    if lambda_sg_after.get("ingress") not in ([], None):
+        raise ContractError("function SG must expose no ingress")
 
 
 def _check_state_normalization_drift(
@@ -2591,15 +3227,32 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             raise ContractError(f"duplicate Terraform resource change: {address}")
         by_address[address] = item
 
-    missing = sorted(set(EXPECTED_RESOURCES) - set(by_address))
-    extra = sorted(set(by_address) - set(EXPECTED_RESOURCES))
-    if missing or extra:
+    # Exactly two managed inventories are admitted: the base foundation, and the
+    # base plus the complete runtime slice. Anything else fails closed.
+    base_inventory = set(EXPECTED_RESOURCES)
+    runtime_inventory = base_inventory | set(AUTHORITY_RUNTIME_RESOURCES)
+    actual_inventory = set(by_address)
+    if actual_inventory == base_inventory:
+        runtime_mode = False
+        expected_resources: dict[str, str] = dict(EXPECTED_RESOURCES)
+    elif actual_inventory == runtime_inventory:
+        runtime_mode = True
+        expected_resources = {**EXPECTED_RESOURCES, **AUTHORITY_RUNTIME_RESOURCES}
+    else:
+        nearest = (
+            runtime_inventory
+            if len(actual_inventory & runtime_inventory)
+            > len(actual_inventory & base_inventory)
+            else base_inventory
+        )
+        missing = sorted(nearest - actual_inventory)
+        extra = sorted(actual_inventory - nearest)
         raise ContractError(
             f"Terraform resource inventory mismatch; missing={missing}, extra={extra}"
         )
 
     actual_non_noop: dict[str, list[str]] = {}
-    for address, expected_type in EXPECTED_RESOURCES.items():
+    for address, expected_type in expected_resources.items():
         item = by_address[address]
         if item.get("mode") != "managed" or item.get("type") != expected_type:
             raise ContractError(f"unexpected mode/type for {address}")
@@ -2665,6 +3318,21 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             by_address[authority_contract_address]["change"].get("after", {})
         )
     )
+    # The runtime slice: every runtime resource is a pure create and exactly the
+    # three dependency-endpoint/SG opens are updates. Nothing else may move.
+    authority_runtime_creates = set(AUTHORITY_RUNTIME_RESOURCES)
+    authority_runtime_transition = (
+        runtime_mode
+        and changed == (authority_runtime_creates | AUTHORITY_RUNTIME_OPENED_ADDRESSES)
+        and all(
+            actual_non_noop.get(address) == ["create"]
+            for address in authority_runtime_creates
+        )
+        and all(
+            actual_non_noop.get(address) == ["update"]
+            for address in AUTHORITY_RUNTIME_OPENED_ADDRESSES
+        )
+    )
 
     if publisher_transition:
         plan_mode = "publisher-bootstrap"
@@ -2713,15 +3381,20 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
             )
     elif authority_contract_transition:
         plan_mode = "authority-contract-binding"
+    elif authority_runtime_transition:
+        plan_mode = "authority-runtime-slice"
+        _require_create_shapes(authority_runtime_creates, by_address)
     elif changed:
         raise ContractError(
             "Terraform changes must be an exact no-op, publisher bootstrap, "
-            "Hub artifact bootstrap, reviewed Redis split, or exact Authority "
-            "contract binding; "
+            "Hub artifact bootstrap, reviewed Redis split, exact Authority "
+            "contract binding, or the exact Authority runtime slice; "
             f"got {actual_non_noop}"
         )
 
-    _check_planned_security(by_address)
+    # runtime_mode with no non-no-op change is the steady post-slice state; its
+    # scoped policies and function fields are still validated below.
+    _check_planned_security(by_address, runtime_mode=runtime_mode)
 
     normalization_drift_kind = _check_state_normalization_drift(
         drift,
@@ -2799,7 +3472,7 @@ def check_plan(plan: Any, prior_state: Any = None) -> dict[str, str | int]:
         "normalization_drift_count": normalization_drift_count,
         "normalization_drift_kind": normalization_drift_kind,
         "plan_mode": plan_mode,
-        "resource_count": len(EXPECTED_RESOURCES),
+        "resource_count": len(expected_resources),
     }
 
 
@@ -2812,19 +3485,34 @@ def check_state_list(path: Path) -> dict[str, int]:
         raise ContractError(f"cannot read Terraform state list: {exc}") from exc
 
     # `terraform state list` includes both managed resources and cached data
-    # sources. Require the reviewed union here; the subsequent JSON state check
-    # remains mode-aware and independently enforces the exact 50 managed
-    # resources plus their types and security-sensitive values.
-    expected = set(EXPECTED_RESOURCES) | set(EXPECTED_DATA_RESOURCES)
-    missing = sorted(expected - addresses)
-    extra = sorted(addresses - expected)
-    if missing or extra:
+    # sources. Require one of the two reviewed unions here (base, or base plus
+    # the complete runtime slice); the subsequent JSON state check remains
+    # mode-aware and independently enforces types and security-sensitive values.
+    data_expected = set(EXPECTED_DATA_RESOURCES)
+    base_expected = set(EXPECTED_RESOURCES) | data_expected
+    runtime_expected = base_expected | set(AUTHORITY_RUNTIME_RESOURCES)
+    if addresses == base_expected:
+        runtime_present = False
+    elif addresses == runtime_expected:
+        runtime_present = True
+    else:
+        nearest = (
+            runtime_expected
+            if len(addresses & runtime_expected) > len(addresses & base_expected)
+            else base_expected
+        )
+        missing = sorted(nearest - addresses)
+        extra = sorted(addresses - nearest)
         raise ContractError(
             f"Terraform state inventory mismatch; missing={missing}, extra={extra}"
         )
     return {
         "data_resource_count": len(EXPECTED_DATA_RESOURCES),
-        "managed_resource_count": len(EXPECTED_RESOURCES),
+        "managed_resource_count": (
+            len(EXPECTED_RESOURCES) + len(AUTHORITY_RUNTIME_RESOURCES)
+            if runtime_present
+            else len(EXPECTED_RESOURCES)
+        ),
     }
 
 
@@ -3020,13 +3708,27 @@ def check_state(state: Any) -> dict[str, Any]:
     by_address = {item.get("address"): item for item in resources}
     if len(by_address) != len(resources):
         raise ContractError("refreshed state contains duplicate managed addresses")
-    missing = sorted(set(EXPECTED_RESOURCES) - set(by_address))
-    extra = sorted(set(by_address) - set(EXPECTED_RESOURCES))
-    if missing or extra:
+    base_expected = set(EXPECTED_RESOURCES)
+    runtime_expected = base_expected | set(AUTHORITY_RUNTIME_RESOURCES)
+    actual_addresses = set(by_address)
+    runtime_present = actual_addresses == runtime_expected
+    if actual_addresses == base_expected:
+        state_expected_resources: dict[str, str] = dict(EXPECTED_RESOURCES)
+    elif runtime_present:
+        state_expected_resources = {**EXPECTED_RESOURCES, **AUTHORITY_RUNTIME_RESOURCES}
+    else:
+        nearest = (
+            runtime_expected
+            if len(actual_addresses & runtime_expected)
+            > len(actual_addresses & base_expected)
+            else base_expected
+        )
+        missing = sorted(nearest - actual_addresses)
+        extra = sorted(actual_addresses - nearest)
         raise ContractError(
             f"refreshed state inventory mismatch; missing={missing}, extra={extra}"
         )
-    for address, expected_type in EXPECTED_RESOURCES.items():
+    for address, expected_type in state_expected_resources.items():
         resource = by_address[address]
         if resource.get("mode") != "managed" or resource.get("type") != expected_type:
             raise ContractError(f"refreshed state mode/type mismatch for {address}")
@@ -3059,6 +3761,30 @@ def check_state(state: Any) -> dict[str, Any]:
         "module.control.aws_security_group.otp_redis",
     ):
         item = values[address]
+        # The interface-endpoint SG carries exactly one TLS/443 SG-scoped ingress
+        # once the runtime slice is live; the default and OTP Redis SGs stay
+        # closed. Egress stays empty on all three.
+        if runtime_present and address == AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS:
+            ingress = item.get("ingress")
+            if item.get("egress") not in ([], None):
+                raise ContractError(f"interface-endpoint SG has egress rules: {address}")
+            if not isinstance(ingress, list) or len(ingress) != 1:
+                raise ContractError(
+                    f"interface-endpoint SG must carry exactly one runtime ingress: {address}"
+                )
+            rule = ingress[0]
+            if (
+                not isinstance(rule, dict)
+                or rule.get("from_port") != 443
+                or rule.get("to_port") != 443
+                or rule.get("protocol") != "tcp"
+                or rule.get("cidr_blocks") not in (None, [])
+                or len(rule.get("security_groups") or []) != 1
+            ):
+                raise ContractError(
+                    f"interface-endpoint SG ingress is not exactly TLS/443 from the function SG: {address}"
+                )
+            continue
         if item.get("ingress") not in ([], None) or item.get("egress") not in (
             [],
             None,
@@ -3176,7 +3902,8 @@ def check_state(state: Any) -> dict[str, Any]:
     }
     deny_policy = DENY_ENDPOINT_POLICY
     for service in INTERFACE_ENDPOINT_SERVICES:
-        item = values[f'module.control.aws_vpc_endpoint.interface["{service}"]']
+        address = f'module.control.aws_vpc_endpoint.interface["{service}"]'
+        item = values[address]
         if (
             item.get("state") != "available"
             or item.get("vpc_endpoint_type") != "Interface"
@@ -3185,8 +3912,15 @@ def check_state(state: Any) -> dict[str, Any]:
             or item.get("vpc_id") != vpc_id
             or set(item.get("subnet_ids", [])) != subnet_ids
             or set(item.get("security_group_ids", [])) != {interface_sg}
-            or json.loads(item.get("policy", "{}")) != deny_policy
         ):
+            raise ContractError(
+                f"dark interface endpoint contract failed for {service}"
+            )
+        # Only the KMS interface endpoint opens (to the execution roles) once the
+        # runtime slice is live; every other interface endpoint stays deny-all.
+        if runtime_present and service == "kms":
+            _check_authority_kms_endpoint_policy(item, address)
+        elif json.loads(item.get("policy", "{}")) != deny_policy:
             raise ContractError(
                 f"dark interface endpoint contract failed for {service}"
             )
@@ -3197,8 +3931,13 @@ def check_state(state: Any) -> dict[str, Any]:
         or dynamodb.get("service_name") != f"com.amazonaws.{AWS_REGION}.dynamodb"
         or dynamodb.get("vpc_id") != vpc_id
         or set(dynamodb.get("route_table_ids", [])) != route_table_ids
-        or json.loads(dynamodb.get("policy", "{}")) != deny_policy
     ):
+        raise ContractError("dark DynamoDB endpoint contract failed")
+    if runtime_present:
+        _check_authority_dynamodb_endpoint_policy(
+            dynamodb, "module.control.aws_vpc_endpoint.dynamodb"
+        )
+    elif json.loads(dynamodb.get("policy", "{}")) != deny_policy:
         raise ContractError("dark DynamoDB endpoint contract failed")
 
     cache = values["module.control.aws_elasticache_serverless_cache.otp"]
@@ -3375,11 +4114,32 @@ def check_live(evidence_dir: Path) -> dict[str, Any]:
             "Control state object is not versioned under the exact KMS key"
         )
 
-    if load_json(evidence_dir / "control-lambdas.json") != []:
-        raise ContractError("Control prefix unexpectedly owns a Lambda function")
+    # The Control/authority prefixes own no Lambda while dark, and exactly the 3
+    # Hub-facing functions once the runtime slice is live. Any other function
+    # fails closed. `control-lambdas.json` is the reviewed `aws lambda
+    # list-functions` projection (function objects filtered to the control and
+    # layerv-nhp-<env>-ca- prefixes). The load-balancer boundary stays absolute.
+    live_lambdas = load_json(evidence_dir / "control-lambdas.json")
+    if not isinstance(live_lambdas, list):
+        raise ContractError("Control Lambda inventory evidence is malformed")
+    live_lambda_names: set[str] = set()
+    for item in live_lambdas:
+        name = item.get("FunctionName") if isinstance(item, dict) else None
+        if not isinstance(name, str):
+            raise ContractError("Control Lambda inventory evidence is malformed")
+        live_lambda_names.add(name)
+    if live_lambda_names not in (set(), set(AUTHORITY_RUNTIME_HUB_FUNCTIONS)):
+        raise ContractError(
+            "Control prefix owns an unexpected Lambda function set; only the exact "
+            "3 Hub-facing Authority functions are admitted"
+        )
     if load_json(evidence_dir / "control-load-balancers.json") != []:
         raise ContractError("Control prefix unexpectedly owns a load balancer")
-    return {"flow_log_id": flow["FlowLogId"], "vpc_id": vpc_id}
+    return {
+        "flow_log_id": flow["FlowLogId"],
+        "vpc_id": vpc_id,
+        "authority_function_count": len(live_lambda_names),
+    }
 
 
 def parse_args() -> argparse.Namespace:

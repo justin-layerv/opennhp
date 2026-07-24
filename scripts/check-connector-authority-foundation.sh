@@ -48,8 +48,13 @@ forbidden_resource_types=(
   aws_eip
   aws_egress_only_internet_gateway
   aws_internet_gateway
-  aws_lambda_alias
-  aws_lambda_function
+  # aws_lambda_function and aws_lambda_alias are legitimized by the Connector
+  # Authority runtime slice (the 3 Hub-facing functions plus their closed
+  # blue/green aliases). They are gated instead by the exact inventory +
+  # transition contract in check-control-sandbox-first-apply.py, which admits
+  # them only as an all-or-nothing runtime transition. aws_lambda_function_url
+  # stays forbidden: the authority operations never expose a public URL, API
+  # Gateway, or ALB route.
   aws_lambda_function_url
   aws_lb
   aws_lb_listener

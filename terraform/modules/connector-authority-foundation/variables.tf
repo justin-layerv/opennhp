@@ -51,6 +51,23 @@ variable "ses_configuration_set_name" {
   }
 }
 
+variable "authority_runtime_functions_enabled" {
+  description = <<-EOT
+    Second, independent enable gate for the Connector Authority Lambda runtime
+    slice (the 3 hub functions, blue/green aliases, execution roles,
+    steady/rollout concurrency, and the lockstep dependency-endpoint opening).
+
+    It is deliberately separate from authority_runtime_contract: binding the
+    contract (Step 3) must NOT create any function, so the contract-binding
+    apply stays a foundation_contract-only transition. This gate flips true
+    only in the later runtime apply (Step 4), and only ever when a non-null
+    contract is already bound (the module fails closed if it is set true while
+    the contract is null). Committed inputs leave it false; prod stays dark.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "tags" {
   description = "Additional tags applied to every supported resource."
   type        = map(string)

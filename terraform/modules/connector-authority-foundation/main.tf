@@ -106,5 +106,14 @@ resource "terraform_data" "foundation_contract" {
       condition     = local.authority_contract_enablement_valid
       error_message = "authority_runtime_contract must remain null until the exact-main evidence generator verifies every referenced blob and explicitly opens the internal evidence latch."
     }
+
+    precondition {
+      # The runtime slice (functions/aliases/concurrency/exec roles + the
+      # lockstep dependency-endpoint opening) may deploy only on top of a bound
+      # contract. Setting the gate against a null contract is a fail-closed hard
+      # error rather than a silent no-op.
+      condition     = !var.authority_runtime_functions_enabled || local.authority_runtime_contract_enabled
+      error_message = "authority_runtime_functions_enabled requires a non-null authority_runtime_contract."
+    }
   }
 }

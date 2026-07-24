@@ -795,6 +795,339 @@ def hub_artifact_transition_fixture(
     return result
 
 
+RUNTIME_QAT1_KEY_ARN = (
+    f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+    "key/00000000-0000-0000-0000-000000000001"
+)
+RUNTIME_LAMBDA_SG_ID = "sg-runtimefn0000000"
+
+
+def authority_runtime_input_with_concurrency() -> dict:
+    payload = authority_runtime_input_fixture()
+    for spec in payload["authority_runtime_contract"]["functions"].values():
+        spec.update(
+            {
+                "steady_provisioned_concurrency": 2,
+                "steady_reserved_concurrency": 2,
+                "rollout_active_provisioned_concurrency": 2,
+                "rollout_standby_provisioned_concurrency": 2,
+                "rollout_reserved_concurrency": 4,
+                "max_caller_in_flight": 2,
+                "max_caller_requests_per_second": 4,
+                "rollback_retention_seconds": 3600,
+            }
+        )
+    return payload
+
+
+def runtime_scoped_endpoint_policies() -> tuple[str, str]:
+    roles = sorted(CHECKER.AUTHORITY_RUNTIME_EXEC_ROLE_ARNS)
+    dynamodb = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AuthorityFunctionsData",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": roles},
+                    "Action": sorted(CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ACTIONS),
+                    "Resource": sorted(CHECKER.AUTHORITY_RUNTIME_DYNAMODB_RESOURCES),
+                }
+            ],
+        }
+    )
+    kms = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AuthorityFunctionsQat1",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": sorted(CHECKER.AUTHORITY_RUNTIME_SIGN_ROLE_ARNS)},
+                    "Action": ["kms:GetPublicKey", "kms:Sign"],
+                    "Resource": [RUNTIME_QAT1_KEY_ARN],
+                }
+            ],
+        }
+    )
+    return dynamodb, kms
+
+
+def runtime_exec_policy(fn: str, operation: str) -> str:
+    """Build the per-operation execution (identity) policy the checker expects.
+
+    Derived from the checker constants so the fixture stays in lockstep with the
+    reviewed IAM; every referenced ARN is a known literal.
+    """
+    spec = CHECKER.AUTHORITY_RUNTIME_OPERATION_IAM[operation]
+    read_resources = sorted(
+        set().union(
+            *(
+                CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES[table]
+                for table in spec["read_tables"]
+            )
+        )
+    )
+    statements = [
+        {
+            "Sid": "LambdaVpcEni",
+            "Effect": "Allow",
+            "Action": sorted(CHECKER.AUTHORITY_RUNTIME_ENI_ACTIONS),
+            "Resource": "*",
+        },
+        {
+            "Sid": "OwnLogStream",
+            "Effect": "Allow",
+            "Action": sorted(CHECKER.AUTHORITY_RUNTIME_LOG_ACTIONS),
+            "Resource": [
+                f"arn:aws:logs:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:"
+                f"log-group:/aws/lambda/{fn}:*"
+            ],
+        },
+        {
+            "Sid": "AuthorityReads",
+            "Effect": "Allow",
+            "Action": sorted(CHECKER.AUTHORITY_RUNTIME_DYNAMODB_READ_ACTIONS),
+            "Resource": read_resources,
+        },
+        {
+            "Sid": spec["write_sid"],
+            "Effect": "Allow",
+            "Action": sorted(spec["write_actions"]),
+            "Resource": sorted(
+                CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES["connector_authority"]
+            ),
+        },
+    ]
+    if spec["signs"]:
+        statements.append(
+            {
+                "Sid": "Qat1Sign",
+                "Effect": "Allow",
+                "Action": ["kms:GetPublicKey", "kms:Sign"],
+                "Resource": [RUNTIME_QAT1_KEY_ARN],
+            }
+        )
+    return json.dumps({"Version": "2012-10-17", "Statement": statements})
+
+
+def runtime_exec_trust(fn: str) -> str:
+    return json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "LambdaAssume",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "lambda.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {
+                        "StringEquals": {"aws:SourceAccount": CHECKER.ACCOUNT_ID},
+                        "ArnEquals": {
+                            "aws:SourceArn": (
+                                f"arn:aws:lambda:{CHECKER.AWS_REGION}:"
+                                f"{CHECKER.ACCOUNT_ID}:function:{fn}"
+                            )
+                        },
+                    },
+                }
+            ],
+        }
+    )
+
+
+def runtime_interface_ingress_rule() -> dict:
+    return {
+        "description": "HTTPS from Connector Authority function ENIs",
+        "from_port": 443,
+        "to_port": 443,
+        "protocol": "tcp",
+        "security_groups": [RUNTIME_LAMBDA_SG_ID],
+        "cidr_blocks": [],
+        "ipv6_cidr_blocks": [],
+        "prefix_list_ids": [],
+        "self": False,
+    }
+
+
+def _runtime_create(after: dict) -> dict:
+    return {
+        "actions": ["create"],
+        "before": None,
+        "after": after,
+        "after_unknown": {},
+    }
+
+
+def _runtime_resource_changes() -> list[dict]:
+    payload = authority_runtime_input_with_concurrency()
+    image_uri = payload["authority_image_uri"]
+    functions = payload["authority_runtime_contract"]["functions"]
+    changes: list[dict] = []
+    for fn, spec in functions.items():
+        changes.append(
+            {
+                "address": f'module.control.aws_lambda_function.authority["{fn}"]',
+                "mode": "managed",
+                "type": "aws_lambda_function",
+                "change": _runtime_create(
+                    {
+                        "function_name": fn,
+                        "package_type": "Image",
+                        "image_uri": image_uri,
+                        "reserved_concurrent_executions": spec[
+                            "steady_reserved_concurrency"
+                        ],
+                        "vpc_config": [
+                            {"subnet_ids": [], "security_group_ids": []}
+                        ],
+                    }
+                ),
+            }
+        )
+        for color in ("blue", "green"):
+            changes.append(
+                {
+                    "address": (
+                        f'module.control.aws_lambda_alias.authority["{fn}:{color}"]'
+                    ),
+                    "mode": "managed",
+                    "type": "aws_lambda_alias",
+                    "change": _runtime_create({"name": color}),
+                }
+            )
+        changes.append(
+            {
+                "address": (
+                    "module.control.aws_lambda_provisioned_concurrency_config."
+                    f'authority["{fn}"]'
+                ),
+                "mode": "managed",
+                "type": "aws_lambda_provisioned_concurrency_config",
+                "change": _runtime_create(
+                    {
+                        "provisioned_concurrent_executions": spec[
+                            "steady_provisioned_concurrency"
+                        ],
+                        "qualifier": "blue",
+                    }
+                ),
+            }
+        )
+        changes.append(
+            {
+                "address": f'module.control.aws_iam_role.authority_exec["{fn}"]',
+                "mode": "managed",
+                "type": "aws_iam_role",
+                "change": _runtime_create(
+                    {
+                        "assume_role_policy": runtime_exec_trust(fn),
+                        "managed_policy_arns": [],
+                        "max_session_duration": 3600,
+                        "permissions_boundary": None,
+                    }
+                ),
+            }
+        )
+        operation = CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS[fn]
+        changes.append(
+            {
+                "address": (
+                    f'module.control.aws_iam_role_policy.authority_exec["{fn}"]'
+                ),
+                "mode": "managed",
+                "type": "aws_iam_role_policy",
+                "change": _runtime_create(
+                    {
+                        "name": f"connector-authority-{operation}",
+                        "policy": runtime_exec_policy(fn, operation),
+                    }
+                ),
+            }
+        )
+        changes.append(
+            {
+                "address": (
+                    f'module.control.aws_cloudwatch_log_group.authority["{fn}"]'
+                ),
+                "mode": "managed",
+                "type": "aws_cloudwatch_log_group",
+                "change": _runtime_create({"name": f"/aws/lambda/{fn}"}),
+            }
+        )
+        changes.append(
+            {
+                "address": (
+                    "module.control.aws_cloudwatch_metric_alarm."
+                    f'authority_spillover["{fn}"]'
+                ),
+                "mode": "managed",
+                "type": "aws_cloudwatch_metric_alarm",
+                "change": _runtime_create(
+                    {"alarm_name": f"{fn}-provisioned-concurrency-spillover"}
+                ),
+            }
+        )
+    changes.append(
+        {
+            "address": CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS,
+            "mode": "managed",
+            "type": "aws_security_group",
+            "change": _runtime_create(
+                {"ingress": [], "egress": [{"from_port": 443, "to_port": 443}]}
+            ),
+        }
+    )
+    return changes
+
+
+def authority_runtime_transition_fixture() -> dict:
+    """The runtime slice: 25 pure creates plus the exact three endpoint/SG opens."""
+    result = plan_fixture()
+    result["applyable"] = True
+    changes = {item["address"]: item for item in result["resource_changes"]}
+    payload = authority_runtime_input_with_concurrency()
+
+    foundation = changes["module.control.terraform_data.foundation_contract"]["change"]
+    foundation["actions"] = ["no-op"]
+    foundation["before"] = {"input": payload, "output": payload}
+    foundation["after"] = {"input": payload, "output": payload}
+    foundation["after_unknown"] = {}
+
+    dynamodb_policy, kms_policy = runtime_scoped_endpoint_policies()
+    ddb = changes[CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS]["change"]
+    ddb["actions"] = ["update"]
+    ddb["after"] = {**ddb["after"], "policy": dynamodb_policy}
+    kms = changes[CHECKER.AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS]["change"]
+    kms["actions"] = ["update"]
+    kms["after"] = {**kms["after"], "policy": kms_policy}
+    sg = changes[CHECKER.AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS]["change"]
+    sg["actions"] = ["update"]
+    sg["after"] = {
+        **sg["after"],
+        "ingress": [runtime_interface_ingress_rule()],
+        "egress": [],
+    }
+
+    result["resource_changes"].extend(_runtime_resource_changes())
+    return result
+
+
+def authority_runtime_steady_fixture() -> dict:
+    """Runtime inventory, every change a no-op: the steady post-slice state."""
+    result = authority_runtime_transition_fixture()
+    result["applyable"] = False
+    for item in result["resource_changes"]:
+        change = item["change"]
+        if change["actions"] == ["no-op"]:
+            continue
+        change["actions"] = ["no-op"]
+        # Steady state: the applied value is both before and after.
+        change["before"] = copy.deepcopy(change["after"])
+        change["after_unknown"] = {}
+    return result
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
@@ -2965,6 +3298,297 @@ class PlanContractTests(unittest.TestCase):
         piggyback["resource_drift"][0]["change"]["after"]["description"] = "changed"
         self.assert_rejected(piggyback, prior_state)
 
+    # --- Connector Authority runtime slice (Step 4) ---------------------------
+
+    def test_exact_authority_runtime_slice_passes(self) -> None:
+        summary = CHECKER.check_plan(authority_runtime_transition_fixture())
+        self.assertEqual(summary["plan_mode"], "authority-runtime-slice")
+        self.assertEqual(
+            summary["resource_count"],
+            len(CHECKER.EXPECTED_RESOURCES) + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
+        )
+        self.assertEqual(summary["bootstrap_create_count"], 0)
+
+    def test_authority_runtime_steady_state_noop_passes(self) -> None:
+        summary = CHECKER.check_plan(authority_runtime_steady_fixture())
+        self.assertEqual(summary["plan_mode"], "no-op")
+        self.assertEqual(
+            summary["resource_count"],
+            len(CHECKER.EXPECTED_RESOURCES) + len(CHECKER.AUTHORITY_RUNTIME_RESOURCES),
+        )
+
+    def test_authority_runtime_rejects_broadened_dynamodb_principal(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        ddb = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
+        policy = json.loads(ddb["after"]["policy"])
+        policy["Statement"][0]["Principal"] = "*"
+        ddb["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_extra_dynamodb_resource(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        ddb = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
+        policy = json.loads(ddb["after"]["policy"])
+        policy["Statement"][0]["Resource"].append(
+            f"arn:aws:dynamodb:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:table/"
+            f"{CHECKER.CONTROL_PREFIX}-qurl-customers"
+        )
+        ddb["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_kms_non_qat1_key(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        kms = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS)
+        policy = json.loads(kms["after"]["policy"])
+        policy["Statement"][0]["Resource"] = [
+            f"arn:aws:kms:{CHECKER.AWS_REGION}:{CHECKER.ACCOUNT_ID}:key/not-a-uuid"
+        ]
+        kms["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_kms_wildcard_action(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        kms = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS)
+        policy = json.loads(kms["after"]["policy"])
+        policy["Statement"][0]["Action"] = ["kms:*"]
+        kms["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_opening_caller_lambda_endpoint(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        lam = self.change(
+            candidate, 'module.control.aws_vpc_endpoint.interface["lambda"]'
+        )
+        lam["actions"] = ["update"]
+        lam["after"] = {
+            **lam["after"],
+            "policy": runtime_scoped_endpoint_policies()[1],
+        }
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_opening_redis_sg(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        redis_sg = self.change(candidate, "module.control.aws_security_group.otp_redis")
+        redis_sg["actions"] = ["update"]
+        redis_sg["after"] = {
+            **redis_sg["after"],
+            "ingress": [runtime_interface_ingress_rule()],
+        }
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_world_interface_ingress(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        sg = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_INTERFACE_SG_ADDRESS)
+        sg["after"]["ingress"][0]["cidr_blocks"] = ["0.0.0.0/0"]
+        sg["after"]["ingress"][0]["security_groups"] = []
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_wrong_reserved_concurrency(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        fn = self.change(
+            candidate,
+            'module.control.aws_lambda_function.authority'
+            '["layerv-nhp-sandbox-ca-ia"]',
+        )
+        fn["after"]["reserved_concurrent_executions"] = 1
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_unpinned_image(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        fn = self.change(
+            candidate,
+            'module.control.aws_lambda_function.authority'
+            '["layerv-nhp-sandbox-ca-ra"]',
+        )
+        fn["after"]["image_uri"] = "public.ecr.aws/rogue/authority:latest"
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_wildcard_exec_trust(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        role = self.change(
+            candidate,
+            'module.control.aws_iam_role.authority_exec["layerv-nhp-sandbox-ca-ia"]',
+        )
+        trust = json.loads(role["after"]["assume_role_policy"])
+        trust["Statement"][0]["Principal"] = {"AWS": "*"}
+        role["after"]["assume_role_policy"] = json.dumps(trust)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_managed_policy_on_exec_role(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        role = self.change(
+            candidate,
+            'module.control.aws_iam_role.authority_exec["layerv-nhp-sandbox-ca-icr"]',
+        )
+        role["after"]["managed_policy_arns"] = ["arn:aws:iam::aws:policy/AdministratorAccess"]
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_ddb_endpoint_missing_describe_table(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        ddb = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
+        policy = json.loads(ddb["after"]["policy"])
+        policy["Statement"][0]["Action"] = [
+            action
+            for action in policy["Statement"][0]["Action"]
+            if action != "dynamodb:DescribeTable"
+        ]
+        ddb["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_kms_endpoint_verify_action(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        kms = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS)
+        policy = json.loads(kms["after"]["policy"])
+        policy["Statement"][0]["Action"] = [
+            "kms:GetPublicKey",
+            "kms:Sign",
+            "kms:Verify",
+        ]
+        kms["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_broadened_kms_endpoint_principal(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        kms = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_KMS_ENDPOINT_ADDRESS)
+        policy = json.loads(kms["after"]["policy"])
+        # Widening the qat1 endpoint back to all three roles must fail: only the
+        # IssueAssignment role builds a KMS client.
+        policy["Statement"][0]["Principal"]["AWS"] = sorted(
+            CHECKER.AUTHORITY_RUNTIME_EXEC_ROLE_ARNS
+        )
+        kms["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def _exec_policy_change(self, candidate: dict, operation: str) -> dict:
+        fn = next(
+            name
+            for name, op in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS.items()
+            if op == operation
+        )
+        return self.change(
+            candidate, f'module.control.aws_iam_role_policy.authority_exec["{fn}"]'
+        )
+
+    def test_authority_runtime_rejects_exec_reads_missing_describe_table(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        change = self._exec_policy_change(candidate, "issue_assignment")
+        policy = json.loads(change["after"]["policy"])
+        reads = next(s for s in policy["Statement"] if s["Sid"] == "AuthorityReads")
+        reads["Action"] = [
+            action for action in reads["Action"] if action != "dynamodb:DescribeTable"
+        ]
+        change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_refresh_exec_kms_statement(self) -> None:
+        # RefreshAssignment builds no KMS client; a Sign statement must be rejected.
+        candidate = authority_runtime_transition_fixture()
+        change = self._exec_policy_change(candidate, "refresh_assignment")
+        policy = json.loads(change["after"]["policy"])
+        policy["Statement"].append(
+            {
+                "Sid": "Qat1Sign",
+                "Effect": "Allow",
+                "Action": ["kms:GetPublicKey", "kms:Sign"],
+                "Resource": [RUNTIME_QAT1_KEY_ARN],
+            }
+        )
+        change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_recovery_exec_writes_api_keys(self) -> None:
+        # IssueCredentialRecovery writes connector_authority ONLY; api_keys is a
+        # ConditionCheck-only (read-set) table.
+        candidate = authority_runtime_transition_fixture()
+        change = self._exec_policy_change(candidate, "issue_credential_recovery")
+        policy = json.loads(change["after"]["policy"])
+        write = next(
+            s for s in policy["Statement"] if s["Sid"] == "AuthorityRecoveryWrite"
+        )
+        write["Resource"] = sorted(
+            set(write["Resource"])
+            | CHECKER.AUTHORITY_RUNTIME_TABLE_RESOURCES["api_keys"]
+        )
+        change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_exec_non_eni_wildcard_resource(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        change = self._exec_policy_change(candidate, "issue_assignment")
+        policy = json.loads(change["after"]["policy"])
+        write = next(
+            s for s in policy["Statement"] if s["Sid"] == "AuthorityReplayWrite"
+        )
+        write["Resource"] = ["*"]
+        change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_replay_write_update_over_grant(self) -> None:
+        # IssueAssignment/RefreshAssignment write only the replay Put; adding
+        # UpdateItem is an over-grant and must be rejected.
+        candidate = authority_runtime_transition_fixture()
+        change = self._exec_policy_change(candidate, "refresh_assignment")
+        policy = json.loads(change["after"]["policy"])
+        write = next(
+            s for s in policy["Statement"] if s["Sid"] == "AuthorityReplayWrite"
+        )
+        write["Action"] = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
+        change["after"]["policy"] = json.dumps(policy)
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_partial_inventory(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        candidate["resource_changes"] = [
+            item
+            for item in candidate["resource_changes"]
+            if item["address"] != CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS
+        ]
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_stray_extra_resource(self) -> None:
+        candidate = authority_runtime_transition_fixture()
+        candidate["resource_changes"].append(
+            {
+                "address": 'module.control.aws_lambda_function.rogue',
+                "mode": "managed",
+                "type": "aws_lambda_function",
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {"function_name": "rogue"},
+                    "after_unknown": {},
+                },
+            }
+        )
+        self.assert_rejected(candidate)
+
+    def test_base_plan_rejects_stray_runtime_resource(self) -> None:
+        candidate = plan_fixture()
+        candidate["resource_changes"].append(
+            {
+                "address": CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS,
+                "mode": "managed",
+                "type": "aws_security_group",
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {"ingress": [], "egress": []},
+                    "after_unknown": {},
+                },
+            }
+        )
+        self.assert_rejected(candidate)
+
+    def test_authority_runtime_rejects_create_without_endpoint_open(self) -> None:
+        # Creating the functions while leaving the dependency endpoints deny-all
+        # is not the admitted transition (they must open in lockstep).
+        candidate = authority_runtime_transition_fixture()
+        ddb = self.change(candidate, CHECKER.AUTHORITY_RUNTIME_DYNAMODB_ADDRESS)
+        ddb["actions"] = ["no-op"]
+        ddb["after"] = {**ddb["after"], "policy": json.dumps(CHECKER.DENY_ENDPOINT_POLICY)}
+        ddb["before"] = ddb["after"]
+        self.assert_rejected(candidate)
+
     def assert_rejected(self, plan: dict, prior_state: object = None) -> None:
         with self.assertRaises(CHECKER.ContractError):
             CHECKER.check_plan(plan, prior_state)
@@ -3358,6 +3982,21 @@ class StateListTests(unittest.TestCase):
                 with self.assertRaisesRegex(CHECKER.ContractError, re.escape(address)):
                     self.check([*self.expected_addresses(), address])
 
+    def test_runtime_inventory_passes_and_partial_fails(self) -> None:
+        runtime = [*self.expected_addresses(), *CHECKER.AUTHORITY_RUNTIME_RESOURCES]
+        self.assertEqual(
+            self.check(runtime),
+            {"data_resource_count": 6, "managed_resource_count": 75},
+        )
+        # A partial runtime inventory (missing one runtime resource) fails closed.
+        partial = [
+            address
+            for address in runtime
+            if address != CHECKER.AUTHORITY_RUNTIME_LAMBDA_SG_ADDRESS
+        ]
+        with self.assertRaises(CHECKER.ContractError):
+            self.check(partial)
+
 
 def state_fixture() -> dict:
     resources = [
@@ -3617,6 +4256,30 @@ def state_fixture() -> dict:
     }
 
 
+def state_fixture_runtime() -> dict:
+    """The dark state plus the applied runtime slice (scoped endpoints, function SG
+    ingress, and the 25 runtime resources)."""
+    state = state_fixture()
+    resources = state["values"]["root_module"]["resources"]
+    by_address = {item["address"]: item["values"] for item in resources}
+    dynamodb_policy, kms_policy = runtime_scoped_endpoint_policies()
+    by_address["module.control.aws_vpc_endpoint.dynamodb"]["policy"] = dynamodb_policy
+    by_address['module.control.aws_vpc_endpoint.interface["kms"]']["policy"] = kms_policy
+    interface_sg = by_address["module.control.aws_security_group.interface_endpoints"]
+    interface_sg["ingress"] = [runtime_interface_ingress_rule()]
+    interface_sg["egress"] = []
+    for address, resource_type in CHECKER.AUTHORITY_RUNTIME_RESOURCES.items():
+        resources.append(
+            {
+                "address": address,
+                "mode": "managed",
+                "type": resource_type,
+                "values": {"id": "runtime-placeholder"},
+            }
+        )
+    return state
+
+
 class StateContractTests(unittest.TestCase):
     def test_resource_inventory_contract_hash_is_reviewed(self) -> None:
         # Update only with an intentional, reviewed address/type inventory change.
@@ -3627,6 +4290,31 @@ class StateContractTests(unittest.TestCase):
 
     def test_exact_state_passes(self) -> None:
         self.assertEqual(CHECKER.check_state(state_fixture())["resource_count"], 50)
+
+    def test_exact_runtime_state_passes(self) -> None:
+        self.assertEqual(
+            CHECKER.check_state(state_fixture_runtime())["resource_count"], 75
+        )
+
+    def test_runtime_state_rejects_still_dark_dependency_endpoint(self) -> None:
+        state = state_fixture_runtime()
+        resources = state["values"]["root_module"]["resources"]
+        by_address = {item["address"]: item["values"] for item in resources}
+        by_address["module.control.aws_vpc_endpoint.dynamodb"]["policy"] = json.dumps(
+            CHECKER.DENY_ENDPOINT_POLICY
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(state)
+
+    def test_runtime_state_rejects_open_caller_lambda_endpoint(self) -> None:
+        state = state_fixture_runtime()
+        resources = state["values"]["root_module"]["resources"]
+        by_address = {item["address"]: item["values"] for item in resources}
+        by_address['module.control.aws_vpc_endpoint.interface["lambda"]']["policy"] = (
+            runtime_scoped_endpoint_policies()[1]
+        )
+        with self.assertRaises(CHECKER.ContractError):
+            CHECKER.check_state(state)
 
     def test_publisher_trust_and_permissions_drift_fail(self) -> None:
         mutations = (
@@ -4054,6 +4742,38 @@ class LiveContractTests(unittest.TestCase):
                     payload = json.loads((root / "state-head.json").read_text())
                     payload["VersionId"] = "null"
                     write_json(root / "state-head.json", payload)
+                with self.assertRaises(CHECKER.ContractError):
+                    CHECKER.check_live(root)
+
+    def test_live_boundary_admits_exactly_the_three_authority_functions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_fixture(root)
+            write_json(
+                root / "control-lambdas.json",
+                [
+                    {"FunctionName": name, "Runtime": None}
+                    for name in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS
+                ],
+            )
+            self.assertEqual(
+                CHECKER.check_live(root)["authority_function_count"], 3
+            )
+
+    def test_live_boundary_rejects_unexpected_or_malformed_lambdas(self) -> None:
+        for payload in (
+            [{"FunctionName": "layerv-nhp-sandbox-ca-rogue"}],
+            [{"FunctionName": name} for name in CHECKER.AUTHORITY_RUNTIME_HUB_FUNCTIONS]
+            + [{"FunctionName": "layerv-nhp-sandbox-ca-ia-extra"}],
+            ["layerv-nhp-sandbox-ca-ia"],
+        ):
+            with (
+                self.subTest(payload=payload),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                live_fixture(root)
+                write_json(root / "control-lambdas.json", payload)
                 with self.assertRaises(CHECKER.ContractError):
                     CHECKER.check_live(root)
 

@@ -70,6 +70,17 @@ variable "authority_runtime_contract_evidence_verified" {
   }
 }
 
+variable "authority_runtime_functions_enabled" {
+  description = "Production runtime-slice gate remains false throughout sandbox measurement."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.authority_runtime_functions_enabled
+    error_message = "Production Authority runtime functions must remain disabled throughout sandbox measurement."
+  }
+}
+
 variable "tags" {
   type = map(string)
   default = {

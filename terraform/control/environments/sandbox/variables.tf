@@ -60,6 +60,12 @@ variable "authority_runtime_contract_evidence_verified" {
   default     = false
 }
 
+variable "authority_runtime_functions_enabled" {
+  description = "Second, independent runtime-slice gate. Committed inputs leave it false so contract binding (Step 3) stays a foundation_contract-only transition; the Step-4 runtime apply supplies it true (via -var or the generated tfvars) on top of a bound contract. See the module variable of the same name."
+  type        = bool
+  default     = false
+}
+
 variable "tags" {
   type = map(string)
   default = {
