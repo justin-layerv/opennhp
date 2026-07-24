@@ -565,6 +565,42 @@ run "rejects_legacy_active_color" {
   expect_failures = [terraform_data.foundation_contract]
 }
 
+run "rejects_live_environment_identity_drift" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = merge(
+          run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global,
+          { environment = "prod" },
+        )
+      },
+    )
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_malformed_authority_image_digest" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = merge(
+          run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global,
+          { authority_image_digest = "sha256:not-a-digest" },
+        )
+      },
+    )
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
 run "rejects_cell_role_name_substitution" {
   command = plan
 
@@ -1068,6 +1104,24 @@ run "rejects_out_of_bounds_rollback_retention" {
   expect_failures = [terraform_data.foundation_contract]
 }
 
+run "rejects_unreserved_concurrency_floor_below_one_hundred" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = merge(
+          run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global,
+          { retained_unreserved_concurrency = 99 },
+        )
+      },
+    )
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
 run "rejects_measurement_result_evidence" {
   command = plan
 
@@ -1101,6 +1155,29 @@ run "rejects_malformed_evidence_reference" {
             basis_evidence = merge(
               run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global.basis_evidence,
               { path = "../outside.json" },
+            )
+          },
+        )
+      },
+    )
+  }
+
+  expect_failures = [terraform_data.foundation_contract]
+}
+
+run "rejects_untrusted_evidence_repository" {
+  command = plan
+
+  variables {
+    authority_runtime_contract = merge(
+      run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract,
+      {
+        global = merge(
+          run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global,
+          {
+            basis_evidence = merge(
+              run.measurement_accepts_hub_group_and_future_cell_catalog.authority_runtime_contract.global.basis_evidence,
+              { repository = "example/untrusted" },
             )
           },
         )

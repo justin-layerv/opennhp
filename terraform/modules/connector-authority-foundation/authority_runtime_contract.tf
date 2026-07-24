@@ -360,6 +360,10 @@ locals {
     local.authority_contract_global.non_authority_reserved_concurrency >= 0 &&
     local.authority_contract_global.retained_unreserved_concurrency >= 100 &&
     local.authority_available_lambda_concurrency >= 1 &&
+    # This precursor freezes positive, evidence-addressable downstream
+    # headroom. The exact-main evidence checker owns service-specific demand
+    # comparison because each operation has a different measured fan-out; the
+    # schema intentionally does not invent those ratios.
     alltrue([
       for value in values(local.authority_contract_global.dependency_headroom) :
       value >= 1
