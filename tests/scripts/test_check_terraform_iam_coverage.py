@@ -143,6 +143,86 @@ class TerraformHelperInvokeScope(unittest.TestCase):
                     IAM._terraform_semantic_read_invoke_scope_error(policy)
                 )
 
+    def integration_test_policy(self):
+        # terraform_apply_data carries the five helper invokes AND the acme
+        # integration-test invoke; the two fences must both pass on this shape.
+        return {
+            "Statement": [
+                {
+                    "Sid": "TerraformHelperInvoke",
+                    "Effect": "Allow",
+                    "Action": [IAM.HELPER_INVOKE_ACTION],
+                    "Resource": sorted(IAM.HELPER_INVOKE_RESOURCES),
+                },
+                *(
+                    {
+                        "Sid": sid,
+                        "Effect": "Allow",
+                        "Action": [IAM.HELPER_INVOKE_ACTION],
+                        "Resource": [resource],
+                    }
+                    for sid, resource in IAM.INTEGRATION_TEST_INVOKE_RESOURCES.items()
+                ),
+            ]
+        }
+
+    def test_helper_scope_ignores_acme_invoke(self):
+        # The helper fence stays green with the separately-fenced acme invoke
+        # present, but still rejects a second *non-acme* invoke-capable Allow.
+        policy = self.integration_test_policy()
+        self.assertIsNone(IAM._terraform_helper_invoke_scope_error(policy))
+        policy["Statement"].append(
+            {
+                "Sid": "RogueInvoke",
+                "Effect": "Allow",
+                "Action": [IAM.HELPER_INVOKE_ACTION],
+                "Resource": ["arn:aws:lambda:us-east-2:123:function:authority"],
+            }
+        )
+        self.assertIsNotNone(IAM._terraform_helper_invoke_scope_error(policy))
+
+    def test_exact_integration_test_scope_passes(self):
+        policy = self.integration_test_policy()
+        self.assertIsNone(
+            IAM._terraform_integration_test_invoke_scope_error(policy)
+        )
+        # The helper fence coexists on the same policy document.
+        self.assertIsNone(IAM._terraform_helper_invoke_scope_error(policy))
+
+    def test_missing_broad_or_wrong_integration_test_fails(self):
+        # The acme target must be UNqualified: a qualified/versioned grant would
+        # not authorize the no-Qualifier SDK invoke, so it must be rejected —
+        # the inverse of the relay refresh invoke's :$LATEST requirement.
+        mutations = (
+            "missing",
+            "broad",
+            "qualified",
+            "wrong-resource",
+            "condition",
+            "duplicate",
+        )
+        for mutation in mutations:
+            policy = self.integration_test_policy()
+            acme = policy["Statement"][-1]
+            if mutation == "missing":
+                policy["Statement"].pop()
+            elif mutation == "broad":
+                acme["Action"] = "lambda:*"
+            elif mutation == "qualified":
+                acme["Resource"][0] = acme["Resource"][0] + ":$LATEST"
+            elif mutation == "wrong-resource":
+                acme["Resource"][0] = acme["Resource"][0].replace(
+                    "-acme-cert-manager", "-relay-status"
+                )
+            elif mutation == "condition":
+                acme["Condition"] = {}
+            else:  # duplicate
+                policy["Statement"].append(dict(acme))
+            with self.subTest(mutation=mutation):
+                self.assertIsNotNone(
+                    IAM._terraform_integration_test_invoke_scope_error(policy)
+                )
+
     def test_real_tree_scope_covers_exact_invocation_inventory(self):
         root = REPO_ROOT / "terraform"
         keygen = "${aws_lambda_function.keygen.function_name}"

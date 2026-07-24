@@ -50,8 +50,9 @@ What it does NOT check
   failure mode is "no grant anywhere in source" — which the union check
   catches.
 - Resource-ARN scope, except for the shared apply role's five Terraform helper
-  Lambda invocations and qualified relay semantic-read Lambda invocation. Other
-  consumers still need manual scope review.
+  Lambda invocations, the qualified relay semantic-read Lambda invocation, and
+  the unqualified acme cert-status integration-test invocation. Other consumers
+  still need manual scope review.
 - `count`/`for_each` gating. Consumers are checked as a union regardless of
   gating, so a mapped resource that is `count = 0` in every environment
   still demands its grants exist. This errs toward requiring grants (safe
@@ -135,6 +136,18 @@ SEMANTIC_READ_INVOKE_RESOURCES = {
         "function:${var.name_prefix}-relay-status:$LATEST"
     ),
 }
+# The Deploy Sandbox - Validate integration test invokes the read-only acme
+# cert-status function under the shared deploy role after apply. The SDK call
+# passes no Qualifier, so IAM authorizes it against the UNqualified function
+# ARN — the opposite of the relay refresh invoke above, which pins $LATEST.
+# This lives on terraform_apply_data (a runtime-invoke policy), never on
+# terraform_read, because no Terraform data source invokes it.
+INTEGRATION_TEST_INVOKE_RESOURCES = {
+    "AcmeCertManagerStatusInvoke": (
+        "arn:aws:lambda:${local.region}:${local.account_id}:"
+        "function:${var.name_prefix}-acme-cert-manager"
+    ),
+}
 
 
 def _terraform_helper_invoke_scope_error(policy: dict[str, Any] | None) -> str | None:
@@ -162,8 +175,19 @@ def _terraform_helper_invoke_scope_error(policy: dict[str, Any] | None) -> str |
         ):
             grants.append(statement)
 
+    # The acme integration-test invoke shares this policy but is fenced
+    # separately (_terraform_integration_test_invoke_scope_error); exclude it by
+    # Sid so the helper set stays independently exact. A rogue invoke that
+    # borrows the acme Sid but broadens action/resource is still caught by that
+    # companion fence.
+    grants = [
+        grant
+        for grant in grants
+        if unquote(grant.get("Sid", "")) not in INTEGRATION_TEST_INVOKE_RESOURCES
+    ]
+
     if len(grants) != 1:
-        return "terraform_apply_data must have exactly one InvokeFunction-capable Allow"
+        return "terraform_apply_data must have exactly one helper InvokeFunction-capable Allow"
     grant = grants[0]
     actions = strings(grant.get("Action"))
     resources = strings(grant.get("Resource"))
@@ -177,6 +201,29 @@ def _terraform_helper_invoke_scope_error(policy: dict[str, Any] | None) -> str |
     ):
         return "TerraformHelperInvoke must grant only the five exact helper ARNs"
     return None
+
+
+def _exact_single_invoke_statement_ok(statement: dict[str, Any], resource: str) -> bool:
+    """Shared exact-shape check for the deploy role's per-Sid invoke fences.
+
+    True iff `statement` grants only `lambda:InvokeFunction` on exactly the one
+    `resource` ARN, with no extra keys (a stray Condition/Principal fails). The
+    qualified-vs-unqualified distinction lives entirely in the caller's ARN
+    string, so both the relay refresh fence and the acme integration-test fence
+    reuse this identical verification — keep the security-critical shape check in
+    one place so the two fences cannot drift.
+    """
+
+    raw_actions = statement.get("Action")
+    actions = raw_actions if isinstance(raw_actions, list) else [raw_actions]
+    raw_resources = statement.get("Resource")
+    resources = raw_resources if isinstance(raw_resources, list) else [raw_resources]
+    return (
+        set(statement) == {"Sid", "Effect", "Action", "Resource"}
+        and [unquote(action) for action in actions if isinstance(action, str)]
+        == [HELPER_INVOKE_ACTION]
+        and [unquote(item) for item in resources if isinstance(item, str)] == [resource]
+    )
 
 
 def _terraform_semantic_read_invoke_scope_error(
@@ -212,21 +259,56 @@ def _terraform_semantic_read_invoke_scope_error(
         return "terraform_read must grant exactly the qualified relay semantic-read invoke"
 
     for sid, resource in SEMANTIC_READ_INVOKE_RESOURCES.items():
-        statement = grants[sid]
-        raw_actions = statement.get("Action")
-        actions = raw_actions if isinstance(raw_actions, list) else [raw_actions]
-        raw_resources = statement.get("Resource")
-        resources = (
-            raw_resources if isinstance(raw_resources, list) else [raw_resources]
-        )
-        if (
-            set(statement) != {"Sid", "Effect", "Action", "Resource"}
-            or [unquote(action) for action in actions if isinstance(action, str)]
-            != [HELPER_INVOKE_ACTION]
-            or [unquote(item) for item in resources if isinstance(item, str)]
-            != [resource]
-        ):
+        if not _exact_single_invoke_statement_ok(grants[sid], resource):
             return f"terraform_read {sid} must grant only its exact qualified target ARN"
+    return None
+
+
+def _terraform_integration_test_invoke_scope_error(
+    policy: dict[str, Any] | None,
+) -> str | None:
+    """Keep the post-deploy acme cert-status invoke exact and unqualified.
+
+    terraform_apply_data also carries the five Terraform helper invokes (fenced
+    by `_terraform_helper_invoke_scope_error`); this check inspects only the
+    integration-test Sid(s) so the two invoke categories stay independently
+    exact. Unlike the relay refresh invoke, the acme target must NOT be
+    qualified: the SDK invoke passes no Qualifier, so a `:$LATEST`/versioned
+    grant would not authorize it.
+    """
+
+    if not policy or not isinstance(policy.get("Statement"), list):
+        return "terraform_apply_data policy could not be decoded"
+
+    grants: dict[str, dict[str, Any]] = {}
+    for statement in policy["Statement"]:
+        if not isinstance(statement, dict):
+            continue
+        effect = unquote(statement.get("Effect", "Allow"))
+        if isinstance(effect, str) and effect.lower() != "allow":
+            continue
+        raw_actions = statement.get("Action", [])
+        actions = raw_actions if isinstance(raw_actions, list) else [raw_actions]
+        normalized_actions = [
+            unquote(action).lower() for action in actions if isinstance(action, str)
+        ]
+        if "NotAction" not in statement and not action_allowed(
+            HELPER_INVOKE_ACTION, normalized_actions
+        ):
+            continue
+        sid = unquote(statement.get("Sid", ""))
+        if sid not in INTEGRATION_TEST_INVOKE_RESOURCES:
+            continue  # helper invokes are fenced separately
+        if sid in grants:
+            return "terraform_apply_data must have unique Sids for the integration-test invoke"
+        grants[sid] = statement
+
+    if set(grants) != set(INTEGRATION_TEST_INVOKE_RESOURCES):
+        return "terraform_apply_data must grant exactly the unqualified acme cert-status invoke"
+
+    for sid, resource in INTEGRATION_TEST_INVOKE_RESOURCES.items():
+        if not _exact_single_invoke_statement_ok(grants[sid], resource):
+            return f"terraform_apply_data {sid} must grant only its exact unqualified target ARN"
     return None
 
 
@@ -246,10 +328,13 @@ def terraform_helper_invoke_scope_error(
     ]:
         return "expected exactly one canonical terraform_apply_data and terraform_read policy"
     policies = dict(matches)
-    return _terraform_helper_invoke_scope_error(
-        extract_policy_body(policies["terraform_apply_data"].get("policy"))
-    ) or _terraform_semantic_read_invoke_scope_error(
-        extract_policy_body(policies["terraform_read"].get("policy"))
+    apply_data_body = extract_policy_body(policies["terraform_apply_data"].get("policy"))
+    return (
+        _terraform_helper_invoke_scope_error(apply_data_body)
+        or _terraform_integration_test_invoke_scope_error(apply_data_body)
+        or _terraform_semantic_read_invoke_scope_error(
+            extract_policy_body(policies["terraform_read"].get("policy"))
+        )
     )
 
 

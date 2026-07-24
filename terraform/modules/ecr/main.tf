@@ -3063,6 +3063,19 @@ resource "aws_iam_policy" "terraform_apply_data" {
         ]
       },
       {
+        # Post-deploy validation invoke (NOT a Terraform operation): the
+        # "Deploy Sandbox - Validate" integration test
+        # (tests/integration/acme_cert_test.go::TestACMECertLambdaCheckStatus)
+        # invokes this read-only cert-status function under the deploy role
+        # after apply with no Qualifier — grant the exact UNqualified ARN, never
+        # :$LATEST. It belongs on this apply policy, not the terraform_read
+        # refresh slot; scope is fenced in check-terraform-iam-coverage.py.
+        Sid      = "AcmeCertManagerStatusInvoke"
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = ["arn:aws:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-acme-cert-manager"]
+      },
+      {
         Sid    = "LambdaLayer"
         Effect = "Allow"
         Action = [
@@ -3137,9 +3150,9 @@ resource "aws_iam_policy" "terraform_apply_data" {
       # IAM counts non-whitespace characters toward the 6,144-character
       # customer-managed-policy quota. jsonencode emits no insignificant
       # whitespace, so this is the exact provider payload length. Environment-
-      # specific renders measured 3,340/3,331 characters in sandbox/production
-      # after adding the Control cache user-group dependency, leaving
-      # 2,804/2,813 characters below the hard quota.
+      # specific renders measured 3,529/3,517 characters in sandbox/production
+      # after adding the acme cert-status invoke, leaving
+      # 2,615/2,627 characters below the hard quota.
       condition     = length(self.policy) <= 6144
       error_message = "terraform_apply_data exceeds IAM's 6,144-character customer-managed policy quota; split statements within the existing attachment budget before applying."
     }
